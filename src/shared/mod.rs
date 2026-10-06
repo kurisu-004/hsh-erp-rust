@@ -4,6 +4,7 @@
 // analytics 不挂 URL、不进 modules/mod.rs（仅在 shared::analytics 命名空间下），
 // 没有 handler/service/repo/dto/vo 五段式，详见 analytics/mod.rs 顶部注释。
 pub mod analytics;
+pub mod customer; // 2026-10-07：客户 L1/L2 id 展开（part / com::union_list / prod::batch 三域共用）
 pub mod error;
 pub mod pagination;
 pub mod response;

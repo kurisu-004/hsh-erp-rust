@@ -6,8 +6,8 @@
 //!
 //! - `crud.rs`：单件 CRUD（create_part / get_part / list_parts / update_part /
 //!   soft_delete_part / upload_part_file / upload_drawing / upload_3d_model /
-//!   get_part_batches_by_serial）+ helpers（map_create_error / expand_customer_id /
-//!   lookup_customer_names）
+//!   get_part_batches_by_serial）+ helpers（map_create_error /
+//!   lookup_customer_names；客户 id 展开走 `crate::shared::customer`）
 //! - `batch.rs`：批量创建（batch_create_parts legacy + batch_create_parts_with_bindings +
 //!   prepare_binding_head_copy + PreparedBinding），2026-09-16 M2-B + M2-C 重构
 //! - `lifecycle.rs`：part 级多批次终态（cancel / force_complete）

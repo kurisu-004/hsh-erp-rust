@@ -34,6 +34,10 @@
 //! ORDER BY <白名单列> <ASC|DESC> NULLS LAST, p.id DESC
 //! LIMIT $limit OFFSET $offset
 //! ```
+//! `<白名单列>` / `<ASC|DESC>` 由 service 层的 `resolve_order_col` /
+//! `resolve_order_dir` 映射后经 [`ProgrammingFilters::order_col`] /
+//! [`ProgrammingFilters::order_dir`] 传进来 —— repo 收到的字段或已规范化、或以
+//! `push_bind` 传参，拼进 SQL 文本的只有 `order_col` / `order_dir` 两个受控字面量。
 //!
 //! - 规则1：工单状态仍是 PROGRAMMING（兼容旧 `GET /parts/pending-programming` 筛选）
 //! - 规则2：工单绑定的工艺链上有任一 `is_cnc` 工序 step（编程员据此进生产流）
@@ -80,9 +84,10 @@
 //!
 //! ## SQL 拼接策略
 //! 走 `sqlx::QueryBuilder`（与 `part/repo/sql/pending_programming_sql.rs` 同形）：
-//! 固定骨架（FROM / WHERE / 白名单列名）走 `push` / `format!` 嵌入，动态入参走
-//! `push_bind`。**不**使用 `query!` / `query_as!` 宏（动态 SQL 无法在编译期
-//! 固化，且会污染 `.sqlx/` 离线元数据），行结构手动 `#[derive(sqlx::FromRow)]`。
+//! 固定骨架（FROM / WHERE）与**已白名单化的**排序列名走 `push` / `format!` 嵌入，
+//! 动态入参走 `push_bind`。**不**使用 `query!` / `query_as!` 宏（动态 SQL 无法在
+//! 编译期固化，且会污染 `.sqlx/` 离线元数据），行结构手动
+//! `#[derive(sqlx::FromRow)]`。
 //!
 //! ## 错误类型
 //! repo 静态方法 → `sqlx::Error`（与项目惯例一致），由 service 层映射 `AppError`。
@@ -168,13 +173,23 @@ const WHERE_SKELETON: &str = " WHERE p.deleted_at IS NULL \
 /// 列表入参（service 层规范化后传入 repo）。
 ///
 /// 独立 struct，不污染其它域的 Filters 类型。`keyword` / `serial_no` 在 service
-/// 层已 trim 且把空串收敛成 `None`。
-#[derive(Debug, Clone, Default)]
-pub struct ProgrammingFilters {
+/// 层已 trim 且把空串收敛成 `None`；排序项收的是**已白名单化的列名 / 方向**
+/// （`p.planned_delivery_date` / `ASC` 这类字面量），映射在 service 层的
+/// `resolve_order_col` / `resolve_order_dir` 完成 —— repo 收到的字段或已规范化、
+/// 或以 `push_bind` 传参，拼进 SQL 文本的只有 `order_col` / `order_dir` 两个受控
+/// 字面量。
+///
+/// 刻意**不**派生 `Default`：`Default` 会造出 `order_col = ""` / `order_dir = ""`，
+/// 一旦被 `..Default::default()` 用上就生成 `ORDER BY  NULLS LAST` → 运行期 SQL
+/// 语法错 500。调用方必须逐字段显式填（service 层的两个 `resolve_*` 兜底）。
+#[derive(Debug, Clone)]
+pub struct ProgrammingFilters<'a> {
     pub keyword: Option<String>,
     pub serial_no: Option<String>,
-    pub sort_by: Option<String>,
-    pub sort_dir: Option<String>,
+    /// 已白名单化的排序列名。
+    pub order_col: &'a str,
+    /// 已白名单化的排序方向：`"ASC"` / `"DESC"`。
+    pub order_dir: &'a str,
     pub limit: i64,
     pub offset: i64,
     pub has_cnc_program: Option<bool>,
@@ -186,7 +201,7 @@ impl ProgrammingRepo {
     /// 返回 `Vec<ProgrammingRow>` —— service 内转换为 `vo::ProgrammingItemOut`。
     pub async fn list(
         conn: &mut PgConnection,
-        f: &ProgrammingFilters,
+        f: &ProgrammingFilters<'_>,
     ) -> Result<Vec<ProgrammingRow>, sqlx::Error> {
         let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(format!(
             "SELECT p.id, p.version, p.serial_no, p.name, p.drawing_no, p.quantity, \
@@ -198,9 +213,9 @@ impl ProgrammingRepo {
         ));
         push_where(&mut qb, f);
 
-        let (order_col, order_dir) = order_by(f);
         qb.push(format!(
-            " ORDER BY {order_col} {order_dir} NULLS LAST, p.id DESC LIMIT "
+            " ORDER BY {} {} NULLS LAST, p.id DESC LIMIT ",
+            f.order_col, f.order_dir
         ));
         qb.push_bind(f.limit);
         qb.push(" OFFSET ");
@@ -213,7 +228,7 @@ impl ProgrammingRepo {
     /// 列表配套 COUNT（与 `list` 共用 [`push_where`] 与 [`FROM_SQL`]）。
     pub async fn count(
         conn: &mut PgConnection,
-        f: &ProgrammingFilters,
+        f: &ProgrammingFilters<'_>,
     ) -> Result<i64, sqlx::Error> {
         let mut qb: QueryBuilder<Postgres> =
             QueryBuilder::new(format!("SELECT COUNT(*)::bigint AS n {FROM_SQL}"));
@@ -232,7 +247,7 @@ impl ProgrammingRepo {
 ///
 /// 注：本仓 sqlx 为 0.9，`QueryBuilder<DB>` 已无生命周期参数（0.7 时代是
 /// `QueryBuilder<'_, DB>`），故签名写作 `&mut QueryBuilder<Postgres>`。
-fn push_where(qb: &mut QueryBuilder<Postgres>, f: &ProgrammingFilters) {
+fn push_where(qb: &mut QueryBuilder<Postgres>, f: &ProgrammingFilters<'_>) {
     qb.push(WHERE_SKELETON);
 
     // 段②：has_cnc_program 三态（None → 恒真不过滤；Some → EXISTS 结果相等）
@@ -282,28 +297,6 @@ fn escape_like(raw: &str) -> String {
         out.push(ch);
     }
     out
-}
-
-/// 排序白名单（Rust 侧 `match` 兜底，杜绝 SQL 注入面）。
-///
-/// 未命中 / 缺省 → `p.planned_delivery_date`；方向仅识别 `DESC`（大小写不敏感），
-/// 其余一律 `ASC`。
-fn order_by(f: &ProgrammingFilters) -> (&'static str, &'static str) {
-    let col = match f.sort_by.as_deref().unwrap_or("") {
-        "CREATED_AT" => "p.created_at",
-        "UPDATED_AT" => "p.updated_at",
-        "PLANNED_DELIVERY_DATE" => "p.planned_delivery_date",
-        "REQUEST_DATE" => "p.request_date",
-        "SERIAL_NO" => "p.serial_no",
-        "DRAWING_NO" => "p.drawing_no",
-        "NAME" => "p.name",
-        _ => "p.planned_delivery_date",
-    };
-    let dir = match f.sort_dir.as_deref().unwrap_or("") {
-        d if d.eq_ignore_ascii_case("DESC") => "DESC",
-        _ => "ASC",
-    };
-    (col, dir)
 }
 
 /// `list` 的行结构（`FromRow`，手写而非 `query_as!` —— SQL 动态拼装）。

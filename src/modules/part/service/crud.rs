@@ -12,8 +12,10 @@
 //!
 //! ## helpers（pub(super)，供 batch.rs 复用）
 //! - `map_create_error` —— sqlx 错误码 → 业务错误码
-//! - `expand_customer_id` —— L1+L2 客户 id 展开
 //! - `lookup_customer_names` —— 取客户名 + L1 名
+//!
+//! 客户 id 展开（L1+L2）见 [`crate::shared::customer`]：`part` /
+//! `com::union_list` / `prod::batch` 三域共用那一份实现。
 //!
 //! 2026-09-22 D-6 重构：方法签名 `<R: PartRepoTrait>`（by-value；trait 已直接
 //! `impl for &mut PgConnection`）。生产 `R = &mut PgConnection`，handler/service
@@ -41,6 +43,7 @@ use crate::modules::part_file::policy; // 2026-09-11 新增：kind → 扩展名
 use crate::modules::part_file::repo::{NewPartFile, PartFileRepo, hash_bytes};
 use crate::modules::prod::batch::repo::{NewInitialBatch, PartBatchRepo};
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
+use crate::shared::customer::expand_customer_id;
 use crate::shared::error::{AppError, code};
 use crate::state::AppState;
 
@@ -56,7 +59,7 @@ use crate::modules::part::dto_crud::{
 ///
 /// 仅本 crate 可见：`get_part_batches_by_serial` 用 `sqlx::query_as!` 接收
 /// `t_part` 的窄字段（id + 8 列），避免读 28 列 `TPart`。由
-/// `PartScanInfoOut::from` 转 DTO，转换实现位于 `src/modules/part/dto.rs`
+/// `PartScanInfoOut::from` 转 DTO，转换实现位于 `src/modules/part/dto_crud.rs`
 /// （与 DTO 同处，便于维护）。
 #[derive(sqlx::FromRow)]
 pub(crate) struct TPartScanRow {
@@ -842,48 +845,6 @@ pub(super) fn map_create_error(e: sqlx::Error) -> AppError {
         );
     }
     AppError::from(e)
-}
-
-/// 展开 `customer_id` 为 `[id]`（含自身 + 子节点）。
-///
-/// 语义：
-/// - L1 客户（无 parent_id）→ 自身 + 全部 L2 子节点 ids
-/// - L2 客户（有 parent_id）→ 自身 + 同 L1 下所有兄弟 L2 ids
-pub(crate) async fn expand_customer_id(
-    conn: &mut PgConnection,
-    cid: i64,
-) -> Result<Vec<i64>, AppError> {
-    let row: Option<(i64, Option<i64>)> =
-        sqlx::query_as("SELECT id, parent_id FROM t_customer WHERE id = $1 AND deleted_at IS NULL")
-            .bind(cid)
-            .fetch_optional(&mut *conn)
-            .await?;
-    let (_id, parent_id) = row.ok_or_else(|| {
-        AppError::biz(
-            code::BIZ_CUSTOMER_NOT_FOUND,
-            format!("customer {cid} 不存在"),
-        )
-    })?;
-    if let Some(p) = parent_id {
-        let mut rows: Vec<i64> = sqlx::query_scalar(
-            "SELECT id FROM t_customer WHERE parent_id = $1 AND deleted_at IS NULL",
-        )
-        .bind(p)
-        .fetch_all(&mut *conn)
-        .await?;
-        if !rows.contains(&cid) {
-            rows.push(cid);
-        }
-        Ok(rows)
-    } else {
-        sqlx::query_scalar(
-            "SELECT id FROM t_customer WHERE (parent_id = $1 OR id = $1) AND deleted_at IS NULL",
-        )
-        .bind(cid)
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(Into::into)
-    }
 }
 
 /// 取客户名 + L1 名（用于 `PartDetailOut` / `PartListItem` 冗余字段）。
