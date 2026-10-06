@@ -1,32 +1,28 @@
 //! part 域 lifecycle / 状态机扩展 handler
 //!
-//! 对应 Phase 1（2026-09-13）+ 4 个终态流转 + Phase 2（2026-09-13）pick-up：
-//! - 1.1 上架 / 召回（place-on-shelf / recall-to-pending）
-//! - 1.2 CNC 编程流转（release-from-programming / pending-programming 列表）；
-//!   2026-09-29 端点下线：send-to-programming / recall-to-programming 已删除
-//! - 1.3 外协流转（send-to-outsource / receive-from-outsource /
-//!   receive-from-outsource-to-inspection）—— **2026-10-02 已随批次用例迁往
-//!   `prod::batch`**；配套的 2 条外协 list 端点（`/outsource-in-flight` /
-//!   `/outsource-sendable`）于 2026-10-03 因**返回形状与前端外协域不匹配**一并
-//!   下线，取代者见 `outsource` 域的 `/outsource-shipments/in-flight` 与
-//!   `/outsource-sendable`
-//! - 1.4 返修闭环（complete-repair / repair-dispatch / repair-batches /
-//!   repairing-batches 列表）
-//! - 1.5 批次拆分 / 取消（split-batch / cancel-batch）
-//! - 终态（deliver / cancel / complete / start-repair）
-//! - Phase 2（pick-up 手动领取）
+//! 本文件只服务 part 维度的 2 条写端点 + 3 条批次行 list 端点：
+//! - `POST /api/v2/parts/{part_id}/cancel`
+//! - `POST /api/v2/parts/{part_id}/force-complete`
+//! - `GET /api/v2/parts/by-work-type/{work_type_id}`
+//! - `GET /api/v2/parts/pickable-by-work-type/{work_type_id}`
+//! - `GET /api/v2/parts/by-worker/{worker_id}`
+//!
+//! 以**单个批次**为操作对象的端点不在 part 域：deliver / complete /
+//! place-on-shelf / recall-to-pending / split-batch / cancel-batch /
+//! release-from-programming / 外协 3 条 / 返修 2 条 / start-repair / pick-up，
+//! 见 `crate::modules::prod::batch::handler::lifecycle`（URL 挂
+//! `/api/v2/prod/batches/*`）—— 批次级动作按批次做权限与状态机判定更贴合语义，
+//! 留在 part 域会让「谁有资格翻状态」这件事跨两个域分裂。
 //!
 //! WS 广播：commit 之后广播（对齐 Python 延迟广播模式）；事件名与 Python 一致。
 //!
 //! ## 权限模式
-//! - deliver / cancel / complete / place-on-shelf / recall-to-pending /
-//!   split-batch / cancel-batch：Manager + Clerk
-//! - release-from-programming：Manager + CncProgrammer
-//! - send-to-outsource / receive-from-outsource /
-//!   receive-from-outsource-to-inspection / complete-repair / repair-dispatch：
-//!   Manager + Clerk + Inspector
-//! - start-repair：Manager + Clerk + Inspector
-//! - force-complete（2026-09-30 新增）：**Manager 单角色** —— 逃生通道，明确不下放 Clerk
+//! - cancel：`require_any_role([Manager, Clerk])` —— 撤销属仓库动作，放开 Clerk
+//! - force-complete：`require_role(Manager)` —— 逃生通道（绕状态机强推），明确
+//!   不下放 Clerk
+//! - 3 条 list 端点：handler 层不设闸门，角色闸门在 service 层
+//!   （`require_any_role([Manager, Clerk, Inspector, ShelfAccount])`）；其中
+//!   pickable 额外按 `pickable_shelf_scope` 收窄货架范围，另两条不做货架收窄
 
 use std::sync::Arc;
 
@@ -96,23 +92,6 @@ pub async fn force_complete(
         "PART_FORCE_COMPLETED",
         json!({ "part_id": part_id.to_string() }),
     );
-    Ok(Json(R::ok(out)))
-}
-
-/// `GET /api/v2/parts/pending-programming`
-///
-/// 2026-09-22 PR5：只读 list 端点改 `pool.acquire()`。
-///
-/// 2026-09-29：基于 `t_process.is_cnc` 列的新过滤规则 + `has_cnc_program?` query 参数
-/// （Tab 切换）；详见 service `PartService::list_pending_programming` 与 docs
-/// `docs/api/parts/lifecycle.md`。
-pub async fn list_pending_programming(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Query(query): Query<crate::modules::part::dto_crud::PendingProgrammingQuery>,
-) -> Result<Json<R<PartListOut>>, AppError> {
-    let mut conn = state.pool.acquire().await?;
-    let out = PartService::list_pending_programming(&mut *conn, &query, &current).await?;
     Ok(Json(R::ok(out)))
 }
 

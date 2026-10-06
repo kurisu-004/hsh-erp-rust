@@ -39,19 +39,16 @@
 //! [`ProgrammingFilters::order_dir`] 传进来 —— repo 收到的字段或已规范化、或以
 //! `push_bind` 传参，拼进 SQL 文本的只有 `order_col` / `order_dir` 两个受控字面量。
 //!
-//! - 规则1：工单状态仍是 PROGRAMMING（兼容旧 `GET /parts/pending-programming` 筛选）
+//! - 规则1：工单状态仍是 PROGRAMMING（该状态仍允许消化）
 //! - 规则2：工单绑定的工艺链上有任一 `is_cnc` 工序 step（编程员据此进生产流）
 //! - 规则3：工单存在在制批次，其当前工序就是 CNC 工序（链可能还没建，先由批次定位）
 //!
-//! ## ⚠️ part 状态闸门约束**全部三条规则**（2026-10-01 review 第 1 轮 A 项）
+//! ## ⚠️ part 状态闸门约束**全部三条规则**
 //! `p.status IN ('PENDING','IN_PROCESS','PROGRAMMING')` 写在 `WHERE` 骨架最外层
 //! （与 `p.deleted_at IS NULL` 同级、在三规则括号**之外**），因此规则2/3 同样受其约束。
 //! 起因：`t_part.process_chain_id` **从不清空**，而规则2（链含 CNC 工序）本身不看
 //! part 状态 → 历史上挂过 CNC 链的 `COMPLETED` / `CANCELLED` / `DELIVERED` /
-//! `READY_TO_SHIP` 工单会**永久**命中「待编程一览」。被替换的 part 域旧端点
-//! （`part/repo/sql/pending_programming_sql.rs`）本来就有这条闸门，且有回归测试
-//! `tests/part/lifecycle.rs::list_pending_programming_excludes_completed_or_cancelled`
-//! 锁住 —— 新端点不允许比旧端点更宽。
+//! `READY_TO_SHIP` 工单会**永久**命中「待编程一览」。
 //! 回归测试：`tests/production/pending_programming.rs::part_status_gate_excludes_completed_and_delivered`。
 //!
 //! ## ⚠️ 规则3 必须用 `t_part_batch.current_process_id`（2026-10-01）
@@ -66,8 +63,8 @@
 //!
 //! ## `has_cnc_program` 真相源
 //! [`G_CODE_EXISTS`] —— `EXISTS (SELECT 1 FROM t_part_file WHERE part_id = p.id
-//! AND kind = 'G_CODE' AND deleted_at IS NULL)`，与 part 域旧端点 / worker_pool
-//! 候选池同源。**同一常量**同时供 list 的 SELECT 列表与 WHERE 过滤复用（见该常量
+//! AND kind = 'G_CODE' AND deleted_at IS NULL)`，与 worker_pool 候选池同源。
+//! **同一常量**同时供 list 的 SELECT 列表与 WHERE 过滤复用（见该常量
 //! doc 的改一同步二约定）。
 //!
 //! ## 批次锚点（2026-10-03 新增）
@@ -78,16 +75,13 @@
 //!
 //! ## list / count 共用谓词
 //! 两个方法共用私有 [`push_where`]（WHERE 骨架 + `has_cnc_program` + keyword +
-//! `serial_no` 四段）与常量 [`FROM_SQL`]。旧端点把同一段谓词手抄两遍（list 一份、
-//! count 一份），改一处漏一处就会让 `total` 与 `items` 对不上；本文件从结构上
-//! 杜绝这种漂移。
+//! `serial_no` 四段）与常量 [`FROM_SQL`]：谓词只写一份，list 与 count 不可能各自
+//! 漂移出「`total` 与 `items` 对不上」的组合。
 //!
 //! ## SQL 拼接策略
-//! 走 `sqlx::QueryBuilder`（与 `part/repo/sql/pending_programming_sql.rs` 同形）：
-//! 固定骨架（FROM / WHERE）与**已白名单化的**排序列名走 `push` / `format!` 嵌入，
-//! 动态入参走 `push_bind`。**不**使用 `query!` / `query_as!` 宏（动态 SQL 无法在
-//! 编译期固化，且会污染 `.sqlx/` 离线元数据），行结构手动
-//! `#[derive(sqlx::FromRow)]`。
+//! 走 `sqlx::QueryBuilder`：固定骨架（FROM / WHERE / 白名单列名）走 `push` / `format!` 嵌入，
+//! 动态入参走 `push_bind`。**不**使用 `query!` / `query_as!` 宏（动态 SQL 无法在编译期
+//! 固化，且会污染 `.sqlx/` 离线元数据），行结构手动 `#[derive(sqlx::FromRow)]`。
 //!
 //! ## 错误类型
 //! repo 静态方法 → `sqlx::Error`（与项目惯例一致），由 service 层映射 `AppError`。

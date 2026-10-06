@@ -44,12 +44,9 @@ pub struct PartRepo;
 pub mod event_sql;
 pub mod helper_sql;
 pub mod part_sql;
-/// 2026-09-29 新增：`pending-programming` 列表专用 SQL（基于 `t_process.is_cnc`）。
-pub mod pending_programming_sql;
 
 // 重导出保留原路径兼容（part/repo/mod.rs 已 `pub use sql::{...}`，继续穿透）。
 pub use helper_sql::scale_qty;
 pub use part_sql::{
     AssemblyMatchRow, ChildInheritFields, NewPartCreate, PartListFilters, PartUpdate,
 };
-pub use pending_programming_sql::{PendingProgrammingFilters, PendingProgrammingItem};

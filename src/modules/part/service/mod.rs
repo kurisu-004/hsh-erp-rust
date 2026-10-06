@@ -15,8 +15,7 @@
 //!   location_tree / batch_with_pdfs / batch_update_order_info）
 //! - `phase1/excel_match.rs`：采购订单 Excel 匹配（2026-10-06 新增，从
 //!   `events.rs` 迁出；含分档决策纯函数 `resolve_match_tier`）
-//! - `phase1/lifecycle_helpers.rs`：待编程一览 + 批次列表（list_pending_programming /
-//!   list_batches）
+//! - `phase1/lifecycle_helpers.rs`：批次列表（list_batches）
 //! - `phase1/work_type.rs`：工种维度只读端点（list_by_work_type /
 //!   list_pickable_by_work_type / list_by_worker）
 //! - `rollup.rs`：rollup 工具（sync_from_batch_change）

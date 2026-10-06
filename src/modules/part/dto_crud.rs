@@ -288,29 +288,6 @@ pub struct ByWorkerQuery {
     pub offset: Option<i64>,
 }
 
-/// `GET /parts/pending-programming` 入参（query，2026-09-29 扩展）。
-///
-/// 沿用 [`PartListQuery`] 的所有分页 / 排序字段；新增 `has_cnc_program` 过滤
-/// （Tab 切换）：`true` = 已上传 G_CODE 的工单；`false` = 待编程（G_CODE 未上传）；
-/// 缺省 / `None` = 全部。
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct PendingProgrammingQuery {
-    #[serde(default)]
-    pub keyword: Option<String>,
-    #[serde(default)]
-    pub sort_by: Option<String>,
-    #[serde(default)]
-    pub sort_dir: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_i64_opt")]
-    pub limit: Option<i64>,
-    #[serde(default, deserialize_with = "deserialize_i64_opt")]
-    pub offset: Option<i64>,
-    /// 2026-09-29 新增：是否已上传 G_CODE 数控程序。`None` 不限；`Some(true)` 仅已上传；
-    /// `Some(false)` 仅未上传。Tab 切换用。
-    #[serde(default)]
-    pub has_cnc_program: Option<bool>,
-}
-
 // ===== 文件 / Excel 工具 =====
 
 /// `POST /parts/batch-with-pdfs` multipart 入参：JSON + PDFs。

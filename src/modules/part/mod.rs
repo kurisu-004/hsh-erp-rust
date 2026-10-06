@@ -53,7 +53,7 @@ use crate::state::AppState;
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         // ★ 静态段必须在 /{part_id}/... catch-all 之前注册，
-        //   否则 axum 会把静态段（如 `batch`、`by-serial`、`pending-programming`）
+        //   否则 axum 会把静态段（如 `batch`、`by-serial`）
         //   解析成 part_id。
         // ---- 列表 / 静态段 ----
         .route("/", get(handler::list_parts).post(handler::create_part))
@@ -64,10 +64,6 @@ pub fn router() -> Router<Arc<AppState>> {
             get(handler::get_by_serial_part_batches),
         )
         // ---- Phase 1（2026-09-13）静态段（在 {part_id} catch-all 之前注册）----
-        .route(
-            "/pending-programming",
-            get(handler::list_pending_programming),
-        )
         .route("/location-tree", get(handler::get_location_tree))
         .route("/match-by-excel-items", post(handler::match_by_excel_items))
         .route(

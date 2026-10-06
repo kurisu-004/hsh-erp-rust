@@ -24,7 +24,7 @@ use crate::shared::error::AppError;
 
 use super::dto::ProgrammingListQuery;
 
-/// 默认分页大小（与 part 域 `pending-programming` 一致）。
+/// 默认分页大小。
 const DEFAULT_LIMIT: i64 = 50;
 
 /// 排序列白名单（`sort_by` → ORDER BY 列名）。

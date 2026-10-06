@@ -22,7 +22,7 @@ pub mod part_batch;
 pub use location_tree::{LocationTreeNodeOut, LocationTreeOut};
 pub use part::{
     ChainState, PartBatchListItemOut, PartDetailOut, PartEventOut, PartListItem, PartListOut,
-    PartOut, PendingProgrammingOut,
+    PartOut,
 };
 pub use part_batch::{
     BatchUpdateOrderInfoFailure, BatchUpdateOrderInfoOut, ExcelMatchType, MatchByExcelItemResult,
