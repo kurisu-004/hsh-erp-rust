@@ -165,7 +165,8 @@ impl ShelfProcessRepo {
     /// ## 为什么 JOIN 上 3 个谓词（zone 的判断依据）
     /// 唯一调用方是 `prod::batch::service::dispatch_single`，它把货架写死成
     /// `location='PRODUCTION_SHELF'` + `current_holder_id=shelf_id` + `status='IN_PROCESS'`
-    /// （`BatchRepo::update_batch_dispatched`），且只接 `status='PENDING'` 的批次
+    /// （`BatchRepo::update_batch_dispatched`），且只接待下发（`status ∈ {PENDING,
+    /// PROGRAMMING}`，2026-10-06 起含已废弃的 PROGRAMMING）的批次
     /// —— 品检流转（`scan_inspect` / `outsource::receive_*`）走的是另一套显式
     /// `target_inspection_shelf_id` + `validate_shelf_zone(.., "INSPECTION")` 路径，
     /// **不经过本方法**。故 `zone='PRODUCTION'` 与写入不变式一致，不会误伤品检。

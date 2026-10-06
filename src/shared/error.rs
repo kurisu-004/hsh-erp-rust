@@ -112,10 +112,15 @@ pub mod code {
     pub const BIZ_PART_NOT_READY_TO_SHIP: i32 = 20117; // deliver 操作要求零件当前为 READY_TO_SHIP
     pub const BIZ_PART_REPAIR_NOT_TRIGGERED: i32 = 20118; // start-repair 操作要求零件当前为 IN_PROCESS
     pub const BIZ_PART_NOT_DELETABLE: i32 = 20119; // 零件处于终态 (DELIVERED/COMPLETED) 或已挂送货单，禁 soft-delete
-    // 2026-09-29 新增：prod/batch 下发（dispatch）阶段专用错误码。
-    // - 20120 BIZ_BATCH_INVALID_STATUS：批次当前 status 不允许 dispatch（非 PENDING）
-    // - 20121 BIZ_BATCH_NOT_FOUND：dispatch 时按 batch_id 查不到（与 20109 BIZ_PART_BATCH_NOT_FOUND
-    //   语义近似但属于 prod/batch 上下文独立槽位，方便前端按 code 区分场景）
+    // 2026-09-29 新增：prod 域批次操作的状态 / 存在性错误码。批次下发
+    // （`prod::batch` dispatch）与工人池 move（`POST /api/v2/prod/pool/move`）
+    // 两个入口共用这一对码位。
+    // - 20120 BIZ_BATCH_INVALID_STATUS：批次当前 status 不允许该操作；白名单由各
+    //   调用点自定 —— dispatch 为待下发白名单（2026-10-06：含已废弃的
+    //   `PROGRAMMING`，与待下发列表同链路），`prod/pool/move` 为 `IN_PROCESS`
+    // - 20121 BIZ_BATCH_NOT_FOUND：按 batch_id 查不到该批次（不存在或已软删；
+    //   与 20109 BIZ_PART_BATCH_NOT_FOUND 语义近似但属 prod 域独立槽位，方便前端
+    //   按 code 区分场景）
     pub const BIZ_BATCH_INVALID_STATUS: i32 = 20120;
     pub const BIZ_BATCH_NOT_FOUND: i32 = 20121;
     // 2026-09-30 新增：prod/pool/move 路径专用错误码（prod 域工人池 9 端点重构）。

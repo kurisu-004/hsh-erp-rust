@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT COUNT(*) AS \"n!\"\n            FROM t_part_batch pb\n            JOIN t_part p\n              ON p.id = pb.part_id\n            WHERE pb.status IN ('PENDING', 'PROGRAMMING')\n              AND pb.deleted_at IS NULL\n              AND p.deleted_at IS NULL\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "n!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "fb0e6cad20de9d095db26c9ab3dd9f44406196484c4431bf10b3e694653dc21b"
+}
