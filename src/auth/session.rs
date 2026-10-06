@@ -59,7 +59,6 @@ pub enum TokenKind {
 /// 线上已存在的 Redis session entry（JSON 含 `cached` 字段）反序列化会失败，
 /// 上线前需清空 Redis session DB（`FLUSHDB` 或选择性删除 `session:tok:*`），
 /// 否则已登录用户在 session TTL（默认 15min / 900s）内持续 5xx（50000 INTERNAL）。
-/// 详见 `docs/api/index.md`「部署顺序」段。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedSession {
     pub user_id: i64,

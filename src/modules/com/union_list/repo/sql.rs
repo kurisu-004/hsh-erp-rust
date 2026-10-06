@@ -79,14 +79,19 @@
 //! - `keyword` 走 ILIKE 三列 OR（name / drawing_no / serial_no），DDL 上无
 //!   trigram 索引，单段可能 seq scan；客户筛选缩窄后命中索引覆盖。
 //!
-//! ## 排序键白名单
+//! ## 排序键白名单（两层，两层都要认全键）
 //! CREATED_AT / UPDATED_AT / PLANNED_DELIVERY_DATE / REQUEST_DATE /
 //! SYSTEM_DELIVERY_DATE / DRAWING_NO / NAME（7 键，逐键对齐 `part/repo/sql/
 //! part_sql.rs::order_col` 去掉 `SERIAL_NO` 的子集 —— `t_assembly` 上无该列）；
 //! 非法值降级 `id`。`SYSTEM_DELIVERY_DATE` 是 dashboard 交期下钻与「最紧急工单」
-//! 的排序语义锚，缺它即静默退化成建单序。`docs/api/com-union-list.md` 的
-//! 「`sort_by` 有两层白名单」块以本节与 `order_col` 为第 2 层的权威来源，
-//! 两处必须逐键对齐。
+//! 的排序语义锚，缺它即静默退化成建单序。
+//!
+//! ⚠️ `sort_by` 要过**两层白名单**，任一层漏认某个键，该键就在该段静默退化成
+//! 建单序（不报错）：① 第 1 层是 service 的 `parse_filters`（`com/union_list/
+//! service/crud.rs`，7 键，拒 → 降级 `CREATED_AT`）；② 第 2 层是本文件的
+//! `union_sort_col`（拒 → 降级 `id`）。ALL 段走本文件，`PART` / `PART_FLAT` 段走
+//! `part/repo/sql/part_sql.rs::order_col`。两处白名单必须逐键对齐 —— 见该文件
+//! `list_with_filters` 的说明。
 //!
 //! ## 函数签名
 //! - `list_union_all_with_filters`：接收 12 个扁平形参（避免

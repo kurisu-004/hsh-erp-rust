@@ -23,7 +23,7 @@
 //! - `GET  /wx/batches?tab=in_progress|done&period=&page=&size=` —— 批次卡片分页
 //! - `GET  /wx/worker/stats?period=YYYY-MM` —— 当月工人工作量
 //!
-//! API 参考见 [`docs/api/wx.md`](../../../docs/api/wx.md)。
+//! 端点清单即契约（本节即全文契约载体）。
 //!
 //! ## 企业微信登录方案（2026-09-29 落地）
 //! - 身份源 = 企业微信 **userid**（不是微信 openid）：小程序只在企业微信客户端内打开

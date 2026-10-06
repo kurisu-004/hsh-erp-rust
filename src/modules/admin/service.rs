@@ -172,7 +172,7 @@ fn split_truncated(mut ids: Vec<i64>, limit: i64) -> (Vec<i64>, bool) {
 /// ⚠️ 已终态（COMPLETED / CANCELLED）的 part **不参与**对账：`update_part_rollup`
 /// 带终态守卫（B1），派生层不会覆盖主操作写下的终态。这种行**不是**「已一致」，
 /// 而是被守卫**跳过** —— 故经 [`PartRecompute::terminal_skip`] 上抛，由报告显式
-/// 计数（2026-10-01 review 第 2 轮 MAJOR-1）。详见 `docs/api/admin.md`。
+/// 计数。
 pub async fn recompute_part(
     conn: &mut PgConnection,
     part_id: i64,

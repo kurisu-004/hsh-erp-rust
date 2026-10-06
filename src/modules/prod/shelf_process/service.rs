@@ -90,17 +90,17 @@ impl ShelfProcessService {
     ///
     /// **收紧的副作用（已知且接受）**：对品检架（或任何非 PRODUCTION 区货架）调本端点
     /// 且 `items` **非空**时现在返 `20104`。这是刻意的 fail-fast：让配置错误在**写侧**
-    /// 暴露，而不是继续静默产出漏件批次。存量非法行的排查 SQL（只读）见
-    /// `docs/api/production/shelf-process-mapping.md` 的「只读诊断 SQL」一节；**本仓不
-    /// 自动修数据**，修复走独立的数据修复单。
+    /// 暴露，而不是继续静默产出漏件批次。存量非法行**本仓不自动修数据**，修复走独立
+    /// 的数据修复单（本仓也没有登记这些行的只读诊断 SQL，改前先按上面三个谓词
+    /// （`deleted_at IS NULL` / `is_active` / `zone = 'PRODUCTION'`）自行捞行）。
     ///
-    /// ## 2026-10-04 review 第 1 轮 B1：`items: []`（清空）豁免 zone / is_active 守卫
+    /// ## `items: []`（清空）豁免 zone / is_active 守卫
     /// 守卫只对「**要写新 mapping 行**」的请求生效，`items.is_empty()` 时跳过。理由：
     /// 清空只会 `soft_delete_all_for_shelf`，**不新增任何非法映射**，拦它零收益；反过来，
     /// 无条件守卫会让**存量非法映射失去唯一的 API 清理路径** —— 整组替换语义下改不了
     /// 其中一条，而 `ShelfUpdateRequest` 只有 `name` / `location`（`zone` 不可经 API 改），
-    /// 也就没有「先把架改成 PRODUCTION 再清映射」这条绕路。结果是「只读诊断 SQL ② 列出的
-    /// 行，在本仓找不到任何 API 能清掉」，诊断与处置自相矛盾。
+    /// 也就没有「先把架改成 PRODUCTION 再清映射」这条绕路 —— 结果是「按上面三个谓词
+    /// 捞出的非法行，在本仓找不到任何 API 能清掉」，诊断与处置自相矛盾。
     /// 存在性（20501）仍无条件守：货架不存在/已软删时清空也无意义（`get_by_id` 带
     /// `deleted_at IS NULL`，否则会静默「成功」一个对已删货架的空操作）。
     /// 回归见 `tests/production/shelf_process.rs::set_shelf_processes_allows_clearing_inspection_zone_mappings`。
@@ -122,13 +122,13 @@ impl ShelfProcessService {
         // `validate_shelf_zone`，与 place_on_shelf / pickup / outsource 等生产流
         // 端点**同源同码**：20501 → 20512 → 20104，不另造判定）。
         //
-        // ⚠️ 2026-10-04 review 第 1 轮 B1：守卫**只对「要写新 mapping 行」的请求生效**，
+        // ⚠️ 守卫**只对「要写新 mapping 行」的请求生效**，
         // `items` 为空（清空）时跳过。存在性（20501）仍在下方无条件守。
         //
         //   为什么不拦清空：清空只 `soft_delete_all_for_shelf`，不新增任何非法映射，
         //   拦它零收益；无条件守卫会让存量非法映射**失去唯一的 API 清理路径**（整组
         //   替换改不了其中一条，且 `ShelfUpdateRequest` 无 `zone` 字段、换不了区），
-        //   于是「只读诊断 SQL ② 列出的行在本仓清不掉」，诊断与处置自相矛盾。
+        //   于是「按那三个谓词捞出的非法行在本仓清不掉」，诊断与处置自相矛盾。
         //
         //   为什么仍守存在性：货架不存在/已软删时清空也无意义，放行会变成对已删货架的
         //   静默空操作（`ShelfRepo::get_by_id` 带 `deleted_at IS NULL`）。

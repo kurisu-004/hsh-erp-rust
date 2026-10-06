@@ -5,7 +5,7 @@
 //! （入参归一化 / corp_id 回退 / 长度上限 / 空数组读端点），两者合起来覆盖
 //! A10 端点的全部可机械核对项。
 //!
-//! 端点形态（详见 `docs/api/iam.md`）：
+//! 端点形态（服务层校验分支见 `src/modules/iam/service/account.rs`）：
 //! - `POST   /api/v2/iam/users/{id}/wx-bind` —— 绑定（幂等；跨账号 → 40108）
 //! - `GET    /api/v2/iam/users/{id}/wx-bind` —— 查该用户全部绑定
 //! - `DELETE /api/v2/iam/users/{id}/wx-bind` —— 解绑（幂等；无绑定 → 空数组）

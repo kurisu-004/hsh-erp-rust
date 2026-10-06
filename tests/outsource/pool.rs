@@ -556,9 +556,9 @@ async fn get_sendable(app: &axum::Router, token: &str) -> (StatusCode, Value) {
 /// 只取状态码 + 原始 body（不解析 JSON）。
 ///
 /// axum 的 `QueryRejection`（query 反序列化失败）返回的是**纯文本** 400，不走
-/// `R<T>` 信封 —— 与 `docs/api/inconsistencies.md` § 9.2 记的「旧路径返回纯文本
-/// 400」是同一个 axum 层行为。因此断言「缺参数必须 400」不能用共享的 `send`
-/// （它强制解析 JSON，非 JSON body 会 panic）。
+/// `R<T>` 信封 —— 与 part 域旧路径被 `Path<i64>` catch-all 兜成纯文本 400 是同一
+/// 个 axum 层行为（成因见 `src/modules/part/mod.rs` 的模块 doc）。因此断言「缺参数
+/// 必须 400」不能用共享的 `send`（它强制解析 JSON，非 JSON body 会 panic）。
 async fn get_raw(app: &axum::Router, token: &str, uri: &str) -> (StatusCode, String) {
     use tower::ServiceExt;
     let response = app

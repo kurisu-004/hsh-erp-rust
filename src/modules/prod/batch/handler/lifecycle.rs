@@ -364,8 +364,8 @@ pub async fn pick_up(
     //
     // ⚠️ 2026-10-03 订正：本事件**不是**「与 split_batch 端点同形」。两处共用
     // `part_id` / `new_batch_id` 两个字段名（消费方唯一可无条件依赖的部分），
-    // 后两个是本处的增量字段。同一事件名两种 payload 的完整对照见
-    // `docs/api/websocket.md#part_batch_split-双-payload2026-10-03-订正`。
+    // 后两个是本处的增量字段。同一事件名两种 payload 的完整对照见本文件
+    // `split_batch` 与 `pick_up` 两个 handler 里的 `ws_broadcast` 调用。
     if let Some(split) = outcome.split.as_ref() {
         ws_broadcast(
             &state,

@@ -157,9 +157,9 @@ impl ShelfProcessRepo {
     /// 报工台取件页数据源（`part::service::phase1::work_type` 的 pickable-by-work-type）
     /// 的取行 SQL 硬限定 `JOIN t_shelf sh ON sh.id = b.current_holder_id
     /// AND sh.is_active = true AND sh.zone = 'PRODUCTION'`，故这种批次永远不会出现在
-    /// 工人的可领列表里。历史脏数据排查 SQL 见
-    /// [`docs/api/production/shelf-process-mapping.md`](../../../../docs/api/production/shelf-process-mapping.md)
-    /// 的「只读诊断 SQL」一节（只读，不自动修数据）。
+    /// 工人的可领列表里。历史脏数据**本仓不自动修**，修复走独立的数据修复单；
+    /// 排查时按本方法收窄前的三个谓词（`t_shelf_process.deleted_at IS NULL` /
+    /// `t_shelf.is_active` / `t_shelf.zone = 'PRODUCTION'`）自行捞行。
     ///
     /// ## 为什么 JOIN 上 3 个谓词（zone 的判断依据）
     /// 唯一调用方是 `prod::batch::service::dispatch_single`，它把货架写死成
