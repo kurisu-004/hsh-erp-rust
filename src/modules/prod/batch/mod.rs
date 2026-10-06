@@ -36,8 +36,8 @@
 //! `repo/list.rs` / `service/list.rs`）整体迁往 `prod::inspection`，新路径
 //! `GET /api/v2/prod/inspection/queue`，**无 alias**。理由：该页面的两个数据源
 //! （队列列表 + 扫码树）本就同属一个页面，迁后 `prod::inspection` 零跨域依赖、
-//! 可被域隔离护栏完整覆盖。**本域的 repo 层不再持有任何集合读 SQL**：`/repair` /
-//! `/repairing` 两条集合读在 service 层直接构造 VO。
+//! 可被域隔离护栏完整覆盖。**返修两条集合读**（`/repair` / `/repairing`）的 SQL 在
+//! service 层自建、不在本域 repo 层。
 //!
 //! ## 路由表（24 条 + 本域原有 3 条）
 //!

@@ -18,14 +18,17 @@
 //! （`drawing_no` / `name` / `serial_no` / `customer_id` / `system_delivery_date_from|to`
 //! / `sort_by` / `sort_dir` / `limit` / `offset`）。前端配套改动在**前端仓**
 //! （`~/Code/hsh-erp/frontend`）由独立任务负责，共 3 类落点：
-//! - 1 处 URL 字面量：队列读的 api 封装 `listInspectionBatches` 连同整个 api 模块
-//!   从 `src/api/parts/batch.ts` 迁入 `src/api/inspection.ts`，URL 字面量
+//! - 1 处 URL 字面量：队列读的 api 封装 `listInspectionBatches` 与其行 / 入参类型
+//!   并入既有的 `src/api/inspection.ts`（该模块此前已承载扫码端点），URL 字面量
 //!   `/prod/batches/inspection` → `/prod/inspection/queue`；
 //! - 1 处单测路径断言：`src/api/parts/__tests__/routes.spec.ts` 里那条
 //!   `expect(...).toBe('/prod/batches/inspection')` 迁到新建的
-//!   `src/api/__tests__/inspection.contract.spec.ts`（该断言同时锁住扫码端点 URL）；
-//! - 9 个文件的注释引用旧路径（`src/composables/queries/{keys,schemas}.ts` /
-//!   `src/types/inspection.ts` / `src/views/inspection/**`），纯文案、不影响行为。
+//!   `src/api/__tests__/inspection.contract.spec.ts`（该 spec 里扫码端点 URL 是
+//!   独立的 Q4 断言）；
+//! - 6 个文件的注释引用旧路径（`src/composables/queries/{keys,schemas}.ts` /
+//!   `src/types/inspection.ts` / `src/views/inspection` 下的
+//!   `inspectionColumnDefs.ts` 与 `composables/{inspectionSchema,useInspectionQueueQuery}.ts`），
+//!   纯文案、不影响行为。
 //!
 //! 本次后端提交不含前端改动。
 //!

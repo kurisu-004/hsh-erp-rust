@@ -1045,9 +1045,9 @@ async fn inspection_batches_filters_by_system_delivery_date_range() {
 /// 角色守卫：白名单外的角色 → 403 / 40300 FORBIDDEN。
 ///
 /// brief 原话「Worker role」并不存在（本仓库 5 角色：Manager / Clerk / Inspector /
-/// CncProgrammer / ShelfAccount）。队列读白名单 = Manager + Inspector
-/// （`prod/inspection/service.rs` 的模块私有常量 `READ_ROLES`，集成测试拿不到，
-/// 故此处不复述其符号名），
+/// CncProgrammer / ShelfAccount）。队列读白名单 = Manager + Inspector，即
+/// `prod/inspection/service.rs` 的模块私有常量 `READ_ROLES`（取值 Manager +
+/// Inspector）；集成测试拿不到该私有项，故此处只描述取值、不做代码级引用。
 /// ShelfAccount 是「能登录但在白名单外」的唯一角色，故用它模拟越权。
 /// 守卫在 service 层第一行（`require_any_role`），**本文件是该守卫的唯一覆盖**。
 #[tokio::test]
