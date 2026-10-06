@@ -335,7 +335,20 @@ pub struct BatchWithPdfsRequest {
     pub note: Option<String>,
 }
 
-/// `POST /parts/match-by-excel-items` 入参：Excel 行（drawing_no 或 serial_no）→ 现有 part id。
+/// `POST /parts/match-by-excel-items` 入参：采购订单 Excel 明细行 → 候选零件。
+///
+/// 2026-10-06 重做：该端点的契约由前端「解析系统交期和订单号」对话框定义（本结构
+/// 此前对着一份从未实现过的富契约，线上表现为「每一行都判未匹配、候选 0、
+/// 提交按钮永久 disabled」）。要点：
+///
+/// - `row_no: i32` **必填**（`Option` 也不行）——它是响应的关联键，前端按它把
+///   结果挂回 Excel 行。
+/// - **不收** `delivery_date` / `unit_price` / `quantity`：前端 Excel 解析器
+///   `parseDateOrNull` 对无法识别的日期文本**原样透传**，声明 `Option<NaiveDate>`
+///   会让无法识别的文本把**整个请求**打成 400；且这 3 个字段后端完全用不到
+///   （系统交期由前端本地预填进 date-picker）。serde 默认忽略未知字段，
+///   前端继续发也无害。
+/// - **删掉** `serial_no`：前端从不发，采购订单 Excel 也没有该列。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct MatchByExcelItemsRequest {
     pub items: Vec<MatchByExcelItem>,
@@ -343,10 +356,15 @@ pub struct MatchByExcelItemsRequest {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct MatchByExcelItem {
+    /// Excel 行号（前端 1-based），响应按它回填。缺字段 ⇒ 整请求反序列化失败。
+    pub row_no: i32,
+    /// 订单行号，仅用于错误提示定位，不参与匹配。
+    #[serde(default)]
+    pub line_no: Option<String>,
+    /// Excel 物料代码 → 对 `t_part.drawing_no` / `t_assembly.drawing_no` 做精确匹配。
     #[serde(default)]
     pub drawing_no: Option<String>,
-    #[serde(default)]
-    pub serial_no: Option<String>,
+    /// Excel 订单物料描述 → 对 `t_part.name` / `t_assembly.name` 做精确匹配。
     #[serde(default)]
     pub name: Option<String>,
 }
@@ -361,11 +379,21 @@ pub struct BatchUpdateOrderInfoRequest {
 pub struct BatchUpdateOrderInfoItem {
     #[serde(deserialize_with = "deserialize_i64")]
     pub part_id: i64,
+    /// 乐观锁期望版本（由 match 端点原样回传）。
     pub version: i32,
+    /// 三态：缺省 = 不改该列；`null` = **清空成 NULL**；给值 = 写入。
+    ///
+    /// 2026-10-06 改用 `deserialize_some`：前端 date-picker 可清空，旧语义
+    /// （单层 `Option`，`None` 一律「不改」）下用户清空系统交期会**静默无效**。
+    /// 范本：assembly 域 `AssemblyUpdate`（`Option<Option<_>>` 同约定）。
+    #[serde(default, deserialize_with = "crate::shared::types::deserialize_some")]
+    pub order_no: Option<Option<String>>,
+    #[serde(default, deserialize_with = "crate::shared::types::deserialize_some")]
+    pub system_delivery_date: Option<Option<chrono::NaiveDate>>,
+    #[serde(default, deserialize_with = "crate::shared::types::deserialize_some")]
+    pub note: Option<Option<String>>,
+    /// 2026-10-06 新增：`Some(true)` 时本行**不写库**，只计入 `skipped_count`。
+    /// 前端对「候选非空但人工判定不该回填」的行用它跳过。
     #[serde(default)]
-    pub order_no: Option<String>,
-    #[serde(default)]
-    pub system_delivery_date: Option<chrono::NaiveDate>,
-    #[serde(default)]
-    pub note: Option<String>,
+    pub skip: Option<bool>,
 }

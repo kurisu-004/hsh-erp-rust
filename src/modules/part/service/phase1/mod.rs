@@ -10,8 +10,9 @@
 //! `PartListItem`，与前端外协域字段需求不匹配。取代者迁往 outsource 域。
 //!
 //! - `events.rs` 1.6 事件历史 + 位置树 + 1.8 批量创建增强（list_events /
-//!   location_tree / batch_with_pdfs / match_by_excel_items /
-//!   batch_update_order_info）
+//!   location_tree / batch_with_pdfs / batch_update_order_info）
+//! - `excel_match.rs` 采购订单 Excel 匹配（2026-10-06 新增，从 `events.rs` 迁出；
+//!   含分档决策纯函数 `resolve_match_tier` + 匹配索引 `ExcelMatchIndex`）
 //! - `lifecycle_helpers.rs` 待编程一览 + 批次列表（list_pending_programming /
 //!   list_batches）
 //! - `work_type.rs` 工种维度只读（list_by_work_type / list_pickable_by_work_type /
@@ -23,6 +24,7 @@
 #![allow(deprecated, clippy::too_many_arguments, clippy::type_complexity)]
 
 pub mod events;
+pub mod excel_match;
 pub mod lifecycle_helpers;
 pub mod work_type;
 

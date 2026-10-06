@@ -12,7 +12,9 @@
 //!   count_with_filters / list_by_assembly_id / insert_child_for_assembly /
 //!   cascade_sync_from_assembly / scale_children_quantity /
 //!   get_part_rollup_state / update_part_rollup /
-//!   clear_part_serial_no_when_completed / serial_prefix_for_customer）
+//!   clear_part_serial_no_when_completed / serial_prefix_for_customer /
+//!   list_match_parts_by_keys / list_match_assemblies_by_keys /
+//!   list_assembly_names_by_ids / update_order_info）
 //! - `event_sql.rs` —— `t_part_event` 表 SQL（insert_part_event）
 //! - `helper_sql.rs` —— 杂项 helper（`scale_qty` 缩放公式纯函数 + 单测）
 //!
@@ -47,5 +49,7 @@ pub mod pending_programming_sql;
 
 // 重导出保留原路径兼容（part/repo/mod.rs 已 `pub use sql::{...}`，继续穿透）。
 pub use helper_sql::scale_qty;
-pub use part_sql::{ChildInheritFields, NewPartCreate, PartListFilters, PartUpdate};
+pub use part_sql::{
+    AssemblyMatchRow, ChildInheritFields, NewPartCreate, PartListFilters, PartUpdate,
+};
 pub use pending_programming_sql::{PendingProgrammingFilters, PendingProgrammingItem};

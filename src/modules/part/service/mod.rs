@@ -12,7 +12,9 @@
 //!   prepare_binding_head_copy + PreparedBinding），2026-09-16 M2-B + M2-C 重构
 //! - `lifecycle.rs`：part 级多批次终态（cancel / force_complete）
 //! - `phase1/events.rs`：事件历史 / 位置树 / 批量创建增强（list_events /
-//!   location_tree / batch_with_pdfs / match_by_excel_items / batch_update_order_info）
+//!   location_tree / batch_with_pdfs / batch_update_order_info）
+//! - `phase1/excel_match.rs`：采购订单 Excel 匹配（2026-10-06 新增，从
+//!   `events.rs` 迁出；含分档决策纯函数 `resolve_match_tier`）
 //! - `phase1/lifecycle_helpers.rs`：待编程一览 + 批次列表（list_pending_programming /
 //!   list_batches）
 //! - `phase1/work_type.rs`：工种维度只读端点（list_by_work_type /

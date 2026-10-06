@@ -5,20 +5,20 @@
 //! - `list_events`（GET /parts/{id}/events）
 //! - `location_tree`（GET /parts/location-tree）
 //! - `batch_with_pdfs`（POST /parts/batch-with-pdfs）
-//! - `match_by_excel_items`（POST /parts/match-by-excel-items）
 //! - `batch_update_order_info`（POST /parts/batch-update-order-info）
+//!
+//! 2026-10-06：`match_by_excel_items`（POST /parts/match-by-excel-items）连同它的
+//! 分档决策纯函数迁到同目录的 `excel_match.rs`（本文件原 548 行里它是唯一一段
+//! 「一次请求 → 一份候选表」的批处理逻辑，与事件/位置树无共同点）。
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::com::customer::repo::CustomerRepo;
-use crate::modules::part::dto_crud::{
-    BatchUpdateOrderInfoRequest, BatchWithPdfsRequest, MatchByExcelItemsRequest,
-};
+use crate::modules::part::dto_crud::{BatchUpdateOrderInfoRequest, BatchWithPdfsRequest};
 use crate::modules::part::repo::NewPartCreate;
 use crate::modules::part::repo::PartRepoTrait;
-use crate::modules::part::repo::PartUpdate;
 use crate::modules::part::vo::{
-    BatchUpdateOrderInfoOut, LocationTreeNodeOut, LocationTreeOut, MatchByExcelItemResult,
+    BatchUpdateOrderInfoFailure, BatchUpdateOrderInfoOut, LocationTreeNodeOut, LocationTreeOut,
     PartEventOut,
 };
 use crate::modules::prod::batch::repo::PartBatchRepo;
@@ -406,102 +406,13 @@ impl PartService {
         )
     }
 
-    /// `POST /parts/match-by-excel-items`：Excel 行（drawing_no 或 serial_no）→ 现有 part id。
-    pub async fn match_by_excel_items<R: PartRepoTrait>(
-        mut repo: R,
-        req: &MatchByExcelItemsRequest,
-        current: &CurrentUser,
-    ) -> Result<Vec<MatchByExcelItemResult>, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk])?;
-        let mut out: Vec<MatchByExcelItemResult> = Vec::new();
-        for item in &req.items {
-            // 先尝试 serial_no
-            if let Some(sn) = item.serial_no.as_deref().filter(|s| !s.is_empty()) {
-                let rows: Vec<(i64,)> = sqlx::query_as::<_, (i64,)>(
-                    "SELECT id FROM t_part WHERE serial_no = $1 AND deleted_at IS NULL",
-                )
-                .bind(sn)
-                .fetch_all(repo.conn_mut())
-                .await?;
-                if rows.len() == 1 {
-                    out.push(MatchByExcelItemResult {
-                        drawing_no: item.drawing_no.clone(),
-                        serial_no: Some(sn.into()),
-                        part_id: Some(rows[0].0),
-                        status: "MATCHED".into(),
-                        message: None,
-                    });
-                    continue;
-                }
-                if rows.is_empty() {
-                    out.push(MatchByExcelItemResult {
-                        drawing_no: item.drawing_no.clone(),
-                        serial_no: Some(sn.into()),
-                        part_id: None,
-                        status: "NOT_FOUND".into(),
-                        message: Some("serial_no 找不到".into()),
-                    });
-                    continue;
-                }
-                out.push(MatchByExcelItemResult {
-                    drawing_no: item.drawing_no.clone(),
-                    serial_no: Some(sn.into()),
-                    part_id: None,
-                    status: "AMBIGUOUS".into(),
-                    message: Some(format!("{} 个匹配", rows.len())),
-                });
-                continue;
-            }
-            // 再尝试 drawing_no（取最近一条 active）
-            if let Some(dn) = item.drawing_no.as_deref().filter(|s| !s.is_empty()) {
-                let rows: Vec<(i64,)> = sqlx::query_as::<_, (i64,)>(
-                    "SELECT id FROM t_part WHERE drawing_no = $1 AND deleted_at IS NULL \
-                     ORDER BY id DESC LIMIT 5",
-                )
-                .bind(dn)
-                .fetch_all(repo.conn_mut())
-                .await?;
-                if rows.len() == 1 {
-                    out.push(MatchByExcelItemResult {
-                        drawing_no: Some(dn.into()),
-                        serial_no: item.serial_no.clone(),
-                        part_id: Some(rows[0].0),
-                        status: "MATCHED".into(),
-                        message: None,
-                    });
-                    continue;
-                }
-                if rows.is_empty() {
-                    out.push(MatchByExcelItemResult {
-                        drawing_no: Some(dn.into()),
-                        serial_no: item.serial_no.clone(),
-                        part_id: None,
-                        status: "NOT_FOUND".into(),
-                        message: Some("drawing_no 找不到".into()),
-                    });
-                    continue;
-                }
-                out.push(MatchByExcelItemResult {
-                    drawing_no: Some(dn.into()),
-                    serial_no: item.serial_no.clone(),
-                    part_id: None,
-                    status: "AMBIGUOUS".into(),
-                    message: Some(format!("{} 个匹配", rows.len())),
-                });
-                continue;
-            }
-            out.push(MatchByExcelItemResult {
-                drawing_no: item.drawing_no.clone(),
-                serial_no: item.serial_no.clone(),
-                part_id: None,
-                status: "NOT_FOUND".into(),
-                message: Some("serial_no 和 drawing_no 均缺失".into()),
-            });
-        }
-        Ok(out)
-    }
-
     /// `POST /parts/batch-update-order-info`：批量回填 order_no / system_delivery_date / note。
+    ///
+    /// 2026-10-06 重做：
+    /// - 走专用窄写 `PartRepo::update_order_info`（三态列）而不是 `update_part`
+    ///   + `PartUpdate`（单层 `Option` 表达不了「显式清空」，改它会波及行内编辑链路）。
+    /// - 响应改 `{updated_count, failed, skipped_count}`（`skip = true` 的行不写库）。
+    /// - **永远 200 + 信封**，全部失败也不抛业务错误（前端依赖部分成功语义）。
     pub async fn batch_update_order_info<R: PartRepoTrait>(
         mut repo: R,
         req: &BatchUpdateOrderInfoRequest,
@@ -511,38 +422,56 @@ impl PartService {
         if req.items.is_empty() {
             return Err(AppError::validation("items 不能为空"));
         }
-        let mut updated = 0_i64;
-        let mut failed: Vec<super::super::super::vo::BatchUpdateOrderInfoFailure> = Vec::new();
+        let mut updated_count = 0_i64;
+        let mut skipped_count = 0_i64;
+        let mut failed: Vec<BatchUpdateOrderInfoFailure> = Vec::new();
         for item in &req.items {
-            let upd = PartUpdate {
-                name: None,
-                drawing_no: None,
-                applicant_name: None,
-                quantity: None,
-                order_no: item.order_no.as_deref(),
-                system_delivery_date: item.system_delivery_date,
-                planned_delivery_date: None,
-                note: item.note.as_deref(),
-                is_urgent: None,
-                unit_price: None,
-                total_price: None,
-                updated_by: current.id,
-            };
-            let n = repo.update_part(item.part_id, item.version, upd).await;
+            // 2026-10-06 新增：`skip = true` 的行是「人工判定不该回填」，不写库、
+            // 不计成功、不计失败，只计入 skipped_count。
+            if item.skip == Some(true) {
+                skipped_count += 1;
+                continue;
+            }
+            let n = repo
+                .update_order_info(
+                    item.part_id,
+                    item.version,
+                    item.order_no.as_ref().map(|v| v.as_deref()),
+                    item.system_delivery_date,
+                    item.note.as_ref().map(|v| v.as_deref()),
+                    current.id,
+                )
+                .await;
             match n {
-                Ok(1) => updated += 1,
-                Ok(_) => failed.push(super::super::super::vo::BatchUpdateOrderInfoFailure {
+                Ok(1) => updated_count += 1,
+                // 0 行 = 版本冲突 / 已软删 / 不存在，三者 SQL 层不可区分，沿用旧口径
+                Ok(_) => failed.push(BatchUpdateOrderInfoFailure {
                     part_id: item.part_id,
                     code: code::VERSION_CONFLICT,
                     message: "版本冲突或 part 已软删".into(),
                 }),
-                Err(e) => failed.push(super::super::super::vo::BatchUpdateOrderInfoFailure {
-                    part_id: item.part_id,
-                    code: code::DATABASE,
-                    message: format!("{e}"),
-                }),
+                Err(e) => {
+                    // 2026-10-06：详情只进服务端日志。响应体里的 message 走统一中文
+                    // 文案，不再 `format!("{e}")` —— sqlx 原始错误（表名列名、约束名）
+                    // 不该泄给客户端，且与 `AppError::into_response` 已把 Database 的
+                    // message 换成字面量「数据库错误」的口径不一致。
+                    tracing::warn!(
+                        part_id = item.part_id,
+                        error = %e,
+                        "batch-update-order-info 单行更新失败"
+                    );
+                    failed.push(BatchUpdateOrderInfoFailure {
+                        part_id: item.part_id,
+                        code: code::DATABASE,
+                        message: "数据库错误，写入失败".into(),
+                    });
+                }
             }
         }
-        Ok(BatchUpdateOrderInfoOut { updated, failed })
+        Ok(BatchUpdateOrderInfoOut {
+            updated_count,
+            failed,
+            skipped_count,
+        })
     }
 }

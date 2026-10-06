@@ -25,7 +25,7 @@ pub use part::{
     PartOut, PendingProgrammingOut,
 };
 pub use part_batch::{
-    BatchUpdateOrderInfoFailure, BatchUpdateOrderInfoOut, MatchByExcelItemResult,
-    PartBatchCreateFailure, PartBatchCreateOut, PartBatchScanOut, PartScanContextOut,
-    PartScanInfoOut,
+    BatchUpdateOrderInfoFailure, BatchUpdateOrderInfoOut, ExcelMatchType, MatchByExcelItemResult,
+    PartBatchCreateFailure, PartBatchCreateOut, PartBatchScanOut, PartMatchInfoOut,
+    PartScanContextOut, PartScanInfoOut,
 };

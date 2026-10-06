@@ -3,17 +3,18 @@
 //! ## 结构（2026-09-22 D-6 重构对齐 iam / shelf / customer / part_batch / worker_pool 范本）
 //! - `sql/`（原 `sql.rs`，已按表拆 `part_sql.rs` / `event_sql.rs` /
 //!   `pending_programming_sql.rs` / `helper_sql.rs` + `mod.rs`）：SQL 全文，
-//!   22 个 pub 固有静态方法（t_part 19 + t_part_event 1 + pending-programming 2）
+//!   26 个 pub 固有静态方法（t_part 23 + t_part_event 1 + pending-programming 2）
 //!   + sqlx `query!` 宏。ZST struct `PartRepo` 收 `impl PgExecutor<'_>` 形参。
-//! - `mod.rs`（本文件）：对外暴露胖 trait `PartRepoTrait`（41 方法合并单 trait，
+//! - `mod.rs`（本文件）：对外暴露胖 trait `PartRepoTrait`（46 方法合并单 trait，
 //!   口径见下文「方法计数口径」），并直接 `impl PartRepoTrait for &mut PgConnection`
 //!   ——handler/service 借 `&mut *tx` / `&mut *conn` 即可，零中间壳。
 //!
 //! ## 方法计数口径
 //! 「trait 方法数」= `pub trait PartRepoTrait` 花括号内声明的 `fn` 签名条数；
 //! `conn_mut` 这类工具方法计入，`#[allow(...)]` / doc 注释不计；`#[async_trait]`
-//! 展开出的生命周期形参不算独立方法。41 = `conn_mut` 1 + t_part 18 +
-//! t_part_batch 17 + t_part_event 1 + 跨域 helper 2 + pending-programming 2：
+//! 展开出的生命周期形参不算独立方法。46 = `conn_mut` 1 + t_part 18 +
+//! t_part_batch 17 + t_part_event 1 + 跨域 helper 2 + pending-programming 2 +
+//! 采购订单 Excel 匹配 + 订单信息回填 5：
 //!
 //! - `conn_mut` 1 —— 工具方法，暴露 `&mut PgConnection`
 //! - t_part 18 —— 查询 5 + CRUD 6 + assembly 子件 4 + rollup 3（一行委托 `sql::PartRepo`）
@@ -24,11 +25,16 @@
 //!   + `serial_prefix_for_customer`（2026-10-05 新增，查 `t_customer`，委托
 //!     `sql::PartRepo`；建单派发序列号的前置）
 //! - pending-programming 2 —— 委托 `sql::PartRepo`
+//! - 采购订单 Excel 匹配 + 订单信息回填 5（2026-10-06 新增）—— 委托 `sql::PartRepo`：
+//!   `list_match_parts_by_keys` / `list_match_assemblies_by_keys` /
+//!   `list_assembly_names_by_ids` / `list_children_by_assemblies` /
+//!   `update_order_info`。上 trait 的**唯一动机是可 mock**：旧实现走
+//!   `conn_mut()` 内联 sqlx，匹配分档只能靠集成测试守护。
 //!
-//! ⚠️ trait 方法数 **不等于** `sql/` 静态方法数（22）：`t_part_batch` 段（17）与跨域 helper
-//! 中的一项转发到 `prod::batch` 域的 ZST 静态方法，`conn_mut` 则无对应 SQL 方法；
-//! 反向地 `sql::PartRepo` 有一个 `list_children_by_assemblies` 静态方法未上 trait
-//! （直接查 t_part 的其它域自用）。
+//! ⚠️ trait 方法数 **不等于** `sql/` 静态方法数（26）：`t_part_batch` 段（17）与跨域 helper
+//! 中的一项转发到 `prod::batch` 域的 ZST 静态方法，`conn_mut` 则无对应 SQL 方法。
+//! 2026-10-06 起 `sql::PartRepo` 的**全部**静态方法都已上 trait（此前
+//! `list_children_by_assemblies` 是唯一漏项，由匹配链路补上）。
 //!
 //! ## 为什么 trait 命名为 `PartRepoTrait`（带 `Trait` 后缀）
 //! 跨模块静态调用方（2026-10-03 实测 7 域 10 文件：assembly 6 / delivery_note 5 /
@@ -39,8 +45,8 @@
 //! 故 trait 改名 `PartRepoTrait`（与 shelf / customer / part_batch 范本同形）：
 //!
 //! - `part::repo::PartRepo` —— ZST struct（在 `sql/mod.rs` 内，通过 `pub use sql::PartRepo;`
-//!   重新导出至本模块），保留 21 个静态方法签名不变（cross-module 调用方零修改）。
-//! - `part::repo::PartRepoTrait` —— 本文件的胖 trait（41 方法合并单 trait），part 域
+//!   重新导出至本模块），保留 26 个静态方法签名不变（cross-module 调用方零修改）。
+//! - `part::repo::PartRepoTrait` —— 本文件的胖 trait（46 方法合并单 trait），part 域
 //!   内部 service 用 `<R: PartRepoTrait>` 收。
 //!
 //! ## 为什么是胖 trait 而非按表拆 3 trait
@@ -81,13 +87,13 @@
 //!   按 conventions.md §4.1 含 IO 不强求 100%。
 //!
 //! ## 错误类型
-//! 41 个方法里 31 个返回 `sqlx::Error`、9 个返回 `AppError`
+//! 46 个方法里 36 个返回 `sqlx::Error`、9 个返回 `AppError`
 //! （`t_part_batch.status` 写点 8 个 —— 契约是「没写成 = `VERSION_CONFLICT`」，
 //! 转 `sqlx::Error` 会把 409 降级成 500；`serial_prefix_for_customer` 1 个 ——
-//! 20308 / 20104 / 20102 三个业务码要原样透出）、`conn_mut` 无返回值。31 个
+//! 20308 / 20104 / 20102 三个业务码要原样透出）、`conn_mut` 无返回值。36 个
 //! `sqlx::Error` 按委托目标再分两处——**都是零翻译**，但 1:1 的对象不同：
-//! - 21 个 1:1 委托 `sql::PartRepo`（t_part 18 + t_part_event 1 + pending-programming 2，
-//!   恰好等于 `sql/` 静态方法数减去未上 trait 的 `list_children_by_assemblies`）
+//! - 26 个 1:1 委托 `sql::PartRepo`（t_part 18 + t_part_event 1 + pending-programming 2
+//!   + 采购订单 Excel 匹配 5，恰好等于 `sql/` 静态方法数）
 //! - 10 个 1:1 委托 `PartBatchRepo`（t_part_batch 段 9 + 跨域 helper 1）
 //!
 //! ## 已知架构债（D-6 阶段过渡）
@@ -129,13 +135,13 @@ pub use crate::modules::part::model::{
     NewPartEvent, TPart, TPartEvent, TPartInspected, TPartRollupState,
 };
 pub use sql::{
-    ChildInheritFields, NewPartCreate, PartListFilters, PartRepo, PartUpdate,
+    AssemblyMatchRow, ChildInheritFields, NewPartCreate, PartListFilters, PartRepo, PartUpdate,
     PendingProgrammingFilters, PendingProgrammingItem, scale_qty,
 };
 
-/// part 域数据访问 trait（41 方法 = `conn_mut` 1 + t_part 18 + t_part_batch 17 +
-/// t_part_event 1 + 跨域 helper 2 + pending-programming 2；计数口径见模块头
-/// 「方法计数口径」小节）。
+/// part 域数据访问 trait（46 方法 = `conn_mut` 1 + t_part 18 + t_part_batch 17 +
+/// t_part_event 1 + 跨域 helper 2 + pending-programming 2 + 采购订单 Excel 匹配 5；
+/// 计数口径见模块头「方法计数口径」小节）。
 ///
 /// 单 trait 而非按表拆 3 trait：`&mut PgConnection` 同一作用域只能借给一个 repo 实例，
 /// 拆分会让 service 无法同时持有三个 repo（2026-09-22 D-6 重构定案；与 iam / shelf /
@@ -425,6 +431,52 @@ pub trait PartRepoTrait: Send {
         &mut self,
         f: &PendingProgrammingFilters,
     ) -> Result<i64, sqlx::Error>;
+
+    // ── 采购订单 Excel 匹配 + 订单信息回填（2026-10-06 新增，5）──
+    //
+    // 这 5 个方法存在的理由是**可 mock**：`POST /parts/match-by-excel-items` 的
+    // 旧实现走 `repo.conn_mut()` 内联 sqlx，service 单测无法注入假数据，只能退化成
+    // 集成测试。分档决策抽成纯函数后，service 只依赖下面这几个方法 ⇒ 分档判定
+    // 可以用 `MockPartRepoTrait` 覆盖。
+    //
+    // **查询数硬约束**：整条匹配链路最多 4 条查询（见 service 侧
+    // `phase1::excel_match::collect_match_index`），与请求行数无关。
+    /// 按「图号命中 ∪ 名称命中」捞回 `t_part` 候选（软删闸门在 SQL 内）。
+    async fn list_match_parts_by_keys<'a>(
+        &mut self,
+        drawing_nos: &'a [&'a str],
+        names: &'a [&'a str],
+    ) -> Result<Vec<TPart>, sqlx::Error>;
+    /// 同上，查 `t_assembly`（装配件命中后取其子件作为候选）。
+    async fn list_match_assemblies_by_keys<'a>(
+        &mut self,
+        drawing_nos: &'a [&'a str],
+        names: &'a [&'a str],
+    ) -> Result<Vec<AssemblyMatchRow>, sqlx::Error>;
+    /// 候选零件「所属装配件」名称映射（`assembly_id` → `name`）。
+    async fn list_assembly_names_by_ids<'a>(
+        &mut self,
+        assembly_ids: &'a [i64],
+    ) -> Result<Vec<AssemblyMatchRow>, sqlx::Error>;
+    /// 一批装配件的全部有效子件（2026-10-06 由 `sql::PartRepo` 的同名静态方法
+    /// 上 trait，供匹配链路取装配件候选；其余调用方仍走静态方法）。
+    async fn list_children_by_assemblies<'a>(
+        &mut self,
+        assembly_ids: &'a [i64],
+        include_deleted: bool,
+    ) -> Result<Vec<TPart>, sqlx::Error>;
+    /// 订单信息三态窄写（`order_no` / `system_delivery_date` / `note`），只服务
+    /// `POST /parts/batch-update-order-info`；不复用 `update_part`（单层 `Option`
+    /// 表达不了「显式清空」，改它会波及行内编辑链路）。
+    async fn update_order_info<'a>(
+        &mut self,
+        part_id: i64,
+        expected_version: i32,
+        order_no: Option<Option<&'a str>>,
+        system_delivery_date: Option<Option<chrono::NaiveDate>>,
+        note: Option<Option<&'a str>>,
+        updated_by: i64,
+    ) -> Result<u64, sqlx::Error>;
 }
 
 /// 把 `PartRepoTrait` 直接对 `&mut PgConnection` 实现——handler/service 借 `&mut *tx` 或
@@ -907,5 +959,58 @@ impl PartRepoTrait for &mut PgConnection {
         f: &PendingProgrammingFilters,
     ) -> Result<i64, sqlx::Error> {
         PartRepo::count_pending_programming_with_cnc_filter(&mut **self, f).await
+    }
+
+    // ── 采购订单 Excel 匹配 + 订单信息回填（2026-10-06 新增，5）──
+    async fn list_match_parts_by_keys<'a>(
+        &mut self,
+        drawing_nos: &'a [&'a str],
+        names: &'a [&'a str],
+    ) -> Result<Vec<TPart>, sqlx::Error> {
+        PartRepo::list_match_parts_by_keys(&mut **self, drawing_nos, names).await
+    }
+
+    async fn list_match_assemblies_by_keys<'a>(
+        &mut self,
+        drawing_nos: &'a [&'a str],
+        names: &'a [&'a str],
+    ) -> Result<Vec<AssemblyMatchRow>, sqlx::Error> {
+        PartRepo::list_match_assemblies_by_keys(&mut **self, drawing_nos, names).await
+    }
+
+    async fn list_assembly_names_by_ids<'a>(
+        &mut self,
+        assembly_ids: &'a [i64],
+    ) -> Result<Vec<AssemblyMatchRow>, sqlx::Error> {
+        PartRepo::list_assembly_names_by_ids(&mut **self, assembly_ids).await
+    }
+
+    async fn list_children_by_assemblies<'a>(
+        &mut self,
+        assembly_ids: &'a [i64],
+        include_deleted: bool,
+    ) -> Result<Vec<TPart>, sqlx::Error> {
+        PartRepo::list_children_by_assemblies(&mut **self, assembly_ids, include_deleted).await
+    }
+
+    async fn update_order_info<'a>(
+        &mut self,
+        part_id: i64,
+        expected_version: i32,
+        order_no: Option<Option<&'a str>>,
+        system_delivery_date: Option<Option<chrono::NaiveDate>>,
+        note: Option<Option<&'a str>>,
+        updated_by: i64,
+    ) -> Result<u64, sqlx::Error> {
+        PartRepo::update_order_info(
+            &mut **self,
+            part_id,
+            expected_version,
+            order_no,
+            system_delivery_date,
+            note,
+            updated_by,
+        )
+        .await
     }
 }

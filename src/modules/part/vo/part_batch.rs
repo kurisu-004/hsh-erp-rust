@@ -1,6 +1,6 @@
 //! part 域 batch 详情 / 列表 / 子域相关出参 VO（2026-09-22 PR4 重构）
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::modules::part::service::crud::TPartScanRow;
 use crate::modules::prod::batch::model::PartBatchScanRow;
@@ -104,25 +104,103 @@ impl From<PartBatchScanRow> for PartBatchScanOut {
     }
 }
 
-/// `POST /parts/match-by-excel-items` 出参：单行匹配结果（part_id 或 null）。
+/// `POST /parts/match-by-excel-items` 出参：单行匹配结果（**恒存在**，未匹配行也返回）。
+///
+/// 2026-10-06 重做。旧结构（`{drawing_no, serial_no, part_id, status, message}`）
+/// 与前端已实现的读取方式不匹配：前端按 `row_no` 关联并读 `parts` 数组，而旧
+/// 结构两者都没有 ⇒ `new Map(results.map(r => [r.row_no, r]))` 的 key 全是
+/// `undefined` ⇒ 每一行都判「未匹配」。
+///
+/// **数组长度恒等于请求 `items` 长度、顺序一致**（前端按 `row_no` 关联，
+/// 顺序仅供人读）；未匹配的行也必须出现（`match_type = NONE` + `parts: []`）。
 #[derive(Debug, Clone, Serialize)]
 pub struct MatchByExcelItemResult {
-    #[serde(default)]
-    pub drawing_no: Option<String>,
-    #[serde(default)]
-    pub serial_no: Option<String>,
-    #[serde(serialize_with = "serialize_i64_opt")]
-    pub part_id: Option<i64>,
-    pub status: String, // "MATCHED" / "NOT_FOUND" / "AMBIGUOUS"
-    #[serde(default)]
-    pub message: Option<String>,
+    /// 关联键，回显请求的 `row_no`。
+    pub row_no: i32,
+    /// 命中的判据档位（`NONE` = 四档全落空）。
+    pub match_type: ExcelMatchType,
+    /// 候选零件（含现值，供前端做「原值 vs 新值」对比与默认勾选）。
+    pub parts: Vec<PartMatchInfoOut>,
+    /// 档位异常提示（无异常时是空数组，不是 null）。
+    pub warnings: Vec<String>,
 }
 
-/// `POST /parts/batch-update-order-info` 出参：成功 N，失败列表。
+/// Excel 行 → 候选零件的**匹配档位**（闭合 5 值）。
+///
+/// 2026-10-06 新增。序列化形态是大写字符串，与本仓「无 DB ENUM、Rust enum 校验」
+/// 的约定一致 —— 范本 `vo::part::ChainState`（它只差一步：`ChainState` 的三个变体
+/// 都是单词，`UPPERCASE` 恰好等于线格式；本枚举是双词，`PartCode` 经 `UPPERCASE`
+/// 会得到 `PARTCODE`（少一个下划线），故每个变体另写显式 `rename`。
+/// **不要**删掉显式 rename —— 前端按 `"PART_CODE"` 字面量判定。
+/// 线格式是 `PART_CODE > ASSEMBLY_CODE > PART_NAME > ASSEMBLY_NAME > NONE` 的
+/// 单行单档位、先命中先占：能按图号唯一定位就不该退到名称去冒险匹配。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum ExcelMatchType {
+    /// 按图号命中 `t_part.drawing_no`（候选是零件本身）。
+    #[serde(rename = "PART_CODE")]
+    PartCode,
+    /// 按图号命中 `t_assembly.drawing_no`（候选是该装配件的**有效子件**）。
+    #[serde(rename = "ASSEMBLY_CODE")]
+    AssemblyCode,
+    /// 按名称命中 `t_part.name`（名称兜底，跨客户同名极容易超限）。
+    #[serde(rename = "PART_NAME")]
+    PartName,
+    /// 按名称命中 `t_assembly.name`（名称兜底，候选是该装配件的有效子件）。
+    #[serde(rename = "ASSEMBLY_NAME")]
+    AssemblyName,
+    /// 四档判据均不存在或全部落空。
+    #[serde(rename = "NONE")]
+    None,
+}
+
+impl ExcelMatchType {
+    /// 候选 cap 提示里用的中文判据名（`warnings` 文案用）。
+    pub fn label_zh(self) -> &'static str {
+        match self {
+            Self::PartCode => "按图号匹配",
+            Self::AssemblyCode => "按装配件图号匹配",
+            Self::PartName => "按名称匹配",
+            Self::AssemblyName => "按装配件名称匹配",
+            Self::None => "未匹配",
+        }
+    }
+}
+
+/// `POST /parts/match-by-excel-items` 出参里的单个候选零件。
+///
+/// 2026-10-06 新增。字段集是前端「现值对比 + 默认勾选 + 提交 OCC」的最小全集：
+/// - `version`：**必须**回传，它是前端提交时的 OCC 依据；缺了整笔更新请求会因
+///   后端 `version: i32` 无 `#[serde(default)]` 而 400。
+/// - `order_no` / `system_delivery_date` / `assembly_name`：前端 `isEmptyTarget`
+///   默认勾选判据与「原值 vs 新值」对比的数据源。
+/// - `drawing_no` / `name`：展示用；`t_part.drawing_no` 是 NOT NULL 列，故类型是
+///   `String` 而非 `Option`。
+#[derive(Debug, Clone, Serialize)]
+pub struct PartMatchInfoOut {
+    #[serde(serialize_with = "serialize_i64")]
+    pub part_id: i64,
+    pub version: i32,
+    pub drawing_no: String,
+    pub name: String,
+    pub order_no: Option<String>,
+    pub system_delivery_date: Option<chrono::NaiveDate>,
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub assembly_id: Option<i64>,
+    pub assembly_name: Option<String>,
+}
+
+/// `POST /parts/batch-update-order-info` 出参：成功 N、跳过 N、失败列表。
+///
+/// 2026-10-06：`updated: i64` 改名为 `updated_count: i64`（前端只读这一个数字，
+/// 显式命名为 count 后不必再靠字段名猜语义）。**永远 HTTP 200 + 信封**，
+/// 全部失败也不抛业务错误（前端依赖部分成功语义）。
 #[derive(Debug, Clone, Serialize)]
 pub struct BatchUpdateOrderInfoOut {
-    pub updated: i64,
+    pub updated_count: i64,
     pub failed: Vec<BatchUpdateOrderInfoFailure>,
+    /// 2026-10-06 新增：请求里 `skip = true` 的行数（未写库）。
+    pub skipped_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -130,5 +208,9 @@ pub struct BatchUpdateOrderInfoFailure {
     #[serde(serialize_with = "serialize_i64")]
     pub part_id: i64,
     pub code: i32,
+    /// 2026-10-06：**不得**含 sqlx 原始错误文本（旧实现 `format!("{e}")` 把
+    /// sqlx 内部错误泄进 200 响应体，与 `AppError::into_response` 已把
+    /// `Database` 的 message 换成字面量「数据库错误」的口径不一致）。
+    /// 细节走 `tracing::warn!` 落服务端日志。
     pub message: String,
 }

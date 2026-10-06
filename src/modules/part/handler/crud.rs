@@ -350,9 +350,11 @@ pub async fn get_location_tree(
 
 /// `POST /api/v2/parts/match-by-excel-items`
 ///
-/// 用 Excel 序列号清单反查 part 匹配结果（批量导入前置校验）。
+/// 采购订单 Excel 明细行 → 候选零件（回填 order_no / system_delivery_date 的前置）。
 ///
 /// 2026-09-22 PR5：POST 入参但纯只读匹配，改 `pool.acquire()`。
+/// 2026-10-06：service 侧从「逐行发 SQL」改成「整请求 ≤4 条查询」，逻辑迁往
+/// `part::service::phase1::excel_match`。
 pub async fn match_by_excel_items(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -365,15 +367,20 @@ pub async fn match_by_excel_items(
 
 /// `POST /api/v2/parts/batch-update-order-info`
 ///
-/// 批量更新工单 order_no / system_delivery_date / note（保留 `begin + commit`，写端点）。
+/// 批量更新工单 order_no / system_delivery_date / note。
+///
+/// 2026-10-06：**不再用事务**，改 `pool.acquire()`。原因：本端点的契约是
+/// 「HTTP 200 + 信封，逐行部分成功」（`failed` 逐条列出行级错误），而 PG 事务内
+/// 一条语句报错后整笔进入 aborted 状态 —— 其余行的 UPDATE 会连带失败，
+/// 末尾 `commit()` 也会报错，于是「部分成功」被整体降级成 500。各行写的
+/// 本来是互不相干的行、每条 UPDATE 自身原子，事务没有额外收益。
 pub async fn batch_update_order_info(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Json(req): Json<BatchUpdateOrderInfoRequest>,
 ) -> Result<Json<R<BatchUpdateOrderInfoOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = PartService::batch_update_order_info(&mut *tx, &req, &current).await?;
-    tx.commit().await?;
+    let mut conn = state.pool.acquire().await?;
+    let out = PartService::batch_update_order_info(&mut *conn, &req, &current).await?;
     Ok(Json(R::ok(out)))
 }
 
