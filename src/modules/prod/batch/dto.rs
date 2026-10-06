@@ -337,7 +337,6 @@ pub struct SendToOutsourceRequest {
     /// 而失败：**`422` + 纯文本** `missing field \`process_id\``（axum `Json` 提取器），
     /// 不是业务信封、不要按 `BIZ_PROCESS_NOT_FOUND` 排查。刻意不加
     /// `deny_unknown_fields`：那会让任何多余字段直接 422，迁移面远大于收益。
-    /// 契约见 `docs/api/production/batches.md#外协流转send--receive`。
     #[serde(deserialize_with = "deserialize_i64")]
     pub process_id: i64,
     #[serde(default, deserialize_with = "deserialize_i64_opt")]

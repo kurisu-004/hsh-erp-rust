@@ -16,8 +16,8 @@
 //!   - scan-deliver-part: 司机扫码发货
 //!
 //! 2026-09-29 端点下线：`send-to-programming` / `recall-to-programming` 整体
-//! 移除测试（PROGRAMMING 状态废弃进入路径；详见 `part/statemachine.rs::can_transition_to`
-//! 与 `docs/api/parts/lifecycle.md`）。
+//! 移除测试（PROGRAMMING 状态废弃进入路径；详见
+//! `src/modules/part/statemachine.rs::can_transition_to`）。
 //!
 //! ## 并行 / 认证
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema

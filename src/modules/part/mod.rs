@@ -25,8 +25,8 @@
 //! `GET /api/v2/outsource-shipments/in-flight` 与
 //! `GET /api/v2/outsource-sendable`。**硬切无 alias**，旧 URL 实际返回 **400**
 //! 而非 404 —— 本域 `/{part_id}`（`Path<i64>`）catch-all 兜住任何未注册的 1 段
-//! 静态路径，再由 `Path` extractor 拒绝非数字段；成因与「不改跨域路由语义」的
-//! 取舍见 `docs/api/inconsistencies.md` § 9.2。
+//! 静态路径，再由 `Path` extractor 拒绝非数字段；该成因与「不改跨域路由语义」的
+//! 取舍，本节即全仓最完整的一处说明（外协域侧另有同义登记）。
 
 pub mod dto_crud;
 pub mod handler;

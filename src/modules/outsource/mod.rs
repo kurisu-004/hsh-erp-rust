@@ -27,7 +27,8 @@
 //!   需求不匹配）：`/parts/outsource-in-flight`、`/parts/outsource-sendable`
 //!   （2026-10-03 硬切，无 alias；旧 URL 实际返回 **400** 而非 404 —— part 域
 //!   `/{part_id}`（`Path<i64>`）catch-all 兜住任何未注册的 1 段静态路径，再由
-//!   `Path` extractor 拒绝非数字段；成因见 `docs/api/inconsistencies.md` § 9.2）。
+//!   `Path` extractor 拒绝非数字段；成因与取舍见 `src/modules/part/mod.rs` 的
+//!   模块 doc）。
 //!
 //! 2026-10-03 看板三件套（`/outsource-pool/*`，3 只读端点）：
 //! - 新增第 5 个 router 工厂 `pool_router()`，独立顶层前缀 `/api/v2/outsource-pool`，

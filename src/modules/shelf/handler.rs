@@ -30,7 +30,7 @@
 //! 写 3 (MANAGER)：create_shelf / update_shelf / soft_delete_shelf
 //!
 //! 旧路径 `GET|POST /api/v2/shelves/{id}/processes` 与 `GET /api/v2/shelves/processes`
-//! 已删除（404，无 alias），新路径见 `docs/api/production/shelf-process-mapping.md`。
+//! 已删除（404，无 alias），新路径见 `src/modules/prod/shelf_process/mod.rs`。
 
 use std::sync::Arc;
 

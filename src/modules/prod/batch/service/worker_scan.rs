@@ -131,7 +131,7 @@ impl BatchService {
             Err(sqlx::Error::RowNotFound) => {
                 return Err(AppError::biz(
                     code::BIZ_PART_BATCH_NOT_HELD_BY_WORKER,
-                    "multiple IN_PROCESS batches held by this worker; specify batch_id in request body (see docs/api/parts.md#worker-scan)"
+                    "multiple IN_PROCESS batches held by this worker; specify batch_id in request body"
                         .to_string(),
                 ));
             }

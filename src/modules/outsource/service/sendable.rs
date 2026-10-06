@@ -8,7 +8,7 @@
 //! 取代 part 域旧 `list_outsource_sendable`（后者返回通用 `PartListItem`，与前端
 //! 外协域字段需求完全不匹配 → 页面全灰）。旧端点已删除（`/parts/outsource-sendable`
 //! 实际返回 400 —— part 域 `/{part_id}` `Path<i64>` catch-all 兜底，非 404，
-//! 见 `docs/api/inconsistencies.md` § 9.2），无 alias。
+//! 成因与取舍见 `src/modules/part/mod.rs` 的模块 doc），无 alias。
 //!
 //! ## 判定逻辑全在 SQL
 //! 哪些批次出行、`send_mode` 的审批闸门、`quote_id` 的选取、`company_options` 的

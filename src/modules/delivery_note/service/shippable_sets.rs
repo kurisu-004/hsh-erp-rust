@@ -29,7 +29,8 @@
 //!    无批次的子件以 `COALESCE(SUM,0)=0` 参与 `min`（其注释原话：「未交任何批次的
 //!    子件若贡献 NULL 会被 MIN 忽略，那样『子件 A 交一半、子件 B 一件没交』会误判
 //!    成 A 能撑的套数」）；
-//! 3. `docs/api/delivery-notes/index.md` / `print.md` 的公式段写的就是「各子件」。
+//! 3. 本仓同公式的其它 SQL 版（`fetch_delivered_sets`）与打印链路都以「各子件」
+//!    为驱动单元，与本式一致。
 //!
 //! 故入参必须有「该装配件的全部子件」`children_by_asm`，它由调用方从
 //! `PartRepo::list_children`（单单，N 次小查询）/ `PartRepo::list_children_by_assemblies`

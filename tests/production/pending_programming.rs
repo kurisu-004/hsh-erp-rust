@@ -1233,8 +1233,7 @@ async fn soft_delete_filters_exclude_rows() {
 ///
 /// 注：`?limit=abc`（真正无法解析）与带引号的 `?limit="50"` 仍 → 400，此处不断言
 /// —— `test_support::send` 强制把响应体当 JSON 解析，axum 的 `QueryRejection` 是
-/// 纯文本会 panic；该行为已在 `docs/api/production/pending-programming.md` 的
-/// 「`limit` / `offset` 的取值容错」脚注 + 「关于 query 解析失败」段记录。
+/// 纯文本会 panic；该行为已在 `docs/api/programming.md` §1.1 与 §5 记录。
 #[tokio::test]
 async fn limit_offset_empty_string_falls_back_to_defaults() {
     let (pool, app, token, _fx, cfx) = bootstrap().await;

@@ -306,8 +306,6 @@ pub mod code {
     ///   （DELIVERED / OUTSOURCE / IN_PROCESS 工人持有 / COMPLETED / CANCELLED）
     /// - submit（`delivery_note::service::lifecycle`）：已挂单批次状态不在
     ///   `{INSPECTION, READY_TO_SHIP}`（挂单后被旁路改状态的数据非法场景）
-    ///
-    /// 详见 docs/api/delivery-notes/drafts.md（scan）与 workflow.md（submit）
     pub const BIZ_DELIVERY_BATCH_STATE_INVALID: i32 = 21421;
 
     // 215xx 外协发货（t_outsource_shipment，2026-09-13 Phase 2 扩展）

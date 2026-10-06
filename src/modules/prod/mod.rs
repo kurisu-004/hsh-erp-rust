@@ -72,8 +72,8 @@
 //! 以及全部 CRUD / 文件 / Excel 工具 / 各类 list 端点。assembly 仍不进 prod
 //! （生产只是其生命周期一段）。
 //!
-//! URL 硬切换（无 alias）：前端配套 PR 锁步迁移。文档层「生产全流程端点地图」在
-//! `docs/api/production/index.md` 兜底串联。
+//! URL 硬切换（无 alias）：前端配套 PR 锁步迁移。端点全貌以本文件末尾的
+//! `router()` 聚合为准。
 
 use std::sync::Arc;
 

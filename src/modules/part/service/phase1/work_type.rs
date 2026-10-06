@@ -193,8 +193,8 @@ impl WorkTypeListRow {
 /// `scope_id` 的 SHELF_ACCOUNT 行（`POST /iam/users/{id}/roles`）：wildcard
 /// （`scope_id IS NULL`）被 `iam::service::account::validate_role_scope` 硬拒，
 /// 属只有 fixture / 直插 SQL 能造出的状态。
-/// 契约见 `docs/api/parts/lifecycle.md` 的
-/// `GET /api/v2/parts/pickable-by-work-type/{work_type_id}` 节。
+/// 契约见 `src/modules/part/handler/lifecycle.rs` 的
+/// `pickable_by_work_type` 端点 doc。
 fn pickable_shelf_scope(current: &CurrentUser) -> Option<Vec<i64>> {
     if current.shelf_wildcard || current.has_role(Role::Manager) {
         None
@@ -483,8 +483,9 @@ impl PartService {
         // `b.current_process_step_id` 的 `sort_order` 直接当位置** —— step 指针与
         // 「当前工序在链内的位置」是两个独立事实，而 worker-scan 的 RETURNED 分支
         // 只写 `current_process_id = next_process_id`、**不推进**
-        // `current_process_step_id`（已知缺口，见 `docs/api/parts/inspection.md`
-        // worker-scan 节）。于是多工序链的批次在第 2 次放回时 step 指针仍停在
+        // `current_process_step_id`（已知缺口，见
+        // `src/modules/prod/batch/service/worker_scan.rs` 的 RETURNED 分支）。于是多工序链
+        // 的批次在第 2 次放回时 step 指针仍停在
         // **首次定位**那一步：按 `sort_order` 推进会把**当前工序自己**当成下一道
         // 返回（如指针停在 A 的 step 而 `current_process_id = B` ⇒ 返回 B），
         // 而 `chain_state` 仍在说「可免填」⇒ 写侧照单全收，静默错值比拒收更难
@@ -512,10 +513,9 @@ impl PartService {
         // 而 `sort_order` 的**密度不由读侧决定**：写侧只保证链内 `sort_order`
         // 互不重复（`upsert_chain` 校验 + `uq_chain_step_chain_order` 兜底），
         // 稠密 0-based（前端 `usePartProcessDesign` 保存时拍平成 `0,1,2…`）与
-        // 稀疏 `10/20/30` 两种密度都能落库且都受支持。⚠️
-        // `docs/api/production/process-chain.md` 记的稀疏口径与真实写路径不符（漂移
-        // 登记见 `docs/api/inconsistencies.md` §9.4），别拿它当密度依据。
-        // `+ 1` 只在稠密下正确、在稀疏下会把
+        // 稀疏 `10/20/30` 两种密度都能落库且都受支持。别拿任何文档当密度依据
+        // —— 写路径（`upsert_chain` 校验 + `uq_chain_step_chain_order` 兜底）才是
+        // 权威。`+ 1` 只在稠密下正确、在稀疏下会把
         // 「还有两道工序」误判成链尾，`>` 对两种密度都成立 ⇒ 读侧只能用 `>`。
         //
         // 4 个派生列都显式 `AS chain_*` 别名，与外层 `COALESCE(nx.*)` 逐字对应，

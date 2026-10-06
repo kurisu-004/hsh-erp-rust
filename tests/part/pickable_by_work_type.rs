@@ -1091,8 +1091,8 @@ async fn deactivate_shelf(pool: &PgPool, shelf_id: i64) {
 ///
 /// 用途：scope 类用例必须先自证「服务端到底算出了什么 scope」，否则「列表为空」可能
 /// 是另一条原因（架被停用 / scope 绑的是别的区）造成的，断言就失去回归价值。
-/// ⚠️ 顺带覆盖 [`docs/api/inconsistencies.md` §9.5] 登记的缺口：响应里**没有**
-/// `shelf_wildcard` 键，所以只能断言 `shelf_ids`，wildcard 与空 scope 在这里同形。
+/// ⚠️ 顺带覆盖 `GET /iam/me` 出参的一个缺口：响应里**没有** `shelf_wildcard` 键，
+/// 所以只能断言 `shelf_ids`，wildcard 与空 scope 在这里同形。
 async fn server_side_shelf_ids(app: &axum::Router, token: &str) -> Vec<String> {
     let (s, env) = send(
         app.clone(),

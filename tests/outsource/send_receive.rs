@@ -1680,10 +1680,9 @@ async fn send_to_outsource_partial_quantity_splits_batch() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let customer_id = insert_l1_customer(&pool, "Psend", "B").await;
     let part_id = insert_part(&pool, customer_id, "PENDING").await;
-    // 源状态只能 PENDING：状态机白名单（`PartStatus::can_transition_to`）没有
-    // `IN_PROCESS → OUTSOURCE` 边，故 service 里那段「IN_PROCESS 必须在
-    // PRODUCTION_SHELF」的守恒在当前代码里不可达（见 docs/api/production/batches.md
-    // 「已知不一致」节）。部分发送的拆批语义与源状态无关，故用 PENDING 覆盖。
+    // 源状态用 PENDING：本用例只覆盖部分发送的拆批语义，与源状态无关；
+    // `IN_PROCESS → OUTSOURCE` 那条边的守卫（`IN_PROCESS` 批次必须在
+    // PRODUCTION_SHELF 上）由同文件的配对负向用例覆盖。
     let bid = insert_batch(&pool, part_id, "PENDING", None).await;
     let company_id = insert_outsource_company(&pool, "PsendCo").await;
     let proc_id = seed_outsource_process(&pool, "PPSEND", "psend2", true).await;

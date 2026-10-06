@@ -111,9 +111,8 @@ pub async fn recompute_rollup(
     // `assembly_after_id`）。
     //
     // `null` = 本轮该段无可处理行（表已扫完 / 显式 id 模式 / 空表）——调用方
-    // 在续扫循环里对 `null` **保持原游标不动**（见 `docs/api/admin.md` 的伪码）：
-    // 只要 `truncated = true`，至少有一段本轮处理了 `limit` 行并推进了游标，
-    // 故循环必然收敛。
+    // 在续扫循环里对 `null` **保持原游标不动**：只要 `truncated = true`，至少有一段
+    // 本轮处理了 `limit` 行并推进了游标，故循环必然收敛。
     report.truncated = part_truncated || asm_truncated;
     if full_scope {
         report.next_part_after_id = next_cursor(&part_targets);
