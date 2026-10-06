@@ -5,13 +5,15 @@
 //! 跨域调用方（part / assembly / delivery_note / wx / prod::worker_pool / task）
 //! 走 `PartBatchRepo::xxx(&mut *conn, ...)` 静态调用形态。
 //!
-//! ## 本目录的 4 个文件
+//! ## 本目录的 3 个文件
 //! - `mod.rs` —— 本域批次 **下发给车间** 专用查询（pending 列表 / auto-dispatch
 //!   预览 / 首道 step），ZST `BatchRepo`
 //! - `queries.rs`（本文件）—— `t_part_batch` 通用 SQL 真源，ZST `PartBatchRepo`
 //! - `sql.rs` —— inspection / lifecycle 流转写点（`status_gate` 之上的薄包装）
-//! - `list.rs` —— 8-JOIN 列表（inspection / repair / repairing 集合读）
 //! - `trait.rs` —— 胖 trait `PartBatchRepoTrait` + `impl for &mut PgConnection`
+//!
+//! 2026-10-07：第 4 个文件 `list.rs`（待品检队列窄投影）连同其端点迁往
+//! `prod::inspection`；返修两条集合读在 service 层自建 SQL，不在本目录。
 //!
 //! ## 错误类型
 //! repo 静态方法 → `sqlx::Error`（唯一特殊：`split_batch` 内部守卫 0 行 →

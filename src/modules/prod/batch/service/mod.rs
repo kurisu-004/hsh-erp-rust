@@ -1,7 +1,7 @@
 //! prod::batch 域业务逻辑（按业务流聚合，`impl BatchService` 拆文件）
 //!
 //! 2026-10-02：`t_part_batch` 是生产执行单元，本模块承载**以批次为对象**的全部
-//! 用例 —— 下发流 + 25 条批次路由的业务逻辑 + 它们共用的状态机 / OCC 守卫。
+//! 用例 —— 下发流 + 24 条批次路由的业务逻辑 + 它们共用的状态机 / OCC 守卫。
 //! part 域只留「多批次动作」（`POST /api/v2/parts/{part_id}/cancel` /
 //! `force-complete`）与 part 级动作（CRUD / 文件 / 各类 list）。
 //!
@@ -14,12 +14,11 @@
 //! - `shelf.rs` —— 上架 / 召回（place-on-shelf / recall-to-pending）
 //! - `programming.rs` —— CNC 编程出口（release-from-programming）
 //! - `outsource.rs` —— 外协流转三端点
-//! - `repair.rs` —— 返修闭环两写点 + 三条集合读
+//! - `repair.rs` —— 返修闭环两写点 + 两条集合读（`/repair` / `/repairing`）
 //! - `batch_ops.rs` —— 拆批 / 取消批次
 //! - `pickup.rs` —— 手动 pick-up
 //! - `scan.rs` —— 扫码品检 / 司机扫码发货
 //! - `worker_scan.rs` —— 工人扫码台主入口（RETURNED / INSPECTED 二合一）
-//! - `list.rs` —— INSPECTION 状态批次集合读
 //! - `guard.rs` —— 全部用例共用的自由函数：状态机守卫 / OCC / 货架校验 /
 //!   status_gate 薄包装
 //!
@@ -35,7 +34,7 @@
 //! `PartBatchRepo` + `status_gate`。即调用链是
 //! `prod::batch::service → part::repo::PartRepoTrait → prod::batch::repo`：
 //! **prod 域的 service 借 part 域的 trait 写 prod 域自己的表**，这是当前真实存在的
-//! 反向依赖，不是单向。少数集合读与拆批直接调本域 `PartBatchRepo`（经
+//! 反向依赖，不是单向。少数拆批用例直接调本域 `PartBatchRepo`（经
 //! `repo.conn_mut()`），不改变上述借用关系。part → prod 方向另有 `status_gate` +
 //! `PartBatchRepo` 两处数据依赖，代码调用点分布在 `part::service` 的 `batch` /
 //! `crud` / `rollup` / `list_enrichment` / `phase1::events`。
@@ -56,7 +55,6 @@ pub mod batch_ops;
 pub mod dispatch;
 pub mod guard;
 pub mod lifecycle;
-pub mod list;
 pub mod outsource;
 pub mod pickup;
 pub mod programming;

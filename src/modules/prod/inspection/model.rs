@@ -1,7 +1,10 @@
-//! prod::inspection 子模块 行模型 —— repo `query_as!` 宏的行结构
+//! prod::inspection 子模块 行模型 —— repo 的 SQL 投影行结构
 //!
 //! 2026-10-05 新增：3 个行结构（`ScanPartRow` / `ScanAssemblyRow` / `ScanBatchRow`），
 //! 字段与 [`super::vo`] 的同名出参结构**一一对应**。
+//!
+//! 2026-10-07 新增：[`InspectionQueueRow`]（待品检队列读的 repo ↔ service 边界类型，
+//! 随 `GET /api/v2/prod/inspection/queue` 自 `prod::batch` 迁入）。
 //!
 //! ## 为什么行结构与 VO 分开两层
 //! 行结构是 SQL 的投影（列名 + DB 原生类型 + 可能的 `LEFT JOIN` 空值），
@@ -16,9 +19,14 @@
 //!   `t_part_batch` 行），故不需要 `version`（OCC 锚在批次上）
 //! - [`ScanBatchRow`] 只读 10 列 + `part_id` 供 service 内存分组（见
 //!   `t_part_batch` **无序列号列**这一事实）
+//! - [`InspectionQueueRow`] 读 13 列（3-JOIN 窄投影），字段与
+//!   `vo::InspectionQueueItemOut` 逐字同形；SQL 侧列别名直接取语义名
+//!   （`pb.id AS batch_id` 等），repo 层 1:1 搬运，service 只做形状转换
 //!
-//! 三个行结构都 `#[derive(sqlx::FromRow)]` —— `query_as!(Struct, …)` 宏需要它
+//! 四个行结构里三个 `#[derive(sqlx::FromRow)]` —— `query_as!(Struct, …)` 宏需要它
 //! 才能把 DB 行搬进结构体，且宏在编译期按列名 + 列类型逐字段校验。
+//! [`InspectionQueueRow`] 的 SQL 由 `QueryBuilder` 动态拼装（动态 `ORDER BY` +
+//! 可选过滤，宏无法固化），故同样手写 `FromRow`（列名由常量 SELECT 里的别名承接）。
 
 use chrono::NaiveDate;
 use sqlx::FromRow;
@@ -98,4 +106,32 @@ pub struct ScanBatchRow {
     /// ⚠️ `INSPECTION` / `DELIVERED` 批次**恒为 `None`**：这两态按「出池清
     /// `current_process_id`」不变式把该列置 NULL，这是**正确**结果不是缺陷。
     pub process_name: Option<String>,
+}
+
+// ===== 待品检队列（`GET /queue`） =====
+
+/// `GET /api/v2/prod/inspection/queue` 单行中间结构（repo ↔ service 边界类型）。
+///
+/// 2026-10-07 自 `prod::batch::model` 迁入（域迁移，字段与投影逐字不变）。
+/// 待品检页只渲染 7 个数据列（序列号 / 图号 / 名称 / 批次 / 数量 / 系统交期 /
+/// 客户），故只投 13 列 —— 不投 holder / 工序 / 送货单。
+/// `l1_customer_name` 的派生在 repo 层完成（原料列 `c.parent_id` / `pc.name`）。
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct InspectionQueueRow {
+    pub batch_id: i64,
+    pub part_id: i64,
+    pub batch_no: i32,
+    pub quantity: i32,
+    /// OCC 锚 `t_part_batch.version`（不是 `t_part.version`）。
+    pub version: i32,
+    pub serial_no: Option<String>,
+    pub drawing_no: String,
+    pub name: String,
+    /// 系统交期（页面已不显示计划交期，日期筛选改筛本列）。
+    pub system_delivery_date: Option<NaiveDate>,
+    pub is_urgent: bool,
+    pub customer_id: i64,
+    pub customer_name: Option<String>,
+    /// L1 集团名（由 `c.parent_id` 是否为空派生，口径见 [`super::repo`]）。
+    pub l1_customer_name: Option<String>,
 }

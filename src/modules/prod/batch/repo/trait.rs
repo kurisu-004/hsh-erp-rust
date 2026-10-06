@@ -5,9 +5,12 @@
 //!
 //! 2026-10-03 集合读收口：删掉 2 条 `list.rs` 的镜像声明与转发 —— 原
 //! `list_batches_with_part` / `count_batches_with_part`（待品检端点迁移后零调用方）。
-//! 本分支新增的 `list_inspection_queue` / `count_inspection_queue` 一律**不进** trait：
-//! service 走固有方法 `PartBatchRepo::yyy`，从不经 trait 侧。trait 只镜像**确有
-//! trait 侧调用方**的方法；集合读一律走 `PartBatchRepo` 固有方法，不进胖 trait。
+//! 集合读一律**不进**胖 trait：service 走 ZST 的固有方法（`PartBatchRepo::yyy`），
+//! 从不经 trait 侧。trait 只镜像**确有 trait 侧调用方**的方法。
+//!
+//! 2026-10-07 待品检队列读迁往 `prod::inspection`（`list_inspection_queue` /
+//! `count_inspection_queue` 随之迁走），本 trait 声明数不变（那 2 条本来就**不在**
+//! trait 里），零改动。
 //!
 //! ## 为什么是胖 trait
 //! `&mut PgConnection` 同一作用域只能借给一个 repo 实例；service 同时需要

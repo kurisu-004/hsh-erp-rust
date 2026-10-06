@@ -427,10 +427,11 @@ impl BatchService {
         // SQL + `list_pickable_by_work_type` + rollup 派生；**展示类列表一律走
         // step 派生**。完整清单见 `prod/batch/model.rs` 模块 doc。
         //
-        // ⚠️ 本函数与 `GET /prod/batches/inspection` 的查询（`repo/list.rs::
-        // list_inspection_queue`，2026-10-03 VO 收口后是 3-JOIN 窄投影且**不投影**
-        // `next_process_*`）是**两条独立 SQL**，M3 当年只回退了 inspection 端点那条；
-        // 本条当时漏网，本次补齐。
+        // ⚠️ 本函数与 `GET /prod/inspection/queue` 的查询
+        // （`prod/inspection/repo.rs::InspectionQueueRepo::list_inspection_queue`，
+        // 2026-10-03 VO 收口后是 3-JOIN 窄投影且**不投影** `next_process_*`）是
+        // **两条独立 SQL**，M3 当年只回退了 inspection 端点那条；本条当时漏网，
+        // 本次补齐。
         let rows: Vec<InspectionRepairRow> = sqlx::query_as::<_, InspectionRepairRow>(
             "SELECT b.id AS batch_id, b.part_id, b.batch_no, b.quantity, b.status, b.is_repairing,              b.location, b.version, b.current_process_step_id, b.parent_batch_id,              b.current_holder_id, COALESCE(s.name, w.name, oc.name) AS holder_name,              s2.process_id AS next_process_id, p2.name AS next_process_name,              b.delivery_note_id, dn.delivery_note_no,              p.serial_no, p.drawing_no, p.name, p.order_no, p.planned_delivery_date,              p.is_urgent, p.version AS part_version, p.created_at, p.updated_at,              p.customer_id, c.name AS customer_name, c_l1.name AS l1_customer_name              FROM t_part_batch b JOIN t_part p ON p.id = b.part_id              LEFT JOIN t_customer c ON c.id = p.customer_id              LEFT JOIN t_customer c_l1 ON c_l1.id = c.parent_id AND c_l1.deleted_at IS NULL              LEFT JOIN t_shelf s ON s.id = b.current_holder_id              LEFT JOIN t_worker w ON w.id = b.current_holder_id              LEFT JOIN t_outsource_company oc ON oc.id = b.current_holder_id              LEFT JOIN t_process_chain_step s2 ON s2.id = b.current_process_step_id              LEFT JOIN t_process p2 ON p2.id = s2.process_id              LEFT JOIN t_delivery_note dn ON dn.id = b.delivery_note_id              WHERE b.deleted_at IS NULL AND p.deleted_at IS NULL              AND (CASE WHEN $9::bool THEN b.is_repairing = true ELSE b.status = ANY($1) END)              AND (NOT $9::bool OR b.status NOT IN ('COMPLETED', 'CANCELLED'))              AND ($2 = '' OR p.drawing_no ILIKE '%' || $2 || '%' OR p.name ILIKE '%' || $2 || '%')              AND ($3::bigint IS NULL OR p.customer_id = $3)              AND ($4::text IS NULL OR p.serial_no ILIKE '%' || $4 || '%')              AND ($5::date IS NULL OR p.planned_delivery_date >= $5)              AND ($6::date IS NULL OR p.planned_delivery_date <= $6)              ORDER BY b.id DESC LIMIT $7 OFFSET $8",
         )

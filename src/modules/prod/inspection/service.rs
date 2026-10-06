@@ -2,19 +2,23 @@
 //!
 //! 2026-10-05 新增：单个方法 [`InspectionScanService::scan`]。
 //!
+//! 2026-10-07 新增：待品检队列读 [`InspectionQueueService::list_queue`]（自
+//! `prod::batch::service::list` 迁入，规范化口径与 SQL 逐字未变），与扫码读同域。
+//!
 //! ## 角色守卫
 //! 下沉到 service 第一行（沿 `prod::batch` 的 `TO_XXX_ROLES` 范本），
-//! `current.require_any_role(&[Role::Manager, Role::Inspector])`；handler 仅做
+//! `current.require_any_role(READ_ROLES)`；handler 仅做
 //! 参数提取，不重复校验。
 //!
-//! 白名单**只有 2 个角色**（与 `GET /api/v2/prod/batches/inspection` 及
+//! 白名单**只有 2 个角色**（与 `GET /api/v2/prod/inspection/queue` 及
 //! `to-ship` / `to-inspection` / `to-process` 三个写端点同一组）：扫码树是
 //! 品检动作的前置上下文，放行 `Clerk` / `CncProgrammer` / `ShelfAccount` 会
-//! 让它们看到本该看不到的批次明细。
+//! 让它们看到本该看不到的批次明细。队列读的白名单逐字相同（迁前就是同一组，
+//! 常量 [`READ_ROLES`] 现由两个 service 共用，改白名单只需改这一处）。
 //!
 //! ## 事务边界
-//! 读端点不开事务（handler `pool.acquire()` 借 `&mut PgConnection`），与
-//! `prod::batch` 的 inspection 集合读一致。纯读，**不发** WS 广播。
+//! 读端点不开事务（handler `pool.acquire()` 借 `&mut PgConnection`）。纯读，
+//! **不发** WS 广播。
 //!
 //! ## 命中顺序：先 `t_part` 再 `t_assembly`
 //! 序列号在**两张表都有值域**（子件 `{asm}-{i:02d}` 与父件 `{prefix}{4 位}`），
@@ -34,18 +38,23 @@ use std::collections::HashMap;
 use sqlx::PgConnection;
 
 use crate::auth::rbac::{CurrentUser, Role};
+use crate::modules::prod::inspection::dto::InspectionQueueQuery;
 use crate::modules::prod::inspection::model::{ScanAssemblyRow, ScanBatchRow, ScanPartRow};
-use crate::modules::prod::inspection::repo::InspectionScanRepo;
-use crate::modules::prod::inspection::vo::{
-    ScanAssemblyOut, ScanBatchOut, ScanPartOut, ScanTreeOut,
+use crate::modules::prod::inspection::repo::{
+    InspectionQueueFilters, InspectionQueueRepo, InspectionScanRepo,
 };
+use crate::modules::prod::inspection::vo::{
+    InspectionQueueItemOut, InspectionQueueListOut, ScanAssemblyOut, ScanBatchOut, ScanPartOut,
+    ScanTreeOut,
+};
+use crate::shared::customer::expand_customer_id;
 use crate::shared::error::{AppError, code};
 
-/// 扫码端点允许的角色：Manager 或 Inspector。
+/// 本域两个读端点（`GET /scan/{serial_no}` / `GET /queue`）允许的角色：Manager 或 Inspector。
 ///
-/// 与 `prod::batch::handler::transition` 的 `TO_XXX_ROLES` 同一组 —— 扫码树里的
-/// 批次就是那三个写端点的操作对象，能看就必须能操作。
-const SCAN_ROLES: &[Role] = &[Role::Manager, Role::Inspector];
+/// 与 `prod::batch::handler::transition` 的 `TO_XXX_ROLES` 同一组 —— 扫码树与
+/// 队列里的批次就是那三个写端点的操作对象，能看就必须能操作。
+const READ_ROLES: &[Role] = &[Role::Manager, Role::Inspector];
 
 /// `hit_kind` 出参的取值白名单。
 ///
@@ -90,7 +99,7 @@ impl InspectionScanService {
         current: &CurrentUser,
         serial_no: &str,
     ) -> Result<ScanTreeOut, AppError> {
-        current.require_any_role(SCAN_ROLES)?;
+        current.require_any_role(READ_ROLES)?;
 
         // 扫码枪偶发尾随空白 / 空格；空串等价于「没扫到东西」，按未命中收口。
         let serial_no = serial_no.trim();
@@ -243,5 +252,175 @@ fn batch_to_out(r: ScanBatchRow, is_scanned: bool) -> ScanBatchOut {
         // INSPECTION / DELIVERED 批次恒为 None：出池已清 current_process_id
         process_name: r.process_name,
         is_scanned,
+    }
+}
+
+// ===========================================================================
+//  待品检队列读（`GET /api/v2/prod/inspection/queue`）
+//  2026-10-07 自 `prod::batch::service::list` 迁入，规范化口径逐字未改
+// ===========================================================================
+
+/// 排序列白名单（`sort_by` → ORDER BY 列名）。
+///
+/// 映射放在 service 层而不是 repo：`order_col` 会被拼进 SQL 文本，只有经过这张
+/// 映射表的 `sort_by` 才能到达 repo —— 外部输入不可能直接成为 SQL 片段。
+///
+/// 与前端表头 7 列一一对应。
+fn resolve_order_col(sort_by: Option<&str>) -> &'static str {
+    match sort_by {
+        Some("SERIAL_NO") => "p.serial_no",
+        Some("DRAWING_NO") => "p.drawing_no",
+        Some("NAME") => "p.name",
+        Some("BATCH_NO") => "pb.batch_no",
+        Some("QUANTITY") => "pb.quantity",
+        Some("CUSTOMER_NAME") => "c.name",
+        // SYSTEM_DELIVERY_DATE + 缺省 + 非法值统一退化到系统交期
+        // （待品检页默认按交期近优先排）。
+        _ => "p.system_delivery_date",
+    }
+}
+
+/// 排序方向：仅 `DESC`（忽略大小写）被接受，其余（含缺省）→ `ASC`。
+fn resolve_order_dir(sort_dir: Option<&str>) -> &'static str {
+    match sort_dir {
+        Some(d) if d.eq_ignore_ascii_case("DESC") => "DESC",
+        _ => "ASC",
+    }
+}
+
+/// 文本筛选参数 → ILIKE pattern：拒绝 `%` / `_` / `\` 后拼 `%...%`。
+///
+/// 拒绝通配符是**语义**约束，不是注入防护：注入面由 repo 侧 `push_bind` 参数化保证。
+/// 拒它的理由是 `%…%` 会被 PG 当通配符放大 —— 表头筛选框只输一个 `%` 就能把整张
+/// 表捞出来，1 次请求退化成全表 ILIKE 扫描。空白串视为「不筛选」（筛选框清空态
+/// 传空串比传缺省更常见）。
+fn to_ilike_pat(field: &str, raw: Option<&str>) -> Result<Option<String>, AppError> {
+    let Some(v) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    if v.contains(['%', '_', '\\']) {
+        return Err(AppError::validation(format!(
+            "{field} 不能包含通配符 % _ \\"
+        )));
+    }
+    Ok(Some(format!("%{v}%")))
+}
+
+/// 队列读默认分页大小（200，clamp 区间 `[1, 200]`）。
+const DEFAULT_QUEUE_LIMIT: i64 = 200;
+
+/// `prod::inspection` 待品检队列读的 service（ZST，与本域扫码读范本一致）。
+pub struct InspectionQueueService;
+
+impl InspectionQueueService {
+    /// `GET /api/v2/prod/inspection/queue` 待品检队列列表。
+    ///
+    /// 返回 `status='INSPECTION'` 的全部活跃批次，出参严格对齐前端待品检页的 7 个
+    /// 数据列 + 操作列锚点。
+    ///
+    /// 流程：角色守卫 → limit/offset 规范化 → `customer_id` 展开为 L1+L2 ids →
+    /// 3 个表头文本筛选 trim + 拒通配符 + 拼 `%…%` → 排序白名单映射 →
+    /// `list_inspection_queue` + `count_inspection_queue` 两条 SQL（同 WHERE 拼装器）。
+    ///
+    /// 排序非法值**不报错**：非法 `sort_by` 退化为系统交期、非法 `sort_dir` 退化为
+    /// ASC（前端切表头不会拿到 5xx）。
+    pub async fn list_queue(
+        conn: &mut PgConnection,
+        query: &InspectionQueueQuery,
+        current: &CurrentUser,
+    ) -> Result<InspectionQueueListOut, AppError> {
+        current.require_any_role(READ_ROLES)?;
+
+        let limit = query.limit.unwrap_or(DEFAULT_QUEUE_LIMIT).clamp(1, 200);
+        let offset = query.offset.unwrap_or(0).max(0);
+
+        // customer_id 展开：单值 → [L1, 所有 L2]；None → 空切片（不过滤）
+        let customer_ids_owned: Vec<i64>;
+        let customer_ids: &[i64] = if let Some(cid) = query.customer_id {
+            customer_ids_owned = expand_customer_id(&mut *conn, cid).await?;
+            &customer_ids_owned
+        } else {
+            &[]
+        };
+
+        let drawing_no_pat = to_ilike_pat("drawing_no", query.drawing_no.as_deref())?;
+        let name_pat = to_ilike_pat("name", query.name.as_deref())?;
+        let serial_no_pat = to_ilike_pat("serial_no", query.serial_no.as_deref())?;
+
+        let filters = InspectionQueueFilters {
+            customer_ids,
+            drawing_no_pat: drawing_no_pat.as_deref(),
+            name_pat: name_pat.as_deref(),
+            serial_no_pat: serial_no_pat.as_deref(),
+            date_from: query.system_delivery_date_from,
+            date_to: query.system_delivery_date_to,
+            order_col: resolve_order_col(query.sort_by.as_deref()),
+            order_dir: resolve_order_dir(query.sort_dir.as_deref()),
+            limit,
+            offset,
+        };
+
+        let rows = InspectionQueueRepo::list_inspection_queue(&mut *conn, &filters).await?;
+        let total = InspectionQueueRepo::count_inspection_queue(&mut *conn, &filters).await?;
+
+        Ok(InspectionQueueListOut {
+            items: rows.into_iter().map(InspectionQueueItemOut::from).collect(),
+            total,
+            limit,
+            offset,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_order_col, resolve_order_dir, to_ilike_pat};
+
+    #[test]
+    fn order_col_whitelist_maps_and_degrades() {
+        assert_eq!(resolve_order_col(Some("SERIAL_NO")), "p.serial_no");
+        assert_eq!(resolve_order_col(Some("DRAWING_NO")), "p.drawing_no");
+        assert_eq!(resolve_order_col(Some("NAME")), "p.name");
+        assert_eq!(resolve_order_col(Some("BATCH_NO")), "pb.batch_no");
+        assert_eq!(resolve_order_col(Some("QUANTITY")), "pb.quantity");
+        assert_eq!(
+            resolve_order_col(Some("SYSTEM_DELIVERY_DATE")),
+            "p.system_delivery_date"
+        );
+        assert_eq!(resolve_order_col(Some("CUSTOMER_NAME")), "c.name");
+        // 缺省 / 非法值 → 系统交期（绝不 500）
+        assert_eq!(resolve_order_col(None), "p.system_delivery_date");
+        assert_eq!(
+            resolve_order_col(Some("p.serial_no; DROP TABLE t_part_batch")),
+            "p.system_delivery_date"
+        );
+    }
+
+    #[test]
+    fn order_dir_only_accepts_desc() {
+        assert_eq!(resolve_order_dir(Some("DESC")), "DESC");
+        assert_eq!(resolve_order_dir(Some("desc")), "DESC");
+        assert_eq!(resolve_order_dir(Some("ASC")), "ASC");
+        assert_eq!(
+            resolve_order_dir(Some("ASC;DROP TABLE t_part_batch")),
+            "ASC"
+        );
+        assert_eq!(resolve_order_dir(None), "ASC");
+    }
+
+    #[test]
+    fn ilike_pat_rejects_wildcards_and_blanks_out_empty() {
+        assert_eq!(
+            to_ilike_pat("name", Some("ABC")).unwrap().as_deref(),
+            Some("%ABC%")
+        );
+        assert_eq!(to_ilike_pat("name", Some("  ")).unwrap(), None);
+        assert_eq!(to_ilike_pat("name", None).unwrap(), None);
+        for bad in ["A%B", "A_B", "A\\B"] {
+            assert!(
+                to_ilike_pat("name", Some(bad)).is_err(),
+                "含通配符应被拒：{bad}"
+            );
+        }
     }
 }

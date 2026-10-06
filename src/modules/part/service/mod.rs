@@ -1,7 +1,7 @@
 //! part 域业务逻辑（按业务流聚合，`impl PartService`）
 //!
 //! 2026-10-02：`t_part_batch` 的归属连同**全部以批次为对象的用例**迁往
-//! `crate::modules::prod::batch`（repo / model / status_gate / 25 条路由的服务层）。
+//! `crate::modules::prod::batch`（repo / model / status_gate / 24 条批次路由的服务层）。
 //! 本模块自此只承载 part 级用例。
 //!
 //! - `crud.rs`：单件 CRUD（create_part / get_part / list_parts / update_part /

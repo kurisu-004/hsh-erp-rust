@@ -576,7 +576,7 @@ impl PartRepo {
     /// （Incremental Sort）。实测数据集下无需新增索引，故不加。
     ///
     /// 2026-10-03：待品检队列的排序列白名单是**另一套**，在 service 层
-    /// （`prod/batch/service/list.rs::resolve_order_col` / `resolve_order_dir`），
+    /// （`prod/inspection/service.rs::resolve_order_col` / `resolve_order_dir`），
     /// 缺省 `p.system_delivery_date` + `ASC`（本处是 `id` + `DESC`）。**不要**把两者
     /// 「统一」—— 白名单放 service 层时 repo 收不到任何外部输入，比放在 repo 内
     /// 更安全，但两个端点的缺省语义本就不同（零件一览按 id 倒序 = 最新在前，

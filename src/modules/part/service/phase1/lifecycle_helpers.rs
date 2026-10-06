@@ -48,7 +48,7 @@ impl PartService {
             //
             // 本分支 6ecdf2c 一度把两列改直读 `b.current_process_id`（migration 004），
             // 本冲突处**不采纳**该改法，理由与 2026-09-30 review 第 3 轮 M3 对
-            // `GET /prod/batches/inspection` 的回退完全同形：
+            // `GET /prod/inspection/queue` 的回退完全同形：
             //   - 本查询 WHERE **无 status 过滤**，会同时返回 PENDING / IN_PROCESS /
             //     INSPECTION / READY_TO_SHIP 等各状态批次（返修中的批次按
             //     IN_PROCESS 一并返回）；

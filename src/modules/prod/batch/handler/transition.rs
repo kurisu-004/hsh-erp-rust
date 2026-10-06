@@ -11,11 +11,17 @@
 //! - `POST /api/v2/prod/batches/to-ship` / `to-inspection`（批量，无 path）
 //! - `POST /api/v2/prod/batches/worker-scan`（无 path，`serial_no` 主键）
 //! - `POST /api/v2/prod/batches/scan/deliver`（无 path，`serial_no` 反查批次）
-//! - `GET  /api/v2/prod/batches/inspection` / `repair` / `repairing`
+//! - `GET  /api/v2/prod/batches/repair` / `repairing`
 //!
 //! ## 事务边界 + WS 广播
 //! 事务边界在 handler（`pool.begin()` → service → `tx.commit()`）；WS 广播在
 //! commit 之后（对齐 Python 延迟广播模式）。
+//!
+//! ## 2026-10-07 迁出
+//! 待品检队列读（`GET /api/v2/prod/batches/inspection`）连同其 DTO / VO / repo /
+//! service 一并迁往 `prod::inspection`（新路径 `GET /api/v2/prod/inspection/queue`，
+//! **无 alias**）—— 该页面现两个数据源同域。本文件保留集合读 2 条
+//! （`/repair` / `/repairing`）。
 //!
 //! ## 2026-10-02 语义变更
 //! 子资源 19 条的 `batch_id` 从**请求体**移到**路径参数**。事件 `kind` 字符串
@@ -33,16 +39,15 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::ws_hub::WsEvent;
 use crate::modules::part::vo::PartOut;
 use crate::modules::prod::batch::dto::{
-    BatchToInspectionRequest, BatchToShipRequest, InspectionQueueQuery, RepairBatchListQuery,
-    ScanDeliverPartRequest, ScanInspectRequest, ToInspectionRequest, ToProcessRequest,
-    ToShipRequest, WorkerScanRequest,
+    BatchToInspectionRequest, BatchToShipRequest, RepairBatchListQuery, ScanDeliverPartRequest,
+    ScanInspectRequest, ToInspectionRequest, ToProcessRequest, ToShipRequest, WorkerScanRequest,
 };
 use crate::modules::prod::batch::service::BatchService;
 use crate::modules::prod::batch::service::transition::{
     BATCH_TO_INSPECTION_MAX_ITEMS, BATCH_TO_SHIP_MAX_ITEMS,
 };
 use crate::modules::prod::batch::vo::{
-    BatchToXxxOut, InspectionBatchListOut, InspectionQueueListOut, ToXxxOut, WorkerScanOut,
+    BatchToXxxOut, InspectionBatchListOut, ToXxxOut, WorkerScanOut,
 };
 use crate::modules::prod::worker_pool::service::WorkerPoolService;
 use crate::shared::error::AppError;
@@ -358,23 +363,6 @@ pub async fn worker_scan(
         scan: scan_out,
         refill: refill_out,
     })))
-}
-
-/// `GET /api/v2/prod/batches/inspection`
-///
-/// 待品检队列列表（Manager + Inspector）。只读端点：`pool.acquire()` 不开事务。
-///
-/// 2026-10-03 VO 收口：出参切到 `InspectionQueueListOut`（13 字段），查询参数
-/// 换 `InspectionQueueQuery`（表头 7 列各一个筛选 + 服务端排序），与
-/// `/repair` / `/repairing` 的宽 VO 彻底分家。
-pub async fn list_inspection_batches(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Query(query): Query<InspectionQueueQuery>,
-) -> Result<Json<R<InspectionQueueListOut>>, AppError> {
-    let mut conn = state.pool.acquire().await?;
-    let out = BatchService::list_inspection_batches(&mut *conn, &query, &current).await?;
-    Ok(Json(R::ok(out)))
 }
 
 /// `GET /api/v2/prod/batches/repair`
