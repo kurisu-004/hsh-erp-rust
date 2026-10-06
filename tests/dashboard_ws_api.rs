@@ -1592,8 +1592,9 @@ async fn overdue_accepts_all_six_delivery_statuses() {
         6,
         "DELIVERY_STATUSES 的 6 个状态都应计入逾期"
     );
-    // 常量字面值本身也要钉死：它与前端 `LAYERS[].statuses` / `useDashboardUrgentList`
-    // 是**人工同步**关系（无编译期保障），漂了不会编译失败，只会让三个数字互相矛盾。
+    // 常量字面值本身也要钉死：它与前端柱状图 `LAYERS[].statuses`
+    // 是**人工同步**关系（无编译期保障），漂了不会编译失败，
+    // 只会让「逾期数」与「柱状图层数」互相矛盾。
     assert_eq!(
         DELIVERY_STATUSES,
         [

@@ -29,8 +29,11 @@ use crate::modules::dashboard::vo::{
 
 /// 影响「未交付」判定的状态白名单（2026-10-07）。
 ///
-/// 与前端 `useDashboardUrgentList.ts` 的 statuses 字面量逐字相同；
-/// 柱状图三层里 top(4) + middle(2) 正是这 6 态，bottom 层额外含 DELIVERED。
+/// 柱状图 `UpcomingDeliveryChart.vue` 的 `LAYERS[].statuses` 里 top(4) + middle(2)
+/// 正是这 6 态，bottom 层额外含 DELIVERED。
+/// 2026-10-07 前端把那两块交期面板的 urgent / partial 判定改为服务端按
+/// `delivered_quantity` 判定后，6 态在前端**只剩 `LAYERS[].statuses` 这一个镜像**
+/// ——改本常量时只需核对这一处。同步关系与症状见 docs/api/dashboard.md §5。
 pub const DELIVERY_STATUSES: [&str; 6] = [
     "PENDING",
     "PROGRAMMING",
@@ -40,9 +43,7 @@ pub const DELIVERY_STATUSES: [&str; 6] = [
     "READY_TO_SHIP",
 ];
 
-/// 最紧急 / 部分已交面板的窗口天数。2026-10-07 自前端
-/// `utils/systemDeliveryOrders.ts::DELIVERY_WINDOW_DAYS` 下沉到服务端（窗口判定与
-/// 截断一起下沉，前端不再自己过滤）。
+/// 最紧急 / 部分已交面板的窗口天数。窗口边界与分桶截断都在服务端算，前端不过滤。
 pub const DELIVERY_WINDOW_DAYS: i64 = 7;
 
 /// 每个分桶的最大行数（urgent / partial 各一条独立上限）。
@@ -186,7 +187,7 @@ impl DeliveryRepo {
                 delivered_quantity,
             };
             // 服务端分桶：0 = 一件没交过（最紧急），> 0 = 已交过一部分。
-            // 前端不再自己跑 splitForDashboard，判定必须留在这里。
+            // 判定必须留在这里，前端不再自己按已交数量分桶。
             if delivered_quantity == 0 {
                 urgent.push(order);
             } else {

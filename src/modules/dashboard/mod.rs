@@ -42,6 +42,10 @@ mod tests {
     //!
     //! 边界：只挡「他域」依赖，**不挡** `crate::shared` / `crate::infra` /
     //! `crate::auth` / `crate::state` 等公共设施依赖（那些是刻意允许的）。
+    //!
+    //! 另有一条口径边界：匹配的是 `modules` 与 `::` **紧邻**的写法，Rust 允许在
+    //! `modules` 与 `::` 之间插空白（`crate::modules :: part::…` 同样合法），本探测器
+    //! 不覆盖这种形态。要覆盖它得上词法分析，规则本身是讲解材料，不值得为它加成本。
 
     use std::path::{Path, PathBuf};
 

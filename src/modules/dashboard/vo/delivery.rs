@@ -29,8 +29,7 @@ pub struct SystemDeliveryOrder {
     pub delivered_quantity: i32,
 }
 
-/// 两桶结果（2026-10-07：窗口 / 判定 / 截断全部下沉服务端，
-/// 前端不再跑 splitForDashboard）
+/// 两桶结果（2026-10-07：窗口 / 判定 / 截断全部在服务端，前端不过滤）
 #[derive(Debug, Clone, Serialize)]
 pub struct SystemDeliveryOrders {
     /// 未交过（delivered_quantity == 0），按 system_delivery_date ASC

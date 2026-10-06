@@ -112,10 +112,15 @@
 ## 5. 状态域约定（无编译期保障）
 
 - 后端常量：`repo/delivery.rs::DELIVERY_STATUSES`
-- 前端对应：`useDashboardUrgentList.ts` 的 `statuses` 字面量 + 柱状图 `LAYERS[].statuses`
+- 前端对应：柱状图 `UpcomingDeliveryChart.vue` 的 `LAYERS[].statuses`——`top`（PENDING /
+  PROGRAMMING / IN_PROCESS / OUTSOURCE）+ `middle`（INSPECTION / READY_TO_SHIP）合起来
+  正是本常量的 6 态，`bottom`（DELIVERED）额外多一个。
+  2026-10-07 那两块交期面板的 urgent / partial 判定改为服务端按 `delivered_quantity`
+  判定后，6 态在前端**只剩 `LAYERS[].statuses` 这一个镜像**（见 §2.2）。
 
-两者是**人工同步**关系：Rust 常量与 TS 字面量之间没有任何编译期约束，漂了不会编译失败，只会让「逾期数」「面板条数」「柱状图层数」互相矛盾（且现象是数字对不上、极难定位）。**改任一侧必须同步另一侧**，集成测试
-`overdue_accepts_all_six_delivery_statuses` 会把后端常量的字面值钉死。
+两者是**人工同步**关系：Rust 常量与 TS 字面量之间没有任何编译期约束，漂了不会编译失败，
+只会让「逾期数」与「柱状图层数」互相矛盾（且现象是数字对不上、极难定位）。改任一侧必须同步另一侧；
+集成测试 `overdue_accepts_all_six_delivery_statuses` 把后端常量的字面值钉死，也只会抓到这一种症状。
 
 ## 6. 移除记录（2026-10-07）
 
@@ -153,15 +158,24 @@ dashboard 是**只读跨域聚合域**——这是本仓既定 pattern（`statis
 
 ### 8.2 前端配套改动清单
 
-1. **composable 增删**
-   - 删：`useDashboardOnProductionShelves`（整棵嵌套树的数据源已消失）
-   - 收窄：`useDashboardInProcess` 的行类型 → 7 字段 `WorkerHeldBatch`
-   - 收窄：`useDashboardInspection` 从「拉 12 列全行」改为「读 `in_inspection_count`」
-   - 新增：`useDashboardSystemDeliveryOrders`（数据源自 `com/union-list` 的聚合端点切到 `GET /api/v2/dashboard/snapshot` 的 `system_delivery_orders`）
-   - 新增：`useDashboardUpcomingList` 的数据源切到 `GET /api/v2/dashboard/delivery-orders`（`date` + `statuses` + `basis`），不再靠前端过滤全量
+1. **composable 增删**（对照 `views/dashboard/composables/` 实际落地）
+   - 删：`useDashboardUrgentList` / `useDashboardOverdue` / `useDashboardUpcomingList` 三个
+     composable，及承载其全部过滤逻辑的 `utils/systemDeliveryOrders.ts`（整文件）
+   - 留：`useDashboardSnapshot` —— 新增 `overdue_count` / `in_inspection_count` /
+     `system_delivery_orders`；`in_process` 行类型收窄到 7 字段 `WorkerHeldBatch`
+     （原 `DashboardItem` 19 字段）；不再返回 `on_production_shelves` /
+     `on_inspection_shelves` / `upcoming_delivery`
+   - 新增：`useDashboardUpcoming` —— 端点 2 `GET /api/v2/dashboard/upcoming-delivery`
+     的 `today` + `buckets[]`
+   - 新增：`useDashboardDeliveryOrders` —— 端点 3 `GET /api/v2/dashboard/delivery-orders`
+     的抽屉明细（`date` + `statuses` + `basis`），取代原 `useDashboardUpcomingList`
+   - 视图侧：`SystemDeliveryOrdersPanel.vue` 数据源自 `com/union-list` 切到快照的
+     `system_delivery_orders`；`DashboardKpiTiles.vue` 读 `overdue_count` /
+     `in_inspection_count`；`UpcomingDeliveryChart.vue` + `UpcomingDeliveryListDrawer.vue`
+     接端点 2 / 3
 2. **`deliveryBasis` 缺省改为 `system`**（原 `planned`）。后端 `DeliveryBasis::Default` 已同步改为 `System`。
 3. **`gcTime: POSITIVE_INFINITY` 例外的适用 query 集合变化**：原来只需对 `snapshot` 长缓存（WS 事件驱动 invalidate）；现在 `upcoming-delivery` 与 `delivery-orders` 也应进例外集合（`today` 锚点 + 窗口下限决定它们天然按天变化，不该在跨零点时被旧数据卡住）。
-4. **前端不再跑 `splitForDashboard`**：窗口过滤、`delivered_quantity == 0` 判定、两桶 30 条截断全在服务端。
+4. **窗口过滤、`delivered_quantity == 0` 判定、两桶 30 条截断全在服务端**（前端不再自己过滤）。
 5. **逾期数来源变更**：原为调 `GET /statistics/overview` 取 1 个数字（后端跑 9 条 SQL、返 16 标量 + 2 数组 + 2 嵌套结构，且口径是 `planned_delivery_date`，与同页右栏面板的 `system_delivery_date` 互相矛盾）→ 现直接读 `snapshot.overdue_count`。
 6. **「在制」标签改名「在加工」**：`in_process` 的 SQL 硬约束是 `location='WORKER'`，语义是「已从货架/品检区出池、压在工人手上」，叫「在制」是误导。
 
