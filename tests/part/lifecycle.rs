@@ -1439,6 +1439,22 @@ async fn recall_to_pending_allows_worker_held_batch() {
     assert_eq!(loc, None, "召回后 location 必须清 NULL");
     assert_eq!(holder, None, "召回后 current_holder_id 必须清 NULL");
     assert_eq!(pid_col, None, "召回后 current_process_id 必须清 NULL");
+
+    // 工人持有列表的谓词是 `location='WORKER' AND current_holder_id=$worker_id`
+    // （take_one_from_pool 的 held 容量 CTE 同谓词）⇒ 召回后该批次对工人工位
+    // 立即不可见，工位容量随之回落，无需额外回收动作。
+    let still_held: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM t_part_batch \
+         WHERE location = 'WORKER' AND current_holder_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(worker_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count worker-held rows");
+    assert_eq!(
+        still_held, 0,
+        "召回后批次不得残留在工人持有列表 / 工位容量计数里"
+    );
 }
 
 /// 2026-10-06：location 白名单是「生产架 + 工人」，其余 location 仍拒。

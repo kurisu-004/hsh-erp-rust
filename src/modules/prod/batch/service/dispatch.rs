@@ -276,7 +276,8 @@ impl BatchService {
     /// 流程（不开事务）：
     /// 1. 角色守卫：Manager + Clerk
     /// 2. 空 batch_ids → `40001 VALIDATION_ERROR`
-    /// 3. 调 `preview_auto_dispatch` 单 SQL 拉所有 PENDING batch 的 preview 元数据
+    /// 3. 调 `preview_auto_dispatch` 单 SQL 拉待下发白名单
+    ///    （`PENDING` / `PROGRAMMING`）内 batch 的 preview 元数据
     /// 4. 对每个 preview 行计算 skip_reason：
     ///    - process_chain_id None → `NO_PROCESS_CHAIN`
     ///    - first_process_id None → `NO_PROCESS_STEP`
@@ -296,7 +297,7 @@ impl BatchService {
             return Err(AppError::validation("auto-dispatch batch_ids 不能为空"));
         }
 
-        // 单 SQL 拉 preview（已包含 batch_id 在 PENDING+未软删 的过滤）
+        // 单 SQL 拉 preview（已包含 batch_id 在待下发白名单 + 未软删 的过滤）
         let previews = BatchRepo::preview_auto_dispatch(&mut *conn, &batch_ids).await?;
         let preview_ids: std::collections::HashSet<i64> =
             previews.iter().map(|p| p.batch_id).collect();
@@ -328,7 +329,7 @@ impl BatchService {
             })
             .collect();
 
-        // 兜底：不在 preview 结果里的 batch_id（已软删 / 非 PENDING / 不存在）
+        // 兜底：不在 preview 结果里的 batch_id（已软删 / 不在待下发白名单 / 不存在）
         // → 单独补一行 + skip_reason='NOT_FOUND'。该路径无法取到 chain/step/shelf，
         // 全部 Option 置 None（→ JSON `null`），对齐上游 OK 路径的 Option 语义。
         for batch_id in &batch_ids {
@@ -933,8 +934,8 @@ mod tests {
     /// 2026-10-06：已废弃的 `PROGRAMMING` 批次必须能正常下发（service 白名单 +
     /// repo 层 `allowed_from` 两道闸门都要放行）。
     ///
-    /// 这条同时锁住「只改 service 不改 `allowed_from`」那种半改法 —— 那样会走到
-    /// `apply_batch_status_change` 的 SQL 层源状态闸门被拒（40901 / 0 行）。
+    /// 这条同时覆盖 service 层状态白名单与 `apply_batch_status_change` 的 SQL 层
+    /// 源状态闸门（`allowed_from`）：后者漏放行会在 UPDATE 阶段被拒（40901 / 0 行）。
     #[tokio::test]
     async fn dispatch_batch_accepts_programming_batch() {
         let pool = test_pool().await;
@@ -1538,5 +1539,94 @@ mod tests {
         assert!(r.items[0].process_chain_id.is_some());
         assert!(r.items[0].first_process_id.is_some());
         assert!(r.items[0].first_shelf_id.is_none());
+    }
+
+    /// 2026-10-06：已废弃的 `PROGRAMMING` 批次必须能被自动下发预览命中。
+    ///
+    /// `preview_auto_dispatch` 的 WHERE 若退回只收 `status = 'PENDING'`，该批次
+    /// 会整条落空 → service 的 `NOT_FOUND` 兜底分支接手（`process_chain_id` /
+    /// `first_process_id` / `first_shelf_id` 全 None），前端「自动下发」把它显示成
+    /// 「批次不存在或状态不可下发」并跳过。故本条断言整条 preview 元数据链
+    /// （chain / 首道工序 / 首货架）都在，且 `skip_reason` 为空。
+    #[tokio::test]
+    async fn auto_dispatch_preview_includes_programming_batch() {
+        let pool = test_pool().await;
+        let user_id = insert_user_with_role(&pool, "manager1", "password", "MANAGER").await;
+        let customer_id = insert_customer_l2(&pool, "ACME").await;
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+
+        // 完整链路：工艺链 + 首道 step + 首货架映射（保证 skip_reason 无从谈起）
+        let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
+        let now = now_naive();
+        let chain_id = snowflake.next_id();
+        sqlx::query(
+            "INSERT INTO t_part_process_chain (id, version, created_at, created_by, updated_at, updated_by) \
+             VALUES ($1, 0, $2, 1, $2, 1)",
+        )
+        .bind(chain_id)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let process_first = insert_process(&pool, "P-PROG-AUTO", "FIRST").await;
+        let shelf_first = insert_shelf(&pool, "SH-PROG-AUTO", "PRODUCTION").await;
+        link_shelf_to_process(&pool, shelf_first, process_first).await;
+        sqlx::query(
+            "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, estimated_minutes, version, \
+             created_at, created_by, updated_at, updated_by) VALUES ($1, $2, 1, $3, 0, 0, $4, 1, $4, 1)",
+        )
+        .bind(snowflake.next_id())
+        .bind(chain_id)
+        .bind(process_first)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let p_prog = insert_part(
+            &pool,
+            "P-PROG-AUTO",
+            "DWG-PROG-AUTO",
+            customer_id,
+            today,
+            Some(today),
+            false,
+            Some(chain_id),
+        )
+        .await;
+        let b_prog = insert_part_batch_with_status(&pool, p_prog, "PROGRAMMING").await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let r = BatchService::auto_dispatch_preview(
+            &mut conn,
+            &make_current(user_id, Role::Manager),
+            vec![b_prog],
+        )
+        .await
+        .expect("preview OK");
+        // 落进 preview 结果就该只有 1 条；若整条落空，兜底分支会补出 NOT_FOUND 行
+        assert_eq!(r.items.len(), 1, "PROGRAMMING 批次应只产出 1 条 preview 项");
+        assert_eq!(
+            r.items[0].batch_id, b_prog,
+            "命中行必须是入参里的那个 PROGRAMMING 批次"
+        );
+        assert_ne!(
+            r.items[0].skip_reason.as_deref(),
+            Some("NOT_FOUND"),
+            "PROGRAMMING 批次被 preview 的状态闸门漏掉，会走 NOT_FOUND 兜底"
+        );
+        assert_eq!(r.items[0].skip_reason, None, "链路完整 ⇒ 可自动下发");
+        assert_eq!(r.items[0].process_chain_id, Some(chain_id));
+        assert_eq!(r.items[0].first_process_id, Some(process_first));
+        assert_eq!(r.items[0].first_shelf_id, Some(shelf_first));
+
+        // DB 验证：preview 只读，批次仍是 PROGRAMMING
+        let row: String = sqlx::query_scalar("SELECT status FROM t_part_batch WHERE id = $1")
+            .bind(b_prog)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row, "PROGRAMMING", "preview 不应改变 batch.status");
     }
 }

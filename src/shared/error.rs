@@ -113,7 +113,8 @@ pub mod code {
     pub const BIZ_PART_REPAIR_NOT_TRIGGERED: i32 = 20118; // start-repair 操作要求零件当前为 IN_PROCESS
     pub const BIZ_PART_NOT_DELETABLE: i32 = 20119; // 零件处于终态 (DELIVERED/COMPLETED) 或已挂送货单，禁 soft-delete
     // 2026-09-29 新增：prod/batch 下发（dispatch）阶段专用错误码。
-    // - 20120 BIZ_BATCH_INVALID_STATUS：批次当前 status 不允许 dispatch（非 PENDING）
+    // - 20120 BIZ_BATCH_INVALID_STATUS：批次当前 status 不允许 dispatch
+    //   （不在待下发白名单 PENDING / PROGRAMMING 内）
     // - 20121 BIZ_BATCH_NOT_FOUND：dispatch 时按 batch_id 查不到（与 20109 BIZ_PART_BATCH_NOT_FOUND
     //   语义近似但属于 prod/batch 上下文独立槽位，方便前端按 code 区分场景）
     pub const BIZ_BATCH_INVALID_STATUS: i32 = 20120;
