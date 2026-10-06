@@ -246,8 +246,9 @@ pub struct PartListItem {
     /// 真要读这个语义，两个口都在别处：编程页走
     /// `GET /api/v2/prod/programming/pending`（真相源是 `t_part_file kind='G_CODE'`
     /// 的 EXISTS 子查询）；worker_pool 候选池的「已编程批次优先 take」走它自己的
-    /// `PoolBatchItem.has_cnc_program`（`prod::worker_pool::repo::sql`），与本字段
-    /// 无数据关系。
+    /// `PoolBatchItem.has_cnc_program`（VO 定义在 `prod::worker_pool::vo::worker_pool`；
+    /// EXISTS 真相源与「已编程优先 take」的 `has_cnc_program DESC` 排序键都在
+    /// `prod::worker_pool::repo::sql`），与本字段无数据关系。
     #[serde(default)]
     pub has_cnc_program: bool,
     /// 2026-10-03 新增：活跃批次雪花 id（序列化走 `serialize_i64_opt` → JSON string）。
