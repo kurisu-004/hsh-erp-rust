@@ -4,6 +4,9 @@
 // analytics 不挂 URL、不进 modules/mod.rs（仅在 shared::analytics 命名空间下），
 // 没有 handler/service/repo/dto/vo 五段式，详见 analytics/mod.rs 顶部注释。
 pub mod analytics;
+// 2026-10-07 新增 domain_guard：跨域只读聚合域（dashboard / prod::programming …）的
+// 域隔离护栏，把「本域不 import 其它域的 service / repo」从口头约定变成 CI 强制。
+pub mod domain_guard;
 pub mod error;
 pub mod pagination;
 pub mod response;

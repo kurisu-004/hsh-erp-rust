@@ -53,3 +53,29 @@ pub mod vo;
 pub fn router() -> Router<Arc<AppState>> {
     Router::new().route("/pending", get(handler::list_pending))
 }
+
+#[cfg(test)]
+mod tests {
+    //! 域隔离护栏：把「待编程域不依赖其它域」从口头约定变成 CI 强制。
+    //!
+    //! 探测器实现（剥注释、根段 + 域路径前缀匹配、元测试）见
+    //! [`crate::shared::domain_guard`]，本域只负责传参 + 域专属指引。
+
+    use std::path::Path;
+
+    use crate::shared::domain_guard::assert_no_foreign_domain;
+
+    /// 待编程域只允许 `crate::` 下的 `auth` / `infra` / `shared` / `state`
+    /// 与本域自身；代码区里出现任何其它域的路径即失败（`prod` 下的兄弟域同样是
+    /// 别的域，如 `prod::batch`）。
+    #[test]
+    fn programming_domain_depends_on_no_other_domain() {
+        assert_no_foreign_domain(
+            "prod::programming",
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src/modules/prod/programming"),
+            "需要别的域的数据时，正确做法是像 statistics / admin 那样在本域 SQL 里只读聚合\
+             （待编程口径要读的 t_part / t_process / t_process_chain_step / t_part_batch / \
+             t_part_file 等表，SQL 真源见 [`repo`](repo.rs)），而不是 import 别人的 service / repo。",
+        );
+    }
+}
