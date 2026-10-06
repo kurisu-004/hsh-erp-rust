@@ -72,7 +72,7 @@ ScanTreeOut
 | `version` | number | `p.version` ⚠️ **仅展示**，任何批次写动作的 OCC 锚是 `ScanBatchOut::version` |
 | `children[]` | array | `ScanBatchOut` |
 
-### 2.5 `ScanBatchOut` 逐字段（11）—— 本端点唯一的写操作锚
+### 2.5 `ScanBatchOut` 逐字段（10）—— 本端点唯一的写操作锚
 
 | 字段 | 类型 | SQL 来源 / 口径 |
 |---|---|---|
@@ -87,7 +87,7 @@ ScanTreeOut
 | `process_name` | string \| null | `LEFT JOIN t_process pr ON pr.id = b.current_process_id`。⚠️ 对 `INSPECTION` / `DELIVERED` 批次**恒为 `null`**（见 §2.7） |
 | `is_scanned` | boolean | 本端点**唯一**内存派生字段（见 §2.6） |
 
-⚠️ **`current_holder_display` 的多态歧义**：`COALESCE(s.name, w.name, oc.name)` 假定 holder id 在三表 PK 空间里互不重叠；一旦某 id 同时命中其中两表，取到的是 `t_shelf.name`。完整说明（全仓 6 处清单 + 正确解法 `CASE location …`）见 `src/modules/prod/batch/repo.rs` 模块 doc；**本文件是该形态的全仓第 6 处**。刻意不修：修一处会让 6 条 SQL 对部分历史脏数据的行为发生变化，且「先清脏数据还是先改判别式」需产品侧确认；**修时必须 6 处一起改**。
+⚠️ **`current_holder_display` 的多态歧义**：`COALESCE(s.name, w.name, oc.name)` 假定 holder id 在三表 PK 空间里互不重叠；一旦某 id 同时命中其中两表，取到的是 `t_shelf.name`。完整说明（全仓 6 处清单 + 正确解法 `CASE location …`）见 `src/modules/prod/batch/repo/mod.rs` 模块 doc（⚠️ `prod::batch::repo` 是**目录**，模块 doc 在 `mod.rs` 而非 `repo.rs`）；**本文件是该形态的全仓第 6 处**。刻意不修：修一处会让 6 条 SQL 对部分历史脏数据的行为发生变化，且「先清脏数据还是先改判别式」需产品侧确认；**修时必须 6 处一起改**。
 
 ### 2.6 命中口径与 `is_scanned`
 
@@ -132,17 +132,21 @@ ScanTreeOut
 | `drawing_no` | string | `p.drawing_no ILIKE '%…%'` | 不过滤 | 含 `%` / `_` / `\` → **40001**（HTTP 422）；空白串按不过滤 |
 | `name` | string | `p.name ILIKE '%…%'` | 不过滤 | 同上 |
 | `serial_no` | string | `p.serial_no ILIKE '%…%'`（⚠️ 本端点是**模糊**，与 `prod::programming` 的精确 `serial_no` 不同） | 不过滤 | 同上 |
-| `customer_id` | i64 | 客户筛选，单值 | 不过滤 | 客户不存在（含软删）→ **20102**（HTTP 404）；非数字字面量 → HTTP 400 纯文本 |
+| `customer_id` | i64 | 客户筛选，单值 | 不过滤 | 客户不存在（含软删）→ **20102**（HTTP 404）；非数字字面量 → HTTP 400 纯文本；⚠️ 空串同样 → HTTP 400 纯文本（同一机制，见 §4.3） |
 | `system_delivery_date_from` | `YYYY-MM-DD` | 系统交期下界（**含**） | 不过滤 | 格式非法 → HTTP 400 纯文本（`chrono::NaiveDate` 反序列化失败） |
 | `system_delivery_date_to` | `YYYY-MM-DD` | 系统交期上界（**含**） | 不过滤 | 同上 |
 | `sort_by` | string | 排序列白名单，7 键（见 §5.2） | 系统交期 | **不报错**，静默退化到 `p.system_delivery_date` |
 | `sort_dir` | string | `ASC` / `DESC` | `ASC` | **不报错**，非 `DESC`（忽略大小写）一律按 `ASC` |
-| `limit` | i64 | 每页行数 | **200** | clamp 到 `[1, 200]`；空串按缺省；非数字字面量 → HTTP 400 纯文本 |
-| `offset` | i64 | 偏移 | `0` | 负数 `max(0)`；空串按缺省；非数字字面量 → HTTP 400 纯文本 |
+| `limit` | i64 | 每页行数 | **200** | clamp 到 `[1, 200]`；非数字字面量 → HTTP 400 纯文本；⚠️ **空串 / 全空白 → HTTP 400 纯文本**（⚠️ 与 `prod::programming` 相反：那边走私有 `deserialize_i64_opt_lenient` 兜成缺省） |
+| `offset` | i64 | 偏移 | `0` | 负数 `max(0)`；非数字字面量 → HTTP 400 纯文本；⚠️ **空串 / 全空白 → HTTP 400 纯文本**（⚠️ 与 `prod::programming` 相反：那边走私有 `deserialize_i64_opt_lenient` 兜成缺省） |
 
 ⚠️ 本端点**不接** `statuses` 参数：判据写死 `pb.status = 'INSPECTION'`。要按其它状态筛请走 `GET /api/v2/prod/batches/repair` / `/repairing`（属 `prod::batch` 域，28 字段宽 VO）。
 
 ⚠️ 日期区间筛的是**系统交期**（页面已不显示计划交期）。与 `prod::programming` 的 `sort_by` 白名单里**有** `REQUEST_DATE` / `PLANNED_DELIVERY_DATE` 不同，本域没有这两列可排。
+
+⚠️ **三个 i64 入参的空串一律 400，不是按缺省**（`customer_id` / `limit` / `offset`，2026-10-07 review 第 1 轮订正原「空串按缺省」的错述）。链路：`dto.rs` 三个字段都标 `deserialize_with = "deserialize_i64_opt"`，指向 `shared::types::deserialize_i64_opt` —— 它对 `Some(str)` 只有一条 `str.parse::<i64>()`，**既不 trim 也不放行空串**。而 `serde_urlencoded 0.7.1` 的 `deserialize_option` 无条件 `visit_some`，`?limit=` 拿到的是 `Some("")` 而非 `None` ⇒ `"".parse::<i64>()` 失败 ⇒ axum `Query` extractor 拒绝 ⇒ **HTTP 400 纯文本（无 `R` 信封）**。连带后果：`limit=%2050`（数字两侧带空白）同样 400。
+
+⇒ ⚠️ 同一组「筛选框清空态」在前端必须**按域分别处理**：待编程页三个参数都能发空串（本域的宽松版 helper 兜着），待品检页三个参数**发空串就 400**。前端清空筛选时应**省略该 query key**（不带 `=`），不要发空值。
 
 ### 3.2 `InspectionQueueListOut` 逐字段
 
@@ -250,6 +254,7 @@ JOIN 只有 3 张：`t_part_batch` JOIN `t_part` JOIN `t_customer`（L2）+ `t_c
 
 - ⚠️ 拒绝是**语义**约束，不是注入防护：注入面由 repo 侧 `push_bind` 参数化保证。拒它的理由是 `%…%` 会被 PG 当通配符放大 —— 表头筛选框只输一个 `%` 就能把整张表捞出来，1 次请求退化成全表 ILIKE 扫描。
 - ⚠️ **与 `prod::programming` 的做法相反**：那边是**转义**通配符（`escape_like` + `ESCAPE '\'`，`keyword=50%` 命中字面量含 `50%` 的行），这边是**拒绝**（40001）。两边都有各自的理由，**不要互相统一**。
+- ⚠️ **另一条与 `prod::programming` 相反的分叉：分页 i64 入参的空串容错**（2026-10-07 review 第 1 轮登记，详见 §3.1）。⚠️ 本条的 3 个 ILIKE 文本筛选**有** trim（`to_ilike_pat` 第一步就 trim、空串按不过滤），但 `customer_id` / `limit` / `offset` 走的是 `shared::types::deserialize_i64_opt`，**没有** trim 也没有空串兜底 ⇒ 空串 400。`prod::programming` 三个对应参数（`limit` / `offset` / `has_cnc_program`）全走它自己那个私有宽松版 helper（`deserialize_i64_opt_lenient` / `deserialize_bool_opt`，两者都先 trim 再兜空串）⇒ 那边空串是**缺省**。⇒ **不要**因为「本域 3 个文本筛选对空串宽容」就推断分页参数也宽容，两组参数的宽容度在同域内都不一致。
 
 ## 5. 错误码表
 
@@ -363,6 +368,7 @@ JOIN 只有 3 张：`t_part_batch` JOIN `t_part` JOIN `t_customer`（L2）+ `t_c
 2. **同域内 `t_customer` 软删口径不一致**（端点 2 带闸门、端点 1 不过滤，见 §8.1）。这是迁域时「SQL 与派生口径逐字未改」的必然结果：队列读的 JOIN 是从 `prod::batch` 原样搬过来的。产品决议（2026-10-07）：**不处理**，端点 1 的「不过滤」与 `prod::programming` 一致（历史工单要显示原客户名）。
 3. **`current_holder_display` 的 holder 三表 COALESCE 多态歧义**（§2.5，本形态全仓第 6 处）。产品决议（2026-10-07）：**不处理**（需先确认「清脏数据」还是「改判别式」，且修必须 6 处同批）。
 4. **读端点不开事务 ⇒ 装配件分支的 2~4 条语句不保证同一快照**（READ COMMITTED 下每条语句各看一个快照）。理论上的可撕裂场景：4 条语句之间被扫中的子件被软删 ⇒ `children` 里没有自己刚扫的码、全树 `is_scanned = false`，**无任何错误提示**。发生概率极低，且全仓读端点都是这个形态（读端点不开事务是本仓约定），故不改；真要消除只能给读端点开 REPEATABLE READ 快照事务，属跨域惯例改动。
+5. **⚠️ `customer_id` / `limit` / `offset` 的空串容错与 `prod::programming` 相反，且无测试钉住**（§3.1 / §4.3）。本域三个字段复用 `shared::types::deserialize_i64_opt`（不 trim、不放行空串），`prod::programming` 三个字段走**该域**私有的宽松版 helper（trim + 空串按缺省）—— 后者正是当初被 `?limit=` 的 400 逼出来的（见 `src/modules/prod/programming/dto.rs` 模块 doc）。⚠️ `tests/part/inspection_batches.rs` **无空串用例** ⇒ 这条宽容度分叉在 CI 上没有任何保护，后人「顺手对齐」或「顺手收紧」都不会被测试拦住。产品决议（2026-10-07）：**不处理**（本域前端目前不发空串）；⚠️ 改任一侧的 i64 反序列化前必须先看另一侧，并补一条空串用例。
 
 ## 9. 域隔离
 

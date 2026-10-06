@@ -18,7 +18,7 @@
 
 | 参数 | 类型 | 语义 | 缺省 | 非法值处理 |
 |---|---|---|---|---|
-| `has_cnc_program` | bool（三态） | Tab 切换：`true` 仅已上传 G_CODE、`false` 仅未上传、`None` 全部 | 不过滤 | 非 `true` / `false` 字面量 → axum `Query` 提取器 **HTTP 400 纯文本**（不走 `R` 信封）；**空串按缺省**（不过滤），不是 422 |
+| `has_cnc_program` | bool（三态） | Tab 切换：`true` 仅已上传 G_CODE、`false` 仅未上传、`None` 全部 | 不过滤 | 非 `true` / `false` 字面量 → axum `Query` 提取器 **HTTP 400 纯文本**（不走 `R` 信封）；**空串按缺省**（不过滤），不是 422。⚠️ **大小写不敏感；首尾空白会被 trim**（详见下方） |
 | `keyword` | string | `name` / `drawing_no` / `serial_no` 三列任一 `ILIKE '%kw%'` | 不过滤 | 任意字符串都接受；trim 后空串 → 不过滤；`%` / `_` / `\` 被**转义**成字面量（见 §3.4） |
 | `serial_no` | string | 工单序列号**精确**匹配（`p.serial_no = $n`） | 不过滤 | trim 后空串 → 不过滤 |
 | `sort_by` | string | 排序列白名单，7 键（见 §4.3） | 计划交期 | **不报错**，一律静默退化到 `p.planned_delivery_date`（含注入串、小写写法） |
@@ -29,6 +29,15 @@
 ⚠️ **宽容度是对齐过的，不是巧合**：`limit` / `offset` 走 `dto.rs` 私有 `deserialize_i64_opt_lenient`、`has_cnc_program` 走私有 `deserialize_bool_opt`，两者都显式兜住 serde_urlencoded 对空串的 `visit_some`（`?limit=` 会得到 `Some("")` 而非 `None`）。这保证「筛选框清空态」在前端三种参数上表现一致（按缺省处理），不会有一半走 400 一半走缺省。
 
 ⚠️ 带引号的字面量（`?limit="50"`）是**非法**值 → 400；后端不剥引号。
+
+⚠️ **`has_cnc_program` 的宽容度比「非 `true` / `false` 就 400」更宽**（2026-10-07 review 第 1 轮订正）。`dto.rs` 私有 `deserialize_bool_opt` 的顺序是**先 `str::trim`、再 `eq_ignore_ascii_case`**：
+
+- 大小写不敏感：`true` / `TRUE` / `True` / `tRuE` 全部接受；`false` 同理。
+- 首尾空白被 trim：`?has_cnc_program=%20false%20` → `Some(false)`。
+- ⚠️ **纯空白按缺省而非 400**：`?has_cnc_program=%20` trim 后是空串 ⇒ 落进 `None | Some("")` 那一支 ⇒ `Ok(None)`（不过滤）。即「空串按缺省」的口径要**包含全空白**，不只字面空串。
+- trim 之后仍非 `true` / `false`（如 `abc` / `1` / `yes`）才是 400 纯文本。
+
+⚠️ 与 `limit` / `offset` 的宽容度口径一致（三者都先 trim 再判），但**实现来源不同**：本域三个都走 `programming/dto.rs` 的私有 helper。⚠️ `prod::inspection` 队列的同位置参数（`customer_id` / `limit` / `offset`）走 `shared::types::deserialize_i64_opt`，**不 trim、不放行空串** ⇒ 那边发空串是 400 而不是缺省。详见 `docs/api/inspection.md` §3.1。
 
 ## 2. `ProgrammingListOut` 逐字段
 
@@ -256,7 +265,26 @@ service 规范化后由 `repo.rs::escape_like` 把用户 keyword 里的 `\ / % /
 
 ### 7.2 ⚠️ 与前端白名单是**人工同步**关系（无编译期保障）
 
-前端 `useDashboardInvalidation.ts` 的 `AFFECTS_DASHBOARD` 集合是 dashboard 域的失效白名单，与本域**没有**订阅关系 —— 本域页面不消费 WS 事件。⚠️ 而上面那张表里的 `PART_RELEASED_FROM_PROGRAMMING` / `PART_CANCELLED` / `PART_FORCE_COMPLETED` / `BATCH_PLACED_ON_SHELF` / `PART_SENT_TO_OUTSOURCE` / `PART_RECEIVED_FROM_OUTSOURCE` **连 `frontend/src/types/dashboard.ts` 的 `DashboardEventType` 联合类型都没进**，遑论进白名单。
+前端 `useDashboardInvalidation.ts` 的 `AFFECTS_DASHBOARD` 集合是 dashboard 域的失效白名单，与本域**没有**订阅关系 —— 本域页面不消费 WS 事件。⚠️ 而 §7.1 表里的 `kind` **有一部分连 `frontend/src/types/dashboard.ts` 的 `DashboardEventType` 联合类型都没进**，遑论进白名单。
+
+⚠️ 下表是 §7.1 全部 12 个 `kind` 与该联合的**逐项差集**（2026-10-07 review 第 1 轮补全 —— 原版只列了 6 个，漏了 `PART_COMPLETED`）。⚠️ 后端 `kind` 是裸 `String`、**无枚举保护**，所以这份差集不会在任一侧编译失败，只会在「列表不动」这类症状里显形；⚠️ §7.1 每新增一个 `kind` 都要回来重算本表。
+
+| §7.1 `kind` | 在 `DashboardEventType` 联合里？ |
+|---|---|
+| `PART_RELEASED_FROM_PROGRAMMING` | ❌ 不在（**本域唯一写出口**，见 §8.3 第 1 条） |
+| `PART_CANCELLED` | ❌ 不在 |
+| `PART_COMPLETED` | ❌ 不在 |
+| `PART_FORCE_COMPLETED` | ❌ 不在 |
+| `BATCH_PLACED_ON_SHELF` | ❌ 不在（⚠️ 易误判：联合里那个是 v1 旧事件集里的 `PLACED_ON_SHELF`，**与本 kind 不是同一个字符串**） |
+| `PART_SENT_TO_OUTSOURCE` | ❌ 不在 |
+| `PART_RECEIVED_FROM_OUTSOURCE` | ❌ 不在 |
+| `PART_SOFT_DELETED` | ✅ 在 |
+| `PART_DELIVERED` | ✅ 在 |
+| `PART_BATCH_CANCELLED` | ✅ 在 |
+| `PART_BATCH_SPLIT` | ✅ 在 |
+| `PART_BATCH_WITH_PDFS_CREATED` | ✅ 在 |
+
+⇒ 差集共 **7 个**（前 7 行），交集 5 个。「在联合里」只保证 TS 侧能把它当 `DashboardEventType` 用，**不代表进了 `AFFECTS_DASHBOARD` 白名单** —— 后者是 `useDashboardInvalidation.ts` 里的独立集合，本域页面两条路都不走。
 
 **无编译期约束的后果**：任一侧新增 `kind` 不会让另一侧编译失败，只会让「看板不动 / 列表不动」这类症状极难定位。§8.3 登记了本域的具体已知偏差。
 
