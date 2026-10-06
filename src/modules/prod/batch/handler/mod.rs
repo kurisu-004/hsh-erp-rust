@@ -138,11 +138,11 @@ pub fn router() -> Router<Arc<AppState>> {
 //
 // **改一同步二的义务**：往上面的 `router()` 加/删一条 `.route(...)` 时，
 // `mod tests::routes_declared_in_router` 会立刻红，直到
-// `ROUTES` 与 `STRIP_REGISTRY` 同步更新为止。
+// `ROUTES` 与 `STRIP_TARGETS` 同步更新为止。
 
 /// 本域 router 注册的全部路由（`METHOD /path`，相对 `/api/v2/prod/batches`）。
 ///
-/// 2026-10-08 起它是**剥离登记表的唯一真源**：`STRIP_REGISTRY` 按同序同下标给出
+/// 2026-10-08 起它是**剥离登记表的唯一真源**：`STRIP_TARGETS` 按同序同下标给出
 /// 每条路由的目标域，单测据本表与 `router()` 源码比对（见 `mod tests`）。
 /// 单独维护两份平行的「路由清单」必然漂移，故只留这一份。
 pub const ROUTES: &[&str] = &[

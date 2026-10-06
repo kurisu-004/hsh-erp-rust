@@ -72,9 +72,20 @@ mod sql_count_guard_tests {
     //! 改法：字段集合同形、held 总数守恒、所有集成测试照样全绿，只有工人数放大时
     //! 请求数悄悄涨回去。
     //!
-    //! 集成测试数不了 SQL 条数（sqlx 0.9 不再为 `sqlx::query` 发 tracing 事件，
-    //! PG 侧 `pg_stat_statements` 又要预热 + 扩展才有意义），所以只能退回源码级
-    //! 护栏 —— 与 `shared::batch::status::write_guard_tests` 同款做法。
+    //! 本条是**结构断言**（源码级），不是行为断言。运行时计数同样可行：sqlx 的
+    //! `QueryLogger` 逐语句发 `target: "sqlx::query"` 的 DEBUG 事件（带
+    //! `db.statement` / `rows_affected` / `rows_returned` / `elapsed`），而
+    //! `LogSettings::default()` 的 `statements_level` 就是 `LevelFilter::Debug`、
+    //! 本仓未覆盖它，故装一个按该 target 计数的 subscriber 便可断言「2 工与 10 工
+    //! 两次请求的条数相等」。
+    //!
+    //! 这里仍取结构断言，是因为计数要可靠归属到「本次请求」：
+    //! `tracing::subscriber::with_default` 只在当前线程生效，而集成测试是同一进程
+    //! 内并行跑多个 case，得改用全局 subscriber + 按 span 归属计数，或 `Instrument`
+    //! 把本请求的 dispatch 带进 tokio worker 线程 —— 后者在 `#[tokio::test]` 由
+    //! current_thread 改成 multi_thread 时会静默少计，「条数相等」退化成
+    //! 0 == 0 的假绿。PG 侧 `pg_stat_statements` 则要预热 + 装扩展才有意义，同样
+    //! 不作为 CI 判据。
     //!
     //! ## 判定规则
     //!
