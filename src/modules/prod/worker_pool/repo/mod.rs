@@ -68,7 +68,7 @@ use async_trait::async_trait;
 use sqlx::PgConnection;
 
 use crate::modules::part::model::{NewPartEvent, TPart};
-use crate::modules::prod::batch::model::TPartBatch;
+use crate::shared::batch::TPartBatch;
 use crate::modules::prod::process::model::TProcess;
 use crate::modules::prod::work_type::model::TWorkType;
 use crate::modules::prod::worker::model::TWorker;
@@ -204,7 +204,7 @@ pub trait WorkerPoolRepoTrait: Send {
     async fn part_batch_count_held_by_worker(&mut self, worker_id: i64)
     -> Result<i64, sqlx::Error>;
 
-    /// 按 id 查 batch（`PartBatchRepo::get_by_id`）。
+    /// 按 id 查 batch（`shared::batch::get_batch_by_id`）。
     async fn part_batch_get_by_id(
         &mut self,
         id: i64,
@@ -524,7 +524,7 @@ impl WorkerPoolRepoTrait for &mut PgConnection {
         id: i64,
         include_deleted: bool,
     ) -> Result<Option<TPartBatch>, sqlx::Error> {
-        crate::modules::prod::batch::repo::PartBatchRepo::get_by_id(
+        crate::shared::batch::get_batch_by_id(
             &mut **self,
             id,
             include_deleted,
@@ -537,7 +537,7 @@ impl WorkerPoolRepoTrait for &mut PgConnection {
         &mut self,
         part_id: i64,
     ) -> Result<Vec<TPartBatch>, sqlx::Error> {
-        crate::modules::prod::batch::repo::PartBatchRepo::list_active_by_part_id(
+        crate::shared::batch::list_active_batches_by_part_id(
             &mut **self,
             part_id,
         )

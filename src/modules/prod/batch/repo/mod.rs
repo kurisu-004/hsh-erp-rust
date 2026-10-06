@@ -213,9 +213,9 @@ impl BatchRepo {
     /// ⇒ 对多工序链工单它永远停在**首次定位**的那一步，故不可当「当前走到第几步」
     /// 用，只作可选的显示用定位信息。
     ///
-    /// 本函数是 `status_gate::apply_batch_status_change` 之上的薄包装
+    /// 本函数是 `batch_status::apply_batch_status_change` 之上的薄包装
     /// （全仓唯一 `t_part_batch.status` 写入口，写完状态自动补做
-    /// part → assembly 派生）。返回 `Result<u64, AppError>`：status_gate 用
+    /// part → assembly 派生）。返回 `Result<u64, AppError>`：shared::batch::status 用
     /// `VERSION_CONFLICT` 表达「没写成」，转 `sqlx::Error` 会把 409 降级成 500。
     pub async fn update_batch_dispatched(
         conn: &mut PgConnection,
@@ -225,9 +225,9 @@ impl BatchRepo {
         updated_by: Option<i64>,
         current_process_id: i64,
     ) -> Result<u64, AppError> {
-        crate::modules::prod::batch::status_gate::apply_batch_status_change(
+        crate::shared::batch::status::apply_batch_status_change(
             conn,
-            crate::modules::prod::batch::status_gate::StatusChange {
+            crate::shared::batch::status::StatusChange {
                 batch_id,
                 new_status: "IN_PROCESS",
                 new_location: Some("PRODUCTION_SHELF"),
@@ -235,7 +235,7 @@ impl BatchRepo {
                 new_process_id: Some(current_process_id),
                 // 显示用定位信息：dispatch 路径不解析 step，step 写 NULL
                 //（由下方 `clear_process_step_id: true` 表达；`new_process_step_id:
-                // None` 在 status_gate 里是「不改」，与「清 NULL」是两件事）。
+                // None` 在 shared::batch::status 里是「不改」，与「清 NULL」是两件事）。
                 new_process_step_id: None,
                 is_repairing: None,
                 expected_version: Some(expected_version),

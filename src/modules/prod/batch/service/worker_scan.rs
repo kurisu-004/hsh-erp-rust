@@ -323,7 +323,7 @@ impl BatchService {
                     ));
                 }
                 // 切 holder worker → target_shelf + 状态 IN_PROCESS → INSPECTION（OCC）
-                // 2026-10-01：写 + part 派生 + assembly 级联已在 status_gate 内完成，
+                // 2026-10-01：写 + part 派生 + assembly 级联已在 shared::batch::status 内完成，
                 // 0 行由 gate 抛 40901（原 `if n == 0` 是死代码）。
                 let rollup = repo
                     .mark_batch_inspected(batch.id, batch.version, target_id, Some(current.id))

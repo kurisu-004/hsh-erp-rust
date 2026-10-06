@@ -481,7 +481,7 @@ pub struct PickUpRequest {
     /// pick-up 路径上 `shelf_id` 只进 `validate_shelf_zone`，而它内部只
     /// `SELECT ... FROM t_shelf WHERE id = $1 AND deleted_at IS NULL`（零写）；
     /// 本路径 `t_part_batch` 的全部 3 个写入点（拆成 4 条 SQL；`pickup.rs` 内联
-    /// SQL、`guard.rs` → `status_gate.rs` 的通用 UPDATE、部分领取的
+    /// SQL、`guards.rs` → `status.rs` 的通用 UPDATE、部分领取的
     /// `split_batch_for_partial_pass` = `_split_batch_inner` 的 INSERT + UPDATE）
     /// 的 SET 与 WHERE 均无货架列或货架条件；
     /// `t_part_event` 无货架列；响应 VO `PartOut` 无 shelf 字段。

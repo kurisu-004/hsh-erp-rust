@@ -120,7 +120,7 @@ pub async fn recompute_rollup(
     }
     drop(conn);
 
-    // ---- part 段：batch → part（父装配件由 status_gate 内部级联）----
+    // ---- part 段：batch → part（父装配件由 shared::batch::status 内部级联）----
     for chunk in part_targets.chunks(CHUNK_SIZE) {
         let mut tx = state.pool.begin().await?;
         for part_id in chunk {

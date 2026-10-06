@@ -24,7 +24,7 @@ use std::collections::{HashMap, HashSet};
 use sqlx::PgConnection;
 
 use crate::modules::part::repo::PartRepoTrait;
-use crate::modules::prod::batch::model::TPartBatch;
+use crate::shared::batch::TPartBatch;
 use crate::modules::prod::batch::repo::PartBatchRepo;
 use crate::shared::error::AppError;
 
@@ -302,7 +302,7 @@ pub(crate) async fn fetch_delivered_sets(
 /// 2026-10-01：删掉 `"IN_PROCESS" | "REPAIRING" => 2` 的合并臂，改回单值
 /// `"IN_PROCESS" => 2`。REPAIRING 降级为 `t_part_batch.is_repairing` 标记列
 /// 后，`t_part.status` 里不会再出现该字面量（migration 006 已把存量洗白，
-/// status_gate 也永不写它）。
+/// shared::batch::status 也永不写它）。
 ///
 /// ⚠️ 存量兼容：migration 006 未 apply 的环境里仍可能读到 `'REPAIRING'`，此时
 /// 落到 `_ => 2` 兜底臂 —— 恰好与原 REPAIRING 档位（2）相同，故本函数对

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, part_id, batch_no, quantity, status, location,\n                   current_holder_id, current_process_id, current_process_step_id,\n                   delivery_note_id, parent_batch_id,\n                   is_repairing,\n                   version, created_at, created_by, updated_at, updated_by, deleted_at\n            FROM t_part_batch\n            WHERE id = $1\n              AND ($2::bool OR deleted_at IS NULL)\n            ",
+  "query": "\n        SELECT id, part_id, batch_no, quantity, status, location,\n               current_holder_id, current_process_id, current_process_step_id,\n               delivery_note_id, parent_batch_id,\n               is_repairing,\n               version, created_at, created_by, updated_at, updated_by, deleted_at\n        FROM t_part_batch\n        WHERE id = $1\n          AND ($2::bool OR deleted_at IS NULL)\n        ",
   "describe": {
     "columns": [
       {
@@ -229,5 +229,5 @@
       true
     ]
   },
-  "hash": "c2ef9603821dfbfe17eb47f35095738ca9b5ad0a457bc13e69ca5448e085cba6"
+  "hash": "a908eb2850bfada44582653287789b8ba4343cd2bca7ee3ab01bbf08b10af763"
 }

@@ -1,7 +1,7 @@
-//! **唯一**批次状态写入口（status_gate）
+//! **唯一**批次状态写入口
 //!
-//! 2026-10-01 新增（原落 `part/service/status_gate.rs`）；2026-10-02 随
-//! `t_part_batch` 归属迁入 prod 域，与 `repo/` 同域。
+//! 2026-10-08 自 `prod::batch::status_gate` 上移到 shared 层：派生链跨 part /
+//! assembly / batch 三域，与 `shared::batch` 模块 doc 的边界小节同因。
 //!
 //! # 为什么要有这个模块
 //!
@@ -57,7 +57,7 @@
 //!
 //! step 2–5 抽成本模块的 [`rollup_part_derived`]，`PartService::sync_from_batch_change`
 //! 改为一行委托它。两条路径共用同一段派生代码，因此**行为完全一致**：
-//! 经 status_gate 写完状态后再调 `sync_from_batch_change` 是安全的冗余
+//! 经本模块写完状态后再调 `sync_from_batch_change` 是安全的冗余
 //! （第二次 target == 当前 → NoChange），不会出现两次释放序列号。
 //!
 //! # 为什么收 `&mut PgConnection` 而不是泛型 `impl PgExecutor<'_>`
@@ -76,10 +76,10 @@ use crate::modules::assembly::service::{AssemblyService, SyncOutcome};
 use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::sql::PartRepo;
 use crate::modules::part::statemachine::{BatchForRollup, compute_part_target};
-use crate::modules::prod::batch::repo::PartBatchRepo;
+use crate::shared::batch::read::list_active_batches_by_part_id;
 use crate::shared::error::{AppError, code};
 
-/// 一次批次状态变更的完整意图（status_gate 的唯一入参形状）。
+/// 一次批次状态变更的完整意图（本模块的唯一入参形状）。
 ///
 /// 2026-10-01 新增。**所有可选列的 `None` 语义统一为「保持原值」**
 /// （SQL `COALESCE($n, col)`），「清 NULL」一律由同名 `clear_*` 标志显式表达。
@@ -321,7 +321,7 @@ pub(crate) async fn write_batch_status_row(
         return Err(AppError::biz(
             code::BIZ_INVALID_VALUE,
             format!(
-                "status_gate: 批次 {} 的 allowed_from 为空，拒绝无条件改写状态",
+                "批次 {} 的 allowed_from 为空，拒绝无条件改写状态",
                 ch.batch_id
             ),
         ));
@@ -357,7 +357,7 @@ pub(crate) async fn write_batch_status_row(
 
 /// step 2–5：part 派生 + assembly 反向同步 + 终态序列号归档 / 释放。
 ///
-/// `PartService::sync_from_batch_change` 与 status_gate 共用本函数，两者行为
+/// `PartService::sync_from_batch_change` 与本模块共用本函数，两者行为
 /// 完全一致（前者是「只做派生」的历史入口，后者是「写 + 派生」的合并入口）。
 ///
 /// ## `event_id`（2026-10-01 review 第 1 轮 M4）
@@ -377,7 +377,7 @@ pub async fn rollup_part_derived(
     event_id: Option<i64>,
 ) -> Result<RollupOutcome, AppError> {
     // ---- step 2.1：拉 part 全部活跃批次（rollup 只看活跃行）----
-    let batches = PartBatchRepo::list_active_by_part_id(&mut *conn, part_id).await?;
+    let batches = list_active_batches_by_part_id(&mut *conn, part_id).await?;
     let rows: Vec<BatchForRollup> = batches
         .iter()
         .map(|b| BatchForRollup {
@@ -750,9 +750,9 @@ fn is_terminal(status: &str) -> bool {
 /// 测试也全绿，只是 `t_part.status` / `t_assembly.status` 从此长期与真源不一致，
 /// 表现为列表页显示错状态。用户看到的是「这单明明还在厂里怎么显示已交付」。
 ///
-/// 2026-10-01 的 status_gate 改造把写与派生焊进 [`apply_batch_status_change`]
+/// 2026-10-01 的写入口收口把写与派生焊进 [`apply_batch_status_change`]
 /// 之后，「漏调」这个选项
-/// 从类型层面消失了；但**绕过** status_gate 直接写一行的能力还在（任何人拿
+/// 从类型层面消失了；但**绕过**本模块直接写一行的能力还在（任何人拿
 /// `sqlx::query` 手写 UPDATE 都不受编译期约束）。这个测试就是那道约束的
 /// 持续执行者：把「不该出现的写法」变成 CI 里的一条红线。
 ///
@@ -764,7 +764,7 @@ fn is_terminal(status: &str) -> bool {
 /// - lib 的 `#[cfg(test)]` 模块被 `cargo test` / `cargo nextest run --lib`
 ///   无条件执行，不需要任何命令行参数、不需要起容器，几百毫秒内完成 —— 于是
 ///   「忘了这茬」的成本降到 0，它是真能当日常 CI 闸门的东西。
-/// - 它也正好住在被保护的那扇门（`status_gate.rs`）里，规则的 rationale 与规则本身
+/// - 它也正好住在被保护的那扇门（`status.rs`）里，规则的 rationale 与规则本身
 ///   写在一起，后人改这个模块时必然读到。
 ///
 /// ## 判定规则
@@ -831,7 +831,7 @@ mod bind_guard_tests {
         let max = max_placeholder(BATCH_STATUS_UPDATE_SQL);
         assert_eq!(
             max, BATCH_STATUS_UPDATE_BIND_COUNT,
-            "status_gate 单行 UPDATE：SQL 最大占位符 ${max}，但 bind 了 \
+            "本模块单行 UPDATE：SQL 最大占位符 ${max}，但 bind 了 \
              {BATCH_STATUS_UPDATE_BIND_COUNT} 个 —— PG 会在 Bind 阶段报 \
              `bind message supplies N parameters, but prepared statement requires M`，\
              且 sqlx 的 statement cache 被污染，同连接后续所有查询一起失败。\
@@ -856,7 +856,7 @@ mod write_guard_tests {
     ///
     /// 写死成字面量而不是 `file!()`：`file!()` 只能证明「本文件自己干净」，
     /// 而这条规则要表达的是「**别的**文件不许写」，两者不是一回事。
-    const SANCTIONED: &str = "src/modules/prod/batch/status_gate.rs";
+    const SANCTIONED: &str = "src/shared/batch/status.rs";
 
     /// 扫描用的字面量。
     ///
@@ -1261,7 +1261,7 @@ mod write_guard_tests {
     ///     **文档**，排除掉之后规则才能盯住真实 SQL。
     ///
     /// (b) **`#[cfg(test)]` 块** —— 排除。全仓唯一的真实例子是
-    ///     `src/modules/prod/batch/service.rs::dispatch_batch_concurrent_modification_collects_invalid_status_failure`
+    ///     `prod::queue` 的 `dispatch_batch_concurrent_modification_collects_invalid_status_failure`
     ///     里的 `UPDATE t_part_batch SET status='IN_PROCESS', version=99`：
     ///     它故意把 version 顶到 99 来**伪造一次并发改动**。`StatusChange` 的
     ///     OCC 只会 `version + 1`，表达不了「凭空跳到 99」，所以这条 fixture
@@ -1324,13 +1324,13 @@ mod write_guard_tests {
         assert!(
             violations.is_empty(),
             "以下 {} 处直接写了 `t_part_batch.status`，绕过了 `t_part_batch` 域唯一 \
-             状态写入口 `src/modules/prod/batch/status_gate.rs`：\n{}\n\
+             状态写入口 `src/shared/batch/status.rs`：\n{}\n\
              \n\
-             规则（见 `status_gate.rs` 末尾 `mod write_guard_tests`）：\n\
+             规则（见 `status.rs` 末尾 `mod write_guard_tests`）：\n\
              \x20 * 判定 = 同一语句里既有对批次表的 UPDATE、其 SET 子句又对 `status` 列赋值；\n\
              \x20 * 注释 / `#[cfg(test)]` 块内、以及只改其它列的 UPDATE 不在判定范围内。\n\
              \n\
-             正确写法：改用 `status_gate::apply_batch_status_change`（单行）或\n\
+             正确写法：改用 `shared::batch::status::apply_batch_status_change`（单行）或\n\
              `apply_bulk_batch_status_change_for_part`（批量）。它们在一个函数内完成\n\
              「写批次状态 → 回流 `t_part.status` / `next_process_id` → 级联 `t_assembly.status`\n\
              → 终态序列号归档 / 释放」，因此 caller 不需要、也不应该自己补调任何 sync ——\n\

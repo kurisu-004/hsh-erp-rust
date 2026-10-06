@@ -672,7 +672,7 @@ impl AssemblyRepo {
     /// **不写归档事件**：`t_assembly` 没有事件表，而它的 `note` 列是**用户可
     /// 编辑的业务备注**，拿它记系统动作会污染用户数据且事后无法区分系统写入
     /// 与用户输入。对比：子件（`t_part`）走 `t_part_event` 归档，见
-    /// `prod/batch/status_gate.rs::release_part_serial_no`。
+    /// `prod/batch/shared::batch::status.rs::release_part_serial_no`。
     ///
     /// 谓词自带 `status IN ('COMPLETED','CANCELLED') AND serial_no IS NOT NULL`
     /// → 天然幂等，重复调用 0 行、无副作用。

@@ -19,8 +19,11 @@
 //! - `pickup.rs` —— 手动 pick-up
 //! - `scan.rs` —— 扫码品检 / 司机扫码发货
 //! - `worker_scan.rs` —— 工人扫码台主入口（RETURNED / INSPECTED 二合一）
-//! - `guard.rs` —— 全部用例共用的自由函数：状态机守卫 / OCC / 货架校验 /
-//!   status_gate 薄包装
+//!
+//! 2026-10-08：原 `guard.rs`（状态机守卫 / OCC / 货架校验 / 写入口薄包装）与
+//! `status_gate.rs` 已上移到 `shared::batch` —— 它们是所有碰批次的域都要用的
+//! 公共设施，留在本域等于让每个新域反向依赖 batch 域。本目录下的调用方一律
+//! `use crate::shared::batch::guards::…` / `crate::shared::batch::status::…`。
 //!
 //! ## 签名约定
 //! 形参一律 `<R: PartRepoTrait>(mut repo: R, ...)`：handler 开 tx 并 commit，
@@ -31,18 +34,18 @@
 //! ## 依赖方向：过渡期，**尚未单向**
 //! 本模块的批次方法以 `<R: PartRepoTrait>` 形参接收 part 域 trait，批次写入经它
 //! 落到 prod 域的表；而 `PartRepoTrait` 的默认体在 `part::repo` 内直接回调
-//! `PartBatchRepo` + `status_gate`。即调用链是
+//! `PartBatchRepo` + `shared::batch::status`。即调用链是
 //! `prod::batch::service → part::repo::PartRepoTrait → prod::batch::repo`：
 //! **prod 域的 service 借 part 域的 trait 写 prod 域自己的表**，这是当前真实存在的
-//! 反向依赖，不是单向。少数拆批用例直接调本域 `PartBatchRepo`（经
-//! `repo.conn_mut()`），不改变上述借用关系。part → prod 方向另有 `status_gate` +
+//! 反向依赖，不是单向。少数集合读与拆批直接调本域 `PartBatchRepo`（经
+//! `repo.conn_mut()`），不改变上述借用关系。part → prod 方向另有 `shared::batch::status` +
 //! `PartBatchRepo` 两处数据依赖，代码调用点分布在 `part::service` 的 `batch` /
 //! `crud` / `rollup` / `list_enrichment` / `phase1::events`。
 //!
 //! 收敛目标（分两步，本轮只做标注，未动代码）：
-//! 1. prod service 改直调 `PartBatchRepo` / `status_gate`，不再借 part 域 trait；
+//! 1. prod service 改直调 `PartBatchRepo` / `shared::batch::status`，不再借 part 域 trait；
 //! 2. part 域的 `POST /api/v2/parts/{part_id}/cancel` 与 `/force-complete`
-//!    改走 `prod::batch::service` / `status_gate` —— **前提是先把这 2 条端点重路由
+//!    改走 `prod::batch::service` / `shared::batch::status` —— **前提是先把这 2 条端点重路由
 //!    到 prod 域**，否则 part 域无法在不自建反向依赖的前提下完成多批次动作。
 //!
 //! ## 事务 / 角色守卫
@@ -53,7 +56,6 @@
 
 pub mod batch_ops;
 pub mod dispatch;
-pub mod guard;
 pub mod lifecycle;
 pub mod outsource;
 pub mod pickup;

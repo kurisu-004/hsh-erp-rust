@@ -28,7 +28,7 @@ use crate::modules::prod::batch::dto::{
     BatchToInspectionRequest, BatchToShipRequest, ToInspectionRequest, ToProcessRequest,
     ToShipRequest,
 };
-use crate::modules::prod::batch::model::TPartBatch;
+use crate::shared::batch::TPartBatch;
 use crate::modules::prod::batch::vo::{BatchOpFailure, BatchToXxxOut, ToXxxOut};
 use crate::modules::shelf::model::TShelf;
 use crate::modules::shelf::repo::ShelfRepo;

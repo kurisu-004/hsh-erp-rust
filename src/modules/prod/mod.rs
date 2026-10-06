@@ -61,9 +61,8 @@
 //! **零跨域依赖**（已被域隔离护栏覆盖，见 `inspection/mod.rs` 的 `mod tests`）。
 //!
 //! `t_part_batch`（批次）是生产执行单元，**归 prod 域**：它的 repo / model /
-//! `status_gate` 状态写入口与 27 条路由（24 条批次路由：`worker-scan` / `pick-up` /
-//! `to-*` / `complete` / `split` / `cancel` / `scan-inspect` / 2 条集合读；另 3 条
-//! 本域原有下发端点 `pending` / `dispatch` / `auto-dispatch`）整体在本域
+//! `shared::batch::status` 状态写入口与批次路由（`worker-scan` / `pick-up` / `to-*` /
+//! `complete` / `split` / `cancel` / `scan-inspect` / 集合读）整体在本域
 //! `prod::batch`，URL 挂 `/api/v2/prod/batches/*`。
 //!
 //! part 域只留「多批次动作 + 非批次动作」：`POST /parts/{part_id}/cancel`（翻转该

@@ -13,7 +13,7 @@ use crate::modules::prod::batch::dto::PlaceOnShelfRequest;
 use crate::shared::error::{AppError, code};
 
 use super::BatchService;
-use super::guard::{
+use crate::shared::batch::guards::{
     assert_shelf_maps_process, ensure_transition, mark_batch_with_status_and_meta,
     optional_process_chain, optional_step_id, validate_batch_version, validate_shelf_zone,
 };
@@ -65,7 +65,7 @@ impl BatchService {
             "IN_PROCESS",
             Some("PRODUCTION_SHELF"),
             Some(req.shelf_id),
-            // 2026-10-03：无链时为 None ⇒ status_gate 的 clear 分支写 NULL
+            // 2026-10-03：无链时为 None ⇒ shared::batch::status 的 clear 分支写 NULL
             step_id,
             // 2026-09-30：进池 → current_process_id 写目标工序
             Some(req.next_process_id),

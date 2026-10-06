@@ -5,15 +5,23 @@
 //! 跨域调用方（part / assembly / delivery_note / wx / prod::worker_pool / task）
 //! 走 `PartBatchRepo::xxx(&mut *conn, ...)` 静态调用形态。
 //!
+//! ## 2026-10-08：`get_by_id` 与 `list_active_by_part_id` 已上移到 `shared::batch::read`
+//!
+//! 两者都是「批次这张表的公共读取单元」（跨域调用方：prod::queue / delivery_note
+//! / part / 派生链），留在本域等于让每个域反向 import prod::batch::repo。
+//! `PartBatchRepoTrait` 的对应方法保留（trait 是本域对外的仓储契约），
+//! 默认体改为转发 `shared::batch::read`。这不是转发壳 —— trait 方法是**接口**，
+//! 实现换位置是正常演进。
+//!
 //! ## 本目录的 3 个文件
 //! - `mod.rs` —— 本域批次 **下发给车间** 专用查询（pending 列表 / auto-dispatch
 //!   预览 / 首道 step），ZST `BatchRepo`
 //! - `queries.rs`（本文件）—— `t_part_batch` 通用 SQL 真源，ZST `PartBatchRepo`
-//! - `sql.rs` —— inspection / lifecycle 流转写点（`status_gate` 之上的薄包装）
+//! - `sql.rs` —— inspection / lifecycle 流转写点（`shared::batch::status` 之上的薄包装）
 //! - `trait.rs` —— 胖 trait `PartBatchRepoTrait` + `impl for &mut PgConnection`
 //!
-//! 2026-10-07：第 4 个文件 `list.rs`（待品检队列窄投影）连同其端点迁往
-//! `prod::inspection`；返修两条集合读在 service 层自建 SQL，不在本目录。
+//! 2026-10-07：原第 4 个文件 `list.rs`（待品检队列窄投影 + 返修集合读）连同其
+//! 端点迁往 `prod::inspection`；返修两条集合读在 service 层自建 SQL，不在本目录。
 //!
 //! ## 错误类型
 //! repo 静态方法 → `sqlx::Error`（唯一特殊：`split_batch` 内部守卫 0 行 →
@@ -23,9 +31,11 @@ use chrono::NaiveDateTime;
 use sqlx::{PgConnection, PgExecutor};
 
 use crate::modules::part::model::TPart;
-use crate::modules::prod::batch::model::{PartBatchScanRow, RecentBatchRow, TPartBatch};
-// 2026-10-01：`PartBatchRepo::update` 的 status 半边改走 status_gate（唯一写入口）。
-use crate::modules::prod::batch::status_gate::{self, StatusChange};
+use crate::modules::prod::batch::model::{PartBatchScanRow, RecentBatchRow};
+use crate::shared::batch::TPartBatch;
+// 2026-10-01：`PartBatchRepo::update` 的 status 半边改走 shared::batch::status（唯一写入口）。
+use crate::shared::batch::status as batch_status;
+use crate::shared::batch::status::StatusChange;
 use crate::shared::error::AppError;
 
 /// SQL 真源 ZST。trait 名为 `PartBatchRepoTrait`（公共接口），
@@ -54,33 +64,6 @@ pub struct NewInitialBatch<'a> {
 }
 
 impl PartBatchRepo {
-    /// 2026-09-16 PR-3 批次 step 化（migration 028）：t_part_batch 删
-    /// `next_process_id` / `placed_at` 列，加 `current_process_step_id`。
-    /// 所有走 `TPartBatch` 投影的查询同步收窄。
-    pub async fn get_by_id<'e, E: PgExecutor<'e>>(
-        executor: E,
-        id: i64,
-        include_deleted: bool,
-    ) -> Result<Option<TPartBatch>, sqlx::Error> {
-        sqlx::query_as!(
-            TPartBatch,
-            r#"
-            SELECT id, part_id, batch_no, quantity, status, location,
-                   current_holder_id, current_process_id, current_process_step_id,
-                   delivery_note_id, parent_batch_id,
-                   is_repairing,
-                   version, created_at, created_by, updated_at, updated_by, deleted_at
-            FROM t_part_batch
-            WHERE id = $1
-              AND ($2::bool OR deleted_at IS NULL)
-            "#,
-            id,
-            include_deleted,
-        )
-        .fetch_optional(executor)
-        .await
-    }
-
     /// 送货单的全部未删批次（Phase P2 列出 / Phase P3 扫码入单后回查）。
     /// 与 Python `list_by_delivery_note` 行为一致；本方法不 JOIN t_part，
     /// caller 需要展示字段时另调 `list_with_part_by_delivery_note`。
@@ -412,13 +395,13 @@ impl PartBatchRepo {
     /// 同步推进 status。caller 必须已在事务内先读 version。
     /// 返回影响行数（0 行 → 由 service 转 `VERSION_CONFLICT` 409）。
     ///
-    /// ## 2026-10-01：`status` 那一半改走 status_gate
+    /// ## 2026-10-01：`status` 那一半改走 shared::batch::status
     ///
     /// 改造前本函数是「一处 UPDATE 同时写 `delivery_note_id` + `status`」，
     /// 于是它本身就是一个**绕过 rollup 的状态写点**（`status` 列在
     /// `t_part_batch` 上，是全链路真源）。现拆成两步：
     ///
-    /// 1. `status` 非 None → [`status_gate::apply_batch_status_change`]
+    /// 1. `status` 非 None → [`batch_status::apply_batch_status_change`]
     ///    （写状态 + part/assembly 派生 + 终态序列号释放一体）。
     /// 2. `delivery_note_id` 非 None → 独立的「只挂送货单」UPDATE。
     ///
@@ -434,7 +417,7 @@ impl PartBatchRepo {
     /// ## 返回值契约（2026-10-01 review 第 1 轮 M6 修正）
     ///
     /// 返回**真实影响行数**，而不是恒 1：
-    /// - `status = Some(..)` → 走 status_gate，0 行已由 gate 抛 `VERSION_CONFLICT`，
+    /// - `status = Some(..)` → 走 shared::batch::status，0 行已由 gate 抛 `VERSION_CONFLICT`，
     ///   走到这里必然是 1；第 2 步是「值没变就不写」，可能 0 行，但**不**把它
     ///   计入返回值（那会让唯一生产调用方 `delivery_note::pickup` 在「送货单 id
     ///   本来就一样」时误报并发冲突）。
@@ -455,9 +438,9 @@ impl PartBatchRepo {
         updated_by: Option<i64>,
     ) -> Result<u64, AppError> {
         let updated_by = updated_by.unwrap_or(0);
-        // 1) status → status_gate（唯一写入口；0 行 = VERSION_CONFLICT）
+        // 1) status → shared::batch::status（唯一写入口；0 行 = VERSION_CONFLICT）
         if let Some(target) = status {
-            status_gate::apply_batch_status_change(
+            batch_status::apply_batch_status_change(
                 conn,
                 StatusChange {
                     batch_id,
@@ -718,29 +701,6 @@ impl PartBatchRepo {
     /// 不传 `include_deleted`：rollup 只看活跃行。
     ///
     /// 2026-09-16 PR-3 批次 step 化：删 next_process_id / placed_at，加
-    /// current_process_step_id。
-    pub async fn list_active_by_part_id<'e, E: PgExecutor<'e>>(
-        executor: E,
-        part_id: i64,
-    ) -> Result<Vec<TPartBatch>, sqlx::Error> {
-        sqlx::query_as!(
-            TPartBatch,
-            r#"
-            SELECT id, part_id, batch_no, quantity, status, location,
-                   current_holder_id, current_process_id, current_process_step_id,
-                   delivery_note_id, parent_batch_id,
-                   is_repairing,
-                   version, created_at, created_by, updated_at, updated_by, deleted_at
-            FROM t_part_batch
-            WHERE part_id = $1 AND deleted_at IS NULL
-            ORDER BY batch_no ASC
-            "#,
-            part_id,
-        )
-        .fetch_all(executor)
-        .await
-    }
-
     /// Scan context 专用：返回工单全部活跃批次 + 持有人/货架**名称**（已解析）。
     /// `holder_name` 通过 `COALESCE(t_shelf.name, t_worker.name, t_outsource_company.name)` 解析，
     /// 适用于 `current_holder_id` 多态（shelf / worker / outsource 的 holder_id）。

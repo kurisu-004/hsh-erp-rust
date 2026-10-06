@@ -20,7 +20,7 @@
 //! ## 与 `mod.rs::sync_from_part_change` 静态 wrapper 的关系
 //! 2026-09-22 D-3 决策：本模块暴露 `pub async fn sync_from_part_change(self, ...)`（收
 //! `&self` + `repo: R`）；`mod.rs::AssemblyService::sync_from_part_change` 是 ZST 静态
-//! 入口（供 `prod::batch::status_gate` 的 ZST 调用点使用），内部一行委托本函数。
+//! 入口（供 `shared::batch::status` 的 ZST 调用点使用），内部一行委托本函数。
 //! 这样既保留 trait 注入式新路径（单测用），又不破坏生产跨模块 ZST 调用。
 
 use crate::auth::rbac::CurrentUser;
@@ -63,9 +63,9 @@ impl AssemblyService {
     /// 2026-10-01 新增：只收 `updated_by` 的反向同步入口（无登录用户上下文）。
     ///
     /// 存在的理由：新的 batch → part → assembly 单一写入口
-    /// （`prod::batch::status_gate`）在整条派生链路上只有 `updated_by`（一个 i64），
+    /// （`shared::batch::status`）在整条派生链路上只有 `updated_by`（一个 i64），
     /// 没有完整的 `CurrentUser`。本函数把 `sync_assembly_status` 直接暴露出来，
-    /// 而**不是**在 status_gate 里伪造一个 `CurrentUser`（伪造身份迟早会被
+    /// 而**不是**在 shared::batch::status 里伪造一个 `CurrentUser`（伪造身份迟早会被
     /// 下游的 `username` / `roles` 依赖带出真实 bug）。
     pub async fn sync_from_part_change_by_id_inner<R: AssemblyRepoTrait>(
         &self,
@@ -175,7 +175,7 @@ async fn sync_assembly_status<R: AssemblyRepoTrait>(
     // `Ok(SyncOutcome::NoChange)` + `tracing::warn!`（留下可观测痕迹），
     // 绝不返回 Err。
     //
-    // 同理，`t_part.status`（`status_gate` step 2）本来就是**不走 OCC 的派生写**，
+    // 同理，`t_part.status`（`shared::batch::status` step 2）本来就是**不走 OCC 的派生写**，
     // 冲突由行锁串行化而非报错 —— 两层派生的冲突策略现在是一致的。
     if affected == 0 {
         tracing::warn!(
@@ -192,7 +192,7 @@ async fn sync_assembly_status<R: AssemblyRepoTrait>(
 // ---------- ZST 静态入口的兼容 wrapper ----------
 //
 // 2026-09-22 D-3 决策：`mod.rs::AssemblyService::sync_from_part_change` 是 ZST 静态入口
-// （供 `prod::batch::status_gate` 的 ZST 调用点使用），内部一行委托本文件的
+// （供 `shared::batch::status` 的 ZST 调用点使用），内部一行委托本文件的
 // `sync_from_part_change_inner`。本文件暴露 `pub async fn sync_from_part_change`
 // 作为 `mod.rs` wrapper 的直接实现点（避免 mod.rs 仅做 4 行 wrapper 而失去内聚性）。
 pub async fn sync_from_part_change(
@@ -207,7 +207,7 @@ pub async fn sync_from_part_change(
         .await
 }
 
-/// 2026-10-01 新增：只收 `updated_by` 的 ZST 静态入口（prod::batch::status_gate 用）。
+/// 2026-10-01 新增：只收 `updated_by` 的 ZST 静态入口（`shared::batch::status` 用）。
 ///
 /// 见 `AssemblyService::sync_from_part_change_by_id_inner` 的 rationale。
 pub async fn sync_from_part_change_by_id(

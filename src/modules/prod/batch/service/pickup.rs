@@ -17,7 +17,7 @@ use crate::modules::prod::batch::repo::PartBatchRepo;
 use crate::shared::error::{AppError, code};
 
 use super::BatchService;
-use super::guard::{mark_batch_with_status_and_meta, validate_batch_version, validate_shelf_zone};
+use crate::shared::batch::guards::{mark_batch_with_status_and_meta, validate_batch_version, validate_shelf_zone};
 
 /// 部分领取自动拆批的附加信息（整批路径为 `None`）。
 ///

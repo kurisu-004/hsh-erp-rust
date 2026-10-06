@@ -16,7 +16,7 @@ use crate::modules::prod::worker::repo::WorkerRepo;
 use crate::shared::error::{AppError, code};
 
 use super::BatchService;
-use super::guard::{
+use crate::shared::batch::guards::{
     mark_batch_status_only, mark_batch_with_status_and_meta, validate_batch_version,
     validate_shelf_zone,
 };
@@ -102,7 +102,7 @@ impl BatchService {
         //   把标记清成 false 了，这里再显式写一次是**冗余但显式**：让每个分支的
         //   不变式在本行自证，不依赖「上一步恰好清了」这种跨函数推理。
         //
-        // 2026-10-01 review 第 1 轮 m6：包装函数恒返回 1（0 行已由 status_gate
+        // 2026-10-01 review 第 1 轮 m6：包装函数恒返回 1（0 行已由 shared::batch::status
         // 转成 `VERSION_CONFLICT` 抛出），原 `if n2 == 0` 是死代码，已删。
         // 两个目标状态都不是终态 → `event_id` 传 `None`。
         if req.pass {

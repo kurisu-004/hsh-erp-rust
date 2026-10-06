@@ -413,10 +413,10 @@ pub(super) async fn add_parts_inner(
     }
 
     // 加载所有 batch + part + part 客户
-    let mut batches_by_id: HashMap<i64, crate::modules::prod::batch::model::TPartBatch> =
+    let mut batches_by_id: HashMap<i64, crate::shared::batch::TPartBatch> =
         HashMap::new();
     for it in items {
-        let b = PartBatchRepo::get_by_id(&mut *conn, it.batch_id, false)
+        let b = crate::shared::batch::get_batch_by_id(&mut *conn, it.batch_id, false)
             .await?
             .ok_or_else(|| {
                 AppError::biz(
@@ -543,7 +543,7 @@ pub(super) async fn add_parts_inner(
         let target = if target_id == batch.id {
             batch.clone()
         } else {
-            PartBatchRepo::get_by_id(&mut *conn, target_id, false)
+            crate::shared::batch::get_batch_by_id(&mut *conn, target_id, false)
                 .await?
                 .ok_or_else(|| {
                     AppError::biz(

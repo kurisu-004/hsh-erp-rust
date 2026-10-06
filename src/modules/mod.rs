@@ -35,7 +35,7 @@ pub mod outsource;
 pub mod part;
 // 2026-10-02 域归属定案：原 `part_batch` 域（1866 行 helper，无独立 URL）整体
 // 归入 prod 域的 `prod::batch` 子模块（src/modules/prod/batch/），承载 `t_part_batch`
-// 的 repo / model / status_gate / 全部批次用例与 24 条批次路由（逐条见
+// 的 repo / model / shared::batch::status / 全部批次用例与批次路由（逐条见
 // `prod/batch/mod.rs` 的路由表）。
 // 这里不再 `pub mod part_batch;`，所有引用走 `crate::modules::prod::batch::*`。
 pub mod part_file;

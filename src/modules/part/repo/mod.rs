@@ -19,7 +19,7 @@
 //! - `conn_mut` 1 —— 工具方法，暴露 `&mut PgConnection`
 //! - t_part 18 —— 查询 5 + CRUD 6 + assembly 子件 4 + rollup 3（一行委托 `sql::PartRepo`）
 //! - t_part_batch 17 —— 查询 6 + mark_* 品检 4 + lifecycle 6 + split 1（一行委托
-//!   `prod::batch::repo::PartBatchRepo` / `prod::batch::status_gate`）
+//!   `prod::batch::repo::PartBatchRepo` / `shared::batch::status`）
 //! - t_part_event 1 —— `insert_part_event`（委托 `sql::PartRepo`）
 //! - 跨域 helper 2 —— `part_batch_has_active_on_delivery_note`（委托 `PartBatchRepo`）
 //!   + `serial_prefix_for_customer`（2026-10-05 新增，查 `t_customer`，委托
@@ -117,15 +117,15 @@ use async_trait::async_trait;
 use sqlx::PgConnection;
 
 use crate::modules::prod::batch::repo::PartBatchRepo;
-use crate::modules::prod::batch::status_gate;
+use crate::shared::batch::status as batch_status;
 use crate::shared::error::AppError;
 
 pub mod batch;
 pub mod event;
 pub mod part;
 pub mod sql;
-// 2026-10-01 review 第 1 轮 M8：`status_gate` 已从 `repo/` 移到
-// `src/modules/prod/batch/status_gate.rs` —— 它承载的是「写批次 + 派生
+// 2026-10-01 review 第 1 轮 M8：`shared::batch::status` 已从 `repo/` 移到
+// `src/shared/batch/status.rs` —— 它承载的是「写批次 + 派生
 // part/assembly + 终态序列号释放」这套**业务策略**（终态判定、归档/释放、
 // 跨域调用 `AssemblyService`），按 CLAUDE.md 六件套分层属 service 层职责；
 // repo 层只留纯 SQL。
@@ -279,19 +279,19 @@ pub trait PartRepoTrait: Send {
         &mut self,
         part_id: i64,
         expected_batch_id: Option<i64>,
-    ) -> Result<Option<crate::modules::prod::batch::model::TPartBatch>, sqlx::Error>;
+    ) -> Result<Option<crate::shared::batch::TPartBatch>, sqlx::Error>;
     async fn find_scan_target_batch(
         &mut self,
         part_id: i64,
         expected_batch_id: Option<i64>,
-    ) -> Result<Option<crate::modules::prod::batch::model::TPartBatch>, sqlx::Error>;
+    ) -> Result<Option<crate::shared::batch::TPartBatch>, sqlx::Error>;
     /// 2026-10-02：原 `find_inspection_batch_for_fail(part_id, Option<batch_id>)`
     /// 改为 `find_inspection_batch_by_id(batch_id)` —— `batch_id` 是 URL 路径
     /// 参数（必填），`part_id` 由 service 从批次行反查。
     async fn find_inspection_batch_by_id(
         &mut self,
         batch_id: i64,
-    ) -> Result<Option<crate::modules::prod::batch::model::TPartBatch>, sqlx::Error>;
+    ) -> Result<Option<crate::shared::batch::TPartBatch>, sqlx::Error>;
     async fn find_current_inspection_batch_id(
         &mut self,
         part_id: i64,
@@ -299,23 +299,23 @@ pub trait PartRepoTrait: Send {
     async fn find_batch_by_id(
         &mut self,
         batch_id: i64,
-    ) -> Result<Option<crate::modules::prod::batch::model::TPartBatch>, sqlx::Error>;
+    ) -> Result<Option<crate::shared::batch::TPartBatch>, sqlx::Error>;
     async fn find_worker_held_batch_for_part(
         &mut self,
         part_id: i64,
         worker_id: i64,
         expected_batch_id: Option<i64>,
-    ) -> Result<Option<crate::modules::prod::batch::model::TPartBatch>, sqlx::Error>;
+    ) -> Result<Option<crate::shared::batch::TPartBatch>, sqlx::Error>;
 
     // ── t_part_batch mark_*（4）──
     //
     // 2026-10-01：除 `mark_batch_returned`（不改 status）外，全部
-    // `t_part_batch.status` 写点已收口到 `service::status_gate`。
-    // 返回类型由 `sqlx::Error` 改 `AppError`：status_gate 的契约是
+    // `t_part_batch.status` 写点已收口到 `shared::batch::status`。
+    // 返回类型由 `sqlx::Error` 改 `AppError`：shared::batch::status 的契约是
     // 「没写成 = `VERSION_CONFLICT`」，转 `sqlx::Error` 会把 409 降级成 500。
     //
-    // 2026-10-01 追加：下面 3 个方法返回 `status_gate::RollupOutcome` 而非
-    // `u64`。status_gate 在同一个函数里已经做完 part 派生 + assembly 反向
+    // 2026-10-01 追加：下面 3 个方法返回 `batch_status::RollupOutcome` 而非
+    // `u64`。shared::batch::status 在同一个函数里已经做完 part 派生 + assembly 反向
     // 同步，而这三个方法的调用点要拿 `SyncOutcome` 填响应里的
     // `synced_assembly_id`（并据此发 `ASSEMBLY_UPDATED` 广播）。若让 service
     // 再补调一次 `PartService::sync_from_batch_change`，第二次派生必然
@@ -325,14 +325,14 @@ pub trait PartRepoTrait: Send {
         batch_id: i64,
         expected_version: i32,
         current_user_id: Option<i64>,
-    ) -> Result<status_gate::RollupOutcome, AppError>;
+    ) -> Result<batch_status::RollupOutcome, AppError>;
     async fn mark_batch_inspected(
         &mut self,
         batch_id: i64,
         expected_version: i32,
         shelf_id: i64,
         current_user_id: Option<i64>,
-    ) -> Result<status_gate::RollupOutcome, AppError>;
+    ) -> Result<batch_status::RollupOutcome, AppError>;
     async fn mark_batch_failed_inspection(
         &mut self,
         batch_id: i64,
@@ -341,7 +341,7 @@ pub trait PartRepoTrait: Send {
         current_process_step_id: Option<i64>,
         current_process_id: Option<i64>,
         current_user_id: Option<i64>,
-    ) -> Result<status_gate::RollupOutcome, AppError>;
+    ) -> Result<batch_status::RollupOutcome, AppError>;
     async fn mark_batch_returned(
         &mut self,
         batch_id: i64,
@@ -686,7 +686,7 @@ impl PartRepoTrait for &mut PgConnection {
         &mut self,
         part_id: i64,
         expected_batch_id: Option<i64>,
-    ) -> Result<Option<crate::modules::prod::batch::model::TPartBatch>, sqlx::Error> {
+    ) -> Result<Option<crate::shared::batch::TPartBatch>, sqlx::Error> {
         PartBatchRepo::find_inprocess_batch_for_part(&mut **self, part_id, expected_batch_id).await
     }
 
@@ -694,14 +694,14 @@ impl PartRepoTrait for &mut PgConnection {
         &mut self,
         part_id: i64,
         expected_batch_id: Option<i64>,
-    ) -> Result<Option<crate::modules::prod::batch::model::TPartBatch>, sqlx::Error> {
+    ) -> Result<Option<crate::shared::batch::TPartBatch>, sqlx::Error> {
         PartBatchRepo::find_scan_target_batch(&mut **self, part_id, expected_batch_id).await
     }
 
     async fn find_inspection_batch_by_id(
         &mut self,
         batch_id: i64,
-    ) -> Result<Option<crate::modules::prod::batch::model::TPartBatch>, sqlx::Error> {
+    ) -> Result<Option<crate::shared::batch::TPartBatch>, sqlx::Error> {
         PartBatchRepo::find_inspection_batch_by_id(&mut **self, batch_id).await
     }
 
@@ -715,7 +715,7 @@ impl PartRepoTrait for &mut PgConnection {
     async fn find_batch_by_id(
         &mut self,
         batch_id: i64,
-    ) -> Result<Option<crate::modules::prod::batch::model::TPartBatch>, sqlx::Error> {
+    ) -> Result<Option<crate::shared::batch::TPartBatch>, sqlx::Error> {
         PartBatchRepo::find_batch_by_id(&mut **self, batch_id).await
     }
 
@@ -724,7 +724,7 @@ impl PartRepoTrait for &mut PgConnection {
         part_id: i64,
         worker_id: i64,
         expected_batch_id: Option<i64>,
-    ) -> Result<Option<crate::modules::prod::batch::model::TPartBatch>, sqlx::Error> {
+    ) -> Result<Option<crate::shared::batch::TPartBatch>, sqlx::Error> {
         PartBatchRepo::find_worker_held_batch_for_part(
             &mut **self,
             part_id,
@@ -740,7 +740,7 @@ impl PartRepoTrait for &mut PgConnection {
         batch_id: i64,
         expected_version: i32,
         current_user_id: Option<i64>,
-    ) -> Result<status_gate::RollupOutcome, AppError> {
+    ) -> Result<batch_status::RollupOutcome, AppError> {
         PartBatchRepo::mark_batch_passed_inspection(
             &mut **self,
             batch_id,
@@ -756,7 +756,7 @@ impl PartRepoTrait for &mut PgConnection {
         expected_version: i32,
         shelf_id: i64,
         current_user_id: Option<i64>,
-    ) -> Result<status_gate::RollupOutcome, AppError> {
+    ) -> Result<batch_status::RollupOutcome, AppError> {
         PartBatchRepo::mark_batch_inspected(
             &mut **self,
             batch_id,
@@ -775,7 +775,7 @@ impl PartRepoTrait for &mut PgConnection {
         current_process_step_id: Option<i64>,
         current_process_id: Option<i64>,
         current_user_id: Option<i64>,
-    ) -> Result<status_gate::RollupOutcome, AppError> {
+    ) -> Result<batch_status::RollupOutcome, AppError> {
         PartBatchRepo::mark_batch_failed_inspection(
             &mut **self,
             batch_id,

@@ -93,7 +93,7 @@ impl BatchService {
                 format!("batch {} 版本冲突", batch.id),
             ));
         }
-        // 6. 2026-10-01：`mark_batch_delivered` 走 status_gate，part → assembly
+        // 6. 2026-10-01：`mark_batch_delivered` 走 shared::batch::status，part → assembly
         //    派生已在同一事务内完成（多批次场景下按 min-progress 决定 part 状态），
         //    **不再**手工调 `sync_from_batch_change`（原 `let _ =` 既冗余，又会把
         //    rollup 错误静默丢弃）。
@@ -174,10 +174,10 @@ impl BatchService {
             ));
         }
         // 4. UPDATE batch: DELIVERED → COMPLETED（OCC）。
-        //    ⚠️ `mark_batch_completed` 经 status_gate 写，0 行已由 status_gate
+        //    ⚠️ `mark_batch_completed` 经 shared::batch::status 写，0 行已由 shared::batch::status
         //    转成 `VERSION_CONFLICT` 抛出，不再重复判 0。
         //
-        //    2026-10-01：**序列号释放已下沉进 status_gate 的 rollup**
+        //    2026-10-01：**序列号释放已下沉进 shared::batch::status 的 rollup**
         //    （step 4）。原实现在这里调 `clear_part_serial_no_when_completed`，
         //    而它的 WHERE 是 **part 级**的 `status='COMPLETED'`，本方法一次只翻
         //    **一条批次** —— 多批次工单完成其中一条时 part 仍是 DELIVERED，该
@@ -297,12 +297,12 @@ impl BatchService {
         //    2026-09-16 PR-2 瘦身（migration 027）：t_part_batch 删
         //    `has_been_repaired` 列；返修事实由下方 REPAIR_STARTED 事件日志 +
         //    `is_repairing` 标记列共同追溯。
-        //    ⚠️ `mark_batch_repairing` 经 status_gate 写，0 行已由 status_gate
+        //    ⚠️ `mark_batch_repairing` 经 shared::batch::status 写，0 行已由 shared::batch::status
         //    转成 `VERSION_CONFLICT` 抛出，故不再重复判 0。
         let _bn = repo
             .mark_batch_repairing(batch.id, batch.version, current.id)
             .await?;
-        // 5. 2026-10-01：`mark_batch_repairing` 走 status_gate，part → assembly
+        // 5. 2026-10-01：`mark_batch_repairing` 走 shared::batch::status，part → assembly
         //    派生已在同一事务内完成，**不再**手工调 `sync_from_batch_change`
         //    （原 `let _ =` 既冗余，又把 rollup 错误降级成「静默丢弃」）。
         // 6. 事件日志。

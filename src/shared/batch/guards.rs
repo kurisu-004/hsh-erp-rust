@@ -1,11 +1,10 @@
-//! prod::batch 全部批次用例共用的自由函数：状态机守卫 / OCC / 货架校验 /
-//! `status_gate` 薄包装。
+//! 跨域批次守卫自由函数：状态机守卫 / OCC / 货架校验 / 批次状态写入口薄包装。
 //!
-//! 2026-10-02 随批次用例整体迁入 prod 域：本文件原先是 `part::service::phase1`
-//! 的私有 helper 层，9 个函数与 `InspectionRepairRow` 的**全部**调用点都在
-//! 以批次为对象的用例里（`list_*` 端点不碰它们），故随调用方一同迁走。
+//! 2026-10-08 自 `prod::batch::service::guard` 上移到 shared 层：判序（存在 →
+//! 停用 → zone）与文案是全仓一份的公共语义，任何碰批次状态的域都要用，留在
+//! batch 域等于让所有域反向依赖它。
 //!
-//! 这里是 part → prod 依赖的反向证明：这层守卫只经 `status_gate` 写
+//! 这里是 part → prod 依赖的反向证明：这层守卫只经 `shared::batch::status` 写
 //! `t_part_batch.status`，不引用 part 域任何 service / vo。
 //!
 //! 2026-10-04 起本文件不再只服务 `prod::batch`：`prod::shelf_process`（建映射时的 zone
@@ -25,55 +24,55 @@
 //! `current_holder_id`（= 货架）的写点全仓恰好 3 个，本批全部覆盖、无遗留：
 //! ① `dispatch_single`（`update_batch_dispatched`，货架由
 //! `find_first_shelf_for_process` 从映射里**选出** ⇒ 谓词下沉到该方法的 SQL）；
-//! ② `move_batch` WORKER→POOL（`worker_pool::service`，货架来自请求 ⇒
+//! ② `move_batch` WORKER→POOL（`prod::queue` 的 move 端点，货架来自请求 ⇒
 //! `validate_shelf_zone`）；③ `worker_scan` RETURNED（货架来自请求 ⇒ 已有的
 //! `get_by_id_zone`）。改任一处都请先回到这条清单核对。
 
 use sqlx::PgConnection;
 
 use crate::modules::part::statemachine::PartStatus;
-use crate::modules::prod::batch::status_gate::{self, StatusChange};
+use crate::shared::batch::status::{apply_batch_status_change, StatusChange};
 use crate::modules::shelf::repo::ShelfRepo;
 use crate::shared::error::{AppError, code};
 
 #[derive(sqlx::FromRow)]
-pub(crate) struct InspectionRepairRow {
-    pub(crate) batch_id: i64,
-    pub(crate) part_id: i64,
-    pub(crate) batch_no: i32,
-    pub(crate) quantity: i32,
-    pub(crate) status: String,
+pub struct InspectionRepairRow {
+    pub batch_id: i64,
+    pub part_id: i64,
+    pub batch_no: i32,
+    pub quantity: i32,
+    pub status: String,
     /// 2026-10-01 review 第 1 轮 M5 新增（migration 005）：返修标记随列表投出
-    pub(crate) is_repairing: bool,
-    pub(crate) location: Option<String>,
-    pub(crate) version: i32,
-    pub(crate) current_process_step_id: Option<i64>,
-    pub(crate) parent_batch_id: Option<i64>,
-    pub(crate) current_holder_id: Option<i64>,
-    pub(crate) holder_name: Option<String>,
-    pub(crate) next_process_id: Option<i64>,
-    pub(crate) next_process_name: Option<String>,
-    pub(crate) delivery_note_id: Option<i64>,
-    pub(crate) delivery_note_no: Option<String>,
-    pub(crate) serial_no: Option<String>,
-    pub(crate) drawing_no: String,
-    pub(crate) name: String,
-    pub(crate) order_no: Option<String>,
-    pub(crate) planned_delivery_date: chrono::NaiveDate,
-    pub(crate) is_urgent: bool,
-    pub(crate) part_version: i32,
-    pub(crate) created_at: chrono::NaiveDateTime,
-    pub(crate) updated_at: chrono::NaiveDateTime,
-    pub(crate) customer_id: i64,
-    pub(crate) customer_name: Option<String>,
-    pub(crate) l1_customer_name: Option<String>,
+    pub is_repairing: bool,
+    pub location: Option<String>,
+    pub version: i32,
+    pub current_process_step_id: Option<i64>,
+    pub parent_batch_id: Option<i64>,
+    pub current_holder_id: Option<i64>,
+    pub holder_name: Option<String>,
+    pub next_process_id: Option<i64>,
+    pub next_process_name: Option<String>,
+    pub delivery_note_id: Option<i64>,
+    pub delivery_note_no: Option<String>,
+    pub serial_no: Option<String>,
+    pub drawing_no: String,
+    pub name: String,
+    pub order_no: Option<String>,
+    pub planned_delivery_date: chrono::NaiveDate,
+    pub is_urgent: bool,
+    pub part_version: i32,
+    pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
+    pub customer_id: i64,
+    pub customer_name: Option<String>,
+    pub l1_customer_name: Option<String>,
 }
 
 /// 状态机迁移守卫 + 错误码映射（在 phase1.rs 内复用）：
 /// - 起点状态非法 → 20103 `BIZ_INVALID_TRANSITION`
 /// - 起点已是终态 → 20115 `BIZ_PART_ALREADY_CANCELLED`（仅 cancel 路径）
 #[inline]
-pub(crate) fn ensure_transition(
+pub fn ensure_transition(
     from: PartStatus,
     to: PartStatus,
     ctx: &str,
@@ -100,7 +99,7 @@ pub(crate) fn ensure_transition(
 /// 批次 id 全局唯一即锚点，不存在「跨 part 批次」这一场景。函数随之更名为
 /// `validate_batch_version` 并去掉两个 part 形参。
 #[inline]
-pub(crate) fn validate_batch_version(
+pub fn validate_batch_version(
     batch_id: i64,
     expected_version: i32,
     actual_version: i32,
@@ -115,12 +114,12 @@ pub(crate) fn validate_batch_version(
 }
 
 #[inline]
-pub(crate) fn batch_version_mismatch(_batch_id: i64, expected: i32, actual: i32) -> bool {
+pub fn batch_version_mismatch(_batch_id: i64, expected: i32, actual: i32) -> bool {
     expected != actual
 }
 
 /// 校验 shelf 存在 + active + zone 一致。
-pub(crate) async fn validate_shelf_zone(
+pub async fn validate_shelf_zone(
     conn: &mut PgConnection,
     shelf_id: i64,
     expected_zone: &str,
@@ -153,7 +152,7 @@ pub(crate) async fn validate_shelf_zone(
 
 /// 校验 shelf ↔ process 映射（`_assert_shelf_maps_process`）：必须存在
 /// `t_shelf_process` 映射行，否则 20507 `BIZ_SHELF_PROCESS_NOT_MAPPED`。
-pub(crate) async fn assert_shelf_maps_process(
+pub async fn assert_shelf_maps_process(
     conn: &mut PgConnection,
     shelf_id: i64,
     process_id: i64,
@@ -211,18 +210,18 @@ pub(crate) async fn assert_shelf_maps_process(
 /// 初始批次 / 子批次仍为严格 NULL（见 `prod/batch/repo/queries.rs::create_initial_batch`
 /// 与 `part/repo/sql/part_sql.rs::insert_child_for_assembly`，两者都不写该列）。
 ///
-/// 2026-10-01：改为 `status_gate::apply_batch_status_change` 的薄包装
+/// 2026-10-01：改为 `apply_batch_status_change` 的薄包装
 /// （全仓唯一的 `t_part_batch.status` 写入口）。
 ///
 /// 语义映射（保持与改造前逐条等价）：
-/// - WHERE 的 `status NOT IN ('CANCELLED','COMPLETED')` 换成 status_gate 的
+/// - WHERE 的 `status NOT IN ('CANCELLED','COMPLETED')` 换成写入口的
 ///   **正向** `allowed_from` 白名单（= 全状态减两个终态）。之所以改成正向：
-///   status_gate 的白名单是「本次允许的源状态」，反向排除无法直接表达，
+///   写入口的白名单是「本次允许的源状态」，反向排除无法直接表达，
 ///   而正向表多写 9 个状态值换来的是「新增状态时若忘了加进白名单会被拒」
 ///   ——fail-safe 方向正确。
 /// - 其余 3 个可选列的 `None` 在原语义里**同样是「写 NULL」**（SQL 是
 ///   `location = $4, current_holder_id = $5, current_process_step_id = $6`），
-///   而 status_gate 的 `None` 是「保持原值」。故本包装函数对 4 列一律
+///   而写入口的 `None` 是「保持原值」。故本包装函数对 4 列一律
 ///   `clear_*: 形参.is_none()`，把「传 None = 清 NULL」这一**既有约定**如实
 ///   翻译过去。
 ///
@@ -264,7 +263,7 @@ pub(crate) async fn assert_shelf_maps_process(
 /// 改任何一处的 step 形参，都要连带复核上表：把该传 `Some(..)` 的地方改成 `None`
 /// 会静默清掉定位信息，把该传 `None` 的地方改成 `Some(..)` 会留下陈旧 step。
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn mark_batch_with_status_and_meta(
+pub async fn mark_batch_with_status_and_meta(
     conn: &mut PgConnection,
     batch_id: i64,
     expected_version: i32,
@@ -275,7 +274,7 @@ pub(crate) async fn mark_batch_with_status_and_meta(
     new_current_process_id: Option<i64>,
     updated_by: i64,
 ) -> Result<u64, AppError> {
-    status_gate::apply_batch_status_change(
+    apply_batch_status_change(
         conn,
         StatusChange {
             batch_id,
@@ -319,7 +318,7 @@ pub(crate) async fn mark_batch_with_status_and_meta(
             updated_by,
             // 2026-10-01 review 第 1 轮 M2：本包装函数沿用「形参 None = 写 NULL」
             // 的**既有约定**（改造前 SQL 是 4 列直写），故 4 列一律
-            // `clear_* = 形参.is_none()`，把旧语义如实翻译进 status_gate 的
+            // `clear_* = 形参.is_none()`，把旧语义如实翻译进写入口的
             // 「None = 保持原值」三态模型。理由与受影响调用点清单见本函数 doc。
             clear_location: new_location.is_none(),
             clear_holder_id: new_holder_id.is_none(),
@@ -337,7 +336,7 @@ pub(crate) async fn mark_batch_with_status_and_meta(
 
 /// mark_batch 的轻量版本（不写 location/holder/process；用于状态机迁移但保持原 holder 的场景，如 CANCELLED）。
 ///
-/// 2026-10-01：改为 `status_gate::apply_batch_status_change` 的薄包装。
+/// 2026-10-01：改为 `apply_batch_status_change` 的薄包装。
 ///
 /// 3 个调用点传入的目标状态是 `READY_TO_SHIP`（scan-inspect pass）/
 /// `IN_PROCESS`（scan-inspect FAIL，**同时置 `is_repairing=true`**）/
@@ -349,7 +348,7 @@ pub(crate) async fn mark_batch_with_status_and_meta(
 ///
 /// `allowed_from` 由目标状态反查（`status_guard_for_target`）——原实现
 /// 「无源状态守卫」，本实现补上；等价性由该函数的 doc 逐目标状态论证。
-pub(crate) async fn mark_batch_status_only(
+pub async fn mark_batch_status_only(
     conn: &mut PgConnection,
     batch_id: i64,
     expected_version: i32,
@@ -358,7 +357,7 @@ pub(crate) async fn mark_batch_status_only(
     updated_by: i64,
     event_id: Option<i64>,
 ) -> Result<u64, AppError> {
-    status_gate::apply_batch_status_change(
+    apply_batch_status_change(
         conn,
         StatusChange {
             batch_id,
@@ -395,7 +394,7 @@ pub(crate) async fn mark_batch_status_only(
 /// - `CANCELLED`：调用点 `batch_ops::cancel_batch` 在 service 层已守
 ///   `from != COMPLETED && from != CANCELLED`，故白名单取
 ///   「全状态减两个终态」→ 等价。
-pub(crate) fn status_guard_for_target(target: &str) -> &'static [&'static str] {
+pub fn status_guard_for_target(target: &str) -> &'static [&'static str] {
     match target {
         "READY_TO_SHIP" | "IN_PROCESS" => &["INSPECTION"],
         _ => &[
@@ -446,7 +445,7 @@ async fn read_part_chain_id(
 ///
 /// 恢复「必须有链」（`20706 BIZ_PROCESS_CHAIN_REQUIRED`）的严格变体时，在本函数
 /// 之上加一层 `ok_or_else` 即可，读链逻辑不必重新发明。
-pub(crate) async fn optional_process_chain(
+pub async fn optional_process_chain(
     conn: &mut PgConnection,
     part_id: i64,
 ) -> Result<Option<i64>, AppError> {
@@ -465,7 +464,7 @@ pub(crate) async fn optional_process_chain(
 ///   却没把正在加工的工序登记进链内（例如链在批次发出之后才被改写）。跟着
 ///   「没链就放行」一起吞掉的话，批次会带着一个链内不存在的工序静默入池，
 ///   之后每一步的 step 定位全部漂移，且没有任何报错可查。
-pub(crate) async fn optional_step_id(
+pub async fn optional_step_id(
     conn: &mut PgConnection,
     chain_id: Option<i64>,
     process_id: i64,

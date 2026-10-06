@@ -30,7 +30,7 @@ use sqlx::PgConnection;
 
 use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::prod::batch::service::guard::validate_shelf_zone;
+use crate::shared::batch::guards::validate_shelf_zone;
 use crate::modules::prod::process::repo::ProcessRepo;
 use crate::modules::shelf::repo::ShelfRepo;
 use crate::shared::error::{AppError, code};
@@ -53,7 +53,7 @@ impl ShelfProcessService {
     ///
     /// 1. 校验 shelf 存在（20501）
     /// 2. **`items` 非空时**额外校验 shelf active（20512）+ `zone='PRODUCTION'`（20104）
-    ///    （`prod::batch::service::guard::validate_shelf_zone`；`items` 为空 = 清空，见下）
+    ///    （`shared::batch::guards::validate_shelf_zone`；`items` 为空 = 清空，见下）
     /// 3. 校验 items 内的所有 process_id 存在（`ProcessRepo::list_by_ids`，同域）
     /// 4. 软删该 shelf 的全部旧 mapping（`ShelfProcessRepo::soft_delete_all_for_shelf`）
     /// 5. INSERT 新 mapping（`ShelfProcessRepo::bulk_insert`，按 sort_order）
@@ -136,7 +136,7 @@ impl ShelfProcessService {
         //   回归：`tests/production/shelf_process.rs::set_shelf_processes_allows_clearing_inspection_zone_mappings`
         //   （品检架 + `items: []` → 200 且旧映射被清掉）。
         //
-        // 依赖方向说明：shelf_process → prod::batch::service::guard 是**同域**横向依赖
+        // 依赖方向说明：shelf_process → shared::batch::guards 是**同域**横向依赖
         // （guard.rs 是 prod 域的货架校验自由函数层，不是 batch 域私有实现）；换来的是
         // 「判序与错误码只有一份」——本仓已因两份判序（2026-10-02 域拆分前后的内联 SQL）
         // 分叉过一次，不值得再开第二个。
@@ -151,7 +151,7 @@ impl ShelfProcessService {
             // 「货架不存在」事实不该因 `items` 是否为空而给运营两种说法。改一处记得改另一处。
             //
             // 2026-10-04 review 第 2 轮 N4（技术债登记，**非缺陷**）：全仓这句 20501 文案
-            // 共 3 处 —— `prod::batch::service::guard::validate_shelf_zone`、本分支这一处、
+            // 共 3 处 —— `shared::batch::guards::validate_shelf_zone`、本分支这一处、
             // 以及本文件 `list_shelf_processes` 的既有那一处（3 处字面值已用 shasum 逐字
             // 核对一致）。抽出共享断言（如 `guard::assert_shelf_exists`）供三处复用属**后续
             // 重构项**，本轮刻意不做：它要动 `validate_shelf_zone` 全部调用点共用的共享层，

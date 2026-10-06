@@ -57,7 +57,7 @@ use crate::modules::part::service::PartService;
 // 2026-10-04：`move_batch` WORKER→POOL 分支改为无条件校验目标货架
 // （存在 / 停用 / `zone='PRODUCTION'`），与 place_on_shelf / pickup / outsource 等
 // 生产流端点共用同一守卫，同源同码（20501 / 20512 / 20104）。
-use crate::modules::prod::batch::service::guard::validate_shelf_zone;
+use crate::shared::batch::guards::validate_shelf_zone;
 use crate::modules::prod::shelf_process::repo::ShelfProcessRepo;
 use crate::modules::prod::worker_pool::repo::WorkerPoolRepoTrait;
 use crate::shared::error::{AppError, code};

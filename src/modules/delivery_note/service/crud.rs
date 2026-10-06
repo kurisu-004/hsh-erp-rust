@@ -301,7 +301,7 @@ impl DeliveryNoteService {
         let mut by_note: HashMap<
             i64,
             Vec<(
-                crate::modules::prod::batch::model::TPartBatch,
+                crate::shared::batch::TPartBatch,
                 crate::modules::part::model::TPart,
             )>,
         > = HashMap::new();

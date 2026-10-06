@@ -27,7 +27,7 @@
 //! service 收 `&mut PgConnection` → handler `commit()`。
 //!
 //! ## 事务内并发冲突（OCC）
-//! dispatch_batch 入口 `PartBatchRepo::get_by_id` 后用 fetched `batch.version` 作
+//! dispatch_batch 入口 `shared::batch::get_batch_by_id` 后用 fetched `batch.version` 作
 //! `expected_version`；UPDATE 0 行 → `VERSION_CONFLICT 40901`。
 //!
 //! ## 2026-10-02 `t_shelf_process` SQL 收口
@@ -41,7 +41,7 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepo;
-use crate::modules::prod::batch::repo::{BatchRepo, PartBatchRepo};
+use crate::modules::prod::batch::repo::BatchRepo;
 use crate::modules::prod::batch::vo::{
     AutoDispatchItem, AutoDispatchResult, DispatchResult, DispatchSuccessItem, PendingBatchItem,
     PendingBatchListOut,
@@ -159,7 +159,7 @@ impl BatchService {
         current: &CurrentUser,
     ) -> Result<DispatchSuccessItem, AppError> {
         // 1. 取 batch
-        let batch = PartBatchRepo::get_by_id(&mut *conn, batch_id, false)
+        let batch = crate::shared::batch::get_batch_by_id(&mut *conn, batch_id, false)
             .await?
             .ok_or_else(|| {
                 AppError::biz(

@@ -33,7 +33,7 @@ use crate::modules::shelf::repo::ShelfRepo;
 use crate::shared::error::{AppError, code};
 
 use super::BatchService;
-use super::guard::{
+use crate::shared::batch::guards::{
     InspectionRepairRow, assert_shelf_maps_process, mark_batch_with_status_and_meta,
     optional_process_chain, optional_step_id, validate_batch_version,
 };
@@ -541,7 +541,7 @@ enum BatchListFilter<'a> {
     /// 额外排除 `status IN ('COMPLETED','CANCELLED')`：正常路径下终态批次不会
     /// 带 `is_repairing = true`（`complete_repair` / `repair_dispatch` /
     /// `cancel_batch` 都清标记），但 part 级批量取消走的
-    /// `status_gate::apply_bulk_batch_status_change_for_part` **只写 status**，
+    /// `batch_status::apply_bulk_batch_status_change_for_part` **只写 status**，
     /// 会留下一批 `CANCELLED + is_repairing=true` 的行。把它们排除掉，
     /// 「待返修列表」就不会列出已作废的批次（否则用户点进去才发现货早没了）。
     /// 该兜底在 bulk 写点补上标记写入后可去掉。

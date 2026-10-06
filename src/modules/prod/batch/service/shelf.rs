@@ -15,7 +15,7 @@ use crate::modules::prod::batch::dto::{PlaceOnShelfRequest, RecallToPendingReque
 use crate::shared::error::{AppError, code};
 
 use super::BatchService;
-use super::guard::{
+use crate::shared::batch::guards::{
     assert_shelf_maps_process, ensure_transition, mark_batch_with_status_and_meta,
     optional_process_chain, optional_step_id, validate_batch_version, validate_shelf_zone,
 };
@@ -67,7 +67,7 @@ impl BatchService {
             "IN_PROCESS",
             Some("PRODUCTION_SHELF"),
             Some(req.shelf_id),
-            // 2026-10-03：无链时为 None ⇒ status_gate 的 clear 分支写 NULL
+            // 2026-10-03：无链时为 None ⇒ shared::batch::status 的 clear 分支写 NULL
             step_id,
             Some(req.next_process_id),
             current.id,
@@ -77,7 +77,7 @@ impl BatchService {
             return Err(AppError::biz(code::VERSION_CONFLICT, "batch 版本冲突"));
         }
         // 2026-10-01 review 第 1 轮 m4：原此处有一行
-        // `let _ = PartService::sync_from_batch_change(...)`。status_gate 收口后它是
+        // `let _ = PartService::sync_from_batch_change(...)`。shared::batch::status 收口后它是
         // 无害空跑（派生已在 `mark_batch_with_status_and_meta` 内做完），且会让
         // 下一个读代码的人以为「调它」是必须的 —— 已删。
         // 事件日志
@@ -136,7 +136,7 @@ impl BatchService {
         // 2026-10-06 放宽到 WORKER：运营需要把**已被工人领走**的批次一键召回，
         // 否则只能等工人手工报工 / 归还。放宽是安全的，因为守卫之后的
         // `mark_batch_with_status_and_meta(..., "PENDING", None, None, None, None, ...)`
-        // 里 4 个 `None` 触发 status_gate 的 `clear_location` / `clear_holder_id` /
+        // 里 4 个 `None` 触发 shared::batch::status 的 `clear_location` / `clear_holder_id` /
         // `clear_process_id` / `clear_process_step_id`（三态约定：`None` = 保持原值，
         // 「清 NULL」由同名 `clear_*` 显式表达）⇒ 一次写入把 location、holder、
         // 工序归属、step 四列一起清空：
