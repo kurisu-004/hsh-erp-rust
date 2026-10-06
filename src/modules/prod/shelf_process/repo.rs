@@ -27,7 +27,6 @@
 //! - `prod::batch::service` 2 处（`guard.rs` 的 `assert_shelf_maps_process` /
 //!   `worker_scan.rs` 的 RETURNED 分支）—— 都要连 `t_part_batch` 一起判，放一起
 //!   省一次往返；拆开反而把「校验 + 写」割成两个事务上下文
-//! - `part::repo::sql::pending_programming_sql` 1 处 —— 待编程一览是 part 域读侧
 
 use sqlx::PgExecutor;
 

@@ -4,7 +4,7 @@
 //! - `crud.rs` —— 单件 CRUD：list / detail / create / update / soft-delete / by-serial /
 //!   列表 / 事件 / 位置树 / match-by-excel / batch-update-order-info
 //! - `lifecycle.rs` —— part 级终态（cancel / force-complete）+ 各种 list 列表
-//!   （pending-programming / by-work-type / by-worker）
+//!   （by-work-type / by-worker）
 //! - `batch.rs` —— 批量创建（batch / batch-with-bindings / batch-with-pdfs）+ 直传 COS confirm
 //! - `print.rs` —— 打印转发（print-drawing / print-drawing-batch，纯 BFF：鉴权 + 转发到 python）
 //!
@@ -21,7 +21,7 @@
 //!   再校验一次（双层守卫，与现有其他域保持一致）。
 //!
 //! ## 静态段路由顺序敏感
-//! 静态段（`/batch` / `/by-serial` / `/pending-programming` …）必须在
+//! 静态段（`/batch` / `/by-serial` …）必须在
 //! `/{part_id}/...` catch-all 之前注册，否则 axum 会把静态段解析成 part_id。
 //! 组装见 `super::router()`（src/modules/part/mod.rs）。
 
@@ -55,8 +55,7 @@ pub use crud::{
 // recall-to-pending / release-from-programming / outsource 三端点 / complete-repair /
 // repair-dispatch / split-batch / cancel-batch / pick-up（见 prod::batch::handler::lifecycle）。
 pub use lifecycle::{
-    cancel, force_complete, list_by_work_type, list_by_worker, list_pending_programming,
-    list_pickable_by_work_type,
+    cancel, force_complete, list_by_work_type, list_by_worker, list_pickable_by_work_type,
 };
 
 // ----- batch.rs -----

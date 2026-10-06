@@ -133,8 +133,7 @@ fn push_inspection_queue_where(qb: &mut QueryBuilder<Postgres>, f: &InspectionQu
 
 /// `list_inspection_queue` 的行结构（FromRow）。
 ///
-/// 手动 `#[derive(FromRow)]` 而非 `query_as!` —— SQL 由 `QueryBuilder` 动态拼装
-/// （范式同 `part/repo/sql/pending_programming_sql.rs::PendingProgrammingItemRow`）。
+/// 手动 `#[derive(FromRow)]` 而非 `query_as!` —— SQL 由 `QueryBuilder` 动态拼装。
 /// 多出的 `customer_parent_id` / `parent_customer_name` 是 `l1_customer_name` 的派生
 /// 原料，不进 VO。
 #[derive(sqlx::FromRow)]

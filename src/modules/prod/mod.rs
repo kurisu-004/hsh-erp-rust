@@ -18,12 +18,12 @@
 //!   合并为单一 bulk-only `/batches/dispatch`，原 `/bulk-dispatch` 路径 404。
 //!
 //! 2026-10-01 新增 `prod::programming` 子模块（待编程一览，1 端点，URL 挂
-//! `/api/v2/prod/programming/pending`）：前端「待编程一览」页从 part 域
-//! `GET /api/v2/parts/pending-programming` 切过来。谓词按 part 状态闸门
+//! `/api/v2/prod/programming/pending`）：它是「待编程一览」页的**唯一**数据源
+//! （part 域同名端点已于 2026-10-07 下线）。谓词按 part 状态闸门
 //! （`p.status IN ('PENDING','IN_PROCESS','PROGRAMMING')`，约束全部规则）+ 三规则
-//! 并集（part 级去重）：① `p.status = 'PROGRAMMING'` 兼容旧筛选 ② 工单工艺链含
-//! `is_cnc` 工序 ③ 批次 `current_process_id` 指向 `is_cnc` 工序（migration 004
-//! 确立的唯一权威列）。part 域旧端点**保留兼容、一行未改**，仅追加弃用文档说明。
+//! 并集（part 级去重）：① `p.status = 'PROGRAMMING'`（历史 PROGRAMMING 状态仍
+//! 允许消化）② 工单工艺链含 `is_cnc` 工序 ③ 批次 `current_process_id` 指向
+//! `is_cnc` 工序（migration 004 确立的唯一权威列）。
 //!
 //! 2026-10-02 新增 `prod::shelf_process` 子模块（货架 ↔ 工序映射 `t_shelf_process`，
 //! 3 端点，URL 挂 `/api/v2/prod/shelf-processes/*`）：原 `src/modules/shelf/

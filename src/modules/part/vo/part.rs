@@ -238,10 +238,9 @@ pub struct PartListItem {
     pub child_count: Option<i64>,
     /// 2026-09-29 新增：是否已上传 G_CODE（数控程序）。
     /// - 真相源：`EXISTS (SELECT 1 FROM t_part_file WHERE part_id = p.id AND kind = 'G_CODE' AND deleted_at IS NULL)`
-    /// - 用途：`GET /parts/pending-programming` 的 Tab 切换 (`has_cnc_program` query 参数) +
-    ///   worker_pool 候选池的自动分配优先级（已上传 G_CODE 的批次优先 take）
-    /// - 其它列表端点（`GET /parts`）默认 `false`（service 层不再 enrich；前端如需，
-    ///   走 `GET /parts/pending-programming` 即可拿到此字段）
+    /// - 用途：prod 域 worker_pool 候选池的自动分配优先级（已上传 G_CODE 的批次优先 take）
+    /// - 本 VO 的所有端点（`GET /parts` 等）默认 `false`（service 层不再 enrich；
+    ///   需要该字段的前端走 `GET /prod/programming/pending`）
     #[serde(default)]
     pub has_cnc_program: bool,
     /// 2026-10-03 新增：活跃批次雪花 id（序列化走 `serialize_i64_opt` → JSON string）。
@@ -251,8 +250,8 @@ pub struct PartListItem {
     /// 「批次行」（取行 SQL 从 `t_part_batch b` 起），扫码台「领料 / 放回」按本
     /// 字段定位批次后发写请求。
     ///
-    /// 其余复用 `PartListItem` 的路径（`GET /parts` / `GET /com/union-list` /
-    /// `GET /parts/pending-programming` 等）**恒为 `None`**：那些行的语义单位是
+    /// 其余复用 `PartListItem` 的路径（`GET /parts` / `GET /com/union-list`
+    /// 等）**恒为 `None`**：那些行的语义单位是
     /// part，一个 part 的活跃批次可能不止一个，填任一活跃批次都是错锚点，故宁可不填。
     #[serde(serialize_with = "serialize_i64_opt")]
     pub batch_id: Option<i64>,
@@ -351,9 +350,9 @@ impl From<TPart> for PartListItem {
             has_children: false,
             child_count: None,
             // 2026-09-29 新增：默认 false；`From<TPart>` 不做 EXISTS enrich
-            // （避免 N+1）；service 层在 `list_pending_programming` / `list_parts`
-            // 调用 repo 时通过 EXISTS 子查询填充。其它 list caller 不填 → 默认 false
-            // （前端无影响，因为这些 caller 不暴露此字段语义）。
+            // （避免 N+1）；需要该字段的端点在调用 repo 时通过 EXISTS 子查询填充。
+            // part 域本 VO 的所有 list caller 都不填 → 恒 false（前端无影响，
+            // 因为这些 caller 不暴露此字段语义）。
             has_cnc_program: false,
             // 2026-10-03 新增：`From<TPart>` 是 part 级投影，不含批次语义
             // （`TPart` 本身不持 batch_id）→ 恒 None。需要批次锚点的端点
@@ -487,14 +486,6 @@ pub struct PartBatchListItemOut {
     pub updated_at: NaiveDateTime,
     pub version: i32,
 }
-
-/// `GET /parts/pending-programming` 出参：PROGRAMMING 状态工单一览（复用 PartListOut）。
-///
-/// 2026-09-29 改造：基于 `t_process.is_cnc` 列的新过滤规则（链上含 CNC step 或
-/// 当前批次位于 CNC 货架）+ 新增 `has_cnc_program` 字段（按 `t_part_file.kind='G_CODE'`
-/// 派生）+ 新 query 参数 `has_cnc_program?: bool`（Tab 切换）。详见
-/// [`PartListItem`](Self#structfield.has_cnc_program)。
-pub type PendingProgrammingOut = PartListOut;
 
 #[cfg(test)]
 mod tests {

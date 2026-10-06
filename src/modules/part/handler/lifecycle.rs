@@ -2,8 +2,10 @@
 //!
 //! 对应 Phase 1（2026-09-13）+ 4 个终态流转 + Phase 2（2026-09-13）pick-up：
 //! - 1.1 上架 / 召回（place-on-shelf / recall-to-pending）
-//! - 1.2 CNC 编程流转（release-from-programming / pending-programming 列表）；
-//!   2026-09-29 端点下线：send-to-programming / recall-to-programming 已删除
+//! - 1.2 CNC 编程流转（release-from-programming）；2026-10-07 下线：
+//!   `pending-programming` 列表（前端 2026-10-01 已迁至
+//!   `GET /prod/programming/pending`）；`send-to-programming` /
+//!   `recall-to-programming` 已于 2026-09-29 删除
 //! - 1.3 外协流转（send-to-outsource / receive-from-outsource /
 //!   receive-from-outsource-to-inspection）—— **2026-10-02 已随批次用例迁往
 //!   `prod::batch`**；配套的 2 条外协 list 端点（`/outsource-in-flight` /
@@ -96,23 +98,6 @@ pub async fn force_complete(
         "PART_FORCE_COMPLETED",
         json!({ "part_id": part_id.to_string() }),
     );
-    Ok(Json(R::ok(out)))
-}
-
-/// `GET /api/v2/parts/pending-programming`
-///
-/// 2026-09-22 PR5：只读 list 端点改 `pool.acquire()`。
-///
-/// 2026-09-29：基于 `t_process.is_cnc` 列的新过滤规则 + `has_cnc_program?` query 参数
-/// （Tab 切换）；详见 service `PartService::list_pending_programming` 与 docs
-/// `docs/api/parts/lifecycle.md`。
-pub async fn list_pending_programming(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Query(query): Query<crate::modules::part::dto_crud::PendingProgrammingQuery>,
-) -> Result<Json<R<PartListOut>>, AppError> {
-    let mut conn = state.pool.acquire().await?;
-    let out = PartService::list_pending_programming(&mut *conn, &query, &current).await?;
     Ok(Json(R::ok(out)))
 }
 

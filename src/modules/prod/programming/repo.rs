@@ -35,19 +35,16 @@
 //! LIMIT $limit OFFSET $offset
 //! ```
 //!
-//! - 规则1：工单状态仍是 PROGRAMMING（兼容旧 `GET /parts/pending-programming` 筛选）
+//! - 规则1：工单状态仍是 PROGRAMMING（该状态仍允许消化）
 //! - 规则2：工单绑定的工艺链上有任一 `is_cnc` 工序 step（编程员据此进生产流）
 //! - 规则3：工单存在在制批次，其当前工序就是 CNC 工序（链可能还没建，先由批次定位）
 //!
-//! ## ⚠️ part 状态闸门约束**全部三条规则**（2026-10-01 review 第 1 轮 A 项）
+//! ## ⚠️ part 状态闸门约束**全部三条规则**
 //! `p.status IN ('PENDING','IN_PROCESS','PROGRAMMING')` 写在 `WHERE` 骨架最外层
 //! （与 `p.deleted_at IS NULL` 同级、在三规则括号**之外**），因此规则2/3 同样受其约束。
 //! 起因：`t_part.process_chain_id` **从不清空**，而规则2（链含 CNC 工序）本身不看
 //! part 状态 → 历史上挂过 CNC 链的 `COMPLETED` / `CANCELLED` / `DELIVERED` /
-//! `READY_TO_SHIP` 工单会**永久**命中「待编程一览」。被替换的 part 域旧端点
-//! （`part/repo/sql/pending_programming_sql.rs`）本来就有这条闸门，且有回归测试
-//! `tests/part/lifecycle.rs::list_pending_programming_excludes_completed_or_cancelled`
-//! 锁住 —— 新端点不允许比旧端点更宽。
+//! `READY_TO_SHIP` 工单会**永久**命中「待编程一览」。
 //! 回归测试：`tests/production/pending_programming.rs::part_status_gate_excludes_completed_and_delivered`。
 //!
 //! ## ⚠️ 规则3 必须用 `t_part_batch.current_process_id`（2026-10-01）
@@ -79,8 +76,7 @@
 //! 杜绝这种漂移。
 //!
 //! ## SQL 拼接策略
-//! 走 `sqlx::QueryBuilder`（与 `part/repo/sql/pending_programming_sql.rs` 同形）：
-//! 固定骨架（FROM / WHERE / 白名单列名）走 `push` / `format!` 嵌入，动态入参走
+//! 走 `sqlx::QueryBuilder`：固定骨架（FROM / WHERE / 白名单列名）走 `push` / `format!` 嵌入，动态入参走
 //! `push_bind`。**不**使用 `query!` / `query_as!` 宏（动态 SQL 无法在编译期
 //! 固化，且会污染 `.sqlx/` 离线元数据），行结构手动 `#[derive(sqlx::FromRow)]`。
 //!
