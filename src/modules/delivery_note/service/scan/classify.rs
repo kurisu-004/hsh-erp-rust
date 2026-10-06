@@ -24,7 +24,7 @@ pub(crate) fn is_attachable_state(status: &str) -> bool {
 
 /// B 组：可送检。`IN_PROCESS` 需未被工人持有。
 ///
-/// 「工人持有」以 `location = 'WORKER'` 判定（与 worker_pool / part repo 的
+/// 「工人持有」以 `location = 'WORKER'` 判定（与 queue / part repo 的
 /// 全部查询一致）。**不能用 `current_holder_id`**：该列多态——批次放货架时
 /// 存 `t_shelf.id`（`location = 'PRODUCTION_SHELF' / 'INSPECTION_SHELF'`），
 /// 只有工人取件时才存 worker id（`location = 'WORKER'`）。

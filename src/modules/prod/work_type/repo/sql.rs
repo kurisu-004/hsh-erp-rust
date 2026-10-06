@@ -315,7 +315,7 @@ impl WorkTypeRepo {
     /// 返回元组，service 层负责构造 DTO。
     ///
     /// 注：本方法保留 `Result<_, AppError>` 返回类型（与原 `repo.rs` 一致），原因是
-    /// 跨模块静态调用方 `prod::worker_pool::service` 直接走 ZST 静态方法 +
+    /// 跨模块静态调用方 `prod::queue::service` 直接走 ZST 静态方法 +
     /// `AppError` 自动 `?`，不能破坏其调用形态。
     /// 胖 trait `WorkTypeRepoTrait` 也对应返回 `AppError`（见 `repo/mod.rs`）。
     pub async fn list_work_types_by_process_id<'e, E: PgExecutor<'e>>(

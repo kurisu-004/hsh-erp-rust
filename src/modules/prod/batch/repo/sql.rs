@@ -532,7 +532,7 @@ impl PartBatchRepo {
     /// | 调用方 | 语义 | `advance_to_process_id` |
     /// |---|---|---|
     /// | `worker_scan.rs::worker_scan` RETURNED | **推进工序**：工人在 P1 完工、扫 RETURNED 传 `next_process_id=P2`，批次应落进 **P2** 池 | `Some(P2)` |
-    /// | `prod/worker_pool/service.rs::move_batch` WORKER→POOL | **池内移动**：工种不变，批次归还货架后仍属原工序候选池 | `None` |
+    /// | `prod/queue/service.rs::move_batch` WORKER→POOL | **池内移动**：工种不变，批次归还货架后仍属原工序候选池 | `None` |
     ///
     /// 修复前 RETURNED 路径不写该列 → 批次带着 `current_process_id=P1` 归还货架
     /// → 落回 **P1** 池而非 P2 池。这正是 migration 004 要确立的「唯一权威依据」

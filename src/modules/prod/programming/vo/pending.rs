@@ -3,7 +3,7 @@
 //! 域级 VO 契约（仅 Serialize / 禁入 extractor / 与前端 schema 对应 / 子文件划分
 //! 取舍）见 [`super`] 模块 doc；此处只留逐字段口径。
 //!
-//! 2026-10-01 新增：与 `prod::batch` / `worker_pool` 同形 VO，仅 `Serialize`
+//! 2026-10-01 新增：与 `prod::batch` / `queue` 同形 VO，仅 `Serialize`
 //! 不 `Deserialize`。
 //!
 //! 2026-10-03 由 13 字段扩到 15：加 `batch_id` / `batch_version`。原因是本端点的唯一
@@ -44,7 +44,7 @@ pub struct ProgrammingItemOut {
     /// L1 一级集团名；L2 未挂 parent 时为 None
     pub parent_customer_name: Option<String>,
     /// 是否已上传 G_CODE（真相源 `EXISTS t_part_file kind='G_CODE' AND
-    /// deleted_at IS NULL`，与 worker_pool 候选池同源）。
+    /// deleted_at IS NULL`，与 queue 候选池同源）。
     pub has_cnc_program: bool,
     /// 2026-10-03 新增：该 part 的 **PROGRAMMING 活跃批次** 雪花 id（JSON string）。
     ///

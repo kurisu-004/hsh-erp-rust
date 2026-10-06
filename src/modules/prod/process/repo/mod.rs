@@ -8,7 +8,7 @@
 //!   `&mut *tx` / `&mut *conn` 即可，零中间壳。
 //!
 //! ## 为什么 trait 命名为 `ProcessRepoTrait`（带 `Trait` 后缀）
-//! 跨模块静态调用方 `prod::worker_pool/service.rs` /
+//! 跨模块静态调用方 `prod/queue/service.rs` /
 //! `prod::work_type/service.rs`（2026-09-22 PR6 起，process_mapping 合入 service） /
 //! `shelf::service/picker.rs`（注释）/ 共 3+ 处
 //! 直接走 ZST 静态方法 `ProcessRepo::xxx(&mut *conn, ...)`，本任务**不能**破坏

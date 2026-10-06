@@ -1,6 +1,9 @@
-//! 「待下发批次下发给车间」3 端点（`pending` / `dispatch` / `auto-dispatch`）
-//! 的 HTTP 路由 + 角色守卫 + WS 广播。2026-10-06 订正：待下发源状态白名单 =
-//! `PENDING` / `PROGRAMMING`（已废弃的 `PROGRAMMING` 只存量兼容，与 `PENDING` 同链路）。
+//! prod::queue 下发流 3 端点（`pending` / `dispatch` / `auto-dispatch`）的 HTTP
+//! 路由 + 角色守卫 + WS 广播。2026-10-08 自 `prod::batch::handler::dispatch` 搬入
+//! （URL 由 `/prod/batches/*` 硬切到 `/prod/queue/*`，无 alias）。
+//!
+//! 待下发源状态白名单 = `PENDING` / `PROGRAMMING`（已废弃的 `PROGRAMMING` 只存量
+//! 兼容，与 `PENDING` 同链路）。
 //!
 //! - dispatch 统一 bulk-only（单条下发即 `targets.length == 1`）
 //! - auto-dispatch 改为只读查询（不开事务、不发 WS 广播）
@@ -13,8 +16,7 @@
 //! - 只读端点（auto-dispatch）：`pool.acquire()` 不开事务，不发 WS
 //!
 //! ## 角色守卫
-//! 在 service 第一行下沉（沿 worker_pool 范本），handler 仅做权限分发。
-//! 当前端点的守卫下沉到 service；handler 不重复校验。
+//! 在 service 第一行下沉（沿本域 `move_batch` 范本），handler 仅做权限分发。
 
 use std::sync::Arc;
 
@@ -28,11 +30,13 @@ use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
 
-use crate::modules::prod::batch::dto::{AutoDispatchRequest, DispatchRequest, ListPendingQuery};
-use crate::modules::prod::batch::service::BatchService;
-use crate::modules::prod::batch::vo::{AutoDispatchResult, DispatchResult, PendingBatchListOut};
+use crate::modules::prod::queue::dto::{AutoDispatchRequest, DispatchRequest, ListPendingQuery};
+use crate::modules::prod::queue::service::queue::QueueService;
+use crate::modules::prod::queue::vo::queue::{
+    AutoDispatchResult, DispatchResult, PendingBatchListOut,
+};
 
-/// 通用 WS 广播 helper：单 kind + 单 payload 字段（与 worker_pool 同形）。
+/// 通用 WS 广播 helper：单 kind + 单 payload 字段（与 queue 同形）。
 #[inline]
 fn ws_broadcast(state: &AppState, kind: &str, payload: serde_json::Value) {
     state.ws_hub.broadcast(WsEvent::DashboardEvent {
@@ -41,7 +45,7 @@ fn ws_broadcast(state: &AppState, kind: &str, payload: serde_json::Value) {
     });
 }
 
-/// `GET /api/v2/prod/batches/pending`
+/// `GET /api/v2/prod/queue/pending`
 ///
 /// 角色：Manager + Clerk + Inspector（service 内守卫）。
 /// 读端点：`pool.acquire()` 不开事务。
@@ -51,11 +55,11 @@ pub async fn list_pending(
     Query(q): Query<ListPendingQuery>,
 ) -> Result<Json<R<PendingBatchListOut>>, AppError> {
     let mut conn = state.pool.acquire().await?;
-    let out = BatchService::list_pending(&mut conn, &_current, q.limit, q.offset).await?;
+    let out = QueueService::list_pending(&mut conn, &_current, q.limit, q.offset).await?;
     Ok(Json(R::ok(out)))
 }
 
-/// `POST /api/v2/prod/batches/dispatch`
+/// `POST /api/v2/prod/queue/dispatch`
 ///
 /// 角色：Manager + Clerk（service 内守卫）。
 ///
@@ -76,7 +80,7 @@ pub async fn dispatch(
         .map(|t| (t.batch_id, t.target_process_id))
         .collect();
     let mut tx = state.pool.begin().await?;
-    let r = BatchService::dispatch_batch(
+    let r = QueueService::dispatch_batch(
         &mut tx,
         targets,
         req.note.as_deref(),
@@ -107,7 +111,7 @@ pub async fn dispatch(
     Ok(Json(R::ok(r)))
 }
 
-/// `POST /api/v2/prod/batches/auto-dispatch`
+/// `POST /api/v2/prod/queue/auto-dispatch`
 ///
 /// 角色：Manager + Clerk（service 内守卫）。
 ///
@@ -124,6 +128,6 @@ pub async fn auto_dispatch(
 ) -> Result<Json<R<AutoDispatchResult>>, AppError> {
     let batch_ids = req.batch_ids.unwrap_or_default();
     let mut conn = state.pool.acquire().await?;
-    let r = BatchService::auto_dispatch_preview(&mut conn, &current, batch_ids).await?;
+    let r = QueueService::auto_dispatch_preview(&mut conn, &current, batch_ids).await?;
     Ok(Json(R::ok(r)))
 }

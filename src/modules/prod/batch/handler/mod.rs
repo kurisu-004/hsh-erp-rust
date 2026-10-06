@@ -1,8 +1,10 @@
-//! `prod::batch` HTTP handler 汇总 + 24 条批次路由的注册表。
+//! `prod::batch` HTTP handler 汇总 + 批次路由的注册表。
+//!
+//! 2026-10-08：`dispatch.rs`（`pending` / `dispatch` / `auto-dispatch` 三端点）
+//! 与 `lifecycle.rs::recall_to_pending` 搬往 `prod::queue`（下发流与召回的
+//! 消费方是队列页，不是批次详情页）。本域剩 `transition.rs` + `lifecycle.rs`。
 //!
 //! ## 子文件
-//! - `dispatch.rs` —— 「待下发批次下发给车间」：`pending` / `dispatch` /
-//!   `auto-dispatch`（2026-10-06 订正：源状态白名单 `PENDING` / `PROGRAMMING`）
 //! - `transition.rs` —— to-XXX 流（`to-ship` / `to-inspection` / `to-process`）+ 批量
 //!   流转 + 扫码快捷入口（`scan-inspect` / `scan/deliver` / `worker-scan`）+ 集合读
 //!   （`repair` / `repairing`）
@@ -24,12 +26,8 @@ use axum::{
 
 use crate::state::AppState;
 
-pub mod dispatch;
 pub mod lifecycle;
 pub mod transition;
-
-// ----- dispatch.rs -----
-pub use dispatch::{auto_dispatch, dispatch, list_pending};
 
 // ----- transition.rs -----
 pub use transition::{
@@ -39,7 +37,7 @@ pub use transition::{
 
 // ----- lifecycle.rs -----
 pub use lifecycle::{
-    cancel_batch, complete, complete_repair, deliver, pick_up, place_on_shelf, recall_to_pending,
+    cancel_batch, complete, complete_repair, deliver, pick_up, place_on_shelf,
     receive_from_outsource, receive_from_outsource_to_inspection, release_from_programming,
     repair_dispatch, send_to_outsource, split_batch, start_repair,
 };
@@ -48,16 +46,9 @@ pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         // ====================================================================
         // ① 1 段静态段（无 Path）—— 与 §2.2 的 3 条批量 / 事件端点、
-        //    §2.3 的 2 条集合读、以及本域原有的 pending / dispatch / auto-dispatch
-        //    同段数。**静态段必须先于 `/{batch_id}/...` 注册**（axum matchit 对
+        //    §2.3 的 2 条集合读同段数。**静态段必须先于 `/{batch_id}/...` 注册**（axum matchit 对
         //    同优先级按注册序；本组与 2 段动态组段数不同，天然无冲突）。
         // ====================================================================
-        // ---- 本域原有：待下发批次下发给车间（2026-10-06 订正：白名单 PENDING / PROGRAMMING）----
-        .route("/pending", get(dispatch::list_pending))
-        // dispatch 统一 bulk-only（单条下发即 targets.length==1）
-        .route("/dispatch", post(dispatch::dispatch))
-        // auto-dispatch 改为只读查询
-        .route("/auto-dispatch", post(dispatch::auto_dispatch))
         // ---- 静态批量流转（2 条，无 Path extractor）----
         .route("/to-ship", post(transition::batch_to_ship))
         .route("/to-inspection", post(transition::batch_to_inspection))
@@ -93,14 +84,10 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{batch_id}/deliver", post(lifecycle::deliver))
         .route("/{batch_id}/complete", post(lifecycle::complete))
         .route("/{batch_id}/start-repair", post(lifecycle::start_repair))
-        // ---- 上架 / 召回 / 编程 ----
+        // ---- 上架 / 编程 ----
         .route(
             "/{batch_id}/place-on-shelf",
             post(lifecycle::place_on_shelf),
-        )
-        .route(
-            "/{batch_id}/recall-to-pending",
-            post(lifecycle::recall_to_pending),
         )
         .route(
             "/{batch_id}/release-from-programming",

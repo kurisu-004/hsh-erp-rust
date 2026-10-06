@@ -21,7 +21,7 @@
 //!
 //! 2026-09-30 新增 `current_process_id`（migration 004）：
 //! - `current_process_id`（逻辑 FK → `t_process.id`）是**判断批次是否属于某
-//!   工序池的唯一权威依据**：worker_pool 候选池 3 条 SQL + count 全部按本列
+//!   工序池的唯一权威依据**：queue 候选池 3 条 SQL + count 全部按本列
 //!   普通过滤（不再 JOIN `t_process_chain_step`）
 //! - `current_process_step_id` 相应**降级为可选的显示用定位信息**：仅当工单已
 //!   绑定工序链时才写，允许 NULL；且**只在首次定位工序时写、之后不再推进**

@@ -1,33 +1,35 @@
-//! worker_pool 域 repo 层（SQL 真源 + 胖 trait + PG 实现）
+//! queue 域 repo 层（SQL 真源 + 胖 trait + PG 实现）
 //!
 //! ## 结构（2026-09-22 D-2 重构对齐 iam / shelf / customer / worker 范本）
 //! - `sql.rs`：原 `repo.rs` 全文搬迁，4 个 pub 固有静态方法 + sqlx `query!` 宏，
 //!   **内容零 diff**（`.sqlx/query-*.json` 哈希不变）。
-//! - `mod.rs`（本文件）：对外暴露胖 trait `WorkerPoolRepoTrait`（本域 4 方法 + 跨域
-//!   helper 14 方法），并直接 `impl WorkerPoolRepoTrait for &mut PgConnection`
+//! - `mod.rs`（本文件）：对外暴露胖 trait `QueueRepoTrait`（本域 3 方法 + 跨域
+//!   helper），并直接 `impl QueueRepoTrait for &mut PgConnection`
 //!   ——handler/service 借 `&mut *tx` / `&mut *conn` 即可，零中间壳。
+//! - `dispatch.rs` —— ZST `QueueDispatchRepo`：「PENDING 批次下发给车间」专用查询
+//!   （2026-10-08 自 `prod::batch::repo` 搬入，见该文件 doc）
 //!
-//! ## 为什么 trait 命名为 `WorkerPoolRepoTrait`（带 `Trait` 后缀）
-//! 本任务范围内 `_e2e` / `statistics` / 其他域对 worker_pool repo 的跨模块静态调用
-//! 命中数为 0（grep 校验：除 `src/modules/prod/worker_pool/` 自身外无
-//! `WorkerPoolRepo::` 调用），但仍按 shelf / customer / process_chain / worker 范本
+//! ## 为什么 trait 命名为 `QueueRepoTrait`（带 `Trait` 后缀）
+//! 本任务范围内 `_e2e` / `statistics` / 其他域对 queue repo 的跨模块静态调用
+//! 命中数为 0（grep 校验：除 `src/modules/prod/queue/` 自身外无
+//! `QueueRepo::` 调用），但仍按 shelf / customer / process_chain / worker 范本
 //! 命名 `*Trait` 后缀——未来跨模块调用方零修改成本（trait 改名比 ZST 改名风险低）。
 //!
-//! - `prod::worker_pool::repo::WorkerPoolRepo` —— ZST struct（在 `sql.rs` 内，通过
-//!   `pub use sql::WorkerPoolRepo;` 重新导出至本模块），保留 4 个 pub 静态方法签名
+//! - `prod::queue::repo::QueueRepo` —— ZST struct（在 `sql.rs` 内，通过
+//!   `pub use sql::QueueRepo;` 重新导出至本模块），保留 4 个 pub 静态方法签名
 //!   不变（任何未来 cross-module 调用方零修改）。
-//! - `prod::worker_pool::repo::WorkerPoolRepoTrait` —— 本文件新加的胖 trait
-//!   （18 方法 = 本域 4 + 跨域 helper 14），worker_pool 域内部 service 用
-//!   `<R: WorkerPoolRepoTrait>` 收。
+//! - `prod::queue::repo::QueueRepoTrait` —— 本文件新加的胖 trait
+//!   （18 方法 = 本域 4 + 跨域 helper 14），queue 域内部 service 用
+//!   `<R: QueueRepoTrait>` 收。
 //!
 //! ## 为什么是胖 trait（含本域 + 跨域 helper）
-//! worker_pool 是跨域核心（CLAUDE.md §「part 是跨域枢纽」的兄弟节点）——同 service
+//! queue 是跨域核心（CLAUDE.md §「part 是跨域枢纽」的兄弟节点）——同 service
 //! 方法（`refill_for_worker_with_work_type` / `compute_state` / `admin_remove_held_batch` /
 //! `auto_allocate_for_process` / `assign_batch_to_worker`）需交替访问
-//! t_worker_pool（本域）+ t_worker + t_work_type + t_process + t_process_chain_step +
+//! t_queue（本域）+ t_worker + t_work_type + t_process + t_process_chain_step +
 //! t_part_batch + t_part 共 7 表。
 //!
-//! 与 assembly / shelf / process_chain 同形：跨域 SQL 全部下沉到 `WorkerPoolRepoTrait`
+//! 与 assembly / shelf / process_chain 同形：跨域 SQL 全部下沉到 `QueueRepoTrait`
 //! helper 方法，trait impl 一行委托到对应 ZST 静态方法（已重构域）或原 ZST 静态方法
 //! （part 域，D-6 未做）。
 //!
@@ -53,12 +55,12 @@
 //! ## 为什么 trait 可以直接对 `&mut PgConnection` 实现
 //! `Transaction<'_, Postgres>` 与 `PoolConnection<Postgres>` 都 `DerefMut<Target = PgConnection>`，
 //! 故 `&mut *tx` / `&mut *conn` 即 `&mut PgConnection`，可直接喂给 `sql::XxxRepo::yyy`。
-//! 无需任何 `PgWorkerPoolRepo<'a>` 转发壳（与 iam 2026-09-22 删 `PgIamRepo` 同步）。
+//! 无需任何 `PgQueueRepo<'a>` 转发壳（与 iam 2026-09-22 删 `PgIamRepo` 同步）。
 //!
 //! ## automock
-//! `#[cfg_attr(test, mockall::automock)]` 在 trait 上声明，生成 `MockWorkerPoolRepoTrait`
-//! 供 service 单测注入。worker_pool 域当前无内联 mod tests（service 全部走
-//! `tests/worker_pool_api.rs` + `tests/worker_pool_auto_allocate_api.rs` 集成测试守护），
+//! `#[cfg_attr(test, mockall::automock)]` 在 trait 上声明，生成 `MockQueueRepoTrait`
+//! 供 service 单测注入。queue 域当前无内联 mod tests（service 全部走
+//! `tests/queue_api.rs` + `tests/queue_auto_allocate_api.rs` 集成测试守护），
 //! 故未建 `service_tests/` 目录——按 conventions.md §4.1 含 IO 不强求 100%。
 //!
 //! ## 错误类型
@@ -73,19 +75,20 @@ use crate::modules::prod::process::model::TProcess;
 use crate::modules::prod::work_type::model::TWorkType;
 use crate::modules::prod::worker::model::TWorker;
 
+pub mod dispatch;
 pub mod sql;
 
 // 重导出 sql.rs 中的 ZST struct 与 model 表行类型，让上层继续用
-// `super::repo::{WorkerPoolRepo, TakenRow, CandidateRow}` 这种路径不破（cross-module
+// `super::repo::{QueueRepo, TakenRow, CandidateRow}` 这种路径不破（cross-module
 // 调用方都依赖这条路径）。
-pub use sql::WorkerPoolRepo;
+pub use sql::QueueRepo;
 
-use crate::modules::prod::worker_pool::model::TakenItem;
+use crate::modules::prod::queue::vo::worker::TakenItem;
 
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
-pub trait WorkerPoolRepoTrait: Send {
-    // ── t_worker_pool 域（本域 4 方法）──
+pub trait QueueRepoTrait: Send {
+    // ── t_queue 域（本域 4 方法）──
     async fn take_one_from_pool(
         &mut self,
         worker_id: i64,
@@ -101,20 +104,6 @@ pub trait WorkerPoolRepoTrait: Send {
         batch_id: i64,
         operator_user_id: i64,
     ) -> Result<Option<TakenItem>, sqlx::Error>;
-
-    async fn list_candidates_by_process_all_shelves(
-        &mut self,
-        process_id: i64,
-    ) -> Result<Vec<super::vo::PoolBatchItem>, sqlx::Error>;
-
-    async fn list_held_by_worker_with_part(
-        &mut self,
-        worker_id: i64,
-    ) -> Result<Vec<super::model::HeldBatchItem>, sqlx::Error>;
-
-    /// 全工序候选批次聚合计数（2026-09-30 新增）。
-    /// 单 SQL GROUP BY current_process_id，service 层二次查 process 元数据。
-    async fn group_count_by_process_all_shelves(&mut self) -> Result<Vec<(i64, i64)>, sqlx::Error>;
 
     /// worker ↔ worker 移动 SQL（2026-09-30 新增）。把 batch 从 src 切到 dst，
     /// 不写 `current_process_step_id`（move 不推进工序链）**也不写
@@ -174,10 +163,6 @@ pub trait WorkerPoolRepoTrait: Send {
         process_id: i64,
         include_deleted: bool,
     ) -> Result<Option<TProcess>, sqlx::Error>;
-
-    /// 批量查 process（`ProcessRepo::list_by_ids`）。
-    /// `pool_counts_all_shelves` 二次取 process_code/name 元数据用。
-    async fn process_list_by_ids(&mut self, ids: &[i64]) -> Result<Vec<TProcess>, sqlx::Error>;
 
     // ── process_chain 域 helper（2）──
     /// 解析 chain 上 process 对应的 step_id（`ProcessChainRepo::resolve_step_id_by_process`）。
@@ -271,15 +256,6 @@ pub trait WorkerPoolRepoTrait: Send {
         created_by: Option<i64>,
     ) -> Result<(), sqlx::Error>;
 
-    // ── 跨域 inline SQL helper（1，service `compute_state` 内联下沉）──
-    /// 池候选数（按 shelf + process 维度）。
-    /// 原 `service.rs:225` 的 `sqlx::query_scalar!` 内联 SQL 下沉。
-    async fn count_pool_by_shelf_and_process(
-        &mut self,
-        shelf_id: i64,
-        process_id: i64,
-    ) -> Result<i64, sqlx::Error>;
-
     // ── 跨域 inline SQL helper（1，admin_remove 内联下沉）──
     /// 取 part 的 process_chain_id（admin_remove 路径解析 step 用）。
     /// 原 `service.rs:304` 的 `sqlx::query_scalar` 内联 SQL 下沉。
@@ -287,7 +263,7 @@ pub trait WorkerPoolRepoTrait: Send {
     -> Result<Option<i64>, sqlx::Error>;
 }
 
-/// 把 `WorkerPoolRepoTrait` 直接对 `&mut PgConnection` 实现——handler/service 借
+/// 把 `QueueRepoTrait` 直接对 `&mut PgConnection` 实现——handler/service 借
 /// `&mut *tx` 或 `&mut *conn` 即可调用 `sql::XxxRepo::yyy`，零转发壳（与
 /// iam 2026-09-22 删 `PgIamRepo` 同步）。
 ///
@@ -296,7 +272,7 @@ pub trait WorkerPoolRepoTrait: Send {
 /// `*self: &mut PgConnection`，`**self: PgConnection`，故喂给
 /// `sql::XxxRepo::yyy` 须写 `&mut **self`（reborrow，避免 move 引用本身）。
 #[async_trait]
-impl WorkerPoolRepoTrait for &mut PgConnection {
+impl QueueRepoTrait for &mut PgConnection {
     // ── 本域 4 方法 ──
     async fn take_one_from_pool(
         &mut self,
@@ -305,7 +281,7 @@ impl WorkerPoolRepoTrait for &mut PgConnection {
         process_ids: &[i64],
         operator_user_id: i64,
     ) -> Result<Option<TakenItem>, sqlx::Error> {
-        WorkerPoolRepo::take_one_from_pool(
+        QueueRepo::take_one_from_pool(
             &mut **self,
             worker_id,
             shelf_id,
@@ -326,7 +302,7 @@ impl WorkerPoolRepoTrait for &mut PgConnection {
         batch_id: i64,
         operator_user_id: i64,
     ) -> Result<Option<TakenItem>, sqlx::Error> {
-        WorkerPoolRepo::take_specific_from_pool(
+        QueueRepo::take_specific_from_pool(
             &mut **self,
             worker_id,
             shelf_id,
@@ -340,29 +316,6 @@ impl WorkerPoolRepoTrait for &mut PgConnection {
         })
     }
 
-    async fn list_candidates_by_process_all_shelves(
-        &mut self,
-        process_id: i64,
-    ) -> Result<Vec<super::vo::PoolBatchItem>, sqlx::Error> {
-        WorkerPoolRepo::list_candidates_by_process_all_shelves(&mut **self, process_id)
-            .await
-            .map_err(|e| match e {
-                crate::shared::error::AppError::Database(db_err) => db_err,
-                other => sqlx::Error::Protocol(other.to_string()),
-            })
-    }
-
-    async fn list_held_by_worker_with_part(
-        &mut self,
-        worker_id: i64,
-    ) -> Result<Vec<super::model::HeldBatchItem>, sqlx::Error> {
-        WorkerPoolRepo::list_held_by_worker_with_part(&mut **self, worker_id).await
-    }
-
-    async fn group_count_by_process_all_shelves(&mut self) -> Result<Vec<(i64, i64)>, sqlx::Error> {
-        WorkerPoolRepo::group_count_by_process_all_shelves(&mut **self).await
-    }
-
     async fn move_worker_to_worker(
         &mut self,
         batch_id: i64,
@@ -371,7 +324,7 @@ impl WorkerPoolRepoTrait for &mut PgConnection {
         expected_version: i32,
         operator_user_id: Option<i64>,
     ) -> Result<u64, sqlx::Error> {
-        WorkerPoolRepo::move_worker_to_worker(
+        QueueRepo::move_worker_to_worker(
             &mut **self,
             batch_id,
             src_worker_id,
@@ -465,10 +418,6 @@ impl WorkerPoolRepoTrait for &mut PgConnection {
             include_deleted,
         )
         .await
-    }
-
-    async fn process_list_by_ids(&mut self, ids: &[i64]) -> Result<Vec<TProcess>, sqlx::Error> {
-        crate::modules::prod::process::repo::ProcessRepo::list_by_ids(&mut **self, ids).await
     }
 
     // ── process_chain helper ──
@@ -619,28 +568,6 @@ impl WorkerPoolRepoTrait for &mut PgConnection {
         PartRepo::insert_part_event(&mut **self, new).await
     }
 
-    // ── 跨域 inline SQL helper（compute_state 路径）──
-    async fn count_pool_by_shelf_and_process(
-        &mut self,
-        shelf_id: i64,
-        process_id: i64,
-    ) -> Result<i64, sqlx::Error> {
-        // 2026-09-30：池归属改按 pb.current_process_id 普通过滤（删 JOIN
-        //   t_process_chain_step，见 sql.rs take_one_from_pool 同名说明）
-        let n: i64 = sqlx::query_scalar!(
-            r#"SELECT COUNT(*) AS "n!" FROM t_part_batch pb
-            WHERE pb.status = 'IN_PROCESS'
-              AND pb.location = 'PRODUCTION_SHELF'
-              AND pb.current_holder_id = $1
-              AND pb.current_process_id = $2
-              AND pb.deleted_at IS NULL"#,
-            shelf_id,
-            process_id
-        )
-        .fetch_one(&mut **self)
-        .await?;
-        Ok(n)
-    }
 
     // ── 跨域 inline SQL helper（admin_remove 路径）──
     async fn part_get_process_chain_id(

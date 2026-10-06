@@ -6,8 +6,6 @@
 //! `force-complete`）与 part 级动作（CRUD / 文件 / 各类 list）。
 //!
 //! ## 文件分工
-//! - `dispatch.rs` —— 下发流：`list_pending` / `dispatch_batch`（bulk-only）/
-//!   `auto_dispatch_preview`
 //! - `transition.rs` / `transition_core.rs` —— to-XXX 三流（送检 / 通过 / 打回）
 //!   的薄 wrapper + 批量聚合器，以及三个 `*_core` 共享核心与私有辅助
 //! - `lifecycle.rs` —— 批次终态与返修起点（deliver / complete / start-repair）
@@ -55,7 +53,6 @@
 #![allow(deprecated, clippy::too_many_arguments, clippy::type_complexity)]
 
 pub mod batch_ops;
-pub mod dispatch;
 pub mod lifecycle;
 pub mod outsource;
 pub mod pickup;
@@ -67,10 +64,10 @@ pub mod transition;
 pub mod transition_core;
 pub mod worker_scan;
 
-/// `prod::batch` service（ZST，与 worker_pool 范本一致）。
+/// `prod::batch` service（ZST，与 queue 范本一致）。
 ///
 /// 公共方法均通过 `<BatchService>::method()` 访问（unit struct 形态）。
-/// 显式 snowflake 形参保留（与 worker_pool `WorkerPoolService::refill_for_worker`
+/// 显式 snowflake 形参保留（与 `prod::queue::QueueService::refill_for_worker`
 /// 同形 —— 跨模块调用方预留兼容）。
 ///
 /// `impl` 块按业务流拆到各子文件（Rust 允许同一 `impl BatchService { ... }`

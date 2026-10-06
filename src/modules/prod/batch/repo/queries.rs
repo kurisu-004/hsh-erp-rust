@@ -2,20 +2,19 @@
 //!
 //! 2026-10-02 随 `t_part_batch` 归属迁入 prod 域（生产执行单元 = 批次）。
 //! 本文件是 `t_part_batch` 的 **SQL 真源**，17 个 `PartBatchRepo::xxx` 静态方法；
-//! 跨域调用方（part / assembly / delivery_note / wx / prod::worker_pool / task）
+//! 跨域调用方（part / assembly / delivery_note / wx / prod::queue / task）
 //! 走 `PartBatchRepo::xxx(&mut *conn, ...)` 静态调用形态。
 //!
 //! ## 2026-10-08：`get_by_id` 与 `list_active_by_part_id` 已上移到 `shared::batch::read`
 //!
-//! 两者都是「批次这张表的公共读取单元」（跨域调用方：prod::queue / delivery_note
+//! 两者都是「批次这张表的公共读取单元」（跨域调用方：queue / delivery_note
 //! / part / 派生链），留在本域等于让每个域反向 import prod::batch::repo。
 //! `PartBatchRepoTrait` 的对应方法保留（trait 是本域对外的仓储契约），
 //! 默认体改为转发 `shared::batch::read`。这不是转发壳 —— trait 方法是**接口**，
 //! 实现换位置是正常演进。
 //!
 //! ## 本目录的 3 个文件
-//! - `mod.rs` —— 本域批次 **下发给车间** 专用查询（pending 列表 / auto-dispatch
-//!   预览 / 首道 step），ZST `BatchRepo`
+//! - `mod.rs` —— 本域 repo 子模块的声明与重导出
 //! - `queries.rs`（本文件）—— `t_part_batch` 通用 SQL 真源，ZST `PartBatchRepo`
 //! - `sql.rs` —— inspection / lifecycle 流转写点（`shared::batch::status` 之上的薄包装）
 //! - `trait.rs` —— 胖 trait `PartBatchRepoTrait` + `impl for &mut PgConnection`

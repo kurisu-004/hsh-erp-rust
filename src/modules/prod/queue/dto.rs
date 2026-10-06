@@ -1,9 +1,13 @@
-//! worker_pool 域 DTO（入参 + 校验 + 跨方向 enum）
+//! prod::queue DTO（入参 + 校验 + 跨方向 enum）
 //!
-//! ## DTO/VO 边界（2026-09-22 PR4 重构）
-//! 出参结构（`PoolBatchItem` / `WorkerBrief` / `WorkTypeMaxHeld` /
-//! `ProcessPoolDetail` / `WorkerFillItem` / `AutoAllocateResult` / `MoveResult`）
-//! 已抽离至 `super::vo`。
+//! ## DTO/VO 边界
+//! 出参结构全在 [`super::vo`]（按写端点 / 下发流 / 聚合板分三个文件）。
+//! VO 禁止出现在 axum extractor 反序列化侧。
+//!
+//! ## 2026-10-08 扩容
+//! 自 `prod::batch::dto` 搬入下发流 5 个入参（`ListPendingQuery` /
+//! `DispatchRequest` / `DispatchTarget` / `AutoDispatchRequest` /
+//! `RecallToPendingRequest`）—— 它们的唯一消费方是队列页的下发 / 召回动作。
 //!
 //! ## `AutoAllocateMode` 双向 derive 说明
 //! `mode` 字段在入参（`AutoAllocateRequest::mode` 反序列化）和出参
@@ -24,7 +28,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::shared::types::{deserialize_i64, serialize_i64};
+use crate::shared::types::deserialize_i64;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
@@ -103,35 +107,78 @@ pub struct MoveRequest {
     pub note: Option<String>,
 }
 
-/// `GET /api/v2/prod/worker-pool/counts` —— 单工序候选批次聚合计数条目。
+// ============================================================================
+// 2026-10-08 自 prod::batch::dto 搬入：下发流 / 召回入参
+// ============================================================================
+
+/// `GET /api/v2/prod/queue/pending` Query 参数。
 ///
-/// 2026-09-30 新增：跨所有生产货架聚合 `t_part_batch` 中
-/// `status='IN_PROCESS' AND location='PRODUCTION_SHELF' AND deleted_at IS NULL`
-/// 的批次数（按 `next_process_id` 维度 GROUP BY）。前端
-/// `WorkerQueueBoard.vue` 用 `counts[].count` 给各 tab 标题加 `(N)` 徽标，
-/// 不再依赖每 tab 的 worker-pool 详情是否已加载。
-///
-/// i64 主键走 `serialize_i64` 序列化为字符串（雪花 ID 全链路 string 约定）。
-#[derive(Debug, Clone, Serialize)]
-pub struct ProcessBatchCount {
-    #[serde(serialize_with = "serialize_i64")]
-    pub process_id: i64,
-    pub process_code: String,
-    pub process_name: String,
-    /// 该工序候选批次数（cross-shelf 聚合）
-    pub count: i64,
+/// 默认 `limit=200` / `offset=0`（与其它 list 端点惯例一致），允许 caller 覆盖。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListPendingQuery {
+    #[serde(default = "default_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
 }
 
-/// `GET /api/v2/prod/worker-pool/counts` 顶层响应。
+fn default_limit() -> i64 {
+    200
+}
+
+impl Default for ListPendingQuery {
+    fn default() -> Self {
+        Self {
+            limit: default_limit(),
+            offset: 0,
+        }
+    }
+}
+
+/// `POST /api/v2/prod/queue/dispatch` —— bulk-only 下发。
 ///
-/// 2026-09-30 新增：admin 视角的全工序候选批次聚合（dashboard 快照型查询）。
-/// 仅做 `GROUP BY next_process_id` 单 SQL + service 层二次取 process 元数据，
-/// 不分页、不带 WS 广播（与 `GET /state` 同形态的轻量端点）。
-#[derive(Debug, Clone, Serialize)]
-pub struct WorkerPoolCountsOut {
-    pub counts: Vec<ProcessBatchCount>,
-    /// `counts.iter().map(|c| c.count).sum()`，前端可与 `counts.len()` 区分：
-    /// - `total`：候选批次总数（worker 视角有意义）
-    /// - `counts.len()`：含候选批次的工序数（dashboard tab 数量）
-    pub total: i64,
+/// 单批次下发即 `targets.length == 1`；批量多批按 `targets` 数组顺序执行，
+/// 任一失败 → 全回滚（事务由 handler 层管）。
+///
+/// 不带 `shelf_id` / `version`：货架由 service 按 `target_process_id` 在
+/// `t_shelf_process` 自动解析，版本号走批次当前 `version` 隐式 OCC。
+#[derive(Debug, Clone, Deserialize)]
+pub struct DispatchRequest {
+    pub targets: Vec<DispatchTarget>,
+    /// 可选，落到所有 `t_part_event.note`
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// `POST /api/v2/prod/queue/dispatch` 单条目标。
+#[derive(Debug, Clone, Deserialize)]
+pub struct DispatchTarget {
+    #[serde(deserialize_with = "deserialize_i64")]
+    pub batch_id: i64,
+    #[serde(deserialize_with = "deserialize_i64")]
+    pub target_process_id: i64,
+}
+
+/// `POST /api/v2/prod/queue/auto-dispatch` —— 自动下发预览（只读查询）。
+///
+/// 返回每个 batch 的「首道工序 + 首货架」+ `skip_reason`，caller 据此构造
+/// `dispatch` 的 `targets` 数组。
+///
+/// `batch_ids` 用 `deserialize_i64_vec_opt` 反序列化：字段缺省 → `None`；
+/// 元素按字符串逐个解析（前端发 `"123"` 字符串形态不会触发 422）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct AutoDispatchRequest {
+    #[serde(default, deserialize_with = "crate::shared::types::deserialize_i64_vec_opt")]
+    pub batch_ids: Option<Vec<i64>>,
+}
+
+/// `POST /api/v2/prod/queue/recall` 入参。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RecallToPendingRequest {
+    /// 2026-10-08：由 URL path 参数改为 body 字段（对齐本域其余写端点 ID 全走 body 的约定）
+    #[serde(deserialize_with = "crate::shared::types::deserialize_i64")]
+    pub batch_id: i64,
+    pub version: i32,
+    #[serde(default)]
+    pub note: Option<String>,
 }

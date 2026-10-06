@@ -1045,7 +1045,7 @@ impl OutsourceQuotableRepo {
 /// 2026-10-03 移除的两层 JOIN：原实现要求「该 OUTSOURCE 工序同时出现在零件的
 /// `process_chain_id` 链内」（`JOIN t_process_chain_step pcs`），而生产库里 1874 个
 /// 零件只有 2 个绑了链、`t_process_chain_step` 里 OUTSOURCE 类的 step 有 0 条 ⇒
-/// 交集恒空 ⇒ 端点恒返回空列表。同一类 bug 在 `prod::worker_pool` 的候选池 SQL 上
+/// 交集恒空 ⇒ 端点恒返回空列表。同一类 bug 在 `prod::queue` 的候选池 SQL 上
 /// 已于 2026-09-30 以同样方式修过（全仓已无 INNER JOIN `t_process_chain_step` 残留）。
 /// 业务决策：**兼容没有工序链的旧零件**，`current_process_id` 指外协工序即可发。
 ///

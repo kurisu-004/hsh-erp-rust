@@ -49,7 +49,7 @@ use crate::modules::prod::batch::service::transition::{
 use crate::modules::prod::batch::vo::{
     BatchToXxxOut, InspectionBatchListOut, ToXxxOut, WorkerScanOut,
 };
-use crate::modules::prod::worker_pool::service::WorkerPoolService;
+use crate::modules::prod::queue::service::QueueService;
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
@@ -282,7 +282,7 @@ pub async fn scan_deliver_part(
 ///     shelf ↔ process 必须有映射）；
 ///   - `INSPECTED`：worker 把持有件直接送检（target_inspection_shelf_id 必填，
 ///     target shelf ∈ INSPECTION 区）；
-///   - 任一成功后同事务 `WorkerPoolService::refill_for_worker`。
+///   - 任一成功后同事务 `QueueService::refill_for_worker`。
 /// - WS 广播：commit 后
 ///   - `WORKER_SCAN_RETURNED` / `WORKER_SCAN_INSPECTED`（依 event_type）；
 ///   - `WORKER_POOL_REFILL_DONE`（refill 抢到一批）或
@@ -320,11 +320,11 @@ pub async fn worker_scan(
     // scan（状态翻转 + 写事件日志）
     let scan_out =
         BatchService::worker_scan_event(&mut *tx, &state.snowflake, req.clone(), &current).await?;
-    // refill（同事务；WorkerPoolService::refill_for_worker_with_work_type 内部
+    // refill（同事务；QueueService::refill_for_worker_with_work_type 内部
     // 对 work_type / process 映射校验失败会抛业务错——事务自动回滚 scan 写入，保持原子语义）。
     // 复用 worker_scan_event 已经 fetch 过的 work_type_id + badge_code，
-    // 跳过 worker_pool service 内的 WorkerRepo::get_by_id 重复查询。
-    let refill_out = WorkerPoolService::refill_for_worker_with_work_type(
+    // 跳过 queue service 内的 WorkerRepo::get_by_id 重复查询。
+    let refill_out = QueueService::refill_for_worker_with_work_type(
         &mut tx,
         &state.snowflake,
         scan_out.worker_id,

@@ -58,12 +58,12 @@
 //! 500（`column "next_process_id" does not exist`）。
 //! `current_process_id` 是 migration 004（`20260930000000_004_add_batch_current_process_id.sql`）
 //! 引入的**批次工序归属唯一权威依据**，下发时由
-//! `BatchRepo::update_batch_dispatched` 写入，worker_pool 候选池 3 条 SQL 也按它
+//! `BatchRepo::update_batch_dispatched` 写入，queue 候选池 3 条 SQL 也按它
 //! 普通过滤。
 //!
 //! ## `has_cnc_program` 真相源
 //! [`G_CODE_EXISTS`] —— `EXISTS (SELECT 1 FROM t_part_file WHERE part_id = p.id
-//! AND kind = 'G_CODE' AND deleted_at IS NULL)`，与 worker_pool 候选池同源。
+//! AND kind = 'G_CODE' AND deleted_at IS NULL)`，与 queue 候选池同源。
 //! **同一常量**同时供 list 的 SELECT 列表与 WHERE 过滤复用（见该常量
 //! doc 的改一同步二约定）。
 //!

@@ -4,7 +4,7 @@
 //! - auto-dispatch 改为只读查询（见 `super::vo::AutoDispatchItem`）
 //! - bulk-dispatch 端点删除
 //!
-//! 与 worker_pool / process_chain 等同形 DTO 模块，
+//! 与 queue / process_chain 等同形 DTO 模块，
 //! 仅入参（`Serialize` + 反序列化兜底由 axum `Json` extractor 处理）。
 //! 出参结构见 [`super::vo`]。
 //! i64 反序列化兜底走 `deserialize_i64` / `deserialize_i64_opt` /
@@ -14,7 +14,7 @@
 
 use serde::Deserialize;
 
-use crate::modules::prod::worker_pool::dto::WorkerScanEvent;
+use crate::modules::prod::queue::dto::WorkerScanEvent;
 use crate::shared::types::{deserialize_i64, deserialize_i64_opt, deserialize_i64_vec_opt};
 
 /// `GET /api/v2/prod/batches/pending` Query 参数。
@@ -198,7 +198,7 @@ pub struct BatchToShipRequest {
 /// 是**补料用的生产架**，在同事务的 worker-pool refill 里当候选池的
 /// `current_holder_id` 过滤键用（候选池 SQL 限
 /// `location='PRODUCTION_SHELF' AND current_holder_id = $2`，见
-/// `prod/worker_pool/repo/sql.rs`）。传品检架会让 refill 查空池。
+/// `prod/queue/repo/sql.rs`）。传品检架会让 refill 查空池。
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkerScanRequest {
     pub serial_no: String,

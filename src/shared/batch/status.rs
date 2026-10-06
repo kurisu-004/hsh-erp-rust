@@ -780,7 +780,7 @@ fn is_terminal(status: &str) -> bool {
 /// - `SELECT ... FOR UPDATE` 之类的**只读**语句：根本没有 SET 子句；
 /// - `UPDATE t_part_batch SET delivery_note_id = ...` / `SET quantity = quantity - $n` /
 ///   `SET current_holder_id = ...` 等**只改其它列**的合法写点（2026-10-01 实测全仓
-///   10 处，分布在 worker_pool 抢占 / move 归还 / 批次挂送货单 / 拆批扣量 /
+///   10 处，分布在 queue 抢占 / move 归还 / 批次挂送货单 / 拆批扣量 /
 ///   `mark_batch_returned` 归还货架 / part 发料台定位）——它们命中条件 1 但不命中
 ///   条件 2，不该被拦。
 ///
@@ -1257,7 +1257,7 @@ mod write_guard_tests {
     /// (a) **注释 / 文档注释里提到这条 SQL** —— 排除。`scan_rust` 把注释
     ///     空格化后才做匹配。本仓有 8 处文档注释在描述「UPDATE t_part_batch
     ///     : INSPECTION → READY_TO_SHIP（OCC）」这类流程（`inspection_core.rs`
-    ///     3 处、`repo/sql.rs` 3 处、`worker_pool/repo/sql.rs` 1 处），它们是
+    ///     3 处、`repo/sql.rs` 3 处、`queue/repo/sql.rs` 1 处），它们是
     ///     **文档**，排除掉之后规则才能盯住真实 SQL。
     ///
     /// (b) **`#[cfg(test)]` 块** —— 排除。全仓唯一的真实例子是

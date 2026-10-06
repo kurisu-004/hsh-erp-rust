@@ -22,7 +22,7 @@
 //! - 20501 `BIZ_SHELF_NOT_FOUND` —— 数字留在 shelf 段（货架本体）
 //! - 20504 `BIZ_SHELF_PROCESS_SHELF_NOT_FOUND`
 //! - 20505 `BIZ_SHELF_PROCESS_PROCESS_NOT_FOUND` —— items 里有 process_id 不存在
-//! - 20507 `BIZ_SHELF_PROCESS_NOT_MAPPED`（worker_pool move 反向校验复用）
+//! - 20507 `BIZ_SHELF_PROCESS_NOT_MAPPED`（queue move 反向校验复用）
 //! - 20508 `BIZ_SHELF_PROCESS_NOT_FOUND`（prod::batch dispatch 解析货架复用）
 //! - 20502 `BIZ_SHELF_DUPLICATE_CODE` —— uk_t_shelf_process 撞（理论不该发生，service 已去重）
 

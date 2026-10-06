@@ -1,6 +1,6 @@
 //! part 域 repo 层（SQL 真源 + 胖 trait + PG 实现）
 //!
-//! ## 结构（2026-09-22 D-6 重构对齐 iam / shelf / customer / part_batch / worker_pool 范本）
+//! ## 结构（2026-09-22 D-6 重构对齐 iam / shelf / customer / part_batch / queue 范本）
 //! - `sql/`（原 `sql.rs`，已按表拆 `part_sql.rs` / `event_sql.rs` /
 //!   `helper_sql.rs` + `mod.rs`）：SQL 全文，
 //!   25 个 pub 固有静态方法（t_part 24 + t_part_event 1）
@@ -37,7 +37,7 @@
 //!
 //! ## 为什么 trait 命名为 `PartRepoTrait`（带 `Trait` 后缀）
 //! 跨模块静态调用方（2026-10-03 实测 7 域 10 文件：assembly 6 / delivery_note 5 /
-//! prod::batch 5 / com::union_list 3 / admin 2 / prod::worker_pool 2 /
+//! prod::batch 5 / com::union_list 3 / admin 2 / prod::queue 2 /
 //! prod::process_chain 1）继续走 `PartRepo::xxx(&mut *conn, ...)` ZST 静态方法——保持
 //! 24 处静态调用零修改（口径：`src/` 下剔除注释行后的 `PartRepo::` 出现次数，排除
 //! part 域自身；本任务**不能**破坏 `part::repo::PartRepo` 作为 ZST 的对外身份），
@@ -147,7 +147,7 @@ pub use sql::{
 ///
 /// 单 trait 而非按表拆 3 trait：`&mut PgConnection` 同一作用域只能借给一个 repo 实例，
 /// 拆分会让 service 无法同时持有三个 repo（2026-09-22 D-6 重构定案；与 iam / shelf /
-/// customer / part_batch / worker_pool 同形）。
+/// customer / part_batch / queue 同形）。
 ///
 /// 方法签名 = `sql.rs` 固有静态方法去 executor 形参。`<'a` 显式生命周期是 mockall
 /// 0.15 automock 在 `async_trait` 上下文的硬性要求。

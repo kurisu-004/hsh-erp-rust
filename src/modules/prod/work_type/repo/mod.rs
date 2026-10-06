@@ -4,7 +4,7 @@
 //! - `sql.rs`：原 `repo.rs` 全文搬迁，9 个 pub 固有静态方法 + sqlx `query!` 宏，
 //!   **内容零 diff**（`.sqlx/query-*.json` 哈希不变）。其中
 //!   `list_work_types_by_process_id` 保留 `Result<_, AppError>` 返回类型，跨模块
-//!   静态调用方（`worker_pool::service`）零修改。
+//!   静态调用方（`queue::service`）零修改。
 //! - `../service.rs`（2026-09-22 PR6 合并入）：`t_work_type_process` SQL 真源（4 静态方法 +
 //!   `NewWorkTypeProcessRow`），原 `process_mapping/{mod.rs, sql.rs}` 子目录合并而来。
 //! - `mod.rs`（本文件）：对外暴露胖 trait `WorkTypeRepoTrait`（15 方法合并单 trait；
@@ -13,7 +13,7 @@
 //!   `&mut *tx` / `&mut *conn` 即可，零中间壳。
 //!
 //! ## 为什么 trait 命名为 `WorkTypeRepoTrait`（带 `Trait` 后缀）
-//! 跨模块静态调用方 `statistics/service.rs` / `prod::worker_pool/service.rs` /
+//! 跨模块静态调用方 `statistics/service.rs` / `prod/queue/service.rs` /
 //! `prod::worker/service.rs` / `delivery_note/service/lifecycle.rs` 共 10+ 处直接走
 //! ZST 静态方法 `WorkTypeRepo::xxx(&mut *conn, ...)`，本任务**不能**破坏
 //! `prod::work_type::repo::WorkTypeRepo` 作为 ZST 的对外身份，故 trait 改名
@@ -129,7 +129,7 @@ pub trait WorkTypeRepoTrait: Send {
     async fn count_work_type_references(&mut self, work_type_id: i64) -> Result<i64, sqlx::Error>;
 
     /// 保留 `Result<_, AppError>` 返回类型（与原 `repo.rs` 一致），让跨模块静态
-    /// 调用方 `prod::worker_pool::service` 走 ZST 调用路径时 `?` 自动转换。
+    /// 调用方 `prod::queue::service` 走 ZST 调用路径时 `?` 自动转换。
     #[allow(clippy::type_complexity)]
     async fn list_work_types_by_process_id(
         &mut self,

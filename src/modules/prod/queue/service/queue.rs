@@ -1,14 +1,18 @@
-//! worker_pool 域业务逻辑
+//! queue 域业务逻辑
 //!
-//! 对应 Python myERP/service/worker_pool_service.py。
+//! 对应 Python myERP/service/queue_service.py。
 //!
 //! ## 阶段 worker-pool-take（Task 7）
 //! - `refill_for_worker` —— admin 触发「为某 worker 从其工序池抢满 max_held_batches」循环；
-//!   内部循环调 `WorkerPoolRepoTrait::take_one_from_pool`，直到池空或达到上限；
+//!   内部循环调 `QueueRepoTrait::take_one_from_pool`，直到池空或达到上限；
 //!   每抢到一批写一条 `TAKEN_FROM_POOL` 事件日志（commit 由 handler 负责）。
-//! - `compute_state` —— worker 当前持有数 + 池候选数（按工序分组）；用于 state 端点。
-//!   2026-10-04 起 `shelf_id` 降为可选（`Option<i64>`）：缺省时不算候选池计数，
-//!   `pool_count_by_process` 返空数组；持有列表 / 上限 / 容量与货架无关，不受影响。
+//!
+//! ## 2026-10-08 三个读方法已删（被 `board` 子模块取代）
+//! `compute_state` / `pool_by_process` / `pool_counts_all_shelves` 三个方法及其
+//! 端点（`GET /queue/state` / `/queue/{process_id}` / `/queue/counts`）删除，
+//! 改由 [`crate::modules::prod::queue::board`] 的两个聚合端点承担：旧路径下
+//! 前端进程序列板要发 N+1 个请求（每工序一次详情 + 每工人一次 state），
+//! 新路径恒定 1 个请求。逐字段的删除清单见 `docs/api/production/queue.md` §5。
 //!
 //! ## 2026-09-30 move 重构
 //! - 原 `admin_remove_held_batch`（WORKER→POOL 单边）+ `assign_batch_to_worker`（POOL→WORKER
@@ -19,22 +23,18 @@
 //!     → 不一致抛 `20122 BIZ_BATCH_LOCATION_MISMATCH`；
 //!   - 同 kind 移动（POOL→POOL / WORKER→WORKER 仅源 ≠ 目标）抛 `40001 VALIDATION_ERROR`。
 //!
-//! ## 阶段 worker-pool-by-process（Task 3）
-//! - `pool_by_process` —— admin 按工序查看候选池：process 元数据 + 映射工种 + 可执行工人 +
-//!   所有货架候选批次（4 子查询合一，纯读，4 路 `&mut *conn` 复用同一事务）。
-//!
 //! ## 事务边界（2026-09-22 D-2 重构对齐 iam / shelf / worker 范本）
 //! 事务移交 handler：handler 显式 `pool.begin()` / `commit()`，service 仅业务逻辑。
-//! 所有跨 repo 操作经 `WorkerPoolRepoTrait`（胖 trait = 本域 4 + 跨域 helper 14），
+//! 所有跨 repo 操作经 `QueueRepoTrait`（胖 trait = 本域 4 + 跨域 helper 14），
 //! service 公共方法签名收 `conn: &mut PgConnection`，内部 reborrow `&mut *conn` 喂 trait。
 //!
 //! ## Service 形态（2026-09-22 D-2 决策）
-//! `WorkerPoolService` 保持 unit struct（**不**持字段依赖）。snowflake 由每个写方法
-//! 形参显式收（与原 `pub struct WorkerPoolService;` + 旧方法签名兼容）——
+//! `QueueService` 保持 unit struct（**不**持字段依赖）。snowflake 由每个写方法
+//! 形参显式收（与原 `pub struct QueueService;` + 旧方法签名兼容）——
 //! 既有跨模块调用点（`prod::batch::service::worker_scan` 的 worker-scan 路径）以
-//! `WorkerPoolService::refill_for_worker_with_work_type(&mut tx, &state.snowflake, ...)`
+//! `QueueService::refill_for_worker_with_work_type(&mut tx, &state.snowflake, ...)`
 //! 形式直调 service，本任务**不修改 part 域代码**，故保留 ZST 静态 + 显式 snowflake
-//! 形参的旧形态。后续 D-6 part 重构时再统一改 trait 注入式 + `Arc<WorkerPoolService>`
+//! 形参的旧形态。后续 D-6 part 重构时再统一改 trait 注入式 + `Arc<QueueService>`
 //! 持 snowflake 字段。
 //!
 //! ## PartService::sync_from_batch_change 兼容性（2026-09-22 D-2 决策）
@@ -59,23 +59,20 @@ use crate::modules::part::service::PartService;
 // 生产流端点共用同一守卫，同源同码（20501 / 20512 / 20104）。
 use crate::shared::batch::guards::validate_shelf_zone;
 use crate::modules::prod::shelf_process::repo::ShelfProcessRepo;
-use crate::modules::prod::worker_pool::repo::WorkerPoolRepoTrait;
+use crate::modules::prod::queue::repo::QueueRepoTrait;
 use crate::shared::error::{AppError, code};
 
-use super::dto::{
-    AutoAllocateMode, AutoAllocateRequest, MoveLocation, MoveRequest, ProcessBatchCount,
-    WorkerPoolCountsOut,
+use crate::modules::prod::queue::dto::{
+    AutoAllocateMode, AutoAllocateRequest, MoveLocation, MoveRequest,
 };
-use super::model::{ProcessPoolCount, RefillResult, TakenItem, WorkerPoolState};
-use super::vo::{
-    AutoAllocateResult, MoveResult, PoolBatchItem, ProcessPoolDetail, WorkTypeMaxHeld, WorkerBrief,
-    WorkerFillItem,
+use crate::modules::prod::queue::vo::worker::{
+    AutoAllocateResult, MoveResult, RefillResult, TakenItem, WorkerFillItem,
 };
 
-/// worker_pool 域 service（2026-09-22 D-2 重构后）
+/// queue 域 service（2026-09-22 D-2 重构后）
 ///
 /// 2026-09-22 D-2 决策：本 service 保持 unit struct（**不**持字段依赖），与
-/// 原 `pub struct WorkerPoolService;` 一致。snowflake 由每个写方法形参显式收——
+/// 原 `pub struct QueueService;` 一致。snowflake 由每个写方法形参显式收——
 /// handler 端调用时传 `&state.snowflake`，跨域调用点（`prod/batch/handler/transition.rs`
 /// 的 worker-scan 后 refill 路径）也按相同形参顺序传，不破坏既有调用点。
 ///
@@ -84,11 +81,11 @@ use super::vo::{
 /// （其它域的事件 id 都用 caller 提供的 id）；为了保留跨模块 ZST 静态调用点
 /// 兼容（`prod::batch::service::worker_scan`），暂保持显式 snowflake 形参。
 ///
-/// 后续 D-6 part 重构时一并改用 `Arc<WorkerPoolService>` 持 snowflake 字段。
-pub struct WorkerPoolService;
+/// 后续 D-6 part 重构时一并改用 `Arc<QueueService>` 持 snowflake 字段。
+pub struct QueueService;
 
-impl WorkerPoolService {
-    /// 构造（空 struct，无字段；保留供未来切到 `Arc<WorkerPoolService>` 时使用）。
+impl QueueService {
+    /// 构造（空 struct，无字段；保留供未来切到 `Arc<QueueService>` 时使用）。
     pub fn new() -> Self {
         Self
     }
@@ -100,7 +97,7 @@ impl WorkerPoolService {
     /// 2. 取 work_type（必须设置 `max_held_batches`）；
     /// 3. 取工种可加工工序 id 列表（process_ids），空 → 业务错
     ///    `BIZ_WORK_TYPE_NO_PROCESS_MAPPING`；
-    /// 4. 循环调 `WorkerPoolRepoTrait::take_one_from_pool`，每抢到一批写
+    /// 4. 循环调 `QueueRepoTrait::take_one_from_pool`，每抢到一批写
     ///    `TAKEN_FROM_POOL` 事件日志 + `PartService::sync_from_batch_change` 同步
     ///    part 派生列（事务内由 handler commit）；
     /// 5. 返回 `RefillResult { worker_id, shelf_id, taken, pool_empty }`。
@@ -230,88 +227,7 @@ impl WorkerPoolService {
         })
     }
 
-    /// 算 worker 当前 state：worker 元数据 + 持有数 + 池候选数（按工序）。
-    ///
-    /// 池候选数 = `t_part_batch` 中 `status='IN_PROCESS' AND location='PRODUCTION_SHELF'
-    /// AND current_holder_id = shelf_id AND next_process_id = pid` 的批次数。
-    /// 该 SQL 通过 trait helper `count_pool_by_shelf_and_process` 下沉。
-    ///
-    /// **2026-10-04：`shelf_id` 降为可选**（`Option<i64>`）。`shelf_id = None` 时
-    /// 不查候选池计数，`pool_count_by_process` 返空数组；`held_batches` / `max_held` /
-    /// `current_held` / `capacity_remaining` 四段本就与货架无关，行为不变。
-    /// 缘由：shelf scope 只对 SHELF_ACCOUNT 返 `shelf_ids`，把它做成必填会让
-    /// MANAGER / CLERK / INSPECTOR 拿不到工人持有列表。
-    ///
-    /// worker 无 work_type 时 `max_held = 0`、`process_ids = []`（state 端点不会拒绝，
-    /// 仅展示空池 + 0 上限）。
-    pub async fn compute_state(
-        conn: &mut PgConnection,
-        worker_id: i64,
-        shelf_id: Option<i64>,
-    ) -> Result<WorkerPoolState, AppError> {
-        let worker = (&mut *conn)
-            .worker_get_by_id(worker_id, false)
-            .await?
-            .ok_or_else(|| AppError::biz(code::BIZ_WORKER_NOT_FOUND, "worker 不存在"))?;
-        let work_type = if let Some(wt_id) = worker.work_type_id {
-            (&mut *conn).work_type_get_by_id(wt_id).await?
-        } else {
-            None
-        };
-        let max_held = work_type
-            .as_ref()
-            .and_then(|w| w.max_held_batches)
-            .unwrap_or(0);
-        let current_held = (&mut *conn)
-            .part_batch_count_held_by_worker(worker_id)
-            .await?;
-        let capacity_remaining = (max_held as i64 - current_held).max(0) as i32;
-
-        // 2026-10-04：shelf_id 缺省 → 不查候选池计数，pool_count_by_process 留空数组。
-        // 工种→工序映射（work_type_list_process_ids）只被下面的计数循环消费，
-        // 故一并收进 Some 分支：缺省时它是无产出的一次 DB 往返，而 state 端点按
-        // worker 逐个轮询，留着会被放大成 N 倍白跑。
-        let mut pool_count_by_process = Vec::new();
-        if let Some(sid) = shelf_id {
-            let process_ids = if let Some(wt_id) = worker.work_type_id {
-                (&mut *conn).work_type_list_process_ids(wt_id).await?
-            } else {
-                vec![]
-            };
-            pool_count_by_process.reserve(process_ids.len());
-            for pid in &process_ids {
-                let n = (&mut *conn)
-                    .count_pool_by_shelf_and_process(sid, *pid)
-                    .await?;
-                pool_count_by_process.push(ProcessPoolCount {
-                    process_id: *pid,
-                    pool_count: n,
-                });
-            }
-        }
-
-        // 2026-09-14 follow-up-ux 新增 → follow-up-round2 升级为 17 字段 HeldBatchItem：
-        // worker 当前持有的完整 batch 列表（JOIN 6 表：t_part_batch + t_part +
-        // t_customer L1+L2 + t_applicant + t_shelf）。命中 ix_t_part_batch_holder_location。
-        // 2026-09-14 review 第 1 轮下沉：本查询已从 part_batch/repo.rs 迁到
-        // worker_pool/repo.rs（owner 同域 + part_batch 行数 ≤1000）。
-        let held_batches = (&mut *conn)
-            .list_held_by_worker_with_part(worker_id)
-            .await?;
-
-        Ok(WorkerPoolState {
-            worker_id,
-            worker_name: worker.name,
-            work_type_code: work_type.map(|w| w.code).unwrap_or_default(),
-            max_held,
-            current_held,
-            capacity_remaining,
-            pool_count_by_process,
-            held_batches,
-        })
-    }
-
-    /// `POST /api/v2/prod/pool/move` 业务逻辑（2026-09-30 新增）。
+    /// `POST /api/v2/prod/queue/move` 业务逻辑（2026-09-30 新增）。
     ///
     /// 通用移动端点：覆盖 POOL ↔ WORKER + WORKER ↔ WORKER 三方向；取代原
     /// `admin_remove_held_batch`（WORKER→POOL）+ `assign_batch_to_worker`（POOL→WORKER）
@@ -841,146 +757,7 @@ impl WorkerPoolService {
         })
     }
 
-    /// `GET /api/v2/worker-pool/{process_id}` 业务逻辑。
-    ///
-    /// 流程：
-    /// 1. 角色守卫：`Manager + Clerk + Inspector`（admin 视角但不止 Manager）；
-    /// 2. 取 process 元数据（code + name），不存在 → `20801 BIZ_PROCESS_NOT_FOUND`；
-    /// 3. 取该 process 映射的 work_type 列表（含 max_held_batches）；
-    /// 4. 取可执行该 process 的 active worker 列表（含 work_type_code）；
-    /// 5. 取该 process 在所有生产货架上的候选批次（JOIN 5 表）；
-    /// 6. 装 `ProcessPoolDetail` 返回。
-    ///
-    /// 全部读操作，单事务只读，无 WS 广播，无 commit 副作用。
-    pub async fn pool_by_process(
-        conn: &mut PgConnection,
-        current: &CurrentUser,
-        process_id: i64,
-    ) -> Result<ProcessPoolDetail, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
-
-        // 1. process 元数据
-        let process = (&mut *conn)
-            .process_get_by_id(process_id, false)
-            .await?
-            .ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_PROCESS_NOT_FOUND,
-                    format!("process {process_id} 不存在"),
-                )
-            })?;
-
-        // 2. work_types
-        let work_types = (&mut *conn)
-            .work_type_list_work_types_by_process_id(process_id)
-            .await?;
-        let work_types = work_types
-            .into_iter()
-            .map(|(id, code, name, max_held_batches)| WorkTypeMaxHeld {
-                work_type_id: id,
-                work_type_code: code,
-                work_type_name: name,
-                max_held_batches,
-            })
-            .collect();
-
-        // 3. workers
-        let worker_rows = (&mut *conn)
-            .worker_list_active_by_process_id(process_id)
-            .await?;
-        let workers = worker_rows
-            .into_iter()
-            .map(
-                |(worker_id, name, work_type_id, work_type_code)| WorkerBrief {
-                    worker_id,
-                    name,
-                    work_type_id,
-                    work_type_code,
-                },
-            )
-            .collect();
-
-        // 4. candidates
-        let items: Vec<PoolBatchItem> = (&mut *conn)
-            .list_candidates_by_process_all_shelves(process_id)
-            .await?;
-        let total = items.len() as i64;
-
-        Ok(ProcessPoolDetail {
-            process_id,
-            process_code: process.code,
-            process_name: process.name,
-            workers,
-            work_types,
-            total,
-            items,
-        })
-    }
-
-    /// `GET /api/v2/prod/worker-pool/counts` 业务逻辑。
-    ///
-    /// 2026-09-30 新增：admin 视角的全工序候选批次聚合（dashboard 快照型查询）。
-    /// 流程：
-    /// 1. 角色守卫：`Manager + Clerk + Inspector`（与 `pool_by_process` 同集
-    ///    —— admin 视角但不止 Manager；service 内守卫）；
-    /// 2. 调 `group_count_by_process_all_shelves` 单 SQL GROUP BY 取
-    ///    `(process_id, count)`；
-    /// 3. 二次调 `process_list_by_ids` 取 process_code / process_name 元数据；
-    /// 4. 装 `WorkerPoolCountsOut` 返回（total = `counts.iter().map(|c| c.count).sum()`）。
-    ///
-    /// 全部读操作，单事务只读，无 WS 广播（counts 是 dashboard 快照型查询，
-    /// 无业务流转，2026-09-30 spec 明确不发 WS）。process_id 顺序沿用 repo
-    /// GROUP BY `ORDER BY s.process_id ASC`（稳定排序，前端按 id 稳定展示）。
-    pub async fn pool_counts_all_shelves(
-        conn: &mut PgConnection,
-        current: &CurrentUser,
-    ) -> Result<WorkerPoolCountsOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
-
-        // 1. 单 SQL GROUP BY 取 (process_id, count)
-        let counts_raw: Vec<(i64, i64)> = (&mut *conn).group_count_by_process_all_shelves().await?;
-
-        if counts_raw.is_empty() {
-            return Ok(WorkerPoolCountsOut {
-                counts: vec![],
-                total: 0,
-            });
-        }
-
-        // 2. 二次取 process 元数据
-        let process_ids: Vec<i64> = counts_raw.iter().map(|(pid, _)| *pid).collect();
-        let processes = (&mut *conn).process_list_by_ids(&process_ids).await?;
-        // process_id → (code, name) 索引（list_by_ids 已 ORDER BY id ASC）
-        let mut meta: std::collections::HashMap<i64, (String, String)> = processes
-            .into_iter()
-            .map(|p| (p.id, (p.code, p.name)))
-            .collect();
-
-        // 3. 装 ProcessBatchCount（保留 repo GROUP BY 的 process_id ASC 顺序）
-        let mut total = 0i64;
-        let counts: Vec<ProcessBatchCount> = counts_raw
-            .into_iter()
-            .map(|(pid, count)| {
-                total += count;
-                let (code, name) = meta.remove(&pid).unwrap_or_else(|| {
-                    // 防御：repo GROUP BY 返回的 process_id 在 t_process 已软删
-                    // → 退化为空串 + 显式 id（前端「process 已删除」占位）。
-                    // 业务流不会撞（候选批次 step_id 必指向 active step）。
-                    (String::new(), format!("(deleted#{pid})"))
-                });
-                ProcessBatchCount {
-                    process_id: pid,
-                    process_code: code,
-                    process_name: name,
-                    count,
-                }
-            })
-            .collect();
-
-        Ok(WorkerPoolCountsOut { counts, total })
-    }
-
-    /// `POST /api/v2/admin/worker-pool/auto-allocate` 业务逻辑。
+    /// `POST /api/v2/prod/queue/auto-allocate` 业务逻辑。
     ///
     /// 按 `process_id + shelf_id` 范围，对每个匹配 worker 计算 target 并循环 refill。
     pub async fn auto_allocate_for_process(
@@ -1152,7 +929,7 @@ impl WorkerPoolService {
     // 旧调用点（POST /api/v2/admin/worker-pool/assign）由 router 层移除。
 }
 
-impl Default for WorkerPoolService {
+impl Default for QueueService {
     fn default() -> Self {
         Self::new()
     }
@@ -1162,7 +939,7 @@ impl Default for WorkerPoolService {
 //
 // 2026-09-30 review 第 1 轮补漏：plan §5.6 要求 move_batch 的核心方向 + 校验失败
 // 路径在 service.rs 末尾 in-source 覆盖。原 plan 第 1 轮实现仅写了集成测试
-// （tests/production/worker_pool.rs::move_*_transfers_batch 等），未在 service
+// （tests/production/queue.rs::move_*_transfers_batch 等），未在 service
 // 内做精细单测。本文件补 7 个场景：
 // - 三方向 happy path：POOL→WORKER / WORKER→POOL / WORKER→WORKER
 // - from 与 batch 实际 (location, holder) 不一致 → 40904 LOCATION_MISMATCH
@@ -1182,7 +959,7 @@ mod tests {
     use crate::infra::clock::now_naive;
     use hsh_erp_test_support::test_pool;
 
-    /// 进程级共享雪花 ID 生成器（与 tests/production/worker_pool.rs 同源设计）。
+    /// 进程级共享雪花 ID 生成器（与 tests/production/queue.rs 同源设计）。
     /// 多个 in-source test 在同一毫秒内连发 helper，独立构造会拿到相同 id
     /// （23505 pkey 冲突）。
     fn pool_snowflake() -> &'static std::sync::Mutex<SnowflakeIdGenerator> {
@@ -1393,7 +1170,7 @@ mod tests {
 
     /// 写一个 part + chain + step（首道指向 process_id）。返回 part_id。
     /// 2026-09-16 PR-3：move 路径要求 part 绑定工艺链 + batch 持有
-    /// current_process_step_id（与 worker_pool 集成测试 helper 同形态）。
+    /// current_process_step_id（与 queue 集成测试 helper 同形态）。
     /// 2026-09-30：候选池归属改按 `current_process_id` 过滤，helper 同步补该列。
     async fn insert_pool_batch(
         pool: &sqlx::PgPool,
@@ -1575,7 +1352,7 @@ mod tests {
             to: MoveLocation::Worker { worker_id: worker },
             note: Some("in-source pool→worker".to_string()),
         };
-        let r = WorkerPoolService::move_batch(
+        let r = QueueService::move_batch(
             &mut conn,
             &snowflake_obj,
             req,
@@ -1625,7 +1402,7 @@ mod tests {
             },
             note: Some("in-source worker→pool".to_string()),
         };
-        let r = WorkerPoolService::move_batch(
+        let r = QueueService::move_batch(
             &mut conn,
             &snowflake_obj,
             req,
@@ -1676,7 +1453,7 @@ mod tests {
             },
             note: Some("in-source worker→worker".to_string()),
         };
-        let r = WorkerPoolService::move_batch(
+        let r = QueueService::move_batch(
             &mut conn,
             &snowflake_obj,
             req,
@@ -1727,7 +1504,7 @@ mod tests {
             },
             note: None,
         };
-        let err = WorkerPoolService::move_batch(
+        let err = QueueService::move_batch(
             &mut conn,
             &snowflake_obj,
             req,
@@ -1771,7 +1548,7 @@ mod tests {
             },
             note: None,
         };
-        let err = WorkerPoolService::move_batch(
+        let err = QueueService::move_batch(
             &mut conn,
             &snowflake_obj,
             req,
@@ -1814,7 +1591,7 @@ mod tests {
             },
             note: None,
         };
-        let err = WorkerPoolService::move_batch(
+        let err = QueueService::move_batch(
             &mut conn,
             &snowflake_obj,
             req,
@@ -1848,7 +1625,7 @@ mod tests {
             },
             note: None,
         };
-        let err = WorkerPoolService::move_batch(
+        let err = QueueService::move_batch(
             &mut conn,
             &snowflake_obj,
             req,

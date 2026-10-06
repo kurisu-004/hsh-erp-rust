@@ -1,7 +1,7 @@
-//! prod 域（生产调度：工人 / 工种 / 工序 / 工艺链 / 工人池 / 待下发批次）
+//! prod 域（生产调度：工人 / 工种 / 工序 / 工艺链 / 生产队列 / 待下发批次）
 //!
 //! 2026-09-19 prod 模块聚合：把 worker + work_type + process + process_chain +
-//! worker_pool 五个支撑域平移至 `prod` 下，URL 一并迁移到 `/api/v2/prod/*`。
+//! queue 五个支撑域平移至 `prod` 下，URL 一并迁移到 `/api/v2/prod/*`。
 //!
 //! 路由风格保持 com 容器模式：各子域各自定义独立 `router()`，prod 模块做 nest。
 //!
@@ -10,10 +10,9 @@
 //! 零 schema 变更。
 //!
 //! 2026-09-30 prod 域 9 端点重构（worker-pool + batches 合并）：
-//! - worker-pool → pool 路径收敛：原 `/worker-pool` + `/admin/worker-pool` 双 nest
-//!   合并为单一 `/pool` nest，5 个端点全部挂 `/api/v2/prod/pool/*`（`/state`、
-//!   `/counts`、`/{process_id}`、`/refill`、`/move`、`/auto-allocate`）。
-//! - 旧 `/admin/worker-pool/{remove,assign}` 路径 404（前端调用统一走 `/pool/move`）。
+//! - worker-pool → pool 路径收敛（2026-09-30）：原 `/worker-pool` +
+//!   `/admin/worker-pool` 双 nest 合并为单一 `/pool` nest。**该路径已于
+//!   2026-10-08 再硬切为 `/queue`**，见下。
 //! - batches 端点合并：原 `/batches/dispatch`（单条）+ `/batches/bulk-dispatch`（批量）
 //!   合并为单一 bulk-only `/batches/dispatch`，原 `/bulk-dispatch` 路径 404。
 //!
@@ -25,6 +24,12 @@
 //! 允许消化）② 工单工艺链含 `is_cnc` 工序 ③ 批次 `current_process_id` 指向
 //! `is_cnc` 工序（migration 004 确立的唯一权威列）。
 //!
+//! 2026-10-08 `prod::worker_pool` 更名 `prod::queue`（URL `/pool` → `/queue`，
+//! **无 alias**）：域职责从「工人候选池」扩到「工序队列」（候选池 + 工人持有 +
+//! 发放 / 召回 / 移动 / 自动分配），`pool` 这个名字只覆盖了第一块。同 commit 从
+//! `prod::batch` 吸收 4 个端点（`pending` / `dispatch` / `auto-dispatch` 三个下发流
+//! + `recall` 召回），因为它们的消费方是队列页而非批次详情页。
+//!
 //! 2026-10-02 新增 `prod::shelf_process` 子模块（货架 ↔ 工序映射 `t_shelf_process`，
 //! 3 端点，URL 挂 `/api/v2/prod/shelf-processes/*`）：原 `src/modules/shelf/
 //! process_mapping/` 整体搬入。域规约依据「货架自身包括账号部分和工序映射部分，
@@ -34,6 +39,8 @@
 //! `GET|POST /api/v2/shelves/{id}/processes` 与 `GET /api/v2/shelves/processes`
 //! 404（**无 alias**，沿 2026-09-19 prod 聚合先例），请求 / 响应契约逐字不变。
 //! 跨域依赖方向由 shelf→prod 翻转为 prod→shelf（只读 `ShelfRepo::get_by_id`）。
+//!
+//! `/prod/batches/{batch_id}/recall-to-pending` 一律 404。
 //!
 //! 2026-10-05 新增 `prod::process_design` 子模块（制定工序页零件列表，1 端点，URL 挂
 //! `/api/v2/prod/process-design/parts`）：前端「制定工序」页从 part 域
@@ -62,8 +69,9 @@
 //!
 //! `t_part_batch`（批次）是生产执行单元，**归 prod 域**：它的 repo / model /
 //! `shared::batch::status` 状态写入口与批次路由（`worker-scan` / `pick-up` / `to-*` /
-//! `complete` / `split` / `cancel` / `scan-inspect` / 集合读）整体在本域
-//! `prod::batch`，URL 挂 `/api/v2/prod/batches/*`。
+//! `complete` / `split` / `cancel` / `scan-inspect` / 2 条集合读）整体在本域
+//! `prod::batch`，URL 挂 `/api/v2/prod/batches/*`。下发流（`pending` / `dispatch` /
+//! `auto-dispatch`）与召回已剥离到 `prod::queue`（2026-10-08）。
 //!
 //! part 域只留「多批次动作 + 非批次动作」：`POST /parts/{part_id}/cancel`（翻转该
 //! part 全部活跃批次）、`POST /parts/{part_id}/force-complete`（全部非 CANCELLED
@@ -86,10 +94,10 @@ pub mod process;
 pub mod process_chain;
 pub mod process_design;
 pub mod programming;
+pub mod queue;
 pub mod shelf_process;
 pub mod work_type;
 pub mod worker;
-pub mod worker_pool;
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -97,9 +105,9 @@ pub fn router() -> Router<Arc<AppState>> {
         .nest("/work-types", work_type::router())
         .nest("/processes", process::router())
         .nest("/process-chains", process_chain::router())
-        // 2026-09-30 重构：worker-pool → pool 路径收敛，原双 nest（/worker-pool +
-        // /admin/worker-pool）合并为单一 /pool nest。
-        .nest("/pool", worker_pool::router())
+        // 2026-10-08：/pool → /queue 硬切（无 alias），并从 prod::batch 吸收
+        // 下发流 + 召回 4 个端点（原挂在 /batches/pending 等路径）。
+        .nest("/queue", queue::router())
         // 2026-09-29 新增：prod::batch（PENDING 批次 + 下发）
         .nest("/batches", batch::router())
         // 2026-10-01 新增：prod::programming（待编程一览，part 状态闸门 + 三规则并集口径）

@@ -1,4 +1,7 @@
-//! prod::batch 的「下发」子流：待下发列表 + 批量下发 + 自动下发预览。
+//! prod::queue 的「下发」子流：待下发列表 + 批量下发 + 自动下发预览。
+//!
+//! 2026-10-08 自 `prod::batch::service::dispatch` 整文件搬入：唯一调用方是队列页
+//! 的「待下发」面板与「自动下发」动作，与 batch 域的流转 / 返修 / 外协用例无关。
 //!
 //! 2026-09-29 新增 + 2026-09-30 重构：
 //! - `dispatch_batch` 改为 bulk-only（接受 `Vec<(batch_id, target_process_id)>`，
@@ -6,25 +9,25 @@
 //! - `bulk_dispatch` service 删除（合并入 `dispatch_batch` 循环）
 //! - `auto_dispatch` 改为 `auto_dispatch_preview` 只读查询（不开事务）
 //!
-//! ## 3 个公共方法
-//! - [`BatchService::list_pending`] —— 读待下发批次列表（handler `pool.acquire()`）
-//! - [`BatchService::dispatch_batch`] —— bulk-only 下发（事务内）：fetch batch → 校验 status ∈ {PENDING, PROGRAMMING} → 解析货架 → UPDATE OCC → 写事件
-//! - [`BatchService::auto_dispatch_preview`] —— 只读查询，返回每个 batch 的首道工序 + 首货架
+//! ## 3 个公共方法（`impl QueueService`）
+//! - [`QueueService::list_pending`] —— 读待下发批次列表（handler `pool.acquire()`）
+//! - [`QueueService::dispatch_batch`] —— bulk-only 下发（事务内）：fetch batch → 校验 status ∈ {PENDING, PROGRAMMING} → 解析货架 → UPDATE OCC → 写事件
+//! - [`QueueService::auto_dispatch_preview`] —— 只读查询，返回每个 batch 的首道工序 + 首货架
 //!
 //! ## 2026-10-06：源状态白名单纳入已废弃的 `PROGRAMMING`
 //! 三个方法的状态闸门统一为 `IN ('PENDING', 'PROGRAMMING')`。`PROGRAMMING` 的入口
 //! 端点已下线（见 `part::statemachine`），但存量行需要在「待下发」页被消化，故与
 //! `PENDING` 同链路：同样可列出、同样可批量下发、同样可自动下发。白名单分布在
-//! `BatchRepo::list_pending_batches` / `count_pending_batches` /
+//! `QueueDispatchRepo::list_pending_batches` / `count_pending_batches` /
 //! `preview_auto_dispatch` / `update_batch_dispatched` 与本文件 `dispatch_single`，
 //! 五处必须同步。
 //!
 //! ## 事务 + 角色守卫
-//! 角色守卫下沉到 service（与 worker_pool `pool_by_process` 等同形）：handler
-//! 仅做权限分发；service 入口第一行 `current.require_any_role(...)`。
+//! 角色守卫下沉到 service（与本域 `move_batch` 同形）：handler 仅做权限分发；
+//! service 入口第一行 `current.require_any_role(...)`。
 //!
-//! 事务边界在 handler（与 worker_pool 范本一致）：handler `pool.begin()` →
-//! service 收 `&mut PgConnection` → handler `commit()`。
+//! 事务边界在 handler：handler `pool.begin()` → service 收 `&mut PgConnection`
+//! → handler `commit()`。
 //!
 //! ## 事务内并发冲突（OCC）
 //! dispatch_batch 入口 `shared::batch::get_batch_by_id` 后用 fetched `batch.version` 作
@@ -32,7 +35,7 @@
 //!
 //! ## 2026-10-02 `t_shelf_process` SQL 收口
 //! 解析货架改调同域 `prod::shelf_process::repo::ShelfProcessRepo::find_first_shelf_for_process`
-//! （原为 `BatchRepo::find_first_shelf_for_process` 内联 SQL），两处 inline 保留见
+//! （原为 `QueueDispatchRepo::find_first_shelf_for_process` 内联 SQL），两处 inline 保留见
 //! `repo.rs::preview_auto_dispatch` 注释。
 
 use sqlx::PgConnection;
@@ -41,23 +44,19 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepo;
-use crate::modules::prod::batch::repo::BatchRepo;
-use crate::modules::prod::batch::vo::{
-    AutoDispatchItem, AutoDispatchResult, DispatchResult, DispatchSuccessItem, PendingBatchItem,
-    PendingBatchListOut,
-};
 use crate::modules::prod::shelf_process::repo::ShelfProcessRepo;
 use crate::shared::error::{AppError, code};
 
-use super::BatchService;
-use crate::modules::prod::batch::repo::PendingBatchRow;
+use super::queue::QueueService;
+use crate::modules::prod::queue::repo::dispatch::{PendingBatchRow, QueueDispatchRepo};
+use crate::modules::prod::queue::vo::queue::{
+    AutoDispatchItem, AutoDispatchResult, DispatchResult, DispatchSuccessItem, PendingBatchItem,
+    PendingBatchListOut,
+};
 
-impl BatchService {
-    pub fn new() -> Self {
-        Self
-    }
+impl QueueService {
 
-    /// `GET /api/v2/prod/batches/pending` 业务逻辑。
+    /// `GET /api/v2/prod/queue/pending` 业务逻辑。
     ///
     /// 角色守卫：Manager + Clerk + Inspector。
     /// 读路径（`pool.acquire()`）：handler 不开事务，service 借 `&mut PgConnection`
@@ -74,8 +73,8 @@ impl BatchService {
         let limit = limit.clamp(1, 500);
         let offset = offset.max(0);
 
-        let rows = BatchRepo::list_pending_batches(&mut *conn, limit, offset).await?;
-        let total = BatchRepo::count_pending_batches(&mut *conn).await?;
+        let rows = QueueDispatchRepo::list_pending_batches(&mut *conn, limit, offset).await?;
+        let total = QueueDispatchRepo::count_pending_batches(&mut *conn).await?;
         let items = rows.into_iter().map(row_to_item).collect();
         Ok(PendingBatchListOut {
             items,
@@ -182,7 +181,7 @@ impl BatchService {
         }
 
         // 3. 解析货架
-        // 2026-10-02 域拆分：原调 `BatchRepo::find_first_shelf_for_process`（本域手写
+        // 2026-10-02 域拆分：原调 `QueueDispatchRepo::find_first_shelf_for_process`（本域手写
         // `t_shelf_process` SQL），现改调 SQL 真源
         // `prod::shelf_process::repo::ShelfProcessRepo::find_first_shelf_for_process`
         // （executor 泛型直接接住 `&mut PgConnection`，无需改事务上下文）。
@@ -208,7 +207,7 @@ impl BatchService {
         // 4. UPDATE OCC（带当前 version）
         // 2026-09-30：透传 target_process_id 作为 current_process_id —— 池归属
         // 的权威依据，缺了它批次会对所有工序池查询隐身（见 repo 同名函数 doc）
-        let rows_affected = BatchRepo::update_batch_dispatched(
+        let rows_affected = QueueDispatchRepo::update_batch_dispatched(
             &mut *conn,
             batch.id,
             batch.version,
@@ -271,7 +270,7 @@ impl BatchService {
         })
     }
 
-    /// `POST /api/v2/prod/batches/auto-dispatch` 业务逻辑（只读查询，2026-09-30 重构）。
+    /// `POST /api/v2/prod/queue/auto-dispatch` 业务逻辑（只读查询，2026-09-30 重构）。
     ///
     /// 流程（不开事务）：
     /// 1. 角色守卫：Manager + Clerk
@@ -299,7 +298,7 @@ impl BatchService {
         }
 
         // 单 SQL 拉 preview（已包含 batch_id 在待下发白名单 + 未软删 的过滤）
-        let previews = BatchRepo::preview_auto_dispatch(&mut *conn, &batch_ids).await?;
+        let previews = QueueDispatchRepo::preview_auto_dispatch(&mut *conn, &batch_ids).await?;
         let preview_ids: std::collections::HashSet<i64> =
             previews.iter().map(|p| p.batch_id).collect();
 
@@ -338,7 +337,7 @@ impl BatchService {
         for batch_id in &batch_ids {
             if !preview_ids.contains(batch_id) {
                 let part_id_opt =
-                    BatchRepo::find_part_id_by_batch_id(&mut *conn, *batch_id).await?;
+                    QueueDispatchRepo::find_part_id_by_batch_id(&mut *conn, *batch_id).await?;
                 let part_id = part_id_opt.unwrap_or(0);
                 items.push(AutoDispatchItem {
                     batch_id: *batch_id,
@@ -362,12 +361,6 @@ impl BatchService {
         items.sort_by_key(|it| order.get(&it.batch_id).copied().unwrap_or(usize::MAX));
 
         Ok(AutoDispatchResult { items })
-    }
-}
-
-impl Default for BatchService {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -673,7 +666,7 @@ mod tests {
 
         // 跑 list_pending
         let mut conn = pool.acquire().await.unwrap();
-        let out = BatchService::list_pending(&mut conn, &make_current(1, Role::Manager), 200, 0)
+        let out = QueueService::list_pending(&mut conn, &make_current(1, Role::Manager), 200, 0)
             .await
             .expect("list_pending OK");
 
@@ -780,7 +773,7 @@ mod tests {
         .unwrap();
 
         let mut conn = pool.acquire().await.unwrap();
-        let out = BatchService::list_pending(&mut conn, &make_current(1, Role::Inspector), 200, 0)
+        let out = QueueService::list_pending(&mut conn, &make_current(1, Role::Inspector), 200, 0)
             .await
             .expect("list_pending OK");
 
@@ -840,7 +833,7 @@ mod tests {
         insert_part_batch_with_status(&pool, p_insp, "INSPECTION").await;
 
         let mut conn = pool.acquire().await.unwrap();
-        let out = BatchService::list_pending(&mut conn, &make_current(1, Role::Manager), 200, 0)
+        let out = QueueService::list_pending(&mut conn, &make_current(1, Role::Manager), 200, 0)
             .await
             .expect("list_pending OK");
 
@@ -884,7 +877,7 @@ mod tests {
 
         let mut conn = pool.acquire().await.unwrap();
         let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
-        let r = BatchService::dispatch_batch(
+        let r = QueueService::dispatch_batch(
             &mut conn,
             vec![(b_id, process_id)],
             Some("dispatch test"),
@@ -965,7 +958,7 @@ mod tests {
 
         let mut conn = pool.acquire().await.unwrap();
         let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
-        let r = BatchService::dispatch_batch(
+        let r = QueueService::dispatch_batch(
             &mut conn,
             vec![(b_id, process_id)],
             Some("dispatch programming"),
@@ -1039,7 +1032,7 @@ mod tests {
         let current = make_current(user_id, Role::Manager);
 
         // 第一次成功
-        BatchService::dispatch_batch(
+        QueueService::dispatch_batch(
             &mut conn,
             vec![(b_id, process_id)],
             None,
@@ -1050,7 +1043,7 @@ mod tests {
         .expect("第 1 次 dispatch OK");
 
         // 第二次：batch.status='IN_PROCESS' → 40903 → failed
-        let _r = BatchService::dispatch_batch(
+        let _r = QueueService::dispatch_batch(
             &mut conn,
             vec![(b_id, process_id)],
             None,
@@ -1072,7 +1065,7 @@ mod tests {
 
         let mut conn = pool.acquire().await.unwrap();
         let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
-        let e = BatchService::dispatch_batch(
+        let e = QueueService::dispatch_batch(
             &mut conn,
             vec![(999_999_999, process_id)],
             None,
@@ -1115,7 +1108,7 @@ mod tests {
 
         let mut conn = pool.acquire().await.unwrap();
         let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
-        let _r = BatchService::dispatch_batch(
+        let _r = QueueService::dispatch_batch(
             &mut conn,
             vec![(b_id, process_id)],
             None,
@@ -1179,7 +1172,7 @@ mod tests {
         let b_id = insert_part_batch(&pool, p_id).await;
 
         let mut conn = pool.acquire().await.unwrap();
-        let r = BatchService::dispatch_batch(
+        let r = QueueService::dispatch_batch(
             &mut conn,
             vec![(b_id, process_id)],
             None,
@@ -1218,7 +1211,7 @@ mod tests {
 
         let mut conn = pool.acquire().await.unwrap();
         let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
-        let _r = BatchService::dispatch_batch(
+        let _r = QueueService::dispatch_batch(
             &mut conn,
             vec![(b_id, process_id_no_shelf)],
             None,
@@ -1253,7 +1246,7 @@ mod tests {
 
         let mut conn = pool.acquire().await.unwrap();
         let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
-        let e = BatchService::dispatch_batch(
+        let e = QueueService::dispatch_batch(
             &mut conn,
             vec![(b_id, process_id)],
             None,
@@ -1272,7 +1265,7 @@ mod tests {
 
         let mut conn = pool.acquire().await.unwrap();
         let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
-        let e = BatchService::dispatch_batch(
+        let e = QueueService::dispatch_batch(
             &mut conn,
             vec![], // empty
             None,
@@ -1312,7 +1305,7 @@ mod tests {
         let b_a = insert_part_batch(&pool, p_a).await;
 
         let mut conn = pool.acquire().await.unwrap();
-        let r = BatchService::auto_dispatch_preview(
+        let r = QueueService::auto_dispatch_preview(
             &mut conn,
             &make_current(user_id, Role::Manager),
             vec![b_a],
@@ -1363,7 +1356,7 @@ mod tests {
         let b_a = insert_part_batch(&pool, p_a).await;
 
         let mut conn = pool.acquire().await.unwrap();
-        let r = BatchService::auto_dispatch_preview(
+        let r = QueueService::auto_dispatch_preview(
             &mut conn,
             &make_current(user_id, Role::Manager),
             vec![b_a],
@@ -1435,7 +1428,7 @@ mod tests {
         let b_a = insert_part_batch(&pool, p_a).await;
 
         let mut conn = pool.acquire().await.unwrap();
-        let r = BatchService::auto_dispatch_preview(
+        let r = QueueService::auto_dispatch_preview(
             &mut conn,
             &make_current(user_id, Role::Manager),
             vec![b_a],
@@ -1465,7 +1458,7 @@ mod tests {
         let user_id = insert_user_with_role(&pool, "manager1", "password", "MANAGER").await;
 
         let mut conn = pool.acquire().await.unwrap();
-        let r = BatchService::auto_dispatch_preview(
+        let r = QueueService::auto_dispatch_preview(
             &mut conn,
             &make_current(user_id, Role::Manager),
             vec![999_999_999],
@@ -1529,7 +1522,7 @@ mod tests {
         let b_a = insert_part_batch(&pool, p_a).await;
 
         let mut conn = pool.acquire().await.unwrap();
-        let r = BatchService::auto_dispatch_preview(
+        let r = QueueService::auto_dispatch_preview(
             &mut conn,
             &make_current(user_id, Role::Manager),
             vec![b_a],
@@ -1601,7 +1594,7 @@ mod tests {
         let b_prog = insert_part_batch_with_status(&pool, p_prog, "PROGRAMMING").await;
 
         let mut conn = pool.acquire().await.unwrap();
-        let r = BatchService::auto_dispatch_preview(
+        let r = QueueService::auto_dispatch_preview(
             &mut conn,
             &make_current(user_id, Role::Manager),
             vec![b_prog],

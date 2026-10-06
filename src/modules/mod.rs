@@ -40,7 +40,7 @@ pub mod part;
 // 这里不再 `pub mod part_batch;`，所有引用走 `crate::modules::prod::batch::*`。
 pub mod part_file;
 // 2026-09-19 新增 prod 模块聚合：worker + work_type + process + process_chain +
-// worker_pool 平移至 `prod::*`，URL 硬切换到 `/api/v2/prod/*`（无 alias，前端锁步）。
+// queue 平移至 `prod::*`，URL 硬切换到 `/api/v2/prod/*`（无 alias，前端锁步）。
 // part / assembly 是核心实体未移入；报工端点保留在 part 域。
 pub mod prod;
 pub mod shelf;
@@ -75,7 +75,7 @@ async fn health(State(_state): State<Arc<AppState>>) -> Json<HealthResp> {
 /// nest 路径由 `/customers` + `/applicants` 迁至 `/com/customers` + `/com/applicants`。
 ///
 /// 2026-09-19 prod 模块聚合：worker + work_type + process + process_chain +
-/// worker_pool 5 支撑域平移至 `prod`，URL 硬切换到 `/api/v2/prod/*`。
+/// queue 5 支撑域平移至 `prod`，URL 硬切换到 `/api/v2/prod/*`。
 /// 旧 `/workers` + `/work-types` + `/processes` + `/process-chains` + `/worker-pool` +
 /// `/admin/worker-pool` 6 个 nest 同步下线，无 alias（前端配套 PR 锁步）。
 ///

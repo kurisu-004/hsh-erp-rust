@@ -325,7 +325,7 @@ impl PartService {
         // 2026-09-30 修复（migration 004）：原写法是
         // `JOIN t_process_chain_step s ON s.id = b.current_process_step_id
         //  JOIN t_work_type_process wtp ON wtp.process_id = s.process_id` ——
-        // 与此前 worker_pool 池查询同款的 INNER JOIN 盲区：batch 的
+        // 与此前 queue 池查询同款的 INNER JOIN 盲区：batch 的
         // current_process_step_id 为 NULL（新下发批次的常态，无工序链工单恒为
         // NULL）时匹配不到任何 step 行，批次会从「可领取」列表里**整条消失**。
         // 改直读 b.current_process_id（工序归属的权威列）后该盲区消失。

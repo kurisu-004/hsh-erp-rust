@@ -545,7 +545,7 @@ pub fn sendable_router() -> Router<Arc<AppState>> {
 
 /// Pool 路由（挂载点 `/outsource-pool`，**独立顶层前缀**）
 ///
-/// 2026-10-03 新增。形态照抄 `src/modules/prod/worker_pool/mod.rs` 的
+/// 2026-10-03 新增。形态照抄 `src/modules/prod/queue/mod.rs` 的
 /// `pool_router()`：静态段 `/counts` `/state` 先于 `/{process_id}` 注册。
 ///
 /// ⚠️ **注册顺序是硬约束**：matchit 里参数段 `/{process_id}` 会兜住任何未命中

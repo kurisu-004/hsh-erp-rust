@@ -109,7 +109,7 @@ impl PartService {
 
     /// 跨域 / 旧路径兼容入口（`conn: &mut PgConnection` → `<&mut PgConnection as PartRepoTrait>`）。
     ///
-    /// 由 worker_pool / delivery_note / delivery_group 等**非 part 域** service 调用；
+    /// 由 queue / delivery_note / delivery_group 等**非 part 域** service 调用；
     /// 这些域内部 service 签名仍是 `&mut PgConnection` 直传，没有 `repo: R` 借位。
     /// 通过此薄壳手动指定 `<&mut PgConnection>` 实例化 trait 泛型，避免外部 caller
     /// 写 `&mut &mut *conn` 这种双层 deref。
@@ -118,7 +118,7 @@ impl PartService {
     /// 借 `&mut *tx` 继续使用同一 tx 即可，无需本壳。
     ///
     /// `event_id`：同 [`Self::sync_from_batch_change`]。跨域调用点
-    /// （worker_pool 的换 holder / delivery_note 的 pickup）派生的批次一定还
+    /// （queue 的换 holder / delivery_note 的 pickup）派生的批次一定还
     /// 处在非终态（DELIVERED / IN_PROCESS），min-progress 推不出终态，故一律
     /// 传 `None`，该分支不可达。
     pub async fn sync_from_batch_change_with_conn(

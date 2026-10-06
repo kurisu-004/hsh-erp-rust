@@ -8,7 +8,7 @@
 //! `t_part_batch.status`，不引用 part 域任何 service / vo。
 //!
 //! 2026-10-04 起本文件不再只服务 `prod::batch`：`prod::shelf_process`（建映射时的 zone
-//! 守卫）与 `prod::worker_pool`（WORKER→POOL 放回时的货架守卫）两个**同域**跨模块
+//! 守卫）与 `prod::queue`（WORKER→POOL 放回时的货架守卫）两个**同域**跨模块
 //! caller 也调 [`validate_shelf_zone`]。新增 caller 时**必须**调本函数而不要复制判序 ——
 //! 判序（20501 存在 → 20512 停用 → 20104 zone）与文案只有一份，是 2026-10-04 那次
 //! 「`current_holder_id` 写脏」修复的核心：3 个写点各写各的守卫时，其中一个漏了
@@ -428,7 +428,7 @@ async fn read_part_chain_id(
 /// 2026-10-03 新增：工序链**可选**版守卫（`optional_process_chain` 的 part 侧）。
 ///
 /// ## 为什么要放松
-/// 生产库里绝大多数零件没有 `t_part.process_chain_id`（`worker_pool` 的候选池 SQL 早在
+/// 生产库里绝大多数零件没有 `t_part.process_chain_id`（`queue` 的候选池 SQL 早在
 /// 2026-09-30 就因为「INNER JOIN t_process_chain_step 导致批次隐身」改成按
 /// `t_part_batch.current_process_id` 普通过滤）。若进生产流仍强制「先有链」，
 /// 读侧（候选池 / 外协可发送列表）能列出来的批次，写侧却发不出去 —— 读侧口径才是

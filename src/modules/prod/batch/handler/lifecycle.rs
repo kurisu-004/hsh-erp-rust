@@ -37,7 +37,7 @@ use crate::infra::ws_hub::WsEvent;
 use crate::modules::part::vo::PartOut;
 use crate::modules::prod::batch::dto::{
     CancelBatchRequest, CompleteRepairRequest, CompleteRequest, DeliverRequest, PickUpRequest,
-    PlaceOnShelfRequest, RecallToPendingRequest, ReceiveFromOutsourceRequest,
+    PlaceOnShelfRequest, ReceiveFromOutsourceRequest,
     ReceiveFromOutsourceToInspectionRequest, RepairDispatchRequest, SendToOutsourceRequest,
     SplitBatchRequest, StartRepairRequest,
 };
@@ -135,25 +135,6 @@ pub async fn place_on_shelf(
     ws_broadcast(
         &state,
         "PART_PLACED_ON_SHELF",
-        json!({ "part_id": out.id.to_string() }),
-    );
-    Ok(Json(R::ok(out)))
-}
-
-/// `POST /api/v2/prod/batches/{batch_id}/recall-to-pending`
-pub async fn recall_to_pending(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(batch_id): Path<i64>,
-    Json(req): Json<RecallToPendingRequest>,
-) -> Result<Json<R<PartOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = BatchService::recall_to_pending(&mut *tx, &state.snowflake, batch_id, req, &current)
-        .await?;
-    tx.commit().await?;
-    ws_broadcast(
-        &state,
-        "PART_RECALLED",
         json!({ "part_id": out.id.to_string() }),
     );
     Ok(Json(R::ok(out)))

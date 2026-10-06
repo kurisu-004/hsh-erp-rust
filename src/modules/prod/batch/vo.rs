@@ -6,7 +6,6 @@
 //! 会丢精度，参见 `shared::types` 模块 doc）。
 //!
 //! ## 分组
-//! - **下发流**（`dispatch.rs`）：pending / dispatch / auto-dispatch 五类
 //! - **流转与生命周期**（`transition*` / `lifecycle` / `shelf` / `programming` /
 //!   `outsource` / `repair` / `batch_ops` / `pickup` / `scan` / `worker_scan`）：
 //!   `ToXxxOut` / `BatchToXxxOut` / `BatchOpFailure` / `WorkerScanOut`
@@ -16,15 +15,15 @@
 //! 2026-10-07：待品检队列的出参（分页列表 + 13 字段行项）随端点迁往
 //! `prod::inspection` —— 该页面的两个数据源现同域。
 //!
-//! 2026-10-02：to-XXX / batch-to-XXX / worker-scan / repair·repairing
-//! 两条集合读这 8 类出参随批次用例自 `part::vo` 迁入。`PartOut` 例外 —— 它是
-//! part 域实体投影，24 条路由与 part 域共用，本模块直接 `use`（单向依赖）。
-
+//! 2026-10-08：下发流 5 类出参（`PendingBatchItem` / `PendingBatchListOut` /
+//! `DispatchResult` / `AutoDispatchItem` / `AutoDispatchResult`）搬往
+//! `prod::queue::vo::queue` —— 它们的唯一消费方是队列页的下发动作。
+//!
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::Serialize;
 
 use crate::modules::part::vo::PartOut;
-use crate::modules::prod::worker_pool::model::RefillResult;
+use crate::modules::prod::queue::vo::worker::RefillResult;
 use crate::shared::types::{serialize_i64, serialize_i64_opt};
 
 // ===== pending list =====
@@ -401,7 +400,7 @@ pub struct BatchToXxxOut {
 ///
 /// `work_type_id` 与 `badge_code` 是**内部管道字段**：handler 用它把
 /// `worker_scan_event` 已经 fetch 过的 worker 信息透传给同事务的
-/// `WorkerPoolService::refill_for_worker_with_work_type`，避免重复
+/// `QueueService::refill_for_worker_with_work_type`，避免重复
 /// `WorkerRepo::get_by_id` 查询。不暴露到 JSON 响应里。
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkerScanCoreOut {
