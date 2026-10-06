@@ -19,6 +19,9 @@
 //! - create_serial_price.rs ← 2026-10-05 新增：建单期序列号派发（`POST /parts` /
 //!   `POST /parts/batch` / `POST /parts/batch-with-pdfs`）+ `unit_price` /
 //!   `total_price` 入参落库
+//! - purchase_order_import.rs ← 2026-10-06 新增：采购订单 Excel 导入两端点
+//!   （`POST /parts/match-by-excel-items` 分档匹配 + `POST /parts/batch-update-order-info`
+//!   三态回填 / skip）；此前这两条端点零覆盖
 
 #![allow(dead_code, clippy::await_holding_lock, unused_imports)]
 
@@ -35,6 +38,8 @@ mod list_enrichment;
 mod pickable_by_work_type;
 mod repair;
 mod rollup_recompute;
+// 2026-10-06 新增：采购订单 Excel 导入（match-by-excel-items + batch-update-order-info）
+mod purchase_order_import;
 mod serial;
 mod to_inspection;
 mod to_process;
