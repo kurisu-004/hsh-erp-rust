@@ -15,12 +15,14 @@ use crate::auth::middleware::verify_session_token;
 use crate::auth::rbac::CurrentUser;
 use crate::infra::ws_hub::WsEvent;
 use crate::modules::dashboard::dto::DeliveryBasis;
-use crate::modules::dashboard::vo::{DashboardSnapshot, WsEventMsg, WsHeartbeatMsg, WsSnapshotMsg};
+use crate::modules::dashboard::vo::{
+    DashboardSnapshot, DeliveryOrderDetailOut, UpcomingDeliveryBuckets, WsEventMsg, WsHeartbeatMsg,
+    WsSnapshotMsg,
+};
 use crate::shared::error::{AppError, code};
 use crate::shared::response::R;
 use crate::shared::types::deserialize_i64_opt;
 use crate::state::AppState;
-
 
 const WS_REAUTH_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
@@ -30,11 +32,25 @@ pub struct WsQuery {
     pub token: Option<String>,
 }
 
-
+/// `GET /upcoming-delivery` 入参。`days` 走 string-or-number 容错解析。
 #[derive(Debug, Default, Deserialize)]
-pub struct SnapshotQuery {
+pub struct UpcomingQuery {
     #[serde(default, deserialize_with = "deserialize_i64_opt")]
-    pub upcoming_days: Option<i64>,
+    pub days: Option<i64>,
+    #[serde(default)]
+    pub basis: Option<DeliveryBasis>,
+}
+
+/// `GET /delivery-orders` 入参。
+///
+/// `date` / `statuses` 声明成 `Option` 而非必填字段，是为了让「缺参数」也走
+/// `AppError::validation`（40001，统一响应信封）：axum 提取器对缺字段直接返 400
+/// **纯文本** body，不走 `R<T>` 信封，两类错误前端得分别处理。
+#[derive(Debug, Default, Deserialize)]
+pub struct DeliveryOrdersQuery {
+    pub date: Option<String>,
+    /// 逗号分隔的 OrderStatus 字面量列表
+    pub statuses: Option<String>,
     #[serde(default)]
     pub basis: Option<DeliveryBasis>,
 }
@@ -68,18 +84,70 @@ pub async fn ws_dashboard(
     Ok(resp)
 }
 
+/// 大屏首帧全量快照。任何已登录用户可读（无角色闸门）。
 pub async fn get_snapshot(
     State(state): State<Arc<AppState>>,
-    Query(q): Query<SnapshotQuery>,
     _current: CurrentUser,
 ) -> Result<Json<R<DashboardSnapshot>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let snap = state
-        .dashboard_service
-        .build_snapshot_with_workers(&mut *tx, None, q.upcoming_days, q.basis)
-        .await?;
+    let snap = state.dashboard_service.build_snapshot(&mut *tx).await?;
     tx.commit().await?;
     Ok(Json(R::ok(snap)))
+}
+
+/// 交期柱状图分桶（柱状图 + 「今日到期」「N 天到期」两个 KPI 的唯一数据源）。
+pub async fn get_upcoming_delivery(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<UpcomingQuery>,
+    _current: CurrentUser,
+) -> Result<Json<R<UpcomingDeliveryBuckets>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = state
+        .dashboard_service
+        .build_upcoming_buckets(&mut *tx, q.days, q.basis)
+        .await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// 柱状图某一天的下钻抽屉明细。
+pub async fn get_delivery_orders(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<DeliveryOrdersQuery>,
+    _current: CurrentUser,
+) -> Result<Json<R<DeliveryOrderDetailOut>>, AppError> {
+    let date = q
+        .date
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::validation("date 必填（YYYY-MM-DD）"))
+        .and_then(|s| {
+            chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                .map_err(|_| AppError::validation(format!("date 格式非法（期望 YYYY-MM-DD）：{s}")))
+        })?;
+
+    let raw = q
+        .statuses
+        .as_deref()
+        .ok_or_else(|| AppError::validation("statuses 必填（逗号分隔的 OrderStatus 字面量）"))?;
+    let statuses: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if statuses.is_empty() {
+        return Err(AppError::validation("statuses 至少需要一个非空状态字面量"));
+    }
+
+    let mut tx = state.pool.begin().await?;
+    let out = state
+        .dashboard_service
+        .build_delivery_order_details(&mut *tx, date, statuses, q.basis)
+        .await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
 }
 
 async fn handle_socket(
@@ -286,20 +354,6 @@ async fn run_socket(
             // 广播来的业务事件
             broadcast = rx.recv() => {
                 match broadcast {
-                    Ok(WsEvent::DashboardSnapshot { data }) => {
-                        // 由业务侧主动 broadcast 的快照：组装 envelope
-                        let envelope = serde_json::json!({
-                            "type": "snapshot",
-                            "data": data,
-                            "ts": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string(),
-                        });
-                        let text = Utf8Bytes::from(envelope.to_string());
-                        // 同 Minor-3：写失败即 break，不再重复发 Close 帧。
-                        if let Err(e) = sender.send(Message::Text(text)).await {
-                            warn!(user_id = user_id, conn_id = conn_id, error = %e, "ws dashboard: 广播快照写失败，关闭连接（写侧已不可用）");
-                            break;
-                        }
-                    }
                     Ok(WsEvent::DashboardEvent { kind, payload }) => {
                         let envelope = WsEventMsg::new(kind, payload);
                         let text = serde_json::to_string(&envelope).unwrap_or_default();
@@ -453,7 +507,6 @@ async fn run_socket(
     }
 }
 
-
 fn reauth_close_code(err_code: i32) -> (u16, &'static str) {
     match err_code {
         code::UNAUTHORIZED | code::TOKEN_EXPIRED | code::SESSION_REVOKED => (4001, "auth expired"),
@@ -463,12 +516,7 @@ fn reauth_close_code(err_code: i32) -> (u16, &'static str) {
 
 async fn build_snapshot_msg(state: &AppState) -> Result<String, AppError> {
     let mut tx = state.pool.begin().await?;
-    // WS 路径无 query：days / basis 形参均固定传 `None`，由 service `unwrap_or_default()` 兜底。
-    // 形参语义见 `service/snapshot.rs::build_snapshot_with_workers` / `dto.rs::DeliveryBasis`。
-    let snap = state
-        .dashboard_service
-        .build_snapshot_with_workers(&mut *tx, None, None, None)
-        .await?;
+    let snap = state.dashboard_service.build_snapshot(&mut *tx).await?;
     tx.commit().await?;
     let envelope = WsSnapshotMsg::new(snap);
     Ok(serde_json::to_string(&envelope).unwrap_or_default())
