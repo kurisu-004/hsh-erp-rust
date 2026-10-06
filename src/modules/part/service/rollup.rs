@@ -127,7 +127,8 @@ impl PartService {
         current: &CurrentUser,
         event_id: Option<i64>,
     ) -> Result<SyncOutcome, AppError> {
-        let outcome = batch_status::rollup_part_derived(conn, part_id, current.id, event_id).await?;
+        let outcome =
+            batch_status::rollup_part_derived(conn, part_id, current.id, event_id).await?;
         Ok(outcome.sync)
     }
 }

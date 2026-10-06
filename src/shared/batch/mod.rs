@@ -13,12 +13,17 @@
 //! | [`status`] | `apply_batch_status_change` / `apply_bulk_batch_status_change_for_part` + 派生链 | assembly / part / 本表（见下） |
 //! | [`guards`] | 7 个自由函数：状态机守卫 / OCC / 货架校验 / status 薄包装 | part / shelf / `status` |
 //!
-//! ## 边界登记：shared/batch 是本仓唯一经域 repo 写库的 shared 模块
+//! ## 边界登记：shared/batch 依赖 4 个域，是本仓依赖面最宽的 shared 模块
 //!
-//! [`status`] 经 `PartRepo::update_part_rollup`（part 域）与
-//! `AssemblyService::sync_assembly_status`（assembly 域）写库，即 shared 层
-//! 反过来调域的 repo。**这是有意为之的例外**，理由：它是 `CLAUDE.md`
-//! 「状态派生契约」三层派生图
+//! | 域 | 经 shared 的哪个文件 | 读 / 写 | 入口 |
+//! |---|---|---|---|
+//! | `part` | `status` | **写** | `PartRepo::update_part_rollup`（`part` 派生列回填）+ `PartRepo::insert_part_event`（事件日志） |
+//! | `assembly` | `status` | **写** | `AssemblyService::sync_assembly_status`（父件派生级联） |
+//! | `shelf` | `guards` | 读 | `ShelfRepo::get_by_id_zone`（`validate_shelf_zone` 的存在 / 停用 / zone 三谓词） |
+//! | `prod::process_chain` | `guards` | 读 | `ProcessChainRepo::resolve_step_id_by_process`（`optional_step_id`） |
+//!
+//! 前两行是**写**库，故 `shared::batch` 是本仓**唯一**经域 repo 写库的 shared 模块。
+//! **这是有意为之的例外**，理由：它是 `CLAUDE.md`「状态派生契约」三层派生图
 //!
 //! ```text
 //! t_part_batch.status            ← 唯一真源
@@ -34,8 +39,12 @@
 //! 把它留在 batch 域只会让 part / assembly 域反向依赖 batch 域，与本轮剥离方向
 //! 相反。上移到 shared 后，**派生方向与域依赖方向一致**（上层域 → shared）。
 //!
+//! 后两行是**只读**单表查询：守卫的判序与文案是全仓一份的公共语义，留域内会让
+//! 每个新域反向依赖 batch（见 `guards` 模块 doc 的 `current_holder_id` 三写点清单）。
+//!
 //! 换言之：`shared::customer`（读 `t_customer`，无反向写）代表 shared 的常态，
-//! `shared::batch` 是唯一例外，且例外的成因是「跨域契约」而非「图省事」。
+//! `shared::batch` 是唯一经域写库的模块、也是唯一依赖 4 个域的模块，两者的成因
+//! 都是「跨域契约」而非「图省事」。
 //!
 //! ## 不放什么
 //!
@@ -49,14 +58,14 @@ pub mod read;
 pub mod status;
 
 pub use guards::{
-    assert_shelf_maps_process, ensure_transition, mark_batch_status_only,
+    InspectionRepairRow, assert_shelf_maps_process, ensure_transition, mark_batch_status_only,
     mark_batch_with_status_and_meta, optional_process_chain, optional_step_id,
-    status_guard_for_target, validate_batch_version, validate_shelf_zone, InspectionRepairRow,
+    status_guard_for_target, validate_batch_version, validate_shelf_zone,
 };
 pub use model::TPartBatch;
 
 pub use read::{get_batch_by_id, list_active_batches_by_part_id};
 pub use status::{
-    apply_batch_status_change, apply_bulk_batch_status_change_for_part, rollup_part_derived,
-    PartDerivation, RollupOutcome, StatusChange,
+    PartDerivation, RollupOutcome, StatusChange, apply_batch_status_change,
+    apply_bulk_batch_status_change_for_part, rollup_part_derived,
 };

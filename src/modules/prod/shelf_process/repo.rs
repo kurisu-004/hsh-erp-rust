@@ -185,9 +185,8 @@ impl ShelfProcessRepo {
     /// 当前是 `NOT NULL`，故按 `i64` 解码当前安全；但列一旦变可空，同款写法会以
     /// `error occurred while decoding column 0: unexpected null; try decoding as an Option`
     /// 整笔 500。**该次加固零行为变化**（`NOT NULL` 列 `.flatten()` 恒为 `Some(v)`）。
-    /// 同款修法见 `prod/queue/repo/mod.rs::process_chain_step_get_process_id`
-    /// 与 `prod/batch/service/worker_scan.rs::worker_scan_event`（后者是可空列，
-    /// 已在 2026-10-04 真修过一次 500）。
+    /// 同款反模式另见 `prod/batch/service/worker_scan.rs::worker_scan_event`
+    /// （那里是可空列，已真修过一次 500）。
     pub async fn find_first_shelf_for_process<'e, E: PgExecutor<'e>>(
         executor: E,
         process_id: i64,

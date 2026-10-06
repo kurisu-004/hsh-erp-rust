@@ -20,7 +20,7 @@
 //!   不变（任何未来 cross-module 调用方零修改）。
 //! - `prod::queue::repo::QueueRepoTrait` —— 本文件新加的胖 trait
 //!   （18 方法 = 本域 4 + 跨域 helper 14），queue 域内部 service 用
-//!   `<R: QueueRepoTrait>` 收。
+//!   `<R: QueueRepoTrait>` 收。跨域 helper 的实时清单见下方「跨域 helper 清单」。
 //!
 //! ## 为什么是胖 trait（含本域 + 跨域 helper）
 //! queue 是跨域核心（CLAUDE.md §「part 是跨域枢纽」的兄弟节点）——同 service
@@ -33,24 +33,25 @@
 //! helper 方法，trait impl 一行委托到对应 ZST 静态方法（已重构域）或原 ZST 静态方法
 //! （part 域，D-6 未做）。
 //!
-//! ## 跨域 helper 清单（14）
+//! ## 跨域 helper 清单（11）
 //! - worker (3)：`worker_get_by_id` / `worker_list_active_by_process_id` /
 //!   `worker_list_with_filters_for_seed`
 //!   （实际只前 2 个被 service 调用；第 3 个预留 forward-compat）
-//! - work_type (3)：`work_type_get_by_id` / `work_type_list_process_ids` /
-//!   `work_type_list_work_types_by_process_id`
+//! - work_type (4)：`work_type_get_by_id` / `work_type_list_process_ids` /
+//!   `work_type_list_work_types_by_process_id` / `work_type_get_max_held_minutes`
 //! - process (1)：`process_get_by_id`
 //! - process_chain (1)：`process_chain_resolve_step_id_by_process`
-//! - process_chain_step (1)：`process_chain_step_get_process_id`（2026-09-30 起
-//!   `move_batch` 无调用方，改直读 `batch.current_process_id`；保留备用）
-//! - part_batch (3)：`part_batch_count_held_by_worker` / `part_batch_get_by_id` /
-//!   `part_batch_list_active_by_part_id`
+//! - part_batch (2)：`part_batch_count_held_by_worker` / `part_batch_get_by_id`
 //! - part (3)：`part_get_by_id` / `part_find_inprocess_batch_by_id_and_holder` /
 //!   `part_mark_batch_returned`
 //! - part_event (1)：`part_insert_part_event`
 //! - inline SQL helper (1)：`count_pool_by_shelf_and_process`（service 中
 //!   `compute_state` 内的 `sqlx::query_scalar!` 块下沉到本 trait；2026-09-30 起
 //!   按 `t_part_batch.current_process_id` 普通过滤，已无 t_process_chain_step JOIN）
+//!
+//! 2026-10-08 删掉 3 个全仓零调用方：`process_chain_step_get_process_id`
+//! （`move_batch` 早已改直读 `batch.current_process_id`）/
+//! `part_batch_list_active_by_part_id` / `part_get_process_chain_id`。
 //!
 //! ## 为什么 trait 可以直接对 `&mut PgConnection` 实现
 //! `Transaction<'_, Postgres>` 与 `PoolConnection<Postgres>` 都 `DerefMut<Target = PgConnection>`，
@@ -70,10 +71,10 @@ use async_trait::async_trait;
 use sqlx::PgConnection;
 
 use crate::modules::part::model::{NewPartEvent, TPart};
-use crate::shared::batch::TPartBatch;
 use crate::modules::prod::process::model::TProcess;
 use crate::modules::prod::work_type::model::TWorkType;
 use crate::modules::prod::worker::model::TWorker;
+use crate::shared::batch::TPartBatch;
 
 pub mod dispatch;
 pub mod sql;
@@ -172,19 +173,7 @@ pub trait QueueRepoTrait: Send {
         process_id: i64,
     ) -> Result<Option<i64>, sqlx::Error>;
 
-    /// 解析 step_id 对应的 process_id（assign 路径校验 batch 当前 step）。
-    /// 原 `service.rs:739` 的 `sqlx::query_scalar` 内联 SQL 下沉。
-    ///
-    /// 2026-09-30：`move_batch` 的唯一调用点已删（改为直读
-    /// `batch.current_process_id`，少一次 DB 往返），本方法当前无调用方，
-    /// 保留供后续「按 step 维度」校验路径复用（如返修/派工的 step 推进）。
-    #[allow(dead_code)]
-    async fn process_chain_step_get_process_id(
-        &mut self,
-        step_id: i64,
-    ) -> Result<Option<i64>, sqlx::Error>;
-
-    // ── part_batch 域 helper（3）──
+    // ── part_batch 域 helper（2）──
     /// 统计 worker 持有批次数（`PartBatchRepo::count_held_by_worker`）。
     async fn part_batch_count_held_by_worker(&mut self, worker_id: i64)
     -> Result<i64, sqlx::Error>;
@@ -195,15 +184,6 @@ pub trait QueueRepoTrait: Send {
         id: i64,
         include_deleted: bool,
     ) -> Result<Option<TPartBatch>, sqlx::Error>;
-
-    /// 列 part 全部活跃批次（`PartBatchRepo::list_active_by_part_id`，sync_from_batch_change
-    /// 间接消费：service 直接调 `PartService::sync_from_batch_change` 不走本 trait）。
-    /// 预留以便后续 service 重构时下沉到 trait。
-    #[allow(dead_code)]
-    async fn part_batch_list_active_by_part_id(
-        &mut self,
-        part_id: i64,
-    ) -> Result<Vec<TPartBatch>, sqlx::Error>;
 
     // ── part 域 helper（3，D-6 未做；直接走 ZST 静态方法）──
     /// 单条查 part（`PartRepo::get_by_id`）。
@@ -255,12 +235,6 @@ pub trait QueueRepoTrait: Send {
         note: Option<&'a str>,
         created_by: Option<i64>,
     ) -> Result<(), sqlx::Error>;
-
-    // ── 跨域 inline SQL helper（1，admin_remove 内联下沉）──
-    /// 取 part 的 process_chain_id（admin_remove 路径解析 step 用）。
-    /// 原 `service.rs:304` 的 `sqlx::query_scalar` 内联 SQL 下沉。
-    async fn part_get_process_chain_id(&mut self, part_id: i64)
-    -> Result<Option<i64>, sqlx::Error>;
 }
 
 /// 把 `QueueRepoTrait` 直接对 `&mut PgConnection` 实现——handler/service 借
@@ -434,28 +408,6 @@ impl QueueRepoTrait for &mut PgConnection {
         .await
     }
 
-    async fn process_chain_step_get_process_id(
-        &mut self,
-        step_id: i64,
-    ) -> Result<Option<i64>, sqlx::Error> {
-        // ⚠️ 2026-10-04 加固：`O` 按 `Option<i64>` 收（外层 `Option` 由
-        // `fetch_optional` 表示「有没有行」，不表示列的类型）。`t_process_chain_step.process_id`
-        // 当前是 `NOT NULL`，故按 `i64` 解码当前安全；列一旦变可空，同款写法会以
-        // `error occurred while decoding column 0: unexpected null; try decoding as an Option`
-        // 整笔 500。**本次零行为变化**（`NOT NULL` 列 `.flatten()` 恒为 `Some(v)`）。
-        // 同款修法见 `prod/shelf_process/repo.rs::find_first_shelf_for_process`
-        // 与 `prod/batch/service/worker_scan.rs::worker_scan_event`（后者是可空列，
-        // 已在 2026-10-04 真修过一次 500）。
-        let row: Option<Option<i64>> = sqlx::query_scalar(
-            "SELECT process_id FROM t_process_chain_step \
-             WHERE id = $1 AND deleted_at IS NULL",
-        )
-        .bind(step_id)
-        .fetch_optional(&mut **self)
-        .await?;
-        Ok(row.flatten())
-    }
-
     // ── part_batch helper ──
     async fn part_batch_count_held_by_worker(
         &mut self,
@@ -473,24 +425,7 @@ impl QueueRepoTrait for &mut PgConnection {
         id: i64,
         include_deleted: bool,
     ) -> Result<Option<TPartBatch>, sqlx::Error> {
-        crate::shared::batch::get_batch_by_id(
-            &mut **self,
-            id,
-            include_deleted,
-        )
-        .await
-    }
-
-    #[allow(dead_code)]
-    async fn part_batch_list_active_by_part_id(
-        &mut self,
-        part_id: i64,
-    ) -> Result<Vec<TPartBatch>, sqlx::Error> {
-        crate::shared::batch::list_active_batches_by_part_id(
-            &mut **self,
-            part_id,
-        )
-        .await
+        crate::shared::batch::get_batch_by_id(&mut **self, id, include_deleted).await
     }
 
     // ── part helper（直接走 PartRepo ZST 静态方法；D-6 未重构）──
@@ -566,20 +501,5 @@ impl QueueRepoTrait for &mut PgConnection {
             created_by,
         };
         PartRepo::insert_part_event(&mut **self, new).await
-    }
-
-
-    // ── 跨域 inline SQL helper（admin_remove 路径）──
-    async fn part_get_process_chain_id(
-        &mut self,
-        part_id: i64,
-    ) -> Result<Option<i64>, sqlx::Error> {
-        let row: Option<i64> = sqlx::query_scalar(
-            "SELECT process_chain_id FROM t_part WHERE id = $1 AND deleted_at IS NULL",
-        )
-        .bind(part_id)
-        .fetch_optional(&mut **self)
-        .await?;
-        Ok(row)
     }
 }

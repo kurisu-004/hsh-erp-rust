@@ -39,13 +39,12 @@ impl QueueService {
     pub async fn recall_to_pending<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
-        batch_id: i64,
         req: RecallToPendingRequest,
         current: &CurrentUser,
     ) -> Result<RecallOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
         let batch = repo
-            .find_batch_by_id(batch_id)
+            .find_batch_by_id(req.batch_id)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_BATCH_NOT_FOUND, "batch 不存在"))?;
         let part_id = batch.part_id;

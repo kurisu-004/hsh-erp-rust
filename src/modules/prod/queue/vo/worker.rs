@@ -13,7 +13,7 @@
 //! | `HeldBatchItem` | 被 [`super::board::QueueHeldBatch`] 取代（旧版含恒为 `null` 的 `shelf_code`） |
 //! | `ProcessPoolCount` / `WorkerPoolState` | 只服务已删除的 `GET /queue/state` |
 //!
-//! 逐字段的「前端零消费」grep 证据见 `docs/api/production/queue.md` §5。
+//! 逐字段的「前端零消费」grep 证据见 `docs/api/queue.md` §5。
 
 use serde::Serialize;
 

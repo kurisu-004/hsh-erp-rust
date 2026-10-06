@@ -101,5 +101,5 @@ impl BatchService {
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "place-on-shelf 后查不到"))?;
         Ok(crate::modules::part::vo::PartOut::from(fresh))
-}
+    }
 }

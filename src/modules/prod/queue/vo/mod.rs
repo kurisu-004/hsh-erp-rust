@@ -17,7 +17,7 @@
 //! `ProcessPoolCount` / `WorkerPoolState`）整体并入本目录 —— 那 5 个 struct 全是纯
 //! 出参，没有一列对应独立的表行模型，留在 `model.rs` 会让人误以为存在「行模型层」。
 //! 本仓对「只读聚合域」已是这个形态（dashboard 域无 `model.rs`，出参全在 `vo/`）。
-//! 同批删掉的字段见 `docs/api/production/queue.md` §5「移除记录」。
+//! 同批删掉的字段见 `docs/api/queue.md` §5「移除记录」。
 
 pub mod board;
 pub mod queue;

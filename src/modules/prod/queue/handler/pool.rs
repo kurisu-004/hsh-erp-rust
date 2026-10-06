@@ -93,8 +93,7 @@ pub async fn auto_allocate(
 ) -> Result<Json<R<AutoAllocateResult>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let result =
-        QueueService::auto_allocate_for_process(&mut tx, &state.snowflake, req, &current)
-            .await?;
+        QueueService::auto_allocate_for_process(&mut tx, &state.snowflake, req, &current).await?;
     tx.commit().await?;
     state.ws_hub.broadcast(WsEvent::DashboardEvent {
         kind: "WORKER_POOL_AUTO_ALLOCATE_DONE".into(),

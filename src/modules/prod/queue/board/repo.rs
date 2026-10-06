@@ -99,7 +99,7 @@ const SQL_WORKERS_BY_PROCESS: &str = "SELECT w.id AS worker_id, \
        AND w.deleted_at IS NULL \
      ORDER BY w.id ASC";
 
-/// `board_process_detail` SQL 4：**一次**取齐该工序全部工人的持有批次。
+/// `board_process_detail` SQL 3：**一次**取齐该工序全部工人的持有批次。
 ///
 /// ⚠️ 这是消灭 N+1 的关键：`current_holder_id = ANY($1::bigint[])`（不是
 /// `= $1`），10 个工人与 2 个工人发的是**同一条 SQL**，只是数组长度不同。
@@ -137,7 +137,7 @@ const SQL_HELD_BATCHES_BY_WORKERS: &str = "SELECT pb.id AS batch_id, \
        AND pb.deleted_at IS NULL \
      ORDER BY pb.current_holder_id ASC, pb.id ASC";
 
-/// `board_process_detail` SQL 5：该工序候选池（跨所有生产货架）。
+/// `board_process_detail` SQL 4：该工序候选池（跨所有生产货架）。
 const SQL_POOL_ITEMS_BY_PROCESS: &str = "SELECT pb.id AS batch_id, \
      pb.part_id AS part_id, \
      pb.batch_no AS batch_no, \
@@ -204,7 +204,7 @@ pub struct WorkerRow {
     pub max_held: Option<i32>,
 }
 
-/// 持有批次行（`board_process_detail` SQL 4）。
+/// 持有批次行（`board_process_detail` SQL 3）。
 pub struct HeldBatchRow {
     pub holder_id: i64,
     pub batch_id: i64,
@@ -226,7 +226,7 @@ pub struct HeldBatchRow {
     pub has_cnc_program: bool,
 }
 
-/// 候选池行（`board_process_detail` SQL 5）。
+/// 候选池行（`board_process_detail` SQL 4）。
 pub struct PoolItemRow {
     pub batch_id: i64,
     pub part_id: i64,
@@ -308,20 +308,21 @@ impl QueueBoardRepo {
         Ok((counts, meta, pending))
     }
 
-    /// 单工序队列板数据。**固定 6 条 SQL，与工人数 / 批次数无关**：
+    /// 单工序队列板数据。**固定 4 条 SQL，与工人数 / 批次数无关**：
     ///
     /// 1. 工序元数据（单行）；
-    /// 2. 该工序可用工人；
-    /// 3. （工种 `max_held` 已在 SQL 2 的 JOIN 里一并取回，**不单独发查询** ——
-    ///    原设计里「工种 max_held 按 `id = ANY` 批量」是为了避免 N+1，但
-    ///    工人查询本身已经 JOIN 了 `t_work_type`，把它拆出去等于同一份数据取两次）；
-    /// 4. **全部工人的持有批次一次取齐**（`current_holder_id = ANY($1)`）；
-    /// 5. 该工序候选池；
-    /// 6. 待下发批次数（供前端在板内显示「待下发」入口计数）。
+    /// 2. 该工序可用工人（工种 `max_held` 在同一条 SQL 的 JOIN 里一并取回 ——
+    ///    工人查询本身已经 JOIN `t_work_type`，把它拆出去等于同一份数据取两次）；
+    /// 3. **全部工人的持有批次一次取齐**（`current_holder_id = ANY($1)`）；
+    /// 4. 该工序候选池。
     ///
-    /// ⚠️ 第 4 条是本方法与旧 `GET /queue/{process_id}` + `GET /queue/state`
+    /// ⚠️ 第 3 条是本方法与旧 `GET /queue/{process_id}` + `GET /queue/state`
     /// 组合的本质区别：旧路径下前端要发 1（工序）+ 1（候选池）+ N（每工人一次
-    /// state）个请求；现在是恒定 6 条。
+    /// state）个请求；现在是恒定 4 条。
+    ///
+    /// 「待下发」计数**不在本方法内查**（`QueueProcessBoardDetail` 没有该字段）：
+    /// 它是工序无关的全局量，由 `board_snapshot` 的 `pending_count` 提供，
+    /// 前端在单工序板上直接复用首帧那个数字，省掉每次下钻一次查询。
     ///
     /// 工序不存在 / 已软删 → `20801 BIZ_PROCESS_NOT_FOUND`（HTTP 404）。
     pub async fn board_process_detail(
@@ -366,7 +367,7 @@ impl QueueBoardRepo {
             })
             .collect();
 
-        // 4. 全部工人的持有批次（一次 ANY，无 N+1）
+        // 3. 全部工人的持有批次（一次 ANY，无 N+1）
         let held: Vec<HeldBatchRow> = if workers.is_empty() {
             Vec::new()
         } else {
@@ -380,7 +381,7 @@ impl QueueBoardRepo {
                 .collect()
         };
 
-        // 5. 候选池
+        // 4. 候选池
         let items: Vec<PoolItemRow> = sqlx::query(SQL_POOL_ITEMS_BY_PROCESS)
             .bind(process_id)
             .fetch_all(&mut *conn)
@@ -389,18 +390,11 @@ impl QueueBoardRepo {
             .map(row_to_pool_item)
             .collect();
 
-        // 6. 待下发批次数
-        let pending: i64 = sqlx::query(SQL_COUNT_PENDING)
-            .fetch_one(&mut *conn)
-            .await?
-            .get("cnt");
-
         Ok(QueueBoardProcessData {
             process,
             workers,
             held,
             items,
-            pending,
         })
     }
 }
@@ -411,7 +405,6 @@ pub struct QueueBoardProcessData {
     pub workers: Vec<WorkerRow>,
     pub held: Vec<HeldBatchRow>,
     pub items: Vec<PoolItemRow>,
-    pub pending: i64,
 }
 
 fn row_to_process_meta(r: sqlx::postgres::PgRow) -> ProcessMetaRow {

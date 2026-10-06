@@ -31,8 +31,8 @@
 use sqlx::PgConnection;
 
 use crate::modules::part::statemachine::PartStatus;
-use crate::shared::batch::status::{apply_batch_status_change, StatusChange};
 use crate::modules::shelf::repo::ShelfRepo;
+use crate::shared::batch::status::{StatusChange, apply_batch_status_change};
 use crate::shared::error::{AppError, code};
 
 #[derive(sqlx::FromRow)]
@@ -72,11 +72,7 @@ pub struct InspectionRepairRow {
 /// - 起点状态非法 → 20103 `BIZ_INVALID_TRANSITION`
 /// - 起点已是终态 → 20115 `BIZ_PART_ALREADY_CANCELLED`（仅 cancel 路径）
 #[inline]
-pub fn ensure_transition(
-    from: PartStatus,
-    to: PartStatus,
-    ctx: &str,
-) -> Result<(), AppError> {
+pub fn ensure_transition(from: PartStatus, to: PartStatus, ctx: &str) -> Result<(), AppError> {
     if from == PartStatus::CANCELLED {
         return Err(AppError::biz(
             code::BIZ_PART_ALREADY_CANCELLED,

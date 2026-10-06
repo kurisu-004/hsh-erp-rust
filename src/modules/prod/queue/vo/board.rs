@@ -4,7 +4,7 @@
 //! `GET /queue/{process_id}`：原实现让「进程序列板」必须发 N 个请求（每个工序
 //! 一次），且 worker 的持有批次要再逐个 worker 拉 —— 两次 N+1。
 //!
-//! ## 字段取舍：按前端实际消费收敛（逐字段 grep 证据见 `docs/api/production/queue.md` §5）
+//! ## 字段取舍：按前端实际消费收敛（逐字段 grep 证据见 `docs/api/queue.md` §5）
 //!
 //! - 删 `customer_path` —— 前端用 `customer_name` + `parent_customer_name` 自行拼；
 //! - 删 `location` 原始 enum —— 候选池项恒为 `PRODUCTION_SHELF`、持有项恒为

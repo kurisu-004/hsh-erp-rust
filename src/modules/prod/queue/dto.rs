@@ -168,7 +168,10 @@ pub struct DispatchTarget {
 /// 元素按字符串逐个解析（前端发 `"123"` 字符串形态不会触发 422）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct AutoDispatchRequest {
-    #[serde(default, deserialize_with = "crate::shared::types::deserialize_i64_vec_opt")]
+    #[serde(
+        default,
+        deserialize_with = "crate::shared::types::deserialize_i64_vec_opt"
+    )]
     pub batch_ids: Option<Vec<i64>>,
 }
 

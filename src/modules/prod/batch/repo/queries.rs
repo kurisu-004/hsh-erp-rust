@@ -1,7 +1,8 @@
 //! `t_part_batch` SQL 真源 ZST `PartBatchRepo` + 固有静态方法。
 //!
 //! 2026-10-02 随 `t_part_batch` 归属迁入 prod 域（生产执行单元 = 批次）。
-//! 本文件是 `t_part_batch` 的 **SQL 真源**，17 个 `PartBatchRepo::xxx` 静态方法；
+//! 本文件是 `t_part_batch` 的 **SQL 真源**，16 个 `PartBatchRepo::xxx` 静态方法
+//! （通用 `get_by_id` 已上移 `shared::batch::read`，见下方小节）；
 //! 跨域调用方（part / assembly / delivery_note / wx / prod::queue / task）
 //! 走 `PartBatchRepo::xxx(&mut *conn, ...)` 静态调用形态。
 //!

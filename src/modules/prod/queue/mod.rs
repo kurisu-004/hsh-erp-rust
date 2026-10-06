@@ -21,11 +21,11 @@
 //! - `POST /api/v2/prod/queue/move` —— 通用移动（POOL ↔ WORKER + WORKER ↔ WORKER）
 //! - `POST /api/v2/prod/queue/auto-allocate` —— 按工序自动分配
 //!
-//! ## 路由注册顺序（axum matchit 硬约束，勿调换）
-//! 1 段静态段（`/pending` `/dispatch` `/auto-dispatch` `/recall` `/refill` `/move`
-//! `/auto-allocate` `/snapshot`）必须**全部**先于 `/{process_id}` 形状的动态段注册，
-//! 否则 axum 把 `"counts"`、`"pending"` 之类的字面量当 process_id 解析。
-//! `/processes/{process_id}` 是 2 段，与 1 段组不冲突。
+//! ## 路由注册顺序
+//! 1 段组（`/pending` `/dispatch` `/auto-dispatch` `/recall` `/refill` `/move`
+//! `/auto-allocate` `/snapshot`）与唯一的 2 段动态组 `/processes/{process_id}`
+//! **段数不同**，matchit 无同段位争用 ⇒ 注册顺序不影响匹配结果。上方 router 里
+//! 「1 段在前」只是书写习惯，不是硬约束。
 
 pub mod board;
 pub mod dto;

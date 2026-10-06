@@ -35,10 +35,10 @@ use crate::modules::outsource::service::OutsourceService;
 use crate::modules::part_file::service::PartFileService;
 use crate::modules::prod::process::service::ProcessService;
 use crate::modules::prod::process_chain::service::crud::ProcessChainService;
+use crate::modules::prod::queue::service::QueueService;
 use crate::modules::prod::work_type::service::WorkTypeProcessService;
 use crate::modules::prod::work_type::service::WorkTypeService;
 use crate::modules::prod::worker::service::WorkerService;
-use crate::modules::prod::queue::service::QueueService;
 use crate::modules::statistics::service::StatisticsService;
 // 2026-09-29 新增：企业微信小程序登录客户端（wx-login 端点）。
 use crate::modules::wx::wecom_client::WeComApiClient;

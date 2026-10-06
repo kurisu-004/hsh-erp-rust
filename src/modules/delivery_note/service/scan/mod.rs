@@ -214,9 +214,7 @@ impl DeliveryNoteService {
 
         // ===== Step 4: 加载 target 全部活跃 batch → C 组短路 → 5 组分类 =====
         let target_part_ids: Vec<i64> = targets.iter().map(|p| p.id).collect();
-        let all_batches: Vec<crate::shared::batch::TPartBatch> = if target_part_ids
-            .is_empty()
-        {
+        let all_batches: Vec<crate::shared::batch::TPartBatch> = if target_part_ids.is_empty() {
             Vec::new()
         } else {
             PartBatchRepo::list_active_by_part_ids(&mut *repo.conn_mut(), &target_part_ids).await?

@@ -122,7 +122,7 @@ pub fn router() -> Router<Arc<AppState>> {
 }
 
 // ============================================================================
-// 剥离登记表（2026-10-08 新增）
+// 剥离登记表
 // ============================================================================
 //
 // 逐域剥离策略：batch 域**本轮只做 queue 那一份**；后续每一轮某个域重构时重复
@@ -133,113 +133,193 @@ pub fn router() -> Router<Arc<AppState>> {
 // 判定 —— 后端按表 / 状态机聚在一起，前端按页面聚在一起，两者的切分线不同。
 // 一条端点被多个页面消费时归「多域共用」，由后续某一轮自行认领。
 //
-// ⚠️ 本表与 `docs/api/production/batch.md` 内容一致：契约只从 `docs/api/` 读
+// ⚠️ 本表与 `docs/api/batch.md` 内容一致：契约只从 `docs/api/` 读
 // （前端 CLAUDE.md 规定），本表是给改 Rust 代码的人就近看的。
+//
+// **改一同步二的义务**：往上面的 `router()` 加/删一条 `.route(...)` 时，
+// `mod tests::routes_declared_in_router` 会立刻红，直到
+// `ROUTES` 与 `STRIP_REGISTRY` 同步更新为止。
 
-/// 剥离登记表（路由 → 目标域）。`mod tests` 里有一条单测断言
-/// 「本表覆盖 router 里注册的全部路由」，改路由时同步改表。
-pub const STRIP_REGISTRY: &[(&str, &str)] = &[
-    // ── 1 段静态 ──
-    ("POST /to-ship", "多域共用（views/inspection/ + views/delivery/）"),
-    ("POST /to-inspection", "多域共用（views/inspection/ + views/delivery/）"),
-    ("POST /worker-scan", "views/scan/（扫码台）"),
-    ("GET /repair", "views/repair/"),
-    ("GET /repairing", "views/repair/"),
-    // ── 2 段静态 ──
-    ("POST /scan/deliver", "views/scan/（扫码台）"),
-    // ── 2 段动态 /{batch_id} ──
-    ("POST /{batch_id}/to-inspection", "多域共用（views/inspection/ + views/delivery/）"),
-    ("POST /{batch_id}/to-ship", "多域共用（views/inspection/ + views/delivery/）"),
-    ("POST /{batch_id}/to-process", "多域共用（views/inspection/ + views/delivery/）"),
-    ("POST /{batch_id}/scan-inspect", "views/scan/（扫码台）"),
-    ("POST /{batch_id}/deliver", "views/delivery/（送货单域）"),
-    ("POST /{batch_id}/complete", "多域共用（views/parts/ + views/assemblies/ + views/statistics/）"),
-    ("POST /{batch_id}/start-repair", "views/repair/"),
-    ("POST /{batch_id}/place-on-shelf", "待定（消费方是零件列表页，非队列页）"),
-    ("POST /{batch_id}/release-from-programming", "views/cnc/"),
-    ("POST /{batch_id}/send-to-outsource", "views/outsource/"),
-    ("POST /{batch_id}/receive-from-outsource", "views/outsource/"),
-    (
-        "POST /{batch_id}/receive-from-outsource-to-inspection",
-        "views/outsource/",
-    ),
-    ("POST /{batch_id}/complete-repair", "views/repair/"),
-    ("POST /{batch_id}/repair-dispatch", "views/repair/"),
-    ("POST /{batch_id}/split", "views/parts/detail/"),
-    ("POST /{batch_id}/cancel", "views/parts/detail/"),
-    ("POST /{batch_id}/pick-up", "views/scan/（扫码台）"),
+/// 本域 router 注册的全部路由（`METHOD /path`，相对 `/api/v2/prod/batches`）。
+///
+/// 2026-10-08 起它是**剥离登记表的唯一真源**：`STRIP_REGISTRY` 按同序同下标给出
+/// 每条路由的目标域，单测据本表与 `router()` 源码比对（见 `mod tests`）。
+/// 单独维护两份平行的「路由清单」必然漂移，故只留这一份。
+pub const ROUTES: &[&str] = &[
+    "POST /to-ship",
+    "POST /to-inspection",
+    "POST /worker-scan",
+    "GET /repair",
+    "GET /repairing",
+    "POST /scan/deliver",
+    "POST /{batch_id}/to-inspection",
+    "POST /{batch_id}/to-ship",
+    "POST /{batch_id}/to-process",
+    "POST /{batch_id}/scan-inspect",
+    "POST /{batch_id}/deliver",
+    "POST /{batch_id}/complete",
+    "POST /{batch_id}/start-repair",
+    "POST /{batch_id}/place-on-shelf",
+    "POST /{batch_id}/release-from-programming",
+    "POST /{batch_id}/send-to-outsource",
+    "POST /{batch_id}/receive-from-outsource",
+    "POST /{batch_id}/receive-from-outsource-to-inspection",
+    "POST /{batch_id}/complete-repair",
+    "POST /{batch_id}/repair-dispatch",
+    "POST /{batch_id}/split",
+    "POST /{batch_id}/cancel",
+    "POST /{batch_id}/pick-up",
 ];
 
-/// 已被认领并从 batch 域移走的端点（2026-10-08 本轮）。
+/// 剥离登记表（目标域），**与 [`ROUTES`] 同序同长度**：下标 `i` 描述 `ROUTES[i]`。
+///
+/// 写成两条平行数组而不是 `&[(&str, &str)]`，是为了让「少写一条目标域」在类型上
+/// 不可能发生（长度不等时 `mod tests` 直接红），而不是靠运行时比对才发现。
+pub const STRIP_TARGETS: &[&str] = &[
+    // ── 1 段静态 ──
+    "多域共用（views/inspection/ + views/delivery/）",
+    "多域共用（views/inspection/ + views/delivery/）",
+    "views/scan/（扫码台）",
+    "views/repair/",
+    "views/repair/",
+    // ── 2 段静态 ──
+    "views/scan/（扫码台）",
+    // ── 2 段动态 /{batch_id} ──
+    "多域共用（views/inspection/ + views/delivery/）",
+    "多域共用（views/inspection/ + views/delivery/）",
+    "多域共用（views/inspection/ + views/delivery/）",
+    "views/scan/（扫码台）",
+    "views/delivery/（送货单域）",
+    "多域共用（views/parts/ + views/assemblies/ + views/statistics/）",
+    "views/repair/",
+    "待定（消费方是零件列表页，非队列页）",
+    "views/cnc/",
+    "views/outsource/",
+    "views/outsource/",
+    "views/outsource/",
+    "views/repair/",
+    "views/repair/",
+    "views/parts/detail/",
+    "views/parts/detail/",
+    "views/scan/（扫码台）",
+];
+
+/// 已被认领并从 batch 域移走的端点。
 ///
 /// 列出来是为了让下一轮的人不重复找：这些路由**不在**本域 router 里了，
 /// 要改它们去目标域。
 pub const STRIPPED: &[(&str, &str)] = &[
     (
         "GET /inspection",
-        "prod::inspection（2026-10-07 已剥离，改为 GET /prod/inspection/queue）",
+        "prod::inspection（2026-10-07 剥离，新路径 GET /prod/inspection/queue）",
     ),
-    ("GET /pending", "prod::queue（本轮已剥离）"),
-    ("POST /dispatch", "prod::queue（本轮已剥离）"),
-    ("POST /auto-dispatch", "prod::queue（本轮已剥离）"),
+    ("GET /pending", "prod::queue（2026-10-08 剥离）"),
+    ("POST /dispatch", "prod::queue（2026-10-08 剥离）"),
+    ("POST /auto-dispatch", "prod::queue（2026-10-08 剥离）"),
     (
         "POST /{batch_id}/recall-to-pending",
-        "prod::queue（本轮已剥离，改为 POST /prod/queue/recall，batch_id 入 body）",
+        "prod::queue（2026-10-08 剥离，新路径 POST /prod/queue/recall，batch_id 入 body）",
     ),
 ];
 
 #[cfg(test)]
 mod tests {
-    use super::STRIP_REGISTRY;
+    use super::{ROUTES, STRIP_TARGETS};
 
-    /// 登记表必须覆盖 router 注册的**每一条**路由，且不多不少。
+    /// 从 `router()` 源码里抠出全部 `METHOD /path`。
     ///
-    /// 防止「新加了路由忘了在登记表上标目标域」—— 那种遗漏在剥离时会变成
-    /// 「这条端点没人认领，batch 域被删后前端才报 404」。
+    /// 解析规则（对本文件的书写方式足够，且不引入构建期依赖）：
+    /// - 以 `.route(` 为锚点，跳过空白后读一个 `"…"` 字面量作 path；
+    /// - 从该字面量末尾到**下一个** `.route(`（或函数末）之间出现 `post(` 记 POST、
+    ///   出现 `get(` 记 GET，两者都出现即多方法路由（本域当前没有，直接 panic 以免
+    ///   误判）。
+    fn routes_in_router_source() -> Vec<String> {
+        let src = include_str!("mod.rs");
+        let body = src
+            .split_once("pub fn router()")
+            .expect("本文件必须有 pub fn router()")
+            .1;
+        let body = &body[..body
+            .find(
+                "
+}
+",
+            )
+            .expect("router() 必须有收尾大括号")];
+        let mut out = Vec::new();
+        let mut rest = body;
+        while let Some(at) = rest.find(".route(") {
+            rest = &rest[at + ".route(".len()..];
+            let after_ws = rest.trim_start();
+            assert!(
+                after_ws.starts_with('"'),
+                ".route( 后必须紧跟字符串字面量 path；实测：{after_ws:.40}"
+            );
+            let after_quote = &after_ws[1..];
+            let end = after_quote.find('"').expect("path 字面量必须有闭合引号");
+            let path = &after_quote[..end];
+            let tail = &after_quote[end..];
+            let seg_end = tail.find(".route(").unwrap_or(tail.len());
+            let seg = &tail[..seg_end];
+            let has_get = seg.contains("get(");
+            let has_post = seg.contains("post(");
+            let method = match (has_get, has_post) {
+                (true, false) => "GET",
+                (false, true) => "POST",
+                (false, false) => panic!("`.route(\"{path}\")` 后既无 get( 也无 post(：{seg:.60}"),
+                (true, true) => {
+                    panic!("`.route(\"{path}\")` 同时注册了 get 与 post（ROUTES 是一路由一方法）")
+                }
+            };
+            out.push(format!("{method} {path}"));
+            rest = &tail[seg_end..];
+        }
+        out
+    }
+
+    /// `ROUTES` 必须与 `router()` 源码**逐条**一致（不多、不少、同序）。
+    ///
+    /// 这是登记表系列测试真正有牙齿的地方：`ROUTES` 与 `STRIP_TARGETS` 都是
+    /// 人工 const，往 `router()` 加一条 `.route(...)` 而忘了更新它们时，靠这条
+    /// 比对会立刻红 —— 否则「新加了路由忘了标目标域」要到 batch 域被删、
+    /// 前端报 404 那天才暴露。
     #[test]
-    fn strip_registry_covers_every_registered_route() {
-        // router() 里注册的 24 条路由（人工核对；改 router 时同步改这里）
-        const REGISTERED: &[&str] = &[
-            "POST /to-ship",
-            "POST /to-inspection",
-            "POST /worker-scan",
-            "GET /repair",
-            "GET /repairing",
-            "POST /scan/deliver",
-            "POST /{batch_id}/to-inspection",
-            "POST /{batch_id}/to-ship",
-            "POST /{batch_id}/to-process",
-            "POST /{batch_id}/scan-inspect",
-            "POST /{batch_id}/deliver",
-            "POST /{batch_id}/complete",
-            "POST /{batch_id}/start-repair",
-            "POST /{batch_id}/place-on-shelf",
-            "POST /{batch_id}/release-from-programming",
-            "POST /{batch_id}/send-to-outsource",
-            "POST /{batch_id}/receive-from-outsource",
-            "POST /{batch_id}/receive-from-outsource-to-inspection",
-            "POST /{batch_id}/complete-repair",
-            "POST /{batch_id}/repair-dispatch",
-            "POST /{batch_id}/split",
-            "POST /{batch_id}/cancel",
-            "POST /{batch_id}/pick-up",
-        ];
-        for r in REGISTERED {
-            assert!(
-                STRIP_REGISTRY.iter().any(|(route, _)| route == r),
-                "路由 `{r}` 未登记目标域（剥离登记表漏了）"
-            );
-        }
-        for (route, _) in STRIP_REGISTRY {
-            assert!(
-                REGISTERED.contains(route),
-                "登记表里的 `{route}` 在 router 里已不存在（端点被移走或改名？）"
-            );
-        }
+    fn routes_declared_in_router() {
+        let actual = routes_in_router_source();
         assert_eq!(
-            STRIP_REGISTRY.len(),
-            REGISTERED.len(),
-            "登记表条数与 router 路由数不一致"
+            actual.len(),
+            ROUTES.len(),
+            "`router()` 注册了 {} 条路由，ROUTES 只列了 {} 条（新增端点忘了登记？）\n\
+             router(): {:?}\nROUTES: {:?}",
+            actual.len(),
+            ROUTES.len(),
+            actual,
+            ROUTES,
         );
+        for (got, want) in actual.iter().zip(ROUTES.iter()) {
+            assert_eq!(
+                got,
+                want,
+                "`router()` 与 ROUTES 的第 {} 条不一致",
+                ROUTES.len()
+            );
+        }
+    }
+
+    /// 每条路由都必须有剥离目标域，且无重复。
+    #[test]
+    fn strip_targets_cover_every_route() {
+        assert_eq!(
+            ROUTES.len(),
+            STRIP_TARGETS.len(),
+            "ROUTES {} 条但 STRIP_TARGETS {} 条（少写目标域）",
+            ROUTES.len(),
+            STRIP_TARGETS.len(),
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        for (route, target) in ROUTES.iter().zip(STRIP_TARGETS.iter()) {
+            assert!(!target.is_empty(), "路由 `{route}` 的目标域是空串");
+            assert!(seen.insert(*route), "ROUTES 里 `{route}` 重复了");
+        }
     }
 }

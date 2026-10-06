@@ -79,7 +79,6 @@
 //! 5 条池 SQL 全部硬限定 `status='IN_PROCESS' AND location='PRODUCTION_SHELF'`
 //! —— 这是「出池必须置 NULL」这条不变式的兜底，也是为什么残留脏值不会污染候选池。
 
-
 /// 草稿卡片「最近批次」展示行（`t_part_batch JOIN t_part` 投影）。
 ///
 /// 2026-08-22 新增：配合 `ScanDeliveryNoteSummaryDto::recent_items` 返回。

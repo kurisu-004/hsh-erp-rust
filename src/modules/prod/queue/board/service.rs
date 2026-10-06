@@ -23,8 +23,8 @@ use crate::shared::error::AppError;
 
 use super::repo::{HeldBatchRow, PoolItemRow, ProcessMetaRow, QueueBoardRepo, WorkerRow};
 use crate::modules::prod::queue::vo::board::{
-    QueueBoardSnapshot, QueueHeldBatch, QueuePoolItem, QueueProcessBoard,
-    QueueProcessBoardDetail, QueueProcessMeta, QueueWorkerBrief,
+    QueueBoardSnapshot, QueueHeldBatch, QueuePoolItem, QueueProcessBoard, QueueProcessBoardDetail,
+    QueueProcessMeta, QueueWorkerBrief,
 };
 
 /// 队列板装配 service（unit struct；service 不持 repo / pool —— handler 借

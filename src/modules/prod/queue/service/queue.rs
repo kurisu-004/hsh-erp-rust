@@ -12,7 +12,7 @@
 //! 端点（`GET /queue/state` / `/queue/{process_id}` / `/queue/counts`）删除，
 //! 改由 [`crate::modules::prod::queue::board`] 的两个聚合端点承担：旧路径下
 //! 前端进程序列板要发 N+1 个请求（每工序一次详情 + 每工人一次 state），
-//! 新路径恒定 1 个请求。逐字段的删除清单见 `docs/api/production/queue.md` §5。
+//! 新路径恒定 1 个请求。逐字段的删除清单见 `docs/api/queue.md` §5。
 //!
 //! ## 2026-09-30 move 重构
 //! - 原 `admin_remove_held_batch`（WORKER→POOL 单边）+ `assign_batch_to_worker`（POOL→WORKER
@@ -57,9 +57,9 @@ use crate::modules::part::service::PartService;
 // 2026-10-04：`move_batch` WORKER→POOL 分支改为无条件校验目标货架
 // （存在 / 停用 / `zone='PRODUCTION'`），与 place_on_shelf / pickup / outsource 等
 // 生产流端点共用同一守卫，同源同码（20501 / 20512 / 20104）。
-use crate::shared::batch::guards::validate_shelf_zone;
-use crate::modules::prod::shelf_process::repo::ShelfProcessRepo;
 use crate::modules::prod::queue::repo::QueueRepoTrait;
+use crate::modules::prod::shelf_process::repo::ShelfProcessRepo;
+use crate::shared::batch::guards::validate_shelf_zone;
 use crate::shared::error::{AppError, code};
 
 use crate::modules::prod::queue::dto::{
@@ -375,12 +375,10 @@ impl QueueService {
                 )
             })?;
 
-        // 取 batch 当前所属工序（POOL→WORKER 与 WORKER→POOL 的 target 校验都需要）
-        //
-        // 2026-09-30 修复（migration 004）：原先是
-        // `batch.current_process_step_id → process_chain_step_get_process_id(step_id)`，
-        // 即**一次额外的 DB 往返**只为把 step_id 翻成 process_id。改直读
-        // `batch.current_process_id`（工序池归属的权威列），查询整段删掉。
+        // 取 batch 当前所属工序（POOL→WORKER 与 WORKER→POOL 的 target 校验都需要）。
+        // 直读 `batch.current_process_id`（migration 004 起的工序池归属权威列），
+        // 不经 `current_process_step_id → t_process_chain_step` 反查：那会多一次
+        // DB 往返，且 step 指针只在首次定位工序时写、多工序链工单上会停住。
         let step_process_id: Option<i64> = batch.current_process_id;
 
         // 取 worker 元数据（事件日志 badge_code；POOL→WORKER / WORKER→WORKER 需要源 worker）

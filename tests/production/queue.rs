@@ -76,7 +76,11 @@ use hsh_erp_test_support::{
 // ===========================================================================
 
 /// 插一个 `is_active=true` 的 `t_user` 行（bcrypt 哈希现场生成）。
-pub(crate) async fn insert_user_with_password(pool: &PgPool, username: &str, plain_password: &str) -> i64 {
+pub(crate) async fn insert_user_with_password(
+    pool: &PgPool,
+    username: &str,
+    plain_password: &str,
+) -> i64 {
     use hsh_erp_rust::auth::password;
     use hsh_erp_rust::infra::clock::now_naive;
 
@@ -282,7 +286,10 @@ pub(crate) async fn login_shelf_account(
 /// worker_pool 独享：每个测试常需要多次以不同 username 登入触发不同 OCC / 审计
 /// 场景（如 admin3 → admin3b 模拟并发 OCC）。`bootstrap_as_manager` 的 token
 /// 是 fx_part_manager 单 token，不支持多身份切换；保留为本地 helper。
-pub(crate) async fn login_manager_with_username(pool: &PgPool, username: &str) -> (axum::Router, String) {
+pub(crate) async fn login_manager_with_username(
+    pool: &PgPool,
+    username: &str,
+) -> (axum::Router, String) {
     let uid = insert_user_with_password(pool, username, "changeme").await;
     add_role(pool, uid, "MANAGER", None, None).await;
     let state = test_state(pool.clone()).await;
@@ -303,7 +310,12 @@ pub(crate) async fn login_manager_with_username(pool: &PgPool, username: &str) -
 //  worker-pool fixture helpers（worker_pool 独享，跨 binary 不迁移）
 // ===========================================================================
 
-pub(crate) async fn insert_work_type(pool: &PgPool, code: &str, name: &str, max_held: Option<i32>) -> i64 {
+pub(crate) async fn insert_work_type(
+    pool: &PgPool,
+    code: &str,
+    name: &str,
+    max_held: Option<i32>,
+) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
     let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
@@ -791,7 +803,12 @@ async fn worker_scan_returned_advances_current_process_id() {
     let (app, mgr) = login_manager_with_username(&pool, "admin_pool2b").await;
     let (sb, eb) = send(
         app.clone(),
-        json_request("GET", &format!("/prod/queue/processes/{proc_b}"), None, Some(&mgr)),
+        json_request(
+            "GET",
+            &format!("/prod/queue/processes/{proc_b}"),
+            None,
+            Some(&mgr),
+        ),
     )
     .await;
     assert_eq!(sb, StatusCode::OK, "GET pool/{proc_b}: {eb}");
@@ -807,7 +824,12 @@ async fn worker_scan_returned_advances_current_process_id() {
 
     let (sc, ec) = send(
         app,
-        json_request("GET", &format!("/prod/queue/processes/{proc_c}"), None, Some(&mgr)),
+        json_request(
+            "GET",
+            &format!("/prod/queue/processes/{proc_c}"),
+            None,
+            Some(&mgr),
+        ),
     )
     .await;
     assert_eq!(sc, StatusCode::OK, "GET pool/{proc_c}: {ec}");
@@ -1932,9 +1954,16 @@ async fn board_process_detail_no_candidates_when_no_batch() {
     // workers 仍返回（该工种有 1 个 active 工人），held_batches 为空
     let workers = data["workers"].as_array().expect("workers array");
     assert_eq!(workers.len(), 1, "workers 应 1 个: {env}");
-    assert_eq!(workers[0]["max_held"], 3, "max_held 直接挂 worker 上: {env}");
+    assert_eq!(
+        workers[0]["max_held"], 3,
+        "max_held 直接挂 worker 上: {env}"
+    );
     assert_eq!(workers[0]["current_held"], 0, "{env}");
-    assert_eq!(workers[0]["held_batches"].as_array().unwrap().len(), 0, "{env}");
+    assert_eq!(
+        workers[0]["held_batches"].as_array().unwrap().len(),
+        0,
+        "{env}"
+    );
     // work_types[] 数组已删（前端零消费，max_held 改由 workers[].max_held 表达）
     assert!(
         data.get("work_types").is_none(),

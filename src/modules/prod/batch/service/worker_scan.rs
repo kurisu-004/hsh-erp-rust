@@ -33,9 +33,9 @@ use crate::modules::part::statemachine::PartStatus;
 use crate::modules::prod::batch::dto::WorkerScanRequest;
 use crate::modules::prod::batch::vo::WorkerScanCoreOut;
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
+use crate::modules::prod::queue::dto::WorkerScanEvent;
 use crate::modules::prod::shelf_process::repo::ShelfProcessRepo;
 use crate::modules::prod::worker::repo::WorkerRepo;
-use crate::modules::prod::queue::dto::WorkerScanEvent;
 use crate::modules::shelf::repo::ShelfRepo;
 use crate::shared::error::{AppError, code};
 
@@ -188,8 +188,7 @@ impl BatchService {
                 // `Option`，下面的 else 分支（保留批次旧 step）对手写工单恒不可达。
                 // 回归见 `tests/production/queue.rs::worker_scan_returned_without_process_chain_succeeds`。
                 // 同款反模式（`Option<i64>` 包当前 `NOT NULL` 的列，列一旦变可空就同样
-                // 500）另见 `prod/shelf_process/repo.rs::find_first_shelf_for_process`
-                // 与 `prod/queue/repo/mod.rs::process_chain_step_get_process_id`。
+                // 500）另见 `prod/shelf_process/repo.rs::find_first_shelf_for_process`。
                 //
                 // ⚠️ 2026-09-30 起的**已知缺口**：下面算出的 `step_id_opt`
                 // 传给 `mark_batch_returned` 后**被丢弃** —— 该函数的

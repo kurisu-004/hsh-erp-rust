@@ -42,8 +42,12 @@ pub async fn board_snapshot(
 /// `GET /api/v2/prod/queue/processes/{process_id}`
 ///
 /// 取代原 `GET /prod/pool/{process_id}` + 逐 worker 的 `GET /prod/pool/state`。
-/// 角色：Manager + Clerk + Inspector（service 内守卫）。**固定 6 条 SQL**，
+/// 角色：Manager + Clerk + Inspector（service 内守卫）。**固定 4 条 SQL**，
 /// 与工人数无关（见 `board/repo.rs::board_process_detail` doc）。
+///
+/// ⚠️ `Path<i64>` 抽不出数字时走 axum 的 `PathRejection`，返 **HTTP 400 纯文本**，
+/// 不进 `R<T>` 信封（与本仓其它带 `Path<i64>` 的端点同款，是全仓行为而非本端点
+/// 的特例）。要拿到信封形态的错误码，path 段必须能解析成 i64。
 ///
 /// 工序不存在 / 已软删 → `20801 BIZ_PROCESS_NOT_FOUND`（HTTP 404）。
 pub async fn board_process_detail(

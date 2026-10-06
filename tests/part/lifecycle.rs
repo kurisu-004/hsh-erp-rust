@@ -318,19 +318,18 @@ async fn recall_to_pending_happy_path() {
     });
     let (s, env) = send(
         app,
-        json_request(
-            "POST",
-            "/prod/queue/recall",
-            Some(body),
-            Some(&token),
-        ),
+        json_request("POST", "/prod/queue/recall", Some(body), Some(&token)),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "recall: {env}");
     assert_eq!(env["code"], 0);
     // 2026-10-08 出参改本域 VO（原返 part 全量投影 PartOut）
     assert_eq!(env["data"]["batch_id"], bid.to_string(), "{env}");
-    assert_eq!(env["data"]["version"], version + 1, "version 应为写入后的值: {env}");
+    assert_eq!(
+        env["data"]["version"],
+        version + 1,
+        "version 应为写入后的值: {env}"
+    );
     let (status,): (String,) = sqlx::query_as("SELECT status FROM t_part_batch WHERE id = $1")
         .bind(bid)
         .fetch_one(&pool)

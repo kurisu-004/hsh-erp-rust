@@ -807,11 +807,7 @@ async fn dispatch_forbidden_for_inspector() {
 async fn list_pending_unauth_returns_401() {
     let (_pool, app, _token, _fx) = bootstrap_as_manager().await;
 
-    let (s, env) = send(
-        app,
-        json_request("GET", "/prod/queue/pending", None, None),
-    )
-    .await;
+    let (s, env) = send(app, json_request("GET", "/prod/queue/pending", None, None)).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED, "未登录应 401: {env}");
     assert_eq!(env["code"], 40100, "UNAUTHORIZED: {env}");
 }
@@ -929,7 +925,11 @@ async fn dispatch_part_without_process_chain_appears_in_pool() {
         ),
     )
     .await;
-    assert_eq!(ps, StatusCode::OK, "GET queue/processes/{process_a}: {pool_env}");
+    assert_eq!(
+        ps,
+        StatusCode::OK,
+        "GET queue/processes/{process_a}: {pool_env}"
+    );
     let items = pool_env["data"]["items"].as_array().expect("data.items");
     let batch_id_str = batch_id.to_string();
     assert!(
@@ -958,7 +958,9 @@ async fn dispatch_part_without_process_chain_appears_in_pool() {
                  与用户报告的症状一致）: {snap_env}"
             )
         });
-    let count: i64 = hit["pool_count"].as_i64().expect("pool_count 应为 JSON integer");
+    let count: i64 = hit["pool_count"]
+        .as_i64()
+        .expect("pool_count 应为 JSON integer");
     assert!(
         count >= 1,
         "process {process_a} 的候选批次数应 ≥ 1，实际 {count}: {snap_env}"

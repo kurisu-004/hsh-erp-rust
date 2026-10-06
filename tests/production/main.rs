@@ -31,7 +31,7 @@
 //!   13 场景；★ 核心回归是「扫子件 → 返回整棵装配件树（全部子件 + 全部批次）」）
 //!
 //! 2026-10-08：worker_pool → queue 更名 + 端点重组（详见 src/modules/prod/queue/mod.rs
-//! 与 docs/api/production/queue.md）。
+//! 与 docs/api/queue.md）。
 
 #![allow(dead_code, clippy::await_holding_lock, unused_imports)]
 
@@ -42,9 +42,9 @@ mod process;
 mod process_chain;
 mod process_design;
 mod queue;
+mod queue_auto_allocate;
 mod queue_board;
 mod queue_dispatch;
 mod shelf_process;
 mod work_type;
 mod worker;
-mod queue_auto_allocate;

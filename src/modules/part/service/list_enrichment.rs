@@ -24,8 +24,8 @@ use std::collections::{HashMap, HashSet};
 use sqlx::PgConnection;
 
 use crate::modules::part::repo::PartRepoTrait;
-use crate::shared::batch::TPartBatch;
 use crate::modules::prod::batch::repo::PartBatchRepo;
+use crate::shared::batch::TPartBatch;
 use crate::shared::error::AppError;
 
 /// 列表页「位置 / 持有人」派生（按 min-progress 活跃批次，跨 t_shelf /

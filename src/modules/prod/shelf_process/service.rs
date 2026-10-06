@@ -30,9 +30,9 @@ use sqlx::PgConnection;
 
 use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::shared::batch::guards::validate_shelf_zone;
 use crate::modules::prod::process::repo::ProcessRepo;
 use crate::modules::shelf::repo::ShelfRepo;
+use crate::shared::batch::guards::validate_shelf_zone;
 use crate::shared::error::{AppError, code};
 
 use super::dto::SetShelfProcessesItem;

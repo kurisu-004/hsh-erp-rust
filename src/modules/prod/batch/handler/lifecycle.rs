@@ -37,9 +37,8 @@ use crate::infra::ws_hub::WsEvent;
 use crate::modules::part::vo::PartOut;
 use crate::modules::prod::batch::dto::{
     CancelBatchRequest, CompleteRepairRequest, CompleteRequest, DeliverRequest, PickUpRequest,
-    PlaceOnShelfRequest, ReceiveFromOutsourceRequest,
-    ReceiveFromOutsourceToInspectionRequest, RepairDispatchRequest, SendToOutsourceRequest,
-    SplitBatchRequest, StartRepairRequest,
+    PlaceOnShelfRequest, ReceiveFromOutsourceRequest, ReceiveFromOutsourceToInspectionRequest,
+    RepairDispatchRequest, SendToOutsourceRequest, SplitBatchRequest, StartRepairRequest,
 };
 use crate::modules::prod::batch::service::BatchService;
 use crate::shared::error::AppError;

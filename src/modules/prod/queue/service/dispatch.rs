@@ -55,7 +55,6 @@ use crate::modules::prod::queue::vo::queue::{
 };
 
 impl QueueService {
-
     /// `GET /api/v2/prod/queue/pending` 业务逻辑。
     ///
     /// 角色守卫：Manager + Clerk + Inspector。

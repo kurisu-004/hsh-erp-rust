@@ -16,8 +16,8 @@ use crate::modules::part::model::{NewPartEvent, TPartInspected};
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
 use crate::modules::part::vo::PartOut;
-use crate::shared::batch::TPartBatch;
 use crate::modules::prod::batch::vo::ToXxxOut;
+use crate::shared::batch::TPartBatch;
 use crate::shared::error::{AppError, code};
 
 use super::BatchService;

@@ -15,9 +15,10 @@
 //! 7. `board_process_detail_held_batches_complete_for_ten_workers` ——
 //!    ★ **10 个工人的工序板**：一次请求返回 10 个 worker、每个 worker 的
 //!    `held_batches` 不漏不错、总持有数守恒
-//! 8. `board_process_detail_sql_count_is_independent_of_worker_count` ——
-//!    ★ **SQL 条数恒定**：2 工人与 10 工人两次请求的响应结构逐字段同形，且
-//!    held 批次总数守恒（断言方式与理由见该用例 doc）
+//! 8. `board_process_detail_response_shape_is_independent_of_worker_count` ——
+//!    ★ 工人数 10 → 3 变化时响应结构逐字段同形、held 计数守恒、`total` 不变
+//!    （⚠️ 它**不**测 SQL 条数；SQL 条数恒定由
+//!    `modules::prod::queue::board::sql_count_guard_tests` 这条 lib 单测守）
 //! 9. `legacy_pool_paths_return_404` —— 旧路径硬切守卫（`/prod/pool/counts`、
 //!    `/prod/pool/state`、`/prod/pool/{id}`、4 个 `/prod/batches/*` 旧下发路径、
 //!    `/prod/batches/{id}/recall-to-pending`）
@@ -35,7 +36,7 @@ use hsh_erp_test_support::{json_request, send, send_raw};
 
 use super::queue::{
     bootstrap_as_manager, count_held_by_worker, insert_customer_l2, insert_pool_part, insert_shelf,
-    insert_worker, insert_worker_held_part, insert_work_type, link_shelf_to_process,
+    insert_work_type, insert_worker, insert_worker_held_part, link_shelf_to_process,
     link_work_type_to_process, login_manager_with_username, login_shelf_account, seed_process,
 };
 
@@ -109,12 +110,10 @@ async fn board_snapshot_matches_legacy_pool_counts() {
     let ts = env["data"]["ts"].as_str().expect("ts 应为字符串");
     assert!(ts.ends_with("+08:00"), "ts 应带 +08:00 偏移，实际 {ts}");
 
-    let processes = env["data"]["processes"].as_array().expect("processes array");
-    assert_eq!(
-        processes.len(),
-        3,
-        "应 3 个 process（含候选批次的）: {env}"
-    );
+    let processes = env["data"]["processes"]
+        .as_array()
+        .expect("processes array");
+    assert_eq!(processes.len(), 3, "应 3 个 process（含候选批次的）: {env}");
     // 按 process_id ASC 稳定排序（SQL ORDER BY 保证）
     for (idx, (proc, code, count)) in [
         (proc_a, "PROC-SA", 1),
@@ -130,7 +129,10 @@ async fn board_snapshot_matches_legacy_pool_counts() {
             "processes[{idx}] 应按 id 升序: {env}"
         );
         assert_eq!(processes[idx]["process_code"], code, "{env}");
-        assert_eq!(processes[idx]["pool_count"], count, "{code} 应 {count} 件: {env}");
+        assert_eq!(
+            processes[idx]["pool_count"], count,
+            "{code} 应 {count} 件: {env}"
+        );
         assert_eq!(processes[idx]["category"], "INHOUSE", "{env}");
         // 与 DB 独立真值对齐（服务端谓词漂移会被这一条抓到）
         assert_eq!(
@@ -160,7 +162,9 @@ async fn board_snapshot_excludes_zero_count_processes() {
     )
     .await;
     assert_eq!(s, StatusCode::OK, "snapshot empty: {env}");
-    let processes = env["data"]["processes"].as_array().expect("processes array");
+    let processes = env["data"]["processes"]
+        .as_array()
+        .expect("processes array");
     assert_eq!(
         processes.len(),
         1,
@@ -195,7 +199,9 @@ async fn board_snapshot_aggregates_across_shelves() {
     )
     .await;
     assert_eq!(s, StatusCode::OK, "snapshot multi: {env}");
-    let processes = env["data"]["processes"].as_array().expect("processes array");
+    let processes = env["data"]["processes"]
+        .as_array()
+        .expect("processes array");
     assert_eq!(processes.len(), 1, "{env}");
     assert_eq!(processes[0]["process_id"], proc.to_string(), "{env}");
     assert_eq!(
@@ -220,12 +226,14 @@ async fn board_snapshot_pending_count_matches_pending_endpoint() {
     for sn in ["PEND-1", "PEND-2", "PEND-3"] {
         let (part, _batch) = insert_pool_part(&pool, customer, sn, prod, proc, 1).await;
         // insert_pool_part 建的是 IN_PROCESS+PRODUCTION_SHELF；改成 PENDING 才算待下发
-        sqlx::query("UPDATE t_part_batch SET status = 'PENDING', location = NULL, \
-                     current_holder_id = NULL, current_process_id = NULL WHERE part_id = $1")
-            .bind(part)
-            .execute(&pool)
-            .await
-            .expect("flip batch to PENDING");
+        sqlx::query(
+            "UPDATE t_part_batch SET status = 'PENDING', location = NULL, \
+                     current_holder_id = NULL, current_process_id = NULL WHERE part_id = $1",
+        )
+        .bind(part)
+        .execute(&pool)
+        .await
+        .expect("flip batch to PENDING");
     }
     // 1 个真正的候选池批次（IN_PROCESS + PRODUCTION_SHELF）
     insert_pool_part(&pool, customer, "PEND-POOL", prod, proc, 1).await;
@@ -411,23 +419,24 @@ async fn board_process_detail_held_batches_complete_for_ten_workers() {
     );
 }
 
-/// ★ **SQL 条数恒定**：2 工人与 10 工人两次请求的响应**结构**逐字段同形，
-/// 且 held 批次总数守恒。
+/// **响应结构与工人数无关**：工人数在 10 → 3 之间变化时，响应里
+/// `workers[]` 元素的字段集合逐字段同形、顶层 key 集合不变、held 批次总数
+/// 守恒、`items.total` 不变。
 ///
-/// ## 断言方式与理由
+/// ## 它测什么 / 不测什么
 ///
-/// 不能在集成测试里直接数 SQL 语句（sqlx 不暴露 statement 计数，PG 侧
-/// `pg_stat_statements` 又需要扩展 + 预热才有意义）。所以改成断言**可观测的
-/// 等价性质**：如果实现是「逐工人循环查」（N+1），那么
-///   (a) 响应里每个 worker 的字段集合会随 worker 个数而变（实现里常见的
-///       「第一个 worker 走一条路径、其余走另一条」的不一致），且
-///   (b) 批次总数在两种规模下不会都等于 DB 真值。
-/// 逐字段同形 + 总数守恒这两条合起来，能抓住「某条分支只在特定规模下多查 /
-/// 少查 / 漏查」的回归 —— 也就是 N+1 修复被局部改回去时的典型症状。
-/// SQL 条数本身的**书面**保证在 `board/repo.rs` 的方法 doc（固定 3 / 6 条），
-/// 那里是改动时必读的位置。
+/// **测**的是「VO 形状与分组逻辑不随工人数漂移」：字段集合同形（防「靠前的
+/// worker 走一条路径、后走的走另一条」）、held 计数守恒（防分组时漏组 / 重复计）、
+/// `total` 与工人数无关（防把持有数混进候选池数）。
+///
+/// **不测** SQL 条数。把 `ANY($1)` 改回 `for w in workers { query_held(w) }`
+/// 是**功能完全正确**的改法 —— 字段集合同形、总数守恒，本用例会 100% 全绿。
+/// 「SQL 条数恒定」这条不变量的护栏是
+/// `modules::prod::queue::board::sql_count_guard_tests`（`cargo test --lib`，
+/// 源码级：禁 `sqlx::query` 出现在循环体内 + 钉死两个方法的 `sqlx::query`
+/// 调用点数），见 `board/mod.rs`。
 #[tokio::test]
-async fn board_process_detail_sql_count_is_independent_of_worker_count() {
+async fn board_process_detail_response_shape_is_independent_of_worker_count() {
     let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let customer = insert_customer_l2(&pool, "QB-SHAPE").await;
     let proc = seed_process(&pool, "PROC-SHAPE", "同形工序").await;
@@ -467,7 +476,11 @@ async fn board_process_detail_sql_count_is_independent_of_worker_count() {
 
     let (app, token) = login_manager_with_username(&pool, "admin_shape").await;
     let uri = format!("/prod/queue/processes/{proc}");
-    let (s10, env10) = send(app.clone(), json_request("GET", &uri, None::<Value>, Some(&token))).await;
+    let (s10, env10) = send(
+        app.clone(),
+        json_request("GET", &uri, None::<Value>, Some(&token)),
+    )
+    .await;
     assert_eq!(s10, StatusCode::OK, "10 工人: {env10}");
     let w10 = env10["data"]["workers"].as_array().expect("workers array");
     assert_eq!(w10.len(), 10, "应有 10 个 worker: {env10}");
@@ -479,7 +492,10 @@ async fn board_process_detail_sql_count_is_independent_of_worker_count() {
         shape10, shape10_last,
         "不同位置的 worker 字段集合应同形: {env10}"
     );
-    let held10: usize = w10.iter().map(|w| w["held_batches"].as_array().unwrap().len()).sum();
+    let held10: usize = w10
+        .iter()
+        .map(|w| w["held_batches"].as_array().unwrap().len())
+        .sum();
     assert_eq!(held10, 10, "10 工人应共持 10 批: {env10}");
     assert_eq!(env10["data"]["total"], 2, "items 应 2 条: {env10}");
     // 顶层 key 集合（含 process / workers / items / total / ts）完整
@@ -490,10 +506,7 @@ async fn board_process_detail_sql_count_is_independent_of_worker_count() {
         .cloned()
         .collect();
     for k in ["process", "workers", "items", "total", "ts"] {
-        assert!(
-            top10.iter().any(|x| x == k),
-            "顶层缺字段 {k}: {env10}"
-        );
+        assert!(top10.iter().any(|x| x == k), "顶层缺字段 {k}: {env10}");
     }
 
     // 停用 8 个新增工人中的 7 个（is_active=false ⇒ 板里应只剩 3 个），规模再变一次
@@ -509,13 +522,16 @@ async fn board_process_detail_sql_count_is_independent_of_worker_count() {
     let w3 = env3["data"]["workers"].as_array().expect("workers array");
     assert_eq!(w3.len(), 3, "停用 7 个后应剩 3 个: {env3}");
     let shape3 = worker_shape(&w3[0]);
-    assert_eq!(shape3, shape10, "3 工人与 10 工人的 worker 字段集合应同形: {env3}");
-    let held3: usize = w3.iter().map(|w| w["held_batches"].as_array().unwrap().len()).sum();
-    assert_eq!(held3, 3, "3 工人应共持 3 批: {env3}");
     assert_eq!(
-        env3["data"]["total"], 2,
-        "items 口径与工人数无关: {env3}"
+        shape3, shape10,
+        "3 工人与 10 工人的 worker 字段集合应同形: {env3}"
     );
+    let held3: usize = w3
+        .iter()
+        .map(|w| w["held_batches"].as_array().unwrap().len())
+        .sum();
+    assert_eq!(held3, 3, "3 工人应共持 3 批: {env3}");
+    assert_eq!(env3["data"]["total"], 2, "items 口径与工人数无关: {env3}");
 }
 
 // ===========================================================================

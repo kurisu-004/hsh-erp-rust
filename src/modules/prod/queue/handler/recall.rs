@@ -34,14 +34,7 @@ pub async fn recall(
     Json(req): Json<RecallToPendingRequest>,
 ) -> Result<Json<R<RecallOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = QueueService::recall_to_pending(
-        &mut *tx,
-        &state.snowflake,
-        req.batch_id,
-        req,
-        &current,
-    )
-    .await?;
+    let out = QueueService::recall_to_pending(&mut *tx, &state.snowflake, req, &current).await?;
     tx.commit().await?;
     state.ws_hub.broadcast(WsEvent::DashboardEvent {
         kind: "PART_RECALLED".into(),

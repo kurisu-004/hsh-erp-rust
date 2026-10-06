@@ -9,8 +9,8 @@
 
 1. **重命名**：`worker_pool` → `queue`，URL `/pool` → `/queue`（**硬切，无 alias**，旧路径 404）。改名缘由：域职责从「工人候选池」扩到「工序队列」（候选池 + 工人持有 + 发放 / 召回 / 移动 / 自动分配），`pool` 只覆盖了第一块。
 2. **从 `prod::batch` 吸收 4 个端点**：`pending` / `dispatch` / `auto-dispatch`（下发流）+ `recall`（召回）。它们原先挂在 `/api/v2/prod/batches/*`，消费方是队列页而非批次详情页。旧路径 404。
-3. **新增 2 个只读聚合端点**（`/snapshot` 与 `/processes/{process_id}`），删掉 3 个旧读端点（`/state`、`/counts`、`/{process_id}`）—— 消掉两次 N+1（见 §4.1）。
-4. **VO 按前端实际消费收敛**（逐字段证据见 §5）。
+3. **新增 2 个只读聚合端点**（`/snapshot` 与 `/processes/{process_id}`），删掉 3 个旧读端点（`/state`、`/counts`、`/{process_id}`）—— 消掉两次 N+1（见 §4.4）。
+4. **VO 按前端实际消费收敛**（逐字段证据见 §6）。
 
 ## 1. 端点表
 
@@ -30,13 +30,15 @@
 - 端点 1 / 2 **不接受**任何 query 参数。端点 3 只接 `limit` / `offset`，传别的 query 参数不会报错但被忽略。
 - 端点 4 / 5 是**契约变更**：`POST /api/v2/prod/batches/{batch_id}/recall-to-pending` 改为 `POST /api/v2/prod/queue/recall`，`batch_id` 由 path 参数改为 **body 字段**，出参由 `PartOut`（工单全量投影）改为 `RecallOut`（3 字段）。⚠️ 旧路径 404，**无 alias**。
 - 端点 1 / 2 是**纯读**（`pool.acquire()` 不开事务、不发 WS 广播）；端点 3 / 5 同。端点 4 / 6 / 7 / 8 / 9 开事务，**广播在 commit 之后**。
-- 端点 2 工序不存在或已软删 → `20801 BIZ_PROCESS_NOT_FOUND`（**HTTP 404**）。
+- 端点 2 工序不存在或已软删 → `20801 BIZ_PROCESS_NOT_FOUND`（**HTTP 404**）。`{process_id}` 抽不出数字时走 axum 的 `PathRejection` → **HTTP 400 纯文本，不进 `R<T>` 信封**（全仓 `Path<i64>` 端点的统一行为，非本端点特例）。
 - 端点 1 / 2 / 3 被 SHELF_ACCOUNT 访问 → `40300`（角色守卫下沉在 service 第一行）。
 - i64 雪花主键一律序列化为 JSON **string**（`"1590000000000000001"`），防 JS `Number` 精度截断。
 
-### 1.1 路由注册顺序（axum matchit 硬约束，勿调换）
+### 1.1 路由注册顺序（当前无硬约束）
 
-1 段静态段（`/pending` `/dispatch` `/auto-dispatch` `/recall` `/snapshot` `/refill` `/move` `/auto-allocate`）必须**全部**先于任何动态段注册，否则 axum 把 `"snapshot"`、`"pending"` 之类的字面量当 `process_id` 解析。`/processes/{process_id}` 是 2 段，与 1 段组不冲突，恒可最后注册。见 `src/modules/prod/queue/mod.rs::router`。
+9 条路由里 8 条是 1 段静态、1 条是 2 段动态（`/processes/{process_id}`），**段数不同 ⇒ matchit 无同段位争用 ⇒ 注册顺序不影响匹配结果**。`src/modules/prod/queue/mod.rs::router` 里「1 段在前」只是书写习惯。
+
+> 若将来新增 1 段动态段（如 `/{batch_id}/…`），届时 1 段组与它同段位，「静态段必须先注册」才重新成为硬约束（对照 `src/modules/outsource/handler.rs::pool_router` 的现状）。
 
 ## 2. 逐字段
 
@@ -65,9 +67,9 @@
 
 | 字段 | 类型 | 后端 SQL 来源 |
 |---|---|---|
-| `process` | object | `SQL_PROCESS_META_ONE`（见 2.3） |
-| `workers[]` | array | `SQL_WORKERS_BY_PROCESS`（见 2.4） |
-| `items[]` | array | `SQL_POOL_ITEMS_BY_PROCESS`（见 2.6） |
+| `process` | object | `SQL_PROCESS_META_ONE` |
+| `workers[]` | array | `SQL_WORKERS_BY_PROCESS`（字段见 `QueueWorkerBrief`） |
+| `items[]` | array | `SQL_POOL_ITEMS_BY_PROCESS`（字段见 `QueuePoolItem`） |
 | `total` | number | `items.len()`（不分页，与 `items` 恒等） |
 | `ts` | string | `infra::clock::now_shanghai_iso()` |
 
@@ -84,7 +86,7 @@
 | `max_held` | number | `t_work_type.max_held_batches`，NULL 时按 **0** 处理 |
 | `current_held` | number | 持有批次行数（`held_batches.len()`） |
 | `capacity_remaining` | number | **service 层算** `max(0, max_held - current_held)` |
-| `held_batches[]` | array | `SQL_HELD_BATCHES_BY_WORKERS`（见 2.5） |
+| `held_batches[]` | array | `SQL_HELD_BATCHES_BY_WORKERS`（字段见 `QueueHeldBatch`） |
 
 闸门：`w.is_active = TRUE` + `w.deleted_at IS NULL` + `wtp.deleted_at IS NULL` + `wt.deleted_at IS NULL`。`work_type_id IS NULL` 的工人被 INNER JOIN 工种表时自然排除（没有工种就没有 `max_held`，无法参与容量计算）。
 
@@ -109,7 +111,7 @@
 | `note` | string \| null | `t_part.note` |
 | `version` | number | `t_part_batch.version`（**OCC 锚**，下次写操作必须带） |
 
-⚠️ **不含 `shelf_code`**（旧 VO 有）：持有态 `current_holder_id = worker_id`，`t_shelf` JOIN 恒不命中，该字段永远是 `null`。见 §5。
+⚠️ **不含 `shelf_code`**（旧 VO 有）：持有态 `current_holder_id = worker_id`，`t_shelf` JOIN 恒不命中，该字段永远是 `null`。见 §6。
 
 ### 2.5 `QueuePoolItem`（`items[]` 元素）
 
@@ -125,44 +127,44 @@
 | `shelf_id` | string | `t_part_batch.current_holder_id` |
 | `shelf_code` / `shelf_name` | string | `t_shelf.code` / `.name`（INNER JOIN，未命中则该批不进候选池） |
 | `is_urgent` | boolean | `t_part.is_urgent` |
-| `has_cnc_program` | boolean | 同 2.4 的 EXISTS |
+| `has_cnc_program` | boolean | 同 `QueueHeldBatch` 的 EXISTS |
 | `note` | string \| null | `t_part.note` |
 | `version` | number | `t_part_batch.version`（OCC 锚） |
 
 `shelf_id` 是 `POST /queue/move` 的 `from.shelf_id` **唯一数据源**：候选池跨货架，不能用用户当前激活货架凑（激活货架对 MANAGER / CLERK / INSPECTOR 恒为空）。
 
-⚠️ **不含 `customer_path` 与 `location`**：前者前端自己拼 L1 / L2；后者恒为 `"PRODUCTION_SHELF"`，前端用 `shelf_code` 表达位置。见 §5。
+⚠️ **不含 `customer_path` 与 `location`**：前者前端自己拼 L1 / L2；后者恒为 `"PRODUCTION_SHELF"`，前端用 `shelf_code` 表达位置。见 §6。
 
-### 2.6 下发流 VO（端点 3 / 4 / 5 / 6）
+## 3. 下发流 VO（端点 3 / 4 / 5 / 6）
 
 - `PendingBatchListOut`：`{ items: PendingBatchItem[], total, limit, offset }`。
 - `DispatchResult`：`{ succeeded: DispatchSuccessItem[], failed: DispatchFailureItem[] }`。`failed` **当前总为空**（保留为 partial commit 启用预留）；任一 target 失败 → service 抛错 → handler tx Drop 全回滚。
 - `AutoDispatchResult`：`{ items: AutoDispatchItem[] }`。`skip_reason` ∈ `NOT_FOUND` / `NO_PROCESS_CHAIN` / `NO_PROCESS_STEP` / `NO_SHELF` / `null`（可下发）。
 - `RecallOut`：**3 字段** `{ batch_id: string, part_id: string, version: number }`。`version` 是写入后的 `version + 1`（OCC 锚），前端下一次对本批次的操作必须带这个值。
 
-## 3. 口径表
+## 4. 口径表
 
-### 3.1 候选池判据（全仓唯一，3 处共用）
+### 4.1 候选池判据（`status` / `location` 两列在 3 处一致，**货架 JOIN 不一致**）
 
 ```
 status = 'IN_PROCESS' AND location = 'PRODUCTION_SHELF'
 ```
 
-这是「一个批次属于某道工序的候选池」的**唯一**判据，被 3 处共用：
+`status` / `location` 这两列是「一个批次在某道工序的候选池里」的判据，被 3 处共用：
 
-| 用途 | SQL 位置 |
-|---|---|
-| 序列板各工序计数（端点 1） | `board/repo.rs::SQL_POOL_COUNT_BY_PROCESS` |
-| 单工序候选池明细（端点 2 `items[]`） | `board/repo.rs::SQL_POOL_ITEMS_BY_PROCESS` |
-| 抢占（`take_one_from_pool` / `take_specific_from_pool`，端点 7 / 8） | `repo/sql.rs` |
+| 用途 | SQL 位置 | `current_process_id` 闸门 | `t_shelf` JOIN |
+|---|---|---|---|
+| 序列板各工序计数（端点 1） | `board/repo.rs::SQL_POOL_COUNT_BY_PROCESS` | `IS NOT NULL` | **无** |
+| 单工序候选池明细（端点 2 `items[]`） | `board/repo.rs::SQL_POOL_ITEMS_BY_PROCESS` | `= $1` | **INNER**（`s.id = pb.current_holder_id AND s.deleted_at IS NULL`） |
+| 抢占（`take_one_from_pool` / `take_specific_from_pool`） | `repo/sql.rs` | `= ANY($1)` | **无** |
 
-加上 `current_process_id IS NOT NULL`（丢弃「池归属为空」的批次 —— 它们不属任何工序，`GROUP BY` 会产出一个 NULL 组而解码进 `i64` 直接报错）。
+`current_process_id` 闸门是必需的：端点 1 靠它丢弃「池归属为空」的批次（否则 `GROUP BY` 会产出一个 NULL 组而解码进 `i64` 直接报错），端点 2 / 抢占是拿它当等值 / 数组匹配条件。⚠️ 这条谓词是「出池必须置 `current_process_id` NULL」这条不变式的**兜底**：写点万一漏清，脏值也命中不了池查询。
 
-⚠️ 这条谓词是「出池必须置 `current_process_id` NULL」这条不变式的**兜底**：写点万一漏清，脏值也命中不了池查询。
+⚠️ **端点 2 额外带了 `t_shelf` INNER JOIN，端点 1 没有** —— 后果见 §8.4 已知偏差登记。改这两条 SQL 时不要顺手动对方的 JOIN。
 
-**与前端是人工同步关系，无编译期保障**。改后端这 3 处时必须同步前端筛选逻辑；改前端时必须同步这 3 处。集成测试 `board_snapshot_matches_legacy_pool_counts` 钉住后端口径（跨货架聚合、零候选工序不出现、total 为求和），前端侧无对应断言。
+**与前端是人工同步关系，无编译期保障**。改后端这 3 处时必须同步前端筛选逻辑；改前端时必须同步这 3 处。集成测试 `board_snapshot_matches_legacy_pool_counts` 钉住端点 1 的后端口径（跨货架聚合、零候选工序不出现、total 为求和），前端侧无对应断言。
 
-### 3.2 待下发判据（2 处共用）
+### 4.2 待下发判据（2 处共用）
 
 ```
 pb.status IN ('PENDING', 'PROGRAMMING') AND pb.deleted_at IS NULL AND p.deleted_at IS NULL
@@ -181,7 +183,7 @@ pb.status IN ('PENDING', 'PROGRAMMING') AND pb.deleted_at IS NULL AND p.deleted_
 
 漏改任一处的症状：列得出但下发不了（40901），或 `total` 与 `items` 口径不一致。
 
-### 3.3 工人持有判据
+### 4.3 工人持有判据
 
 ```
 status = 'IN_PROCESS' AND location = 'WORKER' AND current_holder_id = ANY($worker_ids)
@@ -189,9 +191,8 @@ status = 'IN_PROCESS' AND location = 'WORKER' AND current_holder_id = ANY($worke
 
 `location = 'WORKER'` 是「在手加工」的语义边界（批次已从货架 / 品检区出池、压在工人手上）。工位容量按这两列实时 COUNT，召回时把两列一起清 NULL 即完成回收，无需额外动作。
 
-## 4. N+1 的消除
 
-### 4.1 旧路径 vs 新路径
+### 4.4 N+1 的消除：旧路径 vs 新路径
 
 | 场景 | 旧 | 新 |
 |---|---|---|
@@ -200,26 +201,34 @@ status = 'IN_PROCESS' AND location = 'WORKER' AND current_holder_id = ANY($worke
 
 M = 10 时：12 个 HTTP 请求 → 1 个。
 
-### 4.2 SQL 条数固定（与工人数 / 批次数无关）
+### 4.5 SQL 条数固定（与工人数 / 批次数无关）
 
 | 方法 | SQL 条数 | 组成 |
 |---|---:|---|
 | `board_snapshot` | **3** | 工序计数 / 工序元数据（`id = ANY($1)`）/ 待下发计数 |
-| `board_process_detail` | **6** | 工序元数据（单行）/ 工人+工种 `max_held`（一条 JOIN 带出）/ **全部工人持有批次一条 `current_holder_id = ANY($1)`** / 候选池 / 待下发计数 |
+| `board_process_detail` | **4** | 工序元数据（单行）/ 工人+工种 `max_held`（一条 JOIN 带出）/ **全部工人持有批次一条 `current_holder_id = ANY($1)`** / 候选池 |
 
-第 3 条是消灭 N+1 的关键：`ANY($1::bigint[])`（不是 `= $1`），10 个工人与 2 个工人发的是**同一条 SQL**，只是数组长度不同。集成测试 `board_process_detail_held_batches_complete_for_ten_workers` 钉住「10 个工人一次返回 10 个 worker 且 held 批次不漏不错」。
+`board_process_detail` 的第 3 条是消灭 N+1 的关键：`ANY($1::bigint[])`（不是 `= $1`），10 个工人与 2 个工人发的是**同一条 SQL**，只是数组长度不同。集成测试 `board_process_detail_held_batches_complete_for_ten_workers` 钉住「10 个工人一次返回 10 个 worker 且 held 批次不漏不错」。
 
-`board_process_detail` 的 SQL 里**没有**「工种 `max_held` 单独一条 `id = ANY`」—— 工人查询本身已 JOIN `t_work_type`，拆出去等于同一份数据取两次。
+`board_process_detail` 的 SQL 里**没有**「工种 `max_held` 单独一条 `id = ANY`」—— 工人查询本身已 JOIN `t_work_type`，拆出去等于同一份数据取两次；也**没有**「待下发计数」—— `QueueProcessBoardDetail` 无该字段（`pending_count` 是工序无关的全局量，由端点 1 提供）。
 
-### 4.3 实现约定
+**恒定性由 `cargo test --lib` 的 `modules::prod::queue::board::sql_count_guard_tests` 强制**（源码级护栏，与 `shared::batch::status::write_guard_tests` 同款）：`no_sqlx_query_inside_loop_body` 禁止 `sqlx::query` 出现在 `board/` 任何 `for` / `while` / `loop` 循环体内，`aggregate_query_counts_are_pinned` 钉死上表两个数字。集成测试数不了 SQL 条数（sqlx 0.9 不再为 `sqlx::query` 发 tracing 事件，PG 侧 `pg_stat_statements` 要预热 + 扩展才有意义），故走源码级。
+
+### 4.6 实现约定
 
 - 走运行时 `sqlx::query` + `Row::get`，**不用 `query!` 宏**（照 dashboard 域：复杂聚合 SQL 字段多、迭代频繁，不进 `.sqlx/` 离线缓存）。
 - SQL 写成模块级 `const SQL_*` 字面量，**不做字符串拼接**（拼列名会开注入面）。
 - 时间口径从 service 层绑进 SQL，**不写 `CURRENT_DATE`**（DB 会话时区与本仓统一的 Asia/Shanghai 是两个时钟，测试容器会话时区正是 UTC；不一致时会静默丢行）。本域 2 个聚合方法当前都无日期窗口，一旦加窗口必须走形参。
 
-## 5. 移除记录（2026-10-08）
+## 5. 状态域约定（无编译期保障）
 
-### 5.1 端点
+- 待下发源状态白名单 `IN ('PENDING', 'PROGRAMMING')`：6 处共用（见 §4.2），**无编译期约束**，漏改任一处症状是「列得出但下发不了」或 `total` 与 `items` 对不上。
+- 候选池判据 `status='IN_PROCESS' AND location='PRODUCTION_SHELF'`：3 处共用（见 §4.1），与前端是人工同步关系。
+- `t_part_batch.status` 的**写**入口是全仓唯一的 `shared::batch::status::apply_batch_status_change`，由 `cargo test --lib` 的 `shared::batch::status::write_guard_tests::no_outside_file_writes_batch_status` 强制（扫全 `src/**/*.rs`）。本域的 `move` / `recall` / `dispatch` / `refill` 全部走该入口的薄包装。
+
+## 6. 移除记录（2026-10-08）
+
+### 6.1 端点
 
 | 被移除项 | 原因 |
 |---|---|
@@ -227,11 +236,11 @@ M = 10 时：12 个 HTTP 请求 → 1 个。
 | `GET /api/v2/prod/pool/counts` | 被端点 1 覆盖（后者多工序元数据 + `pending_count`），且不需第 2 个 HTTP 拿待下发数 |
 | `GET /api/v2/prod/pool/{process_id}` | 被端点 2 覆盖（后者多工人维度 + 持有批次） |
 | `GET /api/v2/prod/batches/pending` | 迁到 `/api/v2/prod/queue/pending`（消费方是队列页） |
-| `GET /api/v2/prod/batches/dispatch`（实为 POST） | 迁到 `/api/v2/prod/queue/dispatch` |
-| `GET /api/v2/prod/batches/auto-dispatch`（实为 POST） | 迁到 `/api/v2/prod/queue/auto-dispatch` |
+| `POST /api/v2/prod/batches/dispatch` | 迁到 `/api/v2/prod/queue/dispatch` |
+| `POST /api/v2/prod/batches/auto-dispatch` | 迁到 `/api/v2/prod/queue/auto-dispatch` |
 | `POST /api/v2/prod/batches/{batch_id}/recall-to-pending` | 迁到 `/api/v2/prod/queue/recall`，`batch_id` 改入 body，出参改 `RecallOut` |
 
-### 5.2 字段
+### 6.2 字段
 
 | 被移除字段 | 原因（前端零消费，grep 证据） |
 |---|---|
@@ -244,7 +253,7 @@ M = 10 时：12 个 HTTP 请求 → 1 个。
 | `QueuePoolItem.location`（原始 enum） | 恒为 `"PRODUCTION_SHELF"`；前端用 `shelf_code` 表达位置 |
 | `RecallOut` 的 `part`（原 `PartOut` 全量投影） | 召回的语义锚点是**批次**，返工单投影让前端为拿 `part_id` 解析上百字段对象，且批次自己的 `version` 根本不在里面 |
 
-### 5.3 文件
+### 6.3 文件
 
 | 被移除文件 | 原因 |
 |---|---|
@@ -252,12 +261,6 @@ M = 10 时：12 个 HTTP 请求 → 1 个。
 | `QueueDispatchRepo::first_step_of_chain` | 零调用（被 `preview_auto_dispatch` 的 `LEFT JOIN LATERAL` 取代） |
 | `QueueDispatchRepo::part_get_process_chain_id` | 零调用（同上） |
 | `QueueRepoTrait` 4 个只读 helper | 只服务已删的 3 个读端点，等价能力在 `board/repo.rs` 的聚合 SQL 里 |
-
-## 6. 状态域约定（无编译期保障）
-
-- 待下发源状态白名单 `IN ('PENDING', 'PROGRAMMING')`：6 处共用（见 §3.2），**无编译期约束**，漏改任一处症状是「列得出但下发不了」或 `total` 与 `items` 对不上。
-- 候选池判据 `status='IN_PROCESS' AND location='PRODUCTION_SHELF'`：3 处共用（见 §3.1），与前端是人工同步关系。
-- `t_part_batch.status` 的**写**入口是全仓唯一的 `shared::batch::status::apply_batch_status_change`，由 `cargo test --lib` 的 `shared::batch::status::write_guard_tests::no_outside_file_writes_batch_status` 强制（扫全 `src/**/*.rs`）。本域的 `move` / `recall` / `dispatch` / `refill` 全部走该入口的薄包装。
 
 ## 7. 与 WS 的关系
 
@@ -302,7 +305,7 @@ queue 域**整体不适用**域隔离护栏：它继承 worker_pool 的「经本
 ### 8.3 前端配套改动清单
 
 1. **URL 全量替换**：`/api/v2/prod/pool/*` → `/api/v2/prod/queue/*`；`/api/v2/prod/batches/pending|dispatch|auto-dispatch` 与 `/api/v2/prod/batches/{id}/recall-to-pending` → `/api/v2/prod/queue/pending|dispatch|auto-dispatch|recall`。**无 alias**，旧路径 404。
-2. **`POST /queue/recall` 入参形态变更**：`batch_id` 从 path 参数移到 body（字符串形态，`deserialize_i64` 兼容数字与字符串）。原调用方传 `{ version, note }` + path 的要改成 `{ batch_id, version, note }`。
+2. **`POST /queue/recall` 入参形态变更**：`batch_id` 从 path 参数移到 body，且**必须是 JSON 字符串**（`"1590000000000000001"`）。它走 `shared::types::deserialize_i64`，该函数体是 `String::deserialize` → **只接受字符串**；发 JSON number 会被 axum 的 `JsonRejection`（`JsonDataError`）拒掉 → **HTTP 422 纯文本，不进 `R<T>` 信封**（故响应里没有 `code` 字段，勿按 `40001` 分支解析）。原调用方传 `{ version, note }` + path 的要改成 `{ batch_id, version, note }`。
 3. **`POST /queue/recall` 出参变更**：`data` 由 `PartOut` 换成 `RecallOut`（3 字段）。读 `out.id` 拿 part_id 的改成 `out.part_id`；OCC 版本号改读 `out.version`（原 `PartOut` 里根本没有批次的 `version`）。
 4. **新增 2 个端点的 composable**：`GET /snapshot`（序列板 + 待下发 tab 徽标）、`GET /processes/{id}`（单工序板）。原 `useWorkerPoolByProcessQuery` + `useWorkerStateByWorkerQuery`（每 worker 一次）应合并为**一次**请求；`useWorkerPoolCountsQuery` 迁到 snapshot。
 5. **删 3 个 composable**：`useWorkerStateByWorkerQuery`（`/state`）、`useWorkerPoolCountsQuery`（`/counts`）、`useWorkerPoolByProcessQuery` 的旧形态（`/pool/{id}`）—— 后者改指 `/processes/{id}`。
@@ -310,3 +313,13 @@ queue 域**整体不适用**域隔离护栏：它继承 worker_pool 的「经本
 7. **i64 字符串化**：所有雪花 id 仍是 JSON string，本仓不因本次改动变更该约定。
 8. **`max_held` 取值位置变更**：原从 `work_types[].max_held_batches` 按工种查，改从 `workers[].max_held` 按工人直接读。`max_held_batches` 未设置时后端返 0（不是 null）—— 展示「未设置上限」占位的逻辑需自行按 0 判断。
 9. **代码里残留的 `WORKER_POOL_*` WS 事件名不变**（`kind` 是 WS 协议的一部分，改它要同步 dashboard 域的白名单与前端 `AFFECTS_DASHBOARD`）。本域改的只是 URL 与类型名。
+
+### 8.4 已知偏差登记
+
+**端点 1 的 `pool_count` 可能大于端点 2 的 `items.length`（差值 = 指向已软删货架的批次数）。**
+
+成因：端点 1 的计数 SQL（`SQL_POOL_COUNT_BY_PROCESS`）不带 `t_shelf` JOIN；端点 2 的明细 SQL（`SQL_POOL_ITEMS_BY_PROCESS`）带 **INNER JOIN `t_shelf s ON s.id = pb.current_holder_id AND s.deleted_at IS NULL`**。`current_holder_id` 是「货架还是工人」同列承载的复用列，理论上可残留一个已被软删的货架 id —— 这样的批次命中计数（它确实是 `IN_PROCESS` + `PRODUCTION_SHELF`）却不命中明细（拿不到货架行）。
+
+现有测试抓不到这个跨端点分歧：`board_snapshot_matches_legacy_pool_counts` 的两个断言都不带货架 JOIN（它对照的是被取代的旧 `pool_counts_all_shelves` 口径，两者都不 JOIN `t_shelf`）。
+
+产品决议（2026-10-08）：**暂不处理**。已软删货架上的批次本就是需要人工清理的脏数据，让它在明细里消失反而符合「不该被认领」的直觉；口径差留给将来做货架软删清理时一并收敛（届时把明细的 INNER JOIN 改成 LEFT JOIN + 占位，或给计数 SQL 补同一套货架闸门）。改这两条 SQL 时请先回到本节确认决议是否仍然有效。
