@@ -8,7 +8,7 @@
 //!   入单（唯一入口）
 //!
 //! ## ⚠️ 路由注册顺序是**硬约束**（matchit 要求静态段优先）
-//! `note_router()` 里 2 段静态路径（`/batch-detail`、`/scan`）与 1 段静态前缀
+//! `note_router()` 里 3 段静态路径（`/batch-detail`、`/scan`、`/`）与 1 段静态前缀
 //! （`/scan/{serial_no}`）**必须先于** `/{id}` 注册，否则 axum 会在 nest 构建期直接
 //! panic（不是运行期 404）。新增 1 段静态端点时照本段顺序插入，且同步
 //! [`ROUTES`]。

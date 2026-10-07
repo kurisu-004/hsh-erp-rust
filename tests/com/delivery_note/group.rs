@@ -50,8 +50,7 @@ use hsh_erp_rust::infra::clock::now_naive;
 ///
 /// 这也顺带解掉了**跨文件**碰撞：同一 binary（`tests/com/main.rs`）里本文件与
 /// `note.rs` / `group.rs` / `union_list.rs` 曾经各自 `new(..., 1)`，首个 id 相同。
-/// `union_list.rs` 仍自持 `instance = 1` 的生成器，而本 helper 的 instance 是
-/// pid ⊕ 纳秒派生的，两边不会撞。
+/// 2026-10-08 起 `union_list.rs` 也改走了 `pool_snowflake()`，与本 helper 同一路径。
 fn next_id() -> i64 {
     pool_snowflake().lock().expect("pool_snowflake").next_id()
 }

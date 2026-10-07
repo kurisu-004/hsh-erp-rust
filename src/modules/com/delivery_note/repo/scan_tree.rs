@@ -6,7 +6,7 @@
 //!
 //! ## 单次请求的 SQL 条数
 //! 一次扫码按分支取 2~7 条 SQL，**无 N+1**（批次层一条 `part_id = ANY($1)`）。
-//! 表里的条数由 `com::delivery_note::sql_count_guard_tests` 逐条钉住（改动本表的
+//! 表里的条数由 `com::delivery_note::sql_count_guard` 里的登记表逐条钉住（改动本表的
 //! 数字必须同步改那里，否则单测立刻红）：
 //!
 //! | 扫到的东西 | 依次执行的 SQL | 条数 |
@@ -24,8 +24,15 @@
 //! 分支差异只发生在命中段：1 条（独立件）/ 3 条（父活跃）/ 2 条（父软删）/ 3 条
 //! （装配件码，含那次未命中探测）。
 //!
-//! 边界：`resolve_draft` 在「装配件无活跃子件」（`parts` 为空）时会提前返 `None`
-//! ⇒ 该分支下少 2 条（`l1_of` + `note_find_open_draft_by_l1`），不在上表口径内。
+//! 边界：「装配件父活跃、但它一个未删子件都没有」时 `parts` 为空 ⇒ 尾巴里那两条批次
+//! 查询被 repo 的空 `part_ids` 短路（见本文件 `list_batches_by_part_ids` /
+//! `list_entryable_batches_by_part_ids` 的 `part_ids.is_empty()` 提前返）各少 1 条，
+//! 即 4 − 2 = 2 条，不在上表口径内。
+//!
+//! ⚠️ 此时 `resolve_draft` **仍会**发完 `l1_of` + `note_find_open_draft_by_l1` ——
+//! `hit.assembly` 是 `Some`，走 `Some(a) => a.customer_id` 分支；它那个
+//! 「`parts.first()` 取不到就提前返 `None`」的分支不可达（`HitTree` 的四个构造点
+//! 里两个 `assembly: None` 都同时把 `parts` 设成非空的 `vec![p]`）。
 //!
 //! ## 同一 `serial_no` 可能并存多行：取哪一行是写死的口径
 //! `t_part` 的 `uk_t_part_serial_no` 是**部分**唯一索引（`WHERE serial_no IS NOT

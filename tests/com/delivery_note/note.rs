@@ -1,22 +1,24 @@
 //! delivery_note 端到端集成测试
 //!
-//! Phase P2 覆盖（Python `tests/test_delivery_note.py` 移植 + 设计 §3.4 范围校验）：
-//!  1. counter_acquires_sequential_numbers（spec 1）
-//!  2. create_draft_for_l1_succeeds + create_for_l2_returns_400_21407
-//!  3. list_with_filters (status + pagination)
-//!  4. get_with_parts with line_items (assembly fields populated)
-//!  5. add_parts: same L1 ok; different L1 → 21407; on other active note
-//!     → 21406; not INSPECTION/READY_TO_SHIP → 21405; partial quantity
-//!     splits batch; scope mismatch → 21416 (group-scoped note + L2
-//!     outside the group)
-//!  6. remove_parts: DRAFT ok; SUBMITTED → 21412
-//!  7. submit: DRAFT ok; recall → DRAFT ok; recall into existing draft
-//!     scope → 21419
-//!  8. pickup: non-driver worker → 21409; happy path → PICKED_UP;
-//!     ws_hub.broadcast observed
-//!  9. soft_delete: DRAFT ok; non-DRAFT → 21403
-//! 10. version conflict on any write → 40901
-//! 11. list_candidate_parts for L1 (200, contains fixtures); non-L1 → 400
+//! 覆盖（11 个用例，与本文件 `#[tokio::test]` 一一对应）：
+//!  1. `counter_acquires_sequential_numbers`：单号连号递增
+//!  2. `list_with_filters_status_and_pagination`：status 过滤 + 分页
+//!  3. `get_with_parts_with_assembly_fields`：详情行项带装配件字段
+//!  4. `soft_delete_draft_ok_non_draft_returns_400_21403`：DRAFT 可软删、非 DRAFT 报 21403
+//!  5. `version_conflict_on_write_returns_409_40901`：任意写端点的 version 冲突
+//!  6. `submit_with_illegal_batch_state_returns_21421`：批次状态非法时提交被拒
+//!  7. `batch_get_notes_returns_all_in_order_and_skips_missing`：批量详情按传入序返回、
+//!     跳过不存在的 id
+//!  8. `test_get_delivery_note_line_items_fields_are_populated`：行项逐字段
+//!  9. `get_with_parts_exposes_assembly_quantity_and_shippable_sets`：详情暴露
+//!     `assembly_quantity` 与 `shippable_sets`
+//! 10. `batch_detail_shippable_sets_use_all_children_not_only_note_rows`：批量详情的
+//!     套数以「全部子件」为定义域，不只看单上行
+//! 11. `line_items_carry_each_parts_own_leaf_customer_id`：行项带各自叶子件 customer_id
+//!
+//! 2026-10-08 起建单 / 扫码入单一律走 `POST /scan`（用例见 `scan.rs` /
+//! `entry_gate.rs` / `batch_allocation.rs`），指定司机与领取见 `driver.rs` ——
+//! 「scope mismatch」类闸门归 `entry_gate.rs`（实际码 **21407**，见该文件的闸门表）。
 //!
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
 //! 完全独立，无需 Mutex 串行化。
@@ -53,8 +55,7 @@ use hsh_erp_rust::infra::clock::now_naive;
 ///
 /// 这也顺带解掉了**跨文件**碰撞：同一 binary（`tests/com/main.rs`）里本文件与
 /// `note.rs` / `group.rs` / `union_list.rs` 曾经各自 `new(..., 1)`，首个 id 相同。
-/// `union_list.rs` 仍自持 `instance = 1` 的生成器，而本 helper 的 instance 是
-/// pid ⊕ 纳秒派生的，两边不会撞。
+/// 2026-10-08 起 `union_list.rs` 也改走了 `pool_snowflake()`，与本 helper 同一路径。
 fn next_id() -> i64 {
     pool_snowflake().lock().expect("pool_snowflake").next_id()
 }

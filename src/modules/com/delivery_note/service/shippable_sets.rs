@@ -5,9 +5,15 @@
 //! 不是「这个装配件历史上共出几套」）。分子另按 `READY_TO_SHIP` 过滤，理由见下方
 //! 「与全局已送口径的有意分叉」一节。
 //!
-//! 两个消费方共用本函数，避免同一公式在 service 各写一遍：
-//! - `service/inner.rs::get_with_parts` —— 详情 `line_items[].shippable_sets`
-//! - `service/crud.rs::get_many_with_parts` —— 批量详情同上
+//! 公式只有一个实现，经两个入口对外、共 4 个调用点，避免同一公式在 service 各写
+//! 一遍（分层口径同 `service/mod.rs` 模块 doc）：
+//! - **窄投影 `shippable_sets()`（公式本体）** —— 两个同域调用方各自已把数据摊成
+//!   `SetsBatchRow` / `SetsChild`：`service/scan_tree.rs` 的树节点 `entry_max_sets`、
+//!   `service/scan_entry.rs` 的 `entry_max_sets`（入单闸门）；
+//! - **宽类型适配壳 `note_shippable_sets()`** —— 两个调用方手上还是
+//!   `(TPartBatch, TPart)` / `Vec<TPart>` 宽行：`service/inner.rs::get_with_parts`
+//!   （详情 `line_items[].shippable_sets`）、`service/crud.rs::get_many_with_parts`
+//!   （批量详情同上）。
 //!
 //! ## 公式
 //!
@@ -29,8 +35,8 @@
 //!    无批次的子件以 `COALESCE(SUM,0)=0` 参与 `min`（其注释原话：「未交任何批次的
 //!    子件若贡献 NULL 会被 MIN 忽略，那样『子件 A 交一半、子件 B 一件没交』会误判
 //!    成 A 能撑的套数」）；
-//! 3. 本仓同公式的其它 SQL 版（`fetch_delivered_sets`）与打印链路都以「各子件」
-//!    为驱动单元，与本式一致。
+//! 3. 本仓同公式的 SQL 版 `part::service::list_enrichment::fetch_delivered_sets`
+//!    以「各子件」为驱动单元，与本式一致。
 //!
 //! 故入参必须有「该装配件的全部子件」`children_by_asm`，它由调用方从
 //! `PartRepo::list_children`（单单，N 次小查询）/ `PartRepo::list_children_by_assemblies`
@@ -69,8 +75,9 @@
 //! 这个口径上结果相同**，但与「可入单」定义同源，且对「挂单后被旁路改状态」的脏数据
 //! 不再虚高套数。
 //!
-//! 三个消费方（详情 VO `line_items[].shippable_sets`、批量详情同上、扫码三层树的
-//! `entry_max_sets`）都必须走本函数，否则同一装配件在详情页与扫码弹窗会给出两个套数。
+//! 两个口径的出参（详情 VO `line_items[].shippable_sets`、批量详情同上、扫码三层树
+//! 与扫码入单的 `entry_max_sets`）都必须走本公式，否则同一装配件在详情页与扫码弹窗
+//! 会给出两个套数。
 
 use std::collections::HashMap;
 

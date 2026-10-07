@@ -71,8 +71,8 @@
 
 ### 1.4 路由注册顺序（**硬约束**，已升为 `ROUTES` 断言）
 
-`matchit` 要求静态分支先于参数分支。`note_router()` 里 **2 段静态路径**
-（`/batch-detail`、`/scan`）与 **1 段静态前缀**（`/scan/{serial_no}`）**必须先于
+`matchit` 要求静态分支先于参数分支。`note_router()` 里 **3 段静态路径**
+（`/batch-detail`、`/scan`、`/`）与 **1 段静态前缀**（`/scan/{serial_no}`）**必须先于
 `/{id}` 注册**，否则 axum 在 nest 构建期直接 panic（不是运行期 404）。往任一
 `xxx_router()` 加一条 `.route(...)` 而忘了登记对应的 `ROUTES` / `GROUP_ROUTES` /
 `DRIVERS_ROUTES`，`routes_declared_in_router` 立刻红。

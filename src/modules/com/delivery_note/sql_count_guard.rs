@@ -58,8 +58,11 @@
 //! - 循环写在**宏**里 / `sqlx::query` 的调用点被 `include!` 拼进来（仓库内不存在）；
 //! - 条件编译（`#[cfg(feature = …)]`）的两条分支各有一条查询：单看代码仍是
 //!   「每个分支至多一条」，恒定性成立，故不算绕过口；
-//! - `resolve_draft` 的早退分支（`parts` 为空时少 2 条）：已在本模块的常量与
-//!   `repo/scan_tree.rs` 条数表里显式排除，不靠护栏兜。
+//! - 「装配件父活跃、但无未删子件」⇒ `parts` 为空 ⇒ 尾巴里那两条批次查询被 repo 的空
+//!   `part_ids` 短路（`repo/scan_tree.rs` 的 `part_ids.is_empty()` 提前返）⇒ 4 − 2 = 2 条；
+//!   `resolve_draft` 此时**照发** `l1_of` + `note_find_open_draft_by_l1`（`hit.assembly`
+//!   是 `Some`，走 `Some(a) => a.customer_id`），它的 `parts.first()` 提前返 `None` 分支
+//!   不可达。已在本模块的常量与 `repo/scan_tree.rs` 条数表里显式排除，不靠护栏兜。
 //!
 //! ## 探测器与 `prod::queue::board` 的分工
 //!
@@ -397,7 +400,7 @@ fn each_scan_tree_repo_method_issues_exactly_one_sql() {
              合并成一条（或拆成两个方法并同步条数登记表）时，请同步改：\
              (1) 本文件的该方法 doc、(2) `repo/scan_tree.rs` 模块 doc 的条数表、\
              (3) `docs/api/delivery_note.md` §3 的「SQL 条数」口径行、\
-             (4) `com::delivery_note::sql_count_guard_tests` 的 \
+             (4) `com::delivery_note::sql_count_guard` 的 \
              `SCAN_TREE_REPO_METHODS` 与 `SCAN_TREE_SQL_COUNTS`。",
             rel(&path),
             line_of(&code, lo),

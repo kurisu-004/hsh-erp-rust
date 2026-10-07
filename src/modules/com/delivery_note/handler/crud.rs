@@ -1,9 +1,9 @@
 //! delivery_note 域基础 CRUD handler
 //!
-//! 范围：list / get / update / remove-parts / soft-delete / batch-detail +
+//! 范围：list / get / update / remove-batches / soft-delete / batch-detail +
 //! 送货分组 CRUD。
 //!
-//! 2026-10-08 随入单入口收敛为扫码单一入口删除的 4 条：
+//! 2026-10-08 随入单入口收敛为扫码单一入口删除的 5 条：
 //! - `POST /`（手动建单）
 //! - `POST /{id}/add-parts`
 //! - `GET /candidate-parts`
