@@ -2,18 +2,20 @@
 //!
 //! 覆盖端点：
 //! - list_quotes       — 列表 + 过滤 + 分页
-//! - get_quote         — 详情
 //! - create_quote      — 创建 DRAFT（part/company/process 必填校验 + 重复检查）
-//! - update_quote      — 更新 DRAFT（OCC）
-//! - submit_quote      — DRAFT → SUBMITTED
+//! - submit_quote      — DRAFT → SUBMITTED（OCC）
 //! - approve_quote     — SUBMITTED → APPROVED（MANAGER-only；自动 reject 竞争报价）
 //! - reject_quote      — SUBMITTED → REJECTED（review_note 必填；MANAGER-only）
-//! - soft_delete_quote — 软删（DRAFT / REJECTED 状态才允许）
-//! - list_quotable_parts   — 2026-10-03 新增：报价 picker（还没下发的零件，
+//! - soft_delete_quote — 软删（DRAFT / REJECTED 状态才允许；OCC）
+//! - list_quotable_parts   — 报价 picker（还没下发的零件，
 //!   一零件一行；同日由「零件 × OUTSOURCE 工序」简化而来）。此前路由未注册，
 //!   被 `quote_router` 的 `/{id}`（`Path<i64>`）吞掉 → `PathRejection` → 恒 400。
 //!
-//! ## 事务边界（2026-09-22 refactor 对齐 iam 范本）
+//! 2026-10-09：`get_quote` / `update_quote` 两个函数随
+//! `GET /{id}` / `POST /{id}/update` 端点硬切下线而删除（前端零消费），相应的
+//! `OutsourceQuoteUpdateRequest` 与 repo 的 `quote_update` 随之删除。
+//!
+//! ## 事务边界（2026-09-22 refactor 对齐 iam 范式）
 //! 事务移交 handler：service 仅业务逻辑，所有跨 repo 操作经 `repo: R`
 //! （by-value；`R: OutsourceRepoTrait`）参数传入——handler/service 借 `&mut *tx` /
 //! `&mut *conn` 喂给 `OutsourceRepoTrait` trait（trait 已直接 `impl for &mut PgConnection`）。
@@ -26,12 +28,12 @@
 //! 承接原 `service.rs::mod tests` 中 quote 子域用到的 2 个 helper 测试：
 //! `parse_snowflake_id_valid` / `parse_snowflake_id_invalid`。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::modules::outsource::dto::{
     OutsourceQuotablePartListQuery, OutsourceQuoteCreateRequest, OutsourceQuoteListQuery,
-    OutsourceQuoteUpdateRequest,
+    OutsourceQuoteSoftDeleteRequest, OutsourceQuoteSubmitRequest,
 };
 use crate::modules::outsource::model::{
     NewOutsourceQuote, NewOutsourceQuoteEvent, TOutsourceQuote,
@@ -153,18 +155,18 @@ impl OutsourceService {
         let sort_by = query.sort_by.as_deref().unwrap_or("CREATED_AT");
         let sort_dir = query.sort_dir.as_deref().unwrap_or("DESC");
 
-        // keyword / customer_id → part_ids（2026-10-04：`customer_id` 不再被丢弃）
+        // `drawing_no` / `name` 直连 ILIKE（2026-10-09 取代 `keyword`）：归一化成
+        // `%kw%` 后 bind 进 SQL，**零中间查询、零截断风险**，因此也不需要「给了
+        // 关键词却零命中要早返回」的守卫 —— 零命中在 SQL 里自然就是零行。
+        let drawing_no_pat = keyword_pattern(query.drawing_no.as_deref());
+        let name_pat = keyword_pattern(query.name.as_deref());
+
+        // `customer_id` → part_id 集合（唯一还需要「展开成中间集合」的维度：
+        // 客户子树无法写成对 `t_outsource_quote` 的单表谓词）。
         //
-        // 两个过滤维度各自落成一个 part_id 集合，再求交集：
-        // - 两侧都缺省 → 空 Vec（下游 SQL 的 `cardinality = 0` 表示「不过滤」）
-        // - 只有 keyword → keyword 集；只有 customer → customer 子树集
-        // - 两侧都有 → 交集。`part_keyword_search` / `part_ids_by_customer` 各自
-        //   `LIMIT 10000`，单集合可达万级 ⇒ 必须 `HashSet` 求交，不能 O(n·m) 嵌套。
-        let kw = query
-            .keyword
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
+        // 2026-10-09：`keyword` 拆成直连 ILIKE 后，两个维度**不再在 service 求交**
+        // —— 各自落成 SQL 的一个 WHERE 段，由 DB 求交。旧的 HashSet 求交 + 零命中
+        // 早返回分支一并删除。
         let cid = if let Some(s) = query.customer_id.as_deref().filter(|s| !s.is_empty()) {
             Some(
                 s.parse::<i64>()
@@ -173,29 +175,18 @@ impl OutsourceService {
         } else {
             None
         };
-        let cid_given = cid.is_some();
-        let part_ids_in: Vec<i64> = match (kw, cid) {
-            (Some(k), Some(cid)) => {
-                let kw_part_ids = repo.part_keyword_search(k).await?;
-                let cust_set: HashSet<i64> =
-                    repo.part_ids_by_customer(cid).await?.into_iter().collect();
-                kw_part_ids
-                    .into_iter()
-                    .filter(|id| cust_set.contains(id))
-                    .collect()
-            }
-            (Some(k), None) => repo.part_keyword_search(k).await?,
-            (None, Some(cid)) => repo.part_ids_by_customer(cid).await?,
-            (None, None) => Vec::new(),
+        let part_ids_in: Vec<i64> = match cid {
+            Some(cid) => repo.part_ids_by_customer(cid).await?,
+            None => Vec::new(),
         };
-        // 2026-10-03 / 2026-10-04：过滤条件已给出却零命中时必须早返回。SQL 谓词
-        // `AND (cardinality($N::bigint[]) = 0 OR part_id = ANY($N))` 里，空数组
-        // 让 `cardinality = 0` 成立、整个过滤条件被短路掉；不在这兜住，
-        // 「不存在的关键词」与「一个零件都没有的客户」都会返回**全量**报价。
-        // 判定条件因此必须覆盖两个维度（`kw.is_some() || cid_given`），只判 keyword
-        // 会在「只给 customer_id 且零命中」时漏掉本守卫。SQL 谓词保持不变 ——
-        // 两个维度都缺省时 `cardinality = 0` 正是「不过滤」的正确表达。
-        if (kw.is_some() || cid_given) && part_ids_in.is_empty() {
+        // 客户子树零命中必须早返回：SQL 谓词
+        // `AND (cardinality($4::bigint[]) = 0 OR q.part_id = ANY($4))` 里，空数组让
+        // `cardinality = 0` 成立、整个客户条件被短路掉；不在这兜住，「选了一个零件
+        // 都没有的客户」会返回**全量**报价（list 与 count 同时错）。
+        // 「零件侧筛选」不需要对应守卫 —— 它们的谓词形如 `($6::text IS NULL OR …)`，
+        // NULL 时短路、给值时正常求值，零命中就是零行。
+        let cid_given = cid.is_some();
+        if cid_given && part_ids_in.is_empty() {
             return Ok(OutsourceQuoteListOut {
                 items: vec![],
                 total: 0,
@@ -223,13 +214,30 @@ impl OutsourceService {
         } else {
             None
         };
+        // `statuses` 是逗号分隔单值（见 `OutsourceQuoteListQuery::statuses` 的注释：
+        // `serde_urlencoded` 填不出 `Vec<String>`，故 DTO 收 String、这里展开）。
+        // 展开成空 Vec ⇔ 不过滤（SQL 侧 `cardinality($2::text[]) = 0` 的语义）。
+        let statuses: Vec<String> = query
+            .statuses
+            .as_deref()
+            .map(|raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
         let rows = repo
             .quote_list_with_filters(
                 query.status.as_deref(),
-                &[],
+                &statuses,
                 part_id,
                 &part_ids_in,
                 company_id,
+                drawing_no_pat.as_deref(),
+                name_pat.as_deref(),
+                query.is_urgent,
                 sort_by,
                 sort_dir,
                 limit,
@@ -239,10 +247,13 @@ impl OutsourceService {
         let total = repo
             .quote_count_with_filters(
                 query.status.as_deref(),
-                &[],
+                &statuses,
                 part_id,
                 &part_ids_in,
                 company_id,
+                drawing_no_pat.as_deref(),
+                name_pat.as_deref(),
+                query.is_urgent,
             )
             .await?;
         let items = quote_out_many(&mut repo, rows).await?;
@@ -299,20 +310,6 @@ impl OutsourceService {
             limit,
             offset,
         })
-    }
-
-    pub async fn get_quote<R: OutsourceRepoTrait>(
-        &self,
-        mut repo: R,
-        id: i64,
-        current: &CurrentUser,
-    ) -> Result<OutsourceQuoteOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
-        let q = repo
-            .quote_get_by_id(id, false)
-            .await?
-            .ok_or_else(|| not_found_quote(id))?;
-        quote_out(&mut repo, q).await
     }
 
     pub async fn create_quote<R: OutsourceRepoTrait>(
@@ -409,63 +406,11 @@ impl OutsourceService {
         quote_out(&mut repo, q).await
     }
 
-    pub async fn update_quote<R: OutsourceRepoTrait>(
-        &self,
-        mut repo: R,
-        id: i64,
-        req: &OutsourceQuoteUpdateRequest,
-        current: &CurrentUser,
-    ) -> Result<OutsourceQuoteOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk])?;
-        let q = repo
-            .quote_get_by_id(id, false)
-            .await?
-            .ok_or_else(|| not_found_quote(id))?;
-        if q.status != "DRAFT" {
-            return Err(AppError::biz(
-                code::BIZ_OUTSOURCE_QUOTE_INVALID_TRANSITION,
-                format!("只有 DRAFT 状态的报价可以修改，当前 {}", q.status),
-            ));
-        }
-        if q.version != req.version {
-            return Err(AppError::biz(
-                code::VERSION_CONFLICT,
-                format!("报价版本不一致：当前 {}，请求 {}", q.version, req.version),
-            ));
-        }
-        let price = req.price.as_deref().map(parse_price).transpose()?;
-        let note = req
-            .note
-            .as_ref()
-            .map(|inner| inner.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()));
-        let n = repo
-            .quote_update(id, req.version, price, note, current.id)
-            .await?;
-        if n == 0 {
-            return Err(version_conflict());
-        }
-        // EDITED 事件
-        repo.quote_event_create(NewOutsourceQuoteEvent {
-            id: current_id_to_snowflake(&self.snowflake),
-            quote_id: id,
-            event_type: "EDITED".to_string(),
-            from_status: Some(q.status.clone()),
-            to_status: Some(q.status.clone()),
-            note: None,
-            created_by: current.id,
-        })
-        .await?;
-        let fresh = repo
-            .quote_get_by_id(id, false)
-            .await?
-            .ok_or_else(|| not_found_quote(id))?;
-        quote_out(&mut repo, fresh).await
-    }
-
     pub async fn submit_quote<R: OutsourceRepoTrait>(
         &self,
         mut repo: R,
         id: i64,
+        req: &OutsourceQuoteSubmitRequest,
         current: &CurrentUser,
     ) -> Result<OutsourceQuoteOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
@@ -479,6 +424,15 @@ impl OutsourceService {
                 format!("当前状态 {} 不允许 submit", q.status),
             ));
         }
+        // ⚠️ 必须用**调用方传的** version，而不是上面刚读到的 `q.version`：后者等于
+        // 「用服务端自己读到的值守自己的乐观锁」，`UPDATE … WHERE version = <刚读的>`
+        // 在同一行上恒成立，`n == 0` 的分支永不可达，守卫形同虚设。
+        if q.version != req.version {
+            return Err(AppError::biz(
+                code::VERSION_CONFLICT,
+                "报价版本不一致，请刷新后重试",
+            ));
+        }
         let from = OutsourceQuoteStatus::DRAFT;
         let to = OutsourceQuoteStatus::SUBMITTED;
         if !from.can_transition_to(to) {
@@ -487,7 +441,7 @@ impl OutsourceService {
                 format!("{:?} → {:?} 不允许", from, to),
             ));
         }
-        let n = repo.quote_submit(id, q.version, current.id).await?;
+        let n = repo.quote_submit(id, req.version, current.id).await?;
         if n == 0 {
             return Err(version_conflict());
         }
@@ -632,6 +586,7 @@ impl OutsourceService {
         &self,
         mut repo: R,
         id: i64,
+        req: &OutsourceQuoteSoftDeleteRequest,
         current: &CurrentUser,
     ) -> Result<(), AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
@@ -645,7 +600,15 @@ impl OutsourceService {
                 format!("已提交 / 已批准 / 已使用的报价不可删除；当前 {}", q.status),
             ));
         }
-        let n = repo.quote_soft_delete(id, q.version, current.id).await?;
+        // 同 `submit_quote`：守**调用方传的** version，不能用刚读到的 `q.version`
+        // 自守（那样 UPDATE 恒命中，`n == 0` 分支不可达）。
+        if q.version != req.version {
+            return Err(AppError::biz(
+                code::VERSION_CONFLICT,
+                "报价版本不一致，请刷新后重试",
+            ));
+        }
+        let n = repo.quote_soft_delete(id, req.version, current.id).await?;
         if n == 0 {
             return Err(version_conflict());
         }

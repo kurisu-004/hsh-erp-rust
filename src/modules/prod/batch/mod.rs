@@ -4,7 +4,7 @@
 //! 为对象的服务用例**与批次路由（URL 锚由 `part_id` 改为 `batch_id`）整体
 //! 从 part 域搬入本模块，路由从 `POST /api/v2/parts/…` 硬切到
 //! `POST /api/v2/prod/batches/…`（**无 alias**，前端配套 PR 锁步迁移）。本域现注册
-//! **23 条**路由（权威清单是 `handler/mod.rs::ROUTES`，`mod tests` 断言它与
+//! **19 条**域内路由（权威清单是 `handler/mod.rs::ROUTES`，`mod tests` 断言它与
 //! `router()` 源码逐条一致；下方路由表是给读的人看的手写摘要）。
 //!
 //! part 域自此只保留「多批次动作 + part 级动作」：`/{part_id}/cancel`（BATCH-N）、
@@ -69,18 +69,24 @@
 //! - `to-inspection` / `to-ship` / `to-process` / `scan-inspect`
 //! - `deliver` / `complete` / `start-repair`
 //! - `place-on-shelf` / `release-from-programming`
-//! - `send-to-outsource` / `receive-from-outsource` /
-//!   `receive-from-outsource-to-inspection`
 //! - `complete-repair` / `repair-dispatch`
-//! - `split` / `cancel` / `pick-up`
+//! - `cancel` / `pick-up`
 //!
 //! **本域不再有下发流端点**：`pending` / `dispatch` / `auto-dispatch` /
-//! `recall-to-pending` 已于 2026-10-08 迁往 `prod::queue`（见 `handler/mod.rs`
-//! 的 `STRIPPED` 表）。
+//! `recall-to-pending` 已于 2026-10-08 迁往 `prod::queue`；**也不再有外协端点**：
+//! `send-to-outsource` / `receive-from-outsource` /
+//! `receive-from-outsource-to-inspection` 已于 2026-10-09 合并为
+//! `POST /api/v2/outsource-queue/move`（`outsource` 域）；**拆批也不再是域内路由**：
+//! 2026-10-09 由 `POST /api/v2/prod/batches/{batch_id}/split` 提升为顶层共用端点
+//! `POST /api/v2/batches/split`（`handler::split_router`，旧路径 404 无 alias）。
+//! 三条都见 `handler/mod.rs` 的 `STRIPPED` 表。
+//!
+//! **本域有 2 处挂载**：本 `router()` → `/api/v2/prod/batches/*`（19 条）与
+//! `prod::split_router()` → `/api/v2/batches/*`（1 条拆批）。
 //!
 //! ## DTO 契约
-//! 子资源 16 条的 `batch_id` 自**请求体删除**（它是 URL 路径参数），其余字段不变；
-//! 静态 3 条 body 完全不变。错误码语义随之变化：批次 id 全局唯一即锚点，不存在
+//! 子资源 13 条的 `batch_id` 自**请求体删除**（它是 URL 路径参数），其余字段不变；
+//! 静态 6 条 body 完全不变。错误码语义随之变化：批次 id 全局唯一即锚点，不存在
 //! 「跨 part 批次」，20109 `BIZ_PART_BATCH_NOT_FOUND` 退化为「批次不存在 / 已软删 /
 //! 状态不是流转起点」；20101 `BIZ_PART_NOT_FOUND` 现在只能经由「批次的 part 已软删」
 //! 触发，仍可达。

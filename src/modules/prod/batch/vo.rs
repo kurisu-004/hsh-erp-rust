@@ -20,6 +20,9 @@
 //! `AutoDispatchItem` / `AutoDispatchResult`）**连同本文件里的旧副本**一并迁往
 //! `prod::queue::vo::queue` —— 它们的唯一消费方是队列页的下发动作。
 //!
+//! 2026-10-09：拆批端点提升为顶层共用端点 `POST /api/v2/batches/split`（三个
+//! 消费方共用），出参由 `R<i64>` 裸数字换成 [`BatchSplitOut`]（全 ID 字符串）。
+//!
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::Serialize;
 
@@ -241,4 +244,65 @@ pub struct WorkerScanCoreOut {
 pub struct WorkerScanOut {
     pub scan: WorkerScanCoreOut,
     pub refill: RefillResult,
+}
+
+// ===== 共用顶层端点（/api/v2/batches）=====
+
+/// `POST /api/v2/batches/split` 出参。**全 ID 字符串**。
+///
+/// 2026-10-09 新增。旧端点 `POST /api/v2/prod/batches/{batch_id}/split` 出参是
+/// `R<i64>` 裸数字 —— 雪花 ID ≈ 9.0e18 远超 JS 的 `Number.MAX_SAFE_INTEGER`
+/// (2^53-1 ≈ 9.007e15)，浏览器侧解析即丢精度。这正是本 VO 存在的成因，
+/// 见本文件末尾 `batch_split_out_ids_serialize_as_strings` 回归单测。
+///
+/// `source_version` 是**源批次**（被扣减的那个）拆批后的 version，前端对源批次
+/// 继续操作时必须带这个值；新批次的 version 从 0 起、由 `t_part_batch.version`
+/// 的 DB 默认给出，本 VO 不重复返回。
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchSplitOut {
+    #[serde(serialize_with = "serialize_i64")]
+    pub batch_id: i64,
+    #[serde(serialize_with = "serialize_i64")]
+    pub new_batch_id: i64,
+    #[serde(serialize_with = "serialize_i64")]
+    pub part_id: i64,
+    pub quantity: i32,
+    /// 源批次 version（拆批后 = 请求的 version + 1）
+    pub source_version: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BatchSplitOut;
+
+    /// 2026-10-09 新增：三个雪花 ID 必须序列化成 JSON 字符串，不得出现裸数字。
+    ///
+    /// 这条测试存在的理由是旧出参 `R<i64>`：裸数字在 JS 侧落到
+    /// `Number`（IEEE754 双精度，2^53-1 之上即失真），本仓雪花 ID ≈ 9.0e18
+    /// 比那个上限大三个数量级，前端拿到的 `new_batch_id` 会与库里那一行对不上。
+    #[test]
+    fn batch_split_out_ids_serialize_as_strings() {
+        let value = serde_json::to_value(BatchSplitOut {
+            batch_id: 1_590_000_000_000_000_001,
+            new_batch_id: 1_590_000_000_000_000_002,
+            part_id: 1_590_000_000_000_000_003,
+            quantity: 3,
+            source_version: 4,
+        })
+        .expect("BatchSplitOut 应可序列化");
+        for (field, raw) in [
+            ("batch_id", "1590000000000000001"),
+            ("new_batch_id", "1590000000000000002"),
+            ("part_id", "1590000000000000003"),
+        ] {
+            assert_eq!(
+                value[field],
+                serde_json::Value::String(raw.to_string()),
+                "`{field}` 必须是 JSON 字符串（裸数字会被 JS 截断精度）"
+            );
+        }
+        // 非 ID 字段保持原生类型，别被 serde 顺手字符串化
+        assert_eq!(value["quantity"], serde_json::json!(3));
+        assert_eq!(value["source_version"], serde_json::json!(4));
+    }
 }

@@ -1,7 +1,8 @@
 # prod::batch 域 API（批次流转）—— 剥离中
 
 > 本文件是 `prod::batch` 域的**唯一**契约来源。任何字段 / 端点变更必须同步本文件。
-> 与本域 2026-10-08 同期改动的 `prod::queue` 域契约见 [`queue.md`](queue.md)。
+> 与本域 2026-10-08 同期改动的 `prod::queue` 域契约见 [`queue.md`](queue.md)；
+> 2026-10-09 新增的顶层共用端点与外协三合一写端点见 [`outsource.md`](outsource.md)。
 
 ## 1. 本域定位：逐域剥离的**中间态**
 
@@ -9,13 +10,13 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
 
 **剥离策略**：
 
-1. batch 域本轮（2026-10-08）只做 `prod::queue` 那一份的剥离（4 个端点，见 §3）。
+1. batch 域先做 `prod::queue` 那一份的剥离（4 个端点，2026-10-08），再做 outsource 那一份（3 个端点，2026-10-09，见 §3）。
 2. 后续每一轮某个域重构时**重复这个动作**：认领 §4 表里属于自己目标域的端点，连同 handler / service / repo / VO / DTO 一起搬。
 3. 直到 §4 表里的端点被全部分走之后，**再删除本域**。
 
 本文件的存在目的：让下一轮重构的 agent（以及前端）**不翻 Rust 源码**就能知道 batch 域还剩什么、哪些已被认领。契约只从 `docs/api/` 读（前端 CLAUDE.md 规定）。
 
-## 2. 剩余路由表（23 条）
+## 2. 剩余路由表（19 条）
 
 全部挂 `/api/v2/prod/batches`。`/{batch_id}` 是 path 段；`to-ship` / `to-inspection` / `worker-scan` / `repair` / `repairing` / `scan/deliver` 是静态段（**无 Path extractor**）。
 
@@ -36,14 +37,10 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
 | 13 | POST | `/{batch_id}/start-repair` | Manager + Inspector |
 | 14 | POST | `/{batch_id}/place-on-shelf` | Manager + Clerk |
 | 15 | POST | `/{batch_id}/release-from-programming` | Manager + Clerk |
-| 16 | POST | `/{batch_id}/send-to-outsource` | Manager + Clerk |
-| 17 | POST | `/{batch_id}/receive-from-outsource` | Manager + Clerk |
-| 18 | POST | `/{batch_id}/receive-from-outsource-to-inspection` | Manager + Clerk |
-| 19 | POST | `/{batch_id}/complete-repair` | Manager + Clerk |
-| 20 | POST | `/{batch_id}/repair-dispatch` | Manager + Clerk |
-| 21 | POST | `/{batch_id}/split` | Manager + Clerk |
-| 22 | POST | `/{batch_id}/cancel` | Manager + Clerk |
-| 23 | POST | `/{batch_id}/pick-up` | Manager + Clerk + ShelfAccount |
+| 16 | POST | `/{batch_id}/complete-repair` | Manager + Clerk |
+| 17 | POST | `/{batch_id}/repair-dispatch` | Manager + Clerk |
+| 18 | POST | `/{batch_id}/cancel` | Manager + Clerk |
+| 19 | POST | `/{batch_id}/pick-up` | Manager + Clerk + ShelfAccount |
 
 - 全部返回统一信封 `R { code, message, data }`。
 - 写端点的事务边界在 handler（`state.pool.begin()` → service → `tx.commit()`），**WS 广播在 commit 之后**。
@@ -56,6 +53,20 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
   往 `router()` 加一条路由而忘了更新 `ROUTES` / `STRIP_TARGETS`，该单测立刻红。
   本表与 §4 是给人读的摘要，**改路由时以那条单测为准**。
 
+### 2.1 本域的第二处挂载：`POST /api/v2/batches/split`（1 条，域外）
+
+拆批由 `POST /api/v2/prod/batches/{batch_id}/split` 提升为**顶层共用端点**，旧路径 404 **无 alias**（见 §3）。它**不在** §2 表内、也不在 `ROUTES` 内（`ROUTES` 只描述域内 `router()`），契约如下：
+
+| 方法 | 路径 | 权限 | 入参 | 出参 |
+|---|---|---|---|---|
+| POST | `/api/v2/batches/split` | Manager + Clerk | `{ batch_id: string, version: number, quantity: string, note? }` | `BatchSplitOut` |
+
+`batch_id` / `quantity` 走 `shared::types::deserialize_i64`（**只接受 JSON 字符串**），发数字 → HTTP 422 纯文本、不进信封。`version` 是 `t_part_batch.version` 的 OCC 锚，**必填**；过期 → `40901 VERSION_CONFLICT`。`quantity ∈ [1, source.quantity - 1]`，越界 → `20111`（HTTP 400）。
+
+`BatchSplitOut` 五字段：`batch_id` / `new_batch_id` / `part_id`（**三者均为 JSON 字符串**，雪花 ID 走 `serialize_i64`）、`quantity`（数字，实际拆走量）、`source_version`（数字，源批次写入后的 version = 请求 `version + 1`）。
+
+⚠️ 出参形状是**破坏性变更**：旧端点返 `R<i64>`（裸数字）。裸数字在 JS 侧落到 `Number`（2^53-1 之上即失真），而本仓雪花 ID ≈ 9.0e18 比该上限大三个数量级 —— 前端拿到的 `new_batch_id` 会与库里那一行对不上。回归由 `prod::batch::vo::tests::batch_split_out_ids_serialize_as_strings`（lib 单测）与 `tests/part/batch.rs::split_batch_happy_path`（集成）双锁。
+
 ## 3. 已被认领并移走的端点
 
 | 原路径 | 新路径 | 变更 | 剥离轮次 |
@@ -65,10 +76,18 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
 | `POST /api/v2/prod/batches/dispatch` | `POST /api/v2/prod/queue/dispatch` | 路径 | 2026-10-08 |
 | `POST /api/v2/prod/batches/auto-dispatch` | `POST /api/v2/prod/queue/auto-dispatch` | 路径 | 2026-10-08 |
 | `POST /api/v2/prod/batches/{batch_id}/recall-to-pending` | `POST /api/v2/prod/queue/recall` | 路径 + `batch_id` 改入 body + 出参 `PartOut` → `RecallOut` | 2026-10-08 |
+| `POST /api/v2/prod/batches/{batch_id}/send-to-outsource` | `POST /api/v2/outsource-queue/move` | **三合一**：`from`/`to` 结构体 + `batch_id` 改入 body + 去 `quantity` / `process_id` + 出参 `PartOut` → `OutsourceMoveResult` | 2026-10-09 |
+| `POST /api/v2/prod/batches/{batch_id}/receive-from-outsource` | `POST /api/v2/outsource-queue/move` | 同上（`to.kind = PRODUCTION_SHELF` 臂；`next_process_id` 可省略，后端按工序链推导） | 2026-10-09 |
+| `POST /api/v2/prod/batches/{batch_id}/receive-from-outsource-to-inspection` | `POST /api/v2/outsource-queue/move` | 同上（`to.kind = INSPECTION_SHELF` 臂） | 2026-10-09 |
+| `POST /api/v2/prod/batches/{batch_id}/split` | `POST /api/v2/batches/split` | **提为共用顶层端点**：`batch_id` 改入 body + 出参 `R<i64>` → `BatchSplitOut`（见 §2.1） | 2026-10-09 |
 
-**全部无 alias**，旧路径 404。契约细节见 [`queue.md`](queue.md) §1 与 §5.1。
+**全部无 alias**，旧路径 404。契约细节见 [`queue.md`](queue.md) §1 与 §5.1、[`outsource.md`](outsource.md)。
 
 2026-10-07 一行迁走的是待品检队列读的整条链路（`dto` / `vo` / `model` 行结构 / `repo/list.rs` / `service/list.rs`）→ `prod::inspection`，契约见 [`inspection.md`](inspection.md)。
+
+2026-10-09 外协三端点合并为 `POST /api/v2/outsource-queue/move`（`outsource` 域，硬切无 alias）。一并搬走的代码：`prod::batch/service/outsource.rs`（整文件，含三个 service 方法 + DIRECT 占位报价解析 + 开口 shipment 关闭两个自由函数）、`handler/lifecycle.rs` 的三个 handler、`dto.rs` 的三个入参（`SendToOutsourceRequest` / `ReceiveFromOutsourceRequest` / `ReceiveFromOutsourceToInspectionRequest`）。同时删掉的三个 WS 事件名（`PART_SENT_TO_OUTSOURCE` / `PART_RECEIVED_FROM_OUTSOURCE` / `PART_RECEIVED_FROM_OUTSOURCE_INSPECTED`）合并为 `OUTSOURCE_MOVE_DONE`；`t_part_event` 的三个审计字面量（`SENT_TO_OUTSOURCE` / `RECEIVED_FROM_OUTSOURCE` / `RECEIVED_TO_INSPECTION`）逐字保留。契约见 [`outsource.md`](outsource.md)。
+
+2026-10-09 拆批端点提升为顶层共用端点。它的消费方有**三处**（生产队列看板 / 外协看板 / 零件详情页），按「目标域按前端消费方判定」的规约它属多域共用 —— 挂在 `/prod/batches/{batch_id}/…` 这条「批次子资源」路径下既不贴切、也拿不掉路径参数（顶层前缀下 `/{id}/…` 会与别的 `/batches/*` 端点争 matchit 段位）。代码侧 `handler::split_router` 是**第二个** router 工厂（不动 `router()`），经 `prod::split_router()` 转发、由 `src/modules/mod.rs::v2_router()` 的 `.nest("/batches", …)` 挂载。service / repo / WS 事件名 `PART_BATCH_SPLIT` 与 payload **一行未改**，只有入参形状（`batch_id` 入 body）与出参（`BatchSplitOut`）变了。
 
 2026-10-08 一并搬走的代码：`service/dispatch.rs`、`handler/dispatch.rs`、`repo/mod.rs`（ZST `BatchRepo` → `queue/repo/dispatch.rs` 的 `QueueDispatchRepo`）、`service/shelf.rs` 的 `recall_to_pending` → `queue/service/recall.rs`、`vo.rs` 的 5 类下发流出参 → `queue/vo/queue.rs`、`dto.rs` 的 5 个下发流入参 → `queue/dto.rs`。
 
@@ -88,11 +107,13 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
 | `POST /{batch_id}/start-repair`、`complete-repair`、`repair-dispatch`、`GET /repair`、`GET /repairing` | `views/repair/` |
 | `POST /{batch_id}/place-on-shelf` | 待定（消费方是零件列表页，非队列页） |
 | `POST /{batch_id}/release-from-programming` | `views/cnc/` |
-| `POST /{batch_id}/send-to-outsource`、`receive-from-outsource`、`receive-from-outsource-to-inspection` | `views/outsource/` |
-| `POST /{batch_id}/split`、`POST /{batch_id}/cancel` | `views/parts/detail/` |
+| ~~`POST /{batch_id}/send-to-outsource`、`receive-from-outsource`、`receive-from-outsource-to-inspection`~~ | ~~`views/outsource/`~~（2026-10-09 已剥离，三合一为 `outsource::queue`） |
+| `POST /{batch_id}/cancel` | `views/parts/detail/` |
 | `POST /{batch_id}/pick-up` | `views/scan/`（扫码台） |
+| ~~`POST /{batch_id}/split`~~ | ~~`views/parts/detail/`~~（2026-10-09 已提为共用顶层端点 `POST /batches/split`，三处消费） |
 | ~~`GET /inspection`~~ | ~~`prod::inspection`~~（2026-10-07 已剥离） |
 | ~~`GET /pending` `POST /dispatch` `POST /auto-dispatch` `POST /{batch_id}/recall-to-pending`~~ | ~~`prod::queue`~~（2026-10-08 已剥离） |
+| ~~`POST /{batch_id}/send-to-outsource`、`receive-from-outsource`、`receive-from-outsource-to-inspection`~~ | ~~`outsource::queue`~~（2026-10-09 已剥离，三合一） |
 
 ⚠️ 「多域共用」的几条是后续某一轮的**决策点**：搬之前需要先决定它归哪个域（取决于哪个页面先重构），不要两边都搬。
 
@@ -117,8 +138,8 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
 - `repo/sql.rs`（inspection / lifecycle 流转的 19 个定位 + 写点，全部是写入口之上的薄包装）
 - `repo/trait.rs`（胖 trait `PartBatchRepoTrait` + `impl for &mut PgConnection`）
 - `model.rs`（2 个**窄投影**行结构：`RecentBatchRow` / `PartBatchScanRow`）
-- `service/`（除已剥离的 `dispatch.rs` 与 `shelf.rs::recall_to_pending` 外的全部用例；返修两条集合读的 SQL 在 `service/repair.rs::list_batches_matching` 内联自建）
-- `dto.rs`（除已剥离的 5 个下发流入参外的全部）
+- `service/`（除已剥离的 `dispatch.rs`、`outsource.rs` 与 `shelf.rs::recall_to_pending` 外的全部用例；返修两条集合读的 SQL 在 `service/repair.rs::list_batches_matching` 内联自建）
+- `dto.rs`（除已剥离的 5 个下发流入参与 3 个外协入参外的全部）
 - `vo.rs`（除已剥离的 5 类下发流出参外的全部）
 
 ## 6. 状态派生契约（未变，搬域不搬契约）
@@ -143,6 +164,10 @@ t_assembly.status               ← 派生缓存
 | 被移除项 | 原因 |
 |---|---|
 | `GET /api/v2/prod/batches/inspection` | 迁往 `GET /api/v2/prod/inspection/queue`（2026-10-07） |
+| `POST /api/v2/prod/batches/{batch_id}/send-to-outsource` / `receive-from-outsource` / `receive-from-outsource-to-inspection` | 合并为 `POST /api/v2/outsource-queue/move`（2026-10-09，硬切无 alias）。**部分收发能力随之下线**（入参不再有 `quantity`），部分流转改走 `POST /api/v2/batches/split` |
+| `POST /api/v2/prod/batches/{batch_id}/split` | 提为共用顶层端点 `POST /api/v2/batches/split`（2026-10-09，硬切无 alias，`batch_id` 入 body，出参 `R<i64>` → `BatchSplitOut`）。见 §2.1 |
+| `service/outsource.rs`（整文件）+ `dto.rs` 的三个外协入参 | 随三端点迁往 `outsource::service::move_svc` / `outsource::dto`（2026-10-09） |
+| WS 事件名 `PART_SENT_TO_OUTSOURCE` / `PART_RECEIVED_FROM_OUTSOURCE` / `PART_RECEIVED_FROM_OUTSOURCE_INSPECTED` | 合并为 `OUTSOURCE_MOVE_DONE`（2026-10-09）。`t_part_event` 的三个审计字面量不变 |
 | `GET /api/v2/prod/batches/pending` / `POST /dispatch` / `POST /auto-dispatch` | 迁往 `prod::queue`（2026-10-08） |
 | `POST /api/v2/prod/batches/{batch_id}/recall-to-pending` | 迁往 `POST /api/v2/prod/queue/recall`（2026-10-08），`batch_id` 改入 body、出参改 `RecallOut` |
 | `repo/list.rs` + `service/list.rs` | 随待品检队列读迁往 `prod::inspection`（2026-10-07） |
@@ -152,5 +177,6 @@ t_assembly.status               ← 派生缓存
 ## 8. 已知偏差登记
 
 - **§2 路由表与 §4 剥离登记表是手写摘要，权威源是 `handler/mod.rs::ROUTES` + `STRIP_TARGETS`。** 两者由 `modules::prod::batch::handler::tests` 两条单测与 `router()` 源码比对，但**那两条单测不校验本文件**。改路由时若忘了同步本文件，本文件会静默过期 —— 以单测为准。
+- **`ROUTES` 只描述域内 `router()`，不含 §2.1 的顶层 `/batches/split`。** 加顶层挂载不会让那两条单测红，反过来也一样：改 `split_router()` 时没有编译期/单测层面的登记表兜底，只有 §2.1 这段手写摘要与集成测试 `tests/part/batch.rs::split_batch_*`。
 - **§4 登记表里「多域共用」的几条尚未决定归属。** 搬之前需要先决定它归哪个域（取决于哪个页面先重构），不要两边都搬。
 - **`{batch_id}` 非数字段返 400 纯文本而非 `R<T>` 信封**（`PathRejection` 的默认行为，全仓一致）。前端若按 `code` 分支解析错误，需要对 400 的纯文本单独兜底。

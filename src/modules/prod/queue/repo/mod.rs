@@ -98,11 +98,19 @@ pub trait QueueRepoTrait: Send {
         operator_user_id: i64,
     ) -> Result<Option<TakenItem>, sqlx::Error>;
 
+    /// 单批占坑（`QueueRepo::take_specific_from_pool`）。
+    ///
+    /// `expected_version` 是**客户端传来的 OCC 锚**（`MoveRequest.version`），
+    /// 2026-10-09 起必传：SQL 侧的 `pb.version = candidate.version` 是拿
+    /// `FOR UPDATE` 锁住的行比它自己、恒真，吸收并发改动；只有灌进客户端传值
+    /// 才是真闸门。`Ok(None)` 兼表「不在候选池」与「version 已变」两种归因，
+    /// 由 service 统一转 `40901 VERSION_CONFLICT`。
     async fn take_specific_from_pool(
         &mut self,
         worker_id: i64,
         shelf_id: i64,
         batch_id: i64,
+        expected_version: i32,
         operator_user_id: i64,
     ) -> Result<Option<TakenItem>, sqlx::Error>;
 
@@ -274,6 +282,7 @@ impl QueueRepoTrait for &mut PgConnection {
         worker_id: i64,
         shelf_id: i64,
         batch_id: i64,
+        expected_version: i32,
         operator_user_id: i64,
     ) -> Result<Option<TakenItem>, sqlx::Error> {
         QueueRepo::take_specific_from_pool(
@@ -281,6 +290,7 @@ impl QueueRepoTrait for &mut PgConnection {
             worker_id,
             shelf_id,
             batch_id,
+            expected_version,
             operator_user_id,
         )
         .await

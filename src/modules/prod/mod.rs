@@ -119,3 +119,13 @@ pub fn router() -> Router<Arc<AppState>> {
         // 2026-10-02 新增：prod::shelf_process（货架 ↔ 工序映射，3 端点，自 shelf 域硬切）
         .nest("/shelf-processes", shelf_process::router())
 }
+
+/// 全模块共用的批次拆分工厂（挂载点 `/api/v2/batches`，见 `modules::v2_router`）。
+///
+/// 2026-10-09 新增。拆批有三个前端消费方（生产队列看板 / 外协看板 / 零件详情页），
+/// 按「目标域按前端消费方判定」的规约它属多域共用，因此**不进** `/prod` 前缀而是
+/// 单开一条顶层 nest。⚠️ 这使 `prod::batch` 有**两处挂载**：本 `router()` 里的
+/// `/prod/batches/*`（域内 19 条）与这里的 `/batches/*`（本条）。
+pub fn split_router() -> Router<Arc<AppState>> {
+    batch::handler::split_router()
+}

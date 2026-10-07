@@ -99,6 +99,9 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .nest("/com", com::router())
         // 2026-09-19 prod 聚合：工人 / 工种 / 工序 / 工艺链 / 工人池 5 支撑域统一挂在 `/prod/*` 下
         .nest("/prod", prod::router())
+        // 2026-10-09：批次拆分升为全模块共用端点（生产队列看板 / 外协看板 / 零件详情三处调用）。
+        // ⚠️ `prod::batch` 因此有两处挂载：本前缀（域内）与 `/api/v2/batches`（本条）。
+        .nest("/batches", prod::split_router())
         .nest("/shelves", shelf::router())
         // 2026-09-28 新增：dashboard 域 HTTP 全量首取端点（`GET /snapshot`）。
         // 路径：挂在 `/api/v2/dashboard/*`，与 `/ws/dashboard`（WS-only，不带
@@ -116,12 +119,12 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .nest("/outsource-companies", outsource::company_router())
         .nest("/outsource-quotes", outsource::quote_router())
         .nest("/outsource-shipments", outsource::shipment_router())
-        // 2026-10-03 新增：可发送外协一览（独立顶层前缀；非任何单一域的子资源）
-        .nest("/outsource-sendable", outsource::sendable_router())
-        // 2026-10-03 新增：外协看板三件套（按外协工序切 tab；形态照抄 /prod/pool，
-        // 前端可复用同一套 queryKey / 失效编排）。既有 /outsource-sendable 与
-        // /outsource-shipments/in-flight 都不接受 process_id 且分页，无法支撑切 tab。
-        .nest("/outsource-pool", outsource::pool_router())
+        // 外协看板（2 条只读聚合 + 1 条三合一移动写端点）。
+        // 旧挂载点 `/outsource-pool`（三条旧读）与 `/outsource-sendable`（可发送一览）
+        // 均于 2026-10-09 硬切下线，无 alias。改名理由与 `prod::worker_pool →
+        // prod::queue` 同源 —— `pool` 只覆盖了「候选池」一块，而本 nest 返回的是
+        // 「候选 + 公司列 + 内联在途批次」的整块看板与它的移动写端点。
+        .nest("/outsource-queue", outsource::queue_router())
         .nest("/statistics", statistics::router())
         // 2026-09-28 新增：微信小程序 BFF 域（聚合端点 + 复用 IAM 鉴权）
         .nest("/wx", wx::router())

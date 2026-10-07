@@ -94,13 +94,22 @@ pub enum MoveLocation {
     },
 }
 
-/// `POST /api/v2/prod/pool/move` 入参。
+/// `POST /api/v2/prod/queue/move` 入参。
 ///
-/// 字段顺序与 plan §2.1 一致：`batch_id → from → to → note?`。
+/// 字段顺序：`batch_id → version → from → to → note?`。
 #[derive(Debug, Clone, Deserialize)]
 pub struct MoveRequest {
     #[serde(deserialize_with = "deserialize_i64")]
     pub batch_id: i64,
+    /// 批次 OCC 锚，**必填**（无 `#[serde(default)]`）：缺失 → HTTP 422 纯文本
+    /// （axum `Json` 提取器），不是业务信封。
+    ///
+    /// 2026-10-09 新增。此前三个方向都由 service 用「本次事务里刚读到的
+    /// `batch.version`」当 `expected_version`，等价于**没有 OCC**：看板数据是
+    /// 30s 缓存的快照，期间他人改过批次时，「用户看到 5 件 → 实际移动 3 件」
+    /// 会静默成功。服务端读到的 version 现在只用于**兜底对账**（0 行时区分归因），
+    /// 不能替代客户端传值。豁免清单见 `CLAUDE.md` §8。
+    pub version: i32,
     pub from: MoveLocation,
     pub to: MoveLocation,
     #[serde(default)]
