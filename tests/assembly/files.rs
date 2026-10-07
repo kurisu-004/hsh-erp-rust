@@ -30,11 +30,14 @@
 //! PR-C.Final retry（2026-09-24）：删除 `mod common;` + `use common::test_pool;`，改走
 //! `use hsh_erp_test_support::test_pool;` 直接引入；facade `tests/common/mod.rs` 在 3 个
 //! binary 全部迁移后删除。
+//!
+//! 2026-10-09：本文件 8 处用例内 `SnowflakeIdGenerator::new(1_577_836_800_000, 1)`
+//! 全删 —— 传给 `AssemblyService` 的实参改为 `shared_test_snowflake().as_ref()`，
+//! helper 自取号改为 `shared_test_snowflake().next_id()`。未改任何 `src/` 服务函数签名。
 
 use hsh_erp_rust::auth::rbac::{CurrentUser, Role};
 use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::cos::NoopCos;
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::modules::assembly::dto::AssemblyUpdateRequest;
 use hsh_erp_rust::modules::assembly::service::AssemblyService;
 use hsh_erp_rust::shared::error::AppError;
@@ -42,7 +45,9 @@ use lopdf::{Document, Object, ObjectId, dictionary};
 use sqlx::PgPool;
 use std::sync::Arc;
 
-use hsh_erp_test_support::{AssemblyFixture, load_assembly_fixture, test_pool};
+use hsh_erp_test_support::{
+    AssemblyFixture, load_assembly_fixture, shared_test_snowflake, test_pool,
+};
 
 // ===========================================================================
 //  setup（PR13 Phase H，2026-09-24 fixture 范本化）
@@ -62,8 +67,10 @@ async fn setup() -> (PgPool, AssemblyFixture) {
 }
 
 async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    // 2026-10-09：ID 统一从全进程共享 generator 取（`shared_test_snowflake`）——
+    // 两个 fresh generator 同 instance 同毫秒各取 seq 0 会撞主键（23505），
+    // 与「同一个 helper 调几次」无关。
+    let id = shared_test_snowflake().next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
@@ -81,8 +88,10 @@ async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
 }
 
 async fn insert_l2_customer(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    // 2026-10-09：ID 统一从全进程共享 generator 取（`shared_test_snowflake`）——
+    // 两个 fresh generator 同 instance 同毫秒各取 seq 0 会撞主键（23505），
+    // 与「同一个 helper 调几次」无关。
+    let id = shared_test_snowflake().next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
@@ -193,7 +202,6 @@ async fn seed_assembly(pool: &PgPool) -> (i64, i64, i64) {
 async fn upload_files_happy_path() {
     let (pool, _fx) = setup().await;
     let (l1, l2, _) = seed_assembly(&pool).await;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let cos = Arc::new(NoopCos);
 
     // 建一个不传 PDF 的装配体（建单端点仍会派发 serial_no，PDF 只用于页数校验）
@@ -215,9 +223,15 @@ async fn upload_files_happy_path() {
         children: vec![],
     };
     let current = test_current_user(vec![Role::Manager]);
-    let asm = AssemblyService::create_assembly(&mut tx, &snowflake, &req, vec![], &current)
-        .await
-        .unwrap();
+    let asm = AssemblyService::create_assembly(
+        &mut tx,
+        shared_test_snowflake().as_ref(),
+        &req,
+        vec![],
+        &current,
+    )
+    .await
+    .unwrap();
     tx.commit().await.unwrap();
     let asm_id = asm.assembly.id;
 
@@ -226,7 +240,7 @@ async fn upload_files_happy_path() {
     let mut tx = pool.begin().await.unwrap();
     let out = AssemblyService::upload_assembly_files(
         &mut tx,
-        &snowflake,
+        shared_test_snowflake().as_ref(),
         cos,
         asm_id,
         vec![(
@@ -260,7 +274,6 @@ async fn upload_files_happy_path() {
 async fn upload_files_ext_must_be_pdf() {
     let (pool, _fx) = setup().await;
     let (l1, l2, _) = seed_assembly(&pool).await;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let cos = Arc::new(NoopCos);
 
     let mut tx = pool.begin().await.unwrap();
@@ -281,15 +294,21 @@ async fn upload_files_ext_must_be_pdf() {
         children: vec![],
     };
     let current = test_current_user(vec![Role::Manager]);
-    let asm = AssemblyService::create_assembly(&mut tx, &snowflake, &req, vec![], &current)
-        .await
-        .unwrap();
+    let asm = AssemblyService::create_assembly(
+        &mut tx,
+        shared_test_snowflake().as_ref(),
+        &req,
+        vec![],
+        &current,
+    )
+    .await
+    .unwrap();
     tx.commit().await.unwrap();
 
     let mut tx = pool.begin().await.unwrap();
     let err = AssemblyService::upload_assembly_files(
         &mut tx,
-        &snowflake,
+        shared_test_snowflake().as_ref(),
         cos,
         asm.assembly.id,
         vec![(
@@ -314,7 +333,6 @@ async fn upload_files_ext_must_be_pdf() {
 async fn start_pending_to_in_process() {
     let (pool, _fx) = setup().await;
     let (l1, l2, _) = seed_assembly(&pool).await;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
 
     let mut tx = pool.begin().await.unwrap();
     let req = hsh_erp_rust::modules::assembly::dto::AssemblyCreateRequest {
@@ -334,9 +352,15 @@ async fn start_pending_to_in_process() {
         children: vec![],
     };
     let current = test_current_user(vec![Role::Manager]);
-    let asm = AssemblyService::create_assembly(&mut tx, &snowflake, &req, vec![], &current)
-        .await
-        .unwrap();
+    let asm = AssemblyService::create_assembly(
+        &mut tx,
+        shared_test_snowflake().as_ref(),
+        &req,
+        vec![],
+        &current,
+    )
+    .await
+    .unwrap();
     tx.commit().await.unwrap();
 
     let mut tx = pool.begin().await.unwrap();
@@ -352,7 +376,6 @@ async fn start_pending_to_in_process() {
 async fn soft_delete_has_shipment_returns_20307() {
     let (pool, _fx) = setup().await;
     let (l1, l2, _) = seed_assembly(&pool).await;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
 
     // 用 2 页 PDF 创建装配件 + 1 子件（page1=master, page2=child）
     let pdf = make_pdf_2_pages();
@@ -381,9 +404,15 @@ async fn soft_delete_has_shipment_returns_20307() {
         }],
     };
     let current = test_current_user(vec![Role::Manager]);
-    let asm = AssemblyService::create_assembly(&mut tx, &snowflake, &req, vec![pdf], &current)
-        .await
-        .unwrap();
+    let asm = AssemblyService::create_assembly(
+        &mut tx,
+        shared_test_snowflake().as_ref(),
+        &req,
+        vec![pdf],
+        &current,
+    )
+    .await
+    .unwrap();
     tx.commit().await.unwrap();
     let asm_id = asm.assembly.id;
     let asm_version = asm.assembly.version;
@@ -423,7 +452,6 @@ async fn soft_delete_has_shipment_returns_20307() {
 async fn three_state_note_clear_to_null() {
     let (pool, _fx) = setup().await;
     let (l1, l2, _) = seed_assembly(&pool).await;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
 
     let mut tx = pool.begin().await.unwrap();
     let req = hsh_erp_rust::modules::assembly::dto::AssemblyCreateRequest {
@@ -443,9 +471,15 @@ async fn three_state_note_clear_to_null() {
         children: vec![],
     };
     let current = test_current_user(vec![Role::Manager]);
-    let asm = AssemblyService::create_assembly(&mut tx, &snowflake, &req, vec![], &current)
-        .await
-        .unwrap();
+    let asm = AssemblyService::create_assembly(
+        &mut tx,
+        shared_test_snowflake().as_ref(),
+        &req,
+        vec![],
+        &current,
+    )
+    .await
+    .unwrap();
     tx.commit().await.unwrap();
     let asm_id = asm.assembly.id;
     let asm_version = asm.assembly.version;
@@ -481,7 +515,6 @@ async fn three_state_note_clear_to_null() {
 async fn child_current_batch_id_in_detail() {
     let (pool, _fx) = setup().await;
     let (l1, l2, _) = seed_assembly(&pool).await;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
 
     // 建装配件（带 PDF + 1 子件）
     let pdf = make_pdf_2_pages();
@@ -510,9 +543,15 @@ async fn child_current_batch_id_in_detail() {
         }],
     };
     let current = test_current_user(vec![Role::Manager]);
-    let asm = AssemblyService::create_assembly(&mut tx, &snowflake, &req, vec![pdf], &current)
-        .await
-        .unwrap();
+    let asm = AssemblyService::create_assembly(
+        &mut tx,
+        shared_test_snowflake().as_ref(),
+        &req,
+        vec![pdf],
+        &current,
+    )
+    .await
+    .unwrap();
     tx.commit().await.unwrap();
     let asm_id = asm.assembly.id;
 

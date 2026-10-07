@@ -84,7 +84,6 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 
 use hsh_erp_rust::infra::clock::now_naive;
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::shared::error::code;
 use hsh_erp_test_support::fixture::PartFixture;
 use hsh_erp_test_support::*;
@@ -93,18 +92,17 @@ use hsh_erp_test_support::*;
 //  本文件私有 helper（与 crud.rs / create_serial_price.rs 同风格：sub-file 私有）
 // ===========================================================================
 
-/// 本文件私有的雪花 ID 生成器。
+/// 取下一个测试雪花 ID。
 ///
-/// 2026-10-06：不复用 `test_support::pool_snowflake()`（它被 `tests/part/crud.rs`
-/// 的 `shared_test_snowflake` 各自的域内单例占着语义），单独一个 instance 段，
-/// 避免与其它 sub-file 在**同一测试库**里撞 id（本文件一个用例常插 20+ 行）。
-fn po_snowflake() -> &'static SnowflakeIdGenerator {
-    static GEN: std::sync::OnceLock<SnowflakeIdGenerator> = std::sync::OnceLock::new();
-    GEN.get_or_init(|| SnowflakeIdGenerator::new(1_577_836_800_000, 777))
-}
-
+/// 2026-10-09：本文件原有一个私有 `po_snowflake()` —— `OnceLock<SnowflakeIdGenerator>`
+/// 塞 instance=`777` 的域内单例，doc 里写「单独一个 instance 段，避免与其它 sub-file
+/// 在同一测试库里撞 id」。instance 不同确实位段不同、不会撞，但它是**次优权宜之计**：
+/// instance 仅 10 bit = 1024 槽，字面量仍有与本进程 `test_snowflake_instance()` 派生值
+/// 相等的 1/1024 概率，且一旦相等、两个 fresh generator 的首个 id 同为 `seq=0` 就撞
+/// `t_part_pkey`（23505）。现统一走全进程共享 generator：共享对象按 `next_id()`
+/// 调用顺序串行发号，进程内天然唯一，不再需要靠 instance 制造区分度。
 fn next_id() -> i64 {
-    po_snowflake().next_id()
+    hsh_erp_test_support::shared_test_snowflake().next_id()
 }
 
 /// 插入一行 `t_part`（匹配链路读到的列全部参数化）。

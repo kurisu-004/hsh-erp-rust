@@ -47,12 +47,25 @@
 //! 本文件走 `use hsh_erp_test_support::*` + `load_dashboard_ws_fixture(&pool)` +
 //! `DashboardWsFixture` + 局部 helper。fixture 只提供 1 个 WS 验签 user baseline；
 //! 其余业务数据每个用例现场插。
+//!
+//! ## 雪花 ID 统一走全进程共享 generator（2026-10-09）
+//! 24 处用例内 `SnowflakeIdGenerator::new(1_577_836_800_000, 1)` 全部删除，改为
+//! `shared_test_snowflake().next_id()`。根因：位布局 `ts << 22 | instance << 12 | seq`
+//! 里 `last_ms` / `sequence` 是 generator **对象私有**字段，`new()` 从 0 起步 ⇒ 任意
+//! 两个 instance 相同、对象不同的 generator 在同一毫秒各取第 0 号就发出逐字节相同的
+//! id ⇒ `t_*_pkey` 23505。本文件是全仓最密的受害者：每个用例都 `new` 一个 instance=1
+//! 的 generator，`insert_customer` / `insert_part` 只取 1 个号，正是「两个不同 helper
+//! 各调一次就撞」的典型形态。
+//!
+//! 两个 helper 的 `snowflake: &SnowflakeIdGenerator` 形参（只为传号而存在）一并删除，
+//! 改为函数内部自取号；38 处调用点的 `&snowflake` 实参同步删除。`mint_test_token*` 与
+//! `delete_session(&jti)` 的清理粒度决定不变、其 doc 已订正（见
+//! `mint_test_token_with_jti`）。
 
 use chrono::NaiveDate;
 use futures_util::{SinkExt, StreamExt};
 use hsh_erp_rust::auth::jwt::encode_access;
 use hsh_erp_rust::infra::clock::now_naive;
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::infra::ws_hub::WsEvent;
 use hsh_erp_rust::modules::dashboard::dto::DeliveryBasis;
 use hsh_erp_rust::modules::dashboard::repo::{
@@ -61,7 +74,7 @@ use hsh_erp_rust::modules::dashboard::repo::{
 use hsh_erp_rust::modules::dashboard::service::DashboardService;
 use hsh_erp_test_support::{
     DashboardWsFixture, json_request, load_dashboard_ws_fixture, send as ts_send, send_raw,
-    test_app, test_pool, test_state, test_ws_app,
+    shared_test_snowflake, test_app, test_pool, test_state, test_ws_app,
 };
 use sqlx::{Acquire, PgPool};
 use std::collections::HashSet;
@@ -84,13 +97,8 @@ async fn setup() -> PgPool {
 ///
 /// `prefix` 必传且互不相同：`uq_t_customer_root_prefix` 对「未软删 + 根客户」的
 /// `serial_prefix` 建了唯一索引，同一用例里插第二个根客户必须换前缀。
-async fn insert_customer(
-    pool: &PgPool,
-    snowflake: &SnowflakeIdGenerator,
-    name: &str,
-    prefix: &str,
-) -> i64 {
-    let id = snowflake.next_id();
+async fn insert_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
+    let id = shared_test_snowflake().next_id();
     sqlx::query(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
          created_at, updated_at) VALUES ($1, $2, NULL, $3, 0, $4, $4)",
@@ -111,13 +119,12 @@ async fn insert_customer(
 /// `request_date` 复用同一个值（本文件只关心交期两列）。
 async fn insert_part(
     pool: &PgPool,
-    snowflake: &SnowflakeIdGenerator,
     customer_id: i64,
     status: &str,
     system_delivery_date: Option<NaiveDate>,
     planned_delivery_date: NaiveDate,
 ) -> i64 {
-    let id = snowflake.next_id();
+    let id = shared_test_snowflake().next_id();
     sqlx::query(
         "INSERT INTO t_part (id, name, drawing_no, applicant_name, customer_id, \
          request_date, planned_delivery_date, system_delivery_date, status, version, \
@@ -168,14 +175,13 @@ async fn build_snapshot_in_process_carries_worker_held_batch_shape() {
     // 核心回归：`in_process` 行的 7 字段按前端实际渲染装配。
     // `quantity` 取自 t_part_batch 而非 t_part（两者不同值才能钉死取列来源）。
     let pool = setup().await;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let now = now_naive();
     let today = now.date();
 
-    let cust_id = insert_customer(&pool, &snowflake, "worker_held_cust", "Z").await;
-    let part_id = insert_part(&pool, &snowflake, cust_id, "IN_PROCESS", None, today).await;
+    let cust_id = insert_customer(&pool, "worker_held_cust", "Z").await;
+    let part_id = insert_part(&pool, cust_id, "IN_PROCESS", None, today).await;
 
-    let worker_id = snowflake.next_id();
+    let worker_id = shared_test_snowflake().next_id();
     sqlx::query(
         "INSERT INTO t_worker (id, badge_code, name, is_active, version, created_at, updated_at) \
          VALUES ($1, 'B-WH', '王五', true, 0, $2, $2)",
@@ -186,7 +192,7 @@ async fn build_snapshot_in_process_carries_worker_held_batch_shape() {
     .await
     .expect("insert t_worker");
 
-    let batch_id = snowflake.next_id();
+    let batch_id = shared_test_snowflake().next_id();
     sqlx::query(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
          current_holder_id, version, created_at, created_by, updated_at, updated_by) \
@@ -228,14 +234,13 @@ async fn build_snapshot_in_process_carries_worker_held_batch_shape() {
 #[tokio::test]
 async fn snapshot_counters_by_status_returns_per_status_breakdown() {
     let pool = setup().await;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let now = now_naive();
     // 沿「今天」的服务端口径（now_naive = Asia/Shanghai），避免本地时区漂移
     let today = now.date();
     let day_after_2 = today + chrono::Duration::days(2);
 
     // 1 个 customer（t_part.customer_id NOT NULL 强制）
-    let cust_id = insert_customer(&pool, &snowflake, "by_status_cust", "B").await;
+    let cust_id = insert_customer(&pool, "by_status_cust", "B").await;
 
     // today：3 PENDING + 2 INSPECTION + 1 DELIVERED（count=6）
     for status in &[
@@ -246,19 +251,11 @@ async fn snapshot_counters_by_status_returns_per_status_breakdown() {
         "INSPECTION",
         "DELIVERED",
     ] {
-        insert_part(&pool, &snowflake, cust_id, status, Some(today), today).await;
+        insert_part(&pool, cust_id, status, Some(today), today).await;
     }
 
     // today+2：1 PROGRAMMING（count=1）
-    insert_part(
-        &pool,
-        &snowflake,
-        cust_id,
-        "PROGRAMMING",
-        Some(day_after_2),
-        today,
-    )
-    .await;
+    insert_part(&pool, cust_id, "PROGRAMMING", Some(day_after_2), today).await;
 
     let mut tx = pool.begin().await.unwrap();
     let out = DashboardService::new()
@@ -326,9 +323,8 @@ async fn snapshot_counters_by_status_returns_per_status_breakdown() {
 async fn snapshot_counters_window_anchors_on_passed_today_not_current_date() {
     const DAYS: i64 = 7;
     let pool = setup().await;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     // serial_prefix 是 varchar(1)，根客户前缀按用例取单字符（每个用例独立库，无冲突）
-    let cust_id = insert_customer(&pool, &snowflake, "anchor_cust", "N").await;
+    let cust_id = insert_customer(&pool, "anchor_cust", "N").await;
 
     let mut conn = pool.acquire().await.unwrap();
     let mut tx = conn.begin().await.unwrap();
@@ -355,15 +351,7 @@ async fn snapshot_counters_window_anchors_on_passed_today_not_current_date() {
         today + chrono::Duration::days(DAYS),     // 窗口右开边界外
     ];
     for anchor in anchors {
-        insert_part(
-            &pool,
-            &snowflake,
-            cust_id,
-            "IN_PROCESS",
-            Some(anchor),
-            today,
-        )
-        .await;
+        insert_part(&pool, cust_id, "IN_PROCESS", Some(anchor), today).await;
     }
 
     let out = DashboardRepo::snapshot_counters(&mut tx, today, DAYS, DeliveryBasis::System)
@@ -560,12 +548,24 @@ async fn mint_test_token(state: &Arc<hsh_erp_rust::state::AppState>, user_id: i6
 
 /// 2026-10-02 新增：同上，但**一并返回 jti**（= Redis session key 后缀）。
 ///
-/// 为什么需要 jti：本文件所有用例的 snowflake generator 都写死 `instance = 1`
-/// （`SnowflakeIdGenerator::new(1_577_836_800_000, 1)`），所以**并行执行的用例之间
-/// user_id 会撞**。`ws_e2e_reauth_failure_sends_4001_close` 若用
-/// `delete_all_user_sessions(user_id)` 吊销 session，会把并发用例（撞到同一 user_id）
-/// 的 session 一起删掉 → 那些用例的 re-auth 无端失败，表现为莫名其妙的 flake。
-/// 精确到 jti 的 `delete_session(&jti)` 没有这个副作用。
+/// 为什么按 jti 精确定位（本文件唯一使用 `mint_test_token_with_jti` 的用例是
+/// `ws_e2e_reauth_failure_sends_4001_close`，它要**只吊销自己那条** session）：
+/// session 的 Redis key 是 `session:tok:<jti>`，jti 由 `encode_access` 从 token
+/// 派生。`delete_all_user_sessions(user_id)` 是「按用户批量清空」——清理粒度粗到
+/// 会把同 user_id 名下**所有** session 一并删掉，即便本轮各用例拿到的 user_id 已
+/// 互不相同，它仍然把「本测试造的那条 session」和「未来/其它路径造的同 user_id
+/// session」混为一谈。按 jti 删是**更精确的清理粒度**：只动本 token 派生出的那一个
+/// key，不依赖 user_id 是否唯一、也不受同 user_id 其它 session 影响。
+///
+/// 2026-10-09 订正本 doc 的成因描述：本文件 24 处 `SnowflakeIdGenerator::new(
+/// 1_577_836_800_000, 1)`（各自 `instance = 1` 的独立 generator 对象）已全部改为
+/// `shared_test_snowflake().next_id()`。旧文字把撞 id 的成因说成「所有用例 generator
+/// 写死 `instance = 1`，所以并行用例之间 user_id 会撞」——成因层级说错了：撞号发生在
+/// **同一进程内的多个 generator 对象**之间（`last_ms` / `sequence` 是对象私有字段，
+/// `new()` 从 0 起步 ⇒ 同 instance + 同毫秒 + 同 seq ⇒ 逐字节相同的 id），并非跨进程
+/// instance 冲突。改用全进程共享 generator 后各用例的 user_id 由共享对象按
+/// `next_id()` 调用顺序串行发号、进程内天然唯一，**该撞号成因已消除**；按 jti 精确删除
+/// 的做法保留下来 —— 它本身是对的（粒度更精确），只是不再是「绕开撞号」的手段。
 async fn mint_test_token_with_jti(
     state: &Arc<hsh_erp_rust::state::AppState>,
     user_id: i64,
@@ -626,8 +626,7 @@ async fn ws_e2e_invalid_token_rejected() {
 #[tokio::test]
 async fn ws_e2e_valid_token_receives_snapshot() {
     let (base, state) = spawn_ws_server().await;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let user_id = snowflake.next_id();
+    let user_id = shared_test_snowflake().next_id();
     let token = mint_test_token(&state, user_id).await;
     let url = format!("{base}/dashboard?token={token}");
 
@@ -688,8 +687,7 @@ async fn ws_e2e_valid_token_receives_snapshot() {
 #[tokio::test]
 async fn ws_e2e_valid_token_receives_heartbeat_text() {
     let (base, state) = spawn_ws_server().await;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let user_id = snowflake.next_id();
+    let user_id = shared_test_snowflake().next_id();
     let token = mint_test_token(&state, user_id).await;
     let url = format!("{base}/dashboard?token={token}");
 
@@ -781,8 +779,7 @@ async fn ws_e2e_valid_token_receives_heartbeat_text() {
 async fn ws_e2e_lagged_client_gets_4003_close() {
     // 容量 1 的广播环：连发 3 条必然溢出（tokio ring buffer 覆盖最旧值 → 下次 recv 返 Lagged）。
     let (base, state) = spawn_ws_server_with_hub_cap(1).await;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let user_id = snowflake.next_id();
+    let user_id = shared_test_snowflake().next_id();
     let token = mint_test_token(&state, user_id).await;
     let url = format!("{base}/dashboard?token={token}");
 
@@ -843,8 +840,7 @@ async fn ws_e2e_lagged_client_gets_4003_close() {
 async fn ws_e2e_pong_timeout_closes_dead_peer() {
     let (base, state) = spawn_ws_server().await;
     let pong_timeout = state.config.ws_pong_timeout_seconds;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let user_id = snowflake.next_id();
+    let user_id = shared_test_snowflake().next_id();
     let token = mint_test_token(&state, user_id).await;
     let url = format!("{base}/dashboard?token={token}");
 
@@ -909,8 +905,7 @@ async fn ws_e2e_conn_registry_counts() {
 
     // --- 后半段：真实连接进 / 出表 ---
     let (base, state) = spawn_ws_server().await;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let user_id = snowflake.next_id();
+    let user_id = shared_test_snowflake().next_id();
     let token = mint_test_token(&state, user_id).await;
     let url = format!("{base}/dashboard?token={token}");
 
@@ -950,8 +945,7 @@ async fn ws_e2e_reauth_failure_sends_4001_close() {
     let (base, state) = spawn_ws_server().await;
     let reauth_every = state.config.ws_reauth_every_n_heartbeats;
     let heartbeat = state.config.ws_heartbeat_interval_seconds;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let user_id = snowflake.next_id();
+    let user_id = shared_test_snowflake().next_id();
     let (token, jti) = mint_test_token_with_jti(&state, user_id).await;
     let url = format!("{base}/dashboard?token={token}");
 
@@ -968,9 +962,10 @@ async fn ws_e2e_reauth_failure_sends_4001_close() {
     // 精确吊销**本条** session（等价于「用户登出 / 管理员踢」）→ 下一轮 re-auth 的
     // `get_session` 返 None → `verify_session_token` 返 40105 SESSION_REVOKED。
     //
-    // ⚠️ 必须按 jti 删，不能用 `delete_all_user_sessions(user_id)`：本文件所有用例的
-    // snowflake generator 都写死 instance=1，并行用例之间 user_id 会撞，用 user_id
-    // 删会把并发用例的 session 一起干掉 → 那些用例的 re-auth 无端失败（见 helper 注释）。
+    // ⚠️ 必须按 jti 删，不能用 `delete_all_user_sessions(user_id)`：后者是「按用户批量
+    // 清空」，会把同 user_id 名下所有 session 一起删掉；按 jti 删只动本 token 派生的
+    // 那一个 Redis key，是更精确的清理粒度，也不依赖 user_id 是否唯一
+    // （成因与 2026-10-09 订正见 `mint_test_token_with_jti` 的 doc）。
     state
         .session
         .delete_session(&jti)
@@ -998,8 +993,7 @@ async fn ws_e2e_reauth_failure_sends_4001_close() {
 #[tokio::test]
 async fn ws_e2e_server_shutdown_sends_1012() {
     let (base, state) = spawn_ws_server().await;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let user_id = snowflake.next_id();
+    let user_id = shared_test_snowflake().next_id();
     let token = mint_test_token(&state, user_id).await;
     let url = format!("{base}/dashboard?token={token}");
 
@@ -1269,14 +1263,12 @@ async fn http_upcoming_basis_switches_delivery_date_column() {
     let app = test_app(state.clone());
 
     let today = now_naive().date();
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let cust_id = insert_customer(&pool, &snowflake, "basis_cust", "Z").await;
+    let cust_id = insert_customer(&pool, "basis_cust", "Z").await;
 
     // 唯一 1 行 part：两列交期**故意错开**——planned 落 today+3、system 落 today+9。
     // status 取 PENDING（SQL 已排除 COMPLETED / CANCELLED）。
     insert_part(
         &pool,
-        &snowflake,
         cust_id,
         "PENDING",
         Some(today + chrono::Duration::days(9)),
@@ -1421,12 +1413,11 @@ async fn overdue_of(pool: &PgPool) -> i64 {
 async fn overdue_counts_assembly_once_and_skips_children() {
     // 行单位差异的核心：1 个装配件 + 2 个子件 → 逾期数 = 1（不是 2 也不是 3）。
     let pool = setup().await;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let now = now_naive();
     let today = now.date();
     let overdue_day = today - chrono::Duration::days(3);
 
-    let l1_id = snowflake.next_id();
+    let l1_id = shared_test_snowflake().next_id();
     sqlx::query(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
          created_at, updated_at) VALUES ($1, 'asm_l1', NULL, 'Q', 0, $2, $2)",
@@ -1436,7 +1427,7 @@ async fn overdue_counts_assembly_once_and_skips_children() {
     .execute(&pool)
     .await
     .unwrap();
-    let l2_id = snowflake.next_id();
+    let l2_id = shared_test_snowflake().next_id();
     sqlx::query(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
          created_at, updated_at) VALUES ($1, 'asm_l2', $2, NULL, 0, $3, $3)",
@@ -1449,7 +1440,7 @@ async fn overdue_counts_assembly_once_and_skips_children() {
     .unwrap();
 
     // 装配件本身
-    let asm_id = snowflake.next_id();
+    let asm_id = shared_test_snowflake().next_id();
     sqlx::query(
         "INSERT INTO t_assembly (id, drawing_no, name, applicant_name, customer_id, \
          request_date, planned_delivery_date, system_delivery_date, status, version, \
@@ -1467,7 +1458,7 @@ async fn overdue_counts_assembly_once_and_skips_children() {
 
     // 2 个子件（assembly_id 非空），同样逾期
     for _ in 0..2 {
-        let id = snowflake.next_id();
+        let id = shared_test_snowflake().next_id();
         sqlx::query(
             "INSERT INTO t_part (id, name, drawing_no, applicant_name, customer_id, \
              assembly_id, request_date, planned_delivery_date, system_delivery_date, status, \
@@ -1496,11 +1487,10 @@ async fn overdue_counts_assembly_once_and_skips_children() {
 async fn overdue_skips_null_system_delivery_date() {
     // `system_delivery_date IS NULL` 的工单不计入（无论 planned 是哪天）。
     let pool = setup().await;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let today = now_naive().date();
     let long_ago = today - chrono::Duration::days(90);
-    let cust_id = insert_customer(&pool, &snowflake, "null_sdd_cust", "N").await;
-    insert_part(&pool, &snowflake, cust_id, "IN_PROCESS", None, long_ago).await;
+    let cust_id = insert_customer(&pool, "null_sdd_cust", "N").await;
+    insert_part(&pool, cust_id, "IN_PROCESS", None, long_ago).await;
 
     assert_eq!(
         overdue_of(&pool).await,
@@ -1513,21 +1503,12 @@ async fn overdue_skips_null_system_delivery_date() {
 async fn overdue_skips_soft_deleted_parts() {
     // 软删闸门：part / assembly 两侧都验。
     let pool = setup().await;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let now = now_naive();
     let today = now.date();
     let overdue_day = today - chrono::Duration::days(3);
-    let cust_id = insert_customer(&pool, &snowflake, "softdel_cust", "S").await;
+    let cust_id = insert_customer(&pool, "softdel_cust", "S").await;
 
-    let part_id = insert_part(
-        &pool,
-        &snowflake,
-        cust_id,
-        "IN_PROCESS",
-        Some(overdue_day),
-        overdue_day,
-    )
-    .await;
+    let part_id = insert_part(&pool, cust_id, "IN_PROCESS", Some(overdue_day), overdue_day).await;
     sqlx::query("UPDATE t_part SET deleted_at = $1 WHERE id = $2")
         .bind(now)
         .bind(part_id)
@@ -1535,7 +1516,7 @@ async fn overdue_skips_soft_deleted_parts() {
         .await
         .unwrap();
 
-    let asm_id = snowflake.next_id();
+    let asm_id = shared_test_snowflake().next_id();
     sqlx::query(
         "INSERT INTO t_assembly (id, drawing_no, name, applicant_name, customer_id, \
          request_date, planned_delivery_date, system_delivery_date, status, version, \
@@ -1562,11 +1543,10 @@ async fn overdue_skips_soft_deleted_parts() {
 async fn overdue_accepts_all_six_delivery_statuses() {
     // 6 态白名单逐态计入，其中 READY_TO_SHIP 最容易漏（它在 part / assembly 两侧都合法）。
     let pool = setup().await;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let now = now_naive();
     let today = now.date();
     let overdue_day = today - chrono::Duration::days(2);
-    let cust_id = insert_customer(&pool, &snowflake, "six_status_cust", "W").await;
+    let cust_id = insert_customer(&pool, "six_status_cust", "W").await;
 
     for status in [
         "PENDING",
@@ -1576,15 +1556,7 @@ async fn overdue_accepts_all_six_delivery_statuses() {
         "INSPECTION",
         "READY_TO_SHIP",
     ] {
-        insert_part(
-            &pool,
-            &snowflake,
-            cust_id,
-            status,
-            Some(overdue_day),
-            overdue_day,
-        )
-        .await;
+        insert_part(&pool, cust_id, status, Some(overdue_day), overdue_day).await;
     }
 
     assert_eq!(
@@ -1612,21 +1584,12 @@ async fn overdue_accepts_all_six_delivery_statuses() {
 #[tokio::test]
 async fn overdue_excludes_delivered_completed_cancelled() {
     let pool = setup().await;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let today = now_naive().date();
     let overdue_day = today - chrono::Duration::days(2);
-    let cust_id = insert_customer(&pool, &snowflake, "terminal_cust", "T").await;
+    let cust_id = insert_customer(&pool, "terminal_cust", "T").await;
 
     for status in ["DELIVERED", "COMPLETED", "CANCELLED"] {
-        insert_part(
-            &pool,
-            &snowflake,
-            cust_id,
-            status,
-            Some(overdue_day),
-            overdue_day,
-        )
-        .await;
+        insert_part(&pool, cust_id, status, Some(overdue_day), overdue_day).await;
     }
 
     assert_eq!(
@@ -1640,11 +1603,10 @@ async fn overdue_excludes_delivered_completed_cancelled() {
 async fn overdue_excludes_today_boundary() {
     // 窗口是严格小于：`system_delivery_date == today` 不算逾期（它归面板/柱状图）。
     let pool = setup().await;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let today = now_naive().date();
-    let cust_id = insert_customer(&pool, &snowflake, "boundary_cust", "Y").await;
+    let cust_id = insert_customer(&pool, "boundary_cust", "Y").await;
 
-    insert_part(&pool, &snowflake, cust_id, "IN_PROCESS", Some(today), today).await;
+    insert_part(&pool, cust_id, "IN_PROCESS", Some(today), today).await;
     assert_eq!(
         overdue_of(&pool).await,
         0,
@@ -1660,22 +1622,21 @@ async fn overdue_excludes_today_boundary() {
 async fn system_delivery_orders_split_by_delivered_quantity() {
     // 分桶判据是 `delivered_quantity`：0 → urgent，> 0 → partial。
     let pool = setup().await;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let now = now_naive();
     let today = now.date();
     let sdd = today + chrono::Duration::days(2);
-    let cust_id = insert_customer(&pool, &snowflake, "bucket_cust", "U").await;
+    let cust_id = insert_customer(&pool, "bucket_cust", "U").await;
 
     // urgent：完全没交过
-    let urgent_part = insert_part(&pool, &snowflake, cust_id, "IN_PROCESS", Some(sdd), sdd).await;
+    let urgent_part = insert_part(&pool, cust_id, "IN_PROCESS", Some(sdd), sdd).await;
     // partial：已交过一部分（DELIVERED 批次 quantity=4）
-    let partial_part = insert_part(&pool, &snowflake, cust_id, "IN_PROCESS", Some(sdd), sdd).await;
+    let partial_part = insert_part(&pool, cust_id, "IN_PROCESS", Some(sdd), sdd).await;
     sqlx::query(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, version, \
          created_at, created_by, updated_at, updated_by) \
          VALUES ($1, $2, 1, 4, 'DELIVERED', 0, $3, NULL, $3, NULL)",
     )
-    .bind(snowflake.next_id())
+    .bind(shared_test_snowflake().next_id())
     .bind(partial_part)
     .bind(now)
     .execute(&pool)
@@ -1708,14 +1669,12 @@ async fn system_delivery_orders_window_boundary() {
     // 窗口 `[today, today + 7)`：`== today` 计入，`== today - 1` 不计入，
     // `== today + 7` 也不计入。
     let pool = setup().await;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let today = now_naive().date();
-    let cust_id = insert_customer(&pool, &snowflake, "window_cust", "I").await;
+    let cust_id = insert_customer(&pool, "window_cust", "I").await;
 
-    let in_today = insert_part(&pool, &snowflake, cust_id, "IN_PROCESS", Some(today), today).await;
+    let in_today = insert_part(&pool, cust_id, "IN_PROCESS", Some(today), today).await;
     let yesterday = insert_part(
         &pool,
-        &snowflake,
         cust_id,
         "IN_PROCESS",
         Some(today - chrono::Duration::days(1)),
@@ -1724,7 +1683,6 @@ async fn system_delivery_orders_window_boundary() {
     .await;
     let day7 = insert_part(
         &pool,
-        &snowflake,
         cust_id,
         "IN_PROCESS",
         Some(today + chrono::Duration::days(7)),
@@ -1760,15 +1718,14 @@ async fn system_delivery_orders_window_boundary() {
 async fn system_delivery_orders_caps_each_bucket() {
     // 每桶独立截断到 DELIVERY_BUCKET_LIMIT。
     let pool = setup().await;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let today = now_naive().date();
     let sdd = today + chrono::Duration::days(1);
-    let cust_id = insert_customer(&pool, &snowflake, "cap_cust", "O").await;
+    let cust_id = insert_customer(&pool, "cap_cust", "O").await;
 
     let n = DELIVERY_BUCKET_LIMIT + 5;
     let mut first_id = String::new();
     for i in 0..n {
-        let id = insert_part(&pool, &snowflake, cust_id, "IN_PROCESS", Some(sdd), sdd).await;
+        let id = insert_part(&pool, cust_id, "IN_PROCESS", Some(sdd), sdd).await;
         if i == 0 {
             first_id = id.to_string();
         }
@@ -1799,10 +1756,9 @@ async fn system_delivery_orders_caps_each_bucket() {
 #[tokio::test]
 async fn delivery_order_details_filters_by_date_and_statuses() {
     let pool = setup().await;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let today = now_naive().date();
-    let l1_id = insert_customer(&pool, &snowflake, "drawer_l1", "D").await;
-    let l2_id = snowflake.next_id();
+    let l1_id = insert_customer(&pool, "drawer_l1", "D").await;
+    let l2_id = shared_test_snowflake().next_id();
     sqlx::query(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
          created_at, updated_at) VALUES ($1, 'drawer_l2', $2, NULL, 0, $3, $3)",
@@ -1814,20 +1770,12 @@ async fn delivery_order_details_filters_by_date_and_statuses() {
     .await
     .unwrap();
 
-    let hit = insert_part(&pool, &snowflake, l2_id, "IN_PROCESS", Some(today), today).await;
+    let hit = insert_part(&pool, l2_id, "IN_PROCESS", Some(today), today).await;
     // 同日但状态不在 filters 里
-    insert_part(&pool, &snowflake, l2_id, "PENDING", Some(today), today).await;
+    insert_part(&pool, l2_id, "PENDING", Some(today), today).await;
     // 状态命中但不同日
     let other_day = today + chrono::Duration::days(1);
-    insert_part(
-        &pool,
-        &snowflake,
-        l2_id,
-        "IN_PROCESS",
-        Some(other_day),
-        other_day,
-    )
-    .await;
+    insert_part(&pool, l2_id, "IN_PROCESS", Some(other_day), other_day).await;
 
     let mut tx = pool.begin().await.unwrap();
     let out = DashboardService::new()
@@ -1862,12 +1810,11 @@ async fn delivery_order_details_filters_by_date_and_statuses() {
 async fn delivery_order_details_total_exceeds_items_when_truncated() {
     // 造 205 行（> DELIVERY_DETAIL_LIMIT = 200）：`total` 不受截断，`items` 被截。
     let pool = setup().await;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let today = now_naive().date();
-    let cust_id = insert_customer(&pool, &snowflake, "trunc_cust", "R").await;
+    let cust_id = insert_customer(&pool, "trunc_cust", "R").await;
 
     for _ in 0..(DELIVERY_DETAIL_LIMIT + 5) {
-        insert_part(&pool, &snowflake, cust_id, "IN_PROCESS", Some(today), today).await;
+        insert_part(&pool, cust_id, "IN_PROCESS", Some(today), today).await;
     }
 
     let mut tx = pool.begin().await.unwrap();
@@ -1893,20 +1840,11 @@ async fn delivery_order_details_total_exceeds_items_when_truncated() {
 async fn delivery_order_details_basis_switches_column() {
     // 同一行 planned / system 交期分处不同日：两口径必须打不同的列。
     let pool = setup().await;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let today = now_naive().date();
     let planned_day = today;
     let system_day = today + chrono::Duration::days(4);
-    let cust_id = insert_customer(&pool, &snowflake, "basis2_cust", "E").await;
-    let part_id = insert_part(
-        &pool,
-        &snowflake,
-        cust_id,
-        "IN_PROCESS",
-        Some(system_day),
-        planned_day,
-    )
-    .await;
+    let cust_id = insert_customer(&pool, "basis2_cust", "E").await;
+    let part_id = insert_part(&pool, cust_id, "IN_PROCESS", Some(system_day), planned_day).await;
 
     let mut tx = pool.begin().await.unwrap();
     let by_planned = DashboardService::new()
@@ -2038,9 +1976,8 @@ async fn http_delivery_orders_happy_path() {
     let state = test_state(pool.clone()).await;
     let token = mint_test_token(&state, DashboardWsFixture::WS_USER_ID).await;
     let today = now_naive().date();
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let cust_id = insert_customer(&pool, &snowflake, "http_cust", "H").await;
-    let part_id = insert_part(&pool, &snowflake, cust_id, "IN_PROCESS", Some(today), today).await;
+    let cust_id = insert_customer(&pool, "http_cust", "H").await;
+    let part_id = insert_part(&pool, cust_id, "IN_PROCESS", Some(today), today).await;
 
     let app = test_app(state.clone());
     let (status, envelope) = send(

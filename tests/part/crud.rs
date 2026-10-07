@@ -14,7 +14,6 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::modules::part::service::PartService;
 use hsh_erp_rust::modules::part_file::policy;
 use hsh_erp_rust::modules::part_file::repo::PartFileRepo;
@@ -42,6 +41,10 @@ use hsh_erp_test_support::*;
 /// 遗留（登记在 CLAUDE.md「待办登记：测试内联造 snowflake 生成器应收敛到
 /// `pool_snowflake()`」）：本文件部分**用例内**仍现建 `SnowflakeIdGenerator::new(...)`，
 /// 属逐文件确认的批量迁移范围，不在本轮范围内。
+///
+/// 2026-10-09 补：上一条「遗留」已清零 —— 本文件 7 处用例内 `SnowflakeIdGenerator::new`
+/// （含 instance `1` 与刻意 `99` 的形态）全部改为直调本文件入口 / 共享 generator，
+/// 全仓 `tests/` 已无真实代码行的 `SnowflakeIdGenerator::new`。
 fn next_test_id() -> i64 {
     shared_test_snowflake().next_id()
 }
@@ -159,14 +162,14 @@ async fn list_parts_basic() {
 #[tokio::test]
 async fn list_parts_filter_status_and_customer() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     use hsh_erp_rust::infra::clock::now_naive;
     let now = now_naive();
     let today = now.date();
 
-    // 共用一个雪花生成器连发 4 个唯一 id
+    // 2026-10-09：ID 统一从全进程共享 generator 取（`shared_test_snowflake`）——
+    // 两个 fresh generator 同 instance 同毫秒各取 seq 0 会撞 `t_part_pkey`（23505）。
     for i in 0..3 {
-        let id = snowflake.next_id();
+        let id = shared_test_snowflake().next_id();
         sqlx::query(
             "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
              applicant_name, request_date, planned_delivery_date, quantity, version, \
@@ -183,7 +186,7 @@ async fn list_parts_filter_status_and_customer() {
         .await
         .expect("insert PENDING part");
     }
-    let id = snowflake.next_id();
+    let id = shared_test_snowflake().next_id();
     sqlx::query(
         "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
          applicant_name, request_date, planned_delivery_date, quantity, version, \
@@ -238,13 +241,12 @@ async fn list_parts_filter_status_and_customer() {
 #[tokio::test]
 async fn list_parts_pagination_limit_offset() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     use hsh_erp_rust::infra::clock::now_naive;
     let now = now_naive();
     let today = now.date();
     let mut pids = Vec::new();
     for i in 0..5 {
-        let id = snowflake.next_id();
+        let id = shared_test_snowflake().next_id();
         sqlx::query(
             "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
              applicant_name, request_date, planned_delivery_date, quantity, version, \
@@ -1290,7 +1292,9 @@ async fn upload_drawing_service_integration() {
     let fx = load_part_fixture(&pool).await;
 
     let state = test_state_with_disabled_session(pool.clone());
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 99); // 99 区分测试进程
+    // 2026-10-09：原为 `new(1_577_836_800_000, 99)`，行尾注释写「99 区分测试进程」——
+    // 该说法已失效：instance 不同确实位段不同、不会撞，但它是次优权宜之计（instance
+    // 仅 10 bit = 1024 槽）。现直接传共享 generator 的引用。
 
     // fixture 不预置 part（避免 PENDING 状态污染 list_parts_basic 等期望空库测试）；
     // 这里动态插一个 PENDING part 给 service upload 用。
@@ -1300,7 +1304,7 @@ async fn upload_drawing_service_integration() {
     let mut conn = state.pool.begin().await.unwrap();
     let pf = PartService::upload_drawing(
         &mut *conn,
-        &snowflake,
+        shared_test_snowflake().as_ref(),
         &state,
         part_id,
         &bytes,
@@ -1342,7 +1346,6 @@ async fn upload_3d_model_service_integration() {
     let fx = load_part_fixture(&pool).await;
 
     let state = test_state_with_disabled_session(pool.clone());
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 99);
 
     let part_id = insert_part(&pool, "P-3D", fx.customer_l2_id, None, "PENDING").await;
 
@@ -1350,7 +1353,7 @@ async fn upload_3d_model_service_integration() {
     let mut conn = state.pool.begin().await.unwrap();
     let pf = PartService::upload_3d_model(
         &mut *conn,
-        &snowflake,
+        shared_test_snowflake().as_ref(),
         &state,
         part_id,
         &bytes,
@@ -1387,13 +1390,12 @@ async fn upload_bad_extension_rejected() {
     let pool = test_pool().await;
     let fx = load_part_fixture(&pool).await;
     let state = test_state_with_disabled_session(pool.clone());
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 99);
     let part_id = insert_part(&pool, "P-BAD", fx.customer_l2_id, None, "PENDING").await;
 
     let mut conn = state.pool.begin().await.unwrap();
     let err = PartService::upload_drawing(
         &mut *conn,
-        &snowflake,
+        shared_test_snowflake().as_ref(),
         &state,
         part_id,
         b"junk".to_vec().as_slice(),
@@ -1418,13 +1420,12 @@ async fn upload_content_type_mismatch_rejected() {
     let pool = test_pool().await;
     let fx = load_part_fixture(&pool).await;
     let state = test_state_with_disabled_session(pool.clone());
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 99);
     let part_id = insert_part(&pool, "P-CT", fx.customer_l2_id, None, "PENDING").await;
 
     let mut conn = state.pool.begin().await.unwrap();
     let err = PartService::upload_drawing(
         &mut *conn,
-        &snowflake,
+        shared_test_snowflake().as_ref(),
         &state,
         part_id,
         b"junk".to_vec().as_slice(),
@@ -1453,7 +1454,6 @@ async fn batch_create_with_bindings_partial_failure_cleans_all_tmp() {
     let pool = test_pool().await;
     let fx = load_part_fixture(&pool).await;
 
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let current = manager_current(1);
     let cos = std::sync::Arc::new(MockCos::new());
 
@@ -1525,7 +1525,7 @@ async fn batch_create_with_bindings_partial_failure_cleans_all_tmp() {
     let mut tx = pool.begin().await.unwrap();
     let (out, keys) = PartService::batch_create_parts_with_bindings(
         &mut *tx,
-        &snowflake,
+        shared_test_snowflake().as_ref(),
         cos.clone(),
         "uploads",
         "tmp/",

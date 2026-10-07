@@ -19,7 +19,6 @@ use std::time::Duration;
 
 use chrono::Duration as ChronoDuration;
 use hsh_erp_rust::infra::clock::now_naive;
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::infra::ws_hub::WsEvent;
 use hsh_erp_rust::task::auto_complete::run_once;
 use hsh_erp_test_support::{
@@ -51,10 +50,12 @@ async fn seed_delivered_batch(
     serial: &str,
     placed_days_ago: i64,
 ) -> (i64, i64) {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    // 2026-10-09：ID 统一从全进程共享 generator 取（`shared_test_snowflake`）——
+    // 两个 fresh generator 同 instance 同毫秒各取 seq 0 会撞 `t_part_pkey`（23505），
+    // 与「同一个 helper 调几次」无关。
     let now = now_naive();
     let today = now.date();
-    let part_id = snowflake.next_id();
+    let part_id = hsh_erp_test_support::shared_test_snowflake().next_id();
     // 2026-09-16 PR-2（migration 027）：t_part 删 `actual_delivery_date` /
     // `has_been_repaired`；实际交付日期真相源改为 t_part_event.DELIVERED 事件。
     // 2026-09-16 PR-3（migration 028）：t_part_batch 删 `placed_at`；auto_complete
@@ -79,7 +80,7 @@ async fn seed_delivered_batch(
     // auto_complete 阈值改读 t_part_event DELIVERED 事件 created_at（与 Python 口径对齐）。
     // 本 helper 改为同步插入一条 DELIVERED 事件，created_at = placed_at 旧值。
     let delivered_event_at = now - ChronoDuration::days(placed_days_ago);
-    let batch_id = snowflake.next_id();
+    let batch_id = hsh_erp_test_support::shared_test_snowflake().next_id();
     sqlx::query(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, \
          version, created_at, updated_at) \
@@ -92,7 +93,7 @@ async fn seed_delivered_batch(
     .await
     .expect("insert batch");
     // 同步插入 DELIVERED 事件（PR-3 新口径：auto_complete 按事件 created_at 判定）
-    let event_id = snowflake.next_id();
+    let event_id = hsh_erp_test_support::shared_test_snowflake().next_id();
     sqlx::query(
         "INSERT INTO t_part_event (id, part_id, batch_id, event_type, \
          from_status, to_status, quantity, created_at, created_by) \

@@ -142,10 +142,11 @@ async fn bootstrap_as_manager_with_pair() -> (PgPool, String, String) {
 /// 不同 L1」用例现场造新 L1（snowflake ID 避免 uk_t_customer_root_prefix 撞）。
 async fn insert_l1(pool: &PgPool, name: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    // 2026-10-09：ID 统一从全进程共享 generator 取（`shared_test_snowflake`）——
+    // 两个 fresh generator 同 instance 同毫秒各取 seq 0 会撞 `t_customer_pkey`
+    // （23505），与「同一个 helper 调几次」无关。
+    let id = hsh_erp_test_support::shared_test_snowflake().next_id();
     let now = now_naive();
     // serial_prefix 是 varchar(1) + regex ^[A-Z]$ —— 取 name 首字母大写；fallback 'X'
     let one_char: String = name
@@ -173,10 +174,11 @@ async fn insert_l1(pool: &PgPool, name: &str) -> i64 {
 #[allow(dead_code)]
 async fn insert_l2(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    // 2026-10-09：ID 统一从全进程共享 generator 取（`shared_test_snowflake`）——
+    // 两个 fresh generator 同 instance 同毫秒各取 seq 0 会撞 `t_customer_pkey`
+    // （23505），与「同一个 helper 调几次」无关。
+    let id = hsh_erp_test_support::shared_test_snowflake().next_id();
     let now = now_naive();
     sqlx::query!(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
@@ -202,10 +204,11 @@ async fn insert_part_referencing_applicant(
     applicant_name: &str,
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    // 2026-10-09：ID 统一从全进程共享 generator 取（`shared_test_snowflake`）——
+    // 两个 fresh generator 同 instance 同毫秒各取 seq 0 会撞 `t_customer_pkey`
+    // （23505），与「同一个 helper 调几次」无关。
+    let id = hsh_erp_test_support::shared_test_snowflake().next_id();
     let now = now_naive();
     let today = now.date();
     sqlx::query!(

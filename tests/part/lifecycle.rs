@@ -97,10 +97,8 @@ async fn insert_part_with_batch(
     qty: i32,
 ) -> (i64, i64) {
     use hsh_erp_rust::infra::clock::now_naive;
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let part_id = snowflake.next_id();
-    let batch_id = snowflake.next_id();
+    let part_id = hsh_erp_test_support::shared_test_snowflake().next_id();
+    let batch_id = hsh_erp_test_support::shared_test_snowflake().next_id();
     let now = now_naive();
     let today = now.date();
     sqlx::query(
@@ -505,10 +503,8 @@ async fn scan_deliver_part_requires_driver() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
     // 创建 part 带 serial_no
     use hsh_erp_rust::infra::clock::now_naive;
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let pid = snowflake.next_id();
-    let bid = snowflake.next_id();
+    let pid = hsh_erp_test_support::shared_test_snowflake().next_id();
+    let bid = hsh_erp_test_support::shared_test_snowflake().next_id();
     let now = now_naive();
     let today = now.date();
     sqlx::query(
@@ -568,11 +564,12 @@ async fn insert_part_with_two_delivered_batches(
     serial_no: &str,
 ) -> (i64, i64, i64, String) {
     use hsh_erp_rust::infra::clock::now_naive;
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 11);
-    let part_id = snowflake.next_id();
-    let b1 = snowflake.next_id();
-    let b2 = snowflake.next_id();
+    // 2026-10-09：原为 `new(1_577_836_800_000, 11)`（靠换 instance 与文件内其它
+    // helper 区分的权宜写法）。现统一走全进程共享 generator —— instance 这 10 bit
+    // 只该留给跨进程区分，进程内区分由共享对象按调用顺序串行发号天然保证。
+    let part_id = hsh_erp_test_support::shared_test_snowflake().next_id();
+    let b1 = hsh_erp_test_support::shared_test_snowflake().next_id();
+    let b2 = hsh_erp_test_support::shared_test_snowflake().next_id();
     let now = now_naive();
     let today = now.date();
     sqlx::query(
@@ -702,9 +699,8 @@ async fn multi_batch_complete_releases_serial_only_when_part_terminates() {
 
     // 释放后可被新工单复用（唯一索引不再拦）
     use hsh_erp_rust::infra::clock::now_naive;
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let sf = SnowflakeIdGenerator::new(1_577_836_800_000, 12);
-    let new_part = sf.next_id();
+    // 2026-10-09：原为 `new(1_577_836_800_000, 12)`（靠换 instance 避撞的权宜写法）。
+    let new_part = hsh_erp_test_support::shared_test_snowflake().next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
@@ -808,13 +804,14 @@ async fn insert_assembly_with_mixed_batches(
     part_serial: &str,
 ) -> (i64, i64, i64, i64) {
     use hsh_erp_rust::infra::clock::now_naive;
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    // instance=13 独占：与文件内其它 helper 的 instance 段不重叠
-    let sf = SnowflakeIdGenerator::new(1_577_836_800_000, 13);
-    let asm_id = sf.next_id();
-    let part_id = sf.next_id();
-    let b_done = sf.next_id();
-    let b_live = sf.next_id();
+    // 2026-10-09：原为 `new(1_577_836_800_000, 13)`、doc 写「instance=13 独占：与文件内
+    // 其它 helper 的 instance 段不重叠」—— 该说法已失效：instance 不同确实位段不同、
+    // 不会撞，但它是次优权宜之计。现统一走全进程共享 generator，进程内区分由共享
+    // 对象按调用顺序串行发号天然保证，不再需要靠 instance 制造区分度。
+    let asm_id = hsh_erp_test_support::shared_test_snowflake().next_id();
+    let part_id = hsh_erp_test_support::shared_test_snowflake().next_id();
+    let b_done = hsh_erp_test_support::shared_test_snowflake().next_id();
+    let b_live = hsh_erp_test_support::shared_test_snowflake().next_id();
     let now = now_naive();
     let today = now.date();
     sqlx::query(

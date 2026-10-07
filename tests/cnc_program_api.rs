@@ -20,7 +20,9 @@ use hsh_erp_rust::infra::cos::NoopCos;
 use hsh_erp_rust::modules::cnc_program::service::CncProgramService;
 use hsh_erp_rust::modules::part_file::service::PartFileService;
 use hsh_erp_rust::shared::error::AppError;
-use hsh_erp_test_support::{CncProgramFixture, load_cnc_program_fixture, test_pool};
+use hsh_erp_test_support::{
+    CncProgramFixture, load_cnc_program_fixture, shared_test_snowflake, test_pool,
+};
 use sqlx::PgPool;
 use std::sync::Arc;
 
@@ -45,17 +47,17 @@ async fn upload_pair_happy_path() {
     let pool = setup().await;
     let part_id = CncProgramFixture::PART_ID;
     let current = test_current_user(vec![Role::Manager]);
-    let snowflake = Arc::new(hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(
-        1_577_836_800_000,
-        1,
-    ));
+    // 2026-10-09：ID 统一从全进程共享 generator 取 —— 原为就地
+    // `Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1))`，两个 fresh generator
+    // 同 instance 同毫秒各取 seq 0 会撞主键（23505）。实参直接给 `shared_test_snowflake()`
+    // 克隆出的同一个 `Arc`，`src/` 侧 `Arc<SnowflakeIdGenerator>` 签名一行未改。
     let cos = Arc::new(NoopCos);
 
     let g_bytes = b"O0011\nG0 X0 Y0\n".to_vec();
     let setup_bytes = b"%PDF-1.5\nsetup\n%%EOF".to_vec();
 
     let mut tx = pool.begin().await.unwrap();
-    let out = CncProgramService::new(snowflake.clone(), cos.clone())
+    let out = CncProgramService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_cnc_pair(
             &mut *tx,
             part_id,
@@ -84,14 +86,10 @@ async fn upload_with_invalid_gcode_ext() {
     let pool = setup().await;
     let part_id = CncProgramFixture::PART_ID;
     let current = test_current_user(vec![Role::Manager]);
-    let snowflake = Arc::new(hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(
-        1_577_836_800_000,
-        1,
-    ));
     let cos = Arc::new(NoopCos);
 
     let mut tx = pool.begin().await.unwrap();
-    let err = CncProgramService::new(snowflake.clone(), cos.clone())
+    let err = CncProgramService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_cnc_pair(
             &mut *tx,
             part_id,
@@ -118,14 +116,10 @@ async fn upload_with_invalid_setup_ext() {
     let pool = setup().await;
     let part_id = CncProgramFixture::PART_ID;
     let current = test_current_user(vec![Role::Manager]);
-    let snowflake = Arc::new(hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(
-        1_577_836_800_000,
-        1,
-    ));
     let cos = Arc::new(NoopCos);
 
     let mut tx = pool.begin().await.unwrap();
-    let err = CncProgramService::new(snowflake.clone(), cos.clone())
+    let err = CncProgramService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_cnc_pair(
             &mut *tx,
             part_id,
@@ -151,14 +145,10 @@ async fn upload_with_invalid_setup_ext() {
 async fn upload_part_not_found_returns_20101() {
     let pool = setup().await;
     let current = test_current_user(vec![Role::Manager]);
-    let snowflake = Arc::new(hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(
-        1_577_836_800_000,
-        1,
-    ));
     let cos = Arc::new(NoopCos);
 
     let mut tx = pool.begin().await.unwrap();
-    let err = CncProgramService::new(snowflake.clone(), cos.clone())
+    let err = CncProgramService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_cnc_pair(
             &mut *tx,
             99_999_999_999,
@@ -185,14 +175,10 @@ async fn upload_rbac_clerk_returns_403() {
     let pool = setup().await;
     let part_id = CncProgramFixture::PART_ID;
     let clerk = test_current_user(vec![Role::Clerk]);
-    let snowflake = Arc::new(hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(
-        1_577_836_800_000,
-        1,
-    ));
     let cos = Arc::new(NoopCos);
 
     let mut tx = pool.begin().await.unwrap();
-    let err = CncProgramService::new(snowflake.clone(), cos.clone())
+    let err = CncProgramService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_cnc_pair(
             &mut *tx,
             part_id,
@@ -219,16 +205,12 @@ async fn list_pairs_for_part() {
     let pool = setup().await;
     let part_id = CncProgramFixture::PART_ID;
     let current = test_current_user(vec![Role::Manager]);
-    let snowflake = Arc::new(hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(
-        1_577_836_800_000,
-        1,
-    ));
     let cos = Arc::new(NoopCos);
 
     // 上传 2 对（用不同内容避开 CAS 去重）
     for i in 0..2 {
         let mut tx = pool.begin().await.unwrap();
-        CncProgramService::new(snowflake.clone(), cos.clone())
+        CncProgramService::new(shared_test_snowflake().clone(), cos.clone())
             .upload_cnc_pair(
                 &mut *tx,
                 part_id,
@@ -247,7 +229,7 @@ async fn list_pairs_for_part() {
     }
 
     let mut tx = pool.begin().await.unwrap();
-    let list = CncProgramService::new(snowflake.clone(), cos.clone())
+    let list = CncProgramService::new(shared_test_snowflake().clone(), cos.clone())
         .list_pairs_for_part(&mut *tx, part_id, &current)
         .await
         .unwrap();
@@ -267,14 +249,10 @@ async fn alias_download_url_returns_part_file_with_url() {
     let pool = setup().await;
     let part_id = CncProgramFixture::PART_ID;
     let current = test_current_user(vec![Role::Manager]);
-    let snowflake = Arc::new(hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(
-        1_577_836_800_000,
-        1,
-    ));
     let cos = Arc::new(NoopCos);
 
     let mut tx = pool.begin().await.unwrap();
-    let out = CncProgramService::new(snowflake.clone(), cos.clone())
+    let out = CncProgramService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_cnc_pair(
             &mut *tx,
             part_id,
@@ -295,7 +273,7 @@ async fn alias_download_url_returns_part_file_with_url() {
 
     // /download-url alias 应等于 part-files/{id}/url
     let mut tx = pool.begin().await.unwrap();
-    let dl_url = PartFileService::new(snowflake.clone(), cos.clone())
+    let dl_url = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .get_file_with_url(&mut *tx, cos.clone(), "uploads", g_id, &current)
         .await
         .expect("alias download-url ok");
@@ -304,7 +282,7 @@ async fn alias_download_url_returns_part_file_with_url() {
     assert_eq!(dl_url.kind, "G_CODE");
 
     let mut tx = pool.begin().await.unwrap();
-    let dl_url_s = PartFileService::new(snowflake.clone(), cos.clone())
+    let dl_url_s = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .get_file_with_url(&mut *tx, cos.clone(), "uploads", s_id, &current)
         .await
         .expect("alias download-url setup ok");
@@ -318,14 +296,10 @@ async fn alias_content_returns_bytes() {
     let pool = setup().await;
     let part_id = CncProgramFixture::PART_ID;
     let current = test_current_user(vec![Role::Manager]);
-    let snowflake = Arc::new(hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(
-        1_577_836_800_000,
-        1,
-    ));
     let cos = Arc::new(NoopCos);
 
     let mut tx = pool.begin().await.unwrap();
-    let out = CncProgramService::new(snowflake.clone(), cos.clone())
+    let out = CncProgramService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_cnc_pair(
             &mut *tx,
             part_id,
@@ -343,7 +317,7 @@ async fn alias_content_returns_bytes() {
 
     // alias content
     let mut tx = pool.begin().await.unwrap();
-    let content = PartFileService::new(snowflake.clone(), cos.clone())
+    let content = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .get_file_content(&mut *tx, cos.clone(), "uploads", out.g_code.id, &current)
         .await
         .expect("alias content ok");
@@ -358,14 +332,10 @@ async fn alias_delete_soft_deletes_file() {
     let pool = setup().await;
     let part_id = CncProgramFixture::PART_ID;
     let current = test_current_user(vec![Role::Manager]);
-    let snowflake = Arc::new(hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(
-        1_577_836_800_000,
-        1,
-    ));
     let cos = Arc::new(NoopCos);
 
     let mut tx = pool.begin().await.unwrap();
-    let out = CncProgramService::new(snowflake.clone(), cos.clone())
+    let out = CncProgramService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_cnc_pair(
             &mut *tx,
             part_id,
@@ -387,7 +357,7 @@ async fn alias_delete_soft_deletes_file() {
         .expect("get version");
 
     let mut tx = pool.begin().await.unwrap();
-    PartFileService::new(snowflake.clone(), cos.clone())
+    PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .soft_delete_file(&mut *tx, out.g_code.id, version, &current)
         .await
         .expect("alias delete ok");

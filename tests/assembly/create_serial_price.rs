@@ -194,13 +194,15 @@ async fn counter_of(pool: &PgPool, prefix: &str) -> i64 {
         .expect("查 t_serial_counter")
 }
 
-/// 造客户行用的雪花 ID：每次调用换一个 `instance_id`（同毫秒固定 instance 会撞主键）。
+/// 造客户行用的雪花 ID。
+///
+/// 2026-10-09：原实现是 `static INSTANCE: AtomicU16 = AtomicU16::new(910)` +
+/// `fetch_add` 自增 instance 再 `SnowflakeIdGenerator::new(...).next_id()` —— 那是
+/// 「换 instance 避撞」的权宜之计（instance 仅 10 bit = 1024 槽，且 `fetch_add`
+/// 自增过 1023 会直接 panic）。现统一从全进程共享 generator 取号：共享对象按
+/// `next_id()` 调用顺序串行发号，进程内天然唯一，不再需要靠 instance 制造区分度。
 fn raw_customer_id() -> i64 {
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    use std::sync::atomic::{AtomicU16, Ordering};
-    static INSTANCE: AtomicU16 = AtomicU16::new(910);
-    let instance = INSTANCE.fetch_add(1, Ordering::SeqCst);
-    SnowflakeIdGenerator::new(1_577_836_800_000, instance).next_id()
+    hsh_erp_test_support::shared_test_snowflake().next_id()
 }
 
 /// 直插 L1 客户（绕开 customer 域 service 的前缀校验，只为造 DB 形态）。

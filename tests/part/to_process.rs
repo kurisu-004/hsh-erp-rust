@@ -84,10 +84,11 @@ async fn insert_part_with_batch(
     batch_status: &str,
 ) -> (i64, i64) {
     use hsh_erp_rust::infra::clock::now_naive;
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let part_id = snowflake.next_id();
-    let batch_id = snowflake.next_id();
+    // 2026-10-09：ID 统一从全进程共享 generator 取（`shared_test_snowflake`）——
+    // 两个 fresh generator 同 instance 同毫秒各取 seq 0 会撞主键（23505），
+    // 与「同一个 helper 调几次」无关，取号顺序保持不变。
+    let part_id = hsh_erp_test_support::shared_test_snowflake().next_id();
+    let batch_id = hsh_erp_test_support::shared_test_snowflake().next_id();
     let now = now_naive();
     let today = now.date();
     sqlx::query(
@@ -426,10 +427,11 @@ async fn insert_part_with_batch_qty(
     qty: i32,
 ) -> (i64, i64) {
     use hsh_erp_rust::infra::clock::now_naive;
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let part_id = snowflake.next_id();
-    let batch_id = snowflake.next_id();
+    // 2026-10-09：ID 统一从全进程共享 generator 取（`shared_test_snowflake`）——
+    // 两个 fresh generator 同 instance 同毫秒各取 seq 0 会撞主键（23505），
+    // 与「同一个 helper 调几次」无关，取号顺序保持不变。
+    let part_id = hsh_erp_test_support::shared_test_snowflake().next_id();
+    let batch_id = hsh_erp_test_support::shared_test_snowflake().next_id();
     let now = now_naive();
     let today = now.date();
     sqlx::query(

@@ -91,10 +91,11 @@ async fn insert_part_with_batch_flagged(
     is_repairing: bool,
 ) -> (i64, i64) {
     use hsh_erp_rust::infra::clock::now_naive;
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let part_id = snowflake.next_id();
-    let batch_id = snowflake.next_id();
+    // 2026-10-09：ID 统一从全进程共享 generator 取（`shared_test_snowflake`）——
+    // 两个 fresh generator 同 instance 同毫秒各取 seq 0 会撞主键（23505），
+    // 与「同一个 helper 调几次」无关，取号顺序保持不变。
+    let part_id = hsh_erp_test_support::shared_test_snowflake().next_id();
+    let batch_id = hsh_erp_test_support::shared_test_snowflake().next_id();
     let now = now_naive();
     let today = now.date();
     sqlx::query(
@@ -446,13 +447,14 @@ async fn insert_step_located_delivered_part_batch(
     process_name: &str,
 ) -> (i64, i64, i64, String) {
     use hsh_erp_rust::infra::clock::now_naive;
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    // 2026-10-09：ID 统一从全进程共享 generator 取（`shared_test_snowflake`）——
+    // 两个 fresh generator 同 instance 同毫秒各取 seq 0 会撞主键（23505），
+    // 与「同一个 helper 调几次」无关，取号顺序保持不变。
     let now = now_naive();
     let today = now.date();
 
     // 1. 工序（列表查询只 JOIN t_process 取名，不需 t_shelf_process 映射）
-    let process_id = snowflake.next_id();
+    let process_id = hsh_erp_test_support::shared_test_snowflake().next_id();
     sqlx::query(
         "INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, \
          version, created_at, updated_at) \
@@ -467,7 +469,7 @@ async fn insert_step_located_delivered_part_batch(
     .expect("insert t_process");
 
     // 2. 工艺链 + step（step 指向该工序）
-    let chain_id = snowflake.next_id();
+    let chain_id = hsh_erp_test_support::shared_test_snowflake().next_id();
     sqlx::query(
         "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, \
          updated_at, updated_by) VALUES ($1, $2, 0, $3, 0, $3, 0)",
@@ -478,7 +480,7 @@ async fn insert_step_located_delivered_part_batch(
     .execute(pool)
     .await
     .expect("insert t_part_process_chain");
-    let step_id = snowflake.next_id();
+    let step_id = hsh_erp_test_support::shared_test_snowflake().next_id();
     sqlx::query(
         "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, \
          estimated_minutes, version, created_at, created_by, updated_at, updated_by) \
@@ -493,7 +495,7 @@ async fn insert_step_located_delivered_part_batch(
     .expect("insert t_process_chain_step");
 
     // 3. DELIVERED part（绑上 chain，与真实数据一致）
-    let part_id = snowflake.next_id();
+    let part_id = hsh_erp_test_support::shared_test_snowflake().next_id();
     sqlx::query(
         "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
          applicant_name, request_date, planned_delivery_date, quantity, version, \
@@ -512,7 +514,7 @@ async fn insert_step_located_delivered_part_batch(
     .expect("insert DELIVERED part with chain");
 
     // 4. DELIVERED 批次：step 有值、cpid **显式 NULL**（真实送检后形态）
-    let batch_id = snowflake.next_id();
+    let batch_id = hsh_erp_test_support::shared_test_snowflake().next_id();
     sqlx::query(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, \
          current_process_id, current_process_step_id, version, created_at, updated_at) \

@@ -65,8 +65,10 @@ async fn bootstrap_as_manager() -> (PgPool, String) {
 /// 触发 `20113 BIZ_CUSTOMER_IN_USE`。绕开 part 域 CRUD（part CRUD 不是本任务范畴）。
 async fn insert_part_with_customer(pool: &PgPool, customer_id: i64) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    // 2026-10-09：ID 统一从全进程共享 generator 取（`shared_test_snowflake`）——
+    // 两个 fresh generator 同 instance 同毫秒各取 seq 0 会撞 `t_part_pkey`（23505），
+    // 与「同一个 helper 调几次」无关。
+    let id = hsh_erp_test_support::shared_test_snowflake().next_id();
     let now = now_naive();
     sqlx::query!(
         "INSERT INTO t_part (id, name, drawing_no, applicant_name, quantity, unit_price, total_price, \

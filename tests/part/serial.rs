@@ -21,7 +21,6 @@
 // 本文件改测它。
 
 use hsh_erp_rust::infra::clock::now_naive;
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::shared::error::code;
 use hsh_erp_rust::shared::serial::acquire_via_pool;
 use hsh_erp_test_support::*;
@@ -81,8 +80,9 @@ async fn occupy_serial(
     customer_id: i64,
     status: &str,
 ) {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let part_id = snowflake.next_id();
+    // 2026-10-09：ID 统一从全进程共享 generator 取（`shared_test_snowflake`）——
+    // 两个 fresh generator 同 instance 同毫秒各取 seq 0 会撞 `t_part_pkey`（23505）。
+    let part_id = hsh_erp_test_support::shared_test_snowflake().next_id();
     let serial = format!("{prefix}{suffix:04}");
     let now = now_naive();
     let today = now.date();
@@ -108,9 +108,9 @@ async fn occupy_serial(
 /// `uk_t_assembly_serial_no` 的谓词是 `deleted_at IS NULL AND serial_no IS NOT NULL`
 /// （**无** status 谓词）⇒ 任何未软删的装配件都占坑，`COMPLETED` 也不例外。
 async fn occupy_assembly_serial(pool: &sqlx::PgPool, prefix: &str, suffix: i64, status: &str) {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let assembly_id = snowflake.next_id();
-    let customer_id = snowflake.next_id();
+    // 2026-10-09：ID 统一从全进程共享 generator 取（取号顺序不变）。
+    let assembly_id = hsh_erp_test_support::shared_test_snowflake().next_id();
+    let customer_id = hsh_erp_test_support::shared_test_snowflake().next_id();
     let serial = format!("{prefix}{suffix:04}");
     let now = now_naive();
     let today = now.date();
@@ -190,7 +190,7 @@ async fn acquire_taken_serial_skips_to_next() {
     seed_prefix(&pool, "X").await;
 
     // 占 X1000；acquire 应跳过 X1000，返回 X1001
-    let dummy_cid = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
+    let dummy_cid = hsh_erp_test_support::shared_test_snowflake().next_id();
     occupy_serial(&pool, "X", 1000, dummy_cid, "PENDING").await;
 
     let serial = acquire_via_pool(&pool, 'X').await.expect("acquire X");
@@ -215,7 +215,7 @@ async fn acquire_skips_completed_part_serial() {
     reset_serial_state(&pool).await;
     seed_prefix(&pool, "X").await;
 
-    let dummy_cid = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
+    let dummy_cid = hsh_erp_test_support::shared_test_snowflake().next_id();
     occupy_serial(&pool, "X", 1000, dummy_cid, "COMPLETED").await;
 
     let serial = acquire_via_pool(&pool, 'X').await.expect("acquire X");
@@ -227,7 +227,6 @@ async fn acquire_skips_completed_part_serial() {
     assert_eq!(counter_of(&pool, "X").await, 2, "跳过一次 ⇒ counter 落到 2");
 
     // 拿派到的号真插一行：谓词写宽时这里会撞 uk_t_part_serial_no（23505）
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
@@ -235,7 +234,7 @@ async fn acquire_skips_completed_part_serial() {
          version, created_at, updated_at) \
          VALUES ($1, $2, 'NEW', 'D-NEW', $3, 'PENDING', 'TEST', $4, $4, 1, 0, $5, $5)",
     )
-    .bind(snowflake.next_id())
+    .bind(hsh_erp_test_support::shared_test_snowflake().next_id())
     .bind(&serial)
     .bind(dummy_cid)
     .bind(now.date())
@@ -270,7 +269,6 @@ async fn acquire_skips_completed_assembly_serial() {
     assert_eq!(counter_of(&pool, "X").await, 2, "跳过一次 ⇒ counter 落到 2");
 
     // 拿派到的号真插一行：漏查 t_assembly 时这里会撞 uk_t_assembly_serial_no（23505）
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_assembly (id, drawing_no, name, customer_id, status, \
@@ -278,8 +276,8 @@ async fn acquire_skips_completed_assembly_serial() {
          version, created_at, updated_at) \
          VALUES ($1, 'D-ASM-NEW', 'NEW-ASM', $2, 'PENDING', $3, $3, 1, $4, 0, $5, $5)",
     )
-    .bind(snowflake.next_id())
-    .bind(snowflake.next_id())
+    .bind(hsh_erp_test_support::shared_test_snowflake().next_id())
+    .bind(hsh_erp_test_support::shared_test_snowflake().next_id())
     .bind(now.date())
     .bind(&serial)
     .bind(now)

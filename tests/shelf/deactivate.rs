@@ -35,7 +35,6 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 
 use hsh_erp_rust::infra::clock::now_naive;
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_test_support::{
     ShelfFixture, json_request, load_shelf_fixture, login_token, send, test_app, test_pool,
     test_state,
@@ -69,8 +68,9 @@ async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, ShelfFixture) 
 /// 直插与 fixtures::insert_shelf 同形 SQL（columns / defaults 全部对齐
 /// migration 003 的 t_shelf schema）。
 async fn insert_shelf(pool: &PgPool, code: &str, name: &str, zone: &str) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    // 2026-10-09：ID 统一从全进程共享 generator 取（`shared_test_snowflake`）——
+    // 两个 fresh generator 同 instance 同毫秒各取 seq 0 会撞 `t_shelf_pkey`（23505）。
+    let id = hsh_erp_test_support::shared_test_snowflake().next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_shelf (id, code, name, zone, is_active, display_order, version, \
@@ -91,9 +91,8 @@ async fn insert_shelf(pool: &PgPool, code: &str, name: &str, zone: &str) -> i64 
 /// 直插 L1（parent_id=NULL, prefix='F'）+ L2（parent_id=L1.id, prefix=NULL），
 /// 绕开业务 API + 避开 `uq_t_customer_root_prefix`（part fixture L1 已占 prefix='P'）。
 async fn insert_l2_customer(pool: &PgPool) -> (i64, i64) {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let now = now_naive();
-    let l1 = snowflake.next_id();
+    let l1 = hsh_erp_test_support::shared_test_snowflake().next_id();
     sqlx::query(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
          created_at, updated_at) VALUES ($1, $2, NULL, $3, 0, $4, $4)",
@@ -105,7 +104,7 @@ async fn insert_l2_customer(pool: &PgPool) -> (i64, i64) {
     .execute(pool)
     .await
     .expect("insert L1");
-    let l2 = snowflake.next_id();
+    let l2 = hsh_erp_test_support::shared_test_snowflake().next_id();
     sqlx::query(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
          created_at, updated_at) VALUES ($1, $2, $3, NULL, 0, $4, $4)",
@@ -122,8 +121,7 @@ async fn insert_l2_customer(pool: &PgPool) -> (i64, i64) {
 
 /// 直插一个 t_part 行（IN_PROCESS 状态，customer_id 由 caller 指定）。
 async fn insert_part(pool: &PgPool, customer_id: i64, name: &str, serial_no: Option<&str>) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = hsh_erp_test_support::shared_test_snowflake().next_id();
     let now = now_naive();
     let today = now.date();
     sqlx::query(
@@ -152,8 +150,7 @@ async fn insert_batch(
     location: &str,
     holder_id: Option<i64>,
 ) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = hsh_erp_test_support::shared_test_snowflake().next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
@@ -174,8 +171,7 @@ async fn insert_batch(
 
 /// 直插一个最小 t_worker 行（无 work_type_id，由 worker_pool 域按需绑）。
 async fn insert_worker_min(pool: &PgPool, badge: &str, name: &str) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = hsh_erp_test_support::shared_test_snowflake().next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_worker (id, badge_code, name, is_active, work_type_id, version, \

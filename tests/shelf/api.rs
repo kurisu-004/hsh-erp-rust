@@ -91,9 +91,11 @@ async fn insert_part_held_by_shelf(
     quantity: i32,
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
-    let batch_id = snowflake.next_id();
+    // 2026-10-09：ID 统一从全进程共享 generator 取（`shared_test_snowflake`）——
+    // 两个 fresh generator 同 instance 同毫秒各取 seq 0 会撞 `t_part_pkey`（23505），
+    // 与「同一个 helper 调几次」无关。
+    let id = hsh_erp_test_support::shared_test_snowflake().next_id();
+    let batch_id = hsh_erp_test_support::shared_test_snowflake().next_id();
     let now = now_naive();
     // 2026-09-16 PR-2（migration 027）：t_part 删 `current_holder_id` 等批次依附列；
     // INSERT 列名与 VALUES 占位符同步移除 `0, 0`（unit_price/total_price 不再写）。
