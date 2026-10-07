@@ -281,7 +281,8 @@ pub struct PartListItem {
     /// 2026-10-04 新增：下一道工序 id。
     ///
     /// 非可空 + `"0"` 兜底（沿用仓库既有的 `COALESCE(..., 0)` + `serialize_i64`
-    /// 口径，与 `GET /outsource-pool/state` 的 `receive_next_process_id` 同款）：
+    /// 口径，与 `GET /outsource-queue/processes/{id}` 的
+    /// `companies[].held_batches[].receive_next_process_id` 同款）：
     /// JSON 里恒出现，语义为字符串 `"0"` = 无下一道。仅 `by-worker` 填，
     /// `chain_state != NEXT` 时为 `0`。
     #[serde(serialize_with = "serialize_i64")]

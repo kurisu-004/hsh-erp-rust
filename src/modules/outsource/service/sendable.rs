@@ -18,6 +18,13 @@
 //!
 //! ## 事务边界
 //! 读端点：handler `pool.acquire()` 不开事务，service 借 `&mut *conn`。
+//!
+//! ## 2026-10-09：三个纯函数提为 `pub(crate)`
+//! 看板聚合线（`super::board`）的候选列与本端点**同源**（同一份
+//! `repo/sql.rs::SENDABLE_INNER_X_SQL` 谓词 + 同一个 `DISTINCT ON` 收敛层），因此
+//! `send_mode_of` / `can_send_of` / `decode_company_options` 三处必须共用同一份实现
+//! —— 两边各写一遍时，「tab 内行数 ≠ 一览行数」这类对账事故是静默的。把它们留在本
+//! 模块并放开到 `pub(crate)`，比在看板侧复制粘贴一份更便宜。
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::modules::outsource::dto::OutsourceSendableListQuery;
@@ -33,7 +40,7 @@ use super::{DEFAULT_LIMIT, LIST_MAX_LIMIT, OutsourceService, join_customer_path,
 ///
 /// 解不出来（理论上不会：SQL 侧已 `COALESCE` 成 `ARRAY[]::json[]`）时**降级为空数组**
 /// 而不是让整个 list 端点 500 —— 少一个下拉选项远好过整页不可用。
-fn decode_company_options(raw: serde_json::Value) -> Vec<OutsourceCompanyOption> {
+pub(crate) fn decode_company_options(raw: serde_json::Value) -> Vec<OutsourceCompanyOption> {
     serde_json::from_value(raw).unwrap_or_default()
 }
 
@@ -63,12 +70,25 @@ fn decode_company_options(raw: serde_json::Value) -> Vec<OutsourceCompanyOption>
 ///    `CASE WHEN q.id IS NOT NULL` 短路成 `[]`（`q.id` 为 NULL）⇒ 前端
 ///    `canSend()`（要求 APPROVAL 或 `company_options.length >= 1`）把该行置灰，
 ///    不会出现「用 0 元占位价发货」。
-pub(super) fn send_mode_of(requires_approval: bool, has_approved_quote: bool) -> &'static str {
+pub(crate) fn send_mode_of(requires_approval: bool, has_approved_quote: bool) -> &'static str {
     if requires_approval && has_approved_quote {
         "APPROVAL"
     } else {
         "DIRECT"
     }
+}
+
+/// 该候选行能否发送：`APPROVAL` 恒可发（报价已批），`DIRECT` 需至少一个候选公司。
+///
+/// 提成独立函数是为了能单测 —— 这条判定同时驱动「卡片是否置灰」和「拖到公司列后能否
+/// 真发出去」，两处口径漂移的代价是用户点了没反应。
+///
+/// ⚠️ **当前只有看板候选列消费本函数**（`GET /outsource-sendable` 的出参 VO 没有
+/// `can_send` 字段，前端按 `send_mode` 与 `company_options.length` 自行判定）。函数
+/// 放在本模块而不是看板侧，是因为判定与 `send_mode_of` / `company_options` 是一组，
+/// 而这三个函数的真源都在这里。
+pub(crate) fn can_send_of(send_mode: &str, company_options: &[OutsourceCompanyOption]) -> bool {
+    send_mode == "APPROVAL" || !company_options.is_empty()
 }
 
 impl OutsourceService {
@@ -102,6 +122,7 @@ impl OutsourceService {
                 // send_mode 由「该外协工序是否需要审批」决定（`requires_approval`），
                 // 命中已批准报价的免审批工序仍判 DIRECT —— 见 `send_mode_of`。
                 let send_mode = send_mode_of(r.requires_approval, r.quote_id.is_some());
+                let company_options = decode_company_options(r.company_options);
                 OutsourceSendableItem {
                     version: r.batch_version,
                     send_mode: send_mode.to_string(),
@@ -126,7 +147,7 @@ impl OutsourceService {
                     outsource_company_id: r.outsource_company_id,
                     outsource_company_name: r.outsource_company_name,
                     quote_id: r.quote_id,
-                    company_options: decode_company_options(r.company_options),
+                    company_options,
                     price: r.price,
                     status_label: "sendable".to_string(),
                 }

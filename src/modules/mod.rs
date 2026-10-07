@@ -117,12 +117,16 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .nest("/outsource-companies", outsource::company_router())
         .nest("/outsource-quotes", outsource::quote_router())
         .nest("/outsource-shipments", outsource::shipment_router())
-        // 2026-10-03 新增：可发送外协一览（独立顶层前缀；非任何单一域的子资源）
+        // 2026-10-03 新增：可发送外协一览（独立顶层前缀；非任何单一域的子资源）。
+        // ⚠️ **随看板移动写端点接管删除**（本轮仍在线）：`GET
+        // /outsource-queue/processes/{id}` 的候选列已经是不分页的同一批行，本端点是
+        // 它的一个分页子集。看板不再需要它 → 下一步连同 `sendable_router()` 一起摘掉。
         .nest("/outsource-sendable", outsource::sendable_router())
-        // 2026-10-03 新增：外协看板三件套（按外协工序切 tab；形态照抄 /prod/pool，
-        // 前端可复用同一套 queryKey / 失效编排）。既有 /outsource-sendable 与
-        // /outsource-shipments/in-flight 都不接受 process_id 且分页，无法支撑切 tab。
-        .nest("/outsource-pool", outsource::pool_router())
+        // 2026-10-09 更名（旧挂载点 `/outsource-pool`，三条端点同时下线）：外协看板
+        // 两条只读聚合（`GET /snapshot` + `GET /processes/{id}`）。改名理由与
+        // `prod::worker_pool → prod::queue` 同源 —— `pool` 只覆盖「候选池」一块，
+        // 而本 nest 返回「候选 + 公司列 + 内联在途批次」的整块看板。
+        .nest("/outsource-queue", outsource::queue_router())
         .nest("/delivery-notes", delivery_note::router())
         .nest("/delivery-groups", p1_router())
         .nest("/statistics", statistics::router())

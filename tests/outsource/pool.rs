@@ -1,37 +1,44 @@
-//! `GET /outsource-pool/*` 看板三件套集成测试（2026-10-03 新增）
+//! 外协看板读端点集成测试（`GET /outsource-queue/snapshot` +
+//! `GET /outsource-queue/processes/{id}`）
 //!
-//! 形态模板：`tests/production/queue.rs`（2026-10-08 后为 `/prod/queue/{snapshot,processes/{id}}`）。
+//! 文件名沿用 `pool.rs`（原三条 `/outsource-pool/*` 端点的测试），路径已全部改打新
+//! 前缀。形态模板：`tests/production/queue_board.rs`（`prod::queue` 板聚合）。
 //!
 //! 覆盖（与本轮验收标准逐条对应）：
-//! 1. `pool_counts_returns_200_sorted_and_totals_match`
-//! 2. `pool_detail_lists_all_mapped_companies_including_empty_column`
-//! 3. `pool_detail_items_match_sendable_endpoint_field_by_field`（**防 SQL 分叉的核心断言**）
-//! 4. `pool_detail_keeps_direct_row_with_empty_company_options`
-//! 5. `pool_state_returns_held_batches_with_shipment_fields`
-//! 6. `pool_state_chain_resolvable_when_next_step_exists`
-//! 7. `pool_state_chain_unresolvable_when_no_step_or_chain_tail`
-//! 8. `pool_state_rejects_missing_query_params_with_400`
-//! 9. `pool_serializes_snowflake_ids_and_price_as_strings`
-//! 10. `pool_counts_and_state_are_static_routes_not_process_id`（注册顺序守卫）
-//! 11. 权限：`pool_counts_allows_clerk_role`（正向）+ `pool_counts_forbidden_for_shelf_account`
-//!     / `pool_by_process_forbidden_for_shelf_account` / `pool_state_forbidden_for_shelf_account`
-//!     （三个端点各一条负向回归网）
-//! 12. `pool_state_derives_next_step_from_parts_current_chain_after_rebind`（读侧锚链与写侧同源）
+//! 1. `snapshot_returns_200_sorted_and_totals_match` —— 工序序列板按 `process_id ASC`、
+//!    只含非零工序、两个 total 对得上、**响应里没有 `total` 字段**（可由两个 total 相加）
+//! 2. `snapshot_color_and_category_are_carried` —— 新增的 `color` / `category` 真有数据
+//! 3. `detail_lists_all_mapped_companies_with_inlined_held_batches` —— 右列含
+//!    `held_count = 0` 的空列，且 **`held_count == held_batches.len()`**
+//! 4. `detail_keeps_direct_row_with_empty_company_options`
+//! 5. `detail_items_match_sendable_endpoint_field_by_field`（**防 SQL 分叉的核心断言**）
+//! 6. `detail_candidate_carries_new_card_fields` —— 5 个新增字段 + 拆开的客户两字段，
+//!    并断言 3 个已删字段**不再出现**
+//! 7. `detail_held_batches_carry_shipment_fields`
+//! 8. `detail_chain_resolvable_when_next_step_exists`
+//! 9. `detail_chain_unresolvable_when_no_step_or_chain_tail`
+//! 10. `detail_derives_next_step_from_parts_current_chain_after_rebind`（读侧锚链与写侧同源）
+//! 11. `detail_does_not_fan_out_on_duplicate_applicant_name`（`t_applicant` 重名不扇出 ——
+//!     `LEFT JOIN LATERAL` 的必要性）
+//! 12. `snapshot_serializes_snowflake_ids_and_price_as_strings`
+//! 13. `snapshot_and_processes_routes_do_not_collide`（路由段数守卫 + 旧路径 404）
+//! 14. 权限：`snapshot_allows_clerk_role`（正向）+ `snapshot_forbidden_for_shelf_account`
+//!     / `process_detail_forbidden_for_shelf_account`（两条负向回归网）
+//! 15. `detail_unknown_process_returns_404`
+//! 16. `snapshot_empty_returns_zeroed_totals`
 //!
-//! ## 候选侧（counts.sendable_count / {process_id}.items）的新判据
-//! 2026-10-03 起候选批次由 `t_part_batch.current_process_id` 判定（必须指向一道
-//! OUTSOURCE 工序），**不再要求零件绑了工艺链**；且该工序 `requires_approval = true`
-//! 时必须已有 APPROVED 报价。故本文件的两个 helper 都加了对应形参：
-//! `seed_outsource_process(.., requires_approval)` 与
-//! `insert_candidate_batch(.., process_id, ..)`。
-//! 13. `pool_state_does_not_fan_out_on_duplicate_applicant_name`（`t_applicant` 重名不扇出）
+//! ## 候选侧（`processes[].sendable_count` / `items`）的新判据
+//! 候选批次由 `t_part_batch.current_process_id` 判定（必须指向一道 OUTSOURCE 工序），
+//! **不再要求零件绑了工艺链**；且该工序 `requires_approval = true` 时必须已有 APPROVED
+//! 报价。故本文件两个 seed helper 都带对应形参：
+//! `seed_outsource_process(.., requires_approval)` 与 `insert_candidate_batch(.., process_id, ..)`。
 //!
 //! ## fixture 范本
 //! 通用基建（`send` / `json_request` / `test_app` / `test_pool` / `test_state` /
-//! `login_token` / `load_outsource_fixture`）全部走 `hsh_erp_test_support`，
-//! **不重复声明**。本文件只声明 pool 域独享的数据构造 helper（客户 / 零件 /
-//! 工序 / 货架 / 工艺链多 step / 批次 / 公司 / 报价 / shipment）—— 这些每个用例
-//! 都要按需造不同组合，fixture 预置会污染 counts 的「只含非零工序」断言。
+//! `login_token` / `load_outsource_fixture`）全部走 `hsh_erp_test_support`，**不重复声明**。
+//! 本文件只声明看板域独享的数据构造 helper（客户 / 零件 / 工序 / 货架 / 工艺链多 step /
+//! 批次 / 公司 / 报价 / shipment / 申请人 / G_CODE 文件）—— 这些每个用例都要按需造不同
+//! 组合，fixture 预置会污染 snapshot 的「只含非零工序」断言。
 
 use axum::http::StatusCode;
 use serde_json::{Value, json};
@@ -114,8 +121,8 @@ async fn add_role(
 
 /// SHELF scope 账号登录（scope 限定到给定 shelves；必须给 scope 才能通过登录校验）。
 ///
-/// pool 域独享：`OutsourceFixture` 的 shelf scope 绑的是 fixture 预置货架，
-/// 负向用例要的是「只认货架、看不到全厂」的账号，本地 helper 便于按用例限定。
+/// 看板域独享：`OutsourceFixture` 的 shelf scope 绑的是 fixture 预置货架，负向用例要的
+/// 是「只认货架、看不到全厂」的账号，本地 helper 便于按用例限定。
 async fn login_shelf_account(
     pool: PgPool,
     username: &str,
@@ -138,7 +145,7 @@ async fn login_shelf_account(
 }
 
 // ===========================================================================
-//  pool 域独享 helpers（直插 `sqlx::query`；与 sendable.rs / send_receive.rs 同形）
+//  看板域独享 helpers（直插 `sqlx::query`；与 sendable.rs / send_receive.rs 同形）
 // ===========================================================================
 
 /// 取一个测试用雪花 ID。
@@ -146,8 +153,7 @@ async fn login_shelf_account(
 /// 走 `test-support::pool_snowflake()`（**进程级** `OnceLock<Mutex<..>>`，instance
 /// 由 pid ⊕ 启动时间派生）而不是每次 `SnowflakeIdGenerator::new(...)` 新建 ——
 /// 新建的话同一毫秒内连续两次调用会生成**完全相同**的 id（`instance=1` + 同一
-/// 时间戳 + seq 都从 0 开始），撞 `t_*_pkey`。本文件建公司的间隔只有一次
-/// await，实测能在同一毫秒内跑到两次。
+/// 时间戳 + seq 都从 0 开始），撞 `t_*_pkey`。
 fn next_id() -> i64 {
     pool_snowflake().lock().expect("pool_snowflake").next_id()
 }
@@ -193,6 +199,21 @@ async fn insert_part(pool: &PgPool, customer_id: i64, tag: &str, planned: &str) 
     id
 }
 
+/// 补 part 的卡片字段（`system_delivery_date` / `note` / `is_urgent`）。
+async fn set_part_card_fields(pool: &PgPool, part_id: i64, system: &str, note: &str, urgent: bool) {
+    sqlx::query(
+        "UPDATE t_part SET system_delivery_date = $1::date, note = $2, is_urgent = $3 \
+         WHERE id = $4",
+    )
+    .bind(system)
+    .bind(note)
+    .bind(urgent)
+    .bind(part_id)
+    .execute(pool)
+    .await
+    .expect("update t_part card fields");
+}
+
 /// 直插申请人（`t_applicant` 唯一索引是 `(name, customer_id)`，name 单独可重名）。
 async fn insert_applicant(pool: &PgPool, name: &str, customer_id: i64) -> i64 {
     let id = next_id();
@@ -219,6 +240,24 @@ async fn set_part_applicant(pool: &PgPool, part_id: i64, applicant_name: &str) {
         .execute(pool)
         .await
         .expect("update t_part.applicant_name");
+}
+
+/// 直插一条 `G_CODE` 程序文件（看板卡片角标 `has_cnc_program` 的唯一来源）。
+async fn insert_g_code_file(pool: &PgPool, part_id: i64) -> i64 {
+    let id = next_id();
+    sqlx::query(
+        "INSERT INTO t_part_file (id, part_id, kind, file_type, object_key, original_filename, \
+         file_size, content_type, upload_status, version, created_at, updated_at) \
+         VALUES ($1, $2, 'G_CODE', 'TEXT', $3, $4, 128, 'text/plain', 'READY', 0, now(), now())",
+    )
+    .bind(id)
+    .bind(part_id)
+    .bind(format!("gcode/{part_id}.nc"))
+    .bind(format!("{part_id}.nc"))
+    .execute(pool)
+    .await
+    .expect("insert t_part_file (G_CODE)");
+    id
 }
 
 /// 直插 OUTSOURCE 类别工序，返回 `(id, code, name)`。
@@ -267,6 +306,16 @@ async fn seed_inhouse_process(pool: &PgPool, code: &str) -> (i64, String, String
     .await
     .expect("insert t_process");
     (id, code.to_string(), name)
+}
+
+/// 给工序补 `color`（看板 tab 的 `#RRGGBBAA` 徽标）。
+async fn set_process_color(pool: &PgPool, process_id: i64, color: &str) {
+    sqlx::query("UPDATE t_process SET color = $1 WHERE id = $2")
+        .bind(color)
+        .bind(process_id)
+        .execute(pool)
+        .await
+        .expect("update t_process.color");
 }
 
 async fn insert_shelf(pool: &PgPool, code: &str) -> i64 {
@@ -364,8 +413,7 @@ async fn create_chain_with_steps(
 /// 直插候选批次（在架上等发外协）：`status='PENDING'` + `location='PRODUCTION_SHELF'`
 /// + `current_process_id = process_id`。
 ///
-/// `current_process_id` 是候选侧判定的权威依据（2026-10-03 起不再靠「货架绑了哪些
-/// 外协工序」枚举），故必须显式给出。
+/// `current_process_id` 是候选侧判定的权威依据，故必须显式给出。
 async fn insert_candidate_batch(
     pool: &PgPool,
     part_id: i64,
@@ -393,8 +441,7 @@ async fn insert_candidate_batch(
 /// 直插在外协的批次：`status='OUTSOURCE'` + `location='OUTSOURCE_COMPANY'` +
 /// `current_holder_id = company_id` + `current_process_id = process_id`。
 ///
-/// 这 4 列正是 `prod::batch::service::outsource.rs::send_to_outsource` 落的形状
-/// （见该文件 `mark_batch_with_status_and_meta(...)` 调用）。
+/// 这 4 列正是 `prod::batch::service::outsource.rs::send_to_outsource` 落的形状。
 async fn insert_held_batch(
     pool: &PgPool,
     part_id: i64,
@@ -527,24 +574,15 @@ async fn get(app: &axum::Router, token: &str, uri: &str) -> (StatusCode, Value) 
     .await
 }
 
-async fn get_counts(app: &axum::Router, token: &str) -> (StatusCode, Value) {
-    get(app, token, "/outsource-pool/counts").await
+async fn get_snapshot(app: &axum::Router, token: &str) -> (StatusCode, Value) {
+    get(app, token, "/outsource-queue/snapshot").await
 }
 
 async fn get_detail(app: &axum::Router, token: &str, process_id: i64) -> (StatusCode, Value) {
-    get(app, token, &format!("/outsource-pool/{process_id}")).await
-}
-
-async fn get_state(
-    app: &axum::Router,
-    token: &str,
-    company_id: i64,
-    process_id: i64,
-) -> (StatusCode, Value) {
     get(
         app,
         token,
-        &format!("/outsource-pool/state?outsource_company_id={company_id}&process_id={process_id}"),
+        &format!("/outsource-queue/processes/{process_id}"),
     )
     .await
 }
@@ -555,10 +593,9 @@ async fn get_sendable(app: &axum::Router, token: &str) -> (StatusCode, Value) {
 
 /// 只取状态码 + 原始 body（不解析 JSON）。
 ///
-/// axum 的 `QueryRejection`（query 反序列化失败）返回的是**纯文本** 400，不走
-/// `R<T>` 信封 —— 与 part 域旧路径被 `Path<i64>` catch-all 兜成纯文本 400 是同一
-/// 个 axum 层行为（成因见 `src/modules/part/mod.rs` 的模块 doc）。因此断言「缺参数
-/// 必须 400」不能用共享的 `send`（它强制解析 JSON，非 JSON body 会 panic）。
+/// axum 的路由未命中返回的是**空 body 的 404**，不走 `R<T>` 信封 —— 与
+/// `QueryRejection` 的纯文本 400 属同一类「axum 层行为」。因此断言「旧路径已下线」
+/// 不能用共享的 `send`（它强制解析 JSON，空 body 会 panic）。
 async fn get_raw(app: &axum::Router, token: &str, uri: &str) -> (StatusCode, String) {
     use tower::ServiceExt;
     let response = app
@@ -582,12 +619,21 @@ fn row_by_batch<'a>(items: &'a [Value], batch_id: i64, env: &Value) -> &'a Value
         .unwrap_or_else(|| panic!("items 缺 batch {batch_id}: {env}"))
 }
 
+/// 从 `companies[]` 里按 `company_id` 找一列。
+fn column_by_company<'a>(companies: &'a [Value], company_id: i64, env: &Value) -> &'a Value {
+    let key = company_id.to_string();
+    companies
+        .iter()
+        .find(|c| c["company_id"].as_str() == Some(key.as_str()))
+        .unwrap_or_else(|| panic!("companies 缺公司 {company_id}: {env}"))
+}
+
 // ===========================================================================
-//  1. counts
+//  1. snapshot
 // ===========================================================================
 
 #[tokio::test]
-async fn pool_counts_returns_200_sorted_and_totals_match() {
+async fn snapshot_returns_200_sorted_and_totals_match() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let cid = insert_customer(&pool, "PcCnt", "A").await;
 
@@ -630,18 +676,18 @@ async fn pool_counts_returns_200_sorted_and_totals_match() {
     let co_d = insert_company(&pool, "PcCntCoD", true).await;
     link_company_process(&pool, co_d, proc_d).await;
 
-    let (s, env) = get_counts(&app, &token).await;
+    let (s, env) = get_snapshot(&app, &token).await;
     assert_eq!(s, StatusCode::OK, "{env}");
     let data = &env["data"];
-    let counts = data["counts"].as_array().unwrap();
-    let ids: Vec<String> = counts
+    let processes = data["processes"].as_array().unwrap();
+    let ids: Vec<String> = processes
         .iter()
         .map(|c| c["process_id"].as_str().unwrap().to_string())
         .collect();
     assert_eq!(
         ids,
         vec![proc_a.to_string(), proc_b.to_string(), proc_c.to_string()],
-        "counts 只含非零工序且按 process_id ASC: {env}"
+        "processes 只含非零工序且按 process_id ASC: {env}"
     );
     assert!(
         !ids.contains(&proc_d.to_string()),
@@ -650,10 +696,10 @@ async fn pool_counts_returns_200_sorted_and_totals_match() {
 
     let row_of = |pid: i64| {
         let key = pid.to_string();
-        counts
+        processes
             .iter()
             .find(|c| c["process_id"].as_str() == Some(key.as_str()))
-            .unwrap_or_else(|| panic!("counts 缺工序 {pid}: {env}"))
+            .unwrap_or_else(|| panic!("processes 缺工序 {pid}: {env}"))
     };
     let a = row_of(proc_a);
     assert_eq!(a["sendable_count"], 1, "{env}");
@@ -667,38 +713,87 @@ async fn pool_counts_returns_200_sorted_and_totals_match() {
 
     assert_eq!(data["sendable_total"], 2, "{env}");
     assert_eq!(data["in_flight_total"], 2, "{env}");
-    assert_eq!(data["total"], 4, "{env}");
-    assert_eq!(
-        data["total"].as_i64().unwrap(),
-        data["sendable_total"].as_i64().unwrap() + data["in_flight_total"].as_i64().unwrap(),
-        "total 必须等于两项之和: {env}"
+    // ⚠️ 本 VO **不含 `total`**（与 `prod::queue` 的 `QueueBoardSnapshot` 对齐）：
+    // 两个 total 都在，前端自己相加即可；多一个数就多一个必须与二者对得上的字段。
+    assert!(
+        data.get("total").is_none(),
+        "snapshot 不得带 total 字段: {env}"
+    );
+    assert!(data["ts"].as_str().unwrap().ends_with("+08:00"), "{env}");
+}
+
+/// 新增的 `color` / `category` 必须真有数据源（不是占位）。
+#[tokio::test]
+async fn snapshot_color_and_category_are_carried() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let cid = insert_customer(&pool, "PcCol", "X").await;
+    let (proc_a, _, _) = seed_outsource_process(&pool, "PC-COL", false).await;
+    set_process_color(&pool, proc_a, "#FF8800AA").await;
+    let shelf_a = insert_shelf(&pool, "PCS-COL").await;
+    link_shelf_process(&pool, shelf_a, proc_a).await;
+    let p_a = insert_part(&pool, cid, "COL", "2026-12-01").await;
+    create_chain_with_steps(&pool, p_a, &[(proc_a, 1)]).await;
+    insert_candidate_batch(&pool, p_a, shelf_a, proc_a, 0).await;
+
+    // 一道没设 color 的工序 —— 必须是 null，不是空串。
+    let (proc_b, _, _) = seed_outsource_process(&pool, "PC-NOCOL", false).await;
+    let shelf_b = insert_shelf(&pool, "PCS-NOCOL").await;
+    link_shelf_process(&pool, shelf_b, proc_b).await;
+    let p_b = insert_part(&pool, cid, "NOCOL", "2026-12-02").await;
+    create_chain_with_steps(&pool, p_b, &[(proc_b, 1)]).await;
+    insert_candidate_batch(&pool, p_b, shelf_b, proc_b, 0).await;
+
+    let (s, env) = get_snapshot(&app, &token).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let processes = env["data"]["processes"].as_array().unwrap();
+    let row = |pid: i64| {
+        let key = pid.to_string();
+        processes
+            .iter()
+            .find(|c| c["process_id"].as_str() == Some(key.as_str()))
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(row(proc_a)["color"], "#FF8800AA", "{env}");
+    assert_eq!(row(proc_a)["category"], "OUTSOURCE", "{env}");
+    assert!(
+        row(proc_b)["color"].is_null(),
+        "未设 color 时必须 null 而不是空串: {env}"
     );
 }
 
-/// 权限口径：`counts` / `state` 是 Manager + Clerk（`state` 与同域
-/// `/outsource-shipments/in-flight` 对齐；`counts` 另含 Inspector），
-/// CLERK 都在集合内。
+/// snapshot 无候选也无在协时返回空数组 + 全零（不是 500）。
 #[tokio::test]
-async fn pool_counts_allows_clerk_role() {
-    let (_pool, app, token, _fx) = bootstrap_as_clerk().await;
-    let (s, env) = get_counts(&app, &token).await;
-    assert_eq!(s, StatusCode::OK, "CLERK 应可读 counts: {env}");
-    let (s, env) = get_state(
-        &app,
-        &token,
-        9_000_000_000_000_000_101,
-        9_000_000_000_000_000_100,
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "CLERK 应可读 state: {env}");
+async fn snapshot_empty_returns_zeroed_totals() {
+    let (_pool, app, token, _fx) = bootstrap_as_manager().await;
+    let (s, env) = get_snapshot(&app, &token).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(
+        env["data"]["processes"].as_array().unwrap().len(),
+        0,
+        "{env}"
+    );
+    assert_eq!(env["data"]["sendable_total"], 0, "{env}");
+    assert_eq!(env["data"]["in_flight_total"], 0, "{env}");
 }
 
-/// 权限负向回归：SHELF scope 账号被 `counts` 拒（403）。
-///
-/// 只测正向的话，将来有人删掉 `pool_counts` 里的 `require_any_role` 这条用例
-/// 仍然全绿。口径对齐 `tests/production/worker_pool.rs` 同名用例。
+/// 权限口径：两个看板读端点都是 Manager + Clerk + Inspector，CLERK 在集合内。
 #[tokio::test]
-async fn pool_counts_forbidden_for_shelf_account() {
+async fn snapshot_allows_clerk_role() {
+    let (_pool, app, token, _fx) = bootstrap_as_clerk().await;
+    let (s, env) = get_snapshot(&app, &token).await;
+    assert_eq!(s, StatusCode::OK, "CLERK 应可读 snapshot: {env}");
+    let (s, env) = get_detail(&app, &token, 9_000_000_000_000_000_101).await;
+    // 工序不存在 → 404（能走到 404 说明守卫放行了，而不是被 403 拦在前头）。
+    assert_eq!(s, StatusCode::NOT_FOUND, "CLERK 应可读 detail: {env}");
+}
+
+/// 权限负向回归：SHELF scope 账号被 snapshot 拒（403）。
+///
+/// 只测正向的话，将来有人删掉 `build_snapshot` 里的 `require_any_role` 这条用例
+/// 仍然全绿。
+#[tokio::test]
+async fn snapshot_forbidden_for_shelf_account() {
     let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let (proc_id, _, _) = seed_outsource_process(&pool, "PC-FB", true).await;
     let shelf = insert_shelf(&pool, "PCS-FB").await;
@@ -707,54 +802,35 @@ async fn pool_counts_forbidden_for_shelf_account() {
     link_company_process(&pool, co, proc_id).await;
 
     // scope 必须给才能登录；给了也仍然被 service 的 role 守卫拒。
-    let (app, token) = login_shelf_account(pool.clone(), "shelf_user_pool_counts", &[shelf]).await;
+    let (app, token) =
+        login_shelf_account(pool.clone(), "shelf_user_queue_snapshot", &[shelf]).await;
 
-    let (s, env) = get_counts(&app, &token).await;
+    let (s, env) = get_snapshot(&app, &token).await;
     assert_eq!(s, StatusCode::FORBIDDEN, "ShelfAccount 应 403: {env}");
     assert_eq!(env["code"], 40300, "FORBIDDEN: {env}");
 }
 
-/// 权限负向回归：SHELF scope 账号被 `{process_id}` 拒（403）。
+/// 权限负向回归：SHELF scope 账号被 `processes/{id}` 拒（403）。
 #[tokio::test]
-async fn pool_by_process_forbidden_for_shelf_account() {
+async fn process_detail_forbidden_for_shelf_account() {
     let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let (proc_id, _, _) = seed_outsource_process(&pool, "PBP-FB", true).await;
     let shelf = insert_shelf(&pool, "PBPS-FB").await;
     link_shelf_process(&pool, shelf, proc_id).await;
 
-    let (app, token) = login_shelf_account(pool.clone(), "shelf_user_pool_detail", &[shelf]).await;
+    let (app, token) = login_shelf_account(pool.clone(), "shelf_user_queue_detail", &[shelf]).await;
 
     let (s, env) = get_detail(&app, &token, proc_id).await;
     assert_eq!(s, StatusCode::FORBIDDEN, "ShelfAccount 应 403: {env}");
     assert_eq!(env["code"], 40300, "FORBIDDEN: {env}");
 }
 
-/// 权限负向回归：SHELF scope 账号被 `state` 拒（403）。
-///
-/// `state` 吐 `unit_price` + 客户名 / 申请人名，是外协域的敏感读面 ——
-/// 若守卫被放宽回「已登录即可读」，SHELF 账号就能枚举任意外协公司的在外协批次
-/// 与单价，而 `counts` / `{process_id}` 对它是 403。这条用例就是那道防线。
-#[tokio::test]
-async fn pool_state_forbidden_for_shelf_account() {
-    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
-    let (proc_id, _, _) = seed_outsource_process(&pool, "PST-FB", true).await;
-    let shelf = insert_shelf(&pool, "PSTS-FB").await;
-    let co = insert_company(&pool, "StFbCo", true).await;
-    link_company_process(&pool, co, proc_id).await;
-
-    let (app, token) = login_shelf_account(pool.clone(), "shelf_user_pool_state", &[shelf]).await;
-
-    let (s, env) = get_state(&app, &token, co, proc_id).await;
-    assert_eq!(s, StatusCode::FORBIDDEN, "ShelfAccount 应 403: {env}");
-    assert_eq!(env["code"], 40300, "FORBIDDEN: {env}");
-}
-
 // ===========================================================================
-//  2 + 4 + 10. detail：companies / items / DIRECT 空 options / 路由顺序
+//  3 + 4. detail：公司列（含内联在途批次）/ DIRECT 空 options
 // ===========================================================================
 
 #[tokio::test]
-async fn pool_detail_lists_all_mapped_companies_including_empty_column() {
+async fn detail_lists_all_mapped_companies_with_inlined_held_batches() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let cid = insert_customer(&pool, "PcDet", "B").await;
     let (proc_id, code, name) = seed_outsource_process(&pool, "PD-CO", true).await;
@@ -778,9 +854,9 @@ async fn pool_detail_lists_all_mapped_companies_including_empty_column() {
     create_chain_with_steps(&pool, p_other, &[(other_proc, 1)]).await;
     let other_batch = insert_candidate_batch(&pool, p_other, other_shelf, other_proc, 0).await;
 
-    // 本工序：1 个候选（APPROVAL，co1）+ 1 个在外协（co2）。
+    // 本工序：1 个候选（APPROVAL，co1）+ 2 个在外协（co2）。
     let p1 = insert_part(&pool, cid, "DT1", "2026-12-02").await;
-    let (chain1, steps1) = create_chain_with_steps(&pool, p1, &[(proc_id, 1)]).await;
+    create_chain_with_steps(&pool, p1, &[(proc_id, 1)]).await;
     let batch1 = insert_candidate_batch(&pool, p1, shelf_id, proc_id, 7).await;
     insert_approved_quote(&pool, p1, co1, proc_id, "42.00").await;
 
@@ -789,14 +865,19 @@ async fn pool_detail_lists_all_mapped_companies_including_empty_column() {
     let held = insert_held_batch(&pool, p2, co2, proc_id, Some(steps2[0]), 6, 9).await;
     let q2 = insert_approved_quote(&pool, p2, co2, proc_id, "8.25").await;
     insert_open_shipment(&pool, q2, p2, held, co2, proc_id, 6, "8.25").await;
-    let _ = (&chain1, &steps1);
+
+    let p4 = insert_part(&pool, cid, "DT4", "2026-12-04").await;
+    let (_, steps4) = create_chain_with_steps(&pool, p4, &[(proc_id, 1)]).await;
+    let held4 = insert_held_batch(&pool, p4, co2, proc_id, Some(steps4[0]), 2, 1).await;
+    let q4 = insert_approved_quote(&pool, p4, co2, proc_id, "1.50").await;
+    insert_open_shipment(&pool, q4, p4, held4, co2, proc_id, 2, "1.50").await;
 
     let (s, env) = get_detail(&app, &token, proc_id).await;
     assert_eq!(s, StatusCode::OK, "{env}");
     let data = &env["data"];
-    assert_eq!(data["process_id"], proc_id.to_string(), "{env}");
-    assert_eq!(data["process_code"], code, "{env}");
-    assert_eq!(data["process_name"], name, "{env}");
+    assert_eq!(data["process"]["process_id"], proc_id.to_string(), "{env}");
+    assert_eq!(data["process"]["process_code"], code, "{env}");
+    assert_eq!(data["process"]["process_name"], name, "{env}");
 
     // —— companies：3 家活跃公司都在，含 held_count=0 的空列 ——
     let companies = data["companies"].as_array().unwrap();
@@ -812,7 +893,7 @@ async fn pool_detail_lists_all_mapped_companies_including_empty_column() {
     got.sort();
     let mut want = vec![
         (co1.to_string(), 0i64),
-        (co2.to_string(), 1i64),
+        (co2.to_string(), 2i64),
         (co3.to_string(), 0i64),
     ];
     want.sort();
@@ -826,6 +907,25 @@ async fn pool_detail_lists_all_mapped_companies_including_empty_column() {
         .collect();
     assert!(names.contains(&"PdCo3"), "无在途批次的公司也要在列: {env}");
     assert!(!names.contains(&"PdCoOff"), "停用公司不得出现: {env}");
+
+    // —— 不变量：held_count == held_batches.len()（每一列都要成立）——
+    for c in companies {
+        assert_eq!(
+            c["held_count"].as_i64().unwrap(),
+            c["held_batches"].as_array().unwrap().len() as i64,
+            "held_count 与内联卡片数不一致（company={c}）: {env}"
+        );
+    }
+    let co2_col = column_by_company(companies, co2, &env);
+    let ids: Vec<&str> = co2_col["held_batches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["batch_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2, "{env}");
+    assert!(ids.contains(&held.to_string().as_str()), "{env}");
+    assert!(ids.contains(&held4.to_string().as_str()), "{env}");
 
     // —— items：只含本工序的候选行 ——
     let items = data["items"].as_array().unwrap();
@@ -845,32 +945,14 @@ async fn pool_detail_lists_all_mapped_companies_including_empty_column() {
     );
     assert_eq!(row["send_mode"], "APPROVAL", "{env}");
     assert_eq!(row["can_send"], true, "{env}");
-    assert_eq!(row["status_label"], "sendable", "{env}");
     assert_eq!(row["version"], 7, "{env}");
     assert_eq!(row["shelf_code"], "PDS", "{env}");
-    assert_eq!(row["customer_path"], "PcDet", "{env}");
-}
-
-/// `counts` / `state` 是 1 段静态路径，必须注册在 `/{process_id}` 之前，
-/// 否则会被 `Path<i64>` 兜住 → 400 而不是 200。
-#[tokio::test]
-async fn pool_counts_and_state_are_static_routes_not_process_id() {
-    let (pool, app, token, _fx) = bootstrap_as_manager().await;
-    let co = insert_company(&pool, "RouteCo", true).await;
-    let (proc_id, _, _) = seed_outsource_process(&pool, "PD-ROUTE", true).await;
-
-    // `/counts` 若被 `/{process_id}` 吞掉，这里会是 400（"counts" 不是 i64）。
-    let (s, env) = get_counts(&app, &token).await;
-    assert_eq!(s, StatusCode::OK, "/counts 被当成 process_id 解析了: {env}");
-    assert!(env["data"]["counts"].is_array(), "{env}");
-
-    let (s, env) = get_state(&app, &token, co, proc_id).await;
-    assert_eq!(s, StatusCode::OK, "/state 被当成 process_id 解析了: {env}");
-    assert_eq!(env["data"]["current_held"], 0, "{env}");
+    assert_eq!(row["customer_name"], "PcDet", "{env}");
+    assert!(row["parent_customer_name"].is_null(), "{env}");
 }
 
 #[tokio::test]
-async fn pool_detail_keeps_direct_row_with_empty_company_options() {
+async fn detail_keeps_direct_row_with_empty_company_options() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let cid = insert_customer(&pool, "PcBare", "C").await;
     let (proc_id, _, _) = seed_outsource_process(&pool, "PD-BARE", false).await;
@@ -899,24 +981,24 @@ async fn pool_detail_keeps_direct_row_with_empty_company_options() {
         "{env}"
     );
 
-    // counts 侧口径也必须把它算进 sendable_count。
-    let (s, counts_env) = get_counts(&app, &token).await;
-    assert_eq!(s, StatusCode::OK, "{counts_env}");
-    let c = counts_env["data"]["counts"]
+    // snapshot 侧口径也必须把它算进 sendable_count（徽标与行数要对得上）。
+    let (s, snap_env) = get_snapshot(&app, &token).await;
+    assert_eq!(s, StatusCode::OK, "{snap_env}");
+    let c = snap_env["data"]["processes"]
         .as_array()
         .unwrap()
         .iter()
         .find(|c| c["process_id"].as_str() == Some(proc_id.to_string().as_str()))
-        .unwrap_or_else(|| panic!("counts 缺工序 {proc_id}: {counts_env}"));
-    assert_eq!(c["sendable_count"], 1, "{counts_env}");
+        .unwrap_or_else(|| panic!("snapshot 缺工序 {proc_id}: {snap_env}"));
+    assert_eq!(c["sendable_count"], 1, "{snap_env}");
 }
 
 // ===========================================================================
-//  3. items 与 /outsource-sendable 逐字段一致（防 SQL 分叉的核心断言）
+//  5. items 与 /outsource-sendable 逐字段一致（防 SQL 分叉的核心断言）
 // ===========================================================================
 
 #[tokio::test]
-async fn pool_detail_items_match_sendable_endpoint_field_by_field() {
+async fn detail_items_match_sendable_endpoint_field_by_field() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let cid = insert_customer(&pool, "PcCmp", "E").await;
     // 两道工序：APPROVAL（需审批 + 已批准报价）与 DIRECT（免审批）。
@@ -959,14 +1041,14 @@ async fn pool_detail_items_match_sendable_endpoint_field_by_field() {
     let (s, sendable_env) = get_sendable(&app, &token).await;
     assert_eq!(s, StatusCode::OK, "{sendable_env}");
 
-    // 逐字段比对（detail 少了 current_process_*，工序已提到顶层）。
+    // 逐字段比对。**只比对两边都有的字段**：detail 少了 `current_process_*`（工序已提到
+    // 顶层）与 `source_status` / `batch_quantity` / `status_label` / `customer_path`
+    // （4 个刻意删/拆掉的字段，见 vo/queue.rs 文件头）。
     let fields = [
         "batch_id",
         "batch_no",
-        "batch_quantity",
         "version",
         "send_mode",
-        "source_status",
         "part_id",
         "part_serial_no",
         "part_drawing_no",
@@ -974,13 +1056,11 @@ async fn pool_detail_items_match_sendable_endpoint_field_by_field() {
         "quantity",
         "planned_delivery_date",
         "is_urgent",
-        "customer_path",
         "shelf_code",
         "outsource_company_id",
         "outsource_company_name",
         "quote_id",
         "price",
-        "status_label",
         "company_options",
     ];
     for (proc_id, expect_modes) in [(proc_appr, vec!["APPROVAL"]), (proc_dir, vec!["DIRECT"])] {
@@ -1056,11 +1136,97 @@ async fn pool_detail_items_match_sendable_endpoint_field_by_field() {
 }
 
 // ===========================================================================
-//  5 + 6 + 7 + 8 + 9. state
+//  6. 候选卡的 5 个新增字段 / 拆开的客户两字段 / 3 个已删字段
+// ===========================================================================
+
+/// 候选卡必须真的带上 5 个新增字段 + 拆开的两个客户字段，并且不再出现 3 个已删字段。
+#[tokio::test]
+async fn detail_candidate_carries_new_card_fields() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let l1 = insert_customer(&pool, "L1 Group", "W").await;
+    let l2 = insert_customer(&pool, "L2 Leaf", "V").await;
+    // L2 挂到 L1 下 → `parent_customer_name` 有值。
+    sqlx::query("UPDATE t_customer SET parent_id = $1 WHERE id = $2")
+        .bind(l1)
+        .bind(l2)
+        .execute(&pool)
+        .await
+        .expect("bind L2 under L1");
+
+    let (proc_id, _, _) = seed_outsource_process(&pool, "PD-FIELDS", false).await;
+    let shelf_id = insert_shelf(&pool, "PDF").await;
+    link_shelf_process(&pool, shelf_id, proc_id).await;
+    let co = insert_company(&pool, "FieldCo", true).await;
+    link_company_process(&pool, co, proc_id).await;
+
+    let part_id = insert_part(&pool, l2, "FLD", "2026-12-01").await;
+    create_chain_with_steps(&pool, part_id, &[(proc_id, 1)]).await;
+    let batch_id = insert_candidate_batch(&pool, part_id, shelf_id, proc_id, 5).await;
+
+    // 卡片字段全部补齐：system_delivery_date / note / is_urgent / applicant / G_CODE。
+    insert_applicant(&pool, "Card Applicant", l2).await;
+    set_part_applicant(&pool, part_id, "Card Applicant").await;
+    set_part_card_fields(&pool, part_id, "2026-11-20", "急件-先做粗加工", true).await;
+    insert_g_code_file(&pool, part_id).await;
+
+    let (s, env) = get_detail(&app, &token, proc_id).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let items = env["data"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{env}");
+    let row = row_by_batch(items, batch_id, &env);
+
+    // 5 个新增字段
+    assert_eq!(
+        row["system_delivery_date"], "2026-11-20",
+        "system_delivery_date 是卡片 body 第 3 行的唯一日期，缺了卡片恒显「—」: {env}"
+    );
+    assert_eq!(row["has_cnc_program"], true, "有 G_CODE 文件: {env}");
+    assert_eq!(row["applicant_name"], "Card Applicant", "{env}");
+    assert_eq!(row["note"], "急件-先做粗加工", "{env}");
+    assert_eq!(
+        row["shelf_id"],
+        shelf_id.to_string(),
+        "shelf_id 是移动写端点 from.shelf_id 的数据源，必须等于批次真实所在货架: {env}"
+    );
+
+    // 拆开的客户两字段（不再是合并后的 customer_path）
+    assert_eq!(row["customer_name"], "L2 Leaf", "{env}");
+    assert_eq!(row["parent_customer_name"], "L1 Group", "{env}");
+
+    // 3 个已删字段
+    for gone in [
+        "status_label",
+        "source_status",
+        "batch_quantity",
+        "customer_path",
+    ] {
+        assert!(
+            row.get(gone).is_none(),
+            "{gone} 已从候选 VO 删除，不得再出现: {env}"
+        );
+    }
+    // quantity 与 batch_no 仍在（batch_quantity 与 quantity 同值，已并入后者）
+    assert_eq!(row["quantity"], 8, "{env}");
+    assert_eq!(row["batch_no"], 1, "{env}");
+
+    // 没设 G_CODE 的 part ⇒ has_cnc_program 必须 false（不是缺 key）。
+    let part2 = insert_part(&pool, l2, "NOG", "2026-12-05").await;
+    create_chain_with_steps(&pool, part2, &[(proc_id, 1)]).await;
+    let batch2 = insert_candidate_batch(&pool, part2, shelf_id, proc_id, 0).await;
+    let (s, env2) = get_detail(&app, &token, proc_id).await;
+    assert_eq!(s, StatusCode::OK, "{env2}");
+    let row2 = row_by_batch(env2["data"]["items"].as_array().unwrap(), batch2, &env2);
+    assert_eq!(row2["has_cnc_program"], false, "{env2}");
+    assert!(row2["note"].is_null(), "{env2}");
+    assert!(row2["system_delivery_date"].is_null(), "{env2}");
+}
+
+// ===========================================================================
+//  7 ~ 11. 内联在途批次的字段与派生
 // ===========================================================================
 
 #[tokio::test]
-async fn pool_state_returns_held_batches_with_shipment_fields() {
+async fn detail_held_batches_carry_shipment_fields() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let cid = insert_customer(&pool, "PcSt", "F").await;
     let (proc_id, _, _) = seed_outsource_process(&pool, "PST-MAIN", true).await;
@@ -1075,6 +1241,7 @@ async fn pool_state_returns_held_batches_with_shipment_fields() {
     let b1 = insert_held_batch(&pool, p1, co1, proc_id, Some(s1[0]), 6, 4).await;
     let q1 = insert_approved_quote(&pool, p1, co1, proc_id, "5.55").await;
     insert_open_shipment(&pool, q1, p1, b1, co1, proc_id, 6, "5.55").await;
+    insert_g_code_file(&pool, p1).await;
 
     let p2 = insert_part(&pool, cid, "ST2", "2026-12-02").await;
     let (_, s2) = create_chain_with_steps(&pool, p2, &[(proc_id, 1)]).await;
@@ -1082,31 +1249,39 @@ async fn pool_state_returns_held_batches_with_shipment_fields() {
     let q2 = insert_approved_quote(&pool, p2, co1, proc_id, "7.77").await;
     insert_open_shipment(&pool, q2, p2, b2, co1, proc_id, 3, "7.77").await;
 
-    // co2 在同工序上也有一个批次，但 state 是按公司查的 → 不该出现。
+    // co2 在同工序上也有一个批次 —— 必须出现在**它自己那一列**里。
     let p3 = insert_part(&pool, cid, "ST3", "2026-12-03").await;
     let (_, s3) = create_chain_with_steps(&pool, p3, &[(proc_id, 1)]).await;
     let b3 = insert_held_batch(&pool, p3, co2, proc_id, Some(s3[0]), 9, 6).await;
     let q3 = insert_approved_quote(&pool, p3, co2, proc_id, "1.11").await;
     insert_open_shipment(&pool, q3, p3, b3, co2, proc_id, 9, "1.11").await;
 
-    let (s, env) = get_state(&app, &token, co1, proc_id).await;
+    // 另一工序上同公司的批次 —— 不得出现（谓词含 `current_process_id = $1`）。
+    let (other_proc, _, _) = seed_outsource_process(&pool, "PST-OTHER", true).await;
+    let p4 = insert_part(&pool, cid, "ST4", "2026-12-04").await;
+    let (_, s4) = create_chain_with_steps(&pool, p4, &[(other_proc, 1)]).await;
+    let b4 = insert_held_batch(&pool, p4, co1, other_proc, Some(s4[0]), 2, 1).await;
+    let q4 = insert_approved_quote(&pool, p4, co1, other_proc, "2.00").await;
+    insert_open_shipment(&pool, q4, p4, b4, co1, other_proc, 2, "2.00").await;
+
+    let (s, env) = get_detail(&app, &token, proc_id).await;
     assert_eq!(s, StatusCode::OK, "{env}");
-    let data = &env["data"];
-    assert_eq!(data["outsource_company_id"], co1.to_string(), "{env}");
-    assert_eq!(data["outsource_company_name"], "StCo1", "{env}");
-    assert_eq!(data["process_id"], proc_id.to_string(), "{env}");
-    let items = data["items"].as_array().unwrap();
+    let companies = env["data"]["companies"].as_array().unwrap();
+    let co1_col = column_by_company(companies, co1, &env);
+    let items = co1_col["held_batches"].as_array().unwrap();
     assert_eq!(items.len(), 2, "{env}");
-    assert_eq!(
-        data["current_held"].as_i64().unwrap(),
-        items.len() as i64,
-        "current_held 必须等于 items.len(): {env}"
-    );
+    assert_eq!(co1_col["held_count"].as_i64().unwrap(), 2, "{env}");
     assert!(
         items
             .iter()
             .all(|i| i["batch_id"].as_str() != Some(b3.to_string().as_str())),
-        "别的公司的批次不得出现: {env}"
+        "别的公司的批次不得串到本列: {env}"
+    );
+    assert!(
+        items
+            .iter()
+            .all(|i| i["batch_id"].as_str() != Some(b4.to_string().as_str())),
+        "不得含其它工序的批次: {env}"
     );
 
     let r1 = row_by_batch(items, b1, &env);
@@ -1125,28 +1300,18 @@ async fn pool_state_returns_held_batches_with_shipment_fields() {
         r1["parent_customer_name"].is_null(),
         "无 L1 时为 null: {env}"
     );
+    // 在途卡新增的角标
+    assert_eq!(r1["has_cnc_program"], true, "{env}");
 
-    // criterion 9：雪花 ID 全字符串、price 是字符串。
-    assert!(r1["batch_id"].is_string(), "{r1}");
-    assert!(r1["part_id"].is_string(), "{r1}");
-    assert!(r1["price"].is_string(), "price 必须是字符串: {r1}");
-
-    // 另一工序上同公司的批次也不该出现。
-    let (other_proc, _, _) = seed_outsource_process(&pool, "PST-OTHER", true).await;
-    let p4 = insert_part(&pool, cid, "ST4", "2026-12-04").await;
-    let (_, s4) = create_chain_with_steps(&pool, p4, &[(other_proc, 1)]).await;
-    let b4 = insert_held_batch(&pool, p4, co1, other_proc, Some(s4[0]), 2, 1).await;
-    let q4 = insert_approved_quote(&pool, p4, co1, other_proc, "2.00").await;
-    insert_open_shipment(&pool, q4, p4, b4, co1, other_proc, 2, "2.00").await;
-
-    let (s, env) = get_state(&app, &token, co1, proc_id).await;
-    assert_eq!(s, StatusCode::OK, "{env}");
-    let items = env["data"]["items"].as_array().unwrap();
-    assert_eq!(items.len(), 2, "不得含其它工序的批次: {env}");
+    let co2_col = column_by_company(companies, co2, &env);
+    assert_eq!(co2_col["held_count"].as_i64().unwrap(), 1, "{env}");
+    let r3 = row_by_batch(co2_col["held_batches"].as_array().unwrap(), b3, &env);
+    assert_eq!(r3["price"], "1.11", "{env}");
+    assert_eq!(r3["has_cnc_program"], false, "{env}");
 }
 
 #[tokio::test]
-async fn pool_state_chain_resolvable_when_next_step_exists() {
+async fn detail_chain_resolvable_when_next_step_exists() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let cid = insert_customer(&pool, "PcChain", "G").await;
     let (proc_id, _, _) = seed_outsource_process(&pool, "PCH-OS", true).await;
@@ -1161,9 +1326,11 @@ async fn pool_state_chain_resolvable_when_next_step_exists() {
     let q = insert_approved_quote(&pool, p, co, proc_id, "3.21").await;
     insert_open_shipment(&pool, q, p, b, co, proc_id, 7, "3.21").await;
 
-    let (s, env) = get_state(&app, &token, co, proc_id).await;
+    let (s, env) = get_detail(&app, &token, proc_id).await;
     assert_eq!(s, StatusCode::OK, "{env}");
-    let row = row_by_batch(env["data"]["items"].as_array().unwrap(), b, &env);
+    let companies = env["data"]["companies"].as_array().unwrap();
+    let col = column_by_company(companies, co, &env);
+    let row = row_by_batch(col["held_batches"].as_array().unwrap(), b, &env);
     assert_eq!(row["chain_resolvable"], true, "有下一 step ⇒ 可解析: {env}");
     assert_eq!(
         row["receive_next_process_id"],
@@ -1174,7 +1341,7 @@ async fn pool_state_chain_resolvable_when_next_step_exists() {
 }
 
 #[tokio::test]
-async fn pool_state_chain_unresolvable_when_no_step_or_chain_tail() {
+async fn detail_chain_unresolvable_when_no_step_or_chain_tail() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let cid = insert_customer(&pool, "PcNoChain", "H").await;
     let (proc_id, _, _) = seed_outsource_process(&pool, "PNC-OS", true).await;
@@ -1195,10 +1362,13 @@ async fn pool_state_chain_unresolvable_when_no_step_or_chain_tail() {
     let q_nostep = insert_approved_quote(&pool, p_nostep, co, proc_id, "1.00").await;
     insert_open_shipment(&pool, q_nostep, p_nostep, b_nostep, co, proc_id, 4, "1.00").await;
 
-    let (s, env) = get_state(&app, &token, co, proc_id).await;
+    let (s, env) = get_detail(&app, &token, proc_id).await;
     assert_eq!(s, StatusCode::OK, "{env}");
-    let items = env["data"]["items"].as_array().unwrap();
+    let companies = env["data"]["companies"].as_array().unwrap();
+    let col = column_by_company(companies, co, &env);
+    let items = col["held_batches"].as_array().unwrap();
     assert_eq!(items.len(), 2, "{env}");
+    assert_eq!(col["held_count"].as_i64().unwrap(), 2, "{env}");
     for (b, tag) in [(b_tail, "链尾"), (b_nostep, "无 step")] {
         let row = row_by_batch(items, b, &env);
         assert_eq!(row["chain_resolvable"], false, "{tag} 应不可解析: {env}");
@@ -1218,14 +1388,8 @@ async fn pool_state_chain_unresolvable_when_no_step_or_chain_tail() {
 /// - 位置式定位会返回 `sort_order = 旧 sort + 1` 那一步 = 外协工序自己，
 ///   且 `chain_resolvable` 仍为 `true` ⇒ 写侧照单全收，是**静默错值**；
 /// - 按 `current_process_id` 定位才能取到外协工序在锚链内的真实位置 +1。
-///
-/// ⚠️ **本用例构造的状态产品不可达**：`bind_part_to_chain` 是裸
-/// `UPDATE t_part SET process_chain_id`，绕过了 `link_chain_to_part` 的
-/// `AND process_chain_id IS NULL` 守卫（已绑定的 part 走产品路径不可改绑）。
-/// 保留它是**防御性回归网** —— 守住「锚链内位置漂移时仍取对值」这条性质，
-/// 而不是把该混合语义固化成期望行为。断言未因此弱化。
 #[tokio::test]
-async fn pool_state_derives_next_step_from_parts_current_chain_after_rebind() {
+async fn detail_derives_next_step_from_parts_current_chain_after_rebind() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let cid = insert_customer(&pool, "PcRebind", "I").await;
     let (proc_os, _, os_name) = seed_outsource_process(&pool, "PRB-OS", true).await;
@@ -1244,17 +1408,17 @@ async fn pool_state_derives_next_step_from_parts_current_chain_after_rebind() {
 
     // 改绑到链 B。**关键：外协工序在链 B 里被挪到 sort 2**（sort 1 = NEXT_B），
     // 批次的 `current_process_step_id` 仍指向**旧链 A** 的 step（sort 1）。
-    // ⇒ 位置式定位会算成「链 B 的 sort 2」= 外协工序自己（静默错值）；
-    //   按 current_process_id 定位才会拿到「链 B 的 sort 2 → sort 3」= NEXT_C。
     let chain_b = create_chain(&pool, "rebound-chain").await;
     add_chain_step(&pool, chain_b, proc_next_b, 1).await;
     add_chain_step(&pool, chain_b, proc_os, 2).await;
     add_chain_step(&pool, chain_b, proc_next_c, 3).await;
     bind_part_to_chain(&pool, p, chain_b).await;
 
-    let (s, env) = get_state(&app, &token, co, proc_os).await;
+    let (s, env) = get_detail(&app, &token, proc_os).await;
     assert_eq!(s, StatusCode::OK, "{env}");
-    let row = row_by_batch(env["data"]["items"].as_array().unwrap(), b, &env);
+    let companies = env["data"]["companies"].as_array().unwrap();
+    let col = column_by_company(companies, co, &env);
+    let row = row_by_batch(col["held_batches"].as_array().unwrap(), b, &env);
     assert_eq!(
         row["receive_next_process_id"],
         proc_next_c.to_string(),
@@ -1314,10 +1478,13 @@ async fn pool_state_derives_next_step_from_parts_current_chain_after_rebind() {
 }
 
 /// `t_applicant` 按 name 匹配（字符串非 FK，唯一索引是 `(name, customer_id)`），
-/// 同名申请人跨客户并存时 `list_held` **不得扇出**：一个批次恒一行，且
-/// `current_held == items.len()`。
+/// 同名申请人跨客户并存时在途查询**不得扇出**：一个批次恒一行，且
+/// `held_count == held_batches.len()`。
+///
+/// 这是 `LEFT JOIN LATERAL (… ORDER BY ap.id ASC LIMIT 1)` 的必要性回归网 ——
+/// 直 JOIN 会把一行扇成多行，于是同一批次的卡片在列里出现两次而徽标只写 1。
 #[tokio::test]
-async fn pool_state_does_not_fan_out_on_duplicate_applicant_name() {
+async fn detail_does_not_fan_out_on_duplicate_applicant_name() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     // `serial_prefix` 是 varchar(1) 且全局唯一（uq_t_customer_root_prefix），
     // 两个客户必须用不同前缀。
@@ -1338,18 +1505,20 @@ async fn pool_state_does_not_fan_out_on_duplicate_applicant_name() {
     let q = insert_approved_quote(&pool, p, co, proc_id, "4.00").await;
     insert_open_shipment(&pool, q, p, b, co, proc_id, 5, "4.00").await;
 
-    let (s, env) = get_state(&app, &token, co, proc_id).await;
+    let (s, env) = get_detail(&app, &token, proc_id).await;
     assert_eq!(s, StatusCode::OK, "{env}");
-    let items = env["data"]["items"].as_array().unwrap();
+    let companies = env["data"]["companies"].as_array().unwrap();
+    let col = column_by_company(companies, co, &env);
+    let items = col["held_batches"].as_array().unwrap();
     assert_eq!(
         items.len(),
         1,
         "同名申请人跨客户不得把一行批次扇成多行: {env}"
     );
     assert_eq!(
-        env["data"]["current_held"].as_i64().unwrap(),
+        col["held_count"].as_i64().unwrap(),
         items.len() as i64,
-        "current_held 必须等于 items.len(): {env}"
+        "held_count 必须等于 held_batches.len(): {env}"
     );
     let batch_ids: Vec<&Value> = items.iter().map(|i| &i["batch_id"]).collect();
     assert_eq!(batch_ids.len(), 1, "batch_id 不得重复: {env}");
@@ -1357,41 +1526,106 @@ async fn pool_state_does_not_fan_out_on_duplicate_applicant_name() {
     assert_eq!(row["applicant_name"], "DupName", "{env}");
 }
 
+// ===========================================================================
+//  12 + 13. 序列化口径 / 路由
+// ===========================================================================
+
+/// 雪花 ID 全字符串、price 是字符串（前端 Zod 的 `z.string()` 守门靠这个）。
 #[tokio::test]
-async fn pool_state_rejects_missing_query_params_with_400() {
-    let (_pool, app, token, _fx) = bootstrap_as_manager().await;
+async fn snapshot_serializes_snowflake_ids_and_price_as_strings() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let cid = insert_customer(&pool, "PcSer", "K").await;
+    let (proc_id, _, _) = seed_outsource_process(&pool, "PSER-OS", true).await;
+    let shelf_id = insert_shelf(&pool, "PSER-S").await;
+    link_shelf_process(&pool, shelf_id, proc_id).await;
+    let co = insert_company(&pool, "SerCo", true).await;
+    link_company_process(&pool, co, proc_id).await;
+
+    let p = insert_part(&pool, cid, "SER", "2026-12-01").await;
+    let (_, steps) = create_chain_with_steps(&pool, p, &[(proc_id, 1)]).await;
+    let b = insert_held_batch(&pool, p, co, proc_id, Some(steps[0]), 3, 9).await;
+    let q = insert_approved_quote(&pool, p, co, proc_id, "6.25").await;
+    insert_open_shipment(&pool, q, p, b, co, proc_id, 3, "6.25").await;
+
+    let (s, snap_env) = get_snapshot(&app, &token).await;
+    assert_eq!(s, StatusCode::OK, "{snap_env}");
+    let proc_row = snap_env["data"]["processes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["process_id"].as_str() == Some(proc_id.to_string().as_str()))
+        .unwrap();
+    assert!(proc_row["process_id"].is_string(), "{snap_env}");
+
+    let (s, env) = get_detail(&app, &token, proc_id).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert!(env["data"]["process"]["process_id"].is_string(), "{env}");
+    let companies = env["data"]["companies"].as_array().unwrap();
+    assert!(
+        companies[0]["company_id"].is_string(),
+        "company_id 必须是字符串: {env}"
+    );
+    let col = column_by_company(companies, co, &env);
+    let row = row_by_batch(col["held_batches"].as_array().unwrap(), b, &env);
+    assert!(row["batch_id"].is_string(), "{row}");
+    assert!(row["part_id"].is_string(), "{row}");
+    assert!(row["price"].is_string(), "price 必须是字符串: {row}");
+    assert_eq!(row["price"], "6.25", "{env}");
+}
+
+/// 路由形状守卫：`/snapshot` 是 1 段静态段，`/processes/{id}` 是 2 段，段数不同
+/// ⇒ matchit 不争段位、注册顺序无硬约束（与被删的 `pool_router` 的「静态必须先注册」
+/// 正相反）。本用例把「段数不同所以不冲突」这个事实钉住：将来若有人把
+/// `/snapshot` 改成 2 段（如 `/board/snapshot`）而不动 `/{process_id}`，这里会立刻红。
+///
+/// 顺带断言三条旧路径确实 404（硬切无 alias）。
+#[tokio::test]
+async fn snapshot_and_processes_routes_do_not_collide() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let (proc_id, _, _) = seed_outsource_process(&pool, "PROUTE-OS", true).await;
+
+    // `/snapshot` 若被某个 1 段参数段吞掉，这里会是 400（"snapshot" 不是 i64）。
+    let (s, env) = get_snapshot(&app, &token).await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "/snapshot 被当成 process_id 解析了: {env}"
+    );
+    assert!(env["data"]["processes"].is_array(), "{env}");
+
+    let (s, env) = get_detail(&app, &token, proc_id).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(
+        env["data"]["process"]["process_id"],
+        proc_id.to_string(),
+        "{env}"
+    );
+
+    // 工序 0 不存在 → 404（不是 500 / 400）。
+    let (s, env) = get_detail(&app, &token, 0).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "工序 0 不存在应 404: {env}");
+    assert_eq!(env["code"], 20801, "{env}");
+
+    // 旧路径硬切下线（无 alias）：三条都 404（body 为空，不走信封）。
     for uri in [
-        "/outsource-pool/state",
-        "/outsource-pool/state?outsource_company_id=1",
-        "/outsource-pool/state?process_id=1",
+        "/outsource-pool/counts".to_string(),
+        "/outsource-pool/state?outsource_company_id=1&process_id=1".to_string(),
+        format!("/outsource-pool/{proc_id}"),
     ] {
-        let (s, body) = get_raw(&app, &token, uri).await;
+        let (s, body) = get_raw(&app, &token, &uri).await;
         assert_eq!(
             s,
-            StatusCode::BAD_REQUEST,
-            "{uri} 缺参数必须 400（不得静默给默认值）: body={body}"
+            StatusCode::NOT_FOUND,
+            "{uri} 必须已下线（硬切无 alias）: body={body}"
         );
-        assert_ne!(s, StatusCode::INTERNAL_SERVER_ERROR, "{uri}: body={body}");
     }
 }
 
 /// 工序不存在 → 404（口径同 `/prod/queue/processes/{process_id}`）。
 #[tokio::test]
-async fn pool_detail_unknown_process_returns_404() {
+async fn detail_unknown_process_returns_404() {
     let (_pool, app, token, _fx) = bootstrap_as_manager().await;
     let (s, env) = get_detail(&app, &token, 9_000_000_000_000_009_999).await;
     assert_eq!(s, StatusCode::NOT_FOUND, "{env}");
     assert_eq!(env["code"], 20801, "{env}");
-}
-
-/// counts 端点无候选也无在协时返回空数组 + 全零（不是 500）。
-#[tokio::test]
-async fn pool_counts_empty_returns_zeroed_totals() {
-    let (_pool, app, token, _fx) = bootstrap_as_manager().await;
-    let (s, env) = get_counts(&app, &token).await;
-    assert_eq!(s, StatusCode::OK, "{env}");
-    assert_eq!(env["data"]["counts"].as_array().unwrap().len(), 0, "{env}");
-    assert_eq!(env["data"]["sendable_total"], 0, "{env}");
-    assert_eq!(env["data"]["in_flight_total"], 0, "{env}");
-    assert_eq!(env["data"]["total"], 0, "{env}");
 }

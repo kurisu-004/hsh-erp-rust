@@ -58,7 +58,7 @@ pub use super::model::{
     TOutsourceQuoteEvent, TOutsourceShipment,
 };
 pub use sql::{
-    OutsourceCompanyProcessRepo, OutsourceCompanyRepo, OutsourcePoolRepo, OutsourceQuotableRepo,
+    OutsourceCompanyProcessRepo, OutsourceCompanyRepo, OutsourceQuotableRepo,
     OutsourceQuoteEventRepo, OutsourceQuoteRepo, OutsourceSendableRepo, OutsourceShipmentRepo,
 };
 
@@ -188,68 +188,16 @@ pub struct OutsourceSendableRow {
     pub company_options: serde_json::Value,
 }
 
-/// `GET /outsource-pool/{process_id}` 的 `companies[]` 单条：某工序下的一家
-/// 外协公司 + 它在该工序的外协批次持有数。
-///
-/// 2026-10-03 新增。**无在途批次的公司也要出现**（`held_count = 0`）——
-/// 前端看板要渲染空公司列当拖拽目标。
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct OutsourcePoolCompanyRow {
-    pub company_id: i64,
-    pub name: String,
-    /// `COUNT(pb.id)::bigint`（LEFT JOIN ⇒ 无在途批次时为 0，不是 NULL）。
-    pub held_count: i64,
-}
-
-/// `GET /outsource-pool/state` 的 `items[]` 单条：某公司在某工序在外协的一个批次。
-///
-/// 2026-10-03 新增。全部字段由 `OutsourcePoolRepo::list_held` **一条 SQL** 解析
-/// 完毕（公司 / 工序 / 客户路径 / shipment 字段 / 下一道工序都在 SQL 内 JOIN
-/// 或 LATERAL 子查询里），service 层零回查。
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct OutsourceHeldBatchRow {
-    pub batch_id: i64,
-    pub part_id: i64,
-    pub batch_no: i32,
-    /// **当前余量**（`t_part_batch.quantity`，不是 shipment.quantity）——
-    /// 前端拿它做「部分接收」输入框的 max 值（口径与
-    /// `GET /outsource-shipments/in-flight` 一致）。
-    pub quantity: i32,
-    pub serial_no: Option<String>,
-    pub drawing_no: String,
-    pub name: String,
-    pub system_delivery_date: Option<chrono::NaiveDate>,
-    pub planned_delivery_date: Option<chrono::NaiveDate>,
-    pub is_urgent: bool,
-    /// L2 叶子客户名。
-    pub customer_name: Option<String>,
-    /// L1 一级集团名。
-    pub parent_customer_name: Option<String>,
-    /// `t_part.applicant_name` LEFT JOIN `t_applicant.name`（非 FK，字符串匹配）。
-    pub applicant_name: Option<String>,
-    /// `t_part_batch.location`，恒为 `"OUTSOURCE_COMPANY"`。
-    pub batch_location: String,
-    /// 工单级备注（`t_part.note`；DB 无 batch 级 remark 字段）。
-    pub note: Option<String>,
-    /// `t_part_batch.version`（**不是** shipment.version）—— 前端拿它当
-    /// `receive-from-outsource` 的 OCC 锚。
-    pub batch_version: i32,
-    pub sent_at: Option<chrono::NaiveDateTime>,
-    /// `t_outsource_shipment.unit_price::text`（Decimal 字符串）。
-    pub price: Option<String>,
-    /// 下一道工序 id；`COALESCE(..., 0)` ⇒ 无下一 step 时为 **0**
-    /// （沿 `prod::queue::vo::queue::PendingBatchItem.current_process_step_id`
-    /// 的 0 兜底口径：JSON 里非 nullable，语义为字符串 `"0"` = 未设）。
-    pub receive_next_process_id: i64,
-    pub receive_next_process_name: Option<String>,
-}
-
 /// outsource 域数据访问胖 trait。
 ///
 /// 单 trait 合并 6 ZST（company + company_process + quote + quote_event + shipment，
-/// 外加 2026-10-03 新增的 quotable / sendable / pool 三个读模型 ZST），共 57 方法：
+/// 外加 2026-10-03 新增的 quotable / sendable 两个读模型 ZST），共 52 方法：
 /// company 8 + company_process 4 + quote 13 + quote_event 1 + shipment 9
-/// + quotable 2 + sendable 3 + pool 4 + 跨域 helper 13。
+/// + quotable 2 + sendable 2 + 跨域 helper 13。
+///
+/// 2026-10-09 缩掉 5 个方法：`pool_*` 4 个（`/outsource-pool/{counts,state,{id}}`
+/// 下线，SQL 搬进 `../board/repo.rs`）与 `sendable_list_by_process`（看板候选列现在
+/// 由 `board/repo.rs` 直接拼投影，不再经 trait 回传本文件的行结构）。
 ///
 /// 方法签名 = `sql.rs` 固有静态方法去 executor 形参。`<'a>` 显式生命周期是 mockall
 /// 0.15 automock 在 `async_trait` 上下文的硬性要求。
@@ -511,30 +459,10 @@ pub trait OutsourceRepoTrait: Send {
         keyword_pat: Option<&'a str>,
         customer_id: Option<i64>,
     ) -> Result<i64, sqlx::Error>;
-    /// 2026-10-03 新增：按外协工序取可发送候选（看板左列）。
-    /// 与 `sendable_list` 同核心 SQL、只把外层过滤换成 `current_process_id = $1`。
-    async fn sendable_list_by_process(
-        &mut self,
-        process_id: i64,
-    ) -> Result<Vec<OutsourceSendableRow>, sqlx::Error>;
-
-    // ── pool（2026-10-03 新增，按外协工序切 tab 的看板三端点） ──
-    /// 候选侧按工序分组计数（`GROUP BY current_process_id`，与
-    /// `sendable_list_by_process` 行粒度一致）。
-    async fn pool_group_sendable_counts(&mut self) -> Result<Vec<(i64, i64)>, sqlx::Error>;
-    /// 在途侧按工序分组计数（`GROUP BY current_process_id`）。
-    async fn pool_group_in_flight_counts(&mut self) -> Result<Vec<(i64, i64)>, sqlx::Error>;
-    /// 该工序映射的全部活跃外协公司 + 各自的在外协批次数（LEFT JOIN ⇒ 0 也返回）。
-    async fn pool_list_companies_with_held(
-        &mut self,
-        process_id: i64,
-    ) -> Result<Vec<OutsourcePoolCompanyRow>, sqlx::Error>;
-    /// 某公司在某工序在外协的全部批次（一条 SQL 解析完全部展示 / 派生字段）。
-    async fn pool_list_held(
-        &mut self,
-        company_id: i64,
-        process_id: i64,
-    ) -> Result<Vec<OutsourceHeldBatchRow>, sqlx::Error>;
+    // ⚠️ 2026-10-09：`sendable_list_by_process` 与 `pool_*` 4 个方法在此删除。
+    // 看板两条读端点（`GET /outsource-queue/snapshot` +
+    // `/outsource-queue/processes/{id}`）改由 `../board/` 子模块自持 SQL（固定条数要能
+    // 被源码级护栏单独圈住，且它们的行结构与本 trait 的其它方法无共享）。
 
     // ── 跨域 helper（service 散落的 inline SQL 抽 trait） ──
     // 2026-09-22 refactor：service 内的 inline SQL（`t_part` / `t_process` / `t_part_batch`
@@ -1113,38 +1041,10 @@ impl OutsourceRepoTrait for &mut PgConnection {
         OutsourceSendableRepo::count(&mut **self, keyword_pat, customer_id).await
     }
 
-    async fn sendable_list_by_process(
-        &mut self,
-        process_id: i64,
-    ) -> Result<Vec<OutsourceSendableRow>, sqlx::Error> {
-        OutsourceSendableRepo::list_by_process(&mut **self, process_id).await
-    }
+    // ⚠️ 2026-10-09：`sendable_list_by_process` 与 `pool_*` 4 个委托在此删除，
+    // 对应 SQL 搬进 `../board/repo.rs`（见 trait 定义处的注释）。
 
-    // ── pool（4）── 一行委托 sql::OutsourcePoolRepo ──────────────────────
-    async fn pool_group_sendable_counts(&mut self) -> Result<Vec<(i64, i64)>, sqlx::Error> {
-        OutsourcePoolRepo::group_sendable_counts(&mut **self).await
-    }
-
-    async fn pool_group_in_flight_counts(&mut self) -> Result<Vec<(i64, i64)>, sqlx::Error> {
-        OutsourcePoolRepo::group_in_flight_counts(&mut **self).await
-    }
-
-    async fn pool_list_companies_with_held(
-        &mut self,
-        process_id: i64,
-    ) -> Result<Vec<OutsourcePoolCompanyRow>, sqlx::Error> {
-        OutsourcePoolRepo::list_companies_with_held(&mut **self, process_id).await
-    }
-
-    async fn pool_list_held(
-        &mut self,
-        company_id: i64,
-        process_id: i64,
-    ) -> Result<Vec<OutsourceHeldBatchRow>, sqlx::Error> {
-        OutsourcePoolRepo::list_held(&mut **self, company_id, process_id).await
-    }
-
-    // ── 跨域 helper（14）── 一行委托 `sqlx::query_as` 跨表 SELECT ─────────
+    // ── 跨域 helper（13）── 一行委托 `sqlx::query_as` 跨表 SELECT ─────────
     async fn part_exists(&mut self, part_id: i64) -> Result<bool, sqlx::Error> {
         let row: Option<(i64,)> =
             sqlx::query_as("SELECT id FROM t_part WHERE id = $1 AND deleted_at IS NULL")

@@ -36,7 +36,25 @@
 //! - `vo` 增 `pool.rs`，`service` 增 `pool.rs`，repo 增 ZST `OutsourcePoolRepo`
 //!   （另给 `OutsourceSendableRepo` 增 `list_by_process`，两者共用同一份核心 SQL ——
 //!   见 `repo/sql.rs::SENDABLE_INNER_X_SQL`）。
+//!
+//! 2026-10-09 看板收敛（`/outsource-queue/*`，2 只读端点）：
+//! - `/outsource-pool/{counts,state,{process_id}}` **硬切到**
+//!   `/outsource-queue/{snapshot,processes/{id}}`，**无 alias**。旧路径下打开一道工序
+//!   的板要发 1（工序详情）+ M（每家公司一次 state）= M + 1 个 HTTP 请求；在途批次
+//!   卡片内联进公司列后恒定 1 个请求。
+//! - 新增 `board/` 子模块（`repo.rs` + `service.rs`，范本 `prod/queue/board/`）：
+//!   固定 SQL 条数（snapshot 3 条 / detail 4 条），由
+//!   `board/mod.rs::sql_count_guard_tests` 的源码级护栏钉住。
+//! - `vo/pool.rs` 与 `service/pool.rs` 删除，出参合并进 `vo/queue.rs`；repo 侧
+//!   `OutsourcePoolRepo` 整体删除（4 个方法在三条端点下线后全部无调用方），其 SQL
+//!   按「去公司谓词」的口径搬进 `board/repo.rs`。`OutsourceRepoTrait` 相应瘦身 5 个
+//!   方法（`pool_*` 4 + `sendable_list_by_process` 1）。
+//! - ⚠️ `GET /outsource-sendable` 与 `/outsource-sendable/*` **暂留**（下一步随看板
+//!   移动写端点接管删除）：它仍走 `OutsourceService` + `OutsourceRepoTrait`，与看板
+//!   的 `board/` 聚合线并存但共用同一份候选侧谓词（`repo/sql.rs` 的
+//!   `SENDABLE_INNER_X_SQL`），故两边的 `sendable_count` 与 `items` 仍逐行一致。
 
+pub mod board;
 pub mod dto;
 pub mod handler;
 pub mod model;
@@ -68,15 +86,18 @@ pub fn shipment_router() -> Router<Arc<AppState>> {
 ///
 /// 2026-10-03 新增。独立顶层前缀：可发送判定横跨 company / quote / batch 三域，
 /// 不属于任何单一域的子资源。
+///
+/// ⚠️ **随看板移动写端点接管删除**（当前仍在线）：`GET /outsource-queue/processes/{id}`
+/// 的候选列已经是不分页的同一批行，本端点是它的一个分页子集。
 pub fn sendable_router() -> Router<Arc<AppState>> {
     handler::sendable_router()
 }
 
-/// 外协看板路由（挂载点 `/outsource-pool`）。
+/// 外协看板路由（挂载点 `/outsource-queue`，见 `modules::v2_router`）。
 ///
-/// 2026-10-03 新增。第 5 个独立顶层前缀，形态照抄 `prod::pool`；既有
-/// `/outsource-sendable` / `/outsource-shipments/in-flight` 都**不接受
-/// `process_id` 且分页**，无法支撑按工序切 tab，故另起前缀而不是扩它们。
-pub fn pool_router() -> Router<Arc<AppState>> {
-    handler::pool_router()
+/// 2026-10-09 更名（旧挂载点 `/outsource-pool`，形态与前一条一同下线）。改名的
+/// 理由与 `prod::worker_pool → prod::queue` 同源：`pool` 只覆盖了「候选池」一块，
+/// 而本端点返回的是「候选 + 公司列 + 在途批次」的整块看板。
+pub fn queue_router() -> Router<Arc<AppState>> {
+    handler::queue_router()
 }

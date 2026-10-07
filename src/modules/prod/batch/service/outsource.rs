@@ -358,8 +358,8 @@ impl BatchService {
         // 2026-10-03 review 第 1 轮：写侧补「需审批的工序不许直发」守卫。
         //
         // 守卫的必要性：`requires_approval` 此前**只在读侧生效**（`GET
-        // /outsource-sendable` 与 `/outsource-pool` 的判定 SQL 会把「需审批但无审批
-        // 报价」的批次藏起来），写侧零校验 ⇒ 绕过 UI 直接调本端点传 `direct=true`
+        // /outsource-sendable` 与 `/outsource-queue/processes/{id}` 的判定 SQL 会把
+        // 「需审批但无审批报价」的批次藏起来），写侧零校验 ⇒ 绕过 UI 直接调本端点传 `direct=true`
         // 就能对「先审批再发」这道业务规则下该走报价的工序直发，系统里没有任何一处
         // 强制。两侧同时守才闭环：读侧决定「看不看得见」，写侧决定「发不发得成」。
         //

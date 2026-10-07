@@ -7,8 +7,13 @@
 //!   reject / soft-delete）+ `quotable-parts` picker
 //! - `shipment` — 对账单更新（reconcile-update）+ 对账页 sent-parts + 在途 in-flight
 //! - `sendable` — `GET /outsource-sendable`（可发送外协一览，APPROVAL / DIRECT 双模式）
-//! - `pool`     — `GET /outsource-pool/*`（按外协工序切 tab 的看板三件套，
-//!   形态照抄 `prod::pool`）
+//!
+//! 外协看板两个只读端点（`/outsource-queue/snapshot` +
+//! `/outsource-queue/processes/{id}`）**不走本层**，实现见 `super::board`（与其 repo /
+//! VO 一并成子模块，范本 `prod/queue/board`）：它是纯只读聚合，固定 SQL 条数要能被
+//! 源码级护栏单独圈住，与走胖 trait 的 CRUD 写路径混在一个目录里就圈不出来了。
+//! 两边共用 `sendable` 子模块里的 `send_mode_of` / `can_send_of` /
+//! `decode_company_options` 三个纯函数与同一份候选侧谓词 SQL。
 //!
 //! 对外 API（`handler.rs` 调用面）保持原方法名（`OutsourceService::xxx`），handler 通过
 //! `crate::modules::outsource::service::OutsourceService` 引用。
@@ -23,6 +28,10 @@
 //!   post-commit 副作用需求；与 iam AccountService / com CustomerService 同形）。
 //!
 //! 2026-10-03 新增（读侧补齐）：4 个 list 端点上线上，见各子模块头注释。
+//!
+//! 2026-10-09 删除 `pool` 子模块：三条 `/outsource-pool/*` 旧读被 `super::board`
+//! 的看板两读取代，`OutsourceService::pool_counts` / `pool_by_process` / `pool_state`
+//! 随之删除（handler 同批删掉对应三个 route）。
 
 #![allow(
     clippy::collapsible_if,
@@ -42,9 +51,8 @@ use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::shared::error::{AppError, code};
 
 mod company;
-mod pool;
 mod quote;
-mod sendable;
+pub(crate) mod sendable;
 mod shipment;
 
 const DEFAULT_LIMIT: i64 = 50;

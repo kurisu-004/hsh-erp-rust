@@ -1261,7 +1261,7 @@ async fn send_to_outsource_direct_with_quote_id_rejected() {
 /// → 400 / 20104，且**任何一行都不许被改**。
 ///
 /// 守卫的必要性：改之前 `requires_approval` 只在读侧（`GET /outsource-sendable` /
-/// `/outsource-pool` 的判定 SQL）生效，写侧零校验 ⇒ 绕过 UI 直接调本端点传
+/// `/outsource-queue/processes/{id}` 的判定 SQL）生效，写侧零校验 ⇒ 绕过 UI 直接调本端点传
 /// `direct=true` 就能对「先审批再发」这道业务规则该走报价的工序直发，系统里没有
 /// 任何一处强制。写侧守了之后读侧/写侧才闭环：读侧决定看不看得见，写侧决定发不发
 /// 得成。

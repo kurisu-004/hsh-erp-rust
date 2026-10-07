@@ -38,7 +38,7 @@
 
 9 条路由里 8 条是 1 段静态、1 条是 2 段动态（`/processes/{process_id}`），**段数不同 ⇒ matchit 无同段位争用 ⇒ 注册顺序不影响匹配结果**。`src/modules/prod/queue/mod.rs::router` 里「1 段在前」只是书写习惯。
 
-> 若将来新增 1 段动态段（如 `/{batch_id}/…`），届时 1 段组与它同段位，「静态段必须先注册」才重新成为硬约束（对照 `src/modules/outsource/handler.rs::pool_router` 的现状）。
+> 若将来新增 1 段动态段（如 `/{batch_id}/…`），届时 1 段组与它同段位，「静态段必须先注册」才重新成为硬约束（对照 `src/modules/outsource/handler.rs::company_router` 的 `/{id}` catch-all）。
 
 ## 2. 逐字段
 

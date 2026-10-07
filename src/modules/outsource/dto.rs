@@ -256,26 +256,3 @@ pub struct OutsourceSendableListQuery {
     #[serde(default)]
     pub offset: Option<i64>,
 }
-
-// ===========================================================================
-// 入参 — Pool（2026-10-03 新增）
-// ===========================================================================
-
-/// `GET /outsource-pool/state` 的查询参数。
-///
-/// **两个参数都必填**，形态照抄 `GET /api/v2/prod/pool/state`（`worker_id` +
-/// `shelf_id` 双必填）：缺任一个时 `Query` extractor 反序列化失败 → **400**
-/// （axum `QueryRejection::FailedToDeserializeQuery`），而不是静默给默认值。
-/// 字段写 `i64` 而非 `Option<i64>` 就是这个「必填」语义的全部实现 —— 一旦
-/// 改成 `Option`，缺失参数会静默变成「不限公司 / 不限工序」，看板右列直接空掉
-/// 且不报错。
-///
-/// 反序列化形态与既有 outsource 查询参数一致（`serde_urlencoded` 对整数字段
-/// 按字符串解析，故 `?outsource_company_id=123` 合法）。
-#[derive(Debug, Clone, Deserialize)]
-pub struct OutsourcePoolStateQuery {
-    /// 外协公司雪花 ID（= `t_part_batch.current_holder_id`，`location='OUTSOURCE_COMPANY'`）。
-    pub outsource_company_id: i64,
-    /// 外协工序雪花 ID（= `t_part_batch.current_process_id`）。
-    pub process_id: i64,
-}
