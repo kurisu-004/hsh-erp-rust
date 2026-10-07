@@ -421,6 +421,14 @@ t_assembly.status               ← 派生缓存
 
 修法与代价：机械替换 37 文件 / 182 处为 `pool_snowflake()` 调用（`lock().unwrap().next_id()`），**零行为变更**（进程内已按 pid 隔离），可单独一个 commit。唯一要复核的是**依赖 id 单调递增**或**依赖 id 落在某区段**的断言 —— 换成进程级游标后同一测试内仍单调，但跨 helper 共享游标会改变各 helper 拿到的相对 id，故不能整仓一键替换，需按文件确认。
 
+### 待办登记：lib 单测基线红 `infra::cos_opendal::tests::memory_backend_copy_object`（2026-10-09）
+
+`scripts/test_nextest.sh --lib` 当前**唯一**的基线红，原因与业务代码无关：opendal 的 Memory backend 已支持 copy（当年 spike 结论「Memory backend 不支持 copy（`Unsupported (permanent) at copy`）」已过期），而该单测断言的是「copy 必须返回 Unsupported 类错误」，于是 `result.is_err()` 落空。
+
+**这条红不是任何一次改动引入的**（在 `master` 上同样红），修它要重写该测试的前提：Memory backend 上 copy 现在是 Ok，得改成断言「copy 成功且 `stat` 出来的 size / 内容与源一致」，或者把该断言降级为只在真 COS（S3 backend）下跑。
+
+**登记原因**：review 阶段容易被误判成本轮 diff 带进来的回归。**勿挂在本轮 PR 上** —— 与 `prod::batch` 拆批 quantity 那次修复（`git diff master..HEAD` 只碰 5 个文件、`src/infra/` 与 `Cargo.lock` 均未触碰）无关，单独一个 commit 处理。
+
 ## DB 约定（迁移与查询必须沿用）
 
 - 无物理外键（`bigint` + 索引，存在性由 service 校验）、无 DB ENUM（`varchar` + Rust enum 校验）

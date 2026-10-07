@@ -10,7 +10,8 @@
 //! i64 反序列化兜底走 `deserialize_i64` / `deserialize_i64_opt`（与其它域惯例一致：
 //! 只接受 JSON 字符串形态，雪花 ID 一律 string 以避免 JS `Number.MAX_SAFE_INTEGER`
 //! 精度截断；发数字会在 axum `JsonRejection` 层被拒 —— HTTP 422 纯文本、不进
-//! `R<T>` 信封）。
+//! `R<T>` 信封）。**计数字段刻意不套这层兜底**（`version` / `quantity` 走裸 JSON
+//! 数字），见 [`SplitBatchByBodyRequest`]。
 //! 2026-10-02 追加：自 part 域迁入批次流转入参（见文件末尾小节）。
 
 use serde::Deserialize;

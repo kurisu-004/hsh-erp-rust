@@ -309,6 +309,20 @@ async fn split_batch_string_quantity_rejects_with_422_plaintext() {
         !raw.contains("\"code\""),
         "422 是提取器层的纯文本、不走 R<T> 信封（不应出现 code 字段）: body={raw}"
     );
+    // 正向钉因：光靠上面的否定式断言无法区分「拒在 quantity」与「请求体其它部分
+    // 也拒了」。axum 0.8 的 `Json` 提取器用 `serde_path_to_error` 包装反序列化，
+    // 故 422 原文自带字段路径，实测形态为
+    // `…into the target type: quantity: invalid type: string "4", expected i32 at line 1 column N`：
+    // 字段名钉「哪个字段」、类型错钉「发的是字符串而期望 i32」——即这条用例守的正是
+    // `quantity` 的裸数字契约（`version` 发数字、`batch_id` 本就吃字符串）。
+    assert!(
+        raw.contains("quantity:"),
+        "422 原文应点名拒在 quantity 字段上（axum 经 serde_path_to_error 带出字段路径）: body={raw}"
+    );
+    assert!(
+        raw.contains("invalid type: string \"4\"") && raw.contains("expected i32"),
+        "422 原文应是「字符串 \"4\" 不是 i32」这一个类型错: body={raw}"
+    );
     // 提取器层拒收 ⇒ service 未执行 ⇒ 批次行未变
     let (count, total): (i64, i32) = sqlx::query_as(
         "SELECT COUNT(*)::bigint, COALESCE(SUM(quantity), 0)::int \
