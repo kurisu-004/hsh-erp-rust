@@ -1,11 +1,11 @@
 //! 2026-10-04 新增：本单口径的装配件「可出货套数」（纯内存计算，无 SQL）
 //!
 //! 口径与 `part::service::list_enrichment::fetch_delivered_sets`（**全局已送套数**）
-//! 同源，差别有两处，都在下文列明：分子换成「**本单**批次量」（打印要回答的是
-//! 「这一单能出几套」，不是「这个装配件历史上共出几套」），以及**不按批次状态过滤**。
+//! 同源，差别只有一处：分子换成「**本单**批次量」（本单要回答的是「这一单能出几套」，
+//! 不是「这个装配件历史上共出几套」）。分子另按 `READY_TO_SHIP` 过滤，理由见下方
+//! 「与全局已送口径的有意分叉」一节。
 //!
-//! 三个消费方共用本函数，避免同一公式在 handler / service 各写一遍：
-//! - `handler/print.rs` —— 注入转发 body 的 `merge_quantities`（打印套数）
+//! 两个消费方共用本函数，避免同一公式在 service 各写一遍：
 //! - `service/inner.rs::get_with_parts` —— 详情 `line_items[].shippable_sets`
 //! - `service/crud.rs::get_many_with_parts` —— 批量详情同上
 //!
@@ -56,20 +56,20 @@
 //!   向零截断会让套数偏大而 `NULLIF` 只挡 0 不挡负；本实现在 i32 收窄处把越界值
 //!   兜成 0（`try_from` 失败即 0），不把 wrap 后的垃圾值传下去。
 //!
-//! //! ## 与全局已送口径的有意分叉：分子只计本单 `READY_TO_SHIP` 批次
-
+//! ## 与全局已送口径的有意分叉：分子只计本单 `READY_TO_SHIP` 批次
+//!
 //! `part::service::list_enrichment::fetch_delivered_sets`（**全局已送套数**）的分子
 //! 带 `b.status IN ('DELIVERED','COMPLETED')` 过滤；本单版的分子只计
 //! `status == 'READY_TO_SHIP'` 的批次。两者是两套**刻意不同**的口径，不是同一口径
 //! 的两种实现。
-
+//!
 //! 2026-10-08 起本函数开始过滤状态（此前不过滤）：入单入口收敛为「只允许
 //! `READY_TO_SHIP`」（`POST /scan` 的 21405 闸门），DRAFT 单上只可能挂着
 //! `READY_TO_SHIP` 批次（提交后翻 `DELIVERED`）⇒ **加过滤与不过滤在「本单批次集合」
 //! 这个口径上结果相同**，但与「可入单」定义同源，且对「挂单后被旁路改状态」的脏数据
 //! 不再虚高套数。
-
-//! 两个消费方（详情 VO `line_items[].shippable_sets` 与扫码三层树的
+//!
+//! 三个消费方（详情 VO `line_items[].shippable_sets`、批量详情同上、扫码三层树的
 //! `entry_max_sets`）都必须走本函数，否则同一装配件在详情页与扫码弹窗会给出两个套数。
 
 use std::collections::HashMap;
@@ -192,7 +192,8 @@ pub(crate) fn shippable_sets(
 /// - `asm_quantity` —— `装配件 id → t_assembly.quantity`（工单总套数，既是
 ///   `per_set` 的比例因子、也是 `LEAST` 收口上界）。**只收 quantity 而不是整个
 ///   `TAssembly`**：本函数不需要装配件的其它字段，调用方就不必为了算套数而
-///   clone 整行（`handler/print.rs` 原先的 `asms.iter().map(|(a.id, a.clone()))`）；
+///   clone 整行（`inner.rs::get_with_parts` 就是直接 `assembly_map.iter().map(|(id, a)|
+///   (*id, a.quantity))` 的）；
 /// - `children_by_asm` —— `装配件 id → 全部未软删子件`（`min` 的定义域，见模块
 ///   文档「`min` 的定义域」一节）。缺键 = 该装配件无子件 ⇒ 0 套。
 ///

@@ -2,8 +2,9 @@
 
 > 本文件是 `com::delivery_note` 域的**唯一**契约来源。任何字段 / 端点变更必须同步本文件。
 > 代码位置：`src/modules/com/delivery_note/`（`handler/` · `service/` · `repo/` · `vo/` · `dto.rs`）。
-> 权威路由清单：`handler::ROUTES`（`/note` 段）与 `handler::GROUP_ROUTES`（`/group` 段），
-> 单测 `handler::tests::routes_declared_in_router` 逐条比对二者与 `router()` 源码。
+> 权威路由清单：`handler::ROUTES`（`/note` 段）、`handler::GROUP_ROUTES`（`/group` 段）、
+> `handler::DRIVERS_ROUTES`（`/drivers` 段），单测
+> `handler::tests::routes_declared_in_router` 逐条比对三者与各自 `xxx_router()` 源码。
 
 ## 0. 变更摘要（2026-10-08）
 
@@ -19,6 +20,12 @@
    + `/pickup` 入参瘦身并重跑司机校验。
 5. **VO 字段裁剪 29 个** + `RemoveParts` → `RemoveBatches` 改名 + `SubmitDeliveryOut` 塌缩为
    `R<String>`。
+6. **菜单 `delivery_dispatch` 下线**（`seeds/menu.sql`，非 migration —— seed 每次启动重放）：
+   §0 复活清单 / §2 INSERT / §4.1 + §4.3 白名单全部移除，§3.5 显式软删既有行，§4.6 回收
+   `t_role_menu`。该菜单的目标页依赖的恰好是本轮删掉的 `GET /pickup-pending` /
+   `POST /{id}/pickup-scan` ⇒ 前端必须同步删页（§8.3 第 16 行）。
+7. **`DeliveryNoteLineItem` 新增 `customer_id`**（L2 叶子 id，必填非空）：打印分组键由
+   `customer_name` 切到 id —— `t_customer.name` 非唯一，同名 L2 会被并进同一张 sheet。
 
 ## 1. 端点表（**17 个**）
 
@@ -64,10 +71,11 @@
 
 ### 1.4 路由注册顺序（**硬约束**，已升为 `ROUTES` 断言）
 
-`matchit` 要求静态分支先于参数分支。`note_router()` 里 **1 段静态路径**
-（`/batch-detail`、`/scan`、`/`）与 **2 段静态前缀**（`/scan/{serial_no}`）**必须先于
-`/{id}` 注册**，否则 axum 在 nest 构建期直接 panic（不是运行期 404）。往 `router()` 加一条
-`.route(...)` 而忘了登记 `ROUTES` / `GROUP_ROUTES`，`routes_declared_in_router` 立刻红。
+`matchit` 要求静态分支先于参数分支。`note_router()` 里 **2 段静态路径**
+（`/batch-detail`、`/scan`）与 **1 段静态前缀**（`/scan/{serial_no}`）**必须先于
+`/{id}` 注册**，否则 axum 在 nest 构建期直接 panic（不是运行期 404）。往任一
+`xxx_router()` 加一条 `.route(...)` 而忘了登记对应的 `ROUTES` / `GROUP_ROUTES` /
+`DRIVERS_ROUTES`，`routes_declared_in_router` 立刻红。
 
 ### 1.5 响应信封与 i64 约定
 
@@ -142,7 +150,7 @@ BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY`、`21420 BIZ_DELIVERY_NOTE_LOCKED_PART`
 
 `head`（`#[serde(flatten)]` 的 `DeliveryNoteOut`，wire 上与 head 字段同层）+ `line_items`。
 
-### 2.3 `DeliveryNoteLineItem`（25 字段，**行 = 批次**，`id` = `t_part_batch.id`）
+### 2.3 `DeliveryNoteLineItem`（26 字段，**行 = 批次**，`id` = `t_part_batch.id`）
 
 | 字段 | 类型 | 后端 SQL 来源 |
 |---|---|---|
@@ -164,6 +172,7 @@ BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY`、`21420 BIZ_DELIVERY_NOTE_LOCKED_PART`
 | `customer_name` | string \| null | 零件所属 L2 客户名 |
 | `parent_customer_name` | string \| null | L2 客户的父客户名（取不到回落 L2 名） |
 | `customer_path` | string \| null | `"{L1} / {L2}"`，L1 自指时只给 L2 名 |
+| `customer_id` | string ★ | `t_part.customer_id`（**L2 叶子 id**，必填非空）。打印分组按它查 `t_delivery_group_member` 定位分组；**不得改用 `customer_name` 匹配**（`t_customer.name` 只有非唯一 btree 索引，同名 L2 会被并进同一张 sheet） |
 | `assembly_id` | string \| null | `t_part.assembly_id`（散件 null） |
 | `assembly_serial_no` | string \| null | `AssemblyRepo::list_by_ids(include_deleted=false)` |
 | `assembly_drawing_no` | string \| null | 同上 |
@@ -239,7 +248,7 @@ DeliveryScanTreeOut
 | `customer_name` | string \| null | `LEFT JOIN t_customer`（软删客户 → null） |
 | `customer_id` | string ★ | `t_assembly.customer_id`（L2） |
 | `entry_max_sets` | number ★ | §4.2 公式，分子 = 子件的**可入单**批次 |
-| `per_set_parts` | array ★ | `[{ part_id: string, per_set_quantity: number }]`，装配序按 `part.id ASC` |
+| `per_set_parts` | array ★ | `[{ part_id: string, per_set_quantity: number }]`，装配序沿用 `list_parts_by_assembly` 的源序 `serial_no ASC NULLS LAST, id ASC` |
 
 ⚠️ 装配件节点**没有批次**：`t_assembly` 在 `t_part_batch` 里没有行，批次只挂在
 `DeliveryScanPartOut::children` 上。
@@ -296,7 +305,7 @@ DeliveryScanTreeOut
 | **`children` 恒为数组** | 装配件无活跃子件时是 `[]` 不是 `null` | 少一层前端 `?? []` 判空 |
 | **`per_set_quantity`** | `part.quantity / assembly.quantity`，**整数除法向零截断** | 与 `POST /scan` 的服务端重算同公式；前端不传 per_set 值，只用它展示 |
 | **`assembly.quantity == 0`** | `per_set_parts` 返回 `[]`（不参与除法） | 避免除零；此时 `entry_max_sets` 恒 0 |
-| **SQL 条数** | 独立件 3 条 / 装配件子件（父活跃）5 条 / 装配件子件（父软删）4 条 / 装配件条码 4 条 / 未命中 2 条 | 批次层**一条** `part_id = ANY($1)` 取回整棵树，零 N+1；`entry_max_*` 是**另一条** `list_entryable_batches_by_part_ids` |
+| **SQL 条数** | 独立件 5 条 / 装配件子件（父活跃）7 条 / 装配件子件（父软删）6 条 / 装配件条码 7 条 / 未命中 2 条 | 批次层**一条** `part_id = ANY($1)` 取回整棵树，零 N+1；`entry_max_*` 是**另一条** `list_entryable_batches_by_part_ids`。另有恒 2 条（`l1_of` → `CustomerRepo::get_by_id` + `note_find_open_draft_by_l1`）。⚠️ 这 5 个数字由单测 `com::delivery_note::sql_count_guard_tests` 钉死（禁循环内 SQL + 钉调用点重数 + 与 `repo/scan_tree.rs` 条数表对账），改任何一处必须三处同改 |
 
 ## 4. 入单与分配口径表
 
@@ -382,7 +391,9 @@ entry_max_sets(a) = LEAST( MIN( per_set(c) for c ∈ a 的**全部**未软删子
 装配件下**每个子件独立跑一次**（套数已由 `entry_max_sets` 的 min 定死，子件之间不耦合）⇒
 无跨子件组合爆炸。
 
-分配表按 `batch_id` 升序返回，前端可逐字比对而不必二次排序。
+分配表的顺序：DP 路径（正常输入）按 `batch_id` 升序返回；**降级贪心 G1 路径按入参序**
+（`quantity ASC, batch_no ASC`，见 §8.4 第 1 条）⇒ 前端**不要依赖返回顺序**，
+按批次逐条处理即可。
 
 ### 4.4 与全局 `fetch_delivered_sets` 的有意分叉
 
@@ -571,6 +582,8 @@ schema 与页面都在用」。
 | 13 | 打印改本地生成 | 删 `POST /{id}/print` / `print-labels` 两个请求，xlsx 由前端 **hucre** 本地生成 |
 | 14 | 分组权限 | `/group` 的 3 个写端点现在也接受 Inspector 角色（前端 `canEditGroup` 的角色白名单要加 Inspector） |
 | 15 | VO 字段裁剪 | 从 Zod schema 里删 §6.2 的 29 个字段（多余字段若非 `.strict()` 会静默通过，删 schema 才是真删） |
+| 16 | **删 `delivery_dispatch` 菜单页** | ⛔ 后端已下线该菜单（`seeds/menu.sql` §3.5 软删 + §4.1 / §4.3 白名单移除 + §4.6 回收 `role_menu`），而前端 `src/views/delivery-dispatch/DispatchNoteList.vue` 仍在。**该页依赖的恰好是本轮删掉的两条端点**（`GET /pickup-pending` / `POST /{id}/pickup-scan`）⇒ 不删就是「菜单能点、页面能开、每个请求都 404」的活条目。后端无 alias，这是前端必须同步删的一页 |
+| 17 | `line_items[].customer_id` | ★ `DeliveryNoteLineItem` **新增** `customer_id: string`（L2 叶子 id，必填非空）。打印分组键从 `customer_name` 切成 `customer_id`：`t_customer.name` 只有**非唯一** btree 索引，同名 L2 会被并进同一张 sheet，而打印产物是客户签字的收货凭证。Zod schema 里加必填 `customer_id: z.string()` |
 
 ### 8.4 已知偏差登记
 
@@ -588,7 +601,19 @@ schema 与页面都在用」。
 4. **端点总数是 17 而非任务书写的 18**：任务书 §7 的表里 `/note` 列了 14 行（含 2 条待删的
    打印端点），`/group` 4 行、`/drivers` 1 行，合计 19；删掉 2 条打印端点后 `/note` 是 12 行 ⇒
    12 + 4 + 1 = **17**。按「表里实际列出的路由」逐条实现。
-5. **`DELIVERY_NOTE_SUBMITTED` 的 `delivery_note_no` payload 是单据 id 的字符串**：写端点的
+5. **`DeliveryNoteLineItem.version` 未补（裁决 A）**：行项上**没有** `t_part_batch.version`
+   字段，**刻意不补**。原消费者 `frontend/src/views/delivery/components/
+   BatchInspectionConfirmDialog.vue`（读 `li.version`）随「过检路径」整体下线；新入单
+   入口 `POST /scan` 的批次 OCC **由服务端在事务内读取当前 version 完成**
+   （`split_batch` + 挂单都在同一事务里，客户端不需要回传）。⇒ **前端配套**：Zod
+   schema 里如仍声明 `line_items[].version` 为必填，删掉；`removeBatches` 发的是
+   `{ batch_ids, version }`，那里的 `version` 是**单据**版本（`DeliveryNoteOut.version`），
+   不是批次版本，两者不要混。
+6. **`DeliveryNoteLineItem.customer_id` 是新增必填字段**（2026-10-08）：后端两处装配
+   （`inner.rs::get_with_parts` / `crud.rs::get_many_with_parts`）都已填。前端 schema
+   同步加必填字段，见 §8.3 第 17 行。**不加 `skip_serializing_if`** —— 它是必填非空
+   `i64`，恒发。
+7. **`DELIVERY_NOTE_SUBMITTED` 的 `delivery_note_no` payload 是单据 id 的字符串**：写端点的
    出参已从 `SubmitDeliveryOut` 塌缩为 `String`（只有 id），handler 拿不到 `note_no` ⇒ 该
    payload 字段填的是 `path.id.to_string()`。前端只用 `delivery_note_id` 做 invalidate，无影响；
    若将来要真 no，需在 `submit` 里额外回读 `delivery_note_no`。

@@ -13,9 +13,9 @@
 //!            .nest("/drivers",  handler::drivers_router()) 候选送货司机一览
 //! ```
 //! ⇒ 送货单是 `/api/v2/com/delivery/note/*`、送货分组是
-//! `/api/v2/com/delivery/group/*`、司机候选是 `/api/v2/com/delivery/drivers`；送货单
-//! 与送货分组的**权威路由清单**分别是 [`handler::ROUTES`] / [`handler::GROUP_ROUTES`]
-//! （单测断言它们与对应 `router()` 源码逐条一致）。
+//! `/api/v2/com/delivery/group/*`、司机候选是 `/api/v2/com/delivery/drivers`；三段的
+//! **权威路由清单**分别是 [`handler::ROUTES`] / [`handler::GROUP_ROUTES`] /
+//! [`handler::DRIVERS_ROUTES`]（单测断言它们与各自 `xxx_router()` 源码逐条一致）。
 //!
 //! ## 子模块
 //! - `dto` —— 仅 `Deserialize` 入参（出参全在 `vo`）
@@ -43,6 +43,11 @@ pub mod repo;
 pub mod service;
 pub mod statemachine;
 pub mod vo;
+
+/// 2026-10-08 新增：两条纯读新端点（`GET /scan/{serial_no}` / `GET /drivers`）的
+/// SQL 条数源码级护栏（禁 N+1 + 钉死每分支条数 + 与文档对账）。仅单测编译。
+#[cfg(test)]
+mod sql_count_guard;
 
 use std::sync::Arc;
 

@@ -190,11 +190,11 @@ impl DeliveryNoteService {
 
         // ===== Step 6: 逐零件分类（可入单 / 已占用 / 未过检） =====
         let part_ids: Vec<i64> = targets.keys().copied().collect();
-        let all_batches = PartBatchRepo::list_active_by_part_ids(&mut *repo.conn_mut(), &part_ids)
-            .await?
-            .into_iter()
-            .filter(|b| part_ids.contains(&b.part_id))
-            .collect::<Vec<_>>();
+        // 2026-10-08 review 第 1 轮 m9：删掉 `filter(part_ids.contains(..))` —— repo 的
+        // SQL 已写死 `WHERE part_id = ANY($1) AND deleted_at IS NULL`，返回集恒是入参
+        // 的子集，内存再过一遍既是 O(n·m) 的无用功，也让人误以为 repo 没过滤。
+        let all_batches =
+            PartBatchRepo::list_active_by_part_ids(&mut *repo.conn_mut(), &part_ids).await?;
         let eligible =
             DeliveryScanRepo::list_entryable_batches_by_part_ids(&mut *repo.conn_mut(), &part_ids)
                 .await?;

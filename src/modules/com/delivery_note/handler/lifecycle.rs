@@ -1,6 +1,6 @@
 //! com::delivery_note 域状态机转换 handler（submit / recall / pickup / driver）
 //!
-//! 基础 CRUD 走 `crud.rs`；扫码入单与扫码树走 `scan.rs`；打印走 `print.rs`。
+//! 基础 CRUD 走 `crud.rs`；扫码入单与扫码树走 `scan.rs`。
 //!
 //! ## 约定
 //! - 事务边界在 handler：`state.pool.begin()` → 借 `&mut *tx` 喂给 service → 显式

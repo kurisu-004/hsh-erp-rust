@@ -10,7 +10,7 @@
 //! - `GET /pickup-pending`（并入 `POST /{id}/pickup` 的司机指定动作）
 //! - `POST /{id}/attach-batches`（在 `scan.rs`，随扫码重写删除）
 //!
-//! 状态机转换走 `lifecycle.rs`；扫码入单走 `scan.rs`；打印走 `print.rs`。
+//! 状态机转换走 `lifecycle.rs`；扫码入单走 `scan.rs`。
 //!
 //! ## 约定（2026-09-22 D-5 + review 第 1 轮）
 //! - 事务边界在 handler：`state.pool.begin()` → 借 `&mut *tx` 喂给 service → 显式

@@ -17,9 +17,6 @@
 //! （`DeliveryNotePickupPendingQuery`）、送货台逐件扫码核销
 //! （`DeliveryNotePickupScanRequest`）—— 入单入口收敛为 `POST /scan` 单一入口后，
 //! 前端不再有「先建单 / 先挑批次再挂单 / 逐件核销」这几条并行路径。
-//!
-//! 打印端点的入参也不在本文件：转发链路上 body 以 `Json<Value>` 原样透传给 python，
-//! 字段语义由 python 端 schema 负责。
 
 use chrono::NaiveDate;
 use serde::Deserialize;

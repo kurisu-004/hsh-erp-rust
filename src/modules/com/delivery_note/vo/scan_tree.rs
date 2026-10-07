@@ -82,7 +82,7 @@ pub struct DeliveryScanAssemblyOut {
     pub customer_name: Option<String>,
     /// `t_assembly.customer_id`（L2 客户 id）。
     ///
-    /// 用途：前端展示 + `POST /scan` 的 L1 一致性校验（服务端另有一道 21416 闸门，
+    /// 用途：前端展示 + `POST /scan` 的 L1 一致性校验（服务端另有一道 21407 闸门，
     /// 本字段不是信任边界）。
     #[serde(serialize_with = "crate::shared::types::serialize_i64")]
     pub customer_id: i64,
@@ -96,7 +96,9 @@ pub struct DeliveryScanAssemblyOut {
     /// 每套各子件应入单的数量：`per_set_quantity = part.quantity /
     /// assembly.quantity`（**整数除法，向零截断**）。
     ///
-    /// 装配序按 `part.id ASC`。前端用它把「送 N 套」翻译成每个子件的件数；
+    /// 装配序沿用 `list_parts_by_assembly` 的源序 `serial_no ASC NULLS LAST, id ASC`
+    /// （子件序列号由父件派生，该序即装配序）。前端用它把「送 N 套」翻译成每个子件的
+    /// 件数；
     /// 服务端在 `POST /scan` 里按同一公式重算，不信任客户端传来的值。
     pub per_set_parts: Vec<DeliveryScanPerSetPartOut>,
 }

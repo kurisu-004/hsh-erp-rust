@@ -73,8 +73,8 @@ impl DeliveryNoteService {
                 if let Some(n) = repo.note_find_open_draft_by_l1(l1_id).await? {
                     Ok(n)
                 } else {
-                    // 重查仍未命中，说明撞的是别的唯一索引（单号 uq_t_delivery_note_no_active
-                    // 或事件表残留）⇒ 抛 23505 原始错误，不吞。
+                    // 重查仍未命中，说明撞的是别的唯一索引（本表当前只有
+                    // `uq_t_delivery_note_no_active`）⇒ 抛 23505 原始错误，不吞。
                     Err(AppError::Database(sqlx::Error::Database(db_err)))
                 }
             }

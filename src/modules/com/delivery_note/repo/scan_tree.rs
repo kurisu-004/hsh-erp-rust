@@ -5,15 +5,27 @@
 //! 的取数方式上。
 //!
 //! ## 单次请求的 SQL 条数
-//! 一次扫码按分支取 3~6 条 SQL，**无 N+1**（批次层一条 `part_id = ANY($1)`）：
+//! 一次扫码按分支取 2~7 条 SQL，**无 N+1**（批次层一条 `part_id = ANY($1)`）。
+//! 表里的条数由 `com::delivery_note::sql_count_guard_tests` 逐条钉住（改动本表的
+//! 数字必须同步改那里，否则单测立刻红）：
 //!
 //! | 扫到的东西 | 依次执行的 SQL | 条数 |
 //! |---|---|---:|
-//! | 独立件 | `find_part_by_serial` → `list_batches_by_part_ids` → `find_open_draft_by_l1` | 3 |
-//! | 装配件子件（父装配件活跃） | `find_part_by_serial` → `find_assembly_by_id` → `list_parts_by_assembly` → `list_batches_by_part_ids` → `find_open_draft_by_l1` | 5 |
-//! | 装配件子件（父装配件已软删） | `find_part_by_serial` → `find_assembly_by_id` → `list_batches_by_part_ids` → `find_open_draft_by_l1` | 4 |
-//! | 装配件条码 | `find_assembly_by_serial` → `list_parts_by_assembly` → `list_batches_by_part_ids` → `find_open_draft_by_l1` | 4 |
+//! | 独立件 | `find_part_by_serial` → `list_batches_by_part_ids` → `list_entryable_batches_by_part_ids` → `l1_of`（`CustomerRepo::get_by_id`）→ `note_find_open_draft_by_l1` | 5 |
+//! | 装配件子件（父装配件活跃） | `find_part_by_serial` → `find_assembly_by_id` → `list_parts_by_assembly` → `list_batches_by_part_ids` → `list_entryable_batches_by_part_ids` → `l1_of` → `note_find_open_draft_by_l1` | 7 |
+//! | 装配件子件（父装配件已软删） | `find_part_by_serial` → `find_assembly_by_id` → `list_batches_by_part_ids` → `list_entryable_batches_by_part_ids` → `l1_of` → `note_find_open_draft_by_l1` | 6 |
+//! | 装配件条码 | `find_part_by_serial`（**未命中探测**）→ `find_assembly_by_serial` → `list_parts_by_assembly` → `list_batches_by_part_ids` → `list_entryable_batches_by_part_ids` → `l1_of` → `note_find_open_draft_by_l1` | 7 |
 //! | 两表皆未命中 | `find_part_by_serial` → `find_assembly_by_serial` | 2 |
+//!
+//! 恒 4 条的「尾巴」（命中之后无分支地执行）：`list_batches_by_part_ids`（批次层，
+//! 一条覆盖整棵树）+ `list_entryable_batches_by_part_ids`（两个 `entry_max_*` 的分子）
+//! + `l1_of`（客户 id → L1）+ `note_find_open_draft_by_l1`。
+//!
+//! 分支差异只发生在命中段：1 条（独立件）/ 3 条（父活跃）/ 2 条（父软删）/ 3 条
+//! （装配件码，含那次未命中探测）。
+//!
+//! 边界：`resolve_draft` 在「装配件无活跃子件」（`parts` 为空）时会提前返 `None`
+//! ⇒ 该分支下少 2 条（`l1_of` + `note_find_open_draft_by_l1`），不在上表口径内。
 //!
 //! ## 同一 `serial_no` 可能并存多行：取哪一行是写死的口径
 //! `t_part` 的 `uk_t_part_serial_no` 是**部分**唯一索引（`WHERE serial_no IS NOT
