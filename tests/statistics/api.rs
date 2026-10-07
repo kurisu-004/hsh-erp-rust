@@ -25,12 +25,11 @@
 
 use chrono::NaiveDate;
 
-use hsh_erp_test_support::{load_statistics_fixture, test_pool};
+use hsh_erp_test_support::{load_statistics_fixture, shared_test_snowflake, test_pool};
 
 #[allow(unused_imports)]
 use hsh_erp_rust::auth::rbac::{CurrentUser, Role};
 use hsh_erp_rust::infra::clock::now_naive;
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::modules::statistics::service::StatisticsService;
 use sqlx::PgPool;
 
@@ -51,11 +50,16 @@ async fn setup() -> (PgPool, hsh_erp_test_support::fixture::StatisticsFixture) {
 
 // ===========================================================================
 //  statistics 域独享 helper（按场景造不同 code / badge / prefix / name）
+//
+//  2026-10-09：本节所有 ID 一律从 `shared_test_snowflake()`（全进程唯一 generator 对象）
+//  取号，不再就地 `SnowflakeIdGenerator::new(...)`。原先 5 个 helper 各自 fresh、instance
+//  又都是 1，同毫秒各取 seq 0 就发出逐字节相同的 id —— `insert_l1_customer` /
+//  `insert_l2_customer` 同写 `t_customer`，是最典型的碰撞对（各调一次即撞，不是「同一个
+//  helper 调两次」才撞）。
 // ===========================================================================
 
 async fn insert_work_type(pool: &PgPool, code: &str, name: &str) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = shared_test_snowflake().next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_work_type (id, code, name, sort_order, version, created_at, updated_at) \
@@ -72,8 +76,7 @@ async fn insert_work_type(pool: &PgPool, code: &str, name: &str) -> i64 {
 }
 
 async fn insert_worker(pool: &PgPool, badge: &str, name: &str, wt_id: Option<i64>) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = shared_test_snowflake().next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_worker (id, badge_code, name, is_active, work_type_id, version, \
@@ -92,8 +95,7 @@ async fn insert_worker(pool: &PgPool, badge: &str, name: &str, wt_id: Option<i64
 }
 
 async fn insert_part(pool: &PgPool, customer_id: i64, name: &str) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = shared_test_snowflake().next_id();
     let now = now_naive();
     let today = now.date();
     sqlx::query(
@@ -114,8 +116,7 @@ async fn insert_part(pool: &PgPool, customer_id: i64, name: &str) -> i64 {
 }
 
 async fn insert_l2_customer(pool: &PgPool, l1_id: i64, name: &str) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = shared_test_snowflake().next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
@@ -133,8 +134,7 @@ async fn insert_l2_customer(pool: &PgPool, l1_id: i64, name: &str) -> i64 {
 }
 
 async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = shared_test_snowflake().next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
@@ -209,15 +209,15 @@ async fn workers_stats_happy_path() {
     let l2 = insert_l2_customer(&pool, l1, "子客S-2").await;
     let part_id = insert_part(&pool, l2, "p2").await;
     let now = now_naive();
-    // 单一 snowflake 生成器避免同毫秒内 seq 撞 id
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    // 2026-10-09：原注释「单一 snowflake 生成器避免同毫秒内 seq 撞 id」的局部 generator
+    // 已删除 —— 正确解法是全进程共享同一个对象，进程内任何两处取号都不撞。
     // w1: 3 events quantity=1 each (total 3); w2: 7 events quantity=1 each (total 7)
     for _ in 0..3 {
         sqlx::query(
             "INSERT INTO t_part_event (id, part_id, worker_id, event_type, quantity, created_at) \
              VALUES ($1, $2, $3, 'PICKED_UP', 1, $4)",
         )
-        .bind(snowflake.next_id())
+        .bind(shared_test_snowflake().next_id())
         .bind(part_id)
         .bind(w1)
         .bind(now)
@@ -230,7 +230,7 @@ async fn workers_stats_happy_path() {
             "INSERT INTO t_part_event (id, part_id, worker_id, event_type, quantity, created_at) \
              VALUES ($1, $2, $3, 'PICKED_UP', 1, $4)",
         )
-        .bind(snowflake.next_id())
+        .bind(shared_test_snowflake().next_id())
         .bind(part_id)
         .bind(w2)
         .bind(now)
@@ -278,13 +278,12 @@ async fn worker_detail_happy_path() {
     let l2 = insert_l2_customer(&pool, l1, "子客S-3").await;
     let part_id = insert_part(&pool, l2, "p3").await;
     let now = now_naive();
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     for ev_type in ["PICKED_UP", "PICKED_UP", "RETURNED"] {
         sqlx::query(
             "INSERT INTO t_part_event (id, part_id, worker_id, event_type, quantity, created_at) \
              VALUES ($1, $2, $3, $4, 1, $5)",
         )
-        .bind(snowflake.next_id())
+        .bind(shared_test_snowflake().next_id())
         .bind(part_id)
         .bind(w_id)
         .bind(ev_type)
@@ -321,8 +320,7 @@ async fn pickup_skips_summary_happy_path() {
     let part_id = insert_part(&pool, l2, "p-skip").await;
     let now = now_naive();
     let today = now.date();
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let batch_id = snowflake.next_id();
+    let batch_id = shared_test_snowflake().next_id();
     // 插 2 条 pickup_skip_event
     for i in 0..2 {
         sqlx::query(
@@ -331,7 +329,7 @@ async fn pickup_skips_summary_happy_path() {
                work_type_id, quantity, part_planned_delivery_date, skipped_earliest_date, created_at) \
              VALUES ($1, $2, $3, $4, 1, 'X001', 1, $5, 1, $6, $7, $8)",
         )
-        .bind(snowflake.next_id())
+        .bind(shared_test_snowflake().next_id())
         .bind(w_id)
         .bind(part_id)
         .bind(batch_id)
@@ -369,8 +367,7 @@ async fn pickup_skip_detail_happy_path() {
     let part_id = insert_part(&pool, l2, "p-skip-d").await;
     let now = now_naive();
     let today = now.date();
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let batch_id = snowflake.next_id();
+    let batch_id = shared_test_snowflake().next_id();
     for _ in 0..3 {
         sqlx::query(
             "INSERT INTO t_pickup_skip_event \
@@ -378,7 +375,7 @@ async fn pickup_skip_detail_happy_path() {
                work_type_id, quantity, part_planned_delivery_date, skipped_earliest_date, created_at) \
              VALUES ($1, $2, $3, $4, 1, 'X002', 1, $5, 1, $6, $7, $8)",
         )
-        .bind(snowflake.next_id())
+        .bind(shared_test_snowflake().next_id())
         .bind(w_id)
         .bind(part_id)
         .bind(batch_id)
@@ -420,10 +417,9 @@ async fn count_in_process_at_date_to_boundary() {
     let (pool, _fx) = setup().await;
     let l1 = insert_l1_customer(&pool, "客户S-6", "F").await;
     let l2 = insert_l2_customer(&pool, l1, "子客S-6").await;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
 
     // part A：09-10 创建，09-25 COMPLETED（晚于 date_to）
-    let part_a = snowflake.next_id();
+    let part_a = shared_test_snowflake().next_id();
     let created_a = NaiveDate::from_ymd_opt(2026, 9, 10)
         .unwrap()
         .and_hms_opt(8, 0, 0)
@@ -445,7 +441,7 @@ async fn count_in_process_at_date_to_boundary() {
         "INSERT INTO t_part_event (id, part_id, worker_id, event_type, quantity, created_at) \
          VALUES ($1, $2, NULL, 'COMPLETED', 1, $3)",
     )
-    .bind(snowflake.next_id())
+    .bind(shared_test_snowflake().next_id())
     .bind(part_a)
     .bind(
         NaiveDate::from_ymd_opt(2026, 9, 25)
@@ -458,7 +454,7 @@ async fn count_in_process_at_date_to_boundary() {
     .expect("insert part A COMPLETED event");
 
     // part B：09-10 创建，无任何事件
-    let part_b = snowflake.next_id();
+    let part_b = shared_test_snowflake().next_id();
     let created_b = NaiveDate::from_ymd_opt(2026, 9, 10)
         .unwrap()
         .and_hms_opt(9, 0, 0)

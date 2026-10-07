@@ -69,7 +69,6 @@ use sqlx::PgPool;
 
 use hsh_erp_rust::auth::rbac::{CurrentUser, Role};
 use hsh_erp_rust::infra::clock::now_naive;
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::modules::assembly::service::{AssemblyService, SyncOutcome};
 
 // 2026-09-24 PR13 Phase C.Final：fixture 范本化入口。
@@ -78,7 +77,7 @@ use hsh_erp_rust::modules::assembly::service::{AssemblyService, SyncOutcome};
 // 用本地 `insert_l1` / `insert_l2` 等 helper 创建专属测试数据。
 use hsh_erp_test_support::{
     AssemblyFixture, PartFixture, json_request, load_assembly_fixture, login_token, pool_snowflake,
-    send, test_app, test_pool, test_state,
+    send, shared_test_snowflake, test_app, test_pool, test_state,
 };
 
 // ===========================================================================
@@ -238,8 +237,10 @@ async fn insert_assembly(
     drawing_no: &str,
     name: &str,
 ) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    // 2026-10-09：ID 统一从全进程共享 generator 取（`shared_test_snowflake`），不再就地
+    // new —— 同一 `assembly` binary 里本文件与 `api.rs` / `children.rs` 各自 fresh、
+    // instance 又都是 1，同毫秒各取 seq 0 即撞 `t_assembly_pkey`（23505）。
+    let id = shared_test_snowflake().next_id();
     let now = now_naive();
     let today = now.date();
     sqlx::query!(

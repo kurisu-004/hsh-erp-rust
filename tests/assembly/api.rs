@@ -22,8 +22,12 @@
 //!      cancel_assembly 在终态被拒 (deferred #4 状态机部分)
 //!
 //! ## 与 brief 的差异
-//!   - `SnowflakeIdGenerator::new(epoch_ms, instance_id)` 是 2-arg，`next_id()` 返
-//!     `i64`（不返 Result）—— 修正 brief 中的 1-arg `new(1).next_id().unwrap()`。
+//!   - `next_id()` 返 `i64`（不返 Result）—— 修正 brief 中的 `.unwrap()` 写法。
+//!     ⚠️ 2026-10-09：**不再**在本文件就地 `SnowflakeIdGenerator::new(epoch, instance)`，
+//!     一律 `shared_test_snowflake()`（全进程唯一 generator 对象）。原先本文件 15 处局部
+//!     generator 加上 `children.rs` / `by_part.rs` / `files_list.rs` 的同形写法，instance
+//     全是 1、同毫秒各取 seq 0 就撞 `t_customer_pkey` 等（23505）—— `insert_l1_customer`
+//!     与 `insert_l2_customer` 同写 `t_customer`、各调一次即撞，是最典型的碰撞对。
 //!   - `make_fixture_pdf` 中 page_ids 必须收集并放入 Pages.Kids（用 `Object::Reference`），
 //!     否则 lopdf `load_mem` 解析不出页数。
 //!   - `CurrentUser { roles: vec![Role::Manager], ... }`：service `require_any_role`
@@ -52,7 +56,6 @@ use sqlx::PgPool;
 
 use hsh_erp_rust::auth::rbac::{CurrentUser, Role};
 use hsh_erp_rust::infra::clock::now_naive;
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::modules::assembly::dto::{
     AssemblyChildRequest, AssemblyCreateRequest, AssemblyUpdateRequest,
 };
@@ -60,8 +63,8 @@ use hsh_erp_rust::modules::assembly::service::AssemblyService;
 use hsh_erp_rust::shared::error::AppError;
 
 use hsh_erp_test_support::{
-    AssemblyFixture, PartFixture, json_request, load_assembly_fixture, login_token, send, test_app,
-    test_pool, test_state,
+    AssemblyFixture, PartFixture, json_request, load_assembly_fixture, login_token, send,
+    shared_test_snowflake, test_app, test_pool, test_state,
 };
 
 // ===========================================================================
@@ -89,8 +92,7 @@ async fn setup() -> (PgPool, AssemblyFixture) {
 /// 插一个 L1 客户（`parent_id IS NULL` + `serial_prefix` 单大写字母）。
 /// `serial_prefix` 必须是 `'A'..='Z'`（DB CHECK 约束）。
 async fn insert_l1_customer(pool: &PgPool, name: &str, serial_prefix: &str) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = shared_test_snowflake().next_id();
     let now = now_naive();
     sqlx::query!(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
@@ -109,8 +111,7 @@ async fn insert_l1_customer(pool: &PgPool, name: &str, serial_prefix: &str) -> i
 
 /// 插一个 L2 叶子客户（`parent_id = l1_id`，`serial_prefix IS NULL`）。
 async fn insert_l2_customer(pool: &PgPool, name: &str, parent_id: i64) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = shared_test_snowflake().next_id();
     let now = now_naive();
     sqlx::query!(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
@@ -227,10 +228,15 @@ async fn create_without_pdf_dispatches_serial_no() {
     let current = test_current_user();
 
     let mut tx = pool.begin().await.unwrap();
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let out = AssemblyService::create_assembly(&mut tx, &snowflake, &req, vec![], &current)
-        .await
-        .expect("create without pdf should succeed");
+    let out = AssemblyService::create_assembly(
+        &mut tx,
+        shared_test_snowflake().as_ref(),
+        &req,
+        vec![],
+        &current,
+    )
+    .await
+    .expect("create without pdf should succeed");
     tx.commit().await.unwrap();
 
     assert_eq!(
@@ -303,10 +309,15 @@ async fn create_with_pdf_creates_children_with_serial_pattern() {
     let current = test_current_user();
 
     let mut tx = pool.begin().await.unwrap();
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let out = AssemblyService::create_assembly(&mut tx, &snowflake, &req, vec![pdf], &current)
-        .await
-        .expect("create with pdf should succeed");
+    let out = AssemblyService::create_assembly(
+        &mut tx,
+        shared_test_snowflake().as_ref(),
+        &req,
+        vec![pdf],
+        &current,
+    )
+    .await
+    .expect("create with pdf should succeed");
     tx.commit().await.unwrap();
 
     assert_eq!(out.assembly.serial_no.as_deref(), Some("F1000"));
@@ -450,10 +461,15 @@ async fn create_pdf_page_mismatch_returns_20305() {
     let current = test_current_user();
 
     let mut tx = pool.begin().await.unwrap();
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let err = AssemblyService::create_assembly(&mut tx, &snowflake, &req, vec![pdf], &current)
-        .await
-        .expect_err("page mismatch 应抛错");
+    let err = AssemblyService::create_assembly(
+        &mut tx,
+        shared_test_snowflake().as_ref(),
+        &req,
+        vec![pdf],
+        &current,
+    )
+    .await
+    .expect_err("page mismatch 应抛错");
     // Drop tx without commit → 自动 rollback，不留半成品
     drop(tx);
 
@@ -504,10 +520,15 @@ async fn create_too_many_children_returns_20303() {
     let current = test_current_user();
 
     let mut tx = pool.begin().await.unwrap();
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let err = AssemblyService::create_assembly(&mut tx, &snowflake, &req, vec![], &current)
-        .await
-        .expect_err("100 children 应抛错");
+    let err = AssemblyService::create_assembly(
+        &mut tx,
+        shared_test_snowflake().as_ref(),
+        &req,
+        vec![],
+        &current,
+    )
+    .await
+    .expect_err("100 children 应抛错");
     drop(tx);
 
     match err {
@@ -549,10 +570,15 @@ async fn cancel_blocks_completed_assembly() {
     let current = test_current_user();
 
     let mut tx = pool.begin().await.unwrap();
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let out = AssemblyService::create_assembly(&mut tx, &snowflake, &req, vec![], &current)
-        .await
-        .expect("create should succeed");
+    let out = AssemblyService::create_assembly(
+        &mut tx,
+        shared_test_snowflake().as_ref(),
+        &req,
+        vec![],
+        &current,
+    )
+    .await
+    .expect("create should succeed");
     tx.commit().await.unwrap();
 
     // 2. 强行 UPDATE 到 COMPLETED（绕开状态机；本测试只关心 cancel 拒绝）
@@ -622,10 +648,15 @@ async fn list_with_filters_and_l1_expansion() {
             children: vec![],
         };
         let mut tx = pool.begin().await.unwrap();
-        let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-        AssemblyService::create_assembly(&mut tx, &snowflake, &req, vec![], &current)
-            .await
-            .expect("seed assembly");
+        AssemblyService::create_assembly(
+            &mut tx,
+            shared_test_snowflake().as_ref(),
+            &req,
+            vec![],
+            &current,
+        )
+        .await
+        .expect("seed assembly");
         tx.commit().await.unwrap();
     }
 
@@ -725,10 +756,15 @@ async fn soft_delete_blocks_terminal_states() {
 
     // 1) 建装配体（PENDING，version=0）
     let mut tx = pool.begin().await.unwrap();
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let out = AssemblyService::create_assembly(&mut tx, &snowflake, &req, vec![], &current)
-        .await
-        .expect("create should succeed");
+    let out = AssemblyService::create_assembly(
+        &mut tx,
+        shared_test_snowflake().as_ref(),
+        &req,
+        vec![],
+        &current,
+    )
+    .await
+    .expect("create should succeed");
     let asm_id = out.assembly.id;
     let initial_version = out.assembly.version;
     assert_eq!(initial_version, 0);
@@ -793,11 +829,15 @@ async fn soft_delete_blocks_terminal_states() {
         children: vec![],
     };
     let mut tx = pool.begin().await.unwrap();
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let out2 =
-        AssemblyService::create_assembly(&mut tx, &snowflake, &req_pending, vec![], &current)
-            .await
-            .expect("create pending should succeed");
+    let out2 = AssemblyService::create_assembly(
+        &mut tx,
+        shared_test_snowflake().as_ref(),
+        &req_pending,
+        vec![],
+        &current,
+    )
+    .await
+    .expect("create pending should succeed");
     let pending_id = out2.assembly.id;
     let pending_version = out2.assembly.version;
     tx.commit().await.unwrap();
@@ -856,10 +896,15 @@ async fn create_assembly_default_not_null_columns() {
     let user_id = current.id;
 
     let mut tx = pool.begin().await.unwrap();
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let out = AssemblyService::create_assembly(&mut tx, &snowflake, &req, vec![], &current)
-        .await
-        .expect("create should succeed");
+    let out = AssemblyService::create_assembly(
+        &mut tx,
+        shared_test_snowflake().as_ref(),
+        &req,
+        vec![],
+        &current,
+    )
+    .await
+    .expect("create should succeed");
     let asm_id = out.assembly.id;
     tx.commit().await.unwrap();
 
@@ -982,10 +1027,15 @@ async fn state_machine_transitions() {
     let current = test_current_user();
 
     let mut tx = pool.begin().await.unwrap();
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let out = AssemblyService::create_assembly(&mut tx, &snowflake, &req, vec![], &current)
-        .await
-        .expect("create should succeed");
+    let out = AssemblyService::create_assembly(
+        &mut tx,
+        shared_test_snowflake().as_ref(),
+        &req,
+        vec![],
+        &current,
+    )
+    .await
+    .expect("create should succeed");
     let asm_id = out.assembly.id;
     tx.commit().await.unwrap();
 
@@ -1099,10 +1149,15 @@ async fn update_assembly_cascades_shared_fields_to_children() {
     let current = test_current_user();
 
     let mut tx = pool.begin().await.unwrap();
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let out = AssemblyService::create_assembly(&mut tx, &snowflake, &req, vec![pdf], &current)
-        .await
-        .expect("create should succeed");
+    let out = AssemblyService::create_assembly(
+        &mut tx,
+        shared_test_snowflake().as_ref(),
+        &req,
+        vec![pdf],
+        &current,
+    )
+    .await
+    .expect("create should succeed");
     let asm_id = out.assembly.id;
     let asm_version = out.assembly.version;
     tx.commit().await.unwrap();
@@ -1239,10 +1294,15 @@ async fn update_assembly_scales_child_quantities() {
     let current = test_current_user();
 
     let mut tx = pool.begin().await.unwrap();
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let out = AssemblyService::create_assembly(&mut tx, &snowflake, &req, vec![pdf], &current)
-        .await
-        .expect("create should succeed");
+    let out = AssemblyService::create_assembly(
+        &mut tx,
+        shared_test_snowflake().as_ref(),
+        &req,
+        vec![pdf],
+        &current,
+    )
+    .await
+    .expect("create should succeed");
     let asm_id = out.assembly.id;
     let mut asm_version = out.assembly.version;
     tx.commit().await.unwrap();
@@ -1451,10 +1511,15 @@ async fn update_assembly_scales_child_quantities_rounding_and_floor() {
     };
     let current = test_current_user();
     let mut tx = pool.begin().await.unwrap();
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let out = AssemblyService::create_assembly(&mut tx, &snowflake, &req, vec![pdf], &current)
-        .await
-        .expect("create should succeed");
+    let out = AssemblyService::create_assembly(
+        &mut tx,
+        shared_test_snowflake().as_ref(),
+        &req,
+        vec![pdf],
+        &current,
+    )
+    .await
+    .expect("create should succeed");
     let asm_id = out.assembly.id;
     let asm_version = out.assembly.version;
     tx.commit().await.unwrap();
@@ -1609,8 +1674,7 @@ async fn list_assemblies_with_compat_union_list_fields() {
     // 注入 1 行 asm，避免返回 0 条干扰断言（同时确认确实命中 DB 而非空集）
     let asm_id = {
         use hsh_erp_rust::infra::clock::now_naive;
-        use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-        let id = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
+        let id = shared_test_snowflake().next_id();
         let now = now_naive();
         let today = now.date();
         sqlx::query(

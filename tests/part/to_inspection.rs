@@ -19,7 +19,8 @@ use sqlx::PgPool;
 
 use hsh_erp_test_support::fixture::PartFixture;
 use hsh_erp_test_support::{
-    json_request, load_part_fixture, login_token, send, test_app, test_pool, test_state,
+    json_request, load_part_fixture, login_token, send, shared_test_snowflake, test_app, test_pool,
+    test_state,
 };
 
 // ===========================================================================
@@ -65,10 +66,8 @@ async fn insert_part_with_batch(
     qty: i32,
 ) -> (i64, i64) {
     use hsh_erp_rust::infra::clock::now_naive;
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let part_id = snowflake.next_id();
-    let batch_id = snowflake.next_id();
+    let part_id = shared_test_snowflake().next_id();
+    let batch_id = shared_test_snowflake().next_id();
     let now = now_naive();
     let today = now.date();
     sqlx::query(

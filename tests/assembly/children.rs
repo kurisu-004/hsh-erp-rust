@@ -11,14 +11,15 @@
 use sqlx::PgPool;
 
 use hsh_erp_rust::auth::rbac::{CurrentUser, Role};
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::modules::assembly::dto::{AssemblyChildAddRequest, AssemblyCreateRequest};
 use hsh_erp_rust::modules::assembly::service::AssemblyService;
 use hsh_erp_rust::modules::part::dto_crud::PartCreateRequest;
 use hsh_erp_rust::modules::part::service::PartService;
 use hsh_erp_rust::shared::error::AppError;
 
-use hsh_erp_test_support::{AssemblyFixture, load_assembly_fixture, test_pool};
+use hsh_erp_test_support::{
+    AssemblyFixture, load_assembly_fixture, shared_test_snowflake, test_pool,
+};
 
 // ===========================================================================
 //  共享 setup（PR13 Phase H 范本化 + 本 sub-file 自定义 l1/l2 客户 fixture）
@@ -31,8 +32,7 @@ async fn setup() -> (PgPool, AssemblyFixture) {
 }
 
 async fn insert_l1_customer(pool: &PgPool, name: &str, serial_prefix: &str) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = shared_test_snowflake().next_id();
     let now = chrono::Local::now().naive_utc();
     sqlx::query!(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
@@ -50,8 +50,7 @@ async fn insert_l1_customer(pool: &PgPool, name: &str, serial_prefix: &str) -> i
 }
 
 async fn insert_l2_customer(pool: &PgPool, name: &str, parent_id: i64) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = shared_test_snowflake().next_id();
     let now = chrono::Local::now().naive_utc();
     sqlx::query!(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
@@ -125,10 +124,15 @@ async fn create_empty_assembly(
         children: vec![],
     };
     let mut tx = pool.begin().await.unwrap();
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let out = AssemblyService::create_assembly(&mut tx, &snowflake, &req, vec![], current)
-        .await
-        .expect("create empty assembly");
+    let out = AssemblyService::create_assembly(
+        &mut tx,
+        shared_test_snowflake().as_ref(),
+        &req,
+        vec![],
+        current,
+    )
+    .await
+    .expect("create empty assembly");
     tx.commit().await.unwrap();
     out.assembly.id
 }
@@ -168,10 +172,15 @@ async fn add_child_happy_path() {
         quantity: 3,
     };
     let mut tx = pool.begin().await.unwrap();
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let child = AssemblyService::add_assembly_child(&mut tx, &snowflake, asm_id, &req, &current)
-        .await
-        .expect("add child should succeed");
+    let child = AssemblyService::add_assembly_child(
+        &mut tx,
+        shared_test_snowflake().as_ref(),
+        asm_id,
+        &req,
+        &current,
+    )
+    .await
+    .expect("add child should succeed");
     tx.commit().await.unwrap();
 
     // 3. 验证 PartListItem 返回值
@@ -244,7 +253,6 @@ async fn add_child_happy_path() {
 async fn add_child_assembly_not_found() {
     let (pool, _fx) = setup().await;
     let current = test_current_user();
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
 
     let req = AssemblyChildAddRequest {
         drawing_no: "D-NOT-EXIST".to_string(),
@@ -253,10 +261,15 @@ async fn add_child_assembly_not_found() {
         quantity: 1,
     };
     let mut tx = pool.begin().await.unwrap();
-    let err =
-        AssemblyService::add_assembly_child(&mut tx, &snowflake, 9_999_999_999, &req, &current)
-            .await
-            .expect_err("不存在的 assembly_id 应抛错");
+    let err = AssemblyService::add_assembly_child(
+        &mut tx,
+        shared_test_snowflake().as_ref(),
+        9_999_999_999,
+        &req,
+        &current,
+    )
+    .await
+    .expect_err("不存在的 assembly_id 应抛错");
     drop(tx);
     match err {
         AppError::Biz { code, .. } => {
@@ -277,7 +290,6 @@ async fn add_child_validation_error() {
 
     let asm_id =
         create_empty_assembly(&pool, l2, "CH-V-001", "ASM-V", None, None, None, &current).await;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
 
     // 3a. drawing_no 空字符串 → 40001
     let req = AssemblyChildAddRequest {
@@ -287,9 +299,15 @@ async fn add_child_validation_error() {
         quantity: 1,
     };
     let mut tx = pool.begin().await.unwrap();
-    let err = AssemblyService::add_assembly_child(&mut tx, &snowflake, asm_id, &req, &current)
-        .await
-        .expect_err("空 drawing_no 应抛错");
+    let err = AssemblyService::add_assembly_child(
+        &mut tx,
+        shared_test_snowflake().as_ref(),
+        asm_id,
+        &req,
+        &current,
+    )
+    .await
+    .expect_err("空 drawing_no 应抛错");
     drop(tx);
     match err {
         AppError::Validation { .. } => {} // ok
@@ -304,9 +322,15 @@ async fn add_child_validation_error() {
         quantity: 1,
     };
     let mut tx = pool.begin().await.unwrap();
-    let err = AssemblyService::add_assembly_child(&mut tx, &snowflake, asm_id, &req, &current)
-        .await
-        .expect_err("空 name 应抛错");
+    let err = AssemblyService::add_assembly_child(
+        &mut tx,
+        shared_test_snowflake().as_ref(),
+        asm_id,
+        &req,
+        &current,
+    )
+    .await
+    .expect_err("空 name 应抛错");
     drop(tx);
     match err {
         AppError::Validation { .. } => {}
@@ -321,9 +345,15 @@ async fn add_child_validation_error() {
         quantity: 0,
     };
     let mut tx = pool.begin().await.unwrap();
-    let err = AssemblyService::add_assembly_child(&mut tx, &snowflake, asm_id, &req, &current)
-        .await
-        .expect_err("quantity=0 应抛错");
+    let err = AssemblyService::add_assembly_child(
+        &mut tx,
+        shared_test_snowflake().as_ref(),
+        asm_id,
+        &req,
+        &current,
+    )
+    .await
+    .expect_err("quantity=0 应抛错");
     drop(tx);
     match err {
         AppError::Validation { .. } => {}
@@ -360,10 +390,15 @@ async fn add_child_inherits_planned_delivery_date_when_omitted() {
         children: vec![],
     };
     let mut tx = pool.begin().await.unwrap();
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let out = AssemblyService::create_assembly(&mut tx, &snowflake, &req, vec![], &current)
-        .await
-        .unwrap();
+    let out = AssemblyService::create_assembly(
+        &mut tx,
+        shared_test_snowflake().as_ref(),
+        &req,
+        vec![],
+        &current,
+    )
+    .await
+    .unwrap();
     tx.commit().await.unwrap();
     let asm_id = out.assembly.id;
 
@@ -375,10 +410,15 @@ async fn add_child_inherits_planned_delivery_date_when_omitted() {
         quantity: 1,
     };
     let mut tx = pool.begin().await.unwrap();
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let child = AssemblyService::add_assembly_child(&mut tx, &snowflake, asm_id, &req, &current)
-        .await
-        .unwrap();
+    let child = AssemblyService::add_assembly_child(
+        &mut tx,
+        shared_test_snowflake().as_ref(),
+        asm_id,
+        &req,
+        &current,
+    )
+    .await
+    .unwrap();
     tx.commit().await.unwrap();
 
     assert_eq!(

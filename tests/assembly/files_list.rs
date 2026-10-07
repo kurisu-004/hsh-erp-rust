@@ -11,12 +11,13 @@
 use sqlx::PgPool;
 
 use hsh_erp_rust::auth::rbac::{CurrentUser, Role};
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::modules::assembly::dto::AssemblyCreateRequest;
 use hsh_erp_rust::modules::assembly::service::AssemblyService;
 use hsh_erp_rust::shared::error::AppError;
 
-use hsh_erp_test_support::{AssemblyFixture, load_assembly_fixture, test_pool};
+use hsh_erp_test_support::{
+    AssemblyFixture, load_assembly_fixture, shared_test_snowflake, test_pool,
+};
 
 async fn setup() -> (PgPool, AssemblyFixture) {
     let pool = test_pool().await;
@@ -25,8 +26,7 @@ async fn setup() -> (PgPool, AssemblyFixture) {
 }
 
 async fn insert_l1_customer(pool: &PgPool, name: &str, serial_prefix: &str) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = shared_test_snowflake().next_id();
     let now = chrono::Local::now().naive_utc();
     sqlx::query!(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
@@ -44,8 +44,7 @@ async fn insert_l1_customer(pool: &PgPool, name: &str, serial_prefix: &str) -> i
 }
 
 async fn insert_l2_customer(pool: &PgPool, name: &str, parent_id: i64) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = shared_test_snowflake().next_id();
     let now = chrono::Local::now().naive_utc();
     sqlx::query!(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
@@ -80,8 +79,7 @@ async fn insert_part_file_row(
     kind: &str,
     filename: &str,
 ) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = shared_test_snowflake().next_id();
     sqlx::query!(
         "INSERT INTO t_part_file (id, part_id, kind, file_type, object_key, \
          original_filename, file_size, content_type, upload_status, \
@@ -111,7 +109,6 @@ async fn files_list_empty() {
     let l1 = insert_l1_customer(&pool, "客户FL-1", "F").await;
     let l2 = insert_l2_customer(&pool, "子客FL-1", l1).await;
     let current = test_current_user();
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
 
     // 建空装配体
     let req = AssemblyCreateRequest {
@@ -131,9 +128,15 @@ async fn files_list_empty() {
         children: vec![],
     };
     let mut tx = pool.begin().await.unwrap();
-    let asm = AssemblyService::create_assembly(&mut tx, &snowflake, &req, vec![], &current)
-        .await
-        .unwrap();
+    let asm = AssemblyService::create_assembly(
+        &mut tx,
+        shared_test_snowflake().as_ref(),
+        &req,
+        vec![],
+        &current,
+    )
+    .await
+    .unwrap();
     tx.commit().await.unwrap();
     let asm_id = asm.assembly.id;
 
@@ -155,7 +158,6 @@ async fn files_list_with_one() {
     let l1 = insert_l1_customer(&pool, "客户FL-2", "F").await;
     let l2 = insert_l2_customer(&pool, "子客FL-2", l1).await;
     let current = test_current_user();
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
 
     // 建空装配体
     let req = AssemblyCreateRequest {
@@ -175,9 +177,15 @@ async fn files_list_with_one() {
         children: vec![],
     };
     let mut tx = pool.begin().await.unwrap();
-    let asm = AssemblyService::create_assembly(&mut tx, &snowflake, &req, vec![], &current)
-        .await
-        .unwrap();
+    let asm = AssemblyService::create_assembly(
+        &mut tx,
+        shared_test_snowflake().as_ref(),
+        &req,
+        vec![],
+        &current,
+    )
+    .await
+    .unwrap();
     tx.commit().await.unwrap();
     let asm_id = asm.assembly.id;
 
@@ -208,7 +216,6 @@ async fn files_list_filters_by_kind() {
     let l1 = insert_l1_customer(&pool, "客户FL-3", "F").await;
     let l2 = insert_l2_customer(&pool, "子客FL-3", l1).await;
     let current = test_current_user();
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
 
     let req = AssemblyCreateRequest {
         drawing_no: "FL-D003".into(),
@@ -227,9 +234,15 @@ async fn files_list_filters_by_kind() {
         children: vec![],
     };
     let mut tx = pool.begin().await.unwrap();
-    let asm = AssemblyService::create_assembly(&mut tx, &snowflake, &req, vec![], &current)
-        .await
-        .unwrap();
+    let asm = AssemblyService::create_assembly(
+        &mut tx,
+        shared_test_snowflake().as_ref(),
+        &req,
+        vec![],
+        &current,
+    )
+    .await
+    .unwrap();
     tx.commit().await.unwrap();
     let asm_id = asm.assembly.id;
 

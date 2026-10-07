@@ -87,8 +87,10 @@ async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, ProductionFixt
 async fn insert_work_type_process_mapping(pool: &PgPool, wt_id: i64, p_id: i64) {
     use hsh_erp_rust::infra::clock::now_naive;
 
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    // 2026-10-09：ID 统一从全进程共享 generator 取（`shared_test_snowflake`），
+    // 不再就地 new —— 两个 fresh generator 同 instance 同毫秒各取 seq 0 会撞
+    // `t_work_type_process_pkey`（23505），与「同一个 helper 调几次」无关。
+    let id = hsh_erp_test_support::shared_test_snowflake().next_id();
     let now = now_naive();
     sqlx::query!(
         "INSERT INTO t_work_type_process (id, work_type_id, process_id, sort_order, \

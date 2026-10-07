@@ -76,8 +76,10 @@ async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, ProductionFixt
 /// 迁到本文件，shelf 域不再有 mapping 端点故不再需要它）。
 async fn insert_test_process(pool: &PgPool, code: &str, name: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    // 2026-10-09：ID 统一从全进程共享 generator 取（`shared_test_snowflake`），
+    // 不再就地 new —— 两个 fresh generator 同 instance 同毫秒各取 seq 0 会撞
+    // `t_process_pkey`（23505），与「同一个 helper 调几次」无关。
+    let id = hsh_erp_test_support::shared_test_snowflake().next_id();
     let now = now_naive();
     sqlx::query!(
         "INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, \
@@ -407,8 +409,9 @@ async fn set_shelf_processes_rejects_inactive_shelf() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
 
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_001, 3);
-    let shelf_id = snowflake.next_id();
+    // 2026-10-09：原为 `new(1_577_836_800_001, 3)`（靠换 instance 避撞的权宜写法），
+    // 现统一走全进程共享 generator —— instance 这 10 bit 只该留给跨进程区分。
+    let shelf_id = hsh_erp_test_support::shared_test_snowflake().next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_shelf (id, code, name, zone, is_active, display_order, version, \
@@ -469,8 +472,8 @@ async fn set_shelf_processes_rejects_missing_or_soft_deleted_shelf() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
 
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_002, 5);
-    let shelf_id = snowflake.next_id();
+    // 2026-10-09：原为 `new(1_577_836_800_002, 5)`，现统一走全进程共享 generator。
+    let shelf_id = hsh_erp_test_support::shared_test_snowflake().next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_shelf (id, code, name, zone, is_active, display_order, version, \

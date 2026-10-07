@@ -20,7 +20,8 @@ use sqlx::PgPool;
 
 use hsh_erp_test_support::fixture::PartFixture;
 use hsh_erp_test_support::{
-    json_request, load_part_fixture, login_token, send, test_app, test_pool, test_state,
+    json_request, load_part_fixture, login_token, send, shared_test_snowflake, test_app, test_pool,
+    test_state,
 };
 
 // ===========================================================================
@@ -59,9 +60,7 @@ async fn insert_shelf(pool: &PgPool, code: &str, name: &str, zone: &str) -> i64 
 
 async fn insert_part(pool: &PgPool, name: &str, customer_id: i64, status: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let part_id = snowflake.next_id();
+    let part_id = shared_test_snowflake().next_id();
     let now = now_naive();
     let today = now.date();
     sqlx::query(
@@ -93,9 +92,7 @@ async fn add_batch_with_location(
     holder_id: Option<i64>,
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = shared_test_snowflake().next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
@@ -331,9 +328,7 @@ async fn list_filters_by_holder_ids_param_polymorphic() {
     // 建一个 worker
     let worker_id = {
         use hsh_erp_rust::infra::clock::now_naive;
-        use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-        let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-        let id = snowflake.next_id();
+        let id = shared_test_snowflake().next_id();
         let now = now_naive();
         sqlx::query(
             "INSERT INTO t_worker (id, badge_code, name, work_type_id, is_active, version, \

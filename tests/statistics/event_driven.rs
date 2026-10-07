@@ -25,10 +25,9 @@
 use chrono::NaiveDate;
 use sqlx::PgPool;
 
-use hsh_erp_test_support::{load_statistics_fixture, test_pool};
+use hsh_erp_test_support::{load_statistics_fixture, shared_test_snowflake, test_pool};
 
 use hsh_erp_rust::infra::clock::now_naive;
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::modules::statistics::repo::sql as statistics_sql;
 
 // ===========================================================================
@@ -48,12 +47,15 @@ async fn setup() -> (PgPool, hsh_erp_test_support::fixture::StatisticsFixture) {
 
 // ===========================================================================
 //  statistics 域独享 helper（按场景造不同 prefix / 日期 / batch_no）
+//
+//  2026-10-09：ID 一律从 `shared_test_snowflake()`（全进程唯一 generator 对象）取号，
+//  不再就地 `SnowflakeIdGenerator::new(...)` —— 同一 `statistics` binary 里本文件与
+//  `api.rs` 各建 fresh generator、instance 又都是 1，同毫秒各取 seq 0 即撞 pkey（23505）。
 // ===========================================================================
 
 async fn insert_l2_customer(pool: &PgPool) -> (i64, i64) {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let now = now_naive();
-    let l1 = snowflake.next_id();
+    let l1 = shared_test_snowflake().next_id();
     sqlx::query(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
          created_at, updated_at) VALUES ($1, $2, NULL, $3, 0, $4, $4)",
@@ -65,7 +67,7 @@ async fn insert_l2_customer(pool: &PgPool) -> (i64, i64) {
     .execute(pool)
     .await
     .expect("insert L1");
-    let l2 = snowflake.next_id();
+    let l2 = shared_test_snowflake().next_id();
     sqlx::query(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
          created_at, updated_at) VALUES ($1, $2, $3, NULL, 0, $4, $4)",
@@ -91,8 +93,7 @@ async fn insert_part_with_dates(
     planned_date: NaiveDate,
     system_date: Option<NaiveDate>,
 ) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = shared_test_snowflake().next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_part (id, name, drawing_no, applicant_name, customer_id, \
@@ -114,8 +115,7 @@ async fn insert_part_with_dates(
 
 /// 在 part 上插一个 PENDING 初始批次（PR-B1 引入：每 part 必有 1 个批次）。
 async fn insert_initial_batch(pool: &PgPool, part_id: i64) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = shared_test_snowflake().next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, version, \
@@ -133,8 +133,7 @@ async fn insert_initial_batch(pool: &PgPool, part_id: i64) -> i64 {
 
 /// 插一条 DELIVERED 事件（PR-2 § statistics/repo.rs::delivered_stats 的真相源）。
 async fn insert_delivered_event(pool: &PgPool, part_id: i64, batch_id: i64, at_date: NaiveDate) {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = shared_test_snowflake().next_id();
     let event_at = at_date.and_hms_opt(12, 0, 0).unwrap();
     sqlx::query(
         "INSERT INTO t_part_event (id, part_id, worker_id, event_type, batch_id, quantity, \

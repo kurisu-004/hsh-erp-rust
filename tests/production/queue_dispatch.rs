@@ -83,8 +83,10 @@ async fn bootstrap_as_inspector() -> (PgPool, axum::Router, String, ProductionFi
 /// 直插一个最小 `t_customer` L2 行（绕开 com::customer CRUD）。
 async fn insert_customer_l2(pool: &PgPool, name: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    // 2026-10-09：ID 统一从全进程共享 generator 取（`shared_test_snowflake`），
+    // 不再就地 new —— 两个 fresh generator 同 instance 同毫秒各取 seq 0 就撞
+    // 对应表的 pkey（23505），与「同一个 helper 调几次」无关。
+    let id = hsh_erp_test_support::shared_test_snowflake().next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_customer (id, name, version, created_at, updated_at) \
@@ -103,8 +105,10 @@ async fn insert_customer_l2(pool: &PgPool, name: &str) -> i64 {
 /// 不挂 part_event / chain 等周边表）。
 async fn insert_part(pool: &PgPool, customer_id: i64) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    // 2026-10-09：ID 统一从全进程共享 generator 取（`shared_test_snowflake`），
+    // 不再就地 new —— 两个 fresh generator 同 instance 同毫秒各取 seq 0 就撞
+    // 对应表的 pkey（23505），与「同一个 helper 调几次」无关。
+    let id = hsh_erp_test_support::shared_test_snowflake().next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_part (id, name, drawing_no, applicant_name, quantity, request_date, \
@@ -124,8 +128,10 @@ async fn insert_part(pool: &PgPool, customer_id: i64) -> i64 {
 /// 直插一个最小 `t_part_batch` 行（status='PENDING'，location=NULL）。
 async fn insert_part_batch(pool: &PgPool, part_id: i64) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    // 2026-10-09：ID 统一从全进程共享 generator 取（`shared_test_snowflake`），
+    // 不再就地 new —— 两个 fresh generator 同 instance 同毫秒各取 seq 0 就撞
+    // 对应表的 pkey（23505），与「同一个 helper 调几次」无关。
+    let id = hsh_erp_test_support::shared_test_snowflake().next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, version, \
@@ -176,9 +182,9 @@ async fn insert_shelf_process_mapping_state(
     sort_order: i32,
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let shelf_id = snowflake.next_id();
-    let mapping_id = snowflake.next_id();
+    // 2026-10-09：同上，两个 ID 从同一个共享 generator 连续取号（顺序不变）。
+    let shelf_id = hsh_erp_test_support::shared_test_snowflake().next_id();
+    let mapping_id = hsh_erp_test_support::shared_test_snowflake().next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_shelf (id, code, name, zone, is_active, display_order, version, \
@@ -539,10 +545,11 @@ async fn auto_dispatch_preview_with_chain_returns_first_process_and_shelf() {
 
     // 手动建一个货架 + 映射到 process_a（fixture 不预置 shelf_a_id）
     use hsh_erp_rust::infra::clock::now_naive;
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 7);
+    // 2026-10-09：原为 `SnowflakeIdGenerator::new(1_577_836_800_000, 7)`（靠换 instance
+    // 避撞的权宜写法），现统一走全进程共享 generator —— 下面 3 个 ID 从同一对象
+    // 连续取号，相对顺序不变。
     let now = now_naive();
-    let shelf_a = snowflake.next_id();
+    let shelf_a = hsh_erp_test_support::shared_test_snowflake().next_id();
     sqlx::query(
         "INSERT INTO t_shelf (id, code, name, zone, is_active, display_order, version, \
          created_at, updated_at) VALUES ($1, 'PREVIEW-SH', 'PREVIEW-SH', 'PRODUCTION', true, 0, 0, $2, $2)",
@@ -556,7 +563,7 @@ async fn auto_dispatch_preview_with_chain_returns_first_process_and_shelf() {
         "INSERT INTO t_shelf_process (id, shelf_id, process_id, sort_order, version, \
          created_at, updated_at) VALUES ($1, $2, $3, 0, 0, $4, $4)",
     )
-    .bind(snowflake.next_id())
+    .bind(hsh_erp_test_support::shared_test_snowflake().next_id())
     .bind(shelf_a)
     .bind(process_a)
     .bind(now)
@@ -570,7 +577,7 @@ async fn auto_dispatch_preview_with_chain_returns_first_process_and_shelf() {
     let batch_id = insert_part_batch(&pool, part_id).await;
 
     // 构造 part.process_chain_id + chain step + 工艺链首道指向 process_a
-    let chain_id = snowflake.next_id();
+    let chain_id = hsh_erp_test_support::shared_test_snowflake().next_id();
     sqlx::query(
         "INSERT INTO t_part_process_chain (id, version, created_at, created_by, updated_at, updated_by) \
          VALUES ($1, 0, $2, 1, $2, 1)",
@@ -590,7 +597,7 @@ async fn auto_dispatch_preview_with_chain_returns_first_process_and_shelf() {
         "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, estimated_minutes, version, \
          created_at, created_by, updated_at, updated_by) VALUES ($1, $2, 1, $3, 0, 0, $4, 1, $4, 1)",
     )
-    .bind(snowflake.next_id())
+    .bind(hsh_erp_test_support::shared_test_snowflake().next_id())
     .bind(chain_id)
     .bind(process_a)
     .bind(now)

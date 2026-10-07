@@ -39,10 +39,8 @@ async fn insert_part_with_batch(
     qty: i32,
 ) -> (i64, i64) {
     use hsh_erp_rust::infra::clock::now_naive;
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let part_id = snowflake.next_id();
-    let batch_id = snowflake.next_id();
+    let part_id = shared_test_snowflake().next_id();
+    let batch_id = shared_test_snowflake().next_id();
     let now = now_naive();
     let today = now.date();
     sqlx::query(
@@ -103,9 +101,7 @@ async fn insert_part_with_mixed_batches(
     batches: &[(&str, i32)],
 ) -> (i64, Vec<i64>) {
     use hsh_erp_rust::infra::clock::now_naive;
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let part_id = snowflake.next_id();
+    let part_id = shared_test_snowflake().next_id();
     let now = now_naive();
     let today = now.date();
     sqlx::query(
@@ -127,7 +123,7 @@ async fn insert_part_with_mixed_batches(
 
     let mut ids = Vec::with_capacity(batches.len());
     for (idx, (status, qty)) in batches.iter().enumerate() {
-        let batch_id = snowflake.next_id();
+        let batch_id = shared_test_snowflake().next_id();
         sqlx::query(
             "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, version, \
              created_at, updated_at) \

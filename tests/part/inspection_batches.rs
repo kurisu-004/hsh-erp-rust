@@ -43,6 +43,13 @@ use hsh_erp_test_support::*;
 // ===========================================================================
 //  动态 part/batch 插入 helper（tests/part/ 各 sub-file 私有，Phase G 收敛后
 //  暂保留为 sub-file 内联，PR-C 末统一迁 test-support）
+//
+//  2026-10-09：ID 一律从 `shared_test_snowflake()`（全进程唯一 generator 对象）取号，
+//  不再就地 `SnowflakeIdGenerator::new(...)` —— 本文件 6 处局部 generator、instance 全是
+//  1，同毫秒各取 seq 0 即撞 pkey（23505）；同一 `part` binary 内本文件与 `crud.rs` /
+//  `serial.rs` 等文件各自 fresh 也照样撞。共享一个对象后 `next_id()` 进程内串行发号，
+//  「雪花 id 恒随插入顺序升序」这条既有性质（见 `insert_insp_batch_with_spec` 的 doc）
+//  不受影响。
 // ===========================================================================
 
 /// INSPECTION 批次插入（带 holder 指向 insp_shelf_id，便于 to-ship 测试链）。
@@ -54,9 +61,7 @@ async fn insert_part_with_insp_batch(
     insp_shelf_id: i64,
 ) -> (i64, i64) {
     use hsh_erp_rust::infra::clock::now_naive;
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let part_id = snowflake.next_id();
+    let part_id = shared_test_snowflake().next_id();
     let now = now_naive();
     let today = now.date();
     sqlx::query(
@@ -74,7 +79,7 @@ async fn insert_part_with_insp_batch(
     .execute(pool)
     .await
     .expect("insert INSPECTION part");
-    let batch_id = snowflake.next_id();
+    let batch_id = shared_test_snowflake().next_id();
     sqlx::query(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, version, \
          created_at, updated_at) \
@@ -114,13 +119,11 @@ async fn insert_part_with_step_located_insp_batch(
     process_name: &str,
 ) -> (i64, i64, i64, String) {
     use hsh_erp_rust::infra::clock::now_naive;
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let now = now_naive();
     let today = now.date();
 
     // 1. 工序（逻辑 FK 目标；本测试不建 t_shelf_process 映射 —— 列表查询不需要）
-    let process_id = snowflake.next_id();
+    let process_id = shared_test_snowflake().next_id();
     sqlx::query(
         "INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, \
          version, created_at, updated_at) \
@@ -135,7 +138,7 @@ async fn insert_part_with_step_located_insp_batch(
     .expect("insert t_process");
 
     // 2. 工艺链 + step（step 指向该工序）
-    let chain_id = snowflake.next_id();
+    let chain_id = shared_test_snowflake().next_id();
     sqlx::query(
         "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, \
          updated_at, updated_by) VALUES ($1, $2, 0, $3, 0, $3, 0)",
@@ -146,7 +149,7 @@ async fn insert_part_with_step_located_insp_batch(
     .execute(pool)
     .await
     .expect("insert t_part_process_chain");
-    let step_id = snowflake.next_id();
+    let step_id = shared_test_snowflake().next_id();
     sqlx::query(
         "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, \
          estimated_minutes, version, created_at, created_by, updated_at, updated_by) \
@@ -161,7 +164,7 @@ async fn insert_part_with_step_located_insp_batch(
     .expect("insert t_process_chain_step");
 
     // 3. INSPECTION part（绑上 chain，与真实数据一致）
-    let part_id = snowflake.next_id();
+    let part_id = shared_test_snowflake().next_id();
     sqlx::query(
         "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
          applicant_name, request_date, planned_delivery_date, quantity, version, \
@@ -180,7 +183,7 @@ async fn insert_part_with_step_located_insp_batch(
     .expect("insert INSPECTION part with chain");
 
     // 4. INSPECTION 批次：step 有值、cpid **显式置 NULL**（模拟 H2 修复后的真实形态）
-    let batch_id = snowflake.next_id();
+    let batch_id = shared_test_snowflake().next_id();
     sqlx::query(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
          current_holder_id, current_process_id, current_process_step_id, version, \
@@ -277,10 +280,8 @@ async fn insert_insp_batch_with_spec(
     insp_shelf_id: i64,
     spec: &InspBatchSpec<'_>,
 ) -> (i64, i64) {
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let part_id = snowflake.next_id();
-    let batch_id = snowflake.next_id();
+    let part_id = shared_test_snowflake().next_id();
+    let batch_id = shared_test_snowflake().next_id();
     insert_insp_batch_with_ids(pool, insp_shelf_id, part_id, batch_id, spec).await;
     (part_id, batch_id)
 }
@@ -288,8 +289,7 @@ async fn insert_insp_batch_with_spec(
 /// 造一个 L1 客户（`serial_prefix` 单个大写字母，全库唯一）。
 async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let id = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
+    let id = shared_test_snowflake().next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, created_at, updated_at) \
@@ -351,9 +351,7 @@ async fn inspection_batches_list_returns_only_inpection_status_with_batch_id_and
     .await;
     // part B：IN_PROCESS 状态 + INPROCESS 批次（必须不出现在 list 中）
     use hsh_erp_rust::infra::clock::now_naive;
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let part_b_id = snowflake.next_id();
+    let part_b_id = shared_test_snowflake().next_id();
     let now = now_naive();
     let today = now.date();
     sqlx::query(
@@ -369,7 +367,7 @@ async fn inspection_batches_list_returns_only_inpection_status_with_batch_id_and
     .execute(&pool)
     .await
     .expect("insert IN_PROCESS part");
-    let batch_b = snowflake.next_id();
+    let batch_b = shared_test_snowflake().next_id();
     sqlx::query(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, version, \
          created_at, updated_at) \
@@ -1257,8 +1255,6 @@ async fn inspection_batches_pagination_splits_items_and_total_matches() {
 #[tokio::test]
 async fn inspection_batches_pagination_tiebreak_by_batch_id_is_stable() {
     let (pool, app, token, fx) = bootstrap_as_inspector().await;
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let tied_date = chrono::NaiveDate::from_ymd_opt(2026, 5, 1).expect("固定交期必可构造");
     // 固定 id 基座（远高于任何雪花 id，测试库内不会撞）；按 **降序** 插入 3 行全并列数据
     let id_base = 8_000_000_000_000_000_000i64;
@@ -1268,7 +1264,7 @@ async fn inspection_batches_pagination_tiebreak_by_batch_id_is_stable() {
         insert_insp_batch_with_ids(
             &pool,
             fx.inspection_shelf_id,
-            snowflake.next_id(),
+            shared_test_snowflake().next_id(),
             batch_id,
             &InspBatchSpec {
                 name,

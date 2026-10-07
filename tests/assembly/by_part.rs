@@ -10,14 +10,15 @@
 use sqlx::PgPool;
 
 use hsh_erp_rust::auth::rbac::{CurrentUser, Role};
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::modules::assembly::dto::{AssemblyChildAddRequest, AssemblyCreateRequest};
 use hsh_erp_rust::modules::assembly::service::AssemblyService;
 use hsh_erp_rust::modules::part::dto_crud::PartCreateRequest;
 use hsh_erp_rust::modules::part::service::PartService;
 use hsh_erp_rust::shared::error::AppError;
 
-use hsh_erp_test_support::{AssemblyFixture, load_assembly_fixture, test_pool};
+use hsh_erp_test_support::{
+    AssemblyFixture, load_assembly_fixture, shared_test_snowflake, test_pool,
+};
 
 async fn setup() -> (PgPool, AssemblyFixture) {
     let pool = test_pool().await;
@@ -26,8 +27,7 @@ async fn setup() -> (PgPool, AssemblyFixture) {
 }
 
 async fn insert_l1_customer(pool: &PgPool, name: &str, serial_prefix: &str) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = shared_test_snowflake().next_id();
     let now = chrono::Local::now().naive_utc();
     sqlx::query!(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
@@ -45,8 +45,7 @@ async fn insert_l1_customer(pool: &PgPool, name: &str, serial_prefix: &str) -> i
 }
 
 async fn insert_l2_customer(pool: &PgPool, name: &str, parent_id: i64) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = shared_test_snowflake().next_id();
     let now = chrono::Local::now().naive_utc();
     sqlx::query!(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
@@ -100,7 +99,6 @@ async fn by_part_returns_assembly_detail() {
     let l1 = insert_l1_customer(&pool, "客户BP-1", "F").await;
     let l2 = insert_l2_customer(&pool, "子客BP-1", l1).await;
     let current = test_current_user();
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
 
     // 1. 建空装配体
     let req = AssemblyCreateRequest {
@@ -120,9 +118,15 @@ async fn by_part_returns_assembly_detail() {
         children: vec![],
     };
     let mut tx = pool.begin().await.unwrap();
-    let asm = AssemblyService::create_assembly(&mut tx, &snowflake, &req, vec![], &current)
-        .await
-        .unwrap();
+    let asm = AssemblyService::create_assembly(
+        &mut tx,
+        shared_test_snowflake().as_ref(),
+        &req,
+        vec![],
+        &current,
+    )
+    .await
+    .unwrap();
     tx.commit().await.unwrap();
     let asm_id = asm.assembly.id;
 
@@ -138,9 +142,15 @@ async fn by_part_returns_assembly_detail() {
             quantity: (i + 1) as i32,
         };
         let mut tx = pool.begin().await.unwrap();
-        AssemblyService::add_assembly_child(&mut tx, &snowflake, asm_id, &req, &current)
-            .await
-            .unwrap();
+        AssemblyService::add_assembly_child(
+            &mut tx,
+            shared_test_snowflake().as_ref(),
+            asm_id,
+            &req,
+            &current,
+        )
+        .await
+        .unwrap();
         tx.commit().await.unwrap();
     }
 
@@ -201,7 +211,6 @@ async fn by_part_part_no_parent() {
     let l2 = insert_l2_customer(&pool, "子客BP-NP", l1).await;
     insert_serial_counter(&pool, "F").await;
     let current = test_current_user();
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
 
     // 1. 直接建一个独立 part（无 assembly_id）
     let req = PartCreateRequest {
@@ -221,7 +230,7 @@ async fn by_part_part_no_parent() {
         total_price: None,
     };
     let mut tx = pool.begin().await.unwrap();
-    let out = PartService::create_part(&mut *tx, &snowflake, &req, &current)
+    let out = PartService::create_part(&mut *tx, shared_test_snowflake().as_ref(), &req, &current)
         .await
         .unwrap();
     tx.commit().await.unwrap();

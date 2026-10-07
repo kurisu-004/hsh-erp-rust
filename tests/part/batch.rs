@@ -26,6 +26,11 @@ use hsh_erp_test_support::*;
 
 // ===========================================================================
 //  动态 part/batch 插入 helper（sub-file 私有，PR-C 末统一迁）
+//
+//  2026-10-09：ID 一律从 `shared_test_snowflake()`（全进程唯一 generator 对象）取号，
+//  不再就地 `SnowflakeIdGenerator::new(...)` —— 本文件 3 处局部 generator、instance 全是
+//  1，同毫秒各取 seq 0 即撞 pkey（23505）；同一 `part` binary 内本文件与 `crud.rs` /
+//  `inspection_batches.rs` 等文件各自 fresh 也照样撞。
 // ===========================================================================
 
 async fn insert_part_with_batch(
@@ -36,10 +41,8 @@ async fn insert_part_with_batch(
     qty: i32,
 ) -> (i64, i64) {
     use hsh_erp_rust::infra::clock::now_naive;
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let part_id = snowflake.next_id();
-    let batch_id = snowflake.next_id();
+    let part_id = shared_test_snowflake().next_id();
+    let batch_id = shared_test_snowflake().next_id();
     let now = now_naive();
     let today = now.date();
     sqlx::query(
@@ -81,9 +84,7 @@ async fn insert_extra_batch(
     status: &str,
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let batch_id = snowflake.next_id();
+    let batch_id = shared_test_snowflake().next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, version, \
@@ -462,7 +463,6 @@ async fn location_tree_happy_path() {
 #[tokio::test]
 async fn batch_create_with_bindings_object_key_test() {
     use hsh_erp_rust::auth::rbac::Role;
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
     use hsh_erp_rust::modules::part::dto_crud::{
         FileBindingIn, PartBatchCreateItem, PartBatchCreateRequest,
     };
@@ -471,7 +471,6 @@ async fn batch_create_with_bindings_object_key_test() {
 
     let pool = test_pool().await;
     let fx: PartFixture = load_part_fixture(&pool).await;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     // 2026-09-29 扁平化新增测试：本文件无 manager_current 私有 helper（仅 crud.rs 有），
     // 直接构造 Manager CurrentUser（与 file.rs::test_current_user_with_roles 同形）。
     let current = hsh_erp_rust::auth::rbac::CurrentUser {
@@ -521,7 +520,7 @@ async fn batch_create_with_bindings_object_key_test() {
     let mut tx = pool.begin().await.unwrap();
     let (out, _keys) = PartService::batch_create_parts_with_bindings(
         &mut *tx,
-        &snowflake,
+        shared_test_snowflake().as_ref(),
         cos.clone(),
         "uploads",
         "tmp/",

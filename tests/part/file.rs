@@ -18,7 +18,6 @@ use std::sync::Arc;
 
 use hsh_erp_rust::auth::rbac::{CurrentUser, Role};
 use hsh_erp_rust::infra::cos::NoopCos;
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::modules::part_file::service::PartFileService;
 use hsh_erp_rust::shared::error::AppError;
 use sqlx::PgPool;
@@ -32,8 +31,7 @@ use hsh_erp_test_support::*;
 /// 在 fixture 之外另建 1 个 L1 客户（避免污染 fixture）。
 async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = shared_test_snowflake().next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
@@ -52,8 +50,7 @@ async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
 
 async fn insert_l2_customer(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = shared_test_snowflake().next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
@@ -72,8 +69,7 @@ async fn insert_l2_customer(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
 
 async fn insert_part_for_owner(pool: &PgPool, customer_id: i64) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = shared_test_snowflake().next_id();
     let now = now_naive();
     let today = now.date();
     sqlx::query(
@@ -130,12 +126,11 @@ async fn upload_pdf_happy_path() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
     let cos = Arc::new(NoopCos);
 
     let pdf_bytes = b"%PDF-1.5\nhello world\n%%EOF".to_vec();
     let mut tx = pool.begin().await.unwrap();
-    let out = PartFileService::new(snowflake.clone(), cos.clone())
+    let out = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_file_for_owner(
             &mut *tx,
             "PART",
@@ -168,12 +163,11 @@ async fn upload_invalid_kind_returns_21102() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
     let cos = Arc::new(NoopCos);
 
     let bytes = b"some step data".to_vec();
     let mut tx = pool.begin().await.unwrap();
-    let err = PartFileService::new(snowflake.clone(), cos.clone())
+    let err = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_file_for_owner(
             &mut *tx,
             "PART",
@@ -202,14 +196,13 @@ async fn upload_cas_dedup_skips_cos() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
     let cos = Arc::new(NoopCos);
 
     let pdf_bytes = b"%PDF-1.5\nidentical content\n%%EOF".to_vec();
 
     // 第一次上传
     let mut tx = pool.begin().await.unwrap();
-    let out1 = PartFileService::new(snowflake.clone(), cos.clone())
+    let out1 = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_file_for_owner(
             &mut *tx,
             "PART",
@@ -226,7 +219,7 @@ async fn upload_cas_dedup_skips_cos() {
 
     // 第二次上传同 sha → CAS 命中，复用 object_key，id 不同
     let mut tx = pool.begin().await.unwrap();
-    let out2 = PartFileService::new(snowflake.clone(), cos.clone())
+    let out2 = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_file_for_owner(
             &mut *tx,
             "PART",
@@ -251,12 +244,11 @@ async fn upload_cas_dedup_skips_cos() {
 async fn upload_owner_not_found_returns_21105() {
     let pool = setup().await;
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
     let cos = Arc::new(NoopCos);
 
     let nonexistent = 99_999_999_999_i64;
     let mut tx = pool.begin().await.unwrap();
-    let err = PartFileService::new(snowflake.clone(), cos.clone())
+    let err = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_file_for_owner(
             &mut *tx,
             "PART",
@@ -285,11 +277,10 @@ async fn rbac_inspector_can_upload_returns_403() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let inspector = test_current_user_with_roles(vec![Role::Inspector]);
-    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
     let cos = Arc::new(NoopCos);
 
     let mut tx = pool.begin().await.unwrap();
-    let err = PartFileService::new(snowflake.clone(), cos.clone())
+    let err = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_file_for_owner(
             &mut *tx,
             "PART",
@@ -318,7 +309,6 @@ async fn list_filter_by_kind() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
     let cos = Arc::new(NoopCos);
 
     // 上传 1 个 DRAWING + 1 个 3D_MODEL（每 kind 在 uk_t_part_file_single 下只能 1 个/owner）
@@ -336,7 +326,7 @@ async fn list_filter_by_kind() {
         );
         let body = format!("{}{}", unique_prefix, "x".repeat(1024)).into_bytes();
         let mut tx = pool.begin().await.unwrap();
-        PartFileService::new(snowflake.clone(), cos.clone())
+        PartFileService::new(shared_test_snowflake().clone(), cos.clone())
             .upload_file_for_owner(
                 &mut *tx,
                 "PART",
@@ -361,7 +351,7 @@ async fn list_filter_by_kind() {
         offset: Some(0),
     };
     let mut tx = pool.begin().await.unwrap();
-    let out = PartFileService::new(snowflake.clone(), cos.clone())
+    let out = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .list_files(&mut *tx, &query, &current)
         .await
         .unwrap();
@@ -378,11 +368,10 @@ async fn get_url_returns_presigned_url() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
     let cos = Arc::new(NoopCos);
 
     let mut tx = pool.begin().await.unwrap();
-    let out = PartFileService::new(snowflake.clone(), cos.clone())
+    let out = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_file_for_owner(
             &mut *tx,
             "PART",
@@ -398,7 +387,7 @@ async fn get_url_returns_presigned_url() {
     tx.commit().await.unwrap();
 
     let mut tx = pool.begin().await.unwrap();
-    let detail = PartFileService::new(snowflake.clone(), cos.clone())
+    let detail = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .get_file_with_url(
             &mut *tx,
             cos.clone(),
@@ -428,10 +417,9 @@ async fn list_includes_paired_file_id() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     // 直接 SQL 造配对行（绕开 cnc_program 上传通道，聚焦 part_file 列表投影）
-    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
     let cos = Arc::new(NoopCos);
-    let g_id = snowflake.next_id();
-    let s_id = snowflake.next_id();
+    let g_id = shared_test_snowflake().next_id();
+    let s_id = shared_test_snowflake().next_id();
     for (id, kind, file_type, filename, sha, paired_id) in [
         (g_id, "G_CODE", "NC", "prog.nc", "g".repeat(64), s_id),
         (
@@ -473,7 +461,7 @@ async fn list_includes_paired_file_id() {
         offset: Some(0),
     };
     let mut tx = pool.begin().await.unwrap();
-    let out = PartFileService::new(snowflake.clone(), cos.clone())
+    let out = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .list_files(&mut *tx, &query, &current)
         .await
         .unwrap();
@@ -511,11 +499,10 @@ async fn content_happy_path() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
     let cos = Arc::new(NoopCos);
 
     let mut tx = pool.begin().await.unwrap();
-    let out = PartFileService::new(snowflake.clone(), cos.clone())
+    let out = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_file_for_owner(
             &mut *tx,
             "PART",
@@ -532,7 +519,7 @@ async fn content_happy_path() {
 
     // content 端点 — NoopCos.get_object 返空字节，但应正常返回
     let mut tx = pool.begin().await.unwrap();
-    let content = PartFileService::new(snowflake.clone(), cos.clone())
+    let content = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .get_file_content(
             &mut *tx,
             cos.clone(),
@@ -556,11 +543,10 @@ async fn soft_delete_happy_path() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
     let cos = Arc::new(NoopCos);
 
     let mut tx = pool.begin().await.unwrap();
-    let out = PartFileService::new(snowflake.clone(), cos.clone())
+    let out = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_file_for_owner(
             &mut *tx,
             "PART",
@@ -578,7 +564,7 @@ async fn soft_delete_happy_path() {
 
     // delete by Manager（kind=DRAWING → M+C 通行）
     let mut tx = pool.begin().await.unwrap();
-    let object_key = PartFileService::new(snowflake.clone(), cos.clone())
+    let object_key = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .soft_delete_file(&mut *tx, out.id, version, &current)
         .await
         .expect("delete ok");
@@ -607,11 +593,10 @@ async fn soft_delete_version_conflict() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
     let cos = Arc::new(NoopCos);
 
     let mut tx = pool.begin().await.unwrap();
-    let out = PartFileService::new(snowflake.clone(), cos.clone())
+    let out = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_file_for_owner(
             &mut *tx,
             "PART",
@@ -628,7 +613,7 @@ async fn soft_delete_version_conflict() {
 
     // 故意 version+999 → 冲突
     let mut tx = pool.begin().await.unwrap();
-    let err = PartFileService::new(snowflake.clone(), cos.clone())
+    let err = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .soft_delete_file(&mut *tx, out.id, out.version + 999, &current)
         .await
         .expect_err("version 冲突应抛错");
@@ -657,7 +642,6 @@ async fn confirm_tmp_missing_returns_21114() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
     let cos = Arc::new(MockCos::new()); // 未注册 tmp_key → head_object NoSuch
 
     let tmp_key = "tmp/test/missing.pdf";
@@ -673,7 +657,7 @@ async fn confirm_tmp_missing_returns_21114() {
     };
     let err = PartFileService::bind_uploaded_file(
         &pool,
-        &snowflake,
+        shared_test_snowflake().as_ref(),
         cos.clone(),
         UPLOAD_UPLOAD_PREFIX,
         UPLOAD_TMP_PREFIX,
@@ -711,7 +695,6 @@ async fn confirm_size_mismatch_returns_21115() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
     let cos = Arc::new(MockCos::new());
 
     let tmp_key = "tmp/test/sizemm.pdf";
@@ -729,7 +712,7 @@ async fn confirm_size_mismatch_returns_21115() {
     };
     let err = PartFileService::bind_uploaded_file(
         &pool,
-        &snowflake,
+        shared_test_snowflake().as_ref(),
         cos.clone(),
         UPLOAD_UPLOAD_PREFIX,
         UPLOAD_TMP_PREFIX,
@@ -761,7 +744,6 @@ async fn confirm_replace_old_single_returns_ready() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
     let cos = Arc::new(MockCos::new());
 
     // 第一次 confirm（kind=DRAWING / sha=aaa...）
@@ -770,7 +752,7 @@ async fn confirm_replace_old_single_returns_ready() {
     let sha_1 = "a".repeat(64);
     let (out1, _tk1) = PartFileService::bind_uploaded_file(
         &pool,
-        &snowflake,
+        shared_test_snowflake().as_ref(),
         cos.clone(),
         UPLOAD_UPLOAD_PREFIX,
         UPLOAD_TMP_PREFIX,
@@ -794,7 +776,7 @@ async fn confirm_replace_old_single_returns_ready() {
     let sha_2 = "b".repeat(64);
     let (out2, _tk2) = PartFileService::bind_uploaded_file(
         &pool,
-        &snowflake,
+        shared_test_snowflake().as_ref(),
         cos.clone(),
         UPLOAD_UPLOAD_PREFIX,
         UPLOAD_TMP_PREFIX,
@@ -859,7 +841,6 @@ async fn tmp_to_parts_copy_test() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
     let cos = Arc::new(MockCos::new());
 
     let tmp_key = "tmp/test/copy-2seg.pdf";
@@ -867,7 +848,7 @@ async fn tmp_to_parts_copy_test() {
     let sha = "f".repeat(64);
     let (out, _tk) = PartFileService::bind_uploaded_file(
         &pool,
-        &snowflake,
+        shared_test_snowflake().as_ref(),
         cos.clone(),
         UPLOAD_UPLOAD_PREFIX,
         UPLOAD_TMP_PREFIX,
