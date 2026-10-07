@@ -52,6 +52,11 @@ const SQL_SENDABLE_COUNT_BY_PROCESS: &str = "SELECT d.current_process_id AS proc
      ORDER BY d.current_process_id ASC";
 
 /// `snapshot` SQL 2：在途侧按工序分组计数。
+///
+/// `current_holder_id IS NOT NULL` 是**承重谓词**，不是可选的防御：在途谓词的另两处
+/// 落点（[`SQL_HELD_BY_PROCESS`] 与服务层分组）都以「holder = 公司 id」为分组键，
+/// 而 `t_part_batch.current_holder_id` 没有 NOT NULL 约束。三处谓词必须逐字同形，
+/// 否则 tab 徽标会数到一批 detail 取不出来的行（`COUNT(*)` 会计，WHERE 过滤不会）。
 const SQL_IN_FLIGHT_COUNT_BY_PROCESS: &str = "SELECT pb.current_process_id AS process_id, \
      COUNT(*)::bigint AS count \
      FROM t_part_batch pb \
@@ -59,6 +64,7 @@ const SQL_IN_FLIGHT_COUNT_BY_PROCESS: &str = "SELECT pb.current_process_id AS pr
        AND pb.location = 'OUTSOURCE_COMPANY' \
        AND pb.deleted_at IS NULL \
        AND pb.current_process_id IS NOT NULL \
+       AND pb.current_holder_id IS NOT NULL \
      GROUP BY pb.current_process_id \
      ORDER BY pb.current_process_id ASC";
 
@@ -106,9 +112,16 @@ const SQL_COMPANIES_BY_PROCESS: &str = "SELECT c.id AS company_id, c.name \
 /// `process_detail` SQL 3：该工序**全部**在外协批次（跨公司，一次取齐）。
 ///
 /// 这就是消灭 N+1 的那条查询：**没有任何公司谓词**，10 家公司与 2 家公司发的是同一条
-/// SQL，只是回更多行。SQL 逐字取自被删的 `OutsourcePoolRepo::list_held`，唯一改动是
+/// SQL，只是回更多行。SQL 逐字取自按公司取在途批次的查询，唯一改动是
 /// 去掉 `pb.current_holder_id = $1`（并把 `$2` 提成 `$1`）后把
 /// `pb.current_holder_id` 投影成 `company_id` 供服务层分组，再补一列 `has_cnc_program`。
+///
+/// **`AND pb.current_holder_id IS NOT NULL` 是承重谓词**：`current_holder_id` 没有 DB
+/// 约束（`bigint` 可空），而本查询按它分组、解码目标是 `i64`（`HeldBatchRow`）——
+/// 漏掉它时 sqlx 会把 SQL NULL 解不进 `i64` 而报 `error decoding column`，整个
+/// `process_detail` 返 500。加上它既让解码目标保持非可空，也让在途侧的三个落点
+/// （[`SQL_IN_FLIGHT_COUNT_BY_PROCESS`] 的 `COUNT(*)` / 本查询 / 服务层分组）谓词
+/// 逐字同形 ⇒ `snapshot.processes[].in_flight` 与 detail 的在途行数恒相等。
 ///
 /// `LEFT JOIN LATERAL` 派生 `receive_next_process_*`，两步定位与「为什么必须共用同一份
 /// 片段」的全部论证见 `repo/sql.rs::NEXT_PROCESS_LATERAL_SQL`（2026-10-09 从本文件
@@ -156,6 +169,7 @@ const SQL_HELD_BY_PROCESS: &str = "SELECT pb.id AS batch_id, pb.current_holder_i
      WHERE pb.status = 'OUTSOURCE' \
        AND pb.location = 'OUTSOURCE_COMPANY' \
        AND pb.current_process_id = $1 \
+       AND pb.current_holder_id IS NOT NULL \
        AND pb.deleted_at IS NULL \
      ORDER BY pb.current_holder_id ASC, pb.id ASC";
 
@@ -219,9 +233,11 @@ pub struct CompanyRow {
 pub struct HeldBatchRow {
     /// `t_part_batch.current_holder_id`（在途谓词下即外协公司 id）。分组键。
     ///
-    /// 理论上恒非 NULL（`location='OUTSOURCE_COMPANY'` 的批次 holder 就是公司），
-    /// 但本列没有 DB 约束兜着；异常行会分到一个没有对应公司列的组里、被 `companies[]`
-    /// 的遍历自然丢弃（与旧 `/outsource-pool/state` 查不到它的效果一致）。
+    /// **解码目标恒非可空**：`t_part_batch.current_holder_id` 本身没有 NOT NULL 约束，
+    /// 异常行（`location='OUTSOURCE_COMPANY'` 却没 holder）由
+    /// [`SQL_HELD_BY_PROCESS`] 的 `current_holder_id IS NOT NULL` 在 SQL 层剔除 ——
+    /// 在途侧的三个落点（分组计数 / 本查询 / 服务层分组）共用这一个谓词，因此
+    /// `snapshot.processes[].in_flight` 与 detail 的在途行数恒相等。
     pub company_id: i64,
     pub batch_id: i64,
     pub part_id: i64,

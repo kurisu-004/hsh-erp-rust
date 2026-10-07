@@ -1094,8 +1094,8 @@ impl OutsourceQuotableRepo {
 /// 是第一次真正使用它：
 /// - `requires_approval = false` → 免审批直发，直接出行；
 /// - `requires_approval = true` → 必须已有该 (part, process) 的**真实审批**报价，
-///   否则**不出行**（这是本次新增的排除语义，回归测试
-///   `tests/outsource/sendable.rs::sendable_requires_approval_without_quote_excluded`）。
+///   否则**不出行**（回归网见 `tests/outsource/pool.rs` 的
+///   `detail_requires_approval_without_quote_excluded` / `…_with_draft_quote_excluded`）。
 ///
 /// 报价的 LEFT JOIN 条件里带 `AND pr.requires_approval`：它把「命中报价」严格定义成
 /// 「send_mode = APPROVAL」。否则免审批工序上恰好存在一条历史 APPROVED 报价时，该行
@@ -1104,9 +1104,9 @@ impl OutsourceQuotableRepo {
 /// 恒为 `null`，与 VO 声明一致。
 ///
 /// ## 2026-10-03 review 第 1 轮：`AND is_direct = false`（两处谓词都要带）
-/// 「APPROVED 报价」不等于「被人审批过的报价」：`prod::batch::send_to_outsource` 的
-/// DIRECT 直发路径会自动建 `status='APPROVED' AND is_direct=true AND price=0` 的
-/// 占位报价（见 `prod::batch::service::outsource::resolve_direct_quote_id`）。只判
+/// 「APPROVED 报价」不等于「被人审批过的报价」：DIRECT 直发路径会自动建
+/// `status='APPROVED' AND is_direct=true AND price=0` 的占位报价（见
+/// `service/move.rs::resolve_direct_quote_id`）。只判
 /// `status='APPROVED' AND deleted_at IS NULL` 时，那个组合可达：某 (part, process)
 /// 历史上被 `direct=true` 发过一次（库里留下 0 元占位报价）→ 此后该 (part, process)
 /// 的批次在本列表被判成 `send_mode=APPROVAL` / `price="0.00"` /

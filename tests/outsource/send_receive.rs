@@ -18,15 +18,17 @@
 //!   **键不存在**
 //! - **请求形状守卫**：同 kind → 40001（且早于查批次）、`from` 与真实位置/holder 不符
 //!   → 20122、`version` 过期 → 40901、批次不存在 → 20109、非发送方向带 `quote_id` /
-//!   `direct` → 20104
+//!   `direct` → 20104、**漏传 `version` → 422 纯文本**
+//! - **回收方向的源状态白名单**：批次还在生产架上却请求回收到品检架 → 20103（这条守卫
+//!   是 match 兜底分支不 panic 的前提）
 //! - **价来源守卫**：APPROVAL / DIRECT 二选一、`requires_approval` 工序不许直发、
 //!   占位价不能当审批价（21307）、DRAFT 报价 21307、公司不存在 21201 / 停用 21205、
 //!   非 OUTSOURCE 工序 20104、公司未映射工序 20104、链内缺该工序 step 20702
 //! - **DIRECT 占位报价幂等**（migration 008：同 tuple 只留 1 条 `is_direct=true`）
 //!
 //! ## 2026-10-09 删除的用例（部分发送 / 部分接收）
-//! move 端点是**整批**语义（入参没有 `quantity`），部分流转走独立拆批端点
-//! `POST /prod/batches/{batch_id}/split`。随之删除的用例：
+//! move 端点是**整批**语义（入参没有 `quantity`），部分流转走共用拆批端点
+//! `POST /api/v2/batches/split`。随之删除的用例：
 //! `send_to_outsource_partial_*`（5 条）、`send_to_outsource_quantity_equal_batch_*`、
 //! `send_to_outsource_invalid_quantity_*`、`receive_from_outsource_partial_*`（5 条）。
 //! 拆批端点自身的用例在 `tests/production/` 侧。
@@ -57,7 +59,7 @@ use sqlx::PgPool;
 use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_test_support::{
     OutsourceFixture, json_request, load_outsource_fixture, login_token, pool_snowflake, send,
-    test_app, test_pool, test_state,
+    send_raw, test_app, test_pool, test_state,
 };
 
 /// 移动端点路径（三合一后是静态段，主键走 body）。
@@ -2220,6 +2222,172 @@ async fn move_stale_version_returns_40901() {
     )
     .await;
     assert_eq!(s, StatusCode::OK, "刷新后的 version 必须能过: {env}");
+}
+
+/// `version` 是必填字段：body 里没有 ⇒ axum 的 `422` + **纯文本**，不进 `R<T>` 信封。
+///
+/// 用 `send_raw`：`Json` 提取器的反序列化拒绝是纯文本 body，`send` 会在 JSON 解析处
+/// panic。前端错误处理必须按 HTTP 状态码分支，不能假设响应必有 `code` 字段。
+#[tokio::test]
+async fn move_requires_version_field_returns_422_plain_text() {
+    let (_pool, app, token, _fx) = bootstrap_as_manager().await;
+
+    let (s, body) = send_raw(
+        app,
+        json_request(
+            "POST",
+            MOVE_PATH,
+            Some(json!({
+                "batch_id": "1",
+                "from": { "kind": "OUTSOURCE_COMPANY", "company_id": "1" },
+                "to": { "kind": "PRODUCTION_SHELF", "shelf_id": "1" },
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "缺 version 必须是 422（不是业务信封）: {body}"
+    );
+    assert!(
+        body.contains("version"),
+        "纯文本 body 必须点名缺失字段 version: {body}"
+    );
+    // 纯文本 ⇒ 不是 JSON 信封（前端按 `code` 解析会拿到 null）
+    assert!(
+        !body.trim_start().starts_with('{'),
+        "422 响应不是 R<T> 信封: {body}"
+    );
+}
+
+/// 回收方向的源状态**显式**白名单：批次还在生产架上（`IN_PROCESS`）却请求回收到品检架
+/// ⇒ `20103`。
+///
+/// 这条守卫是「显式钉住」而不是顺带的：状态机白名单里 `IN_PROCESS → INSPECTION` 与
+/// `PENDING → IN_PROCESS` / `PENDING → INSPECTION` 都是合法边（它们属建档 / 待编程流的
+/// 语义），删掉它这些边就会把「从生产架直接回收品检」放进 match 的兜底分支 ⇒ panic
+/// 而不是 4xx。故本用例守的是那条守卫本身，不是它拦下的结果。
+#[tokio::test]
+async fn move_recover_to_inspection_from_production_shelf_returns_20103() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer_id = insert_l1_customer(&pool, "BadRecvKind", "W").await;
+    let part_id = insert_part(&pool, customer_id, "PENDING").await;
+    let company_id = insert_outsource_company(&pool, "BadRecvKindCo").await;
+    let proc_id = seed_outsource_process(&pool, "XBRK", "brk_proc", false).await;
+    map_company_process(&pool, company_id, proc_id).await;
+    let shelf_id = insert_shelf(&pool, "BRK-SH", "PRODUCTION").await;
+    let insp_shelf_id = insert_shelf(&pool, "BRK-INSP", "INSPECTION").await;
+    // 批次在生产架上加工中（**不是**在外协公司）
+    let bid = insert_batch_with_process(
+        &pool,
+        part_id,
+        "IN_PROCESS",
+        Some("PRODUCTION_SHELF"),
+        proc_id,
+        Some(shelf_id),
+    )
+    .await;
+
+    // `from` 逐字等于批次真实位置（否则会挂在更早的 20122 上），`to` 是品检架
+    let (s, env) = post_move(
+        app,
+        &token,
+        json!({
+            "batch_id": bid.to_string(),
+            "version": 0,
+            "from": { "kind": "PRODUCTION_SHELF", "shelf_id": shelf_id.to_string() },
+            "to": { "kind": "INSPECTION_SHELF", "shelf_id": insp_shelf_id.to_string() },
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "生产架 → 品检架必须拒: {env}");
+    assert_eq!(env["code"].as_i64().unwrap(), 20103, "{env}");
+    assert!(
+        env["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("回收方向的源状态必须是 OUTSOURCE"),
+        "文案必须点名源状态白名单: {env}"
+    );
+
+    // 批次一个字节都没动
+    let (status, location, holder): (String, Option<String>, Option<i64>) = sqlx::query_as(
+        "SELECT status, location, current_holder_id FROM t_part_batch WHERE id = $1",
+    )
+    .bind(bid)
+    .fetch_one(&pool)
+    .await
+    .expect("read batch after rejected recovery");
+    assert_eq!(status, "IN_PROCESS", "被拒请求不得改批次状态: {env}");
+    assert_eq!(location.as_deref(), Some("PRODUCTION_SHELF"));
+    assert_eq!(holder, Some(shelf_id));
+}
+
+/// 回收方向省略 `to.next_process_id` 时推不出下一道工序 —— **锚链存在但 step 指针漂移**
+/// 这一支文案。
+///
+/// 与 `move_receive_without_chain_returns_20706`（零件压根没有 `process_chain_id`）是
+/// 两条不同的分支：那条走「该零件尚未制定工序链」，本条走「锚链存在但 `cur` 定位不到
+/// 当前 step」⇒ 文案要指向「指针漂移 / 补全工序链」，前端据此决定是让用户手填还是先
+/// 修链。
+#[tokio::test]
+async fn move_receive_anchor_chain_without_step_pointer_returns_20706() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let (bid, part_id, company_id, _quote_id, shelf_id, _next_proc, _) = setup_inflight(
+        &pool,
+        "DriftRecv",
+        "A",
+        "PDRFT",
+        "REC-D",
+        "REC-PROC-D",
+        true,
+    )
+    .await;
+
+    // 前提断言：锚链在（part 绑了链）
+    let chain_id: Option<i64> =
+        sqlx::query_scalar("SELECT process_chain_id FROM t_part WHERE id = $1")
+            .bind(part_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read part.process_chain_id");
+    assert!(chain_id.is_some(), "前提断言：该零件已绑工序链");
+    // 制造指针漂移：step 指针被清空 ⇒ 推导片段的 `cur.id = current_process_step_id`
+    // 定位不到任何 step，锚链解析失败 ⇒ 推不出下一道工序
+    sqlx::query("UPDATE t_part_batch SET current_process_step_id = NULL WHERE id = $1")
+        .bind(bid)
+        .execute(&pool)
+        .await
+        .expect("clear batch step pointer");
+
+    let (s, env) = post_move(
+        app,
+        &token,
+        receive_body(bid, 0, company_id, shelf_id, None),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "有锚链但推不出: {env}");
+    assert_eq!(env["code"].as_i64().unwrap(), 20706, "{env}");
+    let msg = env["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("指针漂移") && msg.contains("无法推导下一道工序"),
+        "文案必须指向「指针漂移」而不是「尚未制定工序链」: {env}"
+    );
+    assert!(
+        !msg.contains("尚未制定工序链"),
+        "锚链存在时不得落到「尚未制定工序链」那一支: {env}"
+    );
+
+    let (status, version): (String, i32) =
+        sqlx::query_as("SELECT status, version FROM t_part_batch WHERE id = $1")
+            .bind(bid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "OUTSOURCE", "被拒请求不得改批次状态");
+    assert_eq!(version, 0, "被拒请求不得推 version");
 }
 
 /// 出参契约：三个雪花 id 都是字符串；`version` 是**读回行的真实值**（不是 `req.version+1`

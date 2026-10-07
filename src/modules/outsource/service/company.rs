@@ -279,12 +279,16 @@ impl OutsourceService {
     // Company — 写
     // =======================================================================
 
+    /// 出参是 `()`：**建号端点的调用方一个字段都不用**（前端建完一律重拉列表，
+    /// id 从 `GET /outsource-companies?name_like=…` 的首行取），返整份
+    /// `OutsourceCompanyWithProcessesOut` 只会白付「工序映射 + 工序元数据」两次
+    /// 往返 —— 那两次查询连一次都省不掉才是问题所在。
     pub async fn create_company<R: OutsourceRepoTrait>(
         &self,
         mut repo: R,
         req: &OutsourceCompanyCreateRequest,
         current: &CurrentUser,
-    ) -> Result<OutsourceCompanyWithProcessesOut, AppError> {
+    ) -> Result<(), AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
         let name = req.name.trim();
         if name.is_empty() {
@@ -342,7 +346,7 @@ impl OutsourceService {
             replace_processes(self, &mut repo, company.id, &int_ids, current.id).await?;
         }
 
-        build_with_processes(&mut repo, company).await
+        Ok(())
     }
 
     pub async fn update_company<R: OutsourceRepoTrait>(

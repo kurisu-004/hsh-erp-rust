@@ -34,10 +34,9 @@ use serde_json::json;
 use sqlx::PgPool;
 
 use hsh_erp_rust::infra::clock::now_naive;
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_test_support::{
-    OutsourceFixture, json_request, load_outsource_fixture, login_token, send, send_raw, test_app,
-    test_pool, test_state,
+    OutsourceFixture, json_request, load_outsource_fixture, login_token, pool_snowflake, send,
+    send_raw, test_app, test_pool, test_state,
 };
 
 // ===========================================================================
@@ -69,12 +68,23 @@ async fn bootstrap_as_clerk() -> (PgPool, axum::Router, String, OutsourceFixture
 // ===========================================================================
 //  quote 域独享 helpers（绕开 fixtures::* 因为 Phase H gate 5 禁止从 `fixtures`
 //  模块 use 任何动态 helper）
+/// 直插用的雪花 ID：走 `test-support::pool_snowflake()`（**进程级**
+/// `OnceLock<Mutex<..>>`，instance 由 pid ⊕ 启动时间派生）。
+///
+/// 不每次 `SnowflakeIdGenerator::new(epoch, 1)` 新建生成器：新建的生成器在同一毫秒内
+/// 连续两次调用会生成**完全相同**的 id（instance 相同 + 时间戳相同 + seq 都从 0 开始），
+/// 撞 `t_*_pkey`；更隐蔽的是撞成「shelf_id == process_id」这类业务列，让 DB 的
+/// `ck_*_no_self_loop` CHECK 以一条与被测逻辑无关的约束错误把用例打断。范本与理由见
+/// `tests/outsource/pool.rs::next_id`。
+fn next_id() -> i64 {
+    pool_snowflake().lock().expect("pool_snowflake").next_id()
+}
+
 // ===========================================================================
 
 /// 直插客户（L1）—— 绕开 customer CRUD。
 async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_customer (id, name, serial_prefix, version, created_at, updated_at) \
@@ -95,7 +105,7 @@ async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
 /// `serial_prefix` 唯一索引 `uq_t_customer_root_prefix` 只作用于 `parent_id IS NULL`
 /// 的根客户，L2 不受限（这里干脆传 NULL）。
 async fn insert_l2_customer(pool: &PgPool, name: &str, parent_id: i64) -> i64 {
-    let id = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
+    let id = next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_customer (id, name, parent_id, version, created_at, updated_at) \
@@ -113,8 +123,7 @@ async fn insert_l2_customer(pool: &PgPool, name: &str, parent_id: i64) -> i64 {
 
 /// 直插 part（PENDING）—— 绕开 part CRUD。
 async fn insert_part(pool: &PgPool, customer_id: i64) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_part (id, name, drawing_no, applicant_name, quantity, unit_price, total_price, \
@@ -134,7 +143,7 @@ async fn insert_part(pool: &PgPool, customer_id: i64) -> i64 {
 
 /// 直插 part 并在 name / drawing_no 里带上 tag —— `drawing_no` / `name` 维度用例要靠它区分零件。
 async fn insert_tagged_part(pool: &PgPool, customer_id: i64, tag: &str) -> i64 {
-    let id = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
+    let id = next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_part (id, name, drawing_no, applicant_name, quantity, unit_price, total_price, \
@@ -154,7 +163,7 @@ async fn insert_tagged_part(pool: &PgPool, customer_id: i64, tag: &str) -> i64 {
 
 /// 直插 part（可指定 `is_urgent`）—— `is_urgent` 筛选维度用例用。
 async fn insert_urgent_part(pool: &PgPool, customer_id: i64, tag: &str, is_urgent: bool) -> i64 {
-    let id = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
+    let id = next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_part (id, name, drawing_no, applicant_name, quantity, unit_price, total_price, \
@@ -175,8 +184,7 @@ async fn insert_urgent_part(pool: &PgPool, customer_id: i64, tag: &str, is_urgen
 
 /// 直插 OUTSOURCE 类别 process。
 async fn seed_outsource_process(pool: &PgPool, code: &str, name: &str) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, \
@@ -195,8 +203,7 @@ async fn seed_outsource_process(pool: &PgPool, code: &str, name: &str) -> i64 {
 
 /// 直插外协公司。
 async fn insert_company(pool: &PgPool, name: &str, is_active: bool) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_outsource_company \

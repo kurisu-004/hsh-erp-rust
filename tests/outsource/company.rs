@@ -38,10 +38,9 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 
 use hsh_erp_rust::infra::clock::now_naive;
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_test_support::{
-    OutsourceFixture, json_request, load_outsource_fixture, login_token, send, send_raw, test_app,
-    test_pool, test_state,
+    OutsourceFixture, json_request, load_outsource_fixture, login_token, pool_snowflake, send,
+    send_raw, test_app, test_pool, test_state,
 };
 
 // ===========================================================================
@@ -66,6 +65,18 @@ async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, OutsourceFixtu
 // ===========================================================================
 //  company 域独享 helpers（绕开 fixtures::seed_process 因为 Phase H gate 5
 //  禁止从 `fixtures` 模块 use 任何动态 helper）
+/// 直插用的雪花 ID：走 `test-support::pool_snowflake()`（**进程级**
+/// `OnceLock<Mutex<..>>`，instance 由 pid ⊕ 启动时间派生）。
+///
+/// 不每次 `SnowflakeIdGenerator::new(epoch, 1)` 新建生成器：新建的生成器在同一毫秒内
+/// 连续两次调用会生成**完全相同**的 id（instance 相同 + 时间戳相同 + seq 都从 0 开始），
+/// 撞 `t_*_pkey`；更隐蔽的是撞成「shelf_id == process_id」这类业务列，让 DB 的
+/// `ck_*_no_self_loop` CHECK 以一条与被测逻辑无关的约束错误把用例打断。范本与理由见
+/// `tests/outsource/pool.rs::next_id`。
+fn next_id() -> i64 {
+    pool_snowflake().lock().expect("pool_snowflake").next_id()
+}
+
 // ===========================================================================
 
 /// 直插一个 OUTSOURCE 类别 `t_process` 工序。
@@ -73,8 +84,7 @@ async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, OutsourceFixtu
 /// 与 `fixtures::seed_process` 同形 SQL，但 category='OUTSOURCE'（fixture 版
 /// 走 INHOUSE，company 域必须用 OUTSOURCE）。
 async fn seed_outsource_process(pool: &PgPool, code: &str, name: &str) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, \

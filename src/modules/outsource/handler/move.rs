@@ -16,12 +16,14 @@
 //! - `outsource_company_id` / `shelf_id`：改为 `to` 对象里的 `company_id` / `shelf_id`；
 //! - `process_id`：**删除**（外协工序 = 批次当前所属工序，由后端自推）；
 //! - `next_process_id`：改为 `to.next_process_id`，且**可省略**（后端按工序链推导）；
-//! - `quantity`：**删除**（整批语义，部分收发走 `POST /prod/batches/{batch_id}/split`）；
+//! - `quantity`：**删除**（整批语义，部分收发先走共用拆批端点
+//!   `POST /api/v2/batches/split`，`batch_id` 入 body）；
 //! - 出参：`PartOut`（part 级）→ `OutsourceMoveResult`（批次级）。
 //!
 //! ## 事务边界 + WS 广播
 //! 事务边界在 handler：`state.pool.begin()` → service → 显式 `tx.commit()`；提前 return
-//! （`?`）时 `Transaction` 的 Drop 自动回滚。**广播在 commit 之后**。
+//! （`?`）时 `Transaction` 的 Drop 自动回滚。**广播在 commit 之后**，而 payload 的
+//! 序列化在 commit 之前 —— 序列化的失败路径必须是回滚而不是「广播一个空 payload」。
 //!
 //! ## 角色守卫
 //! 下沉到 service（`OutsourceMoveService::move_batch` 入口 `require_any_role`），handler
@@ -63,10 +65,16 @@ pub async fn move_batch(
 ) -> Result<Json<R<OutsourceMoveResult>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let result = OutsourceMoveService::move_batch(&mut tx, &state.snowflake, req, &current).await?;
+    // 广播 payload 在 commit **之前**序列化：出参是「标量 + String + Option」的封闭
+    // 结构，序列化实际不可能失败，但失败路径不能是「静默降级成 `payload: null`」——
+    // 那会让前端 WS 消费者收到一个形状不对的事件却收不到任何报错信号。这里失败即
+    // 回滚，让「DB 已提交 / WS 未广播」这个不一致窗口根本不存在。
+    let payload = serde_json::to_value(&result)
+        .map_err(|e| AppError::internal(format!("序列化 OUTSOURCE_MOVE_DONE payload 失败: {e}")))?;
     tx.commit().await?;
     state.ws_hub.broadcast(WsEvent::DashboardEvent {
         kind: "OUTSOURCE_MOVE_DONE".into(),
-        payload: serde_json::to_value(&result).unwrap_or_default(),
+        payload,
     });
     Ok(Json(R::ok(result)))
 }

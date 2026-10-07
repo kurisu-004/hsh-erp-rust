@@ -44,8 +44,9 @@ pub struct OutsourceCompanyWithProcessesOut {
 /// - `category`：前端勾选框的候选集来自 `GET /proc/processes?category=OUTSOURCE`
 ///   （独立端点），本字段与那份候选集恒等，冗余；
 /// - `sort_order`：**从不由 VO 消费** —— 它只被写侧 `replace_processes` 赋值、被
-///   看板 `pool_list_companies_with_held` 的 `ORDER BY MIN(cp.sort_order)` 读，
-///   两条都不经过本 VO。映射的展示顺序由请求数组顺序决定。
+///   看板公司列的 `ORDER BY MIN(cp.sort_order)` 读
+///   （`board/repo.rs::SQL_COMPANIES_BY_PROCESS`），两条都不经过本 VO。映射的展示顺序
+///   由请求数组顺序决定。
 #[derive(Debug, Clone, Serialize)]
 pub struct OutsourceCompanyProcessLinkOut {
     #[serde(serialize_with = "serialize_i64")]

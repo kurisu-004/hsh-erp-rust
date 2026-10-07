@@ -1,8 +1,8 @@
 //! outsource 域 service —— `POST /api/v2/outsource-queue/move` 三合一移动端点
 //! （2026-10-09 新增）
 //!
-//! 自 `prod::batch::service::outsource.rs` 迁移三个单边端点的全部守卫与写入，
-//! 三合一为**一个带 `from` / `to` 的移动端点**：
+//! 三个单边端点（`prod::batch` 的外协收发）的全部守卫与写入合并到本文件，
+//! 收成**一个带 `from` / `to` 的移动端点**：
 //!
 //! | `from` | `to` | 目标状态 | `current_process_id` | `current_process_step_id` |
 //! |---|---|---|---|---|
@@ -11,8 +11,8 @@
 //! | `OUTSOURCE_COMPANY` | `INSPECTION_SHELF` | `INSPECTION` | **置 NULL**（出池） | **置 NULL**（出池） |
 //!
 //! 三处对旧行为的**有意收窄**，理由都在注释里：
-//! - **不带 `quantity`**（整批语义，部分收发走独立拆批端点
-//!   `POST /prod/batches/{batch_id}/split`）；
+//! - **不带 `quantity`**（整批语义，部分收发先走共用拆批端点
+//!   `POST /api/v2/batches/split`）；
 //! - **不带 `process_id`**（外协工序 = 批次当前所属工序，由后端自推）；
 //! - **不再返回 `PartOut`**（part 级 VO 对批次级看板无用，返回批次级
 //!   [`OutsourceMoveResult`]）。

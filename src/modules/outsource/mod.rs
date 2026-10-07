@@ -69,7 +69,7 @@
 //!   保留 `company_router()` / `quote_router()` / `shipment_router()` /
 //!   `queue_router()`。
 //!
-//! 2026-10-09 公司 / 报价两域收敛（端点 **22 → 18**）：
+//! 2026-10-09 公司 / 报价两域收敛（端点 **22 → 19**）：
 //! - `POST /outsource-companies/{id}/processes` **硬切删除**（无 alias），工序能力清单
 //!   的整体替换吸收进 `POST /{id}/update` 的 `process_ids`（三态：`None` 不动 /
 //!   `Some([])` 清空 / `Some([..])` 替换）。service 侧加了「目标集合 == 当前集合就跳过

@@ -11,6 +11,9 @@
 //! 3. `detail_lists_all_mapped_companies_with_inlined_held_batches` —— 右列含
 //!    `held_count = 0` 的空列，且 **`held_count == held_batches.len()`**
 //! 4. `detail_keeps_direct_row_with_empty_company_options`
+//! - **§4b 候选侧谓词回归网（8 条）** —— 审批闸门 / DIRECT 占位报价不算审批报价 /
+//!   展示序 / `DISTINCT ON` 收敛层 / 非 OUTSOURCE 工序与空 `current_process_id` 排除 /
+//!   行粒度 = 批次
 //! 5. `detail_items_count_matches_snapshot_sendable_count`（**防 SQL 分叉的核心断言**：
 //!    snapshot 的分组计数 == detail 的分组取全量）+ `removed_sendable_endpoint_returns_404`
 //! 6. `detail_candidate_carries_new_card_fields` —— 5 个新增字段 + 拆开的客户两字段，
@@ -31,8 +34,14 @@
 //! ## 候选侧（`processes[].sendable_count` / `items`）的新判据
 //! 候选批次由 `t_part_batch.current_process_id` 判定（必须指向一道 OUTSOURCE 工序），
 //! **不再要求零件绑了工艺链**；且该工序 `requires_approval = true` 时必须已有 APPROVED
-//! 报价。故本文件两个 seed helper 都带对应形参：
+//! **且 `is_direct = false`** 的报价。故本文件两个 seed helper 都带对应形参：
 //! `seed_outsource_process(.., requires_approval)` 与 `insert_candidate_batch(.., process_id, ..)`。
+//!
+//! ## §4b：候选侧谓词回归网为什么必须存在
+//! `GET /outsource-sendable` 的测试曾把这层谓词守得最密（19 个用例），该端点下线后
+//! 谓词**一个都没删**（看板候选列仍在消费同一份 `SENDABLE_INNER_X_SQL`），但**用例**
+//! 若跟着删掉，这层就只剩正向覆盖 —— 谓词被改坏时全绿。故 §4b 把「负向 + 排序 +
+//! 收敛层」整层搬到这里：看板端点是唯一消费方，回归网挂在它上面才是真守。
 //!
 //! ## fixture 范本
 //! 通用基建（`send` / `json_request` / `test_app` / `test_pool` / `test_state` /
@@ -146,7 +155,7 @@ async fn login_shelf_account(
 }
 
 // ===========================================================================
-//  看板域独享 helpers（直插 `sqlx::query`；与 sendable.rs / send_receive.rs 同形）
+//  看板域独享 helpers（直插 `sqlx::query`；与 send_receive.rs 同形）
 // ===========================================================================
 
 /// 取一个测试用雪花 ID。
@@ -263,8 +272,8 @@ async fn insert_g_code_file(pool: &PgPool, part_id: i64) -> i64 {
 
 /// 直插 OUTSOURCE 类别工序，返回 `(id, code, name)`。
 ///
-/// `requires_approval` 是候选侧谓词的输入（true = 必须有已批准报价才出现在
-/// 候选列 / sendable 一览；false = 免审批直发），故由用例显式给出。
+/// `requires_approval` 是候选侧谓词的输入（true = 必须有 `is_direct = false` 的已
+/// 批准报价才出现在候选列；false = 免审批直发），故由用例显式给出。
 async fn seed_outsource_process(
     pool: &PgPool,
     code: &str,
@@ -442,7 +451,8 @@ async fn insert_candidate_batch(
 /// 直插在外协的批次：`status='OUTSOURCE'` + `location='OUTSOURCE_COMPANY'` +
 /// `current_holder_id = company_id` + `current_process_id = process_id`。
 ///
-/// 这 4 列正是 `prod::batch::service::outsource.rs::send_to_outsource` 落的形状。
+/// 这 4 列正是发送方向写端点（`service/move.rs` 的 `PRODUCTION_SHELF →
+/// OUTSOURCE_COMPANY` 臂）落的形状。
 async fn insert_held_batch(
     pool: &PgPool,
     part_id: i64,
@@ -560,6 +570,96 @@ async fn insert_open_shipment(
     .execute(pool)
     .await
     .expect("insert t_outsource_shipment");
+    id
+}
+
+/// 直插一条**状态由入参给定的**报价（`insert_approved_quote` 恒写 `APPROVED` /
+/// `is_direct=false`，谓词回归网要造的恰恰是其它组合）。
+///
+/// `submitted_at` / `reviewed_at` 按状态的**真实可达形状**给：`DRAFT` 两者皆 NULL
+/// （未提交 / 未审），其余状态才有时间戳 —— 造出一个「DRAFT 却已 submitted」的报价
+/// 会让「`DRAFT` 不算审批报价」这条用例的语义变脏。
+#[allow(clippy::too_many_arguments)]
+async fn insert_quote_raw(
+    pool: &PgPool,
+    part_id: i64,
+    company_id: i64,
+    process_id: i64,
+    price: &str,
+    status: &str,
+    is_direct: bool,
+) -> i64 {
+    let id = next_id();
+    let now = now_naive();
+    let draft = status == "DRAFT";
+    sqlx::query(
+        "INSERT INTO t_outsource_quote (id, part_id, outsource_company_id, process_id, price, \
+         note, status, submitted_at, reviewed_at, is_direct, version, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5::numeric, 'DIRECT 直发自动创建（免审批，单价待对账补录）', \
+                 $6, $7, $8, $9, 0, $10, $10)",
+    )
+    .bind(id)
+    .bind(part_id)
+    .bind(company_id)
+    .bind(process_id)
+    .bind(price)
+    .bind(status)
+    .bind(if draft { None } else { Some(now) })
+    .bind(if draft { None } else { Some(now) })
+    .bind(is_direct)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_outsource_quote");
+    id
+}
+
+/// 直插 DIRECT 直发自动创建的 **0 元占位报价**（`status='APPROVED'` +
+/// `is_direct=true` + `price=0`），形状照 `service/move.rs::resolve_direct_quote_id`
+/// 的 INSERT 抄 —— 候选侧谓词必须把它当「不是真实审批报价」看待。
+async fn insert_direct_placeholder_quote(
+    pool: &PgPool,
+    part_id: i64,
+    company_id: i64,
+    process_id: i64,
+) -> i64 {
+    insert_quote_raw(pool, part_id, company_id, process_id, "0", "APPROVED", true).await
+}
+
+/// 直插一个**八列形状全部由入参决定**的批次。
+///
+/// `insert_candidate_batch` 恒写 `PENDING` + `PRODUCTION_SHELF`、`insert_held_batch`
+/// 恒写 `OUTSOURCE` + `OUTSOURCE_COMPANY`，而谓词回归网要造的组合恰恰落在这两组
+/// 之外（`IN_PROCESS` 却停在非外协工序上 / `current_process_id` 为空 / 无 holder），
+/// 故另开一个不预设任何状态的全参 helper。
+#[allow(clippy::too_many_arguments)]
+async fn insert_batch_raw(
+    pool: &PgPool,
+    part_id: i64,
+    batch_no: i32,
+    holder_id: Option<i64>,
+    status: &str,
+    location: &str,
+    process_id: Option<i64>,
+    version: i32,
+) -> i64 {
+    let id = next_id();
+    sqlx::query(
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
+         current_holder_id, current_process_id, version, created_at, updated_at) \
+         VALUES ($1, $2, $3, 8, $4, $5, $6, $7, $8, now(), now())",
+    )
+    .bind(id)
+    .bind(part_id)
+    .bind(batch_no)
+    .bind(status)
+    .bind(location)
+    .bind(holder_id)
+    .bind(process_id)
+    .bind(version)
+    .execute(pool)
+    .await
+    .expect("insert t_part_batch (raw)");
     id
 }
 
@@ -988,6 +1088,307 @@ async fn detail_keeps_direct_row_with_empty_company_options() {
         .find(|c| c["process_id"].as_str() == Some(proc_id.to_string().as_str()))
         .unwrap_or_else(|| panic!("snapshot 缺工序 {proc_id}: {snap_env}"));
     assert_eq!(c["sendable_count"], 1, "{snap_env}");
+}
+
+// ===========================================================================
+//  4b. 候选侧谓词回归网（`repo/sql.rs::SENDABLE_INNER_X_SQL` + 收敛层）
+// ===========================================================================
+
+/// `requires_approval = true` 且**没有真实审批报价** ⇒ 不出行。
+///
+/// `SENDABLE_INNER_X_SQL` 的 WHERE 末段 EXISTS 闸门。工序映射了公司（DIRECT 的必要
+/// 条件齐备）也不豁免 —— 缺审批报价就该不出现。
+#[tokio::test]
+async fn detail_requires_approval_without_quote_excluded() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let cid = insert_customer(&pool, "PcApNoQ", "A").await;
+    let (proc_id, _, _) = seed_outsource_process(&pool, "PA-NOQ", true).await;
+    let shelf_id = insert_shelf(&pool, "PANQ").await;
+    let co = insert_company(&pool, "PcApNoQCo", true).await;
+    link_company_process(&pool, co, proc_id).await;
+    let part_id = insert_part(&pool, cid, "APNOQ", "2026-12-01").await;
+    create_chain_with_steps(&pool, part_id, &[(proc_id, 1)]).await;
+    let batch_id = insert_candidate_batch(&pool, part_id, shelf_id, proc_id, 0).await;
+
+    let (s, env) = get_detail(&app, &token, proc_id).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(
+        env["data"]["items"].as_array().unwrap().len(),
+        0,
+        "需审批但无已批准报价必须不出现: {env}"
+    );
+    assert_eq!(env["data"]["total"], 0, "{env}");
+    assert_eq!(
+        env["data"]["companies"][0]["company_id"],
+        co.to_string(),
+        "公司列白名单与候选谓词互不相干: {env}"
+    );
+
+    // 分组计数侧同一口径 ⇒ snapshot 徽标也是 0，且该工序**连 tab 都不出现**。
+    let (s, snap) = get_snapshot(&app, &token).await;
+    assert_eq!(s, StatusCode::OK, "{snap}");
+    let has_tab = snap["data"]["processes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["process_id"].as_str() == Some(proc_id.to_string().as_str()));
+    assert!(!has_tab, "0 候选 + 0 在途 ⇒ 该工序不得出现在序列板: {snap}");
+
+    // 前提断言：该批次确实存在（否则下面的「不出行」是因为根本没造出数据）
+    let still_there: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM t_part_batch WHERE id = $1)")
+            .bind(batch_id)
+            .fetch_one(&pool)
+            .await
+            .expect("probe candidate batch");
+    assert!(still_there, "前提断言：候选批次已落库");
+}
+
+/// `requires_approval = true` + **DRAFT** 报价 ⇒ 同样不出行（`DRAFT` 不是 `APPROVED`）。
+#[tokio::test]
+async fn detail_requires_approval_with_draft_quote_excluded() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let cid = insert_customer(&pool, "PcApDft", "A").await;
+    let (proc_id, _, _) = seed_outsource_process(&pool, "PA-DRAFT", true).await;
+    let shelf_id = insert_shelf(&pool, "PADF").await;
+    let co = insert_company(&pool, "PcApDftCo", true).await;
+    link_company_process(&pool, co, proc_id).await;
+    let part_id = insert_part(&pool, cid, "APDFT", "2026-12-01").await;
+    create_chain_with_steps(&pool, part_id, &[(proc_id, 1)]).await;
+    insert_quote_raw(&pool, part_id, co, proc_id, "5.00", "DRAFT", false).await;
+    insert_candidate_batch(&pool, part_id, shelf_id, proc_id, 0).await;
+
+    let (s, env) = get_detail(&app, &token, proc_id).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(
+        env["data"]["items"].as_array().unwrap().len(),
+        0,
+        "DRAFT 报价不是已批准报价，必须不出现: {env}"
+    );
+}
+
+/// `requires_approval = true` + **DIRECT 占位报价**（`APPROVED` + `is_direct=true`）
+/// ⇒ 仍不出行。
+///
+/// 这是真实的业务漏洞形态：某 `(part, process)` 历史上被 `direct=true` 发过一次
+/// （库里留下 0 元占位报价）→ 之后同一组合的批次若被当成 APPROVAL 出行，运营会以为
+/// 在按审批价发货，实际用的是一条从未被人审批过的 0 元价，shipment 单价落 0。
+/// 锁住的是 SQL 层**两处**谓词（报价 LEFT JOIN 与 WHERE 的 EXISTS）都带
+/// `is_direct = false`。
+#[tokio::test]
+async fn detail_requires_approval_with_direct_placeholder_quote_excluded() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let cid = insert_customer(&pool, "PcApDir", "A").await;
+    let (proc_id, _, _) = seed_outsource_process(&pool, "PA-DIRECT", true).await;
+    let shelf_id = insert_shelf(&pool, "PADIR").await;
+    let co = insert_company(&pool, "PcApDirCo", true).await;
+    link_company_process(&pool, co, proc_id).await;
+    let part_id = insert_part(&pool, cid, "APDIR", "2026-12-01").await;
+    create_chain_with_steps(&pool, part_id, &[(proc_id, 1)]).await;
+    insert_direct_placeholder_quote(&pool, part_id, co, proc_id).await;
+    insert_candidate_batch(&pool, part_id, shelf_id, proc_id, 0).await;
+
+    let (s, env) = get_detail(&app, &token, proc_id).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(
+        env["data"]["items"].as_array().unwrap().len(),
+        0,
+        "is_direct=true 的占位报价不是真实审批报价，必须不出现: {env}"
+    );
+    assert_eq!(env["data"]["total"], 0, "{env}");
+}
+
+/// 占位报价（**先**建，id 更小）与真实审批报价（**后**建）并存 ⇒ 出行，且回传
+/// 真实审批报价（价非 0）。
+///
+/// 与上一条互为反向：加 `is_direct = false` 是**收窄命中集**（取真实审批报价），不是
+/// 「有占位就整行剔除」。两条一起把谓词语义钉死。
+///
+/// 顺带锁 `DISTINCT ON` 收敛层：报价 LEFT JOIN 一旦漏掉 `is_direct = false`，内层 `x`
+/// 会为这批产出**两行**；若收敛层也没了，同一个 `batch_id` 就会在 `items[]` 里出现两次
+/// （故下面同时断言行数为 1 且 `batch_id` 不重复）。
+#[tokio::test]
+async fn detail_requires_approval_prefers_real_quote_over_direct_placeholder() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let cid = insert_customer(&pool, "PcApBoth", "A").await;
+    let (proc_id, _, _) = seed_outsource_process(&pool, "PA-BOTH", true).await;
+    let shelf_id = insert_shelf(&pool, "PABTH").await;
+    let co = insert_company(&pool, "PcApBothCo", true).await;
+    link_company_process(&pool, co, proc_id).await;
+    let part_id = insert_part(&pool, cid, "APBOTH", "2026-12-01").await;
+    create_chain_with_steps(&pool, part_id, &[(proc_id, 1)]).await;
+    // 占位报价先建（雪花 id 更小）⇒ 若谓词漏了 `is_direct = false`，收敛层的
+    // `quote_id ASC NULLS LAST` 恰好会挑中这条 0 元占位报价
+    let placeholder = insert_direct_placeholder_quote(&pool, part_id, co, proc_id).await;
+    let real = insert_approved_quote(&pool, part_id, co, proc_id, "77.70").await;
+    let batch_id = insert_candidate_batch(&pool, part_id, shelf_id, proc_id, 0).await;
+
+    let (s, env) = get_detail(&app, &token, proc_id).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let items = env["data"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "收敛层必须把同一批次压成一行: {env}");
+    assert_eq!(env["data"]["total"], 1, "{env}");
+    let row = row_by_batch(items, batch_id, &env);
+    assert_eq!(row["send_mode"], "APPROVAL", "{env}");
+    assert_eq!(
+        row["quote_id"].as_str().unwrap(),
+        real.to_string(),
+        "必须回传真实验审批报价而不是 0 元占位报价: {env}"
+    );
+    assert_ne!(
+        real, placeholder,
+        "前提断言：两条报价 id 不同（本用例的整个意义所在）"
+    );
+    assert_eq!(row["price"].as_str().unwrap(), "77.70", "{env}");
+    assert_eq!(
+        row["company_options"].as_array().unwrap().len(),
+        0,
+        "APPROVAL 行的 company_options 恒空: {env}"
+    );
+}
+
+/// 展示序「加急优先 → 交期近的优先」（`board/repo.rs::SQL_CANDIDATES_BY_PROCESS` 的
+/// `ORDER BY` 前两项）。
+///
+/// 插入序故意排成「普通-晚 / 普通-早 / 加急-晚」⇒ 期望输出「加急-晚 / 普通-早 /
+/// 普通-晚」，任何一项排序键被改掉都会被抓住。
+#[tokio::test]
+async fn detail_orders_urgent_first_then_planned_delivery() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let cid = insert_customer(&pool, "PcOrder", "A").await;
+    let (proc_id, _, _) = seed_outsource_process(&pool, "PD-ORDER", false).await;
+    let shelf_id = insert_shelf(&pool, "PDO").await;
+    let co = insert_company(&pool, "PcOrderCo", true).await;
+    link_company_process(&pool, co, proc_id).await;
+
+    let late = insert_part(&pool, cid, "NLA", "2026-12-30").await;
+    let early = insert_part(&pool, cid, "NEB", "2026-12-10").await;
+    let urgent = insert_part(&pool, cid, "URG", "2026-12-31").await;
+    set_part_card_fields(&pool, urgent, "2026-12-31", "", true).await;
+    for p in [late, early, urgent] {
+        create_chain_with_steps(&pool, p, &[(proc_id, 1)]).await;
+        insert_candidate_batch(&pool, p, shelf_id, proc_id, 0).await;
+    }
+
+    let (s, env) = get_detail(&app, &token, proc_id).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let names: Vec<&str> = env["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["part_name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["NAME-URG", "NAME-NEB", "NAME-NLA"],
+        "加急优先，其次交期近的优先: {env}"
+    );
+    assert_eq!(env["data"]["items"][0]["is_urgent"], true, "{env}");
+}
+
+/// `current_process_id` 指向**非 OUTSOURCE** 工序 ⇒ 不出行（内层 `JOIN t_process
+/// … AND pr.category = 'OUTSOURCE'`）。
+#[tokio::test]
+async fn detail_excludes_non_outsource_current_process() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let cid = insert_customer(&pool, "PcInh", "A").await;
+    let (inhouse, _, _) = seed_inhouse_process(&pool, "PI-INH").await;
+    let shelf_id = insert_shelf(&pool, "PIH").await;
+    let part_id = insert_part(&pool, cid, "INHOUSE", "2026-12-01").await;
+    // 在架上加工，却停在厂内工序上
+    insert_batch_raw(
+        &pool,
+        part_id,
+        1,
+        Some(shelf_id),
+        "IN_PROCESS",
+        "PRODUCTION_SHELF",
+        Some(inhouse),
+        0,
+    )
+    .await;
+
+    let (s, env) = get_detail(&app, &token, inhouse).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(
+        env["data"]["items"].as_array().unwrap().len(),
+        0,
+        "current_process_id 指向 INHOUSE 工序必须不出现: {env}"
+    );
+    assert_eq!(env["data"]["total"], 0, "{env}");
+}
+
+/// `current_process_id` 为空（`PENDING` 未派工）⇒ 不出行（内层是 INNER JOIN
+/// `t_process pr ON pr.id = pb.current_process_id`）。
+#[tokio::test]
+async fn detail_excludes_batch_without_current_process() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let cid = insert_customer(&pool, "PcNoProc", "A").await;
+    let shelf_id = insert_shelf(&pool, "PNP").await;
+    let part_id = insert_part(&pool, cid, "NOPROC", "2026-12-01").await;
+    insert_batch_raw(
+        &pool,
+        part_id,
+        1,
+        Some(shelf_id),
+        "PENDING",
+        "PRODUCTION_SHELF",
+        None,
+        0,
+    )
+    .await;
+
+    // 端点要一道**存在的** OUTSOURCE 工序才 200（否则 20801），借一道空工序问
+    let (proc_id, _, _) = seed_outsource_process(&pool, "PD-NOPROC", false).await;
+    let (s, env) = get_detail(&app, &token, proc_id).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(
+        env["data"]["items"].as_array().unwrap().len(),
+        0,
+        "未定位工序的批次必须不出现: {env}"
+    );
+    assert_eq!(env["data"]["total"], 0, "{env}");
+}
+
+/// 行粒度 = **批次**：同一零件的两个批次是两行，且两行 `batch_id` 不同。
+///
+/// 收敛键 `DISTINCT ON (batch_id, current_process_id)` 的另一半断言：多批次不扇行。
+#[tokio::test]
+async fn detail_one_row_per_batch_when_part_has_many_batches() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let cid = insert_customer(&pool, "PcDup", "A").await;
+    let (proc_id, _, _) = seed_outsource_process(&pool, "PD-DUP", false).await;
+    let shelf_id = insert_shelf(&pool, "PDD").await;
+    let co = insert_company(&pool, "PcDupCo", true).await;
+    link_company_process(&pool, co, proc_id).await;
+    let part_id = insert_part(&pool, cid, "DUPB", "2026-12-01").await;
+    create_chain_with_steps(&pool, part_id, &[(proc_id, 1)]).await;
+    let b1 = insert_candidate_batch(&pool, part_id, shelf_id, proc_id, 0).await;
+    let b2 = insert_batch_raw(
+        &pool,
+        part_id,
+        2,
+        Some(shelf_id),
+        "PENDING",
+        "PRODUCTION_SHELF",
+        Some(proc_id),
+        0,
+    )
+    .await;
+
+    let (s, env) = get_detail(&app, &token, proc_id).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let items = env["data"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "同一零件的两个批次是两行: {env}");
+    assert_eq!(env["data"]["total"], 2, "{env}");
+    let mut ids: Vec<String> = items
+        .iter()
+        .map(|i| i["batch_id"].as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    let mut want = vec![b1.to_string(), b2.to_string()];
+    want.sort();
+    assert_eq!(ids, want, "两行必须是不同批次: {env}");
 }
 
 // ===========================================================================

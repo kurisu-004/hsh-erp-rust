@@ -30,7 +30,7 @@
 //! - `board.rs` —— 外协看板只读聚合 2 端点（`snapshot` / `processes/{process_id}`）
 //! - `move.rs` —— 外协看板三合一移动写端点（`POST /move`，2026-10-09 新增）
 //!
-//! ## 路由表（22 端点 → 18 端点）
+//! ## 路由表（22 端点 → 19 端点）
 //!
 //! - `GET    /outsource-companies`              — 列表（READ）
 //! - `POST   /outsource-companies`              — 新建（WRITE）
@@ -123,7 +123,8 @@ pub async fn list_companies(
 /// 出参是 `R<()>`（`data: null`）：前端建完公司后一律重拉列表，建号所需的 id 从
 /// `GET /outsource-companies?name_like=…` 的首行取。返整份
 /// `OutsourceCompanyWithProcessesOut` 的代价是**每次建号多一次工序映射 + 工序元数据
-/// 的往返**，而消费方一个字段都不用。
+/// 的往返**，而消费方一个字段都不用 —— service 侧的签名（`Result<(), _>`）与这个
+/// 出参是同一件事的两端，改任一侧都要改另一侧。
 pub async fn create_company(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,

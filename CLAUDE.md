@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 > - [`docs/api/inspection.md`](docs/api/inspection.md) —— `prod::inspection` 待品检（队列列表 + 扫码三层树、`l1_customer_name` 与返修侧有意分叉、域隔离漏报盲区）
 > - [`docs/api/queue.md`](docs/api/queue.md) —— `prod::queue` 生产队列（9 端点；候选池判据的两列一致 / 货架 JOIN 不一致、`pending_count` 口径、`batch_id` 必须是 JSON 字符串）
 > - [`docs/api/batch.md`](docs/api/batch.md) —— `prod::batch` 批次流转（**剥离中间态**，域内 19 条 + 域外 `/batches/split` 1 条；剥离登记表 / `ROUTES` 权威源 / 状态派生契约 / 外协三端点已迁往 `outsource::queue`）
-> - [`docs/api/outsource.md`](docs/api/outsource.md) —— `outsource` 外协域（4 个 router 工厂 18 端点；外协看板 + `move` 三合一写端点、公司 / 报价两域收敛（端点 8+9 → 7+7、`keyword` 拆 `drawing_no` / `name`、报价 `statuses` 多状态筛选接线）、报价与对账、候选侧两处行粒度一致性、移除记录、WS 事件与审计字面量的区分）
+> - [`docs/api/outsource.md`](docs/api/outsource.md) —— `outsource` 外协域（4 个 router 工厂 19 端点；外协看板 + `move` 三合一写端点、公司 / 报价两域收敛（端点 8+9 → 7+7、`keyword` 拆 `drawing_no` / `name`、报价 `statuses` 多状态筛选接线）、报价与对账、候选侧两处行粒度一致性、移除记录、WS 事件与审计字面量的区分）
 >
 > **其它域的契约在代码注释里**（各域 `mod.rs` / `repo.rs` / `vo` / `dto` 的模块 doc 与逐字段 doc），本仓的目录约定见本文件「`docs/api/` 目录约定」一节。⚠️ **引用不存在的文档路径是禁止的** —— 后端代码变更（新增 / 修改 / 删除端点，或修改 DTO 字段 / 错误码）必须同步更新对应域的 `docs/api/` 文件（若该域有）与代码注释。
 

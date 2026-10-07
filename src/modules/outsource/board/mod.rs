@@ -55,10 +55,18 @@ mod sql_count_guard_tests {
     //!
     //! 1. 扫 `board/` 目录下全部 `.rs` 的**代码区**（注释与字符串字面量内容先被
     //!    空格化，行号保持不变），凡 `for` / `while` / `loop` 循环体（大括号配平
-    //!    范围内）内出现 `sqlx::query`（含 `query_scalar` / `query_as` / `query!` /
-    //!    `raw_sql` 等全部同族形式）即失败；
-    //! 2. `process_detail` 函数体恰好 4 处 `sqlx::query`、`snapshot` 恰好 3 处 ——
+    //!    范围内）内出现**任何数据库往返调用点**即失败；
+    //! 2. `process_detail` 函数体恰好 4 处查询调用点、`snapshot` 恰好 3 处 ——
     //!    钉住具体条数。
+    //!
+    //! 「数据库往返调用点」的判定见 [`QUERY_TERMINALS`]：sqlx 的三条构造路径
+    //! （`sqlx::query` 族 / `sqlx::raw_sql` / `Executor::execute` 族）**都以调用
+    //! Executor 的某个取行方法收尾，且恰好一次**，故取行方法是唯一同时「不漏形态」
+    //! 与「不重复计」的标记。只按构造入口 grep 会漏掉 `raw_sql` 与
+    //! `Executor::execute` —— 它们都不含 `sqlx::query` 子串，而那两条正是本仓在用的
+    //! 写法（见 `prod::batch::service::transition` 与 `part::service::batch` 的
+    //! SAVEPOINT 段）。取行方法另有 `::` 引出的 UFCS 形态
+    //! （[`QUERY_TERMINALS_UFCS`]），只参与本规则的判定。
     //!
     //! 规则 2 是**刻意「会红」的**：真要加第 5 条聚合 SQL 时它会挡住，那正是它该做的
     //! 事（加 SQL 必须同步本目录两处 doc 与 `board/repo.rs` 的方法 doc）。失败信息里
@@ -70,7 +78,10 @@ mod sql_count_guard_tests {
     //!
     //! ## 已知绕过口
     //!
-    //! - 循环写在**宏**里 / `sqlx::query` 的调用点被 `include!` 拼进来（仓库内不存在）；
+    //! - 循环体内**调用私有 helper**，查询写在 helper 里（两条规则都看不到调用点的
+    //!   归属）；本目录现有的 SQL 全部直写在聚合方法体内，helper 化必须同步把
+    //!   「4 条 / 3 条」的计数一并搬进被扫的目录，否则规则 2 会立刻报数不符；
+    //! - 循环写在**宏**里 / 调用点被 `include!` 拼进来（仓库内不存在）；
     //! - 条件编译（`#[cfg(feature = …)]`）的两条分支各有一条查询：单看代码仍是
     //!   「每个分支至多一条」，恒定性成立，故不算绕过口；
     //! - 「恒定」的定义是**不随工序数 / 公司数 / 批次数增长**。按维度分组后各发一条
@@ -79,10 +90,49 @@ mod sql_count_guard_tests {
 
     use std::path::{Path, PathBuf};
 
-    /// `process_detail` 期望的 `sqlx::query` 调用点数。
+    /// `process_detail` 期望的查询调用点数。
     const DETAIL_QUERIES: usize = 4;
-    /// `snapshot` 期望的 `sqlx::query` 调用点数。
+    /// `snapshot` 期望的查询调用点数。
     const SNAPSHOT_QUERIES: usize = 3;
+
+    /// 一次数据库往返的**终点**标记（`Executor` trait 的取行方法，调用形式为方法
+    /// 语法 `.fetch_all(` 等）。
+    ///
+    /// 集合内**互不为子串**（`.fetch(` 不会命中 `.fetch_all(`），且每个查询调用点
+    /// 恰好命中其中一项 ⇒ 「命中总数」= 「查询条数」，不需要去重。
+    const QUERY_TERMINALS: [&[u8]; 8] = [
+        b".execute(",
+        b".execute_many(",
+        b".fetch(",
+        b".fetch_all(",
+        b".fetch_many(",
+        b".fetch_one(",
+        b".fetch_optional(",
+        b".fetch_optional_many(",
+    ];
+
+    /// [`QUERY_TERMINALS`] 的 **UFCS 形态**（以 `::` 而非 `.` 引出取行方法，如
+    /// `sqlx::Executor::execute(&mut *conn, sql)`）。
+    ///
+    /// 只参与规则 1 的「出现即失败」判定，不参与条数计数 —— 同一次往返在源码里只以
+    /// 一种形态出现，但两条 needle 同时启用会让计数与判定的语义分叉。
+    const QUERY_TERMINALS_UFCS: [&[u8]; 8] = [
+        b"::execute(",
+        b"::execute_many(",
+        b"::fetch(",
+        b"::fetch_all(",
+        b"::fetch_many(",
+        b"::fetch_one(",
+        b"::fetch_optional(",
+        b"::fetch_optional_many(",
+    ];
+
+    /// 查询的**构造入口**标记，只用于规则 1（循环体内出现即失败），不进规则 2 的
+    /// 计数 —— 构造入口与终点会在同一条链上各命中一次，同时计数就翻倍了。
+    ///
+    /// `sqlx::query` 一个 needle 就覆盖 `query` / `query_scalar` / `query_as` /
+    /// `query!` 宏（全是它的前缀）；`sqlx::raw_sql` 是另一族前缀，必须单列。
+    const QUERY_ENTRYPOINTS: [&[u8]; 2] = [b"sqlx::query", b"sqlx::raw_sql"];
 
     /// 把 Rust 源码换成「注释与字符串字面量内容已空格化」的等价源码。
     ///
@@ -282,11 +332,34 @@ mod sql_count_guard_tests {
         hay.windows(needle.len()).filter(|w| *w == needle).count()
     }
 
+    /// 代码区内的**查询条数** = [`QUERY_TERMINALS`] 命中总数（见该常量的 doc：
+    /// 标记互不为子串，故无需去重）。
+    fn count_queries(code: &[u8]) -> usize {
+        QUERY_TERMINALS
+            .iter()
+            .map(|n| count_occurrences(code, n))
+            .sum()
+    }
+
+    /// 循环体内是否出现「构造入口」标记（[`QUERY_ENTRYPOINTS`]）。
+    fn has_query_entrypoint(code: &[u8]) -> bool {
+        QUERY_ENTRYPOINTS
+            .iter()
+            .any(|n| count_occurrences(code, n) > 0)
+    }
+
+    /// 循环体内是否出现 UFCS 形态的取行方法（[`QUERY_TERMINALS_UFCS`]）。
+    fn has_query_terminal_ufcs(code: &[u8]) -> bool {
+        QUERY_TERMINALS_UFCS
+            .iter()
+            .any(|n| count_occurrences(code, n) > 0)
+    }
+
     fn board_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("src/modules/outsource/board")
     }
 
-    /// 循环体里不得有 `sqlx::query`。
+    /// 循环体里不得有任何数据库往返调用点。
     #[test]
     fn no_sqlx_query_inside_loop_body() {
         let mut files = Vec::new();
@@ -309,9 +382,13 @@ mod sql_count_guard_tests {
                         continue;
                     };
                     let body = &code[open..=close];
-                    if count_occurrences(body, b"sqlx::query") > 0 {
+                    if count_queries(body) > 0
+                        || has_query_entrypoint(body)
+                        || has_query_terminal_ufcs(body)
+                    {
                         violations.push(format!(
-                            "{}:{}  `{kw}` 循环体内出现 `sqlx::query`",
+                            "{}:{}  `{kw}` 循环体内出现数据库往返调用（\
+                             命中取行方法 / `sqlx::query` / `sqlx::raw_sql`）",
                             path.strip_prefix(env!("CARGO_MANIFEST_DIR"))
                                 .unwrap_or(path)
                                 .display(),
@@ -328,7 +405,7 @@ mod sql_count_guard_tests {
         );
     }
 
-    /// 两个聚合方法的 `sqlx::query` 调用点数被钉死。
+    /// 两个聚合方法的查询条数被钉死。
     ///
     /// 与上一条互补：上一条禁「循环内查」（恒定性的**结构**保证），本条钉「一共几条」
     /// （恒定性的**数值**保证）。加一条聚合 SQL 必须同步 `board/repo.rs` 的方法
@@ -340,26 +417,26 @@ mod sql_count_guard_tests {
         let code = blank_comments_and_strings(&src);
 
         let (d_lo, d_hi) = fn_body(&code, "process_detail");
-        let detail_q = count_occurrences(&code[d_lo..d_hi], b"sqlx::query");
+        let detail_q = count_queries(&code[d_lo..d_hi]);
         assert_eq!(
             detail_q,
             DETAIL_QUERIES,
-            "board/repo.rs:{} `process_detail` 的 `sqlx::query` 调用点数是 {detail_q}，\
+            "board/repo.rs:{} `process_detail` 的查询条数是 {detail_q}，\
              期望 {DETAIL_QUERIES}。新增/删除聚合 SQL 时请同步改：\
              (1) 本文件该方法的 doc（编号 1..{DETAIL_QUERIES} 与「固定 N 条」）、\
              (2) `board/mod.rs` 与 `handler/board.rs` 的条数陈述、\
              (3) 本文件的 `DETAIL_QUERIES`。\
              注意：把某条 SQL 挪进私有 helper 会让本计数失真而不改实际条数 —— \
-             4 条必须全部写在函数体内。",
+             {DETAIL_QUERIES} 条必须全部写在函数体内。",
             line_of(&code, d_lo),
         );
 
         let (s_lo, s_hi) = fn_body(&code, "snapshot");
-        let snapshot_q = count_occurrences(&code[s_lo..s_hi], b"sqlx::query");
+        let snapshot_q = count_queries(&code[s_lo..s_hi]);
         assert_eq!(
             snapshot_q,
             SNAPSHOT_QUERIES,
-            "board/repo.rs:{} `snapshot` 的 `sqlx::query` 调用点数是 {snapshot_q}，\
+            "board/repo.rs:{} `snapshot` 的查询条数是 {snapshot_q}，\
              期望 {SNAPSHOT_QUERIES}。改法同上（对应 `SNAPSHOT_QUERIES`）。",
             line_of(&code, s_lo),
         );

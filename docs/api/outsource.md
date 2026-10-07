@@ -14,7 +14,7 @@
 2. **可发送一览下线**：`GET /outsource-sendable` 的行是看板候选列的**分页子集**，端点删除。
 3. **写端点三合一**：`prod::batch` 的 `send-to-outsource` / `receive-from-outsource` / `receive-from-outsource-to-inspection` → 单条 `POST /outsource-queue/move`。
 
-**第二批 —— 公司 / 报价两域收敛**（端点 22 → **18**）：
+**第二批 —— 公司 / 报价两域收敛**（端点 22 → **19**）：
 
 4. **`POST /outsource-companies/{id}/processes` 下线**，工序能力清单的整体替换吸收进 `POST /{id}/update` 的 `process_ids`（三态：`None` 不动 / `Some([])` 清空 / `Some([..])` 替换），同事务内与公司字段一起提交。
 5. **`GET /outsource-quotes/{id}` 与 `POST /outsource-quotes/{id}/update` 下线**（前端零消费）。
@@ -110,7 +110,7 @@ router 工厂始终是 **4 个**（`company_router` / `quote_router` / `shipment
 `OutsourceCompanyWithProcessesOut`（端点 1.1-#3 / #5）= 上表全部字段 + `processes: OutsourceCompanyProcessLinkOut[]`。
 
 `OutsourceCompanyProcessLinkOut`（**3 字段**）：`process_id`（string）/ `process_code` / `process_name`。
-⚠️ **无 `category` / `sort_order`**（2026-10-09 删）：`category` 的消费方是前端勾选框，而候选集来自独立的 `GET /proc/processes?category=OUTSOURCE`，本字段与那份候选集恒等；`sort_order` 只被写侧 `replace_processes` 赋值、被看板 `pool_list_companies_with_held` 的 `ORDER BY MIN(cp.sort_order)` 读，**两条都不经过本 VO** —— 映射的展示顺序由请求数组顺序决定。`processes[]` 的顺序 = `t_outsource_company_process` 的 `sort_order ASC, id ASC`。
+⚠️ **无 `category` / `sort_order`**（2026-10-09 删）：`category` 的消费方是前端勾选框，而候选集来自独立的 `GET /proc/processes?category=OUTSOURCE`，本字段与那份候选集恒等；`sort_order` 只被写侧 `replace_processes` 赋值、被看板公司列的 `ORDER BY MIN(cp.sort_order)` 读（`board/repo.rs::SQL_COMPANIES_BY_PROCESS`），**两条都不经过本 VO** —— 映射的展示顺序由请求数组顺序决定。`processes[]` 的顺序 = `t_outsource_company_process` 的 `sort_order ASC, id ASC`。
 
 `OutsourceCompanyOptionOut`（端点 1.1-#7 的元素，**2 字段**）：`id`（string）/ `name`。
 ⚠️ **无 `is_active`**：service 层已在 Rust 里 `filter(|c| c.is_active)` 掉了停用公司，能出现在本列表里的行恒为启用 —— 再返一列 `is_active` 等于把「已被后端消掉的事实」交给前端重新判断。
@@ -357,6 +357,8 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 
 批次数由 SQL 3（在途批次一次取齐）后在内存 `HashMap` 分组得到，**不依赖 SQL 的 `COUNT`**（那条 SQL 与明细 SQL 的谓词一旦漂移就会分叉）。守卫测试 `board::held_count_guard_tests::held_count_matches_held_batches_len` 直接对生产路径上的纯函数断言恒等式（含交错输入，顺带证明分组不依赖 SQL 的 ORDER BY）。
 
+**在途侧的三个落点共用同一个 `current_holder_id IS NOT NULL` 谓词**：`snapshot` 的在途分组计数（`COUNT(*)`）、`detail` 的在途明细、服务层的分组键。缺了它两边会分叉 —— `COUNT(*)` 会数到一批 `detail` 取不出来的行（tab 徽标虚高），而 `detail` 侧若也缺，`current_holder_id`（`bigint` 可空，无 DB 约束）会以 SQL NULL 落进 `HeldBatchRow::company_id`（`i64`）⇒ sqlx `error decoding column` ⇒ **整个 `process_detail` 返 500**。异常行（`location='OUTSOURCE_COMPANY'` 却没 holder）本仓判为数据异常，登记在下面的偏差表里，不在读侧兜底。
+
 ### 4.3 snapshot 与 process detail 的关系
 
 | | `snapshot`（4.1） | `detail`（4.2） |
@@ -433,7 +435,7 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 `POST /outsource-companies/{id}/update` 的 `process_ids` 吸收了原 `POST /{id}/processes` 的职责，映射的**有序**集合有两处依赖：
 
 - 写侧 `replace_processes` 按数组下标写 `sort_order`（首次出现位置去重保序）；
-- 看板 `pool_list_companies_with_held` 的 `ORDER BY MIN(cp.sort_order)` 决定公司列内的公司顺序。
+- 看板公司列的 `ORDER BY MIN(cp.sort_order)`（`board/repo.rs::SQL_COMPANIES_BY_PROCESS`）决定公司列内的公司顺序。
 
 **diff 守卫**：目标有序集合 == 当前有序集合（`junction_list_by_company` 按 `sort_order ASC, id ASC`）时**跳过重写**。合并对话框之后每次保存都会走到这条路径，而 `replace_processes` 是「软删全部 + 逐条重建」—— 无脑执行会把整张 `t_outsource_company_process` churn 一遍（换一批雪花 id、`sort_order` 重排），而内容一字未变。去重保序的实现收在一个共享 helper 里（`dedup_keep_order`），因为「重复项在前还是在后」若在两处各写一遍，两份实现一旦漂移，diff 守卫会把「仅顺序不同」误判成「有变化」。
 
@@ -458,7 +460,7 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 | 6d | `quote_id` / `direct` 出现在非发送方向 | `20104 BIZ_INVALID_VALUE` |
 | 7 | 发送方向：公司存在 → 启用 → 工序存在 → 工序类别 `OUTSOURCE` → 公司映射该工序 → `direct` / `quote_id` 恰给一个 → `requires_approval` 工序不许 `direct` | `21201` / `21205` / `20801` / `20104` / `20104` / `20104` / `20104` |
 | 7b | 报价存在 → 状态 `APPROVED` → `(part, company, process)` 三元组一致 → APPROVAL 路径拒 DIRECT 占位价 | `21301` / `21307` / `21302` / `21307` |
-| 8 | 回收生产：目标货架存在 / 启用 / `zone='PRODUCTION'` / 映射该工序；下一道工序推导 | `20501` / `20512` / `20104` / `20507` / `20706` |
+| 8 | 回收生产：目标货架存在 / 启用 / `zone='PRODUCTION'`；下一道工序推导；货架必须映射该工序 | `20501` / `20512` / `20104` / `20706` / `20507` |
 | 9 | 回收品检：目标货架存在 / 启用 / `zone='INSPECTION'` | `20501` / `20512` / `20104` |
 
 `ensure_transition` 依赖 `PartStatus::can_transition_to`（`part::statemachine` 的内存迁移表）。发送方向用到的两条边是 `PENDING → OUTSOURCE` 与 `IN_PROCESS → OUTSOURCE`；⚠️ `IN_PROCESS → OUTSOURCE` 这条边**曾经缺失**，导致「可发送一览的行（几乎全是 `IN_PROCESS` 源）发一单就被 `20103` 拒」，端到端实测下外协发送 100% 不可用。状态机补边后守卫 6b 才真正承担 location 不变式 —— 别因为「守卫 6 已经能拒」就把它删掉。
@@ -577,7 +579,7 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 4. **`move` 出参变更**：`PartOut`（part 级）→ `OutsourceMoveResult`（批次级）。读 part_id 改读 `out.part_id`；OCC 版本号改读 `out.version`（**写后读回的真实值**，不是请求的 `version + 1`）。`shipment_id` / `new_process_id` 按「键是否存在」判定方向，不要按 `null` 判定。
 5. **候选卡 `shelf_id` 是承重字段**：拖拽发送时必须原样回传给 `from.shelf_id`（候选池跨货架，不能用「用户当前激活货架」凑 —— 激活货架对 MANAGER / CLERK / INSPECTOR 恒为空）。填错被写端点按 `20122` 拒收。
 6. **候选卡的 `shelf_id` 为空串的行走不通**：那是 `PENDING` 且未上架的批次（本来就在生产架之外），要先 `place-on-shelf`。
-7. **新增 2 个看板 composable** + **删 3 个旧 composable**（`/counts` 计数、`/state` 每公司一次、``/pool/{id}` 详情）。
+7. **新增 2 个看板 composable** + **删 3 个旧 composable**（`/outsource-pool/counts` 计数、`/outsource-pool/state` 每公司一次、`/outsource-pool/{process_id}` 详情）。
 8. **zod schema 同步**：新增 `outsourceQueueSnapshotSchema` / `outsourceQueueProcessDetailSchema` / `outsourceQueueCandidateSchema` / `outsourceQueueCompanySchema` / `outsourceQueueHeldBatchSchema` / `outsourceMoveResultSchema`。**注意 zod 默认 strip 模式**会让漏声明的字段静默丢失，数组元素必须全字段声明（候选卡 25 字段）。
 9. **日期字段类型不一致**（勿写同一个 schema 复用）：候选卡 / `quotable` 的日期是 `YYYY-MM-DD` **字符串**（`to_char`）；`held_batches` 的是 ISO 日期串（native date）。
 10. **`receive_next_process_id` 是字符串 `"0"`** 而非数字 0、亦非 `null`；配合 `chain_resolvable` 判定要不要弹手填对话框。
@@ -605,6 +607,7 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 - **`GET /outsource-quotes/` 的 `customer_id` 只下潜一层客户子树**，出现 L3 后漏报是**静默的**（`total` 偏小、不报错）。
 - **对账页的 `customer_id` 只判等值、不做子树展开**（与报价一览语义不同，见 §4.6）。若产品要求「按 L1 客户看该客户全部零件的外协发货记录」，需要另行扩子树，不是本轮遗漏。
 - **`companies[].held_count` 与 `held_batches.len()` 的一致性由服务层保证（集成测试 + lib 单测 `held_count_matches_held_batches_len` 锁），但若未来有人在 SQL 侧重新加 `COUNT` 会静默分叉。** SQL 侧已刻意不做 `COUNT`（`SQL_COMPANIES_BY_PROCESS` 的 doc 逐字写了这一点）—— 恢复 `COUNT` 的诱惑来自「顺手」，代价是两条 SQL 的谓词一旦漂移就静默不一致。
+- **`t_part_batch.current_holder_id` 可空，而 `location='OUTSOURCE_COMPANY'` 的批次按业务不变式必有 holder（= 公司 id）；本仓对违约行不兜底。** 在途侧的三个落点统一加 `current_holder_id IS NOT NULL`（见 §4.2），后果是这类批次**在 `snapshot` 的 `in_flight_total` 与 `detail` 的在途卡里都不出现**（静默少算，不是报错）。这是有意的取舍：给它单独一个「holder 缺失」的位置反而要求读侧造一个假的分组键。若将来这类数据真的出现，应该修的是写入侧不变式，不是读侧。
 - **候选卡 `shelf_id` 对「`PENDING` 且未上架」的批次序列化为空串（不是 `null`）。** 这类行本来就在生产架之外，拖拽发送会被 `from` 守卫以 `20122` 拒收。选空串而非 `null` 是因为 `null` 会让前端的必填字符串校验炸在**整页渲染**上。
 - **`snapshot.processes[]` 只含 `sendable + in_flight > 0` 的工序 ⇒ tab 集合必须由前端 join 全量 OUTSOURCE 工序列表，否则操作到一半 tab 会消失。** 后端不返「零货工序」是刻意的（序列板的语义是「现在有活要干的工序」），但这意味着 tab 集合不是后端给的单一真源。
 - **`OutsourceMoveResult.version` 是写后读回的真实值，不是在 Rust 里算的 `batch.version + 1`。** 写入口的 OCC 守卫与源状态白名单都可能让 UPDATE 命中 0 行，让「算出来的 +1」与真实值分叉；而分叉的症状是「刚拖完就冲突」，极难定位。代价是多一次读（同一事务内）。
@@ -613,6 +616,7 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 - **`detail.process` 无 `category` 字段**（单工序详情不展示类别，与 `prod::queue` 的 `QueueProcessMeta` 对齐），而 `snapshot.processes[]` 有。
 - **§1.5 的「静态段必须先于 catch-all 注册」是硬约束，没有编译期保障。** 公司 router 里加一条新的 1 段静态路由而放到 `/{id}` 之后 ⇒ 该路径返 **400**（不是 404），症状与「路由没注册」不同，极易误判。（quote router 暂时无此约束，因为 `/{id}` 已下线。）
 - **公司 / 报价两域的 `version` 必填是**「422 纯文本」**而不是业务信封**，前端错误处理要按 HTTP 状态码分支，不能假设响应必有 `code` 字段。同理 `Path<i64>` 抽不出数字时的 400。
+- **看板两个端点的权限面比旧 `/outsource-pool/state` 宽了半档（2026-10-09 收敛的连带后果）。** 旧 `state` 端点是 **Manager + Clerk**，而它吐的 `unit_price` 与客户 / 申请人名属于外协域的商务敏感读面；收敛后 `held_batches[].price`（同一列的另一种叫法）被内联进 `GET /outsource-queue/processes/{id}` 的 `companies[]`，而该端点为了让 Inspector 能收货/发料给了 **Manager + Clerk + Inspector**。⇒ **`held_batches[].price` 与客户 / 申请人名对 Inspector 打开了**，这是本轮有意接受的暴露面变化（代价：旧端点那点保护没了；收益：收货角色不必再靠两次请求拼看板）。若产品不接受，正确修法是给 `price` 单独加字段级脱敏（按角色置 `null`），而不是把整个端点退回 Manager + Clerk —— 那会让 Inspector 看不到自己经手的在途卡。角色口径与理由记在 `src/modules/outsource/handler/board.rs` 的模块 doc。
 
 ## 9. 错误码分段（`src/shared/error.rs::code`）
 

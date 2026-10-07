@@ -254,7 +254,8 @@ pub struct OutsourceQueueHeldBatch {
     /// `receive_next_process_id != "0"`。
     ///
     /// 业务含义：`true` ⇒ 工序链已知，前端可免填 `to.next_process_id`；`false` ⇒
-    /// 工序链缺失或指针漂移，前端必须让用户手填（否则写端点返 `20702`）。
+    /// 工序链缺失或指针漂移，前端必须让用户手填（省略 `to.next_process_id` 时写端点
+    /// 以 `20706 BIZ_PROCESS_CHAIN_REQUIRED` 拒收）。
     pub chain_resolvable: bool,
 }
 

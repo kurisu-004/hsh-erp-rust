@@ -473,11 +473,11 @@ pub trait OutsourceRepoTrait: Send {
     ) -> Result<Option<String>, sqlx::Error>;
     /// `t_process` 按 id 查 `requires_approval`（仅未软删）。
     ///
-    /// 2026-10-03 新增：供 `prod::batch::send_to_outsource` 写侧守「需审批的工序
-    /// 不许 `direct=true` 直发」——该列此前只有读侧（sendable / pool 的判定 SQL）
-    /// 在用，写侧零校验 ⇒ 绕过 UI 直接调 API 就能对需审批工序直发。读法与
-    /// `process_get_category` 同形（同表、同 `deleted_at IS NULL`、返回 `Option`
-    /// 让调用方自己决定「不存在」怎么处理）。
+    /// 2026-10-03 新增：供外协移动写端点守「需审批的工序不许 `direct=true` 直发」
+    /// （`service/move.rs::resolve_send_quote`）——该列此前只有读侧
+    /// （候选 / 在途看板的判定 SQL）在用，写侧零校验 ⇒ 绕过 UI 直接调 API 就能对
+    /// 需审批工序直发。读法与 `process_get_category` 同形（同表、同
+    /// `deleted_at IS NULL`、返回 `Option` 让调用方自己决定「不存在」怎么处理）。
     ///
     /// **为何不并进 `process_get_category`（2026-10-03 review 第 2 轮登记）**：两者读
     /// 的是 `t_process` 同一行的相邻两列，合到一个 `process_get_flag_row` 里确实能
