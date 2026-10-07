@@ -414,8 +414,9 @@ mod tests {
     use chrono::NaiveDate;
     // 2026-10-09：本模块所有测试 ID 一律从
     // `crate::shared::test_snowflake::shared_test_snowflake()`（**lib 单测进程内唯一**
-    // 的 generator 对象）取号 —— 为什么不用 test-support 的同名函数，见该模块顶部 doc
-    // （dev-dependency 环导致 lib 单测二进制里链进两份 `hsh_erp_rust`）。
+    // 的 generator 对象）取号 —— 为什么不用 test-support 的同名函数，见
+    // `src/shared/test_snowflake.rs` 的模块 doc（dev-dependency 环导致 lib 单测二进制里
+    // 链进两份 `hsh_erp_rust`）。
     // 原先 7 个 helper + 7 个 `#[tokio::test]` 各自 `SnowflakeIdGenerator::new(.., 7)`，
     // 而 `last_ms` / `sequence` 是 generator **对象私有**字段、`new()` 从 0 起步 ⇒
     // 两个 instance 相同、对象不同的 generator 同毫秒各取第 0 号即发出逐字节相同的
@@ -723,7 +724,6 @@ mod tests {
             None,
         )
         .await;
-
         let b_ip = shared_test_snowflake().next_id();
         let now = now_naive();
         // 2026-09-30（review L2）：补 `current_process_id` —— 写入不变式第 1 行要求
@@ -878,7 +878,6 @@ mod tests {
         let b_id = insert_part_batch(&pool, p_id).await;
 
         let mut conn = pool.acquire().await.unwrap();
-
         let r = QueueService::dispatch_batch(
             &mut conn,
             vec![(b_id, process_id)],
@@ -959,7 +958,6 @@ mod tests {
         let b_id = insert_part_batch_with_status(&pool, p_id, "PROGRAMMING").await;
 
         let mut conn = pool.acquire().await.unwrap();
-
         let r = QueueService::dispatch_batch(
             &mut conn,
             vec![(b_id, process_id)],
@@ -1030,7 +1028,6 @@ mod tests {
         let b_id = insert_part_batch(&pool, p_id).await;
 
         let mut conn = pool.acquire().await.unwrap();
-
         let current = make_current(user_id, Role::Manager);
 
         // 第一次成功
@@ -1066,7 +1063,6 @@ mod tests {
         link_shelf_to_process(&pool, shelf_id, process_id).await;
 
         let mut conn = pool.acquire().await.unwrap();
-
         let e = QueueService::dispatch_batch(
             &mut conn,
             vec![(999_999_999, process_id)],
@@ -1109,7 +1105,6 @@ mod tests {
             .unwrap();
 
         let mut conn = pool.acquire().await.unwrap();
-
         let _r = QueueService::dispatch_batch(
             &mut conn,
             vec![(b_id, process_id)],
@@ -1130,7 +1125,6 @@ mod tests {
         let process_id = insert_process(&pool, "P-MULTI", "ACME").await;
 
         // 三个货架：sort_order 分别是 5 / 1 / 9，应取 sort_order=1 的那个
-
         let now = now_naive();
         let shelf_first = shared_test_snowflake().next_id();
         let shelf_mid = shared_test_snowflake().next_id();
@@ -1212,7 +1206,6 @@ mod tests {
         let b_id = insert_part_batch(&pool, p_id).await;
 
         let mut conn = pool.acquire().await.unwrap();
-
         let _r = QueueService::dispatch_batch(
             &mut conn,
             vec![(b_id, process_id_no_shelf)],
@@ -1247,7 +1240,6 @@ mod tests {
         let b_id = insert_part_batch(&pool, p_id).await;
 
         let mut conn = pool.acquire().await.unwrap();
-
         let e = QueueService::dispatch_batch(
             &mut conn,
             vec![(b_id, process_id)],
@@ -1266,7 +1258,6 @@ mod tests {
         let user_id = insert_user_with_role(&pool, "manager1", "password", "MANAGER").await;
 
         let mut conn = pool.acquire().await.unwrap();
-
         let e = QueueService::dispatch_batch(
             &mut conn,
             vec![], // empty
@@ -1331,7 +1322,6 @@ mod tests {
         let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
 
         // 建 chain（无 step）
-
         let now = now_naive();
         let chain_id = shared_test_snowflake().next_id();
         sqlx::query(
@@ -1381,7 +1371,6 @@ mod tests {
         let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
 
         // 建链 + 2 个 step（sort_order=1 / 2）+ 2 个货架 + 2 个映射
-
         let now = now_naive();
         let chain_id = shared_test_snowflake().next_id();
         sqlx::query(
@@ -1483,7 +1472,6 @@ mod tests {
         let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
 
         // 建链 + step，但首道工序不映射货架
-
         let now = now_naive();
         let chain_id = shared_test_snowflake().next_id();
         sqlx::query(
@@ -1554,7 +1542,6 @@ mod tests {
         let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
 
         // 完整链路：工艺链 + 首道 step + 首货架映射（保证 skip_reason 无从谈起）
-
         let now = now_naive();
         let chain_id = shared_test_snowflake().next_id();
         sqlx::query(

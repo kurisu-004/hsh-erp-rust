@@ -61,7 +61,10 @@ static TEST_SNOWFLAKE_GEN: OnceLock<std::sync::Mutex<std::sync::Arc<SnowflakeIdG
 /// `&'static Mutex<Arc<SnowflakeIdGenerator>>`（理由见 [`shared_test_snowflake`]）。
 /// 存量 `.lock().expect(..).next_id()` / `.lock().unwrap().next_id()` / 绑定 guard 后
 /// 再 `next_id()` 的写法全部靠 `Arc: Deref<Target = SnowflakeIdGenerator>` 透明兼容，
-/// `tests/` 里 183 处调用点一行未改。
+/// `tests/` 里 129 处调用点一行未改。
+/// ⚠️ **2026-10-09（review 第 1 轮 M5）订正**：初版此处写「183 处调用点」—— 183 是当时
+/// CLAUDE.md 待办登记表里 `SnowflakeIdGenerator::new` 的**处数**（182 + 1），被误当成
+/// 本函数的调用点数。实测（`rg -o 'pool_snowflake\(\)' tests/ | wc -l`）为 **129**。
 pub fn pool_snowflake() -> &'static std::sync::Mutex<std::sync::Arc<SnowflakeIdGenerator>> {
     TEST_SNOWFLAKE_GEN.get_or_init(|| {
         std::sync::Mutex::new(std::sync::Arc::new(SnowflakeIdGenerator::new(
@@ -130,8 +133,13 @@ pub fn shared_test_snowflake() -> &'static std::sync::Arc<SnowflakeIdGenerator> 
 /// 位布局 `ts << 22 | instance << 12 | seq`，故两个独立 generator 的 id 相同，当且仅当
 /// **同 instance + 同毫秒 + 同 seq** 三条同时成立。由此：
 /// - **instance 不同 ⇒ 位段不同 ⇒ 必然不撞**。刻意给另一个 generator 填不同 instance
+///   曾是**有效**的权宜之计 —— 2026-10-09 本轮改造前本仓确有多处在用
 ///   （`tests/part/purchase_order_import.rs` 的 `777`、`tests/part/lifecycle.rs` 的
-///   `11`/`12`/`13` 等）是**有效**的权宜之计，本仓多处正在用，不是坑。
+///   `11`/`12`/`13`、`tests/part/crud.rs` 的 `99` 等）。
+///   ⚠️ **2026-10-09（review 第 1 轮 M5）订正：那些写法现已全部迁走**（全仓真实代码行
+///   的 `SnowflakeIdGenerator::new` 只剩两个进程级唯一源 + 生产 1 处 + 被测对象自身 8 处），
+///   本条已从「本仓多处正在用」降级为**历史陈述**。「换 instance 有效」这个知识本身仍然
+///   成立，但它不再是本仓任何一处的做法。
 /// - 但 instance 只有 10 bit = **1024 个取值**，刻意填的字面量（如 `1`）仍有
 ///   **1/1024 概率**等于本进程 `test_snowflake_instance()` 的派生值 —— 而两个 fresh
 ///   generator 的首个 id 恰好都是 `seq=0`，故一旦相等就同毫秒同 seq 相撞 `t_*_pkey`
@@ -139,11 +147,23 @@ pub fn shared_test_snowflake() -> &'static std::sync::Arc<SnowflakeIdGenerator> 
 /// - 结论：**「刻意换 instance」只是次优的权宜之计，唯一无歧义的规矩是「进程内只从
 ///   [`shared_test_snowflake`] 取号」**。历史真实事故形态正是两个**同为 instance=1** 的
 ///   独立 generator（`tests/part/crud.rs` 与 `tests/part/rollup_recompute.rs` 的域内单例，
-///   同一 `part` binary 内）——已由 2026-10-09 本轮改造收敛掉。其余仍用本地 generator 的
-///   文件见 CLAUDE.md「待办登记：测试内联造 snowflake 生成器应收敛到 `pool_snowflake()`」。
+///   同一 `part` binary 内）——已由 2026-10-09 本轮改造收敛掉，并由主仓
+///   `src/shared/snowflake_guard.rs`（`cargo test --lib` 强制）钉死「不得再就地 new」。
+///   登记与统计口径见 CLAUDE.md「测试取号：进程内唯一 generator」一节（原「待办登记：
+///   测试内联造 snowflake 生成器应收敛到 `pool_snowflake()`」，已随本轮改造重写）。
 ///
 /// pub(crate)：[`state`](super::state) 构造 `AppConfig::snowflake::instance` 也读它，
 /// 必须 crate 内可见。
+///
+/// ⚠️ **2026-10-09（review 第 1 轮 I2）：本函数与主仓 `src/shared/test_snowflake.rs` 的
+/// `test_snowflake_instance` 是逐字相同的两份，改一必须同步另一份。**
+/// 跨 crate **无编译期保障**（两份代码互不可见），漂移不会让任何测试变红，只会静默
+/// 削弱跨进程撞号保护。两份并存的原因是 dev-dependency 环：本 crate 的
+/// `[dependencies]` 指回主仓，而主仓的 `[dev-dependencies]` 指回本 crate，于是
+/// `cargo test --lib` 的同一个二进制里链进**两份** `hsh_erp_rust` —— 本函数所在的那份
+/// 永远是「集成测试 binary」的那份，`src/**` 的 lib 单测走的是主仓自己那份
+/// （`src/shared/test_snowflake.rs`），两者类型不通、对象不同源。
+/// 收敛手段只能是文档约定 + 双向日期戳（现状：两边已互链）。
 pub(crate) fn test_snowflake_instance() -> u16 {
     static INSTANCE: OnceLock<u16> = OnceLock::new();
     *INSTANCE.get_or_init(|| {

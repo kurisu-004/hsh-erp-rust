@@ -250,7 +250,7 @@ mod tests {
     // **对象私有**字段、`new()` 从 0 起步 ⇒ 两个 instance 相同、对象不同的 generator
     // 同毫秒各取 seq 0 会发出逐字节相同的 id（`t_*_pkey` 23505）。instance 这 10 bit
     // 现在只留给跨进程区分（1024 槽），进程内唯一性由共享对象串行发号保证。
-    // 为什么不用 test-support 的同名函数见该模块顶部 doc。
+    // 为什么不用 test-support 的同名函数，见 `src/shared/test_snowflake.rs` 的模块 doc。
 
     /// MANAGER 单角色测试用户（id=1）。
     fn current_manager() -> CurrentUser {

@@ -335,7 +335,8 @@ mod tests {
     //!
     //! 2026-10-09：generator 由本地 `SnowflakeIdGenerator::new(.., 1)` 改为
     //! `crate::shared::test_snowflake::shared_test_snowflake()`（**lib 单测进程内唯一**
-    //! 的 generator 对象；为什么不用 test-support 的同名函数见该模块顶部 doc）。根因：
+    //! 的 generator 对象；为什么不用 test-support 的同名函数，见
+    //! `src/shared/test_snowflake.rs` 的模块 doc）。根因：
     //! 位布局 `ts << 22 | instance << 12 | seq` 里 `last_ms` / `sequence` 是 generator
     //! **对象私有**字段、`new()` 从 0 起步 ⇒ 两个 instance 相同、对象不同的 generator
     //! 同毫秒各取 seq 0 会发出逐字节相同的 id（`t_*_pkey` 23505）。instance 这 10 bit

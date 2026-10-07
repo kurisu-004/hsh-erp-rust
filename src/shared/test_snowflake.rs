@@ -38,6 +38,17 @@
 //! generator 的典型）。
 //!
 //! 故「进程内唯一」的正确保证点是**对象共享**，不是 instance 编号。
+//!
+//! ## ⚠️ lib 单测不得碰 test-support 的 generator（2026-10-09 review 第 1 轮 I1）
+//! 上文「本进程内没有任何第二条 id 流」这条不变式**曾经只是注释**，现已由
+//! `crate::shared::snowflake_guard::tests::no_lib_unit_test_pulls_in_a_second_generator`
+//! 变成 CI 强制：扫 `src/**/*.rs`，除本模块与护栏自身外，出现 `hsh_erp_test_support`
+//! 即失败，只放行 `::test_pool` / `::test_redis_url` 两个不碰 generator 的入口。
+//! 理由：一旦 `src/**` 的 `#[cfg(test)]` 调了 test-support 的 `state::*` /
+//! `shared_test_snowflake` / `pool_snowflake`（含 glob 导入），上面那条
+//! `#[cfg(test)] mod tests` 里的 dev-dependency 环就会把**第二个 generator** 拉进同一个
+//! `cargo test --lib` 进程 —— 两个 instance 各自独立派生、**不保证不同** ⇒ 23505 复发，
+//! 而它不是一处 `::new`，规则 1 抓不到。
 
 use std::sync::{Arc, OnceLock};
 
@@ -67,6 +78,13 @@ pub(crate) fn shared_test_snowflake() -> &'static Arc<SnowflakeIdGenerator> {
 /// generator 对象」保证（见模块 doc 与 `test_snowflake_instance` 的根因说明）。
 /// 刻意**不**写死 `instance = 7`：那正是本轮改造前 `dispatch.rs` 7 个 helper 的
 /// 写法，写死的字面量还有 1/1024 概率与别的进程撞上。
+///
+/// ⚠️ **2026-10-09（review 第 1 轮 I2）：本函数与 `test-support/src/pool.rs` 的
+/// `test_snowflake_instance` 是逐字相同的两份，改一必须同步另一份。**
+/// 跨 crate **无编译期保障**（两份代码互不可见），漂移不会让任何测试变红，只会静默
+/// 削弱跨进程撞号保护。两份并存的原因是模块 doc 记的 dev-dependency 环：`test-support`
+/// 链的是**另一份** `hsh_erp_rust`，故把本函数挪进正常 lib 也消不掉第二份。
+/// 收敛手段只能是文档约定 + 双向日期戳（现状：两边已互链）。
 fn test_snowflake_instance() -> u16 {
     static INSTANCE: OnceLock<u16> = OnceLock::new();
     *INSTANCE.get_or_init(|| {

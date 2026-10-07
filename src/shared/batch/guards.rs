@@ -494,7 +494,8 @@ mod tests {
     // 2026-10-09：本模块测试 ID 一律从
     // `crate::shared::test_snowflake::shared_test_snowflake()`（**lib 单测进程内唯一**
     // 的 generator 对象）取号，不再就地 `SnowflakeIdGenerator::new`（为什么不用
-    // test-support 的同名函数见该模块顶部 doc）。原先 `insert_part` 用 instance=9、
+    // test-support 的同名函数，见 `src/shared/test_snowflake.rs` 的模块 doc）。
+    // 原先 `insert_part` 用 instance=9、
     // 两条用例各另起 instance=11 —— 但 instance 不同只是**位段**不同、并非充分保证：
     // `last_ms` / `sequence` 是 generator **对象私有**字段，`new()` 从 0 起步，若两个
     // generator 同 instance 且同毫秒各取 seq 0，会发出逐字节相同的 id ⇒ `t_*_pkey`

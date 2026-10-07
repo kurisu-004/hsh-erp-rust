@@ -35,7 +35,7 @@ pub mod session;
 
 /// 测试用雪花 ID 生成器 —— **lib 单测进程内唯一的同一个 generator 对象**
 /// （`crate::shared::test_snowflake::shared_test_snowflake()`；为什么不用
-/// test-support 的同名函数见该模块顶部 doc）。
+/// test-support 的同名函数，见 `src/shared/test_snowflake.rs` 的模块 doc）。
 ///
 /// 2026-10-09 改造：本函数原先每次调用都 `SnowflakeIdGenerator::new(1_735_689_600_000, 1)`
 /// 现造一个**新对象**。位布局 `ts << 22 | instance << 12 | seq` 里 `last_ms` /

@@ -984,8 +984,9 @@ mod tests {
     use crate::infra::clock::now_naive;
     // 2026-10-09：本模块所有测试 ID 一律从
     // `crate::shared::test_snowflake::shared_test_snowflake()`（**lib 单测进程内唯一**
-    // 的 generator 对象）取号 —— 为什么不用 test-support 的同名函数，见该模块顶部
-    // doc（dev-dependency 环导致 lib 单测二进制里链进两份 `hsh_erp_rust`）。
+    // 的 generator 对象）取号 —— 为什么不用 test-support 的同名函数，见
+    // `src/shared/test_snowflake.rs` 的模块 doc（dev-dependency 环导致 lib 单测二进制里
+    // 链进两份 `hsh_erp_rust`）。
     //
     // 原先这里自带一个 `pool_snowflake()`（`OnceLock<Mutex<SnowflakeIdGenerator>>` +
     // 写死 `instance = 7`），它**不是**修复 23505 的正解，只是把撞号概率往后推：

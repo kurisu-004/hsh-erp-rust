@@ -40,8 +40,12 @@
 //! 2. **匹配范围是「代码字符」而非整段文本** —— 那条规则的 needle（表名）**住在字符串
 //!    里**（SQL 本来就是字符串），必须扫字符串正文；本规则的 needle 只可能出现在代码里，
 //!    按字面量分类排除掉字符串既更准又更简单。
-//! 3. **不静默降级** —— 未闭合注释 / 字符串这类畸形输入一律按代码扫，不试图猜（rustc
-//!    在产物之前就拦住这类输入，护栏读到的真实源码一定是合法 Rust）。
+//! 3. **畸形输入的后果按实际状态机如实记录**（2026-10-09 review 第 1 轮订正）——
+//!    rustc 在产物之前就拦住这类输入，护栏读到的真实源码一定是合法 Rust，故这里没有
+//!    「安全降级」可言。实测两条：**未闭合块注释** ⇒ 其后全部内容被当注释跳过
+//!    （**不可见**，即漏报，已登记在「已知漏报盲区」）；**未闭合字符串 / raw string**
+//!    ⇒ `raw_string_end` / `string_end` 返回 `None`，该字节退回按**代码**处理、其后
+//!    内容照常扫描（**可见**，不漏）。初版此处把两者一并写成「按代码扫」，与实测相反。
 //!
 //! ## 为什么不直接复用 `write_guard_tests::scan_rust`（E2 的判断依据）
 //! `scan_rust` 是 `src/shared/batch/status.rs` 里 `mod write_guard_tests` 的**私有**
@@ -72,6 +76,39 @@
 //!    只登记不修：要覆盖它得解析 impl 块。
 //! 2. **未闭合块注释**会让文件剩余全部内容被当注释跳过，其后的真实构造漏过。属
 //!    「rustc 已先拦下的畸形输入」，是「一律视为缺陷」的例外。
+//! 3. **类型别名 / `use` 重命名**（2026-10-09 review 第 1 轮 M1 补登记）：
+//!    `use …::SnowflakeIdGenerator as G;` 后 `G::new(..)`、或
+//!    `type G = SnowflakeIdGenerator;` 后 `G::new(..)`，源码里都不出现类型名字面量
+//!    ⇒ 漏报。这是**真实漏报**（不是「不可能出现的输入」：起个短别名是自然写法），
+//!    只登记不修：要覆盖得做名字解析。第 1 条（`Self::new`）是它的同类。
+//!
+//! ### 已排除项（不是绕过口，防后人重新打开）
+//! - **`SnowflakeIdGenerator::default()` 不会绕过本规则** —— `src/infra/snowflake.rs`
+//!   **没有** `impl Default`（`SnowflakeIdGenerator` 只有 `new` 一个构造函数），
+//!   故这个输入编译不过。⚠️ 若将来给它加了 `impl Default`，本护栏会**立刻**变成
+//!   漏报且无人察觉 —— 那时必须把 `Default::default` 一并纳入 needle。
+//!
+//! ## 规则 2：`src/**` 不得拉入第二个 generator（`no_lib_unit_test_pulls_in_a_second_generator`）
+//!
+//! 规则 1 治的是「就地 `new` 一个 generator」；但 lib 单测还有**第二条**把第二个
+//! generator 拉进同一进程的路径，且它**不是**一处 `::new`、规则 1 抓不到：
+//! `test-support` 自己也持有 generator（`pool_snowflake` / `shared_test_snowflake`
+//! → `state.rs` 的三个 `test_state*` → `AppState.snowflake`），而 `test-support` 是
+//! `[dev-dependencies]` 且 path-depends 回主 crate（dev-dependency 环，成因与后果见
+//! `SANCTIONED` 的 doc），一旦 `src/**` 的 `#[cfg(test)]` 调了它的任一 generator 入口，
+//! 同一个 `cargo test --lib` 进程里就会出现**两个各自独立派生 instance 的 generator**
+//! —— instance 不保证不同 ⇒ 23505 可复发。
+//!
+//! 因此规则 2 采取**白名单式**判定：`src/**` 的代码区里出现 `hsh_erp_test_support`
+//! 即失败，**只**放行两个不碰 generator 的入口（`::test_pool` / `::test_redis_url`）。
+//! 选白名单而不是「列举危险符号」是刻意的：glob 导入（`use hsh_erp_test_support::*;`）
+//! 与分组导入（`use hsh_erp_test_support::{test_app, test_pool};`）都不含那些符号的
+//! 路径形态，按符号名列举会成片漏；而 test-support 将来新增的任何入口都可能是
+//! generator 携带者，白名单天然覆盖。
+//!
+//! 现状核对：`src/**` 对 test-support 的引用只有 `test_pool` 3 处
+//! （`shared/batch/guards.rs`、`prod/queue/service/{queue,dispatch}.rs`）与
+//! `test_redis_url` 1 处（`wx/wecom_client.rs`，也是 dev-dep 环的制造者）。
 //!
 //! ## 已知精度边界（只会漏报、不会误报，方向上是安全的）
 //! - **字符串 / raw string 正文里的构造字面量不报警** —— 有意：doc 贴旧写法、错误提示
@@ -123,6 +160,23 @@ const SANCTIONED: &[(&str, &str)] = &[
     ),
 ];
 
+/// 被允许就地新建 `SnowflakeIdGenerator` 的文件里，**额外**记「命中处数上限」
+/// （相对 crate 根的路径 → 上限）。
+///
+/// 2026-10-09（review 第 1 轮 M2）：`SANCTIONED` 是**整文件**放行，所以这两个文件里
+/// **将来新增**的构造不会被规则 1 抓到 —— 而 `src/main.rs` 恰恰是生产环境里最危险的一种
+/// 漂移（为了「某个模块单独发号」再建一个 generator ⇒ 同进程两个 generator ⇒ 跨表撞号）。
+/// 上限把口子收窄成「改动会被发现、且必须显式改这个常量」。取值由
+/// `sanctioned_files_stay_within_their_hit_cap` 用本探测器**实测**得出，不是估的。
+///
+/// 只给这两个文件记上限：另两条（两个进程级唯一 ID 源）按定义就该有构造点，上限没有意义。
+const SANCTIONED_HIT_CAPS: &[(&str, usize)] = &[
+    // 生产：唯一一处 —— `main.rs` 的 `Arc::new(SnowflakeIdGenerator::new(config…))`
+    ("src/main.rs", 1),
+    // 被测对象自身：位布局 / sequence 回绕 / epoch / `MAX_INSTANCE` panic 边界等 8 处单测
+    ("src/infra/snowflake.rs", 8),
+];
+
 /// 被探测的构造表达式，**刻意**用 `concat!` 拆开：本文件源码里永不出现连续的完整字面量，
 /// 否则护栏扫到自己的文件时会**自指误报**（同 `shared/batch/status.rs` 的
 /// `NEEDLE_TABLE_WORD`、`shared/domain_guard.rs` 的 `ROOT_SEG` 的同一处理）。
@@ -133,6 +187,27 @@ const NEEDLE_TYPE: &str = concat!("Snowflake", "IdGenerator");
 /// 故直接写字面量即可 —— 必须拆 `concat!` 的只有 `NEEDLE_EXPR`（那行含类型名）。
 const NEEDLE_COLONS: &str = "::";
 const NEEDLE_NEW: &str = "new";
+
+/// 规则 2 的 needle：**test-support 这个 crate 名本身**，同样用 `concat!` 拆开
+/// （理由同上：本文件的失败文案里会出现完整字面量，不拆会自指误报）。
+const NEEDLE_TS_CRATE: &str = concat!("hsh_erp_", "test_support");
+/// 规则 2 放行的两个入口（`NEEDLE_TS_CRATE` 之后必须紧跟其中之一 + 非标识符边界）。
+///
+/// 白名单而非黑名单的理由见模块 doc「规则 2」一节。⚠️ 新增条目前必须回答：
+/// 这个 test-support 入口**会不会构造或取用一个 generator**？会 → 不得进本表。
+const TS_ALLOWED_ENTRIES: &[&str] = &["::test_pool", "::test_redis_url"];
+/// 规则 2 的白名单文件（相对 crate 根）—— 只放行「**提及**」test-support 的位置：
+/// `test_snowflake.rs` 的模块 doc 论证为什么不能用它；本文件的失败文案要告诉人正确写法。
+const TS_SANCTIONED: &[(&str, &str)] = &[
+    (
+        "src/shared/test_snowflake.rs",
+        "模块 doc 里论证「为什么 lib 单测不能用 test-support 的同名函数」（doc 与测试都在本文件内）",
+    ),
+    (
+        "src/shared/snowflake_guard.rs",
+        "失败文案里给出两个允许入口与正确写法（护栏自身，不是被治理对象）",
+    ),
+];
 
 /// 字符分类（`scan_rust` 产出）。
 const KIND_OTHER: u8 = 0; // 空白 / 注释（注释已被等量空格化）
@@ -164,7 +239,16 @@ fn scan_rust(src: &str) -> (Vec<u8>, Vec<u8>) {
         }
         // ---- 块注释（Rust 支持嵌套）----
         if c == b'/' && b.get(i + 1) == Some(&b'*') {
-            let mut depth = 1usize;
+            // 2026-10-09（review 第 1 轮 B1）：`depth` 必须从 **0** 起步，让**开界本身**
+            // 也由下面的内层循环统一计数（`/*` 会命中「嵌套开始」分支）。原先写 `1`
+            // 会把开界重复计一次 ⇒ 实际从 2 起步 ⇒ 配平的 `*/` 只降回 1、
+            // `if depth == 0 { break }` 永不触发 ⇒ 一路扫到 EOF，把该文件里**此后全部
+            // 内容**当成注释跳过（`/* note */` 这种单层块注释就能让整条规则对该文件失效）。
+            // 现状：扫描范围 502 个 `.rs` 里 50 个含真实块注释。
+            // ⚠️ `src/shared/batch/status.rs` 的 `write_guard_tests` 里有一份逐字相同的旧
+            // 拷贝，仍带这个缺陷（对本轮规则无影响、对 batch 护栏当前也无误报），
+            // 已登记为 follow-up，本轮刻意不改那个文件。
+            let mut depth = 0usize;
             while i < b.len() {
                 if b[i] == b'\n' {
                     i += 1;
@@ -402,9 +486,56 @@ fn violations_in(src: &str, rel: &str) -> Vec<String> {
         .collect()
 }
 
+/// 规则 2 的判定：返回 `src/**` 代码区里所有「引用 test-support 且**不是**两个允许入口」
+/// 的**代码行**（1 基行号）。
+///
+/// 判定口径（与规则 1 同源的字面量纪律）：
+/// - 左边界不是标识符字符（`…_hsh_erp_test_support` 不算命中）；
+/// - `NEEDLE_TS_CRATE` 之后允许任意空白再接 `::`（Rust 允许 `crate :: path`，漏掉等于
+///   给后人留后门）；
+/// - 紧跟的两个允许入口（`::test_pool` / `::test_redis_url`）放行，且要求其后不是标识符
+///   字符（`::test_pool_helper` 不算放行）；
+/// - 注释 / 字符串 / raw string 里的提及不报警（doc 里论证「为什么不用它」是允许的）。
+fn test_support_entry_lines(src: &str) -> Vec<usize> {
+    let (out, kind) = scan_rust(src);
+    let mut hits = Vec::new();
+    let mut from = 0usize;
+    while let Some(at) = find_word_at(&out, from, NEEDLE_TS_CRATE.as_bytes()) {
+        from = at + 1;
+        if kind.get(at) != Some(&KIND_CODE) {
+            continue;
+        }
+        let p = skip_ws(&out, at + NEEDLE_TS_CRATE.len());
+        let allowed = TS_ALLOWED_ENTRIES.iter().any(|entry| {
+            let e = entry.as_bytes();
+            if !out[p..].starts_with(e) {
+                return false;
+            }
+            !out.get(p + e.len()).is_some_and(|c| is_ident(*c))
+        });
+        if allowed {
+            continue;
+        }
+        hits.push(1 + out[..at].iter().filter(|c| **c == b'\n').count());
+    }
+    hits
+}
+
+/// 规则 2 的「扫描 + 判定 + 报错」收拢（供测试直接喂假源码）。
+fn ts_violations_in(src: &str, rel: &str) -> Vec<String> {
+    test_support_entry_lines(src)
+        .into_iter()
+        .map(|line| format!("  {rel}:{line}"))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{NEEDLE_EXPR, NEEDLE_TYPE, SANCTIONED, SCAN_ROOTS, collect_rs, violations_in};
+    use super::{
+        NEEDLE_EXPR, NEEDLE_TS_CRATE, NEEDLE_TYPE, SANCTIONED, SANCTIONED_HIT_CAPS, SCAN_ROOTS,
+        TS_ALLOWED_ENTRIES, TS_SANCTIONED, collect_rs, construction_lines, ts_violations_in,
+        violations_in,
+    };
     use std::path::{Path, PathBuf};
 
     fn root() -> PathBuf {
@@ -497,6 +628,26 @@ mod tests {
             "fn a() {{\n    let _x = {NEEDLE_EXPR}(1, 1);\n}}\nfn b() {{\n    let _y = {NEEDLE_EXPR}(1, 2);\n}}\n"
         );
         assert_eq!(violations_in(&two, "t.rs"), vec!["  t.rs:2", "  t.rs:5"]);
+
+        // 5) 2026-10-09（review 第 1 轮 B1 回归）：**块注释之后**的真实构造必须照样抓到。
+        //    这两条是 B1 的守门元测试 —— 初版块注释状态机把开界重复计一次，导致
+        //    `/* … */`（含单层）之后的内容全部被当注释跳过、整条规则对该文件静默失效，
+        //    而当时的元测试用例后面跟的是 `fn demo() {}`（内部无构造）所以照样通过。
+        //    单层：`depth` 从 0 起步后，配平的 `*/` 恰好把它降回 0。
+        let block_then_real = format!(
+            "/* 历史写法：{NEEDLE_EXPR} */\nfn demo() {{\n    let _g = {NEEDLE_EXPR}(0, 1);\n}}\n"
+        );
+        assert_eq!(violations_in(&block_then_real, "t.rs"), vec!["  t.rs:3"]);
+
+        //    嵌套：内层 `/* */` 只把 `depth` 加一减一，**不**该让外层的配平失效。
+        let nested_then_real = format!(
+            "/* a /* b {NEEDLE_EXPR} */ c */\nfn demo() {{\n    let _g = {NEEDLE_EXPR}(0, 1);\n}}\n"
+        );
+        assert_eq!(violations_in(&nested_then_real, "t.rs"), vec!["  t.rs:3"]);
+
+        //    块注释里的字面量仍然不报警（回归：修 B1 不能把块注释变成"什么都报"）
+        let block_only = "/* a /* b */ c */\nfn demo() {}\n".to_string();
+        assert!(violations_in(&block_only, "t.rs").is_empty());
     }
 
     /// 反例：注释 / 字面量 / 只 import 类型 / 更长标识符，都不该报警。
@@ -560,6 +711,225 @@ mod tests {
             msg.contains("哪一类 binary"),
             "缺新增白名单的前置问题：{msg}"
         );
+    }
+
+    // ── 规则 1 的白名单收紧：整文件放行的两个文件另记「命中处数上限」（M2）──────────
+
+    /// `SANCTIONED_HIT_CAPS` 里的文件命中数不得超过上限。
+    ///
+    /// 为什么需要：`SANCTIONED` 是整文件放行，`src/main.rs` 里若将来为了「某个模块单独
+    /// 发号」再建一个 generator（生产环境最危险的漂移），规则 1 不会响。
+    #[test]
+    fn sanctioned_files_stay_within_their_hit_cap() {
+        let root = root();
+        for (rel, cap) in SANCTIONED_HIT_CAPS {
+            let path = root.join(rel);
+            let src = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("读不到 {rel}（上限表指向的文件必须存在）：{e}"));
+            let hits = construction_lines(&src);
+            assert!(
+                hits.len() <= *cap,
+                "{rel} 里有 {} 处就地新建（上限 {cap}，行号 {hits:?}）。\n\
+                 若这是**有意**新增的，请同步调高 `SANCTIONED_HIT_CAPS` 里的上限并写明缘由；\n\
+                 若不是，说明有人在白名单文件里新开了 generator —— 这正是整文件白名单掩盖不了的\
+                 那一类漂移（生产代码里的第二个 generator ⇒ 同进程跨表撞号）。",
+                hits.len()
+            );
+            assert!(
+                !hits.is_empty(),
+                "{rel} 当前 0 处命中：上限条目已失去意义，请从 `SANCTIONED_HIT_CAPS` 移除它"
+            );
+        }
+    }
+
+    // ── 规则 2：`src/**` 不得拉入第二个 generator ────────────────────────────────
+
+    /// `src/**` 的代码区里只允许两个**不碰 generator** 的 test-support 入口。
+    #[test]
+    fn no_lib_unit_test_pulls_in_a_second_generator() {
+        let root = root();
+        let mut acc = Vec::new();
+        collect_rs(&root.join("src"), &mut acc);
+        assert!(
+            !acc.is_empty(),
+            "扫不到 `src/**/*.rs`（CARGO_MANIFEST_DIR={}），规则 2 本身失效",
+            root.display()
+        );
+
+        let mut violations: Vec<String> = Vec::new();
+        for path in &acc {
+            let rel = rel_of(path, &root);
+            if TS_SANCTIONED.iter().any(|(p, _)| *p == rel) {
+                continue;
+            }
+            let Ok(src) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            violations.extend(ts_violations_in(&src, &rel));
+        }
+
+        assert!(
+            violations.is_empty(),
+            "{msg}",
+            msg = ts_failure_message(violations.len(), &violations.join("\n"))
+        );
+    }
+
+    /// 规则 2 的白名单条目不许指向已删除的文件。
+    #[test]
+    fn ts_whitelist_entries_all_exist() {
+        let root = root();
+        let missing: Vec<&str> = TS_SANCTIONED
+            .iter()
+            .map(|(p, _)| *p)
+            .filter(|p| !root.join(p).is_file())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "规则 2 的白名单里这些文件已不存在，请清理 `TS_SANCTIONED` 条目：\n  {}\n\
+             （白名单腐烂 = 真正该被拦的引用会被误放行）",
+            missing.join("\n  ")
+        );
+    }
+
+    /// 元测试（正例）：会拉进第二个 generator 的四种真实写法一律抓到，行号逐个报对。
+    #[test]
+    fn ts_detector_flags_generator_carrying_entries() {
+        // 1) 最直接的一种：拿 test-support 的 AppState 工厂
+        let state = format!("fn demo() {{\n    use {NEEDLE_TS_CRATE}::state::test_state;\n}}\n");
+        assert_eq!(ts_violations_in(&state, "t.rs"), vec!["  t.rs:2"]);
+
+        // 2) 直接调共享 generator（类型不同会 E0308，但一旦有人加 `as` 或换签名就成真事故）
+        let shared =
+            format!("fn demo() {{\n    let _g = {NEEDLE_TS_CRATE}::shared_test_snowflake();\n}}\n");
+        assert_eq!(ts_violations_in(&shared, "t.rs"), vec!["  t.rs:2"]);
+
+        // 3) 分组导入 —— **不含** `::state::` 形态，按符号名列举会成片漏
+        let grouped = format!("use {NEEDLE_TS_CRATE}::{{test_app, test_pool}};\nfn demo() {{}}\n");
+        assert_eq!(ts_violations_in(&grouped, "t.rs"), vec!["  t.rs:1"]);
+
+        // 4) glob 导入 —— 把 `pool_snowflake` / `shared_test_snowflake` 全带进作用域
+        let glob = format!("use {NEEDLE_TS_CRATE}::*;\nfn demo() {{}}\n");
+        assert_eq!(ts_violations_in(&glob, "t.rs"), vec!["  t.rs:1"]);
+
+        // 5) `::` 前后有空白（Rust 允许），不能给后人留后门
+        let spaced = format!("use {NEEDLE_TS_CRATE} :: state :: test_state;\n");
+        assert_eq!(ts_violations_in(&spaced, "t.rs"), vec!["  t.rs:1"]);
+
+        // 6) 本 crate 自己的同名函数**不是**违规（`src/**` 里遍地，必须放行）
+        let own =
+            "fn demo() {\n    let _g = crate::shared::test_snowflake::shared_test_snowflake();\n}\n"
+                .to_string();
+        assert!(ts_violations_in(&own, "t.rs").is_empty());
+    }
+
+    /// 元测试（反例）：两个允许入口、注释 / doc / 字符串里的提及，都不报警。
+    #[test]
+    fn ts_detector_allows_pool_and_redis_url_and_prose() {
+        // 1) 两个允许入口（现状 `src/**` 对 test-support 的全部 4 处引用）
+        for entry in TS_ALLOWED_ENTRIES {
+            let ok = format!("use {NEEDLE_TS_CRATE}{entry};\n");
+            assert!(
+                ts_violations_in(&ok, "t.rs").is_empty(),
+                "允许入口 {entry} 被误报"
+            );
+        }
+        let called =
+            format!("fn demo() {{\n    let _u = {NEEDLE_TS_CRATE}::test_redis_url();\n}}\n");
+        assert!(ts_violations_in(&called, "t.rs").is_empty());
+
+        // 2) 名字更长的东西不是允许入口（`::test_pool_helper` 不该被放行）
+        let longer = format!("use {NEEDLE_TS_CRATE}::test_pool_helper;\n");
+        assert_eq!(ts_violations_in(&longer, "t.rs"), vec!["  t.rs:1"]);
+
+        // 3) 前缀更长的 crate 名不是命中（`my_hsh_erp_test_support`）
+        let prefixed = format!("use my_{NEEDLE_TS_CRATE}::state::test_state;\n");
+        assert!(ts_violations_in(&prefixed, "t.rs").is_empty());
+
+        // 4) 行注释 / 文档注释 / 字符串 / raw string 里的提及（论证性文字）不报警
+        let line_comment = format!("// 2026-10-09：不要用 {NEEDLE_TS_CRATE}::state，dev-dep 环\n");
+        assert!(ts_violations_in(&line_comment, "t.rs").is_empty());
+        let doc_comment = format!("//! 不能用 {NEEDLE_TS_CRATE}::state::test_state\n");
+        assert!(ts_violations_in(&doc_comment, "t.rs").is_empty());
+        let string = format!("fn demo() {{\n    let m = \"{NEEDLE_TS_CRATE}::state\";\n}}\n");
+        assert!(ts_violations_in(&string, "t.rs").is_empty());
+        let raw = format!("fn demo() {{\n    let d = r#\"{NEEDLE_TS_CRATE}::state\"#;\n}}\n");
+        assert!(ts_violations_in(&raw, "t.rs").is_empty());
+    }
+
+    /// 规则 2 的失败信息要给出「哪两个入口被允许 + 正确写法 + 成因」。
+    #[test]
+    fn ts_failure_message_carries_guidance() {
+        let msg = ts_failure_message(1, "  src/demo.rs:42");
+        assert!(msg.contains("src/demo.rs:42"), "缺 file:line：{msg}");
+        assert!(
+            msg.contains("crate::shared::test_snowflake::shared_test_snowflake()"),
+            "缺正确写法：{msg}"
+        );
+        assert!(msg.contains("::test_pool"), "缺允许入口：{msg}");
+        assert!(msg.contains("::test_redis_url"), "缺允许入口：{msg}");
+        assert!(msg.contains("23505"), "缺后果说明：{msg}");
+        assert!(
+            msg.contains("dev-dependency 环"),
+            "缺成因（为什么 lib 单测不能用它）：{msg}"
+        );
+    }
+
+    /// 规则 2 的失败信息正文。
+    fn ts_failure_message(n: usize, list: &str) -> String {
+        let mut lines = vec![
+            format!(
+                "以下 {n} 处让 `src/**`（即 lib 单测 binary）引用了 `{NEEDLE_TS_CRATE}` 的\
+                 非白名单入口："
+            ),
+            list.to_string(),
+            String::new(),
+            "为什么违规 —— `test-support` 自己持有 generator（`pool_snowflake` /"
+                .to_string(),
+            "`shared_test_snowflake` → `state.rs` 的 `test_state*` → `AppState.snowflake`）。而它是"
+                .to_string(),
+            "`[dev-dependencies]` 且 path-depends 回主 crate，构成 **dev-dependency 环**：编译"
+                .to_string(),
+            "`cargo test --lib` 时同一个二进制里链进**两份** `hsh_erp_rust`。一旦 lib 单测碰了"
+                .to_string(),
+            "它的 generator 入口，同一进程里就有**两个各自独立派生 instance 的 generator** ——"
+                .to_string(),
+            "instance 不保证不同 ⇒ 同 instance + 同毫秒 + 同 seq ⇒ **逐字节相同的 id** ⇒"
+                .to_string(),
+            "`23505 duplicate key ... t_*_pkey`。注意这条**不是**「就地 `new`」，规则 1 抓不到，"
+                .to_string(),
+            "所以单独立一条规则。".to_string(),
+            String::new(),
+            "允许的入口只有两个（它们都不构造 / 不取用 generator），见 `TS_ALLOWED_ENTRIES`："
+                .to_string(),
+        ];
+        for entry in TS_ALLOWED_ENTRIES {
+            lines.push(format!("  * `{NEEDLE_TS_CRATE}{entry}`"));
+        }
+        lines.push(
+            "  * 需要 generator 时 → `crate::shared::test_snowflake::shared_test_snowflake()`"
+                .to_string(),
+        );
+        lines.push(
+            "    （lib 单测进程内唯一的那个对象；⚠️ 不能用 test-support 的同名函数 —— \
+             dev-dependency 环让该二进制里链进两份 `hsh_erp_rust`，两个 \
+             `SnowflakeIdGenerator` 是**不同类型**，传参即 E0308）"
+                .to_string(),
+        );
+        lines.push(String::new());
+        lines.push(format!(
+            "白名单（`src/shared/snowflake_guard.rs::TS_SANCTIONED`，共 {} 项）：",
+            TS_SANCTIONED.len()
+        ));
+        for (path, why) in TS_SANCTIONED {
+            lines.push(format!("  * `{path}` —— {why}"));
+        }
+        lines.push(
+            "⚠️ 新增允许入口前**必须先回答**：这个 test-support 入口会不会构造或取用一个 \
+             generator？会 → 不得进 `TS_ALLOWED_ENTRIES`。"
+                .to_string(),
+        );
+        lines.join("\n")
     }
 
     /// 失败信息正文（主护栏与 `failure_message_carries_guidance` 共用，避免两处漂移）。
