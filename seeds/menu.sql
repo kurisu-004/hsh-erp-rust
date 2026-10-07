@@ -47,7 +47,8 @@ WHERE deleted_at IS NOT NULL
     'outsource_list', 'floor_group', 'settings_root',
     -- 子菜单
     'parts_list', 'parts_new', 'assemblies_list', 'delivery_notes_manage',
-    'inspection_pending', 'delivery_dispatch', 'repair_receive',
+    -- 2026-10-08 下线 delivery_dispatch：端点已删，故意留在复活清单外
+    'inspection_pending', 'repair_receive',
     'workers_list', 'users_list', 'shelves_list',
     'customers_list', 'applicants_list',
     'outsource_companies_list', 'outsource_quotes_list', 'outsource_send_receive_list',
@@ -101,7 +102,6 @@ INSERT INTO t_menu (
     (9000000000000103, (SELECT id FROM t_menu WHERE code = 'order_group'         AND deleted_at IS NULL), 'assemblies_list',           '装配件一览',    '/assemblies',                  'Connection',   30, true, 0, now(), 0, now(), 0),
     (9000000000000104, (SELECT id FROM t_menu WHERE code = 'order_group'         AND deleted_at IS NULL), 'delivery_notes_manage',     '送货单',        '/delivery-notes',              'Document',     30, true, 0, now(), 0, now(), 0),
     -- 2026-09-29 移除：inspection_pending 从 order_group 移到 production_group 下；sort_order 50 → 30。
-    (9000000000000106, (SELECT id FROM t_menu WHERE code = 'order_group'         AND deleted_at IS NULL), 'delivery_dispatch',         '送货',          '/delivery-dispatch',           'Van',          60, true, 0, now(), 0, now(), 0),
     (9000000000000107, (SELECT id FROM t_menu WHERE code = 'order_group'         AND deleted_at IS NULL), 'repair_receive',            '返修接收',      '/repair/receive',              'Tools',        65, true, 0, now(), 0, now(), 0),
 
     -- auth_group 下（含 025 把 shelves_list 从 floor_group 移入）
@@ -182,6 +182,22 @@ SET is_active  = false,
     version    = version + 1
 WHERE code = 'assemblies_list' AND deleted_at IS NULL AND is_active = true;
 
+-- 3.5 delivery_dispatch 整条下线（2026-10-08）：com::delivery_note 域把「待司机领取
+--     一览」（GET /pickup-pending）与「送货台逐件扫码核销」（POST /{id}/pickup-scan）
+--     两条端点删掉了，前端目标页 /delivery-dispatch 仍在（删页属前端仓范围）⇒ 不下线
+--     的话是「菜单能点进去、页面能打开、每个请求都 404」的活条目。
+--     走「seed 不再声明 + 显式软删」而不是硬删：t_menu.code 的唯一索引是
+--     uk_t_menu_code WHERE deleted_at IS NULL，硬删会与 4.6 段 `m.deleted_at IS NOT
+--     NULL` 的 role_menu 回收、以及本文件 §0 的复活机制三方打架。
+--     配套：§0 复活清单已移除该 code、§4.1 / §4.3 白名单已移除、4.6 段负责回收存量
+--     role_menu 行。
+UPDATE t_menu
+SET deleted_at = now(),
+    is_active  = false,
+    updated_at = now(),
+    version    = version + 1
+WHERE code = 'delivery_dispatch' AND deleted_at IS NULL;
+
 -- ============================================================================
 -- 第 4 节：角色授权（t_role_menu）
 -- ============================================================================
@@ -200,7 +216,7 @@ WHERE m.code IN (
     'home', 'production_stats',
     'customer_management', 'customers_list', 'applicants_list',
     'order_group', 'parts_list', 'parts_new', 'delivery_notes_manage',
-    'inspection_pending', 'delivery_dispatch', 'repair_receive',
+    'inspection_pending', 'repair_receive',
     'assemblies_list',
     'pending_programming',
     'production_group', 'process_work_type', 'part_process_chain', 'worker_queue',
@@ -255,7 +271,7 @@ WHERE m.code IN (
     -- 丢了会变孤儿节点被 build_menu_tree 提升为顶级。
     'production_group',
     'outsource_send_receive_list',
-    'inspection_pending', 'delivery_dispatch', 'repair_receive'
+    'inspection_pending', 'repair_receive'
 )
 AND m.deleted_at IS NULL
 ON CONFLICT (role, menu_id) WHERE deleted_at IS NULL DO NOTHING;
@@ -284,12 +300,14 @@ WHERE m.code IN ('home', 'scan_badge', 'floor_group')
   AND m.deleted_at IS NULL
 ON CONFLICT (role, menu_id) WHERE deleted_at IS NULL DO NOTHING;
 
--- 4.6 清理：seed 删的菜单（settings_root + 3 子菜单 + assemblies_new 等）相关 role_menu 一并清
+-- 4.6 清理：seed 删的菜单（settings_root + 3 子菜单 + assemblies_new + 2026-10-08
+--     下线的 delivery_dispatch 等）相关 role_menu 一并清
 --     （即便菜单软删，role_menu 残留不影响功能，但显式清理便于审计）
 DELETE FROM t_role_menu rm
 USING t_menu m
 WHERE rm.menu_id = m.id
-  AND m.code IN ('settings_root', 'work_types_list', 'processes_list', 'work_type_processes_list')
+  AND m.code IN ('settings_root', 'work_types_list', 'processes_list', 'work_type_processes_list',
+                 'delivery_dispatch')
   AND m.deleted_at IS NOT NULL;
 
 -- ============================================================================

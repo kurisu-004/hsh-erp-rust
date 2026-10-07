@@ -33,11 +33,14 @@ use crate::state::AppState;
 
 /// 打印路径判定：命中则走长档超时（`print_request_timeout_seconds`）。
 ///
-/// 命中的 4 条打印路径（`{id}` 为变段）：
-/// - `POST /api/v2/delivery-notes/{id}/print`
-/// - `POST /api/v2/delivery-notes/{id}/print-labels`
-/// - `GET  /api/v2/parts/{id}/print-drawing`
+/// 命中的 2 条打印路径（`{id}` 为变段）：
+/// - `GET /api/v2/parts/{id}/print-drawing`
 /// - `POST /api/v2/parts/print-drawing-batch`（静态段，无 `{id}`）
+///
+/// ⚠️ 2026-10-08：送货单的两条打印路径（`{id}/print` / `{id}/print-labels`）随
+/// 打印链路下线一并移除，故本判定表不再有送货单分支。历史上它是 `["delivery-notes",
+/// id, action]` 三段匹配；域平移到 `com/delivery/note` 后路径变成 5 段，本就不会
+/// 命中 —— 与其留一段永不生效的分支，不如删干净。
 ///
 /// ## 路径前缀为什么要 strip
 /// 与 `crate::auth::middleware::is_public_path` 同一处理：生产是 `/api/v2` nest，
@@ -61,13 +64,6 @@ pub fn is_print_path(path: &str) -> bool {
         ["parts", "print-drawing-batch"] => true,
         // `GET /parts/{id}/print-drawing`（3 段，中间是变段 id）
         ["parts", id, "print-drawing"] if !id.is_empty() => true,
-        // `POST /delivery-notes/{id}/print` 与 `/print-labels`
-        //（3 段，中间是变段 id，尾段必须逐字命中两个打印动作之一）
-        ["delivery-notes", id, action]
-            if !id.is_empty() && matches!(*action, "print" | "print-labels") =>
-        {
-            true
-        }
         _ => false,
     }
 }
@@ -126,12 +122,10 @@ pub async fn timeout_middleware(
 mod tests {
     use super::*;
 
-    /// 4 条打印路径各自命中（带 `/api/v2` 前缀的生产形态）。
+    /// 2 条打印路径各自命中（带 `/api/v2` 前缀的生产形态）。
     #[test]
     fn print_paths_are_recognized() {
         for p in [
-            "/api/v2/delivery-notes/1234567890/print",
-            "/api/v2/delivery-notes/1234567890/print-labels",
             "/api/v2/parts/1234567890/print-drawing",
             "/api/v2/parts/print-drawing-batch",
         ] {
@@ -142,12 +136,7 @@ mod tests {
     /// 集成测试形态（`test_app` 直接挂 `v2_router`，无 `/api/v2` 前缀）同样命中。
     #[test]
     fn print_paths_are_recognized_without_api_v2_prefix() {
-        for p in [
-            "/delivery-notes/1/print",
-            "/delivery-notes/1/print-labels",
-            "/parts/1/print-drawing",
-            "/parts/print-drawing-batch",
-        ] {
+        for p in ["/parts/1/print-drawing", "/parts/print-drawing-batch"] {
             assert!(is_print_path(p), "应命中打印长档（无前缀形态）：{p}");
         }
     }
@@ -160,8 +149,6 @@ mod tests {
     fn lookalike_non_print_paths_are_rejected() {
         for p in [
             // 前缀相似、后缀不同
-            "/api/v2/delivery-notes/1/print-preview",
-            "/api/v2/delivery-notes/1/prints",
             "/api/v2/parts/1/print-drawing-preview",
             "/api/v2/parts/1/print",
             "/api/v2/parts/1/print-drawing-batch",
@@ -173,8 +160,6 @@ mod tests {
             // 段数不足（缺变段 id / 缺动作段）
             "/api/v2/parts/print",
             "/api/v2/parts/print-drawing",
-            "/api/v2/delivery-notes/print",
-            "/api/v2/delivery-notes",
             // 其它无关路径
             "/api/v2/parts/1/update",
             "/api/v2/parts/batch",
@@ -195,7 +180,7 @@ mod tests {
             Duration::from_secs(660)
         );
         assert_eq!(
-            select_timeout("/api/v2/delivery-notes/1/print-labels", 30, 660),
+            select_timeout("/api/v2/parts/1/print-drawing", 30, 660),
             Duration::from_secs(660)
         );
         assert_eq!(

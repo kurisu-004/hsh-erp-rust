@@ -292,7 +292,7 @@ pub mod code {
     pub const BIZ_DELIVERY_NOTE_DRIVER_INVALID: i32 = 21409; // 司机非送货司机 / 不活跃
     pub const BIZ_DELIVERY_NOTE_SCAN_INCOMPLETE: i32 = 21410; // pickup 时还没扫齐
     pub const BIZ_DELIVERY_NOTE_INVALID_VALUE: i32 = 21411; // 空单 / 等其他非法入参
-    pub const BIZ_DELIVERY_NOTE_PARTS_LOCKED: i32 = 21412; // SUBMITTED/PICKED_UP 后禁止 add_parts / remove_parts
+    pub const BIZ_DELIVERY_NOTE_PARTS_LOCKED: i32 = 21412; // SUBMITTED/PICKED_UP 后禁止 add_parts / remove_batches
     pub const BIZ_DELIVERY_GROUP_NOT_FOUND: i32 = 21413; // 找不到指定的送货分组 / 已软删
     pub const BIZ_DELIVERY_GROUP_DUPLICATE_NAME: i32 = 21414; // 同 L1 下分组重名
     pub const BIZ_DELIVERY_GROUP_MEMBER_CONFLICT: i32 = 21415; // L2 已属于其他活跃分组

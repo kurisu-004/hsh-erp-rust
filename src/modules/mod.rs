@@ -22,7 +22,6 @@ pub mod cnc_program;
 // URL 迁移到 `/api/v2/com/*`（见本文件 `v2_router` 与 `com/mod.rs`）。
 pub mod com;
 pub mod dashboard;
-pub mod delivery_note;
 // 2026-09-28 新增 files 域：薄壳鉴权转发端点（`POST /api/v2/files/sts-tmp-keys` → python `/api/v1/files/sts-tmp-keys`）。
 // 修复 python STS 端口裸开鉴权漏洞：rust 端强制 JWT + Role 鉴权后再转发。
 pub mod files;
@@ -126,8 +125,6 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // prod::queue` 同源 —— `pool` 只覆盖了「候选池」一块，而本 nest 返回的是
         // 「候选 + 公司列 + 内联在途批次」的整块看板与它的移动写端点。
         .nest("/outsource-queue", outsource::queue_router())
-        .nest("/delivery-notes", delivery_note::router())
-        .nest("/delivery-groups", p1_router())
         .nest("/statistics", statistics::router())
         // 2026-09-28 新增：微信小程序 BFF 域（聚合端点 + 复用 IAM 鉴权）
         .nest("/wx", wx::router())
@@ -159,9 +156,4 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
 /// `/ws/*` WebSocket 入口（当前仅 dashboard 大屏）
 pub fn ws_router() -> Router<Arc<AppState>> {
     dashboard::router()
-}
-
-/// P1 送货分组 router re-export（供 `/api/v2/delivery-groups` nest 使用）
-pub fn p1_router() -> Router<Arc<AppState>> {
-    delivery_note::handler::p1_router()
 }

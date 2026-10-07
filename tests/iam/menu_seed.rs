@@ -89,8 +89,11 @@
 //!
 //! 下面 5 份 `*_EXPECTED` 快照是**逐条读 `seeds/menu.sql` 第 4.1-4.5 段白名单推导**的，
 //! 不是「跑一遍 DB 打印出来」的：
-//! - 白名单里的 `settings_root` 被第 3.1 节 soft-delete，而 4.x 段的 INSERT 带
-//!   `AND m.deleted_at IS NULL`，故它不入库（MANAGER 白名单 30 项 → 实际 29 项）；
+//! - 白名单里的 `settings_root`（第 3.1 节）与 `delivery_dispatch`（第 3.5 节，
+//!   2026-10-08 随 `GET /pickup-pending` + `POST /{id}/pickup-scan` 端点下线）被
+//!   soft-delete，而 4.x 段的 INSERT 带 `AND m.deleted_at IS NULL`，故二者都不入库；
+//! - `delivery_dispatch` 同时已从 4.1 / 4.3 白名单移除，两处都要改 —— 只改一处会让
+//!   本用例的断言 A（live == 白名单 − 软删）报「多出 / 缺失」而红，这是有意的 fail-loud；
 //! - `floor_group` 只被第 3.2 段置 `is_active = false`（不软删），仍进授权表；
 //! - 4.6 段 `DELETE` 会硬删 `settings_root` 等已软删菜单的 role_menu 行。
 //!
@@ -133,15 +136,15 @@ const MENU_SEED_SQL: &str = include_str!("../../seeds/menu.sql");
 /// 2026-10-05 收紧的 3 个目标 menuCode。
 const TARGET_CODES: [&str; 3] = ["process_work_type", "part_process_chain", "worker_queue"];
 
-/// `seeds/menu.sql` 第 4.1 段 MANAGER 白名单去掉 `settings_root`（第 3.1 节已 soft-delete）
-/// 后的全量 live 授权 code 快照，**29 项**。
+/// `seeds/menu.sql` 第 4.1 段 MANAGER 白名单去掉两条已 soft-delete 的菜单
+/// （第 3.1 节的 `settings_root`、第 3.5 节的 `delivery_dispatch`）后的全量 live 授权
+/// code 快照，**28 项**。
 const MANAGER_EXPECTED: &[&str] = &[
     "applicants_list",
     "assemblies_list",
     "auth_group",
     "customer_management",
     "customers_list",
-    "delivery_dispatch",
     "delivery_notes_manage",
     "floor_group",
     "home",
@@ -188,11 +191,11 @@ const CLERK_EXPECTED: &[&str] = &[
     "worker_queue",
 ];
 
-/// 第 4.3 段 INSPECTOR 白名单，**9 项**（2026-10-05 已剔除 3 个生产管理子菜单；
-/// `production_group` / `inspection_pending` 保留）。
+/// 第 4.3 段 INSPECTOR 白名单，**8 项**（2026-10-05 已剔除 3 个生产管理子菜单；
+/// 2026-10-08 `delivery_dispatch` 整条下线后也不再出现；`production_group` /
+/// `inspection_pending` 保留）。
 const INSPECTOR_EXPECTED: &[&str] = &[
     "assemblies_list",
-    "delivery_dispatch",
     "delivery_notes_manage",
     "home",
     "inspection_pending",
@@ -208,7 +211,7 @@ const CNC_PROGRAMMER_EXPECTED: &[&str] = &["home", "parts_list", "pending_progra
 /// 第 4.5 段 SHELF_ACCOUNT 白名单，**3 项**。
 const SHELF_ACCOUNT_EXPECTED: &[&str] = &["floor_group", "home", "scan_badge"];
 
-/// 5 份快照 = 29 + 16 + 9 + 3 + 3 = **60 条 live 授权**。
+/// 5 份快照 = 28 + 16 + 8 + 3 + 3 = **58 条 live 授权**。
 const EXPECTED_SNAPSHOT: [(&str, &[&str]); 5] = [
     ("MANAGER", MANAGER_EXPECTED),
     ("CLERK", CLERK_EXPECTED),

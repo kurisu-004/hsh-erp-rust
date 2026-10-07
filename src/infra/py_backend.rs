@@ -9,23 +9,24 @@
 //! | v2（rust 对外） | v1（python） | 业务错误码 |
 //! |---|---|---|
 //! | `POST /api/v2/files/sts-tmp-keys` | `POST /api/v1/files/sts-tmp-keys` | `BIZ_STS_FORWARD_FAILED` = 20406 |
-//! | `POST /api/v2/delivery-notes/{id}/print` | `POST /api/v1/delivery-notes/{id}/print` | `BIZ_PRINT_FORWARD_FAILED` = 20407 |
-//! | `POST /api/v2/delivery-notes/{id}/print-labels` | `POST /api/v1/delivery-notes/{id}/print-labels` | 同上 |
-//! | `GET /api/v2/parts/{id}/print-drawing` | `GET /api/v1/parts/{id}/print` | 同上 |
+//! | `GET /api/v2/parts/{id}/print-drawing` | `GET /api/v1/parts/{id}/print` | `BIZ_PRINT_FORWARD_FAILED` = 20407 |
 //! | `POST /api/v2/parts/print-drawing-batch` | `POST /api/v1/parts/print-batch` | 同上 |
 //!
 //! v2 → v1 的 URL 拼装**只存在于 [`HttpPyBackend`] 的 impl 里**（每方法 1 行
-//! `format!`）；后两条零件端点与 python 端路径不同名（`print-drawing` → `print`、
+//! `format!`）；零件端点与 python 端路径不同名（`print-drawing` → `print`、
 //! `print-drawing-batch` → `print-batch`），映射差异集中在那两行，改名只动那里。
 //!
-//! ## 为什么打印不重新实现
-//! 打印的 4 个真实渲染动作——PDF 光栅化、pikepdf 合并、ReportLab 条码背面、
-//! openpyxl 填送货单模板——全在 python 侧。rust 端只提供「必须带 JWT 才能打印」
-//! 这道闸门 + 一条能撑住分钟级耗时的通道，重写渲染等于把两套渲染实现长期并存。
+//! ## 2026-10-08：送货单打印转发整体下线
+//!
+//! `forward_delivery_note_print` / `forward_delivery_note_labels` 两个方法
+//! （trait 声明 + `HttpPyBackend` impl + `NoopPyBackend` 分支 + `MockPyBackendClient`
+//! 的 expect 块）与对应注释全部删除：送货单 xlsx 改由前端 **hucre 本地生成**，后端
+//! 不再持有这条 python 依赖。零件图纸打印的两个方法**保留**（PDF 光栅化 / pikepdf
+//! 合并仍在 python 侧）。
 //!
 //! ## 两档超时
 //! STS 档缺省 10s、打印档缺省 600s，相差 60 倍，client 级单一 timeout 表达不了：
-//! [`HttpPyBackend`] 存两档，打印 4 个方法用 `RequestBuilder::timeout` 逐请求覆盖
+//! [`HttpPyBackend`] 存两档，打印方法用 `RequestBuilder::timeout` 逐请求覆盖
 //! client 默认值。打印档换算成秒后必须严格小于
 //! [`AppConfig::print_request_timeout_seconds`](crate::infra::config::AppConfig::print_request_timeout_seconds)，
 //! 否则先到点的是 rust，python 的真实错误被 408 掩盖。
@@ -77,26 +78,6 @@ pub trait PyBackendClient: Send + Sync {
     /// 失败（网络层超时 / 连接拒 / 读 body 失败）→ 502 + `BIZ_STS_FORWARD_FAILED`。
     async fn forward_sts_tmp_keys(
         &self,
-        body: Value,
-        headers: HeaderMap,
-    ) -> Result<PyBackendResponse, AppError>;
-
-    /// 2026-10-03 新增：送货单打印转发 → python `POST /api/v1/delivery-notes/{id}/print`。
-    ///
-    /// `body` 是 `Json<Value>` 原样透传：前端发的雪花 ID 是 string（> 2^53），
-    /// rust 侧不定义强类型 DTO、不解析字段，由 python 侧 `parse_snowflake_id` 解析。
-    async fn forward_delivery_note_print(
-        &self,
-        note_id: &str,
-        body: Value,
-        headers: HeaderMap,
-    ) -> Result<PyBackendResponse, AppError>;
-
-    /// 2026-10-03 新增：送货单标签打印转发
-    /// → python `POST /api/v1/delivery-notes/{id}/print-labels`。
-    async fn forward_delivery_note_labels(
-        &self,
-        note_id: &str,
         body: Value,
         headers: HeaderMap,
     ) -> Result<PyBackendResponse, AppError>;
@@ -360,49 +341,6 @@ impl PyBackendClient for HttpPyBackend {
         .await
     }
 
-    async fn forward_delivery_note_print(
-        &self,
-        note_id: &str,
-        body: Value,
-        headers: HeaderMap,
-    ) -> Result<PyBackendResponse, AppError> {
-        // 2026-10-03 新增。v2 `POST /delivery-notes/{id}/print` 与 python 端同名同路径段。
-        let url = format!("{}/api/v1/delivery-notes/{note_id}/print", self.base_url);
-        self.send(
-            reqwest::Method::POST,
-            url,
-            Some(body),
-            None,
-            headers,
-            self.print_timeout,
-            code::BIZ_PRINT_FORWARD_FAILED,
-        )
-        .await
-    }
-
-    async fn forward_delivery_note_labels(
-        &self,
-        note_id: &str,
-        body: Value,
-        headers: HeaderMap,
-    ) -> Result<PyBackendResponse, AppError> {
-        // 2026-10-03 新增。v2 `POST /delivery-notes/{id}/print-labels` 与 python 端同名。
-        let url = format!(
-            "{}/api/v1/delivery-notes/{note_id}/print-labels",
-            self.base_url
-        );
-        self.send(
-            reqwest::Method::POST,
-            url,
-            Some(body),
-            None,
-            headers,
-            self.print_timeout,
-            code::BIZ_PRINT_FORWARD_FAILED,
-        )
-        .await
-    }
-
     async fn forward_part_print_pdf(
         &self,
         part_id: &str,
@@ -470,32 +408,6 @@ impl PyBackendClient for NoopPyBackend {
         warn!("[NoopPyBackend] 跳过真实转发（PYTHON_BACKEND_ENABLED=false，本地调试）");
         Err(AppError::biz(
             code::BIZ_STS_FORWARD_FAILED,
-            "PYTHON_BACKEND_BASE_URL 未配置（NoopPyBackend 占位）",
-        ))
-    }
-
-    async fn forward_delivery_note_print(
-        &self,
-        _note_id: &str,
-        _body: Value,
-        _headers: HeaderMap,
-    ) -> Result<PyBackendResponse, AppError> {
-        warn!("[NoopPyBackend] 跳过送货单打印转发（PYTHON_BACKEND_ENABLED=false）");
-        Err(AppError::biz(
-            code::BIZ_PRINT_FORWARD_FAILED,
-            "PYTHON_BACKEND_BASE_URL 未配置（NoopPyBackend 占位）",
-        ))
-    }
-
-    async fn forward_delivery_note_labels(
-        &self,
-        _note_id: &str,
-        _body: Value,
-        _headers: HeaderMap,
-    ) -> Result<PyBackendResponse, AppError> {
-        warn!("[NoopPyBackend] 跳过送货单标签打印转发（PYTHON_BACKEND_ENABLED=false）");
-        Err(AppError::biz(
-            code::BIZ_PRINT_FORWARD_FAILED,
             "PYTHON_BACKEND_BASE_URL 未配置（NoopPyBackend 占位）",
         ))
     }
