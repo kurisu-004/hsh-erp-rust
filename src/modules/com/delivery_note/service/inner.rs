@@ -23,7 +23,7 @@ use crate::shared::error::{AppError, code};
 
 use super::super::model::DeliveryNote;
 use super::super::vo::{DeliveryNoteDetailOut, DeliveryNoteLineItem, DeliveryNoteOut};
-use super::note_shippable_sets;
+use super::shippable_sets::note_shippable_sets;
 
 // ===========================================================================
 //  types
@@ -122,15 +122,11 @@ pub(super) async fn build_note_outs(
             status: n.status.clone(),
             submitted_at: n.submitted_at,
             picked_up_at: n.picked_up_at,
-            submitted_by: n.submitted_by,
-            picked_up_by: n.picked_up_by,
-            driver_worker_id: n.driver_worker_id,
             driver_worker_name,
             part_count,
             note: n.note.clone(),
             delivery_date: n.delivery_date,
             created_at: n.created_at,
-            updated_at: n.updated_at,
         });
     }
     Ok(out)
@@ -238,7 +234,6 @@ pub(super) async fn get_with_parts(
             drawing_no: p.drawing_no.clone(),
             name: p.name.clone(),
             quantity: b.quantity,
-            is_urgent: false, // TPart 当前投影不含该列
             status: b.status.clone(),
             applicant_name: Some(p.applicant_name.clone()).filter(|s| !s.is_empty()),
             request_date: Some(p.request_date),
@@ -249,8 +244,6 @@ pub(super) async fn get_with_parts(
             customer_name: leaf_name,
             parent_customer_name: parent_name,
             customer_path: path,
-            is_scanned: false,
-            scanned: false,
             assembly_id: asm.map(|a| a.id),
             assembly_serial_no: asm.and_then(|a| a.serial_no.clone()),
             assembly_drawing_no: asm.map(|a| a.drawing_no.clone()),
@@ -268,7 +261,6 @@ pub(super) async fn get_with_parts(
     Ok(DeliveryNoteDetailOut {
         head,
         line_items: items,
-        scanned_serials: vec![],
     })
 }
 

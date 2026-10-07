@@ -4,8 +4,6 @@
 //! - `crud.rs` —— 基础 CRUD：list / get / update / remove-batches / soft-delete /
 //!   batch-detail + 送货分组 CRUD
 //! - `lifecycle.rs` —— 状态机转换：submit / recall / pickup
-//! - `print.rs` —— 打印：print / print-labels（读本单批次算装配件可出货套数后
-//!   BFF 转发到 python 执行渲染）
 //! - `scan.rs` —— 扫码：`GET /scan/{serial_no}` 三层树（纯读）+ `POST /scan`
 //!   入单（唯一入口）
 //!
@@ -14,6 +12,13 @@
 //! `/pickup-pending`）**必须先于** `/{id}` 注册，否则 axum 会在 nest 构建期直接
 //! panic（不是运行期 404）。新增 1 段静态端点时照本段顺序插入，且同步
 //! [`ROUTES`]。
+//!
+//! ## 2026-10-08：打印链路整体下线
+//!
+//! `POST /{id}/print` 与 `POST /{id}/print-labels` 两条端点、`handler/print.rs`
+//! 整个文件（227 行）、`infra::py_backend` 的两个 forward 方法与 Noop 分支全部
+//! 删除。xlsx 渲染改由前端 **hucre 本地生成**，后端不再持有 python 转发依赖，
+//! `print_forward` 的送货单 11 个注入用例一并删除。
 //!
 //! ## 约定（2026-09-22 D-5 + review 第 1 轮）
 //! - 事务边界在 handler：`state.pool.begin()` → 借 `&mut *tx` 喂给 service → 显式
@@ -33,7 +38,6 @@
 
 pub mod crud;
 pub mod lifecycle;
-pub mod print;
 pub mod scan;
 
 use axum::Router;
@@ -62,8 +66,6 @@ pub const ROUTES: &[&str] = &[
     "POST /{id}/driver",
     "POST /{id}/pickup",
     "POST /{id}/soft-delete",
-    "POST /{id}/print",
-    "POST /{id}/print-labels",
     "GET /{id}",
 ];
 
@@ -102,8 +104,6 @@ pub fn note_router() -> Router<Arc<AppState>> {
         .route("/{id}/driver", post(lifecycle::set_driver))
         .route("/{id}/pickup", post(lifecycle::pickup_delivery_note))
         .route("/{id}/soft-delete", post(crud::soft_delete_delivery_note))
-        .route("/{id}/print", post(print::print_delivery_note))
-        .route("/{id}/print-labels", post(print::print_labels))
         .route("/{id}", get(crud::get_delivery_note))
 }
 

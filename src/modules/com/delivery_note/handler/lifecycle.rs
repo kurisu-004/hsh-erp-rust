@@ -169,7 +169,7 @@ pub async fn pickup_delivery_note(
         "delivery_note_id": out.id,
         "delivery_note_no": out.delivery_note_no,
         "part_count": out.part_count,
-        "driver_worker_id": out.driver_worker_id,
+        "driver_worker_name": out.driver_worker_name,
     });
     state
         .ws_hub

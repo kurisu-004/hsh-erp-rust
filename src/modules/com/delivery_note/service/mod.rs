@@ -12,7 +12,9 @@
 //! - `find_or_create` —— `scan_find_or_create_draft`：按单键
 //!   `(customer_id, status='DRAFT')` 找或建草稿（含 23505 并发重查兜底）
 //! - `shippable_sets` —— 装配件「可出货套数」纯函数（分子只计 `READY_TO_SHIP`；
-//!   详情 VO 与扫码树共用同一公式）
+//!   模块私有，公式本体 `shippable_sets()` 只给 `scan_tree.rs` / `scan_entry.rs`
+//!   两个同域调用方用；宽类型适配壳 `note_shippable_sets()` 给 `inner.rs` /
+//!   `crud.rs` 的详情 VO 装配用）
 //! - `inner` —— 跨子模块共享的私有 helper（`build_note_outs` / `get_with_parts` /
 //!   `validate_*` / 错误构造器）
 //!
@@ -49,14 +51,6 @@ mod lifecycle;
 mod scan_entry;
 mod scan_tree;
 mod shippable_sets;
-
-/// 2026-10-04 新增：本单口径的装配件「可出货套数」纯内存计算。
-///
-/// 模块保持私有（与其余 service 子模块一致），只把函数放开到 crate 内 ——
-/// 打印 handler（`handler/print.rs`）也要用它把套数注入转发 body，与
-/// `inner.rs::get_with_parts` / `crud.rs::get_many_with_parts` 共用同一公式，
-/// 避免三处各写一遍。范式 `outsource/service/mod.rs` 的 `pub(crate) fn` 导出。
-pub(crate) use shippable_sets::note_shippable_sets;
 
 use std::sync::Arc;
 

@@ -27,7 +27,7 @@ use super::super::dto::DeliveryNoteUpdateRequest;
 use super::super::repo::SortDir;
 use super::super::vo::{DeliveryNoteDetailOut, DeliveryNoteListOut, DeliveryNoteOut};
 use super::inner::{build_note_outs, get_with_parts, note_not_found, note_version_conflict};
-use super::note_shippable_sets;
+use super::shippable_sets::note_shippable_sets;
 
 use super::DeliveryNoteService;
 
@@ -247,7 +247,6 @@ impl DeliveryNoteService {
                     drawing_no: p.drawing_no.clone(),
                     name: p.name.clone(),
                     quantity: b.quantity,
-                    is_urgent: false,
                     status: b.status.clone(),
                     applicant_name: Some(p.applicant_name.clone()).filter(|s| !s.is_empty()),
                     request_date: Some(p.request_date),
@@ -258,8 +257,6 @@ impl DeliveryNoteService {
                     customer_name: leaf_name,
                     parent_customer_name: parent_name,
                     customer_path: path,
-                    is_scanned: false,
-                    scanned: false,
                     assembly_id: asm.map(|a| a.id),
                     assembly_serial_no: asm.and_then(|a| a.serial_no.clone()),
                     assembly_drawing_no: asm.map(|a| a.drawing_no.clone()),
@@ -273,7 +270,6 @@ impl DeliveryNoteService {
             out.push(DeliveryNoteDetailOut {
                 head: head.clone(),
                 line_items: items,
-                scanned_serials: vec![],
             });
         }
         Ok(out)

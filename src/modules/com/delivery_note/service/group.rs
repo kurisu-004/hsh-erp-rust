@@ -313,12 +313,9 @@ impl DeliveryGroupService {
     ) -> DeliveryGroupOut {
         DeliveryGroupOut {
             id: g.id,
-            customer_id: g.customer_id,
             name: g.name.clone(),
             members,
             version: g.version,
-            created_at: g.created_at,
-            updated_at: g.updated_at,
         }
     }
 }
