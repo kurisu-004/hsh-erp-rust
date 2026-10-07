@@ -59,9 +59,19 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
 
 | 方法 | 路径 | 权限 | 入参 | 出参 |
 |---|---|---|---|---|
-| POST | `/api/v2/batches/split` | Manager + Clerk | `{ batch_id: string, version: number, quantity: string, note? }` | `BatchSplitOut` |
+| POST | `/api/v2/batches/split` | Manager + Clerk | `{ batch_id: string, version: number, quantity: number, note? }` | `BatchSplitOut` |
 
-`batch_id` / `quantity` 走 `shared::types::deserialize_i64`（**只接受 JSON 字符串**），发数字 → HTTP 422 纯文本、不进信封。`version` 是 `t_part_batch.version` 的 OCC 锚，**必填**；过期 → `40901 VERSION_CONFLICT`。`quantity ∈ [1, source.quantity - 1]`，越界 → `20111`（HTTP 400）。
+**入参形态逐字段**（2026-10-09 订正）——同一份请求体里字符串 / 数字**混用**，不是笔误：
+
+| 字段 | 线上形态 | 反序列化 |
+|---|---|---|
+| `batch_id` | **JSON 字符串**（`"1590000000000000001"`） | `shared::types::deserialize_i64`（只吃 `str`）；发数字 → **HTTP 422 纯文本、不进信封**（响应无 `code` 字段） |
+| `version` | 裸 JSON 数字，**必填**（无 `#[serde(default)]`，缺字段 → 422 纯文本） | `i32` 原生 |
+| `quantity` | **裸 JSON 数字** | `i32` 原生；发字符串 `"4"` → 422 纯文本 |
+
+`version` 是 `t_part_batch.version` 的 OCC 锚；过期 → `40901 VERSION_CONFLICT`。`quantity ∈ [1, batch.quantity - 1]`，越界（`<= 0` 或 `>= batch.quantity`）→ `20111`（HTTP 400）。`batch` 指请求体 `batch_id` 命中的**源批次**行（代码里的局部变量名，见 `service/batch_ops.rs::split_batch`）。
+
+⚠️ `quantity` 是 i32 量级的计数，**不能**挂 `deserialize_i64`（那个 helper 是给雪花 ID 防 JS 精度截断的）：挂在计数上，前端按常规发数字就会吃提取器层 422 纯文本，响应里没有 `code` 字段可供提示。回归由 `tests/part/batch.rs::split_batch_numeric_quantity_with_string_batch_id_succeeds`（数字必通 + 出参三 ID 字符串）与 `split_batch_string_quantity_rejects_with_422_plaintext`（字符串必 422）双锁。
 
 `BatchSplitOut` 五字段：`batch_id` / `new_batch_id` / `part_id`（**三者均为 JSON 字符串**，雪花 ID 走 `serialize_i64`）、`quantity`（数字，实际拆走量）、`source_version`（数字，源批次写入后的 version = 请求 `version + 1`）。
 

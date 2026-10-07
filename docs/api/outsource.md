@@ -503,7 +503,7 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 | `vo/pool.rs` / `service/pool.rs` | 出参合并进 `vo/queue.rs`；service 实现被 `board/service.rs` 取代 |
 | `OutsourceRepoTrait` 的 5 个方法（`pool_*` 4 + `sendable_list_by_process` 1） | 同上，无调用方 |
 | `vo/shipment.rs` 的 `ApprovedForSendItem` / `ApprovedForSendListOut` | 死 VO，零调用方（表达不了 DIRECT 模式） |
-| `GET /api/v2/prod/batches/{batch_id}/split` | 2026-10-09 提升为共用顶层端点 `POST /api/v2/batches/split`（`batch_id` 入 body），见 [`batch.md`](batch.md) §2.1 |
+| `POST /api/v2/prod/batches/{batch_id}/split` | 2026-10-09 提升为共用顶层端点 `POST /api/v2/batches/split`（`batch_id` 入 body），入参形态见 [`batch.md`](batch.md) §2.1 |
 | `POST /api/v2/outsource-companies/{id}/processes` | 2026-10-09 硬切，功能吸收进 `POST /api/v2/outsource-companies/{id}/update` 的 `process_ids`（三态，见 §1.1）。连带删除 `SetOutsourceCompanyProcessRequest` 与 `OutsourceService::set_company_processes`。旧 URL 返 **404**（本 router 无其它 2 段 POST 会匹配它） |
 | `GET /api/v2/outsource-quotes/{id}` | 2026-10-09 硬切（前端零消费）。连带删除 `OutsourceService::get_quote`。旧 URL 返 **404**（quote router 已无 1 段路由） |
 | `POST /api/v2/outsource-quotes/{id}/update` | 2026-10-09 硬切（前端零消费）。连带删除 `OutsourceQuoteUpdateRequest` / `OutsourceService::update_quote` / `OutsourceQuoteRepo::update`。DRAFT 报价改价格 / 备注的路径改为「软删后重建一条 DRAFT」 |

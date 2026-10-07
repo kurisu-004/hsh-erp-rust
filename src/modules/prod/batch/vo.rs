@@ -266,6 +266,8 @@ pub struct BatchSplitOut {
     pub new_batch_id: i64,
     #[serde(serialize_with = "serialize_i64")]
     pub part_id: i64,
+    /// **实际拆走量**（= 新批次的 quantity），**不是**源批次余量。
+    /// 源批次余量 = 调用前的源批次 quantity − 本字段，**不在出参里**。
     pub quantity: i32,
     /// 源批次 version（拆批后 = 请求的 version + 1）
     pub source_version: i32,

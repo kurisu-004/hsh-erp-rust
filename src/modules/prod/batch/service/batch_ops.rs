@@ -6,7 +6,7 @@
 //! ## 批次守恒不变量
 //! 拆分时 `Σ(未删批次.quantity) = t_part.quantity` 必须保持；由
 //! `PartBatchRepo::split_batch_for_partial_pass` 强制（同一事务内连发
-//! max+1 / INSERT / UPDATE 三条 SQL，OCC 守源批次），handler 层再加
+//! max+1 / INSERT / UPDATE 三条 SQL，OCC 守源批次），service 层再加
 //! `BIZ_PART_BATCH_INVALID_QUANTITY` 防御性校验。
 
 use crate::auth::rbac::{CurrentUser, Role};
@@ -45,7 +45,7 @@ impl BatchService {
     ///
     /// 不变量 `Σ(未删批次.quantity) = t_part.quantity` 由
     /// `PartBatchRepo::split_batch` 强制（同一事务内连发 max+1 / INSERT / UPDATE 三条 SQL，
-    /// OCC 守源批次）。`quantity` ∈ [1, source.quantity - 1]（本函数内部守）。
+    /// OCC 守源批次）。`quantity` ∈ [1, batch.quantity - 1]（本函数内部守）。
     ///
     /// 2026-10-09：端点由 `POST /api/v2/prod/batches/{batch_id}/split` 提升为
     /// 顶层共用端点 `POST /api/v2/batches/split`（三个消费方：生产队列看板 /
@@ -69,13 +69,8 @@ impl BatchService {
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "part 不存在"))?;
         validate_batch_version(batch.id, req.version, batch.version)?;
-        // 数量校验
-        let qty: i32 = req.quantity.try_into().map_err(|_| {
-            AppError::biz(
-                code::BIZ_PART_BATCH_INVALID_QUANTITY,
-                "quantity 超出 i32 范围",
-            )
-        })?;
+        // 数量校验：DTO 的 `quantity` 已是 i32，这两条才是真正的业务闸
+        let qty = req.quantity;
         if qty <= 0 {
             return Err(AppError::biz(
                 code::BIZ_PART_BATCH_INVALID_QUANTITY,
