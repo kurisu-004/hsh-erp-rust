@@ -24,6 +24,12 @@ use super::inner::{
 
 use super::DeliveryGroupService;
 
+/// `/api/v2/com/delivery/group` 4 个端点的角色白名单。
+///
+/// 2026-10-08 加入 `Inspector`：品检员在送货单扫码入单页要能看 / 改分组（按 L2 归属
+/// 分单是扫码前的准备动作），此前只有 Manager / Clerk 能改，导致品检员被卡在这一步。
+const GROUP_ROLES: &[Role] = &[Role::Manager, Role::Clerk, Role::Inspector];
+
 impl DeliveryGroupService {
     pub async fn list_for_l1<R: DeliveryNoteRepoTrait>(
         &self,
@@ -31,6 +37,8 @@ impl DeliveryGroupService {
         l1_id: i64,
         current: &CurrentUser,
     ) -> Result<DeliveryGroupListOut, AppError> {
+        // 读端点比写端点多放行 `CncProgrammer`（编程员要能看分单视图）；
+        // 写端点用 `GROUP_ROLES`（Manager / Clerk / Inspector）。
         current.require_any_role(&[
             Role::Manager,
             Role::Clerk,
@@ -95,7 +103,7 @@ impl DeliveryGroupService {
         req: super::super::dto::CreateDeliveryGroupRequest,
         current: &CurrentUser,
     ) -> Result<DeliveryGroupOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk])?;
+        current.require_any_role(GROUP_ROLES)?;
 
         let l1 = CustomerRepo::get_by_id(&mut *repo.conn_mut(), req.customer_id, false)
             .await?
@@ -173,7 +181,7 @@ impl DeliveryGroupService {
         req: super::super::dto::UpdateDeliveryGroupRequest,
         current: &CurrentUser,
     ) -> Result<DeliveryGroupOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk])?;
+        current.require_any_role(GROUP_ROLES)?;
 
         let group = repo
             .group_get_by_id(group_id, false)
@@ -273,7 +281,7 @@ impl DeliveryGroupService {
         req: super::super::dto::DeliveryGroupIdRequest,
         current: &CurrentUser,
     ) -> Result<(), AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk])?;
+        current.require_any_role(GROUP_ROLES)?;
 
         let group = repo
             .group_get_by_id(group_id, false)

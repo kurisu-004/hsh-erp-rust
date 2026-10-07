@@ -8,7 +8,7 @@
 //! ## 分段
 //! - 送货分组：创建 / 更新 / 软删三组入参
 //! - 送货单：扫码入单（`ScanEntryRequest` / `ScanEntry`）、版本化 OCC 入参 /
-//!   partial update / 移除批次 / 领取 / 列表 query / 路径参数
+//!   partial update / 移除批次 / 指定司机 / 领取 / 列表 query / 路径参数
 //!
 //! ## 2026-10-08 删除的入参
 //! 手动建单（`DeliveryNoteCreateRequest` / `DeliveryNoteAddItem`）、添加零件
@@ -123,11 +123,26 @@ pub struct DeliveryNoteUpdateRequest {
     pub note: Option<String>,
 }
 
-/// 领取入参（POST /api/v2/com/delivery/note/{id}/pickup）。
+/// 指定司机入参（POST /api/v2/com/delivery/note/{id}/driver）。
+///
+/// 校验链：note 存在 + version 一致 + `validate_driver`（见
+/// `service/lifecycle.rs::validate_driver`）。
 #[derive(Debug, Clone, Deserialize)]
-pub struct DeliveryNotePickupRequest {
+pub struct DeliveryNoteDriverRequest {
+    pub version: i32,
     #[serde(deserialize_with = "crate::shared::types::deserialize_i64")]
     pub driver_worker_id: i64,
+}
+
+/// 领取入参（POST /api/v2/com/delivery/note/{id}/pickup）。
+///
+/// 2026-10-08 瘦身：**删掉 `driver_worker_id`**。司机改从单据上已指定的
+/// `driver_worker_id` 读（指定动作独立成 `POST /{id}/driver`）；未指定 ⇒ 21409，
+/// 指定过也会重跑 `validate_driver`（司机可能在指定之后被停用 / 改工种）。
+///
+/// `badge_code` 保留（司机核销时手输工牌号），当前服务端忽略。
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeliveryNotePickupRequest {
     pub badge_code: Option<String>,
     pub version: i32,
 }

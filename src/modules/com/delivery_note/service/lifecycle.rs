@@ -23,9 +23,13 @@
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock::now_naive;
 use crate::modules::com::delivery_note::repo::DeliveryNoteRepoTrait;
+use crate::modules::com::delivery_note::repo::driver::DeliveryDriverRepo;
+use crate::modules::com::delivery_note::vo::{DeliveryDriverListOut, DeliveryDriverOption};
 use crate::modules::part::service::PartService;
 use crate::modules::prod::batch::repo::PartBatchRepo;
+use crate::modules::prod::work_type::model::TWorkType;
 use crate::modules::prod::work_type::repo::WorkTypeRepo;
+use crate::modules::prod::worker::model::TWorker;
 use crate::modules::prod::worker::repo::WorkerRepo;
 use crate::shared::error::{AppError, code};
 
@@ -189,13 +193,96 @@ impl DeliveryNoteService {
         Ok(out.into_iter().next().unwrap())
     }
 
-    // ---------- pickup ----------
+    // ---------- set_driver ----------
 
-    pub async fn pickup<R: DeliveryNoteRepoTrait>(
+    /// `POST /{id}/driver` —— 指定司机（`SUBMITTED` 与 `DRAFT` 都可改）。
+    ///
+    /// 校验链：note 存在 → version 一致（40901）→ `validate_driver`（21409）。
+    /// handler 在 commit 后广播 `DELIVERY_NOTE_DRIVER_SET`。
+    pub async fn set_driver<R: DeliveryNoteRepoTrait>(
         &self,
         mut repo: R,
         note_id: i64,
         driver_worker_id: i64,
+        version: i32,
+        current: &CurrentUser,
+    ) -> Result<super::super::vo::DeliveryNoteOut, AppError> {
+        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
+
+        let mut obj = repo
+            .note_get_by_id(note_id, false)
+            .await?
+            .ok_or_else(|| note_not_found(note_id))?;
+        if obj.version != version {
+            return Err(note_version_conflict(note_id, obj.version, version));
+        }
+        if obj.status == STATUS_PICKED_UP || obj.status == "ARCHIVED" {
+            return Err(AppError::biz(
+                code::BIZ_DELIVERY_NOTE_INVALID_TRANSITION,
+                format!(
+                    "已领取的单不能再改司机（当前 {}）；请先撤回再指定",
+                    obj.status
+                ),
+            ));
+        }
+
+        // 司机校验与 pickup 共用同一份口径（避免两处口径分叉）。
+        validate_driver(&mut *repo.conn_mut(), driver_worker_id).await?;
+
+        let now = now_naive();
+        obj.driver_worker_id = Some(driver_worker_id);
+        obj.version += 1;
+        obj.updated_at = now;
+        obj.updated_by = Some(current.id);
+        let affected = repo.note_update(&obj).await?;
+        if affected == 0 {
+            return Err(AppError::biz(
+                code::VERSION_CONFLICT,
+                "concurrent modification detected",
+            ));
+        }
+        let out = build_note_outs(&mut *repo.conn_mut(), std::slice::from_ref(&obj)).await?;
+        Ok(out.into_iter().next().unwrap())
+    }
+
+    // ---------- list_drivers ----------
+
+    /// `GET /api/v2/com/delivery/drivers` —— 候选送货司机一览。
+    ///
+    /// 角色白名单比 `GET /api/v2/prod/workers`（MANAGER-only）宽（放行 Manager /
+    /// Clerk / Inspector），但**只返「工种 = 送货司机」这一群人**，不泄露整张工人表。
+    pub async fn list_drivers<R: DeliveryNoteRepoTrait>(
+        &self,
+        mut repo: R,
+        current: &CurrentUser,
+    ) -> Result<DeliveryDriverListOut, AppError> {
+        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
+
+        let rows = DeliveryDriverRepo::list_drivers(&mut *repo.conn_mut()).await?;
+        Ok(DeliveryDriverListOut {
+            items: rows
+                .into_iter()
+                .map(|w| DeliveryDriverOption {
+                    id: w.id,
+                    name: w.name,
+                    badge_code: w.badge_code,
+                })
+                .collect(),
+        })
+    }
+
+    // ---------- pickup ----------
+
+    /// `POST /{id}/pickup` —— 司机领取（`SUBMITTED` → `PICKED_UP`）。
+    ///
+    /// 2026-10-08 入参瘦身：`driver_worker_id` **不再由本请求传**（改从
+    /// `obj.driver_worker_id` 读，司机指定已独立成 `POST /{id}/driver`），且拿到后
+    /// **重跑** `validate_driver`。`badge_code` 保留形参（未来核销用），当前忽略。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn pickup<R: DeliveryNoteRepoTrait>(
+        &self,
+        mut repo: R,
+        note_id: i64,
         version: i32,
         _badge_code: Option<&str>,
         current: &CurrentUser,
@@ -217,42 +304,19 @@ impl DeliveryNoteService {
             ));
         }
 
-        // 司机校验
-        let driver = WorkerRepo::get_by_id(&mut *repo.conn_mut(), driver_worker_id, false)
-            .await?
-            .ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_DELIVERY_NOTE_DRIVER_INVALID,
-                    format!("driver worker {driver_worker_id} not found or inactive"),
-                )
-            })?;
-        if !driver.is_active {
-            return Err(AppError::biz(
+        // 2026-10-08：司机不再由本请求传（入参瘦身成只有 `version`），改从
+        // `obj.driver_worker_id` 读 —— 指定动作已经独立成 `POST /{id}/driver`。
+        // 未指定 ⇒ 21409（与「指定了一个非法司机」同码：领取的前提是「已有合法司机」）。
+        let driver_worker_id = obj.driver_worker_id.ok_or_else(|| {
+            AppError::biz(
                 code::BIZ_DELIVERY_NOTE_DRIVER_INVALID,
-                format!("driver worker {driver_worker_id} not active"),
-            ));
-        }
-        if let Some(wt_id) = driver.work_type_id {
-            let wt = WorkTypeRepo::get_by_id(&mut *repo.conn_mut(), wt_id)
-                .await?
-                .ok_or_else(|| {
-                    AppError::biz(
-                        code::BIZ_DELIVERY_NOTE_DRIVER_INVALID,
-                        "driver work_type not found",
-                    )
-                })?;
-            if wt.code != WORK_TYPE_DRIVER_CODE {
-                return Err(AppError::biz(
-                    code::BIZ_DELIVERY_NOTE_DRIVER_INVALID,
-                    format!("driver work_type {} != {WORK_TYPE_DRIVER_CODE:?}", wt.code),
-                ));
-            }
-        } else {
-            return Err(AppError::biz(
-                code::BIZ_DELIVERY_NOTE_DRIVER_INVALID,
-                "driver has no work_type",
-            ));
-        }
+                "本单尚未指定送货司机；请先调用 POST /{id}/driver 指定后再领取",
+            )
+        })?;
+
+        // ⚠️ **必须重跑** validate_driver：司机可能在「指定 → 打印 → 领取」这段
+        // 窗口里被停用或改工种。指定时校验过一次不够。
+        validate_driver(&mut *repo.conn_mut(), driver_worker_id).await?;
 
         // 校验所有批次 READY_TO_SHIP + 非空
         let mut note_batches =
@@ -407,4 +471,55 @@ impl DeliveryNoteService {
         }
         Ok(())
     }
+}
+
+/// 司机校验的**唯一定义**（被 `set_driver` 与 `pickup` 共用）。
+///
+/// 两条调用链口径必须一致，否则会出现「能指定但不能领取」（或反之）这种只有用户在
+/// 现场才发现的错。校验 5 条，任一不过都返 `21409 BIZ_DELIVERY_NOTE_DRIVER_INVALID`：
+///
+/// | 条件 | 语义 |
+/// |---|---|
+/// | worker 行不存在 / 已软删 | 传了个不存在的工人 |
+/// | `worker.is_active == false` | 已离职 / 已停用 |
+/// | `work_type` 行取不到 | 工种被删了（悬空外键） |
+/// | `work_type.code != "送货司机"` | 是工人但不是司机 |
+/// | `worker.work_type_id IS NULL` | 没分工种 |
+///
+/// ⚠️ 与 `prod::batch::service::scan` 的 `!= Some("DRIVER")` **不一致**（那是另一个
+/// 子系统，用的是 `"DRIVER"` 字面量）。该「扫码发货」功能已计划移除、另案处理；本域
+/// 保持 `"送货司机"`（与 `t_work_type.code` 的实际取值一致）。差异登记在
+/// `docs/api/delivery_note.md` §8.4。
+///
+/// 返回值是 `TWorker` 供调用方复用（`pickup` 记 `picked_up_by` 之外还要司机名）。
+pub(super) async fn validate_driver(
+    conn: &mut sqlx::PgConnection,
+    driver_worker_id: i64,
+) -> Result<TWorker, AppError> {
+    let invalid = |msg: String| AppError::biz(code::BIZ_DELIVERY_NOTE_DRIVER_INVALID, msg);
+    let driver = WorkerRepo::get_by_id(&mut *conn, driver_worker_id, false)
+        .await?
+        .ok_or_else(|| {
+            invalid(format!(
+                "driver worker {driver_worker_id} not found or inactive"
+            ))
+        })?;
+    if !driver.is_active {
+        return Err(invalid(format!(
+            "driver worker {driver_worker_id} not active"
+        )));
+    }
+    let Some(wt_id) = driver.work_type_id else {
+        return Err(invalid("driver has no work_type".to_string()));
+    };
+    let wt: TWorkType = WorkTypeRepo::get_by_id(&mut *conn, wt_id)
+        .await?
+        .ok_or_else(|| invalid("driver work_type not found".to_string()))?;
+    if wt.code != WORK_TYPE_DRIVER_CODE {
+        return Err(invalid(format!(
+            "driver work_type {} != {WORK_TYPE_DRIVER_CODE:?}",
+            wt.code
+        )));
+    }
+    Ok(driver)
 }

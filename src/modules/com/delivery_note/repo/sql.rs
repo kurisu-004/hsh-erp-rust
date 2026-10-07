@@ -16,8 +16,6 @@
 //! Cross-module 调用方：deliver_note 域内部所有 `Repo::xxx(&mut *conn, ...)`
 //! 调用收敛到本文件的固有方法。`repo/mod.rs` 提供 trait 形式供 service 注入。
 
-use std::collections::HashMap;
-
 use chrono::NaiveDateTime;
 use sqlx::PgExecutor;
 
@@ -145,67 +143,6 @@ impl super::DeliveryGroupRepo {
         )
         .fetch_optional(executor)
         .await
-    }
-
-    /// 取 L1 客户的所有活跃分组及其成员 id（Phase P3 扫码入单 find-or-create 草稿前用）。
-    ///
-    /// 返回每组 `(group, member_ids)`；groups 端已按 id ASC；成员按 customer_id ASC（隐含
-    /// `GROUP BY` aggregate 选择）。空组（含 0 个成员）依然返回（member_ids 为空 Vec）。
-    ///
-    /// 该 helper 是设计 §3.2 `classify()` 的数据预加载步骤，**只在 `scan_add` 流程内**用；
-    /// `list_for_l1` 走自己的 list_by_customer + list_members_by_group_ids 以支撑
-    /// `DeliveryGroupListOut` 输出（后者还需成员姓名）。
-    ///
-    /// 该方法需要多次复用 executor，签名收 `&mut PgConnection`（与 `split_batch` 同形）。
-    pub async fn list_active_groups_with_members_for_l1(
-        conn: &mut sqlx::PgConnection,
-        l1_id: i64,
-    ) -> Result<Vec<(DeliveryGroup, Vec<i64>)>, sqlx::Error> {
-        let groups: Vec<DeliveryGroup> = sqlx::query_as!(
-            DeliveryGroup,
-            r#"
-            SELECT id, customer_id, name, version,
-                   created_at, created_by, updated_at, updated_by, deleted_at
-            FROM t_delivery_group
-            WHERE customer_id = $1
-              AND deleted_at IS NULL
-            ORDER BY id ASC
-            "#,
-            l1_id,
-        )
-        .fetch_all(&mut *conn)
-        .await?;
-        if groups.is_empty() {
-            return Ok(Vec::new());
-        }
-        let group_ids: Vec<i64> = groups.iter().map(|g| g.id).collect();
-        let members: Vec<DeliveryGroupMember> = sqlx::query_as!(
-            DeliveryGroupMember,
-            r#"
-            SELECT id, group_id, customer_id,
-                   created_at, created_by, deleted_at
-            FROM t_delivery_group_member
-            WHERE group_id = ANY($1)
-              AND deleted_at IS NULL
-            ORDER BY group_id ASC, customer_id ASC
-            "#,
-            &group_ids,
-        )
-        .fetch_all(&mut *conn)
-        .await?;
-        let mut by_group: HashMap<i64, Vec<i64>> = HashMap::new();
-        for m in members {
-            by_group.entry(m.group_id).or_default().push(m.customer_id);
-        }
-        Ok(groups
-            .into_iter()
-            .map(|g| {
-                let mut ids = by_group.remove(&g.id).unwrap_or_default();
-                ids.sort_unstable();
-                ids.dedup();
-                (g, ids)
-            })
-            .collect())
     }
 
     /// INSERT。id / 审计字段由 service 用雪花 / `now_naive()` 填好。
@@ -465,31 +402,6 @@ impl super::DeliveryNoteRepo {
         push_status_filter(&mut qb, statuses);
 
         qb.build_query_scalar::<i64>().fetch_one(executor).await
-    }
-
-    /// 待司机领取一览：SUBMITTED、非软删，按 `submitted_at DESC` 排。
-    pub async fn list_for_pickup<'e, E: PgExecutor<'e>>(
-        executor: E,
-        customer_id: Option<i64>,
-    ) -> Result<Vec<DeliveryNote>, sqlx::Error> {
-        sqlx::query_as!(
-            DeliveryNote,
-            r#"
-            SELECT id, delivery_note_no, customer_id, status,
-                   submitted_at, picked_up_at, submitted_by, picked_up_by,
-                   driver_worker_id, note, delivery_date,
-                   delivery_group_id, leaf_customer_id,
-                   version, created_at, created_by, updated_at, updated_by, deleted_at
-            FROM t_delivery_note
-            WHERE deleted_at IS NULL
-              AND status = 'SUBMITTED'
-              AND ($1::bigint IS NULL OR customer_id = $1)
-            ORDER BY submitted_at DESC
-            "#,
-            customer_id,
-        )
-        .fetch_all(executor)
-        .await
     }
 
     /// 查该 L1 名下**唯一**的活跃 DRAFT 送货单（建单判定键，2026-10-08 起单键）。

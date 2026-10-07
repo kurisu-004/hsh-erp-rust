@@ -35,8 +35,8 @@
 //! ③ 读端点（`list_*` / `get_*` / `scan_tree`）`pool.acquire() → service`，不开事务。
 //!
 //! ## 本域 SQL 真源与胖 trait
-//! SQL 全在 `repo/sql.rs` 与 `repo/scan_tree.rs`；胖 trait
-//! `DeliveryNoteRepoTrait`（21 方法 = 11 group + 10 note）直接
+//! SQL 全在 `repo/{sql,scan_tree,driver}.rs`；胖 trait
+//! `DeliveryNoteRepoTrait`（19 方法 = 10 group + 9 note）直接
 //! `impl for &mut PgConnection`，service 内部调用走 `conn.note_xxx()` /
 //! `conn.group_xxx()`，trait 另提供 `conn_mut()` 访问器供跨域 ZST 调用。
 

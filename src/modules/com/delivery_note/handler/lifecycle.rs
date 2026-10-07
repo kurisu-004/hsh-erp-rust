@@ -1,12 +1,8 @@
-//! delivery_note 域状态机转换 handler
+//! com::delivery_note 域状态机转换 handler（submit / recall / pickup / driver）
 //!
-//! 范围：状态机迁移端点：submit / recall / pickup。
+//! 基础 CRUD 走 `crud.rs`；扫码入单与扫码树走 `scan.rs`；打印走 `print.rs`。
 //!
-//! 基础 CRUD 走 `crud.rs`；扫码入单走 `scan.rs`；打印走 `print.rs`。
-//!
-//! 2026-10-08：`POST /{id}/pickup-scan`（司机端逐件扫码核销）随送货台一并删除。
-//!
-//! ## 约定（2026-09-22 D-5 + review 第 1 轮）
+//! ## 约定
 //! - 事务边界在 handler：`state.pool.begin()` → 借 `&mut *tx` 喂给 service → 显式
 //!   `tx.commit()`；提前 return（`?`）时 `Transaction` 的 Drop 自动回滚。
 //! - **service 形参 by-value trait**（iam 严格范本）：handler 借 `&mut *tx` 给
@@ -24,10 +20,12 @@ use std::sync::Arc;
 use axum::Json;
 use axum::extract::{Path, State};
 
+use crate::auth::rbac::CurrentUser;
 use crate::modules::com::delivery_note::dto::{
-    DeliveryNotePath, DeliveryNotePickupRequest, DeliveryNoteVersionedRequest,
+    DeliveryNoteDriverRequest, DeliveryNotePath, DeliveryNotePickupRequest,
+    DeliveryNoteVersionedRequest,
 };
-use crate::modules::com::delivery_note::vo::DeliveryNoteOut;
+use crate::modules::com::delivery_note::vo::{DeliveryDriverListOut, DeliveryNoteOut};
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
@@ -43,7 +41,7 @@ use crate::state::AppState;
 /// 与「硬错误」两条路径。
 pub async fn submit_delivery_note(
     State(state): State<Arc<AppState>>,
-    current: crate::auth::rbac::CurrentUser,
+    current: CurrentUser,
     Path(path): Path<DeliveryNotePath>,
     Json(req): Json<DeliveryNoteVersionedRequest>,
 ) -> Result<Json<R<String>>, AppError> {
@@ -70,7 +68,7 @@ pub async fn submit_delivery_note(
 /// POST /api/v2/com/delivery/note/{id}/recall
 pub async fn recall_delivery_note(
     State(state): State<Arc<AppState>>,
-    current: crate::auth::rbac::CurrentUser,
+    current: CurrentUser,
     Path(path): Path<DeliveryNotePath>,
     Json(req): Json<DeliveryNoteVersionedRequest>,
 ) -> Result<Json<R<DeliveryNoteOut>>, AppError> {
@@ -83,10 +81,74 @@ pub async fn recall_delivery_note(
     Ok(Json(R::ok(out)))
 }
 
-/// POST /api/v2/com/delivery/note/{id}/pickup
+/// POST /api/v2/com/delivery/note/{id}/driver —— 指定送货司机。
+///
+/// 入参 `{ version, driver_worker_id }`，出参 `R<DeliveryNoteOut>`。校验链：note
+/// 存在 → version 一致（40901）→ `validate_driver`（21409）。
+///
+/// commit 后广播 `DELIVERY_NOTE_DRIVER_SET`（kind 已补进
+/// `docs/api/dashboard.md` 的 kind 列表）。
+pub async fn set_driver(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(path): Path<DeliveryNotePath>,
+    Json(req): Json<DeliveryNoteDriverRequest>,
+) -> Result<Json<R<DeliveryNoteOut>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = state
+        .delivery_note_service
+        .set_driver(
+            &mut *tx,
+            path.id,
+            req.driver_worker_id,
+            req.version,
+            &current,
+        )
+        .await?;
+    tx.commit().await?;
+
+    let payload = serde_json::json!({
+        "delivery_note_id": out.id,
+        "delivery_note_no": out.delivery_note_no,
+        "driver_worker_id": req.driver_worker_id,
+        "driver_worker_name": out.driver_worker_name,
+    });
+    state
+        .ws_hub
+        .broadcast(crate::infra::ws_hub::WsEvent::DashboardEvent {
+            kind: "DELIVERY_NOTE_DRIVER_SET".to_string(),
+            payload: payload.clone(),
+        });
+    tracing::info!(?payload, "delivery_note driver set");
+
+    Ok(Json(R::ok(out)))
+}
+
+/// GET /api/v2/com/delivery/drivers —— 候选送货司机一览（Manager / Clerk / Inspector）。
+///
+/// 只返「工种 = 送货司机」且在职、未软删的工人，每项 3 字段（id / name /
+/// badge_code），不复用 `prod::worker` 的 11 字段 `WorkerOut`。
+pub async fn list_delivery_drivers(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+) -> Result<Json<R<DeliveryDriverListOut>>, AppError> {
+    // 读端点：pool.acquire() → service → drop，不开事务、不发广播。
+    let mut conn = state.pool.acquire().await?;
+    let out = state
+        .delivery_note_service
+        .list_drivers(&mut *conn, &current)
+        .await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// POST /api/v2/com/delivery/note/{id}/pickup —— 司机领取。
+///
+/// 入参 2026-10-08 起**只有 `version`**（外加预留的 `badge_code`）：司机从单据上已
+/// 指定的 `driver_worker_id` 读，未指定 ⇒ 21409；指定过也会**重跑**
+/// `validate_driver`（司机可能在「指定 → 领取」窗口里被停用或改工种）。
 pub async fn pickup_delivery_note(
     State(state): State<Arc<AppState>>,
-    current: crate::auth::rbac::CurrentUser,
+    current: CurrentUser,
     Path(path): Path<DeliveryNotePath>,
     Json(req): Json<DeliveryNotePickupRequest>,
 ) -> Result<Json<R<DeliveryNoteOut>>, AppError> {
@@ -96,7 +158,6 @@ pub async fn pickup_delivery_note(
         .pickup(
             &mut *tx,
             path.id,
-            req.driver_worker_id,
             req.version,
             req.badge_code.as_deref(),
             &current,

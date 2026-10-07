@@ -6,6 +6,8 @@
 //! - `delivery_note.rs`（送货单 CRUD：DeliveryNoteOut / ListOut / LineItem /
 //!   DetailOut / BatchDeliveryDetailData）
 //! - `batch_status.rs`（`BatchStatusDto`：批次状态强类型投影）
+//! - `driver.rs`（`GET /drivers` 候选：`DeliveryDriverListOut` /
+//!   `DeliveryDriverOption`，刻意 3 字段窄投影）
 //! - `scan_tree.rs`（扫码三层树：DeliveryScanTreeOut / Assembly / Part / Batch /
 //!   Draft / PerSetPart）
 //!
@@ -25,6 +27,7 @@
 pub mod batch_status;
 pub mod delivery_group;
 pub mod delivery_note;
+pub mod driver;
 pub mod scan_tree;
 
 pub use batch_status::BatchStatusDto;
@@ -35,6 +38,7 @@ pub use delivery_note::{
     BatchDeliveryDetailData, DeliveryNoteDetailOut, DeliveryNoteLineItem, DeliveryNoteListOut,
     DeliveryNoteOut,
 };
+pub use driver::{DeliveryDriverListOut, DeliveryDriverOption};
 pub use scan_tree::{
     DeliveryScanAssemblyOut, DeliveryScanBatchOut, DeliveryScanDraftOut, DeliveryScanPartOut,
     DeliveryScanPerSetPartOut, DeliveryScanTreeOut,

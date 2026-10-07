@@ -8,12 +8,14 @@
 //! ```text
 //! v2_router  .nest("/com",   com::router())
 //! com        .nest("/delivery", delivery_note::router())
-//! 本模块      .nest("/note",   handler::note_router())     12 段端点（见下）
-//!            .nest("/group",  handler::group_router())    4 段端点
+//! 本模块      .nest("/note",     handler::note_router())    送货单本体
+//!            .nest("/group",    handler::group_router())   送货分组 CRUD
+//!            .nest("/drivers",  handler::drivers_router()) 候选送货司机一览
 //! ```
-//! ⇒ 送达单是 `/api/v2/com/delivery/note/*`、送货分组是
-//! `/api/v2/com/delivery/group/*`；送货单的**权威路由清单**是
-//! [`handler::ROUTES`]（单测断言它与 `note_router()` 源码逐条一致）。
+//! ⇒ 送货单是 `/api/v2/com/delivery/note/*`、送货分组是
+//! `/api/v2/com/delivery/group/*`、司机候选是 `/api/v2/com/delivery/drivers`；送货单
+//! 与送货分组的**权威路由清单**分别是 [`handler::ROUTES`] / [`handler::GROUP_ROUTES`]
+//! （单测断言它们与对应 `router()` 源码逐条一致）。
 //!
 //! ## 子模块
 //! - `dto` —— 仅 `Deserialize` 入参（出参全在 `vo`）
@@ -57,4 +59,5 @@ pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .nest("/note", handler::note_router())
         .nest("/group", handler::group_router())
+        .nest("/drivers", handler::drivers_router())
 }

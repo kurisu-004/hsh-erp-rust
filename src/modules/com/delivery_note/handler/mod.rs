@@ -59,6 +59,7 @@ pub const ROUTES: &[&str] = &[
     "POST /{id}/remove-batches",
     "POST /{id}/submit",
     "POST /{id}/recall",
+    "POST /{id}/driver",
     "POST /{id}/pickup",
     "POST /{id}/soft-delete",
     "POST /{id}/print",
@@ -73,6 +74,15 @@ pub const GROUP_ROUTES: &[&str] = &[
     "POST /{id}/update",
     "POST /{id}/soft-delete",
 ];
+
+/// 送货司机候选段路由（相对 `/api/v2/com/delivery/drivers`）。
+///
+/// 只有 1 条读端点。**刻意不并进 `/note`**：它不是单据的子资源，而是一份全局的
+/// 「谁能当送货司机」名单（`GET /drivers`），独立前缀让前端的 queryKey 也独立，
+/// 改名单不失效任何单据缓存。
+pub fn drivers_router() -> Router<Arc<AppState>> {
+    Router::new().route("/", get(lifecycle::list_delivery_drivers))
+}
 
 /// 送货单段路由（相对 `/api/v2/com/delivery/note`）。
 pub fn note_router() -> Router<Arc<AppState>> {
@@ -89,6 +99,7 @@ pub fn note_router() -> Router<Arc<AppState>> {
         )
         .route("/{id}/submit", post(lifecycle::submit_delivery_note))
         .route("/{id}/recall", post(lifecycle::recall_delivery_note))
+        .route("/{id}/driver", post(lifecycle::set_driver))
         .route("/{id}/pickup", post(lifecycle::pickup_delivery_note))
         .route("/{id}/soft-delete", post(crud::soft_delete_delivery_note))
         .route("/{id}/print", post(print::print_delivery_note))

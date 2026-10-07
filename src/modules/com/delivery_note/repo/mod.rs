@@ -3,8 +3,11 @@
 //! ## 结构（2026-09-22 D-5 重构对齐 iam / shelf / customer / part_batch 范本）
 //! - `sql.rs`：SQL 真源（`query!` / `query_as!` 宏），ZST struct `DeliveryGroupRepo` /
 //!   `DeliveryNoteRepo` 收 `impl PgExecutor<'_>` 形参。
-//! - `mod.rs`（本文件）：对外暴露胖 trait `DeliveryNoteRepoTrait`（21 方法合并单 trait；
-//!   `DeliveryGroupRepo` 11 + `DeliveryNoteRepo` 10），并直接
+//! - `scan_tree.rs`：扫码三层树 6 条 SQL（`DeliveryScanRepo`）。
+//! - `driver.rs`：`GET /drivers` 的司机候选 1 条 SQL（`DeliveryDriverRepo`）—— 本域
+//!   专有的跨域只读投影，能用他域 repo 的一律走他域 repo。
+//! - `mod.rs`（本文件）：对外暴露胖 trait `DeliveryNoteRepoTrait`（19 方法合并单 trait；
+//!   `DeliveryGroupRepo` 10 + `DeliveryNoteRepo` 9），并直接
 //!   `impl DeliveryNoteRepoTrait for &mut PgConnection`——handler/service
 //!   借 `&mut *tx` / `&mut *conn` 即可，零中间壳。
 //!
@@ -45,6 +48,7 @@
 use async_trait::async_trait;
 use sqlx::PgConnection;
 
+pub mod driver;
 pub mod scan_tree;
 pub mod sql;
 
@@ -109,11 +113,6 @@ pub trait DeliveryNoteRepoTrait: Send {
         &mut self,
         l2_customer_id: i64,
     ) -> Result<Option<DeliveryGroupMember>, sqlx::Error>;
-    /// 一次查询取 L1 全部活跃分组 + 各组成员 id 列表（需要 `&mut PgConnection`）。
-    async fn group_list_active_groups_with_members_for_l1(
-        &mut self,
-        l1_id: i64,
-    ) -> Result<Vec<(DeliveryGroup, Vec<i64>)>, sqlx::Error>;
 
     // ── t_delivery_group 写（5）──
     async fn group_insert(&mut self, g: &DeliveryGroup) -> Result<(), sqlx::Error>;
@@ -167,10 +166,6 @@ pub trait DeliveryNoteRepoTrait: Send {
         customer_id: Option<i64>,
         keyword: Option<&'a str>,
     ) -> Result<i64, sqlx::Error>;
-    async fn note_list_for_pickup(
-        &mut self,
-        customer_id: Option<i64>,
-    ) -> Result<Vec<DeliveryNote>, sqlx::Error>;
     /// 建单判定键（2026-10-08 起单键）：该 L1 名下唯一活跃 DRAFT。
     /// 无范围列、无日期 —— 见 `sql.rs::find_open_draft_by_l1` 的理由。
     async fn note_find_open_draft_by_l1(
@@ -243,13 +238,6 @@ impl DeliveryNoteRepoTrait for &mut PgConnection {
         l2_customer_id: i64,
     ) -> Result<Option<DeliveryGroupMember>, sqlx::Error> {
         DeliveryGroupRepo::list_active_member_by_customer(&mut **self, l2_customer_id).await
-    }
-
-    async fn group_list_active_groups_with_members_for_l1(
-        &mut self,
-        l1_id: i64,
-    ) -> Result<Vec<(DeliveryGroup, Vec<i64>)>, sqlx::Error> {
-        DeliveryGroupRepo::list_active_groups_with_members_for_l1(&mut **self, l1_id).await
     }
 
     // ── t_delivery_group 写（5）── 一行委托 sql::DeliveryGroupRepo ─────────
@@ -338,13 +326,6 @@ impl DeliveryNoteRepoTrait for &mut PgConnection {
         keyword: Option<&'b str>,
     ) -> Result<i64, sqlx::Error> {
         DeliveryNoteRepo::count_with_filters(&mut **self, statuses, customer_id, keyword).await
-    }
-
-    async fn note_list_for_pickup(
-        &mut self,
-        customer_id: Option<i64>,
-    ) -> Result<Vec<DeliveryNote>, sqlx::Error> {
-        DeliveryNoteRepo::list_for_pickup(&mut **self, customer_id).await
     }
 
     async fn note_find_open_draft_by_l1(

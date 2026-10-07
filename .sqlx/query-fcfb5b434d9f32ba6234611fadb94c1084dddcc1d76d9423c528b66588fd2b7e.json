@@ -1,0 +1,170 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT w.id, w.badge_code, w.name, w.id_card_no, w.phone, w.is_active,\n                   w.version, w.created_at, w.created_by, w.updated_at, w.updated_by,\n                   w.deleted_at, w.work_type_id\n            FROM t_worker w\n            JOIN t_work_type wt ON wt.id = w.work_type_id\n            WHERE wt.code = '送货司机'\n              AND w.is_active\n              AND w.deleted_at IS NULL\n              AND wt.deleted_at IS NULL\n            ORDER BY w.name, w.id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_worker",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "badge_code",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_worker",
+            "name": "badge_code"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "name",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_worker",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "id_card_no",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_worker",
+            "name": "id_card_no"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "phone",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_worker",
+            "name": "phone"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "is_active",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "t_worker",
+            "name": "is_active"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_worker",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_worker",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "created_by",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_worker",
+            "name": "created_by"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "updated_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_worker",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "updated_by",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_worker",
+            "name": "updated_by"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "deleted_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_worker",
+            "name": "deleted_at"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "work_type_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_worker",
+            "name": "work_type_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "fcfb5b434d9f32ba6234611fadb94c1084dddcc1d76d9423c528b66588fd2b7e"
+}
