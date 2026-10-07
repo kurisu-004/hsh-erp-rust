@@ -30,7 +30,8 @@ pub struct DeliveryNoteOut {
     #[serde(serialize_with = "crate::shared::types::serialize_i64")]
     pub customer_id: i64,
     pub customer_name: Option<String>,
-    pub parent_customer_name: Option<String>,
+    /// 「L1 / L2」完整路径（L1 自指时只给 L1 名）。前端统一读这个字段展示客户，
+    /// 不再单独读 `parent_customer_name`（2026-10-08 已删）。
     pub customer_path: Option<String>,
     pub status: String,
     pub submitted_at: Option<NaiveDateTime>,
@@ -136,28 +137,4 @@ pub struct DeliveryNoteListOut {
     pub total: i64,
     pub limit: i64,
     pub offset: i64,
-}
-
-/// 候选入单零件（INSPECTION + READY_TO_SHIP 批次，同 L1 根，不在 active 单上）。
-#[derive(Debug, Clone, Serialize)]
-pub struct DeliveryNoteCandidatePart {
-    /// 工单 id（展示 / 反查用）
-    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
-    pub id: i64,
-    /// 批次 id（入单回传用）
-    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
-    pub batch_id: i64,
-    pub batch_no: i32,
-    pub batch_label: String,
-    pub serial_no: String,
-    pub drawing_no: String,
-    pub name: String,
-    pub quantity: i32,
-    pub applicant_name: Option<String>,
-    pub status: String,
-    pub planned_delivery_date: Option<NaiveDate>,
-    pub order_no: Option<String>,
-    pub customer_name: Option<String>,
-    pub parent_customer_name: Option<String>,
-    pub customer_path: Option<String>,
 }

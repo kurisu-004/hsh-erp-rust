@@ -84,7 +84,7 @@ pub(super) async fn build_note_outs(
     let mut out = Vec::with_capacity(rows.len());
     for n in rows {
         let l1 = cust_map.get(&n.customer_id);
-        let (customer_name, parent_customer_name, customer_path) = match l1 {
+        let (customer_name, _parent_customer_name, customer_path) = match l1 {
             Some(c) if c.parent_id.is_none() => (
                 Some(c.name.clone()),
                 Some(c.name.clone()),
@@ -117,7 +117,6 @@ pub(super) async fn build_note_outs(
             delivery_note_no: n.delivery_note_no.clone(),
             customer_id: n.customer_id,
             customer_name,
-            parent_customer_name,
             customer_path,
             status: n.status.clone(),
             submitted_at: n.submitted_at,
