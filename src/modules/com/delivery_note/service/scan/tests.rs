@@ -1,50 +1,16 @@
 //! `scan_add` 单元测试（2026-09-22 review 第 1 轮抽出）
 //!
-//! 5 组测试（classify / resolve_scan_kind / classify_5groups / c_group_distribution /
-//! attachable_batches）从 `scan/mod.rs` 末尾移到本文件，让 `scan/mod.rs` 行数
-//! 从 1294 降到 < 1000 行上限（conventions §2）。
+//! 5 组测试（resolve_scan_kind / classify_5groups / c_group_distribution /
+//! attachable_batches / outcome）从 `scan/mod.rs` 末尾移到本文件，让
+//! `scan/mod.rs` 行数从 1294 降到 < 1000 行上限（conventions §2）。
+//!
+//! 2026-10-08：随范围判定下线的 `classify_tests`（`NoteScope::classify`）整组删除。
 //!
 //! rust 2018+ 规定 `#[cfg(test)] mod` 之后不能再放任何生产代码——所以本文件
 //! 整体是 `#[cfg(test)]` 包裹，只有测试编译时才被纳入。
 //!
 //! `super::` 仍然指向 `scan/mod.rs`（本文件的父 module），`super::classify::*`
 //! 等路径不变。
-
-#[cfg(test)]
-mod classify_tests {
-    use super::super::GroupWithMemberIds;
-    use crate::modules::com::delivery_note::model::NoteScope;
-
-    fn g(id: i64, members: &[i64]) -> GroupWithMemberIds {
-        GroupWithMemberIds {
-            group_id: id,
-            member_ids: members.to_vec(),
-        }
-    }
-
-    #[test]
-    fn classify_no_groups_returns_l1wide() {
-        assert_eq!(NoteScope::classify(101, &[]), NoteScope::L1Wide);
-    }
-
-    #[test]
-    fn classify_member_returns_group() {
-        let groups = vec![g(10, &[101, 102, 103])];
-        assert_eq!(NoteScope::classify(102, &groups), NoteScope::Group(10));
-    }
-
-    #[test]
-    fn classify_non_member_returns_leaf() {
-        let groups = vec![g(10, &[101, 102, 103])];
-        assert_eq!(NoteScope::classify(104, &groups), NoteScope::Leaf(104));
-    }
-
-    #[test]
-    fn classify_with_l1_self_returns_leaf_l1_id() {
-        let groups = vec![g(10, &[101, 102, 103])];
-        assert_eq!(NoteScope::classify(100, &groups), NoteScope::Leaf(100));
-    }
-}
 
 #[cfg(test)]
 mod scan_resolve_tests {

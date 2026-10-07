@@ -3,7 +3,7 @@
 //! 包含：
 //! - sqlx `FromRow` 行结构（送货分组、成员、note、单号日计数器；含 version 乐观锁、
 //!   deleted_at 软删、created/updated 审计字段）
-//! - 域枚举（status / sort_key / scope / scan outcome）
+//! - 域枚举（status / sort_key / scan outcome）
 //!
 //! 2026-10-08：事件行结构 `DeliveryNoteEvent` 与事件枚举 `DeliveryNoteEventType`
 //! 随事件子系统下线一并删除（见 `migrations/20261008100000_001_drop_*`）。
@@ -50,9 +50,10 @@ pub struct DeliveryGroupMember {
 
 /// `t_delivery_note` 行（送货单本体）
 ///
-/// `delivery_group_id` / `leaf_customer_id` 是 2026-10-08 起**逻辑废弃**的范围列：
-/// scope 判定已下线，建单判定键收敛为 `(customer_id, status='DRAFT')` 单键，两列
-/// 不再被任何查询使用，也不再由入单路径写入（保留列本身不动，避免 DDL 抖动）。
+/// ⚠️ `delivery_group_id` / `leaf_customer_id` 是 2026-10-08 起**逻辑废弃**的范围列：
+/// `NoteScope` 三态判定已下线，建单判定键收敛为 `(customer_id, status='DRAFT')`
+/// 单键，两列不再被任何查询使用，新单一律写 NULL（保留列本身不动，避免 DDL 抖动
+/// 与既有 baseline 约束 `ck_t_delivery_note_scope_exclusive` 的耦合）。
 #[derive(Debug, Clone, sqlx::FromRow)]
 #[allow(dead_code)]
 pub struct DeliveryNote {
@@ -178,34 +179,6 @@ impl ScanOutcome {
         match self {
             Self::Added => "ADDED",
             Self::AlreadyPresent => "ALREADY_PRESENT",
-        }
-    }
-}
-
-/// 送货单范围（D1：每单一范围；D4：L1 全域 = L1Wide；D5：同范围 DRAFT 共享）
-///
-/// 内部枚举，P2 / P3 业务实装时由 `classify()` 产出；P1 阶段仅放类型。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum NoteScope {
-    /// L1 全域：两列都 NULL（遗留行为）
-    L1Wide,
-    /// 分组单：delivery_group_id 非空
-    Group(i64),
-    /// 单厂单：leaf_customer_id 非空
-    Leaf(i64),
-}
-
-impl NoteScope {
-    /// 用于响应里的 `scope_label` 字段：
-    /// - Group：分组名（如「二五六厂」）
-    /// - Leaf：L2 客户名
-    /// - L1Wide：L1 客户名
-    pub fn display_label(&self, group_name: Option<&str>, leaf_name: Option<&str>) -> String {
-        match self {
-            Self::L1Wide => leaf_name.unwrap_or("(L1)").to_string(),
-            Self::Group(_) => group_name.unwrap_or("(group)").to_string(),
-            Self::Leaf(_) => leaf_name.unwrap_or("(leaf)").to_string(),
         }
     }
 }

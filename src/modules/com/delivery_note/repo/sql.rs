@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use chrono::NaiveDateTime;
 use sqlx::PgExecutor;
 
-use crate::modules::com::delivery_note::model::{DeliveryNoteSortKey, NoteScope};
+use crate::modules::com::delivery_note::model::DeliveryNoteSortKey;
 
 use super::super::model::{DeliveryGroup, DeliveryGroupMember, DeliveryNote};
 use super::SortDir;
@@ -492,95 +492,40 @@ impl super::DeliveryNoteRepo {
         .await
     }
 
-    /// 按 (customer_id, scope) 查一张活跃 DRAFT 草稿：
-    /// - `NoteScope::Group(gid)`：customer_id + delivery_group_id = gid
-    /// - `NoteScope::Leaf(cid)`：customer_id + leaf_customer_id = cid
-    /// - `NoteScope::L1Wide`：customer_id + 两列均 NULL → 取最早 (`ORDER BY id ASC LIMIT 1`)
+    /// 查该 L1 名下**唯一**的活跃 DRAFT 送货单（建单判定键，2026-10-08 起单键）。
     ///
-    /// `other_than` 排除指定 id（recall 时排除自己）。
-    pub async fn find_open_draft_by_scope<'e, E: PgExecutor<'e>>(
+    /// 判据只有 `(customer_id, status='DRAFT', deleted_at IS NULL)` 三列：
+    /// **不含 delivery_date**、不含任何范围列。理由（业务原文）：「同一天」只是描述
+    /// 新建时的默认行为（`delivery_date` 缺省取 today），日期是可编辑字段 —— 用户改
+    /// 到明天后继续扫码应该加到同一张单，所以拿日期当筛选条件会把单据切碎。
+    ///
+    /// `ORDER BY id ASC LIMIT 1`：数据库侧有部分唯一索引
+    /// `uk_t_delivery_note_l1_open_draft` 兜底，理论上至多一行；保留排序 + LIMIT
+    /// 是为了让「历史脏数据导致多行」时也只取最早那张（与扫码树的 `draft` 提示
+    /// 一致），而不是随机取一张。
+    pub async fn find_open_draft_by_l1<'e, E: PgExecutor<'e>>(
         executor: E,
-        l1_id: i64,
-        scope: NoteScope,
-        other_than: Option<i64>,
+        customer_id: i64,
     ) -> Result<Option<DeliveryNote>, sqlx::Error> {
-        match scope {
-            NoteScope::Group(gid) => {
-                sqlx::query_as!(
-                    DeliveryNote,
-                    r#"
-                SELECT id, delivery_note_no, customer_id, status,
-                       submitted_at, picked_up_at, submitted_by, picked_up_by,
-                       driver_worker_id, note, delivery_date,
-                       delivery_group_id, leaf_customer_id,
-                       version, created_at, created_by, updated_at, updated_by, deleted_at
-                FROM t_delivery_note
-                WHERE customer_id        = $1
-                  AND delivery_group_id  = $2
-                  AND status             = 'DRAFT'
-                  AND deleted_at IS NULL
-                  AND ($3::bigint IS NULL OR id <> $3)
-                ORDER BY id ASC
-                LIMIT 1
-                "#,
-                    l1_id,
-                    gid,
-                    other_than,
-                )
-                .fetch_optional(executor)
-                .await
-            }
-            NoteScope::Leaf(cid) => {
-                sqlx::query_as!(
-                    DeliveryNote,
-                    r#"
-                SELECT id, delivery_note_no, customer_id, status,
-                       submitted_at, picked_up_at, submitted_by, picked_up_by,
-                       driver_worker_id, note, delivery_date,
-                       delivery_group_id, leaf_customer_id,
-                       version, created_at, created_by, updated_at, updated_by, deleted_at
-                FROM t_delivery_note
-                WHERE customer_id       = $1
-                  AND leaf_customer_id   = $2
-                  AND status            = 'DRAFT'
-                  AND deleted_at IS NULL
-                  AND ($3::bigint IS NULL OR id <> $3)
-                ORDER BY id ASC
-                LIMIT 1
-                "#,
-                    l1_id,
-                    cid,
-                    other_than,
-                )
-                .fetch_optional(executor)
-                .await
-            }
-            NoteScope::L1Wide => {
-                sqlx::query_as!(
-                    DeliveryNote,
-                    r#"
-                SELECT id, delivery_note_no, customer_id, status,
-                       submitted_at, picked_up_at, submitted_by, picked_up_by,
-                       driver_worker_id, note, delivery_date,
-                       delivery_group_id, leaf_customer_id,
-                       version, created_at, created_by, updated_at, updated_by, deleted_at
-                FROM t_delivery_note
-                WHERE customer_id          = $1
-                  AND delivery_group_id IS NULL
-                  AND leaf_customer_id  IS NULL
-                  AND status               = 'DRAFT'
-                  AND deleted_at IS NULL
-                  AND ($2::bigint IS NULL OR id <> $2)
-                ORDER BY id ASC
-                LIMIT 1
-                "#,
-                    l1_id,
-                    other_than,
-                )
-                .fetch_optional(executor)
-                .await
-            }
-        }
+        sqlx::query_as!(
+            DeliveryNote,
+            r#"
+            SELECT id, delivery_note_no, customer_id, status,
+                   submitted_at, picked_up_at, submitted_by, picked_up_by,
+                   driver_worker_id, note, delivery_date,
+                   delivery_group_id, leaf_customer_id,
+                   version, created_at, created_by, updated_at, updated_by, deleted_at
+            FROM t_delivery_note
+            WHERE customer_id = $1
+              AND status      = 'DRAFT'
+              AND deleted_at IS NULL
+            ORDER BY id ASC
+            LIMIT 1
+            "#,
+            customer_id,
+        )
+        .fetch_optional(executor)
+        .await
     }
 
     /// INSERT。id / 审计字段由 service 用雪花 / `now_naive()` 填好。

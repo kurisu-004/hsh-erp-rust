@@ -13,9 +13,6 @@ use std::collections::{HashMap, HashSet};
 
 use sqlx::PgConnection;
 
-use crate::auth::rbac::CurrentUser;
-use crate::infra::clock::now_naive;
-use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::assembly::repo::AssemblyRepo;
 use crate::modules::com::customer::model::TCustomer;
 use crate::modules::com::customer::repo::CustomerRepo;
@@ -24,8 +21,7 @@ use crate::modules::part::repo::PartRepo;
 use crate::modules::prod::batch::repo::PartBatchRepo;
 use crate::shared::error::{AppError, code};
 
-use super::super::dto::DeliveryNoteAddItem;
-use super::super::model::{DeliveryNote, NoteScope};
+use super::super::model::DeliveryNote;
 use super::super::vo::{DeliveryNoteDetailOut, DeliveryNoteLineItem, DeliveryNoteOut};
 use super::note_shippable_sets;
 
@@ -33,31 +29,19 @@ use super::note_shippable_sets;
 //  types
 // ===========================================================================
 
-/// service 内部用的分组形态（DB 装载 + 内存投影，避免暴露 `DeliveryGroup` 全字段）
-#[derive(Debug, Clone)]
-pub(super) struct GroupWithMemberIds {
-    pub(super) group_id: i64,
-    pub(super) member_ids: Vec<i64>,
-}
-
 const NAME_MAX_LEN: usize = 100;
-
-/// P2 业务状态常量（与 DB 列 `status` 一致；与 `DeliveryNoteStatus::as_str()` 对齐）
-const STATUS_DRAFT: &str = "DRAFT";
-const STATUS_SUBMITTED: &str = "SUBMITTED";
-
-/// P2 业务批次状态常量
-const STATUS_INSPECTION: &str = "INSPECTION";
-const STATUS_READY_TO_SHIP: &str = "READY_TO_SHIP";
 
 // ===========================================================================
 //  shared helpers
 // ===========================================================================
 
-/// 把 `Vec<DeliveryNote>` 转 `Vec<DeliveryNoteOut>`（批查客户 / 司机 / 范围名）。
+/// 把 `Vec<DeliveryNote>` 转 `Vec<DeliveryNoteOut>`（批查客户 / 司机）。
 ///
 /// 2026-09-22 D-5：内部 SQL 调用通过 trait 方法（`DeliveryNoteRepoTrait::xxx`）+ 跨域
 /// ZST 静态调用（`CustomerRepo::xxx` / `PartBatchRepo::xxx`）混合。
+///
+/// 2026-10-08：删掉分组名 / leaf 名 / `scope_label` 三处派生查询 —— 范围列逻辑废弃
+/// 后这些字段不再出参（见 `vo::DeliveryNoteOut`），留着就是纯浪费的一次 DB 往返。
 pub(super) async fn build_note_outs(
     conn: &mut PgConnection,
     rows: &[DeliveryNote],
@@ -66,13 +50,10 @@ pub(super) async fn build_note_outs(
         return Ok(Vec::new());
     }
 
-    // 客户 id 批查（仅 customer / leaf_customer，不含 group / driver）
+    // 客户 id 批查（仅 customer；范围列已废弃，不再连带查 leaf）
     let mut customer_ids: HashSet<i64> = HashSet::new();
     for n in rows {
         customer_ids.insert(n.customer_id);
-        if let Some(lid) = n.leaf_customer_id {
-            customer_ids.insert(lid);
-        }
     }
     let customers = CustomerRepo::list_by_ids(
         &mut *conn,
@@ -100,21 +81,6 @@ pub(super) async fn build_note_outs(
         }
     }
 
-    // 分组名批查
-    let group_ids: Vec<i64> = rows.iter().filter_map(|n| n.delivery_group_id).collect();
-    let mut group_map: HashMap<i64, String> = HashMap::new();
-    if !group_ids.is_empty() {
-        let groups = sqlx::query!(
-            r#"SELECT id, name FROM t_delivery_group WHERE id = ANY($1) AND deleted_at IS NULL"#,
-            &group_ids
-        )
-        .fetch_all(&mut *conn)
-        .await?;
-        for g in groups {
-            group_map.insert(g.id, g.name);
-        }
-    }
-
     let mut out = Vec::with_capacity(rows.len());
     for n in rows {
         let l1 = cust_map.get(&n.customer_id);
@@ -135,21 +101,6 @@ pub(super) async fn build_note_outs(
                 (Some(c.name.clone()), parent_name, path)
             }
             None => (None, None, None),
-        };
-
-        let leaf_customer_name = n
-            .leaf_customer_id
-            .and_then(|id| cust_map.get(&id).map(|c| c.name.clone()));
-        let group_name = n
-            .delivery_group_id
-            .and_then(|id| group_map.get(&id).cloned());
-
-        let scope_label = match (n.delivery_group_id, n.leaf_customer_id) {
-            (Some(_), _) => group_name.clone().or_else(|| Some("(group)".to_string())),
-            (None, Some(_)) => leaf_customer_name
-                .clone()
-                .or_else(|| Some("(leaf)".to_string())),
-            (None, None) => customer_name.clone().or_else(|| Some("(L1)".to_string())),
         };
 
         let part_count = PartBatchRepo::list_by_delivery_note(&mut *conn, n.id)
@@ -180,11 +131,6 @@ pub(super) async fn build_note_outs(
             delivery_date: n.delivery_date,
             created_at: n.created_at,
             updated_at: n.updated_at,
-            delivery_group_id: n.delivery_group_id,
-            delivery_group_name: group_name,
-            leaf_customer_id: n.leaf_customer_id,
-            leaf_customer_name,
-            scope_label,
         });
     }
     Ok(out)
@@ -324,253 +270,6 @@ pub(super) async fn get_with_parts(
         line_items: items,
         scanned_serials: vec![],
     })
-}
-
-/// 范围校验：根据 note 当前 scope 校验每个 (batch → part) 客户是否合规。
-///
-/// - `L1Wide`：只跨 L1（part.customer_id L1 == note.customer_id）
-/// - `Group(gid)`：part.customer_id ∈ group.member_ids
-/// - `Leaf(cid)`：part.customer_id == leaf_customer_id
-pub(super) async fn check_scope(
-    mut conn: &mut PgConnection,
-    obj: &DeliveryNote,
-    part_customer_id: i64,
-) -> Result<(), AppError> {
-    let scope = scope_from_note(obj);
-    match scope {
-        NoteScope::L1Wide => Ok(()),
-        NoteScope::Group(gid) => {
-            // 加载 group + members
-            let grp = conn.group_get_by_id(gid, false).await?.ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_DELIVERY_GROUP_NOT_FOUND,
-                    format!("delivery group {gid} not found"),
-                )
-            })?;
-            // 必须仍是同一 L1 客户
-            if grp.customer_id != obj.customer_id {
-                return Err(AppError::biz(
-                    code::BIZ_DELIVERY_NOTE_SCOPE_MISMATCH,
-                    "group 与本单 L1 不匹配",
-                ));
-            }
-            let members = conn.group_list_members_by_group_ids(&[gid], false).await?;
-            if !members.iter().any(|m| m.customer_id == part_customer_id) {
-                return Err(AppError::biz(
-                    code::BIZ_DELIVERY_NOTE_SCOPE_MISMATCH,
-                    format!("part 客户 {part_customer_id} 不在分组 {gid} 成员中"),
-                ));
-            }
-            Ok(())
-        }
-        NoteScope::Leaf(cid) => {
-            if part_customer_id != cid {
-                return Err(AppError::biz(
-                    code::BIZ_DELIVERY_NOTE_SCOPE_MISMATCH,
-                    format!("part 客户 {part_customer_id} != 单厂单 leaf {cid}"),
-                ));
-            }
-            Ok(())
-        }
-    }
-}
-
-pub(super) fn scope_from_note(n: &DeliveryNote) -> NoteScope {
-    if let Some(gid) = n.delivery_group_id {
-        NoteScope::Group(gid)
-    } else if let Some(cid) = n.leaf_customer_id {
-        NoteScope::Leaf(cid)
-    } else {
-        NoteScope::L1Wide
-    }
-}
-
-/// add_parts 内部实现（被 create_draft 与 add_parts handler 复用）。
-pub(super) async fn add_parts_inner(
-    mut conn: &mut PgConnection,
-    snowflake: &SnowflakeIdGenerator,
-    note_id: i64,
-    items: &[DeliveryNoteAddItem],
-    version: i32,
-    current: &CurrentUser,
-) -> Result<(), AppError> {
-    let obj = conn
-        .note_get_by_id(note_id, false)
-        .await?
-        .ok_or_else(|| note_not_found(note_id))?;
-    if obj.version != version {
-        return Err(note_version_conflict(note_id, obj.version, version));
-    }
-    if obj.status != STATUS_DRAFT {
-        return Err(AppError::biz(
-            code::BIZ_DELIVERY_NOTE_PARTS_LOCKED,
-            format!(
-                "送货单已提交（{}），不能新增零件；如需调整请先撤回。",
-                obj.status
-            ),
-        ));
-    }
-    if items.is_empty() {
-        return Ok(());
-    }
-
-    // 加载所有 batch + part + part 客户
-    let mut batches_by_id: HashMap<i64, crate::shared::batch::TPartBatch> = HashMap::new();
-    for it in items {
-        let b = crate::shared::batch::get_batch_by_id(&mut *conn, it.batch_id, false)
-            .await?
-            .ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_PART_BATCH_NOT_FOUND,
-                    format!("batch {} 不存在或已删除", it.batch_id),
-                )
-            })?;
-        batches_by_id.insert(it.batch_id, b);
-    }
-
-    let part_ids: Vec<i64> = batches_by_id.values().map(|b| b.part_id).collect();
-    let parts = PartRepo::list_by_ids(&mut *conn, &part_ids, false).await?;
-    let part_map: HashMap<i64, crate::modules::part::model::TPart> =
-        parts.into_iter().map(|p| (p.id, p)).collect();
-
-    // 加载所有 part 客户（含 L2）以推 L1
-    let mut part_customer_ids: HashSet<i64> = part_map.values().map(|p| p.customer_id).collect();
-    part_customer_ids.insert(obj.customer_id);
-    let customers = CustomerRepo::list_by_ids(
-        &mut *conn,
-        &part_customer_ids.iter().copied().collect::<Vec<_>>(),
-        false,
-    )
-    .await?;
-    let cust_map: HashMap<i64, TCustomer> = customers.into_iter().map(|c| (c.id, c)).collect();
-
-    let now = now_naive();
-
-    for it in items {
-        let batch = batches_by_id.get(&it.batch_id).cloned().unwrap();
-        let part = part_map.get(&batch.part_id).cloned().ok_or_else(|| {
-            AppError::biz(
-                code::BIZ_PART_NOT_FOUND,
-                format!("batch {} 所属工单 {} 不存在", batch.id, batch.part_id),
-            )
-        })?;
-
-        if batch.status != STATUS_INSPECTION && batch.status != STATUS_READY_TO_SHIP {
-            return Err(AppError::biz(
-                code::BIZ_DELIVERY_NOTE_PART_NOT_READY,
-                format!(
-                    "part {} 批次 {} status={}, only INSPECTION / READY_TO_SHIP allowed at draft entry",
-                    part.id, batch.batch_no, batch.status
-                ),
-            ));
-        }
-
-        let part_cust = cust_map.get(&part.customer_id).cloned().ok_or_else(|| {
-            AppError::biz(
-                code::BIZ_CUSTOMER_NOT_FOUND,
-                format!("part {} 所属客户 {} 不存在", part.id, part.customer_id),
-            )
-        })?;
-        let part_l1_id = match part_cust.parent_id {
-            Some(pid) => pid,
-            None => part_cust.id,
-        };
-        if part_l1_id != obj.customer_id {
-            return Err(AppError::biz(
-                code::BIZ_DELIVERY_NOTE_PARTS_MULTIPLE_CUSTOMERS,
-                format!(
-                    "part {} 一级客户 {} != note 一级客户 {}",
-                    part.id, part_l1_id, obj.customer_id
-                ),
-            ));
-        }
-
-        // 范围校验（设计 §3.4）
-        check_scope(conn, &obj, part.customer_id).await?;
-
-        // 批次挂单冲突
-        if let Some(other_id) = batch.delivery_note_id
-            && other_id != note_id
-            && let Some(other) = conn.note_get_by_id(other_id, false).await?
-            && (other.status == STATUS_DRAFT || other.status == STATUS_SUBMITTED)
-        {
-            return Err(AppError::biz(
-                code::BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED,
-                format!(
-                    "part {} 批次 {} already on active delivery note {}",
-                    part.id, batch.batch_no, other_id
-                ),
-            ));
-        }
-
-        // 部分量 → 拆
-        let target_id = if let Some(qty) = it.quantity {
-            if qty <= 0 || qty > batch.quantity {
-                return Err(AppError::biz(
-                    code::BIZ_PART_BATCH_INVALID_QUANTITY,
-                    format!(
-                        "入单数量必须 ∈ [1, {}]（批次 {} 当前 {} 件），got {}",
-                        batch.quantity, batch.batch_no, batch.quantity, qty
-                    ),
-                ));
-            }
-            if qty < batch.quantity {
-                // 拆：构造新批次（PR-3 批次 step 化：传 current_process_step_id，不再传 placed_at）
-                let new_id = snowflake.next_id();
-                PartBatchRepo::split_batch(
-                    conn,
-                    new_id,
-                    batch.id,
-                    batch.version,
-                    part.id,
-                    qty,
-                    &batch.status,
-                    batch.location.as_deref(),
-                    batch.current_holder_id,
-                    batch.current_process_step_id,
-                    now,
-                    Some(current.id),
-                    Some(current.id),
-                )
-                .await?;
-                new_id
-            } else {
-                batch.id
-            }
-        } else {
-            batch.id
-        };
-
-        let target = if target_id == batch.id {
-            batch.clone()
-        } else {
-            crate::shared::batch::get_batch_by_id(&mut *conn, target_id, false)
-                .await?
-                .ok_or_else(|| {
-                    AppError::biz(
-                        code::BIZ_PART_BATCH_NOT_FOUND,
-                        format!("newly split batch {target_id} not found"),
-                    )
-                })?
-        };
-
-        let affected = PartBatchRepo::attach_to_note(
-            &mut *conn,
-            target.id,
-            target.version,
-            note_id,
-            now,
-            Some(current.id),
-        )
-        .await?;
-        if affected == 0 {
-            return Err(AppError::biz(
-                code::VERSION_CONFLICT,
-                format!("batch {} version conflict", target.id),
-            ));
-        }
-    }
-    Ok(())
 }
 
 // ===========================================================================

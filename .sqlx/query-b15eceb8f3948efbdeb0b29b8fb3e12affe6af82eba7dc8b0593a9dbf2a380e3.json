@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n                SELECT id, delivery_note_no, customer_id, status,\n                       submitted_at, picked_up_at, submitted_by, picked_up_by,\n                       driver_worker_id, note, delivery_date,\n                       delivery_group_id, leaf_customer_id,\n                       version, created_at, created_by, updated_at, updated_by, deleted_at\n                FROM t_delivery_note\n                WHERE customer_id        = $1\n                  AND delivery_group_id  = $2\n                  AND status             = 'DRAFT'\n                  AND deleted_at IS NULL\n                  AND ($3::bigint IS NULL OR id <> $3)\n                ORDER BY id ASC\n                LIMIT 1\n                ",
+  "query": "\n            SELECT id, delivery_note_no, customer_id, status,\n                   submitted_at, picked_up_at, submitted_by, picked_up_by,\n                   driver_worker_id, note, delivery_date,\n                   delivery_group_id, leaf_customer_id,\n                   version, created_at, created_by, updated_at, updated_by, deleted_at\n            FROM t_delivery_note\n            WHERE customer_id = $1\n              AND status      = 'DRAFT'\n              AND deleted_at IS NULL\n            ORDER BY id ASC\n            LIMIT 1\n            ",
   "describe": {
     "columns": [
       {
@@ -215,8 +215,6 @@
     ],
     "parameters": {
       "Left": [
-        "Int8",
-        "Int8",
         "Int8"
       ]
     },
@@ -242,5 +240,5 @@
       true
     ]
   },
-  "hash": "4de0eb9413c7d114f5373ab3082267a56b41918dfe2e91fa1c0de4e4df502f05"
+  "hash": "b15eceb8f3948efbdeb0b29b8fb3e12affe6af82eba7dc8b0593a9dbf2a380e3"
 }

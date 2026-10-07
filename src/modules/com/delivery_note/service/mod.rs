@@ -7,7 +7,7 @@
 //! - `scan` — DeliveryNoteService::scan_add（P3 扫码入单）+ NoteScope 分类 +
 //!   5 组分类 helpers + resolve_scan_kind（按业务子域再拆为
 //!   `scan/{mod, classify, resolve_scan_kind, helpers, find_or_create, tests}.rs`）
-//! - `attach` — DeliveryNoteService::attach_batches（P3+ 弹窗批量 attach）
+
 //! - `inner` — 跨子模块共享的私有 helper（`build_note_outs` / `add_parts_inner` /
 //!   `get_with_parts` / `check_scope` / `validate_*` / 错误构造器 等）
 //! - `shippable_sets` — 本单口径的装配件可出货套数（纯函数，2026-10-04 新增）
@@ -40,7 +40,6 @@
 //!   `pool.begin() → service → commit → state.ws_hub.broadcast(...)`；
 //!   ③ 读端点（list_*/get_*）`pool.acquire() → service`，不开事务。
 
-mod attach;
 mod crud;
 mod group;
 mod inner;

@@ -1,13 +1,12 @@
 //! com::delivery_note 域 HTTP handler 总入口
 //!
 //! 按业务域拆分为多文件（沿 `part/handler/{crud,batch,lifecycle,inspection}.rs` 范本）：
-//! - `crud.rs` —— 基础 CRUD：list / get / create / update / add-parts /
-//!   remove-parts / soft-delete / batch-detail / candidate-parts / pickup-pending +
-//!   送货分组 CRUD
-//! - `lifecycle.rs` —— 状态机转换：submit / recall / pickup-scan / pickup
+//! - `crud.rs` —— 基础 CRUD：list / get / update / remove-parts / soft-delete /
+//!   batch-detail + 送货分组 CRUD
+//! - `lifecycle.rs` —— 状态机转换：submit / recall / pickup
 //! - `print.rs` —— 打印：print / print-labels（读本单批次算装配件可出货套数后
 //!   BFF 转发到 python 执行渲染）
-//! - `scan.rs` —— 扫码入单：scan（`/scan` 端点）+ attach-batches（弹窗提交时附挂批次）
+//! - `scan.rs` —— 扫码入单：scan（`/scan` 端点）
 //!
 //! ## ⚠️ 路由注册顺序是**硬约束**（matchit 要求静态段优先）
 //! `note_router()` 里 1 段静态路径（`/batch-detail`、`/scan`、`/candidate-parts`、
@@ -53,17 +52,11 @@ use crate::state::AppState;
 pub const ROUTES: &[&str] = &[
     "GET /batch-detail",
     "POST /scan",
-    "GET /candidate-parts",
-    "GET /pickup-pending",
     "GET /",
-    "POST /",
     "POST /{id}/update",
-    "POST /{id}/add-parts",
-    "POST /{id}/attach-batches",
     "POST /{id}/remove-parts",
     "POST /{id}/submit",
     "POST /{id}/recall",
-    "POST /{id}/pickup-scan",
     "POST /{id}/pickup",
     "POST /{id}/soft-delete",
     "POST /{id}/print",
@@ -85,19 +78,11 @@ pub fn note_router() -> Router<Arc<AppState>> {
         // ---- ★静态段必须早于 /{id} ----
         .route("/batch-detail", get(crud::batch_get_delivery_notes))
         .route("/scan", post(scan::scan_delivery_note))
-        .route("/candidate-parts", get(crud::list_candidate_parts))
-        .route("/pickup-pending", get(crud::list_pickup_pending))
-        .route(
-            "/",
-            get(crud::list_delivery_notes).post(crud::create_delivery_note),
-        )
+        .route("/", get(crud::list_delivery_notes))
         .route("/{id}/update", post(crud::update_delivery_note))
-        .route("/{id}/add-parts", post(crud::add_delivery_note_parts))
-        .route("/{id}/attach-batches", post(scan::attach_batches))
         .route("/{id}/remove-parts", post(crud::remove_delivery_note_parts))
         .route("/{id}/submit", post(lifecycle::submit_delivery_note))
         .route("/{id}/recall", post(lifecycle::recall_delivery_note))
-        .route("/{id}/pickup-scan", post(lifecycle::pickup_scan))
         .route("/{id}/pickup", post(lifecycle::pickup_delivery_note))
         .route("/{id}/soft-delete", post(crud::soft_delete_delivery_note))
         .route("/{id}/print", post(print::print_delivery_note))

@@ -170,11 +170,11 @@ pub trait DeliveryNoteRepoTrait: Send {
         &mut self,
         customer_id: Option<i64>,
     ) -> Result<Vec<DeliveryNote>, sqlx::Error>;
-    async fn note_find_open_draft_by_scope(
+    /// 建单判定键（2026-10-08 起单键）：该 L1 名下唯一活跃 DRAFT。
+    /// 无范围列、无日期 —— 见 `sql.rs::find_open_draft_by_l1` 的理由。
+    async fn note_find_open_draft_by_l1(
         &mut self,
-        l1_id: i64,
-        scope: super::model::NoteScope,
-        other_than: Option<i64>,
+        customer_id: i64,
     ) -> Result<Option<DeliveryNote>, sqlx::Error>;
 
     // ── t_delivery_note 写（3）──
@@ -346,13 +346,11 @@ impl DeliveryNoteRepoTrait for &mut PgConnection {
         DeliveryNoteRepo::list_for_pickup(&mut **self, customer_id).await
     }
 
-    async fn note_find_open_draft_by_scope(
+    async fn note_find_open_draft_by_l1(
         &mut self,
-        l1_id: i64,
-        scope: super::model::NoteScope,
-        other_than: Option<i64>,
+        customer_id: i64,
     ) -> Result<Option<DeliveryNote>, sqlx::Error> {
-        DeliveryNoteRepo::find_open_draft_by_scope(&mut **self, l1_id, scope, other_than).await
+        DeliveryNoteRepo::find_open_draft_by_l1(&mut **self, customer_id).await
     }
 
     // ── t_delivery_note 写（3）── 一行委托 sql::DeliveryNoteRepo ─────────────

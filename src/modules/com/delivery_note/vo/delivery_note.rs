@@ -4,6 +4,11 @@ use chrono::{NaiveDate, NaiveDateTime};
 use serde::Serialize;
 
 /// 送货单概要（list + 大部分接口的公共响应）。
+///
+/// 2026-10-08：删掉 4 个范围字段（`delivery_group_id` / `delivery_group_name` /
+/// `leaf_customer_id` / `leaf_customer_name`）与 `scope_label`。范围三态判定已下线、
+/// 建单判定键收敛为 `(customer_id, DRAFT)` 单键 ⇒ 「这张单属于哪个分组 / 哪个单厂」
+/// 不再是单据属性，展示口径统一退化为「L1 客户名 + `customer_path`」。
 #[derive(Debug, Clone, Serialize)]
 pub struct DeliveryNoteOut {
     #[serde(serialize_with = "crate::shared::types::serialize_i64")]
@@ -39,21 +44,6 @@ pub struct DeliveryNoteOut {
     pub delivery_date: Option<NaiveDate>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
-    /// 范围字段（D1 范围列）
-    #[serde(
-        serialize_with = "crate::shared::types::serialize_i64_opt",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub delivery_group_id: Option<i64>,
-    pub delivery_group_name: Option<String>,
-    #[serde(
-        serialize_with = "crate::shared::types::serialize_i64_opt",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub leaf_customer_id: Option<i64>,
-    pub leaf_customer_name: Option<String>,
-    /// 范围展示文案（设计 §6.2：分组名 / L2 名 / L1 名）
-    pub scope_label: Option<String>,
 }
 
 /// 送货单下一行零件的投影（行=批次；id = batch_id）
@@ -136,18 +126,6 @@ pub struct BatchDeliveryDetailData {
     pub items: Vec<DeliveryNoteDetailOut>,
 }
 
-/// 扫码响应（P2 始终 `scanned_count=0 / scanned_serials=[] / ready=false`，
-/// 与 Python 2026-07-23 起后端行为一致）。
-#[derive(Debug, Clone, Serialize)]
-pub struct DeliveryNotePickupScanOut {
-    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
-    pub delivery_note_id: i64,
-    pub scanned_count: i64,
-    pub expected_count: i64,
-    pub ready: bool,
-    pub scanned_serials: Vec<String>,
-}
-
 /// 一览响应（GET /api/v2/com/delivery/note；含分页总计）。
 #[derive(Debug, Clone, Serialize)]
 pub struct DeliveryNoteListOut {
@@ -155,12 +133,6 @@ pub struct DeliveryNoteListOut {
     pub total: i64,
     pub limit: i64,
     pub offset: i64,
-}
-
-/// 待司机领取一览（GET /api/v2/com/delivery/note/pickup-pending）。
-#[derive(Debug, Clone, Serialize)]
-pub struct DeliveryNotePickupListOut {
-    pub items: Vec<DeliveryNoteOut>,
 }
 
 /// 候选入单零件（INSPECTION + READY_TO_SHIP 批次，同 L1 根，不在 active 单上）。
@@ -185,10 +157,4 @@ pub struct DeliveryNoteCandidatePart {
     pub customer_name: Option<String>,
     pub parent_customer_name: Option<String>,
     pub customer_path: Option<String>,
-}
-
-/// 候选入单响应（GET /api/v2/com/delivery/note/candidate-parts）。
-#[derive(Debug, Clone, Serialize)]
-pub struct DeliveryNoteCandidatePartsOut {
-    pub items: Vec<DeliveryNoteCandidatePart>,
 }

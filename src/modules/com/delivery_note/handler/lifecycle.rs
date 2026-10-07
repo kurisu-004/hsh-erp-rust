@@ -1,8 +1,10 @@
 //! delivery_note 域状态机转换 handler
 //!
-//! 范围：状态机迁移端点：submit / recall / pickup-scan / pickup。
+//! 范围：状态机迁移端点：submit / recall / pickup。
 //!
 //! 基础 CRUD 走 `crud.rs`；扫码入单走 `scan.rs`；打印走 `print.rs`。
+//!
+//! 2026-10-08：`POST /{id}/pickup-scan`（司机端逐件扫码核销）随送货台一并删除。
 //!
 //! ## 约定（2026-09-22 D-5 + review 第 1 轮）
 //! - 事务边界在 handler：`state.pool.begin()` → 借 `&mut *tx` 喂给 service → 显式
@@ -23,52 +25,46 @@ use axum::Json;
 use axum::extract::{Path, State};
 
 use crate::modules::com::delivery_note::dto::{
-    DeliveryNotePath, DeliveryNotePickupRequest, DeliveryNotePickupScanRequest,
-    DeliveryNoteVersionedRequest,
+    DeliveryNotePath, DeliveryNotePickupRequest, DeliveryNoteVersionedRequest,
 };
-use crate::modules::com::delivery_note::vo::{
-    DeliveryNoteOut, DeliveryNotePickupScanOut, SubmitDeliveryOut,
-};
+use crate::modules::com::delivery_note::vo::DeliveryNoteOut;
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
 
 /// POST /api/v2/com/delivery/note/{id}/submit
 ///
-/// 出参 `SubmitDeliveryOut` 含两种 outcome，前端据此分支：
-/// - `outcome = SUBMITTED`：`note` 为提交后的送货单投影；状态机 DRAFT → SUBMITTED 已发生；
-///   本次提交会发出 `DELIVERY_NOTE_SUBMITTED` 大屏事件。
-/// - `outcome = CANDIDATES_AVAILABLE`：存在仍在 `INSPECTION` 的已挂单批次，**本次未提交**；
-///   `note` 为 `null`；`unresolved_targets` 按 part 分组列出未过检批次（含 `version`，
-///   前端可一键转发到 `POST /prod/batches/to-ship` 让其到 READY_TO_SHIP 后再重提本接口）。
-///   候选分支不写库、不发事件。
+/// 成功即 DRAFT → SUBMITTED 已发生，出参 `R<String>` 是提交后的送货单 id
+/// （雪花 id 序列化为 JSON string）。本次提交会发出 `DELIVERY_NOTE_SUBMITTED`
+/// 大屏事件。
+///
+/// 2026-10-08：旧的 `CANDIDATES_AVAILABLE` 候选分流随入单只允许 `READY_TO_SHIP`
+/// 一并删除（见 `service/lifecycle.rs::submit` 的理由）⇒ 现在只有「提交成功」
+/// 与「硬错误」两条路径。
 pub async fn submit_delivery_note(
     State(state): State<Arc<AppState>>,
     current: crate::auth::rbac::CurrentUser,
     Path(path): Path<DeliveryNotePath>,
     Json(req): Json<DeliveryNoteVersionedRequest>,
-) -> Result<Json<R<SubmitDeliveryOut>>, AppError> {
+) -> Result<Json<R<String>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = state
+    let note_id = state
         .delivery_note_service
         .submit(&mut *tx, path.id, req.version, &current)
         .await?;
     tx.commit().await?;
 
-    // 仅真正提交时广播；候选分支未写库，不发事件
-    if let Some(note) = out.note.as_ref() {
-        state
-            .ws_hub
-            .broadcast(crate::infra::ws_hub::WsEvent::DashboardEvent {
-                kind: "DELIVERY_NOTE_SUBMITTED".to_string(),
-                payload: serde_json::json!({
-                    "delivery_note_id": note.id,
-                    "delivery_note_no": note.delivery_note_no,
-                }),
-            });
-    }
+    state
+        .ws_hub
+        .broadcast(crate::infra::ws_hub::WsEvent::DashboardEvent {
+            kind: "DELIVERY_NOTE_SUBMITTED".to_string(),
+            payload: serde_json::json!({
+                "delivery_note_id": note_id,
+                "delivery_note_no": path.id.to_string(),
+            }),
+        });
 
-    Ok(Json(R::ok(out)))
+    Ok(Json(R::ok(note_id.to_string())))
 }
 
 /// POST /api/v2/com/delivery/note/{id}/recall
@@ -82,28 +78,6 @@ pub async fn recall_delivery_note(
     let out = state
         .delivery_note_service
         .recall(&mut *tx, path.id, req.version, &current)
-        .await?;
-    tx.commit().await?;
-    Ok(Json(R::ok(out)))
-}
-
-/// POST /api/v2/com/delivery/note/{id}/pickup-scan
-pub async fn pickup_scan(
-    State(state): State<Arc<AppState>>,
-    current: crate::auth::rbac::CurrentUser,
-    Path(path): Path<DeliveryNotePath>,
-    Json(req): Json<DeliveryNotePickupScanRequest>,
-) -> Result<Json<R<DeliveryNotePickupScanOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = state
-        .delivery_note_service
-        .pickup_scan(
-            &mut *tx,
-            path.id,
-            &req.part_serial,
-            req.badge_code.as_deref(),
-            &current,
-        )
         .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))

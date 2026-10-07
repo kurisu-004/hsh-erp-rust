@@ -1,7 +1,14 @@
 //! delivery_note 域基础 CRUD handler
 //!
-//! 范围：list / get / create / update / add-parts / remove-parts / soft-delete /
-//! batch-detail / candidate-parts / pickup-pending + 送货分组 CRUD。
+//! 范围：list / get / update / remove-parts / soft-delete / batch-detail +
+//! 送货分组 CRUD。
+//!
+//! 2026-10-08 随入单入口收敛为扫码单一入口删除的 4 条：
+//! - `POST /`（手动建单）
+//! - `POST /{id}/add-parts`
+//! - `GET /candidate-parts`
+//! - `GET /pickup-pending`（并入 `POST /{id}/pickup` 的司机指定动作）
+//! - `POST /{id}/attach-batches`（在 `scan.rs`，随扫码重写删除）
 //!
 //! 状态机转换走 `lifecycle.rs`；扫码入单走 `scan.rs`；打印走 `print.rs`。
 //!
@@ -26,17 +33,15 @@ use axum::extract::{Path, Query, State};
 use serde::Deserialize;
 
 use crate::modules::com::delivery_note::dto::{
-    CreateDeliveryGroupRequest, DeliveryGroupIdRequest, DeliveryNoteAddPartsRequest,
-    DeliveryNoteBatchDetailQuery, DeliveryNoteCandidatePartsQuery, DeliveryNoteCreateRequest,
-    DeliveryNoteListQuery, DeliveryNotePath, DeliveryNotePickupPendingQuery,
-    DeliveryNoteRemovePartsRequest, DeliveryNoteUpdateRequest, DeliveryNoteVersionedRequest,
-    UpdateDeliveryGroupRequest,
+    CreateDeliveryGroupRequest, DeliveryGroupIdRequest, DeliveryNoteBatchDetailQuery,
+    DeliveryNoteListQuery, DeliveryNotePath, DeliveryNoteRemovePartsRequest,
+    DeliveryNoteUpdateRequest, DeliveryNoteVersionedRequest, UpdateDeliveryGroupRequest,
 };
 use crate::modules::com::delivery_note::model::DeliveryNoteSortKey;
 use crate::modules::com::delivery_note::repo::SortDir;
 use crate::modules::com::delivery_note::vo::{
-    BatchDeliveryDetailData, DeliveryGroupListOut, DeliveryGroupOut, DeliveryNoteCandidatePartsOut,
-    DeliveryNoteDetailOut, DeliveryNoteListOut, DeliveryNoteOut, DeliveryNotePickupListOut,
+    BatchDeliveryDetailData, DeliveryGroupListOut, DeliveryGroupOut, DeliveryNoteDetailOut,
+    DeliveryNoteListOut, DeliveryNoteOut,
 };
 use crate::shared::error::AppError;
 use crate::shared::response::R;
@@ -95,36 +100,6 @@ pub async fn batch_get_delivery_notes(
     Ok(Json(R::ok(BatchDeliveryDetailData { items })))
 }
 
-/// GET /api/v2/com/delivery/note/candidate-parts?customer_id=...
-pub async fn list_candidate_parts(
-    State(state): State<Arc<AppState>>,
-    current: crate::auth::rbac::CurrentUser,
-    Query(q): Query<DeliveryNoteCandidatePartsQuery>,
-) -> Result<Json<R<DeliveryNoteCandidatePartsOut>>, AppError> {
-    // 读端点：pool.acquire() → service → drop。
-    let mut conn = state.pool.acquire().await?;
-    let items = state
-        .delivery_note_service
-        .list_candidate_parts(&mut *conn, q.customer_id, &current)
-        .await?;
-    Ok(Json(R::ok(DeliveryNoteCandidatePartsOut { items })))
-}
-
-/// GET /api/v2/com/delivery/note/pickup-pending?customer_id=...
-pub async fn list_pickup_pending(
-    State(state): State<Arc<AppState>>,
-    current: crate::auth::rbac::CurrentUser,
-    Query(q): Query<DeliveryNotePickupPendingQuery>,
-) -> Result<Json<R<DeliveryNotePickupListOut>>, AppError> {
-    // 读端点：pool.acquire() → service → drop。
-    let mut conn = state.pool.acquire().await?;
-    let items = state
-        .delivery_note_service
-        .list_for_pickup(&mut *conn, q.customer_id, &current)
-        .await?;
-    Ok(Json(R::ok(DeliveryNotePickupListOut { items })))
-}
-
 /// GET /api/v2/com/delivery/note
 pub async fn list_delivery_notes(
     State(state): State<Arc<AppState>>,
@@ -174,34 +149,6 @@ pub async fn list_delivery_notes(
     Ok(Json(R::ok(out)))
 }
 
-/// POST /api/v2/com/delivery/note
-pub async fn create_delivery_note(
-    State(state): State<Arc<AppState>>,
-    current: crate::auth::rbac::CurrentUser,
-    Json(req): Json<DeliveryNoteCreateRequest>,
-) -> Result<Json<R<DeliveryNoteDetailOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = state
-        .delivery_note_service
-        .create_draft(&mut *tx, req, &current)
-        .await?;
-    tx.commit().await?;
-
-    // commit 后广播（设计 §5：commit 之后再 push，避免回滚后误推）
-    state
-        .ws_hub
-        .broadcast(crate::infra::ws_hub::WsEvent::DashboardEvent {
-            kind: "DELIVERY_NOTE_CREATED".to_string(),
-            payload: serde_json::json!({
-                "delivery_note_id": out.head.id,
-                "delivery_note_no": out.head.delivery_note_no,
-                "customer_id": out.head.customer_id,
-            }),
-        });
-
-    Ok(Json(R::ok(out)))
-}
-
 /// GET /api/v2/com/delivery/note/{id}
 pub async fn get_delivery_note(
     State(state): State<Arc<AppState>>,
@@ -230,30 +177,6 @@ pub async fn update_delivery_note(
         .update(&mut *tx, path.id, req, &current)
         .await?;
     tx.commit().await?;
-    Ok(Json(R::ok(out)))
-}
-
-/// POST /api/v2/com/delivery/note/{id}/add-parts
-pub async fn add_delivery_note_parts(
-    State(state): State<Arc<AppState>>,
-    current: crate::auth::rbac::CurrentUser,
-    Path(path): Path<DeliveryNotePath>,
-    Json(req): Json<DeliveryNoteAddPartsRequest>,
-) -> Result<Json<R<DeliveryNoteDetailOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = state
-        .delivery_note_service
-        .add_parts(&mut *tx, path.id, &req.items, req.version, &current)
-        .await?;
-    tx.commit().await?;
-
-    state
-        .ws_hub
-        .broadcast(crate::infra::ws_hub::WsEvent::DashboardEvent {
-            kind: "DELIVERY_NOTE_PARTS_ADDED".to_string(),
-            payload: serde_json::json!({"delivery_note_id": out.head.id}),
-        });
-
     Ok(Json(R::ok(out)))
 }
 

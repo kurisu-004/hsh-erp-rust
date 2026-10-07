@@ -32,7 +32,6 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock::now_naive;
 use crate::modules::assembly::repo::AssemblyRepo;
 use crate::modules::com::customer::repo::CustomerRepo;
-use crate::modules::com::delivery_note::model::NoteScope;
 use crate::modules::com::delivery_note::repo::DeliveryNoteRepoTrait;
 use crate::modules::com::delivery_note::vo::{
     AddedBatchDto, RecentItemDto, ResolvedEntityDto, ResolvedKindDto, ScanDeliveryNoteSummaryDto,
@@ -42,7 +41,7 @@ use crate::modules::part::repo::PartRepo;
 use crate::modules::prod::batch::repo::PartBatchRepo;
 use crate::shared::error::{AppError, code};
 
-use super::inner::{GroupWithMemberIds, note_not_found};
+use super::inner::note_not_found;
 
 use super::DeliveryNoteService;
 mod classify;
@@ -184,7 +183,7 @@ impl DeliveryNoteService {
             ScanKind::Unknown => unreachable!("filtered above"),
         };
 
-        // ===== Step 2: 锚点 + L1 + 分类 =====
+        // ===== Step 2: 锚点 → L1 =====
         let leaf_cust = CustomerRepo::get_by_id(&mut *repo.conn_mut(), anchor_customer_id, false)
             .await?
             .ok_or_else(|| {
@@ -193,23 +192,13 @@ impl DeliveryNoteService {
                     format!("anchor customer {anchor_customer_id} not found"),
                 )
             })?;
+        // 建单判定键 2026-10-08 起是 `(customer_id, DRAFT)` 单键：把锚点 L2 客户往上
+        // 推一级即可，不再按分组 / 单厂分成多张草稿（也不再需要查 t_delivery_group）。
         let l1_id = leaf_cust.parent_id.unwrap_or(leaf_cust.id);
-
-        let groups_with_members = repo
-            .group_list_active_groups_with_members_for_l1(l1_id)
-            .await?;
-        let groups_for_classify: Vec<GroupWithMemberIds> = groups_with_members
-            .iter()
-            .map(|(g, m)| GroupWithMemberIds {
-                group_id: g.id,
-                member_ids: m.clone(),
-            })
-            .collect();
-        let scope = NoteScope::classify(anchor_customer_id, &groups_for_classify);
 
         // ===== Step 3: find-or-create 草稿 =====
         let note = self
-            .scan_find_or_create_draft(&mut *repo.conn_mut(), l1_id, scope, current)
+            .scan_find_or_create_draft(&mut *repo.conn_mut(), l1_id, current)
             .await?;
 
         // ===== Step 4: 加载 target 全部活跃 batch → C 组短路 → 5 组分类 =====
@@ -366,43 +355,17 @@ impl DeliveryNoteService {
             .await?
             .len();
 
-        // 重新取一次 L1 客户名（scope_label L1Wide 路径要用）
+        // 草稿卡展示：L1 客户名（scope_label 语义）与「L1 / L2」路径。
+        // 2026-10-08 起不再有 Group / Leaf 分支 —— 判定键是单键，一个 L1 只有一张
+        // DRAFT，展示口径随之退化为「L1 客户名 + 扫码锚点 L2 的完整路径」。
         let l1_cust_name =
             CustomerRepo::get_by_id(&mut *repo.conn_mut(), fresh_note.customer_id, false)
                 .await?
                 .map(|c| c.name);
-
-        // scope_label / customer_path 由 scope 列确定（与 note 自身保持一致）
-        let (group_name, leaf_name) = match scope {
-            NoteScope::Group(gid) => {
-                let gname = groups_with_members
-                    .iter()
-                    .find(|(g, _)| g.id == gid)
-                    .map(|(g, _)| g.name.clone());
-                (gname, None)
-            }
-            NoteScope::Leaf(_cid) => (None, Some(leaf_cust.name.clone())),
-            NoteScope::L1Wide => (None, l1_cust_name.clone()),
-        };
-        let scope_label = match scope {
-            NoteScope::Group(_) => group_name.clone().unwrap_or_else(|| "(group)".to_string()),
-            NoteScope::Leaf(_) => leaf_name.clone().unwrap_or_else(|| "(leaf)".to_string()),
-            NoteScope::L1Wide => l1_cust_name.clone().unwrap_or_else(|| "(L1)".to_string()),
-        };
-        let customer_path = match scope {
-            // 设计 §5：customer_path = 「L1 / L2」或「L1」兜底
-            NoteScope::Leaf(_) => match (&l1_cust_name, &leaf_name) {
-                (Some(l1), Some(l2)) if l1 != l2 => format!("{l1} / {l2}"),
-                (_, Some(l2)) => l2.clone(),
-                (Some(l1), None) => l1.clone(),
-                _ => leaf_cust.name.clone(),
-            },
-            NoteScope::L1Wide => l1_cust_name
-                .clone()
-                .unwrap_or_else(|| leaf_cust.name.clone()),
-            NoteScope::Group(_) => l1_cust_name
-                .clone()
-                .unwrap_or_else(|| leaf_cust.name.clone()),
+        let scope_label = l1_cust_name.clone().unwrap_or_else(|| "(L1)".to_string());
+        let customer_path = match (&l1_cust_name, &leaf_cust.name) {
+            (Some(l1), l2) if l1 != l2 => format!("{l1} / {l2}"),
+            (_, l2) => l2.clone(),
         };
 
         // unresolved_targets 按 outcome 分流构建

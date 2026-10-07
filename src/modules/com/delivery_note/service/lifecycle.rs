@@ -1,4 +1,8 @@
-//! DeliveryNoteService 状态流转与读视图（提交 / 撤回 / 拣货 / 软删 / 候选）。
+//! DeliveryNoteService 状态流转与读视图（提交 / 撤回 / 拣货 / 软删）。
+//!
+//! 2026-10-08：`pickup_scan`（司机端逐件扫码核销）与 `list_candidate_parts`
+//! （候选取批列表）随入单入口收敛一并删除 —— 前端不再有「先挑批次再入单」两条
+//! 并行路径，也不再有独立的送货台扫码核销端点。
 //!
 //! ## 2026-09-22 D-5 + review 第 1 轮修正（service by-value trait）
 //! - 所有方法签名从 `pub async fn xxx(conn: &mut PgConnection, snowflake: &SnowflakeIdGenerator, ...)`
@@ -16,25 +20,16 @@
 //!   helper 是同态私有 helper，调用方走 `&mut *repo.conn_mut()` 喂入（与 iam
 //!   `AccountService::assemble_user_out` 等私有 helper 一致）。
 
-use std::collections::{HashMap, HashSet};
-
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock::now_naive;
-use crate::modules::com::customer::repo::CustomerRepo;
 use crate::modules::com::delivery_note::repo::DeliveryNoteRepoTrait;
-use crate::modules::part::model::TPart;
-use crate::modules::part::repo::PartRepo;
 use crate::modules::part::service::PartService;
 use crate::modules::prod::batch::repo::PartBatchRepo;
 use crate::modules::prod::work_type::repo::WorkTypeRepo;
 use crate::modules::prod::worker::repo::WorkerRepo;
 use crate::shared::error::{AppError, code};
 
-use super::super::vo::{
-    AvailableBatchDto, BatchStatusDto, DeliveryNoteCandidatePart, DeliveryNotePickupScanOut,
-    SubmitDeliveryOut, SubmitOutcomeDto, UnresolvedTargetDto,
-};
-use super::inner::{build_note_outs, note_not_found, note_version_conflict, scope_from_note};
+use super::inner::{build_note_outs, note_not_found, note_version_conflict};
 
 use super::DeliveryNoteService;
 
@@ -46,23 +41,25 @@ const STATUS_DRAFT: &str = "DRAFT";
 const STATUS_SUBMITTED: &str = "SUBMITTED";
 const STATUS_PICKED_UP: &str = "PICKED_UP";
 
-/// P2 业务批次状态常量
-const STATUS_INSPECTION: &str = "INSPECTION";
+/// P2 业务批次状态常量（入单与提交闸门只允许 `READY_TO_SHIP`）
 const STATUS_READY_TO_SHIP: &str = "READY_TO_SHIP";
-
-/// 候选取批上限（与 Python `list_batches_with_part(limit=2000)` 对齐）
-const CANDIDATE_LIMIT: i64 = 2000;
 
 impl DeliveryNoteService {
     // ---------- submit ----------
 
+    /// 返回值就是提交后的送货单 id（JSON string）。
+    ///
+    /// 2026-10-08：`SubmitDeliveryOut` / `SubmitOutcomeDto` 塌缩为 `R<String>`。
+    /// 旧的候选分流（`CANDIDATES_AVAILABLE`）依赖「单上挂着 INSPECTION 批次」这个
+    /// 状态，而入单入口已收敛为只允许 `READY_TO_SHIP`（见 `POST /scan` 的 21405
+    /// 闸门）⇒ DRAFT 单上不可能再有 INSPECTION 批次，候选分支恒不可达。
     pub async fn submit<R: DeliveryNoteRepoTrait>(
         &self,
         mut repo: R,
         note_id: i64,
         version: i32,
         current: &CurrentUser,
-    ) -> Result<SubmitDeliveryOut, AppError> {
+    ) -> Result<i64, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
 
         let mut obj = repo
@@ -79,79 +76,31 @@ impl DeliveryNoteService {
             ));
         }
 
-        // 已挂单批次 + part 展示字段（候选返回需要 serial_no / drawing_no / name）
-        let rows =
-            PartBatchRepo::list_with_part_by_delivery_note(&mut *repo.conn_mut(), note_id).await?;
-        if rows.is_empty() {
+        // 单上必须非空，且全部批次只能是 READY_TO_SHIP。
+        //
+        // 2026-10-08 收窄：入单只允许 READY_TO_SHIP ⇒ DRAFT 单上不可能挂到
+        // INSPECTION 批次 ⇒ 旧的「有 INSPECTION 就返候选让前端一键过检」分流恒不可达，
+        // 连同 `AvailableBatchDto` / `UnresolvedTargetDto` / `SubmitOutcomeDto` 一并
+        // 删除。这里保留一道状态闸门：批次在挂单后被旁路改了状态（既非 READY_TO_SHIP
+        // 也非 DELIVERED 之类可解释态）时 fail-loud，而不是把脏数据提交出去。
+        let note_batches =
+            PartBatchRepo::list_by_delivery_note(&mut *repo.conn_mut(), note_id).await?;
+        if note_batches.is_empty() {
             return Err(AppError::biz(
                 code::BIZ_DELIVERY_NOTE_INVALID_VALUE,
                 "empty delivery note; add parts before submit",
             ));
         }
-
-        // 批次能挂上送货单的前提是 INSPECTION / READY_TO_SHIP 二者之一：
-        // - READY_TO_SHIP：已过检，可提交
-        // - INSPECTION：仍在品检，进候选（本次不提交，交前端一键过检）
-        // - 其余：数据非法（挂单后被旁路改状态），硬报错
-        //
-        // group key = TPart.id（同一工单下的多批次合并）。保留首次出现的 part 顺序、
-        // 同 part 内沿用 repo 的 ORDER BY pb.id ASC 顺序，不另外排序。
-        let mut unresolved: Vec<(TPart, Vec<AvailableBatchDto>)> = Vec::new();
-        for (b, p) in &rows {
-            match b.status.as_str() {
-                STATUS_READY_TO_SHIP => {}
-                STATUS_INSPECTION => {
-                    let status = BatchStatusDto::from_db(&b.status).ok_or_else(|| {
-                        AppError::biz(
-                            code::BIZ_DELIVERY_NOTE_INVALID_VALUE,
-                            format!("batch {} status 非法: {}", b.id, b.status),
-                        )
-                    })?;
-                    let dto = AvailableBatchDto {
-                        batch_id: b.id,
-                        version: b.version,
-                        quantity: b.quantity,
-                        status,
-                    };
-                    match unresolved.iter_mut().find(|(pp, _)| pp.id == p.id) {
-                        Some((_, v)) => v.push(dto),
-                        None => unresolved.push((p.clone(), vec![dto])),
-                    }
-                }
-                other => {
-                    return Err(AppError::biz(
-                        code::BIZ_DELIVERY_BATCH_STATE_INVALID,
-                        format!(
-                            "batch {} status={other}（挂单批次只允许 INSPECTION / READY_TO_SHIP）",
-                            b.batch_no
-                        ),
-                    ));
-                }
+        for b in &note_batches {
+            if b.status != STATUS_READY_TO_SHIP {
+                return Err(AppError::biz(
+                    code::BIZ_DELIVERY_BATCH_STATE_INVALID,
+                    format!(
+                        "批次 {} status={}；入单只允许 READY_TO_SHIP（挂单后被旁路改状态）",
+                        b.batch_no, b.status
+                    ),
+                ));
             }
-        }
-
-        if !unresolved.is_empty() {
-            // 存在未过检批次：不写任何数据，返回候选供前端一键过检。
-            // A 组（READY_TO_SHIP）在 line 87 的空分支已跳过，不进入 unresolved。
-            // 只有 INSPECTION（line 88）进 unresolved 并填 available_batches。
-            // 顺带补 attachable_batches: Vec::new() —— submit 候选分支只列 B 组（INSPECTION 待过检），
-            // A 组（READY_TO_SHIP）走 attach 不在此处出现。
-            let targets = unresolved
-                .into_iter()
-                .map(|(p, available_batches)| UnresolvedTargetDto {
-                    part_id: p.id,
-                    serial_no: p.serial_no.clone().unwrap_or_default(),
-                    drawing_no: p.drawing_no.clone(),
-                    name: p.name.clone(),
-                    available_batches,
-                    attachable_batches: Vec::new(),
-                })
-                .collect();
-            return Ok(SubmitDeliveryOut {
-                outcome: SubmitOutcomeDto::CandidatesAvailable,
-                note: None,
-                unresolved_targets: Some(targets),
-            });
         }
 
         // 状态机：DRAFT → SUBMITTED
@@ -174,12 +123,7 @@ impl DeliveryNoteService {
             .note_get_by_id(note_id, false)
             .await?
             .ok_or_else(|| note_not_found(note_id))?;
-        let out = build_note_outs(&mut *repo.conn_mut(), std::slice::from_ref(&obj)).await?;
-        Ok(SubmitDeliveryOut {
-            outcome: SubmitOutcomeDto::Submitted,
-            note: Some(out.into_iter().next().unwrap()),
-            unresolved_targets: None,
-        })
+        Ok(obj.id)
     }
 
     // ---------- recall ----------
@@ -207,15 +151,18 @@ impl DeliveryNoteService {
             ));
         }
 
-        // 同范围 DRAFT 撞唯一（设计 §3.3 / 21419）：如果存在另一张同范围的活跃 DRAFT 则拒
-        let scope = scope_from_note(&obj);
-        if let Some(_other) = repo
-            .note_find_open_draft_by_scope(obj.customer_id, scope, Some(note_id))
+        // 建单判定键撞唯一（21419）：2026-10-08 起判定键是 `(customer_id, DRAFT)`
+        // 单键，若该 L1 名下已有另一张活跃 DRAFT，recall 会撞数据库部分唯一索引
+        // `uk_t_delivery_note_l1_open_draft` ⇒ 提前用业务码拒，给出可读原因。
+        // 判据不用「排除自己」：被 recall 的单当前是 SUBMITTED，不可能被这条查询命中。
+        if repo
+            .note_find_open_draft_by_l1(obj.customer_id)
             .await?
+            .is_some()
         {
             return Err(AppError::biz(
                 code::BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT,
-                "同范围已存在 DRAFT 草稿；请先处理现有草稿再 recall",
+                "该 L1 名下已存在 DRAFT 草稿；请先处理现有草稿再 recall",
             ));
         }
 
@@ -240,52 +187,6 @@ impl DeliveryNoteService {
             .ok_or_else(|| note_not_found(note_id))?;
         let out = build_note_outs(&mut *repo.conn_mut(), std::slice::from_ref(&obj)).await?;
         Ok(out.into_iter().next().unwrap())
-    }
-
-    // ---------- pickup_scan ----------
-
-    pub async fn pickup_scan<R: DeliveryNoteRepoTrait>(
-        &self,
-        mut repo: R,
-        note_id: i64,
-        part_serial: &str,
-        _badge_code: Option<&str>,
-        current: &CurrentUser,
-    ) -> Result<DeliveryNotePickupScanOut, AppError> {
-        let _ = current;
-
-        let obj = repo
-            .note_get_by_id(note_id, false)
-            .await?
-            .ok_or_else(|| note_not_found(note_id))?;
-        if obj.status != STATUS_SUBMITTED {
-            return Err(AppError::biz(
-                code::BIZ_DELIVERY_NOTE_NOT_SUBMITTED,
-                format!("only SUBMITTED can be scanned, current={}", obj.status),
-            ));
-        }
-
-        let part = PartRepo::get_by_serial(&mut *repo.conn_mut(), part_serial, false).await?;
-        let note_batches =
-            PartBatchRepo::list_by_delivery_note(&mut *repo.conn_mut(), note_id).await?;
-        if part.is_none()
-            || !note_batches
-                .iter()
-                .any(|b| Some(b.part_id) == part.as_ref().map(|p| p.id))
-        {
-            return Err(AppError::biz(
-                code::BIZ_DELIVERY_NOTE_SCAN_MISMATCH,
-                format!("serial {part_serial:?} is not in this delivery note"),
-            ));
-        }
-
-        Ok(DeliveryNotePickupScanOut {
-            delivery_note_id: note_id,
-            scanned_count: 0,
-            expected_count: note_batches.len() as i64,
-            ready: false,
-            scanned_serials: vec![],
-        })
     }
 
     // ---------- pickup ----------
@@ -505,98 +406,5 @@ impl DeliveryNoteService {
             ));
         }
         Ok(())
-    }
-
-    // ---------- list_candidate_parts ----------
-
-    pub async fn list_candidate_parts<R: DeliveryNoteRepoTrait>(
-        &self,
-        mut repo: R,
-        customer_id: i64,
-        current: &CurrentUser,
-    ) -> Result<Vec<DeliveryNoteCandidatePart>, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
-
-        let cust = CustomerRepo::get_by_id(&mut *repo.conn_mut(), customer_id, false)
-            .await?
-            .ok_or_else(|| super::inner::customer_not_found(customer_id))?;
-        if cust.parent_id.is_some() {
-            return Err(AppError::biz(
-                code::BIZ_INVALID_VALUE,
-                format!("customer {customer_id} 不是一级客户；candidate-parts 必须传一级客户"),
-            ));
-        }
-
-        // L1 根下所有 active 子客户 (L2) + L1 自身
-        let children =
-            CustomerRepo::list_children(&mut *repo.conn_mut(), customer_id, false).await?;
-        let mut customer_ids: Vec<i64> = children.iter().map(|c| c.id).collect();
-        customer_ids.push(customer_id);
-        let mut name_by_id: HashMap<i64, String> =
-            children.iter().map(|c| (c.id, c.name.clone())).collect();
-        name_by_id.insert(customer_id, cust.name.clone());
-        let root_name = cust.name.clone();
-
-        let statuses = [STATUS_INSPECTION, STATUS_READY_TO_SHIP];
-        let rows = PartBatchRepo::list_batches_with_part_in_customers(
-            &mut *repo.conn_mut(),
-            &statuses,
-            &customer_ids,
-            CANDIDATE_LIMIT,
-        )
-        .await?;
-
-        // 过滤：在 active 单 (DRAFT/SUBMITTED) 上的批次排除
-        let linked_note_ids: HashSet<i64> = rows
-            .iter()
-            .filter_map(|(b, _)| b.delivery_note_id)
-            .collect();
-        let active_note_ids: HashSet<i64> = if linked_note_ids.is_empty() {
-            HashSet::new()
-        } else {
-            let notes = repo
-                .note_list_by_ids(&linked_note_ids.iter().copied().collect::<Vec<_>>(), false)
-                .await?;
-            notes
-                .into_iter()
-                .filter(|n| n.status == STATUS_DRAFT || n.status == STATUS_SUBMITTED)
-                .map(|n| n.id)
-                .collect()
-        };
-
-        let mut result = Vec::with_capacity(rows.len());
-        for (b, p) in rows {
-            if let Some(dnid) = b.delivery_note_id
-                && active_note_ids.contains(&dnid)
-            {
-                continue;
-            }
-            let leaf_name = name_by_id.get(&p.customer_id).cloned();
-            let path = match (&root_name, &leaf_name) {
-                (r, Some(l)) if r != l => Some(format!("{r} / {l}")),
-                _ => leaf_name.clone(),
-            };
-            result.push(DeliveryNoteCandidatePart {
-                id: p.id,
-                batch_id: b.id,
-                batch_no: b.batch_no,
-                batch_label: match &p.serial_no {
-                    Some(s) => format!("{s}B{:02}", b.batch_no),
-                    None => format!("批次{}", b.batch_no),
-                },
-                serial_no: p.serial_no.clone().unwrap_or_default(),
-                drawing_no: p.drawing_no.clone(),
-                name: p.name.clone(),
-                quantity: b.quantity,
-                applicant_name: None, // TPart 当前投影不含该列（part 域实施阶段补）
-                status: b.status.clone(),
-                planned_delivery_date: None, // 同上
-                order_no: None,              // 同上
-                customer_name: leaf_name.clone(),
-                parent_customer_name: Some(root_name.clone()),
-                customer_path: path,
-            });
-        }
-        Ok(result)
     }
 }

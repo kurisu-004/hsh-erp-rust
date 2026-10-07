@@ -8,13 +8,14 @@
 //! 出参（响应）VO 已拆分到 `super::vo`（2026-09-22 PR4 重构，对齐 iam
 //! vo/ 范本）。本文件仅保留 `Deserialize` 入参。
 //!
-//! 打印端点的入参不进本文件：转发链路上 body 以 `Json<Value>` 原样透传给
-//! python，字段语义由 python 端 schema 负责（2026-10-03 BFF 转发）。
+//! 2026-10-08：删掉手动建单入参 `DeliveryNoteCreateRequest` / 入单条目
+//! `DeliveryNoteAddItem` / 添加零件入参 `DeliveryNoteAddPartsRequest` —— 入单入口
+//! 收敛为 `POST /scan` 单一入口后，前端不再有「先建单再挂批次」的两段式表单。
 //!
-//! ## Phase 范围
-//! - **P1**：送货分组（§6.1）
-//! - **P2**：送货单生命周期 + 候选入单（不含扫码 P3 / 打印 P4）
-//! - **P3**：扫码入单（§5）—— ScanRequest 等
+//! ## 分段
+//! - 送货分组：创建 / 更新 / 软删三组入参
+//! - 送货单：版本化 OCC 入参 / partial update / 移除批次 / 领取 / 列表 query /
+//!   扫码入单
 
 use chrono::NaiveDate;
 use serde::Deserialize;
@@ -68,33 +69,6 @@ pub struct DeliveryGroupIdRequest {
 //  P2：送货单生命周期 DTO（移植 + 范围字段扩展）
 // ===========================================================================
 
-/// 入单条目（批次 + 可选部分数量）。
-#[derive(Debug, Clone, Deserialize)]
-pub struct DeliveryNoteAddItem {
-    #[serde(deserialize_with = "crate::shared::types::deserialize_i64")]
-    pub batch_id: i64,
-    /// None = 整批；Some(n) 且 n < batch.quantity → 服务端拆分
-    pub quantity: Option<i32>,
-}
-
-/// 创建草稿入参（POST /api/v2/com/delivery/note）。
-#[derive(Debug, Clone, Deserialize)]
-pub struct DeliveryNoteCreateRequest {
-    #[serde(deserialize_with = "crate::shared::types::deserialize_i64")]
-    pub customer_id: i64,
-    pub delivery_date: Option<NaiveDate>,
-    #[serde(default)]
-    pub items: Vec<DeliveryNoteAddItem>,
-    pub note: Option<String>,
-}
-
-/// 添加零件入参（POST /api/v2/com/delivery/note/{id}/add-parts）。
-#[derive(Debug, Clone, Deserialize)]
-pub struct DeliveryNoteAddPartsRequest {
-    pub items: Vec<DeliveryNoteAddItem>,
-    pub version: i32,
-}
-
 /// 移除零件入参（POST /api/v2/com/delivery/note/{id}/remove-parts）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeliveryNoteRemovePartsRequest {
@@ -115,13 +89,6 @@ pub struct DeliveryNoteUpdateRequest {
     pub version: i32,
     pub delivery_date: Option<NaiveDate>,
     pub note: Option<String>,
-}
-
-/// 扫码入单（每扫一个件一次；P3 主用，P2 保留 stub 兼容性）。
-#[derive(Debug, Clone, Deserialize)]
-pub struct DeliveryNotePickupScanRequest {
-    pub part_serial: String,
-    pub badge_code: Option<String>,
 }
 
 /// 领取入参（POST /api/v2/com/delivery/note/{id}/pickup）。
@@ -200,31 +167,3 @@ pub struct DeliveryNotePath {
 pub struct ScanDeliveryRequest {
     pub code: String,
 }
-
-// ===========================================================================
-//  attach_batches 入参（POST /api/v2/com/delivery/note/{id}/attach-batches）
-// ===========================================================================
-
-/// `POST /api/v2/com/delivery/note/{note_id}/attach-batches` 请求体。
-///
-/// 弹窗勾选若干 A 组批次（INSPECTION / READY_TO_SHIP）一次性 attach 到指定
-/// DRAFT 送货单。每个 item 带 `version`（OCC 校验）；后端逐项独立处理：
-/// 失败项进入响应 `conflicts` 列表，不中断其它项；最终返回 200。
-#[derive(Debug, Clone, Deserialize)]
-pub struct AttachBatchesRequest {
-    pub batches: Vec<AttachBatchItem>,
-}
-
-/// 单个批次入参。
-///
-/// `batch_id` 用字符串反序列化（与 `t_part_batch.id` 列一致；前端 JSON 用
-/// 字符串防 JS 精度截断），`version` 是 t_part_batch 当前乐观锁版本。
-#[derive(Debug, Clone, Deserialize)]
-pub struct AttachBatchItem {
-    #[serde(deserialize_with = "crate::shared::types::deserialize_i64")]
-    pub batch_id: i64,
-    pub version: i32,
-}
-
-// 注：原本 dto.rs 中 `use serde::Serialize` / `serialize_i64*` 全部移除，
-// 出参类型已迁出至 `super::vo`（2026-09-22 PR4 重构）。

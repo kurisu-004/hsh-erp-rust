@@ -1,10 +1,14 @@
-//! DeliveryNoteService 列表 / 草稿 / 详情 / 编辑 / 添加 / 移除。
+//! DeliveryNoteService 列表 / 详情 / 编辑 / 移除。
+//!
+//! 2026-10-08：`create_draft`（手动建单）与 `add_parts` 两个方法随入单入口收敛删除
+//! —— `POST /` 与 `POST /{id}/add-parts` 下线后，草稿只可能由扫码入口创建
+//! （`POST /scan` 内部的 `scan_find_or_create_draft`）。
 //!
 //! ## 2026-09-22 D-5 + review 第 1 轮修正（service by-value trait）
 //! - 所有方法签名从 `pub async fn xxx(conn: &mut PgConnection, snowflake: &SnowflakeIdGenerator, ...)`
 //!   改成 `pub async fn xxx<R: DeliveryNoteRepoTrait>(&self, mut repo: R, ...)`（iam 严格范本）。
-//! - 跨域 ZST 静态调用走 `&mut *repo.conn_mut()`；私有 helper（`add_parts_inner` /
-//!   `build_note_outs` / `get_with_parts`）收 `&mut PgConnection`，
+//! - 跨域 ZST 静态调用走 `&mut *repo.conn_mut()`；私有 helper
+//!   （`build_note_outs` / `get_with_parts`）收 `&mut PgConnection`，
 //!   caller 喂 `&mut *repo.conn_mut()`。
 //! - 原 `sqlx::query!(...)` 直调走 `&mut *repo.conn_mut()` 替换 `&mut *conn`。
 
@@ -12,7 +16,6 @@ use std::collections::HashMap;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock::now_naive;
-use crate::infra::serial::next_delivery_note_no;
 use crate::modules::com::customer::repo::CustomerRepo;
 use crate::modules::com::delivery_note::repo::DeliveryNoteRepoTrait;
 use crate::modules::part::model::TPart;
@@ -20,15 +23,10 @@ use crate::modules::part::repo::PartRepo;
 use crate::modules::prod::batch::repo::PartBatchRepo;
 use crate::shared::error::{AppError, code};
 
-use super::super::dto::{
-    DeliveryNoteAddItem, DeliveryNoteCreateRequest, DeliveryNoteUpdateRequest,
-};
-use super::super::model::DeliveryNote;
+use super::super::dto::DeliveryNoteUpdateRequest;
 use super::super::repo::SortDir;
 use super::super::vo::{DeliveryNoteDetailOut, DeliveryNoteListOut, DeliveryNoteOut};
-use super::inner::{
-    add_parts_inner, build_note_outs, get_with_parts, note_not_found, note_version_conflict,
-};
+use super::inner::{build_note_outs, get_with_parts, note_not_found, note_version_conflict};
 use super::note_shippable_sets;
 
 use super::DeliveryNoteService;
@@ -81,89 +79,6 @@ impl DeliveryNoteService {
             limit,
             offset,
         })
-    }
-
-    pub async fn list_for_pickup<R: DeliveryNoteRepoTrait>(
-        &self,
-        mut repo: R,
-        customer_id: Option<i64>,
-        current: &CurrentUser,
-    ) -> Result<Vec<DeliveryNoteOut>, AppError> {
-        // 司机扫码台用：任意已登录账号 + service 层校验 driver work_type
-        // 这里不做角色硬限；具体 worker 校验在 pickup/pickup_scan 里。
-        let _ = current;
-
-        let rows = repo.note_list_for_pickup(customer_id).await?;
-        build_note_outs(&mut *repo.conn_mut(), &rows).await
-    }
-
-    // ---------- create_draft ----------
-
-    pub async fn create_draft<R: DeliveryNoteRepoTrait>(
-        &self,
-        mut repo: R,
-        req: DeliveryNoteCreateRequest,
-        current: &CurrentUser,
-    ) -> Result<DeliveryNoteDetailOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
-
-        // 1. 校验 L1 存在且是 L1（parent_id IS NULL）
-        let l1 = CustomerRepo::get_by_id(&mut *repo.conn_mut(), req.customer_id, false)
-            .await?
-            .ok_or_else(|| super::inner::customer_not_found(req.customer_id))?;
-        if l1.parent_id.is_some() {
-            return Err(AppError::biz(
-                code::BIZ_DELIVERY_NOTE_PARTS_MULTIPLE_CUSTOMERS,
-                format!(
-                    "customer {l1_id} 不是一级客户（parent_id 必须为 NULL）；送货单必须挂在一级客户下",
-                    l1_id = req.customer_id
-                ),
-            ));
-        }
-
-        // 2. 发放单号
-        let delivery_note_no =
-            next_delivery_note_no(&mut *repo.conn_mut(), req.customer_id).await?;
-
-        // 3. 写入草稿
-        let now = now_naive();
-        let note = DeliveryNote {
-            id: self.snowflake.next_id(),
-            delivery_note_no,
-            customer_id: req.customer_id,
-            status: STATUS_DRAFT.to_string(),
-            submitted_at: None,
-            picked_up_at: None,
-            submitted_by: None,
-            picked_up_by: None,
-            driver_worker_id: None,
-            note: req.note,
-            delivery_date: Some(req.delivery_date.unwrap_or_else(|| now.date())),
-            version: 0,
-            created_at: now,
-            created_by: Some(current.id),
-            updated_at: now,
-            updated_by: Some(current.id),
-            deleted_at: None,
-            delivery_group_id: None,
-            leaf_customer_id: None,
-        };
-        repo.note_create(&note).await?;
-
-        // 4. 原子带入首批零件（如果给了 items）
-        if !req.items.is_empty() {
-            add_parts_inner(
-                &mut *repo.conn_mut(),
-                &self.snowflake,
-                note.id,
-                &req.items,
-                note.version,
-                current,
-            )
-            .await?;
-        }
-
-        get_with_parts(&mut *repo.conn_mut(), note.id).await
     }
 
     // ---------- get_with_parts ----------
@@ -432,29 +347,6 @@ impl DeliveryNoteService {
         }
         let out = build_note_outs(&mut *repo.conn_mut(), std::slice::from_ref(&obj)).await?;
         Ok(out.into_iter().next().unwrap())
-    }
-
-    // ---------- add_parts ----------
-
-    pub async fn add_parts<R: DeliveryNoteRepoTrait>(
-        &self,
-        mut repo: R,
-        note_id: i64,
-        items: &[DeliveryNoteAddItem],
-        version: i32,
-        current: &CurrentUser,
-    ) -> Result<DeliveryNoteDetailOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
-        add_parts_inner(
-            &mut *repo.conn_mut(),
-            &self.snowflake,
-            note_id,
-            items,
-            version,
-            current,
-        )
-        .await?;
-        get_with_parts(&mut *repo.conn_mut(), note_id).await
     }
 
     // ---------- remove_parts ----------
