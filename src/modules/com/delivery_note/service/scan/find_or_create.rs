@@ -13,7 +13,7 @@
 
 use crate::auth::rbac::CurrentUser;
 use crate::infra::{clock::now_naive, serial::next_delivery_note_no};
-use crate::modules::delivery_note::{
+use crate::modules::com::delivery_note::{
     model::{DeliveryNote, NoteScope},
     repo::DeliveryNoteRepoTrait,
 };

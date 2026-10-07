@@ -25,16 +25,16 @@ use axum::extract::{Path, Query, State};
 
 use serde::Deserialize;
 
-use crate::modules::delivery_note::dto::{
+use crate::modules::com::delivery_note::dto::{
     CreateDeliveryGroupRequest, DeliveryGroupIdRequest, DeliveryNoteAddPartsRequest,
     DeliveryNoteBatchDetailQuery, DeliveryNoteCandidatePartsQuery, DeliveryNoteCreateRequest,
     DeliveryNoteListQuery, DeliveryNotePath, DeliveryNotePickupPendingQuery,
     DeliveryNoteRemovePartsRequest, DeliveryNoteUpdateRequest, DeliveryNoteVersionedRequest,
     UpdateDeliveryGroupRequest,
 };
-use crate::modules::delivery_note::model::DeliveryNoteSortKey;
-use crate::modules::delivery_note::repo::SortDir;
-use crate::modules::delivery_note::vo::{
+use crate::modules::com::delivery_note::model::DeliveryNoteSortKey;
+use crate::modules::com::delivery_note::repo::SortDir;
+use crate::modules::com::delivery_note::vo::{
     BatchDeliveryDetailData, DeliveryGroupListOut, DeliveryGroupOut, DeliveryNoteCandidatePartsOut,
     DeliveryNoteDetailOut, DeliveryNoteEventOut, DeliveryNoteListOut, DeliveryNoteOut,
     DeliveryNotePickupListOut,
@@ -45,7 +45,7 @@ use crate::state::AppState;
 
 const BATCH_DETAIL_MAX_IDS: usize = 200;
 
-/// `GET /api/v2/delivery-notes/batch-detail?ids=1,2,3`
+/// `GET /api/v2/com/delivery/note/batch-detail?ids=1,2,3`
 ///
 /// 入参 `ids` 是逗号分隔字符串；空 / 越界 / 重复（保留首次出现顺序）/ 非 i64
 /// 都会被规范化或拒为 `BIZ_INVALID_VALUE`（20104）。缺失的 id 静默跳过（按
@@ -96,7 +96,7 @@ pub async fn batch_get_delivery_notes(
     Ok(Json(R::ok(BatchDeliveryDetailData { items })))
 }
 
-/// GET /api/v2/delivery-notes/candidate-parts?customer_id=...
+/// GET /api/v2/com/delivery/note/candidate-parts?customer_id=...
 pub async fn list_candidate_parts(
     State(state): State<Arc<AppState>>,
     current: crate::auth::rbac::CurrentUser,
@@ -111,7 +111,7 @@ pub async fn list_candidate_parts(
     Ok(Json(R::ok(DeliveryNoteCandidatePartsOut { items })))
 }
 
-/// GET /api/v2/delivery-notes/pickup-pending?customer_id=...
+/// GET /api/v2/com/delivery/note/pickup-pending?customer_id=...
 pub async fn list_pickup_pending(
     State(state): State<Arc<AppState>>,
     current: crate::auth::rbac::CurrentUser,
@@ -126,7 +126,7 @@ pub async fn list_pickup_pending(
     Ok(Json(R::ok(DeliveryNotePickupListOut { items })))
 }
 
-/// GET /api/v2/delivery-notes
+/// GET /api/v2/com/delivery/note
 pub async fn list_delivery_notes(
     State(state): State<Arc<AppState>>,
     current: crate::auth::rbac::CurrentUser,
@@ -175,7 +175,7 @@ pub async fn list_delivery_notes(
     Ok(Json(R::ok(out)))
 }
 
-/// POST /api/v2/delivery-notes
+/// POST /api/v2/com/delivery/note
 pub async fn create_delivery_note(
     State(state): State<Arc<AppState>>,
     current: crate::auth::rbac::CurrentUser,
@@ -203,7 +203,7 @@ pub async fn create_delivery_note(
     Ok(Json(R::ok(out)))
 }
 
-/// GET /api/v2/delivery-notes/{id}
+/// GET /api/v2/com/delivery/note/{id}
 pub async fn get_delivery_note(
     State(state): State<Arc<AppState>>,
     _current: crate::auth::rbac::CurrentUser,
@@ -218,7 +218,7 @@ pub async fn get_delivery_note(
     Ok(Json(R::ok(out)))
 }
 
-/// GET /api/v2/delivery-notes/{id}/events
+/// GET /api/v2/com/delivery/note/{id}/events
 pub async fn list_delivery_note_events(
     State(state): State<Arc<AppState>>,
     _current: crate::auth::rbac::CurrentUser,
@@ -233,7 +233,7 @@ pub async fn list_delivery_note_events(
     Ok(Json(R::ok(events)))
 }
 
-/// POST /api/v2/delivery-notes/{id}/update
+/// POST /api/v2/com/delivery/note/{id}/update
 pub async fn update_delivery_note(
     State(state): State<Arc<AppState>>,
     current: crate::auth::rbac::CurrentUser,
@@ -249,7 +249,7 @@ pub async fn update_delivery_note(
     Ok(Json(R::ok(out)))
 }
 
-/// POST /api/v2/delivery-notes/{id}/add-parts
+/// POST /api/v2/com/delivery/note/{id}/add-parts
 pub async fn add_delivery_note_parts(
     State(state): State<Arc<AppState>>,
     current: crate::auth::rbac::CurrentUser,
@@ -273,7 +273,7 @@ pub async fn add_delivery_note_parts(
     Ok(Json(R::ok(out)))
 }
 
-/// POST /api/v2/delivery-notes/{id}/remove-parts
+/// POST /api/v2/com/delivery/note/{id}/remove-parts
 pub async fn remove_delivery_note_parts(
     State(state): State<Arc<AppState>>,
     current: crate::auth::rbac::CurrentUser,
@@ -289,7 +289,7 @@ pub async fn remove_delivery_note_parts(
     Ok(Json(R::ok(out)))
 }
 
-/// POST /api/v2/delivery-notes/{id}/soft-delete
+/// POST /api/v2/com/delivery/note/{id}/soft-delete
 pub async fn soft_delete_delivery_note(
     State(state): State<Arc<AppState>>,
     current: crate::auth::rbac::CurrentUser,

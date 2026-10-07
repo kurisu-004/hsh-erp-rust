@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use chrono::NaiveDateTime;
 use sqlx::PgExecutor;
 
-use crate::modules::delivery_note::model::{DeliveryNoteSortKey, NoteScope};
+use crate::modules::com::delivery_note::model::{DeliveryNoteSortKey, NoteScope};
 
 use super::super::model::{DeliveryGroup, DeliveryGroupMember, DeliveryNote, DeliveryNoteEvent};
 use super::SortDir;

@@ -13,6 +13,16 @@
 //! 2026-10-05 该端点加第四态 `row_type=PART_FLAT`（合计四态）：仅 `t_part`、含
 //! 装配件子件，与 dashboard 交期分桶柱状图的 `t_part` 行口径一致（下钻列表用），
 //! 装配件父行（`t_assembly`）不计入不展示。
+//!
+//! 2026-10-08 新增 `delivery_note` 子模块：送货单 + 送货分组自顶层
+//! `delivery_note` 域平移进来，URL **硬切无 alias**（旧 `/api/v2/delivery-notes`
+//! 与 `/api/v2/delivery-groups` 一律 404）—— 与 2026-09-19 com 聚合、
+//! 2026-10-02 shelf_process 硬切同一先例。
+//!
+//! 送货单的多个前缀收敛成**一个** nest：`/delivery` 下再分 `note`（送货单本体）
+//! 与 `group`（送货分组）。分组表 `t_delivery_group` / `t_delivery_group_member`
+//! 仍在使用（按 L2 归属分单展示），故 `/group` 段保留。整域契约见
+//! `docs/api/delivery_note.md`。
 
 use std::sync::Arc;
 
@@ -22,6 +32,7 @@ use crate::state::AppState;
 
 pub mod applicant;
 pub mod customer;
+pub mod delivery_note;
 pub mod union_list;
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -29,4 +40,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .nest("/customers", customer::router())
         .nest("/applicants", applicant::router())
         .nest("/union-list", union_list::router())
+        // 2026-10-08 送货单 + 送货分组（自顶层 delivery_note 域平移，URL 硬切无 alias）。
+        // 内部再分 `/note` 与 `/group` 两个子 nest，见 `delivery_note::router()`。
+        .nest("/delivery", delivery_note::router())
 }

@@ -32,9 +32,9 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock::now_naive;
 use crate::modules::assembly::repo::AssemblyRepo;
 use crate::modules::com::customer::repo::CustomerRepo;
-use crate::modules::delivery_note::model::NoteScope;
-use crate::modules::delivery_note::repo::DeliveryNoteRepoTrait;
-use crate::modules::delivery_note::vo::{
+use crate::modules::com::delivery_note::model::NoteScope;
+use crate::modules::com::delivery_note::repo::DeliveryNoteRepoTrait;
+use crate::modules::com::delivery_note::vo::{
     AddedBatchDto, RecentItemDto, ResolvedEntityDto, ResolvedKindDto, ScanDeliveryNoteSummaryDto,
     ScanDeliveryOut, ScanOutcomeDto,
 };
@@ -67,7 +67,7 @@ pub(crate) use classify::{classify_invalid_state, is_attachable_state};
 impl DeliveryNoteService {
     // ---------- scan_add (P3，§5) ----------
 
-    /// 扫码入单（POST /delivery-notes/scan）。
+    /// 扫码入单（POST /api/v2/com/delivery/note/scan）。
     ///
     /// 流程概要（设计 §5 + scan-route-b-fix.md）：
     /// 1. 解析（trim + exact match part→assembly→404）；

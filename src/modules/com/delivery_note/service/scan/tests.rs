@@ -13,7 +13,7 @@
 #[cfg(test)]
 mod classify_tests {
     use super::super::GroupWithMemberIds;
-    use crate::modules::delivery_note::model::NoteScope;
+    use crate::modules::com::delivery_note::model::NoteScope;
 
     fn g(id: i64, members: &[i64]) -> GroupWithMemberIds {
         GroupWithMemberIds {
@@ -386,7 +386,7 @@ mod attachable_batches_tests {
         TargetEvaluation, build_unresolved_target, classify_invalid_state, classify_outcome,
     };
     use super::super::helpers::{to_attachable_batch_dto, to_available_batch_dto};
-    use crate::modules::delivery_note::vo::{
+    use crate::modules::com::delivery_note::vo::{
         AttachableBatchDto, AvailableBatchDto, BatchStatusDto, ScanOutcomeDto, UnresolvedTargetDto,
     };
     use crate::modules::part::model::TPart;

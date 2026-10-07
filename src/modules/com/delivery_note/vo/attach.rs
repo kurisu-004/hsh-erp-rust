@@ -2,7 +2,7 @@
 
 use serde::Serialize;
 
-/// `POST /api/v2/delivery-notes/{note_id}/attach-batches` 响应。
+/// `POST /api/v2/com/delivery/note/{note_id}/attach-batches` 响应。
 ///
 /// 即使部分失败也始终返回 200，前端按 `conflicts` 列表做差异处理：
 /// - 全失败：`attached=0`、`conflicts` 非空

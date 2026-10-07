@@ -29,17 +29,17 @@ use axum::Json;
 use axum::extract::{Path, State};
 
 use crate::auth::rbac::{CurrentUser, Role};
-use crate::modules::delivery_note::dto::{
+use crate::modules::com::delivery_note::dto::{
     AttachBatchesRequest, DeliveryNotePath, ScanDeliveryRequest,
 };
-use crate::modules::delivery_note::vo::{
+use crate::modules::com::delivery_note::vo::{
     AttachBatchesOut, ResolvedKindDto, ScanDeliveryOut, ScanOutcomeDto,
 };
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
 
-/// POST /api/v2/delivery-notes/scan  （设计 §5；P3）
+/// POST /api/v2/com/delivery/note/scan  （设计 §5；P3）
 ///
 /// 扫码入单：trim → 解析（part → assembly）→ 分类 → find-or-create 草稿 → 批次
 /// 评估 → 写 `delivery_note_id`（整个流程在事务内）。commit 后广播一次大屏事件
@@ -94,7 +94,7 @@ pub async fn scan_delivery_note(
     Ok(Json(R::ok(out)))
 }
 
-/// POST /api/v2/delivery-notes/{note_id}/attach-batches
+/// POST /api/v2/com/delivery/note/{note_id}/attach-batches
 ///
 /// 弹窗提交时调用，把 A 组（INSPECTION / READY_TO_SHIP）批次 attach 到指定 DRAFT 送货单。
 /// 部分失败（OCC / 状态非法 / 重复）→ 200 + conflicts 列表。

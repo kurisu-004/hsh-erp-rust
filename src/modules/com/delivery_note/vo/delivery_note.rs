@@ -125,7 +125,7 @@ pub struct DeliveryNoteDetailOut {
     pub scanned_serials: Vec<String>,
 }
 
-/// `GET /delivery-notes/batch-detail?ids=...` 响应载体。
+/// `GET /api/v2/com/delivery/note/batch-detail?ids=...` 响应载体。
 ///
 /// 仅作为 `items: [DeliveryNoteDetailOut]` 的轻量封装，避免 schema 顶层直接
 /// 给出数组（信封 `data` 不能是裸数组）。`DeliveryNoteDetailOut` 自身已
@@ -167,7 +167,7 @@ pub struct DeliveryNotePickupScanOut {
     pub scanned_serials: Vec<String>,
 }
 
-/// 一览响应（GET /delivery-notes；含分页总计）。
+/// 一览响应（GET /api/v2/com/delivery/note；含分页总计）。
 #[derive(Debug, Clone, Serialize)]
 pub struct DeliveryNoteListOut {
     pub items: Vec<DeliveryNoteOut>,
@@ -176,7 +176,7 @@ pub struct DeliveryNoteListOut {
     pub offset: i64,
 }
 
-/// 待司机领取一览（GET /delivery-notes/pickup-pending）。
+/// 待司机领取一览（GET /api/v2/com/delivery/note/pickup-pending）。
 #[derive(Debug, Clone, Serialize)]
 pub struct DeliveryNotePickupListOut {
     pub items: Vec<DeliveryNoteOut>,
@@ -206,7 +206,7 @@ pub struct DeliveryNoteCandidatePart {
     pub customer_path: Option<String>,
 }
 
-/// 候选入单响应（GET /delivery-notes/candidate-parts）。
+/// 候选入单响应（GET /api/v2/com/delivery/note/candidate-parts）。
 #[derive(Debug, Clone, Serialize)]
 pub struct DeliveryNoteCandidatePartsOut {
     pub items: Vec<DeliveryNoteCandidatePart>,

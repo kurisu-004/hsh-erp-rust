@@ -1,7 +1,7 @@
 //! delivery_note 域打印 handler（BFF 转发 + 套数注入）
 //!
-//! 2026-10-03：2 个端点改为**纯转发**——`POST /delivery-notes/{id}/print` 与
-//! `POST /delivery-notes/{id}/print-labels` 只做「鉴权 + 闸门 + 转发」，渲染动作
+//! 2026-10-03：2 个端点改为**纯转发**——`POST /api/v2/com/delivery/note/{id}/print` 与
+//! `POST /api/v2/com/delivery/note/{id}/print-labels` 只做「鉴权 + 闸门 + 转发」，渲染动作
 //! （模板填表 / 标签生成）全在 python 侧执行。
 //!
 //! 2026-10-04：转发前**读本单批次算装配件可出货套数**并注入 body 的
@@ -65,8 +65,8 @@ use serde_json::{Map, Value, json};
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::modules::assembly::repo::AssemblyRepo;
-use crate::modules::delivery_note::dto::DeliveryNotePath;
-use crate::modules::delivery_note::service::note_shippable_sets;
+use crate::modules::com::delivery_note::dto::DeliveryNotePath;
+use crate::modules::com::delivery_note::service::note_shippable_sets;
 use crate::modules::part::model::TPart;
 use crate::modules::part::repo::PartRepo;
 use crate::modules::prod::batch::repo::PartBatchRepo;
@@ -181,7 +181,7 @@ async fn with_shippable_sets(
     Ok(Value::Object(out))
 }
 
-/// `POST /api/v2/delivery-notes/{id}/print` —— 鉴权 + 注入套数 + 转发
+/// `POST /api/v2/com/delivery/note/{id}/print` —— 鉴权 + 注入套数 + 转发
 ///
 /// 转发到 python `POST /api/v1/delivery-notes/{id}/print`（路径同名），
 /// 拿回 xlsx 字节流原样返回。
@@ -203,7 +203,7 @@ pub async fn print_delivery_note(
     Ok((resp.status, resp.headers, resp.body).into_response())
 }
 
-/// `POST /api/v2/delivery-notes/{id}/print-labels` —— 鉴权 + 注入套数 + 转发
+/// `POST /api/v2/com/delivery/note/{id}/print-labels` —— 鉴权 + 注入套数 + 转发
 ///
 /// 转发到 python `POST /api/v1/delivery-notes/{id}/print-labels`（路径同名）。
 /// 注入逻辑与 `/print` **完全一致**（同一 helper）：两个端点的 xlsx 行构建在

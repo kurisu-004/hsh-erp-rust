@@ -295,7 +295,7 @@ async fn scan_empty_code_returns_400_20104() {
         app,
         json_request(
             "POST",
-            "/delivery-notes/scan",
+            "/com/delivery/note/scan",
             Some(json!({"code": "   "})),
             Some(&token),
         ),
@@ -316,7 +316,7 @@ async fn scan_unknown_code_returns_404_21417() {
         app,
         json_request(
             "POST",
-            "/delivery-notes/scan",
+            "/com/delivery/note/scan",
             Some(json!({"code": "NOPE9999"})),
             Some(&token),
         ),
@@ -338,7 +338,7 @@ async fn scan_single_part_inspection_happy_path() {
         app.clone(),
         json_request(
             "POST",
-            "/delivery-notes/scan",
+            "/com/delivery/note/scan",
             Some(json!({"code": "P001"})),
             Some(&token),
         ),
@@ -395,7 +395,7 @@ async fn scan_rescan_same_part_idempotent_already_present() {
         app.clone(),
         json_request(
             "POST",
-            "/delivery-notes/scan",
+            "/com/delivery/note/scan",
             Some(json!({"code": "P002"})),
             Some(&token),
         ),
@@ -409,7 +409,7 @@ async fn scan_rescan_same_part_idempotent_already_present() {
         app,
         json_request(
             "POST",
-            "/delivery-notes/scan",
+            "/com/delivery/note/scan",
             Some(json!({"code": "P002"})),
             Some(&token),
         ),
@@ -442,7 +442,7 @@ async fn scan_part_in_process_returns_400_21405() {
         app,
         json_request(
             "POST",
-            "/delivery-notes/scan",
+            "/com/delivery/note/scan",
             Some(json!({"code": "P003"})),
             Some(&token),
         ),
@@ -480,7 +480,7 @@ async fn scan_part_in_process_on_production_shelf_returns_candidates() {
         app,
         json_request(
             "POST",
-            "/delivery-notes/scan",
+            "/com/delivery/note/scan",
             Some(json!({"code": "PE0002"})),
             Some(&token),
         ),
@@ -562,7 +562,7 @@ async fn scan_part_on_other_active_note_returns_409_21406() {
         app.clone(),
         json_request(
             "POST",
-            "/delivery-notes",
+            "/com/delivery/note",
             Some(json!({
                 "customer_id": l1.to_string(),
                 "items": [{"batch_id": bid.to_string()}],
@@ -582,7 +582,7 @@ async fn scan_part_on_other_active_note_returns_409_21406() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/delivery-notes/{other_id}/submit"),
+            &format!("/com/delivery/note/{other_id}/submit"),
             Some(json!({"version": 0})),
             Some(&token),
         ),
@@ -595,7 +595,7 @@ async fn scan_part_on_other_active_note_returns_409_21406() {
         app,
         json_request(
             "POST",
-            "/delivery-notes/scan",
+            "/com/delivery/note/scan",
             Some(json!({"code": "P004"})),
             Some(&token),
         ),
@@ -639,7 +639,7 @@ async fn scan_assembly_full_all_subparts_ready_added() {
         app.clone(),
         json_request(
             "POST",
-            "/delivery-notes/scan",
+            "/com/delivery/note/scan",
             Some(json!({"code": "L1067"})),
             Some(&token),
         ),
@@ -713,7 +713,7 @@ async fn scan_assembly_atomic_reject_with_failures() {
         app,
         json_request(
             "POST",
-            "/delivery-notes/scan",
+            "/com/delivery/note/scan",
             Some(json!({"code": "L2099"})),
             Some(&token),
         ),
@@ -778,7 +778,7 @@ async fn scan_assembly_rescan_idempotent_already_present() {
         app.clone(),
         json_request(
             "POST",
-            "/delivery-notes/scan",
+            "/com/delivery/note/scan",
             Some(json!({"code": "L3055"})),
             Some(&token),
         ),
@@ -791,7 +791,7 @@ async fn scan_assembly_rescan_idempotent_already_present() {
         app,
         json_request(
             "POST",
-            "/delivery-notes/scan",
+            "/com/delivery/note/scan",
             Some(json!({"code": "L3055"})),
             Some(&token),
         ),
@@ -823,7 +823,7 @@ async fn scan_auto_routes_by_l2_to_distinct_groups() {
         app.clone(),
         json_request(
             "POST",
-            "/delivery-notes/scan",
+            "/com/delivery/note/scan",
             Some(json!({"code": "R0001"})),
             Some(&token),
         ),
@@ -844,7 +844,7 @@ async fn scan_auto_routes_by_l2_to_distinct_groups() {
         app,
         json_request(
             "POST",
-            "/delivery-notes/scan",
+            "/com/delivery/note/scan",
             Some(json!({"code": "R0002"})),
             Some(&token),
         ),
@@ -878,7 +878,7 @@ async fn scan_no_groups_for_l1_collapses_to_one_l1wide_note() {
         app.clone(),
         json_request(
             "POST",
-            "/delivery-notes/scan",
+            "/com/delivery/note/scan",
             Some(json!({"code": "Q0001"})),
             Some(&token),
         ),
@@ -891,7 +891,7 @@ async fn scan_no_groups_for_l1_collapses_to_one_l1wide_note() {
         app,
         json_request(
             "POST",
-            "/delivery-notes/scan",
+            "/com/delivery/note/scan",
             Some(json!({"code": "Q0002"})),
             Some(&token),
         ),
@@ -996,7 +996,7 @@ async fn test_scan_recent_items_caps_at_8_and_includes_required_fields() {
         app,
         json_request(
             "POST",
-            "/delivery-notes/scan",
+            "/com/delivery/note/scan",
             Some(json!({"code": "REC00001"})),
             Some(&token),
         ),
@@ -1091,7 +1091,7 @@ async fn test_scan_recent_items_caps_at_8_and_includes_required_fields() {
 //  Task 7: scan-route-b 5 类状态分组 + 21421 + 幂等（7 场景）
 // ===========================================================================
 //
-// 5 类状态分组语义（详见 `src/modules/delivery_note/service/scan.rs:36-64`）：
+// 5 类状态分组语义（详见 `src/modules/com/delivery_note/service/scan.rs:36-64`）：
 //   A 组（attachable）：INSPECTION + READY_TO_SHIP          → 直接挂单
 //   B 组（inspectable）：PENDING / PROGRAMMING / IN_PROCESS(无 holder)
 //   2026-10-01：REPAIRING 降级为 t_part_batch.is_repairing 标记列，返修中批次
@@ -1121,7 +1121,7 @@ async fn scan_standalone_part_with_ready_batch_returns_added() {
         app,
         json_request(
             "POST",
-            "/delivery-notes/scan",
+            "/com/delivery/note/scan",
             Some(json!({"code": "RB0001"})),
             Some(&token),
         ),
@@ -1180,7 +1180,7 @@ async fn scan_standalone_part_with_inspection_batch_returns_added() {
         app,
         json_request(
             "POST",
-            "/delivery-notes/scan",
+            "/com/delivery/note/scan",
             Some(json!({"code": "IB0001"})),
             Some(&token),
         ),
@@ -1212,7 +1212,7 @@ async fn scan_standalone_part_with_only_pending_returns_candidates() {
         app,
         json_request(
             "POST",
-            "/delivery-notes/scan",
+            "/com/delivery/note/scan",
             Some(json!({"code": "PE0001"})),
             Some(&token),
         ),
@@ -1296,7 +1296,7 @@ async fn scan_assembly_with_all_ready_returns_added() {
         app,
         json_request(
             "POST",
-            "/delivery-notes/scan",
+            "/com/delivery/note/scan",
             Some(json!({"code": "ASM-R1"})),
             Some(&token),
         ),
@@ -1379,7 +1379,7 @@ async fn scan_assembly_with_partial_ready_returns_partial_added() {
         app,
         json_request(
             "POST",
-            "/delivery-notes/scan",
+            "/com/delivery/note/scan",
             Some(json!({"code": "ASM-P1"})),
             Some(&token),
         ),
@@ -1498,7 +1498,7 @@ async fn scan_with_delivered_batch_returns_21421() {
         app,
         json_request(
             "POST",
-            "/delivery-notes/scan",
+            "/com/delivery/note/scan",
             Some(json!({"code": "DV0001"})),
             Some(&token),
         ),
@@ -1547,7 +1547,7 @@ async fn scan_twice_same_code_is_idempotent() {
         app.clone(),
         json_request(
             "POST",
-            "/delivery-notes/scan",
+            "/com/delivery/note/scan",
             Some(json!({"code": "ID0001"})),
             Some(&token),
         ),
@@ -1564,7 +1564,7 @@ async fn scan_twice_same_code_is_idempotent() {
         app,
         json_request(
             "POST",
-            "/delivery-notes/scan",
+            "/com/delivery/note/scan",
             Some(json!({"code": "ID0001"})),
             Some(&token),
         ),
@@ -1638,7 +1638,7 @@ async fn scan_standalone_full_a_returns_added_with_no_unresolved() {
         app,
         json_request(
             "POST",
-            "/delivery-notes/scan",
+            "/com/delivery/note/scan",
             Some(json!({"code": "FULLA0001"})),
             Some(&token),
         ),
@@ -1685,7 +1685,7 @@ async fn scan_standalone_a_plus_b_returns_candidates_with_attachable_and_availab
         app,
         json_request(
             "POST",
-            "/delivery-notes/scan",
+            "/com/delivery/note/scan",
             Some(json!({"code": "APB00001"})),
             Some(&token),
         ),
@@ -1785,7 +1785,7 @@ async fn scan_standalone_a_plus_c_returns_candidates_with_only_attachable() {
         app,
         json_request(
             "POST",
-            "/delivery-notes/scan",
+            "/com/delivery/note/scan",
             Some(json!({"code": "APC00001"})),
             Some(&token),
         ),
@@ -1870,7 +1870,7 @@ async fn scan_standalone_b_plus_c_returns_candidates_with_only_available() {
         app,
         json_request(
             "POST",
-            "/delivery-notes/scan",
+            "/com/delivery/note/scan",
             Some(json!({"code": "BPC00001"})),
             Some(&token),
         ),
@@ -1947,7 +1947,7 @@ async fn scan_assembly_child_a_plus_b_returns_partial_added_with_attachable_per_
         app,
         json_request(
             "POST",
-            "/delivery-notes/scan",
+            "/com/delivery/note/scan",
             Some(json!({"code": "ASM-MAB"})),
             Some(&token),
         ),
@@ -2083,7 +2083,7 @@ async fn scan_assembly_asymmetric_had_invalid_per_child_returns_partial_added() 
         app,
         json_request(
             "POST",
-            "/delivery-notes/scan",
+            "/com/delivery/note/scan",
             Some(json!({"code": "ASM-ASYM"})),
             Some(&token),
         ),

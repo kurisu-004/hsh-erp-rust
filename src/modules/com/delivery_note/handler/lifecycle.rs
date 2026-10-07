@@ -22,18 +22,18 @@ use std::sync::Arc;
 use axum::Json;
 use axum::extract::{Path, State};
 
-use crate::modules::delivery_note::dto::{
+use crate::modules::com::delivery_note::dto::{
     DeliveryNotePath, DeliveryNotePickupRequest, DeliveryNotePickupScanRequest,
     DeliveryNoteVersionedRequest,
 };
-use crate::modules::delivery_note::vo::{
+use crate::modules::com::delivery_note::vo::{
     DeliveryNoteOut, DeliveryNotePickupScanOut, SubmitDeliveryOut,
 };
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
 
-/// POST /api/v2/delivery-notes/{id}/submit
+/// POST /api/v2/com/delivery/note/{id}/submit
 ///
 /// 出参 `SubmitDeliveryOut` 含两种 outcome，前端据此分支：
 /// - `outcome = SUBMITTED`：`note` 为提交后的送货单投影；状态机 DRAFT → SUBMITTED 已发生；
@@ -71,7 +71,7 @@ pub async fn submit_delivery_note(
     Ok(Json(R::ok(out)))
 }
 
-/// POST /api/v2/delivery-notes/{id}/recall
+/// POST /api/v2/com/delivery/note/{id}/recall
 pub async fn recall_delivery_note(
     State(state): State<Arc<AppState>>,
     current: crate::auth::rbac::CurrentUser,
@@ -87,7 +87,7 @@ pub async fn recall_delivery_note(
     Ok(Json(R::ok(out)))
 }
 
-/// POST /api/v2/delivery-notes/{id}/pickup-scan
+/// POST /api/v2/com/delivery/note/{id}/pickup-scan
 pub async fn pickup_scan(
     State(state): State<Arc<AppState>>,
     current: crate::auth::rbac::CurrentUser,
@@ -109,7 +109,7 @@ pub async fn pickup_scan(
     Ok(Json(R::ok(out)))
 }
 
-/// POST /api/v2/delivery-notes/{id}/pickup
+/// POST /api/v2/com/delivery/note/{id}/pickup
 pub async fn pickup_delivery_note(
     State(state): State<Arc<AppState>>,
     current: crate::auth::rbac::CurrentUser,

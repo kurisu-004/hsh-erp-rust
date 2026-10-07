@@ -274,7 +274,7 @@ async fn create_draft_for_l1_succeeds_and_for_l2_returns_400_21407() {
         app.clone(),
         json_request(
             "POST",
-            "/delivery-notes",
+            "/com/delivery/note",
             Some(json!({"customer_id": l1.to_string(), "note": "draft 1"})),
             Some(&token),
         ),
@@ -289,7 +289,7 @@ async fn create_draft_for_l1_succeeds_and_for_l2_returns_400_21407() {
         app,
         json_request(
             "POST",
-            "/delivery-notes",
+            "/com/delivery/note",
             Some(json!({"customer_id": l2.to_string()})),
             Some(&token),
         ),
@@ -313,7 +313,7 @@ async fn list_with_filters_status_and_pagination() {
             app.clone(),
             json_request(
                 "POST",
-                "/delivery-notes",
+                "/com/delivery/note",
                 Some(json!({"customer_id": l1.to_string(), "note": format!("d{i}")})),
                 Some(&token),
             ),
@@ -327,7 +327,7 @@ async fn list_with_filters_status_and_pagination() {
         app.clone(),
         json_request(
             "GET",
-            "/delivery-notes?statuses=DRAFT&limit=2&offset=0",
+            "/com/delivery/note?statuses=DRAFT&limit=2&offset=0",
             None,
             Some(&token),
         ),
@@ -342,7 +342,7 @@ async fn list_with_filters_status_and_pagination() {
         app,
         json_request(
             "GET",
-            "/delivery-notes?customer_id=999999",
+            "/com/delivery/note?customer_id=999999",
             None,
             Some(&token),
         ),
@@ -364,7 +364,7 @@ async fn get_with_parts_with_assembly_fields() {
         app.clone(),
         json_request(
             "POST",
-            "/delivery-notes",
+            "/com/delivery/note",
             Some(json!({
                 "customer_id": l1.to_string(),
                 "items": [{"batch_id": batch_id.to_string(), "quantity": null}],
@@ -380,12 +380,12 @@ async fn get_with_parts_with_assembly_fields() {
         .unwrap()
         .to_string();
 
-    // GET /delivery-notes/{id}
+    // GET /com/delivery/note/{id}
     let (gs, genv) = send(
         app.clone(),
         json_request(
             "GET",
-            &format!("/delivery-notes/{note_id}"),
+            &format!("/com/delivery/note/{note_id}"),
             None,
             Some(&token),
         ),
@@ -427,7 +427,7 @@ async fn add_parts_same_l1_ok_different_l1_returns_400_21407() {
         app.clone(),
         json_request(
             "POST",
-            "/delivery-notes",
+            "/com/delivery/note",
             Some(json!({"customer_id": l1_a.to_string()})),
             Some(&token),
         ),
@@ -442,7 +442,7 @@ async fn add_parts_same_l1_ok_different_l1_returns_400_21407() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/delivery-notes/{note_id}/add-parts"),
+            &format!("/com/delivery/note/{note_id}/add-parts"),
             Some(json!({
                 "items": [{"batch_id": batch_id.to_string()}],
                 "version": version,
@@ -468,7 +468,7 @@ async fn add_parts_already_assigned_returns_409_21406() {
         app.clone(),
         json_request(
             "POST",
-            "/delivery-notes",
+            "/com/delivery/note",
             Some(json!({
                 "customer_id": l1.to_string(),
                 "items": [{"batch_id": batch_id.to_string()}],
@@ -485,7 +485,7 @@ async fn add_parts_already_assigned_returns_409_21406() {
         app.clone(),
         json_request(
             "POST",
-            "/delivery-notes",
+            "/com/delivery/note",
             Some(json!({"customer_id": l1.to_string()})),
             Some(&token),
         ),
@@ -500,7 +500,7 @@ async fn add_parts_already_assigned_returns_409_21406() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/delivery-notes/{note_b_id}/add-parts"),
+            &format!("/com/delivery/note/{note_b_id}/add-parts"),
             Some(json!({
                 "items": [{"batch_id": batch_id.to_string()}],
                 "version": version_b,
@@ -527,7 +527,7 @@ async fn add_parts_invalid_status_returns_400_21405() {
         app.clone(),
         json_request(
             "POST",
-            "/delivery-notes",
+            "/com/delivery/note",
             Some(json!({"customer_id": l1.to_string()})),
             Some(&token),
         ),
@@ -541,7 +541,7 @@ async fn add_parts_invalid_status_returns_400_21405() {
         app,
         json_request(
             "POST",
-            &format!("/delivery-notes/{note_id}/add-parts"),
+            &format!("/com/delivery/note/{note_id}/add-parts"),
             Some(json!({
                 "items": [{"batch_id": batch_id.to_string()}],
                 "version": version,
@@ -566,7 +566,7 @@ async fn add_parts_partial_quantity_splits_batch() {
         app.clone(),
         json_request(
             "POST",
-            "/delivery-notes",
+            "/com/delivery/note",
             Some(json!({"customer_id": l1.to_string()})),
             Some(&token),
         ),
@@ -580,7 +580,7 @@ async fn add_parts_partial_quantity_splits_batch() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/delivery-notes/{note_id}/add-parts"),
+            &format!("/com/delivery/note/{note_id}/add-parts"),
             Some(json!({
                 "items": [{"batch_id": batch_id.to_string(), "quantity": 4}],
                 "version": version,
@@ -622,7 +622,7 @@ async fn add_parts_group_scope_mismatch_returns_400_21416() {
         app.clone(),
         json_request(
             "POST",
-            "/delivery-notes",
+            "/com/delivery/note",
             Some(json!({"customer_id": l1.to_string()})),
             Some(&token),
         ),
@@ -645,7 +645,7 @@ async fn add_parts_group_scope_mismatch_returns_400_21416() {
         app,
         json_request(
             "POST",
-            &format!("/delivery-notes/{note_id}/add-parts"),
+            &format!("/com/delivery/note/{note_id}/add-parts"),
             Some(json!({
                 "items": [{"batch_id": batch_id.to_string()}],
                 "version": version,
@@ -670,7 +670,7 @@ async fn remove_parts_draft_ok_submitted_returns_409_21412() {
         app.clone(),
         json_request(
             "POST",
-            "/delivery-notes",
+            "/com/delivery/note",
             Some(json!({
                 "customer_id": l1.to_string(),
                 "items": [{"batch_id": batch_id.to_string()}],
@@ -688,7 +688,7 @@ async fn remove_parts_draft_ok_submitted_returns_409_21412() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/delivery-notes/{note_id}/remove-parts"),
+            &format!("/com/delivery/note/{note_id}/remove-parts"),
             Some(json!({
                 "batch_ids": [batch_id.to_string()],
                 "version": version,
@@ -706,7 +706,7 @@ async fn remove_parts_draft_ok_submitted_returns_409_21412() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/delivery-notes/{note_id}/add-parts"),
+            &format!("/com/delivery/note/{note_id}/add-parts"),
             Some(json!({
                 "items": [{"batch_id": batch_id.to_string()}],
                 "version": version,
@@ -726,7 +726,7 @@ async fn remove_parts_draft_ok_submitted_returns_409_21412() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/delivery-notes/{note_id}/submit"),
+            &format!("/com/delivery/note/{note_id}/submit"),
             Some(json!({"version": version})),
             Some(&token),
         ),
@@ -744,7 +744,7 @@ async fn remove_parts_draft_ok_submitted_returns_409_21412() {
         app,
         json_request(
             "POST",
-            &format!("/delivery-notes/{note_id}/remove-parts"),
+            &format!("/com/delivery/note/{note_id}/remove-parts"),
             Some(json!({
                 "batch_ids": [batch_id.to_string()],
                 "version": version + 1,
@@ -771,7 +771,7 @@ async fn submit_and_recall_draft_scope_conflict_returns_409_21419() {
         app.clone(),
         json_request(
             "POST",
-            "/delivery-notes",
+            "/com/delivery/note",
             Some(json!({
                 "customer_id": l1.to_string(),
                 "items": [{"batch_id": batch_id_a.to_string()}],
@@ -788,7 +788,7 @@ async fn submit_and_recall_draft_scope_conflict_returns_409_21419() {
         app.clone(),
         json_request(
             "POST",
-            "/delivery-notes",
+            "/com/delivery/note",
             Some(json!({
                 "customer_id": l1.to_string(),
                 "items": [{"batch_id": batch_id_b.to_string()}],
@@ -804,7 +804,7 @@ async fn submit_and_recall_draft_scope_conflict_returns_409_21419() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/delivery-notes/{note_a_id}/submit"),
+            &format!("/com/delivery/note/{note_a_id}/submit"),
             Some(json!({"version": 0})),
             Some(&token),
         ),
@@ -819,7 +819,7 @@ async fn submit_and_recall_draft_scope_conflict_returns_409_21419() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/delivery-notes/{note_a_id}/recall"),
+            &format!("/com/delivery/note/{note_a_id}/recall"),
             Some(json!({"version": 1})),
             Some(&token),
         ),
@@ -845,7 +845,7 @@ async fn submit_and_recall_draft_scope_conflict_returns_409_21419() {
         json_request(
             "POST",
             &format!(
-                "/delivery-notes/{}/soft-delete",
+                "/com/delivery/note/{}/soft-delete",
                 b_env["data"]["id"].as_str().unwrap()
             ),
             Some(json!({"version": 0})),
@@ -859,7 +859,7 @@ async fn submit_and_recall_draft_scope_conflict_returns_409_21419() {
         app,
         json_request(
             "POST",
-            &format!("/delivery-notes/{note_a_id}/recall"),
+            &format!("/com/delivery/note/{note_a_id}/recall"),
             Some(json!({"version": 1})),
             Some(&token),
         ),
@@ -906,7 +906,7 @@ async fn pickup_non_driver_returns_400_21409_and_happy_path_picks_up() {
         app.clone(),
         json_request(
             "POST",
-            "/delivery-notes",
+            "/com/delivery/note",
             Some(json!({
                 "customer_id": l1.to_string(),
                 "items": [{"batch_id": batch_id.to_string()}],
@@ -922,7 +922,7 @@ async fn pickup_non_driver_returns_400_21409_and_happy_path_picks_up() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/delivery-notes/{note_id}/submit"),
+            &format!("/com/delivery/note/{note_id}/submit"),
             Some(json!({"version": 0})),
             Some(&token),
         ),
@@ -936,7 +936,7 @@ async fn pickup_non_driver_returns_400_21409_and_happy_path_picks_up() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/delivery-notes/{note_id}/pickup"),
+            &format!("/com/delivery/note/{note_id}/pickup"),
             Some(json!({
                 "driver_worker_id": non_driver_id.to_string(),
                 "version": 1,
@@ -979,7 +979,7 @@ async fn pickup_non_driver_returns_400_21409_and_happy_path_picks_up() {
         app,
         json_request(
             "POST",
-            &format!("/delivery-notes/{note_id}/pickup"),
+            &format!("/com/delivery/note/{note_id}/pickup"),
             Some(json!({
                 "driver_worker_id": driver_id.to_string(),
                 "version": 1,
@@ -1004,7 +1004,7 @@ async fn soft_delete_draft_ok_non_draft_returns_400_21403() {
         app.clone(),
         json_request(
             "POST",
-            "/delivery-notes",
+            "/com/delivery/note",
             Some(json!({
                 "customer_id": l1.to_string(),
                 "items": [{"batch_id": batch_id.to_string()}],
@@ -1021,7 +1021,7 @@ async fn soft_delete_draft_ok_non_draft_returns_400_21403() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/delivery-notes/{note_id}/soft-delete"),
+            &format!("/com/delivery/note/{note_id}/soft-delete"),
             Some(json!({"version": 0})),
             Some(&token),
         ),
@@ -1035,7 +1035,7 @@ async fn soft_delete_draft_ok_non_draft_returns_400_21403() {
         app.clone(),
         json_request(
             "POST",
-            "/delivery-notes",
+            "/com/delivery/note",
             Some(json!({
                 "customer_id": l1.to_string(),
                 "items": [{"batch_id": batch_id2.to_string()}],
@@ -1050,7 +1050,7 @@ async fn soft_delete_draft_ok_non_draft_returns_400_21403() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/delivery-notes/{note_id2}/submit"),
+            &format!("/com/delivery/note/{note_id2}/submit"),
             Some(json!({"version": 0})),
             Some(&token),
         ),
@@ -1062,7 +1062,7 @@ async fn soft_delete_draft_ok_non_draft_returns_400_21403() {
         app,
         json_request(
             "POST",
-            &format!("/delivery-notes/{note_id2}/soft-delete"),
+            &format!("/com/delivery/note/{note_id2}/soft-delete"),
             Some(json!({"version": 1})),
             Some(&token),
         ),
@@ -1081,7 +1081,7 @@ async fn version_conflict_on_write_returns_409_40901() {
         app.clone(),
         json_request(
             "POST",
-            "/delivery-notes",
+            "/com/delivery/note",
             Some(json!({"customer_id": l1.to_string()})),
             Some(&token),
         ),
@@ -1095,7 +1095,7 @@ async fn version_conflict_on_write_returns_409_40901() {
         app,
         json_request(
             "POST",
-            &format!("/delivery-notes/{note_id}/submit"),
+            &format!("/com/delivery/note/{note_id}/submit"),
             Some(json!({"version": 999})),
             Some(&token),
         ),
@@ -1122,7 +1122,7 @@ async fn submit_with_inspection_batch_returns_candidates_and_stays_draft() {
         app.clone(),
         json_request(
             "POST",
-            "/delivery-notes",
+            "/com/delivery/note",
             Some(json!({
                 "customer_id": l1.to_string(),
                 "items": [
@@ -1157,7 +1157,7 @@ async fn submit_with_inspection_batch_returns_candidates_and_stays_draft() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/delivery-notes/{note_id}/submit"),
+            &format!("/com/delivery/note/{note_id}/submit"),
             Some(json!({"version": note_version})),
             Some(&token),
         ),
@@ -1199,7 +1199,7 @@ async fn submit_with_inspection_batch_returns_candidates_and_stays_draft() {
         app,
         json_request(
             "GET",
-            &format!("/delivery-notes/{note_id}"),
+            &format!("/com/delivery/note/{note_id}"),
             None,
             Some(&token),
         ),
@@ -1223,7 +1223,7 @@ async fn submit_with_illegal_batch_state_returns_21421() {
         app.clone(),
         json_request(
             "POST",
-            "/delivery-notes",
+            "/com/delivery/note",
             Some(json!({
                 "customer_id": l1.to_string(),
                 "items": [{"batch_id": batch_id.to_string()}],
@@ -1247,7 +1247,7 @@ async fn submit_with_illegal_batch_state_returns_21421() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/delivery-notes/{note_id}/submit"),
+            &format!("/com/delivery/note/{note_id}/submit"),
             Some(json!({"version": note_version})),
             Some(&token),
         ),
@@ -1260,7 +1260,7 @@ async fn submit_with_illegal_batch_state_returns_21421() {
         app,
         json_request(
             "GET",
-            &format!("/delivery-notes/{note_id}"),
+            &format!("/com/delivery/note/{note_id}"),
             None,
             Some(&token),
         ),
@@ -1282,7 +1282,7 @@ async fn list_candidate_parts_l1_returns_fixtures_non_l1_returns_400() {
         app.clone(),
         json_request(
             "GET",
-            &format!("/delivery-notes/candidate-parts?customer_id={l1}"),
+            &format!("/com/delivery/note/candidate-parts?customer_id={l1}"),
             None,
             Some(&token),
         ),
@@ -1296,7 +1296,7 @@ async fn list_candidate_parts_l1_returns_fixtures_non_l1_returns_400() {
         app,
         json_request(
             "GET",
-            &format!("/delivery-notes/candidate-parts?customer_id={l2}"),
+            &format!("/com/delivery/note/candidate-parts?customer_id={l2}"),
             None,
             Some(&token),
         ),
@@ -1336,7 +1336,7 @@ async fn batch_get_notes_returns_all_in_order_and_skips_missing() {
 
     // 1) 全部存在 → 200, items.len() == 3, 顺序同入参
     let uri = format!(
-        "/delivery-notes/batch-detail?ids={},{},{}",
+        "/com/delivery/note/batch-detail?ids={},{},{}",
         note_ids[0], note_ids[1], note_ids[2]
     );
     let (status, body) = send(app.clone(), json_request("GET", &uri, None, Some(&token))).await;
@@ -1352,7 +1352,7 @@ async fn batch_get_notes_returns_all_in_order_and_skips_missing() {
 
     // 2) 中间缺失 → 200, items.len() == 2, 顺序 [a, c]
     let uri = format!(
-        "/delivery-notes/batch-detail?ids={},99999999,{}",
+        "/com/delivery/note/batch-detail?ids={},99999999,{}",
         note_ids[0], note_ids[2]
     );
     let (status, body) = send(app.clone(), json_request("GET", &uri, None, Some(&token))).await;
@@ -1365,7 +1365,7 @@ async fn batch_get_notes_returns_all_in_order_and_skips_missing() {
     // 3) 缺 ids → 400 BIZ_INVALID_VALUE (20104)
     let (status, body) = send(
         app.clone(),
-        json_request("GET", "/delivery-notes/batch-detail", None, Some(&token)),
+        json_request("GET", "/com/delivery/note/batch-detail", None, Some(&token)),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1376,7 +1376,7 @@ async fn batch_get_notes_returns_all_in_order_and_skips_missing() {
         .map(|i| i.to_string())
         .collect::<Vec<_>>()
         .join(",");
-    let uri = format!("/delivery-notes/batch-detail?ids={too_many}");
+    let uri = format!("/com/delivery/note/batch-detail?ids={too_many}");
     let (status, body) = send(app, json_request("GET", &uri, None, Some(&token))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], 20104);
@@ -1435,12 +1435,12 @@ async fn test_get_delivery_note_line_items_fields_are_populated() {
     // 3. 直插批次（READY_TO_SHIP 才能挂到 DRAFT 单；service add_parts 校验）
     let batch_id = insert_batch(&pool, part_id, 1, 5, "READY_TO_SHIP").await;
 
-    // 4. 登录 → POST /delivery-notes 建 DRAFT 单并挂批次 → GET 详情
+    // 4. 登录 → POST /com/delivery/note 建 DRAFT 单并挂批次 → GET 详情
     let (cs, env) = send(
         app.clone(),
         json_request(
             "POST",
-            "/delivery-notes",
+            "/com/delivery/note",
             Some(json!({
                 "customer_id": l1.to_string(),
                 "items": [{"batch_id": batch_id.to_string(), "quantity": null}],
@@ -1456,7 +1456,7 @@ async fn test_get_delivery_note_line_items_fields_are_populated() {
         app.clone(),
         json_request(
             "GET",
-            &format!("/delivery-notes/{note_id}"),
+            &format!("/com/delivery/note/{note_id}"),
             None,
             Some(&token),
         ),
@@ -1657,7 +1657,7 @@ async fn get_with_parts_exposes_assembly_quantity_and_shippable_sets() {
         app,
         json_request(
             "GET",
-            &format!("/delivery-notes/{note_id}"),
+            &format!("/com/delivery/note/{note_id}"),
             None,
             Some(&token),
         ),
@@ -1721,7 +1721,7 @@ async fn batch_detail_shippable_sets_use_all_children_not_only_note_rows() {
     // 单 2 只挂子件 A，子件 C 完全不在这张单上（同一 part 挂两张单 ⇒ batch_no 递进）
     insert_note_batch_no(&pool, child_a, note2, 8, 2).await;
 
-    let uri = format!("/delivery-notes/batch-detail?ids={note1},{note2}");
+    let uri = format!("/com/delivery/note/batch-detail?ids={note1},{note2}");
     let (status, env) = send(app, json_request("GET", &uri, None, Some(&token))).await;
     assert_eq!(status, StatusCode::OK, "batch detail: {env}");
 

@@ -1,4 +1,4 @@
-//! 弹窗勾选 → 批量 attach A 组批次（POST /delivery-notes/{note_id}/attach-batches）。
+//! 弹窗勾选 → 批量 attach A 组批次（POST /api/v2/com/delivery/note/{note_id}/attach-batches）。
 //!
 //! 与 `scan_add` 的区别：
 //! - `scan_add` 是「扫码 + 自动 attach A 组」一站式，本文件是「前端弹窗勾选
@@ -14,7 +14,7 @@ use axum::http::StatusCode;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock::now_naive;
-use crate::modules::delivery_note::repo::DeliveryNoteRepoTrait;
+use crate::modules::com::delivery_note::repo::DeliveryNoteRepoTrait;
 use crate::modules::prod::batch::repo::PartBatchRepo;
 use crate::shared::error::{AppError, code};
 

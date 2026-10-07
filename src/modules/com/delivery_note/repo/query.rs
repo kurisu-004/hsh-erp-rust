@@ -6,7 +6,7 @@
 //! `DeliveryNoteEventRepo`），并新增胖 trait `DeliveryNoteRepoTrait`（在 `mod.rs`）。
 //!
 //! 本文件保留为**重导出壳**，让潜在 caller 的
-//! `use crate::modules::delivery_note::repo::query::xxx` 路径仍可解析。这是
+//! `use crate::modules::com::delivery_note::repo::query::xxx` 路径仍可解析。这是
 //! 2026-09-22 shelf / customer / part_batch 范本同形做法（见 `part/repo/part.rs`）。
 //!
 //! ## 本任务不修改 SQL 字符串

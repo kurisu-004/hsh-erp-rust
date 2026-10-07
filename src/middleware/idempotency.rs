@@ -476,17 +476,17 @@ mod tests {
     /// 打印响应又会重新落进 Redis 缓存。两者都不可接受。
     ///
     /// 断言方向：中间件只对 `is_print_path` 判定为真的路径跳过缓存，所以这里
-    /// 反过来断言「4 条已注册打印路由的两种路径形态（带 /api/v2 前缀的生产形态
+    /// 反过来断言「全部已注册打印路由的两种路径形态（带 /api/v2 前缀的生产形态
     /// + 测试直挂 v2_router 的裸路径形态）都必须命中该判定」。
+    ///
+    /// 2026-10-08：送货单的两条打印路由随打印链路下线从 `is_print_path` 移除，
+    /// 本表同步收窄到 parts 的 2 条（与 `middleware::timeout::is_print_path`
+    /// 的判定表严格同源 —— 本测试守的就是「跳过缓存的闸门不被悄悄关掉」）。
     #[test]
     fn print_gate_covers_every_registered_print_route() {
         for p in [
-            "/api/v2/delivery-notes/1234567890/print",
-            "/api/v2/delivery-notes/1234567890/print-labels",
             "/api/v2/parts/1234567890/print-drawing",
             "/api/v2/parts/print-drawing-batch",
-            "/delivery-notes/1234567890/print",
-            "/delivery-notes/1234567890/print-labels",
             "/parts/1234567890/print-drawing",
             "/parts/print-drawing-batch",
         ] {
@@ -501,12 +501,12 @@ mod tests {
     #[test]
     fn print_gate_does_not_swallow_regular_write_paths() {
         for p in [
-            "/api/v2/delivery-notes",
+            "/api/v2/com/delivery/note",
             "/api/v2/parts",
             "/api/v2/parts/1234567890/update",
-            "/api/v2/delivery-notes/1234567890/submit",
+            "/api/v2/com/delivery/note/1234567890/submit",
             // 名字相近但不是打印的路径：既不命中 is_print_path，也不该被跳过缓存
-            "/api/v2/delivery-notes/1234567890/print-preview",
+            "/api/v2/com/delivery/note/1234567890/print-preview",
             "/api/v2/parts/1234567890/print-drawing-batch",
         ] {
             assert!(

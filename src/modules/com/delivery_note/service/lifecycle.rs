@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock::now_naive;
 use crate::modules::com::customer::repo::CustomerRepo;
-use crate::modules::delivery_note::repo::DeliveryNoteRepoTrait;
+use crate::modules::com::delivery_note::repo::DeliveryNoteRepoTrait;
 use crate::modules::part::model::TPart;
 use crate::modules::part::repo::PartRepo;
 use crate::modules::part::service::PartService;

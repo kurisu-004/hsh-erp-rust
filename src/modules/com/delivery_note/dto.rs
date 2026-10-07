@@ -23,7 +23,7 @@ use serde::Deserialize;
 //  P1：送货分组 DTO（设计 §6.1）
 // ===========================================================================
 
-/// 创建分组入参（POST /delivery-groups）
+/// 创建分组入参（POST /api/v2/com/delivery/group）
 ///
 /// `member_customer_ids` 是**初始成员集合**，新增分组时一次性写入。
 /// `name` 长度 1..=100（与 DB 列 `varchar(100)` 对齐），空白字符串 trim 后为空则拒。
@@ -39,7 +39,7 @@ pub struct CreateDeliveryGroupRequest {
     pub member_customer_ids: Vec<i64>,
 }
 
-/// 更新分组入参（POST /delivery-groups/{id}/update）
+/// 更新分组入参（POST /api/v2/com/delivery/group/{id}/update）
 ///
 /// 字段语义：
 /// - `version`：必填，用于乐观锁（req 与 DB 当前 version 不一致 → 409 / VERSION_CONFLICT）
@@ -58,7 +58,7 @@ pub struct UpdateDeliveryGroupRequest {
     pub member_customer_ids: Option<Vec<i64>>,
 }
 
-/// 软删除分组入参（POST /delivery-groups/{id}/soft-delete）
+/// 软删除分组入参（POST /api/v2/com/delivery/group/{id}/soft-delete）
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeliveryGroupIdRequest {
     pub version: i32,
@@ -77,7 +77,7 @@ pub struct DeliveryNoteAddItem {
     pub quantity: Option<i32>,
 }
 
-/// 创建草稿入参（POST /delivery-notes）。
+/// 创建草稿入参（POST /api/v2/com/delivery/note）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeliveryNoteCreateRequest {
     #[serde(deserialize_with = "crate::shared::types::deserialize_i64")]
@@ -88,14 +88,14 @@ pub struct DeliveryNoteCreateRequest {
     pub note: Option<String>,
 }
 
-/// 添加零件入参（POST /delivery-notes/{id}/add-parts）。
+/// 添加零件入参（POST /api/v2/com/delivery/note/{id}/add-parts）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeliveryNoteAddPartsRequest {
     pub items: Vec<DeliveryNoteAddItem>,
     pub version: i32,
 }
 
-/// 移除零件入参（POST /delivery-notes/{id}/remove-parts）。
+/// 移除零件入参（POST /api/v2/com/delivery/note/{id}/remove-parts）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeliveryNoteRemovePartsRequest {
     #[serde(deserialize_with = "crate::shared::types::deserialize_i64_vec")]
@@ -109,7 +109,7 @@ pub struct DeliveryNoteVersionedRequest {
     pub version: i32,
 }
 
-/// partial update 入参（POST /delivery-notes/{id}/update；DRAFT/SUBMITTED）。
+/// partial update 入参（POST /api/v2/com/delivery/note/{id}/update；DRAFT/SUBMITTED）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeliveryNoteUpdateRequest {
     pub version: i32,
@@ -124,7 +124,7 @@ pub struct DeliveryNotePickupScanRequest {
     pub badge_code: Option<String>,
 }
 
-/// 领取入参（POST /delivery-notes/{id}/pickup）。
+/// 领取入参（POST /api/v2/com/delivery/note/{id}/pickup）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeliveryNotePickupRequest {
     #[serde(deserialize_with = "crate::shared::types::deserialize_i64")]
@@ -137,7 +137,7 @@ pub struct DeliveryNotePickupRequest {
 //  列表 query DTO
 // ---------------------------------------------------------------------------
 
-/// GET /delivery-notes/batch-detail?ids=... 查询参数。
+/// GET /api/v2/com/delivery/note/batch-detail?ids=... 查询参数。
 /// `ids` 为可选；handler 内部做 split/trim/filter/dedupe/parse i64 + 1..=200
 /// 校验。这里只声明 query 形状。
 #[derive(Debug, Clone, Deserialize)]
@@ -145,7 +145,7 @@ pub struct DeliveryNoteBatchDetailQuery {
     pub ids: Option<String>,
 }
 
-/// GET /delivery-notes 查询参数。
+/// GET /api/v2/com/delivery/note 查询参数。
 ///
 /// `statuses` 是逗号分隔字符串（axum 默认 Query 不支持重复 key）：
 /// `?statuses=DRAFT,SUBMITTED`。
@@ -164,7 +164,7 @@ pub struct DeliveryNoteListQuery {
     pub offset: Option<i64>,
 }
 
-/// GET /delivery-notes/pickup-pending 查询参数。
+/// GET /api/v2/com/delivery/note/pickup-pending 查询参数。
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeliveryNotePickupPendingQuery {
     #[serde(
@@ -174,14 +174,14 @@ pub struct DeliveryNotePickupPendingQuery {
     pub customer_id: Option<i64>,
 }
 
-/// GET /delivery-notes/candidate-parts 查询参数。
+/// GET /api/v2/com/delivery/note/candidate-parts 查询参数。
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeliveryNoteCandidatePartsQuery {
     #[serde(deserialize_with = "crate::shared::types::deserialize_i64")]
     pub customer_id: i64,
 }
 
-/// GET /delivery-notes/{id} 路径参数。
+/// GET /api/v2/com/delivery/note/{id} 路径参数。
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeliveryNotePath {
     #[serde(deserialize_with = "crate::shared::types::deserialize_i64")]
@@ -189,7 +189,7 @@ pub struct DeliveryNotePath {
 }
 
 // ===========================================================================
-//  P3：扫码入单 DTO（设计 §5，POST /delivery-notes/scan）
+//  P3：扫码入单 DTO（设计 §5，POST /api/v2/com/delivery/note/scan）
 // ===========================================================================
 
 /// 扫码入单请求体。
@@ -202,10 +202,10 @@ pub struct ScanDeliveryRequest {
 }
 
 // ===========================================================================
-//  attach_batches 入参（POST /delivery-notes/{id}/attach-batches）
+//  attach_batches 入参（POST /api/v2/com/delivery/note/{id}/attach-batches）
 // ===========================================================================
 
-/// `POST /api/v2/delivery-notes/{note_id}/attach-batches` 请求体。
+/// `POST /api/v2/com/delivery/note/{note_id}/attach-batches` 请求体。
 ///
 /// 弹窗勾选若干 A 组批次（INSPECTION / READY_TO_SHIP）一次性 attach 到指定
 /// DRAFT 送货单。每个 item 带 `version`（OCC 校验）；后端逐项独立处理：

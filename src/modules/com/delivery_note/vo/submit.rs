@@ -5,7 +5,7 @@ use serde::Serialize;
 use super::delivery_note::DeliveryNoteOut;
 use super::scan::UnresolvedTargetDto;
 
-/// `POST /delivery-notes/{id}/submit` 的结果类别。
+/// `POST /api/v2/com/delivery/note/{id}/submit` 的结果类别。
 ///
 /// - `SUBMITTED`：全部批次已 `READY_TO_SHIP`，状态机 DRAFT → SUBMITTED 已提交；
 ///   `note` 字段返回提交后的送货单投影。
@@ -19,7 +19,7 @@ pub enum SubmitOutcomeDto {
     CandidatesAvailable,
 }
 
-/// `POST /delivery-notes/{id}/submit` 出参（200 OK）。
+/// `POST /api/v2/com/delivery/note/{id}/submit` 出参（200 OK）。
 ///
 /// `outcome = SUBMITTED` → `note` 为提交后的送货单投影，`unresolved_targets` 缺省不序列化。
 /// `outcome = CANDIDATES_AVAILABLE` → `note` 为 `null`（未提交，无新状态可返回），

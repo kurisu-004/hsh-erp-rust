@@ -16,7 +16,7 @@
 //!
 //! ## 认证
 //! 每个用例都用 MANAGER 用户（fx_part_manager，part 域基线），所有 POST
-//! /delivery-groups/* 都要求 M/C，按设计 §6.1 用 MANAGER 跑通即可。
+//! /com/delivery/group/* 都要求 M/C，按设计 §6.1 用 MANAGER 跑通即可。
 //!
 //! 2026-09-23 PR13 Phase G 改造：本地 `fn send` / `fn json_request` / `fn setup` /
 //! `fn login_manager` 全部删除，统一用 `hsh_erp_test_support::{send, json_request,
@@ -116,7 +116,7 @@ async fn create_group_succeeds_and_appears_in_list() {
         app.clone(),
         json_request(
             "POST",
-            "/delivery-groups",
+            "/com/delivery/group",
             Some(json!({
                 "customer_id": l1.to_string(),
                 "name": "二五六厂",
@@ -136,7 +136,7 @@ async fn create_group_succeeds_and_appears_in_list() {
         app,
         json_request(
             "GET",
-            &format!("/delivery-groups?customer_id={l1}"),
+            &format!("/com/delivery/group?customer_id={l1}"),
             None,
             Some(&token),
         ),
@@ -160,7 +160,7 @@ async fn create_duplicate_name_returns_409_21414() {
         app.clone(),
         json_request(
             "POST",
-            "/delivery-groups",
+            "/com/delivery/group",
             Some(json!({
                 "customer_id": l1.to_string(),
                 "name": "二五六厂",
@@ -177,7 +177,7 @@ async fn create_duplicate_name_returns_409_21414() {
         app,
         json_request(
             "POST",
-            "/delivery-groups",
+            "/com/delivery/group",
             Some(json!({
                 "customer_id": l1.to_string(),
                 "name": "二五六厂",
@@ -203,7 +203,7 @@ async fn create_with_member_in_other_group_returns_409_21415() {
         app.clone(),
         json_request(
             "POST",
-            "/delivery-groups",
+            "/com/delivery/group",
             Some(json!({
                 "customer_id": l1.to_string(),
                 "name": "组 A",
@@ -220,7 +220,7 @@ async fn create_with_member_in_other_group_returns_409_21415() {
         app,
         json_request(
             "POST",
-            "/delivery-groups",
+            "/com/delivery/group",
             Some(json!({
                 "customer_id": l1.to_string(),
                 "name": "组 B",
@@ -247,7 +247,7 @@ async fn update_members_full_replace_succeeds() {
         app.clone(),
         json_request(
             "POST",
-            "/delivery-groups",
+            "/com/delivery/group",
             Some(json!({
                 "customer_id": l1.to_string(),
                 "name": "动态组",
@@ -266,7 +266,7 @@ async fn update_members_full_replace_succeeds() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/delivery-groups/{gid}/update"),
+            &format!("/com/delivery/group/{gid}/update"),
             Some(json!({
                 "version": v0,
                 "member_customer_ids": [l2_b.to_string(), l2_c.to_string()],
@@ -298,7 +298,7 @@ async fn update_with_wrong_version_returns_409_version_conflict() {
         app.clone(),
         json_request(
             "POST",
-            "/delivery-groups",
+            "/com/delivery/group",
             Some(json!({
                 "customer_id": l1.to_string(),
                 "name": "G1",
@@ -316,7 +316,7 @@ async fn update_with_wrong_version_returns_409_version_conflict() {
         app,
         json_request(
             "POST",
-            &format!("/delivery-groups/{gid}/update"),
+            &format!("/com/delivery/group/{gid}/update"),
             Some(json!({
                 "version": 9999,
                 "name": "G1-renamed",
@@ -339,7 +339,7 @@ async fn soft_delete_removes_group_from_list() {
         app.clone(),
         json_request(
             "POST",
-            "/delivery-groups",
+            "/com/delivery/group",
             Some(json!({
                 "customer_id": l1.to_string(),
                 "name": "to-delete",
@@ -358,7 +358,7 @@ async fn soft_delete_removes_group_from_list() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/delivery-groups/{gid}/soft-delete"),
+            &format!("/com/delivery/group/{gid}/soft-delete"),
             Some(json!({"version": v0})),
             Some(&token),
         ),
@@ -371,7 +371,7 @@ async fn soft_delete_removes_group_from_list() {
         app,
         json_request(
             "GET",
-            &format!("/delivery-groups?customer_id={l1}"),
+            &format!("/com/delivery/group?customer_id={l1}"),
             None,
             Some(&token),
         ),
@@ -395,7 +395,7 @@ async fn create_with_non_l1_customer_returns_400_20104() {
         app,
         json_request(
             "POST",
-            "/delivery-groups",
+            "/com/delivery/group",
             Some(json!({
                 "customer_id": l2.to_string(),
                 "name": "非法",
@@ -420,7 +420,7 @@ async fn list_with_nonexistent_customer_returns_404_20102() {
         app,
         json_request(
             "GET",
-            "/delivery-groups?customer_id=999999999",
+            "/com/delivery/group?customer_id=999999999",
             None,
             Some(&token),
         ),

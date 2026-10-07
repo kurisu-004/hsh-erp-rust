@@ -1,6 +1,6 @@
 //! delivery-notes/{note_id}/attach-batches 弹窗批量 attach 端到端集成测试
 //!
-//! 端点契约（POST /api/v2/delivery-notes/{note_id}/attach-batches）：
+//! 端点契约（POST /api/v2/com/delivery/note/{note_id}/attach-batches）：
 //! - 入参 `{ batches: [{ batch_id: string, version: i32 }, ...] }`
 //! - 出参 `{ attached: usize, conflicts: [{ batch_id, reason }] }`
 //! - 部分失败 → 200 + `conflicts[]`（不中断其它 item）
@@ -164,7 +164,7 @@ async fn create_draft_note(pool: &PgPool, customer_id: i64) -> i64 {
     id
 }
 
-/// 直接 POST /delivery-notes（建草稿）走业务路径，避免与 test 自身构造的字段耦合。
+/// 直接 POST /com/delivery/note（建草稿）走业务路径，避免与 test 自身构造的字段耦合。
 /// 创建 DRAFT 草稿并预挂 1 个 A 组批次（attach-batches 测试需要 note 已存在）。
 /// `first_batch_id` 必须传一个 INSPECTION / READY_TO_SHIP 批次，否则服务端会拒。
 async fn create_draft_note_via_api(
@@ -177,7 +177,7 @@ async fn create_draft_note_via_api(
         app.clone(),
         json_request(
             "POST",
-            "/delivery-notes",
+            "/com/delivery/note",
             Some(json!({
                 "customer_id": customer_id.to_string(),
                 "items": [{"batch_id": first_batch_id.to_string()}],
@@ -205,7 +205,7 @@ async fn submit_note(app: axum::Router, token: &str, note_id: i64, pool: &PgPool
         app.clone(),
         json_request(
             "POST",
-            &format!("/delivery-notes/{note_id}/submit"),
+            &format!("/com/delivery/note/{note_id}/submit"),
             Some(json!({"version": 0})),
             Some(token),
         ),
@@ -254,7 +254,7 @@ async fn attach_batches_normal_path() {
         app,
         json_request(
             "POST",
-            &format!("/delivery-notes/{note_id}/attach-batches"),
+            &format!("/com/delivery/note/{note_id}/attach-batches"),
             Some(json!({
                 "batches": [{"batch_id": bid.to_string(), "version": ver}],
             })),
@@ -302,7 +302,7 @@ async fn attach_batches_occ_conflict_via_wrong_version() {
         app,
         json_request(
             "POST",
-            &format!("/delivery-notes/{note_id}/attach-batches"),
+            &format!("/com/delivery/note/{note_id}/attach-batches"),
             Some(json!({
                 "batches": [{"batch_id": bid.to_string(), "version": 999}],
             })),
@@ -353,7 +353,7 @@ async fn attach_batches_already_attached_conflict() {
         app,
         json_request(
             "POST",
-            &format!("/delivery-notes/{note2_id}/attach-batches"),
+            &format!("/com/delivery/note/{note2_id}/attach-batches"),
             Some(json!({
                 "batches": [{"batch_id": bid.to_string(), "version": ver1}],
             })),
@@ -395,7 +395,7 @@ async fn attach_batches_invalid_state_conflict() {
         app,
         json_request(
             "POST",
-            &format!("/delivery-notes/{note_id}/attach-batches"),
+            &format!("/com/delivery/note/{note_id}/attach-batches"),
             Some(json!({
                 "batches": [{"batch_id": bid.to_string(), "version": ver}],
             })),
@@ -452,7 +452,7 @@ async fn attach_batches_non_draft_note_returns_409() {
         app,
         json_request(
             "POST",
-            &format!("/delivery-notes/{note_id}/attach-batches"),
+            &format!("/com/delivery/note/{note_id}/attach-batches"),
             Some(json!({
                 "batches": [{"batch_id": bid2.to_string(), "version": ver2}],
             })),
@@ -490,7 +490,7 @@ async fn attach_batches_too_many_items_returns_400() {
         app,
         json_request(
             "POST",
-            &format!("/delivery-notes/{note_id}/attach-batches"),
+            &format!("/com/delivery/note/{note_id}/attach-batches"),
             Some(json!({"batches": items})),
             Some(&token),
         ),
@@ -526,7 +526,7 @@ async fn attach_batches_partial_success() {
         app,
         json_request(
             "POST",
-            &format!("/delivery-notes/{note_id}/attach-batches"),
+            &format!("/com/delivery/note/{note_id}/attach-batches"),
             Some(json!({
                 "batches": [
                     {"batch_id": ok_bid.to_string(), "version": 1},

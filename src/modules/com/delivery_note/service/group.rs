@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock::now_naive;
 use crate::modules::com::customer::repo::CustomerRepo;
-use crate::modules::delivery_note::repo::DeliveryNoteRepoTrait;
+use crate::modules::com::delivery_note::repo::DeliveryNoteRepoTrait;
 use crate::shared::error::{AppError, code};
 
 use super::super::model::{DeliveryGroup, DeliveryGroupMember};

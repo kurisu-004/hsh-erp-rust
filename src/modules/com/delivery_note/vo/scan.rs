@@ -187,7 +187,7 @@ pub struct AvailableBatchDto {
 
 /// A 组候选批次（`unresolved_targets[i].attachable_batches[]`），
 /// CandidatesAvailable / PartialAdded 时随 available_batches 一起返回
-/// 供前端弹窗勾选 attach（前端选中后转发到 `POST /delivery-notes/{id}/add-parts`）。
+/// 供前端弹窗勾选 attach（前端选中后转发到 `POST /api/v2/com/delivery/note/{id}/add-parts`）。
 /// 字段与 AvailableBatchDto 同形状，独立成 DTO 便于未来扩展差异。
 #[derive(Debug, Clone, Serialize)]
 pub struct AttachableBatchDto {
@@ -199,7 +199,7 @@ pub struct AttachableBatchDto {
     pub status: BatchStatusDto,
 }
 
-/// `POST /delivery-notes/scan` 出参（200 OK）。
+/// `POST /api/v2/com/delivery/note/scan` 出参（200 OK）。
 ///
 /// 场景 → outcome 映射：
 /// - `ADDED`：A 组覆盖所有 target，本次挂载 ≥1 个；`added_batches` 非空，`unresolved_targets = None`

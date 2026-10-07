@@ -1,8 +1,8 @@
 //! 打印链路 BFF 转发集成测试（2026-10-03 新增）
 //!
 //! 覆盖 4 条打印端点的「鉴权 + 闸门 + 转发」链路：
-//! 1. `POST /delivery-notes/{id}/print` → 命中 `forward_delivery_note_print`
-//! 2. `POST /delivery-notes/{id}/print-labels` → 命中 `forward_delivery_note_labels`
+//! 1. `POST /com/delivery/note/{id}/print` → 命中 `forward_delivery_note_print`
+//! 2. `POST /com/delivery/note/{id}/print-labels` → 命中 `forward_delivery_note_labels`
 //! 3. `GET  /parts/{id}/print-drawing` → 命中 `forward_part_print_pdf`（query 透传）
 //! 4. `POST /parts/print-drawing-batch` → 命中 `forward_part_print_pdf_batch`
 //!
@@ -51,8 +51,8 @@ use hsh_erp_test_support::{
 // 路径常量（同时是被测路由的字面量）
 // ===========================================================================
 
-const DN_PRINT_URI: &str = "/delivery-notes/1234567890/print";
-const DN_LABELS_URI: &str = "/delivery-notes/1234567890/print-labels";
+const DN_PRINT_URI: &str = "/com/delivery/note/1234567890/print";
+const DN_LABELS_URI: &str = "/com/delivery/note/1234567890/print-labels";
 const PART_DRAWING_URI: &str = "/parts/1234567890/print-drawing";
 const PART_DRAWING_BATCH_URI: &str = "/parts/print-drawing-batch";
 
@@ -616,7 +616,7 @@ fn print_path_gate_rejects_lookalikes() {
     use hsh_erp_rust::middleware::timeout::is_print_path;
 
     for uri in [
-        "/delivery-notes/1234567890/print-preview",
+        "/com/delivery/note/1234567890/print-preview",
         "/parts/1234567890/print",
         // ★ 批量段是 2 段静态；`/parts/{id}/print-drawing-batch` 是 3 段，不能命中
         "/parts/1234567890/print-drawing-batch",
@@ -956,7 +956,7 @@ fn idem_request(uri: &str, key: &str) -> Request<Body> {
 // ===========================================================================
 //
 // 打印 handler 不再是纯转发：转发前读本单批次算装配件「可出货套数」，注入 body。
-// 公式与边界见 `src/modules/delivery_note/service/shippable_sets.rs`，本节锁死
+// 公式与边界见 `src/modules/com/delivery_note/service/shippable_sets.rs`，本节锁死
 // 对外可见的 4 件事：
 // 1. 注入的 id 与 key 全是 JSON **string**（雪花 id > 2^53）；
 // 2. 「不注入」分支（本单无装配件 / 装配件全软删）不产生空数组或空对象；
@@ -1123,11 +1123,11 @@ async fn soft_delete_assembly(pool: &PgPool, asm_id: i64) {
 }
 
 fn print_uri(note_id: i64) -> String {
-    format!("/delivery-notes/{note_id}/print")
+    format!("/com/delivery/note/{note_id}/print")
 }
 
 fn labels_uri(note_id: i64) -> String {
-    format!("/delivery-notes/{note_id}/print-labels")
+    format!("/com/delivery/note/{note_id}/print-labels")
 }
 
 /// 装一套「1 个装配件 + 若干子件 + 批次挂单」的场景，返回 (note_id, asm_id, 子件 part id 列表)。
@@ -1609,7 +1609,7 @@ async fn detail_shippable_sets_match_injected_merge_quantities() {
         app2.clone(),
         json_request(
             "GET",
-            &format!("/delivery-notes/{note_id}"),
+            &format!("/com/delivery/note/{note_id}"),
             None,
             Some(&manager_token),
         ),

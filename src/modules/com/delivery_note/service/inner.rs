@@ -17,7 +17,7 @@ use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::assembly::repo::AssemblyRepo;
 use crate::modules::com::customer::model::TCustomer;
 use crate::modules::com::customer::repo::CustomerRepo;
-use crate::modules::delivery_note::repo::DeliveryNoteRepoTrait;
+use crate::modules::com::delivery_note::repo::DeliveryNoteRepoTrait;
 use crate::modules::part::repo::PartRepo;
 use crate::modules::prod::batch::repo::PartBatchRepo;
 use crate::shared::error::{AppError, code};

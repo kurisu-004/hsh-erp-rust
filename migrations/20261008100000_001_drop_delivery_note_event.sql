@@ -1,0 +1,20 @@
+-- 2026-10-08：送货单事件子系统下线。
+--
+-- 删除理由（全部实测确认，见 docs/api/delivery_note.md §6.1）：
+--   * 外键：零。t_delivery_note_event.delivery_note_id 只是注释里的逻辑外键，
+--     无 REFERENCES 约束，删表不影响 t_delivery_note。
+--   * 读端点：唯一读端点 GET /api/v2/com/delivery/note/{id}/events 本轮同时下线。
+--   * 跨域：零。全仓 e.event_type 读法全是 t_part_event（另一个子系统）。
+--   * WS 广播：独立。6 个 DELIVERY_NOTE_* kind 是硬编码字面量，与事件枚举零映射。
+--   * 保留策略：无软删列、无限增长、无清理任务 —— 453 行历史（173 张单，含 8 行
+--     WITHDRAWN 撤回记录）只会单调增长，且业务上从未按事件做过查询。
+--
+-- 代价：库内历史事件不可恢复。t_delivery_note 仍保留 submitted_at/by +
+-- picked_up_at/by + updated_at + version，每次状态迁移的**终点**时间戳可查，
+-- 但所有中间态与撤回轨迹丢失。
+--
+-- ⚠️ 只删送货单这一张表。archive/20260811100010_010_create_event_tables.sql 建了
+-- 4 张事件表，本 migration 不碰另外 3 张（part / outsource 等仍各自使用）。
+--
+-- sequence t_delivery_note_event_id_seq 由 OWNED BY 自动级联，不需要 CASCADE。
+DROP TABLE IF EXISTS public.t_delivery_note_event;

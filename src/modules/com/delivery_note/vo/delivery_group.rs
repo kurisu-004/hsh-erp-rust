@@ -33,7 +33,7 @@ pub struct UngroupedCustomerOut {
     pub name: String,
 }
 
-/// 分组列表出参（GET /delivery-groups）
+/// 分组列表出参（GET /api/v2/com/delivery/group）
 #[derive(Debug, Clone, Serialize)]
 pub struct DeliveryGroupListOut {
     pub groups: Vec<DeliveryGroupOut>,
