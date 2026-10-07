@@ -78,6 +78,14 @@ pub struct DeliveryNoteLineItem {
     pub customer_name: Option<String>,
     pub parent_customer_name: Option<String>,
     pub customer_path: Option<String>,
+    /// L2 叶子客户 id（`t_part.customer_id`）—— 打印分组时按它查
+    /// `t_delivery_group_member` 定位分组。
+    ///
+    /// 2026-10-08 新增。⚠️ 分组键**必须是 id 而不是 `customer_name`**：
+    /// `t_customer.name` 只有**非唯一** btree 索引，同名 L2 会被并进同一张 sheet，
+    /// 而打印产物是客户签字的收货凭证 —— 收货单位归属错了是业务事故。
+    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
+    pub customer_id: i64,
     /// 装配件父行字段（仅子件行填；散件 None）
     #[serde(
         serialize_with = "crate::shared::types::serialize_i64_opt",

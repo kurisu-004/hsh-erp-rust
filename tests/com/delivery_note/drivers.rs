@@ -16,12 +16,28 @@ use serde_json::Value;
 use sqlx::PgPool;
 
 use hsh_erp_test_support::{
-    PartFixture, json_request, load_delivery_fixture, load_part_fixture, login_token, send,
-    test_app, test_pool, test_state,
+    PartFixture, json_request, load_delivery_fixture, load_part_fixture, login_token,
+    pool_snowflake, send, test_app, test_pool, test_state,
 };
 
 use hsh_erp_rust::infra::clock::now_naive;
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+
+/// 取一个测试用雪花 ID。
+///
+/// 2026-10-08 review 第 1 轮 B3：**必须**走 `test-support::pool_snowflake()`
+/// （进程级 `OnceLock<Mutex<..>>`，instance 由 pid ⊕ 启动纳秒派生），不能每次
+/// `SnowflakeIdGenerator::new(...)` 新建 —— 新建会把 `last_ms` / `sequence` 归零，
+/// 同一毫秒内两次调用返回**完全相同**的 id（epoch 与 instance 都写死、seq 都从 0
+/// 开始），撞 `t_*_pkey` 报 23505。共享一个生成器后同进程内 `next_id()` 串行发号，
+/// 跨进程靠派生 instance 区分。
+///
+/// 这也顺带解掉了**跨文件**碰撞：同一 binary（`tests/com/main.rs`）里本文件与
+/// `note.rs` / `group.rs` / `union_list.rs` 曾经各自 `new(..., 1)`，首个 id 相同。
+/// `union_list.rs` 仍自持 `instance = 1` 的生成器，而本 helper 的 instance 是
+/// pid ⊕ 纳秒派生的，两边不会撞。
+fn next_id() -> i64 {
+    pool_snowflake().lock().expect("pool_snowflake").next_id()
+}
 
 async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, String) {
     let pool = test_pool().await;
@@ -46,7 +62,7 @@ async fn work_type(pool: &PgPool, code: &str, name: &str) -> i64 {
     {
         return id;
     }
-    let id = SnowflakeIdGenerator::new(1_577_836_800_000, 29).next_id();
+    let id = next_id();
     sqlx::query(
         "INSERT INTO t_work_type (id, code, name, sort_order, version, \
          created_at, created_by, updated_at, updated_by) \
@@ -71,7 +87,7 @@ async fn insert_worker(
     active: bool,
     soft_deleted: bool,
 ) -> i64 {
-    let id = SnowflakeIdGenerator::new(1_577_836_800_000, 29).next_id();
+    let id = next_id();
     let now = now_naive();
     // `uk_t_worker_id_card_no` 全局唯一 ⇒ 用 badge 派生的 18 位串（同一测试内 badge
     // 各不相同，故不会撞）。证件号 / 手机号只是为了让「响应不该带 PII」那条断言

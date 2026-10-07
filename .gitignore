@@ -15,7 +15,9 @@
 # Claude Code 本地 worktree（不入版本库）
 .claude/
 .claude/plans/
-keys/
+# 2026-10-08 review 第 1 轮 B1：不带斜杠才同时匹配目录与符号链接
+# （带斜杠的 `keys/` 在 git 眼里只认目录，本地那个指向密钥目录的符号链接会漏网进版本库）
+keys
 db_backup/
 
 # worktree 专属服务状态文件（worktree 起 PG/Redis 容器时生成的端口/项目名记录，

@@ -36,12 +36,28 @@ use sqlx::PgPool;
 use sqlx::Row;
 
 use hsh_erp_test_support::{
-    DeliveryFixture, json_request, load_delivery_fixture, login_token, send, test_app, test_pool,
-    test_state,
+    DeliveryFixture, json_request, load_delivery_fixture, login_token, pool_snowflake, send,
+    test_app, test_pool, test_state,
 };
 
 use hsh_erp_rust::infra::clock::now_naive;
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+
+/// 取一个测试用雪花 ID。
+///
+/// 2026-10-08 review 第 1 轮 B3：**必须**走 `test-support::pool_snowflake()`
+/// （进程级 `OnceLock<Mutex<..>>`，instance 由 pid ⊕ 启动纳秒派生），不能每次
+/// `SnowflakeIdGenerator::new(...)` 新建 —— 新建会把 `last_ms` / `sequence` 归零，
+/// 同一毫秒内两次调用返回**完全相同**的 id（epoch 与 instance 都写死、seq 都从 0
+/// 开始），撞 `t_*_pkey` 报 23505。共享一个生成器后同进程内 `next_id()` 串行发号，
+/// 跨进程靠派生 instance 区分。
+///
+/// 这也顺带解掉了**跨文件**碰撞：同一 binary（`tests/com/main.rs`）里本文件与
+/// `note.rs` / `group.rs` / `union_list.rs` 曾经各自 `new(..., 1)`，首个 id 相同。
+/// `union_list.rs` 仍自持 `instance = 1` 的生成器，而本 helper 的 instance 是
+/// pid ⊕ 纳秒派生的，两边不会撞。
+fn next_id() -> i64 {
+    pool_snowflake().lock().expect("pool_snowflake").next_id()
+}
 
 // ===========================================================================
 //  Bootstrap helpers
@@ -86,8 +102,7 @@ async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, DeliveryFixtur
 
 /// 直插 L1 客户
 async fn insert_l1(pool: &PgPool, name: &str, prefix: &str) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
@@ -106,8 +121,7 @@ async fn insert_l1(pool: &PgPool, name: &str, prefix: &str) -> i64 {
 
 /// 直插 L2 客户（parent_id = l1_id）
 async fn insert_l2(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
@@ -126,8 +140,7 @@ async fn insert_l2(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
 
 /// 直插工单
 async fn insert_part(pool: &PgPool, name: &str, customer_id: i64, serial_no: Option<&str>) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = next_id();
     let now = now_naive();
     let today = now.date();
     // 2026-09-16 PR-2（migration 027）：t_part 删 `has_been_repaired`；INSERT 列名与
@@ -158,8 +171,7 @@ async fn insert_batch(
     quantity: i32,
     status: &str,
 ) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = next_id();
     let now = now_naive();
     // 2026-09-16 PR-2（migration 027）：t_part_batch 删 `has_been_repaired`；INSERT
     // 列名与 VALUES 占位符同步移除 `false` 字面量。
@@ -182,8 +194,7 @@ async fn insert_batch(
 
 /// 直插送货分组
 async fn insert_group(pool: &PgPool, l1_id: i64, name: &str) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_delivery_group (id, customer_id, name, version, created_at, \
@@ -202,8 +213,7 @@ async fn insert_group(pool: &PgPool, l1_id: i64, name: &str) -> i64 {
 
 /// 直插分组成员
 async fn insert_group_member(pool: &PgPool, group_id: i64, l2_id: i64) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_delivery_group_member (id, group_id, customer_id, created_at, created_by) \
@@ -227,7 +237,6 @@ async fn insert_worker(
     is_active: bool,
     work_type_code: &str,
 ) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     // 找或插工种
     let wt_id: i64 = sqlx::query_scalar("SELECT id FROM t_work_type WHERE code = $1 LIMIT 1")
         .bind(work_type_code)
@@ -236,7 +245,7 @@ async fn insert_worker(
         .expect("query work_type")
         .unwrap_or_else(|| panic!("work_type {} not seeded", work_type_code));
 
-    let id = snowflake.next_id();
+    let id = next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_worker (id, badge_code, name, is_active, work_type_id, version, \
@@ -258,8 +267,7 @@ async fn insert_worker(
 /// 直插一张 `DRAFT` 送货单（2026-10-08 起 `POST /` 手动建单端点已删，测试要造
 /// 「一张已存在的草稿」只能走 SQL；生产路径只有 `POST /scan` 的 find-or-create）。
 async fn insert_draft_note(pool: &PgPool, l1_id: i64) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_delivery_note (id, delivery_note_no, customer_id, delivery_date, \
@@ -585,12 +593,11 @@ async fn batch_get_notes_returns_all_in_order_and_skips_missing() {
     // ⚠️ 2026-10-08 起 `uk_t_delivery_note_l1_open_draft` 保证「同 L1 只有一张
     // DRAFT」⇒ 这里给 3 个不同 L1 各建一张，而不是同 L1 建 3 张。
     let note_ids: Vec<i64> = {
-        let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
         let mut ids = Vec::new();
         for i in 0..3 {
             let prefix = fresh_prefix(&pool).await;
             let l1 = insert_l1(&pool, &format!("批量客户{i}"), &prefix).await;
-            let id = snowflake.next_id();
+            let id = next_id();
             // delivery_note_no 是 varchar(16)；雪花 id 17+ 位拼前缀会超 16 字符，
             // 这里手写 14-char 测试单号（DN-TEST-NNNN + i 适配）。
             let no = format!("DN-TEST-{i:04}");
@@ -683,8 +690,7 @@ async fn test_get_delivery_note_line_items_fields_are_populated() {
     //
     // 2026-09-16 PR-2（migration 027）：t_part 删 `has_been_repaired`；INSERT 列名
     // 与 VALUES 占位符同步移除 `false` 字面量。
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let part_id = snowflake.next_id();
+    let part_id = next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
@@ -781,24 +787,11 @@ async fn test_get_delivery_note_line_items_fields_are_populated() {
 //  2026-10-04 新增：line_items 的装配件套数字段（只读展示用）
 // ===========================================================================
 
-/// 本节新增 helper 共用的雪花生成器。
-///
-/// ⚠️ 必须共享：每次 `SnowflakeIdGenerator::new()` 的首个 id 相同（sequence=0），
-/// 各自 `new()` 的 helper 在**同一张表**插两行会直接撞主键。范式
-/// `tests/com/union_list.rs::next_test_id`。
-static SHARED_SNOWFLAKE: std::sync::OnceLock<SnowflakeIdGenerator> = std::sync::OnceLock::new();
-
-fn next_shared_id() -> i64 {
-    SHARED_SNOWFLAKE
-        .get_or_init(|| SnowflakeIdGenerator::new(1_577_836_800_000, 1))
-        .next_id()
-}
-
 /// 直插装配件（`quantity` = 工单总套数）。测试侧用 `sqlx::query()` 而非 `query!`
 /// 宏，避免污染 `.sqlx/` 离线缓存（同本文件 `test_get_delivery_note_line_items_
 /// fields_are_populated` 的约定）。
 async fn insert_assembly(pool: &PgPool, customer_id: i64, name: &str, quantity: i32) -> i64 {
-    let id = next_shared_id();
+    let id = next_id();
     let now = now_naive();
     let today = now.date();
     sqlx::query(
@@ -828,7 +821,7 @@ async fn insert_part_local(
     assembly_id: Option<i64>,
     quantity: i32,
 ) -> i64 {
-    let id = next_shared_id();
+    let id = next_id();
     let now = now_naive();
     let today = now.date();
     sqlx::query(
@@ -863,7 +856,7 @@ async fn insert_note_row(pool: &PgPool, l1_id: i64, no: &str) -> i64 {
 
 /// [`insert_note_row`] 的显式 status 版本。
 async fn insert_note_row_with_status(pool: &PgPool, l1_id: i64, no: &str, status: &str) -> i64 {
-    let id = next_shared_id();
+    let id = next_id();
     sqlx::query(
         "INSERT INTO t_delivery_note \
          (id, delivery_note_no, customer_id, status, version, created_at, updated_at) \
@@ -882,8 +875,8 @@ async fn insert_note_row_with_status(pool: &PgPool, l1_id: i64, no: &str, status
 /// 直插一个**已挂在单上**的批次（`delivery_note_id` 直写，跳过 add_parts 的状态机
 /// 校验 —— 详情与打印都只读「本单挂了哪些批次」）。
 ///
-/// ⚠️ 不能复用本文件既有的 `insert_batch`：它每次 `SnowflakeIdGenerator::new()` 拿
-/// 同一个 sequence=0 的 id，同一测试里连插 2 个批次就会撞主键。
+/// ⚠️ 不能复用本文件既有的 `insert_batch`：它按「每批次一个 quantity」的口径造数据，
+/// 与本 helper 的「整批挂单」语义不同（见两条 helper 的 doc）。
 async fn insert_note_batch(pool: &PgPool, part_id: i64, note_id: i64, quantity: i32) -> i64 {
     insert_note_batch_no(pool, part_id, note_id, quantity, 1).await
 }
@@ -899,7 +892,7 @@ async fn insert_note_batch_no(
     quantity: i32,
     batch_no: i32,
 ) -> i64 {
-    let id = next_shared_id();
+    let id = next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, \
@@ -1045,4 +1038,74 @@ async fn batch_detail_shippable_sets_use_all_children_not_only_note_rows() {
         vec![0],
         "单 2：子件 C 本单没交批次（按 0 参与 min）⇒ 0 套，不能误判成 8 套"
     );
+}
+
+// ===========================================================================
+//  2026-10-08 新增（裁决 C）：`line_items[].customer_id` 必须是各行自己工单的 L2
+// ===========================================================================
+
+/// 同一张单里两个不同 L2 的行项，各自带**自己零件**的 `customer_id`。
+///
+/// 为什么这条必须有：打印分组原来按 `customer_name` 匹配，而 `t_customer.name` 只有
+/// **非唯一** btree 索引 ⇒ 同名 L2 会被并进同一张 sheet。打印产物是客户签字的收货
+/// 凭证，收货单位归属错了是业务事故。⇒ 分组键必须换成 id，出参就得把这个 id 发出来。
+///
+/// 数据刻意造「**两个 L2 同名**」（`t_customer` 允许重名）+ 单据归 L1：
+/// `GET /{id}` 与 `GET /batch-detail` 两条装配路径都要给对。
+#[tokio::test]
+async fn line_items_carry_each_parts_own_leaf_customer_id() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let l1 = insert_l1(&pool, "同名客户父", "F").await;
+    // ⚠️ 两个 L2 **故意同名** —— 这正是「按 name 分组会串」的成因
+    let l2_a = insert_l2(&pool, "同名客户", l1).await;
+    let l2_b = insert_l2(&pool, "同名客户", l1).await;
+    let note_id = insert_note_row(&pool, l1, "DN-TEST-9301").await;
+
+    let part_a = insert_part_local(&pool, l2_a, "A厂零件", None, 10).await;
+    let part_b = insert_part_local(&pool, l2_b, "B厂零件", None, 10).await;
+    insert_note_batch(&pool, part_a, note_id, 4).await;
+    insert_note_batch(&pool, part_b, note_id, 6).await;
+
+    let uri = format!("/com/delivery/note/{note_id}");
+    let (status, env) = send(app.clone(), json_request("GET", &uri, None, Some(&token))).await;
+    assert_eq!(status, StatusCode::OK, "detail: {env}");
+
+    let items = env["data"]["line_items"].as_array().expect("数组");
+    assert_eq!(items.len(), 2, "两个批次两行: {env}");
+
+    // customer_id 是 JSON **string**（雪花 i64 约定，见 §1.5）
+    let cid = |li: &serde_json::Value| -> String {
+        li["customer_id"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("行项必须带 string 型 customer_id（裁决 C：必填非空，不设 skip_serializing_if）: {li}")
+            })
+            .to_string()
+    };
+    let name =
+        |li: &serde_json::Value| -> String { li["name"].as_str().unwrap_or_default().to_string() };
+
+    let a_row = items.iter().find(|li| name(li) == "A厂零件").unwrap();
+    let b_row = items.iter().find(|li| name(li) == "B厂零件").unwrap();
+    assert_eq!(cid(a_row), l2_a.to_string(), "A 行应带 L2-A 的 id: {env}");
+    assert_eq!(cid(b_row), l2_b.to_string(), "B 行应带 L2-B 的 id: {env}");
+    assert_ne!(l2_a, l2_b, "前提校验：两个 L2 是不同的行");
+    assert_eq!(
+        a_row["customer_name"].as_str(),
+        b_row["customer_name"].as_str(),
+        "前提校验：两个 L2 同名（这才是「按 name 分组会串」的前提）"
+    );
+
+    // 批量详情（第二条装配路径）必须一致
+    let uri = format!("/com/delivery/note/batch-detail?ids={note_id}");
+    let (status, benv) = send(app, json_request("GET", &uri, None, Some(&token))).await;
+    assert_eq!(status, StatusCode::OK, "batch detail: {benv}");
+    let bitems = benv["data"]["items"][0]["line_items"]
+        .as_array()
+        .expect("数组");
+    assert_eq!(bitems.len(), 2, "两个批次两行: {benv}");
+    let b_a = bitems.iter().find(|li| name(li) == "A厂零件").unwrap();
+    let b_b = bitems.iter().find(|li| name(li) == "B厂零件").unwrap();
+    assert_eq!(cid(b_a), l2_a.to_string(), "批量详情 A 行: {benv}");
+    assert_eq!(cid(b_b), l2_b.to_string(), "批量详情 B 行: {benv}");
 }

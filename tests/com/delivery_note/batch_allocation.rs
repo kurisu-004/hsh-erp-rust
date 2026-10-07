@@ -16,12 +16,28 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 
 use hsh_erp_test_support::{
-    DeliveryFixture, json_request, load_delivery_fixture, login_token, send, test_app, test_pool,
-    test_state,
+    DeliveryFixture, json_request, load_delivery_fixture, login_token, pool_snowflake, send,
+    test_app, test_pool, test_state,
 };
 
 use hsh_erp_rust::infra::clock::now_naive;
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+
+/// 取一个测试用雪花 ID。
+///
+/// 2026-10-08 review 第 1 轮 B3：**必须**走 `test-support::pool_snowflake()`
+/// （进程级 `OnceLock<Mutex<..>>`，instance 由 pid ⊕ 启动纳秒派生），不能每次
+/// `SnowflakeIdGenerator::new(...)` 新建 —— 新建会把 `last_ms` / `sequence` 归零，
+/// 同一毫秒内两次调用返回**完全相同**的 id（epoch 与 instance 都写死、seq 都从 0
+/// 开始），撞 `t_*_pkey` 报 23505。共享一个生成器后同进程内 `next_id()` 串行发号，
+/// 跨进程靠派生 instance 区分。
+///
+/// 这也顺带解掉了**跨文件**碰撞：同一 binary（`tests/com/main.rs`）里本文件与
+/// `note.rs` / `group.rs` / `union_list.rs` 曾经各自 `new(..., 1)`，首个 id 相同。
+/// `union_list.rs` 仍自持 `instance = 1` 的生成器，而本 helper 的 instance 是
+/// pid ⊕ 纳秒派生的，两边不会撞。
+fn next_id() -> i64 {
+    pool_snowflake().lock().expect("pool_snowflake").next_id()
+}
 
 async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, DeliveryFixture) {
     let pool = test_pool().await;
@@ -32,7 +48,7 @@ async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, DeliveryFixtur
 }
 
 async fn insert_l1(pool: &PgPool, name: &str) -> i64 {
-    let id = SnowflakeIdGenerator::new(1_577_836_800_000, 23).next_id();
+    let id = next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
@@ -49,7 +65,7 @@ async fn insert_l1(pool: &PgPool, name: &str) -> i64 {
 }
 
 async fn insert_l2(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
-    let id = SnowflakeIdGenerator::new(1_577_836_800_000, 23).next_id();
+    let id = next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
@@ -67,7 +83,7 @@ async fn insert_l2(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
 }
 
 async fn insert_part(pool: &PgPool, name: &str, serial_no: &str, customer_id: i64) -> i64 {
-    let id = SnowflakeIdGenerator::new(1_577_836_800_000, 23).next_id();
+    let id = next_id();
     let now = now_naive();
     let today = now.date();
     sqlx::query(
@@ -93,7 +109,7 @@ async fn insert_part(pool: &PgPool, name: &str, serial_no: &str, customer_id: i6
 async fn insert_batches(pool: &PgPool, part_id: i64, quantities: &[i32]) -> Vec<i64> {
     let mut ids = Vec::with_capacity(quantities.len());
     for (i, q) in quantities.iter().enumerate() {
-        let id = SnowflakeIdGenerator::new(1_577_836_800_000, 23).next_id();
+        let id = next_id();
         let now = now_naive();
         sqlx::query(
             "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \

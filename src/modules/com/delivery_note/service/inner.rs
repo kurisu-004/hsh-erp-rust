@@ -185,7 +185,7 @@ pub(super) async fn get_with_parts(
 
     // 2026-10-04 新增：循环前先聚合一次本单可出货套数。`min` 的定义域是「该
     // 装配件的**全部**子件」（本单没批次的子件按 0 参与），故必须补取子件 ——
-    // 按装配件逐个取（单单装配件通常 1~3 个），与 `handler/print.rs` 同一写法。
+    // 按装配件逐个取（单单装配件通常 1~3 个）。
     let asm_quantity: HashMap<i64, i32> = assembly_map
         .iter()
         .map(|(id, a)| (*id, a.quantity))
@@ -243,6 +243,8 @@ pub(super) async fn get_with_parts(
             customer_name: leaf_name,
             parent_customer_name: parent_name,
             customer_path: path,
+            // 与 `leaf_map` 的查表 key 同值，不额外查库
+            customer_id: p.customer_id,
             assembly_id: asm.map(|a| a.id),
             assembly_serial_no: asm.and_then(|a| a.serial_no.clone()),
             assembly_drawing_no: asm.map(|a| a.drawing_no.clone()),

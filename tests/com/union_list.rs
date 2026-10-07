@@ -33,27 +33,26 @@
 //! MANAGER 用户跑通（与 `/parts` list 端点同权限：Manager / Clerk / Inspector /
 //! CncProgrammer，2026-09-19 聚合到 com nest）。
 
-use std::sync::OnceLock;
-
 use axum::http::StatusCode;
 use serde_json::Value;
 use sqlx::PgPool;
 
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-use hsh_erp_test_support::{PartFixture, load_part_fixture, login_token, test_app, test_pool};
+use hsh_erp_test_support::{
+    PartFixture, load_part_fixture, login_token, pool_snowflake, test_app, test_pool,
+};
 
 // ===========================================================================
 //  Test fixtures
 // ===========================================================================
 
-static SHARED_TEST_SNOWFLAKE: OnceLock<SnowflakeIdGenerator> = OnceLock::new();
-
-fn shared_test_snowflake() -> &'static SnowflakeIdGenerator {
-    SHARED_TEST_SNOWFLAKE.get_or_init(|| SnowflakeIdGenerator::new(1_577_836_800_000, 1))
-}
-
+/// 取一个测试用雪花 ID。
+///
+/// 2026-10-08 review 第 1 轮 B3：改走 `test-support::pool_snowflake()`。原实现是本文件
+/// 私有的 `OnceLock<SnowflakeIdGenerator>` + 写死 `instance = 1`；而本 binary（`--test com`）
+/// 里的 `delivery_note/*` 夹具此前也各自 `new(..., 1)`，同一毫秒内会发出**完全相同**的
+/// id ⇒ 23505。共享进程级生成器（instance 由 pid ⊕ 启动纳秒派生）后彻底消除该类碰撞。
 fn next_test_id() -> i64 {
-    shared_test_snowflake().next_id()
+    pool_snowflake().lock().expect("pool_snowflake").next_id()
 }
 
 async fn send(

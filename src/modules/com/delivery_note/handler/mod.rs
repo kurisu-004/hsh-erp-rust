@@ -8,8 +8,8 @@
 //!   入单（唯一入口）
 //!
 //! ## ⚠️ 路由注册顺序是**硬约束**（matchit 要求静态段优先）
-//! `note_router()` 里 1 段静态路径（`/batch-detail`、`/scan`、`/candidate-parts`、
-//! `/pickup-pending`）**必须先于** `/{id}` 注册，否则 axum 会在 nest 构建期直接
+//! `note_router()` 里 2 段静态路径（`/batch-detail`、`/scan`）与 1 段静态前缀
+//! （`/scan/{serial_no}`）**必须先于** `/{id}` 注册，否则 axum 会在 nest 构建期直接
 //! panic（不是运行期 404）。新增 1 段静态端点时照本段顺序插入，且同步
 //! [`ROUTES`]。
 //!
@@ -77,6 +77,10 @@ pub const GROUP_ROUTES: &[&str] = &[
     "POST /{id}/soft-delete",
 ];
 
+/// 送货司机候选段路由表（相对 `/api/v2/com/delivery/drivers`），与 [`ROUTES`] /
+/// [`GROUP_ROUTES`] 同形登记（单测 `routes_declared_in_router` 逐条比对）。
+pub const DRIVERS_ROUTES: &[&str] = &["GET /"];
+
 /// 送货司机候选段路由（相对 `/api/v2/com/delivery/drivers`）。
 ///
 /// 只有 1 条读端点。**刻意不并进 `/note`**：它不是单据的子资源，而是一份全局的
@@ -131,7 +135,7 @@ pub fn group_router() -> Router<Arc<AppState>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{GROUP_ROUTES, ROUTES};
+    use super::{DRIVERS_ROUTES, GROUP_ROUTES, ROUTES};
 
     /// 从 `router()` 函数体源码里抠出全部 `METHOD /path`。
     ///
@@ -186,6 +190,16 @@ mod tests {
         fn_body("pub fn group_router() -> Router", "// ===")
     }
 
+    /// 只取 `drivers_router` 的函数体源码：它在本文件里排在 `note_router` **之前**，
+    /// 故以 `note_router` 的签名作为结束锚点（与 `note_router_src` 的首尾互为镜像，
+    /// 三个 marker 都必须在本文件中唯一且顺序固定）。
+    fn drivers_router_src() -> String {
+        fn_body(
+            "pub fn drivers_router() -> Router",
+            "pub fn note_router() -> Router",
+        )
+    }
+
     /// 取 `start_marker` 第一次出现之后、`end_marker` 第一次出现之前的那段源码。
     ///
     /// 两个 marker 都必须是**在本文件中唯一且顺序固定**的字符串：marker 没找到或
@@ -203,15 +217,17 @@ mod tests {
         after_start[..end].to_string()
     }
 
-    /// [`ROUTES`] 必须与 `note_router()` 源码**逐条**一致（不多、不少、同序）。
+    /// [`ROUTES`] / [`GROUP_ROUTES`] / [`DRIVERS_ROUTES`] 必须与各自 `xxx_router()`
+    /// 源码**逐条**一致（不多、不少、同序）。
     ///
-    /// 这是登记表系列测试真正有牙齿的地方：`ROUTES` 是人工 const，往
+    /// 这是登记表系列测试真正有牙齿的地方：`ROUTES` 等是人工 const，往
     /// `note_router()` 加一条 `.route(...)` 而忘了登记时，靠这条比对立刻红。
     #[test]
     fn routes_declared_in_router() {
         for (label, actual, want) in [
             ("note", routes_in(note_router_src()), ROUTES),
             ("group", routes_in(group_router_src()), GROUP_ROUTES),
+            ("drivers", routes_in(drivers_router_src()), DRIVERS_ROUTES),
         ] {
             assert_eq!(
                 actual.len(),
@@ -237,7 +253,11 @@ mod tests {
     /// 登记表内无重复条目（手抄错行号时立刻发现）。
     #[test]
     fn routes_have_no_duplicates() {
-        for (label, table) in [("note", ROUTES), ("group", GROUP_ROUTES)] {
+        for (label, table) in [
+            ("note", ROUTES),
+            ("group", GROUP_ROUTES),
+            ("drivers", DRIVERS_ROUTES),
+        ] {
             let mut seen = std::collections::BTreeSet::new();
             for route in table {
                 assert!(!route.is_empty(), "`{label}` 段有空路由条目");

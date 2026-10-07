@@ -12,7 +12,7 @@
 //! - scan_tree.rs    ← 2026-10-08 新增（`GET /com/delivery/note/scan/{serial_no}`
 //!   三层树：形状 / 命中口径 / 批次不过滤 status / occupied_by_note_no / draft 判定）
 //! - entry_gate.rs   ← 2026-10-08 新增（`POST /com/delivery/note/scan` 的 21405 /
-//!   21406 / 21416 闸门）
+//!   21406 / 21407 闸门）
 //! - batch_allocation.rs ← 2026-10-08 新增（DP 分配算法端到端）
 //! - drivers.rs      ← 2026-10-08 新增（`GET /com/delivery/drivers` 只返送货司机）
 //! - driver.rs       ← 2026-10-08 新增（`POST /{id}/driver` + `validate_driver` 5 条

@@ -168,8 +168,8 @@ impl DeliveryNoteService {
         // 2026-10-04 新增：套数公式的 `min` 定义域是「该装配件的**全部**子件」，
         // 本单没批次的子件按 0 参与（否则会算出凑不齐的套数 → 错标签）。批量详情
         // 是 N 单 × M 装配件，不能逐个 `list_children`，故 1 条 SQL 批量取。
-        // 与 `inner.rs::get_with_parts` / `handler/print.rs` 同 `include_deleted=false`
-        // 口径 ⇒ 详情 VO 与打印注入的套数同源同值。
+        // 与 `inner.rs::get_with_parts` 同 `include_deleted=false` 口径 ⇒ 批量详情
+        // 与单张详情给同一装配件的套数同源同值。
         let children_by_asm: HashMap<i64, Vec<TPart>> = if assembly_map.is_empty() {
             HashMap::new()
         } else {
@@ -257,6 +257,8 @@ impl DeliveryNoteService {
                     customer_name: leaf_name,
                     parent_customer_name: parent_name,
                     customer_path: path,
+                    // 与 `leaf_map` 的查表 key 同值，不额外查库
+                    customer_id: p.customer_id,
                     assembly_id: asm.map(|a| a.id),
                     assembly_serial_no: asm.and_then(|a| a.serial_no.clone()),
                     assembly_drawing_no: asm.map(|a| a.drawing_no.clone()),
