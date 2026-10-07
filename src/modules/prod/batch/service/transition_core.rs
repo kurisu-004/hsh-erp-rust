@@ -72,7 +72,8 @@ impl BatchService {
         //    锚点（URL 从 `/parts/{part_id}/to-ship` 硬切到
         //    `/prod/batches/{batch_id}/to-ship`），判据却没跟着换，直到本次才修。
         //    房内已正确实现的同类端点见 `shelf.rs::place_on_shelf` /
-        //    `outsource.rs::send_to_outsource` / `lifecycle.rs::deliver`（同款注释）。
+        //    `crate::modules::outsource::service::move_svc::OutsourceMoveService::move_batch` /
+        //    `lifecycle.rs::deliver`（同款注释）。
         let from = PartStatus::from_str(&anchor.status).ok_or_else(|| {
             AppError::biz(
                 code::BIZ_INVALID_VALUE,

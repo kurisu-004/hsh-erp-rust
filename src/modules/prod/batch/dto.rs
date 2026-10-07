@@ -210,8 +210,11 @@ pub struct StartRepairRequest {
 }
 
 /// `POST /api/v2/prod/batches/{batch_id}/place-on-shelf` 入参。
-/// 被 3 个端点复用（place-on-shelf / release-from-programming /
-/// receive-from-outsource）。
+/// 被 2 个端点复用（place-on-shelf / release-from-programming）。
+///
+/// ⚠️ 2026-10-09：第三个复用方 `receive-from-outsource` 随外协三合一迁移到
+/// `POST /api/v2/outsource-queue/move`（入参改为 `to: {kind: PRODUCTION_SHELF,
+/// shelf_id, next_process_id}`），本结构不再是 3 复用。
 ///
 /// PENDING → IN_PROCESS（`location='PRODUCTION_SHELF'`）：放到指定生产货架。
 /// service 层校验 `shelf ↔ process` 映射（`BIZ_SHELF_PROCESS_NOT_MAPPED` 422）。
@@ -222,99 +225,6 @@ pub struct PlaceOnShelfRequest {
     pub shelf_id: i64,
     #[serde(deserialize_with = "deserialize_i64")]
     pub next_process_id: i64,
-    #[serde(default)]
-    pub note: Option<String>,
-}
-
-/// `POST /api/v2/prod/batches/{batch_id}/send-to-outsource` 入参。
-///
-/// PENDING / IN_PROCESS+PRODUCTION_SHELF → OUTSOURCE（`location='OUTSOURCE_COMPANY'`）。
-/// `outsource_company_id` + `process_id` 必填。
-///
-/// ## 价来源：APPROVAL 与 DIRECT 二选一（2026-10-03 起强制）
-///
-/// - APPROVAL 模式：传 `quote_id`（APPROVED 报价）；service 在同事务内 INSERT
-///   `t_outsource_shipment`，`unit_price = quote.price`。
-/// - DIRECT 模式（免审批直发）：传 `direct = true`。service 先按
-///   `(part_id, outsource_company_id, process_id)` 找活跃 APPROVED 报价复用；找不到
-///   则自动建一条 `price = 0` 的 APPROVED 占位报价（`is_direct = true`），
-///   shipment 的 `unit_price` 因而可能是 0 —— 对账时靠该报价的 `note` 识别。
-/// - 两者都不传 / 同时传 → `400 BIZ_INVALID_VALUE`（service 层显式校验）。守卫的
-///   必要性：没有价来源时 shipment 的 `unit_price` 只能是 0，外协对账页会看到
-///   「单价 0」却无从判断是漏填还是免审批直发。
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct SendToOutsourceRequest {
-    pub version: i32,
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub outsource_company_id: i64,
-    /// 外协加工的**工序** id（`t_process.category` 必须为 `'OUTSOURCE'`，且该公司
-    /// 必须映射该工序）。
-    ///
-    /// 字段名是 `process_id` 而非 `next_process_id`：本名与已上线的 Python v1 客户端
-    /// 绑定，改名会破坏它。前端已按本名对齐（`SendToOutsourcePayload.process_id`，
-    /// 契约用例逐字钉死并反断言 body 里不得出现 `next_process_id`）。
-    ///
-    /// ⚠️ 本字段**无 `serde(default)`**，是必填；本结构也**没有**
-    /// `deny_unknown_fields`，故发 `next_process_id` 会被静默丢弃并因必填字段缺失
-    /// 而失败：**`422` + 纯文本** `missing field \`process_id\``（axum `Json` 提取器），
-    /// 不是业务信封、不要按 `BIZ_PROCESS_NOT_FOUND` 排查。刻意不加
-    /// `deny_unknown_fields`：那会让任何多余字段直接 422，迁移面远大于收益。
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub process_id: i64,
-    #[serde(default, deserialize_with = "deserialize_i64_opt")]
-    pub quote_id: Option<i64>,
-    #[serde(default)]
-    pub direct: Option<bool>,
-    /// 部分发送数量（2026-10-03 新增）。
-    ///
-    /// - `None` 或 `== 批次量` = 整批发送（不拆批）。
-    /// - `0 < q < 批次量` = **部分发送**：先把源批次按 `q` 拆出新子批次，只把子
-    ///   批次发出（源批次留在原货架、状态不变、量减少 `q`），shipment 的
-    ///   `quantity` 记 `q`。
-    /// - `q <= 0` 或 `q > 批次量` → `400 BIZ_INVALID_VALUE`。
-    #[serde(default)]
-    pub quantity: Option<i32>,
-    #[serde(default)]
-    pub note: Option<String>,
-}
-
-/// `POST /api/v2/prod/batches/{batch_id}/receive-from-outsource` 入参。
-///
-/// OUTSOURCE → IN_PROCESS（`location='PRODUCTION_SHELF'`，`next_process_id` 为收回后
-/// 重新入池的工序）。
-///
-/// 2026-10-03 从 `PlaceOnShelfRequest` 独立出来：外协收回要支持**部分接收**
-/// （`quantity`），而 `PlaceOnShelfRequest` 仍被 `place-on-shelf` /
-/// `release-from-programming` 两个端点共用，加字段会污染它们的契约。
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct ReceiveFromOutsourceRequest {
-    pub version: i32,
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub shelf_id: i64,
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub next_process_id: i64,
-    /// 部分接收数量（2026-10-03 新增），语义同
-    /// [`SendToOutsourceRequest::quantity`]。
-    ///
-    /// ⚠️ 记账口径：部分接收**只拆批**、不动 shipment —— 源批次保留余量且**开口
-    /// shipment 保持 `OUTSOURCING`**，`received_at` / `status='RECEIVED'` 只在
-    /// 整批回收时才落。故 `shipment.quantity` 与当前批次余量可能不相等，这是有意的。
-    #[serde(default)]
-    pub quantity: Option<i32>,
-    #[serde(default)]
-    pub note: Option<String>,
-}
-
-/// `POST /api/v2/prod/batches/{batch_id}/receive-from-outsource-to-inspection` 入参。
-///
-/// OUTSOURCE → INSPECTION（直接送检）。`shelf_id` 必填，service 层校验 zone=INSPECTION。
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct ReceiveFromOutsourceToInspectionRequest {
-    pub version: i32,
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub shelf_id: i64,
-    #[serde(default)]
-    pub auto_pass_inspection: Option<bool>,
     #[serde(default)]
     pub note: Option<String>,
 }

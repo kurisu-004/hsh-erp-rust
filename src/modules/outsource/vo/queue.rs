@@ -1,12 +1,15 @@
-//! outsource 域外协看板两个只读端点的出参（2026-10-09 新增）
+//! outsource 域外协看板三个端点的出参（2026-10-09 新增读、2026-10-09 新增写）
 //!
 //! - `GET /api/v2/outsource-queue/snapshot` —— 工序序列板
 //! - `GET /api/v2/outsource-queue/processes/{process_id}` —— 单工序板（左列候选 +
 //!   右列公司列，公司列内联在途批次）
+//! - `POST /api/v2/outsource-queue/move` —— 三合一移动写端点（2026-10-09 新增）
 //!
 //! 取代 `GET /outsource-pool/{counts,state,{process_id}}` 三条旧读（硬切无 alias）：
 //! 旧路径下打开一道工序的板要发 1（工序详情）+ M（每家公司一次 state）= M + 1 个
 //! HTTP 请求；在途批次的卡片字段本来就是齐的，内联进公司列后恒定 1 个请求。
+//! 写侧同时取代 `prod::batch` 的三个单边端点（`send-to-outsource` /
+//! `receive-from-outsource` / `receive-from-outsource-to-inspection`）。
 //!
 //! ## 字段取舍：按前端实际消费收敛
 //!
@@ -35,13 +38,20 @@
 //!
 //! ## 雪花 ID 序列化口径
 //!
-//! **本文件全部出参的 i64 都在装配处 `.to_string()`**（不 derive 序列化助手）——
-//! 照 `prod::queue::vo::board` 与 `dashboard` 域的做法：聚合出参一次序列化几十上百行，
-//! 每个字段挂 serde 属性等于每行多走一层 `serialize_with` 间接调用。唯一的例外是
-//! `company_options` 里的 `OutsourceCompanyOption`（与 `GET /outsource-sendable` 共用
-//! 同一个类型，故保留 `serialize_i64`），它每次请求至多十几行。
+//! **读侧（`snapshot` / `processes/{id}`）的 i64 一律在装配处 `.to_string()`**
+//! （不 derive 序列化助手）—— 照 `prod::queue::vo::board` 与 `dashboard` 域的做法：
+//! 聚合出参一次序列化几十上百行，每个字段挂 serde 属性等于每行多走一层
+//! `serialize_with` 间接调用。
+//!
+//! **两个例外**（都只序列化一行，属性成本可忽略，且必须逐字对齐契约）：
+//! - `company_options` 里的 `OutsourceCompanyOption`（与 `GET /outsource-sendable`
+//!   共用同一个类型，是 repo 层 `array_agg` JSON 的解码目标，故保留 `serialize_i64`）；
+//! - [`OutsourceMoveResult`]（写端点单行出参，`serialize_i64` +
+//!   `skip_serializing_if` 组合，见其 doc 的两条序列化回归单测）。
 
 use serde::Serialize;
+
+use crate::shared::types::{serialize_i64, serialize_i64_opt};
 
 use super::sendable::OutsourceCompanyOption;
 
@@ -248,6 +258,71 @@ pub struct OutsourceQueueHeldBatch {
     pub chain_resolvable: bool,
 }
 
+// ===========================================================================
+//  POST /api/v2/outsource-queue/move
+// ===========================================================================
+
+/// `POST /api/v2/outsource-queue/move` 出参。
+///
+/// **替代旧三端点的 `PartOut`** —— `PartOut` 是 **part 级** VO（一次返回整个工单的
+/// 聚合视图），对批次级看板毫无用处：移动的是**一个批次**，前端要的是「这批现在在哪、
+/// 版本号是多少、下一次拖拽该带哪个 `version` / `shelf_id`」，零件级的十几列派生字段
+/// （rollup 状态、各类件数）纯属噪音，还让前端必须为一次拖拽拉全 part 详情。
+///
+/// 三个雪花 id（`batch_id` / `part_id` / `new_holder_id`）与两个方向相关的 id
+/// （`shipment_id` / `new_process_id`）**一律 JSON 字符串**（`serialize_i64` /
+/// `serialize_i64_opt`）：前端把 `batch_id` 直接当下一次调用的锚，`new_holder_id`
+/// 直接当拖拽目标回填给下一次 move 的 `from`，任一处漏标序列化器就是前端必填字段
+/// 校验炸在整页渲染上。
+#[derive(Debug, Clone, Serialize)]
+pub struct OutsourceMoveResult {
+    #[serde(serialize_with = "serialize_i64")]
+    pub batch_id: i64,
+    /// 批次所属零件（`t_part_batch.part_id`）。前端据此刷新零件详情 / 状态标签。
+    #[serde(serialize_with = "serialize_i64")]
+    pub part_id: i64,
+    /// `from.kind` 的字面（`PRODUCTION_SHELF` / `OUTSOURCE_COMPANY`）。
+    pub from_kind: String,
+    /// `to.kind` 的字面（`OUTSOURCE_COMPANY` / `PRODUCTION_SHELF` /
+    /// `INSPECTION_SHELF`）。
+    pub to_kind: String,
+    /// 移动后批次的 `current_holder_id`（生产架 / 外协公司 / 品检架的 id，
+    /// 取 `to` 的那个 id 字段）。前端拿它当**下一次** move 的 `from` 侧 id。
+    #[serde(serialize_with = "serialize_i64")]
+    pub new_holder_id: i64,
+    /// 移动后 `t_part_batch.location` —— **恒等于 `to_kind`**。
+    ///
+    /// 之所以冗余一个与 `to_kind` 恒等的字段：前端在 `OUTSOURCE_MOVE_DONE` 的 WS
+    /// 增量里按 `new_location` 做卡片归位，而 WS payload 会被缓存重放（前端刷新后
+    /// 先补事件再拉列表），让「归位键」是一个显式字段而不是「推导得出」的东西，
+    /// 少一处需要同时维护的推导规则。
+    pub new_location: String,
+    /// **读回行的真实 version**（移动后 `t_part_batch.version`）。
+    ///
+    /// ⚠️ 不在 Rust 里算 `batch.version + 1`：写入口是
+    /// `shared::batch::status::apply_batch_status_change`，它的 OCC 守卫与
+    /// `allowed_from` 白名单都可能让 UPDATE 命中 0 行 / 影响行数与调用方的算式
+    /// 分叉；且「算出来的 +1」一旦与真实值不一致，前端下一次拖拽必吃 409，而症状是
+    /// 「刚拖完就冲突」，极难定位。真实值由 service 在写后读回该行得到。
+    pub version: i32,
+    /// **仅发送方向**（`to_kind == "OUTSOURCE_COMPANY"`）：本次新建的
+    /// `t_outsource_shipment.id`。前端把它挂到卡片上（对账页按 shipment 追这次发货）。
+    #[serde(
+        serialize_with = "serialize_i64_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub shipment_id: Option<i64>,
+    /// **仅回收到生产架**（`to_kind == "PRODUCTION_SHELF"`）：批次进入的下一道工序
+    /// id（`t_part_batch.current_process_id`）。
+    ///
+    /// 回收到品检架时该列按出池不变式清 NULL，故该方向恒 `None`（键不存在）。
+    #[serde(
+        serialize_with = "serialize_i64_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub new_process_id: Option<i64>,
+}
+
 #[cfg(test)]
 mod tests {
     //! 序列化口径守卫。
@@ -328,5 +403,105 @@ mod tests {
         .unwrap();
         assert!(v["process_id"].is_string(), "{v}");
         assert_eq!(v["category"], serde_json::json!("OUTSOURCE"));
+    }
+
+    /// 发送方向：`shipment_id` 有值 ⇒ JSON 字符串（与 `batch_id` / `part_id` /
+    /// `new_holder_id` 同一口径）；`new_process_id` 反向缺席。
+    fn move_result_send() -> OutsourceMoveResult {
+        OutsourceMoveResult {
+            batch_id: 9_000_000_000_000_000_501,
+            part_id: 9_000_000_000_000_000_502,
+            from_kind: "PRODUCTION_SHELF".into(),
+            to_kind: "OUTSOURCE_COMPANY".into(),
+            new_holder_id: 9_000_000_000_000_000_503,
+            new_location: "OUTSOURCE_COMPANY".into(),
+            version: 2,
+            shipment_id: Some(9_000_000_000_000_000_504),
+            new_process_id: None,
+        }
+    }
+
+    /// 回收方向：两个 `Option` 恰好与发送方向相反。
+    fn move_result_receive() -> OutsourceMoveResult {
+        OutsourceMoveResult {
+            batch_id: 9_000_000_000_000_000_501,
+            part_id: 9_000_000_000_000_000_502,
+            from_kind: "OUTSOURCE_COMPANY".into(),
+            to_kind: "PRODUCTION_SHELF".into(),
+            new_holder_id: 9_000_000_000_000_000_505,
+            new_location: "PRODUCTION_SHELF".into(),
+            version: 4,
+            shipment_id: None,
+            new_process_id: Some(9_000_000_000_000_000_506),
+        }
+    }
+
+    /// `Some` 时走 `serialize_i64_opt` ⇒ JSON 字符串，且十进制内容与传入值一致。
+    ///
+    /// 这条守的是 `OutsourceMoveResult` 的全部 5 个 id 字段：前端把它们直接当
+    /// 下一次 move 的入参锚（`batch_id` / `new_holder_id`）与列表刷新键
+    /// （`part_id`），任何一处漏标 `serialize_*` 都是 `expected string, received
+    /// number` 炸在整页渲染上。
+    #[test]
+    fn move_result_snowflake_ids_are_strings() {
+        let send = serde_json::to_value(move_result_send()).unwrap();
+        assert_eq!(
+            send["batch_id"],
+            serde_json::json!("9000000000000000501"),
+            "{send}"
+        );
+        assert_eq!(
+            send["part_id"],
+            serde_json::json!("9000000000000000502"),
+            "{send}"
+        );
+        assert_eq!(
+            send["new_holder_id"],
+            serde_json::json!("9000000000000000503"),
+            "{send}"
+        );
+        assert_eq!(
+            send["shipment_id"],
+            serde_json::json!("9000000000000000504"),
+            "{send}"
+        );
+
+        let receive = serde_json::to_value(move_result_receive()).unwrap();
+        assert_eq!(
+            receive["new_process_id"],
+            serde_json::json!("9000000000000000506"),
+            "{receive}"
+        );
+        assert_eq!(
+            receive["new_location"],
+            serde_json::json!("PRODUCTION_SHELF")
+        );
+    }
+
+    /// `None` 时**键整个不存在**（`skip_serializing_if` 优先于 `serialize_i64_opt`）。
+    ///
+    /// 这条是 `prod::queue::vo::worker::MoveResult::shelf_id` 那个坑的同形守卫：
+    /// 漏标 `skip_serializing_if` 会让前端拿到 `null`，而它对这两个字段的判定是
+    /// 「有没有这个方向的东西」（`"shipment_id" in payload` / 挂 shipment 卡片），
+    /// `null` 与「这个方向不产生它」在语义上不是一回事。
+    #[test]
+    fn move_result_omits_direction_specific_keys_when_absent() {
+        // 先断言是 object：`Value::get` 对非 object 同样返回 None，直接 get 会让
+        // 「序列化结果不是 object」这条异常路径静默通过。
+        let send = serde_json::to_value(move_result_send())
+            .unwrap()
+            .as_object()
+            .expect("OutsourceMoveResult 应序列化为 JSON object")
+            .clone();
+        assert!(send.get("shipment_id").is_some());
+        assert!(send.get("new_process_id").is_none());
+
+        let receive = serde_json::to_value(move_result_receive())
+            .unwrap()
+            .as_object()
+            .expect("OutsourceMoveResult 应序列化为 JSON object")
+            .clone();
+        assert!(receive.get("new_process_id").is_some());
+        assert!(receive.get("shipment_id").is_none());
     }
 }

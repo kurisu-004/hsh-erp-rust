@@ -11,12 +11,16 @@
 //! - `lifecycle.rs` —— 批次终态与返修起点（deliver / complete / start-repair）
 //! - `shelf.rs` —— 上架 / 召回（place-on-shelf / recall-to-pending）
 //! - `programming.rs` —— CNC 编程出口（release-from-programming）
-//! - `outsource.rs` —— 外协流转三端点
 //! - `repair.rs` —— 返修闭环两写点 + 两条集合读（`/repair` / `/repairing`）
 //! - `batch_ops.rs` —— 拆批 / 取消批次
 //! - `pickup.rs` —— 手动 pick-up
 //! - `scan.rs` —— 扫码品检 / 司机扫码发货
 //! - `worker_scan.rs` —— 工人扫码台主入口（RETURNED / INSPECTED 二合一）
+//!
+//! 2026-10-09：`outsource.rs`（外协流转三端点）整体删除 —— 三个端点合并为
+//! `POST /api/v2/outsource-queue/move`（`crate::modules::outsource::service::move_svc`，
+//! 硬切无 alias）。随之删除的还有「部分发送 / 部分接收」的拆批调用：move 端点是整批
+//! 语义，部分流转走 `POST /prod/batches/{batch_id}/split`（`batch_ops.rs` 内）。
 //!
 //! 2026-10-08：原 `guard.rs`（状态机守卫 / OCC / 货架校验 / 写入口薄包装）与
 //! `status_gate.rs` 已上移到 `shared::batch` —— 它们是所有碰批次的域都要用的
@@ -54,7 +58,6 @@
 
 pub mod batch_ops;
 pub mod lifecycle;
-pub mod outsource;
 pub mod pickup;
 pub mod programming;
 pub mod repair;

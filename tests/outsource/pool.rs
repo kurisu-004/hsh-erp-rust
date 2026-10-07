@@ -11,7 +11,8 @@
 //! 3. `detail_lists_all_mapped_companies_with_inlined_held_batches` —— 右列含
 //!    `held_count = 0` 的空列，且 **`held_count == held_batches.len()`**
 //! 4. `detail_keeps_direct_row_with_empty_company_options`
-//! 5. `detail_items_match_sendable_endpoint_field_by_field`（**防 SQL 分叉的核心断言**）
+//! 5. `detail_items_count_matches_snapshot_sendable_count`（**防 SQL 分叉的核心断言**：
+//!    snapshot 的分组计数 == detail 的分组取全量）+ `removed_sendable_endpoint_returns_404`
 //! 6. `detail_candidate_carries_new_card_fields` —— 5 个新增字段 + 拆开的客户两字段，
 //!    并断言 3 个已删字段**不再出现**
 //! 7. `detail_held_batches_carry_shipment_fields`
@@ -587,10 +588,6 @@ async fn get_detail(app: &axum::Router, token: &str, process_id: i64) -> (Status
     .await
 }
 
-async fn get_sendable(app: &axum::Router, token: &str) -> (StatusCode, Value) {
-    get(app, token, "/outsource-sendable?limit=200").await
-}
-
 /// 只取状态码 + 原始 body（不解析 JSON）。
 ///
 /// axum 的路由未命中返回的是**空 body 的 404**，不走 `R<T>` 信封 —— 与
@@ -994,11 +991,19 @@ async fn detail_keeps_direct_row_with_empty_company_options() {
 }
 
 // ===========================================================================
-//  5. items 与 /outsource-sendable 逐字段一致（防 SQL 分叉的核心断言）
+//  5. items 与 snapshot 的 sendable_count 对得上（防 SQL 分叉的核心断言）
 // ===========================================================================
 
+/// `snapshot.processes[].sendable_count` 必须等于 `processes/{id}.items.len()`。
+///
+/// ⚠️ 2026-10-09：原形态是「detail 的 items 与 `GET /outsource-sendable` 的分页子集逐
+/// 字段比对」，守的是「两个端点共用同一份候选侧谓词」。该端点已随三合一硬切下线
+/// （它是看板候选列的一个分页子集），所以断言改挂在**同域内仍然存在的两个口径**上：
+/// `snapshot` 的分组计数与 `detail` 的分组取全量。两者虽然各自拼了外层（一条
+/// `GROUP BY current_process_id`、一条 `WHERE current_process_id = $1`），谓词仍来自
+/// 同一份 `SENDABLE_INNER_X_SQL` —— 改谓词漏改一处，这里照样红。
 #[tokio::test]
-async fn detail_items_match_sendable_endpoint_field_by_field() {
+async fn detail_items_count_matches_snapshot_sendable_count() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let cid = insert_customer(&pool, "PcCmp", "E").await;
     // 两道工序：APPROVAL（需审批 + 已批准报价）与 DIRECT（免审批）。
@@ -1014,15 +1019,16 @@ async fn detail_items_match_sendable_endpoint_field_by_field() {
     link_company_process(&pool, co1, proc_appr).await;
     link_company_process(&pool, co1, proc_dir).await;
     link_company_process(&pool, co2, proc_dir).await;
-    // 停用但已映射的公司：两边都不得把它列进 company_options。
+    // 停用但已映射的公司：不得被列进 company_options。
     let co_off = insert_company(&pool, "CmpCoOff", false).await;
     link_company_process(&pool, co_off, proc_dir).await;
 
+    let appr_quote_id: i64;
     let batch_appr = {
         let p = insert_part(&pool, cid, "AP", "2026-12-01").await;
         create_chain_with_steps(&pool, p, &[(proc_appr, 1)]).await;
         let b = insert_candidate_batch(&pool, p, shelf_id, proc_appr, 11).await;
-        insert_approved_quote(&pool, p, co1, proc_appr, "19.90").await;
+        appr_quote_id = insert_approved_quote(&pool, p, co1, proc_appr, "19.90").await;
         b
     };
     let batch_direct = {
@@ -1038,47 +1044,26 @@ async fn detail_items_match_sendable_endpoint_field_by_field() {
     create_chain_with_steps(&pool, p_other, &[(other_proc, 1)]).await;
     let other_batch = insert_candidate_batch(&pool, p_other, other_shelf, other_proc, 33).await;
 
-    let (s, sendable_env) = get_sendable(&app, &token).await;
-    assert_eq!(s, StatusCode::OK, "{sendable_env}");
+    let (s, snap_env) = get_snapshot(&app, &token).await;
+    assert_eq!(s, StatusCode::OK, "{snap_env}");
 
-    // 逐字段比对。**只比对两边都有的字段**：detail 少了 `current_process_*`（工序已提到
-    // 顶层）与 `source_status` / `batch_quantity` / `status_label` / `customer_path`
-    // （4 个刻意删/拆掉的字段，见 vo/queue.rs 文件头）。
-    let fields = [
-        "batch_id",
-        "batch_no",
-        "version",
-        "send_mode",
-        "part_id",
-        "part_serial_no",
-        "part_drawing_no",
-        "part_name",
-        "quantity",
-        "planned_delivery_date",
-        "is_urgent",
-        "shelf_code",
-        "outsource_company_id",
-        "outsource_company_name",
-        "quote_id",
-        "price",
-        "company_options",
-    ];
     for (proc_id, expect_modes) in [(proc_appr, vec!["APPROVAL"]), (proc_dir, vec!["DIRECT"])] {
         let (s, detail_env) = get_detail(&app, &token, proc_id).await;
         assert_eq!(s, StatusCode::OK, "{detail_env}");
         let detail_items = detail_env["data"]["items"].as_array().unwrap();
-        // sendable 侧按 current_process_id 过滤出同一批行。
+        // snapshot 的分组计数必须等于 detail 的取全量行数
         let pid = proc_id.to_string();
-        let sendable_items: Vec<&Value> = sendable_env["data"]["items"]
+        let snap_count = snap_env["data"]["processes"]
             .as_array()
             .unwrap()
             .iter()
-            .filter(|i| i["current_process_id"] == pid)
-            .collect();
+            .find(|c| c["process_id"].as_str() == Some(pid.as_str()))
+            .unwrap_or_else(|| panic!("snapshot 缺工序 {proc_id}: {snap_env}"))["sendable_count"]
+            .clone();
         assert_eq!(
-            detail_items.len(),
-            sendable_items.len(),
-            "同一工序的行数必须一致: detail={detail_env} sendable={sendable_env}"
+            snap_count,
+            serde_json::json!(detail_items.len()),
+            "同一工序的 snapshot 计数与 detail 行数必须一致: detail={detail_env} snapshot={snap_env}"
         );
         assert_eq!(detail_items.len(), expect_modes.len(), "{detail_env}");
         assert!(
@@ -1092,18 +1077,14 @@ async fn detail_items_match_sendable_endpoint_field_by_field() {
             .map(|i| i["send_mode"].as_str().unwrap())
             .collect();
         assert_eq!(modes, expect_modes, "{detail_env}");
+        // 每行都必须给出移动写端点要用的两个锚：`version`（OCC）与 `shelf_id`（from）
         for d in detail_items {
-            let key = d["batch_id"].as_str().unwrap().to_string();
-            let s_row = sendable_items
-                .iter()
-                .find(|i| i["batch_id"].as_str() == Some(key.as_str()))
-                .unwrap_or_else(|| panic!("sendable 缺 batch {key}: {sendable_env}"));
-            for f in fields {
-                assert_eq!(
-                    d[f], s_row[f],
-                    "字段 {f} 在 batch {key} 上不一致: detail={detail_env} sendable={sendable_env}"
-                );
-            }
+            assert!(d["version"].is_i64(), "候选卡必须带 version: {detail_env}");
+            assert_eq!(
+                d["shelf_id"],
+                shelf_id.to_string(),
+                "候选卡 shelf_id 必须等于批次真实所在货架（移动写端点 from 的锚）: {detail_env}"
+            );
         }
     }
 
@@ -1129,10 +1110,32 @@ async fn detail_items_match_sendable_endpoint_field_by_field() {
     );
     assert_eq!(appr["send_mode"], "APPROVAL", "{appr_env}");
     assert_eq!(
+        appr["quote_id"],
+        appr_quote_id.to_string(),
+        "APPROVAL 行给出的必须是**报价 id**（移动写端点的 quote_id 入参）: {appr_env}"
+    );
+    assert_eq!(
+        appr["outsource_company_id"],
+        co1.to_string(),
+        "APPROVAL 行给出报价所属公司: {appr_env}"
+    );
+    assert_eq!(appr["price"], "19.90", "{appr_env}");
+    assert_eq!(
         appr["company_options"].as_array().unwrap().len(),
         0,
         "{appr_env}"
     );
+}
+
+/// `GET /outsource-sendable` 已随三合一硬切下线 → 404（**无 alias**）。
+///
+/// 它是看板候选列的一个分页子集，留着只会让前端有两条口径可打、`sendable_count` 与
+/// 行数对不上时无从判断该信哪个。
+#[tokio::test]
+async fn removed_sendable_endpoint_returns_404() {
+    let (_pool, app, token, _fx) = bootstrap_as_manager().await;
+    let (s, body) = get_raw(&app, &token, "/outsource-sendable?limit=200").await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "旧可发送一览必须已下线: {body}");
 }
 
 // ===========================================================================

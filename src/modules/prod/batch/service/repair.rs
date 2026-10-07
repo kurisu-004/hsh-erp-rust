@@ -407,8 +407,9 @@ impl BatchService {
         //   `PENDING → READY_TO_SHIP`）⇒ DELIVERED 批次**必经 INSPECTION**；而
         //   所有进 INSPECTION 的写点都把 `current_process_id` 置 NULL
         //   （`BatchService::scan_inspect` /
-        //   `BatchService::receive_from_outsource_to_inspection` /
-        //   `BatchService::complete_repair` / `mark_batch_inspected`），其后
+        //   `OutsourceMoveService::move_batch` 的 `OUTSOURCE_COMPANY →
+        //   INSPECTION_SHELF` 臂 / `BatchService::complete_repair` /
+        //   `mark_batch_inspected`），其后
         //   `mark_batch_passed_inspection` 与 `mark_batch_delivered` 都**不写该列**
         //   ⇒ 直读会让本端点的 `next_process_id` / `next_process_name`
         //   **结构性恒 null**（用户可见回归，与 M3 修掉的 inspection-batches

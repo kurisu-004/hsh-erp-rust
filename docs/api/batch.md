@@ -9,13 +9,13 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
 
 **剥离策略**：
 
-1. batch 域本轮（2026-10-08）只做 `prod::queue` 那一份的剥离（4 个端点，见 §3）。
+1. batch 域先做 `prod::queue` 那一份的剥离（4 个端点，2026-10-08），再做 outsource 那一份（3 个端点，2026-10-09，见 §3）。
 2. 后续每一轮某个域重构时**重复这个动作**：认领 §4 表里属于自己目标域的端点，连同 handler / service / repo / VO / DTO 一起搬。
 3. 直到 §4 表里的端点被全部分走之后，**再删除本域**。
 
 本文件的存在目的：让下一轮重构的 agent（以及前端）**不翻 Rust 源码**就能知道 batch 域还剩什么、哪些已被认领。契约只从 `docs/api/` 读（前端 CLAUDE.md 规定）。
 
-## 2. 剩余路由表（23 条）
+## 2. 剩余路由表（20 条）
 
 全部挂 `/api/v2/prod/batches`。`/{batch_id}` 是 path 段；`to-ship` / `to-inspection` / `worker-scan` / `repair` / `repairing` / `scan/deliver` 是静态段（**无 Path extractor**）。
 
@@ -36,14 +36,11 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
 | 13 | POST | `/{batch_id}/start-repair` | Manager + Inspector |
 | 14 | POST | `/{batch_id}/place-on-shelf` | Manager + Clerk |
 | 15 | POST | `/{batch_id}/release-from-programming` | Manager + Clerk |
-| 16 | POST | `/{batch_id}/send-to-outsource` | Manager + Clerk |
-| 17 | POST | `/{batch_id}/receive-from-outsource` | Manager + Clerk |
-| 18 | POST | `/{batch_id}/receive-from-outsource-to-inspection` | Manager + Clerk |
-| 19 | POST | `/{batch_id}/complete-repair` | Manager + Clerk |
-| 20 | POST | `/{batch_id}/repair-dispatch` | Manager + Clerk |
-| 21 | POST | `/{batch_id}/split` | Manager + Clerk |
-| 22 | POST | `/{batch_id}/cancel` | Manager + Clerk |
-| 23 | POST | `/{batch_id}/pick-up` | Manager + Clerk + ShelfAccount |
+| 16 | POST | `/{batch_id}/complete-repair` | Manager + Clerk |
+| 17 | POST | `/{batch_id}/repair-dispatch` | Manager + Clerk |
+| 18 | POST | `/{batch_id}/split` | Manager + Clerk |
+| 19 | POST | `/{batch_id}/cancel` | Manager + Clerk |
+| 20 | POST | `/{batch_id}/pick-up` | Manager + Clerk + ShelfAccount |
 
 - 全部返回统一信封 `R { code, message, data }`。
 - 写端点的事务边界在 handler（`state.pool.begin()` → service → `tx.commit()`），**WS 广播在 commit 之后**。
@@ -65,10 +62,15 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
 | `POST /api/v2/prod/batches/dispatch` | `POST /api/v2/prod/queue/dispatch` | 路径 | 2026-10-08 |
 | `POST /api/v2/prod/batches/auto-dispatch` | `POST /api/v2/prod/queue/auto-dispatch` | 路径 | 2026-10-08 |
 | `POST /api/v2/prod/batches/{batch_id}/recall-to-pending` | `POST /api/v2/prod/queue/recall` | 路径 + `batch_id` 改入 body + 出参 `PartOut` → `RecallOut` | 2026-10-08 |
+| `POST /api/v2/prod/batches/{batch_id}/send-to-outsource` | `POST /api/v2/outsource-queue/move` | **三合一**：`from`/`to` 结构体 + `batch_id` 改入 body + 去 `quantity` / `process_id` + 出参 `PartOut` → `OutsourceMoveResult` | 2026-10-09 |
+| `POST /api/v2/prod/batches/{batch_id}/receive-from-outsource` | `POST /api/v2/outsource-queue/move` | 同上（`to.kind = PRODUCTION_SHELF` 臂；`next_process_id` 可省略，后端按工序链推导） | 2026-10-09 |
+| `POST /api/v2/prod/batches/{batch_id}/receive-from-outsource-to-inspection` | `POST /api/v2/outsource-queue/move` | 同上（`to.kind = INSPECTION_SHELF` 臂） | 2026-10-09 |
 
 **全部无 alias**，旧路径 404。契约细节见 [`queue.md`](queue.md) §1 与 §5.1。
 
 2026-10-07 一行迁走的是待品检队列读的整条链路（`dto` / `vo` / `model` 行结构 / `repo/list.rs` / `service/list.rs`）→ `prod::inspection`，契约见 [`inspection.md`](inspection.md)。
+
+2026-10-09 外协三端点合并为 `POST /api/v2/outsource-queue/move`（`outsource` 域，硬切无 alias）。一并搬走的代码：`prod::batch/service/outsource.rs`（整文件，含三个 service 方法 + DIRECT 占位报价解析 + 开口 shipment 关闭两个自由函数）、`handler/lifecycle.rs` 的三个 handler、`dto.rs` 的三个入参（`SendToOutsourceRequest` / `ReceiveFromOutsourceRequest` / `ReceiveFromOutsourceToInspectionRequest`）。同时删掉的三个 WS 事件名（`PART_SENT_TO_OUTSOURCE` / `PART_RECEIVED_FROM_OUTSOURCE` / `PART_RECEIVED_FROM_OUTSOURCE_INSPECTED`）合并为 `OUTSOURCE_MOVE_DONE`；`t_part_event` 的三个审计字面量（`SENT_TO_OUTSOURCE` / `RECEIVED_FROM_OUTSOURCE` / `RECEIVED_TO_INSPECTION`）逐字保留。契约见 `src/modules/outsource/{dto.rs,vo/queue.rs,service/move.rs,handler/move.rs}` 的模块 doc（outsource 域暂无 `docs/api/` 文件）。
 
 2026-10-08 一并搬走的代码：`service/dispatch.rs`、`handler/dispatch.rs`、`repo/mod.rs`（ZST `BatchRepo` → `queue/repo/dispatch.rs` 的 `QueueDispatchRepo`）、`service/shelf.rs` 的 `recall_to_pending` → `queue/service/recall.rs`、`vo.rs` 的 5 类下发流出参 → `queue/vo/queue.rs`、`dto.rs` 的 5 个下发流入参 → `queue/dto.rs`。
 
@@ -88,11 +90,12 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
 | `POST /{batch_id}/start-repair`、`complete-repair`、`repair-dispatch`、`GET /repair`、`GET /repairing` | `views/repair/` |
 | `POST /{batch_id}/place-on-shelf` | 待定（消费方是零件列表页，非队列页） |
 | `POST /{batch_id}/release-from-programming` | `views/cnc/` |
-| `POST /{batch_id}/send-to-outsource`、`receive-from-outsource`、`receive-from-outsource-to-inspection` | `views/outsource/` |
+| ~~`POST /{batch_id}/send-to-outsource`、`receive-from-outsource`、`receive-from-outsource-to-inspection`~~ | ~~`views/outsource/`~~（2026-10-09 已剥离，三合一为 `outsource::queue`） |
 | `POST /{batch_id}/split`、`POST /{batch_id}/cancel` | `views/parts/detail/` |
 | `POST /{batch_id}/pick-up` | `views/scan/`（扫码台） |
 | ~~`GET /inspection`~~ | ~~`prod::inspection`~~（2026-10-07 已剥离） |
 | ~~`GET /pending` `POST /dispatch` `POST /auto-dispatch` `POST /{batch_id}/recall-to-pending`~~ | ~~`prod::queue`~~（2026-10-08 已剥离） |
+| ~~`POST /{batch_id}/send-to-outsource`、`receive-from-outsource`、`receive-from-outsource-to-inspection`~~ | ~~`outsource::queue`~~（2026-10-09 已剥离，三合一） |
 
 ⚠️ 「多域共用」的几条是后续某一轮的**决策点**：搬之前需要先决定它归哪个域（取决于哪个页面先重构），不要两边都搬。
 
@@ -117,8 +120,8 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
 - `repo/sql.rs`（inspection / lifecycle 流转的 19 个定位 + 写点，全部是写入口之上的薄包装）
 - `repo/trait.rs`（胖 trait `PartBatchRepoTrait` + `impl for &mut PgConnection`）
 - `model.rs`（2 个**窄投影**行结构：`RecentBatchRow` / `PartBatchScanRow`）
-- `service/`（除已剥离的 `dispatch.rs` 与 `shelf.rs::recall_to_pending` 外的全部用例；返修两条集合读的 SQL 在 `service/repair.rs::list_batches_matching` 内联自建）
-- `dto.rs`（除已剥离的 5 个下发流入参外的全部）
+- `service/`（除已剥离的 `dispatch.rs`、`outsource.rs` 与 `shelf.rs::recall_to_pending` 外的全部用例；返修两条集合读的 SQL 在 `service/repair.rs::list_batches_matching` 内联自建）
+- `dto.rs`（除已剥离的 5 个下发流入参与 3 个外协入参外的全部）
 - `vo.rs`（除已剥离的 5 类下发流出参外的全部）
 
 ## 6. 状态派生契约（未变，搬域不搬契约）
@@ -143,6 +146,9 @@ t_assembly.status               ← 派生缓存
 | 被移除项 | 原因 |
 |---|---|
 | `GET /api/v2/prod/batches/inspection` | 迁往 `GET /api/v2/prod/inspection/queue`（2026-10-07） |
+| `POST /api/v2/prod/batches/{batch_id}/send-to-outsource` / `receive-from-outsource` / `receive-from-outsource-to-inspection` | 合并为 `POST /api/v2/outsource-queue/move`（2026-10-09，硬切无 alias）。**部分收发能力随之下线**（入参不再有 `quantity`），部分流转改走 `POST /api/v2/prod/batches/{batch_id}/split` |
+| `service/outsource.rs`（整文件）+ `dto.rs` 的三个外协入参 | 随三端点迁往 `outsource::service::move_svc` / `outsource::dto`（2026-10-09） |
+| WS 事件名 `PART_SENT_TO_OUTSOURCE` / `PART_RECEIVED_FROM_OUTSOURCE` / `PART_RECEIVED_FROM_OUTSOURCE_INSPECTED` | 合并为 `OUTSOURCE_MOVE_DONE`（2026-10-09）。`t_part_event` 的三个审计字面量不变 |
 | `GET /api/v2/prod/batches/pending` / `POST /dispatch` / `POST /auto-dispatch` | 迁往 `prod::queue`（2026-10-08） |
 | `POST /api/v2/prod/batches/{batch_id}/recall-to-pending` | 迁往 `POST /api/v2/prod/queue/recall`（2026-10-08），`batch_id` 改入 body、出参改 `RecallOut` |
 | `repo/list.rs` + `service/list.rs` | 随待品检队列读迁往 `prod::inspection`（2026-10-07） |

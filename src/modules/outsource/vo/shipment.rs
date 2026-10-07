@@ -130,5 +130,5 @@ pub struct OutsourceSentPartListOut {
 // 2026-10-03 删除 `ApprovedForSendItem` / `ApprovedForSendListOut`（死 VO，零调用方）。
 // 它们想表达的是「可发送外协」，但形状是「必须先有 APPROVED 报价」—— 表达不了
 // DIRECT 模式（无报价直发），也没有 `company_options` / `send_mode` / `quote_id`。
-// 取代者：`super::sendable::OutsourceSendableItem`（`GET /outsource-sendable`），
-// 同一行同时覆盖 APPROVAL 与 DIRECT 两种模式。
+// 取代者：`super::queue::OutsourceQueueCandidate`（看板候选列，同一行同时覆盖 APPROVAL
+// 与 DIRECT 两种模式，2026-10-09 随 `GET /outsource-sendable` 一并下线）。

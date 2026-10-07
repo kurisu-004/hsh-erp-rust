@@ -9,8 +9,12 @@
 //!   流转 + 扫码快捷入口（`scan-inspect` / `scan/deliver` / `worker-scan`）+ 集合读
 //!   （`repair` / `repairing`）
 //! - `lifecycle.rs` —— 终态 + 状态机扩展（`deliver` / `complete` / `start-repair` /
-//!   `place-on-shelf` / `release-from-programming` / outsource 三端点
-//!   / `complete-repair` / `repair-dispatch` / `split` / `cancel` / `pick-up`）
+//!   `place-on-shelf` / `release-from-programming` / `complete-repair` /
+//!   `repair-dispatch` / `split` / `cancel` / `pick-up`）
+//!
+//! 2026-10-09：外协三个端点（`send-to-outsource` / `receive-from-outsource` /
+//! `receive-from-outsource-to-inspection`）剥离到 `outsource::queue`，合并为
+//! `POST /api/v2/outsource-queue/move`（三合一，硬切无 alias）。
 //!
 //! ## 事务边界
 //! 统一在 handler：`state.pool.begin()` → 传 `&mut tx` 给 service → 显式
@@ -38,8 +42,7 @@ pub use transition::{
 // ----- lifecycle.rs -----
 pub use lifecycle::{
     cancel_batch, complete, complete_repair, deliver, pick_up, place_on_shelf,
-    receive_from_outsource, receive_from_outsource_to_inspection, release_from_programming,
-    repair_dispatch, send_to_outsource, split_batch, start_repair,
+    release_from_programming, repair_dispatch, split_batch, start_repair,
 };
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -64,7 +67,7 @@ pub fn router() -> Router<Arc<AppState>> {
         // ====================================================================
         .route("/scan/deliver", post(transition::scan_deliver_part))
         // ====================================================================
-        // ③ 2 段、首段动态 `/{batch_id}` —— 子资源 16 条
+        // ③ 2 段、首段动态 `/{batch_id}` —— 子资源 13 条
         //
         // ⚠️ `/{batch_id}/…` 与上面的 `/scan/deliver` **段数相同**，靠 matchit 的
         // 静态段优先规则消解（静态注册在前即可，实测 `POST /prod/batches/scan/deliver`
@@ -92,19 +95,6 @@ pub fn router() -> Router<Arc<AppState>> {
         .route(
             "/{batch_id}/release-from-programming",
             post(lifecycle::release_from_programming),
-        )
-        // ---- 外协 ----
-        .route(
-            "/{batch_id}/send-to-outsource",
-            post(lifecycle::send_to_outsource),
-        )
-        .route(
-            "/{batch_id}/receive-from-outsource",
-            post(lifecycle::receive_from_outsource),
-        )
-        .route(
-            "/{batch_id}/receive-from-outsource-to-inspection",
-            post(lifecycle::receive_from_outsource_to_inspection),
         )
         // ---- 返修 ----
         .route(
@@ -161,9 +151,6 @@ pub const ROUTES: &[&str] = &[
     "POST /{batch_id}/start-repair",
     "POST /{batch_id}/place-on-shelf",
     "POST /{batch_id}/release-from-programming",
-    "POST /{batch_id}/send-to-outsource",
-    "POST /{batch_id}/receive-from-outsource",
-    "POST /{batch_id}/receive-from-outsource-to-inspection",
     "POST /{batch_id}/complete-repair",
     "POST /{batch_id}/repair-dispatch",
     "POST /{batch_id}/split",
@@ -194,9 +181,6 @@ pub const STRIP_TARGETS: &[&str] = &[
     "views/repair/",
     "待定（消费方是零件列表页，非队列页）",
     "views/cnc/",
-    "views/outsource/",
-    "views/outsource/",
-    "views/outsource/",
     "views/repair/",
     "views/repair/",
     "views/parts/detail/",
@@ -219,6 +203,18 @@ pub const STRIPPED: &[(&str, &str)] = &[
     (
         "POST /{batch_id}/recall-to-pending",
         "prod::queue（2026-10-08 剥离，新路径 POST /prod/queue/recall，batch_id 入 body）",
+    ),
+    (
+        "POST /{batch_id}/send-to-outsource",
+        "outsource::queue（2026-10-09 剥离，三合一为 POST /outsource-queue/move）",
+    ),
+    (
+        "POST /{batch_id}/receive-from-outsource",
+        "outsource::queue（2026-10-09 剥离，三合一为 POST /outsource-queue/move）",
+    ),
+    (
+        "POST /{batch_id}/receive-from-outsource-to-inspection",
+        "outsource::queue（2026-10-09 剥离，三合一为 POST /outsource-queue/move）",
     ),
 ];
 

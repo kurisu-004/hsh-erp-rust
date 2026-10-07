@@ -1,40 +1,30 @@
-//! outsource 域 service — `GET /outsource-sendable` 子模块
+//! outsource 域 — 候选侧三个共用纯函数（2026-10-03 新增，2026-10-09 端点下线后
+//! 只剩「共用纯函数」这一个身份）
 //!
-//! 2026-10-03 新增，同日改判据：可发送外协的一览，一行 = 一个活跃批次（判据是
-//! `t_part_batch.current_process_id` 指向一道 OUTSOURCE 工序，不再要求零件绑了
-//! 工艺链 —— 生产库里绝大多数零件没有链，原谓词导致端点恒空，见
-//! `repo/sql.rs::SENDABLE_INNER_X_SQL`）。
+//! 本文件原本是 `GET /outsource-sendable` 的实现（service + 该端点的判定入口）。该端点
+//! 于 2026-10-09 硬切下线：它的行就是 `GET /outsource-queue/processes/{id}` 候选列的
+//! **分页子集**（看板不分页），分页 + 关键字 + 客户过滤那套入参与 VO 一并删除。
 //!
-//! 取代 part 域旧 `list_outsource_sendable`（后者返回通用 `PartListItem`，与前端
-//! 外协域字段需求完全不匹配 → 页面全灰）。旧端点已删除（`/parts/outsource-sendable`
-//! 实际返回 400 —— part 域 `/{part_id}` `Path<i64>` catch-all 兜底，非 404，
-//! 成因与取舍见 `src/modules/part/mod.rs` 的模块 doc），无 alias。
+//! ## 为什么这三个函数留在这里而不是删掉 / 搬去看板侧
 //!
-//! ## 判定逻辑全在 SQL
-//! 哪些批次出行、`send_mode` 的审批闸门、`quote_id` 的选取、`company_options` 的
-//! `array_agg` 全部在 `OutsourceSendableRepo`（`repo/sql.rs`）一条 SQL 内完成；
-//! service 只做 VO 映射（含 `company_options` 的 JSON → 结构体解码）。**禁止**
-//! 在这里循环查公司（会退化成 N+1）。
+//! | 函数 | 谁消费 | 判的是什么 |
+//! |---|---|---|
+//! | `send_mode_of` | 看板候选列 | APPROVAL / DIRECT 双模式 |
+//! | `can_send_of` | 看板候选列（卡片是否置灰） | 该行能不能发 |
+//! | `decode_company_options` | 看板候选列 | SQL `array_agg` JSON → 结构体 |
+//!
+//! 候选侧的**谓词 SQL**（`repo/sql.rs::SENDABLE_INNER_X_SQL` + `DISTINCT ON` 收敛层）
+//! 与这三个纯函数是**同一份判定**的三个出口。判定与 `company_options` 是一组，搬到
+//! `board/` 会让 `repo/sql.rs` 的谓词真源与它的消费者分居两个目录（`board/` 受
+//! 「固定 SQL 条数」源码护栏圈住，判定函数混进去就不再是纯聚合）。留在本模块并
+//! `pub(crate)` 放开，比在看板侧复制粘贴一份更便宜 —— 两边各写一遍时，「tab 内行数
+//! ≠ 一览行数」这类对账事故是**静默**的。
 //!
 //! ## 事务边界
-//! 读端点：handler `pool.acquire()` 不开事务，service 借 `&mut *conn`。
-//!
-//! ## 2026-10-09：三个纯函数提为 `pub(crate)`
-//! 看板聚合线（`super::board`）的候选列与本端点**同源**（同一份
-//! `repo/sql.rs::SENDABLE_INNER_X_SQL` 谓词 + 同一个 `DISTINCT ON` 收敛层），因此
-//! `send_mode_of` / `can_send_of` / `decode_company_options` 三处必须共用同一份实现
-//! —— 两边各写一遍时，「tab 内行数 ≠ 一览行数」这类对账事故是静默的。把它们留在本
-//! 模块并放开到 `pub(crate)`，比在看板侧复制粘贴一份更便宜。
+//! 无：本文件只剩纯函数，不再有端点实现（看板两读是 handler `pool.acquire()` 不开
+//! 事务，见 `super::board`）。
 
-use crate::auth::rbac::{CurrentUser, Role};
-use crate::modules::outsource::dto::OutsourceSendableListQuery;
-use crate::modules::outsource::repo::OutsourceRepoTrait;
-use crate::modules::outsource::vo::{
-    OutsourceCompanyOption, OutsourceSendableItem, OutsourceSendableListOut,
-};
-use crate::shared::error::AppError;
-
-use super::{DEFAULT_LIMIT, LIST_MAX_LIMIT, OutsourceService, join_customer_path, keyword_pattern};
+use crate::modules::outsource::vo::OutsourceCompanyOption;
 
 /// 把 SQL `array_agg(json_build_object(...))` 的结果解成 `Vec<OutsourceCompanyOption>`。
 ///
@@ -44,7 +34,7 @@ pub(crate) fn decode_company_options(raw: serde_json::Value) -> Vec<OutsourceCom
     serde_json::from_value(raw).unwrap_or_default()
 }
 
-/// 候选行的 `send_mode` 判定（`service/pool.rs` 的看板候选列复用本函数）。
+/// 候选行的 `send_mode` 判定（看板候选列 `board/service.rs::to_candidate` 消费）。
 ///
 /// 2026-10-03 起语义由「有没有命中已批准报价」改为「该外协工序是否需要审批」：
 /// - `requires_approval = false` → `DIRECT`（免审批直发）。此时候选报价字段
@@ -60,7 +50,7 @@ pub(crate) fn decode_company_options(raw: serde_json::Value) -> Vec<OutsourceCom
 /// 1. **不可达**：`requires_approval=true` 的行要出行必须过 SQL 的 EXISTS 闸门，
 ///    而同一份内层 `x` 的 LEFT JOIN 谓词与之等价（都要求命中一条真实审批报价，
 ///    2026-10-03 起两处都带 `is_direct = false`）⇒ `quote_id IS NULL` 的行根本进不了
-///    结果集；写侧 `send_to_outsource` 也已拒 `requires_approval && direct`（20104）。
+///    结果集；写侧 `service/move.rs` 也已拒 `requires_approval && direct`（20104）。
 /// 2. **改 fail-closed 会破坏 VO 契约**：`OutsourceSendableItem.quote_id` 的契约是
 ///    「APPROVAL 有值 / DIRECT `null`」。让本函数返回 APPROVAL 之外的第三种结果（或
 ///    抛错）都要求 service 层开始丢弃行，于是「列表行数 ≠ count」这类对账事故重新
@@ -83,84 +73,11 @@ pub(crate) fn send_mode_of(requires_approval: bool, has_approved_quote: bool) ->
 /// 提成独立函数是为了能单测 —— 这条判定同时驱动「卡片是否置灰」和「拖到公司列后能否
 /// 真发出去」，两处口径漂移的代价是用户点了没反应。
 ///
-/// ⚠️ **当前只有看板候选列消费本函数**（`GET /outsource-sendable` 的出参 VO 没有
-/// `can_send` 字段，前端按 `send_mode` 与 `company_options.length` 自行判定）。函数
+/// 消费方是看板候选列（`board/service.rs::to_candidate` 把它装进 `can_send`）。
 /// 放在本模块而不是看板侧，是因为判定与 `send_mode_of` / `company_options` 是一组，
 /// 而这三个函数的真源都在这里。
 pub(crate) fn can_send_of(send_mode: &str, company_options: &[OutsourceCompanyOption]) -> bool {
     send_mode == "APPROVAL" || !company_options.is_empty()
-}
-
-impl OutsourceService {
-    /// `GET /outsource-sendable`（2026-10-03 新增）
-    ///
-    /// 角色守卫与旧 `list_outsource_sendable` 一致（多给 Inspector 只读）。
-    pub async fn list_sendable<R: OutsourceRepoTrait>(
-        &self,
-        mut repo: R,
-        query: &OutsourceSendableListQuery,
-        current: &CurrentUser,
-    ) -> Result<OutsourceSendableListOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
-        let limit = query
-            .limit
-            .unwrap_or(DEFAULT_LIMIT)
-            .clamp(1, LIST_MAX_LIMIT);
-        let offset = query.offset.unwrap_or(0).max(0);
-        let pat = keyword_pattern(query.keyword.as_deref());
-
-        let rows = repo
-            .sendable_list(pat.as_deref(), query.customer_id, limit, offset)
-            .await?;
-        let total = repo
-            .sendable_count(pat.as_deref(), query.customer_id)
-            .await?;
-
-        let items = rows
-            .into_iter()
-            .map(|r| {
-                // send_mode 由「该外协工序是否需要审批」决定（`requires_approval`），
-                // 命中已批准报价的免审批工序仍判 DIRECT —— 见 `send_mode_of`。
-                let send_mode = send_mode_of(r.requires_approval, r.quote_id.is_some());
-                let company_options = decode_company_options(r.company_options);
-                OutsourceSendableItem {
-                    version: r.batch_version,
-                    send_mode: send_mode.to_string(),
-                    source_status: r.source_status,
-                    part_id: r.part_id,
-                    part_serial_no: r.part_serial_no,
-                    part_drawing_no: r.part_drawing_no,
-                    part_name: r.part_name,
-                    quantity: r.batch_quantity,
-                    batch_id: r.batch_id,
-                    batch_no: r.batch_no,
-                    batch_quantity: r.batch_quantity,
-                    planned_delivery_date: r.planned_delivery_date,
-                    is_urgent: r.is_urgent,
-                    customer_path: join_customer_path(
-                        r.parent_customer_name.as_deref(),
-                        r.customer_name.as_deref(),
-                    ),
-                    current_process_id: r.current_process_id,
-                    current_process_name: Some(r.current_process_name),
-                    shelf_code: r.shelf_code,
-                    outsource_company_id: r.outsource_company_id,
-                    outsource_company_name: r.outsource_company_name,
-                    quote_id: r.quote_id,
-                    company_options,
-                    price: r.price,
-                    status_label: "sendable".to_string(),
-                }
-            })
-            .collect();
-
-        Ok(OutsourceSendableListOut {
-            items,
-            total,
-            limit,
-            offset,
-        })
-    }
 }
 
 #[cfg(test)]

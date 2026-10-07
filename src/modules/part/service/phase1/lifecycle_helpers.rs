@@ -54,8 +54,9 @@ impl PartService {
             //     IN_PROCESS 一并返回）；
             //   - 而所有进 INSPECTION 的写点都按「出池 → `current_process_id = NULL`」
             //     不变式把该列清空（`BatchService::scan_inspect` /
-            //     `BatchService::receive_from_outsource_to_inspection` /
-            //     `BatchService::complete_repair` / `mark_batch_inspected`）→
+            //     `OutsourceMoveService::move_batch` 的 `OUTSOURCE_COMPANY →
+            //     INSPECTION_SHELF` 臂 / `BatchService::complete_repair` /
+            //     `mark_batch_inspected`）→
             //     直读会让 INSPECTION 批次的 `next_process_id` /
             //     `next_process_name` **恒为 null**。
             //

@@ -193,8 +193,9 @@ pub async fn assert_shelf_maps_process(
 /// 写入不变式第 4 行「非生产流 → NULL」的**唯一例外**（2026-09-30 review 第 1 轮
 /// M1 补记，勿按表机械核对后误判为 bug）：
 ///
-/// `outsource::send_to_outsource`（`status='OUTSOURCE'` +
-/// `location='OUTSOURCE_COMPANY'`）传 `Some(req.process_id)` 而非 NULL。三条理由：
+/// 外协发送（`outsource` 域 `service/move.rs` 的 `PRODUCTION_SHELF →
+/// OUTSOURCE_COMPANY` 臂，`status='OUTSOURCE'` + `location='OUTSOURCE_COMPANY'`）传
+/// `Some(batch.current_process_id)` 而非 NULL。三条理由：
 ///
 /// 1. 外协加工的就是这道工序，rollup 派生 `t_part.next_process_id` 需要它；
 /// 2. 与本次改动**前**的行为一致（旧代码写 `Some(step_id)`，rollup 再翻成
@@ -228,7 +229,8 @@ pub async fn assert_shelf_maps_process(
 ///   - `shelf::recall_to_pending`（`None,None,None,None`）：
 ///     PENDING 批次仍留着 `location='PRODUCTION_SHELF'` + `current_holder_id`
 ///     + 陈旧 step，UI 上「待投产」的工单显示还压在生产架上；
-///   - `outsource::receive_from_outsource_to_inspection`（外协收回 → INSPECTION）、
+///   - 外协收回直送品检（`outsource` 域 `service/move.rs` 的
+///     `OUTSOURCE_COMPANY → INSPECTION_SHELF` 臂）、
 ///     `scan::scan_inspect`（第一步）、`repair::complete_repair` /
 ///     `repair::repair_dispatch` 的 INSPECTION 分支：
 ///     `current_process_step_id` 不再清，而展示用的 `next_process_id` 正是由它
@@ -241,12 +243,12 @@ pub async fn assert_shelf_maps_process(
 /// |---|---|---|
 /// | `shelf::place_on_shelf` | `optional_step_id(..)` | 无链 |
 /// | `programming::release_from_programming` | `optional_step_id(..)` | 无链 |
-/// | `outsource::send_to_outsource` | `optional_step_id(..)` | 无链 |
-/// | `outsource::receive_from_outsource` | `optional_step_id(..)` | 无链 |
+/// | 外协发送（`outsource::service::move.rs`） | `optional_step_id(..)` | 无链 |
+/// | 外协收回回生产架（`outsource::service::move.rs`） | `optional_step_id(..)` | 无链 |
 /// | `repair::complete_repair` | `step_id_opt` | 无链（PRODUCTION 分支）/ 恒 `None`（INSPECTION 分支） |
 /// | `repair::repair_dispatch` | `step_id_opt` | 无链（PRODUCTION 分支）/ 恒 `None`（INSPECTION 分支） |
 /// | `shelf::recall_to_pending` | 字面 `None` | 恒 `None` |
-/// | `outsource::receive_from_outsource_to_inspection` | 字面 `None` | 恒 `None` |
+/// | 外协收回直送品检（`outsource::service::move.rs`） | 字面 `None` | 恒 `None` |
 /// | `scan::scan_inspect`（第一步） | 字面 `None` | 恒 `None` |
 /// | `pickup`（work_type pick-up） | `batch.current_process_step_id`（读回） | 批次行该列本来就是 NULL（无链零件）⇒ 传 `None`，与 clear 等价（目标列已 NULL，无副作用） |
 ///
@@ -610,7 +612,7 @@ mod tests {
         ensure_transition(PartStatus::PROGRAMMING, PartStatus::PENDING, "test").unwrap();
         ensure_transition(PartStatus::PROGRAMMING, PartStatus::IN_PROCESS, "test").unwrap();
         ensure_transition(PartStatus::OUTSOURCE, PartStatus::IN_PROCESS, "test").unwrap();
-        // 2026-10-03：send-to-outsource 的两个源状态
+        // 2026-10-03：外协发送的两个源状态
         ensure_transition(PartStatus::PENDING, PartStatus::OUTSOURCE, "test").unwrap();
         ensure_transition(PartStatus::IN_PROCESS, PartStatus::OUTSOURCE, "test").unwrap();
     }

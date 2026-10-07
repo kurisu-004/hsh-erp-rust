@@ -59,7 +59,7 @@ pub use super::model::{
 };
 pub use sql::{
     OutsourceCompanyProcessRepo, OutsourceCompanyRepo, OutsourceQuotableRepo,
-    OutsourceQuoteEventRepo, OutsourceQuoteRepo, OutsourceSendableRepo, OutsourceShipmentRepo,
+    OutsourceQuoteEventRepo, OutsourceQuoteRepo, OutsourceShipmentRepo,
 };
 
 // ===========================================================================
@@ -142,62 +142,22 @@ pub struct OutsourceQuotableRow {
     pub parent_customer_name: Option<String>,
 }
 
-/// `GET /outsource-sendable` 行。
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct OutsourceSendableRow {
-    /// `t_part_batch.version`（批次级 OCC）。
-    pub batch_version: i32,
-    pub batch_id: i64,
-    pub batch_no: i32,
-    pub batch_quantity: i32,
-    /// `t_part_batch.status`（`PENDING` / `IN_PROCESS`）。
-    pub source_status: String,
-    pub part_id: i64,
-    pub part_serial_no: Option<String>,
-    pub part_drawing_no: Option<String>,
-    pub part_name: Option<String>,
-    /// `t_part.planned_delivery_date`（Postgres `date` → 文本）。
-    pub planned_delivery_date: Option<String>,
-    pub is_urgent: bool,
-    pub customer_name: Option<String>,
-    pub parent_customer_name: Option<String>,
-    /// **只服务 SQL 层的过滤，Rust 侧不消费**：`OutsourceSendableRepo::list` 的
-    /// 外层 `WHERE ($2::bigint IS NULL OR d.customer_id = $2)` 要投影出这一列才能
-    /// 引用它。VO 不暴露客户 id（前端只拿 `customer_path`），故 `service/sendable.rs`
-    /// 从不读这个字段 —— 保留投影是为了让 list / count 的过滤位置保持同构（见
-    /// `repo/sql.rs::OutsourceSendableRepo` 头注释）。
-    pub customer_id: Option<i64>,
-    /// `t_shelf.code`（`LEFT JOIN t_shelf`）⇒ `PENDING` 且未上架的批次（无
-    /// holder）为 `None`，VO 相应可空。
-    pub shelf_code: Option<String>,
-    /// `t_part_batch.current_process_id`（池归属权威依据），`JOIN t_process pr`
-    /// （INNER）⇒ DB 层 NOT NULL。
-    pub current_process_id: i64,
-    /// `t_process.name`，同一 INNER JOIN ⇒ DB 层 NOT NULL。
-    pub current_process_name: String,
-    /// `t_process.requires_approval` —— `send_mode` 判定的输入（false = 免审批
-    /// 直发 / true = 必须有已审批报价）。见 `service/sendable.rs::send_mode_of`。
-    pub requires_approval: bool,
-    pub quote_id: Option<i64>,
-    pub price: Option<String>,
-    pub outsource_company_id: Option<i64>,
-    pub outsource_company_name: Option<String>,
-    /// SQL `to_jsonb(array_agg(json_build_object(...)))` 的结果（单个 JSONB 值，
-    /// 不是 `json[]` —— 后者 sqlx 解不进 `serde_json::Value`）。
-    /// APPROVAL 行恒为 `[]`（SQL 侧 CASE 短路）。
-    pub company_options: serde_json::Value,
-}
-
 /// outsource 域数据访问胖 trait。
 ///
 /// 单 trait 合并 6 ZST（company + company_process + quote + quote_event + shipment，
-/// 外加 2026-10-03 新增的 quotable / sendable 两个读模型 ZST），共 52 方法：
+/// 外加 quotable 读模型 ZST），共 45 方法：
 /// company 8 + company_process 4 + quote 13 + quote_event 1 + shipment 9
-/// + quotable 2 + sendable 2 + 跨域 helper 13。
+/// + quotable 2 + 跨域 helper 8。
 ///
-/// 2026-10-09 缩掉 5 个方法：`pool_*` 4 个（`/outsource-pool/{counts,state,{id}}`
-/// 下线，SQL 搬进 `../board/repo.rs`）与 `sendable_list_by_process`（看板候选列现在
-/// 由 `board/repo.rs` 直接拼投影，不再经 trait 回传本文件的行结构）。
+/// 2026-10-09 两轮缩掉 7 个方法：
+/// - `pool_*` 4 个（`/outsource-pool/{counts,state,{id}}` 下线，SQL 搬进
+///   `../board/repo.rs`）与 `sendable_list_by_process`（看板候选列现在由
+///   `board/repo.rs` 直接拼投影，不再经 trait 回传本文件的行结构）；
+/// - `sendable_list` / `sendable_count` 2 个（`GET /outsource-sendable` 下线 —— 它是
+///   看板候选列的分页子集，候选侧谓词 SQL 保留在 `sql.rs` 供看板自取）。
+///
+/// 本文件因此不再有任何「候选侧」行结构（`OutsourceSendableRow` 随之删除）——
+/// 看板侧的对应行结构是 `board/repo.rs::CandidateRow`。
 ///
 /// 方法签名 = `sql.rs` 固有静态方法去 executor 形参。`<'a>` 显式生命周期是 mockall
 /// 0.15 automock 在 `async_trait` 上下文的硬性要求。
@@ -446,19 +406,6 @@ pub trait OutsourceRepoTrait: Send {
         keyword_pat: Option<&'a str>,
     ) -> Result<i64, sqlx::Error>;
 
-    // ── sendable（2026-10-03 新增，可发送外协的活跃批次，一批次一行） ──
-    async fn sendable_list<'a>(
-        &mut self,
-        keyword_pat: Option<&'a str>,
-        customer_id: Option<i64>,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<OutsourceSendableRow>, sqlx::Error>;
-    async fn sendable_count<'a>(
-        &mut self,
-        keyword_pat: Option<&'a str>,
-        customer_id: Option<i64>,
-    ) -> Result<i64, sqlx::Error>;
     // ⚠️ 2026-10-09：`sendable_list_by_process` 与 `pool_*` 4 个方法在此删除。
     // 看板两条读端点（`GET /outsource-queue/snapshot` +
     // `/outsource-queue/processes/{id}`）改由 `../board/` 子模块自持 SQL（固定条数要能
@@ -476,9 +423,9 @@ pub trait OutsourceRepoTrait: Send {
     /// `t_part` 按客户子树取零件 id（2026-10-04 新增）。供 list_quotes 的
     /// `customer_id` 过滤展开。
     ///
-    /// 谓词形状与 `OutsourceSendableRepo` 的 `customer_id` 谓词**逐字同形**
-    /// （`customer_id = $1 OR customer_id IN (直接子客户)`，反向引用见
-    /// `repo/sql.rs::SENDABLE_CUSTOMER_SUBTREE_PREDICATE` 的注释）：实测
+    /// 谓词形状与已下线的 `GET /outsource-sendable` 的 `customer_id` 谓词**逐字同形**
+    /// （`customer_id = $1 OR customer_id IN (直接子客户)`；该端点 2026-10-09 下线时其
+    /// 谓词常量一并删除，两处形状靠本注释保持同步，**无编译期保障**）：实测
     /// `t_part.customer_id` 指向的都是叶子客户，前端选的常是 L1，只判等值时 L1 必然
     /// 零命中。**等值那一支保留** ⇒ 传 L2 id 的行为与展开前一致。
     ///
@@ -1020,25 +967,6 @@ impl OutsourceRepoTrait for &mut PgConnection {
         keyword_pat: Option<&'a str>,
     ) -> Result<i64, sqlx::Error> {
         OutsourceQuotableRepo::count(&mut **self, keyword_pat).await
-    }
-
-    // ── sendable（3）── 一行委托 sql::OutsourceSendableRepo ───────────────
-    async fn sendable_list<'a>(
-        &mut self,
-        keyword_pat: Option<&'a str>,
-        customer_id: Option<i64>,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<OutsourceSendableRow>, sqlx::Error> {
-        OutsourceSendableRepo::list(&mut **self, keyword_pat, customer_id, limit, offset).await
-    }
-
-    async fn sendable_count<'a>(
-        &mut self,
-        keyword_pat: Option<&'a str>,
-        customer_id: Option<i64>,
-    ) -> Result<i64, sqlx::Error> {
-        OutsourceSendableRepo::count(&mut **self, keyword_pat, customer_id).await
     }
 
     // ⚠️ 2026-10-09：`sendable_list_by_process` 与 `pool_*` 4 个委托在此删除，

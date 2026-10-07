@@ -6,14 +6,20 @@
 //! - `quote`    — 报价 CRUD + 状态机（list / create / get / update / submit / approve /
 //!   reject / soft-delete）+ `quotable-parts` picker
 //! - `shipment` — 对账单更新（reconcile-update）+ 对账页 sent-parts + 在途 in-flight
-//! - `sendable` — `GET /outsource-sendable`（可发送外协一览，APPROVAL / DIRECT 双模式）
+//! - `move`     — `POST /outsource-queue/move`（三合一移动写端点，取代 `prod::batch`
+//!   的外协收发三个单边端点）
 //!
 //! 外协看板两个只读端点（`/outsource-queue/snapshot` +
 //! `/outsource-queue/processes/{id}`）**不走本层**，实现见 `super::board`（与其 repo /
 //! VO 一并成子模块，范本 `prod/queue/board`）：它是纯只读聚合，固定 SQL 条数要能被
 //! 源码级护栏单独圈住，与走胖 trait 的 CRUD 写路径混在一个目录里就圈不出来了。
-//! 两边共用 `sendable` 子模块里的 `send_mode_of` / `can_send_of` /
-//! `decode_company_options` 三个纯函数与同一份候选侧谓词 SQL。
+//! 移动写端点同样不进 `board/`（它不是聚合读），但也不挂 `OutsourceService`：它收
+//! `&mut PgConnection` 而非胖 trait，形如 ZST（范本 `prod::queue::QueueService`）。
+//!
+//! `sendable` 子模块（`GET /outsource-sendable` 的实现）已于 2026-10-09 删除；留在
+//! 该目录的三个纯函数 `send_mode_of` / `can_send_of` / `decode_company_options` 是
+//! 看板候选列与旧端点共用的判定真源，**仍归本模块**（`pub(crate)`）—— 详见
+//! `service/sendable.rs` 的文件头。
 //!
 //! 对外 API（`handler.rs` 调用面）保持原方法名（`OutsourceService::xxx`），handler 通过
 //! `crate::modules::outsource::service::OutsourceService` 引用。
@@ -29,9 +35,10 @@
 //!
 //! 2026-10-03 新增（读侧补齐）：4 个 list 端点上线上，见各子模块头注释。
 //!
-//! 2026-10-09 删除 `pool` 子模块：三条 `/outsource-pool/*` 旧读被 `super::board`
+//! 2026-10-09 删除两个子模块：`pool`（三条 `/outsource-pool/*` 旧读被 `super::board`
 //! 的看板两读取代，`OutsourceService::pool_counts` / `pool_by_process` / `pool_state`
-//! 随之删除（handler 同批删掉对应三个 route）。
+//! 随之删除）与 `sendable`（`GET /outsource-sendable` 的 list 端点被看板候选列取代，
+//! `OutsourceService::list_sendable` 删除；三个共用纯函数保留在本目录）。
 
 #![allow(
     clippy::collapsible_if,
@@ -51,9 +58,13 @@ use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::shared::error::{AppError, code};
 
 mod company;
+#[path = "move.rs"]
+pub mod move_svc;
 mod quote;
 pub(crate) mod sendable;
 mod shipment;
+
+pub use move_svc::OutsourceMoveService;
 
 const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 500;

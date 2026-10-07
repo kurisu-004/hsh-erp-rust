@@ -56,7 +56,8 @@ pub struct TPartBatch {
     ///   派发）→ **不动**
     /// - 非生产流（初始批次、子批次）→ NULL
     ///
-    /// 唯一显式例外：`send_to_outsource` 写 `Some(req.process_id)`
+    /// 唯一显式例外：外协发送（`outsource` 域 `service/move.rs` 的
+    /// `PRODUCTION_SHELF → OUTSOURCE_COMPANY` 臂）写 `Some(batch.current_process_id)`
     /// （`status='OUTSOURCE'` + `location='OUTSOURCE_COMPANY'`，池 SQL 硬限定
     /// IN_PROCESS + PRODUCTION_SHELF 故不可能命中；rollup 派生需要）。
     ///
@@ -78,8 +79,8 @@ pub struct TPartBatch {
     ///
     /// 2026-09-30 review 第 3 轮订正措辞：本列**不是会随流转推进的「进度指针」**
     /// —— 它只在**首次定位**工序时被写入（dispatch 路径刻意写 NULL；其余由
-    /// `place_on_shelf` / `release_from_programming` / `send_to_outsource` /
-    /// `receive_from_outsource` / `complete_repair` / `to_process` 写），
+    /// `place_on_shelf` / `release_from_programming` / 外协收发（`outsource` 域
+    /// `service/move.rs`）/ `complete_repair` / `to_process` 写），
     /// 之后**不再推进**：worker-scan RETURNED、send_to_inspection、
     /// `mark_batch_returned`、`mark_batch_inspected` 都不写它。对多工序链工单，
     /// 它永远停在首次定位的那一步，故**不可**当「当前走到第几步」用。

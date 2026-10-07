@@ -8,18 +8,22 @@
 //! - `POST /api/v2/prod/batches/{batch_id}/deliver` / `complete` / `start-repair`
 //! - `POST /api/v2/prod/batches/{batch_id}/place-on-shelf` / `recall-to-pending`
 //! - `POST /api/v2/prod/batches/{batch_id}/release-from-programming`
-//! - `POST /api/v2/prod/batches/{batch_id}/send-to-outsource` / `receive-from-outsource`
-//!   / `receive-from-outsource-to-inspection`
 //! - `POST /api/v2/prod/batches/{batch_id}/complete-repair` / `repair-dispatch`
 //! - `POST /api/v2/prod/batches/{batch_id}/split` / `cancel` / `pick-up`
+//!
+//! ## 2026-10-09 外协三端点迁出
+//! `send-to-outsource` / `receive-from-outsource` /
+//! `receive-from-outsource-to-inspection` 已合并为 `POST /api/v2/outsource-queue/move`
+//! （`crate::modules::outsource::handler::move_batch`，文件 `handler/move.rs`），本文件
+//! 三个 handler 与其 service 一并
+//! 删除。随之删除的 WS 事件名是 `PART_SENT_TO_OUTSOURCE` /
+//! `PART_RECEIVED_FROM_OUTSOURCE` / `PART_RECEIVED_FROM_OUTSOURCE_INSPECTED`，三合一
+//! 后统一为 `OUTSOURCE_MOVE_DONE`；`t_part_event` 的三个审计字面量逐字保留。
 //!
 //! ## 权限模式
 //! - deliver / complete / place-on-shelf / recall-to-pending / split / cancel：
 //!   Manager + Clerk
-//! - send-to-outsource / receive-from-outsource /
-//!   receive-from-outsource-to-inspection / complete-repair / repair-dispatch：
-//!   Manager + Clerk + Inspector
-//! - start-repair：Manager + Clerk + Inspector
+//! - complete-repair / repair-dispatch / start-repair：Manager + Clerk + Inspector
 //!
 //! ## 事务边界 + WS 广播
 //! 事务边界在 handler（`pool.begin()` → service → `tx.commit()`）；WS 广播在
@@ -37,8 +41,7 @@ use crate::infra::ws_hub::WsEvent;
 use crate::modules::part::vo::PartOut;
 use crate::modules::prod::batch::dto::{
     CancelBatchRequest, CompleteRepairRequest, CompleteRequest, DeliverRequest, PickUpRequest,
-    PlaceOnShelfRequest, ReceiveFromOutsourceRequest, ReceiveFromOutsourceToInspectionRequest,
-    RepairDispatchRequest, SendToOutsourceRequest, SplitBatchRequest, StartRepairRequest,
+    PlaceOnShelfRequest, RepairDispatchRequest, SplitBatchRequest, StartRepairRequest,
 };
 use crate::modules::prod::batch::service::BatchService;
 use crate::shared::error::AppError;
@@ -154,74 +157,6 @@ pub async fn release_from_programming(
     ws_broadcast(
         &state,
         "PART_RELEASED_FROM_PROGRAMMING",
-        json!({ "part_id": out.id.to_string() }),
-    );
-    Ok(Json(R::ok(out)))
-}
-
-/// `POST /api/v2/prod/batches/{batch_id}/send-to-outsource`
-pub async fn send_to_outsource(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(batch_id): Path<i64>,
-    Json(req): Json<SendToOutsourceRequest>,
-) -> Result<Json<R<PartOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = BatchService::send_to_outsource(&mut *tx, &state.snowflake, batch_id, req, &current)
-        .await?;
-    tx.commit().await?;
-    ws_broadcast(
-        &state,
-        "PART_SENT_TO_OUTSOURCE",
-        json!({ "part_id": out.id.to_string() }),
-    );
-    Ok(Json(R::ok(out)))
-}
-
-/// `POST /api/v2/prod/batches/{batch_id}/receive-from-outsource`
-///
-/// 2026-10-03 入参由 `PlaceOnShelfRequest` 换成 `ReceiveFromOutsourceRequest`
-/// （多一个 `quantity` 支持部分接收；`PlaceOnShelfRequest` 仍被 place-on-shelf /
-/// release-from-programming 共用，不受影响）。
-pub async fn receive_from_outsource(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(batch_id): Path<i64>,
-    Json(req): Json<ReceiveFromOutsourceRequest>,
-) -> Result<Json<R<PartOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out =
-        BatchService::receive_from_outsource(&mut *tx, &state.snowflake, batch_id, req, &current)
-            .await?;
-    tx.commit().await?;
-    ws_broadcast(
-        &state,
-        "PART_RECEIVED_FROM_OUTSOURCE",
-        json!({ "part_id": out.id.to_string() }),
-    );
-    Ok(Json(R::ok(out)))
-}
-
-/// `POST /api/v2/prod/batches/{batch_id}/receive-from-outsource-to-inspection`
-pub async fn receive_from_outsource_to_inspection(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(batch_id): Path<i64>,
-    Json(req): Json<ReceiveFromOutsourceToInspectionRequest>,
-) -> Result<Json<R<PartOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = BatchService::receive_from_outsource_to_inspection(
-        &mut *tx,
-        &state.snowflake,
-        batch_id,
-        req,
-        &current,
-    )
-    .await?;
-    tx.commit().await?;
-    ws_broadcast(
-        &state,
-        "PART_RECEIVED_FROM_OUTSOURCE_INSPECTED",
         json!({ "part_id": out.id.to_string() }),
     );
     Ok(Json(R::ok(out)))

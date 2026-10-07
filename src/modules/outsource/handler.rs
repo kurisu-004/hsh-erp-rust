@@ -8,10 +8,10 @@
 //!   set_company_processes / create_quote / update_quote / submit_quote / approve_quote /
 //!   reject_quote / soft_delete_quote / reconcile_update_shipment）：
 //!   `pool.begin()` → service call → `tx.commit()`，错误路径 tx drop 隐式回滚。
-//! - ② **写 + post-commit 副作用**：outsource 域当前无 Redis / WS 副作用需求，
-//!   故全部写端点走形态 ①。
+//! - ② **写 + post-commit 副作用**：外协看板移动端点（`POST /outsource-queue/move`，
+//!   见 `handler/move.rs`）—— `tx.commit()` 之后广播 `OUTSOURCE_MOVE_DONE`。
 //! - ③ **读端点**（list_companies / get_company / list_companies_by_process /
-//!   list_quotes / get_quote）：`pool.acquire()` 不开事务，
+//!   list_quotes / get_quote / 看板两读）：`pool.acquire()` 不开事务，
 //!   service 借 `&mut *conn` 执行查询，用完即 drop。
 //!
 //! service 形参：`repo: R: OutsourceRepoTrait`（by-value）。生产路径
@@ -28,8 +28,9 @@
 //!
 //! ## 子模块
 //! - `board.rs` —— 外协看板只读聚合 2 端点（`snapshot` / `processes/{process_id}`）
+//! - `move.rs` —— 外协看板三合一移动写端点（`POST /move`，2026-10-09 新增）
 //!
-//! ## 路由表（22 端点）
+//! ## 路由表（20 端点）
 //!
 //! - `GET    /outsource-companies`              — 列表（READ）
 //! - `POST   /outsource-companies`              — 新建（WRITE）
@@ -54,17 +55,25 @@
 //! - `POST   /outsource-shipments/{id}/reconcile-update` — 对账页更新
 //!
 //! 顶层（独立前缀，见 `modules::mod.rs::v2_router`）：
-//! - `GET    /outsource-sendable`               — 可发送外协一览（2026-10-03 新增；
-//!   **2026-10-09 起随看板接管而待删**，见 `modules/mod.rs` 的 nest 注释）
 //! - `GET    /outsource-queue/snapshot`         — 外协工序序列板（2026-10-09 新增）
 //! - `GET    /outsource-queue/processes/{id}`   — 单工序看板（候选 + 公司列含在途批次）
+//! - `POST   /outsource-queue/move`             — 三合一移动写端点（2026-10-09 新增）
 //!
-//! ### 2026-10-09 下线的三条读端点（硬切无 alias）
+//! ### 2026-10-09 硬切下线的端点（无 alias）
 //! - `GET /outsource-pool/counts` → `/outsource-queue/snapshot`
 //! - `GET /outsource-pool/{process_id}` → `/outsource-queue/processes/{process_id}`
 //! - `GET /outsource-pool/state` → 被 `companies[].held_batches` 内联取代
+//! - `GET /outsource-sendable` → 被 `/outsource-queue/processes/{id}` 的候选列取代
+//!   （它只是同一批行的分页子集）
+//! - `POST /prod/batches/{id}/send-to-outsource` / `receive-from-outsource` /
+//!   `receive-from-outsource-to-inspection` → 三合一为 `POST /outsource-queue/move`
 
 mod board;
+// `move` 是 Rust 关键字，不能直接作模块名；文件仍叫 `move.rs`（与
+// `service/move.rs` 同名对称），故显式给 `#[path]`。注意本文件不是 `mod.rs`，
+// 显式 path 相对的是**本文件所在目录**（`outsource/`）而不是 `handler/`
+#[path = "handler/move.rs"]
+mod move_batch;
 
 use std::sync::Arc;
 
@@ -78,13 +87,13 @@ use crate::modules::outsource::dto::{
     OutsourceCompanyCreateRequest, OutsourceCompanyListQuery, OutsourceCompanyUpdateRequest,
     OutsourceInFlightListQuery, OutsourceQuotablePartListQuery, OutsourceQuoteApproveRequest,
     OutsourceQuoteCreateRequest, OutsourceQuoteListQuery, OutsourceQuoteRejectRequest,
-    OutsourceQuoteUpdateRequest, OutsourceSendableListQuery, OutsourceSentPartListQuery,
+    OutsourceQuoteUpdateRequest, OutsourceSentPartListQuery,
     OutsourceShipmentReconcileUpdateRequest, SetOutsourceCompanyProcessRequest,
 };
 use crate::modules::outsource::vo::{
     OutsourceCompanyListOut, OutsourceCompanyOut, OutsourceCompanyWithProcessesOut,
-    OutsourceInFlightListOut, OutsourceQuoteListOut, OutsourceQuoteOut, OutsourceSendableListOut,
-    OutsourceSentPartListOut, OutsourceShipmentOut, QuotablePartListOut,
+    OutsourceInFlightListOut, OutsourceQuoteListOut, OutsourceQuoteOut, OutsourceSentPartListOut,
+    OutsourceShipmentOut, QuotablePartListOut,
 };
 use crate::shared::error::AppError;
 use crate::shared::response::R;
@@ -408,28 +417,6 @@ pub async fn reconcile_update_shipment(
 }
 
 // ===========================================================================
-//  Sendable（2026-10-03 新增，独立顶层前缀 `/outsource-sendable`）
-// ===========================================================================
-
-/// `GET /outsource-sendable` —— 读端点
-///
-/// 一行 = 一个（活跃批次 × OUTSOURCE 工序）组合，`send_mode` 判 APPROVAL / DIRECT
-/// 由 SQL 一次判定（见 `OutsourceSendableRepo`）。角色守卫与旧
-/// `/parts/outsource-sendable` 一致。
-pub async fn list_sendable(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Query(query): Query<OutsourceSendableListQuery>,
-) -> Result<Json<R<OutsourceSendableListOut>>, AppError> {
-    let mut conn = state.pool.acquire().await?;
-    let out = state
-        .outsource_service
-        .list_sendable(&mut *conn, &query, &current)
-        .await?;
-    Ok(Json(R::ok(out)))
-}
-
-// ===========================================================================
 //  Router（注意静态段必须在 catch-all `/{id}` 之前注册）
 // ===========================================================================
 
@@ -470,26 +457,17 @@ pub fn shipment_router() -> Router<Arc<AppState>> {
         .route("/{id}/reconcile-update", post(reconcile_update_shipment))
 }
 
-/// Sendable 路由（挂载点 `/outsource-sendable`，**独立顶层前缀**）
-///
-/// 2026-10-03 新增。`/outsource-sendable` 不是 quote / shipment / company 任何
-/// 单一域的子资源（「可发送外协的批次」横跨全部三者），故不 nest 进既有 3 个
-/// router，而是顶层独立前缀 —— 命名沿用旧的 `/parts/outsource-sendable`，便于
-/// 前端对照迁移。
-pub fn sendable_router() -> Router<Arc<AppState>> {
-    Router::new().route("/", get(list_sendable))
-}
-
 /// 外协看板路由（挂载点 `/outsource-queue`，见 `modules::v2_router`）。
 ///
-/// ⚠️ **本 router 的两条 route 段数不同，注册顺序无硬约束**：`/snapshot` 是 1 段
-/// 静态段，`/processes/{process_id}` 是 2 段，matchit 按段位匹配，两者不争同一段位。
-/// 这与被取代的 `pool_router`（`/counts` `/state` `/{process_id}` **全是 1 段**）正
-/// 相反 —— 那里静态段必须先注册，否则参数段 `/{process_id}` 会兜住任何未命中的单段
+/// ⚠️ **本 router 的三条 route 段数不同，注册顺序无硬约束**：`/snapshot` 与 `/move`
+/// 是 1 段静态段，`/processes/{process_id}` 是 2 段，matchit 按段位匹配，两者不争同一
+/// 段位。被取代的 `pool_router`（`/counts` `/state` `/{process_id}` **全是 1 段**）
+/// 恰好相反 —— 那里静态段必须先注册，否则参数段 `/{process_id}` 会兜住任何未命中的单段
 /// 静态路径，再由 `Path<i64>` 反序列化拒绝 → **400** 而非 404。同一坑在
 /// `quote_router()` 的 `quotable-parts` 与 part 域的 `/{part_id}` 上都踩过。
 pub fn queue_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/snapshot", get(board::snapshot))
         .route("/processes/{process_id}", get(board::process_detail))
+        .route("/move", post(move_batch::move_batch))
 }

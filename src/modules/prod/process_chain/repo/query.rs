@@ -77,7 +77,7 @@ impl ProcessChainRepo {
     /// 2026-09-16 PR-3 批次 step 化：在指定 chain 内按 process_id 解析 step_id。
     ///
     /// 用于：
-    /// - place_on_shelf / release_from_programming / send_to_outsource 等
+    /// - place_on_shelf / release_from_programming / 外协发送（`service/move.rs`）等
     ///   进入生产流场景：service 拿到 caller 传的 process_id 后必须解析为
     ///   step_id 才能写入 `t_part_batch.current_process_step_id`
     /// - worker RETURNED / to_process 等"保持当前 step"场景：service 按当前

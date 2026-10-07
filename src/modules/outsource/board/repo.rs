@@ -30,8 +30,8 @@ use std::collections::BTreeMap;
 use sqlx::{AssertSqlSafe, PgConnection};
 
 use crate::modules::outsource::repo::sql::{
-    SENDABLE_DEDUP_PROJECTION_COUNT, SENDABLE_DEDUP_PROJECTION_FULL, SENDABLE_PROJECTION_COUNT,
-    SENDABLE_PROJECTION_FULL, sendable_dedup_sql,
+    NEXT_PROCESS_LATERAL_SQL, SENDABLE_DEDUP_PROJECTION_COUNT, SENDABLE_DEDUP_PROJECTION_FULL,
+    SENDABLE_PROJECTION_COUNT, SENDABLE_PROJECTION_FULL, sendable_dedup_sql,
 };
 use crate::shared::error::{AppError, code};
 
@@ -110,45 +110,16 @@ const SQL_COMPANIES_BY_PROCESS: &str = "SELECT c.id AS company_id, c.name \
 /// 去掉 `pb.current_holder_id = $1`（并把 `$2` 提成 `$1`）后把
 /// `pb.current_holder_id` 投影成 `company_id` 供服务层分组，再补一列 `has_cnc_program`。
 ///
-/// `LEFT JOIN LATERAL` 派生 `receive_next_process_*`，两步定位：
-/// 1. **锚链** = `COALESCE(p.process_chain_id, cur.chain_id)`（`cur` =
-///    `pb.current_process_step_id` 指向的 step，只用于回退取链 id）；
-/// 2. **当前 step 在锚链内的位置**：`cur2.process_id = pb.current_process_id`；
-///    再取锚链内 `sort_order = cur2.sort_order + 1` 的未软删 step（唯一索引
-///    `uq_chain_step_chain_order (chain_id, sort_order) WHERE deleted_at IS NULL`
-///    ⇒ 唯一无歧义）。中间 JOIN `t_part_process_chain` 是为了让「锚链已软删」也落到
-///    「无下一 step」分支（`chain_resolvable=false`）。
-///
-/// ⚠️ **第 2 步必须按 `current_process_id` 在锚链内重新定位，不能拿
-/// `pb.current_process_step_id` 的 `sort_order` 直接当位置**：step 指针与「当前工序在
-/// 链内的位置」是两个独立事实，后者漂移时按位置推进会把**外协工序自己**当成下一道
-/// 工序返回，而 `chain_resolvable` 仍在说「可免填」⇒ 写侧照单全收，静默错值比拒收
-/// 更难发现。
-///
-/// **锚链与写侧同源**：写侧回收外协批次走 `optional_process_chain(part_id)`（读
-/// `t_part.process_chain_id`）+ `optional_step_id(chain_id, process_id)`。锚
-/// `p.process_chain_id` ⇒ 本查询返回的 process_id 必然是**锚链内活跃 step 的工序**，
-/// 写侧能在同一条链上解析到（有链时）。
-///
-/// `COALESCE(p.process_chain_id, cur.chain_id)` 的回落分支服务于**无链批次**
-/// （`p.process_chain_id IS NULL`）：这类零件可发外协也就可能在途，其
-/// `current_process_step_id` 按写入不变式恒为 NULL ⇒ `cur` 子查询无行 ⇒ 锚链解析
-/// 失败 ⇒ 落 `chain_resolvable = false`（前端弹「需手填下一道工序」对话框）。保留
-/// `COALESCE` 是因为读侧不假设写侧何时写 step，它守的是「无链」这一常态。
-///
-/// ⚠️ **两个派生列都必须显式 `AS receive_next_process_*`**：LATERAL 子查询的输出列名
-/// 只跟子查询内部的名字走（`nx.next_process_name` 的列名是 `next_process_name`，不带
-/// `nx.` 前缀），不写别名时 runtime `query_as` 的 `FromRow` 会报
-/// `ColumnNotFound("receive_next_process_name")`。末尾 `LIMIT 1` 保证 LATERAL 恒至多
-/// 一行：锚链内同一 `process_id` 重复属数据异常，而这不读侧单方面放过的缺口 ——
-/// 写侧 `resolve_step_id_by_process` 自己登记的立场逐字是「链内同一 process_id 重复
-/// （数据异常）的歧义不在本函数守」，读侧沿用同一口径收口、不另立一套；不设 `LIMIT`
-/// 会把一行批次扇成多行、破坏 VO 层 `held_count == held_batches.len()`。
+/// `LEFT JOIN LATERAL` 派生 `receive_next_process_*`，两步定位与「为什么必须共用同一份
+/// 片段」的全部论证见 `repo/sql.rs::NEXT_PROCESS_LATERAL_SQL`（2026-10-09 从本文件
+/// 抽成共用常量：移动写端点省略 `to.next_process_id` 时的推导用同一份口径）。
+/// 本查询用 `{nx}` 占位符取回该片段，故这条常量是运行时拼装的（走 `AssertSqlSafe`，
+/// 拼进去的是编译期常量、无注入面）。
 ///
 /// **`t_applicant` 走 `LEFT JOIN LATERAL (… ORDER BY ap.id ASC LIMIT 1)` 而不是直接
 /// JOIN**：`t_part.applicant_name` 是字符串非 FK，而 `t_applicant` 的唯一索引是
 /// `(name, customer_id)`，**name 单独不唯一** —— 同名申请人跨客户存在时直接 JOIN 会把
-/// 一行批次扇出成多行，破坏上面那个 `held_count == held_batches.len()` 不变量
+/// 一行批次扇出成多行，破坏下面那个 `held_count == held_batches.len()` 不变量
 /// （`batch_id` 重复 + 计数虚高）。投影只有 `ap.name` 一个列，而
 /// `ap.name = p.applicant_name` 由 WHERE 保证恒等 ⇒ **取哪一行取值都一样**，
 /// `ORDER BY ap.id ASC` 的作用只是给这条 LATERAL 一个确定的行（配合 `LIMIT 1`），零
@@ -181,25 +152,7 @@ const SQL_HELD_BY_PROCESS: &str = "SELECT pb.id AS batch_id, pb.current_holder_i
      ) a ON TRUE \
      LEFT JOIN t_outsource_shipment s \
        ON s.batch_id = pb.id AND s.status = 'OUTSOURCING' AND s.deleted_at IS NULL \
-     LEFT JOIN LATERAL ( \
-       SELECT nsp.process_id AS next_process_id, np.name AS next_process_name \
-       FROM t_process_chain_step cur \
-       JOIN t_part_process_chain pc \
-         ON pc.id = COALESCE(p.process_chain_id, cur.chain_id) \
-        AND pc.deleted_at IS NULL \
-       JOIN t_process_chain_step cur2 \
-         ON cur2.chain_id = pc.id \
-        AND cur2.process_id = pb.current_process_id \
-        AND cur2.deleted_at IS NULL \
-       JOIN t_process_chain_step nsp \
-         ON nsp.chain_id = pc.id \
-        AND nsp.sort_order = cur2.sort_order + 1 \
-        AND nsp.deleted_at IS NULL \
-       LEFT JOIN t_process np \
-         ON np.id = nsp.process_id AND np.deleted_at IS NULL \
-       WHERE cur.id = pb.current_process_step_id AND cur.deleted_at IS NULL \
-       LIMIT 1 \
-     ) nx ON TRUE \
+     {nx} \
      WHERE pb.status = 'OUTSOURCE' \
        AND pb.location = 'OUTSOURCE_COMPANY' \
        AND pb.current_process_id = $1 \
@@ -429,7 +382,8 @@ impl OutsourceQueueRepo {
             .await?;
 
         // 3. 该工序全部在外协批次（一次查询，无公司谓词）
-        let held = sqlx::query_as::<_, HeldBatchRow>(SQL_HELD_BY_PROCESS)
+        let held_sql = SQL_HELD_BY_PROCESS.replace("{nx}", NEXT_PROCESS_LATERAL_SQL);
+        let held = sqlx::query_as::<_, HeldBatchRow>(AssertSqlSafe(held_sql))
             .bind(process_id)
             .fetch_all(&mut *conn)
             .await?;
