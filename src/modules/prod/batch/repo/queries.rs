@@ -637,7 +637,7 @@ impl PartBatchRepo {
         Ok(new_batch_id)
     }
 
-    /// 拆分批次（手动部分量）：`POST /prod/batches/{batch_id}/split` 入口。
+    /// 拆分批次（手动部分量）：`POST /api/v2/batches/split` 的 repo 入口。
     ///
     /// 在 `qty` < `source_batch.quantity` 时调用，构造一条新批次（继承
     /// 状态/位置/holder/current_process_step；**不继承** delivery_note_id 与

@@ -134,13 +134,17 @@ impl PartStatus {
     /// - `IN_PROCESS → PENDING`：recall-to-pending（service 层要求 location=PRODUCTION_SHELF）
     /// - `PROGRAMMING → PENDING`：recall-to-pending
     /// - `PROGRAMMING → IN_PROCESS`：release-from-programming
-    /// - `OUTSOURCE → IN_PROCESS`：receive-from-outsource（回生产架）
-    /// - `OUTSOURCE → INSPECTION`：receive-from-outsource-to-inspection
-    /// - `PENDING → OUTSOURCE` / `IN_PROCESS → OUTSOURCE`：send-to-outsource
+    /// - `OUTSOURCE → IN_PROCESS`：外协收回（`POST /outsource-queue/move` 的
+    ///   `OUTSOURCE_COMPANY → PRODUCTION_SHELF` 臂，2026-10-09 由
+    ///   `POST /prod/batches/{id}/receive-from-outsource` 迁入）
+    /// - `OUTSOURCE → INSPECTION`：外协收回直送品检（同端点的
+    ///   `OUTSOURCE_COMPANY → INSPECTION_SHELF` 臂）
+    /// - `PENDING → OUTSOURCE` / `IN_PROCESS → OUTSOURCE`：外协发送（同端点的
+    ///   `PRODUCTION_SHELF → OUTSOURCE_COMPANY` 臂）
     /// - `OUTSOURCE → CANCELLED`：cancel 路径
     ///
     /// 2026-10-03 新增 `IN_PROCESS → OUTSOURCE`。此前白名单里只有
-    /// `PENDING → OUTSOURCE`，而 `send_to_outsource` 的 service 层本来就有一条
+    /// `PENDING → OUTSOURCE`，而外协发送端的 service 层本来就有一条
     /// 「`IN_PROCESS` 源必须在 `PRODUCTION_SHELF` 上」的守卫 —— 那条守卫在
     /// `IN_PROCESS → OUTSOURCE` 缺边时**永远不可达**，实际效果是端到端实测时
     /// 「可发送一览」里的行 100% 被状态机拒（`20103`）。而一览的行按
@@ -195,10 +199,10 @@ impl PartStatus {
                 | (IN_PROCESS, PENDING)              // recall-to-pending（service 层守 location=PRODUCTION_SHELF）
                 | (PROGRAMMING, PENDING)             // recall-to-pending
                 | (PROGRAMMING, IN_PROCESS)          // release-from-programming
-                | (OUTSOURCE, IN_PROCESS)            // receive-from-outsource（回生产架）
-                | (OUTSOURCE, INSPECTION)            // receive-from-outsource-to-inspection
-                | (PENDING, OUTSOURCE)               // send-to-outsource（DIRECT 路径从 PENDING 发）
-                // 2026-10-03 新增：send-to-outsource 的 IN_PROCESS 源（location
+                | (OUTSOURCE, IN_PROCESS)            // 外协收回（回生产架）
+                | (OUTSOURCE, INSPECTION)            // 外协收回（直送品检）
+                | (PENDING, OUTSOURCE)               // 外协发送（DIRECT 路径从 PENDING 发）
+                // 2026-10-03 新增：外协发送的 IN_PROCESS 源（location
                 // 不变式由 service 守卫承担，见 can_transition_to 的 doc 注释）
                 | (IN_PROCESS, OUTSOURCE)
                 | (OUTSOURCE, CANCELLED) // cancel 路径
@@ -358,22 +362,24 @@ mod tests {
 
     #[test]
     fn allowed_phase1_receive_from_outsource() {
-        // OUTSOURCE → IN_PROCESS（receive-from-outsource 回生产架）
+        // 外协收回的两条边（2026-10-09 起同一个 `POST /outsource-queue/move` 端点的
+        // 两个臂；状态机白名单与端点拆分无关，故本用例名保留不改）
+        // OUTSOURCE → IN_PROCESS（回生产架）
         assert!(PartStatus::OUTSOURCE.can_transition_to(PartStatus::IN_PROCESS));
-        // OUTSOURCE → INSPECTION（receive-from-outsource-to-inspection）
+        // OUTSOURCE → INSPECTION（直送品检）
         assert!(PartStatus::OUTSOURCE.can_transition_to(PartStatus::INSPECTION));
     }
 
     #[test]
     fn allowed_phase1_send_to_outsource() {
-        // PENDING → OUTSOURCE（send-to-outsource；DIRECT 路径）
+        // PENDING → OUTSOURCE（外协发送；DIRECT 路径）
         assert!(PartStatus::PENDING.can_transition_to(PartStatus::OUTSOURCE));
-        // 2026-10-03 新增：IN_PROCESS → OUTSOURCE。一览「可发送」的行按写入不变式
+        // 2026-10-03 新增：IN_PROCESS → OUTSOURCE。候选卡「可发送」的行按写入不变式
         // （`PENDING ⇔ 出池`）几乎全是 IN_PROCESS 源，缺这条边会让端到端实测时
         // 发送 100% 被状态机拒（20103）。IN_PROCESS 源的 location 不变式
-        // （必须在 PRODUCTION_SHELF）由 send_to_outsource 的 service 守卫承担。
+        // （必须在 PRODUCTION_SHELF）由 `outsource::service::move_svc` 的 from 守卫承担。
         assert!(PartStatus::IN_PROCESS.can_transition_to(PartStatus::OUTSOURCE));
-        // 反向（receive-from-outsource 回生产架）不受影响
+        // 反向（外协收回回生产架）不受影响
         assert!(PartStatus::OUTSOURCE.can_transition_to(PartStatus::IN_PROCESS));
     }
 

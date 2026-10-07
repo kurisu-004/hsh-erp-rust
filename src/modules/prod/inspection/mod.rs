@@ -57,7 +57,7 @@
 //! ### 1. `process_name` 对 `INSPECTION` / `DELIVERED` 批次恒为 `null`
 //! 这**不是 bug**，是「出池必须把 `current_process_id` 置 NULL」这条不变式的
 //! **正确**结果：所有进 `INSPECTION` 的写点（`BatchService::scan_inspect` /
-//! `BatchService::receive_from_outsource_to_inspection` /
+//! `OutsourceMoveService::move_batch` 的 `OUTSOURCE_COMPANY → INSPECTION_SHELF` 臂 /
 //! `BatchService::complete_repair` / `mark_batch_inspected`）都按出池清该列；
 //! `DELIVERED` 更进一步 —— 进 `READY_TO_SHIP` 的边只有
 //! `INSPECTION → READY_TO_SHIP`，故也必经 `INSPECTION`、同样恒 NULL。

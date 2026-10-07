@@ -4,13 +4,14 @@
 //! - create DRAFT happy path + DRAFT→SUBMITTED→APPROVED 状态机
 //! - approve MANAGER-only（CLERK 拒绝 403）
 //! - reject SUBMITTED → REJECTED（review_note 必填）
-//! - update DRAFT（OCC 版本冲突）
-//! - submit DRAFT only（SUBMITTED 状态再 submit → 400）
-//! - soft-delete 仅 DRAFT / REJECTED 可删
+//! - submit DRAFT only（SUBMITTED 状态再 submit → 400）+ `version` 必填
+//! - soft-delete 仅 DRAFT / REJECTED 可删 + `version` 必填
 //! - duplicate 同 (part, company, process) → 409
-//! - list keyword 零命中 → 0 行
-//! - list `customer_id`：L1 展开到全部 L2 子客户（无需 keyword）/ L2 精确 / 与 keyword
-//!   取交集 / 零命中 → 0 行（2026-10-04）
+//! - list `statuses[]`：传则过滤、不传不过滤（2026-09 前 DTO 缺字段 ⇒ 恒不过滤）
+//! - list `drawing_no` / `name` / `is_urgent`：直连 ILIKE / 精确谓词
+//! - list `customer_id`：L1 展开到全部 L2 子客户（无需零件侧筛选）/ L2 精确 /
+//!   零件侧维度取交集 / 零命中 → 0 行（2026-10-04）
+//! - `GET /{id}` 与 `POST /{id}/update` 已硬切下线（404）
 //!
 //! ## 集成测试范本（PR13 Phase H，2026-09-24）
 //! 本文件按 Phase F 范本收敛：删除本地 `send` / `json_request` / `setup` /
@@ -33,10 +34,9 @@ use serde_json::json;
 use sqlx::PgPool;
 
 use hsh_erp_rust::infra::clock::now_naive;
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_test_support::{
-    OutsourceFixture, json_request, load_outsource_fixture, login_token, send, test_app, test_pool,
-    test_state,
+    OutsourceFixture, json_request, load_outsource_fixture, login_token, pool_snowflake, send,
+    send_raw, test_app, test_pool, test_state,
 };
 
 // ===========================================================================
@@ -68,12 +68,23 @@ async fn bootstrap_as_clerk() -> (PgPool, axum::Router, String, OutsourceFixture
 // ===========================================================================
 //  quote 域独享 helpers（绕开 fixtures::* 因为 Phase H gate 5 禁止从 `fixtures`
 //  模块 use 任何动态 helper）
+/// 直插用的雪花 ID：走 `test-support::pool_snowflake()`（**进程级**
+/// `OnceLock<Mutex<..>>`，instance 由 pid ⊕ 启动时间派生）。
+///
+/// 不每次 `SnowflakeIdGenerator::new(epoch, 1)` 新建生成器：新建的生成器在同一毫秒内
+/// 连续两次调用会生成**完全相同**的 id（instance 相同 + 时间戳相同 + seq 都从 0 开始），
+/// 撞 `t_*_pkey`；更隐蔽的是撞成「shelf_id == process_id」这类业务列，让 DB 的
+/// `ck_*_no_self_loop` CHECK 以一条与被测逻辑无关的约束错误把用例打断。范本与理由见
+/// `tests/outsource/pool.rs::next_id`。
+fn next_id() -> i64 {
+    pool_snowflake().lock().expect("pool_snowflake").next_id()
+}
+
 // ===========================================================================
 
 /// 直插客户（L1）—— 绕开 customer CRUD。
 async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_customer (id, name, serial_prefix, version, created_at, updated_at) \
@@ -94,7 +105,7 @@ async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
 /// `serial_prefix` 唯一索引 `uq_t_customer_root_prefix` 只作用于 `parent_id IS NULL`
 /// 的根客户，L2 不受限（这里干脆传 NULL）。
 async fn insert_l2_customer(pool: &PgPool, name: &str, parent_id: i64) -> i64 {
-    let id = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
+    let id = next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_customer (id, name, parent_id, version, created_at, updated_at) \
@@ -112,8 +123,7 @@ async fn insert_l2_customer(pool: &PgPool, name: &str, parent_id: i64) -> i64 {
 
 /// 直插 part（PENDING）—— 绕开 part CRUD。
 async fn insert_part(pool: &PgPool, customer_id: i64) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_part (id, name, drawing_no, applicant_name, quantity, unit_price, total_price, \
@@ -131,9 +141,9 @@ async fn insert_part(pool: &PgPool, customer_id: i64) -> i64 {
     id
 }
 
-/// 直插 part 并在 name / drawing_no 里带上 tag —— keyword 维度用例要靠它区分零件。
+/// 直插 part 并在 name / drawing_no 里带上 tag —— `drawing_no` / `name` 维度用例要靠它区分零件。
 async fn insert_tagged_part(pool: &PgPool, customer_id: i64, tag: &str) -> i64 {
-    let id = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
+    let id = next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_part (id, name, drawing_no, applicant_name, quantity, unit_price, total_price, \
@@ -151,10 +161,30 @@ async fn insert_tagged_part(pool: &PgPool, customer_id: i64, tag: &str) -> i64 {
     id
 }
 
+/// 直插 part（可指定 `is_urgent`）—— `is_urgent` 筛选维度用例用。
+async fn insert_urgent_part(pool: &PgPool, customer_id: i64, tag: &str, is_urgent: bool) -> i64 {
+    let id = next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_part (id, name, drawing_no, applicant_name, quantity, unit_price, total_price, \
+         request_date, planned_delivery_date, customer_id, is_urgent, status, version, created_at, updated_at) \
+         VALUES ($1, $2, $3, 'Tester', 1, 0, 0, CURRENT_DATE, CURRENT_DATE, $4, $5, 'PENDING', 0, $6, $6)",
+    )
+    .bind(id)
+    .bind(format!("PT-{tag}"))
+    .bind(format!("DWG-{tag}-{id}"))
+    .bind(customer_id)
+    .bind(is_urgent)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert urgent t_part");
+    id
+}
+
 /// 直插 OUTSOURCE 类别 process。
 async fn seed_outsource_process(pool: &PgPool, code: &str, name: &str) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, \
@@ -173,8 +203,7 @@ async fn seed_outsource_process(pool: &PgPool, code: &str, name: &str) -> i64 {
 
 /// 直插外协公司。
 async fn insert_company(pool: &PgPool, name: &str, is_active: bool) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_outsource_company \
@@ -235,6 +264,28 @@ fn part_names(env: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
+/// 提交一条 DRAFT 报价（`version` 必填，2026-10-09 起）。
+///
+/// 传 `version = 0` 对应刚建出来的行；本文件多数用例在 create 之后只发生一次状态
+/// 流转，所以 0 就是当下的真值。
+async fn submit_quote(
+    app: &axum::Router,
+    token: &str,
+    qid: &str,
+    version: i64,
+) -> (StatusCode, serde_json::Value) {
+    send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/outsource-quotes/{qid}/submit"),
+            Some(json!({ "version": version })),
+            Some(token),
+        ),
+    )
+    .await
+}
+
 // ===========================================================================
 //  Tests
 // ===========================================================================
@@ -264,15 +315,15 @@ async fn create_quote_draft_happy() {
     assert_eq!(env["data"]["price"], "12.50");
 }
 
-/// `list_quotes` 的 keyword **零命中**必须返回 0 行（与 `sent-parts` 同源）。
+/// `list_quotes` 的 `drawing_no` / `name` **零命中**必须返回 0 行。
 ///
-/// 这条断言守着 SQL 谓词
-/// `AND (cardinality($N::bigint[]) = 0 OR part_id = ANY($N))` 的一个陷阱：
-/// `part_keyword_search` 零命中时给出空数组 → `cardinality = 0` 成立 →
-/// keyword 条件被短路掉 → 返回**全量**报价（list 与 count 同时错）。
-/// service 层早返回是唯一的兜底点。
+/// 2026-10-09 起这两个维度是**直连 ILIKE 谓词**（`($6::text IS NULL OR p.drawing_no
+/// ILIKE $6)`），零命中在 SQL 里自然就是零行 —— 不再依赖 service 层那个「给了关键词却
+/// 零命中要早返回」的分支（它是旧 `part_keyword_search` 预搜索留下的补偿逻辑：空数组
+/// 会让 `cardinality($2) = 0` 成立、整个条件被短路，从而返回全量）。本用例守着
+/// 「直连谓词 + 空数组语义不再被复用」这个事实。
 #[tokio::test]
-async fn list_quotes_keyword_zero_match_returns_empty_not_all_rows() {
+async fn list_quotes_part_filters_zero_match_returns_empty_not_all_rows() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let (pid, cid, proc_id) = setup_basic(&pool).await;
     // 同 (company, process) 下两台不同零件各挂 1 条报价 —— 同一 (part, company,
@@ -309,21 +360,235 @@ async fn list_quotes_keyword_zero_match_returns_empty_not_all_rows() {
         }
     };
 
-    // 无 keyword → 全量（对照组）
+    // 不传零件侧筛选 → 全量（对照组）
     let (s, env) = list("", &app, token.clone()).await;
     assert_eq!(s, StatusCode::OK, "{env}");
-    assert_eq!(env["data"]["total"], 2, "无 keyword 应返回全量: {env}");
+    assert_eq!(env["data"]["total"], 2, "不传筛选应返回全量: {env}");
 
-    // 零命中 keyword → 0 条。删掉 service 层早返回就会拿到 2 条 → 红。
-    let (s, env) = list("?keyword=NOSUCHTOKENQQ", &app, token).await;
+    // 零命中 drawing_no → 0 条
+    let (s, env) = list("?drawing_no=NOSUCHTOKENQQ", &app, token.clone()).await;
     assert_eq!(s, StatusCode::OK, "{env}");
     assert_eq!(
         env["data"]["total"], 0,
-        "零命中 keyword 必须 total=0（曾返回全量 2）: {env}"
+        "零命中 drawing_no 必须 total=0（曾返回全量 2）: {env}"
     );
     assert!(
         env["data"]["items"].as_array().unwrap().is_empty(),
-        "零命中 keyword 必须 items 为空: {env}"
+        "零命中 drawing_no 必须 items 为空: {env}"
+    );
+
+    // 零命中 name → 0 条
+    let (s, env) = list("?name=NOSUCHTOKENQQ", &app, token).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(env["data"]["total"], 0, "零命中 name 必须 total=0: {env}");
+}
+
+/// `drawing_no` / `name` / `is_urgent` 三个零件侧维度各自的命中与排除。
+#[tokio::test]
+async fn list_quotes_part_filters_are_applied() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let cust = insert_l1_customer(&pool, "PartDimCust", "M").await;
+    let proc_id = seed_outsource_process(&pool, "QPD", "Q-PartDim").await;
+    let company = insert_company(&pool, "PartDimCo", true).await;
+    // 急件（HOT，name 含 HOT）与常件（COLD）
+    let hot = insert_urgent_part(&pool, cust, "HOT", true).await;
+    let cold = insert_urgent_part(&pool, cust, "COLD", false).await;
+    for p in [hot, cold] {
+        let (s, env) = create_quote(&app, &token, p, company, proc_id).await;
+        assert_eq!(s, StatusCode::CREATED, "{env}");
+    }
+
+    let list = |qs: &str, app: &axum::Router, token: String| {
+        let url = format!("/outsource-quotes{qs}");
+        let app = app.clone();
+        async move {
+            send(
+                app.clone(),
+                json_request("GET", &url, None, Some(token.as_str())),
+            )
+            .await
+        }
+    };
+
+    // drawing_no 命中只有 HOT（DWG-HOT-… 含 HOT）
+    let (s, env) = list("?drawing_no=DWG-HOT", &app, token.clone()).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(env["data"]["total"], 1, "{env}");
+    assert_eq!(part_names(&env), vec!["PT-HOT".to_string()], "{env}");
+
+    // name 命中只有 COLD
+    let (s, env) = list("?name=PT-COLD", &app, token.clone()).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(part_names(&env), vec!["PT-COLD".to_string()], "{env}");
+
+    // is_urgent=true 只有 HOT
+    let (s, env) = list("?is_urgent=true", &app, token.clone()).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(part_names(&env), vec!["PT-HOT".to_string()], "{env}");
+
+    // is_urgent=false 只有 COLD
+    let (s, env) = list("?is_urgent=false", &app, token).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(part_names(&env), vec!["PT-COLD".to_string()], "{env}");
+}
+
+/// 🔴 `statuses` 筛选必须真的生效。
+///
+/// 这是本域最隐蔽的一个 bug 的回归：SQL（`AND (cardinality($2::text[]) = 0 OR status
+/// = ANY($2))`）与 repo（`statuses: &[String]` 形参）两层**早就支持**多状态，缺的是 DTO
+/// 字段与 service 接线。症状是**静默**的：前端一直发状态筛选参数，DTO 没有对应字段 ⇒
+/// serde 忽略未知 query 参数（不报错）⇒ 状态筛选恒不生效 —— 连前端的角色默认筛选
+/// （MANAGER → `['SUBMITTED']`、CLERK → `['DRAFT']`）也没生效，所以 MANAGER 打开报价
+/// 一览看到的是全量报价，且表头因 `statusFilterActive` 判定为「有筛选」而变蓝加粗，
+/// 视觉上在说筛选已生效。
+///
+/// ⚠️ wire format 是**逗号分隔单值**（`?statuses=SUBMITTED`），不是重复 key：axum 的
+/// `Query` 走 `serde_urlencoded`，它的 `Part` 反序列化器不支持序列 —— 重复 key 形态会
+/// 400（`invalid type: string "DRAFT", expected a sequence`）。
+#[tokio::test]
+async fn list_quotes_statuses_filter_is_applied() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let (pid, cid, proc_id) = setup_basic(&pool).await;
+    let (s, env) = create_quote(&app, &token, pid, cid, proc_id).await;
+    assert_eq!(s, StatusCode::CREATED, "{env}");
+    let qid = env["data"]["id"].as_str().unwrap().to_string();
+    // 提交 → SUBMITTED
+    let (s, env) = submit_quote(&app, &token, &qid, 0).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    // 再造一条留在 DRAFT 的（同 company / process，必须换 part）
+    let pid2 = insert_part(&pool, insert_l1_customer(&pool, "StCust", "N").await).await;
+    let (s, env) = create_quote(&app, &token, pid2, cid, proc_id).await;
+    assert_eq!(s, StatusCode::CREATED, "{env}");
+
+    let list = |qs: &str, app: &axum::Router, token: String| {
+        let url = format!("/outsource-quotes{qs}");
+        let app = app.clone();
+        async move {
+            send(
+                app.clone(),
+                json_request("GET", &url, None, Some(token.as_str())),
+            )
+            .await
+        }
+    };
+
+    // 不传 statuses → 不过滤（对照组，全量 2）
+    let (s, env) = list("", &app, token.clone()).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(env["data"]["total"], 2, "不传 statuses 应不过滤: {env}");
+
+    // statuses[]=SUBMITTED → 只剩 1 条
+    let (s, env) = list("?statuses=SUBMITTED", &app, token.clone()).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(
+        env["data"]["total"], 1,
+        "statuses=SUBMITTED 必须过滤掉 DRAFT（曾恒返全量）: {env}"
+    );
+    assert_eq!(env["data"]["items"][0]["status"], "SUBMITTED", "{env}");
+
+    // statuses=DRAFT → 只剩 1 条，且与上一条互补
+    let (s, env) = list("?statuses=DRAFT", &app, token.clone()).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(env["data"]["total"], 1, "{env}");
+    assert_eq!(env["data"]["items"][0]["status"], "DRAFT", "{env}");
+
+    // CSV 多值 → 两条都出（证明是 ANY 而不是「只认第一个」）。
+    // 注：逗号写成 %2C 是因为 `serde_urlencoded` 的 `Part` 反序列化器**不支持序列**，
+    // `?statuses=DRAFT&statuses=SUBMITTED` 那种重复 key 形态会 400（见 DTO 注释）。
+    let (s, env) = list("?statuses=DRAFT%2CSUBMITTED", &app, token).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(
+        env["data"]["total"], 2,
+        "CSV 多值 statuses 应命中 2 条: {env}"
+    );
+}
+
+/// `status`（单值）与 `statuses`（多值）是**两个并存**的维度，AND 生效。
+#[tokio::test]
+async fn list_quotes_status_and_statuses_are_anded() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let (pid, cid, proc_id) = setup_basic(&pool).await;
+    let (s, env) = create_quote(&app, &token, pid, cid, proc_id).await;
+    assert_eq!(s, StatusCode::CREATED, "{env}");
+    let qid = env["data"]["id"].as_str().unwrap().to_string();
+    let (s, env) = submit_quote(&app, &token, &qid, 0).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let pid2 = insert_part(&pool, insert_l1_customer(&pool, "AndCust", "O").await).await;
+    let (s, env) = create_quote(&app, &token, pid2, cid, proc_id).await;
+    assert_eq!(s, StatusCode::CREATED, "{env}");
+
+    // status=SUBMITTED AND statuses=SUBMITTED → 1 条
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "GET",
+            "/outsource-quotes?status=SUBMITTED&statuses=SUBMITTED",
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(env["data"]["total"], 1, "{env}");
+
+    // status=SUBMITTED AND statuses=DRAFT → 0 条（AND，不是 OR 也不是覆盖）
+    let (s, env) = send(
+        app,
+        json_request(
+            "GET",
+            "/outsource-quotes?status=SUBMITTED&statuses=DRAFT",
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(env["data"]["total"], 0, "{env}");
+}
+
+/// `GET /{id}` 与 `POST /{id}/update` 已于 2026-10-09 硬切下线（前端零消费，无 alias）。
+///
+/// 用 `send_raw`：matchit 的 404 fallback 是**空 body**，`send` 的 JSON 解析会 panic。
+#[tokio::test]
+async fn quote_detail_and_update_endpoints_are_gone() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let (pid, cid, proc_id) = setup_basic(&pool).await;
+    let (s, env) = create_quote(&app, &token, pid, cid, proc_id).await;
+    assert_eq!(s, StatusCode::CREATED, "{env}");
+    let qid = env["data"]["id"].as_str().unwrap().to_string();
+
+    // `GET /{id}`：删掉后本 router 无任何 1 段路由 ⇒ 404
+    let (s, _) = send_raw(
+        app.clone(),
+        json_request(
+            "GET",
+            &format!("/outsource-quotes/{qid}"),
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::NOT_FOUND,
+        "GET /{{id}} 必须已硬切下线（404）"
+    );
+
+    // `POST /{id}/update`
+    let (s, _) = send_raw(
+        app,
+        json_request(
+            "POST",
+            &format!("/outsource-quotes/{qid}/update"),
+            Some(json!({"price": "1.00", "version": 0})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::NOT_FOUND,
+        "POST /{{id}}/update 必须已硬切下线（404）"
     );
 }
 
@@ -382,16 +647,7 @@ async fn quote_full_lifecycle_draft_submit_approve() {
     let ver = env_c["data"]["version"].as_i64().unwrap();
 
     // submit
-    let (s_sub, env_sub) = send(
-        app.clone(),
-        json_request(
-            "POST",
-            &format!("/outsource-quotes/{qid}/submit"),
-            None,
-            Some(&token),
-        ),
-    )
-    .await;
+    let (s_sub, env_sub) = submit_quote(&app, &token, &qid, ver).await;
     assert_eq!(s_sub, StatusCode::OK, "submit: {env_sub}");
     assert_eq!(env_sub["data"]["status"], "SUBMITTED");
     assert!(env_sub["data"]["submitted_at"].is_string());
@@ -482,16 +738,8 @@ async fn reject_quote_requires_review_note() {
     .await;
     let qid = env_c["data"]["id"].as_str().unwrap().to_string();
     // submit
-    let (_, _) = send(
-        app.clone(),
-        json_request(
-            "POST",
-            &format!("/outsource-quotes/{qid}/submit"),
-            None,
-            Some(&token),
-        ),
-    )
-    .await;
+    let (s, env) = submit_quote(&app, &token, &qid, 0).await;
+    assert_eq!(s, StatusCode::OK, "submit: {env}");
     // reject with empty note → 400
     let (s, env) = send(
         app.clone(),
@@ -541,29 +789,126 @@ async fn submit_quote_wrong_status_returns_21302() {
     .await;
     let qid = env_c["data"]["id"].as_str().unwrap().to_string();
     // 第一次 submit OK
-    let (_, _) = send(
-        app.clone(),
-        json_request(
-            "POST",
-            &format!("/outsource-quotes/{qid}/submit"),
-            None,
-            Some(&token),
-        ),
-    )
-    .await;
-    // 第二次 submit → 400 / 21302
-    let (s, env) = send(
+    let (s, env) = submit_quote(&app, &token, &qid, 0).await;
+    assert_eq!(s, StatusCode::OK, "1st submit: {env}");
+    // 第二次 submit → 400 / 21302（version 传 1，即 submit 之后的真实版本；
+    // **状态机守卫在 OCC 之前**，所以传对传错都是 21302）
+    let (s, env) = submit_quote(&app, &token, &qid, 1).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "2nd submit: {env}");
+    assert_eq!(env["code"].as_i64().unwrap(), 21302);
+}
+
+/// `submit` 的 `version` 必填：缺字段 ⇒ axum `422` 纯文本，不进 `R<T>` 信封。
+///
+/// 用 `send_raw`：axum 的 `Json` 反序列化拒绝是纯文本 body，`send` 会在 JSON 解析处 panic。
+#[tokio::test]
+async fn submit_quote_requires_version_field() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let (pid, cid, proc_id) = setup_basic(&pool).await;
+    let (s, env) = create_quote(&app, &token, pid, cid, proc_id).await;
+    assert_eq!(s, StatusCode::CREATED, "{env}");
+    let qid = env["data"]["id"].as_str().unwrap().to_string();
+
+    let (s, body) = send_raw(
         app,
         json_request(
             "POST",
             &format!("/outsource-quotes/{qid}/submit"),
-            None,
+            Some(json!({})),
             Some(&token),
         ),
     )
     .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "2nd submit: {env}");
-    assert_eq!(env["code"].as_i64().unwrap(), 21302);
+    assert_eq!(
+        s,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "缺 version 必须是 422（不是业务信封）: {body}"
+    );
+    assert!(
+        !body.contains("\"code\""),
+        "缺字段是 axum 的纯文本拒绝，不得有 code 字段: {body}"
+    );
+    assert!(
+        body.contains("missing field `version`"),
+        "错误正文应指出缺 version: {body}"
+    );
+}
+
+/// `submit` 的 OCC：传过期 `version` ⇒ 40901。
+///
+/// 守卫必须用**调用方传的** version。此前 service 是「先 `quote_get_by_id` 读到当前
+/// version 再喂给 `quote_submit`」，等于用服务端自己读到的值守自己的乐观锁 ——
+/// `UPDATE … WHERE version = <刚读的>` 在同一行上恒成立，守卫形同虚设。
+#[tokio::test]
+async fn submit_quote_version_conflict_returns_40901() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let (pid, cid, proc_id) = setup_basic(&pool).await;
+    let (s, env) = create_quote(&app, &token, pid, cid, proc_id).await;
+    assert_eq!(s, StatusCode::CREATED, "{env}");
+    let qid = env["data"]["id"].as_str().unwrap().to_string();
+
+    let (s, env) = submit_quote(&app, &token, &qid, 99).await;
+    assert_eq!(s, StatusCode::CONFLICT, "过期 version 必须 409: {env}");
+    assert_eq!(env["code"].as_i64().unwrap(), 40901, "{env}");
+}
+
+/// `soft-delete` 的 `version` 必填 + OCC 生效。
+#[tokio::test]
+async fn soft_delete_quote_requires_and_guards_version() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let (pid, cid, proc_id) = setup_basic(&pool).await;
+    let (s, env) = create_quote(&app, &token, pid, cid, proc_id).await;
+    assert_eq!(s, StatusCode::CREATED, "{env}");
+    let qid = env["data"]["id"].as_str().unwrap().to_string();
+
+    // 缺 version → 422（axum 纯文本，用 send_raw）
+    let (s, body) = send_raw(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/outsource-quotes/{qid}/soft-delete"),
+            Some(json!({})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(body.contains("missing field `version`"), "{body}");
+
+    // 过期 version → 40901
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/outsource-quotes/{qid}/soft-delete"),
+            Some(json!({"version": 99})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "{env}");
+    assert_eq!(env["code"].as_i64().unwrap(), 40901, "{env}");
+
+    // 正确 version → 200，且行被软删（列表里看不到）
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/outsource-quotes/{qid}/soft-delete"),
+            Some(json!({"version": 0})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert!(env["data"].is_null(), "{env}");
+    let (s, env) = send(
+        app,
+        json_request("GET", "/outsource-quotes", None, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(env["data"]["total"], 0, "软删后不应再出现: {env}");
 }
 
 #[tokio::test]
@@ -587,16 +932,8 @@ async fn soft_delete_quote_approved_forbidden() {
     .await;
     let qid = env_c["data"]["id"].as_str().unwrap().to_string();
     // submit + approve → APPROVED
-    let (_, _) = send(
-        app.clone(),
-        json_request(
-            "POST",
-            &format!("/outsource-quotes/{qid}/submit"),
-            None,
-            Some(&token),
-        ),
-    )
-    .await;
+    let (s, env) = submit_quote(&app, &token, &qid, 0).await;
+    assert_eq!(s, StatusCode::OK, "submit: {env}");
     let (_, _) = send(
         app.clone(),
         json_request(
@@ -607,13 +944,13 @@ async fn soft_delete_quote_approved_forbidden() {
         ),
     )
     .await;
-    // soft-delete → 400 / 21302
+    // soft-delete → 400 / 21302（**状态机守卫在 OCC 之前**，故 version 传 2 无妨）
     let (s, env) = send(
         app,
         json_request(
             "POST",
             &format!("/outsource-quotes/{qid}/soft-delete"),
-            None,
+            Some(json!({"version": 2})),
             Some(&token),
         ),
     )
@@ -626,12 +963,12 @@ async fn soft_delete_quote_approved_forbidden() {
 //  `customer_id` 过滤（2026-10-04 新增语义）
 // ===========================================================================
 
-/// 只给 `customer_id`（**L1**）就能命中其全部 L2 子客户的报价，**不需 keyword**。
+/// 只给 `customer_id`（**L1**）就能命中其全部 L2 子客户的报价，**不需零件侧筛选**。
 ///
 /// 2026-10-04 之前 service 把 `customer_id` 解析成 `_cid` 后直接丢弃，且「给了
 /// `customer_id` 没给 `keyword`」就早返回空列表 ⇒ 前端选客户后一览恒空。
 #[tokio::test]
-async fn list_quotes_customer_id_l1_expands_to_children_without_keyword() {
+async fn list_quotes_customer_id_l1_expands_to_children_without_part_filter() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let l1 = insert_l1_customer(&pool, "QCustRoot", "W").await;
     let l2_a = insert_l2_customer(&pool, "QCustA", l1).await;
@@ -670,7 +1007,7 @@ async fn list_quotes_customer_id_l1_expands_to_children_without_keyword() {
     assert_eq!(s, StatusCode::OK, "{env}");
     assert_eq!(
         env["data"]["total"], 2,
-        "只给 L1 必须命中其全部 L2 子客户且无需 keyword: {env}"
+        "只给 L1 必须命中其全部 L2 子客户且无需零件侧筛选: {env}"
     );
     let names = part_names(&env);
     assert!(names.iter().any(|n| n == "PT-ALPHA"), "{names:?}");
@@ -708,9 +1045,13 @@ async fn list_quotes_customer_id_l2_returns_only_its_own_quotes() {
     assert_eq!(part_names(&env), vec!["PT-ALPHA".to_string()], "{env}");
 }
 
-/// `customer_id` + `keyword` 同时给 → **取交集**（service 层 `HashSet` 求交）。
+/// `customer_id` 与 `drawing_no` 同时给 → **AND**（各占各的 WHERE 段，由 DB 求交）。
+///
+/// 2026-10-09 之前是 service 层拿两个 part_id 集合做 `HashSet` 求交；拆成直连 ILIKE
+/// 之后零件侧谓词直接落在 SQL 上，交集由 PG 求，交集语义不变、但中间集合与那段求交
+/// 代码一起消失。
 #[tokio::test]
-async fn list_quotes_customer_id_and_keyword_intersection() {
+async fn list_quotes_customer_id_and_drawing_no_intersection() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let l1 = insert_l1_customer(&pool, "QCustRoot3", "T").await;
     let l2_a = insert_l2_customer(&pool, "QCustA3", l1).await;
@@ -726,12 +1067,12 @@ async fn list_quotes_customer_id_and_keyword_intersection() {
         assert_eq!(s, StatusCode::CREATED, "{env}");
     }
 
-    // 交集命中：L1 子树 ∩ keyword=ALPHA
+    // 交集命中：L1 子树 ∩ drawing_no 含 ALPHA
     let (s, env) = send(
         app.clone(),
         json_request(
             "GET",
-            &format!("/outsource-quotes?customer_id={l1}&keyword=ALPHA"),
+            &format!("/outsource-quotes?customer_id={l1}&drawing_no=ALPHA"),
             None,
             Some(&token),
         ),
@@ -741,21 +1082,26 @@ async fn list_quotes_customer_id_and_keyword_intersection() {
     assert_eq!(env["data"]["total"], 1, "交集必须只留 1 条: {env}");
     assert_eq!(part_names(&env), vec!["PT-ALPHA".to_string()], "{env}");
 
-    // keyword 单独给 → 全库 1 条（证明上面的 1 不是 keyword 的功劳）
+    // drawing_no 单独给 → 全库 1 条（证明上面的 1 不是 drawing_no 的功劳）
     let (s, env) = send(
         app.clone(),
-        json_request("GET", "/outsource-quotes?keyword=ALPHA", None, Some(&token)),
+        json_request(
+            "GET",
+            "/outsource-quotes?drawing_no=ALPHA",
+            None,
+            Some(&token),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "{env}");
     assert_eq!(env["data"]["total"], 1, "{env}");
 
-    // 交集为空：keyword=GAMMA 的零件不在 L1 子树内 ⇒ total 0（不是全量 3）
+    // 交集为空：GAMMA 的零件不在 L1 子树内 ⇒ total 0（不是全量 3）
     let (s, env) = send(
-        app.clone(),
+        app,
         json_request(
             "GET",
-            &format!("/outsource-quotes?customer_id={l1}&keyword=GAMMA"),
+            &format!("/outsource-quotes?customer_id={l1}&drawing_no=GAMMA"),
             None,
             Some(&token),
         ),

@@ -23,6 +23,16 @@
 //!     → 不一致抛 `20122 BIZ_BATCH_LOCATION_MISMATCH`；
 //!   - 同 kind 移动（POOL→POOL / WORKER→WORKER 仅源 ≠ 目标）抛 `40001 VALIDATION_ERROR`。
 //!
+//! ## 2026-10-09 `move_batch` 改显式 OCC
+//! `MoveRequest` 新增**必填** `version`（无 `#[serde(default)]`，缺失 → HTTP 422
+//! 纯文本），三个方向一律以它作 `expected_version`：POOL→WORKER 灌进
+//! `take_specific_from_pool` 的 WHERE，WORKER→POOL / WORKER→WORKER 直接传给
+//! 各自的 UPDATE。先前三个方向用的都是「本次事务里刚读到的 `batch.version`」
+//! 或「SQL 内自比 `pb.version = candidate.version`」，两者都是**恒真式**——
+//! 看板数据是 30s 缓存的快照，期间他人改过批次时，「用户看到 5 件 → 实际移动
+//! 3 件」会静默成功。服务端读到的 version 现在只用于兜底对账（0 行时在错误文案里
+//! 点名客户端与服务端两个值），不替代客户端传值。全仓 OCC 规约见 `CLAUDE.md` §8。
+//!
 //! ## 事务边界（2026-09-22 D-2 重构对齐 iam / shelf / worker 范本）
 //! 事务移交 handler：handler 显式 `pool.begin()` / `commit()`，service 仅业务逻辑。
 //! 所有跨 repo 操作经 `QueueRepoTrait`（胖 trait = 本域 4 + 跨域 helper 14），
@@ -260,8 +270,16 @@ impl QueueService {
     /// - 所有 move SQL **不写** `current_process_step_id`（工序链不被破坏）
     /// - 所有 move SQL **不写** `current_process_id`（2026-09-30 写入不变式：
     ///   池内移动工序不变，批次归还货架后仍属原工序候选池）
-    /// - OCC：`UPDATE ... WHERE version = $exp`，0 行 → `40901 VERSION_CONFLICT`
+    /// - OCC：**三个方向一律以 `req.version`（客户端传值）为 `expected_version`**，
+    ///   0 行 → `40901 VERSION_CONFLICT`。服务端读到的 `batch.version` 只用于
+    ///   兜底对账（错误文案里点名「客户端 version=… 服务端 version=…」），
+    ///   **不得**拿来当 `expected_version` 复用 —— 那是隐式 OCC，等于没锁：
+    ///   看板数据是 30s 缓存的快照，期间他人改过批次时，「用户看到 5 件 → 实际移动
+    ///   3 件」会静默成功。
     /// - `from` 必与 batch 当前状态匹配（→ 40904）
+    ///
+    /// 守卫顺序（2026-10-09 起固定，调换会让错误码语义漂移）：
+    /// 角色 → 同 kind 40001 → 批次存在 → status → `from` 匹配 → 分方向校验。
     #[allow(clippy::too_many_arguments)]
     pub async fn move_batch(
         conn: &mut PgConnection,
@@ -465,21 +483,30 @@ impl QueueService {
                     ));
                 }
 
-                // take_specific_from_pool（OCC + WHERE version = candidate.version）
+                // take_specific_from_pool（OCC + WHERE pb.version = $exp）
                 // 0 行 → 与 WORKER→POOL / WORKER→WORKER 分支统一返 40901 VERSION_CONFLICT
                 // （plan §2.3「OCC 0 行 → 40901 VERSION_CONFLICT」）；
                 // from 已在 §4 校验过 holder 匹配，故此处 0 行只能是被并发改版本。
                 // 2026-09-30 review 第 1 轮：原返 BIZ_BATCH_LOCATION_MISMATCH (20122)，
                 // 与同函数其它 0 行分支语义不一致，统一回滚为 VERSION_CONFLICT。
+                // 2026-10-09：$exp 由「SQL 内自比 candidate.version」改为 `req.version`
+                // （客户端传值）。自比是拿 `FOR UPDATE` 锁住的行比它自己、恒真，
+                // 并发改动会被悄悄吸收；灌客户端传值后过期的看板快照才真的被拒。
                 let taken = (&mut *conn)
-                    .take_specific_from_pool(*worker_id, *shelf_id, batch.id, current.id)
+                    .take_specific_from_pool(
+                        *worker_id,
+                        *shelf_id,
+                        batch.id,
+                        req.version,
+                        current.id,
+                    )
                     .await?
                     .ok_or_else(|| {
                         AppError::biz(
                             code::VERSION_CONFLICT,
                             format!(
-                                "take_specific_from_pool 0 行：batch {} 已被并发改动",
-                                batch.id
+                                "take_specific_from_pool 0 行：batch {} 已被并发改动（客户端 version={}，服务端 version={}）",
+                                batch.id, req.version, batch.version
                             ),
                         )
                     })?;
@@ -571,7 +598,7 @@ impl QueueService {
                 let rows = (&mut *conn)
                     .part_mark_batch_returned(
                         batch.id,
-                        batch.version,
+                        req.version,
                         *shelf_id,
                         None, // 2026-09-30 重构：move 不写 step
                         Some(current.id),
@@ -581,8 +608,8 @@ impl QueueService {
                     return Err(AppError::biz(
                         code::VERSION_CONFLICT,
                         format!(
-                            "batch {} 版本冲突或状态非 IN_PROCESS+WORKER（move WORKER→POOL）",
-                            batch.id
+                            "batch {} 版本冲突或状态非 IN_PROCESS+WORKER（move WORKER→POOL；客户端 version={}，服务端 version={}）",
+                            batch.id, req.version, batch.version
                         ),
                     ));
                 }
@@ -693,7 +720,7 @@ impl QueueService {
                         batch.id,
                         *src_worker_id,
                         *dst_worker_id,
-                        batch.version,
+                        req.version,
                         Some(current.id),
                     )
                     .await?;
@@ -701,8 +728,8 @@ impl QueueService {
                     return Err(AppError::biz(
                         code::VERSION_CONFLICT,
                         format!(
-                            "batch {} 版本冲突或状态非 IN_PROCESS+WORKER（move WORKER→WORKER）",
-                            batch.id
+                            "batch {} 版本冲突或状态非 IN_PROCESS+WORKER（move WORKER→WORKER；客户端 version={}，服务端 version={}）",
+                            batch.id, req.version, batch.version
                         ),
                     ));
                 }
@@ -1344,6 +1371,8 @@ mod tests {
         let _ = snowflake; // 占位避免 unused warning
         let req = MoveRequest {
             batch_id: batch,
+            // 2026-10-09 新增 OCC 锚；上方两个 fixture helper 建批时 version 写死 0
+            version: 0,
             from: MoveLocation::Pool {
                 shelf_id: prod_shelf,
             },
@@ -1394,6 +1423,8 @@ mod tests {
         let snowflake_obj = SnowflakeIdGenerator::new(1_577_836_800_000, 7);
         let req = MoveRequest {
             batch_id: batch,
+            // 2026-10-09 新增 OCC 锚；上方两个 fixture helper 建批时 version 写死 0
+            version: 0,
             from: MoveLocation::Worker { worker_id: worker },
             to: MoveLocation::Pool {
                 shelf_id: prod_shelf,
@@ -1443,6 +1474,8 @@ mod tests {
         let snowflake_obj = SnowflakeIdGenerator::new(1_577_836_800_000, 7);
         let req = MoveRequest {
             batch_id: batch,
+            // 2026-10-09 新增 OCC 锚；上方两个 fixture helper 建批时 version 写死 0
+            version: 0,
             from: MoveLocation::Worker {
                 worker_id: worker_src,
             },
@@ -1493,6 +1526,8 @@ mod tests {
         let snowflake_obj = SnowflakeIdGenerator::new(1_577_836_800_000, 7);
         let req = MoveRequest {
             batch_id: batch,
+            // 2026-10-09 新增 OCC 锚；上方两个 fixture helper 建批时 version 写死 0
+            version: 0,
             // from 谎报成 WORKER（实际在 POOL），期望 40904
             from: MoveLocation::Worker {
                 worker_id: 999_999_999,
@@ -1538,6 +1573,8 @@ mod tests {
         let snowflake_obj = SnowflakeIdGenerator::new(1_577_836_800_000, 7);
         let req = MoveRequest {
             batch_id: batch,
+            // 2026-10-09 新增 OCC 锚；上方两个 fixture helper 建批时 version 写死 0
+            version: 0,
             from: MoveLocation::Worker {
                 worker_id: worker_src,
             },
@@ -1583,6 +1620,8 @@ mod tests {
         let snowflake_obj = SnowflakeIdGenerator::new(1_577_836_800_000, 7);
         let req = MoveRequest {
             batch_id: batch,
+            // 2026-10-09 新增 OCC 锚；上方两个 fixture helper 建批时 version 写死 0
+            version: 0,
             from: MoveLocation::Worker { worker_id: worker },
             to: MoveLocation::Pool {
                 shelf_id: dst_shelf,
@@ -1615,6 +1654,8 @@ mod tests {
         let snowflake_obj = SnowflakeIdGenerator::new(1_577_836_800_000, 7);
         let req = MoveRequest {
             batch_id: batch,
+            // 2026-10-09 新增 OCC 锚；上方两个 fixture helper 建批时 version 写死 0
+            version: 0,
             from: MoveLocation::Pool {
                 shelf_id: prod_shelf,
             },

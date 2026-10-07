@@ -15,11 +15,22 @@ use serde_json::json;
 use sqlx::PgPool;
 
 use hsh_erp_rust::infra::clock::now_naive;
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_test_support::{
-    OutsourceFixture, json_request, load_outsource_fixture, login_token, send, test_app, test_pool,
-    test_state,
+    OutsourceFixture, json_request, load_outsource_fixture, login_token, pool_snowflake, send,
+    test_app, test_pool, test_state,
 };
+
+/// 直插用的雪花 ID：走 `test-support::pool_snowflake()`（**进程级**
+/// `OnceLock<Mutex<..>>`，instance 由 pid ⊕ 启动时间派生）。
+///
+/// 不每次 `SnowflakeIdGenerator::new(epoch, 1)` 新建生成器：新建的生成器在同一毫秒内
+/// 连续两次调用会生成**完全相同**的 id（instance 相同 + 时间戳相同 + seq 都从 0 开始），
+/// 撞 `t_*_pkey`；更隐蔽的是撞成「shelf_id == process_id」这类业务列，让 DB 的
+/// `ck_*_no_self_loop` CHECK 以一条与被测逻辑无关的约束错误把用例打断。范本与理由见
+/// `tests/outsource/pool.rs::next_id`。
+fn next_id() -> i64 {
+    pool_snowflake().lock().expect("pool_snowflake").next_id()
+}
 
 async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, OutsourceFixture) {
     let pool = test_pool().await;
@@ -34,7 +45,7 @@ async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, OutsourceFixtu
 // ===========================================================================
 
 async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
-    let id = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
+    let id = next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_customer (id, name, serial_prefix, version, created_at, updated_at) \
@@ -51,7 +62,7 @@ async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
 }
 
 async fn insert_part(pool: &PgPool, customer_id: i64, tag: &str) -> i64 {
-    let id = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
+    let id = next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_part (id, name, drawing_no, applicant_name, quantity, unit_price, total_price, \
@@ -80,7 +91,7 @@ async fn insert_batch(
     location: Option<&str>,
     holder: Option<i64>,
 ) -> i64 {
-    let id = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
+    let id = next_id();
     sqlx::query(
         "INSERT INTO t_part_batch \
          (id, part_id, batch_no, quantity, status, location, current_holder_id, version, created_at, updated_at) \

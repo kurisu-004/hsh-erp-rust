@@ -183,10 +183,16 @@ impl QueueRepo {
     /// - `shelf_id`：候选池货架（限定 `current_holder_id` 必须等于）
     /// - `batch_id`：唯一指定的批次
     /// - `operator_user_id`：审计字段 `updated_by`
+    /// - `expected_version`：**客户端传来的 OCC 锚**（`MoveRequest.version`）。
+    ///   2026-10-09 新增形参：此前本 SQL 的 OCC 是 `pb.version = candidate.version`
+    ///   —— 拿 `FOR UPDATE` 锁住读到的行再拿它自己的 version 去比，等价于恒真，
+    ///   并发改动会被这层自比悄悄吸收。改成灌客户端传值后，「看板 30s 快照已过期」
+    ///   才真的被拒（0 行 → service 转 `40901 VERSION_CONFLICT`）。
     ///
     /// 返回：
     /// - `Ok(None)`：批次不在候选池（status ≠ IN_PROCESS / location ≠
-    ///   PRODUCTION_SHELF / `current_holder_id` ≠ shelf_id / 已软删）
+    ///   PRODUCTION_SHELF / `current_holder_id` ≠ shelf_id / 已软删），
+    ///   **或** `expected_version` 与库中现值不符
     /// - `Ok(Some(taken))`：抢到（含 part 元数据）
     /// - `Err(BIZ_WORKER_HOLD_LIMIT_EXCEEDED)`：由 service 守卫触发，本 repo 不抛
     pub async fn take_specific_from_pool(
@@ -194,6 +200,7 @@ impl QueueRepo {
         worker_id: i64,
         shelf_id: i64,
         batch_id: i64,
+        expected_version: i32,
         operator_user_id: i64,
     ) -> Result<Option<TakenItem>, AppError> {
         let row: Option<TakenRow> = sqlx::query_as!(
@@ -221,10 +228,14 @@ impl QueueRepo {
                 UPDATE t_part_batch pb
                 SET current_holder_id = $1, location = 'WORKER',
                     version = pb.version + 1,
-                    updated_at = NOW(), updated_by = $4
+                    updated_at = NOW(), updated_by = $5
                 FROM candidate
                 WHERE pb.id = candidate.id
                   AND pb.version = candidate.version
+                  -- 2026-10-09 新增：客户端传的 OCC 锚。candidate 里的
+                  -- `pb.version = candidate.version` 是拿 FOR UPDATE 锁住的行比它自己，
+                  -- 恒真，吸收并发改动；这一条才是真正的闸门。
+                  AND pb.version = $4
                 RETURNING pb.id, pb.part_id, pb.batch_no, pb.quantity, pb.version
             ),
             sel_part AS (
@@ -243,6 +254,7 @@ impl QueueRepo {
             worker_id,
             shelf_id,
             batch_id,
+            expected_version,
             operator_user_id,
         )
         .fetch_optional(&mut *conn)

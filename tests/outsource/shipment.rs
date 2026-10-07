@@ -2,9 +2,10 @@
 //!
 //! 覆盖：
 //! - `GET /outsource-companies/{id}/sent-parts`：happy path（OUTSOURCING + RECEIVED
-//!   都出现）/ keyword 过滤（命中 + **零命中返回 0 行**）/ sent_at 日期窗 /
-//!   3 种 sort_by / sort 白名单大小写不敏感 / 非法 sort_by 回落并**验序** /
-//!   分页 total+offset
+//!   都出现）/ 信封带公司 id + 名 / 行投影瘦身（无 `quote_id` / `part_id`）/
+//!   `drawing_no` 过滤（命中 + **零命中返回 0 行**）/ `customer_id` / `process_id` /
+//!   `is_billed` 三个精确维度 / sent_at 日期窗 / 3 种 sort_by / sort 白名单大小写
+//!   不敏感 / 非法 sort_by 回落并**验序** / 分页 total+offset
 //! - `GET /outsource-shipments/in-flight`：只返 OUTSOURCING；**`version` 取
 //!   `t_part_batch.version` 而非 `t_outsource_shipment.version`**（专门用两个不同值
 //!   区分）；**`quantity` 取 `t_part_batch.quantity` 而非 `shipment.quantity`**
@@ -18,15 +19,26 @@ use serde_json::json;
 use sqlx::PgPool;
 
 use hsh_erp_rust::infra::clock::now_naive;
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_test_support::{
-    OutsourceFixture, PartFixture, json_request, load_outsource_fixture, login_token, send,
-    test_app, test_pool, test_state,
+    OutsourceFixture, PartFixture, json_request, load_outsource_fixture, login_token,
+    pool_snowflake, send, test_app, test_pool, test_state,
 };
 
 // ===========================================================================
 //  Bootstrap
 // ===========================================================================
+
+/// 直插用的雪花 ID：走 `test-support::pool_snowflake()`（**进程级**
+/// `OnceLock<Mutex<..>>`，instance 由 pid ⊕ 启动时间派生）。
+///
+/// 不每次 `SnowflakeIdGenerator::new(epoch, 1)` 新建生成器：新建的生成器在同一毫秒内
+/// 连续两次调用会生成**完全相同**的 id（instance 相同 + 时间戳相同 + seq 都从 0 开始），
+/// 撞 `t_*_pkey`；更隐蔽的是撞成「shelf_id == process_id」这类业务列，让 DB 的
+/// `ck_*_no_self_loop` CHECK 以一条与被测逻辑无关的约束错误把用例打断。范本与理由见
+/// `tests/outsource/pool.rs::next_id`。
+fn next_id() -> i64 {
+    pool_snowflake().lock().expect("pool_snowflake").next_id()
+}
 
 async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, OutsourceFixture) {
     let pool = test_pool().await;
@@ -56,7 +68,7 @@ async fn bootstrap_as_inspector() -> (PgPool, axum::Router, String) {
 // ===========================================================================
 
 async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
-    let id = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
+    let id = next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_customer (id, name, serial_prefix, version, created_at, updated_at) \
@@ -72,9 +84,9 @@ async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
     id
 }
 
-/// 直插 part；`drawing_tag` 便于 keyword 断言区分。
+/// 直插 part；`drawing_tag` 便于 `drawing_no` 断言区分。
 async fn insert_part(pool: &PgPool, customer_id: i64, drawing_tag: &str) -> i64 {
-    let id = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
+    let id = next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_part (id, name, drawing_no, applicant_name, quantity, unit_price, total_price, \
@@ -94,7 +106,7 @@ async fn insert_part(pool: &PgPool, customer_id: i64, drawing_tag: &str) -> i64 
 }
 
 async fn seed_outsource_process(pool: &PgPool, code: &str) -> i64 {
-    let id = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
+    let id = next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, \
@@ -126,7 +138,7 @@ async fn insert_shipment(
     sent_at: &str,
     received_at: Option<&str>,
 ) -> i64 {
-    let id = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
+    let id = next_id();
     sqlx::query(
         "INSERT INTO t_outsource_shipment \
          (id, quote_id, part_id, batch_id, outsource_company_id, process_id, quantity, \
@@ -152,7 +164,7 @@ async fn insert_shipment(
 }
 
 async fn insert_quote(pool: &PgPool, part_id: i64, company_id: i64, process_id: i64) -> i64 {
-    let id = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
+    let id = next_id();
     sqlx::query(
         "INSERT INTO t_outsource_quote \
          (id, part_id, outsource_company_id, process_id, price, status, version, created_at, updated_at) \
@@ -170,7 +182,7 @@ async fn insert_quote(pool: &PgPool, part_id: i64, company_id: i64, process_id: 
 
 /// 直插批次（可指定 version / quantity —— in-flight 断言要靠它们与 shipment 区分）。
 async fn insert_batch(pool: &PgPool, part_id: i64, quantity: i32, version: i32) -> i64 {
-    let id = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
+    let id = next_id();
     sqlx::query(
         "INSERT INTO t_part_batch \
          (id, part_id, batch_no, quantity, status, location, version, created_at, updated_at) \
@@ -203,6 +215,25 @@ async fn get_sent_parts(
         ),
     )
     .await
+}
+
+/// 把一条 shipment 标成「已开票」（`insert_shipment` 一律写 `is_billed = false`，
+/// 所以 `is_billed` 筛选维度用得着单独一条 UPDATE）。
+async fn mark_billed(pool: &PgPool, shipment_id: i64) {
+    sqlx::query("UPDATE t_outsource_shipment SET is_billed = true WHERE id = $1")
+        .bind(shipment_id)
+        .execute(pool)
+        .await
+        .expect("mark shipment billed");
+}
+
+/// 取零件的 `drawing_no`（`?drawing_no=` 断言用，避免拼 id）。
+async fn part_drawing_no(pool: &PgPool, part_id: i64) -> String {
+    sqlx::query_scalar("SELECT drawing_no FROM t_part WHERE id = $1")
+        .bind(part_id)
+        .fetch_one(pool)
+        .await
+        .expect("读 part drawing_no")
 }
 
 // ===========================================================================
@@ -269,10 +300,61 @@ async fn sent_parts_lists_outsourcing_and_received() {
         .expect("OUTSOURCING row");
     assert_eq!(found["unit_price"], "2.50", "{env}");
     assert_eq!(found["total_price"], "7.50", "{env}");
+
+    // 2026-10-09：信封带公司 id + 名（前端渲染页头，不必再单独 GET 一次公司详情）
+    assert_eq!(
+        env["data"]["outsource_company_id"],
+        company.to_string(),
+        "{env}"
+    );
+    let company_name: String = sqlx::query_scalar(
+        "SELECT name FROM t_outsource_company WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(company)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(env["data"]["outsource_company_name"], company_name, "{env}");
+
+    // 2026-10-09：行投影删 `quote_id` / `part_id`（18 → 16 字段）
+    assert_eq!(items[0].as_object().unwrap().len(), 16, "{env}");
+    assert!(
+        items[0].get("quote_id").is_none() && items[0].get("part_id").is_none(),
+        "sent-parts 行不得再带 quote_id / part_id: {env}"
+    );
 }
 
+/// 公司被软删后，信封的 `outsource_company_name` 必须是 `null`（端点**不**因此 404）。
+///
+/// 这是本端点的容错口径：它按 company_id 查 shipment 行，公司行消失只影响标题位，
+/// 不该让整页数据读不出来。
 #[tokio::test]
-async fn sent_parts_keyword_filter_hits_only_matching_part() {
+async fn sent_parts_envelope_company_name_null_when_company_soft_deleted() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let company = OutsourceFixture::OUTSOURCE_COMPANY_ID;
+    // 软删 fixture 公司（直接 UPDATE，绕过「仍映射工序」守卫）
+    sqlx::query("UPDATE t_outsource_company SET deleted_at = now() WHERE id = $1")
+        .bind(company)
+        .execute(&pool)
+        .await
+        .expect("soft delete fixture company");
+
+    let (s, env) = get_sent_parts(&app, &token, company, "").await;
+    assert_eq!(s, StatusCode::OK, "公司已软删不得让端点 404: {env}");
+    assert_eq!(
+        env["data"]["outsource_company_id"],
+        company.to_string(),
+        "{env}"
+    );
+    assert!(
+        env["data"]["outsource_company_name"].is_null(),
+        "公司已软删时公司名必须是 null: {env}"
+    );
+}
+
+/// `drawing_no` 直连 ILIKE 过滤：命中只有匹配的那一行。
+#[tokio::test]
+async fn sent_parts_drawing_no_filter_hits_only_matching_part() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let cid = insert_l1_customer(&pool, "KwCo", "V").await;
     let hit = insert_part(&pool, cid, "MATCHME").await;
@@ -310,10 +392,123 @@ async fn sent_parts_keyword_filter_hits_only_matching_part() {
     )
     .await;
 
-    let (s, env) = get_sent_parts(&app, &token, company, "?keyword=MATCHME").await;
+    let (s, env) = get_sent_parts(&app, &token, company, "?drawing_no=MATCHME").await;
     assert_eq!(s, StatusCode::OK, "{env}");
     assert_eq!(env["data"]["total"], 1, "{env}");
-    assert_eq!(env["data"]["items"][0]["part_id"], hit.to_string(), "{env}");
+    // 行投影已删 `part_id`，改用 `part_drawing_no` 定位
+    assert_eq!(
+        env["data"]["items"][0]["part_drawing_no"],
+        part_drawing_no(&pool, hit).await,
+        "{env}"
+    );
+}
+
+/// 2026-10-09 新增的三个精确筛选维度：`customer_id` / `process_id` / `is_billed`。
+///
+/// `customer_id` 与报价一览**语义不同**：那边是「自身 ∪ 直接子客户」的客户子树展开，
+/// 这边只判 `t_part.customer_id` 等值（对账时按「这家外协厂供过哪个客户的货」筛）。
+#[tokio::test]
+async fn sent_parts_exact_filters_customer_process_is_billed() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let cust_a = insert_l1_customer(&pool, "ExA", "X").await;
+    let cust_b = insert_l1_customer(&pool, "ExB", "Y").await;
+    let proc_a = seed_outsource_process(&pool, "EXPA").await;
+    let proc_b = seed_outsource_process(&pool, "EXPB").await;
+    let company = OutsourceFixture::OUTSOURCE_COMPANY_ID;
+    let p_a = insert_part(&pool, cust_a, "A").await;
+    let p_b = insert_part(&pool, cust_b, "B").await;
+    let q1 = insert_quote(&pool, p_a, company, proc_a).await;
+    let q2 = insert_quote(&pool, p_b, company, proc_b).await;
+    // A 行：proc_a + 未开票；B 行：proc_b + 已开票
+    insert_shipment(
+        &pool,
+        q1,
+        p_a,
+        None,
+        company,
+        proc_a,
+        1,
+        "1.00",
+        "OUTSOURCING",
+        "2026-09-01 10:00:00",
+        None,
+    )
+    .await;
+    let sid_b = insert_shipment(
+        &pool,
+        q2,
+        p_b,
+        None,
+        company,
+        proc_b,
+        1,
+        "2.00",
+        "OUTSOURCING",
+        "2026-09-01 10:00:00",
+        None,
+    )
+    .await;
+    mark_billed(&pool, sid_b).await;
+
+    let names = |env: &serde_json::Value| -> Vec<String> {
+        env["data"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["part_drawing_no"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // 对照组：不传任何精确维度 → 2 条
+    let (s, env) = get_sent_parts(&app, &token, company, "").await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(env["data"]["total"], 2, "{env}");
+
+    // customer_id 等值
+    let (s, env) = get_sent_parts(&app, &token, company, &format!("?customer_id={cust_a}")).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(env["data"]["total"], 1, "{env}");
+    assert_eq!(
+        names(&env),
+        vec![part_drawing_no(&pool, p_a).await],
+        "{env}"
+    );
+
+    // process_id 等值
+    let (s, env) = get_sent_parts(&app, &token, company, &format!("?process_id={proc_b}")).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(
+        names(&env),
+        vec![part_drawing_no(&pool, p_b).await],
+        "{env}"
+    );
+
+    // is_billed=true / false 互补
+    let (s, env) = get_sent_parts(&app, &token, company, "?is_billed=true").await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(
+        names(&env),
+        vec![part_drawing_no(&pool, p_b).await],
+        "{env}"
+    );
+    let (s, env) = get_sent_parts(&app, &token, company, "?is_billed=false").await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(
+        names(&env),
+        vec![part_drawing_no(&pool, p_a).await],
+        "{env}"
+    );
+
+    // 多维度 AND：cust_a + proc_b（跨行）→ 0 条
+    let (s, env) = get_sent_parts(
+        &app,
+        &token,
+        company,
+        &format!("?customer_id={cust_a}&process_id={proc_b}"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(env["data"]["total"], 0, "多维度必须 AND: {env}");
 }
 
 #[tokio::test]
@@ -365,7 +560,12 @@ async fn sent_parts_sent_from_sent_to_window_excludes_outside() {
     .await;
     assert_eq!(s, StatusCode::OK, "{env}");
     assert_eq!(env["data"]["total"], 1, "{env}");
-    assert_eq!(env["data"]["items"][0]["part_id"], p1.to_string(), "{env}");
+    // 行投影已删 `part_id`，改用 `part_drawing_no` 定位
+    assert_eq!(
+        env["data"]["items"][0]["part_drawing_no"],
+        part_drawing_no(&pool, p1).await,
+        "{env}"
+    );
 }
 
 #[tokio::test]
@@ -445,15 +645,15 @@ async fn sent_parts_sort_by_price_sent_at_received_at() {
     );
 }
 
-/// keyword **零命中**必须返回 0 行。
+/// `drawing_no` **零命中**必须返回 0 行。
 ///
-/// 这条断言守着 SQL 谓词
-/// `AND (cardinality($2::bigint[]) = 0 OR s.part_id = ANY($2))` 的一个陷阱：
-/// `part_keyword_search` 零命中时给出空数组 → `cardinality = 0` 成立 → 整个
-/// keyword 条件被短路掉 → 返回该公司的**全部** shipment（list 与 count 同时错，
-/// `total` 也一起错）。service 层早返回是唯一的兜底点。
+/// 2026-10-09 起 `drawing_no` 是直连 ILIKE 谓词
+/// （`$2::text IS NULL OR p.drawing_no ILIKE $2`），零命中在 SQL 里就是零行 ——
+/// 不再依赖 service 层那个「给了关键词却零命中要早返回」的分支（它是旧
+/// `part_keyword_search` 预搜索的补偿逻辑：空数组让 `cardinality($2) = 0` 成立、
+/// 整个条件被短路，从而返回该公司的**全部** shipment，list 与 count 同时错）。
 #[tokio::test]
-async fn sent_parts_keyword_zero_match_returns_empty_not_all_rows() {
+async fn sent_parts_drawing_no_zero_match_returns_empty_not_all_rows() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let cid = insert_l1_customer(&pool, "ZeroCo", "Z").await;
     // 两台零件 / 两条 shipment，都不含 keyword 里那个词
@@ -492,23 +692,27 @@ async fn sent_parts_keyword_zero_match_returns_empty_not_all_rows() {
     )
     .await;
 
-    // 无 keyword → 全量 2 条（对照组：证明"全量"本身是可达的，不是断言写错）
+    // 不传筛选 → 全量 2 条（对照组：证明"全量"本身是可达的，不是断言写错）
     let (s, env) = get_sent_parts(&app, &token, company, "").await;
     assert_eq!(s, StatusCode::OK, "{env}");
-    assert_eq!(env["data"]["total"], 2, "无 keyword 应返回全量: {env}");
+    assert_eq!(env["data"]["total"], 2, "不传筛选应返回全量: {env}");
 
-    // 零命中 keyword → 0 条。**空 items 是本用例的全部断言**，删掉 service 层的
-    // 早返回就会拿到 2 条 → 红。
-    let (s, env) = get_sent_parts(&app, &token, company, "?keyword=NOSUCHTOKENZZ").await;
+    // 零命中 drawing_no → 0 条
+    let (s, env) = get_sent_parts(&app, &token, company, "?drawing_no=NOSUCHTOKENZZ").await;
     assert_eq!(s, StatusCode::OK, "{env}");
     assert_eq!(
         env["data"]["total"], 0,
-        "零命中 keyword 必须 total=0（曾返回全量 2）: {env}"
+        "零命中 drawing_no 必须 total=0（曾返回全量 2）: {env}"
     );
     assert!(
         env["data"]["items"].as_array().unwrap().is_empty(),
-        "零命中 keyword 必须 items 为空: {env}"
+        "零命中 drawing_no 必须 items 为空: {env}"
     );
+
+    // `name` 零命中同样为 0
+    let (s, env) = get_sent_parts(&app, &token, company, "?name=NOSUCHTOKENZZ").await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(env["data"]["total"], 0, "零命中 name 必须 total=0: {env}");
 }
 
 /// 2026-10-03：`sort_by` / `sort_dir` 白名单**大小写不敏感** ——

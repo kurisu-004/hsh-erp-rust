@@ -36,7 +36,66 @@
 //! - `vo` 增 `pool.rs`，`service` 增 `pool.rs`，repo 增 ZST `OutsourcePoolRepo`
 //!   （另给 `OutsourceSendableRepo` 增 `list_by_process`，两者共用同一份核心 SQL ——
 //!   见 `repo/sql.rs::SENDABLE_INNER_X_SQL`）。
+//!
+//! 2026-10-09 看板收敛（`/outsource-queue/*`，2 只读 + 1 写）：
+//! - `/outsource-pool/{counts,state,{process_id}}` **硬切到**
+//!   `/outsource-queue/{snapshot,processes/{id}}`，**无 alias**。旧路径下打开一道工序
+//!   的板要发 1（工序详情）+ M（每家公司一次 state）= M + 1 个 HTTP 请求；在途批次
+//!   卡片内联进公司列后恒定 1 个请求。
+//! - 新增 `board/` 子模块（`repo.rs` + `service.rs`，范本 `prod/queue/board/`）：
+//!   固定 SQL 条数（snapshot 3 条 / detail 4 条），由
+//!   `board/mod.rs::sql_count_guard_tests` 的源码级护栏钉住。
+//! - `vo/pool.rs` 与 `service/pool.rs` 删除，出参合并进 `vo/queue.rs`；repo 侧
+//!   `OutsourcePoolRepo` 整体删除（4 个方法在三条端点下线后全部无调用方），其 SQL
+//!   按「去公司谓词」的口径搬进 `board/repo.rs`。`OutsourceRepoTrait` 相应瘦身 5 个
+//!   方法（`pool_*` 4 + `sendable_list_by_process` 1）。
+//!
+//! 2026-10-09 写端点接管（`/outsource-queue/move`，三合一）：
+//! - 新增 `POST /api/v2/outsource-queue/move`，取代 `prod::batch` 的外协收发三个单边
+//!   端点（`send-to-outsource` / `receive-from-outsource` /
+//!   `receive-from-outsource-to-inspection`），**硬切无 alias**。实现见
+//!   `service/move.rs` + `handler/move.rs`，出参见 `vo/queue.rs::OutsourceMoveResult`。
+//! - `GET /outsource-sendable` **硬切下线**（`sendable_router()` 整体删除）：它的行
+//!   就是 `/outsource-queue/processes/{id}` 候选列的分页子集，分页 + 关键字 + 客户过滤
+//!   那套入参（`OutsourceSendableListQuery`）随之删除。候选侧谓词 SQL
+//!   （`repo/sql.rs::SENDABLE_INNER_X_SQL`）与三个共用纯函数
+//!   （`service/sendable.rs` 的 `send_mode_of` / `can_send_of` /
+//!   `decode_company_options`）**保留** —— 看板候选列仍消费它们。
+//! - 旧的三个 WS 事件名（`PART_SENT_TO_OUTSOURCE` / `PART_RECEIVED_FROM_OUTSOURCE` /
+//!   `PART_RECEIVED_FROM_OUTSOURCE_INSPECTED`）合并为一个 `OUTSOURCE_MOVE_DONE`；
+//!   `t_part_event` 的三个审计字面量（`SENT_TO_OUTSOURCE` /
+//!   `RECEIVED_FROM_OUTSOURCE` / `RECEIVED_TO_INSPECTION`）**逐字不变**。
+//! - router 工厂 5 → **4**：删 `sendable_router()`（`pool_router()` 已于上一条删除）；
+//!   保留 `company_router()` / `quote_router()` / `shipment_router()` /
+//!   `queue_router()`。
+//!
+//! 2026-10-09 公司 / 报价两域收敛（端点 **22 → 19**）：
+//! - `POST /outsource-companies/{id}/processes` **硬切删除**（无 alias），工序能力清单
+//!   的整体替换吸收进 `POST /{id}/update` 的 `process_ids`（三态：`None` 不动 /
+//!   `Some([])` 清空 / `Some([..])` 替换）。service 侧加了「目标集合 == 当前集合就跳过
+//!   重写」的守卫，否则「改个电话号码」也会 churn 整张 `t_outsource_company_process`。
+//! - `GET /outsource-quotes/{id}` 与 `POST /outsource-quotes/{id}/update` **硬切删除**
+//!   （无 alias，前端零消费），`OutsourceQuoteUpdateRequest` / repo 的 `quote_update`
+//!   一并删除。
+//! - 三条写端点补**必填 body `version`**：公司 `soft-delete`、报价 `submit` 与
+//!   `soft-delete` —— 此前都是 service 内部自读 version，等于用自己读到的值守自己的
+//!   乐观锁，`UPDATE … WHERE version = <刚读的>` 恒成立、守卫形同虚设。公司
+//!   `soft-delete` 的守卫顺序同步调整为**先 OCC（40901）后工序映射（21205）**。
+//! - 两个列表端点的 `keyword` 拆成 `drawing_no` / `name` 直连 ILIKE（并新增
+//!   `customer_id` / `process_id` / `is_billed` / `is_urgent` 维度）。原来的
+//!   `part_keyword_search` 预搜索带 `LIMIT 10000` 且无 `ORDER BY` ⇒ 触顶时静默返回
+//!   非确定性子集，还要靠 service 层一个易漏的「零命中早返回」兜底 —— 三样一起消失。
+//! - **补上报价一览的 `statuses` 筛选接线**（🔴 本轮最重要的修复）：SQL 与 repo 两层
+//!   早就支持，DTO 少字段 + service 恒传 `&[]`，前端发的 `statuses[]=…` 被 serde
+//!   忽略 ⇒ 状态筛选恒不生效，连角色默认筛选（MANAGER→`SUBMITTED` / CLERK→`DRAFT`）
+//!   也没生效。本轮只补 DTO 与 service 接线，SQL / repo 零改动。
+//! - VO 瘦身：`OutsourceCompanyOut` / `OutsourceCompanyWithProcessesOut` 各删两个时间
+//!   字段；`OutsourceCompanyProcessLinkOut` 删 `category` / `sort_order`；
+//!   `by-process` 换窄 VO `OutsourceCompanyOptionOut { id, name }`；`OutsourceSentPartOut`
+//!   删 `quote_id` / `part_id`，信封加 `outsource_company_id` / `outsource_company_name`。
+//! - `POST /outsource-companies` 出参 → `R<()>`（前端建完一律重拉列表）。
 
+pub mod board;
 pub mod dto;
 pub mod handler;
 pub mod model;
@@ -64,19 +123,11 @@ pub fn shipment_router() -> Router<Arc<AppState>> {
     handler::shipment_router()
 }
 
-/// 可发送外协一览路由（挂载点 `/outsource-sendable`）。
+/// 外协看板路由（挂载点 `/outsource-queue`，见 `modules::v2_router`）。
 ///
-/// 2026-10-03 新增。独立顶层前缀：可发送判定横跨 company / quote / batch 三域，
-/// 不属于任何单一域的子资源。
-pub fn sendable_router() -> Router<Arc<AppState>> {
-    handler::sendable_router()
-}
-
-/// 外协看板路由（挂载点 `/outsource-pool`）。
-///
-/// 2026-10-03 新增。第 5 个独立顶层前缀，形态照抄 `prod::pool`；既有
-/// `/outsource-sendable` / `/outsource-shipments/in-flight` 都**不接受
-/// `process_id` 且分页**，无法支撑按工序切 tab，故另起前缀而不是扩它们。
-pub fn pool_router() -> Router<Arc<AppState>> {
-    handler::pool_router()
+/// 旧挂载点 `/outsource-pool`（形态与「可发送一览」的前缀一同下线）。改名的理由与
+/// `prod::worker_pool → prod::queue` 同源：`pool` 只覆盖了「候选池」一块，而本
+/// router 返回的是「候选 + 公司列 + 在途批次」的整块看板 + 三合一移动写端点。
+pub fn queue_router() -> Router<Arc<AppState>> {
+    handler::queue_router()
 }

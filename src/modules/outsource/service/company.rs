@@ -5,9 +5,9 @@
 //! - get_company          — 详情（含工序映射）
 //! - list_companies_for_process — 按工序反查 active 公司
 //! - create_company       — 创建（可选一并写入工序能力清单）
-//! - update_company       — 部分字段更新（OCC）
-//! - soft_delete_company  — 软删（仍映射工序时 409）
-//! - set_company_processes — 整体替换工序映射
+//! - update_company       — 部分字段更新 + 工序映射整体替换（OCC；2026-10-09 吸收
+//!   原独立的 `POST /{id}/processes`）
+//! - soft_delete_company  — 软删（OCC 先守，再查仍映射工序）
 //!
 //! ## 事务边界（2026-09-22 refactor 对齐 iam 范本）
 //! 事务移交 handler：service 仅业务逻辑，所有跨 repo 操作经 `repo: R`
@@ -23,16 +23,16 @@ use std::collections::{HashMap, HashSet};
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::modules::outsource::dto::{
-    OutsourceCompanyCreateRequest, OutsourceCompanyListQuery, OutsourceCompanyUpdateRequest,
-    SetOutsourceCompanyProcessRequest,
+    OutsourceCompanyCreateRequest, OutsourceCompanyListQuery, OutsourceCompanySoftDeleteRequest,
+    OutsourceCompanyUpdateRequest,
 };
 use crate::modules::outsource::model::{
     NewOutsourceCompany, NewOutsourceCompanyProcess, TOutsourceCompany,
 };
 use crate::modules::outsource::repo::OutsourceRepoTrait;
 use crate::modules::outsource::vo::{
-    OutsourceCompanyListOut, OutsourceCompanyOut, OutsourceCompanyProcessLinkOut,
-    OutsourceCompanyWithProcessesOut,
+    OutsourceCompanyListOut, OutsourceCompanyOptionOut, OutsourceCompanyOut,
+    OutsourceCompanyProcessLinkOut, OutsourceCompanyWithProcessesOut,
 };
 use crate::shared::error::{AppError, code};
 
@@ -50,8 +50,6 @@ fn company_out(c: TOutsourceCompany) -> OutsourceCompanyOut {
         address: c.address,
         is_active: c.is_active,
         version: c.version,
-        created_at: c.created_at,
-        updated_at: c.updated_at,
     }
 }
 
@@ -62,26 +60,28 @@ async fn build_with_processes<R: OutsourceRepoTrait>(
 ) -> Result<OutsourceCompanyWithProcessesOut, AppError> {
     let junctions = repo.junction_list_by_company(company.id, false).await?;
     let process_ids: Vec<i64> = junctions.iter().map(|j| j.process_id).collect();
-    let mut process_map: HashMap<i64, (String, String, String)> = HashMap::new();
+    let mut process_map: HashMap<i64, (String, String)> = HashMap::new();
     if !process_ids.is_empty() {
-        let rows = repo.process_map_full(&process_ids).await?;
+        // 2026-10-09：原先走 `process_map_full`（`(id, code, name, category)` 四元组，
+        // 那多出来的 `category` 只喂给已删除的 `OutsourceCompanyProcessLinkOut::category`
+        // —— 前端勾选框的候选集来自独立的 `listProcesses?category=OUTSOURCE` 端点）。
+        // 删掉该字段后本查询与 `process_map_short` 逐字同形，两个方法合并成后者。
+        let rows = repo.process_map_short(&process_ids).await?;
         for r in rows {
-            process_map.insert(r.0, (r.1, r.2, r.3));
+            process_map.insert(r.0, (r.1, r.2));
         }
     }
     let processes = junctions
         .into_iter()
         .map(|j| {
-            let (code, name, category) = process_map
+            let (code, name) = process_map
                 .get(&j.process_id)
                 .cloned()
-                .unwrap_or_else(|| (String::new(), String::new(), "OUTSOURCE".to_string()));
+                .unwrap_or_else(|| (String::new(), String::new()));
             OutsourceCompanyProcessLinkOut {
                 process_id: j.process_id,
                 process_code: code,
                 process_name: name,
-                category,
-                sort_order: j.sort_order,
             }
         })
         .collect();
@@ -93,8 +93,6 @@ async fn build_with_processes<R: OutsourceRepoTrait>(
         address: company.address,
         is_active: company.is_active,
         version: company.version,
-        created_at: company.created_at,
-        updated_at: company.updated_at,
         processes,
     })
 }
@@ -114,18 +112,23 @@ fn parse_process_ids(raw: &[String]) -> Result<Vec<i64>, AppError> {
     Ok(out)
 }
 
+/// 去重并保序（首次出现的位置决定顺序）。
+///
+/// 工序映射的**有序**语义有两处依赖它：`replace_processes` 用下标当 `sort_order`，
+/// `update_company` 的 diff 守卫拿它与 DB 当前有序集合比对。抽成共享 helper 是因为
+/// 「重复项在前还是在后」若在两处各写一遍，两份实现一旦漂移，diff 守卫会把
+/// 「仅顺序不同」误判成「有变化」而无脑重写。
+fn dedup_keep_order(ids: &[i64]) -> Vec<i64> {
+    let mut seen = HashSet::new();
+    ids.iter().copied().filter(|p| seen.insert(*p)).collect()
+}
+
 /// 校验给定的 process_ids 全是 OUTSOURCE 类别 + 存在。
 async fn validate_processes_outsource<R: OutsourceRepoTrait>(
     repo: &mut R,
     process_ids: &[i64],
 ) -> Result<(), AppError> {
-    // 去重保序
-    let mut seen = HashSet::new();
-    let ordered: Vec<i64> = process_ids
-        .iter()
-        .copied()
-        .filter(|p| seen.insert(*p))
-        .collect();
+    let ordered = dedup_keep_order(process_ids);
     if ordered.is_empty() {
         return Ok(());
     }
@@ -158,6 +161,9 @@ async fn validate_processes_outsource<R: OutsourceRepoTrait>(
 
 /// 整体替换工序映射：先软删所有 junction，再按顺序 insert 新集合。
 ///
+/// ⚠️ **调用方必须先做 diff 判断**（见 `update_company`）：本函数是「软删全部 +
+/// 逐条重建」，无条件执行会把整张 `t_outsource_company_process` churn 一遍。
+///
 /// snowflake id 通过 `service.snowflake` 生成（而非借 trait 注入），与 iam 范本同形：
 /// `service` 持有 `Arc<SnowflakeIdGenerator>` 字段，helper 借用 `&OutsourceService` 取 id。
 async fn replace_processes<R: OutsourceRepoTrait>(
@@ -167,12 +173,7 @@ async fn replace_processes<R: OutsourceRepoTrait>(
     process_ids: &[i64],
     updated_by: i64,
 ) -> Result<(), AppError> {
-    let mut seen = HashSet::new();
-    let ordered: Vec<i64> = process_ids
-        .iter()
-        .copied()
-        .filter(|p| seen.insert(*p))
-        .collect();
+    let ordered = dedup_keep_order(process_ids);
     let _ = repo
         .junction_soft_delete_by_company(company_id, updated_by)
         .await?;
@@ -242,12 +243,15 @@ impl OutsourceService {
         build_with_processes(&mut repo, company).await
     }
 
+    /// `GET /outsource-companies/by-process/{process_id}` —— 出参是窄 VO
+    /// `OutsourceCompanyOptionOut`（只 `id` + `name`），前端工序对话框的公司多选
+    /// 只 map 这两个字段。
     pub async fn list_companies_for_process<R: OutsourceRepoTrait>(
         &self,
         mut repo: R,
         process_id: i64,
         current: &CurrentUser,
-    ) -> Result<Vec<OutsourceCompanyOut>, AppError> {
+    ) -> Result<Vec<OutsourceCompanyOptionOut>, AppError> {
         current.require_any_role(&[
             Role::Manager,
             Role::Clerk,
@@ -264,7 +268,10 @@ impl OutsourceService {
         Ok(companies
             .into_iter()
             .filter(|c| c.is_active)
-            .map(company_out)
+            .map(|c| OutsourceCompanyOptionOut {
+                id: c.id,
+                name: c.name,
+            })
             .collect())
     }
 
@@ -272,12 +279,16 @@ impl OutsourceService {
     // Company — 写
     // =======================================================================
 
+    /// 出参是 `()`：**建号端点的调用方一个字段都不用**（前端建完一律重拉列表，
+    /// id 从 `GET /outsource-companies?name_like=…` 的首行取），返整份
+    /// `OutsourceCompanyWithProcessesOut` 只会白付「工序映射 + 工序元数据」两次
+    /// 往返 —— 那两次查询连一次都省不掉才是问题所在。
     pub async fn create_company<R: OutsourceRepoTrait>(
         &self,
         mut repo: R,
         req: &OutsourceCompanyCreateRequest,
         current: &CurrentUser,
-    ) -> Result<OutsourceCompanyWithProcessesOut, AppError> {
+    ) -> Result<(), AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
         let name = req.name.trim();
         if name.is_empty() {
@@ -335,7 +346,7 @@ impl OutsourceService {
             replace_processes(self, &mut repo, company.id, &int_ids, current.id).await?;
         }
 
-        build_with_processes(&mut repo, company).await
+        Ok(())
     }
 
     pub async fn update_company<R: OutsourceRepoTrait>(
@@ -407,6 +418,28 @@ impl OutsourceService {
         if n == 0 {
             return Err(version_conflict());
         }
+        // 2026-10-09：工序映射整体替换吸收进本端点（原 `POST /{id}/processes`
+        // 硬切下线）。放在 `company_update` **之后**，让映射的校验错误
+        // （工序不存在 / 非 OUTSOURCE 类别）不至于先把公司行改掉 —— handler 的
+        // `pool.begin()` 包住两步，任一步失败整体回滚。
+        if let Some(ref raw_ids) = req.process_ids {
+            let int_ids = parse_process_ids(raw_ids)?;
+            validate_processes_outsource(&mut repo, &int_ids).await?;
+            // diff 守卫：目标有序集合与当前**完全一致**时跳过重写。吸收后每次保存
+            // 都会走到这里，而 `replace_processes` 是「软删全部 + 逐条重建」——
+            // 无脑重写会把 `t_outsource_company_process` 整张表 churn 一遍（换一批
+            // 雪花 id、`sort_order` 重排），而内容一字未变。
+            let current_ordered: Vec<i64> = repo
+                .junction_list_by_company(id, false)
+                .await?
+                .into_iter()
+                .map(|j| j.process_id)
+                .collect();
+            let target_ordered = dedup_keep_order(&int_ids);
+            if target_ordered != current_ordered {
+                replace_processes(self, &mut repo, id, &int_ids, current.id).await?;
+            }
+        }
         let fresh = repo
             .company_get_by_id(id, false)
             .await?
@@ -418,6 +451,7 @@ impl OutsourceService {
         &self,
         mut repo: R,
         id: i64,
+        req: &OutsourceCompanySoftDeleteRequest,
         current: &CurrentUser,
     ) -> Result<(), AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
@@ -425,46 +459,31 @@ impl OutsourceService {
             .company_get_by_id(id, false)
             .await?
             .ok_or_else(|| not_found_company(id))?;
+        // ⚠️ 守卫顺序：**先 version，后工序映射**（2026-10-09 调整）。
+        // version 过期意味着整个对话框看到的公司状态已失效（可能是别人刚改的联系人 /
+        // 启停用 / 工序），此时报「仍映射 N 项工序，请先清空」会把用户引向错误的排查
+        // 方向 —— 他会去清工序，而真正的原因是数据已被他人改动。
+        if company.version != req.version {
+            return Err(version_conflict());
+        }
         let junctions = repo.junction_list_by_company(id, false).await?;
         if !junctions.is_empty() {
             return Err(AppError::biz(
                 code::BIZ_OUTSOURCE_COMPANY_IN_USE,
                 format!(
-                    "外协公司「{name}」仍映射 {n} 项工序，请先在「维护工序」中清空",
+                    "外协公司「{name}」仍映射 {n} 项工序，请先在编辑对话框里清空工序勾选",
                     name = company.name,
                     n = junctions.len()
                 ),
             ));
         }
         let n = repo
-            .company_soft_delete(id, company.version, current.id)
+            .company_soft_delete(id, req.version, current.id)
             .await?;
         if n == 0 {
             return Err(version_conflict());
         }
         Ok(())
-    }
-
-    pub async fn set_company_processes<R: OutsourceRepoTrait>(
-        &self,
-        mut repo: R,
-        id: i64,
-        req: &SetOutsourceCompanyProcessRequest,
-        current: &CurrentUser,
-    ) -> Result<OutsourceCompanyWithProcessesOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk])?;
-        let company = repo
-            .company_get_by_id(id, false)
-            .await?
-            .ok_or_else(|| not_found_company(id))?;
-        let int_ids = parse_process_ids(&req.process_ids)?;
-        validate_processes_outsource(&mut repo, &int_ids).await?;
-        replace_processes(self, &mut repo, id, &int_ids, current.id).await?;
-        let fresh = repo
-            .company_get_by_id(id, false)
-            .await?
-            .ok_or_else(|| not_found_company(id))?;
-        build_with_processes(&mut repo, fresh).await
     }
 }
 

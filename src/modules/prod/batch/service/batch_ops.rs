@@ -1,6 +1,6 @@
 //! prod::batch 的批次结构操作：拆批 / 取消批次
 //!
-//! - `POST /api/v2/prod/batches/{batch_id}/split`
+//! - `POST /api/v2/batches/split`
 //! - `POST /api/v2/prod/batches/{batch_id}/cancel`
 //!
 //! ## 批次守恒不变量
@@ -14,39 +14,55 @@ use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
-use crate::modules::prod::batch::dto::{CancelBatchRequest, SplitBatchRequest};
+use crate::modules::prod::batch::dto::{CancelBatchRequest, SplitBatchByBodyRequest};
 use crate::modules::prod::batch::repo::PartBatchRepo;
 use crate::shared::error::{AppError, code};
 
 use super::BatchService;
 use crate::shared::batch::guards::{mark_batch_status_only, validate_batch_version};
 
+/// `split_batch` 的返回形状（handler 据此组装 [`crate::modules::prod::batch::vo::BatchSplitOut`]）。
+///
+/// 2026-10-09 新增：拆批端点由「返新批次裸 i64」改为 5 字段 VO，本结构把
+/// handler 需要的三项（`new_batch_id` / `part_id` / `source_version`）与
+/// 拆走量一起带出，避免 handler 再回查一次批次。
+#[derive(Debug, Clone, Copy)]
+pub struct SplitBatchOutcome {
+    /// 拆出来的新批次 id（雪花）。
+    pub new_batch_id: i64,
+    /// 源批次的 part id（由批次行反查；旧路径参数时代那个值已不存在）。
+    pub part_id: i64,
+    /// 实际拆走的数量。
+    pub quantity: i32,
+    /// 源批次写入后的 version（= 请求的 `version + 1`），供前端续做 OCC。
+    pub source_version: i32,
+}
+
 impl BatchService {
     // ===== 1.5 批次拆分 / 取消 =====
 
-    /// `POST /api/v2/prod/batches/{batch_id}/split`：拆出部分量为新批次。
+    /// `POST /api/v2/batches/split`：拆出部分量为新批次。
     ///
     /// 不变量 `Σ(未删批次.quantity) = t_part.quantity` 由
     /// `PartBatchRepo::split_batch` 强制（同一事务内连发 max+1 / INSERT / UPDATE 三条 SQL，
-    /// OCC 守源批次）。`quantity` ∈ [1, source.quantity - 1]（split_batch 内部守）。
+    /// OCC 守源批次）。`quantity` ∈ [1, source.quantity - 1]（本函数内部守）。
     ///
-    /// 返回 `(new_batch_id, part_id)`：2026-10-02 起 part_id 由批次行反查，handler
-    /// 需要它填 WS `PART_BATCH_SPLIT` payload（原 payload 的 `part_id` 取自 URL 的
-    /// `part_id` 路径参数，那个值已不存在）。
+    /// 2026-10-09：端点由 `POST /api/v2/prod/batches/{batch_id}/split` 提升为
+    /// 顶层共用端点 `POST /api/v2/batches/split`（三个消费方：生产队列看板 /
+    /// 外协看板 / 零件详情页），故 `batch_id` 改从入参 DTO 取、不再走路径参数。
+    /// 守卫链、OCC、数量守卫与 WS payload 一律不变。
     pub async fn split_batch<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
-        batch_id: i64,
-        req: SplitBatchRequest,
+        req: SplitBatchByBodyRequest,
         current: &CurrentUser,
-    ) -> Result<(i64, i64), AppError> {
+    ) -> Result<SplitBatchOutcome, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
         let batch = repo
-            .find_batch_by_id(batch_id)
+            .find_batch_by_id(req.batch_id)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_BATCH_NOT_FOUND, "batch 不存在"))?;
-        // 2026-10-02：batch_id 来自 URL 路径参数（`POST /prod/batches/{batch_id}/…`），
-        // part_id 由批次行反查。
+        // 2026-10-02：part_id 由批次行反查（旧路径参数时代 URL 带的是 batch_id）。
         let part_id = batch.part_id;
         let part = repo
             .get_part_inspected(part_id)
@@ -114,7 +130,14 @@ impl BatchService {
             created_by: Some(current.id),
         })
         .await?;
-        Ok((new_id, part_id))
+        Ok(SplitBatchOutcome {
+            new_batch_id: new_id,
+            part_id,
+            quantity: qty,
+            // OCC 守的是 `t_part_batch.version`：UPDATE 恒 `version = version + 1`，
+            // 守卫已确保 `req.version` 等于读到的当前值，故写入后必为 `req.version + 1`。
+            source_version: req.version + 1,
+        })
     }
 
     /// `POST /prod/batches/{batch_id}/cancel`：批次级取消。

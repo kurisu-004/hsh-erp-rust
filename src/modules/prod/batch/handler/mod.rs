@@ -9,8 +9,17 @@
 //!   流转 + 扫码快捷入口（`scan-inspect` / `scan/deliver` / `worker-scan`）+ 集合读
 //!   （`repair` / `repairing`）
 //! - `lifecycle.rs` —— 终态 + 状态机扩展（`deliver` / `complete` / `start-repair` /
-//!   `place-on-shelf` / `release-from-programming` / outsource 三端点
-//!   / `complete-repair` / `repair-dispatch` / `split` / `cancel` / `pick-up`）
+//!   `place-on-shelf` / `release-from-programming` / `complete-repair` /
+//!   `repair-dispatch` / `cancel` / `pick-up` / 拆批）
+//!
+//! 2026-10-09：外协三个端点（`send-to-outsource` / `receive-from-outsource` /
+//! `receive-from-outsource-to-inspection`）剥离到 `outsource::queue`，合并为
+//! `POST /api/v2/outsource-queue/move`（三合一，硬切无 alias）。
+//!
+//! 2026-10-09：拆批由 `POST /api/v2/prod/batches/{batch_id}/split` 提升为**顶层共用
+//! 端点** `POST /api/v2/batches/split`（见本文件的 [`split_router`]）：它有三个前端
+//! 消费方（生产队列看板 / 外协看板 / 零件详情页），旧路径已下线、**无 alias**。
+//! 因此 `ROUTES` 只描述 [`router()`]，不含 `split_router()` 的那一条。
 //!
 //! ## 事务边界
 //! 统一在 handler：`state.pool.begin()` → 传 `&mut tx` 给 service → 显式
@@ -38,8 +47,7 @@ pub use transition::{
 // ----- lifecycle.rs -----
 pub use lifecycle::{
     cancel_batch, complete, complete_repair, deliver, pick_up, place_on_shelf,
-    receive_from_outsource, receive_from_outsource_to_inspection, release_from_programming,
-    repair_dispatch, send_to_outsource, split_batch, start_repair,
+    release_from_programming, repair_dispatch, split_batch_by_body, start_repair,
 };
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -64,7 +72,7 @@ pub fn router() -> Router<Arc<AppState>> {
         // ====================================================================
         .route("/scan/deliver", post(transition::scan_deliver_part))
         // ====================================================================
-        // ③ 2 段、首段动态 `/{batch_id}` —— 子资源 16 条
+        // ③ 2 段、首段动态 `/{batch_id}` —— 子资源 13 条
         //
         // ⚠️ `/{batch_id}/…` 与上面的 `/scan/deliver` **段数相同**，靠 matchit 的
         // 静态段优先规则消解（静态注册在前即可，实测 `POST /prod/batches/scan/deliver`
@@ -93,19 +101,6 @@ pub fn router() -> Router<Arc<AppState>> {
             "/{batch_id}/release-from-programming",
             post(lifecycle::release_from_programming),
         )
-        // ---- 外协 ----
-        .route(
-            "/{batch_id}/send-to-outsource",
-            post(lifecycle::send_to_outsource),
-        )
-        .route(
-            "/{batch_id}/receive-from-outsource",
-            post(lifecycle::receive_from_outsource),
-        )
-        .route(
-            "/{batch_id}/receive-from-outsource-to-inspection",
-            post(lifecycle::receive_from_outsource_to_inspection),
-        )
         // ---- 返修 ----
         .route(
             "/{batch_id}/complete-repair",
@@ -116,9 +111,21 @@ pub fn router() -> Router<Arc<AppState>> {
             post(lifecycle::repair_dispatch),
         )
         // ---- 批次操作 ----
-        .route("/{batch_id}/split", post(lifecycle::split_batch))
         .route("/{batch_id}/cancel", post(lifecycle::cancel_batch))
         .route("/{batch_id}/pick-up", post(lifecycle::pick_up))
+}
+
+/// 批次拆分（挂载点 `/api/v2/batches`，**顶层**而非本域 nest）。
+/// `batch_id` 入 body 而非路径 —— 与 `prod::queue` 的 recall 硬切同款。
+///
+/// 2026-10-09：拆批由 `POST /api/v2/prod/batches/{batch_id}/split` 提升而来。
+/// 它有**三个前端消费方**（生产队列看板 / 外协看板 / 零件详情页），挂在
+/// `/prod/batches/{batch_id}/…` 这条「批次子资源」路径下既不贴切、也拿不掉
+/// 路径参数（顶层前缀下 `/{id}/…` 与别的 `/batches/*` 端点会争 matchit 段位）。
+/// 故本域有两处挂载：本 `router()`（`/api/v2/prod/batches/*` 域内）与
+/// `prod::split_router()` → `/api/v2/batches/*`（本条，全模块共用）。
+pub fn split_router() -> Router<Arc<AppState>> {
+    Router::new().route("/split", post(lifecycle::split_batch_by_body))
 }
 
 // ============================================================================
@@ -161,12 +168,8 @@ pub const ROUTES: &[&str] = &[
     "POST /{batch_id}/start-repair",
     "POST /{batch_id}/place-on-shelf",
     "POST /{batch_id}/release-from-programming",
-    "POST /{batch_id}/send-to-outsource",
-    "POST /{batch_id}/receive-from-outsource",
-    "POST /{batch_id}/receive-from-outsource-to-inspection",
     "POST /{batch_id}/complete-repair",
     "POST /{batch_id}/repair-dispatch",
-    "POST /{batch_id}/split",
     "POST /{batch_id}/cancel",
     "POST /{batch_id}/pick-up",
 ];
@@ -194,12 +197,8 @@ pub const STRIP_TARGETS: &[&str] = &[
     "views/repair/",
     "待定（消费方是零件列表页，非队列页）",
     "views/cnc/",
-    "views/outsource/",
-    "views/outsource/",
-    "views/outsource/",
     "views/repair/",
     "views/repair/",
-    "views/parts/detail/",
     "views/parts/detail/",
     "views/scan/（扫码台）",
 ];
@@ -219,6 +218,22 @@ pub const STRIPPED: &[(&str, &str)] = &[
     (
         "POST /{batch_id}/recall-to-pending",
         "prod::queue（2026-10-08 剥离，新路径 POST /prod/queue/recall，batch_id 入 body）",
+    ),
+    (
+        "POST /{batch_id}/send-to-outsource",
+        "outsource::queue（2026-10-09 剥离，三合一为 POST /outsource-queue/move）",
+    ),
+    (
+        "POST /{batch_id}/receive-from-outsource",
+        "outsource::queue（2026-10-09 剥离，三合一为 POST /outsource-queue/move）",
+    ),
+    (
+        "POST /{batch_id}/receive-from-outsource-to-inspection",
+        "outsource::queue（2026-10-09 剥离，三合一为 POST /outsource-queue/move）",
+    ),
+    (
+        "POST /{batch_id}/split",
+        "prod（2026-10-09 提升为共用顶层端点 POST /batches/split，batch_id 入 body）",
     ),
 ];
 

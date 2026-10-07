@@ -30,6 +30,9 @@
 //!      → 20501 / 已停用 → 20512 / 是品检架 → 20104，且批次不被写脏）
 //!  19. move_worker_to_pool_validates_shelf_when_batch_has_no_process
 //!      （同上，但 `current_process_id=NULL` ⇒ 收紧前一条货架校验都不跑的那条分支）
+//!  20. move_{pool_to_worker|worker_to_pool|worker_to_worker}_stale_version_returns_40901
+//!      （2026-10-09 OCC：move 的 `version` 改为客户端必填，三个方向各一条，
+//!      钉住「过期的看板快照真的会被挡住、批次不被写脏」）
 //!
 //! ## 串行化
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
@@ -1405,6 +1408,8 @@ async fn move_worker_to_pool_returns_batch_to_pool() {
             "/prod/queue/move",
             Some(json!({
                 "batch_id": held_batch.to_string(),
+                // 2026-10-09：move 的 OCC 锚必填；两个 fixture helper 建批时 version 写死 0
+                "version": 0,
                 "from": { "kind": "WORKER", "worker_id": worker.to_string() },
                 "to":   { "kind": "POOL",   "shelf_id": prod_shelf.to_string() },
                 "note": "退换料"
@@ -1478,6 +1483,8 @@ async fn move_pool_to_worker_assigns_batch() {
             "/prod/queue/move",
             Some(json!({
                 "batch_id": pool_batch.to_string(),
+                // 2026-10-09：move 的 OCC 锚必填；fixture 建批时 version 写死 0
+                "version": 0,
                 "from": { "kind": "POOL",   "shelf_id": prod_shelf.to_string() },
                 "to":   { "kind": "WORKER", "worker_id": worker.to_string() },
             })),
@@ -1531,6 +1538,8 @@ async fn move_worker_to_worker_transfers_batch() {
             "/prod/queue/move",
             Some(json!({
                 "batch_id": held_batch.to_string(),
+                // 2026-10-09：move 的 OCC 锚必填；两个 fixture helper 建批时 version 写死 0
+                "version": 0,
                 "from": { "kind": "WORKER", "worker_id": worker_src.to_string() },
                 "to":   { "kind": "WORKER", "worker_id": worker_dst.to_string() },
             })),
@@ -1572,6 +1581,8 @@ async fn move_from_mismatch_returns_location_mismatch_error() {
             "/prod/queue/move",
             Some(json!({
                 "batch_id": pool_batch.to_string(),
+                // 2026-10-09：move 的 OCC 锚必填；fixture 建批时 version 写死 0
+                "version": 0,
                 // from 谎报成 WORKER（实际在 POOL），期望 40904
                 "from": { "kind": "WORKER", "worker_id": "999999999" },
                 "to":   { "kind": "POOL",   "shelf_id": prod_shelf.to_string() },
@@ -1615,6 +1626,8 @@ async fn move_target_worker_capacity_exceeded() {
             "/prod/queue/move",
             Some(json!({
                 "batch_id": held_batch_src.to_string(),
+                // 2026-10-09：move 的 OCC 锚必填；fixture 建批时 version 写死 0
+                "version": 0,
                 "from": { "kind": "WORKER", "worker_id": worker_src.to_string() },
                 "to":   { "kind": "WORKER", "worker_id": worker_dst.to_string() },
             })),
@@ -1653,6 +1666,8 @@ async fn move_same_kind_rejected_with_validation_error() {
             "/prod/queue/move",
             Some(json!({
                 "batch_id": batch.to_string(),
+                // 2026-10-09：move 的 OCC 锚必填；fixture 建批时 version 写死 0
+                "version": 0,
                 "from": { "kind": "POOL", "shelf_id": prod_shelf.to_string() },
                 "to":   { "kind": "POOL", "shelf_id": prod_shelf.to_string() },
             })),
@@ -2307,6 +2322,8 @@ async fn move_worker_to_pool_rejects_unusable_shelf_in_all_three_shapes() {
                 "/prod/queue/move",
                 Some(json!({
                     "batch_id": held_batch.to_string(),
+                    // 2026-10-09：move 的 OCC 锚必填；fixture 建批时 version 写死 0
+                    "version": 0,
                     "from": { "kind": "WORKER", "worker_id": worker.to_string() },
                     "to":   { "kind": "POOL",   "shelf_id": bad_shelf.to_string() },
                 })),
@@ -2392,6 +2409,8 @@ async fn move_worker_to_pool_validates_shelf_when_batch_has_no_process() {
             "/prod/queue/move",
             Some(json!({
                 "batch_id": held_batch.to_string(),
+                // 2026-10-09：move 的 OCC 锚必填；两个 fixture helper 建批时 version 写死 0
+                "version": 0,
                 "from": { "kind": "WORKER", "worker_id": worker.to_string() },
                 "to":   { "kind": "POOL",   "shelf_id": bad_shelf.to_string() },
             })),
@@ -2420,5 +2439,156 @@ async fn move_worker_to_pool_validates_shelf_when_batch_has_no_process() {
         holder,
         Some(worker),
         "拒收后 current_holder_id 必须仍指向 worker（未被写脏）"
+    );
+}
+
+// ===========================================================================
+//  2026-10-09：`POST /prod/queue/move` 的 OCC 锚改为**客户端必填**
+// ===========================================================================
+//
+// `MoveRequest.version` 新增且无 `#[serde(default)]`：三个方向一律以它作
+// `expected_version`，0 行 → `40901 VERSION_CONFLICT`。
+//
+// 这三条用例钉住的是「客户端传值真的会挡住过期的看板快照」。先前三个方向用的
+// 都是「本次事务里刚读到的 `batch.version`」或「SQL 内 `pb.version =
+// candidate.version` 自比」，两者都恒真 —— 期间他人改过批次时，「用户看到 5 件 →
+// 实际移动 3 件」会静默成功。三个方向各一条：三条 SQL 各自独立改过 WHERE，
+// 少改一条就是这个用例红。
+
+/// POOL→WORKER：过期 `version` → 40901，批次**不得**被切到 worker。
+#[tokio::test]
+async fn move_pool_to_worker_stale_version_returns_40901() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "OCC-PW").await;
+    let proc = seed_process(&pool, "PROC-OCPW", "工序OCPW").await;
+    let wt = insert_work_type(&pool, "WT-OCPW", "工种OCPW", Some(3)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let prod_shelf = insert_shelf(&pool, "PROD-OCPW", "PROD-OCPW", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc).await;
+    let worker = insert_worker(&pool, "BC-OCPW", "工OCPW", Some(wt)).await;
+    let (_part, pool_batch) =
+        insert_pool_part(&pool, customer, "P-OCPW", prod_shelf, proc, 1).await;
+
+    let (app, token) = login_manager_with_username(&pool, "admin-occpw").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/queue/move",
+            Some(json!({
+                "batch_id": pool_batch.to_string(),
+                // fixture 建批 version=0，这里传 +9 ⇒ 过期
+                "version": 9,
+                "from": { "kind": "POOL",   "shelf_id": prod_shelf.to_string() },
+                "to":   { "kind": "WORKER", "worker_id": worker.to_string() },
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "过期 version 应 409: {env}");
+    assert_eq!(env["code"], 40901, "VERSION_CONFLICT: {env}");
+
+    // 批次不得被写脏：仍在货架上、holder 未变、version 未自增
+    let row: (String, Option<i64>, i32) = sqlx::query_as(
+        "SELECT location, current_holder_id, version FROM t_part_batch WHERE id = $1",
+    )
+    .bind(pool_batch)
+    .fetch_one(&pool)
+    .await
+    .expect("query batch");
+    assert_eq!(row.0, "PRODUCTION_SHELF", "拒收后 location 不应变");
+    assert_eq!(row.1, Some(prod_shelf), "拒收后 holder 不应被改写成 worker");
+    assert_eq!(row.2, 0, "拒收后 version 不应被自增");
+    assert_eq!(count_held_by_worker(&pool, worker).await, 0);
+}
+
+/// WORKER→POOL：过期 `version` → 40901，批次**不得**回到货架。
+#[tokio::test]
+async fn move_worker_to_pool_stale_version_returns_40901() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "OCC-WP").await;
+    let proc = seed_process(&pool, "PROC-OCWP", "工序OCWP").await;
+    let wt = insert_work_type(&pool, "WT-OCWP", "工种OCWP", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let prod_shelf = insert_shelf(&pool, "PROD-OCWP", "PROD-OCWP", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc).await;
+    let worker = insert_worker(&pool, "BC-OCWP", "工OCWP", Some(wt)).await;
+    let (_held_part, held_batch, _step) =
+        insert_worker_held_part(&pool, customer, "H-OCWP", worker, proc, 1, true).await;
+
+    let (app, token) = login_manager_with_username(&pool, "admin-occwp").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/queue/move",
+            Some(json!({
+                "batch_id": held_batch.to_string(),
+                "version": 9,
+                "from": { "kind": "WORKER", "worker_id": worker.to_string() },
+                "to":   { "kind": "POOL",   "shelf_id": prod_shelf.to_string() },
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "过期 version 应 409: {env}");
+    assert_eq!(env["code"], 40901, "VERSION_CONFLICT: {env}");
+
+    let (loc, holder): (String, Option<i64>) =
+        sqlx::query_as("SELECT location, current_holder_id FROM t_part_batch WHERE id = $1")
+            .bind(held_batch)
+            .fetch_one(&pool)
+            .await
+            .expect("query batch");
+    assert_eq!(loc, "WORKER", "拒收后批次应仍在 worker 手上");
+    assert_eq!(holder, Some(worker), "拒收后 holder 不应被改成货架");
+    assert_eq!(count_held_by_worker(&pool, worker).await, 1);
+}
+
+/// WORKER→WORKER：过期 `version` → 40901，批次**不得**易主。
+#[tokio::test]
+async fn move_worker_to_worker_stale_version_returns_40901() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "OCC-WW").await;
+    let proc = seed_process(&pool, "PROC-OCWW", "工序OCWW").await;
+    let wt = insert_work_type(&pool, "WT-OCWW", "工种OCWW", Some(3)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let prod_shelf = insert_shelf(&pool, "PROD-OCWW", "PROD-OCWW", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc).await;
+    let worker_src = insert_worker(&pool, "BC-OCWW1", "工OCWW1", Some(wt)).await;
+    let worker_dst = insert_worker(&pool, "BC-OCWW2", "工OCWW2", Some(wt)).await;
+    let (_held_part, held_batch, _step) =
+        insert_worker_held_part(&pool, customer, "H-OCWW", worker_src, proc, 1, true).await;
+
+    let (app, token) = login_manager_with_username(&pool, "admin-occww").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/queue/move",
+            Some(json!({
+                "batch_id": held_batch.to_string(),
+                "version": 9,
+                "from": { "kind": "WORKER", "worker_id": worker_src.to_string() },
+                "to":   { "kind": "WORKER", "worker_id": worker_dst.to_string() },
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "过期 version 应 409: {env}");
+    assert_eq!(env["code"], 40901, "VERSION_CONFLICT: {env}");
+
+    assert_eq!(
+        count_held_by_worker(&pool, worker_src).await,
+        1,
+        "源工人仍持有"
+    );
+    assert_eq!(
+        count_held_by_worker(&pool, worker_dst).await,
+        0,
+        "目标工人未拿到"
     );
 }

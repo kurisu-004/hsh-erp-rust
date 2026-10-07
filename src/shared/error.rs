@@ -322,7 +322,7 @@ pub mod code {
     // 2026-09-16 新增（FK 翻转 PR-1）：part.status 非 PENDING 时禁止制定/修改工艺链
     pub const BIZ_PROCESS_CHAIN_PART_NOT_PENDING: i32 = 20705;
     // 2026-09-16 新增（PR-3 批次 step 化）：批次进入生产流（place-on-shelf /
-    // release-from-programming / send-to-outsource）时 part 还未制定工艺链 → 拒
+    // release-from-programming / 外协收回时 part 还未制定工艺链 → 拒
     pub const BIZ_PROCESS_CHAIN_REQUIRED: i32 = 20706;
 
     // 2026-09-28 删除：216xx 相关会话域错误码（域整体下线，码段释放）。
