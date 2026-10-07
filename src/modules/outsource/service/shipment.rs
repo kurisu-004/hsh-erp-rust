@@ -332,17 +332,26 @@ impl OutsourceService {
 mod tests {
     //! 2026-09-22 refactor：原 `service.rs::mod tests` 5 helper 测试拆分；
     //! 本文件承接 shipment 子域用到的 1 个：`current_id_to_snowflake_unique`。
-    use crate::infra::snowflake::SnowflakeIdGenerator;
-
+    //!
+    //! 2026-10-09：generator 由本地 `SnowflakeIdGenerator::new(.., 1)` 改为
+    //! `crate::shared::test_snowflake::shared_test_snowflake()`（**lib 单测进程内唯一**
+    //! 的 generator 对象；为什么不用 test-support 的同名函数见该模块顶部 doc）。根因：
+    //! 位布局 `ts << 22 | instance << 12 | seq` 里 `last_ms` / `sequence` 是 generator
+    //! **对象私有**字段、`new()` 从 0 起步 ⇒ 两个 instance 相同、对象不同的 generator
+    //! 同毫秒各取 seq 0 会发出逐字节相同的 id（`t_*_pkey` 23505）。instance 这 10 bit
+    //! 现在只留给跨进程区分（1024 槽），进程内唯一性由共享对象串行发号保证。
+    //!
+    //! 共享对象不会削弱本用例的前提：它仍是「同一 generator 连续两次调用」，只是
+    //! `sequence` 由进程内已用过多少号决定，而非每次从 0 重新起步。
     use super::super::current_id_to_snowflake;
 
     #[test]
     fn current_id_to_snowflake_unique() {
         // 2026-09-14 Phase 3 follow-up：使用真实雪花 id 生成器。
         // 同一 generator 连续两次调用应产生不同的 id（雪花 id sequence 自增）。
-        let generator = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-        let a = current_id_to_snowflake(&generator);
-        let b = current_id_to_snowflake(&generator);
+        let generator = crate::shared::test_snowflake::shared_test_snowflake();
+        let a = current_id_to_snowflake(generator);
+        let b = current_id_to_snowflake(generator);
         assert_ne!(a, b, "雪花 id 应当单调递增");
     }
 }

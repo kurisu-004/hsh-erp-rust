@@ -490,17 +490,25 @@ pub async fn optional_step_id(
 mod tests {
     use super::*;
     use crate::infra::clock::now_naive;
-    use crate::infra::snowflake::SnowflakeIdGenerator;
     use crate::modules::part::statemachine::PartStatus;
+    // 2026-10-09：本模块测试 ID 一律从
+    // `crate::shared::test_snowflake::shared_test_snowflake()`（**lib 单测进程内唯一**
+    // 的 generator 对象）取号，不再就地 `SnowflakeIdGenerator::new`（为什么不用
+    // test-support 的同名函数见该模块顶部 doc）。原先 `insert_part` 用 instance=9、
+    // 两条用例各另起 instance=11 —— 但 instance 不同只是**位段**不同、并非充分保证：
+    // `last_ms` / `sequence` 是 generator **对象私有**字段，`new()` 从 0 起步，若两个
+    // generator 同 instance 且同毫秒各取 seq 0，会发出逐字节相同的 id ⇒ `t_*_pkey`
+    // 23505。instance 这 10 bit（1024 槽）现在只留给**跨进程**区分，进程内唯一性由
+    // 共享对象按调用顺序串行发号保证。
+    use crate::shared::test_snowflake::shared_test_snowflake;
     use hsh_erp_test_support::test_pool;
 
     /// 2026-10-03 新增：写一个 `t_part` 行（`process_chain_id` 留空由调用方决定）。
     ///
     /// `t_part.customer_id` 是 NOT NULL，故先造一个根 L1 客户（无 parent）。
     async fn insert_part(pool: &sqlx::PgPool, name: &str) -> i64 {
-        let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 9);
         let now = now_naive();
-        let customer_id = snowflake.next_id();
+        let customer_id = shared_test_snowflake().next_id();
         sqlx::query(
             "INSERT INTO t_customer (id, name, version, created_at, updated_at) \
              VALUES ($1, $2, 0, $3, $3)",
@@ -511,7 +519,7 @@ mod tests {
         .execute(pool)
         .await
         .expect("insert t_customer");
-        let id = snowflake.next_id();
+        let id = shared_test_snowflake().next_id();
         sqlx::query(
             "INSERT INTO t_part (id, name, drawing_no, applicant_name, quantity, unit_price, \
              total_price, request_date, planned_delivery_date, customer_id, status, version, \
@@ -544,8 +552,9 @@ mod tests {
         let pool = test_pool().await;
         let conn = &mut *pool.acquire().await.expect("acquire");
         let part_id = insert_part(&pool, "OPCH-SOME").await;
-        // 换 instance 取 id：同毫秒内重复 `SnowflakeIdGenerator::new(..)` 会撞 pkey
-        let chain_id = SnowflakeIdGenerator::new(1_577_836_800_000, 11).next_id();
+        // 2026-10-09：与 `insert_part` 共用同一个 generator 对象取号（原注释写的
+        // 「换 instance 取 id」只是权宜之计：同 instance + 同毫秒 + 同 seq 仍会撞 pkey）
+        let chain_id = shared_test_snowflake().next_id();
         sqlx::query(
             "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, \
              updated_at, updated_by) VALUES ($1, 'chain-opch', 0, now(), 0, now(), 0)",
@@ -584,7 +593,7 @@ mod tests {
         let pool = test_pool().await;
         let conn = &mut *pool.acquire().await.expect("acquire");
         let part_id = insert_part(&pool, "OPST").await;
-        let chain_id = SnowflakeIdGenerator::new(1_577_836_800_000, 11).next_id();
+        let chain_id = shared_test_snowflake().next_id();
         sqlx::query(
             "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, \
              updated_at, updated_by) VALUES ($1, 'chain-opst', 0, now(), 0, now(), 0)",

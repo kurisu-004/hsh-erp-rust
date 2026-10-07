@@ -982,16 +982,25 @@ mod tests {
     use super::*;
     use crate::auth::rbac::Role;
     use crate::infra::clock::now_naive;
+    // 2026-10-09：本模块所有测试 ID 一律从
+    // `crate::shared::test_snowflake::shared_test_snowflake()`（**lib 单测进程内唯一**
+    // 的 generator 对象）取号 —— 为什么不用 test-support 的同名函数，见该模块顶部
+    // doc（dev-dependency 环导致 lib 单测二进制里链进两份 `hsh_erp_rust`）。
+    //
+    // 原先这里自带一个 `pool_snowflake()`（`OnceLock<Mutex<SnowflakeIdGenerator>>` +
+    // 写死 `instance = 7`），它**不是**修复 23505 的正解，只是把撞号概率往后推：
+    // 7 个 test body 各自 `SnowflakeIdGenerator::new(1_577_836_800_000, 7)` 又另起一条
+    // id 流，而 `last_ms` / `sequence` 是 generator **对象私有**字段、`new()` 从 0 起步
+    // ⇒「本文件本地流」与「test body 私有流」同 instance、同毫秒各取 seq 0 时发出
+    // **逐字节相同**的 id。更早一版甚至同时存在这两条流（本地 `pool_snowflake()`
+    // 取的号被 `let _ = snowflake;` 丢弃、私有 generator 直接传给 `move_batch`）。
+    //
+    // 现在只有一条流：`shared_test_snowflake()` 返回进程内共享的
+    // `Arc<SnowflakeIdGenerator>`，`next_id()` 由对象内部 `Mutex` 串行发号 ⇒
+    // 进程内任何两个 helper / 用例取到的 id 必然不同，**不再依赖「某个用例恰好没写
+    // 某张表」这类偶然事实**。instance 这 10 bit 只留给跨进程区分（1024 槽）。
+    use crate::shared::test_snowflake::shared_test_snowflake;
     use hsh_erp_test_support::test_pool;
-
-    /// 进程级共享雪花 ID 生成器（与 tests/production/queue.rs 同源设计）。
-    /// 多个 in-source test 在同一毫秒内连发 helper，独立构造会拿到相同 id
-    /// （23505 pkey 冲突）。
-    fn pool_snowflake() -> &'static std::sync::Mutex<SnowflakeIdGenerator> {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<SnowflakeIdGenerator>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(SnowflakeIdGenerator::new(1_577_836_800_000, 7)))
-    }
 
     // ===== helper =====
 
@@ -1003,12 +1012,9 @@ mod tests {
     ) -> i64 {
         use crate::auth::password;
         let hash = password::hash(plain_password).expect("bcrypt");
-        // 一次性取两个 id 后立即 drop MutexGuard（避免跨 .await 持锁触发
-        // `clippy::await_holding_lock`）。
-        let (user_id, role_id) = {
-            let s = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
-            (s.next_id(), s.next_id())
-        };
+        // 2026-10-09：一次性取两个 id（共享 generator 内部串行发号，无需外部再加锁）。
+        let user_id = shared_test_snowflake().next_id();
+        let role_id = shared_test_snowflake().next_id();
         let now = now_naive();
         sqlx::query(
             "INSERT INTO t_user (id, username, password_hash, full_name, is_active, \
@@ -1039,10 +1045,7 @@ mod tests {
 
     /// 写一个 INHOUSE 工序。
     async fn insert_process(pool: &sqlx::PgPool, code: &str, name: &str) -> i64 {
-        let id = {
-            let s = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
-            s.next_id()
-        };
+        let id = shared_test_snowflake().next_id();
         let now = now_naive();
         sqlx::query(
             "INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, \
@@ -1066,10 +1069,7 @@ mod tests {
         name: &str,
         max_held: Option<i32>,
     ) -> i64 {
-        let id = {
-            let s = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
-            s.next_id()
-        };
+        let id = shared_test_snowflake().next_id();
         let now = now_naive();
         sqlx::query(
             "INSERT INTO t_work_type (id, code, name, sort_order, max_held_batches, version, \
@@ -1088,10 +1088,7 @@ mod tests {
     }
 
     async fn link_work_type_to_process(pool: &sqlx::PgPool, wt_id: i64, p_id: i64) {
-        let id = {
-            let s = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
-            s.next_id()
-        };
+        let id = shared_test_snowflake().next_id();
         let now = now_naive();
         sqlx::query(
             "INSERT INTO t_work_type_process (id, work_type_id, process_id, sort_order, version, \
@@ -1108,10 +1105,7 @@ mod tests {
 
     /// 写一个 PRODUCTION 货架。
     async fn insert_shelf(pool: &sqlx::PgPool, code: &str, zone: &str) -> i64 {
-        let id = {
-            let s = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
-            s.next_id()
-        };
+        let id = shared_test_snowflake().next_id();
         let now = now_naive();
         sqlx::query(
             "INSERT INTO t_shelf (id, code, name, zone, is_active, display_order, version, \
@@ -1129,10 +1123,7 @@ mod tests {
     }
 
     async fn link_shelf_to_process(pool: &sqlx::PgPool, shelf_id: i64, process_id: i64) {
-        let id = {
-            let s = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
-            s.next_id()
-        };
+        let id = shared_test_snowflake().next_id();
         let now = now_naive();
         sqlx::query(
             "INSERT INTO t_shelf_process (id, shelf_id, process_id, sort_order, version, \
@@ -1153,10 +1144,7 @@ mod tests {
         badge_code: &str,
         work_type_id: Option<i64>,
     ) -> i64 {
-        let id = {
-            let s = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
-            s.next_id()
-        };
+        let id = shared_test_snowflake().next_id();
         let now = now_naive();
         sqlx::query(
             "INSERT INTO t_worker (id, badge_code, name, is_active, work_type_id, version, \
@@ -1175,10 +1163,7 @@ mod tests {
 
     /// 写一个 L2 customer（parent_id NULL 表示 L1 叶子）。
     async fn insert_customer(pool: &sqlx::PgPool, name: &str) -> i64 {
-        let id = {
-            let s = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
-            s.next_id()
-        };
+        let id = shared_test_snowflake().next_id();
         let now = now_naive();
         sqlx::query(
             "INSERT INTO t_customer (id, name, version, created_at, updated_at) \
@@ -1205,11 +1190,11 @@ mod tests {
     ) -> (i64, i64) {
         let now = now_naive();
         let today = now.date();
-        // 一次性取 4 个 id（chain / step / part / batch），drop guard 后再 await。
-        let (chain_id, step_id, part_id, batch_id) = {
-            let s = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
-            (s.next_id(), s.next_id(), s.next_id(), s.next_id())
-        };
+        // 2026-10-09：一次性取 4 个 id（chain / step / part / batch），共享 generator 内部串行发号。
+        let chain_id = shared_test_snowflake().next_id();
+        let step_id = shared_test_snowflake().next_id();
+        let part_id = shared_test_snowflake().next_id();
+        let batch_id = shared_test_snowflake().next_id();
 
         sqlx::query(
             "INSERT INTO t_part_process_chain (id, version, created_at, created_by, updated_at, \
@@ -1276,10 +1261,10 @@ mod tests {
     ) -> (i64, i64) {
         let now = now_naive();
         let today = now.date();
-        let (chain_id, step_id, part_id, batch_id) = {
-            let s = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
-            (s.next_id(), s.next_id(), s.next_id(), s.next_id())
-        };
+        let chain_id = shared_test_snowflake().next_id();
+        let step_id = shared_test_snowflake().next_id();
+        let part_id = shared_test_snowflake().next_id();
+        let batch_id = shared_test_snowflake().next_id();
 
         sqlx::query(
             "INSERT INTO t_part_process_chain (id, version, created_at, created_by, updated_at, \
@@ -1363,12 +1348,6 @@ mod tests {
         let (_part, batch) = insert_pool_batch(&pool, customer, proc, prod_shelf).await;
 
         let mut conn = pool.acquire().await.unwrap();
-        let snowflake = pool_snowflake()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .next_id();
-        let snowflake_obj = SnowflakeIdGenerator::new(1_577_836_800_000, 7);
-        let _ = snowflake; // 占位避免 unused warning
         let req = MoveRequest {
             batch_id: batch,
             // 2026-10-09 新增 OCC 锚；上方两个 fixture helper 建批时 version 写死 0
@@ -1381,7 +1360,7 @@ mod tests {
         };
         let r = QueueService::move_batch(
             &mut conn,
-            &snowflake_obj,
+            shared_test_snowflake().as_ref(),
             req,
             &make_current(user_id, Role::Manager),
         )
@@ -1420,7 +1399,6 @@ mod tests {
         let (_part, batch) = insert_worker_held_batch(&pool, customer, proc, worker).await;
 
         let mut conn = pool.acquire().await.unwrap();
-        let snowflake_obj = SnowflakeIdGenerator::new(1_577_836_800_000, 7);
         let req = MoveRequest {
             batch_id: batch,
             // 2026-10-09 新增 OCC 锚；上方两个 fixture helper 建批时 version 写死 0
@@ -1433,7 +1411,7 @@ mod tests {
         };
         let r = QueueService::move_batch(
             &mut conn,
-            &snowflake_obj,
+            shared_test_snowflake().as_ref(),
             req,
             &make_current(user_id, Role::Manager),
         )
@@ -1471,7 +1449,6 @@ mod tests {
         let (_part, batch) = insert_worker_held_batch(&pool, customer, proc, worker_src).await;
 
         let mut conn = pool.acquire().await.unwrap();
-        let snowflake_obj = SnowflakeIdGenerator::new(1_577_836_800_000, 7);
         let req = MoveRequest {
             batch_id: batch,
             // 2026-10-09 新增 OCC 锚；上方两个 fixture helper 建批时 version 写死 0
@@ -1486,7 +1463,7 @@ mod tests {
         };
         let r = QueueService::move_batch(
             &mut conn,
-            &snowflake_obj,
+            shared_test_snowflake().as_ref(),
             req,
             &make_current(user_id, Role::Manager),
         )
@@ -1523,7 +1500,6 @@ mod tests {
         let (_part, batch) = insert_pool_batch(&pool, customer, proc, prod_shelf).await;
 
         let mut conn = pool.acquire().await.unwrap();
-        let snowflake_obj = SnowflakeIdGenerator::new(1_577_836_800_000, 7);
         let req = MoveRequest {
             batch_id: batch,
             // 2026-10-09 新增 OCC 锚；上方两个 fixture helper 建批时 version 写死 0
@@ -1539,7 +1515,7 @@ mod tests {
         };
         let err = QueueService::move_batch(
             &mut conn,
-            &snowflake_obj,
+            shared_test_snowflake().as_ref(),
             req,
             &make_current(user_id, Role::Manager),
         )
@@ -1570,7 +1546,6 @@ mod tests {
         let worker_dst = insert_worker(&pool, "BC-X-DST", Some(wt_dst)).await;
 
         let mut conn = pool.acquire().await.unwrap();
-        let snowflake_obj = SnowflakeIdGenerator::new(1_577_836_800_000, 7);
         let req = MoveRequest {
             batch_id: batch,
             // 2026-10-09 新增 OCC 锚；上方两个 fixture helper 建批时 version 写死 0
@@ -1585,7 +1560,7 @@ mod tests {
         };
         let err = QueueService::move_batch(
             &mut conn,
-            &snowflake_obj,
+            shared_test_snowflake().as_ref(),
             req,
             &make_current(user_id, Role::Manager),
         )
@@ -1617,7 +1592,6 @@ mod tests {
         let (_part, batch) = insert_worker_held_batch(&pool, customer, proc_p, worker).await;
 
         let mut conn = pool.acquire().await.unwrap();
-        let snowflake_obj = SnowflakeIdGenerator::new(1_577_836_800_000, 7);
         let req = MoveRequest {
             batch_id: batch,
             // 2026-10-09 新增 OCC 锚；上方两个 fixture helper 建批时 version 写死 0
@@ -1630,7 +1604,7 @@ mod tests {
         };
         let err = QueueService::move_batch(
             &mut conn,
-            &snowflake_obj,
+            shared_test_snowflake().as_ref(),
             req,
             &make_current(user_id, Role::Manager),
         )
@@ -1651,7 +1625,6 @@ mod tests {
         let (_part, batch) = insert_pool_batch(&pool, customer, proc, prod_shelf).await;
 
         let mut conn = pool.acquire().await.unwrap();
-        let snowflake_obj = SnowflakeIdGenerator::new(1_577_836_800_000, 7);
         let req = MoveRequest {
             batch_id: batch,
             // 2026-10-09 新增 OCC 锚；上方两个 fixture helper 建批时 version 写死 0
@@ -1666,7 +1639,7 @@ mod tests {
         };
         let err = QueueService::move_batch(
             &mut conn,
-            &snowflake_obj,
+            shared_test_snowflake().as_ref(),
             req,
             &make_current(user_id, Role::Manager),
         )

@@ -2,7 +2,8 @@
 //!
 //! 为 `account.rs`（27 用例）+ `session.rs`（13 用例）提供：
 //! - `MockIamRepoTrait` 注入（mockall 0.15 automock 自动生成于 `iam/repo/mod.rs`）
-//! - `test_snowflake()`：固定 `instance_id=1` 的雪花 ID 生成器
+//! - `test_snowflake()`：**lib 单测进程内唯一**的雪花 ID 生成器（2026-10-09 起
+//!   转发到 `crate::shared::test_snowflake::shared_test_snowflake()`）
 //! - `current_with_role(role)` / `current_manager()` / `current_worker()` / `current_inspector()`
 //! - `make_account_service()` / `make_session_service()`：service 实例工厂
 //! - `sample_user(...)` / `sample_user_role(...)`：mock 返回值构造
@@ -29,15 +30,23 @@ pub mod account;
 pub mod session;
 
 // ===========================================================================
-// 雪花 ID 生成器（固定 instance_id=1）
+// 雪花 ID 生成器（lib 单测进程内唯一，2026-10-09）
 // ===========================================================================
 
-/// 测试用雪花 ID 生成器（instance_id=1，与生产对齐 `RUST_SNOWFLAKE_INSTANCE=1`）。
+/// 测试用雪花 ID 生成器 —— **lib 单测进程内唯一的同一个 generator 对象**
+/// （`crate::shared::test_snowflake::shared_test_snowflake()`；为什么不用
+/// test-support 的同名函数见该模块顶部 doc）。
+///
+/// 2026-10-09 改造：本函数原先每次调用都 `SnowflakeIdGenerator::new(1_735_689_600_000, 1)`
+/// 现造一个**新对象**。位布局 `ts << 22 | instance << 12 | seq` 里 `last_ms` /
+/// `sequence` 是 generator **对象私有**字段、`new()` 从 0 起步 ⇒ 任意两个 instance
+/// 相同、对象不同的 generator 同毫秒各取 seq 0 会发出**逐字节相同**的 id，撞
+/// `t_*_pkey`（23505）。instance 这 10 bit（1024 槽）现在只留给**跨进程**区分；
+/// 进程内唯一性由共享对象按调用顺序串行发号保证。
+///
+/// 对 iam 单测无行为影响：本模块零 DB，任何 case 都不把生成的 id 落库或比对绝对值。
 pub fn test_snowflake() -> Arc<SnowflakeIdGenerator> {
-    Arc::new(SnowflakeIdGenerator::new(
-        1_735_689_600_000, // 2025-01-01 UTC
-        1,
-    ))
+    crate::shared::test_snowflake::shared_test_snowflake().clone()
 }
 
 // ===========================================================================

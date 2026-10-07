@@ -240,9 +240,17 @@ mod tests {
 
     use super::*;
     use crate::auth::rbac::{CurrentUser, Role};
-    use crate::infra::snowflake::SnowflakeIdGenerator;
     use crate::modules::part::model::TPartInspected;
     use crate::modules::part::repo::MockPartRepoTrait;
+    // 2026-10-09：测试用雪花生成器改为
+    // `crate::shared::test_snowflake::shared_test_snowflake()`（**lib 单测进程内唯一**
+    // 的 generator 对象），原先的本地 `test_snowflake()` 工厂
+    // （`SnowflakeIdGenerator::new(1_735_689_600_000, 1)`）已删除。根因：位布局
+    // `ts << 22 | instance << 12 | seq` 里 `last_ms` / `sequence` 是 generator
+    // **对象私有**字段、`new()` 从 0 起步 ⇒ 两个 instance 相同、对象不同的 generator
+    // 同毫秒各取 seq 0 会发出逐字节相同的 id（`t_*_pkey` 23505）。instance 这 10 bit
+    // 现在只留给跨进程区分（1024 槽），进程内唯一性由共享对象串行发号保证。
+    // 为什么不用 test-support 的同名函数见该模块顶部 doc。
 
     /// MANAGER 单角色测试用户（id=1）。
     fn current_manager() -> CurrentUser {
@@ -264,14 +272,6 @@ mod tests {
             shelf_ids: vec![],
             shelf_wildcard: false,
         }
-    }
-
-    /// 测试用雪花 ID 生成器（instance_id=1，与生产对齐）。
-    fn test_snowflake() -> std::sync::Arc<SnowflakeIdGenerator> {
-        std::sync::Arc::new(SnowflakeIdGenerator::new(
-            1_735_689_600_000, // 2025-01-01 UTC
-            1,
-        ))
     }
 
     /// 构造一个最小化的 `TPartInspected` 行（status 参数化）。
@@ -297,7 +297,7 @@ mod tests {
         // Arrange：Clerk 角色 → 期望 force_complete 直接返回 FORBIDDEN，
         // 不会触发任何 repo 方法。
         let mock = MockPartRepoTrait::new();
-        let snowflake = test_snowflake();
+        let snowflake = crate::shared::test_snowflake::shared_test_snowflake().clone();
 
         // Act
         let err = PartService::force_complete(
@@ -322,7 +322,7 @@ mod tests {
         mock.expect_get_part_inspected()
             .with(eq(42))
             .returning(|_| Ok(None));
-        let snowflake = test_snowflake();
+        let snowflake = crate::shared::test_snowflake::shared_test_snowflake().clone();
 
         // Act
         let err = PartService::force_complete(
@@ -347,7 +347,7 @@ mod tests {
         mock.expect_get_part_inspected()
             .with(eq(42))
             .returning(|id| Ok(Some(sample_part_inspected(id, "COMPLETED"))));
-        let snowflake = test_snowflake();
+        let snowflake = crate::shared::test_snowflake::shared_test_snowflake().clone();
 
         // Act
         let err = PartService::force_complete(

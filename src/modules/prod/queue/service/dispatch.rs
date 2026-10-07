@@ -412,6 +412,16 @@ mod tests {
     use crate::auth::rbac::Role;
     use crate::infra::clock::now_naive;
     use chrono::NaiveDate;
+    // 2026-10-09：本模块所有测试 ID 一律从
+    // `crate::shared::test_snowflake::shared_test_snowflake()`（**lib 单测进程内唯一**
+    // 的 generator 对象）取号 —— 为什么不用 test-support 的同名函数，见该模块顶部 doc
+    // （dev-dependency 环导致 lib 单测二进制里链进两份 `hsh_erp_rust`）。
+    // 原先 7 个 helper + 7 个 `#[tokio::test]` 各自 `SnowflakeIdGenerator::new(.., 7)`，
+    // 而 `last_ms` / `sequence` 是 generator **对象私有**字段、`new()` 从 0 起步 ⇒
+    // 两个 instance 相同、对象不同的 generator 同毫秒各取第 0 号即发出逐字节相同的
+    // id ⇒ `t_*_pkey` 23505。instance 这 10 bit 现在只留给**跨进程**区分（1024 槽），
+    // 进程内区分由共享对象按调用顺序串行发号天然保证。
+    use crate::shared::test_snowflake::shared_test_snowflake;
     use hsh_erp_test_support::test_pool;
 
     // ===== helper：构造一个最小可跑的 user / role / customer / process / part / batch =====
@@ -425,9 +435,8 @@ mod tests {
     ) -> i64 {
         use crate::auth::password;
         let hash = password::hash(plain_password).expect("bcrypt");
-        let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
-        let user_id = snowflake.next_id();
-        let role_id = snowflake.next_id();
+        let user_id = shared_test_snowflake().next_id();
+        let role_id = shared_test_snowflake().next_id();
         let now = now_naive();
         sqlx::query(
             "INSERT INTO t_user (id, username, password_hash, full_name, is_active, \
@@ -458,8 +467,7 @@ mod tests {
 
     /// 写一个 L2 customer（parent_id 留 NULL 表示它本身就是 L1）。
     async fn insert_customer_l2(pool: &sqlx::PgPool, name: &str) -> i64 {
-        let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
-        let id = snowflake.next_id();
+        let id = shared_test_snowflake().next_id();
         let now = now_naive();
         sqlx::query(
             "INSERT INTO t_customer (id, name, version, created_at, updated_at) \
@@ -476,8 +484,7 @@ mod tests {
 
     /// 写一个 INHOUSE 工序（category='INHOUSE'，确保 apply_filter 通用）。
     async fn insert_process(pool: &sqlx::PgPool, code: &str, name: &str) -> i64 {
-        let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
-        let id = snowflake.next_id();
+        let id = shared_test_snowflake().next_id();
         let now = now_naive();
         sqlx::query(
             "INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, \
@@ -496,8 +503,7 @@ mod tests {
 
     /// 写一个 PRODUCTION 货架。
     async fn insert_shelf(pool: &sqlx::PgPool, code: &str, zone: &str) -> i64 {
-        let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
-        let id = snowflake.next_id();
+        let id = shared_test_snowflake().next_id();
         let now = now_naive();
         sqlx::query(
             "INSERT INTO t_shelf (id, code, name, zone, is_active, display_order, version, \
@@ -516,8 +522,7 @@ mod tests {
 
     /// 写一条 **active** 的 `t_shelf_process` 映射（`deleted_at` 留默认 NULL）。
     async fn link_shelf_to_process(pool: &sqlx::PgPool, shelf_id: i64, process_id: i64) {
-        let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
-        let id = snowflake.next_id();
+        let id = shared_test_snowflake().next_id();
         let now = now_naive();
         sqlx::query(
             "INSERT INTO t_shelf_process (id, shelf_id, process_id, sort_order, version, \
@@ -546,8 +551,7 @@ mod tests {
         is_urgent: bool,
         process_chain_id: Option<i64>,
     ) -> i64 {
-        let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
-        let id = snowflake.next_id();
+        let id = shared_test_snowflake().next_id();
         let now = now_naive();
         sqlx::query(
             "INSERT INTO t_part (id, serial_no, name, drawing_no, applicant_name, quantity, \
@@ -583,8 +587,7 @@ mod tests {
     /// 2026-10-06 新增：`PROGRAMMING` 已纳入待下发白名单，需要能造出该状态的批次
     /// 来锁住「列得出 + 下发得了」。默认 helper 保持 PENDING，存量调用点零改动。
     async fn insert_part_batch_with_status(pool: &sqlx::PgPool, part_id: i64, status: &str) -> i64 {
-        let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
-        let id = snowflake.next_id();
+        let id = shared_test_snowflake().next_id();
         let now = now_naive();
         sqlx::query(
             "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
@@ -720,8 +723,8 @@ mod tests {
             None,
         )
         .await;
-        let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
-        let b_ip = snowflake.next_id();
+
+        let b_ip = shared_test_snowflake().next_id();
         let now = now_naive();
         // 2026-09-30（review L2）：补 `current_process_id` —— 写入不变式第 1 行要求
         // 「进池（IN_PROCESS + PRODUCTION_SHELF）必写目标 process_id」。此前本
@@ -757,7 +760,7 @@ mod tests {
             None,
         )
         .await;
-        let b_del = snowflake.next_id();
+        let b_del = shared_test_snowflake().next_id();
         sqlx::query(
             "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
              current_holder_id, current_process_step_id, delivery_note_id, parent_batch_id, \
@@ -875,12 +878,12 @@ mod tests {
         let b_id = insert_part_batch(&pool, p_id).await;
 
         let mut conn = pool.acquire().await.unwrap();
-        let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
+
         let r = QueueService::dispatch_batch(
             &mut conn,
             vec![(b_id, process_id)],
             Some("dispatch test"),
-            &snowflake,
+            shared_test_snowflake().as_ref(),
             &make_current(user_id, Role::Manager),
         )
         .await
@@ -956,12 +959,12 @@ mod tests {
         let b_id = insert_part_batch_with_status(&pool, p_id, "PROGRAMMING").await;
 
         let mut conn = pool.acquire().await.unwrap();
-        let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
+
         let r = QueueService::dispatch_batch(
             &mut conn,
             vec![(b_id, process_id)],
             Some("dispatch programming"),
-            &snowflake,
+            shared_test_snowflake().as_ref(),
             &make_current(user_id, Role::Manager),
         )
         .await
@@ -1027,7 +1030,7 @@ mod tests {
         let b_id = insert_part_batch(&pool, p_id).await;
 
         let mut conn = pool.acquire().await.unwrap();
-        let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
+
         let current = make_current(user_id, Role::Manager);
 
         // 第一次成功
@@ -1035,7 +1038,7 @@ mod tests {
             &mut conn,
             vec![(b_id, process_id)],
             None,
-            &snowflake,
+            shared_test_snowflake().as_ref(),
             &current,
         )
         .await
@@ -1046,7 +1049,7 @@ mod tests {
             &mut conn,
             vec![(b_id, process_id)],
             None,
-            &snowflake,
+            shared_test_snowflake().as_ref(),
             &current,
         )
         .await
@@ -1063,12 +1066,12 @@ mod tests {
         link_shelf_to_process(&pool, shelf_id, process_id).await;
 
         let mut conn = pool.acquire().await.unwrap();
-        let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
+
         let e = QueueService::dispatch_batch(
             &mut conn,
             vec![(999_999_999, process_id)],
             None,
-            &snowflake,
+            shared_test_snowflake().as_ref(),
             &make_current(user_id, Role::Manager),
         )
         .await
@@ -1106,12 +1109,12 @@ mod tests {
             .unwrap();
 
         let mut conn = pool.acquire().await.unwrap();
-        let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
+
         let _r = QueueService::dispatch_batch(
             &mut conn,
             vec![(b_id, process_id)],
             None,
-            &snowflake,
+            shared_test_snowflake().as_ref(),
             &make_current(user_id, Role::Manager),
         )
         .await
@@ -1127,11 +1130,11 @@ mod tests {
         let process_id = insert_process(&pool, "P-MULTI", "ACME").await;
 
         // 三个货架：sort_order 分别是 5 / 1 / 9，应取 sort_order=1 的那个
-        let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
+
         let now = now_naive();
-        let shelf_first = snowflake.next_id();
-        let shelf_mid = snowflake.next_id();
-        let shelf_last = snowflake.next_id();
+        let shelf_first = shared_test_snowflake().next_id();
+        let shelf_mid = shared_test_snowflake().next_id();
+        let shelf_last = shared_test_snowflake().next_id();
         for (shelf_id, sort_order) in [(shelf_first, 5), (shelf_mid, 1), (shelf_last, 9)] {
             sqlx::query(
                 "INSERT INTO t_shelf (id, code, name, zone, is_active, display_order, version, \
@@ -1147,7 +1150,7 @@ mod tests {
                 "INSERT INTO t_shelf_process (id, shelf_id, process_id, sort_order, version, \
                  created_at, updated_at) VALUES ($1, $2, $3, $4, 0, $5, $5)",
             )
-            .bind(snowflake.next_id())
+            .bind(shared_test_snowflake().next_id())
             .bind(shelf_id)
             .bind(process_id)
             .bind(sort_order)
@@ -1175,7 +1178,7 @@ mod tests {
             &mut conn,
             vec![(b_id, process_id)],
             None,
-            &snowflake,
+            shared_test_snowflake().as_ref(),
             &make_current(user_id, Role::Manager),
         )
         .await
@@ -1209,12 +1212,12 @@ mod tests {
         let b_id = insert_part_batch(&pool, p_id).await;
 
         let mut conn = pool.acquire().await.unwrap();
-        let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
+
         let _r = QueueService::dispatch_batch(
             &mut conn,
             vec![(b_id, process_id_no_shelf)],
             None,
-            &snowflake,
+            shared_test_snowflake().as_ref(),
             &make_current(user_id, Role::Manager),
         )
         .await
@@ -1244,12 +1247,12 @@ mod tests {
         let b_id = insert_part_batch(&pool, p_id).await;
 
         let mut conn = pool.acquire().await.unwrap();
-        let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
+
         let e = QueueService::dispatch_batch(
             &mut conn,
             vec![(b_id, process_id)],
             None,
-            &snowflake,
+            shared_test_snowflake().as_ref(),
             &make_current(user_id, Role::Inspector),
         )
         .await
@@ -1263,12 +1266,12 @@ mod tests {
         let user_id = insert_user_with_role(&pool, "manager1", "password", "MANAGER").await;
 
         let mut conn = pool.acquire().await.unwrap();
-        let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
+
         let e = QueueService::dispatch_batch(
             &mut conn,
             vec![], // empty
             None,
-            &snowflake,
+            shared_test_snowflake().as_ref(),
             &make_current(user_id, Role::Manager),
         )
         .await
@@ -1328,9 +1331,9 @@ mod tests {
         let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
 
         // 建 chain（无 step）
-        let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
+
         let now = now_naive();
-        let chain_id = snowflake.next_id();
+        let chain_id = shared_test_snowflake().next_id();
         sqlx::query(
             "INSERT INTO t_part_process_chain (id, version, created_at, created_by, updated_at, updated_by) \
              VALUES ($1, 0, $2, 1, $2, 1)",
@@ -1378,9 +1381,9 @@ mod tests {
         let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
 
         // 建链 + 2 个 step（sort_order=1 / 2）+ 2 个货架 + 2 个映射
-        let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
+
         let now = now_naive();
-        let chain_id = snowflake.next_id();
+        let chain_id = shared_test_snowflake().next_id();
         sqlx::query(
             "INSERT INTO t_part_process_chain (id, version, created_at, created_by, updated_at, updated_by) \
              VALUES ($1, 0, $2, 1, $2, 1)",
@@ -1403,7 +1406,7 @@ mod tests {
                 "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, estimated_minutes, version, \
                  created_at, created_by, updated_at, updated_by) VALUES ($1, $2, $3, $4, 0, 0, $5, 1, $5, 1)",
             )
-            .bind(snowflake.next_id())
+            .bind(shared_test_snowflake().next_id())
             .bind(chain_id)
             .bind(step_no)
             .bind(process_id)
@@ -1480,9 +1483,9 @@ mod tests {
         let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
 
         // 建链 + step，但首道工序不映射货架
-        let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
+
         let now = now_naive();
-        let chain_id = snowflake.next_id();
+        let chain_id = shared_test_snowflake().next_id();
         sqlx::query(
             "INSERT INTO t_part_process_chain (id, version, created_at, created_by, updated_at, updated_by) \
              VALUES ($1, 0, $2, 1, $2, 1)",
@@ -1498,7 +1501,7 @@ mod tests {
             "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, estimated_minutes, version, \
              created_at, created_by, updated_at, updated_by) VALUES ($1, $2, 1, $3, 0, 0, $4, 1, $4, 1)",
         )
-        .bind(snowflake.next_id())
+        .bind(shared_test_snowflake().next_id())
         .bind(chain_id)
         .bind(process_first)
         .bind(now)
@@ -1551,9 +1554,9 @@ mod tests {
         let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
 
         // 完整链路：工艺链 + 首道 step + 首货架映射（保证 skip_reason 无从谈起）
-        let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
+
         let now = now_naive();
-        let chain_id = snowflake.next_id();
+        let chain_id = shared_test_snowflake().next_id();
         sqlx::query(
             "INSERT INTO t_part_process_chain (id, version, created_at, created_by, updated_at, updated_by) \
              VALUES ($1, 0, $2, 1, $2, 1)",
@@ -1571,7 +1574,7 @@ mod tests {
             "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, estimated_minutes, version, \
              created_at, created_by, updated_at, updated_by) VALUES ($1, $2, 1, $3, 0, 0, $4, 1, $4, 1)",
         )
-        .bind(snowflake.next_id())
+        .bind(shared_test_snowflake().next_id())
         .bind(chain_id)
         .bind(process_first)
         .bind(now)

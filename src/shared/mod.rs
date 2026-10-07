@@ -24,4 +24,11 @@ pub mod error;
 pub mod pagination;
 pub mod response;
 pub mod serial; // 2026-09-14 Phase 3：跨域序列号派发（assembly + 后续 part 域统一入口）
+// 2026-10-09 新增 test_snowflake：`src/` 单元测试专用的进程内唯一雪花 ID 源。
+// 不能直接用 `hsh_erp_test_support::shared_test_snowflake()` —— dev-dependency 环
+// 让 lib 单测二进制里链进两份 `hsh_erp_rust`，那个函数返回的是**另一个 crate 实例**
+// 的 `SnowflakeIdGenerator`，传参即 E0308。根因与取舍详见 `test_snowflake.rs` 顶部 doc。
+// 同 `domain_guard`：`#[cfg(test)]` 项、不进生产 API 面。
+#[cfg(test)]
+pub mod test_snowflake;
 pub mod types;
