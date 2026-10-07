@@ -10,11 +10,16 @@
 //!   （`repair` / `repairing`）
 //! - `lifecycle.rs` —— 终态 + 状态机扩展（`deliver` / `complete` / `start-repair` /
 //!   `place-on-shelf` / `release-from-programming` / `complete-repair` /
-//!   `repair-dispatch` / `split` / `cancel` / `pick-up`）
+//!   `repair-dispatch` / `cancel` / `pick-up` / 拆批）
 //!
 //! 2026-10-09：外协三个端点（`send-to-outsource` / `receive-from-outsource` /
 //! `receive-from-outsource-to-inspection`）剥离到 `outsource::queue`，合并为
 //! `POST /api/v2/outsource-queue/move`（三合一，硬切无 alias）。
+//!
+//! 2026-10-09：拆批由 `POST /api/v2/prod/batches/{batch_id}/split` 提升为**顶层共用
+//! 端点** `POST /api/v2/batches/split`（见本文件的 [`split_router`]）：它有三个前端
+//! 消费方（生产队列看板 / 外协看板 / 零件详情页），旧路径已下线、**无 alias**。
+//! 因此 `ROUTES` 只描述 [`router()`]，不含 `split_router()` 的那一条。
 //!
 //! ## 事务边界
 //! 统一在 handler：`state.pool.begin()` → 传 `&mut tx` 给 service → 显式
@@ -42,7 +47,7 @@ pub use transition::{
 // ----- lifecycle.rs -----
 pub use lifecycle::{
     cancel_batch, complete, complete_repair, deliver, pick_up, place_on_shelf,
-    release_from_programming, repair_dispatch, split_batch, start_repair,
+    release_from_programming, repair_dispatch, split_batch_by_body, start_repair,
 };
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -106,9 +111,21 @@ pub fn router() -> Router<Arc<AppState>> {
             post(lifecycle::repair_dispatch),
         )
         // ---- 批次操作 ----
-        .route("/{batch_id}/split", post(lifecycle::split_batch))
         .route("/{batch_id}/cancel", post(lifecycle::cancel_batch))
         .route("/{batch_id}/pick-up", post(lifecycle::pick_up))
+}
+
+/// 批次拆分（挂载点 `/api/v2/batches`，**顶层**而非本域 nest）。
+/// `batch_id` 入 body 而非路径 —— 与 `prod::queue` 的 recall 硬切同款。
+///
+/// 2026-10-09：拆批由 `POST /api/v2/prod/batches/{batch_id}/split` 提升而来。
+/// 它有**三个前端消费方**（生产队列看板 / 外协看板 / 零件详情页），挂在
+/// `/prod/batches/{batch_id}/…` 这条「批次子资源」路径下既不贴切、也拿不掉
+/// 路径参数（顶层前缀下 `/{id}/…` 与别的 `/batches/*` 端点会争 matchit 段位）。
+/// 故本域有两处挂载：本 `router()`（`/api/v2/prod/batches/*` 域内）与
+/// `prod::split_router()` → `/api/v2/batches/*`（本条，全模块共用）。
+pub fn split_router() -> Router<Arc<AppState>> {
+    Router::new().route("/split", post(lifecycle::split_batch_by_body))
 }
 
 // ============================================================================
@@ -153,7 +170,6 @@ pub const ROUTES: &[&str] = &[
     "POST /{batch_id}/release-from-programming",
     "POST /{batch_id}/complete-repair",
     "POST /{batch_id}/repair-dispatch",
-    "POST /{batch_id}/split",
     "POST /{batch_id}/cancel",
     "POST /{batch_id}/pick-up",
 ];
@@ -183,7 +199,6 @@ pub const STRIP_TARGETS: &[&str] = &[
     "views/cnc/",
     "views/repair/",
     "views/repair/",
-    "views/parts/detail/",
     "views/parts/detail/",
     "views/scan/（扫码台）",
 ];
@@ -215,6 +230,10 @@ pub const STRIPPED: &[(&str, &str)] = &[
     (
         "POST /{batch_id}/receive-from-outsource-to-inspection",
         "outsource::queue（2026-10-09 剥离，三合一为 POST /outsource-queue/move）",
+    ),
+    (
+        "POST /{batch_id}/split",
+        "prod（2026-10-09 提升为共用顶层端点 POST /batches/split，batch_id 入 body）",
     ),
 ];
 

@@ -100,6 +100,9 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .nest("/com", com::router())
         // 2026-09-19 prod 聚合：工人 / 工种 / 工序 / 工艺链 / 工人池 5 支撑域统一挂在 `/prod/*` 下
         .nest("/prod", prod::router())
+        // 2026-10-09：批次拆分升为全模块共用端点（生产队列看板 / 外协看板 / 零件详情三处调用）。
+        // ⚠️ `prod::batch` 因此有两处挂载：本前缀（域内）与 `/api/v2/batches`（本条）。
+        .nest("/batches", prod::split_router())
         .nest("/shelves", shelf::router())
         // 2026-09-28 新增：dashboard 域 HTTP 全量首取端点（`GET /snapshot`）。
         // 路径：挂在 `/api/v2/dashboard/*`，与 `/ws/dashboard`（WS-only，不带

@@ -264,12 +264,20 @@ pub struct RepairDispatchRequest {
     pub note: Option<String>,
 }
 
-/// `POST /api/v2/prod/batches/{batch_id}/split` 入参。
+/// `POST /api/v2/batches/split` 入参。
 ///
 /// 拆出部分量为新批次（继承源批次 status/location/holder/next_process；
 /// 不继承 delivery_note_id）。`quantity` ∈ [1, source_batch.quantity - 1]。
+///
+/// 2026-10-09 新增：`batch_id` 由路径参数改入 body（旧路径
+/// `POST /api/v2/prod/batches/{batch_id}/split` 已硬切下线、无 alias）——
+/// 本端点有**三个消费方**（生产队列看板 / 外协看板 / 零件详情页），提到顶层
+/// `/api/v2/batches` 之后不能再按 `/{batch_id}/…` 形状挂载，且这与
+/// `prod::queue::recall` 的硬切同款（ID 全走 body）。
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct SplitBatchRequest {
+pub struct SplitBatchByBodyRequest {
+    #[serde(deserialize_with = "deserialize_i64")]
+    pub batch_id: i64,
     pub version: i32,
     #[serde(deserialize_with = "deserialize_i64")]
     pub quantity: i64,
@@ -366,7 +374,7 @@ pub struct PickUpRequest {
     pub shelf_id: Option<i64>,
     /// 2026-10-03 新增：部分领取；缺省 = 整批。
     ///
-    /// 线上形态与同族的 `SplitBatchRequest.quantity` 一致：**JSON 字符串**
+    /// 线上形态与同族的 `SplitBatchByBodyRequest.quantity` 一致：**JSON 字符串**
     /// （`deserialize_i64_opt` 只吃 str），例如 `"quantity": "4"`。
     ///
     /// `None` / `>= batch.quantity` 一律按整批处理（`==` 是「显式整批」的合法

@@ -1,11 +1,18 @@
 //! part 域 Phase 1（2026-09-13）批次集成测试：1.5 拆分/取消 + 1.6 事件/位置树。
 //!
 //! 覆盖：
-//!   - split_batch: happy path + 数量校验 + 批次守恒不变量
+//!   - split_batch: happy path + 数量校验 + 批次守恒不变量 + OCC 过期 + 硬切守卫
 //!   - cancel_batch: happy path + 终态保护
 //!   - list_batches: 工单全部活跃批次
 //!   - list_events: 工单事件历史
 //!   - location_tree: 位置树聚合
+//!
+//! ## 拆批端点的位置（2026-10-09）
+//! 拆批由 `POST /api/v2/prod/batches/{batch_id}/split` 提升为**顶层共用端点**
+//! `POST /api/v2/batches/split`（`batch_id` 入 body，三个消费方：生产队列看板 /
+//! 外协看板 / 零件详情页），旧路径 404 **无 alias** —— 由
+//! `split_batch_legacy_path_is_gone` 钉住。拆批的 fixture 与守恒不变量用例留在
+//! 本文件（批次用例的既有归属），不再另开 binary。
 //!
 //! ## 批次守恒不变量测试
 //! `Σ(未删批次.quantity) = t_part.quantity` 必须保持 —— 用 `invariant` 命名空间测试。
@@ -122,26 +129,55 @@ async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, PartFixture) {
 #[tokio::test]
 async fn split_batch_happy_path() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let (_pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PENDING", 10).await;
+    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PENDING", 10).await;
     let version = batch_version(&pool, bid).await;
     let body = json!({
+        "batch_id": bid.to_string(),
         "version": version,
         "quantity": "3",
     });
     let (s, env) = send(
         app,
-        json_request(
-            "POST",
-            &format!("/prod/batches/{bid}/split"),
-            Some(body),
-            Some(&token),
-        ),
+        json_request("POST", "/batches/split", Some(body), Some(&token)),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "split: {env}");
     assert_eq!(env["code"], 0);
-    let new_batch_id = env["data"].as_i64().expect("data is i64");
-    assert!(new_batch_id > 0);
+    // 2026-10-09：出参由 `R<i64>` 裸数字换成 5 字段 VO，三个雪花 ID 必须是
+    // JSON 字符串（裸数字会被 JS 截断精度）。
+    let data = &env["data"];
+    for field in ["batch_id", "new_batch_id", "part_id"] {
+        assert!(
+            data[field].is_string(),
+            "`{field}` 必须是 JSON 字符串而非裸数字: {env}"
+        );
+    }
+    assert_eq!(
+        data["batch_id"],
+        bid.to_string(),
+        "batch_id 回显请求值: {env}"
+    );
+    assert_eq!(
+        data["part_id"],
+        pid.to_string(),
+        "part_id 由批次行反查: {env}"
+    );
+    assert_eq!(data["quantity"], 3, "quantity 是实际拆走量: {env}");
+    assert_eq!(
+        data["source_version"],
+        version + 1,
+        "source_version = 请求 version + 1: {env}"
+    );
+    // 新批次确实落库且 version 从 0 起
+    let new_batch_id: i64 = data["new_batch_id"].as_str().unwrap().parse().unwrap();
+    let (new_qty, new_version): (i32, i32) =
+        sqlx::query_as("SELECT quantity, version FROM t_part_batch WHERE id = $1")
+            .bind(new_batch_id)
+            .fetch_one(&pool)
+            .await
+            .expect("新批次应落库");
+    assert_eq!(new_qty, 3, "新批次数量 = 拆走量");
+    assert_eq!(new_version, 0, "新批次 version 从 0 起");
 }
 
 #[tokio::test]
@@ -157,12 +193,7 @@ async fn split_batch_invalid_quantity_rejects() {
     });
     let (s, env) = send(
         app,
-        json_request(
-            "POST",
-            &format!("/prod/batches/{bid}/split"),
-            Some(body),
-            Some(&token),
-        ),
+        json_request("POST", "/batches/split", Some(body), Some(&token)),
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "quantity=全量应拒绝: {env}");
@@ -181,6 +212,62 @@ async fn split_batch_quantity_negative_rejects() {
     });
     let (s, env) = send(
         app,
+        json_request("POST", "/batches/split", Some(body), Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "quantity<0 应拒绝: {env}");
+    assert_eq!(env["code"], 20111);
+}
+
+/// OCC 锚过期 → 40901，且**不得**写脏批次。
+///
+/// 2026-10-09 新增：拆批是三个消费方共用的写端点，必须显式守 version，
+/// 否则「看板 30s 快照已过期」会被静默吸收。
+#[tokio::test]
+async fn split_batch_stale_version_returns_40901() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PENDING", 10).await;
+    let stale = batch_version(&pool, bid).await + 7;
+    let body = json!({
+        "batch_id": bid.to_string(),
+        "version": stale,
+        "quantity": "3",
+    });
+    let (s, env) = send(
+        app,
+        json_request("POST", "/batches/split", Some(body), Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "过期 version 应 409: {env}");
+    assert_eq!(env["code"], 40901, "VERSION_CONFLICT: {env}");
+    // 未发生任何拆批：仍只有 1 条批次、总量不变
+    let (count, total): (i64, i32) = sqlx::query_as(
+        "SELECT COUNT(*)::bigint, COALESCE(SUM(quantity), 0)::int \
+         FROM t_part_batch WHERE part_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(pid)
+    .fetch_one(&pool)
+    .await
+    .expect("sum");
+    assert_eq!(count, 1, "过期 version 不应产生新批次");
+    assert_eq!(total, 10, "源批次数量不应被扣减");
+}
+
+/// **硬切守卫**（2026-10-09）：旧路径 `POST /api/v2/prod/batches/{batch_id}/split`
+/// 已下线，**无 alias** —— 必须返 404（而不是被 `/{batch_id}/cancel` 之类的
+/// 同形路由吞掉或静默命中）。
+#[tokio::test]
+async fn split_batch_legacy_path_is_gone() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let (_pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PENDING", 10).await;
+    let version = batch_version(&pool, bid).await;
+    let body = json!({
+        "version": version,
+        "quantity": "3",
+    });
+    // 404 是 axum 的空 body 兜底响应，不走 `R<T>` 信封 → 用 `send_raw`
+    let (s, raw) = send_raw(
+        app,
         json_request(
             "POST",
             &format!("/prod/batches/{bid}/split"),
@@ -189,8 +276,11 @@ async fn split_batch_quantity_negative_rejects() {
         ),
     )
     .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "quantity<0 应拒绝: {env}");
-    assert_eq!(env["code"], 20111);
+    assert_eq!(
+        s,
+        StatusCode::NOT_FOUND,
+        "旧路径已硬切下线，必须 404（无 alias）；body={raw}"
+    );
 }
 
 // ===== 批次守恒不变量测试 =====
@@ -201,17 +291,13 @@ async fn invariant_split_preserves_total_quantity() {
     let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PENDING", 10).await;
     let version = batch_version(&pool, bid).await;
     let body = json!({
+        "batch_id": bid.to_string(),
         "version": version,
         "quantity": "3",
     });
     let (s, env) = send(
         app,
-        json_request(
-            "POST",
-            &format!("/prod/batches/{bid}/split"),
-            Some(body),
-            Some(&token),
-        ),
+        json_request("POST", "/batches/split", Some(body), Some(&token)),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "split: {env}");

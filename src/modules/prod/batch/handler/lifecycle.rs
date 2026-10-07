@@ -9,7 +9,14 @@
 //! - `POST /api/v2/prod/batches/{batch_id}/place-on-shelf` / `recall-to-pending`
 //! - `POST /api/v2/prod/batches/{batch_id}/release-from-programming`
 //! - `POST /api/v2/prod/batches/{batch_id}/complete-repair` / `repair-dispatch`
-//! - `POST /api/v2/prod/batches/{batch_id}/split` / `cancel` / `pick-up`
+//! - `POST /api/v2/prod/batches/{batch_id}/cancel` / `pick-up`
+//!
+//! ## 2026-10-09 拆批端点迁出
+//! `POST /api/v2/prod/batches/{batch_id}/split` 提升为**顶层共用端点**
+//! `POST /api/v2/batches/split`（`split_batch_by_body`，三个消费方：生产队列看板 /
+//! 外协看板 / 零件详情页）。旧路径 404、**无 alias**，`batch_id` 改入 body，
+//! 出参由 `R<i64>` 裸数字换成 `BatchSplitOut`（全 ID 字符串 —— 旧出参被 JS
+//! 截断精度）。WS 事件名 `PART_BATCH_SPLIT` 与 payload 逐字不变。
 //!
 //! ## 2026-10-09 外协三端点迁出
 //! `send-to-outsource` / `receive-from-outsource` /
@@ -41,9 +48,10 @@ use crate::infra::ws_hub::WsEvent;
 use crate::modules::part::vo::PartOut;
 use crate::modules::prod::batch::dto::{
     CancelBatchRequest, CompleteRepairRequest, CompleteRequest, DeliverRequest, PickUpRequest,
-    PlaceOnShelfRequest, RepairDispatchRequest, SplitBatchRequest, StartRepairRequest,
+    PlaceOnShelfRequest, RepairDispatchRequest, SplitBatchByBodyRequest, StartRepairRequest,
 };
 use crate::modules::prod::batch::service::BatchService;
+use crate::modules::prod::batch::vo::BatchSplitOut;
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
@@ -207,26 +215,36 @@ pub async fn repair_dispatch(
     Ok(Json(R::ok(out)))
 }
 
-/// `POST /api/v2/prod/batches/{batch_id}/split`
-pub async fn split_batch(
+/// `POST /api/v2/batches/split` —— **顶层**共用端点（挂载点
+/// `/api/v2/batches`，见 `modules::mod` 的 `v2_router` 与
+/// `prod::batch::handler::split_router`），不是本域 `/prod/batches/*` 下的路由。
+///
+/// `batch_id` 从 body 取（硬切自 `POST /api/v2/prod/batches/{batch_id}/split`
+/// 的路径参数，旧路径已下线、无 alias）。
+pub async fn split_batch_by_body(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
-    Path(batch_id): Path<i64>,
-    Json(req): Json<SplitBatchRequest>,
-) -> Result<Json<R<i64>>, AppError> {
+    Json(req): Json<SplitBatchByBodyRequest>,
+) -> Result<Json<R<BatchSplitOut>>, AppError> {
+    let batch_id = req.batch_id;
     let mut tx = state.pool.begin().await?;
-    let (new_batch_id, part_id) =
-        BatchService::split_batch(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
+    let outcome = BatchService::split_batch(&mut *tx, &state.snowflake, req, &current).await?;
     tx.commit().await?;
     ws_broadcast(
         &state,
         "PART_BATCH_SPLIT",
         json!({
-            "part_id": part_id.to_string(),
-            "new_batch_id": new_batch_id.to_string(),
+            "part_id": outcome.part_id.to_string(),
+            "new_batch_id": outcome.new_batch_id.to_string(),
         }),
     );
-    Ok(Json(R::ok(new_batch_id)))
+    Ok(Json(R::ok(BatchSplitOut {
+        batch_id,
+        new_batch_id: outcome.new_batch_id,
+        part_id: outcome.part_id,
+        quantity: outcome.quantity,
+        source_version: outcome.source_version,
+    })))
 }
 
 /// `POST /api/v2/prod/batches/{batch_id}/cancel`
@@ -277,10 +295,10 @@ pub async fn pick_up(
     // 必须发：拆批把源批次的 quantity 静默扣减、并新建了一个批次行，其它端的
     // 批次视图不收到这条事件就永远看不到「源批次余量变了 / 多了一个批次」。
     //
-    // ⚠️ 2026-10-03 订正：本事件**不是**「与 split_batch 端点同形」。两处共用
+    // ⚠️ 2026-10-03 订正：本事件**不是**「与拆批端点同形」。两处共用
     // `part_id` / `new_batch_id` 两个字段名（消费方唯一可无条件依赖的部分），
     // 后两个是本处的增量字段。同一事件名两种 payload 的完整对照见本文件
-    // `split_batch` 与 `pick_up` 两个 handler 里的 `ws_broadcast` 调用。
+    // `split_batch_by_body` 与 `pick_up` 两个 handler 里的 `ws_broadcast` 调用。
     if let Some(split) = outcome.split.as_ref() {
         ws_broadcast(
             &state,
