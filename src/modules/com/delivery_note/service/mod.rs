@@ -1,50 +1,53 @@
-//! delivery_note service 层入口
+//! com::delivery_note service 层入口
 //!
-//! 按功能拆为下列子模块：
-//! - `group` — DeliveryGroupService（P1 分组 CRUD）
-//! - `crud` — DeliveryNoteService 列表/草稿/编辑/添加/移除
-//! - `lifecycle` — DeliveryNoteService 状态流转与读视图（提交/撤回/拣货/事件/候选）
-//! - `scan` — DeliveryNoteService::scan_add（P3 扫码入单）+ NoteScope 分类 +
-//!   5 组分类 helpers + resolve_scan_kind（按业务子域再拆为
-//!   `scan/{mod, classify, resolve_scan_kind, helpers, find_or_create, tests}.rs`）
+//! 按职责拆为下列子模块：
+//! - `group` —— `DeliveryGroupService`：送货分组 CRUD
+//! - `crud` —— `DeliveryNoteService`：列表 / 详情 / 批量详情 / 编辑 / 移除批次
+//! - `lifecycle` —— `DeliveryNoteService`：状态流转与读视图（提交 / 撤回 / 领取 /
+//!   软删）
+//! - `scan_tree` —— `DeliveryNoteService::scan_tree`：扫码三层树（**纯读**，不建单）
+//! - `scan_entry` —— `DeliveryNoteService::scan_entry`：`POST /scan` 扫码入单
+//!   （**唯一**入单入口；DP 分配 + 拆批 + 挂单在同一事务内）
+//! - `batch_allocation` —— DP 批次分配纯函数（`allocate`；零 IO，10 个单测）
+//! - `find_or_create` —— `scan_find_or_create_draft`：按单键
+//!   `(customer_id, status='DRAFT')` 找或建草稿（含 23505 并发重查兜底）
+//! - `shippable_sets` —— 装配件「可出货套数」纯函数（分子只计 `READY_TO_SHIP`；
+//!   详情 VO 与扫码树共用同一公式）
+//! - `inner` —— 跨子模块共享的私有 helper（`build_note_outs` / `get_with_parts` /
+//!   `validate_*` / 错误构造器）
+//!
+//! ## service 形参 by-value trait（iam / shelf / customer 严格范本）
+//! service 方法一律 `<R: DeliveryNoteRepoTrait>(&self, mut repo: R, ...)`，生产
+//! `R = &mut PgConnection`（借 `&mut *tx` / `&mut *conn` 喂入）。跨域 ZST 静态调用
+//! （`CustomerRepo::xxx` / `PartRepo::xxx` / `PartBatchRepo::xxx` /
+//! `AssemblyRepo::xxx`）走 `&mut *repo.conn_mut()` 借位。
+//!
+//! ## service 装线 AppState
+//! `DeliveryNoteService` / `DeliveryGroupService` 字段仅
+//! `Arc<SnowflakeIdGenerator>`（事务已移交 handler；WS 广播也移交 handler）；
+//! `Arc<DeliveryNoteService>` / `Arc<DeliveryGroupService>` 注入 `AppState`，
+//! handler 调 `state.delivery_note_service.method(&mut *tx, ...)`。
+//!
+//! ## handler 三形态严格区分
+//! ① 纯写端点 `pool.begin() → service → commit`；
+//! ② 写 + post-commit 副作用（`scan_entry` / `submit` / `pickup` 等写后广播）
+//! `pool.begin() → service → commit → state.ws_hub.broadcast(...)`；
+//! ③ 读端点（`list_*` / `get_*` / `scan_tree`）`pool.acquire() → service`，不开事务。
+//!
+//! ## 本域 SQL 真源与胖 trait
+//! SQL 全在 `repo/sql.rs` 与 `repo/scan_tree.rs`；胖 trait
+//! `DeliveryNoteRepoTrait`（21 方法 = 11 group + 10 note）直接
+//! `impl for &mut PgConnection`，service 内部调用走 `conn.note_xxx()` /
+//! `conn.group_xxx()`，trait 另提供 `conn_mut()` 访问器供跨域 ZST 调用。
 
-//! - `inner` — 跨子模块共享的私有 helper（`build_note_outs` / `add_parts_inner` /
-//!   `get_with_parts` / `check_scope` / `validate_*` / 错误构造器 等）
-//! - `shippable_sets` — 本单口径的装配件可出货套数（纯函数，2026-10-04 新增）
-//!
-//! 对外 API（`handler.rs` 调用面）保持原路径：
-//! - `service::DeliveryGroupService::{list_for_l1, create, update, soft_delete}`
-//! - `service::DeliveryNoteService::{list_with_filters, list_for_pickup, create_draft,
-//!    get_with_parts, get_many_with_parts, update, add_parts, remove_parts, submit, recall,
-//!    pickup_scan, pickup, soft_delete, list_events, list_candidate_parts, scan_add,
-//!    attach_batches}`
-//!
-//! ## 2026-09-22 D-5 重构对齐 iam / shelf / customer 范本（review 第 1 轮修正）
-//! - 本域 SQL 真源统一在 `repo/sql.rs`（原 `repo/query.rs` + `repo/mutate.rs`
-//!   合并），ZST struct（`DeliveryGroupRepo` / `DeliveryNoteRepo` /
-//!   `DeliveryNoteRepo`）保留为静态调用面。
-//! - 胖 trait `DeliveryNoteRepoTrait`（21 方法 = 11 group + 10 note；2026-10-08
-//!   事件 2 方法随事件子系统下线删除），
-//!   `impl for &mut PgConnection`——service 内部 SQL 调用全部走 trait 方法
-//!   （`conn.note_xxx()` / `conn.group_xxx()`）；trait 提供
-//!   `conn_mut()` 访问器供跨域 ZST 调用（`PartRepo::xxx(&mut *repo.conn_mut(), ...)`）。
-//! - **service 形参 by-value trait**（review 第 1 轮 D1 修正）：service 方法
-//!   `<R: DeliveryNoteRepoTrait>(&self, mut repo: R, ...)`（对齐 iam / shelf / customer
-//!   严格范本，不再使用 `conn: &mut PgConnection` 形参）。
-//! - **service 装线 AppState**：`DeliveryNoteService` / `DeliveryGroupService` 字段仅
-//!   `Arc<SnowflakeIdGenerator>`（事务已移交 handler；WS 广播也移交 handler）；
-//!   `Arc<DeliveryNoteService>` / `Arc<DeliveryGroupService>` 注入 `AppState`，
-//!   handler 调 `state.delivery_note_service.method(&mut *tx, ...)`。
-//! - handler 三形态严格区分：① 纯写端点 `pool.begin() → service → commit`；
-//!   ② 写 + post-commit 副作用（attach_batches / pickup / scan_add 等写后广播）
-//!   `pool.begin() → service → commit → state.ws_hub.broadcast(...)`；
-//!   ③ 读端点（list_*/get_*）`pool.acquire() → service`，不开事务。
-
+mod batch_allocation;
 mod crud;
+mod find_or_create;
 mod group;
 mod inner;
 mod lifecycle;
-mod scan;
+mod scan_entry;
+mod scan_tree;
 mod shippable_sets;
 
 /// 2026-10-04 新增：本单口径的装配件「可出货套数」纯内存计算。

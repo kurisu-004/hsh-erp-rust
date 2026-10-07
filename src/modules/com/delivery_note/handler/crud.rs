@@ -34,7 +34,7 @@ use serde::Deserialize;
 
 use crate::modules::com::delivery_note::dto::{
     CreateDeliveryGroupRequest, DeliveryGroupIdRequest, DeliveryNoteBatchDetailQuery,
-    DeliveryNoteListQuery, DeliveryNotePath, DeliveryNoteRemovePartsRequest,
+    DeliveryNoteListQuery, DeliveryNotePath, DeliveryNoteRemoveBatchesRequest,
     DeliveryNoteUpdateRequest, DeliveryNoteVersionedRequest, UpdateDeliveryGroupRequest,
 };
 use crate::modules::com::delivery_note::model::DeliveryNoteSortKey;
@@ -180,17 +180,17 @@ pub async fn update_delivery_note(
     Ok(Json(R::ok(out)))
 }
 
-/// POST /api/v2/com/delivery/note/{id}/remove-parts
-pub async fn remove_delivery_note_parts(
+/// POST /api/v2/com/delivery/note/{id}/remove-batches
+pub async fn remove_delivery_note_batches(
     State(state): State<Arc<AppState>>,
     current: crate::auth::rbac::CurrentUser,
     Path(path): Path<DeliveryNotePath>,
-    Json(req): Json<DeliveryNoteRemovePartsRequest>,
+    Json(req): Json<DeliveryNoteRemoveBatchesRequest>,
 ) -> Result<Json<R<DeliveryNoteDetailOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out = state
         .delivery_note_service
-        .remove_parts(&mut *tx, path.id, &req.batch_ids, req.version, &current)
+        .remove_batches(&mut *tx, path.id, &req.batch_ids, req.version, &current)
         .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))

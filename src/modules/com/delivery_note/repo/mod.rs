@@ -45,6 +45,7 @@
 use async_trait::async_trait;
 use sqlx::PgConnection;
 
+pub mod scan_tree;
 pub mod sql;
 
 // ZST struct 定义（与 SQL 真源同在 `sql.rs` 内 —— 定义放本文件，与 SQL 隔开，

@@ -16,8 +16,8 @@ use crate::infra::{clock::now_naive, serial::next_delivery_note_no};
 use crate::modules::com::delivery_note::{model::DeliveryNote, repo::DeliveryNoteRepoTrait};
 use crate::shared::error::AppError;
 
-use super::super::DeliveryNoteService;
-use super::super::inner::note_not_found;
+use super::DeliveryNoteService;
+use super::inner::note_not_found;
 
 /// `t_delivery_note.status` 常量（与 DB 列值严格一致）
 const STATUS_DRAFT: &str = "DRAFT";

@@ -56,52 +56,107 @@
 //!   向零截断会让套数偏大而 `NULLIF` 只挡 0 不挡负；本实现在 i32 收窄处把越界值
 //!   兜成 0（`try_from` 失败即 0），不把 wrap 后的垃圾值传下去。
 //!
-//! ## 与全局已送口径的**有意**不同：不按批次状态过滤
-//!
-//! 2026-10-04 review 第 3 轮（MINOR-4）订正：原文档写「唯一差别是分子」，不准确。
-//! `fetch_delivered_sets` 的分子除了求和，还带 `b.status IN ('DELIVERED','COMPLETED')`
-//! 过滤（`src/modules/part/service/list_enrichment.rs`）；本单版**不过滤批次状态**
-//! —— 入参 `rows` 来自 `PartBatchRepo::list_with_part_by_delivery_note`，只过滤
-//! `deleted_at`，入单时挂上来的批次一律计入（`service/inner.rs` 的入单校验允许
-//! `INSPECTION` / `READY_TO_SHIP` 进单）。
-//!
-//! ⇒ DRAFT 单上若挂着 `INSPECTION` 状态的批次，本单口径会把它算进可出货套数、
-//! 全局已送口径不会。这是「**多算**」方向（不会凭空多出整套：缺件仍然压到 0），
-//! 且与打印语义自洽 —— 打印问的是「这张单声称能出几套」，入单动作本身已经
-//! 把这些批次认领到本单上了。故保留现状，**不要**给本单口径补状态过滤：
-//! 那会让 DRAFT 单在 `INSPECTION` 阶段就打印出 0 套，与详情 VO 同源同值的约束冲突。
+//! //! ## 与全局已送口径的有意分叉：分子只计本单 `READY_TO_SHIP` 批次
+
+//! `part::service::list_enrichment::fetch_delivered_sets`（**全局已送套数**）的分子
+//! 带 `b.status IN ('DELIVERED','COMPLETED')` 过滤；本单版的分子只计
+//! `status == 'READY_TO_SHIP'` 的批次。两者是两套**刻意不同**的口径，不是同一口径
+//! 的两种实现。
+
+//! 2026-10-08 起本函数开始过滤状态（此前不过滤）：入单入口收敛为「只允许
+//! `READY_TO_SHIP`」（`POST /scan` 的 21405 闸门），DRAFT 单上只可能挂着
+//! `READY_TO_SHIP` 批次（提交后翻 `DELIVERED`）⇒ **加过滤与不过滤在「本单批次集合」
+//! 这个口径上结果相同**，但与「可入单」定义同源，且对「挂单后被旁路改状态」的脏数据
+//! 不再虚高套数。
+
+//! 两个消费方（详情 VO `line_items[].shippable_sets` 与扫码三层树的
+//! `entry_max_sets`）都必须走本函数，否则同一装配件在详情页与扫码弹窗会给出两个套数。
 
 use std::collections::HashMap;
 
 use crate::modules::part::model::TPart;
 use crate::shared::batch::TPartBatch;
 
-/// 算每个装配件的「本单可出货套数」，key = 装配件 id。
+/// 计入分子的唯一批次状态（与 `POST /scan` 的入单闸门同源）。
+const STATUS_READY_TO_SHIP: &str = "READY_TO_SHIP";
+
+/// 套数公式的窄投影输入：公式只读这 4 个值，别的一概不看。
 ///
-/// 入参：
-/// - `rows` —— `PartBatchRepo::list_with_part_by_delivery_note` 的结果（本单
-///   全部未删批次 × 对应工单，`ORDER BY pb.id ASC`）；
-/// - `asm_quantity` —— `装配件 id → t_assembly.quantity`（工单总套数，既是
-///   `per_set` 的比例因子、也是 `LEAST` 收口上界）。**只收 quantity 而不是整个
-///   `TAssembly`**：本函数不需要装配件的其它字段，调用方就不必为了算套数而
-///   clone 整行（`handler/print.rs` 原先的 `asms.iter().map(|(a.id, a.clone()))`）；
-/// - `children_by_asm` —— `装配件 id → 全部未软删子件`（`min` 的定义域，见模块
-///   文档「`min` 的定义域」一节）。缺键 = 该装配件无子件 ⇒ 0 套。
+/// 为什么要它：两个消费方拿得到的数据形状不同 —— 详情 VO / 批量详情手上有完整的
+/// `(TPartBatch, TPart)` 行，而扫码三层树为了「零 N+1 + 一条 SQL 取可入单批次」只
+/// 投影了 `part_id` / `part_quantity` / `batch_quantity` / `batch_status` 四列。
+/// 让公式只吃这个窄结构，两个消费方各自在边界摊平一次，**公式本体只有一份**。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SetsBatchRow {
+    pub part_id: i64,
+    /// 该行批次的件数。
+    pub batch_quantity: i32,
+    /// 该行批次的状态（分子只计 `READY_TO_SHIP`）。
+    pub batch_status: String,
+}
+
+/// 子件的窄投影（`min` 的定义域只需要 id 与工单总件数）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SetsChild {
+    pub part_id: i64,
+    /// `t_part.quantity`（工单总件数，整套比例的分母）。
+    pub part_quantity: i32,
+}
+
+/// 把 `(TPartBatch, TPart)` 行摊平成 [`SetsBatchRow`]。宽 → 窄的唯一入口。
+fn narrow(rows: &[(TPartBatch, TPart)]) -> Vec<SetsBatchRow> {
+    rows.iter()
+        .map(|(b, p)| SetsBatchRow {
+            part_id: p.id,
+            batch_quantity: b.quantity,
+            batch_status: b.status.clone(),
+        })
+        .collect()
+}
+
+/// 把「装配件 → 全部子件」摊平成 [`SetsChild`]。宽 → 窄的唯一入口。
+fn narrow_children(children_by_asm: &HashMap<i64, Vec<TPart>>) -> HashMap<i64, Vec<SetsChild>> {
+    children_by_asm
+        .iter()
+        .map(|(k, v)| {
+            (
+                *k,
+                v.iter()
+                    .map(|c| SetsChild {
+                        part_id: c.id,
+                        part_quantity: c.quantity,
+                    })
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// 套数公式本体（纯内存、无 SQL、无 IO）。
 ///
-/// **返回集合 = `asm_quantity` 的 key**（不是「本单引用过」的装配件全集）：软删 /
-/// 不存在的装配件不在 map 里，也就不出现在结果里 —— 打印侧据此不把它的 id 写进
-/// `assembly_ids`，python 端 `assembly_map` 缺它，其子件按散件行打印。
-pub(crate) fn note_shippable_sets(
-    rows: &[(TPartBatch, TPart)],
+/// 入参见 [`note_shippable_sets`] 的同名条目；本函数是唯一实现，
+/// `note_shippable_sets` 只是宽 → 窄的适配壳。
+pub(crate) fn shippable_sets(
+    rows: &[SetsBatchRow],
     asm_quantity: &HashMap<i64, i32>,
-    children_by_asm: &HashMap<i64, Vec<TPart>>,
+    children_by_asm: &HashMap<i64, Vec<SetsChild>>,
 ) -> HashMap<i64, i32> {
-    // 本单上每个子件 part 的批次量合计（同 part 多批次折叠，与 python 端
-    // `_build_print_rows` 的 `qty_by_part` 求和同口径）。本单没批次的子件
-    // 不进这张表，下面查不到时按 0 参与 min。
+    // 本单上每个子件 part 的批次量合计（同 part 多批次折叠）。
+    //
+    // ⚠️ 分子**只计 `READY_TO_SHIP`**（2026-10-08）：入单只允许该状态 ⇒ DRAFT 单上
+    // 挂到的批次恒为 READY_TO_SHIP，本过滤在正常数据上不改变结果，但让本口径与
+    // 「可入单」定义同源，且对「挂单后被旁路改成 INSPECTION / IN_PROCESS」的脏数据
+    // 不再虚高套数。
+    //
+    // 过滤在**本函数内**做而不是改 `rows` 的来源（`list_with_part_by_delivery_note`）：
+    // 该 repo 方法还服务详情 VO 的行项装配（行上要显示真实 status 与 quantity），
+    // 由它顺带过滤会让「本单有哪些行」与「本单能出几套」两个口径分叉。
     let mut note_qty_by_part: HashMap<i64, i64> = HashMap::new();
-    for (b, p) in rows {
-        *note_qty_by_part.entry(p.id).or_insert(0) += i64::from(b.quantity);
+    for r in rows {
+        if r.batch_status != STATUS_READY_TO_SHIP {
+            continue;
+        }
+        *note_qty_by_part.entry(r.part_id).or_insert(0) += i64::from(r.batch_quantity);
     }
 
     // 每个装配件取「全部子件」的 per_set 最小值；`part.quantity == 0` 的子件不参与。
@@ -109,13 +164,13 @@ pub(crate) fn note_shippable_sets(
     for (asm_id, cap) in asm_quantity {
         let cap = i64::from(*cap);
         let mut min_per_set: Option<i64> = None;
-        let empty: Vec<TPart> = Vec::new();
+        let empty: Vec<SetsChild> = Vec::new();
         for child in children_by_asm.get(asm_id).unwrap_or(&empty) {
-            if child.quantity == 0 {
+            if child.part_quantity == 0 {
                 continue;
             }
-            let note_qty = note_qty_by_part.get(&child.id).copied().unwrap_or(0);
-            let per_set = note_qty * cap / i64::from(child.quantity);
+            let note_qty = note_qty_by_part.get(&child.part_id).copied().unwrap_or(0);
+            let per_set = note_qty * cap / i64::from(child.part_quantity);
             min_per_set = Some(match min_per_set {
                 Some(cur) => cur.min(per_set),
                 None => per_set,
@@ -126,6 +181,37 @@ pub(crate) fn note_shippable_sets(
         out.insert(*asm_id, i32::try_from(sets).unwrap_or(0));
     }
     out
+}
+
+/// 算每个装配件的「本单可出货套数」，key = 装配件 id。
+///
+/// 入参：
+/// - `rows` —— `PartBatchRepo::list_with_part_by_delivery_note` 的结果（本单
+///   全部未删批次 × 对应工单，`ORDER BY pb.id ASC`）。**状态不在这里过滤**，
+///   过滤在本函数内做（见上方「分子只计 READY_TO_SHIP」）；
+/// - `asm_quantity` —— `装配件 id → t_assembly.quantity`（工单总套数，既是
+///   `per_set` 的比例因子、也是 `LEAST` 收口上界）。**只收 quantity 而不是整个
+///   `TAssembly`**：本函数不需要装配件的其它字段，调用方就不必为了算套数而
+///   clone 整行（`handler/print.rs` 原先的 `asms.iter().map(|(a.id, a.clone()))`）；
+/// - `children_by_asm` —— `装配件 id → 全部未软删子件`（`min` 的定义域，见模块
+///   文档「`min` 的定义域」一节）。缺键 = 该装配件无子件 ⇒ 0 套。
+///
+/// **分子只计 `status == "READY_TO_SHIP"` 的批次**（2026-10-08 起），理由见模块
+/// doc「与全局已送口径的有意分叉」一节。
+///
+/// **返回集合 = `asm_quantity` 的 key**（不是「本单引用过」的装配件全集）：软删 /
+/// 不存在的装配件不在 map 里，也就不出现在结果里 —— 对应行上 `shippable_sets`
+/// 取 `None`，其子件按散件行展示。
+pub(crate) fn note_shippable_sets(
+    rows: &[(TPartBatch, TPart)],
+    asm_quantity: &HashMap<i64, i32>,
+    children_by_asm: &HashMap<i64, Vec<TPart>>,
+) -> HashMap<i64, i32> {
+    shippable_sets(
+        &narrow(rows),
+        asm_quantity,
+        &narrow_children(children_by_asm),
+    )
 }
 
 #[cfg(test)]
@@ -376,6 +462,47 @@ mod tests {
             note_shippable_sets(&rows, &asms, &children).get(&10),
             Some(&0),
             "子件 11 本单无批次 ⇒ 0 套；行里的 part 99 不该被当成子件 11 的量"
+        );
+    }
+
+    /// ★ 2026-10-08 回归锁：分子**只计 READY_TO_SHIP**。
+    ///
+    /// 装配件 3 套；两个子件各有一半在 INSPECTION：
+    /// - F1001-01：整单 9 件，批次 5 件 READY_TO_SHIP + 4 件 IN_PROCESS
+    /// - F1001-02：整单 6 件，批次 4 件 READY_TO_SHIP + 2 件 INSPECTION
+    ///
+    /// 收窄前（不过滤状态）：per_set 分别为 9×3/9 = 3 与 6×3/6 = 3 ⇒ min = **3 套**。
+    /// 收窄后（只计 READY_TO_SHIP）：per_set 为 5×3/9 = 1（向零截断）与
+    /// 4×3/6 = 2 ⇒ min = **1 套**。后者才是「这批货现在真能凑出几套整套」的答案
+    /// —— INSPECTION 的货还没过检，不能算进可出货套数。
+    #[test]
+    fn only_ready_to_ship_batches_count_toward_sets() {
+        let mut ready = batch(1, 11, 5);
+        ready.status = "READY_TO_SHIP".to_string();
+        let mut inspecting = batch(2, 11, 4);
+        inspecting.status = "IN_PROCESS".to_string();
+
+        let mut ready2 = batch(3, 12, 4);
+        ready2.status = "READY_TO_SHIP".to_string();
+        let mut inspecting2 = batch(4, 12, 2);
+        inspecting2.status = "INSPECTION".to_string();
+
+        let rows = vec![
+            (ready, child_part(11, Some(20), 9)),
+            (inspecting, child_part(11, Some(20), 9)),
+            (ready2, child_part(12, Some(20), 6)),
+            (inspecting2, child_part(12, Some(20), 6)),
+        ];
+        let asms = HashMap::from([(20, 3)]);
+        let children = HashMap::from([(
+            20,
+            vec![child_part(11, Some(20), 9), child_part(12, Some(20), 6)],
+        )]);
+        assert_eq!(
+            note_shippable_sets(&rows, &asms, &children).get(&20),
+            Some(&1),
+            "只计 READY_TO_SHIP：5×3/9=1（截断）与 4×3/6=2，min=1；\
+             若把 INSPECTION / IN_PROCESS 也计入会算出 3 套（错的）"
         );
     }
 

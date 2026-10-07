@@ -1,0 +1,576 @@
+//! `POST /api/v2/com/delivery/note/scan` —— 扫码入单（**唯一**入单入口）
+//!
+//! ## 请求体（客户端**不传批次 version**）
+//! ```rust
+//! pub struct ScanEntryRequest {
+//!     pub serial_no: String,          // 扫码串：定位 L1 → find-or-create 草稿
+//!     pub note_version: Option<i32>,  // draft 非 null 时必填（送货单 OCC）
+//!     pub entries: Vec<ScanEntry>,
+//! }
+//! pub struct ScanEntry {
+//!     pub node_kind: String,   // "ASSEMBLY" | "PART"
+//!     pub node_id: i64,        // JSON string
+//!     pub sets: Option<i32>,      // node_kind=ASSEMBLY 时必填（套数）
+//!     pub quantity: Option<i32>,  // node_kind=PART 时必填（件数）
+//! }
+//! ```
+//!
+//! 批次 version **不收**：分配在服务端事务内完成，读到的就是最新 —— 让客户端回传
+//! 一个可能已过期的版本只会制造假的 OCC 冲突。
+//!
+//! ## 处理流程（Step 编号即代码分段编号）
+//! ```text
+//! 1. 角色守卫 Manager / Clerk / Inspector
+//! 2. 打开 tx
+//! 3. scan_find_or_create_draft(l1_id) —— 判定键单键 (customer_id, DRAFT)
+//! 4. 命中既有单：obj.version != note_version ⇒ 40901 VERSION_CONFLICT
+//!    （23505 撞唯一索引时已在 find-or-create 内部重查一次，兜并发扫码）
+//! 5. 解析 serial_no → 得到 targets（零件 + 装配件的全部子件）
+//! 6. 对每个 entry：
+//!    ├─ PART      → eligible = 该零件 READY_TO_SHIP 且未占用的活跃批次
+//!    │              target = quantity，DP 分配
+//!    └─ ASSEMBLY → sets <= entry_max_sets（否则 21405）
+//!                   对**每个**子件：target = sets × (part.quantity / assembly.quantity)
+//!                   各跑一次 DP（子件之间不耦合）
+//! 7. 汇总 split_batch + attach_to_note（同事务）
+//! 8. note.version++ → commit → WS 广播 DELIVERY_NOTE_SCAN_ADD
+//! 9. 返回 DeliveryNoteDetailOut（含拆批后的完整行项，前端可就地替换草稿卡）
+//! ```
+//!
+//! ## 校验闸门
+//! | 检查 | 错误码 |
+//! |---|---|
+//! | 批次 status ≠ `READY_TO_SHIP`（含 `INSPECTION`） | 21405 |
+//! | 批次已挂在别的 `DRAFT`/`SUBMITTED` 单上 | 21406 |
+//! | 零件的 L1 客户 ≠ 单据 L1 客户 | 21407 |
+//! | DP 不可行（凑不出 / 差额 > 0 且无可拆批次） | 21405 |
+//! | `sets` > `entry_max_sets` | 21405 |
+//!
+//! ### ⚠️ `INSPECTION` 必须显式分支，绝不走兜底沉默
+//! 入单口径从 `{INSPECTION, READY_TO_SHIP}` 收窄为 `{READY_TO_SHIP}` 后，
+//! `INSPECTION` 批次会掉进分类循环的兜底臂 —— 那段注释自称「剩下的合法状态只有
+//! `READY_TO_SHIP`（已收进 attachable）」，即它声称自己不可达。若真让 `INSPECTION`
+//! 掉进去：`all_attachable_empty = true` ⇒ 返回 `AlreadyPresent` ⇒ 前端弹「已在
+//! XX 上」，**但它根本没被挂上去**。这是静默说谎。
+//!
+//! ⇒ 本文件在分类循环里给 `INSPECTION` 显式分支，收集到 `not_ready` 列表，循环
+//! 结束后一次性 `Err(21405)` 并带上 part_id / serial_no / batch_no 明细。
+
+use std::collections::HashMap;
+
+use super::batch_allocation::allocate;
+use super::scan_tree::l1_of;
+use super::shippable_sets::{SetsBatchRow, SetsChild, shippable_sets};
+use crate::auth::rbac::{CurrentUser, Role};
+use crate::infra::clock::now_naive;
+use crate::modules::assembly::model::TAssembly;
+use crate::modules::assembly::repo::AssemblyRepo;
+use crate::modules::com::delivery_note::repo::DeliveryNoteRepoTrait;
+use crate::modules::com::delivery_note::repo::scan_tree::DeliveryScanRepo;
+use crate::modules::com::delivery_note::vo::DeliveryNoteDetailOut;
+use crate::modules::part::model::TPart;
+use crate::modules::part::repo::PartRepo;
+use crate::modules::prod::batch::repo::PartBatchRepo;
+use crate::shared::batch::TPartBatch;
+use crate::shared::error::{AppError, code};
+
+use super::DeliveryNoteService;
+use super::inner::get_with_parts;
+
+/// `entries[].node_kind` 的取值白名单。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeKind {
+    Assembly,
+    Part,
+}
+
+impl NodeKind {
+    fn parse(raw: &str) -> Result<Self, AppError> {
+        match raw {
+            "ASSEMBLY" => Ok(Self::Assembly),
+            "PART" => Ok(Self::Part),
+            other => Err(AppError::validation(format!(
+                "node_kind 必须是 ASSEMBLY 或 PART，收到 {other:?}"
+            ))),
+        }
+    }
+}
+
+/// 入单唯一允许的批次状态。
+const STATUS_READY_TO_SHIP: &str = "READY_TO_SHIP";
+
+/// 一批「已占用但不属于本单」的批次明细（报 21406 时附在 message 里）。
+struct OccupiedDetail {
+    part_id: i64,
+    batch_no: i32,
+    on_note_id: i64,
+}
+
+/// 一批「状态不是 READY_TO_SHIP」的批次明细（报 21405 时附在 message 里）。
+struct NotReadyDetail {
+    part_id: i64,
+    serial_no: String,
+    batch_no: i32,
+    status: String,
+}
+
+impl DeliveryNoteService {
+    /// `POST /api/v2/com/delivery/note/scan` —— 扫码入单。
+    ///
+    /// 见模块 doc 的完整流程与闸门表。事务边界：handler `pool.begin()` → 这里 →
+    /// handler `commit()`；本方法不 commit、不发广播。
+    pub async fn scan_entry<R: DeliveryNoteRepoTrait>(
+        &self,
+        mut repo: R,
+        req: crate::modules::com::delivery_note::dto::ScanEntryRequest,
+        current: &CurrentUser,
+    ) -> Result<DeliveryNoteDetailOut, AppError> {
+        // ===== Step 1: 角色守卫 =====
+        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
+
+        // ===== Step 2: 解析入参 =====
+        let serial_no = req.serial_no.trim();
+        if serial_no.is_empty() {
+            return Err(AppError::validation("serial_no must not be empty"));
+        }
+        if req.entries.is_empty() {
+            return Err(AppError::validation("entries must not be empty"));
+        }
+
+        // ===== Step 3: find-or-create 草稿（判定键单键） =====
+        //
+        // 先解析 serial_no 拿到锚点客户（L1 由它上推）—— 建单必须发生在拿到 L1 之后，
+        // 否则「扫了个不存在的码」也会凭空建出一张草稿。
+        let anchor_customer_id =
+            match DeliveryScanRepo::find_part_by_serial(&mut *repo.conn_mut(), serial_no).await? {
+                Some(p) => p.customer_id,
+                None => {
+                    let asm =
+                        DeliveryScanRepo::find_assembly_by_serial(&mut *repo.conn_mut(), serial_no)
+                            .await?
+                            .ok_or_else(|| {
+                                AppError::biz(
+                                    code::BIZ_DELIVERY_SCAN_UNKNOWN_CODE,
+                                    format!("序列号 {serial_no} 未找到对应零件或装配件"),
+                                )
+                            })?;
+                    asm.customer_id
+                }
+            };
+        // 锚点客户 = 扫码命中的零件 / 装配件所属客户；L1 由它上推一级。
+        let l1_id = l1_of(anchor_customer_id, &mut *repo.conn_mut()).await?;
+
+        let mut note = self
+            .scan_find_or_create_draft(&mut *repo.conn_mut(), l1_id, current)
+            .await?;
+
+        // ===== Step 4: OCC =====
+        // `note_version` 在「命中既有单」时必填；草稿刚建出来时前端拿不到 version，
+        // 传 None 也接受（刚建的单 version 必为 0，无并发可冲突）。
+        if let Some(v) = req.note_version
+            && v != note.version
+        {
+            return Err(super::inner::note_version_conflict(
+                note.id,
+                note.version,
+                v,
+            ));
+        }
+
+        // ===== Step 5: 解析 entries → 每个零件的 target 件数 =====
+        let targets = self
+            .resolve_entry_targets(&mut *repo.conn_mut(), &req.entries, note.customer_id)
+            .await?;
+
+        // ===== Step 6: 逐零件分类（可入单 / 已占用 / 未过检） =====
+        let part_ids: Vec<i64> = targets.keys().copied().collect();
+        let all_batches = PartBatchRepo::list_active_by_part_ids(&mut *repo.conn_mut(), &part_ids)
+            .await?
+            .into_iter()
+            .filter(|b| part_ids.contains(&b.part_id))
+            .collect::<Vec<_>>();
+        let eligible =
+            DeliveryScanRepo::list_entryable_batches_by_part_ids(&mut *repo.conn_mut(), &part_ids)
+                .await?;
+
+        // 批次自身信息（serial_no / part 名）用于错误明细，懒加载。
+        let part_rows = PartRepo::list_by_ids(&mut *repo.conn_mut(), &part_ids, false).await?;
+        let part_map: HashMap<i64, TPart> = part_rows.into_iter().map(|p| (p.id, p)).collect();
+
+        let mut eligible_by_part: HashMap<i64, Vec<TPartBatch>> = HashMap::new();
+        for b in eligible {
+            eligible_by_part.entry(b.part_id).or_default().push(b);
+        }
+
+        // 21406 收集：批次挂在别的 `DRAFT` / `SUBMITTED` 单上。
+        let mut occupied: Vec<OccupiedDetail> = Vec::new();
+        let mut note_ids_involved: Vec<i64> = Vec::new();
+        // 21405 收集：`INSPECTION` 批次（**显式分支，绝不走兜底沉默**）。
+        let mut not_ready: Vec<NotReadyDetail> = Vec::new();
+        for b in &all_batches {
+            if let Some(other_id) = b.delivery_note_id
+                && other_id != note.id
+            {
+                note_ids_involved.push(other_id);
+            }
+        }
+        // 批量取占用方单据（去重），只保留「活跃」的（DRAFT / SUBMITTED 算占用）。
+        note_ids_involved.sort_unstable();
+        note_ids_involved.dedup();
+        let active_note_ids: std::collections::HashSet<i64> = if note_ids_involved.is_empty() {
+            Default::default()
+        } else {
+            repo.note_list_by_ids(&note_ids_involved, false)
+                .await?
+                .into_iter()
+                .filter(|n| n.status == "DRAFT" || n.status == "SUBMITTED")
+                .map(|n| n.id)
+                .collect()
+        };
+        for b in &all_batches {
+            match b.delivery_note_id {
+                Some(other_id) if other_id != note.id && active_note_ids.contains(&other_id) => {
+                    occupied.push(OccupiedDetail {
+                        part_id: b.part_id,
+                        batch_no: b.batch_no,
+                        on_note_id: other_id,
+                    });
+                }
+                _ => {
+                    // 不是「被占用」⇒ 判状态。READY_TO_SHIP 由 repo 的
+                    // `list_entryable_batches_by_part_ids` 保证进了 `eligible`，
+                    // 其余一律收集到 not_ready 并显式报 21405。
+                    if b.status != STATUS_READY_TO_SHIP {
+                        not_ready.push(NotReadyDetail {
+                            part_id: b.part_id,
+                            serial_no: part_map
+                                .get(&b.part_id)
+                                .and_then(|p| p.serial_no.clone())
+                                .unwrap_or_default(),
+                            batch_no: b.batch_no,
+                            status: b.status.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
+        if !occupied.is_empty() {
+            let detail = occupied
+                .iter()
+                .map(|d| {
+                    format!(
+                        "part {} 批次 {} 已在送货单 {}",
+                        d.part_id, d.batch_no, d.on_note_id
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("；");
+            return Err(AppError::biz(
+                code::BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED,
+                format!("以下批次已被其它有效送货单占用：{detail}"),
+            ));
+        }
+        if !not_ready.is_empty() {
+            let detail = not_ready
+                .iter()
+                .map(|d| {
+                    format!(
+                        "part {}（{}）批次 {} status={}",
+                        d.part_id, d.serial_no, d.batch_no, d.status
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("；");
+            return Err(AppError::biz(
+                code::BIZ_DELIVERY_NOTE_PART_NOT_READY,
+                format!("入单只允许 READY_TO_SHIP；以下批次未过检：{detail}"),
+            ));
+        }
+
+        // ===== Step 7: DP 分配 + 拆批 + 挂单（同一事务） =====
+        let now = now_naive();
+        let mut attached: Vec<(i64, i32)> = Vec::new();
+        let mut split_calls: Vec<SplitCall> = Vec::new();
+        for (part_id, target) in &targets {
+            let cands = eligible_by_part.get(part_id).cloned().unwrap_or_default();
+            // DP 要求候选按 (quantity ASC, batch_no ASC) 排序；repo 已保证，
+            // 这里再排一次是为了不把「排序契约」只写在 repo 的注释里。
+            let mut cands = cands;
+            cands.sort_by(|a, b| {
+                a.quantity
+                    .cmp(&b.quantity)
+                    .then(a.batch_no.cmp(&b.batch_no))
+            });
+            let plan = allocate(*target, &cands)?;
+            attached.extend(plan.iter().copied());
+            for (batch_id, qty) in plan {
+                let src = cands
+                    .iter()
+                    .find(|b| b.id == batch_id)
+                    .expect("DP 只可能返回候选内的 batch_id");
+                if qty < src.quantity {
+                    split_calls.push(SplitCall {
+                        source_id: src.id,
+                        qty,
+                    });
+                }
+            }
+        }
+        if attached.is_empty() {
+            return Err(AppError::biz(
+                code::BIZ_DELIVERY_NOTE_PART_NOT_READY,
+                "没有可入单的批次（请先完成品检让批次到 READY_TO_SHIP）",
+            ));
+        }
+
+        // 拆批：差额新建独立批次行并挂单；原批次保持不动（不挂单、不改 status）。
+        let mut final_batches: Vec<(i64, i32)> = Vec::new();
+        for c in &split_calls {
+            let src =
+                crate::shared::batch::get_batch_by_id(&mut *repo.conn_mut(), c.source_id, false)
+                    .await?
+                    .ok_or_else(|| {
+                        AppError::biz(
+                            code::BIZ_PART_BATCH_NOT_FOUND,
+                            format!("batch {} 不存在或已删除", c.source_id),
+                        )
+                    })?;
+            let new_id = self.snowflake.next_id();
+            PartBatchRepo::split_batch(
+                &mut *repo.conn_mut(),
+                new_id,
+                src.id,
+                src.version,
+                src.part_id,
+                c.qty,
+                &src.status,
+                src.location.as_deref(),
+                src.current_holder_id,
+                src.current_process_step_id,
+                now,
+                Some(current.id),
+                Some(current.id),
+            )
+            .await?;
+            final_batches.push((new_id, c.qty));
+        }
+        // 整批入单的批次直接挂。
+        for (batch_id, qty) in &attached {
+            let already_split = split_calls.iter().any(|c| c.source_id == *batch_id);
+            if !already_split {
+                final_batches.push((*batch_id, *qty));
+            }
+        }
+
+        for (batch_id, qty) in &final_batches {
+            let b = crate::shared::batch::get_batch_by_id(&mut *repo.conn_mut(), *batch_id, false)
+                .await?
+                .ok_or_else(|| {
+                    AppError::biz(
+                        code::BIZ_PART_BATCH_NOT_FOUND,
+                        format!("batch {batch_id} 不存在或已删除"),
+                    )
+                })?;
+            let affected = PartBatchRepo::attach_to_note(
+                &mut *repo.conn_mut(),
+                b.id,
+                b.version,
+                note.id,
+                now,
+                Some(current.id),
+            )
+            .await?;
+            if affected == 0 {
+                return Err(AppError::biz(
+                    code::VERSION_CONFLICT,
+                    format!("batch {batch_id} version conflict during scan attach（数量 {qty}）"),
+                ));
+            }
+        }
+
+        // ===== Step 8: 送货单 version++ =====
+        note.version += 1;
+        note.updated_at = now;
+        note.updated_by = Some(current.id);
+        let affected = repo.note_update(&note).await?;
+        if affected == 0 {
+            return Err(AppError::biz(
+                code::VERSION_CONFLICT,
+                "concurrent modification detected",
+            ));
+        }
+
+        // ===== Step 9: 返回完整详情（含拆批后的行项，前端可替换草稿卡） =====
+        get_with_parts(&mut *repo.conn_mut(), note.id).await
+    }
+
+    /// 把 `entries[]` 解析成「part_id → 本次该零件要入单的总件数」。
+    ///
+    /// 装配件条目会展开成「每个子件 × sets 套的用量」；同一 part 被多个条目命中时
+    /// **件数相加**（例如前端同时送「装配件 A 的 2 套」与「A 的某个子件 3 件」，
+    /// 该子件本次共入 2×per_set + 3 件）。
+    async fn resolve_entry_targets(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        entries: &[crate::modules::com::delivery_note::dto::ScanEntry],
+        note_customer_id: i64,
+    ) -> Result<HashMap<i64, i32>, AppError> {
+        let mut out: HashMap<i64, i32> = HashMap::new();
+        for e in entries {
+            match NodeKind::parse(&e.node_kind)? {
+                NodeKind::Part => {
+                    let quantity = e.quantity.ok_or_else(|| {
+                        AppError::validation(format!(
+                            "node_kind=PART 的条目（node_id={}）必须带 quantity",
+                            e.node_id
+                        ))
+                    })?;
+                    if quantity <= 0 {
+                        return Err(AppError::validation(format!(
+                            "quantity must be positive, got {quantity}"
+                        )));
+                    }
+                    // 散件树里扫子件条码也归到这里：扫到的是子件就按子件算件数。
+                    let part = PartRepo::get_by_id(&mut *conn, e.node_id, false)
+                        .await?
+                        .ok_or_else(|| {
+                            AppError::biz(
+                                code::BIZ_PART_NOT_FOUND,
+                                format!("part {} not found", e.node_id),
+                            )
+                        })?;
+                    check_l1(&mut *conn, &part, note_customer_id).await?;
+                    *out.entry(part.id).or_insert(0) += quantity;
+                }
+                NodeKind::Assembly => {
+                    let sets = e.sets.ok_or_else(|| {
+                        AppError::validation(format!(
+                            "node_kind=ASSEMBLY 的条目（node_id={}）必须带 sets",
+                            e.node_id
+                        ))
+                    })?;
+                    if sets <= 0 {
+                        return Err(AppError::validation(format!(
+                            "sets must be positive, got {sets}"
+                        )));
+                    }
+                    let asm = AssemblyRepo::get_by_id(&mut *conn, e.node_id, false)
+                        .await?
+                        .ok_or_else(|| {
+                            AppError::biz(
+                                code::BIZ_ASSEMBLY_NOT_FOUND,
+                                format!("assembly {} not found", e.node_id),
+                            )
+                        })?;
+                    let children = PartRepo::list_children(&mut *conn, e.node_id, false).await?;
+                    if children.is_empty() {
+                        return Err(AppError::biz(
+                            code::BIZ_DELIVERY_NOTE_PART_NOT_READY,
+                            format!("装配件 {} 没有活跃子件，无法按套入单", asm.id),
+                        ));
+                    }
+                    // 可组套数：把该装配件全部子件的「可入单」批次喂进与扫码树
+                    // `entry_max_sets` 同一个公式 ⇒ 前端看到的上限与这里的上限同源。
+                    let cap = entry_max_sets(&mut *conn, &asm, &children).await?;
+                    if sets > cap {
+                        return Err(AppError::biz(
+                            code::BIZ_DELIVERY_NOTE_PART_NOT_READY,
+                            format!(
+                                "装配件 {} 要送 {sets} 套，但当前最多只能组 {cap} 套",
+                                asm.id
+                            ),
+                        ));
+                    }
+                    // 每个子件：target = sets × (part.quantity / assembly.quantity)
+                    //（整数除法向零截断，与扫码树 `per_set_parts` 同口径）。
+                    for c in &children {
+                        check_l1(&mut *conn, c, note_customer_id).await?;
+                        if asm.quantity == 0 {
+                            return Err(AppError::biz(
+                                code::BIZ_DELIVERY_NOTE_PART_NOT_READY,
+                                format!("装配件 {} 的总套数为 0，无法按套入单", asm.id),
+                            ));
+                        }
+                        let per_set = c.quantity / asm.quantity;
+                        if per_set == 0 {
+                            return Err(AppError::biz(
+                                code::BIZ_DELIVERY_NOTE_PART_NOT_READY,
+                                format!(
+                                    "装配件 {} 的子件 {} 每套用量为 0（整单 {} 件 / 总 {} 套）",
+                                    asm.id, c.id, c.quantity, asm.quantity
+                                ),
+                            ));
+                        }
+                        *out.entry(c.id).or_insert(0) += sets * per_set;
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// 一次拆批调用的参数（收集后统一执行，让「先算完全部分配、再写库」的边界可见）。
+struct SplitCall {
+    source_id: i64,
+    /// 从源批次拆出的件数（小于源批次数量 ⇒ 需拆批）。
+    qty: i32,
+}
+
+/// L1 一致性闸门：零件所属客户的 L1 必须等于单据 L1（21407）。
+///
+/// 「零件的 L1」与「单据的 L1」是两个独立查询的结果（零件表存的是 L2 客户），所以
+/// 这里现查一次 `t_customer` 而不是信任入参。
+async fn check_l1(
+    conn: &mut sqlx::PgConnection,
+    part: &TPart,
+    note_customer_id: i64,
+) -> Result<(), AppError> {
+    let l1 = l1_of(part.customer_id, &mut *conn).await?;
+    if l1 != note_customer_id {
+        return Err(AppError::biz(
+            code::BIZ_DELIVERY_NOTE_PARTS_MULTIPLE_CUSTOMERS,
+            format!(
+                "part {} 所属 L1 客户 {} != 送货单 L1 客户 {}",
+                part.id, l1, note_customer_id
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// 装配件的「可组套数」上限：把全部子件的**可入单**批次喂进与扫码树
+/// `entry_max_sets` 同一个 `shippable_sets` 公式。
+async fn entry_max_sets(
+    conn: &mut sqlx::PgConnection,
+    asm: &TAssembly,
+    children: &[TPart],
+) -> Result<i32, AppError> {
+    let part_ids: Vec<i64> = children.iter().map(|c| c.id).collect();
+    let entryable =
+        DeliveryScanRepo::list_entryable_batches_by_part_ids(&mut *conn, &part_ids).await?;
+    let rows: Vec<SetsBatchRow> = entryable
+        .iter()
+        .map(|b| SetsBatchRow {
+            part_id: b.part_id,
+            batch_quantity: b.quantity,
+            batch_status: b.status.clone(),
+        })
+        .collect();
+    let asm_quantity = HashMap::from([(asm.id, asm.quantity)]);
+    let children_by_asm = HashMap::from([(
+        asm.id,
+        children
+            .iter()
+            .map(|c| SetsChild {
+                part_id: c.id,
+                part_quantity: c.quantity,
+            })
+            .collect::<Vec<_>>(),
+    )]);
+    Ok(shippable_sets(&rows, &asm_quantity, &children_by_asm)
+        .get(&asm.id)
+        .copied()
+        .unwrap_or(0))
+}

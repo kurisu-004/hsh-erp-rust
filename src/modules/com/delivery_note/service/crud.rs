@@ -349,9 +349,9 @@ impl DeliveryNoteService {
         Ok(out.into_iter().next().unwrap())
     }
 
-    // ---------- remove_parts ----------
+    // ---------- remove_batches ----------
 
-    pub async fn remove_parts<R: DeliveryNoteRepoTrait>(
+    pub async fn remove_batches<R: DeliveryNoteRepoTrait>(
         &self,
         mut repo: R,
         note_id: i64,
@@ -372,7 +372,7 @@ impl DeliveryNoteService {
             return Err(AppError::biz(
                 code::BIZ_DELIVERY_NOTE_PARTS_LOCKED,
                 format!(
-                    "送货单已提交（{}），不能移除零件；如需调整请先撤回。",
+                    "送货单已提交（{}），不能移除批次；如需调整请先撤回。",
                     obj.status
                 ),
             ));

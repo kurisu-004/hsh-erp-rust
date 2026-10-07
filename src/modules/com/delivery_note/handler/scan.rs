@@ -1,93 +1,85 @@
-//! delivery_note 域扫码入单 handler
+//! com::delivery_note 域扫码入单 / 扫码树 handler
 //!
-//! 范围：扫码入单端点 `/scan`（`scan_delivery_note`）。
+//! 两个端点同源（都以 `serial_no` 为入口），但职责严格分开：
+//! - `GET /api/v2/com/delivery/note/scan/{serial_no}` —— **纯读**三层树。回答
+//!   「这是谁的件 / 现在什么状态 / 每个批次能点什么动作 / 现有草稿在哪」。绝不建单。
+//! - `POST /api/v2/com/delivery/note/scan` —— **唯一**入单入口。在同一事务内完成
+//!   find-or-create 草稿 + DP 分配 + 拆批 + 挂单 + `note.version++`。
 //!
-//! 2026-10-08：弹窗附挂批次端点 `/attach-batches` 随入单入口收敛一并删除
-//! （`POST /scan` 在同一事务内完成分配 + 挂单，不再需要前端二次勾选提交）。
+//! 角色：Manager / Clerk / Inspector（与送货单其余端点同一组；`ShelfAccount` 不放行
+//! —— 它只该扫码核销批次，不该开送货单）。
 //!
-//! 流程（`scan_delivery_note`）：trim → 解析（part → assembly）→ 分类 → find-or-create 草稿 → 批次
-//! 评估 → 写 `delivery_note_id`（整个流程在事务内）。commit 后广播一次大屏事件
-//! `DELIVERY_NOTE_SCAN_ADD`（轻量级 high-frequency）。
-//!
-//! 角色：M / C / I（与 Python `pickup_scan` 对应，但 Python 仅 I；这里放宽允许
-//! MANAGER/CLERK 调试用，与 `create_draft` 一致）。
-//!
-//! ## 约定（2026-09-22 D-5 + review 第 1 轮）
+//! ## 约定
 //! - 事务边界在 handler：`state.pool.begin()` → 借 `&mut *tx` 喂给 service → 显式
 //!   `tx.commit()`；提前 return（`?`）时 `Transaction` 的 Drop 自动回滚。
-//! - **service 形参 by-value trait**（iam 严格范本）：handler 借 `&mut *tx` 给
-//!   `state.delivery_note_service.xxx(&mut *tx, ...)` 或 `&mut *conn` 给读端点。
-//! - **handler 三形态**：
-//!   - ① 纯写端点 `pool.begin() → service → commit`；
-//!   - ② 写 + post-commit Redis / WS（broadcast 落 handler，service 不持有 WsHub）`pool.begin() → service → commit → state.ws_hub.broadcast(...)`；
-//!   - ③ 读端点（list_*/get_*）`pool.acquire() → service`，不开事务。
+//! - WS 广播在 `tx.commit()` **之后**（handler 形态②）。
 //! - 统一响应信封：`Result<Json<R<T>>, AppError>`。
-//! - 权限在 service 层（`current.require_any_role(...)`）；handler 这里只解析
-//!   query / path / body。
 
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Path, State};
 
-use crate::auth::rbac::{CurrentUser, Role};
-use crate::modules::com::delivery_note::dto::ScanDeliveryRequest;
-use crate::modules::com::delivery_note::vo::{ResolvedKindDto, ScanDeliveryOut, ScanOutcomeDto};
+use crate::auth::rbac::CurrentUser;
+use crate::modules::com::delivery_note::dto::ScanEntryRequest;
+use crate::modules::com::delivery_note::vo::{DeliveryNoteDetailOut, DeliveryScanTreeOut};
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
 
-/// POST /api/v2/com/delivery/note/scan  （设计 §5；P3）
+/// `GET /api/v2/com/delivery/note/scan/{serial_no}` —— 扫码三层树（纯读）。
 ///
-/// 扫码入单：trim → 解析（part → assembly）→ 分类 → find-or-create 草稿 → 批次
-/// 评估 → 写 `delivery_note_id`（整个流程在事务内）。commit 后广播一次大屏事件
-/// `DELIVERY_NOTE_SCAN_ADD`（轻量级 high-frequency）。
+/// `serial_no` 收 `Path<String>`（**不是** `ni64!` 数值提取器）：序列号是
+/// `varchar(15)` 且可能含 `-`，前端必须 `encodeURIComponent`。
 ///
-/// 角色：M / C / I（与 Python `pickup_scan` 对应，但 Python 仅 I；这里放宽允许
-/// MANAGER/CLERK 调试用，与 `create_draft` 一致）。
+/// 命中口径：先查 `t_part.serial_no`（软删闸门 + `ORDER BY (status='CANCELLED') ASC,
+/// id DESC LIMIT 1`），未命中再查 `t_assembly.serial_no`；都未命中 ⇒
+/// `20101 BIZ_PART_NOT_FOUND`（HTTP 404）。trim 后为空同样按未命中。
+pub async fn scan_tree(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(serial_no): Path<String>,
+) -> Result<Json<R<DeliveryScanTreeOut>>, AppError> {
+    // 读端点：pool.acquire() → service → drop。不开事务、不发广播、不建单。
+    let mut conn = state.pool.acquire().await?;
+    let out = state
+        .delivery_note_service
+        .scan_tree(&mut *conn, &current, &serial_no)
+        .await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// `POST /api/v2/com/delivery/note/scan` —— 扫码入单（唯一入口）。
+///
+/// 出参 `DeliveryNoteDetailOut` 含**拆批后的完整行项** ⇒ 前端可就地替换草稿卡，
+/// 不用重新扫一遍。
+///
+/// commit 后广播一次大屏事件 `DELIVERY_NOTE_SCAN_ADD`（轻量级 high-frequency）。
 pub async fn scan_delivery_note(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
-    Json(req): Json<ScanDeliveryRequest>,
-) -> Result<Json<R<ScanDeliveryOut>>, AppError> {
-    current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
+    Json(req): Json<ScanEntryRequest>,
+) -> Result<Json<R<DeliveryNoteDetailOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out = state
         .delivery_note_service
-        .scan_add(&mut *tx, &req.code, &current)
+        .scan_entry(&mut *tx, req, &current)
         .await?;
     tx.commit().await?;
 
-    let added_count = out.added_batches.len();
-    let note_id = out.note.id;
-    let note_no = out.note.delivery_note_no.clone();
-    let unresolved_count = out
-        .unresolved_targets
-        .as_ref()
-        .map(|v| v.len())
-        .unwrap_or(0);
+    let payload = serde_json::json!({
+        "delivery_note_id": out.head.id,
+        "delivery_note_no": out.head.delivery_note_no,
+        "line_count": out.line_items.len(),
+        "version": out.head.version,
+    });
     state
         .ws_hub
         .broadcast(crate::infra::ws_hub::WsEvent::DashboardEvent {
             kind: "DELIVERY_NOTE_SCAN_ADD".to_string(),
-            payload: serde_json::json!({
-                "delivery_note_id": note_id,
-                "delivery_note_no": note_no,
-                "added_count": added_count,
-                "unresolved_count": unresolved_count,
-                "line_count": out.note.line_count,
-                "resolved_kind": match out.resolved.kind {
-                    ResolvedKindDto::Part => "PART",
-                    ResolvedKindDto::Assembly => "ASSEMBLY",
-                },
-                "outcome": match out.outcome {
-                    ScanOutcomeDto::Added => "ADDED",
-                    ScanOutcomeDto::AlreadyPresent => "ALREADY_PRESENT",
-                    ScanOutcomeDto::CandidatesAvailable => "CANDIDATES_AVAILABLE",
-                    ScanOutcomeDto::PartialAdded => "PARTIAL_ADDED",
-                },
-            }),
+            payload: payload.clone(),
         });
+    tracing::info!(?payload, "delivery_note scan entry");
 
     Ok(Json(R::ok(out)))
 }

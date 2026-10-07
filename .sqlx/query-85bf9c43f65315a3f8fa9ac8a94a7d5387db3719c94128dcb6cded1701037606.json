@@ -1,0 +1,136 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                a.id AS \"id!\",\n                a.serial_no AS \"serial_no?\",\n                a.name AS \"name!\",\n                a.drawing_no AS \"drawing_no!\",\n                a.status AS \"status!\",\n                a.quantity AS \"quantity!\",\n                a.is_urgent AS \"is_urgent!\",\n                a.system_delivery_date AS \"system_delivery_date?\",\n                a.customer_id AS \"customer_id!\",\n                c.name AS \"customer_name?\"\n            FROM t_assembly a\n            LEFT JOIN t_customer c ON c.id = a.customer_id AND c.deleted_at IS NULL\n            WHERE a.id = $1\n              AND a.deleted_at IS NULL\n            LIMIT 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "serial_no?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "serial_no"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "name!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "drawing_no!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "drawing_no"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "status!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "quantity!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "quantity"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "is_urgent!",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "is_urgent"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "system_delivery_date?",
+        "type_info": "Date",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "system_delivery_date"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "customer_id!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "customer_id"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "customer_name?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_customer",
+            "name": "name"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "85bf9c43f65315a3f8fa9ac8a94a7d5387db3719c94128dcb6cded1701037606"
+}

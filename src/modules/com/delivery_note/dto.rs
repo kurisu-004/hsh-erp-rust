@@ -1,27 +1,31 @@
-//! delivery_note 域 DTO
+//! com::delivery_note 域 DTO（**仅** `Deserialize` 入参）
 //!
-//! 对应 Python myERP/schema/delivery_note.py。命名约定：
+//! 出参（响应）VO 全在 `super::vo`。命名约定：
 //! - `CreateXxxRequest` / `UpdateXxxRequest`：写操作入参
 //! - `XxxQuery` / `XxxPath`：查询 / 路径参数
 //! - `XxxRequest` / `XxxItem`：业务入参
 //!
-//! 出参（响应）VO 已拆分到 `super::vo`（2026-09-22 PR4 重构，对齐 iam
-//! vo/ 范本）。本文件仅保留 `Deserialize` 入参。
-//!
-//! 2026-10-08：删掉手动建单入参 `DeliveryNoteCreateRequest` / 入单条目
-//! `DeliveryNoteAddItem` / 添加零件入参 `DeliveryNoteAddPartsRequest` —— 入单入口
-//! 收敛为 `POST /scan` 单一入口后，前端不再有「先建单再挂批次」的两段式表单。
-//!
 //! ## 分段
 //! - 送货分组：创建 / 更新 / 软删三组入参
-//! - 送货单：版本化 OCC 入参 / partial update / 移除批次 / 领取 / 列表 query /
-//!   扫码入单
+//! - 送货单：扫码入单（`ScanEntryRequest` / `ScanEntry`）、版本化 OCC 入参 /
+//!   partial update / 移除批次 / 领取 / 列表 query / 路径参数
+//!
+//! ## 2026-10-08 删除的入参
+//! 手动建单（`DeliveryNoteCreateRequest` / `DeliveryNoteAddItem`）、添加零件
+//! （`DeliveryNoteAddPartsRequest`）、弹窗附挂批次（`AttachBatchesRequest`）、
+//! 候选取批（`DeliveryNoteCandidatePartsQuery`）、待司机领取一览
+//! （`DeliveryNotePickupPendingQuery`）、送货台逐件扫码核销
+//! （`DeliveryNotePickupScanRequest`）—— 入单入口收敛为 `POST /scan` 单一入口后，
+//! 前端不再有「先建单 / 先挑批次再挂单 / 逐件核销」这几条并行路径。
+//!
+//! 打印端点的入参也不在本文件：转发链路上 body 以 `Json<Value>` 原样透传给 python，
+//! 字段语义由 python 端 schema 负责。
 
 use chrono::NaiveDate;
 use serde::Deserialize;
 
 // ===========================================================================
-//  P1：送货分组 DTO（设计 §6.1）
+//  送货分组 DTO
 // ===========================================================================
 
 /// 创建分组入参（POST /api/v2/com/delivery/group）
@@ -66,12 +70,40 @@ pub struct DeliveryGroupIdRequest {
 }
 
 // ===========================================================================
-//  P2：送货单生命周期 DTO（移植 + 范围字段扩展）
+//  送货单入参
 // ===========================================================================
 
-/// 移除零件入参（POST /api/v2/com/delivery/note/{id}/remove-parts）。
+/// `POST /api/v2/com/delivery/note/scan` 请求体（**唯一**入单入口）。
+///
+/// ⚠️ **不收批次 version**：分配在服务端事务内完成，读到的就是最新；让客户端回传
+/// 一个可能已过期的版本只会制造假的 OCC 冲突。
 #[derive(Debug, Clone, Deserialize)]
-pub struct DeliveryNoteRemovePartsRequest {
+pub struct ScanEntryRequest {
+    /// 扫码串（trim 后用于定位零件 / 装配件 → 上推 L1 → find-or-create 草稿）。
+    pub serial_no: String,
+    /// 送货单 OCC 锚。扫码树返回的 `draft` 非 null 时**必填**；新建草稿（前端还没
+    /// 拿到 version）时可缺省。
+    pub note_version: Option<i32>,
+    pub entries: Vec<ScanEntry>,
+}
+
+/// 一个入单条目（零件按件数、装配件按套数）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScanEntry {
+    /// `"ASSEMBLY"` | `"PART"`；其它值 400。
+    pub node_kind: String,
+    /// 节点 id（零件或装配件）。JSON **字符串**（雪花 id > 2^53）。
+    #[serde(deserialize_with = "crate::shared::types::deserialize_i64")]
+    pub node_id: i64,
+    /// `node_kind = ASSEMBLY` 时必填（套数，> 0）。
+    pub sets: Option<i32>,
+    /// `node_kind = PART` 时必填（件数，> 0）。
+    pub quantity: Option<i32>,
+}
+
+/// 移除批次入参（POST /api/v2/com/delivery/note/{id}/remove-batches）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeliveryNoteRemoveBatchesRequest {
     #[serde(deserialize_with = "crate::shared::types::deserialize_i64_vec")]
     pub batch_ids: Vec<i64>,
     pub version: i32,
@@ -131,39 +163,9 @@ pub struct DeliveryNoteListQuery {
     pub offset: Option<i64>,
 }
 
-/// GET /api/v2/com/delivery/note/pickup-pending 查询参数。
-#[derive(Debug, Clone, Deserialize)]
-pub struct DeliveryNotePickupPendingQuery {
-    #[serde(
-        default,
-        deserialize_with = "crate::shared::types::deserialize_i64_opt"
-    )]
-    pub customer_id: Option<i64>,
-}
-
-/// GET /api/v2/com/delivery/note/candidate-parts 查询参数。
-#[derive(Debug, Clone, Deserialize)]
-pub struct DeliveryNoteCandidatePartsQuery {
-    #[serde(deserialize_with = "crate::shared::types::deserialize_i64")]
-    pub customer_id: i64,
-}
-
 /// GET /api/v2/com/delivery/note/{id} 路径参数。
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeliveryNotePath {
     #[serde(deserialize_with = "crate::shared::types::deserialize_i64")]
     pub id: i64,
-}
-
-// ===========================================================================
-//  P3：扫码入单 DTO（设计 §5，POST /api/v2/com/delivery/note/scan）
-// ===========================================================================
-
-/// 扫码入单请求体。
-///
-/// `code` 是 trim 后的扫码载荷，长度要求 1..=64 字符；空白 / 空 → 400
-/// `BIZ_INVALID_VALUE`。
-#[derive(Debug, Clone, Deserialize)]
-pub struct ScanDeliveryRequest {
-    pub code: String,
 }
