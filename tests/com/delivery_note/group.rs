@@ -15,8 +15,11 @@
 //! 完全独立，无需 Mutex 串行化。
 //!
 //! ## 认证
-//! 每个用例都用 MANAGER 用户（fx_part_manager，part 域基线），所有 POST
-//! /com/delivery/group/* 都要求 M/C，按设计 §6.1 用 MANAGER 跑通即可。
+//! 每个用例都用 MANAGER 用户（fx_part_manager，part 域基线）。
+//!
+//! 2026-10-08：`/group` 的 3 个写端点白名单从 `[Manager, Clerk]` 放宽为
+//! `[Manager, Clerk, Inspector]`（品检员在扫码入单页要能按 L2 归属分单）。理由与
+//! 覆盖见末尾的 `inspector_can_manage_groups`。
 //!
 //! 2026-09-23 PR13 Phase G 改造：本地 `fn send` / `fn json_request` / `fn setup` /
 //! `fn login_manager` 全部删除，统一用 `hsh_erp_test_support::{send, json_request,
@@ -428,4 +431,99 @@ async fn list_with_nonexistent_customer_returns_404_20102() {
     .await;
     assert_eq!(s, StatusCode::NOT_FOUND);
     assert_eq!(env["code"], 20102);
+}
+
+/// 2026-10-08：`/group` 写端点放行 `Inspector`（3 条写路径全测）。
+///
+/// 之前只有 Manager / Clerk 能改分组，品检员在扫码入单页被卡在这一步。
+///
+/// ⚠️ 只装 part fixture：`load_delivery_fixture` 与 `load_part_fixture` 的
+/// `t_customer` 常量 id 区段重叠，同库两次装会撞主键。
+#[tokio::test]
+async fn inspector_can_manage_groups() {
+    use hsh_erp_test_support::{PartFixture, load_part_fixture};
+
+    let pool = test_pool().await;
+    let fx = load_part_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+    let token = login_token(&app, &fx.inspector_username, PartFixture::PASSWORD).await;
+
+    let l1 = insert_l1(&pool, "品检分组", "I").await;
+    let l2a = insert_l2(&pool, "品检分组一厂", l1).await;
+    let l2b = insert_l2(&pool, "品检分组二厂", l1).await;
+
+    // 1) POST / 创建
+    let (s1, env1) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/com/delivery/group",
+            Some(json!({
+                "customer_id": l1.to_string(),
+                "name": "品检可建组",
+                "member_customer_ids": [l2a.to_string()],
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK, "Inspector 应能建组: {env1}");
+    let group_id = env1["data"]["id"].as_str().unwrap().to_string();
+    // 2026-10-08：VO 裁掉 `customer_id` / `created_at` / `updated_at`
+    assert!(env1["data"].get("customer_id").is_none(), "{env1}");
+
+    // 2) POST /{id}/update（全量替换成员）
+    let (s2, env2) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/com/delivery/group/{group_id}/update"),
+            Some(json!({
+                "version": env1["data"]["version"].as_i64().unwrap(),
+                "member_customer_ids": [l2b.to_string()],
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK, "Inspector 应能改组: {env2}");
+    let members = env2["data"]["members"]
+        .as_array()
+        .expect("members 必须是数组");
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0]["customer_id"].as_str().unwrap(), l2b.to_string());
+
+    // 3) POST /{id}/soft-delete
+    let (s3, env3) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/com/delivery/group/{group_id}/soft-delete"),
+            Some(json!({"version": env2["data"]["version"].as_i64().unwrap()})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s3, StatusCode::OK, "Inspector 应能软删组: {env3}");
+
+    // 4) GET / 一并放行 Inspector
+    let (s4, env4) = send(
+        app,
+        json_request(
+            "GET",
+            &format!("/com/delivery/group?customer_id={l1}"),
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s4, StatusCode::OK, "Inspector 应能读分组: {env4}");
+    assert!(
+        env4["data"]["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|g| g["id"].as_str() != Some(group_id.as_str())),
+        "软删后不该再出现: {env4}"
+    );
 }

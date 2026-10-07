@@ -99,11 +99,17 @@ impl NodeKind {
 /// 入单唯一允许的批次状态。
 const STATUS_READY_TO_SHIP: &str = "READY_TO_SHIP";
 
-/// 一批「已占用但不属于本单」的批次明细（报 21406 时附在 message 里）。
+/// 一批「已被某张送货单占着」的批次明细（报 21406 时附在 message 里）。
+///
+/// `reason` 区分两种占用：
+/// - `"活跃单"`：`DRAFT` / `SUBMITTED` —— 货还在单上，换单要先把货撤下来；
+/// - `"已领取/已归档单"`：`PICKED_UP` / `ARCHIVED` —— 货已经随该单送出，
+///   **不可再次入单**（若放行会把已送出的货再挂一张新单，账实不符）。
 struct OccupiedDetail {
     part_id: i64,
     batch_no: i32,
     on_note_id: i64,
+    reason: &'static str,
 }
 
 /// 一批「状态不是 READY_TO_SHIP」的批次明细（报 21405 时附在 message 里）。
@@ -214,30 +220,50 @@ impl DeliveryNoteService {
                 note_ids_involved.push(other_id);
             }
         }
-        // 批量取占用方单据（去重），只保留「活跃」的（DRAFT / SUBMITTED 算占用）。
+        // 批量取占用方单据（去重）。三态：
+        //   * `DRAFT` / `SUBMITTED` ⇒ **活跃占用**（货还在单上，换单要先撤货）；
+        //   * `PICKED_UP` / `ARCHIVED` ⇒ **已送出占用**（同样 21406，但 message 要说清
+        //     与「货还在单上」不同 —— 换单救不回来）；
+        //   * 不在结果里 ⇒ 占用方已软删 / 查不到（`note_list_by_ids` 带
+        //     `include_deleted=false`）⇒ 视为未占用，与扫码树 JOIN 的
+        //     `dn.deleted_at IS NULL` 同口径。
         note_ids_involved.sort_unstable();
         note_ids_involved.dedup();
-        let active_note_ids: std::collections::HashSet<i64> = if note_ids_involved.is_empty() {
-            Default::default()
-        } else {
-            repo.note_list_by_ids(&note_ids_involved, false)
-                .await?
-                .into_iter()
-                .filter(|n| n.status == "DRAFT" || n.status == "SUBMITTED")
-                .map(|n| n.id)
-                .collect()
-        };
+        let mut occupied_note_ids: HashMap<i64, &'static str> = HashMap::new();
+        if !note_ids_involved.is_empty() {
+            for n in repo.note_list_by_ids(&note_ids_involved, false).await? {
+                let reason = match n.status.as_str() {
+                    "DRAFT" | "SUBMITTED" => "活跃单，货还在这张单上",
+                    _ => "已领取/已归档单，货已随该单送出，不可再次入单",
+                };
+                occupied_note_ids.insert(n.id, reason);
+            }
+        }
         for b in &all_batches {
             match b.delivery_note_id {
-                Some(other_id) if other_id != note.id && active_note_ids.contains(&other_id) => {
-                    occupied.push(OccupiedDetail {
-                        part_id: b.part_id,
-                        batch_no: b.batch_no,
-                        on_note_id: other_id,
-                    });
+                Some(other_id) if other_id != note.id => {
+                    if let Some(reason) = occupied_note_ids.get(&other_id) {
+                        occupied.push(OccupiedDetail {
+                            part_id: b.part_id,
+                            batch_no: b.batch_no,
+                            on_note_id: other_id,
+                            reason,
+                        });
+                    } else if b.status != STATUS_READY_TO_SHIP {
+                        // 占用方已软删 ⇒ 视为未占用；此时按状态闸门判。
+                        not_ready.push(NotReadyDetail {
+                            part_id: b.part_id,
+                            serial_no: part_map
+                                .get(&b.part_id)
+                                .and_then(|p| p.serial_no.clone())
+                                .unwrap_or_default(),
+                            batch_no: b.batch_no,
+                            status: b.status.clone(),
+                        });
+                    }
                 }
                 _ => {
-                    // 不是「被占用」⇒ 判状态。READY_TO_SHIP 由 repo 的
+                    // 未被占用 ⇒ 判状态。READY_TO_SHIP 由 repo 的
                     // `list_entryable_batches_by_part_ids` 保证进了 `eligible`，
                     // 其余一律收集到 not_ready 并显式报 21405。
                     if b.status != STATUS_READY_TO_SHIP {
@@ -260,15 +286,15 @@ impl DeliveryNoteService {
                 .iter()
                 .map(|d| {
                     format!(
-                        "part {} 批次 {} 已在送货单 {}",
-                        d.part_id, d.batch_no, d.on_note_id
+                        "part {} 批次 {} 已在送货单 {}（{}）",
+                        d.part_id, d.batch_no, d.on_note_id, d.reason
                     )
                 })
                 .collect::<Vec<_>>()
                 .join("；");
             return Err(AppError::biz(
                 code::BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED,
-                format!("以下批次已被其它有效送货单占用：{detail}"),
+                format!("以下批次已被其它送货单占用：{detail}"),
             ));
         }
         if !not_ready.is_empty() {
