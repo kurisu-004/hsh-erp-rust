@@ -577,3 +577,43 @@ mod tests {
         assert!(extract_key(&h3).is_none(), "超长 → None（不传 4xx）");
     }
 }
+
+/// 2026-10-09 新增（review 第 1 轮 Q10）：Redis 前缀拼接的**常驻**不变量单测。
+///
+/// 幂等 key 是**两层拼接**：中间件层 `format!("{KEY_PREFIX}{key}")`（`idem:<client_key>`，
+/// 中间件不该知道 Redis 的存在）+ store 层 `RedisIdempotencyStore::redis_key` 的
+/// `key_prefix`（进程级隔离）。生产 `key_prefix` 缺省空串 ⇒ 两层拼接结果必须与
+/// 2026-10-09 之前**逐字节相同**，否则全部幂等缓存条目失配（同一请求被重复执行）。
+#[cfg(test)]
+mod key_prefix_tests {
+    use super::{KEY_PREFIX, RedisIdempotencyStore};
+
+    /// `deadpool_redis::Config::create_pool` 只构造 Manager、**不建连**，
+    /// 故本测试零 IO、不需要 Redis 在场（与 `src/modules/wx/wecom_client.rs` 的
+    /// `try_redis_pool` 注释同一条事实）。
+    fn store(key_prefix: &str) -> RedisIdempotencyStore {
+        let pool = deadpool_redis::Config::from_url("redis://127.0.0.1:1/0")
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("构造连接池（不建连）");
+        RedisIdempotencyStore::new(pool, key_prefix.to_string())
+    }
+
+    #[test]
+    fn empty_prefix_reproduces_legacy_key_byte_for_byte() {
+        let client_key = "req-abc-123";
+        // 中间件层产出（历史逐字不变）
+        let middleware_key = format!("{KEY_PREFIX}{client_key}");
+        assert_eq!(middleware_key, "idem:req-abc-123");
+        // store 层在空前缀下必须原样透传
+        assert_eq!(store("").redis_key(&middleware_key), "idem:req-abc-123");
+    }
+
+    #[test]
+    fn non_empty_prefix_is_prepended_whole() {
+        let client_key = "req-abc-123";
+        let middleware_key = format!("{KEY_PREFIX}{client_key}");
+        let full = store("t12345:").redis_key(&middleware_key);
+        assert_eq!(full, "t12345:idem:req-abc-123");
+        assert_eq!(full.strip_prefix("t12345:"), Some(middleware_key.as_str()));
+    }
+}

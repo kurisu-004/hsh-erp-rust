@@ -16,21 +16,18 @@
 # - fail-fast=false：全量跑收齐所有失败（CI 友好）
 # - slow-timeout 60s/2x：HTTP/WS 测试宽松超时 —— 60s 告警、120s 杀
 
+# 2026-09-20 曾有一个 `redis-flush` 串行组（`_e2e_api` / `iam` 两个 binary
+# `max-threads = 1`），用于防「测试 setup 调 FLUSHDB 杀掉并行测试的 session」——
+# 那两个 binary 当时各自独占一个 Redis db，FLUSHDB 只会清自己。
+# 2026-10-09 该组**已整体删除**（review 第 1 轮 Q5）：
+# - Redis 隔离改由 key 前缀（`test-support/src/redis.rs::test_key_prefix`）承担，
+#   所有测试进程共用 db 0 但前缀空间物理不相交，不需要任何串行组；
+# - 触发该组的 `clean_redis`（FLUSHDB）本身也已删除（全仓零调用方），
+#   即「FLUSHDB 会杀掉别人 session」的前提已不存在；
+# - 顺带恢复这两个 binary 的并行度（原先纯属白串行）。
+# ⚠️ 未来确需清理 Redis 时，**不要**恢复本组去「兜底」：正确做法是按本进程前缀
+# `SCAN` + `DEL`（`SCAN MATCH "t{pid}:*"`），只碰自己的命名空间。
 [profile.default]
 test-threads = 15
 fail-fast = false
 slow-timeout = { period = "60s", terminate-after = 2 }
-
-# 2026-09-20 修复竞态 #2：3 个 FLUSHDB binary 串行（_e2e_api / auth_middleware /
-# iam_api 在 setup 调 FLUSHDB；nextest 跨 binary 并行下会杀并行测试的 session →
-# 40105 SESSION_REVOKED flake）。max-threads=1 让这 3 个 binary 的测试串行跑，
-# 跨 binary 仍并行（其余 40 个 binary 全并行）。[test-groups] 必须先声明 group
-# 名才能在 overrides 里引用（nextest 强类型校验）。
-# 2026-09-23 PR13 Phase E：iam_api + auth_middleware 已合为 `tests/iam/`
-# （binary 名 = `iam`）；FLUSHDB binary 从 3 个减为 2 个。
-[test-groups]
-redis-flush = { max-threads = 1 }
-
-[[profile.default.overrides]]
-filter = "binary(/^(_e2e_api|iam)$/)"
-test-group = "redis-flush"

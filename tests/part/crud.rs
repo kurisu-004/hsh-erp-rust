@@ -10,8 +10,6 @@
 //! 完全独立，无需 Mutex 串行化。
 //! 每个用例按需使用 MANAGER / CLERK / INSPECTOR token。
 
-use std::sync::OnceLock;
-
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -27,21 +25,23 @@ use hsh_erp_test_support::*;
 //  动态 part/batch 插入 helper（sub-file 私有，PR-C 末统一迁）
 // ===========================================================================
 
-/// 测试套件共享的雪花 ID 生成器（2026-09-28 修复）。
+/// 测试套件取雪花 ID 的唯一入口：转发到 test-support 的**全进程共享 generator**。
 ///
-/// 之前每个 helper 都 `SnowflakeIdGenerator::new(1_577_836_800_000, 1)` 后只调一次
-/// `next_id()`——新建实例 `last_ms=0, sequence=0`，首次 `.next_id()` 永远返回
+/// 2026-09-28 修复：之前每个 helper 都 `SnowflakeIdGenerator::new(1_577_836_800_000, 1)`
+/// 后只调一次 `next_id()`——新建实例 `last_ms=0, sequence=0`，首次 `.next_id()` 永远返回
 /// `compose(now_ms, 1, 0)`，同毫秒连插 5 行只会得到 4 个唯一 ID（甚至 PK 冲突）。
+/// 当时的修法是本文件内建一个 `OnceLock<SnowflakeIdGenerator>` 域内单例。
 ///
-/// 现在 4 个 helper 全部走这个共享单例，single process 内 sequence 单调递增，
-/// 跨 helper / 跨测试稳定产生唯一 ID。`SnowflakeIdGenerator::next_id` 自身已
-/// 用 `std::sync::Mutex` 保证线程安全，此处仅做进程级共享（OnceLock）。
-static SHARED_TEST_SNOWFLAKE: OnceLock<SnowflakeIdGenerator> = OnceLock::new();
-
-fn shared_test_snowflake() -> &'static SnowflakeIdGenerator {
-    SHARED_TEST_SNOWFLAKE.get_or_init(|| SnowflakeIdGenerator::new(1_577_836_800_000, 1))
-}
-
+/// 2026-10-09 改用 test-support 的 `shared_test_snowflake()`（review 第 1 轮 Q1）：
+/// 本文件原域内单例写死 `instance = 1`，而 `tests/part/rollup_recompute.rs` 的域内单例
+/// **也是 `instance = 1`** —— 两者同属 `part` 一个 binary，在 `cargo test --test part`
+/// （CLAUDE.md 记载的单 binary 调试路径，同进程多线程）下就是 review 报告点名的原 bug
+/// 完整复现形态：同 instance + 同毫秒 + 同 seq ⇒ 逐字节相同的 id ⇒ `t_part_pkey` 23505。
+/// 共享 generator 后这些 ID 与 fixture helper 发出的 ID 同属一条流，进程内单调唯一。
+///
+/// 遗留（登记在 CLAUDE.md「待办登记：测试内联造 snowflake 生成器应收敛到
+/// `pool_snowflake()`」）：本文件部分**用例内**仍现建 `SnowflakeIdGenerator::new(...)`，
+/// 属逐文件确认的批量迁移范围，不在本轮范围内。
 fn next_test_id() -> i64 {
     shared_test_snowflake().next_id()
 }

@@ -3,7 +3,10 @@
 //! 3 个 sub-file（main / api / middleware）共用一份 iam.sql。iam/api.rs 是
 //! `test-support::fixtures` 最后重度用户（`add_role` / `insert_user_with_password` /
 //! `insert_inactive_user` / `insert_menu` / `add_role_menu` / `get_refresh_token_version` /
-//! `clean_db` / `clean_redis` / `test_redis_pool`），本 fixture 替代其依赖。
+//! `clean_db` / `test_redis_pool`），本 fixture 替代其依赖。
+//! ⚠️ 2026-10-09：当年的依赖清单里还有 `clean_redis`（FLUSHDB），该函数已因零调用方
+//! 且会清掉其它测试进程的前缀空间而删除 —— session 隔离现在只靠 `redis::test_key_prefix()`
+//! 的 `t{pid}:` 前缀承担，**不再有任何 FLUSHDB 路径**。
 //!
 //! 与 [`outsource`](super::outsource) 子模块同结构：
 //! 1. SQL 落到 `test-support/fixtures/iam.sql`，常量 ID 走

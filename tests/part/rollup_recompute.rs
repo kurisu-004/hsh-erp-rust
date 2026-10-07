@@ -46,34 +46,33 @@
 //! ## 并行 / 认证
 //! 进程级 test_pool 每次 fresh database，无需 Mutex 串行化。
 
-use std::sync::OnceLock;
-
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 
 use hsh_erp_rust::infra::clock::now_naive;
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::shared::error::code;
 use hsh_erp_test_support::{
-    PartFixture, json_request, load_part_fixture, login_token, pool_snowflake, send, test_app,
-    test_pool, test_state,
+    PartFixture, json_request, load_part_fixture, login_token, pool_snowflake, send,
+    shared_test_snowflake, test_app, test_pool, test_state,
 };
 
 const URL: &str = "/admin/recompute-rollup";
 
-/// 进程级共享雪花生成器（同 `tests/part/crud.rs` 的做法）。
+/// 进程级共享雪花生成器：转发到 test-support 的 `shared_test_snowflake()`。
 ///
 /// 每次 `SnowflakeIdGenerator::new(...)` 只调一次 `next_id()` 会让同毫秒插入的
 /// 多行拿到相同 ID（首次 `next_id()` 固定返回 `compose(now_ms, seq=0)`），
-/// 表现为 `duplicate key ... t_process_pkey` 之类的偶发失败。单例让 sequence
+/// 表现为 `duplicate key ... t_process_pkey` 之类的偶发失败。共享单例让 sequence
 /// 在进程内单调递增。
-static SHARED_TEST_SNOWFLAKE: OnceLock<SnowflakeIdGenerator> = OnceLock::new();
-
+///
+/// 2026-10-09 改用 test-support 的共享 generator（review 第 1 轮 Q1）：本文件原域内
+/// 单例写死 `instance = 1`，与 `tests/part/crud.rs` 的域内单例**完全同 instance**，
+/// 两者同属 `part` 一个 binary —— 在 `cargo test --test part` 的同进程多线程下即
+/// 「同 instance + 同毫秒 + 同 seq」的原 bug 复现形态（23505）。改为全进程共享后，
+/// 这些 ID 与 `pool_snowflake()` 发出的 fixture ID 同属一条流。
 fn next_test_id() -> i64 {
-    SHARED_TEST_SNOWFLAKE
-        .get_or_init(|| SnowflakeIdGenerator::new(1_577_836_800_000, 1))
-        .next_id()
+    shared_test_snowflake().next_id()
 }
 
 /// 插一个 `t_part` 行，`status` 由调用方指定（用来造漂移）。

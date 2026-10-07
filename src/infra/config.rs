@@ -109,8 +109,14 @@ pub struct RedisConfig {
     /// 集成测试按进程填 `t{pid}:` 实现并行隔离（Redis 只有 16 个 db，无法按 binary
     /// 分桶，21 个测试 binary 必然撞）。改动本字段会作废所有已签发 session 的缓存条目。
     ///
+    /// ⚠️ 多副本部署时**所有实例必须配置相同前缀**：前缀不一致 ⇒ 各副本写的 key 物理
+    /// 不相交 ⇒ LB 后 session 不共享 ⇒ 已登录用户随机被 40105 拦下。
+    ///
     /// 环境变量 `REDIS_KEY_PREFIX`，缺省 `""`。前缀只能**整体前置**到既有 key
     /// 之前（`{prefix}session:tok:{jti}`），不得插进命名结构中间。
+    ///
+    /// ⚠️ 已知偏差：`src/modules/wx/wecom_client.rs::token_cache_key` 的
+    /// `wecom:access_token:<corpid>` **不吃本前缀**（该处有偏差登记）。
     pub key_prefix: String,
 }
 

@@ -122,12 +122,25 @@ pub fn shared_test_snowflake() -> &'static std::sync::Arc<SnowflakeIdGenerator> 
 /// 的实例私有字段，`new()` 又从 `last_ms=0, sequence=0` 起步，故两个 instance 相同的
 /// 独立 generator 在同一毫秒各自取第 j 个号会发出逐字节相同的 id。
 ///
-/// **由此产生的新约定 —— 进程内禁止再 `SnowflakeIdGenerator::new`**：测试代码
-/// （`tests/**` 与本 crate）要 ID 一律走 `shared_test_snowflake()`（或其兼容薄壳
-/// `pool_snowflake()`）。另建 generator = 另起一条 id 流，与共享流在同毫秒必撞
-/// `t_*_pkey`（23505）—— 即使把 instance 填成 11 / 99 / 777 这类「看起来不同」的值也
-/// 不管用：冲突条件是**同 instance + 同毫秒 + 同 seq**，而两个 fresh generator 的
-/// 首个 id 恰好都是 `seq=0`。
+/// **由此产生的新约定 —— 进程内只从 [`shared_test_snowflake`] 取号**（或其兼容薄壳
+/// [`pool_snowflake`]）。测试代码（`tests/**` 与本 crate）**不应**再 `SnowflakeIdGenerator::new`
+/// 另起一条 id 流。
+///
+/// ## 冲突条件（review 第 1 轮 Q1 订正，勿再简化为「必撞」）
+/// 位布局 `ts << 22 | instance << 12 | seq`，故两个独立 generator 的 id 相同，当且仅当
+/// **同 instance + 同毫秒 + 同 seq** 三条同时成立。由此：
+/// - **instance 不同 ⇒ 位段不同 ⇒ 必然不撞**。刻意给另一个 generator 填不同 instance
+///   （`tests/part/purchase_order_import.rs` 的 `777`、`tests/part/lifecycle.rs` 的
+///   `11`/`12`/`13` 等）是**有效**的权宜之计，本仓多处正在用，不是坑。
+/// - 但 instance 只有 10 bit = **1024 个取值**，刻意填的字面量（如 `1`）仍有
+///   **1/1024 概率**等于本进程 `test_snowflake_instance()` 的派生值 —— 而两个 fresh
+///   generator 的首个 id 恰好都是 `seq=0`，故一旦相等就同毫秒同 seq 相撞 `t_*_pkey`
+///   （23505）。
+/// - 结论：**「刻意换 instance」只是次优的权宜之计，唯一无歧义的规矩是「进程内只从
+///   [`shared_test_snowflake`] 取号」**。历史真实事故形态正是两个**同为 instance=1** 的
+///   独立 generator（`tests/part/crud.rs` 与 `tests/part/rollup_recompute.rs` 的域内单例，
+///   同一 `part` binary 内）——已由 2026-10-09 本轮改造收敛掉。其余仍用本地 generator 的
+///   文件见 CLAUDE.md「待办登记：测试内联造 snowflake 生成器应收敛到 `pool_snowflake()`」。
 ///
 /// pub(crate)：[`state`](super::state) 构造 `AppConfig::snowflake::instance` 也读它，
 /// 必须 crate 内可见。

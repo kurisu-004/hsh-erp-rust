@@ -168,15 +168,22 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
     // 2026-09-28 新增：python 后端转发默认走 NoopPyBackend（不真发 HTTP）。
     let py_backend: Arc<dyn PyBackendClient> = Arc::new(NoopPyBackend);
     let shutdown = CancellationToken::new();
-    let session: Arc<dyn SessionStore> =
-        Arc::new(RedisSessionStore::new(redis_pool.clone(), test_key_prefix()));
+    // 2026-10-09 收紧（review 第 1 轮 Q9）：两个 store 的前缀**从 `config.redis.key_prefix`
+    // 取**，不再各自独立调 `test_key_prefix()` —— 前缀一致性由「同一个值 clone 两份」变成
+    // 编译期事实，杜绝「写用前缀、读不用前缀」的静默 40105。
+    let session: Arc<dyn SessionStore> = Arc::new(RedisSessionStore::new(
+        redis_pool.clone(),
+        config.redis.key_prefix.clone(),
+    ));
     // 2026-09-23 新增 Idempotency 中间件存储：默认走 RedisIdempotencyStore
     // （与 session 共享同一 redis_pool）。
     let idempotency_store: Arc<dyn hsh_erp_rust::middleware::idempotency::IdempotencyStore> =
-        Arc::new(hsh_erp_rust::middleware::idempotency::RedisIdempotencyStore::new(
-            redis_pool,
-            test_key_prefix(),
-        ));
+        Arc::new(
+            hsh_erp_rust::middleware::idempotency::RedisIdempotencyStore::new(
+                redis_pool,
+                config.redis.key_prefix.clone(),
+            ),
+        );
     Arc::new(AppState::new(
         pool,
         config,
@@ -496,14 +503,20 @@ pub async fn test_state_with_cos(
     // 2026-09-28 新增：python 后端转发默认走 NoopPyBackend。
     let py_backend: Arc<dyn PyBackendClient> = Arc::new(NoopPyBackend);
     let shutdown = CancellationToken::new();
-    let session: Arc<dyn SessionStore> =
-        Arc::new(RedisSessionStore::new(redis_pool.clone(), test_key_prefix()));
+    // 2026-10-09 收紧（review 第 1 轮 Q9）：同 `test_state_with_redis`，两个 store 的
+    // 前缀从 `config.redis.key_prefix` 取，一致性由编译期保证。
+    let session: Arc<dyn SessionStore> = Arc::new(RedisSessionStore::new(
+        redis_pool.clone(),
+        config.redis.key_prefix.clone(),
+    ));
     // 2026-09-23 新增 Idempotency 中间件存储：cos 替换场景同 test_state_with_redis
     let idempotency_store: Arc<dyn hsh_erp_rust::middleware::idempotency::IdempotencyStore> =
-        Arc::new(hsh_erp_rust::middleware::idempotency::RedisIdempotencyStore::new(
-            redis_pool,
-            test_key_prefix(),
-        ));
+        Arc::new(
+            hsh_erp_rust::middleware::idempotency::RedisIdempotencyStore::new(
+                redis_pool,
+                config.redis.key_prefix.clone(),
+            ),
+        );
     Arc::new(AppState::new(
         pool,
         config,

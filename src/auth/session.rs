@@ -316,10 +316,7 @@ impl SessionStore for RedisSessionStore {
     async fn touch_session(&self, jti: &str, ttl_seconds: u64) -> Result<bool, AppError> {
         let mut conn = self.conn().await?;
         let updated: bool = conn
-            .expire(
-                key_session(&self.key_prefix, jti),
-                ttl_seconds as i64,
-            )
+            .expire(key_session(&self.key_prefix, jti), ttl_seconds as i64)
             .await
             .map_err(map_redis)?;
         Ok(updated)
@@ -359,7 +356,8 @@ impl SessionStore for RedisSessionStore {
 pub struct NoopSessionStore;
 
 impl NoopSessionStore {
-    /// 单元构造：保持与 `RedisSessionStore::new(pool)` 同形调用风格。
+    /// 单元构造：保持与 `RedisSessionStore::new(pool, key_prefix)` 同形调用风格。
+    /// （2026-10-09：`new` 加了 `key_prefix` 形参，本注释同步）
     pub fn new() -> Self {
         Self
     }
@@ -412,5 +410,48 @@ impl SessionStore for NoopSessionStore {
         // Noop 路径下永远视为未吊销 —— 测试 fixture 中复用检测分支将永远走 false
         // （即不会被黑名单拦截）；若测试需要走黑名单分支，必须用真实 RedisSessionStore。
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod key_prefix_tests {
+    use super::{key_revoked, key_session, key_user_set};
+
+    /// 2026-10-09 新增（review 第 1 轮 Q10）：`key_prefix` 为空串时，三个 key 的产出
+    /// 必须与 2026-10-09 之前**逐字节相同**。
+    ///
+    /// 这是整个前缀设计的承重墙：生产缺省 `key_prefix = ""`，一旦有人把
+    /// `format!("{prefix}session:tok:{jti}")` 改成 `format!("{prefix}:session:tok:{jti}")`
+    /// 或把前缀插到命名结构中间，编译与测试都不会红，但**所有已签发 session 的缓存条目
+    /// 会在上线瞬间全部失配** ⇒ 全站用户被 40105 拦下重新登录。故在此钉死。
+    #[test]
+    fn empty_prefix_reproduces_legacy_keys_byte_for_byte() {
+        let empty = String::new();
+        // 字面量即历史实现（master: `format!("session:tok:{jti}")` 等三处）
+        assert_eq!(key_session(&empty, "jti-1"), "session:tok:jti-1");
+        assert_eq!(key_user_set(&empty, 42), "sessions:user:42");
+        assert_eq!(key_revoked(&empty, "jti-1"), "revoked:jti-1");
+    }
+
+    /// 非空前缀必须是**整体前置**（`{prefix}` + 原 key），不得插进命名结构中间，
+    /// 否则「按前缀 SCAN 自清理」之类的运维手段就失效了。
+    #[test]
+    fn non_empty_prefix_is_prepended_whole() {
+        let prefix = "t12345:";
+        assert_eq!(key_session(prefix, "jti-1"), "t12345:session:tok:jti-1");
+        assert_eq!(key_user_set(prefix, 42), "t12345:sessions:user:42");
+        assert_eq!(key_revoked(prefix, "jti-1"), "t12345:revoked:jti-1");
+        // 去掉前缀必须精确还原历史 key —— 这一条等价于「前缀只可能整体前置」
+        for (prefixed, legacy) in [
+            (key_session(prefix, "jti-1"), "session:tok:jti-1"),
+            (key_user_set(prefix, 42), "sessions:user:42"),
+            (key_revoked(prefix, "jti-1"), "revoked:jti-1"),
+        ] {
+            assert_eq!(
+                prefixed.strip_prefix(prefix),
+                Some(legacy),
+                "前缀必须是可剥离的整段前缀（否则运维无法按前缀清理/统计）"
+            );
+        }
     }
 }

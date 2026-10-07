@@ -16,8 +16,9 @@
 //!   `fresh_database_url` / `pool_snowflake` / `register_db_for_drop` 等）
 //! - [`pem`]：进程级缓存的 RSA 密钥对（`test_private_pem` /
 //!   `test_public_pem` / `test_public_kids`）
-//! - [`redis`]：redis 连接池 + clean_redis + URL 定位 + **进程级 key 前缀**
-//!   （`test_redis_pool` / `clean_redis` / `test_redis_url` / `test_key_prefix`）
+//! - [`redis`]：redis 连接池 + URL 定位 + **进程级 key 前缀**
+//!   （`test_redis_pool` / `test_redis_url` / `test_key_prefix`；2026-10-09 起
+//!   **不使用 FLUSHDB**——原 `clean_redis` 因零调用方且会清掉别的进程前缀空间而删除）
 //! - [`state`]：构造测试 `AppState` 的 helper（`test_state` /
 //!   `test_state_with_cos` / `test_state_with_disabled_session` / `test_app`
 //!   / `test_ws_app`）

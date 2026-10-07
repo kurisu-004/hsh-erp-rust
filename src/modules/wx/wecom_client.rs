@@ -244,6 +244,22 @@ impl HttpWeComClient {
     }
 
     /// access_token 缓存 key（含 corpid，避免多企业部署共用一套 Redis 时串号）。
+    ///
+    /// ## ⚠️ 已知偏差登记（2026-10-09 review 第 1 轮 Q6）：**本 key 不吃 `RedisConfig::key_prefix`**
+    ///
+    /// 2026-10-09 给 `src/auth/session.rs` 的三个 session key 与
+    /// `src/middleware/idempotency.rs` 的幂等 key 加了可配置前缀（测试侧按进程填
+    /// `t{pid}:` 实现并行隔离），**本函数未纳入**。当前**无实际风险**：
+    /// - 全仓唯一消费该 key 的真 Redis 路径是本模块 `mod tests` 的
+    ///   `gettoken_is_cached_in_redis_and_reissued_after_invalidate`（CORP_ID=`C1`，
+    ///   同进程内自建自删自断言）；
+    /// - `tests/wecom_login.rs` 走 `NoopWeComClient` / mock，根本不碰这个 key。
+    ///
+    /// 之所以本轮**不修**：接入前缀要改 `HttpWeComClient::new` 的构造签名（生产
+    /// `main.rs` + `test-support/src/state.rs` 两处）并连带打破
+    /// `token_cache_key_format_is_stable` 的字面量断言，收益（防一个当前不存在的
+    /// 并行干扰）与改动面不成比例。**若将来有第二个 binary/进程开始消费该 key**，
+    /// 或出现跨进程 token 缓存干扰，必须先把本 key 纳入前缀体系再谈别的。
     fn token_cache_key(corpid: &str) -> String {
         format!("wecom:access_token:{corpid}")
     }
