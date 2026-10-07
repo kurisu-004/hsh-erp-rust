@@ -163,18 +163,38 @@ const SANCTIONED: &[(&str, &str)] = &[
 /// 被允许就地新建 `SnowflakeIdGenerator` 的文件里，**额外**记「命中处数上限」
 /// （相对 crate 根的路径 → 上限）。
 ///
-/// 2026-10-09（review 第 1 轮 M2）：`SANCTIONED` 是**整文件**放行，所以这两个文件里
+/// 2026-10-09（review 第 1 轮 M2）：`SANCTIONED` 是**整文件**放行，所以这几个文件里
 /// **将来新增**的构造不会被规则 1 抓到 —— 而 `src/main.rs` 恰恰是生产环境里最危险的一种
 /// 漂移（为了「某个模块单独发号」再建一个 generator ⇒ 同进程两个 generator ⇒ 跨表撞号）。
 /// 上限把口子收窄成「改动会被发现、且必须显式改这个常量」。取值由
 /// `sanctioned_files_stay_within_their_hit_cap` 用本探测器**实测**得出，不是估的。
 ///
-/// 只给这两个文件记上限：另两条（两个进程级唯一 ID 源）按定义就该有构造点，上限没有意义。
+/// **2026-10-09（review 第 2 轮 N2）补齐两个「唯一源」文件**：原先只给
+/// `src/main.rs` / `src/infra/snowflake.rs` 记上限，恰恰漏掉了护栏最该守的两处 ——
+/// `test-support/src/pool.rs` 与 `src/shared/test_snowflake.rs`。漏掉它们的理由是
+/// 「按定义就该有构造点」，但那个推理只对白名单放行的**范围**成立，放行**范围**恰恰
+/// 是问题的成因：将来若有人在这两个文件里**新建第二个** generator（旧的还在用），
+/// 规则 1（白名单外禁 `::new`）与规则 2（`src/**` 禁拉入 test-support 的 generator
+/// 入口）**都抓不到** —— 因为新构造点就住在白名单文件内部。
+///
+/// ⚠️ **这两条的语义是「恰好一个」而不是「至多 N 个」**：`SANCTIONED_HIT_CAPS` 记的是
+/// 「**这个文件总共几处构造**」，对 `src/main.rs` / `src/infra/snowflake.rs` 而言多一处
+/// 只是「多了一个 generator 对象」；但这两个文件是**唯一源** —— 集成测试 binary 与
+/// lib 单测 binary 各进程域**唯一**那个取号对象。多一个构造点 = 同一进程里出现**两条
+/// ID 流**，而这正是 2026-10-09 那一轮改造要消灭的东西（两个 fresh generator 都从
+/// `last_ms=0, sequence=0` 起步，同 instance + 背靠背毫秒 ⇒ 逐字节相同的 id ⇒
+/// `23505`）。故必须把上限压到当前实测值，不给它留「再加一个也行」的余量。
 const SANCTIONED_HIT_CAPS: &[(&str, usize)] = &[
     // 生产：唯一一处 —— `main.rs` 的 `Arc::new(SnowflakeIdGenerator::new(config…))`
     ("src/main.rs", 1),
     // 被测对象自身：位布局 / sequence 回绕 / epoch / `MAX_INSTANCE` panic 边界等 8 处单测
     ("src/infra/snowflake.rs", 8),
+    // 2026-10-09（N2）：集成测试 binary 的**唯一** ID 源（`TEST_SNOWFLAKE_GEN` 的
+    // `get_or_init` 里那一句）。**恰好一个** —— 第二个即两条 ID 流。
+    ("test-support/src/pool.rs", 1),
+    // 2026-10-09（N2）：lib 单测 binary 的**唯一** ID 源（`SHARED_TEST_SNOWFLAKE` 的
+    // `get_or_init` 里那一句）。**恰好一个** —— 第二个即两条 ID 流。
+    ("src/shared/test_snowflake.rs", 1),
 ];
 
 /// 被探测的构造表达式，**刻意**用 `concat!` 拆开：本文件源码里永不出现连续的完整字面量，
@@ -713,12 +733,22 @@ mod tests {
         );
     }
 
-    // ── 规则 1 的白名单收紧：整文件放行的两个文件另记「命中处数上限」（M2）──────────
+    // ── 规则 1 的白名单收紧：整文件放行的四个文件另记「命中处数上限」（M2 / N2）────
 
     /// `SANCTIONED_HIT_CAPS` 里的文件命中数不得超过上限。
     ///
-    /// 为什么需要：`SANCTIONED` 是整文件放行，`src/main.rs` 里若将来为了「某个模块单独
-    /// 发号」再建一个 generator（生产环境最危险的漂移），规则 1 不会响。
+    /// 为什么需要：`SANCTIONED` 是整文件放行，所以白名单文件里若将来**再开一个**
+    /// generator，规则 1 不会响。两类后果：
+    /// - `src/main.rs`：生产环境最危险的漂移（为了「某个模块单独发号」再建一个 ⇒
+    ///   同进程两个 generator ⇒ 跨表撞号）；
+    /// - `test-support/src/pool.rs` / `src/shared/test_snowflake.rs`（2026-10-09 N2
+    ///   补齐）：这两个是**唯一源**文件，多一个构造点就是**两条 ID 流**，而它们恰好
+    ///   是规则 1（白名单外）与规则 2（禁拉入 test-support generator 入口）都够不着
+    ///   的位置 —— 新构造点就住在白名单文件内部。
+    ///
+    /// 两条断言与 `SANCTIONED_HIT_CAPS` 文档一致：`hits.len() <= cap`（上限）+
+    /// `!hits.is_empty()`（防上限表无声腐烂 —— 构造点被删光后条目就该移除，而不是
+    /// 永远躺在一张没人看的表里）。
     #[test]
     fn sanctioned_files_stay_within_their_hit_cap() {
         let root = root();
@@ -732,7 +762,9 @@ mod tests {
                 "{rel} 里有 {} 处就地新建（上限 {cap}，行号 {hits:?}）。\n\
                  若这是**有意**新增的，请同步调高 `SANCTIONED_HIT_CAPS` 里的上限并写明缘由；\n\
                  若不是，说明有人在白名单文件里新开了 generator —— 这正是整文件白名单掩盖不了的\
-                 那一类漂移（生产代码里的第二个 generator ⇒ 同进程跨表撞号）。",
+                 那一类漂移（生产代码里的第二个 generator ⇒ 同进程跨表撞号；两个**唯一源**文件\
+                 （`test-support/src/pool.rs` / `src/shared/test_snowflake.rs`）里的第二个 ⇒\
+                 同一进程两条 ID 流）。",
                 hits.len()
             );
             assert!(
