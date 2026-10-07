@@ -53,10 +53,11 @@ const SQL_SENDABLE_COUNT_BY_PROCESS: &str = "SELECT d.current_process_id AS proc
 
 /// `snapshot` SQL 2：在途侧按工序分组计数。
 ///
-/// `current_holder_id IS NOT NULL` 是**承重谓词**，不是可选的防御：在途谓词的另两处
-/// 落点（[`SQL_HELD_BY_PROCESS`] 与服务层分组）都以「holder = 公司 id」为分组键，
-/// 而 `t_part_batch.current_holder_id` 没有 NOT NULL 约束。三处谓词必须逐字同形，
-/// 否则 tab 徽标会数到一批 detail 取不出来的行（`COUNT(*)` 会计，WHERE 过滤不会）。
+/// `current_holder_id IS NOT NULL` 是**承重谓词**，不是可选的防御：`t_part_batch.
+/// current_holder_id` 没有 NOT NULL 约束，而另两处落点（[`SQL_HELD_BY_PROCESS`] 与
+/// `to_companies` 的 HashMap 分组）都以「holder = 公司 id」为分组键。在途两条 SQL 的
+/// 谓词必须逐字同形，否则 tab 徽标会数到一批 detail 取不出来的行（`COUNT(*)` 会计，
+/// WHERE 过滤不会）。
 const SQL_IN_FLIGHT_COUNT_BY_PROCESS: &str = "SELECT pb.current_process_id AS process_id, \
      COUNT(*)::bigint AS count \
      FROM t_part_batch pb \
@@ -72,12 +73,11 @@ const SQL_IN_FLIGHT_COUNT_BY_PROCESS: &str = "SELECT pb.current_process_id AS pr
 ///
 /// `color` 可空（新列，历史行为 NULL）。
 ///
-/// **为什么是本文件自己的一条查询而不是复用 `repo::OutsourcePoolRepo` /
-/// `OutsourceRepoTrait::process_map_short`**：`process_map_short` 返回
-/// `(id, code, name)` 三元组，看板要的第四列是 `color`；扩成四元组要改它的返回值类型
-/// 与全部解构点（`service/quote.rs::quote_out_many`），回归面从看板一条端点扩到整个
-/// 报价域的出参装配，换来的只是省掉一句 `SELECT`。新开一条同形查询的成本是几行 SQL，
-/// 收益是报价域一行不动。
+/// **为什么是本文件自己的一条查询而不是复用 `OutsourceRepoTrait::process_map_short`**：
+/// `process_map_short` 返回 `(id, code, name)` 三元组，看板要的第四列是 `color`；扩成
+/// 四元组要改它的返回值类型与全部解构点（`service/quote.rs::quote_out_many`），回归面
+/// 从看板一条端点扩到整个报价域的出参装配，换来的只是省掉一句 `SELECT`。新开一条同形
+/// 查询的成本是几行 SQL，收益是报价域一行不动。
 const SQL_PROCESS_META_BY_IDS: &str = "SELECT id, code, name, color, category \
      FROM t_process \
      WHERE id = ANY($1::bigint[]) \
@@ -119,9 +119,16 @@ const SQL_COMPANIES_BY_PROCESS: &str = "SELECT c.id AS company_id, c.name \
 /// **`AND pb.current_holder_id IS NOT NULL` 是承重谓词**：`current_holder_id` 没有 DB
 /// 约束（`bigint` 可空），而本查询按它分组、解码目标是 `i64`（`HeldBatchRow`）——
 /// 漏掉它时 sqlx 会把 SQL NULL 解不进 `i64` 而报 `error decoding column`，整个
-/// `process_detail` 返 500。加上它既让解码目标保持非可空，也让在途侧的三个落点
-/// （[`SQL_IN_FLIGHT_COUNT_BY_PROCESS`] 的 `COUNT(*)` / 本查询 / 服务层分组）谓词
-/// 逐字同形 ⇒ `snapshot.processes[].in_flight` 与 detail 的在途行数恒相等。
+/// `process_detail` 返 500。加上它既让解码目标保持非可空，也让在途两侧的 SQL 谓词与
+/// [`SQL_IN_FLIGHT_COUNT_BY_PROCESS`] 逐字同形。
+///
+/// **谓词同形不等于「徽标 == 列内卡片数」**：本查询**不带公司谓词**（一次取齐全部
+/// 公司的在途批次），而公司列只渲染 [`SQL_COMPANIES_BY_PROCESS`] 那份「活跃 + 已映射」
+/// 白名单 ⇒ holder 指向已停用 / 已解映射公司的批次**照旧计入** `snapshot` 的
+/// `in_flight`，却在 `to_companies` 的 `HashMap::remove` 处取不到对应列而被整组丢弃。
+/// 症状是「tab 徽标 3、列里 0 张卡」（批次发出后停用公司或解映射即可复现）。所以两侧
+/// 的差**只可能**来自这一处丢弃，不是谓词漂移。偏差登记见 `docs/api/outsource.md`
+/// §8.4（该表同时登记了正确的修法方向：在写入侧禁止停用公司持有在途批次）。
 ///
 /// `LEFT JOIN LATERAL` 派生 `receive_next_process_*`，两步定位与「为什么必须共用同一份
 /// 片段」的全部论证见 `repo/sql.rs::NEXT_PROCESS_LATERAL_SQL`（2026-10-09 从本文件
@@ -175,9 +182,10 @@ const SQL_HELD_BY_PROCESS: &str = "SELECT pb.id AS batch_id, pb.current_holder_i
 
 /// `process_detail` SQL 4：该工序的候选卡。
 ///
-/// 分层与 `OutsourceSendableRepo::list_by_process` 同构（内层 `x` → `DISTINCT ON`
-/// 收敛层 `d` → 外层过滤 + 展示序），收敛层的 `DISTINCT ON (batch_id,
-/// current_process_id)` 与排序键来自既有常量，只有投影不同。
+/// 分层与候选侧 SQL 的既有形态同构（内层 `x` → `DISTINCT ON` 收敛层 `d` → 外层过滤
+/// 与展示序），收敛层的 `DISTINCT ON (batch_id, current_process_id)` 与排序键来自
+/// `repo/sql.rs` 的既有常量（`SENDABLE_INNER_X_SQL` / `SENDABLE_DISTINCT_D_SQL` /
+/// `sendable_dedup_sql`），只有投影不同。
 ///
 /// 展示序沿用 `repo/sql.rs::SENDABLE_DISPLAY_ORDER` 的前四项（加急优先 → 交期近的
 /// 优先 → 同 part → 同批次号），**不再按 `current_process_id` 收尾**：本查询已按
@@ -236,8 +244,8 @@ pub struct HeldBatchRow {
     /// **解码目标恒非可空**：`t_part_batch.current_holder_id` 本身没有 NOT NULL 约束，
     /// 异常行（`location='OUTSOURCE_COMPANY'` 却没 holder）由
     /// [`SQL_HELD_BY_PROCESS`] 的 `current_holder_id IS NOT NULL` 在 SQL 层剔除 ——
-    /// 在途侧的三个落点（分组计数 / 本查询 / 服务层分组）共用这一个谓词，因此
-    /// `snapshot.processes[].in_flight` 与 detail 的在途行数恒相等。
+    /// 该谓词与 [`SQL_IN_FLIGHT_COUNT_BY_PROCESS`] 逐字同形，故这批行在 tab 徽标与
+    /// detail 里同时消失（而不是只有一边少算）。
     pub company_id: i64,
     pub batch_id: i64,
     pub part_id: i64,

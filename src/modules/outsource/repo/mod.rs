@@ -482,8 +482,8 @@ pub trait OutsourceRepoTrait: Send {
     /// **为何不并进 `process_get_category`（2026-10-03 review 第 2 轮登记）**：两者读
     /// 的是 `t_process` 同一行的相邻两列，合到一个 `process_get_flag_row` 里确实能
     /// 少一次往返。但代价是回归面从 outsource 域扩到全部 `process_get_category`
-    /// 调用方（`outsource/service/quote.rs` 的建报价校验、`prod::batch::
-    /// send_to_outsource` 的类别校验），且返回类型要从 `Option<String>` 变成一个
+    /// 调用方（`service/quote.rs` 的建报价校验、`service/move.rs` 的发送方向工序
+    /// 类别校验），且返回类型要从 `Option<String>` 变成一个
     /// 两字段结构体 —— 收益（省一次同表主键查询）远小于改面。故本轮保持独立，等真有
     /// 第三个同表 flag 列时再合并。
     async fn process_get_requires_approval(

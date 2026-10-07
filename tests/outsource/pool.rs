@@ -1391,6 +1391,61 @@ async fn detail_one_row_per_batch_when_part_has_many_batches() {
     assert_eq!(ids, want, "两行必须是不同批次: {env}");
 }
 
+/// `PENDING` + **无 holder**（`current_holder_id IS NULL`）⇒ 仍出行，且
+/// `shelf_id` 是**空串**、`shelf_code` 是 `null`。
+///
+/// 锁两处「无 holder」的映射口径，两条断言都实测过能红（2026-10-09）：
+///
+/// 1. `SENDABLE_INNER_X_SQL` 的 `t_shelf` 必须走 **LEFT JOIN**（不是 INNER）——
+///    生产库里 PENDING 未上架批次的 holder 全为 NULL，改回 INNER 会让「还没下发」的
+///    零件整批从看板消失。实测把 `LEFT JOIN t_shelf` 改回 `JOIN` 后本用例的
+///    `items.len() == 1` 变 0。
+/// 2. `shelf_id` 的**线值**恒是空串而非 `null`：`board/service.rs::to_candidate` 的
+///    `unwrap_or_default()` 是映射点，VO 侧 `shelf_id` 是非可空 `String`（单把映射改成
+///    `None` 编译就过不去）；真正的漂移路径是**连带**把 VO 也改成可空 —— 实测那样改
+///    完本用例的 `row["shelf_id"] == ""` 断言立刻红（序列化出 `null`）。前端已把这个
+///    字段的 Zod 从 `.nullable()` 收紧成 `z.string()`，所以线值必须是空串。
+///
+/// `insert_batch_raw` 的 `holder_id` 形参取 `None` —— 该形参此前两处调用都传 `Some`，
+/// 形同虚设，这是它唯一的 `None` 调用点（也是无 holder 组合的唯一构造入口）。
+#[tokio::test]
+async fn detail_pending_without_holder_still_listed_with_empty_shelf_id() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let cid = insert_customer(&pool, "PcNoHold", "A").await;
+    let (proc_id, _, _) = seed_outsource_process(&pool, "PD-NOHOLD", false).await;
+    let part_id = insert_part(&pool, cid, "NOHOLD", "2026-12-01").await;
+    // 未上架：没有货架可挂 ⇒ holder 为 NULL
+    insert_batch_raw(
+        &pool,
+        part_id,
+        1,
+        None,
+        "PENDING",
+        "PRODUCTION_SHELF",
+        Some(proc_id),
+        0,
+    )
+    .await;
+
+    let (s, env) = get_detail(&app, &token, proc_id).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(
+        env["data"]["items"].as_array().unwrap().len(),
+        1,
+        "无 holder 的 PENDING 批次仍必须出行（t_shelf 只能是 LEFT JOIN）: {env}"
+    );
+    assert_eq!(env["data"]["total"], 1, "{env}");
+    let row = &env["data"]["items"][0];
+    assert_eq!(
+        row["shelf_id"], "",
+        "无 holder 时 shelf_id 序列化为空串（VO 是非可空字符串）: {env}"
+    );
+    assert!(
+        row["shelf_code"].is_null(),
+        "无 holder 时 shelf_code 为 null: {env}"
+    );
+}
+
 // ===========================================================================
 //  5. items 与 snapshot 的 sendable_count 对得上（防 SQL 分叉的核心断言）
 // ===========================================================================

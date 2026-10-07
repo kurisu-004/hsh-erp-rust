@@ -357,7 +357,9 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 
 批次数由 SQL 3（在途批次一次取齐）后在内存 `HashMap` 分组得到，**不依赖 SQL 的 `COUNT`**（那条 SQL 与明细 SQL 的谓词一旦漂移就会分叉）。守卫测试 `board::held_count_guard_tests::held_count_matches_held_batches_len` 直接对生产路径上的纯函数断言恒等式（含交错输入，顺带证明分组不依赖 SQL 的 ORDER BY）。
 
-**在途侧的三个落点共用同一个 `current_holder_id IS NOT NULL` 谓词**：`snapshot` 的在途分组计数（`COUNT(*)`）、`detail` 的在途明细、服务层的分组键。缺了它两边会分叉 —— `COUNT(*)` 会数到一批 `detail` 取不出来的行（tab 徽标虚高），而 `detail` 侧若也缺，`current_holder_id`（`bigint` 可空，无 DB 约束）会以 SQL NULL 落进 `HeldBatchRow::company_id`（`i64`）⇒ sqlx `error decoding column` ⇒ **整个 `process_detail` 返 500**。异常行（`location='OUTSOURCE_COMPANY'` 却没 holder）本仓判为数据异常，登记在下面的偏差表里，不在读侧兜底。
+**在途侧两条 SQL 共用同一个 `current_holder_id IS NOT NULL` 谓词**：`snapshot` 的在途分组计数（`COUNT(*)`）与 `detail` 的在途明细。缺了它两边会分叉 —— `COUNT(*)` 会数到一批 `detail` 取不出来的行（tab 徽标虚高），而 `detail` 侧若也缺，`current_holder_id`（`bigint` 可空，无 DB 约束）会以 SQL NULL 落进 `HeldBatchRow::company_id`（`i64`）⇒ sqlx `error decoding column` ⇒ **整个 `process_detail` 返 500**。服务层的 `HashMap` 分组**不含谓词**（只按 `company_id` 建键），不是第三个落点。异常行（`location='OUTSOURCE_COMPANY'` 却没 holder）本仓判为数据异常，登记在下面的偏差表里，不在读侧兜底。
+
+⚠️ **两条 SQL 谓词同形只保证「holder 为 NULL 的行两侧一致」，不保证 tab 徽标（`in_flight_count`）等于各公司列卡片数之和。** `detail` 的在途明细**不带公司谓词**（一次取齐全部公司的在途批次），而公司列只渲染「活跃 + 已映射」白名单 ⇒ holder 指向已停用 / 已解映射公司的批次照旧计入 tab 徽标，却在服务层被整组丢弃。tab 徽标与列内卡片数的差**只可能**来自这一处丢弃，见 §8.4 的登记条目（注意区分：单列内部的 `held_count == held_batches.len()` 恒等不受影响）。
 
 ### 4.3 snapshot 与 process detail 的关系
 
@@ -370,7 +372,7 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 
 ⚠️ **`snapshot.processes[]` 只含有货工序 ⇒ tab 集合必须由前端 join 全量 OUTSOURCE 工序列表**，否则「该工序的货被发完 / 收完」的那一瞬间 tab 会从界面上消失，正在操作的用户被踢出当前页。工序的全量列表来自 `prod::process` 域（`category='OUTSOURCE'`）。
 
-`snapshot` 的 SQL 条数恒定 3、`detail` 恒定 4，由 `cargo test --lib` 的 `outsource::board::sql_count_guard_tests::{no_sqlx_query_inside_loop_body, detail_queries_are_pinned}` 钉死（源码级护栏：循环体内禁 `sqlx::query` + 调用点数钉死）。改这两条聚合 SQL 必须同步 `board/repo.rs` 的方法 doc、`board/mod.rs` 的条数陈述与那两个常量。
+`snapshot` 的 SQL 条数恒定 3、`detail` 恒定 4，由 `cargo test --lib` 的 `outsource::board::sql_count_guard_tests::{no_sqlx_query_inside_loop_body, detail_queries_are_pinned}` 钉死（源码级护栏：**循环体内禁任何数据库往返调用点**（判定见 `board/mod.rs::QUERY_TERMINALS` / `QUERY_TERMINALS_UFCS`）+ 调用点数钉死）。改这两条聚合 SQL 必须同步 `board/repo.rs` 的方法 doc、`board/mod.rs` 的条数陈述与那两个常量。
 
 ### 4.4 审批闸门 `t_process.requires_approval`
 
@@ -607,7 +609,8 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 - **`GET /outsource-quotes/` 的 `customer_id` 只下潜一层客户子树**，出现 L3 后漏报是**静默的**（`total` 偏小、不报错）。
 - **对账页的 `customer_id` 只判等值、不做子树展开**（与报价一览语义不同，见 §4.6）。若产品要求「按 L1 客户看该客户全部零件的外协发货记录」，需要另行扩子树，不是本轮遗漏。
 - **`companies[].held_count` 与 `held_batches.len()` 的一致性由服务层保证（集成测试 + lib 单测 `held_count_matches_held_batches_len` 锁），但若未来有人在 SQL 侧重新加 `COUNT` 会静默分叉。** SQL 侧已刻意不做 `COUNT`（`SQL_COMPANIES_BY_PROCESS` 的 doc 逐字写了这一点）—— 恢复 `COUNT` 的诱惑来自「顺手」，代价是两条 SQL 的谓词一旦漂移就静默不一致。
-- **`t_part_batch.current_holder_id` 可空，而 `location='OUTSOURCE_COMPANY'` 的批次按业务不变式必有 holder（= 公司 id）；本仓对违约行不兜底。** 在途侧的三个落点统一加 `current_holder_id IS NOT NULL`（见 §4.2），后果是这类批次**在 `snapshot` 的 `in_flight_total` 与 `detail` 的在途卡里都不出现**（静默少算，不是报错）。这是有意的取舍：给它单独一个「holder 缺失」的位置反而要求读侧造一个假的分组键。若将来这类数据真的出现，应该修的是写入侧不变式，不是读侧。
+- **`t_part_batch.current_holder_id` 可空，而 `location='OUTSOURCE_COMPANY'` 的批次按业务不变式必有 holder（= 公司 id）；本仓对违约行不兜底。** 在途侧的两条 SQL 统一加 `current_holder_id IS NOT NULL`（见 §4.2），后果是这类批次**在 `snapshot` 的 `in_flight_total` 与 `detail` 的在途卡里都不出现**（静默少算，不是报错）。这是有意的取舍：给它单独一个「holder 缺失」的位置反而要求读侧造一个假的分组键。若将来这类数据真的出现，应该修的是写入侧不变式，不是读侧。
+- **tab 的在途徽标可能大于全部公司列的卡片数之和，且这是当前设计的正常表现（不是显示 bug）。** 徽标来自 `snapshot` 的 `COUNT(*)`（**不带公司谓词**），卡片只落在 `detail.companies[]` 的「活跃 + 已映射」白名单列里；holder 指向**已停用**或**已解映射**公司的在途批次会计入徽标却被整组丢弃（批次发出后再停用公司 / 解映射即可复现，症状是「徽标 3、列里 0 张卡」）。两条 SQL 的 `current_holder_id IS NOT NULL` 谓词逐字同形也**只**保证「holder 为 NULL 的行两侧一致」，所以徽标与列内卡片数的差**只可能**来自这一处丢弃；前端不要把它当数据不一致做告警。**该修的是写入侧**：不应允许停用公司持有在途批次（公司停用 / 映射删除的写端点应拒绝「仍有在途批次」的公司），而不是在读侧造一个假分组键把丢弃的批次重新挂回某列。
 - **候选卡 `shelf_id` 对「`PENDING` 且未上架」的批次序列化为空串（不是 `null`）。** 这类行本来就在生产架之外，拖拽发送会被 `from` 守卫以 `20122` 拒收。选空串而非 `null` 是因为 `null` 会让前端的必填字符串校验炸在**整页渲染**上。
 - **`snapshot.processes[]` 只含 `sendable + in_flight > 0` 的工序 ⇒ tab 集合必须由前端 join 全量 OUTSOURCE 工序列表，否则操作到一半 tab 会消失。** 后端不返「零货工序」是刻意的（序列板的语义是「现在有活要干的工序」），但这意味着 tab 集合不是后端给的单一真源。
 - **`OutsourceMoveResult.version` 是写后读回的真实值，不是在 Rust 里算的 `batch.version + 1`。** 写入口的 OCC 守卫与源状态白名单都可能让 UPDATE 命中 0 行，让「算出来的 +1」与真实值分叉；而分叉的症状是「刚拖完就冲突」，极难定位。代价是多一次读（同一事务内）。

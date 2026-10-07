@@ -381,6 +381,22 @@ t_assembly.status               ← 派生缓存
 | Phase H | production 其余（work_type / process / worker / queue / queue_auto_allocate）/ assembly / shelf / statistics / outsource | queue fixture 复用度高 |
 | Phase I | iam / user_repo / applicant / customer / dashboard_ws / _e2e / cnc_program / auto_complete / guard_dn_in_use / idempotency / cos_opendal / cos_real_smoke | 单 binary 不拆 |
 
+### 待办登记：测试内联造 snowflake 生成器应收敛到 `pool_snowflake()`（2026-10-09）
+
+各测试文件普遍**本地** `SnowflakeIdGenerator::new(1_577_836_800_000, 1)`（部分还 `.next_id()` 立即调用），而 `test-support/src/pool.rs::pool_snowflake()` 已经是**进程级 `OnceLock` + Mutex**、instance 取 `pid ⊕ 启动纳秒低位 → 0-1023`（正是为并行测试不撞 id 设计的）。两者并存导致进程内可能出现同一毫秒的两条 id 流。
+
+实测口径（`rg -o … tests/`，**不含 `src/` 与 `test-support/`**）：
+
+| 形态 | 文件 | 处数 |
+|---|---|---|
+| 同形 `SnowflakeIdGenerator::new(1_577_836_800_000, 1)` | **37** | **182** |
+| 任意 instance 形态（`…new(` 全量） | 51 | 219 |
+
+单文件计数：`tests/dashboard_ws_api.rs` 25 / `tests/part/file.rs` 18 / `tests/assembly/api.rs` 16（这三份占同形写法的 1/3）。`src/` 内另有 1 处同形（`src/modules/outsource/service/shipment.rs` 的 lib 单测），全仓合计 38 文件 / 183 处。
+
+**不算坑**（刻意用不同 instance 区分并行进程，替换时要跳过）：`tests/part/lifecycle.rs` 的 instance `11` / `12` / `13`、`tests/part/crud.rs:1293` 起的 `99`、`tests/part/purchase_order_import.rs` 的 `777`。
+
+修法与代价：机械替换 37 文件 / 182 处为 `pool_snowflake()` 调用（`lock().unwrap().next_id()`），**零行为变更**（进程内已按 pid 隔离），可单独一个 commit。唯一要复核的是**依赖 id 单调递增**或**依赖 id 落在某区段**的断言 —— 换成进程级游标后同一测试内仍单调，但跨 helper 共享游标会改变各 helper 拿到的相对 id，故不能整仓一键替换，需按文件确认。
 
 ## DB 约定（迁移与查询必须沿用）
 
