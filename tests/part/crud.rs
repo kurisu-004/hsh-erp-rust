@@ -38,10 +38,6 @@ use hsh_erp_test_support::*;
 /// 完整复现形态：同 instance + 同毫秒 + 同 seq ⇒ 逐字节相同的 id ⇒ `t_part_pkey` 23505。
 /// 共享 generator 后这些 ID 与 fixture helper 发出的 ID 同属一条流，进程内单调唯一。
 ///
-/// 遗留（登记在 CLAUDE.md「待办登记：测试内联造 snowflake 生成器应收敛到
-/// `pool_snowflake()`」）：本文件部分**用例内**仍现建 `SnowflakeIdGenerator::new(...)`，
-/// 属逐文件确认的批量迁移范围，不在本轮范围内。
-///
 /// 2026-10-09 补：上一条「遗留」已清零 —— 本文件 7 处用例内 `SnowflakeIdGenerator::new`
 /// （含 instance `1` 与刻意 `99` 的形态）全部改为直调本文件入口 / 共享 generator，
 /// 全仓 `tests/` 已无真实代码行的 `SnowflakeIdGenerator::new`。

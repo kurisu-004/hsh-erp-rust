@@ -27,7 +27,8 @@ pub mod serial; // 2026-09-14 Phase 3：跨域序列号派发（assembly + 后�
 // 2026-10-09 新增 snowflake_guard：雪花 ID 构造护栏，把「进程内只从共享 generator 取号」
 // 从口头约定变成 CI 强制（扫 `src/` + `tests/` + `test-support/src/`，白名单只有 4 个文件：
 // 两个进程级唯一 ID 源 + 生产 instance 来源 + generator 自身的位布局单测）。
-// 缘起见 CLAUDE.md「待办登记：测试内联造 snowflake 生成器应收敛到 pool_snowflake()」——
+// 缘起见 CLAUDE.md「测试取号：进程内唯一 generator」一节（原名「待办登记：测试内联造
+// snowflake 生成器应收敛到 pool_snowflake()」，已随 2026-10-09 那轮改造重写为已完成）——
 // 本仓此前就因为缺这道护栏，让 200 处本地 generator 积累了几个月。
 // 同 `domain_guard`：`#[cfg(test)]` 项、不进生产 API 面。
 #[cfg(test)]

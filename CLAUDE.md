@@ -25,6 +25,9 @@ docker compose up -d postgres-test   # 测试库（localhost:5429，库 postgres
 cargo check                 # 已有 query! 宏：编译期经 .env 的 DATABASE_URL 连开发库校验；无库时用 SQLX_OFFLINE=true（.sqlx 已提交）
 cargo clippy --all-targets
 cargo test                  # 需先起 postgres-test；跑单个测试：cargo test <name>
+                            # ⚠️ lib 单测与每个 integration test binary **各起各的进程**，
+                            #   故雪花取号源也各有一个（进程内唯一，不是全仓唯一）：
+                            #   详见「测试取号：进程内唯一 generator」一节。
                             # ⚠️ wx 域有一条 access_token 缓存单测用**真 Redis**
                             # （默认 redis-test:6380，可用 TEST_REDIS_URL 覆盖）；
                             #   无 Redis 时该测试**自动跳过并打印 [跳过] 提示**，
@@ -43,7 +46,9 @@ cargo install cargo-nextest --locked
 scripts/test_nextest.sh
 
 # 单个 binary 调试（runner 自动起容器、用完即删）
-cargo test --test <name>
+cargo test --test <name>   # ⚠️ 该路径下同一 binary 是**多线程同进程**跑的，
+                           #    正是「进程内 ID 唯一性」最值得验的路径（历史上两个
+                           #    instance=1 的域内单例就是这样撞出 23505 的）
 
 # 快速路：复用 postgres-test 服务（:5429，跳过容器)
 # ⚠️ 2026-09-30 起 5429 被孤儿容器占着，此路当前不可用 → 走 scripts/test_nextest.sh
@@ -231,6 +236,21 @@ t_assembly.status               ← 派生缓存
   的 UPDATE 不在判定范围）。写入口再搬家时该测试的允许路径常量要同步改。
   同模块另有 `shared::batch::status::bind_guard_tests::bind_placeholders_are_contiguous`
   钉住单行 UPDATE 的占位符 ↔ bind 个数。改动 `mark_batch_*` 后请顺手跑一次。
+- **CI 强制（本仓级，2026-10-09 新增）**：`cargo test --lib` 的两道
+  `shared::snowflake_guard::tests::*` 把「测试期进程内只从唯一源取号」钉成事实 ——
+  守卫对象是 `src/shared/snowflake_guard.rs`，与上面的 `write_guard_tests` 同级：
+  - `no_local_generator_construction_outside_whitelist` —— 扫 `src/` + `tests/` +
+    `test-support/src`，白名单 4 个文件（`SANCTIONED`）+ 每个白名单文件的命中处数上限
+    4 条（`SANCTIONED_HIT_CAPS`，实测值；含两个「唯一源」文件各 1 条，防白名单文件内部
+    再开一个 generator）。判定只认**代码字符**，注释 / 字符串 / raw string 里贴的旧写法
+    样例天然不误报；
+  - `no_lib_unit_test_pulls_in_a_second_generator` —— 扫 `src/`，只放行 test-support 的
+    `::test_pool` / `::test_redis_url` 两个**不碰 generator** 的入口。防的是 lib 单测
+    进程里出现第二个 generator（那不是一处 `::new`，上一条抓不到，成因见「测试取号」
+    一节的 dev-dependency 环）。
+  ⚠️ **已知漏报盲区登记在 `src/shared/snowflake_guard.rs` 的模块 doc 顶部**（「未登记的
+  漏报形态一律视为护栏缺陷」），CLAUDE.md 只放指针、不复制内容。护栏搬家或改判定逻辑时
+  请连带复核那份 doc。
 - **派生层不得否决主操作**：派生写不抛错，`sync_assembly_status` 的 OCC 冲突降级为
   「跳过 + `tracing::warn!`」。
 - **派生层不得覆盖主操作**（2026-10-01 review 第 1 轮 B1 补齐，两条都要守）：
@@ -353,7 +373,7 @@ t_assembly.status               ← 派生缓存
 | `tests/delivery/{main,group,attach_batches,scan,note}.rs` | 5 | `delivery` |
 | `tests/part/{main,create_serial_price,batch,crud,file,inspection_batches,lifecycle,list_enrichment,pickable_by_work_type,purchase_order_import,repair,rollup_recompute,serial,to_inspection,to_process,to_ship}.rs` | 12 | `part`（sub-file 穷举，`main.rs` 为 binary 入口。★ `purchase_order_import.rs` 2026-10-06 新增：采购订单 Excel 导入两端点 —— `match-by-excel-items` 分档匹配 + `batch-update-order-info` 三态回填 / skip）|
 | `tests/assembly/{main,api,files,status_sync}.rs` | 3 | `assembly` |
-| `tests/iam/{main,api,middleware}.rs` | 2 | `iam`（redis-flush group）|
+| `tests/iam/{main,api,middleware}.rs` | 2 | `iam`（**2026-10-09**：原 `redis-flush` 串行组已整体删除 —— Redis 隔离改由 key 前缀承担、触发该组的 `clean_redis`（FLUSHDB）已零调用方随函数删除、两个 binary 的并行度已恢复；删除理由留档在 `.config/nextest.toml` 的注释里）|
 | `tests/shelf/{main,api,deactivate}.rs` | 2 | `shelf` |
 | `tests/statistics/{main,api,event_driven}.rs` | 2 | `statistics` |
 | `tests/production/{main,work_type,process,process_chain,worker,queue,queue_auto_allocate,queue_dispatch,queue_board,pending_programming,shelf_process,pickup,process_design,inspection}.rs` | 6 | `production`（按 `src/modules/prod/*` 对齐；`shelf_process.rs` 2026-10-02 自 `tests/shelf/api.rs` 迁入；**`process_design.rs` 2026-10-05 新增**，★ 核心回归是「装配件子件可见」；**`inspection.rs` 2026-10-05 新增** 13 场景，★ 核心回归是「扫子件 → 返回整棵装配件树」；**2026-10-08** `worker_pool.rs` → `queue.rs`、`worker_pool_auto_allocate.rs` → `queue_auto_allocate.rs`、`batch.rs` → `queue_dispatch.rs`，并新增 `queue_board.rs`（队列板聚合 9 场景））|
@@ -369,7 +389,9 @@ t_assembly.status               ← 派生缓存
 
 ## 集成测试 fixture 范本（2026-09-23 PR13 Phase F 引入）
 
-`test-support` 提供三类共享资产，新 integration test binary 一律走下列入口，**禁止在测试文件内重新声明本地 `send` / `json_request` / `setup` / `login_*` / `insert_*` / `seed_*`**：
+`test-support` 提供三类共享资产，新 integration test binary 一律走下列入口，**禁止在测试文件内重新声明本地 `send` / `json_request` / `setup` / `login_*` / `insert_*` / `seed_*` / snowflake 取号入口**：
+
+⚠️ **新 fixture 的第一坑是取号**：每个测试文件都自己写一个 `SnowflakeIdGenerator::new(...)` 是 2026-10-09 之前本仓积累 200 处本地 generator 的根因（两个 fresh generator 各自从 `seq=0` 起步 ⇒ 同毫秒发出逐字节相同的 id ⇒ `23505`）。**不要**在 fixture 里现建 generator，走「测试取号：进程内唯一 generator」一节登记的两个入口之一。
 
 ### `test-support::http` —— HTTP 客户端 helper
 
@@ -391,6 +413,15 @@ t_assembly.status               ← 派生缓存
 2. **Fixture struct**：`test-support/src/fixture.rs::ProcessChainFixture`（字段 + 常量 ID `pub const`），`Default` 实现给出 `manager_username` / `clerk_username` 等字符串常量
 3. **Loader 函数**：`load_<domain>_fixture(pool: &PgPool) -> <Domain>Fixture`，走 `include_str!` 编译期嵌入 + `sqlx::raw_sql` 一次性执行（multi-statement）；与 [`fixtures`](test-support/src/fixtures.rs)（动态 helper）分工：前者批量差异跨域共享，后者单条参数化差异
 
+### `test-support::snowflake` —— 进程内**唯一**取号入口（2026-10-09）
+
+| 进程域 | 入口 | 备注 |
+|---|---|---|
+| `tests/**`（集成测试 binary） | `hsh_erp_test_support::shared_test_snowflake()` | `pool_snowflake()` 是**兼容薄壳**（同一把锁 + 内层多包一层 `Arc`，靠 `Deref` 照旧 `lock().unwrap().next_id()`），存量调用点未改 |
+| `src/**` 的 `#[cfg(test)]`（lib 单测 binary） | `crate::shared::test_snowflake::shared_test_snowflake()` | ⚠️ **不能**用 test-support 的同名函数 —— dev-dependency 环让该二进制里链进两份 `hsh_erp_rust`，两个 `SnowflakeIdGenerator` 是**不同类型**，传参即 `E0308` |
+
+两者为什么必须并存（成因、被否决的两个替代方案、根治方向）见「测试取号：进程内唯一 generator」一节；CI 护栏见「状态派生契约」一节登记的两条 `shared::snowflake_guard::tests::*`。**测试文件里不得出现第三处 generator**。
+
 ### 范本文件
 
 `tests/production/process_chain.rs` 是首个按 fixture 范本改写的 integration test binary，10 个场景的字面请求 / 断言**逐字保留**，仅替换本地 helper 为 test-support 引入 + 抽出 `bootstrap_as_manager` / `bootstrap_as_clerk` 两个样板函数。新 binary 改造时可参照此模式。
@@ -404,22 +435,40 @@ t_assembly.status               ← 派生缓存
 | Phase H | production 其余（work_type / process / worker / queue / queue_auto_allocate）/ assembly / shelf / statistics / outsource | queue fixture 复用度高 |
 | Phase I | iam / user_repo / applicant / customer / dashboard_ws / _e2e / cnc_program / auto_complete / guard_dn_in_use / idempotency / cos_opendal / cos_real_smoke | 单 binary 不拆 |
 
-### 待办登记：测试内联造 snowflake 生成器应收敛到 `pool_snowflake()`（2026-10-09）
+### 测试取号：进程内唯一 generator（2026-10-09 已完成 + 新规约）
 
-各测试文件普遍**本地** `SnowflakeIdGenerator::new(1_577_836_800_000, 1)`（部分还 `.next_id()` 立即调用），而 `test-support/src/pool.rs::pool_snowflake()` 已经是**进程级 `OnceLock` + Mutex**、instance 取 `pid ⊕ 启动纳秒低位 → 0-1023`（正是为并行测试不撞 id 设计的）。两者并存导致进程内可能出现同一毫秒的两条 id 流。
+⚠️ 本节原名「待办登记：测试内联造 snowflake 生成器应收敛到 `pool_snowflake()`」，内容已随本轮改造作废并重写为**已完成**。若在别处（代码注释 / 测试文件）看到指向旧节名的引用，按本节为准。
 
-实测口径（`rg -o … tests/`，**不含 `src/` 与 `test-support/`**）：
+**根因（一句话）**：位布局 `ts << 22 | instance << 12 | seq` 里 `last_ms` / `sequence` 是 **generator 对象私有**字段，而 `new()` 一律从 `last_ms=0, sequence=0` 起步 ⇒ 碰撞判据是「**两个不同 helper 各调一次**」（各自 fresh、都取 seq 0、都写同一张表、背靠背毫秒大概率同 ts），**不是**「同一个 helper 调两次」。所以「进程内唯一」的正确保证点是**对象共享**，不是 instance 编号（instance 只有 10 bit = 1024 槽，本就该留给**跨进程**区分）。
 
-| 形态 | 文件 | 处数 |
-|---|---|---|
-| 同形 `SnowflakeIdGenerator::new(1_577_836_800_000, 1)` | **37** | **182** |
-| 任意 instance 形态（`…new(` 全量） | 51 | 219 |
+**实测口径（护栏探测器实测，非 `rg` 粗算；真实代码行，注释与字符串字面量不计）**：
 
-单文件计数：`tests/dashboard_ws_api.rs` 25 / `tests/part/file.rs` 18 / `tests/assembly/api.rs` 16（这三份占同形写法的 1/3）。`src/` 内另有 1 处同形（`src/modules/outsource/service/shipment.rs` 的 lib 单测），全仓合计 38 文件 / 183 处。
+| 文件 | 处数 | 身份 |
+|---|---:|---|
+| `test-support/src/pool.rs` | 1 | 集成测试 binary 的**唯一** ID 源（`TEST_SNOWFLAKE_GEN` 的 `get_or_init`） |
+| `src/shared/test_snowflake.rs` | 1 | lib 单测 binary 的**唯一** ID 源（`SHARED_TEST_SNOWFLAKE` 的 `get_or_init`） |
+| `src/main.rs` | 1 | 生产 instance 来源 |
+| `src/infra/snowflake.rs` | 8 | **被测对象自身**的位布局 / sequence 回绕 / epoch / `MAX_INSTANCE` panic 边界单测 |
+| **合计** | **11** | 4 个文件 |
 
-**不算坑**（刻意用不同 instance 区分并行进程，替换时要跳过）：`tests/part/lifecycle.rs` 的 instance `11` / `12` / `13`、`tests/part/crud.rs:1293` 起的 `99`、`tests/part/purchase_order_import.rs` 的 `777`。
+`tests/**` 侧取号调用点：`pool_snowflake()`（兼容薄壳）**129** 处、`shared_test_snowflake()` **240** 处。
 
-修法与代价：机械替换 37 文件 / 182 处为 `pool_snowflake()` 调用（`lock().unwrap().next_id()`），**零行为变更**（进程内已按 pid 隔离），可单独一个 commit。唯一要复核的是**依赖 id 单调递增**或**依赖 id 落在某区段**的断言 —— 换成进程级游标后同一测试内仍单调，但跨 helper 共享游标会改变各 helper 拿到的相对 id，故不能整仓一键替换，需按文件确认。
+**新规约：进程内只从唯一源取号**（任何一类的测试代码都不得再 `SnowflakeIdGenerator::new` 另起一条 id 流）：
+
+| 代码位置 | 入口 |
+|---|---|
+| `tests/**`（集成测试 binary） | `hsh_erp_test_support::shared_test_snowflake()`；存量 `pool_snowflake().lock().unwrap().next_id()` 是它的**兼容薄壳**（同一把锁 + 内层多包一层 `Arc`，靠 `Deref` 照旧可用），129 处调用点一行未改 |
+| `src/**` 的 `#[cfg(test)]`（lib 单测 binary） | `crate::shared::test_snowflake::shared_test_snowflake()` |
+
+**为什么是两个进程域各一个源（不是各仓共用一个）**：`test-support` 是 `[dev-dependencies]` 且 path-depends 回主 crate，构成 **dev-dependency 环**，编译 lib 单测目标时同一个二进制里链进**两份** `hsh_erp_rust`，两个 `SnowflakeIdGenerator` 是**两个不同的类型**，把 test-support 那个传给收本 crate 类型的形参即 `E0308`。两类 binary 又是**不同进程**（`cargo test` 里 lib 单测与每个 integration test binary 各起各的进程），跨进程撞号只可能通过 Redis 显形，而 Redis 已由 `RedisConfig::key_prefix` 按进程隔离，故「进程内各有一个唯一源」已经足够。
+⚠️ **两个替代方案已被评估并否决，不要重走**：① 把共享 generator 移出 `#[cfg(test)]` 进正常 lib —— `test-support` 链的是**另一份** `hsh_erp_rust`，消不掉第二份；② 让 `test-support` 走 feature 而非 dev-dependency —— 环仍在（它 path-depends 主 crate 这条依赖关系不变）。
+**根治方向（登记为独立重构）**：把 `test-support` 合回主 crate，让「两个 crate 实例」这个前提消失。
+
+**已迁走的写法（历史陈述，不是本仓现状）**：
+- 刻意填不同 instance 的「权宜之计」曾见于 `tests/part/lifecycle.rs`（`11`/`12`/`13`）、`tests/part/crud.rs`（`99`）、`tests/part/purchase_order_import.rs`（`777`）—— **现已全部迁走**。「换 instance 有效」这个知识本身仍成立（instance 不同 ⇒ 位段不同 ⇒ 必然不撞），但它不再是本仓任何一处的做法，且 instance 填字面量仍有 1/1024 概率与本进程派生值相等 ⇒ 不是可依赖的规约。
+- 历史真实事故形态是两个**同为 instance=1** 的独立 generator（`tests/part/crud.rs` 与 `tests/part/rollup_recompute.rs` 各有一个域内单例，同属 `part` 一个 binary，`cargo test --test part` 下同进程多线程 ⇒ 完整复现）。
+
+**旧登记表里「待复核」项已复核**：当时担心「有断言依赖 id 单调递增 / 落在某绝对区段」—— 逐个打开 34 个迁移文件复核，**零 id 算术、零 id 比较**：全仓唯一的 id 算术在 `tests/part/inspection_batches.rs` 的兜底键用例里，且它是**写死的字面量基座** `id_base` 加 0/1/2，与 generator 行为无关。迁移前后断言逐字未改。
 
 ## DB 约定（迁移与查询必须沿用）
 
@@ -427,6 +476,12 @@ t_assembly.status               ← 派生缓存
 - 乐观锁：`version` 列，UPDATE 带 `WHERE id=$1 AND version=$2`，0 行 → 409 / `VERSION_CONFLICT`
 - 软删除：`deleted_at IS NULL`；审计字段 `created_at/by`、`updated_at/by`
 - 雪花主键：`SnowflakeIdGenerator::next_id()` App 侧生成
+  - ⚠️ **测试期例外（2026-10-09）**：测试代码**不得**自己 `new` generator，进程内各有一个
+    唯一源 —— `tests/**` 走 `hsh_erp_test_support::shared_test_snowflake()`（兼容薄壳
+    `pool_snowflake()`）、`src/**` 的 `#[cfg(test)]` 走
+    `crate::shared::test_snowflake::shared_test_snowflake()`；由
+    `src/shared/snowflake_guard.rs` 的两道 CI 护栏强制，详见「测试取号：进程内唯一
+    generator」一节
 - i64 主键序列化为 JSON string（`shared/types.rs` 的 serde helper），防 JS 精度截断
 - 时间列存 naive `timestamp`，写入用 `infra::clock::now_naive()`（Asia/Shanghai）
 - 迁移命名：`<13位时间戳>_<顺序>_<描述>.sql`，见 `migrations/README.md`
