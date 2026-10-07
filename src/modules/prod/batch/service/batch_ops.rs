@@ -69,13 +69,8 @@ impl BatchService {
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "part 不存在"))?;
         validate_batch_version(batch.id, req.version, batch.version)?;
-        // 数量校验
-        let qty: i32 = req.quantity.try_into().map_err(|_| {
-            AppError::biz(
-                code::BIZ_PART_BATCH_INVALID_QUANTITY,
-                "quantity 超出 i32 范围",
-            )
-        })?;
+        // 数量校验：DTO 的 `quantity` 已是 i32，这两条才是真正的业务闸
+        let qty = req.quantity;
         if qty <= 0 {
             return Err(AppError::biz(
                 code::BIZ_PART_BATCH_INVALID_QUANTITY,

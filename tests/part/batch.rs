@@ -2,6 +2,8 @@
 //!
 //! 覆盖：
 //!   - split_batch: happy path + 数量校验 + 批次守恒不变量 + OCC 过期 + 硬切守卫
+//!   - split_batch 入参形态（2026-10-09）：`quantity` 裸 JSON 数字必通 /
+//!     字符串必 422 纯文本，`batch_id` 字符串形态与出参三 ID 字符串形态一并钉住
 //!   - cancel_batch: happy path + 终态保护
 //!   - list_batches: 工单全部活跃批次
 //!   - list_events: 工单事件历史
@@ -134,7 +136,7 @@ async fn split_batch_happy_path() {
     let body = json!({
         "batch_id": bid.to_string(),
         "version": version,
-        "quantity": "3",
+        "quantity": 3,
     });
     let (s, env) = send(
         app,
@@ -189,7 +191,7 @@ async fn split_batch_invalid_quantity_rejects() {
     let body = json!({
         "batch_id": bid.to_string(),
         "version": version,
-        "quantity": "10",
+        "quantity": 10,
     });
     let (s, env) = send(
         app,
@@ -208,7 +210,7 @@ async fn split_batch_quantity_negative_rejects() {
     let body = json!({
         "batch_id": bid.to_string(),
         "version": version,
-        "quantity": "-1",
+        "quantity": -1,
     });
     let (s, env) = send(
         app,
@@ -217,6 +219,107 @@ async fn split_batch_quantity_negative_rejects() {
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "quantity<0 应拒绝: {env}");
     assert_eq!(env["code"], 20111);
+}
+
+/// 2026-10-09：`quantity` 是**裸 JSON 数字**，`batch_id` 是**JSON 字符串** ——
+/// 同一份请求体里两种形态并存，本用例把这条口径钉死。
+///
+/// 钉两件事：① 数字形态的 `quantity` 必须打通（计数字段挂 `deserialize_i64` 时前端
+/// 发数字会吃 axum `Json` 提取器的 422 纯文本）；② 出参三个雪花 ID 仍是 JSON 字符串
+/// （守住 `R<i64>` → `BatchSplitOut` 那次出参改造的精度修复不被入参形态改动带坏）。
+#[tokio::test]
+async fn split_batch_numeric_quantity_with_string_batch_id_succeeds() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PENDING", 10).await;
+    let version = batch_version(&pool, bid).await;
+    let body = json!({
+        "batch_id": bid.to_string(),
+        "version": version,
+        "quantity": 4,
+    });
+    let (s, env) = send(
+        app,
+        json_request("POST", "/batches/split", Some(body), Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "数字形态的 quantity 应打通: {env}");
+    assert_eq!(env["code"], 0);
+    let data = &env["data"];
+    // 三个雪花 ID 一律字符串（裸数字会被 JS 截断精度）
+    for field in ["batch_id", "new_batch_id", "part_id"] {
+        assert!(
+            data[field].is_string(),
+            "`{field}` 必须是 JSON 字符串而非裸数字: {env}"
+        );
+    }
+    assert_eq!(
+        data["batch_id"],
+        bid.to_string(),
+        "batch_id 回显请求值: {env}"
+    );
+    assert_eq!(
+        data["part_id"],
+        pid.to_string(),
+        "part_id 由批次行反查: {env}"
+    );
+    assert_eq!(data["quantity"], 4, "quantity 是实际拆走量: {env}");
+    assert_eq!(
+        data["source_version"],
+        version + 1,
+        "source_version = 请求 version + 1: {env}"
+    );
+    // 新批次确实落库，数量 = 拆走量
+    let new_batch_id: i64 = data["new_batch_id"].as_str().unwrap().parse().unwrap();
+    let new_qty: i32 = sqlx::query_scalar("SELECT quantity FROM t_part_batch WHERE id = $1")
+        .bind(new_batch_id)
+        .fetch_one(&pool)
+        .await
+        .expect("新批次应落库");
+    assert_eq!(new_qty, 4, "新批次数量 = 拆走量");
+}
+
+/// `quantity` 的**反向**用例：字符串形态必须被拒。
+///
+/// 2026-10-09 新增：`quantity` 的入参形态是裸 JSON 数字，`"quantity": "4"`
+/// 走 `i32` 反序列化失败 ⇒ axum `JsonRejection::JsonDataError` ⇒ **HTTP 422 纯文本**。
+/// 这类响应**不是** `R<T>` 信封（响应里没有 `code` 字段），故用 `send_raw` 拿
+/// 原文断言，不能走 `send`（它在 JSON 解析处 panic）。同时确认提取器层拒收时
+/// 没落任何批次行。
+#[tokio::test]
+async fn split_batch_string_quantity_rejects_with_422_plaintext() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PENDING", 10).await;
+    let version = batch_version(&pool, bid).await;
+    let body = json!({
+        "batch_id": bid.to_string(),
+        "version": version,
+        "quantity": "4",
+    });
+    let (s, raw) = send_raw(
+        app,
+        json_request("POST", "/batches/split", Some(body), Some(&token)),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "字符串形态的 quantity 应被 Json 提取器拒（422）: body={raw}"
+    );
+    assert!(
+        !raw.contains("\"code\""),
+        "422 是提取器层的纯文本、不走 R<T> 信封（不应出现 code 字段）: body={raw}"
+    );
+    // 提取器层拒收 ⇒ service 未执行 ⇒ 批次行未变
+    let (count, total): (i64, i32) = sqlx::query_as(
+        "SELECT COUNT(*)::bigint, COALESCE(SUM(quantity), 0)::int \
+         FROM t_part_batch WHERE part_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(pid)
+    .fetch_one(&pool)
+    .await
+    .expect("sum");
+    assert_eq!(count, 1, "422 不得产生新批次");
+    assert_eq!(total, 10, "422 不得扣减源批次数量");
 }
 
 /// OCC 锚过期 → 40901，且**不得**写脏批次。
@@ -231,7 +334,7 @@ async fn split_batch_stale_version_returns_40901() {
     let body = json!({
         "batch_id": bid.to_string(),
         "version": stale,
-        "quantity": "3",
+        "quantity": 3,
     });
     let (s, env) = send(
         app,
@@ -263,7 +366,7 @@ async fn split_batch_legacy_path_is_gone() {
     let version = batch_version(&pool, bid).await;
     let body = json!({
         "version": version,
-        "quantity": "3",
+        "quantity": 3,
     });
     // 404 是 axum 的空 body 兜底响应，不走 `R<T>` 信封 → 用 `send_raw`
     let (s, raw) = send_raw(
@@ -293,7 +396,7 @@ async fn invariant_split_preserves_total_quantity() {
     let body = json!({
         "batch_id": bid.to_string(),
         "version": version,
-        "quantity": "3",
+        "quantity": 3,
     });
     let (s, env) = send(
         app,
