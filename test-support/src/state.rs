@@ -32,7 +32,6 @@ use hsh_erp_rust::infra::config::{
 use hsh_erp_rust::infra::cos::{CosClient, NoopCos, ObjectMeta};
 // 2026-09-28 新增：rust → python 后端转发客户端（薄壳鉴权转发 STS）。
 use hsh_erp_rust::infra::py_backend::{NoopPyBackend, PyBackendClient};
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::infra::ws_hub::WsHub;
 // 2026-09-29 新增：企业微信登录客户端（默认 Noop；集成测试用 mock 替换）。
 use hsh_erp_rust::modules::wx::wecom_client::{NoopWeComClient, WeComApiClient};
@@ -40,7 +39,7 @@ use hsh_erp_rust::shared::error::{AppError, code};
 use hsh_erp_rust::state::AppState;
 
 use crate::pem;
-use crate::pool::{test_database_url, test_snowflake_instance};
+use crate::pool::{shared_test_snowflake, test_database_url, test_snowflake_instance};
 use crate::redis::test_redis_url;
 
 /// 测试用 JWT secret：长度 >= 32（HS256 建议）+ 与生产区分
@@ -110,8 +109,10 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
         },
         snowflake: SnowflakeConfig {
             epoch_ms: 1_577_836_800_000,
-            // 2026-09-20：per-process instance（pid ⊕ 启动纳秒 mod 1024），
-            // 替代原固定 1，消除 nextest 跨进程并行撞 snowflake ID（详见 test_snowflake_instance）。
+            // 2026-09-20：per-process instance（pid ⊕ 启动纳秒 mod 1024）。
+            // 2026-10-09 职责收窄：instance 现在只负责**跨进程**区分（10 bit = 1024 槽）；
+            // 进程内唯一性改由下方 `shared_test_snowflake()` 的共享 generator 对象保证
+            // （详见 pool.rs::test_snowflake_instance 的「新约定」）。
             instance: test_snowflake_instance(),
         },
         redis: AppRedisConfig {
@@ -153,10 +154,11 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
         // 2026-09-29 新增：企业微信登录配置默认未配置（enabled=false）。
         wecom: WeComConfig::default(),
     });
-    let snowflake = Arc::new(SnowflakeIdGenerator::new(
-        config.snowflake.epoch_ms,
-        config.snowflake.instance,
-    ));
+    // 2026-10-09：AppState 复用全进程共享 generator（`shared_test_snowflake()`），与
+    // fixture helper 发出的 ID 同流。此前每个 `test_state*` 各建一个 generator、且
+    // instance 与 `pool_snowflake()` 相同 —— 两个独立 generator 在同一毫秒各取 seq 0
+    // 会发出逐字节相同的 id，撞 `t_*_pkey`（23505）。根因见 pool.rs 的模块 doc。
+    let snowflake = shared_test_snowflake().clone();
     let ws_hub = Arc::new(WsHub::new());
     let cos: Arc<dyn CosClient> = Arc::new(NoopCos);
     // 2026-09-28 新增：python 后端转发默认走 NoopPyBackend（不真发 HTTP）。
@@ -278,8 +280,10 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
         },
         snowflake: SnowflakeConfig {
             epoch_ms: 1_577_836_800_000,
-            // 2026-09-20：per-process instance（pid ⊕ 启动纳秒 mod 1024），
-            // 替代原固定 1，消除 nextest 跨进程并行撞 snowflake ID（详见 test_snowflake_instance）。
+            // 2026-09-20：per-process instance（pid ⊕ 启动纳秒 mod 1024）。
+            // 2026-10-09 职责收窄：instance 现在只负责**跨进程**区分（10 bit = 1024 槽）；
+            // 进程内唯一性改由下方 `shared_test_snowflake()` 的共享 generator 对象保证
+            // （详见 pool.rs::test_snowflake_instance 的「新约定」）。
             instance: test_snowflake_instance(),
         },
         redis: AppRedisConfig {
@@ -319,10 +323,11 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
         // 2026-09-29 新增：企业微信登录配置默认未配置（enabled=false）。
         wecom: WeComConfig::default(),
     });
-    let snowflake = Arc::new(SnowflakeIdGenerator::new(
-        config.snowflake.epoch_ms,
-        config.snowflake.instance,
-    ));
+    // 2026-10-09：AppState 复用全进程共享 generator（`shared_test_snowflake()`），与
+    // fixture helper 发出的 ID 同流。此前每个 `test_state*` 各建一个 generator、且
+    // instance 与 `pool_snowflake()` 相同 —— 两个独立 generator 在同一毫秒各取 seq 0
+    // 会发出逐字节相同的 id，撞 `t_*_pkey`（23505）。根因见 pool.rs 的模块 doc。
+    let snowflake = shared_test_snowflake().clone();
     let ws_hub = Arc::new(WsHub::new());
     let cos: Arc<dyn CosClient> = Arc::new(NoopCos);
     // 2026-09-28 新增：python 后端转发默认走 NoopPyBackend。
@@ -423,8 +428,10 @@ pub async fn test_state_with_cos(
         },
         snowflake: SnowflakeConfig {
             epoch_ms: 1_577_836_800_000,
-            // 2026-09-20：per-process instance（pid ⊕ 启动纳秒 mod 1024），
-            // 替代原固定 1，消除 nextest 跨进程并行撞 snowflake ID（详见 test_snowflake_instance）。
+            // 2026-09-20：per-process instance（pid ⊕ 启动纳秒 mod 1024）。
+            // 2026-10-09 职责收窄：instance 现在只负责**跨进程**区分（10 bit = 1024 槽）；
+            // 进程内唯一性改由下方 `shared_test_snowflake()` 的共享 generator 对象保证
+            // （详见 pool.rs::test_snowflake_instance 的「新约定」）。
             instance: test_snowflake_instance(),
         },
         redis: AppRedisConfig {
@@ -463,10 +470,11 @@ pub async fn test_state_with_cos(
         // 2026-09-29 新增：企业微信登录配置默认未配置（enabled=false）。
         wecom: WeComConfig::default(),
     });
-    let snowflake = Arc::new(SnowflakeIdGenerator::new(
-        config.snowflake.epoch_ms,
-        config.snowflake.instance,
-    ));
+    // 2026-10-09：AppState 复用全进程共享 generator（`shared_test_snowflake()`），与
+    // fixture helper 发出的 ID 同流。此前每个 `test_state*` 各建一个 generator、且
+    // instance 与 `pool_snowflake()` 相同 —— 两个独立 generator 在同一毫秒各取 seq 0
+    // 会发出逐字节相同的 id，撞 `t_*_pkey`（23505）。根因见 pool.rs 的模块 doc。
+    let snowflake = shared_test_snowflake().clone();
     let ws_hub = Arc::new(WsHub::new());
     // 2026-09-28 新增：python 后端转发默认走 NoopPyBackend。
     let py_backend: Arc<dyn PyBackendClient> = Arc::new(NoopPyBackend);

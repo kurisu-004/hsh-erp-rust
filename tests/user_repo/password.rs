@@ -49,7 +49,11 @@ use hsh_erp_test_support::{UserRepoFixture, load_user_repo_fixture, test_pool};
 /// 同一毫秒内多次 seed 会撞 ID。共享同一生成器才能保证每个用例内多 ID 唯一。
 /// 复用 `test-support::pool::pool_snowflake()` 的实例 + epoch + instance 配置
 ///（原 tests/common/mod.rs::pool_snowflake 转发路径已收口到 crate root）。
-fn snowflake() -> &'static std::sync::Mutex<SnowflakeIdGenerator> {
+///
+/// 2026-10-09：`pool_snowflake()` 内层包了 `Arc`（全进程唯一 generator 对象，
+/// 见 `test-support/src/pool.rs`），故本转发壳的返回类型同步改一层 `Arc`；
+/// 调用侧 `.lock()?.next_id()` 靠 `Deref` 不受影响。
+fn snowflake() -> &'static std::sync::Mutex<std::sync::Arc<SnowflakeIdGenerator>> {
     hsh_erp_test_support::pool_snowflake()
 }
 

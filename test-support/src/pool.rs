@@ -3,7 +3,8 @@
 //! 2026-09-23 PR13 Phase A：从原 `tests/common/mod.rs` 切到这里。承载：
 //! - `test_pool` + `fresh_database_url`（每测试 fresh database）
 //! - `register_db_for_drop` + `drop_dbs_atexit`（进程退出回收）
-//! - `pool_snowflake` + `test_snowflake_instance`（per-process 雪花 ID）
+//! - `shared_test_snowflake` + `pool_snowflake` + `test_snowflake_instance`
+//!   （进程内唯一 ID 源 / 存量调用点的兼容薄壳 / 跨进程 instance 派生）
 //!
 //! ## 设计要点（沿用原 mod.rs 实现）
 //! - 容器由 bash runner 启好（`scripts/test_runner.sh` / `scripts/test_nextest.sh`），
@@ -14,6 +15,11 @@
 //! - 每建库登记 `(server_url, db_name)` 到 `CREATED_DBS`，进程退出时
 //!   `libc::atexit` 注册的 handler 在独立 std::thread + 全新 current_thread
 //!   runtime 里跑 `DROP DATABASE ... WITH (FORCE)`。
+//! - 2026-10-09 新增：`shared_test_snowflake()` 是**全进程唯一的测试 ID 源**
+//!   （`AppState.snowflake` 与所有 fixture helper 共用同一个 generator 对象）；
+//!   `pool_snowflake()` 退化为给存量调用点的**兼容薄壳** —— 返回同一把锁、只在内层多包
+//!   一层 `Arc`，`.lock()?.next_id()` 靠 `Deref` 照旧可用，`tests/` 里 183 处调用点
+//!   一行未改。
 //! - `pool_snowflake` 全局互斥，按 call 顺序发 ID，同进程内 `next_id()` 串行，
 //!   跨进程 unique (epoch, instance) 不撞 ID。
 //!
@@ -36,20 +42,67 @@ use sqlx::postgres::PgPoolOptions;
 /// 2026-09-20：instance 改为 `test_snowflake_instance()` 派生（pid ⊕ 启动纳秒），
 /// 取代固定 `instance=1`。nextest process-per-test 模型下，跨进程并行若共享
 /// instance=1 会撞 redis session key（sessions:user:{id} 等）。
-static TEST_SNOWFLAKE_GEN: OnceLock<std::sync::Mutex<SnowflakeIdGenerator>> = OnceLock::new();
+///
+/// 2026-10-09 新增：内层由 `SnowflakeIdGenerator` 改为 `Arc<SnowflakeIdGenerator>`。
+/// 根因见 [`shared_test_snowflake`] 的 doc；包 `Arc` 是因为 `SnowflakeIdGenerator`
+/// 内部是 `Mutex<Inner>` 且**没有** `Clone` 实现，不包 `Arc` 就没法把同一个对象同时
+/// 交给 `pool_snowflake()` 的互斥访问与多个 `AppState`。
+static TEST_SNOWFLAKE_GEN: OnceLock<std::sync::Mutex<std::sync::Arc<SnowflakeIdGenerator>>> =
+    OnceLock::new();
 
-/// 全局 snowflake 生成器访问器。
+/// 全局 snowflake 生成器访问器 —— **兼容薄壳**，唯一真源是 [`shared_test_snowflake`]。
 ///
 /// 公开暴露：原 `tests/common/mod.rs` 写的是 `pub fn`，部分 integration test
 /// binary（worker_pool_api 等）通过 `common::pool_snowflake().lock().unwrap().next_id()`
 /// 直接拿 ID 串联多 fixture —— 保持公开语义以不破坏现有 51 个 binary 的 import。
 /// [`fixtures`](super::fixtures) 的 INSERT helper 也走它。
-pub fn pool_snowflake() -> &'static std::sync::Mutex<SnowflakeIdGenerator> {
+///
+/// 2026-10-09：返回类型由 `&'static Mutex<SnowflakeIdGenerator>` 改为
+/// `&'static Mutex<Arc<SnowflakeIdGenerator>>`（理由见 [`shared_test_snowflake`]）。
+/// 存量 `.lock().expect(..).next_id()` / `.lock().unwrap().next_id()` / 绑定 guard 后
+/// 再 `next_id()` 的写法全部靠 `Arc: Deref<Target = SnowflakeIdGenerator>` 透明兼容，
+/// `tests/` 里 183 处调用点一行未改。
+pub fn pool_snowflake() -> &'static std::sync::Mutex<std::sync::Arc<SnowflakeIdGenerator>> {
     TEST_SNOWFLAKE_GEN.get_or_init(|| {
-        std::sync::Mutex::new(SnowflakeIdGenerator::new(
+        std::sync::Mutex::new(std::sync::Arc::new(SnowflakeIdGenerator::new(
             1_577_836_800_000,
             test_snowflake_instance(),
-        ))
+        )))
+    })
+}
+
+/// 供 [`shared_test_snowflake`] 交出 `&'static Arc<_>` 用的旁挂 static。
+///
+/// 实现说明：generator 只在 `TEST_SNOWFLAKE_GEN` 里构造一次，本 static 只是把**同一个
+/// `Arc`** 另存一份 —— `MutexGuard` 是临时值，从 `&'static Mutex<_>` 解引用出来的引用
+/// 无法逃出函数（E0515）。两个 static 存的永远是同一个 `Arc`，不存在分叉风险。
+static SHARED_TEST_SNOWFLAKE: OnceLock<std::sync::Arc<SnowflakeIdGenerator>> = OnceLock::new();
+
+/// 全进程唯一的测试雪花 ID 源（2026-10-09 新增）。
+///
+/// ## 为什么要有它（根因）
+/// 位布局是 `ts << 22 | instance << 12 | seq`，其中 `last_ms` / `sequence` 属于
+/// `SnowflakeIdGenerator` 的**实例私有**字段，而 `SnowflakeIdGenerator::new()` 一律从
+/// `last_ms=0, sequence=0` 起步。于是**任意两个 instance 相同、但对象不同的
+/// generator**，只要在同一毫秒各自取到第 j 个号，就发出**逐字节相同**的 id，撞
+/// `t_*_pkey` 报 `23505` —— 与「同一个 helper 调几次」无关，最典型的形态恰恰是
+/// **两个不同 helper 各调一次**。
+///
+/// 改造前本仓已有两处共享 generator，但它们**是彼此独立的对象、却共用同一个
+/// instance**（都是 `test_snowflake_instance()`），所以照样撞：
+/// - [`pool_snowflake`] 发的 fixture id；
+/// - [`state`](super::state) 三个 `test_state*` 构造函数各建一个 generator，
+///   `AppState.snowflake` 发的业务 id（同一测试里建两个 AppState 即自撞）。
+///
+/// 所以「进程内唯一」的正确保证点是**对象共享**，而不是 instance 编号 —— instance 只有
+/// 10 bit = 1024 槽，本就该留给跨进程（见 `test_snowflake_instance()`）。本函数返回
+/// `&'static Arc<..>`，调用方 `.clone()` 拿到的就是同一个对象。
+pub fn shared_test_snowflake() -> &'static std::sync::Arc<SnowflakeIdGenerator> {
+    SHARED_TEST_SNOWFLAKE.get_or_init(|| {
+        pool_snowflake()
+            .lock()
+            .expect("TEST_SNOWFLAKE_GEN mutex poisoned")
+            .clone()
     })
 }
 
@@ -62,6 +115,19 @@ pub fn pool_snowflake() -> &'static std::sync::Mutex<SnowflakeIdGenerator> {
 ///
 /// 2026-09-28 备注：相关 STS 会话域 redis key 已下线；本函数仍服务于 `sessions:user:{id}`
 /// 防撞；instance 派生逻辑未变。
+///
+/// **2026-10-09 职责收窄**：instance 现在**只负责跨进程**这 10 bit（1024 槽）的区分，
+/// **不再承担进程内唯一性** —— 后者已由「全进程共享同一个 generator 对象」
+/// （[`shared_test_snowflake`]）保证。根因：位布局里 `last_ms` / `sequence` 是 generator
+/// 的实例私有字段，`new()` 又从 `last_ms=0, sequence=0` 起步，故两个 instance 相同的
+/// 独立 generator 在同一毫秒各自取第 j 个号会发出逐字节相同的 id。
+///
+/// **由此产生的新约定 —— 进程内禁止再 `SnowflakeIdGenerator::new`**：测试代码
+/// （`tests/**` 与本 crate）要 ID 一律走 `shared_test_snowflake()`（或其兼容薄壳
+/// `pool_snowflake()`）。另建 generator = 另起一条 id 流，与共享流在同毫秒必撞
+/// `t_*_pkey`（23505）—— 即使把 instance 填成 11 / 99 / 777 这类「看起来不同」的值也
+/// 不管用：冲突条件是**同 instance + 同毫秒 + 同 seq**，而两个 fresh generator 的
+/// 首个 id 恰好都是 `seq=0`。
 ///
 /// pub(crate)：[`state`](super::state) 构造 `AppConfig::snowflake::instance` 也读它，
 /// 必须 crate 内可见。
