@@ -3,14 +3,15 @@
 //! 合并原 `repo/query.rs` + `repo/mutate.rs` 的全部固有静态方法，**内容零 diff**
 //! （`.sqlx/query-*.json` 哈希不变）。
 //!
-//! ZST struct `DeliveryGroupRepo` / `DeliveryNoteRepo` / `DeliveryNoteEventRepo`
-//! 收 `impl PgExecutor<'_>` 形参（与原 repo/query.rs 等一致），与胖 trait
-//! `DeliveryNoteRepoTrait` 方法 1:1 对应：
+//! ZST struct `DeliveryGroupRepo` / `DeliveryNoteRepo` 收 `impl PgExecutor<'_>` 形参，
+//! 与胖 trait `DeliveryNoteRepoTrait` 方法 1:1 对应：
 //!
-//! - `DeliveryGroupRepo::list_by_customer` ↔ `DeliveryNoteRepoTrait::list_groups_by_customer`
+//! - `DeliveryGroupRepo::list_by_customer` ↔ `DeliveryNoteRepoTrait::group_list_by_customer`
 //! - `DeliveryNoteRepo::get_by_id` ↔ `DeliveryNoteRepoTrait::note_get_by_id`
-//! - `DeliveryNoteRepoEventRepo::add_event` ↔ `DeliveryNoteRepoTrait::event_add`
 //! - ...
+//!
+//! 2026-10-08：`DeliveryNoteEventRepo` 整块删除（事件子系统下线，见
+//! `migrations/20261008100000_001_drop_delivery_note_event.sql`）。
 //!
 //! Cross-module 调用方：deliver_note 域内部所有 `Repo::xxx(&mut *conn, ...)`
 //! 调用收敛到本文件的固有方法。`repo/mod.rs` 提供 trait 形式供 service 注入。
@@ -22,7 +23,7 @@ use sqlx::PgExecutor;
 
 use crate::modules::com::delivery_note::model::{DeliveryNoteSortKey, NoteScope};
 
-use super::super::model::{DeliveryGroup, DeliveryGroupMember, DeliveryNote, DeliveryNoteEvent};
+use super::super::model::{DeliveryGroup, DeliveryGroupMember, DeliveryNote};
 use super::SortDir;
 
 // ---------------------------------------------------------------------------
@@ -689,57 +690,6 @@ impl super::DeliveryNoteRepo {
         .execute(executor)
         .await?;
         Ok(res.rows_affected())
-    }
-}
-
-// ---------------------------------------------------------------------------
-//  DeliveryNoteEventRepo  (P2)
-// ---------------------------------------------------------------------------
-
-impl super::DeliveryNoteEventRepo {
-    pub async fn list_by_note<'e, E: PgExecutor<'e>>(
-        executor: E,
-        note_id: i64,
-    ) -> Result<Vec<DeliveryNoteEvent>, sqlx::Error> {
-        sqlx::query_as!(
-            DeliveryNoteEvent,
-            r#"
-            SELECT id, delivery_note_id, event_type,
-                   from_status, to_status, note, created_by, created_at
-            FROM t_delivery_note_event
-            WHERE delivery_note_id = $1
-            ORDER BY created_at ASC, id ASC
-            "#,
-            note_id,
-        )
-        .fetch_all(executor)
-        .await
-    }
-
-    /// 同步 add（state machine callback 用）；走 `execute` flush inline。
-    pub async fn add_event<'e, E: PgExecutor<'e>>(
-        executor: E,
-        ev: &DeliveryNoteEvent,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query!(
-            r#"
-            INSERT INTO t_delivery_note_event
-                (id, delivery_note_id, event_type,
-                 from_status, to_status, note, created_by, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            "#,
-            ev.id,
-            ev.delivery_note_id,
-            ev.event_type,
-            ev.from_status,
-            ev.to_status,
-            ev.note,
-            ev.created_by,
-            ev.created_at,
-        )
-        .execute(executor)
-        .await?;
-        Ok(())
     }
 }
 

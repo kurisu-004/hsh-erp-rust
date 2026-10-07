@@ -1,4 +1,4 @@
-//! DeliveryNoteService 状态流转与读视图（提交 / 撤回 / 拣货 / 软删 / 事件 / 候选）。
+//! DeliveryNoteService 状态流转与读视图（提交 / 撤回 / 拣货 / 软删 / 候选）。
 //!
 //! ## 2026-09-22 D-5 + review 第 1 轮修正（service by-value trait）
 //! - 所有方法签名从 `pub async fn xxx(conn: &mut PgConnection, snowflake: &SnowflakeIdGenerator, ...)`
@@ -12,7 +12,7 @@
 //!   `&mut *repo.conn_mut()` 同样模式。
 //! - 原 sqlx::query! 直调（如 `soft_delete` 的 UPDATE batches）走
 //!   `sqlx::query!(...).execute(&mut *repo.conn_mut())` 替换 `&mut *conn`。
-//! - 私有 helper（`build_note_outs` / `write_event`）签名仍收 `&mut PgConnection`——
+//! - 私有 helper（`build_note_outs`）签名仍收 `&mut PgConnection`——
 //!   helper 是同态私有 helper，调用方走 `&mut *repo.conn_mut()` 喂入（与 iam
 //!   `AccountService::assemble_user_out` 等私有 helper 一致）。
 
@@ -30,14 +30,11 @@ use crate::modules::prod::work_type::repo::WorkTypeRepo;
 use crate::modules::prod::worker::repo::WorkerRepo;
 use crate::shared::error::{AppError, code};
 
-use super::super::model::DeliveryNoteEventType;
 use super::super::vo::{
-    AvailableBatchDto, BatchStatusDto, DeliveryNoteCandidatePart, DeliveryNoteEventOut,
-    DeliveryNotePickupScanOut, SubmitDeliveryOut, SubmitOutcomeDto, UnresolvedTargetDto,
+    AvailableBatchDto, BatchStatusDto, DeliveryNoteCandidatePart, DeliveryNotePickupScanOut,
+    SubmitDeliveryOut, SubmitOutcomeDto, UnresolvedTargetDto,
 };
-use super::inner::{
-    build_note_outs, note_not_found, note_version_conflict, scope_from_note, write_event,
-};
+use super::inner::{build_note_outs, note_not_found, note_version_conflict, scope_from_note};
 
 use super::DeliveryNoteService;
 
@@ -166,18 +163,6 @@ impl DeliveryNoteService {
         obj.updated_at = now;
         obj.updated_by = Some(current.id);
 
-        write_event(
-            &mut *repo.conn_mut(),
-            &self.snowflake,
-            note_id,
-            DeliveryNoteEventType::Submitted,
-            Some(STATUS_DRAFT.to_string()),
-            Some(STATUS_SUBMITTED.to_string()),
-            None,
-            Some(current.id),
-        )
-        .await?;
-
         let affected = repo.note_update(&obj).await?;
         if affected == 0 {
             return Err(AppError::biz(
@@ -241,18 +226,6 @@ impl DeliveryNoteService {
         obj.version += 1;
         obj.updated_at = now;
         obj.updated_by = Some(current.id);
-
-        write_event(
-            &mut *repo.conn_mut(),
-            &self.snowflake,
-            note_id,
-            DeliveryNoteEventType::Withdrawn,
-            Some(STATUS_SUBMITTED.to_string()),
-            Some(STATUS_DRAFT.to_string()),
-            None,
-            Some(current.id),
-        )
-        .await?;
 
         let affected = repo.note_update(&obj).await?;
         if affected == 0 {
@@ -465,18 +438,6 @@ impl DeliveryNoteService {
         obj.updated_at = now;
         obj.updated_by = Some(current.id);
 
-        write_event(
-            &mut *repo.conn_mut(),
-            &self.snowflake,
-            note_id,
-            DeliveryNoteEventType::PickedUp,
-            Some(STATUS_SUBMITTED.to_string()),
-            Some(STATUS_PICKED_UP.to_string()),
-            None,
-            Some(current.id),
-        )
-        .await?;
-
         let affected = repo.note_update(&obj).await?;
         if affected == 0 {
             return Err(AppError::biz(
@@ -544,30 +505,6 @@ impl DeliveryNoteService {
             ));
         }
         Ok(())
-    }
-
-    // ---------- list_events ----------
-
-    pub async fn list_events<R: DeliveryNoteRepoTrait>(
-        &self,
-        mut repo: R,
-        note_id: i64,
-    ) -> Result<Vec<DeliveryNoteEventOut>, AppError> {
-        // 任何已登录账号可看；service 不做角色硬限（与 Python 一致）
-        let events = repo.event_list_by_note(note_id).await?;
-        Ok(events
-            .into_iter()
-            .map(|e| DeliveryNoteEventOut {
-                id: e.id,
-                delivery_note_id: e.delivery_note_id,
-                event_type: e.event_type,
-                from_status: e.from_status,
-                to_status: e.to_status,
-                note: e.note,
-                created_by: e.created_by,
-                created_at: Some(e.created_at),
-            })
-            .collect())
     }
 
     // ---------- list_candidate_parts ----------

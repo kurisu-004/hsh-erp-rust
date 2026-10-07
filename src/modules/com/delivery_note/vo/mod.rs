@@ -3,7 +3,8 @@
 //! 仅含 handler 返回的 output 类型；入参类型见 `super::dto`。
 //! 按端点语义拆为：
 //! - `delivery_group.rs`（P1 送货分组：DeliveryGroup* / UngroupedCustomerOut）
-//! - `delivery_note.rs`（P2 送货单 CRUD：DeliveryNoteOut / *ListOut / LineItem / DetailOut / EventOut / PickupScanOut / CandidatePart*）
+//! - `delivery_note.rs`（送货单 CRUD：DeliveryNoteOut / *ListOut / LineItem /
+//!   DetailOut / PickupScanOut / CandidatePart*）
 //! - `attach.rs`（P3 attach-batches：AttachBatchesOut / AttachBatchConflict）
 //! - `scan.rs`（P3 扫码：Scan* / BatchStatus / Resolved* / RecentItem / AddedBatch / UnresolvedTarget / AvailableBatch / AttachableBatch）
 //! - `submit.rs`（P2 submit：SubmitDeliveryOut / SubmitOutcomeDto）
@@ -26,8 +27,8 @@ pub use delivery_group::{
 };
 pub use delivery_note::{
     BatchDeliveryDetailData, DeliveryNoteCandidatePart, DeliveryNoteCandidatePartsOut,
-    DeliveryNoteDetailOut, DeliveryNoteEventOut, DeliveryNoteLineItem, DeliveryNoteListOut,
-    DeliveryNoteOut, DeliveryNotePickupListOut, DeliveryNotePickupScanOut,
+    DeliveryNoteDetailOut, DeliveryNoteLineItem, DeliveryNoteListOut, DeliveryNoteOut,
+    DeliveryNotePickupListOut, DeliveryNotePickupScanOut,
 };
 pub use scan::{
     AddedBatchDto, AttachableBatchDto, AvailableBatchDto, BatchStatusDto, RecentItemDto,

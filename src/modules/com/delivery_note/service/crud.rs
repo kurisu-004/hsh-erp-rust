@@ -4,7 +4,7 @@
 //! - 所有方法签名从 `pub async fn xxx(conn: &mut PgConnection, snowflake: &SnowflakeIdGenerator, ...)`
 //!   改成 `pub async fn xxx<R: DeliveryNoteRepoTrait>(&self, mut repo: R, ...)`（iam 严格范本）。
 //! - 跨域 ZST 静态调用走 `&mut *repo.conn_mut()`；私有 helper（`add_parts_inner` /
-//!   `build_note_outs` / `get_with_parts` / `write_event`）收 `&mut PgConnection`，
+//!   `build_note_outs` / `get_with_parts`）收 `&mut PgConnection`，
 //!   caller 喂 `&mut *repo.conn_mut()`。
 //! - 原 `sqlx::query!(...)` 直调走 `&mut *repo.conn_mut()` 替换 `&mut *conn`。
 
@@ -23,12 +23,11 @@ use crate::shared::error::{AppError, code};
 use super::super::dto::{
     DeliveryNoteAddItem, DeliveryNoteCreateRequest, DeliveryNoteUpdateRequest,
 };
-use super::super::model::{DeliveryNote, DeliveryNoteEventType};
+use super::super::model::DeliveryNote;
 use super::super::repo::SortDir;
 use super::super::vo::{DeliveryNoteDetailOut, DeliveryNoteListOut, DeliveryNoteOut};
 use super::inner::{
     add_parts_inner, build_note_outs, get_with_parts, note_not_found, note_version_conflict,
-    write_event,
 };
 use super::note_shippable_sets;
 
@@ -151,20 +150,7 @@ impl DeliveryNoteService {
         };
         repo.note_create(&note).await?;
 
-        // 4. CREATED 事件
-        write_event(
-            &mut *repo.conn_mut(),
-            &self.snowflake,
-            note.id,
-            DeliveryNoteEventType::Created,
-            None,
-            Some(STATUS_DRAFT.to_string()),
-            Some(format!("create draft for customer {}", l1.name)),
-            Some(current.id),
-        )
-        .await?;
-
-        // 5. 原子带入首批零件（如果给了 items）
+        // 4. 原子带入首批零件（如果给了 items）
         if !req.items.is_empty() {
             add_parts_inner(
                 &mut *repo.conn_mut(),

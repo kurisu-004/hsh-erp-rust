@@ -136,25 +136,6 @@ pub struct BatchDeliveryDetailData {
     pub items: Vec<DeliveryNoteDetailOut>,
 }
 
-/// 送货单事件条目（时间线）。
-#[derive(Debug, Clone, Serialize)]
-pub struct DeliveryNoteEventOut {
-    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
-    pub id: i64,
-    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
-    pub delivery_note_id: i64,
-    pub event_type: String,
-    pub from_status: Option<String>,
-    pub to_status: Option<String>,
-    pub note: Option<String>,
-    #[serde(
-        serialize_with = "crate::shared::types::serialize_i64_opt",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub created_by: Option<i64>,
-    pub created_at: Option<NaiveDateTime>,
-}
-
 /// 扫码响应（P2 始终 `scanned_count=0 / scanned_serials=[] / ready=false`，
 /// 与 Python 2026-07-23 起后端行为一致）。
 #[derive(Debug, Clone, Serialize)]

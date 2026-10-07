@@ -1,14 +1,12 @@
-//! delivery_note 域数据模型
+//! com::delivery_note 域数据模型
 //!
-//! 对应 Python myERP/model/delivery_note.py + model/delivery_note_event.py +
-//! model/delivery_note_counter.py。包含：
-//! - sqlx `FromRow` 行结构（送货分组、成员、note、event、counter；含 version 乐观锁、
+//! 包含：
+//! - sqlx `FromRow` 行结构（送货分组、成员、note、单号日计数器；含 version 乐观锁、
 //!   deleted_at 软删、created/updated 审计字段）
-//! - 域枚举（status / event_type / sort_key / scope / scan outcome）
+//! - 域枚举（status / sort_key / scope / scan outcome）
 //!
-//! ## Phase P1 范围
-//! 本期落「送货分组」CRUD（model / dto / repo / service / handler / statemachine）；
-//! 送货单生命周期 + 扫码入单留到 P2 / P3。
+//! 2026-10-08：事件行结构 `DeliveryNoteEvent` 与事件枚举 `DeliveryNoteEventType`
+//! 随事件子系统下线一并删除（见 `migrations/20261008100000_001_drop_*`）。
 
 use chrono::NaiveDateTime;
 
@@ -47,13 +45,14 @@ pub struct DeliveryGroupMember {
 }
 
 // ---------------------------------------------------------------------------
-//  DeliveryNote / DeliveryNoteEvent / DeliveryNoteCounter  (P2 / P3 占位)
+//  DeliveryNote / DeliveryNoteCounter
 // ---------------------------------------------------------------------------
 
-/// `t_delivery_note` 行（P2 / P3 业务实装阶段会用到）
+/// `t_delivery_note` 行（送货单本体）
 ///
-/// Phase P1 不写不读本表（除错误码常量以外），但 model 先就位避免后续重复编辑。
-/// `delivery_group_id` / `leaf_customer_id` 由 migration 012 引入（D1 范围列）。
+/// `delivery_group_id` / `leaf_customer_id` 是 2026-10-08 起**逻辑废弃**的范围列：
+/// scope 判定已下线，建单判定键收敛为 `(customer_id, status='DRAFT')` 单键，两列
+/// 不再被任何查询使用，也不再由入单路径写入（保留列本身不动，避免 DDL 抖动）。
 #[derive(Debug, Clone, sqlx::FromRow)]
 #[allow(dead_code)]
 pub struct DeliveryNote {
@@ -76,20 +75,6 @@ pub struct DeliveryNote {
     pub delivery_date: Option<chrono::NaiveDate>,
     pub delivery_group_id: Option<i64>,
     pub leaf_customer_id: Option<i64>,
-}
-
-/// `t_delivery_note_event` 行
-#[derive(Debug, Clone, sqlx::FromRow)]
-#[allow(dead_code)]
-pub struct DeliveryNoteEvent {
-    pub id: i64,
-    pub delivery_note_id: i64,
-    pub event_type: String,
-    pub from_status: Option<String>,
-    pub to_status: Option<String>,
-    pub note: Option<String>,
-    pub created_by: Option<i64>,
-    pub created_at: NaiveDateTime,
 }
 
 /// `t_delivery_note_counter` 行（业务日计数器）
@@ -155,34 +140,6 @@ impl std::str::FromStr for DeliveryNoteStatus {
             "PICKED_UP" => Ok(Self::PickedUp),
             "ARCHIVED" => Ok(Self::Archived),
             _ => Err(()),
-        }
-    }
-}
-
-/// 送货单事件类型枚举（DB 存 `varchar(32)`）
-///
-/// 与 Python `DeliveryNoteEventType` 对齐：CREATED / SUBMITTED / WITHDRAWN /
-/// RECALLED (历史) / PICKED_UP / ARCHIVED。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum DeliveryNoteEventType {
-    Created,
-    Submitted,
-    Withdrawn,
-    Recalled, // 历史兼容，只读
-    PickedUp,
-    Archived,
-}
-
-impl DeliveryNoteEventType {
-    pub const fn as_str(&self) -> &'static str {
-        match self {
-            Self::Created => "CREATED",
-            Self::Submitted => "SUBMITTED",
-            Self::Withdrawn => "WITHDRAWN",
-            Self::Recalled => "RECALLED",
-            Self::PickedUp => "PICKED_UP",
-            Self::Archived => "ARCHIVED",
         }
     }
 }

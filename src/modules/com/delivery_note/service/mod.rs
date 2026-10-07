@@ -9,7 +9,7 @@
 //!   `scan/{mod, classify, resolve_scan_kind, helpers, find_or_create, tests}.rs`）
 //! - `attach` — DeliveryNoteService::attach_batches（P3+ 弹窗批量 attach）
 //! - `inner` — 跨子模块共享的私有 helper（`build_note_outs` / `add_parts_inner` /
-//!   `write_event` / `validate_*` / 错误构造器 等）
+//!   `get_with_parts` / `check_scope` / `validate_*` / 错误构造器 等）
 //! - `shippable_sets` — 本单口径的装配件可出货套数（纯函数，2026-10-04 新增）
 //!
 //! 对外 API（`handler.rs` 调用面）保持原路径：
@@ -22,10 +22,11 @@
 //! ## 2026-09-22 D-5 重构对齐 iam / shelf / customer 范本（review 第 1 轮修正）
 //! - 本域 SQL 真源统一在 `repo/sql.rs`（原 `repo/query.rs` + `repo/mutate.rs`
 //!   合并），ZST struct（`DeliveryGroupRepo` / `DeliveryNoteRepo` /
-//!   `DeliveryNoteEventRepo`）保留为静态调用面。
-//! - 新增胖 trait `DeliveryNoteRepoTrait`（23 方法 = 11 group + 10 note + 2 event），
+//!   `DeliveryNoteRepo`）保留为静态调用面。
+//! - 胖 trait `DeliveryNoteRepoTrait`（21 方法 = 11 group + 10 note；2026-10-08
+//!   事件 2 方法随事件子系统下线删除），
 //!   `impl for &mut PgConnection`——service 内部 SQL 调用全部走 trait 方法
-//!   （`conn.note_xxx()` / `conn.group_xxx()` / `conn.event_xxx()`）；trait 提供
+//!   （`conn.note_xxx()` / `conn.group_xxx()`）；trait 提供
 //!   `conn_mut()` 访问器供跨域 ZST 调用（`PartRepo::xxx(&mut *repo.conn_mut(), ...)`）。
 //! - **service 形参 by-value trait**（review 第 1 轮 D1 修正）：service 方法
 //!   `<R: DeliveryNoteRepoTrait>(&self, mut repo: R, ...)`（对齐 iam / shelf / customer

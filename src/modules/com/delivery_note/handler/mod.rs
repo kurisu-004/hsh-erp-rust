@@ -1,8 +1,9 @@
 //! com::delivery_note 域 HTTP handler 总入口
 //!
 //! 按业务域拆分为多文件（沿 `part/handler/{crud,batch,lifecycle,inspection}.rs` 范本）：
-//! - `crud.rs` —— 基础 CRUD：list / get / update / remove-batches / soft-delete /
-//!   batch-detail / candidate-parts / pickup-pending + P1 送货分组 CRUD
+//! - `crud.rs` —— 基础 CRUD：list / get / create / update / add-parts /
+//!   remove-parts / soft-delete / batch-detail / candidate-parts / pickup-pending +
+//!   送货分组 CRUD
 //! - `lifecycle.rs` —— 状态机转换：submit / recall / pickup-scan / pickup
 //! - `print.rs` —— 打印：print / print-labels（读本单批次算装配件可出货套数后
 //!   BFF 转发到 python 执行渲染）
@@ -56,7 +57,6 @@ pub const ROUTES: &[&str] = &[
     "GET /pickup-pending",
     "GET /",
     "POST /",
-    "GET /{id}/events",
     "POST /{id}/update",
     "POST /{id}/add-parts",
     "POST /{id}/attach-batches",
@@ -91,7 +91,6 @@ pub fn note_router() -> Router<Arc<AppState>> {
             "/",
             get(crud::list_delivery_notes).post(crud::create_delivery_note),
         )
-        .route("/{id}/events", get(crud::list_delivery_note_events))
         .route("/{id}/update", post(crud::update_delivery_note))
         .route("/{id}/add-parts", post(crud::add_delivery_note_parts))
         .route("/{id}/attach-batches", post(scan::attach_batches))

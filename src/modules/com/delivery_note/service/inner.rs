@@ -1,7 +1,9 @@
 //! 跨子模块共享的私有 helper。
 //!
 //! 全部以 `pub(super)` 暴露给 `service/` 下的兄弟模块（`group` / `crud` /
-//! `lifecycle` / `scan` / `print`）。本文件不对外导出。
+//! `lifecycle` / `scan`）。本文件不对外导出。
+//!
+//! 2026-10-08：事件写入 helper `write_event` 随事件子系统下线删除。
 //!
 //! 2026-09-22 D-5 重构：保持 `pub(super) async fn xxx(conn: &mut PgConnection, ...)`
 //! 私有 helper 形态——内部 SQL 调用走 trait 方法（`DeliveryNoteRepoTrait`）实现于
@@ -23,7 +25,7 @@ use crate::modules::prod::batch::repo::PartBatchRepo;
 use crate::shared::error::{AppError, code};
 
 use super::super::dto::DeliveryNoteAddItem;
-use super::super::model::{DeliveryNote, DeliveryNoteEvent, NoteScope};
+use super::super::model::{DeliveryNote, NoteScope};
 use super::super::vo::{DeliveryNoteDetailOut, DeliveryNoteLineItem, DeliveryNoteOut};
 use super::note_shippable_sets;
 
@@ -568,32 +570,6 @@ pub(super) async fn add_parts_inner(
             ));
         }
     }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn write_event(
-    mut conn: &mut PgConnection,
-    snowflake: &SnowflakeIdGenerator,
-    note_id: i64,
-    event_type: super::super::model::DeliveryNoteEventType,
-    from_status: Option<String>,
-    to_status: Option<String>,
-    note: Option<String>,
-    created_by: Option<i64>,
-) -> Result<(), AppError> {
-    let now = now_naive();
-    let ev = DeliveryNoteEvent {
-        id: snowflake.next_id(),
-        delivery_note_id: note_id,
-        event_type: event_type.as_str().to_string(),
-        from_status,
-        to_status,
-        note,
-        created_by,
-        created_at: now,
-    };
-    conn.event_add(&ev).await?;
     Ok(())
 }
 

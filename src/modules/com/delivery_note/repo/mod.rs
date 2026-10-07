@@ -1,18 +1,16 @@
 //! delivery_note 域 repo 层（SQL 真源 + 胖 trait + PG 实现）
 //!
 //! ## 结构（2026-09-22 D-5 重构对齐 iam / shelf / customer / part_batch 范本）
-//! - `sql.rs`：原 `repo/query.rs` + `repo/mutate.rs` 两文件 SQL 全文搬迁合并，
-//!   23 个 pub 固有静态方法 + sqlx `query!` 宏，**内容零 diff**
-//!   （`.sqlx/query-*.json` 哈希不变）。ZST struct `DeliveryGroupRepo` /
-//!   `DeliveryNoteRepo` / `DeliveryNoteEventRepo` 收 `impl PgExecutor<'_>` 形参。
-//! - `mod.rs`（本文件）：对外暴露胖 trait `DeliveryNoteRepoTrait`（23 方法合并单 trait；
-//!   `DeliveryGroupRepo` 11 + `DeliveryNoteRepo` 10 + `DeliveryNoteEventRepo` 2），
-//!   并直接 `impl DeliveryNoteRepoTrait for &mut PgConnection`——handler/service
+//! - `sql.rs`：SQL 真源（`query!` / `query_as!` 宏），ZST struct `DeliveryGroupRepo` /
+//!   `DeliveryNoteRepo` 收 `impl PgExecutor<'_>` 形参。
+//! - `mod.rs`（本文件）：对外暴露胖 trait `DeliveryNoteRepoTrait`（21 方法合并单 trait；
+//!   `DeliveryGroupRepo` 11 + `DeliveryNoteRepo` 10），并直接
+//!   `impl DeliveryNoteRepoTrait for &mut PgConnection`——handler/service
 //!   借 `&mut *tx` / `&mut *conn` 即可，零中间壳。
 //!
 //! ## 为什么是胖 trait 而不是按实体拆 3 trait
 //! `&mut PgConnection` 同一作用域只能借给一个 repo 实例；service 同时需要
-//! `group_repo` + `note_repo` + `event_repo` 时无法表达「同连接三次借用」。胖
+//! `group_repo` + `note_repo` 时无法表达「同连接两次借用」。胖
 //! trait `DeliveryNoteRepoTrait` 是单借位，service 签名 `<R: DeliveryNoteRepoTrait>`
 //! 一次收下（by-value；生产 `R = &mut PgConnection`，单测 `R = MockDeliveryNoteRepo`）。
 //!
@@ -36,33 +34,29 @@
 //! `PartBatchRepo::xxx` 等），通过 `repo.conn_mut()` 借位即可——本任务**不**下沉跨域
 //! SQL 到 trait（与 part 域 D-6 阶段过渡 conn_mut 模式同步）。
 //!
-//! ## `query.rs` / `mutate.rs` 重导出壳
-//! 历史：原 `repo/query.rs` + `repo/mutate.rs` 拆分。本任务把 SQL 全搬到 `sql.rs`，
-//! 但保留 `query.rs` / `mutate.rs` 作为重导出壳（注释文件），让 `use ...repo::query::xxx`
-//! 或 `...repo::mutate::xxx` 路径仍可解析（避免打破潜在 caller；2026-09-22 shelf /
-//! customer / part_batch 范本同形做法）。
+//! ## 2026-10-08：事件子系统下线 + 死壳文件删除
+//! - `DeliveryNoteEventRepo` ZST、`DeliveryNoteEvent` 行模型、`DeliveryNoteEventType`
+//!   枚举、trait 上 2 个事件方法、`sql.rs` 的事件 SQL 整块删除（表已 DROP，见
+//!   `migrations/20261008100000_001_drop_delivery_note_event.sql`）。
+//! - `repo/query.rs` + `repo/mutate.rs` 两个重导出壳文件**整个删除**：它们只是 2026-09-22
+//!   D-5 拆分期的兼容垫片（`_Query` / `_Mutate` 别名），全仓零 caller，且两个别名里
+//!   有一个还指向已删的 `DeliveryNoteEventRepo`。
 
 use async_trait::async_trait;
 use sqlx::PgConnection;
 
-pub mod mutate;
-pub mod query;
 pub mod sql;
 
-// ZST struct 定义（review 第 1 轮修复：原 commit `a64ec0f` 删除但下游
-// `impl super::DeliveryGroupRepo` / `impl super::DeliveryNoteRepo` /
-// `impl super::DeliveryNoteEventRepo` 仍引用，造成 E0432「unresolved import
-// super::sql::DeliveryGroupRepo」。ZST 与 SQL 真源同在 `sql.rs` 内——
-// 定义放本文件（与 SQL 隔开），`impl super::XxxRepo` 一行委托 SQL 真源）。
+// ZST struct 定义（与 SQL 真源同在 `sql.rs` 内 —— 定义放本文件，与 SQL 隔开，
+// `impl super::XxxRepo` 一行委托 SQL 真源）。
 pub struct DeliveryGroupRepo;
 pub struct DeliveryNoteRepo;
-pub struct DeliveryNoteEventRepo;
 
 // 重导出 model 表行类型，让上层继续用
-// `super::repo::{DeliveryGroup, DeliveryNote, DeliveryNoteEvent, DeliveryGroupMember}` 这种路径不破。
-// ZST struct（DeliveryGroupRepo / DeliveryNoteRepo / DeliveryNoteEventRepo）
-// 直接在本文件定义（见上方 `pub struct XxxRepo;`），不再从 sql.rs 重导出。
-pub use super::model::{DeliveryGroup, DeliveryGroupMember, DeliveryNote, DeliveryNoteEvent};
+// `super::repo::{DeliveryGroup, DeliveryNote, DeliveryGroupMember}` 这种路径不破。
+// ZST struct（DeliveryGroupRepo / DeliveryNoteRepo）直接在本文件定义
+// （见上方 `pub struct XxxRepo;`），不再从 sql.rs 重导出。
+pub use super::model::{DeliveryGroup, DeliveryGroupMember, DeliveryNote};
 
 /// 排序方向（与 Python `model.enums::SortDir` 对齐）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,13 +187,6 @@ pub trait DeliveryNoteRepoTrait: Send {
         when: chrono::NaiveDateTime,
         deleted_by: Option<i64>,
     ) -> Result<u64, sqlx::Error>;
-
-    // ── t_delivery_note_event（2）──
-    async fn event_list_by_note(
-        &mut self,
-        note_id: i64,
-    ) -> Result<Vec<DeliveryNoteEvent>, sqlx::Error>;
-    async fn event_add(&mut self, ev: &DeliveryNoteEvent) -> Result<(), sqlx::Error>;
 }
 
 /// 把 `DeliveryNoteRepoTrait` 直接对 `&mut PgConnection` 实现——handler/service
@@ -385,17 +372,5 @@ impl DeliveryNoteRepoTrait for &mut PgConnection {
         deleted_by: Option<i64>,
     ) -> Result<u64, sqlx::Error> {
         DeliveryNoteRepo::soft_delete(&mut **self, id, version, when, deleted_by).await
-    }
-
-    // ── t_delivery_note_event（2）── 一行委托 sql::DeliveryNoteEventRepo ─────
-    async fn event_list_by_note(
-        &mut self,
-        note_id: i64,
-    ) -> Result<Vec<DeliveryNoteEvent>, sqlx::Error> {
-        DeliveryNoteEventRepo::list_by_note(&mut **self, note_id).await
-    }
-
-    async fn event_add(&mut self, ev: &DeliveryNoteEvent) -> Result<(), sqlx::Error> {
-        DeliveryNoteEventRepo::add_event(&mut **self, ev).await
     }
 }

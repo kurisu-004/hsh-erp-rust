@@ -1,7 +1,7 @@
 //! delivery_note 域基础 CRUD handler
 //!
 //! 范围：list / get / create / update / add-parts / remove-parts / soft-delete /
-//! batch-detail / candidate-parts / pickup-pending / events + P1 送货分组 CRUD。
+//! batch-detail / candidate-parts / pickup-pending + 送货分组 CRUD。
 //!
 //! 状态机转换走 `lifecycle.rs`；扫码入单走 `scan.rs`；打印走 `print.rs`。
 //!
@@ -36,8 +36,7 @@ use crate::modules::com::delivery_note::model::DeliveryNoteSortKey;
 use crate::modules::com::delivery_note::repo::SortDir;
 use crate::modules::com::delivery_note::vo::{
     BatchDeliveryDetailData, DeliveryGroupListOut, DeliveryGroupOut, DeliveryNoteCandidatePartsOut,
-    DeliveryNoteDetailOut, DeliveryNoteEventOut, DeliveryNoteListOut, DeliveryNoteOut,
-    DeliveryNotePickupListOut,
+    DeliveryNoteDetailOut, DeliveryNoteListOut, DeliveryNoteOut, DeliveryNotePickupListOut,
 };
 use crate::shared::error::AppError;
 use crate::shared::response::R;
@@ -216,21 +215,6 @@ pub async fn get_delivery_note(
         .get_with_parts(&mut *conn, path.id)
         .await?;
     Ok(Json(R::ok(out)))
-}
-
-/// GET /api/v2/com/delivery/note/{id}/events
-pub async fn list_delivery_note_events(
-    State(state): State<Arc<AppState>>,
-    _current: crate::auth::rbac::CurrentUser,
-    Path(path): Path<DeliveryNotePath>,
-) -> Result<Json<R<Vec<DeliveryNoteEventOut>>>, AppError> {
-    // 读端点：pool.acquire() → service → drop。
-    let mut conn = state.pool.acquire().await?;
-    let events = state
-        .delivery_note_service
-        .list_events(&mut *conn, path.id)
-        .await?;
-    Ok(Json(R::ok(events)))
 }
 
 /// POST /api/v2/com/delivery/note/{id}/update

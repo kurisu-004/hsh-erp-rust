@@ -20,7 +20,7 @@
 //! 跨域调用（t_part / t_assembly / t_customer / t_part_batch）通过 `repo.conn_mut()`
 //! 拿 `&mut PgConnection`，再喂给 ZST 静态方法（`PartRepo::xxx` / `AssemblyRepo::xxx` /
 //! `CustomerRepo::xxx` / `PartBatchRepo::xxx`）。本域 SQL 走 `DeliveryNoteRepoTrait`
-//! trait 方法（`note_*` / `group_*` / `event_*`）。
+//! trait 方法（`note_*` / `group_*`）。
 //!
 //! ## 事务边界（2026-09-22 D-5 + review 第 1 轮）
 //! handler `state.pool.begin()` → 这里 → handler `commit()`；本方法不 commit。
