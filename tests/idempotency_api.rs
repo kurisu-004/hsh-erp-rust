@@ -15,8 +15,10 @@
 //! 测试栈：tokio::test + tower::ServiceExt::oneshot + 自建 mini router
 //! （绕过 auth_middleware，仅挂 idempotency_middleware + 计数器 handler）
 //!
-//! ⚠️ 注意：测试 binary 名 `idempotency_api` 必须独占 Redis db 12；
-//! `tests/common/mod.rs::test_redis_url` 已分配。
+//! ⚠️ 注意：2026-10-09 起**不再按 binary 名分配独占 Redis db**（Redis 只有 16 个
+//! db，21 个测试 binary 必然撞，原「独占 db 12」已随分库逻辑整体删除）。
+//! 隔离改由 `hsh_erp_test_support::redis::test_key_prefix()` 的 `t{pid}:` 前缀按进程
+//! 承担；本文件的裸 Redis 断言必须带同一前缀（见 `redis_idem_key`）。
 //!
 //! 2026-09-23 review #1 修复：counter 从全局 static 改为 per-state Arc<AtomicUsize>。
 //! 旧实现 `static COUNTER: AtomicUsize` 在 cargo test 并行下（默认 4 threads）
@@ -51,7 +53,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use deadpool_redis::redis::AsyncCommands;
 use hsh_erp_test_support::{
-    load_idempotency_fixture, test_pool, test_redis_pool, test_state_with_redis,
+    load_idempotency_fixture, redis::test_key_prefix, test_pool, test_redis_pool,
+    test_state_with_redis,
 };
 use serde_json::json;
 use sqlx::PgPool;
@@ -188,6 +191,15 @@ fn make_request(method: &str, uri: &str, idem_key: Option<&str>) -> Request<Body
         builder = builder.header("idempotency-key", k);
     }
     builder.body(Body::empty()).expect("build request")
+}
+
+/// 真实落 Redis 的幂等 key = 进程级前缀 + 中间件拼好的 `idem:{client_key}`。
+///
+/// 2026-10-09 新增：`RedisIdempotencyStore` 会在 store 内部前置 `key_prefix`
+/// （测试侧 `t{pid}:`），中间件的 `format!("{KEY_PREFIX}{key}")` 不变。本 helper 与
+/// 该拼接顺序严格同源，否则裸 `EXISTS` 查不到。
+fn redis_idem_key(client_key: &str) -> String {
+    format!("{}idem:{client_key}", test_key_prefix())
 }
 
 /// 检查 Redis 是否存在指定 key（简化 helper：返回 bool）
@@ -386,7 +398,7 @@ async fn header_missing_passes_through() {
     let _state = test_state_with_redis(_pool.clone(), test_redis_pool().await);
 
     let key = unique_key("K1");
-    let redis_key = format!("idem:{key}");
+    let redis_key = redis_idem_key(&key);
 
     // 第 1 次：POST 带 K1（写缓存 + handler 调）
     let app1 = make_test_app(
@@ -448,7 +460,7 @@ async fn ttl_expiry() {
     }
 
     let key = unique_key("ttl");
-    let redis_key = format!("idem:{key}");
+    let redis_key = redis_idem_key(&key);
 
     let app1 = make_test_app(state.clone(), counter.clone());
     let (s1, _, _) = send(app1, make_request("POST", "/__test/post", Some(&key))).await;
@@ -497,7 +509,7 @@ async fn login_with_idempotency_key_does_not_cache_jwt() {
     let state = test_state_with_redis(_pool.clone(), test_redis_pool().await);
 
     let key = unique_key("login-idem");
-    let redis_key = format!("idem:{key}");
+    let redis_key = redis_idem_key(&key);
 
     // 第 1 次：POST /iam/login 带 key（闸门放行 → handler 调）
     let app1 = make_public_app(state.clone(), counter.clone());

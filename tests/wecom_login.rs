@@ -29,7 +29,8 @@
 //! ## 并行注意
 //! `test_pool()` 每次 fresh database，DB 间 schema 完全独立（`t_wx_identity`
 //! 的 partial unique 索引不会跨测试撞车）。Redis 侧 wx-login 只写
-//! `session:tok:*`，`test_state` 用的 db 15 与 dev 隔离。
+//! `session:tok:*`（2026-10-09 起带 `t{pid}:` 进程前缀），`test_state` 连的是
+//! `redis-test` 实例、与 dev 的 `redis-dev` 实例隔离。
 
 use std::sync::Arc;
 

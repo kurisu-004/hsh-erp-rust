@@ -27,8 +27,8 @@
 use deadpool_redis::redis::AsyncCommands;
 use hsh_erp_rust::auth::session::{CachedUserProfile, RedisSessionStore, SessionStore, TokenKind};
 use hsh_erp_test_support::{
-    E2eFixture, load_e2e_fixture, send as ts_send, test_app, test_pool, test_redis_pool,
-    test_state_with_redis,
+    E2eFixture, load_e2e_fixture, redis::test_key_prefix, send as ts_send, test_app, test_pool,
+    test_redis_pool, test_state_with_redis,
 };
 use sqlx::PgPool;
 
@@ -300,7 +300,10 @@ async fn revoke_session_clears_redis_user_set() {
     let uid: i64 = env["data"]["id"].as_str().unwrap().parse().unwrap();
 
     // 模拟登录：写一条 session 到 Redis
-    let store = RedisSessionStore::new(redis.clone());
+    // 2026-10-09：store 需注入本进程的 key 前缀（生产空串 / 测试 `t{pid}:`），
+    // 下方裸 Redis `smembers` 断言必须用同一个前缀，否则查不到本用例写的 Set。
+    let key_prefix = test_key_prefix();
+    let store = RedisSessionStore::new(redis.clone(), key_prefix.clone());
     // 2026-09-23 重构：session key 后缀从 sha256(token) hex 改为 JWT jti (UUID v4)。
     // 测试 fixture 用合法 UUID v4 字符串模拟，避免被 `revoke-session` 误伤其它 jti。
     let fixture_jti = "00000000-0000-4000-8000-000000000001";
@@ -323,7 +326,7 @@ async fn revoke_session_clears_redis_user_set() {
         .expect("create_session");
 
     // 确认 set 有该 jti
-    let set_key = format!("sessions:user:{uid}");
+    let set_key = format!("{key_prefix}sessions:user:{uid}");
     let mut conn = redis.get().await.expect("redis conn");
     let members_before: Vec<String> = conn.smembers(&set_key).await.expect("smembers before");
     assert!(

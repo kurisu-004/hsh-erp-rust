@@ -7,6 +7,10 @@
 // 业界规范——client 自生成 UUID 撞 key 是 client bug）。
 // 升级路径：把 key 改为 `idem:{method}:{path}:{key}` 即可（仅 T03 拼 key 行）。
 //
+// 2026-10-09：`idem:` 之外还会整体前置一层 `RedisIdempotencyStore::key_prefix`
+// （见该 struct 的 doc）。本文件的 `format!("{KEY_PREFIX}{key}")` **保持不变**——
+// 前缀是 Redis 专有设施，中间件层不该知道它。
+//
 // CachedResponse.headers 用 BTreeMap<String,String> 序列化会丢多值 header
 // （如 set-cookie）—— 当前 API 形态（auth cookie + JSON 响应）不受影响。
 //
@@ -62,7 +66,10 @@ pub struct CachedResponse {
 /// 2026-09-23 新增：
 /// - `get` 返回 `Ok(None)` 表示未命中；
 /// - `put` 把缓存写入底层存储 + 设置 TTL；
-/// - key 由 caller 拼好（已含 `idem:` 前缀）——store 端不二次拼接。
+/// - key 由 caller 拼好（已含 `idem:` 前缀）——store 端不二次拼接 `idem:`。
+///   2026-10-09 补一句：Redis 实现仍会在自己内部前置 `key_prefix`（进程级隔离用），
+///   最终 key 是 `{key_prefix}idem:<client_key>`；该前缀不进 trait —— Noop / 内存
+///   实现没有 Redis，不需要它。
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub trait IdempotencyStore: Send + Sync {
@@ -170,13 +177,26 @@ impl IdempotencyStore for InMemoryIdempotencyStore {
 /// key 形如 `idem:<client_key>`（caller 已拼好前缀）；value = `CachedResponse`。
 /// `SET idem:<key> <json> EX <ttl_seconds>` 一次写入原子挂 TTL。
 /// `GET idem:<key>` 反序列化失败 → 当作 `Ok(None)` 走 pass-through（不阻塞业务）。
+///
+/// 2026-10-09：`key` 前面还会前置 `key_prefix`（由 `new(pool, key_prefix)` 注入），
+/// 最终落 Redis 的 key 是 `{key_prefix}idem:<client_key>`；`key_prefix` 为空串时与
+/// 历史逐字节相同。caller（中间件主入口 `idempotency_middleware`）**不知道** Redis 的
+/// 存在，故这一步在 store 内部完成——`IdempotencyStore` 还有 Noop / 内存实现，
+/// 它们不需要前缀。
 pub struct RedisIdempotencyStore {
     pool: RedisPool,
+    /// 2026-10-09 新增：key 统一前缀（生产空串 / 测试 `t{pid}:`），语义见字段上方 doc。
+    key_prefix: String,
 }
 
 impl RedisIdempotencyStore {
-    pub fn new(pool: RedisPool) -> Self {
-        Self { pool }
+    pub fn new(pool: RedisPool, key_prefix: String) -> Self {
+        Self { pool, key_prefix }
+    }
+
+    /// 把 caller 拼好的 `idem:<client_key>` 补上本 store 的前缀，得到真正落 Redis 的 key。
+    fn redis_key(&self, key: &str) -> String {
+        format!("{}{key}", self.key_prefix)
     }
 
     async fn conn(&self) -> anyhow::Result<deadpool_redis::Connection> {
@@ -190,11 +210,12 @@ impl RedisIdempotencyStore {
 #[async_trait]
 impl IdempotencyStore for RedisIdempotencyStore {
     async fn get(&self, key: &str) -> anyhow::Result<Option<CachedResponse>> {
+        let redis_key = self.redis_key(key);
         let mut conn = self.conn().await?;
         let raw: Option<String> = conn
-            .get(key)
+            .get(&redis_key)
             .await
-            .with_context(|| format!("redis GET {key}"))?;
+            .with_context(|| format!("redis GET {redis_key}"))?;
         match raw {
             None => Ok(None),
             Some(s) => match serde_json::from_str::<CachedResponse>(&s) {
@@ -203,7 +224,7 @@ impl IdempotencyStore for RedisIdempotencyStore {
                     // 反序列化失败（Redis 里残留旧格式 / 被外部破坏）—— 当作未命中，
                     // 不阻塞业务。下次 put 会覆盖。
                     tracing::warn!(
-                        key = %key,
+                        key = %redis_key,
                         error = %e,
                         "idempotency 反序列化失败，按未命中处理"
                     );
@@ -214,13 +235,14 @@ impl IdempotencyStore for RedisIdempotencyStore {
     }
 
     async fn put(&self, key: &str, value: &CachedResponse, ttl_seconds: u64) -> anyhow::Result<()> {
+        let redis_key = self.redis_key(key);
         let payload = serde_json::to_string(value)
-            .with_context(|| format!("serialize CachedResponse for {key}"))?;
+            .with_context(|| format!("serialize CachedResponse for {redis_key}"))?;
         let mut conn = self.conn().await?;
         let _: () = conn
-            .set_ex(key, payload, ttl_seconds)
+            .set_ex(&redis_key, payload, ttl_seconds)
             .await
-            .with_context(|| format!("redis SET EX {key}"))?;
+            .with_context(|| format!("redis SET EX {redis_key}"))?;
         Ok(())
     }
 }

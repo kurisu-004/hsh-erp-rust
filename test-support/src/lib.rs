@@ -16,8 +16,8 @@
 //!   `fresh_database_url` / `pool_snowflake` / `register_db_for_drop` 等）
 //! - [`pem`]：进程级缓存的 RSA 密钥对（`test_private_pem` /
 //!   `test_public_pem` / `test_public_kids`）
-//! - [`redis`]：redis 连接池 + clean_redis + URL 派生（`test_redis_pool` /
-//!   `clean_redis` / `test_redis_url`）
+//! - [`redis`]：redis 连接池 + clean_redis + URL 定位 + **进程级 key 前缀**
+//!   （`test_redis_pool` / `clean_redis` / `test_redis_url` / `test_key_prefix`）
 //! - [`state`]：构造测试 `AppState` 的 helper（`test_state` /
 //!   `test_state_with_cos` / `test_state_with_disabled_session` / `test_app`
 //!   / `test_ws_app`）
@@ -53,6 +53,8 @@
 //!   `CREATE DATABASE test_<uuid> TEMPLATE hsh_erp_template`（~100ms tmpfs 克隆）。
 //! - **Layer 2.5**：进程退出回收（libc::atexit + admin DROP）。
 //! - **Snowflake 隔离**：per-process instance 由 `pid ⊕ startup_nanos` 派生。
+//! - **Redis 隔离（2026-10-09）**：不按 db 分桶（Redis 只有 16 个 db，21 个 binary
+//!   必然撞），改由 `redis::test_key_prefix()` 的 `t{pid}:` 前缀按进程隔离。
 //!
 //! ## 公开入口（crate root re-export）
 //! `pub use pool::*; pub use pem::*; pub use redis::*;

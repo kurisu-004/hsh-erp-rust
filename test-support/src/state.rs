@@ -40,7 +40,7 @@ use hsh_erp_rust::state::AppState;
 
 use crate::pem;
 use crate::pool::{shared_test_snowflake, test_database_url, test_snowflake_instance};
-use crate::redis::test_redis_url;
+use crate::redis::{test_key_prefix, test_redis_url};
 
 /// 测试用 JWT secret：长度 >= 32（HS256 建议）+ 与生产区分
 ///
@@ -119,6 +119,10 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
             url: test_redis_url(),
             session_ttl_seconds: 3600,
             pool_max_size: 5,
+            // 2026-10-09 新增：进程级 key 前缀（`t{pid}:`）。db 分桶方案已作废
+            // （Redis 只有 16 个 db，21 个测试 binary 必然撞），隔离改由它承担；
+            // 生产缺省空串，此处三处构造必须一致。
+            key_prefix: test_key_prefix(),
         },
         max_request_body_size: 314_572_800,
         auto_complete: AutoCompleteConfig {
@@ -164,11 +168,15 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
     // 2026-09-28 新增：python 后端转发默认走 NoopPyBackend（不真发 HTTP）。
     let py_backend: Arc<dyn PyBackendClient> = Arc::new(NoopPyBackend);
     let shutdown = CancellationToken::new();
-    let session: Arc<dyn SessionStore> = Arc::new(RedisSessionStore::new(redis_pool.clone()));
+    let session: Arc<dyn SessionStore> =
+        Arc::new(RedisSessionStore::new(redis_pool.clone(), test_key_prefix()));
     // 2026-09-23 新增 Idempotency 中间件存储：默认走 RedisIdempotencyStore
     // （与 session 共享同一 redis_pool）。
     let idempotency_store: Arc<dyn hsh_erp_rust::middleware::idempotency::IdempotencyStore> =
-        Arc::new(hsh_erp_rust::middleware::idempotency::RedisIdempotencyStore::new(redis_pool));
+        Arc::new(hsh_erp_rust::middleware::idempotency::RedisIdempotencyStore::new(
+            redis_pool,
+            test_key_prefix(),
+        ));
     Arc::new(AppState::new(
         pool,
         config,
@@ -290,6 +298,10 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
             url: test_redis_url(),
             session_ttl_seconds: 3600,
             pool_max_size: 5,
+            // 2026-10-09 新增：进程级 key 前缀（`t{pid}:`）。db 分桶方案已作废
+            // （Redis 只有 16 个 db，21 个测试 binary 必然撞），隔离改由它承担；
+            // 生产缺省空串，此处三处构造必须一致。
+            key_prefix: test_key_prefix(),
         },
         max_request_body_size: 314_572_800,
         auto_complete: AutoCompleteConfig {
@@ -356,7 +368,8 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
     ))
 }
 
-/// 测试便捷入口：只传 PgPool，自动建 Redis 池（db 15，与 dev 隔离）。
+/// 测试便捷入口：只传 PgPool，自动建 Redis 池（`redis-test` 实例，与 dev 实例隔离；
+/// 2026-10-09 起该实例内固定 db 0，进程间隔离由 `test_key_prefix()` 的 key 前缀承担）。
 #[allow(dead_code)]
 pub async fn test_state(pool: PgPool) -> Arc<AppState> {
     let redis_pool = crate::redis::test_redis_pool().await;
@@ -438,6 +451,10 @@ pub async fn test_state_with_cos(
             url: test_redis_url(),
             session_ttl_seconds: 3600,
             pool_max_size: 5,
+            // 2026-10-09 新增：进程级 key 前缀（`t{pid}:`）。db 分桶方案已作废
+            // （Redis 只有 16 个 db，21 个测试 binary 必然撞），隔离改由它承担；
+            // 生产缺省空串，此处三处构造必须一致。
+            key_prefix: test_key_prefix(),
         },
         max_request_body_size: 314_572_800,
         auto_complete: AutoCompleteConfig {
@@ -479,10 +496,14 @@ pub async fn test_state_with_cos(
     // 2026-09-28 新增：python 后端转发默认走 NoopPyBackend。
     let py_backend: Arc<dyn PyBackendClient> = Arc::new(NoopPyBackend);
     let shutdown = CancellationToken::new();
-    let session: Arc<dyn SessionStore> = Arc::new(RedisSessionStore::new(redis_pool.clone()));
+    let session: Arc<dyn SessionStore> =
+        Arc::new(RedisSessionStore::new(redis_pool.clone(), test_key_prefix()));
     // 2026-09-23 新增 Idempotency 中间件存储：cos 替换场景同 test_state_with_redis
     let idempotency_store: Arc<dyn hsh_erp_rust::middleware::idempotency::IdempotencyStore> =
-        Arc::new(hsh_erp_rust::middleware::idempotency::RedisIdempotencyStore::new(redis_pool));
+        Arc::new(hsh_erp_rust::middleware::idempotency::RedisIdempotencyStore::new(
+            redis_pool,
+            test_key_prefix(),
+        ));
     Arc::new(AppState::new(
         pool,
         config,

@@ -105,6 +105,13 @@ pub struct RedisConfig {
     pub session_ttl_seconds: u64,
     /// 连接池上限
     pub pool_max_size: usize,
+    /// 2026-10-09 新增：Redis key 统一前缀。生产默认空串（key 格式与历史逐字节一致）；
+    /// 集成测试按进程填 `t{pid}:` 实现并行隔离（Redis 只有 16 个 db，无法按 binary
+    /// 分桶，21 个测试 binary 必然撞）。改动本字段会作废所有已签发 session 的缓存条目。
+    ///
+    /// 环境变量 `REDIS_KEY_PREFIX`，缺省 `""`。前缀只能**整体前置**到既有 key
+    /// 之前（`{prefix}session:tok:{jti}`），不得插进命名结构中间。
+    pub key_prefix: String,
 }
 
 /// JWT 配置（2026-09-22 增 audience 字段 + 2026-09-23 重构 RS256 + kid）
@@ -543,6 +550,8 @@ impl AppConfig {
                 // Redis 滑动 TTL 在 extractor 中 EXPIRE 续期
                 session_ttl_seconds: env_parse("REDIS_SESSION_TTL_SECONDS", 900u64)?,
                 pool_max_size: env_parse("REDIS_POOL_MAX_SIZE", 10usize)?,
+                // 2026-10-09 新增：缺省空串 = 生产 key 格式与历史逐字节一致。
+                key_prefix: env_or("REDIS_KEY_PREFIX", ""),
             },
             // 2026-09-14 新增：_e2e 路由门控。
             // 单一控制点 = env `E2E_HOOKS_ENABLED`（缺省 true）。docker compose / dev `cargo run`
@@ -651,8 +660,9 @@ pub fn build_test_database_url() -> Result<String> {
 /// 从环境变量构建 Redis 连接 URL（session store）
 ///
 /// 两层回退：优先 `REDIS_URL`（含密码 / db index），否则按 `REDIS_HOST/PORT/DB/PASSWORD`
-/// 拼接（dev/test 默认即可）。注意测试容器走 `redis://localhost:6380/15`（与
-/// dev 的 db 0 隔离）。
+/// 拼接（dev/test 默认即可）。注意测试容器走 `redis://localhost:6380/0`，但那是
+/// **另一个实例**（`redis-test` vs dev 的 `redis-dev`）；同实例内的测试进程隔离
+/// 由 `RedisConfig::key_prefix` 承担（2026-10-09，原先靠 db 分桶，已作废）。
 pub fn build_redis_url() -> String {
     if let Ok(url) = env::var("REDIS_URL") {
         return url;

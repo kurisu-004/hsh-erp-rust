@@ -118,9 +118,17 @@ async fn main() -> anyhow::Result<()> {
             "企业微信登录客户端已就绪"
         );
         (
-            Arc::new(RedisSessionStore::new(redis_pool.clone())),
+            // 2026-10-09：key 前缀从配置注入（生产缺省空串 = key 格式与历史逐字节一致；
+            // 集成测试按进程填 `t{pid}:`）。session 与 idempotency 共用同一前缀。
+            Arc::new(RedisSessionStore::new(
+                redis_pool.clone(),
+                config.redis.key_prefix.clone(),
+            )),
             // 2026-09-23 新增 Idempotency 中间件：与 session 同池共享
-            Arc::new(RedisIdempotencyStore::new(redis_pool)),
+            Arc::new(RedisIdempotencyStore::new(
+                redis_pool,
+                config.redis.key_prefix.clone(),
+            )),
             wecom,
         )
     };

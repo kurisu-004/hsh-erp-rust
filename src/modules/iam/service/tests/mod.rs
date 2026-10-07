@@ -229,6 +229,9 @@ pub fn test_app_config() -> Arc<AppConfig> {
             url: String::new(),
             session_ttl_seconds: 900,
             pool_max_size: 1,
+            // 2026-10-09 新增：session service 单测走 NoopSessionStore，不读 Redis，
+            // 前缀取生产缺省（空串）。
+            key_prefix: String::new(),
         },
         enable_e2e_hooks: false,
         ws_heartbeat_interval_seconds: 30,

@@ -720,8 +720,9 @@ mod tests {
     /// 探测并构造测试用 Redis 连接池；连不上返回 `None`（不打 panic）。
     ///
     /// 2026-09-29（review 第 3 轮 N1）：URL 复用
-    /// `hsh_erp_test_support::test_redis_url()`（db index 仍按测试 binary 名派生、
-    /// 可用 `TEST_REDIS_URL` 整体覆盖），但**不走** `test_redis_pool()`——后者内部
+    /// `hsh_erp_test_support::test_redis_url()`（2026-10-09 起固定 db 0，进程间隔离
+    /// 改由 `redis::test_key_prefix()` 的 key 前缀承担；可用 `TEST_REDIS_URL` 整体
+    /// 覆盖），但**不走** `test_redis_pool()`——后者内部
     /// 是 `.expect("create test redis pool")`。deadpool 的 `Config::create_pool`
     /// 只构造 Manager、**不建连**，所以还必须真的 `pool.get()` 探活一次，
     /// 死端口才会被识别成「不可用」而不是等到后面的命令超时。

@@ -9,6 +9,16 @@
 //! - 每 token 一条主条目：`session:tok:<jti UUID v4>`（string，存 JSON `CachedSession`，TTL 滑动）
 //! - 每用户一个 Set 索引：`sessions:user:<user_id>`（每条 token 一个 jti (UUID v4)）
 //!
+//! ## 2026-10-09：key 前缀（进程级隔离）
+//! 三个 key 构造函数（`key_session` / `key_user_set` / `key_revoked`）的返回值前置
+//! `RedisSessionStore::key_prefix`，由 `new(pool, key_prefix)` 注入。生产缺省空串 ⇒
+//! key 与历史逐字节相同；集成测试填 `t{pid}:` ⇒ 进程间物理隔离。
+//!
+//! 为什么必须隔离：`sessions:user:{user_id}` 的 `{user_id}` 是雪花 ID。两个测试进程
+//! 各自 mint 出同一个 `user_id` 时会写进**同一个 Set**，一方调 `delete_all_user_sessions`
+//! 就会连坐吊销另一方的 session → `40105 SESSION_REVOKED` flake。
+//! 前缀只能整体前置，不得插进 `session:tok:` 命名结构中间（见各函数 doc）。
+//!
 //! ## 兜底
 //! `t_user.refresh_token_version` 的 DB 轮转保留——Redis 数据丢失或被 `FLUSHDB` 时，
 //! refresh 仍会被版本校验挡住，access 则靠自然到期。
@@ -141,11 +151,14 @@ pub trait SessionStore: Send + Sync {
 /// Redis 实现的 SessionStore
 pub struct RedisSessionStore {
     pool: Pool,
+    /// 2026-10-09 新增：key 统一前缀，由构造方注入（生产空串 / 测试 `t{pid}:`）。
+    /// 拼在三个 key 构造函数返回值的最前面；空串时 key 与历史逐字节相同。
+    key_prefix: String,
 }
 
 impl RedisSessionStore {
-    pub fn new(pool: Pool) -> Self {
-        Self { pool }
+    pub fn new(pool: Pool, key_prefix: String) -> Self {
+        Self { pool, key_prefix }
     }
 
     async fn conn(&self) -> Result<Connection, AppError> {
@@ -156,20 +169,25 @@ impl RedisSessionStore {
     }
 }
 
-fn key_session(jti: &str) -> String {
-    format!("session:tok:{jti}")
+/// 2026-10-09：`prefix` 只能整体前置，不得插进 `session:tok:` 命名结构中间
+/// （`prefix` 为空串时产出与历史逐字节相同的 `session:tok:{jti}`）。
+fn key_session(prefix: &str, jti: &str) -> String {
+    format!("{prefix}session:tok:{jti}")
 }
 
-fn key_user_set(user_id: i64) -> String {
-    format!("sessions:user:{user_id}")
+/// 2026-10-09：同 [`key_session`] 的前缀约定。
+fn key_user_set(prefix: &str, user_id: i64) -> String {
+    format!("{prefix}sessions:user:{user_id}")
 }
 
 /// 2026-09-23 新增：reuse detection 黑名单 key。
 ///
 /// 空值写入（payload 仅占位），TTL 由业务层根据 refresh 剩余有效期计算。
 /// TTL 到期即由 Redis 自动回收——与 refresh token 自身的过期保持语义一致。
-fn key_revoked(jti: &str) -> String {
-    format!("revoked:{jti}")
+///
+/// 2026-10-09：同 [`key_session`] 的前缀约定。
+fn key_revoked(prefix: &str, jti: &str) -> String {
+    format!("{prefix}revoked:{jti}")
 }
 
 fn now_unix() -> i64 {
@@ -209,17 +227,17 @@ impl SessionStore for RedisSessionStore {
         redis::pipe()
             .atomic()
             .cmd("SET")
-            .arg(key_session(jti))
+            .arg(key_session(&self.key_prefix, jti))
             .arg(payload)
             .arg("EX")
             .arg(ttl_seconds)
             .ignore()
             .cmd("SADD")
-            .arg(key_user_set(user_id))
+            .arg(key_user_set(&self.key_prefix, user_id))
             .arg(jti)
             .ignore()
             .cmd("EXPIRE")
-            .arg(key_user_set(user_id))
+            .arg(key_user_set(&self.key_prefix, user_id))
             .arg(ttl_seconds)
             .ignore()
             .query_async::<()>(&mut conn)
@@ -230,7 +248,10 @@ impl SessionStore for RedisSessionStore {
 
     async fn get_session(&self, jti: &str) -> Result<Option<CachedSession>, AppError> {
         let mut conn = self.conn().await?;
-        let raw: Option<String> = conn.get(key_session(jti)).await.map_err(map_redis)?;
+        let raw: Option<String> = conn
+            .get(key_session(&self.key_prefix, jti))
+            .await
+            .map_err(map_redis)?;
         match raw {
             None => Ok(None),
             Some(s) => serde_json::from_str(&s)
@@ -242,7 +263,10 @@ impl SessionStore for RedisSessionStore {
     async fn delete_session(&self, jti: &str) -> Result<(), AppError> {
         // GET → user_id（SREM 必需）；失败/不存在也允许继续 DEL（幂等）
         let mut conn = self.conn().await?;
-        let raw: Option<String> = conn.get(key_session(jti)).await.map_err(map_redis)?;
+        let raw: Option<String> = conn
+            .get(key_session(&self.key_prefix, jti))
+            .await
+            .map_err(map_redis)?;
         let user_id = raw
             .as_deref()
             .and_then(|s| serde_json::from_str::<CachedSession>(s).ok())
@@ -251,21 +275,24 @@ impl SessionStore for RedisSessionStore {
         redis::pipe()
             .atomic()
             .cmd("DEL")
-            .arg(key_session(jti))
+            .arg(key_session(&self.key_prefix, jti))
             .ignore()
             .query_async::<()>(&mut conn)
             .await
             .map_err(map_redis)?;
 
         if let Some(uid) = user_id {
-            let _: () = conn.srem(key_user_set(uid), jti).await.map_err(map_redis)?;
+            let _: () = conn
+                .srem(key_user_set(&self.key_prefix, uid), jti)
+                .await
+                .map_err(map_redis)?;
         }
         Ok(())
     }
 
     async fn delete_all_user_sessions(&self, user_id: i64) -> Result<(), AppError> {
         let mut conn = self.conn().await?;
-        let set_key = key_user_set(user_id);
+        let set_key = key_user_set(&self.key_prefix, user_id);
         // SMEMBERS 当前用户 Set 的全部 jti
         let jtis: Vec<String> = conn.smembers(&set_key).await.map_err(map_redis)?;
         if !jtis.is_empty() {
@@ -273,7 +300,9 @@ impl SessionStore for RedisSessionStore {
             let mut pipe = redis::pipe();
             pipe.atomic();
             for jti in &jtis {
-                pipe.cmd("DEL").arg(key_session(jti)).ignore();
+                pipe.cmd("DEL")
+                    .arg(key_session(&self.key_prefix, jti))
+                    .ignore();
             }
             pipe.query_async::<()>(&mut conn).await.map_err(map_redis)?;
             // SREM 把这些 jti 从 Set 里摘掉（最后一次 DEL 后 Set 也会被下面清空）
@@ -287,7 +316,10 @@ impl SessionStore for RedisSessionStore {
     async fn touch_session(&self, jti: &str, ttl_seconds: u64) -> Result<bool, AppError> {
         let mut conn = self.conn().await?;
         let updated: bool = conn
-            .expire(key_session(jti), ttl_seconds as i64)
+            .expire(
+                key_session(&self.key_prefix, jti),
+                ttl_seconds as i64,
+            )
             .await
             .map_err(map_redis)?;
         Ok(updated)
@@ -300,7 +332,7 @@ impl SessionStore for RedisSessionStore {
         // Redis 返回 nil 时（key 已存在）转 false；返回 "OK" 时转 true。
         let mut conn = self.conn().await?;
         let reply: Option<String> = redis::cmd("SET")
-            .arg(key_revoked(jti))
+            .arg(key_revoked(&self.key_prefix, jti))
             .arg("")
             .arg("EX")
             .arg(ttl_seconds)
@@ -313,7 +345,10 @@ impl SessionStore for RedisSessionStore {
 
     async fn is_jti_revoked(&self, jti: &str) -> Result<bool, AppError> {
         let mut conn = self.conn().await?;
-        let exists: bool = conn.exists(key_revoked(jti)).await.map_err(map_redis)?;
+        let exists: bool = conn
+            .exists(key_revoked(&self.key_prefix, jti))
+            .await
+            .map_err(map_redis)?;
         Ok(exists)
     }
 }
