@@ -3,11 +3,11 @@
 //! 覆盖：
 //! - list: 创建 3 个公司 + name_like 过滤 + is_active 过滤
 //! - get: 详情含 process_ids 反查
-//! - create: name 必填 + 重名 409 + 可选 process_ids 注入
-//! - update: OCC 版本冲突 + 部分字段
-//! - soft-delete: 仍映射工序时 409
-//! - list-by-process: 按 process 反查 active 公司
-//! - set-processes: 整体替换（delete-then-insert）
+//! - create: name 必填 + 重名 409 + 可选 process_ids 注入（出参 `R<()>`）
+//! - update: OCC 版本冲突 + 部分字段 + `process_ids` 三态（不动 / 清空 / 替换）
+//!   与「集合未变则不重写映射表」的 diff 守卫
+//! - soft-delete: 必传 `version`；仍映射工序时 21205；**version 过期时 40901 早于 21205**
+//! - list-by-process: 按 process 反查 active 公司（窄 VO）
 //!
 //! ## 集成测试范本（PR13 Phase H，2026-09-24）
 //! 本文件按 Phase F 范本收敛：删除本地 `send` / `json_request` / `setup` /
@@ -27,6 +27,11 @@
 //! 不与测试自建 company 撞（uk_t_outsource_company_name 仅约束 active 同名
 //! 唯一），但绝大多数场景希望公司列表干净从 0 起算，因此各 sub-file 用
 //! 本地 `insert_outsource_company` 插自定义行。
+//!
+//! ## 2026-10-09 的三处契约变更对测试面的影响
+//! - `POST /` 出参改 `R<()>` ⇒ 建号后拿不到 id，改从 `GET /?name_like=` 回查；
+//! - `POST /{id}/processes` 硬切下线 ⇒ 「整体替换」用例改打 `/{id}/update`；
+//! - `POST /{id}/soft-delete` 与报价的 `submit` / `soft-delete` 必须带 body `version`。
 
 use axum::http::StatusCode;
 use serde_json::{Value, json};
@@ -35,8 +40,8 @@ use sqlx::PgPool;
 use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_test_support::{
-    OutsourceFixture, json_request, load_outsource_fixture, login_token, send, test_app, test_pool,
-    test_state,
+    OutsourceFixture, json_request, load_outsource_fixture, login_token, send, send_raw, test_app,
+    test_pool, test_state,
 };
 
 // ===========================================================================
@@ -89,27 +94,125 @@ async fn seed_outsource_process(pool: &PgPool, code: &str, name: &str) -> i64 {
 // ===========================================================================
 //  Tests
 // ===========================================================================
+//  域独享 test helper（依赖上面 `POST /` 出参已是 `R<()>`）
+// ===========================================================================
 
-#[tokio::test]
-async fn create_outsource_company_happy_path() {
-    let (_pool, app, token, _fx) = bootstrap_as_manager().await;
+/// 按 `name` 精确取公司 id（直查 DB，避开 `?name_like=` 的 URI 编码问题）。
+async fn company_id_by_name(pool: &PgPool, name: &str) -> i64 {
+    sqlx::query_scalar("SELECT id FROM t_outsource_company WHERE name = $1 AND deleted_at IS NULL")
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|e| panic!("按名字取公司 id 失败（{name:?}）: {e}"))
+}
 
+/// 建一家公司 → 返回 `(status, env)`。
+///
+/// 2026-10-09 起 `POST /outsource-companies` 出参是 `R<()>`，**拿不到 id**，
+/// 需要 id 的用例另用 [`company_id_by_name`] 回查。
+async fn create_company(app: &axum::Router, token: &str, body: Value) -> (StatusCode, Value) {
+    send(
+        app.clone(),
+        json_request("POST", "/outsource-companies", Some(body), Some(token)),
+    )
+    .await
+}
+
+/// 取 `GET /{id}` 的 `version`（OCC 锚）。
+async fn company_version(app: &axum::Router, token: &str, cid: &str) -> i64 {
     let (s, env) = send(
         app.clone(),
         json_request(
-            "POST",
-            "/outsource-companies",
-            Some(json!({"name": "Acme 加工厂", "is_active": true})),
-            Some(&token),
+            "GET",
+            &format!("/outsource-companies/{cid}"),
+            None,
+            Some(token),
         ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "get company: {env}");
+    env["data"]["version"].as_i64().unwrap()
+}
+
+/// 取 `GET /{id}` 的 `processes[]` 里的 `process_id` 序列（按响应里的顺序）。
+async fn company_process_ids(app: &axum::Router, token: &str, cid: &str) -> Vec<String> {
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "GET",
+            &format!("/outsource-companies/{cid}"),
+            None,
+            Some(token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "get company: {env}");
+    env["data"]["processes"]
+        .as_array()
+        .expect("processes 必须是数组")
+        .iter()
+        .map(|p| p["process_id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// 取该公司在 `t_outsource_company_process` 里**未软删**的 junction id 序列。
+///
+/// diff 守卫用例靠它断言「提交同一集合不重写映射表」：重写会换掉全部 junction id。
+async fn live_junction_ids(pool: &PgPool, cid: i64) -> Vec<i64> {
+    sqlx::query_scalar(
+        "SELECT id FROM t_outsource_company_process \
+         WHERE outsource_company_id = $1 AND deleted_at IS NULL ORDER BY sort_order ASC, id ASC",
+    )
+    .bind(cid)
+    .fetch_all(pool)
+    .await
+    .expect("读 junction id")
+}
+
+// ===========================================================================
+
+#[tokio::test]
+async fn create_outsource_company_happy_path() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+
+    let (s, env) = create_company(
+        &app,
+        &token,
+        json!({"name": "Acme 加工厂", "is_active": true}),
     )
     .await;
     assert_eq!(s, StatusCode::CREATED, "create: {env}");
     assert_eq!(env["code"], 0);
-    assert_eq!(env["data"]["name"], "Acme 加工厂");
-    assert_eq!(env["data"]["is_active"], true);
-    assert_eq!(env["data"]["version"], 0);
-    assert_eq!(env["data"]["processes"].as_array().unwrap().len(), 0);
+    // 2026-10-09：出参收窄为 `R<()>`，`data` 是 null（建号后前端一律重拉列表）。
+    assert!(
+        env["data"].is_null(),
+        "create 出参必须是 R<()>（data=null）: {env}"
+    );
+
+    let cid = company_id_by_name(&pool, "Acme 加工厂").await;
+    let (_, env2) = send(
+        app,
+        json_request(
+            "GET",
+            &format!("/outsource-companies/{cid}"),
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(env2["data"]["name"], "Acme 加工厂", "{env2}");
+    assert_eq!(env2["data"]["is_active"], true, "{env2}");
+    assert_eq!(env2["data"]["version"], 0, "{env2}");
+    assert_eq!(
+        env2["data"]["processes"].as_array().unwrap().len(),
+        0,
+        "{env2}"
+    );
+    // 2026-10-09：`OutsourceCompanyWithProcessesOut` 删掉两个时间字段。
+    assert!(
+        env2["data"].get("created_at").is_none() && env2["data"].get("updated_at").is_none(),
+        "公司出参不得再带 created_at / updated_at: {env2}"
+    );
 }
 
 #[tokio::test]
@@ -191,27 +294,43 @@ async fn create_outsource_company_with_process_ids_creates_mapping() {
     let p1 = seed_outsource_process(&pool, "PROC-O-1", "外协工序1").await;
     let p2 = seed_outsource_process(&pool, "PROC-O-2", "外协工序2").await;
 
-    let (s, env) = send(
+    let (s, env) = create_company(
+        &app,
+        &token,
+        json!({
+            "name": "ProcMapping Co",
+            "process_ids": [p1.to_string(), p2.to_string()]
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "create with procs: {env}");
+    let cid = company_id_by_name(&pool, "ProcMapping Co").await;
+
+    // 出参是 `R<()>`，映射要用 `GET /{id}` 验。
+    let (_, env_g) = send(
         app.clone(),
         json_request(
-            "POST",
-            "/outsource-companies",
-            Some(json!({
-                "name": "ProcMapping Co",
-                "process_ids": [p1.to_string(), p2.to_string()]
-            })),
+            "GET",
+            &format!("/outsource-companies/{cid}"),
+            None,
             Some(&token),
         ),
     )
     .await;
-    assert_eq!(s, StatusCode::CREATED, "create with procs: {env}");
-    let cid = env["data"]["id"].as_str().unwrap().to_string();
-    let procs = env["data"]["processes"].as_array().unwrap();
-    assert_eq!(procs.len(), 2);
+    let procs = env_g["data"]["processes"].as_array().unwrap();
+    assert_eq!(procs.len(), 2, "{env_g}");
     assert_eq!(procs[0]["process_id"].as_str().unwrap(), p1.to_string());
     assert_eq!(procs[1]["process_id"].as_str().unwrap(), p2.to_string());
+    // 2026-10-09：`OutsourceCompanyProcessLinkOut` 收成 3 字段（删 `category` /
+    // `sort_order`）—— 前端勾选框的候选集来自独立的工序列表端点，`sort_order`
+    // 从不由 VO 消费。
+    assert_eq!(procs[0].as_object().unwrap().len(), 3, "{env_g}");
+    assert!(
+        procs[0].get("category").is_none() && procs[0].get("sort_order").is_none(),
+        "工序链接出参不得再带 category / sort_order: {env_g}"
+    );
 
-    // by-process 也能查到
+    // by-process 也能查到（窄 VO：只有 id + name）
     let (_, env_by) = send(
         app,
         json_request(
@@ -223,25 +342,27 @@ async fn create_outsource_company_with_process_ids_creates_mapping() {
     )
     .await;
     let items = env_by["data"].as_array().unwrap();
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0]["id"].as_str().unwrap(), cid);
+    assert_eq!(items.len(), 1, "{env_by}");
+    assert_eq!(
+        items[0]["id"].as_str().unwrap(),
+        cid.to_string(),
+        "{env_by}"
+    );
+    assert_eq!(items[0]["name"], "ProcMapping Co", "{env_by}");
+    assert_eq!(
+        items[0].as_object().unwrap().len(),
+        2,
+        "by-process 出参必须是窄 VO（id + name）: {env_by}"
+    );
 }
 
 #[tokio::test]
 async fn update_outsource_company_version_conflict_returns_40901() {
-    let (_pool, app, token, _fx) = bootstrap_as_manager().await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
 
-    let (_, env_c) = send(
-        app.clone(),
-        json_request(
-            "POST",
-            "/outsource-companies",
-            Some(json!({"name": "VC Co"})),
-            Some(&token),
-        ),
-    )
-    .await;
-    let cid = env_c["data"]["id"].as_str().unwrap().to_string();
+    let (s, _) = create_company(&app, &token, json!({"name": "VC Co"})).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let cid = company_id_by_name(&pool, "VC Co").await;
 
     // 故意传错 version
     let (s, env) = send(
@@ -258,37 +379,301 @@ async fn update_outsource_company_version_conflict_returns_40901() {
     assert_eq!(env["code"].as_i64().unwrap(), 40901);
 }
 
+/// `process_ids` 三态：缺省 = 不动、`[]` = 清空、`[..]` = 替换。
+///
+/// 三态必须可分 —— 「取消全选并保存」若被当成「没改」而静默丢失，合并成一个对话框
+/// 后用户在界面上看不出任何异常。
 #[tokio::test]
-async fn soft_delete_outsource_company_in_use_returns_21205() {
+async fn update_company_process_ids_three_states() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
-    let p1 = seed_outsource_process(&pool, "PROC-INUSE", "外协INUSE").await;
-    let (_, env_c) = send(
+    let p1 = seed_outsource_process(&pool, "PS-1", "ps1").await;
+    let p2 = seed_outsource_process(&pool, "PS-2", "ps2").await;
+    let p3 = seed_outsource_process(&pool, "PS-3", "ps3").await;
+
+    let (s, env) = create_company(
+        &app,
+        &token,
+        json!({"name": "ThreeStates Co", "process_ids": [p1.to_string()]}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{env}");
+    let cid = company_id_by_name(&pool, "ThreeStates Co").await;
+    let cid = cid.to_string();
+    assert_eq!(
+        company_process_ids(&app, &token, &cid).await,
+        vec![p1.to_string()]
+    );
+
+    // ① 缺省（不给 process_ids）：映射不动
+    let mut ver = company_version(&app, &token, &cid).await;
+    let (s, env) = send(
         app.clone(),
         json_request(
             "POST",
-            "/outsource-companies",
+            &format!("/outsource-companies/{cid}/update"),
+            Some(json!({"contact_phone": "021-111", "version": ver})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "只改电话: {env}");
+    assert_eq!(env["data"]["contact_phone"], "021-111", "{env}");
+    assert_eq!(
+        company_process_ids(&app, &token, &cid).await,
+        vec![p1.to_string()],
+        "缺省 process_ids 必须不动映射: {env}"
+    );
+
+    // ② 空数组：清空
+    ver = company_version(&app, &token, &cid).await;
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/outsource-companies/{cid}/update"),
+            Some(json!({"version": ver, "process_ids": []})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "清空: {env}");
+    assert!(
+        company_process_ids(&app, &token, &cid).await.is_empty(),
+        "process_ids=[] 必须清空映射: {env}"
+    );
+
+    // ③ 替换：整体换成 [p2, p3]，p1 不再出现
+    ver = company_version(&app, &token, &cid).await;
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/outsource-companies/{cid}/update"),
             Some(json!({
-                "name": "InUse Co",
-                "process_ids": [p1.to_string()]
+                "version": ver,
+                "process_ids": [p2.to_string(), p3.to_string()]
             })),
             Some(&token),
         ),
     )
     .await;
-    let cid = env_c["data"]["id"].as_str().unwrap().to_string();
+    assert_eq!(s, StatusCode::OK, "替换: {env}");
+    assert_eq!(
+        company_process_ids(&app, &token, &cid).await,
+        vec![p2.to_string(), p3.to_string()],
+        "process_ids 必须整体替换且保序: {env}"
+    );
+}
+
+/// diff 守卫：目标有序集合 == 当前有序集合时**跳过重写**（junction id 不变）。
+///
+/// 吸收 `process_ids` 进 update 之后，每次保存（哪怕只改电话号码）都会走到映射写入
+/// 路径；而 `replace_processes` 是「软删全部 + 逐条重建」，无脑执行会把整张
+/// `t_outsource_company_process` churn 一遍却内容不变。
+#[tokio::test]
+async fn update_company_same_process_set_does_not_rewrite_mapping() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let p1 = seed_outsource_process(&pool, "DG-1", "dg1").await;
+    let p2 = seed_outsource_process(&pool, "DG-2", "dg2").await;
+
+    let (s, env) = create_company(
+        &app,
+        &token,
+        json!({
+            "name": "DiffGuard Co",
+            "process_ids": [p1.to_string(), p2.to_string()]
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{env}");
+    let cid = company_id_by_name(&pool, "DiffGuard Co").await;
+    let before = live_junction_ids(&pool, cid).await;
+    assert_eq!(before.len(), 2, "造数必须有两行映射");
+
+    // 提交完全相同的集合（顺序也相同）
+    let ver = company_version(&app, &token, &cid.to_string()).await;
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/outsource-companies/{cid}/update"),
+            Some(json!({
+                "version": ver,
+                "process_ids": [p1.to_string(), p2.to_string()]
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(
+        live_junction_ids(&pool, cid).await,
+        before,
+        "集合未变时不得重写映射表（junction id 应保持不变）: {env}"
+    );
+
+    // 真要替换时才换 id
+    let ver = company_version(&app, &token, &cid.to_string()).await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/outsource-companies/{cid}/update"),
+            Some(json!({"version": ver, "process_ids": [p2.to_string()]})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let after = live_junction_ids(&pool, cid).await;
+    assert_eq!(after.len(), 1, "替换后应只剩一行: {env}");
+    assert_ne!(after, before, "集合真变了必须重写: {env}");
+}
+
+/// `version` 过期必须返 40901，**且早于** 21205（仍映射工序）。
+///
+/// 守卫顺序是契约：version 过期意味着整个对话框看到的公司状态已失效，此时报
+/// 「仍映射 N 项工序，请先清空」会把用户引向错误的排查方向（他真去清工序，而真正
+/// 的原因是数据已被他人改动）。
+#[tokio::test]
+async fn soft_delete_version_conflict_precedes_in_use_guard() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let p1 = seed_outsource_process(&pool, "PROC-VC-INUSE", "外协VC").await;
+    let (s, env) = create_company(
+        &app,
+        &token,
+        json!({"name": "VcInUse Co", "process_ids": [p1.to_string()]}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{env}");
+    let cid = company_id_by_name(&pool, "VcInUse Co").await;
+
+    // 故意传错 version，且该公司**确实**仍映射着工序
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/outsource-companies/{cid}/soft-delete"),
+            Some(json!({"version": 99})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "vc 必须先于 in-use 判定: {env}");
+    assert_eq!(
+        env["code"].as_i64().unwrap(),
+        40901,
+        "version 过期必须先返 40901（曾返 21205）: {env}"
+    );
+}
+
+/// `version` 是必填字段：body 里没有 ⇒ axum 的 `422` + 纯文本，**不进 `R<T>` 信封**。
+///
+/// 用 `send_raw`：axum 的 `Json` 反序列化拒绝是纯文本 body，`send` 会在 JSON 解析处 panic。
+#[tokio::test]
+async fn soft_delete_company_requires_version_field() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let (s, _) = create_company(&app, &token, json!({"name": "NoVer Co"})).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let cid = company_id_by_name(&pool, "NoVer Co").await;
+
+    let (s, body) = send_raw(
+        app,
+        json_request(
+            "POST",
+            &format!("/outsource-companies/{cid}/soft-delete"),
+            Some(json!({})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "缺 version 必须是 422（不是业务信封）: {body}"
+    );
+    assert!(
+        !body.contains("\"code\""),
+        "缺字段是 axum 的纯文本拒绝，不得有 code 字段: {body}"
+    );
+    assert!(
+        body.contains("missing field `version`"),
+        "错误正文应指出缺 version: {body}"
+    );
+}
+
+#[tokio::test]
+async fn soft_delete_outsource_company_in_use_returns_21205() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let p1 = seed_outsource_process(&pool, "PROC-INUSE", "外协INUSE").await;
+    let (s, env) = create_company(
+        &app,
+        &token,
+        json!({
+            "name": "InUse Co",
+            "process_ids": [p1.to_string()]
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{env}");
+    let cid = company_id_by_name(&pool, "InUse Co").await;
+    let ver = company_version(&app, &token, &cid.to_string()).await;
 
     let (s, env) = send(
         app,
         json_request(
             "POST",
             &format!("/outsource-companies/{cid}/soft-delete"),
-            None,
+            Some(json!({"version": ver})),
             Some(&token),
         ),
     )
     .await;
     assert_eq!(s, StatusCode::CONFLICT, "in-use: {env}");
     assert_eq!(env["code"].as_i64().unwrap(), 21205);
+}
+
+/// 清空映射后软删成功（正向闭环）。
+#[tokio::test]
+async fn soft_delete_company_succeeds_after_clearing_processes() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let p1 = seed_outsource_process(&pool, "PROC-CLEAR", "外协CLEAR").await;
+    let (s, env) = create_company(
+        &app,
+        &token,
+        json!({"name": "Clear Co", "process_ids": [p1.to_string()]}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{env}");
+    let cid = company_id_by_name(&pool, "Clear Co").await;
+    let cid = cid.to_string();
+
+    let ver = company_version(&app, &token, &cid).await;
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/outsource-companies/{cid}/update"),
+            Some(json!({"version": ver, "process_ids": []})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+
+    let ver = company_version(&app, &token, &cid).await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/outsource-companies/{cid}/soft-delete"),
+            Some(json!({"version": ver})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "清空后应能软删: {env}");
+    assert!(env["data"].is_null(), "{env}");
 }
 
 #[tokio::test]
@@ -339,48 +724,40 @@ async fn list_outsource_companies_name_like_and_is_active_filter() {
     assert_eq!(env2["data"]["total"].as_i64().unwrap(), 3);
 }
 
+/// 2026-10-09：`POST /{id}/processes` 硬切下线，整体替换改由 `POST /{id}/update`
+/// 的 `process_ids` 承担（同批新增的 `update_company_process_ids_three_states`
+/// 覆盖三态语义与 diff 守卫）。本用例只钉一件事：**旧端点确实不再存在**。
+///
+/// 旧路径是 2 段 `/{id}/processes`，删掉路由后同 router 里没有任何 2 段 POST 路由
+/// 会匹配它 ⇒ matchit 返 **404**（不是 405 / 422）。
 #[tokio::test]
-async fn set_outsource_company_processes_replaces_mapping() {
+async fn company_processes_endpoint_is_gone() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
-    let p1 = seed_outsource_process(&pool, "SP-1", "sp1").await;
-    let p2 = seed_outsource_process(&pool, "SP-2", "sp2").await;
-    let p3 = seed_outsource_process(&pool, "SP-3", "sp3").await;
-    // 创建时只挂 p1
-    let (_, env_c) = send(
-        app.clone(),
-        json_request(
-            "POST",
-            "/outsource-companies",
-            Some(json!({"name": "SetProc Co", "process_ids": [p1.to_string()]})),
-            Some(&token),
-        ),
+    let p1 = seed_outsource_process(&pool, "SP-GONE", "sp-gone").await;
+    let (s, env) = create_company(
+        &app,
+        &token,
+        json!({"name": "GoneProc Co", "process_ids": [p1.to_string()]}),
     )
     .await;
-    let cid = env_c["data"]["id"].as_str().unwrap().to_string();
-    assert_eq!(env_c["data"]["processes"].as_array().unwrap().len(), 1);
+    assert_eq!(s, StatusCode::CREATED, "{env}");
+    let cid = company_id_by_name(&pool, "GoneProc Co").await;
 
-    // 整体替换为 [p2, p3]
-    let (s, env) = send(
-        app.clone(),
+    let (s, _) = send_raw(
+        app,
         json_request(
             "POST",
             &format!("/outsource-companies/{cid}/processes"),
-            Some(json!({"process_ids": [p2.to_string(), p3.to_string()]})),
+            Some(json!({"process_ids": [p1.to_string()]})),
             Some(&token),
         ),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "set-processes: {env}");
-    let procs = env["data"]["processes"].as_array().unwrap();
-    assert_eq!(procs.len(), 2);
-    let ids: Vec<String> = procs
-        .iter()
-        .map(|p| p["process_id"].as_str().unwrap().to_string())
-        .collect();
-    assert!(ids.contains(&p2.to_string()));
-    assert!(ids.contains(&p3.to_string()));
-    // p1 应被清除
-    assert!(!ids.contains(&p1.to_string()));
+    assert_eq!(
+        s,
+        StatusCode::NOT_FOUND,
+        "POST /{cid}/processes 必须已硬切下线（404）"
+    );
 }
 
 #[tokio::test]
@@ -388,30 +765,22 @@ async fn list_outsource_companies_by_process_filters_inactive() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let p = seed_outsource_process(&pool, "BYP", "byp").await;
     // active
-    let (_, _) = send(
-        app.clone(),
-        json_request(
-            "POST",
-            "/outsource-companies",
-            Some(json!({"name": "Active Co", "process_ids": [p.to_string()]})),
-            Some(&token),
-        ),
+    let (s, env) = create_company(
+        &app,
+        &token,
+        json!({"name": "Active Co", "process_ids": [p.to_string()]}),
     )
     .await;
+    assert_eq!(s, StatusCode::CREATED, "{env}");
     // inactive
-    let (_, env_i) = send(
-        app.clone(),
-        json_request(
-            "POST",
-            "/outsource-companies",
-            Some(
-                json!({"name": "Inactive Co", "is_active": false, "process_ids": [p.to_string()]}),
-            ),
-            Some(&token),
-        ),
+    let (s, env) = create_company(
+        &app,
+        &token,
+        json!({"name": "Inactive Co", "is_active": false, "process_ids": [p.to_string()]}),
     )
     .await;
-    let inactive_id = env_i["data"]["id"].as_str().unwrap().to_string();
+    assert_eq!(s, StatusCode::CREATED, "{env}");
+    let inactive_id = company_id_by_name(&pool, "Inactive Co").await;
 
     let (_, env) = send(
         app,
@@ -424,6 +793,10 @@ async fn list_outsource_companies_by_process_filters_inactive() {
     )
     .await;
     let items = env["data"].as_array().unwrap();
-    assert_eq!(items.len(), 1);
-    assert_ne!(items[0]["id"].as_str().unwrap(), inactive_id);
+    assert_eq!(items.len(), 1, "{env}");
+    assert_ne!(
+        items[0]["id"].as_str().unwrap(),
+        inactive_id.to_string(),
+        "{env}"
+    );
 }

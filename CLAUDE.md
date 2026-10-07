@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 > - [`docs/api/inspection.md`](docs/api/inspection.md) —— `prod::inspection` 待品检（队列列表 + 扫码三层树、`l1_customer_name` 与返修侧有意分叉、域隔离漏报盲区）
 > - [`docs/api/queue.md`](docs/api/queue.md) —— `prod::queue` 生产队列（9 端点；候选池判据的两列一致 / 货架 JOIN 不一致、`pending_count` 口径、`batch_id` 必须是 JSON 字符串）
 > - [`docs/api/batch.md`](docs/api/batch.md) —— `prod::batch` 批次流转（**剥离中间态**，域内 19 条 + 域外 `/batches/split` 1 条；剥离登记表 / `ROUTES` 权威源 / 状态派生契约 / 外协三端点已迁往 `outsource::queue`）
-> - [`docs/api/outsource.md`](docs/api/outsource.md) —— `outsource` 外协域（4 个 router 工厂 22 端点；外协看板 + `move` 三合一写端点、报价与对账、候选侧三处行粒度一致性、移除记录、WS 事件与审计字面量的区分）
+> - [`docs/api/outsource.md`](docs/api/outsource.md) —— `outsource` 外协域（4 个 router 工厂 18 端点；外协看板 + `move` 三合一写端点、公司 / 报价两域收敛（端点 8+9 → 7+7、`keyword` 拆 `drawing_no` / `name`、报价 `statuses` 多状态筛选接线）、报价与对账、候选侧两处行粒度一致性、移除记录、WS 事件与审计字面量的区分）
 >
 > **其它域的契约在代码注释里**（各域 `mod.rs` / `repo.rs` / `vo` / `dto` 的模块 doc 与逐字段 doc），本仓的目录约定见本文件「`docs/api/` 目录约定」一节。⚠️ **引用不存在的文档路径是禁止的** —— 后端代码变更（新增 / 修改 / 删除端点，或修改 DTO 字段 / 错误码）必须同步更新对应域的 `docs/api/` 文件（若该域有）与代码注释。
 
@@ -311,7 +311,7 @@ t_assembly.status               ← 派生缓存
 | [`docs/api/inspection.md`](docs/api/inspection.md) | `prod::inspection`（待品检队列 + 扫码树） |
 | [`docs/api/queue.md`](docs/api/queue.md) | `prod::queue`（工序候选池 + 工人持有 + 下发 / 召回 / 移动 + 队列板聚合） |
 | [`docs/api/batch.md`](docs/api/batch.md) | `prod::batch`（批次流转，剥离中间态） |
-| [`docs/api/outsource.md`](docs/api/outsource.md) | `outsource`（外协公司 / 报价 / 发货 + 外协看板与三合一写端点） |
+| [`docs/api/outsource.md`](docs/api/outsource.md) | `outsource`（外协公司 / 报价 / 发货 + 外协看板与三合一写端点；公司 7 条 / 报价 7 条 / 发货 2 条 / 看板 3 条） |
 
 **约定**：
 
@@ -334,7 +334,7 @@ t_assembly.status               ← 派生缓存
 | `tests/shelf/{main,api,deactivate}.rs` | 2 | `shelf` |
 | `tests/statistics/{main,api,event_driven}.rs` | 2 | `statistics` |
 | `tests/production/{main,work_type,process,process_chain,worker,queue,queue_auto_allocate,queue_dispatch,queue_board,pending_programming,shelf_process,pickup,process_design,inspection}.rs` | 6 | `production`（按 `src/modules/prod/*` 对齐；`shelf_process.rs` 2026-10-02 自 `tests/shelf/api.rs` 迁入；**`process_design.rs` 2026-10-05 新增**，★ 核心回归是「装配件子件可见」；**`inspection.rs` 2026-10-05 新增** 13 场景，★ 核心回归是「扫子件 → 返回整棵装配件树」；**2026-10-08** `worker_pool.rs` → `queue.rs`、`worker_pool_auto_allocate.rs` → `queue_auto_allocate.rs`、`batch.rs` → `queue_dispatch.rs`，并新增 `queue_board.rs`（队列板聚合 9 场景））|
-| `tests/outsource/{main,company,quote,send_receive}.rs` | 3 | `outsource` |
+| `tests/outsource/{main,company,quote,quotable,send_receive,shipment,pool}.rs` | 3 | `outsource` |
 | `tests/user_repo/{main,basic,role,password}.rs` | 1 → 3 sub-file | `user_repo` |
 | 单文件保留：applicant_api / customer_api / _e2e_api / cos_opendal_api / cos_real_smoke / auto_complete_api / dashboard_ws_api / idempotency_api / guard_dn_in_use_api / cnc_program_api | 10 | （各自原 binary 名）|
 | **合计** | 51 → | **20 binary** |

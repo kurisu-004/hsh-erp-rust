@@ -5,13 +5,13 @@
 //! ## 事务边界（2026-09-22 refactor 对齐 iam 范本）
 //! handler 负责 `pool.begin()` / `tx.commit()`——与 iam / 11 个其它 handler 文件现状对齐：
 //! - ① **纯写端点**（create_company / update_company / soft_delete_company /
-//!   set_company_processes / create_quote / update_quote / submit_quote / approve_quote /
-//!   reject_quote / soft_delete_quote / reconcile_update_shipment）：
-//!   `pool.begin()` → service call → `tx.commit()`，错误路径 tx drop 隐式回滚。
+//!   create_quote / submit_quote / approve_quote / reject_quote / soft_delete_quote /
+//!   reconcile_update_shipment）：`pool.begin()` → service call → `tx.commit()`，
+//!   错误路径 tx drop 隐式回滚。
 //! - ② **写 + post-commit 副作用**：外协看板移动端点（`POST /outsource-queue/move`，
 //!   见 `handler/move.rs`）—— `tx.commit()` 之后广播 `OUTSOURCE_MOVE_DONE`。
 //! - ③ **读端点**（list_companies / get_company / list_companies_by_process /
-//!   list_quotes / get_quote / 看板两读）：`pool.acquire()` 不开事务，
+//!   list_quotes / 看板两读）：`pool.acquire()` 不开事务，
 //!   service 借 `&mut *conn` 执行查询，用完即 drop。
 //!
 //! service 形参：`repo: R: OutsourceRepoTrait`（by-value）。生产路径
@@ -30,34 +30,31 @@
 //! - `board.rs` —— 外协看板只读聚合 2 端点（`snapshot` / `processes/{process_id}`）
 //! - `move.rs` —— 外协看板三合一移动写端点（`POST /move`，2026-10-09 新增）
 //!
-//! ## 路由表（20 端点）
+//! ## 路由表（22 端点 → 18 端点）
 //!
 //! - `GET    /outsource-companies`              — 列表（READ）
 //! - `POST   /outsource-companies`              — 新建（WRITE）
-//! - `GET    /outsource-companies/{id}`         — 详情
-//! - `GET    /outsource-companies/{id}/sent-parts` — 对账页 sent-parts 一览（2026-10-03 新增）
-//! - `POST   /outsource-companies/{id}/update`  — 更新（OCC）
-//! - `POST   /outsource-companies/{id}/soft-delete` — 软删
-//! - `GET    /outsource-companies/by-process/{process_id}` — 按工序反查
-//! - `POST   /outsource-companies/{id}/processes` — 整体替换工序映射
+//! - `GET    /outsource-companies/{id}`         — 详情（含工序映射）
+//! - `GET    /outsource-companies/{id}/sent-parts` — 对账页 sent-parts 一览
+//! - `POST   /outsource-companies/{id}/update`  — 更新（OCC + 可选整体替换工序映射）
+//! - `POST   /outsource-companies/{id}/soft-delete` — 软删（OCC）
+//! - `GET    /outsource-companies/by-process/{process_id}` — 按工序反查（窄 VO）
 //!
 //! - `GET    /outsource-quotes`                 — 列表
 //! - `POST   /outsource-quotes`                 — 新建 DRAFT
-//! - `GET    /outsource-quotes/quotable-parts`  — 报价 picker（2026-10-03 新增）
-//! - `GET    /outsource-quotes/{id}`            — 详情
-//! - `POST   /outsource-quotes/{id}/update`     — 更新 DRAFT
-//! - `POST   /outsource-quotes/{id}/submit`     — DRAFT → SUBMITTED
+//! - `GET    /outsource-quotes/quotable-parts`  — 报价 picker
+//! - `POST   /outsource-quotes/{id}/submit`     — DRAFT → SUBMITTED（OCC）
 //! - `POST   /outsource-quotes/{id}/approve`    — SUBMITTED → APPROVED (MANAGER-only)
 //! - `POST   /outsource-quotes/{id}/reject`     — SUBMITTED → REJECTED (MANAGER-only)
-//! - `POST   /outsource-quotes/{id}/soft-delete` — 软删 DRAFT/REJECTED
+//! - `POST   /outsource-quotes/{id}/soft-delete` — 软删 DRAFT/REJECTED（OCC）
 //!
-//! - `GET    /outsource-shipments/in-flight`    — 在途批次一览（2026-10-03 新增）
+//! - `GET    /outsource-shipments/in-flight`    — 在途批次一览
 //! - `POST   /outsource-shipments/{id}/reconcile-update` — 对账页更新
 //!
 //! 顶层（独立前缀，见 `modules::mod.rs::v2_router`）：
-//! - `GET    /outsource-queue/snapshot`         — 外协工序序列板（2026-10-09 新增）
+//! - `GET    /outsource-queue/snapshot`         — 外协工序序列板
 //! - `GET    /outsource-queue/processes/{id}`   — 单工序看板（候选 + 公司列含在途批次）
-//! - `POST   /outsource-queue/move`             — 三合一移动写端点（2026-10-09 新增）
+//! - `POST   /outsource-queue/move`             — 三合一移动写端点
 //!
 //! ### 2026-10-09 硬切下线的端点（无 alias）
 //! - `GET /outsource-pool/counts` → `/outsource-queue/snapshot`
@@ -67,6 +64,10 @@
 //!   （它只是同一批行的分页子集）
 //! - `POST /prod/batches/{id}/send-to-outsource` / `receive-from-outsource` /
 //!   `receive-from-outsource-to-inspection` → 三合一为 `POST /outsource-queue/move`
+//! - `POST /outsource-companies/{id}/processes` → 吸收进 `POST /{id}/update` 的
+//!   `process_ids`
+//! - `GET /outsource-quotes/{id}` / `POST /outsource-quotes/{id}/update` → 删除
+//!   （前端零消费）
 
 mod board;
 // `move` 是 Rust 关键字，不能直接作模块名；文件仍叫 `move.rs`（与
@@ -84,14 +85,14 @@ use axum::{Json, Router};
 
 use crate::auth::rbac::CurrentUser;
 use crate::modules::outsource::dto::{
-    OutsourceCompanyCreateRequest, OutsourceCompanyListQuery, OutsourceCompanyUpdateRequest,
-    OutsourceInFlightListQuery, OutsourceQuotablePartListQuery, OutsourceQuoteApproveRequest,
-    OutsourceQuoteCreateRequest, OutsourceQuoteListQuery, OutsourceQuoteRejectRequest,
-    OutsourceQuoteUpdateRequest, OutsourceSentPartListQuery,
-    OutsourceShipmentReconcileUpdateRequest, SetOutsourceCompanyProcessRequest,
+    OutsourceCompanyCreateRequest, OutsourceCompanyListQuery, OutsourceCompanySoftDeleteRequest,
+    OutsourceCompanyUpdateRequest, OutsourceInFlightListQuery, OutsourceQuotablePartListQuery,
+    OutsourceQuoteApproveRequest, OutsourceQuoteCreateRequest, OutsourceQuoteListQuery,
+    OutsourceQuoteRejectRequest, OutsourceQuoteSoftDeleteRequest, OutsourceQuoteSubmitRequest,
+    OutsourceSentPartListQuery, OutsourceShipmentReconcileUpdateRequest,
 };
 use crate::modules::outsource::vo::{
-    OutsourceCompanyListOut, OutsourceCompanyOut, OutsourceCompanyWithProcessesOut,
+    OutsourceCompanyListOut, OutsourceCompanyOptionOut, OutsourceCompanyWithProcessesOut,
     OutsourceInFlightListOut, OutsourceQuoteListOut, OutsourceQuoteOut, OutsourceSentPartListOut,
     OutsourceShipmentOut, QuotablePartListOut,
 };
@@ -118,18 +119,23 @@ pub async fn list_companies(
 }
 
 /// POST /outsource-companies → 201 —— 纯写端点
+///
+/// 出参是 `R<()>`（`data: null`）：前端建完公司后一律重拉列表，建号所需的 id 从
+/// `GET /outsource-companies?name_like=…` 的首行取。返整份
+/// `OutsourceCompanyWithProcessesOut` 的代价是**每次建号多一次工序映射 + 工序元数据
+/// 的往返**，而消费方一个字段都不用。
 pub async fn create_company(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Json(req): Json<OutsourceCompanyCreateRequest>,
-) -> Result<(StatusCode, Json<R<OutsourceCompanyWithProcessesOut>>), AppError> {
+) -> Result<(StatusCode, Json<R<()>>), AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = state
+    state
         .outsource_service
         .create_company(&mut *tx, &req, &current)
         .await?;
     tx.commit().await?;
-    Ok((StatusCode::CREATED, Json(R::ok(out))))
+    Ok((StatusCode::CREATED, Json(R::ok_empty())))
 }
 
 /// GET /outsource-companies/{id} —— 读端点，acquire 不开事务
@@ -167,11 +173,12 @@ pub async fn soft_delete_company(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Path(id): Path<i64>,
+    Json(req): Json<OutsourceCompanySoftDeleteRequest>,
 ) -> Result<Json<R<()>>, AppError> {
     let mut tx = state.pool.begin().await?;
     state
         .outsource_service
-        .soft_delete_company(&mut *tx, id, &current)
+        .soft_delete_company(&mut *tx, id, &req, &current)
         .await?;
     tx.commit().await?;
     Ok(Json(R::ok_empty()))
@@ -185,7 +192,7 @@ pub async fn list_companies_by_process(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Path(process_id): Path<i64>,
-) -> Result<Json<R<Vec<OutsourceCompanyOut>>>, AppError> {
+) -> Result<Json<R<Vec<OutsourceCompanyOptionOut>>>, AppError> {
     let mut conn = state.pool.acquire().await?;
     let out = state
         .outsource_service
@@ -194,27 +201,11 @@ pub async fn list_companies_by_process(
     Ok(Json(R::ok(out)))
 }
 
-/// POST /outsource-companies/{id}/processes —— 纯写端点
-pub async fn set_company_processes(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(id): Path<i64>,
-    Json(req): Json<SetOutsourceCompanyProcessRequest>,
-) -> Result<Json<R<OutsourceCompanyWithProcessesOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = state
-        .outsource_service
-        .set_company_processes(&mut *tx, id, &req, &current)
-        .await?;
-    tx.commit().await?;
-    Ok(Json(R::ok(out)))
-}
-
-/// `GET /outsource-companies/{id}/sent-parts`（2026-10-03 新增）—— 读端点
+/// `GET /outsource-companies/{id}/sent-parts` —— 读端点
 ///
 /// 2 段路径（`/{id}/sent-parts`），与 1 段的 `/{id}` 无 matchit 冲突。
-/// 此前本端点**根本没注册**，前端「外协对账」页恒 404（写侧 reconcile-update
-/// 一直存在，只是读不到数据）。
+/// 出参信封带 `outsource_company_id` + `outsource_company_name`，前端用它渲染页头，
+/// 不必再单独发一次 `GET /outsource-companies/{id}`。
 pub async fn list_company_sent_parts(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -262,46 +253,17 @@ pub async fn create_quote(
     Ok((StatusCode::CREATED, Json(R::ok(out))))
 }
 
-/// GET /outsource-quotes/{id} —— 读端点，acquire 不开事务
-pub async fn get_quote(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(id): Path<i64>,
-) -> Result<Json<R<OutsourceQuoteOut>>, AppError> {
-    let mut conn = state.pool.acquire().await?;
-    let out = state
-        .outsource_service
-        .get_quote(&mut *conn, id, &current)
-        .await?;
-    Ok(Json(R::ok(out)))
-}
-
-/// POST /outsource-quotes/{id}/update —— 纯写端点
-pub async fn update_quote(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(id): Path<i64>,
-    Json(req): Json<OutsourceQuoteUpdateRequest>,
-) -> Result<Json<R<OutsourceQuoteOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = state
-        .outsource_service
-        .update_quote(&mut *tx, id, &req, &current)
-        .await?;
-    tx.commit().await?;
-    Ok(Json(R::ok(out)))
-}
-
 /// POST /outsource-quotes/{id}/submit —— 纯写端点
 pub async fn submit_quote(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Path(id): Path<i64>,
+    Json(req): Json<OutsourceQuoteSubmitRequest>,
 ) -> Result<Json<R<OutsourceQuoteOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out = state
         .outsource_service
-        .submit_quote(&mut *tx, id, &current)
+        .submit_quote(&mut *tx, id, &req, &current)
         .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
@@ -350,21 +312,22 @@ pub async fn soft_delete_quote(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Path(id): Path<i64>,
+    Json(req): Json<OutsourceQuoteSoftDeleteRequest>,
 ) -> Result<Json<R<()>>, AppError> {
     let mut tx = state.pool.begin().await?;
     state
         .outsource_service
-        .soft_delete_quote(&mut *tx, id, &current)
+        .soft_delete_quote(&mut *tx, id, &req, &current)
         .await?;
     tx.commit().await?;
     Ok(Json(R::ok_empty()))
 }
 
-/// `GET /outsource-quotes/quotable-parts`（2026-10-03 新增）—— 读端点
+/// `GET /outsource-quotes/quotable-parts` —— 读端点
 ///
-/// ⚠️ **必须注册在 `quote_router()` 的 `/{id}` 之前**。此前本端点未注册，
-/// 请求被 `/{id}`（`Path<i64>`）吞掉 → `PathRejection` → 恒 400（前端报价一览页
-/// 每次进都报错、「新建报价」picker 恒空）。
+/// ⚠️ **必须注册在 `quote_router()` 的 `/{id}` 之前**。当前 `quote_router()` 里已
+/// **没有** `/{id}` 路由（2026-10-09 删除），这条约束随之失效 —— 但它是「将来谁
+/// 想加回一条 1 段静态路由」时的陷阱登记，故保留在注释里。
 pub async fn list_quotable_parts(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -428,25 +391,24 @@ pub fn company_router() -> Router<Arc<AppState>> {
         .route("/", get(list_companies).post(create_company))
         .route("/{id}/update", post(update_company))
         .route("/{id}/soft-delete", post(soft_delete_company))
-        .route("/{id}/processes", post(set_company_processes))
-        // 2026-10-03 新增：对账页 sent-parts（2 段路径，与 1 段 `/{id}` 无冲突）
+        // 对账页 sent-parts（2 段路径，与 1 段 `/{id}` 无冲突）
         .route("/{id}/sent-parts", get(list_company_sent_parts))
         .route("/{id}", get(get_company))
 }
 
 /// Quote 路由（挂载点 `/outsource-quotes`）
+///
+/// 2026-10-09 删除 `GET /{id}` 与 `POST /{id}/update`（前端零消费，硬切无 alias），
+/// 端点 **9 → 7**。删除后本 router 只剩 1 段静态 `/quotable-parts` 与 2 段
+/// `/{id}/*`，段数不同 ⇒ matchit 无同段位争用 ⇒ **注册顺序不再有硬约束**。
 pub fn quote_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", get(list_quotes).post(create_quote))
-        // 2026-10-03 新增：**静态段必须在 `/{id}` catch-all 之前注册**，否则
-        // `quotable-parts` 会被 `Path<i64>` 吞掉（400 PathRejection）。
         .route("/quotable-parts", get(list_quotable_parts))
-        .route("/{id}/update", post(update_quote))
         .route("/{id}/submit", post(submit_quote))
         .route("/{id}/approve", post(approve_quote))
         .route("/{id}/reject", post(reject_quote))
         .route("/{id}/soft-delete", post(soft_delete_quote))
-        .route("/{id}", get(get_quote))
 }
 
 /// Shipment 路由（挂载点 `/outsource-shipments`）

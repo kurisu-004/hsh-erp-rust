@@ -86,6 +86,10 @@ pub struct OutsourceInFlightListOut {
 /// 2026-10-03 新增（`GET /outsource-companies/{id}/sent-parts`）。**刻意不复用
 /// `OutsourceShipmentOut`**：后者是 reconcile-update 写端点的出参，主键字段叫
 /// `id`；本 VO 主键叫 `shipment_id`（前端行编辑端点入参按此名取）。
+///
+/// 2026-10-09 删 `quote_id` / `part_id` 两个字段：前端对账页两列都不存在（行编辑
+/// 端点的入参按 `shipment_id` 取，零件列展示的是 `part_drawing_no` / `part_name`
+/// 两个可读字段），后端留着的后果是同一份零件标识序列化两次且分叉。
 #[derive(Debug, Clone, Serialize)]
 pub struct OutsourceSentPartOut {
     /// `t_outsource_shipment.id`。
@@ -93,10 +97,6 @@ pub struct OutsourceSentPartOut {
     pub shipment_id: i64,
     /// shipment 行 OCC（reconcile-update 必传）。
     pub version: i32,
-    #[serde(serialize_with = "serialize_i64")]
-    pub quote_id: i64,
-    #[serde(serialize_with = "serialize_i64")]
-    pub part_id: i64,
     pub part_drawing_no: Option<String>,
     pub part_name: Option<String>,
     /// 客户路径：有 L1 拼 `L1 / L2`，否则仅 L2 名，缺客户为 `null`。
@@ -119,8 +119,18 @@ pub struct OutsourceSentPartOut {
     pub is_urgent: bool,
 }
 
+/// `GET /outsource-companies/{id}/sent-parts` 的分页信封。
+///
+/// 2026-10-09 加两个公司字段：前端对账页原先要额外发一次
+/// `GET /outsource-companies/{id}` 才能拿到公司名渲染页头。`outsource_company_id`
+/// 是请求 id 的回显（前端把它当行编辑时的 company 上下文），`outsource_company_name`
+/// **公司不存在 / 已软删时为 `null`** —— 端点本身不因公司缺失而 404（口径对齐
+/// `prod::queue` 的 `held_count` 容错风格），所以标题位需要能显示「未知公司」。
 #[derive(Debug, Clone, Serialize)]
 pub struct OutsourceSentPartListOut {
+    #[serde(serialize_with = "serialize_i64")]
+    pub outsource_company_id: i64,
+    pub outsource_company_name: Option<String>,
     pub items: Vec<OutsourceSentPartOut>,
     pub total: i64,
     pub limit: i64,

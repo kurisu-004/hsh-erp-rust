@@ -2,11 +2,10 @@
 //!
 //! 覆盖端点：
 //! - reconcile_update_shipment — 对账页更新 shipment（unit_price / quantity / is_billed）
-//! - list_company_sent_parts    — 2026-10-03 新增：对账页 sent-parts 一览
-//!   （`GET /outsource-companies/{id}/sent-parts`；此前路由未注册 → 前端 404）
-//! - list_in_flight             — 2026-10-03 新增：在途批次一览
-//!   （`GET /outsource-shipments/in-flight`；替代 part 域错形状的
-//!   `/parts/outsource-in-flight`）
+//! - list_company_sent_parts    — 对账页 sent-parts 一览
+//!   （`GET /outsource-companies/{id}/sent-parts`）
+//! - list_in_flight             — 在途批次一览
+//!   （`GET /outsource-shipments/in-flight`）
 //!
 //! ## 事务边界（2026-09-22 refactor 对齐 iam 范本）
 //! 事务移交 handler：service 仅业务逻辑，所有跨 repo 操作经 `repo: R`
@@ -24,7 +23,7 @@ use crate::modules::outsource::dto::{
     OutsourceInFlightListQuery, OutsourceSentPartListQuery, OutsourceShipmentReconcileUpdateRequest,
 };
 use crate::modules::outsource::model::TOutsourceShipment;
-use crate::modules::outsource::repo::OutsourceRepoTrait;
+use crate::modules::outsource::repo::{OutsourceRepoTrait, OutsourceSentPartFilter};
 use crate::modules::outsource::vo::{
     OutsourceInFlightItem, OutsourceInFlightListOut, OutsourceSentPartListOut,
     OutsourceSentPartOut, OutsourceShipmentOut,
@@ -33,7 +32,7 @@ use crate::shared::error::{AppError, code};
 
 use super::{
     DEFAULT_LIMIT, LIST_MAX_LIMIT, OutsourceService, format_price, join_customer_path,
-    keyword_pattern, not_found_shipment, parse_price, version_conflict,
+    keyword_pattern, not_found_shipment, parse_optional_snowflake, parse_price, version_conflict,
 };
 
 /// shipment_out：单条拼装（part / 客户 / process / company 批查 + 批次号补全）。
@@ -138,13 +137,21 @@ impl OutsourceService {
         shipment_out(&mut repo, fresh).await
     }
 
-    /// `GET /outsource-companies/{company_id}/sent-parts`（2026-10-03 新增）
+    /// `GET /outsource-companies/{company_id}/sent-parts`
     ///
     /// 角色与 `reconcile_update_shipment` 对齐（Manager / Clerk）——对账页能看
     /// 就能改，反之不成立。
     ///
     /// **防 N+1**：list SQL 已把 part / 客户 / 工序 / 批次号 JOIN 出来，service
-    /// 只做 Decimal 乘法与 VO 组装，不再逐行回查。
+    /// 只做 Decimal 乘法与 VO 组装，另加一次公司名补全（信封字段，前端渲染页头用），
+    /// 不再逐行回查。
+    ///
+    /// 2026-10-09：`keyword` 拆成 `drawing_no` / `name` 两个直连 ILIKE，并新增
+    /// `customer_id` / `process_id` / `is_billed` 三个精确维度。**省掉了三样东西**：
+    /// `part_keyword_search` 那条预搜索（`LIMIT 10000` 且无 `ORDER BY` ⇒ 触顶时静默
+    /// 返回非确定性子集，`total` 偏小）、配套的「给了 keyword 却零命中要早返回」分支
+    /// （SQL 谓词是 `($N::text IS NULL OR col ILIKE $N)` 形态，零命中天然就是零行，
+    /// 不需要 service 兜底）、以及两个 repo 方法里的 `part_ids_in` 形参。
     pub async fn list_company_sent_parts<R: OutsourceRepoTrait>(
         &self,
         mut repo: R,
@@ -159,9 +166,9 @@ impl OutsourceService {
             .clamp(1, LIST_MAX_LIMIT);
         let offset = query.offset.unwrap_or(0).max(0);
         // 排序列白名单归一化：**用户输入只在这里被映射成 3 个 token 之一**，
-        // 之后一律 bind 进 SQL（`CASE WHEN $7 = ...`），绝不拼进 SQL 文本。
-        // 2026-10-03：`to_ascii_uppercase` 后再 match，白名单**大小写不敏感**
-        // （`?sort_by=price` 与 `?sort_by=PRICE` 等价）。
+        // 之后一律 bind 进 SQL（`CASE WHEN $11 = ...`），绝不拼进 SQL 文本。
+        // `to_ascii_uppercase` 后再 match，白名单**大小写不敏感**
+        //（`?sort_by=price` 与 `?sort_by=PRICE` 等价）。
         let sort_by = match query
             .sort_by
             .as_deref()
@@ -184,58 +191,36 @@ impl OutsourceService {
             _ => "DESC",
         };
 
-        // keyword → part_ids（复用现成的 ILIKE 语义）。
-        let kw = query
-            .keyword
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        let part_ids_in: Vec<i64> = match kw {
-            Some(kw) => repo.part_keyword_search(kw).await?,
-            None => Vec::new(),
+        // 公司名补全（信封字段）：公司已软删 / 不存在时给 `null` —— 本端点不因公司
+        // 缺失而 404，前端标题位要能显示「未知公司」。
+        let outsource_company_name = repo
+            .company_map_name(&[company_id])
+            .await?
+            .into_iter()
+            .next()
+            .map(|(_, name)| name);
+
+        let drawing_no_pat = keyword_pattern(query.drawing_no.as_deref());
+        let name_pat = keyword_pattern(query.name.as_deref());
+        let filter = OutsourceSentPartFilter {
+            drawing_no: drawing_no_pat.as_deref(),
+            name: name_pat.as_deref(),
+            customer_id: parse_optional_snowflake(query.customer_id.as_deref(), "customer_id")?,
+            process_id: parse_optional_snowflake(query.process_id.as_deref(), "process_id")?,
+            is_billed: query.is_billed,
+            sent_from: query.sent_from,
+            sent_to: query.sent_to,
+            received_from: query.received_from,
+            received_to: query.received_to,
         };
-        // 2026-10-03：**给了 keyword 却零命中时必须在 service 层早返回**。SQL 谓词
-        // `AND (cardinality($2::bigint[]) = 0 OR s.part_id = ANY($2))` 里，空数组
-        // 让 `cardinality = 0` 成立、整个 keyword 条件被短路掉；不在这兜住，
-        // 「不存在的关键词」会返回该公司的全部 shipment（list 与 count 同时错）。
-        // SQL 谓词保持不变 —— 无 keyword 时 `cardinality = 0` 正是「不过滤」的
-        // 正确表达，语义由这里兜住。
-        if kw.is_some() && part_ids_in.is_empty() {
-            return Ok(OutsourceSentPartListOut {
-                items: vec![],
-                total: 0,
-                limit,
-                offset,
-            });
-        }
 
         let rows = repo
-            .shipment_list_for_company(
-                company_id,
-                &part_ids_in,
-                query.sent_from,
-                query.sent_to,
-                query.received_from,
-                query.received_to,
-                sort_by,
-                sort_dir,
-                limit,
-                offset,
-            )
+            .shipment_list_for_company(company_id, &filter, sort_by, sort_dir, limit, offset)
             .await?;
-        let total = repo
-            .shipment_count_for_company(
-                company_id,
-                &part_ids_in,
-                query.sent_from,
-                query.sent_to,
-                query.received_from,
-                query.received_to,
-            )
-            .await?;
+        let total = repo.shipment_count_for_company(company_id, &filter).await?;
 
-        // 2026-10-03：`unit_price` 解析失败用 `?` 传播（`create_quote` 同款），不
-        // 降级成 `Decimal::ZERO` —— 对账页上的「假 0.00 金额」是最坏的失败模式
+        // `unit_price` 解析失败用 `?` 传播（`create_quote` 同款），不降级成
+        // `Decimal::ZERO` —— 对账页上的「假 0.00 金额」是最坏的失败模式
         // （`total_price` 静默变 0，用户看不出是数据坏了）。该列 DB 侧是
         // `Numeric(12,2) NOT NULL`，正常不可达，是兜底闸门。
         let mut items = Vec::with_capacity(rows.len());
@@ -245,8 +230,6 @@ impl OutsourceService {
             items.push(OutsourceSentPartOut {
                 shipment_id: r.id,
                 version: r.version,
-                quote_id: r.quote_id,
-                part_id: r.part_id,
                 part_drawing_no: r.drawing_no,
                 part_name: r.name,
                 customer_path: join_customer_path(
@@ -268,6 +251,8 @@ impl OutsourceService {
         }
 
         Ok(OutsourceSentPartListOut {
+            outsource_company_id: company_id,
+            outsource_company_name,
             items,
             total,
             limit,

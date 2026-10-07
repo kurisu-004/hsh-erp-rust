@@ -23,7 +23,7 @@
 | 5 | POST | `/api/v2/prod/queue/auto-dispatch` | Manager + Clerk | `{ batch_ids?: string[] }` | `AutoDispatchResult` |
 | 6 | POST | `/api/v2/prod/queue/recall` | Manager + Clerk | `{ batch_id, version, note? }` | `RecallOut` |
 | 7 | POST | `/api/v2/prod/queue/refill` | **Manager 独占** | `{ worker_id, shelf_id }` | `RefillResult` |
-| 8 | POST | `/api/v2/prod/queue/move` | **Manager 独占** | `{ batch_id, from, to, note? }` | `MoveResult` |
+| 8 | POST | `/api/v2/prod/queue/move` | **Manager 独占** | `{ batch_id: string, version: number, from, to, note? }` | `MoveResult` |
 | 9 | POST | `/api/v2/prod/queue/auto-allocate` | **Manager 独占** | `{ process_id, shelf_id, mode, fill_ratio }` | `AutoAllocateResult` |
 
 - 全部返回统一信封 `R { code, message, data }`。
@@ -313,6 +313,7 @@ queue 域**整体不适用**域隔离护栏：它继承 worker_pool 的「经本
 7. **i64 字符串化**：所有雪花 id 仍是 JSON string，本仓不因本次改动变更该约定。
 8. **`max_held` 取值位置变更**：原从 `work_types[].max_held_batches` 按工种查，改从 `workers[].max_held` 按工人直接读。`max_held_batches` 未设置时后端返 0（不是 null）—— 展示「未设置上限」占位的逻辑需自行按 0 判断。
 9. **代码里残留的 `WORKER_POOL_*` WS 事件名不变**（`kind` 是 WS 协议的一部分，改它要同步 dashboard 域的白名单与前端 `AFFECTS_DASHBOARD`）。本域改的只是 URL 与类型名。
+10. **`POST /queue/move` 的 `version` 升为必填**（2026-10-09）：此前三个方向都由 service 用「本次事务里刚读到的 `batch.version`」当 `expected_version`，等价于**没有 OCC** —— 看板数据是 30s 缓存的快照，期间他人改过批次时「用户看到 5 件 → 实际移动 3 件」会静默成功。值取候选卡 / 持有卡的 `version`；漏传 → **HTTP 422 纯文本**（`version` 无 `#[serde(default)]`）。
 
 ### 8.4 已知偏差登记
 

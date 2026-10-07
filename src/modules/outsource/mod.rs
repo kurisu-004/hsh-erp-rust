@@ -68,6 +68,32 @@
 //! - router 工厂 5 → **4**：删 `sendable_router()`（`pool_router()` 已于上一条删除）；
 //!   保留 `company_router()` / `quote_router()` / `shipment_router()` /
 //!   `queue_router()`。
+//!
+//! 2026-10-09 公司 / 报价两域收敛（端点 **22 → 18**）：
+//! - `POST /outsource-companies/{id}/processes` **硬切删除**（无 alias），工序能力清单
+//!   的整体替换吸收进 `POST /{id}/update` 的 `process_ids`（三态：`None` 不动 /
+//!   `Some([])` 清空 / `Some([..])` 替换）。service 侧加了「目标集合 == 当前集合就跳过
+//!   重写」的守卫，否则「改个电话号码」也会 churn 整张 `t_outsource_company_process`。
+//! - `GET /outsource-quotes/{id}` 与 `POST /outsource-quotes/{id}/update` **硬切删除**
+//!   （无 alias，前端零消费），`OutsourceQuoteUpdateRequest` / repo 的 `quote_update`
+//!   一并删除。
+//! - 三条写端点补**必填 body `version`**：公司 `soft-delete`、报价 `submit` 与
+//!   `soft-delete` —— 此前都是 service 内部自读 version，等于用自己读到的值守自己的
+//!   乐观锁，`UPDATE … WHERE version = <刚读的>` 恒成立、守卫形同虚设。公司
+//!   `soft-delete` 的守卫顺序同步调整为**先 OCC（40901）后工序映射（21205）**。
+//! - 两个列表端点的 `keyword` 拆成 `drawing_no` / `name` 直连 ILIKE（并新增
+//!   `customer_id` / `process_id` / `is_billed` / `is_urgent` 维度）。原来的
+//!   `part_keyword_search` 预搜索带 `LIMIT 10000` 且无 `ORDER BY` ⇒ 触顶时静默返回
+//!   非确定性子集，还要靠 service 层一个易漏的「零命中早返回」兜底 —— 三样一起消失。
+//! - **补上报价一览的 `statuses` 筛选接线**（🔴 本轮最重要的修复）：SQL 与 repo 两层
+//!   早就支持，DTO 少字段 + service 恒传 `&[]`，前端发的 `statuses[]=…` 被 serde
+//!   忽略 ⇒ 状态筛选恒不生效，连角色默认筛选（MANAGER→`SUBMITTED` / CLERK→`DRAFT`）
+//!   也没生效。本轮只补 DTO 与 service 接线，SQL / repo 零改动。
+//! - VO 瘦身：`OutsourceCompanyOut` / `OutsourceCompanyWithProcessesOut` 各删两个时间
+//!   字段；`OutsourceCompanyProcessLinkOut` 删 `category` / `sort_order`；
+//!   `by-process` 换窄 VO `OutsourceCompanyOptionOut { id, name }`；`OutsourceSentPartOut`
+//!   删 `quote_id` / `part_id`，信封加 `outsource_company_id` / `outsource_company_name`。
+//! - `POST /outsource-companies` 出参 → `R<()>`（前端建完一律重拉列表）。
 
 pub mod board;
 pub mod dto;

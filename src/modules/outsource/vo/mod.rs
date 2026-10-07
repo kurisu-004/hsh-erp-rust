@@ -30,8 +30,8 @@ pub mod sendable;
 pub mod shipment;
 
 pub use company::{
-    OutsourceCompanyListOut, OutsourceCompanyOut, OutsourceCompanyProcessLinkOut,
-    OutsourceCompanyWithProcessesOut,
+    OutsourceCompanyListOut, OutsourceCompanyOptionOut, OutsourceCompanyOut,
+    OutsourceCompanyProcessLinkOut, OutsourceCompanyWithProcessesOut,
 };
 pub use queue::{
     OutsourceMoveResult, OutsourceQueueCandidate, OutsourceQueueCompany, OutsourceQueueHeldBatch,

@@ -23,6 +23,12 @@
 //! `../board/repo.rs::SQL_HELD_BY_PROCESS` 抽到这里：看板在途卡的 `receive_next_*`
 //! 与移动写端点省略 `next_process_id` 时的推导问的是同一个事实，两处各写一份必然
 //! 分叉（前端看板上显示「可免填」、写端点却拒收，或反之）。
+//!
+//! 同日 `OutsourceQuoteRepo::update` 删除（`POST /outsource-quotes/{id}/update`
+//! 硬切下线，前端零消费）；报价一览与对账页的 `keyword` 预搜索（`part_keyword_search`）
+//! 一并删除 —— 两处的 `keyword` 都改成 `drawing_no` / `name` 直连 ILIKE 谓词，
+//! `p.drawing_no` / `p.name` 在各自的 SQL 里本来就已 SELECT ⇒ **零 JOIN 改动**，
+//! 省掉的是 `LIMIT 10000` 无 `ORDER BY` 的静默截断风险与配套的「零命中早返回」守卫。
 
 use sqlx::PgExecutor;
 
@@ -31,7 +37,9 @@ use super::super::model::{
     NewOutsourceShipment, TOutsourceCompany, TOutsourceCompanyProcess, TOutsourceQuote,
     TOutsourceQuoteEvent, TOutsourceShipment,
 };
-use super::{OutsourceInFlightRow, OutsourceQuotableRow, OutsourceSentPartRow};
+use super::{
+    OutsourceInFlightRow, OutsourceQuotableRow, OutsourceSentPartFilter, OutsourceSentPartRow,
+};
 
 // ===========================================================================
 // Company
@@ -391,38 +399,57 @@ impl OutsourceQuoteRepo {
         part_id: Option<i64>,
         part_ids_in: &[i64],
         outsource_company_id: Option<i64>,
+        drawing_no_pat: Option<&str>,
+        name_pat: Option<&str>,
+        is_urgent: Option<bool>,
         sort_by: &str,
         sort_dir: &str,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<TOutsourceQuote>, sqlx::Error> {
         // 单一固定 ORDER BY（避免动态 SQL 字符串）：用 case 表达式选列
+        //
+        // 2026-10-09：`keyword` 拆成 `drawing_no` / `name` 两个直连 ILIKE 的谓词，
+        // 外加 `is_urgent` 精确谓词。为此加了一条 `LEFT JOIN t_part p` ——
+        // **LEFT 而非 INNER**：不传任何零件侧筛选时它必须恒等空操作（零件已软删 /
+        // part_id 悬空的存量报价仍要出现在一览里）；传了筛选时谓词 `p.col …` 在 NULL 行
+        // 上求值为 NULL、不成立，行为与 INNER JOIN 一致。
+        // JOIN 要求给 `t_outsource_quote` 起别名 `q`：两表都有 `id` / `deleted_at`
+        // 等同名列，不加前缀的 `SELECT id` / `WHERE deleted_at IS NULL` 会被 PG 判成
+        // ambiguous 而 42703。
         sqlx::query_as::<_, TOutsourceQuote>(
-            "SELECT id, part_id, outsource_company_id, process_id, price, note, status, \
-             submitted_at, reviewed_at, review_note, version, \
-             created_at, created_by, updated_at, updated_by, deleted_at \
-             FROM t_outsource_quote \
-             WHERE deleted_at IS NULL \
-               AND ($1::text IS NULL OR status = $1) \
-               AND (cardinality($2::text[]) = 0 OR status = ANY($2)) \
-               AND ($3::bigint IS NULL OR part_id = $3) \
-               AND (cardinality($4::bigint[]) = 0 OR part_id = ANY($4)) \
-               AND ($5::bigint IS NULL OR outsource_company_id = $5) \
+            "SELECT q.id, q.part_id, q.outsource_company_id, q.process_id, q.price, q.note, q.status, \
+             q.submitted_at, q.reviewed_at, q.review_note, q.version, \
+             q.created_at, q.created_by, q.updated_at, q.updated_by, q.deleted_at \
+             FROM t_outsource_quote q \
+             LEFT JOIN t_part p ON p.id = q.part_id \
+             WHERE q.deleted_at IS NULL \
+               AND ($1::text IS NULL OR q.status = $1) \
+               AND (cardinality($2::text[]) = 0 OR q.status = ANY($2)) \
+               AND ($3::bigint IS NULL OR q.part_id = $3) \
+               AND (cardinality($4::bigint[]) = 0 OR q.part_id = ANY($4)) \
+               AND ($5::bigint IS NULL OR q.outsource_company_id = $5) \
+               AND ($6::text IS NULL OR p.drawing_no ILIKE $6) \
+               AND ($7::text IS NULL OR p.name ILIKE $7) \
+               AND ($8::boolean IS NULL OR p.is_urgent = $8) \
              ORDER BY \
-               CASE WHEN $6::text = 'PRICE' AND $7::text = 'DESC' THEN price END DESC NULLS LAST, \
-               CASE WHEN $6::text = 'PRICE' AND $7::text <> 'DESC' THEN price END ASC NULLS LAST, \
-               CASE WHEN $6::text = 'REVIEWED_AT' AND $7::text = 'ASC' THEN reviewed_at END ASC NULLS LAST, \
-               CASE WHEN $6::text = 'REVIEWED_AT' AND $7::text <> 'ASC' THEN reviewed_at END DESC NULLS LAST, \
-               CASE WHEN $6::text = 'CREATED_AT' AND $7::text = 'ASC' THEN created_at END ASC, \
-               created_at DESC, \
-               id DESC \
-             LIMIT $8 OFFSET $9",
+               CASE WHEN $9::text = 'PRICE' AND $10::text = 'DESC' THEN q.price END DESC NULLS LAST, \
+               CASE WHEN $9::text = 'PRICE' AND $10::text <> 'DESC' THEN q.price END ASC NULLS LAST, \
+               CASE WHEN $9::text = 'REVIEWED_AT' AND $10::text = 'ASC' THEN q.reviewed_at END ASC NULLS LAST, \
+               CASE WHEN $9::text = 'REVIEWED_AT' AND $10::text <> 'ASC' THEN q.reviewed_at END DESC NULLS LAST, \
+               CASE WHEN $9::text = 'CREATED_AT' AND $10::text = 'ASC' THEN q.created_at END ASC, \
+               q.created_at DESC, \
+               q.id DESC \
+             LIMIT $11 OFFSET $12",
         )
         .bind(status)
         .bind(statuses)
         .bind(part_id)
         .bind(part_ids_in)
         .bind(outsource_company_id)
+        .bind(drawing_no_pat)
+        .bind(name_pat)
+        .bind(is_urgent)
         .bind(sort_by)
         .bind(sort_dir)
         .bind(limit)
@@ -439,21 +466,31 @@ impl OutsourceQuoteRepo {
         part_id: Option<i64>,
         part_ids_in: &[i64],
         outsource_company_id: Option<i64>,
+        drawing_no_pat: Option<&str>,
+        name_pat: Option<&str>,
+        is_urgent: Option<bool>,
     ) -> Result<i64, sqlx::Error> {
         let n: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM t_outsource_quote \
-             WHERE deleted_at IS NULL \
-               AND ($1::text IS NULL OR status = $1) \
-               AND (cardinality($2::text[]) = 0 OR status = ANY($2)) \
-               AND ($3::bigint IS NULL OR part_id = $3) \
-               AND (cardinality($4::bigint[]) = 0 OR part_id = ANY($4)) \
-               AND ($5::bigint IS NULL OR outsource_company_id = $5)",
+            "SELECT COUNT(*)::bigint FROM t_outsource_quote q \
+             LEFT JOIN t_part p ON p.id = q.part_id \
+             WHERE q.deleted_at IS NULL \
+               AND ($1::text IS NULL OR q.status = $1) \
+               AND (cardinality($2::text[]) = 0 OR q.status = ANY($2)) \
+               AND ($3::bigint IS NULL OR q.part_id = $3) \
+               AND (cardinality($4::bigint[]) = 0 OR q.part_id = ANY($4)) \
+               AND ($5::bigint IS NULL OR q.outsource_company_id = $5) \
+               AND ($6::text IS NULL OR p.drawing_no ILIKE $6) \
+               AND ($7::text IS NULL OR p.name ILIKE $7) \
+               AND ($8::boolean IS NULL OR p.is_urgent = $8)",
         )
         .bind(status)
         .bind(statuses)
         .bind(part_id)
         .bind(part_ids_in)
         .bind(outsource_company_id)
+        .bind(drawing_no_pat)
+        .bind(name_pat)
+        .bind(is_urgent)
         .fetch_one(executor)
         .await?;
         Ok(n)
@@ -483,37 +520,11 @@ impl OutsourceQuoteRepo {
         .await
     }
 
-    pub async fn update<'e, E: PgExecutor<'e>>(
-        executor: E,
-        id: i64,
-        version: i32,
-        price: Option<rust_decimal::Decimal>,
-        note: Option<Option<&str>>,
-        updated_by: i64,
-    ) -> Result<u64, sqlx::Error> {
-        let set_note = note.is_some();
-        let new_note = note.flatten();
-        let r = sqlx::query(
-            "UPDATE t_outsource_quote SET \
-             price      = COALESCE($3::numeric, price), \
-             note       = CASE WHEN $4::bool THEN $5::varchar ELSE note END, \
-             version    = version + 1, \
-             updated_at = now(), \
-             updated_by = $6 \
-             WHERE id = $1 AND version = $2 AND deleted_at IS NULL",
-        )
-        .bind(id)
-        .bind(version)
-        .bind(price)
-        .bind(set_note)
-        .bind(new_note)
-        .bind(updated_by)
-        .execute(executor)
-        .await?;
-        Ok(r.rows_affected())
-    }
-
     /// 提交：DRAFT → SUBMITTED，写 submitted_at。
+    ///
+    /// ⚠️ `version` 形参**必须来自调用方**（见 `service/quote.rs::submit_quote`）。
+    /// 若像本轮之前那样让 service 先 `quote_get_by_id` 读到当前 version 再喂进来，
+    /// `WHERE id AND version = <刚读到的>` 在同一行上恒成立 ⇒ 守卫形同虚设。
     pub async fn submit<'e, E: PgExecutor<'e>>(
         executor: E,
         id: i64,
@@ -777,59 +788,70 @@ impl OutsourceShipmentRepo {
     /// 2026-10-03：原名 `count_reconciliation_for_company`，是零调用方的孤儿
     /// （前端子页从未落地）。`GET /outsource-companies/{id}/sent-parts` 补齐时
     /// 收编为正式 count，改名 `count_for_company` 与 `list_for_company` 对齐。
+    ///
+    /// ⚠️ 本方法与 `list_for_company` 各自有一份**形状相同的谓词串**（形参收成
+    /// `OutsourceSentPartFilter` 后仍各写一遍，因为 list 还要排序列）。加筛选维度时
+    /// 必须两处同改 —— 漏改 count 的症状是 `items` 少了一截而 `total` 不变，
+    /// 分页条数与总数对不上。
     pub async fn count_for_company<'e, E: PgExecutor<'e>>(
         executor: E,
         company_id: i64,
-        part_ids_in: &[i64],
-        sent_from: Option<chrono::NaiveDateTime>,
-        sent_to: Option<chrono::NaiveDateTime>,
-        received_from: Option<chrono::NaiveDateTime>,
-        received_to: Option<chrono::NaiveDateTime>,
+        filter: &OutsourceSentPartFilter<'_>,
     ) -> Result<i64, sqlx::Error> {
         let n: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM t_outsource_shipment \
-             WHERE deleted_at IS NULL AND status IN ('OUTSOURCING', 'RECEIVED') \
-               AND outsource_company_id = $1 \
-               AND (cardinality($2::bigint[]) = 0 OR part_id = ANY($2)) \
-               AND ($3::timestamp IS NULL OR sent_at >= $3) \
-               AND ($4::timestamp IS NULL OR sent_at <= $4) \
-               AND ($5::timestamp IS NULL OR received_at >= $5) \
-               AND ($6::timestamp IS NULL OR received_at <= $6)",
+            "SELECT COUNT(*)::bigint FROM t_outsource_shipment s \
+             LEFT JOIN t_part p ON p.id = s.part_id \
+             WHERE s.deleted_at IS NULL AND s.status IN ('OUTSOURCING', 'RECEIVED') \
+               AND s.outsource_company_id = $1 \
+               AND ($2::text IS NULL OR p.drawing_no ILIKE $2) \
+               AND ($3::text IS NULL OR p.name ILIKE $3) \
+               AND ($4::bigint IS NULL OR p.customer_id = $4) \
+               AND ($5::bigint IS NULL OR s.process_id = $5) \
+               AND ($6::boolean IS NULL OR s.is_billed = $6) \
+               AND ($7::timestamp IS NULL OR s.sent_at >= $7) \
+               AND ($8::timestamp IS NULL OR s.sent_at <= $8) \
+               AND ($9::timestamp IS NULL OR s.received_at >= $9) \
+               AND ($10::timestamp IS NULL OR s.received_at <= $10)",
         )
         .bind(company_id)
-        .bind(part_ids_in)
-        .bind(sent_from)
-        .bind(sent_to)
-        .bind(received_from)
-        .bind(received_to)
+        .bind(filter.drawing_no)
+        .bind(filter.name)
+        .bind(filter.customer_id)
+        .bind(filter.process_id)
+        .bind(filter.is_billed)
+        .bind(filter.sent_from)
+        .bind(filter.sent_to)
+        .bind(filter.received_from)
+        .bind(filter.received_to)
         .fetch_one(executor)
         .await?;
         Ok(n)
     }
 
-    /// 2026-10-03 新增：对账页 list（行 = shipment，JOIN 补齐展示字段）。
+    /// 对账页 list（行 = shipment，JOIN 补齐展示字段）。
     ///
     /// 展示字段（part 图号/名称/加急、客户路径、工序名、批次号）**一次 JOIN 拿完**，
     /// service 层不再逐行回查（防 N+1）。
     ///
-    /// `sort_by` / `sort_dir` 以**归一化后的白名单 token** 走 bind（`$7` / `$8`），
+    /// `sort_by` / `sort_dir` 以**归一化后的白名单 token** 走 bind（`$11` / `$12`），
     /// 用 CASE 表达式选列 —— 用户输入永远不进 SQL 文本。
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// 2026-10-09：投影去掉 `s.quote_id` / `s.part_id`（无消费方），WHERE 去掉
+    /// `s.part_id = ANY($2)` 的 part_ids 预搜索，换成 `drawing_no` / `name` 两个
+    /// 直连 ILIKE + `customer_id` / `process_id` / `is_billed` 三个精确谓词。
+    /// `LEFT JOIN t_part p` 本就存在（取 `drawing_no` / `name` / `is_urgent`），
+    /// 故 `p.customer_id` 的谓词是**零 JOIN 改动**。
     pub async fn list_for_company<'e, E: PgExecutor<'e>>(
         executor: E,
         company_id: i64,
-        part_ids_in: &[i64],
-        sent_from: Option<chrono::NaiveDateTime>,
-        sent_to: Option<chrono::NaiveDateTime>,
-        received_from: Option<chrono::NaiveDateTime>,
-        received_to: Option<chrono::NaiveDateTime>,
+        filter: &OutsourceSentPartFilter<'_>,
         sort_by: &str,
         sort_dir: &str,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<OutsourceSentPartRow>, sqlx::Error> {
         sqlx::query_as::<_, OutsourceSentPartRow>(
-            "SELECT s.id, s.version, s.quote_id, s.part_id, \
+            "SELECT s.id, s.version, \
                     p.drawing_no, p.name, p.is_urgent, \
                     c.name AS customer_name, cp.name AS parent_customer_name, \
                     s.process_id, pr.name AS process_name, \
@@ -844,27 +866,35 @@ impl OutsourceShipmentRepo {
              LEFT JOIN t_customer cp ON cp.id = c.parent_id AND cp.deleted_at IS NULL \
              WHERE s.deleted_at IS NULL AND s.status IN ('OUTSOURCING', 'RECEIVED') \
                AND s.outsource_company_id = $1 \
-               AND (cardinality($2::bigint[]) = 0 OR s.part_id = ANY($2)) \
-               AND ($3::timestamp IS NULL OR s.sent_at >= $3) \
-               AND ($4::timestamp IS NULL OR s.sent_at <= $4) \
-               AND ($5::timestamp IS NULL OR s.received_at >= $5) \
-               AND ($6::timestamp IS NULL OR s.received_at <= $6) \
+               AND ($2::text IS NULL OR p.drawing_no ILIKE $2) \
+               AND ($3::text IS NULL OR p.name ILIKE $3) \
+               AND ($4::bigint IS NULL OR p.customer_id = $4) \
+               AND ($5::bigint IS NULL OR s.process_id = $5) \
+               AND ($6::boolean IS NULL OR s.is_billed = $6) \
+               AND ($7::timestamp IS NULL OR s.sent_at >= $7) \
+               AND ($8::timestamp IS NULL OR s.sent_at <= $8) \
+               AND ($9::timestamp IS NULL OR s.received_at >= $9) \
+               AND ($10::timestamp IS NULL OR s.received_at <= $10) \
              ORDER BY \
-               CASE WHEN $7::text = 'PRICE' AND $8::text = 'ASC' THEN s.unit_price END ASC NULLS LAST, \
-               CASE WHEN $7::text = 'PRICE' AND $8::text <> 'ASC' THEN s.unit_price END DESC NULLS LAST, \
-               CASE WHEN $7::text = 'RECEIVED_AT' AND $8::text = 'ASC' THEN s.received_at END ASC NULLS LAST, \
-               CASE WHEN $7::text = 'RECEIVED_AT' AND $8::text <> 'ASC' THEN s.received_at END DESC NULLS LAST, \
-               CASE WHEN $7::text = 'SENT_AT' AND $8::text = 'ASC' THEN s.sent_at END ASC, \
-               CASE WHEN $7::text = 'SENT_AT' AND $8::text <> 'ASC' THEN s.sent_at END DESC, \
+               CASE WHEN $11::text = 'PRICE' AND $12::text = 'ASC' THEN s.unit_price END ASC NULLS LAST, \
+               CASE WHEN $11::text = 'PRICE' AND $12::text <> 'ASC' THEN s.unit_price END DESC NULLS LAST, \
+               CASE WHEN $11::text = 'RECEIVED_AT' AND $12::text = 'ASC' THEN s.received_at END ASC NULLS LAST, \
+               CASE WHEN $11::text = 'RECEIVED_AT' AND $12::text <> 'ASC' THEN s.received_at END DESC NULLS LAST, \
+               CASE WHEN $11::text = 'SENT_AT' AND $12::text = 'ASC' THEN s.sent_at END ASC, \
+               CASE WHEN $11::text = 'SENT_AT' AND $12::text <> 'ASC' THEN s.sent_at END DESC, \
                s.id DESC \
-             LIMIT $9 OFFSET $10",
+             LIMIT $13 OFFSET $14",
         )
         .bind(company_id)
-        .bind(part_ids_in)
-        .bind(sent_from)
-        .bind(sent_to)
-        .bind(received_from)
-        .bind(received_to)
+        .bind(filter.drawing_no)
+        .bind(filter.name)
+        .bind(filter.customer_id)
+        .bind(filter.process_id)
+        .bind(filter.is_billed)
+        .bind(filter.sent_from)
+        .bind(filter.sent_to)
+        .bind(filter.received_from)
+        .bind(filter.received_to)
         .bind(sort_by)
         .bind(sort_dir)
         .bind(limit)

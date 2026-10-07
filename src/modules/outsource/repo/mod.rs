@@ -79,8 +79,6 @@ pub use sql::{
 pub struct OutsourceSentPartRow {
     pub id: i64,
     pub version: i32,
-    pub quote_id: i64,
-    pub part_id: i64,
     pub drawing_no: Option<String>,
     pub name: Option<String>,
     pub is_urgent: bool,
@@ -98,6 +96,33 @@ pub struct OutsourceSentPartRow {
     pub received_at: Option<chrono::NaiveDateTime>,
     pub status: String,
     pub is_billed: bool,
+}
+
+/// `GET /outsource-companies/{id}/sent-parts` 的筛选条件（list 与 count 共用一份）。
+///
+/// 2026-10-09 新增。此前这两个方法各有 6~10 个平铺形参（list 带 `sort_by` /
+/// `sort_dir` / `limit` / `offset` 共 10 个）并挂 `#[allow(clippy::too_many_arguments)]`，
+/// 而 **list 与 count 各自重复同一串筛选谓词** —— 平铺形参下两处的 WHERE 段序号
+/// 各自数一遍，加一个筛选就要改两遍且极易错位（错位时 PG 报参数类型不匹配，属
+/// 「响亮的失败」，但仍要靠人发现）。收成结构体后：谓词只在各自 SQL 里出现一次，
+/// 形参从 10 个降到 7 个，`too_many_arguments` 的 allow 也一并撤掉。
+///
+/// **`drawing_no` / `name` 收的是已归一化好的 `%kw%` 通配串**（service 用
+/// `keyword_pattern` 生成），repo 层不做 trim / 判空 —— 与本文件其余 `keyword_pat`
+/// 形参的约定一致：通配串的构造是 service 的责任。
+///
+/// 所有字段都是「缺省 = 不过滤」，SQL 侧一律写成 `($N::text IS NULL OR col …)` 形态。
+#[derive(Debug, Clone, Default)]
+pub struct OutsourceSentPartFilter<'a> {
+    pub drawing_no: Option<&'a str>,
+    pub name: Option<&'a str>,
+    pub customer_id: Option<i64>,
+    pub process_id: Option<i64>,
+    pub is_billed: Option<bool>,
+    pub sent_from: Option<NaiveDateTime>,
+    pub sent_to: Option<NaiveDateTime>,
+    pub received_from: Option<NaiveDateTime>,
+    pub received_to: Option<NaiveDateTime>,
 }
 
 /// `GET /outsource-shipments/in-flight` 行。
@@ -145,16 +170,21 @@ pub struct OutsourceQuotableRow {
 /// outsource 域数据访问胖 trait。
 ///
 /// 单 trait 合并 6 ZST（company + company_process + quote + quote_event + shipment，
-/// 外加 quotable 读模型 ZST），共 45 方法：
-/// company 8 + company_process 4 + quote 13 + quote_event 1 + shipment 9
-/// + quotable 2 + 跨域 helper 8。
+/// 外加 quotable 读模型 ZST），共 48 方法：
+/// company 8 + company_process 4 + quote 12 + quote_event 1 + shipment 9
+/// + quotable 2 + 跨域 helper 12。
 ///
-/// 2026-10-09 两轮缩掉 7 个方法：
+/// 2026-10-09 两轮缩掉 11 个方法：
 /// - `pool_*` 4 个（`/outsource-pool/{counts,state,{id}}` 下线，SQL 搬进
 ///   `../board/repo.rs`）与 `sendable_list_by_process`（看板候选列现在由
 ///   `board/repo.rs` 直接拼投影，不再经 trait 回传本文件的行结构）；
 /// - `sendable_list` / `sendable_count` 2 个（`GET /outsource-sendable` 下线 —— 它是
-///   看板候选列的分页子集，候选侧谓词 SQL 保留在 `sql.rs` 供看板自取）。
+///   看板候选列的分页子集，候选侧谓词 SQL 保留在 `sql.rs` 供看板自取）；
+/// - `quote_update`（`POST /outsource-quotes/{id}/update` 下线，前端零消费 —— 报价
+///   的价格 / 备注改法由「新建一条 DRAFT」与审批流承担）；
+/// - `part_keyword_search`（报价一览与对账页的 `keyword` 均已拆成直连 ILIKE，见
+///   `OutsourceSentPartFilter`）与 `process_map_full`（`OutsourceCompanyProcessLinkOut`
+/// 删掉 `category` 后与 `process_map_short` 逐字同形，合并）。
 ///
 /// 本文件因此不再有任何「候选侧」行结构（`OutsourceSendableRow` 随之删除）——
 /// 看板侧的对应行结构是 `board/repo.rs::CandidateRow`。
@@ -260,6 +290,9 @@ pub trait OutsourceRepoTrait: Send {
         part_id: Option<i64>,
         part_ids_in: &'a [i64],
         outsource_company_id: Option<i64>,
+        drawing_no_pat: Option<&'a str>,
+        name_pat: Option<&'a str>,
+        is_urgent: Option<bool>,
         sort_by: &'a str,
         sort_dir: &'a str,
         limit: i64,
@@ -273,19 +306,14 @@ pub trait OutsourceRepoTrait: Send {
         part_id: Option<i64>,
         part_ids_in: &'a [i64],
         outsource_company_id: Option<i64>,
+        drawing_no_pat: Option<&'a str>,
+        name_pat: Option<&'a str>,
+        is_urgent: Option<bool>,
     ) -> Result<i64, sqlx::Error>;
     async fn quote_create(
         &mut self,
         new: NewOutsourceQuote,
     ) -> Result<TOutsourceQuote, sqlx::Error>;
-    async fn quote_update<'a>(
-        &mut self,
-        id: i64,
-        version: i32,
-        price: Option<Decimal>,
-        note: Option<Option<&'a str>>,
-        updated_by: i64,
-    ) -> Result<u64, sqlx::Error>;
     async fn quote_submit(
         &mut self,
         id: i64,
@@ -357,26 +385,18 @@ pub trait OutsourceRepoTrait: Send {
         is_billed: Option<bool>,
         updated_by: i64,
     ) -> Result<u64, sqlx::Error>;
-    #[allow(clippy::too_many_arguments)]
     async fn shipment_count_for_company<'a>(
         &mut self,
         company_id: i64,
-        part_ids_in: &'a [i64],
-        sent_from: Option<NaiveDateTime>,
-        sent_to: Option<NaiveDateTime>,
-        received_from: Option<NaiveDateTime>,
-        received_to: Option<NaiveDateTime>,
+        filter: &OutsourceSentPartFilter<'a>,
     ) -> Result<i64, sqlx::Error>;
-    /// 2026-10-03 新增：对账页 list（与 `shipment_count_for_company` 同 WHERE 口径）。
-    #[allow(clippy::too_many_arguments)]
+    /// 对账页 list（`OutsourceSentPartRow`），筛选口径与 `shipment_count_for_company`
+    /// 共用同一个 `filter` 值。`sort_by` / `sort_dir` 是 service 归一化后的白名单
+    /// token。
     async fn shipment_list_for_company<'a>(
         &mut self,
         company_id: i64,
-        part_ids_in: &'a [i64],
-        sent_from: Option<NaiveDateTime>,
-        sent_to: Option<NaiveDateTime>,
-        received_from: Option<NaiveDateTime>,
-        received_to: Option<NaiveDateTime>,
+        filter: &OutsourceSentPartFilter<'a>,
         sort_by: &'a str,
         sort_dir: &'a str,
         limit: i64,
@@ -418,10 +438,7 @@ pub trait OutsourceRepoTrait: Send {
 
     /// `t_part` 按 id 查存在性（仅未软删）。供 create_quote 校验 part_id。
     async fn part_exists(&mut self, part_id: i64) -> Result<bool, sqlx::Error>;
-    /// `t_part` 按关键字模糊搜（drawing_no OR name）。供 list_quotes 关键字过滤。
-    async fn part_keyword_search<'a>(&mut self, keyword: &'a str) -> Result<Vec<i64>, sqlx::Error>;
-    /// `t_part` 按客户子树取零件 id（2026-10-04 新增）。供 list_quotes 的
-    /// `customer_id` 过滤展开。
+    /// `t_part` 按客户子树取零件 id。供 list_quotes 的 `customer_id` 过滤展开。
     ///
     /// 谓词形状与已下线的 `GET /outsource-sendable` 的 `customer_id` 谓词**逐字同形**
     /// （`customer_id = $1 OR customer_id IN (直接子客户)`；该端点 2026-10-09 下线时其
@@ -439,15 +456,15 @@ pub trait OutsourceRepoTrait: Send {
     /// 「按自己查得到、按父亲查不到」。零件可见性不受客户 ACL 约束故不是权限漏洞，
     /// 业务上客户一旦被引用就被 `BIZ_CUSTOMER_IN_USE` 挡住软删，几乎不可达。
     ///
-    /// **`LIMIT 10000` 的依据与已知取舍**（2026-10-04 review 第 1 轮登记）：这个数字
-    /// 是从 `part_keyword_search` 抄来的（那边要的是「万级关键词结果求交」，两者在
-    /// service 层求交），**与「某客户子树的零件数」没有因果关系**，纯形式一致。实际
-    /// 余量：全库 `t_part` 1874 行（2026-10-04 实测），所以任何单棵子树的规模上界就是
-    /// 全库 1874 ⇒ **最坏情况余量也有 5 倍以上**（10000 / 1874 ≈ 5.3），实测中单棵
-    /// 子树只是全库的一个零头，今天不可能截断。但 ⚠️ 本查询**没有 `ORDER BY`** ⇒ 一旦
-    /// 真的触顶，返回的是**任意 10000 条**（非确定性子集、同一请求两次可能不同），
-    /// `total` 偏小且零命中守卫不触发 ⇒ 静默少报。已知取舍，本轮不改成 count+warn、
-    /// 不加 `ORDER BY`（属计划外改动）。
+    /// **`LIMIT 10000` 的依据与已知取舍**：这个数字是本域唯一还需要「万级 id 集合
+    /// 再回筛」的查询（`t_outsource_quote` 的 base 表没有零件列，`drawing_no` / `name`
+    /// 只能直连 `t_part` ILIKE，但「客户子树」只能展开成 id 集合），**与「某客户子树的
+    /// 零件数」没有因果关系**，纯形式一致。实际余量：全库 `t_part` 1874 行（2026-10-04
+    /// 实测），所以任何单棵子树的规模上界就是全库 1874 ⇒ **最坏情况余量也有 5 倍以上**
+    /// （10000 / 1874 ≈ 5.3），实测中单棵子树只是全库的一个零头，今天不可能截断。但 ⚠️
+    /// 本查询**没有 `ORDER BY`** ⇒ 一旦真的触顶，返回的是**任意 10000 条**（非确定性子集、
+    /// 同一请求两次可能不同），`total` 偏小且零命中守卫不触发 ⇒ 静默少报。已知取舍，本轮
+    /// 不改成 count+warn、不加 `ORDER BY`（属计划外改动）。
     async fn part_ids_by_customer(&mut self, customer_id: i64) -> Result<Vec<i64>, sqlx::Error>;
     /// `t_process` 按 id 查 category。供 create_quote 校验 OUTSOURCE 类别。
     async fn process_get_category(
@@ -473,13 +490,10 @@ pub trait OutsourceRepoTrait: Send {
         &mut self,
         process_id: i64,
     ) -> Result<Option<bool>, sqlx::Error>;
-    /// `t_process` 按 ids 查 `(id, code, name, category)`（仅未软删）。
-    /// 供 build_with_processes 与 quote_out_many 使用。
-    async fn process_map_full<'a>(
-        &mut self,
-        process_ids: &'a [i64],
-    ) -> Result<Vec<(i64, String, String, String)>, sqlx::Error>;
-    /// `t_process` 按 ids 查 `(id, code, name)`（仅未软删）。供 quote_out_many。
+    /// `t_process` 按 ids 查 `(id, code, name)`（仅未软删）。供 `build_with_processes`
+    /// 与 `quote_out_many` 使用。2026-10-09 吸收 `process_map_full`（那方法是
+    /// `(id, code, name, category)` 四元组，多出来的 `category` 只喂给已删除的
+    /// `OutsourceCompanyProcessLinkOut::category`）。
     async fn process_map_short<'a>(
         &mut self,
         process_ids: &'a [i64],
@@ -707,6 +721,9 @@ impl OutsourceRepoTrait for &mut PgConnection {
         part_id: Option<i64>,
         part_ids_in: &'b [i64],
         outsource_company_id: Option<i64>,
+        drawing_no_pat: Option<&'b str>,
+        name_pat: Option<&'b str>,
+        is_urgent: Option<bool>,
         sort_by: &'b str,
         sort_dir: &'b str,
         limit: i64,
@@ -719,6 +736,9 @@ impl OutsourceRepoTrait for &mut PgConnection {
             part_id,
             part_ids_in,
             outsource_company_id,
+            drawing_no_pat,
+            name_pat,
+            is_urgent,
             sort_by,
             sort_dir,
             limit,
@@ -735,6 +755,9 @@ impl OutsourceRepoTrait for &mut PgConnection {
         part_id: Option<i64>,
         part_ids_in: &'b [i64],
         outsource_company_id: Option<i64>,
+        drawing_no_pat: Option<&'b str>,
+        name_pat: Option<&'b str>,
+        is_urgent: Option<bool>,
     ) -> Result<i64, sqlx::Error> {
         OutsourceQuoteRepo::count_with_filters(
             &mut **self,
@@ -743,6 +766,9 @@ impl OutsourceRepoTrait for &mut PgConnection {
             part_id,
             part_ids_in,
             outsource_company_id,
+            drawing_no_pat,
+            name_pat,
+            is_urgent,
         )
         .await
     }
@@ -752,17 +778,6 @@ impl OutsourceRepoTrait for &mut PgConnection {
         new: NewOutsourceQuote,
     ) -> Result<TOutsourceQuote, sqlx::Error> {
         OutsourceQuoteRepo::create(&mut **self, new).await
-    }
-
-    async fn quote_update<'b>(
-        &mut self,
-        id: i64,
-        version: i32,
-        price: Option<Decimal>,
-        note: Option<Option<&'b str>>,
-        updated_by: i64,
-    ) -> Result<u64, sqlx::Error> {
-        OutsourceQuoteRepo::update(&mut **self, id, version, price, note, updated_by).await
     }
 
     async fn quote_submit(
@@ -884,37 +899,18 @@ impl OutsourceRepoTrait for &mut PgConnection {
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn shipment_count_for_company<'b>(
         &mut self,
         company_id: i64,
-        part_ids_in: &'b [i64],
-        sent_from: Option<NaiveDateTime>,
-        sent_to: Option<NaiveDateTime>,
-        received_from: Option<NaiveDateTime>,
-        received_to: Option<NaiveDateTime>,
+        filter: &OutsourceSentPartFilter<'b>,
     ) -> Result<i64, sqlx::Error> {
-        OutsourceShipmentRepo::count_for_company(
-            &mut **self,
-            company_id,
-            part_ids_in,
-            sent_from,
-            sent_to,
-            received_from,
-            received_to,
-        )
-        .await
+        OutsourceShipmentRepo::count_for_company(&mut **self, company_id, filter).await
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn shipment_list_for_company<'b>(
         &mut self,
         company_id: i64,
-        part_ids_in: &'b [i64],
-        sent_from: Option<NaiveDateTime>,
-        sent_to: Option<NaiveDateTime>,
-        received_from: Option<NaiveDateTime>,
-        received_to: Option<NaiveDateTime>,
+        filter: &OutsourceSentPartFilter<'b>,
         sort_by: &'b str,
         sort_dir: &'b str,
         limit: i64,
@@ -923,11 +919,7 @@ impl OutsourceRepoTrait for &mut PgConnection {
         OutsourceShipmentRepo::list_for_company(
             &mut **self,
             company_id,
-            part_ids_in,
-            sent_from,
-            sent_to,
-            received_from,
-            received_to,
+            filter,
             sort_by,
             sort_dir,
             limit,
@@ -982,20 +974,9 @@ impl OutsourceRepoTrait for &mut PgConnection {
         Ok(row.is_some())
     }
 
-    async fn part_keyword_search<'b>(&mut self, keyword: &'b str) -> Result<Vec<i64>, sqlx::Error> {
-        let rows: Vec<(i64,)> = sqlx::query_as(
-            "SELECT id FROM t_part WHERE deleted_at IS NULL AND \
-             (drawing_no ILIKE $1 OR name ILIKE $1) LIMIT 10000",
-        )
-        .bind(format!("%{}%", keyword))
-        .fetch_all(&mut **self)
-        .await?;
-        Ok(rows.into_iter().map(|r| r.0).collect())
-    }
-
-    // 2026-10-04 review 第 1 轮：谓词与 `LIMIT 10000` 的依据（含「无 ORDER BY ⇒
-    // 触顶时静默返回非确定性子集」这个已知取舍）统一写在 trait 处同名方法的 doc 上，
-    // 避免两份拷贝各自漂移。此处只放字面量，不重复论证。
+    // `LIMIT 10000` 的依据与已知取舍（含「无 ORDER BY ⇒ 触顶时静默返回非确定性子集」
+    // 这个已知取舍）写在 trait 处同名方法的 doc 上，避免两份拷贝各自漂移。
+    // 此处只放字面量，不重复论证。
     async fn part_ids_by_customer(&mut self, customer_id: i64) -> Result<Vec<i64>, sqlx::Error> {
         let rows: Vec<(i64,)> = sqlx::query_as(
             "SELECT id FROM t_part WHERE deleted_at IS NULL \
@@ -1033,19 +1014,6 @@ impl OutsourceRepoTrait for &mut PgConnection {
         .fetch_optional(&mut **self)
         .await?;
         Ok(row.map(|r| r.0))
-    }
-
-    async fn process_map_full<'b>(
-        &mut self,
-        process_ids: &'b [i64],
-    ) -> Result<Vec<(i64, String, String, String)>, sqlx::Error> {
-        sqlx::query_as(
-            "SELECT id, code, name, category FROM t_process \
-             WHERE id = ANY($1) AND deleted_at IS NULL",
-        )
-        .bind(process_ids)
-        .fetch_all(&mut **self)
-        .await
     }
 
     async fn process_map_short<'b>(

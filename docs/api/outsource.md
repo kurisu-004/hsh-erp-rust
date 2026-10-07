@@ -6,44 +6,62 @@
 
 ## 0. 2026-10-09 变更摘要
 
-本文件描述的域本轮一次做完三件事（全部**硬切无 alias**）：
+本文件描述的域本轮分两批做完，全部**硬切无 alias**。
+
+**第一批 —— 看板与写端点**（端点 23 → 22）：
 
 1. **看板读端点收敛**：`/outsource-pool/{counts,state,{process_id}}` 三条旧读 → `/outsource-queue/{snapshot,processes/{id}}` 两条新读（内联 `held_batches` 消灭 N+1）。
 2. **可发送一览下线**：`GET /outsource-sendable` 的行是看板候选列的**分页子集**，端点删除。
 3. **写端点三合一**：`prod::batch` 的 `send-to-outsource` / `receive-from-outsource` / `receive-from-outsource-to-inspection` → 单条 `POST /outsource-queue/move`。
 
-router 工厂 **5 → 4**（删 `sendable_router()` 与 `pool_router()`），端点 **23 → 22**（companies 8 + quotes 9 + shipments 2 + queue 3）。
+**第二批 —— 公司 / 报价两域收敛**（端点 22 → **18**）：
+
+4. **`POST /outsource-companies/{id}/processes` 下线**，工序能力清单的整体替换吸收进 `POST /{id}/update` 的 `process_ids`（三态：`None` 不动 / `Some([])` 清空 / `Some([..])` 替换），同事务内与公司字段一起提交。
+5. **`GET /outsource-quotes/{id}` 与 `POST /outsource-quotes/{id}/update` 下线**（前端零消费）。
+6. **三条写端点补必填 body `version`**：公司 `soft-delete`、报价 `submit` 与 `soft-delete`。此前这三条都是 service 内部自读 version，等于用自己读到的值守自己的乐观锁（见 §4.7）。
+7. **两个列表端点的 `keyword` 拆成 `drawing_no` / `name` 直连 ILIKE**，另加 `is_urgent`（报价）与 `customer_id` / `process_id` / `is_billed`（对账页）三个精确维度（见 §4.8）。
+8. **报价一览的 `statuses` 多状态筛选接线**（本轮最重要的修复，见 §3.3）。
+9. **VO 瘦身与端点收窄**：见 §2 的逐字段表与 §6 的移除记录。
+
+router 工厂始终是 **4 个**（`company_router` / `quote_router` / `shipment_router` / `queue_router`）。
 
 ## 1. 端点表
 
 四个 router 工厂，一个前缀一个工厂（禁止合并成一个大 router，否则 matchit 的注册顺序约束会跨前缀纠缠 —— 见 `CLAUDE.md` 路由声明规约第 9 条）。全部返回统一信封 `R { code, message, data }`。
 
-### 1.1 `/outsource-companies`（8 条）
+### 1.1 `/outsource-companies`（7 条）
 
 | # | 方法 | 路径 | 权限 | 入参 | 响应 |
 |---|---|---|---|---|---|
 | 1 | GET | `/api/v2/outsource-companies/` | Manager + Clerk + CncProgrammer + Inspector | `name_like?` / `is_active?` / `limit?`（缺省 50，clamp 1..500）/ `offset?` | `OutsourceCompanyListOut` |
-| 2 | POST | `/api/v2/outsource-companies/` | Manager + Clerk | `{ name, contact_name?, contact_phone?, address?, is_active?=true, process_ids?: string[] }` | **201** `OutsourceCompanyWithProcessesOut` |
+| 2 | POST | `/api/v2/outsource-companies/` | Manager + Clerk | `{ name, contact_name?, contact_phone?, address?, is_active?=true, process_ids?: string[] }` | **201** `R<()>`（`data: null`） |
 | 3 | GET | `/api/v2/outsource-companies/{id}` | Manager + Clerk + CncProgrammer + Inspector | path `id` | `OutsourceCompanyWithProcessesOut` |
-| 4 | POST | `/api/v2/outsource-companies/{id}/update` | Manager + Clerk | `{ name?, contact_name?, contact_phone?, address?, is_active?, version }` | `OutsourceCompanyWithProcessesOut` |
-| 5 | POST | `/api/v2/outsource-companies/{id}/soft-delete` | Manager + Clerk | path `id` | `R<()>`（`data: null`） |
-| 6 | GET | `/api/v2/outsource-companies/by-process/{process_id}` | Manager + Clerk + CncProgrammer + Inspector | path `process_id` | `OutsourceCompanyOut[]`（**不分页**） |
-| 7 | POST | `/api/v2/outsource-companies/{id}/processes` | Manager + Clerk | `{ process_ids: string[] }` | `OutsourceCompanyWithProcessesOut` |
-| 8 | GET | `/api/v2/outsource-companies/{id}/sent-parts` | Manager + Clerk | `keyword?` / `sent_from?` / `sent_to?` / `received_from?` / `received_to?` / `sort_by?` / `sort_dir?` / `limit?`（缺省 50，clamp 1..200）/ `offset?` | `OutsourceSentPartListOut` |
+| 4 | GET | `/api/v2/outsource-companies/{id}/sent-parts` | Manager + Clerk | `drawing_no?` / `name?` / `customer_id?` / `process_id?` / `is_billed?` / `sent_from?` / `sent_to?` / `received_from?` / `received_to?` / `sort_by?` / `sort_dir?` / `limit?`（缺省 50，clamp 1..200）/ `offset?` | `OutsourceSentPartListOut` |
+| 5 | POST | `/api/v2/outsource-companies/{id}/update` | Manager + Clerk | `{ name?, contact_name?, contact_phone?, address?, is_active?, version, process_ids?: string[] }` | `OutsourceCompanyWithProcessesOut` |
+| 6 | POST | `/api/v2/outsource-companies/{id}/soft-delete` | Manager + Clerk | path `id` + **`{ version }`** | `R<()>`（`data: null`） |
+| 7 | GET | `/api/v2/outsource-companies/by-process/{process_id}` | Manager + Clerk + CncProgrammer + Inspector | path `process_id` | `OutsourceCompanyOptionOut[]`（**不分页**） |
 
-### 1.2 `/outsource-quotes`（9 条）
+- 端点 2 / 5 / 6 的 `version`（端点 2 无）**必填**，无 `#[serde(default)]`：缺省 → HTTP **422 纯文本**（axum `Json` 提取器），不是业务信封。
+- 端点 5 的 `process_ids` 三态可分：缺省 / `null` = 不动、`[]` = 清空、`[..]` = 整体替换（保序）。**「清空」必须能与「不动」区分**，否则「取消全选并保存」会被静默丢弃。目标有序集合与当前有序集合完全相同时 service 跳过重写映射表（见 §4.9）。
+- 端点 6 的守卫顺序是契约：**先 OCC（`40901`），再工序映射非空（`21205`）**（见 §4.7）。
+- 端点 1 之外的 query 参数被忽略（不报错）。
+- 端点 7 的出参是窄 VO（只有 `id` + `name`）：能出现在本列表里的公司恒为启用（service 已 `filter(is_active)`），故不返 `is_active`。
+
+### 1.2 `/outsource-quotes`（7 条）
 
 | # | 方法 | 路径 | 权限 | 入参 | 响应 |
 |---|---|---|---|---|---|
-| 1 | GET | `/api/v2/outsource-quotes/` | Manager + Clerk + Inspector | `status?` / `part_id?` / `outsource_company_id?` / `customer_id?` / `keyword?` / `sort_by?`（缺省 `CREATED_AT`）/ `sort_dir?`（缺省 `DESC`）/ `limit?`（缺省 50，clamp 1..500）/ `offset?` | `OutsourceQuoteListOut` |
+| 1 | GET | `/api/v2/outsource-quotes/` | Manager + Clerk + Inspector | `status?` / `statuses?`（**逗号分隔**）/ `part_id?` / `outsource_company_id?` / `customer_id?` / `drawing_no?` / `name?` / `is_urgent?` / `sort_by?`（缺省 `CREATED_AT`）/ `sort_dir?`（缺省 `DESC`）/ `limit?`（缺省 50，clamp 1..500）/ `offset?` | `OutsourceQuoteListOut` |
 | 2 | POST | `/api/v2/outsource-quotes/` | Manager + Clerk | `{ part_id: string, outsource_company_id: string, process_id: string, price: string, note? }` | **201** `OutsourceQuoteOut`（恒为 `DRAFT`） |
 | 3 | GET | `/api/v2/outsource-quotes/quotable-parts` | Manager + Clerk | `keyword?` / `limit?` / `offset?` | `QuotablePartListOut` |
-| 4 | GET | `/api/v2/outsource-quotes/{id}` | Manager + Clerk + Inspector | path `id` | `OutsourceQuoteOut` |
-| 5 | POST | `/api/v2/outsource-quotes/{id}/update` | Manager + Clerk | `{ price?, note?, version }` | `OutsourceQuoteOut` |
-| 6 | POST | `/api/v2/outsource-quotes/{id}/submit` | Manager + Clerk | path `id` | `OutsourceQuoteOut` |
-| 7 | POST | `/api/v2/outsource-quotes/{id}/approve` | **Manager 独占** | `{ review_note?, version }` | `OutsourceQuoteOut` |
-| 8 | POST | `/api/v2/outsource-quotes/{id}/reject` | **Manager 独占** | `{ review_note: string, version }` | `OutsourceQuoteOut` |
-| 9 | POST | `/api/v2/outsource-quotes/{id}/soft-delete` | Manager + Clerk | path `id` | `R<()>` |
+| 4 | POST | `/api/v2/outsource-quotes/{id}/submit` | Manager + Clerk | **`{ version }`** | `OutsourceQuoteOut` |
+| 5 | POST | `/api/v2/outsource-quotes/{id}/approve` | **Manager 独占** | `{ review_note?, version }` | `OutsourceQuoteOut` |
+| 6 | POST | `/api/v2/outsource-quotes/{id}/reject` | **Manager 独占** | `{ review_note: string, version }` | `OutsourceQuoteOut` |
+| 7 | POST | `/api/v2/outsource-quotes/{id}/soft-delete` | Manager + Clerk | **`{ version }`** | `R<()>` |
+
+- 端点 4 / 5 / 6 / 7 的 `version` 全部必填。守卫顺序统一为：**状态机 → OCC**（所以对一条已 `SUBMITTED` 的报价再 `submit`，无论 `version` 对不对都是 `21302`）。
+- `statuses` 的 wire format 是**逗号分隔单值**（`?statuses=DRAFT,SUBMITTED`），**不是**重复 key —— 理由见 §3.3。
+- ⚠️ 本 router **没有 1 段动态路由**了（`GET /{id}` 已下线），故 §1.5 的注册顺序约束在本前缀不再生效。
 
 ### 1.3 `/outsource-shipments`（2 条）
 
@@ -65,54 +83,75 @@ router 工厂 **5 → 4**（删 `sendable_router()` 与 `pool_router()`），端
 - `process_id` 不存在或已软删（端点 4.2）→ `20801 BIZ_PROCESS_NOT_FOUND`（**HTTP 404**）。
 - i64 雪花主键一律序列化为 JSON **string**；Decimal（`price` / `unit_price` / `total_price`）一律**字符串**。
 - 端点 4.3 的 `version` **无 `#[serde(default)]`**：缺失 → HTTP **422 纯文本**（axum `Json` 提取器），不是业务信封。
-- 端点 1.1-#1 的 `is_active` 与 `limit` 之外的 query 参数被忽略（不报错）。
 
 ### 1.5 路由注册顺序（硬约束，见 handler 源码注释）
 
-`company_router()` 的 `/by-process/{process_id}` 与 `quote_router()` 的 `/quotable-parts` **必须注册在同前缀的 `/{id}` catch-all 之前**：它们与 `/{id}` 同段位，matchit 按注册序匹配，被 `Path<i64>` 兜住会返 **400**（不是 404）。`quote_router()` 的 `quotable-parts` 就是这个坑的实际受害者（此前恒 400，前端 picker 恒空）。
+`company_router()` 的 `/by-process/{process_id}` **必须注册在同前缀的 `/{id}` catch-all 之前**：两者同段位，matchit 按注册序匹配，被 `Path<i64>` 兜住会返 **400**（不是 404）。
 
-`queue_router()` 的三条 route 段数不同（`/snapshot` 与 `/move` 1 段、`/processes/{process_id}` 2 段）⇒ **无同段位争用**，注册顺序不影响匹配。被取代的旧 `pool_router()` 三条全是 1 段，那里静态段必须先注册。
+`quote_router()` 原先的 `quotable-parts` 也是同一个坑的实际受害者（此前恒 400、前端 picker 恒空），但 `GET /{id}` 已在 2026-10-09 下线 ⇒ 该前缀已无 1 段动态路由，注册顺序不再有硬约束。这条约束留给「将来谁想加回一条 1 段动态路由」的人。
+
+`queue_router()` 的三条 route 段数不同（`/snapshot` 与 `/move` 1 段、`/processes/{process_id}` 2 段）⇒ **无同段位争用**，注册顺序不影响匹配。`shipment_router()` 同理（`/in-flight` 1 段、`/{id}/reconcile-update` 2 段）。
 
 ## 2. 逐字段
 
-### 2.1 `OutsourceCompanyOut`（端点 1.1-#1 / #6 元素、1.1-#3 的基础形状）
+### 2.1 公司域出参（端点 1.1-#1 / #3 / #5 / #7）
+
+`OutsourceCompanyOut`（端点 1.1-#1 的元素；端点 #3/#5 是它的超集 + `processes`）：
 
 | 字段 | 类型 | 后端 SQL 来源 |
 |---|---|---|
 | `id` | string | `t_outsource_company.id`（`serialize_i64`） |
 | `name` / `contact_name` / `contact_phone` / `address` | string \| null | 同名列 |
 | `is_active` | boolean | 同名列 |
-| `version` | number | 同名列（**OCC 锚**，update 必传） |
-| `created_at` / `updated_at` | string | 同名列（naive timestamp，无时区后缀） |
+| `version` | number | 同名列（**OCC 锚**，端点 1.1-#5 / #6 必传） |
 
-`OutsourceCompanyWithProcessesOut` = 上表全部字段 + `processes: OutsourceCompanyProcessLinkOut[]`。
+⚠️ **无 `created_at` / `updated_at`**（2026-10-09 删）：公司一览是对账 / 报价 / 看板三处的公司下拉数据源，前端只渲染「名称 + 联系人 + 启停用」，两列时间戳无任何消费方，而每次写端点都会让它们变化 ⇒ 纯粹的缓存抖动。
 
-`OutsourceCompanyProcessLinkOut`：`process_id`（string）/ `process_code` / `process_name` / `category`（`t_process`，取自 `t_outsource_company_process` JOIN）。工序链接为**整组替换**（端点 1.1-#7），`process_ids` 传空数组即清空。
+`OutsourceCompanyWithProcessesOut`（端点 1.1-#3 / #5）= 上表全部字段 + `processes: OutsourceCompanyProcessLinkOut[]`。
 
-### 2.2 `OutsourceSentPartOut`（端点 1.1-#8 元素）
+`OutsourceCompanyProcessLinkOut`（**3 字段**）：`process_id`（string）/ `process_code` / `process_name`。
+⚠️ **无 `category` / `sort_order`**（2026-10-09 删）：`category` 的消费方是前端勾选框，而候选集来自独立的 `GET /proc/processes?category=OUTSOURCE`，本字段与那份候选集恒等；`sort_order` 只被写侧 `replace_processes` 赋值、被看板 `pool_list_companies_with_held` 的 `ORDER BY MIN(cp.sort_order)` 读，**两条都不经过本 VO** —— 映射的展示顺序由请求数组顺序决定。`processes[]` 的顺序 = `t_outsource_company_process` 的 `sort_order ASC, id ASC`。
+
+`OutsourceCompanyOptionOut`（端点 1.1-#7 的元素，**2 字段**）：`id`（string）/ `name`。
+⚠️ **无 `is_active`**：service 层已在 Rust 里 `filter(|c| c.is_active)` 掉了停用公司，能出现在本列表里的行恒为启用 —— 再返一列 `is_active` 等于把「已被后端消掉的事实」交给前端重新判断。
+
+### 2.2 `OutsourceSentPartListOut` / `OutsourceSentPartOut`（端点 1.1-#4）
+
+信封（`data`）：
+
+| 字段 | 类型 | 来源 |
+|---|---|---|
+| `outsource_company_id` | string | 请求 path `id` 回显（`serialize_i64`） |
+| `outsource_company_name` | string \| null | `t_outsource_company.name`（仅未软删）。**公司不存在 / 已软删时为 `null`** —— 端点本身**不**因公司缺失而 404，所以标题位需要能显示「未知公司」 |
+| `items` | array | 见下 |
+| `total` / `limit` / `offset` | number | `limit` 缺省 50、clamp 1..200 |
+
+2026-10-09 加 `outsource_company_id` / `outsource_company_name` 的理由：前端对账页原先要**额外发一次** `GET /outsource-companies/{id}` 才能拿到公司名渲染页头。
+
+`OutsourceSentPartOut`（**16 字段**，行粒度 = 一行一个 shipment，WHERE 带 `status IN ('OUTSOURCING','RECEIVED')`）：
 
 | 字段 | 类型 | 后端 SQL 来源 |
 |---|---|---|
-| `shipment_id` / `quote_id` / `part_id` / `process_id` | string | `t_outsource_shipment` 同名列 |
+| `shipment_id` | string | `t_outsource_shipment.id`（**主键字段名是 `shipment_id`，不是 `id`** —— 前端行编辑端点入参按此名取） |
 | `version` | number | `s.version`（**shipment 行 OCC**，reconcile-update 必传） |
 | `part_drawing_no` / `part_name` / `is_urgent` | string \| null / boolean | `LEFT JOIN t_part p` |
 | `customer_path` | string \| null | `service::join_customer_path`（L2 `c.name` + L1 `cp.name`，有 L1 拼 `L1 / L2`） |
 | `batch_no` | number \| null | `LEFT JOIN t_part_batch pb`（shipment 未绑批次的历史行为 null） |
-| `process_name` | string \| null | `LEFT JOIN t_process pr` |
+| `process_id` / `process_name` | string / string \| null | `s.process_id` / `LEFT JOIN t_process pr` |
 | `quantity` | number | `s.quantity`（**发出时的全量**，不是批次当前余量） |
 | `unit_price` / `total_price` | string | `s.unit_price::text` / `unit_price × quantity`（Decimal 字符串） |
 | `sent_at` / `received_at` | string | `s.sent_at` / `s.received_at`（后者可空） |
 | `status` | string | `OUTSOURCING` / `RECEIVED` |
 | `is_billed` | boolean | 同名列 |
 
-行粒度 = **一行一个 shipment**（`list_for_company` 的 WHERE 带 `status IN ('OUTSOURCING','RECEIVED')`）。**刻意不复用 `OutsourceShipmentOut`**：后者主键字段叫 `id`，本 VO 叫 `shipment_id`（前端行编辑端点入参按此名取）。
+⚠️ **无 `quote_id` / `part_id`**（2026-10-09 删）：前端对账页两列都不存在（行编辑端点的入参按 `shipment_id` 取，零件列展示的是 `part_drawing_no` / `part_name` 两个可读字段），后端留着的后果是同一份零件标识序列化两次且分叉。**刻意不复用 `OutsourceShipmentOut`**：后者主键字段叫 `id`。
 
-### 2.3 `OutsourceQuoteOut`（端点 1.2 全部返回）
+### 2.3 `OutsourceQuoteOut`（端点 1.2 的写端点返回）
 
 | 字段 | 类型 | 后端 SQL 来源 |
 |---|---|---|
 | `id` / `part_id` / `outsource_company_id` / `process_id` | string | `t_outsource_quote` 同名列 |
-| `version` | number | 同名列（**OCC 锚**，update / approve / reject 必传） |
+| `version` | number | 同名列（**OCC 锚**，submit / approve / reject / soft-delete 必传） |
 | `price` | string | `price::text`（Decimal 字符串；DIRECT 占位报价为 `"0.00"`） |
 | `note` / `review_note` | string \| null | 同名列 |
 | `status` | string | 同名列，5 态：`DRAFT` / `SUBMITTED` / `APPROVED` / `REJECTED` / `USED` |
@@ -123,7 +162,7 @@ router 工厂 **5 → 4**（删 `sendable_router()` 与 `pool_router()`），端
 | `customer_path` | string \| null | service 拼 L1 / L2 |
 | `part_unit_price` | string \| null | `t_part.unit_price::text`（供与报价对比） |
 
-`is_direct` **不在出参里**（内部列，谓词用途见 §4.2）。
+`is_direct` **不在出参里**（内部列，谓词用途见 §4.4）。
 
 ### 2.4 `QuotablePartOut`（端点 1.2-#3 元素）
 
@@ -236,9 +275,9 @@ router 工厂 **5 → 4**（删 `sendable_router()` 与 `pool_router()`），端
 
 ## 3. 报价与对账（第二块能力）
 
-外协域除看板外还有两块能力，本轮**未改动**，按现状记录。
+外协域除看板外还有两块能力。2026-10-09 对这两块做了端点收敛与入参拆分，**状态机本身未改动**。
 
-### 3.1 报价生命周期（端点 1.2 的 8 条）
+### 3.1 报价生命周期（端点 1.2 的 7 条）
 
 状态机（`statemachine.rs`，**纯内存迁移表，不写 DB**）：
 
@@ -252,28 +291,56 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 
 - `USED` 是**占位态**：`from_str` 接受它以读存量行，但 service 当前**不自动迁**（approve 后发送时未写 USED 事件）。
 - 历史兼容词汇（`OUTSOURCING` / `RECEIVED` / `BILLED`）同样只读不写。
-- 每个写端点的状态前置闸门：`update` / `soft-delete` 要求 `DRAFT`（软删另允许 `REJECTED`）；`submit` 要求 `DRAFT`；`approve` / `reject` 要求 `SUBMITTED`。违反 → `21302 BIZ_OUTSOURCE_QUOTE_INVALID_TRANSITION`。
+- 每个写端点的状态前置闸门：`soft-delete` 要求 `DRAFT`（另允许 `REJECTED`）；`submit` 要求 `DRAFT`；`approve` / `reject` 要求 `SUBMITTED`。违反 → `21302 BIZ_OUTSOURCE_QUOTE_INVALID_TRANSITION`。
+- **守卫顺序统一为「状态机 → OCC」**：对一条已 `SUBMITTED` 的报价再 `submit`，无论 `version` 对不对都是 `21302`，不是 `40901`。
 - `approve` 会把同 `(part_id, process_id)` 的 `SUBMITTED` / `APPROVED` 报价批量置 `REJECTED`（`reject_competitors`，被新批准报价取代）。
 - `approve` / `reject` **Manager 独占**（service 第一行 `require_role(Role::Manager)`）。
+- **`update` 端点已下线**（2026-10-09）：DRAFT 报价的价格 / 备注改法只剩「软删后重建一条 DRAFT」。前端本就零消费该端点。
 
 ### 3.2 对账与在途
 
 - **对账页**（`GET /outsource-companies/{id}/sent-parts` + `POST /outsource-shipments/{id}/reconcile-update`）：行 = shipment；`reconcile-update` 三态回填（`unit_price` / `quantity` / `is_billed`，`None` = 不改）+ 必传 `version`，OCC 冲突 → `40901`。`quantity <= 0` → `20104`。
-- **在途**（`GET /outsource-shipments/in-flight`）：行 = shipment，`status='OUTSOURCING'`。
+- **对账页的页头信息内联在 sent-parts 信封里**（`outsource_company_id` / `outsource_company_name`），前端不必再单独 `GET /outsource-companies/{id}`。
+- **在途**（`GET /outsource-shipments/in-flight`）：行 = shipment，`status='OUTSOURCING'`。该端点的 `keyword` **未**拆成 `drawing_no` / `name`（它是单一 `keyword_pat` 绑进一个 `($1::text IS NULL OR p.drawing_no ILIKE $1 OR p.name ILIKE $1)` 谓词，本来就直连 ILIKE，无中间查询与截断风险）。
 - `shipment` 状态：`OUTSOURCING`（已发出）→ `RECEIVED`（已收回）。移动写端点在两个回收方向上自动把开口 shipment 标 `RECEIVED` 并写 `received_at`。
 - DB 上有 partial unique `uq_t_outsource_shipment_open_batch`：一个批次最多一张开口 shipment。
 
+### 3.3 🔴 `statuses` 多状态筛选（本轮最重要的修复）
+
+**症状**：报价一览的状态筛选**恒不生效**，且没有任何报错。
+
+**完整故事**：
+
+1. `repo/sql.rs` 的 `quote_list_with_filters` / `quote_count_with_filters` **早就支持**多状态 —— 形参 `statuses: &[String]`，SQL 里有 `AND (cardinality($2::text[]) = 0 OR status = ANY($2))`（空数组 = 不过滤）。
+2. 但 `dto.rs` 的 `OutsourceQuoteListQuery` **没有这个字段**，而 `service/quote.rs` 里两处都硬编码传 `&[]`。SQL 与 repo 完好，DTO 与 service 断在中间。
+3. 前端一直发状态筛选参数；axum 的 `Query` 走 `serde_urlencoded`，它**忽略未知 query 参数且不报错** ⇒ 参数被静默丢弃 ⇒ 筛选恒不生效。
+4. 前端的角色默认筛选（`defaultStatusesForRole`：MANAGER → `['SUBMITTED']`、CLERK → `['DRAFT']`）本来就走这个参数，所以**两条路径同时失效**：MANAGER 打开报价一览看到的是**全量报价而非待审核报价**，而表头因 `statusFilterActive` 判定为「有筛选」变蓝加粗，**视觉上在说筛选已生效** —— 这是最坏的一种失效形态。
+
+**修复**：只补 DTO 字段 + service 接线，SQL 与 repo 零改动。
+
+**wire format 是逗号分隔单值，不是重复 key** —— 这是本轮实测得出的硬约束，值得单独记：
+
+| 写法 | `Option<Vec<String>>` 的结果 |
+|---|---|
+| `?statuses=DRAFT&statuses=SUBMITTED` | **400**，纯文本 `invalid type: string "DRAFT", expected a sequence` |
+| `?statuses[]=DRAFT&statuses[]=SUBMITTED` | 静默 `None`（键名带 `[]` 不匹配字段名） |
+| `?statuses=DRAFT,SUBMITTED` | **400**（同上，`serde_urlencoded` 不按逗号拆序列） |
+| `?statuses=DRAFT` + `Option<String>` + service `split(',')` | ✅ 正确表单值 |
+
+即：axum 的 `Query`（`serde_urlencoded`）的 `Part` 反序列化器**不支持序列**，所以「多值 query 参数」在本仓一律写成逗号分隔的 `Option<String>`，由 service 展开（对照 `prod::part::dto_crud::PartListQuery.statuses` 与 `delivery_note` 的列表入参）。DTO 侧字段名保持 `statuses`，所以前端的 `paramsSerializer` 只要把它列进「CSV 单值」白名单即可（它**已经**在了）。
+
+⚠️ 重复 key 形态在 `Option<String>` 上是**取最后一个**（query 被解析成 `HashMap<key, String>`，后写覆盖先写），**不是 OR**。
+
 ## 4. 口径表
 
-### 4.1 候选侧三处的行粒度一致性（`sendable_count` / `items` / 旧 `sendable` 端点）
+### 4.1 候选侧两处的行粒度一致性（`sendable_count` / `items`）
 
-三个消费方共用**同一个谓词常量** `repo/sql.rs::SENDABLE_INNER_X_SQL` + 同一个 `x → d` 收敛层（`DISTINCT ON (batch_id, current_process_id)`）：
+两个消费方共用**同一个谓词常量** `repo/sql.rs::SENDABLE_INNER_X_SQL` + 同一个 `x → d` 收敛层（`DISTINCT ON (batch_id, current_process_id)`）：
 
 | 消费方 | SQL 落点 | 行粒度 | 收敛 |
 |---|---|---|---|
 | `snapshot.processes[].sendable_count` | `board/repo.rs::SQL_SENDABLE_COUNT_BY_PROCESS`（用 `*_PROJECTION_COUNT` 精简投影） | 一批次一行 | 有 |
 | `detail.items[]` | `board/repo.rs::SQL_CANDIDATES_BY_PROCESS`（用 `*_PROJECTION_FULL`） | 一批次一行 | 有 |
-| 旧 `GET /outsource-sendable` | `repo/sql.rs::OutsourceSendableRepo::list_by_process` | 一批次一行 | 有 |
 
 ⇒ **`snapshot.processes[].sendable_count == detail.items.len()` 恒成立**（看板侧集成测试 `tests/outsource/pool.rs::detail_items_count_matches_snapshot_sendable_count` 钉住）。看板只换**投影**（`sendable_dedup_sql` 的两个投影形参 + 外层列清单），**JOIN 与 WHERE 一行都不重写** —— 改谓词只改一个常量。
 
@@ -325,9 +392,52 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 
 ### 4.6 `customer_id` 的客户子树展开（报价列表）
 
-`GET /outsource-quotes/` 的 `customer_id` 在 service 层展开成 part_id 集合（自身 ∪ **直接**子客户），与 `keyword` 展开出的集合**取交集**。
+`GET /outsource-quotes/` 的 `customer_id` 在 service 层展开成 part_id 集合（自身 ∪ **直接**子客户），落成 SQL 的一个 WHERE 段（`part_id = ANY($4)`）。
 
 展开只下潜**一层** —— 依据是生产库实测（零件全挂 L2、L3 数量 0），而该结构 API 层不强制（`create_customer` 不校验 `parent_id` 是否指向根客户）。出现 L3 后本字段需改成递归 CTE，且漏报**是静默的**（`total` 偏小、不报错）。
+
+⚠️ 这是报价一览里**唯一**还需要「展开成中间 id 集合」的维度（客户子树无法写成对 `t_outsource_quote` 单表 + `t_part` LEFT JOIN 的谓词），也因此它是**唯一**需要「客户子树零命中 → service 早返回空列表」守卫的维度 —— 空数组会让 `cardinality($4) = 0` 成立、整个客户条件被短路掉，不兜住就会「选了一个零件都没有的客户」返回**全量**报价。零件侧维度（`drawing_no` / `name` / `is_urgent`）不需要对应守卫：谓词形如 `($N::text IS NULL OR col …)`，NULL 时短路、给值时正常求值，零命中天然就是零行。
+
+⚠️ **`GET /outsource-companies/{id}/sent-parts` 的 `customer_id` 语义不同** —— 那边**只判等值**（`p.customer_id = $4`），不做子树展开。理由：对账页筛的是「零件本身的归属客户」（这家外协厂供过哪个客户的货），与 batch / 工序域的 `customer_id` 谓词同形；而报价一览筛的是「客户视角的报价归属」，前端给的常是 L1 客户，故需展开。两者不要混用同一个 DTO 字段名当同义。
+
+### 4.7 写端点的 OCC 锚（必填 `version`）
+
+全仓约定：**写端点 body 的 `version` 必须必填**（无 `#[serde(default)]`），缺失 → HTTP **422 纯文本**，不是业务信封。
+
+本域 2026-10-09 补齐的三条曾长期破例 —— service 内部 `quote_get_by_id` / `company_get_by_id` 读到当前 version 再喂给 repo 的 `UPDATE … WHERE id = $1 AND version = $2`。同一行上「刚读到的 version」必然等于「当前 version」，所以 `rows_affected = 0` 的分支**永不可达**，守卫形同虚设。
+
+| 端点 | 补齐前 | 现在 |
+|---|---|---|
+| `POST /outsource-quotes/{id}/submit` | 无 body，`quote_submit(id, q.version, …)` | `{ version }`，先比 `q.version` 再守 |
+| `POST /outsource-quotes/{id}/soft-delete` | 无 body，`quote_soft_delete(id, q.version, …)` | `{ version }` |
+| `POST /outsource-companies/{id}/soft-delete` | 无 body，`company_soft_delete(id, company.version, …)` | `{ version }` |
+
+**公司 `soft-delete` 的守卫顺序是契约：先 OCC（`40901`），再工序映射非空（`21205`）。** version 过期意味着整个对话框看到的公司状态已失效（可能是别人刚改的联系人 / 启停用 / 工序），此时报「仍映射 N 项工序，请先清空」会把用户引向错误的排查方向 —— 他会去清工序，而真正的原因是数据已被他人改动。
+
+报价写端点的守卫顺序与之相反，是**状态机 → OCC**（见 §3.1）：状态不对时先说状态不对，因为状态流转失败与版本无关。
+
+### 4.8 零件侧筛选：`drawing_no` / `name` 直连 ILIKE（取代 `keyword` 预搜索）
+
+2026-10-09 两个列表端点的 `keyword` 都拆成 `drawing_no` + `name`（外加精确维度），**省掉三样东西**：
+
+1. **`part_keyword_search` 预搜索**：`SELECT id FROM t_part WHERE … (drawing_no ILIKE $1 OR name ILIKE $1) LIMIT 10000`，**无 `ORDER BY`** ⇒ 一旦触顶返回的是**任意 10000 条**（非确定性子集、同一请求两次可能不同），`total` 偏小且零命中守卫不触发 ⇒ **静默少报**。
+2. **「给了关键词却零命中要早返回」的 service 兜底分支**：那是第 1 条的补偿逻辑（空数组会让 `cardinality(...) = 0` 成立、整个条件被短路，从而返回全量）。直连谓词下零命中就是零行，这个易漏的分支一并消失。
+3. **`part_ids_in` 中间数组**及其在 list / count 两条 SQL 里的 `part_id = ANY($N)` 谓词。
+
+**SQL 侧的改动量**：报价一览为了 `p.drawing_no` / `p.name` / `p.is_urgent` 新加了一条 `LEFT JOIN t_part p`（并给 `t_outsource_quote` 起别名 `q`，否则两表的 `id` / `deleted_at` 同名列会判 ambiguous）；对账页的 `LEFT JOIN t_part p` 本就存在（取 `drawing_no` / `name` / `is_urgent`），新增谓词是**零 JOIN 改动**。
+
+`LEFT` 而非 `INNER`：不传任何零件侧筛选时它必须恒等空操作（零件已软删 / `part_id` 悬空的存量报价仍要出现在一览里）；传了筛选时谓词在 NULL 行上求值为 NULL、不成立，行为与 `INNER JOIN` 一致。
+
+### 4.9 工序映射的「有序集合」语义与 diff 守卫
+
+`POST /outsource-companies/{id}/update` 的 `process_ids` 吸收了原 `POST /{id}/processes` 的职责，映射的**有序**集合有两处依赖：
+
+- 写侧 `replace_processes` 按数组下标写 `sort_order`（首次出现位置去重保序）；
+- 看板 `pool_list_companies_with_held` 的 `ORDER BY MIN(cp.sort_order)` 决定公司列内的公司顺序。
+
+**diff 守卫**：目标有序集合 == 当前有序集合（`junction_list_by_company` 按 `sort_order ASC, id ASC`）时**跳过重写**。合并对话框之后每次保存都会走到这条路径，而 `replace_processes` 是「软删全部 + 逐条重建」—— 无脑执行会把整张 `t_outsource_company_process` churn 一遍（换一批雪花 id、`sort_order` 重排），而内容一字未变。去重保序的实现收在一个共享 helper 里（`dedup_keep_order`），因为「重复项在前还是在后」若在两处各写一遍，两份实现一旦漂移，diff 守卫会把「仅顺序不同」误判成「有变化」。
+
+`company_update` 与 `replace_processes` 在**同一事务**内（handler `pool.begin()` 包两步），任一步失败整体回滚 —— 所以映射的校验错误（工序不存在 / 非 OUTSOURCE 类别 → `20801` / `21203`）不会留下「公司字段已改、映射没改」的半截状态。
 
 ## 5. 状态域约定（无编译期保障）
 
@@ -390,6 +500,11 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 | `OutsourceRepoTrait` 的 5 个方法（`pool_*` 4 + `sendable_list_by_process` 1） | 同上，无调用方 |
 | `vo/shipment.rs` 的 `ApprovedForSendItem` / `ApprovedForSendListOut` | 死 VO，零调用方（表达不了 DIRECT 模式） |
 | `GET /api/v2/prod/batches/{batch_id}/split` | 2026-10-09 提升为共用顶层端点 `POST /api/v2/batches/split`（`batch_id` 入 body），见 [`batch.md`](batch.md) §2.1 |
+| `POST /api/v2/outsource-companies/{id}/processes` | 2026-10-09 硬切，功能吸收进 `POST /api/v2/outsource-companies/{id}/update` 的 `process_ids`（三态，见 §1.1）。连带删除 `SetOutsourceCompanyProcessRequest` 与 `OutsourceService::set_company_processes`。旧 URL 返 **404**（本 router 无其它 2 段 POST 会匹配它） |
+| `GET /api/v2/outsource-quotes/{id}` | 2026-10-09 硬切（前端零消费）。连带删除 `OutsourceService::get_quote`。旧 URL 返 **404**（quote router 已无 1 段路由） |
+| `POST /api/v2/outsource-quotes/{id}/update` | 2026-10-09 硬切（前端零消费）。连带删除 `OutsourceQuoteUpdateRequest` / `OutsourceService::update_quote` / `OutsourceQuoteRepo::update`。DRAFT 报价改价格 / 备注的路径改为「软删后重建一条 DRAFT」 |
+| `OutsourceRepoTrait` 的 `part_keyword_search` / `quote_update` / `process_map_full` | 端点下线 + `keyword` 拆 `drawing_no` / `name`（见 §4.8）+ `OutsourceCompanyProcessLinkOut` 删 `category`（使 `process_map_full` 与 `process_map_short` 逐字同形），三者均无调用方 |
+| 两个列表端点的 `keyword` 入参 | 拆成 `drawing_no` + `name` 直连 ILIKE（报价侧另有 `is_urgent`，对账页另有 `customer_id` / `process_id` / `is_billed`） |
 
 ### 6.1 因 move 端点收窄而**部分下线**的能力
 
@@ -448,6 +563,8 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 
 ### 8.3 前端配套改动清单（外协看板接线）
 
+#### 外协看板（第一批）
+
 1. **URL 全量替换**：`/api/v2/outsource-pool/*` → `/api/v2/outsource-queue/{snapshot,processes/{id}}`；`/api/v2/outsource-sendable` **删除**（改用 `processes/{id}` 的 `items[]`）；`/api/v2/prod/batches/{id}/{send-to-outsource,receive-from-outsource,receive-from-outsource-to-inspection}` → `/api/v2/outsource-queue/move`。**无 alias**，旧路径 404。
 2. **N+1 消除**：原「进程序列板 1 次 + 每公司 1 次 state」的组合应合并为**一次** `processes/{id}` 请求。
 3. **`move` 入参形态变更**（**破坏性**）：
@@ -460,23 +577,42 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 4. **`move` 出参变更**：`PartOut`（part 级）→ `OutsourceMoveResult`（批次级）。读 part_id 改读 `out.part_id`；OCC 版本号改读 `out.version`（**写后读回的真实值**，不是请求的 `version + 1`）。`shipment_id` / `new_process_id` 按「键是否存在」判定方向，不要按 `null` 判定。
 5. **候选卡 `shelf_id` 是承重字段**：拖拽发送时必须原样回传给 `from.shelf_id`（候选池跨货架，不能用「用户当前激活货架」凑 —— 激活货架对 MANAGER / CLERK / INSPECTOR 恒为空）。填错被写端点按 `20122` 拒收。
 6. **候选卡的 `shelf_id` 为空串的行走不通**：那是 `PENDING` 且未上架的批次（本来就在生产架之外），要先 `place-on-shelf`。
-7. **新增 2 个看板 composable** + **删 3 个旧 composable**（`/counts` 计数、`/state` 每公司一次、`/pool/{id}` 详情）。
+7. **新增 2 个看板 composable** + **删 3 个旧 composable**（`/counts` 计数、`/state` 每公司一次、``/pool/{id}` 详情）。
 8. **zod schema 同步**：新增 `outsourceQueueSnapshotSchema` / `outsourceQueueProcessDetailSchema` / `outsourceQueueCandidateSchema` / `outsourceQueueCompanySchema` / `outsourceQueueHeldBatchSchema` / `outsourceMoveResultSchema`。**注意 zod 默认 strip 模式**会让漏声明的字段静默丢失，数组元素必须全字段声明（候选卡 25 字段）。
 9. **日期字段类型不一致**（勿写同一个 schema 复用）：候选卡 / `quotable` 的日期是 `YYYY-MM-DD` **字符串**（`to_char`）；`held_batches` 的是 ISO 日期串（native date）。
 10. **`receive_next_process_id` 是字符串 `"0"`** 而非数字 0、亦非 `null`；配合 `chain_resolvable` 判定要不要弹手填对话框。
 11. **`snapshot.processes[]` 的 tab 集合必须 join 全量 OUTSOURCE 工序列表**（见 §4.3）。
 
+#### 公司 / 报价（第二批）
+
+12. **删 3 个 api 函数**：`setOutsourceCompanyProcesses`（→ `updateOutsourceCompany` 的 `process_ids`）、`getOutsourceQuote`、`updateOutsourceQuote`。**无 alias**，旧 URL 404。
+13. **`POST /outsource-companies` 出参改 `R<()>`**：`createOutsourceCompany` 的返回类型从 `OutsourceCompanyWithProcesses` 改成 `void`；建号后走列表失效重拉（不要试图从建号响应里取 `id`）。
+14. **`POST /{id}/soft-delete`（公司）与报价的 `submit` / `soft-delete` 现在必须带 `{ version }`**。漏传 → **HTTP 422 纯文本**（响应无 `code` 字段，勿按 `40001` 分支解析）。公司 `soft-delete` 的 `version` 取公司 `GET /{id}` 或列表行的 `version`。
+15. **公司编辑对话框合并工序勾选**：工序多选与联系人字段在**同一次** `POST /{id}/update` 里提交。`process_ids` 三态：不给 = 不动（只改联系人时**可以省略**，服务端不会重写映射表）；`[]` = 清空；`[..]` = 替换（保序）。⚠️ 要表达「用户什么都没改」时**不要**误传 `[]`。
+16. **公司 VO 删字段**：`OutsourceCompany` / `OutsourceCompanyWithProcesses` 不再有 `created_at` / `updated_at`；`OutsourceCompanyProcessLink` 收成 `{ process_id, process_code, process_name }`（无 `category` / `sort_order`）。zod schema 必须同步删（zod strip 模式下「多声明」不报错但会误导，「少声明」会静默丢字段 —— 这里的方向是删，所以要确认删干净）。
+17. **`GET /outsource-companies/by-process/{id}` 出参换窄 VO** `OutsourceCompanyOption { id, name }`（无 `is_active` / 联系人 / `version`）。**关键**：这个端点**没有 `version`** —— 若代码把它当成 `OutsourceCompany` 用（比如直接塞进需要 `version` 的保存 payload），会在提交时才炸 `40901`。
+18. **对账页页头改读 sent-parts 信封**：`data.outsource_company_id` / `data.outsource_company_name`，可以删掉那次额外的 `GET /outsource-companies/{id}`。公司名可能为 `null`（公司已软删），标题位要能显示「未知公司」。
+19. **sent-parts 行删 `quote_id` / `part_id`**：凡是靠 `item.part_id` 做零件跳转 / 定位的地方改用 `part_drawing_no` / `part_name`，或调 `GET /api/v2/parts/{id}` 时从别处拿 id（当前后端**没有**在 sent-parts 行里给零件 id，这是有意的取舍，见 §8.4）。
+20. **两个列表的 `keyword` 拆成 `drawing_no` / `name`**：报价一览另有 `is_urgent`，对账页另有 `customer_id` / `process_id` / `is_billed`。⚠️ 对账页的 `customer_id` 是**等值**（零件直属客户），报价一览的 `customer_id` 是**一层子树展开**（见 §4.6），两者语义不同、不要复用同一个筛选组件的语义描述。
+21. **`statuses` 现在真的生效了** —— wire format 是**逗号分隔单值**（`?statuses=DRAFT,SUBMITTED`），不是重复 key（详见 §3.3）。前端 `paramsSerializer` 的「CSV 单值」白名单已含 `statuses`，所以 `listOutsourceQuotes({ statuses: [...] })` 无需改动即可生效。⚠️ 顺带把 `statusFilterActive` 的判定复核一遍：后端此前恒不过滤，若前端曾用它做「有没有筛选」的提示，现在它才真正成立。
+22. **报价一览的 `status` 与 `statuses` 并存且 AND**：两者同时传时取交集（各占各的 WHERE 段）。
+
 ### 8.4 已知偏差登记（不得省）
 
+- **对账页（`sent-parts`）的每一行不再带零件 id（`part_id` 已删）。** 后端判断是「前端对账页只展示 `part_drawing_no` / `part_name`，零件 id 无消费方」；代价是若将来要在这张表里做「点零件跳详情」，得先补回 `part_id` 或另开一个按 shipment 取零件的端点。这是**有意**的字段删减，不是遗漏。
+- **`by-process` 端点不返 `version`**，而 `GET /{id}` 与列表端点返。前端若把 `by-process` 的结果直接塞进需要 `version` 的保存 payload，会在提交时 `40901`。
+- **`statuses` 的 wire format 与「多值 query 参数」的直觉相反**（逗号单值，不是重复 key），根因是 axum `Query` 走 `serde_urlencoded`、其 `Part` 反序列化器不支持序列（§3.3 有实测表）。**重复 key 形态在本字段上是「取最后一个」而非 OR**，误用它会静默少筛。
+- **`GET /outsource-quotes/` 的 `customer_id` 只下潜一层客户子树**，出现 L3 后漏报是**静默的**（`total` 偏小、不报错）。
+- **对账页的 `customer_id` 只判等值、不做子树展开**（与报价一览语义不同，见 §4.6）。若产品要求「按 L1 客户看该客户全部零件的外协发货记录」，需要另行扩子树，不是本轮遗漏。
 - **`companies[].held_count` 与 `held_batches.len()` 的一致性由服务层保证（集成测试 + lib 单测 `held_count_matches_held_batches_len` 锁），但若未来有人在 SQL 侧重新加 `COUNT` 会静默分叉。** SQL 侧已刻意不做 `COUNT`（`SQL_COMPANIES_BY_PROCESS` 的 doc 逐字写了这一点）—— 恢复 `COUNT` 的诱惑来自「顺手」，代价是两条 SQL 的谓词一旦漂移就静默不一致。
 - **候选卡 `shelf_id` 对「`PENDING` 且未上架」的批次序列化为空串（不是 `null`）。** 这类行本来就在生产架之外，拖拽发送会被 `from` 守卫以 `20122` 拒收。选空串而非 `null` 是因为 `null` 会让前端的必填字符串校验炸在**整页渲染**上。
 - **`snapshot.processes[]` 只含 `sendable + in_flight > 0` 的工序 ⇒ tab 集合必须由前端 join 全量 OUTSOURCE 工序列表，否则操作到一半 tab 会消失。** 后端不返「零货工序」是刻意的（序列板的语义是「现在有活要干的工序」），但这意味着 tab 集合不是后端给的单一真源。
 - **`OutsourceMoveResult.version` 是写后读回的真实值，不是在 Rust 里算的 `batch.version + 1`。** 写入口的 OCC 守卫与源状态白名单都可能让 UPDATE 命中 0 行，让「算出来的 +1」与真实值分叉；而分叉的症状是「刚拖完就冲突」，极难定位。代价是多一次读（同一事务内）。
 - **`OutsourceMoveResult.new_location` 与 `to_kind` 恒等**（冗余字段）。让「归位键」是显式字段而不是「推导得出」的东西，理由是 WS payload 会被缓存重放（前端刷新后先补事件再拉列表）。
-- **`GET /outsource-quotes/` 的 `customer_id` 只下潜一层客户子树**，出现 L3 后漏报是**静默的**（`total` 偏小、不报错）。
 - **`snapshot` 的工序元数据查不到（已软删）时 `category` 兜底为 `"OUTSOURCE"`**，而候选侧不可能命中软删工序（它 INNER JOIN 了 `t_process`）—— 只有在途侧会。兜底而非返 `null` 是因为前端要按 `category` 分组渲染。
 - **`detail.process` 无 `category` 字段**（单工序详情不展示类别，与 `prod::queue` 的 `QueueProcessMeta` 对齐），而 `snapshot.processes[]` 有。
-- **§1.5 的「静态段必须先于 catch-all 注册」是硬约束，没有编译期保障。** 加一条新的 1 段静态路由而放到 `/{id}` 之后 ⇒ 该路径返 **400**（不是 404），症状与「路由没注册」不同，极易误判。
+- **§1.5 的「静态段必须先于 catch-all 注册」是硬约束，没有编译期保障。** 公司 router 里加一条新的 1 段静态路由而放到 `/{id}` 之后 ⇒ 该路径返 **400**（不是 404），症状与「路由没注册」不同，极易误判。（quote router 暂时无此约束，因为 `/{id}` 已下线。）
+- **公司 / 报价两域的 `version` 必填是**「422 纯文本」**而不是业务信封**，前端错误处理要按 HTTP 状态码分支，不能假设响应必有 `code` 字段。同理 `Path<i64>` 抽不出数字时的 400。
 
 ## 9. 错误码分段（`src/shared/error.rs::code`）
 

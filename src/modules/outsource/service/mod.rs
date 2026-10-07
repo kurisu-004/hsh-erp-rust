@@ -1,10 +1,10 @@
 //! outsource service 层入口
 //!
 //! 按职责拆为：
-//! - `company`  — 外协公司 CRUD + 工序映射（list / create / get / update / soft-delete /
-//!   by-process / set-processes）
-//! - `quote`    — 报价 CRUD + 状态机（list / create / get / update / submit / approve /
-//!   reject / soft-delete）+ `quotable-parts` picker
+//! - `company`  — 外协公司 CRUD + 工序映射（list / create / get / update（含工序映射
+//!   整体替换）/ soft-delete / by-process）
+//! - `quote`    — 报价状态机（list / create / submit / approve / reject / soft-delete）
+//!   + `quotable-parts` picker
 //! - `shipment` — 对账单更新（reconcile-update）+ 对账页 sent-parts + 在途 in-flight
 //! - `move`     — `POST /outsource-queue/move`（三合一移动写端点，取代 `prod::batch`
 //!   的外协收发三个单边端点）
@@ -39,6 +39,13 @@
 //! 的看板两读取代，`OutsourceService::pool_counts` / `pool_by_process` / `pool_state`
 //! 随之删除）与 `sendable`（`GET /outsource-sendable` 的 list 端点被看板候选列取代，
 //! `OutsourceService::list_sendable` 删除；三个共用纯函数保留在本目录）。
+//!
+//! 同日公司 / 报价两域收敛（见 `handler.rs` 路由表）：
+//! - `set_company_processes` 删除（功能吸收进 `update_company` 的 `process_ids`）；
+//! - `get_quote` / `update_quote` 删除（对应端点硬切下线，前端零消费）；
+//! - `submit_quote` / `soft_delete_quote` / `soft_delete_company` 改为收**调用方传的**
+//!   `version`，不再用 service 自己刚读到的值自守乐观锁；
+//! - 新增共享 helper `parse_optional_snowflake`（可选雪花 ID query 形参 → `Option<i64>`）。
 
 #![allow(
     clippy::collapsible_if,
@@ -155,6 +162,24 @@ pub(crate) fn parse_snowflake_id(s: &str, field: &str) -> Result<i64, AppError> 
             format!("{field} 不是合法雪花 ID: {s:?}"),
         )
     })
+}
+
+/// 可选的雪花 ID query 形参 → `Option<i64>`：`None` / 全空白 ⇒ `None`（不过滤）。
+///
+/// 与 [`parse_snowflake_id`] 的区别只在于**缺省不是错**：列表端点的可选筛选维度
+/// 靠 `None` 表达「不过滤」，空串（前端把搜索框清空后序列化出来的形态）与 `None`
+/// 同义。
+pub(crate) fn parse_optional_snowflake(
+    raw: Option<&str>,
+    field: &str,
+) -> Result<Option<i64>, AppError> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(t) => t
+            .parse::<i64>()
+            .map(Some)
+            .map_err(|_| AppError::biz(code::BIZ_INVALID_VALUE, format!("{field} 非整数"))),
+    }
 }
 
 /// 2026-09-14 Phase 3 follow-up（current_id_to_snowflake 修复）：
