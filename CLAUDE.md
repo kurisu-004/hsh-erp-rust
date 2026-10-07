@@ -470,6 +470,14 @@ t_assembly.status               ← 派生缓存
 
 **旧登记表里「待复核」项已复核**：当时担心「有断言依赖 id 单调递增 / 落在某绝对区段」—— 逐个打开 34 个迁移文件复核，**零 id 算术、零 id 比较**：全仓唯一的 id 算术在 `tests/part/inspection_batches.rs` 的兜底键用例里，且它是**写死的字面量基座** `id_base` 加 0/1/2，与 generator 行为无关。迁移前后断言逐字未改。
 
+### 待办登记：lib 单测基线红 `infra::cos_opendal::tests::memory_backend_copy_object`（2026-10-09）
+
+`scripts/test_nextest.sh --lib` 当前**唯一**的基线红，原因与业务代码无关：opendal 的 Memory backend 已支持 copy（当年 spike 结论「Memory backend 不支持 copy（`Unsupported (permanent) at copy`）」已过期），而该单测断言的是「copy 必须返回 Unsupported 类错误」，于是 `result.is_err()` 落空。
+
+**这条红不是任何一次改动引入的**（在 `master` 上同样红），修它要重写该测试的前提：Memory backend 上 copy 现在是 Ok，得改成断言「copy 成功且 `stat` 出来的 size / 内容与源一致」，或者把该断言降级为只在真 COS（S3 backend）下跑。
+
+**登记原因**：review 阶段容易被误判成本轮 diff 带进来的回归。**勿挂在本轮 PR 上** —— 与 `prod::batch` 拆批 quantity 那次修复（`git diff master..HEAD` 只碰 5 个文件、`src/infra/` 与 `Cargo.lock` 均未触碰）无关，单独一个 commit 处理。
+
 ## DB 约定（迁移与查询必须沿用）
 
 - 无物理外键（`bigint` + 索引，存在性由 service 校验）、无 DB ENUM（`varchar` + Rust enum 校验）

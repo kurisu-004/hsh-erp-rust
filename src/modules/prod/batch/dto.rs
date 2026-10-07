@@ -10,7 +10,8 @@
 //! i64 反序列化兜底走 `deserialize_i64` / `deserialize_i64_opt`（与其它域惯例一致：
 //! 只接受 JSON 字符串形态，雪花 ID 一律 string 以避免 JS `Number.MAX_SAFE_INTEGER`
 //! 精度截断；发数字会在 axum `JsonRejection` 层被拒 —— HTTP 422 纯文本、不进
-//! `R<T>` 信封）。
+//! `R<T>` 信封）。**计数字段刻意不套这层兜底**（`version` / `quantity` 走裸 JSON
+//! 数字），见 [`SplitBatchByBodyRequest`]。
 //! 2026-10-02 追加：自 part 域迁入批次流转入参（见文件末尾小节）。
 
 use serde::Deserialize;
@@ -276,11 +277,23 @@ pub struct RepairDispatchRequest {
 /// `prod::queue::recall` 的硬切同款（ID 全走 body）。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SplitBatchByBodyRequest {
+    /// 源批次雪花 ID。**必须发 JSON 字符串**（`deserialize_i64` 只吃 `str`），
+    /// 例如 `"batch_id": "1590000000000000001"`；发数字 → axum `Json` 提取器
+    /// 直接拒 ⇒ **HTTP 422 纯文本、不进 `R<T>` 信封**（响应里没有 `code` 字段）。
+    ///
+    /// 对照：同结构的 `version` / `quantity` 是计数与 OCC 锚，走**裸 JSON 数字**。
+    /// 同一份请求体里字符串 / 数字混用是刻意的，不要互相套用。
     #[serde(deserialize_with = "deserialize_i64")]
     pub batch_id: i64,
+    /// `t_part_batch.version` 的 OCC 锚，**必填**（无 `#[serde(default)]`）：缺字段
+    /// → 422 纯文本；与库中当前值不符 → `40901 VERSION_CONFLICT`。
     pub version: i32,
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub quantity: i64,
+    /// 拆出数量，∈ [1, 源批次 quantity - 1]。
+    ///
+    /// **裸 JSON 数字**（不带 `deserialize_i64`）—— 数量是 i32 量级的计数，
+    /// `deserialize_i64` 是给 19 位雪花 ID 防 JS 精度截断用的，挂在这里会让前端发数字
+    /// 直接吃 axum `Json` 提取器的 422 纯文本（不是业务信封，前端无从提示原因）。
+    pub quantity: i32,
     #[serde(default)]
     pub note: Option<String>,
 }
@@ -374,8 +387,10 @@ pub struct PickUpRequest {
     pub shelf_id: Option<i64>,
     /// 2026-10-03 新增：部分领取；缺省 = 整批。
     ///
-    /// 线上形态与同族的 `SplitBatchByBodyRequest.quantity` 一致：**JSON 字符串**
-    /// （`deserialize_i64_opt` 只吃 str），例如 `"quantity": "4"`。
+    /// 线上形态是 **JSON 字符串**（`deserialize_i64_opt` 只吃 `str`），例如
+    /// `"quantity": "4"`；发数字 → 422 纯文本。本字段的字符串形态是**前端既有约定**
+    /// （扫码台照此发送），与本模块其它「裸 JSON 数字计数」字段刻意不同形，改它要
+    /// 连带改前端。
     ///
     /// `None` / `>= batch.quantity` 一律按整批处理（`==` 是「显式整批」的合法
     /// 写法，语义与 `None` 等价）；`0 < q < batch.quantity` 触发自动拆批。
