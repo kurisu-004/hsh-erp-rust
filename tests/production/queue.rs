@@ -2938,3 +2938,211 @@ async fn move_worker_to_worker_stale_version_returns_40901() {
         "目标工人未拿到"
     );
 }
+
+/// 2026-10-09：`has_process_chain` 派生列（卡片绿色左边框的判据）。
+///
+/// 覆盖 4 处落点里的 3 个端点（外协候选卡在 `tests/outsource/pool.rs`，因为那边
+/// 才有 OUTSOURCE 类工序与候选 fixture）。三种批次形态 × 三个端点：
+///
+/// | 形态 | `has_process_chain` | 走的判据分支 |
+/// |---|---|---|
+/// | 已绑链 + 指针指向当前工序所在 step | `true` | 分支 1 |
+/// | 已绑链 + **未定位**（`current_process_id` 与指针都 NULL） | `true` | 分支 2（链内有活跃 step） |
+/// | 无链 | `false` | 首个条件 `process_chain_id IS NOT NULL` 即否 |
+///
+/// ⚠️ 「未定位」这一形态用 `IN_PROCESS` + `WORKER` 的批次而不是字面的 `PENDING`
+/// 批次：4 个列表的谓词都硬限定 `status='IN_PROCESS'`（候选池还额外要求
+/// `current_process_id = $1`），`PENDING` 批次根本不出现在这 4 个端点里。判据要
+/// 验的是「工序未定位但工单有链」，用同形态的行才打得到那条 EXISTS 分支。
+///
+/// ⚠️ 判据必须用 `IS NOT NULL AND =` 而不是 `IS NOT DISTINCT FROM` —— 后者在
+/// `NULL = NULL` 时为真，会让「未定位」这一形态的批次走分支 1（`cs.process_id` 是
+/// NULL，与 NULL 比「相等」）而被误判成 `true` 之外的另一条错路径。本用例的
+/// 「未定位 ⇒ true」与「无链 ⇒ false」两条一起把分支边界钉住。
+#[tokio::test]
+async fn has_process_chain_reflects_chain_and_pointer_state() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "POOL-HPC").await;
+    let proc = seed_process(&pool, "PROC-HPC", "工序-HPC").await;
+    let wt = insert_work_type(&pool, "WT-HPC", "工种-HPC", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let prod_shelf = insert_shelf(&pool, "PROD-HPC", "PROD-HPC", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc).await;
+    let worker = insert_worker(&pool, "BC-HPC", "工HPC", Some(wt)).await;
+
+    // A. 已绑链 + 指针一致（insert_pool_part 建链、绑 part，并把批次指针指向该
+    //    step，而 step.process_id == 批次 current_process_id）
+    let (part_a, _batch_a) = insert_pool_part(&pool, customer, "HPC-A", prod_shelf, proc, 1).await;
+    // B. 无链（同一 helper 建完后把链摘掉 ⇒ process_chain_id IS NULL）
+    let (part_b, _batch_b) = insert_pool_part(&pool, customer, "HPC-B", prod_shelf, proc, 1).await;
+    sqlx::query("UPDATE t_part SET process_chain_id = NULL WHERE id = $1")
+        .bind(part_b)
+        .execute(&pool)
+        .await
+        .expect("unbind part B from chain");
+    // C. 已绑链 + 未定位（指针与工序都清 NULL ⇒ 走分支 2）
+    let (part_c, batch_c, _step_c) =
+        insert_worker_held_part(&pool, customer, "HPC-C", worker, proc, 1, true).await;
+    sqlx::query(
+        "UPDATE t_part_batch SET current_process_id = NULL, current_process_step_id = NULL \
+         WHERE id = $1",
+    )
+    .bind(batch_c)
+    .execute(&pool)
+    .await
+    .expect("clear batch C position");
+    // D. 无链 + 未定位
+    let (part_d, batch_d, _step_d) =
+        insert_worker_held_part(&pool, customer, "HPC-D", worker, proc, 1, false).await;
+    sqlx::query(
+        "UPDATE t_part_batch SET current_process_id = NULL, current_process_step_id = NULL \
+         WHERE id = $1",
+    )
+    .bind(batch_d)
+    .execute(&pool)
+    .await
+    .expect("clear batch D position");
+    // 前置断言：四个 part 的链绑定与批次位置必须与用例名一致，否则后面的断言
+    // 会在「数据没造对」的前提下假绿。
+    let chain_of = async |part_id: i64| {
+        sqlx::query_scalar::<_, Option<i64>>("SELECT process_chain_id FROM t_part WHERE id = $1")
+            .bind(part_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read process_chain_id")
+    };
+    assert!(chain_of(part_a).await.is_some(), "A 应已绑链");
+    assert!(chain_of(part_b).await.is_none(), "B 应无链");
+    assert!(chain_of(part_c).await.is_some(), "C 应已绑链");
+    assert!(chain_of(part_d).await.is_none(), "D 应无链");
+
+    let (app, token) = login_manager_with_username(&pool, "admin_hpc").await;
+
+    // ---- 端点 a/b：GET /prod/queue/processes/{proc} ----
+    let uri = format!("/prod/queue/processes/{proc}");
+    let (s, env) = send(
+        app.clone(),
+        json_request("GET", &uri, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "board process detail: {env}");
+    let item_of = |part_id: i64| -> Value {
+        env["data"]["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|i| i["part_id"] == json!(part_id.to_string()))
+            .cloned()
+            .unwrap_or_else(|| panic!("候选池应含 part {part_id}: {env}"))
+    };
+    assert_eq!(
+        item_of(part_a)["has_process_chain"],
+        json!(true),
+        "A（已绑链 + 指针一致）⇒ true: {env}"
+    );
+    assert_eq!(
+        item_of(part_b)["has_process_chain"],
+        json!(false),
+        "B（无链）⇒ false: {env}"
+    );
+    assert!(
+        item_of(part_a)["has_process_chain"].is_boolean(),
+        "出参必须是 JSON boolean（不是 0/1、不是字符串）: {env}"
+    );
+
+    let held_of = |part_id: i64| -> Value {
+        env["data"]["workers"]
+            .as_array()
+            .expect("workers")
+            .iter()
+            .flat_map(|w| {
+                w["held_batches"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+            })
+            .find(|h| h["part_id"] == json!(part_id.to_string()))
+            .unwrap_or_else(|| panic!("held_batches 应含 part {part_id}: {env}"))
+    };
+    assert_eq!(
+        held_of(part_c)["has_process_chain"],
+        json!(true),
+        "C（已绑链 + 未定位）⇒ 走 EXISTS 分支 ⇒ true: {env}"
+    );
+    assert_eq!(
+        held_of(part_d)["has_process_chain"],
+        json!(false),
+        "D（无链）⇒ false: {env}"
+    );
+
+    // ---- 端点 d（之一）：GET /parts/pickable-by-work-type/{wt_id} ----
+    let (s2, env2) = send(
+        app.clone(),
+        json_request(
+            "GET",
+            &format!("/parts/pickable-by-work-type/{wt}"),
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK, "pickable-by-work-type: {env2}");
+    let pickable_of = |part_id: i64| -> Value {
+        env2["data"]["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|i| i["id"] == json!(part_id.to_string()))
+            .cloned()
+            .unwrap_or_else(|| panic!("可领列表应含 part {part_id}: {env2}"))
+    };
+    assert_eq!(
+        pickable_of(part_a)["has_process_chain"],
+        json!(true),
+        "pickable：A（已绑链 + 指针一致）⇒ true: {env2}"
+    );
+    assert_eq!(
+        pickable_of(part_b)["has_process_chain"],
+        json!(false),
+        "pickable：B（无链）⇒ false: {env2}"
+    );
+
+    // ---- 端点 d（之二）：GET /parts/by-worker/{worker_id} ----
+    let (s3, env3) = send(
+        app,
+        json_request(
+            "GET",
+            &format!("/parts/by-worker/{worker}"),
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s3, StatusCode::OK, "by-worker: {env3}");
+    let held_item_of = |part_id: i64| -> Value {
+        env3["data"]["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|i| i["id"] == json!(part_id.to_string()))
+            .cloned()
+            .unwrap_or_else(|| panic!("持有列表应含 part {part_id}: {env3}"))
+    };
+    assert_eq!(
+        held_item_of(part_c)["has_process_chain"],
+        json!(true),
+        "by-worker：C（已绑链 + 未定位）⇒ true: {env3}"
+    );
+    assert_eq!(
+        held_item_of(part_d)["has_process_chain"],
+        json!(false),
+        "by-worker：D（无链）⇒ false: {env3}"
+    );
+    // 链四字段不受本次改动影响（那是给放回页分流用的）
+    assert_eq!(
+        held_item_of(part_c)["chain_state"],
+        json!("NONE"),
+        "C 的指针与工序都为空 ⇒ chain_state 仍是 NONE（本次不动它）: {env3}"
+    );
+}

@@ -95,6 +95,16 @@ struct WorkTypeListRow {
     chain_next_process_id: Option<i64>,
     chain_next_process_name: Option<String>,
     chain_current_process_name: Option<String>,
+    // ---- 工序链存在性派生（pickable-by-work-type / by-worker 填）----
+    /// `shared::batch::chain::HAS_PROCESS_CHAIN_EXPR` 的结果（判据 = 工单已绑链
+    /// 且批次当前工序能在链内定位）。字段名即 SQL 别名（`FromRow` 按列名匹配）。
+    ///
+    /// **按 `Option<bool>` 收**（同 `chain_state` 等链派生列）：`by-work-type` 那条
+    /// SELECT 按本文件的约定把「本端点不填」投影成 `NULL::boolean`，而 `NULL` 解不进
+    /// 非可空的 `bool`（sqlx 报 `unexpected null; try decoding as an Option` ⇒ 整页
+    /// 500）。另两条端点投影的是非空 boolean（`IS NOT NULL AND …` 的结果恒非
+    /// NULL），故恒为 `Some`。
+    has_process_chain: Option<bool>,
 }
 
 impl WorkTypeListRow {
@@ -133,6 +143,9 @@ impl WorkTypeListRow {
             chain_next_process_id: self.chain_next_process_id.unwrap_or(0),
             chain_next_process_name: self.chain_next_process_name,
             chain_current_process_name: self.chain_current_process_name,
+            // 2026-10-09：链条上「这批货当前工序能不能在链内定位」（卡片绿色边框）。
+            // `by-work-type` 投影 `NULL::boolean` ⇒ 取保守默认 false（「没绑链」）。
+            has_process_chain: self.has_process_chain.unwrap_or(false),
             // ---- 以下为占位值（前端无消费方，见方法 doc）----
             applicant_name: String::new(),
             request_date: PLACEHOLDER_DATE,
@@ -255,7 +268,8 @@ impl PartService {
                     NULL::bigint AS process_chain_id, NULL::text AS chain_state, \
                     NULL::bigint AS chain_next_process_id, \
                     NULL::text AS chain_next_process_name, \
-                    NULL::text AS chain_current_process_name \
+                    NULL::text AS chain_current_process_name, \
+                    NULL::boolean AS has_process_chain \
              FROM t_part_batch b \
              JOIN t_part p ON p.id = b.part_id \
              JOIN t_worker w ON w.id = b.current_holder_id \
@@ -359,19 +373,27 @@ impl PartService {
         // 2026-10-09：批次别名由 `b` 改成 `pb`，与 `list_by_worker` 统一 —— 两条
         // SELECT 都经 `shared::batch::chain::HAS_PROCESS_CHAIN_EXPR`（别名契约是
         // `p` / `pb` / `cs`），别名不统一就得给片段准备第二套别名。
-        let rows: Vec<WorkTypeListRow> = sqlx::query_as(
+        //
+        // ⚠️ **注入面为 0**：`format!` 只填 `HAS_PROCESS_CHAIN_EXPR` 这一个编译期
+        // 常量，其余五个入参一律走 bind，故 `AssertSqlSafe` 包裹安全
+        // （口径同 `list_by_worker`）。`t_process_chain_step cs` 走 **LEFT JOIN** ——
+        // 指针为 NULL 的批次（无链工单的常态）必须照样出现在可领列表里。
+        let sql = format!(
             "SELECT p.id, p.serial_no, p.name, p.drawing_no, p.is_urgent, \
                     p.system_delivery_date, p.planned_delivery_date, pb.quantity, \
                     pb.id AS batch_id, pb.version AS batch_version, \
                     NULL::bigint AS process_chain_id, NULL::text AS chain_state, \
                     NULL::bigint AS chain_next_process_id, \
                     NULL::text AS chain_next_process_name, \
-                    NULL::text AS chain_current_process_name \
+                    NULL::text AS chain_current_process_name, \
+                    {} AS has_process_chain \
              FROM t_part_batch pb \
              JOIN t_part p ON p.id = pb.part_id \
              JOIN t_work_type_process wtp ON wtp.process_id = pb.current_process_id \
                 AND wtp.deleted_at IS NULL \
              JOIN t_shelf sh ON sh.id = pb.current_holder_id AND sh.deleted_at IS NULL \
+             LEFT JOIN t_process_chain_step cs \
+               ON cs.id = pb.current_process_step_id AND cs.deleted_at IS NULL \
              WHERE pb.deleted_at IS NULL AND p.deleted_at IS NULL \
                AND pb.status = 'IN_PROCESS' AND pb.location = 'PRODUCTION_SHELF' \
                AND sh.is_active = true AND sh.zone = 'PRODUCTION' \
@@ -380,14 +402,16 @@ impl PartService {
                AND ($5::bigint[] IS NULL OR sh.id = ANY($5)) \
              ORDER BY p.is_urgent DESC, p.planned_delivery_date ASC, pb.id ASC \
              LIMIT $3 OFFSET $4",
-        )
-        .bind(work_type_id)
-        .bind(shelf_filter)
-        .bind(limit)
-        .bind(offset)
-        .bind(shelf_scope.clone())
-        .fetch_all(repo.conn_mut())
-        .await?;
+            crate::shared::batch::chain::HAS_PROCESS_CHAIN_EXPR
+        );
+        let rows: Vec<WorkTypeListRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .bind(work_type_id)
+            .bind(shelf_filter)
+            .bind(limit)
+            .bind(offset)
+            .bind(shelf_scope.clone())
+            .fetch_all(repo.conn_mut())
+            .await?;
         let items: Vec<PartListItem> = rows
             .into_iter()
             .map(WorkTypeListRow::into_list_item)
@@ -548,7 +572,8 @@ impl PartService {
                     COALESCE(nx.chain_state, 'NONE') AS chain_state, \
                     COALESCE(nx.next_process_id, 0) AS chain_next_process_id, \
                     np.name AS chain_next_process_name, \
-                    cp.name AS chain_current_process_name \
+                    cp.name AS chain_current_process_name, \
+                    {} AS has_process_chain \
              FROM t_part_batch pb \
              JOIN t_part p ON p.id = pb.part_id \
              LEFT JOIN LATERAL ( {} ) nx ON TRUE \
@@ -557,14 +582,19 @@ impl PartService {
              LEFT JOIN t_process cp \
                ON cp.id = pb.current_process_id AND np.deleted_at IS NULL \
               AND nx.current_step_id IS NOT NULL \
+             LEFT JOIN t_process_chain_step cs \
+               ON cs.id = pb.current_process_step_id AND cs.deleted_at IS NULL \
              WHERE pb.deleted_at IS NULL AND p.deleted_at IS NULL \
                AND pb.status = 'IN_PROCESS' AND pb.location = 'WORKER' \
                AND pb.current_holder_id = $1 \
              ORDER BY pb.id DESC LIMIT $2 OFFSET $3",
+            crate::shared::batch::chain::HAS_PROCESS_CHAIN_EXPR,
             crate::shared::batch::chain::CHAIN_POSITION_LATERAL_SQL
         );
-        // ⚠️ **注入面为 0**：`format!` 只填 `CHAIN_POSITION_LATERAL_SQL` 这一个编译期
-        // 常量，`worker_id` / `limit` / `offset` 一律走 bind，故 `AssertSqlSafe` 安全。
+        // ⚠️ **注入面为 0**：`format!` 只填 `HAS_PROCESS_CHAIN_EXPR` 与
+        // `CHAIN_POSITION_LATERAL_SQL` 两个编译期常量，`worker_id` / `limit` /
+        // `offset` 一律走 bind，故 `AssertSqlSafe` 安全。`t_process_chain_step cs`
+        // 走 **LEFT JOIN**（无 step 的批次必须照样出现在放回列表里）。
         let rows: Vec<WorkTypeListRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
             .bind(worker_id)
             .bind(limit)

@@ -117,6 +117,36 @@ pub const CHAIN_POSITION_LATERAL_SQL: &str = "SELECT \
    ORDER BY cur.id ASC \
    LIMIT 1";
 
+/// 绿色左边框判据的 SQL **表达式**（不是片段 —— 它接在 `AS has_process_chain`
+/// 之前）。别名契约：`p` / `pb` / `cs`（同 [`CHAIN_POSITION_LATERAL_SQL`] 另加
+/// `cs` = `pb.current_process_step_id` 指向的 step）。
+///
+/// 语义：工单已绑链，**且**批次当前工序在链内能定位到 —— 两个分支：
+/// 1. `cs.process_id = pb.current_process_id`：指针存在且指向的 step 就是当前工序
+///    所在的那一步（与 [`ChainPosition::is_pointer_consistent`] 同款判据）；
+/// 2. `pb.current_process_id IS NULL` 且链内至少有一道未软删 step：批次尚未定位
+///    （PENDING 未下发 / 池内待领），但工单是有工艺链的。
+///
+/// 两条分支**互斥**（分支 1 蕴含 `current_process_id IS NOT NULL`），故可以并列
+/// `OR`。
+///
+/// ⚠️ **必须用 `IS NOT NULL AND =` 而不是 `IS NOT DISTINCT FROM`**：后者在
+/// `NULL = NULL` 时为真，会让未定位（`current_process_id IS NULL`）的批次一律走
+/// 分支 1 —— 而分支 1 拿 `cs.process_id`（NULL）与 NULL 比「相等」，于是**任何**
+/// 带链工单的 PENDING 批次都被判成「顺应工序」，绿色边框出现在它还没进任何工序
+/// 的时候。这条判据的消费方是卡片边框，不是安全闸门，但错值同样会被前端当事实
+/// 渲染。
+///
+/// 消费方在各自 SQL 里**必须**配一条
+/// `LEFT JOIN t_process_chain_step cs ON cs.id = pb.current_process_step_id AND cs.deleted_at IS NULL`
+/// —— 列表一律 LEFT JOIN（INNER 会让无 step 的批次从列表里消失，那比给错边框更糟）。
+pub const HAS_PROCESS_CHAIN_EXPR: &str = "p.process_chain_id IS NOT NULL \
+     AND ( (cs.process_id IS NOT NULL AND cs.process_id = pb.current_process_id) \
+           OR (pb.current_process_id IS NULL \
+               AND EXISTS (SELECT 1 FROM t_process_chain_step x \
+                           WHERE x.chain_id = p.process_chain_id \
+                             AND x.deleted_at IS NULL)) )";
+
 /// 单批次的链位置解析结果。`chain_state` 是**DB 文本**（`NEXT`/`TAIL`/`NONE`），
 /// 不在这里做枚举校验 —— 枚举在 `part::vo::ChainState::from_db_text`（wire 侧）。
 ///
@@ -146,7 +176,7 @@ impl ChainPosition {
     /// `process_id` 重复（歧义）。
     ///
     /// 这是「step 指针可安全当位置指针用」的判据，也是读侧列表卡片「绿色左边框」的判据
-    /// （列表侧是同一判据的纯 SQL 表达，见 `docs/api/queue.md` §2.5）。
+    /// —— 列表侧是同一判据的纯 SQL 表达 [`HAS_PROCESS_CHAIN_EXPR`]（两者必须同改）。
     pub fn is_pointer_consistent(&self, batch: &TPartBatch) -> bool {
         match (self.current_step_id, batch.current_process_step_id) {
             (Some(located), Some(pointer)) => located == pointer,

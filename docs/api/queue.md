@@ -104,6 +104,7 @@
 | `planned_delivery_date` | string \| null | `t_part.planned_delivery_date` |
 | `is_urgent` | boolean | `t_part.is_urgent` |
 | `has_cnc_program` | boolean | `EXISTS (t_part_file kind='G_CODE' AND part_id=pb.part_id AND deleted_at IS NULL)` |
+| `has_process_chain` | boolean | `shared::batch::chain::HAS_PROCESS_CHAIN_EXPR`（判据与理由见下） |
 | `customer_name` | string \| null | `t_customer`（`p.customer_id`，L2 叶子） |
 | `parent_customer_name` | string \| null | `t_customer`（`c2.parent_id`，L1 集团） |
 | `applicant_name` | string \| null | `t_applicant.name`（`a.name = p.applicant_name`，非 FK） |
@@ -128,12 +129,47 @@
 | `shelf_code` / `shelf_name` | string | `t_shelf.code` / `.name`（INNER JOIN，未命中则该批不进候选池） |
 | `is_urgent` | boolean | `t_part.is_urgent` |
 | `has_cnc_program` | boolean | 同 `QueueHeldBatch` 的 EXISTS |
+| `has_process_chain` | boolean | 同 `QueueHeldBatch` 的 `HAS_PROCESS_CHAIN_EXPR` |
 | `note` | string \| null | `t_part.note` |
 | `version` | number | `t_part_batch.version`（OCC 锚） |
 
 `shelf_id` 是 `POST /queue/move` 的 `from.shelf_id` **唯一数据源**：候选池跨货架，不能用用户当前激活货架凑（激活货架对 MANAGER / CLERK / INSPECTOR 恒为空）。
 
 ⚠️ **不含 `customer_path` 与 `location`**：前者前端自己拼 L1 / L2；后者恒为 `"PRODUCTION_SHELF"`，前端用 `shelf_code` 表达位置。见 §6。
+
+### 2.6 `has_process_chain` 判据（4 处卡片共用一个常量）
+
+卡片绿色左边框的判据，**唯一真源**是 `shared::batch::chain::HAS_PROCESS_CHAIN_EXPR`（Rust 侧同款判据是 `ChainPosition::is_pointer_consistent`）：
+
+```sql
+p.process_chain_id IS NOT NULL
+AND ( (cs.process_id IS NOT NULL AND cs.process_id = pb.current_process_id)
+   OR (pb.current_process_id IS NULL
+       AND EXISTS (SELECT 1 FROM t_process_chain_step x
+                   WHERE x.chain_id = p.process_chain_id AND x.deleted_at IS NULL)) )
+```
+
+| 分支 | 形态 | 含义 |
+|---|---|---|
+| 1 | 指针存在且其 step 的工序 == 批次当前工序 | 批次当前工序能在链内定位（dispatch / 顺工序推进后的正常形态） |
+| 2 | `current_process_id IS NULL` 且链内有活跃 step | 批次**尚未定位工序**但工单有链（PENDING / 未下发） |
+
+两条分支互斥（分支 1 蕴含 `current_process_id IS NOT NULL`），故可并列 `OR`。
+
+⚠️ **必须用 `IS NOT NULL AND =` 而不是 `IS NOT DISTINCT FROM`**：后者在 `NULL = NULL` 时为真，会让未定位（`current_process_id IS NULL`）的批次走分支 1（`cs.process_id` 也是 NULL，与 NULL 比「相等」），把「还没进任何工序」的批次也画上绿框。
+
+⚠️ `t_process_chain_step cs` 一律 **LEFT JOIN**（`cs.id = pb.current_process_step_id AND cs.deleted_at IS NULL`）：INNER 会让无 step 的批次（无链工单的常态）从列表里整批消失 —— 那比给错边框更糟。
+
+**4 处落点**（四处必须同改，共用同一常量）：
+
+| # | 域 | 端点 / 出参 |
+|---|---|---|
+| a | `prod::queue` | `GET /prod/queue/processes/{id}` → `items[].has_process_chain`（`QueuePoolItem`） |
+| b | `prod::queue` | 同上 → `workers[].held_batches[].has_process_chain`（`QueueHeldBatch`） |
+| c | `outsource` | `GET /outsource-queue/processes/{id}` → `items[].has_process_chain`（`OutsourceQueueCandidate`） |
+| d | `part` | `GET /parts/pickable-by-work-type/{id}` 与 `GET /parts/by-worker/{id}` → `items[].has_process_chain`（`PartListItem`） |
+
+`PartListItem` 是 **7 个域共用**的 VO，仅 (d) 的两个端点填真值；其余构造点（`From<TPart>` / `com::union_list` 的两个 project 函数）显式填 `false` —— 链位置是**批次级**事实，part 级行无从推导（没有 `#[serde(default)]`，漏赋值会编译失败）。
 
 ## 3. 下发流 VO（端点 3 / 4 / 5 / 6）
 
@@ -328,7 +364,8 @@ queue 域**整体不适用**域隔离护栏：它继承 worker_pool 的「经本
 7. **i64 字符串化**：所有雪花 id 仍是 JSON string，本仓不因本次改动变更该约定。
 8. **`max_held` 取值位置变更**：原从 `work_types[].max_held_batches` 按工种查，改从 `workers[].max_held` 按工人直接读。`max_held_batches` 未设置时后端返 0（不是 null）—— 展示「未设置上限」占位的逻辑需自行按 0 判断。
 9. **代码里残留的 `WORKER_POOL_*` WS 事件名不变**（`kind` 是 WS 协议的一部分，改它要同步 dashboard 域的白名单与前端 `AFFECTS_DASHBOARD`）。本域改的只是 URL 与类型名。
-10. **`POST /queue/move` 的 `version` 升为必填**（2026-10-09）：此前三个方向都由 service 用「本次事务里刚读到的 `batch.version`」当 `expected_version`，等价于**没有 OCC** —— 看板数据是 30s 缓存的快照，期间他人改过批次时「用户看到 5 件 → 实际移动 3 件」会静默成功。值取候选卡 / 持有卡的 `version`；漏传 → **HTTP 422 纯文本**（`version` 无 `#[serde(default)]`）。
+10. **4 处卡片 DTO 新增 `has_process_chain`（boolean）**（2026-10-09）：`QueuePoolItem` / `QueueHeldBatch` / `OutsourceQueueCandidate` / `PartListItem`（仅扫码台两条端点填真值）。它是**绿色左边框的判据**，判据见 §2.6。zod 侧按 `z.boolean()` 声明 —— 前端不要按「工单有没有绑链」重新在前端推一遍（后端已经算好，且未定位批次走的是另一个分支）。
+11. **`POST /queue/move` 的 `version` 升为必填**（2026-10-09）：此前三个方向都由 service 用「本次事务里刚读到的 `batch.version`」当 `expected_version`，等价于**没有 OCC** —— 看板数据是 30s 缓存的快照，期间他人改过批次时「用户看到 5 件 → 实际移动 3 件」会静默成功。值取候选卡 / 持有卡的 `version`；漏传 → **HTTP 422 纯文本**（`version` 无 `#[serde(default)]`）。
 
 ### 8.4 已知偏差登记
 

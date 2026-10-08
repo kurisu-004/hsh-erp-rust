@@ -114,6 +114,11 @@ pub struct QueueHeldBatch {
     pub planned_delivery_date: Option<chrono::NaiveDate>,
     pub is_urgent: bool,
     pub has_cnc_program: bool,
+    /// 工单已绑工序链**且**批次当前工序能在链内定位（判据见
+    /// `shared::batch::chain::HAS_PROCESS_CHAIN_EXPR`）—— 卡片绿色左边框的判据。
+    /// 判据与 [`QueuePoolItem::has_process_chain`] 同源（同一个常量），两列必须
+    /// 同时改。
+    pub has_process_chain: bool,
     pub customer_name: Option<String>,
     pub parent_customer_name: Option<String>,
     pub applicant_name: Option<String>,
@@ -147,6 +152,8 @@ pub struct QueuePoolItem {
     pub shelf_name: String,
     pub is_urgent: bool,
     pub has_cnc_program: bool,
+    /// 同 [`QueueHeldBatch::has_process_chain`]（同一个常量、同一个判据）。
+    pub has_process_chain: bool,
     pub note: Option<String>,
     pub version: i32,
 }

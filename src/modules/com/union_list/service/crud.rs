@@ -775,6 +775,9 @@ fn project_assembly_to_part_list_item(a: TAssembly) -> PartListItem {
         chain_next_process_id: 0,
         chain_next_process_name: None,
         chain_current_process_name: None,
+        // 2026-10-09 新增：链位置判据是**批次级**事实，装配行没有批次锚点 ⇒
+        // 恒 false（与 `chain_state` / `batch_id` 同款）。
+        has_process_chain: false,
         // 2026-10-03 新增：已送数量。本 helper 只做 TAssembly → PartListItem 的字段
         // 搬运，装配行的已送套数需跨表聚合，由 caller（list_assembly / list_all 的
         // ASSEMBLY 分支）用 `fetch_delivered_sets` 显式覆写。
@@ -830,6 +833,8 @@ fn union_row_to_part_list_item(r: UnionListRow) -> PartListItem {
         chain_next_process_id: 0,
         chain_next_process_name: None,
         chain_current_process_name: None,
+        // 2026-10-09：同上，链位置判据恒 false（行单位是 part，批次不唯一）。
+        has_process_chain: false,
         // 2026-10-03 新增：同上，已送数量由 caller（list_all 的 PART / ASSEMBLY
         // 两个分支）按行类型分别用两个聚合 helper 覆写。
         delivered_quantity: None,
