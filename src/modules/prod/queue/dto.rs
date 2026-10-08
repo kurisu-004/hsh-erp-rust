@@ -17,12 +17,14 @@
 //! 跨方向 enum 在 doc comment 注明」即视作合理偏离，本域 `AutoAllocateMode`
 //! 是这种 enum 模式。
 //!
-//! ## `MoveLocation` tagged enum（2026-09-30 重构）
+//! ## `from` / `to` 两个 tagged enum（2026-09-30 重构；2026-10-10 拆分）
 //! 原 `admin_remove` / `admin_assign` 合并为通用 `POST /api/v2/prod/pool/move`，
 //! 端点接受 `from` / `to` 两个 tagged enum 标识 batch 当前位置与目标位置。
-//! 序列化形态：
-//! - `{"kind":"POOL",  "shelf_id":100}`
-//! - `{"kind":"WORKER","worker_id":50}`
+//! 2026-10-10 起 `from` 用 [`MoveFromLocation`]、`to` 用 [`MoveToLocation`] 两个独立
+//! 类型 —— `to` 侧的 `POOL` 分支不再有 `shelf_id`（目标架自动选），`from` 侧仍必填
+//! （要拿它比对批次的真实所在货架）。序列化形态：
+//! - `from`：`{"kind":"POOL",  "shelf_id":100}` / `{"kind":"WORKER","worker_id":50}`
+//! - `to`：`{"kind":"POOL"}` / `{"kind":"WORKER","worker_id":50}`
 //!
 //! 不支持 `POOL → POOL`（视为非法，service 返回 `40001 VALIDATION_ERROR`）。
 
@@ -37,7 +39,12 @@ pub enum WorkerScanEvent {
     INSPECTED,
 }
 
-/// POST /api/v2/prod/pool/refill
+/// `POST /api/v2/prod/queue/refill` 入参（Manager only，前端零消费方）。
+///
+/// `shelf_id` **2026-10-10 起保留必填**：它是「为某工人在某架上抢料」这条**显式
+/// 管理员操作**的架锚，与 worker-scan 的跨架取料（`shelf_id = null`）是两种口径。
+/// 自动选架只接管了 worker-scan 路径；这里刻意不改，否则「限定在某个架上抢料」
+/// 这个运维动作就没有入口了。
 #[derive(Debug, Clone, Deserialize)]
 pub struct AdminRefillRequest {
     #[serde(deserialize_with = "deserialize_i64")]
@@ -61,6 +68,8 @@ pub enum AutoAllocateMode {
 pub struct AutoAllocateRequest {
     #[serde(deserialize_with = "deserialize_i64")]
     pub process_id: i64,
+    /// 2026-10-10 起**保留必填**，理由同 [`AdminRefillRequest::shelf_id`]：
+    /// 「按工序 + 架自动分配」是管理员的显式批量操作，架锚是它的语义的一部分。
     #[serde(deserialize_with = "deserialize_i64")]
     pub shelf_id: i64,
     pub mode: AutoAllocateMode,
@@ -70,24 +79,55 @@ pub struct AutoAllocateRequest {
 /// `POST /api/v2/prod/pool/move` —— 通用移动端点。
 ///
 /// 把 batch 在 `from` → `to` 之间移动，覆盖 pool ↔ worker（worker ↔ worker 也支持）。
-/// 该 enum 取代原 `AdminAssignRequest`（POOL→WORKER 单边）与 `AdminRemoveRequest`
+/// 该端点取代原 `AdminAssignRequest`（POOL→WORKER 单边）与 `AdminRemoveRequest`
 /// （WORKER→POOL 单边）。`POOL → POOL` / `WORKER → WORKER` 同 kind 视为非法
 /// （service 抛 `40001 VALIDATION_ERROR`）。
 ///
+/// ## 为什么 `from` / `to` 是两个独立类型（2026-10-10）
+///
+/// 两侧的 `POOL` 语义相反、字段需求也不同，硬塞进一个 enum 就会出现「`from` 需要
+/// `shelf_id`、`to` 不需要」这种没法表达的不对称 —— 2026-10-10 之前正是那样：共用
+/// 的 `MoveLocation::Pool { shelf_id }` 让 `to` 侧也被迫要求 `shelf_id`，而目标货架
+/// 改由服务端按负载自动选之后这个字段已经**没有角色可留**（前端不发它，服务端就会在
+/// axum `Json` 提取器阶段返 422 纯文本）。
+///
+/// | 侧 | `POOL` 分支的 `shelf_id` |
+/// |---|---|
+/// | `from` | **必填** —— 它是批次**真实所在**的货架，service 要拿它比对 `batch.current_holder_id` |
+/// | `to` | **不存在** —— 目标货架由 `shared::shelf::select::pick_least_loaded` 按批次当前工序自动选 |
+///
 /// 序列化形态：
 /// ```jsonc
+/// // from
 /// {"kind":"POOL",   "shelf_id": 100}
+/// {"kind":"WORKER", "worker_id": 50}
+/// // to
+/// {"kind":"POOL"}
 /// {"kind":"WORKER", "worker_id": 50}
 /// ```
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "UPPERCASE")]
-pub enum MoveLocation {
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MoveFromLocation {
     /// batch 当前在生产货架（候选池）。`shelf_id` 必须与 batch.current_holder_id 一致。
     Pool {
         #[serde(deserialize_with = "deserialize_i64")]
         shelf_id: i64,
     },
     /// batch 当前被 worker 持有。`worker_id` 必须与 batch.current_holder_id 一致。
+    Worker {
+        #[serde(deserialize_with = "deserialize_i64")]
+        worker_id: i64,
+    },
+}
+
+/// `to` 侧位置。见 [`MoveFromLocation`] 的「两个独立类型」一节。
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MoveToLocation {
+    /// 目标候选池。**不带任何字段** —— 目标货架由服务端自动选（`WORKER → POOL`
+    /// 方向：按批次当前 `current_process_id` 在映射了该工序的活跃生产架里挑负载最低的）。
+    Pool,
+    /// 目标 worker。`worker_id` 是接收方。
     Worker {
         #[serde(deserialize_with = "deserialize_i64")]
         worker_id: i64,
@@ -110,8 +150,8 @@ pub struct MoveRequest {
     /// 会静默成功。服务端读到的 version 现在只用于**兜底对账**（0 行时区分归因），
     /// 不能替代客户端传值。豁免清单见 `CLAUDE.md` §8。
     pub version: i32,
-    pub from: MoveLocation,
-    pub to: MoveLocation,
+    pub from: MoveFromLocation,
+    pub to: MoveToLocation,
     #[serde(default)]
     pub note: Option<String>,
 }

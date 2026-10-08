@@ -8,22 +8,36 @@
 //! —— scan 与 refill 共享一个原子事务，否则「扫描放回 → refill 抢批」中间会被
 //! 并发抢走同批。
 //!
-//! ## 错误码契约
+//! ## 错误码契约（2026-10-10：货架由服务端自动选，`shelf_id` 入参删除）
 //! - 20101 `BIZ_PART_NOT_FOUND` —— serial_no 不存在
-//! - 20103 `BIZ_INVALID_TRANSITION` —— part 当前状态不允许（INSPECTED 分支）
+//! - 20103 `BIZ_INVALID_TRANSITION` —— part 当前状态不允许（送检分支）
 //! - 20104 `BIZ_INVALID_VALUE` —— 非法 part 状态
 //! - 20114 `BIZ_PART_BATCH_NOT_HELD_BY_WORKER` —— worker 没持有 / 多批歧义
 //! - 20201 `BIZ_WORKER_NOT_FOUND` —— badge_code 未注册
 //! - 20202 `BIZ_WORKER_INACTIVE` —— worker 已停用
 //! - 20206 `BIZ_WORKER_NO_WORK_TYPE` —— worker 未分配工种
-//! - 20501 `BIZ_SHELF_NOT_FOUND` —— shelf 不存在 / 非 PRODUCTION / target 非 INSPECTION
-//! - 20507 `BIZ_SHELF_PROCESS_NOT_MAPPED` —— RETURNED 时 shelf ↔ process 未映射
-//! - 20511 `BIZ_SHELF_NOT_INSPECTION_ZONE` —— target_inspection_shelf.zone ≠ 'INSPECTION'
+//! - 20508 `BIZ_SHELF_PROCESS_NOT_FOUND` —— RETURNED：推导出的下一道工序**没有**
+//!   可用生产货架（没配映射 / 映射的架全停用或软删 / 全非 PRODUCTION / 都不在
+//!   当前账号 scope 内）
 //! - 40001 `VALIDATION_ERROR` —— next_process_id 缺 / 非法（**仅非顺应工序时**
-//!   才要求前端传 `next_process_id`；顺应工序时后端按链推导，见
-//!   `crate::shared::batch::chain` 与 RETURNED 分支注释）或 target_inspection_shelf_id 缺
-//! - 40301 `SHELF_MISMATCH` —— 当前用户无权限访问 target shelf
+//!   才要求前端传 `next_process_id`；顺应工序时后端按链推导，链尾时直接自动送检，
+//!   见 `crate::shared::batch::chain` 与 RETURNED 分支注释）
+//! - 40301 `SHELF_MISMATCH` —— 送检时当前账号 scope 内**没有**任何可用的 INSPECTION
+//!   货架（原先这条码守的是「前端指定的品检架越权」；选架后触发时机变成「scope 内
+//!   没有品检架」，语义仍是**无权**而不是「架不存在」）
 //! - 40901 `VERSION_CONFLICT` —— 乐观锁失败
+//!
+//! ## 2026-10-10 三处结构变化
+//!
+//! 1. **共享前置的 shelf 校验删除**：原来第 1 步（`event_type` 分支**之前**）无条件
+//!    查 `ShelfRepo::get_by_id_zone(req.shelf_id, "PRODUCTION")`，两个分支共用一个
+//!    架。现在两个分支各自选架（RETURNED 选生产架、送检选品检架），共享前置无从谈起。
+//! 2. **RETURNED 与 INSPECTED 都改成「选架 + 写入」**，`ShelfProcessRepo` 与
+//!    `ShelfRepo` 在本文件的引用归零（映射校验与存在/停用/zone 三谓词都已被选架覆盖）。
+//! 3. **RETURNED 新增「链尾自动送检」分支**：批次在工序链上是最后一道时，放回 = 做
+//!    完了，直接走送检写入路径，不落生产架。响应的 `event_type` 因此**可能与请求的
+//!    不同**（发 `RETURNED` 收 `WORKER_SCAN_INSPECTED`）—— handler 按
+//!    `scan_out.event_type` 广播，所以 WS 链路自动成立、无需改 handler。
 
 use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
@@ -35,9 +49,7 @@ use crate::modules::part::statemachine::PartStatus;
 use crate::modules::prod::batch::dto::WorkerScanRequest;
 use crate::modules::prod::batch::vo::WorkerScanCoreOut;
 use crate::modules::prod::queue::dto::WorkerScanEvent;
-use crate::modules::prod::shelf_process::repo::ShelfProcessRepo;
 use crate::modules::prod::worker::repo::WorkerRepo;
-use crate::modules::shelf::repo::ShelfRepo;
 use crate::shared::error::{AppError, code};
 
 use super::BatchService;
@@ -47,14 +59,17 @@ impl BatchService {
     ///
     /// 两分支：
     /// - `RETURNED`：worker 把持有件放回生产架（同 admin_remove 语义，但走扫码台 +
-    ///   worker 自查路径）；要求 shelf ∈ PRODUCTION 区 + active；shelf ↔ 目标工序在
-    ///   `t_shelf_process` 必须有映射（20507 NOT_MAPPED）；切 holder worker → shelf
-    ///   （OCC）+ 写 `RETURNED_TO_SHELF` 事件。**目标工序 2026-10-09 起由后端按链
-    ///   推导**（顺应工序时），前端只在非顺应工序时必须显式传
-    ///   `next_process_id`（详见 RETURNED 分支注释与
-    ///   `crate::shared::batch::chain`）。
+    ///   worker 自查路径）；目标架由 `pick_least_loaded(PRODUCTION, Some(目标工序), scope)`
+    ///   按负载选出（选不出 → 20508）；切 holder worker → shelf（OCC）+ 写
+    ///   `RETURNED_TO_SHELF` 事件。**目标工序 2026-10-09 起由后端按链推导**（顺应工序
+    ///   时），前端只在非顺应工序时必须显式传 `next_process_id`（详见 RETURNED 分支注释
+    ///   与 `crate::shared::batch::chain`）。
+    ///   **2026-10-10 新增**：批次在链尾（`chain_state == "TAIL"`）时该批已完工，
+    ///   改走与 `INSPECTED` 完全相同的送检写入路径，`event_type` 响应为
+    ///   `WORKER_SCAN_INSPECTED`。
     /// - `INSPECTED`：worker 把持有件直接送检（INSPECTION → INSPECTION + 状态机
-    ///   IN_PROCESS → INSPECTION）；要求 target shelf ∈ INSPECTION 区 + active；
+    ///   IN_PROCESS → INSPECTION）；目标品检架由
+    ///   `pick_least_loaded(INSPECTION, None, scope)` 按负载选出（选不出 → 40301）；
     ///   状态机校验 → mark_*_inspected（OCC）+ 写 `SENT_TO_INSPECTION` 事件。
     ///
     /// 两条路径都先定位 worker 持有的 IN_PROCESS+WORKER 批次
@@ -79,15 +94,9 @@ impl BatchService {
         req: WorkerScanRequest,
         current: &CurrentUser,
     ) -> Result<WorkerScanCoreOut, AppError> {
-        // 1. shelf 校验（worker-scan shelf 必须 PRODUCTION 区 active；存在性 + zone 守卫）
-        let _shelf = ShelfRepo::get_by_id_zone(repo.conn_mut(), req.shelf_id, "PRODUCTION")
-            .await?
-            .ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_SHELF_NOT_FOUND,
-                    format!("shelf {} 不存在或非 PRODUCTION 区", req.shelf_id),
-                )
-            })?;
+        // 1. 2026-10-10：原来的「共享前置 shelf 校验」（无条件查 PRODUCTION 区活跃架）
+        //    随 `shelf_id` 入参删除而消失 —— 两个分支现在各自选架（RETURNED 选生产架、
+        //    送检选品检架），不存在「共用的那一个架」。
         // 2. 反查 worker
         let worker = WorkerRepo::get_by_badge_code(repo.conn_mut(), &req.badge_code, false)
             .await?
@@ -150,13 +159,20 @@ impl BatchService {
             WorkerScanEvent::RETURNED => {
                 // 解析批次在链上的位置，决定「下一道工序」是自动推导还是前端显式指定。
                 //
-                // 2026-10-09 起这段是「一个判据、两个分支」：
+                // 2026-10-09 起这段是「一个判据、三个分支」：
+                // - **链尾**（`chain_state == "TAIL"`）⇒ 这批做完了，**直接送检**，
+                //   不落生产架（2026-10-10 新增）；
                 // - **顺应工序**（step 指针与 `current_process_id` 一致）且链内有下一
                 //   道 ⇒ 自动取链上下一 step 的工序，前端可以**不传**
                 //   `next_process_id`；
-                // - **非顺应**（无链 / 链已软删 / 指针漂移 / 链内工序重复 / 链尾）⇒
+                // - **非顺应**（无链 / 链已软删 / 指针漂移 / 链内工序重复）⇒
                 //   必须由前端显式指定 —— 这些成因下「链上下一道」要么推不出来，要么
                 //   推出来的值不可信，猜一次就是一次静默错工序。
+                //
+                // ⚠️ **TAIL 判定必须先于 `next_process_id` 的必填校验**：链尾是
+                // 「顺应但没有下一道」，若把必填校验放在 TAIL 判定之前，工人在链尾
+                // 放回时会被 40001 拦下、根本走不到送检分支（而链尾恰恰**不该**要求
+                // 前端填下一道工序）。
                 //
                 // 判据本身（锚链两步定位、按 `current_process_id` 在链内重新定位、
                 // 链内工序重复显式落 NONE）与读侧 `GET /parts/by-worker` 逐条同源：
@@ -169,6 +185,35 @@ impl BatchService {
                     &batch,
                 )
                 .await?;
+                // ── 链尾自动送检（2026-10-10 新增）────────────────────────────
+                //
+                // 判据是 `is_pointer_consistent(&batch) && chain_state == "TAIL"` ——
+                // 与紧邻其下的 NEXT 分支**同款**地要求指针一致。缺了指针一致性这一半，
+                // 一个 step 指针已经漂移的批次（`current_process_step_id` 指向别的链
+                // / 已软删 / NULL）只要它恰好落进一条单 step 链的锚链里，就会被判成
+                // 「做完了」直接送检 —— 绕过了「非顺应 ⇒ 必须显式指定下一道工序」
+                // 这道闸门。而指针漂移的成因恰恰说明链信息已经不可信，此时最不该做
+                // 的是替工人断定「这批做完了」。
+                if position.is_pointer_consistent(&batch)
+                    && position.chain_state.as_deref() == Some("TAIL")
+                {
+                    // 与 `INSPECTED` 分支**逐字同款**的写入路径（同一个
+                    // `sent_to_inspection` helper），故状态机守卫、OCC、
+                    // part/assembly 派生、事件日志都只有一份实现。
+                    synced_assembly_id =
+                        sent_to_inspection(&mut repo, snowflake, &part, &batch, &worker, current)
+                            .await?;
+                    event_type_str = "WORKER_SCAN_INSPECTED";
+                    return Ok(WorkerScanCoreOut {
+                        worker_id: worker.id,
+                        part_id: part.id,
+                        batch_id: batch.id,
+                        event_type: event_type_str.to_string(),
+                        synced_assembly_id,
+                        work_type_id,
+                        badge_code: worker.badge_code.clone(),
+                    });
+                }
                 let (next_pid, step_id_opt): (i64, Option<i64>) = if position
                     .is_pointer_consistent(&batch)
                     && position.chain_state.as_deref() == Some("NEXT")
@@ -206,28 +251,33 @@ impl BatchService {
                             .await?;
                     (pid, step)
                 };
-                // shelf ↔ process 映射校验。
+                // 目标生产架：2026-10-10 起由服务端按 `current_load / capacity`
+                // 升序选（`shelf_id` 入参删除）。
                 //
-                // 必须走 `ShelfProcessRepo::exists_for_shelf_process`，**不要**在本文件
-                // 内联 `SELECT EXISTS(…)`：共享方法带 `deleted_at IS NULL` 守卫，内联
-                // 写法一旦漏掉，已软删的货架↔工序映射就会放行 RETURNED，使 20507
-                // `BIZ_SHELF_PROCESS_NOT_MAPPED` 的触发条件与 worker-pool `move_batch`
-                // 那条路径分叉。走共享方法后两条路径同源，不会再各自漂移。
+                // 「选出来的架必须映射 `next_pid`」这条 20507 守卫**已被选架本身
+                // 覆盖**：选架的候选集只含 `t_shelf_process` 里映射了该工序的行
+                // （带 `deleted_at IS NULL` 闸门）。所以不必再调
+                // `ShelfProcessRepo::exists_for_shelf_process` 做第二次判定 ——
+                // 那会变成「同一个谓词判两遍」，两遍的闸门一旦漂移就会放行已软删的映射。
                 //
-                // ⚠️ 校验用的是**推导出来的** `next_pid`（顺应工序时 = 链上下一道），
+                // ⚠️ 选架用的是**推导出来的** `next_pid`（顺应工序时 = 链上下一道），
                 // 而请求体里的 `next_process_id` 在该分支可能压根不存在。
-                let maps = ShelfProcessRepo::exists_for_shelf_process(
+                let shelf = crate::shared::shelf::select::pick_least_loaded(
                     repo.conn_mut(),
-                    req.shelf_id,
-                    next_pid,
+                    "PRODUCTION",
+                    Some(next_pid),
+                    crate::shared::shelf::select::shelf_scope_for(current),
                 )
-                .await?;
-                if !maps {
-                    return Err(AppError::biz(
-                        code::BIZ_SHELF_PROCESS_NOT_MAPPED,
-                        format!("shelf {} 不映射到工序 {}", req.shelf_id, next_pid),
-                    ));
-                }
+                .await?
+                .ok_or_else(|| {
+                    AppError::biz(
+                        code::BIZ_SHELF_PROCESS_NOT_FOUND,
+                        format!(
+                            "process {next_pid} 无可用生产货架（无 active 映射，或命中的映射其货架 \
+                             均已软删 / 已停用 / 非 PRODUCTION 区 / 不在当前账号 scope 内）"
+                        ),
+                    )
+                })?;
                 // 切 holder worker → shelf（OCC）
                 //
                 // 2026-09-30 修复：RETURNED 是全仓唯一**推进工序**的
@@ -260,7 +310,9 @@ impl BatchService {
                     .mark_batch_returned(
                         batch.id,
                         batch.version,
-                        req.shelf_id,
+                        // 形参语义未变：「服务端选出来的目标架」，2026-10-10 起不再
+                        // 来自请求体。
+                        shelf.id,
                         step_id_opt,
                         Some(next_pid),
                         Some(current.id),
@@ -293,79 +345,9 @@ impl BatchService {
                 event_type_str = "WORKER_SCAN_RETURNED";
             }
             WorkerScanEvent::INSPECTED => {
-                // INSPECTED 必须传 target_inspection_shelf_id
-                let target_id: i64 = req
-                    .target_inspection_shelf_id
-                    .as_deref()
-                    .ok_or_else(|| {
-                        AppError::validation("INSPECTED 必须传 target_inspection_shelf_id")
-                    })?
-                    .parse()
-                    .map_err(|_| AppError::validation("target_inspection_shelf_id 非法"))?;
-                let target = ShelfRepo::get_active_by_id(repo.conn_mut(), target_id)
-                    .await?
-                    .ok_or_else(|| {
-                        AppError::biz(code::BIZ_SHELF_NOT_FOUND, "target shelf 不存在")
-                    })?;
-                if target.zone != "INSPECTION" {
-                    return Err(AppError::biz(
-                        code::BIZ_SHELF_NOT_INSPECTION_ZONE,
-                        format!("target shelf zone={} 非 INSPECTION", target.zone),
-                    ));
-                }
-                // 防御性：即使 req.shelf_id 已在 scope 内，target 也需校验
-                // （SHELF_ACCOUNT 用户的 shelf_ids 是手填白名单）。
-                if !current.can_access_shelf(target_id) {
-                    return Err(AppError::biz(
-                        code::SHELF_MISMATCH,
-                        format!("无权限访问 target shelf {}", target_id),
-                    ));
-                }
-                // 状态机：IN_PROCESS → INSPECTION
-                //
-                // 2026-10-06 读 `batch.status`（批次真源）而非 `part.status`（派生缓存列），
-                // 理由与假阴性分析见 `transition_core.rs::to_ship_core` 同处注释。本分支
-                // 当前无假阴性（batch 源状态固定 IN_PROCESS，part 派生值不会更晚），
-                // 但判据读错列本身是隐患，一并对齐。
-                let from = PartStatus::from_str(&batch.status).ok_or_else(|| {
-                    AppError::biz(
-                        code::BIZ_INVALID_VALUE,
-                        format!("batch {} 状态非法: {}", batch.id, batch.status),
-                    )
-                })?;
-                if !from.can_transition_to(PartStatus::INSPECTION) {
-                    return Err(AppError::biz(
-                        code::BIZ_INVALID_TRANSITION,
-                        format!("batch {} 当前状态 {} 不允许送检", batch.id, from.as_str()),
-                    ));
-                }
-                // 切 holder worker → target_shelf + 状态 IN_PROCESS → INSPECTION（OCC）
-                // 2026-10-01：写 + part 派生 + assembly 级联已在 shared::batch::status 内完成，
-                // 0 行由 gate 抛 40901（原 `if n == 0` 是死代码）。
-                let rollup = repo
-                    .mark_batch_inspected(batch.id, batch.version, target_id, Some(current.id))
-                    .await?;
-                // PR-B2：直接取 gate 的派生结果（不再补调
-                // `PartService::sync_from_batch_change` —— 第二次派生必然
-                // `NoChange`，会把 `synced_assembly_id` 恒吞成 null）。
-                synced_assembly_id = match rollup.sync {
-                    SyncOutcome::Changed(aid) => Some(aid),
-                    SyncOutcome::NoChange => None,
-                };
-                repo.insert_part_event(NewPartEvent {
-                    id: snowflake.next_id(),
-                    part_id: part.id,
-                    event_type: "SENT_TO_INSPECTION",
-                    from_status: Some("IN_PROCESS"),
-                    to_status: Some("INSPECTION"),
-                    batch_id: Some(batch.id),
-                    quantity: Some(batch.quantity),
-                    drawing_code: Some(&part.drawing_no),
-                    badge_code: Some(&worker.badge_code),
-                    note: None,
-                    created_by: Some(current.id),
-                })
-                .await?;
+                synced_assembly_id =
+                    sent_to_inspection(&mut repo, snowflake, &part, &batch, &worker, current)
+                        .await?;
                 event_type_str = "WORKER_SCAN_INSPECTED";
             }
         }
@@ -379,4 +361,88 @@ impl BatchService {
             badge_code: worker.badge_code.clone(),
         })
     }
+}
+
+/// 「送检」的完整写入路径：`选品检架 → 状态机守卫 → mark_batch_inspected → 写事件`。
+///
+/// **两个调用点**（2026-10-10 起）：
+/// 1. `WorkerScanEvent::INSPECTED` —— 工人显式送检；
+/// 2. `WorkerScanEvent::RETURNED` 且 `chain_state == "TAIL"` —— 链尾自动送检。
+///
+/// 之所以抽成自由函数而不是让第二条路径「跳进」第一条：`match` 的两个臂在同一个
+/// 作用域里共享 `synced_assembly_id` 等可变绑定，而链尾那条需要**提前 return**
+/// （TAIL 分支之后不再有 RETURNED 的其余逻辑），用「设 flag + 臂内分支」会让两条
+/// 路径的状态机守卫被复制一遍 —— 而守卫与事件字面量是最该只有一份的东西。
+///
+/// 返回 `synced_assembly_id`（父装配件真变了才有值），供 handler 决定是否广播
+/// `ASSEMBLY_UPDATED`。
+///
+/// ## 错误码
+/// - `40301 SHELF_MISMATCH`：当前账号 scope 内没有可用的 INSPECTION 货架
+/// - `20103 BIZ_INVALID_TRANSITION` / `20104 BIZ_INVALID_VALUE`：批次状态不允许送检
+/// - `40901 VERSION_CONFLICT`：乐观锁失败（由 `shared::batch::status` 抛）
+async fn sent_to_inspection<R: PartRepoTrait>(
+    repo: &mut R,
+    snowflake: &SnowflakeIdGenerator,
+    part: &crate::modules::part::model::TPart,
+    batch: &crate::shared::batch::TPartBatch,
+    worker: &crate::modules::prod::worker::model::TWorker,
+    current: &CurrentUser,
+) -> Result<Option<i64>, AppError> {
+    // 目标品检架：按负载自动选（`target_inspection_shelf_id` 入参 2026-10-10 删除）。
+    // 选不出时用 `40301` 而不是 `20501`：成因是「你的 scope 里没有任何可用的品检架」
+    // （典型：一个只绑了生产架的 SHELF_ACCOUNT），语义是**无权**而不是「架不存在」。
+    let target_id = crate::shared::shelf::select::pick_least_loaded(
+        repo.conn_mut(),
+        "INSPECTION",
+        None,
+        crate::shared::shelf::select::shelf_scope_for(current),
+    )
+    .await?
+    .ok_or_else(|| crate::shared::shelf::select::no_candidate_in_scope("INSPECTION"))?
+    .id;
+    // 状态机：IN_PROCESS → INSPECTION
+    //
+    // 2026-10-06 读 `batch.status`（批次真源）而非 `part.status`（派生缓存列），
+    // 理由与假阴性分析见 `transition_core.rs::to_ship_core` 同处注释。本路径
+    // 当前无假阴性（batch 源状态固定 IN_PROCESS，part 派生值不会更晚），
+    // 但判据读错列本身是隐患，一并对齐。
+    let from = PartStatus::from_str(&batch.status).ok_or_else(|| {
+        AppError::biz(
+            code::BIZ_INVALID_VALUE,
+            format!("batch {} 状态非法: {}", batch.id, batch.status),
+        )
+    })?;
+    if !from.can_transition_to(PartStatus::INSPECTION) {
+        return Err(AppError::biz(
+            code::BIZ_INVALID_TRANSITION,
+            format!("batch {} 当前状态 {} 不允许送检", batch.id, from.as_str()),
+        ));
+    }
+    // 切 holder worker → target_shelf + 状态 IN_PROCESS → INSPECTION（OCC）
+    // 2026-10-01：写 + part 派生 + assembly 级联已在 shared::batch::status 内完成，
+    // 0 行由 gate 抛 40901（原 `if n == 0` 是死代码）。
+    let rollup = repo
+        .mark_batch_inspected(batch.id, batch.version, target_id, Some(current.id))
+        .await?;
+    repo.insert_part_event(NewPartEvent {
+        id: snowflake.next_id(),
+        part_id: part.id,
+        event_type: "SENT_TO_INSPECTION",
+        from_status: Some("IN_PROCESS"),
+        to_status: Some("INSPECTION"),
+        batch_id: Some(batch.id),
+        quantity: Some(batch.quantity),
+        drawing_code: Some(&part.drawing_no),
+        badge_code: Some(&worker.badge_code),
+        note: None,
+        created_by: Some(current.id),
+    })
+    .await?;
+    // PR-B2：直接取 gate 的派生结果（不再补调 `PartService::sync_from_batch_change`
+    // —— 第二次派生必然 `NoChange`，会把 `synced_assembly_id` 恒吞成 null）。
+    Ok(match rollup.sync {
+        SyncOutcome::Changed(aid) => Some(aid),
+        SyncOutcome::NoChange => None,
+    })
 }

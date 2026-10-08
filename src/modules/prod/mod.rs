@@ -31,14 +31,14 @@
 //! + `recall` 召回），因为它们的消费方是队列页而非批次详情页。
 //!
 //! 2026-10-02 新增 `prod::shelf_process` 子模块（货架 ↔ 工序映射 `t_shelf_process`，
-//! 3 端点，URL 挂 `/api/v2/prod/shelf-processes/*`）：原 `src/modules/shelf/
-//! process_mapping/` 整体搬入。域规约依据「货架自身包括账号部分和工序映射部分，
-//! 应拆分到 iam 域和 prod 域」——账号部分**消除**（`ShelfOut.account_count` 字段与
-//! `count_accounts_by_shelf` 一并删除，绑定真源本来就在 iam），工序映射**搬进 prod**
-//! （`t_shelf_process` 关联的是 prod 域实体 `t_process`）。旧路径
-//! `GET|POST /api/v2/shelves/{id}/processes` 与 `GET /api/v2/shelves/processes`
-//! 404（**无 alias**，沿 2026-09-19 prod 聚合先例），请求 / 响应契约逐字不变。
-//! 跨域依赖方向由 shelf→prod 翻转为 prod→shelf（只读 `ShelfRepo::get_by_id`）。
+//! 3 端点，URL 挂 `/api/v2/prod/shelf-processes/*`）：自当时的 shelf 域整体搬入。
+//! 域规约依据「货架自身包括账号部分和工序映射部分，应拆分到 iam 域和 prod 域」——
+//! 账号部分**消除**（`ShelfOut.account_count` 字段与 `count_accounts_by_shelf` 一并
+//! 删除，绑定真源本来就在 iam），工序映射**搬进 prod**（`t_shelf_process` 关联的是
+//! prod 域实体 `t_process`）。旧路径 `GET|POST /api/v2/shelves/{id}/processes` 与
+//! `GET /api/v2/shelves/processes` 404（**无 alias**，沿 2026-09-19 prod 聚合先例），
+//! 请求 / 响应契约逐字不变。跨域依赖方向是 prod → `iam::shelf`（只读
+//! `ShelfRepo::get_by_id`）—— 货架实体本身已于 2026-10-10 迁入 iam 域。
 //!
 //! `/prod/batches/{batch_id}/recall-to-pending` 一律 404。
 //!

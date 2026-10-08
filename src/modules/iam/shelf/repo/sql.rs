@@ -1,4 +1,4 @@
-//! shelf 域数据访问（SQL 真源，零 diff 搬迁自 `repo.rs`）
+//! 货架子模块数据访问（SQL 真源）
 //!
 //! 对应 Python myERP/repository/shelf_repository.py。函数签名接收 `impl PgExecutor<'_>`，
 //! 兼容 `&PgPool` / `&mut PgConnection` / `&mut Transaction`。
@@ -8,25 +8,20 @@
 //! - 读查询一律带 `deleted_at IS NULL`（软删）—— **含 LEFT JOIN 的聚合子查询**（外层带了
 //!   不算数，子查询自己也得带，否则软删行的量会被永久计入）
 //! - 写查询带 `WHERE id = $1 AND version = $2` 乐观锁，返回 `rows_affected`，0 行由 service 转 409
-//! - `list_active_production_ordered` 通过 LEFT JOIN `t_part_batch` 聚合 current_load
-//! - `list_active_inspection_with_load` 是 11 个静态方法里专供 picker for-inspection
-//!   的那一个，与 for-return 聚合口径逐字一致；理由见各方法 doc
 //!
-//! ## Phase P3+ shelf CRUD 暴露给 service 的能力（2026-10-02 起 10 静态方法；
-//! 2026-10-04 加 `list_active_inspection_with_load` 后为 11）
+//! ## Phase P3+ shelf CRUD 暴露给 service 的能力
 //! - 读：`get_active_by_id` / `get_by_id` / `get_by_id_zone`
-//!   / `list_with_filters` / `count_with_filters` / `list_active_production_ordered`
-//!   / `list_active_inspection_with_load`
 //! - 过滤+分页+计数：`list_with_filters` / `count_with_filters`（QueryBuilder）
 //! - 写：`create` / `update` / `soft_delete`（同时 `is_active = false`）
 //! - 引用计数：`count_in_use_parts`（deactivate 前查 t_part_batch.current_holder_id
 //!   + location + status 三维核对，PR-2 真相源迁移后已不再读 t_part）
 //!
-//! 数字依据（2026-10-02 订正）：`repo/mod.rs` 的 `ShelfRepoTrait` 恰好 10 个方法，
-//! impl 逐个一行委托到本文件的同名静态方法，故本文件 `pub async fn` 也是 10 个，
-//! 一一对应无遗漏。master 原写「8」是 `t_shelf_process` 4 方法尚在时对 `t_shelf`
-//! 部分的旧计数，本次随方法搬移一并订正为 10。
-//! 2026-10-04：随 `list_active_inspection_with_load` 新增，两处同步为 **11**。
+//! ## 2026-10-10：两个聚合列表方法删除
+//! `list_active_production_ordered` / `list_active_inspection_with_load` 是 picker
+//! 两条端点的专供查询，随端点下线一并删除。它们各自内联了一份**逐字重复**的
+//! `t_part_batch` 负载聚合子查询；口径的**唯一**真源现在在
+//! [`crate::shared::shelf::load::LOAD_AGGREGATE_SQL`]，由 `ShelfRepoTrait::load_by_ids`
+//! 与 `shared::shelf::select::pick_least_loaded` 共用 —— 本文件不再有任何负载聚合。
 //!
 //! 2026-09-22 重构：从 `repo.rs` 平移到 `repo/sql.rs`，本文件 SQL 与方法签名零 diff，
 //! `.sqlx/query-*.json` 哈希不变；新增的 `ShelfRepoTrait` 胖 trait 在 `repo/mod.rs`。
@@ -39,32 +34,10 @@
 
 use sqlx::{PgExecutor, QueryBuilder};
 
-use crate::modules::shelf::model::TShelf;
-
-/// `TShelf` + 聚合 `current_load`（来自 t_part_batch LEFT JOIN）。
-///
-/// 用于 `list_active_production_ordered`（picker for-return）与
-/// `list_active_inspection_with_load`（picker for-inspection，2026-10-04）。
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct TShelfWithLoad {
-    pub id: i64,
-    pub code: String,
-    pub name: String,
-    pub zone: String,
-    pub location: Option<String>,
-    pub is_active: bool,
-    pub display_order: i32,
-    pub version: i32,
-    pub created_at: chrono::NaiveDateTime,
-    pub created_by: Option<i64>,
-    pub updated_at: chrono::NaiveDateTime,
-    pub updated_by: Option<i64>,
-    pub deleted_at: Option<chrono::NaiveDateTime>,
-    pub current_load: i64,
-}
+use crate::modules::iam::shelf::model::TShelf;
 
 // ---------------------------------------------------------------------------
-// ShelfRepo（t_shelf，11 方法）
+// ShelfRepo（t_shelf，9 方法）
 // ---------------------------------------------------------------------------
 
 pub struct ShelfRepo;
@@ -79,7 +52,7 @@ impl ShelfRepo {
             TShelf,
             r#"
             SELECT id, code, name, zone, location, is_active, display_order,
-                   version, created_at, created_by, updated_at, updated_by, deleted_at
+                   capacity, version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_shelf
             WHERE id = $1 AND is_active = true AND deleted_at IS NULL
             "#,
@@ -98,7 +71,7 @@ impl ShelfRepo {
             TShelf,
             r#"
             SELECT id, code, name, zone, location, is_active, display_order,
-                   version, created_at, created_by, updated_at, updated_by, deleted_at
+                   capacity, version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_shelf
             WHERE id = $1 AND deleted_at IS NULL
             "#,
@@ -119,7 +92,7 @@ impl ShelfRepo {
             TShelf,
             r#"
             SELECT id, code, name, zone, location, is_active, display_order,
-                   version, created_at, created_by, updated_at, updated_by, deleted_at
+                   capacity, version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_shelf
             WHERE id = $1 AND zone = $2 AND is_active = true AND deleted_at IS NULL
             "#,
@@ -142,8 +115,8 @@ impl ShelfRepo {
         offset: i64,
     ) -> Result<Vec<TShelf>, sqlx::Error> {
         let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
-            "SELECT id, code, name, zone, location, is_active, display_order, version, \
-             created_at, created_by, updated_at, updated_by, deleted_at \
+            "SELECT id, code, name, zone, location, is_active, display_order, capacity, \
+             version, created_at, created_by, updated_at, updated_by, deleted_at \
              FROM t_shelf WHERE deleted_at IS NULL",
         );
         if let Some(z) = zone {
@@ -199,110 +172,10 @@ impl ShelfRepo {
         qb.build_query_scalar::<i64>().fetch_one(executor).await
     }
 
-    /// PRODUCTION 区活跃货架列表，按 current_load 升序（同 load 时按 display_order ASC）。
-    ///
-    /// 用途：`list_for_return` picker —— worker 把成品零件送回时找空货架。
-    /// `current_load` 用 `LEFT JOIN t_part_batch` 聚合（status IN ('PENDING',
-    /// 'IN_PROCESS', 'INSPECTION', 'OUTSOURCE')）的批次 quantity 总和；
-    /// LEFT JOIN 保留 0-负载货架（current_load = 0）。
-    ///
-    /// ⚠️ 聚合子查询**自己**也必须带 `deleted_at IS NULL`（本文件「读查询一律带
-    /// `deleted_at IS NULL`」的约定对 LEFT JOIN 的聚合子查询同样成立：外层
-    /// `t_shelf` 带了不算数）。不过滤则软删批次的 quantity 会被**永久**计入所属
-    /// 货架的负载。2026-10-04 在本 worktree 库上核对
-    /// `t_part_batch WHERE deleted_at IS NOT NULL` 为 0 行，即该约束当前不可观测，
-    /// 属预防性护栏。
-    ///
-    /// 2026-10-01：聚合条件删掉 `'REPAIRING'` 字面量。REPAIRING 已从
-    /// `PartStatus` 降级为 `t_part_batch.is_repairing` 标记列（migration
-    /// 005/006），返修中的批次 `status` 就是 `'IN_PROCESS'`，已被本 IN 列表的
-    /// IN_PROCESS 臂覆盖 —— **负载口径不变**（返修批次仍占着货架），只是不再
-    /// 需要第二个字面量。
-    ///
-    /// ⚠️ 聚合子查询与 `list_active_inspection_with_load` 的那段**必须逐字一致**
-    /// （同 status 列表、同 `SUM(quantity)`、同 `deleted_at IS NULL`）：两个 picker
-    /// 对同一个架必须给出同一个数。改一处务必同步另一处。
-    pub async fn list_active_production_ordered<'e, E: PgExecutor<'e>>(
-        executor: E,
-    ) -> Result<Vec<TShelfWithLoad>, sqlx::Error> {
-        sqlx::query_as!(
-            TShelfWithLoad,
-            r#"
-            SELECT s.id, s.code, s.name, s.zone, s.location, s.is_active, s.display_order,
-                   s.version, s.created_at, s.created_by, s.updated_at, s.updated_by, s.deleted_at,
-                   COALESCE(load.cnt, 0)::bigint AS "current_load!"
-            FROM t_shelf s
-            LEFT JOIN (
-                SELECT current_holder_id AS shelf_id,
-                       SUM(quantity)::bigint AS cnt
-                FROM t_part_batch
-                WHERE status IN ('PENDING', 'IN_PROCESS', 'INSPECTION', 'OUTSOURCE')
-                  AND deleted_at IS NULL
-                GROUP BY current_holder_id
-            ) load ON load.shelf_id = s.id
-            WHERE s.zone = 'PRODUCTION'
-              AND s.is_active = true
-              AND s.deleted_at IS NULL
-            ORDER BY load.cnt ASC NULLS FIRST, s.display_order ASC, s.id ASC
-            "#,
-        )
-        .fetch_all(executor)
-        .await
-    }
-
-    /// INSPECTION 区活跃货架列表，带 `current_load` 聚合（供 picker for-inspection）。
-    ///
-    /// 必须出 `current_load`（前端品检架卡片无 `v-if` 守卫地渲染「在架 N 件」，
-    /// 缺该字段则每张送检架卡片显示「在架 **undefined** 件」），故聚合补在**后端**
-    /// 而不是前端加守卫，口径与 `list_active_production_ordered` 逐字一致。
-    /// 数据源**不可**退回裸 `TShelf` 列表查询（那种查询不带任何聚合）。
-    ///
-    /// 与 for-return 的差异**仅两处**，且都不影响 `current_load` 口径：
-    /// 1. `zone` 常量为 `'INSPECTION'`；
-    /// 2. 不按 `load.cnt` 排序（品检架无「最空优先」语义，for-return 的
-    ///    `is_recommended` 是它独有的出参，本方法不提供）。
-    ///    末两段 `ORDER BY s.display_order ASC, s.id ASC` 与 for-return 一致，
-    ///    即本方法**有**稳定排序，只是不按负载排。
-    ///
-    /// **不设 LIMIT**（2026-10-04 决策）：INSPECTION 区活跃架一次性全量返回，
-    /// 不分页。旧路径 `list_with_filters(..., MAX_LIMIT=500, offset=0)` 的
-    /// 500 截断**不保留** —— 它的 `ORDER BY` 与本方法逐段相同，所以去掉截断
-    /// 只改「最多 500 条」为「全部」，排序语义零变化；而静默丢架比超长列表更糟
-    ///（前端 picker 会把第 501 个架当成不存在）。同时使两个 picker 的分页形态
-    /// 统一（`list_active_production_ordered` 同样无 LIMIT）。品检架基数是
-    /// 「物理送检架数」量级，全量返回无性能压力。**下一个人不要把 500 加回来。**
-    ///
-    /// ⚠️ 聚合子查询与 `list_active_production_ordered` 的那段必须逐字一致。
-    pub async fn list_active_inspection_with_load<'e, E: PgExecutor<'e>>(
-        executor: E,
-    ) -> Result<Vec<TShelfWithLoad>, sqlx::Error> {
-        sqlx::query_as!(
-            TShelfWithLoad,
-            r#"
-            SELECT s.id, s.code, s.name, s.zone, s.location, s.is_active, s.display_order,
-                   s.version, s.created_at, s.created_by, s.updated_at, s.updated_by, s.deleted_at,
-                   COALESCE(load.cnt, 0)::bigint AS "current_load!"
-            FROM t_shelf s
-            LEFT JOIN (
-                SELECT current_holder_id AS shelf_id,
-                       SUM(quantity)::bigint AS cnt
-                FROM t_part_batch
-                WHERE status IN ('PENDING', 'IN_PROCESS', 'INSPECTION', 'OUTSOURCE')
-                  AND deleted_at IS NULL
-                GROUP BY current_holder_id
-            ) load ON load.shelf_id = s.id
-            WHERE s.zone = 'INSPECTION'
-              AND s.is_active = true
-              AND s.deleted_at IS NULL
-            ORDER BY s.display_order ASC, s.id ASC
-            "#,
-        )
-        .fetch_all(executor)
-        .await
-    }
-
     /// 插入新货架。雪花 id 由调用方（service）生成；created_by / updated_by
     /// 共用 `created_by`，后续 UPDATE 才更新 updated_by。
+    ///
+    /// `capacity` 2026-10-10 起可传（件数上限）；`None` → 落 NULL = 不限。
     #[allow(clippy::too_many_arguments)]
     pub async fn create<'e, E: PgExecutor<'e>>(
         executor: E,
@@ -313,15 +186,16 @@ impl ShelfRepo {
         location: Option<&str>,
         display_order: i32,
         created_by: i64,
+        capacity: Option<i32>,
     ) -> Result<TShelf, sqlx::Error> {
         sqlx::query_as!(
             TShelf,
             r#"
             INSERT INTO t_shelf (id, code, name, zone, location, is_active, display_order,
-                                 created_by, updated_by)
-            VALUES ($1, $2, $3, $4, $5, true, $6, $7, $7)
+                                 capacity, created_by, updated_by)
+            VALUES ($1, $2, $3, $4, $5, true, $6, $7, $8, $8)
             RETURNING id, code, name, zone, location, is_active, display_order,
-                      version, created_at, created_by, updated_at, updated_by, deleted_at
+                      capacity, version, created_at, created_by, updated_at, updated_by, deleted_at
             "#,
             snowflake_id,
             code,
@@ -329,6 +203,7 @@ impl ShelfRepo {
             zone,
             location,
             display_order,
+            capacity,
             created_by,
         )
         .fetch_one(executor)
@@ -337,7 +212,7 @@ impl ShelfRepo {
 
     /// 部分更新（OCC）：带乐观锁。
     ///
-    /// `location` / `display_order` 三态编码（与 process.update 同形）：
+    /// `location` / `capacity` 三态编码（与 process.update 同形）：
     /// - `None` ⇒ 字段缺省，不修改
     /// - `Some(None)` ⇒ 显式清空（SET NULL）
     /// - `Some(Some(v))` ⇒ 改值
@@ -350,15 +225,19 @@ impl ShelfRepo {
         location: Option<Option<&str>>,
         display_order: Option<i32>,
         updated_by: i64,
+        capacity: Option<Option<i32>>,
     ) -> Result<u64, sqlx::Error> {
         let set_location = location.is_some();
         let new_location = location.flatten();
+        let set_capacity = capacity.is_some();
+        let new_capacity = capacity.flatten();
         sqlx::query!(
             r#"
             UPDATE t_shelf
             SET name          = COALESCE($3::varchar, name),
                 location      = CASE WHEN $4::bool THEN $5::varchar ELSE location END,
                 display_order = COALESCE($6::integer, display_order),
+                capacity      = CASE WHEN $8::bool THEN $9::integer ELSE capacity END,
                 version       = version + 1,
                 updated_at    = now(),
                 updated_by    = $7
@@ -371,6 +250,8 @@ impl ShelfRepo {
             new_location,
             display_order,
             updated_by,
+            set_capacity,
+            new_capacity,
         )
         .execute(executor)
         .await

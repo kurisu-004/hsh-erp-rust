@@ -260,12 +260,19 @@ async fn place_on_shelf_invalid_transition_rejects() {
     assert_eq!(env["code"], 20103);
 }
 
+/// 2026-10-10：`shelf_id` 入参删除 + 目标架由服务端自动选后，「没有可用货架」一律
+/// 返 `20508 BIZ_SHELF_PROCESS_NOT_FOUND`。
+///
+/// 本用例覆盖「**完全没有** shelf↔process 映射」这一支（原 `20507
+/// BIZ_SHELF_PROCESS_NOT_MAPPED`）。原来那条守卫判的是「你指定的这个架没有映射
+/// 这道工序」，现在选架的候选集本身就只含映射了该工序的架 —— 判据没被削弱，只是
+/// 换了个更前置的形态：没有映射 ⇒ 候选为空 ⇒ 选不出。
 #[tokio::test]
-async fn place_on_shelf_shelf_process_not_mapped_rejects() {
+async fn place_on_shelf_no_candidate_shelf_rejects() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
     let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PENDING", 5).await;
     let version = batch_version(&pool, bid).await;
-    // 删除 fixture 预置的 shelf↔process 映射 → 20507 BIZ_SHELF_PROCESS_NOT_MAPPED
+    // 删除 fixture 预置的 shelf↔process 映射 ⇒ 该工序没有任何候选架
     sqlx::query("DELETE FROM t_shelf_process WHERE shelf_id = $1 AND process_id = $2")
         .bind(fx.production_shelf_id)
         .bind(fx.process_id)
@@ -274,6 +281,7 @@ async fn place_on_shelf_shelf_process_not_mapped_rejects() {
         .expect("delete shelf_process mapping");
     let chain_id = create_chain_for_part(&pool, pid).await;
     let _step_id = create_step(&pool, chain_id, fx.process_id, 1).await;
+    // 仍然发 `shelf_id`：老客户端的字段必须被静默忽略（向后兼容的契约）
     let body = json!({
         "version": version,
         "shelf_id": fx.production_shelf_id.to_string(),
@@ -289,13 +297,8 @@ async fn place_on_shelf_shelf_process_not_mapped_rejects() {
         ),
     )
     .await;
-    // 20507 BIZ_SHELF_PROCESS_NOT_MAPPED → Phase 2 (2026-09-13) 显式映射 422
-    assert_eq!(
-        s,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "shelf↔process 缺失应拒绝: {env}"
-    );
-    assert_eq!(env["code"], 20507);
+    assert_eq!(s, StatusCode::NOT_FOUND, "无可用货架应被拒: {env}");
+    assert_eq!(env["code"], 20508);
 }
 
 #[tokio::test]

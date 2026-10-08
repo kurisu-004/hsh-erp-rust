@@ -11,10 +11,13 @@
 //! 1. **SQL 写成模块级 `const SQL_*` 字面量，不做字符串拼接。** 拼列名/拼条件会
 //!    开注入面，也让 SQL 文本不再可被静态检查。两种口径（如 planned / system）
 //!    就写两段完整字面量。
-//!    **唯一例外**：`{has_process_chain}` 占位符填的是
-//!    `shared::batch::chain::HAS_PROCESS_CHAIN_EXPR` 这一个**编译期常量**（4 处
-//!    卡片 DTO 共用同一判据，各自复制表达式文本等于让四处各漂一次），填完走
-//!    `AssertSqlSafe`。注入面为 0：用户输入一律走 bind。
+//!    **已登记的例外（2 处，都是编译期常量占位符）**：
+//!    - `{has_process_chain}` → `shared::batch::chain::HAS_PROCESS_CHAIN_EXPR`
+//!      （4 处卡片 DTO 共用同一判据，各自复制表达式文本等于让四处各漂一次）；
+//!    - `{pool_priority}` → `shared::shelf::pool_priority::POOL_PRIORITY_ORDER_SQL`
+//!      （2026-10-10 起，看板池明细与 refill 取料共用同一份 ORDER BY）。
+//!
+//!    填完走 `AssertSqlSafe`。注入面为 0：用户输入一律走 bind。
 //! 2. **SQL 条数固定，与工人数 / 批次数无关。** 逐工人循环查是本文件要消灭的
 //!    东西（`GET /queue/state` 时代前端要发 N+1 个请求）。每个方法的 doc 写明
 //!    「固定 N 条」。
@@ -36,6 +39,7 @@ use sqlx::{AssertSqlSafe, PgConnection, Row};
 
 use crate::shared::batch::chain::HAS_PROCESS_CHAIN_EXPR;
 use crate::shared::error::{AppError, code};
+use crate::shared::shelf::pool_priority::POOL_PRIORITY_ORDER_SQL;
 
 // ---------------------------------------------------------------------------
 // SQL 常量
@@ -151,6 +155,16 @@ const SQL_HELD_BATCHES_BY_WORKERS: &str = "SELECT pb.id AS batch_id, \
 /// 判据与理由（含「必须 `IS NOT NULL AND =` 而不是 `IS NOT DISTINCT FROM`」）见
 /// 该常量。`t_process_chain_step cs` 走 **LEFT JOIN** —— 无 step 的批次（PENDING /
 /// 指针为空）必须照样出现在列表里。
+///
+/// 2026-10-10 三处变化（都是为了与 refill 取料对齐）：
+///
+/// 1. `ORDER BY` 换成 [`POOL_PRIORITY_ORDER_SQL`]。此前本查询按
+///    `system_delivery_date → is_urgent → id` 排、而 refill 的 `take_one_from_pool`
+///    按 `已编程 → system_delivery_date → planned_delivery_date → is_urgent → id` 排 ——
+///    **两处漂移**，于是「看板上看到的顺序」与「工人实际抢到的顺序」对不上。
+/// 2. 补投影 `p.planned_delivery_date`：统一排序的第 3 键要用它。
+/// 3. 补 `LEFT JOIN t_process pr`：第 4 层要判 `pr.is_cnc`（CNC 工序内已编程优先）。
+///    必须 **LEFT** JOIN —— 无 `current_process_id` 的批次不能因 INNER JOIN 而消失。
 const SQL_POOL_ITEMS_BY_PROCESS: &str = "SELECT pb.id AS batch_id, \
      pb.part_id AS part_id, \
      pb.batch_no AS batch_no, \
@@ -160,6 +174,7 @@ const SQL_POOL_ITEMS_BY_PROCESS: &str = "SELECT pb.id AS batch_id, \
      p.name AS name, \
      p.drawing_no AS drawing_no, \
      p.system_delivery_date AS system_delivery_date, \
+     p.planned_delivery_date AS planned_delivery_date, \
      p.is_urgent AS is_urgent, \
      p.note AS note, \
      p.applicant_name AS applicant_name, \
@@ -182,13 +197,12 @@ const SQL_POOL_ITEMS_BY_PROCESS: &str = "SELECT pb.id AS batch_id, \
      JOIN t_shelf s ON s.id = pb.current_holder_id AND s.deleted_at IS NULL \
      LEFT JOIN t_process_chain_step cs \
        ON cs.id = pb.current_process_step_id AND cs.deleted_at IS NULL \
+     LEFT JOIN t_process pr ON pr.id = pb.current_process_id \
      WHERE pb.status = 'IN_PROCESS' \
        AND pb.location = 'PRODUCTION_SHELF' \
        AND pb.current_process_id = $1 \
        AND pb.deleted_at IS NULL \
-     ORDER BY p.system_delivery_date ASC NULLS LAST, \
-              p.is_urgent DESC, \
-              pb.id ASC";
+     ORDER BY {pool_priority}";
 
 // ---------------------------------------------------------------------------
 // 行精简（repo ↔ service 边界）
@@ -410,8 +424,13 @@ impl QueueBoardRepo {
         };
 
         // 4. 候选池（同上：只拼编译期常量）
+        // `{pool_priority}` 同样是编译期常量填充（铁律 1 的**第二处**已登记例外）：
+        // 与 refill 的 `take_one_from_pool` 共用同一份 ORDER BY 片段，否则看板与
+        // 取料两套排序必然再次漂移。注入面为 0：用户输入一律走 bind。
         let sql = AssertSqlSafe(
-            SQL_POOL_ITEMS_BY_PROCESS.replace("{has_process_chain}", HAS_PROCESS_CHAIN_EXPR),
+            SQL_POOL_ITEMS_BY_PROCESS
+                .replace("{has_process_chain}", HAS_PROCESS_CHAIN_EXPR)
+                .replace("{pool_priority}", POOL_PRIORITY_ORDER_SQL),
         );
         let items: Vec<PoolItemRow> = sqlx::query(sql)
             .bind(process_id)

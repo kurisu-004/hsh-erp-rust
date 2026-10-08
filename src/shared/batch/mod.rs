@@ -11,7 +11,7 @@
 //! | [`model`] | `TPartBatch` 全列行结构 | 仅 chrono |
 //! | [`read`] | `get_batch_by_id` / `list_active_batches_by_part_id` | `model` + sqlx |
 //! | [`status`] | `apply_batch_status_change` / `apply_bulk_batch_status_change_for_part` + 派生链 | assembly / part / 本表（见下） |
-//! | [`guards`] | 10 个 `pub fn`：状态机守卫 / OCC / 货架校验 / status 薄包装 | part / shelf / `status` |
+//! | [`guards`] | 9 个 `pub fn`：状态机守卫 / OCC / 货架校验 / status 薄包装 | part / iam / `status` |
 //! | [`chain`] | `CHAIN_POSITION_LATERAL_SQL` + `HAS_PROCESS_CHAIN_EXPR` + `resolve_chain_position`（批次在工序链上的位置派生，读写共用） | `model` + 本表 SQL 内聚合（见下） |
 //!
 //! ## 边界登记：shared/batch 依赖 4 个域，是本仓依赖面最宽的 shared 模块
@@ -20,7 +20,7 @@
 //! |---|---|---|---|
 //! | `part` | `status` | **写** | `PartRepo::update_part_rollup`（`part` 派生列回填）+ `PartRepo::insert_part_event`（事件日志） |
 //! | `assembly` | `status` | **写** | `AssemblyService::sync_assembly_status`（父件派生级联） |
-//! | `shelf` | `guards` | 读 | `ShelfRepo::get_by_id`（`validate_shelf_zone` 的存在 / 停用 / zone 三谓词在 Rust 层逐条判） |
+//! | `iam` | `guards` | 读 | `ShelfRepo::get_by_id`（`validate_shelf_zone` 的存在 / 停用 / zone 三谓词在 Rust 层逐条判） |
 //! | `prod::process_chain` | `guards` | 读 | `ProcessChainRepo::resolve_step_id_by_process`（`optional_step_id`） |
 //!
 //! ## `chain` 的表依赖（不经域 repo，与上表 4 行不同类）
@@ -71,7 +71,7 @@ pub mod read;
 pub mod status;
 
 pub use guards::{
-    InspectionRepairRow, assert_shelf_maps_process, ensure_transition, mark_batch_status_only,
+    InspectionRepairRow, ensure_transition, mark_batch_status_only,
     mark_batch_with_status_and_meta, optional_process_chain, optional_step_id,
     status_guard_for_target, validate_batch_version, validate_shelf_zone,
 };

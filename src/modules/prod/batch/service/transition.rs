@@ -16,8 +16,8 @@
 //! - 20104 `BIZ_INVALID_VALUE` —— 入参值非法
 //! - 20109 `BIZ_PART_BATCH_NOT_FOUND` —— 找不到指定批次
 //! - 20111 `BIZ_PART_BATCH_INVALID_QUANTITY` —— 拆分数量非法（仅 ≤0；> batch_quantity 等价于整批操作）
-//! - 20511 `BIZ_SHELF_NOT_INSPECTION_ZONE` —— target_inspection_shelf.zone ≠ 'INSPECTION'
-//! - 20512 `BIZ_SHELF_INACTIVE` —— target_inspection_shelf.is_active = false
+//! - 20508 `BIZ_SHELF_PROCESS_NOT_FOUND` —— 该工序无可用生产货架（自动选架）
+//! - 40301 `SHELF_MISMATCH` —— 当前账号 scope 内无任何可用品检架（自动选架）
 //! - 40001 `VALIDATION_ERROR` —— 批量入参校验失败（items 为空 / 超过上限 / batch_id 解析失败）
 //! - 40901 `VERSION_CONFLICT` —— 乐观锁失败（已被并发修改）
 
@@ -29,8 +29,6 @@ use crate::modules::prod::batch::dto::{
     ToShipRequest,
 };
 use crate::modules::prod::batch::vo::{BatchOpFailure, BatchToXxxOut, ToXxxOut};
-use crate::modules::shelf::model::TShelf;
-use crate::modules::shelf::repo::ShelfRepo;
 use crate::shared::batch::TPartBatch;
 use crate::shared::error::{AppError, code};
 
@@ -42,88 +40,6 @@ pub const BATCH_TO_SHIP_MAX_ITEMS: usize = 200;
 pub const BATCH_TO_INSPECTION_MAX_ITEMS: usize = 200;
 
 impl BatchService {
-    /// 校验品检架：必须存在、未软删、is_active=true、zone='INSPECTION'。
-    ///
-    /// 错误码：
-    /// - 20501 `BIZ_SHELF_NOT_FOUND`：不存在 / 已软删
-    /// - 20512 `BIZ_SHELF_INACTIVE`：is_active=false
-    /// - 20511 `BIZ_SHELF_NOT_INSPECTION_ZONE`：zone ≠ 'INSPECTION'
-    pub(super) async fn _validate_inspection_shelf<R: PartRepoTrait>(
-        repo: &mut R,
-        shelf_id: i64,
-    ) -> Result<TShelf, AppError> {
-        let shelf = ShelfRepo::get_by_id(repo.conn_mut(), shelf_id)
-            .await?
-            .ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_SHELF_NOT_FOUND,
-                    format!("shelf {shelf_id} 不存在"),
-                )
-            })?;
-        if !shelf.is_active {
-            return Err(AppError::biz(
-                code::BIZ_SHELF_INACTIVE,
-                format!("shelf {} (id={}) 已停用", shelf.code, shelf.id),
-            ));
-        }
-        if shelf.zone != "INSPECTION" {
-            return Err(AppError::biz(
-                code::BIZ_SHELF_NOT_INSPECTION_ZONE,
-                format!(
-                    "shelf {} (id={}) 不在 INSPECTION 区（zone={}）",
-                    shelf.code, shelf.id, shelf.zone
-                ),
-            ));
-        }
-        Ok(shelf)
-    }
-
-    /// 校验生产架 + 下一道工序映射（用于 to_process）。
-    ///
-    /// 仅校验 shelf 在 PRODUCTION 区且 active；next_process_id 与 shelf 映射
-    /// 校验通过 `t_shelf_process` 表 SQL（详 shelf 域后续 PR；本 PR 仅校验
-    /// shelf 存在 + zone + active，next_process_id 由 caller 传入，校验留待
-    /// 后续 shelf 域 PR 实施）。
-    ///
-    /// 错误码：
-    /// - 20501 `BIZ_SHELF_NOT_FOUND`
-    /// - 20512 `BIZ_SHELF_INACTIVE`
-    /// - 20104 `BIZ_INVALID_VALUE`：zone ≠ 'PRODUCTION'
-    pub(super) async fn _validate_production_shelf_and_process<R: PartRepoTrait>(
-        repo: &mut R,
-        shelf_id: i64,
-        next_process_id: i64,
-    ) -> Result<TShelf, AppError> {
-        let shelf = ShelfRepo::get_by_id(repo.conn_mut(), shelf_id)
-            .await?
-            .ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_SHELF_NOT_FOUND,
-                    format!("shelf {shelf_id} 不存在"),
-                )
-            })?;
-        if !shelf.is_active {
-            return Err(AppError::biz(
-                code::BIZ_SHELF_INACTIVE,
-                format!("shelf {} (id={}) 已停用", shelf.code, shelf.id),
-            ));
-        }
-        if shelf.zone != "PRODUCTION" {
-            return Err(AppError::biz(
-                code::BIZ_INVALID_VALUE,
-                format!(
-                    "shelf {} (id={}) 不在 PRODUCTION 区（zone={}）",
-                    shelf.code, shelf.id, shelf.zone
-                ),
-            ));
-        }
-        // next_process_id 与 shelf 映射的强校验属于 shelf 域职责。本 PR 仅
-        // 接受 caller 传入的 next_process_id 并写入 DB，跨 shelf 映射校验
-        // 留待 shelf 域 PR。
-        let _ = next_process_id;
-        Ok(shelf)
-    }
-
     /// 定位 to-inspection 目标批次（白名单 `{PENDING, PROGRAMMING, IN_PROCESS}`）。
     ///
     /// 2026-10-02：`batch_id` 是必填路径参数，本方法只接 `i64`。
@@ -344,12 +260,6 @@ impl BatchService {
         req: ToProcessRequest,
         current: &CurrentUser,
     ) -> Result<ToXxxOut, AppError> {
-        let shelf_id: i64 = req.shelf_id.parse().map_err(|_| {
-            AppError::biz(
-                code::BIZ_INVALID_VALUE,
-                format!("shelf_id '{}' is not a numeric id", req.shelf_id),
-            )
-        })?;
         let next_process_id: i64 = req.next_process_id.parse().map_err(|_| {
             AppError::biz(
                 code::BIZ_INVALID_VALUE,
@@ -362,7 +272,6 @@ impl BatchService {
         Self::to_process_core(
             &mut repo,
             snowflake,
-            shelf_id,
             next_process_id,
             req.note.as_deref(),
             batch_id,
@@ -381,20 +290,28 @@ impl BatchService {
         req: ToInspectionRequest,
         current: &CurrentUser,
     ) -> Result<ToXxxOut, AppError> {
-        let target_inspection_shelf_id: i64 =
-            req.target_inspection_shelf_id.parse().map_err(|_| {
-                AppError::biz(
-                    code::BIZ_INVALID_VALUE,
-                    format!(
-                        "target_inspection_shelf_id '{}' is not a numeric id",
-                        req.target_inspection_shelf_id
-                    ),
-                )
-            })?;
+        // 2026-10-10：目标品检架由服务端选（入参 `target_inspection_shelf_id` 已删除）。
+        //
+        // `None` ⇒ `40301 SHELF_MISMATCH`（不是 `20501`）：成因是「当前账号的
+        // `shelf_ids` 白名单里没有任何可用的 INSPECTION 架」，语义是**无权**而不是
+        // 「架不存在」。这是既有约束的延续（手动选架时同样会被 `can_access_shelf`
+        // 拒），只是触发时机从「选了一个越权的架」变成「scope 内没有品检架」。
+        // 成因与后果登记见 `docs/api/batch.md`。
+        // `id` 与 `code` 取自**同一次**选架结果：事件 note 要的是人类可读的货架 code。
+        let shelf = crate::shared::shelf::select::pick_least_loaded(
+            repo.conn_mut(),
+            "INSPECTION",
+            None,
+            crate::shared::shelf::select::shelf_scope_for(current),
+        )
+        .await?
+        .ok_or_else(|| crate::shared::shelf::select::no_candidate_in_scope("INSPECTION"))?;
+        let target_inspection_shelf_id = shelf.id;
         Self::to_inspection_core(
             &mut repo,
             snowflake,
             target_inspection_shelf_id,
+            &shelf.code,
             batch_id,
             req.version,
             req.quantity,
@@ -411,9 +328,9 @@ impl BatchService {
     /// 与 `batch_to_ship` 同形；额外校验：
     /// - `items.is_empty()` → 40001
     /// - `items.len() > BATCH_TO_INSPECTION_MAX_ITEMS` → 40001
-    /// - `target_inspection_shelf_id` 在循环外一次性做（zone='INSPECTION' +
-    ///   is_active=true）—— 不合法 → 顶层 20511 / 20512（**整批失败**，不让
-    ///   per-item 循环开始）。
+    /// - **选品检架在循环外做一次**（2026-10-10）：原实现也在循环外做一次
+    ///   `target_inspection_shelf_id` 的 zone/active 校验，口径一致。选不出 →
+    ///   顶层 `40301`（**整批失败**，不让 per-item 循环开始）。
     pub async fn batch_to_inspection<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
@@ -430,18 +347,18 @@ impl BatchService {
                 BATCH_TO_INSPECTION_MAX_ITEMS
             )));
         }
-        let target_inspection_shelf_id: i64 =
-            req.target_inspection_shelf_id.parse().map_err(|_| {
-                AppError::biz(
-                    code::BIZ_INVALID_VALUE,
-                    format!(
-                        "target_inspection_shelf_id '{}' is not a numeric id",
-                        req.target_inspection_shelf_id
-                    ),
-                )
-            })?;
-        // 共享品检架校验（一次性）—— 不合法 → 顶层 20511 / 20512（整批失败）
-        Self::_validate_inspection_shelf(&mut repo, target_inspection_shelf_id).await?;
+        // 共享品检架（一次性自动选）—— 选不出 → 顶层 40301（整批失败）。
+        // 「循环外一次」是刻意保留的：批量送检的语义是「这 N 批一起进同一个品检架」，
+        // 在循环内选架会让每批各落一个架、把一次批量操作拆成 N 次物理分布决策。
+        let shelf = crate::shared::shelf::select::pick_least_loaded(
+            repo.conn_mut(),
+            "INSPECTION",
+            None,
+            crate::shared::shelf::select::shelf_scope_for(current),
+        )
+        .await?
+        .ok_or_else(|| crate::shared::shelf::select::no_candidate_in_scope("INSPECTION"))?;
+        let target_inspection_shelf_id = shelf.id;
 
         let mut submitted: Vec<ToXxxOut> = Vec::new();
         let mut failed: Vec<BatchOpFailure> = Vec::new();
@@ -468,6 +385,7 @@ impl BatchService {
                 &mut repo,
                 snowflake,
                 target_inspection_shelf_id,
+                &shelf.code,
                 parsed_bid,
                 // caller 送来的 version（**不是** target.version）——否则 OCC 恒真、静默失效
                 item.version,

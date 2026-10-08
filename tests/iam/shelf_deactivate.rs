@@ -2,6 +2,9 @@
 //! 改查 t_part_batch 真相源（PR-2 § shelf/repo.rs::count_in_use_parts、
 //! worker/repo.rs::count_in_use_parts）。
 //!
+//! 2026-10-10 自 `tests/shelf/deactivate.rs` 迁入 iam binary（货架子模块并入 iam 域），
+//! 断言 URL 自 `/shelves/{id}/deactivate` 改为 `/iam/shelves/{id}/deactivate`。
+//!
 //! PR-2 之前：「被 X 引用」查 `t_part.current_holder_id`（已删列）。
 //! PR-2 之后：改查 `t_part_batch.current_holder_id + location + status` ——
 //! shelf 守卫是 `location IN ('PRODUCTION_SHELF','INSPECTION_SHELF')` +
@@ -212,7 +215,7 @@ async fn shelf_deactivate_rejects_when_held_by_active_batch() {
         app,
         json_request(
             "POST",
-            &format!("/shelves/{shelf_id}/deactivate"),
+            &format!("/iam/shelves/{shelf_id}/deactivate"),
             None::<Value>,
             Some(&token),
         ),
@@ -277,7 +280,7 @@ async fn shelf_deactivate_succeeds_when_no_active_holders() {
         app,
         json_request(
             "POST",
-            &format!("/shelves/{shelf_id}/deactivate"),
+            &format!("/iam/shelves/{shelf_id}/deactivate"),
             None::<Value>,
             Some(&token),
         ),

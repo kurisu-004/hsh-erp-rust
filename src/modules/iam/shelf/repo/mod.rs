@@ -1,11 +1,13 @@
-//! shelf 域 repo 层（SQL 真源 + 胖 trait + PG 实现）
+//! 货架子模块 repo 层（SQL 真源 + 胖 trait + PG 实现）
 //!
 //! ## 结构（2026-09-22 重构）
 //! - `sql.rs`：原 `repo.rs` 全文搬迁，pub 固有静态方法 + sqlx `query!` 宏，
 //!   **内容零 diff**（`.sqlx/query-*.json` 哈希不变）。
-//! - `mod.rs`（本文件）：对外暴露胖 trait `ShelfRepoTrait`（11 方法，全部是
+//! - `mod.rs`（本文件）：对外暴露胖 trait `ShelfRepoTrait`（9 方法，全部是
 //!   `t_shelf` 自身操作），并直接 `impl ShelfRepoTrait for &mut PgConnection`
 //!   ——handler/service 借 `&mut *tx` / `&mut *conn` 即可，零中间壳。
+//!
+//! 2026-10-10：picker 的两个聚合列表方法随端点下线删除，trait 由 11 → 9 方法。
 //!
 //! ## 方法数演进
 //! - 2026-09-22 初版：17 方法（t_shelf 12 + t_shelf_process 4 + 跨域 helper 2 的
@@ -18,24 +20,26 @@
 //!     依赖清零
 //!   - 删 `count_accounts_by_shelf`（`ShelfOut.account_count` 出参取消，账号绑定
 //!     真源在 iam 域）
+//! - 2026-10-10：picker 下线，**11 → 9 方法**（删 `list_active_production_ordered` /
+//!   `list_active_inspection_with_load`）
 //!
 //! ## 为什么 trait 命名为 `ShelfRepoTrait` 而非 `ShelfRepo`
-//! iam 范本里 trait 名 = `IamRepoTrait`。但 shelf 域有跨模块静态调用方（part 域
+//! iam 范本里 trait 名 = `IamRepoTrait`。但本模块有跨模块静态调用方（part 域
 //! `worker_scan` / `phase1` / `inspection` 三个 service 文件都
-//! `use crate::modules::shelf::repo::ShelfRepo;` 然后 `ShelfRepo::xxx(&mut *conn, ...)`
+//! `use crate::modules::iam::shelf::repo::ShelfRepo;` 然后 `ShelfRepo::xxx(&mut *conn, ...)`
 //! 走 ZST 静态方法）。**该 3 文件本次不在本任务范围**（属于 Group B/C/D/E），
 //! 故本任务不能破坏 `shelf::repo::ShelfRepo` 作为 ZST 的对外身份。
 //!
 //! 解法：
 //! - `shelf::repo::ShelfRepo` —— ZST struct（在 `sql.rs` 内，通过 `pub use sql::ShelfRepo;`
 //!   重新导出至本模块），保留 t_shelf 静态方法签名不变（cross-module 调用方零修改）。
-//! - `shelf::repo::ShelfRepoTrait` —— 本文件里的胖 trait，shelf 域内部 service 用
+//! - `iam::shelf::repo::ShelfRepoTrait` —— 本文件里的胖 trait，本模块内部 service 用
 //!   `<R: ShelfRepoTrait>` 收。2026-10-02 起 trait 只剩 `t_shelf` 10 方法；
 //!   2026-10-04 加 `list_active_inspection_with_load` 后为 11 方法。
 //!
 //! ## 跨域依赖现状（2026-10-02：shelf → prod 依赖清零）
 //! `t_shelf_process` 属 `prod::shelf_process`，`t_process` 属 `prod::process`，
-//! 两者都移出本 trait。shelf 域现在**不**依赖任何 prod 模块；反向（prod 域读
+//! 两者都移出本 trait。本模块现在**不**依赖任何 prod 模块；反向（prod 域读
 //! `ShelfRepo::get_by_id` 校验货架存在 / scope）见
 //! `src/modules/prod/shelf_process/service.rs`。
 //!
@@ -46,8 +50,8 @@
 //!
 //! ## automock
 //! `#[cfg_attr(test, mockall::automock)]` 在 trait 上声明，生成 `MockShelfRepoTrait` 供
-//! service 单测注入。shelf 域当前无内联 mod tests（service 全部走
-//! `tests/shelf/{api,deactivate}.rs` 集成测试守护），故未建 `shelf/service_tests/`
+//! service 单测注入。本模块当前无内联 mod tests（service 全部走
+//! `tests/iam/{shelf,shelf_deactivate}.rs` 集成测试守护），故未建 `shelf/service_tests/`
 //! 目录——按 conventions.md §4.1 含 IO 不强求 100%。
 //! 2026-10-02 核查：全仓 `MockShelfRepoTrait` 引用为**零**（只有本行 doc 提及），
 //! 故本 trait 17 → 10 的收缩不影响任何单测。
@@ -59,16 +63,16 @@
 use async_trait::async_trait;
 use sqlx::PgConnection;
 
-use crate::modules::shelf::model::TShelf;
+use crate::modules::iam::shelf::model::TShelf;
 
 pub mod sql;
 
 // 重导出 sql.rs 中的 ZST struct / 表行类型，让上层继续用
 // `super::repo::{TShelf, TShelfWithLoad, ShelfRepo}` 这种路径不破
 // （cross-module 调用方都依赖这条路径）。
-pub use sql::{ShelfRepo, TShelfWithLoad};
+pub use sql::ShelfRepo;
 
-/// shelf 域数据访问 trait（11 方法，全部 `t_shelf`）。
+/// 货架子模块数据访问 trait（9 方法，全部 `t_shelf`）。
 ///
 /// 单 trait 而非每实体一个：`&mut PgConnection` 同一作用域只能借给一个 repo 实例，
 /// 拆分会让 service 无法同时持有两个 repo（2026-09-22 重构定案；与 iam 同形）。
@@ -102,12 +106,6 @@ pub trait ShelfRepoTrait: Send {
         zone: Option<&'a str>,
         is_active: Option<bool>,
     ) -> Result<i64, sqlx::Error>;
-    async fn list_active_production_ordered(&mut self) -> Result<Vec<TShelfWithLoad>, sqlx::Error>;
-    /// 2026-10-04 新增（picker for-inspection 专供，聚合口径与
-    /// `list_active_production_ordered` 逐字一致）：出参带 `current_load`。
-    async fn list_active_inspection_with_load(
-        &mut self,
-    ) -> Result<Vec<TShelfWithLoad>, sqlx::Error>;
     #[allow(clippy::too_many_arguments)]
     async fn create<'a>(
         &mut self,
@@ -118,8 +116,11 @@ pub trait ShelfRepoTrait: Send {
         location: Option<&'a str>,
         display_order: i32,
         created_by: i64,
+        capacity: Option<i32>,
     ) -> Result<TShelf, sqlx::Error>;
     #[allow(clippy::too_many_arguments)]
+    /// `location` / `capacity` 三态：`None` 不改 / `Some(None)` 清 NULL /
+    /// `Some(Some(v))` 改值。
     async fn update<'a>(
         &mut self,
         id: i64,
@@ -128,6 +129,7 @@ pub trait ShelfRepoTrait: Send {
         location: Option<Option<&'a str>>,
         display_order: Option<i32>,
         updated_by: i64,
+        capacity: Option<Option<i32>>,
     ) -> Result<u64, sqlx::Error>;
     async fn soft_delete(
         &mut self,
@@ -136,6 +138,16 @@ pub trait ShelfRepoTrait: Send {
         updated_by: i64,
     ) -> Result<u64, sqlx::Error>;
     async fn count_in_use_parts(&mut self, shelf_id: i64) -> Result<i64, sqlx::Error>;
+    /// 2026-10-10：批量取一组货架的 `(capacity, current_load)`（零 N+1）。
+    ///
+    /// 委托 [`crate::shared::shelf::load::loads_by_shelf_ids`] —— 负载聚合的口径
+    /// 由那个共享常量单点承担，本 trait 只是为了让 service 能在泛型 `R` 下调用它
+    /// （`ShelfRepoTrait` 不暴露 `conn()` 访问器：加一个返回 `&mut PgConnection`
+    /// 的方法会让 `mockall::automock` 无法伪造返回值）。
+    async fn load_by_ids(
+        &mut self,
+        shelf_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, (Option<i32>, i64)>, sqlx::Error>;
 }
 
 /// 把 `ShelfRepoTrait` 直接对 `&mut PgConnection` 实现——handler/service 借 `&mut *tx` 或
@@ -183,16 +195,6 @@ impl ShelfRepoTrait for &mut PgConnection {
         ShelfRepo::count_with_filters(&mut **self, code_like, zone, is_active).await
     }
 
-    async fn list_active_production_ordered(&mut self) -> Result<Vec<TShelfWithLoad>, sqlx::Error> {
-        ShelfRepo::list_active_production_ordered(&mut **self).await
-    }
-
-    async fn list_active_inspection_with_load(
-        &mut self,
-    ) -> Result<Vec<TShelfWithLoad>, sqlx::Error> {
-        ShelfRepo::list_active_inspection_with_load(&mut **self).await
-    }
-
     #[allow(clippy::too_many_arguments)]
     async fn create<'b>(
         &mut self,
@@ -203,6 +205,7 @@ impl ShelfRepoTrait for &mut PgConnection {
         location: Option<&'b str>,
         display_order: i32,
         created_by: i64,
+        capacity: Option<i32>,
     ) -> Result<TShelf, sqlx::Error> {
         ShelfRepo::create(
             &mut **self,
@@ -213,6 +216,7 @@ impl ShelfRepoTrait for &mut PgConnection {
             location,
             display_order,
             created_by,
+            capacity,
         )
         .await
     }
@@ -226,6 +230,7 @@ impl ShelfRepoTrait for &mut PgConnection {
         location: Option<Option<&'b str>>,
         display_order: Option<i32>,
         updated_by: i64,
+        capacity: Option<Option<i32>>,
     ) -> Result<u64, sqlx::Error> {
         ShelfRepo::update(
             &mut **self,
@@ -235,6 +240,7 @@ impl ShelfRepoTrait for &mut PgConnection {
             location,
             display_order,
             updated_by,
+            capacity,
         )
         .await
     }
@@ -250,5 +256,12 @@ impl ShelfRepoTrait for &mut PgConnection {
 
     async fn count_in_use_parts(&mut self, shelf_id: i64) -> Result<i64, sqlx::Error> {
         ShelfRepo::count_in_use_parts(&mut **self, shelf_id).await
+    }
+
+    async fn load_by_ids(
+        &mut self,
+        shelf_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, (Option<i32>, i64)>, sqlx::Error> {
+        crate::shared::shelf::load::loads_by_shelf_ids(&mut **self, shelf_ids).await
     }
 }

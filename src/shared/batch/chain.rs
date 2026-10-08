@@ -156,8 +156,8 @@ pub const CHAIN_POSITION_LATERAL_SQL: &str = "SELECT \
 /// 把整个 `CHAIN_POSITION_LATERAL_SQL` 片段塞进 4 条列表 SQL，代价与该片段的逐批次
 /// LATERAL 成本都不接受。**绿框的语义因此要按「近似」理解**：它表示「有链且指针
 /// step 的工序与当前工序对得上」，是前端**提示**（可免填下一道工序），不是写侧闸门；
-/// 真正的闸门是 `is_pointer_consistent`，两者不一致时以写侧为准（放回应要求显式指定
-/// 下一道工序，拒收不会静默错值）。
+/// 真正的闸门是 `is_pointer_consistent`，两者不一致时以写侧为准（放回时：链尾且指针
+/// 一致 ⇒ 自动送检；其余非顺应 ⇒ 要求前端显式指定下一道工序，拒收不会静默错值）。
 pub const HAS_PROCESS_CHAIN_EXPR: &str = "p.process_chain_id IS NOT NULL \
      AND ( (cs.process_id IS NOT NULL AND cs.process_id = pb.current_process_id) \
            OR (pb.current_process_id IS NULL \
@@ -198,7 +198,7 @@ impl ChainPosition {
     /// `process_id` 唯一命中、且定位到的 step 就是指针，而列表侧的
     /// [`HAS_PROCESS_CHAIN_EXPR`] 只能比「指针 step 的工序 == 批次当前工序」
     /// （三种分叉形态见该常量的 doc）。**不一致时以本方法为准**：绿框是前端提示，
-    /// 本方法是放回端点的拒收闸门，故静默错值不会发生。
+    /// 本方法是 worker-scan 放回端点的分流闸门，故静默错值不会发生。
     pub fn is_pointer_consistent(&self, batch: &TPartBatch) -> bool {
         match (self.current_step_id, batch.current_process_step_id) {
             (Some(located), Some(pointer)) => located == pointer,
@@ -460,7 +460,8 @@ mod tests {
         );
     }
 
-    /// 链尾 ⇒ `TAIL` 且**不产出**任何下一道 id（写侧据此要求前端显式指定）。
+    /// 链尾 ⇒ `TAIL` 且**不产出**任何下一道 id（写侧据此判定「这批做完了」→ 自动送检，
+    /// 不落生产架）。
     #[tokio::test]
     async fn resolve_chain_position_tail_has_no_next() {
         let pool = test_pool().await;
@@ -484,7 +485,8 @@ mod tests {
     }
 
     /// 无链（`t_part.process_chain_id IS NULL`）⇒ `NONE` + 无任何派生值，且
-    /// `is_pointer_consistent` 为 false ⇒ 写侧要求前端显式指定下一道工序。
+    /// `is_pointer_consistent` 为 false ⇒ 写侧落「非顺应」分支（要求前端显式指定下一道
+    /// 工序；链尾自动送检只对 `is_pointer_consistent && TAIL` 生效，不含本形态）。
     #[tokio::test]
     async fn resolve_chain_position_none_without_chain() {
         let pool = test_pool().await;

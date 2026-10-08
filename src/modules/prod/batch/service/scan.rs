@@ -18,7 +18,6 @@ use crate::shared::error::{AppError, code};
 use super::BatchService;
 use crate::shared::batch::guards::{
     mark_batch_status_only, mark_batch_with_status_and_meta, validate_batch_version,
-    validate_shelf_zone,
 };
 
 impl BatchService {
@@ -26,10 +25,13 @@ impl BatchService {
 
     /// `POST /prod/batches/{batch_id}/scan-inspect`：扫码快捷品检（一步式）。
     ///
-    /// `{PENDING, PROGRAMMING, IN_PROCESS}` → INSPECTION（target_shelf）→
-    /// READY_TO_SHIP（pass=true）或 IN_PROCESS + `is_repairing = true`
-    /// （pass=false，批次停在送检架等 `complete-repair` 落回生产架；shelf_id +
-    /// next_process_id 由 DTO 承载，作用于后续那次 complete-repair）。
+    /// `{PENDING, PROGRAMMING, IN_PROCESS}` → INSPECTION（服务端自动选出的品检架）
+    /// → READY_TO_SHIP（pass=true）或 IN_PROCESS + `is_repairing = true`
+    /// （pass=false，批次停在送检架等 `complete-repair` 落回生产架）。
+    ///
+    /// 2026-10-10：品检架由 `shared::shelf::select::pick_least_loaded` 按负载选出，
+    /// DTO 里的 `target_inspection_shelf_id` / `shelf_id` / `next_process_id`
+    /// 三个字段全部删除（后两个本端点从 2026-10-04 起就从不消费）。
     pub async fn scan_inspect<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
@@ -62,12 +64,18 @@ impl BatchService {
                 format!("scan-inspect: 起点 {from:?} 不允许"),
             ));
         }
-        validate_shelf_zone(
+        // 2026-10-10：目标品检架由服务端按负载自动选（入参已删除）。
+        // `None` ⇒ `40301 SHELF_MISMATCH`（scope 内无可用品检架），不用 20501 ——
+        // 成因是「无权」而不是「架不存在」。
+        let target_inspection_shelf_id = crate::shared::shelf::select::pick_least_loaded(
             repo.conn_mut(),
-            req.target_inspection_shelf_id,
             "INSPECTION",
+            None,
+            crate::shared::shelf::select::shelf_scope_for(current),
         )
-        .await?;
+        .await?
+        .ok_or_else(|| crate::shared::shelf::select::no_candidate_in_scope("INSPECTION"))?
+        .id;
         // 第一步：到 INSPECTION
         // 2026-09-30：出池（转 INSPECTION）→ current_process_id 置 NULL，
         // 否则 INSPECTION 批次会混进工序候选池
@@ -77,7 +85,7 @@ impl BatchService {
             req.version,
             "INSPECTION",
             Some("INSPECTION_SHELF"),
-            Some(req.target_inspection_shelf_id),
+            Some(target_inspection_shelf_id),
             None,
             None,
             current.id,

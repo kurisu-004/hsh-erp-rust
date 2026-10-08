@@ -5,8 +5,8 @@
 //! - role.rs    ← UserRoleRepo 16 + MenuRepo 4 + ShelfRepo 2 = 22 例（本文件）
 //! - password.rs ← 多表组合事务 + 事务边界 + 3 个补充集成测试 7 例
 //!
-//! 本文件 22 例：覆盖 `iam/repo/sql/{user_role,menu,shelf}.rs` 共 8 个固有方法
-//! （user_role 6 + menu 1 + shelf 1）。
+//! 本文件 22 例：覆盖 `iam/repo/sql/{user_role,menu}.rs` 共 7 个固有方法
+//! （user_role 6 + menu 1）+ `t_shelf` SQL 真源（`iam::shelf::repo::sql`）1 个方法。
 //! 22 例**已含**针对 `seeds/menu.sql` 的那条自锁断言（`MenuRepo` 4 例之一，不碰
 //! DB），不是 22 之外再加的第 23 条。
 //!
@@ -28,13 +28,15 @@ use sqlx::PgPool;
 use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 // 2026-09-19 IAM 域合并：原 `user::repo` 重定向到 `iam::repo`，方法零 diff。
-// 2026-09-22 重构 #2：sql.rs 拆为 sql/{user,user_role,menu,shelf}.rs free fn；
+// 2026-09-22 重构 #2：sql.rs 拆为 sql/{user,user_role,menu,wx_identity}.rs free fn；
 // 原 `user_role_sql::xxx` → `sql::user_role::xxx`（`UserRoleInsert` 等入参 DTO 仍从
-// `repo` re-export 取，与 handler 层 `state.pool.begin()` + `&mut *tx` 路径同构。
+// `repo` re-export 取，与 handler 层 `state.pool.begin()` + `&mut *tx` 路径同构）。
 use hsh_erp_rust::modules::iam::repo::UserRoleInsert;
-use hsh_erp_rust::modules::iam::repo::sql::{
-    menu as menu_sql, shelf as shelf_sql, user_role as user_role_sql,
-};
+use hsh_erp_rust::modules::iam::repo::sql::{menu as menu_sql, user_role as user_role_sql};
+// 2026-10-10：货架子模块并入 iam 后，`t_shelf` 的 SQL 真源只有一份
+// （`iam::shelf::repo::sql`），原 `iam::repo::sql::shelf` 已删除、其两条用例改打
+// 这里的新真源。
+use hsh_erp_rust::modules::iam::shelf::repo::sql as shelf_sql;
 
 // 2026-09-24 PR13 Phase I：fixture 范本化入口。`load_user_repo_fixture(&pool)` 加载
 // 1 menu baseline（PR-C.Final 移除 user + role baseline，避免污染
@@ -596,12 +598,12 @@ async fn seed_shelf(pool: &PgPool, code: &str, zone: &str) -> i64 {
     id
 }
 
-/// `shelf_sql::get_by_id`：命中
+/// `ShelfRepo::get_by_id`：命中
 #[tokio::test]
 async fn get_by_id_returns_shelf() {
     let (pool, _fx) = setup().await;
     let sid = seed_shelf(&pool, "S-001", "PRODUCTION").await;
-    let s = shelf_sql::get_shelf_by_id(&pool, sid)
+    let s = shelf_sql::ShelfRepo::get_by_id(&pool, sid)
         .await
         .expect("query")
         .expect("hit");
@@ -610,11 +612,11 @@ async fn get_by_id_returns_shelf() {
     assert_eq!(s.zone, "PRODUCTION");
 }
 
-/// `shelf_sql::get_by_id`：不存在的 id
+/// `ShelfRepo::get_by_id`：不存在的 id
 #[tokio::test]
 async fn shelf_get_by_id_returns_none_for_missing() {
     let (pool, _fx) = setup().await;
-    let s = shelf_sql::get_shelf_by_id(&pool, 999_999_999_999)
+    let s = shelf_sql::ShelfRepo::get_by_id(&pool, 999_999_999_999)
         .await
         .expect("query");
     assert!(s.is_none());

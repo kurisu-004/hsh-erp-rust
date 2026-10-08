@@ -7,7 +7,9 @@
 //!
 //! 旧路径 `GET|POST /api/v2/shelves/{id}/processes` 与 `GET /api/v2/shelves/processes`
 //! **不再挂载**（404，无 alias；沿 2026-09-19 prod 聚合先例）。请求 / 响应契约逐字
-//! 不变，前端只改 URL。
+//! 不变，前端只改 URL。⚠️ 2026-10-10 起这三条的 404 成因变了：`/api/v2/shelves`
+//! 整段前缀随货架子模块迁入 iam 域一并下线，不再是「本 router 少一条路由」而是
+//! 「前缀整体不存在」—— 响应形态不变（都是 404），原因不同。
 //!
 //! ## 为什么搬到 prod（2026-10-02 域拆分）
 //! 「货架在后端现在是单独的模块，但货架自身包括了账号的部分和工序映射相关的部分，
@@ -28,10 +30,11 @@
 //!   `list_all_mappings` / `list_shelf_processes`），事务边界在 handler
 //! - `handler.rs` —— 3 端点 + 路由工厂
 //!
-//! ## 与 shelf 域的关系
-//! shelf 域（`src/modules/shelf/`）保留 7 端点（CRUD 4 + picker 2 + 列表 / 详情），
-//! 其 `ShelfRepoTrait` 已缩到 10 个纯 `t_shelf` 方法，`t_shelf_process` 与 2 个
-//! 反向 helper 全部删除。
+//! ## 与货架实体的关系（2026-10-10）
+//! 货架实体本身是 **iam 域下的嵌套子模块** `iam::shelf`（`src/modules/iam/shelf/`，
+//! 5 端点、URL `/api/v2/iam/shelves/*`）。本子模块跨域只读它的 `ShelfRepo::get_by_id`
+//! 校验货架存在 / 停用 / zone —— `t_shelf_process` 归 prod、`t_shelf` 归 iam，两者的
+//! 切分依据就是「哪张表的外键指向本域实体」。
 
 use std::sync::Arc;
 

@@ -17,7 +17,7 @@
 
 use serde::Serialize;
 
-use crate::shared::types::serialize_i64;
+use crate::shared::types::{serialize_i64, serialize_i64_opt};
 
 /// `take_one_from_pool` / `take_specific_from_pool` 单条返回形状。
 ///
@@ -46,8 +46,11 @@ pub struct TakenItem {
 pub struct RefillResult {
     #[serde(serialize_with = "serialize_i64")]
     pub worker_id: i64,
-    #[serde(serialize_with = "serialize_i64")]
-    pub shelf_id: i64,
+    /// 2026-10-10：改 `Option<i64>`，`null` = 跨全部货架取料（worker-scan 路径）。
+    /// 省略本就没有信息量（refill 不移动批次，只是把池里的批次派给工人），但保留
+    /// 它是为了让管理员限架场景（「在某架上抢料」）能被前端区分显示。
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub shelf_id: Option<i64>,
     pub taken: Vec<TakenItem>,
     /// 一批也没抢到（池空）。handler 据此广播 `WORKER_POOL_EMPTY`。
     pub pool_empty: bool,

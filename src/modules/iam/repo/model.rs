@@ -97,22 +97,3 @@ pub struct Menu {
     pub updated_by: Option<i64>,
     pub deleted_at: Option<NaiveDateTime>,
 }
-
-/// `t_shelf` 行（本域只读，用于 SHELF_ACCOUNT 角色的 scope 校验）
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct Shelf {
-    pub id: i64,
-    pub code: String,
-    pub name: String,
-    /// `PRODUCTION` / `INSPECTION`
-    pub zone: String,
-    pub location: Option<String>,
-    pub is_active: bool,
-    pub display_order: i32,
-    pub version: i32,
-    pub created_at: NaiveDateTime,
-    pub created_by: Option<i64>,
-    pub updated_at: NaiveDateTime,
-    pub updated_by: Option<i64>,
-    pub deleted_at: Option<NaiveDateTime>,
-}

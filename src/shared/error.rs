@@ -194,7 +194,9 @@ pub mod code {
     // to-inspection 一键送检新增
     pub const BIZ_SHELF_NOT_INSPECTION_ZONE: i32 = 20511; // target_inspection_shelf.zone ≠ 'INSPECTION'
     pub const BIZ_SHELF_INACTIVE: i32 = 20512; // target_inspection_shelf.is_active = false
-    // 20507 BIZ_SHELF_PROCESS_NOT_MAPPED（货架未映射该工序）已存在，worker-pool admin_remove 校验沿用此码，勿新增
+    // ⚠️ 2026-10-10：`BIZ_SHELF_PROCESS_NOT_MAPPED`(20507) 已**全仓零触发点** —— 最后一个
+    // 服务对象（queue move WORKER→POOL 的映射校验）随目标货架自动选架退场，「架必须映射
+    // 该工序」改由选架 SQL 的候选集承担。常量与码名暂留（历史行与已发布契约），勿新增使用。
 
     // 206xx 账号（t_user / t_user_role）—— Python 命名 BIZ_* 长名为正典
     pub const BIZ_USER_ACCOUNT_NOT_FOUND: i32 = 20601;

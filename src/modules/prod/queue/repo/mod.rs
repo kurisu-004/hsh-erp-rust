@@ -90,10 +90,12 @@ use crate::modules::prod::queue::vo::worker::TakenItem;
 #[async_trait]
 pub trait QueueRepoTrait: Send {
     // ── t_queue 域（本域 4 方法）──
+    /// 2026-10-10：`shelf_id` 改 `Option<i64>`，`None` = 跨全部货架取料
+    /// （worker-scan 路径不再有架锚；负载均衡在放回时的 `pick_least_loaded` 一侧）。
     async fn take_one_from_pool(
         &mut self,
         worker_id: i64,
-        shelf_id: i64,
+        shelf_id: Option<i64>,
         process_ids: &[i64],
         operator_user_id: i64,
     ) -> Result<Option<TakenItem>, sqlx::Error>;
@@ -258,10 +260,12 @@ pub trait QueueRepoTrait: Send {
 #[async_trait]
 impl QueueRepoTrait for &mut PgConnection {
     // ── 本域 4 方法 ──
+    /// 2026-10-10：`shelf_id` 改 `Option<i64>`，`None` = 跨全部货架取料
+    /// （worker-scan 路径不再有架锚；负载均衡在放回时的 `pick_least_loaded` 一侧）。
     async fn take_one_from_pool(
         &mut self,
         worker_id: i64,
-        shelf_id: i64,
+        shelf_id: Option<i64>,
         process_ids: &[i64],
         operator_user_id: i64,
     ) -> Result<Option<TakenItem>, sqlx::Error> {

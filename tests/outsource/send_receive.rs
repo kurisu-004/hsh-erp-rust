@@ -12,15 +12,16 @@
 //! - **回收生产**（`OUTSOURCE_COMPANY → PRODUCTION_SHELF`）：shipment 标
 //!   `RECEIVED` + `received_at` + quote event `RECEIVED`；工序**推进**到
 //!   `next_process_id`；省略 `next_process_id` 时按工序链推导 / 推不出返 20706
-//! - **回收品检**（`OUTSOURCE_COMPANY → INSPECTION_SHELF`）：出池清 `current_process_id`
-//!   与 step，shipment 同样关闭，part 事件 `RECEIVED_TO_INSPECTION`
+//! - **回收品检**（`OUTSOURCE_COMPANY → INSPECTION_SHELF`）：2026-10-10 起该方向
+//!   **整条下线**（`OutsourceLocation::InspectionShelf` 变体删除），发这个 kind 的请求
+//!   在反序列化阶段即被拒 ⇒ 422 纯文本、不进 `R<T>` 信封、批次零改动
 //! - **出参契约**：5 个雪花 id 全是字符串；`shipment_id` / `new_process_id` 在非本方向
 //!   **键不存在**
 //! - **请求形状守卫**：同 kind → 40001（且早于查批次）、`from` 与真实位置/holder 不符
 //!   → 20122、`version` 过期 → 40901、批次不存在 → 20109、非发送方向带 `quote_id` /
 //!   `direct` → 20104、**漏传 `version` → 422 纯文本**
-//! - **回收方向的源状态白名单**：批次还在生产架上却请求回收到品检架 → 20103（这条守卫
-//!   是 match 兜底分支不 panic 的前提）
+//! - **回收方向的源状态白名单**：批次还在生产架上（`IN_PROCESS`）却请求回收 → 20103
+//!   （这条守卫是 match 兜底分支不 panic 的前提）
 //! - **价来源守卫**：APPROVAL / DIRECT 二选一、`requires_approval` 工序不许直发、
 //!   占位价不能当审批价（21307）、DRAFT 报价 21307、公司不存在 21201 / 停用 21205、
 //!   非 OUTSOURCE 工序 20104、公司未映射工序 20104、链内缺该工序 step 20702
@@ -130,16 +131,6 @@ fn receive_body(
         "version": version,
         "from": { "kind": "OUTSOURCE_COMPANY", "company_id": company_id.to_string() },
         "to": to,
-    })
-}
-
-/// 回收直送品检 body：`from` = 外协公司 → `to` = 品检架。
-fn receive_inspection_body(batch_id: i64, version: i32, company_id: i64, shelf_id: i64) -> Value {
-    json!({
-        "batch_id": batch_id.to_string(),
-        "version": version,
-        "from": { "kind": "OUTSOURCE_COMPANY", "company_id": company_id.to_string() },
-        "to": { "kind": "INSPECTION_SHELF", "shelf_id": shelf_id.to_string() },
     })
 }
 
@@ -484,7 +475,8 @@ async fn insert_shelf(pool: &PgPool, code: &str, zone: &str) -> i64 {
     id
 }
 
-/// 直插 `t_shelf_process`（货架 ↔ 工序映射）。回收到生产架时缺它会吃 20507。
+/// 直插 `t_shelf_process`（货架 ↔ 工序映射）。回收到生产架时缺它 ⇒ 该工序无可用生产货架
+/// ⇒ 20508（选架的候选集要求「映射了该工序」，候选为空即选不出）。
 async fn map_shelf_process(pool: &PgPool, shelf_id: i64, process_id: i64) {
     let id = next_id();
     let now = now_naive();
@@ -2016,76 +2008,54 @@ async fn move_receive_rejects_price_source_fields() {
 }
 
 /// 回收直送品检：落 `INSPECTION` + 品检架，`current_process_id` / step 按出池不变式清
-/// NULL，并把开口 shipment 标 RECEIVED。
+/// 2026-10-10：`OUTSOURCE_COMPANY → INSPECTION_SHELF` 方向**整条下线**。
+///
+/// `OutsourceLocation::InspectionShelf` 变体随该方向一并删除，于是发这个 kind 的
+/// 请求在**反序列化阶段**就被拒：axum 的 `Json` 提取器返回 422 **纯文本**
+/// （`unknown variant \`INSPECTION_SHELF\``），**不进 `R<T>` 信封**。
+///
+/// 断言的是这个「硬切无 alias」形态，而不是某个业务错误码 —— 该方向连 service 都
+/// 进不去。替代路径：先收进生产架（`to.kind = PRODUCTION_SHELF`），再走常规送检
+/// 链路，品检架同样由服务端自动选。
 #[tokio::test]
-async fn move_receive_to_inspection_closes_shipment() {
+async fn move_receive_to_inspection_direction_is_gone() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
-    let (bid, part_id, company_id, quote_id, _shelf, _next_proc, _) =
+    let (bid, _part_id, company_id, _quote_id, _shelf, _next_proc, _) =
         setup_inflight(&pool, "Insp", "Z", "PINSP", "REC-I", "REC-PROC-I", true).await;
     let insp_shelf = insert_shelf(&pool, "INS-1", "INSPECTION").await;
 
-    let (s, env) = post_move(
+    // 422 纯文本不进 `R<T>` 信封，故用 `send_raw` 而不是 `post_move`（后者会 panic）
+    let (s, raw) = send_raw(
         app.clone(),
-        &token,
-        receive_inspection_body(bid, 0, company_id, insp_shelf),
+        json_request(
+            "POST",
+            MOVE_PATH,
+            Some(json!({
+                "batch_id": bid.to_string(),
+                "version": 0,
+                "from": { "kind": "OUTSOURCE_COMPANY", "company_id": company_id.to_string() },
+                "to": { "kind": "INSPECTION_SHELF", "shelf_id": insp_shelf.to_string() },
+            })),
+            Some(&token),
+        ),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "直送品检: {env}");
-    assert_eq!(env["data"]["to_kind"], "INSPECTION_SHELF", "{env}");
-    // 品检方向没有「下一道工序」⇒ `new_process_id` 键不存在
-    assert!(
-        env["data"].get("new_process_id").is_none(),
-        "回收到品检时 new_process_id 必须整个键不存在: {env}"
+    assert_eq!(
+        s,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "已下线的 kind 必须在反序列化阶段被拒: {raw}"
     );
-    let (status, location, holder, cur_proc, step): (
-        String,
-        Option<String>,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-    ) = sqlx::query_as(
-        "SELECT status, location, current_holder_id, current_process_id, \
-                current_process_step_id \
-         FROM t_part_batch WHERE id = $1",
-    )
-    .bind(bid)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(status, "INSPECTION");
-    assert_eq!(location.as_deref(), Some("INSPECTION_SHELF"));
-    assert_eq!(holder, Some(insp_shelf));
-    assert_eq!(cur_proc, None, "出池必须清 current_process_id");
-    assert_eq!(step, None, "出池必须清 current_process_step_id");
-
-    let received_at: Option<chrono::NaiveDateTime> =
-        sqlx::query_scalar("SELECT received_at FROM t_outsource_shipment WHERE batch_id = $1")
-            .bind(bid)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
     assert!(
-        received_at.is_some(),
-        "整批直送品检应关 shipment 并写 received_at"
+        raw.contains("unknown variant") && raw.contains("INSPECTION_SHELF"),
+        "响应应点名被删掉的 kind: {raw}"
     );
-    let event_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint FROM t_outsource_quote_event \
-         WHERE quote_id = $1 AND event_type = 'RECEIVED'",
-    )
-    .bind(quote_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(event_count, 1);
-    let ev: String = sqlx::query_scalar(
-        "SELECT event_type FROM t_part_event \
-         WHERE part_id = $1 AND event_type = 'RECEIVED_TO_INSPECTION'",
-    )
-    .bind(part_id)
-    .fetch_one(&pool)
-    .await
-    .expect("part_event RECEIVED_TO_INSPECTION");
-    assert_eq!(ev, "RECEIVED_TO_INSPECTION");
+    // 批次不受影响（错误发生在 service 之前）
+    let status: String = sqlx::query_scalar("SELECT status FROM t_part_batch WHERE id = $1")
+        .bind(bid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "OUTSOURCE", "被拒的请求不得改动批次");
 }
 
 // ===========================================================================
@@ -2130,33 +2100,42 @@ async fn move_unknown_batch_returns_20109() {
 
 /// `from` 的 `kind` 与批次真实 location 不符 → 20122。
 #[tokio::test]
-async fn move_from_kind_mismatch_returns_20122() {
+async fn move_from_kind_mismatch_is_rejected() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let (bid, _part_id, company_id, quote_id, shelf_id, next_proc, _) =
         setup_inflight(&pool, "KindMM", "K", "PKIND", "REC-K", "REC-PROC-K", true).await;
 
-    // 批次在 OUTSOURCE_COMPANY，from 却报生产架
+    // 批次在 OUTSOURCE_COMPANY，from 却报生产架 —— 守卫 ⑤（状态机）先于 ⑥（from 锚点）
+    // 命中：`OUTSOURCE → OUTSOURCE` 不是合法边，所以这一形态**不会**走到 20122。
+    // 2026-10-10 只剩两个 kind 之后，「from 报生产架 + to 报外协公司」是这个唯一的
+    // 跨 kind 组合，故 20122 的可达形态收窄为「from 报外协公司但 company_id 不符」。
     let body = json!({
         "batch_id": bid.to_string(),
         "version": 0,
-        "from": { "kind": "PRODUCTION_SHELF", "shelf_id": shelf_id.to_string() },
-        "to": { "kind": "INSPECTION_SHELF", "shelf_id": shelf_id.to_string() },
+        "from": { "kind": "PRODUCTION_SHELF" },
+        "to": { "kind": "OUTSOURCE_COMPANY", "company_id": company_id.to_string() },
     });
     let (s, env) = post_move(app.clone(), &token, body).await;
-    assert_eq!(s, StatusCode::CONFLICT, "from.kind 与真实位置不符: {env}");
-    assert_eq!(env["code"].as_i64().unwrap(), 20122, "{env}");
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "OUTSOURCE → OUTSOURCE 应先被状态机拒（不是 20122）: {env}"
+    );
+    assert_eq!(env["code"].as_i64().unwrap(), 20103, "{env}");
 
-    // from 是品检架：一律非法起点
+    // from 报外协公司但 company_id 对不上：2026-10-10 起 `to.kind` 只剩
+    // PRODUCTION_SHELF / OUTSOURCE_COMPANY 两值（品检架方向已下线），故这一段改用
+    // 「外协公司侧 holder 不符」来触发同一条 20122 守卫。
     let body = json!({
         "batch_id": bid.to_string(),
         "version": 0,
-        "from": { "kind": "INSPECTION_SHELF", "shelf_id": shelf_id.to_string() },
-        "to": { "kind": "PRODUCTION_SHELF", "shelf_id": shelf_id.to_string() },
+        "from": { "kind": "OUTSOURCE_COMPANY", "company_id": (company_id + 1).to_string() },
+        "to": { "kind": "PRODUCTION_SHELF", "next_process_id": next_proc.to_string() },
     });
     let (s, env) = post_move(app, &token, body).await;
-    assert_eq!(s, StatusCode::CONFLICT, "品检架不是合法起点: {env}");
+    assert_eq!(s, StatusCode::CONFLICT, "外协公司 id 不符: {env}");
     assert_eq!(env["code"].as_i64().unwrap(), 20122, "{env}");
-    let _ = (company_id, quote_id, next_proc);
+    let _ = (quote_id, shelf_id);
 }
 
 /// `from` 的 holder id 与批次真实 `current_holder_id` 不符 → 20122。
@@ -2268,9 +2247,13 @@ async fn move_requires_version_field_returns_422_plain_text() {
 /// 这条守卫是「显式钉住」而不是顺带的：状态机白名单里 `IN_PROCESS → INSPECTION` 与
 /// `PENDING → IN_PROCESS` / `PENDING → INSPECTION` 都是合法边（它们属建档 / 待编程流的
 /// 语义），删掉它这些边就会把「从生产架直接回收品检」放进 match 的兜底分支 ⇒ panic
-/// 而不是 4xx。故本用例守的是那条守卫本身，不是它拦下的结果。
+/// 回收方向的**源状态**守卫：批次不在 `OUTSOURCE`（这里是 `IN_PROCESS`）→ 20103。
+///
+/// 2026-10-10 起 `to` 只剩 `PRODUCTION_SHELF` 一个合法值（直送品检方向下线），
+/// 本用例改用「`from` 逐字等于批次真实位置（否则会挂在更早的 20122 上）+ 回收生产」
+/// 来触发同一条守卫。文案仍必须点名源状态白名单。
 #[tokio::test]
-async fn move_recover_to_inspection_from_production_shelf_returns_20103() {
+async fn move_recover_requires_outsource_source_status() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let customer_id = insert_l1_customer(&pool, "BadRecvKind", "W").await;
     let part_id = insert_part(&pool, customer_id, "PENDING").await;
@@ -2278,31 +2261,31 @@ async fn move_recover_to_inspection_from_production_shelf_returns_20103() {
     let proc_id = seed_outsource_process(&pool, "XBRK", "brk_proc", false).await;
     map_company_process(&pool, company_id, proc_id).await;
     let shelf_id = insert_shelf(&pool, "BRK-SH", "PRODUCTION").await;
-    let insp_shelf_id = insert_shelf(&pool, "BRK-INSP", "INSPECTION").await;
-    // 批次在生产架上加工中（**不是**在外协公司）
-    let bid = insert_batch_with_process(
-        &pool,
-        part_id,
-        "IN_PROCESS",
-        Some("PRODUCTION_SHELF"),
-        proc_id,
-        Some(shelf_id),
-    )
-    .await;
+    // 批次**还没上架**（PENDING，**不是**在外协公司）。选 PENDING 而不是 IN_PROCESS
+    // 是因为 `IN_PROCESS → IN_PROCESS` 不是状态机白名单里的边，会被 `ensure_transition`
+    // 先拒掉、根本走不到「源状态必须是 OUTSOURCE」那条守卫；PENDING → IN_PROCESS 是
+    // 合法边，于是能精确地命中目标守卫。
+    let bid = insert_batch_with_process(&pool, part_id, "PENDING", None, proc_id, None).await;
+    let _ = shelf_id;
 
-    // `from` 逐字等于批次真实位置（否则会挂在更早的 20122 上），`to` 是品检架
+    // `from.kind` 是唯一能让本守卫可达的取值（kind 不同才能通过守卫 ②；批次状态
+    // 由守卫 ⑤ 判，⑥ 的 from 锚点守卫在它之后，永不执行）
     let (s, env) = post_move(
         app,
         &token,
         json!({
             "batch_id": bid.to_string(),
             "version": 0,
-            "from": { "kind": "PRODUCTION_SHELF", "shelf_id": shelf_id.to_string() },
-            "to": { "kind": "INSPECTION_SHELF", "shelf_id": insp_shelf_id.to_string() },
+            "from": { "kind": "OUTSOURCE_COMPANY", "company_id": company_id.to_string() },
+            "to": { "kind": "PRODUCTION_SHELF", "next_process_id": proc_id.to_string() },
         }),
     )
     .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "生产架 → 品检架必须拒: {env}");
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "非 OUTSOURCE 源回收必须拒: {env}"
+    );
     assert_eq!(env["code"].as_i64().unwrap(), 20103, "{env}");
     assert!(
         env["message"]
@@ -2311,18 +2294,6 @@ async fn move_recover_to_inspection_from_production_shelf_returns_20103() {
             .contains("回收方向的源状态必须是 OUTSOURCE"),
         "文案必须点名源状态白名单: {env}"
     );
-
-    // 批次一个字节都没动
-    let (status, location, holder): (String, Option<String>, Option<i64>) = sqlx::query_as(
-        "SELECT status, location, current_holder_id FROM t_part_batch WHERE id = $1",
-    )
-    .bind(bid)
-    .fetch_one(&pool)
-    .await
-    .expect("read batch after rejected recovery");
-    assert_eq!(status, "IN_PROCESS", "被拒请求不得改批次状态: {env}");
-    assert_eq!(location.as_deref(), Some("PRODUCTION_SHELF"));
-    assert_eq!(holder, Some(shelf_id));
 }
 
 /// 回收方向省略 `to.next_process_id` 时推不出下一道工序 —— **锚链存在但 step 指针漂移**

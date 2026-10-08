@@ -348,9 +348,10 @@ pub struct OutsourceInFlightListQuery {
 ///
 /// ## `kind` 取值必须与 `t_part_batch.location` 的枚举值**逐字对齐**
 ///
-/// `PRODUCTION_SHELF` / `OUTSOURCE_COMPANY` / `INSPECTION_SHELF` 三值取自该列的
-/// 域内取值（`OFFICE` / `WORKER` 两个值不进外协看板：一个是工单建档位的非批次态、
-/// 一个是厂内工人持有位）。**这条对齐是整个三合一设计成立的前提**：
+/// `PRODUCTION_SHELF` / `OUTSOURCE_COMPANY` 两值取自该列的域内取值
+/// （`OFFICE` / `WORKER` / `INSPECTION_SHELF` 三个值不进外协看板：分别是工单建档位的
+/// 非批次态、厂内工人持有位、以及 2026-10-10 起随「外协直收直送品检」方向一并下线
+/// 的那个值）。**这条对齐是整个三合一设计成立的前提**：
 ///
 /// - 不变式 1：`from.kind` **必须等于**批次当前 `location`，否则 service 以
 ///   `20122 BIZ_BATCH_LOCATION_MISMATCH` 拒收；
@@ -363,12 +364,18 @@ pub struct OutsourceInFlightListQuery {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OutsourceLocation {
-    /// 生产货架（候选池）。作为 `to`（回收）时 `next_process_id` 语义见
-    /// [`OutsourceMoveRequest`]；作为 `from` 时留空（`shelf_id` 必须等于批次真实
-    /// `current_holder_id`）。
+    /// 生产货架（候选池）。作为 `to`（回收）时目标货架由后端**自动选**
+    /// （`shared::shelf::select::pick_least_loaded`，见 [`OutsourceMoveRequest`]）；
+    /// 作为 `from` 时留空（只需 `batch.location == 'PRODUCTION_SHELF'`）。
+    ///
+    /// ## `shelf_id` 字段已移除（2026-10-10）
+    /// 老客户端多发的 `shelf_id` 会被 serde 静默忽略（本仓生产代码零
+    /// `deny_unknown_fields`），故移除是**向后兼容**的；但新客户端发老版本服务端
+    /// 会得 422（字段必填缺失），**部署顺序必须后端先上**。
+    ///
+    /// 作为 `from` 时不再比对 `current_holder_id`：批次在哪个生产架上与「它是不是在
+    /// 生产架上」是两件事，把后者做成前者的同义要求会让「同一批货换个架就被拒」。
     ProductionShelf {
-        #[serde(deserialize_with = "deserialize_i64")]
-        shelf_id: i64,
         /// **仅 `to` 需要**：回收后进入的下一道 INHOUSE 工序。
         ///
         /// 缺省时后端从工序链推导（`next_process` 相关口径见
@@ -384,13 +391,23 @@ pub enum OutsourceLocation {
         #[serde(deserialize_with = "deserialize_i64")]
         company_id: i64,
     },
-    /// 品检货架（回收直送品检）。只有 `to` 方向出现（`from` 不可能是品检架上的
-    /// 在外协批次）。
-    InspectionShelf {
-        #[serde(deserialize_with = "deserialize_i64")]
-        shelf_id: i64,
-    },
 }
+
+// ## `InspectionShelf` 变体已删除（2026-10-10）
+//
+// 「外协直收直送品检」这个方向（`OUTSOURCE_COMPANY → INSPECTION_SHELF`）整条下线。
+//
+// 移除缘由：该变体只有 `shelf_id` 一个字段，而这个字段在自动选架上线后**没有任何
+// 角色可留** —— 品检架由 `shared::shelf::select::pick_least_loaded(INSPECTION,
+// None, scope)` 挑，保留一个「调用方指定品检架」的入口就等于保留了自动选架的
+// 旁路，而这条旁路与「worker-scan 的 INSPECTED 分支有 40301 scope 守卫」配套：
+// 一旦允许前端指定品检架，它就必须重新拿到 `can_access_shelf(target)` 校验，
+// 否则会出现「worker-scan 越权被拒、从外协看板却能直送任意品检架」的口子。
+//
+// 替代者：`OUTSOURCE_COMPANY → PRODUCTION_SHELF`（回收进生产）之后走正常的送检
+// 链路（`POST /api/v2/prod/batches/{batch_id}/to-inspection` 或 worker-scan
+// INSPECTED），品检架同样由服务端自动选。代价是多一次工序推进/一次扫码，
+// 换来的是「品检架只有一个入口」与「该入口恒有 scope 守卫」。
 
 /// `POST /api/v2/outsource-queue/move` 入参。
 ///
@@ -402,7 +419,17 @@ pub enum OutsourceLocation {
 /// |---|---|---|
 /// | `PRODUCTION_SHELF` | `OUTSOURCE_COMPANY` | `PENDING` / `IN_PROCESS` → `OUTSOURCE` |
 /// | `OUTSOURCE_COMPANY` | `PRODUCTION_SHELF` | `OUTSOURCE` → `IN_PROCESS`（推进到 `next_process_id`） |
-/// | `OUTSOURCE_COMPANY` | `INSPECTION_SHELF` | `OUTSOURCE` → `INSPECTION`（`current_process_id` 置 NULL） |
+///
+/// 2026-10-10：`OUTSOURCE_COMPANY → INSPECTION_SHELF` 方向**整条下线**
+/// （`OutsourceLocation::InspectionShelf` 变体随之删除，缘由见该处的注释）。
+///
+/// ## 目标货架由服务端选（2026-10-10）
+/// 两个方向的货架都不再由前端传：
+/// - `to = PRODUCTION_SHELF`：`pick_least_loaded(PRODUCTION, Some(next_process), scope)`
+/// - `to = OUTSOURCE_COMPANY`：目标是外协公司，与货架无关
+///
+/// `from = PRODUCTION_SHELF` 只校验 `batch.location == 'PRODUCTION_SHELF'`，不再
+/// 比对 `current_holder_id`。
 ///
 /// ## 为什么不带 `quantity`（整批语义）
 /// 旧三端点带 `quantity` 支持部分收发（写侧先拆批、只流转子批次）。看板卡片是

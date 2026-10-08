@@ -43,7 +43,6 @@ pub mod part_file;
 // queue 平移至 `prod::*`，URL 硬切换到 `/api/v2/prod/*`（无 alias，前端锁步）。
 // part / assembly 是核心实体未移入；报工端点保留在 part 域。
 pub mod prod;
-pub mod shelf;
 pub mod statistics;
 // 2026-09-28 删除：相关上传会话域（Redis 共享 STS 凭证会话机制）。
 // 前端改为单 uploader 触发时单 HTTP 调用 python `sts-tmp-keys` 数组入参直签，
@@ -103,7 +102,6 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // 2026-10-09：批次拆分升为全模块共用端点（生产队列看板 / 外协看板 / 零件详情三处调用）。
         // ⚠️ `prod::batch` 因此有两处挂载：本前缀（域内）与 `/api/v2/batches`（本条）。
         .nest("/batches", prod::split_router())
-        .nest("/shelves", shelf::router())
         // 2026-09-28 新增：dashboard 域 HTTP 全量首取端点（`GET /snapshot`）。
         // 路径：挂在 `/api/v2/dashboard/*`，与 `/ws/dashboard`（WS-only，不带
         // `/api/v2` 前缀）并存；前者给前端走「HTTP 首取 + WS 事件 invalidate」

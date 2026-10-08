@@ -8,30 +8,50 @@
 //! `t_part_batch.status`，不引用 part 域任何 service / vo。
 //!
 //! 2026-10-04 起本文件不再只服务 `prod::batch`：`prod::shelf_process`（建映射时的 zone
-//! 守卫）与 `prod::queue`（WORKER→POOL 放回时的货架守卫）两个**同域**跨模块
+//! 守卫）与 `prod::batch::pickup`（`PickUpRequest.shelf_id` 的可选校验）两个跨模块
 //! caller 也调 [`validate_shelf_zone`]。新增 caller 时**必须**调本函数而不要复制判序 ——
 //! 判序（20501 存在 → 20512 停用 → 20104 zone）与文案只有一份，是 2026-10-04 那次
-//! 「`current_holder_id` 写脏」修复的核心：3 个写点各写各的守卫时，其中一个漏了
+//! 「`current_holder_id` 写脏」修复的核心：写点各写各的守卫时，其中一个漏了
 //! `t_shelf` 侧谓词就足以让批次落到品检架上并从此静默漏件。
 //!
-//! 2026-10-04 review 第 1 轮 I1：**不要**给 `prod::batch::service::worker_scan` 的
-//! RETURNED 分支再加一道货架守卫。它在 `worker_scan_event` 的第 1 步（`event_type`
-//! 分支**之前**）已经用 `ShelfRepo::get_by_id_zone(req.shelf_id, "PRODUCTION")` 一步
-//! 守掉存在 / 软删 / 停用 / zone 四个谓词（`shelf::repo::sql` 的 WHERE 是
-//! `id=$1 AND zone=$2 AND is_active=true AND deleted_at IS NULL`），而写进
-//! `current_holder_id` 的正是同一个 `req.shelf_id`。
+//! ⚠️ `prod::queue` 曾是第三个 caller（`move` 端点 WORKER→POOL 的货架守卫），2026-10-10
+//! 起该分支改走自动选架（`shared::shelf::select::pick_least_loaded`，候选集自带
+//! 存在 / 停用 / zone 三个谓词），`prod::queue` 不再 import 本函数。
 //!
-//! `current_holder_id`（= 货架）的写点全仓恰好 3 个，本批全部覆盖、无遗留：
-//! ① `dispatch_single`（`update_batch_dispatched`，货架由
-//! `find_first_shelf_for_process` 从映射里**选出** ⇒ 谓词下沉到该方法的 SQL）；
-//! ② `move_batch` WORKER→POOL（`prod::queue` 的 move 端点，货架来自请求 ⇒
-//! `validate_shelf_zone`）；③ `worker_scan` RETURNED（货架来自请求 ⇒ 已有的
-//! `get_by_id_zone`）。改任一处都请先回到这条清单核对。
+//! ## 2026-10-10：`assert_shelf_maps_process` 删除
+//!
+//! 「写进 `current_holder_id` 的架必须映射批次的当前工序」这条守卫已**被选架本身
+//! 覆盖**：`shared::shelf::select::pick_least_loaded` 的候选集只含
+//! `t_shelf_process` 里映射了该工序的行（带 `deleted_at IS NULL` 闸门）。全部写路径
+//! 改走选架之后，本函数零调用方 ⇒ 删除。若将来重新引入「调用方指定货架」的写
+//! 路径，**不要**恢复这个函数，而是在选架 SQL 里加同样的 `EXISTS` 谓词 —— 让守卫留在
+//! 一处，别再分成「选架一次 + 事后校验一次」两个可能漂移的判定。同理
+//! `ShelfProcessRepo::exists_for_shelf_process` 也已删除（零调用方）。
+//!
+//! ## `current_holder_id` 的写点：写货架的**全部**走 `pick_least_loaded`
+//!
+//! 这是本文件存在的理由 —— 「写进 `current_holder_id` 的架必须满足的一组谓词」应当
+//! **只在一处**（选架的候选集），而不是每个写点各判一次。故此处登记全量写点清单：
+//! 新增 / 修改任何写 `current_holder_id` 的路径时，回来核对它有没有绕过选架。
+//!
+//! **写货架（14 处，全部 `shared::shelf::select::pick_least_loaded`）**
+//!
+//! | 目标区 | 调用点 |
+//! |---|---|
+//! | `PRODUCTION`（按工序筛候选） | `to_process_core`（含检验不合格打回生产架的 `mark_batch_failed_inspection`）/ `place_on_shelf` / `release_from_programming` / `worker_scan` RETURNED / `move_batch` WORKER→POOL / `complete_repair` 与 `repair_dispatch` 的回生产臂 / `outsource::move` 回收生产 / `dispatch_single`（经 `queue::repo::dispatch::update_batch_dispatched`，它与本文件 `mark_batch_with_status_and_meta` 是 `shared::batch::status` 同一条 UPDATE 的两个薄包装） |
+//! | `INSPECTION`（无工序映射，只按 zone 筛） | `to_inspection_core`（两个 wrapper 各自选一次：单件端点选一次；批量端点在 per-item 循环**外**选一次、这批 item 共用）/ `scan_inspect` / `complete_repair` 与 `repair_dispatch` 的回品检臂 / `sent_to_inspection`（worker-scan 的 `INSPECTED` 分支与链尾自动送检两处共用） |
+//!
+//! **写非货架 holder（不要混进上面那张表）**：`pickup` / `take_one_from_pool` /
+//! `take_specific_from_pool` / `move_worker_to_worker` 写 worker id；
+//! `outsource::move` 的发送方向写外协公司 id；`recall` 清 NULL。
+//!
+//! ⚠️ 计数会随端点增删漂移，故上面按「目标区 + 调用点」列而不是只写个数字 ——
+//! 判断一个写点是否合规，看的是「它拿到货架 id 的那一步有没有走选架」，不是清单长度。
 
 use sqlx::PgConnection;
 
+use crate::modules::iam::shelf::repo::ShelfRepo;
 use crate::modules::part::statemachine::PartStatus;
-use crate::modules::shelf::repo::ShelfRepo;
 use crate::shared::batch::status::{StatusChange, apply_batch_status_change};
 use crate::shared::error::{AppError, code};
 
@@ -146,29 +166,6 @@ pub async fn validate_shelf_zone(
     Ok(())
 }
 
-/// 校验 shelf ↔ process 映射（`_assert_shelf_maps_process`）：必须存在
-/// `t_shelf_process` 映射行，否则 20507 `BIZ_SHELF_PROCESS_NOT_MAPPED`。
-pub async fn assert_shelf_maps_process(
-    conn: &mut PgConnection,
-    shelf_id: i64,
-    process_id: i64,
-) -> Result<(), AppError> {
-    let exists: Option<(i64,)> = sqlx::query_as(
-        "SELECT id FROM t_shelf_process WHERE shelf_id = $1 AND process_id = $2 \
-         AND deleted_at IS NULL LIMIT 1",
-    )
-    .bind(shelf_id)
-    .bind(process_id)
-    .fetch_optional(&mut *conn)
-    .await?;
-    if exists.is_none() {
-        return Err(AppError::biz(
-            code::BIZ_SHELF_PROCESS_NOT_MAPPED,
-            format!("shelf {shelf_id} 未映射 process {process_id}"),
-        ));
-    }
-    Ok(())
-}
 /// 2026-09-16 PR-3 批次 step 化：
 /// - 删 `placed_at` 列写入（COALESCE(placed_at, now()) 已无意义）
 /// - `next_process_id: Option<i64>` → `current_process_step_id: Option<i64>`

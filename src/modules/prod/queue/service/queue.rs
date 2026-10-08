@@ -52,28 +52,26 @@
 //! `PartService::sync_from_batch_change(&mut PgConnection, ...)`，service 公共
 //! 方法签名收 `&mut PgConnection`，与 PartService 形参直接匹配。
 //!
-//! ## 2026-10-02 `t_shelf_process` SQL 收口
-//! `move_batch` WORKER→POOL 分支的货架映射存在性检查由内联 SQL 改调
-//! `prod::shelf_process::repo::ShelfProcessRepo::exists_for_shelf_process`
-//! （`SELECT EXISTS(…)`，与原恒真式写法语义等价；20507 `BIZ_SHELF_PROCESS_NOT_MAPPED`
-//! 的触发条件与文案不变）。下方 `#[cfg(test)]` 集成测试 fixture helper 里的
-//! `INSERT INTO t_shelf_process` 保持原样（测试数据落库，不属 SQL 真源收口范围）。
+//! ## 2026-10-10：目标货架一律自动选
+//! `move_batch` 的 WORKER→POOL 分支（撤回候选池）原先由调用方传 `to.shelf_id`，再走
+//! `validate_shelf_zone` + `ShelfProcessRepo::exists_for_shelf_process` 两道守卫。
+//! 现在 `to` 侧的 `POOL` 分支**没有** `shelf_id` 字段（`MoveToLocation::Pool` 是
+//! 无字段变体），目标架由 `shared::shelf::select::pick_least_loaded` 按批次当前
+//! `current_process_id` 选 —— 那两道守卫的谓词已由选架候选集整体覆盖，本文件因此
+//! 不再 import `validate_shelf_zone` 与 `ShelfProcessRepo`。`from` 侧仍要
+//! `shelf_id`（比对批次的真实所在货架），故 `from` / `to` 拆成两个独立类型。
+//! 契约见 `docs/api/queue.md` §2 与 §4。
 
 use sqlx::PgConnection;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::part::service::PartService;
-// 2026-10-04：`move_batch` WORKER→POOL 分支改为无条件校验目标货架
-// （存在 / 停用 / `zone='PRODUCTION'`），与 place_on_shelf / pickup / outsource 等
-// 生产流端点共用同一守卫，同源同码（20501 / 20512 / 20104）。
 use crate::modules::prod::queue::repo::QueueRepoTrait;
-use crate::modules::prod::shelf_process::repo::ShelfProcessRepo;
-use crate::shared::batch::guards::validate_shelf_zone;
 use crate::shared::error::{AppError, code};
 
 use crate::modules::prod::queue::dto::{
-    AutoAllocateMode, AutoAllocateRequest, MoveLocation, MoveRequest,
+    AutoAllocateMode, AutoAllocateRequest, MoveFromLocation, MoveRequest, MoveToLocation,
 };
 use crate::modules::prod::queue::vo::worker::{
     AutoAllocateResult, MoveResult, RefillResult, TakenItem, WorkerFillItem,
@@ -111,12 +109,18 @@ impl QueueService {
     ///    `TAKEN_FROM_POOL` 事件日志 + `PartService::sync_from_batch_change` 同步
     ///    part 派生列（事务内由 handler commit）；
     /// 5. 返回 `RefillResult { worker_id, shelf_id, taken, pool_empty }`。
+    ///
+    /// `shelf_id`（2026-10-10 起 `Option<i64>`）：`None` = **跨全部映射该工种工序的
+    /// 活跃生产架取料**（worker-scan 路径）。旧实现要求「工人站在某个架上」并把该架
+    /// 当候选池过滤键，而 worker-scan 的 `shelf_id` 入参已经删除 —— 继续限架会在
+    /// 「放回到 A 架 → 随即从 A 架补料」这个闭环里查空池。负载均衡现在整体由
+    /// `shared::shelf::select::pick_least_loaded`（放回时选架）承担。
     #[allow(clippy::too_many_arguments)]
     pub async fn refill_for_worker(
         conn: &mut PgConnection,
         snowflake: &SnowflakeIdGenerator,
         worker_id: i64,
-        shelf_id: i64,
+        shelf_id: Option<i64>,
         operator_user_id: i64,
         current: &CurrentUser,
     ) -> Result<RefillResult, AppError> {
@@ -161,13 +165,15 @@ impl QueueService {
     /// 由 [`refill_for_worker`]（admin 路径：自己 fetch）与
     /// `prod::batch::service::worker_scan`（worker-scan 路径：service 已在 scan 步骤
     /// fetch 过 worker）共用。
+    ///
+    /// `shelf_id` 语义见 [`refill_for_worker`]（`None` = 跨全部映射架取料）。
     #[allow(clippy::too_many_arguments)]
     pub async fn refill_for_worker_with_work_type(
         conn: &mut PgConnection,
         snowflake: &SnowflakeIdGenerator,
         worker_id: i64,
         work_type_id: i64,
-        shelf_id: i64,
+        shelf_id: Option<i64>,
         badge_code: &str,
         operator_user_id: i64,
         current: &CurrentUser,
@@ -252,8 +258,9 @@ impl QueueService {
     ///    - WORKER → `(location='WORKER', current_holder_id=worker_id)`
     ///    - 不一致 → `20122 BIZ_BATCH_LOCATION_MISMATCH`
     /// 5. 校验 `to`：
-    ///    - POOL → shelf 必须映射 `batch.current_process_id`（2026-09-30：直读
-    ///      工序归属新列，不再经 `current_process_step_id` → step JOIN 中转）
+    ///    - POOL → **2026-10-10 起无入参可校验**：目标架由服务端按
+    ///      `batch.current_process_id` 自动选（`pick_least_loaded`）。直读工序归属新列，
+    ///      不再经 `current_process_step_id` → step JOIN 中转
     ///    - WORKER → worker is_active 且工序资格 + 容量（`held < max_held`）
     /// 6. 按 (from, to) 选 SQL：
     ///    - POOL → WORKER：复用 `take_specific_from_pool`（service 入口已 fetch batch，
@@ -295,14 +302,19 @@ impl QueueService {
         // `require_any_role` 分支），故该判定对本端点的**每一个** caller 恒为 true，
         // 加上去是可证明的死代码。scope 收窄只对 SHELF_ACCOUNT 有意义，而 SHELF_ACCOUNT
         // 进不来本端点。
+        //
+        // 2026-10-10：WORKER→POOL 分支改走自动选架后，`shelf_scope_for(&current)` 按上述
+        // 同一条理由对本端点的每一个 caller 恒返 `None`（Manager）—— 传它是形态一致
+        // （选架的 scope 形参必填，不是可选参数），**不是**新增了一条有效校验。选不出
+        // 架时因此报 20508 而不是 40301。
 
         let from_kind = match &req.from {
-            MoveLocation::Pool { .. } => "POOL",
-            MoveLocation::Worker { .. } => "WORKER",
+            MoveFromLocation::Pool { .. } => "POOL",
+            MoveFromLocation::Worker { .. } => "WORKER",
         };
         let to_kind = match &req.to {
-            MoveLocation::Pool { .. } => "POOL",
-            MoveLocation::Worker { .. } => "WORKER",
+            MoveToLocation::Pool => "POOL",
+            MoveToLocation::Worker { .. } => "WORKER",
         };
 
         // 2. POOL→POOL 同 kind 移动 → 非法（WORKER→WORKER 是合法方向，需走 §5 三方向分支）
@@ -334,7 +346,7 @@ impl QueueService {
 
         // 4. from 与 batch 当前 (location, holder) 匹配校验
         match &req.from {
-            MoveLocation::Pool { shelf_id } => {
+            MoveFromLocation::Pool { shelf_id } => {
                 let loc = batch.location.as_deref().unwrap_or("");
                 if loc != "PRODUCTION_SHELF" {
                     return Err(AppError::biz(
@@ -355,7 +367,7 @@ impl QueueService {
                     ));
                 }
             }
-            MoveLocation::Worker { worker_id } => {
+            MoveFromLocation::Worker { worker_id } => {
                 let loc = batch.location.as_deref().unwrap_or("");
                 if loc != "WORKER" {
                     return Err(AppError::biz(
@@ -401,16 +413,16 @@ impl QueueService {
         let step_process_id: Option<i64> = batch.current_process_id;
 
         // 取 worker 元数据（事件日志 badge_code；POOL→WORKER / WORKER→WORKER 需要源 worker）
-        let src_worker_badge: Option<String> = if let MoveLocation::Worker { worker_id } = &req.from
-        {
-            let w = (&mut *conn)
-                .worker_get_by_id(*worker_id, false)
-                .await?
-                .ok_or_else(|| AppError::biz(code::BIZ_WORKER_NOT_FOUND, "源 worker 不存在"))?;
-            Some(w.badge_code)
-        } else {
-            None
-        };
+        let src_worker_badge: Option<String> =
+            if let MoveFromLocation::Worker { worker_id } = &req.from {
+                let w = (&mut *conn)
+                    .worker_get_by_id(*worker_id, false)
+                    .await?
+                    .ok_or_else(|| AppError::biz(code::BIZ_WORKER_NOT_FOUND, "源 worker 不存在"))?;
+                Some(w.badge_code)
+            } else {
+                None
+            };
 
         // 5/6 主体分支
         // 三个分支必填 new_holder_id / new_location；其余为可选填充（按 to_kind 决定）
@@ -422,7 +434,7 @@ impl QueueService {
         let mut taken_opt: Option<TakenItem> = None;
 
         match (&req.from, &req.to) {
-            (MoveLocation::Pool { shelf_id }, MoveLocation::Worker { worker_id }) => {
+            (MoveFromLocation::Pool { shelf_id }, MoveToLocation::Worker { worker_id }) => {
                 // POOL → WORKER：复用 take_specific_from_pool（不写 step）
                 // worker 资格 + 容量校验
                 let worker = (&mut *conn)
@@ -547,60 +559,60 @@ impl QueueService {
             }
 
             (
-                MoveLocation::Worker {
+                MoveFromLocation::Worker {
                     worker_id: src_worker_id,
                 },
-                MoveLocation::Pool { shelf_id },
+                MoveToLocation::Pool,
             ) => {
                 // WORKER → POOL：复用 part_mark_batch_returned（不写 step）
                 //
-                // 2026-10-04 新增（`current_holder_id` 写脏缺口）：本分支把 `shelf_id`
-                // 直接写进 `t_part_batch.current_holder_id` 且 `location` 翻成
-                // `PRODUCTION_SHELF`，原先**只**在 `step_process_id` 是 `Some` 时校验
-                // 货架↔工序映射，且任何情况下都不校验货架本身。后果是静默漏件：报工台
-                // 取件页的取件 SQL 硬限定 `JOIN t_shelf sh ON sh.id = b.current_holder_id
-                // AND sh.is_active = true AND sh.zone = 'PRODUCTION'`，故落到品检架 /
-                // 停用架 / 已软删架上的批次永远不会被工人领到，也不报错。
-                // 下面改为**无条件**走 `validate_shelf_zone`（与 place_on_shelf / pickup /
-                // outsource 等生产流端点同源同码：20501 → 20512 → 20104）。
-                // 2026-10-04 review 第 2 轮 N2：原文写「6 个生产流端点」，那是本分支
-                // 收紧**之前**的调用点数；本分支新增 2 个 caller 后已过期。调用点数会随
-                // 端点增删漂移，故此处不写数字。
-                validate_shelf_zone(&mut *conn, *shelf_id, "PRODUCTION").await?;
-                if let Some(spid) = step_process_id {
-                    // 2026-10-02 SQL 收口 + review 第 1 轮 M-6 改名：原内联
-                    // `SELECT shelf_id FROM t_shelf_process WHERE shelf_id=$1 AND
-                    //  process_id=$2 AND deleted_at IS NULL ORDER BY … LIMIT 1` +
-                    // `is_none()` 判定（恒真式写法），改调 SQL 真源
-                    // `prod::shelf_process::repo::ShelfProcessRepo::exists_for_shelf_process`
-                    // 的 `SELECT EXISTS(…)` 显式存在性检查（语义等价，错误码 20507
-                    // 与文案不变）。变量随之从 `mapped`（曾指被丢弃的行）改为
-                    // `is_mapped`（收 bool），读法与类型对齐。
-                    let is_mapped =
-                        ShelfProcessRepo::exists_for_shelf_process(&mut *conn, *shelf_id, spid)
-                            .await?;
-                    if !is_mapped {
-                        return Err(AppError::biz(
-                            code::BIZ_SHELF_PROCESS_NOT_MAPPED,
-                            format!("shelf {shelf_id} 未映射工序 {spid}（batch 当前工序）"),
-                        ));
-                    }
-                } else {
-                    // ⚠️ 2026-10-04 判定：`None` 分支**不**升级为硬拒。`None` =
-                    // `t_part_batch.current_process_id IS NULL`，即「在池/在工人手上但
-                    // 没有工序归属」的批次（migration 004 之前的存量 + 直接改库的历史
-                    // 脏数据）。此时**无从校验映射**（没有 process_id 可比），若改成
-                    // 拒收，管理员连「把卡住的批次手动放回货架」这条自救路径都会被堵死。
-                    // 故保留跳过映射校验，但货架本身的存在性 / 停用 / zone 已由上方
-                    // `validate_shelf_zone` 无条件守住 —— 本分支不再存在「完全不校验货架」
-                    // 的形态。
-                }
+                // 2026-10-10：目标货架改由 `shared::shelf::select::pick_least_loaded`
+                // 自动选（`to` 侧不再有 `shelf_id`）。原先那两道守卫 —— 无条件
+                // `validate_shelf_zone(.., "PRODUCTION")` + `step_process_id` 存在时的
+                // `t_shelf_process` 映射校验（20507）—— **已被选架本身覆盖**：
+                // 候选集就限定了 `zone='PRODUCTION'` ∧ `is_active` ∧ 未软删 ∧
+                // 「映射了该工序」（带 `deleted_at IS NULL` 闸门）。判据没被削弱、
+                // 只是从「选完之后再判一遍」变成「只判一遍」，后者反而消掉了两遍闸门
+                // 漂移的可能。
+                //
+                // `step_process_id = None`（批次无工序归属：migration 004 之前的存量 +
+                // 历史脏数据）时**仍不硬拒**：传 `None` 进 `process_id` 形参即「不按工序
+                // 筛候选」，于是落在该 zone 全部活跃生产架里 —— 与改造前那条
+                // 「无从校验映射就跳过」的判定同形，管理员「把卡住的批次手动放回货架」
+                // 的自救路径不被堵死。
+                //
+                // 选不出时用 `20508 BIZ_SHELF_PROCESS_NOT_FOUND` 而不是 40301：本端点
+                // 角色闸门是 `require_role(Role::Manager)` 独占，`shelf_scope_for` 对它
+                // 恒返 `None`（不限），所以「候选为空」**只可能**是「没有可用生产架 /
+                // 没有架映射这道工序」，永远不会是 scope 问题 —— 说成「无权」是错的。
+                let shelf_id = crate::shared::shelf::select::pick_least_loaded(
+                    &mut *conn,
+                    "PRODUCTION",
+                    step_process_id,
+                    crate::shared::shelf::select::shelf_scope_for(current),
+                )
+                .await?
+                .ok_or_else(|| {
+                    AppError::biz(
+                        code::BIZ_SHELF_PROCESS_NOT_FOUND,
+                        match step_process_id {
+                            Some(spid) => format!(
+                                "process {spid} 无可用生产货架（无 active 映射，或命中的映射其货架 \
+                                 均已软删 / 已停用 / 非 PRODUCTION 区）"
+                            ),
+                            None => {
+                                "没有任何可用的生产货架（该 zone 无活跃未软删的货架）".to_string()
+                            }
+                        },
+                    )
+                })?
+                .id;
 
                 let rows = (&mut *conn)
                     .part_mark_batch_returned(
                         batch.id,
                         req.version,
-                        *shelf_id,
+                        shelf_id,
                         None, // 2026-09-30 重构：move 不写 step
                         Some(current.id),
                     )
@@ -636,18 +648,18 @@ impl QueueService {
                     )
                     .await?;
 
-                new_holder_id = *shelf_id;
+                new_holder_id = shelf_id;
                 new_location = "PRODUCTION_SHELF";
-                shelf_id_opt = Some(*shelf_id);
+                shelf_id_opt = Some(shelf_id);
                 // 释放源 worker 当前持有一条（current_held 语义仅在 to=WORKER 时填）
                 let _ = src_worker_id; // 显式标注使用
             }
 
             (
-                MoveLocation::Worker {
+                MoveFromLocation::Worker {
                     worker_id: src_worker_id,
                 },
-                MoveLocation::Worker {
+                MoveToLocation::Worker {
                     worker_id: dst_worker_id,
                 },
             ) => {
@@ -763,8 +775,8 @@ impl QueueService {
             }
             // 同 kind 已在前面 ② 拦截；显式 unreachable 分支让编译器穷尽性检查通过
             #[allow(unreachable_patterns)]
-            (MoveLocation::Pool { .. }, MoveLocation::Pool { .. })
-            | (MoveLocation::Worker { .. }, MoveLocation::Worker { .. }) => {
+            (MoveFromLocation::Pool { .. }, MoveToLocation::Pool)
+            | (MoveFromLocation::Worker { .. }, MoveToLocation::Worker { .. }) => {
                 unreachable!("同 kind 移动已在 ② 拦截")
             }
         }
@@ -899,7 +911,9 @@ impl QueueService {
             let mut filled_count = 0i32;
             for _ in 0..target {
                 match (&mut *conn)
-                    .take_one_from_pool(worker_id, req.shelf_id, &process_ids, current.id)
+                    // 管理员显式指定货架（「为该工序在某架上抢料」）⇒ 限架。
+                    // 与 worker-scan 的跨架取料是两种口径，这里**刻意保留**架锚。
+                    .take_one_from_pool(worker_id, Some(req.shelf_id), &process_ids, current.id)
                     .await?
                 {
                     Some(t) => {
@@ -970,7 +984,7 @@ impl Default for QueueService {
 // - 三方向 happy path：POOL→WORKER / WORKER→POOL / WORKER→WORKER
 // - from 与 batch 实际 (location, holder) 不一致 → 40904 LOCATION_MISMATCH
 // - 目标 worker 工种不含 batch 当前工序（current_process_id）→ 20104 BIZ_INVALID_VALUE
-// - 目标 shelf 未映射工序 → 20507 BIZ_SHELF_PROCESS_NOT_MAPPED
+// - 批次当前工序无可用生产货架（选架候选为空）→ 20508 BIZ_SHELF_PROCESS_NOT_FOUND
 // - POOL→POOL 同 kind 移动 → 40001 VALIDATION_ERROR
 //
 // helper 沿用 batch/service.rs::mod tests 风格：直接 raw INSERT，避免引
@@ -1354,10 +1368,10 @@ mod tests {
             batch_id: batch,
             // 2026-10-09 新增 OCC 锚；上方两个 fixture helper 建批时 version 写死 0
             version: 0,
-            from: MoveLocation::Pool {
+            from: MoveFromLocation::Pool {
                 shelf_id: prod_shelf,
             },
-            to: MoveLocation::Worker { worker_id: worker },
+            to: MoveToLocation::Worker { worker_id: worker },
             note: Some("in-source pool→worker".to_string()),
         };
         let r = QueueService::move_batch(
@@ -1405,10 +1419,8 @@ mod tests {
             batch_id: batch,
             // 2026-10-09 新增 OCC 锚；上方两个 fixture helper 建批时 version 写死 0
             version: 0,
-            from: MoveLocation::Worker { worker_id: worker },
-            to: MoveLocation::Pool {
-                shelf_id: prod_shelf,
-            },
+            from: MoveFromLocation::Worker { worker_id: worker },
+            to: MoveToLocation::Pool,
             note: Some("in-source worker→pool".to_string()),
         };
         let r = QueueService::move_batch(
@@ -1455,10 +1467,10 @@ mod tests {
             batch_id: batch,
             // 2026-10-09 新增 OCC 锚；上方两个 fixture helper 建批时 version 写死 0
             version: 0,
-            from: MoveLocation::Worker {
+            from: MoveFromLocation::Worker {
                 worker_id: worker_src,
             },
-            to: MoveLocation::Worker {
+            to: MoveToLocation::Worker {
                 worker_id: worker_dst,
             },
             note: Some("in-source worker→worker".to_string()),
@@ -1507,12 +1519,10 @@ mod tests {
             // 2026-10-09 新增 OCC 锚；上方两个 fixture helper 建批时 version 写死 0
             version: 0,
             // from 谎报成 WORKER（实际在 POOL），期望 40904
-            from: MoveLocation::Worker {
+            from: MoveFromLocation::Worker {
                 worker_id: 999_999_999,
             },
-            to: MoveLocation::Pool {
-                shelf_id: prod_shelf,
-            },
+            to: MoveToLocation::Pool,
             note: None,
         };
         let err = QueueService::move_batch(
@@ -1552,10 +1562,10 @@ mod tests {
             batch_id: batch,
             // 2026-10-09 新增 OCC 锚；上方两个 fixture helper 建批时 version 写死 0
             version: 0,
-            from: MoveLocation::Worker {
+            from: MoveFromLocation::Worker {
                 worker_id: worker_src,
             },
-            to: MoveLocation::Worker {
+            to: MoveToLocation::Worker {
                 worker_id: worker_dst,
             },
             note: None,
@@ -1571,21 +1581,23 @@ mod tests {
         assert_eq!(err.code(), code::BIZ_INVALID_VALUE);
     }
 
-    /// 场景：目标 shelf 未映射 batch 当前工序（current_process_id）→ 20507 SHELF_PROCESS_NOT_MAPPED。
-    /// 走 WORKER→POOL 分支（to=POOL 时会校验 shelf 映射）。
+    /// 场景：批次当前工序（`current_process_id`）**没有任何映射的可用生产货架**
+    /// → 20508 BIZ_SHELF_PROCESS_NOT_FOUND。走 WORKER→POOL 分支。
+    ///
+    /// 2026-10-10：目标架不再由调用方指定，所以「未映射」的形态从「指定了一个没映射
+    /// 该工序的架」变成「这道工序压根没有可用生产架」——选架的候选集要求
+    /// `t_shelf_process` 里有该工序的未软删映射且货架活跃、为 `PRODUCTION`，全都不满足
+    /// 时返 `Ok(None)`。原 20507 守卫与 `validate_shelf_zone` 都已被选架覆盖。
     #[tokio::test]
-    async fn move_batch_target_shelf_unmapped_returns_20507() {
+    async fn move_batch_no_candidate_shelf_returns_20508() {
         let pool = test_pool().await;
         let user_id = insert_user_with_role(&pool, "manager_ts", "password", "MANAGER").await;
         let customer = insert_customer(&pool, "ACME-TS").await;
-        // batch 当前工序 = PROC-P
+        // batch 当前工序 = PROC-P；**不**给任何架映射它 ⇒ 选架候选为空
         let proc_p = insert_process(&pool, "PROC-P", "工序P").await;
         let wt = insert_work_type(&pool, "WT-P", "工种P", Some(5)).await;
         link_work_type_to_process(&pool, wt, proc_p).await;
-        // 源 shelf 映射 PROC-P
-        let src_shelf = insert_shelf(&pool, "SH-P-SRC", "PRODUCTION").await;
-        link_shelf_to_process(&pool, src_shelf, proc_p).await;
-        // 目标 shelf 映射另一个 PROC-Q（不映射 PROC-P）
+        // 只造一个映射到**别的**工序的架（模拟「配了架但配错了工序」这个真实运维形态）
         let proc_q = insert_process(&pool, "PROC-Q", "工序Q").await;
         let dst_shelf = insert_shelf(&pool, "SH-Q-DST", "PRODUCTION").await;
         link_shelf_to_process(&pool, dst_shelf, proc_q).await;
@@ -1598,10 +1610,8 @@ mod tests {
             batch_id: batch,
             // 2026-10-09 新增 OCC 锚；上方两个 fixture helper 建批时 version 写死 0
             version: 0,
-            from: MoveLocation::Worker { worker_id: worker },
-            to: MoveLocation::Pool {
-                shelf_id: dst_shelf,
-            },
+            from: MoveFromLocation::Worker { worker_id: worker },
+            to: MoveToLocation::Pool,
             note: None,
         };
         let err = QueueService::move_batch(
@@ -1611,8 +1621,8 @@ mod tests {
             &make_current(user_id, Role::Manager),
         )
         .await
-        .expect_err("shelf 未映射应 Err");
-        assert_eq!(err.code(), code::BIZ_SHELF_PROCESS_NOT_MAPPED);
+        .expect_err("无可用生产货架应 Err");
+        assert_eq!(err.code(), code::BIZ_SHELF_PROCESS_NOT_FOUND);
     }
 
     /// 场景：POOL→POOL 同 kind 移动 → 40001 VALIDATION_ERROR。
@@ -1631,12 +1641,10 @@ mod tests {
             batch_id: batch,
             // 2026-10-09 新增 OCC 锚；上方两个 fixture helper 建批时 version 写死 0
             version: 0,
-            from: MoveLocation::Pool {
+            from: MoveFromLocation::Pool {
                 shelf_id: prod_shelf,
             },
-            to: MoveLocation::Pool {
-                shelf_id: prod_shelf,
-            },
+            to: MoveToLocation::Pool,
             note: None,
         };
         let err = QueueService::move_batch(

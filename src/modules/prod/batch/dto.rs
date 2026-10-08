@@ -53,12 +53,16 @@ pub struct ToShipRequest {
 /// `POST /api/v2/prod/batches/{batch_id}/to-inspection` 入参。
 ///
 /// 状态机迁移：`{PENDING, PROGRAMMING, IN_PROCESS}` → `INSPECTION`。
-/// `target_inspection_shelf_id`：必填；service 校验 `zone='INSPECTION'` 且
-/// `is_active=true`（20511 / 20512）。
 /// `version`：**必填**；目标批次 `t_part_batch.version`；不符 → 40901。
+///
+/// ## `target_inspection_shelf_id` 已移除（2026-10-10）
+/// 目标品检架由服务端按负载自动选（`shared::shelf::select::pick_least_loaded`），
+/// 选不出时返 `40301 SHELF_MISMATCH`（scope 内无可用品检架）。
+/// 老客户端多发的 `shelf_id` 会被 serde 静默忽略（本仓生产代码零
+/// `deny_unknown_fields`），故移除是**向后兼容**的；但新客户端发老版本服务端
+/// 会得 422（字段必填缺失），**部署顺序必须后端先上**。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ToInspectionRequest {
-    pub target_inspection_shelf_id: String,
     pub version: i32,
     #[serde(default)]
     pub note: Option<String>,
@@ -69,12 +73,16 @@ pub struct ToInspectionRequest {
 /// `POST /api/v2/prod/batches/{batch_id}/to-process` 入参。
 ///
 /// 状态机迁移：`INSPECTION` → `IN_PROCESS`，同时写入目标 production shelf。
-/// `shelf_id`：必填；目标生产货架 id（`zone='PRODUCTION'` 且 `is_active=true`）。
-/// `next_process_id`：必填；下一道工序 id（与 shelf 映射）。
+/// `next_process_id`：**必填**且保留 —— 工人指定的是「打回到哪道工序」不是「打回到
+/// 哪个架」，服务端按这道工序 + 负载自动挑架（候选集只含映射了该工序的活跃生产架）。
 /// `version`：**必填**；目标批次 `t_part_batch.version`；不符 → 40901。
+///
+/// ## `shelf_id` 已移除（2026-10-10）
+/// 老客户端多发的 `shelf_id` 会被 serde 静默忽略（本仓生产代码零
+/// `deny_unknown_fields`），故移除是**向后兼容**的；但新客户端发老版本服务端
+/// 会得 422（字段必填缺失），**部署顺序必须后端先上**。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ToProcessRequest {
-    pub shelf_id: String,
     pub next_process_id: String,
     pub version: i32,
     #[serde(default)]
@@ -100,11 +108,14 @@ pub struct BatchOpItem {
 
 /// 批量入参（`POST /api/v2/prod/batches/to-inspection`）。
 ///
-/// `target_inspection_shelf_id`：批量共享一个品检架（与单件入参同形校验）。
 /// `items.len()` 限制由 service 校验（`BATCH_TO_INSPECTION_MAX_ITEMS`）。
+/// 品检架由服务端选**一次**、这批 item 共用（与单件端点同款选架，但不在循环内选）。
+///
+/// ## `target_inspection_shelf_id` 已移除（2026-10-10）
+/// 移除与单件端点同款：向后兼容（老客户端多发的字段被 serde 静默忽略），但
+/// **部署顺序必须后端先上**（新客户端发老服务端会得 422）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct BatchToInspectionRequest {
-    pub target_inspection_shelf_id: String,
     pub items: Vec<BatchOpItem>,
 }
 
@@ -122,40 +133,46 @@ pub struct BatchToShipRequest {
 /// 无 Path extractor：`serial_no` 是主键，`batch_id` 仅在多批次歧义时用于消歧。
 /// `event_type`：`WorkerScanEvent::RETURNED` / `INSPECTED`。
 ///
-/// ## `next_process_id`：**仅非顺应工序时必填**（2026-10-09 改写）
-/// 此前它是「RETURNED 必填」。现在后端会先解析批次在工序链上的位置
+/// ## `next_process_id`：**仅非顺应工序时必填**（2026-10-09 改写，2026-10-10 微调）
+/// 后端先解析批次在工序链上的位置
 /// （`shared::batch::chain::resolve_chain_position`，判据与读侧
-/// `GET /parts/by-worker` 的 `chain_state` 逐条同源）：
-/// - **顺应工序**（step 指针与 `current_process_id` 一致）且链内有下一道 ⇒ 后端按链
-///   推导下一道工序与 step，**本字段可省略**；
-/// - **非顺应工序**（无链 / 链已软删 / 指针漂移 / 链内同一 `process_id` 重复 /
-///   当前已是链尾）⇒ **必填**，缺失 → `40001 VALIDATION_ERROR`。
+/// `GET /parts/by-worker` 的 `chain_state` 逐条同源），按下表分流：
 ///
-/// 字段类型保持 `Option<String>` 不变（本轮不改 wire）：前端可以继续照
-/// `chain_state` 决定填不填，两条路径都合法。
+/// | 链上位置 | 分流 | `next_process_id` |
+/// |---|---|---|
+/// | `TAIL`（链内最后一道） | **自动送检**（2026-10-10 新增）：这批做完了，不落生产架 | 可省略 |
+/// | `NEXT` 且顺应 | 后端按链推导下一道工序与 step | 可省略 |
+/// | 其余（非顺应：无链 / 链已软删 / 指针漂移 / 链内 `process_id` 重复） | 按前端指定推进 | **必填**，缺失 → `40001` |
 ///
-/// `shelf_id`：**必填，且两个 event_type 都是 PRODUCTION 区的 worker-scan 货架** ——
-/// service 对它做的是**无条件**的 PRODUCTION 硬校验（不分 `event_type`），非
-/// PRODUCTION → 20501 `BIZ_SHELF_NOT_FOUND`。**不要**把 INSPECTION 区的品检架塞进
-/// 本字段：INSPECTED 的品检架走 `target_inspection_shelf_id`。任何声称本字段
-/// 「按 `event_type` 分支校验 zone」的说明都是错的 —— 本段是唯一权威口径。
+/// 字段类型保持 `Option<String>` 不变（不改 wire）：前端可以继续照 `chain_state`
+/// 决定填不填，两条路径都合法。
 ///
-/// 它**必须留在 PRODUCTION 区**的真正原因不是「工人站在哪个架前」：INSPECTED 时它
-/// 是**补料用的生产架**，在同事务的 worker-pool refill 里当候选池的
-/// `current_holder_id` 过滤键用（候选池 SQL 限
-/// `location='PRODUCTION_SHELF' AND current_holder_id = $2`，见
-/// `prod/queue/repo/sql.rs`）。传品检架会让 refill 查空池。
+/// ## ⚠️ 响应 `event_type` 可能与请求的**不同**（2026-10-10 新增）
+/// 请求发 `RETURNED` 但批次在链尾时，服务端把它当送检处理，响应
+/// `event_type = "WORKER_SCAN_INSPECTED"`。前端**必须按响应里的 `event_type` 分支**，
+/// 不能按自己发的那一个 —— 服务端比前端更清楚批次做完了没有。语义与 WS 链路登记见
+/// `docs/api/batch.md`。
+///
+/// ## 两个货架字段已移除（2026-10-10）
+///
+/// - `shelf_id`：目标生产架改由服务端按负载自动选
+///   （`shared::shelf::select::pick_least_loaded`）。它原先的**双重**身份 —— 「放回
+///   到的架」与「refill 的候选池过滤键」—— 两条都随之消失：放回由选架决定，补料改成
+///   **跨全部映射该工种工序的活跃生产架**取料（`take_one_from_pool` 的
+///   `shelf_id = NULL` 分支）；
+/// - `target_inspection_shelf_id`：目标品检架同样由服务端按负载自动选。选不出时返
+///   `40301 SHELF_MISMATCH`（当前账号 scope 内没有任何可用的 INSPECTION 架）。
+///
+/// 两个字段的移除都是**向后兼容**的（老客户端多发的字段被 serde 静默忽略，本仓生产
+/// 代码零 `deny_unknown_fields`）；但新客户端发老版本服务端会得 422（`shelf_id`
+/// 必填缺失），**部署顺序必须后端先上**。
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkerScanRequest {
     pub serial_no: String,
     pub badge_code: String,
     pub event_type: WorkerScanEvent,
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub shelf_id: i64,
     #[serde(default)]
     pub next_process_id: Option<String>,
-    #[serde(default)]
-    pub target_inspection_shelf_id: Option<String>,
     #[serde(default)]
     pub batch_id: Option<String>,
 }
@@ -229,13 +246,20 @@ pub struct StartRepairRequest {
 /// `POST /api/v2/outsource-queue/move`（入参改为 `to: {kind: PRODUCTION_SHELF,
 /// shelf_id, next_process_id}`），本结构不再是 3 复用。
 ///
-/// PENDING → IN_PROCESS（`location='PRODUCTION_SHELF'`）：放到指定生产货架。
-/// service 层校验 `shelf ↔ process` 映射（`BIZ_SHELF_PROCESS_NOT_MAPPED` 422）。
+/// PENDING → IN_PROCESS（`location='PRODUCTION_SHELF'`）：放到服务端选的架上。
+///
+/// `next_process_id` 必填 —— **服务端按这道工序选架**，候选集只含
+/// `t_shelf_process` 里映射了该工序的活跃生产架，因此原「`shelf ↔ process` 映射
+/// 校验（`BIZ_SHELF_PROCESS_NOT_MAPPED` 422）」已被选架本身覆盖；选不出时返
+/// `20508 BIZ_SHELF_PROCESS_NOT_FOUND`。
+///
+/// ## `shelf_id` 已移除（2026-10-10）
+/// 老客户端多发的 `shelf_id` 会被 serde 静默忽略（本仓生产代码零
+/// `deny_unknown_fields`），故移除是**向后兼容**的；但新客户端发老版本服务端
+/// 会得 422（字段必填缺失），**部署顺序必须后端先上**。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct PlaceOnShelfRequest {
     pub version: i32,
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub shelf_id: i64,
     #[serde(deserialize_with = "deserialize_i64")]
     pub next_process_id: i64,
     #[serde(default)]
@@ -244,16 +268,39 @@ pub struct PlaceOnShelfRequest {
 
 /// `POST /api/v2/prod/batches/{batch_id}/complete-repair` 入参。
 ///
-/// 要求 batch `is_repairing = true`（确实在返修中）。去向由 shelf.zone 决定：
-/// PRODUCTION → `IN_PROCESS`（落回生产架、重新入池，写 `next_process_id` +
-/// step）或 INSPECTION → `INSPECTION`（送检区、出池）。两条路径都清
-/// `is_repairing`。shelf.zone=PRODUCTION 时 next_process_id 必填且需校验
-/// shelf↔process 映射。
+/// 要求 batch `is_repairing = true`（确实在返修中）。
+///
+/// ## 去向由 `next_process_id` 有无决定（2026-10-10）
+///
+/// - `Some(np)` → 回生产：服务端按该工序自动选生产架（`current_load / capacity`
+///   升序），写 `next_process_id` + step，目标 `IN_PROCESS`；
+/// - `None` → 回品检：服务端自动选品检架（品检架无工序映射，故不按工序筛），
+///   目标 `INSPECTION`。
+///
+/// 两条路径都清 `is_repairing`。
+///
+/// ## `shelf_id` 已移除（2026-10-10）
+/// 它曾是「去向」的唯一载体（读 `shelf.zone` 分流）；现在 `next_process_id` 承担
+/// 了这个语义 —— 工人填「打回到哪道工序」就是「回生产」，不填就是「回品检」。
+/// 老客户端多发的 `shelf_id` 会被 serde 静默忽略（本仓生产代码零
+/// `deny_unknown_fields`），故移除本身**向后兼容**；但去向**会漂**，两个方向都要注意：
+///
+/// | 老 body | 老服务端 | 新服务端 |
+/// |---|---|---|
+/// | 生产架 + `next_process_id` | 回生产 | 回生产 ✅ |
+/// | 生产架 + 无 `next_process_id` | `20104` | **回品检**（静默改去向） |
+/// | 品检架 + `next_process_id` | 回品检（该字段被忽略） | **回生产**（静默改去向）⚠️ |
+/// | 品检架 + 无 `next_process_id` | 回品检 | 回品检 ✅ |
+///
+/// ⚠️ 第三行是更危险的一侧：老服务端在品检分支完全忽略 `next_process_id`，所以
+/// 「回品检时顺带把下一道工序一起发过去」在老系统里是无感的，新服务端会当成「回生产」
+/// —— 把本该返修完送检的货放回产线重跑，且返回 200。
+/// ⇒ **调用方义务**：回生产时发 `next_process_id`，**回品检时不得发**。
+/// 部署顺序必须后端先上。逐端点登记见 [`RepairDispatchRequest`] 与
+/// `docs/api/batch.md` §2.1。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct CompleteRepairRequest {
     pub version: i32,
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub shelf_id: i64,
     #[serde(default, deserialize_with = "deserialize_i64_opt")]
     pub next_process_id: Option<i64>,
     #[serde(default)]
@@ -263,12 +310,16 @@ pub struct CompleteRepairRequest {
 /// `POST /api/v2/prod/batches/{batch_id}/repair-dispatch` 入参。
 ///
 /// 一步式返修下发（`start_repair + complete_repair` 合并）：从 IN_PROCESS / INSPECTION
-/// / READY_TO_SHIP 入口直达目标状态。`shelf_id` 必填（PRODUCTION 或 INSPECTION 区）。
+/// / READY_TO_SHIP 入口直达目标状态。
+///
+/// 去向由 `next_process_id` 有无决定（与 [`CompleteRepairRequest`] 同款）：
+/// `Some` → 回生产（自动选生产架）、`None` → 回品检（自动选品检架）。
+///
+/// ## `shelf_id` 已移除（2026-10-10）
+/// 移除理由与向后兼容性同 [`CompleteRepairRequest::shelf_id`]。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RepairDispatchRequest {
     pub version: i32,
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub shelf_id: i64,
     #[serde(default, deserialize_with = "deserialize_i64_opt")]
     pub next_process_id: Option<i64>,
     #[serde(default)]
@@ -417,19 +468,26 @@ pub struct PickUpRequest {
 ///
 /// 扫码快捷品检（一步式：`{PENDING, PROGRAMMING, IN_PROCESS}` → INSPECTION →
 /// READY_TO_SHIP 或「返修中」，由 `pass` 字段决定）。
-/// `target_inspection_shelf_id` 必填（INSPECTION 区 active）。
-/// `pass=false`：`status='IN_PROCESS'` + `is_repairing=true`（批次停在送检架，
-/// `shelf_id` + `next_process_id` 供随后的 `complete-repair` 落回生产架用）。
+///
+/// `pass=false`：`status='IN_PROCESS'` + `is_repairing=true`（批次停在送检架；
+/// **落回生产架要打哪道工序**改由随后的 `complete-repair` 自己带 `next_process_id`
+/// 决定，本端点不再预收）。
+///
+/// ## 三个字段已移除（2026-10-10）
+///
+/// - `target_inspection_shelf_id`：目标品检架由服务端按负载自动选；
+/// - `shelf_id` / `next_process_id`：**前向兼容字段，本端点从 2026-10-04 起就从不
+///   消费**（它们的 doc 当时明写「供随后的 complete-repair 用」）。自动选架让
+///   「先告诉 complete-repair 用哪个架」这件事彻底没有意义，故一并删掉，避免调用
+///   方以为它们生效。
+///
+/// 三个字段的移除都是**向后兼容**的（老客户端多发的字段被 serde 静默忽略，本仓
+/// 生产代码零 `deny_unknown_fields`）；但新客户端发老版本服务端会得 422，
+/// **部署顺序必须后端先上**。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ScanInspectRequest {
     pub pass: bool,
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub target_inspection_shelf_id: i64,
     pub version: i32,
-    #[serde(default, deserialize_with = "deserialize_i64_opt")]
-    pub shelf_id: Option<i64>,
-    #[serde(default, deserialize_with = "deserialize_i64_opt")]
-    pub next_process_id: Option<i64>,
     #[serde(default)]
     pub note: Option<String>,
 }

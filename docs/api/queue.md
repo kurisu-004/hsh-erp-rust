@@ -23,7 +23,7 @@
 | 5 | POST | `/api/v2/prod/queue/auto-dispatch` | Manager + Clerk | `{ batch_ids?: string[] }` | `AutoDispatchResult` |
 | 6 | POST | `/api/v2/prod/queue/recall` | Manager + Clerk | `{ batch_id, version, note? }` | `RecallOut` |
 | 7 | POST | `/api/v2/prod/queue/refill` | **Manager 独占** | `{ worker_id, shelf_id }` | `RefillResult` |
-| 8 | POST | `/api/v2/prod/queue/move` | **Manager 独占** | `{ batch_id: string, version: number, from, to, note? }` | `MoveResult` |
+| 8 | POST | `/api/v2/prod/queue/move` | **Manager 独占** | `{ batch_id: string, version: number, from, to, note? }`（`from` / `to` 是**两个不同**的 tagged enum，见 §2.8） | `MoveResult` |
 | 9 | POST | `/api/v2/prod/queue/auto-allocate` | **Manager 独占** | `{ process_id, shelf_id, mode, fill_ratio }` | `AutoAllocateResult` |
 
 - 全部返回统一信封 `R { code, message, data }`。
@@ -133,9 +133,32 @@
 | `note` | string \| null | `t_part.note` |
 | `version` | number | `t_part_batch.version`（OCC 锚） |
 
-`shelf_id` 是 `POST /queue/move` 的 `from.shelf_id` **唯一数据源**：候选池跨货架，不能用用户当前激活货架凑（激活货架对 MANAGER / CLERK / INSPECTOR 恒为空）。
+`shelf_id` 是 `POST /queue/move` 的 `from.shelf_id` **唯一数据源**：`from.kind = "POOL"` 时它必须与批次真实所在货架一致（service 比对 `batch.current_holder_id`）。候选池跨货架，不能用用户当前激活货架凑（激活货架对 MANAGER / CLERK / INSPECTOR 恒为空）。
 
 ⚠️ **不含 `customer_path` 与 `location`**：前者前端自己拼 L1 / L2；后者恒为 `"PRODUCTION_SHELF"`，前端用 `shelf_code` 表达位置。见 §6。
+
+### 2.8 `POST /queue/move` 的 `from` / `to` 入参（2026-10-10 拆成两个类型）
+
+| 侧 | 类型 | `POOL` 分支 | `WORKER` 分支 |
+|---|---|---|---|
+| `from` | `MoveFromLocation` | `{ kind: "POOL", shelf_id }` —— **必填** | `{ kind: "WORKER", worker_id }` |
+| `to` | `MoveToLocation` | `{ kind: "POOL" }` —— **无字段** | `{ kind: "WORKER", worker_id }` |
+
+`from` 侧仍要 `shelf_id`：它是批次**真实所在**的货架，POOL→WORKER 方向 service 拿它比对
+`batch.current_holder_id`（不符 → `20122`）。
+
+`to` 侧的 `shelf_id` 于 2026-10-10 **删除**（WORKER→POOL 即「撤回候选池」）：目标货架改由
+服务端按 `batch.current_process_id` 自动选（[`shelves.md`](shelves.md) §4），
+候选集只含映射了该工序的活跃 `PRODUCTION` 架；选不出 → `20508 BIZ_SHELF_PROCESS_NOT_FOUND`。
+`batch.current_process_id IS NULL` 的存量批次按「不按工序筛候选」处理（落在该 zone 全部
+活跃生产架里），管理员「把卡住的手动放回货架」的自救路径不被堵死 —— 但 zone / 停用 / 软删
+三条谓词仍然生效，不会落到品检架上。
+
+⚠️ **向后兼容只有单向**：老客户端多发 `to.shelf_id` 会被 serde 静默忽略（本仓生产代码零
+`deny_unknown_fields`），所以**老客户端 + 新服务端不受影响**；反过来**新客户端 + 老版本
+服务端会得 HTTP 422 纯文本**（老服务端的 `to.shelf_id` 是必填、无 `#[serde(default)]`，
+缺字段在 axum `Json` 提取器阶段就被拒，不进 `R<T>` 信封）⇒ **部署顺序必须后端先上**。
+前端改造后撤回候选池时 `to` 就是 `{"kind":"POOL"}`；在新服务端上补发 `shelf_id` 无害但无用。
 
 ### 2.6 `has_process_chain` 判据（4 处卡片共用一个常量）
 
@@ -220,11 +243,44 @@ status = 'IN_PROCESS' AND location = 'PRODUCTION_SHELF'
 
 `status` / `location` 这两列是「一个批次在某道工序的候选池里」的判据，被 3 处共用：
 
-| 用途 | SQL 位置 | `current_process_id` 闸门 | `t_shelf` JOIN |
-|---|---|---|---|
-| 序列板各工序计数（端点 1） | `board/repo.rs::SQL_POOL_COUNT_BY_PROCESS` | `IS NOT NULL` | **无** |
-| 单工序候选池明细（端点 2 `items[]`） | `board/repo.rs::SQL_POOL_ITEMS_BY_PROCESS` | `= $1` | **INNER**（`s.id = pb.current_holder_id AND s.deleted_at IS NULL`） |
-| 抢占（`take_one_from_pool` / `take_specific_from_pool`） | `repo/sql.rs` | `= ANY($1)` | **无** |
+| 用途 | SQL 位置 | `current_process_id` 闸门 | 货架范围 | `t_shelf` JOIN |
+|---|---|---|---|---|
+| 序列板各工序计数（端点 1） | `board/repo.rs::SQL_POOL_COUNT_BY_PROCESS` | `IS NOT NULL` | 跨全部货架 | **无** |
+| 单工序候选池明细（端点 2 `items[]`） | `board/repo.rs::SQL_POOL_ITEMS_BY_PROCESS` | `= $1` | 跨全部货架（明细本身 INNER JOIN `t_shelf` 顺带展示架信息） | **INNER**（`s.id = pb.current_holder_id AND s.deleted_at IS NULL`） |
+| 抢占 `take_one_from_pool`（refill） | `repo/sql.rs` | `= ANY($3)` | **跨全部货架**（`$2::bigint IS NULL OR pb.current_holder_id = $2`） | **无** |
+| 抢占 `take_specific_from_pool`（admin 单批） | `repo/sql.rs` | 无（按 `batch_id` 定位） | **限架**（`pb.current_holder_id = $2`，必传） | **无** |
+| 撤回候选池 `POST /queue/move`（WORKER→POOL） | 不经本 SQL（走 `pick_least_loaded` + `part_mark_batch_returned`） | 不改（`COALESCE` 保留） | 目标架**自动选**（`to` 侧无 `shelf_id`） | — |
+
+### 「货架范围」列的口径（2026-10-10）
+
+- **refill（`take_one_from_pool`）不再有架锚**：`$2::bigint IS NULL` 时候选跨全部
+  活跃生产架。worker-scan 的 `shelf_id` 入参已删除（目标架由
+  `shared::shelf::select::pick_least_loaded` 选），refill 若还按架过滤就会在
+  「放回到 A 架 → 随即从 A 架补料」这个闭环里查空池。**负载均衡的整体职责在放回时
+  的选架一侧**。
+- 管理员端点仍是限架：`POST /prod/queue/refill`（`AdminRefillRequest.shelf_id`）与
+  `POST /prod/queue/auto-allocate`（`AutoAllocateRequest.shelf_id`）的 `shelf_id`
+  **保留必填**，handler 传 `Some(req.shelf_id)` 进 `take_one_from_pool` —— 它们是
+  「为某工人在某架上抢料」的显式管理员操作。
+- `POST /prod/queue/move` 的 POOL→WORKER 方向不经本 SQL（走
+  `take_specific_from_pool`），其 `from.shelf_id` 语义未变（仍是「批次真实所在货架」）。
+  WORKER→POOL（撤回候选池）方向的目标架 2026-10-10 起**不再由调用方指定**，改走
+  `shared::shelf::select::pick_least_loaded`（见 §2.8）。
+
+### 取件优先级（2026-10-10 统一）
+
+看板池明细与 refill 取料共用**同一份** `ORDER BY` 片段
+（`shared::shelf::pool_priority::POOL_PRIORITY_ORDER_SQL`），4 层语义与取舍见该常量
+的 doc：
+
+1. `p.is_urgent DESC` —— 加急在前（人工判定的例外，优先级高于系统交期）
+2. `p.system_delivery_date ASC NULLS LAST`
+3. `p.planned_delivery_date ASC NULLS LAST`
+4. CNC 工序内已上传 G_CODE 的批次优先（`pr.is_cnc` 门控）
+5. `pb.id ASC` —— 稳定兜底（`FOR UPDATE SKIP LOCKED` 的前提）
+
+⚠️ 本节之前两处排序**已经漂移**：refill 把「已编程」排最前，看板把「系统交期」排最前
+⇒ 工人以为在按加急抢货，板子上却是另一套顺序。现已收口为一份片段。
 
 `current_process_id` 闸门是必需的：端点 1 靠它丢弃「池归属为空」的批次（否则 `GROUP BY` 会产出一个 NULL 组而解码进 `i64` 直接报错），端点 2 / 抢占是拿它当等值 / 数组匹配条件。⚠️ 这条谓词是「出池必须置 `current_process_id` NULL」这条不变式的**兜底**：写点万一漏清，脏值也命中不了池查询。
 
@@ -366,7 +422,7 @@ M = 10 时：12 个 HTTP 请求 → 1 个。
 
 ### 8.2 跨域依赖登记
 
-queue 域**整体不适用**域隔离护栏：它继承 worker_pool 的「经本域 trait 转发其它域单表查询」pattern（`repo/mod.rs::QueueRepoTrait` 转发 `worker` / `work_type` / `process` / `process_chain` / `part` / `shelf_process`），这是逐域剥离期间的既定 pattern（与 assembly / shelf / process_chain 同形）。**这是本域唯一被允许的跨域面**。
+queue 域**整体不适用**域隔离护栏：它继承 worker_pool 的「经本域 trait 转发其它域单表查询」pattern（`repo/mod.rs::QueueRepoTrait` 转发 `worker` / `work_type` / `process` / `process_chain` / `part` / `shelf_process`），这是逐域剥离期间的既定 pattern（与 assembly / `iam::shelf` / process_chain 同形）。**这是本域唯一被允许的跨域面**。
 
 **新增的 board 聚合 SQL 零跨域依赖** —— `board/` 子模块单独由 `cargo test --lib` 的 `modules::prod::queue::board::tests::board_aggregation_depends_on_no_other_domain` 守住（扫 `src/modules/prod/queue/board/**/*.rs`，代码区里任何 `crate::modules::<他域>` 路径即失败，含同父兄弟域 `prod::batch`）。护栏为什么只扫 `board/`：聚合 SQL 读的 9 张表完全可以在本域 SQL 内聚合，写端点的转发 pattern 则是既有事实，圈出来单独守比整域不守要强。
 
@@ -385,6 +441,51 @@ queue 域**整体不适用**域隔离护栏：它继承 worker_pool 的「经本
 11. **`POST /queue/move` 的 `version` 升为必填**（2026-10-09）：此前三个方向都由 service 用「本次事务里刚读到的 `batch.version`」当 `expected_version`，等价于**没有 OCC** —— 看板数据是 30s 缓存的快照，期间他人改过批次时「用户看到 5 件 → 实际移动 3 件」会静默成功。值取候选卡 / 持有卡的 `version`；漏传 → **HTTP 422 纯文本**（`version` 无 `#[serde(default)]`）。
 
 ### 8.4 已知偏差登记
+
+---
+
+**`POST /queue/move` 的 `from` / `to` 从一个 `MoveLocation` 拆成两个类型（2026-10-10）**
+
+- `MoveLocation::Pool { shelf_id }` 一个变体同时服务两侧，导致 `to` 侧也被迫要求
+  `shelf_id`。目标架自动选之后该字段在 `to` 侧没有角色可留，而前端**不发**它 ⇒
+  axum `Json` 提取器直接 422 纯文本，撤回候选池对所有角色都不可用。
+- 拆成 `MoveFromLocation`（`Pool { shelf_id }` 必填）+ `MoveToLocation`（`Pool` 无字段）
+  之后，「`from` 需要架、`to` 不需要」这个不对称才在类型上可表达。
+- 契约：§2.8。选架口径与错误码见 [`shelves.md`](shelves.md) §4。
+- ⚠️ `MoveResult.new_holder_id` 在 WORKER→POOL 方向是**服务端选的架**，客户端无法预知，
+  必须从响应（或刷新后的批次详情）读。
+
+---
+
+**`ShelfProcessRepo::find_first_shelf_for_process` 已无调用方**（2026-10-10 登记）。
+
+dispatch 的目标货架自 2026-10-10 起改走
+`shared::shelf::select::pick_least_loaded`（按 `current_load / capacity` 升序），
+该方法（`t_shelf_process` 上 `sort_order ASC, id ASC LIMIT 1`）因此**失去唯一调用方**。
+
+**保留不删**，理由与后续处置：
+
+- **口径已不同**：新的退化路径（候选集里全部架都没配 `capacity`）在选架 SQL 内
+  自然退化成 `display_order ASC, id ASC`，而旧方法是 `t_shelf_process.sort_order ASC`
+  —— **两者的「第一」不是同一个**。同一道工序在两种口径下可能落到不同的架（映射行
+  的 `sort_order` 与货架的 `display_order` 是两套独立的人工排序）。
+- **下一轮决定**：要么删（判定它已无价值），要么复用为「全部架都不限容量时按映射
+  顺序取首个」的显式退化路径（那样就要把 `display_order` 与 `sort_order` 的优先级
+  写进选架 SQL，并同步改那条退化路径的文档与测试）。**不要**在没想清楚这两套排序的
+  关系之前就把它接回去。
+
+---
+
+**`capacity IS NULL OR <= 0` 视为「不限」时，选架退化到 `display_order ASC, id ASC`**
+（2026-10-10 登记，与上一条同源）。
+
+存量货架的 `capacity` 全为 NULL（migration 未 backfill，容量未知），故生产库现状下
+选架**恒走这条退化路径**。此时排序等价于「按人工排的物理顺序取第一个可用架」，
+与 2026-10-10 之前 dispatch 的行为相近但不完全相同（见上一条：映射 `sort_order` vs
+货架 `display_order`）。要让负载均衡真正生效，需要在货架管理页给货架配容量；
+在此之前，本仓**不对退化路径与旧口径的差异做补偿**。
+
+---
 
 **存量批次的 `current_process_step_id` 为 NULL 或陈旧**（2026-10-09 新增登记）。
 

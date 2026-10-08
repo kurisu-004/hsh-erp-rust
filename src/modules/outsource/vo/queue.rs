@@ -293,11 +293,13 @@ pub struct OutsourceMoveResult {
     pub part_id: i64,
     /// `from.kind` 的字面（`PRODUCTION_SHELF` / `OUTSOURCE_COMPANY`）。
     pub from_kind: String,
-    /// `to.kind` 的字面（`OUTSOURCE_COMPANY` / `PRODUCTION_SHELF` /
-    /// `INSPECTION_SHELF`）。
+    /// `to.kind` 的字面（`OUTSOURCE_COMPANY` / `PRODUCTION_SHELF`）。
     pub to_kind: String,
-    /// 移动后批次的 `current_holder_id`（生产架 / 外协公司 / 品检架的 id，
-    /// 取 `to` 的那个 id 字段）。前端拿它当**下一次** move 的 `from` 侧 id。
+    /// 移动后批次的 `current_holder_id`（外协公司的 id，或**服务端自动选出**的
+    /// 生产架 id）。前端拿它当**下一次** move 的 `from` 侧 id。
+    ///
+    /// ⚠️ 2026-10-10：生产架不再由调用方指定，所以这个值**客户端无法预知** ——
+    /// 必须从本响应（或刷新后的批次详情）读，不能沿用上一次看到的架 id。
     #[serde(serialize_with = "serialize_i64")]
     pub new_holder_id: i64,
     /// 移动后 `t_part_batch.location` —— **恒等于 `to_kind`**。

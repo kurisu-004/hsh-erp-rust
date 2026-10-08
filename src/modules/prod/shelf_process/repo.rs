@@ -15,9 +15,12 @@
 //! 平级单文件形态，不是 `sql.rs`/`mod.rs` 目录拆分的继任者）：
 //! - 4 个「平移」方法（`list_by_shelf` / `list_all_active_mappings` /
 //!   `soft_delete_all_for_shelf` / `bulk_insert`）SQL 与方法签名**零 diff**
-//! - 新增 2 个「收口」方法（`find_first_shelf_for_process` /
-//!   `exists_for_shelf_process`）供 prod 域内部调用方改调，消灭手写 `t_shelf_process`
-//!   SQL（`prod::batch` / `prod::queue` 各 1 处）
+//! - 新增「收口」方法 `find_first_shelf_for_process` 供 prod 域内部调用方改调，消灭手写
+//!   `t_shelf_process` SQL（`prod::batch` / `prod::queue` 各 1 处）。
+//!   ⚠️ 2026-10-10：另一个收口方法 `exists_for_shelf_process` 已删除 —— 它唯一的服务
+//!   对象（`move_batch` WORKER→POOL 的映射校验）随目标货架自动选架一并退场，方法零
+//!   调用方。**不要**恢复它：要判「架是否映射该工序」就在选架 SQL 的候选集里用
+//!   `EXISTS`（见 `shared::shelf::select`），让谓词只留一处。
 //!
 //! ## 本仓内保留 inline 的 `t_shelf_process` SQL（2026-10-02 判定，不要硬抽）
 //! - `prod::batch::repo::preview_auto_dispatch` —— `LEFT JOIN LATERAL t_shelf_process`
@@ -151,6 +154,12 @@ impl ShelfProcessRepo {
     /// 文件作为 SQL 真源，调用方 `prod::batch::service::dispatch_single` 改调本方法。
     /// 0 结果 → `Ok(None)`（由 service 层映射 `BIZ_SHELF_PROCESS_NOT_FOUND`）。
     ///
+    /// ⚠️ **2026-10-10 起本方法零调用方**（dispatch 的目标货架改走
+    /// `shared::shelf::select::pick_least_loaded`）。保留不删的理由与后续处置登记在
+    /// `docs/api/queue.md` §8.4 —— 新旧两套「第一」的排序口径不同（映射
+    /// `sort_order` vs 货架 `display_order`），**不要**在没想清楚之前把它接回选架
+    /// 的退化路径。下面几段记的是它被调用时期的设计取舍，供追溯。
+    ///
     /// ⚠️ 2026-10-04 加固（`current_holder_id` 写脏缺口）：原 SQL **不 JOIN `t_shelf`**，
     /// 只要 `t_shelf_process` 行未软删就返回，故已停用 / 已软删 / 品检区货架会被
     /// 下发给批次并写进 `t_part_batch.current_holder_id`。后果不是报错而是**静默漏件**：
@@ -162,7 +171,7 @@ impl ShelfProcessRepo {
     /// `t_shelf.is_active` / `t_shelf.zone = 'PRODUCTION'`）自行捞行。
     ///
     /// ## 为什么 JOIN 上 3 个谓词（zone 的判断依据）
-    /// 唯一调用方是 `prod::batch::service::dispatch_single`，它把货架写死成
+    /// 当时的唯一调用方 `prod::batch::service::dispatch_single` 把货架写死成
     /// `location='PRODUCTION_SHELF'` + `current_holder_id=shelf_id` + `status='IN_PROCESS'`
     /// （`BatchRepo::update_batch_dispatched`），且只接待下发（`status ∈ {PENDING,
     /// PROGRAMMING}`，2026-10-06 起含已废弃的 PROGRAMMING）的批次
@@ -209,36 +218,5 @@ impl ShelfProcessRepo {
         .fetch_optional(executor)
         .await?;
         Ok(row.flatten())
-    }
-
-    /// 存在性检查：该 shelf 是否映射了该 process。
-    ///
-    /// 2026-10-02 新增：原为 `prod::queue::service::move_batch` WORKER→POOL
-    /// 分支里的内联 SQL
-    /// `SELECT shelf_id FROM t_shelf_process WHERE shelf_id=$1 AND process_id=$2
-    ///  AND deleted_at IS NULL ORDER BY sort_order ASC, id ASC LIMIT 1` +
-    /// `mapped.is_none()` 判定 —— 该写法是**恒真式**（只 SELECT 一列后判空，实际只判
-    /// 「是否存在」，拿到的 `shelf_id` 恒等于入参 `$1`，`ORDER BY … LIMIT 1` 也是
-    /// 冗余）。本方法改用 `SELECT EXISTS(…)` 把「存在性」语义显式化，与原逻辑
-    /// **语义等价**（同一组 WHERE 谓词 + 同一 `deleted_at IS NULL` 守卫），20507
-    /// `BIZ_SHELF_PROCESS_NOT_MAPPED` 的触发条件与文案保持不变。
-    pub async fn exists_for_shelf_process<'e, E: PgExecutor<'e>>(
-        executor: E,
-        shelf_id: i64,
-        process_id: i64,
-    ) -> Result<bool, sqlx::Error> {
-        let exists: bool = sqlx::query_scalar(
-            r#"
-            SELECT EXISTS(
-                SELECT 1 FROM t_shelf_process
-                WHERE shelf_id = $1 AND process_id = $2 AND deleted_at IS NULL
-            )
-            "#,
-        )
-        .bind(shelf_id)
-        .bind(process_id)
-        .fetch_one(executor)
-        .await?;
-        Ok(exists)
     }
 }

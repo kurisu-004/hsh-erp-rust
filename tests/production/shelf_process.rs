@@ -1,16 +1,17 @@
-//! prod::shelf_process 子模块端到端集成测试（2026-10-02 自 tests/shelf/api.rs 迁入）
+//! prod::shelf_process 子模块端到端集成测试（2026-10-02 自货架子模块的 api 测试迁入）
 //!
 //! ## 覆盖
 //! 1. `set_shelf_processes_replaces_existing_mapping` —— 整组替换：先 set [P1]，
 //!    再 set [P2, P3] 后旧映射 (P1) 软删、新映射 (P2+P3) 在场。
-//!    （原 `tests/shelf/api.rs::set_shelf_processes_replaces_existing_mapping`，
+//!    （原 `set_shelf_processes_replaces_existing_mapping`，
 //!    URL 从 `/shelves/{id}/processes` 改为 `/prod/shelf-processes/{shelf_id}`）
 //! 2. `list_all_mappings_returns_active_shelf_mappings` —— `GET /prod/shelf-processes`
-//!    全集查询（新 URL，原 shelf 域 `GET /shelves/processes` 从未被集成测试覆盖）
+//!    全集查询（新 URL，`GET /shelves/processes` 从未被集成测试覆盖）
 //! 3. `set_shelf_processes_rejects_unknown_process` —— items 里 process_id 不存在
 //!    → 20505 `BIZ_SHELF_PROCESS_PROCESS_NOT_FOUND`（HTTP 404）
 //! 4. `old_shelf_process_paths_are_gone` —— 硬切验证：3 个旧路径按 URI 钉死状态码
-//!    （`GET /shelves/processes` → 400；`GET|POST /shelves/{id}/processes` → 404）
+//!    （三条全 404；`GET /shelves/processes` 自 2026-10-10 起随 `/api/v2/shelves`
+//!    整段前缀下线由 400 变 404）
 //! 5. `set_shelf_processes_rejects_inspection_zone_shelf` —— 2026-10-04 zone 守卫：
 //!    品检区货架配工序 → 20104 `BIZ_INVALID_VALUE`，且一条 mapping 都不写
 //! 6. `set_shelf_processes_rejects_inactive_shelf` —— 2026-10-04：`is_active=false`
@@ -299,12 +300,14 @@ async fn set_shelf_processes_rejects_unknown_process() {
 /// 注意响应体**不是** `R` 信封，故本测试绕过 `send()`（它会
 /// `serde_json::from_str` 解析信封而 panic），直接 `app.oneshot(req)` 断状态码。
 ///
-/// 期望值（2026-10-02 review 第 1 轮 M-4 加固：原先只断 `4xx`，误加 403 角色守卫
-/// 或误返 405 也会绿，故按 URI 钉死具体码）：
-/// - `GET /shelves/processes` → **400**：`processes` 落到 shelf 域 `/{id}` 路由，
-///   `Path<i64>` 解析失败被 axum 拒为 400 纯文本（**不是** 404）
+/// 期望值：
 /// - `GET|POST /shelves/{id}/processes` → **404**：该 route 已从 router 整体删除，
 ///   无任何匹配
+/// - `GET /shelves/processes` → **404**：2026-10-02 时它落进当时 shelf 模块的
+///   `/{id}` catch-all、被 `Path<i64>` 拒为 400；2026-10-10 货架子模块并入 iam
+///   域后 `/api/v2/shelves` 整段前缀硬切下线，连 catch-all 都不存在了 ⇒ 干净的
+///   404。**带 `/iam` 前缀**的对应形态见 `tests/iam/shelf.rs` 的
+///   `picker_endpoints_are_gone`（那条仍是 400，因为新前缀下 `/{id}` 还在）。
 #[tokio::test]
 async fn old_shelf_process_paths_are_gone() {
     let (_pool, app, token, _fx) = bootstrap_as_manager().await;
@@ -314,7 +317,7 @@ async fn old_shelf_process_paths_are_gone() {
         (
             "GET",
             "/shelves/processes".to_string(),
-            StatusCode::BAD_REQUEST,
+            StatusCode::NOT_FOUND,
         ),
         (
             "GET",

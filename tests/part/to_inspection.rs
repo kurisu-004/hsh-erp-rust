@@ -23,6 +23,50 @@ use hsh_erp_test_support::{
     test_state,
 };
 
+/// to-inspection 的 `INSPECTED` 事件 note 必须写**货架 code**（人类可读），
+/// 不能写 19 位雪花 id。
+///
+/// 这条 note 直接显示在工单时间线上（`GET /parts/{id}/events`）。自动选架之后
+/// `to_inspection_core` 不再自己查架，它拿的是 caller 传下来的 `(id, code)` 配对；
+/// 若哪一侧只传了 id（或把 code 换成 id 格式化），时间线就会退化成
+/// 「送检：来自待下发 → 品检架 9000000000000000014」这种运维噪声。
+#[tokio::test]
+async fn to_inspection_event_note_carries_shelf_code_not_id() {
+    let (pool, app, token, fx) = bootstrap_as_inspector().await;
+    let (_part_id, batch_id) =
+        insert_part_with_batch(&pool, "P0", fx.customer_l2_id, Some("P000"), "PENDING", 5).await;
+    let v = batch_version(&pool, batch_id).await;
+
+    let (status, body) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/batches/{batch_id}/to-inspection"),
+            Some(json!({ "version": v })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+
+    let note: Option<String> = sqlx::query_scalar(
+        "SELECT note FROM t_part_event WHERE batch_id = $1 AND event_type = 'INSPECTED'",
+    )
+    .bind(batch_id)
+    .fetch_one(&pool)
+    .await
+    .expect("读 INSPECTED 事件");
+    let note = note.expect("INSPECTED 事件应带 note");
+    assert!(
+        note.contains("FX-SH-INSP"),
+        "note 必须含货架 code `FX-SH-INSP`（实际：{note}）"
+    );
+    assert!(
+        !note.contains(&fx.inspection_shelf_id.to_string()),
+        "note 不应含货架雪花 id（实际：{note}）"
+    );
+}
+
 // ===========================================================================
 //  动态 fixture helpers（PR-C.Final retry 第 3 轮，2026-09-24）
 //  原从 `hsh_erp_test_support::fixtures::insert_shelf` 引入，因 fixtures.rs
@@ -400,9 +444,16 @@ async fn to_inspection_in_process_non_production_shelf_rejected() {
     assert!(body["message"].as_str().unwrap().contains("不在生产架上"));
 }
 
-/// to-inspection 拒绝：target_inspection_shelf.zone = PRODUCTION → 20511。
+/// 2026-10-10：`target_inspection_shelf_id` 已删除 ⇒ 「指定一个 PRODUCTION 架当
+/// 品检架」这条错误路径**不再存在**。
+///
+/// 原用例断言 20511（zone ≠ INSPECTION）。现在选架的候选集硬限定
+/// `zone = 'INSPECTION'`，于是「请求体里带一个生产架 id」这件事被 serde 静默忽略
+/// —— 请求会**成功**，批次落在自动选出的品检架上。
+///
+/// 本用例断言的正是这个新语义（老客户端多发 `target_inspection_shelf_id` 不破）。
 #[tokio::test]
-async fn to_inspection_target_shelf_wrong_zone_rejected() {
+async fn to_inspection_ignores_removed_target_shelf_field() {
     let (pool, app, token, fx) = bootstrap_as_inspector().await;
     let (_part_id, batch_id) =
         insert_part_with_batch(&pool, "P0", fx.customer_l2_id, Some("P000"), "PENDING", 5).await;
@@ -414,22 +465,36 @@ async fn to_inspection_target_shelf_wrong_zone_rejected() {
             "POST",
             &format!("/prod/batches/{batch_id}/to-inspection"),
             Some(json!({
-                "target_inspection_shelf_id": fx.production_shelf_id.to_string(),  // 故意用 PRODUCTION 架
+                // 已移除的字段：老客户端仍在发（且故意给一个 PRODUCTION 架），必须被静默忽略
+                "target_inspection_shelf_id": fx.production_shelf_id.to_string(),
                 "version": v,
             })),
             Some(&token),
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
-    assert_eq!(body["code"], 20511);
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    let holder: i64 =
+        sqlx::query_scalar("SELECT current_holder_id FROM t_part_batch WHERE id = $1")
+            .bind(batch_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read back holder");
+    assert_eq!(
+        holder, fx.inspection_shelf_id,
+        "批次必须落在服务端选出的品检架上，而不是请求里那个生产架"
+    );
 }
 
-/// to-inspection 拒绝：target_inspection_shelf.is_active = false → 20512。
+/// 2026-10-10：停用的品检架不再被选（原先是 20512 `BIZ_SHELF_INACTIVE`）。
+///
+/// 错误码随之变成 `40301 SHELF_MISMATCH`：唯一可用品检架被停用后候选为空，而
+/// 「选不出品检架」在写侧的统一语义是「你无权访问任何可用的 INSPECTION 货架」
+/// （见 `shared::shelf::select::no_candidate_in_scope` 与 `docs/api/batch.md`）。
 #[tokio::test]
-async fn to_inspection_target_shelf_inactive_rejected() {
+async fn to_inspection_all_shelves_inactive_rejected() {
     let (pool, app, token, fx) = bootstrap_as_inspector().await;
-    // 把品检架置为 inactive
+    // 把品检架置为 inactive —— 候选集里一个都不剩
     sqlx::query!(
         "UPDATE t_shelf SET is_active = false WHERE id = $1",
         fx.inspection_shelf_id
@@ -447,15 +512,14 @@ async fn to_inspection_target_shelf_inactive_rejected() {
             "POST",
             &format!("/prod/batches/{batch_id}/to-inspection"),
             Some(json!({
-                "target_inspection_shelf_id": fx.inspection_shelf_id.to_string(),
                 "version": v,
             })),
             Some(&token),
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
-    assert_eq!(body["code"], 20512);
+    assert_eq!(status, StatusCode::FORBIDDEN, "body={body}");
+    assert_eq!(body["code"], 40301);
 }
 
 /// batch-to-inspection 拒绝：items 为空 → 422 / 40001 VALIDATION_ERROR。

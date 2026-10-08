@@ -37,6 +37,11 @@
 //! 解析货架改调同域 `prod::shelf_process::repo::ShelfProcessRepo::find_first_shelf_for_process`
 //! （原为 `QueueDispatchRepo::find_first_shelf_for_process` 内联 SQL），两处 inline 保留见
 //! `repo.rs::preview_auto_dispatch` 注释。
+//!
+//! ## 2026-10-10：货架改由服务端自动选
+//! `find_first_shelf_for_process`（`sort_order ASC, id ASC LIMIT 1`）换成
+//! `shared::shelf::select::pick_least_loaded`（`current_load / capacity` 升序）。
+//! 那个旧实现由此**失去唯一调用方**（保留不删，登记见 `docs/api/queue.md` §8.4）。
 
 use sqlx::PgConnection;
 
@@ -45,7 +50,6 @@ use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepo;
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
-use crate::modules::prod::shelf_process::repo::ShelfProcessRepo;
 use crate::shared::error::{AppError, code};
 
 use super::queue::QueueService;
@@ -111,9 +115,11 @@ impl QueueService {
     ///    与待下发列表同一白名单）
     /// 4. 解析链首 step（有链）/ 回落 `target_process_id`（无链）；链存在但链内一个
     ///    活跃 step 都没有 → `BIZ_PROCESS_CHAIN_STEP_NOT_FOUND`（20702）
-    /// 5. `find_first_shelf_for_process(目标工序)` → `None` → `BIZ_SHELF_PROCESS_NOT_FOUND` 抛错
-    ///    （2026-10-04：该方法已带 `t_shelf` 的 `deleted_at` / `is_active` / `zone='PRODUCTION'`
-    ///    守卫，故 `None` 含「有映射但货架全不可用」，仍复用 20508 不新造码）
+    /// 5. `pick_least_loaded(PRODUCTION, Some(目标工序), scope)`（2026-10-10）→ `None`
+    ///    → `BIZ_SHELF_PROCESS_NOT_FOUND` 抛错。该函数自带 `t_shelf` 的 `deleted_at` /
+    ///    `is_active` / `zone='PRODUCTION'` 守卫与「只在该工序映射到的架里选」的约束，
+    ///    故 `None` 含「有映射但货架全不可用 / 不在当前账号 scope 内」，仍复用 20508
+    ///    不新造码
     /// 6. `update_batch_dispatched`（OCC）→ 0 行 → `VERSION_CONFLICT` 抛错
     /// 7. `PartRepo::insert_part_event('PLACED_ON_SHELF')`
     ///
@@ -227,32 +233,32 @@ impl QueueService {
             None => (target_process_id, None),
         };
 
-        // 3. 解析货架
-        // 2026-10-02 域拆分：原调 `QueueDispatchRepo::find_first_shelf_for_process`（本域手写
-        // `t_shelf_process` SQL），现改调 SQL 真源
-        // `prod::shelf_process::repo::ShelfProcessRepo::find_first_shelf_for_process`
-        // （executor 泛型直接接住 `&mut PgConnection`，无需改事务上下文）。
+        // 3. 选目标货架（2026-10-10：由 `sort_order` 取首个映射 → 负载最低者胜出）
         //
-        // ⚠️ 有链工单解析的是**链首工序**的货架（`target_process_id` 已在上面被
+        // ⚠️ 有链工单选的是**链首工序**对应的货架（`target_process_id` 已在上面被
         // 链首覆盖），不是请求里那道工序的货架。
         //
-        // 2026-10-04：货源守卫下沉到该方法的 SQL（`JOIN t_shelf` + `deleted_at IS NULL`
-        // + `is_active` + `zone='PRODUCTION'`），故此处拿到的 `shelf_id` 一定是可被
-        // 报工台取件页取到的生产架。`None` 有两种成因（完全没配映射 / 配了但货架全
-        // 不可用），都收敛到既有的 20508，不新造错误码；文案要写全，否则运营会去查
-        // 错方向（以为只是漏配映射，实际是货架被停用 / 改成了品检架）。
-        let shelf_id =
-            ShelfProcessRepo::find_first_shelf_for_process(&mut *conn, target_process_id)
-                .await?
-                .ok_or_else(|| {
-                    AppError::biz(
-                        code::BIZ_SHELF_PROCESS_NOT_FOUND,
-                        format!(
-                            "process {target_process_id} 无可用货架映射（无 active 映射，\
-                             或命中的映射其货架均已软删 / 已停用 / 非 PRODUCTION 区）"
-                        ),
-                    )
-                })?;
+        // `None` 的四种成因都收敛到既有的 `20508`，不新造错误码：
+        // 完全没配映射 / 配了但映射的货架全被停用或软删 / 全部改成了品检架 /
+        // 当前账号的 `shelf_ids` 白名单里一个都没有。文案要写全，否则运营会去查错
+        // 方向（以为只是漏配映射，实际是货架被停用或改成了品检架）。
+        let shelf = crate::shared::shelf::select::pick_least_loaded(
+            &mut *conn,
+            "PRODUCTION",
+            Some(target_process_id),
+            crate::shared::shelf::select::shelf_scope_for(current),
+        )
+        .await?
+        .ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_SHELF_PROCESS_NOT_FOUND,
+                format!(
+                    "process {target_process_id} 无可用生产货架（无 active 映射，\
+                     或命中的映射其货架均已软删 / 已停用 / 非 PRODUCTION 区 / 不在当前账号 scope 内）"
+                ),
+            )
+        })?;
+        let shelf_id = shelf.id;
 
         // 4. UPDATE OCC（带当前 version）
         // 2026-09-30：透传 target_process_id 作为 current_process_id —— 池归属
@@ -1397,26 +1403,38 @@ mod tests {
         .expect_err("应抛 BIZ_BATCH_INVALID_STATUS");
     }
 
+    /// 2026-10-10：多条映射时按 **负载比例** 最低者胜出（不再是 `sort_order` 最小）。
+    ///
+    /// 三条映射按 `display_order` 排序落在「最前 / 中间 / 最后」，
+    /// 但 `capacity` + 在架件数刻意排成另一条次序 —— 选中的必须是 `shelf_mid`，
+    /// 于是「按物理顺序取第一个」与「按负载取最空」两种口径被区分开了。
     #[tokio::test]
-    async fn dispatch_batch_picks_first_shelf_when_multiple_mappings_exist() {
+    async fn dispatch_batch_picks_least_loaded_shelf_when_multiple_mappings_exist() {
         let pool = test_pool().await;
         let user_id = insert_user_with_role(&pool, "manager1", "password", "MANAGER").await;
         let customer_id = insert_customer_l2(&pool, "ACME").await;
         let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
         let process_id = insert_process(&pool, "P-MULTI", "ACME").await;
 
-        // 三个货架：sort_order 分别是 5 / 1 / 9，应取 sort_order=1 的那个
+        // (display_order, capacity, 已占用件数) ⇒ 比例 80% / 25% / 67%
         let now = now_naive();
         let shelf_first = shared_test_snowflake().next_id();
         let shelf_mid = shared_test_snowflake().next_id();
         let shelf_last = shared_test_snowflake().next_id();
-        for (shelf_id, sort_order) in [(shelf_first, 5), (shelf_mid, 1), (shelf_last, 9)] {
+        for (shelf_id, display_order, capacity, loaded) in [
+            (shelf_first, 0, 100_i32, 80_i32),
+            (shelf_mid, 1, 200, 50),
+            (shelf_last, 2, 150, 100),
+        ] {
             sqlx::query(
-                "INSERT INTO t_shelf (id, code, name, zone, is_active, display_order, version, \
-                 created_at, updated_at) VALUES ($1, $2, $2, 'PRODUCTION', true, 0, 0, $3, $3)",
+                "INSERT INTO t_shelf (id, code, name, zone, is_active, display_order, capacity, \
+                 version, created_at, updated_at) \
+                 VALUES ($1, $2, $2, 'PRODUCTION', true, $3, $4, 0, $5, $5)",
             )
             .bind(shelf_id)
-            .bind(format!("SH-MULTI-{sort_order}"))
+            .bind(format!("SH-MULTI-{display_order}"))
+            .bind(display_order)
+            .bind(capacity)
             .bind(now)
             .execute(&pool)
             .await
@@ -1428,7 +1446,38 @@ mod tests {
             .bind(shared_test_snowflake().next_id())
             .bind(shelf_id)
             .bind(process_id)
-            .bind(sort_order)
+            .bind(display_order)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .unwrap();
+            // 在该架上堆 `loaded` 件在架负载（`SUM(quantity)` 件数口径）
+            let load_part = shared_test_snowflake().next_id();
+            sqlx::query(
+                "INSERT INTO t_part (id, name, drawing_no, applicant_name, quantity, unit_price, \
+                 total_price, request_date, planned_delivery_date, customer_id, status, version, \
+                 created_at, updated_at) \
+                 VALUES ($1, $2, $3, 'T', $4, 1.00, 1.00, CURRENT_DATE, CURRENT_DATE, $5, \
+                         'IN_PROCESS', 0, $6, $6)",
+            )
+            .bind(load_part)
+            .bind(format!("P-LOAD-{display_order}"))
+            .bind(format!("DWG-LOAD-{display_order}"))
+            .bind(loaded)
+            .bind(customer_id)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
+                 current_holder_id, version, created_at, updated_at) \
+                 VALUES ($1, $2, 1, $3, 'IN_PROCESS', 'PRODUCTION_SHELF', $4, 0, $5, $5)",
+            )
+            .bind(shared_test_snowflake().next_id())
+            .bind(load_part)
+            .bind(loaded)
+            .bind(shelf_id)
             .bind(now)
             .execute(&pool)
             .await
@@ -1458,10 +1507,9 @@ mod tests {
         )
         .await
         .expect("dispatch OK");
-        // 期望 sort_order=1 的 shelf_mid
         assert_eq!(
             r.succeeded[0].shelf_id, shelf_mid,
-            "应取 sort_order 最小的 shelf"
+            "应取负载比例最低的 shelf（25%），不是 display_order 最小的那个（80%）"
         );
     }
 

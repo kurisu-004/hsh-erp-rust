@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE t_shelf\n            SET name          = COALESCE($3::varchar, name),\n                location      = CASE WHEN $4::bool THEN $5::varchar ELSE location END,\n                display_order = COALESCE($6::integer, display_order),\n                capacity      = CASE WHEN $8::bool THEN $9::integer ELSE capacity END,\n                version       = version + 1,\n                updated_at    = now(),\n                updated_by    = $7\n            WHERE id = $1 AND version = $2 AND deleted_at IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int4",
+        "Varchar",
+        "Bool",
+        "Varchar",
+        "Int4",
+        "Int8",
+        "Bool",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3d06eaec8dbc9fa440060c8261538dae92351f5116b22c9f9895dfd9bc3cf09b"
+}
