@@ -27,6 +27,13 @@
 7. **`DeliveryNoteLineItem` 新增 `customer_id`**（L2 叶子 id，必填非空）：打印分组键由
    `customer_name` 切到 id —— `t_customer.name` 非唯一，同名 L2 会被并进同一张 sheet。
 
+### 0.1 变更记录
+
+- **2026-10-09 `POST /scan` 状态闸门的作用域收窄（§4.1）**：批次状态 ≠ `READY_TO_SHIP`
+  **不再顺带拒绝整个请求**。判定权交给 DP —— 该零件的可入单量够本次要的量就正常入单，
+  非 READY 批次只是不参与分配；只有凑不出时才报 21405，并在 message 里附被拦下的批次明细。
+  21406（占用）**仍是请求级闸门**，语义不变。
+
 ## 1. 端点表（**17 个**）
 
 ### 1.1 `/api/v2/com/delivery/note`（12 个）
@@ -97,7 +104,7 @@
 | 21402 | `BIZ_DELIVERY_NOTE_INVALID_TRANSITION` | `update` 单据非 DRAFT/SUBMITTED；`/{id}/driver` 作用于已领取/已归档单 | 400 |
 | 21403 | `BIZ_DELIVERY_NOTE_NOT_DRAFT` | `soft-delete` 单据非 DRAFT | 400 |
 | 21404 | `BIZ_DELIVERY_NOTE_NOT_SUBMITTED` | `recall` / `pickup` 单据非 SUBMITTED | 400 |
-| **21405** | `BIZ_DELIVERY_NOTE_PART_NOT_READY` | ★ 入单唯一允许的批次状态是 `READY_TO_SHIP`：批次状态不符 / DP 不可行 / `sets > entry_max_sets`；`submit` 单上有非 `READY_TO_SHIP` 批次；`pickup` 单上有非 `READY_TO_SHIP` 批次 | 400 |
+| **21405** | `BIZ_DELIVERY_NOTE_PART_NOT_READY` | ★ 入单唯一允许的批次状态是 `READY_TO_SHIP`：批次状态不符**且**该零件可入单量凑不出本次要的量（作用域见 §4.1）/ DP 不可行 / `sets > entry_max_sets`；`submit` 单上有非 `READY_TO_SHIP` 批次；`pickup` 单上有非 `READY_TO_SHIP` 批次 | 400 |
 | 21406 | `BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED` | 批次已被**其它**送货单占着（活跃单 / 已领取单，两种 message 不同） | 409 |
 | **21407** | `BIZ_DELIVERY_NOTE_PARTS_MULTIPLE_CUSTOMERS` | 零件的 L1 客户 ≠ 单据 L1 客户（同一请求混入别的 L1 的零件） | 400 |
 | 21409 | `BIZ_DELIVERY_NOTE_DRIVER_INVALID` | `validate_driver` 5 条任一不过；`pickup` 单据未指定司机 | 400 |
@@ -320,12 +327,29 @@ JOIN 带 `deleted_at IS NULL`）—— 这条 SQL 是「可入单」的**唯一*
 | 状态 | 可入单？ | 报什么码 |
 |---|---|---|
 | `READY_TO_SHIP` + 未占用 | ✅ | — |
-| `INSPECTION` | ❌ | **21405**，message 带 `part / serial_no / batch_no / status` 明细 |
+| `INSPECTION` | ❌ | **21405**（该零件可入单量不够时），message 带 `part / serial_no / batch_no / status` 明细 |
 | `PENDING` / `PROGRAMMING` / `IN_PROCESS` / `DELIVERED` / `OUTSOURCE` / `COMPLETED` / `CANCELLED` | ❌ | 21405（同上） |
 | `READY_TO_SHIP` + 挂在**活跃单**（`DRAFT` / `SUBMITTED`）上 | ❌ | **21406**，message 标「活跃单，货还在这张单上」 |
 | `READY_TO_SHIP` + 挂在**已领取/已归档单**上 | ❌ | **21406**，message 标「已领取/已归档单，货已随该单送出，不可再次入单」 |
-| 任意状态 + 挂在**已软删**的单上 | 按状态判（软删单的占用视同未占用） | 状态不符 → 21405 |
+| 任意状态 + 挂在**已软删**的单上 | 按状态判（软删单的占用视同未占用） | 状态不符且不够量 → 21405 |
 | 任意状态 + 挂在**本单**上 | 幂等跳过 | — |
+
+**状态闸门的判定作用域 = 「本次分配实际需要的量」（2026-10-09 修）**。上表左列判的是
+「这个批次本身能不能被选中」，**不构成对整个请求的拒绝**：同一个零件只要 `READY_TO_SHIP`
+的可入单量够本次要的量，就正常入单，非 `READY_TO_SHIP` 的批次只是**不参与分配**。
+只有当该零件的 DP **凑不出本次 target** 时才报 21405，并在 message 里附上被拦下的批次明细。
+（此前状态闸门是请求级的：零件只要沾一个非 `READY_TO_SHIP` 批次，整单就 21405，
+哪怕旁边有足量可入单的批次 —— 这正是本次修掉的缺陷。）
+
+| 失败形态 | message |
+|---|---|
+| 该 part 无状态明细（货就是不够） | 只回 DP 原文：「可入单件数不足：需要 N 件，候选批次合计 M 件」。**不**加「READY_TO_SHIP」字样 —— 那种场景说成状态问题是说错话 |
+| 该 part 有状态明细 | DP 原文 + `；入单只允许 READY_TO_SHIP，以下批次不可用：part {id}（{serial_no}）批次 {no} status={status}；…` |
+| 多个 part 同时凑不出 | 按 `part_id` 升序逐个列出，每段 `part {id}（需 N 件）：{DP 文案}`（有状态明细则同样追加明细段） |
+
+> ⚠️ **21406 仍是请求级闸门**，刻意与状态闸门不同：任一批次被别的单占着（哪怕同零件另有
+> 足量可入单批次），整个请求原子失败、零写入，不允许「挑能用的挂上」。用例
+> `batch_on_active_note_rejected_21406` 钉死。
 
 > ⚠️ **三桶必须穷尽**。批次挂在 `PICKED_UP` 单上时，它既不在「可入单」集合里（repo 按状态 +
 > 占用筛）、也不算「活跃占用」、状态又是 `READY_TO_SHIP`（不进 not_ready）⇒ 若分类循环漏了
