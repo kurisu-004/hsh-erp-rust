@@ -3,7 +3,7 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 > 📌 **前端对接**：后端 API 参考见 [`docs/api/`](docs/api/)。**2026-10-10 现状**：`docs/api/` 有 8 份文件，每份是一个域的**整域契约**（端点表 / 逐字段 / 口径表 / 错误码 / 移除记录 / WS 关系 / 表依赖与前端配套 / 已知偏差登记），范本是 [`dashboard.md`](docs/api/dashboard.md) 的八节骨架：
-> - [`docs/api/dashboard.md`](docs/api/dashboard.md) —— 大屏聚合域（3 个只读 HTTP 端点 + WS 首帧 / 增量；`DELIVERY_STATUSES` 四处共用、行单位差异、`ts` 格式、前端配套清单）
+> - [`docs/api/dashboard.md`](docs/api/dashboard.md) —— 大屏聚合域（3 个只读 HTTP 端点 + WS 首帧 / 增量；`DELIVERY_STATUSES` 四处共用、行单位、装配件整套交付不变式、`ts` 格式、前端配套清单）
 > - [`docs/api/programming.md`](docs/api/programming.md) —— `prod::programming` 待编程一览（part 状态闸门 + 三规则并集、part 级去重、批次锚点、排序白名单大小写不对称）
 > - [`docs/api/inspection.md`](docs/api/inspection.md) —— `prod::inspection` 待品检（队列列表 + 扫码三层树、`l1_customer_name` 与返修侧有意分叉、域隔离漏报盲区）
 > - [`docs/api/queue.md`](docs/api/queue.md) —— `prod::queue` 生产队列（9 端点；候选池判据的两列一致 / 货架 JOIN 不一致、`pending_count` 口径、`batch_id` 必须是 JSON 字符串）
@@ -170,7 +170,7 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 
 | 端点 | 权限 | 说明 |
 |---|---|---|
-| `GET /api/v2/dashboard/snapshot` | 登录即可 | 大屏首帧：`overdue_count` / `in_inspection_count` / `in_process[]`(7 字段 `WorkerHeldBatch`) / `system_delivery_orders{urgent,partial}`；**无 query 参数** |
+| `GET /api/v2/dashboard/snapshot` | 登录即可 | 大屏首帧：`overdue_count` / `in_inspection_count` / `in_process[]`(7 字段 `WorkerHeldBatch`) / `system_delivery_orders{upcoming,overdue,partial}`（各 `{items[≤30], total}`，**工单级**）；**无 query 参数** |
 | `GET /api/v2/dashboard/upcoming-delivery` | 登录即可 | 交期柱状图分桶：`today` + `buckets[]`；`days` 缺省 14 clamp 1..60，`basis` 缺省 **system** |
 | `GET /api/v2/dashboard/delivery-orders` | 登录即可 | 柱状图下钻抽屉：`date` + `statuses` 必填（逗号分隔），`basis` 缺省 system，`total` 不受 200 条截断影响 |
 | `GET /ws/dashboard` | JWT + session | 握手首帧 snapshot + `WsEvent::DashboardEvent` 增量 + text 心跳 |
@@ -180,8 +180,9 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
   - **已接入的四处**：`modules::dashboard::tests::dashboard_domain_depends_on_no_other_domain`（扫 `src/modules/dashboard/**/*.rs`）、`modules::prod::programming::tests::programming_domain_depends_on_no_other_domain`、`modules::prod::inspection::tests::inspection_domain_depends_on_no_other_domain`（后两者分别扫 `src/modules/prod/programming/**/*.rs` 与 `src/modules/prod/inspection/**/*.rs`，本域路径为嵌套域 `prod::xxx`，**同父兄弟域 `prod::batch` 同样算跨域**），以及 `modules::prod::queue::board::tests::board_aggregation_depends_on_no_other_domain`（只扫 `src/modules/prod/queue/board/**/*.rs` —— queue 域整体**不适用**该护栏，它的写端点按既定 pattern 经本域 trait 转发其它域单表查询，圈出 board 这块纯聚合 SQL 单独守）。新增只读跨域聚合域时照此加一行调用即可。
   - **元测试**：`shared::domain_guard::tests::*`（6 条，含「本域标识符非法必须 panic」与 raw string 字符串状态两组）。任一写法漏报、误报或探测器瞎了都会红。
 - `DELIVERY_STATUSES`（6 态，`repo/delivery.rs`）是「未交付」的**唯一**判据，逾期计数 / 面板 / 抽屉 / 柱状图 top+middle 四处共用；柱状图 bottom 层额外含 `DELIVERED`。**它与前端 `LAYERS[].statuses` 是人工同步关系，无编译期保障**，改一侧必须改另一侧。
-- ⚠️ **行单位差异**：逾期 = **工单级**（装配件算 1 条，`t_part` 侧 `assembly_id IS NULL` 排除子件）；面板 / 柱状图 = **件级**（子件各算 1）。两者时间窗口不重叠（`< today` vs `>= today`），故同一条不会重复出现。
-- ⚠️ 与 `statistics::repo::sql::count_overdue_undelivered` **有意分叉**（planned 口径 + DELIVERED 事件兜底，服务生产统计页）——不要动它。
+- ⚠️ **行单位**（2026-10-10）：逾期 = **工单级**；交期面板三桶 = **工单级**（装配件行**替换**其子件行，行内新增 `row_type` 标 PART / ASSEMBLY，装配件的 `quantity` 与 `delivered_quantity` 单位是**套**）；柱状图 / 抽屉 = **件级**（子件各算 1）。
+- ⚠️ **装配件整套交付不变式**（2026-10-10）：`count_overdue` 用 `NOT EXISTS(已交批次)`、面板 `upcoming`/`overdue` 用 `delivered_sets`，两个**字面不同**的谓词在该不变式下**语义等价**（推导见 `docs/api/dashboard.md` §4.4）—— 不要把其中任何一条当成漏判"修"掉。唯一破坏路径是 `POST /prod/batches/{id}/deliver`（无装配件套数校验）。
+- ⚠️ 与 `statistics::repo::sql::count_overdue_undelivered` **有意分叉**（planned 口径 + DELIVERED 事件兜底，服务生产统计页）——不要动它。⚠️ 那是**另一份 SQL**；dashboard 自己这份是 system 口径 + 已交量守卫，两者分叉点只在「交期列 + 事件兜底」两处。
 - 完整契约（含每字段 SQL 来源、移除记录、WS 事件集、前端配套改动清单、已知偏差登记）见 [`docs/api/dashboard.md`](docs/api/dashboard.md)。
 
 **2026-10-02 shelf 域拆分**（依据「货架自身包括了账号的部分和工序映射相关的部分，

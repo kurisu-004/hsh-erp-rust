@@ -40,7 +40,7 @@ impl DashboardService {
     /// 异步构建一次完整快照（HTTP 首取与 WS 握手首帧共用）。
     ///
     /// 返回 `{overdue_count, in_inspection_count, in_process,
-    /// system_delivery_orders, ts}`。交期分桶已拆到独立端点
+    /// system_delivery_orders{upcoming,overdue,partial}, ts}`。交期分桶已拆到独立端点
     /// （`GET /api/v2/dashboard/upcoming-delivery`），不再内嵌在本快照里。
     ///
     /// service 内零 SQL——所有 SQL 在 `repo/sql.rs` / `repo/delivery.rs`。
@@ -48,12 +48,16 @@ impl DashboardService {
         &self,
         mut repo: R,
     ) -> Result<DashboardSnapshot, sqlx::Error> {
-        // 「今天」只取一次，同一个值喂给逾期 / 面板两个查询：两侧窗口边界必须一致，
-        // 否则同一条工单可能同时落进逾期数与面板。
+        // 「今天」只取一次，同一个值喂给逾期 / 面板三桶：逾期与 `overdue` 桶的窗口边界
+        // 必须一致，否则同一条工单可能同时落进逾期数与逾期面板（或两侧都漏）。
+        // ⚠️ 三桶里 `partial` 刻意**不吃** `today`（无时间窗口），故它不受这条约束。
         let today = now_naive().date();
 
         let overdue_count = repo.snapshot_overdue(today).await?;
         let in_inspection_count = repo.snapshot_in_inspection_count().await?;
+        // upcoming（`>= today` 未交）/ overdue（`< today` 未交）/ partial（已交过一部分、
+        // 无窗口）三桶，全部工单级，装配件行替换其子件行。口径见
+        // `repo/delivery.rs` 的三个 `SQL_ORDERS_*` 常量。
         let system_delivery_orders = repo.snapshot_system_delivery_orders(today).await?;
 
         let recent = repo.snapshot_recent_batches().await?;

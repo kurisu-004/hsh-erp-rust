@@ -41,7 +41,7 @@ pub trait DashboardRepoTrait: Send {
     /// 逾期未交工单数（工单级：装配件算 1 条，子件不重复计入）。
     async fn snapshot_overdue(&mut self, today: NaiveDate) -> Result<i64, sqlx::Error>;
 
-    /// 最紧急工单 + 部分已交两桶（`delivered_quantity` 判据在 repo 侧）。
+    /// 交期面板三桶 `upcoming` / `overdue` / `partial`（桶归属与已交判据都在 SQL 侧）。
     async fn snapshot_system_delivery_orders(
         &mut self,
         today: NaiveDate,

@@ -11,8 +11,9 @@
 //!     4. snapshot_counters_window_anchors_on_passed_today_not_current_date
 //!                                                  — 分桶窗口下界取自传入 `today`
 //!                                                    而非 SQL `CURRENT_DATE`（核心回归）
-//!     5. overdue_count_* （6 组口径，见下方小节标题）
-//!     6. system_delivery_orders_* （分桶 / 截断 / 窗口边界）
+//!     5. overdue_count_* （逾期口径，见下方小节标题）
+//!     6. system_delivery_orders_* （三桶分桶 / 窗口 / 截断 / total / row_type）
+//!        delivered_sets_* （装配件按套的 min 公式 4 条）
 //!     7. delivery_order_details_* （单日 / 状态 / total 与截断 / 两口径）
 //!
 //!   ws_hub 协作：
@@ -148,10 +149,143 @@ async fn insert_part(
     id
 }
 
+/// 插一条指定「工单总件数」的散件，返回其 id。
+///
+/// 与 `insert_part` 的差别只有一个：`quantity` 显式给值（`insert_part` 走列默认值 1）。
+/// 「部分已交」与装配件 min 公式的用例必须能区分总量与已交量。
+async fn insert_part_with_quantity(
+    pool: &PgPool,
+    customer_id: i64,
+    status: &str,
+    system_delivery_date: Option<NaiveDate>,
+    planned_delivery_date: NaiveDate,
+    quantity: i32,
+) -> i64 {
+    let id = shared_test_snowflake().next_id();
+    sqlx::query(
+        "INSERT INTO t_part (id, name, drawing_no, applicant_name, customer_id, quantity, \
+         request_date, planned_delivery_date, system_delivery_date, status, version, \
+         created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, 'p-qty', 'DWG-Q', 'tester', $2, $3, $4, $5, $6, $7, 0, $8, NULL, $8, NULL)",
+    )
+    .bind(id)
+    .bind(customer_id)
+    .bind(quantity)
+    .bind(planned_delivery_date)
+    .bind(planned_delivery_date)
+    .bind(system_delivery_date)
+    .bind(status)
+    .bind(now_naive())
+    .execute(pool)
+    .await
+    .expect("insert t_part with quantity");
+    id
+}
+
+/// 插一条装配件（`t_assembly`），返回其 id。`quantity` = **工单总套数**。
+///
+/// 2026-10-10 新增：交期面板三桶改成工单级（装配件行替换其子件行）后，组装配件成为
+/// 面板行的一等来源，逾期 / 面板两侧的装配件用例都得直插 `t_assembly`。
+async fn insert_assembly(
+    pool: &PgPool,
+    customer_id: i64,
+    status: &str,
+    system_delivery_date: Option<NaiveDate>,
+    quantity: i32,
+) -> i64 {
+    let id = shared_test_snowflake().next_id();
+    let planned = system_delivery_date.unwrap_or_else(|| now_naive().date());
+    sqlx::query(
+        "INSERT INTO t_assembly (id, drawing_no, name, applicant_name, customer_id, \
+         quantity, request_date, planned_delivery_date, system_delivery_date, status, version, \
+         created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, 'DWG-ASM', '装配件', 'tester', $2, $3, $4, $4, $5, $6, 0, $7, NULL, $7, NULL)",
+    )
+    .bind(id)
+    .bind(customer_id)
+    .bind(quantity)
+    .bind(planned)
+    .bind(system_delivery_date)
+    .bind(status)
+    .bind(now_naive())
+    .execute(pool)
+    .await
+    .expect("insert t_assembly");
+    id
+}
+
+/// 插一条装配件的子件（`t_part.assembly_id` 非空），返回其 id。`quantity` = **子件总数**。
+///
+/// 子件的 `system_delivery_date` 刻意留 NULL：面板与逾期两侧都是**工单级**（子件既不
+/// 单独出行、也不计入逾期），该列对被测口径无影响，留 NULL 才能顺带守住「子件不因
+/// 交期进面板」这条。
+async fn insert_child_part(
+    pool: &PgPool,
+    customer_id: i64,
+    assembly_id: i64,
+    quantity: i32,
+) -> i64 {
+    let id = shared_test_snowflake().next_id();
+    let today = now_naive().date();
+    sqlx::query(
+        "INSERT INTO t_part (id, name, drawing_no, applicant_name, customer_id, assembly_id, \
+         quantity, request_date, planned_delivery_date, system_delivery_date, status, version, \
+         created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, 'child', 'DWG-CH', 'tester', $2, $3, $4, $5, $5, NULL, 'IN_PROCESS', 0, \
+                 $6, NULL, $6, NULL)",
+    )
+    .bind(id)
+    .bind(customer_id)
+    .bind(assembly_id)
+    .bind(quantity)
+    .bind(today)
+    .bind(now_naive())
+    .execute(pool)
+    .await
+    .expect("insert child t_part");
+    id
+}
+
+/// 给 `part` 插一条已交批次（`status IN ('DELIVERED','COMPLETED')`），返回其 id。
+///
+/// 这是「已交过」的**唯一**判据来源：面板三桶的 `EXISTS` / `NOT EXISTS` 与
+/// `count_overdue` 的「已交过就排除」守卫都只看它。
+async fn insert_delivered_batch(pool: &PgPool, part_id: i64, quantity: i32) -> i64 {
+    let id = shared_test_snowflake().next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, version, \
+         created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, 1, $3, 'DELIVERED', 0, $4, NULL, $4, NULL)",
+    )
+    .bind(id)
+    .bind(part_id)
+    .bind(quantity)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert delivered t_part_batch");
+    id
+}
+
+/// 取一次快照的交期三桶（少一层重复的 `build_snapshot` 调用样板）。
+async fn delivery_orders_of(
+    pool: &PgPool,
+) -> hsh_erp_rust::modules::dashboard::vo::SystemDeliveryOrders {
+    let mut tx = pool.begin().await.unwrap();
+    let orders = DashboardService::new()
+        .build_snapshot(&mut *tx)
+        .await
+        .expect("snapshot ok")
+        .system_delivery_orders;
+    drop(tx);
+    orders
+}
+
 #[tokio::test]
 async fn build_snapshot_basic_shape() {
     // 空业务数据下：4 个字段各自的「空形态」都必须成立（overdue/in_inspection 是数字 0，
-    // in_process 与 system_delivery_orders 两桶是空数组）。
+    // in_process 与 system_delivery_orders 三桶都是空 items + total 0）。
     let pool = setup().await;
     let mut tx = pool.begin().await.unwrap();
     let snap = DashboardService::new()
@@ -163,14 +297,15 @@ async fn build_snapshot_basic_shape() {
     assert_eq!(snap.overdue_count, 0, "空库无逾期工单");
     assert_eq!(snap.in_inspection_count, 0, "空库无待品检批次");
     assert!(snap.in_process.is_empty(), "空库无在加工批次");
-    assert!(
-        snap.system_delivery_orders.urgent.is_empty(),
-        "空库无最紧急工单"
-    );
-    assert!(
-        snap.system_delivery_orders.partial.is_empty(),
-        "空库无部分已交工单"
-    );
+    let orders = snap.system_delivery_orders;
+    for (bucket, label) in [
+        (&orders.upcoming, "upcoming（>= today 未交）"),
+        (&orders.overdue, "overdue（< today 未交）"),
+        (&orders.partial, "partial（已交一部分，无窗口）"),
+    ] {
+        assert!(bucket.items.is_empty(), "空库 {label} 桶应为空");
+        assert_eq!(bucket.total, 0, "空库 {label} 桶 total 应为 0");
+    }
     assert!(!snap.ts.is_empty());
 }
 
@@ -678,14 +813,16 @@ async fn ws_e2e_valid_token_receives_snapshot() {
         "in_inspection_count 应为 number"
     );
     assert!(data["in_process"].is_array(), "in_process 应为 array");
-    assert!(
-        data["system_delivery_orders"]["urgent"].is_array(),
-        "system_delivery_orders.urgent 应为 array"
-    );
-    assert!(
-        data["system_delivery_orders"]["partial"].is_array(),
-        "system_delivery_orders.partial 应为 array"
-    );
+    for bucket in ["upcoming", "overdue", "partial"] {
+        assert!(
+            data["system_delivery_orders"][bucket]["items"].is_array(),
+            "system_delivery_orders.{bucket}.items 应为 array"
+        );
+        assert!(
+            data["system_delivery_orders"][bucket]["total"].is_number(),
+            "system_delivery_orders.{bucket}.total 应为裸 number"
+        );
+    }
 
     // 2026-10-07：外层 envelope 的 `ts` 与嵌套 `data.ts` 必须同格式、都锁死
     // Asia/Shanghai。回归点是外层曾用 `chrono::Local::now()`——它跟**宿主**时区走，
@@ -1215,14 +1352,16 @@ async fn http_snapshot_happy_path_returns_full_shape() {
         "data.in_inspection_count 应为 number"
     );
     assert!(data["in_process"].is_array(), "data.in_process 应为数组");
-    assert!(
-        data["system_delivery_orders"]["urgent"].is_array(),
-        "data.system_delivery_orders.urgent 应为数组"
-    );
-    assert!(
-        data["system_delivery_orders"]["partial"].is_array(),
-        "data.system_delivery_orders.partial 应为数组"
-    );
+    for bucket in ["upcoming", "overdue", "partial"] {
+        assert!(
+            data["system_delivery_orders"][bucket]["items"].is_array(),
+            "data.system_delivery_orders.{bucket}.items 应为数组"
+        );
+        assert!(
+            data["system_delivery_orders"][bucket]["total"].is_number(),
+            "data.system_delivery_orders.{bucket}.total 应为裸 number"
+        );
+    }
     assert!(
         !data["ts"].as_str().unwrap_or("").is_empty(),
         "data.ts 应非空"
@@ -1241,6 +1380,113 @@ async fn http_snapshot_happy_path_returns_full_shape() {
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::OK, "旧入参被忽略而不是报错");
+}
+
+/// JSON 层的字段契约（前端 Zod schema 的对接口径，2026-10-10 三桶）。
+///
+/// 逐键钉死 `system_delivery_orders` 的形状：三桶都是 `{items, total}` **对象**
+/// （原 `urgent` / `partial` 是裸数组），行内新增 `row_type`，`id` 是字符串而
+/// `total` 是裸 number。⚠️ 前端已按这份契约并行开发，改键名 / 改类型会当场红。
+#[tokio::test]
+async fn http_snapshot_delivery_orders_json_shape_is_stable() {
+    let pool = setup().await;
+    let state = test_state(pool.clone()).await;
+    let token = mint_test_token(&state, DashboardWsFixture::WS_USER_ID).await;
+    let app = test_app(state.clone());
+
+    let today = now_naive().date();
+    let cust_id = insert_customer(&pool, "shape_cust", "P").await;
+    let sdd = today + chrono::Duration::days(2);
+    // upcoming：散件 1 行
+    insert_part_with_quantity(&pool, cust_id, "IN_PROCESS", Some(sdd), sdd, 10).await;
+    // upcoming：装配件 1 行（row_type = ASSEMBLY，quantity 单位是套）
+    let asm = insert_assembly(&pool, cust_id, "IN_PROCESS", Some(sdd), 10).await;
+    insert_child_part(&pool, cust_id, asm, 20).await;
+    // partial：已交过一部分的散件 1 行
+    let pa = insert_part_with_quantity(&pool, cust_id, "IN_PROCESS", Some(sdd), sdd, 10).await;
+    insert_delivered_batch(&pool, pa, 4).await;
+
+    let (status, envelope) = send(
+        app,
+        json_request("GET", "/dashboard/snapshot", None, Some(&token)),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "envelope={envelope}");
+    let orders = &envelope["data"]["system_delivery_orders"];
+
+    // 三桶都是对象，且键名就是 upcoming / overdue / partial（`urgent` 已不存在）
+    for bucket in ["upcoming", "overdue", "partial"] {
+        assert!(
+            orders[bucket].is_object(),
+            "{bucket} 应是 {{items, total}} 对象而非数组：{orders}"
+        );
+        assert!(
+            orders[bucket]["items"].is_array(),
+            "{bucket}.items 应为数组"
+        );
+        assert!(
+            orders[bucket]["total"].is_number(),
+            "{bucket}.total 应为裸 number"
+        );
+    }
+    assert!(
+        orders.get("urgent").is_none(),
+        "urgent 桶已于 2026-10-10 下线，响应里不得再出现：{orders}"
+    );
+    assert_eq!(orders["upcoming"]["total"], 2);
+    assert_eq!(orders["partial"]["total"], 1);
+    assert_eq!(
+        orders["overdue"]["total"], 0,
+        "零命中时 total 退化为 0 而非 null"
+    );
+
+    // 行的 10 个键逐个钉死
+    let mut keys: Vec<&str> = orders["upcoming"]["items"][0]
+        .as_object()
+        .expect("行应是对象")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "customer_name",
+            "delivered_quantity",
+            "id",
+            "is_urgent",
+            "name",
+            "quantity",
+            "row_type",
+            "serial_no",
+            "status",
+            "system_delivery_date",
+        ],
+        "SystemDeliveryOrder 的字段集不得漂移（前端 Zod 必填字段逐字依赖）"
+    );
+    let part_row = orders["upcoming"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["row_type"] == "PART")
+        .expect("upcoming 桶应有 PART 行");
+    assert!(part_row["id"].is_string(), "id 是雪花 ID 字符串形态");
+    assert_eq!(part_row["quantity"], 10);
+    assert_eq!(part_row["delivered_quantity"], 0);
+    assert_eq!(part_row["customer_name"], "shape_cust");
+
+    let asm_row = orders["upcoming"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["row_type"] == "ASSEMBLY")
+        .expect("upcoming 桶应有 ASSEMBLY 行");
+    assert_eq!(asm_row["id"], asm.to_string());
+    assert_eq!(asm_row["quantity"], 10, "装配件行 quantity 是总套数");
+
+    let pa_row = &orders["partial"]["items"][0];
+    assert_eq!(pa_row["id"], pa.to_string());
+    assert_eq!(pa_row["delivered_quantity"], 4);
 }
 
 // ===========================================================================
@@ -1518,12 +1764,18 @@ async fn http_upcoming_basis_invalid_value_returns_400() {
 }
 
 // ===========================================================================
-// 2026-10-07 新增：`snapshot.overdue_count` 逾期口径（6 组）
+// `snapshot.overdue_count` 逾期口径
 // ===========================================================================
 //
 // 逾期是**工单级**计数：装配件算 1 条，子件不重复计入（`t_part` 侧
 // `assembly_id IS NULL` 排除，`t_assembly` 侧直接查装配件表）。窗口是
-// `system_delivery_date < today`，状态白名单 6 态。
+// `system_delivery_date < today`，状态白名单 6 态，且**只要交过一部分就不计入**
+// （2026-10-10 口径决策，两侧各一个 `NOT EXISTS`）。
+//
+// 组构成：6 条原有口径 + 3 条新增守卫用例 + 1 条 KPI↔面板对数用例。
+// 原有 6 条在新增守卫后**逐条复核过**：它们都不造已交批次，故
+// `NOT EXISTS` 恒真、语义不变（`overdue_excludes_delivered_completed_cancelled`
+// 靠的是 `status` 白名单守卫，与新守卫互相独立 —— 双守卫不可互相替代的原因即在此）。
 
 /// 直调 service 取逾期数（少一层 HTTP，便于逐条钉口径）。
 async fn overdue_of(pool: &PgPool) -> i64 {
@@ -1742,34 +1994,140 @@ async fn overdue_excludes_today_boundary() {
     );
 }
 
-// ===========================================================================
-// 2026-10-07 新增：`snapshot.system_delivery_orders` 两桶
-// ===========================================================================
+// ---------------------------------------------------------------------------
+// 2026-10-10 口径决策：`count_overdue` 改按**已交数量**判断，只要交过一部分就不计入
+// ---------------------------------------------------------------------------
+//
+// 守卫是 `SQL_COUNT_OVERDUE` 两侧各一个 `NOT EXISTS`（`t_assembly` 侧经
+// `t_part JOIN t_part_batch` 的子件路径）。散件与装配件两条路径必须各钉一条 ——
+// 只钉一侧的话，另一侧的谓词写错不会被发现。
 
 #[tokio::test]
-async fn system_delivery_orders_split_by_delivered_quantity() {
-    // 分桶判据是 `delivered_quantity`：0 → urgent，> 0 → partial。
+async fn overdue_excludes_partially_delivered_parts() {
+    // 散件侧：交期已过 + 有 DELIVERED 批次 ⇒ 不计入逾期（哪怕工单仍处 IN_PROCESS）。
     let pool = setup().await;
-    let now = now_naive();
-    let today = now.date();
-    let sdd = today + chrono::Duration::days(2);
-    let cust_id = insert_customer(&pool, "bucket_cust", "U").await;
+    let today = now_naive().date();
+    let overdue_day = today - chrono::Duration::days(2);
+    let cust_id = insert_customer(&pool, "part_deliv_cust", "M").await;
 
-    // urgent：完全没交过
-    let urgent_part = insert_part(&pool, cust_id, "IN_PROCESS", Some(sdd), sdd).await;
-    // partial：已交过一部分（DELIVERED 批次 quantity=4）
-    let partial_part = insert_part(&pool, cust_id, "IN_PROCESS", Some(sdd), sdd).await;
-    sqlx::query(
-        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, version, \
-         created_at, created_by, updated_at, updated_by) \
-         VALUES ($1, $2, 1, 4, 'DELIVERED', 0, $3, NULL, $3, NULL)",
+    // 一件没交过的对照组：必须仍然计入（否则守卫写成了无条件排除）
+    insert_part_with_quantity(
+        &pool,
+        cust_id,
+        "IN_PROCESS",
+        Some(overdue_day),
+        overdue_day,
+        10,
     )
-    .bind(shared_test_snowflake().next_id())
-    .bind(partial_part)
-    .bind(now)
-    .execute(&pool)
-    .await
-    .unwrap();
+    .await;
+    // 交过一部分：总量 10、已交 4
+    let partial = insert_part_with_quantity(
+        &pool,
+        cust_id,
+        "IN_PROCESS",
+        Some(overdue_day),
+        overdue_day,
+        10,
+    )
+    .await;
+    insert_delivered_batch(&pool, partial, 4).await;
+
+    assert_eq!(
+        overdue_of(&pool).await,
+        1,
+        "只有完全没交过的那条计入；交过 4/10 的不计逾期"
+    );
+
+    // 面板侧对照：未交的那条在 overdue 桶，已交的那条在 partial 桶（无窗口，与本例
+    // 的过期交期不冲突）。KPI ↔ 面板严格对数。
+    let orders = delivery_orders_of(&pool).await;
+    assert_eq!(orders.overdue.total, 1);
+    assert_eq!(orders.partial.total, 1);
+    assert_eq!(orders.partial.items[0].id, partial.to_string());
+}
+
+#[tokio::test]
+async fn overdue_excludes_assembly_with_any_child_batch_delivered() {
+    // 装配件侧：`t_assembly` 的 NOT EXISTS 走子件路径。**只交了一个子件** ⇒ 整个装配件
+    // 不计入逾期（业务不变式「装配件只能整套交付」下，部分子件已交即已交过一部分）。
+    let pool = setup().await;
+    let today = now_naive().date();
+    let overdue_day = today - chrono::Duration::days(4);
+    let cust_id = insert_customer(&pool, "asm_deliv_cust", "L").await;
+
+    // 对照组：一个子件都没交过的装配件，必须仍计入逾期
+    let untouched_asm = insert_assembly(&pool, cust_id, "IN_PROCESS", Some(overdue_day), 10).await;
+    insert_child_part(&pool, cust_id, untouched_asm, 20).await;
+    insert_child_part(&pool, cust_id, untouched_asm, 20).await;
+
+    // 被排除的那个：交期同样过期，但有一个子件的批次已 DELIVERED
+    let delivered_asm = insert_assembly(&pool, cust_id, "IN_PROCESS", Some(overdue_day), 10).await;
+    let child_a = insert_child_part(&pool, cust_id, delivered_asm, 20).await;
+    insert_child_part(&pool, cust_id, delivered_asm, 20).await;
+    insert_delivered_batch(&pool, child_a, 20).await;
+
+    assert_eq!(
+        overdue_of(&pool).await,
+        1,
+        "装配件侧也要按已交量排除：一个子件已交即不计逾期"
+    );
+
+    let orders = delivery_orders_of(&pool).await;
+    assert_eq!(
+        orders.overdue.total, 1,
+        "只有完全没交过的装配件在 overdue 桶"
+    );
+    assert_eq!(orders.overdue.items[0].id, untouched_asm.to_string());
+    assert_eq!(orders.overdue.items[0].row_type, "ASSEMBLY");
+    assert_eq!(
+        orders.partial.total, 1,
+        "已交过一部分的装配件落 partial 桶（子件 A 交满 20 件 = 10 套，子件 B 为 0 ⇒ min 0 套 ⇒ 桶仍归 partial，因桶判据是 EXISTS 而非 delivered_quantity）"
+    );
+    assert_eq!(orders.partial.items[0].id, delivered_asm.to_string());
+    assert_eq!(
+        orders.partial.items[0].delivered_quantity, 0,
+        "min 公式给出 0 套（子件 B 一件没交）"
+    );
+    // 读法提示：本例两个子件的 `t_part.status` 都还是 IN_PROCESS，装配件自身也是
+    // IN_PROCESS ⇒ 被排除的原因**只可能**是子件路径上的 NOT EXISTS 命中了已交批次。
+}
+
+#[tokio::test]
+async fn overdue_bucket_matches_overdue_count_on_undelivered_subset() {
+    // KPI ↔ 面板对数：`SQL_COUNT_OVERDUE` 与 `SQL_ORDERS_OVERDUE` 逐字同谓词 ⇒
+    // `overdue.total == overdue_count`（`total` 不受 30 条截断影响，故此处能取等号，
+    // 而 `overdue.items.len()` 只能说 `<=`）。
+    let pool = setup().await;
+    let today = now_naive().date();
+    let cust_id = insert_customer(&pool, "reconcile_cust", "X").await;
+
+    for i in 0..(DELIVERY_BUCKET_LIMIT + 4) {
+        // 造足 34 条以确保 `items` 被截断而 `total` 仍等于 KPI
+        let overdue_day = today - chrono::Duration::days(1 + (i % 5) as i64);
+        insert_part_with_quantity(
+            &pool,
+            cust_id,
+            "IN_PROCESS",
+            Some(overdue_day),
+            overdue_day,
+            10,
+        )
+        .await;
+    }
+    // 混进一批「交过一部分」的：KPI 与 overdue 桶都不得计它
+    for _ in 0..3 {
+        let overdue_day = today - chrono::Duration::days(1);
+        let p = insert_part_with_quantity(
+            &pool,
+            cust_id,
+            "IN_PROCESS",
+            Some(overdue_day),
+            overdue_day,
+            10,
+        )
+        .await;
+        insert_delivered_batch(&pool, p, 5).await;
+    }
 
     let mut tx = pool.begin().await.unwrap();
     let snap = DashboardService::new()
@@ -1778,24 +2136,211 @@ async fn system_delivery_orders_split_by_delivered_quantity() {
         .expect("snapshot ok");
     drop(tx);
 
-    let orders = snap.system_delivery_orders;
-    assert_eq!(orders.urgent.len(), 1, "未交过的工单应落在 urgent 桶");
-    assert_eq!(orders.urgent[0].id, urgent_part.to_string());
-    assert_eq!(orders.urgent[0].delivered_quantity, 0);
     assert_eq!(
-        orders.urgent[0].customer_name.as_deref(),
+        snap.system_delivery_orders.overdue.total, snap.overdue_count,
+        "overdue.total 与 overdue_count 必须逐条相等（无已交子集上严格对数）"
+    );
+    assert_eq!(snap.overdue_count, DELIVERY_BUCKET_LIMIT as i64 + 4);
+    assert_eq!(
+        snap.system_delivery_orders.overdue.items.len(),
+        DELIVERY_BUCKET_LIMIT,
+        "items 被 30 条上限截断，故只能说 items.len() <= overdue_count"
+    );
+    assert!(
+        snap.system_delivery_orders.overdue.items.len() as i64 <= snap.overdue_count,
+        "面板行数不得超过 KPI"
+    );
+    assert_eq!(
+        snap.system_delivery_orders.partial.total, 3,
+        "交过一部分的 3 条全部落 partial 桶，且不计逾期"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 装配件行 `delivered_quantity` 按**套数**（`repo/delivery.rs::fetch_delivered_sets` 的
+// min 公式，与 `com::union_list` 侧逐字同源）
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn delivered_sets_assembly_row_uses_min_set_formula() {
+    // 装配件 10 套；子件 A 总量 20 已交 10（→ 10*10/20 = 5 套）；子件 B 总量 10 已交 0
+    // （→ 0 套）⇒ min = 0；补交 B 的 10 件后 ⇒ min(5, 10) = 5。
+    let pool = setup().await;
+    let today = now_naive().date();
+    let sdd = today + chrono::Duration::days(5);
+    let cust_id = insert_customer(&pool, "setmin_cust", "J").await;
+
+    let asm = insert_assembly(&pool, cust_id, "IN_PROCESS", Some(sdd), 10).await;
+    let child_a = insert_child_part(&pool, cust_id, asm, 20).await;
+    let child_b = insert_child_part(&pool, cust_id, asm, 10).await;
+    insert_delivered_batch(&pool, child_a, 10).await;
+
+    let orders = delivery_orders_of(&pool).await;
+    assert_eq!(
+        orders.partial.total, 1,
+        "有子件已交 ⇒ 桶判据 EXISTS 命中（不依赖 delivered_quantity 本身）"
+    );
+    assert_eq!(
+        orders.partial.items[0].delivered_quantity, 0,
+        "子件 B 一件没交 → min(5, 0) = 0"
+    );
+
+    insert_delivered_batch(&pool, child_b, 10).await;
+    let orders = delivery_orders_of(&pool).await;
+    assert_eq!(
+        orders.partial.items[0].delivered_quantity, 5,
+        "子件 B 补齐后 → min(5, 10) = 5 套"
+    );
+}
+
+#[tokio::test]
+async fn delivered_sets_assembly_row_skips_zero_quantity_child() {
+    // 子件 Z 总量 0（已交 100 件，数学上无意义但能验证 NULLIF 分支）、子件 A 总量 20
+    // 已交 10（→ 5 套）⇒ 期望 5：总量 0 的子件不参与 min。
+    let pool = setup().await;
+    let today = now_naive().date();
+    let sdd = today + chrono::Duration::days(5);
+    let cust_id = insert_customer(&pool, "setzero_cust", "G").await;
+
+    let asm = insert_assembly(&pool, cust_id, "IN_PROCESS", Some(sdd), 10).await;
+    let child_zero = insert_child_part(&pool, cust_id, asm, 0).await;
+    let child_a = insert_child_part(&pool, cust_id, asm, 20).await;
+    insert_delivered_batch(&pool, child_zero, 100).await;
+    insert_delivered_batch(&pool, child_a, 10).await;
+
+    let orders = delivery_orders_of(&pool).await;
+    assert_eq!(
+        orders.partial.items[0].delivered_quantity, 5,
+        "总量 0 的子件经 NULLIF 变 NULL 被 MIN 忽略，其余子件仍给出 5 套"
+    );
+}
+
+#[tokio::test]
+async fn delivered_sets_assembly_row_is_zero_without_children() {
+    // 无子件的装配件：`fetch_delivered_sets` 以子件表为驱动表 ⇒ 不产生结果行，
+    // 调用方 `.unwrap_or(0)` 兜底 ⇒ delivered_quantity = 0，落 upcoming 桶。
+    let pool = setup().await;
+    let today = now_naive().date();
+    let sdd = today + chrono::Duration::days(5);
+    let cust_id = insert_customer(&pool, "setnokid_cust", "F").await;
+
+    insert_assembly(&pool, cust_id, "IN_PROCESS", Some(sdd), 7).await;
+
+    let orders = delivery_orders_of(&pool).await;
+    assert_eq!(
+        orders.upcoming.total, 1,
+        "无子件 ⇒ 无已交 ⇒ 落 upcoming 桶（与 count_overdue 计它的行为一致）"
+    );
+    assert_eq!(
+        orders.upcoming.items[0].delivered_quantity, 0,
+        "无子件兜 0 套"
+    );
+    assert_eq!(orders.partial.total, 0);
+}
+
+#[tokio::test]
+async fn delivered_sets_assembly_row_clamps_on_over_delivery() {
+    // 装配件 10 套；子件 A 总量 20 已交 100（超交）⇒ 未收口时 100*10/20 = 50 套，
+    // 收口后必须给 10（`LEAST(..., a.quantity)`）。
+    let pool = setup().await;
+    let today = now_naive().date();
+    let sdd = today + chrono::Duration::days(5);
+    let cust_id = insert_customer(&pool, "setover_cust", "E").await;
+
+    let asm = insert_assembly(&pool, cust_id, "IN_PROCESS", Some(sdd), 10).await;
+    let child_a = insert_child_part(&pool, cust_id, asm, 20).await;
+    insert_delivered_batch(&pool, child_a, 100).await;
+
+    let orders = delivery_orders_of(&pool).await;
+    assert_eq!(
+        orders.partial.items[0].delivered_quantity, 10,
+        "子件超交必须收口到总套数 10（UI 不得出现「50 / 10 套」）"
+    );
+}
+
+// ===========================================================================
+// `snapshot.system_delivery_orders` 三桶（2026-10-10：urgent/partial → upcoming/overdue/partial）
+// ===========================================================================
+//
+// 三桶全部是**工单级**：`t_part`（`assembly_id IS NULL`）+ `t_assembly` 各出一行，
+// 装配件行**替换**其子件行（子件只作为装配件已交量的计算中间量）。判据：
+//
+// | 桶 | 交期窗口 | 已交判据 | 上限 | 排序 |
+// |---|---|---|---|---|
+// | `upcoming` | `sdd >= today` | 一件没交过 | 30 | `sdd ASC NULLS LAST, id ASC` |
+// | `overdue` | `sdd < today` | 一件没交过 | 30 | 同上 |
+// | `partial` | **无窗口** | 交过一部分 | 30 | 同上 |
+//
+// 判据与窗口都在 SQL 里（`repo/delivery.rs` 的三个 `SQL_ORDERS_*`），不在 Rust 侧分桶。
+
+#[tokio::test]
+async fn system_delivery_orders_split_into_three_buckets_by_window_and_delivery() {
+    // 同一交期下造 3 条散件，靠「有没有已交批次」分 upcoming / partial；
+    // 再造一条过期未交的进 overdue。三桶互斥。
+    let pool = setup().await;
+    let today = now_naive().date();
+    let sdd = today + chrono::Duration::days(2);
+    let cust_id = insert_customer(&pool, "bucket_cust", "U").await;
+
+    // upcoming：交期在未来 + 一件没交过
+    let untouched =
+        insert_part_with_quantity(&pool, cust_id, "IN_PROCESS", Some(sdd), sdd, 10).await;
+    // partial：交期在未来 + 已交过一部分（DELIVERED 批次 quantity=4 < 总量 10）
+    let partial = insert_part_with_quantity(&pool, cust_id, "IN_PROCESS", Some(sdd), sdd, 10).await;
+    insert_delivered_batch(&pool, partial, 4).await;
+    // overdue：交期已过 + 一件没交过
+    let late = insert_part_with_quantity(
+        &pool,
+        cust_id,
+        "IN_PROCESS",
+        Some(today - chrono::Duration::days(1)),
+        sdd,
+        10,
+    )
+    .await;
+
+    let orders = delivery_orders_of(&pool).await;
+
+    assert_eq!(orders.upcoming.total, 1, "只 1 条「未来 + 未交」");
+    assert_eq!(orders.upcoming.items.len(), 1);
+    let up = &orders.upcoming.items[0];
+    assert_eq!(up.id, untouched.to_string());
+    assert_eq!(up.delivered_quantity, 0);
+    assert_eq!(up.row_type, "PART", "散件行的 row_type 必须是 PART");
+    assert_eq!(
+        up.customer_name.as_deref(),
         Some("bucket_cust"),
         "客户名应被批量填上（防 N+1 的可观测结果）"
     );
-    assert_eq!(orders.partial.len(), 1, "交过一部分的应落在 partial 桶");
-    assert_eq!(orders.partial[0].id, partial_part.to_string());
-    assert_eq!(orders.partial[0].delivered_quantity, 4);
+
+    assert_eq!(orders.overdue.total, 1, "只 1 条「过期 + 未交」");
+    assert_eq!(orders.overdue.items[0].id, late.to_string());
+
+    assert_eq!(orders.partial.total, 1, "只 1 条「已交一部分」");
+    let pa = &orders.partial.items[0];
+    assert_eq!(pa.id, partial.to_string());
+    assert_eq!(
+        pa.delivered_quantity, 4,
+        "散件行 delivered_quantity 是已交件数"
+    );
+    assert_eq!(pa.row_type, "PART");
+
+    // 三桶互斥：任一 id 不得同时出现在两桶
+    let ids_of = |b: &hsh_erp_rust::modules::dashboard::vo::DeliveryBucket| -> HashSet<String> {
+        b.items.iter().map(|o| o.id.clone()).collect()
+    };
+    let (up, over, pa) = (
+        ids_of(&orders.upcoming),
+        ids_of(&orders.overdue),
+        ids_of(&orders.partial),
+    );
+    assert!(up.is_disjoint(&over) && up.is_disjoint(&pa) && over.is_disjoint(&pa));
 }
 
 #[tokio::test]
 async fn system_delivery_orders_window_boundary() {
-    // 窗口 `[today, today + 7)`：`== today` 计入，`== today - 1` 不计入，
-    // `== today + 7` 也不计入。
+    // 三桶各自的窗口边界：`== today` 进 upcoming；`< today`（含 today-1）进 overdue；
+    // 两桶互斥。`partial` 无窗口 ⇒ `today + 7` 这类远期交期只要交过一部分就在 partial 里。
     let pool = setup().await;
     let today = now_naive().date();
     let cust_id = insert_customer(&pool, "window_cust", "I").await;
@@ -1818,63 +2363,230 @@ async fn system_delivery_orders_window_boundary() {
     )
     .await;
 
-    let mut tx = pool.begin().await.unwrap();
-    let snap = DashboardService::new()
-        .build_snapshot(&mut *tx)
-        .await
-        .expect("snapshot ok");
-    drop(tx);
+    let orders = delivery_orders_of(&pool).await;
+    let upcoming: HashSet<String> = orders.upcoming.items.iter().map(|o| o.id.clone()).collect();
+    let overdue: HashSet<String> = orders.overdue.items.iter().map(|o| o.id.clone()).collect();
 
-    let ids: HashSet<String> = snap
-        .system_delivery_orders
-        .urgent
+    assert_eq!(
+        upcoming.len(),
+        2,
+        "today 与 today+7 都属 upcoming 桶（面板不再有 7 天窗口上界）"
+    );
+    assert!(
+        upcoming.contains(&in_today.to_string()),
+        "system_delivery_date == today 应计入 upcoming"
+    );
+    assert!(
+        upcoming.contains(&day7.to_string()),
+        "upcoming 无上界：today+7 也计入"
+    );
+    assert_eq!(overdue.len(), 1, "只有 today-1 在逾期窗口");
+    assert!(
+        overdue.contains(&yesterday.to_string()),
+        "system_delivery_date == today-1 属 overdue 桶"
+    );
+    assert!(
+        !upcoming.contains(&yesterday.to_string()),
+        "两桶互斥：today-1 不得同时出现在 upcoming"
+    );
+    assert!(orders.partial.items.is_empty(), "无已交批次 → partial 为空");
+}
+
+#[tokio::test]
+async fn system_delivery_orders_partial_has_no_time_window() {
+    // 产品决议：「部分已交不应该限制时间范围，应该扫出全部的部分已交工单」。
+    // 本例钉住该桶**无时间上下界**：过期 / 今天 / 远期三种交期的已交工单都在里面，
+    // 且含 `system_delivery_date IS NULL` 的（排序 NULLS LAST，见 docs §8.3）。
+    let pool = setup().await;
+    let today = now_naive().date();
+    let cust_id = insert_customer(&pool, "nowindow_cust", "V").await;
+
+    let overdue_day = today - chrono::Duration::days(10);
+    let far = today + chrono::Duration::days(90);
+    let mut ids = Vec::new();
+    for sdd in [Some(overdue_day), Some(today), Some(far), None] {
+        let p =
+            insert_part_with_quantity(&pool, cust_id, "IN_PROCESS", sdd, sdd.unwrap_or(today), 10)
+                .await;
+        insert_delivered_batch(&pool, p, 3).await;
+        ids.push(p.to_string());
+    }
+
+    let orders = delivery_orders_of(&pool).await;
+    assert_eq!(
+        orders.partial.total, 4,
+        "partial 桶不设时间窗口：4 种交期（含 NULL）都应命中"
+    );
+    let got: HashSet<String> = orders.partial.items.iter().map(|o| o.id.clone()).collect();
+    for id in &ids {
+        assert!(got.contains(id), "交期 {id} 的已交工单必须在 partial 桶内");
+    }
+    // 「无窗口」的另一面：这些行不再被 upcoming / overdue 收走（EXISTS 与 NOT EXISTS 互斥）
+    assert!(orders.upcoming.items.is_empty());
+    assert!(orders.overdue.items.is_empty());
+
+    // 排序 `sdd ASC NULLS LAST`：NULL 交期排在最后
+    let null_row = orders
+        .partial
+        .items
         .iter()
-        .map(|o| o.id.clone())
-        .collect();
-    assert!(
-        ids.contains(&in_today.to_string()),
-        "system_delivery_date == today 应计入面板"
+        .find(|o| o.system_delivery_date.is_none())
+        .expect("NULL 交期的行应在 partial 桶内");
+    assert_eq!(
+        orders.partial.items.last().map(|o| o.id.as_str()),
+        Some(null_row.id.as_str()),
+        "system_delivery_date IS NULL 的行应排最后（NULLS LAST）"
     );
-    assert!(
-        !ids.contains(&yesterday.to_string()),
-        "system_delivery_date == today-1 属逾期窗口，不进面板"
-    );
-    assert!(!ids.contains(&day7.to_string()), "窗口右开：today+7 不计入");
 }
 
 #[tokio::test]
 async fn system_delivery_orders_caps_each_bucket() {
-    // 每桶独立截断到 DELIVERY_BUCKET_LIMIT。
+    // 三桶各 30 条上限，且 `total` 是**匹配总数**（不受截断影响）。
     let pool = setup().await;
     let today = now_naive().date();
-    let sdd = today + chrono::Duration::days(1);
+    let future = today + chrono::Duration::days(1);
+    let past = today - chrono::Duration::days(1);
     let cust_id = insert_customer(&pool, "cap_cust", "O").await;
 
     let n = DELIVERY_BUCKET_LIMIT + 5;
-    let mut first_id = String::new();
+    let mut first_upcoming_id = String::new();
+    let mut first_overdue_id = String::new();
+    let mut first_partial_id = String::new();
     for i in 0..n {
-        let id = insert_part(&pool, cust_id, "IN_PROCESS", Some(sdd), sdd).await;
+        // upcoming：无已交批次 + 未来交期
+        let up = insert_part(&pool, cust_id, "IN_PROCESS", Some(future), future).await;
+        // overdue：无已交批次 + 过期交期
+        let over = insert_part(&pool, cust_id, "IN_PROCESS", Some(past), future).await;
+        // partial：已交过一部分（交期随意，partial 无窗口）
+        let pa = insert_part(&pool, cust_id, "IN_PROCESS", Some(future), future).await;
+        insert_delivered_batch(&pool, pa, 1).await;
         if i == 0 {
-            first_id = id.to_string();
+            // 雪花 id 单调 ⇒ 同交期下 `id ASC` tiebreaker 让截断保留最早的三批
+            first_upcoming_id = up.to_string();
+            first_overdue_id = over.to_string();
+            first_partial_id = pa.to_string();
         }
     }
 
-    let mut tx = pool.begin().await.unwrap();
-    let snap = DashboardService::new()
-        .build_snapshot(&mut *tx)
-        .await
-        .expect("snapshot ok");
-    drop(tx);
+    let orders = delivery_orders_of(&pool).await;
 
-    let orders = snap.system_delivery_orders;
+    for (bucket, label, first_id) in [
+        (&orders.upcoming, "upcoming", &first_upcoming_id),
+        (&orders.overdue, "overdue", &first_overdue_id),
+        (&orders.partial, "partial", &first_partial_id),
+    ] {
+        assert_eq!(
+            bucket.items.len(),
+            DELIVERY_BUCKET_LIMIT,
+            "{label} 桶应被截断到 {DELIVERY_BUCKET_LIMIT}"
+        );
+        assert_eq!(
+            bucket.total, n as i64,
+            "{label}.total 是匹配总数，不受 items 截断影响"
+        );
+        assert_eq!(
+            bucket.items[0].id, *first_id,
+            "{label} 截断应按 `sdd ASC NULLS LAST, id ASC` 保留最早的一批"
+        );
+    }
+}
+
+#[tokio::test]
+async fn system_delivery_orders_bucket_total_is_full_match_count() {
+    // `LIMIT` 占位符守门用例：`COUNT(*) OVER ()` 在 LIMIT 之前求值，故 `total` 恒等于
+    // 真实匹配数。⚠️ 本文件三条主查询走运行时 `sqlx::query`、**不校验占位符个数** ——
+    // 若某条把 `LIMIT $3` / `LIMIT $2` 漏写掉，那条查询既不截断、`total` 也退化成
+    // 返回行数，本用例是唯一的防线（另两条 >30 桶的用例也会红，但本用例的断言最直接）。
+    let pool = setup().await;
+    let today = now_naive().date();
+    let sdd = today + chrono::Duration::days(3);
+    let cust_id = insert_customer(&pool, "total_cust", "B").await;
+
+    let n = DELIVERY_BUCKET_LIMIT + 7;
+    for _ in 0..n {
+        insert_part(&pool, cust_id, "IN_PROCESS", Some(sdd), sdd).await;
+    }
+
+    let orders = delivery_orders_of(&pool).await;
+    assert_eq!(orders.upcoming.items.len(), DELIVERY_BUCKET_LIMIT);
     assert_eq!(
-        orders.urgent.len(),
-        DELIVERY_BUCKET_LIMIT,
-        "urgent 桶应被截断到 {DELIVERY_BUCKET_LIMIT}"
+        orders.upcoming.total, n as i64,
+        "upcoming.total 必须是匹配总数（{}），不是返回行数（{DELIVERY_BUCKET_LIMIT}）",
+        n
     );
-    assert!(orders.partial.is_empty(), "无已交批次 → partial 为空");
-    // 截断取的是 SQL 排序后的前 N 条（id ASC 作为 tiebreaker，雪花 ID 单调）
-    assert_eq!(orders.urgent[0].id, first_id, "截断应保留最早的一批");
+    assert!(
+        orders.upcoming.total > orders.upcoming.items.len() as i64,
+        "total 必须大于 items.len() 才说明 LIMIT 真的生效了"
+    );
+}
+
+#[tokio::test]
+async fn system_delivery_orders_row_type_marks_assembly_rows() {
+    // 装配件行**替换**其子件行：同一条 SQL 结果里 part 行与 assembly 行并存，
+    // `row_type` 分别标 PART / ASSEMBLY，子件不单独出行。
+    //
+    // ⚠️ 桶归属由 SQL 的 `NOT EXISTS` / `EXISTS`（任一子件有没有已交批次）决定，
+    // **不是**由 `delivered_quantity` 是否为 0 决定 —— 两者在「装配件只能整套交付」
+    // 不变式下等价（推导见 docs/api/dashboard.md §4.4），但本例刻意造「子件 A 交满、
+    // 子件 B 没交」这种半套数据把两者分开：行落 `partial`（EXISTS 命中），
+    // `delivered_quantity` 却是 min 公式给出的 0 套。
+    let pool = setup().await;
+    let today = now_naive().date();
+    let sdd = today + chrono::Duration::days(4);
+    let cust_id = insert_customer(&pool, "rowtype_cust", "H").await;
+
+    let loose_part =
+        insert_part_with_quantity(&pool, cust_id, "IN_PROCESS", Some(sdd), sdd, 10).await;
+    // 未交过的装配件：两个子件都没交过 ⇒ EXISTS 不命中 ⇒ 留 upcoming 桶
+    let asm = insert_assembly(&pool, cust_id, "IN_PROCESS", Some(sdd), 10).await;
+    insert_child_part(&pool, cust_id, asm, 20).await;
+    insert_child_part(&pool, cust_id, asm, 10).await;
+    // 已交过一部分的装配件：子件 A 交满 20 件（20×10/20 = 10 套）、子件 B 一件没交 ⇒ min 0 套
+    let asm_partial = insert_assembly(&pool, cust_id, "IN_PROCESS", Some(sdd), 10).await;
+    let child_pa = insert_child_part(&pool, cust_id, asm_partial, 20).await;
+    insert_child_part(&pool, cust_id, asm_partial, 20).await;
+    insert_delivered_batch(&pool, child_pa, 20).await;
+
+    let orders = delivery_orders_of(&pool).await;
+    assert_eq!(
+        orders.upcoming.total, 2,
+        "散件 1 + 装配件 1；子件不单独出行"
+    );
+    let by_id = |id: i64| -> &hsh_erp_rust::modules::dashboard::vo::SystemDeliveryOrder {
+        orders
+            .upcoming
+            .items
+            .iter()
+            .find(|o| o.id == id.to_string())
+            .unwrap_or_else(|| panic!("upcoming 桶缺 {id}"))
+    };
+
+    let p = by_id(loose_part);
+    assert_eq!(p.row_type, "PART");
+    assert_eq!(p.quantity, 10, "散件行 quantity 是件数");
+    assert_eq!(p.delivered_quantity, 0, "散件无已交批次");
+
+    let a = by_id(asm);
+    assert_eq!(a.row_type, "ASSEMBLY", "装配件行必须标 ASSEMBLY");
+    assert_eq!(a.quantity, 10, "装配件行 quantity 是总套数");
+    assert_eq!(a.delivered_quantity, 0, "子件都没交过 → min 公式给 0 套");
+
+    assert_eq!(orders.partial.total, 1, "已交过一部分的装配件单独成行");
+    let a = &orders.partial.items[0];
+    assert_eq!(a.id, asm_partial.to_string());
+    assert_eq!(a.row_type, "ASSEMBLY");
+    assert_eq!(
+        a.delivered_quantity, 0,
+        "min(10, 0) = 0 套：桶归 EXISTS 判、`delivered_quantity` 归 min 公式，二者分开"
+    );
+    assert!(
+        !orders
+            .partial
+            .items
+            .iter()
+            .any(|o| o.id == child_pa.to_string()),
+        "子件不单独出行（装配件行替换它）"
+    );
 }
 
 // ===========================================================================

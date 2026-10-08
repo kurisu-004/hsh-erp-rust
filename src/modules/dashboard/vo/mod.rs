@@ -16,7 +16,8 @@ pub mod snapshot;
 pub mod upcoming;
 
 pub use delivery::{
-    DeliveryOrderDetail, DeliveryOrderDetailOut, SystemDeliveryOrder, SystemDeliveryOrders,
+    DeliveryBucket, DeliveryOrderDetail, DeliveryOrderDetailOut, SystemDeliveryOrder,
+    SystemDeliveryOrders,
 };
 pub use snapshot::{
     DashboardSnapshot, UpcomingDeliveryBucket, WorkerHeldBatch, WsEventMsg, WsHeartbeatMsg,

@@ -81,7 +81,8 @@ pub struct DashboardSnapshot {
     pub in_inspection_count: i64,
     /// 工人在手加工批次（替代原 in_process，字段已收窄，见 WorkerHeldBatch）
     pub in_process: Vec<WorkerHeldBatch>,
-    /// 最紧急工单 + 部分已交（2026-10-07 新增，从 com/union_list 域外聚合迁入本域）
+    /// 交期面板三桶 `upcoming` / `overdue` / `partial`（2026-10-10 拆三桶，全部工单级；
+    /// 从 com/union_list 域外聚合迁入本域）
     pub system_delivery_orders: super::delivery::SystemDeliveryOrders,
     pub ts: String,
 }
