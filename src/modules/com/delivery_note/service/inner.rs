@@ -228,6 +228,9 @@ pub(super) async fn get_with_parts(
             id: b.id,
             part_id: p.id,
             batch_no: b.batch_no,
+            // 加入本单的次序（bigint 单内计数 → i32 不会溢出：单张送货单的批次
+            // 数是人工扫码的量级）
+            delivery_seq: b.delivery_seq.map(|v| v as i32),
             batch_label,
             serial_no: p.serial_no.clone().unwrap_or_default(),
             drawing_no: p.drawing_no.clone(),

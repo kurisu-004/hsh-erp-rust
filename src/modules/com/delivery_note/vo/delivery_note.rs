@@ -63,6 +63,17 @@ pub struct DeliveryNoteLineItem {
     #[serde(serialize_with = "crate::shared::types::serialize_i64")]
     pub part_id: i64,
     pub batch_no: i32,
+    /// 2026-10-10 新增：**加入本送货单的先后次序**，本单内从 1 起递增；
+    /// `null` = 该批次未挂单（行本身不该出现，属脏值兜底）。
+    ///
+    /// `line_items[]` 的默认序即按本字段升序（`t_part_batch.delivery_seq`
+    /// `ASC NULLS LAST, id ASC`）。历史数据由 migration
+    /// `20261010000000_001_add_batch_delivery_seq` 按 `pb.id` 序回填，部署后与
+    /// 上线前的展示顺序逐行一致。
+    ///
+    /// 走普通 serde（同 `batch_no`）：它是**单内计数**不是雪花 id，不需要
+    /// `serialize_i64_opt`；也不 `skip_serializing_if`，保持字段恒定存在。
+    pub delivery_seq: Option<i32>,
     pub batch_label: String,
     pub serial_no: String,
     pub drawing_no: String,

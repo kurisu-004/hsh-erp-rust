@@ -91,6 +91,22 @@ pub struct TPartBatch {
     /// 2026-09-16 PR-3 替代 `next_process_id`（已删）。
     pub current_process_step_id: Option<i64>,
     pub delivery_note_id: Option<i64>,
+    /// 2026-10-10 新增（migration `20261010000000_001_add_batch_delivery_seq`）：
+    /// **加入当前送货单的次序**，本单内从 1 起递增。
+    ///
+    /// **NULL = 未挂单**（与 `delivery_note_id IS NULL` 同步：挂单写点赋值、
+    /// 摘单 / 单据软删写点置 NULL）。本列**只在「这一张送货单」的语境内有意义**：
+    /// 同一个批次先后挂过两张单，`delivery_seq` 是相对各自那张单重新计的，
+    /// 拿它跨单比较无意义。
+    ///
+    /// 为什么不用批次 id 当排序键：id 是**建批顺序**，只有拆批路径产生新 id
+    /// （反映扫码时刻），整批直接挂单的批次用的是建批时的 id ⇒「先扫 A 后扫 B、
+    /// 但 A 建得更早」会把 A 排前面。送货单详情的零件列表要的是扫码次序。
+    ///
+    /// 与本仓 `sort_order`（iam 菜单 / 外协公司等配置表的显示序）语义不同，
+    /// 不要混用：本列是挂单时自动递增的**业务事实**，`sort_order` 是人工维护的
+    /// **配置显示序**。
+    pub delivery_seq: Option<i64>,
     pub parent_batch_id: Option<i64>,
     /// 2026-10-01 新增（migration 005）：本批次**当前**是否处于返修中。
     ///

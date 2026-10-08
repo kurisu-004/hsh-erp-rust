@@ -307,6 +307,7 @@ mod tests {
             current_process_id: None,
             current_process_step_id: None,
             delivery_note_id: Some(1),
+            delivery_seq: None,
             parent_batch_id: None,
             is_repairing: false,
             version: 0,

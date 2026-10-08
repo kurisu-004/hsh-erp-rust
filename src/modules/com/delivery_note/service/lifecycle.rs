@@ -443,11 +443,14 @@ impl DeliveryNoteService {
             ));
         }
 
-        // 清批次 delivery_note_id
+        // 清批次 delivery_note_id（2026-10-10 新增：同条 UPDATE 清 delivery_seq，
+        // 维持「delivery_seq IS NULL ⟺ delivery_note_id IS NULL」—— 不清的话
+        // 这些批次日后重新挂单会带着已作废单据的旧序号，详情排序错位）
         let _ = sqlx::query!(
             r#"
             UPDATE t_part_batch
             SET delivery_note_id = NULL,
+                delivery_seq     = NULL,
                 version          = version + 1,
                 updated_at       = $2,
                 updated_by       = $3

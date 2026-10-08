@@ -79,7 +79,7 @@ impl PartBatchRepo {
             r#"
             SELECT id, part_id, batch_no, quantity, status, location,
                    current_holder_id, current_process_id, current_process_step_id,
-                   delivery_note_id, parent_batch_id,
+                   delivery_note_id, delivery_seq, parent_batch_id,
                    is_repairing,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
@@ -104,6 +104,16 @@ impl PartBatchRepo {
     ///
     /// 2026-09-16 PR-3 批次 step 化（migration 028）：删 `pb.next_process_id` /
     /// `pb.placed_at`，加 `pb.current_process_step_id`。
+    ///
+    /// ## 默认序 = 加入本单的次序（2026-10-10 新增 `pb.delivery_seq`）
+    ///
+    /// `ORDER BY pb.id ASC`。`delivery_seq` 由
+    /// 挂单写点（`PartBatchRepo::attach_to_note`）按 `MAX+1` 赋值，只在
+    /// 「这一张送货单」语境内有意义；历史数据由 migration
+    /// `20261010000000_001_add_batch_delivery_seq` 按 `pb.id` 序回填，故本单
+    /// 内 `delivery_seq` 是从 1 起的不重复连续序号、`NULLS LAST` 实际只兜住
+    /// 「挂单后 seq 被外部改坏」的脏值。末尾保留 `pb.id ASC` 作 tiebreak，
+    /// 保证同 seq 时结果集仍然确定。
     pub async fn list_with_part_by_delivery_note<'e, E: PgExecutor<'e>>(
         executor: E,
         note_id: i64,
@@ -121,6 +131,8 @@ impl PartBatchRepo {
                 pb.current_process_id AS "pb_current_process_id?",
                 pb.current_process_step_id AS "pb_current_process_step_id?",
                 pb.delivery_note_id AS "pb_delivery_note_id?",
+                -- 2026-10-10 新增：加入本单的次序，随批次一同返回
+                pb.delivery_seq  AS "pb_delivery_seq?",
                 pb.parent_batch_id AS "pb_parent_batch_id?",
                 -- 2026-10-01 新增（migration 005）：返修标记随批次一同返回
                 pb.is_repairing AS "pb_is_repairing!",
@@ -160,7 +172,7 @@ impl PartBatchRepo {
             WHERE pb.delivery_note_id = $1
               AND pb.deleted_at IS NULL
               AND p.deleted_at IS NULL
-            ORDER BY pb.id ASC
+            ORDER BY pb.delivery_seq ASC NULLS LAST, pb.id ASC
             "#,
             note_id,
         )
@@ -182,6 +194,7 @@ impl PartBatchRepo {
                         current_process_id: r.pb_current_process_id,
                         current_process_step_id: r.pb_current_process_step_id,
                         delivery_note_id: r.pb_delivery_note_id,
+                        delivery_seq: r.pb_delivery_seq,
                         parent_batch_id: r.pb_parent_batch_id,
                         is_repairing: r.pb_is_repairing,
                         version: r.pb_version,
@@ -225,9 +238,11 @@ impl PartBatchRepo {
 
     /// 多送货单的「批次 + 工单展示字段」批查（PR3 batch-detail 专用）。
     ///
-    /// 与 `list_with_part_by_delivery_note` 同投影；改用 `WHERE pb.delivery_note_id = ANY($1)`，
-    /// 由 caller 按 `b.delivery_note_id` 分桶后组装 N 个 `DeliveryNoteDetailOut`。
-    /// 空输入短路（避免 `ANY($1::bigint[])` 抛 sqlx 类型推断错）。
+    /// 与 `list_with_part_by_delivery_note` 同投影、同默认序；改用
+    /// `WHERE pb.delivery_note_id = ANY($1)`，由 caller 按 `b.delivery_note_id`
+    /// 分桶后组装 N 个 `DeliveryNoteDetailOut`。空输入短路（避免
+    /// `ANY($1::bigint[])` 抛 sqlx 类型推断错）。分桶保持 SQL 返回序，故桶内
+    /// 仍是「加入本单的次序」。
     ///
     /// 2026-09-16 PR-2 瘦身（migration 027）：JOIN 投影同步删 `pb.has_been_repaired`
     /// + `p.actual_delivery_date` / `p.location` / `p.current_holder_id` /
@@ -256,6 +271,8 @@ impl PartBatchRepo {
                 pb.current_process_id AS "pb_current_process_id?",
                 pb.current_process_step_id AS "pb_current_process_step_id?",
                 pb.delivery_note_id AS "pb_delivery_note_id?",
+                -- 2026-10-10 新增：加入本单的次序，随批次一同返回
+                pb.delivery_seq  AS "pb_delivery_seq?",
                 pb.parent_batch_id AS "pb_parent_batch_id?",
                 -- 2026-10-01 新增（migration 005）：返修标记随批次一同返回
                 pb.is_repairing AS "pb_is_repairing!",
@@ -295,7 +312,7 @@ impl PartBatchRepo {
             WHERE pb.delivery_note_id = ANY($1)
               AND pb.deleted_at IS NULL
               AND p.deleted_at IS NULL
-            ORDER BY pb.id ASC
+            ORDER BY pb.delivery_seq ASC NULLS LAST, pb.id ASC
             "#,
             note_ids,
         )
@@ -317,6 +334,7 @@ impl PartBatchRepo {
                         current_process_id: r.pb_current_process_id,
                         current_process_step_id: r.pb_current_process_step_id,
                         delivery_note_id: r.pb_delivery_note_id,
+                        delivery_seq: r.pb_delivery_seq,
                         parent_batch_id: r.pb_parent_batch_id,
                         is_repairing: r.pb_is_repairing,
                         version: r.pb_version,
@@ -375,7 +393,7 @@ impl PartBatchRepo {
             r#"
             SELECT id, part_id, batch_no, quantity, status, location,
                    current_holder_id, current_process_id, current_process_step_id,
-                   delivery_note_id, parent_batch_id,
+                   delivery_note_id, delivery_seq, parent_batch_id,
                    is_repairing,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
@@ -466,8 +484,22 @@ impl PartBatchRepo {
             .await?;
             // 2) delivery_note_id → 只挂单，不动 version（理由见上方 doc）
             if let Some(note_id) = delivery_note_id {
+                // 2026-10-10 新增 delivery_seq：挂单时赋「加入本单的次序」。
+                // `MAX+1` 的并发安全性依据：同一张单的并发扫码被 `POST /scan`
+                // 的 Step 4 `note_version` OCC（草稿刚建出时是 Step 8 的
+                // note version++ OCC）串行化 —— 败者整事务回滚，故同一单上不会有
+                // 两条事务同时读到同一个 MAX。
+                //
+                // 本分支当前的实际生产调用方是 `delivery_note::pickup`，它以
+                // **相同的** `delivery_note_id` 调用 ⇒ `IS DISTINCT FROM` 判否、
+                // 整条 UPDATE 命中 0 行、delivery_seq 也不会被重算。赋值语句是
+                // 为「将来出现真变更」准备的，届时 seq 语义与
+                // `attach_to_note` 完全一致。
                 sqlx::query(
-                    "UPDATE t_part_batch SET delivery_note_id = $2 \
+                    "UPDATE t_part_batch SET delivery_note_id = $2, \
+                        delivery_seq = (SELECT COALESCE(MAX(delivery_seq), 0) + 1 \
+                                        FROM t_part_batch \
+                                        WHERE delivery_note_id = $2::bigint) \
                      WHERE id = $1 AND deleted_at IS NULL \
                        AND delivery_note_id IS DISTINCT FROM $2::bigint",
                 )
@@ -483,8 +515,14 @@ impl PartBatchRepo {
         // 「一次调用同时给两列赋值」的既有调用点签名。
         let mut affected = 0u64;
         if let Some(note_id) = delivery_note_id {
+            // 2026-10-10 新增 delivery_seq：与 `attach_to_note` 同款 `MAX+1`
+            // 赋值（本分支是它的等价写点，唯一生产调用方 `delivery_note::pickup`
+            // 与它落在同一批 OCC 串行化下）。
             let r = sqlx::query(
-                "UPDATE t_part_batch SET delivery_note_id = $2 \
+                "UPDATE t_part_batch SET delivery_note_id = $2, \
+                    delivery_seq = (SELECT COALESCE(MAX(delivery_seq), 0) + 1 \
+                                    FROM t_part_batch \
+                                    WHERE delivery_note_id = $2::bigint) \
                  WHERE id = $1 AND version = $3 AND deleted_at IS NULL \
                    AND delivery_note_id IS DISTINCT FROM $2::bigint",
             )
@@ -501,6 +539,18 @@ impl PartBatchRepo {
     /// version-checked 「仅写 delivery_note_id」更新（attach_to_note 用）。
     /// `attach_to_note`：把一个批次挂到指定送货单（不改 status / 其它列）；
     /// 0 行 → version 冲突由 service 转 `VERSION_CONFLICT` 409。
+    ///
+    /// 2026-10-10 新增：同一次 UPDATE 写 `delivery_seq`，取值
+    /// `COALESCE(MAX(delivery_seq), 0) + 1`（限本单）= 「加入本单的次序」，
+    /// 送货单详情的零件列表按它排序（见
+    /// `list_with_part_by_delivery_note` 的 ORDER BY）。摘单 / 单据软删的写点
+    /// 置 NULL，维持 `delivery_seq IS NULL ⟺ delivery_note_id IS NULL`。
+    ///
+    /// `MAX+1` 天然产出 1,2,3…：同一事务内前几次 attach 的 UPDATE 对后续
+    /// `MAX()` 可见（READ COMMITTED 读己所写），`POST /scan` 的 Step 7 就是
+    /// 在一个事务里循环调用本函数。并发安全依赖 Step 4 的 `note_version` OCC
+    /// —— 同一张单上的并发扫码被串行化，败者整事务回滚，故同一单上不会有两条
+    /// 事务同时读到同一个 MAX。
     pub async fn attach_to_note<'e, E: PgExecutor<'e>>(
         executor: E,
         batch_id: i64,
@@ -513,6 +563,9 @@ impl PartBatchRepo {
             r#"
             UPDATE t_part_batch
             SET delivery_note_id = $3,
+                delivery_seq     = (SELECT COALESCE(MAX(delivery_seq), 0) + 1
+                                    FROM t_part_batch
+                                    WHERE delivery_note_id = $3::bigint),
                 version          = version + 1,
                 updated_at       = $4,
                 updated_by       = $5
@@ -537,7 +590,8 @@ impl PartBatchRepo {
     /// 1. 同 part_id 下 max(batch_no) + 1（与 uq_t_part_batch_part_no 对齐）
     /// 2. `INSERT ... SELECT FROM t_part_batch WHERE id = source_id`：
     ///    - 继承源 location / current_holder_id / current_process_step_id
-    ///    - **不**继承 delivery_note_id（拆出批次独立流转）
+    ///    - **不**继承 delivery_note_id / delivery_seq（拆出批次独立流转；
+    ///      新批次的 `delivery_seq` 由随后的 `attach_to_note` 按挂单次序赋值）
     ///    - 写 parent_batch_id = source_batch_id
     ///    - quantity = caller 传入的 qty
     ///    - status = caller 传入的新批次 status（通常等于源 status）
@@ -757,7 +811,7 @@ impl PartBatchRepo {
             r#"
             SELECT id, part_id, batch_no, quantity, status, location,
                    current_holder_id, current_process_id, current_process_step_id,
-                   delivery_note_id, parent_batch_id,
+                   delivery_note_id, delivery_seq, parent_batch_id,
                    is_repairing,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
@@ -792,7 +846,7 @@ impl PartBatchRepo {
             SELECT
                 pb.id, pb.part_id, pb.batch_no, pb.quantity, pb.status, pb.location,
                 pb.current_holder_id, pb.current_process_id, pb.current_process_step_id,
-                pb.delivery_note_id, pb.parent_batch_id,
+                pb.delivery_note_id, pb.delivery_seq, pb.parent_batch_id,
                 -- 2026-10-01 新增（migration 005）
                 pb.is_repairing,
                 pb.version, pb.created_at, pb.created_by, pb.updated_at, pb.updated_by, pb.deleted_at,
@@ -845,6 +899,7 @@ impl PartBatchRepo {
                 current_process_id: r.try_get("current_process_id")?,
                 current_process_step_id: r.try_get("current_process_step_id")?,
                 delivery_note_id: r.try_get("delivery_note_id")?,
+                delivery_seq: r.try_get("delivery_seq")?,
                 parent_batch_id: r.try_get("parent_batch_id")?,
                 is_repairing: r.try_get("is_repairing")?,
                 version: r.try_get("version")?,
@@ -974,7 +1029,7 @@ impl PartBatchRepo {
             r#"
             SELECT id, part_id, batch_no, quantity, status, location,
                    current_holder_id, current_process_id, current_process_step_id,
-                   delivery_note_id, parent_batch_id,
+                   delivery_note_id, delivery_seq, parent_batch_id,
                    is_repairing,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch

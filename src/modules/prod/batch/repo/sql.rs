@@ -77,7 +77,7 @@ impl PartBatchRepo {
                     r#"
                 SELECT id, part_id, batch_no, quantity, status, location,
                        current_holder_id, current_process_id, current_process_step_id,
-                       delivery_note_id, parent_batch_id,
+                       delivery_note_id, delivery_seq, parent_batch_id,
                        is_repairing,
                        version, created_at, created_by, updated_at, updated_by,
                        deleted_at
@@ -109,7 +109,7 @@ impl PartBatchRepo {
                             r#"
                         SELECT id, part_id, batch_no, quantity, status, location,
                                current_holder_id, current_process_id, current_process_step_id,
-                               delivery_note_id, parent_batch_id,
+                               delivery_note_id, delivery_seq, parent_batch_id,
                                is_repairing,
                                version, created_at, created_by, updated_at, updated_by,
                                deleted_at
@@ -152,7 +152,7 @@ impl PartBatchRepo {
                     r#"
                 SELECT id, part_id, batch_no, quantity, status, location,
                        current_holder_id, current_process_id, current_process_step_id,
-                       delivery_note_id, parent_batch_id,
+                       delivery_note_id, delivery_seq, parent_batch_id,
                        is_repairing,
                        version, created_at, created_by, updated_at, updated_by,
                        deleted_at
@@ -187,7 +187,7 @@ impl PartBatchRepo {
                             r#"
                         SELECT id, part_id, batch_no, quantity, status, location,
                                current_holder_id, current_process_id, current_process_step_id,
-                               delivery_note_id, parent_batch_id,
+                               delivery_note_id, delivery_seq, parent_batch_id,
                                is_repairing,
                                version, created_at, created_by, updated_at, updated_by,
                                deleted_at
@@ -229,7 +229,7 @@ impl PartBatchRepo {
             r#"
             SELECT id, part_id, batch_no, quantity, status, location,
                    current_holder_id, current_process_id, current_process_step_id,
-                   delivery_note_id, parent_batch_id,
+                   delivery_note_id, delivery_seq, parent_batch_id,
                    is_repairing,
                    version, created_at, created_by, updated_at, updated_by,
                    deleted_at
@@ -277,7 +277,7 @@ impl PartBatchRepo {
             r#"
             SELECT id, part_id, batch_no, quantity, status, location,
                    current_holder_id, current_process_id, current_process_step_id,
-                   delivery_note_id, parent_batch_id,
+                   delivery_note_id, delivery_seq, parent_batch_id,
                    is_repairing,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
@@ -487,7 +487,7 @@ impl PartBatchRepo {
             r#"
             SELECT id, part_id, batch_no, quantity, status, location,
                    current_holder_id, current_process_id, current_process_step_id,
-                   delivery_note_id, parent_batch_id,
+                   delivery_note_id, delivery_seq, parent_batch_id,
                    is_repairing,
                    version, created_at, created_by, updated_at, updated_by,
                    deleted_at
@@ -635,7 +635,7 @@ impl PartBatchRepo {
                     r#"
                 SELECT id, part_id, batch_no, quantity, status, location,
                        current_holder_id, current_process_id, current_process_step_id,
-                       delivery_note_id, parent_batch_id,
+                       delivery_note_id, delivery_seq, parent_batch_id,
                        is_repairing,
                        version, created_at, created_by, updated_at, updated_by,
                        deleted_at
@@ -673,7 +673,7 @@ impl PartBatchRepo {
                             r#"
                         SELECT id, part_id, batch_no, quantity, status, location,
                                current_holder_id, current_process_id, current_process_step_id,
-                               delivery_note_id, parent_batch_id,
+                               delivery_note_id, delivery_seq, parent_batch_id,
                                is_repairing,
                                version, created_at, created_by, updated_at, updated_by,
                                deleted_at

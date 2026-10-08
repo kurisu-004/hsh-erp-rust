@@ -328,7 +328,7 @@ impl DeliveryScanRepo {
             r#"
             SELECT b.id, b.part_id, b.batch_no, b.quantity, b.status, b.location,
                    b.current_holder_id, b.current_process_id, b.current_process_step_id,
-                   b.delivery_note_id, b.parent_batch_id,
+                   b.delivery_note_id, b.delivery_seq, b.parent_batch_id,
                    b.is_repairing,
                    b.version, b.created_at, b.created_by, b.updated_at, b.updated_by,
                    b.deleted_at

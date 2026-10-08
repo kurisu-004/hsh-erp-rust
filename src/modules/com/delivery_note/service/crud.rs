@@ -242,6 +242,9 @@ impl DeliveryNoteService {
                     id: b.id,
                     part_id: p.id,
                     batch_no: b.batch_no,
+                    // 加入本单的次序（口径同 `inner.rs::get_with_parts`；批量详情
+                    // 逐单分桶保持 SQL 返回序，故桶内也是这个次序）
+                    delivery_seq: b.delivery_seq.map(|v| v as i32),
                     batch_label,
                     serial_no: p.serial_no.clone().unwrap_or_default(),
                     drawing_no: p.drawing_no.clone(),
@@ -382,11 +385,15 @@ impl DeliveryNoteService {
 
         let now = now_naive();
         // 清空确实属于本单的 batch.delivery_note_id（version 校验 + 仅限本单）
+        // 2026-10-10 新增：同一条 UPDATE 清 delivery_seq，维持
+        // 「delivery_seq IS NULL ⟺ delivery_note_id IS NULL」。不清的话这个批次
+        // 日后挂到另一张单上会带着上一张单的旧序号，详情排序直接错位。
         for bid in batch_ids {
             let _ = sqlx::query!(
                 r#"
                 UPDATE t_part_batch
                 SET delivery_note_id = NULL,
+                    delivery_seq     = NULL,
                     version          = version + 1,
                     updated_at       = $2,
                     updated_by       = $3
