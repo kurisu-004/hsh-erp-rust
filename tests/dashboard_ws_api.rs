@@ -1029,7 +1029,13 @@ async fn ws_e2e_reauth_failure_sends_4001_close() {
 ///   漂移）⇒ 短 TTL 的 access token 要到 `ttl + 30s` 之后才被判 `TOKEN_EXPIRED`。
 /// - re-auth 周期 = `ws_heartbeat_interval_seconds`（测试配置 1s）×
 ///   `ws_reauth_every_n_heartbeats`（测试配置 2）= 2s；判过期后再等最多一个周期即踢连接。
-/// 故本用例实际耗时 ~34s（nextest 的 `slow-timeout` 是 60s 告警 / 120s 杀，留有余量）。
+/// 故本用例实际耗时 ~40s（nextest 的 `slow-timeout` 是 60s 告警 / 120s 杀，deadline 余量
+/// 见下方 `WAIT_MARGIN_SECONDS`）。
+///
+/// ⚠️ **它是本仓持有 DB 连接最久的用例**（~40s，同 binary 内其它 WS e2e 各约 2s）：
+/// 一个 pool 连接 + 一个 axum server 被一起攥着，因此**若 `test-support/src/pool.rs`
+/// 里那条 admin 连接 EOF flake 再现，先来这里看**——它复用完全相同的 `spawn_ws_server`
+/// 路径，没有引入任何新的失败形态，只是把既有的暴露时长抬高了一个数量级。
 #[tokio::test]
 async fn ws_e2e_access_token_expiry_sends_4001_with_access_token_expired() {
     /// 短 TTL：握手时有效、几秒后过期。取值只需「远小于 leeway（30s）」即可让用例在
@@ -1039,6 +1045,15 @@ async fn ws_e2e_access_token_expiry_sends_4001_with_access_token_expired() {
     /// import：它是「被测行为的输入」，写死让用例对 leeway 变化敏感（leeway 调大只会
     /// 让本用例等更久，不会误判；调小则等更短）。
     const JWT_EXP_LEEWAY_SECONDS: u64 = 30;
+    /// `wait` deadline 相对「理论检出点」的余量。
+    ///
+    /// 2026-10-09 量化依据：理论检出点 = ttl 2s + leeway 30s + 至多一个 re-auth 周期 2s
+    /// ≈ 34s，但**实测** 3 次为 39.83 / 41.28 / 39.50s ⇒ 心跳 tick 实际累计漂移
+    /// **5.5–7.3s**（34 个 tick 上 `MissedTickBehavior::Delay` 每遇一次 stall 就整段
+    /// 推迟，nextest 15 进程并行 + 每用例各建 fresh DB 的负载下不算异常）。12s 余量在最
+    /// 坏观测值之上仍有 ~4.7s 缓冲，且 deadline（46s，自握手起算）仍低于
+    /// `.config/nextest.toml` 的 `slow-timeout` 60s 告警线（terminate-after 120s 更远）。
+    const WAIT_MARGIN_SECONDS: u64 = 12;
 
     let (base, state) = spawn_ws_server().await;
     let heartbeat = state.config.ws_heartbeat_interval_seconds;
@@ -1059,7 +1074,10 @@ async fn ws_e2e_access_token_expiry_sends_4001_with_access_token_expired() {
         .expect("ws frame err");
 
     let wait = Duration::from_secs(
-        ACCESS_TOKEN_TTL_SECONDS as u64 + JWT_EXP_LEEWAY_SECONDS + heartbeat * reauth_every + 8,
+        ACCESS_TOKEN_TTL_SECONDS as u64
+            + JWT_EXP_LEEWAY_SECONDS
+            + heartbeat * reauth_every
+            + WAIT_MARGIN_SECONDS,
     );
     let reason = wait_for_close(&mut ws, 4001, wait)
         .await

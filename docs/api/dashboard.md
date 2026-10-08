@@ -158,7 +158,9 @@
 ### 7.1 关闭码表（前后端联合契约）
 
 **关闭码只表达「这条连接必须终止」，处置方式由 reason 文案区分。** 前端按 `(code, reason)`
-二元组分流，不要只看 code。发出点列给出的是 `src/modules/dashboard/handler.rs` 内的分支名。
+二元组分流，不要只看 code。「发出点」列给出**触发该关闭的位置**：由服务端发出的 7 行标的是
+`src/modules/dashboard/handler.rs` 内的具体分支 / 时机，`1000` 与 `1006` 两行没有服务端
+发出点（分别由前端主动 `close()` 与网络层裸断产生）。
 
 | code | reason | 发出点 | 含义 | 前端应做什么 |
 |---|---|---|---|---|
@@ -176,14 +178,20 @@
 HTTP 流量，access token（`JWT_ACCESS_TOKEN_EXPIRE_SECONDS`，缺省 900s）自然过期是**常规
 现象**，与「会话被吊销」完全不同。二者共用一个 reason 时，前端只能一律清掉**仍然有效**的
 refresh token 并跳登录页 ⇒ 空闲用户被踢下线。决策点收在纯函数 `reauth_close_code`
-（`src/modules/dashboard/handler.rs`），lib 单测
-`reauth_token_expired_maps_to_4001_with_distinct_reason` /
-`reauth_revoked_session_maps_to_4001_auth_expired` /
-`reauth_infra_failure_maps_to_1011_not_4001` 钉死；端到端由集成用例
-`ws_e2e_access_token_expiry_sends_4001_with_access_token_expired`（access JWT 过期）、
-`ws_e2e_reauth_failure_sends_4001_close`（session 被吊销）、
-`ws_e2e_lagged_client_gets_4003_close`、`ws_e2e_pong_timeout_closes_dead_peer`、
-`ws_e2e_server_shutdown_sends_1012` 覆盖。
+（`src/modules/dashboard/handler.rs`）。
+
+**上表 9 行的测试覆盖并不齐整**（`tests/dashboard_ws_api.rs` 的真实 e2e 清单，逐行如实登记）：
+
+| 覆盖形态 | 涉及的行 |
+|---|---|
+| 端到端（WS 集成用例） | `1011 pong timeout`（`ws_e2e_pong_timeout_closes_dead_peer`）、`1012 server restart`（`ws_e2e_server_shutdown_sends_1012`）、`4001 auth expired`（`ws_e2e_reauth_failure_sends_4001_close`）、`4001 access token expired`（`ws_e2e_access_token_expiry_sends_4001_with_access_token_expired`）、`4003 lagged`（`ws_e2e_lagged_client_gets_4003_close`） |
+| 仅 lib 单测（`reauth_close_code` 纯函数，无 IO） | `1011 re-auth unavailable`：`reauth_infra_failure_maps_to_1011_not_4001` + `reauth_unknown_code_defaults_to_1011`；两条 `4001` 另有 `reauth_token_expired_maps_to_4001_with_distinct_reason` / `reauth_revoked_session_maps_to_4001_auth_expired` 钉死 reason 串 |
+| 无自动化覆盖 | `1000`（由前端自己发起，与后端无关）、`1006`（网络层裸断，无法稳定构造）、`1011 snapshot build failed`（需制造 DB 故障）、`1011 re-auth unavailable` 的**端到端**（需自定义 `SessionStore` 才能造 Redis 故障） |
+
+「无自动化覆盖」里的后两项——`1011 snapshot build failed` 与 `1011 re-auth unavailable` 的
+端到端形态——是**已知缺口，不追求补齐**：造 DB 故障与自定义 `SessionStore` 的代价远大于收益，
+且这两条的前端处置（退避重连、不登出）与已在 e2e 里验过的 `1011 pong timeout` 同形，
+前端逻辑不会因此漏分支。改上表任一行时同步核对这张覆盖表。
 
 **三个必须知道的边界**：
 
@@ -193,10 +201,10 @@ refresh token 并跳登录页 ⇒ 空闲用户被踢下线。决策点收在纯�
 - **re-auth 周期** = `WS_HEARTBEAT_INTERVAL_SECONDS` × `WS_REAUTH_EVERY_N_HEARTBEATS`
   （缺省 30s × 10 ≈ 5min），所以上表里 4001 类关闭**最晚滞后一个周期**才到达。re-auth
   调用套 5s 超时：Redis 卡住只跳过本轮、不判死（此时问题在服务端，不在用户会话）。
-- **写侧已失败的路径不发 Close 帧**（初始快照写失败 / 心跳写失败 / Ping 写失败 / 广播写
-  失败）。此时 socket 已不可用，`send(Close)` 必然再失败一次，只会多一条噪音日志；前端
-  侧表现为连接直接结束（等效 `1006`）。因此前端**不能**假设「服务端要断就一定给 Close
-  帧」，重连逻辑必须能兜住「无理由断流」。
+- **写侧已失败的路径不发 Close 帧**（共 5 条：初始快照写失败 / 回 Pong 写失败 / 广播事件写
+  失败 / 心跳写失败 / Ping 写失败）。此时 socket 已不可用，`send(Close)` 必然再失败一次，
+  只会多一条噪音日志；前端侧表现为连接直接结束（等效 `1006`）。因此前端**不能**假设
+  「服务端要断就一定给 Close 帧」，重连逻辑必须能兜住「无理由断流」。
 
 ## 8. 表依赖与前端配套
 
@@ -228,7 +236,7 @@ dashboard 是**只读跨域聚合域**——这是本仓既定 pattern（`statis
 4. **窗口过滤、`delivered_quantity == 0` 判定、两桶 30 条截断全在服务端**（前端不再自己过滤）。
 5. **逾期数来源变更**：原为调 `GET /statistics/overview` 取 1 个数字（后端跑 9 条 SQL、返 16 标量 + 2 数组 + 2 嵌套结构，且口径是 `planned_delivery_date`，与同页右栏面板的 `system_delivery_date` 互相矛盾）→ 现直接读 `snapshot.overdue_count`。
 6. **「在制」标签改名「在加工」**：`in_process` 的 SQL 硬约束是 `location='WORKER'`，语义是「已从货架/品检区出池、压在工人手上」，叫「在制」是误导。
-7. **WS 关闭处理按 `(code, reason)` 二元组分流**（2026-10-09，与本节 §7.1 同批）：`4001` 按 reason 拆两段——`auth expired` ⇒ 终止会话并跳登录页；`access token expired` ⇒ 先 refresh 再重连。判别依据只有 reason 串本身，**不要**改写/规范化它（大小写、前后空格都算契约）。
+7. **WS 关闭处理按 `(code, reason)` 二元组分流**（2026-10-09，与 §7.1 同批）：`4001` 按 reason 拆两段——`auth expired` ⇒ 终止会话并跳登录页；`access token expired` ⇒ 先 refresh 再重连。判别依据只有 reason 串本身，**不要**改写/规范化它（大小写、前后空格都算契约）。
 
 ### 8.3 已知偏差登记
 
