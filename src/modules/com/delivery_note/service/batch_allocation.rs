@@ -55,8 +55,9 @@ const DP_MAX_TARGET: i32 = 100_000;
 /// 入参 `eligible` 必须是「**可入单**的批次行」：`status == "READY_TO_SHIP"` 且
 /// `delivery_note_id IS NULL`（未占用）的活跃批次。函数**不做**这两个闸门。口径由
 /// `DeliveryScanRepo::list_entryable_batches_by_part_ids`（`repo/scan_tree.rs`）的 SQL
-/// 保证 —— 那是「可入单」的唯一定义；`POST /scan` 的分类循环只按同一口径把非 READY
-/// 批次收进诊断明细（失败时附进 21405 的 message），不参与本函数的候选筛选。
+/// 保证 —— 那是「可入单」的唯一定义；`POST /scan` 的分类循环只按同一口径把非 READY 批次与
+/// 被别的送货单占用的批次都收进诊断明细（分配失败时附进 21406 / 21405 的 message），
+/// 两者都不参与本函数的候选筛选。
 ///
 /// 返回 `Vec<(batch_id, quantity)>`。
 ///
