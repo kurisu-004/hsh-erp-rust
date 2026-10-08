@@ -129,7 +129,7 @@ pub async fn pick_least_loaded(
 /// - 其余（`Clerk` / `Inspector` / `CncProgrammer` …）→ `None`
 ///
 /// ## ⚠️ 第三条（`Clerk` / `Inspector` 不受收窄）是刻意与
-/// `modules::part::service::phase1::work_type::pickable_shelf_scope` 分歧的
+/// `prod::scan::listing::service::pickable_shelf_scope` 分歧的
 ///
 /// `pickable_shelf_scope`（工人取件列表的读侧筛选）只有两条分支：
 /// wildcard/Manager → 不限，其余 → `Some(shelf_ids)`。本函数多出一条「非货架账号

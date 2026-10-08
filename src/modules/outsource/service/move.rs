@@ -843,7 +843,7 @@ async fn write_send(
         // **写外协工序本身**（不是置 NULL）：外协加工的就是这道工序，rollup 派生
         // `t_part.next_process_id` 需要它；且 `status='OUTSOURCE'` +
         // `location='OUTSOURCE_COMPANY'` 使它不可能被任何工序池查询命中（4 条池 SQL 与
-        // `list_pickable_by_work_type` 都硬限定 `IN_PROCESS` + `PRODUCTION_SHELF`）——
+        // 报工台的 pickable 列表 SQL 都硬限定 `IN_PROCESS` + `PRODUCTION_SHELF`）——
         // 登记见 `shared::batch::model::TPartBatch::current_process_id` 的「写入不变式
         // 第 4 行的唯一例外」
         Some(process_id),

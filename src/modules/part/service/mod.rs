@@ -17,7 +17,7 @@
 //!   `events.rs` 迁出；含分档决策纯函数 `resolve_match_tier`）
 //! - `phase1/lifecycle_helpers.rs`：批次列表（list_batches）
 //! - `phase1/work_type.rs`：工种维度只读端点（list_by_work_type /
-//!   list_pickable_by_work_type / list_by_worker）
+//!   list_by_work_type）
 //! - `rollup.rs`：rollup 工具（sync_from_batch_change）
 //! - `list_enrichment.rs`：list_parts 派生层「位置 / 持有人」跨三表解析
 //!   helper（2026-09-22 review 第 2 轮从 crud.rs 抽出，原 1054 行超限）

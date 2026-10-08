@@ -200,7 +200,7 @@ pub async fn validate_shelf_zone(
 /// 2. 与本次改动**前**的行为一致（旧代码写 `Some(step_id)`，rollup 再翻成
 ///    process_id），不写才是行为变更；
 /// 3. `status='OUTSOURCE'` + `location='OUTSOURCE_COMPANY'` 使其**不可能**被任何
-///    工序池查询命中（4 条池 SQL 与 `list_pickable_by_work_type` 均硬限定
+///    工序池查询命中（4 条池 SQL 与报工台的 pickable 列表 SQL 均硬限定
 ///    `status='IN_PROCESS'` 叠加 `location='PRODUCTION_SHELF'`）。
 ///
 /// 初始批次 / 子批次仍为严格 NULL（见 `prod/batch/repo/queries.rs::create_initial_batch`

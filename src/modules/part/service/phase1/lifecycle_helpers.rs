@@ -61,7 +61,7 @@ impl PartService {
             //     `next_process_name` **恒为 null**。
             //
             // 读取方分工（勿越界）：`current_process_id` 的读取方严格限定为 5 条
-            // 工序池 SQL + `list_pickable_by_work_type` + rollup 派生；
+            // 工序池 SQL + 报工台的 pickable 列表 SQL + rollup 派生；
             // **展示类列表一律走 step 派生**。该清单目前登记了 4 个读点（3 条走
             // step 派生 + 1 个有意例外），**第 4 个例外见
             // `prod/batch/model.rs` 模块 doc 的读取方分工清单**。

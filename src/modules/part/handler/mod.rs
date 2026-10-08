@@ -54,9 +54,8 @@ pub use crud::{
 // 2026-10-02 批次级端点迁出：deliver / complete / start-repair / place-on-shelf /
 // recall-to-pending / release-from-programming / outsource 三端点 / complete-repair /
 // repair-dispatch / split-batch / cancel-batch / pick-up（见 prod::batch::handler::lifecycle）。
-pub use lifecycle::{
-    cancel, force_complete, list_by_work_type, list_by_worker, list_pickable_by_work_type,
-};
+// 2026-10-10 报工台端点迁出：pickable-by-work-type / by-worker（见 prod::scan::handler）。
+pub use lifecycle::{cancel, force_complete, list_by_work_type};
 
 // ----- batch.rs -----
 pub use batch::{batch_create_parts, batch_with_pdfs, confirm_part_file};

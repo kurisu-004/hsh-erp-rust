@@ -111,7 +111,14 @@ impl PartDetailOut {
     }
 }
 
-/// 2026-10-04 新增：报工台放回页的「工序链可否免填下一道工序」三值判据。
+/// 「工序链可否免填下一道工序」三值判据。
+///
+/// 2026-10-10 起本 VO 内**恒为 [`ChainState::None`]**：唯一有值的填充路径
+/// （`GET /parts/by-worker/{worker_id}`）已随报工台迁往
+/// `crate::modules::prod::scan`，那里用的是同语义的独立类型
+/// `prod::scan::vo::ScanChainState`。两份类型刻意并存而不是互相 re-export
+/// —— 让 `part` 反向依赖 `prod::scan` 换来的只是省几行字，代价是一条本不该
+/// 存在的跨域依赖。
 ///
 /// 序列化形态是大写字符串（`rename_all = "UPPERCASE"` ⇒ `"NONE"` / `"NEXT"` /
 /// `"TAIL"`），与本仓「无 DB ENUM、Rust enum 校验」的约定一致。
@@ -137,6 +144,10 @@ impl ChainState {
     /// 未知取值降级成 [`ChainState::None`] 并 `warn!`。判错的代价不对称：
     /// `NEXT` / `TAIL` 会让写侧**免填**下一道工序（投错工序静默发生），
     /// `NONE` 只是多一次人工选择，故一律往保守方向降。
+    ///
+    /// 2026-10-10 起本函数在 part 域**没有调用方**（唯一那条取行 SQL 已迁走），
+    /// 保留它是为了让 wire 字面量与降级口径在本 VO 上仍有一个可测的锚点 —— 与
+    /// 报工台那份 `ScanChainState::from_db_text` 逐条同形、同样的单测。
     pub fn from_db_text(raw: &str) -> Self {
         match raw {
             "NEXT" => Self::Next,
@@ -253,43 +264,43 @@ pub struct PartListItem {
     pub has_cnc_program: bool,
     /// 2026-10-03 新增：活跃批次雪花 id（序列化走 `serialize_i64_opt` → JSON string）。
     ///
-    /// **仅 `GET /parts/pickable-by-work-type/{work_type_id}` 与
-    /// `GET /parts/by-worker/{worker_id}` 填** —— 这两条端点的行本来就是
-    /// 「批次行」（取行 SQL 从 `t_part_batch b` 起），扫码台「领料 / 放回」按本
-    /// 字段定位批次后发写请求。
+    /// **2026-10-10 起本 VO 恒为 `None`**：唯一填充路径（报工台两条端点）已迁往
+    /// `crate::modules::prod::scan`（`ScanListItem::batch_id`）。**字段保留** ——
+    /// 其余 6 个复用本 VO 的域的响应形状不变，删字段是破坏性 wire 变更。
     ///
-    /// 其余复用 `PartListItem` 的路径（`GET /parts` / `GET /com/union-list`
-    /// 等）**恒为 `None`**：那些行的语义单位是
-    /// part，一个 part 的活跃批次可能不止一个，填任一活跃批次都是错锚点，故宁可不填。
+    /// 恒 null 的理由：这些路径的行语义单位是 part，一个 part 的活跃批次可能
+    /// 不止一个，填任一活跃批次都是错锚点，故宁可不填。
     #[serde(serialize_with = "serialize_i64_opt")]
     pub batch_id: Option<i64>,
     /// 2026-10-03 新增：`batch_id` 那个批次的乐观锁版本号（`t_part_batch.version`）。
     ///
     /// 前端发写请求时作 OCC 版本回传。⚠️ 本 VO 的 `version` 字段是 **part 级**
     /// （`t_part.version`），与批次 OCC 无关；批次 OCC 只认本字段，**不要拿
-    /// `version` 当批次版本用**。填充口径与 `batch_id` 完全一致（同为「pickable 与
-    /// by-worker 填，其余路径 null」）。
+    /// `version` 当批次版本用**。
+    ///
+    /// **2026-10-10 起本 VO 恒为 `None`**：唯一填充路径已迁往
+    /// `crate::modules::prod::scan`（`ScanListItem::batch_version`）。字段保留，
+    /// 理由同 `batch_id`。
     #[serde(default)]
     pub batch_version: Option<i32>,
     /// 2026-10-09 新增：工单已绑工序链**且**批次当前工序能在链内定位 —— 卡片绿色
     /// 左边框的判据（判据与理由含「必须 `IS NOT NULL AND =` 而不是
     /// `IS NOT DISTINCT FROM`」见 `shared::batch::chain::HAS_PROCESS_CHAIN_EXPR`）。
     ///
-    /// **仅 `GET /parts/pickable-by-work-type/{work_type_id}` 与
-    /// `GET /parts/by-worker/{worker_id}` 填** —— 这两条端点的行是「批次行」，
-    /// 位置指针才有意义。其余复用本 VO 的路径**恒 `false`**（它们是 part 级行，
-    /// 一个 part 的活跃批次可能不止一个，任一批次的链位置都是错锚点，理由与
-    /// `batch_id` 同款；没有 `#[serde(default)]`，漏赋值会编译失败）。
+    /// **2026-10-10 起本 VO 恒 `false`**：唯一填充路径已迁往
+    /// `crate::modules::prod::scan`（`ScanListItem::has_process_chain`，同一个
+    /// `shared::batch::chain::HAS_PROCESS_CHAIN_EXPR` 常量）。字段保留，理由同
+    /// `batch_id`；没有 `#[serde(default)]`，漏赋值会编译失败。
     ///
     /// 与 `prod::queue` 的 `QueuePoolItem.has_process_chain` /
     /// `QueueHeldBatch.has_process_chain`、`outsource` 候选卡的同名列**同源**（同一个
     /// 常量），四处必须同改。
     pub has_process_chain: bool,
-    /// 2026-10-04 新增：报工台放回页的「工序链可否免填下一道工序」三值判据。
+    /// 2026-10-04 新增：工序链位置三值判据。
     ///
-    /// **仅 `GET /parts/by-worker/{worker_id}` 填**（其余 6 处返回点恒 `NONE`：
-    /// 它们是 part 级行，一个 part 的活跃批次可能不止一个，任一批次的链位置都是
-    /// 错锚点，理由与 `batch_id` 同款）。
+    /// **2026-10-10 起本 VO 恒 `NONE`**：唯一填充路径（报工台的放回 / 送检列表）
+    /// 已迁往 `crate::modules::prod::scan`（`ScanListItem::chain_state`，类型
+    /// `ScanChainState`）。字段保留，理由同 `batch_id`。
     #[serde(default)]
     pub chain_state: ChainState,
     /// 2026-10-04 新增：下一道工序 id。
@@ -297,23 +308,23 @@ pub struct PartListItem {
     /// 非可空 + `"0"` 兜底（沿用仓库既有的 `COALESCE(..., 0)` + `serialize_i64`
     /// 口径，与 `GET /outsource-queue/processes/{id}` 的
     /// `companies[].held_batches[].receive_next_process_id` 同款）：
-    /// JSON 里恒出现，语义为字符串 `"0"` = 无下一道。仅 `by-worker` 填，
-    /// `chain_state != NEXT` 时为 `0`。
+    /// JSON 里恒出现，语义为字符串 `"0"` = 无下一道。
+    ///
+    /// **2026-10-10 起本 VO 恒为 `0`**：唯一填充路径已迁往 `prod::scan`。字段
+    /// 保留，理由同 `batch_id`。
     #[serde(serialize_with = "serialize_i64")]
     pub chain_next_process_id: i64,
-    /// 2026-10-04 新增：下一道工序名称（`t_process.name`）。仅 `by-worker` 填。
-    /// `chain_next_process_id == "0"`（无下一道）时为 `None`；⚠️ **`chain_state ==
-    /// "NEXT"` 时也可能为 `None`** —— 下一道工序本身被软删（取名走
-    /// `LEFT JOIN t_process ... AND np.deleted_at IS NULL`，id 仍有值）。
-    /// **前端按本字段判空，不要按 `chain_state` 推断。**
+    /// 2026-10-04 新增：下一道工序名称（`t_process.name`）。
+    ///
+    /// **2026-10-10 起本 VO 恒为 `None`**：唯一填充路径已迁往 `prod::scan`。字段
+    /// 保留，理由同 `batch_id`。
     #[serde(default)]
     pub chain_next_process_name: Option<String>,
     /// 2026-10-04 新增：当前工序名称（`t_process.name`，链尾提示里点名
-    /// 「当前工序 X 已是最后一道」用）。仅 `by-worker` 填。
-    /// 取名走锚链内按 `b.current_process_id` 定位到的那一步 ⇒ **门控是链内定位**，
-    /// 不是工序本身存不存在：`chain_state == "NONE"`（链内定位不成立，含链内
-    /// `process_id` 重复的歧义）时恒为 `None`；`NEXT` / `TAIL` 下为该工序的
-    /// `t_process.name`，工序本身被软删时为 `None`。
+    /// 「当前工序 X 已是最后一道」用）。
+    ///
+    /// **2026-10-10 起本 VO 恒为 `None`**：唯一填充路径已迁往 `prod::scan`。字段
+    /// 保留，理由同 `batch_id`。
     #[serde(default)]
     pub chain_current_process_name: Option<String>,
     /// 2026-10-03 新增：已送数量。
@@ -377,15 +388,12 @@ impl From<TPart> for PartListItem {
             // 恒为 `false`；真实语义读 `GET /prod/programming/pending`。
             has_cnc_program: false,
             // 2026-10-03 新增：`From<TPart>` 是 part 级投影，不含批次语义
-            // （`TPart` 本身不持 batch_id）→ 恒 None。需要批次锚点的端点
-            // （`pickable-by-work-type` / `by-worker`）在 `PartListItem::from`
-            // 之后显式覆写这两个字段。
+            // （`TPart` 本身不持 batch_id）→ 恒 None。
             batch_id: None,
             batch_version: None,
             // 2026-10-04 新增：链位置是**批次级**事实（同一 part 的不同活跃批次
             // 处在链的不同道次），`From<TPart>` 无从推导 → 恒取保守默认值
-            // `NONE` / `"0"` / `null` / `null`。只有 `by-worker` 在 `from` 之后
-            // 显式覆写这四个字段。
+            // `NONE` / `"0"` / `null` / `null`。
             chain_state: ChainState::None,
             chain_next_process_id: 0,
             chain_next_process_name: None,
