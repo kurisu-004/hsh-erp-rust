@@ -347,10 +347,12 @@ target** 时才报 21405，并在 message 里附上被拦下的批次明细。
 | **请求只含 1 个 part**，且它有状态明细 | DP 原文 + `；入单只允许 READY_TO_SHIP，以下批次不可用：part {id}（{serial_no}）批次 {no} status={status}；…` |
 | **请求含 ≥ 2 个 part**（不论几个失败） | 每个失败 part 一段，按 `part_id` 升序：`part {id}（需 N 件）：{DP 文案}`，有状态明细则同样追加明细段；同一段内的多条明细用 `；` 分隔 |
 
-> 上表两行是**正交**的两个维度：`part_id` 前缀只取决于「本请求是否含多个 part」，
-> 状态明细段只取决于「该失败 part 在 `not_ready_by_part` 里有没有条目」。所以「两个 part、
+> 上表的**前缀维度**与**明细维度**是正交的两件事：`part_id` 前缀只取决于「本请求是否含多个
+> part」，状态明细段只取决于「该失败 part 在 `not_ready_by_part` 里有没有条目」。所以「两个 part、
 > 只有 B 凑不出」得到的是**一段**带 `part B（需 8 件）：…` 的文案，不是两句，也不是无主语的
-> 裸 DP 文案。段间分隔符统一是 `；`。
+> 裸 DP 文案；两个 part 都凑不出则是**两段**、按 `part_id` 升序（用例
+> `tests/com/delivery_note/entry_gate.rs::multi_part_failures_are_listed_in_part_id_order`
+> 钉死）。段间分隔符统一是 `；`。
 
 > ⚠️ **21406 仍是请求级闸门**，刻意与状态闸门不同：任一批次被别的单占着（哪怕同零件另有
 > 足量可入单批次），整个请求原子失败、零写入，不允许「挑能用的挂上」。用例
@@ -369,8 +371,10 @@ target** 时才报 21405，并在 message 里附上被拦下的批次明细。
 
 > ⚠️ **跨 part 原子性**：DP 循环收集完全部失败 part 才决定拒绝，拒绝点落在第一个拆批 / 挂单
 > 写之前 ⇒ 「A part 分配成功 + B part 凑不出」时 A 的批次也**不挂单**（草稿行的 find-or-create
-> 与它们同处一个事务，整体回滚）。用例
-> `tests/com/delivery_note/entry_gate.rs::multi_part_shortage_writes_nothing_across_parts` 钉死这条。
+> 与它们同处 handler 开的那条事务，handler 只在 `Ok` 时 commit ⇒ 整体回滚）。用例
+> `tests/com/delivery_note/entry_gate.rs::multi_part_shortage_writes_nothing_across_parts`
+> 钉死的是**可观测**的那一半（零写入）；「拒绝点在第一个写之前」这条结构属性在 DB 上不可观测
+> —— 把写挪进 DP 循环的写法与现写法在集成测试里同解。
 
 ### 4.2 套装数公式
 

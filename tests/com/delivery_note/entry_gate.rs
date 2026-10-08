@@ -10,6 +10,7 @@
 //! | 零件的 L1 客户 ≠ 单据 L1 客户 | 21407 | `cross_l1_part_rejected_21407` |
 //! | DP 不可行（凑不出） | 21405 | `quantity_over_entryable_total_returns_21405` |
 //! | 跨 part 原子性：一个 part 够、另一个凑不出 ⇒ **整个请求零写入** | 21405 | `multi_part_shortage_writes_nothing_across_parts` |
+//! | ≥2 个 part 全部凑不出 ⇒ message 是**多段**、按 `part_id` 升序、每段带 part 身份 | 21405 | `multi_part_failures_are_listed_in_part_id_order` |
 //!
 //! ## ★ 最重要的一条：`INSPECTION` 必须显式报 21405，且 message 点名该批次
 //!
@@ -26,11 +27,15 @@
 //! `mixed_status_part_shortage_lists_blocked_batches` 钉住「不够才 21405，且 message
 //! 要点名被拦下的批次」。
 //!
-//! ## 跨 part 原子性
+//! ## 跨 part 原子性与失败汇总的形状
 //!
-//! DP 循环收集完全部失败 part 才决定拒绝，拒绝点落在第一个拆批 / 挂单写之前
-//! ⇒ 同一个请求里「A part 分配成功 + B part 凑不出」时，A 的批次也**不挂单**。
-//! `multi_part_shortage_writes_nothing_across_parts` 钉死这条不变量。
+//! DP 循环收集完全部失败 part 才决定拒绝 ⇒ 同一个请求里「A part 分配成功 + B part 凑不出」
+//! 时，A 的批次也**不挂单**。`multi_part_shortage_writes_nothing_across_parts` 钉死这条
+//! 不变量（零写入）。
+//!
+//! message 的形状分两片由 `multi_part_failures_are_listed_in_part_id_order` 钉：请求含
+//! ≥2 个 part 时每段带 `part {id}（需 N 件）：`，多个失败 part **按 `part_id` 升序**拼接
+//! （`targets` 是 `HashMap`、迭代序不定，不排序会让同一请求的 message 抖动）。
 
 use axum::http::StatusCode;
 use serde_json::{Value, json};
@@ -232,6 +237,9 @@ async fn batch_note_id(pool: &PgPool, batch_id: i64) -> Option<i64> {
 ///
 /// 不显式收集 `INSPECTION` 的代价不是「报错了码」，而是**状态信息彻底丢失**：它不在可入单
 /// 集合里，DP 只会报一句无主语的「可入单件数不足」，用户无从知道要先去品检。
+///
+/// ⚠️ 函数名里的 `already_present` 沿用的是早期实现（有「幂等 200」路径）的命名；当前
+/// 实现里 200 只可能是「入单成功」，本用例断言的是上面那条 21405 + 明细。
 #[tokio::test]
 async fn inspection_batch_is_not_silently_reported_as_already_present() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
@@ -246,7 +254,7 @@ async fn inspection_batch_is_not_silently_reported_as_already_present() {
     assert_eq!(
         s,
         StatusCode::BAD_REQUEST,
-        "INSPECTION 批次必须显式报 21405（绝不能是 200 / 幂等说谎）: {env}"
+        "INSPECTION 批次必须显式报 21405（绝不能是 200）: {env}"
     );
     assert_eq!(env["code"], 21405);
     let msg = env["message"].as_str().unwrap();
@@ -291,7 +299,7 @@ async fn non_ready_statuses_all_rejected_21405() {
         assert_eq!(
             s,
             StatusCode::BAD_REQUEST,
-            "status={status} 必须 21405（不能被兜底成幂等）: {env}"
+            "status={status} 必须 21405（message 要点名该状态）: {env}"
         );
         assert_eq!(env["code"], 21405, "status={status}: {env}");
     }
@@ -390,11 +398,15 @@ async fn mixed_status_part_shortage_lists_blocked_batches() {
 
 /// ★ 跨 part 原子性：一个 part 够、另一个凑不出 ⇒ **整请求零写入**。
 ///
-/// DP 循环收集完全部失败 part 才决定拒绝，拒绝点落在第一个拆批 / 挂单写之前。若谁把写操作
-/// 挪进 DP 循环内（每个 part 分配成功就立刻挂），这条会红 —— 那正是本用例存在的理由。
-/// 单 part 的用例（`mixed_status_part_shortage_lists_blocked_batches` 等）测不到这点：
-/// 只有一个 part 时 `attached` 本来就是空集合，拒绝点落在 DP 循环内还是循环后，
-/// 库里的写入结果完全一样。
+/// DP 循环收集完全部失败 part 才决定拒绝。本用例钉的是**可观测**的结果：A 的 DP 成功
+/// （A 有 8 件足量 `READY_TO_SHIP`、本次正要 8 件，而失败段是穷举的 —— `!msg.contains(A)`
+/// 即 A 未失败）却零写入 ⇒ 跨 part 原子失败。
+///
+/// ⚠️ 别指望它能钉「拒绝点在第一个写之前」那条结构性属性：拆批 / 挂单与草稿行的
+/// find-or-create 全在 handler 开的那**同一条事务**里，handler 只在 `Ok` 时 commit ⇒
+/// 把写操作挪进 DP 循环（每个 part 分配成功就立刻挂），返回 `Err` 后整体回滚，库里
+/// 的结果与现在完全相同（雪花号消耗、行写入都回滚，DB 上不可观测）。任何集成测试都
+/// 区分不了这两种写法，要区分只能靠 `sqlx::query!` 的编译期断言或事务内快照。
 #[tokio::test]
 async fn multi_part_shortage_writes_nothing_across_parts() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
@@ -438,6 +450,12 @@ async fn multi_part_shortage_writes_nothing_across_parts() {
         !msg.contains("G-XPARTA"),
         "分配成功的 A 不该出现在失败汇总里: {msg}"
     );
+    // message 里的失败段是**穷举**的（DP 循环把全部失败 part 一次收齐再汇总），所以 A 的
+    // part_id 不出现即证明 A 的 DP 成功 —— 上面「零写入」才是「够量的那个也没被挂」。
+    assert!(
+        !msg.contains(&part_a.to_string()),
+        "A 的 DP 成功 ⇒ 它的 part_id 不该进失败汇总: {msg}"
+    );
     assert_eq!(
         attached_count(&pool).await,
         0,
@@ -447,6 +465,85 @@ async fn multi_part_shortage_writes_nothing_across_parts() {
         batch_note_id(&pool, ready_a).await,
         None,
         "A 的 READY 批次必须仍是未挂单状态（不允许 per-part 先挂后验）"
+    );
+}
+
+/// ★ 多个 part 全部凑不出 ⇒ message 是**多段**、按 `part_id` 升序、每段都带 part 身份。
+///
+/// 上一条钉的是「2 个 part、1 个失败」（`multiple == true` 但只有一段），本条覆盖另一侧：
+/// `alloc_failure_error` 的 `sort_by_key(part_id)` 与 `segments.join("；")` 只在
+/// `segments.len() >= 2` 时才真的被执行到。
+///
+/// 序是确定的：A 的 id 先于 B 生成（`pool_snowflake()` 同进程单调发号，见 `next_id` 的
+/// doc），所以「A 段在前」就是「按 `part_id` 升序」—— 钉的是排序，不是请求里的插入序
+/// （`targets` 是 `HashMap`，插入序不保证复现）。
+#[tokio::test]
+async fn multi_part_failures_are_listed_in_part_id_order() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let l1 = insert_l1(&pool, "闸门多段").await;
+    let l2 = insert_l2(&pool, "闸门多段二厂", l1).await;
+    // A：只有 4 件可入单，本次要 8 件 ⇒ 必然凑不出；无状态明细 ⇒ 该段不带明细尾
+    let part_a = insert_part(&pool, "多段甲件", "G-XORDA", l2).await;
+    insert_batch(&pool, part_a, 1, 4, "READY_TO_SHIP", None).await;
+    // B：4 件可入单 + 8 件 IN_PROCESS，本次要 8 件 ⇒ 必然凑不出；该段带状态明细尾
+    let part_b = insert_part(&pool, "多段乙件", "G-XORDB", l2).await;
+    insert_batch(&pool, part_b, 1, 8, "IN_PROCESS", None).await;
+    insert_batch(&pool, part_b, 2, 4, "READY_TO_SHIP", None).await;
+    assert!(
+        part_a < part_b,
+        "本用例的序前提不成立：A 的 id 应先于 B 生成（{part_a} vs {part_b}）"
+    );
+
+    let (s, env) = scan_entry(
+        &app,
+        &token,
+        "G-XORDA",
+        json!([
+            {"node_kind": "PART", "node_id": part_a.to_string(), "quantity": 8},
+            {"node_kind": "PART", "node_id": part_b.to_string(), "quantity": 8},
+        ]),
+    )
+    .await;
+
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "两个 part 都凑不出 ⇒ 整请求 21405: {env}"
+    );
+    assert_eq!(env["code"], 21405, "{env}");
+    let msg = env["message"].as_str().unwrap();
+    let a_pos = msg
+        .find(&part_a.to_string())
+        .expect("失败段必须带 A 的 part_id");
+    let b_pos = msg
+        .find(&part_b.to_string())
+        .expect("失败段必须带 B 的 part_id");
+    assert!(
+        a_pos < b_pos,
+        "多段必须按 part_id 升序拼接（A 段在前）: {msg}"
+    );
+    // 恰好两段：每个失败 part 一段，不重复也不合并
+    assert_eq!(
+        msg.matches("（需 8 件）：").count(),
+        2,
+        "每个失败 part 恰好一段（两个 target 都是 8 件）: {msg}"
+    );
+    assert!(
+        msg.contains(&format!("part {part_a}（需 8 件）：可入单件数不足")),
+        "A 的段应是「part 前缀 + DP 原文」，且不带状态明细尾: {msg}"
+    );
+    assert!(
+        msg.contains("G-XORDB") && msg.contains("IN_PROCESS"),
+        "B 段应追加被拦下的批次明细（serial_no + status）: {msg}"
+    );
+    assert!(
+        !msg.contains("G-XORDA"),
+        "A 没有非 READY 批次，明细段不该凭空造出它的批次: {msg}"
+    );
+    assert_eq!(
+        attached_count(&pool).await,
+        0,
+        "两个 part 都失败 ⇒ 零写入: {env}"
     );
 }
 

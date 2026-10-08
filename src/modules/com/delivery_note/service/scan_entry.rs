@@ -308,8 +308,8 @@ impl DeliveryNoteService {
         // 21406 收集：批次挂在别的 `DRAFT` / `SUBMITTED` 单上。
         let mut occupied: Vec<OccupiedDetail> = Vec::new();
         let mut note_ids_involved: Vec<i64> = Vec::new();
-        // 21405 诊断明细收集：`INSPECTION` 等非 READY_TO_SHIP 批次（**显式分支，
-        // 绝不走兜底沉默**），**按 part 分组**。
+        // 21405 诊断明细收集：`INSPECTION` 等非 READY_TO_SHIP 批次（**必须显式分支**，
+        // 否则这些批次在整条链路上无处被提到、message 丢状态信息），**按 part 分组**。
         //
         // 2026-10-09 改：原先它是请求级闸门（分类循环结束即整单 21405），作用域被
         // 放大成「该零件的全部活跃批次」—— 零件只要沾一个非 READY 批次，即便有足量
