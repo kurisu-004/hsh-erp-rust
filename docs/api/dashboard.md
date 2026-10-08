@@ -159,13 +159,14 @@
 
 **关闭码只表达「这条连接必须终止」，处置方式由 reason 文案区分。** 前端按 `(code, reason)`
 二元组分流，不要只看 code。「发出点」列给出**触发该关闭的位置**：由服务端发出的 7 行标的是
-`src/modules/dashboard/handler.rs` 内的具体分支 / 时机，`1000` 与 `1006` 两行没有服务端
-发出点（分别由前端主动 `close()` 与网络层裸断产生）。
+`src/modules/dashboard/handler.rs` 内的具体分支 / 时机；`1000` / `1001` / `1006` 三行没有
+服务端发出点（分别是前端主动 `close()`、本仓从不使用的规范码、网络层裸断）。
 
 | code | reason | 发出点 | 含义 | 前端应做什么 |
 |---|---|---|---|---|
-| `1000` | （浏览器不发 reason） | 前端主动 `close()`（VueUse `useWebSocket` 的 `open()` 会先关旧连接） | 正常收摊，不是故障 | 无需处置（不要记错误、不要弹提示） |
-| `1006` | — | 无 Close 帧：裸 TCP 断（网络抖动 / 代理掐 / 进程被 kill） | 连接非正常终止，看不到任何服务端信号 | 照常退避重连；40105 一类的会话信号只能靠 HTTP 侧感知 |
+| `1000` | （浏览器不发 reason） | 前端主动 `close()`（VueUse `useWebSocket` 的 `open()` 会先关旧连接） | 正常收摊，不是故障 | 自己发起的照常无需处置（不记错误、不弹提示）。⚠️ **code 1000 也可能由服务端 / 中间层主动发出**，那属于真实断开、必须照常记一次失败，故前端另有一道兜底判定：按 **socket 实例同一性**（不是 code）识别「这次 close 是自己发起的」，非自己发起的 1000 一律走失败记账 |
+| `1001` | （后端不发） | **无服务端发出点**，保留仅作对照 | 规范里的「端点离开」；本仓不用它 | 与 `1000` 同属「正常收摊」，照常继续无限重试。**别按 code 分流**：写侧失败路径一律裸断（见下「写侧已失败的路径不发 Close 帧」），浏览器侧落的是 `1006` 而不是 1001 |
+| `1006` | — | 无 Close 帧：裸 TCP 断（网络抖动 / 代理掐 / 进程被 kill / 写侧失败后的裸断） | 连接非正常终止，看不到任何服务端信号 | 照常退避重连；40105 一类的会话信号只能靠 HTTP 侧感知 |
 | `1011` | `snapshot build failed` | `run_socket` 进主循环前的首帧快照构建失败 | 服务端算不出大屏数据（DB 故障） | 退避重连，不要登出 |
 | `1011` | `pong timeout` | 超过 `WS_PONG_TIMEOUT_SECONDS` 未收到任何入站帧 | 对端已死 / 半开 TCP | 退避重连，不要登出 |
 | `1011` | `re-auth unavailable` | 周期 re-auth 失败**且**失败码不是 40100/40102/40105（`reauth_close_code` 兜底段，主要是 Redis 故障的 `50000`） | **服务端**不可用，与用户会话无关 | 退避重连，不要登出（切勿据此清本地 token） |
@@ -180,13 +181,13 @@ HTTP 流量，access token（`JWT_ACCESS_TOKEN_EXPIRE_SECONDS`，缺省 900s）�
 refresh token 并跳登录页 ⇒ 空闲用户被踢下线。决策点收在纯函数 `reauth_close_code`
 （`src/modules/dashboard/handler.rs`）。
 
-**上表 9 行的测试覆盖并不齐整**（`tests/dashboard_ws_api.rs` 的真实 e2e 清单，逐行如实登记）：
+**上表 10 行的测试覆盖并不齐整**（`tests/dashboard_ws_api.rs` 的真实 e2e 清单，逐行如实登记）：
 
 | 覆盖形态 | 涉及的行 |
 |---|---|
 | 端到端（WS 集成用例） | `1011 pong timeout`（`ws_e2e_pong_timeout_closes_dead_peer`）、`1012 server restart`（`ws_e2e_server_shutdown_sends_1012`）、`4001 auth expired`（`ws_e2e_reauth_failure_sends_4001_close`）、`4001 access token expired`（`ws_e2e_access_token_expiry_sends_4001_with_access_token_expired`）、`4003 lagged`（`ws_e2e_lagged_client_gets_4003_close`） |
 | 仅 lib 单测（`reauth_close_code` 纯函数，无 IO） | `1011 re-auth unavailable`：`reauth_infra_failure_maps_to_1011_not_4001` + `reauth_unknown_code_defaults_to_1011`；两条 `4001` 另有 `reauth_token_expired_maps_to_4001_with_distinct_reason` / `reauth_revoked_session_maps_to_4001_auth_expired` 钉死 reason 串 |
-| 无自动化覆盖 | `1000`（由前端自己发起，与后端无关）、`1006`（网络层裸断，无法稳定构造）、`1011 snapshot build failed`（需制造 DB 故障）、`1011 re-auth unavailable` 的**端到端**（需自定义 `SessionStore` 才能造 Redis 故障） |
+| 无自动化覆盖 | `1000`（由前端自己发起，与后端无关）、`1001`（后端从不发出，无可构造的触发路径）、`1006`（网络层裸断，无法稳定构造）、`1011 snapshot build failed`（需制造 DB 故障）、`1011 re-auth unavailable` 的**端到端**（需自定义 `SessionStore` 才能造 Redis 故障） |
 
 「无自动化覆盖」里的后两项——`1011 snapshot build failed` 与 `1011 re-auth unavailable` 的
 端到端形态——是**已知缺口，不追求补齐**：造 DB 故障与自定义 `SessionStore` 的代价远大于收益，
