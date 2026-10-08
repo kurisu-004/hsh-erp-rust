@@ -8,12 +8,15 @@
 //! `t_part_batch.status`，不引用 part 域任何 service / vo。
 //!
 //! 2026-10-04 起本文件不再只服务 `prod::batch`：`prod::shelf_process`（建映射时的 zone
-//! 守卫）、`prod::queue`（WORKER→POOL 放回时的货架守卫）与 `prod::batch::pickup`
-//! （`PickUpRequest.shelf_id` 的可选校验）三个跨模块 caller 也调
-//! [`validate_shelf_zone`]。新增 caller 时**必须**调本函数而不要复制判序 ——
+//! 守卫）与 `prod::batch::pickup`（`PickUpRequest.shelf_id` 的可选校验）两个跨模块
+//! caller 也调 [`validate_shelf_zone`]。新增 caller 时**必须**调本函数而不要复制判序 ——
 //! 判序（20501 存在 → 20512 停用 → 20104 zone）与文案只有一份，是 2026-10-04 那次
 //! 「`current_holder_id` 写脏」修复的核心：写点各写各的守卫时，其中一个漏了
 //! `t_shelf` 侧谓词就足以让批次落到品检架上并从此静默漏件。
+//!
+//! ⚠️ `prod::queue` 曾是第三个 caller（`move` 端点 WORKER→POOL 的货架守卫），2026-10-10
+//! 起该分支改走自动选架（`shared::shelf::select::pick_least_loaded`，候选集自带
+//! 存在 / 停用 / zone 三个谓词），`prod::queue` 不再 import 本函数。
 //!
 //! ## 2026-10-10：`assert_shelf_maps_process` 删除
 //!
@@ -35,8 +38,8 @@
 //!
 //! | 目标区 | 调用点 |
 //! |---|---|
-//! | `PRODUCTION`（按工序筛候选） | `to_process_core`（含检验不合格打回生产架的 `mark_batch_failed_inspection`）/ `place_on_shelf` / `release_from_programming` / `worker_scan` RETURNED / `move_batch` WORKER→POOL / `complete_repair` 与 `repair_dispatch` 的回生产臂 / `outsource::move` 回收生产 / `dispatch_single`（走 `update_batch_dispatched`，不经本文件） |
-//! | `INSPECTION`（无工序映射，只按 zone 筛） | `to_inspection_core`（单件与批量共用同一次选架）/ `scan_inspect` / `complete_repair` 与 `repair_dispatch` 的回品检臂 / `sent_to_inspection`（worker-scan 的 `INSPECTED` 分支与链尾自动送检两处共用） |
+//! | `PRODUCTION`（按工序筛候选） | `to_process_core`（含检验不合格打回生产架的 `mark_batch_failed_inspection`）/ `place_on_shelf` / `release_from_programming` / `worker_scan` RETURNED / `move_batch` WORKER→POOL / `complete_repair` 与 `repair_dispatch` 的回生产臂 / `outsource::move` 回收生产 / `dispatch_single`（经 `queue::repo::dispatch::update_batch_dispatched`，它与本文件 `mark_batch_with_status_and_meta` 是 `shared::batch::status` 同一条 UPDATE 的两个薄包装） |
+//! | `INSPECTION`（无工序映射，只按 zone 筛） | `to_inspection_core`（两个 wrapper 各自选一次：单件端点选一次；批量端点在 per-item 循环**外**选一次、这批 item 共用）/ `scan_inspect` / `complete_repair` 与 `repair_dispatch` 的回品检臂 / `sent_to_inspection`（worker-scan 的 `INSPECTED` 分支与链尾自动送检两处共用） |
 //!
 //! **写非货架 holder（不要混进上面那张表）**：`pickup` / `take_one_from_pool` /
 //! `take_specific_from_pool` / `move_worker_to_worker` 写 worker id；

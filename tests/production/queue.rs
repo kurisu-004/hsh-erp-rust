@@ -18,25 +18,22 @@
 //!  10. take_does_not_update_placed_at
 //!  11. events_persisted_to_t_part_event
 //!  12. admin_refill_endpoint_works
-//!  13. admin_remove_returns_batch_to_pool
+//!  13. move_worker_to_pool_returns_batch_to_pool
 //!  14. refill_failure_rolls_back_worker_scan   [`#[ignore]`：DB 故障注入缺基建]
 //!  15. max_held_null_returns_error
 //!  16. worker_no_work_type_returns_error
-//!  17. state_without_shelf_id_returns_held_batches_and_empty_pool_count
-//!      （2026-10-04 回归：`GET /pool/state` 的 `shelf_id` 降为可选后，缺省调用
-//!      仍须返回完整持有视图，仅 `pool_count_by_process` 退化为空数组）
-//!  18. move_worker_to_pool_picks_least_loaded_shelf
+//!  17. move_worker_to_pool_picks_least_loaded_shelf
 //!      （2026-10-10：撤回候选池的目标架按 `current_load / capacity` 升序自动选；
 //!      `to` 侧无 `shelf_id`，断言落负载最低的架而非 display_order 最小的架）
-//!  19. move_worker_to_pool_never_lands_on_unmapped_shelf
+//!  18. move_worker_to_pool_never_lands_on_unmapped_shelf
 //!      （20507 退役后的端点级等价不变量：更靠前且完全空的**未映射**架也不能被选中）
-//!  20. move_worker_to_pool_rejects_when_no_usable_shelf_for_process
+//!  19. move_worker_to_pool_rejects_when_no_usable_shelf_for_process
 //!      （2026-10-10 `current_holder_id` 写脏守卫（自动选架形态）：批次当前工序唯一
 //!      映射的货架已软删 / 已停用 / 是品检架 ⇒ 选架候选为空 → 20508，批次不被写脏）
-//!  21. move_worker_to_pool_no_process_still_lands_on_production_zone_shelf
+//!  20. move_worker_to_pool_no_process_still_lands_on_production_zone_shelf
 //!      （同上，但 `current_process_id=NULL` ⇒ 选架不按工序筛候选的那条分支；
 //!      断言 zone 谓词**仍然生效**，批次不会落到品检架）
-//!  20. move_{pool_to_worker|worker_to_pool|worker_to_worker}_stale_version_returns_40901
+//!  21. move_{pool_to_worker|worker_to_pool|worker_to_worker}_stale_version_returns_40901
 //!      （2026-10-09 OCC：move 的 `version` 改为客户端必填，三个方向各一条，
 //!      钉住「过期的看板快照真的会被挡住、批次不被写脏」）
 //!
@@ -1007,7 +1004,8 @@ async fn worker_scan_returned_without_process_chain_succeeds() {
     let wt = insert_work_type(&pool, "WT-B3", "工种B3", Some(5)).await;
     link_work_type_to_process(&pool, wt, proc_b).await;
     let prod_shelf = insert_shelf(&pool, "PROD-B3", "PROD-B3", "PRODUCTION").await;
-    // RETURNED 的 20507 校验要求目标货架映射 next_process_id（= proc_c）
+    // RETURNED 的目标架由选架按 `next_process_id`（= proc_c）挑 ⇒ 候选集要求存在
+    // 「映射了 proc_c」的活跃 PRODUCTION 架，缺它则 20508（20507 那条事后校验已被选架覆盖）
     link_shelf_to_process(&pool, prod_shelf, proc_c).await;
 
     let worker = insert_worker(&pool, "BC002D", "工2D", Some(wt)).await;

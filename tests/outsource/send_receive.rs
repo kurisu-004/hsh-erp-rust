@@ -475,7 +475,8 @@ async fn insert_shelf(pool: &PgPool, code: &str, zone: &str) -> i64 {
     id
 }
 
-/// 直插 `t_shelf_process`（货架 ↔ 工序映射）。回收到生产架时缺它会吃 20507。
+/// 直插 `t_shelf_process`（货架 ↔ 工序映射）。回收到生产架时缺它 ⇒ 该工序无可用生产货架
+/// ⇒ 20508（选架的候选集要求「映射了该工序」，候选为空即选不出）。
 async fn map_shelf_process(pool: &PgPool, shelf_id: i64, process_id: i64) {
     let id = next_id();
     let now = now_naive();

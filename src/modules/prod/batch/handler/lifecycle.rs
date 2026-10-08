@@ -25,7 +25,9 @@
 //! 三个 handler 与其 service 一并
 //! 删除。随之删除的 WS 事件名是 `PART_SENT_TO_OUTSOURCE` /
 //! `PART_RECEIVED_FROM_OUTSOURCE` / `PART_RECEIVED_FROM_OUTSOURCE_INSPECTED`，三合一
-//! 后统一为 `OUTSOURCE_MOVE_DONE`；`t_part_event` 的三个审计字面量逐字保留。
+//! 后统一为 `OUTSOURCE_MOVE_DONE`；`t_part_event` 的审计字面量 `SENT_TO_OUTSOURCE` /
+//! `RECEIVED_FROM_OUTSOURCE` 逐字保留（第三个 `RECEIVED_TO_INSPECTION` 随 2026-10-10
+//! 的 `OUTSOURCE_COMPANY → INSPECTION_SHELF` 方向下线而不再被写入）。
 //!
 //! ## 权限模式
 //! - deliver / complete / place-on-shelf / recall-to-pending / split / cancel：

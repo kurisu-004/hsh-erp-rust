@@ -265,7 +265,7 @@ t_assembly.status               ← 派生缓存
 | `POST /api/v2/prod/batches/{batch_id}/send-to-outsource` / `receive-from-outsource` / `receive-from-outsource-to-inspection` | 合并为 `POST /api/v2/outsource-queue/move`（2026-10-09，硬切无 alias）。**部分收发能力随之下线**（入参不再有 `quantity`），部分流转改走 `POST /api/v2/batches/split` |
 | `POST /api/v2/prod/batches/{batch_id}/split` | 提为共用顶层端点 `POST /api/v2/batches/split`（2026-10-09，硬切无 alias，`batch_id` 入 body，出参 `R<i64>` → `BatchSplitOut`）。见 §2.1 |
 | `service/outsource.rs`（整文件）+ `dto.rs` 的三个外协入参 | 随三端点迁往 `outsource::service::move_svc` / `outsource::dto`（2026-10-09） |
-| WS 事件名 `PART_SENT_TO_OUTSOURCE` / `PART_RECEIVED_FROM_OUTSOURCE` / `PART_RECEIVED_FROM_OUTSOURCE_INSPECTED` | 合并为 `OUTSOURCE_MOVE_DONE`（2026-10-09）。`t_part_event` 的三个审计字面量不变 |
+| WS 事件名 `PART_SENT_TO_OUTSOURCE` / `PART_RECEIVED_FROM_OUTSOURCE` / `PART_RECEIVED_FROM_OUTSOURCE_INSPECTED` | 合并为 `OUTSOURCE_MOVE_DONE`（2026-10-09）。`t_part_event` 的 `SENT_TO_OUTSOURCE` / `RECEIVED_FROM_OUTSOURCE` 不变（`RECEIVED_TO_INSPECTION` 随 2026-10-10 的 `OUTSOURCE_COMPANY → INSPECTION_SHELF` 方向下线而不再被写入，见 §0b） |
 | `GET /api/v2/prod/batches/pending` / `POST /dispatch` / `POST /auto-dispatch` | 迁往 `prod::queue`（2026-10-08） |
 | `POST /api/v2/prod/batches/{batch_id}/recall-to-pending` | 迁往 `POST /api/v2/prod/queue/recall`（2026-10-08），`batch_id` 改入 body、出参改 `RecallOut` |
 | `repo/list.rs` + `service/list.rs` | 随待品检队列读迁往 `prod::inspection`（2026-10-07） |

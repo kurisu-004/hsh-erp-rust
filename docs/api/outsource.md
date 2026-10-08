@@ -665,7 +665,6 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 | `422` | 无信封（axum `JsonRejection`） | **2026-10-10 新增于本域**：`to.kind = "INSPECTION_SHELF"`（变体已删除）|
 | `20109` | `BIZ_PART_BATCH_NOT_FOUND` | 批次不存在 / 已软删 |
 | `20122` | `BIZ_BATCH_LOCATION_MISMATCH` | `from` 与批次真实位置不符 |
-| `20501` / `20507` / `20512` | `BIZ_SHELF_NOT_FOUND` / `BIZ_SHELF_PROCESS_NOT_MAPPED` / `BIZ_SHELF_INACTIVE` | 回收目标货架三条守卫 |
 | `20706` | `BIZ_PROCESS_CHAIN_REQUIRED` | 下一道工序推不出（需手填 `to.next_process_id`） |
 | `20801` | `BIZ_PROCESS_NOT_FOUND` | 工序不存在 / 已软删（HTTP 404） |
 | `21201` | `BIZ_OUTSOURCE_COMPANY_NOT_FOUND` | 公司不存在 / 已软删（HTTP 404） |
