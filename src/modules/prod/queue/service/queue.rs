@@ -111,12 +111,18 @@ impl QueueService {
     ///    `TAKEN_FROM_POOL` 事件日志 + `PartService::sync_from_batch_change` 同步
     ///    part 派生列（事务内由 handler commit）；
     /// 5. 返回 `RefillResult { worker_id, shelf_id, taken, pool_empty }`。
+    ///
+    /// `shelf_id`（2026-10-10 起 `Option<i64>`）：`None` = **跨全部映射该工种工序的
+    /// 活跃生产架取料**（worker-scan 路径）。旧实现要求「工人站在某个架上」并把该架
+    /// 当候选池过滤键，而 worker-scan 的 `shelf_id` 入参已经删除 —— 继续限架会在
+    /// 「放回到 A 架 → 随即从 A 架补料」这个闭环里查空池。负载均衡现在整体由
+    /// `shared::shelf::select::pick_least_loaded`（放回时选架）承担。
     #[allow(clippy::too_many_arguments)]
     pub async fn refill_for_worker(
         conn: &mut PgConnection,
         snowflake: &SnowflakeIdGenerator,
         worker_id: i64,
-        shelf_id: i64,
+        shelf_id: Option<i64>,
         operator_user_id: i64,
         current: &CurrentUser,
     ) -> Result<RefillResult, AppError> {
@@ -161,13 +167,15 @@ impl QueueService {
     /// 由 [`refill_for_worker`]（admin 路径：自己 fetch）与
     /// `prod::batch::service::worker_scan`（worker-scan 路径：service 已在 scan 步骤
     /// fetch 过 worker）共用。
+    ///
+    /// `shelf_id` 语义见 [`refill_for_worker`]（`None` = 跨全部映射架取料）。
     #[allow(clippy::too_many_arguments)]
     pub async fn refill_for_worker_with_work_type(
         conn: &mut PgConnection,
         snowflake: &SnowflakeIdGenerator,
         worker_id: i64,
         work_type_id: i64,
-        shelf_id: i64,
+        shelf_id: Option<i64>,
         badge_code: &str,
         operator_user_id: i64,
         current: &CurrentUser,
@@ -899,7 +907,9 @@ impl QueueService {
             let mut filled_count = 0i32;
             for _ in 0..target {
                 match (&mut *conn)
-                    .take_one_from_pool(worker_id, req.shelf_id, &process_ids, current.id)
+                    // 管理员显式指定货架（「为该工序在某架上抢料」）⇒ 限架。
+                    // 与 worker-scan 的跨架取料是两种口径，这里**刻意保留**架锚。
+                    .take_one_from_pool(worker_id, Some(req.shelf_id), &process_ids, current.id)
                     .await?
                 {
                     Some(t) => {

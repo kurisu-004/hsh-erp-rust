@@ -275,16 +275,19 @@ pub async fn scan_deliver_part(
 ///
 /// 行为：
 /// - 权限：`Manager` 或 `ShelfAccount`（不是 Inspector——工人持有件自有工人操作）
-/// - 入参：`WorkerScanRequest { serial_no, badge_code, event_type, shelf_id, ... }`
-///   主键是 `serial_no`，`batch_id` 仅用于多批次消歧
+/// - 入参：`WorkerScanRequest { serial_no, badge_code, event_type, next_process_id?, batch_id? }`
+///   主键是 `serial_no`，`batch_id` 仅用于多批次消歧。**没有任何货架字段**
+///   （2026-10-10 起两个货架字段都被删除，目标架由服务端按负载自动选）
 /// - 业务流转：
-///   - `RETURNED`：worker 把 IN_PROCESS+WORKER 批次放回生产架（next_process_id 必填，
-///     shelf ↔ process 必须有映射）；
-///   - `INSPECTED`：worker 把持有件直接送检（target_inspection_shelf_id 必填，
-///     target shelf ∈ INSPECTION 区）；
-///   - 任一成功后同事务 `QueueService::refill_for_worker`。
+///   - `RETURNED`：worker 把 IN_PROCESS+WORKER 批次放回**服务端选出的**生产架
+///     （`next_process_id` 仅非顺应工序时必填）；**批次在链尾时改走送检**（自动送检）
+///   - `INSPECTED`：worker 把持有件直接送检（品检架服务端自动选）
+///   - 任一成功后同事务 `QueueService::refill_for_worker`（**跨全部映射架取料**，无架锚）。
 /// - WS 广播：commit 后
-///   - `WORKER_SCAN_RETURNED` / `WORKER_SCAN_INSPECTED`（依 event_type）；
+///   - `WORKER_SCAN_RETURNED` / `WORKER_SCAN_INSPECTED`（依 **`scan_out.event_type`**，
+///     即**响应**里那个值而非请求里的值 —— 2026-10-10 起链尾自动送检会让「请求
+///     `RETURNED` / 响应 `WORKER_SCAN_INSPECTED`」成立，而 dashboard 两条事件都监听，
+///     故广播链路无需改动即成立）；
 ///   - `WORKER_POOL_REFILL_DONE`（refill 抢到一批）或
 ///   - `WORKER_POOL_EMPTY`（refill 池空）。
 ///
@@ -296,26 +299,10 @@ pub async fn worker_scan(
     Json(req): Json<WorkerScanRequest>,
 ) -> Result<Json<R<WorkerScanOut>>, AppError> {
     current.require_any_role(&[Role::Manager, Role::ShelfAccount])?;
-    // 防御性：shelf_ids 是手填白名单，manager 因 wildcard=true 自动通过
-    if !current.can_access_shelf(req.shelf_id) {
-        return Err(AppError::biz(
-            crate::shared::error::code::SHELF_MISMATCH,
-            format!("无权限访问 shelf {}", req.shelf_id),
-        ));
-    }
-    // INSPECTED 时 target_inspection_shelf_id 也必须校验（防御性，避免 SHELF_ACCOUNT
-    // 用户手填两个不在 scope 内的 shelf_id）
-    if let Some(tid) = req
-        .target_inspection_shelf_id
-        .as_deref()
-        .and_then(|s| s.parse::<i64>().ok())
-        && !current.can_access_shelf(tid)
-    {
-        return Err(AppError::biz(
-            crate::shared::error::code::SHELF_MISMATCH,
-            format!("无权限访问 shelf {}", tid),
-        ));
-    }
+    // 2026-10-10：`shelf_id` / `target_inspection_shelf_id` 两个入参删除 ⇒ handler
+    // 侧那两道 `can_access_shelf` 防御检查也一并消失。货架范围收敛改由
+    // `shared::shelf::select::shelf_scope_for` 在**选架那一步**统一承担
+    // （它同时覆盖 SHELF_ACCOUNT 的手填白名单与 Manager 的 wildcard）。
     let mut tx = state.pool.begin().await?;
     // scan（状态翻转 + 写事件日志）
     let scan_out =
@@ -329,7 +316,11 @@ pub async fn worker_scan(
         &state.snowflake,
         scan_out.worker_id,
         scan_out.work_type_id,
-        req.shelf_id,
+        // 2026-10-10：worker-scan 的 refill **不再有架锚** —— 跨全部映射该工种工序的
+        // 活跃生产架取料。负载均衡的整体职责已在「放回时 `pick_least_loaded` 选架」
+        // 一侧完成，继续按架过滤会在「放回到 A 架 → 随即从 A 架补料」这个闭环里查空池
+        // （尤其是链尾自动送检：批次根本没落任何生产架）。
+        None,
         &scan_out.badge_code,
         current.id,
         &current,
@@ -352,9 +343,11 @@ pub async fn worker_scan(
     } else if refill_out.pool_empty {
         state.ws_hub.broadcast(WsEvent::DashboardEvent {
             kind: "WORKER_POOL_EMPTY".into(),
+            // 2026-10-10：`shelf_id` 键删除（refill 已无架锚，worker-scan 也不再收它）。
+            // WS payload 与 HTTP 响应的 `refill.shelf_id` 同步为 `null`。
             payload: json!({
                 "worker_id": scan_out.worker_id.to_string(),
-                "shelf_id": req.shelf_id.to_string(),
+                "shelf_id": serde_json::Value::Null,
                 "pool_empty": true,
             }),
         });

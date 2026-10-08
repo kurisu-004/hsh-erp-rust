@@ -739,8 +739,21 @@ async fn worker_scan_returned_triggers_refill() {
     link_shelf_to_process(&pool, prod_shelf, proc).await;
 
     let worker = insert_worker(&pool, "BC002", "工2", Some(wt)).await;
-    let (_held_part, _held_batch, _step) =
+    let (_held_part, held_batch, _step) =
         insert_worker_held_part(&pool, customer, "H-002", worker, proc, 1, true).await;
+    // 2026-10-10：清掉 step 指针，把批次压到「非顺应 ⇒ 用请求里的 `next_process_id`」
+    // 那条分支。
+    //
+    // 为什么要清：fixture 造的是**单 step 链**，指针一致时 `chain_state == "TAIL"`
+    // ⇒ RETURNED 会被「链尾自动送检」接管（那正是本用例**不**想测的路径 —— 本用例测
+    // 「放回生产架 → refill」，链尾自动送检由
+    // `worker_scan_returned_at_chain_tail_auto_sends_to_inspection` 专门覆盖）。
+    // 清指针让 `is_pointer_consistent = false`，既绕开 TAIL 又落到显式分支。
+    sqlx::query("UPDATE t_part_batch SET current_process_step_id = NULL WHERE id = $1")
+        .bind(held_batch)
+        .execute(&pool)
+        .await
+        .expect("clear step pointer");
     let (_pool_part, _pool_batch) =
         insert_pool_part(&pool, customer, "P-002", prod_shelf, proc, 1).await;
 
@@ -954,13 +967,20 @@ async fn worker_scan_returned_advances_current_process_id() {
 /// 1. 前置：`t_part.process_chain_id IS NULL`（防 fixture 未来被改成有链而假绿）
 /// 2. `POST /prod/batches/worker-scan`（RETURNED）→ HTTP 200 + `code=0`
 /// 3. `current_process_id` 推进到 `next_process_id`（RETURNED 的主状态变更）
-/// 4. `current_process_step_id` 保留原值（走 else 分支）
+/// 4. `current_process_step_id` 仍为 NULL（step 指针扫描前已被清空 → 无链 ⇒ step 落 NULL）
+///
+/// ## 2026-10-10：为什么本用例要先把 step 指针清空
+/// 锚链解析会**回退**到批次的 step 指针所属链（`COALESCE(p.process_chain_id,
+/// cur.chain_id)`），所以「part 无链 + 指针非空」这条形态**仍然能解析出链**；而
+/// fixture 造的是单 step 链 ⇒ 指针一致时 `chain_state == "TAIL"` ⇒ RETURNED 会被
+/// 「链尾自动送检」接管。清空指针让三条闸门（非顺应 / 指针漂移 / 链解析不出来）同时
+/// 成立，才真正测到「无链 ⇒ 要求前端显式 `next_process_id`」这条分支。
 ///
 /// ## 断言 4 的诚实边界
-/// `mark_batch_returned` 的 `current_process_step_id` 形参带 `_` 前缀、SQL 里
-/// **不写**该列（2026-09-30 起的已知缺口，只影响显示），所以「保留原值」
-/// 无论 else 分支返回什么都成立 —— 它是**防回归的护栏**（挡住将来有人改成写 NULL），
-/// 不是 else 分支确实执行过的证明。真正的回归信号是断言 2 的 HTTP 200。
+/// 改清指针之后，断言 4 从「原值被保留」退化成「本来就是 NULL 所以还是 NULL」——
+/// **信息量归零**，真正的回归信号是断言 2 的 HTTP 200 与断言 3 的工序推进。
+/// 「原值被保留」这条不变式改由 `worker_scan_returned_advances_step_pointer_when_process_chain_is_consistent`
+/// 覆盖（它有链、指针非空、且断言指针被推到链内下一 step）。
 #[tokio::test]
 async fn worker_scan_returned_without_process_chain_succeeds() {
     let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
@@ -980,6 +1000,19 @@ async fn worker_scan_returned_without_process_chain_succeeds() {
     // 的旧 current_process_step_id，好让断言 4 有东西可保留
     let (_held_part, held_batch, old_step) =
         insert_worker_held_part(&pool, customer, "H-002D", worker, proc_b, 1, false).await;
+    // 2026-10-10：锚链解析会回退到 `cur.chain_id`，所以「part 无链 + 指针非空」这条
+    // 形态仍能解析出链、并被判成 `TAIL` ⇒ 会被「链尾自动送检」接管。本用例要测的是
+    // **无链 ⇒ 要求前端显式 `next_process_id`** 这条分支，故把 step 指针恢复成
+    // 刚插入时的 NULL 之外的值不可能 —— 只能反过来：这里保留 `old_step` 只作
+    // 「写入不变式」的护栏，并显式把指针清空，让链真的解析不出来。
+    //
+    // ⚠️ 清空后断言 4（`current_process_step_id` 保留原值）恒成立且信息量归零 ——
+    // 它从「防回归护栏」降级为平凡断言，真正的回归信号是 HTTP 200 + 工序推进。
+    sqlx::query("UPDATE t_part_batch SET current_process_step_id = NULL WHERE id = $1")
+        .bind(held_batch)
+        .execute(&pool)
+        .await
+        .expect("clear step pointer");
 
     // 前置守卫：fixture 的 `with_chain=false` 失效的话，本测试会变成假绿，先在这里 fail
     let chain_id: Option<i64> = sqlx::query_scalar(
@@ -1033,11 +1066,11 @@ async fn worker_scan_returned_without_process_chain_succeeds() {
         after.0
     );
     assert_eq!(
-        after.1,
-        Some(old_step),
-        "part 无工艺链时 RETURNED 应保留批次既有 current_process_step_id({old_step})，实际 {:?}",
+        after.1, None,
+        "step 指针在扫描前已被本用例清空（造非顺应形态），RETURNED 后应仍为 NULL，实际 {:?}",
         after.1
     );
+    let _ = old_step;
 }
 
 /// 造一个「**已绑链的 PENDING 批次**」，链内 `process_ids` 按数组顺序占
@@ -1284,6 +1317,17 @@ async fn worker_scan_returned_requires_next_process_id_when_not_consistent() {
     let worker = insert_worker(&pool, "BC002F", "工2F", Some(wt)).await;
     let (_held_part, held_batch, _step) =
         insert_worker_held_part(&pool, customer, "H-002F", worker, proc_b, 1, false).await;
+    // 2026-10-10：把 step 指针清成 NULL，造出**真的**非顺应形态。
+    //
+    // fixture 造的链是单 step 链，而锚链解析会回退到 `cur.chain_id`（批次的 step 指针
+    // 所属链）—— 于是 `with_chain=false` 并不足以让本批次落到「非顺应」：锚链仍能解析、
+    // 指针仍一致、`chain_state` 落 `TAIL`。指针清空后 `is_pointer_consistent = false`，
+    // 三条闸门（非顺应 / 指针漂移）都成立，本用例才真正测到它声称测的那条分支。
+    sqlx::query("UPDATE t_part_batch SET current_process_step_id = NULL WHERE id = $1")
+        .bind(held_batch)
+        .execute(&pool)
+        .await
+        .expect("clear step pointer");
 
     let (app, token, _pool) = login_shelf_account(pool.clone(), "user2f", &[prod_shelf]).await;
     let (s, env) = send(
@@ -3227,5 +3271,211 @@ async fn has_process_chain_reflects_chain_and_pointer_state() {
         held_item_of(part_c)["chain_state"],
         json!("NONE"),
         "C 的指针与工序都为空 ⇒ chain_state 仍是 NONE（本次不动它）: {env3}"
+    );
+}
+
+// ===========================================================================
+//  2026-10-10：worker-scan 自动选架 / 链尾自动送检 / refill 跨架取料
+// ===========================================================================
+
+/// RETURNED：目标架由服务端按负载选出，请求里**没有** `shelf_id`。
+///
+/// 两个映射架按 `display_order` 排成 A / B，但 `capacity` + 在架件数排成另一条次序
+/// （A 80%、B 20%），断言落 B —— 于是「按物理顺序取第一个」与「按负载取最空」两种
+/// 口径被分开。批次 `current_holder_id` 就是被断言的那个架 id。
+#[tokio::test]
+async fn worker_scan_returned_picks_least_loaded_shelf() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "AUTO-PICK").await;
+    let proc_a = seed_process(&pool, "AP-P1", "AP1").await;
+    let proc_b = seed_process(&pool, "AP-P2", "AP2").await;
+    let wt = insert_work_type(&pool, "AP-WT", "AP工种", Some(0)).await;
+    link_work_type_to_process(&pool, wt, proc_a).await;
+
+    let shelf_a = insert_shelf(&pool, "AP-SH-A", "AP架A", "PRODUCTION").await;
+    let shelf_b = insert_shelf(&pool, "AP-SH-B", "AP架B", "PRODUCTION").await;
+    for shelf in [shelf_a, shelf_b] {
+        sqlx::query("UPDATE t_shelf SET capacity = 100, display_order = $2 WHERE id = $1")
+            .bind(shelf)
+            .bind(if shelf == shelf_a { 0_i32 } else { 1 })
+            .execute(&pool)
+            .await
+            .expect("set capacity/display_order");
+        link_shelf_to_process(&pool, shelf, proc_b).await;
+    }
+    // 在架负载：A 80 件、B 20 件（`SUM(quantity)` 件数口径）
+    let (_pa, _ba) = insert_pool_part(&pool, customer, "AP-LOAD-A", shelf_a, proc_b, 80).await;
+    let (_pb, _bb) = insert_pool_part(&pool, customer, "AP-LOAD-B", shelf_b, proc_b, 20).await;
+
+    let worker = insert_worker(&pool, "AP-W1", "AP工人", Some(wt)).await;
+    let (_held_part, held_batch, _step) =
+        insert_worker_held_part(&pool, customer, "AP-HELD", worker, proc_a, 1, false).await;
+    // 清 step 指针压到「非顺应 ⇒ 显式 `next_process_id`」分支：fixture 的链是单
+    // step 链，指针一致时会被判成 `TAIL` 并被「链尾自动送检」接管（那条路径由
+    // `worker_scan_returned_at_chain_tail_auto_sends_to_inspection` 覆盖）
+    sqlx::query("UPDATE t_part_batch SET current_process_step_id = NULL WHERE id = $1")
+        .bind(held_batch)
+        .execute(&pool)
+        .await
+        .expect("clear step pointer");
+
+    let (app, token, _pool) =
+        login_shelf_account(pool.clone(), "ap-user", &[shelf_a, shelf_b]).await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/batches/worker-scan",
+            Some(json!({
+                "serial_no": "AP-HELD",
+                "badge_code": "AP-W1",
+                "event_type": "RETURNED",
+                "next_process_id": proc_b.to_string(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "scan RETURNED: {env}");
+    assert_eq!(env["data"]["scan"]["event_type"], "WORKER_SCAN_RETURNED");
+
+    let (holder, location, current_process): (Option<i64>, Option<String>, Option<i64>) =
+        sqlx::query_as(
+            "SELECT current_holder_id, location, current_process_id FROM t_part_batch WHERE id = $1",
+        )
+        .bind(held_batch)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        holder,
+        Some(shelf_b),
+        "应落负载比例最低的架（20%），不是 display_order 最小的 A（80%）"
+    );
+    assert_eq!(location.as_deref(), Some("PRODUCTION_SHELF"));
+    assert_eq!(current_process, Some(proc_b), "工序应推进到目标工序");
+}
+
+/// 链尾自动送检：单 step 链 + 指针一致 ⇒ RETURNED 直接送检。
+///
+/// 断言四件事：HTTP 200、响应 `event_type = "WORKER_SCAN_INSPECTED"`（**与请求的
+/// `RETURNED` 不同** —— 这是前端必须按响应分支的那条语义）、批次
+/// `status = INSPECTION` + `location = INSPECTION_SHELF`、holder 是服务端选出的
+/// 品检架。
+#[tokio::test]
+async fn worker_scan_returned_at_chain_tail_auto_sends_to_inspection() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "TAIL").await;
+    let proc_only = seed_process(&pool, "TAIL-P", "链尾唯一工序").await;
+    let wt = insert_work_type(&pool, "TAIL-WT", "TAIL工种", Some(0)).await;
+    link_work_type_to_process(&pool, wt, proc_only).await;
+
+    let prod_shelf = insert_shelf(&pool, "TAIL-SH", "TAIL架", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc_only).await;
+    let insp_shelf = insert_shelf(&pool, "TAIL-INSP", "TAIL品检架", "INSPECTION").await;
+
+    // `with_chain = true` ⇒ part 绑链，链内**只有一道** step（= 链尾），且批次指针
+    // 指向它 ⇒ `is_pointer_consistent = true` ∧ `chain_state == "TAIL"`
+    let worker = insert_worker(&pool, "TAIL-W1", "TAIL工人", Some(wt)).await;
+    let (_held_part, held_batch, _step) =
+        insert_worker_held_part(&pool, customer, "TAIL-HELD", worker, proc_only, 1, true).await;
+
+    let (app, token, _pool) =
+        login_shelf_account(pool.clone(), "tail-user", &[prod_shelf, insp_shelf]).await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/batches/worker-scan",
+            // 刻意**不传** `next_process_id`：链尾没有下一道，它本来就该可省
+            Some(json!({
+                "serial_no": "TAIL-HELD",
+                "badge_code": "TAIL-W1",
+                "event_type": "RETURNED",
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "链尾 RETURNED 应自动送检: {env}");
+    assert_eq!(
+        env["data"]["scan"]["event_type"], "WORKER_SCAN_INSPECTED",
+        "响应的 event_type 必须反映实际发生的动作（链尾 ⇒ 送检）: {env}"
+    );
+
+    let (status, location, holder): (String, Option<String>, Option<i64>) = sqlx::query_as(
+        "SELECT status, location, current_holder_id FROM t_part_batch WHERE id = $1",
+    )
+    .bind(held_batch)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(status, "INSPECTION");
+    assert_eq!(location.as_deref(), Some("INSPECTION_SHELF"));
+    assert_eq!(holder, Some(insp_shelf), "应落服务端自动选出的品检架");
+}
+
+/// refill 跨架取料：worker-scan 路径传 `shelf_id = None`，候选池**不限架**。
+///
+/// 两个生产架各有一个在架批次；放回时落 A 架（只给 A 架配了映射），随后的 refill 若
+/// 还按架取料就只能拿到 A 架那一批 —— 断言它拿到了**两个架**的批次即证明跨架生效。
+#[tokio::test]
+async fn refill_takes_across_all_shelves_without_shelf_anchor() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "XSHELF").await;
+    let proc_a = seed_process(&pool, "XS-P1", "XS1").await;
+    let proc_b = seed_process(&pool, "XS-P2", "XS2").await;
+    let wt = insert_work_type(&pool, "XS-WT", "XS工种", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc_a).await;
+    link_work_type_to_process(&pool, wt, proc_b).await;
+
+    // A 架只映射 proc_a（RETURNED 的目标架）；B 架映射 proc_b，且预置一个批次
+    let shelf_a = insert_shelf(&pool, "XS-SH-A", "XS架A", "PRODUCTION").await;
+    let shelf_b = insert_shelf(&pool, "XS-SH-B", "XS架B", "PRODUCTION").await;
+    link_shelf_to_process(&pool, shelf_a, proc_a).await;
+    link_shelf_to_process(&pool, shelf_b, proc_b).await;
+    let (_pb, batch_b) = insert_pool_part(&pool, customer, "XS-POOL-B", shelf_b, proc_b, 1).await;
+
+    let worker = insert_worker(&pool, "XS-W1", "XS工人", Some(wt)).await;
+    let (_held_part, held_batch, _step) =
+        insert_worker_held_part(&pool, customer, "XS-HELD", worker, proc_a, 1, false).await;
+    sqlx::query("UPDATE t_part_batch SET current_process_step_id = NULL WHERE id = $1")
+        .bind(held_batch)
+        .execute(&pool)
+        .await
+        .expect("clear step pointer");
+
+    let (app, token, _pool) = login_shelf_account(pool.clone(), "xs-user", &[shelf_a]).await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/batches/worker-scan",
+            Some(json!({
+                "serial_no": "XS-HELD",
+                "badge_code": "XS-W1",
+                "event_type": "RETURNED",
+                "next_process_id": proc_a.to_string(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "scan RETURNED: {env}");
+    let taken = env["data"]["refill"]["taken"]
+        .as_array()
+        .expect("refill.taken");
+    let batch_ids: Vec<String> = taken
+        .iter()
+        .map(|t| t["batch_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        taken.len(),
+        2,
+        "refill 应跨两个架各取一件（放回那件 + B 架原有那件）: {env}"
+    );
+    assert!(
+        batch_ids.contains(&batch_b.to_string()),
+        "必须取到 B 架的批次 {batch_b}（证明不限架）: {env}"
     );
 }

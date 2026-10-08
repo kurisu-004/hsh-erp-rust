@@ -5,9 +5,11 @@
 //!
 //! - `take_one_from_pool` —— 工人「抢一批」原子 SQL。CTE + FOR UPDATE SKIP LOCKED，
 //!   单条 SQL 内同时原子地完成：(1) 计算「已持批次数 < max_held_batches」守卫；
-//!   (2) 从候选池按 system_delivery_date → planned_delivery_date → is_urgent → id
-//!   优先级取一批；(3) UPDATE t_part_batch 与 t_part 的 holder/location/version。
+//!   (2) 从候选池按 `shared::shelf::pool_priority::POOL_PRIORITY_ORDER_SQL`
+//!   （加急 → 系统交期 → 计划交期 → CNC 已编程）取一批；(3) UPDATE t_part_batch
+//!   与 t_part 的 holder/location/version。
 //!   0 行 → 池空或达上限，返回 Ok(None)，由 service 决定是否抛容量/空池业务错。
+//!   2026-10-10：`shelf_id` 形参改 `Option<i64>`，`None` = 跨全部货架取料。
 //! - `take_specific_from_pool` —— 同上，但指定 batch_id（POOL→WORKER 移动用）
 //! - `move_worker_to_worker` —— worker ↔ worker 移动（OCC）
 //!
@@ -16,9 +18,10 @@
 //! 改由 [`crate::modules::prod::queue::board`] 的聚合 SQL 承担（那几个方法是
 //! 逐工序 / 逐 worker 的，前端正是要靠它们发 N+1 个请求）。
 
-use sqlx::PgConnection;
+use sqlx::{AssertSqlSafe, PgConnection};
 
 use crate::shared::error::AppError;
+use crate::shared::shelf::pool_priority::POOL_PRIORITY_ORDER_SQL;
 
 use crate::modules::prod::queue::vo::worker::TakenItem;
 
@@ -42,13 +45,15 @@ struct TakenRow {
 pub struct QueueRepo;
 
 impl QueueRepo {
-    /// 工人从其货架候选池「抢一批」（单 SQL 原子：held<max 守卫 + FOR UPDATE SKIP LOCKED）。
+    /// 工人「抢一批」（单 SQL 原子：held<max 守卫 + FOR UPDATE SKIP LOCKED）。
     ///
     /// 参数：
     /// - `conn`：调用方持有事务（handler 的 `state.pool.begin()`），repo 不 commit。
     /// - `worker_id`：目标工人 snowflake id（`t_worker.id`）。
-    /// - `shelf_id`：工人所属货架（`t_shelf.id`），候选池按 `t_part_batch.current_holder_id = shelf_id` 过滤。
-    /// - `process_ids`：工人可加工工序 id 列表（`t_process.id`），候选池按 `t_part_batch.current_process_id = ANY($3)` 过滤。
+    /// - `shelf_id`：**2026-10-10 起是 `Option<i64>`**。`Some(sid)` 限架（管理员
+    ///   显式「为某工人在某架上抢料」）；`None` **跨全部货架**取料。
+    /// - `process_ids`：工人可加工工序 id 列表（`t_process.id`），候选池按
+    ///   `t_part_batch.current_process_id = ANY($3)` 过滤。
     /// - `operator_user_id`：审计字段 `updated_by`，由 service 透传（一般是 manager 自己）。
     ///
     /// 返回 `Ok(None)` 当且仅当：候选池为空 / 工人已达 `max_held_batches`。
@@ -60,15 +65,35 @@ impl QueueRepo {
     /// 匹配不到任何行 → 批次对候选池隐身。现改为按
     /// `pb.current_process_id`（池归属权威依据）直接过滤，删掉 JOIN（顺带省
     /// 一次主键查找）。
+    ///
+    /// ## 2026-10-10 三处变化
+    ///
+    /// 1. **不再有「架锚」**：候选 WHERE 的 `pb.current_holder_id = $2` 换成
+    ///    `($2::bigint IS NULL OR pb.current_holder_id = $2)`。worker-scan 端点的
+    ///    `shelf_id` 入参已删除（放回时由 `pick_least_loaded` 选架），refill 若还按架
+    ///    过滤就会在「放回到 A 架、随即从 A 架补料」这个闭环里查空池。负载均衡的职责
+    ///    已经整体移到 `pick_least_loaded`（放回时选架）一侧。
+    /// 2. **ORDER BY 换成 `shared::shelf::pool_priority::POOL_PRIORITY_ORDER_SQL`**，
+    ///    与看板池明细（`board/repo.rs::SQL_POOL_ITEMS_BY_PROCESS`）同一份。此前两处
+    ///    各写一套且**已经漂移**（这里「已编程」排最前，那里「系统交期」排最前），
+    ///    于是「看板上看到的顺序」与「工人实际抢到的顺序」对不上。
+    /// 3. **新增 `LEFT JOIN t_process pr`**（供上面那条片段的第 4 层判 `is_cnc`）。
+    ///
+    /// ## 为什么从 `query_as!` 改成运行时 `query` + `AssertSqlSafe`
+    ///
+    /// `POOL_PRIORITY_ORDER_SQL` 是一个**编译期常量**，但它要插进 CTE 的 `ORDER BY`
+    /// 位置 —— `query_as!` 宏只吃 `&'static str` 字面量，没法在编译期做
+    /// `concat!`。改成运行时 `query` + `format!` 填片段 + `AssertSqlSafe` 之后：
+    /// 注入面为 0（用户输入一律走 bind，填进去的是一个编译期常量），代价是这条 SQL
+    /// 不再进 `.sqlx/` 离线缓存（与 `board/repo.rs` 的选择同因）。
     pub async fn take_one_from_pool(
         conn: &mut PgConnection,
         worker_id: i64,
-        shelf_id: i64,
+        shelf_id: Option<i64>,
         process_ids: &[i64],
         operator_user_id: i64,
     ) -> Result<Option<TakenItem>, AppError> {
-        let row: Option<TakenRow> = sqlx::query_as!(
-            TakenRow,
+        let sql = format!(
             r#"
             WITH
             held AS (
@@ -83,36 +108,25 @@ impl QueueRepo {
             ),
             candidate AS (
                 SELECT pb.id, pb.version, pb.part_id,
-                       -- 2026-09-29 新增：has_cnc_program!（已上传 G_CODE → TRUE）。
-                       -- 见 ORDER BY 第 1 键：已编程 batch 优先 take（编程员已完成
-                       -- G_CODE 上传，下一步即可上机）。
+                       -- 已上传 G_CODE → TRUE。透传给 `TakenItem.has_cnc_program`
+                       --（前端据此提示「可直接上机」）。
                        EXISTS (SELECT 1 FROM t_part_file pf
                                WHERE pf.part_id = pb.part_id
                                  AND pf.kind = 'G_CODE'
-                                 AND pf.deleted_at IS NULL) AS "has_cnc_program!"
+                                 AND pf.deleted_at IS NULL) AS has_cnc_program
                 FROM t_part_batch pb
                 JOIN t_part p ON p.id = pb.part_id
+                LEFT JOIN t_process pr ON pr.id = pb.current_process_id
                 -- 2026-09-30：候选池归属改按 pb.current_process_id 普通过滤
                 --   （删 JOIN t_process_chain_step，见函数 doc 的 bug 修复说明）
                 WHERE pb.status = 'IN_PROCESS'
                   AND pb.location = 'PRODUCTION_SHELF'
-                  AND pb.current_holder_id = $2
+                  AND ($2::bigint IS NULL OR pb.current_holder_id = $2)
                   AND pb.current_process_id = ANY($3)
                   AND pb.deleted_at IS NULL
                   AND p.deleted_at IS NULL
                   AND (SELECT n FROM held) < (SELECT max_held FROM max_batches)
-                ORDER BY
-                    -- 2026-09-29 新增：已编程 batch 优先（has_cnc_program DESC）。
-                    -- 同交期同加急时，先把已上传 G_CODE 的工件派给工人，省
-                    -- 「工人拿到手 → 还要等编程员传程序」这段等待。
-                    EXISTS (SELECT 1 FROM t_part_file pf
-                            WHERE pf.part_id = pb.part_id
-                              AND pf.kind = 'G_CODE'
-                              AND pf.deleted_at IS NULL) DESC,
-                    p.system_delivery_date ASC NULLS LAST,
-                    p.planned_delivery_date ASC NULLS LAST,
-                    p.is_urgent DESC,
-                    pb.id ASC
+                ORDER BY {POOL_PRIORITY_ORDER_SQL}
                 LIMIT 1
                 FOR UPDATE OF pb SKIP LOCKED
             ),
@@ -136,18 +150,19 @@ impl QueueRepo {
                    sp.serial_no, sp.drawing_no,
                    sp.system_delivery_date, sp.planned_delivery_date,
                    sp.is_urgent, ub.version,
-                   -- 2026-09-29 新增：从 candidate 透传 has_cnc_program
-                   (SELECT "has_cnc_program!" FROM candidate WHERE candidate.id = ub.id) AS "has_cnc_program!"
+                   -- 从 candidate 透传 has_cnc_program
+                   (SELECT has_cnc_program FROM candidate WHERE candidate.id = ub.id) AS has_cnc_program
             FROM upd_batch ub JOIN sel_part sp ON sp.id = ub.part_id
-            "#,
-            worker_id,
-            shelf_id,
-            process_ids as &[i64],
-            operator_user_id,
-        )
-        .fetch_optional(&mut *conn)
-        .await
-        .map_err(AppError::from)?;
+            "#
+        );
+        let row: Option<TakenRow> = sqlx::query_as::<_, TakenRow>(AssertSqlSafe(sql))
+            .bind(worker_id)
+            .bind(shelf_id)
+            .bind(process_ids)
+            .bind(operator_user_id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(AppError::from)?;
         Ok(row.map(|r| TakenItem {
             batch_id: r.batch_id,
             part_id: r.part_id,

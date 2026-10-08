@@ -220,11 +220,41 @@ status = 'IN_PROCESS' AND location = 'PRODUCTION_SHELF'
 
 `status` / `location` 这两列是「一个批次在某道工序的候选池里」的判据，被 3 处共用：
 
-| 用途 | SQL 位置 | `current_process_id` 闸门 | `t_shelf` JOIN |
-|---|---|---|---|
-| 序列板各工序计数（端点 1） | `board/repo.rs::SQL_POOL_COUNT_BY_PROCESS` | `IS NOT NULL` | **无** |
-| 单工序候选池明细（端点 2 `items[]`） | `board/repo.rs::SQL_POOL_ITEMS_BY_PROCESS` | `= $1` | **INNER**（`s.id = pb.current_holder_id AND s.deleted_at IS NULL`） |
-| 抢占（`take_one_from_pool` / `take_specific_from_pool`） | `repo/sql.rs` | `= ANY($1)` | **无** |
+| 用途 | SQL 位置 | `current_process_id` 闸门 | 货架范围 | `t_shelf` JOIN |
+|---|---|---|---|---|
+| 序列板各工序计数（端点 1） | `board/repo.rs::SQL_POOL_COUNT_BY_PROCESS` | `IS NOT NULL` | 跨全部货架 | **无** |
+| 单工序候选池明细（端点 2 `items[]`） | `board/repo.rs::SQL_POOL_ITEMS_BY_PROCESS` | `= $1` | 跨全部货架（明细本身 INNER JOIN `t_shelf` 顺带展示架信息） | **INNER**（`s.id = pb.current_holder_id AND s.deleted_at IS NULL`） |
+| 抢占 `take_one_from_pool`（refill） | `repo/sql.rs` | `= ANY($3)` | **跨全部货架**（`$2::bigint IS NULL OR pb.current_holder_id = $2`） | **无** |
+| 抢占 `take_specific_from_pool`（admin 单批） | `repo/sql.rs` | 无（按 `batch_id` 定位） | **限架**（`pb.current_holder_id = $2`，必传） | **无** |
+
+### 「货架范围」列的口径（2026-10-10）
+
+- **refill（`take_one_from_pool`）不再有架锚**：`$2::bigint IS NULL` 时候选跨全部
+  活跃生产架。worker-scan 的 `shelf_id` 入参已删除（目标架由
+  `shared::shelf::select::pick_least_loaded` 选），refill 若还按架过滤就会在
+  「放回到 A 架 → 随即从 A 架补料」这个闭环里查空池。**负载均衡的整体职责在放回时
+  的选架一侧**。
+- 管理员端点仍是限架：`POST /prod/queue/refill`（`AdminRefillRequest.shelf_id`）与
+  `POST /prod/queue/auto-allocate`（`AutoAllocateRequest.shelf_id`）的 `shelf_id`
+  **保留必填**，handler 传 `Some(req.shelf_id)` 进 `take_one_from_pool` —— 它们是
+  「为某工人在某架上抢料」的显式管理员操作。
+- `POST /prod/queue/move` 的 POOL↔WORKER 方向不经本 SQL（`move` 走
+  `take_specific_from_pool` / `mark_batch_*`），其 `shelf_id` 语义未变。
+
+### 取件优先级（2026-10-10 统一）
+
+看板池明细与 refill 取料共用**同一份** `ORDER BY` 片段
+（`shared::shelf::pool_priority::POOL_PRIORITY_ORDER_SQL`），4 层语义与取舍见该常量
+的 doc：
+
+1. `p.is_urgent DESC` —— 加急在前（人工判定的例外，优先级高于系统交期）
+2. `p.system_delivery_date ASC NULLS LAST`
+3. `p.planned_delivery_date ASC NULLS LAST`
+4. CNC 工序内已上传 G_CODE 的批次优先（`pr.is_cnc` 门控）
+5. `pb.id ASC` —— 稳定兜底（`FOR UPDATE SKIP LOCKED` 的前提）
+
+⚠️ 本节之前两处排序**已经漂移**：refill 把「已编程」排最前，看板把「系统交期」排最前
+⇒ 工人以为在按加急抢货，板子上却是另一套顺序。现已收口为一份片段。
 
 `current_process_id` 闸门是必需的：端点 1 靠它丢弃「池归属为空」的批次（否则 `GROUP BY` 会产出一个 NULL 组而解码进 `i64` 直接报错），端点 2 / 抢占是拿它当等值 / 数组匹配条件。⚠️ 这条谓词是「出池必须置 `current_process_id` NULL」这条不变式的**兜底**：写点万一漏清，脏值也命中不了池查询。
 
@@ -385,6 +415,38 @@ queue 域**整体不适用**域隔离护栏：它继承 worker_pool 的「经本
 11. **`POST /queue/move` 的 `version` 升为必填**（2026-10-09）：此前三个方向都由 service 用「本次事务里刚读到的 `batch.version`」当 `expected_version`，等价于**没有 OCC** —— 看板数据是 30s 缓存的快照，期间他人改过批次时「用户看到 5 件 → 实际移动 3 件」会静默成功。值取候选卡 / 持有卡的 `version`；漏传 → **HTTP 422 纯文本**（`version` 无 `#[serde(default)]`）。
 
 ### 8.4 已知偏差登记
+
+---
+
+**`ShelfProcessRepo::find_first_shelf_for_process` 已无调用方**（2026-10-10 登记）。
+
+dispatch 的目标货架自 2026-10-10 起改走
+`shared::shelf::select::pick_least_loaded`（按 `current_load / capacity` 升序），
+该方法（`t_shelf_process` 上 `sort_order ASC, id ASC LIMIT 1`）因此**失去唯一调用方**。
+
+**保留不删**，理由与后续处置：
+
+- **口径已不同**：新的退化路径（候选集里全部架都没配 `capacity`）在选架 SQL 内
+  自然退化成 `display_order ASC, id ASC`，而旧方法是 `t_shelf_process.sort_order ASC`
+  —— **两者的「第一」不是同一个**。同一道工序在两种口径下可能落到不同的架（映射行
+  的 `sort_order` 与货架的 `display_order` 是两套独立的人工排序）。
+- **下一轮决定**：要么删（判定它已无价值），要么复用为「全部架都不限容量时按映射
+  顺序取首个」的显式退化路径（那样就要把 `display_order` 与 `sort_order` 的优先级
+  写进选架 SQL，并同步改那条退化路径的文档与测试）。**不要**在没想清楚这两套排序的
+  关系之前就把它接回去。
+
+---
+
+**`capacity IS NULL OR <= 0` 视为「不限」时，选架退化到 `display_order ASC, id ASC`**
+（2026-10-10 登记，与上一条同源）。
+
+存量货架的 `capacity` 全为 NULL（migration 未 backfill，容量未知），故生产库现状下
+选架**恒走这条退化路径**。此时排序等价于「按人工排的物理顺序取第一个可用架」，
+与 2026-10-10 之前 dispatch 的行为相近但不完全相同（见上一条：映射 `sort_order` vs
+货架 `display_order`）。要让负载均衡真正生效，需要在货架管理页给货架配容量；
+在此之前，本仓**不对退化路径与旧口径的差异做补偿**。
+
+---
 
 **存量批次的 `current_process_step_id` 为 NULL 或陈旧**（2026-10-09 新增登记）。
 

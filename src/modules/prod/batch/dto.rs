@@ -133,40 +133,46 @@ pub struct BatchToShipRequest {
 /// 无 Path extractor：`serial_no` 是主键，`batch_id` 仅在多批次歧义时用于消歧。
 /// `event_type`：`WorkerScanEvent::RETURNED` / `INSPECTED`。
 ///
-/// ## `next_process_id`：**仅非顺应工序时必填**（2026-10-09 改写）
-/// 此前它是「RETURNED 必填」。现在后端会先解析批次在工序链上的位置
+/// ## `next_process_id`：**仅非顺应工序时必填**（2026-10-09 改写，2026-10-10 微调）
+/// 后端先解析批次在工序链上的位置
 /// （`shared::batch::chain::resolve_chain_position`，判据与读侧
-/// `GET /parts/by-worker` 的 `chain_state` 逐条同源）：
-/// - **顺应工序**（step 指针与 `current_process_id` 一致）且链内有下一道 ⇒ 后端按链
-///   推导下一道工序与 step，**本字段可省略**；
-/// - **非顺应工序**（无链 / 链已软删 / 指针漂移 / 链内同一 `process_id` 重复 /
-///   当前已是链尾）⇒ **必填**，缺失 → `40001 VALIDATION_ERROR`。
+/// `GET /parts/by-worker` 的 `chain_state` 逐条同源），按下表分流：
 ///
-/// 字段类型保持 `Option<String>` 不变（本轮不改 wire）：前端可以继续照
-/// `chain_state` 决定填不填，两条路径都合法。
+/// | 链上位置 | 分流 | `next_process_id` |
+/// |---|---|---|
+/// | `TAIL`（链内最后一道） | **自动送检**（2026-10-10 新增）：这批做完了，不落生产架 | 可省略 |
+/// | `NEXT` 且顺应 | 后端按链推导下一道工序与 step | 可省略 |
+/// | 其余（非顺应：无链 / 链已软删 / 指针漂移 / 链内 `process_id` 重复） | 按前端指定推进 | **必填**，缺失 → `40001` |
 ///
-/// `shelf_id`：**必填，且两个 event_type 都是 PRODUCTION 区的 worker-scan 货架** ——
-/// service 对它做的是**无条件**的 PRODUCTION 硬校验（不分 `event_type`），非
-/// PRODUCTION → 20501 `BIZ_SHELF_NOT_FOUND`。**不要**把 INSPECTION 区的品检架塞进
-/// 本字段：INSPECTED 的品检架走 `target_inspection_shelf_id`。任何声称本字段
-/// 「按 `event_type` 分支校验 zone」的说明都是错的 —— 本段是唯一权威口径。
+/// 字段类型保持 `Option<String>` 不变（不改 wire）：前端可以继续照 `chain_state`
+/// 决定填不填，两条路径都合法。
 ///
-/// 它**必须留在 PRODUCTION 区**的真正原因不是「工人站在哪个架前」：INSPECTED 时它
-/// 是**补料用的生产架**，在同事务的 worker-pool refill 里当候选池的
-/// `current_holder_id` 过滤键用（候选池 SQL 限
-/// `location='PRODUCTION_SHELF' AND current_holder_id = $2`，见
-/// `prod/queue/repo/sql.rs`）。传品检架会让 refill 查空池。
+/// ## ⚠️ 响应 `event_type` 可能与请求的**不同**（2026-10-10 新增）
+/// 请求发 `RETURNED` 但批次在链尾时，服务端把它当送检处理，响应
+/// `event_type = "WORKER_SCAN_INSPECTED"`。前端**必须按响应里的 `event_type` 分支**，
+/// 不能按自己发的那一个 —— 服务端比前端更清楚批次做完了没有。语义与 WS 链路登记见
+/// `docs/api/batch.md`。
+///
+/// ## 两个货架字段已移除（2026-10-10）
+///
+/// - `shelf_id`：目标生产架改由服务端按负载自动选
+///   （`shared::shelf::select::pick_least_loaded`）。它原先的**双重**身份 —— 「放回
+///   到的架」与「refill 的候选池过滤键」—— 两条都随之消失：放回由选架决定，补料改成
+///   **跨全部映射该工种工序的活跃生产架**取料（`take_one_from_pool` 的
+///   `shelf_id = NULL` 分支）；
+/// - `target_inspection_shelf_id`：目标品检架同样由服务端按负载自动选。选不出时返
+///   `40301 SHELF_MISMATCH`（当前账号 scope 内没有任何可用的 INSPECTION 架）。
+///
+/// 两个字段的移除都是**向后兼容**的（老客户端多发的字段被 serde 静默忽略，本仓生产
+/// 代码零 `deny_unknown_fields`）；但新客户端发老版本服务端会得 422（`shelf_id`
+/// 必填缺失），**部署顺序必须后端先上**。
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkerScanRequest {
     pub serial_no: String,
     pub badge_code: String,
     pub event_type: WorkerScanEvent,
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub shelf_id: i64,
     #[serde(default)]
     pub next_process_id: Option<String>,
-    #[serde(default)]
-    pub target_inspection_shelf_id: Option<String>,
     #[serde(default)]
     pub batch_id: Option<String>,
 }

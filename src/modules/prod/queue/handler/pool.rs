@@ -54,7 +54,9 @@ pub async fn admin_refill(
         &mut tx,
         &state.snowflake,
         req.worker_id,
-        req.shelf_id,
+        // 管理员端点**保留**架锚：它是「为某工人在某架上抢料」的显式操作（Manager
+        // only、前端零消费方）。worker-scan 走的是另一条路径，传 `None`（跨架取料）。
+        Some(req.shelf_id),
         current.id,
         &current,
     )

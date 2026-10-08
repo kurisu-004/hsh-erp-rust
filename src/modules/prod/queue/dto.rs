@@ -37,7 +37,12 @@ pub enum WorkerScanEvent {
     INSPECTED,
 }
 
-/// POST /api/v2/prod/pool/refill
+/// `POST /api/v2/prod/queue/refill` 入参（Manager only，前端零消费方）。
+///
+/// `shelf_id` **2026-10-10 起保留必填**：它是「为某工人在某架上抢料」这条**显式
+/// 管理员操作**的架锚，与 worker-scan 的跨架取料（`shelf_id = null`）是两种口径。
+/// 自动选架只接管了 worker-scan 路径；这里刻意不改，否则「限定在某个架上抢料」
+/// 这个运维动作就没有入口了。
 #[derive(Debug, Clone, Deserialize)]
 pub struct AdminRefillRequest {
     #[serde(deserialize_with = "deserialize_i64")]
@@ -61,6 +66,8 @@ pub enum AutoAllocateMode {
 pub struct AutoAllocateRequest {
     #[serde(deserialize_with = "deserialize_i64")]
     pub process_id: i64,
+    /// 2026-10-10 起**保留必填**，理由同 [`AdminRefillRequest::shelf_id`]：
+    /// 「按工序 + 架自动分配」是管理员的显式批量操作，架锚是它的语义的一部分。
     #[serde(deserialize_with = "deserialize_i64")]
     pub shelf_id: i64,
     pub mode: AutoAllocateMode,
