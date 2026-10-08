@@ -1,4 +1,4 @@
-//! iam 域 account 端点 handler（9 个，原 user 域）
+//! iam 域 account 端点 handler（12 个，原 user 域）
 use std::sync::Arc;
 
 use axum::Json;
@@ -11,7 +11,8 @@ use crate::shared::response::R;
 use crate::state::AppState;
 
 use super::super::dto::{
-    UserAddRoleRequest, UserCreateRequest, UserListQuery, UserUpdateRequest, WxBindRequest,
+    UserAddRoleRequest, UserCreateRequest, UserDeactivateRequest, UserListQuery,
+    UserRemoveRoleRequest, UserUpdateRequest, WxBindRequest, WxUnbindRequest,
 };
 use super::super::vo::{UserListOut, UserOut, UserRoleOut, WxIdentityOut};
 
@@ -59,6 +60,8 @@ pub async fn get_user(
 }
 
 /// POST /api/v2/iam/users/{id}/update —— 纯写端点
+///
+/// OCC 锚点 = `req.version`（客户端必填，缺失 → axum `Json` 提取器返 422 纯文本）。
 pub async fn update_user(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -94,15 +97,19 @@ pub async fn admin_reset_password(
 }
 
 /// POST /api/v2/iam/users/{id}/deactivate —— 纯写端点
+///
+/// OCC 锚点 = `req.version`（客户端必填，缺失 → 422 纯文本）。停用 = 软删
+/// `t_user`，出参仍返被软删那一行的快照（`is_active=false` + `version+1`）。
 pub async fn deactivate_user(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Path(id): Path<i64>,
+    Json(req): Json<UserDeactivateRequest>,
 ) -> Result<Json<R<UserOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out = state
         .account_service
-        .deactivate_user(&mut *tx, id, &current)
+        .deactivate_user(&mut *tx, id, req.version, &current)
         .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
@@ -139,25 +146,29 @@ pub async fn add_role(
 }
 
 /// POST /api/v2/iam/users/{id}/roles/{role_id}/remove —— 纯写端点
+///
+/// OCC 锚点 = `req.version`（被撤销那一行自己的 version，客户端必填）。
 pub async fn remove_role(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Path((id, role_id)): Path<(i64, i64)>,
+    Json(req): Json<UserRemoveRoleRequest>,
 ) -> Result<Json<R<()>>, AppError> {
     let mut tx = state.pool.begin().await?;
     state
         .account_service
-        .remove_role(&mut *tx, id, role_id, &current)
+        .remove_role(&mut *tx, id, role_id, req.version, &current)
         .await?;
     tx.commit().await?;
     Ok(Json(R::ok_empty()))
 }
 /// POST /api/v2/iam/users/{id}/wx-bind —— 写端点（`state.pool.begin()`）
 ///
-/// 2026-09-29 新增：把企业微信 userid 预绑定到系统账号（`t_wx_identity`）。
+/// 把企业微信 userid 预绑定到系统账号（`t_wx_identity`）。请求体只有 `wx_user_id`；
+/// `corp_id` 一律取后端配置 `state.config.wecom.corpid`（与登录侧对称）。
 /// 权限守卫（`require_role(Role::Manager)`）在 service 层——与 `list_users` /
 /// `add_role` 同一做法，handler 不重复校验。
-/// 幂等：绑到同一 user_id 重复调用 → 200；绑到别的 user_id → 40108。
+/// 幂等：同一 userid 重复绑 → 200；userid 已属他人 → 40108；本账号已绑别的 userid → 40110。
 pub async fn bind_wx_identity(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -167,39 +178,46 @@ pub async fn bind_wx_identity(
     let mut tx = state.pool.begin().await?;
     let out = state
         .account_service
-        .bind_wx_identity(&mut tx, id, &req, &state.config.wecom.corpid, &current)
+        .bind_wx_identity(&mut *tx, id, &req, &state.config.wecom.corpid, &current)
         .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
 
 /// GET /api/v2/iam/users/{id}/wx-bind —— 读端点（`state.pool.acquire()`，不开事务）
+///
+/// 未绑定 → `data: null`；已绑定 → `data` 是**单个对象**（业务上双向一对一）。
 pub async fn get_wx_identity(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Path(id): Path<i64>,
-) -> Result<Json<R<Vec<WxIdentityOut>>>, AppError> {
+) -> Result<Json<R<Option<WxIdentityOut>>>, AppError> {
     let mut conn = state.pool.acquire().await?;
     let out = state
         .account_service
-        .get_wx_identity(&mut conn, id, &current)
+        .get_wx_identity(&mut *conn, id, &current)
         .await?;
     Ok(Json(R::ok(out)))
 }
 
-/// DELETE /api/v2/iam/users/{id}/wx-bind —— 写端点（`state.pool.begin()`）
+/// POST /api/v2/iam/users/{id}/wx-bind/unbind —— 写端点（`state.pool.begin()`）
 ///
-/// 幂等：该账号当前无绑定时重复 DELETE → 200 + 空数组。
+/// 2026-10-10 硬切：旧路径 `DELETE /api/v2/iam/users/{id}/wx-bind` **已删、无 alias**
+/// （本仓只用 GET + POST，不留唯一的 DELETE 路由）。返回值从 `R<Vec<WxIdentityOut>>`
+/// 收敛为 `R<()>`——软删后的行快照对调用方无意义。
+/// OCC 锚点 = `req.version`（绑定行自己的 version，客户端必填）。
+/// 幂等：该账号当前无绑定时重复调用 → 200。
 pub async fn unbind_wx_identity(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Path(id): Path<i64>,
-) -> Result<Json<R<Vec<WxIdentityOut>>>, AppError> {
+    Json(req): Json<WxUnbindRequest>,
+) -> Result<Json<R<()>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = state
+    state
         .account_service
-        .unbind_wx_identity(&mut tx, id, &current)
+        .unbind_wx_identity(&mut *tx, id, req.version, &current)
         .await?;
     tx.commit().await?;
-    Ok(Json(R::ok(out)))
+    Ok(Json(R::ok_empty()))
 }

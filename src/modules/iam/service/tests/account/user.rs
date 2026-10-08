@@ -1,12 +1,14 @@
-//! AccountService 单元测试（27 用例，2026-09-23 新增）
+//! `AccountService` 的 `t_user` 子块单测（18 用例）
 //!
-//! 用例覆盖矩阵：
+//! 覆盖矩阵：
 //! - happy path（每个方法 1 个）
-//! - NotFound（get_user / update_user / admin_reset_password / remove_role）
-//! - Duplicate（create_user / add_role）
+//! - NotFound（get_user / update_user / admin_reset_password）
+//! - Duplicate（create_user）
 //! - Forbidden（create_user / admin_reset_password / change_own_password）
-//! - Validation（create_user 空 password / 空 username / full_name）
-//! - VersionConflict（update_user / admin_reset_password / remove_role）
+//! - Validation（create_user 空 password / 空 username）
+//! - VersionConflict（update_user / admin_reset_password / deactivate_user）
+//! - `list_users` 的 N+1 消解：2026-10-10 起批量查角色，断言只发**一次**
+//!   `list_user_roles_by_user_ids`
 //!
 //! mockall 用法：每个 `expect_*.with(eq(...))` 必须严格匹配（mockall 0.15 strict mode）；
 //! service 内**未**调用的方法可不 expect，但调用过的方法都必须 expect。
@@ -15,12 +17,11 @@
 
 use mockall::predicate::*;
 
-use super::*;
-use crate::modules::iam::dto::{
-    UserAddRoleRequest, UserCreateRequest, UserListQuery, UserUpdateRequest,
-};
+use crate::modules::iam::dto::{UserCreateRequest, UserListQuery, UserUpdateRequest};
 use crate::modules::iam::repo::MockIamRepoTrait;
-use crate::modules::iam::service::AccountService;
+use crate::modules::iam::service::tests::{
+    current_clerk, current_manager, make_account_service, sample_user, sample_user_role,
+};
 use crate::modules::iam::vo::UserListOut;
 use crate::shared::error::{AppError, code};
 
@@ -36,6 +37,10 @@ async fn list_users_returns_empty_when_repo_yields_no_rows() {
         .returning(|_, _, _, _| Ok(vec![]));
     mock.expect_count_users_with_filters()
         .returning(|_, _| Ok(0));
+    // 空页也会发一次批量角色查询（repo 侧见 `= ANY('{}')` 短路，不落 SQL）
+    mock.expect_list_user_roles_by_user_ids()
+        .withf(|ids: &[i64]| ids.is_empty())
+        .returning(|_| Ok(vec![]));
     let svc = make_account_service();
     let query = UserListQuery {
         username_like: None,
@@ -69,13 +74,15 @@ async fn list_users_returns_rows_with_total_count() {
         .returning(move |_, _, _, _| Ok(vec![u1.clone(), u2.clone()]));
     mock.expect_count_users_with_filters()
         .returning(|_, _| Ok(2));
-    // 每个用户调一次 list_user_roles_by_user_id
-    mock.expect_list_user_roles_by_user_id()
-        .with(eq(101))
-        .returning(move |_| Ok(vec![r1.clone()]));
-    mock.expect_list_user_roles_by_user_id()
-        .with(eq(102))
-        .returning(move |_| Ok(vec![r2.clone()]));
+    // 2026-10-10：一次批量查询取回本页全部角色（`.times(1)` 是 N+1 消解的断言）
+    let r1c = r1.clone();
+    let r2c = r2.clone();
+    mock.expect_list_user_roles_by_user_ids()
+        .times(1)
+        .returning(move |ids| {
+            assert_eq!(ids, &[101, 102], "批量查询应带本页全部 user_id");
+            Ok(vec![r1c.clone(), r2c.clone()])
+        });
     let svc = make_account_service();
     let query = UserListQuery {
         username_like: Some("a".into()),
@@ -343,6 +350,7 @@ async fn update_user_happy_path_returns_updated_user() {
         .returning(|_| Ok(vec![]));
     let svc = make_account_service();
     let req = UserUpdateRequest {
+        version: 1, // OCC 锚点来自客户端
         full_name: Some("Alice New".into()),
         phone: None,
         password: None,
@@ -367,6 +375,7 @@ async fn update_user_not_found_when_user_missing() {
     mock.expect_get_user_by_id().returning(|_| Ok(None));
     let svc = make_account_service();
     let req = UserUpdateRequest {
+        version: 1, // OCC 锚点来自客户端
         full_name: Some("Alice".into()),
         phone: None,
         password: None,
@@ -396,6 +405,7 @@ async fn update_user_version_conflict_returns_409() {
     mock.expect_update_user_partial().returning(|_, _, _| Ok(0)); // 0 行 → version_conflict
     let svc = make_account_service();
     let req = UserUpdateRequest {
+        version: 1, // OCC 锚点来自客户端
         full_name: Some("Alice".into()),
         phone: None,
         password: None,
@@ -501,7 +511,7 @@ async fn deactivate_user_happy_path_returns_deactivated_user() {
 
     // Act
     let out = svc
-        .deactivate_user(mock, 101, &current_manager())
+        .deactivate_user(mock, 101, 1, &current_manager())
         .await
         .expect("deactivate_user 应 Ok");
 
@@ -522,7 +532,7 @@ async fn deactivate_user_already_inactive_returns_version_conflict() {
 
     // Act
     let err = svc
-        .deactivate_user(mock, 101, &current_manager())
+        .deactivate_user(mock, 101, 1, &current_manager())
         .await
         .expect_err("deactivate_user 0 行应 Err");
 
@@ -530,249 +540,6 @@ async fn deactivate_user_already_inactive_returns_version_conflict() {
     match err {
         AppError::Biz { code, .. } => assert_eq!(code, code::VERSION_CONFLICT),
         other => panic!("expected Biz VERSION_CONFLICT, got {:?}", other),
-    }
-}
-
-// ===========================================================================
-// list_user_roles（2 用例）
-// ===========================================================================
-
-#[tokio::test]
-async fn list_user_roles_empty_returns_empty_vec() {
-    // Arrange
-    let u = sample_user(101, "alice");
-    let mut mock = MockIamRepoTrait::new();
-    mock.expect_get_user_by_id()
-        .returning(move |_| Ok(Some(u.clone())));
-    mock.expect_list_user_roles_by_user_id()
-        .returning(|_| Ok(vec![]));
-    let svc = make_account_service();
-
-    // Act
-    let out = svc
-        .list_user_roles(mock, 101, &current_manager())
-        .await
-        .expect("list_user_roles 空应 Ok");
-
-    // Assert
-    assert_eq!(out.len(), 0);
-}
-
-#[tokio::test]
-async fn list_user_roles_with_roles_returns_role_list() {
-    // Arrange
-    let u = sample_user(101, "alice");
-    let r1 = sample_user_role(201, 101, "MANAGER");
-    let r2 = sample_user_role(202, 101, "CLERK");
-    let mut mock = MockIamRepoTrait::new();
-    mock.expect_get_user_by_id()
-        .returning(move |_| Ok(Some(u.clone())));
-    mock.expect_list_user_roles_by_user_id()
-        .returning(move |_| Ok(vec![r1.clone(), r2.clone()]));
-    let svc = make_account_service();
-
-    // Act
-    let out = svc
-        .list_user_roles(mock, 101, &current_manager())
-        .await
-        .expect("list_user_roles 应 Ok");
-
-    // Assert
-    assert_eq!(out.len(), 2);
-    assert_eq!(out[0].role, "MANAGER");
-    assert_eq!(out[1].role, "CLERK");
-}
-
-// ===========================================================================
-// add_role（3 用例）
-// ===========================================================================
-
-#[tokio::test]
-async fn add_role_happy_path_returns_role() {
-    // Arrange — 服务内部用 `snowflake.next_id()` 算 `insert.id`，mock 必须返回
-    // 同 id 的角色才能让 `find(|r| r.id == insert.id)` 命中。
-    use std::sync::{Arc, Mutex};
-    let u = sample_user(101, "alice");
-    let captured: Arc<Mutex<i64>> = Arc::new(Mutex::new(0));
-    let cap_for_create = captured.clone();
-    let cap_for_list = captured.clone();
-    let mut mock = MockIamRepoTrait::new();
-    mock.expect_get_user_by_id()
-        .returning(move |_| Ok(Some(u.clone())));
-    mock.expect_has_user_role_with_scope()
-        .returning(|_, _, _, _| Ok(false));
-    mock.expect_create_user_role().returning(
-        move |role: &crate::modules::iam::repo::UserRoleInsert| {
-            *cap_for_create.lock().unwrap() = role.id;
-            Ok(())
-        },
-    );
-    mock.expect_list_user_roles_by_user_id()
-        .returning(move |uid| {
-            let id = *cap_for_list.lock().unwrap();
-            Ok(vec![sample_user_role(id, uid, "MANAGER")])
-        });
-    let svc = make_account_service();
-    let req = UserAddRoleRequest {
-        role: crate::auth::rbac::Role::Manager,
-        scope_type: None,
-        scope_id: None,
-    };
-
-    // Act
-    let out = svc
-        .add_role(mock, 101, &req, &current_manager())
-        .await
-        .expect("add_role 应 Ok");
-
-    // Assert
-    assert_eq!(out.role, "MANAGER");
-    assert_eq!(out.id, *captured.lock().unwrap());
-}
-
-#[tokio::test]
-async fn add_role_duplicate_returns_role_duplicate() {
-    // Arrange
-    let u = sample_user(101, "alice");
-    let mut mock = MockIamRepoTrait::new();
-    mock.expect_get_user_by_id()
-        .returning(move |_| Ok(Some(u.clone())));
-    mock.expect_has_user_role_with_scope()
-        .returning(|_, _, _, _| Ok(true)); // 已存在
-    let svc = make_account_service();
-    let req = UserAddRoleRequest {
-        role: crate::auth::rbac::Role::Manager,
-        scope_type: None,
-        scope_id: None,
-    };
-
-    // Act
-    let err = svc
-        .add_role(mock, 101, &req, &current_manager())
-        .await
-        .expect_err("add_role 重名应 Err");
-
-    // Assert
-    match err {
-        AppError::Biz { code, .. } => assert_eq!(code, code::ROLE_DUPLICATE),
-        other => panic!("expected Biz ROLE_DUPLICATE, got {:?}", other),
-    }
-}
-
-#[tokio::test]
-async fn add_role_invalid_role_string_returns_validation_error() {
-    // Arrange
-    let u = sample_user(101, "alice");
-    let mut mock = MockIamRepoTrait::new();
-    mock.expect_get_user_by_id()
-        .returning(move |_| Ok(Some(u.clone())));
-    let svc = make_account_service();
-    // 非 SHELF_ACCOUNT 但带 scope → validation error
-    let req = UserAddRoleRequest {
-        role: crate::auth::rbac::Role::Manager,
-        scope_type: Some("shelf".into()),
-        scope_id: Some(1),
-    };
-
-    // Act
-    let err = svc
-        .add_role(mock, 101, &req, &current_manager())
-        .await
-        .expect_err("MANAGER 带 scope 应 Err");
-
-    // Assert
-    match err {
-        AppError::Validation(msg) => {
-            assert!(msg.contains("scope"), "expected scope 错误信息，got: {msg}");
-        }
-        other => panic!("expected Validation, got {:?}", other),
-    }
-}
-
-// ===========================================================================
-// remove_role（2 用例）
-// ===========================================================================
-
-#[tokio::test]
-async fn remove_role_happy_path_succeeds() {
-    // Arrange
-    let u = sample_user(101, "alice");
-    let r = crate::modules::iam::repo::UserRole {
-        id: 201,
-        user_id: 101,
-        role: "MANAGER".into(),
-        scope_type: None,
-        scope_id: None,
-        version: 1,
-        ..make_user_role_dummy(201)
-    };
-    let mut mock = MockIamRepoTrait::new();
-    mock.expect_get_user_by_id()
-        .returning(move |_| Ok(Some(u.clone())));
-    mock.expect_get_user_role_by_id()
-        .returning(move |_| Ok(Some(r.clone())));
-    mock.expect_soft_delete_user_role()
-        .returning(|_, _, _, _| Ok(1));
-    let svc = make_account_service();
-
-    // Act
-    svc.remove_role(mock, 101, 201, &current_manager())
-        .await
-        .expect("remove_role 应 Ok");
-}
-
-#[tokio::test]
-async fn remove_role_not_found_returns_role_not_found() {
-    // Arrange
-    let u = sample_user(101, "alice");
-    let mut mock = MockIamRepoTrait::new();
-    mock.expect_get_user_by_id()
-        .returning(move |_| Ok(Some(u.clone())));
-    // 角色存在但属于别的用户
-    let r_other = crate::modules::iam::repo::UserRole {
-        id: 201,
-        user_id: 999,
-        role: "MANAGER".into(),
-        scope_type: None,
-        scope_id: None,
-        version: 1,
-        ..make_user_role_dummy(201)
-    };
-    mock.expect_get_user_role_by_id()
-        .returning(move |_| Ok(Some(r_other.clone())));
-    let svc = make_account_service();
-
-    // Act
-    let err = svc
-        .remove_role(mock, 101, 201, &current_manager())
-        .await
-        .expect_err("remove_role 别人的角色应 Err");
-
-    // Assert
-    match err {
-        AppError::Biz { code, .. } => assert_eq!(code, code::ROLE_NOT_FOUND),
-        other => panic!("expected Biz ROLE_NOT_FOUND, got {:?}", other),
-    }
-}
-
-/// 构造 `UserRole` 的最小化字段补全 helper。
-fn make_user_role_dummy(id: i64) -> crate::modules::iam::repo::UserRole {
-    let now = chrono::NaiveDate::from_ymd_opt(2026, 9, 23)
-        .unwrap()
-        .and_hms_opt(0, 0, 0)
-        .unwrap();
-    crate::modules::iam::repo::UserRole {
-        id,
-        user_id: 0, // 由具体 case 覆盖
-        role: String::new(),
-        scope_type: None,
-        scope_id: None,
-        version: 1,
-        created_at: now,
-        created_by: Some(1),
-        updated_at: now,
-        updated_by: Some(1),
-        deleted_at: None,
     }
 }
 
@@ -850,16 +617,4 @@ async fn change_own_password_forbidden_for_other_user() {
         AppError::Biz { code, .. } => assert_eq!(code, code::FORBIDDEN),
         other => panic!("expected Biz FORBIDDEN, got {:?}", other),
     }
-}
-
-// ===========================================================================
-// 单元验证：AccountService::new 的字段访问正确性
-// ===========================================================================
-
-#[test]
-fn account_service_construction_does_not_panic() {
-    // 测试构造函数不 panic；snowflake 字段正确持有
-    let svc = AccountService::new(test_snowflake());
-    // 烟雾测试：通过构造验证 trait 方法可访问（编译期验证即可）
-    let _: &AccountService = &svc;
 }

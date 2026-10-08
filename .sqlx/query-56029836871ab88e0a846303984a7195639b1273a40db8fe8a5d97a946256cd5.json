@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO t_shelf (id, code, name, zone, is_active, display_order, version, created_at, updated_at) VALUES ($1, 'S-BATCH', 'Shelf Batch', 'INSPECTION', true, 0, 0, now(), now())",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "56029836871ab88e0a846303984a7195639b1273a40db8fe8a5d97a946256cd5"
+}

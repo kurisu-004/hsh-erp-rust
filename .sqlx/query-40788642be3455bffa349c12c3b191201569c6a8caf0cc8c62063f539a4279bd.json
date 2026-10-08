@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO t_wx_identity\n            (id, corp_id, wx_user_id, user_id, version, created_at, created_by, updated_at, updated_by)\n        VALUES ($1, $2, $3, $4, 0, $5, $6, $5, $6)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Varchar",
+        "Varchar",
+        "Int8",
+        "Timestamp",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "40788642be3455bffa349c12c3b191201569c6a8caf0cc8c62063f539a4279bd"
+}

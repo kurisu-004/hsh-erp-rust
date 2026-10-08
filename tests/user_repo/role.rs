@@ -297,6 +297,132 @@ async fn soft_delete_returns_zero_rows_on_version_conflict() {
 }
 
 // ===========================================================================
+// 批量角色查询（2026-10-10 新增，消解 list_users 的 N+1）
+// ===========================================================================
+
+/// `list_user_roles_by_user_ids`：多个 user_id 一次取回，按 user_id 可分组
+#[tokio::test]
+async fn list_user_roles_by_user_ids_returns_roles_of_multiple_users() {
+    let (pool, _fx) = setup().await;
+    let u1 = seed_user(&pool, "alice", true).await;
+    let u2 = seed_user(&pool, "bob", true).await;
+    let _ = seed_role(&pool, u1, "MANAGER", None, None).await;
+    let _ = seed_role(&pool, u1, "CLERK", None, None).await;
+    let _ = seed_role(&pool, u2, "INSPECTOR", None, None).await;
+    // u3 有角色但不在查询集合里 → 不该被返回
+    let u3 = seed_user(&pool, "carol", true).await;
+    let _ = seed_role(&pool, u3, "CLERK", None, None).await;
+
+    let rows = user_role_sql::list_user_roles_by_user_ids(&pool, &[u1, u2])
+        .await
+        .expect("list");
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|r| r.user_id == u1 || r.user_id == u2));
+    let u1_roles: Vec<_> = rows
+        .iter()
+        .filter(|r| r.user_id == u1)
+        .map(|r| r.role.as_str())
+        .collect();
+    assert_eq!(u1_roles.len(), 2, "alice 应有 2 个角色：{u1_roles:?}");
+}
+
+/// 单个 user_id 与批量版逐字等价（两条路径的投影必须一致）
+#[tokio::test]
+async fn list_user_roles_by_user_ids_with_single_id_matches_single_id_query() {
+    let (pool, _fx) = setup().await;
+    let uid = seed_user(&pool, "alice", true).await;
+    let _ = seed_role(&pool, uid, "MANAGER", None, None).await;
+    let _ = seed_role(&pool, uid, "SHELF_ACCOUNT", Some("shelf"), Some(1)).await;
+
+    let batch = user_role_sql::list_user_roles_by_user_ids(&pool, &[uid])
+        .await
+        .expect("batch");
+    let single = user_role_sql::list_user_roles_by_user_id(&pool, uid)
+        .await
+        .expect("single");
+    assert_eq!(batch.len(), single.len());
+    for (b, s) in batch.iter().zip(single.iter()) {
+        assert_eq!(b.id, s.id);
+        assert_eq!(b.role, s.role);
+        assert_eq!(b.scope_type, s.scope_type);
+        assert_eq!(b.scope_id, s.scope_id);
+        assert_eq!(b.version, s.version);
+        assert_eq!(b.shelf_code, s.shelf_code);
+        assert_eq!(b.shelf_name, s.shelf_name);
+    }
+}
+
+/// 空数组 → 返空 Vec（不发 SQL；`= ANY('{}')` 虽能命中 0 行，但白跑一次往返）
+#[tokio::test]
+async fn list_user_roles_by_user_ids_with_empty_slice_returns_empty() {
+    let (pool, _fx) = setup().await;
+    let uid = seed_user(&pool, "alice", true).await;
+    let _ = seed_role(&pool, uid, "MANAGER", None, None).await;
+
+    let rows = user_role_sql::list_user_roles_by_user_ids(&pool, &[])
+        .await
+        .expect("空数组不应报错");
+    assert!(rows.is_empty(), "空 user_ids 应返空集合");
+}
+
+/// 软删行被排除
+#[tokio::test]
+async fn list_user_roles_by_user_ids_excludes_soft_deleted() {
+    let (pool, _fx) = setup().await;
+    let uid = seed_user(&pool, "alice", true).await;
+    let keep = seed_role(&pool, uid, "MANAGER", None, None).await;
+    let drop = seed_role(&pool, uid, "CLERK", None, None).await;
+    user_role_sql::soft_delete_user_role(&pool, drop, 0, now_naive(), None)
+        .await
+        .expect("soft_delete");
+
+    let rows = user_role_sql::list_user_roles_by_user_ids(&pool, &[uid])
+        .await
+        .expect("list");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, keep);
+}
+
+/// LEFT JOIN t_shelf 带出 shelf_code / shelf_name（与单账号版同形）
+#[tokio::test]
+async fn list_user_roles_by_user_ids_includes_shelf_code_and_name() {
+    let (pool, _fx) = setup().await;
+    let uid = seed_user(&pool, "shelfie", true).await;
+
+    let shelf_id = snowflake().lock().unwrap().next_id();
+    sqlx::query!(
+        "INSERT INTO t_shelf (id, code, name, zone, is_active, display_order, version, \
+         created_at, updated_at) \
+         VALUES ($1, 'S-BATCH', 'Shelf Batch', 'INSPECTION', true, 0, 0, now(), now())",
+        shelf_id,
+    )
+    .execute(&pool)
+    .await
+    .expect("seed t_shelf");
+
+    let _ = seed_role(&pool, uid, "SHELF_ACCOUNT", Some("shelf"), Some(shelf_id)).await;
+    // 非货架角色不应被 JOIN 出的货架字段污染
+    let _ = seed_role(&pool, uid, "MANAGER", None, None).await;
+
+    let rows = user_role_sql::list_user_roles_by_user_ids(&pool, &[uid])
+        .await
+        .expect("list");
+    assert_eq!(rows.len(), 2);
+    let shelf_row = rows
+        .iter()
+        .find(|r| r.role == "SHELF_ACCOUNT")
+        .expect("SHELF_ACCOUNT 行");
+    assert_eq!(shelf_row.shelf_code.as_deref(), Some("S-BATCH"));
+    assert_eq!(shelf_row.shelf_name.as_deref(), Some("Shelf Batch"));
+    let mgr_row = rows
+        .iter()
+        .find(|r| r.role == "MANAGER")
+        .expect("MANAGER 行");
+    assert!(mgr_row.shelf_code.is_none());
+    assert!(mgr_row.shelf_name.is_none());
+}
+
+// ===========================================================================
 // MenuRepo 测试 (3 例，覆盖 1 个固有方法)
 // ===========================================================================
 

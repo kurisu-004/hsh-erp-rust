@@ -48,19 +48,14 @@ use crate::infra::config::AppConfig;
 use crate::shared::error::{AppError, code};
 
 // `iam/service/` 子目录中 dto / vo / repo 是 sibling 的兄弟模块 —— 用 `super::super::` 跨级
-// account 是同 parent 下的兄弟 service 文件，用 `super::account::`（与 account.rs 的
+// account 是同 parent 下的兄弟 service 模块，用 `super::account::`（与 account/mod.rs 的
 // `super::menu::` 同形）
 use super::super::dto::{ChangePasswordRequest, LoginRequest, RefreshRequest};
 use super::super::repo::model::User;
 use super::super::repo::{IamRepoTrait, UserRoleRow};
 use super::super::vo::{CurrentUserOut, LoginResponse, MenuNodeOut};
-use super::account::{AccountService, role_as_str};
-
-/// SHELF_ACCOUNT 角色唯一合法的 scope_type
-const SCOPE_TYPE_SHELF: &str = "shelf";
-
-/// 可绑定 SHELF_ACCOUNT 的货架分区白名单（与 account 域 `validate_role_scope` 对齐）
-const ALLOWED_SHELF_ZONES: [&str; 2] = ["PRODUCTION", "INSPECTION"];
+use super::account::{ALLOWED_SHELF_ZONES, AccountService, SCOPE_TYPE_SHELF, role_as_str};
+use crate::auth::rbac::parse_role_string;
 
 /// login 第一阶段产出：DB 操作结果 + 待签 token + 用户视图素材。
 /// handler 拿到后 commit，然后调 `complete_login` 写 Redis + 组装响应。
@@ -108,19 +103,13 @@ pub struct SessionService {
     account_service: Arc<AccountService>,
 }
 
-/// 把 DB 中的 role 字符串转回 `Role` 枚举。
+/// 把 DB 中的 role 字符串转回 `Role` 枚举（薄委托到 `auth::rbac::parse_role_string`
+/// —— `Role` ↔ 字符串的映射以那里为唯一真源）。
 ///
 /// `UserRoleRow.role` 是数据库返回的 varchar，已由 seed 数据保证只含 5 种已知值；遇到未知值时
-/// 记 warn 并跳过——宁可不识别也不 panic。
+/// 跳过——宁可不识别也不 panic。未知值的 warn 由 `parse_role_string` 打（带 `role` 字段）。
 fn parse_role(s: &str) -> Option<Role> {
-    Some(match s {
-        "MANAGER" => Role::Manager,
-        "CLERK" => Role::Clerk,
-        "INSPECTOR" => Role::Inspector,
-        "CNC_PROGRAMMER" => Role::CncProgrammer,
-        "SHELF_ACCOUNT" => Role::ShelfAccount,
-        _ => return None,
-    })
+    parse_role_string(s)
 }
 
 /// 重复 AccountService::change_own_password 中的乐观锁翻译，service 局部使用。
@@ -638,8 +627,8 @@ async fn resolve_roles_and_scope<R: IamRepoTrait>(
     let mut shelf_wildcard = false;
 
     for r in rows {
+        // 未知 role 值由 `parse_role_string` 内部打 warn（带 `role` 字段），此处只跳过
         let Some(role) = parse_role(&r.role) else {
-            tracing::warn!(role = %r.role, user_id = r.user_id, "未知 role 字符串，跳过");
             continue;
         };
         if role == Role::ShelfAccount && r.scope_type.as_deref() == Some(SCOPE_TYPE_SHELF) {

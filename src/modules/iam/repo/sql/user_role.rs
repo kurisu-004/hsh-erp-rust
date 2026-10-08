@@ -1,4 +1,4 @@
-//! iam 域 `t_user_role` SQL 真源（5 方法）
+//! iam 域 `t_user_role` SQL 真源（6 方法）
 
 use chrono::NaiveDateTime;
 use sqlx::PgExecutor;
@@ -72,6 +72,51 @@ pub async fn list_user_roles_by_user_id<'e, E: PgExecutor<'e>>(
         ORDER BY ur.created_at, ur.id
         "#,
         user_id
+    )
+    .fetch_all(executor)
+    .await
+}
+
+/// 批量版 `list_user_roles_by_user_id`：一次查回多个账号的全部活跃角色。
+///
+/// `list_users` 的角色组装走本函数（`WHERE user_id = ANY($1)`）消解 N+1 —— 一页
+/// N 个账号从 N+1 次查询降为 1 次。投影 / JOIN / 排序与单账号版**逐字相同**，故
+/// 两条路径取回的 `UserRoleRow` 逐字段等价。
+///
+/// `user_ids` 为空数组时**短路返空 Vec 且不发 SQL**（`= ANY('{}')` 虽然也能
+/// 命中 0 行，但白跑一次网络往返）。
+pub async fn list_user_roles_by_user_ids<'e, E: PgExecutor<'e>>(
+    executor: E,
+    user_ids: &[i64],
+) -> Result<Vec<UserRoleRow>, sqlx::Error> {
+    if user_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as!(
+        UserRoleRow,
+        r#"
+        SELECT ur.id            AS "id!",
+               ur.user_id       AS "user_id!",
+               ur.role          AS "role!",
+               ur.scope_type    AS "scope_type?",
+               ur.scope_id      AS "scope_id?",
+               ur.version       AS "version!",
+               ur.created_at    AS "created_at!",
+               ur.created_by    AS "created_by?",
+               ur.updated_at    AS "updated_at!",
+               ur.updated_by    AS "updated_by?",
+               ur.deleted_at    AS "deleted_at?",
+               s.code           AS "shelf_code?",
+               s.name           AS "shelf_name?"
+        FROM t_user_role ur
+        LEFT JOIN t_shelf s
+               ON ur.scope_type = 'shelf'
+              AND ur.scope_id = s.id
+              AND s.deleted_at IS NULL
+        WHERE ur.user_id = ANY($1) AND ur.deleted_at IS NULL
+        ORDER BY ur.created_at, ur.id
+        "#,
+        user_ids
     )
     .fetch_all(executor)
     .await

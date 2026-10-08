@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT deleted_at AS \"d?\" FROM t_wx_identity WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "d?",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_wx_identity",
+            "name": "deleted_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "2d7f3d97e6debb8bf01f1aeb1e3efed35cc4d285b73e01eb833bd8022d3d3d2d"
+}
