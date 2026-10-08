@@ -30,13 +30,17 @@
 //!    14. ws_e2e_conn_registry_counts           — 连接表 register/unregister 计数
 //!    15. ws_e2e_server_shutdown_sends_1012     — shutdown.cancel() → 1012 server restart
 //!    16. ws_e2e_reauth_failure_sends_4001_close — 吊销 session → 周期 re-auth 失败 → 4001
+//!                                                  （reason `auth expired`）
+//!    17. ws_e2e_access_token_expiry_sends_4001_with_access_token_expired
+//!                                                  — access JWT 过期（session 仍活）→
+//!                                                    4001（reason `access token expired`）
 //!
 //!   HTTP 端点：
-//!    17. http_snapshot_unauthenticated_returns_401
-//!    18. http_snapshot_happy_path_returns_full_shape
-//!    19-22. `GET /dashboard/upcoming-delivery`：缺省 days=14 / days=7 / basis 切换 /
+//!    18. http_snapshot_unauthenticated_returns_401
+//!    19. http_snapshot_happy_path_returns_full_shape
+//!    20-23. `GET /dashboard/upcoming-delivery`：缺省 days=14 / days=7 / basis 切换 /
 //!         basis 非法值 → 400 + today 字段
-//!    23-25. `GET /dashboard/delivery-orders`：date / statuses 的 40001 契约 + 正常返回
+//!    24-26. `GET /dashboard/delivery-orders`：date / statuses 的 40001 契约 + 正常返回
 //!
 //! （`statuses` 的限长闸门 `STATUSES_MAX_ITEMS` / `STATUSES_MAX_RAW_LEN` 由 lib 单测
 //!   `handler::tests::statuses_filter_*` 覆盖，不进本 binary。）
@@ -570,6 +574,24 @@ async fn mint_test_token_with_jti(
     state: &Arc<hsh_erp_rust::state::AppState>,
     user_id: i64,
 ) -> (String, String) {
+    mint_test_token_with_ttl(state, user_id, state.config.jwt.access_ttl_seconds).await
+}
+
+/// 2026-10-09 新增：`mint_test_token_with_jti` 的 TTL 可注入版本（默认 TTL = 配置里的
+/// `jwt.access_ttl_seconds`）。
+///
+/// 存在理由：`ws_e2e_access_token_expiry_sends_4001_with_access_token_expired` 要复现
+/// 「**握手时有效、握手后过期**」的 access JWT（线上空闲用户被踢下线的成因），只能靠
+/// 一枚极短 TTL 的 token —— 缺省 900s 等不起。其余语义（写 Redis session、返回
+/// `(token, jti)`）与 `mint_test_token_with_jti` 完全一致。
+///
+/// ⚠️ 短 TTL token 在 `decode_access` 的 30s exp leeway 内**仍然有效**（见该常量的
+/// doc），所以「过期」不是 ttl 那一刻发生，而是 ttl + 30s 之后。
+async fn mint_test_token_with_ttl(
+    state: &Arc<hsh_erp_rust::state::AppState>,
+    user_id: i64,
+    ttl_seconds: i64,
+) -> (String, String) {
     use hsh_erp_rust::auth::session::{CachedUserProfile, TokenKind};
     // 2026-09-23 重构：encode_access 第 2-7 参数改为 `(private_key, signing_kid, issuer, audience, subject, ttl_seconds)` —— RS256 + kid 多密钥轮换；
     // 返回三元组 `(token, jti, exp)`，jti 即为 Redis session key 后缀来源（`session:tok:<jti>`），无需再调用 `hash_token`。
@@ -579,7 +601,7 @@ async fn mint_test_token_with_jti(
         &state.config.jwt.issuer,
         &state.config.jwt.audience,
         user_id,
-        state.config.jwt.access_ttl_seconds,
+        ttl_seconds,
     )
     .expect("encode_access");
     // 写 Redis session，让 ws_dashboard 握手时 session 校验通过（不返 40105）。
@@ -930,16 +952,18 @@ async fn ws_e2e_conn_registry_counts() {
     assert_eq!(state.ws_hub.conn_count(), 0, "连接关闭后应已出表");
 }
 
-/// B4 + Minor-7：周期性 re-auth 失败（session 被吊销）→ 服务端发 `4001 auth expired`
+/// 周期性 re-auth 失败（session 被吊销）→ 服务端发 `4001 auth expired`
 /// Close 帧（前端契约：清本地 token 跳登录页，**不要**重连）。
 ///
-/// 依赖「re-auth 周期可注入」（`AppConfig::ws_reauth_every_n_heartbeats`，review 第 1 轮
-/// Minor 7 改动）：test-support 默认 `2` + text 心跳 1s → 每 2s 验一次，~2s 内即可验到。
-/// 改之前是硬编码 `const 10`，触发一次要跑 >10s，这条**安全核心路径**在 CI 上永远覆盖不到。
+/// 依赖「re-auth 周期可注入」（`AppConfig::ws_reauth_every_n_heartbeats`）：test-support
+/// 默认 `2` + text 心跳 1s → 每 2s 验一次，~2s 内即可验到（生产缺省是 30s × 10 ≈ 5min，
+/// 那条安全核心路径在 CI 上就永远覆盖不到）。
 ///
 /// 对应的另一半契约（基础设施故障 → `1011 re-auth unavailable`，而不是 4001）由
 /// `src/modules/dashboard/handler.rs` 的单测 `reauth_infra_failure_maps_to_1011_not_4001`
 /// 钉死（要端到端造「Redis 故障」需自定义 `SessionStore` 实现，代价远大于收益）。
+/// 同族的另一半「access JWT 过期但 session 仍活 → reason `access token expired`」由
+/// `ws_e2e_access_token_expiry_sends_4001_with_access_token_expired` 覆盖。
 #[tokio::test]
 async fn ws_e2e_reauth_failure_sends_4001_close() {
     let (base, state) = spawn_ws_server().await;
@@ -984,7 +1008,86 @@ async fn ws_e2e_reauth_failure_sends_4001_close() {
         });
     assert_eq!(
         reason, "auth expired",
-        "4001 Close 帧的 reason 应为 auth expired"
+        "4001 Close 帧的 reason 应为 auth expired（删掉 session ⇒ 40105，是真·会话吊销）"
+    );
+}
+
+/// 2026-10-09 新增：access JWT 在连接期间**自然过期**（Redis session 仍活着）→ 服务端发
+/// `4001 access token expired` Close 帧。
+///
+/// 与 `ws_e2e_reauth_failure_sends_4001_close`（删 session ⇒ 40105 ⇒ reason
+/// `auth expired`）构成本仓 re-auth 分流的**两段语义**：40102 与 40105 共用关闭码 4001、
+/// 只靠 reason 串区分，前端据此分流「先 refresh 再重连」 vs 「终止会话」。这个 reason
+/// 串是**前后端联合契约**，改它必须同步 `docs/api/dashboard.md` 的 WS 关闭码表。
+///
+/// 复现的线上形态：大屏页开着 ⇒ 用户零 HTTP 流量 ⇒ access token 自然过期 ⇒ 周期
+/// re-auth 拿到 40102。此时 Redis session 因 `verify_session_token` 的滑动续期而**依旧
+/// 活着**（用例末尾直接查 Redis 断言这一点），所以这条 4001 不等于「会话没了」。
+///
+/// 时长由两条配置/实现事实决定（都不可省，否则等不到或等太久）：
+/// - `decode_access` 的 `Validation::leeway = 30`（`src/auth/jwt.rs`，容忍跨节点时钟
+///   漂移）⇒ 短 TTL 的 access token 要到 `ttl + 30s` 之后才被判 `TOKEN_EXPIRED`。
+/// - re-auth 周期 = `ws_heartbeat_interval_seconds`（测试配置 1s）×
+///   `ws_reauth_every_n_heartbeats`（测试配置 2）= 2s；判过期后再等最多一个周期即踢连接。
+/// 故本用例实际耗时 ~34s（nextest 的 `slow-timeout` 是 60s 告警 / 120s 杀，留有余量）。
+#[tokio::test]
+async fn ws_e2e_access_token_expiry_sends_4001_with_access_token_expired() {
+    /// 短 TTL：握手时有效、几秒后过期。取值只需「远小于 leeway（30s）」即可让用例在
+    /// 半分钟内跑完，同时又长到握手期（编码后 + 建连 + 首帧快照）绝无可能落在过期之后。
+    const ACCESS_TOKEN_TTL_SECONDS: i64 = 2;
+    /// `decode_access` 的 exp leeway（`src/auth/jwt.rs`）。此处**复制**该常量而不是
+    /// import：它是「被测行为的输入」，写死让用例对 leeway 变化敏感（leeway 调大只会
+    /// 让本用例等更久，不会误判；调小则等更短）。
+    const JWT_EXP_LEEWAY_SECONDS: u64 = 30;
+
+    let (base, state) = spawn_ws_server().await;
+    let heartbeat = state.config.ws_heartbeat_interval_seconds;
+    let reauth_every = u64::from(state.config.ws_reauth_every_n_heartbeats);
+    let user_id = shared_test_snowflake().next_id();
+    let (token, jti) = mint_test_token_with_ttl(&state, user_id, ACCESS_TOKEN_TTL_SECONDS).await;
+    let url = format!("{base}/dashboard?token={token}");
+
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("WS upgrade must succeed：此刻 token 尚未过期");
+    // 收首条 snapshot，确保 handler 已进主循环（re-auth 只在心跳分支里跑，早于此刻
+    // 发生的任何踢出都不会被本用例观察到）
+    let _ = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("snapshot 超时")
+        .expect("ws stream closed")
+        .expect("ws frame err");
+
+    let wait = Duration::from_secs(
+        ACCESS_TOKEN_TTL_SECONDS as u64 + JWT_EXP_LEEWAY_SECONDS + heartbeat * reauth_every + 8,
+    );
+    let reason = wait_for_close(&mut ws, 4001, wait)
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "access token 在连接期间过期后应在 ~{}s 内收到 4001/access token expired Close 帧\
+                 （ttl={ACCESS_TOKEN_TTL_SECONDS}s + leeway={JWT_EXP_LEEWAY_SECONDS}s + \
+                 heartbeat={heartbeat}s × reauth_every={reauth_every}），但：{e}",
+                wait.as_secs()
+            )
+        });
+    assert_eq!(
+        reason, "access token expired",
+        "40102 只说明 access JWT 过期，reason 必须与「会话被吊销」的 auth expired 分开，\
+         否则前端会清掉仍有效的 refresh token 把空闲用户踢去登录页"
+    );
+
+    // 佐证这条 4001 的成因确实是「JWT 过期」而非「会话被吊销」：被踢时 Redis session
+    // 仍在（前面的 re-auth 成功轮次已把它滑动续期）。若这里拿不到 session，用例就变成
+    // 在测「吊销」路径，reason 断言再对也没有意义。
+    assert!(
+        state
+            .session
+            .get_session(&jti)
+            .await
+            .expect("get_session")
+            .is_some(),
+        "被踢连接时 Redis session 应仍然存在（滑动续期），否则本用例测的不是「access JWT 过期」"
     );
 }
 

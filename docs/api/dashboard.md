@@ -154,7 +154,49 @@
     `DRIVER_SET` / `PICKED_UP`。逐条写端点对照见
     [`delivery_note.md` §7](delivery_note.md#7-与-ws-的关系)。
 - 心跳：text 帧 `{type:"heartbeat", ts:<unix 秒>}` + 协议层 `Message::Ping`（前端 JS 不可见，服务端判活用）。
-- 慢消费方：广播队列（容量 1024）溢出 → 服务端发 `4003 lagged` Close 帧，前端重连 + 全量 HTTP 重取。
+
+### 7.1 关闭码表（前后端联合契约）
+
+**关闭码只表达「这条连接必须终止」，处置方式由 reason 文案区分。** 前端按 `(code, reason)`
+二元组分流，不要只看 code。发出点列给出的是 `src/modules/dashboard/handler.rs` 内的分支名。
+
+| code | reason | 发出点 | 含义 | 前端应做什么 |
+|---|---|---|---|---|
+| `1000` | （浏览器不发 reason） | 前端主动 `close()`（VueUse `useWebSocket` 的 `open()` 会先关旧连接） | 正常收摊，不是故障 | 无需处置（不要记错误、不要弹提示） |
+| `1006` | — | 无 Close 帧：裸 TCP 断（网络抖动 / 代理掐 / 进程被 kill） | 连接非正常终止，看不到任何服务端信号 | 照常退避重连；40105 一类的会话信号只能靠 HTTP 侧感知 |
+| `1011` | `snapshot build failed` | `run_socket` 进主循环前的首帧快照构建失败 | 服务端算不出大屏数据（DB 故障） | 退避重连，不要登出 |
+| `1011` | `pong timeout` | 超过 `WS_PONG_TIMEOUT_SECONDS` 未收到任何入站帧 | 对端已死 / 半开 TCP | 退避重连，不要登出 |
+| `1011` | `re-auth unavailable` | 周期 re-auth 失败**且**失败码不是 40100/40102/40105（`reauth_close_code` 兜底段，主要是 Redis 故障的 `50000`） | **服务端**不可用，与用户会话无关 | 退避重连，不要登出（切勿据此清本地 token） |
+| `1012` | `server restart` | 服务优雅退出（`state.shutdown` 被 cancel：Ctrl-C / 部署） | 服务端要重启了 | 立刻重连 |
+| `4001` | `auth expired` | 周期 re-auth 命中 `UNAUTHORIZED`(40100) 或 `SESSION_REVOKED`(40105) | **会话真被吊销**（登出 / 改密 / 管理员停用 / refresh reuse detection） | 终止会话：清本地 token + refresh token，跳登录页。**不要**重连 |
+| `4001` | `access token expired` | 周期 re-auth 命中 `TOKEN_EXPIRED`(40102) | **只是这枚 access JWT 过期**，Redis session 通常还活着 | 先用 refresh token 续期再重连；续期失败（refresh 也过期 / 被吊销）才终止会话跳登录页 |
+| `4003` | `lagged` | 广播队列（容量 1024）溢出，tokio 已永久丢弃 n 条事件 | 慢消费方，本连接漏事件 | 重连 + **全量 HTTP 重取**（事件是「invalidate → 重取」语义，不补发增量） |
+
+**4001 的两段 reason 是本表的核心**（2026-10-09 拆分，线上缺陷修复）：大屏页开着时用户零
+HTTP 流量，access token（`JWT_ACCESS_TOKEN_EXPIRE_SECONDS`，缺省 900s）自然过期是**常规
+现象**，与「会话被吊销」完全不同。二者共用一个 reason 时，前端只能一律清掉**仍然有效**的
+refresh token 并跳登录页 ⇒ 空闲用户被踢下线。决策点收在纯函数 `reauth_close_code`
+（`src/modules/dashboard/handler.rs`），lib 单测
+`reauth_token_expired_maps_to_4001_with_distinct_reason` /
+`reauth_revoked_session_maps_to_4001_auth_expired` /
+`reauth_infra_failure_maps_to_1011_not_4001` 钉死；端到端由集成用例
+`ws_e2e_access_token_expiry_sends_4001_with_access_token_expired`（access JWT 过期）、
+`ws_e2e_reauth_failure_sends_4001_close`（session 被吊销）、
+`ws_e2e_lagged_client_gets_4003_close`、`ws_e2e_pong_timeout_closes_dead_peer`、
+`ws_e2e_server_shutdown_sends_1012` 覆盖。
+
+**三个必须知道的边界**：
+
+- **`4001` 只在已建立的连接上有效**。握手阶段的鉴权失败不会产生 Close 帧——服务端在
+  upgrade 前就返 HTTP 401，浏览器 WS API 不暴露握手期状态码，前端只会看到 `1006`。
+  所以「会话真死」的最终兜底在 HTTP 侧（40105 → 登出），不是 WS 侧。
+- **re-auth 周期** = `WS_HEARTBEAT_INTERVAL_SECONDS` × `WS_REAUTH_EVERY_N_HEARTBEATS`
+  （缺省 30s × 10 ≈ 5min），所以上表里 4001 类关闭**最晚滞后一个周期**才到达。re-auth
+  调用套 5s 超时：Redis 卡住只跳过本轮、不判死（此时问题在服务端，不在用户会话）。
+- **写侧已失败的路径不发 Close 帧**（初始快照写失败 / 心跳写失败 / Ping 写失败 / 广播写
+  失败）。此时 socket 已不可用，`send(Close)` 必然再失败一次，只会多一条噪音日志；前端
+  侧表现为连接直接结束（等效 `1006`）。因此前端**不能**假设「服务端要断就一定给 Close
+  帧」，重连逻辑必须能兜住「无理由断流」。
 
 ## 8. 表依赖与前端配套
 
@@ -186,6 +228,7 @@ dashboard 是**只读跨域聚合域**——这是本仓既定 pattern（`statis
 4. **窗口过滤、`delivered_quantity == 0` 判定、两桶 30 条截断全在服务端**（前端不再自己过滤）。
 5. **逾期数来源变更**：原为调 `GET /statistics/overview` 取 1 个数字（后端跑 9 条 SQL、返 16 标量 + 2 数组 + 2 嵌套结构，且口径是 `planned_delivery_date`，与同页右栏面板的 `system_delivery_date` 互相矛盾）→ 现直接读 `snapshot.overdue_count`。
 6. **「在制」标签改名「在加工」**：`in_process` 的 SQL 硬约束是 `location='WORKER'`，语义是「已从货架/品检区出池、压在工人手上」，叫「在制」是误导。
+7. **WS 关闭处理按 `(code, reason)` 二元组分流**（2026-10-09，与本节 §7.1 同批）：`4001` 按 reason 拆两段——`auth expired` ⇒ 终止会话并跳登录页；`access token expired` ⇒ 先 refresh 再重连。判别依据只有 reason 串本身，**不要**改写/规范化它（大小写、前后空格都算契约）。
 
 ### 8.3 已知偏差登记
 
