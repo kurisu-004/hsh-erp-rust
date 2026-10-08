@@ -53,9 +53,10 @@ const DP_MAX_TARGET: i32 = 100_000;
 /// 把 `target` 件数分配到 `eligible` 批次上。
 ///
 /// 入参 `eligible` 必须是「**可入单**的批次行」：`status == "READY_TO_SHIP"` 且
-/// `delivery_note_id IS NULL`（未占用）的活跃批次。函数**不做**这两个闸门 —— 它们是
-/// 调用方（`POST /scan` 的分类循环）的责任，混进来会让「为什么这批没被选中」变得
-/// 无法解释。
+/// `delivery_note_id IS NULL`（未占用）的活跃批次。函数**不做**这两个闸门。口径由
+/// `DeliveryScanRepo::list_entryable_batches_by_part_ids`（`repo/scan_tree.rs`）的 SQL
+/// 保证 —— 那是「可入单」的唯一定义；`POST /scan` 的分类循环只按同一口径把非 READY
+/// 批次收进诊断明细（失败时附进 21405 的 message），不参与本函数的候选筛选。
 ///
 /// 返回 `Vec<(batch_id, quantity)>`。
 ///
@@ -65,7 +66,7 @@ const DP_MAX_TARGET: i32 = 100_000;
 /// 任何语义 ⇒ 调用方（`POST /scan` 的挂单循环）不要依赖返回顺序，它按批次逐条处理。
 ///
 /// `quantity < batch.quantity` 的项表示该批次被拆分，调用方需对**差额**新建拆批
-/// 并把差额挂单（原批次保持不动、不挂单 —— 见 `POST /scan` 的 Step 6）。
+/// 并把差额挂单（原批次保持不动、不挂单 —— 见 `POST /scan` 的 Step 7）。
 ///
 /// 失败：`target <= 0`、target 大于候选总量、或降级路径凑不出 → 21405
 /// `BIZ_DELIVERY_NOTE_PART_NOT_READY`。
