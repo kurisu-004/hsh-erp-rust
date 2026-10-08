@@ -30,8 +30,8 @@
 //! 6. 逐零件分类：可入单（`READY_TO_SHIP` 且未占用）/ 已占用（21406，请求级拒绝）/
 //!    状态未过检（只按 part 收集明细，不拒绝 —— 见「状态闸门的作用域」）
 //! 7. 每个 target 跑一次 DP（子件之间不耦合）+ 拆批 + 挂单（同事务）：任一 part
-//!    凑不出 ⇒ 21405，message 附该 part 状态未过检的批次明细；此时尚未发生任何
-//!    写操作 ⇒ 整请求零写入
+//!    凑不出 ⇒ 21405，message 附该 part 状态未过检的批次明细；失败发生在任何拆批 /
+//!    挂单写之前，草稿行的 find-or-create 也与它们同处一个事务 ⇒ 整体回滚、零写入
 //! 8. note.version++ → commit → WS 广播 DELIVERY_NOTE_SCAN_ADD
 //! 9. 返回 DeliveryNoteDetailOut（含拆批后的完整行项，前端可就地替换草稿卡）
 //! ```
@@ -52,18 +52,18 @@
 //! 不是「顺带拒绝」的理由。原先把它做成请求级闸门，会让「旁边趴着 8 件
 //! `IN_PROCESS`、8 件 `READY_TO_SHIP` 明明能入单」这种场景整单 21405。
 //!
-//! ⇒ `not_ready` 从请求级闸门降级为**分配失败时的诊断明细**：判定依据只有一条
-//! —— DP 能否凑出该 part 本次的 target；失败时才把这些明细附进 21405 的 message。
+//! ⇒ `not_ready_by_part` 是**分配失败时的诊断明细**，不是请求级闸门：判定依据只有
+//! 一条 —— DP 能否凑出该 part 本次的 target；失败时才把这些明细附进 21405 的 message。
 //!
-//! ### ⚠️ `INSPECTION` 必须显式分支，绝不走兜底沉默
-//! 入单口径从 `{INSPECTION, READY_TO_SHIP}` 收窄为 `{READY_TO_SHIP}` 后，
-//! `INSPECTION` 批次会掉进分类循环的兜底臂 —— 那段注释自称「剩下的合法状态只有
-//! `READY_TO_SHIP`（已收进 attachable）」，即它声称自己不可达。若真让 `INSPECTION`
-//! 掉进去：`all_attachable_empty = true` ⇒ 返回 `AlreadyPresent` ⇒ 前端弹「已在
-//! XX 上」，**但它根本没被挂上去**。这是静默说谎。
+//! ### ⚠️ `INSPECTION` 必须显式分支，否则状态信息彻底丢失
+//! 入单口径从 `{INSPECTION, READY_TO_SHIP}` 收窄为 `{READY_TO_SHIP}` 后，`INSPECTION`
+//! 批次在任何地方都不可被分配 —— 可入单集合由 repo 的 SQL 定（只放 `READY_TO_SHIP`
+//! 且未占用的活跃批次）。若分类循环不显式收集它，这些批次在整条链路上**没有任何一处
+//! 会提到**：DP 只能报「可入单件数不足」，用户看到的是「货不够」，而真实原因是「还没
+//! 品检完」⇒ 状态信息丢失，且 message 里没有任何线索指向该去做品检。
 //!
-//! ⇒ 本文件在分类循环里给 `INSPECTION` 显式分支，收集到**按 part 分组**的
-//! `not_ready` 明细；当该 part 的 DP 分配失败时，这些明细连同 part_id /
+//! ⇒ 本文件在分类循环里给 `INSPECTION` 显式分支，收进**按 part 分组**的
+//! `not_ready_by_part`；当该 part 的 DP 分配失败时，这些明细连同 part_id /
 //! serial_no / batch_no / status 一起进 21405 的 message。
 
 use std::collections::HashMap;
@@ -142,7 +142,13 @@ struct AllocFailure {
     error: AppError,
 }
 
-/// 取 `AppError` 的 message 原文（拼汇总文案时用；非业务错误退回 `Display`）。
+/// 取 `AppError` 的 message 原文（拼汇总文案时用）。
+///
+/// 前提：`alloc_failure_error` 收进来的 `AllocFailure.error` 目前**只可能是 21405**
+/// （`allocate` 的唯一错误出口是 `batch_allocation::not_enough`），所以这里取到的
+/// 一定是业务 message。下游由 `debug_assert!` 把这条前提钉住：一旦 `allocate` 将来
+/// 改吐别的错误、非业务错误就会走进兜底分支，它的 `Display` 会被拼进 message 且整个
+/// 响应的错误码退化成 21405（500 被伪装成业务错），这种事必须在开发期就炸掉。
 fn error_message(e: &AppError) -> String {
     match e {
         AppError::Biz { message, .. } | AppError::BizWithFailures { message, .. } => {
@@ -154,23 +160,36 @@ fn error_message(e: &AppError) -> String {
 
 /// 把「本次分配的失败 part」汇总成一条 21405。
 ///
-/// 2026-10-09 定。三条规则：
+/// 三条规则：
 /// - **基底是 DP 自己的 message**（如「可入单件数不足：需要 8 件，候选批次合计 4 件」）
 ///   —— 根因是「货不够」时不要硬塞「READY_TO_SHIP」字样，那是在说错话；
-/// - 该失败 part 在 `not_ready` 里有明细时，在基底后追加
+/// - 该失败 part 在 `not_ready_by_part` 里有明细时，在基底后追加
 ///   `；入单只允许 READY_TO_SHIP，以下批次不可用：…` + 明细；
-/// - 多个 part 同时失败时逐个列出（`part_id` + 需要件数 + DP 文案），按 `part_id`
-///   升序输出（`targets` 迭代序不定，不排序会让同一请求的 message 抖动）。
+/// - **part 前缀的判据是「本请求是否含多个 part」，不是「几个 part 失败」**：
+///   `request_parts > 1` 或失败数 > 1 时，每段带 `part_id` + 需要件数
+///   （`part {id}（需 N 件）：{DP 文案}`）。只按失败数判会让「两个 part、只有 B 凑不出」
+///   的 message 变成一句无主语的「可入单件数不足」—— 用户看不出是哪件货不够；
+///   多个失败 part 按 `part_id` 升序输出（`targets` 是 `HashMap`、迭代序不定，不排序
+///   会让同一请求的 message 抖动）。
 fn alloc_failure_error(
     failures: &[AllocFailure],
     not_ready_by_part: &HashMap<i64, Vec<NotReadyDetail>>,
+    request_parts: usize,
 ) -> AppError {
     let mut sorted: Vec<&AllocFailure> = failures.iter().collect();
     sorted.sort_by_key(|f| f.part_id);
-    let multiple = sorted.len() > 1;
+    let multiple = sorted.len() > 1 || request_parts > 1;
     let segments: Vec<String> = sorted
         .iter()
         .map(|f| {
+            // 见 `error_message` 的 doc：非业务错误混进来会让 500 退化成 21405。
+            debug_assert!(
+                matches!(
+                    f.error,
+                    AppError::Biz { .. } | AppError::BizWithFailures { .. }
+                ),
+                "alloc_failure_error 的入参 error 应当只可能是业务错误（21405）"
+            );
             let dp_msg = error_message(&f.error);
             let head = if multiple {
                 format!("part {}（需 {} 件）：{dp_msg}", f.part_id, f.target)
@@ -354,7 +373,7 @@ impl DeliveryNoteService {
                 _ => {
                     // 未被占用 ⇒ 判状态。READY_TO_SHIP 由 repo 的
                     // `list_entryable_batches_by_part_ids` 保证进了 `eligible`，
-                    // 其余一律收集到 not_ready（Step 7 分配失败时才用它们报错）。
+                    // 其余一律收集到 `not_ready_by_part`（Step 7 分配失败时才用它们报错）。
                     if b.status != STATUS_READY_TO_SHIP {
                         not_ready_by_part
                             .entry(b.part_id)
@@ -433,7 +452,11 @@ impl DeliveryNoteService {
         // 状态闸门在此生效：只有 DP 凑不出本次要的量才拒绝，且拒绝发生在任何
         // `split_batch` / 挂单之前 ⇒ 整请求原子失败（不部分挂单）。
         if !alloc_failures.is_empty() {
-            return Err(alloc_failure_error(&alloc_failures, &not_ready_by_part));
+            return Err(alloc_failure_error(
+                &alloc_failures,
+                &not_ready_by_part,
+                targets.len(),
+            ));
         }
         // 兜底：`targets` 非空、每个 target > 0（入参闸门已保证）⇒ DP 全成功必有
         // 分配，走不到这；留着防将来改动把某个分支挪到 DP 之后。

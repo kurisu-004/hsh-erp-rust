@@ -9,14 +9,15 @@
 //! | 批次已挂在别的 `DRAFT` / `SUBMITTED` 单上（**请求级**闸门） | 21406 | `batch_on_active_note_rejected_21406` |
 //! | 零件的 L1 客户 ≠ 单据 L1 客户 | 21407 | `cross_l1_part_rejected_21407` |
 //! | DP 不可行（凑不出） | 21405 | `quantity_over_entryable_total_returns_21405` |
+//! | 跨 part 原子性：一个 part 够、另一个凑不出 ⇒ **整个请求零写入** | 21405 | `multi_part_shortage_writes_nothing_across_parts` |
 //!
-//! ## ★ 最重要的一条：`INSPECTION` 必须显式报 21405，绝不静默说谎
+//! ## ★ 最重要的一条：`INSPECTION` 必须显式报 21405，且 message 点名该批次
 //!
-//! 入单口径从 `{INSPECTION, READY_TO_SHIP}` 收窄为 `{READY_TO_SHIP}` 后，
-//! `INSPECTION` 批次如果掉进分类循环的兜底臂，会得到「无可入单批次」⇒ 旧实现返回
-//! `AlreadyPresent` ⇒ 前端弹「已在 XX 上」，**但它根本没被挂上去**。
-//! `inspection_batch_is_not_silently_reported_as_already_present` 钉死这条：响应必须
-//! 是 21405（带 part / serial / batch 明细），绝不是 200。
+//! `INSPECTION` 批次不在可入单集合里（可入单只放 `READY_TO_SHIP` 且未占用的活跃批次）。
+//! 若分类循环不显式收集它，这些批次在整条链路上没有任何一处会提到：DP 只能报「可入单件数
+//! 不足」，用户看到的是「货不够」，真实原因却是「还没品检完」⇒ 状态信息丢失。
+//! `inspection_batch_is_not_silently_reported_as_already_present` 钉死这条：响应必须是
+//! 21405，且 message 带 serial_no / batch_no / status 明细，绝不是 200。
 //!
 //! ## 状态闸门的作用域（2026-10-09 修）
 //!
@@ -24,6 +25,12 @@
 //! 本次要的量：`mixed_status_part_enters_from_ready_batch_only` 钉住「够就成功」，
 //! `mixed_status_part_shortage_lists_blocked_batches` 钉住「不够才 21405，且 message
 //! 要点名被拦下的批次」。
+//!
+//! ## 跨 part 原子性
+//!
+//! DP 循环收集完全部失败 part 才决定拒绝，拒绝点落在第一个拆批 / 挂单写之前
+//! ⇒ 同一个请求里「A part 分配成功 + B part 凑不出」时，A 的批次也**不挂单**。
+//! `multi_part_shortage_writes_nothing_across_parts` 钉死这条不变量。
 
 use axum::http::StatusCode;
 use serde_json::{Value, json};
@@ -223,8 +230,8 @@ async fn batch_note_id(pool: &PgPool, batch_id: i64) -> Option<i64> {
 
 /// ★ `INSPECTION` 批次一律 21405，**且必须带 part / serial / batch 明细**。
 ///
-/// 规格原文：「不许走兜底沉默」—— 旧实现会让 `INSPECTION` 掉进「无可入单批次」的兜底
-/// 臂并返回 `AlreadyPresent`，前端弹「已在 XX 上」而实际没挂上去。
+/// 不显式收集 `INSPECTION` 的代价不是「报错了码」，而是**状态信息彻底丢失**：它不在可入单
+/// 集合里，DP 只会报一句无主语的「可入单件数不足」，用户无从知道要先去品检。
 #[tokio::test]
 async fn inspection_batch_is_not_silently_reported_as_already_present() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
@@ -257,8 +264,8 @@ async fn inspection_batch_is_not_silently_reported_as_already_present() {
 
 /// 其余未过检状态（`PENDING` / `IN_PROCESS` / `DELIVERED` …）同样 21405。
 ///
-/// ⚠️ 这条同时钉住「显式分支」的实现形态：任何一个**没进 `not_ready` 列表**的状态都会
-/// 掉进兜底臂。
+/// ⚠️ 这条同时钉住「显式分支」的实现形态：任何一个**没进 `not_ready_by_part`** 的状态都会
+/// 在 message 里丢掉自己的名字（只剩「可入单件数不足」）。
 #[tokio::test]
 async fn non_ready_statuses_all_rejected_21405() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
@@ -381,6 +388,68 @@ async fn mixed_status_part_shortage_lists_blocked_batches() {
     );
 }
 
+/// ★ 跨 part 原子性：一个 part 够、另一个凑不出 ⇒ **整请求零写入**。
+///
+/// DP 循环收集完全部失败 part 才决定拒绝，拒绝点落在第一个拆批 / 挂单写之前。若谁把写操作
+/// 挪进 DP 循环内（每个 part 分配成功就立刻挂），这条会红 —— 那正是本用例存在的理由。
+/// 单 part 的用例（`mixed_status_part_shortage_lists_blocked_batches` 等）测不到这点：
+/// 只有一个 part 时 `attached` 本来就是空集合，拒绝点落在 DP 循环内还是循环后，
+/// 库里的写入结果完全一样。
+#[tokio::test]
+async fn multi_part_shortage_writes_nothing_across_parts() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let l1 = insert_l1(&pool, "闸门跨 part").await;
+    let l2 = insert_l2(&pool, "闸门跨 part 二厂", l1).await;
+    // A：足量的 READY_TO_SHIP 批次（8 件，本次要 8 件 ⇒ DP 必然成功）
+    let part_a = insert_part(&pool, "跨 part 甲件", "G-XPARTA", l2).await;
+    let ready_a = insert_batch(&pool, part_a, 1, 8, "READY_TO_SHIP", None).await;
+    // B：只有 4 件可入单，另 8 件卡在 IN_PROCESS ⇒ 本次要 8 件 ⇒ 必然凑不出
+    let part_b = insert_part(&pool, "跨 part 乙件", "G-XPARTB", l2).await;
+    insert_batch(&pool, part_b, 1, 8, "IN_PROCESS", None).await;
+    insert_batch(&pool, part_b, 2, 4, "READY_TO_SHIP", None).await;
+
+    let (s, env) = scan_entry(
+        &app,
+        &token,
+        "G-XPARTA",
+        json!([
+            {"node_kind": "PART", "node_id": part_a.to_string(), "quantity": 8},
+            {"node_kind": "PART", "node_id": part_b.to_string(), "quantity": 8},
+        ]),
+    )
+    .await;
+
+    assert_eq!(s, StatusCode::BAD_REQUEST, "B 凑不出 ⇒ 整请求 21405: {env}");
+    assert_eq!(env["code"], 21405, "{env}");
+    let msg = env["message"].as_str().unwrap();
+    assert!(
+        msg.contains("可入单件数不足"),
+        "message 基底应是 DP 的「可入单件数不足」: {msg}"
+    );
+    assert!(
+        msg.contains(&part_b.to_string()),
+        "请求含多个 part 时失败段必须带 part 身份（B 的 part_id）: {msg}"
+    );
+    assert!(
+        msg.contains("G-XPARTB") && msg.contains("IN_PROCESS"),
+        "message 应点名被拦下的批次（serial_no + status）: {msg}"
+    );
+    assert!(
+        !msg.contains("G-XPARTA"),
+        "分配成功的 A 不该出现在失败汇总里: {msg}"
+    );
+    assert_eq!(
+        attached_count(&pool).await,
+        0,
+        "跨 part 原子失败：一个 part 凑不出 ⇒ 够量的那个也不挂: {env}"
+    );
+    assert_eq!(
+        batch_note_id(&pool, ready_a).await,
+        None,
+        "A 的 READY 批次必须仍是未挂单状态（不允许 per-part 先挂后验）"
+    );
+}
+
 /// 整批被占用（无可用批次）时也要 21405（而不是「已在 XX 上」）。
 #[tokio::test]
 async fn fully_occupied_part_returns_21405_not_already_present() {
@@ -443,7 +512,7 @@ async fn batch_on_active_note_rejected_21406() {
 ///
 /// 这条钉住 2026-10-08 修掉的一个**三桶漏底**：批次挂在 `PICKED_UP` 单上时，
 /// 它既不在「可入单」集合（repo 按 `READY_TO_SHIP` + 未占用筛）里、也不算「活跃占用」
-/// （`DRAFT` / `SUBMITTED` 才算）、状态又是 `READY_TO_SHIP`（不进 not_ready）⇒ 落进
+/// （`DRAFT` / `SUBMITTED` 才算）、状态又是 `READY_TO_SHIP`（不进 `not_ready_by_part`）⇒ 落进
 /// DP 的「凑不出」⇒ 返回 **21405「可入单件数不足」**，语义完全错（用户看到的是
 /// 「货不够」，实际是「货已经送走了」）。现按「已送出占用」显式报 21406。
 #[tokio::test]
