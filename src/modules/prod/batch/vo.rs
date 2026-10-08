@@ -7,8 +7,8 @@
 //!
 //! ## 分组
 //! - **流转与生命周期**（`transition*` / `lifecycle` / `shelf` / `programming` /
-//!   `outsource` / `repair` / `batch_ops` / `pickup` / `scan` / `worker_scan`）：
-//!   `ToXxxOut` / `BatchToXxxOut` / `BatchOpFailure` / `WorkerScanOut`
+//!   `repair` / `batch_ops` / `scan`）：`ToXxxOut` / `BatchToXxxOut` /
+//!   `BatchOpFailure`
 //! - **集合读**（`repair.rs`）：`InspectionBatchListOut`（仅 repair / repairing
 //!   两条共用）
 //!
@@ -23,11 +23,14 @@
 //! 2026-10-09：拆批端点提升为顶层共用端点 `POST /api/v2/batches/split`（三个
 //! 消费方共用），出参由 `R<i64>` 裸数字换成 [`BatchSplitOut`]（全 ID 字符串）。
 //!
+//! 2026-10-10：报工台的 worker-scan 出参（`WorkerScanCoreOut` / `WorkerScanOut`）
+//! 随端点迁往 `prod::scan::vo::transition`。pick-up 端点也一并迁出，但其 HTTP
+//! 响应体是 `PartOut`（与 to-XXX 三流共用），本 VO 的形状不变。
+//!
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::Serialize;
 
 use crate::modules::part::vo::PartOut;
-use crate::modules::prod::queue::vo::worker::RefillResult;
 use crate::shared::types::{serialize_i64, serialize_i64_opt};
 
 // ===== 集合读（返修：repair / repairing 两条共用）=====
@@ -171,8 +174,6 @@ pub type RepairBatchesOut = InspectionBatchListOut;
 ///   为 `Some(assembly_id)`（handler 据此发 `ASSEMBLY_UPDATED` WS 广播）；
 ///   无父装配件或父未变更时为 `None`。
 #[derive(Debug, Clone, Serialize)]
-// ===== to-XXX 三流 / 批量流转 / worker-scan =====
-
 pub struct ToXxxOut {
     pub part: PartOut,
     #[serde(serialize_with = "serialize_i64_opt")]
@@ -207,43 +208,6 @@ pub struct BatchOpFailure {
 pub struct BatchToXxxOut {
     pub submitted: Vec<ToXxxOut>,
     pub failed: Vec<BatchOpFailure>,
-}
-
-/// worker-scan 核心出参（不含 refill）。
-///
-/// handler 会把 `scan + refill` 一起装到 [`WorkerScanOut`] 返回；
-/// `WorkerScanCoreOut` 是 service 层直接产出的最小投影（与 worker-pool
-/// `RefillResult` 解耦，便于 service 层单测）。
-///
-/// `work_type_id` 与 `badge_code` 是**内部管道字段**：handler 用它把
-/// `worker_scan_event` 已经 fetch 过的 worker 信息透传给同事务的
-/// `QueueService::refill_for_worker_with_work_type`，避免重复
-/// `WorkerRepo::get_by_id` 查询。不暴露到 JSON 响应里。
-#[derive(Debug, Clone, Serialize)]
-pub struct WorkerScanCoreOut {
-    #[serde(serialize_with = "serialize_i64")]
-    pub worker_id: i64,
-    #[serde(serialize_with = "serialize_i64")]
-    pub part_id: i64,
-    #[serde(serialize_with = "serialize_i64")]
-    pub batch_id: i64,
-    pub event_type: String,
-    /// 父装配件 id（仅当 INSPECTED 分支触发父 status 变更时 Some）
-    #[serde(serialize_with = "serialize_i64_opt")]
-    pub synced_assembly_id: Option<i64>,
-    /// 内部：透传给 refill，refill 不再 fetch worker。
-    #[serde(skip)]
-    pub work_type_id: i64,
-    /// 内部：refill 写 `TAKEN_FROM_POOL` 事件日志需要 badge_code。
-    #[serde(skip)]
-    pub badge_code: String,
-}
-
-/// worker-scan 端点出参：`scan` + 同事务 refill 结果。
-#[derive(Debug, Clone, Serialize)]
-pub struct WorkerScanOut {
-    pub scan: WorkerScanCoreOut,
-    pub refill: RefillResult,
 }
 
 // ===== 共用顶层端点（/api/v2/batches）=====

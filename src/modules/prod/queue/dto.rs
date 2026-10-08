@@ -4,6 +4,10 @@
 //! 出参结构全在 [`super::vo`]（按写端点 / 下发流 / 聚合板分三个文件）。
 //! VO 禁止出现在 axum extractor 反序列化侧。
 //!
+//! 2026-10-10：`WorkerScanEvent`（worker-scan 的入参枚举）迁往
+//! `crate::modules::prod::scan::dto` —— 它是报工台的入参，本域只是当初的收留地，
+//! 归属按**消费方**而非「谁先写出来」判定。
+//!
 //! ## 2026-10-08 扩容
 //! 自 `prod::batch::dto` 搬入下发流 5 个入参（`ListPendingQuery` /
 //! `DispatchRequest` / `DispatchTarget` / `AutoDispatchRequest` /
@@ -31,13 +35,6 @@
 use serde::{Deserialize, Serialize};
 
 use crate::shared::types::deserialize_i64;
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "UPPERCASE")]
-pub enum WorkerScanEvent {
-    RETURNED,
-    INSPECTED,
-}
 
 /// `POST /api/v2/prod/queue/refill` 入参（Manager only，前端零消费方）。
 ///

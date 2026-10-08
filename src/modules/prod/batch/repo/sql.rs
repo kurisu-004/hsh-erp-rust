@@ -375,7 +375,7 @@ impl PartBatchRepo {
     /// 之所以**不会**立刻造成池污染：全部 4 条工序池 SQL
     /// （`take_one_from_pool` / `list_candidates_by_process_all_shelves` /
     /// `group_count_by_process_all_shelves` / `count_pool_by_shelf_and_process`）
-    /// 与 `work_type::list_pickable_by_work_type` 都同时限定
+    /// 与报工台的 pickable 列表 SQL 都同时限定
     /// `status='IN_PROCESS' AND location='PRODUCTION_SHELF'`。但那条 DB 级不变量
     /// 必须成立，否则将来任何「只按 `current_process_id` 过滤、不带
     /// status/location」的查询都会把送检批次错当池内批次捞出来。

@@ -10,7 +10,7 @@
 //!
 //! ## Service 形态
 //! [`queue::QueueService`] 保持 unit struct（**不**持字段依赖）。snowflake 由每个
-//! 写方法形参显式收 —— 跨域调用点（`prod::batch::service::worker_scan` 的
+//! 写方法形参显式收 —— 跨域调用点（`prod::scan::service::worker_scan` 的
 //! worker-scan 路径直接调 `QueueService::refill_for_worker_with_work_type`）
 //! 沿用 ZST 静态 + 显式 snowflake 的旧形态，改成 trait 注入式要动 batch 域。
 //!

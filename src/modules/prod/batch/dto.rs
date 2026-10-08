@@ -13,10 +13,12 @@
 //! `R<T>` 信封）。**计数字段刻意不套这层兜底**（`version` / `quantity` 走裸 JSON
 //! 数字），见 [`SplitBatchByBodyRequest`]。
 //! 2026-10-02 追加：自 part 域迁入批次流转入参（见文件末尾小节）。
+//!
+//! 2026-10-10：报工台的 `WorkerScanRequest` / `PickUpRequest`（连同
+//! `WorkerScanEvent` 枚举）迁往 `crate::modules::prod::scan::dto`。
 
 use serde::Deserialize;
 
-use crate::modules::prod::queue::dto::WorkerScanEvent;
 use crate::shared::types::{deserialize_i64, deserialize_i64_opt};
 
 // 2026-10-02：自 part 域迁入的批次流转 DTO（原 `part/dto.rs` + `part/dto_crud.rs`）
@@ -126,55 +128,6 @@ pub struct BatchToInspectionRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct BatchToShipRequest {
     pub items: Vec<BatchOpItem>,
-}
-
-/// `POST /api/v2/prod/batches/worker-scan` 入参。
-///
-/// 无 Path extractor：`serial_no` 是主键，`batch_id` 仅在多批次歧义时用于消歧。
-/// `event_type`：`WorkerScanEvent::RETURNED` / `INSPECTED`。
-///
-/// ## `next_process_id`：**仅非顺应工序时必填**（2026-10-09 改写，2026-10-10 微调）
-/// 后端先解析批次在工序链上的位置
-/// （`shared::batch::chain::resolve_chain_position`，判据与读侧
-/// `GET /parts/by-worker` 的 `chain_state` 逐条同源），按下表分流：
-///
-/// | 链上位置 | 分流 | `next_process_id` |
-/// |---|---|---|
-/// | `TAIL`（链内最后一道） | **自动送检**（2026-10-10 新增）：这批做完了，不落生产架 | 可省略 |
-/// | `NEXT` 且顺应 | 后端按链推导下一道工序与 step | 可省略 |
-/// | 其余（非顺应：无链 / 链已软删 / 指针漂移 / 链内 `process_id` 重复） | 按前端指定推进 | **必填**，缺失 → `40001` |
-///
-/// 字段类型保持 `Option<String>` 不变（不改 wire）：前端可以继续照 `chain_state`
-/// 决定填不填，两条路径都合法。
-///
-/// ## ⚠️ 响应 `event_type` 可能与请求的**不同**（2026-10-10 新增）
-/// 请求发 `RETURNED` 但批次在链尾时，服务端把它当送检处理，响应
-/// `event_type = "WORKER_SCAN_INSPECTED"`。前端**必须按响应里的 `event_type` 分支**，
-/// 不能按自己发的那一个 —— 服务端比前端更清楚批次做完了没有。语义与 WS 链路登记见
-/// `docs/api/batch.md`。
-///
-/// ## 两个货架字段已移除（2026-10-10）
-///
-/// - `shelf_id`：目标生产架改由服务端按负载自动选
-///   （`shared::shelf::select::pick_least_loaded`）。它原先的**双重**身份 —— 「放回
-///   到的架」与「refill 的候选池过滤键」—— 两条都随之消失：放回由选架决定，补料改成
-///   **跨全部映射该工种工序的活跃生产架**取料（`take_one_from_pool` 的
-///   `shelf_id = NULL` 分支）；
-/// - `target_inspection_shelf_id`：目标品检架同样由服务端按负载自动选。选不出时返
-///   `40301 SHELF_MISMATCH`（当前账号 scope 内没有任何可用的 INSPECTION 架）。
-///
-/// 两个字段的移除都是**向后兼容**的（老客户端多发的字段被 serde 静默忽略，本仓生产
-/// 代码零 `deny_unknown_fields`）；但新客户端发老版本服务端会得 422（`shelf_id`
-/// 必填缺失），**部署顺序必须后端先上**。
-#[derive(Debug, Clone, Deserialize)]
-pub struct WorkerScanRequest {
-    pub serial_no: String,
-    pub badge_code: String,
-    pub event_type: WorkerScanEvent,
-    #[serde(default)]
-    pub next_process_id: Option<String>,
-    #[serde(default)]
-    pub batch_id: Option<String>,
 }
 
 /// `GET /api/v2/prod/batches/repair` / `repairing` 查询参数（2 条共用）。
@@ -369,99 +322,6 @@ pub struct CancelBatchRequest {
     pub version: i32,
     #[serde(default)]
     pub reason: Option<String>,
-}
-
-/// `POST /api/v2/prod/batches/{batch_id}/pick-up` 入参（手动 pick-up 兜底）。
-///
-/// PENDING / IN_PROCESS+PRODUCTION_SHELF → IN_PROCESS+WORKER。
-/// `worker_id` 必填（持有件工人）；`shelf_id` **可选**（见该字段 doc）。
-///
-/// 2026-10-03 新增：部分领取。`quantity` 缺省 = 整批领取（保持既有行为，向后
-/// 兼容）；`0 < quantity < batch.quantity` 时 service 自动拆批，把拆出来的那
-/// 部分交给工人，源批次留在原处、数量递减。
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct PickUpRequest {
-    pub version: i32,
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub worker_id: i64,
-    /// 当前批次所在货架。**2026-10-04 起可选**。
-    ///
-    /// ## 传了才校验，缺省什么都不做
-    ///
-    /// `Some(sid)` → service 校验「存在 + `is_active` + `zone='PRODUCTION'`」
-    /// （`validate_shelf_zone`，依次 `20501` / `20512` / `20104`）。
-    /// `None`（缺省或显式 `null`）→ **不校验、不推导、不回退**，请求照常受理。
-    ///
-    /// ## 为什么可以缺省：这个字段对最终结果零影响
-    ///
-    /// pick-up 路径上 `shelf_id` 只进 `validate_shelf_zone`，而它内部只
-    /// `SELECT ... FROM t_shelf WHERE id = $1 AND deleted_at IS NULL`（零写）；
-    /// 本路径 `t_part_batch` 的全部 3 个写入点（拆成 4 条 SQL；`pickup.rs` 内联
-    /// SQL、`guards.rs` → `status.rs` 的通用 UPDATE、部分领取的
-    /// `split_batch_for_partial_pass` = `_split_batch_inner` 的 INSERT + UPDATE）
-    /// 的 SET 与 WHERE 均无货架列或货架条件；
-    /// `t_part_event` 无货架列；响应 VO `PartOut` 无 shelf 字段。
-    /// ⇒ 那条校验是**防呆断言**（让手填错区的人当场看见 20104），不是安全边界，
-    /// 故不必强绑在成功路径上 —— 扫码台 / 看板等自动发起 pick-up 的调用方
-    /// 本就无从知道「批次此刻名义上在哪一个架」。
-    ///
-    /// ## 订正一处旧表述（2026-10-04）
-    ///
-    /// 本字段旧注释写「service 层仅校验存在 + 同 shelf ↔ process 映射」，
-    /// **后半句是错的**：pick-up 从不校验货架↔工序映射，
-    /// `assert_shelf_maps_process`（`20507 BIZ_SHELF_PROCESS_NOT_MAPPED`）在本
-    /// 路径一次都没被调用 —— 它只服务 `place-on-shelf` 与 worker-scan。
-    ///
-    /// ## 为什么不做「从 `current_holder_id` 推导」
-    ///
-    /// 技术上不可行（2026-10-04 逐条核实）：
-    /// 1. PENDING 起点的批次 `current_holder_id` 恒为 `NULL`
-    ///    （`create_initial_batch` 写死 `NULL, NULL`），而 PENDING 正是「待下发池」
-    ///    的 pick-up 起点；
-    /// 2. IN_PROCESS 起点只守 `location='PRODUCTION_SHELF'`、**不守 holder**，
-    ///    `dispatch` 与 `pool/move` 两个写点能把 INSPECTION 区的架写进
-    ///    `current_holder_id`；
-    /// 3. `current_holder_id` 可能指向**已软删 / 非 PRODUCTION 区**的架，
-    ///    「推导 + 施加同样校验」会把这类批次**永久锁死**。三条机制（2026-10-04
-    ///    review 第 1 轮订正：原表述「货架被停用 / 软删时 holder 仍指向失效 id」
-    ///    按字面不成立 —— `deactivate` 与 soft-delete 是同一操作，且 soft-delete
-    ///    被引用时会被 `20503 BIZ_SHELF_IN_USE` 拦住）：
-    ///    （a）`dispatch` 的 `ShelfProcessRepo::find_first_shelf_for_process` 只按
-    ///    `t_shelf_process.deleted_at IS NULL` 过滤、**不 JOIN `t_shelf`** ⇒ 既不过滤
-    ///    `zone` 也不过滤 `is_active`，映射残留时会把已软删的架 id 直接写进
-    ///    `current_holder_id`；
-    ///    （b）soft-delete 的 `20503` 守卫（`ShelfRepo::count_in_use_parts`）谓词是
-    ///    `location IN ('PRODUCTION_SHELF','INSPECTION_SHELF') AND status IN
-    ///    ('IN_PROCESS','INSPECTION')` ⇒ `location='PRODUCTION_SHELF'` 但 status 落在
-    ///    该集合之外的行**不被计入**；
-    ///    （c）该守卫是「先 count、再 soft_delete」两条独立语句、中间无锁 ⇒ 并发
-    ///    上架可穿过守卫（TOCTOU）。
-    ///
-    /// ## ⚠️ 本字段**无 scope 校验**
-    ///
-    /// 与 worker-scan 对照：后者对 `shelf_id` 走 `can_access_shelf` 并在越权时
-    /// 返 `40301 SHELF_MISMATCH`。pick-up 不做该校验，故本字段缺省时**没有**
-    /// 任何货架维度的权限收敛；SHELF_ACCOUNT 角色门（`require_any_role`）是本
-    /// 端点唯一的权限边界。
-    ///
-    /// 线上形态仍是 **JSON 字符串**（`deserialize_i64_opt` 只吃 `str`），
-    /// 例如 `"shelf_id": "43"`；`"shelf_id": 43`（数字）→ `422`。
-    #[serde(default, deserialize_with = "deserialize_i64_opt")]
-    pub shelf_id: Option<i64>,
-    /// 2026-10-03 新增：部分领取；缺省 = 整批。
-    ///
-    /// 线上形态是 **JSON 字符串**（`deserialize_i64_opt` 只吃 `str`），例如
-    /// `"quantity": "4"`；发数字 → 422 纯文本。本字段的字符串形态是**前端既有约定**
-    /// （扫码台照此发送），与本模块其它「裸 JSON 数字计数」字段刻意不同形，改它要
-    /// 连带改前端。
-    ///
-    /// `None` / `>= batch.quantity` 一律按整批处理（`==` 是「显式整批」的合法
-    /// 写法，语义与 `None` 等价）；`0 < q < batch.quantity` 触发自动拆批。
-    /// 范围校验在 service 层，错误码 `BIZ_PART_BATCH_INVALID_QUANTITY`。
-    #[serde(default, deserialize_with = "deserialize_i64_opt")]
-    pub quantity: Option<i64>,
-    #[serde(default)]
-    pub note: Option<String>,
 }
 
 /// `POST /api/v2/prod/batches/{batch_id}/scan-inspect` 入参。

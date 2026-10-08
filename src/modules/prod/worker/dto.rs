@@ -5,14 +5,10 @@
 //! ## DTO/VO 边界（2026-09-22 PR4 重构）
 //! 出参结构（`WorkerOut` / `WorkerListOut`）已抽离至 `super::vo`。
 //! 本文件仅含入参（Deserialize）。
+//!
+//! 2026-10-10：报工台的 `VerifyBadgeRequest` 迁往 `crate::modules::prod::scan::dto`。
 
 use serde::Deserialize;
-
-/// 校验工牌请求体（扫码台用）。
-#[derive(Debug, Clone, Deserialize)]
-pub struct VerifyBadgeRequest {
-    pub badge_code: String,
-}
 
 /// 创建工人。
 ///

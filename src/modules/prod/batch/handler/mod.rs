@@ -6,11 +6,15 @@
 //!
 //! ## 子文件
 //! - `transition.rs` —— to-XXX 流（`to-ship` / `to-inspection` / `to-process`）+ 批量
-//!   流转 + 扫码快捷入口（`scan-inspect` / `scan/deliver` / `worker-scan`）+ 集合读
+//!   流转 + 扫码快捷入口（`scan-inspect` / `scan/deliver`）+ 集合读
 //!   （`repair` / `repairing`）
 //! - `lifecycle.rs` —— 终态 + 状态机扩展（`deliver` / `complete` / `start-repair` /
 //!   `place-on-shelf` / `release-from-programming` / `complete-repair` /
-//!   `repair-dispatch` / `cancel` / `pick-up` / 拆批）
+//!   `repair-dispatch` / `cancel` / 拆批）
+//!
+//! 2026-10-10：报工台两条端点（`worker-scan` / `{batch_id}/pick-up`）连同其
+//! handler / service / DTO / 出参迁往 `crate::modules::prod::scan`（硬切无 alias），
+//! 见下方 `STRIPPED` 表。
 //!
 //! 2026-10-09：外协三个端点（`send-to-outsource` / `receive-from-outsource` /
 //! `receive-from-outsource-to-inspection`）剥离到 `outsource::queue`，合并为
@@ -41,13 +45,13 @@ pub mod transition;
 // ----- transition.rs -----
 pub use transition::{
     batch_to_inspection, batch_to_ship, list_repair_batches, list_repairing_batches,
-    scan_deliver_part, scan_inspect, to_inspection, to_process, to_ship, worker_scan,
+    scan_deliver_part, scan_inspect, to_inspection, to_process, to_ship,
 };
 
 // ----- lifecycle.rs -----
 pub use lifecycle::{
-    cancel_batch, complete, complete_repair, deliver, pick_up, place_on_shelf,
-    release_from_programming, repair_dispatch, split_batch_by_body, start_repair,
+    cancel_batch, complete, complete_repair, deliver, place_on_shelf, release_from_programming,
+    repair_dispatch, split_batch_by_body, start_repair,
 };
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -60,8 +64,6 @@ pub fn router() -> Router<Arc<AppState>> {
         // ---- 静态批量流转（2 条，无 Path extractor）----
         .route("/to-ship", post(transition::batch_to_ship))
         .route("/to-inspection", post(transition::batch_to_inspection))
-        // ---- 工人扫码台主入口（无 Path extractor，主键 serial_no）----
-        .route("/worker-scan", post(transition::worker_scan))
         // ---- 集合读 2 条（只读端点，pool.acquire() 不开事务）----
         // 待品检队列读 `/inspection` 已于 2026-10-07 迁往 `prod::inspection`
         // （新路径 `GET /api/v2/prod/inspection/queue`，**无 alias**）
@@ -112,7 +114,6 @@ pub fn router() -> Router<Arc<AppState>> {
         )
         // ---- 批次操作 ----
         .route("/{batch_id}/cancel", post(lifecycle::cancel_batch))
-        .route("/{batch_id}/pick-up", post(lifecycle::pick_up))
 }
 
 /// 批次拆分（挂载点 `/api/v2/batches`，**顶层**而非本域 nest）。
@@ -155,7 +156,6 @@ pub fn split_router() -> Router<Arc<AppState>> {
 pub const ROUTES: &[&str] = &[
     "POST /to-ship",
     "POST /to-inspection",
-    "POST /worker-scan",
     "GET /repair",
     "GET /repairing",
     "POST /scan/deliver",
@@ -171,7 +171,6 @@ pub const ROUTES: &[&str] = &[
     "POST /{batch_id}/complete-repair",
     "POST /{batch_id}/repair-dispatch",
     "POST /{batch_id}/cancel",
-    "POST /{batch_id}/pick-up",
 ];
 
 /// 剥离登记表（目标域），**与 [`ROUTES`] 同序同长度**：下标 `i` 描述 `ROUTES[i]`。
@@ -182,7 +181,6 @@ pub const STRIP_TARGETS: &[&str] = &[
     // ── 1 段静态 ──
     "多域共用（views/inspection/ + views/delivery/）",
     "多域共用（views/inspection/ + views/delivery/）",
-    "views/scan/（扫码台）",
     "views/repair/",
     "views/repair/",
     // ── 2 段静态 ──
@@ -200,7 +198,6 @@ pub const STRIP_TARGETS: &[&str] = &[
     "views/repair/",
     "views/repair/",
     "views/parts/detail/",
-    "views/scan/（扫码台）",
 ];
 
 /// 已被认领并从 batch 域移走的端点。
@@ -234,6 +231,14 @@ pub const STRIPPED: &[(&str, &str)] = &[
     (
         "POST /{batch_id}/split",
         "prod（2026-10-09 提升为共用顶层端点 POST /batches/split，batch_id 入 body）",
+    ),
+    (
+        "POST /worker-scan",
+        "prod::scan（2026-10-10 剥离，新路径 POST /prod/scan/worker-scan）",
+    ),
+    (
+        "POST /{batch_id}/pick-up",
+        "prod::scan（2026-10-10 剥离，新路径 POST /prod/scan/batches/{batch_id}/pick-up）",
     ),
 ];
 

@@ -12,11 +12,15 @@
 //!   装进同一个 `R` 信封。
 //! - 权限在 service 层（`require_role` / `require_auth`），此处不重复校验。
 //!
-//! ## 7 端点
-//! 公开（任意已登录）：`POST /workers/verify-badge`
-//! MANAGER-only（6）：`GET /workers` / `POST /workers` / `GET /workers/{id}` /
-//!                    `POST /workers/{id}/update` / `POST /workers/{id}/deactivate` /
-//!                    `POST /workers/{id}/reactivate`
+//! ## 6 端点（全部 MANAGER-only）
+//! `GET /workers` / `POST /workers` / `GET /workers/{id}` /
+//! `POST /workers/{id}/update` / `POST /workers/{id}/deactivate` /
+//! `POST /workers/{id}/reactivate`
+//!
+//! 2026-10-10：报工台的 `POST /workers/verify-badge`（任意已登录可调）连同其
+//! service 方法与 DTO 迁往 `crate::modules::prod::scan`（新路径
+//! `POST /api/v2/prod/scan/verify-badge`，**无 alias**）—— 按「目标域按前端消费方
+//! 判定」的规约，它属于报工台而不属于工人档案。
 
 use std::sync::Arc;
 
@@ -27,27 +31,12 @@ use axum::{Json, Router};
 
 use crate::auth::rbac::CurrentUser;
 use crate::modules::prod::worker::dto::{
-    VerifyBadgeRequest, WorkerCreateRequest, WorkerListQuery, WorkerUpdateRequest,
+    WorkerCreateRequest, WorkerListQuery, WorkerUpdateRequest,
 };
 use crate::modules::prod::worker::vo::{WorkerListOut, WorkerOut};
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
-
-/// POST /api/v2/prod/workers/verify-badge —— 任意已登录用户可调（含 SHELF_ACCOUNT）
-pub async fn verify_badge(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Json(req): Json<VerifyBadgeRequest>,
-) -> Result<Json<R<WorkerOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = state
-        .worker_service
-        .verify_badge(&mut *tx, &req.badge_code, &current)
-        .await?;
-    tx.commit().await?;
-    Ok(Json(R::ok(out)))
-}
 
 /// GET /api/v2/prod/workers —— MANAGER-only
 pub async fn list_workers(
@@ -144,7 +133,6 @@ pub async fn reactivate_worker(
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", get(list_workers).post(create_worker))
-        .route("/verify-badge", post(verify_badge))
         .route("/{id}", get(get_worker))
         .route("/{id}/update", post(update_worker))
         .route("/{id}/deactivate", post(deactivate_worker))

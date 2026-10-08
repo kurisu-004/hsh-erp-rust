@@ -13,9 +13,12 @@
 //! - `programming.rs` —— CNC 编程出口（release-from-programming）
 //! - `repair.rs` —— 返修闭环两写点 + 两条集合读（`/repair` / `/repairing`）
 //! - `batch_ops.rs` —— 拆批 / 取消批次
-//! - `pickup.rs` —— 手动 pick-up
 //! - `scan.rs` —— 扫码品检 / 司机扫码发货
-//! - `worker_scan.rs` —— 工人扫码台主入口（RETURNED / INSPECTED 二合一）
+//!
+//! 2026-10-10：`pickup.rs`（手动 pick-up）与 `worker_scan.rs`（报工台主入口）
+//! 整体迁往 `crate::modules::prod::scan::service`（硬切无 alias，新路径
+//! `POST /api/v2/prod/scan/worker-scan` 与 `POST /api/v2/prod/scan/batches/
+//! {batch_id}/pick-up`）—— 两条端点的唯一消费方都是报工台 / 队列看板。
 //!
 //! 2026-10-09：`outsource.rs`（外协流转三端点）整体删除 —— 三个端点合并为
 //! `POST /api/v2/outsource-queue/move`（`crate::modules::outsource::service::move_svc`，
@@ -58,14 +61,12 @@
 
 pub mod batch_ops;
 pub mod lifecycle;
-pub mod pickup;
 pub mod programming;
 pub mod repair;
 pub mod scan;
 pub mod shelf;
 pub mod transition;
 pub mod transition_core;
-pub mod worker_scan;
 
 /// `prod::batch` service（ZST，与 queue 范本一致）。
 ///
