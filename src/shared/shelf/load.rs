@@ -11,11 +11,12 @@ use sqlx::{AssertSqlSafe, PgConnection, Row};
 
 /// `t_part_batch` 按 `current_holder_id` 聚合的负载子查询（**只此一处**）。
 ///
-/// 2026-10-10 之前本仓有两处**逐字重复**的这段聚合：
-/// `modules::shelf::repo::sql.rs` 的 `list_active_production_ordered` 与
-/// `list_active_inspection_with_load`。两处各写一份的直接后果是它们只能靠注释
+/// 2026-10-10 之前本仓有两处**逐字重复**的这段聚合：`modules::shelf::repo::sql.rs`
+/// 里两个 picker 专供查询的内联子查询。两处各写一份的直接后果是它们只能靠注释
 /// 互相约束（「必须逐字一致」）—— 注释不执行，改一处忘了另一处时两个 picker 会
-/// 对同一个架给出不同的负载数，而没有任何测试会红。搬成本常量后约束由类型承担。
+/// 对同一个架给出不同的负载数，而没有任何测试会红。搬成本常量后约束由类型承担
+/// （那两个查询本身已于 picker 下线时删除，本常量现在被
+/// [`crate::shared::shelf::select`] 与本文件的 [`loads_by_shelf_ids`] 共用）。
 ///
 /// ## 口径里的三处「刻意」
 ///

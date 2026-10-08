@@ -2,8 +2,11 @@
 //!
 //! 仅含 handler 返回的 output 类型；入参类型见 `super::dto`。
 //! 按端点语义拆为：
-//! - `shelf.rs`（ShelfOut / ShelfListOut / ShelfForReturnItem / ShelfForReturnOut /
-//!   ShelfForInspectionItem / ShelfForInspectionOut）—— 主货架 CRUD + picker
+//! - `shelf.rs`（ShelfOut / ShelfListOut）—— 主货架 CRUD
+//!
+//! 2026-10-10：picker 的 4 个 VO（`ShelfForReturnItem` / `ShelfForReturnOut` /
+//! `ShelfForInspectionItem` / `ShelfForInspectionOut`）随两条 picker 端点下线而删除
+//! （移除记录见 `docs/api/shelves.md`）。
 //!
 //! ## 2026-10-02 域拆分
 //! 原 `process_mapping.rs`（4 个货架↔工序映射 VO）已随端点搬到
@@ -19,7 +22,4 @@
 
 pub mod shelf;
 
-pub use shelf::{
-    ShelfForInspectionItem, ShelfForInspectionOut, ShelfForReturnItem, ShelfForReturnOut,
-    ShelfListOut, ShelfOut,
-};
+pub use shelf::{ShelfListOut, ShelfOut};

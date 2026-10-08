@@ -6,9 +6,10 @@
 //!    （2026-10-01：REPAIRING 降级为 `t_part_batch.is_repairing` 标记列，返修
 //!    批次 status 即 IN_PROCESS，仍被本守卫覆盖。）
 //! 2. `create_then_get_shelf_round_trip` — happy path：create → get → 含 location 字段。
-//! 3. `for_inspection_returns_current_load_as_sum_of_quantity`（2026-10-04）—— picker
-//!    for-inspection 必须出 `current_load`（`SUM(quantity)` 件数口径）且空架取 0；
-//!    出参若缺该字段，前端会渲染「在架 undefined 件」—— 由本测试兜住。
+//! 3. `picker_endpoints_are_gone`（2026-10-10）—— picker 两条端点下线后旧路径 404。
+//!    （原 `for_inspection_returns_current_load_as_sum_of_quantity` 随端点下线删除；
+//!    `current_load` 的出参契约改由 `list_and_get_expose_capacity_and_current_load`
+//!    在 `GET /shelves` 上覆盖。）
 //!
 //! 2026-10-02 域拆分：原第 3 个测试 `set_shelf_processes_replaces_existing_mapping`
 //! 连同 `insert_test_process` helper 一起迁到
@@ -44,8 +45,8 @@ use serde_json::json;
 use sqlx::PgPool;
 
 use hsh_erp_test_support::{
-    ShelfFixture, json_request, load_shelf_fixture, login_token, send, test_app, test_pool,
-    test_state,
+    ShelfFixture, json_request, load_shelf_fixture, login_token, send, send_raw, test_app,
+    test_pool, test_state,
 };
 
 // ===========================================================================
@@ -246,98 +247,34 @@ async fn create_shelf_then_deactivate_with_in_use_part_fails() {
     );
 }
 
-/// `GET /shelves/for-inspection` 必须带 `current_load`，且为该架在架批次的
-/// `SUM(quantity)`（件数口径）。
+/// 2026-10-10：picker 两条端点**下线**，旧路径不再返回货架数据。
 ///
-/// 2026-10-04 回归：出参若缺 `current_load`（数据源退回裸 `TShelf` 列表查询、
-/// 不带聚合），前端品检架卡片无 `v-if` 守卫地渲染「在架 N 件」⇒ 每张送检架卡片
-/// 显示「在架 **undefined** 件」。本测试是该出参契约的防线：断言会直接失败。
+/// 货架改由服务端按负载自动选（`shared::shelf::select::pick_least_loaded`），
+/// 前端不再需要「挑一个架」这个动作，故 `/for-return` 与 `/for-inspection` 一并
+/// 删除。
 ///
-/// 断言用 `quantity=3` 的单个批次而非 2 个 `quantity=1`：这样 `SUM(quantity)=3`
-/// 与 `COUNT(*)=1` 可区分，把「件数口径」钉死。
+/// ## 响应形态：400 而不是 404（必须知道，否则会误判成「端点还在」）
+///
+/// 本域还挂着 `/{id}`（`Path<i64>`），所以 `/for-return` 现在落进那个 catch-all 并在
+/// **Path 提取器**阶段被拒 ⇒ **400 + 纯文本** `Invalid URL: Cannot parse
+/// \`for-return\` to a \`i64\``，**不进 `R<T>` 信封**。也就是说「下线」在本 router 下的
+/// 实际表现是 400 而不是 404；无论哪种都不是 200、都不会返回货架数据。
 #[tokio::test]
-async fn for_inspection_returns_current_load_as_sum_of_quantity() {
-    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+async fn picker_endpoints_are_gone() {
+    let (_pool, app, token, _fx) = bootstrap_as_manager().await;
 
-    // 1. 建一个 INSPECTION 区货架（for-inspection 只看 INSPECTION 区）
-    let (s1, env1) = send(
-        app.clone(),
-        json_request(
-            "POST",
-            "/shelves",
-            Some(json!({
-                "code": "S-INSP-01",
-                "name": "Inspection-01",
-                "zone": "INSPECTION",
-                "location": "QC-Bay-01",
-            })),
-            Some(&token),
-        ),
-    )
-    .await;
-    assert_eq!(s1, StatusCode::CREATED, "create inspection shelf: {env1}");
-    let shelf_id: i64 = env1["data"]["id"].as_str().unwrap().parse().unwrap();
-
-    // 2. 另一个 INSPECTION 架，零批次 —— 用于验证 LEFT JOIN 侧的空载取 0
-    let (s1b, env1b) = send(
-        app.clone(),
-        json_request(
-            "POST",
-            "/shelves",
-            Some(json!({
-                "code": "S-INSP-02",
-                "name": "Inspection-02",
-                "zone": "INSPECTION",
-                "location": "QC-Bay-02",
-            })),
-            Some(&token),
-        ),
-    )
-    .await;
-    assert_eq!(
-        s1b,
-        StatusCode::CREATED,
-        "create 2nd inspection shelf: {env1b}"
-    );
-
-    // 3. 直插一个 quantity=3、current_holder_id=该架的 INSPECTION 批次
-    insert_part_held_by_shelf(&pool, shelf_id, "INSPECTION", "INSPECTION_SHELF", 3).await;
-
-    // 4. 拉 for-inspection picker，按 code 定位本测试建的 2 个架
-    let (s2, env2) = send(
-        app,
-        json_request("GET", "/shelves/for-inspection", None, Some(&token)),
-    )
-    .await;
-    assert_eq!(s2, StatusCode::OK, "for-inspection: {env2}");
-    assert_eq!(env2["code"], 0);
-
-    let items = env2["data"]["items"].as_array().unwrap();
-    let loaded = items
-        .iter()
-        .find(|it| it["code"] == "S-INSP-01")
-        .unwrap_or_else(|| panic!("S-INSP-01 missing from for-inspection: {env2}"));
-    assert_eq!(
-        loaded["current_load"].as_i64(),
-        Some(3),
-        "current_load 必须是 quantity 总和（件数口径）而非批次数; got: {loaded}"
-    );
-    assert_eq!(loaded["zone"], "INSPECTION");
-    // is_recommended 是 for-return 独有的出参，本端点不提供
-    assert!(
-        loaded.get("is_recommended").is_none(),
-        "for-inspection 不应带 is_recommended; got: {loaded}"
-    );
-
-    let empty = items
-        .iter()
-        .find(|it| it["code"] == "S-INSP-02")
-        .unwrap_or_else(|| panic!("S-INSP-02 missing from for-inspection: {env2}"));
-    assert_eq!(
-        empty["current_load"].as_i64(),
-        Some(0),
-        "空载货架 LEFT JOIN 应取 0（不是 null）; got: {empty}"
-    );
+    for path in ["/shelves/for-return", "/shelves/for-inspection"] {
+        let (s, raw) = send_raw(app.clone(), json_request("GET", path, None, Some(&token))).await;
+        assert_eq!(
+            s,
+            StatusCode::BAD_REQUEST,
+            "{path} 应已下线（落进 /{{id}} 的 Path 提取器 → 400）: {s} {raw}"
+        );
+        assert!(
+            !raw.contains("current_load") && !raw.contains(r#""items""#),
+            "{path} 不得再返回 picker 的货架列表: {raw}"
+        );
+    }
 }
 
 /// 2026-10-10：`GET /shelves` 与 `GET /shelves/{id}` 的 `capacity` / `current_load`

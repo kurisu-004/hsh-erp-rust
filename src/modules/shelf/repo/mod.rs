@@ -3,9 +3,11 @@
 //! ## 结构（2026-09-22 重构）
 //! - `sql.rs`：原 `repo.rs` 全文搬迁，pub 固有静态方法 + sqlx `query!` 宏，
 //!   **内容零 diff**（`.sqlx/query-*.json` 哈希不变）。
-//! - `mod.rs`（本文件）：对外暴露胖 trait `ShelfRepoTrait`（11 方法，全部是
+//! - `mod.rs`（本文件）：对外暴露胖 trait `ShelfRepoTrait`（9 方法，全部是
 //!   `t_shelf` 自身操作），并直接 `impl ShelfRepoTrait for &mut PgConnection`
 //!   ——handler/service 借 `&mut *tx` / `&mut *conn` 即可，零中间壳。
+//!
+//! 2026-10-10：picker 的两个聚合列表方法随端点下线删除，trait 由 11 → 9 方法。
 //!
 //! ## 方法数演进
 //! - 2026-09-22 初版：17 方法（t_shelf 12 + t_shelf_process 4 + 跨域 helper 2 的
@@ -18,6 +20,8 @@
 //!     依赖清零
 //!   - 删 `count_accounts_by_shelf`（`ShelfOut.account_count` 出参取消，账号绑定
 //!     真源在 iam 域）
+//! - 2026-10-10：picker 下线，**11 → 9 方法**（删 `list_active_production_ordered` /
+//!   `list_active_inspection_with_load`）
 //!
 //! ## 为什么 trait 命名为 `ShelfRepoTrait` 而非 `ShelfRepo`
 //! iam 范本里 trait 名 = `IamRepoTrait`。但 shelf 域有跨模块静态调用方（part 域
@@ -66,9 +70,9 @@ pub mod sql;
 // 重导出 sql.rs 中的 ZST struct / 表行类型，让上层继续用
 // `super::repo::{TShelf, TShelfWithLoad, ShelfRepo}` 这种路径不破
 // （cross-module 调用方都依赖这条路径）。
-pub use sql::{ShelfRepo, TShelfWithLoad};
+pub use sql::ShelfRepo;
 
-/// shelf 域数据访问 trait（11 方法，全部 `t_shelf`）。
+/// shelf 域数据访问 trait（9 方法，全部 `t_shelf`）。
 ///
 /// 单 trait 而非每实体一个：`&mut PgConnection` 同一作用域只能借给一个 repo 实例，
 /// 拆分会让 service 无法同时持有两个 repo（2026-09-22 重构定案；与 iam 同形）。
@@ -102,12 +106,6 @@ pub trait ShelfRepoTrait: Send {
         zone: Option<&'a str>,
         is_active: Option<bool>,
     ) -> Result<i64, sqlx::Error>;
-    async fn list_active_production_ordered(&mut self) -> Result<Vec<TShelfWithLoad>, sqlx::Error>;
-    /// 2026-10-04 新增（picker for-inspection 专供，聚合口径与
-    /// `list_active_production_ordered` 逐字一致）：出参带 `current_load`。
-    async fn list_active_inspection_with_load(
-        &mut self,
-    ) -> Result<Vec<TShelfWithLoad>, sqlx::Error>;
     #[allow(clippy::too_many_arguments)]
     async fn create<'a>(
         &mut self,
@@ -195,16 +193,6 @@ impl ShelfRepoTrait for &mut PgConnection {
         is_active: Option<bool>,
     ) -> Result<i64, sqlx::Error> {
         ShelfRepo::count_with_filters(&mut **self, code_like, zone, is_active).await
-    }
-
-    async fn list_active_production_ordered(&mut self) -> Result<Vec<TShelfWithLoad>, sqlx::Error> {
-        ShelfRepo::list_active_production_ordered(&mut **self).await
-    }
-
-    async fn list_active_inspection_with_load(
-        &mut self,
-    ) -> Result<Vec<TShelfWithLoad>, sqlx::Error> {
-        ShelfRepo::list_active_inspection_with_load(&mut **self).await
     }
 
     #[allow(clippy::too_many_arguments)]

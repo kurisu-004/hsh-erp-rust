@@ -25,6 +25,22 @@
 
 router 工厂始终是 **4 个**（`company_router` / `quote_router` / `shipment_router` / `queue_router`）。
 
+## 0b. 2026-10-10 变更摘要：移动端点只剩两个方向
+
+1. **`OUTSOURCE_COMPANY → INSPECTION_SHELF` 方向整条下线**：
+   `OutsourceLocation::InspectionShelf` 变体随之删除（该变体只有 `shelf_id` 一个
+   字段，而品检架上线自动选架后它没有任何角色可留）。发这个 kind 的请求现在在
+   **反序列化阶段**被拒 → **HTTP 422 纯文本**（`unknown variant \`INSPECTION_SHELF\``）、
+   不进 `R<T>` 信封、批次零改动。
+2. **`to = PRODUCTION_SHELF` 删掉 `shelf_id`**：目标架由服务端按
+   `current_load / capacity` 升序选（[`shelves.md`](shelves.md) §4），选不出 →
+   `20508 BIZ_SHELF_PROCESS_NOT_FOUND`。
+3. **`from = PRODUCTION_SHELF` 不再比对 `current_holder_id`**：只校验
+   `batch.location == 'PRODUCTION_SHELF'`。「批次在某个生产架上」与「它是不是在生产架
+   上」是两件事；保留比对会让「同一批货只是换了个架」被拒，而看板卡片本来就不承诺
+   自己知道批次此刻在哪一格。`20122` 因此只剩 `from = OUTSOURCE_COMPANY` 且
+   `company_id` 不符这一条可达路径。
+
 ## 1. 端点表
 
 四个 router 工厂，一个前缀一个工厂（禁止合并成一个大 router，否则 matchit 的注册顺序约束会跨前缀纠缠 —— 见 `CLAUDE.md` 路由声明规约第 9 条）。全部返回统一信封 `R { code, message, data }`。
@@ -76,7 +92,7 @@ router 工厂始终是 **4 个**（`company_router` / `quote_router` / `shipment
 |---|---|---|---|---|---|
 | 1 | GET | `/api/v2/outsource-queue/snapshot` | Manager + Clerk + Inspector | **无** | `OutsourceQueueSnapshot` |
 | 2 | GET | `/api/v2/outsource-queue/processes/{process_id}` | Manager + Clerk + Inspector | path `process_id`（雪花 ID 字符串） | `OutsourceQueueProcessDetail` |
-| 3 | POST | `/api/v2/outsource-queue/move` | Manager + Clerk + Inspector | `{ batch_id: string, version: number, from, to, quote_id?, direct?, note? }` | `OutsourceMoveResult` |
+| 3 | POST | `/api/v2/outsource-queue/move` | Manager + Clerk + Inspector | `{ batch_id: string, version: number, from, to, quote_id?, direct?, note? }`；`from` / `to` 的 `kind` ∈ `{PRODUCTION_SHELF, OUTSOURCE_COMPANY}`（**`INSPECTION_SHELF` 已于 2026-10-10 删除**） | `OutsourceMoveResult` |
 
 - 端点 4.1 / 4.2 是**纯读**（`pool.acquire()` 不开事务、不发 WS 广播）；其余写端点开事务，**广播在 commit 之后**（仅端点 4.3 广播）。
 - `{id}` / `{process_id}` 抽不出数字时走 axum 的 `PathRejection` → **HTTP 400 纯文本，不进 `R<T>` 信封**（全仓 `Path<i64>` 端点的统一行为，非本域特例）。
@@ -234,7 +250,7 @@ router 工厂始终是 **4 个**（`company_router` / `quote_router` / `shipment
 | `held_count` | number | **服务层内存分组行数**（`== held_batches.len()`，见 §4.1） |
 | `held_batches[]` | array | SQL 3（**无公司谓词**，见下） |
 
-`items[]` 元素（`OutsourceQueueCandidate`，26 字段）：取自 `SENDABLE_PROJECTION_FULL` 的全投影，字段与后端 SQL 列一一对应 —— `version`（`pb.version`，**OCC 锚**）、`send_mode`、`batch_id` / `part_id`（string）、`batch_no`、`quantity`（`pb.quantity`，行 = 批次故与旧 VO 的 `batch_quantity` 同值）、`part_serial_no` / `part_drawing_no` / `part_name`、`planned_delivery_date` / `system_delivery_date`（`to_char(…,'YYYY-MM-DD')`，**字符串不是日期对象**）、`is_urgent`、`customer_name` / `parent_customer_name`、`applicant_name`、`note`、`shelf_code`（string \| null）、`shelf_id`（string，**承重字段**，见 §8.4）、`outsource_company_id` / `outsource_company_name`、`quote_id`、`company_options: OutsourceCompanyOption[]`（`id` string + `name`）、`price`（Decimal 字符串）、`can_send`（**服务层算** `send_mode == "APPROVAL" || !company_options.is_empty()`）、`has_cnc_program`（`EXISTS (t_part_file kind='G_CODE')`）、`has_process_chain`（判据见 §8.4）。
+`items[]` 元素（`OutsourceQueueCandidate`，26 字段）：取自 `SENDABLE_PROJECTION_FULL` 的全投影，字段与后端 SQL 列一一对应 —— `version`（`pb.version`，**OCC 锚**）、`send_mode`、`batch_id` / `part_id`（string）、`batch_no`、`quantity`（`pb.quantity`，行 = 批次故与旧 VO 的 `batch_quantity` 同值）、`part_serial_no` / `part_drawing_no` / `part_name`、`planned_delivery_date` / `system_delivery_date`（`to_char(…,'YYYY-MM-DD')`，**字符串不是日期对象**）、`is_urgent`、`customer_name` / `parent_customer_name`、`applicant_name`、`note`、`shelf_code`（string \| null）、`shelf_id`（string，**2026-10-10 起只是展示字段**、写端点不再消费，见 §8.4 与 §0b）、`outsource_company_id` / `outsource_company_name`、`quote_id`、`company_options: OutsourceCompanyOption[]`（`id` string + `name`）、`price`（Decimal 字符串）、`can_send`（**服务层算** `send_mode == "APPROVAL" || !company_options.is_empty()`）、`has_cnc_program`（`EXISTS (t_part_file kind='G_CODE')`）、`has_process_chain`（判据见 §8.4）。
 
 ⚠️ `has_process_chain` **只加在候选卡上，同屏的在途卡 `OutsourceQueueHeldBatch` 没有这一列** —— 外协收发阶段的批次在厂外，不存在「按工序链顺推到下一道」的语义，故在途卡恒按无链渲染（不画绿框）。这是**有意的不对称**，见 §8.4。
 
@@ -266,11 +282,11 @@ router 工厂始终是 **4 个**（`company_router` / `quote_router` / `shipment
 | 字段 | 类型 | 后端 SQL 来源 / 说明 |
 |---|---|---|
 | `batch_id` / `part_id` / `new_holder_id` | string | 批次 id / `batch.part_id` / `to` 的那个 id 字段（前端拿它当**下一次** move 的 `from` 侧 id） |
-| `from_kind` / `to_kind` | string | 请求 `from.kind` / `to.kind` 字面（`PRODUCTION_SHELF` / `OUTSOURCE_COMPANY` / `INSPECTION_SHELF`） |
+| `from_kind` / `to_kind` | string | 请求 `from.kind` / `to.kind` 字面（`PRODUCTION_SHELF` / `OUTSOURCE_COMPANY` 两值） |
 | `new_location` | string | **恒等于 `to_kind`**（写入口直接用 `to.kind` 作 `location` 值） |
 | `version` | number | **写后读回 `t_part_batch.version` 的真实值**（不在 Rust 里算 `+1`，见 §8.4） |
 | `shipment_id` | string，**仅发送方向存在** | 本次新建的 `t_outsource_shipment.id`；回收方向**键不存在**（不是 `null`） |
-| `new_process_id` | string，**仅回收生产方向存在** | `t_part_batch.current_process_id`；回收到品检架时按出池不变式清 NULL ⇒ 键不存在 |
+| `new_process_id` | string，**仅回收生产方向存在** | `t_part_batch.current_process_id`；发送方向不产生它 ⇒ 键不存在 |
 
 `shipment_id` / `new_process_id` 带 `skip_serializing_if = "Option::is_none"`：前端的判定是「这个方向有没有这个东西」（`"shipment_id" in payload` / 挂 shipment 卡片），`null` 与「这个方向不产生它」语义不同。两个字段的序列化回归由 `vo/queue.rs::tests` 的 `move_result_omits_direction_specific_keys_when_absent` 钉住。
 
@@ -461,18 +477,24 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 | 5 | 状态机 `ensure_transition`；两个回收方向**额外**显式要求源为 `OUTSOURCE` | `20103 BIZ_INVALID_TRANSITION` |
 | 6 | `from` 必须等于批次真实 `(location, current_holder_id)` | `20122 BIZ_BATCH_LOCATION_MISMATCH` |
 | 6b | 源为 `IN_PROCESS` 时 location 必须是 `PRODUCTION_SHELF`（在 6 之前判） | `20103` |
-| 6c | `from.kind = INSPECTION_SHELF` 一律拒（品检架上的批次不走外协看板） | `20122` |
+| 6c | （2026-10-10 删除：`from.kind = INSPECTION_SHELF` 变体已不存在） | — |
 | 6d | `quote_id` / `direct` 出现在非发送方向 | `20104 BIZ_INVALID_VALUE` |
 | 7 | 发送方向：公司存在 → 启用 → 工序存在 → 工序类别 `OUTSOURCE` → 公司映射该工序 → `direct` / `quote_id` 恰给一个 → `requires_approval` 工序不许 `direct` | `21201` / `21205` / `20801` / `20104` / `20104` / `20104` / `20104` |
 | 7b | 报价存在 → 状态 `APPROVED` → `(part, company, process)` 三元组一致 → APPROVAL 路径拒 DIRECT 占位价 | `21301` / `21307` / `21302` / `21307` |
-| 8 | 回收生产：目标货架存在 / 启用 / `zone='PRODUCTION'`；下一道工序推导；货架必须映射该工序 | `20501` / `20512` / `20104` / `20706` / `20507` |
-| 9 | 回收品检：目标货架存在 / 启用 / `zone='INSPECTION'` | `20501` / `20512` / `20104` |
+| 8 | 回收生产：下一道工序推导；然后**自动选目标架**（候选集自带 `zone='PRODUCTION'` / 启用 / 未软删 / 「映射了该工序」四个谓词） | `20706` / `20508` |
+| 9 | （2026-10-10 删除：回收直送品检方向整条下线。替代路径 = 先收进生产架，再走 `POST /api/v2/prod/batches/{batch_id}/to-inspection`，品检架同样由服务端自动选） | — |
 
 `ensure_transition` 依赖 `PartStatus::can_transition_to`（`part::statemachine` 的内存迁移表）。发送方向用到的两条边是 `PENDING → OUTSOURCE` 与 `IN_PROCESS → OUTSOURCE`；⚠️ `IN_PROCESS → OUTSOURCE` 这条边**曾经缺失**，导致「可发送一览的行（几乎全是 `IN_PROCESS` 源）发一单就被 `20103` 拒」，端到端实测下外协发送 100% 不可用。状态机补边后守卫 6b 才真正承担 location 不变式 —— 别因为「守卫 6 已经能拒」就把它删掉。
 
-### 5.2 出池不变式（回收品检方向）
+### 5.2 出池不变式（回收直送品检方向已下线）
 
-`OUTSOURCE → INSPECTION` 是**出池**：`t_part_batch.current_process_id` 与 `current_process_step_id` 两列**同时清 NULL**。所以回收到品检架时 `new_process_id` 恒缺席（`OutsourceMoveResult` 的键不存在），且该批次从此不再出现在任何候选池查询里（候选谓词要求 `current_process_id` 指向一道 `OUTSOURCE` 工序）。
+该方向的 `OUTSOURCE → INSPECTION` 是**出池**（`current_process_id` 与
+`current_process_step_id` 两列同时清 NULL）。**2026-10-10 该方向整条下线**
+（见 §0b），本节记录的是它下线前的不变式，供追溯历史行的口径：这条不变式本身仍然
+成立 —— 走常规送检链路（`to-inspection` / worker-scan `INSPECTED`）落到品检架时，
+出池清两列的行为完全相同。
+
+`current_process_step_id` 指针的链尾自动送检衔接见 [`batch.md`](batch.md) §2.2。
 
 ### 5.3 `t_part_batch.status` 的写入口
 
@@ -498,7 +520,7 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 | `GET /api/v2/outsource-sendable` | 被 `GET /outsource-queue/processes/{id}` 的候选列取代（它是同一批行的分页子集）。连带删除 `sendable_router()` 工厂与 `OutsourceSendableListQuery` |
 | `POST /api/v2/prod/batches/{batch_id}/send-to-outsource` | 三合一为 `POST /api/v2/outsource-queue/move`（`from=PRODUCTION_SHELF` + `to=OUTSOURCE_COMPANY`） |
 | `POST /api/v2/prod/batches/{batch_id}/receive-from-outsource` | 同端点（`OUTSOURCE_COMPANY` → `PRODUCTION_SHELF`） |
-| `POST /api/v2/prod/batches/{batch_id}/receive-from-outsource-to-inspection` | 同端点（`OUTSOURCE_COMPANY` → `INSPECTION_SHELF`） |
+| `POST /api/v2/prod/batches/{batch_id}/receive-from-outsource-to-inspection` | 2026-10-09 并入 `POST /api/v2/outsource-queue/move`（`OUTSOURCE_COMPANY` → `INSPECTION_SHELF`）；**2026-10-10 该方向本身也下线**（§0b），无替代端点。发 `to.kind = "INSPECTION_SHELF"` 现在得 **422 纯文本** |
 | `GET /api/v2/parts/outsource-in-flight` | 2026-10-03 硬切 → `GET /outsource-shipments/in-flight`（旧端点返回错形状的通用 `PartListItem`；旧 URL 实际返 **400** 而非 404 —— part 域 `/{part_id}` catch-all 兜住未注册的 1 段静态路径后由 `Path` extractor 拒绝） |
 | `GET /api/v2/parts/outsource-sendable` | 同上，2026-10-03 硬切（`OUTSOURCING` 端点同款错形状） |
 | WS 事件名 `PART_SENT_TO_OUTSOURCE` / `PART_RECEIVED_FROM_OUTSOURCE` / `PART_RECEIVED_FROM_OUTSOURCE_INSPECTED` | 合并为 `OUTSOURCE_MOVE_DONE`（见 §7） |
@@ -577,12 +599,16 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 3. **`move` 入参形态变更**（**破坏性**）：
    - `batch_id` 从 path 参数移到 body，且**必须是 JSON 字符串**（`"1590000000000000001"`）。`shared::types::deserialize_i64` 只接受字符串，发 JSON number → **HTTP 422 纯文本**（响应里没有 `code` 字段，勿按 `40001` 分支解析）。
    - `version` **必填**，值取卡片上的 `items[].version` 或 `held_batches[].version`。
-   - `outsource_company_id` / `shelf_id` 移进 `to` / `from` 对象（`{ kind, company_id | shelf_id }`）。
+   - `outsource_company_id` 移进 `to` / `from` 对象（`{ kind, company_id }`）。
+   - 2026-10-10：`shelf_id` **从两个变体里都删掉**（目标架由服务端选）；`INSPECTION_SHELF` 变体删除。
    - `process_id` **删除**；`next_process_id` 改为 `to.next_process_id` 且**可省略**（后端按工序链推导，`chain_resolvable = true` 时可省）。
    - `quantity` **删除**（整批语义）。
    - DIRECT 传 `direct: true` 且 `quote_id: null`；APPROVAL 传 `quote_id` 且 `direct: null`（两者互斥，恰给一个）。
 4. **`move` 出参变更**：`PartOut`（part 级）→ `OutsourceMoveResult`（批次级）。读 part_id 改读 `out.part_id`；OCC 版本号改读 `out.version`（**写后读回的真实值**，不是请求的 `version + 1`）。`shipment_id` / `new_process_id` 按「键是否存在」判定方向，不要按 `null` 判定。
-5. **候选卡 `shelf_id` 是承重字段**：拖拽发送时必须原样回传给 `from.shelf_id`（候选池跨货架，不能用「用户当前激活货架」凑 —— 激活货架对 MANAGER / CLERK / INSPECTOR 恒为空）。填错被写端点按 `20122` 拒收。
+5. **候选卡 `shelf_id` 仍要读、但不再回传**（2026-10-10）：写端点的 `from.shelf_id`
+   字段已删除，只校验 `batch.location == 'PRODUCTION_SHELF'`。候选卡的 `shelf_id`
+   退化为**纯展示**（它仍有助于用户看清这批货在哪一格），**回传它不再有任何作用**
+   —— 老客户端继续回传会被 serde 静默忽略。
 6. **候选卡的 `shelf_id` 为空串的行走不通**：那是 `PENDING` 且未上架的批次（本来就在生产架之外），要先 `place-on-shelf`。
 7. **新增 2 个看板 composable** + **删 3 个旧 composable**（`/outsource-pool/counts` 计数、`/outsource-pool/state` 每公司一次、`/outsource-pool/{process_id}` 详情）。
 8. **zod schema 同步**：新增 `outsourceQueueSnapshotSchema` / `outsourceQueueProcessDetailSchema` / `outsourceQueueCandidateSchema` / `outsourceQueueCompanySchema` / `outsourceQueueHeldBatchSchema` / `outsourceMoveResultSchema`。**注意 zod 默认 strip 模式**会让漏声明的字段静默丢失，数组元素必须全字段声明（**候选卡 26 字段**，含 `has_process_chain`；**在途卡刻意无 `has_process_chain`**，勿给它补声明）。
@@ -632,7 +658,9 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 |---|---|---|
 | `20101` | `BIZ_PART_NOT_FOUND` | 批次关联的 part 不存在 / 已软删 |
 | `20103` | `BIZ_INVALID_TRANSITION` | move 状态机守卫 |
-| `20104` | `BIZ_INVALID_VALUE` | 分方向业务规则（工序类别 / 公司映射 / direct 互斥 / 货架 zone / `quantity <= 0` / `review_note` 空） |
+| `20104` | `BIZ_INVALID_VALUE` | 分方向业务规则（工序类别 / 公司映射 / direct 互斥 / `quantity <= 0` / `review_note` 空）。**货架 zone 一项已随 2026-10-10 自动选架下线** |
+| `20508` | `BIZ_SHELF_PROCESS_NOT_FOUND` | **2026-10-10 新增于本域**：回收生产时该工序无可用生产货架（选架候选为空） |
+| `422` | 无信封（axum `JsonRejection`） | **2026-10-10 新增于本域**：`to.kind = "INSPECTION_SHELF"`（变体已删除）|
 | `20109` | `BIZ_PART_BATCH_NOT_FOUND` | 批次不存在 / 已软删 |
 | `20122` | `BIZ_BATCH_LOCATION_MISMATCH` | `from` 与批次真实位置不符 |
 | `20501` / `20507` / `20512` | `BIZ_SHELF_NOT_FOUND` / `BIZ_SHELF_PROCESS_NOT_MAPPED` / `BIZ_SHELF_INACTIVE` | 回收目标货架三条守卫 |

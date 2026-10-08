@@ -2,9 +2,8 @@
 //!
 //! 对应 Python myERP/schema/shelf.py。
 //!
-//! 2026-09-22 PR4：原 `dto.rs` 中的出参类型（ShelfOut / ShelfListOut /
-//! ShelfForReturnItem / ShelfForReturnOut / ShelfForInspectionItem /
-//! ShelfForInspectionOut）已迁移至 `vo/shelf.rs`。
+//! 2026-09-22 PR4：原 `dto.rs` 中的出参类型（ShelfOut / ShelfListOut 等）已迁移至
+//! `vo/shelf.rs`。
 //!
 //! 2026-10-02 域拆分：`SetShelfProcessesRequest` / `SetShelfProcessesItem` 与
 //! 仓内 `all mapping` VO 一并迁出到 `src/modules/prod/shelf_process/{dto,vo}.rs`
@@ -95,16 +94,4 @@ pub struct ShelfListQuery {
     pub limit: Option<i64>,
     #[serde(default)]
     pub offset: Option<i64>,
-}
-
-/// for-return picker 查询参数：`next_process_id` 必填（worker 当前持有
-/// 批次的下一道工序，决定哪些货架可用 —— 仅映射了该工序的货架候选）。
-///
-/// 2026-10-02：`next_process_id` 的「process 存在性占位校验」已从 service 删除
-/// （校验结果被立刻丢弃、且是一次跨域多余查询；该语义本就由 worker-scan 后端强
-/// 校验）。字段保留：picker 前端仍会把它与候选 shelf 一并提交给 worker-scan。
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct ShelfForReturnQuery {
-    #[serde(default)]
-    pub next_process_id: Option<String>,
 }
