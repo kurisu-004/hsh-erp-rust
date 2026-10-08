@@ -40,6 +40,10 @@ use super::super::model::{
 use super::{
     OutsourceInFlightRow, OutsourceQuotableRow, OutsourceSentPartFilter, OutsourceSentPartRow,
 };
+// 2026-10-09：候选卡的绿色边框判据与 prod::queue / part 的三处卡片**同源**，故取
+// shared 层的那一份常量而不是本地复制（判据与「必须 IS NOT NULL AND =」的理由见
+// 该常量的 doc）。
+use crate::shared::batch::chain::HAS_PROCESS_CHAIN_EXPR;
 
 // ===========================================================================
 // Company
@@ -1154,6 +1158,12 @@ const SENDABLE_INNER_X_SQL: &str = "SELECT {projection} \
              JOIN t_process pr ON pr.id = pb.current_process_id AND pr.deleted_at IS NULL \
                AND pr.category = 'OUTSOURCE' \
              LEFT JOIN t_shelf sh ON sh.id = pb.current_holder_id AND sh.deleted_at IS NULL \
+             -- 2026-10-09：卡片绿色边框判据（shared::batch::chain::HAS_PROCESS_CHAIN_EXPR）
+             -- 用的 step 行。**必须 LEFT JOIN** —— 指针为 NULL 的批次（无链工单的常态）
+             -- 要照样出行；INNER 会让它们从候选列表整批消失。该 JOIN 按主键匹配、不改变
+             -- 行数，故不影响本层「谓词唯一真源」的行粒度。
+             LEFT JOIN t_process_chain_step cs \
+               ON cs.id = pb.current_process_step_id AND cs.deleted_at IS NULL \
              LEFT JOIN t_outsource_quote q ON q.part_id = p.id AND q.process_id = pr.id \
                AND q.status = 'APPROVED' AND q.is_direct = false \
                AND q.deleted_at IS NULL AND pr.requires_approval \
@@ -1186,8 +1196,10 @@ const SENDABLE_INNER_X_SQL: &str = "SELECT {projection} \
 /// 恰好逐字覆盖这个集合 ⇒ 同一 (part, process) 的真实审批报价至多一条，撞了 → 21303。
 /// 仍保留 `DISTINCT ON` 作为兜底：并发审批 / 历史数据 / 索引缺失都可能让重复行出现，
 /// 取最早批准的那条语义是「先批准的报价优先」且结果稳定，不随查询计划变化。
-/// 2026-10-03 起内层不再有 `t_shelf_process` / `t_process_chain_step` 的重复行来源
-/// （两层 JOIN 已删），重复行只剩报价这一处。
+/// 2026-10-03 起内层不再有 `t_shelf_process` 的重复行来源（该 JOIN 已删）；
+/// `t_process_chain_step` 2026-10-09 起按主键 `LEFT JOIN` 回来（供
+/// `HAS_PROCESS_CHAIN_EXPR` 取 step 行），它按 `cs.id = pb.current_process_step_id`
+/// 匹配、至多一行，不构成重复行来源。故重复行只剩报价这一处。
 ///
 /// **为什么保留 `current_process_id` 这一列而不是只写 `DISTINCT ON (batch_id)`**：
 /// `current_process_id` 由 `batch_id` 单值决定，两者语义等价。保留两列是为了让
@@ -1214,6 +1226,7 @@ pub(crate) const SENDABLE_PROJECTION_FULL: &str = "pb.version AS batch_version, 
              WHERE pf.part_id = pb.part_id \
                AND pf.kind = 'G_CODE' \
                AND pf.deleted_at IS NULL) AS has_cnc_program, \
+      __HAS_PROCESS_CHAIN_EXPR__ AS has_process_chain, \
      sh.code AS shelf_code, \
      pr.id AS current_process_id, pr.name AS current_process_name, \
      pr.requires_approval, \
@@ -1236,7 +1249,7 @@ pub(crate) const SENDABLE_DEDUP_PROJECTION_FULL: &str = "x.batch_version, x.batc
      x.part_id, x.part_serial_no, x.part_drawing_no, x.part_name, x.note, \
      x.planned_delivery_date, x.system_delivery_date, x.is_urgent, \
      x.customer_name, x.parent_customer_name, x.customer_id, \
-     x.applicant_name, x.has_cnc_program, \
+      x.applicant_name, x.has_cnc_program, x.has_process_chain, \
      x.shelf_code, x.current_process_id, x.current_process_name, x.requires_approval, \
      x.quote_id, x.price, x.outsource_company_id, x.outsource_company_name, \
      x.company_options";
@@ -1260,11 +1273,27 @@ pub(crate) const SENDABLE_DEDUP_PROJECTION_COUNT: &str = "x.batch_id, x.current_
 /// 用 `AssertSqlSafe(sql)` 包裹动态 SQL 文本是安全的（口径同
 /// `com::union_list::repo::sql`）。
 pub(crate) fn sendable_dedup_sql(inner_projection: &str, dedup_projection: &str) -> String {
-    let inner = SENDABLE_INNER_X_SQL.replace("{projection}", inner_projection);
+    // 2026-10-09：`HAS_PROCESS_CHAIN_EXPR` 来自 shared 层（4 处卡片 DTO 共用同一
+    // 判据），本函数负责把它填进内层投影 —— 哨兵串 `__HAS_PROCESS_CHAIN_EXPR__`
+    // 在本文件只出现一次，不存在「替换误伤另一个同款表达式」的可能。
+    //
+    // ⚠️ 注入面为 0：两个投影与被填进去的表达式**全是编译期常量**，用户输入
+    // （`process_id`）一律走 bind。
+    let inner = SENDABLE_INNER_X_SQL
+        .replace("{projection}", inner_projection)
+        .replace(HAS_PROCESS_CHAIN_SENTINEL, HAS_PROCESS_CHAIN_EXPR);
     SENDABLE_DISTINCT_D_SQL
         .replace("{projection}", dedup_projection)
         .replace("{inner}", &inner)
 }
+
+/// 哨兵串：内层全投影里 `AS has_process_chain` 之前的占位，由
+/// [`sendable_dedup_sql`] 替换成 `shared::batch::chain::HAS_PROCESS_CHAIN_EXPR`。
+///
+/// 刻意做成一个**不可能出现在 SQL 其它位置**的整串，而不是靠常量名做
+/// `.replace()`：后者在「同一个表达式文本出现多次」时会全部替换，前者只可能
+/// 命中本文件自己写下的那一处。
+const HAS_PROCESS_CHAIN_SENTINEL: &str = "__HAS_PROCESS_CHAIN_EXPR__";
 
 // ===========================================================================
 // 「下一道工序」推导（LATERAL 片段，2026-10-09 抽成共用常量）

@@ -214,8 +214,10 @@ pub trait QueueRepoTrait: Send {
     /// `advance_to_process_id` —— move WORKER→POOL 是池内移动、工序不变
     /// （写入不变式），批次归还货架后仍属原工序候选池。推进工序是 worker-scan
     /// RETURNED 的职责，它直连 `PartRepo::mark_batch_returned` 不经本转发器。
-    /// `step_id` 形参保持存在（转发给 `current_process_step_id`，被 SQL 丢弃，
-    /// 属已知缺口，见 `PartRepo::mark_batch_returned` doc）。
+    /// `step_id` 形参同样恒传 `None`（转发给 `current_process_step_id`）：**主动
+    /// 退回不改工序归属**，故链内位置指针保持原值（SQL 侧 `COALESCE(.., 原值)`）。
+    /// 2026-10-09 起该列会被真实写入（不再是「形参被 SQL 丢弃」），但本路径仍刻意
+    /// 不传 —— 见 `PartRepo::mark_batch_returned` doc 的「推进不是无条件的」段。
     async fn part_mark_batch_returned(
         &mut self,
         batch_id: i64,

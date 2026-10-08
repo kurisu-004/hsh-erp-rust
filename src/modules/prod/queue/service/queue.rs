@@ -258,8 +258,8 @@ impl QueueService {
     /// 6. 按 (from, to) 选 SQL：
     ///    - POOL → WORKER：复用 `take_specific_from_pool`（service 入口已 fetch batch，
     ///      走 OCC `WHERE version = $exp` 单 SQL 原子切换）
-    ///    - WORKER → POOL：复用 `part_mark_batch_returned`（**去掉 step 写入**，
-    ///      2026-09-30 重构）
+    ///    - WORKER → POOL：复用 `part_mark_batch_returned`（**工序与 step 都不写**：
+    ///      池内移动，「退回不改工序归属」）
     ///    - WORKER → WORKER：新加 `move_worker_to_worker`（同样不写 step）
     /// 7. 写 part_event（`MOVED` 类型，note 含 from→to 描述）
     /// 8. `PartService::sync_from_batch_change` 同步 part 派生列
@@ -396,7 +396,8 @@ impl QueueService {
         // 取 batch 当前所属工序（POOL→WORKER 与 WORKER→POOL 的 target 校验都需要）。
         // 直读 `batch.current_process_id`（migration 004 起的工序池归属权威列），
         // 不经 `current_process_step_id → t_process_chain_step` 反查：那会多一次
-        // DB 往返，且 step 指针只在首次定位工序时写、多工序链工单上会停住。
+        // DB 往返，且指针可空 / 可漂移（存量批次与 admin 主动退回都不保证它有值），
+        // 反查会让这批批次查不到工序。
         let step_process_id: Option<i64> = batch.current_process_id;
 
         // 取 worker 元数据（事件日志 badge_code；POOL→WORKER / WORKER→WORKER 需要源 worker）

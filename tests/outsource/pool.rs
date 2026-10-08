@@ -2088,3 +2088,73 @@ async fn detail_unknown_process_returns_404() {
     assert_eq!(s, StatusCode::NOT_FOUND, "{env}");
     assert_eq!(env["code"], 20801, "{env}");
 }
+
+/// 2026-10-09：外协候选卡的 `has_process_chain` 派生列（卡片绿色左边框的判据）。
+///
+/// 判据与 `prod::queue` 的候选池 / 工人持有、`part` 域扫码台的同名列**同源**
+/// （`shared::batch::chain::HAS_PROCESS_CHAIN_EXPR`，经本文件
+/// `repo/sql.rs::sendable_dedup_sql` 填进内层投影）。两种形态：
+/// - 已绑链 + 批次指针指向链上那道工序的 step ⇒ `true`（走「指针工序 == 当前工序」
+///   分支；外协候选的 `current_process_id` 恒非空，故另一分支在本端点不可达）；
+/// - 无链 ⇒ `false`。
+///
+/// ⚠️ 「有链但指针没落位」在外协候选侧**恒为 false**（判据的第一个条件通过、
+/// 两个分支都不成立：指针 NULL ⇒ 分支 1 否；`current_process_id` 非 NULL ⇒
+/// 分支 2 否）。这不是 bug —— 判据表达的是「当前工序能在链内定位」，外协候选的
+/// 工序列由 dispatch / 移动写端点填，指针与它同步与否是另一件事。
+#[tokio::test]
+async fn candidate_includes_has_process_chain() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let cid = insert_customer(&pool, "HpcCo", "H").await;
+    // 免审批直发工序：不需要报价，候选行照样出行（`can_send` 另行算）
+    let (proc_id, _, _) = seed_outsource_process(&pool, "HPC", false).await;
+    let shelf_id = insert_shelf(&pool, "HPCS").await;
+    link_shelf_process(&pool, shelf_id, proc_id).await;
+    let co = insert_company(&pool, "HpcCo1", true).await;
+    link_company_process(&pool, co, proc_id).await;
+
+    // A. 已绑链 + 指针落位
+    let p_a = insert_part(&pool, cid, "HPC1", "2026-12-01").await;
+    let (_, steps_a) = create_chain_with_steps(&pool, p_a, &[(proc_id, 10)]).await;
+    let batch_a = insert_candidate_batch(&pool, p_a, shelf_id, proc_id, 0).await;
+    sqlx::query("UPDATE t_part_batch SET current_process_step_id = $1 WHERE id = $2")
+        .bind(steps_a[0])
+        .bind(batch_a)
+        .execute(&pool)
+        .await
+        .expect("point batch A at chain step");
+    // B. 无链
+    let p_b = insert_part(&pool, cid, "HPC2", "2026-12-02").await;
+    let batch_b = insert_candidate_batch(&pool, p_b, shelf_id, proc_id, 0).await;
+    sqlx::query("UPDATE t_part SET process_chain_id = NULL WHERE id = $1")
+        .bind(p_b)
+        .execute(&pool)
+        .await
+        .expect("part B has no chain");
+
+    let (s, env) = get_detail(&app, &token, proc_id).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let items = env["data"]["items"].as_array().expect("data.items");
+    let find = |batch_id: i64| {
+        items
+            .iter()
+            .find(|i| i["batch_id"] == batch_id.to_string().as_str())
+            .cloned()
+            .unwrap_or_else(|| panic!("候选列应含 batch {batch_id}: {env}"))
+    };
+    let a = find(batch_a);
+    assert_eq!(
+        a["has_process_chain"],
+        json!(true),
+        "A（已绑链 + 指针落位）⇒ true: {env}"
+    );
+    assert!(
+        a["has_process_chain"].is_boolean(),
+        "出参必须是 JSON boolean（不是 0/1、不是字符串）: {env}"
+    );
+    assert_eq!(
+        find(batch_b)["has_process_chain"],
+        json!(false),
+        "B（无链）⇒ false: {env}"
+    );
+}

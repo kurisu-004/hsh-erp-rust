@@ -271,6 +271,20 @@ pub struct PartListItem {
     /// by-worker 填，其余路径 null」）。
     #[serde(default)]
     pub batch_version: Option<i32>,
+    /// 2026-10-09 新增：工单已绑工序链**且**批次当前工序能在链内定位 —— 卡片绿色
+    /// 左边框的判据（判据与理由含「必须 `IS NOT NULL AND =` 而不是
+    /// `IS NOT DISTINCT FROM`」见 `shared::batch::chain::HAS_PROCESS_CHAIN_EXPR`）。
+    ///
+    /// **仅 `GET /parts/pickable-by-work-type/{work_type_id}` 与
+    /// `GET /parts/by-worker/{worker_id}` 填** —— 这两条端点的行是「批次行」，
+    /// 位置指针才有意义。其余复用本 VO 的路径**恒 `false`**（它们是 part 级行，
+    /// 一个 part 的活跃批次可能不止一个，任一批次的链位置都是错锚点，理由与
+    /// `batch_id` 同款；没有 `#[serde(default)]`，漏赋值会编译失败）。
+    ///
+    /// 与 `prod::queue` 的 `QueuePoolItem.has_process_chain` /
+    /// `QueueHeldBatch.has_process_chain`、`outsource` 候选卡的同名列**同源**（同一个
+    /// 常量），四处必须同改。
+    pub has_process_chain: bool,
     /// 2026-10-04 新增：报工台放回页的「工序链可否免填下一道工序」三值判据。
     ///
     /// **仅 `GET /parts/by-worker/{worker_id}` 填**（其余 6 处返回点恒 `NONE`：
@@ -376,6 +390,9 @@ impl From<TPart> for PartListItem {
             chain_next_process_id: 0,
             chain_next_process_name: None,
             chain_current_process_name: None,
+            // 2026-10-09：`From<TPart>` 是 part 级投影，不含批次语义 ⇒ 恒 false
+            // （与 `chain_state` / `batch_id` 同款保守默认）。
+            has_process_chain: false,
             // 2026-10-03 新增：`From<TPart>` 是 part 级投影，不含批次语义
             // （`TPart` 本身不持任何批次聚合量）→ 恒 None。需要该值的端点
             // （`GET /parts` / `GET /com/union-list`）在 `PartListItem::from`

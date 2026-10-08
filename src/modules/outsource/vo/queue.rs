@@ -202,6 +202,15 @@ pub struct OutsourceQueueCandidate {
     /// 有 G_CODE 程序（`EXISTS (SELECT 1 FROM t_part_file …)`），与 `prod::queue`
     /// 候选卡的同名 EXISTS 逐字一致。
     pub has_cnc_program: bool,
+    /// 2026-10-09 新增：工单已绑工序链**且**批次当前工序能在链内定位（判据见
+    /// `shared::batch::chain::HAS_PROCESS_CHAIN_EXPR`）—— 卡片绿色左边框的判据。
+    /// 与 `prod::queue` 的 `QueuePoolItem.has_process_chain` /
+    /// `QueueHeldBatch.has_process_chain` 同源（同一个常量），三处必须同改。
+    ///
+    /// 同屏的**在途卡**（`OutsourceQueueHeldBatch`，外协公司列）**不**带这一列 ——
+    /// 外协收发阶段批次在厂外，不存在「按链顺推到下一道」的语义，故在途卡恒按无链
+    /// 渲染（不画绿框）。这是**有意的不对称**，不是漏改。
+    pub has_process_chain: bool,
 }
 
 /// 看板右列里的一家公司在途批次卡片。

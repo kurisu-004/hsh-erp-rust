@@ -95,6 +95,16 @@ struct WorkTypeListRow {
     chain_next_process_id: Option<i64>,
     chain_next_process_name: Option<String>,
     chain_current_process_name: Option<String>,
+    // ---- 工序链存在性派生（pickable-by-work-type / by-worker 填）----
+    /// `shared::batch::chain::HAS_PROCESS_CHAIN_EXPR` 的结果（判据 = 工单已绑链
+    /// 且批次当前工序能在链内定位）。字段名即 SQL 别名（`FromRow` 按列名匹配）。
+    ///
+    /// **按 `Option<bool>` 收**（同 `chain_state` 等链派生列）：`by-work-type` 那条
+    /// SELECT 按本文件的约定把「本端点不填」投影成 `NULL::boolean`，而 `NULL` 解不进
+    /// 非可空的 `bool`（sqlx 报 `unexpected null; try decoding as an Option` ⇒ 整页
+    /// 500）。另两条端点投影的是非空 boolean（`IS NOT NULL AND …` 的结果恒非
+    /// NULL），故恒为 `Some`。
+    has_process_chain: Option<bool>,
 }
 
 impl WorkTypeListRow {
@@ -133,6 +143,9 @@ impl WorkTypeListRow {
             chain_next_process_id: self.chain_next_process_id.unwrap_or(0),
             chain_next_process_name: self.chain_next_process_name,
             chain_current_process_name: self.chain_current_process_name,
+            // 2026-10-09：链条上「这批货当前工序能不能在链内定位」（卡片绿色边框）。
+            // `by-work-type` 投影 `NULL::boolean` ⇒ 取保守默认 false（「没绑链」）。
+            has_process_chain: self.has_process_chain.unwrap_or(false),
             // ---- 以下为占位值（前端无消费方，见方法 doc）----
             applicant_name: String::new(),
             request_date: PLACEHOLDER_DATE,
@@ -255,7 +268,8 @@ impl PartService {
                     NULL::bigint AS process_chain_id, NULL::text AS chain_state, \
                     NULL::bigint AS chain_next_process_id, \
                     NULL::text AS chain_next_process_name, \
-                    NULL::text AS chain_current_process_name \
+                    NULL::text AS chain_current_process_name, \
+                    NULL::boolean AS has_process_chain \
              FROM t_part_batch b \
              JOIN t_part p ON p.id = b.part_id \
              JOIN t_worker w ON w.id = b.current_holder_id \
@@ -355,35 +369,49 @@ impl PartService {
         // `$n` 只是占位名、不要求按序出现，故把新参数追加在 bind 列表末尾即可把
         // `LIMIT`/`OFFSET` 的 diff 压到零（下方 COUNT 无 `$3`/`$4`，它的编号为何要
         // 独立连续，见该处注释）。
-        let rows: Vec<WorkTypeListRow> = sqlx::query_as(
+        //
+        // 2026-10-09：批次别名由 `b` 改成 `pb`，与 `list_by_worker` 统一 —— 两条
+        // SELECT 都用同一套绿框判据表达式（它按别名 `p` / `pb` / `cs` 取列），
+        // 别名不统一就得给表达式准备第二套别名。
+        //
+        // ⚠️ **注入面为 0**：`format!` 只填 `HAS_PROCESS_CHAIN_EXPR` 这一个编译期
+        // 常量，其余五个入参一律走 bind，故 `AssertSqlSafe` 包裹安全
+        // （口径同 `list_by_worker`）。`t_process_chain_step cs` 走 **LEFT JOIN** ——
+        // 指针为 NULL 的批次（无链工单的常态）必须照样出现在可领列表里。
+        let sql = format!(
             "SELECT p.id, p.serial_no, p.name, p.drawing_no, p.is_urgent, \
-                    p.system_delivery_date, p.planned_delivery_date, b.quantity, \
-                    b.id AS batch_id, b.version AS batch_version, \
+                    p.system_delivery_date, p.planned_delivery_date, pb.quantity, \
+                    pb.id AS batch_id, pb.version AS batch_version, \
                     NULL::bigint AS process_chain_id, NULL::text AS chain_state, \
                     NULL::bigint AS chain_next_process_id, \
                     NULL::text AS chain_next_process_name, \
-                    NULL::text AS chain_current_process_name \
-             FROM t_part_batch b \
-             JOIN t_part p ON p.id = b.part_id \
-             JOIN t_work_type_process wtp ON wtp.process_id = b.current_process_id \
+                    NULL::text AS chain_current_process_name, \
+                    {} AS has_process_chain \
+             FROM t_part_batch pb \
+             JOIN t_part p ON p.id = pb.part_id \
+             JOIN t_work_type_process wtp ON wtp.process_id = pb.current_process_id \
                 AND wtp.deleted_at IS NULL \
-             JOIN t_shelf sh ON sh.id = b.current_holder_id AND sh.deleted_at IS NULL \
-             WHERE b.deleted_at IS NULL AND p.deleted_at IS NULL \
-               AND b.status = 'IN_PROCESS' AND b.location = 'PRODUCTION_SHELF' \
+             JOIN t_shelf sh ON sh.id = pb.current_holder_id AND sh.deleted_at IS NULL \
+             LEFT JOIN t_process_chain_step cs \
+               ON cs.id = pb.current_process_step_id AND cs.deleted_at IS NULL \
+             WHERE pb.deleted_at IS NULL AND p.deleted_at IS NULL \
+               AND pb.status = 'IN_PROCESS' AND pb.location = 'PRODUCTION_SHELF' \
                AND sh.is_active = true AND sh.zone = 'PRODUCTION' \
                AND wtp.work_type_id = $1 \
-               AND ($2::bigint IS NULL OR b.current_holder_id = $2) \
+               AND ($2::bigint IS NULL OR pb.current_holder_id = $2) \
                AND ($5::bigint[] IS NULL OR sh.id = ANY($5)) \
-             ORDER BY p.is_urgent DESC, p.planned_delivery_date ASC, b.id ASC \
+             ORDER BY p.is_urgent DESC, p.planned_delivery_date ASC, pb.id ASC \
              LIMIT $3 OFFSET $4",
-        )
-        .bind(work_type_id)
-        .bind(shelf_filter)
-        .bind(limit)
-        .bind(offset)
-        .bind(shelf_scope.clone())
-        .fetch_all(repo.conn_mut())
-        .await?;
+            crate::shared::batch::chain::HAS_PROCESS_CHAIN_EXPR
+        );
+        let rows: Vec<WorkTypeListRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .bind(work_type_id)
+            .bind(shelf_filter)
+            .bind(limit)
+            .bind(offset)
+            .bind(shelf_scope.clone())
+            .fetch_all(repo.conn_mut())
+            .await?;
         let items: Vec<PartListItem> = rows
             .into_iter()
             .map(WorkTypeListRow::into_list_item)
@@ -465,139 +493,126 @@ impl PartService {
         // `chain_current_process_name`（填充口径见 `vo/part.rs` 字段 doc；本端点是
         // 链四字段的唯一填充路径）。
         //
-        // `LEFT JOIN LATERAL` 派生的三值判据，**两步定位**（本端点自有纪律：锚链两步
-        // 定位 / 派生列显式别名 / 末尾 `ORDER BY ... LIMIT 1` 收口 / 链内歧义显式
-        // 落 `NONE`；「下一道」的定义见下）：
+        // `LEFT JOIN LATERAL` 派生的三值判据，**两步定位**（纪律与理由见
+        // `shared::batch::chain::CHAIN_POSITION_LATERAL_SQL` 的模块 doc —— 2026-10-09
+        // 起该片段是读写共用的唯一真源，本端点是它的第一个消费方）：
         // 1. **锚链** = `COALESCE(p.process_chain_id, cur.chain_id)`，`cur` =
-        //    `b.current_process_step_id` 指向的 step，只用于回退取链 id（该 JOIN
+        //    `pb.current_process_step_id` 指向的 step，只用于回退取链 id（该 JOIN
         //    无行 ⇒ 锚链解析失败 ⇒ 落 `NONE`）；中间 JOIN `t_part_process_chain`
         //    是为了让「锚链已软删」同样落 `NONE`。
-        // 2. **当前 step 在锚链内的位置**：`cur2.process_id = b.current_process_id`；
-        //    再取锚链内 **`sort_order` 大于它且最小**的那一个未软删 step。
-        //    `cur2` 由 JOIN LATERAL 定位并带出 `hit_count`（链内命中数），
-        //    命中 >1 视作歧义落 `NONE`（见下）。`cur2` 是 **inner** `JOIN
-        //    LATERAL`：定位不到时整个派生子查询无行，故下面的 `CASE` 里没有
-        //    「定位不到」这一分支（该路径由最外层 `COALESCE(..., 'NONE')` 兜底）。
+        // 2. **当前 step 在锚链内的位置**：片段按 `pb.current_process_id` 在锚链内
+        //    **重新定位**（`cur2` inner `JOIN LATERAL`），再取锚链内 `sort_order`
+        //    大于它且最小的那个未软删 step。命中 >1 视作歧义落 `NONE`。`cur2` 是
+        //    inner `JOIN LATERAL`：定位不到时整个派生子查询无行，故片段里的
+        //    `CASE` 没有「定位不到」这一分支（该路径由本处
+        //    `COALESCE(nx.chain_state, 'NONE')` 兜底）。
         //
-        // ⚠️ **第 2 步必须按 `current_process_id` 在锚链内重新定位，绝对不能拿
-        // `b.current_process_step_id` 的 `sort_order` 直接当位置** —— step 指针与
-        // 「当前工序在链内的位置」是两个独立事实，而 worker-scan 的 RETURNED 分支
-        // 只写 `current_process_id = next_process_id`、**不推进**
-        // `current_process_step_id`（已知缺口，见
-        // `src/modules/prod/batch/service/worker_scan.rs` 的 RETURNED 分支）。于是多工序链
-        // 的批次在第 2 次放回时 step 指针仍停在
-        // **首次定位**那一步：按 `sort_order` 推进会把**当前工序自己**当成下一道
-        // 返回（如指针停在 A 的 step 而 `current_process_id = B` ⇒ 返回 B），
-        // 而 `chain_state` 仍在说「可免填」⇒ 写侧照单全收，静默错值比拒收更难
-        // 发现。同一批次第 N 次放回都只能靠 `current_process_id` 定位。
+        // ⚠️ **第 2 步绝对不能拿 `pb.current_process_step_id` 的 `sort_order` 直接当
+        // 位置** —— step 指针与「当前工序在链内的位置」是两个独立事实，而 worker-scan
+        // 的 RETURNED 分支在**非顺应工序**时只写 `current_process_id`、step 指针留在
+        // 原处（`shared::batch::chain::ChainPosition::is_pointer_consistent` 为 false
+        // 时前端必须显式指定下一道工序）。于是指针漂移的批次在放回时按 `sort_order`
+        // 推进会把**当前工序自己**当成下一道返回（如指针停在 A 的 step 而
+        // `current_process_id = B` ⇒ 返回 B），而 `chain_state` 仍在说「可免填」⇒
+        // 写侧照单全收，静默错值比拒收更难发现。同一批次第 N 次放回都只能靠
+        // `current_process_id` 定位。
         //
-        // ⚠️ **锚链内同一 `process_id` 允许重复，读侧必须自己识别歧义**：
-        // `t_process_chain_step` 只有 `uq_chain_step_chain_order (chain_id,
-        // sort_order) WHERE deleted_at IS NULL` 一个唯一约束，**没有**
-        // `(chain_id, process_id)` 唯一约束；写侧 `prod::process_chain::service::
-        // upsert_chain` 也只校验链内 `sort_order` 互不重复，不校验 `process_id`
-        // 重复 ⇒ 重复工序的链后端照收（前端工序链编辑页连续「添加工序」且不改
-        // 工序即是一条）。此时 `cur2` 会扇出多行：一行派生 `NEXT → 当前工序自己`
-        // （如链 `[(A,10),(A,20),(B,30)]` 而 `current_process_id = A`），另一行
-        // 派生 `TAIL`，让 `LIMIT 1` 静默取其一就是拿「绝不能把当前工序自己当成
-        // 下一道」这条安全承诺去赌 PG 的行序。故 `cur2` 侧用
-        // `(count(*) OVER ())` 带出命中数，`hit_count > 1` 时**显式落 `NONE`**
-        // （与「未知一律往保守方向降」一致），并同时门控 `nsp` / `cp` 两个派生
-        // 侧：歧义时不产出任何派生值，维持 `NONE` ⇒ 下一道 id 为 `"0"`、两个名字
-        // 均为 `null` 的不变量。
+        // ⚠️ **链内同一 `process_id` 允许重复，读侧必须自己识别歧义**：片段的
+        // `cur2` 侧用 `(count(*) OVER ())` 带出命中数，`hit_count > 1` 时**显式落
+        // `NONE`**（与「未知一律往保守方向降」一致），并同时门控 `current_step_id` /
+        // `current_sort_order` / `nsp` 三个派生侧：歧义时不产出任何派生值，维持
+        // `NONE` ⇒ 下一道 id 为 `"0"`、两个名字均为 `null` 的不变量。
         //
         // ⚠️ **「下一道」按 `sort_order > 当前 ORDER BY ASC LIMIT 1` 取，不按
-        // `= 当前 + 1`**：与写侧的「链内下一步」正典
-        // `prod::process_chain::repo::query::next_step_in_chain`（`sort_order > $2
-        // ORDER BY sort_order ASC LIMIT 1`）逐条同形，读侧不会替写侧产生分歧。
-        // 而 `sort_order` 的**密度不由读侧决定**：写侧只保证链内 `sort_order`
-        // 互不重复（`upsert_chain` 校验 + `uq_chain_step_chain_order` 兜底），
-        // 稠密 0-based（前端 `usePartProcessDesign` 保存时拍平成 `0,1,2…`）与
-        // 稀疏 `10/20/30` 两种密度都能落库且都受支持。别拿任何文档当密度依据
-        // —— 写路径（`upsert_chain` 校验 + `uq_chain_step_chain_order` 兜底）才是
-        // 权威。`+ 1` 只在稠密下正确、在稀疏下会把
-        // 「还有两道工序」误判成链尾，`>` 对两种密度都成立 ⇒ 读侧只能用 `>`。
+        // `= 当前 + 1`**：与写侧正典
+        // `prod::process_chain::repo::query::next_step_in_chain` 逐条同形，读侧不会
+        // 替写侧产生分歧。而 `sort_order` 的**密度不由读侧决定**：写侧只保证链内
+        // `sort_order` 互不重复，稠密 0-based 与稀疏 `10/20/30` 两种密度都能落库且
+        // 都受支持。别拿任何文档当密度依据 —— 写路径才是权威。`+ 1` 只在稠密下正确、
+        // 在稀疏下会把「还有两道工序」误判成链尾，`>` 对两种密度都成立。
         //
-        // 4 个派生列都显式 `AS chain_*` 别名，与外层 `COALESCE(nx.*)` 逐字对应，
-        // 避免内外层列名不一致时读错位。
+        // 4 个投影列都显式 `AS chain_*` 别名，与 [`WorkTypeListRow`] 的字段名逐字
+        // 对应，避免内外层列名不一致时读错位。
         //
-        // 外层 LATERAL 末尾 `ORDER BY cur.id ASC LIMIT 1` 收口：不为消歧（`cur` /
-        // `pc` 都按主键定位，本就至多一行），而是把「至多一行」这条不变量写进
-        // SQL —— 不收口则一旦上游改动放宽了任一 JOIN，一行批次就会扇成多行、
-        // 破坏 VO 层「`items.len()` 等于持有批次数」的不变量。排序键 `cur.id` 在
-        // 任何假设的扇行里都是同一个常量、打不破平局，故这个 `ORDER BY` 只表达
-        // 行数上界，**不买确定性**。
+        // ⚠️ **两个工序名改由外层 LEFT JOIN `t_process` 取**（2026-10-09）：片段只导出
+        // id（`nx.next_process_id` / `nx.current_step_id`），名字在外层查。改引用后
+        // **出参取值逐字不变**，两个 JOIN 谓词与改前内联版逐条对应：
+        // 「下一道」侧 `np.id = nsp.process_id AND np.deleted_at IS NULL` 换成
+        // `np.id = nx.next_process_id AND np.deleted_at IS NULL`（`nsp` 被搬进片段后
+        // 不再出现在外层，外键取片段导出的 id）；「当前工序」侧
+        // `cp.id = cur2.process_id AND cp.deleted_at IS NULL AND cur2.hit_count = 1`
+        // 换成 `cp.id = pb.current_process_id AND cp.deleted_at IS NULL AND
+        // nx.current_step_id IS NOT NULL`，两个差异都只是把片段内才可判定的谓词换成
+        // 外层等价物 ——
+        //   - `cur2.process_id` 恒等于 `pb.current_process_id`：`cur2` 的定位条件就是
+        //     「在锚链内找 `process_id = pb.current_process_id` 的 step」，而
+        //     `pb.current_process_id IS NULL` 时 `cur2` 无行、`nx` 整行 NULL，此时
+        //     新谓词同样不成立；
+        //   - `cur2.hit_count = 1` 恒等价于 `nx.current_step_id IS NOT NULL`：
+        //     `cur2` 零命中时该 `JOIN LATERAL`（inner）整块无行、`hit_count` 不存在；
+        //     ≥2 命中时片段显式落 `NONE` 且 `current_step_id` 保持 NULL
+        //     （见上方歧义处理），只有恰好 1 命中才会带出 `current_step_id`。
+        // `t_process.id` 是主键，两条 LEFT JOIN 都不改变行数。
         //
-        // `p.process_chain_id` / `b.current_process_id` /
-        // `b.current_process_step_id` 全部是可空列：列本身可空时 `query_as` 返回的
+        // ⚠️ **`cp` 的软删闸门不可丢**：`np` 是 LEFT JOIN、未命中时整行 NULL，
+        // 若谓词写 `np.deleted_at IS NULL` 则该子句恒为真（命中时它也是 join 条件
+        // 的一部分），等于把 `cp` 的 `deleted_at IS NULL` 删掉 —— 批次的
+        // `current_process_id` 指向已软删工序时 `chain_current_process_name` 会从
+        // `null` 变成该软删工序的名字。改前内联版写的是 `cp.`，此处照原样保留。
+        //
+        // ⚠️ **别名契约**：片段引用 `p`（`t_part`）与 `pb`（`t_part_batch`）两个别名，
+        // 故本 SELECT 的批次别名是 `pb` 而非 `b`（`list_pickable_by_work_type` 同理；
+        // `list_by_work_type` 本轮不动，它不拼该片段）。
+        //
+        // 外层 LATERAL 末尾 `ORDER BY cur.id ASC LIMIT 1` 收口（片段内）：不为消歧
+        // （`cur` / `pc` 都按主键定位，本就至多一行），而是把「至多一行」这条不变量
+        // 写进 SQL —— 不收口则一旦上游改动放宽了任一 JOIN，一行批次就会扇成多行、
+        // 破坏 VO 层「`items.len()` 等于持有批次数」的不变量。排序键 `cur.id` 在任何
+        // 假设的扇行里都是同一个常量、打不破平局，故这个 `ORDER BY` 只表达行数上界，
+        // **不买确定性**。
+        //
+        // `p.process_chain_id` / `pb.current_process_id` /
+        // `pb.current_process_step_id` 全部是可空列：列本身可空时 `query_as` 返回的
         // `O` 仍须是 `Option<T>`（外层 `Result<Option<O>>` 那层 `Option` 只表示
         // 「有没有行」）。`chain_state` 的 `COALESCE(..., 'NONE')` 在最外层兜底：
         // 无链批次的 `current_process_step_id` 按写入不变式恒为 NULL ⇒ `cur` 无行
-        // ⇒ LATERAL 无行 ⇒ 四个派生列全 NULL，此时必须仍给出 `NONE` / `0`。
-        let rows: Vec<WorkTypeListRow> = sqlx::query_as(
+        // ⇒ LATERAL 无行 ⇒ 派生列全 NULL，此时必须仍给出 `NONE` / `0`。
+        let sql = format!(
             "SELECT p.id, p.serial_no, p.name, p.drawing_no, p.is_urgent, \
-                    p.system_delivery_date, p.planned_delivery_date, b.quantity, \
-                    b.id AS batch_id, b.version AS batch_version, p.process_chain_id, \
+                    p.system_delivery_date, p.planned_delivery_date, pb.quantity, \
+                    pb.id AS batch_id, pb.version AS batch_version, p.process_chain_id, \
                     COALESCE(nx.chain_state, 'NONE') AS chain_state, \
-                    COALESCE(nx.chain_next_process_id, 0) AS chain_next_process_id, \
-                    nx.chain_next_process_name AS chain_next_process_name, \
-                    nx.chain_current_process_name AS chain_current_process_name \
-             FROM t_part_batch b \
-             JOIN t_part p ON p.id = b.part_id \
-             LEFT JOIN LATERAL ( \
-               SELECT \
-                  CASE \
-                    WHEN cur2.hit_count > 1 THEN 'NONE' \
-                    WHEN nsp.id IS NULL THEN 'TAIL' \
-                    ELSE 'NEXT' \
-                  END AS chain_state, \
-                  nsp.process_id AS chain_next_process_id, \
-                  np.name AS chain_next_process_name, \
-                  cp.name AS chain_current_process_name \
-               FROM t_process_chain_step cur \
-               JOIN t_part_process_chain pc \
-                 ON pc.id = COALESCE(p.process_chain_id, cur.chain_id) \
-                AND pc.deleted_at IS NULL \
-               JOIN LATERAL ( \
-                 SELECT cur2b.id AS id, cur2b.process_id AS process_id, \
-                        cur2b.sort_order AS sort_order, \
-                        (count(*) OVER ()) AS hit_count \
-                 FROM t_process_chain_step cur2b \
-                 WHERE cur2b.chain_id = pc.id \
-                   AND cur2b.process_id = b.current_process_id \
-                   AND cur2b.deleted_at IS NULL \
-                 ORDER BY cur2b.sort_order ASC, cur2b.id ASC \
-                 LIMIT 1 \
-               ) cur2 ON TRUE \
-               LEFT JOIN LATERAL ( \
-                 SELECT nxt.id AS id, nxt.process_id AS process_id \
-                 FROM t_process_chain_step nxt \
-                 WHERE cur2.hit_count = 1 \
-                   AND nxt.chain_id = pc.id \
-                   AND nxt.sort_order > cur2.sort_order \
-                   AND nxt.deleted_at IS NULL \
-                 ORDER BY nxt.sort_order ASC \
-                 LIMIT 1 \
-               ) nsp ON TRUE \
-               LEFT JOIN t_process np \
-                 ON np.id = nsp.process_id AND np.deleted_at IS NULL \
-               LEFT JOIN t_process cp \
-                 ON cp.id = cur2.process_id AND cp.deleted_at IS NULL \
-                AND cur2.hit_count = 1 \
-               WHERE cur.id = b.current_process_step_id AND cur.deleted_at IS NULL \
-               ORDER BY cur.id ASC \
-               LIMIT 1 \
-             ) nx ON TRUE \
-             WHERE b.deleted_at IS NULL AND p.deleted_at IS NULL \
-               AND b.status = 'IN_PROCESS' AND b.location = 'WORKER' \
-               AND b.current_holder_id = $1 \
-             ORDER BY b.id DESC LIMIT $2 OFFSET $3",
-        )
-        .bind(worker_id)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(repo.conn_mut())
-        .await?;
+                    COALESCE(nx.next_process_id, 0) AS chain_next_process_id, \
+                    np.name AS chain_next_process_name, \
+                    cp.name AS chain_current_process_name, \
+                    {} AS has_process_chain \
+             FROM t_part_batch pb \
+             JOIN t_part p ON p.id = pb.part_id \
+             LEFT JOIN LATERAL ( {} ) nx ON TRUE \
+             LEFT JOIN t_process np \
+               ON np.id = nx.next_process_id AND np.deleted_at IS NULL \
+             LEFT JOIN t_process cp \
+               ON cp.id = pb.current_process_id AND cp.deleted_at IS NULL \
+              AND nx.current_step_id IS NOT NULL \
+             LEFT JOIN t_process_chain_step cs \
+               ON cs.id = pb.current_process_step_id AND cs.deleted_at IS NULL \
+             WHERE pb.deleted_at IS NULL AND p.deleted_at IS NULL \
+               AND pb.status = 'IN_PROCESS' AND pb.location = 'WORKER' \
+               AND pb.current_holder_id = $1 \
+             ORDER BY pb.id DESC LIMIT $2 OFFSET $3",
+            crate::shared::batch::chain::HAS_PROCESS_CHAIN_EXPR,
+            crate::shared::batch::chain::CHAIN_POSITION_LATERAL_SQL
+        );
+        // ⚠️ **注入面为 0**：`format!` 只填 `HAS_PROCESS_CHAIN_EXPR` 与
+        // `CHAIN_POSITION_LATERAL_SQL` 两个编译期常量，`worker_id` / `limit` /
+        // `offset` 一律走 bind，故 `AssertSqlSafe` 安全。`t_process_chain_step cs`
+        // 走 **LEFT JOIN**（无 step 的批次必须照样出现在放回列表里）。
+        let rows: Vec<WorkTypeListRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .bind(worker_id)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(repo.conn_mut())
+            .await?;
         let items: Vec<PartListItem> = rows
             .into_iter()
             .map(WorkTypeListRow::into_list_item)

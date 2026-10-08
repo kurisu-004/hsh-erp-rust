@@ -200,7 +200,7 @@ const SQL_CANDIDATES_BY_PROCESS: &str = "SELECT d.batch_version, d.batch_id, d.b
      d.customer_name, d.parent_customer_name, d.applicant_name, d.note, \
      d.shelf_code, d.requires_approval, d.quote_id, d.price, \
      d.outsource_company_id, d.outsource_company_name, \
-     d.has_cnc_program, d.company_options \
+     d.has_cnc_program, d.has_process_chain, d.company_options \
      FROM ( {dedup} ) d \
      WHERE d.current_process_id = $1 \
      ORDER BY d.is_urgent DESC, \
@@ -302,6 +302,14 @@ pub struct CandidateRow {
     pub outsource_company_id: Option<i64>,
     pub outsource_company_name: Option<String>,
     pub has_cnc_program: bool,
+    /// 工单已绑工序链且批次当前工序能在链内定位（判据见
+    /// `shared::batch::chain::HAS_PROCESS_CHAIN_EXPR`，经 `repo/sql.rs` 的
+    /// `sendable_dedup_sql` 填进内层投影）。卡片绿色左边框的判据。
+    ///
+    /// 与 `OutsourceQueueCandidate.has_process_chain` 的**不对称是有意的**：
+    /// 那是厂内候选池（可按链顺推下一道），这里是在途批次（批次已发到外协公司、
+    /// 不在厂内工序链上），故在途卡恒不画绿框。
+    pub has_process_chain: bool,
     /// SQL `to_jsonb(array_agg(json_build_object(...)))` 的结果（单个 JSONB 值，
     /// 不是 `json[]` —— 后者 sqlx 解不进 `serde_json::Value`）。APPROVAL 行恒为
     /// `[]`（SQL 侧 CASE 短路）。

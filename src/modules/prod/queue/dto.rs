@@ -164,6 +164,16 @@ pub struct DispatchRequest {
 pub struct DispatchTarget {
     #[serde(deserialize_with = "deserialize_i64")]
     pub batch_id: i64,
+    /// **仅无链工单的回落值**（2026-10-09）：工单已绑工序链
+    /// （`t_part.process_chain_id IS NOT NULL`）时本字段被**忽略** —— 后端按下发
+    /// 链内第一道未软删 step（口径与端点 5 `auto_dispatch_preview` 的
+    /// `first_process_id` 逐条相同），并把批次的 `current_process_step_id` 指向
+    /// 该 step。工单无链（手工工单的常态）时才按本字段下发。
+    ///
+    /// 字段**保持必填**（无 `#[serde(default)]`）：漏传仍是 HTTP 422 纯文本，而让
+    /// 「有链时忽略」这件事只存在于文档里、把必填改成可选会让「忘了传」从
+    /// fail-loud 退化成「按链首下发」这条静默路径。前端可继续照 preview 的
+    /// `first_process_id` 填同一个值，两条路径结果一致。
     #[serde(deserialize_with = "deserialize_i64")]
     pub target_process_id: i64,
 }

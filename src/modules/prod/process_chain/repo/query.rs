@@ -74,6 +74,48 @@ impl ProcessChainRepo {
         .await
     }
 
+    /// 2026-10-09 新增：取链内**第一道**未软删 step（`sort_order ASC, id ASC LIMIT 1`）。
+    ///
+    /// 消费方是 `prod::queue::service::dispatch::dispatch_single`：有工序链的工单
+    /// 按**链首**工序下发（2026-10-09 起的不变式，见
+    /// `shared::batch::chain` 模块 doc 的背景段）。step 取值口径与端点 5
+    /// `preview_auto_dispatch` 的 `LEFT JOIN LATERAL … ORDER BY pcs.sort_order ASC,
+    /// pcs.id ASC LIMIT 1` 逐条相同 —— 预览说「可下发到首道工序」，写端点就必须真的
+    /// 下发到首道，否则「前端照 preview 显示的值操作，落库却是另一道」。
+    ///
+    /// 返回 `(step_id, process_id)`；`None` = **锚链行已软删**、或链内一个未软删
+    /// step 都没有（已清空）。**没有**「链内工序歧义」这一返回：取的是链首，与链内
+    /// `process_id` 是否重复无关。
+    ///
+    /// ⚠️ **带 `t_part_process_chain` 的软删闸门**（2026-10-09）：链软删时
+    /// `t_part.process_chain_id` 仍指向那条已删链，而链内 step 通常**不随链软删**，
+    /// 不加闸门就会把「链没了」当成「链还在、首道是 X」照常下发成功 —— 落库的
+    /// `current_process_id` / `current_process_step_id` 指向一条业务上已不存在的链。
+    /// 加闸门后该形态与读侧 `shared::batch::chain::resolve_chain_position` 的锚链
+    /// JOIN（`pc.deleted_at IS NULL`）口径一致：两边都判「锚链不可解析」⇒ dispatch
+    /// 落 `20702`，卡片绿框（`HAS_PROCESS_CHAIN_EXPR`）也不会误导前端显示「可免填」。
+    ///
+    /// 走运行时 `sqlx::query_as`（与同文件 `resolve_step_id_by_process` 同款）：
+    /// 只投影两个列，进 `.sqlx/` 离线缓存带来的维护成本高于收益。
+    pub async fn first_step_in_chain<'e, E: PgExecutor<'e>>(
+        executor: E,
+        chain_id: i64,
+    ) -> Result<Option<(i64, i64)>, sqlx::Error> {
+        let row: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT pcs.id, pcs.process_id \
+             FROM t_part_process_chain pc \
+             JOIN t_process_chain_step pcs \
+               ON pcs.chain_id = pc.id AND pcs.deleted_at IS NULL \
+             WHERE pc.id = $1 AND pc.deleted_at IS NULL \
+             ORDER BY pcs.sort_order ASC, pcs.id ASC \
+             LIMIT 1",
+        )
+        .bind(chain_id)
+        .fetch_optional(executor)
+        .await?;
+        Ok(row)
+    }
+
     /// 2026-09-16 PR-3 批次 step 化：在指定 chain 内按 process_id 解析 step_id。
     ///
     /// 用于：

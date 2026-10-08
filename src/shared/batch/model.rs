@@ -75,19 +75,26 @@ pub struct TPartBatch {
     /// 完整记录见 `migrations/20260930000000_004_add_batch_current_process_id.sql`
     /// 「已知局限 (4)」—— 做写点穷举时不必重新提这两条。
     pub current_process_id: Option<i64>,
-    /// 逻辑 FK → `t_process_chain_step.id`；**可选的显示用定位信息**。
+    /// 逻辑 FK → `t_process_chain_step.id`；**可选的链内位置指针**（随工序推进）。
     ///
-    /// 2026-09-30 review 第 3 轮订正措辞：本列**不是会随流转推进的「进度指针」**
-    /// —— 它只在**首次定位**工序时被写入（dispatch 路径刻意写 NULL；其余由
+    /// **随工序推进的位置指针**（2026-10-09 起）。写点：dispatch（落链首 step）、
+    /// worker-scan RETURNED（顺工序时推进到链上下一 step）、以及
     /// `place_on_shelf` / `release_from_programming` / 外协收发（`outsource` 域
-    /// `service/move.rs`）/ `complete_repair` / `to_process` 写），
-    /// 之后**不再推进**：worker-scan RETURNED、send_to_inspection、
-    /// `mark_batch_returned`、`mark_batch_inspected` 都不写它。对多工序链工单，
-    /// 它永远停在首次定位的那一步，故**不可**当「当前走到第几步」用。
+    /// `service/move.rs`）/ `complete_repair` / `to_process` 这批「首次定位工序」的
+    /// 入口。
+    ///
+    /// ⚠️ 推进**不是**无条件的：`prod::queue::move` 的 WORKER→POOL（admin 主动退回
+    /// 候选池）刻意传 `None`，语义是「退回不改工序归属」。
+    ///
+    /// ⚠️ **存量行**：2026-10-09 之前 dispatch 把本列清成 NULL、RETURNED 又把它
+    /// 丢弃，凡走过一次领取 / 放回的批次指针恒为 NULL（另有一批停在首次定位的
+    /// 陈旧值）。这类批次需重新走一次流转才被重定位；读侧
+    /// `chain_state` 按 `current_process_id` 在链内重新定位，不受指针影响
+    /// （纪律见 `shared::batch::chain`）。
     ///
     /// NULL = 批次尚未进入生产流（PENDING/PROGRAMMING/OUTSOURCE 起点）、
     /// 所属 part 无工艺链，或 step 已软删。允许 NULL 是本设计的核心：池归属
-    /// 判定已改由 `current_process_id` 承担，本列退化为可选的显示用信息。
+    /// 判定由 `current_process_id` 承担。
     /// 2026-09-16 PR-3 替代 `next_process_id`（已删）。
     pub current_process_step_id: Option<i64>,
     pub delivery_note_id: Option<i64>,

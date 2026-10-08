@@ -12,6 +12,7 @@
 //! | [`read`] | `get_batch_by_id` / `list_active_batches_by_part_id` | `model` + sqlx |
 //! | [`status`] | `apply_batch_status_change` / `apply_bulk_batch_status_change_for_part` + 派生链 | assembly / part / 本表（见下） |
 //! | [`guards`] | 10 个 `pub fn`：状态机守卫 / OCC / 货架校验 / status 薄包装 | part / shelf / `status` |
+//! | [`chain`] | `CHAIN_POSITION_LATERAL_SQL` + `HAS_PROCESS_CHAIN_EXPR` + `resolve_chain_position`（批次在工序链上的位置派生，读写共用） | `model` + 本表 SQL 内聚合（见下） |
 //!
 //! ## 边界登记：shared/batch 依赖 4 个域，是本仓依赖面最宽的 shared 模块
 //!
@@ -21,6 +22,17 @@
 //! | `assembly` | `status` | **写** | `AssemblyService::sync_assembly_status`（父件派生级联） |
 //! | `shelf` | `guards` | 读 | `ShelfRepo::get_by_id`（`validate_shelf_zone` 的存在 / 停用 / zone 三谓词在 Rust 层逐条判） |
 //! | `prod::process_chain` | `guards` | 读 | `ProcessChainRepo::resolve_step_id_by_process`（`optional_step_id`） |
+//!
+//! ## `chain` 的表依赖（不经域 repo，与上表 4 行不同类）
+//!
+//! | 表 | 读 / 写 | 为什么不经域 repo |
+//! |---|---|---|
+//! | `t_part`（`process_chain_id`） | 只读 | 锚链的第一来源。`ProcessChainRepo` 的入口全部以 `chain_id` 为入参（「某条链如何」），而本层问的是「这个 part 当前锚在哪条链」—— 与 `optional_process_chain`（`guards`）读的是同一个列，两处各写一份 SQL 只会让锚链口径漂移 |
+//! | `t_part_process_chain` | 只读 | `CHAIN_POSITION_LATERAL_SQL` 的锚链 JOIN 查的就是它，而 `pc.deleted_at IS NULL` 这一条决定「锚链能否解析」：链被软删时位置解析无行、落 `NONE`。写侧口径**只对齐了一半**：`ProcessChainRepo::first_step_in_chain` 补上了同一道软删闸门（dispatch 侧），而 `resolve_step_id_by_process` 只查 `t_process_chain_step`、**无这道闸门** ⇒ worker-scan 显式分支仍能在已软删链里解析出活跃 step（分叉登记见 `docs/api/queue.md` §8.4） |
+//! | `t_process_chain_step` | 只读 | 「链内定位 + 下一道」必须与读侧 `LEFT JOIN LATERAL` 在**同一条 SQL** 里完成（拆成两条往返会让「定位到的位置」与「算出的下一道」之间出现写窗口）。同理 `NEXT_PROCESS_LATERAL_SQL`（`outsource` 域自己的同款片段）也是片段内自聚合 |
+//!
+//! 两条纪律（锚链两步定位、按 `current_process_id` 重新定位）与理由见
+//! [`chain`] 的模块 doc；纪律的文本锚点由该文件的单测钉住。
 //!
 //! 前两行是**写**库，故 `shared::batch` 是本仓**唯一**经域 repo 写库的 shared 模块。
 //! **这是有意为之的例外**，理由：它是 `CLAUDE.md`「状态派生契约」三层派生图
@@ -52,6 +64,7 @@
 //!   行）—— 各域列表端点的列集与筛选语义各不相同，逐域自持；
 //! - 批次**流转**用例（送检 / 发货 / 返修 / 外协）—— 属 batch 域或已剥离的新域。
 
+pub mod chain;
 pub mod guards;
 pub mod model;
 pub mod read;

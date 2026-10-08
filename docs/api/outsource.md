@@ -234,7 +234,9 @@ router 工厂始终是 **4 个**（`company_router` / `quote_router` / `shipment
 | `held_count` | number | **服务层内存分组行数**（`== held_batches.len()`，见 §4.1） |
 | `held_batches[]` | array | SQL 3（**无公司谓词**，见下） |
 
-`items[]` 元素（`OutsourceQueueCandidate`，25 字段）：取自 `SENDABLE_PROJECTION_FULL` 的全投影，字段与后端 SQL 列一一对应 —— `version`（`pb.version`，**OCC 锚**）、`send_mode`、`batch_id` / `part_id`（string）、`batch_no`、`quantity`（`pb.quantity`，行 = 批次故与旧 VO 的 `batch_quantity` 同值）、`part_serial_no` / `part_drawing_no` / `part_name`、`planned_delivery_date` / `system_delivery_date`（`to_char(…,'YYYY-MM-DD')`，**字符串不是日期对象**）、`is_urgent`、`customer_name` / `parent_customer_name`、`applicant_name`、`note`、`shelf_code`（string \| null）、`shelf_id`（string，**承重字段**，见 §8.4）、`outsource_company_id` / `outsource_company_name`、`quote_id`、`company_options: OutsourceCompanyOption[]`（`id` string + `name`）、`price`（Decimal 字符串）、`can_send`（**服务层算** `send_mode == "APPROVAL" || !company_options.is_empty()`）、`has_cnc_program`（`EXISTS (t_part_file kind='G_CODE')`）。
+`items[]` 元素（`OutsourceQueueCandidate`，26 字段）：取自 `SENDABLE_PROJECTION_FULL` 的全投影，字段与后端 SQL 列一一对应 —— `version`（`pb.version`，**OCC 锚**）、`send_mode`、`batch_id` / `part_id`（string）、`batch_no`、`quantity`（`pb.quantity`，行 = 批次故与旧 VO 的 `batch_quantity` 同值）、`part_serial_no` / `part_drawing_no` / `part_name`、`planned_delivery_date` / `system_delivery_date`（`to_char(…,'YYYY-MM-DD')`，**字符串不是日期对象**）、`is_urgent`、`customer_name` / `parent_customer_name`、`applicant_name`、`note`、`shelf_code`（string \| null）、`shelf_id`（string，**承重字段**，见 §8.4）、`outsource_company_id` / `outsource_company_name`、`quote_id`、`company_options: OutsourceCompanyOption[]`（`id` string + `name`）、`price`（Decimal 字符串）、`can_send`（**服务层算** `send_mode == "APPROVAL" || !company_options.is_empty()`）、`has_cnc_program`（`EXISTS (t_part_file kind='G_CODE')`）、`has_process_chain`（判据见 §8.4）。
+
+⚠️ `has_process_chain` **只加在候选卡上，同屏的在途卡 `OutsourceQueueHeldBatch` 没有这一列** —— 外协收发阶段的批次在厂外，不存在「按工序链顺推到下一道」的语义，故在途卡恒按无链渲染（不画绿框）。这是**有意的不对称**，见 §8.4。
 
 `held_batches[]` 元素（`OutsourceQueueHeldBatch`）：
 
@@ -250,6 +252,7 @@ router 工厂始终是 **4 个**（`company_router` / `quote_router` / `shipment
 | `note` | string \| null | `t_part.note` |
 | `version` | number | `pb.version`（**移动写端点的 OCC 锚**） |
 | `has_cnc_program` | boolean | `EXISTS (t_part_file kind='G_CODE')` |
+| ~~`has_process_chain`~~ | — | **刻意没有这一列**（候选卡有、在途卡无，见上）。写 zod 时**不要**声明它 |
 | `sent_at` | string \| null | `LEFT JOIN t_outsource_shipment.sent_at`（`status='OUTSOURCING'`） |
 | `price` | string \| null | `s.unit_price::text`（Decimal 字符串，**刻意不用空串兜底**） |
 | `receive_next_process_id` | string | `COALESCE(nx.next_process_id, 0)` ⇒ **推不出时是字符串 `"0"`**（0 兜底口径，非 nullable） |
@@ -582,7 +585,7 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 5. **候选卡 `shelf_id` 是承重字段**：拖拽发送时必须原样回传给 `from.shelf_id`（候选池跨货架，不能用「用户当前激活货架」凑 —— 激活货架对 MANAGER / CLERK / INSPECTOR 恒为空）。填错被写端点按 `20122` 拒收。
 6. **候选卡的 `shelf_id` 为空串的行走不通**：那是 `PENDING` 且未上架的批次（本来就在生产架之外），要先 `place-on-shelf`。
 7. **新增 2 个看板 composable** + **删 3 个旧 composable**（`/outsource-pool/counts` 计数、`/outsource-pool/state` 每公司一次、`/outsource-pool/{process_id}` 详情）。
-8. **zod schema 同步**：新增 `outsourceQueueSnapshotSchema` / `outsourceQueueProcessDetailSchema` / `outsourceQueueCandidateSchema` / `outsourceQueueCompanySchema` / `outsourceQueueHeldBatchSchema` / `outsourceMoveResultSchema`。**注意 zod 默认 strip 模式**会让漏声明的字段静默丢失，数组元素必须全字段声明（候选卡 25 字段）。
+8. **zod schema 同步**：新增 `outsourceQueueSnapshotSchema` / `outsourceQueueProcessDetailSchema` / `outsourceQueueCandidateSchema` / `outsourceQueueCompanySchema` / `outsourceQueueHeldBatchSchema` / `outsourceMoveResultSchema`。**注意 zod 默认 strip 模式**会让漏声明的字段静默丢失，数组元素必须全字段声明（**候选卡 26 字段**，含 `has_process_chain`；**在途卡刻意无 `has_process_chain`**，勿给它补声明）。
 9. **日期字段类型不一致**（勿写同一个 schema 复用）：候选卡 / `quotable` 的日期是 `YYYY-MM-DD` **字符串**（`to_char`）；`held_batches` 的是 ISO 日期串（native date）。
 10. **`receive_next_process_id` 是字符串 `"0"`** 而非数字 0、亦非 `null`；配合 `chain_resolvable` 判定要不要弹手填对话框。
 11. **`snapshot.processes[]` 的 tab 集合必须 join 全量 OUTSOURCE 工序列表**（见 §4.3）。

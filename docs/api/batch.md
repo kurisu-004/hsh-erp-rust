@@ -137,6 +137,7 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
 | `prod::batch::service::guard.rs` | `shared::batch::guards.rs` | `prod::batch` / `prod::queue` / `prod::shelf_process` / part / outsource |
 | `prod::batch::model::TPartBatch` | `shared::batch::model.rs` | 十个域直接引用（prod / part / delivery_note / outsource / wx / statistics / admin / dashboard …） |
 | `PartBatchRepo::get_by_id` / `list_active_by_part_id` | `shared::batch::read.rs` | prod::batch / prod::queue / delivery_note / part / 派生链 |
+| 批次在工序链上的位置派生（锚链两步定位 / 「下一道」/ 顺应工序判据） | `shared::batch::chain.rs`（2026-10-09 新增） | `prod::batch::service::worker_scan`（RETURNED）/ `prod::queue::service::dispatch` / part 读侧 `list_by_worker` / 4 处卡片 DTO 的 `has_process_chain` |
 
 迁移动机：这四处都是**所有碰批次的域都要用**的公共设施，与「批次有哪些业务用例」无关。留在 batch 域意味着每剥离一个新域就多一条指向 batch 域的反向依赖。上移后依赖方向与派生图方向一致（上层域 → shared）。
 

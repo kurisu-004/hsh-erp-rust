@@ -141,6 +141,7 @@ fn to_held_batch(r: HeldBatchRow) -> QueueHeldBatch {
         planned_delivery_date: r.planned_delivery_date,
         is_urgent: r.is_urgent,
         has_cnc_program: r.has_cnc_program,
+        has_process_chain: r.has_process_chain,
         customer_name: r.customer_name,
         parent_customer_name: r.parent_customer_name,
         applicant_name: r.applicant_name,
@@ -187,6 +188,7 @@ fn to_pool_item(r: PoolItemRow) -> QueuePoolItem {
         shelf_name: r.shelf_name,
         is_urgent: r.is_urgent,
         has_cnc_program: r.has_cnc_program,
+        has_process_chain: r.has_process_chain,
         note: r.note,
         version: r.version,
     }

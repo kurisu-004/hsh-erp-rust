@@ -114,6 +114,13 @@ pub struct QueueHeldBatch {
     pub planned_delivery_date: Option<chrono::NaiveDate>,
     pub is_urgent: bool,
     pub has_cnc_program: bool,
+    /// 工单已绑工序链**且**批次当前工序能在链内定位（判据见
+    /// `shared::batch::chain::HAS_PROCESS_CHAIN_EXPR`）—— 卡片绿色左边框的判据。
+    /// 该判据**与写侧闸门 `ChainPosition::is_pointer_consistent` 不是同款**，只比
+    /// 「指针 step 的工序 == 批次当前工序」（分叉形态见该常量的 doc），故绿框是提示
+    /// 而非安全保证。与 [`QueuePoolItem::has_process_chain`] 同源（同一个常量），
+    /// 两列必须同时改。
+    pub has_process_chain: bool,
     pub customer_name: Option<String>,
     pub parent_customer_name: Option<String>,
     pub applicant_name: Option<String>,
@@ -147,6 +154,9 @@ pub struct QueuePoolItem {
     pub shelf_name: String,
     pub is_urgent: bool,
     pub has_cnc_program: bool,
+    /// 同 [`QueueHeldBatch::has_process_chain`]（同一个常量，判据本身的适用范围与
+    /// 写侧闸门的分叉形态见该字段 doc 与 `HAS_PROCESS_CHAIN_EXPR` 的 doc）。
+    pub has_process_chain: bool,
     pub note: Option<String>,
     pub version: i32,
 }

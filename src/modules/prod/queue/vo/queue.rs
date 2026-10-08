@@ -103,20 +103,31 @@ pub struct DispatchResult {
 
 /// `DispatchResult.succeeded` 单条（每条 target 对应一个）。
 ///
-/// 2026-09-30 新增 `current_process_id`（工序池归属权威依据）；原
-/// `current_process_step_id` 走 `Option<i64>`（dispatch 不解析 step → None）。
+/// 2026-09-30 新增 `current_process_id`（工序池归属权威依据）。
+/// 2026-10-09：`current_process_step_id` 由「恒 `null`（dispatch 不解析 step）」
+/// 改为**真实写入值** —— 有链工单按下发链首工序，指针落链首 step。
 #[derive(Debug, Clone, Serialize)]
 pub struct DispatchSuccessItem {
     #[serde(serialize_with = "serialize_i64")]
     pub batch_id: i64,
-    pub current_process_step_id: Option<i64>,
-    /// 下发后写入 `t_part_batch.current_process_id` 的值（逻辑 FK → `t_process.id`），
-    /// 恒等于本次 `target_process_id`。
+    /// 下发后 `t_part_batch.current_process_step_id` 的值（逻辑 FK →
+    /// `t_process_chain_step.id`）。JSON 里是 **number**（不带字符串化器，与本 VO
+    /// 里 `batch_id` 等 id 字段不同，见各自的 `serialize_with`）。
     ///
-    /// **Option 语义**：当前 dispatch 路径恒为 `Some(target_process_id)`；保留
-    /// `Option` 是为了与 `current_process_step_id` 对齐并为将来「下发不到指定
-    /// 工序」的分支留出 `null` 表达。None → JSON `null`，避免前端拿 `"0"` 误判
-    /// 为合法工序 id。
+    /// - 有链工单（`t_part.process_chain_id IS NOT NULL`）→ 链内第一道未软删 step 的
+    ///   id（口径与端点 5 的 `first_process_id` 同源）；
+    /// - 无链工单 → `null`（该列按写入不变式恒为 NULL）。
+    pub current_process_step_id: Option<i64>,
+    /// 下发后写入 `t_part_batch.current_process_id` 的值（逻辑 FK → `t_process.id`）。
+    ///
+    /// ⚠️ **有链工单下它等于链首 step 的工序，不等于请求里的 `target_process_id`** ——
+    /// 后者此时只是无链时的回落值（见 `DispatchTarget::target_process_id` 的 doc）。
+    /// 前端要展示「实际下发到哪道工序」必须读本字段，读 `target_process_id` 会在
+    /// 有链时显示成用户随手传的那道。
+    ///
+    /// **Option 语义**：当前 dispatch 路径恒为 `Some(..)`；保留 `Option` 是为了与
+    /// `current_process_step_id` 对齐并为将来「工序落空」的分支留出 `null` 表达。
+    /// None → JSON `null`，避免前端拿 `"0"` 误判为合法工序 id。
     #[serde(serialize_with = "serialize_i64_opt")]
     pub current_process_id: Option<i64>,
     #[serde(serialize_with = "serialize_i64")]

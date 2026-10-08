@@ -49,7 +49,7 @@ use crate::shared::types::{serialize_i64, serialize_i64_opt};
 /// 2026-09-16 PR-3 批次 step 化（migration 028）：
 /// - 删 `placed_at`（t_part_batch 列已删，不再统计生产时间）
 /// - 新增 `current_process_step_id`：逻辑 FK → t_process_chain_step.id
-///   （批次**首次定位**的工艺链步骤；NULL = 批次尚未进入生产流或 part 无链）
+///   （批次的**链内位置指针**，随工序推进；NULL = 批次尚未进入生产流或 part 无链）
 /// - `next_process_id` / `next_process_name` 字段保留，由 repo JOIN step 派生
 ///   （保持 DTO 兼容，不破坏前端）
 ///

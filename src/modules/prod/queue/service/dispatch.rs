@@ -44,6 +44,7 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepo;
+use crate::modules::prod::process_chain::repo::ProcessChainRepo;
 use crate::modules::prod::shelf_process::repo::ShelfProcessRepo;
 use crate::shared::error::{AppError, code};
 
@@ -91,6 +92,16 @@ impl QueueService {
     ///   handler 层做 targets 解构后调用（避免新增 `bulk_dispatch` 转发壳）
     /// - 返回 `DispatchResult { succeeded, failed }`（BulkDispatchResult 形态）
     ///
+    /// ## `target_process_id` 的语义（2026-10-09 改写）
+    /// 它是**仅无链时的回落值**：
+    /// - 工单已绑工序链（`t_part.process_chain_id IS NOT NULL`）⇒ **忽略本字段**，
+    ///   按链内第一道未软删 step（`sort_order ASC, id ASC LIMIT 1`）下发，并把
+    ///   `current_process_step_id` 指向该 step；
+    /// - 工单无链（手工工单的常态）⇒ 回落本字段，`current_process_step_id` 落 NULL。
+    ///
+    /// 这条与端点 5 `auto_dispatch_preview` 的口径**同源**（都取链首），所以
+    /// 「前端照 preview 显示的 `first_process_id` 操作，落库也是那道工序」。
+    ///
     /// 事务内流程（每条 target 顺序执行，任一硬失败 → service 抛 AppError，
     /// handler tx Drop 自动回滚全部 succeeded 写入）：
     /// 1. 角色守卫：Manager + Clerk
@@ -98,11 +109,13 @@ impl QueueService {
     /// 3. 校验 `batch.status ∈ {'PENDING', 'PROGRAMMING'}` → 否则
     ///    `BIZ_BATCH_INVALID_STATUS` 抛错（2026-10-06：纳入已废弃的 `PROGRAMMING`，
     ///    与待下发列表同一白名单）
-    /// 4. `find_first_shelf_for_process(target_process_id)` → `None` → `BIZ_SHELF_PROCESS_NOT_FOUND` 抛错
+    /// 4. 解析链首 step（有链）/ 回落 `target_process_id`（无链）；链存在但链内一个
+    ///    活跃 step 都没有 → `BIZ_PROCESS_CHAIN_STEP_NOT_FOUND`（20702）
+    /// 5. `find_first_shelf_for_process(目标工序)` → `None` → `BIZ_SHELF_PROCESS_NOT_FOUND` 抛错
     ///    （2026-10-04：该方法已带 `t_shelf` 的 `deleted_at` / `is_active` / `zone='PRODUCTION'`
     ///    守卫，故 `None` 含「有映射但货架全不可用」，仍复用 20508 不新造码）
-    /// 5. `update_batch_dispatched`（OCC）→ 0 行 → `VERSION_CONFLICT` 抛错
-    /// 6. `PartRepo::insert_part_event('PLACED_ON_SHELF')`
+    /// 6. `update_batch_dispatched`（OCC）→ 0 行 → `VERSION_CONFLICT` 抛错
+    /// 7. `PartRepo::insert_part_event('PLACED_ON_SHELF')`
     ///
     /// 当前实现：保留原 bulk_dispatch 「任一失败 → 全回滚」语义。
     /// `succeeded` / `failed` 数组实际只在全部成功时填 succeeded；失败路径
@@ -148,6 +161,10 @@ impl QueueService {
     ///
     /// `dispatch_batch` 在循环内调：成功 → 返回 `DispatchSuccessItem`；
     /// 失败 → 返回 `AppError`（由 `dispatch_batch` 转 `DispatchFailureItem`）。
+    ///
+    /// `target_process_id` 形参是**仅无链时的回落值**（见 [`QueueService::
+    /// dispatch_batch`] 的 doc）：有链时按链首 step 下发并落 step 指针。
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_single(
         conn: &mut PgConnection,
         batch_id: i64,
@@ -179,11 +196,45 @@ impl QueueService {
             ));
         }
 
+        // 2.5 解析链首 step（2026-10-09 新增）
+        //
+        // 有链工单按**链首**工序下发，step 指针落链首 step；无链（手工工单的常态）
+        // 回落请求里的 `target_process_id`，step 留 NULL。口径与端点 5
+        // `auto_dispatch_preview` 的 `LEFT JOIN LATERAL … ORDER BY pcs.sort_order ASC`
+        // 同源（`ProcessChainRepo::first_step_in_chain` 的 doc 已记这一致性）。
+        //
+        // 错误码复用 `20702 BIZ_PROCESS_CHAIN_STEP_NOT_FOUND`（不新造码）：它原本的
+        // 语义是「链内找不到某工序」，本处是「链内一个未软删 step 都没有」——同属
+        // 「链存在却定位不到可用工序」，且两条路径都要求运营去修链本身。文案里写清
+        // 区别，避免按「某个工序不在链里」的方向去查。
+        let chain_id = crate::shared::batch::optional_process_chain(conn, batch.part_id).await?;
+        let (target_process_id, target_step_id) = match chain_id {
+            Some(chain_id) => {
+                let (step_id, process_id) =
+                    ProcessChainRepo::first_step_in_chain(&mut *conn, chain_id)
+                        .await?
+                        .ok_or_else(|| {
+                            AppError::biz(
+                                code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND,
+                                format!(
+                                    "chain {chain_id} 内没有任何未软删的 step（链已软删或已清空），\
+                                     无法按链首工序下发"
+                                ),
+                            )
+                        })?;
+                (process_id, Some(step_id))
+            }
+            None => (target_process_id, None),
+        };
+
         // 3. 解析货架
         // 2026-10-02 域拆分：原调 `QueueDispatchRepo::find_first_shelf_for_process`（本域手写
         // `t_shelf_process` SQL），现改调 SQL 真源
         // `prod::shelf_process::repo::ShelfProcessRepo::find_first_shelf_for_process`
         // （executor 泛型直接接住 `&mut PgConnection`，无需改事务上下文）。
+        //
+        // ⚠️ 有链工单解析的是**链首工序**的货架（`target_process_id` 已在上面被
+        // 链首覆盖），不是请求里那道工序的货架。
         //
         // 2026-10-04：货源守卫下沉到该方法的 SQL（`JOIN t_shelf` + `deleted_at IS NULL`
         // + `is_active` + `zone='PRODUCTION'`），故此处拿到的 `shelf_id` 一定是可被
@@ -213,6 +264,7 @@ impl QueueService {
             shelf_id,
             Some(current.id),
             target_process_id,
+            target_step_id,
         )
         .await?;
         if rows_affected == 0 {
@@ -259,9 +311,11 @@ impl QueueService {
 
         Ok(DispatchSuccessItem {
             batch_id: batch.id,
-            // 2026-09-30：dispatch 路径仍不解析 step（诚实置 None），
-            // current_process_id 才是入池的权威依据 —— 填真实写入值
-            current_process_step_id: None,
+            // 2026-10-09：填真实写入值（链首 step 的 id；无链时为 None ⇒ JSON null）。
+            // 此前是「诚实置 None」（当时 dispatch 路径根本不解析 step），那条注释
+            // 随「dispatch 落链首 step」这条不变式一并作废。
+            current_process_step_id: target_step_id,
+            // 有链时等于**链首** step 的 process_id，不等于请求里那道工序。
             current_process_id: Some(target_process_id),
             target_process_id,
             shelf_id,
@@ -606,6 +660,38 @@ mod tests {
         id
     }
 
+    /// 写一条**链 + 链首 step**，返回 `(chain_id, step_id)`。
+    ///
+    /// `sort_order` 固定 10（稀疏）：dispatch 取链首用的是 `sort_order ASC, id ASC
+    /// LIMIT 1`，与端点 5 `preview_auto_dispatch` 逐条同形，不依赖密度。
+    async fn insert_chain_with_step(pool: &sqlx::PgPool, process_id: i64) -> (i64, i64) {
+        let chain_id = shared_test_snowflake().next_id();
+        let now = now_naive();
+        sqlx::query(
+            "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, \
+             updated_at, updated_by) VALUES ($1, 'chain-dispatch', 0, $2, 0, $2, 0)",
+        )
+        .bind(chain_id)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert t_part_process_chain");
+        let step_id = shared_test_snowflake().next_id();
+        sqlx::query(
+            "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, \
+             estimated_minutes, version, created_at, created_by, updated_at, updated_by) \
+             VALUES ($1, $2, 10, $3, 30, 0, $4, 0, $4, 0)",
+        )
+        .bind(step_id)
+        .bind(chain_id)
+        .bind(process_id)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert t_process_chain_step");
+        (chain_id, step_id)
+    }
+
     /// 构造一个最小的 `CurrentUser` 用于 service 直调（绕开 JWT 解析）。
     fn make_current(user_id: i64, role: Role) -> CurrentUser {
         CurrentUser {
@@ -897,7 +983,7 @@ mod tests {
         // 真正的池归属权威依据是 current_process_id，必须等于目标工序。
         assert!(
             r.succeeded[0].current_process_step_id.is_none(),
-            "dispatch 路径仍不解析 step，step 应为 None（可选的显示用定位信息）"
+            "无链工单（t_part.process_chain_id IS NULL）没有链首可落，step 应为 None"
         );
         assert_eq!(
             r.succeeded[0].current_process_id,
@@ -1000,6 +1086,201 @@ mod tests {
         .unwrap();
         assert_eq!(from_status.as_deref(), Some("PROGRAMMING"));
         assert_eq!(to_status.as_deref(), Some("IN_PROCESS"));
+    }
+
+    /// 2026-10-09：已绑链的 PENDING 批次 dispatch 后**按链首工序下发**，
+    /// `current_process_step_id` 落链首 step，且请求里那道工序被忽略。
+    ///
+    /// 「忽略」是本用例的判别点：请求传的 `target_process_id` 是**另一道**也有货架
+    /// 映射的工序，若实现回落了它，断言 2 / 4 都会红（而断言 1 / 3 仍绿）⇒ 只断言
+    /// 「落链首」不足以钉住行为，必须同时断言「请求那道没被用」。
+    #[tokio::test]
+    async fn dispatch_uses_chain_head_step_and_ignores_target_process_when_chained() {
+        let pool = test_pool().await;
+        let user_id = insert_user_with_role(&pool, "manager1", "password", "MANAGER").await;
+        let customer_id = insert_customer_l2(&pool, "ACME").await;
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+
+        let head_process = insert_process(&pool, "P-HEAD", "链首工序").await;
+        let other_process = insert_process(&pool, "P-OTHER", "请求里那道工序").await;
+        // 两道工序都有货架映射：解析货架这一步在两条路径下都能过，差异只在
+        // 「用谁的工序去解析」上。
+        let head_shelf = insert_shelf(&pool, "SH-HEAD", "PRODUCTION").await;
+        let other_shelf = insert_shelf(&pool, "SH-OTHER", "PRODUCTION").await;
+        link_shelf_to_process(&pool, head_shelf, head_process).await;
+        link_shelf_to_process(&pool, other_shelf, other_process).await;
+        let (chain_id, step_id) = insert_chain_with_step(&pool, head_process).await;
+
+        let p_id = insert_part(
+            &pool,
+            "P-CHAIN",
+            "DWG-CHAIN",
+            customer_id,
+            today,
+            Some(today),
+            false,
+            Some(chain_id),
+        )
+        .await;
+        let b_id = insert_part_batch(&pool, p_id).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let r = QueueService::dispatch_batch(
+            &mut conn,
+            vec![(b_id, other_process)],
+            Some("dispatch chain head"),
+            shared_test_snowflake().as_ref(),
+            &make_current(user_id, Role::Manager),
+        )
+        .await
+        .expect("dispatch OK");
+
+        // 1. 出参：step 指针 = 链首 step
+        assert_eq!(
+            r.succeeded[0].current_process_step_id,
+            Some(step_id),
+            "有链工单 dispatch 后出参必须回填链首 step id"
+        );
+        // 2. 出参：current_process_id = 链首工序（≠ 请求里那道）
+        assert_eq!(
+            r.succeeded[0].current_process_id,
+            Some(head_process),
+            "有链工单按链首工序下发，不看请求里的 target_process_id"
+        );
+        assert_eq!(r.succeeded[0].shelf_id, head_shelf, "货架按链首工序解析");
+
+        // 3. DB 层：两列都落链首（权威锚点在库里，不只出参）
+        let row: (String, Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT status, current_process_id, current_process_step_id, current_holder_id \
+             FROM t_part_batch WHERE id = $1",
+        )
+        .bind(b_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "IN_PROCESS");
+        assert_eq!(row.1, Some(head_process));
+        assert_eq!(row.2, Some(step_id), "step 指针必须落链首 step");
+        assert_eq!(row.3, Some(head_shelf));
+    }
+
+    /// 2026-10-09：链行未软删、但链内一个未软删 step 都没有（已清空）⇒
+    /// `20702 BIZ_PROCESS_CHAIN_STEP_NOT_FOUND`，批次保持 PENDING 不被写脏。
+    #[tokio::test]
+    async fn dispatch_rejects_chain_without_active_step() {
+        let pool = test_pool().await;
+        let user_id = insert_user_with_role(&pool, "manager1", "password", "MANAGER").await;
+        let customer_id = insert_customer_l2(&pool, "ACME").await;
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+
+        let process_id = insert_process(&pool, "P-NOSTEP", "ACME").await;
+        let shelf_id = insert_shelf(&pool, "SH-NOSTEP", "PRODUCTION").await;
+        link_shelf_to_process(&pool, shelf_id, process_id).await;
+        // 建链后立刻软删 step（链行本身仍是活跃的，故这条用例钉的是「链内已清空」）
+        let (chain_id, step_id) = insert_chain_with_step(&pool, process_id).await;
+        sqlx::query("UPDATE t_process_chain_step SET deleted_at = now() WHERE id = $1")
+            .bind(step_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let p_id = insert_part(
+            &pool,
+            "P-NOSTEP",
+            "DWG-NOSTEP",
+            customer_id,
+            today,
+            Some(today),
+            false,
+            Some(chain_id),
+        )
+        .await;
+        let b_id = insert_part_batch(&pool, p_id).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let e = QueueService::dispatch_batch(
+            &mut conn,
+            vec![(b_id, process_id)],
+            None,
+            shared_test_snowflake().as_ref(),
+            &make_current(user_id, Role::Manager),
+        )
+        .await
+        .expect_err("链内无活跃 step 必须拒");
+        assert_eq!(e.code(), code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND);
+
+        let status: String = sqlx::query_scalar("SELECT status FROM t_part_batch WHERE id = $1")
+            .bind(b_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "PENDING", "拒收时批次不能被写脏");
+    }
+
+    /// 2026-10-09：**锚链行已软删、链内 step 仍活跃** ⇒ `20702`。
+    ///
+    /// 与 `dispatch_rejects_chain_without_active_step` 是两种不同成因、共用同一错误码：
+    /// 那条钉「链行活跃但链内已清空」，本条钉「step 还在、但链本身没了」。本条是
+    /// `ProcessChainRepo::first_step_in_chain` 补 `t_part_process_chain.deleted_at`
+    /// 闸门的直接回归 —— 不补闸门时链内首个活跃 step 会被当成「链首」照常下发成功，
+    /// 落库的 `current_process_step_id` 指向一条业务上已不存在的链；同时读侧
+    /// `resolve_chain_position` 的锚链 JOIN 判「不可解析」、`chain_state = NONE`，
+    /// 卡片绿框与写侧落库会给出互相矛盾的信号。
+    #[tokio::test]
+    async fn dispatch_rejects_soft_deleted_chain_with_live_step() {
+        let pool = test_pool().await;
+        let user_id = insert_user_with_role(&pool, "manager1", "password", "MANAGER").await;
+        let customer_id = insert_customer_l2(&pool, "ACME").await;
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+
+        let process_id = insert_process(&pool, "P-DCHAIN", "ACME").await;
+        let shelf_id = insert_shelf(&pool, "SH-DCHAIN", "PRODUCTION").await;
+        link_shelf_to_process(&pool, shelf_id, process_id).await;
+        // 关键形态：**只软删链行，不动 step**（`t_part.process_chain_id` 仍指向它）
+        let (chain_id, _step_id) = insert_chain_with_step(&pool, process_id).await;
+        sqlx::query("UPDATE t_part_process_chain SET deleted_at = now() WHERE id = $1")
+            .bind(chain_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let p_id = insert_part(
+            &pool,
+            "P-DCHAIN",
+            "DWG-DCHAIN",
+            customer_id,
+            today,
+            Some(today),
+            false,
+            Some(chain_id),
+        )
+        .await;
+        let b_id = insert_part_batch(&pool, p_id).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let e = QueueService::dispatch_batch(
+            &mut conn,
+            vec![(b_id, process_id)],
+            None,
+            shared_test_snowflake().as_ref(),
+            &make_current(user_id, Role::Manager),
+        )
+        .await
+        .expect_err("锚链已软删必须拒，不能把链内残留 step 当链首下发");
+        assert_eq!(e.code(), code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND);
+
+        // 拒收时批次不能被写脏：status 保持 PENDING，step 指针保持 NULL
+        let row: (String, Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT status, current_process_id, current_process_step_id \
+             FROM t_part_batch WHERE id = $1",
+        )
+        .bind(b_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "PENDING", "拒收时批次不能被写脏");
+        assert_eq!(row.1, None, "拒收时不能落 current_process_id");
+        assert_eq!(row.2, None, "拒收时不能落 step 指针");
     }
 
     #[tokio::test]

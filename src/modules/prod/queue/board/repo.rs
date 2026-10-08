@@ -11,6 +11,10 @@
 //! 1. **SQL 写成模块级 `const SQL_*` 字面量，不做字符串拼接。** 拼列名/拼条件会
 //!    开注入面，也让 SQL 文本不再可被静态检查。两种口径（如 planned / system）
 //!    就写两段完整字面量。
+//!    **唯一例外**：`{has_process_chain}` 占位符填的是
+//!    `shared::batch::chain::HAS_PROCESS_CHAIN_EXPR` 这一个**编译期常量**（4 处
+//!    卡片 DTO 共用同一判据，各自复制表达式文本等于让四处各漂一次），填完走
+//!    `AssertSqlSafe`。注入面为 0：用户输入一律走 bind。
 //! 2. **SQL 条数固定，与工人数 / 批次数无关。** 逐工人循环查是本文件要消灭的
 //!    东西（`GET /queue/state` 时代前端要发 N+1 个请求）。每个方法的 doc 写明
 //!    「固定 N 条」。
@@ -28,8 +32,9 @@
 //! 全部在本域 SQL 内聚合。护栏见 `super::mod` 的
 //! `board_aggregation_depends_on_no_other_domain` 单测。
 
-use sqlx::{PgConnection, Row};
+use sqlx::{AssertSqlSafe, PgConnection, Row};
 
+use crate::shared::batch::chain::HAS_PROCESS_CHAIN_EXPR;
 use crate::shared::error::{AppError, code};
 
 // ---------------------------------------------------------------------------
@@ -125,12 +130,15 @@ const SQL_HELD_BATCHES_BY_WORKERS: &str = "SELECT pb.id AS batch_id, \
      EXISTS (SELECT 1 FROM t_part_file pf \
              WHERE pf.part_id = pb.part_id \
                AND pf.kind = 'G_CODE' \
-               AND pf.deleted_at IS NULL) AS has_cnc_program \
+               AND pf.deleted_at IS NULL) AS has_cnc_program, \
+     {has_process_chain} AS has_process_chain \
      FROM t_part_batch pb \
      JOIN t_part p ON p.id = pb.part_id AND p.deleted_at IS NULL \
      LEFT JOIN t_customer c2 ON c2.id = p.customer_id AND c2.deleted_at IS NULL \
      LEFT JOIN t_customer c1 ON c1.id = c2.parent_id AND c1.deleted_at IS NULL \
      LEFT JOIN t_applicant a ON a.name = p.applicant_name AND a.deleted_at IS NULL \
+     LEFT JOIN t_process_chain_step cs \
+       ON cs.id = pb.current_process_step_id AND cs.deleted_at IS NULL \
      WHERE pb.status = 'IN_PROCESS' \
        AND pb.location = 'WORKER' \
        AND pb.current_holder_id = ANY($1::bigint[]) \
@@ -138,6 +146,11 @@ const SQL_HELD_BATCHES_BY_WORKERS: &str = "SELECT pb.id AS batch_id, \
      ORDER BY pb.current_holder_id ASC, pb.id ASC";
 
 /// `board_process_detail` SQL 4：该工序候选池（跨所有生产货架）。
+///
+/// `has_process_chain` 由 `shared::batch::chain::HAS_PROCESS_CHAIN_EXPR` 提供，
+/// 判据与理由（含「必须 `IS NOT NULL AND =` 而不是 `IS NOT DISTINCT FROM`」）见
+/// 该常量。`t_process_chain_step cs` 走 **LEFT JOIN** —— 无 step 的批次（PENDING /
+/// 指针为空）必须照样出现在列表里。
 const SQL_POOL_ITEMS_BY_PROCESS: &str = "SELECT pb.id AS batch_id, \
      pb.part_id AS part_id, \
      pb.batch_no AS batch_no, \
@@ -159,13 +172,16 @@ const SQL_POOL_ITEMS_BY_PROCESS: &str = "SELECT pb.id AS batch_id, \
      EXISTS (SELECT 1 FROM t_part_file pf \
              WHERE pf.part_id = pb.part_id \
                AND pf.kind = 'G_CODE' \
-               AND pf.deleted_at IS NULL) AS has_cnc_program \
+               AND pf.deleted_at IS NULL) AS has_cnc_program, \
+     {has_process_chain} AS has_process_chain \
      FROM t_part_batch pb \
      JOIN t_part p ON p.id = pb.part_id AND p.deleted_at IS NULL \
      LEFT JOIN t_customer c2 ON c2.id = p.customer_id AND c2.deleted_at IS NULL \
      LEFT JOIN t_customer c1 ON c1.id = c2.parent_id AND c1.deleted_at IS NULL \
      LEFT JOIN t_applicant a ON a.name = p.applicant_name AND a.deleted_at IS NULL \
      JOIN t_shelf s ON s.id = pb.current_holder_id AND s.deleted_at IS NULL \
+     LEFT JOIN t_process_chain_step cs \
+       ON cs.id = pb.current_process_step_id AND cs.deleted_at IS NULL \
      WHERE pb.status = 'IN_PROCESS' \
        AND pb.location = 'PRODUCTION_SHELF' \
        AND pb.current_process_id = $1 \
@@ -224,6 +240,9 @@ pub struct HeldBatchRow {
     pub parent_customer_name: Option<String>,
     pub applicant_name: Option<String>,
     pub has_cnc_program: bool,
+    /// 工单已绑工序链且批次当前工序能在链内定位（判据见
+    /// `shared::batch::chain::HAS_PROCESS_CHAIN_EXPR`）。前端用它决定卡片的绿色边框。
+    pub has_process_chain: bool,
 }
 
 /// 候选池行（`board_process_detail` SQL 4）。
@@ -246,6 +265,9 @@ pub struct PoolItemRow {
     pub shelf_code: String,
     pub shelf_name: String,
     pub has_cnc_program: bool,
+    /// 同 [`HeldBatchRow::has_process_chain`]（同一个常量；该判据与写侧闸门的分叉形态
+    /// 见 `HAS_PROCESS_CHAIN_EXPR` 的 doc）。
+    pub has_process_chain: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -372,7 +394,13 @@ impl QueueBoardRepo {
             Vec::new()
         } else {
             let ids: Vec<i64> = workers.iter().map(|w| w.worker_id).collect();
-            sqlx::query(SQL_HELD_BATCHES_BY_WORKERS)
+            // ⚠️ `{has_process_chain}` 填的是**编译期常量** `HAS_PROCESS_CHAIN_EXPR`，
+            // 用户输入（`ids` / `process_id`）一律走 bind ⇒ 注入面为 0，
+            // `AssertSqlSafe` 包裹安全（口径同 `outsource::board::repo`）。
+            let sql = AssertSqlSafe(
+                SQL_HELD_BATCHES_BY_WORKERS.replace("{has_process_chain}", HAS_PROCESS_CHAIN_EXPR),
+            );
+            sqlx::query(sql)
                 .bind(&ids)
                 .fetch_all(&mut *conn)
                 .await?
@@ -381,8 +409,11 @@ impl QueueBoardRepo {
                 .collect()
         };
 
-        // 4. 候选池
-        let items: Vec<PoolItemRow> = sqlx::query(SQL_POOL_ITEMS_BY_PROCESS)
+        // 4. 候选池（同上：只拼编译期常量）
+        let sql = AssertSqlSafe(
+            SQL_POOL_ITEMS_BY_PROCESS.replace("{has_process_chain}", HAS_PROCESS_CHAIN_EXPR),
+        );
+        let items: Vec<PoolItemRow> = sqlx::query(sql)
             .bind(process_id)
             .fetch_all(&mut *conn)
             .await?
@@ -437,6 +468,7 @@ fn row_to_held_batch(r: sqlx::postgres::PgRow) -> HeldBatchRow {
         parent_customer_name: r.get("parent_customer_name"),
         applicant_name: r.get("applicant_name"),
         has_cnc_program: r.get("has_cnc_program"),
+        has_process_chain: r.get("has_process_chain"),
     }
 }
 
@@ -467,5 +499,6 @@ fn row_to_pool_item(r: sqlx::postgres::PgRow) -> PoolItemRow {
         shelf_code: r.get("shelf_code"),
         shelf_name: r.get("shelf_name"),
         has_cnc_program: r.get("has_cnc_program"),
+        has_process_chain: r.get("has_process_chain"),
     }
 }

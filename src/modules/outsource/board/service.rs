@@ -188,6 +188,7 @@ fn to_candidate(r: CandidateRow) -> OutsourceQueueCandidate {
         company_options,
         price: r.price,
         has_cnc_program: r.has_cnc_program,
+        has_process_chain: r.has_process_chain,
     }
 }
 

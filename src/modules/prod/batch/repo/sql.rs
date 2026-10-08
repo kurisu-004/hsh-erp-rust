@@ -45,6 +45,30 @@ use crate::shared::batch::status as batch_status;
 use crate::shared::batch::status::StatusChange;
 use crate::shared::error::AppError;
 
+/// `mark_batch_returned` 的单行 UPDATE（2026-10-09 从函数体内抽出）。
+///
+/// 抽成模块级 const 只为一件事：让本文件末尾 `sql_placeholder_guard_tests` 能扫
+/// 它的文本，断言「SQL 里出现的最大 `$n` == bind 个数且 `1..=N` 无空洞」。
+/// 2026-10-09 本次改动就往这条 SQL 里插入了一个新占位符 `$5`（step 指针）并把
+/// `advance_to_process_id` 顺延成 `$6` —— 这类「插入中间参数」的改动人眼极易漏改
+/// 某一处 `.bind()` 的注释或顺序，而漏了之后 PG 在 **Bind 阶段**才报错，且 sqlx
+/// 的 statement cache 被污染 ⇒ 同连接上后续**所有**查询跟着一起炸，报错点离真凶
+/// 十万八千里。护栏口径与 `shared::batch::status` 的
+/// `bind_placeholders_are_contiguous` 逐条相同（同一件事钉两次）。
+const MARK_BATCH_RETURNED_SQL: &str = r#"
+    UPDATE t_part_batch
+       SET current_holder_id       = $3,
+           location                = 'PRODUCTION_SHELF',
+           current_process_id      = COALESCE($6::bigint, current_process_id),
+           current_process_step_id = COALESCE($5::bigint, current_process_step_id),
+           version                 = version + 1,
+           updated_at              = now(),
+           updated_by              = $4
+     WHERE id = $1 AND version = $2
+       AND status = 'IN_PROCESS' AND location = 'WORKER'
+       AND deleted_at IS NULL
+    "#;
+
 impl PartBatchRepo {
     /// 定位 INSPECTION 状态批次。
     ///
@@ -357,8 +381,9 @@ impl PartBatchRepo {
     /// status/location」的查询都会把送检批次错当池内批次捞出来。
     ///
     /// 关于 `current_process_step_id`：**本函数仍不写它**（沿用 2026-09-16 PR-3
-    /// 行为）。原先的注释理由是「保留被打回的那一步，让 INSPECTION→to_process
-    /// 时不丢 step 上下文」—— 该理由在 step 降级为**可选的显示用定位信息**后已不成立：
+    /// 行为）—— `clear_process_step_id: false` 使 SQL 的 `COALESCE(.., 原值)`
+    /// 保留原指针。原先的注释理由是「保留被打回的那一步，让 INSPECTION→to_process
+    /// 时不丢 step 上下文」—— 该理由在 step 定位改由各写入口负责后已不成立：
     /// `mark_batch_failed_inspection`（检验不合格打回生产架）会按
     /// `chain_id + next_process_id` **重新解析** step_id 写入
     /// （`inspection_core.rs::to_process`），所以上下文不会真的丢。
@@ -366,10 +391,15 @@ impl PartBatchRepo {
     /// 现在保留 step 的实际价值：它是 `GET /prod/batches/repair` / `repairing`
     /// 两张 VO 的 `next_process_id` / `next_process_name` 的**唯一数据来源**
     /// （step JOIN 派生）。待品检队列读（`GET /prod/inspection/queue`）自 2026-10-03
-    /// 起**不投影**这两列，与本列无关。属**显示用信息**，不是状态机依赖。
-    /// ⚠️ 措辞订正（2026-09-30 review 第 3 轮附带发现）：**不是**「当前走到第
-    /// 几步」—— 本列只在首次定位工序时写、之后一律不再推进（worker-scan
-    /// RETURNED / INSPECTED 都不写），对多工序链工单永远停在首次定位那一步。
+    /// 起**不投影**这两列，与本列无关。它同时是链内**位置指针** —— worker-scan
+    /// RETURNED 的「能否免填 `next_process_id`」闸门
+    /// （`ChainPosition::is_pointer_consistent`）读它；但 `status` 列的状态流转
+    /// 不读它，故不是状态机依赖。
+    ///
+    /// ⚠️ 措辞订正（2026-09-30 review 第 3 轮附带发现，2026-10-09 review 第 2 轮
+    /// 续订）：本列**随工序推进**（dispatch 落链首 step、worker-scan RETURNED 顺
+    /// 工序推进），**不是**「只写一次就停住」；本函数「不写」是**保持原值**（送检
+    /// 不改工序归属），不代表该列不推进。
     pub async fn mark_batch_inspected(
         conn: &mut PgConnection,
         batch_id: i64,
@@ -385,9 +415,10 @@ impl PartBatchRepo {
                 new_location: Some("INSPECTION_SHELF"),
                 new_holder_id: Some(shelf_id),
                 new_process_id: None,
-                // 2026-09-16 PR-3：to_inspection 保留 current_process_step_id，
-                //   但其定位已降级为「可选的显示用定位信息」（首次定位后不再推进）；
-                //   to_process 会重新解析 step 写入，故此处不写不丢状态机上下文。
+                // 2026-09-16 PR-3：to_inspection 保留 current_process_step_id ——
+                //   本列是链内位置指针、随工序推进（dispatch / worker-scan
+                //   RETURNED 写），送检不改工序归属故保留原值；to_process 会按
+                //   新工序重新解析 step 写入。
                 new_process_step_id: None,
                 is_repairing: None,
                 expected_version: Some(expected_version),
@@ -418,7 +449,8 @@ impl PartBatchRepo {
     ///
     /// 2026-09-30 新增 `current_process_id: Option<i64>`：检验不合格打回生产架
     /// = **进池**，故写入目标工序（池归属权威依据）；`current_process_step_id`
-    /// 仍是可选的显示用定位信息（首次定位后不再推进），允许 NULL。
+    /// 是可选的**链内位置指针**（随工序推进、允许 NULL），其值由 caller 在本函数
+    /// 之前按新工序解析后传入。
     ///
     /// ## `is_repairing: None`（保持）的合法性前提（2026-10-01 review 第 2 轮 MAJOR-3）
     ///
@@ -521,8 +553,20 @@ impl PartBatchRepo {
     ///
     /// - 移除 `current_process_step_id` SET 子句；admin 主动退回只是把 holder
     ///   切回 pool，不推进工序链。
-    /// - 形参 `current_process_step_id` 保留 `_` 前缀 —— **它被丢弃**（根本没进
-    ///   `query!` 的 bind 列表）。详见下面「已知缺口」段。
+    /// - 形参 `current_process_step_id` 曾被改名 `_current_process_step_id` ——
+    ///   **它被丢弃**（根本没进 bind 列表）。
+    ///
+    /// ## 2026-10-09 恢复写 step（推翻 2026-09-30 的「RETURNED 不推进」）
+    ///
+    /// 该列现在**随工序推进**：`current_process_step_id` 由
+    /// `COALESCE($5::bigint, current_process_step_id)` 条件写入，与
+    /// `current_process_id` 的 `COALESCE($6::bigint, current_process_id)` 同形。
+    /// 两者成对推进 ⇒ 批次在链内的位置指针与池归属**恒同步**。
+    ///
+    /// 旧设计（2026-09-30 ~ 2026-10-08）把本列当「一次性定位 + 可选重定位」的
+    /// 显示信息：worker-scan 算出了下一个 step 却传给一个被丢弃的形参，于是凡走过
+    /// 一次领取 / 放回的批次指针恒为 NULL，「当前所处工序是否与链指针一致」判不出来。
+    /// 现已由 dispatch（落链首 step）+ RETURNED（顺工序推进）两条写点补齐。
     ///
     /// ## 2026-09-30（review 第 1 轮 H1 修复）新增 `advance_to_process_id`
     ///
@@ -531,13 +575,12 @@ impl PartBatchRepo {
     ///
     /// | 调用方 | 语义 | `advance_to_process_id` |
     /// |---|---|---|
-    /// | `worker_scan.rs::worker_scan` RETURNED | **推进工序**：工人在 P1 完工、扫 RETURNED 传 `next_process_id=P2`，批次应落进 **P2** 池 | `Some(P2)` |
+    /// | `worker_scan.rs::worker_scan_event` RETURNED | **推进工序**：工人在 P1 完工、扫 RETURNED 后批次应落进 **P2** 池 | `Some(P2)` |
     /// | `prod/queue/service.rs::move_batch` WORKER→POOL | **池内移动**：工种不变，批次归还货架后仍属原工序候选池 | `None` |
     ///
     /// 修复前 RETURNED 路径不写该列 → 批次带着 `current_process_id=P1` 归还货架
     /// → 落回 **P1** 池而非 P2 池。这正是 migration 004 要确立的「唯一权威依据」
-    /// 在主干流程（完工归还）上说谎；且本次修复打破了「要推进 step 先进池、要进池
-    /// 先有 step」的死锁后，RETURNED 从不可达变为可达，该路径的问题会立刻暴露。
+    /// 在主干流程（完工归还）上说谎。
     ///
     /// **采用 `None` = 不改（COALESCE）而非拆两个函数**，理由：
     /// 1. WHERE 守卫（`status='IN_PROCESS' AND location='WORKER'` + OCC
@@ -551,59 +594,45 @@ impl PartBatchRepo {
     /// NULL」。本函数没有任何调用方需要「清空」—— 清空属于出池，走
     /// `mark_batch_with_status_and_meta`（漏斗）或 `mark_batch_inspected`。
     ///
-    /// ## 已知缺口（2026-09-30 记录，本轮不扩 scope）
+    /// ## ⚠️ 推进**不是**无条件的：admin 主动退回刻意不推进
+    /// `prod::queue::move` 的 WORKER→POOL 分支调本函数并**传 `step = None`** ⇒
+    /// `COALESCE(NULL, 原值)` = 保持原值，与改造前逐字一致。语义是「退回不改工序
+    /// 归属」（池内移动，工种不变），**不是**「退回就退回上一步」。将来若有人把
+    /// 这个调用点的 step 也填上，会让管理员的一次拖拽把批次推进到下一道工序 ——
+    /// 那是一条无意的工序推进，且没有任何界面在提示。
     ///
-    /// `current_process_step_id`（可选的显示用定位信息）**在 RETURNED 时不推进**：
-    /// `prod::batch::service::worker_scan::worker_scan_event` 已经把
-    /// `chain_id + next_pid` 解析成 `step_id_opt`，
-    /// 却传给一个被丢弃的形参。
-    /// 影响面仅限显示：池归属已由 `current_process_id` 承担且本函数已正确写入。
-    /// 待后续单独一轮处理（届时 `mark_batch_returned` 需要按调用方决定是否写
-    /// step，语义与 `advance_to_process_id` 同形）。
+    /// ## 2026-10-09：SQL 抽成模块级 const + 运行时 `query`
     ///
-    /// ⚠️ 措辞订正（2026-09-30 review 第 3 轮附带发现）：本列**不是会随流转推进的
-    /// 「进度指针」**，它只在**首次定位**工序时被写入（dispatch 刻意写 NULL；其余
-    /// 由 place_on_shelf / release_from_programming / outsource 收发 /
-    /// complete_repair / to_process 写），**之后一律不再推进**。对多工序链工单它
-    /// 永远停在首次定位那一步。修这一缺口时应把它当「一次性定位 + 可选重定位」看，
-    /// 而不是「每流转一步就前进一步」。
+    /// 与 `shared::batch::status::BATCH_STATUS_UPDATE_SQL` 同款做法，目的只有一个：
+    /// 让 `bind_placeholders_are_contiguous` 单测能扫这条 SQL 的文本，断言「最大
+    /// `$n` == bind 个数且 `1..=N` 无空洞」。占位符编号与 `.bind()` 顺序成对是本仓
+    /// 踩过两次的坑（PG 在 Bind 阶段报
+    /// `bind message supplies N parameters, but prepared statement requires M`，
+    /// 且 sqlx 的 statement cache 被污染，同连接后续所有查询一起炸）。
+    ///
+    /// 由 `query!` 宏改为运行时 `query` 的代价是丢掉编译期列 / 参数类型校验；本函数
+    /// 只返回 `rows_affected()`、不取任何行，那份校验没有产出可消费，故可以放弃。
     pub async fn mark_batch_returned<'e, E: PgExecutor<'e>>(
         executor: E,
         batch_id: i64,
         expected_version: i32,
         shelf_id: i64,
-        _current_process_step_id: Option<i64>,
+        current_process_step_id: Option<i64>,
         advance_to_process_id: Option<i64>,
         current_user_id: Option<i64>,
     ) -> Result<u64, sqlx::Error> {
-        let result = sqlx::query!(
-            r#"
-            UPDATE t_part_batch
-            SET current_holder_id       = $3,
-                location                = 'PRODUCTION_SHELF',
-                -- 2026-09-30（review H1）：条件写入 —— Some(目标 process_id) 推进
-                --   工序（worker-scan RETURNED，批次落进下一道工序的候选池）；
-                --   None 表示「不推进」（prod/pool move 池内移动，工序不变）。
-                --   用 COALESCE 而非直接 `= $5`，是因为直接赋值会在 move 路径
-                --   把 current_process_id 抹成 NULL（那会让归还的批次对所有池隐身）。
-                current_process_id      = COALESCE($5::bigint, current_process_id),
-                -- 2026-09-30：current_process_step_id 仍不写（可选的显示用定位信息，
-                --   RETURNED 不推进是已知缺口，见函数 doc「已知缺口」段）
-                version                 = version + 1,
-                updated_at              = now(),
-                updated_by              = $4
-            WHERE id = $1 AND version = $2
-              AND status = 'IN_PROCESS' AND location = 'WORKER'
-              AND deleted_at IS NULL
-            "#,
-            batch_id,
-            expected_version,
-            shelf_id,
-            current_user_id as Option<i64>,
-            advance_to_process_id,
-        )
-        .execute(executor)
-        .await?;
+        let result = sqlx::query(MARK_BATCH_RETURNED_SQL)
+            .bind(batch_id) // $1
+            .bind(expected_version) // $2
+            .bind(shelf_id) // $3
+            .bind(current_user_id as Option<i64>) // $4
+            // $5：链内位置指针。Some(链上某一步) 随工序推进；None = 不动
+            // （admin 主动退回 / 无链回落），COALESCE 保留原值。
+            .bind(current_process_step_id)
+            // $6：池归属权威列。Some(目标 process_id) 推进工序；None = 不动。
+            .bind(advance_to_process_id)
+            .execute(executor)
+            .await?;
         Ok(result.rows_affected())
     }
 
@@ -1067,5 +1096,75 @@ impl PartBatchRepo {
         )
         .await?;
         Ok(out.affected_rows)
+    }
+}
+
+/// `mark_batch_returned` 的**源码级**护栏：占位符编号与 `.bind()` 个数必须成对。
+///
+/// ## 为什么需要它（2026-10-09）
+/// 本次改动往这条 SQL 中间插入了一个新占位符（step 指针 `$5`）并把
+/// `advance_to_process_id` 顺延成 `$6`。这类「在中间插参数」的改法，人眼漏掉
+/// 某一处 `.bind()` 顺序或注释的概率很高，而漏了之后**编译期完全静默**（运行时
+/// `query` 不校验参数个数），PG 在 Bind 阶段才报
+/// `bind message supplies 5 parameters, but prepared statement ... requires 6`，
+/// 且 sqlx 的 statement cache 被污染 ⇒ 同连接上后续**所有**查询跟着一起失败，
+/// 报错点离真凶十万八千里。
+///
+/// 口径与 `shared::batch::status::bind_placeholders_are_contiguous` 逐条相同
+/// （同一件事钉两次：那边钉的是全仓唯一的状态写入口，这条钉的是唯一绕过它、
+/// 直接 UPDATE `t_part_batch` 的归还写点）。
+///
+/// 判据只用文本，不用 DB：单测跑在 fresh database 上，而「bind 少了两个」这类
+/// 错误在**任何**输入下都必现（PG 拒绝的是 Parse/Bind 阶段的参数个数，不是数据），
+/// 故文本断言足够且确定。
+#[cfg(test)]
+mod sql_placeholder_guard_tests {
+    use super::MARK_BATCH_RETURNED_SQL;
+
+    /// 与 `.bind()` 链的个数严格相等（改 SQL 加占位符时**必须**同步改这里）。
+    const BIND_COUNT: usize = 6;
+
+    /// 取 SQL 文本里出现的最大 `$n`（`$10` 要按 10 解析，故不能按「`$` 后两位」切）。
+    fn max_placeholder(sql: &str) -> usize {
+        sql.split('$')
+            .skip(1)
+            .filter_map(|tail| {
+                let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+                digits.parse::<usize>().ok()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn mark_batch_returned_placeholders_match_bind_count() {
+        let max = max_placeholder(MARK_BATCH_RETURNED_SQL);
+        assert_eq!(
+            max, BIND_COUNT,
+            "mark_batch_returned：SQL 最大占位符 ${max}，但 bind 了 {BIND_COUNT} 个 —— \
+             PG 会在 Bind 阶段报 `bind message supplies N parameters, but prepared \
+             statement requires M`，且 sqlx 的 statement cache 被污染，同连接后续所有 \
+             查询一起失败。请同步改 SQL 占位符与 `.bind()` 链（每个 `.bind()` 后已标注 \
+             它对应哪个 $n），并同步 BIND_COUNT。"
+        );
+        // 1..=N 每个占位符都必须真的被用到（跳号会让 bind 顺序错位）
+        for n in 1..=max {
+            assert!(
+                MARK_BATCH_RETURNED_SQL.contains(&format!("${n}")),
+                "占位符 ${n} 在 SQL 里没有出现（跳号会让 bind 顺序错位）"
+            );
+        }
+        // 语义钉子：两列**都是** COALESCE（None = 不推进，不是清 NULL）。
+        // 把其中一列改成直写 `= $n::bigint`，admin 主动退回路径（move WORKER→POOL
+        // 传 None）会把该列抹成 NULL —— 池归属被抹 NULL 会让批次对所有池查询隐身，
+        // 而 step 指针被抹 NULL 只是让「自动推进」退回要手填。
+        assert!(
+            MARK_BATCH_RETURNED_SQL.contains("COALESCE($5::bigint, current_process_step_id)"),
+            "current_process_step_id 必须是条件写入（COALESCE），None 表示「不推进」"
+        );
+        assert!(
+            MARK_BATCH_RETURNED_SQL.contains("COALESCE($6::bigint, current_process_id)"),
+            "current_process_id 必须是条件写入（COALESCE），None 表示「不推进」"
+        );
     }
 }
