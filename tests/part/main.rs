@@ -14,14 +14,17 @@
 //! - inspection_batches.rs ← 原 part_api_inspection_batches.rs
 //! - serial.rs            ← 原 serial_api.rs
 //! - rollup_recompute.rs   ← 2026-10-01 新增：admin 对账端点（POST /admin/recompute-rollup）定点修正 + 幂等断言
-//! - pickable_by_work_type.rs ← 2026-10-03 新增：`GET /parts/pickable-by-work-type/{id}`
-//!   出参 `batch_id` / `batch_version` 批次锚点（本端点此前零覆盖）
 //! - create_serial_price.rs ← 2026-10-05 新增：建单期序列号派发（`POST /parts` /
 //!   `POST /parts/batch` / `POST /parts/batch-with-pdfs`）+ `unit_price` /
 //!   `total_price` 入参落库
 //! - purchase_order_import.rs ← 2026-10-06 新增：采购订单 Excel 导入两端点
 //!   （`POST /parts/match-by-excel-items` 分档匹配 + `POST /parts/batch-update-order-info`
 //!   三态回填 / skip）；此前这两条端点零覆盖
+//!
+//! 2026-10-10：报工台两条 list 端点（`GET /parts/pickable-by-work-type/{id}` /
+//! `GET /parts/by-worker/{id}`）随端点迁往 `prod::scan`，其测试文件随之迁往
+//! `tests/production/scan_listing.rs`。留在本 binary 的 `lifecycle.rs` 覆盖
+//! `GET /parts/by-work-type/{id}`（本域唯一剩下的工种维度 list 端点）。
 
 #![allow(dead_code, clippy::await_holding_lock, unused_imports)]
 
@@ -35,7 +38,6 @@ mod file;
 mod inspection_batches;
 mod lifecycle;
 mod list_enrichment;
-mod pickable_by_work_type;
 // 2026-10-06 新增：采购订单 Excel 导入（match-by-excel-items + batch-update-order-info）
 mod purchase_order_import;
 mod repair;

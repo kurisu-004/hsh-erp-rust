@@ -1,6 +1,8 @@
-//! prod::batch pick-up 端点集成测试（2026-10-03 新增）
+//! prod::scan pick-up 端点集成测试（2026-10-03 新增于 prod::batch，2026-10-10 随端点迁入）
 //!
-//! 覆盖 `POST /api/v2/prod/batches/{batch_id}/pick-up` 的整批领取与**部分领取**
+//! 覆盖 `POST /api/v2/prod/scan/batches/{batch_id}/pick-up` 的整批领取与**部分领取**
+//! （旧路径 `POST /api/v2/prod/batches/{batch_id}/pick-up` 已下线、无 alias；
+//! 响应体 `R<PartOut>` 与 WS 事件名 `PART_PICKED_UP` / `PART_BATCH_SPLIT` 逐字不变）
 //! （`quantity` 缺省 = 整批；`0 < quantity < batch.quantity` 时 service 自动拆批，
 //! 把拆出来的那部分交给工人，源批次留在生产架上、数量递减）：
 //!   1. 整批领取（不传 quantity）→ 200；批次 location=WORKER、holder=worker、数量不变
@@ -284,7 +286,7 @@ async fn pick_up_without_quantity_picks_whole_batch() {
         ctx.app.clone(),
         json_request(
             "POST",
-            &format!("/prod/batches/{batch_id}/pick-up"),
+            &format!("/prod/scan/batches/{batch_id}/pick-up"),
             Some(json!({
                 "version": 0,
                 "worker_id": worker_id.to_string(),
@@ -353,7 +355,7 @@ async fn pick_up_partial_splits_batch_and_delivers_new_batch() {
         ctx.app.clone(),
         json_request(
             "POST",
-            &format!("/prod/batches/{batch_id}/pick-up"),
+            &format!("/prod/scan/batches/{batch_id}/pick-up"),
             Some(json!({
                 "version": 0,
                 "worker_id": worker_id.to_string(),
@@ -476,7 +478,7 @@ async fn pick_up_partial_from_pending_batch_succeeds() {
         ctx.app.clone(),
         json_request(
             "POST",
-            &format!("/prod/batches/{batch_id}/pick-up"),
+            &format!("/prod/scan/batches/{batch_id}/pick-up"),
             Some(json!({
                 "version": 0,
                 "worker_id": worker_id.to_string(),
@@ -527,7 +529,7 @@ async fn pick_up_quantity_over_batch_quantity_returns_invalid_quantity() {
         ctx.app.clone(),
         json_request(
             "POST",
-            &format!("/prod/batches/{batch_id}/pick-up"),
+            &format!("/prod/scan/batches/{batch_id}/pick-up"),
             Some(json!({
                 "version": 0,
                 "worker_id": worker_id.to_string(),
@@ -564,7 +566,7 @@ async fn pick_up_non_positive_quantity_returns_invalid_quantity() {
             ctx.app.clone(),
             json_request(
                 "POST",
-                &format!("/prod/batches/{batch_id}/pick-up"),
+                &format!("/prod/scan/batches/{batch_id}/pick-up"),
                 Some(json!({
                     "version": 0,
                     "worker_id": worker_id.to_string(),
@@ -585,7 +587,7 @@ async fn pick_up_non_positive_quantity_returns_invalid_quantity() {
 
 /// 场景 5: `quantity == batch.quantity` → **合法**，等同整批领取
 ///
-/// 这是与 `POST /api/v2/prod/batches/{batch_id}/split`（要求严格小于）的语义
+/// 这是与 `POST /api/v2/prod/scan/batches/{batch_id}/split`（要求严格小于）的语义
 /// 差异：pick-up 里「等于」就是整批领取的显式写法，无需拆批，故不应报
 /// 20111、也不应产生第二个批次。
 #[tokio::test]
@@ -600,7 +602,7 @@ async fn pick_up_quantity_equal_batch_quantity_is_whole_batch() {
         ctx.app.clone(),
         json_request(
             "POST",
-            &format!("/prod/batches/{batch_id}/pick-up"),
+            &format!("/prod/scan/batches/{batch_id}/pick-up"),
             Some(json!({
                 "version": 0,
                 "worker_id": worker_id.to_string(),
@@ -649,7 +651,7 @@ async fn pick_up_version_conflict_leaves_no_split_residue() {
         ctx.app.clone(),
         json_request(
             "POST",
-            &format!("/prod/batches/{batch_id}/pick-up"),
+            &format!("/prod/scan/batches/{batch_id}/pick-up"),
             Some(json!({
                 "version": 0,
                 "worker_id": worker_id.to_string(),
@@ -686,7 +688,7 @@ async fn pick_up_allowed_for_shelf_account() {
         ctx.app.clone(),
         json_request(
             "POST",
-            &format!("/prod/batches/{batch_id}/pick-up"),
+            &format!("/prod/scan/batches/{batch_id}/pick-up"),
             Some(json!({
                 "version": 0,
                 "worker_id": worker_id.to_string(),
@@ -730,7 +732,7 @@ async fn pick_up_forbidden_for_inspector() {
         ctx.app.clone(),
         json_request(
             "POST",
-            &format!("/prod/batches/{batch_id}/pick-up"),
+            &format!("/prod/scan/batches/{batch_id}/pick-up"),
             Some(json!({
                 "version": 0,
                 "worker_id": worker_id.to_string(),
@@ -772,7 +774,7 @@ async fn pick_up_without_shelf_id_succeeds() {
         ctx.app.clone(),
         json_request(
             "POST",
-            &format!("/prod/batches/{batch_id}/pick-up"),
+            &format!("/prod/scan/batches/{batch_id}/pick-up"),
             // ⚠️ body 里**没有** shelf_id 这个 key（不是 null）
             Some(json!({
                 "version": 0,
@@ -835,7 +837,7 @@ async fn pick_up_partial_without_shelf_id_succeeds() {
         ctx.app.clone(),
         json_request(
             "POST",
-            &format!("/prod/batches/{batch_id}/pick-up"),
+            &format!("/prod/scan/batches/{batch_id}/pick-up"),
             Some(json!({
                 "version": 0,
                 "worker_id": worker_id.to_string(),
@@ -928,7 +930,7 @@ async fn pick_up_invalid_shelf_id_still_rejected() {
             ctx.app.clone(),
             json_request(
                 "POST",
-                &format!("/prod/batches/{batch_id}/pick-up"),
+                &format!("/prod/scan/batches/{batch_id}/pick-up"),
                 Some(json!({
                     "version": 0,
                     "worker_id": worker_id.to_string(),
@@ -997,7 +999,7 @@ async fn pick_up_shelf_id_as_json_number_is_rejected() {
         .clone()
         .oneshot(json_request(
             "POST",
-            &format!("/prod/batches/{batch_id}/pick-up"),
+            &format!("/prod/scan/batches/{batch_id}/pick-up"),
             Some(json!({
                 "version": 0,
                 "worker_id": worker_id.to_string(),
@@ -1051,7 +1053,7 @@ async fn pick_up_null_shelf_id_is_treated_as_absent() {
         ctx.app.clone(),
         json_request(
             "POST",
-            &format!("/prod/batches/{batch_id}/pick-up"),
+            &format!("/prod/scan/batches/{batch_id}/pick-up"),
             Some(json!({
                 "version": 0,
                 "worker_id": worker_id.to_string(),
@@ -1113,7 +1115,7 @@ async fn pick_up_missing_required_fields_still_422() {
             .clone()
             .oneshot(json_request(
                 "POST",
-                &format!("/prod/batches/{batch_id}/pick-up"),
+                &format!("/prod/scan/batches/{batch_id}/pick-up"),
                 Some(body),
                 Some(&ctx.manager),
             ))
