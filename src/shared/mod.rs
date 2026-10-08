@@ -8,7 +8,7 @@ pub mod analytics;
 // status 写入口 / 7 个守卫）。**边界记档**：`shared::batch` 是本仓唯一经域 repo
 // **写**库的 shared 模块（`PartRepo::update_part_rollup` /
 // `PartRepo::insert_part_event` / `AssemblyService::sync_assembly_status`），也是
-// 唯一依赖 **4 个域** 的 shared 模块（写 part / assembly，读 shelf /
+// 唯一依赖 **4 个域** 的 shared 模块（写 part / assembly，读 iam /
 // prod::process_chain）。成因是 CLAUDE.md「状态派生契约」三层派生图
 // （t_part_batch.status → t_part.status/next_process_id → t_assembly.status）
 // 的实现本身天然跨域、无域可归属；留在 prod::batch 只会让 part / assembly 反向

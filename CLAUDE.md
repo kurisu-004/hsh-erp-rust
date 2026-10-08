@@ -193,7 +193,7 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 
 - **域外依赖 = 0**（只读 5 表 `t_part` / `t_part_batch` / `t_assembly` / `t_customer` / `t_worker`，只读跨域聚合是本仓既定 pattern，同 `statistics` / `admin`）。
   - **护栏设施**：`src/shared/domain_guard.rs`（`#[cfg(test)]` 项、不进 lib 产物，故**只有 `src/` 内单元测试能用**，`tests/` 集成测试拿不到、要靠它得先改调用方式）的 `assert_no_foreign_domain(本域路径, 本域源码目录, 域专属指引)` —— 在剥掉注释的代码区里找「域根段 + 他域路径」前缀失配；不连网不连库，单测可在无 DB 环境跑。已登记的漏报盲区与精度边界见该文件顶部 doc。
-  - **已接入的五处**：`modules::dashboard::tests::dashboard_domain_depends_on_no_other_domain`（扫 `src/modules/dashboard/**/*.rs`）、`modules::iam::tests::iam_domain_depends_on_no_other_domain`（扫 `src/modules/iam/**/*.rs`，含嵌套子模块 `iam::shelf`；⚠️ iam 是「**纯自有表域**」—— `t_user` / `t_user_role` / `t_menu` / `t_wx_identity` / `t_shelf` 全部归它，不需要 dashboard / statistics 那种「在本域 SQL 里跨域只读聚合」的取舍，故这条护栏只有「不许 import 别人的 service / repo」一重含义）、`modules::prod::programming::tests::programming_domain_depends_on_no_other_domain`、`modules::prod::inspection::tests::inspection_domain_depends_on_no_other_domain`（后两者分别扫 `src/modules/prod/programming/**/*.rs` 与 `src/modules/prod/inspection/**/*.rs`，本域路径为嵌套域 `prod::xxx`，**同父兄弟域 `prod::batch` 同样算跨域**），以及 `modules::prod::queue::board::tests::board_aggregation_depends_on_no_other_domain`（只扫 `src/modules/prod/queue/board/**/*.rs` —— queue 域整体**不适用**该护栏，它的写端点按既定 pattern 经本域 trait 转发其它域单表查询，圈出 board 这块纯聚合 SQL 单独守）。新增只读跨域聚合域时照此加一行调用即可。
+  - **已接入共 5 处 = 整域 4 + 非整域切片 1**（与 `src/shared/domain_guard.rs` 顶部 doc 同一套口径）：整域接入的 4 处是 `modules::dashboard::tests::dashboard_domain_depends_on_no_other_domain`（扫 `src/modules/dashboard/**/*.rs`）、`modules::iam::tests::iam_domain_depends_on_no_other_domain`（扫 `src/modules/iam/**/*.rs`，含嵌套子模块 `iam::shelf`；⚠️ iam 是「**纯自有表域**」—— `t_user` / `t_user_role` / `t_menu` / `t_wx_identity` / `t_shelf` 全部归它，不需要 dashboard / statistics 那种「在本域 SQL 里跨域只读聚合」的取舍，故这条护栏只有「不许 import 别人的 service / repo」一重含义）、`modules::prod::programming::tests::programming_domain_depends_on_no_other_domain`、`modules::prod::inspection::tests::inspection_domain_depends_on_no_other_domain`（后两者分别扫 `src/modules/prod/programming/**/*.rs` 与 `src/modules/prod/inspection/**/*.rs`，本域路径为嵌套域 `prod::xxx`，**同父兄弟域 `prod::batch` 同样算跨域**）；**非整域切片接入**的 1 处是 `modules::prod::queue::board::tests::board_aggregation_depends_on_no_other_domain`（只扫 `src/modules/prod/queue/board/**/*.rs` —— queue 域整体**不适用**该护栏，它的写端点按既定 pattern 经本域 trait 转发其它域单表查询，圈出 board 这块纯聚合 SQL 单独守）。新增只读跨域聚合域时照此加一行调用即可。
   - **元测试**：`shared::domain_guard::tests::*`（6 条，含「本域标识符非法必须 panic」与 raw string 字符串状态两组）。任一写法漏报、误报或探测器瞎了都会红。
 - `DELIVERY_STATUSES`（6 态，`repo/delivery.rs`）是「未交付」的**唯一**判据，逾期计数 / 面板 / 抽屉 / 柱状图 top+middle 四处共用；柱状图 bottom 层额外含 `DELIVERED`。**它与前端 `LAYERS[].statuses` 是人工同步关系，无编译期保障**，改一侧必须改另一侧。
 - ⚠️ **行单位**（2026-10-10）：逾期 = **工单级**；交期面板三桶 = **工单级**（装配件行**替换**其子件行，行内新增 `row_type` 标 PART / ASSEMBLY，装配件的 `quantity` 与 `delivered_quantity` 单位是**套**）；柱状图 / 抽屉 = **件级**（子件各算 1）。
@@ -237,7 +237,7 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
   `iam::shelf::repo::ShelfRepo::get_by_id`（两条 SQL 谓词逐字相同，都只过滤
   `deleted_at`、不过滤 `is_active`，差别只在列集）。`t_shelf` 全仓只有一份行结构与
   一份 SQL 真源。
-- **端点数不变**：iam 域 17 → **22**（+5），`/api/v2` 顶层少一个 `/shelves` nest。
+- **端点数**：货架子模块自身仍是 5 条（请求 / 响应契约逐字未变），但挂载后 iam 域合计 17 → **22**（+5）；`/api/v2` 顶层少一个 `/shelves` nest。
 - 测试 binary `shelf` **取消**：`tests/shelf/{main,api,deactivate}.rs` 并入
   `tests/iam/`，用例改名 `shelf.rs` / `shelf_deactivate.rs`（与「一域一份测试 binary」
   的归属一致）。
@@ -374,7 +374,7 @@ t_assembly.status               ← 派生缓存
    }
    ```
 
-   - **仓内多数域用转发式**（`outsource` / `shelf` / `cnc_program` / `part_file` / `assembly` / `statistics` / `delivery_note` / `iam`），少数用 `mod.rs` 内联（`part` / `prod::queue` / `admin`）。转发式是多数形态，新域与重构域一律按转发式。
+   - **仓内多数域用转发式**（`outsource` / `cnc_program` / `part_file` / `assembly` / `statistics` / `delivery_note` / `iam`），少数用 `mod.rs` 内联（`part` / `prod::queue` / `admin`）。转发式是多数形态，新域与重构域一律按转发式。（2026-10-10 订正：原清单里的 `shelf` 已不是一级域 —— 货架子模块于同日迁入 iam，仍是转发式。）
    - **一个前缀一个 router 工厂**。多个独立顶层前缀时用多个 `xxx_router()`（`outsource` 有 4 个），而不是一个工厂返回合并 router —— 合并后 matchit 的注册顺序约束会跨前缀纠缠，排查困难。
    - **`handler.rs` > 600 行或工厂数 > 4 时拆 `handler/<子域>.rs`**，`handler.rs` 退化为聚合器。`prod/queue/handler/`、`prod/batch/handler/` 是范本。
    - **`mod.rs` 的模块 doc 逐条列出端点表与硬切记录**；域改名/URL 硬切必须写「旧路径 404，无 alias」。
@@ -407,20 +407,20 @@ t_assembly.status               ← 派生缓存
 
 ## 集成测试目录结构（2026-09-23 PR13 重构后）
 
-51 个 integration test binary 已重组为 **19 binary**（8 多文件 domain 子目录化 + 11 single-file 保留；**2026-10-10** 原 `shelf` binary 并入 `iam` binary）：
+integration test binary 已重组为 **20 binary**（8 多文件 domain 子目录化 + 12 single-file 保留；**2026-10-10** 原 `shelf` binary 并入 `iam` binary）—— 数字以 `cargo metadata --no-deps` 列出的 test target 为准逐个复核过（2026-10-10）：
 
 | 新结构 | 拆前 binary 数 | 拆后 binary 名（nextest filter） |
 |---|---:|---|
-| `tests/delivery/{main,group,attach_batches,scan,note}.rs` | 5 | `delivery` |
+| `tests/com/{main,union_list,delivery_note_in_use}.rs` | 5 | `com`（送货单域 2026-10-08 平移进 com 容器时目录随之更名 `delivery` → `com`；`group` / `attach_batches` / `scan` 三个 sub-file 已随端点收敛删除）|
 | `tests/part/{main,create_serial_price,batch,crud,file,inspection_batches,lifecycle,list_enrichment,pickable_by_work_type,purchase_order_import,repair,rollup_recompute,serial,to_inspection,to_process,to_ship}.rs` | 12 | `part`（sub-file 穷举，`main.rs` 为 binary 入口。★ `purchase_order_import.rs` 2026-10-06 新增：采购订单 Excel 导入两端点 —— `match-by-excel-items` 分档匹配 + `batch-update-order-info` 三态回填 / skip）|
-| `tests/assembly/{main,api,files,status_sync}.rs` | 3 | `assembly` |
+| `tests/assembly/{main,api,files,files_list,by_part,children,create_serial_price,status_sync}.rs` | 3 | `assembly` |
 | `tests/iam/{main,api,middleware,bootstrap_admin_seed,menu_seed,wx_bind,shelf,shelf_deactivate}.rs` | 2 | `iam`（**2026-10-09**：原 `redis-flush` 串行组已整体删除 —— Redis 隔离改由 key 前缀承担、触发该组的 `clean_redis`（FLUSHDB）已零调用方随函数删除、两个 binary 的并行度已恢复；删除理由留档在 `.config/nextest.toml` 的注释里。**2026-10-10**：`tests/shelf/` 整体并入本 binary，用例改名 `shelf.rs`（← `api.rs`，`api.rs` 同名冲突）/ `shelf_deactivate.rs`（← `deactivate.rs`），与货架子模块迁入 iam 域同批）|
 | `tests/statistics/{main,api,event_driven}.rs` | 2 | `statistics` |
 | `tests/production/{main,work_type,process,process_chain,worker,queue,queue_auto_allocate,queue_dispatch,queue_board,pending_programming,shelf_process,pickup,process_design,inspection}.rs` | 6 | `production`（按 `src/modules/prod/*` 对齐；`shelf_process.rs` 2026-10-02 自当时的 `tests/shelf/api.rs` 迁入；**`process_design.rs` 2026-10-05 新增**，★ 核心回归是「装配件子件可见」；**`inspection.rs` 2026-10-05 新增** 13 场景，★ 核心回归是「扫子件 → 返回整棵装配件树」；**2026-10-08** `worker_pool.rs` → `queue.rs`、`worker_pool_auto_allocate.rs` → `queue_auto_allocate.rs`、`batch.rs` → `queue_dispatch.rs`，并新增 `queue_board.rs`（队列板聚合 9 场景））|
 | `tests/outsource/{main,company,quote,quotable,send_receive,shipment,pool}.rs` | 3 | `outsource` |
 | `tests/user_repo/{main,basic,role,password}.rs` | 1 → 3 sub-file | `user_repo` |
-| 单文件保留：applicant_api / customer_api / _e2e_api / cos_opendal_api / cos_real_smoke / auto_complete_api / dashboard_ws_api / idempotency_api / guard_dn_in_use_api / cnc_program_api | 10 | （各自原 binary 名）|
-| **合计** | 51 → | **19 binary** |
+| 单文件保留：_e2e_api / applicant_api / auto_complete_api / cnc_program_api / cos_opendal_api / cos_real_smoke / customer_api / dashboard_ws_api / files_sts_tmp_keys / idempotency_api / print_forward / wecom_login | 12 | （各自原 binary 名）|
+| **合计** | — | **20 binary**（8 子目录 + 12 单文件；`cargo metadata --no-deps` 实测）|
 
 **关键约定**：
 - cargo 1.98.1 **不识别** `tests/<dir>/mod.rs`，只识别 `tests/<dir>/main.rs`（binary 名 = `<dir>`）。新 domain 一律用 `main.rs`。

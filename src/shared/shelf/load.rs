@@ -78,7 +78,7 @@ pub fn load_ratio(current_load: i64, capacity: Option<i32>) -> Option<f64> {
 /// `QueryBuilder` 动态拼（`code_like` / `zone` / `is_active` 三态过滤），那份
 /// 查询**已经是** `t_shelf` 列表端点的权威口径。把负载 JOIN 进去需要让 shared 层
 /// 接管那份 `QueryBuilder`（连带 `count_with_filters` 的重复 WHERE），代价是本层
-/// 反过来要理解 shelf 域的筛选语义 —— 与「零域依赖」直接冲突。
+/// 反过来要理解货架子模块（`iam::shelf`）的筛选语义 —— 与「零域依赖」直接冲突。
 ///
 /// 代价是一次额外往返 + 一个 `id → (capacity, load)` 的 join，这在列表页（几十行）
 /// 上可忽略，而口径单一（`LOAD_AGGREGATE_SQL` 唯一）得到的收益是永久的。

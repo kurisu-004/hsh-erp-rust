@@ -51,7 +51,7 @@
 //! ## automock
 //! `#[cfg_attr(test, mockall::automock)]` 在 trait 上声明，生成 `MockShelfRepoTrait` 供
 //! service 单测注入。本模块当前无内联 mod tests（service 全部走
-//! `tests/shelf/{api,deactivate}.rs` 集成测试守护），故未建 `shelf/service_tests/`
+//! `tests/iam/{shelf,shelf_deactivate}.rs` 集成测试守护），故未建 `shelf/service_tests/`
 //! 目录——按 conventions.md §4.1 含 IO 不强求 100%。
 //! 2026-10-02 核查：全仓 `MockShelfRepoTrait` 引用为**零**（只有本行 doc 提及），
 //! 故本 trait 17 → 10 的收缩不影响任何单测。

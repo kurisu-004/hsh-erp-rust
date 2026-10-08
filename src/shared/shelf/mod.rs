@@ -29,12 +29,16 @@
 //! ## 不放什么
 //!
 //! - 货架 **CRUD**（`t_shelf` 的增删改查、软删、`count_in_use_parts` 引用计数）
-//!   —— 归 `shelf` 域，本层只提供「读负载 + 选架」两项；
+//!   —— 归 iam 域下的货架子模块 `iam::shelf`（2026-10-10 自独立 shelf 域迁入），
+//!   本层只提供「读负载 + 选架」两项；
 //! - 货架 ↔ 工序**映射**的写侧（`t_shelf_process`）—— 归 `prod::shelf_process`
 //!   域。选架的 SQL 自己 `EXISTS` 查那张表（只读，且需要 `deleted_at IS NULL`
 //!   闸门与 `t_shelf` 的可用性谓词在**同一条** SQL 里生效），不 import 该域 repo；
-//! - picker 端点（`GET /shelves/for-return` / `for-inspection`）—— 2026-10-10
-//!   随自动选架一并下线（移除记录见 `docs/api/shelves.md`）。
+//! - picker 端点（`GET /iam/shelves/for-return` / `for-inspection`）—— 2026-10-10
+//!   随自动选架一并下线。⚠️ 两种「下线」形态不同：带 `/iam` 前缀的这条落进
+//!   `/iam/shelves/{id}` 的 `Path<i64>` catch-all ⇒ **400 纯文本**；不带 `/iam`
+//!   前缀的旧路径因整段前缀已从 router 删除 ⇒ **干净 404**。
+//!   移除记录见 `docs/api/shelves.md` §5.1。
 
 pub mod load;
 pub mod pool_priority;
