@@ -126,26 +126,45 @@ pub async fn pick_least_loaded(
 
 /// `CurrentUser` → 选架 scope。
 ///
-/// **逐条对齐** `modules::part::service::phase1::work_type::pickable_shelf_scope`
-/// （那是 `GET /parts/by-work-type/{id}` 读侧筛选货架的同一判据）：
+/// - `shelf_wildcard || has_role(Manager)` → `None`（SQL 不加谓词，全域可见）
+/// - `has_role(ShelfAccount)` → `Some(current.shelf_ids.clone())`
+/// - 其余（`Clerk` / `Inspector` / `CncProgrammer` …）→ `None`
 ///
-/// - `shelf_wildcard || has_role(Role::Manager)` → `None`（SQL 不加谓词）
-/// - 其余 → `Some(current.shelf_ids.clone())`
+/// ## ⚠️ 第三条（`Clerk` / `Inspector` 不受收窄）是刻意与
+/// `modules::part::service::phase1::work_type::pickable_shelf_scope` 分歧的
 ///
-/// 这与 [`CurrentUser::can_access_shelf`] 的三个 disjunct 同源，所以「选架选出
-/// 来的架」与「读侧看得见的架」恒同集合。
+/// `pickable_shelf_scope`（工人取件列表的读侧筛选）只有两条分支：
+/// wildcard/Manager → 不限，其余 → `Some(shelf_ids)`。本函数多出一条「非货架账号
+/// 不限」，成因是 **`shelf_ids` 只对 `ShelfAccount` 角色填**
+/// （见 `modules::iam::service::session::resolve_roles_and_scope`：只有
+/// `Role::ShelfAccount` 且 `scope_type='shelf'` 的角色行才会往 `shelf_ids` 里塞 id，
+/// `scope_id IS NULL` 时置 `shelf_wildcard = true`）。
+///
+/// 后果非常具体：一个**从未**被授予货架范围的 `Inspector`，`shelf_ids` 恒为
+/// `[]`、`shelf_wildcard` 恒为 `false`。若照 `pickable_shelf_scope` 原样收窄，
+/// 它的选架 scope 就是 `Some(vec![])` ⇒ 候选恒空 ⇒ `to-inspection` /
+/// `batch-to-inspection` / `scan-inspect` / `place-on-shelf` / `dispatch` 一律
+/// `40301`。而这些端点的角色白名单里 `Inspector` / `Clerk` 恰恰是**主要使用者**
+/// —— 送检就是品检员做的事。把「按负载挑最空的架」实现成「除 Manager 外谁都送不了
+/// 检」不是本层该造成的后果。
+///
+/// 读侧不受影响：`pickable_shelf_scope` 服务的是「工人能取哪些件」，把无货架范围
+/// 的 Clerk 收窄成空列表在那个语境下无害（他本来就不该替工人取件），所以那一侧
+/// 保持原样、**不要**跟着本函数一起改。
 ///
 /// ## ⚠️ 空数组必须原样返回 `Some(vec![])`
 ///
 /// `ANY('{}')` 对任何货架都为假 ⇒ 候选为空 ⇒ `pick_least_loaded` 返 `Ok(None)`。
-/// 这正是「一个 `shelf_ids` 为空的 `SHELF_ACCOUNT` 看不见任何架」想要的语义。
-/// 若把它误判成 `None`（= 不限），该账号会拿到**全厂**货架 —— 而它的
-/// `can_access_shelf` 在读侧对任何架都返 false，两侧口径当场分裂。
+/// 这正是「一个 `shelf_ids` 为空的 `SHELF_ACCOUNT` 看不见任何架」想要的语义
+/// （`can_access_shelf` 对它也返 false，两侧同集合）。若把它误判成 `None`
+/// （= 不限），该账号会拿到**全厂**货架。
 pub fn shelf_scope_for(current: &CurrentUser) -> Option<Vec<i64>> {
     if current.shelf_wildcard || current.has_role(Role::Manager) {
         None
-    } else {
+    } else if current.has_role(Role::ShelfAccount) {
         Some(current.shelf_ids.clone())
+    } else {
+        None
     }
 }
 
@@ -423,28 +442,31 @@ mod tests {
         assert_eq!(picked.id, alive);
     }
 
-    /// `shelf_scope_for` 与 `can_access_shelf` 的三个 disjunct 同源。
+    /// `shelf_scope_for` 的三条分支（见函数 doc 的「刻意分歧」段）。
     #[test]
-    fn shelf_scope_for_aligns_with_can_access_shelf() {
-        let mk = |wildcard: bool, is_manager: bool, ids: Vec<i64>| CurrentUser {
+    fn shelf_scope_for_narrows_only_shelf_accounts() {
+        let mk = |roles: Vec<Role>, wildcard: bool, ids: Vec<i64>| CurrentUser {
             id: 1,
             username: "u".into(),
-            roles: if is_manager {
-                vec![Role::Manager]
-            } else {
-                vec![Role::Clerk]
-            },
+            roles,
             shelf_wildcard: wildcard,
             shelf_ids: ids,
         };
-        // wildcard / Manager → 不限
-        assert!(shelf_scope_for(&mk(true, false, vec![])).is_none());
-        assert!(shelf_scope_for(&mk(false, true, vec![])).is_none());
-        // 其余 → Some(shelf_ids)，空数组原样保留
+        // ① wildcard / Manager → 不限
+        assert!(shelf_scope_for(&mk(vec![Role::ShelfAccount], true, vec![])).is_none());
+        assert!(shelf_scope_for(&mk(vec![Role::Manager], false, vec![])).is_none());
+        // ② ShelfAccount → Some(shelf_ids)，**空数组原样保留**
         assert_eq!(
-            shelf_scope_for(&mk(false, false, vec![1, 2])),
+            shelf_scope_for(&mk(vec![Role::ShelfAccount], false, vec![1, 2])),
             Some(vec![1, 2])
         );
-        assert_eq!(shelf_scope_for(&mk(false, false, vec![])), Some(vec![]));
+        assert_eq!(
+            shelf_scope_for(&mk(vec![Role::ShelfAccount], false, vec![])),
+            Some(vec![]),
+            "未绑架的 SHELF_ACCOUNT 必须看不到任何架（不能退化成不限）"
+        );
+        // ③ 非货架账号（Clerk / Inspector …）→ 不限（它们没有货架范围概念）
+        assert!(shelf_scope_for(&mk(vec![Role::Inspector], false, vec![])).is_none());
+        assert!(shelf_scope_for(&mk(vec![Role::Clerk], false, vec![])).is_none());
     }
 }

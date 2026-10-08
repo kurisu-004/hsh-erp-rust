@@ -8,7 +8,15 @@
 //! |---|---|---|---|---|
 //! | `PRODUCTION_SHELF` | `OUTSOURCE_COMPANY` | `OUTSOURCE` | **不变**（仍指外协工序） | 按同一工序重解析 |
 //! | `OUTSOURCE_COMPANY` | `PRODUCTION_SHELF` | `IN_PROCESS` | **推进**到 `next_process_id` | 按新工序重解析 |
-//! | `OUTSOURCE_COMPANY` | `INSPECTION_SHELF` | `INSPECTION` | **置 NULL**（出池） | **置 NULL**（出池） |
+//!
+//! 2026-10-10：`OUTSOURCE_COMPANY → INSPECTION_SHELF`（外协直收直送品检）方向
+//! **整条下线** —— 那个 `InspectionShelf` 变体只有 `shelf_id` 一个字段，而品检架
+//! 上线自动选架后它没有任何角色可留（详见 `dto.rs` 里该变体的移除缘由注释）。
+//! 替代路径：先收进生产架，再走常规送检链路，品检架同样由服务端选。
+//!
+//! 2026-10-10：**目标货架由服务端自动选**（`shared::shelf::select::pick_least_loaded`），
+//! `to = PRODUCTION_SHELF` 的 `shelf_id` 入参随之删除；`from = PRODUCTION_SHELF`
+//! 只校验 `batch.location`，不再比对 `current_holder_id`。
 //!
 //! 三处对旧行为的**有意收窄**，理由都在注释里：
 //! - **不带 `quantity`**（整批语义，部分收发先走共用拆批端点
@@ -47,8 +55,8 @@ use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
 use crate::shared::batch::TPartBatch;
 use crate::shared::batch::guards::{
-    assert_shelf_maps_process, ensure_transition, mark_batch_with_status_and_meta,
-    optional_process_chain, optional_step_id, validate_batch_version, validate_shelf_zone,
+    ensure_transition, mark_batch_with_status_and_meta, optional_process_chain, optional_step_id,
+    validate_batch_version,
 };
 use crate::shared::error::{AppError, code};
 
@@ -56,7 +64,7 @@ use crate::shared::error::{AppError, code};
 /// 「这行单价 0 不是漏填，是免审批直发自动建的占位报价」。
 const DIRECT_PLACEHOLDER_NOTE: &str = "DIRECT 直发自动创建（免审批，单价待对账补录）";
 
-/// part 事件的三个审计字面量 —— **与 WS 事件名是两件事，不要一起改**。
+/// part 事件的两个审计字面量 —— **与 WS 事件名是两件事，不要一起改**。
 ///
 /// `t_part_event.event_type` 是 `varchar(30)`，字面量超 30 字符会让 PG 返 22001 并把
 /// **整个事务**回滚（三个字面量分别 19 / 26 / 22 字符，均在限内）。
@@ -67,7 +75,6 @@ const DIRECT_PLACEHOLDER_NOTE: &str = "DIRECT 直发自动创建（免审批，�
 /// 的分组口径会在新写入的行上断裂。
 const EVENT_SENT_TO_OUTSOURCE: &str = "SENT_TO_OUTSOURCE";
 const EVENT_RECEIVED_FROM_OUTSOURCE: &str = "RECEIVED_FROM_OUTSOURCE";
-const EVENT_RECEIVED_TO_INSPECTION: &str = "RECEIVED_TO_INSPECTION";
 
 /// 推导「下一道工序」的 SQL（`to.kind = PRODUCTION_SHELF` 且省略 `next_process_id`
 /// 时跑一次）。
@@ -295,19 +302,34 @@ impl OutsourceMoveService {
             // ── ② 外协公司 → 生产架（回收生产，工序推进）─────────────────
             (
                 OutsourceLocation::OutsourceCompany { .. },
-                OutsourceLocation::ProductionShelf {
-                    shelf_id,
-                    next_process_id,
-                },
+                OutsourceLocation::ProductionShelf { next_process_id },
             ) => {
-                // 货架守卫：存在（20501）/ 启用（20512）/ zone=PRODUCTION（20104）
-                validate_shelf_zone(conn, *shelf_id, "PRODUCTION").await?;
                 let next_process =
                     resolve_receive_next_process(conn, batch.id, *next_process_id).await?;
-                // 货架必须映射该工序（20507）：否则批次落到一个「不做这道工序」的架上，
-                // 取件 SQL 硬限定 `zone='PRODUCTION'` 但工序池按 process 查，批次会静默
-                // 失联
-                assert_shelf_maps_process(conn, *shelf_id, next_process).await?;
+                // 2026-10-10：目标生产架改由服务端选（`current_load / capacity` 升序）。
+                // 「货架必须映射该工序」这条守卫**已被选架本身覆盖** —— 选架的候选集
+                // 只含 `t_shelf_process` 里映射了该工序的行（带软删闸门），选出来的
+                // 架必然映射它，不再需要 20507 的单独判定。
+                // `None` ⇒ `20508`：该工序无可用生产货架（没配映射 / 映射的架全停用
+                // 或软删 / 全非 PRODUCTION / 都不在当前账号 scope 内）。
+                let shelf_id = crate::shared::shelf::select::pick_least_loaded(
+                    conn,
+                    "PRODUCTION",
+                    Some(next_process),
+                    crate::shared::shelf::select::shelf_scope_for(current),
+                )
+                .await?
+                .ok_or_else(|| {
+                    AppError::biz(
+                        code::BIZ_SHELF_PROCESS_NOT_FOUND,
+                        format!(
+                            "process {next_process} 无可用生产货架（无 active 映射，\
+                             或命中的映射其货架均已软删 / 已停用 / 非 PRODUCTION 区 / \
+                             不在当前账号 scope 内）"
+                        ),
+                    )
+                })?
+                .id;
                 let chain_id = optional_process_chain(conn, part_id).await?;
                 let step_id = optional_step_id(conn, chain_id, next_process).await?;
                 mark_batch_with_status_and_meta(
@@ -316,7 +338,7 @@ impl OutsourceMoveService {
                     batch.version,
                     "IN_PROCESS",
                     Some("PRODUCTION_SHELF"),
-                    Some(*shelf_id),
+                    Some(shelf_id),
                     step_id,
                     Some(next_process),
                     current.id,
@@ -342,52 +364,8 @@ impl OutsourceMoveService {
                     current,
                 )
                 .await?;
-                new_holder_id = *shelf_id;
+                new_holder_id = shelf_id;
                 new_process_id = Some(next_process);
-            }
-
-            // ── ③ 外协公司 → 品检架（回收直送品检，出池清工序列）─────────
-            (
-                OutsourceLocation::OutsourceCompany { .. },
-                OutsourceLocation::InspectionShelf { shelf_id },
-            ) => {
-                validate_shelf_zone(conn, *shelf_id, "INSPECTION").await?;
-                mark_batch_with_status_and_meta(
-                    conn,
-                    batch.id,
-                    batch.version,
-                    "INSPECTION",
-                    Some("INSPECTION_SHELF"),
-                    Some(*shelf_id),
-                    // 出池（转 INSPECTION）→ step 与 process 两列都按出池不变式清 NULL
-                    // （形参 `None` ⇒ 写入口的 `clear_*` 分支，调用点清单见
-                    // `shared::batch::guards::mark_batch_with_status_and_meta`）
-                    None,
-                    None,
-                    current.id,
-                )
-                .await?;
-                close_open_outsource_shipment(
-                    conn,
-                    snowflake,
-                    batch.id,
-                    req.note.as_deref(),
-                    current,
-                )
-                .await?;
-                write_part_event(
-                    conn,
-                    snowflake,
-                    &batch,
-                    &part,
-                    EVENT_RECEIVED_TO_INSPECTION,
-                    "OUTSOURCE",
-                    "INSPECTION",
-                    req.note.as_deref(),
-                    current,
-                )
-                .await?;
-                new_holder_id = *shelf_id;
             }
 
             // `from` 侧只能是生产架或外协公司（品检架不是合法起点，守卫 ⑥ 已拒），
@@ -429,7 +407,6 @@ fn location_kind(loc: &OutsourceLocation) -> &'static str {
     match loc {
         OutsourceLocation::ProductionShelf { .. } => "PRODUCTION_SHELF",
         OutsourceLocation::OutsourceCompany { .. } => "OUTSOURCE_COMPANY",
-        OutsourceLocation::InspectionShelf { .. } => "INSPECTION_SHELF",
     }
 }
 
@@ -465,7 +442,7 @@ fn assert_from_matches_batch(
         )
     };
     match from {
-        OutsourceLocation::ProductionShelf { shelf_id, .. } => {
+        OutsourceLocation::ProductionShelf { .. } => {
             if from_status == PartStatus::IN_PROCESS
                 && batch.location.as_deref() != Some("PRODUCTION_SHELF")
             {
@@ -484,12 +461,10 @@ fn assert_from_matches_batch(
                     batch.location
                 )));
             }
-            if batch.current_holder_id != Some(*shelf_id) {
-                return Err(mismatch(format!(
-                    "current_holder_id={:?} 与 from.shelf_id={shelf_id} 不一致",
-                    batch.current_holder_id
-                )));
-            }
+            // 2026-10-10：**不再**比对 `current_holder_id`（`from.shelf_id` 已删除）。
+            // 「批次在某个生产架上」与「它是不是在生产架上」是两件事；后者是本守卫的
+            // 全部职责，前者由选架 / 取件路径各自负责。保留比对会让「同一批货只是
+            // 换了个架」被拒 —— 而看板上的卡片本来就不承诺自己知道批次此刻在哪一格。
             Ok(())
         }
         OutsourceLocation::OutsourceCompany { company_id } => {
@@ -507,9 +482,6 @@ fn assert_from_matches_batch(
             }
             Ok(())
         }
-        OutsourceLocation::InspectionShelf { .. } => Err(mismatch(
-            "from.kind=INSPECTION_SHELF 不是合法起点（品检架上的批次不走外协看板）".to_string(),
-        )),
     }
 }
 
@@ -993,7 +965,7 @@ async fn close_open_outsource_shipment(
     Ok(())
 }
 
-/// 写 `t_part_event`（批次流转的审计事实；三个方向各用自己的字面量）。
+/// 写 `t_part_event`（批次流转的审计事实；两个方向各用自己的字面量）。
 async fn write_part_event(
     conn: &mut PgConnection,
     snowflake: &SnowflakeIdGenerator,

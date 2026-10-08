@@ -17,8 +17,8 @@ use crate::shared::error::{AppError, code};
 
 use super::BatchService;
 use crate::shared::batch::guards::{
-    assert_shelf_maps_process, ensure_transition, mark_batch_with_status_and_meta,
-    optional_process_chain, optional_step_id, validate_batch_version, validate_shelf_zone,
+    ensure_transition, mark_batch_with_status_and_meta, optional_process_chain, optional_step_id,
+    validate_batch_version,
 };
 
 impl BatchService {
@@ -53,10 +53,30 @@ impl BatchService {
         ensure_transition(from, PartStatus::IN_PROCESS, "place-on-shelf")?;
         // 2026-10-03：工序链可选（无链的旧零件也能上架，见 guard.rs）
         let chain_id = optional_process_chain(repo.conn_mut(), part_id).await?;
-        // shelf 校验
-        validate_shelf_zone(repo.conn_mut(), req.shelf_id, "PRODUCTION").await?;
-        // shelf ↔ process 映射
-        assert_shelf_maps_process(repo.conn_mut(), req.shelf_id, req.next_process_id).await?;
+        // 2026-10-10：目标生产架由服务端按负载自动选（`shelf_id` 入参已删除）。
+        //
+        // 原先这里是**两步**守卫（`validate_shelf_zone` 判存在/active/zone +
+        // `assert_shelf_maps_process` 判映射），现在合成一次选架：它的候选集同时带了
+        // 那四个谓词（`zone='PRODUCTION'` / `is_active` / `deleted_at IS NULL` /
+        // 「`t_shelf_process` 里有该工序的未软删映射」）。选不出 → `20508`。
+        let shelf_id = crate::shared::shelf::select::pick_least_loaded(
+            repo.conn_mut(),
+            "PRODUCTION",
+            Some(req.next_process_id),
+            crate::shared::shelf::select::shelf_scope_for(current),
+        )
+        .await?
+        .ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_SHELF_PROCESS_NOT_FOUND,
+                format!(
+                    "process {} 无可用生产货架（无 active 映射，或命中的映射其货架均已软删 / \
+                     已停用 / 非 PRODUCTION 区 / 不在当前账号 scope 内）",
+                    req.next_process_id
+                ),
+            )
+        })?
+        .id;
         // PR-3：解析 step_id（无链 → NULL；有链但链内无该工序 → 20702）
         let step_id = optional_step_id(repo.conn_mut(), chain_id, req.next_process_id).await?;
         // 翻状态
@@ -67,7 +87,7 @@ impl BatchService {
             req.version,
             "IN_PROCESS",
             Some("PRODUCTION_SHELF"),
-            Some(req.shelf_id),
+            Some(shelf_id),
             // 2026-10-03：无链时为 None ⇒ shared::batch::status 的 clear 分支写 NULL
             step_id,
             Some(req.next_process_id),

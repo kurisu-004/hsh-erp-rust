@@ -1364,3 +1364,200 @@ async fn dispatch_skips_unusable_shelf_and_uses_next_candidate() {
             .expect("read holder");
     assert_eq!(holder, Some(good), "holder 必须是那个可用的生产架");
 }
+
+// ===========================================================================
+//  2026-10-10：自动选架（dispatch 落负载最低的映射架）
+// ===========================================================================
+
+/// 在某个架上堆 `total` 件在架负载（`SUM(quantity)` 件数口径：1 个批次 quantity=N）。
+async fn add_shelf_load(pool: &PgPool, shelf_id: i64, customer_id: i64, total: i32, tag: &str) {
+    use hsh_erp_rust::infra::clock::now_naive;
+    let part_id = hsh_erp_test_support::shared_test_snowflake().next_id();
+    let batch_id = hsh_erp_test_support::shared_test_snowflake().next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_part (id, name, drawing_no, applicant_name, quantity, unit_price, \
+         total_price, request_date, planned_delivery_date, customer_id, status, version, \
+         created_at, updated_at) \
+         VALUES ($1, $2, $3, 'T', $4, 1.00, 1.00, CURRENT_DATE, CURRENT_DATE, $5, \
+                 'IN_PROCESS', 0, $6, $6)",
+    )
+    .bind(part_id)
+    .bind(format!("LOAD-{tag}"))
+    .bind(format!("DWG-LOAD-{tag}"))
+    .bind(total)
+    .bind(customer_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert load part");
+    sqlx::query(
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
+         current_holder_id, version, created_at, updated_at) \
+         VALUES ($1, $2, 1, $3, 'IN_PROCESS', 'PRODUCTION_SHELF', $4, 0, $5, $5)",
+    )
+    .bind(batch_id)
+    .bind(part_id)
+    .bind(total)
+    .bind(shelf_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert load batch");
+}
+
+/// dispatch 落到**负载比例最低**的映射架。
+///
+/// 三个映射架按 `sort_order` 排成 A(1) / B(2) / C(3)，但 `capacity` + 在架件数排成
+/// 另一条次序：A 80%、C 20%、B 90%。若实现仍按旧的「`sort_order ASC` 取首个」，
+/// 落到的会是 A —— 断言落 C 于是把两种口径分开。
+#[tokio::test]
+async fn dispatch_lands_on_least_loaded_mapped_shelf() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let process_a = fx.process_a_id;
+    let customer_id = insert_customer_l2(&pool, "ACME-LOAD").await;
+
+    // (sort_order, capacity, 已占用件数) ⇒ 比例 A=80% / B=90% / C=20%
+    let shelf_a = insert_shelf_process_mapping_state(
+        &pool,
+        "LOAD-A",
+        process_a,
+        "PRODUCTION",
+        true,
+        false,
+        1,
+    )
+    .await;
+    let shelf_b = insert_shelf_process_mapping_state(
+        &pool,
+        "LOAD-B",
+        process_a,
+        "PRODUCTION",
+        true,
+        false,
+        2,
+    )
+    .await;
+    let shelf_c = insert_shelf_process_mapping_state(
+        &pool,
+        "LOAD-C",
+        process_a,
+        "PRODUCTION",
+        true,
+        false,
+        3,
+    )
+    .await;
+    for (shelf_id, capacity) in [(shelf_a, 100_i32), (shelf_b, 100), (shelf_c, 100)] {
+        sqlx::query("UPDATE t_shelf SET capacity = $2 WHERE id = $1")
+            .bind(shelf_id)
+            .bind(capacity)
+            .execute(&pool)
+            .await
+            .expect("set capacity");
+    }
+    add_shelf_load(&pool, shelf_a, customer_id, 80, "A").await;
+    add_shelf_load(&pool, shelf_b, customer_id, 90, "B").await;
+    add_shelf_load(&pool, shelf_c, customer_id, 20, "C").await;
+
+    let part_id = insert_part(&pool, customer_id).await;
+    let batch_id = insert_part_batch(&pool, part_id).await;
+
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/queue/dispatch",
+            Some(json!({
+                "targets": [{
+                    "batch_id": batch_id.to_string(),
+                    "target_process_id": process_a.to_string(),
+                }],
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "dispatch: {env}");
+    let holder: Option<i64> =
+        sqlx::query_scalar("SELECT current_holder_id FROM t_part_batch WHERE id = $1")
+            .bind(batch_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        holder,
+        Some(shelf_c),
+        "应落负载比例最低的架（20%），不是 sort_order 最小的 A（80%）"
+    );
+}
+
+/// 没配 `capacity` 的架恒排最后：有一个容量已配但已装的架 + 一个完全没配容量的
+/// 空架 ⇒ 必须选前者（空架「不限」，不限恒排最后）。
+#[tokio::test]
+async fn dispatch_prefers_configured_capacity_over_unbounded_shelf() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let process_a = fx.process_a_id;
+    let customer_id = insert_customer_l2(&pool, "ACME-UB").await;
+
+    // 排最前的是「不限」空架
+    let unbounded = insert_shelf_process_mapping_state(
+        &pool,
+        "UB-EMPTY",
+        process_a,
+        "PRODUCTION",
+        true,
+        false,
+        1,
+    )
+    .await;
+    // 排最后的是配了容量、已装 80% 的架
+    let bounded = insert_shelf_process_mapping_state(
+        &pool,
+        "UB-LOADED",
+        process_a,
+        "PRODUCTION",
+        true,
+        false,
+        2,
+    )
+    .await;
+    sqlx::query("UPDATE t_shelf SET capacity = 100 WHERE id = $1")
+        .bind(bounded)
+        .execute(&pool)
+        .await
+        .expect("set capacity");
+    add_shelf_load(&pool, bounded, customer_id, 80, "UB").await;
+
+    let part_id = insert_part(&pool, customer_id).await;
+    let batch_id = insert_part_batch(&pool, part_id).await;
+
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/queue/dispatch",
+            Some(json!({
+                "targets": [{
+                    "batch_id": batch_id.to_string(),
+                    "target_process_id": process_a.to_string(),
+                }],
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "dispatch: {env}");
+    let holder: Option<i64> =
+        sqlx::query_scalar("SELECT current_holder_id FROM t_part_batch WHERE id = $1")
+            .bind(batch_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        holder,
+        Some(bounded),
+        "「不限」架恒排最后，即使它是空架；应落 capacity=100 且 80% 负载的那个"
+    );
+    let _ = unbounded;
+}

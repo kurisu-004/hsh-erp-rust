@@ -7,13 +7,16 @@
 //!   （`from.kind=PRODUCTION_SHELF` + `to.kind=OUTSOURCE_COMPANY`）
 //! - `POST /prod/batches/{batch_id}/receive-from-outsource` → 同端点
 //!   （`OUTSOURCE_COMPANY` → `PRODUCTION_SHELF`）
-//! - `POST /prod/batches/{batch_id}/receive-from-outsource-to-inspection` → 同端点
-//!   （`OUTSOURCE_COMPANY` → `INSPECTION_SHELF`）
+//! - `POST /prod/batches/{batch_id}/receive-from-outsource-to-inspection` → **下线**
+//!   （`OUTSOURCE_COMPANY` → `INSPECTION_SHELF`）：2026-10-10 起该方向整条移除，
+//!   旧路径 404、无替代端点（见 `dto.rs::OutsourceLocation` 的移除缘由）。
 //!
 //! 三个旧端点的入参变化（**破坏性**，前端必须同步改）：
 //! - `batch_id`：从 URL path 段改为 body 字段（三合一后路径退化成静态段 `/move`，
 //!   主键进 body，与本域其余写端点一致）；
-//! - `outsource_company_id` / `shelf_id`：改为 `to` 对象里的 `company_id` / `shelf_id`；
+//! - `outsource_company_id`：改为 `to` 对象里的 `company_id`；
+//! - `shelf_id`：**删除**（2026-10-10 目标货架由服务端自动选，见
+//!   `service/move.rs` 的模块 doc）；
 //! - `process_id`：**删除**（外协工序 = 批次当前所属工序，由后端自推）；
 //! - `next_process_id`：改为 `to.next_process_id`，且**可省略**（后端按工序链推导）；
 //! - `quantity`：**删除**（整批语义，部分收发先走共用拆批端点

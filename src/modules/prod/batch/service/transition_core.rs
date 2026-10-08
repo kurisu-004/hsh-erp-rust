@@ -187,19 +187,16 @@ impl BatchService {
     /// # Errors
     /// - 20101 `BIZ_PART_NOT_FOUND`
     /// - 20103 `BIZ_INVALID_TRANSITION` —— 当前状态非 INSPECTION
-    /// - 20104 `BIZ_INVALID_VALUE` —— shelf 不在 PRODUCTION 区 / 缺 shelf_id
     /// - 20109 `BIZ_PART_BATCH_NOT_FOUND`
     /// - 20111 `BIZ_PART_BATCH_INVALID_QUANTITY`
     /// - 20118 `BIZ_PART_REPAIR_NOT_TRIGGERED` —— 目标批次**处于返修中**
     ///   （`is_repairing = true`），应改用 `complete-repair`（step 4.6 的守卫）
-    /// - 20501 `BIZ_SHELF_NOT_FOUND`
-    /// - 20512 `BIZ_SHELF_INACTIVE`
+    /// - 20508 `BIZ_SHELF_PROCESS_NOT_FOUND` —— 该工序无可用生产货架（自动选架）
     /// - 40901 `VERSION_CONFLICT`
     #[allow(clippy::too_many_arguments)]
     pub async fn to_process_core<R: PartRepoTrait>(
         repo: &mut R,
         snowflake: &SnowflakeIdGenerator,
-        shelf_id: i64,
         next_process_id: i64,
         note: Option<&str>,
         batch_id: i64,
@@ -235,8 +232,31 @@ impl BatchService {
                 ),
             ));
         }
-        // 3. 校验 shelf（PRODUCTION 区 + active）
-        Self::_validate_production_shelf_and_process(repo, shelf_id, next_process_id).await?;
+        // 3. 自动选目标生产架（2026-10-10：`shelf_id` 入参删除）
+        //
+        // 旧守卫 `_validate_production_shelf_and_process` 是「存在 + active +
+        // zone=PRODUCTION」三谓词 + 一句「next_process_id 的映射校验留待后续 PR」
+        // 的空壳；现在选架本身把前三条（候选集限定 `zone` / `is_active` / 未软删）
+        // 加上第四条（只在该工序映射到的架里选）一起做掉了，而第四条**正是**那句
+        // 「留待后续 PR」的映射校验。选不出 → `20508`。
+        let shelf_id = crate::shared::shelf::select::pick_least_loaded(
+            repo.conn_mut(),
+            "PRODUCTION",
+            Some(next_process_id),
+            crate::shared::shelf::select::shelf_scope_for(current),
+        )
+        .await?
+        .ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_SHELF_PROCESS_NOT_FOUND,
+                format!(
+                    "process {next_process_id} 无可用生产货架（无 active 映射，\
+                     或命中的映射其货架均已软删 / 已停用 / 非 PRODUCTION 区 / \
+                     不在当前账号 scope 内）"
+                ),
+            )
+        })?
+        .id;
         // 4. 校验锚定批次处于 INSPECTION 状态（2026-10-02：改为纯按 id 定位，
         //    `part_id` 形参与 `AND part_id = $2` 断言一并删除）
         let target: TPartBatch = match repo.find_inspection_batch_by_id(batch_id).await {
@@ -382,9 +402,7 @@ impl BatchService {
     ///   IN_PROCESS}`；或 IN_PROCESS+WORKER；或 IN_PROCESS+非 PRODUCTION_SHELF
     /// - 20109 `BIZ_PART_BATCH_NOT_FOUND`
     /// - 20111 `BIZ_PART_BATCH_INVALID_QUANTITY`
-    /// - 20501 `BIZ_SHELF_NOT_FOUND`
-    /// - 20511 `BIZ_SHELF_NOT_INSPECTION_ZONE`
-    /// - 20512 `BIZ_SHELF_INACTIVE`
+    /// - 40301 `SHELF_MISMATCH` —— 当前账号 scope 内无任何可用品检架（自动选架）
     /// - 40901 `VERSION_CONFLICT`
     ///
     /// 2026-09-16 PR-2 瘦身（migration 027）：t_part 删 `current_holder_id` 列；
@@ -401,6 +419,11 @@ impl BatchService {
     // 参数过多（9 > 7）。本函数聚合 part_id / shelf_id / batch_id / version /
     // quantity / note 等必要输入，与 `to_ship_core` 同形；将它们打包为
     // `ToInspectionCoreArgs` 结构体收益微薄、调用面广，重构 ROI 低，故豁免。
+    ///
+    /// `target_inspection_shelf_id` 是**caller 已经选好**的品检架 id —— 选架由
+    /// `shared::shelf::select::pick_least_loaded` 在 service 层完成（单件端点在
+    /// wrapper 里选一次，批量端点在循环外选一次共用），本核心**不再**重选也不校验。
+    /// 「批量共用一个架」是批量送检的语义本身：一次操作把 N 批一起放进同一个架。
     #[allow(clippy::too_many_arguments)]
     pub async fn to_inspection_core<R: PartRepoTrait>(
         repo: &mut R,
@@ -412,9 +435,9 @@ impl BatchService {
         note: Option<&str>,
         current: &CurrentUser,
     ) -> Result<ToXxxOut, AppError> {
-        // 1. 校验品检架（target_inspection_shelf）
-        let target_shelf =
-            Self::_validate_inspection_shelf(repo, target_inspection_shelf_id).await?;
+        // 1. 品检架由 caller 选好（2026-10-10：`target_inspection_shelf_id` 入参删除）。
+        //    这里只需要它的 code / id 写事件日志，不再重做存在 / zone / scope 校验 ——
+        //    选架那一步（`pick_least_loaded`）已经把三件事一次做完。
         // 2. 反查批次 → part_id 并读 part（2026-10-02 去 part 化，理由同 `to_ship_core`）
         let anchor = Self::_lookup_batch_by_id(repo, batch_id).await?;
         let part_id = anchor.part_id;
@@ -489,7 +512,7 @@ impl BatchService {
             .mark_batch_inspected(
                 operated_id,
                 operated_version,
-                target_shelf.id,
+                target_inspection_shelf_id,
                 Some(current.id),
             )
             .await?;
@@ -501,10 +524,16 @@ impl BatchService {
         // 9. 写 INSPECTED 事件日志
         let event_id = snowflake.next_id();
         let note_text = match from {
-            PartStatus::PENDING => format!("送检：来自待下发 → 品检架 {}", target_shelf.code),
-            PartStatus::PROGRAMMING => format!("送检：来自编程中 → 品检架 {}", target_shelf.code),
-            PartStatus::IN_PROCESS => format!("送检：来自生产架 → 品检架 {}", target_shelf.code),
-            _ => format!("送检 → 品检架 {}", target_shelf.code),
+            PartStatus::PENDING => {
+                format!("送检：来自待下发 → 品检架 {}", target_inspection_shelf_id)
+            }
+            PartStatus::PROGRAMMING => {
+                format!("送检：来自编程中 → 品检架 {}", target_inspection_shelf_id)
+            }
+            PartStatus::IN_PROCESS => {
+                format!("送检：来自生产架 → 品检架 {}", target_inspection_shelf_id)
+            }
+            _ => format!("送检 → 品检架 {}", target_inspection_shelf_id),
         };
         repo.insert_part_event(NewPartEvent {
             id: event_id,

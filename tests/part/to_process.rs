@@ -148,12 +148,13 @@ async fn bootstrap_as_inspector() -> (PgPool, axum::Router, String, PartFixture)
 
 /// to-process 拒绝：shelf_id 非数字 → 20104 BIZ_INVALID_VALUE。
 ///
-/// to-XXX 重命名：原一键送检的 FAIL 分支 `shelf_id` / `next_process_id` 在
-/// `to-process` 成为必填字段（`ToProcessRequest.shelf_id: String`）。缺字段走
-/// axum Json 提取 → 422 不在信封内（已退化为非 envelope plain text），故改用
-/// 「非数字」值（"abc"）保留 service 层 20104 校验路径的覆盖。
+/// 2026-10-10：`ToProcessRequest.shelf_id` **已删除**，目标架由服务端按负载自动选。
+/// 本用例改为断言新的失败形态：`next_process_id = 1`（fixture 里没有这道工序的
+/// 映射）⇒ 选架候选为空 ⇒ `20508 BIZ_SHELF_PROCESS_NOT_FOUND`（HTTP 404）。
+///
+/// 顺带验证向后兼容：请求体里仍然发 `shelf_id`，它被 serde 静默忽略而不报错。
 #[tokio::test]
-async fn to_process_invalid_shelf_id_rejected() {
+async fn to_process_no_candidate_shelf_rejected() {
     let (pool, app, token, fx) = bootstrap_as_inspector().await;
     let (_part_id, batch_id) = insert_part_with_batch(
         &pool,
@@ -172,6 +173,7 @@ async fn to_process_invalid_shelf_id_rejected() {
             "POST",
             &format!("/prod/batches/{batch_id}/to-process"),
             Some(json!({
+                // 已移除的字段：老客户端仍在发，必须被静默忽略
                 "shelf_id": "abc",
                 "next_process_id": "1",
                 "version": v,
@@ -180,10 +182,13 @@ async fn to_process_invalid_shelf_id_rejected() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
-    assert_eq!(body["code"], 20104);
+    assert_eq!(status, StatusCode::NOT_FOUND, "body={body}");
+    assert_eq!(body["code"], 20508);
     let msg = body["message"].as_str().unwrap();
-    assert!(msg.contains("abc"), "message 应含原值 'abc': {msg}");
+    assert!(
+        msg.contains("无可用生产货架"),
+        "message 应写明成因（无可用生产货架）: {msg}"
+    );
 }
 
 /// to-process 拒绝：next_process_id 非数字 → 20104 BIZ_INVALID_VALUE。

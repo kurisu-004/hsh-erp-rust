@@ -14,6 +14,7 @@
 //! |---|---|---|
 //! | 「在返修中」判据 | `status = 'REPAIRING'` | `is_repairing = true` |
 //! | `complete_repair` 守卫 | 枚举迁移白名单（源须为 REPAIRING） | `is_repairing == true`（否则 20118） |
+//! | `complete_repair` / `repair_dispatch` 去向 | 读 `shelf.zone` 分流 | 2026-10-10：由 `next_process_id` 有无分流，目标货架由服务端自动选 |
 //! | `complete_repair` / `repair_dispatch` 的写点 | 写 `status` | 写 `status` **并**清 `is_repairing`（经 `mark_batch_with_status_and_meta`）|
 //! | 事件 `from_status` / `to_status` | 含 `'REPAIRING'` 字面量 | 一律写**真实**状态值（返修事实由 `event_type` + `is_repairing` 承载）|
 //! | `GET /repairing` 列表 | `statuses = ['REPAIRING']` | `is_repairing = true`（`BatchListFilter::Repairing`）|
@@ -29,13 +30,12 @@ use crate::modules::prod::batch::dto::{
     CompleteRepairRequest, RepairBatchListQuery, RepairDispatchRequest,
 };
 use crate::modules::prod::batch::vo::{InspectionBatchListItemOut, InspectionBatchListOut};
-use crate::modules::shelf::repo::ShelfRepo;
 use crate::shared::error::{AppError, code};
 
 use super::BatchService;
 use crate::shared::batch::guards::{
-    InspectionRepairRow, assert_shelf_maps_process, mark_batch_with_status_and_meta,
-    optional_process_chain, optional_step_id, validate_batch_version,
+    InspectionRepairRow, mark_batch_with_status_and_meta, optional_process_chain, optional_step_id,
+    validate_batch_version,
 };
 
 impl BatchService {
@@ -44,8 +44,9 @@ impl BatchService {
     /// `POST /prod/batches/{batch_id}/complete-repair`：完成返修。
     ///
     /// 前置：批次 `is_repairing = true`（确实在返修中）。
-    /// 去向由 shelf.zone 决定：PRODUCTION → `IN_PROCESS`（落回生产架、重新
-    /// 入池并写目标工序）／INSPECTION → `INSPECTION`（送检区、出池）。
+    /// 去向由 `next_process_id` 有无决定（2026-10-10，原先是 shelf.zone）：
+    /// `Some` → `IN_PROCESS`（落回服务端选出的生产架、重新入池并写目标工序）／
+    /// `None` → `INSPECTION`（落回服务端选出的品检架、出池）。
     /// 两条路径都把 `is_repairing` 清回 false（`mark_batch_with_status_and_meta`）。
     pub async fn complete_repair<R: PartRepoTrait>(
         mut repo: R,
@@ -110,38 +111,66 @@ impl BatchService {
                 ),
             ));
         }
-        // shelf 区决定目标状态
-        let shelf = ShelfRepo::get_by_id(repo.conn_mut(), req.shelf_id)
-            .await?
-            .ok_or_else(|| AppError::biz(code::BIZ_SHELF_NOT_FOUND, "shelf 不存在"))?;
-        if !shelf.is_active {
-            return Err(AppError::biz(code::BIZ_SHELF_INACTIVE, "shelf 已停用"));
-        }
+        // 2026-10-10：**去向由 `next_process_id` 有无决定**（原先是读 `shelf.zone`）。
+        //
+        // 「回生产」必须带一道工序（要重新入池、`current_process_id` 是池归属的
+        // 权威依据），而「回品检」出池且不需要工序上下文 —— 于是这一个字段的有无
+        // 就是完整的去向表达，不必再让调用方挑一个货架来间接表达。原先那条
+        // `zone=<其它值> → 20104` 的错误码随之消失：`t_shelf.zone` 只有
+        // PRODUCTION / INSPECTION 两个合法值（DB 层有 CHECK），「其它值」不可达，
+        // 而现在 zone 根本不参与判定。
+        //
         // 2026-09-30：新增 current_process_id（池归属权威依据）—— 返修完成
         // 回生产架即重新入池（写目标工序）；回送检区则出池（置 NULL）
-        let (new_status, new_location, step_id_opt, process_id_opt) = match shelf.zone.as_str() {
-            "PRODUCTION" => {
-                let np = req.next_process_id.ok_or_else(|| {
-                    AppError::biz(code::BIZ_INVALID_VALUE, "PRODUCTION 区需要 next_process_id")
-                })?;
+        let (new_status, new_location, shelf_id, step_id_opt, process_id_opt) = match req
+            .next_process_id
+        {
+            Some(np) => {
+                // 「货架必须映射该工序」这条守卫已被选架本身覆盖（候选集只含映射了
+                // 该工序的活跃生产架）。`None` ⇒ `20508`。
+                let shelf_id = crate::shared::shelf::select::pick_least_loaded(
+                    repo.conn_mut(),
+                    "PRODUCTION",
+                    Some(np),
+                    crate::shared::shelf::select::shelf_scope_for(current),
+                )
+                .await?
+                .ok_or_else(|| {
+                    AppError::biz(
+                        code::BIZ_SHELF_PROCESS_NOT_FOUND,
+                        format!(
+                            "process {np} 无可用生产货架（无 active 映射，或命中的映射其货架 \
+                                 均已软删 / 已停用 / 非 PRODUCTION 区 / 不在当前账号 scope 内）"
+                        ),
+                    )
+                })?
+                .id;
                 // 2026-10-03：PRODUCTION 区的工序链可选（无链落 NULL step）
                 let chain_id = optional_process_chain(repo.conn_mut(), part_id).await?;
-                assert_shelf_maps_process(repo.conn_mut(), req.shelf_id, np).await?;
                 // PR-3：解析 step_id（无链 → NULL；有链但链内无该工序 → 20702）
                 let step_id = optional_step_id(repo.conn_mut(), chain_id, np).await?;
-                ("IN_PROCESS", Some("PRODUCTION_SHELF"), step_id, Some(np))
+                (
+                    "IN_PROCESS",
+                    Some("PRODUCTION_SHELF"),
+                    shelf_id,
+                    step_id,
+                    Some(np),
+                )
             }
-            "INSPECTION" => {
+            None => {
                 // INSPECTION 区不带 step（送检区不需要 process 上下文）；
                 // 检验完成后 to_process / to_ship 再设 step。
                 // 2026-09-30：同理不带 current_process_id（出池 → NULL）
-                ("INSPECTION", Some("INSPECTION_SHELF"), None, None)
-            }
-            other => {
-                return Err(AppError::biz(
-                    code::BIZ_INVALID_VALUE,
-                    format!("complete-repair 不允许 zone={other}"),
-                ));
+                let shelf_id = crate::shared::shelf::select::pick_least_loaded(
+                    repo.conn_mut(),
+                    "INSPECTION",
+                    None,
+                    crate::shared::shelf::select::shelf_scope_for(current),
+                )
+                .await?
+                .ok_or_else(|| crate::shared::shelf::select::no_candidate_in_scope("INSPECTION"))?
+                .id;
+                ("INSPECTION", Some("INSPECTION_SHELF"), shelf_id, None, None)
             }
         };
         let n = mark_batch_with_status_and_meta(
@@ -150,7 +179,7 @@ impl BatchService {
             req.version,
             new_status,
             new_location,
-            Some(req.shelf_id),
+            Some(shelf_id),
             step_id_opt,
             process_id_opt,
             current.id,
@@ -200,7 +229,7 @@ impl BatchService {
     /// `POST /prod/batches/{batch_id}/repair-dispatch`：一步式返修下发。
     ///
     /// 入口：IN_PROCESS / INSPECTION / READY_TO_SHIP / DELIVERED；目标状态由
-    /// shelf.zone 决定（PRODUCTION → IN_PROCESS；INSPECTION → INSPECTION）。
+    /// `next_process_id` 有无决定（`Some` → IN_PROCESS；`None` → INSPECTION）。
     /// 一次调用完成「起修 + 到位」，故 `is_repairing` 在本调用内被清成 false
     /// （批次到达最终位置，不再处于待返修态）。
     pub async fn repair_dispatch<R: PartRepoTrait>(
@@ -238,32 +267,52 @@ impl BatchService {
                 format!("repair-dispatch: 起点 {from:?} 不允许"),
             ));
         }
-        let shelf = ShelfRepo::get_by_id(repo.conn_mut(), req.shelf_id)
-            .await?
-            .ok_or_else(|| AppError::biz(code::BIZ_SHELF_NOT_FOUND, "shelf 不存在"))?;
-        if !shelf.is_active {
-            return Err(AppError::biz(code::BIZ_SHELF_INACTIVE, "shelf 已停用"));
-        }
-        // 2026-09-30：新增 current_process_id（池归属权威依据）—— 返修下发
-        // 到生产架即入池（写目标工序）；下发到送检区则出池（置 NULL）
-        let (new_status, new_location, step_id_opt, process_id_opt) = match shelf.zone.as_str() {
-            "PRODUCTION" => {
-                let np = req.next_process_id.ok_or_else(|| {
-                    AppError::biz(code::BIZ_INVALID_VALUE, "PRODUCTION 区需要 next_process_id")
-                })?;
+        // 2026-10-10：去向由 `next_process_id` 有无决定 + 货架由服务端选，理由与口径
+        // 逐字同 `complete_repair`（两个端点是同一套守卫，分开写必然漂移）。
+        let (new_status, new_location, shelf_id, step_id_opt, process_id_opt) = match req
+            .next_process_id
+        {
+            Some(np) => {
+                let shelf_id = crate::shared::shelf::select::pick_least_loaded(
+                    repo.conn_mut(),
+                    "PRODUCTION",
+                    Some(np),
+                    crate::shared::shelf::select::shelf_scope_for(current),
+                )
+                .await?
+                .ok_or_else(|| {
+                    AppError::biz(
+                        code::BIZ_SHELF_PROCESS_NOT_FOUND,
+                        format!(
+                            "process {np} 无可用生产货架（无 active 映射，或命中的映射其货架 \
+                                 均已软删 / 已停用 / 非 PRODUCTION 区 / 不在当前账号 scope 内）"
+                        ),
+                    )
+                })?
+                .id;
                 // 2026-10-03：PRODUCTION 区的工序链可选（无链落 NULL step）
                 let chain_id = optional_process_chain(repo.conn_mut(), part_id).await?;
-                assert_shelf_maps_process(repo.conn_mut(), req.shelf_id, np).await?;
                 // PR-3：解析 step_id（无链 → NULL；有链但链内无该工序 → 20702）
                 let step_id = optional_step_id(repo.conn_mut(), chain_id, np).await?;
-                ("IN_PROCESS", Some("PRODUCTION_SHELF"), step_id, Some(np))
+                (
+                    "IN_PROCESS",
+                    Some("PRODUCTION_SHELF"),
+                    shelf_id,
+                    step_id,
+                    Some(np),
+                )
             }
-            "INSPECTION" => ("INSPECTION", Some("INSPECTION_SHELF"), None, None),
-            other => {
-                return Err(AppError::biz(
-                    code::BIZ_INVALID_VALUE,
-                    format!("repair-dispatch 不允许 zone={other}"),
-                ));
+            None => {
+                let shelf_id = crate::shared::shelf::select::pick_least_loaded(
+                    repo.conn_mut(),
+                    "INSPECTION",
+                    None,
+                    crate::shared::shelf::select::shelf_scope_for(current),
+                )
+                .await?
+                .ok_or_else(|| crate::shared::shelf::select::no_candidate_in_scope("INSPECTION"))?
+                .id;
+                ("INSPECTION", Some("INSPECTION_SHELF"), shelf_id, None, None)
             }
         };
         // 一步式：单条 UPDATE + 两条事件日志（REPAIR_STARTED + REPAIR_COMPLETED），
@@ -285,7 +334,7 @@ impl BatchService {
             req.version,
             new_status,
             new_location,
-            Some(req.shelf_id),
+            Some(shelf_id),
             step_id_opt,
             process_id_opt,
             current.id,
