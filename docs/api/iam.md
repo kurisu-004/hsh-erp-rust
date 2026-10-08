@@ -176,8 +176,12 @@ jti 写入黑名单（TTL 对齐旧 token 剩余有效期），旧 jti 再次使
 `Failed to deserialize the JSON body into the target type: missing field \`version\``），
 **没有** `{code, message, data}` 信封。断言这类响应必须用
 `test_support::http::send_raw`（`send` 会在 JSON 解析处 panic）。端点表里带 `Json`
-提取器的 10 个端点（1/4/5/7/9/11/13/14/16/17）的提取失败都属此类；端点 3 与 10 无
-提取器，6 是 `Query`、8/12/15 是 `Path`。
+提取器的 10 个端点（1/4/5/7/9/11/13/14/16/17）的提取失败都属此类；其余 7 个端点没有
+`Json` body：2 取 `CurrentUser`、3 取 `CurrentUser` + `SessionJti`、6 取
+`Query<UserListQuery>`、8/10/12/15 只取 `Path<i64>`。`Path` 与 `Json` 并存的是 9/11/13/17
+（`Path<i64>`）与 14（`Path<(i64, i64)>`）；`SessionJti` 仅端点 3。17 个端点都带 `State`，
+`CurrentUser` 覆盖除公开端点 1/5 外的 15 个（它是 middleware 注入 extensions 的薄壳，
+验签与 session 校验都在 middleware）。
 
 ## 5. 移除记录（2026-10-10）
 

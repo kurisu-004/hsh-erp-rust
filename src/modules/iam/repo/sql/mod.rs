@@ -7,7 +7,7 @@
 //! - `shelf.rs`       — `t_shelf` 1 个 SQL fn（本域只读）
 //! - `wx_identity.rs` — `t_wx_identity` 4 个 SQL fns（2026-10-10 自 wx 域搬入）
 //! - `mod.rs`（本文件）— 声明子模块 + **单一** `impl IamRepoTrait for &mut PgConnection` 块
-//!   （覆盖全部 23 方法，按实体分组；call 各子文件 free fn）
+//!   （覆盖全部 22 方法，按实体分组；call 各子文件 free fn）
 //!
 //! ## 为什么不是 4 个分散 impl 块
 //! Rust coherence 规则：同 crate 内同一 trait 对同一类型至多一个 impl 块（auto trait
