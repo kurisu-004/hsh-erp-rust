@@ -12,13 +12,27 @@ mod session;
 
 /// iam 域 router（挂在 `/api/v2/iam`，见 `modules::v2_router`）
 ///
-/// 端点拆分：
+/// 端点拆分（account 12 + session 5 = 17）：
 /// - session 端点（`session.rs`，5 个）：挂在 `/iam` 根
 /// - account 端点（`account.rs`，12 个）：挂在 `/iam/users`
-///   （9 个账号 CRUD/角色 + 3 个企业微信绑定，2026-09-29 新增）
+///   （9 个账号 CRUD/角色/改密 + 3 个企业微信绑定）
 ///
-/// 2026-09-19 IAM 域收尾（PR-4）：`auth_router` / `users_router` 旧 alias 已下线；
-/// 新路径 `/api/v2/iam/*` 是 IAM 域唯一对外接口。
+/// ## 硬切记录（2026-10-10）
+/// - `DELETE /api/v2/iam/users/{id}/wx-bind` **已删、无 alias** → 改为
+///   `POST /api/v2/iam/users/{id}/wx-bind/unbind`（本仓只用 GET + POST；
+///   不留全后端唯一的 DELETE 路由）。两者段数不同（3 vs 4），matchit 无需考虑
+///   「静态段先于 catch-all」的注册顺序约束。
+/// - `GET /api/v2/iam/users/{id}/wx-bind` 返回值由 `Vec<WxIdentityOut>` 改为
+///   `Option<WxIdentityOut>`（业务上双向一对一）。
+/// - `POST /api/v2/iam/users/{id}/wx-bind` 请求体删掉 `corp_id`（它此前是
+///   「保留字段、一律忽略」）。
+/// - 4 个写端点 body 新增**必填** `version`：`/{id}/update`、`/{id}/deactivate`、
+///   `/{id}/roles/{role_id}/remove`、`/{id}/wx-bind/unbind`。缺失 → HTTP 422 纯文本
+///   （axum `Json` 提取器，不是业务信封）。
+///   （`/{id}/reset-password` 是 OCC 豁免的幂等端点、`/{id}/roles` 是纯 INSERT，
+///   两者都不收 version。）
+/// - 2026-09-19 IAM 域收尾（PR-4）：`auth_router` / `users_router` 旧 alias 已下线；
+///   新路径 `/api/v2/iam/*` 是 IAM 域唯一对外接口。
 pub fn router() -> Router<Arc<AppState>> {
     let session = Router::new()
         .route("/login", post(session::login))
@@ -37,13 +51,11 @@ pub fn router() -> Router<Arc<AppState>> {
             get(account::list_user_roles).post(account::add_role),
         )
         .route("/{id}/roles/{role_id}/remove", post(account::remove_role))
-        // 2026-09-29 新增：企业微信身份预绑定（GET/POST/DELETE 同一路径）
-        // 注意 axum 0.8 的 `MethodRouter` 组合顺序：先 get 再 post 再 delete。
+        // 企业微信身份预绑定：GET/POST 同一路径（查 / 绑），解绑走子路径
         .route(
             "/{id}/wx-bind",
-            get(account::get_wx_identity)
-                .post(account::bind_wx_identity)
-                .delete(account::unbind_wx_identity),
-        );
+            get(account::get_wx_identity).post(account::bind_wx_identity),
+        )
+        .route("/{id}/wx-bind/unbind", post(account::unbind_wx_identity));
     Router::new().merge(session).nest("/users", users)
 }

@@ -26,7 +26,8 @@ pub mod dashboard;
 // 修复 python STS 端口裸开鉴权漏洞：rust 端强制 JWT + Role 鉴权后再转发。
 pub mod files;
 // 2026-09-19 IAM 域合并（PR-1）：合并 `auth` + `user` 为单一 `iam` 业务域；
-// handler 内 14 端点 + 1 个 router 工厂函数 `router()`。auth / user 目录已删除。
+// handler 内 17 端点（session 5 + users 12）+ 1 个 router 工厂函数 `router()`。
+// auth / user 目录已删除。
 // 2026-09-19 IAM 域收尾（PR-4）：旧 alias `/auth` + `/users` nest 已下线，
 // `/api/v2/iam/*` 成为 IAM 域唯一对外接口。
 pub mod iam;
@@ -93,7 +94,7 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // 2026-10-01 新增 admin 域（对账逃生口）：`POST /api/v2/admin/recompute-rollup`。
         // Manager 单角色守卫写在 handler 内（`require_role`），此处不挂 role layer。
         .nest("/admin", admin::router())
-        // 2026-09-19 IAM 域：新路径 `/iam` 14 端点（PR-1 起开放，PR-4 收尾后唯一）
+        // 2026-09-19 IAM 域：新路径 `/iam` 17 端点（session 5 + users 12，PR-1 起开放，PR-4 收尾后唯一）
         .nest("/iam", iam::router())
         // 2026-09-19 com 聚合：customer + applicant 统一挂在 `/com/*` 下
         .nest("/com", com::router())

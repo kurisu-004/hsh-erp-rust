@@ -1,25 +1,30 @@
-//! iam 域企业微信绑定端点补充测试（2026-09-29 新增）
+//! iam 域企业微信绑定端点补充测试
 //!
 //! 与 `tests/wecom_login.rs` 的分工：那里覆盖 wx-login 主链路 + 白名单；
-//! 本文件聚焦 `/api/v2/iam/users/{id}/wx-bind` 的 **service 层校验分支**
-//! （入参归一化 / corp_id 回退 / 长度上限 / 空数组读端点），两者合起来覆盖
-//! A10 端点的全部可机械核对项。
+//! 本文件聚焦 `/api/v2/iam/users/{id}/wx-bind*` 的 **service 层校验分支**
+//! （入参归一化 / 配置回退 / 长度上限 / 双向一对一 / OCC 冲突），两者合起来覆盖
+//! 这 3 个端点的全部可机械核对项。
 //!
-//! 端点形态（服务层校验分支见 `src/modules/iam/service/account.rs`）：
-//! - `POST   /api/v2/iam/users/{id}/wx-bind` —— 绑定（幂等；跨账号 → 40108）
-//! - `GET    /api/v2/iam/users/{id}/wx-bind` —— 查该用户全部绑定
-//! - `DELETE /api/v2/iam/users/{id}/wx-bind` —— 解绑（幂等；无绑定 → 空数组）
+//! 端点形态（服务层校验分支见 `src/modules/iam/service/account/wx.rs`）：
+//! - `POST /api/v2/iam/users/{id}/wx-bind` —— 绑定（幂等；userid 已属他人 → 40108；
+//!   本账号已绑别的 userid → 40110）
+//! - `GET  /api/v2/iam/users/{id}/wx-bind` —— 查当前绑定（未绑定 → `data: null`）
+//! - `POST /api/v2/iam/users/{id}/wx-bind/unbind` —— 解绑（body 带 `version`；
+//!   幂等；无绑定 → 200）
+//!
+//! 2026-10-10 破坏性变更：`DELETE /api/v2/iam/users/{id}/wx-bind` **已删、无 alias**
+//! （`wx_unbind_old_delete_route_is_gone` 一条钉住 405）。
 
 use std::sync::Arc;
 
 use axum::http::StatusCode;
-use serde_json::{Value, json};
+use serde_json::json;
 use sqlx::PgPool;
 
 use hsh_erp_rust::modules::wx::wecom_client::NoopWeComClient;
 use hsh_erp_test_support::{
     IamFixture, WecomFixture, json_request, load_iam_fixture, load_wecom_fixture, login_token,
-    send, test_app, test_pool,
+    send, send_raw, test_app, test_pool,
 };
 
 /// 基础 bootstrap：fresh DB + iam/wecom fixture + state + app + MANAGER token
@@ -42,8 +47,8 @@ async fn fresh_app(pool: &PgPool) -> axum::Router {
 
 /// 构造一个 **配了 `WECOM_CORPID`** 的 app。
 ///
-/// 2026-09-29（review 第 1 轮 Y3）：绑定端点只读 `state.config.wecom.corpid`，
-/// **不碰**企微接口，所以 wecom 客户端塞 `NoopWeComClient` 即可（只为换 config）。
+/// 绑定端点只读 `state.config.wecom.corpid`，**不碰**企微接口，所以 wecom 客户端塞
+/// `NoopWeComClient` 即可（只为换 config）。
 async fn fresh_app_with_corp(pool: &PgPool, corp_id: &str) -> axum::Router {
     let state = hsh_erp_test_support::test_state_with_wecom(
         pool.clone(),
@@ -54,16 +59,27 @@ async fn fresh_app_with_corp(pool: &PgPool, corp_id: &str) -> axum::Router {
     test_app(state)
 }
 
+/// 读一条绑定行的当前 `version`（解绑的 OCC 锚点）。
+async fn bind_version(pool: &PgPool, bind_id: i64) -> i32 {
+    sqlx::query_scalar!(
+        "SELECT version AS \"v!\" FROM t_wx_identity WHERE id = $1",
+        bind_id
+    )
+    .fetch_one(pool)
+    .await
+    .expect("query wx_identity.version")
+}
+
 // ===========================================================================
 // 1. GET 读端点
 // ===========================================================================
 
 #[tokio::test]
-async fn wx_bind_get_returns_all_active_bindings_of_user() {
-    let (_pool, _app, fx, wfx, mgr) = bootstrap().await;
+async fn wx_bind_get_returns_single_object_when_bound() {
+    let (pool, _app, fx, wfx, mgr) = bootstrap().await;
 
     let (status, env) = send(
-        fresh_app(&_pool).await,
+        fresh_app(&pool).await,
         json_request(
             "GET",
             &format!("/iam/users/{}/wx-bind", fx.manager_user_id),
@@ -73,22 +89,28 @@ async fn wx_bind_get_returns_all_active_bindings_of_user() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "envelope = {env}");
-    let items = env["data"].as_array().expect("data 必须是数组");
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0]["wx_user_id"], WecomFixture::MANAGER_WX_USER_ID);
-    assert_eq!(items[0]["corp_id"], WecomFixture::CORP_ID);
+    // 业务上双向一对一 ⇒ data 是**单对象**，不是数组
+    let item = &env["data"];
+    assert!(item.is_object(), "data 应是单个对象：{env}");
+    assert_eq!(item["wx_user_id"], WecomFixture::MANAGER_WX_USER_ID);
+    assert_eq!(item["corp_id"], WecomFixture::CORP_ID);
     assert_eq!(
-        items[0]["id"].as_str().unwrap().parse::<i64>().unwrap(),
+        item["id"].as_str().unwrap().parse::<i64>().unwrap(),
         wfx.manager_bind_id
+    );
+    // version 是 OCC 锚点，前端解绑时要用
+    assert_eq!(
+        item["version"].as_i64(),
+        Some(bind_version(&pool, wfx.manager_bind_id).await as i64)
     );
 }
 
 #[tokio::test]
-async fn wx_bind_get_on_user_without_binding_returns_empty_array() {
+async fn wx_bind_get_without_binding_returns_null() {
     let (pool, _app, _fx, _wfx, mgr) = bootstrap().await;
 
-    // 用一个不存在的账号 ID（999 号段）验证「无绑定 → 空数组」而非 404：
-    // 本端点不做目标账号存在性校验（它只是列绑定，语义上等价于「查空集合」）
+    // 用一个不存在的账号 ID（999 号段）验证「无绑定 → data: null」而非 404：
+    // 本端点不做目标账号存在性校验（它只是查绑定，语义上等价于「查不到」）
     let (status, env) = send(
         fresh_app(&pool).await,
         json_request(
@@ -100,9 +122,10 @@ async fn wx_bind_get_on_user_without_binding_returns_empty_array() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "envelope = {env}");
+    assert_eq!(env["code"], 0);
     assert!(
-        env["data"].as_array().unwrap().is_empty(),
-        "无绑定账号应返回空数组：{env}"
+        env["data"].is_null(),
+        "无绑定账号应返回 data: null（不是空数组）：{env}"
     );
 }
 
@@ -205,15 +228,29 @@ async fn wx_bind_rejects_unknown_target_user() {
     assert_eq!(env["code"], 20601);
 }
 
-/// 2026-09-29（review 第 1 轮 Y3）：请求体的 `corp_id` **被忽略**，一律以后端
-/// `WECOM_CORPID` 落库。
-///
-/// 初版把「`corp_id: "ww-second-corp"` 绑定成功」固化成了断言，但登录侧只认
-/// 配置值——这样绑出来的行用户永远登不进来（40107），还会在别的企业命名空间
-/// 占住 `(corp_id, wx_user_id)` 的唯一坑位。
+/// 请求体带 `corp_id` 仍是**未知字段**（DTO 已删该字段），serde 默认忽略未知字段
+/// 不报错，落库一律用后端配置的 `WECOM_CORPID`。这条钉住「删字段」不破坏旧客户端。
 #[tokio::test]
-async fn wx_bind_ignores_request_corp_id_and_uses_configured_one() {
-    let (pool, _app, fx, _wfx, mgr) = bootstrap().await;
+async fn wx_bind_ignores_unknown_corp_id_field_and_uses_configured_one() {
+    let (pool, _app, _fx, _wfx, mgr) = bootstrap().await;
+
+    // wecom fixture 给 5 个账号都建了绑定行（system→wx 已占），故先建一个全新账号
+    let (status, env) = send(
+        fresh_app_with_corp(&pool, WecomFixture::CORP_ID).await,
+        json_request(
+            "POST",
+            "/iam/users",
+            Some(json!({
+                "username": "brandnew",
+                "password": "pwd-12345",
+                "full_name": "Brand New",
+            })),
+            Some(&mgr),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "建新账号: {env}");
+    let new_user_id = env["data"]["id"].as_str().unwrap().parse::<i64>().unwrap();
 
     // 传一个与配置不同的 corp_id + 混合大小写 userid
     // → 落库为配置的 corp + 小写 userid
@@ -221,7 +258,7 @@ async fn wx_bind_ignores_request_corp_id_and_uses_configured_one() {
         fresh_app_with_corp(&pool, WecomFixture::CORP_ID).await,
         json_request(
             "POST",
-            &format!("/iam/users/{}/wx-bind", fx.target_user_id),
+            &format!("/iam/users/{new_user_id}/wx-bind"),
             Some(json!({ "wx_user_id": "  MiXeDCase  ", "corp_id": "ww-second-corp" })),
             Some(&mgr),
         ),
@@ -258,9 +295,8 @@ async fn wx_bind_returns_40109_when_backend_corp_id_blank() {
     assert_eq!(env["code"], 40109);
 }
 
-/// 2026-09-29（review 第 1 轮 Y3）：请求体带 corp_id 也**不能**绕过
-/// 「后端未配置 WECOM_CORPID → 40109」这道闸（否则就是一条「配了但生效不了」
-/// 的隐性配置路径）。
+/// 请求体带 corp_id 也**不能**绕过「后端未配置 WECOM_CORPID → 40109」这道闸
+/// （否则就是一条「配了但生效不了」的隐性配置路径）。
 #[tokio::test]
 async fn wx_bind_request_corp_id_cannot_bypass_40109_when_config_blank() {
     let (pool, _app, fx, _wfx, mgr) = bootstrap().await;
@@ -279,28 +315,116 @@ async fn wx_bind_request_corp_id_cannot_bypass_40109_when_config_blank() {
 }
 
 // ===========================================================================
-// 3. DELETE 解绑
+// 3. 绑定基数：双向一对一
+// ===========================================================================
+
+/// wx → system 方向：该 userid 已属别的账号 → 40108 / 409
+#[tokio::test]
+async fn wx_bind_rejects_userid_owned_by_another_user() {
+    let (pool, _app, fx, _wfx, mgr) = bootstrap().await;
+
+    // lonely_user 在 wecom fixture 里有 `fx_wx_lonely` 的绑定；这里拿 manager 已占的
+    // `fx_wx_manager` 去绑 lonely_user ⇒ wx→system 冲突
+    let (status, env) = send(
+        fresh_app_with_corp(&pool, WecomFixture::CORP_ID).await,
+        json_request(
+            "POST",
+            &format!("/iam/users/{}/wx-bind", fx.lonely_user_id),
+            Some(json!({ "wx_user_id": WecomFixture::MANAGER_WX_USER_ID })),
+            Some(&mgr),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "envelope = {env}");
+    assert_eq!(env["code"], 40108, "envelope = {env}");
+}
+
+/// wx → system 方向：同账号同 userid 重复绑 → 幂等 200，且不新增行
+#[tokio::test]
+async fn wx_bind_same_userid_is_idempotent() {
+    let (pool, _app, fx, wfx, mgr) = bootstrap().await;
+    let before = bind_version(&pool, wfx.target_bind_id).await;
+
+    let (status, env) = send(
+        fresh_app_with_corp(&pool, WecomFixture::CORP_ID).await,
+        json_request(
+            "POST",
+            &format!("/iam/users/{}/wx-bind", fx.target_user_id),
+            Some(json!({ "wx_user_id": "fx_wx_target" })),
+            Some(&mgr),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "envelope = {env}");
+    assert_eq!(
+        env["data"]["id"].as_str().unwrap().parse::<i64>().unwrap(),
+        wfx.target_bind_id,
+        "幂等应返回已有行"
+    );
+
+    let n: i64 = sqlx::query_scalar!(
+        "SELECT count(*) AS \"n!\" FROM t_wx_identity WHERE user_id = $1",
+        fx.target_user_id
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(n, 1, "幂等重复绑不应新增行");
+    assert_eq!(
+        bind_version(&pool, wfx.target_bind_id).await,
+        before,
+        "幂等重复绑不应改动已有行"
+    );
+}
+
+/// system → wx 方向：本账号已绑别的 userid → 40110 / 409
+#[tokio::test]
+async fn wx_bind_rejects_second_distinct_userid_on_same_account() {
+    let (pool, _app, fx, _wfx, mgr) = bootstrap().await;
+
+    let (status, env) = send(
+        fresh_app_with_corp(&pool, WecomFixture::CORP_ID).await,
+        json_request(
+            "POST",
+            &format!("/iam/users/{}/wx-bind", fx.target_user_id),
+            Some(json!({ "wx_user_id": "brand-new-userid" })),
+            Some(&mgr),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "envelope = {env}");
+    assert_eq!(
+        env["code"], 40110,
+        "一个系统账号只能绑一个企业微信 userid：{env}"
+    );
+}
+
+// ===========================================================================
+// 4. POST 解绑
 // ===========================================================================
 
 #[tokio::test]
 async fn wx_unbind_soft_deletes_and_is_idempotent() {
     let (pool, _app, fx, wfx, mgr) = bootstrap().await;
-    let url = format!("/iam/users/{}/wx-bind", fx.manager_user_id);
+    let url = format!("/iam/users/{}/wx-bind/unbind", fx.manager_user_id);
+    let version = bind_version(&pool, wfx.manager_bind_id).await;
 
     let (status, env) = send(
         fresh_app(&pool).await,
-        json_request("DELETE", &url, None, Some(&mgr)),
+        json_request(
+            "POST",
+            &url,
+            Some(json!({ "version": version })),
+            Some(&mgr),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "envelope = {env}");
-    let removed = env["data"].as_array().unwrap();
-    assert_eq!(removed.len(), 1);
-    assert_eq!(
-        removed[0]["id"].as_str().unwrap().parse::<i64>().unwrap(),
-        wfx.manager_bind_id
-    );
+    assert_eq!(env["code"], 0);
+    // 2026-10-10：返回值收敛为 R<()>（data: null），不再回逐行快照
+    assert!(env["data"].is_null(), "unbind 应返 R<()>：{env}");
 
-    // DB 侧确认为软删（deleted_at 非空），不是物理删除
+    // DB 侧确认为软删（deleted_at 非空），不是物理删除；version 推进 +1
     let row = sqlx::query!(
         "SELECT deleted_at AS \"d?\", version FROM t_wx_identity WHERE id = $1",
         wfx.manager_bind_id
@@ -309,23 +433,86 @@ async fn wx_unbind_soft_deletes_and_is_idempotent() {
     .await
     .expect("query deleted_at");
     assert!(row.d.is_some(), "解绑必须是软删（deleted_at 非空）");
-
-    // 2026-09-29（review 第 1 轮 B3）：响应里的 version 必须是**软删之后**的值，
-    // 即与 DB 现状一致；初版推的是删除**前**的旧值，会与 DB 差 1。
     assert_eq!(
-        removed[0]["version"].as_i64(),
-        Some(row.version as i64),
-        "返回的 version 应等于软删后的 DB 值（初版返回的是删除前的旧值，会差 1）"
+        row.version,
+        version + 1,
+        "soft_delete 的 SQL 是 version = version + 1"
     );
 
-    // 幂等：再删一次 → 200 + 空数组
+    // GET 现在应返 data: null
     let (status, env) = send(
         fresh_app(&pool).await,
-        json_request("DELETE", &url, None, Some(&mgr)),
+        json_request(
+            "GET",
+            &format!("/iam/users/{}/wx-bind", fx.manager_user_id),
+            None,
+            Some(&mgr),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "envelope = {env}");
-    assert!(env["data"].as_array().unwrap().is_empty());
+    assert!(env["data"].is_null(), "解绑后 GET 应返 null：{env}");
+
+    // 幂等：再解绑一次 → 200
+    let (status, env) = send(
+        fresh_app(&pool).await,
+        json_request("POST", &url, Some(json!({ "version": 0 })), Some(&mgr)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "envelope = {env}");
+}
+
+/// 缺 `version` → axum `Json` 提取器返 422 **纯文本**（不是业务信封）
+#[tokio::test]
+async fn wx_unbind_without_version_returns_422_plain_text() {
+    let (pool, _app, fx, _wfx, mgr) = bootstrap().await;
+
+    // ⚠️ 422 走 axum `Json` 提取器，body 是**纯文本**不是业务信封 ⇒ 必须用
+    // `send_raw`（`send` 会在 JSON 解析处 panic）
+    let (status, body) = send_raw(
+        fresh_app(&pool).await,
+        json_request(
+            "POST",
+            &format!("/iam/users/{}/wx-bind/unbind", fx.manager_user_id),
+            Some(json!({})),
+            Some(&mgr),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body = {body}");
+    assert!(
+        !body.contains("\"code\""),
+        "422 是纯文本不是业务信封，实际 body = {body}"
+    );
+}
+
+/// version 与 DB 不符 → 409 / 40901
+#[tokio::test]
+async fn wx_unbind_version_mismatch_returns_409() {
+    let (pool, _app, fx, wfx, mgr) = bootstrap().await;
+
+    let (status, env) = send(
+        fresh_app(&pool).await,
+        json_request(
+            "POST",
+            &format!("/iam/users/{}/wx-bind/unbind", fx.manager_user_id),
+            Some(json!({ "version": 999 })),
+            Some(&mgr),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "envelope = {env}");
+    assert_eq!(env["code"], 40901, "envelope = {env}");
+
+    // 冲突时整笔回滚：行仍在
+    let row = sqlx::query!(
+        "SELECT deleted_at AS \"d?\" FROM t_wx_identity WHERE id = $1",
+        wfx.manager_bind_id
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query");
+    assert!(row.d.is_none(), "OCC 冲突后不得真的软删");
 }
 
 #[tokio::test]
@@ -337,17 +524,40 @@ async fn wx_unbind_requires_manager_role() {
         IamFixture::PASSWORD,
     )
     .await;
+    let version = bind_version(&pool, WecomFixture::MANAGER_BIND_ID).await;
 
     let (status, env) = send(
         fresh_app(&pool).await,
         json_request(
-            "DELETE",
-            &format!("/iam/users/{}/wx-bind", fx.manager_user_id),
-            None,
+            "POST",
+            &format!("/iam/users/{}/wx-bind/unbind", fx.manager_user_id),
+            Some(json!({ "version": version })),
             Some(&clerk),
         ),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "envelope = {env}");
     assert_eq!(env["code"], 40300);
+}
+
+/// 旧路由 `DELETE /iam/users/{id}/wx-bind` 已下线、无 alias ⇒ 405
+#[tokio::test]
+async fn wx_unbind_old_delete_route_is_gone() {
+    let (pool, _app, fx, _wfx, mgr) = bootstrap().await;
+
+    let (status, body) = send_raw(
+        fresh_app(&pool).await,
+        json_request(
+            "DELETE",
+            &format!("/iam/users/{}/wx-bind", fx.manager_user_id),
+            None,
+            Some(&mgr),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::METHOD_NOT_ALLOWED,
+        "DELETE 已下线（无 alias），只应 405：{body}"
+    );
 }

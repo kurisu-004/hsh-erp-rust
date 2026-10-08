@@ -11,6 +11,12 @@
 //! - `shelf_ids`：可访问的具体货架列表
 //! - `shelf_wildcard`：是否对所有货架放行（仅 Manager 标志）
 //!
+//! ## Role ↔ 字符串的唯一真源
+//! 2026-10-10 收敛：`Role` 的字符串表示此前散在 3 处（`auth::rbac::parse_role_string`
+//! 反向映射、`iam::service::account::role_as_str` 正向映射、`iam::service::session`
+//! 的私有 `parse_role` 复制品），改规则时极易漏改一处。现在两个方向都收在本文件：
+//! `Role::as_str`（正向）与 `parse_role_string`（反向）。
+//!
 //! ## JWT 字段（2026-09-22 重构）
 //! - access token 业务字段（username/roles/shelf_ids/shelf_wildcard/ver）已从 JWT 中删除，
 //!   全部改走 Redis session 校验 + 服务端缓存；handler/extractor 仍通过 `CurrentUser`
@@ -23,7 +29,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::shared::error::{AppError, code};
 
-/// 把 DB / Redis 缓存里的大写 role 字符串转回 `Role` 枚举。
+/// 把 DB / Redis 缓存里的大写 role 字符串转回 `Role` 枚举（`Role::as_str` 的反向）。
 ///
 /// 仅识别 5 种已知值；未知值打 `tracing::warn!` 并返回 `None`，调用方自行决定是否跳过。
 pub fn parse_role_string(s: &str) -> Option<Role> {
@@ -52,6 +58,22 @@ pub enum Role {
     CncProgrammer,
     #[serde(rename = "SHELF_ACCOUNT")]
     ShelfAccount,
+}
+
+impl Role {
+    /// `Role` → DB / JSON 中的大写字符串（与本枚举的 `serde(rename)` 逐字一致）。
+    ///
+    /// 改任一处的 `serde(rename)` 必须同步改这里，否则「序列化给前端」与「写进
+    /// `t_user_role.role`」会分叉，而后者只有 restart 后重建的数据才对得上。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Manager => "MANAGER",
+            Role::Clerk => "CLERK",
+            Role::Inspector => "INSPECTOR",
+            Role::CncProgrammer => "CNC_PROGRAMMER",
+            Role::ShelfAccount => "SHELF_ACCOUNT",
+        }
+    }
 }
 
 /// access token 标准字段 + RFC 7519 claim set（业务字段已全部移到 Redis session）

@@ -1,7 +1,9 @@
 //! iam service 层入口
 //!
 //! 按职责拆为：
-//! - `account` — AccountService（原 UserService）：账号 CRUD + 角色管理 + 改密
+//! - `account` — AccountService（原 UserService）：账号 CRUD + 角色管理 + 改密 + 企业微信绑定。
+//!   2026-10-10 起 `account/` 是子目录，三块 + `mod.rs` 里的常量与共享 helper：
+//!   `user`（`t_user`）、`role`（`t_user_role`）、`wx`（`t_wx_identity`）
 //! - `session` — SessionService（原 AuthService）：login / refresh / me / logout / change-password
 //! - `menu`    — `build_menu_tree` 纯函数（菜单树组装）
 //!
@@ -18,6 +20,8 @@ mod session;
 #[cfg(test)]
 mod tests;
 
-pub use account::{AccountService, DEFAULT_RESET_PASSWORD, role_as_str};
+pub use account::{
+    ALLOWED_SHELF_ZONES, AccountService, DEFAULT_RESET_PASSWORD, SCOPE_TYPE_SHELF, role_as_str,
+};
 pub use menu::build_menu_tree;
 pub use session::SessionService;

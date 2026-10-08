@@ -26,6 +26,10 @@
 //! **不**自动创建账号——企业微信通讯录与本系统账号并非一一对应，自动开户会让
 //! 离职/外部协作人员凭一个 userid 拿到系统权限。
 //!
+//! 2026-10-10：绑定表的查询与系统账号解析合进 iam 域的
+//! `AccountService::resolve_wx_login_user`（`t_wx_identity` 的 SQL 真源属 iam 域），
+//! 本 handler 对该表零 SQL。
+//!
 //! ## `session_key` 拿到即丢
 //! 本方案只用 userid 做身份映射，不解密任何业务数据（无手机号 / 头像昵称），
 //! 因此 `session_key` 在 `HttpWeComClient` 反序列化瞬间即被丢弃，**不落库**、
@@ -56,14 +60,12 @@ use axum::Router;
 use axum::extract::State;
 use axum::routing::post;
 
-use crate::modules::iam::repo::sql::user::get_user_by_id;
 use crate::modules::iam::vo::LoginResponse;
 use crate::shared::error::{AppError, code};
 use crate::shared::response::R;
 use crate::state::AppState;
 
 use super::dto::WxLoginRequest;
-use super::repo::{WxIdentity, WxIdentityRepo};
 
 /// `/api/v2/wx/iam/*` 入口 router 工厂。
 pub fn router() -> Router<Arc<AppState>> {
@@ -124,26 +126,13 @@ pub async fn wx_login(
     // ---- 3. 事务内：查绑定 → 查 user → 签 token ---------------------------
     let mut tx = state.pool.begin().await?;
 
-    // 3a. 预绑定查询（仅预绑定，未绑定即拒）
-    let identity: Option<WxIdentity> =
-        WxIdentityRepo::get_by_corp_and_user(&mut *tx, expected_corp, &wx_user_id).await?;
-    let Some(identity) = identity else {
-        return Err(AppError::biz(
-            code::BIZ_WX_NOT_BOUND,
-            "该企业微信账号未绑定系统账号，请联系管理员",
-        ));
-    };
-
-    // 3b. 取系统账号（软删 / 不存在 → 40101；不泄露「绑定记录存在但账号已删」）
-    let user = get_user_by_id(&mut *tx, identity.user_id)
-        .await?
-        .ok_or_else(|| {
-            tracing::warn!(
-                user_id = identity.user_id,
-                "wx-login: 绑定指向的用户不存在或已软删"
-            );
-            AppError::biz(code::BIZ_AUTH_INVALID, "用户名或密码错误")
-        })?;
+    // 3a+3b. 查预绑定 + 取系统账号（两步合进 iam 域的 `resolve_wx_login_user`：
+    // 绑定表的 SQL 真源属 iam 域，wx 域对 `t_wx_identity` 零 SQL）。
+    // 错误码语义与拆开写时逐字相同：未绑定 → 40107；账号已软删/不存在 → 40101。
+    let user = state
+        .account_service
+        .resolve_wx_login_user(&mut *tx, expected_corp, &wx_user_id)
+        .await?;
 
     // 3c. 复用 iam 登录流水线（is_active → 角色 → shelf 范围 → 菜单 → 签双 token）
     let pending = state

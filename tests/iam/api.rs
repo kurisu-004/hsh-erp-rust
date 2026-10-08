@@ -34,8 +34,8 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 
 use hsh_erp_test_support::{
-    IamFixture, json_request, load_iam_fixture, login_token, send as ts_send, test_app, test_pool,
-    test_state,
+    IamFixture, json_request, load_iam_fixture, login_token, send as ts_send, send_raw, test_app,
+    test_pool, test_state,
 };
 
 // ===========================================================================
@@ -525,6 +525,231 @@ async fn add_duplicate_role_returns_409() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(env["code"], 20604);
+}
+
+// ===========================================================================
+// 7. OCC 锚点：4 个写端点 body 必须显式带 version（2026-10-10）
+// ===========================================================================
+
+/// 读一个账号的当前 `version`（写端点的 OCC 锚点）。
+async fn user_version(pool: &PgPool, user_id: i64) -> i32 {
+    sqlx::query_scalar!(
+        "SELECT version AS \"v!\" FROM t_user WHERE id = $1",
+        user_id
+    )
+    .fetch_one(pool)
+    .await
+    .expect("query t_user.version")
+}
+
+#[tokio::test]
+async fn update_user_with_version_succeeds() {
+    let (pool, app, fx) = bootstrap().await;
+    let (_, login_env) = login_admin(app, &fx.manager_username, IamFixture::PASSWORD).await;
+    let mgr = login_env["data"]["token"].as_str().unwrap().to_string();
+    let version = user_version(&pool, fx.target_user_id).await;
+
+    let (status, env) = send(
+        fresh_app(&pool).await,
+        json_request(
+            "POST",
+            &format!("/iam/users/{}/update", fx.target_user_id),
+            Some(json!({ "version": version, "full_name": "Renamed" })),
+            Some(&mgr),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "envelope = {env}");
+    assert_eq!(env["data"]["full_name"], "Renamed");
+    assert_eq!(env["data"]["version"], version + 1);
+}
+
+#[tokio::test]
+async fn update_user_without_version_returns_422_plain_text() {
+    let (pool, app, fx) = bootstrap().await;
+    let (_, login_env) = login_admin(app, &fx.manager_username, IamFixture::PASSWORD).await;
+    let mgr = login_env["data"]["token"].as_str().unwrap().to_string();
+
+    // ⚠️ 422 走 axum `Json` 提取器，body 是**纯文本**不是业务信封 ⇒ 必须用
+    // `send_raw`（`send` 会在 JSON 解析处 panic）
+    let (status, body) = send_raw(
+        fresh_app(&pool).await,
+        json_request(
+            "POST",
+            &format!("/iam/users/{}/update", fx.target_user_id),
+            Some(json!({ "full_name": "Renamed" })),
+            Some(&mgr),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body = {body}");
+    assert!(
+        !body.contains("\"code\""),
+        "422 应是纯文本不是业务信封，实际 body = {body}"
+    );
+    assert!(body.contains("version"), "错误信息应点名缺失字段：{body}");
+}
+
+#[tokio::test]
+async fn deactivate_user_with_version_succeeds() {
+    let (pool, app, fx) = bootstrap().await;
+    let (_, login_env) = login_admin(app, &fx.manager_username, IamFixture::PASSWORD).await;
+    let mgr = login_env["data"]["token"].as_str().unwrap().to_string();
+    let version = user_version(&pool, fx.target_user_id).await;
+
+    let (status, env) = send(
+        fresh_app(&pool).await,
+        json_request(
+            "POST",
+            &format!("/iam/users/{}/deactivate", fx.target_user_id),
+            Some(json!({ "version": version })),
+            Some(&mgr),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "envelope = {env}");
+    assert_eq!(env["data"]["is_active"], false);
+    assert_eq!(env["data"]["version"], version + 1);
+}
+
+#[tokio::test]
+async fn deactivate_user_without_version_returns_422_plain_text() {
+    let (pool, app, fx) = bootstrap().await;
+    let (_, login_env) = login_admin(app, &fx.manager_username, IamFixture::PASSWORD).await;
+    let mgr = login_env["data"]["token"].as_str().unwrap().to_string();
+
+    let (status, body) = send_raw(
+        fresh_app(&pool).await,
+        json_request(
+            "POST",
+            &format!("/iam/users/{}/deactivate", fx.target_user_id),
+            Some(json!({})),
+            Some(&mgr),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body = {body}");
+    assert!(
+        !body.contains("\"code\""),
+        "422 应是纯文本不是业务信封，实际 body = {body}"
+    );
+}
+
+#[tokio::test]
+async fn remove_role_with_version_succeeds() {
+    let (pool, app, fx) = bootstrap().await;
+    let (_, login_env) = login_admin(app, &fx.manager_username, IamFixture::PASSWORD).await;
+    let mgr = login_env["data"]["token"].as_str().unwrap().to_string();
+
+    // 先授一个角色，再撤
+    let (status, env) = send(
+        fresh_app(&pool).await,
+        json_request(
+            "POST",
+            &format!("/iam/users/{}/roles", fx.target_user_id),
+            Some(json!({ "role": "SHELF_ACCOUNT", "scope_type": "shelf", "scope_id": fx.shelf_a_id })),
+            Some(&mgr),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "add_role: {env}");
+    let role_id = env["data"]["id"].as_str().unwrap().parse::<i64>().unwrap();
+    let role_version = env["data"]["version"].as_i64().unwrap() as i32;
+
+    let (status, env) = send(
+        fresh_app(&pool).await,
+        json_request(
+            "POST",
+            &format!("/iam/users/{}/roles/{role_id}/remove", fx.target_user_id),
+            Some(json!({ "version": role_version })),
+            Some(&mgr),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "remove_role: {env}");
+    assert!(env["data"].is_null(), "remove_role 应返 R<()>：{env}");
+}
+
+#[tokio::test]
+async fn remove_role_without_version_returns_422_plain_text() {
+    let (pool, app, fx) = bootstrap().await;
+    let (_, login_env) = login_admin(app, &fx.manager_username, IamFixture::PASSWORD).await;
+    let mgr = login_env["data"]["token"].as_str().unwrap().to_string();
+
+    let (status, body) = send_raw(
+        fresh_app(&pool).await,
+        json_request(
+            "POST",
+            &format!(
+                "/iam/users/{}/roles/900000000000009999/remove",
+                fx.target_user_id
+            ),
+            Some(json!({})),
+            Some(&mgr),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body = {body}");
+    assert!(
+        !body.contains("\"code\""),
+        "422 应是纯文本不是业务信封，实际 body = {body}"
+    );
+}
+
+#[tokio::test]
+async fn remove_role_version_mismatch_returns_409() {
+    let (pool, app, fx) = bootstrap().await;
+    let (_, login_env) = login_admin(app, &fx.manager_username, IamFixture::PASSWORD).await;
+    let mgr = login_env["data"]["token"].as_str().unwrap().to_string();
+
+    let (_, env) = send(
+        fresh_app(&pool).await,
+        json_request(
+            "POST",
+            &format!("/iam/users/{}/roles", fx.target_user_id),
+            Some(json!({ "role": "SHELF_ACCOUNT", "scope_type": "shelf", "scope_id": fx.shelf_a_id })),
+            Some(&mgr),
+        ),
+    )
+    .await;
+    let role_id = env["data"]["id"].as_str().unwrap().parse::<i64>().unwrap();
+
+    let (status, env) = send(
+        fresh_app(&pool).await,
+        json_request(
+            "POST",
+            &format!("/iam/users/{}/roles/{role_id}/remove", fx.target_user_id),
+            Some(json!({ "version": 999 })),
+            Some(&mgr),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "envelope = {env}");
+    assert_eq!(env["code"], 40901, "envelope = {env}");
+}
+
+#[tokio::test]
+async fn admin_reset_password_stays_occ_exempt_and_needs_no_version() {
+    // OCC 豁免清单登记的幂等端点：body 不收 version，缺失也必须正常跑
+    let (pool, app, fx) = bootstrap().await;
+    let (_, login_env) = login_admin(app, &fx.manager_username, IamFixture::PASSWORD).await;
+    let mgr = login_env["data"]["token"].as_str().unwrap().to_string();
+
+    let (status, env) = send(
+        fresh_app(&pool).await,
+        json_request(
+            "POST",
+            &format!("/iam/users/{}/reset-password", fx.clerk_user_id),
+            Some(json!({})),
+            Some(&mgr),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "envelope = {env}");
+    assert_eq!(
+        env["data"]["id"].as_str().unwrap().parse::<i64>().unwrap(),
+        fx.clerk_user_id
+    );
 }
 
 // ===========================================================================

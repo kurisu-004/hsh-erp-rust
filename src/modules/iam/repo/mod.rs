@@ -2,7 +2,7 @@ pub mod sql;
 
 pub mod model;
 
-pub use model::{Menu, Shelf, User, UserRole};
+pub use model::{Menu, Shelf, User, UserRole, WxIdentity, WxIdentityInsert};
 pub use sql::user::{UserInsert, UserPartialUpdate};
 pub use sql::user_role::{UserRoleInsert, UserRoleRow};
 
@@ -75,10 +75,16 @@ pub trait IamRepoTrait: Send {
         updated_by: Option<i64>,
     ) -> Result<u64, sqlx::Error>;
 
-    // ── t_user_role（5）──
+    // ── t_user_role（6）──
     async fn list_user_roles_by_user_id(
         &mut self,
         user_id: i64,
+    ) -> Result<Vec<UserRoleRow>, sqlx::Error>;
+    /// 批量版 `list_user_roles_by_user_id`：`list_users` 的 N+1 消解路径
+    /// （一页 N 个账号 → 一次 `WHERE user_id = ANY($1)`）。
+    async fn list_user_roles_by_user_ids(
+        &mut self,
+        user_ids: &[i64],
     ) -> Result<Vec<UserRoleRow>, sqlx::Error>;
     async fn get_user_role_by_id(&mut self, id: i64) -> Result<Option<UserRole>, sqlx::Error>;
     async fn has_user_role_with_scope<'a>(
@@ -105,4 +111,23 @@ pub trait IamRepoTrait: Send {
 
     // ── t_shelf（1）──
     async fn get_shelf_by_id(&mut self, id: i64) -> Result<Option<Shelf>, sqlx::Error>;
+
+    // ── t_wx_identity（4，2026-10-10 自 wx 域搬入）──
+    async fn get_wx_identity_by_corp_and_user<'a>(
+        &mut self,
+        corp_id: &'a str,
+        wx_user_id: &'a str,
+    ) -> Result<Option<WxIdentity>, sqlx::Error>;
+    async fn get_wx_identity_by_user_id(
+        &mut self,
+        user_id: i64,
+    ) -> Result<Vec<WxIdentity>, sqlx::Error>;
+    async fn create_wx_identity(&mut self, identity: &WxIdentityInsert) -> Result<(), sqlx::Error>;
+    async fn soft_delete_wx_identity(
+        &mut self,
+        id: i64,
+        version: i32,
+        when: NaiveDateTime,
+        updated_by: Option<i64>,
+    ) -> Result<u64, sqlx::Error>;
 }

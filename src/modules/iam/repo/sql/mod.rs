@@ -1,12 +1,13 @@
-//! iam 域 SQL 真源（按实体拆 4 子文件）+ 单一 `impl IamRepoTrait for &mut PgConnection` 块
+//! iam 域 SQL 真源（按实体拆 5 子文件）+ 单一 `impl IamRepoTrait for &mut PgConnection` 块
 //!
-//! ## 结构（2026-09-22 重构 #2）
+//! ## 结构
 //! - `user.rs`        — `t_user` 10 个 SQL fns + `UserInsert` / `UserPartialUpdate<'_>` 入参
-//! - `user_role.rs`   — `t_user_role` 5 个 SQL fns + `UserRoleInsert` / `UserRoleRow`
+//! - `user_role.rs`   — `t_user_role` 6 个 SQL fns + `UserRoleInsert` / `UserRoleRow`
 //! - `menu.rs`        — `t_menu` 1 个 SQL fn
 //! - `shelf.rs`       — `t_shelf` 1 个 SQL fn（本域只读）
+//! - `wx_identity.rs` — `t_wx_identity` 4 个 SQL fns（2026-10-10 自 wx 域搬入）
 //! - `mod.rs`（本文件）— 声明子模块 + **单一** `impl IamRepoTrait for &mut PgConnection` 块
-//!   （覆盖全部 17 方法，按实体分组；call 各子文件 free fn）
+//!   （覆盖全部 22 方法，按实体分组；call 各子文件 free fn）
 //!
 //! ## 为什么不是 4 个分散 impl 块
 //! Rust coherence 规则：同 crate 内同一 trait 对同一类型至多一个 impl 块（auto trait
@@ -14,21 +15,31 @@
 //! SQL 子文件仅放「真源」（free fn + 入参 DTO），调用点 `super::user::xxx`。
 //!
 //! ## SQL 真源 → trait 方法的薄委托
-//! impl 块里每方法只一行 `super::xxx::yyy(&mut **self, ...).await`，无业务分支；
-//! 全部 17 行的 `&mut **self` reborrow（避免 move 引用本身）见 `repo/mod.rs` 注释。
+//! impl 块里每方法只一行 `super::xxx::yyy(&mut **self, ...).await`，无业务分支。
+//!
+//! ### 为什么方法体一律是 `&mut **self`（2026-10-10 复核）
+//! 本 impl 是 `impl IamRepoTrait for &mut PgConnection`，方法签名里 `self` 的类型是
+//! `&mut &mut PgConnection`。`*self` 是「内层那个 `&mut PgConnection` 本身」，按值
+//! 用它等于把引用 move 出借来的内容（编译报 cannot move out of borrowed content）；
+//! `&mut **self` 才是 **reborrow** —— 重新借一层 `&mut PgConnection` 交给子文件
+//! free fn（其首参与之一致），`self` 本身保持可用。
+//! **22 个方法 = 22 处 reborrow**，与本文件 impl 块的方法数、`repo/mod.rs` 里 trait
+//! 的方法数三者恒等。`repo/mod.rs` 只承担 trait 声明与命名约定，不承载这个实现细节，
+//! 故说明就地留在本文件。
 
 pub mod menu;
 pub mod shelf;
 pub mod user;
 pub mod user_role;
+pub mod wx_identity;
 
 use async_trait::async_trait;
 use chrono::NaiveDateTime;
 use sqlx::PgConnection;
 
-use crate::modules::iam::repo::model::{Menu, Shelf, User, UserRole};
+use crate::modules::iam::repo::model::{Menu, Shelf, User, UserRole, WxIdentity};
 use crate::modules::iam::repo::{
-    IamRepoTrait, UserInsert, UserPartialUpdate, UserRoleInsert, UserRoleRow,
+    IamRepoTrait, UserInsert, UserPartialUpdate, UserRoleInsert, UserRoleRow, WxIdentityInsert,
 };
 
 /// 统一 `IamRepoTrait for &mut PgConnection` 实现（按实体分组，零业务逻辑）
@@ -117,12 +128,18 @@ impl IamRepoTrait for &mut PgConnection {
         .await
     }
 
-    // ── t_user_role（5）──
+    // ── t_user_role（6）──
     async fn list_user_roles_by_user_id(
         &mut self,
         user_id: i64,
     ) -> Result<Vec<UserRoleRow>, sqlx::Error> {
         user_role::list_user_roles_by_user_id(&mut **self, user_id).await
+    }
+    async fn list_user_roles_by_user_ids(
+        &mut self,
+        user_ids: &[i64],
+    ) -> Result<Vec<UserRoleRow>, sqlx::Error> {
+        user_role::list_user_roles_by_user_ids(&mut **self, user_ids).await
     }
     async fn get_user_role_by_id(&mut self, id: i64) -> Result<Option<UserRole>, sqlx::Error> {
         user_role::get_user_role_by_id(&mut **self, id).await
@@ -160,5 +177,32 @@ impl IamRepoTrait for &mut PgConnection {
     // ── t_shelf（1）──
     async fn get_shelf_by_id(&mut self, id: i64) -> Result<Option<Shelf>, sqlx::Error> {
         shelf::get_shelf_by_id(&mut **self, id).await
+    }
+
+    // ── t_wx_identity（4，2026-10-10 自 wx 域搬入）──
+    async fn get_wx_identity_by_corp_and_user<'b>(
+        &mut self,
+        corp_id: &'b str,
+        wx_user_id: &'b str,
+    ) -> Result<Option<WxIdentity>, sqlx::Error> {
+        wx_identity::get_wx_identity_by_corp_and_user(&mut **self, corp_id, wx_user_id).await
+    }
+    async fn get_wx_identity_by_user_id(
+        &mut self,
+        user_id: i64,
+    ) -> Result<Vec<WxIdentity>, sqlx::Error> {
+        wx_identity::get_wx_identity_by_user_id(&mut **self, user_id).await
+    }
+    async fn create_wx_identity(&mut self, identity: &WxIdentityInsert) -> Result<(), sqlx::Error> {
+        wx_identity::create_wx_identity(&mut **self, identity).await
+    }
+    async fn soft_delete_wx_identity(
+        &mut self,
+        id: i64,
+        version: i32,
+        when: NaiveDateTime,
+        updated_by: Option<i64>,
+    ) -> Result<u64, sqlx::Error> {
+        wx_identity::soft_delete_wx_identity(&mut **self, id, version, when, updated_by).await
     }
 }

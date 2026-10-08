@@ -7,7 +7,7 @@ pub mod account;
 pub mod login;
 
 pub use account::{
-    ChangePasswordRequest, UserAddRoleRequest, UserCreateRequest, UserListQuery, UserUpdateRequest,
-    WxBindRequest,
+    ChangePasswordRequest, UserAddRoleRequest, UserCreateRequest, UserDeactivateRequest,
+    UserListQuery, UserRemoveRoleRequest, UserUpdateRequest, WxBindRequest, WxUnbindRequest,
 };
 pub use login::{LoginRequest, RefreshRequest};

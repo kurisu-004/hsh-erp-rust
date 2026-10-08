@@ -7,6 +7,7 @@
 //!   40101 BIZ_AUTH_INVALID、40102 TOKEN_EXPIRED、40103 REFRESH_INVALID、40104 OLD_PASSWORD_MISMATCH、
 //!   40105 SESSION_REVOKED、40106 BIZ_WX_LOGIN_FAILED、40107 BIZ_WX_NOT_BOUND、
 //!   40108 BIZ_WX_BINDING_DUPLICATE、40109 BIZ_WX_NOT_CONFIGURED、
+//!   40110 BIZ_WX_USER_ALREADY_BOUND、
 //!   40300 FORBIDDEN、40301 SHELF_MISMATCH、40400 NOT_FOUND、40800 REQUEST_TIMEOUT、
 //!   40901 VERSION_CONFLICT、41301 REQUEST_TOO_LARGE）
 //!   Auth 业务码与通用 UNAUTHORIZED 的区别：业务码携带细分原因。
@@ -65,10 +66,14 @@ pub mod code {
     //   （admin 绑定端点；绑到同一个 user_id 是幂等成功，不返此码）。
     // 40109 = 后端未配置企业微信凭据（`corpid` / `corpsecret` 留空 → enabled=false，
     //   `NoopWeComClient` 占位），HTTP 503 表示「服务未就绪」而非「调用方无权」。
+    // 40110 = system → wx 方向的一对一冲突：某 `t_user.id` 已绑了**另一个**
+    //   企业微信 userid（2026-10-10 新增，admin 绑定端点；同 userid 重复绑是幂等成功，
+    //   不返此码）。与 40108 的方向相反：40108 是「这个 userid 已经名花有主」。
     pub const BIZ_WX_LOGIN_FAILED: i32 = 40106;
     pub const BIZ_WX_NOT_BOUND: i32 = 40107;
     pub const BIZ_WX_BINDING_DUPLICATE: i32 = 40108;
     pub const BIZ_WX_NOT_CONFIGURED: i32 = 40109;
+    pub const BIZ_WX_USER_ALREADY_BOUND: i32 = 40110;
 
     pub const FORBIDDEN: i32 = 40300;
 
@@ -466,7 +471,9 @@ fn status_from_code(c: i32) -> StatusCode {
         // ⚠️ 必须显式登记：下面 `(40000..50000) => BAD_REQUEST` 的兜底会把它们变成 400。
         c if c == code::BIZ_WX_NOT_BOUND => StatusCode::FORBIDDEN,
         c if c == code::BIZ_WX_NOT_CONFIGURED => StatusCode::SERVICE_UNAVAILABLE,
-        c if c == code::BIZ_WX_BINDING_DUPLICATE => StatusCode::CONFLICT,
+        c if c == code::BIZ_WX_BINDING_DUPLICATE || c == code::BIZ_WX_USER_ALREADY_BOUND => {
+            StatusCode::CONFLICT
+        }
         c if c == code::SHELF_MISMATCH => StatusCode::FORBIDDEN,
         c if c == code::USER_NOT_FOUND || c == code::ROLE_NOT_FOUND => StatusCode::NOT_FOUND,
         c if c == code::DUPLICATE_USERNAME || c == code::ROLE_DUPLICATE => StatusCode::CONFLICT,
@@ -1062,6 +1069,7 @@ mod tests {
         assert_eq!(code::BIZ_WX_NOT_BOUND, 40107);
         assert_eq!(code::BIZ_WX_BINDING_DUPLICATE, 40108);
         assert_eq!(code::BIZ_WX_NOT_CONFIGURED, 40109);
+        assert_eq!(code::BIZ_WX_USER_ALREADY_BOUND, 40110);
         assert_eq!(code::FORBIDDEN, 40300);
         assert_eq!(code::SHELF_MISMATCH, 40301);
         assert_eq!(code::NOT_FOUND, 40400);

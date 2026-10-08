@@ -1,10 +1,10 @@
 //! iam 域 service 层单元测试公共 fixture（2026-09-23 新增）
 //!
-//! 为 `account.rs`（27 用例）+ `session.rs`（13 用例）提供：
+//! 为 `account/`（`user` 20 + `role` 8 + `wx` 16 用例）+ `session.rs`（14 用例）提供：
 //! - `MockIamRepoTrait` 注入（mockall 0.15 automock 自动生成于 `iam/repo/mod.rs`）
 //! - `test_snowflake()`：**lib 单测进程内唯一**的雪花 ID 生成器（2026-10-09 起
 //!   转发到 `crate::shared::test_snowflake::shared_test_snowflake()`）
-//! - `current_with_role(role)` / `current_manager()` / `current_worker()` / `current_inspector()`
+//! - `current_with_role(role)` / `current_manager()` / `current_clerk()`
 //! - `make_account_service()` / `make_session_service()`：service 实例工厂
 //! - `sample_user(...)` / `sample_user_role(...)`：mock 返回值构造
 //! - `test_jwt_config()`：session service 测试用的 JwtConfig（含 RS256 RSA keypair）

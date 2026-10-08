@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, corp_id, wx_user_id, user_id, version,\n                   created_at, created_by, updated_at, updated_by, deleted_at\n            FROM t_wx_identity\n            WHERE user_id = $1 AND deleted_at IS NULL\n            ORDER BY created_at ASC, id ASC\n            ",
+  "query": "\n        SELECT id, corp_id, wx_user_id, user_id, version,\n               created_at, created_by, updated_at, updated_by, deleted_at\n        FROM t_wx_identity\n        WHERE corp_id = $1 AND wx_user_id = $2 AND deleted_at IS NULL\n        ",
   "describe": {
     "columns": [
       {
@@ -116,7 +116,8 @@
     ],
     "parameters": {
       "Left": [
-        "Int8"
+        "Text",
+        "Text"
       ]
     },
     "nullable": [
@@ -132,5 +133,5 @@
       true
     ]
   },
-  "hash": "5683aa00b8776ee2643eeebaebb93fe39d8e4685e38e3bcfdd52157378602e62"
+  "hash": "197643b9170b8b776bc793f5ce95f14d1a16f6b2d6dcb048e6c8c2ff8a87b2c9"
 }

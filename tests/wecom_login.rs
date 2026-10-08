@@ -423,14 +423,32 @@ async fn bind_app(pool: &PgPool) -> axum::Router {
 
 #[tokio::test]
 async fn wx_bind_manager_can_bind_unbound_userid() {
-    let (pool, fx, _wfx, mgr, _clerk) = bind_bootstrap().await;
+    let (pool, _fx, _wfx, mgr, _clerk) = bind_bootstrap().await;
 
-    // fx_iam_target 已绑 fx_wx_target；这里用一个全新 userid 演示绑定能力
+    // wecom fixture 给 5 个账号都建了绑定行（system→wx 方向已占），故先建一个
+    // 全新账号来演示「绑一个没人用的 userid」
     let (status, env) = send(
         bind_app(&pool).await,
         json_request(
             "POST",
-            &format!("/iam/users/{}/wx-bind", fx.target_user_id),
+            "/iam/users",
+            Some(json!({
+                "username": "wxbindnew",
+                "password": "pwd-12345",
+                "full_name": "Wx Bind New",
+            })),
+            Some(&mgr),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "建新账号: {env}");
+    let new_user_id = env["data"]["id"].as_str().unwrap().parse::<i64>().unwrap();
+
+    let (status, env) = send(
+        bind_app(&pool).await,
+        json_request(
+            "POST",
+            &format!("/iam/users/{new_user_id}/wx-bind"),
             Some(json!({ "wx_user_id": "  NewWxUser  " })),
             Some(&mgr),
         ),
@@ -510,33 +528,50 @@ async fn wx_bind_same_account_rebind_is_idempotent_200() {
 async fn wx_unbind_then_rebind_succeeds() {
     let (pool, fx, _wfx, mgr, _clerk) = bind_bootstrap().await;
     let url = format!("/iam/users/{}/wx-bind", fx.target_user_id);
+    let unbind_url = format!("{url}/unbind");
+    let version: i32 = sqlx::query_scalar!(
+        "SELECT version AS \"v!\" FROM t_wx_identity WHERE id = $1",
+        WecomFixture::TARGET_BIND_ID
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query bind version");
 
-    // GET：解绑前能看到 fixture 绑定
+    // GET：解绑前能看到 fixture 绑定（业务上双向一对一 ⇒ data 是单对象）
     let (status, env) = send(
         bind_app(&pool).await,
         json_request("GET", &url, None, Some(&mgr)),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "envelope = {env}");
-    assert_eq!(env["data"].as_array().unwrap().len(), 1);
+    assert_eq!(env["data"]["wx_user_id"], WecomFixture::TARGET_WX_USER_ID);
 
-    // DELETE：软删
+    // POST .../unbind：软删（body 带 OCC 锚点 version）
     let (status, env) = send(
         bind_app(&pool).await,
-        json_request("DELETE", &url, None, Some(&mgr)),
+        json_request(
+            "POST",
+            &unbind_url,
+            Some(json!({ "version": version })),
+            Some(&mgr),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "envelope = {env}");
-    assert_eq!(env["data"].as_array().unwrap().len(), 1);
+    assert!(env["data"].is_null(), "unbind 应返 R<()>：{env}");
 
-    // DELETE 幂等：再删一次仍成功（无绑定 → 空数组）
+    // 幂等：再解绑一次仍成功（无绑定）
     let (status, env) = send(
         bind_app(&pool).await,
-        json_request("DELETE", &url, None, Some(&mgr)),
+        json_request(
+            "POST",
+            &unbind_url,
+            Some(json!({ "version": version })),
+            Some(&mgr),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "envelope = {env}");
-    assert!(env["data"].as_array().unwrap().is_empty());
 
     // 解绑后可重新绑定同一个 userid（partial unique 索引释放了坑位）
     let (status, env) = send(
