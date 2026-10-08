@@ -371,8 +371,8 @@ impl PartService {
         // 独立连续，见该处注释）。
         //
         // 2026-10-09：批次别名由 `b` 改成 `pb`，与 `list_by_worker` 统一 —— 两条
-        // SELECT 都经 `shared::batch::chain::HAS_PROCESS_CHAIN_EXPR`（别名契约是
-        // `p` / `pb` / `cs`），别名不统一就得给片段准备第二套别名。
+        // SELECT 都用同一套绿框判据表达式（它按别名 `p` / `pb` / `cs` 取列），
+        // 别名不统一就得给表达式准备第二套别名。
         //
         // ⚠️ **注入面为 0**：`format!` 只填 `HAS_PROCESS_CHAIN_EXPR` 这一个编译期
         // 常量，其余五个入参一律走 bind，故 `AssertSqlSafe` 包裹安全

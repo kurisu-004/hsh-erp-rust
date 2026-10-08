@@ -396,7 +396,8 @@ impl QueueService {
         // 取 batch 当前所属工序（POOL→WORKER 与 WORKER→POOL 的 target 校验都需要）。
         // 直读 `batch.current_process_id`（migration 004 起的工序池归属权威列），
         // 不经 `current_process_step_id → t_process_chain_step` 反查：那会多一次
-        // DB 往返，且 step 指针只在首次定位工序时写、多工序链工单上会停住。
+        // DB 往返，且指针可空 / 可漂移（存量批次与 admin 主动退回都不保证它有值），
+        // 反查会让这批批次查不到工序。
         let step_process_id: Option<i64> = batch.current_process_id;
 
         // 取 worker 元数据（事件日志 badge_code；POOL→WORKER / WORKER→WORKER 需要源 worker）

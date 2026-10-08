@@ -866,7 +866,7 @@ async fn write_send(
         "OUTSOURCE",
         Some("OUTSOURCE_COMPANY"),
         Some(company_id),
-        // 无链时为 `None` ⇒ 写入口的 clear 分支写 NULL（step 是可选的显示用定位信息）
+        // 无链时为 `None` ⇒ 写入口的 clear 分支写 NULL（step 是可选的链内位置指针）
         step_id,
         // **写外协工序本身**（不是置 NULL）：外协加工的就是这道工序，rollup 派生
         // `t_part.next_process_id` 需要它；且 `status='OUTSOURCE'` +

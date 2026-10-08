@@ -172,7 +172,9 @@ AND ( (cs.process_id IS NOT NULL AND cs.process_id = pb.current_process_id)
 
 **因此绿框的语义按「近似」理解**：它表示「有链、且指针 step 的工序与批次当前工序对得上」，是前端**提示**（可免填下一道工序），**不是**安全保证。真正决定放回时能否免填的是 `is_pointer_consistent` —— 两者不一致时以写侧为准：放回端点会要求显式指定下一道工序，拒收而非静默错值。
 
-上述 3 种形态中**第 ① 种（链行已软删）在本轮写侧已不可达**：`ProcessChainRepo::first_step_in_chain` 补上了 `t_part_process_chain.deleted_at IS NULL` 闸门，该形态的 dispatch 现在落 `20702`（见 §3.1），与读侧 `chain_state = NONE` 口径一致。**但 ② ③ 两种仍可分叉**，且它们靠列表 SQL 自身无法判别。
+形态 ① 的**写侧只对齐了一半**：dispatch 侧的 `ProcessChainRepo::first_step_in_chain` 补上了 `t_part_process_chain.deleted_at IS NULL` 闸门，该形态的 dispatch 落 `20702`（见 §3.1），与读侧 `chain_state = NONE` 口径一致；**但 worker-scan RETURNED 的显式分支尚未对齐** —— `is_pointer_consistent` 因锚链 JOIN 落空而落 false，于是要求前端显式传 `next_process_id`，而解析该工序 step 的 `resolve_step_id_by_process` 不带链行闸门，**在已软删链里照样解析出活跃 step 并落库** ⇒ 绿框给 `true`、闸门放行，与 dispatch 的 `20702` 矛盾。分叉登记见 §8.4「锚链软删的写侧分叉」。
+
+形态 ② ③ 同样仍可分叉，且三种都靠列表 SQL 自身无法判别。
 
 **4 处落点**（四处必须同改，共用同一常量）：
 
@@ -401,9 +403,34 @@ queue 域**整体不适用**域隔离护栏：它继承 worker_pool 的「经本
 
 绿框判据（`HAS_PROCESS_CHAIN_EXPR`，纯 SQL）与放回端点的闸门（`ChainPosition::is_pointer_consistent`，Rust）**不是同一判据**，只共同覆盖「指针 step 的工序 == 批次当前工序」。分叉形态逐条见 §2.6 的表。现状与决议：
 
-- 形态 ①（链行已软删、step 仍活跃）**已从写侧消除**：`ProcessChainRepo::first_step_in_chain` 补了 `t_part_process_chain.deleted_at IS NULL` 闸门，该形态的 dispatch 落 `20702`（§3.1），与读侧 `chain_state = NONE` 一致。
+- 形态 ①（链行已软删、step 仍活跃）**写侧只对齐了一半**：dispatch 侧的 `ProcessChainRepo::first_step_in_chain` 补了 `t_part_process_chain.deleted_at IS NULL` 闸门，该形态的 dispatch 落 `20702`（§3.1），与读侧 `chain_state = NONE` 一致；**worker-scan RETURNED 的显式分支仍会放行**并写下悬空 step 指针 —— 详见本节下一条登记。
 - 形态 ②（链内 `process_id` 重复）③（指针 step 属于另一条链）**仍会分叉**：绿框给 `true`、放回要求显式指定下一道工序。**本轮刻意不修** —— 修它要把 `CHAIN_POSITION_LATERAL_SQL` 整块搬进 4 处列表 SQL，代价与逐批次 LATERAL 的查询成本都不接受。**后果是可接受的**：分叉方向永远是「绿框误报可免填 → 放回端点拒收并要求显式指定」，即**提示偏松、闸门偏严**，不会静默落错值。
 - **前端不要拿绿框当安全保证**，只当提示；「免填对话框」仍应处理「用户没填 / 填了但写端点返 `20701`/`20702`」这条路径。
+
+---
+
+**锚链软删的写侧分叉：dispatch 拒收 / worker-scan 显式分支放行**（2026-10-09 新增登记）。
+
+形态 ①（`t_part_process_chain.deleted_at` 非空、链内 step 仍活跃）在写侧**只对齐了一半** —— 两个写入口的 step 来源不同，只有一个带了链行闸门：
+
+| 写入口 | step 来源 | 链行软删闸门 | 该形态下结果 |
+|---|---|---|---|
+| dispatch | `ProcessChainRepo::first_step_in_chain` | 有（`JOIN t_part_process_chain … AND pc.deleted_at IS NULL`） | 落 `20702` 拒收 |
+| worker-scan RETURNED 的**显式分支** | `optional_step_id` → `ProcessChainRepo::resolve_step_id_by_process` | **无**（只查 `t_process_chain_step`，`WHERE chain_id=$1 AND process_id=$2 AND deleted_at IS NULL`，不 JOIN 链行） | **放行**，并写下悬空 step 指针 |
+
+可达路径（代码级确定）：锚链软删 ⇒ `resolve_chain_position` 的锚链 JOIN（`pc.deleted_at IS NULL`）落空 ⇒ 派生子查询无行 ⇒ `current_step_id = NULL` ⇒ `is_pointer_consistent` 落 false ⇒ RETURNED 走**显式分支**、要求前端传 `next_process_id`；而 `optional_step_id` 经 `resolve_step_id_by_process` 只按 `chain_id` + `process_id` 找 step，**链行软删不影响它命中**，于是解析出 `Some(step_id)`，随 `mark_batch_returned` 落库。
+
+**后果（悬空 step 指针）**：该批次的 `current_process_step_id` 指向一条**软删链**的 step，于是
+
+- 读侧 `GET /parts/by-worker/{worker_id}` 的 `chain_state` 恒 `NONE` —— 它按锚链 JOIN 重新定位，链行软删就无行；
+- 绿框 `HAS_PROCESS_CHAIN_EXPR` 走分支 1（`cs.process_id = pb.current_process_id`，该表达式不 JOIN 链行）⇒ 给 `true`，与上一条矛盾；
+- 后续每一次 worker-scan RETURNED 都重新落回显式分支（`is_pointer_consistent` 永远 false）⇒ 该批次**永远无法自动顺工序推进**，前端每次都要显式填 `next_process_id`。
+
+即「提示偏松 + 自动推进被永久打断」，**不是静默错工序**（下一道工序仍由前端显式给值，链读不出来也猜不出来）。修复链（恢复软删链或换绑）后自愈：重新定位出的指针会落回活跃链。
+
+**本轮刻意不修**：给 `resolve_step_id_by_process` 补同一道链行闸门，会改变**全部 8 个 `optional_step_id` 调用点**的既有行为（`prod/batch/service/shelf.rs`、`programming.rs`、`transition_core.rs`、`repair.rs` 两处、`outsource/move.rs` 两处、`worker_scan.rs`），其中多处当前依赖「链软删时仍能解析 step」的历史行为，需**独立一轮逐点核对**后再改。`first_step_in_chain` 已有的闸门保留不动。
+
+---
 
 **`auto_dispatch_preview` 与 dispatch 对「锚链已软删」分叉**（2026-10-09 新增登记）。
 

@@ -75,7 +75,7 @@ pub struct TPartBatch {
     /// 完整记录见 `migrations/20260930000000_004_add_batch_current_process_id.sql`
     /// 「已知局限 (4)」—— 做写点穷举时不必重新提这两条。
     pub current_process_id: Option<i64>,
-    /// 逻辑 FK → `t_process_chain_step.id`；**可选的显示用定位信息**。
+    /// 逻辑 FK → `t_process_chain_step.id`；**可选的链内位置指针**（随工序推进）。
     ///
     /// **随工序推进的位置指针**（2026-10-09 起）。写点：dispatch（落链首 step）、
     /// worker-scan RETURNED（顺工序时推进到链上下一 step）、以及

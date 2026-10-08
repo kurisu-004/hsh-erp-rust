@@ -439,9 +439,15 @@ async fn read_part_chain_id(
 /// - `process_chain_id IS NULL` → `Ok(None)`，caller 放行、`current_process_step_id` 落 NULL
 /// - 已绑链 → `Ok(Some(chain_id))`
 ///
-/// **链行自身已软删的情形本函数不判**：读的就是 `t_part.process_chain_id` 一个列，
-/// 链软删后该列仍是旧 id，caller 的 step 解析在链内找不到活跃 step 时才以
-/// `20702` 拒收（见 [`optional_step_id`]）。
+/// **链行自身已软删的情形本函数不判**，且**不要**指望下游以 `20702` 兜住：读的就是
+/// `t_part.process_chain_id` 一个列，链软删后该列仍是旧 id；而 [`optional_step_id`]
+/// 解析 step 的底层 `ProcessChainRepo::resolve_step_id_by_process` 只查
+/// `t_process_chain_step`（`chain_id` + `process_id` + step 未软删）、**不 JOIN
+/// `t_part_process_chain`** ⇒ **软删链里照样找得到活跃 step**。
+///
+/// 于是锚链软删时：dispatch 侧（`first_step_in_chain` 带了链行闸门）落 `20702` 拒收，
+/// 而 worker-scan RETURNED 的**显式分支**会放行并写下一个悬空 step 指针。
+/// 分叉登记与后果见 `docs/api/queue.md` §8.4「锚链软删的写侧分叉」。
 ///
 /// 恢复「必须有链」（`20706 BIZ_PROCESS_CHAIN_REQUIRED`）的严格变体时，在本函数
 /// 之上加一层 `ok_or_else` 即可，读链逻辑不必重新发明。

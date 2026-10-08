@@ -381,8 +381,9 @@ impl PartBatchRepo {
     /// status/location」的查询都会把送检批次错当池内批次捞出来。
     ///
     /// 关于 `current_process_step_id`：**本函数仍不写它**（沿用 2026-09-16 PR-3
-    /// 行为）。原先的注释理由是「保留被打回的那一步，让 INSPECTION→to_process
-    /// 时不丢 step 上下文」—— 该理由在 step 降级为**可选的显示用定位信息**后已不成立：
+    /// 行为）—— `clear_process_step_id: false` 使 SQL 的 `COALESCE(.., 原值)`
+    /// 保留原指针。原先的注释理由是「保留被打回的那一步，让 INSPECTION→to_process
+    /// 时不丢 step 上下文」—— 该理由在 step 定位改由各写入口负责后已不成立：
     /// `mark_batch_failed_inspection`（检验不合格打回生产架）会按
     /// `chain_id + next_process_id` **重新解析** step_id 写入
     /// （`inspection_core.rs::to_process`），所以上下文不会真的丢。
@@ -390,10 +391,15 @@ impl PartBatchRepo {
     /// 现在保留 step 的实际价值：它是 `GET /prod/batches/repair` / `repairing`
     /// 两张 VO 的 `next_process_id` / `next_process_name` 的**唯一数据来源**
     /// （step JOIN 派生）。待品检队列读（`GET /prod/inspection/queue`）自 2026-10-03
-    /// 起**不投影**这两列，与本列无关。属**显示用信息**，不是状态机依赖。
-    /// ⚠️ 措辞订正（2026-09-30 review 第 3 轮附带发现）：**不是**「当前走到第
-    /// 几步」—— 本列只在首次定位工序时写、之后一律不再推进（worker-scan
-    /// RETURNED / INSPECTED 都不写），对多工序链工单永远停在首次定位那一步。
+    /// 起**不投影**这两列，与本列无关。它同时是链内**位置指针** —— worker-scan
+    /// RETURNED 的「能否免填 `next_process_id`」闸门
+    /// （`ChainPosition::is_pointer_consistent`）读它；但 `status` 列的状态流转
+    /// 不读它，故不是状态机依赖。
+    ///
+    /// ⚠️ 措辞订正（2026-09-30 review 第 3 轮附带发现，2026-10-09 review 第 2 轮
+    /// 续订）：本列**随工序推进**（dispatch 落链首 step、worker-scan RETURNED 顺
+    /// 工序推进），**不是**「只写一次就停住」；本函数「不写」是**保持原值**（送检
+    /// 不改工序归属），不代表该列不推进。
     pub async fn mark_batch_inspected(
         conn: &mut PgConnection,
         batch_id: i64,
@@ -409,9 +415,10 @@ impl PartBatchRepo {
                 new_location: Some("INSPECTION_SHELF"),
                 new_holder_id: Some(shelf_id),
                 new_process_id: None,
-                // 2026-09-16 PR-3：to_inspection 保留 current_process_step_id，
-                //   但其定位已降级为「可选的显示用定位信息」（首次定位后不再推进）；
-                //   to_process 会重新解析 step 写入，故此处不写不丢状态机上下文。
+                // 2026-09-16 PR-3：to_inspection 保留 current_process_step_id ——
+                //   本列是链内位置指针、随工序推进（dispatch / worker-scan
+                //   RETURNED 写），送检不改工序归属故保留原值；to_process 会按
+                //   新工序重新解析 step 写入。
                 new_process_step_id: None,
                 is_repairing: None,
                 expected_version: Some(expected_version),
@@ -442,7 +449,8 @@ impl PartBatchRepo {
     ///
     /// 2026-09-30 新增 `current_process_id: Option<i64>`：检验不合格打回生产架
     /// = **进池**，故写入目标工序（池归属权威依据）；`current_process_step_id`
-    /// 仍是可选的显示用定位信息（首次定位后不再推进），允许 NULL。
+    /// 是可选的**链内位置指针**（随工序推进、允许 NULL），其值由 caller 在本函数
+    /// 之前按新工序解析后传入。
     ///
     /// ## `is_repairing: None`（保持）的合法性前提（2026-10-01 review 第 2 轮 MAJOR-3）
     ///
