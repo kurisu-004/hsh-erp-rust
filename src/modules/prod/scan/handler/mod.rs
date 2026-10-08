@@ -32,8 +32,10 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/pickable", get(listing::list_pickable))
         .route("/held", get(listing::list_held))
         // ---- 2 段：首段静态 `batches` + 动态 `{batch_id}` ----
-        // ⚠️ 两组段数相同，靠 matchit 的静态段优先规则消解（静态注册在前即可，
-        // 实测 `POST /scan/batches/pick-up` 不会被 `{batch_id}` 吞掉）。
-        // 切勿把 `/batches/{batch_id}/…` 移到静态组之前。
+        // 本域只有这一条 2 段以上路由，与上面 4 条 1 段静态路由**段数不同** ⇒
+        // `matchit` 结构上不可能冲突，注册顺序不影响结果（实测
+        // `POST /scan/batches/pick-up` 与 `POST /scan/batches/1/pick-up` 都按
+        // 本条命中）。将来新增 2 段首段动态路由时，静态组才必须在前（先例见
+        // `src/modules/prod/batch/handler/mod.rs` 的 `/scan/deliver`）。
         .route("/batches/{batch_id}/pick-up", post(transition::pick_up))
 }

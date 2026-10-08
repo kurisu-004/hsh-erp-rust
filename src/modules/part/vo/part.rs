@@ -578,4 +578,31 @@ mod tests {
         // 小写字面量必须拒收（`rename_all = "UPPERCASE"` 的大小写是契约的一部分）
         assert!(serde_json::from_str::<ChainState>("\"next\"").is_err());
     }
+
+    /// ⚠️ 本测试**故意**跨域引用 `prod::scan`（2026-10-10 新增）。理由：报工台
+    /// 迁域时把 `ChainState` 的填充路径整条搬到了 `ScanChainState`，本 VO 那份
+    /// 变成零调用方的孤儿副本 —— 两份 `from_db_text` 是同一段映射抄了两遍，**没有
+    /// 任何测试锁住它们一致**。任一边改了字面量而另一边没改，只会在报工台放回页
+    /// 上表现为「突然让工人手填工序」，离根因极远，所以用对拍把漂移钉死在编译期。
+    ///
+    /// 域隔离不违规：`shared::domain_guard::assert_no_foreign_domain` 只扫
+    /// `src/modules/prod/scan/listing/`，而这条引用写在 part 域的文件里、且只在
+    /// `#[cfg(test)]` 内 —— 产物代码零跨域依赖。
+    #[test]
+    fn from_db_text_matches_scan_chain_state_on_every_input() {
+        use crate::modules::prod::scan::vo::ScanChainState;
+
+        // 三个合法字面量 + 若干未知取值（含大小写 / 空白 / 空串的近似形）。
+        // 比的是**序列化后的 wire 字面量**而非枚举本身：两份是不同类型，
+        // `assert_eq!` 不了，而漂移真正伤人的正是 wire 字面量。
+        for raw in [
+            "NEXT", "TAIL", "NONE", "WAT", "", "next", "Next", "TAIL ", " NONE", "none",
+        ] {
+            let mine = serde_json::to_string(&ChainState::from_db_text(raw))
+                .expect("serialize ChainState");
+            let theirs = serde_json::to_string(&ScanChainState::from_db_text(raw))
+                .expect("serialize ScanChainState");
+            assert_eq!(mine, theirs, "from_db_text 对输入 {raw:?} 的两侧产出漂移了");
+        }
+    }
 }

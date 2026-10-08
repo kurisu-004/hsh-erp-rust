@@ -3,7 +3,12 @@
 > 本文件是 `prod::scan` 域的**唯一**契约来源。任何字段 / 端点变更必须同步本文件。
 > 与本域同批改动的契约见 [`batch.md`](batch.md)（worker-scan / pick-up 的旧出处）、
 > [`queue.md`](queue.md)（refill 与同事务编排）、[`shelves.md`](shelves.md)（自动选架）、
-> [`iam.md`](iam.md)（货架实体）、[`part.md`](part.md) §登记（两条 list 端点的旧出处）。
+> [`iam.md`](iam.md)（货架实体）。
+>
+> ⚠️ part 域**没有** `docs/api/` 契约文档（`docs/api/` 清单里没有它），两条 list
+> 端点的旧出处只能从代码追：`src/modules/part/handler/lifecycle.rs`（旧 handler
+> 所在文件，2026-10-10 起已无这两条路由）与 `src/modules/prod/scan/listing/`
+> （新址）。完整的旧 → 新对照见 §6.1 移除记录表。
 
 ## 0. 2026-10-10 变更摘要
 
@@ -14,8 +19,8 @@
    消费方** —— 5 条端点的唯一消费方是 `views/scan/` 三页（取件 / 放回 / 送检）+
    扫工牌弹窗 + 队列看板的一条动作。后端看它们分属三域、依赖完全不同的模块；从
    工厂现场看它们是**一台机器的五个按钮**。
-2. **行 VO 收敛**：`PartListItem`（39 字段，7 个域共用）→ `ScanListItem`（17 字段）。
-   报工台**零消费**的 22 个占位字段（`applicant_name` 写死空串、`customer_id` 写死
+2. **行 VO 收敛**：`PartListItem`（40 字段，7 个域共用）→ `ScanListItem`（17 字段）。
+   报工台**零消费**的 23 个占位字段（`applicant_name` 写死空串、`customer_id` 写死
    `0`、`status` 写死 `"IN_PROCESS"`、4 个审计字段写死 epoch、`unit_price` /
    `total_price` 写死 `"0"`…）不再下发。逐字段证据见 §2.2。
 3. **出参收敛**：`WorkerOut`（12 字段）→ `ScanWorkerBrief`（4 字段）。报工台合计只读
@@ -156,7 +161,7 @@ $ grep -rno 'worker??\.\(id\|name\|badge_code\|work_type_id\|work_type_name\|id_
 `skip_serializing_if` 会让报工台卡片静默少掉「未知位置」这一行，且仓内没有测试能
 提前发现（前端 fixture 自己显式带上了这个键）。
 
-**被砍掉的 22 个字段**（全部恒为占位值且报工台零消费，按仓内既有先例
+**被砍掉的 23 个字段**（全部恒为占位值且报工台零消费，按仓内既有先例
 `has_cnc_program` 的处理留档）：`applicant_name`（写死空串）/ `request_date`
 （写死 `1970-01-01`）/ `customer_id`（写死 `0`）/ `assembly_id`（恒 null）/
 `status`（写死 `"IN_PROCESS"`）/ `order_no` / `note` / `unit_price` +
@@ -164,7 +169,9 @@ $ grep -rno 'worker??\.\(id\|name\|badge_code\|work_type_id\|work_type_name\|id_
 `p.version`，批次 OCC 只认 `batch_version`）/ `created_at` + `created_by` +
 `updated_at` + `updated_by`（写死 epoch）/ `deleted_at` / `customer_name` /
 `l1_customer_name` / `holder_name` / `row_type` / `has_children` / `child_count` /
-`has_cnc_program`。
+`has_cnc_program` / `delivered_quantity`（`From<TPart>` 是 part 级投影、不含批次
+聚合量 ⇒ 恒 `None`；报工台的行单位是批次，「已送数量」对它是批次级量，取行 SQL
+从 `t_part_batch` 起也不投影该聚合）。
 
 > `request_date` 这一条对前端有连带义务：它原本带一条 `'1970-01-01' → null` 的字段级
 > transform。键不再下发后 Zod 会因 `undefined` 抛错（整份信封 parse 失败），那条
@@ -357,7 +364,7 @@ HTTP 响应的 `refill.shelf_id` 同步。
 ### 6.2 字段
 
 - `ScanWorkerBrief` 相对 `WorkerOut` 删 8 个字段（§2.1）。
-- `ScanListItem` 相对 `PartListItem` 删 22 个字段（§2.2）。
+- `ScanListItem` 相对 `PartListItem` 删 23 个字段（§2.2）。
 - `PickableQuery` 删 `shelf_id`；`ByWorkTypeQuery`（留在 part 域）同步删。
 
 ### 6.3 文件 / 类型归属
@@ -423,17 +430,20 @@ SQL 里聚合，一处他域的 service / repo 都不 import（连 `PartRepoTrai
      `/api/v2/prod/scan/batches/{batch_id}/pick-up`
 2. **api 层函数改名 + 入参形态**：两条 list 函数的过滤键从路径段改 query 参数；删除
    所有 `shelf_id` 入参。
-3. **`scanPartRowSchema` 删 22 个键**（§2.2），其中 `request_date` 那条
+3. **`scanPartRowSchema` 删 23 个键**（§2.2），其中 `request_date` 那条
    `'1970-01-01' → null` 的字段级 transform 必须**一并删**（键不再下发，Zod 会因
    `undefined` 抛错炸掉整份信封）。⚠️ **不要**动 `location` 的声明（键必须在）。
 4. **`scanBadgeSchema`（verify-badge 出参）收敛为 4 键**：`id` / `badge_code` /
    `name` / `work_type_id`（§2.1）。前端 `Worker` 类型若同时服务 worker 管理页，
    需拆成两个类型（管理页继续用全字段 `WorkerOut`）。
-5. **目录归位**：报工台的 api 函数按域落到 `src/api/production/`（或等价的 scan 目录），
-   不要再挂在 `api/parts/crud.ts` / `api/worker.ts` 下 —— 后者按前端实体扁平放置，
-   不按后端模块分层（见 `api/shelves.ts` 文件头）。
-6. **路径形硬切要同步前端契约测试**：`api/parts/__tests__/routes.spec.ts` 与
-   `scan-list.contract.spec.ts` 里逐字写着旧 URL。
+5. **目录归位**：报工台的 api 函数落到**两级切分的两个文件** ——
+   `src/api/productionScan.ts`（请求函数）+ `src/api/productionScan.contract.ts`
+   （守门 schema 与派生类型），不要再挂在 `api/parts/crud.ts` / `api/worker.ts`
+   下 —— 后者按前端实体扁平放置，不按后端模块分层（见 `api/shelves.ts` 文件头）。
+6. **路径形硬切要同步前端契约测试**：旧 URL 逐字写在
+   `src/api/parts/__tests__/routes.spec.ts` 与
+   `src/api/__tests__/productionScan.contract.spec.ts`（随第 5 条一起搬家，
+   原 `src/api/parts/__tests__/scan-list.contract.spec.ts` 是它的旧名）。
 7. **`worker-scan` 的成功文案必须按响应的 `event_type` 分支**（§4.1）—— 2026-10-10
    起这条从「链尾边缘场景」变成常规路径。
 8. **i64 字符串化**：所有雪花 id 仍是 JSON string，本轮不改变该约定。
@@ -442,7 +452,7 @@ SQL 里聚合，一处他域的 service / repo 都不 import（连 `PartRepoTrai
 
 ---
 
-**`part::vo::PartListItem` 的 6 个字段退场（保留但恒占位）**
+**`part::vo::PartListItem` 的 7 个字段退场（保留但恒占位）**
 
 2026-10-10 起，`PartListItem` 里的 `batch_id` / `batch_version` / `chain_state` /
 `chain_next_process_id` / `chain_next_process_name` / `chain_current_process_name` /

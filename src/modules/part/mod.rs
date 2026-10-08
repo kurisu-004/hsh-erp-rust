@@ -22,8 +22,11 @@
 //! `GET /by-worker/{id}` —— 它们的唯一消费方是报工台三页，连同取行 SQL / 出参
 //! 一并迁往 `crate::modules::prod::scan`（新路径
 //! `GET /api/v2/prod/scan/pickable` 与 `GET /api/v2/prod/scan/held`，**无 alias**）。
-//! 两条旧路径是 2 段 path，落进本域 `/{part_id}`（`Path<i64>`）catch-all ⇒ 实际
-//! 返回 **400 纯文本**而不是 404，成因与外协那两条同款（见下）。
+//! 两条旧路径**实际返回干净 404**（不是 400）：它们是 2 段 path，而本域 `/{part_id}`
+//! catch-all 只有 **1 段**，2 段路径够不着它 ⇒ `matchit` 无命中 ⇒ `Path<i64>`
+//! extractor 根本没机会出手。⚠️ 别照抄下方外协那段的 400 —— 那两条是 **1 段**
+//! 静态路径，落进 catch-all 才会被 `Path` 拒成 400。段数是分水岭。逐条实测表见
+//! `docs/api/scan.md` §1.2（「教训登记」小节写了这条直觉为什么不总成立）。
 //!
 //! 2026-10-03 下线 2 条外协 list 端点：`/outsource-in-flight` /
 //! `/outsource-sendable` —— 二者返回的是通用 `PartListItem`，与前端外协域需要的

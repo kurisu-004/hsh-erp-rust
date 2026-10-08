@@ -21,10 +21,12 @@
 //! | `POST /scan/worker-scan` | `POST /prod/batches/worker-scan` | `prod::batch` |
 //! | `POST /scan/batches/{batch_id}/pick-up` | `POST /prod/batches/{batch_id}/pick-up` | `prod::batch` |
 //!
-//! 旧路径的实际失效形态（404 还是 400）逐条登记在 `docs/api/scan.md` ——
-//! `/parts/pickable-by-work-type/{id}` 与 `/parts/by-worker/{id}` 是 2 段 path，
-//! 落进 part 域的 `/{part_id}` catch-all（`Path<i64>`）⇒ 400 纯文本；
-//! `/prod/workers/verify-badge` 落进 worker 域的 `/{id}` ⇒ 同样 400。
+//! 旧路径的实际失效形态（404 / 405，逐条实测）登记在 `docs/api/scan.md` §1.2 ——
+//! **5 条里 4 条 404、1 条 405，没有一条是 400**：两条 part 域旧 list 路径是
+//! 2 段 path，而 part 域的 `/{part_id}` catch-all 只有 1 段、够不着 ⇒ 干净 404；
+//! `/prod/workers/verify-badge` 落进 worker 域的 `/{id}`（那条只注册了 GET）⇒
+//! 方法不匹配 405；两条 batch 域旧路径整段路由已不存在 ⇒ 404。⚠️「落进 catch-all
+//! ⇒ 400」这个直觉不总成立，段的**数量**是分水岭，详见 §1.2 的「教训登记」。
 //!
 //! ## 模块结构
 //! - `dto.rs` —— 5 条端点的全部入参（`VerifyBadgeRequest` / `PickableQuery` /

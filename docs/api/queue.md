@@ -209,7 +209,11 @@ AND ( (cs.process_id IS NOT NULL AND cs.process_id = pb.current_process_id)
 | c | `outsource` | `GET /outsource-queue/processes/{id}` → `items[].has_process_chain`（`OutsourceQueueCandidate`） |
 | d | `prod::scan` | `GET /prod/scan/pickable` 与 `GET /prod/scan/held` → `items[].has_process_chain`（`ScanListItem`）。2026-10-10 自 part 域迁入报工台域，判据常量不变 |
 
-`PartListItem` 是 **7 个域共用**的 VO，仅 (d) 的两个端点填真值；其余构造点（`From<TPart>` / `com::union_list` 的两个 project 函数）显式填 `false` —— 链位置是**批次级**事实，part 级行无从推导（没有 `#[serde(default)]`，漏赋值会编译失败）。
+`PartListItem` 本身仍是 **7 个域共用**的 VO，但 2026-10-10 报工台两条 list 端点连同
+本列迁往 `prod::scan`（行 VO 换成 `ScanListItem`）后，它**已无任何填真值的端点** ——
+本域是上表行 a / b，`outsource` 是行 c。其余构造点（`From<TPart>` /
+`com::union_list` 的两个 project 函数）显式填 `false`：链位置是**批次级**事实，
+part 级行无从推导（没有 `#[serde(default)]`，漏赋值会编译失败）。
 
 ## 3. 下发流 VO（端点 3 / 4 / 5 / 6）
 
@@ -438,7 +442,7 @@ queue 域**整体不适用**域隔离护栏：它继承 worker_pool 的「经本
 7. **i64 字符串化**：所有雪花 id 仍是 JSON string，本仓不因本次改动变更该约定。
 8. **`max_held` 取值位置变更**：原从 `work_types[].max_held_batches` 按工种查，改从 `workers[].max_held` 按工人直接读。`max_held_batches` 未设置时后端返 0（不是 null）—— 展示「未设置上限」占位的逻辑需自行按 0 判断。
 9. **代码里残留的 `WORKER_POOL_*` WS 事件名不变**（`kind` 是 WS 协议的一部分，改它要同步 dashboard 域的白名单与前端 `AFFECTS_DASHBOARD`）。本域改的只是 URL 与类型名。
-10. **4 处卡片 DTO 新增 `has_process_chain`（boolean）**（2026-10-09）：`QueuePoolItem` / `QueueHeldBatch` / `OutsourceQueueCandidate` / `PartListItem`（仅扫码台两条端点填真值）。它是**绿色左边框的判据**，判据见 §2.6。zod 侧按 `z.boolean()` 声明 —— 前端不要按「工单有没有绑链」重新在前端推一遍（后端已经算好，且未定位批次走的是另一个分支）。
+10. **4 处卡片 DTO 新增 `has_process_chain`（boolean）**（2026-10-09）：`QueuePoolItem` / `QueueHeldBatch` / `OutsourceQueueCandidate` / `ScanListItem`。第四处原先是 `PartListItem`，2026-10-10 随报工台两条 list 端点迁往 `prod::scan`（行 VO 换成 `ScanListItem`）后它在 part 域恒为 `false`，字段保留只为不动其余复用该 VO 的域的 wire 形状。它是**绿色左边框的判据**，判据见 §2.6。zod 侧按 `z.boolean()` 声明 —— 前端不要按「工单有没有绑链」重新在前端推一遍（后端已经算好，且未定位批次走的是另一个分支）。
 11. **`POST /queue/move` 的 `version` 升为必填**（2026-10-09）：此前三个方向都由 service 用「本次事务里刚读到的 `batch.version`」当 `expected_version`，等价于**没有 OCC** —— 看板数据是 30s 缓存的快照，期间他人改过批次时「用户看到 5 件 → 实际移动 3 件」会静默成功。值取候选卡 / 持有卡的 `version`；漏传 → **HTTP 422 纯文本**（`version` 无 `#[serde(default)]`）。
 
 ### 8.4 已知偏差登记

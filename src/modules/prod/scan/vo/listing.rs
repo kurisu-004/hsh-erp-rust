@@ -1,6 +1,6 @@
 //! prod::scan 报工台**列表行**出参 VO（`GET /scan/pickable` / `GET /scan/held` 共用）
 //!
-//! 2026-10-10 自 `part::vo::PartListItem`（39 字段）收敛而来。收敛判据是「报工台
+//! 2026-10-10 自 `part::vo::PartListItem`（40 字段）收敛而来。收敛判据是「报工台
 //! 三页真正渲染 / 真正拿它发写请求的字段」，而不是「`t_part` 有这一列」。
 //!
 //! ## 为什么能收敛：行单位是**批次**，不是工单
@@ -12,7 +12,7 @@
 //! 写死 `0`、`status` 写死 `"IN_PROCESS"`、`version`（part 级 OCC）写死 `0`、
 //! 四个审计字段写死 epoch、`unit_price` / `total_price` 写死 `"0"`、
 //! `location` / `holder_name` 恒 null。报工台一个都不读，让它们继续留在 wire 上
-//! 只是让 Zod 守门 schema 逐个声明 20 个不会变的常量。
+//! 只是让 Zod 守门 schema 逐个声明 23 个不会变的常量。
 //!
 //! ## 逐字段的消费证据
 //!
@@ -39,7 +39,9 @@
 //! `order_no` / `note` / `unit_price` / `total_price` / `version` / `created_at` /
 //! `created_by` / `updated_at` / `updated_by` / `deleted_at` / `customer_name` /
 //! `l1_customer_name` / `holder_name` / `row_type` / `has_children` / `child_count` /
-//! `has_cnc_program` —— 全部恒为占位值且报工台零消费。
+//! `has_cnc_program` / `delivered_quantity` —— 全部恒为占位值且报工台零消费
+//! （`delivered_quantity` 是批次级已送聚合量，`From<TPart>` 那侧恒 `None`，
+//! 而报工台这两条端点的取行 SQL 也不投影它）。
 //!
 //! ⚠️ 其中 **`request_date` 需要前端一并删掉那条 `'1970-01-01' → null` 的字段级
 //! transform**（`scanPartRowSchema`）：键不再下发后 Zod 会因 `undefined` 抛错，
