@@ -1,4 +1,4 @@
-//! shelf 域主货架端点响应 VO
+//! 货架子模块主端点响应 VO
 
 use chrono::NaiveDateTime;
 use serde::Serialize;

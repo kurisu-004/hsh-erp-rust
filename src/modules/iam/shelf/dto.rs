@@ -1,4 +1,4 @@
-//! shelf 域 DTO（HTTP 请求入参）
+//! 货架子模块 DTO（HTTP 请求入参）
 //!
 //! 对应 Python myERP/schema/shelf.py。
 //!

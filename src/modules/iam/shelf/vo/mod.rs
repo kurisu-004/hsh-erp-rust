@@ -1,4 +1,4 @@
-//! shelf 域响应 VO（HTTP 返回值隔离层）
+//! 货架子模块响应 VO（HTTP 返回值隔离层）
 //!
 //! 仅含 handler 返回的 output 类型；入参类型见 `super::dto`。
 //! 按端点语义拆为：

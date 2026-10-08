@@ -11,7 +11,7 @@ use sqlx::{AssertSqlSafe, PgConnection, Row};
 
 /// `t_part_batch` 按 `current_holder_id` 聚合的负载子查询（**只此一处**）。
 ///
-/// 2026-10-10 之前本仓有两处**逐字重复**的这段聚合：`modules::shelf::repo::sql.rs`
+/// 2026-10-10 之前本仓有两处**逐字重复**的这段聚合：`iam::shelf::repo::sql`
 /// 里两个 picker 专供查询的内联子查询。两处各写一份的直接后果是它们只能靠注释
 /// 互相约束（「必须逐字一致」）—— 注释不执行，改一处忘了另一处时两个 picker 会
 /// 对同一个架给出不同的负载数，而没有任何测试会红。搬成本常量后约束由类型承担
@@ -74,7 +74,7 @@ pub fn load_ratio(current_load: i64, capacity: Option<i32>) -> Option<f64> {
 ///
 /// ## 为什么是「按 id 批量补」而不是「把负载 JOIN 进货架列表查询」
 ///
-/// 货架列表的过滤 / 分页由 `modules::shelf::repo::sql.rs::list_with_filters` 用
+/// 货架列表的过滤 / 分页由 `iam::shelf::repo::sql::ShelfRepo::list_with_filters` 用
 /// `QueryBuilder` 动态拼（`code_like` / `zone` / `is_active` 三态过滤），那份
 /// 查询**已经是** `t_shelf` 列表端点的权威口径。把负载 JOIN 进去需要让 shared 层
 /// 接管那份 `QueryBuilder`（连带 `count_with_filters` 的重复 WHERE），代价是本层

@@ -1,7 +1,8 @@
-# iam 域 API（认证 + 账号 + 企业微信绑定）
+# iam 域 API（认证 + 账号 + 企业微信绑定 + 货架实体）
 
 > 本文件是 iam 域的**唯一**契约来源。任何字段 / 端点变更必须同步本文件。
-> 覆盖域：`src/modules/iam/`（`handler` / `dto` / `vo` / `service` / `repo`）。
+> 覆盖域：`src/modules/iam/`（`handler` / `dto` / `vo` / `service` / `repo`）+
+> 嵌套子模块 `src/modules/iam/shelf/`（**货架子模块**，见 §1.4）。
 > 域外有一处开口：`modules/wx/auth.rs` 的 `POST /api/v2/wx/iam/wx-login` 经
 > `AccountService::resolve_wx_login_user` 反查本域的 `t_wx_identity`（见 §5）。
 
@@ -52,6 +53,35 @@
 
 端点 10（`reset-password`）是 OCC 豁免的幂等端点、端点 13（`add_role`）是纯 INSERT
 （新行没有 `version`），两者**不收** `version`。
+
+### 1.4 shelves（5，2026-10-10 自独立的 shelf 域迁入）
+
+| # | 方法 | 路径 | 权限 | 事务 | 入参 | 成功码 | 响应 `data` |
+|---|---|---|---|---|---|---|---|
+| 18 | GET | `/iam/shelves` | Manager + Clerk + CncProgrammer + ShelfAccount + Inspector | acquire | `?code_like=&zone=&is_active=&limit=&offset=` | 200 | `ShelfListOut` |
+| 19 | POST | `/iam/shelves` | **Manager 独占** | begin/commit | `{ code, name, zone, location?, capacity?, display_order? }` | **201** | `ShelfOut` |
+| 20 | GET | `/iam/shelves/{id}` | 同端点 18 | acquire | path `id` | 200 | `ShelfOut` |
+| 21 | POST | `/iam/shelves/{id}/update` | **Manager 独占** | begin/commit | `{ name?, location?, capacity?, display_order?, version }` | 200 | `ShelfOut` |
+| 22 | POST | `/iam/shelves/{id}/deactivate` | **Manager 独占** | begin/commit | 无 body | 200 | `null` |
+
+⚠️ **硬切无 alias**：旧前缀 `/api/v2/shelves/*` 整体下线，5 条端点全部 404
+（不带 `/iam` 前缀时连 `/{id}` catch-all 都不存在，故是干净的 404 而非 400）。
+请求 / 响应 / 错误码 / OCC 语义**逐字未变**，只有 URL 前缀变了。
+
+**归属缘由**：账号与货架同属「谁能碰什么」的权限资源 —— `t_user_role` 里
+`SHELF_ACCOUNT` 角色的 `scope_id` 指向某个货架，货架实体是这套权限体系的落点；
+5 条写端点又全部 MANAGer 独占，与账号 / 角色管理同一批授权动作。
+
+不动的东西：工序映射（`prod::shelf_process`，`t_shelf_process` 关联的是 prod 域实体
+`t_process`）与选架设施（`shared::shelf`，跨域设施层、无域归属）**均不搬**。
+
+`t_shelf` 迁入后行结构收口为一份（`iam::shelf::model::TShelf`，14 列含 `capacity`）：
+原先 iam 账号侧那份 13 列投影已删除，`IamRepoTrait::get_shelf_by_id` 改为委托
+`ShelfRepo::get_by_id`（两条 SQL 谓词逐字相同，都只过滤 `deleted_at`、不过滤
+`is_active`）。**wire 契约不受影响** —— `ShelfOut` 的列集由 VO 决定。
+
+货架实体这一块的**逐字段、口径表、负载聚合与选架算法、前端配套清单**见
+[`shelves.md`](shelves.md)（本文件只登记归属与端点表，不重复字段口径）。
 
 ## 2. 逐字段
 
@@ -172,6 +202,11 @@ jti 写入黑名单（TTL 对齐旧 token 剩余有效期），旧 jti 再次使
 | 40400 | `NOT_FOUND` | 404 | 角色 scope 校验里的货架缺失 / zone 不合法 / 货架停用 |
 | （无 code） | 方法不允许 | 405 | 请求方法不被该路径支持（例：已下线的 `DELETE /iam/users/{id}/wx-bind`） |
 
+货架端点（18~22）的错误码 `20501` / `20502` / `20503` / `20512` 由**调用方 service 层**
+返回（`shared::error::code` 常量），逐条口径见 [`shelves.md`](shelves.md) 与
+`src/modules/iam/shelf/service/crud.rs`；它们不进本表是因为货架的判序与文案与账号
+CRUD 完全独立 —— 本表只覆盖 session / users 两段。
+
 ⚠️ **422 是纯文本，不是错误码**：body 是 axum 提取器的拒绝文本（如
 `Failed to deserialize the JSON body into the target type: missing field \`version\``），
 **没有** `{code, message, data}` 信封。断言这类响应必须用
@@ -187,6 +222,7 @@ jti 写入黑名单（TTL 对齐旧 token 剩余有效期），旧 jti 再次使
 
 | 移除项 | 替代 | 备注 |
 |---|---|---|
+| `/api/v2/shelves/*`（5 条端点的旧前缀，自独立的 shelf 域继承） | `/api/v2/iam/shelves/*` | **旧路径 404，无 alias**。域归属迁移，契约逐字不变 |
 | `DELETE /iam/users/{id}/wx-bind` | `POST /iam/users/{id}/wx-bind/unbind` | **旧路径 405，无 alias**。本仓只用 GET + POST，不留全后端唯一的 DELETE 路由 |
 | `WxBindRequest.corp_id`（保留字段，一律忽略） | 无（`corp_id` 恒取 `WECOM_CORPID`） | 旧客户端继续传不报错（serde 忽略未知字段） |
 | `GET /iam/users/{id}/wx-bind` 的数组返回 | 单对象 / `null` | 业务上双向一对一 |
@@ -220,7 +256,7 @@ session TTL / refresh。
 | `t_user` | 登录、账号 CRUD、`/me`、refresh | 建号、更新、软删停用、密码、戳 `last_login_at`、轮转 `refresh_token_version` | 无物理外键，存在性由 service 校验 |
 | `t_user_role` | 角色解析、账号角色组装、查重 | 授予、软删撤销 | 唯一约束**非 partial**，见 §8.3 |
 | `t_menu` + `t_role_menu` | 按角色取可见菜单并组树 | — | `seeds/menu.sql` 是菜单的权威源 |
-| `t_shelf` | SHELF_ACCOUNT 的 scope 校验 + 登录态货架范围解析 | — | **只读**（shelf 域的写端点在本域之外） |
+| `t_shelf` | SHELF_ACCOUNT 的 scope 校验 + 登录态货架范围解析 + 端点 18~22 的 CRUD | 建架、改架、软删停用 | **2026-10-10 起写端点在本域内**（货架子模块自独立 shelf 域迁入，`ShelfRepo` 是本域自有 repo）；字段口径见 [`shelves.md`](shelves.md) |
 | `t_wx_identity` | 绑定查询、wx-login 反查、system → wx 一对一判定（读该账号全部活跃行） | 绑定、解绑软删 | 唯一索引 `uk_wx_identity_corp_user` 是 **partial**（软删行不参与） |
 
 另读 Redis（session 条目 + refresh jti 黑名单），键前缀由 `RedisConfig::key_prefix`

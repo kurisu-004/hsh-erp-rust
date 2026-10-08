@@ -422,7 +422,7 @@ M = 10 时：12 个 HTTP 请求 → 1 个。
 
 ### 8.2 跨域依赖登记
 
-queue 域**整体不适用**域隔离护栏：它继承 worker_pool 的「经本域 trait 转发其它域单表查询」pattern（`repo/mod.rs::QueueRepoTrait` 转发 `worker` / `work_type` / `process` / `process_chain` / `part` / `shelf_process`），这是逐域剥离期间的既定 pattern（与 assembly / shelf / process_chain 同形）。**这是本域唯一被允许的跨域面**。
+queue 域**整体不适用**域隔离护栏：它继承 worker_pool 的「经本域 trait 转发其它域单表查询」pattern（`repo/mod.rs::QueueRepoTrait` 转发 `worker` / `work_type` / `process` / `process_chain` / `part` / `shelf_process`），这是逐域剥离期间的既定 pattern（与 assembly / `iam::shelf` / process_chain 同形）。**这是本域唯一被允许的跨域面**。
 
 **新增的 board 聚合 SQL 零跨域依赖** —— `board/` 子模块单独由 `cargo test --lib` 的 `modules::prod::queue::board::tests::board_aggregation_depends_on_no_other_domain` 守住（扫 `src/modules/prod/queue/board/**/*.rs`，代码区里任何 `crate::modules::<他域>` 路径即失败，含同父兄弟域 `prod::batch`）。护栏为什么只扫 `board/`：聚合 SQL 读的 9 张表完全可以在本域 SQL 内聚合，写端点的转发 pattern 则是既有事实，圈出来单独守比整域不守要强。
 

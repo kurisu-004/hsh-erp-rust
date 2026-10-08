@@ -1,4 +1,4 @@
-//! shelf 域数据访问（SQL 真源，零 diff 搬迁自 `repo.rs`）
+//! 货架子模块数据访问（SQL 真源）
 //!
 //! 对应 Python myERP/repository/shelf_repository.py。函数签名接收 `impl PgExecutor<'_>`，
 //! 兼容 `&PgPool` / `&mut PgConnection` / `&mut Transaction`。

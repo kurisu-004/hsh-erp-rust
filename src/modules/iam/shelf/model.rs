@@ -1,11 +1,12 @@
-//! shelf 域数据模型
+//! 货架子模块数据模型
 //!
 //! 对应 Python myERP/model/shelf.py。包含：
 //! - sqlx `FromRow` 行结构（含 version 乐观锁、deleted_at 软删、created/updated 审计字段）
 //! - 域枚举（DB 用 varchar，应用层用 enum 校验）
 //!
-//! `TShelf` 当前承载 Phase P3+ 完整 CRUD 投影（含 `location`）；其他模块
-//! （part、user、auth）的 row 类型是本域的只读投影，仍可与本结构并存。
+//! `TShelf` 是**全仓唯一的 `t_shelf` 行结构**（14 列，含 `location` 与
+//! `capacity`）：iam 账号侧的 SHELF_ACCOUNT scope 校验、货架 CRUD、part / prod /
+//! shared 各处对 `ShelfRepo` 的调用，读的都是这一份。
 //!
 //! `zone`: `'PRODUCTION'` | `'INSPECTION'`（DB varchar，无 enum 约束；应用层校验）。
 

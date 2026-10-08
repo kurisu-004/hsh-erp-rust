@@ -228,7 +228,7 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
 
 迁移动机：这四处都是**所有碰批次的域都要用**的公共设施，与「批次有哪些业务用例」无关。留在 batch 域意味着每剥离一个新域就多一条指向 batch 域的反向依赖。上移后依赖方向与派生图方向一致（上层域 → shared）。
 
-**边界记档**：`shared::batch` 是本仓唯一经域 repo **写**库的 shared 模块（`PartRepo::update_part_rollup` / `PartRepo::insert_part_event` / `AssemblyService::sync_assembly_status`），也是唯一依赖 **4 个域** 的 shared 模块 —— 另两个是**只读**单表查询：`shelf::ShelfRepo::get_by_id_zone`（`guards::validate_shelf_zone` 的存在 / 停用 / zone 三谓词）与 `prod::process_chain::ProcessChainRepo::resolve_step_id_by_process`（`guards::optional_step_id`）。写库那 3 处对应「状态派生契约」三层派生图（`t_part_batch.status` → `t_part.status` / `next_process_id` → `t_assembly.status`）的实现本身，该契约天然跨域、无域可归属。详见 `src/shared/batch/mod.rs` 与 `src/shared/mod.rs`。
+**边界记档**：`shared::batch` 是本仓唯一经域 repo **写**库的 shared 模块（`PartRepo::update_part_rollup` / `PartRepo::insert_part_event` / `AssemblyService::sync_assembly_status`），也是唯一依赖 **4 个域** 的 shared 模块 —— 另两个是**只读**单表查询：`iam::shelf::ShelfRepo::get_by_id_zone`（`guards::validate_shelf_zone` 的存在 / 停用 / zone 三谓词）与 `prod::process_chain::ProcessChainRepo::resolve_step_id_by_process`（`guards::optional_step_id`）。写库那 3 处对应「状态派生契约」三层派生图（`t_part_batch.status` → `t_part.status` / `next_process_id` → `t_assembly.status`）的实现本身，该契约天然跨域、无域可归属。详见 `src/shared/batch/mod.rs` 与 `src/shared/mod.rs`。
 
 ### 5.2 仍留在 batch 域的
 

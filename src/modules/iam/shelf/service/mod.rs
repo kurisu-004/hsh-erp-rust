@@ -1,4 +1,4 @@
-//! shelf 域 service 子模块聚合
+//! 货架子模块 service 子模块聚合
 //!
 //! 2026-10-10：picker 端点（for-return / for-inspection）随自动选架下线，
 //! `picker.rs` 随之删除 —— 本子模块现在只剩 `crud`（list / get / create / update /

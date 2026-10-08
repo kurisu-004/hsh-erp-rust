@@ -1,4 +1,4 @@
-//! shelf 域 CRUD service
+//! 货架子模块 CRUD service
 //!
 //! 列表 / 详情 / 创建 / 更新 / 软删（deactivate）—— 共 5 个端点。
 //!
@@ -60,7 +60,7 @@ fn version_conflict() -> AppError {
 /// 加 `current_load` 之后它需要一次额外查询，于是调用方改为「先查行、再查负载、
 /// 再映射」三步。**不**把聚合 JOIN 进货架列表 SQL 的理由见
 /// [`crate::shared::shelf::load::loads_by_shelf_ids`] 的 doc（会让 shared 层接管
-/// shelf 域的 `QueryBuilder` 筛选语义）。
+/// 货架子模块的 `QueryBuilder` 筛选语义）。
 fn to_shelf_out(s: TShelf, load: (Option<i32>, i64)) -> ShelfOut {
     let (capacity, current_load) = load;
     ShelfOut {

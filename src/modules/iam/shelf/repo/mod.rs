@@ -1,4 +1,4 @@
-//! shelf 域 repo 层（SQL 真源 + 胖 trait + PG 实现）
+//! 货架子模块 repo 层（SQL 真源 + 胖 trait + PG 实现）
 //!
 //! ## 结构（2026-09-22 重构）
 //! - `sql.rs`：原 `repo.rs` 全文搬迁，pub 固有静态方法 + sqlx `query!` 宏，
@@ -24,7 +24,7 @@
 //!   `list_active_inspection_with_load`）
 //!
 //! ## 为什么 trait 命名为 `ShelfRepoTrait` 而非 `ShelfRepo`
-//! iam 范本里 trait 名 = `IamRepoTrait`。但 shelf 域有跨模块静态调用方（part 域
+//! iam 范本里 trait 名 = `IamRepoTrait`。但本模块有跨模块静态调用方（part 域
 //! `worker_scan` / `phase1` / `inspection` 三个 service 文件都
 //! `use crate::modules::iam::shelf::repo::ShelfRepo;` 然后 `ShelfRepo::xxx(&mut *conn, ...)`
 //! 走 ZST 静态方法）。**该 3 文件本次不在本任务范围**（属于 Group B/C/D/E），
@@ -33,13 +33,13 @@
 //! 解法：
 //! - `shelf::repo::ShelfRepo` —— ZST struct（在 `sql.rs` 内，通过 `pub use sql::ShelfRepo;`
 //!   重新导出至本模块），保留 t_shelf 静态方法签名不变（cross-module 调用方零修改）。
-//! - `shelf::repo::ShelfRepoTrait` —— 本文件里的胖 trait，shelf 域内部 service 用
+//! - `iam::shelf::repo::ShelfRepoTrait` —— 本文件里的胖 trait，本模块内部 service 用
 //!   `<R: ShelfRepoTrait>` 收。2026-10-02 起 trait 只剩 `t_shelf` 10 方法；
 //!   2026-10-04 加 `list_active_inspection_with_load` 后为 11 方法。
 //!
 //! ## 跨域依赖现状（2026-10-02：shelf → prod 依赖清零）
 //! `t_shelf_process` 属 `prod::shelf_process`，`t_process` 属 `prod::process`，
-//! 两者都移出本 trait。shelf 域现在**不**依赖任何 prod 模块；反向（prod 域读
+//! 两者都移出本 trait。本模块现在**不**依赖任何 prod 模块；反向（prod 域读
 //! `ShelfRepo::get_by_id` 校验货架存在 / scope）见
 //! `src/modules/prod/shelf_process/service.rs`。
 //!
@@ -50,7 +50,7 @@
 //!
 //! ## automock
 //! `#[cfg_attr(test, mockall::automock)]` 在 trait 上声明，生成 `MockShelfRepoTrait` 供
-//! service 单测注入。shelf 域当前无内联 mod tests（service 全部走
+//! service 单测注入。本模块当前无内联 mod tests（service 全部走
 //! `tests/shelf/{api,deactivate}.rs` 集成测试守护），故未建 `shelf/service_tests/`
 //! 目录——按 conventions.md §4.1 含 IO 不强求 100%。
 //! 2026-10-02 核查：全仓 `MockShelfRepoTrait` 引用为**零**（只有本行 doc 提及），
@@ -72,7 +72,7 @@ pub mod sql;
 // （cross-module 调用方都依赖这条路径）。
 pub use sql::ShelfRepo;
 
-/// shelf 域数据访问 trait（9 方法，全部 `t_shelf`）。
+/// 货架子模块数据访问 trait（9 方法，全部 `t_shelf`）。
 ///
 /// 单 trait 而非每实体一个：`&mut PgConnection` 同一作用域只能借给一个 repo 实例，
 /// 拆分会让 service 无法同时持有两个 repo（2026-09-22 重构定案；与 iam 同形）。

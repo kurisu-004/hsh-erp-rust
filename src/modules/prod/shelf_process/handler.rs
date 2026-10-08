@@ -15,7 +15,7 @@
 //! 权限守卫在 service 层（`current.require_any_role` / `require_role`），handler
 //! 不重复校验。
 //!
-//! ## 3 端点（2026-10-02 自 shelf 域硬切，旧路径无 alias）
+//! ## 3 端点（2026-10-02 自当时的 shelf 域硬切，旧路径无 alias）
 //! 读 2：`GET /api/v2/prod/shelf-processes`（全集）/
 //!        `GET /api/v2/prod/shelf-processes/{shelf_id}`（单架）
 //! 写 1 (MANAGER)：`POST /api/v2/prod/shelf-processes/{shelf_id}`（整组替换）

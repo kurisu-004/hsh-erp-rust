@@ -1,11 +1,42 @@
-# shelf 域 API（货架 CRUD + 负载与自动选架）
+# iam 域 · 货架实体 API（CRUD + 负载与自动选架）
 
-> 本文件是 `shelf` 域的**唯一**契约来源。任何字段 / 端点变更必须同步本文件。
+> 本文件是 **iam 域下的货架子模块**（`src/modules/iam/shelf/`）的**唯一**契约来源。
+> 任何字段 / 端点变更必须同步本文件。
 > 与本轮同批改动的域契约见 [`batch.md`](batch.md)（worker-scan 链尾自动送检）、
 > [`queue.md`](queue.md)（refill 去架锚 + 取件优先级统一）、
 > [`outsource.md`](outsource.md)（移动端点方向 C 删除）。
 
 ## 0. 2026-10-10 变更摘要
+
+### 0.1 货架子模块自独立的 shelf 域迁入 iam 域
+
+货架管理（新增 / 编辑 / 停用 / 绑定工序的另一半归属）连同它的 5 条 CRUD 端点整体迁入
+iam 域，源码自 `src/modules/shelf/` 移到 `src/modules/iam/shelf/`。
+
+| 项 | 变更 |
+|---|---|
+| URL | `/api/v2/shelves/*` → `/api/v2/iam/shelves/*`，**硬切无 alias**，旧路径 404 |
+| 源码 | `src/modules/shelf/` → `src/modules/iam/shelf/`（iam 域下的嵌套子模块） |
+| 挂载点 | `modules::v2_router` 删掉 `/shelves` nest，改由 `iam::handler::router()` 以 `.nest("/shelves", …)` 挂载 |
+| 契约 | 请求 / 响应 / 错误码 / OCC 语义**逐字未变**，只有 URL 前缀变了 |
+| 测试 | `tests/shelf/`（binary `shelf`）并入 `tests/iam/`（binary `iam`），用例改名 `shelf.rs` / `shelf_deactivate.rs` |
+
+**为什么归 iam**：账号与货架是同一类东西 —— 「谁能碰什么」的权限资源。
+`t_user_role` 里 `SHELF_ACCOUNT` 角色的 `scope_id` 就指向某个货架，货架实体是权限
+体系的落点而非独立业务对象；5 条写端点又全部 MANAGER 独占，与账号 / 角色管理同一批
+授权动作。归属 iam 后「货架还在不在」这件事不必跨域问。
+
+**不动的东西**：工序映射（`prod::shelf_process`，`t_shelf_process` 关联的是 prod 域实体
+`t_process`）与选架设施（`shared::shelf`，跨域设施层、无域归属）**均不搬**。
+
+⚠️ **两种「下线」的响应形态不同，别混**：
+
+| 路径 | 形态 | 为什么 |
+|---|---|---|
+| `/api/v2/iam/shelves/for-return` | **400 纯文本** | 落进 `/iam/shelves/{id}` 的 `Path<i64>` 提取器被拒 |
+| `/api/v2/shelves/*`（旧前缀） | **404** | 整段前缀已从 router 删除，连 catch-all 都没有 |
+
+### 0.2 货架负载与自动选架
 
 本轮把「所有落货架的写操作都由人挑一个货架」改成「**服务端按负载自动挑**」。四件事：
 
@@ -23,17 +54,25 @@
    （裸 `number`，件数）。`load_ratio` **刻意不进 wire**（理由见 §2）。
 3. **两条 picker 端点下线**：`GET /for-return` / `GET /for-inspection`（见 §5）。
 4. **选架算法收进跨域设施层** `crate::shared::shelf`（零域依赖），8 条写路径改调它；
-   选架的失败语义由**调用方**决定错误码（`20508` / `40301`），本域不参与。
+   选架的失败语义由**调用方**决定错误码（`20508` / `40301`），本模块不参与。
+
+### 0.3 `t_shelf` 行结构收口为一份（2026-10-10）
+
+迁入 iam 后域内一度有两份 `t_shelf` 行结构：iam 账号侧那份 13 列（**不含 `capacity`**）、
+货架子模块那份 14 列。两者 SELECT 谓词逐字相同（`WHERE id = $1 AND deleted_at IS NULL`，
+都不过滤 `is_active`），差别只在列集。已收口为 `iam::shelf::model::TShelf` 一份，
+`IamRepoTrait::get_shelf_by_id` 改为委托 `ShelfRepo::get_by_id`；**wire 契约不受影响**
+（`ShelfOut` 的列集由 VO 决定，与行结构解耦）。
 
 ## 1. 端点表
 
 | # | 方法 | 路径 | 权限 | 入参 | 响应 |
 |---|---|---|---|---|---|
-| 1 | GET | `/api/v2/shelves` | Manager + Clerk + CncProgrammer + ShelfAccount + Inspector | `code_like?`、`zone?`、`is_active?`、`limit?`（缺省 50，clamp 1..500）、`offset?` | `ShelfListOut` |
-| 2 | GET | `/api/v2/shelves/{id}` | 同上 | path `id`（雪花 ID 字符串） | `ShelfOut` |
-| 3 | POST | `/api/v2/shelves` | **Manager 独占** | `{ code, name, zone, location?, capacity?, display_order? }` → 201 | `ShelfOut` |
-| 4 | POST | `/api/v2/shelves/{id}/update` | **Manager 独占** | `{ name?, location?, capacity?, display_order?, version }` | `ShelfOut` |
-| 5 | POST | `/api/v2/shelves/{id}/deactivate` | **Manager 独占** | 无 body | `R<()>` |
+| 1 | GET | `/api/v2/iam/shelves` | Manager + Clerk + CncProgrammer + ShelfAccount + Inspector | `code_like?`、`zone?`、`is_active?`、`limit?`（缺省 50，clamp 1..500）、`offset?` | `ShelfListOut` |
+| 2 | GET | `/api/v2/iam/shelves/{id}` | 同上 | path `id`（雪花 ID 字符串） | `ShelfOut` |
+| 3 | POST | `/api/v2/iam/shelves` | **Manager 独占** | `{ code, name, zone, location?, capacity?, display_order? }` → 201 | `ShelfOut` |
+| 4 | POST | `/api/v2/iam/shelves/{id}/update` | **Manager 独占** | `{ name?, location?, capacity?, display_order?, version }` | `ShelfOut` |
+| 5 | POST | `/api/v2/iam/shelves/{id}/deactivate` | **Manager 独占** | 无 body | `R<()>` |
 
 - 全部返回统一信封 `R { code, message, data }`。
 - 端点 1 **不接受**别的 query 参数（传了被忽略）。
@@ -127,7 +166,7 @@
 
 ## 4. 选架算法（`shared::shelf::select::pick_least_loaded`）
 
-本域**不**实现选架；它是 `crate::shared::shelf::select` 的算法，本域只提供「被选」的
+本货架子模块**不**实现选架；它是 `crate::shared::shelf::select` 的算法，本模块只提供「被选」的
 货架数据。这里记口径，供前端与运维理解「为什么落到了那个架」。
 
 ### 4.1 候选集与排序
@@ -187,8 +226,8 @@
 SQL 在本层聚合。理由与对照（`shared::batch` 为什么反而依赖 4 个域）见
 `src/shared/shelf/mod.rs` 顶部注释。
 
-代价是同一张 `t_shelf` 在本域 `repo/sql.rs` 里另有一份查询 —— 但**负载聚合只有一份**
-（`LOAD_AGGREGATE_SQL`），本域的列表 / 详情走 `ShelfRepoTrait::load_by_ids` 委托它。
+代价是同一张 `t_shelf` 在本模块 `repo/sql.rs` 里另有一份查询 —— 但**负载聚合只有一份**
+（`LOAD_AGGREGATE_SQL`），本模块的列表 / 详情走 `ShelfRepoTrait::load_by_ids` 委托它。
 
 ## 5. 移除记录（2026-10-10）
 
@@ -196,14 +235,14 @@ SQL 在本层聚合。理由与对照（`shared::batch` 为什么反而依赖 4 
 
 | 被移除项 | 原因 | 替代者 |
 |---|---|---|
-| `GET /api/v2/shelves/for-return` | picker 的存在意义是「让人挑一个最空的架」；自动选架上线后该动作消失。保留它等于保留自动选架的旁路（调用方可以指定任意架，从而绕过选架的 scope 与映射守卫） | 服务端 `pick_least_loaded`；调用方不再需要选架 |
-| `GET /api/v2/shelves/for-inspection` | 同上 | 同上 |
+| `GET /api/v2/iam/shelves/for-return` | picker 的存在意义是「让人挑一个最空的架」；自动选架上线后该动作消失。保留它等于保留自动选架的旁路（调用方可以指定任意架，从而绕过选架的 scope 与映射守卫） | 服务端 `pick_least_loaded`；调用方不再需要选架 |
+| `GET /api/v2/iam/shelves/for-inspection` | 同上 | 同上 |
 
-⚠️ **「下线」的响应形态是 400 而不是 404**：本域还挂着 `/{id}`（`Path<i64>`），所以
+⚠️ **「下线」的响应形态是 400 而不是 404**：本模块还挂着 `/{id}`（`Path<i64>`），所以
 `/for-return` 现在落进那个 catch-all 并在 Path 提取器阶段被拒 ⇒ **400 + 纯文本**
 `Invalid URL: Cannot parse \`for-return\` to a \`i64\``，**不进 `R<T>` 信封**。无论哪种
 都不是 200、都不会返回货架数据。回归见
-`tests/shelf/api.rs::picker_endpoints_are_gone`。
+`tests/iam/shelf.rs::picker_endpoints_are_gone`（另见 `old_shelf_paths_are_gone` 钉死旧前缀的 404）。
 
 连带删除：`service/picker.rs` 整个文件、`dto.rs::ShelfForReturnQuery`、4 个 picker VO
 （`ShelfForReturnItem/Out`、`ShelfInspectionItem/Out`）、`repo/sql.rs` 的
@@ -212,11 +251,11 @@ SQL 在本层聚合。理由与对照（`shared::batch` 为什么反而依赖 4 
 
 ### 5.2 字段
 
-本域**没有**字段被移除。`capacity` 是新增。
+本货架子模块**没有**字段被移除。`capacity` 是新增。
 
 ## 6. 与 WS 的关系
 
-本域**不发任何 WS 事件**（纯 CRUD）。货架相关的 WS 广播由写路径的调用方负责：
+本货架子模块**不发任何 WS 事件**（纯 CRUD）。货架相关的 WS 广播由写路径的调用方负责：
 
 - `WORKER_SCAN_RETURNED` / `WORKER_SCAN_INSPECTED`（`prod::batch::handler::transition`
   的 worker-scan handler，按 `scan_out.event_type` 广播 —— 链尾自动送检会让「请求
@@ -231,8 +270,8 @@ dashboard 侧对以上事件名的监听与处理见 [`dashboard.md`](dashboard.
 
 ### 7.1 读的表
 
-`t_shelf`（本域）、`t_part_batch`（负载聚合）、`t_shelf_process`（选架的工序过滤）、
-`t_user_role`（读侧 scope，不在本域）。
+`t_shelf`（本模块自有）、`t_part_batch`（负载聚合）、`t_shelf_process`（选架的工序过滤）、
+`t_user_role`（读侧 scope；`t_user_role` 归 iam 域账号侧，不在本模块）。
 
 ### 7.2 前端配套改动清单（2026-10-10）
 
@@ -242,7 +281,7 @@ dashboard 侧对以上事件名的监听与处理见 [`dashboard.md`](dashboard.
 | 删掉 `shelfId` 表单项 | 所有「落货架」的表单不再让用户选架 |
 | 货架管理页加 `capacity` 输入 | 端点 3 / 4 传 `capacity`；端点 2 的回显可展示 |
 | 货架列表展示 `current_load` / `capacity` | 百分比由前端现算：`capacity && capacity > 0 ? Math.round(current_load / capacity * 100) : null` |
-| `GET /shelves` 的 TS 类型加两字段 | `capacity: number \| null`、`current_load: number` |
+| `GET /api/v2/iam/shelves` 的 TS 类型加两字段（**URL 同批硬切**） | `capacity: number \| null`、`current_load: number` |
 
 **与后端是人工同步关系，无编译期保障**。
 
@@ -251,5 +290,5 @@ dashboard 侧对以上事件名的监听与处理见 [`dashboard.md`](dashboard.
 - **`location` 的三态声明未实现**（§2.3）—— 已知，本轮刻意不改。
 - **`ShelfOut` 无 `load_ratio`**（§2.1）—— 有意，不是遗漏。
 - **选架退化路径与旧 `sort_order` 口径不等价**（§4.2）—— 已知，待下一轮决策。
-- **`POST /shelves/{id}/update` 的 `version` 缺字段返回 422 纯文本**（不在 `R<T>` 信封
+- **`POST /api/v2/iam/shelves/{id}/update` 的 `version` 缺字段返回 422 纯文本**（不在 `R<T>` 信封
   内）—— axum `JsonRejection` 的全仓统一行为，非本端点特例。
