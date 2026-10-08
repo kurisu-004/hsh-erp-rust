@@ -1,4 +1,4 @@
-//! shelf 域端到端集成测试
+//! iam 域 · 货架子模块端到端集成测试（2026-10-10 自 `tests/shelf/api.rs` 迁入）
 //!
 //! ## 覆盖（Task 3 shelf CRUD + picker）
 //! 1. `create_shelf_then_deactivate_with_in_use_part_fails` — `deactivate` 拒绝
@@ -7,11 +7,17 @@
 //!    批次 status 即 IN_PROCESS，仍被本守卫覆盖。）
 //! 2. `create_then_get_shelf_round_trip` — happy path：create → get → 含 location 字段。
 //! 3. `picker_endpoints_are_gone`（2026-10-10）—— picker 两条端点下线后旧路径落进
-//!    `/shelves/{id}` 的 `Path<i64>` 提取器 ⇒ **400 纯文本**（不是 404，见
+//!    `/iam/shelves/{id}` 的 `Path<i64>` 提取器 ⇒ **400 纯文本**（不是 404，见
 //!    `docs/api/shelves.md` §5.1）。
 //!    （原 `for_inspection_returns_current_load_as_sum_of_quantity` 随端点下线删除；
 //!    `current_load` 的出参契约改由 `list_and_get_expose_capacity_and_current_load`
-//!    在 `GET /shelves` 上覆盖。）
+//!    在 `GET /iam/shelves` 上覆盖。）
+//! 4. `old_shelf_paths_are_gone`（2026-10-10）—— 域归属迁移的硬切回归：5 条端点的
+//!    旧前缀 `/api/v2/shelves*` 一律 404（无 alias）。
+//!
+//! ## URL 硬切（2026-10-10）
+//! 本文件所有断言 URL 自 `/api/v2/shelves/*` 改为 `/api/v2/iam/shelves/*`
+//! （货架子模块并入 iam 域，硬切无 alias）。响应契约逐字未变，只改前缀。
 //!
 //! 2026-10-02 域拆分：原第 3 个测试 `set_shelf_processes_replaces_existing_mapping`
 //! 连同 `insert_test_process` helper 一起迁到
@@ -24,7 +30,7 @@
 //! 完全独立，无需 Mutex 串行化。
 //!
 //! ## 认证
-//! 用 MANAGER 用户跑通（POST /shelves 写路径要求 M-only，按设计 §6.1 用 M 即可）。
+//! 用 MANAGER 用户跑通（POST /iam/shelves 写路径要求 M-only，按设计 §6.1 用 M 即可）。
 //!
 //! ## 直插 t_part 的说明
 //! brief 的 20503 测试需要在 deactivate 前插一个 t_part_batch.current_holder_id =
@@ -38,7 +44,7 @@
 //! `setup` / 通用 `login_manager` helper，统一走
 //! `use hsh_erp_test_support::{...}` + `bootstrap_as_manager()` +
 //! `load_shelf_fixture(&pool)`。保留：
-//! - `insert_part_held_by_shelf`：shelf 域独享（绕开 part CRUD 直插 t_part +
+//! - `insert_part_held_by_shelf`：货架子模块独享（绕开 part CRUD 直插 t_part +
 //!   t_part_batch；PR-2 已把 `current_holder_id` 等批次依附列迁移到 t_part_batch，
 //!   故同时插 batch 行让 `ShelfRepo::count_in_use_parts` 命中真相源路径）
 
@@ -151,7 +157,7 @@ async fn create_then_get_shelf_round_trip() {
         app.clone(),
         json_request(
             "POST",
-            "/shelves",
+            "/iam/shelves",
             Some(json!({
                 "code": "S-CRT-01",
                 "name": "Create-Shelf-01",
@@ -179,7 +185,12 @@ async fn create_then_get_shelf_round_trip() {
 
     let (s_get, env_get) = send(
         app,
-        json_request("GET", &format!("/shelves/{shelf_id}"), None, Some(&token)),
+        json_request(
+            "GET",
+            &format!("/iam/shelves/{shelf_id}"),
+            None,
+            Some(&token),
+        ),
     )
     .await;
     assert_eq!(
@@ -207,7 +218,7 @@ async fn create_shelf_then_deactivate_with_in_use_part_fails() {
         app.clone(),
         json_request(
             "POST",
-            "/shelves",
+            "/iam/shelves",
             Some(json!({
                 "code": "S-PROD-01",
                 "name": "Production-01",
@@ -231,7 +242,7 @@ async fn create_shelf_then_deactivate_with_in_use_part_fails() {
         app,
         json_request(
             "POST",
-            &format!("/shelves/{shelf_id_str}/deactivate"),
+            &format!("/iam/shelves/{shelf_id_str}/deactivate"),
             None,
             Some(&token),
         ),
@@ -257,15 +268,19 @@ async fn create_shelf_then_deactivate_with_in_use_part_fails() {
 ///
 /// ## 响应形态：400 而不是 404（必须知道，否则会误判成「端点还在」）
 ///
-/// 本域还挂着 `/{id}`（`Path<i64>`），所以 `/for-return` 现在落进那个 catch-all 并在
-/// **Path 提取器**阶段被拒 ⇒ **400 + 纯文本** `Invalid URL: Cannot parse
-/// \`for-return\` to a \`i64\``，**不进 `R<T>` 信封**。也就是说「下线」在本 router 下的
-/// 实际表现是 400 而不是 404；无论哪种都不是 200、都不会返回货架数据。
+/// 本模块还挂着 `/{id}`（`Path<i64>`），所以 `/iam/shelves/for-return` 现在落进那个
+/// catch-all 并在 **Path 提取器**阶段被拒 ⇒ **400 + 纯文本** `Invalid URL: Cannot
+/// parse \`for-return\` to a \`i64\``，**不进 `R<T>` 信封**。也就是说「下线」在本
+/// router 下的实际表现是 400 而不是 404；无论哪种都不是 200、都不会返回货架数据。
+///
+/// ⚠️ 这是**带 `/iam` 前缀**时的形态。不带前缀的 `/shelves/for-return` 连路由都
+/// 匹配不上（整个 `/shelves` 前缀已下线），是干净的 404 —— 见
+/// `old_shelf_paths_are_gone`。
 #[tokio::test]
 async fn picker_endpoints_are_gone() {
     let (_pool, app, token, _fx) = bootstrap_as_manager().await;
 
-    for path in ["/shelves/for-return", "/shelves/for-inspection"] {
+    for path in ["/iam/shelves/for-return", "/iam/shelves/for-inspection"] {
         let (s, raw) = send_raw(app.clone(), json_request("GET", path, None, Some(&token))).await;
         assert_eq!(
             s,
@@ -279,7 +294,85 @@ async fn picker_endpoints_are_gone() {
     }
 }
 
-/// 2026-10-10：`GET /shelves` 与 `GET /shelves/{id}` 的 `capacity` / `current_load`
+/// 2026-10-10 域归属迁移的硬切回归：`/api/v2/shelves*` 这一整段前缀下线，
+/// 5 条端点的新家是 `/api/v2/iam/shelves*`。
+///
+/// 本测试里的 URI 是**相对 `/api/v2` 的**，故旧前缀写成 `/shelves*`。
+///
+/// ## 断言口径：为什么全部是 404（而不是 picker 那条的 400）
+///
+/// 迁移**没有**在 `/api/v2` 根留下任何 `/shelves` 前缀（硬切无 alias），于是旧路径
+/// 在路由匹配阶段就没有候选 ⇒ 干净的 404。这与 `picker_endpoints_are_gone` 的 400
+/// 形态不同，区别在于：新路径下 `/{id}` 这条 catch-all **存在**，非数字段会落进
+/// `Path<i64>` 被拒；旧路径下连 catch-all 都没有。
+///
+/// 鉴权不参与：`route_layer` 只作用于**已匹配**的路由（见 `modules::v2_router` 的
+/// 注释与 `tests/iam/middleware.rs` 的不变量用例），故 404 路径不会先吃 40100 ——
+/// 这正是本次要验的：请求确实没有落进任何端点，而不是被角色守卫挡下。
+#[tokio::test]
+async fn old_shelf_paths_are_gone() {
+    let (_pool, app, token, _fx) = bootstrap_as_manager().await;
+
+    // 先造一个真实货架，让「旧路径 404」不能被「资源本来就不存在」解释。
+    let (s_create, env_create) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/iam/shelves",
+            Some(json!({
+                "code": "S-HARDCUT",
+                "name": "Hardcut-01",
+                "zone": "PRODUCTION",
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s_create, StatusCode::CREATED, "create shelf: {env_create}");
+    let shelf_id = env_create["data"]["id"].as_str().unwrap().to_string();
+
+    let cases: [(&str, String); 5] = [
+        ("GET", "/shelves".to_string()),
+        ("POST", "/shelves".to_string()),
+        ("GET", format!("/shelves/{shelf_id}")),
+        ("POST", format!("/shelves/{shelf_id}/update")),
+        ("POST", format!("/shelves/{shelf_id}/deactivate")),
+    ];
+    for (method, uri) in cases {
+        let body = if method == "GET" {
+            None
+        } else {
+            Some(json!({}))
+        };
+        let (s, raw) = send_raw(app.clone(), json_request(method, &uri, body, Some(&token))).await;
+        assert_eq!(
+            s,
+            StatusCode::NOT_FOUND,
+            "旧前缀 {method} {uri} 必须 404（硬切无 alias）: {s} {raw}"
+        );
+    }
+}
+
+/// 2026-10-10：旧前缀下的**非数字**段 —— 实测同样是 404（连 catch-all 都没有，
+/// 与 `picker_endpoints_are_gone` 的 400 形态对照）。
+///
+/// 这条用例的作用是钉住「旧前缀整段消失」而不是「旧前缀某几条还在」：若将来有人
+/// 在 `/api/v2/shelves` 悄悄加回一个 `{id}` 路由，这一条会先红。
+#[tokio::test]
+async fn old_shelf_prefix_returns_404_even_for_non_numeric_segment() {
+    let (_pool, app, token, _fx) = bootstrap_as_manager().await;
+
+    for path in ["/shelves/for-return", "/shelves/abc", "/shelves/1/update"] {
+        let (s, raw) = send_raw(app.clone(), json_request("GET", path, None, Some(&token))).await;
+        assert_eq!(
+            s,
+            StatusCode::NOT_FOUND,
+            "旧前缀 GET {path} 应是干净的 404（无 catch-all 可落）: {s} {raw}"
+        );
+    }
+}
+
+/// 2026-10-10：`GET /iam/shelves` 与 `GET /iam/shelves/{id}` 的 `capacity` / `current_load`
 /// 两个新出参。
 ///
 /// 断言三件事：
@@ -297,7 +390,7 @@ async fn list_and_get_expose_capacity_and_current_load() {
         app.clone(),
         json_request(
             "POST",
-            "/shelves",
+            "/iam/shelves",
             Some(json!({
                 "code": "S-CAP-01",
                 "name": "Capacity-01",
@@ -321,7 +414,7 @@ async fn list_and_get_expose_capacity_and_current_load() {
 
     let (s2, env2) = send(
         app.clone(),
-        json_request("GET", "/shelves", None, Some(&token)),
+        json_request("GET", "/iam/shelves", None, Some(&token)),
     )
     .await;
     assert_eq!(s2, StatusCode::OK, "list shelves: {env2}");
@@ -344,7 +437,12 @@ async fn list_and_get_expose_capacity_and_current_load() {
 
     let (s3, env3) = send(
         app,
-        json_request("GET", &format!("/shelves/{shelf_id}"), None, Some(&token)),
+        json_request(
+            "GET",
+            &format!("/iam/shelves/{shelf_id}"),
+            None,
+            Some(&token),
+        ),
     )
     .await;
     assert_eq!(s3, StatusCode::OK, "get shelf: {env3}");
@@ -367,7 +465,7 @@ async fn update_capacity_supports_three_states() {
         app.clone(),
         json_request(
             "POST",
-            "/shelves",
+            "/iam/shelves",
             Some(json!({
                 "code": "S-CAP-02",
                 "name": "Capacity-02",
@@ -391,7 +489,7 @@ async fn update_capacity_supports_three_states() {
             app,
             json_request(
                 "POST",
-                &format!("/shelves/{id}/update"),
+                &format!("/iam/shelves/{id}/update"),
                 Some(body),
                 Some(token),
             ),
@@ -439,7 +537,7 @@ async fn update_capacity_supports_three_states() {
         app.clone(),
         json_request(
             "POST",
-            "/shelves",
+            "/iam/shelves",
             Some(json!({
                 "code": "S-CAP-03",
                 "name": "Capacity-03",
