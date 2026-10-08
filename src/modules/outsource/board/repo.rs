@@ -305,6 +305,10 @@ pub struct CandidateRow {
     /// 工单已绑工序链且批次当前工序能在链内定位（判据见
     /// `shared::batch::chain::HAS_PROCESS_CHAIN_EXPR`，经 `repo/sql.rs` 的
     /// `sendable_dedup_sql` 填进内层投影）。卡片绿色左边框的判据。
+    ///
+    /// 与 `OutsourceQueueCandidate.has_process_chain` 的**不对称是有意的**：
+    /// 那是厂内候选池（可按链顺推下一道），这里是在途批次（批次已发到外协公司、
+    /// 不在厂内工序链上），故在途卡恒不画绿框。
     pub has_process_chain: bool,
     /// SQL `to_jsonb(array_agg(json_build_object(...)))` 的结果（单个 JSONB 值，
     /// 不是 `json[]` —— 后者 sqlx 解不进 `serde_json::Value`）。APPROVAL 行恒为

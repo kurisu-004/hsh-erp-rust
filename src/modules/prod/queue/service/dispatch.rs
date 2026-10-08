@@ -1164,7 +1164,7 @@ mod tests {
         assert_eq!(row.3, Some(head_shelf));
     }
 
-    /// 2026-10-09：链存在但链内一个未软删 step 都没有（链被软删 / 已清空）⇒
+    /// 2026-10-09：链行未软删、但链内一个未软删 step 都没有（已清空）⇒
     /// `20702 BIZ_PROCESS_CHAIN_STEP_NOT_FOUND`，批次保持 PENDING 不被写脏。
     #[tokio::test]
     async fn dispatch_rejects_chain_without_active_step() {
@@ -1176,7 +1176,7 @@ mod tests {
         let process_id = insert_process(&pool, "P-NOSTEP", "ACME").await;
         let shelf_id = insert_shelf(&pool, "SH-NOSTEP", "PRODUCTION").await;
         link_shelf_to_process(&pool, shelf_id, process_id).await;
-        // 建链后立刻软删 step（等价于「链被软删后 t_part.process_chain_id 仍是旧 id」）
+        // 建链后立刻软删 step（链行本身仍是活跃的，故这条用例钉的是「链内已清空」）
         let (chain_id, step_id) = insert_chain_with_step(&pool, process_id).await;
         sqlx::query("UPDATE t_process_chain_step SET deleted_at = now() WHERE id = $1")
             .bind(step_id)
@@ -1215,6 +1215,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, "PENDING", "拒收时批次不能被写脏");
+    }
+
+    /// 2026-10-09：**锚链行已软删、链内 step 仍活跃** ⇒ `20702`。
+    ///
+    /// 与 `dispatch_rejects_chain_without_active_step` 是两种不同成因、共用同一错误码：
+    /// 那条钉「链行活跃但链内已清空」，本条钉「step 还在、但链本身没了」。本条是
+    /// `ProcessChainRepo::first_step_in_chain` 补 `t_part_process_chain.deleted_at`
+    /// 闸门的直接回归 —— 不补闸门时链内首个活跃 step 会被当成「链首」照常下发成功，
+    /// 落库的 `current_process_step_id` 指向一条业务上已不存在的链；同时读侧
+    /// `resolve_chain_position` 的锚链 JOIN 判「不可解析」、`chain_state = NONE`，
+    /// 卡片绿框与写侧落库会给出互相矛盾的信号。
+    #[tokio::test]
+    async fn dispatch_rejects_soft_deleted_chain_with_live_step() {
+        let pool = test_pool().await;
+        let user_id = insert_user_with_role(&pool, "manager1", "password", "MANAGER").await;
+        let customer_id = insert_customer_l2(&pool, "ACME").await;
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+
+        let process_id = insert_process(&pool, "P-DCHAIN", "ACME").await;
+        let shelf_id = insert_shelf(&pool, "SH-DCHAIN", "PRODUCTION").await;
+        link_shelf_to_process(&pool, shelf_id, process_id).await;
+        // 关键形态：**只软删链行，不动 step**（`t_part.process_chain_id` 仍指向它）
+        let (chain_id, _step_id) = insert_chain_with_step(&pool, process_id).await;
+        sqlx::query("UPDATE t_part_process_chain SET deleted_at = now() WHERE id = $1")
+            .bind(chain_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let p_id = insert_part(
+            &pool,
+            "P-DCHAIN",
+            "DWG-DCHAIN",
+            customer_id,
+            today,
+            Some(today),
+            false,
+            Some(chain_id),
+        )
+        .await;
+        let b_id = insert_part_batch(&pool, p_id).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let e = QueueService::dispatch_batch(
+            &mut conn,
+            vec![(b_id, process_id)],
+            None,
+            shared_test_snowflake().as_ref(),
+            &make_current(user_id, Role::Manager),
+        )
+        .await
+        .expect_err("锚链已软删必须拒，不能把链内残留 step 当链首下发");
+        assert_eq!(e.code(), code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND);
+
+        // 拒收时批次不能被写脏：status 保持 PENDING，step 指针保持 NULL
+        let row: (String, Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT status, current_process_id, current_process_step_id \
+             FROM t_part_batch WHERE id = $1",
+        )
+        .bind(b_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "PENDING", "拒收时批次不能被写脏");
+        assert_eq!(row.1, None, "拒收时不能落 current_process_id");
+        assert_eq!(row.2, None, "拒收时不能落 step 指针");
     }
 
     #[tokio::test]

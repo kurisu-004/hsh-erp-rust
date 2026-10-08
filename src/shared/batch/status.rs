@@ -128,8 +128,8 @@ pub struct StatusChange<'a> {
     /// `migrations/20260930000000_004_add_batch_current_process_id.sql`）。
     ///
     /// 为什么单独一个 flag 而不是塞进 `new_process_id`：出池要**清**
-    /// `current_process_id` 却要**保留** `current_process_step_id`（后者是展示用
-    /// 定位信息），两者由 caller 独立决定，一个 `Option` 表达不了三态。
+    /// `current_process_id`，此时是否连带清 `current_process_step_id` 由 caller 独立
+    /// 决定（两者不必同进同出），一个 `Option` 表达不了三态。
     pub clear_process_id: bool,
     /// `true` = `current_process_step_id` 必须清 NULL。
     ///

@@ -107,7 +107,7 @@ ScanTreeOut
 
 **1. `process_name` 对 `INSPECTION` / `DELIVERED` 批次恒为 `null` —— 这不是 bug。** 它是「出池必须把 `current_process_id` 置 NULL」这条不变式的**正确**结果：`DELIVERED` 更进一步 —— 进 `READY_TO_SHIP` 的边只有 `INSPECTION → READY_TO_SHIP`，故也必经 `INSPECTION`、同样恒 NULL。前端在这两个状态下**不要**渲染工序标签。
 
-取值列是 `current_process_id`（migration 004 确立的工序归属权威列），**不是** `current_process_step_id`：后者只在首次定位工序时写、之后永不推进，多工序链工单上会停在第一步。其余展示类列表仍走 step 派生 —— ⚠️ 本端点是那条分工的**唯一有意例外**，登记在 `src/modules/prod/batch/model.rs` 模块 doc 的读取方分工清单里。
+取值列是 `current_process_id`（migration 004 确立的工序归属权威列），**不是** `current_process_step_id`：后者是**可选**的链内定位指针（无链工单恒为 NULL），表达「链上位置」而非「工序归属」，答不出本端点要的「当前工序」。其余展示类列表仍走 step 派生 —— ⚠️ 本端点是那条分工的**唯一有意例外**，登记在 `src/modules/prod/batch/model.rs` 模块 doc 的读取方分工清单里。
 
 **2. 本端点读全部批次，不按状态过滤。** 含 `COMPLETED` / `CANCELLED` 等终态，与 `GET /api/v2/parts/{id}/batches` 同口径。理由：扫码弹窗要回答「这批货总共分了几批、每批现在什么状态」，砍掉终态就答不了；**状态闸门在前端**。
 

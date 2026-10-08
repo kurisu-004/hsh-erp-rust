@@ -139,7 +139,7 @@
 
 ### 2.6 `has_process_chain` 判据（4 处卡片共用一个常量）
 
-卡片绿色左边框的判据，**唯一真源**是 `shared::batch::chain::HAS_PROCESS_CHAIN_EXPR`（Rust 侧同款判据是 `ChainPosition::is_pointer_consistent`）：
+卡片绿色左边框的判据，**唯一真源**是 `shared::batch::chain::HAS_PROCESS_CHAIN_EXPR`：
 
 ```sql
 p.process_chain_id IS NOT NULL
@@ -159,6 +159,20 @@ AND ( (cs.process_id IS NOT NULL AND cs.process_id = pb.current_process_id)
 ⚠️ **必须用 `IS NOT NULL AND =` 而不是 `IS NOT DISTINCT FROM`**：后者在 `NULL = NULL` 时为真，会让未定位（`current_process_id IS NULL`）的批次走分支 1（`cs.process_id` 也是 NULL，与 NULL 比「相等」），把「还没进任何工序」的批次也画上绿框。
 
 ⚠️ `t_process_chain_step cs` 一律 **LEFT JOIN**（`cs.id = pb.current_process_step_id AND cs.deleted_at IS NULL`）：INNER 会让无 step 的批次（无链工单的常态）从列表里整批消失 —— 那比给错边框更糟。
+
+⚠️ **本判据与 Rust 侧 `ChainPosition::is_pointer_consistent` 只是「近似判据」，不是同一判据**（2026-10-09 登记）：两者共同的那条只有「指针 step 的工序 == 批次当前工序」。本表达式只看 SQL 可表达的形状，判不了下面三种形态，而 `is_pointer_consistent` 会判 `false`：
+
+| 形态 | 本表达式（绿框） | `is_pointer_consistent`（写侧闸门） |
+|---|---|---|
+| 链行已软删（`t_part_process_chain.deleted_at` 非空）但链内 step 仍活跃 | 分支 1 成立 ⇒ `true` | `false`：锚链 JOIN 要求 `pc.deleted_at IS NULL`，查不到链行 ⇒ 位置解析无行 |
+| 链内同一 `process_id` 出现多次（后端照收的合法脏形态） | 分支 1 成立 ⇒ `true` | `false`：`hit_count > 1` 门控掉，`current_step_id` 保持 `NULL` |
+| 指针 step 属于**另一条**链 | 分支 1 成立 ⇒ `true` | `false`：按 `pb.current_process_id` 在锚链内重新定位，命中的 step 不是指针 |
+
+写成「同一判据 / 同款判据的纯 SQL 表达」是错的：把这三条搬进列表 SQL 等于把整个 `CHAIN_POSITION_LATERAL_SQL` 塞进上表 4 处 SQL，代价与逐批次 LATERAL 的查询成本都不接受（本轮**刻意不做**）。
+
+**因此绿框的语义按「近似」理解**：它表示「有链、且指针 step 的工序与批次当前工序对得上」，是前端**提示**（可免填下一道工序），**不是**安全保证。真正决定放回时能否免填的是 `is_pointer_consistent` —— 两者不一致时以写侧为准：放回端点会要求显式指定下一道工序，拒收而非静默错值。
+
+上述 3 种形态中**第 ① 种（链行已软删）在本轮写侧已不可达**：`ProcessChainRepo::first_step_in_chain` 补上了 `t_part_process_chain.deleted_at IS NULL` 闸门，该形态的 dispatch 现在落 `20702`（见 §3.1），与读侧 `chain_state = NONE` 口径一致。**但 ② ③ 两种仍可分叉**，且它们靠列表 SQL 自身无法判别。
 
 **4 处落点**（四处必须同改，共用同一常量）：
 
@@ -189,8 +203,9 @@ AND ( (cs.process_id IS NOT NULL AND cs.process_id = pb.current_process_id)
 
 - **有链时请求里的 `target_process_id` 被忽略**（它只是无链时的回落值）。前端要展示「实际下发到哪道工序」读 `DispatchSuccessItem.current_process_id`，读 `target_process_id` 会在有链时显示成用户随手传的那道。
 - 与端点 5 `auto_dispatch_preview` 的 `first_process_id` **同源**（都取链首，见 `ProcessChainRepo::first_step_in_chain`），故「照 preview 显示的值操作」与「实际落库」一致。
-- 链存在但**链内一个未软删 step 都没有**（链被软删 / 已清空）→ `20702 BIZ_PROCESS_CHAIN_STEP_NOT_FOUND`（HTTP 404），批次保持 `PENDING` 不被写脏。不新造错误码：`20702` 原语义是「链内找不到某工序」，本处是「链内一道都没有」，两者都指向同一个动作 —— 去修链。
-- `shared::batch::status::BATCH_STATUS_UPDATE_SQL` 的 `current_process_step_id = CASE WHEN $14 THEN NULL ELSE COALESCE($6::bigint, current_process_step_id) END` 早已支持两种写法，dispatch 侧只改传参（`new_process_step_id` / `clear_process_step_id: false`），**SQL 文本逐字未动**。
+- 链首解析带**锚链软删闸门**（`ProcessChainRepo::first_step_in_chain` JOIN `t_part_process_chain` 且 `pc.deleted_at IS NULL`），与读侧 `resolve_chain_position` 的锚链 JOIN 同口径。
+- **锚链已软删**（`t_part.process_chain_id` 仍指向已删链，链内 step 未随链软删）**或**链行活跃但**链内一个未软删 step 都没有**（已清空）→ `20702 BIZ_PROCESS_CHAIN_STEP_NOT_FOUND`（HTTP 404），批次保持 `PENDING` 不被写脏，`current_process_id` / `current_process_step_id` 都不落。不新造错误码：`20702` 原语义是「链内找不到某工序」，本处是「链内一道都没有」，两者都指向同一个动作 —— 去修链。
+- `shared::batch::status::BATCH_STATUS_UPDATE_SQL` 的 `current_process_step_id = CASE WHEN $14 THEN NULL ELSE COALESCE($6::bigint, current_process_step_id) END` 早已支持两种写法，dispatch 侧只改传参（`new_process_step_id` / `clear_process_step_id`），**SQL 文本逐字未动**。`clear_process_step_id` 与 `new_process_step_id.is_none()` 配对：有链写链首 step（`false`）、无链清 step（`true`，与本口径改动前逐字一致）。无链侧不采用「保留原值」写法 —— 那需要论证「无链批次的 step 恒为 NULL」这条**无任何约束保证**的不变式（`allowed_from` 之外的旁路写点、手工 SQL、历史脏数据都能破坏它）。
 - 出参 `DispatchSuccessItem.current_process_step_id` 由「恒 `null`」改为**真实写入值**（JSON number，不带字符串化器，与同 VO 的 `batch_id` 等不同）。
 
 ## 4. 口径表
@@ -378,7 +393,27 @@ queue 域**整体不适用**域隔离护栏：它继承 worker_pool 的「经本
 - 读侧 `GET /parts/by-worker/{worker_id}` 的 `chain_state` **不受影响** —— 它按 `current_process_id` 在锚链内重新定位（纪律见 `shared::batch::chain` 模块 doc），不依赖指针。
 - 写侧 worker-scan RETURNED 的「自动推进」分支**对存量批次不生效**：指针为 NULL 或陈旧时 `ChainPosition::is_pointer_consistent` 为 false，走「要求前端显式指定 `next_process_id`」分支。前端体验上就是「本来能免填的字段现在要填」，功能不受损。
 - `has_process_chain` 那类按「指针的工序 == 当前工序」判定的卡片列，在 `current_process_id` 非 NULL 时对陈旧指针与 NULL 指针同样落 `false`，语义自洽。
-- 自愈需要**重新走一次流转**（再走一次 dispatch / RETURNED / 池内移动）才会被重定位。存量数据清洗不在本轮范围内；前端不要把「绿色左边框缺失」当成新缺陷上报。
+- 自愈需要**重新走一次会重定位指针的流转**（再走一次 dispatch，或 worker-scan RETURNED）才会被纠正。⚠️ **`POST /queue/move`（admin 主动退回，`WORKER → POOL`）不算**：它传 `new_process_step_id = None` + `clear_process_step_id = false`，`COALESCE` 保留原值、**刻意不重定位** —— 管理员的意图是「退回候选池让人重领」，不表达任何链上位置意图。存量数据清洗不在本轮范围内；前端不要把「绿色左边框缺失」当成新缺陷上报。
+
+---
+
+**`has_process_chain` 绿框与放回端点的「可免填」判据分叉（3 种形态）**（2026-10-09 新增登记）。
+
+绿框判据（`HAS_PROCESS_CHAIN_EXPR`，纯 SQL）与放回端点的闸门（`ChainPosition::is_pointer_consistent`，Rust）**不是同一判据**，只共同覆盖「指针 step 的工序 == 批次当前工序」。分叉形态逐条见 §2.6 的表。现状与决议：
+
+- 形态 ①（链行已软删、step 仍活跃）**已从写侧消除**：`ProcessChainRepo::first_step_in_chain` 补了 `t_part_process_chain.deleted_at IS NULL` 闸门，该形态的 dispatch 落 `20702`（§3.1），与读侧 `chain_state = NONE` 一致。
+- 形态 ②（链内 `process_id` 重复）③（指针 step 属于另一条链）**仍会分叉**：绿框给 `true`、放回要求显式指定下一道工序。**本轮刻意不修** —— 修它要把 `CHAIN_POSITION_LATERAL_SQL` 整块搬进 4 处列表 SQL，代价与逐批次 LATERAL 的查询成本都不接受。**后果是可接受的**：分叉方向永远是「绿框误报可免填 → 放回端点拒收并要求显式指定」，即**提示偏松、闸门偏严**，不会静默落错值。
+- **前端不要拿绿框当安全保证**，只当提示；「免填对话框」仍应处理「用户没填 / 填了但写端点返 `20701`/`20702`」这条路径。
+
+**`auto_dispatch_preview` 与 dispatch 对「锚链已软删」分叉**（2026-10-09 新增登记）。
+
+端点 5 的 LATERAL 取链首 step 时**不 JOIN `t_part_process_chain` 行**，而端点 4 的写侧现在带了锚链软删闸门（§3.1）。故「锚链已软删、链内 step 仍活跃」这一形态下：preview 仍会报「可下发到工序 X」，实际 dispatch 落 `20702`。
+
+**本轮刻意不改 preview 的 SQL**：① 它只影响**预览提示**、不影响任何实际写入（写侧才是闸门，且已经拒收）；② 改它要动 `.sqlx/` 离线缓存（preview 走 `query!` 宏），为一处提示分叉付维护成本不划算。**后果**是 preview 可能报出一个 dispatch 会拒的工序 —— 报错文案已写明「链已软删或已清空」，运营按提示去修链即可。改 preview 前请先回到本节确认决议是否仍然有效。
+
+**外协在途卡不画绿框（有意的不对称）**（2026-10-09 新增登记）。
+
+绿框的 4 处落点里，外协只加在**候选卡** `OutsourceQueueCandidate`，同屏的**在途卡** `OutsourceQueueHeldBatch`（外协公司列，消费形态与候选卡同款）**刻意不带**这一列。理由：在途批次已发到外协公司、不在厂内工序链上，「按链顺推到下一道」这个语义在收发阶段不成立；给它加绿框等于宣称「这批货能免填下一道工序」，而收发端点的 `next_process_id` 走的是**另一套**判据（`OutsourceQueueHeldBatch.chain_resolvable` = `receive_next_process_id != "0"`）。两套判据并存时给在途卡画绿框会误导。**待决议**：若将来外协收回也要支持「按链顺推」，届时应统一到 `chain_resolvable`，而不是补一个 `has_process_chain`。
 
 ---
 

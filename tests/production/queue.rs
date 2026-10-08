@@ -789,6 +789,18 @@ async fn worker_scan_returned_triggers_refill() {
 /// 错误」判定），而本用例要验的是「推进 `current_process_id`」，前提就是目标工序
 /// 在链内。断言本身逐字未动。
 ///
+/// ⚠️ **本用例覆盖的是「非顺应 + 显式指定链内工序」这条分支**（2026-10-09 review
+/// 第 1 轮订正）：补了 `append_chain_step(proc_c, 20)` 之后，批次形态是「指针指向
+/// `proc_b` 的 step ∧ `current_process_id = proc_b`」= 顺应，且链上下一道恰好就是
+/// `proc_c` —— 于是自动推进分支会成立，请求里的 `next_process_id` **被完全忽略**
+/// （推进到 `proc_c` 只是因为链上下一道恰好是它，不是本用例传的值）。那会让
+/// 「显式分支在集成层的唯一覆盖」消失，而断言逐字未动、照样全绿。
+/// 修法：把批次指针置 `NULL` 造成非顺应（`is_pointer_consistent = false`），让
+/// `next_process_id` 真正参与决策、step 由 `optional_step_id` 从链内解析。
+/// 「顺应 + 自动推进」分支由场景 2e 的
+/// `worker_scan_returned_advances_step_pointer_when_process_chain_is_consistent`
+/// 覆盖（它刻意**不传** `next_process_id`），两条分支各有归属。
+///
 /// 本测试直接打用户报告的那个症状面：扫完后分别查 PROC-B / PROC-C 两个池，
 /// 断言批次只在 PROC-C 池里。
 #[tokio::test]
@@ -823,7 +835,14 @@ async fn worker_scan_returned_advances_current_process_id() {
     let chain_id = part_chain_id(&pool, held_part)
         .await
         .expect("fixture 应给该 part 绑了链");
-    let _proc_c_step = append_chain_step(&pool, chain_id, proc_c, 20).await;
+    let proc_c_step = append_chain_step(&pool, chain_id, proc_c, 20).await;
+    // ⚠️ 把批次指针置 NULL ⇒ 非顺应（`is_pointer_consistent = false`）。不做这一步，
+    // 本用例会退化到自动推进分支、请求里的 `next_process_id` 被忽略（见 fn doc）。
+    sqlx::query("UPDATE t_part_batch SET current_process_step_id = NULL WHERE id = $1")
+        .bind(held_batch)
+        .execute(&pool)
+        .await
+        .expect("clear batch step pointer to force explicit branch");
 
     let (app, token, _pool) = login_shelf_account(pool.clone(), "user2b", &[prod_shelf]).await;
     let (s, env) = send(
@@ -857,6 +876,22 @@ async fn worker_scan_returned_advances_current_process_id() {
         Some(proc_c),
         "RETURNED 应把 current_process_id 推进到 next_process_id（{proc_c}），\
          实际 {process_after:?} —— 不推进会让批次落回原工序池"
+    );
+
+    // step 指针必须由**显式分支**的 `optional_step_id` 解析成链内那道 proc_c 的
+    // step（自动推进分支取的是链上下一道 step，值相同但来源不同 —— 本用例钉的是
+    // 显式分支，所以顺带钉住「step 由请求里那道工序在链内解析出来」）。
+    let step_after: Option<i64> =
+        sqlx::query_scalar("SELECT current_process_step_id FROM t_part_batch WHERE id = $1")
+            .bind(held_batch)
+            .fetch_one(&pool)
+            .await
+            .expect("query current_process_step_id after RETURNED");
+    assert_eq!(
+        step_after,
+        Some(proc_c_step),
+        "显式分支应由 optional_step_id 把 step 解析成 proc_c 在链内那道（{proc_c_step}），\
+         实际 {step_after:?}"
     );
 
     // 端点层：批次只应出现在 PROC-C 池，不应再出现在 PROC-B 池
@@ -2942,23 +2977,29 @@ async fn move_worker_to_worker_stale_version_returns_40901() {
 /// 2026-10-09：`has_process_chain` 派生列（卡片绿色左边框的判据）。
 ///
 /// 覆盖 4 处落点里的 3 个端点（外协候选卡在 `tests/outsource/pool.rs`，因为那边
-/// 才有 OUTSOURCE 类工序与候选 fixture）。三种批次形态 × 三个端点：
+/// 才有 OUTSOURCE 类工序与候选 fixture）。四种批次形态 × 三个端点：
 ///
 /// | 形态 | `has_process_chain` | 走的判据分支 |
 /// |---|---|---|
 /// | 已绑链 + 指针指向当前工序所在 step | `true` | 分支 1 |
-/// | 已绑链 + **未定位**（`current_process_id` 与指针都 NULL） | `true` | 分支 2（链内有活跃 step） |
+/// | 已绑链 + **未定位**（`current_process_id` 与指针都 NULL）+ 链内有活跃 step | `true` | 分支 2 的 EXISTS 成立 |
 /// | 无链 | `false` | 首个条件 `process_chain_id IS NOT NULL` 即否 |
+/// | 已绑链 + **未定位** + **链内零活跃 step** | `false` | 两条分支都不成立（**算子选型的唯一可观测形态**，见下） |
 ///
 /// ⚠️ 「未定位」这一形态用 `IN_PROCESS` + `WORKER` 的批次而不是字面的 `PENDING`
 /// 批次：4 个列表的谓词都硬限定 `status='IN_PROCESS'`（候选池还额外要求
 /// `current_process_id = $1`），`PENDING` 批次根本不出现在这 4 个端点里。判据要
 /// 验的是「工序未定位但工单有链」，用同形态的行才打得到那条 EXISTS 分支。
 ///
-/// ⚠️ 判据必须用 `IS NOT NULL AND =` 而不是 `IS NOT DISTINCT FROM` —— 后者在
-/// `NULL = NULL` 时为真，会让「未定位」这一形态的批次走分支 1（`cs.process_id` 是
-/// NULL，与 NULL 比「相等」）而被误判成 `true` 之外的另一条错路径。本用例的
-/// 「未定位 ⇒ true」与「无链 ⇒ false」两条一起把分支边界钉住。
+/// ⚠️ 判据必须用 `IS NOT NULL AND =` 而不是 `IS NOT DISTINCT FROM`，但**前三种形态
+/// 钉不住这个区别**（钉的是取值、不是算子选型）：C 那条两种写法都是 `true`（分支 1
+/// 显式否掉后落到分支 2 的 EXISTS），B/D 那条两种写法都在首个条件就否掉。
+/// **能区分两种写法的只有 E**（已绑链 + 未定位 + 链内零活跃 step）：此时 `cs` 无行
+/// （指针 NULL）故 `cs.process_id` 与 `pb.current_process_id` 同为 NULL ——
+///   - 现写法：分支 1 因 `cs.process_id IS NOT NULL` 为假而否掉，分支 2 因 EXISTS
+///     找不到活跃 step 而否掉 ⇒ **`false`**；
+///   - `IS NOT DISTINCT FROM` 写法：分支 1 的 `NULL IS NOT DISTINCT FROM NULL` 为
+///     真 ⇒ 误判成 `true`（把「有链但链内一道都没了」的批次也画上绿框）。
 #[tokio::test]
 async fn has_process_chain_reflects_chain_and_pointer_state() {
     let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
@@ -3002,7 +3043,28 @@ async fn has_process_chain_reflects_chain_and_pointer_state() {
     .execute(&pool)
     .await
     .expect("clear batch D position");
-    // 前置断言：四个 part 的链绑定与批次位置必须与用例名一致，否则后面的断言
+    // E. 已绑链 + 未定位 + **链内零活跃 step**（唯一能区分 `IS NOT NULL AND =` 与
+    //    `IS NOT DISTINCT FROM` 的形态，理由见本用例 doc）
+    let (part_e, batch_e, _step_e) =
+        insert_worker_held_part(&pool, customer, "HPC-E", worker, proc, 1, true).await;
+    sqlx::query(
+        "UPDATE t_part_batch SET current_process_id = NULL, current_process_step_id = NULL \
+         WHERE id = $1",
+    )
+    .bind(batch_e)
+    .execute(&pool)
+    .await
+    .expect("clear batch E position");
+    sqlx::query(
+        "UPDATE t_process_chain_step SET deleted_at = now() \
+                WHERE chain_id = (SELECT process_chain_id FROM t_part WHERE id = $1) \
+                  AND deleted_at IS NULL",
+    )
+    .bind(part_e)
+    .execute(&pool)
+    .await
+    .expect("soft-delete all steps of chain E");
+    // 前置断言：五个 part 的链绑定与批次位置必须与用例名一致，否则后面的断言
     // 会在「数据没造对」的前提下假绿。
     let chain_of = async |part_id: i64| {
         sqlx::query_scalar::<_, Option<i64>>("SELECT process_chain_id FROM t_part WHERE id = $1")
@@ -3015,6 +3077,17 @@ async fn has_process_chain_reflects_chain_and_pointer_state() {
     assert!(chain_of(part_b).await.is_none(), "B 应无链");
     assert!(chain_of(part_c).await.is_some(), "C 应已绑链");
     assert!(chain_of(part_d).await.is_none(), "D 应无链");
+    assert!(chain_of(part_e).await.is_some(), "E 应已绑链");
+    // E 的「链内零活跃 step」前置：EXISTS 必须落空，否则 E 就退化成 C、钉不住算子选型
+    let e_active_steps: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM t_process_chain_step \
+         WHERE chain_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(chain_of(part_e).await.expect("E 的 chain_id"))
+    .fetch_one(&pool)
+    .await
+    .expect("count active steps of chain E");
+    assert_eq!(e_active_steps, 0, "E 的链内必须一个活跃 step 都没有");
 
     let (app, token) = login_manager_with_username(&pool, "admin_hpc").await;
 
@@ -3074,6 +3147,11 @@ async fn has_process_chain_reflects_chain_and_pointer_state() {
         held_of(part_d)["has_process_chain"],
         json!(false),
         "D（无链）⇒ false: {env}"
+    );
+    assert_eq!(
+        held_of(part_e)["has_process_chain"],
+        json!(false),
+        "E（已绑链 + 未定位 + 链内零活跃 step）⇒ 两条分支都不成立 ⇒ false: {env}"
     );
 
     // ---- 端点 d（之一）：GET /parts/pickable-by-work-type/{wt_id} ----
@@ -3138,6 +3216,11 @@ async fn has_process_chain_reflects_chain_and_pointer_state() {
         held_item_of(part_d)["has_process_chain"],
         json!(false),
         "by-worker：D（无链）⇒ false: {env3}"
+    );
+    assert_eq!(
+        held_item_of(part_e)["has_process_chain"],
+        json!(false),
+        "by-worker：E（已绑链 + 未定位 + 链内零活跃 step）⇒ false: {env3}"
     );
     // 链四字段不受本次改动影响（那是给放回页分流用的）
     assert_eq!(

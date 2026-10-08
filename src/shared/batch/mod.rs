@@ -28,6 +28,7 @@
 //! | 表 | 读 / 写 | 为什么不经域 repo |
 //! |---|---|---|
 //! | `t_part`（`process_chain_id`） | 只读 | 锚链的第一来源。`ProcessChainRepo` 的入口全部以 `chain_id` 为入参（「某条链如何」），而本层问的是「这个 part 当前锚在哪条链」—— 与 `optional_process_chain`（`guards`）读的是同一个列，两处各写一份 SQL 只会让锚链口径漂移 |
+//! | `t_part_process_chain` | 只读 | `CHAIN_POSITION_LATERAL_SQL` 的锚链 JOIN 查的就是它，而 `pc.deleted_at IS NULL` 这一条决定「锚链能否解析」：链被软删时位置解析无行、落 `NONE`。写侧口径靠 `ProcessChainRepo::first_step_in_chain` 补上同一道软删闸门对齐 |
 //! | `t_process_chain_step` | 只读 | 「链内定位 + 下一道」必须与读侧 `LEFT JOIN LATERAL` 在**同一条 SQL** 里完成（拆成两条往返会让「定位到的位置」与「算出的下一道」之间出现写窗口）。同理 `NEXT_PROCESS_LATERAL_SQL`（`outsource` 域自己的同款片段）也是片段内自聚合 |
 //!
 //! 两条纪律（锚链两步定位、按 `current_process_id` 重新定位）与理由见

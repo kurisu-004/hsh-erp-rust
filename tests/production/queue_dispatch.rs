@@ -1110,6 +1110,18 @@ async fn dispatch_chained_part_uses_chain_head_process_and_step() {
 /// 场景 12 已经从 DB 层钉了这两列；本条补的是**出参**层（`DispatchSuccessItem`
 /// 的两个字段），因为出参这轮从「诚实置 None」改成了「填真实写入值」，改错了
 /// 只有断言出参才测得出来。
+///
+/// ⚠️ **fixture 刻意给批次预置一个陈旧 step 指针**（2026-10-09 review 第 1 轮补）：
+/// 只断言「dispatch 后 step 是 NULL」钉不住 `clear_process_step_id` 的取值 ——
+/// 指针本来就是 NULL 时，`clear = true`（写 NULL）与 `clear = false`（`COALESCE`
+/// 保留原值）结果完全一样。预置一个**真实存在过的 step** 才能区分：只有
+/// `clear = true` 才会把它洗成 NULL。
+///
+/// 这个形态不是臆造的：2026-10-09 之前 dispatch 一律清 NULL，但同期 worker-scan
+/// RETURNED / 外协发送等写点会写 step，工单解绑链之后就会留下这种「无链 + 指针非
+/// NULL」的陈旧数据。也正因为这条不变式（「无链 ⇒ step 恒 NULL」）没有任何约束保证，
+/// 无链侧才必须显式清 NULL 而不能保留原值（见 `QueueDispatchRepo::
+/// update_batch_dispatched` 的 doc）。
 #[tokio::test]
 async fn dispatch_no_chain_part_falls_back_to_target_process_and_null_step() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
@@ -1119,6 +1131,33 @@ async fn dispatch_no_chain_part_falls_back_to_target_process_and_null_step() {
     let part_id = insert_part(&pool, customer_id).await;
     let batch_id = insert_part_batch(&pool, part_id).await;
     insert_shelf_process_mapping(&pool, process_a).await;
+
+    // 造陈旧指针：建链 + step → 把批次指针指过去 → 把 part 从链上解绑。
+    // 终态是「无链工单 + step 指针非 NULL」，正是 clear=true 要清洗的形态。
+    let (chain_id, stale_step_id) = insert_chain_with_step(&pool, process_a).await;
+    bind_part_to_chain(&pool, part_id, chain_id).await;
+    sqlx::query("UPDATE t_part_batch SET current_process_step_id = $1 WHERE id = $2")
+        .bind(stale_step_id)
+        .bind(batch_id)
+        .execute(&pool)
+        .await
+        .expect("seed stale step pointer");
+    sqlx::query("UPDATE t_part SET process_chain_id = NULL WHERE id = $1")
+        .bind(part_id)
+        .execute(&pool)
+        .await
+        .expect("unbind part from chain");
+    // 前置：确认造出来的确实是「无链 + 指针非 NULL」，否则后面的断言会假绿
+    let pre: (Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT p.process_chain_id, pb.current_process_step_id \
+         FROM t_part_batch pb JOIN t_part p ON p.id = pb.part_id WHERE pb.id = $1",
+    )
+    .bind(batch_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read pre-dispatch state");
+    assert_eq!(pre.0, None, "前置：工单应无链");
+    assert_eq!(pre.1, Some(stale_step_id), "前置：批次应带陈旧 step 指针");
 
     let (s, env) = send(
         app,
@@ -1153,7 +1192,10 @@ async fn dispatch_no_chain_part_falls_back_to_target_process_and_null_step() {
             .fetch_one(&pool)
             .await
             .expect("read dispatched batch");
-    assert_eq!(step, None, "无链工单 → step 恒 NULL");
+    assert_eq!(
+        step, None,
+        "无链工单 → 陈旧 step 指针必须被洗成 NULL（clear_process_step_id = true）"
+    );
 }
 
 // ===========================================================================

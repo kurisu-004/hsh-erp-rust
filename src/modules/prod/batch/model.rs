@@ -23,9 +23,11 @@
 //! - `current_process_id`（逻辑 FK → `t_process.id`）是**判断批次是否属于某
 //!   工序池的唯一权威依据**：queue 候选池 3 条 SQL + count 全部按本列
 //!   普通过滤（不再 JOIN `t_process_chain_step`）
-//! - `current_process_step_id` 相应**降级为可选的显示用定位信息**：仅当工单已
-//!   绑定工序链时才写，允许 NULL；且**只在首次定位工序时写、之后不再推进**
-//!   （只在首次定位工序时写、之后不再推进，详见 `TPartBatch` 字段 doc）
+//! - `current_process_step_id` 相应**降级为可选的链内定位指针**：仅当工单已
+//!   绑定工序链时才写，允许 NULL；且**随工序推进**（2026-10-09 起：
+//!   `prod::queue` 的 dispatch 落链首 step、worker 放回时顺工序自动推进到链内
+//!   下一道 step；admin 主动退回 `prod::queue::move` 的 `WORKER → POOL` 刻意
+//!   不推进）。无链工单恒为 NULL。详见 `TPartBatch` 字段 doc
 //! - 目的：让**没有工序链的工单，其批次也能正常入池**（旧设计下 dispatch 写
 //!   `step=NULL` + 候选池 SQL INNER JOIN step → 批次对所有池查询隐身，形成
 //!   「要推进 step 先进池、要进池先有 step」的死状态）
@@ -54,8 +56,9 @@
 //!      list_batches_by_part_ids` —— `GET /prod/inspection/scan/{serial_no}`
 //!      （2026-10-05 新增的扫码树，批次层唯一一条 SQL）。它的 `process_name`
 //!      直读 `current_process_id`，与第 1~3 条**故意不同**，理由是本端点的
-//!      工序名要回答「这批货现在在哪道工序」，而 step 指针只在首次定位工序时写、
-//!      之后永不推进，多工序链工单上会停在第一步 → 用它渲染会显示过时工序。
+//!      工序名要回答「这批货现在在哪道工序」，而 step 指针是**可选**的链内定位
+//!      列：无链工单（生产库绝大多数）恒为 NULL、压根答不出工序名，且它表达的是
+//!      「链上位置」而非「工序归属」——归属的权威列始终是 `current_process_id`。
 //!      代价是本端点的 `INSPECTION` / `DELIVERED` 批次 `process_name` 恒 `null`
 //!      （这两个状态本就不在生产流里，不渲染工序标签即可）。
 //!

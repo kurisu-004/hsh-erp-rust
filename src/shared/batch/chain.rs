@@ -122,8 +122,8 @@ pub const CHAIN_POSITION_LATERAL_SQL: &str = "SELECT \
 /// `cs` = `pb.current_process_step_id` 指向的 step）。
 ///
 /// 语义：工单已绑链，**且**批次当前工序在链内能定位到 —— 两个分支：
-/// 1. `cs.process_id = pb.current_process_id`：指针存在且指向的 step 就是当前工序
-///    所在的那一步（与 [`ChainPosition::is_pointer_consistent`] 同款判据）；
+/// 1. `cs.process_id = pb.current_process_id`：指针存在且指向的 step 的工序就是批次
+///    当前工序；
 /// 2. `pb.current_process_id IS NULL` 且链内至少有一道未软删 step：批次尚未定位
 ///    （PENDING 未下发 / 池内待领），但工单是有工艺链的。
 ///
@@ -140,6 +140,24 @@ pub const CHAIN_POSITION_LATERAL_SQL: &str = "SELECT \
 /// 消费方在各自 SQL 里**必须**配一条
 /// `LEFT JOIN t_process_chain_step cs ON cs.id = pb.current_process_step_id AND cs.deleted_at IS NULL`
 /// —— 列表一律 LEFT JOIN（INNER 会让无 step 的批次从列表里消失，那比给错边框更糟）。
+///
+/// ⚠️ **本表达式与 [`ChainPosition::is_pointer_consistent`] 只是「近似判据」，不是
+/// 同一判据**（2026-10-09 登记）：两者共同的那条只有「指针 step 的工序 == 批次当前
+/// 工序」。本表达式只看 SQL 可表达的形状，判不了下面三种形态，而
+/// `is_pointer_consistent` 会判 false：
+///
+/// | 形态 | 本表达式 | `is_pointer_consistent` |
+/// |---|---|---|
+/// | 链行已软删（`t_part_process_chain.deleted_at` 非空）但链内 step 仍活跃 | 分支 1 成立 ⇒ true | false（锚链 JOIN 查不到链行，位置解析无行） |
+/// | 链内同一 `process_id` 出现多次（后端照收的合法脏形态） | 分支 1 成立 ⇒ true | false（`hit_count > 1` 门控掉，`current_step_id` 保持 NULL） |
+/// | 指针 step 属于**另一条**链 | 分支 1 成立 ⇒ true | false（按 `pb.current_process_id` 在锚链内重新定位，命中的 step 不是指针） |
+///
+/// 写成「同款判据 / 同一判据的纯 SQL 表达」是错的：把三者的额外条件搬进列表 SQL 等于
+/// 把整个 `CHAIN_POSITION_LATERAL_SQL` 片段塞进 4 条列表 SQL，代价与该片段的逐批次
+/// LATERAL 成本都不接受。**绿框的语义因此要按「近似」理解**：它表示「有链且指针
+/// step 的工序与当前工序对得上」，是前端**提示**（可免填下一道工序），不是写侧闸门；
+/// 真正的闸门是 `is_pointer_consistent`，两者不一致时以写侧为准（放回应要求显式指定
+/// 下一道工序，拒收不会静默错值）。
 pub const HAS_PROCESS_CHAIN_EXPR: &str = "p.process_chain_id IS NOT NULL \
      AND ( (cs.process_id IS NOT NULL AND cs.process_id = pb.current_process_id) \
            OR (pb.current_process_id IS NULL \
@@ -175,8 +193,12 @@ impl ChainPosition {
     /// 链已软删 / 指针为 NULL 或漂移（`current_process_id` 不在锚链内）/ 链内同一
     /// `process_id` 重复（歧义）。
     ///
-    /// 这是「step 指针可安全当位置指针用」的判据，也是读侧列表卡片「绿色左边框」的判据
-    /// —— 列表侧是同一判据的纯 SQL 表达 [`HAS_PROCESS_CHAIN_EXPR`]（两者必须同改）。
+    /// 这是「step 指针可安全当位置指针用」的判据，也是读侧列表卡片「绿色左边框」判据
+    /// 背后的**写侧闸门** —— 两者**不是同款判据**：本方法多要求锚链可解析、链内
+    /// `process_id` 唯一命中、且定位到的 step 就是指针，而列表侧的
+    /// [`HAS_PROCESS_CHAIN_EXPR`] 只能比「指针 step 的工序 == 批次当前工序」
+    /// （三种分叉形态见该常量的 doc）。**不一致时以本方法为准**：绿框是前端提示，
+    /// 本方法是放回端点的拒收闸门，故静默错值不会发生。
     pub fn is_pointer_consistent(&self, batch: &TPartBatch) -> bool {
         match (self.current_step_id, batch.current_process_step_id) {
             (Some(located), Some(pointer)) => located == pointer,

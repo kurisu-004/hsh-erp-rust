@@ -136,7 +136,7 @@ impl QueueDispatchRepo {
     ///
     /// 副作用：`status='IN_PROCESS'` + `location='PRODUCTION_SHELF'` +
     /// `current_holder_id=shelf_id` + `current_process_id=target_process_id` +
-    /// `current_process_step_id` 有值时写入 + `version += 1`。
+    /// `current_process_step_id` = 传入的 step（传 `None` 则写 NULL）+ `version += 1`。
     ///
     /// 2026-09-30 新增 `current_process_id` 写入（用户报告 bug 修复）：本列是
     /// **判断批次是否属于某工序池的唯一权威依据**（queue 候选池 3 条 SQL
@@ -148,13 +148,18 @@ impl QueueDispatchRepo {
     /// 要求批次先在池里，形成死状态。
     ///
     /// 2026-10-09：`current_process_step_id` 由「恒写 NULL」改为「**有链写链首
-    /// step，无链不动**」。旧写法的依据是「dispatch 的批次从未写过 step，等价于
-    /// NULL」这条**没有任何约束保证**的不变式（`allowed_from` 之外的旁路写点、
-    /// 手工 SQL、历史脏数据都能破坏它），现已随「dispatch 落链首 step」这条不变式
-    /// 作废。故 `clear_process_step_id` 由 `true` 改 `false`：
-    /// - `new_process_step_id = Some(链首 step)` → 指针落链首 step（写侧核心目标）；
-    /// - `new_process_step_id = None`（无链工单）→ `COALESCE(NULL, 原值)` = 保持原值。
-    ///   无链工单的 step 按写入不变式恒为 NULL，故逐字等价于旧行为。
+    /// step，无链清 NULL**」。两种取值分别由 `new_process_step_id` 与
+    /// `clear_process_step_id` 表达（`new_process_step_id = None` 在
+    /// `shared::batch::status` 里是「不改」，不是「清 NULL」，故两者必须配对看）：
+    /// - `new_process_step_id = Some(链首 step)` + `clear_process_step_id: false`
+    ///   → `COALESCE(Some(x), 原值)` 恒为 `Some(x)`，指针必落链首（写侧核心目标）；
+    /// - `new_process_step_id = None` + `clear_process_step_id: true`（无链工单）
+    ///   → 显式写 NULL，与本函数改动前逐字一致。
+    ///
+    /// 无链侧不采用「`clear = false` 保留原值」写法：那需要论证「无链批次的 step 按
+    /// 写入不变式恒为 NULL」，而这条不变式**没有任何约束保证**（`allowed_from` 之外的
+    /// 旁路写点、手工 SQL、历史脏数据都能破坏它）。显式清 NULL 只依赖入参定义
+    /// （无链 ⇒ 不写 step），不依赖任何不变式。
     ///
     /// 本函数是 `shared::batch::status::apply_batch_status_change` 之上的薄包装
     /// （全仓唯一 `t_part_batch.status` 写入口，写完状态自动补做
@@ -177,7 +182,9 @@ impl QueueDispatchRepo {
                 new_location: Some("PRODUCTION_SHELF"),
                 new_holder_id: Some(shelf_id),
                 new_process_id: Some(current_process_id),
-                // 链首 step（有链）/ None（无链工单）→ 保持原值
+                // 链首 step（有链工单）/ None（无链工单）。
+                // `None` 在 shared::batch::status 里语义是「不改」，与「清 NULL」是
+                // 两件事，故无链侧的清空靠下方 `clear_process_step_id` 表达。
                 new_process_step_id: current_process_step_id,
                 is_repairing: None,
                 expected_version: Some(expected_version),
@@ -192,9 +199,19 @@ impl QueueDispatchRepo {
                 clear_location: false,
                 clear_holder_id: false,
                 clear_process_id: false,
-                // 2026-10-09：由 `true`（显式清 NULL）改为 `false`。理由见上方 doc
-                // 的「恒写 NULL 已作废」段：dispatch 现在要写链首 step。
-                clear_process_step_id: false,
+                // 2026-10-09：与 `current_process_step_id.is_none()` 配对取值 ——
+                // 有链写链首 step（`clear = false`），无链清 step（`clear = true`）。
+                //
+                // 无链侧取 `true`（显式清 NULL）是**保持改动前的清洗行为**，且不依赖
+                // 任何不变式：清 NULL 只需要「无链 ⇒ 不写 step」，而那是入参本身的定义。
+                // 早先一度改 `false`（用 `COALESCE(NULL, 原值)` 保留陈旧值），那样就得
+                // 论证「无链批次的 step 本来恒为 NULL」这条**没有任何约束保证**的不变式
+                // （`allowed_from` 之外的旁路写点、手工 SQL、历史脏数据都能破坏它），
+                // 论证还与同段 doc 里「这条不变式不作数」自相矛盾。
+                //
+                // 有链侧取 `false`：`new_process_step_id` 是 `Some(链首 step)`，
+                // `COALESCE(Some(x), 原值)` 恒为 `Some(x)`，即指针必落链首。
+                clear_process_step_id: current_process_step_id.is_none(),
                 // 目标状态 IN_PROCESS 不是终态 → 终态归档事件分支不可达
                 event_id: None,
             },

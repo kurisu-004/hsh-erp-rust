@@ -535,18 +535,30 @@ impl PartService {
         // 对应，避免内外层列名不一致时读错位。
         //
         // ⚠️ **两个工序名改由外层 LEFT JOIN `t_process` 取**（2026-10-09）：片段只导出
-        // id（`nx.next_process_id` / `nx.current_step_id`），名字在外层查。逐字等价：
-        // 原内联版查的是 `np.name`（`np.id = nsp.process_id AND np.deleted_at IS NULL`）
-        // 与 `cp.name`（`cp.id = cur2.process_id AND cur2.hit_count = 1`），而
-        // `cur2.process_id` 按定义恒等于 `pb.current_process_id`、`hit_count = 1` 恒
-        // 等价于 `nx.current_step_id IS NOT NULL`。`t_process.id` 是主键，LEFT JOIN
-        // 不改变行数。
+        // id（`nx.next_process_id` / `nx.current_step_id`），名字在外层查。改引用后
+        // **出参取值逐字不变**，两个 JOIN 谓词与改前内联版逐条对应：
+        // 「下一道」侧 `np.id = nsp.process_id AND np.deleted_at IS NULL` 换成
+        // `np.id = nx.next_process_id AND np.deleted_at IS NULL`（`nsp` 被搬进片段后
+        // 不再出现在外层，外键取片段导出的 id）；「当前工序」侧
+        // `cp.id = cur2.process_id AND cp.deleted_at IS NULL AND cur2.hit_count = 1`
+        // 换成 `cp.id = pb.current_process_id AND cp.deleted_at IS NULL AND
+        // nx.current_step_id IS NOT NULL`，两个差异都只是把片段内才可判定的谓词换成
+        // 外层等价物 ——
+        //   - `cur2.process_id` 恒等于 `pb.current_process_id`：`cur2` 的定位条件就是
+        //     「在锚链内找 `process_id = pb.current_process_id` 的 step」，而
+        //     `pb.current_process_id IS NULL` 时 `cur2` 无行、`nx` 整行 NULL，此时
+        //     新谓词同样不成立；
+        //   - `cur2.hit_count = 1` 恒等价于 `nx.current_step_id IS NOT NULL`：
+        //     `cur2` 零命中时该 `JOIN LATERAL`（inner）整块无行、`hit_count` 不存在；
+        //     ≥2 命中时片段显式落 `NONE` 且 `current_step_id` 保持 NULL
+        //     （见上方歧义处理），只有恰好 1 命中才会带出 `current_step_id`。
+        // `t_process.id` 是主键，两条 LEFT JOIN 都不改变行数。
         //
-        // ⚠️ **`cp` 那条谓词里写的是 `np.deleted_at IS NULL` 而不是 `cp.`** —— 这是内联
-        // 版的既有原文（看起来是复制粘贴的残留，导致软删的当前工序仍会取到名字）。
-        // 本次是**逐字搬运**，故照原样保留：该行为属于既有 wire 契约，改它要单独一轮
-        // （连带 `chain_current_process_name` 的 doc 与前端「链尾提示点名」的语义），
-        // 不能混进「把读侧改引用共享片段」这轮。
+        // ⚠️ **`cp` 的软删闸门不可丢**：`np` 是 LEFT JOIN、未命中时整行 NULL，
+        // 若谓词写 `np.deleted_at IS NULL` 则该子句恒为真（命中时它也是 join 条件
+        // 的一部分），等于把 `cp` 的 `deleted_at IS NULL` 删掉 —— 批次的
+        // `current_process_id` 指向已软删工序时 `chain_current_process_name` 会从
+        // `null` 变成该软删工序的名字。改前内联版写的是 `cp.`，此处照原样保留。
         //
         // ⚠️ **别名契约**：片段引用 `p`（`t_part`）与 `pb`（`t_part_batch`）两个别名，
         // 故本 SELECT 的批次别名是 `pb` 而非 `b`（`list_pickable_by_work_type` 同理；
@@ -580,7 +592,7 @@ impl PartService {
              LEFT JOIN t_process np \
                ON np.id = nx.next_process_id AND np.deleted_at IS NULL \
              LEFT JOIN t_process cp \
-               ON cp.id = pb.current_process_id AND np.deleted_at IS NULL \
+               ON cp.id = pb.current_process_id AND cp.deleted_at IS NULL \
               AND nx.current_step_id IS NOT NULL \
              LEFT JOIN t_process_chain_step cs \
                ON cs.id = pb.current_process_step_id AND cs.deleted_at IS NULL \

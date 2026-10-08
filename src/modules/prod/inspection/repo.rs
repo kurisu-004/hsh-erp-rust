@@ -73,7 +73,8 @@
 //! 1. **不 JOIN `t_process_chain_step`**，工序名直接 `LEFT JOIN t_process ON
 //!    t_process.id = b.current_process_id`。本端点的 `process_name` 契约就是
 //!    「批次当前工序」，`current_process_id` 是工序归属的权威列（migration 004）；
-//!    `current_process_step_id` 只是一次性写入、永不推进的显示用定位信息。
+//!    `current_process_step_id` 是**可选**的链内定位指针（无链工单恒为 NULL），
+//!    表达链上位置而非工序归属，答不出本端点要的「当前工序」。
 //! 2. **不 JOIN `t_delivery_note`**：`delivery_note_no` 不在本端点契约里。
 //!
 //! ⚠️ `process_name` 对 `INSPECTION` / `DELIVERED` 批次**恒为 `null`**：这两态

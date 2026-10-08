@@ -1196,8 +1196,10 @@ const SENDABLE_INNER_X_SQL: &str = "SELECT {projection} \
 /// 恰好逐字覆盖这个集合 ⇒ 同一 (part, process) 的真实审批报价至多一条，撞了 → 21303。
 /// 仍保留 `DISTINCT ON` 作为兜底：并发审批 / 历史数据 / 索引缺失都可能让重复行出现，
 /// 取最早批准的那条语义是「先批准的报价优先」且结果稳定，不随查询计划变化。
-/// 2026-10-03 起内层不再有 `t_shelf_process` / `t_process_chain_step` 的重复行来源
-/// （两层 JOIN 已删），重复行只剩报价这一处。
+/// 2026-10-03 起内层不再有 `t_shelf_process` 的重复行来源（该 JOIN 已删）；
+/// `t_process_chain_step` 2026-10-09 起按主键 `LEFT JOIN` 回来（供
+/// `HAS_PROCESS_CHAIN_EXPR` 取 step 行），它按 `cs.id = pb.current_process_step_id`
+/// 匹配、至多一行，不构成重复行来源。故重复行只剩报价这一处。
 ///
 /// **为什么保留 `current_process_id` 这一列而不是只写 `DISTINCT ON (batch_id)`**：
 /// `current_process_id` 由 `batch_id` 单值决定，两者语义等价。保留两列是为了让

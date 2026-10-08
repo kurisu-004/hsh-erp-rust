@@ -265,7 +265,8 @@ pub struct PoolItemRow {
     pub shelf_code: String,
     pub shelf_name: String,
     pub has_cnc_program: bool,
-    /// 同 [`HeldBatchRow::has_process_chain`]（同一常量、同一判据）。
+    /// 同 [`HeldBatchRow::has_process_chain`]（同一个常量；该判据与写侧闸门的分叉形态
+    /// 见 `HAS_PROCESS_CHAIN_EXPR` 的 doc）。
     pub has_process_chain: bool,
 }
 
