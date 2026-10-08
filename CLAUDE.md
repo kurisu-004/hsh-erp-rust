@@ -386,12 +386,12 @@ t_assembly.status               ← 派生缓存
 
 **关键约定**：
 - cargo 1.98.1 **不识别** `tests/<dir>/mod.rs`，只识别 `tests/<dir>/main.rs`（binary 名 = `<dir>`）。新 domain 一律用 `main.rs`。
-- 共享基建已全部在独立 dev-only crate **`test-support/`**（`hsh-erp-test-support`）：原 monolith 测试共享目录与其 facade re-export 均已删除、**全仓零 `mod common;` 调用点**，新测试一律直接 `use hsh_erp_test_support::*`。`test-support/` 源码里仍留有若干「原 monolith 目录已迁走」的历史溯源注释，那是有意保留的来路说明，不是活指针。
+- 共享基建已全部在独立 dev-only crate **`test-support/`**（`hsh-erp-test-support`）：原 monolith 测试共享目录与其 facade re-export 均已删除、**全仓零 `mod common;` 调用点**，新测试一律直接 `use hsh_erp_test_support::*`。⚠️ 但 `rg 'mod common'` 仍会命中 **14 处**，全部是**注释里的历史溯源文字**、不是活指针：`test-support/src/lib.rs` 2 处 + `tests/**` 下 11 个文件 12 处（`cnc_program_api` / `applicant_api` / `customer_api` / `_e2e_api` / `idempotency_api`（2 处）/ `auto_complete_api` / `assembly/{api,files}` / `user_repo/{basic,password,role}`）—— 这些注释统一是「本文件原 `mod common;` + `use common::{...};` 已改成 `use hsh_erp_test_support::*`」的来路说明，属有意保留。
 - **修改 tests 内 query! 宏后必须重跑 `./scripts/sqlx_prepare.sh`** 生成 `.sqlx/query-*.json` 并提交；拆分 sub-file 会引入新 cache hash（路径变化）。
 
 ### 测试数据两条硬约定（2026-10-10 新增）
 
-**1）共享 template DB 已灌 `seeds/menu.sql`** —— `scripts/test_nextest.sh` 建 template 库时会 apply 它（与生产启动钩子 `src/infra/seed.rs` 同一份 SQL），因此每个测试用例 clone 出来的库**都带着**那份 seed 给 `MANAGER` / `CLERK` / `INSPECTOR` / `CNC_PROGRAMMER` / `SHELF_ACCOUNT` 五个真实角色授予的二十余个菜单。
+**1）共享 template DB 已灌 `seeds/menu.sql`** —— `scripts/test_nextest.sh` 建 template 库时会 apply 它（与生产启动钩子 `src/infra/seed.rs` 同一份 SQL），因此每个测试用例 clone 出来的库**都带着**那份 seed 给 `MANAGER` / `CLERK` / `INSPECTOR` / `CNC_PROGRAMMER` / `SHELF_ACCOUNT` 五个真实角色授予的若干菜单。**角色数 5 是结构事实、不随 seed 内容变；菜单条数随 `seeds/menu.sql` 改动而变，故此处不写数字**（要确切条数就查库，别把它抄进注释或文档 —— 那正是会立刻过期的陈旧数字）。
 
 ⇒ **任何断言 `t_menu` / `t_role_menu` 条数或内容的测试，必须用 `seeds/menu.sql` 永不授予的合成角色串**（`t_role_menu.role` 是 `varchar(20)`、无 DB ENUM、无 `t_role` 表，任意 ≤20 字符字符串都合法），不能用 `MANAGER` 等真实角色反查 —— 否则会把共享 seed 的菜单一起数进来。范本见 `tests/user_repo/role.rs` 的 `SYNTHETIC_MENU_ROLE` / `SYNTHETIC_MENU_ROLE_B`，同文件 `menu_seed_never_grants_synthetic_menu_roles` 自锁「seed 文本不得出现这两个串」（护的是「合成角色」这个前提本身，一旦被破坏就在 seed 文本上当场红，而不是稀释掉某条断言）。
 
@@ -482,7 +482,7 @@ t_assembly.status               ← 派生缓存
 
 ### 待办登记：lib 单测基线红 `infra::cos_opendal::tests::memory_backend_copy_object`（2026-10-09）
 
-**当前唯一已知基线红 = 这一条**（2026-10-10 实跑 `./scripts/test_nextest.sh` 复核：1356 run / 1355 passed / 1 failed / 10 skipped），原因与业务代码无关：opendal 的 Memory backend 已支持 copy（当年 spike 结论「Memory backend 不支持 copy（`Unsupported (permanent) at copy`）」已过期），而该单测断言的是「copy 必须返回 Unsupported 类错误」，于是 `result.is_err()` 落空。
+**当前唯一已知基线红 = 这一条**（2026-10-10 实跑 `./scripts/test_nextest.sh` 复核：1357 run / 1356 passed / 1 failed / 10 skipped），原因与业务代码无关：opendal 的 Memory backend 已支持 copy（当年 spike 结论「Memory backend 不支持 copy（`Unsupported (permanent) at copy`）」已过期），而该单测断言的是「copy 必须返回 Unsupported 类错误」，于是 `result.is_err()` 落空。
 
 **这条红不是任何一次改动引入的**（在 `master` 上同样红），修它要重写该测试的前提：Memory backend 上 copy 现在是 Ok，得改成断言「copy 成功且 `stat` 出来的 size / 内容与源一致」，或者把该断言降级为只在真 COS（S3 backend）下跑。
 
@@ -496,16 +496,16 @@ t_assembly.status               ← 派生缓存
 
 reviewer 在 iam 域重构期间实跑复现出的另外 6 条基线红（与 iam 无关），根因已逐条核实并处置完毕。两条根因各自都**不是** fixture 污染，也都被收进了「测试数据两条硬约定」一节的机制约束：
 
-| 3 条 `user_repo role::list_active_for_roles_*` | 根因：共享 template DB 已灌 `seeds/menu.sql`，真实角色带着二十余个 seed 菜单；测试用 `MANAGER` / `CLERK` 反查并断言**精确条数**，把 seed 菜单数了进去。处置：改用合成角色 `SYNTHETIC_MENU_ROLE`（断言逐字未削弱），另加 `menu_seed_never_grants_synthetic_menu_roles` 自锁「seed 文本不得出现该串」。 |
+| 3 条 `user_repo role::list_active_for_roles_*` | 根因：共享 template DB 已灌 `seeds/menu.sql`，真实角色带着共享 seed 授予的那批菜单；测试用 `MANAGER` / `CLERK` 反查并断言**精确条数**，把 seed 菜单数了进去。处置：改用合成角色 `SYNTHETIC_MENU_ROLE`（断言逐字未削弱），另加 `menu_seed_never_grants_synthetic_menu_roles` 自锁「seed 文本不得出现该串」。 |
 | 3 条 `statistics api::{overview,workers_stats,worker_detail}_happy_path` | 根因：**时间炸弹** —— 插入行用 `now_naive()`，查询窗口却硬编码 `2026-09-01..2026-09-30`，`2026-09` 写、`2026-09` 跑是绿的，`2026-10-01` 起窗口里查不到行。处置：**删除**（用户决定接受该覆盖清零，不修复）。 |
 
 ### 覆盖空洞登记：`StatisticsService` 的三个方法无 happy-path 测试（2026-10-10）
 
 ⚠️ 写 statistics 相关代码前先知道这件事，否则会误以为该层已被集成测试守住：
 
-- `StatisticsService::overview` / `worker_stats` / `worker_detail` **无 happy-path 集成测试**（原三条硬编码日期窗口的用例已按上表删除）。仅剩 `overview` 的**参数校验**用例（`date_from > date_to` → `BIZ 20104`）与两条 pickup-skip 用例（那两条的 service 调用根本不接日期窗口，与 `overview` / `worker_stats` / `worker_detail` 是不同代码路径）。
+- `StatisticsService::overview` / `worker_stats` / `worker_detail` **无 happy-path 集成测试**（原三条硬编码日期窗口的用例已按上表删除）。`tests/statistics/api.rs` 现存 4 条里，走到这三个方法的只有 `overview` 的**参数校验**用例（`date_from > date_to` → `BIZ 20104`）与两条 pickup-skip 用例（那两条的 service 调用根本不接日期窗口，与 `overview` / `worker_stats` / `worker_detail` 是不同代码路径）；第 4 条 `count_in_process_at_date_to_boundary` 是 repo 层 `count_in_process_at` 的直调覆盖，**不经 service**，故不计入这三个方法。
 - `shared::analytics` 的两个 helper（`daily_buckets` / `worker_contribution`）仍**各保有 2 条纯函数单测**。
-- repo 层 SQL 仍由 `tests/statistics/event_driven.rs` 的 **3 条** repo 层测试覆盖（它们自己钉死时间戳、一直绿）。
+- repo 层 SQL 未被上述删除波及 —— 已知的覆盖点至少有：`tests/statistics/event_driven.rs` 的 3 条（自己钉死时间戳、一直绿）+ 上面那条 `count_in_process_at_date_to_boundary`（钉 `date_to` 边界口径）。这只是**当前已知的**覆盖点、不该当穷举读：判断某个 repo 方法有没有覆盖，要打开 `tests/statistics/` 两个 sub-file 逐个核。
 - 补 happy-path 时遵守「测试数据两条硬约定」第 2 条：**不得**硬编码绝对日期窗口。
 
 ## DB 约定（迁移与查询必须沿用）

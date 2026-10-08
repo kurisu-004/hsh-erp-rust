@@ -5,8 +5,9 @@
 //! - role.rs    ← UserRoleRepo 16 + MenuRepo 4 + ShelfRepo 2 = 22 例（本文件）
 //! - password.rs ← 多表组合事务 + 事务边界 + 3 个补充集成测试 7 例
 //!
-//! 本文件 22 例：覆盖 `iam/repo/sql/{user_role,menu,shelf}.rs` 共 7 个固有方法，
-//! 另有 1 条针对 `seeds/menu.sql` 的自锁断言（不碰 DB）。
+//! 本文件 22 例：覆盖 `iam/repo/sql/{user_role,menu,shelf}.rs` 共 7 个固有方法。
+//! 22 例**已含**针对 `seeds/menu.sql` 的那条自锁断言（`MenuRepo` 4 例之一，不碰
+//! DB），不是 22 之外再加的第 23 条。
 //!
 //! ## 测试并行注意
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
@@ -429,7 +430,7 @@ async fn list_user_roles_by_user_ids_includes_shelf_code_and_name() {
 
 /// 合成菜单角色（主）：`scripts/test_nextest.sh` 建共享 template DB 时会 apply
 /// `seeds/menu.sql`，那份 seed 给 MANAGER / CLERK / INSPECTOR / CNC_PROGRAMMER /
-/// SHELF_ACCOUNT 五个真实角色授了二十余个菜单。断言 `t_role_menu` / `t_menu`
+/// SHELF_ACCOUNT 五个真实角色授了若干菜单。断言 `t_role_menu` / `t_menu`
 /// 精确条数或内容时若用这五个角色反查，会把共享 seed 的菜单一起数进来
 /// （`list_active_menus_by_roles` 因此变红）。故 MenuRepo 的 3 条用例一律走
 /// 本常量这种 seed 永不授予的合成角色。
@@ -450,6 +451,14 @@ const SYNTHETIC_MENU_ROLE_B: &str = "TEST_MENU_ROLE_B";
 /// 授权白名单，下面的 3 条用例会以「精确条数」失败（可见的红）；但更隐蔽的形态是
 /// 同一菜单既被 seed 授予又被测试自建、断言写成 `>=`，红不起来而覆盖已被稀释。
 /// 本断言让前提被破坏时**当场**红在 seed 文本上。
+///
+/// ⚠️ **边界（2026-10-10 登记）**：本断言只读 `seeds/menu.sql` 这一份**文本**。
+/// ① 若日后 template DB 改灌别的 seed 文件、或新增别的含授权的 seed，则
+/// 「模板库只带这一份 seed」这个前提已破，而本断言仍会绿 —— 届时的失效形态是
+/// 下方 3 条用例的精确条数被数错，不会红在 seed 文本上。改 template DB 的灌库
+/// 清单（`scripts/test_nextest.sh`）时必须回来补这份前提的护栏。
+/// ② 反方向偏严、无漏报：`contains` 是子串匹配，`TEST_MENU_ROLE_X` 这类**包含**
+/// 合成串的写法（`SYNTHETIC_MENU_ROLE_B` 就是这种形态）也会被算作命中而误报。
 #[test]
 fn menu_seed_never_grants_synthetic_menu_roles() {
     // 与生产启动钩子 `src/infra/seed.rs`、测试 template DB 同一份 SQL
