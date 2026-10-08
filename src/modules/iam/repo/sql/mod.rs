@@ -15,8 +15,17 @@
 //! SQL 子文件仅放「真源」（free fn + 入参 DTO），调用点 `super::user::xxx`。
 //!
 //! ## SQL 真源 → trait 方法的薄委托
-//! impl 块里每方法只一行 `super::xxx::yyy(&mut **self, ...).await`，无业务分支；
-//! 全部 17 行的 `&mut **self` reborrow（避免 move 引用本身）见 `repo/mod.rs` 注释。
+//! impl 块里每方法只一行 `super::xxx::yyy(&mut **self, ...).await`，无业务分支。
+//!
+//! ### 为什么方法体一律是 `&mut **self`（2026-10-10 复核）
+//! 本 impl 是 `impl IamRepoTrait for &mut PgConnection`，方法签名里 `self` 的类型是
+//! `&mut &mut PgConnection`。`*self` 是「内层那个 `&mut PgConnection` 本身」，按值
+//! 用它等于把引用 move 出借来的内容（编译报 cannot move out of borrowed content）；
+//! `&mut **self` 才是 **reborrow** —— 重新借一层 `&mut PgConnection` 交给子文件
+//! free fn（其首参与之一致），`self` 本身保持可用。
+//! **22 个方法 = 22 处 reborrow**，与本文件 impl 块的方法数、`repo/mod.rs` 里 trait
+//! 的方法数三者恒等。`repo/mod.rs` 只承担 trait 声明与命名约定，不承载这个实现细节，
+//! 故说明就地留在本文件。
 
 pub mod menu;
 pub mod shelf;

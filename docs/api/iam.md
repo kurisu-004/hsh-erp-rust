@@ -238,7 +238,8 @@ session TTL / refresh。
 4. **新增 40110 分支**：绑定时报「该系统账号已绑其它 userid，请先解绑」——与 40108
    方向相反，UI 文案要区分（40108 = 这个 userid 已名花有主；40110 = 这个账号已占）。
 5. `POST /iam/users/{id}/wx-bind` 的 `corp_id` 字段删掉（继续传也不报错）。
-6. `/iam/reset-password`、`/iam/users/{id}/roles`（授予）**不需要** `version`。
+6. `/iam/users/{id}/reset-password`、`/iam/users/{id}/roles`（授予）**不需要**
+   `version`。
 
 ## 8. 已知偏差登记
 
