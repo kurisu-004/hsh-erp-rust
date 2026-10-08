@@ -4,7 +4,8 @@
 //! admin 都不 import 别域的 service / repo，而是各自在本域 SQL 里聚合），但口头
 //! 约定挡不住回退，故用单测在源码层兜住。
 //!
-//! 已接入的三域：`dashboard`（扫 `src/modules/dashboard`）、`prod::programming`
+//! 已接入的五域：`dashboard`（扫 `src/modules/dashboard`）、`iam`（扫
+//! `src/modules/iam`，含嵌套子模块 `iam::shelf`）、`prod::programming`
 //! （扫 `src/modules/prod/programming`）、`prod::inspection`（扫
 //! `src/modules/prod/inspection`）—— 后两域是**嵌套域**，同父兄弟域
 //! （`prod::batch`）同样算跨域，由前缀匹配而非「首段相同即本域」判定。

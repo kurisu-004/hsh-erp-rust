@@ -34,3 +34,41 @@ use crate::state::AppState;
 pub fn router() -> Router<Arc<AppState>> {
     handler::router()
 }
+
+#[cfg(test)]
+mod tests {
+    //! 域隔离护栏：把「iam 域不依赖其它域」从口头约定变成 CI 强制。
+    //!
+    //! 探测器实现（剥注释、根段 + 域路径前缀匹配、元测试）见
+    //! [`crate::shared::domain_guard`]，本域只负责传参 + 域专属指引。
+
+    use std::path::Path;
+
+    use crate::shared::domain_guard::assert_no_foreign_domain;
+
+    /// iam 域只允许 `crate::` 下的 `auth` / `infra` / `shared` / `state` 与本域自身
+    /// （含嵌套子模块 `iam::shelf`）；代码区里出现任何其它域的路径即失败。
+    ///
+    /// 这条护栏对本域是**结构性成立**的，不是「暂时没依赖」：iam 管的表是
+    /// `t_user` / `t_user_role` / `t_menu` / `t_wx_identity` / `t_shelf`，全部自有；
+    /// 唯一的跨域诉求是校验 `scope_id` 指向的货架，而货架已于 2026-10-10 收进本域
+    /// （`IamRepoTrait::get_shelf_by_id` 委托 `iam::shelf::repo::ShelfRepo::get_by_id`）。
+    /// 换句话说 iam 是本仓少有的「**纯自有表域**」—— 不像 `dashboard` / `statistics` /
+    /// `admin` 那样要在本域 SQL 里跨域只读聚合，所以不需要为护栏写「正确做法」的
+    /// 取舍说明，只要守住「不许 import 别人的 service / repo」这一条。
+    ///
+    /// ⚠️ 若哪天本域真的需要别的域的数据，**先改这里**而不是删掉这条护栏：要么按
+    /// `statistics` / `admin` 的 pattern 在本域 SQL 里只读聚合（护栏仍然成立），
+    /// 要么把本域降级为与 `prod::queue` 同形的「经本域 trait 转发他域单表查询」的
+    /// 域并显式登记例外。
+    #[test]
+    fn iam_domain_depends_on_no_other_domain() {
+        assert_no_foreign_domain(
+            "iam",
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src/modules/iam"),
+            "iam 域管的表（t_user / t_user_role / t_menu / t_wx_identity / t_shelf）全部自有，\
+             不需要读别的域；真的要跨域只读时，正确做法是像 statistics / admin 那样在本域 \
+             SQL 里只读聚合，而不是 import 别人的 service / repo。",
+        );
+    }
+}
