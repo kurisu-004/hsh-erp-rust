@@ -18,6 +18,9 @@ use sqlx::FromRow;
 ///
 /// `location`：物理位置描述（货架所在通道/楼层），由 MANAGER 创建/更新
 /// 时填写，可空。
+///
+/// `capacity`（2026-10-10）：负载上限（件数）。`None` 或 `<= 0` = 不限，
+/// 选架排序时恒排最后（见 `shared::shelf::select::pick_least_loaded`）。
 #[derive(Debug, Clone, FromRow)]
 pub struct TShelf {
     pub id: i64,
@@ -27,6 +30,7 @@ pub struct TShelf {
     pub location: Option<String>,
     pub is_active: bool,
     pub display_order: i32,
+    pub capacity: Option<i32>,
     pub version: i32,
     pub created_at: chrono::NaiveDateTime,
     pub created_by: Option<i64>,

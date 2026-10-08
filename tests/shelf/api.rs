@@ -339,3 +339,182 @@ async fn for_inspection_returns_current_load_as_sum_of_quantity() {
         "空载货架 LEFT JOIN 应取 0（不是 null）; got: {empty}"
     );
 }
+
+/// 2026-10-10：`GET /shelves` 与 `GET /shelves/{id}` 的 `capacity` / `current_load`
+/// 两个新出参。
+///
+/// 断言三件事：
+/// 1. `capacity` 是**裸 JSON number**（不是雪花 id 那样的字符串）—— 前端表单控件
+///    要拿到 `200` 而不是 `"200"`；
+/// 2. `current_load` 是 `SUM(quantity)` 的件数口径（`quantity=3` 的单批次 ⇒ 3，
+///    与 `COUNT(*)=1` 可区分）；
+/// 3. `load_ratio` **不在**响应里 —— 比例由前端按 `current_load / capacity` 现算，
+///    后端发浮点会让前端多一层精度处理（理由见 `vo/shelf.rs` 的注释）。
+#[tokio::test]
+async fn list_and_get_expose_capacity_and_current_load() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+
+    let (s1, env1) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/shelves",
+            Some(json!({
+                "code": "S-CAP-01",
+                "name": "Capacity-01",
+                "zone": "PRODUCTION",
+                "capacity": 50,
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::CREATED, "create shelf: {env1}");
+    let shelf_id: i64 = env1["data"]["id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(
+        env1["data"]["capacity"].as_i64(),
+        Some(50),
+        "create 回显必须是裸 number; got: {env1}"
+    );
+    assert_eq!(env1["data"]["current_load"].as_i64(), Some(0));
+
+    insert_part_held_by_shelf(&pool, shelf_id, "IN_PROCESS", "PRODUCTION_SHELF", 3).await;
+
+    let (s2, env2) = send(
+        app.clone(),
+        json_request("GET", "/shelves", None, Some(&token)),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK, "list shelves: {env2}");
+    let row = env2["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|it| it["code"] == "S-CAP-01")
+        .unwrap_or_else(|| panic!("S-CAP-01 missing from list: {env2}"));
+    assert_eq!(row["capacity"].as_i64(), Some(50));
+    assert_eq!(
+        row["current_load"].as_i64(),
+        Some(3),
+        "current_load 必须是 quantity 总和（件数口径）; got: {row}"
+    );
+    assert!(
+        row.get("load_ratio").is_none(),
+        "load_ratio 不进 ShelfOut（前端现算）；got: {row}"
+    );
+
+    let (s3, env3) = send(
+        app,
+        json_request("GET", &format!("/shelves/{shelf_id}"), None, Some(&token)),
+    )
+    .await;
+    assert_eq!(s3, StatusCode::OK, "get shelf: {env3}");
+    assert_eq!(env3["data"]["capacity"].as_i64(), Some(50));
+    assert_eq!(env3["data"]["current_load"].as_i64(), Some(3));
+}
+
+/// 2026-10-10：`ShelfUpdateRequest.capacity` 的**三态**语义。
+///
+/// - 缺省（字段不出现）⇒ 不改
+/// - `null` ⇒ 清空回「不限」
+/// - `200` ⇒ 改上限
+///
+/// 「清空」必须能与「不动」区分，否则「取消上限并保存」会被当成没改而静默丢失。
+#[tokio::test]
+async fn update_capacity_supports_three_states() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+
+    let (s1, env1) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/shelves",
+            Some(json!({
+                "code": "S-CAP-02",
+                "name": "Capacity-02",
+                "zone": "PRODUCTION",
+                "capacity": 100,
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::CREATED, "create shelf: {env1}");
+    let shelf_id: i64 = env1["data"]["id"].as_str().unwrap().parse().unwrap();
+
+    async fn put(
+        app: axum::Router,
+        token: &str,
+        id: i64,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        send(
+            app,
+            json_request(
+                "POST",
+                &format!("/shelves/{id}/update"),
+                Some(body),
+                Some(token),
+            ),
+        )
+        .await
+    }
+
+    // ① 缺省 ⇒ 不改
+    let (sa, enva) = put(app.clone(), &token, shelf_id, json!({ "version": 0 })).await;
+    assert_eq!(sa, StatusCode::OK, "update: {enva}");
+    assert_eq!(
+        enva["data"]["capacity"].as_i64(),
+        Some(100),
+        "缺省 capacity 不应改动; got: {enva}"
+    );
+
+    // ② 改值
+    let (sb, envb) = put(
+        app.clone(),
+        &token,
+        shelf_id,
+        json!({ "version": enva["data"]["version"].as_i64().unwrap(), "capacity": 200 }),
+    )
+    .await;
+    assert_eq!(sb, StatusCode::OK, "update capacity: {envb}");
+    assert_eq!(envb["data"]["capacity"].as_i64(), Some(200));
+
+    // ③ 清空
+    let (sc, envc) = put(
+        app.clone(),
+        &token,
+        shelf_id,
+        json!({ "version": envb["data"]["version"].as_i64().unwrap(), "capacity": null }),
+    )
+    .await;
+    assert_eq!(sc, StatusCode::OK, "clear capacity: {envc}");
+    assert_eq!(
+        envc["data"]["capacity"].as_i64(),
+        None,
+        "null 必须清空成「不限」; got: {envc}"
+    );
+
+    // ④ `<= 0` 被接受（口径：<= 0 = 不限），不报 20104
+    let (sd, envd) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/shelves",
+            Some(json!({
+                "code": "S-CAP-03",
+                "name": "Capacity-03",
+                "zone": "PRODUCTION",
+                "capacity": 0,
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        sd,
+        StatusCode::CREATED,
+        "capacity=0 必须被接受（<= 0 = 不限），不报错; got: {envd}"
+    );
+    let _ = pool;
+}

@@ -118,8 +118,11 @@ pub trait ShelfRepoTrait: Send {
         location: Option<&'a str>,
         display_order: i32,
         created_by: i64,
+        capacity: Option<i32>,
     ) -> Result<TShelf, sqlx::Error>;
     #[allow(clippy::too_many_arguments)]
+    /// `location` / `capacity` 三态：`None` 不改 / `Some(None)` 清 NULL /
+    /// `Some(Some(v))` 改值。
     async fn update<'a>(
         &mut self,
         id: i64,
@@ -128,6 +131,7 @@ pub trait ShelfRepoTrait: Send {
         location: Option<Option<&'a str>>,
         display_order: Option<i32>,
         updated_by: i64,
+        capacity: Option<Option<i32>>,
     ) -> Result<u64, sqlx::Error>;
     async fn soft_delete(
         &mut self,
@@ -136,6 +140,16 @@ pub trait ShelfRepoTrait: Send {
         updated_by: i64,
     ) -> Result<u64, sqlx::Error>;
     async fn count_in_use_parts(&mut self, shelf_id: i64) -> Result<i64, sqlx::Error>;
+    /// 2026-10-10：批量取一组货架的 `(capacity, current_load)`（零 N+1）。
+    ///
+    /// 委托 [`crate::shared::shelf::load::loads_by_shelf_ids`] —— 负载聚合的口径
+    /// 由那个共享常量单点承担，本 trait 只是为了让 service 能在泛型 `R` 下调用它
+    /// （`ShelfRepoTrait` 不暴露 `conn()` 访问器：加一个返回 `&mut PgConnection`
+    /// 的方法会让 `mockall::automock` 无法伪造返回值）。
+    async fn load_by_ids(
+        &mut self,
+        shelf_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, (Option<i32>, i64)>, sqlx::Error>;
 }
 
 /// 把 `ShelfRepoTrait` 直接对 `&mut PgConnection` 实现——handler/service 借 `&mut *tx` 或
@@ -203,6 +217,7 @@ impl ShelfRepoTrait for &mut PgConnection {
         location: Option<&'b str>,
         display_order: i32,
         created_by: i64,
+        capacity: Option<i32>,
     ) -> Result<TShelf, sqlx::Error> {
         ShelfRepo::create(
             &mut **self,
@@ -213,6 +228,7 @@ impl ShelfRepoTrait for &mut PgConnection {
             location,
             display_order,
             created_by,
+            capacity,
         )
         .await
     }
@@ -226,6 +242,7 @@ impl ShelfRepoTrait for &mut PgConnection {
         location: Option<Option<&'b str>>,
         display_order: Option<i32>,
         updated_by: i64,
+        capacity: Option<Option<i32>>,
     ) -> Result<u64, sqlx::Error> {
         ShelfRepo::update(
             &mut **self,
@@ -235,6 +252,7 @@ impl ShelfRepoTrait for &mut PgConnection {
             location,
             display_order,
             updated_by,
+            capacity,
         )
         .await
     }
@@ -250,5 +268,12 @@ impl ShelfRepoTrait for &mut PgConnection {
 
     async fn count_in_use_parts(&mut self, shelf_id: i64) -> Result<i64, sqlx::Error> {
         ShelfRepo::count_in_use_parts(&mut **self, shelf_id).await
+    }
+
+    async fn load_by_ids(
+        &mut self,
+        shelf_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, (Option<i32>, i64)>, sqlx::Error> {
+        crate::shared::shelf::load::loads_by_shelf_ids(&mut **self, shelf_ids).await
     }
 }

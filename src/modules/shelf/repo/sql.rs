@@ -12,6 +12,13 @@
 //! - `list_active_inspection_with_load` 是 11 个静态方法里专供 picker for-inspection
 //!   的那一个，与 for-return 聚合口径逐字一致；理由见各方法 doc
 //!
+//! ## 2026-10-10：两处聚合子查询改为引用共享常量
+//! 这两个方法各自的 `LEFT JOIN (SELECT current_holder_id … GROUP BY …)` 子查询
+//! 原本是**逐字重复**的两份，唯一的约束是注释里那句「必须逐字一致」。注释不执行，
+//! 改一处忘了另一处时两个 picker 会对同一个架给出不同的负载数且没有任何测试报警。
+//! 现在两处都 `format!` 填 [`crate::shared::shelf::load::LOAD_AGGREGATE_SQL`]，
+//! 口径由常量单点承担（注入面为 0：用户输入一律走 bind，填的是编译期常量）。
+//!
 //! ## Phase P3+ shelf CRUD 暴露给 service 的能力（2026-10-02 起 10 静态方法；
 //! 2026-10-04 加 `list_active_inspection_with_load` 后为 11）
 //! - 读：`get_active_by_id` / `get_by_id` / `get_by_id_zone`
@@ -37,9 +44,10 @@
 //! 域），后者随 `ShelfOut.account_count` 出参取消而删除（账号绑定真源在 iam 域）。
 //! 本文件现在只负责 `t_shelf` 单表。
 
-use sqlx::{PgExecutor, QueryBuilder};
+use sqlx::{AssertSqlSafe, PgExecutor, QueryBuilder};
 
 use crate::modules::shelf::model::TShelf;
+use crate::shared::shelf::load::LOAD_AGGREGATE_SQL;
 
 /// `TShelf` + 聚合 `current_load`（来自 t_part_batch LEFT JOIN）。
 ///
@@ -54,6 +62,8 @@ pub struct TShelfWithLoad {
     pub location: Option<String>,
     pub is_active: bool,
     pub display_order: i32,
+    /// 负载上限（件数）；`None` 或 `<= 0` = 不限。
+    pub capacity: Option<i32>,
     pub version: i32,
     pub created_at: chrono::NaiveDateTime,
     pub created_by: Option<i64>,
@@ -79,7 +89,7 @@ impl ShelfRepo {
             TShelf,
             r#"
             SELECT id, code, name, zone, location, is_active, display_order,
-                   version, created_at, created_by, updated_at, updated_by, deleted_at
+                   capacity, version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_shelf
             WHERE id = $1 AND is_active = true AND deleted_at IS NULL
             "#,
@@ -98,7 +108,7 @@ impl ShelfRepo {
             TShelf,
             r#"
             SELECT id, code, name, zone, location, is_active, display_order,
-                   version, created_at, created_by, updated_at, updated_by, deleted_at
+                   capacity, version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_shelf
             WHERE id = $1 AND deleted_at IS NULL
             "#,
@@ -119,7 +129,7 @@ impl ShelfRepo {
             TShelf,
             r#"
             SELECT id, code, name, zone, location, is_active, display_order,
-                   version, created_at, created_by, updated_at, updated_by, deleted_at
+                   capacity, version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_shelf
             WHERE id = $1 AND zone = $2 AND is_active = true AND deleted_at IS NULL
             "#,
@@ -142,8 +152,8 @@ impl ShelfRepo {
         offset: i64,
     ) -> Result<Vec<TShelf>, sqlx::Error> {
         let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
-            "SELECT id, code, name, zone, location, is_active, display_order, version, \
-             created_at, created_by, updated_at, updated_by, deleted_at \
+            "SELECT id, code, name, zone, location, is_active, display_order, capacity, \
+             version, created_at, created_by, updated_at, updated_by, deleted_at \
              FROM t_shelf WHERE deleted_at IS NULL",
         );
         if let Some(z) = zone {
@@ -225,27 +235,20 @@ impl ShelfRepo {
     pub async fn list_active_production_ordered<'e, E: PgExecutor<'e>>(
         executor: E,
     ) -> Result<Vec<TShelfWithLoad>, sqlx::Error> {
-        sqlx::query_as!(
-            TShelfWithLoad,
+        sqlx::query_as::<_, TShelfWithLoad>(AssertSqlSafe(format!(
             r#"
             SELECT s.id, s.code, s.name, s.zone, s.location, s.is_active, s.display_order,
-                   s.version, s.created_at, s.created_by, s.updated_at, s.updated_by, s.deleted_at,
-                   COALESCE(load.cnt, 0)::bigint AS "current_load!"
+                   s.capacity, s.version, s.created_at, s.created_by, s.updated_at, s.updated_by,
+                   s.deleted_at,
+                   COALESCE(load.cnt, 0)::bigint AS current_load
             FROM t_shelf s
-            LEFT JOIN (
-                SELECT current_holder_id AS shelf_id,
-                       SUM(quantity)::bigint AS cnt
-                FROM t_part_batch
-                WHERE status IN ('PENDING', 'IN_PROCESS', 'INSPECTION', 'OUTSOURCE')
-                  AND deleted_at IS NULL
-                GROUP BY current_holder_id
-            ) load ON load.shelf_id = s.id
+            LEFT JOIN ({LOAD_AGGREGATE_SQL}) load ON load.shelf_id = s.id
             WHERE s.zone = 'PRODUCTION'
               AND s.is_active = true
               AND s.deleted_at IS NULL
             ORDER BY load.cnt ASC NULLS FIRST, s.display_order ASC, s.id ASC
-            "#,
-        )
+            "#
+        )))
         .fetch_all(executor)
         .await
     }
@@ -276,33 +279,28 @@ impl ShelfRepo {
     pub async fn list_active_inspection_with_load<'e, E: PgExecutor<'e>>(
         executor: E,
     ) -> Result<Vec<TShelfWithLoad>, sqlx::Error> {
-        sqlx::query_as!(
-            TShelfWithLoad,
+        sqlx::query_as::<_, TShelfWithLoad>(AssertSqlSafe(format!(
             r#"
             SELECT s.id, s.code, s.name, s.zone, s.location, s.is_active, s.display_order,
-                   s.version, s.created_at, s.created_by, s.updated_at, s.updated_by, s.deleted_at,
-                   COALESCE(load.cnt, 0)::bigint AS "current_load!"
+                   s.capacity, s.version, s.created_at, s.created_by, s.updated_at, s.updated_by,
+                   s.deleted_at,
+                   COALESCE(load.cnt, 0)::bigint AS current_load
             FROM t_shelf s
-            LEFT JOIN (
-                SELECT current_holder_id AS shelf_id,
-                       SUM(quantity)::bigint AS cnt
-                FROM t_part_batch
-                WHERE status IN ('PENDING', 'IN_PROCESS', 'INSPECTION', 'OUTSOURCE')
-                  AND deleted_at IS NULL
-                GROUP BY current_holder_id
-            ) load ON load.shelf_id = s.id
+            LEFT JOIN ({LOAD_AGGREGATE_SQL}) load ON load.shelf_id = s.id
             WHERE s.zone = 'INSPECTION'
               AND s.is_active = true
               AND s.deleted_at IS NULL
             ORDER BY s.display_order ASC, s.id ASC
-            "#,
-        )
+            "#
+        )))
         .fetch_all(executor)
         .await
     }
 
     /// 插入新货架。雪花 id 由调用方（service）生成；created_by / updated_by
     /// 共用 `created_by`，后续 UPDATE 才更新 updated_by。
+    ///
+    /// `capacity` 2026-10-10 起可传（件数上限）；`None` → 落 NULL = 不限。
     #[allow(clippy::too_many_arguments)]
     pub async fn create<'e, E: PgExecutor<'e>>(
         executor: E,
@@ -313,15 +311,16 @@ impl ShelfRepo {
         location: Option<&str>,
         display_order: i32,
         created_by: i64,
+        capacity: Option<i32>,
     ) -> Result<TShelf, sqlx::Error> {
         sqlx::query_as!(
             TShelf,
             r#"
             INSERT INTO t_shelf (id, code, name, zone, location, is_active, display_order,
-                                 created_by, updated_by)
-            VALUES ($1, $2, $3, $4, $5, true, $6, $7, $7)
+                                 capacity, created_by, updated_by)
+            VALUES ($1, $2, $3, $4, $5, true, $6, $7, $8, $8)
             RETURNING id, code, name, zone, location, is_active, display_order,
-                      version, created_at, created_by, updated_at, updated_by, deleted_at
+                      capacity, version, created_at, created_by, updated_at, updated_by, deleted_at
             "#,
             snowflake_id,
             code,
@@ -329,6 +328,7 @@ impl ShelfRepo {
             zone,
             location,
             display_order,
+            capacity,
             created_by,
         )
         .fetch_one(executor)
@@ -337,7 +337,7 @@ impl ShelfRepo {
 
     /// 部分更新（OCC）：带乐观锁。
     ///
-    /// `location` / `display_order` 三态编码（与 process.update 同形）：
+    /// `location` / `capacity` 三态编码（与 process.update 同形）：
     /// - `None` ⇒ 字段缺省，不修改
     /// - `Some(None)` ⇒ 显式清空（SET NULL）
     /// - `Some(Some(v))` ⇒ 改值
@@ -350,15 +350,19 @@ impl ShelfRepo {
         location: Option<Option<&str>>,
         display_order: Option<i32>,
         updated_by: i64,
+        capacity: Option<Option<i32>>,
     ) -> Result<u64, sqlx::Error> {
         let set_location = location.is_some();
         let new_location = location.flatten();
+        let set_capacity = capacity.is_some();
+        let new_capacity = capacity.flatten();
         sqlx::query!(
             r#"
             UPDATE t_shelf
             SET name          = COALESCE($3::varchar, name),
                 location      = CASE WHEN $4::bool THEN $5::varchar ELSE location END,
                 display_order = COALESCE($6::integer, display_order),
+                capacity      = CASE WHEN $8::bool THEN $9::integer ELSE capacity END,
                 version       = version + 1,
                 updated_at    = now(),
                 updated_by    = $7
@@ -371,6 +375,8 @@ impl ShelfRepo {
             new_location,
             display_order,
             updated_by,
+            set_capacity,
+            new_capacity,
         )
         .execute(executor)
         .await

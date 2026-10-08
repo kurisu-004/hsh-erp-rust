@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO t_shelf (id, code, name, zone, location, is_active, display_order,\n                                 created_by, updated_by)\n            VALUES ($1, $2, $3, $4, $5, true, $6, $7, $7)\n            RETURNING id, code, name, zone, location, is_active, display_order,\n                      version, created_at, created_by, updated_at, updated_by, deleted_at\n            ",
+  "query": "\n            SELECT id, code, name, zone, location, is_active, display_order,\n                   capacity, version, created_at, created_by, updated_at, updated_by, deleted_at\n            FROM t_shelf\n            WHERE id = $1 AND deleted_at IS NULL\n            ",
   "describe": {
     "columns": [
       {
@@ -82,6 +82,17 @@
       },
       {
         "ordinal": 7,
+        "name": "capacity",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_shelf",
+            "name": "capacity"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
         "name": "version",
         "type_info": "Int4",
         "origin": {
@@ -92,7 +103,7 @@
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "created_at",
         "type_info": "Timestamp",
         "origin": {
@@ -103,7 +114,7 @@
         }
       },
       {
-        "ordinal": 9,
+        "ordinal": 10,
         "name": "created_by",
         "type_info": "Int8",
         "origin": {
@@ -114,7 +125,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 11,
         "name": "updated_at",
         "type_info": "Timestamp",
         "origin": {
@@ -125,7 +136,7 @@
         }
       },
       {
-        "ordinal": 11,
+        "ordinal": 12,
         "name": "updated_by",
         "type_info": "Int8",
         "origin": {
@@ -136,7 +147,7 @@
         }
       },
       {
-        "ordinal": 12,
+        "ordinal": 13,
         "name": "deleted_at",
         "type_info": "Timestamp",
         "origin": {
@@ -149,12 +160,6 @@
     ],
     "parameters": {
       "Left": [
-        "Int8",
-        "Varchar",
-        "Varchar",
-        "Varchar",
-        "Varchar",
-        "Int4",
         "Int8"
       ]
     },
@@ -166,6 +171,7 @@
       true,
       false,
       false,
+      true,
       false,
       false,
       true,
@@ -174,5 +180,5 @@
       true
     ]
   },
-  "hash": "957ab8e7adcb2948b76b5f9359391631edbb31b097db5813def8a84988f54385"
+  "hash": "fe496e06cfdb1fc2e8b6d74c3b3f6796a577c84bb0acb658c970fc9c9dd727cf"
 }

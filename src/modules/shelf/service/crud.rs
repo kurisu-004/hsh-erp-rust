@@ -49,9 +49,20 @@ fn version_conflict() -> AppError {
 
 /// 把 `TShelf` 转 `ShelfOut`。
 ///
-/// 2026-10-02：原签名带第 2 参数 `account_count`（由 caller 在 list 时统一 GROUP BY
-/// 批量补全、get 时恒传 0）。`ShelfOut.account_count` 出参取消后该参数无意义，一并删除。
-fn to_shelf_out(s: TShelf) -> ShelfOut {
+/// 2026-10-10：新增 `capacity`（直接取 `t_shelf` 列）+ `current_load`（**读时聚合**，
+/// 不在 `TShelf` 里）。聚合口径由 [`crate::shared::shelf::load::LOAD_AGGREGATE_SQL`]
+/// 单点承担；`capacity = None` 表示该货架行**不在** batch 查询的结果里（理论上不会
+/// 发生 —— id 来自同一张表），落 `None` 而非 panic。
+///
+/// ## 为什么不再保持「纯 `TShelf → ShelfOut`」
+///
+/// 2026-10-10 之前本函数确实是纯函数（`account_count` 出参取消后只剩字段搬运）。
+/// 加 `current_load` 之后它需要一次额外查询，于是调用方改为「先查行、再查负载、
+/// 再映射」三步。**不**把聚合 JOIN 进货架列表 SQL 的理由见
+/// [`crate::shared::shelf::load::loads_by_shelf_ids`] 的 doc（会让 shared 层接管
+/// shelf 域的 `QueryBuilder` 筛选语义）。
+fn to_shelf_out(s: TShelf, load: (Option<i32>, i64)) -> ShelfOut {
+    let (capacity, current_load) = load;
     ShelfOut {
         id: s.id,
         code: s.code,
@@ -60,6 +71,10 @@ fn to_shelf_out(s: TShelf) -> ShelfOut {
         location: s.location,
         is_active: s.is_active,
         display_order: s.display_order,
+        // `TShelf.capacity` 是存储列、`loads_by_shelf_ids` 那份是同一列的第二次
+        // 读取；取前者（零额外往返语义），后者只为算 `current_load`。
+        capacity: s.capacity.or(capacity),
+        current_load,
         version: s.version,
         created_at: s.created_at,
         updated_at: s.updated_at,
@@ -118,8 +133,19 @@ impl ShelfService {
         let total = repo
             .count_with_filters(code_like, zone, query.is_active)
             .await?;
-
-        let out_items = items.into_iter().map(to_shelf_out).collect();
+        // 2026-10-10：`capacity` / `current_load` 出参 —— 一次批量聚合（零 N+1），
+        // 口径见 `shared::shelf::load::LOAD_AGGREGATE_SQL`
+        let loads = repo
+            .load_by_ids(&items.iter().map(|s| s.id).collect::<Vec<_>>())
+            .await?;
+        let zero = (None, 0);
+        let out_items = items
+            .into_iter()
+            .map(|s| {
+                let load = loads.get(&s.id).copied().unwrap_or(zero);
+                to_shelf_out(s, load)
+            })
+            .collect();
 
         Ok(ShelfListOut {
             items: out_items,
@@ -152,8 +178,17 @@ impl ShelfService {
             ));
         }
 
-        // 2026-10-02：`account_count` 出参取消，单条 get 不再做额外查询
-        Ok(to_shelf_out(s))
+        // 2026-10-10：`capacity` / `current_load` 出参。单条详情也要出这两个字段 ——
+        // 前端货架管理页的编辑弹窗靠 `GET /shelves/{id}` 回显上限（列表页只给
+        // 摘要，不回显全部可编辑字段）
+        let load = repo
+            .load_by_ids(&[s.id])
+            .await?
+            .get(&s.id)
+            .copied()
+            .unwrap_or((None, 0));
+
+        Ok(to_shelf_out(s, load))
     }
 
     // =======================================================================
@@ -184,10 +219,25 @@ impl ShelfService {
             .map(str::trim)
             .filter(|s| !s.is_empty());
         let display_order = req.display_order.unwrap_or(0);
+        // 2026-10-10：`capacity` 缺省 = 不限（落 NULL）。**刻意不校验 `> 0`** ——
+        // 「`NULL` 或 `<= 0` = 不限」是选架排序的口径（不限架恒排最后），在这里
+        // 报 20104 会让同一个值在 create 走不通、在 update 却走得通（后者按同一
+        // 口径接受），两个端点的容错集合分叉。零 / 负值与 NULL 语义完全相同，
+        // 没有理由区别对待。
+        let capacity = req.capacity;
 
         let id = snowflake.next_id();
         let s = repo
-            .create(id, code, name, &zone, location, display_order, current.id)
+            .create(
+                id,
+                code,
+                name,
+                &zone,
+                location,
+                display_order,
+                current.id,
+                capacity,
+            )
             .await
             .map_err(
                 |e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
@@ -200,7 +250,7 @@ impl ShelfService {
                 },
             )?;
 
-        Ok(to_shelf_out(s))
+        Ok(to_shelf_out(s, (capacity, 0)))
     }
 
     pub async fn update_shelf<R: ShelfRepoTrait>(
@@ -246,6 +296,10 @@ impl ShelfService {
                 loc_update,
                 req.display_order,
                 current.id,
+                // 2026-10-10：三态透传（`None` 不改 / `Some(None)` 清空 /
+                // `Some(Some(v))` 改值）。**`<= 0` 照样接受**（= 不限），理由同
+                // `create_shelf` 的注释。
+                req.capacity,
             )
             .await
             .map_err(
