@@ -478,6 +478,10 @@ t_assembly.status               ← 派生缓存
 
 **登记原因**：review 阶段容易被误判成本轮 diff 带进来的回归。**勿挂在本轮 PR 上** —— 与 `prod::batch` 拆批 quantity 那次修复（`git diff master..HEAD` 只碰 5 个文件、`src/infra/` 与 `Cargo.lock` 均未触碰）无关，单独一个 commit 处理。
 
+⚠️ **配套坑：`cargo test --lib` 的红绿不可直接判读——lib 单测的可靠闸门是 `scripts/test_nextest.sh --lib`**（2026-10-09 登记）：`.cargo/config.toml` 的 runner（`scripts/test_runner.sh`）对 `hsh_erp_rust-*`（lib/bin 单测 binary）走第 4 个转义口直接 `exec`，不起 PG 容器、不注入 `TEST_DATABASE_BASE_URL`，故 `prod/queue/service/dispatch.rs`(18) + `service/queue.rs`(7) + `shared/batch/guards.rs`(4) 共 **29** 条调 `test_pool()` 的 `#[tokio::test]` 在 `cargo test --lib` 下会以「`TEST_DATABASE_BASE_URL` 未设置」panic 额外报错（它们在 `test_nextest.sh --lib` 下是绿的），把这批 panic 当成本轮 diff 的回归就会误判。
+
+口径提示：`cargo test --lib` 的失败总数是 **30**，比上面那 29 条多出的 1 条是上文已单列的 `infra::cos_opendal::tests::memory_backend_copy_object` 基线红（与 `TEST_DATABASE_BASE_URL` 无关）。实测 `cargo test --lib` = 386 passed / 30 failed。
+
 ## DB 约定（迁移与查询必须沿用）
 
 - 无物理外键（`bigint` + 索引，存在性由 service 校验）、无 DB ENUM（`varchar` + Rust enum 校验）

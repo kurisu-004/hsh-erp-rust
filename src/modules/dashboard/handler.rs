@@ -486,8 +486,9 @@ async fn run_socket(
                         // Redis 卡住超过 WS_REAUTH_CALL_TIMEOUT：判「本轮跳过」而不是判死。
                         // 判死会误伤健康连接（且真正的问题在服务端，不在客户端会话）。
                         Ok(Err(e)) => {
-                            // 2026-10-02（review 第 1 轮 Major-1）：**按失败原因分流**，
-                            // 决策全部收在纯函数 `reauth_close_code` 里（见其 doc）。
+                            // **按失败原因分流**（access JWT 过期 / 会话被吊销 / 服务端故障
+                            // 三段语义完全不同），决策全部收在纯函数 `reauth_close_code`
+                            // 里（见其 doc 与 `docs/api/dashboard.md` 的 WS 关闭码表）。
                             let (close_code, reason) = reauth_close_code(e.code());
                             warn!(
                                 user_id = user_id,
@@ -540,9 +541,36 @@ async fn run_socket(
     }
 }
 
+/// 周期性 re-auth 失败时「关闭码 + reason 文案」的**唯一决策点**（纯函数，无 IO、
+/// 无状态，故可在 lib 单测里直接断言）。完整的前后端契约见 `docs/api/dashboard.md`
+/// 的 WS 关闭码表。
+///
+/// 按 `verify_session_token` 的失败码分三段：
+///
+/// - `TOKEN_EXPIRED`（40102）⇒ `4001 "access token expired"`：**只是这枚 access JWT
+///   过期**，Redis 里的 session（及 refresh token 允许的续期路径）很可能仍然活着。
+///   前端应**先拿 refresh token 续期再重连**，不要当成会话被吊销去清本地 token。
+/// - `UNAUTHORIZED`（40100）/ `SESSION_REVOKED`（40105）⇒ `4001 "auth expired"`：
+///   **会话确实已被吊销**（登出 / 改密 / 管理员停用 / refresh reuse detection），
+///   前端必须终止会话、清 token 跳登录页。
+/// - 其它（`INTERNAL` 50000 等基础设施故障、未预见的码）⇒ `1011 "re-auth
+///   unavailable"`：问题在服务端，前端走**普通重连**即可。Redis 故障绝不能映射成
+///   4001 —— 那会把「服务端不可用」误报成「用户会话没了」，前端据此清掉仍有效的
+///   token，用户白丢登录态。未知码同样走 1011：新错误码一上线不该把用户踢去登录页。
+///
+/// **关闭码只表达「这条连接必须终止」，处置方式由 reason 文案区分。** 故
+/// `TOKEN_EXPIRED` 仍取 4001 而不是 1011：连接该断还是断（前端握着一枚过期 token
+/// 重连，必然在握手期鉴权就被拒，只是把失败推后一轮并刷屏重试日志）；变的只是
+/// 「断完之后做什么」。同理**不在 re-auth 里跳过 `exp` 校验** —— 那会削弱吊销检测
+/// 强度，属于另一套取舍；本轮只把「客户端怎么处置」的信号补精确。
+///
+/// 2026-10-09 变更缘由：`TOKEN_EXPIRED` 与 `SESSION_REVOKED` 共用一个 reason 时，
+/// 「access JWT 自然过期」被当成「会话被吊销」，前端一律清掉**仍然有效**的 refresh
+/// token 并跳登录页 —— 大屏页开着、用户只是空闲过久就被踢下线。
 fn reauth_close_code(err_code: i32) -> (u16, &'static str) {
     match err_code {
-        code::UNAUTHORIZED | code::TOKEN_EXPIRED | code::SESSION_REVOKED => (4001, "auth expired"),
+        code::TOKEN_EXPIRED => (4001, "access token expired"),
+        code::UNAUTHORIZED | code::SESSION_REVOKED => (4001, "auth expired"),
         _ => (1011, "re-auth unavailable"),
     }
 }
@@ -604,30 +632,52 @@ async fn close_with(
 mod tests {
     use super::*;
 
+    /// `TOKEN_EXPIRED`（40102）⇒ `4001 "access token expired"`。
+    ///
+    /// 断言的语义原因：40102 只说明**这枚 access JWT 过期**，不说明会话被吊销 ——
+    /// 大屏页开着时 Redis session 会被 re-auth 滑动续期、始终活着。前端据此应先
+    /// refresh 再重连；若这里回退成 `"auth expired"`，前端会清掉仍有效的 refresh
+    /// token 把空闲用户踢去登录页（2026-10-09 修的线上缺陷）。
+    ///
+    /// 关闭码仍是 4001 而非 1011：连接该断还是断，前端据 4001 停止重连。
     #[test]
-    fn reauth_auth_failures_map_to_4001() {
-        assert_eq!(
-            reauth_close_code(code::UNAUTHORIZED),
-            (4001, "auth expired")
-        );
+    fn reauth_token_expired_maps_to_4001_with_distinct_reason() {
         assert_eq!(
             reauth_close_code(code::TOKEN_EXPIRED),
-            (4001, "auth expired")
-        );
-        assert_eq!(
-            reauth_close_code(code::SESSION_REVOKED),
-            (4001, "auth expired")
+            (4001, "access token expired"),
+            "access JWT 过期必须与「会话被吊销」区分开：前端要能走 refresh 续期，而不是清 token 跳登录页"
         );
     }
 
-    /// 基础设施类失败（Redis 挂 / 连接池耗尽 → `50000 INTERNAL`）→ `1011`
-    /// （前端走**普通重连**，不登出）。这是 Major-1 的核心断言。
+    /// `UNAUTHORIZED`（40100）/ `SESSION_REVOKED`（40105）⇒ `4001 "auth expired"`。
+    ///
+    /// 断言的语义原因：这两个码是**会话真被吊销**（登出 / 改密 / 管理员停用 /
+    /// refresh reuse detection），前端必须终止会话。reason 保持 `auth expired`，
+    /// 与上一条 `access token expired` 构成前后端唯一约定的分流键。
+    #[test]
+    fn reauth_revoked_session_maps_to_4001_auth_expired() {
+        assert_eq!(
+            reauth_close_code(code::UNAUTHORIZED),
+            (4001, "auth expired"),
+            "验签失败（40100）无有效凭据可续期，按会话终止处理"
+        );
+        assert_eq!(
+            reauth_close_code(code::SESSION_REVOKED),
+            (4001, "auth expired"),
+            "session 不在 Redis（40105）是真·吊销，前端必须清 token 跳登录页"
+        );
+    }
+
+    /// 基础设施类失败（Redis 挂 / 连接池耗尽 → `50000 INTERNAL`）→ `1011`。
+    ///
+    /// 断言的语义原因：问题在服务端而非用户会话，前端只需普通重连。映射成 4001 会
+    /// 让「Redis 抖一下」变成「全员被踢下线」。
     #[test]
     fn reauth_infra_failure_maps_to_1011_not_4001() {
         assert_eq!(
             reauth_close_code(code::INTERNAL),
             (1011, "re-auth unavailable"),
-            "Redis 故障必须走 1011（可重连），绝不能是 4001（会让前端清 token 跳登录页）"
+            "Redis 故障必须走 1011（普通重连即可），绝不能是 4001（会让前端把服务端故障当成会话吊销）"
         );
     }
 
