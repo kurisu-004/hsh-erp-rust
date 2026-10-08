@@ -29,12 +29,18 @@
 
 ### 0.1 变更记录
 
+- **2026-10-09 `POST /scan` 占用闸门的作用域收窄（§4.1）**：21406（批次被其它送货单占用）
+  **不再顺带拒绝整个请求**，与同日的 21405 状态闸门收敛成同口径。判定权同样交给 DP ——
+  该零件的可入单量够本次要的量就正常入单，被占用的批次只是不参与分配；只有凑不出时才报
+  21406，并在 message 里附被占用批次的单号与单据状态。**21406 的业务含义没有削弱**：占用
+  批次依然不可入单（可入单集合的 SQL 已结构性排除它们 ⇒ 不存在重复挂单），依然被点名。
+  错误码在汇总处二选一：**失败 part 里只要有一条占用明细就是 21406**，否则 21405（混合场景
+  取「冲突」这一侧，message 里两类明细都列全）。
 - **2026-10-09 `POST /scan` 状态闸门的作用域收窄（§4.1）**：批次状态 ≠ `READY_TO_SHIP`
   **不再顺带拒绝整个请求**。判定权交给 DP —— 该零件的可入单量够本次要的量就正常入单，
   非 READY 批次只是不参与分配；只有凑不出时才报 21405，并在 message 里附被拦下的批次明细。
-  21406（占用）**仍是请求级闸门**，语义不变。DP 失败改为**收集**而非遇错即停 ⇒ 一次请求里
-  所有凑不出的 part 汇总进同一条 21405（按 `part_id` 升序分段）；请求含 ≥2 个 part 时每个失败
-  段必带 `part {id}（需 N 件）：` 前缀。
+  DP 失败改为**收集**而非遇错即停 ⇒ 一次请求里所有凑不出的 part 汇总进同一条 21405（按
+  `part_id` 升序分段）；请求含 ≥2 个 part 时每个失败段必带 `part {id}（需 N 件）：` 前缀。
 
 ## 1. 端点表（**17 个**）
 
@@ -107,7 +113,7 @@
 | 21403 | `BIZ_DELIVERY_NOTE_NOT_DRAFT` | `soft-delete` 单据非 DRAFT | 400 |
 | 21404 | `BIZ_DELIVERY_NOTE_NOT_SUBMITTED` | `recall` / `pickup` 单据非 SUBMITTED | 400 |
 | **21405** | `BIZ_DELIVERY_NOTE_PART_NOT_READY` | ★ 入单唯一允许的批次状态是 `READY_TO_SHIP`：批次状态不符**且**该零件可入单量凑不出本次要的量（作用域见 §4.1）/ DP 不可行 / `sets > entry_max_sets`；`submit` 单上有非 `READY_TO_SHIP` 批次；`pickup` 单上有非 `READY_TO_SHIP` 批次 | 400 |
-| 21406 | `BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED` | 批次已被**其它**送货单占着（活跃单 / 已领取单，两种 message 不同） | 409 |
+| 21406 | `BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED` | 批次已被**其它**送货单占着（`reason` 两种字面量：「活跃单，货还在这张单上」/「已领取/已归档单，货已随该单送出，不可再次入单」）**且该零件可入单量凑不出本次要的量**（作用域与 `reason` 映射见 §4.1）；汇总处与 21405 二选一：失败 part 里有占用明细 ⇒ 21406，否则 21405 | 409 |
 | **21407** | `BIZ_DELIVERY_NOTE_PARTS_MULTIPLE_CUSTOMERS` | 零件的 L1 客户 ≠ 单据 L1 客户（同一请求混入别的 L1 的零件） | 400 |
 | 21409 | `BIZ_DELIVERY_NOTE_DRIVER_INVALID` | `validate_driver` 5 条任一不过；`pickup` 单据未指定司机 | 400 |
 | 21411 | `BIZ_DELIVERY_NOTE_INVALID_VALUE` | 空单提交 / 空单领取 | 400 |
@@ -331,8 +337,8 @@ JOIN 带 `deleted_at IS NULL`）—— 这条 SQL 是「可入单」的**唯一*
 | `READY_TO_SHIP` + 未占用 | ✅ | — |
 | `INSPECTION` | ❌ | **21405**（该零件可入单量不够时），message 带 `part / serial_no / batch_no / status` 明细 |
 | `PENDING` / `PROGRAMMING` / `IN_PROCESS` / `DELIVERED` / `OUTSOURCE` / `COMPLETED` / `CANCELLED` | ❌ | 21405（同上） |
-| `READY_TO_SHIP` + 挂在**活跃单**（`DRAFT` / `SUBMITTED`）上 | ❌ | **21406**，message 标「活跃单，货还在这张单上」 |
-| `READY_TO_SHIP` + 挂在**已领取/已归档单**上 | ❌ | **21406**，message 标「已领取/已归档单，货已随该单送出，不可再次入单」 |
+| `READY_TO_SHIP` + 挂在**活跃单**（`DRAFT` / `SUBMITTED`）上 | ❌ | **21406**（该零件可入单量不够时），message 标「活跃单，货还在这张单上」 |
+| `READY_TO_SHIP` + 挂在**已领取/已归档单**上 | ❌ | **21406**（该零件可入单量不够时），message 标「已领取/已归档单，货已随该单送出，不可再次入单」 |
 | 任意状态 + 挂在**已软删**的单上 | 按状态判（软删单的占用视同未占用） | 状态不符且不够量 → 21405 |
 | 任意状态 + 挂在**本单**上 | 幂等跳过 | — |
 
@@ -341,22 +347,48 @@ JOIN 带 `deleted_at IS NULL`）—— 这条 SQL 是「可入单」的**唯一*
 就正常入单，非 `READY_TO_SHIP` 的批次只是**不参与分配**。只有当该零件的 DP **凑不出本次
 target** 时才报 21405，并在 message 里附上被拦下的批次明细。
 
+**占用闸门的判定作用域 = 「本次分配实际需要的量」**。同理，被别的送货单占着的批次**只是不
+参与分配**：同零件另有足量空闲 `READY_TO_SHIP` 批次时正常入单（用例
+`occupied_batch_on_active_note_does_not_block_free_batch`、
+`mixed_occupancy_part_enters_from_free_batch`）。只有 DP 凑不出本次 target 时才报 21406，并
+附上被占用批次的单号与单据状态。
+
+这条收敛**没有削弱 21406 的业务含义**，也不引入重复挂单风险：可入单集合由
+`list_entryable_batches_by_part_ids` 的 SQL 定义（写死 `b.status = 'READY_TO_SHIP'` ∧
+`(b.delivery_note_id IS NULL OR dn.id IS NULL)`），DP 的候选只来自它 ⇒ **DP 不可能选中占用
+批次**。占用判定不承担数据一致性职责，它值得一句提醒，但作用域只能是「本次分配实际需要的量」。
+
+**错误码二选一**：失败 part 里**只要有一条占用明细就是 21406**（409，`冲突`：货在别的单上，
+要去那张单处理），否则 21405（400，`校验不过`）。判据的输入是**失败 part 集合**而非整张占用
+明细表 —— 分配成功的 part 上有占用明细**不**参与选码，用例
+`occupied_detail_on_successful_part_stays_21405` 钉死这一半。混合场景（有 part 是占用原因、
+有 part 只是状态原因）取 21406 —— 那是更可执行的一侧，且 message 里两类明细都会列全。
+
+**归因取舍**：占用批次**只**归占用桶，**不**按 status 二次归因。一个 `status = COMPLETED` 且
+被 `PICKED_UP` 单占着的批次，报给用户时只说「已在送货单 X（已随该单送出）」，不附带
+`status = COMPLETED` —— 「去那张单看」比「它完工了」更有行动指向，且库里绝大多数占用批次
+确实是 `COMPLETED` / `DELIVERED`，若按状态归因 21406 几乎永远选不到。
+
 | 失败形态 | message |
 |---|---|
 | **请求只含 1 个 part**，且它无状态明细（货就是不够） | 只回 DP 原文：「可入单件数不足：需要 N 件，候选批次合计 M 件」。**不**加「READY_TO_SHIP」字样 —— 那种场景说成状态问题是说错话 |
 | **请求只含 1 个 part**，且它有状态明细 | DP 原文 + `；入单只允许 READY_TO_SHIP，以下批次不可用：part {id}（{serial_no}）批次 {no} status={status}；…` |
-| **请求含 ≥ 2 个 part**（不论几个失败） | 每个失败 part 一段，按 `part_id` 升序：`part {id}（需 N 件）：{DP 文案}`，有状态明细则同样追加明细段；同一段内的多条明细用 `；` 分隔 |
+| **请求只含 1 个 part**，且它有占用明细 | DP 原文 + `；该零件另有批次已在其它送货单上、不可入单：part {id} 批次 {no} 已在送货单 {note_id}（{reason}）；…` |
+| **请求只含 1 个 part**，占用明细与状态明细并存 | DP 原文 + 占用段 + 状态段（占用段在前） |
+| **请求含 ≥ 2 个 part**（不论几个失败） | 每个失败 part 一段，按 `part_id` 升序：`part {id}（需 N 件）：{DP 文案}`，有占用明细 / 状态明细则依次追加对应明细段；同一段内的多条明细用 `；` 分隔 |
 
 > 上表的**前缀维度**与**明细维度**是正交的两件事：`part_id` 前缀只取决于「本请求是否含多个
-> part」，状态明细段只取决于「该失败 part 在 `not_ready_by_part` 里有没有条目」。所以「两个 part、
-> 只有 B 凑不出」得到的是**一段**带 `part B（需 8 件）：…` 的文案，不是两句，也不是无主语的
-> 裸 DP 文案；两个 part 都凑不出则是**两段**、按 `part_id` 升序（用例
+> part」，占用明细段与状态明细段只取决于「该失败 part 在 `occupied_by_part` /
+> `not_ready_by_part` 里有没有条目」。所以「两个 part、只有 B 凑不出」得到的是**一段**带
+> `part B（需 8 件）：…` 的文案，不是两句，也不是无主语的裸 DP 文案；两个 part 都凑不出则是
+> **两段**、按 `part_id` 升序（用例
 > `tests/com/delivery_note/entry_gate.rs::multi_part_failures_are_listed_in_part_id_order`
-> 钉死）。段间分隔符统一是 `；`。
-
-> ⚠️ **21406 仍是请求级闸门**，刻意与状态闸门不同：任一批次被别的单占着（哪怕同零件另有
-> 足量可入单批次），整个请求原子失败、零写入，不允许「挑能用的挂上」。用例
-> `batch_on_active_note_rejected_21406` 钉死。
+> 钉死）。段间分隔符统一是 `；`。两个明细段都**没有顶层前缀**、各带自己的引导语 ——
+> 一个响应里两种失败原因可能并存，顶层前缀无法同时描述。
+>
+> 错误码与明细段的一致性由 `mixed_failure_reasons_pick_21406_and_list_both_details` 钉死：
+> 一个请求里 A 全被 `PICKED_UP` 单占用、B 是状态原因 ⇒ 报 21406，message 同时列出 A 的占用
+> 明细与 B 的 `status=IN_PROCESS`。
 
 > ⚠️ **三桶必须穷尽**。批次挂在 `PICKED_UP` 单上时，它既不在「可入单」集合里（repo 按状态 +
 > 占用筛）、也不算「活跃占用」、状态又是 `READY_TO_SHIP`（不进 `not_ready_by_part`）⇒ 若分类
@@ -419,7 +451,8 @@ entry_max_sets(a) = LEAST( MIN( per_set(c) for c ∈ a 的**全部**未软删子
 
 算法：① 全体子集和 DP（后向可达表）；② 可达 ⇒ 回溯取字典序最小解（拆批数 0）；③ 不可达 ⇒
 排除 quantity 最大的那个批次再跑一次 DP 得 `max_reachable`，差额从被排除的最大批次拆出
-（**拆批数恒为 1**）；④ 差额不可行（target > Σ 全部数量）⇒ `21405`。
+（**拆批数恒为 1**）；④ 差额不可行（target > Σ 全部数量）⇒ `21405`（该 part 另有占用明细时
+为 21406，见 §4.1）。
 
 **「最大」的定序**：`quantity DESC, batch_no ASC` —— 数量相同时取 batch_no 小的，保证同一输入
 的分配结果稳定可复现。

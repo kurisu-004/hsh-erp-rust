@@ -27,11 +27,12 @@
 //!    （23505 撞唯一索引时已在 find-or-create 内部重查一次，兜并发扫码）
 //! 5. 解析 entries → 得到 targets（零件 + 装配件的全部子件；装配件按
 //!    `sets × (part.quantity / assembly.quantity)` 展开，且 `sets <= entry_max_sets`）
-//! 6. 逐零件分类：可入单（`READY_TO_SHIP` 且未占用）/ 已占用（21406，请求级拒绝）/
-//!    状态未过检（只按 part 收集明细，不拒绝 —— 见「状态闸门的作用域」）
+//! 6. 逐零件分类：可入单（`READY_TO_SHIP` 且未占用）/ 状态未过检 / 已占用 —— 后两类都
+//!    **只按 part 收集诊断明细、不拒绝**（见「状态闸门的作用域」与「占用闸门的作用域」）
 //! 7. 每个 target 跑一次 DP（子件之间不耦合）+ 拆批 + 挂单（同事务）：任一 part
-//!    凑不出 ⇒ 21405，message 附该 part 状态未过检的批次明细；失败发生在任何拆批 /
-//!    挂单写之前，草稿行的 find-or-create 也与它们同处一个事务 ⇒ 整体回滚、零写入
+//!    凑不出 ⇒ 任一失败 part 有占用明细则 21406、否则 21405（错误码按响应二选一），
+//!    message 附该 part 的占用明细与状态明细；失败发生在任何拆批 / 挂单写之前，草稿行的
+//!    find-or-create 也与它们同处一个事务 ⇒ 整体回滚、零写入
 //! 8. note.version++ → commit → WS 广播 DELIVERY_NOTE_SCAN_ADD
 //! 9. 返回 DeliveryNoteDetailOut（含拆批后的完整行项，前端可就地替换草稿卡）
 //! ```
@@ -40,9 +41,9 @@
 //! | 检查 | 作用域 | 错误码 |
 //! |---|---|---|
 //! | 批次 status ≠ `READY_TO_SHIP`（含 `INSPECTION`） | **本次分配实际需要的量**（见下节） | 21405 |
-//! | 批次已挂在别的 `DRAFT`/`SUBMITTED`/`PICKED_UP`/`ARCHIVED` 单上 | 请求级 | 21406 |
+//! | 批次已挂在别的 `DRAFT`/`SUBMITTED`/`PICKED_UP`/`ARCHIVED` 单上 | **本次分配实际需要的量**（见下节） | 21406 |
 //! | 零件的 L1 客户 ≠ 单据 L1 客户 | 请求级 | 21407 |
-//! | DP 不可行（凑不出 / 差额 > 0 且无可拆批次） | 请求级 | 21405 |
+//! | DP 不可行（凑不出 / 差额 > 0 且无可拆批次） | 请求级 | 21405 / 21406（见下节） |
 //! | `sets` > `entry_max_sets` | 请求级 | 21405 |
 //!
 //! ### 状态闸门的作用域：判「本次要的量」，不是「该零件的全部活跃批次」
@@ -54,6 +55,32 @@
 //!
 //! ⇒ `not_ready_by_part` 是**分配失败时的诊断明细**，不是请求级闸门：判定依据只有
 //! 一条 —— DP 能否凑出该 part 本次的 target；失败时才把这些明细附进 21405 的 message。
+//!
+//! ### 占用闸门的作用域：与状态闸门同构
+//!
+//! 2026-10-09 改。同一个零件既有「被别的送货单占着」的批次、又有足量的空闲
+//! `READY_TO_SHIP` 批次时，只要可入单量够，本次入单正常成功 —— 被占用的批次只是不参与
+//! 分配，不是「顺带拒绝」的理由。
+//!
+//! ⇒ `occupied_by_part` 同样是**分配失败时的诊断明细**，判定依据只有一条 —— DP 能否凑出
+//! 该 part 本次的 target。**21406 的业务含义没有被削弱**：占用批次依然不可入单，且依然被
+//! 点名到单号与单据状态（`reason` 两态）。
+//!
+//! **它不承担数据一致性职责**：可入单集合由
+//! `DeliveryScanRepo::list_entryable_batches_by_part_ids` 的 SQL 定义（写死
+//! `b.status = 'READY_TO_SHIP'` ∧ `(b.delivery_note_id IS NULL OR dn.id IS NULL)`），
+//! Step 7 的 DP 候选只来自它 ⇒ DP **不可能**选中占用批次，不存在重复挂单。占用与否值得
+//! 一句提醒，但它的作用域只能是「本次分配实际需要的量」，不能放大到整个请求。
+//!
+//! **真实事故形态**（5430 开发库实测的返单零件）：历史批次长期挂在已领取 / 已归档单上，
+//! 新的返工批次到了 `READY_TO_SHIP`，两者同属一个 part ⇒ 用户每次想下新单都被挡，
+//! 只能先去另一张单上手工撤货。
+//!
+//! **归因取舍：占用批次只归占用桶，不按 status 二次归因**。一个 `status = COMPLETED` 且被
+//! `PICKED_UP` 单占着的批次，报给用户时只说「已在送货单 X（已随该单送出）」，**不**附带
+//! `status = COMPLETED`。理由有三：两个桶分开与既有结构一致、改动最小；「去那张单看」比
+//! 「它完工了」更有行动指向；库里绝大多数占用批次确实是 `COMPLETED` / `DELIVERED`（若按
+//! 状态归因，21406 几乎永远选不到、诊断反而变弱）。
 //!
 //! ### ⚠️ `INSPECTION` 必须显式分支，否则状态信息彻底丢失
 //! 入单口径从 `{INSPECTION, READY_TO_SHIP}` 收窄为 `{READY_TO_SHIP}` 后，`INSPECTION`
@@ -109,12 +136,17 @@ impl NodeKind {
 /// 入单唯一允许的批次状态。
 const STATUS_READY_TO_SHIP: &str = "READY_TO_SHIP";
 
-/// 一批「已被某张送货单占着」的批次明细（报 21406 时附在 message 里）。
+/// 一批「已被某张送货单占着」的批次明细。
+///
+/// 2026-10-09 起按 `part_id` 分组收集（`HashMap<i64, Vec<OccupiedDetail>>`）：它不再是
+/// 请求级闸门，只在**该 part 的 DP 分配失败**时用来解释「为什么凑不出」—— 与
+/// `NotReadyDetail` 同构。占用批次本身依然**不可入单**（可入单集合的 SQL 已结构性排除它们），
+/// 这里只负责把它点名到单号与单据状态。
 ///
 /// `reason` 区分两种占用：
-/// - `"活跃单"`：`DRAFT` / `SUBMITTED` —— 货还在单上，换单要先把货撤下来；
-/// - `"已领取/已归档单"`：`PICKED_UP` / `ARCHIVED` —— 货已经随该单送出，
-///   **不可再次入单**（若放行会把已送出的货再挂一张新单，账实不符）。
+/// - `"活跃单，货还在这张单上"`：`DRAFT` / `SUBMITTED` —— 货还在单上，换单要先把货撤下来；
+/// - `"已领取/已归档单，货已随该单送出，不可再次入单"`：`PICKED_UP` / `ARCHIVED` —— 货
+///   已经随该单送出，**不可再次入单**（若放行会把已送出的货再挂一张新单，账实不符）。
 struct OccupiedDetail {
     part_id: i64,
     batch_no: i32,
@@ -148,7 +180,7 @@ struct AllocFailure {
 /// （`allocate` 的唯一错误出口是 `batch_allocation::not_enough`），所以这里取到的
 /// 一定是业务 message。下游由 `debug_assert!` 把这条前提钉住：一旦 `allocate` 将来
 /// 改吐别的错误、非业务错误就会走进兜底分支，它的 `Display` 会被拼进 message 且整个
-/// 响应的错误码退化成 21405（500 被伪装成业务错），这种事必须在开发期就炸掉。
+/// 响应的错误码退化成 21405 / 21406（500 被伪装成业务错），这种事必须在开发期就炸掉。
 fn error_message(e: &AppError) -> String {
     match e {
         AppError::Biz { message, .. } | AppError::BizWithFailures { message, .. } => {
@@ -158,13 +190,23 @@ fn error_message(e: &AppError) -> String {
     }
 }
 
-/// 把「本次分配的失败 part」汇总成一条 21405。
+/// 把「本次分配的失败 part」汇总成一条 21406 或 21405。
 ///
-/// 三条规则：
+/// **错误码二选一**：
+/// - 任一失败 part 在 `occupied_by_part` 里有条目 ⇒ 21406（`BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED`，
+///   HTTP 409）。21406 是「**冲突**」：货在别的送货单上，得先去那张单处理；
+/// - 否则 ⇒ 21405（`BIZ_DELIVERY_NOTE_PART_NOT_READY`，HTTP 400）。21405 是「**校验不过**」。
+///
+/// 混合场景（有 part 是占用原因、有 part 只是状态原因）选 21406：那是更可执行的一侧，且
+/// message 里两类明细都会列全，用户不必再试一次才能看到另一类原因。
+///
+/// **message 的拼装形态**是 `{head}{占用段}{状态段}`，三条规则：
 /// - **基底是 DP 自己的 message**（如「可入单件数不足：需要 8 件，候选批次合计 4 件」）
 ///   —— 根因是「货不够」时不要硬塞「READY_TO_SHIP」字样，那是在说错话；
-/// - 该失败 part 在 `not_ready_by_part` 里有明细时，在基底后追加
-///   `；入单只允许 READY_TO_SHIP，以下批次不可用：…` + 明细；
+/// - 该失败 part 在 `occupied_by_part` / `not_ready_by_part` 里有明细时，在基底后依次追加
+///   `；该零件另有批次已在其它送货单上、不可入单：…` 与 `；入单只允许 READY_TO_SHIP，以下批次
+///   不可用：…` + 明细；两段都没有顶层前缀，各自带引导语（一个响应里两种原因可能并存，
+///   顶层前缀无法同时描述）；
 /// - **part 前缀的判据是「本请求是否含多个 part」，不是「几个 part 失败」**：
 ///   `request_parts > 1` 或失败数 > 1 时，每段带 `part_id` + 需要件数
 ///   （`part {id}（需 N 件）：{DP 文案}`）。只按失败数判会让「两个 part、只有 B 凑不出」
@@ -173,48 +215,77 @@ fn error_message(e: &AppError) -> String {
 ///   会让同一请求的 message 抖动）。
 fn alloc_failure_error(
     failures: &[AllocFailure],
+    occupied_by_part: &HashMap<i64, Vec<OccupiedDetail>>,
     not_ready_by_part: &HashMap<i64, Vec<NotReadyDetail>>,
     request_parts: usize,
 ) -> AppError {
     let mut sorted: Vec<&AllocFailure> = failures.iter().collect();
     sorted.sort_by_key(|f| f.part_id);
     let multiple = sorted.len() > 1 || request_parts > 1;
+    // 错误码判据：只看**失败** part 里有没有占用明细（够用的 part 的占用批次与本次拒绝无关）。
+    let has_occupied = sorted
+        .iter()
+        .any(|f| occupied_by_part.contains_key(&f.part_id));
     let segments: Vec<String> = sorted
         .iter()
         .map(|f| {
-            // 见 `error_message` 的 doc：非业务错误混进来会让 500 退化成 21405。
+            // 见 `error_message` 的 doc：非业务错误混进来会让 500 退化成业务码。
             debug_assert!(
                 matches!(
                     f.error,
                     AppError::Biz { .. } | AppError::BizWithFailures { .. }
                 ),
-                "alloc_failure_error 的入参 error 应当只可能是业务错误（21405）"
+                "alloc_failure_error 的入参 error 应当只可能是业务错误（allocate 唯一出口是 21405）"
             );
             let dp_msg = error_message(&f.error);
-            let head = if multiple {
+            let mut seg = if multiple {
                 format!("part {}（需 {} 件）：{dp_msg}", f.part_id, f.target)
             } else {
                 dp_msg
             };
-            match not_ready_by_part.get(&f.part_id) {
-                Some(details) if !details.is_empty() => {
-                    let detail = details
-                        .iter()
-                        .map(|d| {
-                            format!(
-                                "part {}（{}）批次 {} status={}",
-                                d.part_id, d.serial_no, d.batch_no, d.status
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("；");
-                    format!("{head}；入单只允许 READY_TO_SHIP，以下批次不可用：{detail}")
-                }
-                _ => head,
+            if let Some(details) = occupied_by_part.get(&f.part_id)
+                && !details.is_empty()
+            {
+                let detail = details
+                    .iter()
+                    .map(|d| {
+                        format!(
+                            "part {} 批次 {} 已在送货单 {}（{}）",
+                            d.part_id, d.batch_no, d.on_note_id, d.reason
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("；");
+                seg.push_str(&format!(
+                    "；该零件另有批次已在其它送货单上、不可入单：{detail}"
+                ));
             }
+            if let Some(details) = not_ready_by_part.get(&f.part_id)
+                && !details.is_empty()
+            {
+                let detail = details
+                    .iter()
+                    .map(|d| {
+                        format!(
+                            "part {}（{}）批次 {} status={}",
+                            d.part_id, d.serial_no, d.batch_no, d.status
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("；");
+                seg.push_str(&format!(
+                    "；入单只允许 READY_TO_SHIP，以下批次不可用：{detail}"
+                ));
+            }
+            seg
         })
         .collect();
-    AppError::biz(code::BIZ_DELIVERY_NOTE_PART_NOT_READY, segments.join("；"))
+    let biz_code = if has_occupied {
+        code::BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED
+    } else {
+        code::BIZ_DELIVERY_NOTE_PART_NOT_READY
+    };
+    AppError::biz(biz_code, segments.join("；"))
 }
 
 impl DeliveryNoteService {
@@ -305,8 +376,13 @@ impl DeliveryNoteService {
             eligible_by_part.entry(b.part_id).or_default().push(b);
         }
 
-        // 21406 收集：批次挂在别的 `DRAFT` / `SUBMITTED` 单上。
-        let mut occupied: Vec<OccupiedDetail> = Vec::new();
+        // 21406 诊断明细收集：批次挂在别的 `DRAFT` / `SUBMITTED` / `PICKED_UP` /
+        // `ARCHIVED` 单上，**按 part 分组**。2026-10-09 起降级为「分配失败时的诊断明细」
+        // （与 `not_ready_by_part` 同构，理由见模块 doc「占用闸门的作用域」）：判定权在
+        // Step 7 的 DP 能不能凑出本次 target，失败时才把明细附进 21406 的 message。
+        // 三条分支判定本身（占用方 != 本单 / 占用方已软删视为未占用 / 未占用）一字未动，
+        // 占用批次也仍不可入单（`eligible` 的 SQL 已结构性排除它们）。
+        let mut occupied_by_part: HashMap<i64, Vec<OccupiedDetail>> = HashMap::new();
         let mut note_ids_involved: Vec<i64> = Vec::new();
         // 21405 诊断明细收集：`INSPECTION` 等非 READY_TO_SHIP 批次（**必须显式分支**，
         // 否则这些批次在整条链路上无处被提到、message 丢状态信息），**按 part 分组**。
@@ -348,12 +424,15 @@ impl DeliveryNoteService {
             match b.delivery_note_id {
                 Some(other_id) if other_id != note.id => {
                     if let Some(reason) = occupied_note_ids.get(&other_id) {
-                        occupied.push(OccupiedDetail {
-                            part_id: b.part_id,
-                            batch_no: b.batch_no,
-                            on_note_id: other_id,
-                            reason,
-                        });
+                        occupied_by_part
+                            .entry(b.part_id)
+                            .or_default()
+                            .push(OccupiedDetail {
+                                part_id: b.part_id,
+                                batch_no: b.batch_no,
+                                on_note_id: other_id,
+                                reason,
+                            });
                     } else if b.status != STATUS_READY_TO_SHIP {
                         // 占用方已软删 ⇒ 视为未占用；此时按状态闸门判。
                         not_ready_by_part
@@ -392,22 +471,6 @@ impl DeliveryNoteService {
             }
         }
 
-        if !occupied.is_empty() {
-            let detail = occupied
-                .iter()
-                .map(|d| {
-                    format!(
-                        "part {} 批次 {} 已在送货单 {}（{}）",
-                        d.part_id, d.batch_no, d.on_note_id, d.reason
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("；");
-            return Err(AppError::biz(
-                code::BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED,
-                format!("以下批次已被其它送货单占用：{detail}"),
-            ));
-        }
         // ===== Step 7: DP 分配 + 拆批 + 挂单（同一事务） =====
         let now = now_naive();
         let mut attached: Vec<(i64, i32)> = Vec::new();
@@ -449,11 +512,13 @@ impl DeliveryNoteService {
                 }),
             }
         }
-        // 状态闸门在此生效：只有 DP 凑不出本次要的量才拒绝，且拒绝发生在任何
+        // 两个闸门都在此生效：只有 DP 凑不出本次要的量才拒绝（错误码由失败 part 有没有占用明细
+        // 决定：21406 / 21405，由 `alloc_failure_error` 选），且拒绝发生在任何
         // `split_batch` / 挂单之前 ⇒ 整请求原子失败（不部分挂单）。
         if !alloc_failures.is_empty() {
             return Err(alloc_failure_error(
                 &alloc_failures,
+                &occupied_by_part,
                 &not_ready_by_part,
                 targets.len(),
             ));
