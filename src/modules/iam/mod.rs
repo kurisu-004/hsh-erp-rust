@@ -3,6 +3,7 @@ pub mod dto;
 pub mod handler;
 pub mod repo;
 pub mod service;
+pub mod shelf;
 pub mod vo;
 
 use std::sync::Arc;

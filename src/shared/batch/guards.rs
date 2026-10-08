@@ -50,8 +50,8 @@
 
 use sqlx::PgConnection;
 
+use crate::modules::iam::shelf::repo::ShelfRepo;
 use crate::modules::part::statemachine::PartStatus;
-use crate::modules::shelf::repo::ShelfRepo;
 use crate::shared::batch::status::{StatusChange, apply_batch_status_change};
 use crate::shared::error::{AppError, code};
 

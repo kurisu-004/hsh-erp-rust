@@ -14,6 +14,7 @@
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::com::customer::repo::CustomerRepo;
+use crate::modules::iam::shelf::repo::ShelfRepo;
 use crate::modules::part::dto_crud::{BatchUpdateOrderInfoRequest, BatchWithPdfsRequest};
 use crate::modules::part::repo::NewPartCreate;
 use crate::modules::part::repo::PartRepoTrait;
@@ -23,7 +24,6 @@ use crate::modules::part::vo::{
 };
 use crate::modules::prod::batch::repo::PartBatchRepo;
 use crate::modules::prod::worker::repo::WorkerRepo;
-use crate::modules::shelf::repo::ShelfRepo;
 use crate::shared::error::{AppError, code};
 
 use super::super::PartService;

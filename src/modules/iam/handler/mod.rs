@@ -5,6 +5,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::routing::{get, post};
 
+use crate::modules::iam::shelf;
 use crate::state::AppState;
 
 mod account;
@@ -12,12 +13,16 @@ mod session;
 
 /// iam 域 router（挂在 `/api/v2/iam`，见 `modules::v2_router`）
 ///
-/// 端点拆分（account 12 + session 5 = 17）：
+/// 端点拆分（account 12 + session 5 + shelf 5 = 22）：
 /// - session 端点（`session.rs`，5 个）：挂在 `/iam` 根
 /// - account 端点（`account.rs`，12 个）：挂在 `/iam/users`
 ///   （9 个账号 CRUD/角色/改密 + 3 个企业微信绑定）
+/// - shelf 端点（`iam::shelf::handler`，5 个）：挂在 `/iam/shelves`，
+///   由嵌套子模块自带 router 工厂，本文件只做挂载（详见 `iam/shelf/mod.rs`）
 ///
 /// ## 硬切记录（2026-10-10）
+/// - 5 条货架端点自 `/api/v2/shelves/*` 迁到 `/api/v2/iam/shelves/*`，
+///   **硬切无 alias**，旧路径 404。
 /// - `DELETE /api/v2/iam/users/{id}/wx-bind` **已删、无 alias** → 改为
 ///   `POST /api/v2/iam/users/{id}/wx-bind/unbind`（本仓只用 GET + POST；
 ///   不留全后端唯一的 DELETE 路由）。两者段数不同（3 vs 4），matchit 无需考虑
@@ -57,5 +62,10 @@ pub fn router() -> Router<Arc<AppState>> {
             get(account::get_wx_identity).post(account::bind_wx_identity),
         )
         .route("/{id}/wx-bind/unbind", post(account::unbind_wx_identity));
-    Router::new().merge(session).nest("/users", users)
+    // 2026-10-10：货架子模块迁入 iam，路由自 `/api/v2/shelves/*` 硬切到
+    // `/api/v2/iam/shelves/*`（无 alias，旧路径 404）。
+    Router::new()
+        .merge(session)
+        .nest("/users", users)
+        .nest("/shelves", shelf::router())
 }

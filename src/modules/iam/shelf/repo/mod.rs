@@ -26,7 +26,7 @@
 //! ## 为什么 trait 命名为 `ShelfRepoTrait` 而非 `ShelfRepo`
 //! iam 范本里 trait 名 = `IamRepoTrait`。但 shelf 域有跨模块静态调用方（part 域
 //! `worker_scan` / `phase1` / `inspection` 三个 service 文件都
-//! `use crate::modules::shelf::repo::ShelfRepo;` 然后 `ShelfRepo::xxx(&mut *conn, ...)`
+//! `use crate::modules::iam::shelf::repo::ShelfRepo;` 然后 `ShelfRepo::xxx(&mut *conn, ...)`
 //! 走 ZST 静态方法）。**该 3 文件本次不在本任务范围**（属于 Group B/C/D/E），
 //! 故本任务不能破坏 `shelf::repo::ShelfRepo` 作为 ZST 的对外身份。
 //!
@@ -63,7 +63,7 @@
 use async_trait::async_trait;
 use sqlx::PgConnection;
 
-use crate::modules::shelf::model::TShelf;
+use crate::modules::iam::shelf::model::TShelf;
 
 pub mod sql;
 

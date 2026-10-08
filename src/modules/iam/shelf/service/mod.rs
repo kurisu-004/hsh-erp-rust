@@ -10,7 +10,7 @@
 //! 纯 `t_shelf` 的 7 端点业务逻辑。
 //!
 //! ## 调用方契约
-//! `handler.rs` 仅引 `crate::modules::shelf::service::ShelfService::*`，
+//! `handler.rs` 仅引 `crate::modules::iam::shelf::service::ShelfService::*`，
 //! 不直接访问 `crud`。本模块用 `pub use crud::*` 把 `ShelfService` 类型重新汇出到
 //! `service` 命名空间。
 //!

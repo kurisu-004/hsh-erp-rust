@@ -34,7 +34,7 @@
 
 use sqlx::{PgExecutor, QueryBuilder};
 
-use crate::modules::shelf::model::TShelf;
+use crate::modules::iam::shelf::model::TShelf;
 
 // ---------------------------------------------------------------------------
 // ShelfRepo（t_shelf，9 方法）

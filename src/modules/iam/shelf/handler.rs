@@ -50,9 +50,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 
 use crate::auth::rbac::CurrentUser;
-use crate::modules::shelf::dto::{ShelfCreateRequest, ShelfListQuery, ShelfUpdateRequest};
-use crate::modules::shelf::service::ShelfService;
-use crate::modules::shelf::vo::{ShelfListOut, ShelfOut};
+use crate::modules::iam::shelf::dto::{ShelfCreateRequest, ShelfListQuery, ShelfUpdateRequest};
+use crate::modules::iam::shelf::service::ShelfService;
+use crate::modules::iam::shelf::vo::{ShelfListOut, ShelfOut};
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;

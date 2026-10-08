@@ -20,7 +20,7 @@
 //! |---|---|---|---|
 //! | `part` | `status` | **写** | `PartRepo::update_part_rollup`（`part` 派生列回填）+ `PartRepo::insert_part_event`（事件日志） |
 //! | `assembly` | `status` | **写** | `AssemblyService::sync_assembly_status`（父件派生级联） |
-//! | `shelf` | `guards` | 读 | `ShelfRepo::get_by_id`（`validate_shelf_zone` 的存在 / 停用 / zone 三谓词在 Rust 层逐条判） |
+//! | `iam` | `guards` | 读 | `ShelfRepo::get_by_id`（`validate_shelf_zone` 的存在 / 停用 / zone 三谓词在 Rust 层逐条判） |
 //! | `prod::process_chain` | `guards` | 读 | `ProcessChainRepo::resolve_step_id_by_process`（`optional_step_id`） |
 //!
 //! ## `chain` 的表依赖（不经域 repo，与上表 4 行不同类）
