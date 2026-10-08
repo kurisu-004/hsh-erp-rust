@@ -10,7 +10,7 @@ use crate::auth::rbac::CurrentUser;
 use crate::auth::rbac::Role;
 use crate::shared::error::{AppError, code};
 
-use super::load::{LOAD_AGGREGATE_SQL, ShelfLoad, load_ratio};
+use super::load::{LOAD_AGGREGATE_SQL, ShelfLoad, shelf_load_from_parts};
 
 /// `pick_least_loaded` 的 SQL 模板（`{load_agg}` 由 [`LOAD_AGGREGATE_SQL`] 填）。
 ///
@@ -51,7 +51,7 @@ use super::load::{LOAD_AGGREGATE_SQL, ShelfLoad, load_ratio};
 /// - **第 2 段**：比例升序。`COALESCE(load.cnt, 0)` 不可省 —— `LEFT JOIN` 未命中
 ///   时 `load.cnt` 是 SQL NULL，`NULL::numeric / capacity` 也是 NULL，于是**空架
 ///   会被排到有货的架之后**（PG `ASC` 默认 NULLS LAST），与「空架最该被选中」
-///   正好相反。超载（比例 > 1.0）不拒（见 [`load_ratio`] 的 doc）。
+///   正好相反。超载（比例 > 1.0）不拒（见 [`load_ratio`](super::load::load_ratio) 的 doc）。
 /// - **第 3、4 段**：稳定兜底，保证同样的输入恒选到同一个架（否则同一条业务在
 ///   两台应用上会选到不同的架，批次分布会无谓地抖动）。
 ///
@@ -111,17 +111,15 @@ pub async fn pick_least_loaded(
         return Ok(None);
     };
     let current_load: i64 = r.get("current_load");
-    let capacity: Option<i32> = r.get("capacity");
-    Ok(Some(ShelfLoad {
-        id: r.get("id"),
-        code: r.get("code"),
-        name: r.get("name"),
-        zone: r.get("zone"),
-        location: r.get("location"),
-        capacity,
+    Ok(Some(shelf_load_from_parts(
+        r.get("id"),
+        r.get("code"),
+        r.get("name"),
+        r.get("zone"),
+        r.get("location"),
+        r.get("capacity"),
         current_load,
-        load_ratio: load_ratio(current_load, capacity),
-    }))
+    )))
 }
 
 /// `CurrentUser` → 选架 scope。
@@ -354,7 +352,10 @@ mod tests {
             Some(100),
             "不限架（capacity=NULL）必须排在一个装了 1 件但有上限的架之后"
         );
-        let _ = unbounded;
+        assert_ne!(
+            unbounded, bounded,
+            "两条 fixture 必须是两个不同的架，否则本用例退化成单候选"
+        );
     }
 
     /// 给了 `process_id` 时只在映射了该工序的架里选。
@@ -372,16 +373,24 @@ mod tests {
             .expect("不应报错")
             .expect("候选非空");
         assert_eq!(picked.id, mapped);
-        let _ = other;
+        assert_ne!(
+            other, mapped,
+            "两条 fixture 必须是两个不同的架，否则本用例退化成单候选"
+        );
     }
 
     /// scope 过滤：`Some(vec![])` 返空（不是「不限」），`Some(vec![x])` 只在 x 里选，
     /// `None` 不受限。
+    ///
+    /// 三段的对比点是 scope 的**宽窄**：`Some(vec![])` 一个都看不见（返 `None`）→
+    /// `Some(vec![sc_a])` 只看得见 `SC-A`（`SC-B` 被挡掉）→ `None` 两个都看得见，
+    /// 此时排序退化到 `display_order`（`SC-A` 在前）⇒ 落 `SC-A`。最后一段与第二段
+    /// 落同一个架，但路径不同：它证明的是「`None` 真的放宽到了 scope 之外的候选」。
     #[tokio::test]
     async fn scope_filters_candidates_and_empty_scope_yields_none() {
         let pool = test_pool().await;
         let allowed = insert_shelf(&pool, "SC-A", "PRODUCTION", Some(100), 0).await;
-        insert_shelf(&pool, "SC-B", "PRODUCTION", Some(100), 1).await;
+        let denied = insert_shelf(&pool, "SC-B", "PRODUCTION", Some(100), 1).await;
         let mut conn = pool.acquire().await.expect("acquire");
 
         let empty = pick_least_loaded(&mut conn, "PRODUCTION", None, Some(vec![]))
@@ -394,12 +403,19 @@ mod tests {
             .expect("不应报错")
             .expect("scope 内有候选");
         assert_eq!(scoped.id, allowed);
+        assert_ne!(
+            scoped.id, denied,
+            "限架 scope 必须挡住不在白名单里的 {denied}"
+        );
 
         let unbounded = pick_least_loaded(&mut conn, "PRODUCTION", None, None)
             .await
             .expect("不应报错")
             .expect("不限 scope 下候选非空");
-        assert!(unbounded.id == allowed || unbounded.id != allowed);
+        assert_eq!(
+            unbounded.id, allowed,
+            "scope=None 时候选含两个架，排序退化到 display_order（SC-A=0 在 SC-B=1 前）"
+        );
     }
 
     /// zone 隔离：`INSPECTION` 只在品检架里选，PRODUCTION 架不参与。

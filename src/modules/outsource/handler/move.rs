@@ -37,9 +37,9 @@
 //! `prod::queue::handler::pool::move_batch` 广播 `WORKER_POOL_MOVE_DONE` 的形态），
 //! 前端按 `from_kind` / `to_kind` 自行推断方向。
 //!
-//! ⚠️ **它不替代 `t_part_event` 的三个审计字面量**（`SENT_TO_OUTSOURCE` /
-//! `RECEIVED_FROM_OUTSOURCE` / `RECEIVED_TO_INSPECTION`）：那三个是**业务事实**、
-//! 逐字不变；WS 事件名是**传输层的一次移动完成**。旧的三个 WS 事件名
+//! ⚠️ **它不替代 `t_part_event` 的审计字面量**（`SENT_TO_OUTSOURCE` /
+//! `RECEIVED_FROM_OUTSOURCE`）：那两个是**业务事实**、逐字不变；WS 事件名是
+//! **传输层的一次移动完成**。旧的三个 WS 事件名
 //! （`PART_SENT_TO_OUTSOURCE` / `PART_RECEIVED_FROM_OUTSOURCE` /
 //! `PART_RECEIVED_FROM_OUTSOURCE_INSPECTED`）随本端点下线而删除。
 

@@ -23,7 +23,7 @@
 | 5 | POST | `/api/v2/prod/queue/auto-dispatch` | Manager + Clerk | `{ batch_ids?: string[] }` | `AutoDispatchResult` |
 | 6 | POST | `/api/v2/prod/queue/recall` | Manager + Clerk | `{ batch_id, version, note? }` | `RecallOut` |
 | 7 | POST | `/api/v2/prod/queue/refill` | **Manager 独占** | `{ worker_id, shelf_id }` | `RefillResult` |
-| 8 | POST | `/api/v2/prod/queue/move` | **Manager 独占** | `{ batch_id: string, version: number, from, to, note? }` | `MoveResult` |
+| 8 | POST | `/api/v2/prod/queue/move` | **Manager 独占** | `{ batch_id: string, version: number, from, to, note? }`（`from` / `to` 是**两个不同**的 tagged enum，见 §2.8） | `MoveResult` |
 | 9 | POST | `/api/v2/prod/queue/auto-allocate` | **Manager 独占** | `{ process_id, shelf_id, mode, fill_ratio }` | `AutoAllocateResult` |
 
 - 全部返回统一信封 `R { code, message, data }`。
@@ -133,9 +133,31 @@
 | `note` | string \| null | `t_part.note` |
 | `version` | number | `t_part_batch.version`（OCC 锚） |
 
-`shelf_id` 是 `POST /queue/move` 的 `from.shelf_id` **唯一数据源**：候选池跨货架，不能用用户当前激活货架凑（激活货架对 MANAGER / CLERK / INSPECTOR 恒为空）。
+`shelf_id` 是 `POST /queue/move` 的 `from.shelf_id` **唯一数据源**：`from.kind = "POOL"` 时它必须与批次真实所在货架一致（service 比对 `batch.current_holder_id`）。候选池跨货架，不能用用户当前激活货架凑（激活货架对 MANAGER / CLERK / INSPECTOR 恒为空）。
 
 ⚠️ **不含 `customer_path` 与 `location`**：前者前端自己拼 L1 / L2；后者恒为 `"PRODUCTION_SHELF"`，前端用 `shelf_code` 表达位置。见 §6。
+
+### 2.8 `POST /queue/move` 的 `from` / `to` 入参（2026-10-10 拆成两个类型）
+
+| 侧 | 类型 | `POOL` 分支 | `WORKER` 分支 |
+|---|---|---|---|
+| `from` | `MoveFromLocation` | `{ kind: "POOL", shelf_id }` —— **必填** | `{ kind: "WORKER", worker_id }` |
+| `to` | `MoveToLocation` | `{ kind: "POOL" }` —— **无字段** | `{ kind: "WORKER", worker_id }` |
+
+`from` 侧仍要 `shelf_id`：它是批次**真实所在**的货架，POOL→WORKER 方向 service 拿它比对
+`batch.current_holder_id`（不符 → `20122`）。
+
+`to` 侧的 `shelf_id` 于 2026-10-10 **删除**（WORKER→POOL 即「撤回候选池」）：目标货架改由
+服务端按 `batch.current_process_id` 自动选（[`shelves.md`](shelves.md) §4），
+候选集只含映射了该工序的活跃 `PRODUCTION` 架；选不出 → `20508 BIZ_SHELF_PROCESS_NOT_FOUND`。
+`batch.current_process_id IS NULL` 的存量批次按「不按工序筛候选」处理（落在该 zone 全部
+活跃生产架里），管理员「把卡住的手动放回货架」的自救路径不被堵死 —— 但 zone / 停用 / 软删
+三条谓词仍然生效，不会落到品检架上。
+
+⚠️ 老客户端多发 `to.shelf_id` 会被 serde 静默忽略（本仓生产代码零 `deny_unknown_fields`），
+**新客户端发老版本服务端不会破**（老服务端把它当作必需的 `to.shelf_id`，此时反而要发）。
+真正需要注意的是**新客户端 + 新服务端**：撤回候选池时 `to` 就是 `{"kind":"POOL"}`，
+发 `shelf_id` 无害但无用。
 
 ### 2.6 `has_process_chain` 判据（4 处卡片共用一个常量）
 
@@ -226,6 +248,7 @@ status = 'IN_PROCESS' AND location = 'PRODUCTION_SHELF'
 | 单工序候选池明细（端点 2 `items[]`） | `board/repo.rs::SQL_POOL_ITEMS_BY_PROCESS` | `= $1` | 跨全部货架（明细本身 INNER JOIN `t_shelf` 顺带展示架信息） | **INNER**（`s.id = pb.current_holder_id AND s.deleted_at IS NULL`） |
 | 抢占 `take_one_from_pool`（refill） | `repo/sql.rs` | `= ANY($3)` | **跨全部货架**（`$2::bigint IS NULL OR pb.current_holder_id = $2`） | **无** |
 | 抢占 `take_specific_from_pool`（admin 单批） | `repo/sql.rs` | 无（按 `batch_id` 定位） | **限架**（`pb.current_holder_id = $2`，必传） | **无** |
+| 撤回候选池 `POST /queue/move`（WORKER→POOL） | 不经本 SQL（走 `pick_least_loaded` + `part_mark_batch_returned`） | 不改（`COALESCE` 保留） | 目标架**自动选**（`to` 侧无 `shelf_id`） | — |
 
 ### 「货架范围」列的口径（2026-10-10）
 
@@ -238,8 +261,10 @@ status = 'IN_PROCESS' AND location = 'PRODUCTION_SHELF'
   `POST /prod/queue/auto-allocate`（`AutoAllocateRequest.shelf_id`）的 `shelf_id`
   **保留必填**，handler 传 `Some(req.shelf_id)` 进 `take_one_from_pool` —— 它们是
   「为某工人在某架上抢料」的显式管理员操作。
-- `POST /prod/queue/move` 的 POOL↔WORKER 方向不经本 SQL（`move` 走
-  `take_specific_from_pool` / `mark_batch_*`），其 `shelf_id` 语义未变。
+- `POST /prod/queue/move` 的 POOL→WORKER 方向不经本 SQL（走
+  `take_specific_from_pool`），其 `from.shelf_id` 语义未变（仍是「批次真实所在货架」）。
+  WORKER→POOL（撤回候选池）方向的目标架 2026-10-10 起**不再由调用方指定**，改走
+  `shared::shelf::select::pick_least_loaded`（见 §2.8）。
 
 ### 取件优先级（2026-10-10 统一）
 
@@ -415,6 +440,19 @@ queue 域**整体不适用**域隔离护栏：它继承 worker_pool 的「经本
 11. **`POST /queue/move` 的 `version` 升为必填**（2026-10-09）：此前三个方向都由 service 用「本次事务里刚读到的 `batch.version`」当 `expected_version`，等价于**没有 OCC** —— 看板数据是 30s 缓存的快照，期间他人改过批次时「用户看到 5 件 → 实际移动 3 件」会静默成功。值取候选卡 / 持有卡的 `version`；漏传 → **HTTP 422 纯文本**（`version` 无 `#[serde(default)]`）。
 
 ### 8.4 已知偏差登记
+
+---
+
+**`POST /queue/move` 的 `from` / `to` 从一个 `MoveLocation` 拆成两个类型（2026-10-10）**
+
+- `MoveLocation::Pool { shelf_id }` 一个变体同时服务两侧，导致 `to` 侧也被迫要求
+  `shelf_id`。目标架自动选之后该字段在 `to` 侧没有角色可留，而前端**不发**它 ⇒
+  axum `Json` 提取器直接 422 纯文本，撤回候选池对所有角色都不可用。
+- 拆成 `MoveFromLocation`（`Pool { shelf_id }` 必填）+ `MoveToLocation`（`Pool` 无字段）
+  之后，「`from` 需要架、`to` 不需要」这个不对称才在类型上可表达。
+- 契约：§2.8。选架口径与错误码见 [`shelves.md`](shelves.md) §4。
+- ⚠️ `MoveResult.new_holder_id` 在 WORKER→POOL 方向是**服务端选的架**，客户端无法预知，
+  必须从响应（或刷新后的批次详情）读。
 
 ---
 

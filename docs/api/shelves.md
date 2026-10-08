@@ -12,6 +12,13 @@
 1. **新增存储列** `t_shelf.capacity`（整数，件数上限）。`NULL` 或 `<= 0` = **不限**，
    选架排序时恒排最后。migration **不做 backfill** —— 存量货架容量未知，留 `NULL`
    走退化路径（见 §4.2）。
+   ⚠️ 加列 migration 的**版本号必须与已有 migration 不撞**（本仓格式是
+   `<14 位时间戳>_<顺序>_<描述>.sql`，取当日时间戳后要看一眼同目录有没有同前缀的
+   序号）。撞了不会在编译期或启动时立刻报，而是 `sqlx` 在 apply 那一刻按唯一版本号
+   插 `*_sqlx_migrations` 时撞主键、返 `23505`。另外**不要在分支内给已提交的
+   migration 改名** —— 改名的版本号对任何已 apply 过它的库都是「缺了一条记录」，
+   启动直接 `VersionMismatch` panic；只有在那个版本号从未被任何环境 apply 过的
+   分支上改名才是安全的。
 2. **`ShelfOut` 出参加两列**：`capacity`（裸 `number | null`）与 `current_load`
    （裸 `number`，件数）。`load_ratio` **刻意不进 wire**（理由见 §2）。
 3. **两条 picker 端点下线**：`GET /for-return` / `GET /for-inspection`（见 §5）。
@@ -103,9 +110,11 @@
 用裸 derive 时 JSON `null` 与「字段缺省」**都**反序列化成外层 `None`，`Some(None)`
 分支不可达（已实测确认）。
 
-⚠️ **同文件的 `location` 声明了三态但没实现**：`Option<Option<String>>` 缺了那个
-`deserialize_with`，所以它的 `Some(None)` 同样不可达。本轮**不改** —— 改它会让
-「以前传 `location: null` 能清空」的旧客户端突然变成「不清空」，是一个静默的行为变更。
+⚠️ **同文件的 `location` 声明了三态但当前不可达**：`Option<Option<String>>` 缺了那个
+`deserialize_with`，所以 `service/crud.rs` 里 `Some(None) ⇒ 清空` 那个分支走不到 ——
+今天发 `{"location": null}` 的实际效果是**不改**。本轮**不改** —— 加上
+`deserialize_some` 会让「清空」这个动作第一次开始生效，属于行为变更，要先与前端确认
+有没有调用方在依赖当前的 no-op。
 
 ## 3. 口径表
 

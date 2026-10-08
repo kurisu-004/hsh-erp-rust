@@ -23,6 +23,50 @@ use hsh_erp_test_support::{
     test_state,
 };
 
+/// to-inspection 的 `INSPECTED` 事件 note 必须写**货架 code**（人类可读），
+/// 不能写 19 位雪花 id。
+///
+/// 这条 note 直接显示在工单时间线上（`GET /parts/{id}/events`）。自动选架之后
+/// `to_inspection_core` 不再自己查架，它拿的是 caller 传下来的 `(id, code)` 配对；
+/// 若哪一侧只传了 id（或把 code 换成 id 格式化），时间线就会退化成
+/// 「送检：来自待下发 → 品检架 9000000000000000014」这种运维噪声。
+#[tokio::test]
+async fn to_inspection_event_note_carries_shelf_code_not_id() {
+    let (pool, app, token, fx) = bootstrap_as_inspector().await;
+    let (_part_id, batch_id) =
+        insert_part_with_batch(&pool, "P0", fx.customer_l2_id, Some("P000"), "PENDING", 5).await;
+    let v = batch_version(&pool, batch_id).await;
+
+    let (status, body) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/batches/{batch_id}/to-inspection"),
+            Some(json!({ "version": v })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+
+    let note: Option<String> = sqlx::query_scalar(
+        "SELECT note FROM t_part_event WHERE batch_id = $1 AND event_type = 'INSPECTED'",
+    )
+    .bind(batch_id)
+    .fetch_one(&pool)
+    .await
+    .expect("读 INSPECTED 事件");
+    let note = note.expect("INSPECTED 事件应带 note");
+    assert!(
+        note.contains("FX-SH-INSP"),
+        "note 必须含货架 code `FX-SH-INSP`（实际：{note}）"
+    );
+    assert!(
+        !note.contains(&fx.inspection_shelf_id.to_string()),
+        "note 不应含货架雪花 id（实际：{note}）"
+    );
+}
+
 // ===========================================================================
 //  动态 fixture helpers（PR-C.Final retry 第 3 轮，2026-09-24）
 //  原从 `hsh_erp_test_support::fixtures::insert_shelf` 引入，因 fixtures.rs

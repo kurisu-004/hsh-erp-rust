@@ -111,8 +111,10 @@ pub async fn loads_by_shelf_ids(
 
 /// `ShelfLoad` 的构造（`load_ratio` 按 [`load_ratio`] 算）。
 ///
-/// 收敛成一个函数而不是让 4 处调用方各拼一遍字段：`load_ratio` 的口径一旦两处各
-/// 算一次，其中一处漏掉「`<= 0` 视为不限」就会在选架排序里变成 `inf`。
+/// 收敛成一个函数而不是让每个调用方各拼一遍字段：`load_ratio` 的口径（`capacity`
+/// 为 `NULL` 或 `<= 0` 一律 `None`）一旦两处各算一次，其中一处漏掉这条就会在选架
+/// 排序里变成 `inf` / `NaN`。当前唯一调用方是
+/// [`crate::shared::shelf::select::pick_least_loaded`]（行 → 结构体的转换点）。
 pub fn shelf_load_from_parts(
     id: i64,
     code: String,

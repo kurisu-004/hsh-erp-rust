@@ -6,7 +6,9 @@
 //!    （2026-10-01：REPAIRING 降级为 `t_part_batch.is_repairing` 标记列，返修
 //!    批次 status 即 IN_PROCESS，仍被本守卫覆盖。）
 //! 2. `create_then_get_shelf_round_trip` — happy path：create → get → 含 location 字段。
-//! 3. `picker_endpoints_are_gone`（2026-10-10）—— picker 两条端点下线后旧路径 404。
+//! 3. `picker_endpoints_are_gone`（2026-10-10）—— picker 两条端点下线后旧路径落进
+//!    `/shelves/{id}` 的 `Path<i64>` 提取器 ⇒ **400 纯文本**（不是 404，见
+//!    `docs/api/shelves.md` §5.1）。
 //!    （原 `for_inspection_returns_current_load_as_sum_of_quantity` 随端点下线删除；
 //!    `current_load` 的出参契约改由 `list_and_get_expose_capacity_and_current_load`
 //!    在 `GET /shelves` 上覆盖。）

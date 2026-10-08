@@ -48,11 +48,13 @@ pub struct ShelfCreateRequest {
 ///
 /// - `location` 三态：`None` ⇒ 缺省不改；`Some(null)` ⇒ 清空；`Some(v)` ⇒ 改
 ///
-///   ⚠️ 这一条**目前只声明了三态、没有实现**：`Option<Option<String>>` 用裸
+/// ⚠️ 这一条**声明了三态但当前不可达**：`Option<Option<String>>` 用裸
 ///   `#[derive(Deserialize)]` 时，JSON `null` 与「字段缺省」都反序列化成外层
-///   `None`，`Some(None)` 分支不可达（已实测确认）。本轮**不改**该字段的行为 ——
-///   改它会让「以前传 `location: null` 能清空」的旧客户端突然变成「不清空」，是
-///   一个静默的行为变更。已知偏差登记见 `docs/api/shelves.md`。
+///   `None`，`service/crud.rs` 里 `Some(None) ⇒ 清空` 那个分支走不到。所以今天
+///   `{"location": null}` 的实际效果是**不改**。本轮**不改** —— 加上
+///   `deserialize_some` 会让「清空」这个动作**第一次开始生效**，那是一次行为变更，
+///   要与前端确认过「有没有调用方在依赖当前的 no-op」再动。已知偏差登记见
+///   `docs/api/shelves.md`。
 /// - `capacity`（2026-10-10）：三态**且真的三态**，靠 `deserialize_some` 让 JSON
 ///   `null` 至少走到外层 `Some(_)`（见
 ///   `crate::shared::types::deserialize_some` 的 doc）———

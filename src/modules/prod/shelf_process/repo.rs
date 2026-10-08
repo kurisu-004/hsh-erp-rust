@@ -151,6 +151,12 @@ impl ShelfProcessRepo {
     /// 文件作为 SQL 真源，调用方 `prod::batch::service::dispatch_single` 改调本方法。
     /// 0 结果 → `Ok(None)`（由 service 层映射 `BIZ_SHELF_PROCESS_NOT_FOUND`）。
     ///
+    /// ⚠️ **2026-10-10 起本方法零调用方**（dispatch 的目标货架改走
+    /// `shared::shelf::select::pick_least_loaded`）。保留不删的理由与后续处置登记在
+    /// `docs/api/queue.md` §8.4 —— 新旧两套「第一」的排序口径不同（映射
+    /// `sort_order` vs 货架 `display_order`），**不要**在没想清楚之前把它接回选架
+    /// 的退化路径。下面几段记的是它被调用时期的设计取舍，供追溯。
+    ///
     /// ⚠️ 2026-10-04 加固（`current_holder_id` 写脏缺口）：原 SQL **不 JOIN `t_shelf`**，
     /// 只要 `t_shelf_process` 行未软删就返回，故已停用 / 已软删 / 品检区货架会被
     /// 下发给批次并写进 `t_part_batch.current_holder_id`。后果不是报错而是**静默漏件**：
@@ -162,7 +168,7 @@ impl ShelfProcessRepo {
     /// `t_shelf.is_active` / `t_shelf.zone = 'PRODUCTION'`）自行捞行。
     ///
     /// ## 为什么 JOIN 上 3 个谓词（zone 的判断依据）
-    /// 唯一调用方是 `prod::batch::service::dispatch_single`，它把货架写死成
+    /// 当时的唯一调用方 `prod::batch::service::dispatch_single` 把货架写死成
     /// `location='PRODUCTION_SHELF'` + `current_holder_id=shelf_id` + `status='IN_PROCESS'`
     /// （`BatchRepo::update_batch_dispatched`），且只接待下发（`status ∈ {PENDING,
     /// PROGRAMMING}`，2026-10-06 起含已废弃的 PROGRAMMING）的批次

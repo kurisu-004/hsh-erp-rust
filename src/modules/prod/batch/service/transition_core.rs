@@ -420,15 +420,21 @@ impl BatchService {
     // quantity / note 等必要输入，与 `to_ship_core` 同形；将它们打包为
     // `ToInspectionCoreArgs` 结构体收益微薄、调用面广，重构 ROI 低，故豁免。
     ///
-    /// `target_inspection_shelf_id` 是**caller 已经选好**的品检架 id —— 选架由
-    /// `shared::shelf::select::pick_least_loaded` 在 service 层完成（单件端点在
-    /// wrapper 里选一次，批量端点在循环外选一次共用），本核心**不再**重选也不校验。
-    /// 「批量共用一个架」是批量送检的语义本身：一次操作把 N 批一起放进同一个架。
+    /// `target_inspection_shelf_id` / `target_shelf_code` 是**caller 已经选好**的
+    /// 品检架 —— 选架由 `shared::shelf::select::pick_least_loaded` 在 service 层完成
+    /// （单件端点在 wrapper 里选一次，批量端点在循环外选一次共用），本核心**不再**
+    /// 重选也不校验。「批量共用一个架」是批量送检的语义本身：一次操作把 N 批一起
+    /// 放进同一个架。
+    ///
+    /// `target_shelf_code` 只进事件 note（人类可读的「送检 → 品检架 INS-01」）。它与
+    /// id **必须由同一个 caller 同一次选架产出** —— note 里写雪花 id 会让工单时间线
+    /// 退化成运维噪声，而分开取两处则可能拿到不同架的 id 与 code。
     #[allow(clippy::too_many_arguments)]
     pub async fn to_inspection_core<R: PartRepoTrait>(
         repo: &mut R,
         snowflake: &SnowflakeIdGenerator,
         target_inspection_shelf_id: i64,
+        target_shelf_code: &str,
         batch_id: i64,
         expected_batch_version: i32,
         quantity: Option<i32>,
@@ -436,8 +442,8 @@ impl BatchService {
         current: &CurrentUser,
     ) -> Result<ToXxxOut, AppError> {
         // 1. 品检架由 caller 选好（2026-10-10：`target_inspection_shelf_id` 入参删除）。
-        //    这里只需要它的 code / id 写事件日志，不再重做存在 / zone / scope 校验 ——
-        //    选架那一步（`pick_least_loaded`）已经把三件事一次做完。
+        //    这里只需要它的 id 写批次、code 写事件日志，不再重做存在 / zone / scope
+        //    校验 —— 选架那一步（`pick_least_loaded`）已经把三件事一次做完。
         // 2. 反查批次 → part_id 并读 part（2026-10-02 去 part 化，理由同 `to_ship_core`）
         let anchor = Self::_lookup_batch_by_id(repo, batch_id).await?;
         let part_id = anchor.part_id;
@@ -523,17 +529,12 @@ impl BatchService {
         };
         // 9. 写 INSPECTED 事件日志
         let event_id = snowflake.next_id();
+        // note 用货架 **code**（人类可读），不是 id：这条 note 直接显示在工单时间线上。
         let note_text = match from {
-            PartStatus::PENDING => {
-                format!("送检：来自待下发 → 品检架 {}", target_inspection_shelf_id)
-            }
-            PartStatus::PROGRAMMING => {
-                format!("送检：来自编程中 → 品检架 {}", target_inspection_shelf_id)
-            }
-            PartStatus::IN_PROCESS => {
-                format!("送检：来自生产架 → 品检架 {}", target_inspection_shelf_id)
-            }
-            _ => format!("送检 → 品检架 {}", target_inspection_shelf_id),
+            PartStatus::PENDING => format!("送检：来自待下发 → 品检架 {target_shelf_code}"),
+            PartStatus::PROGRAMMING => format!("送检：来自编程中 → 品检架 {target_shelf_code}"),
+            PartStatus::IN_PROCESS => format!("送检：来自生产架 → 品检架 {target_shelf_code}"),
+            _ => format!("送检 → 品检架 {target_shelf_code}"),
         };
         repo.insert_part_event(NewPartEvent {
             id: event_id,

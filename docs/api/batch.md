@@ -85,9 +85,21 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
 **新客户端发老版本服务端会得 422**（字段必填缺失）⇒ **部署顺序必须后端先上**。
 
 ⚠️ **唯一一处移除后语义会漂**：`complete-repair` / `repair-dispatch` 的 `shelf_id`
-曾是「去向」的唯一载体（读 `shelf.zone` 分流）。新客户端若**只发老 body**（带
-`shelf_id`、不带 `next_process_id`），「回生产」会被静默解释成「回品检」。这两个端点
-的调用方必须改发 `next_process_id`。
+曾是「去向」的唯一载体（读 `shelf.zone` 分流），老服务端对四种 body 的处理是：
+
+| 老 body | 老服务端行为 | 新服务端行为 |
+|---|---|---|
+| `{shelf_id: 生产架, next_process_id: X}` | `IN_PROCESS`（回生产） | `IN_PROCESS` ✅ 一致 |
+| `{shelf_id: 生产架, 无 next_process_id}` | `20104` 报错 | **`INSPECTION`**（静默改去向） |
+| `{shelf_id: 品检架, next_process_id: X}` | `INSPECTION`（该字段被**忽略**） | **`IN_PROCESS`**（静默改去向）⚠️ |
+| `{shelf_id: 品检架, 无 next_process_id}` | `INSPECTION` | `INSPECTION` ✅ 一致 |
+
+第三行是更危险的一侧：老服务端在品检分支**完全忽略** `next_process_id`，所以「回品检时
+顺带把下一道工序一起发过去」在老系统里是合法且无感的（发不发一个样），新服务端会把它
+当成「回生产」—— 把本该返修完送检的货放回产线重跑，而且返回 200。
+
+⇒ **这两个端点的调用方必须改**：回生产时发 `next_process_id`，**回品检时不得发**
+`next_process_id`。
 
 #### 2.1.1 选架失败时的错误码
 

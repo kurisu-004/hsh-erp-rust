@@ -562,9 +562,11 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 | 层 | 值 | 性质 |
 |---|---|---|
 | WS 事件名（传输层） | `OUTSOURCE_MOVE_DONE` | 一次移动在网络上完成，前端按它做卡片归位 |
-| `t_part_event.event_type`（业务事实） | `SENT_TO_OUTSOURCE` / `RECEIVED_FROM_OUTSOURCE` / `RECEIVED_TO_INSPECTION` | **记录发生了什么业务事实**（哪个方向、去了哪），前端在工单时间线上按它分组 |
+| `t_part_event.event_type`（业务事实） | `SENT_TO_OUTSOURCE` / `RECEIVED_FROM_OUTSOURCE` | **记录发生了什么业务事实**（哪个方向、去了哪），前端在工单时间线上按它分组 |
 
-三个审计字面量**逐字不变**，与 WS 事件名的合并无关。`t_part_event.event_type` 是 `varchar(30)`，字面量超 30 字符会让 PG 返 22001 并把**整个事务**回滚（三个字面量分别 19 / 26 / 22 字符，均在限内）。
+两个审计字面量**逐字不变**，与 WS 事件名的合并无关。`t_part_event.event_type` 是 `varchar(30)`，字面量超 30 字符会让 PG 返 22001 并把**整个事务**回滚（两个字面量分别 19 / 26 字符，均在限内）。
+
+`RECEIVED_TO_INSPECTION` 曾是第三个审计字面量，随 `OUTSOURCE_COMPANY → INSPECTION_SHELF` 方向于 2026-10-10 下线而**不再被写入**（§0b）。历史行里已有的该字面量仍可在时间线上读到。
 
 ## 8. 表依赖与前端配套
 

@@ -297,19 +297,21 @@ impl BatchService {
         // 「架不存在」。这是既有约束的延续（手动选架时同样会被 `can_access_shelf`
         // 拒），只是触发时机从「选了一个越权的架」变成「scope 内没有品检架」。
         // 成因与后果登记见 `docs/api/batch.md`。
-        let target_inspection_shelf_id = crate::shared::shelf::select::pick_least_loaded(
+        // `id` 与 `code` 取自**同一次**选架结果：事件 note 要的是人类可读的货架 code。
+        let shelf = crate::shared::shelf::select::pick_least_loaded(
             repo.conn_mut(),
             "INSPECTION",
             None,
             crate::shared::shelf::select::shelf_scope_for(current),
         )
         .await?
-        .ok_or_else(|| crate::shared::shelf::select::no_candidate_in_scope("INSPECTION"))?
-        .id;
+        .ok_or_else(|| crate::shared::shelf::select::no_candidate_in_scope("INSPECTION"))?;
+        let target_inspection_shelf_id = shelf.id;
         Self::to_inspection_core(
             &mut repo,
             snowflake,
             target_inspection_shelf_id,
+            &shelf.code,
             batch_id,
             req.version,
             req.quantity,
@@ -348,15 +350,15 @@ impl BatchService {
         // 共享品检架（一次性自动选）—— 选不出 → 顶层 40301（整批失败）。
         // 「循环外一次」是刻意保留的：批量送检的语义是「这 N 批一起进同一个品检架」，
         // 在循环内选架会让每批各落一个架、把一次批量操作拆成 N 次物理分布决策。
-        let target_inspection_shelf_id = crate::shared::shelf::select::pick_least_loaded(
+        let shelf = crate::shared::shelf::select::pick_least_loaded(
             repo.conn_mut(),
             "INSPECTION",
             None,
             crate::shared::shelf::select::shelf_scope_for(current),
         )
         .await?
-        .ok_or_else(|| crate::shared::shelf::select::no_candidate_in_scope("INSPECTION"))?
-        .id;
+        .ok_or_else(|| crate::shared::shelf::select::no_candidate_in_scope("INSPECTION"))?;
+        let target_inspection_shelf_id = shelf.id;
 
         let mut submitted: Vec<ToXxxOut> = Vec::new();
         let mut failed: Vec<BatchOpFailure> = Vec::new();
@@ -383,6 +385,7 @@ impl BatchService {
                 &mut repo,
                 snowflake,
                 target_inspection_shelf_id,
+                &shelf.code,
                 parsed_bid,
                 // caller 送来的 version（**不是** target.version）——否则 OCC 恒真、静默失效
                 item.version,

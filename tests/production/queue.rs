@@ -25,11 +25,15 @@
 //!  17. state_without_shelf_id_returns_held_batches_and_empty_pool_count
 //!      （2026-10-04 回归：`GET /pool/state` 的 `shelf_id` 降为可选后，缺省调用
 //!      仍须返回完整持有视图，仅 `pool_count_by_process` 退化为空数组）
-//!  18. move_worker_to_pool_rejects_unusable_shelf_in_all_three_shapes
-//!      （2026-10-04 `current_holder_id` 写脏守卫：WORKER→POOL 的目标货架已软删
-//!      → 20501 / 已停用 → 20512 / 是品检架 → 20104，且批次不被写脏）
-//!  19. move_worker_to_pool_validates_shelf_when_batch_has_no_process
-//!      （同上，但 `current_process_id=NULL` ⇒ 收紧前一条货架校验都不跑的那条分支）
+//!  18. move_worker_to_pool_picks_least_loaded_shelf
+//!      （2026-10-10：撤回候选池的目标架按 `current_load / capacity` 升序自动选；
+//!      `to` 侧无 `shelf_id`，断言落负载最低的架而非 display_order 最小的架）
+//!  19. move_worker_to_pool_rejects_when_no_usable_shelf_for_process
+//!      （2026-10-10 `current_holder_id` 写脏守卫（自动选架形态）：批次当前工序唯一
+//!      映射的货架已软删 / 已停用 / 是品检架 ⇒ 选架候选为空 → 20508，批次不被写脏）
+//!  20. move_worker_to_pool_no_process_still_lands_on_production_zone_shelf
+//!      （同上，但 `current_process_id=NULL` ⇒ 选架不按工序筛候选的那条分支；
+//!      断言 zone 谓词**仍然生效**，批次不会落到品检架）
 //!  20. move_{pool_to_worker|worker_to_pool|worker_to_worker}_stale_version_returns_40901
 //!      （2026-10-09 OCC：move 的 `version` 改为客户端必填，三个方向各一条，
 //!      钉住「过期的看板快照真的会被挡住、批次不被写脏」）
@@ -967,20 +971,27 @@ async fn worker_scan_returned_advances_current_process_id() {
 /// 1. 前置：`t_part.process_chain_id IS NULL`（防 fixture 未来被改成有链而假绿）
 /// 2. `POST /prod/batches/worker-scan`（RETURNED）→ HTTP 200 + `code=0`
 /// 3. `current_process_id` 推进到 `next_process_id`（RETURNED 的主状态变更）
-/// 4. `current_process_step_id` 仍为 NULL（step 指针扫描前已被清空 → 无链 ⇒ step 落 NULL）
+/// 4. `current_process_step_id` 保留扫描前的值（else 分支解出的 step 是 `None`，
+///    SQL 的 `COALESCE($5, current_process_step_id)` 必须保住原指针）
 ///
-/// ## 2026-10-10：为什么本用例要先把 step 指针清空
+/// ## 2026-10-10：为什么本用例要造「指针漂移」而不是「清空指针」
 /// 锚链解析会**回退**到批次的 step 指针所属链（`COALESCE(p.process_chain_id,
-/// cur.chain_id)`），所以「part 无链 + 指针非空」这条形态**仍然能解析出链**；而
-/// fixture 造的是单 step 链 ⇒ 指针一致时 `chain_state == "TAIL"` ⇒ RETURNED 会被
-/// 「链尾自动送检」接管。清空指针让三条闸门（非顺应 / 指针漂移 / 链解析不出来）同时
-/// 成立，才真正测到「无链 ⇒ 要求前端显式 `next_process_id`」这条分支。
+/// cur.chain_id)`），所以「part 无链 + 指针指向本链的 step」这条形态**仍然能解析出链**；
+/// 而 fixture 造的是单 step 链 ⇒ 指针一致时 `chain_state == "TAIL"` ⇒ RETURNED 会被
+/// 「链尾自动送检」接管。
 ///
-/// ## 断言 4 的诚实边界
-/// 改清指针之后，断言 4 从「原值被保留」退化成「本来就是 NULL 所以还是 NULL」——
-/// **信息量归零**，真正的回归信号是断言 2 的 HTTP 200 与断言 3 的工序推进。
-/// 「原值被保留」这条不变式改由 `worker_scan_returned_advances_step_pointer_when_process_chain_is_consistent`
-/// 覆盖（它有链、指针非空、且断言指针被推到链内下一 step）。
+/// 所以要落 else 分支（非顺应 ⇒ 用请求里的 `next_process_id`），必须让
+/// `is_pointer_consistent = false`。**不能靠把指针清成 NULL**：那样断言 4 恒成立
+/// （本来就是 NULL），`COALESCE` 保留语义就失去覆盖。改把指针指向**另一条链**上挂
+/// 了**别的工序**的 step —— 锚链回退到那条链、按 `pb.current_process_id` 重定位落空、
+/// `is_pointer_consistent` 为 false；`chain_state` 同时落 `TAIL`，但链尾自动送检要求
+/// 两者同时成立，所以落 else 分支并解出 `step = None`。
+///
+/// ## 断言 4 是承重的，不是护栏
+/// `mark_batch_returned` 的 SQL 写的是
+/// `current_process_step_id = COALESCE($5::bigint, current_process_step_id)`。把它改成
+/// `= $5` 时本断言会红，而后果是每一次非顺应 RETURNED 都把批次链位置静默清空 ——
+/// 所以断言 4 必须留着一个**非 NULL 的原值**可保。
 #[tokio::test]
 async fn worker_scan_returned_without_process_chain_succeeds() {
     let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
@@ -997,22 +1008,55 @@ async fn worker_scan_returned_without_process_chain_succeeds() {
 
     let worker = insert_worker(&pool, "BC002D", "工2D", Some(wt)).await;
     // with_chain = false ⇒ t_part.process_chain_id 为 NULL；批次仍带一个**非 NULL**
-    // 的旧 current_process_step_id，好让断言 4 有东西可保留
+    // 的旧 current_process_step_id（它属于 fixture 自建的那条单 step 链），断言 4
+    // 用它当「写入不变式」的护栏。
     let (_held_part, held_batch, old_step) =
         insert_worker_held_part(&pool, customer, "H-002D", worker, proc_b, 1, false).await;
-    // 2026-10-10：锚链解析会回退到 `cur.chain_id`，所以「part 无链 + 指针非空」这条
-    // 形态仍能解析出链、并被判成 `TAIL` ⇒ 会被「链尾自动送检」接管。本用例要测的是
-    // **无链 ⇒ 要求前端显式 `next_process_id`** 这条分支，故把 step 指针恢复成
-    // 刚插入时的 NULL 之外的值不可能 —— 只能反过来：这里保留 `old_step` 只作
-    // 「写入不变式」的护栏，并显式把指针清空，让链真的解析不出来。
+    // 2026-10-10：把批次指针改指到**另一条链**的 step 上（指针漂移），而不是清空它。
     //
-    // ⚠️ 清空后断言 4（`current_process_step_id` 保留原值）恒成立且信息量归零 ——
-    // 它从「防回归护栏」降级为平凡断言，真正的回归信号是 HTTP 200 + 工序推进。
-    sqlx::query("UPDATE t_part_batch SET current_process_step_id = NULL WHERE id = $1")
+    // 为什么必须造漂移而不是清空：本用例要测的是「非顺应 ⇒ 按前端指定的
+    // `next_process_id` 推进」，而进入那条分支要求 `is_pointer_consistent = false`。
+    // 两条路子都能造出非顺应，清空最省事 —— 但那样断言 4 就退化成「本来就是 NULL
+    // 所以还是 NULL」，**恒成立**，`mark_batch_returned` 的
+    // `current_process_step_id = COALESCE($5, current_process_step_id)` 这条不变式
+    // 就没人守了（把它改成 `= $5` 测试也不会红，而后果是每一次非顺应 RETURNED 都把
+    // 批次链位置静默清空）。
+    //
+    // 造漂移后本用例的形态：锚链解析回退到指针所属链（`COALESCE(p.process_chain_id,
+    // cur.chain_id)`，本 part 无链 ⇒ 取指针所属的 foreign 链），而那条链里**没有**
+    // `pb.current_process_id = proc_b` 这个工序 ⇒ 按工序重定位落空、
+    // `current_step_id` 保持 NULL ⇒ `is_pointer_consistent = false`；`chain_state`
+    // 同时落 `TAIL`，但「链尾自动送检」要求两者**同时**成立，所以照样落 else 分支。
+    // 于是 `step_id_opt = None` 绑进 SQL，断言 4 真正钉住 COALESCE 保留语义。
+    //
+    // ⚠️ foreign 链的那道 step **必须**挂 `proc_c`（≠ 批次当前工序 `proc_b`）：若挂上
+    // `proc_b`，按工序重定位会正好命中它，`current_step_id == 指针` ⇒ 指针反而变成
+    // 一致的，`chain_state` 与 `is_pointer_consistent` 同时为真 ⇒ 请求被「链尾自动
+    // 送检」接管，本用例就测不到 else 分支了。
+    let foreign_chain = {
+        use hsh_erp_test_support::shared_test_snowflake;
+        shared_test_snowflake().next_id()
+    };
+    sqlx::query(
+        "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, \
+         updated_at, updated_by) VALUES ($1, $2, 0, now(), 0, now(), 0)",
+    )
+    .bind(foreign_chain)
+    .bind("chain-H-002D-foreign")
+    .execute(&pool)
+    .await
+    .expect("insert foreign chain");
+    let foreign_step = append_chain_step(&pool, foreign_chain, proc_c, 10).await;
+    assert_ne!(
+        foreign_step, old_step,
+        "foreign step 必须与 fixture 原指针不同，否则造不出指针漂移"
+    );
+    sqlx::query("UPDATE t_part_batch SET current_process_step_id = $2 WHERE id = $1")
         .bind(held_batch)
+        .bind(foreign_step)
         .execute(&pool)
         .await
-        .expect("clear step pointer");
+        .expect("point batch at a foreign chain step");
 
     // 前置守卫：fixture 的 `with_chain=false` 失效的话，本测试会变成假绿，先在这里 fail
     let chain_id: Option<i64> = sqlx::query_scalar(
@@ -1066,11 +1110,16 @@ async fn worker_scan_returned_without_process_chain_succeeds() {
         after.0
     );
     assert_eq!(
-        after.1, None,
-        "step 指针在扫描前已被本用例清空（造非顺应形态），RETURNED 后应仍为 NULL，实际 {:?}",
+        after.1,
+        Some(foreign_step),
+        "else 分支解出的 step 是 None，RETURNED 后 SQL 的 COALESCE 必须保住扫描前的指针 \
+         {foreign_step}（把 COALESCE 改成直接写 $5 会让这里变 None），实际 {:?}",
         after.1
     );
-    let _ = old_step;
+    assert_ne!(
+        foreign_step, old_step,
+        "指针漂移的前提：foreign step 必须不同于 fixture 原指针"
+    );
 }
 
 /// 造一个「**已绑链的 PENDING 批次**」，链内 `process_ids` 按数组顺序占
@@ -1836,7 +1885,7 @@ async fn move_worker_to_pool_returns_batch_to_pool() {
                 // 2026-10-09：move 的 OCC 锚必填；两个 fixture helper 建批时 version 写死 0
                 "version": 0,
                 "from": { "kind": "WORKER", "worker_id": worker.to_string() },
-                "to":   { "kind": "POOL",   "shelf_id": prod_shelf.to_string() },
+                "to":   { "kind": "POOL" },
                 "note": "退换料"
             })),
             Some(&token),
@@ -2010,7 +2059,7 @@ async fn move_from_mismatch_returns_location_mismatch_error() {
                 "version": 0,
                 // from 谎报成 WORKER（实际在 POOL），期望 40904
                 "from": { "kind": "WORKER", "worker_id": "999999999" },
-                "to":   { "kind": "POOL",   "shelf_id": prod_shelf.to_string() },
+                "to":   { "kind": "POOL" },
             })),
             Some(&token),
         ),
@@ -2094,7 +2143,7 @@ async fn move_same_kind_rejected_with_validation_error() {
                 // 2026-10-09：move 的 OCC 锚必填；fixture 建批时 version 写死 0
                 "version": 0,
                 "from": { "kind": "POOL", "shelf_id": prod_shelf.to_string() },
-                "to":   { "kind": "POOL", "shelf_id": prod_shelf.to_string() },
+                "to":   { "kind": "POOL" },
             })),
             Some(&token),
         ),
@@ -2662,60 +2711,92 @@ async fn held_batch_includes_has_cnc_program() {
 // 通过 from/to 显式校验状态而非 process_id；功能已合并到 move_pool_to_worker_assigns_batch（场景 13b）。
 
 // ===========================================================================
-//  2026-10-04 `current_holder_id` 写脏守卫：move WORKER → POOL 的目标货架
+//  2026-10-10 move WORKER → POOL 的目标货架守卫（改自动选架后的形态）
 // ===========================================================================
 //
-// 背景：`move_batch` 的 WORKER→POOL 分支把 `to.shelf_id` 直接写进
-// `t_part_batch.current_holder_id` 并把 `location` 翻成 `PRODUCTION_SHELF`，
-// 收紧前**只在** `step_process_id` 是 `Some` 时才校验货架↔工序映射，且任何情况下
-// 都不校验货架本身（存在性 / 软删 / 停用 / zone 全无）。后果是静默漏件：报工台
-// 取件页数据源（`part::service::phase1::work_type` pickable-by-work-type）硬限定
+// 背景：`move_batch` 的 WORKER→POOL 分支把选出来的货架写进
+// `t_part_batch.current_holder_id` 并把 `location` 翻成 `PRODUCTION_SHELF`。
+// 报工台取件页数据源（`part::service::phase1::work_type` pickable-by-work-type）硬限定
 // `JOIN t_shelf sh ON sh.id = b.current_holder_id AND sh.is_active = true
 //   AND sh.zone = 'PRODUCTION'`，故落到品检架 / 停用架 / 已软删架上的批次永远不会被
-// 工人领到，也不报错。
+// 工人领到，也不报错 —— 静默漏件。
 //
-// 收紧后该分支**无条件**走 `validate_shelf_zone(.., "PRODUCTION")`（与 place_on_shelf /
-// pickup / outsource 等生产流端点同源同码：20501 → 20512 → 20104）。
+// 2026-10-10：目标架不再由调用方传（`to.kind = "POOL"` 无字段），改由
+// `shared::shelf::select::pick_least_loaded` 按批次当前工序选。这三条谓词
+// （未软删 / `is_active` / `zone='PRODUCTION'`）变成了选架**候选集**的一部分，
+// 选架层自己的单测 `shared::shelf::select::tests::
+// inactive_and_soft_deleted_shelves_are_excluded` 已锁住谓词本身；本文件锁的是
+// **端到端后果**：这些架一个都选不中时请求被拒、且批次不被写脏。
 
-/// 目标货架的三种不可用形态：已软删 / 已停用 / 品检区 → 拒收且批次不被写脏。
+/// WORKER→POOL 的目标架由**负载**决定（2026-10-10 自动选架的核心行为）。
+///
+/// 两个映射架的 `display_order` 与负载排成**相反**的次序（A 在前但更满、B 在后但更空），
+/// 于是「按物理顺序取第一个」与「按负载取最空」两种口径被分开：断言落 B。
 #[tokio::test]
-async fn move_worker_to_pool_rejects_unusable_shelf_in_all_three_shapes() {
-    // (短标, 说明, zone, is_active, deleted, 期望错误码, 期望 HTTP 状态)
-    // 「短标」只进 serial_no / shelf code / 批号等有长度上限的列
-    // （`t_part.serial_no` 是 varchar(15)），长描述只进断言消息。
-    // HTTP 状态按 `error.rs::status_from_code` 的既有映射：20501 → 404（资源缺失段），
-    // 20512 / 20104 落在 2xxxx 兜底段 → 400。
-    let cases: [(&str, &str, &str, bool, bool, i64, StatusCode); 3] = [
-        (
-            "DEL",
-            "soft-deleted",
-            "PRODUCTION",
-            true,
-            true,
-            20501,
-            StatusCode::NOT_FOUND,
+async fn move_worker_to_pool_picks_least_loaded_shelf() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "MPICKS").await;
+    let proc = seed_process(&pool, "PROC-MPICK", "工序MPICK").await;
+    let wt = insert_work_type(&pool, "WT-MPICK", "工种MPICK", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let worker = insert_worker(&pool, "BC-MPICK", "工MPICK", Some(wt)).await;
+
+    let shelf_a = insert_shelf(&pool, "MPICK-A", "MPICK架A", "PRODUCTION").await;
+    let shelf_b = insert_shelf(&pool, "MPICK-B", "MPICK架B", "PRODUCTION").await;
+    for shelf in [shelf_a, shelf_b] {
+        sqlx::query("UPDATE t_shelf SET capacity = 100, display_order = $2 WHERE id = $1")
+            .bind(shelf)
+            .bind(if shelf == shelf_a { 0_i32 } else { 1 })
+            .execute(&pool)
+            .await
+            .expect("set capacity/display_order");
+        link_shelf_to_process(&pool, shelf, proc).await;
+    }
+    // 在架负载：A 80 件、B 20 件（`SUM(quantity)` 件数口径）⇒ 比例 80% / 20%
+    let (_pa, _ba) = insert_pool_part(&pool, customer, "MPICK-LA", shelf_a, proc, 80).await;
+    let (_pb, _bb) = insert_pool_part(&pool, customer, "MPICK-LB", shelf_b, proc, 20).await;
+
+    let (_held_part, held_batch, _step) =
+        insert_worker_held_part(&pool, customer, "H-MPICK", worker, proc, 1, true).await;
+
+    let (app, token) = login_manager_with_username(&pool, "admin-mpick").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/queue/move",
+            Some(json!({
+                "batch_id": held_batch.to_string(),
+                "version": 0,
+                "from": { "kind": "WORKER", "worker_id": worker.to_string() },
+                // 2026-10-10：to 侧无 shelf_id —— 目标架由服务端按负载选
+                "to":   { "kind": "POOL" },
+            })),
+            Some(&token),
         ),
-        (
-            "INACT",
-            "inactive",
-            "PRODUCTION",
-            false,
-            false,
-            20512,
-            StatusCode::BAD_REQUEST,
-        ),
-        (
-            "INSP",
-            "inspection-zone",
-            "INSPECTION",
-            true,
-            false,
-            20104,
-            StatusCode::BAD_REQUEST,
-        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "move WORKER→POOL: {env}");
+    assert_eq!(
+        env["data"]["new_holder_id"],
+        shelf_b.to_string(),
+        "应落负载比例最低的架（20%），不是 display_order 最小的 A（80%）: {env}"
+    );
+}
+
+/// 该工序唯一映射的货架不可用（已软删 / 已停用 / 品检区）→ 20508 且批次不被写脏。
+#[tokio::test]
+async fn move_worker_to_pool_rejects_when_no_usable_shelf_for_process() {
+    // (短标, 说明, zone, is_active, deleted)
+    // 「短标」只进 serial_no / shelf code 等有长度上限的列（`t_part.serial_no` 是
+    // varchar(15)），长描述只进断言消息。
+    let cases: [(&str, &str, &str, bool, bool); 3] = [
+        ("DEL", "soft-deleted", "PRODUCTION", true, true),
+        ("INACT", "inactive", "PRODUCTION", false, false),
+        ("INSP", "inspection-zone", "INSPECTION", true, false),
     ];
 
-    for (tag, name, zone, is_active, deleted, expect_code, expect_status) in cases {
+    for (tag, name, zone, is_active, deleted) in cases {
         let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
         let customer = insert_customer_l2(&pool, "MPG").await;
         let proc = seed_process(&pool, "PROC-MPG", "工序MPG").await;
@@ -2724,7 +2805,7 @@ async fn move_worker_to_pool_rejects_unusable_shelf_in_all_three_shapes() {
         let worker =
             insert_worker(&pool, &format!("BC-{tag}"), &format!("工{tag}"), Some(wt)).await;
 
-        // 目标货架按用例指定状态（**不**建映射：映射校验是另一层守卫，本用例只锁货架本身）
+        // 该工序**唯一**的映射货架，按用例指定状态。选了它就必然落选 ⇒ 候选为空。
         let bad_shelf = insert_shelf_state(
             &pool,
             &format!("SH-{tag}"),
@@ -2734,6 +2815,7 @@ async fn move_worker_to_pool_rejects_unusable_shelf_in_all_three_shapes() {
             deleted,
         )
         .await;
+        link_shelf_to_process(&pool, bad_shelf, proc).await;
 
         let (_part, held_batch, _step) =
             insert_worker_held_part(&pool, customer, &format!("H-{tag}"), worker, proc, 1, true)
@@ -2750,20 +2832,19 @@ async fn move_worker_to_pool_rejects_unusable_shelf_in_all_three_shapes() {
                     // 2026-10-09：move 的 OCC 锚必填；fixture 建批时 version 写死 0
                     "version": 0,
                     "from": { "kind": "WORKER", "worker_id": worker.to_string() },
-                    "to":   { "kind": "POOL",   "shelf_id": bad_shelf.to_string() },
+                    // 2026-10-10：to 侧不再有 shelf_id（目标架自动选）
+                    "to":   { "kind": "POOL" },
                 })),
                 Some(&token),
             ),
         )
         .await;
-        assert_eq!(
-            s, expect_status,
-            "{name}: 不可用货架应 {expect_status}: {env}"
-        );
+        // 20508 落在「资源缺失」段 → HTTP 404（`error.rs::status_from_code` 的既有映射）
+        assert_eq!(s, StatusCode::NOT_FOUND, "{name}: 应拒收: {env}");
         assert_eq!(
             env["code"].as_i64().unwrap(),
-            expect_code,
-            "{name}: 错误码应复用 validate_shelf_zone 体系（不新造码）: {env}"
+            20508,
+            "{name}: 无可用生产货架应 20508 BIZ_SHELF_PROCESS_NOT_FOUND: {env}"
         );
 
         // 批次未被写脏：仍在 worker 手上（location/holder 均未变）
@@ -2793,21 +2874,24 @@ async fn move_worker_to_pool_rejects_unusable_shelf_in_all_three_shapes() {
     }
 }
 
-/// `step_process_id`（= `t_part_batch.current_process_id`）为 `None` 时也必须校验目标货架。
+/// `current_process_id` 为 `None` 时选架**不按工序筛候选**，但 zone / 停用 / 软删
+/// 三条谓词一条都不能松 —— 本用例造「一个 INSPECTION 架 + 一个 PRODUCTION 架」，
+/// 断言批次落到 **PRODUCTION** 那个上。
 ///
-/// 收紧前 WORKER→POOL 分支的**全部**货架校验都包在 `if let Some(spid) = step_process_id`
-/// 里，`None` 时一条校验都不跑（`None` = 批次无工序归属，见 migration 004 之前的存量 /
-/// 直接改库的历史脏数据）。收紧后货架本身的存在性 / 停用 / zone 无条件守（映射校验仍
-/// 跳过 —— 没有 process_id 可比），本用例锁的就是这一点。
+/// 这是 WORKER→POOL 分支对「无工序归属批次」（`t_part_batch.current_process_id IS
+/// NULL`：migration 004 之前的存量 + 历史脏数据）的刻意取舍：传 `None` 进选架的
+/// `process_id` 形参即「不按工序筛」，管理员「把卡住的批次手动放回货架」的自救路径
+/// 不被堵死；但 zone 谓词仍在候选集里，所以**不可能**把批次落到品检架上。
 #[tokio::test]
-async fn move_worker_to_pool_validates_shelf_when_batch_has_no_process() {
+async fn move_worker_to_pool_no_process_still_lands_on_production_zone_shelf() {
     let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let customer = insert_customer_l2(&pool, "MPOOLNOPROC").await;
     let proc = seed_process(&pool, "PROC-MPNP", "工序MPNP").await;
     let wt = insert_work_type(&pool, "WT-MPNP", "工种MPNP", Some(5)).await;
     link_work_type_to_process(&pool, wt, proc).await;
     let worker = insert_worker(&pool, "BC-MPNP", "工MPNP", Some(wt)).await;
-    let bad_shelf = insert_shelf_state(
+    // 品检架排在前面（display_order=0）：若 zone 谓词被漏掉，它会被选中
+    let insp_shelf = insert_shelf_state(
         &pool,
         "SH-MPNP-INSP",
         "SH-MPNP-INSP",
@@ -2816,10 +2900,24 @@ async fn move_worker_to_pool_validates_shelf_when_batch_has_no_process() {
         false,
     )
     .await;
+    let prod_shelf = insert_shelf_state(
+        &pool,
+        "SH-MPNP-PROD",
+        "SH-MPNP-PROD",
+        "PRODUCTION",
+        true,
+        false,
+    )
+    .await;
+    sqlx::query("UPDATE t_shelf SET display_order = 0 WHERE id = $1")
+        .bind(insp_shelf)
+        .execute(&pool)
+        .await
+        .expect("inspection shelf first");
 
     let (_part, held_batch, _step) =
         insert_worker_held_part(&pool, customer, "H-MPNP", worker, proc, 1, true).await;
-    // 把 current_process_id 清空 ⇒ service 侧 step_process_id = None（映射校验会被跳过）
+    // 把 current_process_id 清空 ⇒ service 侧 step_process_id = None
     sqlx::query("UPDATE t_part_batch SET current_process_id = NULL WHERE id = $1")
         .bind(held_batch)
         .execute(&pool)
@@ -2834,10 +2932,10 @@ async fn move_worker_to_pool_validates_shelf_when_batch_has_no_process() {
             "/prod/queue/move",
             Some(json!({
                 "batch_id": held_batch.to_string(),
-                // 2026-10-09：move 的 OCC 锚必填；两个 fixture helper 建批时 version 写死 0
+                // 2026-10-09：move 的 OCC 锚必填；fixture 建批时 version 写死 0
                 "version": 0,
                 "from": { "kind": "WORKER", "worker_id": worker.to_string() },
-                "to":   { "kind": "POOL",   "shelf_id": bad_shelf.to_string() },
+                "to":   { "kind": "POOL" },
             })),
             Some(&token),
         ),
@@ -2845,26 +2943,23 @@ async fn move_worker_to_pool_validates_shelf_when_batch_has_no_process() {
     .await;
     assert_eq!(
         s,
-        StatusCode::BAD_REQUEST,
-        "current_process_id=NULL 时也必须拒品检架: {env}"
+        StatusCode::OK,
+        "无工序归属的批次仍可放回货架（自救路径不被堵死）: {env}"
     );
     assert_eq!(
-        env["code"].as_i64().unwrap(),
-        20104,
-        "应复用 20104 BIZ_INVALID_VALUE（zone 不符）: {env}"
+        env["data"]["new_holder_id"],
+        prod_shelf.to_string(),
+        "必须落 PRODUCTION 架；品检架排在 display_order 前面仍被 zone 谓词挡掉: {env}"
     );
 
-    let holder: Option<i64> =
-        sqlx::query_scalar("SELECT current_holder_id FROM t_part_batch WHERE id = $1")
+    let (loc, holder): (String, Option<i64>) =
+        sqlx::query_as("SELECT location, current_holder_id FROM t_part_batch WHERE id = $1")
             .bind(held_batch)
             .fetch_one(&pool)
             .await
-            .expect("read holder");
-    assert_eq!(
-        holder,
-        Some(worker),
-        "拒收后 current_holder_id 必须仍指向 worker（未被写脏）"
-    );
+            .expect("read batch");
+    assert_eq!(loc, "PRODUCTION_SHELF");
+    assert_eq!(holder, Some(prod_shelf));
 }
 
 // ===========================================================================
@@ -2952,7 +3047,7 @@ async fn move_worker_to_pool_stale_version_returns_40901() {
                 "batch_id": held_batch.to_string(),
                 "version": 9,
                 "from": { "kind": "WORKER", "worker_id": worker.to_string() },
-                "to":   { "kind": "POOL",   "shelf_id": prod_shelf.to_string() },
+                "to":   { "kind": "POOL" },
             })),
             Some(&token),
         ),

@@ -283,9 +283,21 @@ pub struct PlaceOnShelfRequest {
 /// 它曾是「去向」的唯一载体（读 `shelf.zone` 分流）；现在 `next_process_id` 承担
 /// 了这个语义 —— 工人填「打回到哪道工序」就是「回生产」，不填就是「回品检」。
 /// 老客户端多发的 `shelf_id` 会被 serde 静默忽略（本仓生产代码零
-/// `deny_unknown_fields`），故移除是**向后兼容**的；但**新客户端必须重发
-/// `next_process_id`**，否则「回生产」会被静默解释成「回品检」—— 这是本轮唯一
-/// 一处**移除后语义会漂**的字段，部署顺序必须后端先上。
+/// `deny_unknown_fields`），故移除本身**向后兼容**；但去向**会漂**，两个方向都要注意：
+///
+/// | 老 body | 老服务端 | 新服务端 |
+/// |---|---|---|
+/// | 生产架 + `next_process_id` | 回生产 | 回生产 ✅ |
+/// | 生产架 + 无 `next_process_id` | `20104` | **回品检**（静默改去向） |
+/// | 品检架 + `next_process_id` | 回品检（该字段被忽略） | **回生产**（静默改去向）⚠️ |
+/// | 品检架 + 无 `next_process_id` | 回品检 | 回品检 ✅ |
+///
+/// ⚠️ 第三行是更危险的一侧：老服务端在品检分支完全忽略 `next_process_id`，所以
+/// 「回品检时顺带把下一道工序一起发过去」在老系统里是无感的，新服务端会当成「回生产」
+/// —— 把本该返修完送检的货放回产线重跑，且返回 200。
+/// ⇒ **调用方义务**：回生产时发 `next_process_id`，**回品检时不得发**。
+/// 部署顺序必须后端先上。逐端点登记见 [`RepairDispatchRequest`] 与
+/// `docs/api/batch.md` §2.1。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct CompleteRepairRequest {
     pub version: i32,

@@ -63,8 +63,10 @@
 //!   `decode_company_options`）**保留** —— 看板候选列仍消费它们。
 //! - 旧的三个 WS 事件名（`PART_SENT_TO_OUTSOURCE` / `PART_RECEIVED_FROM_OUTSOURCE` /
 //!   `PART_RECEIVED_FROM_OUTSOURCE_INSPECTED`）合并为一个 `OUTSOURCE_MOVE_DONE`；
-//!   `t_part_event` 的三个审计字面量（`SENT_TO_OUTSOURCE` /
-//!   `RECEIVED_FROM_OUTSOURCE` / `RECEIVED_TO_INSPECTION`）**逐字不变**。
+//!   `t_part_event` 的审计字面量 `SENT_TO_OUTSOURCE` / `RECEIVED_FROM_OUTSOURCE`
+//!   **逐字不变**。
+//!   （2026-10-10：`OUTSOURCE_COMPANY → INSPECTION_SHELF` 方向下线后，
+//!   `RECEIVED_TO_INSPECTION` 这个审计字面量随之不再被写入。）
 //! - router 工厂 5 → **4**：删 `sendable_router()`（`pool_router()` 已于上一条删除）；
 //!   保留 `company_router()` / `quote_router()` / `shipment_router()` /
 //!   `queue_router()`。
