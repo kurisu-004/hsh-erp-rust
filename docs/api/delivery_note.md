@@ -113,7 +113,7 @@
 | 21403 | `BIZ_DELIVERY_NOTE_NOT_DRAFT` | `soft-delete` 单据非 DRAFT | 400 |
 | 21404 | `BIZ_DELIVERY_NOTE_NOT_SUBMITTED` | `recall` / `pickup` 单据非 SUBMITTED | 400 |
 | **21405** | `BIZ_DELIVERY_NOTE_PART_NOT_READY` | ★ 入单唯一允许的批次状态是 `READY_TO_SHIP`：批次状态不符**且**该零件可入单量凑不出本次要的量（作用域见 §4.1）/ DP 不可行 / `sets > entry_max_sets`；`submit` 单上有非 `READY_TO_SHIP` 批次；`pickup` 单上有非 `READY_TO_SHIP` 批次 | 400 |
-| 21406 | `BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED` | 批次已被**其它**送货单占着（活跃单 / 已领取单，两种 message 不同） | 409 |
+| 21406 | `BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED` | 批次已被**其它**送货单占着（活跃单 / 已领取单，两种 message 不同）**且该零件可入单量凑不出本次要的量**（作用域见 §4.1）；汇总处与 21405 二选一：失败 part 里有占用明细 ⇒ 21406，否则 21405 | 409 |
 | **21407** | `BIZ_DELIVERY_NOTE_PARTS_MULTIPLE_CUSTOMERS` | 零件的 L1 客户 ≠ 单据 L1 客户（同一请求混入别的 L1 的零件） | 400 |
 | 21409 | `BIZ_DELIVERY_NOTE_DRIVER_INVALID` | `validate_driver` 5 条任一不过；`pickup` 单据未指定司机 | 400 |
 | 21411 | `BIZ_DELIVERY_NOTE_INVALID_VALUE` | 空单提交 / 空单领取 | 400 |
@@ -449,7 +449,8 @@ entry_max_sets(a) = LEAST( MIN( per_set(c) for c ∈ a 的**全部**未软删子
 
 算法：① 全体子集和 DP（后向可达表）；② 可达 ⇒ 回溯取字典序最小解（拆批数 0）；③ 不可达 ⇒
 排除 quantity 最大的那个批次再跑一次 DP 得 `max_reachable`，差额从被排除的最大批次拆出
-（**拆批数恒为 1**）；④ 差额不可行（target > Σ 全部数量）⇒ `21405`。
+（**拆批数恒为 1**）；④ 差额不可行（target > Σ 全部数量）⇒ `21405`（该 part 另有占用明细时
+为 21406，见 §4.1）。
 
 **「最大」的定序**：`quantity DESC, batch_no ASC` —— 数量相同时取 batch_no 小的，保证同一输入
 的分配结果稳定可复现。

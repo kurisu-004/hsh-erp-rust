@@ -30,9 +30,9 @@
 //! 6. 逐零件分类：可入单（`READY_TO_SHIP` 且未占用）/ 状态未过检 / 已占用 —— 后两类都
 //!    **只按 part 收集诊断明细、不拒绝**（见「状态闸门的作用域」与「占用闸门的作用域」）
 //! 7. 每个 target 跑一次 DP（子件之间不耦合）+ 拆批 + 挂单（同事务）：任一 part
-//!    凑不出 ⇒ 该 part 有占用明细则 21406、否则 21405，message 附该 part 的占用明细与
-//!    状态明细；失败发生在任何拆批 / 挂单写之前，草稿行的 find-or-create 也与它们同处一个
-//!    事务 ⇒ 整体回滚、零写入
+//!    凑不出 ⇒ 任一失败 part 有占用明细则 21406、否则 21405（错误码按响应二选一），
+//!    message 附该 part 的占用明细与状态明细；失败发生在任何拆批 / 挂单写之前，草稿行的
+//!    find-or-create 也与它们同处一个事务 ⇒ 整体回滚、零写入
 //! 8. note.version++ → commit → WS 广播 DELIVERY_NOTE_SCAN_ADD
 //! 9. 返回 DeliveryNoteDetailOut（含拆批后的完整行项，前端可就地替换草稿卡）
 //! ```
@@ -180,7 +180,7 @@ struct AllocFailure {
 /// （`allocate` 的唯一错误出口是 `batch_allocation::not_enough`），所以这里取到的
 /// 一定是业务 message。下游由 `debug_assert!` 把这条前提钉住：一旦 `allocate` 将来
 /// 改吐别的错误、非业务错误就会走进兜底分支，它的 `Display` 会被拼进 message 且整个
-/// 响应的错误码退化成 21405（500 被伪装成业务错），这种事必须在开发期就炸掉。
+/// 响应的错误码退化成 21405 / 21406（500 被伪装成业务错），这种事必须在开发期就炸掉。
 fn error_message(e: &AppError) -> String {
     match e {
         AppError::Biz { message, .. } | AppError::BizWithFailures { message, .. } => {
@@ -243,41 +243,39 @@ fn alloc_failure_error(
             } else {
                 dp_msg
             };
-            match occupied_by_part.get(&f.part_id) {
-                Some(details) if !details.is_empty() => {
-                    let detail = details
-                        .iter()
-                        .map(|d| {
-                            format!(
-                                "part {} 批次 {} 已在送货单 {}（{}）",
-                                d.part_id, d.batch_no, d.on_note_id, d.reason
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("；");
-                    seg.push_str(&format!(
-                        "；该零件另有批次已在其它送货单上、不可入单：{detail}"
-                    ));
-                }
-                _ => {}
+            if let Some(details) = occupied_by_part.get(&f.part_id)
+                && !details.is_empty()
+            {
+                let detail = details
+                    .iter()
+                    .map(|d| {
+                        format!(
+                            "part {} 批次 {} 已在送货单 {}（{}）",
+                            d.part_id, d.batch_no, d.on_note_id, d.reason
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("；");
+                seg.push_str(&format!(
+                    "；该零件另有批次已在其它送货单上、不可入单：{detail}"
+                ));
             }
-            match not_ready_by_part.get(&f.part_id) {
-                Some(details) if !details.is_empty() => {
-                    let detail = details
-                        .iter()
-                        .map(|d| {
-                            format!(
-                                "part {}（{}）批次 {} status={}",
-                                d.part_id, d.serial_no, d.batch_no, d.status
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("；");
-                    seg.push_str(&format!(
-                        "；入单只允许 READY_TO_SHIP，以下批次不可用：{detail}"
-                    ));
-                }
-                _ => {}
+            if let Some(details) = not_ready_by_part.get(&f.part_id)
+                && !details.is_empty()
+            {
+                let detail = details
+                    .iter()
+                    .map(|d| {
+                        format!(
+                            "part {}（{}）批次 {} status={}",
+                            d.part_id, d.serial_no, d.batch_no, d.status
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("；");
+                seg.push_str(&format!(
+                    "；入单只允许 READY_TO_SHIP，以下批次不可用：{detail}"
+                ));
             }
             seg
         })

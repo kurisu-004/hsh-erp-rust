@@ -8,6 +8,7 @@
 //! | 同零件另有足量 `READY_TO_SHIP` 批次 ⇒ 非 READY 批次**不**顺带拒绝 | 200 | `mixed_status_part_enters_from_ready_batch_only` |
 //! | 批次已挂在别的 `DRAFT` / `SUBMITTED` / `PICKED_UP` / `ARCHIVED` 单上**且该零件可入单量凑不出本次要的量** | 21406 | `occupied_batch_shortage_returns_21406_with_occupied_detail`、`mixed_failure_reasons_pick_21406_and_list_both_details` |
 //! | 同零件另有足量空闲 `READY_TO_SHIP` 批次 ⇒ 被占用的批次**不**顺带拒绝（且不重复挂单） | 200 | `occupied_batch_on_active_note_does_not_block_free_batch`、`mixed_occupancy_part_enters_from_free_batch` |
+//! | 错误码判据**只看失败 part**：分配成功的 part 上有占用明细**不**把整条响应抬成 21406 | 21405 | `occupied_detail_on_successful_part_stays_21405` |
 //! | 零件的 L1 客户 ≠ 单据 L1 客户 | 21407 | `cross_l1_part_rejected_21407` |
 //! | DP 不可行（凑不出） | 21405 | `quantity_over_entryable_total_returns_21405` |
 //! | 跨 part 原子性：一个 part 够、另一个凑不出 ⇒ **整个请求零写入** | 21405 | `multi_part_shortage_writes_nothing_across_parts` |
@@ -38,7 +39,10 @@
 //! - `occupied_batch_shortage_returns_21406_with_occupied_detail` 钉住「不够才 21406，且
 //!   message 要点名占用方单号与单据状态」；
 //! - `mixed_failure_reasons_pick_21406_and_list_both_details` 钉住**错误码二选一**规则：
-//!   失败 part 里只要有一条占用明细就是 21406（否则 21405），且两类明细都列全。
+//!   失败 part 里只要有一条占用明细就是 21406（否则 21405），且两类明细都列全；
+//! - `occupied_detail_on_successful_part_stays_21405` 钉住判据的**另一半**：判据的输入是
+//!   **失败** part 集合，不是整张占用明细表 —— A 有占用明细但 A 的 DP 成功、B 无占用明细却
+//!   失败 ⇒ 整条响应报 21405。
 //!
 //! ## 跨 part 原子性与失败汇总的形状
 //!
@@ -767,6 +771,89 @@ async fn mixed_failure_reasons_pick_21406_and_list_both_details() {
     assert!(
         msg.contains(&part_b.to_string()) && msg.contains("G-OCCFB") && msg.contains("IN_PROCESS"),
         "B 段应同时带 part 身份与状态明细: {msg}"
+    );
+    assert_eq!(
+        attached_count(&pool).await,
+        attached_before,
+        "任一 part 凑不出 ⇒ 整请求零写入: {env}"
+    );
+}
+
+/// ★ 错误码判据**只看失败 part**：分配**成功**的 part 上有占用明细，**不**把整条响应抬成
+/// 21406。
+///
+/// 上一条钉的是「占用明细 ⇒ 21406」，本条钉的是它的**另一半**：`has_occupied` 遍历的是
+/// `alloc_failures`，不是整张 `occupied_by_part`。本场景里 A 的占用批次存在、A 的 DP 也
+/// **成功**（5 件空闲批次正好够 5 件），所以：占用明细存在（A 侧）＋ 唯一失败 part 是 B
+/// 且 B **无占用明细** ⇒ 判据应为假 ⇒ 整条响应报 **21405**。
+///
+/// 这条同时钉跨 part 原子性：A 的空闲批次**不得**被挂上（拒绝点早于任何拆批 / 挂单写），
+/// A 的占用批次归属**不被改写**，B 的批次当然也不挂。
+#[tokio::test]
+async fn occupied_detail_on_successful_part_stays_21405() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let l1 = insert_l1(&pool, "闸门占用不外溢").await;
+    let l2 = insert_l2(&pool, "闸门占用不外溢二厂", l1).await;
+    // A：5 件空闲 + 5 件被活跃单占着，本次要 5 件 ⇒ A 的 DP **成功**（用掉空闲那 5 件）。
+    // A 的占用明细是本场景里唯一存在的占用明细，而它所在的 part 并不失败。
+    let part_a = insert_part(&pool, "占用不外溢甲件", "G-MIXCODEA", l2).await;
+    let free_a = insert_batch(&pool, part_a, 1, 5, "READY_TO_SHIP", None).await;
+    // 占用单不能是 `DRAFT`：本域判定键是「同 L1 唯一的 DRAFT」，占用单若是 DRAFT，它就是
+    // 本次扫码的落点单，那个批次算「已挂本单」而不是冲突。
+    let taken_note = insert_note(&pool, l1, "DN-GMIXCODE-1", "SUBMITTED").await;
+    let taken_a = insert_batch(&pool, part_a, 2, 5, "READY_TO_SHIP", Some(taken_note)).await;
+    // B：只有 IN_PROCESS，本次要 5 件 ⇒ B 失败，且 B **无占用明细**（未被占用、只是状态不符）
+    let part_b = insert_part(&pool, "占用不外溢乙件", "G-MIXCODEB", l2).await;
+    let only_b = insert_batch(&pool, part_b, 1, 8, "IN_PROCESS", None).await;
+    // 场景自带 1 条挂单（A 的占用批次挂在活跃单上），「零写入」只能钉成「挂单数不变」。
+    let attached_before = attached_count(&pool).await;
+
+    let (s, env) = scan_entry(
+        &app,
+        &token,
+        "G-MIXCODEA",
+        json!([
+            {"node_kind": "PART", "node_id": part_a.to_string(), "quantity": 5},
+            {"node_kind": "PART", "node_id": part_b.to_string(), "quantity": 5},
+        ]),
+    )
+    .await;
+
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "唯一失败 part 无占用明细 ⇒ 整请求应是 21405 那一侧: {env}"
+    );
+    assert_eq!(
+        env["code"], 21405,
+        "占用明细在**分配成功**的 A 上，不该把整条响应抬成 21406: {env}"
+    );
+    let msg = env["message"].as_str().unwrap();
+    assert!(
+        msg.contains(&part_b.to_string())
+            && msg.contains("G-MIXCODEB")
+            && msg.contains("IN_PROCESS"),
+        "失败段是 B，带 part 身份与状态明细: {msg}"
+    );
+    assert!(
+        !msg.contains("已在其它送货单上"),
+        "A 分配成功 ⇒ 它的占用明细不进 message（占用段只挂在失败 part 上）: {msg}"
+    );
+    // 跨 part 原子性：拒绝点早于任何拆批 / 挂单写，够量的 A 也不能先挂。
+    assert_eq!(
+        batch_note_id(&pool, free_a).await,
+        None,
+        "A 的 DP 成功也不能先挂上（整请求原子失败）: {env}"
+    );
+    assert_eq!(
+        batch_note_id(&pool, taken_a).await,
+        Some(taken_note),
+        "A 的占用批次归属不得被改写: {env}"
+    );
+    assert_eq!(
+        batch_note_id(&pool, only_b).await,
+        None,
+        "B 凑不出，它的批次不该被挂上: {env}"
     );
     assert_eq!(
         attached_count(&pool).await,
