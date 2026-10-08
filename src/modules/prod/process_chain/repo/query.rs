@@ -74,6 +74,37 @@ impl ProcessChainRepo {
         .await
     }
 
+    /// 2026-10-09 新增：取链内**第一道**未软删 step（`sort_order ASC, id ASC LIMIT 1`）。
+    ///
+    /// 消费方是 `prod::queue::service::dispatch::dispatch_single`：有工序链的工单
+    /// 按**链首**工序下发（2026-10-09 起的不变式，见
+    /// `shared::batch::chain` 模块 doc 的背景段）。口径与端点 5
+    /// `preview_auto_dispatch` 的 `LEFT JOIN LATERAL … ORDER BY pcs.sort_order ASC,
+    /// pcs.id ASC LIMIT 1` 逐条相同 —— 预览说「可下发到首道工序」，写端点就必须真的
+    /// 下发到首道，否则「前端照 preview 显示的值操作，落库却是另一道」。
+    ///
+    /// 返回 `(step_id, process_id)`；`None` = 链内一个未软删 step 都没有（链被软删
+    /// 时 `t_part.process_chain_id` 仍是旧 id，会走到这里）。**没有**「链内工序
+    /// 歧义」这一返回：取的是链首，与链内 `process_id` 是否重复无关。
+    ///
+    /// 走运行时 `sqlx::query_as`（与同文件 `resolve_step_id_by_process` 同款）：
+    /// 只投影两个列，进 `.sqlx/` 离线缓存带来的维护成本高于收益。
+    pub async fn first_step_in_chain<'e, E: PgExecutor<'e>>(
+        executor: E,
+        chain_id: i64,
+    ) -> Result<Option<(i64, i64)>, sqlx::Error> {
+        let row: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT id, process_id FROM t_process_chain_step \
+             WHERE chain_id = $1 AND deleted_at IS NULL \
+             ORDER BY sort_order ASC, id ASC \
+             LIMIT 1",
+        )
+        .bind(chain_id)
+        .fetch_optional(executor)
+        .await?;
+        Ok(row)
+    }
+
     /// 2026-09-16 PR-3 批次 step 化：在指定 chain 内按 process_id 解析 step_id。
     ///
     /// 用于：

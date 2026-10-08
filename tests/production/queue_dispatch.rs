@@ -215,6 +215,50 @@ async fn insert_shelf_process_mapping_state(
     shelf_id
 }
 
+/// 直插一条**链 + 链首 step**，返回 `(chain_id, step_id)`。
+///
+/// 2026-10-09：dispatch 的不变式改成「有链时按链首工序下发」，故集成测试必须能
+/// 造出「已绑链的 PENDING 批次」。`sort_order` 用 10（稀疏）—— dispatch 取链首
+/// 按 `sort_order ASC, id ASC LIMIT 1`，与端点 5 `preview_auto_dispatch` 同形。
+async fn insert_chain_with_step(pool: &PgPool, process_id: i64) -> (i64, i64) {
+    use hsh_erp_rust::infra::clock::now_naive;
+    let chain_id = hsh_erp_test_support::shared_test_snowflake().next_id();
+    let step_id = hsh_erp_test_support::shared_test_snowflake().next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, \
+         updated_at, updated_by) VALUES ($1, 'chain-disp', 0, $2, 0, $2, 0)",
+    )
+    .bind(chain_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_part_process_chain");
+    sqlx::query(
+        "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, \
+         estimated_minutes, version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, 10, $3, 30, 0, $4, 0, $4, 0)",
+    )
+    .bind(step_id)
+    .bind(chain_id)
+    .bind(process_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_process_chain_step");
+    (chain_id, step_id)
+}
+
+/// 把 part 绑到某条链上（`insert_part` 建的是无链 part）。
+async fn bind_part_to_chain(pool: &PgPool, part_id: i64, chain_id: i64) {
+    sqlx::query("UPDATE t_part SET process_chain_id = $1 WHERE id = $2")
+        .bind(chain_id)
+        .bind(part_id)
+        .execute(pool)
+        .await
+        .expect("bind part to chain");
+}
+
 // ===========================================================================
 //  Tests
 // ===========================================================================
@@ -972,6 +1016,144 @@ async fn dispatch_part_without_process_chain_appears_in_pool() {
         count >= 1,
         "process {process_a} 的候选批次数应 ≥ 1，实际 {count}: {snap_env}"
     );
+}
+
+/// 2026-10-09：dispatch 的新不变式 —— **已绑链工单按链首工序下发**，step 指针落
+/// 链首 step，请求里的 `target_process_id` 被忽略（它只是无链时的回落值）。
+///
+/// 与场景 12（无链回落）成对：两条路径一起钉住，「有链走链首 / 无链走请求」这个
+/// 二分不会被单边改动悄悄改掉。请求传的是 `process_b`（**不是**链首），若实现
+/// 回落了它，本测试的 `current_process_id` / 货架两项断言都会红。
+#[tokio::test]
+async fn dispatch_chained_part_uses_chain_head_process_and_step() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let head_process = fx.process_a_id; // 链首工序
+    let requested_process = fx.process_b_id; // 请求里传的那道（应被忽略）
+
+    let customer_id = insert_customer_l2(&pool, "ACME-CHAIN").await;
+    let part_id = insert_part(&pool, customer_id).await;
+    let (chain_id, head_step_id) = insert_chain_with_step(&pool, head_process).await;
+    bind_part_to_chain(&pool, part_id, chain_id).await;
+    let batch_id = insert_part_batch(&pool, part_id).await;
+    // 两道工序都配货架映射：差异只在「用谁的工序去解析货架」
+    let head_shelf = insert_shelf_process_mapping_state(
+        &pool,
+        "SH-CHAIN-HEAD",
+        head_process,
+        "PRODUCTION",
+        true,
+        false,
+        0,
+    )
+    .await;
+    insert_shelf_process_mapping_state(
+        &pool,
+        "SH-CHAIN-REQ",
+        requested_process,
+        "PRODUCTION",
+        true,
+        false,
+        0,
+    )
+    .await;
+
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/queue/dispatch",
+            Some(json!({
+                "targets": [{
+                    "batch_id": batch_id.to_string(),
+                    "target_process_id": requested_process.to_string(),
+                }]
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "dispatch: {env}");
+    let item = &env["data"]["succeeded"][0];
+
+    // 出参：step 指针 = 链首 step id（本字段是 JSON number，不带字符串化器）
+    assert_eq!(
+        item["current_process_step_id"],
+        json!(head_step_id),
+        "有链工单 dispatch 后 current_process_step_id 应 = 链首 step id: {env}"
+    );
+    assert_eq!(
+        item["current_process_id"],
+        head_process.to_string(),
+        "有链工单按链首工序下发（≠ 请求里的 target_process_id）: {env}"
+    );
+    assert_eq!(
+        item["shelf_id"],
+        head_shelf.to_string(),
+        "货架按链首工序解析: {env}"
+    );
+
+    // DB 层：权威锚点在库里（出参可能只是回显）
+    let (cpid, step): (Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT current_process_id, current_process_step_id FROM t_part_batch WHERE id = $1",
+    )
+    .bind(batch_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read dispatched batch");
+    assert_eq!(cpid, Some(head_process));
+    assert_eq!(step, Some(head_step_id));
+}
+
+/// 2026-10-09：**无链工单** dispatch 仍按请求的 `target_process_id` 回落，
+/// `current_process_step_id` 落 NULL —— 与上条成对，逐字保持旧行为。
+///
+/// 场景 12 已经从 DB 层钉了这两列；本条补的是**出参**层（`DispatchSuccessItem`
+/// 的两个字段），因为出参这轮从「诚实置 None」改成了「填真实写入值」，改错了
+/// 只有断言出参才测得出来。
+#[tokio::test]
+async fn dispatch_no_chain_part_falls_back_to_target_process_and_null_step() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let process_a = fx.process_a_id;
+
+    let customer_id = insert_customer_l2(&pool, "ACME-NOCHAIN2").await;
+    let part_id = insert_part(&pool, customer_id).await;
+    let batch_id = insert_part_batch(&pool, part_id).await;
+    insert_shelf_process_mapping(&pool, process_a).await;
+
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/queue/dispatch",
+            Some(json!({
+                "targets": [{
+                    "batch_id": batch_id.to_string(),
+                    "target_process_id": process_a.to_string(),
+                }]
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "dispatch: {env}");
+    let item = &env["data"]["succeeded"][0];
+    assert_eq!(
+        item["current_process_id"],
+        process_a.to_string(),
+        "无链工单按请求的 target_process_id 下发: {env}"
+    );
+    assert_eq!(
+        item["current_process_step_id"],
+        serde_json::Value::Null,
+        "无链工单没有链首可落，step 出参应为 null: {env}"
+    );
+    let step: Option<i64> =
+        sqlx::query_scalar("SELECT current_process_step_id FROM t_part_batch WHERE id = $1")
+            .bind(batch_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read dispatched batch");
+    assert_eq!(step, None, "无链工单 → step 恒 NULL");
 }
 
 // ===========================================================================

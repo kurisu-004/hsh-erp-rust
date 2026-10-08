@@ -142,6 +142,21 @@
 - `AutoDispatchResult`：`{ items: AutoDispatchItem[] }`。`skip_reason` ∈ `NOT_FOUND` / `NO_PROCESS_CHAIN` / `NO_PROCESS_STEP` / `NO_SHELF` / `null`（可下发）。
 - `RecallOut`：**3 字段** `{ batch_id: string, part_id: string, version: number }`。`version` 是写入后的 `version + 1`（OCC 锚），前端下一次对本批次的操作必须带这个值。
 
+### 3.1 端点 4 的下发口径（2026-10-09）
+
+**有链时按下发链首工序 + 指针落链首 step；无链时回落 `target_process_id`。**
+
+| 工单形态 | `current_process_id` | `current_process_step_id` | 货架解析基准 |
+|---|---|---|---|
+| `t_part.process_chain_id IS NOT NULL` | 链内第一道未软删 step 的 `process_id`（`sort_order ASC, id ASC LIMIT 1`） | 链首 step 的 id | 链首工序 |
+| `t_part.process_chain_id IS NULL`（手工工单的常态） | 请求里的 `target_process_id` | `NULL` | 请求里的 `target_process_id` |
+
+- **有链时请求里的 `target_process_id` 被忽略**（它只是无链时的回落值）。前端要展示「实际下发到哪道工序」读 `DispatchSuccessItem.current_process_id`，读 `target_process_id` 会在有链时显示成用户随手传的那道。
+- 与端点 5 `auto_dispatch_preview` 的 `first_process_id` **同源**（都取链首，见 `ProcessChainRepo::first_step_in_chain`），故「照 preview 显示的值操作」与「实际落库」一致。
+- 链存在但**链内一个未软删 step 都没有**（链被软删 / 已清空）→ `20702 BIZ_PROCESS_CHAIN_STEP_NOT_FOUND`（HTTP 404），批次保持 `PENDING` 不被写脏。不新造错误码：`20702` 原语义是「链内找不到某工序」，本处是「链内一道都没有」，两者都指向同一个动作 —— 去修链。
+- `shared::batch::status::BATCH_STATUS_UPDATE_SQL` 的 `current_process_step_id = CASE WHEN $14 THEN NULL ELSE COALESCE($6::bigint, current_process_step_id) END` 早已支持两种写法，dispatch 侧只改传参（`new_process_step_id` / `clear_process_step_id: false`），**SQL 文本逐字未动**。
+- 出参 `DispatchSuccessItem.current_process_step_id` 由「恒 `null`」改为**真实写入值**（JSON number，不带字符串化器，与同 VO 的 `batch_id` 等不同）。
+
 ## 4. 口径表
 
 ### 4.1 候选池判据（`status` / `location` 两列在 3 处一致，**货架 JOIN 不一致**）
@@ -316,6 +331,19 @@ queue 域**整体不适用**域隔离护栏：它继承 worker_pool 的「经本
 10. **`POST /queue/move` 的 `version` 升为必填**（2026-10-09）：此前三个方向都由 service 用「本次事务里刚读到的 `batch.version`」当 `expected_version`，等价于**没有 OCC** —— 看板数据是 30s 缓存的快照，期间他人改过批次时「用户看到 5 件 → 实际移动 3 件」会静默成功。值取候选卡 / 持有卡的 `version`；漏传 → **HTTP 422 纯文本**（`version` 无 `#[serde(default)]`）。
 
 ### 8.4 已知偏差登记
+
+**存量批次的 `current_process_step_id` 为 NULL 或陈旧**（2026-10-09 新增登记）。
+
+`current_process_step_id`（链内位置指针）自 2026-10-09 起才真正随工序推进：dispatch 落链首 step、worker-scan RETURNED 顺工序时推进到下一 step。**在此之前走过至少一次领取 / 放回的存量批次，其指针恒为 NULL**（dispatch 旧实现 `clear_process_step_id: true` 把它清成 NULL，RETURNED 旧实现算出了下一个 step 却丢弃），另有一批「指针停在首次定位那一步」的陈旧数据。
+
+影响面与自愈路径：
+
+- 读侧 `GET /parts/by-worker/{worker_id}` 的 `chain_state` **不受影响** —— 它按 `current_process_id` 在锚链内重新定位（纪律见 `shared::batch::chain` 模块 doc），不依赖指针。
+- 写侧 worker-scan RETURNED 的「自动推进」分支**对存量批次不生效**：指针为 NULL 或陈旧时 `ChainPosition::is_pointer_consistent` 为 false，走「要求前端显式指定 `next_process_id`」分支。前端体验上就是「本来能免填的字段现在要填」，功能不受损。
+- `has_process_chain` 那类按「指针的工序 == 当前工序」判定的卡片列，在 `current_process_id` 非 NULL 时对陈旧指针与 NULL 指针同样落 `false`，语义自洽。
+- 自愈需要**重新走一次流转**（再走一次 dispatch / RETURNED / 池内移动）才会被重定位。存量数据清洗不在本轮范围内；前端不要把「绿色左边框缺失」当成新缺陷上报。
+
+---
 
 **端点 1 的 `pool_count` 可能大于端点 2 的 `items.length`（差值 = 指向已软删货架的批次数）。**
 
