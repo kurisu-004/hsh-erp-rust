@@ -1,11 +1,11 @@
 //! user 域 repo 集成测试 —— UserRepo 子集（PR13 Phase D 拆分）
 //!
 //! ## 拆分映射（原 1164 行 user_repo.rs → 3 文件）
-//! - basic.rs   ← UserRepo 24 例（user CRUD/query/update/touch_login/refresh_token/密码轮转）
-//! - role.rs    ← UserRoleRepo + MenuRepo + ShelfRepo 16 例
+//! - basic.rs   ← UserRepo 26 例（user CRUD/query/update/touch_login/refresh_token/密码轮转）
+//! - role.rs    ← UserRoleRepo + MenuRepo + ShelfRepo 22 例
 //! - password.rs ← 多表组合事务 + 事务边界 + 3 个补充集成测试 7 例
 //!
-//! 本文件 24 例：覆盖 `iam/repo/sql/user.rs` 10 个固有方法（happy + error）。
+//! 本文件 26 例：覆盖 `iam/repo/sql/user.rs` 10 个固有方法（happy + error）。
 //!
 //! ## 测试并行注意
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
@@ -14,7 +14,7 @@
 //! ## 事务迁移（2026-09-21）
 //! 原 2 例 SqlxUoW commit / drop 语义测试已删除——`uow.rs` 全家删除后 UoW 不再存在，
 //! 事务由 handler 层 `state.pool.begin()` 管；handler 层语义回归改由
-//! `tests/iam/api.rs`（HTTP 契约测试，强回归网）承担。本文件保留 SQL/repo 层 47 例。
+//! `tests/iam/api.rs`（HTTP 契约测试，强回归网）承担。本文件保留 SQL/repo 层 26 例。
 //!
 //! ## Fixture 范本化（2026-09-24 PR13 Phase I）
 //! 本文件原 `#[path = "../common/mod.rs"] mod common;` + `use common::{...};`

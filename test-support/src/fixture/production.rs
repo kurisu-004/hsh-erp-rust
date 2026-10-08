@@ -18,8 +18,11 @@
 //! 自有行（ID 段 60+）。
 //!
 //! ## 当前域
-//! - `production`：2 INHOUSE 工序（FX-PROC-A / FX-PROC-B）+ 2 工种
-//!   （FX-WT-A / FX-WT-B）+ 2 work_type_process 映射。不预置 t_part /
+//! - `production`：2 INHOUSE 工序（FX-NA / FX-NB）+ 2 工种
+//!   （FX-WTA / FX-WTB）+ 2 work_type_process 映射。这 4 个 code 是为避开
+//!   `part.sql` 复用基线那 2 行而另取的（code 唯一约束，理由写在
+//!   `fixtures/production.sql` 的 ID 段注释里）——**不要**按 `part.sql` 侧的
+//!   名字把它们「订正」回去。不预置 t_part /
 //!   t_part_batch / t_part_process_chain / t_process_chain_step / t_worker
 //!   行：各 sub-file 按需用 sqlx::query 直插（process / work_type / worker
 //!   域测试常需要特定 code / status / work_type_id / 数量，状态机不允许从这些

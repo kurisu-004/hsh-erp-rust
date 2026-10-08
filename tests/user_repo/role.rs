@@ -1,11 +1,12 @@
 //! user 域 repo 集成测试 —— UserRoleRepo / MenuRepo / ShelfRepo 子集（PR13 Phase D 拆分）
 //!
 //! ## 拆分映射（原 1164 行 user_repo.rs → 3 文件）
-//! - basic.rs   ← UserRepo 24 例
+//! - basic.rs   ← UserRepo 26 例
 //! - role.rs    ← UserRoleRepo 16 + MenuRepo 4 + ShelfRepo 2 = 22 例（本文件）
 //! - password.rs ← 多表组合事务 + 事务边界 + 3 个补充集成测试 7 例
 //!
-//! 本文件 22 例：覆盖 `iam/repo/sql/{user_role,menu,shelf}.rs` 共 7 个固有方法。
+//! 本文件 22 例：覆盖 `iam/repo/sql/{user_role,menu,shelf}.rs` 共 8 个固有方法
+//! （user_role 6 + menu 1 + shelf 1）。
 //! 22 例**已含**针对 `seeds/menu.sql` 的那条自锁断言（`MenuRepo` 4 例之一，不碰
 //! DB），不是 22 之外再加的第 23 条。
 //!

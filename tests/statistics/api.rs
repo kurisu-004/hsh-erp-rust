@@ -21,7 +21,7 @@
 //! 保留本地 helper `insert_work_type` / `insert_worker` / `insert_part` /
 //! `insert_l1_customer` / `insert_l2_customer`：statistics 域测试每个用例
 //! 都要按需造不同 code / badge / prefix / name 的行（与 fixture 预置的
-//! FX-WT-STAT / FX-W-STAT baseline 不同），保留本地 fn 直插。
+//! FX-WT-STAT baseline 不同），保留本地 fn 直插。
 //!
 //! ## 不预置 part / batch / event / pickup_skip_event
 //! statistics 域状态机不允许从 IN_PROCESS / COMPLETED 回退 PENDING，且事件行

@@ -38,7 +38,7 @@
 --  INSPECTION_SHELF_ID=14, PRODUCTION_SHELF_ID=15, MANAGER_USER_ID=16, ...
 -- ============================================================================
 
--- ---- 工序（INHOUSE 类别 FX-SHP；不与 part.sql FX-PROC-A / production.sql FX-NA/FB 重复）----
+-- ---- 工序（INHOUSE 类别 FX-SHP；不与 part.sql FX-PROC-A / production.sql FX-NA/FX-NB 重复）----
 INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, version, created_at, updated_at)
 VALUES
   (9000000000000000080, 'FX-SHP', 'FX 货架工序', 'INHOUSE', 0, false, 0, now(), now());

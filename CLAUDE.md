@@ -461,7 +461,7 @@ t_assembly.status               ← 派生缓存
 | `src/infra/snowflake.rs` | 8 | **被测对象自身**的位布局 / sequence 回绕 / epoch / `MAX_INSTANCE` panic 边界单测 |
 | **合计** | **11** | 4 个文件 |
 
-`tests/**` 侧取号调用点：`pool_snowflake()`（兼容薄壳）**129** 处、`shared_test_snowflake()` **240** 处。
+`tests/**` 侧取号调用点：`pool_snowflake()`（兼容薄壳）**129** 处、`shared_test_snowflake()` **238** 处。
 
 **新规约：进程内只从唯一源取号**（任何一类的测试代码都不得再 `SnowflakeIdGenerator::new` 另起一条 id 流）：
 

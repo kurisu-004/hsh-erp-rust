@@ -28,8 +28,10 @@
 //! - part_event / pickup_skip_event 都是测试现场按 event_type / worker_id /
 //!   part_id / created_at 构造，fixture 不预置避免污染；
 //! - **t_worker 不预置**：`StatisticsService::worker_stats` 按日期范围列出全部工人，
-//!   用例的 list 断言要求行数严格等于自建工人数，预置 1 个
-//!   worker 会多出一行破坏断言；各 sub-file 用本地
+//!   而该方法当前**无** happy-path 集成测试（见 `CLAUDE.md`「覆盖空洞登记」）。
+//!   不预置的理由是**前瞻约束**、不是对现有断言的描述：将来任何按行数断言
+//!   worker_stats 列表的用例，预置的 1 个 worker 都会让行数比「测试自建工人数」
+//!   多出一行；各 sub-file 用本地
 //!   `insert_worker(&pool, badge, name, Some(wt))` 按需造 badge / 名称 / 工种。
 //!
 //! fixture 仅放 1 工种 baseline（提供强类型 `fx.work_type_id` 句柄），给
