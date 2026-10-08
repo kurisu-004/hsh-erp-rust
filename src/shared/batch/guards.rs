@@ -19,18 +19,31 @@
 //!
 //! 「写进 `current_holder_id` 的架必须映射批次的当前工序」这条守卫已**被选架本身
 //! 覆盖**：`shared::shelf::select::pick_least_loaded` 的候选集只含
-//! `t_shelf_process` 里映射了该工序的行（带 `deleted_at IS NULL` 闸门）。8 条写路径
-//! 全部改走选架之后，本函数零调用方 ⇒ 删除。若将来重新引入「调用方指定货架」的写
+//! `t_shelf_process` 里映射了该工序的行（带 `deleted_at IS NULL` 闸门）。全部写路径
+//! 改走选架之后，本函数零调用方 ⇒ 删除。若将来重新引入「调用方指定货架」的写
 //! 路径，**不要**恢复这个函数，而是在选架 SQL 里加同样的 `EXISTS` 谓词 —— 让守卫留在
-//! 一处，别再分成「选架一次 + 事后校验一次」两个可能漂移的判定。
+//! 一处，别再分成「选架一次 + 事后校验一次」两个可能漂移的判定。同理
+//! `ShelfProcessRepo::exists_for_shelf_process` 也已删除（零调用方）。
 //!
-//! `current_holder_id`（= 货架）的写点全仓恰好 3 个，本批全部覆盖、无遗留：
-//! ① `dispatch_single`（`update_batch_dispatched`，货架由 `pick_least_loaded`
-//! 从映射里**选出** ⇒ 谓词下沉到该函数的候选集）；
-//! ② `move_batch` WORKER→POOL（`prod::queue` 的 move 端点，货架来自请求 ⇒
-//! `validate_shelf_zone` + `ShelfProcessRepo::exists_for_shelf_process`）；
-//! ③ `worker_scan` RETURNED（货架来自 `pick_least_loaded`）。改任一处都请先回到
-//! 这条清单核对。
+//! ## `current_holder_id` 的写点：写货架的**全部**走 `pick_least_loaded`
+//!
+//! 这是本文件存在的理由 —— 「写进 `current_holder_id` 的架必须满足的一组谓词」应当
+//! **只在一处**（选架的候选集），而不是每个写点各判一次。故此处登记全量写点清单：
+//! 新增 / 修改任何写 `current_holder_id` 的路径时，回来核对它有没有绕过选架。
+//!
+//! **写货架（14 处，全部 `shared::shelf::select::pick_least_loaded`）**
+//!
+//! | 目标区 | 调用点 |
+//! |---|---|
+//! | `PRODUCTION`（按工序筛候选） | `to_process_core`（含检验不合格打回生产架的 `mark_batch_failed_inspection`）/ `place_on_shelf` / `release_from_programming` / `worker_scan` RETURNED / `move_batch` WORKER→POOL / `complete_repair` 与 `repair_dispatch` 的回生产臂 / `outsource::move` 回收生产 / `dispatch_single`（走 `update_batch_dispatched`，不经本文件） |
+//! | `INSPECTION`（无工序映射，只按 zone 筛） | `to_inspection_core`（单件与批量共用同一次选架）/ `scan_inspect` / `complete_repair` 与 `repair_dispatch` 的回品检臂 / `sent_to_inspection`（worker-scan 的 `INSPECTED` 分支与链尾自动送检两处共用） |
+//!
+//! **写非货架 holder（不要混进上面那张表）**：`pickup` / `take_one_from_pool` /
+//! `take_specific_from_pool` / `move_worker_to_worker` 写 worker id；
+//! `outsource::move` 的发送方向写外协公司 id；`recall` 清 NULL。
+//!
+//! ⚠️ 计数会随端点增删漂移，故上面按「目标区 + 调用点」列而不是只写个数字 ——
+//! 判断一个写点是否合规，看的是「它拿到货架 id 的那一步有没有走选架」，不是清单长度。
 
 use sqlx::PgConnection;
 

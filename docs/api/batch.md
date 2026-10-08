@@ -182,7 +182,7 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
 
 2026-10-07 一行迁走的是待品检队列读的整条链路（`dto` / `vo` / `model` 行结构 / `repo/list.rs` / `service/list.rs`）→ `prod::inspection`，契约见 [`inspection.md`](inspection.md)。
 
-2026-10-09 外协三端点合并为 `POST /api/v2/outsource-queue/move`（`outsource` 域，硬切无 alias）。一并搬走的代码：`prod::batch/service/outsource.rs`（整文件，含三个 service 方法 + DIRECT 占位报价解析 + 开口 shipment 关闭两个自由函数）、`handler/lifecycle.rs` 的三个 handler、`dto.rs` 的三个入参（`SendToOutsourceRequest` / `ReceiveFromOutsourceRequest` / `ReceiveFromOutsourceToInspectionRequest`）。同时删掉的三个 WS 事件名（`PART_SENT_TO_OUTSOURCE` / `PART_RECEIVED_FROM_OUTSOURCE` / `PART_RECEIVED_FROM_OUTSOURCE_INSPECTED`）合并为 `OUTSOURCE_MOVE_DONE`；`t_part_event` 的三个审计字面量（`SENT_TO_OUTSOURCE` / `RECEIVED_FROM_OUTSOURCE` / `RECEIVED_TO_INSPECTION`）逐字保留。契约见 [`outsource.md`](outsource.md)。
+2026-10-09 外协三端点合并为 `POST /api/v2/outsource-queue/move`（`outsource` 域，硬切无 alias）。一并搬走的代码：`prod::batch/service/outsource.rs`（整文件，含三个 service 方法 + DIRECT 占位报价解析 + 开口 shipment 关闭两个自由函数）、`handler/lifecycle.rs` 的三个 handler、`dto.rs` 的三个入参（`SendToOutsourceRequest` / `ReceiveFromOutsourceRequest` / `ReceiveFromOutsourceToInspectionRequest`）。同时删掉的三个 WS 事件名（`PART_SENT_TO_OUTSOURCE` / `PART_RECEIVED_FROM_OUTSOURCE` / `PART_RECEIVED_FROM_OUTSOURCE_INSPECTED`）合并为 `OUTSOURCE_MOVE_DONE`；`t_part_event` 的审计字面量 `SENT_TO_OUTSOURCE` / `RECEIVED_FROM_OUTSOURCE` 逐字保留（第三个 `RECEIVED_TO_INSPECTION` 随 2026-10-10 的 `OUTSOURCE_COMPANY → INSPECTION_SHELF` 方向下线而不再被写入，见 §0b）。契约见 [`outsource.md`](outsource.md)。
 
 2026-10-09 拆批端点提升为顶层共用端点。它的消费方有**三处**（生产队列看板 / 外协看板 / 零件详情页），按「目标域按前端消费方判定」的规约它属多域共用 —— 挂在 `/prod/batches/{batch_id}/…` 这条「批次子资源」路径下既不贴切、也拿不掉路径参数（顶层前缀下 `/{id}/…` 会与别的 `/batches/*` 端点争 matchit 段位）。代码侧 `handler::split_router` 是**第二个** router 工厂（不动 `router()`），经 `prod::split_router()` 转发、由 `src/modules/mod.rs::v2_router()` 的 `.nest("/batches", …)` 挂载。service / repo / WS 事件名 `PART_BATCH_SPLIT` 与 payload **一行未改**，只有入参形状（`batch_id` 入 body）与出参（`BatchSplitOut`）变了。
 
@@ -289,5 +289,7 @@ t_assembly.status               ← 派生缓存
   货架」承担（生产 `20508` / 品检 `40301`）。
 - **`20507 BIZ_SHELF_PROCESS_NOT_MAPPED` 在本域不再触发**（2026-10-10）。它原先守的是
   「你指定的这个架没有映射这道工序」；选架的候选集本身就只含映射了该工序的架，判据
-  没被削弱、只是换了个更前置的形态（没有映射 ⇒ 候选为空 ⇒ 选不出）。该码在全仓仍有
-  其它触发点（`prod::queue::move` 的 WORKER→POOL 分支）。
+  没被削弱、只是换了个更前置的形态（没有映射 ⇒ 候选为空 ⇒ 选不出）。
+  ⚠️ **2026-10-10 起该码在全仓零触发点** —— 最后一个触发点（`prod::queue::move` 的
+  WORKER→POOL 映射校验）随 `to` 侧货架入参移除一并退场，只剩 `shared::error` 里的
+  常量与码名测试。前端若还有分支 20507 的代码，那是死分支。

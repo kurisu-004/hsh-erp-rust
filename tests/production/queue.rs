@@ -28,10 +28,12 @@
 //!  18. move_worker_to_pool_picks_least_loaded_shelf
 //!      （2026-10-10：撤回候选池的目标架按 `current_load / capacity` 升序自动选；
 //!      `to` 侧无 `shelf_id`，断言落负载最低的架而非 display_order 最小的架）
-//!  19. move_worker_to_pool_rejects_when_no_usable_shelf_for_process
+//!  19. move_worker_to_pool_never_lands_on_unmapped_shelf
+//!      （20507 退役后的端点级等价不变量：更靠前且完全空的**未映射**架也不能被选中）
+//!  20. move_worker_to_pool_rejects_when_no_usable_shelf_for_process
 //!      （2026-10-10 `current_holder_id` 写脏守卫（自动选架形态）：批次当前工序唯一
 //!      映射的货架已软删 / 已停用 / 是品检架 ⇒ 选架候选为空 → 20508，批次不被写脏）
-//!  20. move_worker_to_pool_no_process_still_lands_on_production_zone_shelf
+//!  21. move_worker_to_pool_no_process_still_lands_on_production_zone_shelf
 //!      （同上，但 `current_process_id=NULL` ⇒ 选架不按工序筛候选的那条分支；
 //!      断言 zone 谓词**仍然生效**，批次不会落到品检架）
 //!  20. move_{pool_to_worker|worker_to_pool|worker_to_worker}_stale_version_returns_40901
@@ -984,8 +986,10 @@ async fn worker_scan_returned_advances_current_process_id() {
 /// `is_pointer_consistent = false`。**不能靠把指针清成 NULL**：那样断言 4 恒成立
 /// （本来就是 NULL），`COALESCE` 保留语义就失去覆盖。改把指针指向**另一条链**上挂
 /// 了**别的工序**的 step —— 锚链回退到那条链、按 `pb.current_process_id` 重定位落空、
-/// `is_pointer_consistent` 为 false；`chain_state` 同时落 `TAIL`，但链尾自动送检要求
-/// 两者同时成立，所以落 else 分支并解出 `step = None`。
+/// `is_pointer_consistent` 为 false；`chain_state` 落 `NONE`（`cur2` 是内连接 LATERAL，
+/// 0 行会丢掉整个 joined 行，取不到 TAIL 那条臂），链尾自动送检要求
+/// `is_pointer_consistent && TAIL`，两个条件都不满足，于是落 else 分支并解出
+/// `step = None`。
 ///
 /// ## 断言 4 是承重的，不是护栏
 /// `mark_batch_returned` 的 SQL 写的是
@@ -1024,10 +1028,16 @@ async fn worker_scan_returned_without_process_chain_succeeds() {
     //
     // 造漂移后本用例的形态：锚链解析回退到指针所属链（`COALESCE(p.process_chain_id,
     // cur.chain_id)`，本 part 无链 ⇒ 取指针所属的 foreign 链），而那条链里**没有**
-    // `pb.current_process_id = proc_b` 这个工序 ⇒ 按工序重定位落空、
-    // `current_step_id` 保持 NULL ⇒ `is_pointer_consistent = false`；`chain_state`
-    // 同时落 `TAIL`，但「链尾自动送检」要求两者**同时**成立，所以照样落 else 分支。
-    // 于是 `step_id_opt = None` 绑进 SQL，断言 4 真正钉住 COALESCE 保留语义。
+    // `pb.current_process_id = proc_b` 这个工序 ⇒ 按工序重定位落空 ⇒
+    // `current_step_id` 为 NULL ⇒ `is_pointer_consistent = false`。
+    //
+    // ⚠️ 此时 `chain_state` 落 **`NONE`** 而不是 `TAIL`：`cur2` 在
+    // `CHAIN_POSITION_LATERAL_SQL` 里是 `JOIN LATERAL (…) cur2 ON TRUE`（**内**
+    // 连接），重定位 0 行会把整个 joined 行丢掉，于是取不到 `nsp.id IS NULL ⇒ TAIL`
+    // 那条臂，只能由外层 `COALESCE(nx.chain_state, 'NONE')` 兜底成 `NONE`。
+    // 落 `NONE` 同样不进「链尾自动送检」（那条要求 `is_pointer_consistent && TAIL`，
+    // 两个条件都不满足），所以照样落 else 分支 ⇒ `step_id_opt = None` 绑进 SQL，
+    // 断言 4 真正钉住 COALESCE 保留语义。
     //
     // ⚠️ foreign 链的那道 step **必须**挂 `proc_c`（≠ 批次当前工序 `proc_b`）：若挂上
     // `proc_b`，按工序重定位会正好命中它，`current_step_id == 指针` ⇒ 指针反而变成
@@ -2782,6 +2792,86 @@ async fn move_worker_to_pool_picks_least_loaded_shelf() {
         shelf_b.to_string(),
         "应落负载比例最低的架（20%），不是 display_order 最小的 A（80%）: {env}"
     );
+}
+
+/// WORKER→POOL 绝不会把批次落到**未映射该工序**的架上 —— 20507 那条守卫退役后的
+/// 端点级等价不变量。
+///
+/// 构造：同 zone 有三个架，其中 `UNMAPPED` 既 `display_order` 最靠前（0）又**完全空**
+/// （负载 0）。若端点只按 zone + 负载选、不看映射，它会选 `UNMAPPED`（0 件 < 80 件）；
+/// 正确的行为是映射谓词把它挡在候选集外 ⇒ 落 `MAPPED`。
+///
+/// 选架层已有单元级护栏（`shared::shelf::select::tests::
+/// process_id_restricts_candidates_to_mapped_shelves`）锁那个 `EXISTS` 谓词；本用例锁
+/// 的是「端点真的经由选架」—— 若哪天有人绕过 `pick_least_loaded` 直接写
+/// `current_holder_id`，这里会红。
+#[tokio::test]
+async fn move_worker_to_pool_never_lands_on_unmapped_shelf() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "MPUNMAP").await;
+    let proc = seed_process(&pool, "PROC-MPUM", "工序MPUM").await;
+    let proc_other = seed_process(&pool, "PROC-MPUM2", "工序MPUM2").await;
+    let wt = insert_work_type(&pool, "WT-MPUM", "工种MPUM", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let worker = insert_worker(&pool, "BC-MPUM", "工MPUM", Some(wt)).await;
+
+    // 空架、未映射本工序、display_order 最靠前 —— 「只看 zone+负载」的实现会选它
+    let unmapped = insert_shelf(&pool, "MPUM-UNMAP", "MPUM未映射架", "PRODUCTION").await;
+    sqlx::query("UPDATE t_shelf SET capacity = 100, display_order = 0 WHERE id = $1")
+        .bind(unmapped)
+        .execute(&pool)
+        .await
+        .expect("set unmapped shelf");
+    link_shelf_to_process(&pool, unmapped, proc_other).await;
+
+    let mapped = insert_shelf(&pool, "MPUM-MAP", "MPUM已映射架", "PRODUCTION").await;
+    sqlx::query("UPDATE t_shelf SET capacity = 100, display_order = 1 WHERE id = $1")
+        .bind(mapped)
+        .execute(&pool)
+        .await
+        .expect("set mapped shelf");
+    link_shelf_to_process(&pool, mapped, proc).await;
+    // mapped 装 80 件（比例 80%）—— 仍必须胜过空的 unmapped（0 件）
+    let (_pa, _ba) = insert_pool_part(&pool, customer, "MPUM-LOAD", mapped, proc, 80).await;
+
+    let (_held_part, held_batch, _step) =
+        insert_worker_held_part(&pool, customer, "H-MPUM", worker, proc, 1, true).await;
+
+    let (app, token) = login_manager_with_username(&pool, "admin-mpum").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/queue/move",
+            Some(json!({
+                "batch_id": held_batch.to_string(),
+                "version": 0,
+                "from": { "kind": "WORKER", "worker_id": worker.to_string() },
+                "to":   { "kind": "POOL" },
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "move WORKER→POOL: {env}");
+    assert_eq!(
+        env["data"]["new_holder_id"],
+        mapped.to_string(),
+        "必须落映射了本工序的架；未映射的架哪怕更空也不该被选: {env}"
+    );
+    assert_ne!(
+        env["data"]["new_holder_id"],
+        unmapped.to_string(),
+        "绝不能落到未映射 {proc} 的架上（20507 退役后的等价不变量）"
+    );
+
+    let holder: Option<i64> =
+        sqlx::query_scalar("SELECT current_holder_id FROM t_part_batch WHERE id = $1")
+            .bind(held_batch)
+            .fetch_one(&pool)
+            .await
+            .expect("read holder");
+    assert_eq!(holder, Some(mapped));
 }
 
 /// 该工序唯一映射的货架不可用（已软删 / 已停用 / 品检区）→ 20508 且批次不被写脏。

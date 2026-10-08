@@ -15,9 +15,12 @@
 //! 平级单文件形态，不是 `sql.rs`/`mod.rs` 目录拆分的继任者）：
 //! - 4 个「平移」方法（`list_by_shelf` / `list_all_active_mappings` /
 //!   `soft_delete_all_for_shelf` / `bulk_insert`）SQL 与方法签名**零 diff**
-//! - 新增 2 个「收口」方法（`find_first_shelf_for_process` /
-//!   `exists_for_shelf_process`）供 prod 域内部调用方改调，消灭手写 `t_shelf_process`
-//!   SQL（`prod::batch` / `prod::queue` 各 1 处）
+//! - 新增「收口」方法 `find_first_shelf_for_process` 供 prod 域内部调用方改调，消灭手写
+//!   `t_shelf_process` SQL（`prod::batch` / `prod::queue` 各 1 处）。
+//!   ⚠️ 2026-10-10：另一个收口方法 `exists_for_shelf_process` 已删除 —— 它唯一的服务
+//!   对象（`move_batch` WORKER→POOL 的映射校验）随目标货架自动选架一并退场，方法零
+//!   调用方。**不要**恢复它：要判「架是否映射该工序」就在选架 SQL 的候选集里用
+//!   `EXISTS`（见 `shared::shelf::select`），让谓词只留一处。
 //!
 //! ## 本仓内保留 inline 的 `t_shelf_process` SQL（2026-10-02 判定，不要硬抽）
 //! - `prod::batch::repo::preview_auto_dispatch` —— `LEFT JOIN LATERAL t_shelf_process`
@@ -215,36 +218,5 @@ impl ShelfProcessRepo {
         .fetch_optional(executor)
         .await?;
         Ok(row.flatten())
-    }
-
-    /// 存在性检查：该 shelf 是否映射了该 process。
-    ///
-    /// 2026-10-02 新增：原为 `prod::queue::service::move_batch` WORKER→POOL
-    /// 分支里的内联 SQL
-    /// `SELECT shelf_id FROM t_shelf_process WHERE shelf_id=$1 AND process_id=$2
-    ///  AND deleted_at IS NULL ORDER BY sort_order ASC, id ASC LIMIT 1` +
-    /// `mapped.is_none()` 判定 —— 该写法是**恒真式**（只 SELECT 一列后判空，实际只判
-    /// 「是否存在」，拿到的 `shelf_id` 恒等于入参 `$1`，`ORDER BY … LIMIT 1` 也是
-    /// 冗余）。本方法改用 `SELECT EXISTS(…)` 把「存在性」语义显式化，与原逻辑
-    /// **语义等价**（同一组 WHERE 谓词 + 同一 `deleted_at IS NULL` 守卫），20507
-    /// `BIZ_SHELF_PROCESS_NOT_MAPPED` 的触发条件与文案保持不变。
-    pub async fn exists_for_shelf_process<'e, E: PgExecutor<'e>>(
-        executor: E,
-        shelf_id: i64,
-        process_id: i64,
-    ) -> Result<bool, sqlx::Error> {
-        let exists: bool = sqlx::query_scalar(
-            r#"
-            SELECT EXISTS(
-                SELECT 1 FROM t_shelf_process
-                WHERE shelf_id = $1 AND process_id = $2 AND deleted_at IS NULL
-            )
-            "#,
-        )
-        .bind(shelf_id)
-        .bind(process_id)
-        .fetch_one(executor)
-        .await?;
-        Ok(exists)
     }
 }
