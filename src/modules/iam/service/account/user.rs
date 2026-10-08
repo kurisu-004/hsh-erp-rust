@@ -5,14 +5,14 @@
 //! （`list_user_roles_*` 属于「读账号带出角色」的组装动作，故留在本文件）。
 //!
 //! ## 乐观锁（OCC）约定
-//! 三个写端点（`update_user` / `deactivate_user` / `admin_reset_password`）的
-//! `version` 来自**客户端 body**（`req.version` / 显式形参），不是 service 自己
-//! 从 DB 读来的。看板数据是 30s 缓存的快照，「读-再-比」式隐式 OCC 会让
-//! 「用户看到 5 件 → 实际只动 3 件」静默成功。service 内的
-//! `get_user_by_id` 只用于 404 归因（区分「不存在」与「版本冲突」）。
-//!
-//! `admin_reset_password` 是幂等端点，在 OCC 豁免清单里（`CLAUDE.md` 约定），
-//! 仍按 service 读到的 version 写。
+//! `version` 有两个来源，按端点分：
+//! - **客户端 body 传入**（`update_user` 的 `req.version` / `deactivate_user` 的
+//!   `expected_version`）。看板数据是 30s 缓存的快照，「读-再-比」式隐式 OCC 会让
+//!   「用户看到 5 件 → 实际只动 3 件」静默成功；这类端点里 service 的
+//!   `get_user_by_id` 只用于 404 归因（区分「不存在」与「版本冲突」）。
+//! - **service 从 DB 读到**：`admin_reset_password`（OCC 豁免的幂等端点，
+//!   `CLAUDE.md` 的豁免清单登记了这一条）与 `change_own_password`（必须先读出
+//!   `password_hash` 才能校验旧密码，本仓改密端点一律不收 OCC 锚点）。
 
 use crate::auth::password;
 use crate::auth::rbac::{CurrentUser, Role};
@@ -269,6 +269,9 @@ impl AccountService {
     /// 允许本人或 MANAGER 调用。**不**再自己清 Redis session——handler 在 commit 之后
     /// 调 `state.session.delete_all_user_sessions(user_id)`（best-effort）。DB 的
     /// `refresh_token_version` 轮转是兜底。
+    ///
+    /// 条件写用读到的 `u.version`（该端点不收 OCC 锚点：改密是本人显式操作，不与
+    /// 看板上的账号编辑争并发）。
     pub async fn change_own_password<R: IamRepoTrait>(
         &self,
         mut repo: R,

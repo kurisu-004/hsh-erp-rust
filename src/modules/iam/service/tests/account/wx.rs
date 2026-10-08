@@ -1,19 +1,21 @@
-//! `AccountService` 的 `t_wx_identity` 子块单测（11 用例）
+//! `AccountService` 的 `t_wx_identity` 子块单测（16 用例）
 //!
-//! 2026-10-10 新增：此前这 3 个方法**绕过 `IamRepoTrait`**、直接收 `&mut PgConnection`
-//! 打 wx 域的 repo，所以它们既不在 `MockIamRepoTrait` 的 mock 面上、也没有任何单测。
-//! 搬进 trait 之后 mock 面齐了，本文件把矩阵补齐：
-//! - bind：成功 / 同 userid 幂等 / 撞别人 40108 / 反向冲突 40110 / 空 userid /
-//!   超长 userid / 配置 corpid 为空 40109 / 目标账号不存在 404 / 非 Manager 403
-//! - unbind：成功 / 无绑定幂等 / OCC 冲突 409
+//! 覆盖矩阵：
+//! - bind：成功 / 同 corp 同 userid 幂等 / **同 userid 但别的 corp 不算幂等**（返
+//!   40110）/ 撞别人 40108 / 反向冲突 40110 / 空 userid / 超长 userid /
+//!   配置 corpid 为空 40109 / 目标账号不存在 404 / 非 Manager 403
+//! - unbind：成功（首行吃客户端 version）/ **存量多行时只有首行吃客户端 version** /
+//!   无绑定幂等 / OCC 冲突 409
 //! - get：已绑返单对象、未绑定返 `None`
 
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use mockall::predicate::*;
 
 use super::{assert_biz_code, sample_wx_identity, wx_bind_req};
 use crate::modules::iam::repo::MockIamRepoTrait;
+use crate::modules::iam::repo::model::WxIdentity;
 use crate::modules::iam::service::tests::{
     current_clerk, current_manager, make_account_service, sample_user,
 };
@@ -44,8 +46,8 @@ async fn bind_wx_identity_happy_path_inserts_and_returns_row() {
                 Ok(Some(sample_wx_identity(500, CORP, "zhangsan", 101)))
             }
         });
-    mock.expect_count_active_wx_identities_by_user_id()
-        .returning(|_| Ok(0)); // system→wx 方向也空
+    mock.expect_get_wx_identity_by_user_id()
+        .returning(|_| Ok(vec![])); // system→wx 方向也空
     let created: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
     let cap = created.clone();
     mock.expect_create_wx_identity().returning(
@@ -113,6 +115,43 @@ async fn bind_wx_identity_same_userid_is_idempotent() {
 }
 
 #[tokio::test]
+async fn bind_wx_identity_same_userid_other_corp_is_not_idempotent() {
+    // Arrange —— 账号上挂着**别的 corp** 的同名 userid（存量数据）。配置 corp 侧查不到
+    // 该 userid，但该账号仍被占着 ⇒ 返 40110 让管理员先解绑，绝不能把别的 corp 的
+    // 那行当幂等结果返出去（登录侧比对 corpid 时认不出来，等于给了个死绑定）。
+    let u = sample_user(101, "alice");
+    let mut mock = MockIamRepoTrait::new();
+    mock.expect_get_user_by_id()
+        .returning(move |_| Ok(Some(u.clone())));
+    mock.expect_get_wx_identity_by_corp_and_user()
+        .returning(|_, _| Ok(None));
+    mock.expect_get_wx_identity_by_user_id().returning(|_| {
+        Ok(vec![sample_wx_identity(
+            500,
+            "ww-other-corp",
+            "zhangsan",
+            101,
+        )])
+    });
+    let svc = make_account_service();
+
+    // Act
+    let err = svc
+        .bind_wx_identity(
+            mock,
+            101,
+            &wx_bind_req("zhangsan"),
+            CORP,
+            &current_manager(),
+        )
+        .await
+        .expect_err("别的 corp 占着该账号应 Err");
+
+    // Assert
+    assert_biz_code(err, code::BIZ_WX_USER_ALREADY_BOUND);
+}
+
+#[tokio::test]
 async fn bind_wx_identity_userid_owned_by_other_user_returns_40108() {
     // Arrange —— wx→system 方向：该 userid 已属别的账号
     let u = sample_user(101, "alice");
@@ -148,8 +187,6 @@ async fn bind_wx_identity_reverse_conflict_returns_40110() {
         .returning(move |_| Ok(Some(u.clone())));
     mock.expect_get_wx_identity_by_corp_and_user()
         .returning(|_, _| Ok(None));
-    mock.expect_count_active_wx_identities_by_user_id()
-        .returning(|_| Ok(1));
     mock.expect_get_wx_identity_by_user_id()
         .returning(|_| Ok(vec![sample_wx_identity(500, CORP, "lisi", 101)]));
     let svc = make_account_service();
@@ -282,6 +319,41 @@ async fn unbind_wx_identity_soft_deletes_with_client_version() {
     svc.unbind_wx_identity(mock, 101, 3, &current_manager())
         .await
         .expect("unbind 应 Ok");
+}
+
+#[tokio::test]
+async fn unbind_wx_identity_multi_row_uses_client_version_on_first_row_only() {
+    // Arrange —— 存量账号有 2 行活跃绑定、version 已分化（5 / 8）。客户端只从
+    // `GET wx-bind` 读到首行的 version，故只有首行该用客户端值。
+    let mut mock = MockIamRepoTrait::new();
+    mock.expect_get_wx_identity_by_user_id().returning(|_| {
+        let second = WxIdentity {
+            version: 8,
+            ..sample_wx_identity(600, CORP, "lisi", 101)
+        };
+        Ok(vec![sample_wx_identity(500, CORP, "zhangsan", 101), second])
+    });
+    // 同一个 mock 方法被调两次 ⇒ 用调用计数分发（mockall 0.15 不支持同名多次注册）
+    let seen: Arc<std::sync::Mutex<Vec<(i64, i32)>>> = Default::default();
+    let cap = seen.clone();
+    mock.expect_soft_delete_wx_identity()
+        .returning(move |id, version, _, _| {
+            cap.lock().unwrap().push((id, version));
+            Ok(1)
+        });
+    let svc = make_account_service();
+
+    // Act
+    svc.unbind_wx_identity(mock, 101, 5, &current_manager())
+        .await
+        .expect("两行都应软删成功");
+
+    // Assert —— 首行吃客户端 version=5，非首行用事务内读到的 8（不得被 5 误伤成 409）
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![(500, 5), (600, 8)],
+        "首行用客户端 version，非首行用事务内读到的 version"
+    );
 }
 
 #[tokio::test]

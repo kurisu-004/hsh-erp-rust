@@ -1,4 +1,4 @@
-//! iam 域 `t_wx_identity` SQL 真源（5 方法）
+//! iam 域 `t_wx_identity` SQL 真源（4 方法）
 //!
 //! 2026-10-10 迁移：本文件从 `modules/wx/repo.rs::WxIdentityRepo` 搬来。搬家的理由是
 //! 表归属 —— `t_wx_identity` 存的是「企业微信 userid ↔ 本系统 `t_user.id`」的账号
@@ -42,8 +42,14 @@ pub async fn get_wx_identity_by_corp_and_user<'e, E: PgExecutor<'e>>(
 
 /// 查某系统账号的全部活跃绑定，按 `created_at ASC, id ASC` 排序。
 ///
-/// 排序对「一个账号历史上绑过多个 userid」的存量数据有意义：读端点
-/// （`GET /iam/users/{id}/wx-bind`）只取第一行作为当前绑定，解绑端点则全清。
+/// 三个消费方：读端点（`GET /iam/users/{id}/wx-bind`）取第一行作为当前绑定；绑定端点
+/// 用行数与内容判 system → wx 方向的一对一（不另发 count）；解绑端点全清。
+/// 排序对「一个账号历史上绑过多个 userid」的存量数据有意义。
+///
+/// ⚠️ 本仓**没有** `uk_wx_identity_user_id` 这样的 partial unique 索引（`t_wx_identity`
+/// 只有 `uk_wx_identity_corp_user` 那个 wx → system 方向的索引），故绑定端点这条读与
+/// 随后的 `INSERT` 之间存在 TOCTOU 窗口，靠管理端低并发兜住。详见
+/// `docs/api/iam.md` 的「已知偏差登记」。
 pub async fn get_wx_identity_by_user_id<'e, E: PgExecutor<'e>>(
     executor: E,
     user_id: i64,
@@ -61,29 +67,6 @@ pub async fn get_wx_identity_by_user_id<'e, E: PgExecutor<'e>>(
     )
     .fetch_all(executor)
     .await
-}
-
-/// 数某系统账号当前有几行活跃绑定（system → wx 方向的一对一检查）。
-///
-/// ⚠️ 本仓**没有** `uk_wx_identity_user_id` 这样的 partial unique 索引（`t_wx_identity`
-/// 只有 `uk_wx_identity_corp_user` 那个 wx → system 方向的索引），故
-/// `count` 与随后的 `INSERT` 之间存在 TOCTOU 窗口，靠管理端低并发兜住。详见
-/// `docs/api/iam.md` 的「已知偏差登记」。
-pub async fn count_active_wx_identities_by_user_id<'e, E: PgExecutor<'e>>(
-    executor: E,
-    user_id: i64,
-) -> Result<i64, sqlx::Error> {
-    let row = sqlx::query!(
-        r#"
-        SELECT count(*) AS "n!"
-        FROM t_wx_identity
-        WHERE user_id = $1 AND deleted_at IS NULL
-        "#,
-        user_id,
-    )
-    .fetch_one(executor)
-    .await?;
-    Ok(row.n)
 }
 
 /// 新增一条绑定。

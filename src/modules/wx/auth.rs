@@ -59,7 +59,6 @@ use axum::Json;
 use axum::Router;
 use axum::extract::State;
 use axum::routing::post;
-use sqlx::PgConnection;
 
 use crate::modules::iam::vo::LoginResponse;
 use crate::shared::error::{AppError, code};
@@ -130,12 +129,9 @@ pub async fn wx_login(
     // 3a+3b. 查预绑定 + 取系统账号（两步合进 iam 域的 `resolve_wx_login_user`：
     // 绑定表的 SQL 真源属 iam 域，wx 域对 `t_wx_identity` 零 SQL）。
     // 错误码语义与拆开写时逐字相同：未绑定 → 40107；账号已软删/不存在 → 40101。
-    // 形参是 `repo: &mut R`（R = `&mut PgConnection`），故调用处要先取出
-    // `&mut PgConnection` 再取一层引用。
-    let mut repo: &mut PgConnection = &mut tx;
     let user = state
         .account_service
-        .resolve_wx_login_user(&mut repo, expected_corp, &wx_user_id)
+        .resolve_wx_login_user(&mut *tx, expected_corp, &wx_user_id)
         .await?;
 
     // 3c. 复用 iam 登录流水线（is_active → 角色 → shelf 范围 → 菜单 → 签双 token）

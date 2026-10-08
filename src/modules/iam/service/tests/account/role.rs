@@ -1,4 +1,4 @@
-//! `AccountService` 的 `t_user_role` 子块单测（7 用例）
+//! `AccountService` 的 `t_user_role` 子块单测（8 用例）
 //!
 //! 覆盖矩阵：happy path（add / remove / list）、NotFound（remove 别人的角色）、
 //! Duplicate（add_role 查重命中）、Validation（MANAGER 带 scope）、
@@ -170,7 +170,7 @@ async fn add_role_invalid_role_string_returns_validation_error() {
 }
 
 // ===========================================================================
-// remove_role（2 用例）
+// remove_role（3 用例）
 // ===========================================================================
 
 #[tokio::test]

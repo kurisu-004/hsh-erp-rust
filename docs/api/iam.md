@@ -137,12 +137,13 @@ jti 写入黑名单（TTL 对齐旧 token 剩余有效期），旧 jti 再次使
 - `scope_id` 指向的货架必须存在、`zone ∈ ALLOWED_SHELF_ZONES`
   （`PRODUCTION` / `INSPECTION`）、`is_active = true`，任一不满足 → **40400**。
 - **`scope_id IS NULL` 的 SHELF_ACCOUNT 行 = 共享 HMI 通配**（登录态里的
-  `shelf_wildcard = true`，可访问全部货架）。该行能被写入是因为
-  `t_user_role` 的唯一约束拦不住含 NULL 的组合（见 §8.3），管理端正常路径请始终
-  传 `scope_id`。
+  `shelf_wildcard = true`，可访问全部货架）。⚠️ **本仓写端点写不出这种行**：
+  `validate_role_scope` 对 SHELF_ACCOUNT 强制要求 `scope_id`，缺了直接 40001。
+  库里若存在，是 Python 端或人工写入的存量数据，本仓只读兼容（§8.1）。
 - **scope / 角色变更不在请求即刻生效于鉴权层**：`CurrentUser` 的 `shelf_ids` /
   `roles` 来自 **Redis session 缓存**，不是请求时读 DB。管理端改完角色后最长滞后
-  一个 session TTL（`REDIS_SESSION_TTL_SECONDS`，缺省 900 秒）；执行一次
+  一个 session TTL（`REDIS_SESSION_TTL_SECONDS`，代码缺省 900 秒；**现网 `.env` 实配
+  43200 秒 = 12 小时**）；执行一次
   `/iam/refresh` 会按 DB 重算并重写缓存，因而立即生效。`/iam/me` 每次都重读 DB，
   但它**不**改写缓存 —— 界面上看到的角色列表与鉴权实际生效的角色在 TTL 内可能不一致。
 
@@ -174,8 +175,9 @@ jti 写入黑名单（TTL 对齐旧 token 剩余有效期），旧 jti 再次使
 ⚠️ **422 是纯文本，不是错误码**：body 是 axum 提取器的拒绝文本（如
 `Failed to deserialize the JSON body into the target type: missing field \`version\``），
 **没有** `{code, message, data}` 信封。断言这类响应必须用
-`test_support::http::send_raw`（`send` 会在 JSON 解析处 panic）。端点 1/3/5/6/7/8
-之外的所有 `Json` 提取器失败都属此类。
+`test_support::http::send_raw`（`send` 会在 JSON 解析处 panic）。端点表里带 `Json`
+提取器的 10 个端点（1/4/5/7/9/11/13/14/16/17）的提取失败都属此类；端点 3 与 10 无
+提取器，6 是 `Query`、8/12/15 是 `Path`。
 
 ## 5. 移除记录（2026-10-10）
 
@@ -190,8 +192,10 @@ jti 写入黑名单（TTL 对齐旧 token 剩余有效期），旧 jti 再次使
 **域外开口**（不是移除，是收口）：`modules/wx/auth.rs` 的 wx-login 过去直接调
 `WxIdentityRepo::get_by_corp_and_user` + `iam::repo::sql::user::get_user_by_id`，
 现在两步合进 `AccountService::resolve_wx_login_user`。**错误码语义逐字未变**
-（未绑定 40107、账号已软删 40101），`tests/wecom_login.rs` 的 15 个 wx-login 场景
-零改动通过。
+（未绑定 40107、账号已软删 40101）：`tests/wecom_login.rs` 的 10 个 `wx_login_*`
+场景零改动通过；同文件另 2 个 bind/unbind 场景按新契约改写（bind 新增 system → wx
+冲突检查后需先建新账号再绑、unbind 改 `POST .../unbind` + body `version`，
+且 `GET wx-bind` 返单对象）。
 
 ## 6. 与 WS 的关系
 
@@ -213,7 +217,7 @@ session TTL / refresh。
 | `t_user_role` | 角色解析、账号角色组装、查重 | 授予、软删撤销 | 唯一约束**非 partial**，见 §8.3 |
 | `t_menu` + `t_role_menu` | 按角色取可见菜单并组树 | — | `seeds/menu.sql` 是菜单的权威源 |
 | `t_shelf` | SHELF_ACCOUNT 的 scope 校验 + 登录态货架范围解析 | — | **只读**（shelf 域的写端点在本域之外） |
-| `t_wx_identity` | 绑定查询、wx-login 反查、1:1 计数 | 绑定、解绑软删 | 唯一索引 `uk_wx_identity_corp_user` 是 **partial**（软删行不参与） |
+| `t_wx_identity` | 绑定查询、wx-login 反查、system → wx 一对一判定（读该账号全部活跃行） | 绑定、解绑软删 | 唯一索引 `uk_wx_identity_corp_user` 是 **partial**（软删行不参与） |
 
 另读 Redis（session 条目 + refresh jti 黑名单），键前缀由 `RedisConfig::key_prefix`
 隔离（测试期按进程隔离）。
@@ -246,11 +250,15 @@ session TTL / refresh。
 - 残留风险：预检与 INSERT 之间仍有窗口（与 §8.2 同源问题），且含 NULL 的组合
   索引层完全拦不住。要彻底堵住需改约束为 partial unique（**独立决策**，涉及数据
   迁移，本轮未做）。
-- 顺带：`scope_id IS NULL` 的 SHELF_ACCOUNT 行（共享 HMI 通配）也因此能被写入。
+- ⚠️ 别把它读成「`scope_id IS NULL` 的 SHELF_ACCOUNT 行在本仓能写进去」：索引层
+  拦不住 ≠ 服务层放行。`validate_role_scope` 对 SHELF_ACCOUNT 强制
+  `scope_id.is_some()`，缺了直接 40001 ⇒ Rust 端**写不进**这种行。库里的通配行
+  （登录态 `shelf_wildcard = true`，见 §3）是 Python 端或人工写入的存量数据，
+  本仓只读兼容。
 
 ### 8.2 system → wx 一对一的 TOCTOU 窗口
 
-端点 16 的 40110 检查是「先 `count` 活跃绑定数、再 `INSERT`」，**没有**
+端点 16 的 40110 检查是「先读该账号的全部活跃绑定行、再 `INSERT`」，**没有**
 `uk_wx_identity_user_id` 这样的 partial unique 索引兜底，故两步之间的并发绑定会
 穿透检查。本仓的处理是「靠管理端低并发兜住」（该端点只有 Manager 能调，是人工操作
 界面，不存在高并发自动调用方）。要彻底堵住需追加一个 partial unique 索引
@@ -282,7 +290,17 @@ userid 不区分大小写、统一转为小写。⚠️ **不是**登录流程�
 读端点要单值（UI 只显示一个），写端点要幂等安全（一次解绑让该账号彻底失去所有
 企微身份）。多行数据只可能来自 8.2 描述的窗口。
 
+**多行解绑的 OCC 锚点只落在首行**：端点 17 的 `version` 来自 `GET wx-bind` 返回的
+那一个值，解绑时**只**把它打在 `created_at ASC, id ASC` 的首行上，其余行用同一事务
+里读到的 `r.version`。否则一个可能与各行已分化的 version 会把非首行全判成 409，
+而仓里没有 force-unbind 端点可救。
+⚠️ **当前前提**：所有活跃行的 `version` 恒为 0 —— `create_wx_identity` 恒插
+`version = 0`，而唯一推进它的 `soft_delete_wx_identity` 同时置 `deleted_at`，
+故不存在「保留行被推进 version」的状态，首行 / 非首行的取值差异今天不可观测。
+若将来新增「改绑定而不删行」的写入口（从而推进保留行的 version），本节口径要跟着复核。
+
 ### 8.6 权限上下文滞后一个 session TTL
 
-角色 / 货架 scope 的变更不在请求即刻生效于鉴权层（走 Redis 缓存，缺省 900 秒）。
+角色 / 货架 scope 的变更不在请求即刻生效于鉴权层（走 Redis 缓存，
+`REDIS_SESSION_TTL_SECONDS` 代码缺省 900 秒、**现网 `.env` 实配 43200 秒 = 12 小时**）。
 详见 §3。要立即生效需执行一次 `/iam/refresh`。

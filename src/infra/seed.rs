@@ -20,7 +20,7 @@
 //! seeds/admin.sql 是**可选**的初始管理员账号（username=admin / password=changeme /
 //! role=MANAGER），由环境变量 `BOOTSTRAP_ADMIN_ENABLED` 门控（默认 false）。首次启用后
 //! **必须**立刻登录并改密，再设回 `BOOTSTRAP_ADMIN_ENABLED=false` 重启（明文密码
-//! 与 `src/modules/iam/service/account.rs::DEFAULT_RESET_PASSWORD` 同源）。
+//! 与 `src/modules/iam/service/account/mod.rs::DEFAULT_RESET_PASSWORD` 同源）。
 //!
 //! ## 应用时机
 //!

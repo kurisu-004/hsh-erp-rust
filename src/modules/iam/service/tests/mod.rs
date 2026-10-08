@@ -1,6 +1,6 @@
 //! iam 域 service 层单元测试公共 fixture（2026-09-23 新增）
 //!
-//! 为 `account/`（`user` 18 + `role` 7 + `wx` 14 用例）+ `session.rs`（13 用例）提供：
+//! 为 `account/`（`user` 20 + `role` 8 + `wx` 16 用例）+ `session.rs`（14 用例）提供：
 //! - `MockIamRepoTrait` 注入（mockall 0.15 automock 自动生成于 `iam/repo/mod.rs`）
 //! - `test_snowflake()`：**lib 单测进程内唯一**的雪花 ID 生成器（2026-10-09 起
 //!   转发到 `crate::shared::test_snowflake::shared_test_snowflake()`）

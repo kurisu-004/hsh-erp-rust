@@ -112,7 +112,7 @@ pub trait IamRepoTrait: Send {
     // ── t_shelf（1）──
     async fn get_shelf_by_id(&mut self, id: i64) -> Result<Option<Shelf>, sqlx::Error>;
 
-    // ── t_wx_identity（5，2026-10-10 自 wx 域搬入）──
+    // ── t_wx_identity（4，2026-10-10 自 wx 域搬入）──
     async fn get_wx_identity_by_corp_and_user<'a>(
         &mut self,
         corp_id: &'a str,
@@ -122,10 +122,6 @@ pub trait IamRepoTrait: Send {
         &mut self,
         user_id: i64,
     ) -> Result<Vec<WxIdentity>, sqlx::Error>;
-    async fn count_active_wx_identities_by_user_id(
-        &mut self,
-        user_id: i64,
-    ) -> Result<i64, sqlx::Error>;
     async fn create_wx_identity(&mut self, identity: &WxIdentityInsert) -> Result<(), sqlx::Error>;
     async fn soft_delete_wx_identity(
         &mut self,

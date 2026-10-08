@@ -1,7 +1,6 @@
 //! iam 域账号管理 service —— `AccountService` 本体 + 跨子模块共享的常量 / helper
 //!
-//! 2026-10-10 拆分：本文件原先是 837 行的单文件 `service/account.rs`，现按职责拆成
-//! 4 个子模块（`AccountService` 仍是同一个 struct，方法按 `impl` 块分散在各文件里）：
+//! `AccountService` 是同一个 struct，方法按 `impl` 块分散在 3 个子模块里：
 //!
 //! | 子模块 | 装什么 |
 //! |---|---|
@@ -104,7 +103,7 @@ impl AccountService {
     ///   该情形只进 `tracing::warn!`。
     pub async fn resolve_wx_login_user<R: IamRepoTrait>(
         &self,
-        repo: &mut R,
+        mut repo: R,
         corp_id: &str,
         wx_user_id: &str,
     ) -> Result<User, AppError> {
@@ -143,8 +142,13 @@ pub(crate) fn user_not_found(user_id: i64) -> AppError {
     AppError::biz(code::USER_NOT_FOUND, format!("user {user_id} not found"))
 }
 
-/// 乐观锁写入返回 0 行 → 409。version 由**客户端**在 body 里显式传入，故 0 行
-/// 只可能是并发改动（不是「读到的版本过期」）。
+/// 乐观锁写入返回 0 行 → 409。
+///
+/// 0 行的含义取决于 `version` 的来源，本仓两种都有：
+/// - **客户端 body 传入**（`update_user` / `deactivate_user` / `remove_role` /
+///   `unbind_wx_identity` 的首行）⇒ 只能是并发改动；
+/// - **service 从 DB 读到**（`admin_reset_password` 这条 OCC 豁免的幂等端点、
+///   `change_own_password`）⇒ 也可能是读到的 version 在本事务内已过期。
 pub(crate) fn version_conflict() -> AppError {
     AppError::biz(code::VERSION_CONFLICT, "数据已被他人修改，请刷新后重试")
 }

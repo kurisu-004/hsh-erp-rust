@@ -1,4 +1,4 @@
-//! `AccountService` 的 `t_user` 子块单测（18 用例）
+//! `AccountService` 的 `t_user` 子块单测（20 用例）
 //!
 //! 覆盖矩阵：
 //! - happy path（每个方法 1 个）

@@ -13,9 +13,10 @@
 //! ## 绑定基数：双向一对一（业务层，无 DB 约束）
 //! - `wx → system`：`uk_wx_identity_corp_user` partial unique 索引 + 应用层预检，
 //!   冲突码 `40108 BIZ_WX_BINDING_DUPLICATE`。
-//! - `system → wx`：本文件 `bind_wx_identity` 在插入前查活跃绑定数，非 0 且
-//!   userid 不同即 `40110 BIZ_WX_USER_ALREADY_BOUND`。**没有**对应索引，
-//!   count 与 INSERT 之间存在 TOCTOU 窗口（靠管理端低并发兜住），登记在
+//! - `system → wx`：本文件 `bind_wx_identity` 在插入前读该账号的全部活跃行，非空
+//!   且不含「corp 与 userid 都与请求一致」的那一行即
+//!   `40110 BIZ_WX_USER_ALREADY_BOUND`。**没有**对应索引，
+//!   这条读与 INSERT 之间存在 TOCTOU 窗口（靠管理端低并发兜住），登记在
 //!   `docs/api/iam.md` 的「已知偏差登记」。
 
 use crate::auth::rbac::{CurrentUser, Role};
@@ -100,13 +101,20 @@ impl AccountService {
             ));
         }
 
-        // system → wx 方向：一个系统账号最多一个活跃绑定
-        let active = repo.count_active_wx_identities_by_user_id(user_id).await?;
-        if active > 0 {
-            let rows = repo.get_wx_identity_by_user_id(user_id).await?;
-            if let Some(same) = rows.into_iter().find(|r| r.wx_user_id == wx_user_id) {
-                return Ok(to_wx_identity_out(same)); // 幂等（corp 与 userid 都相同）
-            }
+        // system → wx 方向：一个系统账号最多一个活跃绑定。判据直接取
+        // `get_wx_identity_by_user_id` 的行（同一套 `deleted_at IS NULL` 谓词，
+        // 不另发一条 count）。
+        let rows = repo.get_wx_identity_by_user_id(user_id).await?;
+        // 幂等：corp 与 userid 都与请求一致 ⇒ 这行就是要写的绑定，原样返回
+        if let Some(same) = rows
+            .iter()
+            .find(|r| r.corp_id == corp_id && r.wx_user_id == wx_user_id)
+            .cloned()
+        {
+            return Ok(to_wx_identity_out(same));
+        }
+        if !rows.is_empty() {
+            // 别的 corp / 别的 userid 占着这个账号：必须先解绑
             return Err(AppError::biz(
                 code::BIZ_WX_USER_ALREADY_BOUND,
                 "该系统账号已绑定其它企业微信 userid，请先解绑",
@@ -138,11 +146,14 @@ impl AccountService {
     /// ## 幂等语义
     /// 该 user 当前**没有**活跃绑定时重复调用 → 成功（`Ok(())`）。
     ///
-    /// ## 存量多行绑定
+    /// ## 存量多行绑定的 version 取值
     /// 本仓没有 `uk_wx_identity_user_id` 索引，早期写入可能留下同一 `user_id` 的
-    /// 多行活跃绑定。解绑**全部**软删（解绑账号 = 该账号的所有企业微信身份一并失效），
-    /// 逐行带同一个 `expected_version` 写，任一行 affected==0 → 409（handler 未
-    /// commit，整笔回滚）。
+    /// 多行活跃绑定。解绑**全部**软删（解绑账号 = 该账号的所有企业微信身份一并失效）。
+    /// 客户端传来的 `expected_version`（它只能从 `GET wx-bind` 读到那一个值）**只**打在
+    /// 客户端实际看到的那一行上 —— 即 `created_at ASC, id ASC` 的首行，与读端点同序；
+    /// 其余行用同一事务里刚读到的 `r.version`。否则一个可能与各行已分化的 version 会把
+    /// 非首行全判成 409，且仓里没有 force-unbind 端点可救。任一行 affected==0 → 409
+    /// （handler 未 commit，整笔回滚）。
     pub async fn unbind_wx_identity<R: IamRepoTrait>(
         &self,
         mut repo: R,
@@ -159,9 +170,15 @@ impl AccountService {
         }
 
         let when = now_naive();
-        for r in rows {
+        for (idx, r) in rows.into_iter().enumerate() {
+            // OCC 锚点只落在首行（客户端 GET 能看到的那一行），其余行用事务内读到的 version
+            let version = if idx == 0 {
+                expected_version
+            } else {
+                r.version
+            };
             let affected = repo
-                .soft_delete_wx_identity(r.id, expected_version, when, Some(current.id))
+                .soft_delete_wx_identity(r.id, version, when, Some(current.id))
                 .await?;
             if affected == 0 {
                 // 乐观锁冲突：并发已被别人解绑 / 改过。整体回滚（handler 未 commit）

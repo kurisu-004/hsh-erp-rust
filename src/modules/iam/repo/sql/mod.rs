@@ -5,7 +5,7 @@
 //! - `user_role.rs`   — `t_user_role` 6 个 SQL fns + `UserRoleInsert` / `UserRoleRow`
 //! - `menu.rs`        — `t_menu` 1 个 SQL fn
 //! - `shelf.rs`       — `t_shelf` 1 个 SQL fn（本域只读）
-//! - `wx_identity.rs` — `t_wx_identity` 5 个 SQL fns（2026-10-10 自 wx 域搬入）
+//! - `wx_identity.rs` — `t_wx_identity` 4 个 SQL fns（2026-10-10 自 wx 域搬入）
 //! - `mod.rs`（本文件）— 声明子模块 + **单一** `impl IamRepoTrait for &mut PgConnection` 块
 //!   （覆盖全部 23 方法，按实体分组；call 各子文件 free fn）
 //!
@@ -170,7 +170,7 @@ impl IamRepoTrait for &mut PgConnection {
         shelf::get_shelf_by_id(&mut **self, id).await
     }
 
-    // ── t_wx_identity（5，2026-10-10 自 wx 域搬入）──
+    // ── t_wx_identity（4，2026-10-10 自 wx 域搬入）──
     async fn get_wx_identity_by_corp_and_user<'b>(
         &mut self,
         corp_id: &'b str,
@@ -183,12 +183,6 @@ impl IamRepoTrait for &mut PgConnection {
         user_id: i64,
     ) -> Result<Vec<WxIdentity>, sqlx::Error> {
         wx_identity::get_wx_identity_by_user_id(&mut **self, user_id).await
-    }
-    async fn count_active_wx_identities_by_user_id(
-        &mut self,
-        user_id: i64,
-    ) -> Result<i64, sqlx::Error> {
-        wx_identity::count_active_wx_identities_by_user_id(&mut **self, user_id).await
     }
     async fn create_wx_identity(&mut self, identity: &WxIdentityInsert) -> Result<(), sqlx::Error> {
         wx_identity::create_wx_identity(&mut **self, identity).await
