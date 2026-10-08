@@ -14,7 +14,7 @@
 //! - `count_inspection_batches()` —— 品检区待品检批次数
 //! - `snapshot_recent_batches()` —— 工人在手 IN_PROCESS 批次
 //! - `snapshot_workers(ids)` —— 工人 id → 名称 映射
-//! - `snapshot_system_delivery_orders(today)` —— 最紧急工单 + 部分已交两桶
+//! - `snapshot_system_delivery_orders(today)` —— 交期面板三桶（在 `repo/delivery.rs`）
 //!
 //! 交期相关的逾期计数 / 面板 / 抽屉三个方法在 `repo/delivery.rs::DeliveryRepo`（SQL 真源
 //! 独立成文件，便于与「状态白名单」常量同处一地）。
