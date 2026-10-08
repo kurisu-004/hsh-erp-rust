@@ -122,6 +122,18 @@ pub struct BatchToShipRequest {
 /// 无 Path extractor：`serial_no` 是主键，`batch_id` 仅在多批次歧义时用于消歧。
 /// `event_type`：`WorkerScanEvent::RETURNED` / `INSPECTED`。
 ///
+/// ## `next_process_id`：**仅非顺应工序时必填**（2026-10-09 改写）
+/// 此前它是「RETURNED 必填」。现在后端会先解析批次在工序链上的位置
+/// （`shared::batch::chain::resolve_chain_position`，判据与读侧
+/// `GET /parts/by-worker` 的 `chain_state` 逐条同源）：
+/// - **顺应工序**（step 指针与 `current_process_id` 一致）且链内有下一道 ⇒ 后端按链
+///   推导下一道工序与 step，**本字段可省略**；
+/// - **非顺应工序**（无链 / 链已软删 / 指针漂移 / 链内同一 `process_id` 重复 /
+///   当前已是链尾）⇒ **必填**，缺失 → `40001 VALIDATION_ERROR`。
+///
+/// 字段类型保持 `Option<String>` 不变（本轮不改 wire）：前端可以继续照
+/// `chain_state` 决定填不填，两条路径都合法。
+///
 /// `shelf_id`：**必填，且两个 event_type 都是 PRODUCTION 区的 worker-scan 货架** ——
 /// service 对它做的是**无条件**的 PRODUCTION 硬校验（不分 `event_type`），非
 /// PRODUCTION → 20501 `BIZ_SHELF_NOT_FOUND`。**不要**把 INSPECTION 区的品检架塞进

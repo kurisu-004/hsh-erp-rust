@@ -183,12 +183,14 @@ pub async fn assert_shelf_maps_process(
 ///   写入不变式：进池（`status='IN_PROCESS'` + `location='PRODUCTION_SHELF'`）
 ///   写目标 `process_id`；出池（转 PENDING / INSPECTION / INSPECTION_SHELF）
 ///   传 `None`；池内移动不经过本函数，故无「不动」分支。
-/// - `new_current_process_step_id` —— **可选的显示用定位信息**（逻辑 FK →
+/// - `new_current_process_step_id` —— **链内位置指针**（逻辑 FK →
 ///   t_process_chain_step.id），仅当工单已绑定工序链时才写，允许 NULL。
 ///   NULL 不影响入池（旧设计的死状态已由 `current_process_id` 打破）。
-///   ⚠️ 措辞（2026-09-30 review 第 3 轮附带发现）：该列**只在首次定位工序时写、
-///   之后不再推进**（worker-scan RETURNED / 送检都不写），故**不是**「当前走到
-///   第几步」的进度指针。
+///   2026-10-09 起它**随工序推进**（dispatch 落链首 step、worker-scan RETURNED
+///   顺工序时推进），不再只是「首次定位」的显示信息；本漏斗的调用点绝大多数是
+///   出池 / 首次定位，故对它们仍然是「写一个定位值或清 NULL」。
+///   ⚠️ 本漏斗**不是**推进路径：工序推进只发生在 worker-scan RETURNED
+///   （`mark_batch_returned`，另一个写点）与 dispatch。
 ///
 /// 写入不变式第 4 行「非生产流 → NULL」的**唯一例外**（2026-09-30 review 第 1 轮
 /// M1 补记，勿按表机械核对后误判为 bug）：
@@ -453,10 +455,9 @@ pub async fn optional_process_chain(
 /// 2026-10-03 新增：工序链**可选**版守卫（step 侧），与 [`optional_process_chain`] 配对使用。
 ///
 /// ## 两种返回必须分清
-/// - `chain_id = None`（压根没链）→ `Ok(None)`，**放行**。写 NULL 的先例见
-///   `dispatch` 路径（`worker-scan` RETURNED 不写 step 是既有行为），
-///   `current_process_step_id` 早已被官方降级为「可选的显示用定位信息」
-///   （写入不变式见本文件 [`mark_batch_with_status_and_meta`]）。
+/// - `chain_id = None`（压根没链）→ `Ok(None)`，**放行**：`current_process_step_id`
+///   按写入不变式恒为 NULL（见本文件 [`mark_batch_with_status_and_meta`]），
+///   写侧把它交给 SQL 的 `COALESCE(.., 原值)` 即「保持原值」。
 /// - `chain_id = Some(_)` 但链内找不到该 process 的活跃 step → `20702
 ///   BIZ_PROCESS_CHAIN_STEP_NOT_FOUND`，**继续拒**。这是真数据错误：链是有的，
 ///   却没把正在加工的工序登记进链内（例如链在批次发出之后才被改写）。跟着

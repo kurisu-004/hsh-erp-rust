@@ -19,7 +19,9 @@
 //! - 20501 `BIZ_SHELF_NOT_FOUND` —— shelf 不存在 / 非 PRODUCTION / target 非 INSPECTION
 //! - 20507 `BIZ_SHELF_PROCESS_NOT_MAPPED` —— RETURNED 时 shelf ↔ process 未映射
 //! - 20511 `BIZ_SHELF_NOT_INSPECTION_ZONE` —— target_inspection_shelf.zone ≠ 'INSPECTION'
-//! - 40001 `VALIDATION_ERROR` —— next_process_id / target_inspection_shelf_id 缺 / 非法
+//! - 40001 `VALIDATION_ERROR` —— next_process_id 缺 / 非法（**仅非顺应工序时**
+//!   才要求前端传 `next_process_id`；顺应工序时后端按链推导，见
+//!   `crate::shared::batch::chain` 与 RETURNED 分支注释）或 target_inspection_shelf_id 缺
 //! - 40301 `SHELF_MISMATCH` —— 当前用户无权限访问 target shelf
 //! - 40901 `VERSION_CONFLICT` —— 乐观锁失败
 
@@ -32,7 +34,6 @@ use crate::modules::part::service::PartService;
 use crate::modules::part::statemachine::PartStatus;
 use crate::modules::prod::batch::dto::WorkerScanRequest;
 use crate::modules::prod::batch::vo::WorkerScanCoreOut;
-use crate::modules::prod::process_chain::repo::ProcessChainRepo;
 use crate::modules::prod::queue::dto::WorkerScanEvent;
 use crate::modules::prod::shelf_process::repo::ShelfProcessRepo;
 use crate::modules::prod::worker::repo::WorkerRepo;
@@ -46,9 +47,12 @@ impl BatchService {
     ///
     /// 两分支：
     /// - `RETURNED`：worker 把持有件放回生产架（同 admin_remove 语义，但走扫码台 +
-    ///   worker 自查路径）；要求 shelf ∈ PRODUCTION 区 + active；shelf ↔
-    ///   next_process_id 在 `t_shelf_process` 必须有映射（20507 NOT_MAPPED）；切
-    ///   holder worker → shelf（OCC）+ 写 `RETURNED_TO_SHELF` 事件。
+    ///   worker 自查路径）；要求 shelf ∈ PRODUCTION 区 + active；shelf ↔ 目标工序在
+    ///   `t_shelf_process` 必须有映射（20507 NOT_MAPPED）；切 holder worker → shelf
+    ///   （OCC）+ 写 `RETURNED_TO_SHELF` 事件。**目标工序 2026-10-09 起由后端按链
+    ///   推导**（顺应工序时），前端只在非顺应工序时必须显式传
+    ///   `next_process_id`（详见 RETURNED 分支注释与
+    ///   `crate::shared::batch::chain`）。
     /// - `INSPECTED`：worker 把持有件直接送检（INSPECTION → INSPECTION + 状态机
     ///   IN_PROCESS → INSPECTION）；要求 target shelf ∈ INSPECTION 区 + active；
     ///   状态机校验 → mark_*_inspected（OCC）+ 写 `SENT_TO_INSPECTION` 事件。
@@ -144,13 +148,64 @@ impl BatchService {
         let mut synced_assembly_id: Option<i64> = None;
         match req.event_type {
             WorkerScanEvent::RETURNED => {
-                // RETURNED 必须传 next_process_id
-                let next_pid: i64 = req
-                    .next_process_id
-                    .as_deref()
-                    .ok_or_else(|| AppError::validation("RETURNED 必须传 next_process_id"))?
-                    .parse()
-                    .map_err(|_| AppError::validation("next_process_id 非法"))?;
+                // 解析批次在链上的位置，决定「下一道工序」是自动推导还是前端显式指定。
+                //
+                // 2026-10-09 起这段是「一个判据、两个分支」：
+                // - **顺应工序**（step 指针与 `current_process_id` 一致）且链内有下一
+                //   道 ⇒ 自动取链上下一 step 的工序，前端可以**不传**
+                //   `next_process_id`；
+                // - **非顺应**（无链 / 链已软删 / 指针漂移 / 链内工序重复 / 链尾）⇒
+                //   必须由前端显式指定 —— 这些成因下「链上下一道」要么推不出来，要么
+                //   推出来的值不可信，猜一次就是一次静默错工序。
+                //
+                // 判据本身（锚链两步定位、按 `current_process_id` 在链内重新定位、
+                // 链内工序重复显式落 NONE）与读侧 `GET /parts/by-worker` 逐条同源：
+                // 共用 `shared::batch::chain`，故「前端看到可免填」与「写侧实际推进到
+                // 哪道」不会分叉（这正是 2026-09-30 起 step 指针恒 NULL 时两者会
+                // 分叉的根因）。
+                let position = crate::shared::batch::chain::resolve_chain_position(
+                    repo.conn_mut(),
+                    part.id,
+                    &batch,
+                )
+                .await?;
+                let (next_pid, step_id_opt): (i64, Option<i64>) = if position
+                    .is_pointer_consistent(&batch)
+                    && position.chain_state.as_deref() == Some("NEXT")
+                {
+                    // 顺应工序：链上下一个 step 已定位到，`next_process_id` 为
+                    // NULL 说明 LATERAL 的 `NEXT` 分支与派生值口径被改散了 ——
+                    // 那是 SQL 内部不自洽，宁可拒收也不能放一个无工序的批次进池。
+                    let pid = position.next_process_id.ok_or_else(|| {
+                        AppError::biz(
+                            code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND,
+                            "链位置派生返回 NEXT 但没有下一道工序（SQL 内部不自洽）",
+                        )
+                    })?;
+                    (pid, position.next_step_id)
+                } else {
+                    // 非顺应工序：必须前端显式指定。
+                    let raw = req.next_process_id.as_deref().ok_or_else(|| {
+                        AppError::validation(
+                            "非顺应工序（无工序链 / 链已软删 / 当前工序不在链内 / 当前已是链尾），\
+                                 必须在 next_process_id 里显式指定下一道工序",
+                        )
+                    })?;
+                    let pid = raw
+                        .parse()
+                        .map_err(|_| AppError::validation("next_process_id 非法"))?;
+                    // 链内解析该工序的 step：无链 → `None`（该列按写入不变式恒为
+                    // NULL，SQL 侧 COALESCE 保留原值）；有链但链内没有这道工序 ⇒
+                    // `20702`，即「链是有的，却没把正在加工的工序登记进链内」——
+                    // 跟放着批次一起静默入池、之后每一步定位都漂移相比，拒收更便宜。
+                    let chain_id =
+                        crate::shared::batch::optional_process_chain(repo.conn_mut(), part.id)
+                            .await?;
+                    let step =
+                        crate::shared::batch::optional_step_id(repo.conn_mut(), chain_id, pid)
+                            .await?;
+                    (pid, step)
+                };
                 // shelf ↔ process 映射校验。
                 //
                 // 必须走 `ShelfProcessRepo::exists_for_shelf_process`，**不要**在本文件
@@ -158,6 +213,9 @@ impl BatchService {
                 // 写法一旦漏掉，已软删的货架↔工序映射就会放行 RETURNED，使 20507
                 // `BIZ_SHELF_PROCESS_NOT_MAPPED` 的触发条件与 worker-pool `move_batch`
                 // 那条路径分叉。走共享方法后两条路径同源，不会再各自漂移。
+                //
+                // ⚠️ 校验用的是**推导出来的** `next_pid`（顺应工序时 = 链上下一道），
+                // 而请求体里的 `next_process_id` 在该分支可能压根不存在。
                 let maps = ShelfProcessRepo::exists_for_shelf_process(
                     repo.conn_mut(),
                     req.shelf_id,
@@ -170,74 +228,34 @@ impl BatchService {
                         format!("shelf {} 不映射到工序 {}", req.shelf_id, next_pid),
                     ));
                 }
-                // PR-3 批次 step 化：解析 step_id（chain 内 process_id → step_id）。
-                // part 的 `process_chain_id` 为 NULL（未制定工艺链）时**不能**静默抹除
-                // batch.current_process_step_id（否则 part 持有件从 worker 归还到货架后
-                // 丢失 step 上下文）—— 此时保留旧 step_id 值。
-                //
-                // ⚠️ `O` 必须是 `Option<i64>`（外层 `Option` 由 `fetch_optional` 表示
-                // 「有没有行」，**不是**列的类型；列的可空性要自己收在 `O` 里，末尾
-                // `.flatten()` 把两层压成一层）。
-                // `t_part.process_chain_id` 是可空列：baseline migration 001 建表时
-                // `process_chain_id bigint` **无 NOT NULL**，列 COMMENT 明写
-                // 「NULL = 未制定工艺链」；本查询的目标列即 `column 0`，为 NULL 时按
-                // `i64` 解码触发 sqlx
-                // `error occurred while decoding column 0: unexpected null; try decoding as an Option`
-                // 整笔 500。**真会触发**：手工工单（无工艺链）是常态，工人归还这类件
-                // 必现；且 NULL 在下方 `if let` **之前**就抛，所以 `O` 若不收
-                // `Option`，下面的 else 分支（保留批次旧 step）对手写工单恒不可达。
-                // 回归见 `tests/production/queue.rs::worker_scan_returned_without_process_chain_succeeds`。
-                // 同款反模式（`Option<i64>` 包当前 `NOT NULL` 的列，列一旦变可空就同样
-                // 500）另见 `prod/shelf_process/repo.rs::find_first_shelf_for_process`。
-                //
-                // ⚠️ 2026-09-30 起的**已知缺口**：下面算出的 `step_id_opt`
-                // 传给 `mark_batch_returned` 后**被丢弃** —— 该函数的
-                // `current_process_step_id` SET 子句在 2026-09-30 prod/pool move
-                // 重构中被移除（admin 主动退回不推进工序链），RETURNED 复用了同一
-                // 函数，于是该显示用列在 RETURNED 时也不再更新。
-                //
-                // **刻意不修**：影响面仅限显示 —— 池归属已由
-                // `current_process_id` 承担并正确写入；step 是「批次
-                // **首次定位**在工艺链哪一步」的可选显示用信息，不是状态机依赖。
-                //
-                // ⚠️ 措辞订正（2026-09-30 附带发现）：step **不是**
-                // 「会随流转推进的进度指针」—— 它只在首次定位工序时写、之后一律
-                // 不再推进（RETURNED / INSPECTED 都不写），对多工序链工单永远停在
-                // 首次定位那一步。后续单独一轮处理（届时 `mark_batch_returned` 需按
-                // 调用方决定是否写 step，语义与 `advance_to_process_id` 同形）。
-                let chain_id_opt: Option<i64> = sqlx::query_scalar::<_, Option<i64>>(
-                    "SELECT process_chain_id FROM t_part WHERE id = $1 AND deleted_at IS NULL",
-                )
-                .bind(batch.part_id)
-                .fetch_optional(repo.conn_mut())
-                .await?
-                .flatten();
-                let step_id_opt: Option<i64> = if let Some(chain_id) = chain_id_opt {
-                    ProcessChainRepo::resolve_step_id_by_process(
-                        repo.conn_mut(),
-                        chain_id,
-                        next_pid,
-                    )
-                    .await?
-                } else {
-                    // 无工艺链（手写工单的常态）：保留 batch 旧的
-                    // current_process_step_id（fallback 到入参快照）
-                    batch.current_process_step_id
-                };
                 // 切 holder worker → shelf（OCC）
                 //
                 // 2026-09-30 修复：RETURNED 是全仓唯一**推进工序**的
-                // 路径 —— 工人在 P1 完工、扫 RETURNED 传 next_process_id=P2，批次
-                // 归还货架后必须落进 **P2** 的候选池。此前 `mark_batch_returned` 不写
+                // 路径 —— 工人在 P1 完工、扫 RETURNED，批次归还货架后必须落进 **P2**
+                // 的候选池。此前 `mark_batch_returned` 不写
                 // `current_process_id`，批次会带着 P1 落回 P1 池（migration 004 确立
                 // 的「唯一权威依据」在主干流程上说谎）。
                 //
-                // 传 `Some(next_pid)` 而非「chain 软删时 fallback 旧值」：`next_pid`
-                // 已在上方通过 `t_shelf_process WHERE shelf_id=$1 AND process_id=$2`
-                // 校验（真实映射到该货架的 t_process.id），且 RETURNED 的业务语义就是
-                // 「这批要进 P2 池」。chain 被软删只导致解析不出 P2 对应的 step
-                // （**显示用定位信息**写不了），不影响**池归属**该写成 P2 —— 若此时
-                // fallback 旧值，恰好让「RETURNED 不推进工序」的缺陷换个条件复现。
+                // 2026-10-09：step 指针与 `current_process_id` **成对推进** ——
+                // `step_id_opt` 自此真正落库（`mark_batch_returned` 的
+                // `current_process_step_id = COALESCE($5, 原值)`），批次在链内的位置
+                // 指针不再停在首次定位那一步。
+                //
+                // ⚠️ `t_part.process_chain_id` 是**可空列**（baseline migration 001
+                // 建表时 `process_chain_id bigint` 无 NOT NULL，列 COMMENT 明写
+                // 「NULL = 未制定工艺链」），手工工单无链是常态。链 id 一律经
+                // `shared::batch::optional_process_chain` / `optional_step_id` 取，
+                // 它们按 `Option<i64>` 收（外层 `Option` 由 `fetch_optional` 表示
+                // 「有没有行」，**不是**列的类型；列的可空性收在 `O` 里，末尾
+                // `.flatten()` 把两层压成一层）。若改成按 `i64` 解码，
+                // `t_part` 查询会在 `column 0` 上抛
+                // `error occurred while decoding column 0: unexpected null; try
+                // decoding as an Option` 整笔 500 —— 且因为发生在下面的 `if let`
+                // **之前**，「无链时保留批次旧 step」那条分支对手写工单恒不可达。
+                // 回归见
+                // `tests/production/queue.rs::worker_scan_returned_without_process_chain_succeeds`。
+                // 同款反模式（`Option<i64>` 包当前 `NOT NULL` 的列，列一旦变可空就
+                // 同样 500）另见 `prod/shelf_process/repo.rs::find_first_shelf_for_process`。
                 let n = repo
                     .mark_batch_returned(
                         batch.id,

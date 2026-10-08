@@ -258,8 +258,8 @@ impl QueueService {
     /// 6. 按 (from, to) 选 SQL：
     ///    - POOL → WORKER：复用 `take_specific_from_pool`（service 入口已 fetch batch，
     ///      走 OCC `WHERE version = $exp` 单 SQL 原子切换）
-    ///    - WORKER → POOL：复用 `part_mark_batch_returned`（**去掉 step 写入**，
-    ///      2026-09-30 重构）
+    ///    - WORKER → POOL：复用 `part_mark_batch_returned`（**工序与 step 都不写**：
+    ///      池内移动，「退回不改工序归属」）
     ///    - WORKER → WORKER：新加 `move_worker_to_worker`（同样不写 step）
     /// 7. 写 part_event（`MOVED` 类型，note 含 from→to 描述）
     /// 8. `PartService::sync_from_batch_change` 同步 part 派生列

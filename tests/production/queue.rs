@@ -610,6 +610,51 @@ pub(crate) async fn insert_worker_held_part(
     (part_id, batch_id, step_id)
 }
 
+/// 给某条链**追加**一道 step，返回 step_id。
+///
+/// 2026-10-09：`insert_worker_held_part` / `insert_pool_part` 两个 fixture 只建
+/// **一道** step（`sort_order = 1`）。而 worker-scan RETURNED 的新不变式要求目标
+/// 工序登记在链内（链内找不到 ⇒ `20702`，见
+/// `shared::batch::guards::optional_step_id` 的 doc），所以「RETURNED 推进到**另一
+/// 道**工序」的用例必须先把那道工序补进链里。`sort_order` 用 20（稀疏）——
+/// 读侧「下一道」按 `sort_order > 当前` 取，稀疏链才是它的判别性输入。
+pub(crate) async fn append_chain_step(
+    pool: &PgPool,
+    chain_id: i64,
+    process_id: i64,
+    sort_order: i32,
+) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+    let now = now_naive();
+    let step_id = pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .next_id();
+    sqlx::query(
+        "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, \
+         estimated_minutes, version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, $3, $4, 30, 0, $5, 0, $5, 0)",
+    )
+    .bind(step_id)
+    .bind(chain_id)
+    .bind(sort_order)
+    .bind(process_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("append chain step");
+    step_id
+}
+
+/// 取某个 part 当前绑定的链 id（前置断言用）。
+pub(crate) async fn part_chain_id(pool: &PgPool, part_id: i64) -> Option<i64> {
+    sqlx::query_scalar("SELECT process_chain_id FROM t_part WHERE id = $1")
+        .bind(part_id)
+        .fetch_one(pool)
+        .await
+        .expect("query t_part.process_chain_id")
+}
+
 /// 把 part_id 给定批次标为 worker 持有（针对 pool→worker 流转后的批次）。
 pub(crate) async fn count_held_by_worker(pool: &PgPool, worker_id: i64) -> i64 {
     sqlx::query_scalar!(
@@ -739,6 +784,11 @@ async fn worker_scan_returned_triggers_refill() {
 /// 仍带 `current_process_id=PROC-B` → 落回 **PROC-B** 池。这正是 migration 004
 /// 确立的「唯一权威依据」在主干流程上说谎。
 ///
+/// 2026-10-09：fixture 补一道链 step（`append_chain_step`）。RETURNED 的目标工序
+/// 现在必须在链内 —— 链内找不到就以 `20702` 拒收（`optional_step_id` 的「真数据
+/// 错误」判定），而本用例要验的是「推进 `current_process_id`」，前提就是目标工序
+/// 在链内。断言本身逐字未动。
+///
 /// 本测试直接打用户报告的那个症状面：扫完后分别查 PROC-B / PROC-C 两个池，
 /// 断言批次只在 PROC-C 池里。
 #[tokio::test]
@@ -764,8 +814,16 @@ async fn worker_scan_returned_advances_current_process_id() {
 
     let worker = insert_worker(&pool, "BC002B", "工2B", Some(wt)).await;
     // 工人持有 1 件 IN_PROCESS+WORKER 批次，current_process_id = proc_b（起点工序）
-    let (_held_part, held_batch, _step) =
+    let (held_part, held_batch, _step) =
         insert_worker_held_part(&pool, customer, "H-002B", worker, proc_b, 1, true).await;
+    // 2026-10-09：把 RETURNED 的目标工序 proc_c 补进链里（fixture 只建一道 step）。
+    // 新不变式下「链是有的，却没把目标工序登记进链内」是**真数据错误**（`20702`
+    // `BIZ_PROCESS_CHAIN_STEP_NOT_FOUND`），而本用例要验的是「RETURNED 推进
+    // current_process_id」，前提必须是目标工序在链内。
+    let chain_id = part_chain_id(&pool, held_part)
+        .await
+        .expect("fixture 应给该 part 绑了链");
+    let _proc_c_step = append_chain_step(&pool, chain_id, proc_c, 20).await;
 
     let (app, token, _pool) = login_shelf_account(pool.clone(), "user2b", &[prod_shelf]).await;
     let (s, env) = send(
@@ -945,6 +1003,294 @@ async fn worker_scan_returned_without_process_chain_succeeds() {
         "part 无工艺链时 RETURNED 应保留批次既有 current_process_step_id({old_step})，实际 {:?}",
         after.1
     );
+}
+
+/// 造一个「**已绑链的 PENDING 批次**」，链内 `process_ids` 按数组顺序占
+/// `sort_order` 10 / 20 / 30…（稀疏）。返回 `(part_id, batch_id, step_ids)`。
+///
+/// 2026-10-09 新增：`insert_pool_part` 造的是「**已下发**且在池」的批次
+/// （`IN_PROCESS` + `PRODUCTION_SHELF` + 指针已落链首），而「dispatch 按链首
+/// 下发」这条不变式的输入恰恰是 dispatch **之前**的形态 —— PENDING、指针 NULL。
+/// 两者不能互相顶替，故单开一个 helper。
+pub(crate) async fn insert_pending_part_with_chain(
+    pool: &PgPool,
+    customer_id: i64,
+    serial_no: &str,
+    process_ids: &[i64],
+) -> (i64, i64, Vec<i64>) {
+    use hsh_erp_rust::infra::clock::now_naive;
+    let now = now_naive();
+    let today = now.date();
+    let chain_id = pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .next_id();
+    sqlx::query(
+        "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, \
+         updated_at, updated_by) VALUES ($1, $2, 0, $3, 0, $3, 0)",
+    )
+    .bind(chain_id)
+    .bind(format!("chain-{serial_no}"))
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert chain");
+    let mut step_ids = Vec::new();
+    for (i, pid) in process_ids.iter().enumerate() {
+        step_ids.push(append_chain_step(pool, chain_id, *pid, (i as i32 + 1) * 10).await);
+    }
+    let part_id = pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .next_id();
+    sqlx::query(
+        "INSERT INTO t_part (id, serial_no, name, drawing_no, applicant_name, \
+         request_date, planned_delivery_date, system_delivery_date, status, \
+         is_urgent, next_process_id, customer_id, quantity, version, created_at, \
+         updated_at, process_chain_id) \
+         VALUES ($1, $2, 'pending-chain-item', 'D-PENDCH', $2, $3, $3, $3, 'PENDING', \
+         false, NULL, $4, 1, 0, $5, $5, $6)",
+    )
+    .bind(part_id)
+    .bind(serial_no)
+    .bind(today)
+    .bind(customer_id)
+    .bind(now)
+    .bind(chain_id)
+    .execute(pool)
+    .await
+    .expect("insert t_part with chain");
+    let batch_id = pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .next_id();
+    // 初始批次：PENDING / location NULL / 指针与工序均 NULL（dispatch 的真实输入）
+    sqlx::query(
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, version, \
+         created_at, updated_at) VALUES ($1, $2, 1, 1, 'PENDING', 0, $3, $3)",
+    )
+    .bind(batch_id)
+    .bind(part_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_part_batch PENDING");
+    (part_id, batch_id, step_ids)
+}
+
+/// 场景 2e（2026-10-09 新增）：**顺应工序**时 RETURNED 自动按链推进 —— 请求体
+/// **不带** `next_process_id`，后端自己查链上下一道，两列同时推进。
+///
+/// ## 为什么这条用例是端到端的
+/// 它把三条写点串成一条真实主干流：
+/// 1. `POST /prod/queue/dispatch` —— 落**链首** step（`current_process_id` =
+///    链首工序、`current_process_step_id` = 链首 step）；
+/// 2. `POST /prod/queue/move` POOL→WORKER —— 批次压到工人手上（工序与指针都不动）；
+/// 3. `POST /prod/batches/worker-scan` RETURNED —— **不带** `next_process_id`。
+///
+/// 只有第 1 步把指针落到链首 step，第 3 步的 `ChainPosition::is_pointer_consistent`
+/// 才会为真、自动推进分支才可达。缺任一步本用例都会退化成「要求前端显式指定」
+/// 那条分支（返回 40001）。
+///
+/// ## 断言
+/// 推进后 `current_process_id` = 第二道工序、`current_process_step_id` =
+/// 第二道 step（**两列一起动**，这正是 `mark_batch_returned` 本轮恢复写 step 的
+/// 目的）。指针停在链首 step 而工序推进了那种「两列不同步」的形态，正是本次要消灭
+/// 的状态。
+#[tokio::test]
+async fn worker_scan_returned_advances_step_pointer_when_process_chain_is_consistent() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "POOL2E").await;
+    // 链 = [PROC-2E1(10), PROC-2E2(20)]；工种只映射第一道（否则 refill 会把刚
+    // 归还的批次又抢回工人，干扰「落进第二道池」的断言）
+    let proc_1 = seed_process(&pool, "PROC-2E1", "工序2E1").await;
+    let proc_2 = seed_process(&pool, "PROC-2E2", "工序2E2").await;
+    let wt = insert_work_type(&pool, "WT-2E", "工种2E", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc_1).await;
+    // 同一货架映射两道工序：dispatch 按链首解析货架、RETURNED 按推导出的第二道
+    // 校验货架映射，两者都要过各自的货架守卫
+    let prod_shelf = insert_shelf(&pool, "PROD-2E", "PROD-2E", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc_1).await;
+    link_shelf_to_process(&pool, prod_shelf, proc_2).await;
+
+    let worker = insert_worker(&pool, "BC002E", "工2E", Some(wt)).await;
+    let (_part_id, batch_id, step_ids) =
+        insert_pending_part_with_chain(&pool, customer, "P-002E", &[proc_1, proc_2]).await;
+    let head_step = step_ids[0];
+    let second_step = step_ids[1];
+
+    // 前置：dispatch 之前指针与工序都必须是 NULL（真实输入形态）
+    let before: (Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT current_process_id, current_process_step_id FROM t_part_batch WHERE id = $1",
+    )
+    .bind(batch_id)
+    .fetch_one(&pool)
+    .await
+    .expect("query pending batch");
+    assert_eq!(
+        before,
+        (None, None),
+        "前置：PENDING 批次的工序与链内指针都应为 NULL"
+    );
+
+    let (app, mgr) = login_manager_with_username(&pool, "admin_pool2e").await;
+
+    // 1. dispatch —— 落链首 step（请求里刻意传第二道工序，它必须被忽略）
+    let (s1, env1) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/prod/queue/dispatch",
+            Some(json!({
+                "targets": [{
+                    "batch_id": batch_id.to_string(),
+                    "target_process_id": proc_2.to_string(),
+                }]
+            })),
+            Some(&mgr),
+        ),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK, "dispatch: {env1}");
+    let after_dispatch: (Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT current_process_id, current_process_step_id FROM t_part_batch WHERE id = $1",
+    )
+    .bind(batch_id)
+    .fetch_one(&pool)
+    .await
+    .expect("query after dispatch");
+    assert_eq!(
+        after_dispatch,
+        (Some(proc_1), Some(head_step)),
+        "dispatch 应落链首工序 + 链首 step（≠ 请求里的 proc_2）: {env1}"
+    );
+
+    // 2. move POOL → WORKER（工序不动，指针不动）
+    let (s2, env2) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/prod/queue/move",
+            Some(json!({
+                "batch_id": batch_id.to_string(),
+                // dispatch 刚把 version 从 0 推到 1
+                "version": 1,
+                "from": { "kind": "POOL",   "shelf_id": prod_shelf.to_string() },
+                "to":   { "kind": "WORKER", "worker_id": worker.to_string() },
+            })),
+            Some(&mgr),
+        ),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK, "move POOL→WORKER: {env2}");
+
+    // 3. worker-scan RETURNED —— **不带** next_process_id
+    let (app, token, _pool) = login_shelf_account(pool.clone(), "user2e", &[prod_shelf]).await;
+    let (s3, env3) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/batches/worker-scan",
+            Some(json!({
+                "serial_no": "P-002E",
+                "badge_code": "BC002E",
+                "event_type": "RETURNED",
+                "shelf_id": prod_shelf.to_string(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s3,
+        StatusCode::OK,
+        "顺应工序时不该要求前端传 next_process_id: {env3}"
+    );
+
+    // 断言：两列一起推进到第二道
+    let after: (Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT current_process_id, current_process_step_id FROM t_part_batch WHERE id = $1",
+    )
+    .bind(batch_id)
+    .fetch_one(&pool)
+    .await
+    .expect("query after RETURNED");
+    assert_eq!(after.0, Some(proc_2), "RETURNED 应自动推进到链上下一道工序");
+    assert_eq!(
+        after.1,
+        Some(second_step),
+        "RETURNED 应把链内位置指针一起推进到下一 step（两列必须同步）"
+    );
+    assert_ne!(
+        after.1,
+        Some(head_step),
+        "指针不能停在链首 step —— 那样下次放回就会按错误位置推导下一道"
+    );
+}
+
+/// 场景 2f（2026-10-09 新增，**行为变更**）：非顺应工序 + 请求体不带
+/// `next_process_id` ⇒ `40001 VALIDATION_ERROR`，文案点明成因。
+///
+/// 「非顺应」的成因共四种（无链 / 链已软删 / 指针漂移 / 链内工序重复）与链尾，
+/// 全落这一个分支。这里用场景 2d 的 fixture 形态（`with_chain=false`：part 无链、
+/// 批次带一个孤儿 step 指针）—— 指针非 NULL 但它所属的链不是锚链，判据同样为
+/// false。
+#[tokio::test]
+async fn worker_scan_returned_requires_next_process_id_when_not_consistent() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "POOL2F").await;
+    let proc_b = seed_process(&pool, "PROC-2F1", "工序2F1").await;
+    let proc_c = seed_process(&pool, "PROC-2F2", "工序2F2").await;
+    let wt = insert_work_type(&pool, "WT-2F", "工种2F", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc_b).await;
+    let prod_shelf = insert_shelf(&pool, "PROD-2F", "PROD-2F", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc_c).await;
+
+    let worker = insert_worker(&pool, "BC002F", "工2F", Some(wt)).await;
+    let (_held_part, held_batch, _step) =
+        insert_worker_held_part(&pool, customer, "H-002F", worker, proc_b, 1, false).await;
+
+    let (app, token, _pool) = login_shelf_account(pool.clone(), "user2f", &[prod_shelf]).await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/batches/worker-scan",
+            Some(json!({
+                "serial_no": "H-002F",
+                "badge_code": "BC002F",
+                "event_type": "RETURNED",
+                "shelf_id": prod_shelf.to_string(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "非顺应工序缺参应 422: {env}"
+    );
+    assert_eq!(env["code"], 40001, "应为 VALIDATION_ERROR: {env}");
+    let msg = env["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("next_process_id") && msg.contains("非顺应工序"),
+        "文案要同时点名「缺哪个字段」与「为什么必须填」，否则运营只会看到 422 去查前端: {env}"
+    );
+
+    // 批次不该被写脏
+    let (location, holder): (Option<String>, Option<i64>) =
+        sqlx::query_as("SELECT location, current_holder_id FROM t_part_batch WHERE id = $1")
+            .bind(held_batch)
+            .fetch_one(&pool)
+            .await
+            .expect("query batch after rejected scan");
+    assert_eq!(
+        location.as_deref(),
+        Some("WORKER"),
+        "拒收时批次仍应留在工人手上"
+    );
+    assert_eq!(holder, Some(worker));
 }
 
 /// 场景 3: 池空时 refill 返回 empty + pool_empty=true
