@@ -209,9 +209,7 @@ AND ( (cs.process_id IS NOT NULL AND cs.process_id = pb.current_process_id)
 | c | `outsource` | `GET /outsource-queue/processes/{id}` → `items[].has_process_chain`（`OutsourceQueueCandidate`） |
 | d | `prod::scan` | `GET /prod/scan/pickable` 与 `GET /prod/scan/held` → `items[].has_process_chain`（`ScanListItem`）。2026-10-10 自 part 域迁入报工台域，判据常量不变 |
 
-`PartListItem` 本身仍是 **7 个域共用**的 VO，但 2026-10-10 报工台两条 list 端点连同
-本列迁往 `prod::scan`（行 VO 换成 `ScanListItem`）后，它**已无任何填真值的端点** ——
-本域是上表行 a / b，`outsource` 是行 c。其余构造点（`From<TPart>` /
+`PartListItem` 本身仍是 `part` / `assembly` / `com::union_list` 三个域共用的 VO（wire 上共 4 个端点；`outsource` / `wx` 只在注释里拿它做字段对照、各有自己的 VO，不算），但 2026-10-10 报工台两条 list 端点连同本列迁往 `prod::scan`（行 VO 换成 `ScanListItem`）后，它**已无任何填真值的端点** —— 本域是上表行 a / b，`outsource` 是行 c。其余构造点（`From<TPart>` /
 `com::union_list` 的两个 project 函数）显式填 `false`：链位置是**批次级**事实，
 part 级行无从推导（没有 `#[serde(default)]`，漏赋值会编译失败）。
 

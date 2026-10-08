@@ -22,7 +22,7 @@ use crate::state::AppState;
 /// 权限：**任意已登录用户**（含 `SHELF_ACCOUNT`），故本 handler 不设角色闸门；
 /// 鉴权由 `CurrentUser` extractor 承担（未登录 → 401）。
 ///
-/// 出参是 `ScanWorkerBrief`（4 字段），不是 `WorkerOut`（12 字段）—— 收敛判据
+/// 出参是 `ScanWorkerBrief`（4 字段），不是 `WorkerOut`（11 字段）—— 收敛判据
 /// 与证据见 [`ScanWorkerBrief`] 的 doc。
 pub async fn verify_badge(
     State(state): State<Arc<AppState>>,

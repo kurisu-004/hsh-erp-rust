@@ -16,14 +16,15 @@
 一个域，URL 全部挂 `/api/v2/prod/scan/*`，**硬切、无 alias**。
 
 1. **立域**：`prod::scan`（URL `/api/v2/prod/scan/*`，5 端点）。判定依据是**前端
-   消费方** —— 5 条端点的唯一消费方是 `views/scan/` 三页（取件 / 放回 / 送检）+
-   扫工牌弹窗 + 队列看板的一条动作。后端看它们分属三域、依赖完全不同的模块；从
-   工厂现场看它们是**一台机器的五个按钮**。
-2. **行 VO 收敛**：`PartListItem`（40 字段，7 个域共用）→ `ScanListItem`（17 字段）。
+   消费方** —— 5 条端点的唯一消费方是 `views/production/scan/` 三页（取件 / 放回 /
+   送检）+ 扫工牌弹窗 + 队列看板的一条动作。后端看它们分属三域、依赖完全不同的
+   模块；从工厂现场看它们是**一台机器的五个按钮**。
+2. **行 VO 收敛**：`PartListItem`（40 字段，其余 3 个域的 4 个端点仍在下发）→
+   `ScanListItem`（17 字段）。
    报工台**零消费**的 23 个占位字段（`applicant_name` 写死空串、`customer_id` 写死
    `0`、`status` 写死 `"IN_PROCESS"`、4 个审计字段写死 epoch、`unit_price` /
    `total_price` 写死 `"0"`…）不再下发。逐字段证据见 §2.2。
-3. **出参收敛**：`WorkerOut`（12 字段）→ `ScanWorkerBrief`（4 字段）。报工台合计只读
+3. **出参收敛**：`WorkerOut`（11 字段）→ `ScanWorkerBrief`（4 字段）。报工台合计只读
    `id` / `badge_code` / `name` / `work_type_id`。`WorkerOut` **不删** ——
    `GET /prod/workers/{id}` 与 worker 列表端点仍在用它。
 4. **入参形态变更**：两条 list 端点的过滤键由 **path 参数改 query 参数**
@@ -94,8 +95,10 @@ catch-all 吃掉的那条路径，它的动态段是不是唯一一段」。part
 | `name` | string | `t_worker.name` | 顶栏显示 |
 | `work_type_id` | string \| null | `t_worker.work_type_id`（`serialize_i64_opt`） | 发 `GET /scan/pickable?work_type_id=` |
 
-**砍掉 8 个字段的 grep 证据**（前端 `views/scan/` 四个组件 + 三个 composable 全量
-grep `worker?.<字段>`，命中仅这 4 个）：
+**砍掉 7 个字段的 grep 证据**（前端 `views/scan/` 四个组件 + 三个 composable 全量
+grep `worker?.<字段>`，命中仅这 4 个）。⚠️ 下列路径是**迁移前路径**：报工台视图目录
+2026-10-10 自 `src/views/scan/` 搬进 `src/views/production/scan/`，本块是迁移**当时**
+跑出来的原始输出，保留原样以存证：
 
 ```
 $ grep -rno 'worker??\.\(id\|name\|badge_code\|work_type_id\|work_type_name\|id_card_no\|phone\|is_active\|version\|created_at\|updated_at\)' src/views/scan/ src/composables/ | sort | uniq -c
@@ -115,7 +118,7 @@ $ grep -rno 'worker??\.\(id\|name\|badge_code\|work_type_id\|work_type_name\|id_
    1 src/views/scan/ScanActionPicker.vue:31:worker?.name
 ```
 
-被砍的 8 个：`id_card_no` / `phone` / `is_active` / `work_type_name` / `version` /
+被砍的 7 个：`id_card_no` / `phone` / `is_active` / `work_type_name` / `version` /
 `created_at` / `updated_at`。其中 `work_type_name` 在 `verify_badge` 路径上本就恒
 `null`（service 不做工种名回填，只 `GET /workers/{id}` 与列表端点才填）。
 
@@ -363,7 +366,7 @@ HTTP 响应的 `refill.shelf_id` 同步。
 
 ### 6.2 字段
 
-- `ScanWorkerBrief` 相对 `WorkerOut` 删 8 个字段（§2.1）。
+- `ScanWorkerBrief` 相对 `WorkerOut` 删 7 个字段（§2.1）。
 - `ScanListItem` 相对 `PartListItem` 删 23 个字段（§2.2）。
 - `PickableQuery` 删 `shelf_id`；`ByWorkTypeQuery`（留在 part 域）同步删。
 
@@ -458,11 +461,15 @@ SQL 里聚合，一处他域的 service / repo 都不 import（连 `PartRepoTrai
 `chain_next_process_id` / `chain_next_process_name` / `chain_current_process_name` /
 `has_process_chain` 在**本 VO 内已无填充点**（唯一填它们的端点已迁往本域）。
 
-**字段保留**，理由：其余 6 个域（assembly / com::union_list / outsource / part / wx）
-的响应形状不能变，删字段是**破坏性 wire 变更**。按仓内既有先例（`has_cnc_program` 的
-处理）补了字段 doc 写明「恒 null / NONE / "0" / false」。它们在那些 part 级行上的
-正确值本来就是「不知道」—— 一个 part 的活跃批次可能不止一个，任一批次的链位置都是
-错锚点。
+**字段保留**，理由：`PartListItem` 在 wire 上还有 **3 个域的 4 个端点**在用 ——
+`part`（`GET /parts` + `GET /parts/by-work-type/{id}` 两条 list）、`assembly`
+（`POST /assemblies/{id}/children` 的单条响应）、`com::union_list`（`GET /com/union-list`），
+它们的响应形状不能变，删字段是**破坏性 wire 变更**。⚠️ `outsource` 与 `wx` **不在此列**：
+两者只在注释里拿 `PartListItem` 做字段对照，各有自己的 VO（`QuotablePartListOut` /
+`OutsourceSentPartListOut` 等、`wx::vo` 的窄投影），从不返回它 —— 算域数时别把
+「注释提到」当成「wire 上有」。按仓内既有先例（`has_cnc_program` 的处理）补了字段
+doc 写明「恒 null / NONE / "0" / false」。它们在那些 part 级行上的正确值本来就是
+「不知道」—— 一个 part 的活跃批次可能不止一个，任一批次的链位置都是错锚点。
 
 ---
 

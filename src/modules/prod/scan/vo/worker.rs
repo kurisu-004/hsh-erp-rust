@@ -6,8 +6,8 @@ use crate::shared::types::serialize_i64;
 
 /// `POST /api/v2/prod/scan/verify-badge` 出参（4 字段）。
 ///
-/// 2026-10-10 自 `prod::worker::vo::WorkerOut`（12 字段）收敛。报工台扫工牌后只读
-/// 4 个字段，其余 8 个是纯 wire 兼容负载：
+/// 2026-10-10 自 `prod::worker::vo::WorkerOut`（11 字段）收敛。报工台扫工牌后只读
+/// 4 个字段，其余 7 个是纯 wire 兼容负载：
 ///
 /// | 字段 | 报工台的用途 |
 /// |---|---|
@@ -16,7 +16,7 @@ use crate::shared::types::serialize_i64;
 /// | `name` | 顶栏显示 |
 /// | `work_type_id` | 发 `GET /scan/pickable?work_type_id=` |
 ///
-/// 被砍掉的 8 个：`id_card_no` / `phone` / `is_active` / `work_type_name` / `version`
+/// 被砍掉的 7 个：`id_card_no` / `phone` / `is_active` / `work_type_name` / `version`
 /// / `created_at` / `updated_at`。其中 `work_type_name` 在 `verify_badge` 路径上
 /// 本就恒 `null`（service 不做工种名回填，只 `GET /workers/{id}` 与列表端点才填）。
 ///
@@ -37,7 +37,7 @@ pub struct ScanWorkerBrief {
 mod tests {
     //! 出参形状守卫：键集合逐字钉死，前端多消费一个字段时立刻能看出来。
     //!
-    //! `ScanWorkerBrief` 只有 4 个键 —— 前端 `views/scan/` 四个页面合计只读这 4 个
+    //! `ScanWorkerBrief` 只有 4 个键 —— 前端 `views/production/scan/` 四个页面合计只读这 4 个
     //! （`worker?.id` / `worker?.badge_code` / `worker?.name` / `worker?.work_type_id`）。
     //! 将来真要加字段（例如顶栏要显示工种名），改这里 + 加消费方 + 同步前端类型。
     use super::ScanWorkerBrief;

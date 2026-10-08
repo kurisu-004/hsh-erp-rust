@@ -18,10 +18,11 @@
 //! - `pub use <sub>::*` 在本 mod.rs 重新导出，让 crate-root 可访问
 //!   （`hsh_erp_test_support::load_part_fixture` 直接可用）
 //!
-//! ## 与 `fixtures`（动态 helper）的分工
-//! - `fixtures`：动态 INSERT helper（`insert_user_with_password` / `add_role` 等），
-//!   计划 PR-C.Final 全部迁出后删除（PR-C 末删 `test-support/src/fixtures.rs`）
-//! - `fixture`（本目录）：预制 SQL 静态行集合，PR13 Phase F 引入的范本
+//! ## 与动态 INSERT helper 的分工
+//! - 本目录：预制 SQL 静态行集合（`fixtures/<domain>.sql`），PR13 Phase F 引入的范本
+//! - 原 `test-support/src/fixtures.rs`（动态 INSERT helper，如 `insert_user_with_password`
+//!   / `add_role`）已于 2026-09-24 PR-C.Final 随迁出全部删除：多数 helper 复制为各测试
+//!   文件底部的本地 async fn，零调用的直接删除。当前不存在「动态 helper 那一腿」
 
 pub mod _e2e;
 pub mod applicant;

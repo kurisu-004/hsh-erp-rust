@@ -78,9 +78,10 @@ pub struct WorkTypeListRow {
     /// `shared::batch::chain::HAS_PROCESS_CHAIN_EXPR` 的结果（判据 = 工单已绑链
     /// 且批次当前工序能在链内定位）。字段名即 SQL 别名（`FromRow` 按列名匹配）。
     ///
-    /// **按 `Option<bool>` 收**：`pickable` 侧那条 SELECT 按本文件的约定把
-    /// 「本端点不填」投影成 `NULL::boolean`，而 `NULL` 解不进非可空的 `bool`
+    /// **按 `Option<bool>` 收**：解码侧的安全网 —— `NULL` 解不进非可空的 `bool`
     /// （sqlx 报 `unexpected null; try decoding as an Option` ⇒ 整页 500）。
+    /// 本 struct 只被两条 SELECT 消费（`pickable` / `held`），两条都投影
+    /// `HAS_PROCESS_CHAIN_EXPR` 的真值，**不是** `NULL::boolean` ⇒ 恒 `Some`。
     has_process_chain: Option<bool>,
 }
 
@@ -114,7 +115,8 @@ impl WorkTypeListRow {
             chain_next_process_name: self.chain_next_process_name,
             chain_current_process_name: self.chain_current_process_name,
             // 链条上「这批货当前工序能不能在链内定位」（卡片绿色边框）。
-            // `pickable` 投影 `NULL::boolean` ⇒ 取保守默认 false（「没绑链」）。
+            // 两条 SELECT 都投影 `HAS_PROCESS_CHAIN_EXPR` 的真值，`unwrap_or(false)`
+            // 只是 `Option` 解包的兜底。
             has_process_chain: self.has_process_chain.unwrap_or(false),
             // 这两条端点不做 batch enrichment，位置恒 null。字段保留只为保住
             // 前端 `BatchPickerDialog.holderText` 的「键存在性」判据，理由见

@@ -112,8 +112,9 @@ impl ScanChainState {
 /// 「不知道」同向。`held` 侧才真正沿
 /// `shared::batch::chain::CHAIN_POSITION_LATERAL_SQL` 解析链并填值。
 ///
-/// `batch_id` / `batch_version` / `has_process_chain` / `process_chain_id` 四条
-/// 两条端点都填。
+/// `batch_id` / `batch_version` / `has_process_chain` 三条两条端点都填。
+/// ⚠️ `process_chain_id` 不在其列：`held` 侧投影 `p.process_chain_id`，`pickable`
+/// 侧投影 `NULL::bigint` ⇒ 报工台恒 `null`。
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanListItem {
     /// `t_part.id`（`serialize_i64` → JSON string）。列表卡 `v-for` key。

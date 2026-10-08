@@ -588,6 +588,22 @@ mod tests {
     /// 域隔离不违规：`shared::domain_guard::assert_no_foreign_domain` 只扫
     /// `src/modules/prod/scan/listing/`，而这条引用写在 part 域的文件里、且只在
     /// `#[cfg(test)]` 内 —— 产物代码零跨域依赖。
+    ///
+    /// ## 覆盖不到什么（2026-10-10 review 第 2 轮登记）
+    /// 本用例只锁「**同样 10 个输入**下两侧的 wire 字面量一致」，是**取样对拍**而非
+    /// **形状对拍**。以下三类漂移它一个都抓不到，且都不会让本用例变红：
+    ///
+    /// - 给一侧**新增枚举变体**（输入表里没有新变体的字面量，两侧对它都走
+    ///   `from_db_text` 的兜底分支）—— ⚠️ 这条**当前无任何守卫**，相邻的
+    ///   `serializes_as_uppercase_strings` 只逐字断言既有 3 个变体，不枚举全集；
+    /// - 改 `#[serde(rename)]` / `rename_all` / `alias`；
+    /// - 改 `Deserialize` 的接受集（`alias` / 自定义 `Deserialize`）。
+    ///
+    /// 后两条另有守卫：`ChainState` / `ScanChainState` 各自
+    /// `serializes_as_uppercase_strings`（钉大小写）+ `deserializes_from_uppercase_strings`
+    /// （钉小写必须**拒收** ⇒ 加 `alias` 立刻红）。要连「新增变体」也覆盖得比对两侧的
+    /// 变体集合相等，代价与收益不成比例，故**明确不补**：本用例的职责就是兜住
+    /// 「同一段映射被抄成两份」这一类漂移。
     #[test]
     fn from_db_text_matches_scan_chain_state_on_every_input() {
         use crate::modules::prod::scan::vo::ScanChainState;

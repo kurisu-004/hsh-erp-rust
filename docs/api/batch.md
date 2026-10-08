@@ -204,9 +204,9 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
 |---|---|
 | `POST /to-ship`、`POST /to-inspection`、批量同形两条 | 多域共用（`views/inspection/` + `views/delivery/`） |
 | ~~`POST /worker-scan`~~ | ~~`views/scan/`（扫码台）~~（2026-10-10 已迁往 `prod::scan`） |
-| `POST /scan/deliver` | `views/scan/`（扫码台） |
+| `POST /scan/deliver` | `views/production/scan/`（扫码台） |
 | `POST /{batch_id}/to-inspection` / `to-ship` / `to-process` | 多域共用（`views/inspection/` + `views/delivery/`） |
-| `POST /{batch_id}/scan-inspect` | `views/scan/`（扫码台） |
+| `POST /{batch_id}/scan-inspect` | `views/production/scan/`（扫码台） |
 | `POST /{batch_id}/deliver` | `views/delivery/`（送货单域） |
 | `POST /{batch_id}/complete` | 多域共用（`views/parts/` + `views/assemblies/` + `views/statistics/`） |
 | `POST /{batch_id}/start-repair`、`complete-repair`、`repair-dispatch`、`GET /repair`、`GET /repairing` | `views/repair/` |
@@ -222,6 +222,10 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
 | ~~`POST /worker-scan`~~、~~`POST /{batch_id}/pick-up`~~ | ~~`prod::scan`~~（2026-10-10 已剥离，报工台域） |
 
 ⚠️ 「多域共用」的几条是后续某一轮的**决策点**：搬之前需要先决定它归哪个域（取决于哪个页面先重构），不要两边都搬。
+
+⚠️ 划掉的三行里那个 `views/scan/` 是**迁移前路径**（报工台三页 2026-10-10 自
+`src/views/scan/` 搬进 `src/views/production/scan/`），记的是「当时按哪个页面认领」
+的判断依据；未划掉的行按现行路径记。
 
 ## 5. 域边界与公共设施
 

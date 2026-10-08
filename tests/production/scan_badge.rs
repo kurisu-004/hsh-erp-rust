@@ -130,8 +130,8 @@ async fn verify_badge_unknown_returns_20201() {
 /// ★ 出参形状：`ScanWorkerBrief` 只有 4 个键。
 ///
 /// 报工台四页合计只读 `id`（发 held 列表）/ `work_type_id`（发 pickable 列表）/
-/// `badge_code`（顶栏 + worker-scan 入参）/ `name`（顶栏）。后端多给 8 个
-/// `WorkerOut` 字段不会让任何 UI 多显示一行，却会让 Zod 逐个声明 8 个不会变的
+/// `badge_code`（顶栏 + worker-scan 入参）/ `name`（顶栏）。后端多给 7 个
+/// `WorkerOut` 字段不会让任何 UI 多显示一行，却会让 Zod 逐个声明 7 个不会变的
 /// 键；后端**少给**一个则顶栏直接空。这条断言把键集合钉死。
 #[tokio::test]
 async fn verify_badge_response_has_exactly_four_keys() {

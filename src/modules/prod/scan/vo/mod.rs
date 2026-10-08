@@ -5,7 +5,7 @@
 //! 会丢精度，参见 `shared::types` 模块 doc）。
 //!
 //! ## 分组
-//! - `worker.rs` —— `ScanWorkerBrief`（扫工牌 1 字段）
+//! - `worker.rs` —— `ScanWorkerBrief`（扫工牌 1 端点、4 字段）
 //! - `listing.rs` —— `ScanListItem` / `ScanListOut` / `ScanChainState`
 //!   （两条只读聚合端点的分页行）
 //! - `transition.rs` —— `WorkerScanCoreOut` / `WorkerScanOut`（放回 / 送检）
