@@ -63,6 +63,21 @@ pub struct DeliveryNoteLineItem {
     #[serde(serialize_with = "crate::shared::types::serialize_i64")]
     pub part_id: i64,
     pub batch_no: i32,
+    /// 2026-10-10 新增：**加入本送货单的先后次序**，本单内从 1 起递增；
+    /// `null` = 该批次未挂单（行本身不该出现，属脏值兜底）。
+    ///
+    /// `line_items[]` 的默认序即按本字段升序（`t_part_batch.delivery_seq`
+    /// `ASC NULLS LAST, id ASC`）。历史数据由 migration
+    /// `20261010000000_001_add_batch_delivery_seq` 按 `pb.id` 序回填，部署后与
+    /// 上线前的展示顺序逐行一致。
+    ///
+    /// 走普通 serde（同 `batch_no`）：它是**单内计数**不是雪花 id，不需要
+    /// `serialize_i64_opt`；也不 `skip_serializing_if`，保持字段恒定存在。
+    ///
+    /// 序号**可能不连续**（摘单只清被摘行、不重排剩余行，见
+    /// `PartBatchRepo::list_with_part_by_delivery_note`）⇒ 前端不要拿它推算行号
+    /// （`index + 1`），要行号用数组下标。
+    pub delivery_seq: Option<i32>,
     pub batch_label: String,
     pub serial_no: String,
     pub drawing_no: String,
@@ -145,4 +160,15 @@ pub struct DeliveryNoteListOut {
     pub total: i64,
     pub limit: i64,
     pub offset: i64,
+}
+
+/// `t_part_batch.delivery_seq`（bigint）→ [`DeliveryNoteLineItem::delivery_seq`]
+/// 的 `Option<i32>` 收口（本域两个装配点共用）。
+///
+/// 2026-10-10 新增：用裸 `as` 收窄而不是 `i32::try_from(..).ok()` —— 本列是**单张
+/// 送货单内的批次计数**（人工扫码的量级，离 i32 上限极远），而 `try_from` 失败回落
+/// `None` 会与「未挂单」的 NULL 混同、静默破坏行项默认序（NULLS LAST 把该行甩到
+/// 末尾），比一次理论上的截断更难发现。
+pub fn delivery_seq_i32(v: Option<i64>) -> Option<i32> {
+    v.map(|v| v as i32)
 }

@@ -22,6 +22,8 @@
 //! 6. 送货单 OCC：`note_version` 不匹配 ⇒ 40901
 //! 7. 未知序列号 ⇒ 404 / 21417
 //! 8. 出参是 `DeliveryNoteDetailOut`（含 `line_items`），前端可就地替换草稿卡
+//! 9. 行项默认序 = 加入本单的次序（`line_items[].delivery_seq`），不是批次 id；
+//!    顺带覆盖摘单写点把 `delivery_seq` 清 NULL
 //!
 //! ## 测试栈
 //! `tokio::test` + `test-support` 的 `send` / `json_request` / `login_token` /
@@ -496,5 +498,92 @@ async fn scan_entry_returns_full_detail_so_frontend_can_replace_draft_card() {
     assert!(
         d.get("scanned_serials").is_none(),
         "2026-10-08：`scanned_serials` 已从 VO 删除"
+    );
+}
+
+/// 2026-10-10 新增：行项默认序 = **加入本单的次序**，不是批次 id（建批次序）。
+///
+/// 场景刻意把两者反向：先建的批次（id 小）**后扫码**，后建的批次（id 大）**先扫码**。
+/// 排序键若仍是 `pb.id ASC`，`line_items[0]` 会是后扫的那个 —— 与用户看到的
+/// 扫码次序相反。`delivery_seq` 钉死正确口径。
+///
+/// 顺带覆盖摘单写点：`remove-batches` 把批次移出本单时 `delivery_seq` 归 NULL，
+/// 重新挂到别单时会按新单重新计数，不带旧序号。
+#[tokio::test]
+async fn scan_entry_orders_line_items_by_delivery_seq_not_batch_id() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let l1 = insert_l1(&pool, "挂单次序").await;
+    let l2 = insert_l2(&pool, "挂单次序二厂", l1).await;
+    let part_scanned_first = insert_part(&pool, "先扫件", "SQ01", l2, None, 10).await;
+    let part_scanned_second = insert_part(&pool, "后扫件", "SQ02", l2, None, 10).await;
+    // ⚠️ 建批顺序与扫码顺序**故意相反**：后扫件的批次 id 更小
+    let batch_second = insert_ready_batch(&pool, part_scanned_second, 1, 5).await;
+    let batch_first = insert_ready_batch(&pool, part_scanned_first, 1, 5).await;
+    assert!(
+        batch_second < batch_first,
+        "前置条件：后扫的批次 id 必须更小，否则本用例测不出排序键切换"
+    );
+
+    let (s1, env1) = scan_entry(
+        &app,
+        &token,
+        "SQ01",
+        None,
+        part_entry(part_scanned_first, 5),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK, "第一次扫码: {env1}");
+    let v1 = env1["data"]["version"].as_i64().unwrap();
+
+    let (s2, env2) = scan_entry(
+        &app,
+        &token,
+        "SQ02",
+        Some(v1 as i32),
+        part_entry(part_scanned_second, 5),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK, "第二次扫码: {env2}");
+
+    let items = env2["data"]["line_items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(
+        items[0]["part_id"].as_str().unwrap(),
+        part_scanned_first.to_string(),
+        "行项默认序必须按加入本单的次序，不是批次 id: {env2}"
+    );
+    assert_eq!(items[0]["delivery_seq"], 1);
+    assert_eq!(
+        items[1]["part_id"].as_str().unwrap(),
+        part_scanned_second.to_string()
+    );
+    assert_eq!(items[1]["delivery_seq"], 2);
+
+    // 摘单 ⇒ delivery_seq 归 NULL（与 delivery_note_id 同点清）
+    let note_id = env2["data"]["id"].as_str().unwrap().to_string();
+    let v2 = env2["data"]["version"].as_i64().unwrap();
+    let (s3, env3) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/com/delivery/note/{note_id}/remove-batches"),
+            Some(json!({
+                "batch_ids": [batch_first.to_string()],
+                "version": v2,
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s3, StatusCode::OK, "摘单应成功: {env3}");
+    let seq_left: Option<i64> =
+        sqlx::query_scalar("SELECT delivery_seq FROM t_part_batch WHERE id = $1")
+            .bind(batch_first)
+            .fetch_one(&pool)
+            .await
+            .expect("read delivery_seq");
+    assert_eq!(
+        seq_left, None,
+        "摘单必须清 delivery_seq，否则该批次改挂别单时会带旧序号"
     );
 }

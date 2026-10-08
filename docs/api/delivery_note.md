@@ -29,6 +29,14 @@
 
 ### 0.1 变更记录
 
+- **2026-10-10 行项默认序改为「加入本单的次序」（§2.3.1）**：单据详情与批量详情的
+  `line_items[]` 排序键从 `t_part_batch.id` 切成 `delivery_seq ASC NULLS LAST, id ASC`
+  —— 批次 id 是**建批顺序**，整批直接挂单的批次用的是建批时的 id，「先扫 A 后扫 B、
+  但 A 建得更早」会把 A 排到前面。为此新增 DB 列 `t_part_batch.delivery_seq`
+  （migration `20261010000000_001_add_batch_delivery_seq`，按 `pb.id` 序回填历史行、
+  部署无视觉跳变）与行项字段 `DeliveryNoteLineItem.delivery_seq`（`number | null`，
+  走普通 serde）。挂单写点赋 `MAX+1`、摘单 / 单据软删写点置 NULL。
+  ⚠️ 与本仓既有的 `sort_order`（配置显示序）语义不同，不要混用。
 - **2026-10-09 `POST /scan` 占用闸门的作用域收窄（§4.1）**：21406（批次被其它送货单占用）
   **不再顺带拒绝整个请求**，与同日的 21405 状态闸门收敛成同口径。判定权同样交给 DP ——
   该零件的可入单量够本次要的量就正常入单，被占用的批次只是不参与分配；只有凑不出时才报
@@ -165,13 +173,14 @@ BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY`、`21420 BIZ_DELIVERY_NOTE_LOCKED_PART`
 
 `head`（`#[serde(flatten)]` 的 `DeliveryNoteOut`，wire 上与 head 字段同层）+ `line_items`。
 
-### 2.3 `DeliveryNoteLineItem`（26 字段，**行 = 批次**，`id` = `t_part_batch.id`）
+### 2.3 `DeliveryNoteLineItem`（27 字段，**行 = 批次**，`id` = `t_part_batch.id`）
 
 | 字段 | 类型 | 后端 SQL 来源 |
 |---|---|---|
 | `id` | string | `t_part_batch.id`（行身份） |
 | `part_id` | string | `t_part_batch.part_id` |
 | `batch_no` | number | `t_part_batch.batch_no` |
+| `delivery_seq` | number \| null ★ | `t_part_batch.delivery_seq` —— **加入本单的先后次序**，本单内从 1 起递增；`null` = 未挂单。`line_items[]` 的默认序即按它升序，见 §2.3.1 |
 | `batch_label` | string | 派生：`"{serial_no}B{batch_no:02}"`；无序列号时 `"批次{batch_no}"` |
 | `serial_no` | string | `t_part.serial_no`（可空 → `""`） |
 | `drawing_no` | string | `t_part.drawing_no` |
@@ -199,6 +208,29 @@ BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY`、`21420 BIZ_DELIVERY_NOTE_LOCKED_PART`
 **装配件被软删 / 不存在时**：`assembly_id` 仍有值（那是 `t_part` 上的列）但
 `assembly_*` 与 `shippable_sets` 全为 `null`（`AssemblyRepo::list_by_ids(include_deleted=false)`
 解析不到）—— 前端据此把子件当散件行展示。
+
+#### 2.3.1 ★ `line_items[]` 默认序 = 加入本单的次序
+
+单据详情 `GET /{id}` 与批量详情 `GET /batch-detail` 的 `line_items[]` 排序键是
+`t_part_batch.delivery_seq ASC NULLS LAST, t_part_batch.id ASC`
+（`PartBatchRepo::list_with_part_by_delivery_note` /
+`list_with_part_by_delivery_note_ids`；批量详情逐单分桶保持 SQL 返回序 ⇒ 桶内同序）。
+**不**再按 `t_part_batch.id` 单键排序。
+
+| 判据 | 口径 |
+|---|---|
+| **为什么不用批次 id** | id 是**建批顺序**：只有拆批路径产生新批次 id（反映扫码时刻），整批直接挂单的批次用的是建批时的 id ⇒「先扫 A、后扫 B，但 A 的批次建得更早」会把 A 排到前面，与用户看到的扫码次序相反 |
+| **`delivery_seq` 怎么来** | 挂单写点（`PartBatchRepo::attach_to_note`，扫码 Step 7 在一个事务里循环调用）赋 `COALESCE(MAX(delivery_seq),0)+1`（限本单）；READ COMMITTED 下同事务内前几次 UPDATE 对后续 `MAX()` 可见 ⇒ **同一批挂单动作内部**产出连续的 1,2,3…，但整单生命周期内的 seq 不保证连续（见「序号空洞」） |
+| **并发安全** | 同一张单的并发扫码被 `POST /scan` Step 4 的 `note_version` OCC 串行化（草稿刚建出时是 Step 8 的 `note.version++` OCC），败者整事务回滚 ⇒ 同一单上不会有两条事务同时读到同一个 `MAX` |
+| **摘单 / 单据软删** | 与 `delivery_note_id = NULL` 同一条 UPDATE 置 `delivery_seq = NULL`（`remove_batches` / `soft_delete`）⇒ 不变式 `delivery_seq IS NULL ⟺ delivery_note_id IS NULL` 恒成立；重新挂单时 seq 按新单重新计 |
+| **序号空洞** | 本单内 seq **不重复**、但**可能不连续**，空洞不影响相对序（排序仍正确）：① 摘单只清被摘那行、**不重排**剩余行 ⇒ 摘掉 seq=2 之后本单是 1,3,4；② 回填的 `ROW_NUMBER()` 只按 `delivery_note_id IS NOT NULL` 过滤、不看 `deleted_at`，而展示查询按 `deleted_at IS NULL` 过滤 ⇒ 表里若有软删的批次行，它占的号在结果集里看不到。前端要行号用数组下标，不要拿 `delivery_seq` 推算 |
+| **历史数据** | migration `20261010000000_001_add_batch_delivery_seq` 按 `ROW_NUMBER() OVER (PARTITION BY delivery_note_id ORDER BY id)` 回填 ⇒ 与上线前的 `id ASC` **逐行一致**，部署无视觉跳变 |
+| **⚠️ 从备份恢复的库** | `scripts/restore_from_backup.sh` 默认 `REBUILD_SCHEMA=1` = `DROP SCHEMA` → `sqlx migrate run` → 灌 dump：回填 UPDATE 跑在**空表**上、dump 里也没有本列 ⇒ 恢复出来的库里**已挂单批次的 `delivery_seq` 全为 NULL**，`line_items[].delivery_seq` 也是 null。此时展示整体退回 `id ASC`（= 上线前行为，**不是故障**）；但该单**此后新挂**的行 seq 从 1 重新起（`MAX` 只看得到新写的非 NULL 行），而 `NULLS LAST` 让非 NULL 排在前面 ⇒ 新扫的批次显示在恢复出来的旧行**上面**。要让该库的行项序正确，只能按各单 `pb.id` 序手工回填一次 |
+| **`NULLS LAST` + `id ASC` 的作用** | `NULLS LAST` 兜「`delivery_note_id` 有值而 seq 为 NULL」的脏值（外部改坏、或上面那条从备份恢复的库）；末尾 `id ASC` 兜同 seq / 同 NULL 时结果集仍确定 |
+| **⚠️ 与 `sort_order` 无关** | 本仓既有 `sort_order`（iam 菜单 / 外协公司 / 外协工序能力清单）全是**配置显示序**（人工维护的静态排列）；本列是挂单时自动递增的**业务事实**，且只在「这一张送货单」的语境内有意义（同一批次先后挂过两张单时，seq 相对各自那张单重新计） |
+
+`line_items[].delivery_seq` 走**普通 serde**（同 `batch_no`）：它是单内计数不是雪花 id，
+不需要 `serialize_i64_opt`，也不 `skip_serializing_if` —— 字段恒定存在。
 
 ### 2.4 `DeliveryNoteListOut` / `BatchDeliveryDetailData`
 
@@ -612,7 +644,7 @@ schema 与页面都在用」。
 | `t_delivery_note_counter` | 单号日计数器（`next_delivery_note_no`） |
 | `t_part` | 零件 / 装配件子件（扫码树、入单、详情行项） |
 | `t_assembly` | 装配件（扫码树节点、套装数分子） |
-| `t_part_batch` | 批次（入单分配、拆批、挂单、扫码树批次层） |
+| `t_part_batch` | 批次（入单分配、拆批、挂单、扫码树批次层）；`delivery_seq` 列承载行项默认序（§2.3.1），本域是它的**全部写点**（挂单赋值 / 摘单与单据软删置 NULL） |
 | `t_customer` | L1 / L2 客户（`customer_path`、`L1_id` 推导、成员名） |
 | `t_worker` | 指定司机（`driver_worker_name`、`GET /drivers`） |
 | `t_work_type` | 工种（`送货司机` 判据） |
@@ -655,6 +687,7 @@ schema 与页面都在用」。
 | 15 | VO 字段裁剪 | 从 Zod schema 里删 §6.2 的 29 个字段（多余字段若非 `.strict()` 会静默通过，删 schema 才是真删） |
 | 16 | **删 `delivery_dispatch` 菜单页** | ⛔ 后端已下线该菜单（`seeds/menu.sql` §3.5 软删 + §4.1 / §4.3 白名单移除 + §4.6 回收 `role_menu`），而前端 `src/views/delivery-dispatch/DispatchNoteList.vue` 仍在。**该页依赖的恰好是本轮删掉的两条端点**（`GET /pickup-pending` / `POST /{id}/pickup-scan`）⇒ 不删就是「菜单能点、页面能开、每个请求都 404」的活条目。后端无 alias，这是前端必须同步删的一页 |
 | 17 | `line_items[].customer_id` | ★ `DeliveryNoteLineItem` **新增** `customer_id: string`（L2 叶子 id，必填非空）。打印分组键从 `customer_name` 切成 `customer_id`：`t_customer.name` 只有**非唯一** btree 索引，同名 L2 会被并进同一张 sheet，而打印产物是客户签字的收货凭证。Zod schema 里加必填 `customer_id: z.string()` |
+| 18 | `line_items[].delivery_seq` | ★ `DeliveryNoteLineItem` **新增** `delivery_seq: number \| null`（**加入本单的次序**，口径见 §2.3.1）。数组顺序已由后端按它排好，前端**零改动即得「按扫码先后」的展示**；Zod schema 里加 `delivery_seq: z.number().nullable()`，供页面按需展示序号列 |
 
 ### 8.4 已知偏差登记
 

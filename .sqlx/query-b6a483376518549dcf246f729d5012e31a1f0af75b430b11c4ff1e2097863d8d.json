@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE t_part_batch\n            SET delivery_note_id = $3,\n                delivery_seq     = (SELECT COALESCE(MAX(delivery_seq), 0) + 1\n                                    FROM t_part_batch\n                                    WHERE delivery_note_id = $3::bigint),\n                version          = version + 1,\n                updated_at       = $4,\n                updated_by       = $5\n            WHERE id = $1 AND version = $2 AND deleted_at IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int4",
+        "Int8",
+        "Timestamp",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b6a483376518549dcf246f729d5012e31a1f0af75b430b11c4ff1e2097863d8d"
+}
