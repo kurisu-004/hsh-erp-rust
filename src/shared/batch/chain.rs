@@ -2,8 +2,9 @@
 //!
 //! ## 抽这层的动机
 //! 「这批货当前处在工序链的哪一步、下一道是哪道」原先只有**读侧**一份实现在
-//! `part::service::phase1::work_type::list_by_worker`（内联 `LEFT JOIN LATERAL`），
-//! 写侧（`prod::batch::service::worker_scan` 的 RETURNED 分支）另有��份**廉价版**：
+//! 报工台的 held 列表 SQL（`prod::scan::listing::repo::fetch_held`，内联
+//! `LEFT JOIN LATERAL`），写侧（`prod::scan::service::worker_scan` 的 RETURNED
+//! 分支）另有��份**廉价版**：
 //! 按 `process_id` 在链内反查 `step_id`，两套口径互不知情。
 //!
 //! 2026-10-09 起的不变式把两条路径合并了：dispatch 落链首 step、worker 放回时

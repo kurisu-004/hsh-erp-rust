@@ -14,8 +14,8 @@
 //! - `excel_match.rs` 采购订单 Excel 匹配（2026-10-06 新增，从 `events.rs` 迁出；
 //!   含分档决策纯函数 `resolve_match_tier` + 匹配索引 `ExcelMatchIndex`）
 //! - `lifecycle_helpers.rs` 批次列表（list_batches）
-//! - `work_type.rs` 工种维度只读（list_by_work_type / list_pickable_by_work_type /
-//!   list_by_worker）
+//! - `work_type.rs` 工种维度只读（list_by_work_type；2026-10-10 起另两条随报工台
+//!   迁往 `crate::modules::prod::scan::listing`）
 //!
 //! 状态机扩展见 `part/statemachine.rs`（2026-09-29 缩至 19 个合法迁移）。
 //! 错误码全部沿用 `shared/error.rs::code` 已声明常量（201xx / 205xx）。

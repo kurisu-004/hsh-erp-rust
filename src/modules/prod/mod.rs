@@ -95,6 +95,7 @@ pub mod process_chain;
 pub mod process_design;
 pub mod programming;
 pub mod queue;
+pub mod scan;
 pub mod shelf_process;
 pub mod work_type;
 pub mod worker;
@@ -116,6 +117,10 @@ pub fn router() -> Router<Arc<AppState>> {
         .nest("/process-design", process_design::router())
         // 2026-10-05 新增：prod::inspection（扫码查询：装配件 → 子件 → 批次 三层树）
         .nest("/inspection", inspection::router())
+        // 2026-10-10 新增：prod::scan（报工台：扫工牌 + 取件 / 放回列表 +
+        // worker-scan + pick-up 共 5 端点，自 prod::worker / part / prod::batch
+        // 三域硬切迁入，**无 alias**）
+        .nest("/scan", scan::router())
         // 2026-10-02 新增：prod::shelf_process（货架 ↔ 工序映射，3 端点，自 shelf 域硬切）
         .nest("/shelf-processes", shelf_process::router())
 }

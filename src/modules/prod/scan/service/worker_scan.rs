@@ -1,6 +1,9 @@
-//! prod::batch 的工人扫码台主入口：`POST /api/v2/prod/batches/worker-scan`
+//! prod::scan 的报工台主入口：`POST /api/v2/prod/scan/worker-scan`
 //!
 //! worker 把持有件通过扫码台 **RETURNED**（放回生产架）/ **INSPECTED**（直接送检）。
+//!
+//! 2026-10-10 自 `prod::batch::service::worker_scan` 搬来（硬切无 alias）：
+//! 唯一消费方是报工台三页，按「目标域按前端消费方判定」的规约归 `prod::scan`。
 //!
 //! ## 与 refill 的原子性
 //! 本文件只承载 `worker_scan_event`（状态翻转 + 写事件日志）；refill 由 handler
@@ -46,16 +49,15 @@ use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::service::PartService;
 use crate::modules::part::statemachine::PartStatus;
-use crate::modules::prod::batch::dto::WorkerScanRequest;
-use crate::modules::prod::batch::vo::WorkerScanCoreOut;
-use crate::modules::prod::queue::dto::WorkerScanEvent;
+use crate::modules::prod::scan::dto::{WorkerScanEvent, WorkerScanRequest};
+use crate::modules::prod::scan::vo::WorkerScanCoreOut;
 use crate::modules::prod::worker::repo::WorkerRepo;
 use crate::shared::error::{AppError, code};
 
-use super::BatchService;
+use super::ScanService;
 
-impl BatchService {
-    /// worker-scan 共享核心（被单件端点 `POST /prod/batches/worker-scan` 调用，Task 8）。
+impl ScanService {
+    /// worker-scan 共享核心（被单件端点 `POST /scan/worker-scan` 调用）。
     ///
     /// 两分支：
     /// - `RETURNED`：worker 把持有件放回生产架（同 admin_remove 语义，但走扫码台 +
@@ -175,7 +177,7 @@ impl BatchService {
                 // 前端填下一道工序）。
                 //
                 // 判据本身（锚链两步定位、按 `current_process_id` 在链内重新定位、
-                // 链内工序重复显式落 NONE）与读侧 `GET /parts/by-worker` 逐条同源：
+                // 链内工序重复显式落 NONE）与读侧 `GET /scan/held` 逐条同源：
                 // 共用 `shared::batch::chain`，故「前端看到可免填」与「写侧实际推进到
                 // 哪道」不会分叉（这正是 2026-09-30 起 step 指针恒 NULL 时两者会
                 // 分叉的根因）。
@@ -303,7 +305,7 @@ impl BatchService {
                 // decoding as an Option` 整笔 500 —— 且因为发生在下面的 `if let`
                 // **之前**，「无链时保留批次旧 step」那条分支对手写工单恒不可达。
                 // 回归见
-                // `tests/production/queue.rs::worker_scan_returned_without_process_chain_succeeds`。
+                // `tests/production/scan_worker_scan.rs::worker_scan_returned_without_process_chain_succeeds`。
                 // 同款反模式（`Option<i64>` 包当前 `NOT NULL` 的列，列一旦变可空就
                 // 同样 500）另见 `prod/shelf_process/repo.rs::find_first_shelf_for_process`。
                 let n = repo

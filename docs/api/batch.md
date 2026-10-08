@@ -3,7 +3,8 @@
 > 本文件是 `prod::batch` 域的**唯一**契约来源。任何字段 / 端点变更必须同步本文件。
 > 与本域 2026-10-08 同期改动的 `prod::queue` 域契约见 [`queue.md`](queue.md)；
 > 2026-10-09 新增的顶层共用端点与外协三合一写端点见 [`outsource.md`](outsource.md)；
-> 2026-10-10 的自动选架口径见 [`shelves.md`](shelves.md)（§4 选架算法）。
+> 2026-10-10 的自动选架口径见 [`shelves.md`](shelves.md)（§4 选架算法）；
+> 2026-10-10 迁走的报工台两条端点（`worker-scan` / `pick-up`）见 [`scan.md`](scan.md)。
 
 ## 0. 2026-10-10 变更摘要：货架入参全部删除 + 链尾自动送检
 
@@ -18,6 +19,9 @@
 4. **`zone = <其它值> → 20104` 这条错误码消失**（`complete-repair` / `repair-dispatch`
    原先读 `shelf.zone` 分流，现在由 `next_process_id` 有无决定）。
 5. **`20507 BIZ_SHELF_PROCESS_NOT_MAPPED` 在本域不再触发**：映射校验已被选架覆盖。
+6. **`worker-scan` 与 `{batch_id}/pick-up` 已迁往 `prod::scan`**（下节），本域剩
+   **17 条**域内路由。§2.2 的三条分流、`§2.1.1` 的选架错误码表随端点迁走，正文
+   保留一份摘要，权威版在 [`scan.md`](scan.md)。
 
 ## 1. 本域定位：逐域剥离的**中间态**
 
@@ -31,31 +35,29 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
 
 本文件的存在目的：让下一轮重构的 agent（以及前端）**不翻 Rust 源码**就能知道 batch 域还剩什么、哪些已被认领。契约只从 `docs/api/` 读（前端 CLAUDE.md 规定）。
 
-## 2. 剩余路由表（19 条）
+## 2. 剩余路由表（17 条）
 
-全部挂 `/api/v2/prod/batches`。`/{batch_id}` 是 path 段；`to-ship` / `to-inspection` / `worker-scan` / `repair` / `repairing` / `scan/deliver` 是静态段（**无 Path extractor**）。
+全部挂 `/api/v2/prod/batches`。`/{batch_id}` 是 path 段；`to-ship` / `to-inspection` / `repair` / `repairing` / `scan/deliver` 是静态段（**无 Path extractor**）。
 
 | # | 方法 | 路径（相对 `/api/v2/prod/batches`） | 权限 |
 |---|---|---|---|
 | 1 | POST | `/to-ship` | Manager + Inspector |
 | 2 | POST | `/to-inspection` | Manager + Inspector |
-| 3 | POST | `/worker-scan` | Manager + ShelfAccount |
-| 4 | GET | `/repair` | Manager + Inspector |
-| 5 | GET | `/repairing` | Manager + Inspector |
-| 6 | POST | `/scan/deliver` | Manager + Inspector |
-| 7 | POST | `/{batch_id}/to-inspection` | Manager + Inspector |
-| 8 | POST | `/{batch_id}/to-ship` | Manager + Inspector |
-| 9 | POST | `/{batch_id}/to-process` | Manager + Inspector |
-| 10 | POST | `/{batch_id}/scan-inspect` | Manager + Inspector |
-| 11 | POST | `/{batch_id}/deliver` | Manager + Inspector |
-| 12 | POST | `/{batch_id}/complete` | Manager + Inspector |
-| 13 | POST | `/{batch_id}/start-repair` | Manager + Inspector |
-| 14 | POST | `/{batch_id}/place-on-shelf` | Manager + Clerk |
-| 15 | POST | `/{batch_id}/release-from-programming` | Manager + Clerk |
-| 16 | POST | `/{batch_id}/complete-repair` | Manager + Clerk |
-| 17 | POST | `/{batch_id}/repair-dispatch` | Manager + Clerk |
-| 18 | POST | `/{batch_id}/cancel` | Manager + Clerk |
-| 19 | POST | `/{batch_id}/pick-up` | Manager + Clerk + ShelfAccount |
+| 3 | GET | `/repair` | Manager + Inspector |
+| 4 | GET | `/repairing` | Manager + Inspector |
+| 5 | POST | `/scan/deliver` | Manager + Inspector |
+| 6 | POST | `/{batch_id}/to-inspection` | Manager + Inspector |
+| 7 | POST | `/{batch_id}/to-ship` | Manager + Inspector |
+| 8 | POST | `/{batch_id}/to-process` | Manager + Inspector |
+| 9 | POST | `/{batch_id}/scan-inspect` | Manager + Inspector |
+| 10 | POST | `/{batch_id}/deliver` | Manager + Inspector |
+| 11 | POST | `/{batch_id}/complete` | Manager + Inspector |
+| 12 | POST | `/{batch_id}/start-repair` | Manager + Inspector |
+| 13 | POST | `/{batch_id}/place-on-shelf` | Manager + Clerk |
+| 14 | POST | `/{batch_id}/release-from-programming` | Manager + Clerk |
+| 15 | POST | `/{batch_id}/complete-repair` | Manager + Clerk |
+| 16 | POST | `/{batch_id}/repair-dispatch` | Manager + Clerk |
+| 17 | POST | `/{batch_id}/cancel` | Manager + Clerk |
 
 - 全部返回统一信封 `R { code, message, data }`。
 - 写端点的事务边界在 handler（`state.pool.begin()` → service → `tx.commit()`），**WS 广播在 commit 之后**。
@@ -78,7 +80,7 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
 | `POST /{batch_id}/scan-inspect` | `target_inspection_shelf_id`、`shelf_id`、`next_process_id` | 三者全删（后两个**本端点从 2026-10-04 起就从不消费**） |
 | `POST /{batch_id}/place-on-shelf` / `release-from-programming` | `shelf_id` | 服务端选生产架（`next_process_id` 保留必填） |
 | `POST /{batch_id}/complete-repair` / `repair-dispatch` | `shelf_id` | 由 `next_process_id` **有无**决定去向：有 → 生产架、无 → 品检架 |
-| `POST /worker-scan` | `shelf_id`、`target_inspection_shelf_id` | 见 §2.2 |
+| ~~`POST /worker-scan`~~ | ~~`shelf_id`、`target_inspection_shelf_id`~~ | 已迁往 `prod::scan`，见 [`scan.md`](scan.md) |
 
 **向后兼容性**：本仓生产代码零 `deny_unknown_fields`，serde 对 struct **默认忽略未知
 字段** ⇒ 老客户端多发的 `shelf_id` 会被静默丢弃，「老前端 + 新后端」不破。但
@@ -113,7 +115,11 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
 品检架时同样会被 `can_access_shelf(target)` 拒（`worker-scan` 的 INSPECTED 分支就是
 这条守卫）。只是**触发时机**从「选了一个越权的架」变成「scope 内没有品检架」。
 
-### 2.2 worker-scan 的三条分流（2026-10-10）
+### 2.2 ~~worker-scan 的三条分流~~（2026-10-10 迁往 `prod::scan`）
+
+⚠️ 本端点已于 2026-10-10 连同 handler / service / DTO / 出参整体迁往
+`POST /api/v2/prod/scan/worker-scan`（硬切无 alias）。**权威契约见
+[`scan.md`](scan.md) §4**，本节保留口径摘要供后端读者就近查。
 
 请求 `event_type` 只有 `RETURNED` / `INSPECTED` 两个值，但服务端在 `RETURNED` 下还有
 第三种去向：
@@ -177,6 +183,8 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
 | `POST /api/v2/prod/batches/{batch_id}/receive-from-outsource` | `POST /api/v2/outsource-queue/move` | 同上（`to.kind = PRODUCTION_SHELF` 臂；`next_process_id` 可省略，后端按工序链推导） | 2026-10-09 |
 | `POST /api/v2/prod/batches/{batch_id}/receive-from-outsource-to-inspection` | `POST /api/v2/outsource-queue/move` | 同上（`to.kind = INSPECTION_SHELF` 臂） | 2026-10-09 |
 | `POST /api/v2/prod/batches/{batch_id}/split` | `POST /api/v2/batches/split` | **提为共用顶层端点**：`batch_id` 改入 body + 出参 `R<i64>` → `BatchSplitOut`（见 §2.1） | 2026-10-09 |
+| `POST /api/v2/prod/batches/worker-scan` | `POST /api/v2/prod/scan/worker-scan` | 路径（响应形状与 WS 事件名逐字不变） | 2026-10-10 |
+| `POST /api/v2/prod/batches/{batch_id}/pick-up` | `POST /api/v2/prod/scan/batches/{batch_id}/pick-up` | 路径（响应 `R<PartOut>` 与 WS 事件名逐字不变） | 2026-10-10 |
 
 **全部无 alias**，旧路径 404。契约细节见 [`queue.md`](queue.md) §1 与 §5.1、[`outsource.md`](outsource.md)。
 
@@ -195,10 +203,10 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
 | 端点 | 目标域 |
 |---|---|
 | `POST /to-ship`、`POST /to-inspection`、批量同形两条 | 多域共用（`views/inspection/` + `views/delivery/`） |
-| `POST /worker-scan` | `views/scan/`（扫码台） |
-| `POST /scan/deliver` | `views/scan/`（扫码台） |
+| ~~`POST /worker-scan`~~ | ~~`views/scan/`（扫码台）~~（2026-10-10 已迁往 `prod::scan`） |
+| `POST /scan/deliver` | `views/production/scan/`（扫码台） |
 | `POST /{batch_id}/to-inspection` / `to-ship` / `to-process` | 多域共用（`views/inspection/` + `views/delivery/`） |
-| `POST /{batch_id}/scan-inspect` | `views/scan/`（扫码台） |
+| `POST /{batch_id}/scan-inspect` | `views/production/scan/`（扫码台） |
 | `POST /{batch_id}/deliver` | `views/delivery/`（送货单域） |
 | `POST /{batch_id}/complete` | 多域共用（`views/parts/` + `views/assemblies/` + `views/statistics/`） |
 | `POST /{batch_id}/start-repair`、`complete-repair`、`repair-dispatch`、`GET /repair`、`GET /repairing` | `views/repair/` |
@@ -206,13 +214,18 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
 | `POST /{batch_id}/release-from-programming` | `views/cnc/` |
 | ~~`POST /{batch_id}/send-to-outsource`、`receive-from-outsource`、`receive-from-outsource-to-inspection`~~ | ~~`views/outsource/`~~（2026-10-09 已剥离，三合一为 `outsource::queue`） |
 | `POST /{batch_id}/cancel` | `views/parts/detail/` |
-| `POST /{batch_id}/pick-up` | `views/scan/`（扫码台） |
+| ~~`POST /{batch_id}/pick-up`~~ | ~~`views/scan/`（扫码台）~~（2026-10-10 已迁往 `prod::scan`） |
 | ~~`POST /{batch_id}/split`~~ | ~~`views/parts/detail/`~~（2026-10-09 已提为共用顶层端点 `POST /batches/split`，三处消费） |
 | ~~`GET /inspection`~~ | ~~`prod::inspection`~~（2026-10-07 已剥离） |
 | ~~`GET /pending` `POST /dispatch` `POST /auto-dispatch` `POST /{batch_id}/recall-to-pending`~~ | ~~`prod::queue`~~（2026-10-08 已剥离） |
 | ~~`POST /{batch_id}/send-to-outsource`、`receive-from-outsource`、`receive-from-outsource-to-inspection`~~ | ~~`outsource::queue`~~（2026-10-09 已剥离，三合一） |
+| ~~`POST /worker-scan`~~、~~`POST /{batch_id}/pick-up`~~ | ~~`prod::scan`~~（2026-10-10 已剥离，报工台域） |
 
 ⚠️ 「多域共用」的几条是后续某一轮的**决策点**：搬之前需要先决定它归哪个域（取决于哪个页面先重构），不要两边都搬。
+
+⚠️ 划掉的三行里那个 `views/scan/` 是**迁移前路径**（报工台三页 2026-10-10 自
+`src/views/scan/` 搬进 `src/views/production/scan/`），记的是「当时按哪个页面认领」
+的判断依据；未划掉的行按现行路径记。
 
 ## 5. 域边界与公共设施
 
@@ -224,7 +237,7 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
 | `prod::batch::service::guard.rs` | `shared::batch::guards.rs` | `prod::batch` / `prod::queue` / `prod::shelf_process` / part / outsource |
 | `prod::batch::model::TPartBatch` | `shared::batch::model.rs` | 十个域直接引用（prod / part / delivery_note / outsource / wx / statistics / admin / dashboard …） |
 | `PartBatchRepo::get_by_id` / `list_active_by_part_id` | `shared::batch::read.rs` | prod::batch / prod::queue / delivery_note / part / 派生链 |
-| 批次在工序链上的位置派生（锚链两步定位 / 「下一道」/ 顺应工序判据） | `shared::batch::chain.rs`（2026-10-09 新增） | `prod::batch::service::worker_scan`（RETURNED）/ `prod::queue::service::dispatch` / part 读侧 `list_by_worker` / 4 处卡片 DTO 的 `has_process_chain` |
+| 批次在工序链上的位置派生（锚链两步定位 / 「下一道」/ 顺应工序判据） | `shared::batch::chain.rs`（2026-10-09 新增） | `prod::scan::service::worker_scan`（RETURNED）/ `prod::queue::service::dispatch` / 报工台 held 列表 SQL（`prod::scan::listing`）/ 4 处卡片 DTO 的 `has_process_chain` |
 
 迁移动机：这四处都是**所有碰批次的域都要用**的公共设施，与「批次有哪些业务用例」无关。留在 batch 域意味着每剥离一个新域就多一条指向 batch 域的反向依赖。上移后依赖方向与派生图方向一致（上层域 → shared）。
 

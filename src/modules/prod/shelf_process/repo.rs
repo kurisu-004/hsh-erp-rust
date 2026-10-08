@@ -163,7 +163,7 @@ impl ShelfProcessRepo {
     /// ⚠️ 2026-10-04 加固（`current_holder_id` 写脏缺口）：原 SQL **不 JOIN `t_shelf`**，
     /// 只要 `t_shelf_process` 行未软删就返回，故已停用 / 已软删 / 品检区货架会被
     /// 下发给批次并写进 `t_part_batch.current_holder_id`。后果不是报错而是**静默漏件**：
-    /// 报工台取件页数据源（`part::service::phase1::work_type` 的 pickable-by-work-type）
+    /// 报工台取件页数据源（`prod::scan::listing` 的 pickable 列表 SQL）
     /// 的取行 SQL 硬限定 `JOIN t_shelf sh ON sh.id = b.current_holder_id
     /// AND sh.is_active = true AND sh.zone = 'PRODUCTION'`，故这种批次永远不会出现在
     /// 工人的可领列表里。历史脏数据**本仓不自动修**，修复走独立的数据修复单；

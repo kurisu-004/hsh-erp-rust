@@ -3,8 +3,6 @@
 //! 对应 Python myERP/service/worker.py + repository/worker_repository.py。
 //!
 //! ## 业务约束（service 层 enforce）
-//! - `verify_badge` 命中但 `is_active=false` → 20202 `BIZ_WORKER_INACTIVE`（HTTP 400）；
-//!   未命中 → 20201 `BIZ_WORKER_NOT_FOUND`（HTTP 404）。
 //! - `deactivate` 前查 `t_part_batch.current_holder_id = worker_id` 且
 //!   `status IN ('IN_PROCESS','INSPECTION','RETURNED')` 引用，>0 ⇒ 20203 拒
 //!   （2026-10-01：REPAIRING 降级为 `is_repairing` 标记后，返修批次 status 即
@@ -16,8 +14,11 @@
 //! - `badge_code` 业务唯一键，撞 → 40901 `VERSION_CONFLICT`
 //!
 //! ## 权限（RBAC）
-//! - `verify_badge`：**任意已登录用户**（含 SHELF_ACCOUNT）。service 层 `require_auth`。
-//! - 其它 6 端点：MANAGER-only。service 层 `require_role(Role::Manager)`。
+//! - 全部 6 端点：MANAGER-only。service 层 `require_role(Role::Manager)`。
+//!
+//! 2026-10-10：`verify_badge`（任意已登录可调，含 SHELF_ACCOUNT）连同其 handler
+//! 与 DTO 迁往 `crate::modules::prod::scan`（新路径
+//! `POST /api/v2/prod/scan/verify-badge`）。
 //!
 //! ## 事务边界（2026-09-22 D-2-simple 重构对齐 iam / shelf / customer 范本）
 //! 事务移交 handler：handler 显式 `pool.begin()` / `commit()`，service 仅业务逻辑。
@@ -48,16 +49,12 @@ fn worker_not_found() -> AppError {
     AppError::biz(code::BIZ_WORKER_NOT_FOUND, "工人不存在")
 }
 
-fn worker_inactive() -> AppError {
-    AppError::biz(code::BIZ_WORKER_INACTIVE, "工人已停用")
-}
-
 fn version_conflict() -> AppError {
     AppError::biz(code::VERSION_CONFLICT, "数据已被他人修改，请刷新后重试")
 }
 
 /// 把 service 的 `TWorker` 转 `WorkerOut`。`work_type_name` 由 caller 在 list 时
-/// 一次性批量补全；单条 get 与 verify_badge 不补 name（保持响应轻量）。
+/// 一次性批量补全；单条 get 不补 name（保持响应轻量）。
 fn to_worker_out(w: TWorker, work_type_name: Option<String>) -> WorkerOut {
     WorkerOut {
         id: w.id,
@@ -115,33 +112,6 @@ impl WorkerService {
     /// 构造：仅需雪花 ID 生成器。
     pub fn new(snowflake: Arc<SnowflakeIdGenerator>) -> Self {
         Self { snowflake }
-    }
-
-    // =======================================================================
-    // 扫码校验（任意已登录用户）
-    // =======================================================================
-
-    pub async fn verify_badge<R: WorkerRepoTrait>(
-        &self,
-        mut repo: R,
-        badge_code: &str,
-        _user: &CurrentUser,
-    ) -> Result<WorkerOut, AppError> {
-        let code = badge_code.trim();
-        if code.is_empty() {
-            return Err(worker_not_found());
-        }
-        // include_deleted=true：以区分「不存在 (20201)」与「存在但停用 (20202)」。
-        // Python `_d_get_by_badge_code` 也走 `include_deleted=True` 实现此语义。
-        let w = repo
-            .get_by_badge_code(code, true)
-            .await?
-            .ok_or_else(worker_not_found)?;
-        if !w.is_active {
-            return Err(worker_inactive());
-        }
-        // verify_badge 不补 work_type_name（响应轻量）；如需由前端再调 get_worker。
-        Ok(to_worker_out(w, None))
     }
 
     // =======================================================================

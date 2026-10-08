@@ -19,6 +19,13 @@
 //!   ★ 核心回归是「10 个工人的工序板一次返回 10 个 worker 且 held 批次不漏不错」）
 //! - queue_auto_allocate.rs     ← 原 worker_pool_auto_allocate_api.rs（2026-10-08 更名）
 //! - worker.rs                 ← 原 worker_api.rs
+//! - scan_badge.rs             ← 2026-10-10 新增（`prod::scan` 扫工牌
+//!   `POST /prod/scan/verify-badge`；自 worker.rs 迁入其 verify-badge 场景）
+//! - scan_listing.rs           ← 2026-10-10 迁入（`prod::scan` 两条只读聚合端点
+//!   `GET /prod/scan/pickable` / `GET /prod/scan/held`；自 tests/part/
+//!   pickable_by_work_type.rs 迁来，URL 与行 VO 一并换成 `ScanListItem`）
+//! - scan_worker_scan.rs       ← 2026-10-10 自 queue.rs 搬出 worker-scan 场景
+//!   （`POST /prod/scan/worker-scan`；refill 那一半仍留在 queue.rs）
 //! - pending_programming.rs     ← 2026-10-01 新增（prod::programming 待编程一览 1 端点，10 场景）
 //! - shelf_process.rs          ← 2026-10-02 新增（prod::shelf_process 3 端点；自
 //!   tests/shelf/api.rs 迁入整组替换场景 + 补全集查询 / 20505 / 旧路径 404 场景）
@@ -45,6 +52,9 @@ mod queue;
 mod queue_auto_allocate;
 mod queue_board;
 mod queue_dispatch;
+mod scan_badge;
+mod scan_listing;
+mod scan_worker_scan;
 mod shelf_process;
 mod work_type;
 mod worker;

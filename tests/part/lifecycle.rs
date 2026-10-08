@@ -1205,24 +1205,25 @@ async fn recall_to_pending_rejects_non_production_location() {
 }
 
 // ===========================================================================
-//  2026-10-04：工种 / 工人维度三条 list 端点的 part 侧真实字段投影
+//  2026-10-04：工种维度 list 端点的 part 侧真实字段投影
 // ===========================================================================
 //
-// 三个端点（`GET /parts/by-work-type/{id}` / `GET /parts/pickable-by-work-type/{id}`
-// / `GET /parts/by-worker/{id}`）此前共享一个根因：取行 SQL 只投影
+// 三个同族端点（`GET /parts/by-work-type/{id}` 与已迁往 `prod::scan` 的
+// `GET /prod/scan/pickable?work_type_id=` / `GET /prod/scan/held?worker_id=`）
+// 此前共享一个根因：取行 SQL 只投影
 // `p.id` / `p.serial_no` / `p.drawing_no` 三列，剩下的 `PartListItem` 字段靠**手抄
 // 20 个占位值**的 `TPart { ... }` 字面量填。于是 `name` 填成图号副本（前端卡片第 1
 // 行与第 2 行重复）、`is_urgent` 恒 `false`（加急 tag 永不渲染）、
 // `system_delivery_date` 恒 `null`（交期 chip 永不渲染）、
 // `planned_delivery_date` 恒 `1970-01-01`。
 //
-// 而 `pickable-by-work-type` 的 `ORDER BY p.is_urgent DESC,
-// p.planned_delivery_date ASC` 排的是 **DB 真实列** ⇒ 列表已经按加急排好了，工件上
-// 却看不出任何标记。
+// 而 `pickable` 列表的 `ORDER BY p.is_urgent DESC, p.planned_delivery_date ASC`
+// 排的是 **DB 真实列** ⇒ 列表已经按加急排好了，工件上却看不出任何标记。
 //
 // 2026-10-04 起三处改为投影 `p.name` / `p.is_urgent` / `p.system_delivery_date` /
 // `p.planned_delivery_date` 真实值并共用 `WorkTypeListRow` 投影 struct。本节把
-// 「真实值」与「响应不含 `next_process_id`」两条不变量锁在这三个端点上。
+// 「真实值」与「响应不含 `next_process_id`」两条不变量锁在这个端点上；
+// 另两条端点的同类断言随其迁往 `tests/production/scan_listing.rs`。
 //
 // ## 断言手法
 // `insert_part_biz` 造 part 时让 `name` **不等于** `drawing_no`：改造前 `name`
@@ -1419,69 +1420,6 @@ async fn by_work_type_projects_real_part_business_fields() {
     );
 }
 
-/// `GET /parts/pickable-by-work-type/{id}`：part 侧 4 列投影真实值。
-#[tokio::test]
-async fn pickable_by_work_type_projects_real_part_business_fields() {
-    let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let part_id = insert_part_biz(
-        &pool,
-        fx.customer_l1_id,
-        "可领急件名",
-        "D-BIZ-PICK",
-        true,
-        chrono::NaiveDate::from_ymd_opt(2026, 10, 20).unwrap(),
-        None,
-    )
-    .await;
-    insert_pickable_batch(&pool, part_id, fx.production_shelf_id, fx.process_id).await;
-
-    let item = list_item(
-        &app,
-        &token,
-        &format!("/parts/pickable-by-work-type/{}", fx.work_type_id),
-        part_id,
-    )
-    .await;
-    // system_delivery_date 为 NULL ⇒ 序列化成 null（不是 1970-01-01）
-    assert_real_part_fields(&item, "可领急件名", true, "2026-10-20", None);
-}
-
-/// `GET /parts/by-worker/{id}`：part 侧 4 列投影真实值。
-#[tokio::test]
-async fn by_worker_projects_real_part_business_fields() {
-    let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let part_id = insert_part_biz(
-        &pool,
-        fx.customer_l1_id,
-        "持有中工单名",
-        "D-BIZ-WK",
-        true,
-        chrono::NaiveDate::from_ymd_opt(2027, 1, 15).unwrap(),
-        Some(chrono::NaiveDate::from_ymd_opt(2026, 12, 20).unwrap()),
-    )
-    .await;
-    let worker_id = insert_worker(&pool, fx.work_type_id, "WK-BIZ").await;
-    insert_worker_held_batch(&pool, part_id, worker_id).await;
-
-    let item = list_item(
-        &app,
-        &token,
-        &format!("/parts/by-worker/{worker_id}"),
-        part_id,
-    )
-    .await;
-    assert_real_part_fields(
-        &item,
-        "持有中工单名",
-        true,
-        "2027-01-15",
-        Some("2026-12-20"),
-    );
-    // 本端点**不填**链四字段的前提：无链 ⇒ 保守默认 NONE / "0" / null / null
-    assert_eq!(item["chain_state"], "NONE", "无链批次应落 NONE: {item}");
-    assert_eq!(item["chain_next_process_id"].as_str(), Some("0"), "{item}");
-}
-
 /// 非加急 + 有 system_delivery_date 的组合：`is_urgent` 不得被反向填成 true。
 ///
 /// 上一节三例全走 `is_urgent = true`，只锁住「true 能穿透」；本例锁住另一半：false
@@ -1510,4 +1448,83 @@ async fn by_work_type_keeps_non_urgent_and_real_system_delivery_date() {
     )
     .await;
     assert_real_part_fields(&item, "不急工单", false, "2027-03-01", Some("2027-02-01"));
+}
+
+/// `serial_no IS NULL` 的手工工单不得让本端点整页 500。
+///
+/// `t_part.serial_no` 是 nullable（手工工单无序列号；baseline 里是
+/// `serial_no character varying(15)`，无 NOT NULL）。取行 SQL 一旦把它按 `String`
+/// 解码，遇到任一行 `serial_no IS NULL` 就 `unexpected null; try decoding as an
+/// Option` ⇒ 整页 500。手工工单是常态，这是必经路径而非边角。
+///
+/// 用例刻意造一个 `serial_no IS NULL` 的行**并**给同页另一个行补上序列号，证明
+/// 「null 行不会被整页炸掉、且与有值行共存」而不是「整页恰好只有 null 行所以
+/// 看不出来」。
+#[tokio::test]
+async fn by_work_type_tolerates_null_serial_no() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let worker_id = insert_worker(&pool, fx.work_type_id, "WT-SERIAL-NULL").await;
+
+    // `insert_part_biz` 不写 serial_no ⇒ DB 里是 NULL（手工工单形态）
+    let manual_part = insert_part_biz(
+        &pool,
+        fx.customer_l1_id,
+        "无序列号件",
+        "D-SERIAL-NULL",
+        false,
+        chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
+        None,
+    )
+    .await;
+    insert_worker_held_batch(&pool, manual_part, worker_id).await;
+
+    let numbered_part = insert_part_biz(
+        &pool,
+        fx.customer_l1_id,
+        "有序列号件",
+        "D-SERIAL-OK",
+        false,
+        chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
+        None,
+    )
+    .await;
+    sqlx::query("UPDATE t_part SET serial_no = $2 WHERE id = $1")
+        .bind(numbered_part)
+        .bind("WT-OK-001")
+        .execute(&pool)
+        .await
+        .expect("give the second part a serial_no");
+    insert_worker_held_batch(&pool, numbered_part, worker_id).await;
+
+    let uri = format!("/parts/by-work-type/{}", fx.work_type_id);
+    let (s, env) = send(
+        app.clone(),
+        json_request("GET", &uri, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "serial_no=NULL 不应 500: {env}");
+    assert_eq!(env["code"], 0, "GET {uri}: {env}");
+
+    let manual = env["data"]["items"]
+        .as_array()
+        .expect("data.items")
+        .iter()
+        .find(|it| it["id"].as_str() == Some(manual_part.to_string().as_str()))
+        .expect("无序列号那行应在结果里")
+        .clone();
+    assert!(
+        manual["serial_no"].is_null(),
+        "手工工单的 serial_no 应序列化成 null 而非整页炸掉: {env}"
+    );
+    let numbered = env["data"]["items"]
+        .as_array()
+        .expect("data.items")
+        .iter()
+        .find(|it| it["id"].as_str() == Some(numbered_part.to_string().as_str()))
+        .expect("有序列号那行应与 null 行共存")
+        .clone();
+    assert_eq!(
+        numbered["serial_no"], "WT-OK-001",
+        "同页有序列号的行不受影响: {env}"
+    );
 }

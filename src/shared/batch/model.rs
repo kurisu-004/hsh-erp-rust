@@ -13,7 +13,7 @@
 //!
 //! - `current_process_id` 的**工序池类**读取方严格限定为 5 条工序池 SQL
 //!   （take_one / take_specific / list_candidates / group_count /
-//!   count_pool_by_shelf）与 `list_pickable_by_work_type`，外加 rollup 派生
+//!   count_pool_by_shelf）与报工台的 pickable 列表 SQL，外加 rollup 派生
 //!   `t_part.next_process_id`；工序池口径之外另有 1 处有意例外：扫码树
 //!   （`prod::inspection::repo::InspectionScanRepo::list_batches_by_part_ids`）
 //!   直读本列，理由见该方法 doc。

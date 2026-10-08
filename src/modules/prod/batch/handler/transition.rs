@@ -9,7 +9,6 @@
 //! - `POST /api/v2/prod/batches/{batch_id}/to-process`
 //! - `POST /api/v2/prod/batches/{batch_id}/scan-inspect`
 //! - `POST /api/v2/prod/batches/to-ship` / `to-inspection`（批量，无 path）
-//! - `POST /api/v2/prod/batches/worker-scan`（无 path，`serial_no` 主键）
 //! - `POST /api/v2/prod/batches/scan/deliver`（无 path，`serial_no` 反查批次）
 //! - `GET  /api/v2/prod/batches/repair` / `repairing`
 //!
@@ -22,6 +21,12 @@
 //! service 一并迁往 `prod::inspection`（新路径 `GET /api/v2/prod/inspection/queue`，
 //! **无 alias**）—— 该页面现两个数据源同域。本文件保留集合读 2 条
 //! （`/repair` / `/repairing`）。
+//!
+//! ## 2026-10-10 迁出
+//! 报工台主入口 `worker-scan`（`POST /api/v2/prod/batches/worker-scan`）连同其
+//! service 与出参迁往 `crate::modules::prod::scan`（新路径
+//! `POST /api/v2/prod/scan/worker-scan`，**无 alias**）。本文件保留批量流转 +
+//! 单件 to-XXX + 扫码品检 / 司机发货 + 集合读。
 //!
 //! ## 2026-10-02 语义变更
 //! 子资源 19 条的 `batch_id` 从**请求体**移到**路径参数**。事件 `kind` 字符串
@@ -40,16 +45,13 @@ use crate::infra::ws_hub::WsEvent;
 use crate::modules::part::vo::PartOut;
 use crate::modules::prod::batch::dto::{
     BatchToInspectionRequest, BatchToShipRequest, RepairBatchListQuery, ScanDeliverPartRequest,
-    ScanInspectRequest, ToInspectionRequest, ToProcessRequest, ToShipRequest, WorkerScanRequest,
+    ScanInspectRequest, ToInspectionRequest, ToProcessRequest, ToShipRequest,
 };
 use crate::modules::prod::batch::service::BatchService;
 use crate::modules::prod::batch::service::transition::{
     BATCH_TO_INSPECTION_MAX_ITEMS, BATCH_TO_SHIP_MAX_ITEMS,
 };
-use crate::modules::prod::batch::vo::{
-    BatchToXxxOut, InspectionBatchListOut, ToXxxOut, WorkerScanOut,
-};
-use crate::modules::prod::queue::service::QueueService;
+use crate::modules::prod::batch::vo::{BatchToXxxOut, InspectionBatchListOut, ToXxxOut};
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
@@ -265,97 +267,6 @@ pub async fn scan_deliver_part(
         payload: json!({ "part_id": out.id.to_string() }),
     });
     Ok(Json(R::ok(out)))
-}
-
-/// `POST /api/v2/prod/batches/worker-scan`
-///
-/// 工人扫码台主入口：RETURNED / INSPECTED 二合一。**同事务**调 scan →
-/// refill_for_worker（scan 与 refill 必须原子，否则扫描放回 → refill 抢批中间
-/// 会被并发抢走同批）。
-///
-/// 行为：
-/// - 权限：`Manager` 或 `ShelfAccount`（不是 Inspector——工人持有件自有工人操作）
-/// - 入参：`WorkerScanRequest { serial_no, badge_code, event_type, next_process_id?, batch_id? }`
-///   主键是 `serial_no`，`batch_id` 仅用于多批次消歧。**没有任何货架字段**
-///   （2026-10-10 起两个货架字段都被删除，目标架由服务端按负载自动选）
-/// - 业务流转：
-///   - `RETURNED`：worker 把 IN_PROCESS+WORKER 批次放回**服务端选出的**生产架
-///     （`next_process_id` 仅非顺应工序时必填）；**批次在链尾时改走送检**（自动送检）
-///   - `INSPECTED`：worker 把持有件直接送检（品检架服务端自动选）
-///   - 任一成功后同事务 `QueueService::refill_for_worker`（**跨全部映射架取料**，无架锚）。
-/// - WS 广播：commit 后
-///   - `WORKER_SCAN_RETURNED` / `WORKER_SCAN_INSPECTED`（依 **`scan_out.event_type`**，
-///     即**响应**里那个值而非请求里的值 —— 2026-10-10 起链尾自动送检会让「请求
-///     `RETURNED` / 响应 `WORKER_SCAN_INSPECTED`」成立，而 dashboard 两条事件都监听，
-///     故广播链路无需改动即成立）；
-///   - `WORKER_POOL_REFILL_DONE`（refill 抢到一批）或
-///   - `WORKER_POOL_EMPTY`（refill 池空）。
-///
-/// 本端点一笔事务改 2 个批次（扫的那个 + 同事务从工人池补的），是全仓唯一的
-/// 跨 part 批次写点，但动作语义仍是「以批次为对象的工人报工」，故归 prod 域。
-pub async fn worker_scan(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Json(req): Json<WorkerScanRequest>,
-) -> Result<Json<R<WorkerScanOut>>, AppError> {
-    current.require_any_role(&[Role::Manager, Role::ShelfAccount])?;
-    // 2026-10-10：`shelf_id` / `target_inspection_shelf_id` 两个入参删除 ⇒ handler
-    // 侧那两道 `can_access_shelf` 防御检查也一并消失。货架范围收敛改由
-    // `shared::shelf::select::shelf_scope_for` 在**选架那一步**统一承担
-    // （它同时覆盖 SHELF_ACCOUNT 的手填白名单与 Manager 的 wildcard）。
-    let mut tx = state.pool.begin().await?;
-    // scan（状态翻转 + 写事件日志）
-    let scan_out =
-        BatchService::worker_scan_event(&mut *tx, &state.snowflake, req.clone(), &current).await?;
-    // refill（同事务；QueueService::refill_for_worker_with_work_type 内部
-    // 对 work_type / process 映射校验失败会抛业务错——事务自动回滚 scan 写入，保持原子语义）。
-    // 复用 worker_scan_event 已经 fetch 过的 work_type_id + badge_code，
-    // 跳过 queue service 内的 WorkerRepo::get_by_id 重复查询。
-    let refill_out = QueueService::refill_for_worker_with_work_type(
-        &mut tx,
-        &state.snowflake,
-        scan_out.worker_id,
-        scan_out.work_type_id,
-        // 2026-10-10：worker-scan 的 refill **不再有架锚** —— 跨全部映射该工种工序的
-        // 活跃生产架取料。负载均衡的整体职责已在「放回时 `pick_least_loaded` 选架」
-        // 一侧完成，继续按架过滤会在「放回到 A 架 → 随即从 A 架补料」这个闭环里查空池
-        // （尤其是链尾自动送检：批次根本没落任何生产架）。
-        None,
-        &scan_out.badge_code,
-        current.id,
-        &current,
-    )
-    .await?;
-    tx.commit().await?;
-    // commit 之后广播（对齐 Python 延迟广播模式）
-    if let Some(aid) = scan_out.synced_assembly_id {
-        ws_broadcast_assembly_updated(&state, aid);
-    }
-    state.ws_hub.broadcast(WsEvent::DashboardEvent {
-        kind: scan_out.event_type.clone(),
-        payload: serde_json::to_value(&scan_out).unwrap_or_default(),
-    });
-    if !refill_out.taken.is_empty() {
-        state.ws_hub.broadcast(WsEvent::DashboardEvent {
-            kind: "WORKER_POOL_REFILL_DONE".into(),
-            payload: serde_json::to_value(&refill_out).unwrap_or_default(),
-        });
-    } else if refill_out.pool_empty {
-        state.ws_hub.broadcast(WsEvent::DashboardEvent {
-            kind: "WORKER_POOL_EMPTY".into(),
-            // 2026-10-10：`shelf_id` 键删除（refill 已无架锚，worker-scan 也不再收它）。
-            // WS payload 与 HTTP 响应的 `refill.shelf_id` 同步为 `null`。
-            payload: json!({
-                "worker_id": scan_out.worker_id.to_string(),
-                "shelf_id": serde_json::Value::Null,
-                "pool_empty": true,
-            }),
-        });
-    }
-    Ok(Json(R::ok(WorkerScanOut {
-        scan: scan_out,
-        refill: refill_out,
-    })))
 }
 
 /// `GET /api/v2/prod/batches/repair`

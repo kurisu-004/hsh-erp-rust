@@ -90,7 +90,8 @@ pub struct AppState {
     /// 3 个 alias 端点（download-url / content / delete）由 handler 直接转发到
     /// `state.part_file_service.method(&mut *tx, ...)`，不抽 trait 到 part_file。
     pub cnc_program_service: Arc<CncProgramService>,
-    /// 2026-09-22 D-2-simple 新增：prod/worker service（CRUD + verify-badge）。
+    /// 2026-09-22 D-2-simple 新增：prod/worker service（仅 CRUD —— `verify-badge`
+    /// 已于 2026-10-10 随 handler 迁往 `prod::scan`，worker 侧零调用方）。
     /// 字段仅 `snowflake`；handler 借 `&mut *tx` 喂给 `WorkerRepoTrait`
     /// （trait 已直接 `impl for &mut PgConnection`）。
     pub worker_service: Arc<WorkerService>,

@@ -266,22 +266,13 @@ pub struct ForceCompleteRequest {
     pub note: Option<String>,
 }
 /// `GET /parts/by-work-type/{work_type_id}` 入参（query）。
+///
+/// 2026-10-10：`shelf_id` 字段**删除**。它此前只被报工台的 `pickable` 端点消费，
+/// 而那条端点已迁往 `GET /api/v2/prod/scan/pickable`（新 DTO `prod::scan::dto::PickableQuery`
+/// 同样不带 `shelf_id`，货架范围改由服务端按账号 scope 收窄）。本端点列的是
+/// **工人手上**的件而非架上的候选池，shelf 过滤对它没有语义。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ByWorkTypeQuery {
-    #[serde(default, deserialize_with = "deserialize_i64_opt")]
-    pub shelf_id: Option<i64>,
-    #[serde(default)]
-    pub limit: Option<i64>,
-    #[serde(default)]
-    pub offset: Option<i64>,
-}
-
-/// `GET /parts/pickable-by-work-type/{work_type_id}` 入参（query）。
-pub type PickableByWorkTypeQuery = ByWorkTypeQuery;
-
-/// `GET /parts/by-worker/{worker_id}` 入参（query）。
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct ByWorkerQuery {
     #[serde(default)]
     pub limit: Option<i64>,
     #[serde(default)]

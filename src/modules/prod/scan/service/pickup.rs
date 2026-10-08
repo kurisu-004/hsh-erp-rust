@@ -1,10 +1,13 @@
-//! prod::batch 的手动 pick-up：`POST /api/v2/prod/batches/{batch_id}/pick-up`
+//! prod::scan 的手动 pick-up：`POST /api/v2/prod/scan/batches/{batch_id}/pick-up`
 //!
 //! 起点 `PENDING` / `IN_PROCESS+PRODUCTION_SHELF` → 目标 `IN_PROCESS+WORKER`。
 //! Manager / Clerk / ShelfAccount 三角色可触发；worker 必须 active 且绑定 work_type。
 //!
-//! 2026-10-03 新增：部分领取（`quantity` 缺省 = 整批，行为与此前逐字一致）。
-//! 见 [`BatchService::pick_up`] 的「部分领取语义」段。
+//! 2026-10-10 自 `prod::batch::service::pickup` 搬来（硬切无 alias）：唯一消费方
+//! 是报工台的取件页与队列看板，按「目标域按前端消费方判定」的规约归 `prod::scan`。
+//! 业务逻辑逐字不变。
+//!
+//! 部分领取（`quantity` 缺省 = 整批）见 [`ScanService::pick_up`] 的「部分领取语义」段。
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
@@ -12,11 +15,11 @@ use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
 use crate::modules::part::vo::PartOut;
-use crate::modules::prod::batch::dto::PickUpRequest;
 use crate::modules::prod::batch::repo::PartBatchRepo;
+use crate::modules::prod::scan::dto::PickUpRequest;
 use crate::shared::error::{AppError, code};
 
-use super::BatchService;
+use super::ScanService;
 use crate::shared::batch::guards::{
     mark_batch_with_status_and_meta, validate_batch_version, validate_shelf_zone,
 };
@@ -52,8 +55,8 @@ pub struct PickUpOutcome {
     pub split: Option<PickUpSplitInfo>,
 }
 
-impl BatchService {
-    /// `POST /prod/batches/{batch_id}/pick-up`：手动 pick-up。
+impl ScanService {
+    /// `POST /scan/batches/{batch_id}/pick-up`：手动 pick-up。
     /// 起点：PENDING / IN_PROCESS+PRODUCTION_SHELF → 目标 IN_PROCESS+WORKER。
     ///
     /// 不变量：
@@ -73,7 +76,8 @@ impl BatchService {
     ///   IN_PROCESS+WORKER，源批次原地保留、数量递减；
     /// - `<= 0` / `> batch.quantity` → `BIZ_PART_BATCH_INVALID_QUANTITY`。
     ///
-    /// ⚠️ 与 [`super::batch_ops::BatchService::split_batch`] 的**数量语义差异**：
+    /// ⚠️ 与 [`crate::modules::prod::batch::service::batch_ops::BatchService::split_batch`]
+    /// 的**数量语义差异**：
     /// 那边要求 `quantity < batch.quantity`（等于即非法），因为「等于」在 split
     /// 语境下是「白拆一次」；这边允许 `==` ，因为 `==` 就是**整批领取**的显式
     /// 写法，无需拆。故只有 `>` 才非法。
@@ -93,7 +97,7 @@ impl BatchService {
             .find_batch_by_id(batch_id)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_BATCH_NOT_FOUND, "batch 不存在"))?;
-        // 2026-10-02：batch_id 来自 URL 路径参数（`POST /prod/batches/{batch_id}/…`），
+        // batch_id 来自 URL 路径参数（`POST /scan/batches/{batch_id}/…`），
         // part_id 由批次行反查。
         let part_id = batch.part_id;
         let part = repo

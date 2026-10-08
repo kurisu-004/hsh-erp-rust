@@ -1,7 +1,8 @@
 # prod::queue 域 API（生产队列：工序候选池 + 工人持有 + 发放/召回/移动）
 
 > 本文件是 `prod::queue` 域的**唯一**契约来源。任何字段 / 端点变更必须同步本文件。
-> 与本域同批改动的 `prod::batch` 域契约见 [`batch.md`](batch.md)。
+> 与本域同批改动的 `prod::batch` 域契约见 [`batch.md`](batch.md)；
+> 与本域同事务编排的报工台端点（`POST /scan/worker-scan`）见 [`scan.md`](scan.md)。
 
 ## 0. 2026-10-08 变更摘要
 
@@ -206,9 +207,11 @@ AND ( (cs.process_id IS NOT NULL AND cs.process_id = pb.current_process_id)
 | a | `prod::queue` | `GET /prod/queue/processes/{id}` → `items[].has_process_chain`（`QueuePoolItem`） |
 | b | `prod::queue` | 同上 → `workers[].held_batches[].has_process_chain`（`QueueHeldBatch`） |
 | c | `outsource` | `GET /outsource-queue/processes/{id}` → `items[].has_process_chain`（`OutsourceQueueCandidate`） |
-| d | `part` | `GET /parts/pickable-by-work-type/{id}` 与 `GET /parts/by-worker/{id}` → `items[].has_process_chain`（`PartListItem`） |
+| d | `prod::scan` | `GET /prod/scan/pickable` 与 `GET /prod/scan/held` → `items[].has_process_chain`（`ScanListItem`）。2026-10-10 自 part 域迁入报工台域，判据常量不变 |
 
-`PartListItem` 是 **7 个域共用**的 VO，仅 (d) 的两个端点填真值；其余构造点（`From<TPart>` / `com::union_list` 的两个 project 函数）显式填 `false` —— 链位置是**批次级**事实，part 级行无从推导（没有 `#[serde(default)]`，漏赋值会编译失败）。
+`PartListItem` 本身仍是 `part` / `assembly` / `com::union_list` 三个域共用的 VO（wire 上共 4 个端点；`outsource` / `wx` 只在注释里拿它做字段对照、各有自己的 VO，不算），但 2026-10-10 报工台两条 list 端点连同本列迁往 `prod::scan`（行 VO 换成 `ScanListItem`）后，它**已无任何填真值的端点** —— 本域是上表行 a / b，`outsource` 是行 c。其余构造点（`From<TPart>` /
+`com::union_list` 的两个 project 函数）显式填 `false`：链位置是**批次级**事实，
+part 级行无从推导（没有 `#[serde(default)]`，漏赋值会编译失败）。
 
 ## 3. 下发流 VO（端点 3 / 4 / 5 / 6）
 
@@ -437,7 +440,7 @@ queue 域**整体不适用**域隔离护栏：它继承 worker_pool 的「经本
 7. **i64 字符串化**：所有雪花 id 仍是 JSON string，本仓不因本次改动变更该约定。
 8. **`max_held` 取值位置变更**：原从 `work_types[].max_held_batches` 按工种查，改从 `workers[].max_held` 按工人直接读。`max_held_batches` 未设置时后端返 0（不是 null）—— 展示「未设置上限」占位的逻辑需自行按 0 判断。
 9. **代码里残留的 `WORKER_POOL_*` WS 事件名不变**（`kind` 是 WS 协议的一部分，改它要同步 dashboard 域的白名单与前端 `AFFECTS_DASHBOARD`）。本域改的只是 URL 与类型名。
-10. **4 处卡片 DTO 新增 `has_process_chain`（boolean）**（2026-10-09）：`QueuePoolItem` / `QueueHeldBatch` / `OutsourceQueueCandidate` / `PartListItem`（仅扫码台两条端点填真值）。它是**绿色左边框的判据**，判据见 §2.6。zod 侧按 `z.boolean()` 声明 —— 前端不要按「工单有没有绑链」重新在前端推一遍（后端已经算好，且未定位批次走的是另一个分支）。
+10. **4 处卡片 DTO 新增 `has_process_chain`（boolean）**（2026-10-09）：`QueuePoolItem` / `QueueHeldBatch` / `OutsourceQueueCandidate` / `ScanListItem`。第四处原先是 `PartListItem`，2026-10-10 随报工台两条 list 端点迁往 `prod::scan`（行 VO 换成 `ScanListItem`）后它在 part 域恒为 `false`，字段保留只为不动其余复用该 VO 的域的 wire 形状。它是**绿色左边框的判据**，判据见 §2.6。zod 侧按 `z.boolean()` 声明 —— 前端不要按「工单有没有绑链」重新在前端推一遍（后端已经算好，且未定位批次走的是另一个分支）。
 11. **`POST /queue/move` 的 `version` 升为必填**（2026-10-09）：此前三个方向都由 service 用「本次事务里刚读到的 `batch.version`」当 `expected_version`，等价于**没有 OCC** —— 看板数据是 30s 缓存的快照，期间他人改过批次时「用户看到 5 件 → 实际移动 3 件」会静默成功。值取候选卡 / 持有卡的 `version`；漏传 → **HTTP 422 纯文本**（`version` 无 `#[serde(default)]`）。
 
 ### 8.4 已知偏差登记
@@ -493,7 +496,7 @@ dispatch 的目标货架自 2026-10-10 起改走
 
 影响面与自愈路径：
 
-- 读侧 `GET /parts/by-worker/{worker_id}` 的 `chain_state` **不受影响** —— 它按 `current_process_id` 在锚链内重新定位（纪律见 `shared::batch::chain` 模块 doc），不依赖指针。
+- 读侧 `GET /prod/scan/held?worker_id=` 的 `chain_state` **不受影响** —— 它按 `current_process_id` 在锚链内重新定位（纪律见 `shared::batch::chain` 模块 doc），不依赖指针。
 - 写侧 worker-scan RETURNED 的「自动推进」分支**对存量批次不生效**：指针为 NULL 或陈旧时 `ChainPosition::is_pointer_consistent` 为 false，走「要求前端显式指定 `next_process_id`」分支。前端体验上就是「本来能免填的字段现在要填」，功能不受损。
 - `has_process_chain` 那类按「指针的工序 == 当前工序」判定的卡片列，在 `current_process_id` 非 NULL 时对陈旧指针与 NULL 指针同样落 `false`，语义自洽。
 - 自愈需要**重新走一次会重定位指针的流转**（再走一次 dispatch，或 worker-scan RETURNED）才会被纠正。⚠️ **`POST /queue/move`（admin 主动退回，`WORKER → POOL`）不算**：它传 `new_process_step_id = None` + `clear_process_step_id = false`，`COALESCE` 保留原值、**刻意不重定位** —— 管理员的意图是「退回候选池让人重领」，不表达任何链上位置意图。存量数据清洗不在本轮范围内；前端不要把「绿色左边框缺失」当成新缺陷上报。
@@ -523,7 +526,7 @@ dispatch 的目标货架自 2026-10-10 起改走
 
 **后果（悬空 step 指针）**：该批次的 `current_process_step_id` 指向一条**软删链**的 step，于是
 
-- 读侧 `GET /parts/by-worker/{worker_id}` 的 `chain_state` 恒 `NONE` —— 它按锚链 JOIN 重新定位，链行软删就无行；
+- 读侧 `GET /prod/scan/held?worker_id=` 的 `chain_state` 恒 `NONE` —— 它按锚链 JOIN 重新定位，链行软删就无行；
 - 绿框 `HAS_PROCESS_CHAIN_EXPR` 走分支 1（`cs.process_id = pb.current_process_id`，该表达式不 JOIN 链行）⇒ 给 `true`，与上一条矛盾；
 - 后续每一次 worker-scan RETURNED 都重新落回显式分支（`is_pointer_consistent` 永远 false）⇒ 该批次**永远无法自动顺工序推进**，前端每次都要显式填 `next_process_id`。
 

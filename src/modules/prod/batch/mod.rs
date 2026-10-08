@@ -53,12 +53,19 @@
 //! 可被域隔离护栏完整覆盖。**返修两条集合读**（`/repair` / `/repairing`）的 SQL 在
 //! service 层自建、不在本域 repo 层。
 //!
+//! ## 2026-10-10 报工台两条端点迁出
+//! `POST /worker-scan` 与 `POST /{batch_id}/pick-up` 连同其 handler / service /
+//! DTO / 出参整体迁往 `crate::modules::prod::scan`（硬切无 alias，新路径
+//! `POST /api/v2/prod/scan/worker-scan` 与
+//! `POST /api/v2/prod/scan/batches/{batch_id}/pick-up`）—— 两条端点的唯一消费方
+//! 是报工台三页与队列看板，按「目标域按前端消费方判定」的规约归 `prod::scan`。
+//! 见 `handler/mod.rs` 的 `STRIPPED` 表。
+//!
 //! ## 路由表（摘要，权威清单见 `handler/mod.rs::ROUTES`）
 //!
 //! 静态 1 段（原 `/api/v2/parts/…`，**无 Path extractor**）：
 //! - `POST   /to-ship`          ← `/api/v2/prod/batches/to-ship`
 //! - `POST   /to-inspection`    ← `/api/v2/prod/batches/to-inspection`
-//! - `POST   /worker-scan`      ← `/api/v2/prod/batches/worker-scan`
 //! - `GET    /repair`           ← `/api/v2/prod/batches/repair`
 //! - `GET    /repairing`        ← `/api/v2/prod/batches/repairing`
 //!
@@ -70,7 +77,10 @@
 //! - `deliver` / `complete` / `start-repair`
 //! - `place-on-shelf` / `release-from-programming`
 //! - `complete-repair` / `repair-dispatch`
-//! - `cancel` / `pick-up`
+//! - `cancel`
+//!
+//! **本域也不再有报工台端点**：`worker-scan` / `pick-up` 已于 2026-10-10 迁往
+//! `prod::scan`。
 //!
 //! **本域不再有下发流端点**：`pending` / `dispatch` / `auto-dispatch` /
 //! `recall-to-pending` 已于 2026-10-08 迁往 `prod::queue`；**也不再有外协端点**：
@@ -81,7 +91,7 @@
 //! `POST /api/v2/batches/split`（`handler::split_router`，旧路径 404 无 alias）。
 //! 三条都见 `handler/mod.rs` 的 `STRIPPED` 表。
 //!
-//! **本域有 2 处挂载**：本 `router()` → `/api/v2/prod/batches/*`（19 条）与
+//! **本域有 2 处挂载**：本 `router()` → `/api/v2/prod/batches/*`（17 条）与
 //! `prod::split_router()` → `/api/v2/batches/*`（1 条拆批）。
 //!
 //! ## DTO 契约
@@ -98,7 +108,8 @@
 //! ## 角色守卫
 //! - GET repair / repairing: Manager + Inspector
 //! - to-XXX 三流 + 批量两流: Manager + Inspector
-//! - worker-scan: Manager + ShelfAccount
+//! - 报工台两条端点（已迁往 `prod::scan`）：worker-scan 是 Manager + ShelfAccount，
+//!   pick-up 是 Manager + Clerk + ShelfAccount
 
 use std::sync::Arc;
 

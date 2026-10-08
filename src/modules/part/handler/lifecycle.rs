@@ -1,11 +1,9 @@
 //! part 域 lifecycle / 状态机扩展 handler
 //!
-//! 本文件只服务 part 维度的 2 条写端点 + 3 条批次行 list 端点：
+//! 本文件只服务 part 维度的 2 条写端点 + 1 条批次行 list 端点：
 //! - `POST /api/v2/parts/{part_id}/cancel`
 //! - `POST /api/v2/parts/{part_id}/force-complete`
 //! - `GET /api/v2/parts/by-work-type/{work_type_id}`
-//! - `GET /api/v2/parts/pickable-by-work-type/{work_type_id}`
-//! - `GET /api/v2/parts/by-worker/{worker_id}`
 //!
 //! 以**单个批次**为操作对象的端点不在 part 域：deliver / complete /
 //! place-on-shelf / recall-to-pending / split-batch / cancel-batch /
@@ -20,9 +18,12 @@
 //! - cancel：`require_any_role([Manager, Clerk])` —— 撤销属仓库动作，放开 Clerk
 //! - force-complete：`require_role(Manager)` —— 逃生通道（绕状态机强推），明确
 //!   不下放 Clerk
-//! - 3 条 list 端点：handler 层不设闸门，角色闸门在 service 层
-//!   （`require_any_role([Manager, Clerk, Inspector, ShelfAccount])`）；其中
-//!   pickable 额外按 `pickable_shelf_scope` 收窄货架范围，另两条不做货架收窄
+//! - list 端点：handler 层不设闸门，角色闸门在 service 层
+//!   （`require_any_role([Manager, Clerk, Inspector, ShelfAccount])`）
+//!
+//! 2026-10-10：报工台的 `pickable-by-work-type` / `by-worker` 两条 list 端点连同
+//! 它们的 handler 迁往 `crate::modules::prod::scan`（新路径
+//! `GET /api/v2/prod/scan/pickable` 与 `GET /api/v2/prod/scan/held`，**无 alias**）。
 
 use std::sync::Arc;
 
@@ -32,9 +33,7 @@ use serde_json::json;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::ws_hub::WsEvent;
-use crate::modules::part::dto_crud::{
-    ByWorkTypeQuery, ByWorkerQuery, CancelRequest, ForceCompleteRequest,
-};
+use crate::modules::part::dto_crud::{ByWorkTypeQuery, CancelRequest, ForceCompleteRequest};
 use crate::modules::part::service::PartService;
 use crate::modules::part::vo::{PartListOut, PartOut};
 use crate::shared::error::AppError;
@@ -106,36 +105,5 @@ pub async fn list_by_work_type(
 ) -> Result<Json<R<PartListOut>>, AppError> {
     let mut conn = state.pool.acquire().await?;
     let out = PartService::list_by_work_type(&mut *conn, work_type_id, &query, &current).await?;
-    Ok(Json(R::ok(out)))
-}
-
-/// `GET /api/v2/parts/pickable-by-work-type/{work_type_id}`
-///
-/// 「可领取」列表（与 by-work-type 同形，但限定 shelf.zone=PRODUCTION + active）。
-///
-/// 2026-09-22 PR5：只读 list 端点改 `pool.acquire()`。
-pub async fn list_pickable_by_work_type(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(work_type_id): Path<i64>,
-    Query(query): Query<ByWorkTypeQuery>,
-) -> Result<Json<R<PartListOut>>, AppError> {
-    let mut conn = state.pool.acquire().await?;
-    let out =
-        PartService::list_pickable_by_work_type(&mut *conn, work_type_id, &query, &current).await?;
-    Ok(Json(R::ok(out)))
-}
-
-/// `GET /api/v2/parts/by-worker/{worker_id}`
-///
-/// 2026-09-22 PR5：只读 list 端点改 `pool.acquire()`。
-pub async fn list_by_worker(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(worker_id): Path<i64>,
-    Query(query): Query<ByWorkerQuery>,
-) -> Result<Json<R<PartListOut>>, AppError> {
-    let mut conn = state.pool.acquire().await?;
-    let out = PartService::list_by_worker(&mut *conn, worker_id, &query, &current).await?;
     Ok(Json(R::ok(out)))
 }

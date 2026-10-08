@@ -18,6 +18,16 @@
 //! 已迁至 `crate::modules::prod::batch`，URL 改挂 `/api/v2/prod/batches/*`
 //! （原 `/api/v2/parts/{part_id}/…` 404，**无 alias**）。
 //!
+//! 2026-10-10 下线报工台的 2 条 list 端点：`GET /pickable-by-work-type/{id}` 与
+//! `GET /by-worker/{id}` —— 它们的唯一消费方是报工台三页，连同取行 SQL / 出参
+//! 一并迁往 `crate::modules::prod::scan`（新路径
+//! `GET /api/v2/prod/scan/pickable` 与 `GET /api/v2/prod/scan/held`，**无 alias**）。
+//! 两条旧路径**实际返回干净 404**（不是 400）：它们是 2 段 path，而本域 `/{part_id}`
+//! catch-all 只有 **1 段**，2 段路径够不着它 ⇒ `matchit` 无命中 ⇒ `Path<i64>`
+//! extractor 根本没机会出手。⚠️ 别照抄下方外协那段的 400 —— 那两条是 **1 段**
+//! 静态路径，落进 catch-all 才会被 `Path` 拒成 400。段数是分水岭。逐条实测表见
+//! `docs/api/scan.md` §1.2（「教训登记」小节写了这条直觉为什么不总成立）。
+//!
 //! 2026-10-03 下线 2 条外协 list 端点：`/outsource-in-flight` /
 //! `/outsource-sendable` —— 二者返回的是通用 `PartListItem`，与前端外协域需要的
 //! 字段（批次级 version / quantity、外协公司、报价价、客户路径…）**形状不匹配**
@@ -77,16 +87,11 @@ pub fn router() -> Router<Arc<AppState>> {
             "/print-drawing-batch",
             post(handler::print::print_drawing_batch),
         )
-        // ---- Phase 2 (2026-09-13) 静态段（by-work-type / pickable / by-worker）----
+        // ---- Phase 2 (2026-09-13) 静态段（by-work-type）----
         .route(
             "/by-work-type/{work_type_id}",
             get(handler::list_by_work_type),
         )
-        .route(
-            "/pickable-by-work-type/{work_type_id}",
-            get(handler::list_pickable_by_work_type),
-        )
-        .route("/by-worker/{worker_id}", get(handler::list_by_worker))
         // ---- 单件 {part_id} ----
         .route("/{part_id}", get(handler::get_part_detail))
         .route("/{part_id}/update", post(handler::update_part))

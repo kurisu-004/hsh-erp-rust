@@ -1,15 +1,25 @@
-//! `GET /parts/pickable-by-work-type/{work_type_id}` 出参集成测试（2026-10-03 新增）
+//! `prod::scan` 报工台两条只读聚合端点的出参集成测试（2026-10-03 新增，2026-10-10 迁入）
 //!
-//! 本端点此前在 `tests/` 下**零覆盖**（只在 `to_inspection.rs` 的注释里被提到）。
-//! 2026-10-03 起本端点是扫码台「领料」的字段级契约载体，故在此补最小覆盖：
-//! `PartListItem` 新增的 `batch_id` / `batch_version` 必须等于该行
-//! `t_part_batch.id` / `t_part_batch.version`。
+//! 覆盖 `GET /api/v2/prod/scan/pickable?work_type_id=` 与
+//! `GET /api/v2/prod/scan/held?worker_id=`。这两个端点此前在 `tests/` 下**零覆盖**
+//! （只在别的文件的注释里被提到）；它们自 2026-10-04 起是报工台三页的**唯一数据源**，
+//! 故在此补齐字段级契约：`batch_id` / `batch_version` 必须等于该行
+//! `t_part_batch.id` / `t_part_batch.version`；`chain_*` 四字段只有 `held` 侧有值。
+//!
+//! 2026-10-10 自 `tests/part/pickable_by_work_type.rs` 迁来（URL 全部硬切，无 alias），
+//! 同时吸收 `tests/part/lifecycle.rs` 里「工种 / 工人维度三条 list 端点的 part 侧真实
+//! 字段投影」一节里属于这两条端点的两例。留在 part 域的 `GET /parts/by-work-type/{id}`
+//! 仍由 `tests/part/lifecycle.rs` 覆盖。
 //!
 //! ## 过滤条件（全套都满足，行才进列表）
-//! 批次 `status='IN_PROCESS'` + `location='PRODUCTION_SHELF'` + `deleted_at IS NULL`，
-//! 挂在 `zone='PRODUCTION'` 且 `is_active=true` 的货架上（`t_shelf_process` 不参与
-//! 本端点过滤），且批次 `current_process_id` 命中 `t_work_type_process` 里该工种的
-//! **活跃**映射；另需 part 本身 `deleted_at IS NULL`。
+//! **pickable**：批次 `status='IN_PROCESS'` + `location='PRODUCTION_SHELF'` +
+//! `deleted_at IS NULL`，挂在 `zone='PRODUCTION'` 且 `is_active=true` 且**未软删**的
+//! 货架上，且批次 `current_process_id` 命中 `t_work_type_process` 里该工种的**活跃**
+//! 映射；另需 part 本身 `deleted_at IS NULL`。货架范围再按当前账号 scope 收窄。
+//!
+//! **held**：批次 `status='IN_PROCESS'` + `location='WORKER'` + `deleted_at IS NULL`
+//! 且 `current_holder_id = worker_id`；另需 part 本身 `deleted_at IS NULL`。不做货架
+//! scope 收窄（行已在工人手上，不是架上的候选池）。
 //!
 //! fixture 复用 `ProductionFixture`（它内部先 `load_part_fixture`，故 `FX-PROC-A`
 //! 工序 / `FX-WT-A` 工种 / `FX-WTA ↔ FX-PROC-A` 映射都是预置的）。生产货架取
@@ -17,17 +27,20 @@
 //! 几个 id，没转出 production shelf）。本文件只需直插 part / batch / 附加货架。
 
 use axum::http::StatusCode;
-use serde_json::Value;
+use serde_json::{Value, json};
 use sqlx::PgPool;
 
 use hsh_erp_test_support::fixture::{PartFixture, ProductionFixture};
 use hsh_erp_test_support::{
-    json_request, load_production_fixture, login_token, pool_snowflake, send, test_app, test_pool,
-    test_state,
+    json_request, load_production_fixture, login_token, pool_snowflake, send, send_raw, test_app,
+    test_pool, test_state,
 };
 
-/// 可领取列表路径前缀（测试 app 不带 `/api/v2`）。
-const PICKABLE_URI_PREFIX: &str = "/parts/pickable-by-work-type";
+/// 可领取列表路径前缀（测试 app 不带 `/api/v2`）。2026-10-10 起 `work_type_id` 是
+/// **query 参数**（旧路径是 path 段）。
+const PICKABLE_URI_PREFIX: &str = "/prod/scan/pickable";
+/// 工人持有列表路径前缀（测试 app 不带 `/api/v2`）。
+const HELD_URI_PREFIX: &str = "/prod/scan/held";
 
 /// fixture 预置的 active PRODUCTION 货架（`FX-SH-PROD`）。
 const PRODUCTION_SHELF_ID: i64 = PartFixture::PRODUCTION_SHELF_ID;
@@ -157,7 +170,7 @@ async fn batch_id_version_in_db(pool: &PgPool, batch_id: i64) -> (i64, i32) {
 
 /// 打一次可领取列表端点，返回信封（已 assert 200 + code 0）。
 async fn get_pickable(app: &axum::Router, token: &str, work_type_id: i64) -> Value {
-    let uri = format!("{PICKABLE_URI_PREFIX}/{work_type_id}");
+    let uri = format!("{PICKABLE_URI_PREFIX}?work_type_id={work_type_id}");
     let (status, env) = send(
         app.clone(),
         json_request("GET", &uri, None::<Value>, Some(token)),
@@ -222,90 +235,16 @@ async fn pickable_returns_batch_id_and_version_matching_db() {
         item["batch_version"], 4,
         "batch_version 必须等于 t_part_batch.version: {env}"
     );
-    // part 级 `version` 在本端点恒为 0（取行 SQL 不投影 `p.version`）——批次 OCC 只认
-    // `batch_version`，两个字段不可混用。
-    assert_eq!(
-        item["version"], 0,
-        "part 级 version 仍是 0 占位（与 batch_version 严格区分）: {env}"
+    // 2026-10-10：行 VO 已收敛成 `ScanListItem`，**没有** part 级 `version` 字段
+    // （它在本 VO 上恒为 0 占位，取行 SQL 也从不投影 `p.version`）。批次 OCC 只认
+    // `batch_version`；留着 `version` 只会让两个「版本」继续被混用。
+    assert!(
+        item.get("version").is_none(),
+        "行 VO 不该再带 part 级 version 占位字段: {item}"
     );
     // 行内其余字段仍由手工 TPart 占位派生：quantity 取自批次、drawing_no 来自 part
     assert_eq!(item["quantity"], 2, "quantity 取自批次而非 part: {env}");
     assert_eq!(item["drawing_no"], "D-PICK-A", "{env}");
-}
-
-/// `shelf_id` 过滤：只返指定货架上的批次，但 `batch_id` 仍是各自那一行的批次。
-#[tokio::test]
-async fn pickable_shelf_filter_keeps_per_batch_anchor() {
-    let (pool, app, token, fx) = bootstrap().await;
-    let on_fixture_shelf = insert_part(
-        &pool,
-        fx.part_customer_l1_id,
-        "可领件B",
-        "D-PICK-B",
-        Some("PICK-B-001"),
-    )
-    .await;
-    let batch_b = insert_pickable_batch(
-        &pool,
-        on_fixture_shelf,
-        PRODUCTION_SHELF_ID,
-        fx.process_a_id,
-        2,
-    )
-    .await;
-
-    // 另造一张 PRODUCTION 货架 + 其上的可领批次，验证 shelf_id 过滤
-    let other_shelf = insert_production_shelf(&pool, "PICK-SH-OTHER").await;
-    let on_other_shelf = insert_part(
-        &pool,
-        fx.part_customer_l1_id,
-        "可领件C",
-        "D-PICK-C",
-        Some("PICK-C-001"),
-    )
-    .await;
-    let batch_c =
-        insert_pickable_batch(&pool, on_other_shelf, other_shelf, fx.process_a_id, 6).await;
-
-    // 不带 shelf_id → 两张货架上的批次都在，且 batch_id 各自不同（证明不是「整表同一个 id」）
-    let env = get_pickable(&app, &token, fx.work_type_a_id).await;
-    assert_eq!(
-        item_by_part_id(&env, on_fixture_shelf)["batch_id"].as_str(),
-        Some(batch_b.to_string().as_str()),
-        "batch_id 必须是该行自己的批次: {env}"
-    );
-    assert_eq!(
-        item_by_part_id(&env, on_other_shelf)["batch_id"].as_str(),
-        Some(batch_c.to_string().as_str()),
-        "batch_id 必须是该行自己的批次: {env}"
-    );
-    assert_eq!(
-        item_by_part_id(&env, on_other_shelf)["batch_version"],
-        6,
-        "batch_version 同样逐行对应: {env}"
-    );
-
-    // 指定 shelf_id → 只剩该货架上的行
-    let uri = format!(
-        "{PICKABLE_URI_PREFIX}/{}?shelf_id={PRODUCTION_SHELF_ID}",
-        fx.work_type_a_id
-    );
-    let (status, env) = send(
-        app.clone(),
-        json_request("GET", &uri, None::<Value>, Some(&token)),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "GET {uri}: {env}");
-    assert_eq!(
-        part_ids(&env),
-        vec![on_fixture_shelf.to_string()],
-        "shelf_id 过滤后只剩该货架上的行: {env}"
-    );
-    assert_eq!(
-        env["data"]["items"][0]["batch_id"].as_str(),
-        Some(batch_b.to_string().as_str()),
-        "shelf_id 过滤不影响 batch_id: {env}"
-    );
 }
 
 // ===========================================================================
@@ -319,12 +258,13 @@ async fn pickable_shelf_filter_keeps_per_batch_anchor() {
 // 手工工单是常态 ⇒ 这是必经路径而非边角。
 //
 // 本轮（独立 commit）一次清完 `part/service/phase1/work_type.rs` 的全部 3 处：
-//   · `list_pickable_by_work_type`（`GET /parts/pickable-by-work-type/{id}`）
-//   · `list_by_work_type`（`GET /parts/by-work-type/{id}`）  ← 本节用例 1
-//   · `list_by_worker`（`GET /parts/by-worker/{id}`）        ← 本节用例 2
+//   · 报工台 pickable 列表（`GET /prod/scan/pickable?work_type_id=`）
+//   · 报工台 held 列表（`GET /prod/scan/held?worker_id=`）        ← 本节用例 2
+// 同族的 `list_by_work_type`（`GET /parts/by-work-type/{id}`）留在 part 域，用例在
+// `tests/part/lifecycle.rs`。
 
 /// 插一个 active 且已绑 work_type 的工人（`by-work-type` 走 `t_worker` JOIN，
-/// `by-worker` 以 worker_id 为过滤锚点）。
+/// 报工台 held 列表以 worker_id 为过滤锚点）。
 async fn insert_active_worker(pool: &PgPool, work_type_id: i64, code: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
 
@@ -349,7 +289,7 @@ async fn insert_active_worker(pool: &PgPool, work_type_id: i64, code: &str) -> i
 }
 
 /// 插一个「工人持有中」的批次（`IN_PROCESS` + `location='WORKER'` + holder=worker），
-/// 这是 `by-work-type` / `by-worker` 两个端点的硬过滤条件。
+/// 这是 `by-work-type` 与报工台 held 列表的硬过滤条件。
 async fn insert_worker_held_batch(pool: &PgPool, part_id: i64, worker_id: i64, qty: i32) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
 
@@ -374,64 +314,7 @@ async fn insert_worker_held_batch(pool: &PgPool, part_id: i64, worker_id: i64, q
     id
 }
 
-/// 2026-10-03 review 第 1 轮 Major-2 用例 1：`GET /parts/by-work-type/{id}` 遇
-/// `serial_no IS NULL` 的手工工单必须 200 且该行 `serial_no` 为 `null`。
-///
-/// 修复前本端点整页 500（`by-work-type` 是 `pickable-by-work-type` 的同族兄弟，
-/// 扫码台两个列表页挨着）。用例刻意造 `serial_no: None` 的行。
-#[tokio::test]
-async fn by_work_type_tolerates_null_serial_no() {
-    let (pool, app, token, fx) = bootstrap().await;
-    let worker_id = insert_active_worker(&pool, fx.work_type_a_id, "WT-SERIAL-NULL").await;
-    let manual_part = insert_part(
-        &pool,
-        fx.part_customer_l1_id,
-        "无序列号件",
-        "D-SERIAL-NULL",
-        None,
-    )
-    .await;
-    let _manual_batch = insert_worker_held_batch(&pool, manual_part, worker_id, 3).await;
-
-    // 同工种再放一个**有**序列号的行：证明 null 行不是「整页空」而是「与有值行共存」
-    let normal_part = insert_part(
-        &pool,
-        fx.part_customer_l1_id,
-        "有序列号件",
-        "D-SERIAL-OK",
-        Some("WT-OK-001"),
-    )
-    .await;
-    let _normal_batch = insert_worker_held_batch(&pool, normal_part, worker_id, 5).await;
-
-    let uri = format!("/parts/by-work-type/{}", fx.work_type_a_id);
-    let (status, env) = send(
-        app.clone(),
-        json_request("GET", &uri, None::<Value>, Some(&token)),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "serial_no=NULL 不应 500: {env}");
-    assert_eq!(env["code"], 0, "{uri}: {env}");
-
-    let ids = part_ids(&env);
-    assert_eq!(
-        ids.len(),
-        2,
-        "null 行与有值行都应上榜（修复前整页 500、一行都拿不到）: {env}"
-    );
-    let null_item = item_by_part_id(&env, manual_part);
-    assert!(
-        null_item["serial_no"].is_null(),
-        "手工工单的 serial_no 应序列化为 null 而非整页炸掉: {env}"
-    );
-    assert_eq!(
-        item_by_part_id(&env, normal_part)["serial_no"],
-        "WT-OK-001",
-        "同页有序列号的行不受影响: {env}"
-    );
-}
-
-/// 2026-10-03 review 第 1 轮 Major-2 用例 2：`GET /parts/by-worker/{id}` 同款。
+/// 2026-10-03 review 第 1 轮 Major-2 用例 2：报工台 held 列表同款。
 #[tokio::test]
 async fn by_worker_tolerates_null_serial_no() {
     let (pool, app, token, fx) = bootstrap().await;
@@ -458,7 +341,7 @@ async fn by_worker_tolerates_null_serial_no() {
     .await;
     let _other_batch = insert_worker_held_batch(&pool, other_part, other_worker, 2).await;
 
-    let uri = format!("/parts/by-worker/{worker_id}");
+    let uri = format!("{HELD_URI_PREFIX}?worker_id={worker_id}");
     let (status, env) = send(
         app.clone(),
         json_request("GET", &uri, None::<Value>, Some(&token)),
@@ -481,7 +364,7 @@ async fn by_worker_tolerates_null_serial_no() {
 }
 
 // ===========================================================================
-//  2026-10-04：`GET /parts/by-worker/{worker_id}` 的工序链派生
+//  2026-10-04：报工台 held 列表的工序链派生
 // ===========================================================================
 //
 // 报工台「放回」页要判定三态，全部依赖本端点行内字段（前端无第二数据源）：
@@ -615,9 +498,9 @@ async fn set_batch_position(
     .expect("update t_part_batch chain position");
 }
 
-/// 打一次 by-worker 列表并按 part id 取出目标行（找不到即 panic 并打印整份信封）。
+/// 打一次 held 列表并按 part id 取出目标行（找不到即 panic 并打印整份信封）。
 async fn by_worker_item(app: &axum::Router, token: &str, worker_id: i64, part_id: i64) -> Value {
-    let uri = format!("/parts/by-worker/{worker_id}");
+    let uri = format!("{HELD_URI_PREFIX}?worker_id={worker_id}");
     let (status, env) = send(
         app.clone(),
         json_request("GET", &uri, None::<Value>, Some(token)),
@@ -639,9 +522,9 @@ fn assert_batch_anchor(item: &Value, batch_id: i64) {
         item["batch_version"], 0,
         "batch_version 必须等于 t_part_batch.version（insert_worker_held_batch 写死 0）: {item}"
     );
-    assert_eq!(
-        item["version"], 0,
-        "part 级 version 仍是 0 占位，批次 OCC 只认 batch_version: {item}"
+    assert!(
+        item.get("version").is_none(),
+        "行 VO 不该再带 part 级 version 占位字段，批次 OCC 只认 batch_version: {item}"
     );
 }
 
@@ -937,7 +820,11 @@ async fn by_worker_chain_state_none_when_duplicate_process_in_chain() {
 // 输入是客户端可控的 `?shelf_id=`，而它不与用户 scope 求交、不传时谓词恒真。
 // ⇒ 绑了架 A 的 SHELF_ACCOUNT 能看到**全厂所有 PRODUCTION 架**上该工种可领的批次。
 //
-// 收口规则（`pickable_shelf_scope`，语义逐条对齐
+// 2026-10-10 起 `?shelf_id=` 这个入参本身也删掉了（8 条写路径都不再要人指定货架，
+// 「指定某一个架」这件事全仓再无消费方）：收窄**只能**来自服务端按账号 scope 求，
+// 不再有客户端可控的那一半。
+//
+// 收口规则（`prod::scan::listing::service::pickable_shelf_scope`，语义逐条对齐
 // `auth::rbac::CurrentUser::can_access_shelf`）：
 // - `shelf_wildcard == true` **或** 角色含 `MANAGER` ⇒ `None`（SQL 不加谓词，全集）
 // - 否则 ⇒ `Some(shelf_ids)`，谓词 `sh.id = ANY($n)`（空数组 ⇒ 空集）
@@ -1132,7 +1019,7 @@ async fn pickable_scope_closed_to_single_bound_shelf() {
     insert_pickable_batch(&pool, on_b, shelf_b, fx.process_a_id, 1).await;
 
     let token = login_shelf_account(&pool, &app, "scope_single", Scope::Bound(vec![shelf_a])).await;
-    let uri = format!("{PICKABLE_URI_PREFIX}/{}", fx.work_type_a_id);
+    let uri = format!("{PICKABLE_URI_PREFIX}?work_type_id={}", fx.work_type_a_id);
     let (s, env) = send(
         app.clone(),
         json_request("GET", &uri, None::<Value>, Some(&token)),
@@ -1168,7 +1055,7 @@ async fn pickable_scope_is_union_of_bound_shelves() {
         Scope::Bound(vec![shelf_a, shelf_b]),
     )
     .await;
-    let uri = format!("{PICKABLE_URI_PREFIX}/{}", fx.work_type_a_id);
+    let uri = format!("{PICKABLE_URI_PREFIX}?work_type_id={}", fx.work_type_a_id);
     let (s, env) = send(
         app.clone(),
         json_request("GET", &uri, None::<Value>, Some(&token)),
@@ -1197,7 +1084,7 @@ async fn pickable_scope_wildcard_sees_all_shelves() {
     insert_pickable_batch(&pool, on_b, shelf_b, fx.process_a_id, 1).await;
 
     let token = login_shelf_account(&pool, &app, "scope_wildcard", Scope::Wildcard).await;
-    let uri = format!("{PICKABLE_URI_PREFIX}/{}", fx.work_type_a_id);
+    let uri = format!("{PICKABLE_URI_PREFIX}?work_type_id={}", fx.work_type_a_id);
     let (s, env) = send(
         app.clone(),
         json_request("GET", &uri, None::<Value>, Some(&token)),
@@ -1223,7 +1110,7 @@ async fn pickable_scope_manager_bypasses_closure() {
     insert_pickable_batch(&pool, on_b, shelf_b, fx.process_a_id, 1).await;
 
     // bootstrap 的 token 就是 MANAGER（且无 SHELF_ACCOUNT 行 ⇒ 靠 Manager 角色短路）
-    let uri = format!("{PICKABLE_URI_PREFIX}/{}", fx.work_type_a_id);
+    let uri = format!("{PICKABLE_URI_PREFIX}?work_type_id={}", fx.work_type_a_id);
     let (s, env) = send(
         app.clone(),
         json_request("GET", &uri, None::<Value>, Some(&mgr_token)),
@@ -1232,61 +1119,6 @@ async fn pickable_scope_manager_bypasses_closure() {
     assert_eq!(s, StatusCode::OK, "GET {uri}: {env}");
     assert_eq!(part_ids(&env).len(), 2, "Manager 必须见全集: {env}");
     assert_total_matches_items(&env, &uri);
-}
-
-/// 场景 5：`?shelf_id=` 与 scope 求**交** —— X 不在 scope 内 ⇒ 空集。
-///
-/// 收口后 `?shelf_id=` 的语义从「不传即全给」变成「scope 的进一步收窄」，只能更严
-/// 不能更松。这本身就是一处安全改善：收口前它能把视野撑到 scope 之外。
-#[tokio::test]
-async fn pickable_shelf_filter_intersects_with_scope() {
-    let (pool, app, _mgr_token, fx) = bootstrap().await;
-    let shelf_a = PRODUCTION_SHELF_ID;
-    let shelf_b = insert_production_shelf(&pool, "SCOPE-SH-B").await;
-    let on_a = insert_part(&pool, fx.part_customer_l1_id, "架A件", "D-SCOPE-A", None).await;
-    let on_b = insert_part(&pool, fx.part_customer_l1_id, "架B件", "D-SCOPE-B", None).await;
-    insert_pickable_batch(&pool, on_a, shelf_a, fx.process_a_id, 1).await;
-    insert_pickable_batch(&pool, on_b, shelf_b, fx.process_a_id, 1).await;
-
-    let token = login_shelf_account(&pool, &app, "scope_x", Scope::Bound(vec![shelf_a])).await;
-
-    // X 在 scope 内 ⇒ 只剩架 A
-    let uri_ok = format!(
-        "{PICKABLE_URI_PREFIX}/{}?shelf_id={shelf_a}",
-        fx.work_type_a_id
-    );
-    let (s, env) = send(
-        app.clone(),
-        json_request("GET", &uri_ok, None::<Value>, Some(&token)),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "GET {uri_ok}: {env}");
-    assert_eq!(
-        part_ids(&env),
-        vec![on_a.to_string()],
-        "shelf_id ∈ scope ⇒ 取交集: {env}"
-    );
-    assert_total_matches_items(&env, &uri_ok);
-
-    // X 不在 scope 内 ⇒ 空集（**且 total 也必须是 0**，证明 COUNT 带了同一条谓词）
-    let uri_bad = format!(
-        "{PICKABLE_URI_PREFIX}/{}?shelf_id={shelf_b}",
-        fx.work_type_a_id
-    );
-    let (s, env) = send(
-        app.clone(),
-        json_request("GET", &uri_bad, None::<Value>, Some(&token)),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "GET {uri_bad}: {env}");
-    assert!(
-        env["data"]["items"].as_array().expect("items").is_empty(),
-        "shelf_id ∉ scope ⇒ 必须空集（收口前这里会返回架 B 的批次）: {env}"
-    );
-    assert_eq!(
-        env["data"]["total"], 0,
-        "COUNT 必须带同一条 scope 谓词，否则 total 会说「有 N 条」而 items 是空的: {env}"
-    );
 }
 
 /// 场景 6（**行为变更**）：软删货架上的批次不再出现在结果里（取行 + COUNT 同步）。
@@ -1303,7 +1135,7 @@ async fn pickable_excludes_batches_on_soft_deleted_shelf() {
     insert_pickable_batch(&pool, on_a, PRODUCTION_SHELF_ID, fx.process_a_id, 1).await;
     insert_pickable_batch(&pool, on_b, shelf_b, fx.process_a_id, 1).await;
     // 前提自证：软删前两张架都可见
-    let uri = format!("{PICKABLE_URI_PREFIX}/{}", fx.work_type_a_id);
+    let uri = format!("{PICKABLE_URI_PREFIX}?work_type_id={}", fx.work_type_a_id);
     let (s, env) = send(
         app.clone(),
         json_request("GET", &uri, None::<Value>, Some(&mgr_token)),
@@ -1357,7 +1189,7 @@ async fn pickable_scope_empty_when_bound_shelf_deactivated() {
     let on_a = insert_part(&pool, fx.part_customer_l1_id, "架A件", "D-SCOPE-A", None).await;
     insert_pickable_batch(&pool, on_a, PRODUCTION_SHELF_ID, fx.process_a_id, 1).await;
 
-    let uri = format!("{PICKABLE_URI_PREFIX}/{}", fx.work_type_a_id);
+    let uri = format!("{PICKABLE_URI_PREFIX}?work_type_id={}", fx.work_type_a_id);
     // 前提自证：批次确实可领（否则下面的空集断言是恒真的）
     let (s, env) = send(
         app.clone(),
@@ -1416,7 +1248,7 @@ async fn pickable_scope_bound_to_inspection_shelf_only_yields_nothing() {
     let on_a = insert_part(&pool, fx.part_customer_l1_id, "架A件", "D-SCOPE-A", None).await;
     insert_pickable_batch(&pool, on_a, PRODUCTION_SHELF_ID, fx.process_a_id, 1).await;
 
-    let uri = format!("{PICKABLE_URI_PREFIX}/{}", fx.work_type_a_id);
+    let uri = format!("{PICKABLE_URI_PREFIX}?work_type_id={}", fx.work_type_a_id);
     // 前提自证：批次可领
     let (s, env) = send(
         app.clone(),
@@ -1460,4 +1292,356 @@ async fn pickable_scope_bound_to_inspection_shelf_only_yields_nothing() {
     );
     assert_eq!(env["data"]["total"], 0, "COUNT 同样为 0: {env}");
     assert_total_matches_items(&env, &uri);
+}
+
+// ===========================================================================
+//  2026-10-04（随端点迁入）：part 侧业务列投影真实值
+// ===========================================================================
+//
+// 三个同族端点此前共享一个根因：取行 SQL 只投影 `p.id` / `p.serial_no` /
+// `p.drawing_no` 三列，剩下的行字段靠**手抄 20 个占位值**的字面量填。于是 `name`
+// 填成图号副本（前端卡片第 1 行与第 2 行重复）、`is_urgent` 恒 `false`（加急 tag
+// 永不渲染）、`planned_delivery_date` 恒 `1970-01-01`。
+//
+// 而 pickable 列表的 `ORDER BY p.is_urgent DESC, p.planned_delivery_date ASC` 排的
+// 是 **DB 真实列** ⇒ 列表已经按加急排好了，工件上却看不出任何标记。
+//
+// 断言手法：造 part 时让 `name` **不等于** `drawing_no` —— 改造前 `name` 就是图号
+// 副本，两者相等时任何 `assert_eq!(name, …)` 都测不出漂移。另外 `is_urgent` /
+// `planned_delivery_date` 刻意取**非默认值**，否则「投影到真值」与「仍填占位」不可区分。
+fn assert_real_part_fields(
+    item: &Value,
+    want_name: &str,
+    want_urgent: bool,
+    want_planned: &str,
+    want_system: Option<&str>,
+) {
+    assert_eq!(
+        item["name"], want_name,
+        "name 必须是 t_part.name 真实值（改造前是 drawing_no 的副本）: {item}"
+    );
+    assert_eq!(
+        item["is_urgent"], want_urgent,
+        "is_urgent 必须是 t_part.is_urgent 真实值（改造前恒 false）: {item}"
+    );
+    assert_eq!(
+        item["planned_delivery_date"], want_planned,
+        "planned_delivery_date 必须是真实值（改造前恒 1970-01-01）: {item}"
+    );
+    match want_system {
+        Some(s) => assert_eq!(
+            item["system_delivery_date"], s,
+            "system_delivery_date 必须是 t_part 的真实值: {item}"
+        ),
+        None => assert!(
+            item["system_delivery_date"].is_null(),
+            "system_delivery_date 为 NULL 的 part 必须序列化成 null: {item}"
+        ),
+    }
+    assert!(
+        item.get("next_process_id").is_none(),
+        "列表响应恒不含 next_process_id: {item}"
+    );
+    // 2026-10-10：占位字段已随 VO 收敛整体退场（见 `ScanListItem` 的 doc）。
+    for gone in [
+        "applicant_name",
+        "request_date",
+        "customer_id",
+        "assembly_id",
+        "status",
+        "order_no",
+        "note",
+        "unit_price",
+        "total_price",
+        "version",
+        "created_at",
+        "created_by",
+        "updated_at",
+        "updated_by",
+        "deleted_at",
+        "customer_name",
+        "l1_customer_name",
+        "holder_name",
+        "row_type",
+        "has_children",
+        "child_count",
+        "has_cnc_program",
+    ] {
+        assert!(
+            item.get(gone).is_none(),
+            "`{gone}` 是恒为占位值的字段，2026-10-10 起不该再出现在行里: {item}"
+        );
+    }
+}
+
+/// `GET /prod/scan/pickable`：part 侧 4 列投影真实值。
+#[tokio::test]
+async fn pickable_projects_real_part_business_fields() {
+    let (pool, app, token, fx) = bootstrap().await;
+    let part_id = insert_part(
+        &pool,
+        fx.part_customer_l1_id,
+        "可领急件名",
+        "D-BIZ-PICK",
+        Some("BIZ-PICK-001"),
+    )
+    .await;
+    sqlx::query(
+        "UPDATE t_part SET is_urgent = true, \
+           planned_delivery_date = DATE '2026-10-20', system_delivery_date = NULL \
+         WHERE id = $1",
+    )
+    .bind(part_id)
+    .execute(&pool)
+    .await
+    .expect("mark part urgent");
+    insert_pickable_batch(&pool, part_id, PRODUCTION_SHELF_ID, fx.process_a_id, 2).await;
+
+    let env = get_pickable(&app, &token, fx.work_type_a_id).await;
+    let item = item_by_part_id(&env, part_id);
+    // system_delivery_date 为 NULL ⇒ 序列化成 null（不是 1970-01-01）
+    assert_real_part_fields(item, "可领急件名", true, "2026-10-20", None);
+    assert_ne!(
+        item["name"], item["drawing_no"],
+        "前提自证：name 与 drawing_no 必须不同（相等时测不出「name 填成图号」的漂移）: {item}"
+    );
+}
+
+/// `GET /prod/scan/held`：part 侧 4 列投影真实值。
+#[tokio::test]
+async fn held_projects_real_part_business_fields() {
+    let (pool, app, token, fx) = bootstrap().await;
+    let part_id = insert_part(
+        &pool,
+        fx.part_customer_l1_id,
+        "持有中工单名",
+        "D-BIZ-HELD",
+        Some("BIZ-HELD-001"),
+    )
+    .await;
+    sqlx::query(
+        "UPDATE t_part SET is_urgent = true, \
+           planned_delivery_date = DATE '2027-01-15', \
+           system_delivery_date = DATE '2026-12-20' \
+         WHERE id = $1",
+    )
+    .bind(part_id)
+    .execute(&pool)
+    .await
+    .expect("mark part urgent");
+    let worker_id = insert_active_worker(&pool, fx.work_type_a_id, "WK-BIZ").await;
+    insert_worker_held_batch(&pool, part_id, worker_id, 5).await;
+
+    let item = by_worker_item(&app, &token, worker_id, part_id).await;
+    assert_real_part_fields(
+        &item,
+        "持有中工单名",
+        true,
+        "2027-01-15",
+        Some("2026-12-20"),
+    );
+}
+
+// ===========================================================================
+//  2026-10-10：`ScanListItem` 字段集 + 「哪些字段只有 held 有值」
+// ===========================================================================
+
+/// 行 VO 的键集合逐字钉死。
+///
+/// 后端**加字段**时前端 Zod 会静默 strip（报工台照常渲染、零报错，而那个字段永远
+/// 没人消费）；**删字段**时前端必填声明会炸掉整份信封。这两种漂移只有把键集合
+/// 写死才拦得住。
+#[tokio::test]
+async fn scan_list_item_key_set_is_pinned() {
+    let (pool, app, token, fx) = bootstrap().await;
+    let part_id = insert_part(
+        &pool,
+        fx.part_customer_l1_id,
+        "键集合用例件",
+        "D-KEYSET",
+        Some("KEYSET-001"),
+    )
+    .await;
+    insert_pickable_batch(&pool, part_id, PRODUCTION_SHELF_ID, fx.process_a_id, 2).await;
+
+    let env = get_pickable(&app, &token, fx.work_type_a_id).await;
+    let item = item_by_part_id(&env, part_id);
+    let mut keys: Vec<&str> = item
+        .as_object()
+        .expect("行应是 JSON 对象")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "batch_id",
+            "batch_version",
+            "chain_current_process_name",
+            "chain_next_process_id",
+            "chain_next_process_name",
+            "chain_state",
+            "drawing_no",
+            "has_process_chain",
+            "id",
+            "is_urgent",
+            "location",
+            "name",
+            "planned_delivery_date",
+            "process_chain_id",
+            "quantity",
+            "serial_no",
+            "system_delivery_date",
+        ],
+        "ScanListItem 的字段集变了：加字段要同步前端 scanPartRowSchema，\
+         删字段要先确认前端无消费方并同步改本断言"
+    );
+    // `location` 值恒 null，但**键必须在** —— 前端 `BatchPickerDialog.holderText`
+    // 用「键存在性」判断要不要渲染 holder 行，键被 strip 掉时卡片静默少一行。
+    assert!(
+        item.as_object().unwrap().contains_key("location"),
+        "location 键必须在（哪怕值恒 null）: {item}"
+    );
+    assert!(item["location"].is_null(), "location 值恒 null: {item}");
+    // 序列化方向：雪花 id 一律 string，计数裸数字
+    assert!(item["id"].is_string(), "id 必须是 JSON string: {item}");
+    assert_eq!(item["batch_version"], 2, "batch_version 是裸数字: {item}");
+    assert!(item["quantity"].is_number(), "quantity 是裸数字: {item}");
+}
+
+/// **同一个批次**在两条端点上的链字段：pickable 侧是占位、held 侧是真值。
+///
+/// 这是本 VO 最容易被误读的一处：链四字段 + `process_chain_id` 只在 `held` 侧填，
+/// 因为链位置是**批次级**事实，而 `pickable` 侧那行「还没被领走」，前端不需要知道
+/// 它的下一道工序（放回分流只在放回页做，而放回页读的是 `held`）。取保守默认
+/// （`NONE` / `"0"` / `null` / `null`）而不是编一个值，是因为 `NONE` 的语义与
+/// 「不知道」同向 —— 宁可让用户手填，也不给一个可能错的下一道。
+#[tokio::test]
+async fn chain_fields_only_held_side_has_values() {
+    let (pool, app, token, fx) = bootstrap().await;
+    // 链 = [A(sort_order 10), B(20)]；批次当前工序 = A（指向 step_a）
+    // ⇒ 链位置 NEXT、下一道 = B。
+    let part_id = insert_part(
+        &pool,
+        fx.part_customer_l1_id,
+        "链字段对照件",
+        "D-CHAIN-PAIR",
+        Some("CHAIN-PAIR-1"),
+    )
+    .await;
+    let chain_id = create_chain(&pool, "chain-pair").await;
+    bind_part_to_chain(&pool, part_id, chain_id).await;
+    let step_a = add_chain_step(&pool, chain_id, fx.process_a_id, 10).await;
+    add_chain_step(&pool, chain_id, fx.process_b_id, 20).await;
+
+    // ---- 同一个批次，先在生产架上（pickable 侧），再交给工人（held 侧）----
+    // current_process 必须取 `process_a`：`t_work_type_process` 里只有 FX-WTA ↔
+    // FX-PROC-A 的映射，取 B 的话 pickable 根本看不见这行（与链位置无关）。
+    let pick_batch =
+        insert_pickable_batch(&pool, part_id, PRODUCTION_SHELF_ID, fx.process_a_id, 3).await;
+    set_batch_position(&pool, pick_batch, Some(fx.process_a_id), Some(step_a)).await;
+
+    let pick_env = get_pickable(&app, &token, fx.work_type_a_id).await;
+    let pick_item = item_by_part_id(&pick_env, part_id);
+    assert_none_state(pick_item);
+    assert!(
+        pick_item["process_chain_id"].is_null(),
+        "pickable 侧不投影 process_chain_id（恒 null）: {pick_item}"
+    );
+    assert!(
+        pick_item["has_process_chain"].as_bool().is_some(),
+        "has_process_chain 两条端点都填: {pick_item}"
+    );
+
+    // 交给工人
+    let worker_id = insert_active_worker(&pool, fx.work_type_a_id, "WK-CHAIN-PAIR").await;
+    sqlx::query(
+        "UPDATE t_part_batch SET location = 'WORKER', current_holder_id = $2 \
+         WHERE id = $1",
+    )
+    .bind(pick_batch)
+    .bind(worker_id)
+    .execute(&pool)
+    .await
+    .expect("hand the batch to the worker");
+
+    let held_item = by_worker_item(&app, &token, worker_id, part_id).await;
+    assert_eq!(
+        held_item["chain_state"], "NEXT",
+        "held 侧填真值: {held_item}"
+    );
+    assert_eq!(
+        held_item["chain_next_process_id"].as_str(),
+        Some(fx.process_b_id.to_string().as_str()),
+        "held 侧的下一道是链上第二道（工序 B）: {held_item}"
+    );
+    assert_eq!(
+        held_item["chain_next_process_name"], "FX 工序 NB",
+        "held 侧的下一道工序名（字面值取自 test-support/fixtures/production.sql \
+         的 FX-NB 行）: {held_item}"
+    );
+    assert_eq!(
+        held_item["chain_current_process_name"], "FX 工序 NA",
+        "held 侧的当前工序名: {held_item}"
+    );
+    assert_eq!(
+        held_item["process_chain_id"].as_str(),
+        Some(chain_id.to_string().as_str()),
+        "held 侧投影真实链 id: {held_item}"
+    );
+}
+
+// ===========================================================================
+//  2026-10-10：旧路径全部失效（硬切无 alias）
+// ===========================================================================
+
+/// 5 条旧端点逐一断言已失效。
+///
+/// ⚠️ 响应码**按实跑结果**写。实跑结论与直觉相反，值得记一笔：
+/// **5 条全是 404，没有一条是 400**。
+/// - 两条 `/parts/...` 的直觉依据是「落进 `/{part_id}` catch-all ⇒ `Path<i64>`
+///   拒绝非数字段 ⇒ 400」。**不成立**：part 域的 2 段路由（`/{part_id}/update` 等）
+///   第二段是**字面量**（`update` / `cancel` / `pick-up` …），`matchit` 匹配不上
+///   `1` ⇒ 根本没有路由命中 ⇒ 干净的 404。`Path` 提取器压根没机会拒绝。
+/// - `POST /prod/workers/verify-badge`：落进 worker 域的 `/{id}`，那条**只注册了
+///   GET** ⇒ 方法不匹配返 405（该条由 `scan_badge.rs` 守）。
+/// - 两条 `/prod/batches/...`：整个路由段已不存在 ⇒ 404。
+///
+/// 结论：**跨域硬切时不要预设响应码**。`/shelves/*` 是干净 404、`/iam/shelves/*`
+/// 落 catch-all 才是 400 —— 差别在「被 catch-all 吃掉的那条路径有没有字面量第二段」。
+#[tokio::test]
+async fn old_scan_paths_are_gone() {
+    let (_pool, app, token, _fx) = bootstrap().await;
+
+    for (uri, method, want) in [
+        (
+            "/parts/pickable-by-work-type/1",
+            "GET",
+            StatusCode::NOT_FOUND,
+        ),
+        ("/parts/by-worker/1", "GET", StatusCode::NOT_FOUND),
+        (
+            "/prod/workers/verify-badge",
+            "POST",
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
+        ("/prod/batches/worker-scan", "POST", StatusCode::NOT_FOUND),
+        ("/prod/batches/1/pick-up", "POST", StatusCode::NOT_FOUND),
+    ] {
+        let body = if method == "POST" {
+            Some(json!({"serial_no": "X", "badge_code": "X"}))
+        } else {
+            None
+        };
+        // 走 `send_raw`：400 / 405 / 404 的响应体是纯文本（axum 提取器 rejection /
+        // 方法不匹配 / 空路由），不走 `R<T>` 信封，`send` 会在 JSON 解析处 panic ——
+        // 而那正是本用例要断言的形态。
+        let (status, raw) =
+            send_raw(app.clone(), json_request(method, uri, body, Some(&token))).await;
+        assert_eq!(
+            status, want,
+            "旧路径 {method} {uri} 应当失效，实得 {status}: {raw}"
+        );
+    }
 }

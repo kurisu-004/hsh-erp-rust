@@ -2,12 +2,13 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-> 📌 **前端对接**：后端 API 参考见 [`docs/api/`](docs/api/)。**2026-10-10 现状**：`docs/api/` 有 9 份文件，每份是一个域的**整域契约**（端点表 / 逐字段 / 口径表 / 错误码 / 移除记录 / WS 关系 / 表依赖与前端配套 / 已知偏差登记），范本是 [`dashboard.md`](docs/api/dashboard.md) 的八节骨架：
+> 📌 **前端对接**：后端 API 参考见 [`docs/api/`](docs/api/)。**2026-10-10 现状**：`docs/api/` 有 10 份文件，每份是一个域的**整域契约**（端点表 / 逐字段 / 口径表 / 错误码 / 移除记录 / WS 关系 / 表依赖与前端配套 / 已知偏差登记），范本是 [`dashboard.md`](docs/api/dashboard.md) 的八节骨架：
 > - [`docs/api/dashboard.md`](docs/api/dashboard.md) —— 大屏聚合域（3 个只读 HTTP 端点 + WS 首帧 / 增量；`DELIVERY_STATUSES` 四处共用、行单位、装配件整套交付不变式、`ts` 格式、前端配套清单）
 > - [`docs/api/programming.md`](docs/api/programming.md) —— `prod::programming` 待编程一览（part 状态闸门 + 三规则并集、part 级去重、批次锚点、排序白名单大小写不对称）
 > - [`docs/api/inspection.md`](docs/api/inspection.md) —— `prod::inspection` 待品检（队列列表 + 扫码三层树、`l1_customer_name` 与返修侧有意分叉、域隔离漏报盲区）
 > - [`docs/api/queue.md`](docs/api/queue.md) —— `prod::queue` 生产队列（9 端点；候选池判据的两列一致 / 货架 JOIN 不一致、`pending_count` 口径、`batch_id` 必须是 JSON 字符串）
-> - [`docs/api/batch.md`](docs/api/batch.md) —— `prod::batch` 批次流转（**剥离中间态**，域内 19 条 + 域外 `/batches/split` 1 条；剥离登记表 / `ROUTES` 权威源 / 状态派生契约 / 外协三端点已迁往 `outsource::queue`）
+> - [`docs/api/scan.md`](docs/api/scan.md) —— `prod::scan` 报工台（**2026-10-10 新建**，5 端点硬切自 `prod::worker` / `part` / `prod::batch`；`ScanListItem` 39 → 17 字段收敛、`ScanWorkerBrief` 12 → 4 字段收敛、旧路径 4×404 + 1×405 的实跑形态、`pickable_shelf_scope` 与 `shelf_scope_for` 的刻意分歧、`listing/` 子模块的域隔离护栏）
+> - [`docs/api/batch.md`](docs/api/batch.md) —— `prod::batch` 批次流转（**剥离中间态**，域内 17 条 + 域外 `/batches/split` 1 条；剥离登记表 / `ROUTES` 权威源 / 状态派生契约 / 外协三端点已迁往 `outsource::queue` / 报工台 2 条已迁往 `prod::scan`）
 > - [`docs/api/outsource.md`](docs/api/outsource.md) —— `outsource` 外协域（4 个 router 工厂 19 端点；外协看板 + `move` 三合一写端点、公司 / 报价两域收敛（端点 8+9 → 7+7、`keyword` 拆 `drawing_no` / `name`、报价 `statuses` 多状态筛选接线）、报价与对账、候选侧两处行粒度一致性、移除记录、WS 事件与审计字面量的区分）
 > - [`docs/api/delivery_note.md`](docs/api/delivery_note.md) —— `com::delivery_note` 送货单（17 端点；扫码三层树 + DP 批次分配 / 建单判定键单键 / 移除记录 29 条 VO 字段）
 > - [`docs/api/shelves.md`](docs/api/shelves.md) —— **iam 域下的货架子模块**（2026-10-10 自独立 shelf 域迁入 iam，URL 硬切 `/api/v2/shelves/*` → `/api/v2/iam/shelves/*`、旧前缀 404；5 端点、`t_shelf.capacity` 负载上限 + `ShelfOut.current_load` 出参、自动选架算法与 `shelf_scope_for` 三分支、picker 两端点移除记录）
@@ -133,40 +134,42 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 
 | 子模块 | 端点数 | URL 前缀 | 表 | 说明 |
 |---|---:|---|---|---|
-| `prod::worker` | 7 | `/api/v2/prod/workers` | `t_worker` | 工人档案主数据 |
+| `prod::worker` | 6 | `/api/v2/prod/workers` | `t_worker` | 工人档案主数据（**2026-10-10** 报工台的 `POST /verify-badge` 迁往 `prod::scan`，旧路径 `/prod/workers/verify-badge` **405** —— 落进 `/{id}` 而那条只注册 GET） |
 | `prod::work_type` | 7 | `/api/v2/prod/work-types` | `t_work_type` + `t_work_type_process` | 工种 CRUD 5 + 工种↔工序映射 2 |
 | `prod::process` | 5 | `/api/v2/prod/processes` | `t_process` | 工序主数据（INHOUSE/OUTSOURCE）；**2026-10-02 订正**：文档原写 6，逐 router 复核为 5（`/` 的 GET+POST 算 2 条 route） |
 | `prod::process_chain` | 3 | `/api/v2/prod/process-chains` | `t_part_process_chain` + `t_process_chain_step` | 工单工艺链 |
 | `prod::shelf_process` | 3 | `/api/v2/prod/shelf-processes` | `t_shelf_process` | **2026-10-02 新增**：货架 ↔ 工序映射，2026-10-02 自当时的 shelf 域搬入（`t_shelf_process` 关联的是 prod 域实体 `t_process`，故归 prod 而非 iam）。旧路径 `GET|POST /api/v2/shelves/{id}/processes` + `GET /api/v2/shelves/processes` 已删除（**无 alias**；⚠️ 2026-10-10 起这三条在 wire 上的形态统一变成 404 —— `/api/v2/shelves` 整段前缀随货架子模块迁入 iam 而下线）。这 3 个端点请求 / 响应契约逐字不变；前端配套改动清单见 `src/modules/prod/shelf_process/mod.rs` 的模块 doc |
 | ⚠️ **货架本体不在本表**：货架子模块 `iam::shelf`（5 端点）是 iam 域下的嵌套子模块，见下表 |
 | `prod::queue` | 9 | `/api/v2/prod/queue` | `t_part_batch`（候选池视图）+ `t_process` / `t_worker` / `t_work_type` / `t_shelf`（板聚合只读） | **2026-10-08** `prod::worker_pool` 更名（URL `/pool` → `/queue`，**硬切无 alias**）+ 从 `prod::batch` 吸收下发流 3 条（`pending` / `dispatch` / `auto-dispatch`）+ 召回 1 条（`{batch_id}/recall-to-pending` → `POST /queue/recall`，`batch_id` 改入 body）+ 新增队列板聚合 2 条（`GET /snapshot` / `GET /processes/{id}`，消掉 `/state` `/counts` `/{process_id}` 三条旧读）。整域契约见 [`docs/api/queue.md`](docs/api/queue.md) |
-| `prod::batch` | 19 | `/api/v2/prod/batches` | `t_part_batch` | 批次流转域（**2026-10-08** 下发流 3 条 + 召回 1 条剥离往 `prod::queue` 后剩 23 条；**2026-10-09** 外协三端点合并为 `POST /api/v2/outsource-queue/move`（`outsource` 域）后剩 20 条，同日**拆批 1 条提升为顶层共用端点 `POST /api/v2/batches/split`**（`batch_id` 入 body、三处消费）后剩 19 条；2026-10-07 待品检队列读 `GET /inspection` 迁往 `prod::inspection`）。⚠️ **本域有 2 处挂载**：本行的域内前缀 + 顶层 `/api/v2/batches`（拆批，经 `prod::split_router()` 转发，登记在 `src/modules/mod.rs::v2_router()`）。**权威路由清单是 `src/modules/prod/batch/handler/mod.rs::ROUTES`**（`mod tests` 断言它与 `router()` 源码逐条一致），域整体处于逐端点剥离的中间态、尚未删除；剥离登记表见 `STRIP_TARGETS` 与 [`docs/api/batch.md`](docs/api/batch.md) |
+| `prod::batch` | 17 | `/api/v2/prod/batches` | `t_part_batch` | 批次流转域（**2026-10-08** 下发流 3 条 + 召回 1 条剥离往 `prod::queue` 后剩 23 条；**2026-10-09** 外协三端点合并为 `POST /api/v2/outsource-queue/move`（`outsource` 域）后剩 20 条，同日**拆批 1 条提升为顶层共用端点 `POST /api/v2/batches/split`**（`batch_id` 入 body、三处消费）后剩 19 条；2026-10-07 待品检队列读 `GET /inspection` 迁往 `prod::inspection`；**2026-10-10 报工台 2 条 `POST /worker-scan` + `POST /{batch_id}/pick-up` 迁往 `prod::scan`** 后剩 **17** 条）。⚠️ **本域有 2 处挂载**：本行的域内前缀 + 顶层 `/api/v2/batches`（拆批，经 `prod::split_router()` 转发，登记在 `src/modules/mod.rs::v2_router()`）。**权威路由清单是 `src/modules/prod/batch/handler/mod.rs::ROUTES`**（`mod tests` 断言它与 `router()` 源码逐条一致），域整体处于逐端点剥离的中间态、尚未删除；剥离登记表见 `STRIP_TARGETS` 与 [`docs/api/batch.md`](docs/api/batch.md) |
 | `prod::programming` | 1 | `/api/v2/prod/programming` | `t_part` + `t_part_batch` + chain | 待编程一览（2026-10-01 新增） |
 | `prod::process_design` | 1 | `/api/v2/prod/process-design` | `t_part` | **2026-10-05 新增**：制定工序页零件列表。软删闸门 + `status = 'PENDING'` 闸门，7 字段最小集，**刻意不加** `AND assembly_id IS NULL` 守卫（part 域 `GET /parts` 带 `part_only: true` 会把装配件子件全部排除）故**含装配件子件**；入参只有 `sort_dir` / `limit` / `offset`。前端「制定工序」页自 part 域 `GET /api/v2/parts?status=PENDING` 切来，part 域旧端点保留兼容、一行未改 |
 | `com::delivery_note` | 17 | `/api/v2/com/delivery` | `t_delivery_note`（送货单）+ `t_delivery_group` / `t_delivery_group_member`（送货分组）+ 跨域只读 `t_part` / `t_assembly` / `t_part_batch` / `t_customer` / `t_worker` / `t_work_type` / `t_shelf` / `t_process` / `t_outsource_company` | **2026-10-08 自顶层 `delivery_note` 域平移**（URL `/api/v2/delivery-notes` + `/api/v2/delivery-groups` → `/api/v2/com/delivery/note` + `/api/v2/com/delivery/group`，**硬切无 alias**）+ **事件子系统下线**（`DROP TABLE t_delivery_note_event`）+ **`NoteScope` 范围判定逻辑删除**，建单判定键收敛为 `(customer_id, status='DRAFT')` 单键（`uk_t_delivery_note_l1_open_draft` 部分唯一索引兜底）+ **入单收敛为扫码单一入口** `POST /scan`（删 7 端点；客户端显式提交 `entries[]`，服务端在同一事务内 find-or-create + **DP 批次分配** + 拆批 + 挂单）+ 新增只读扫码三层树 `GET /scan/{serial_no}` + **打印链路全删**（xlsx 改由前端 hucre 本地生成）+ 新增 `POST /{id}/driver` 与 `GET /drivers`（后者刻意不用 `prod::worker` 的 11 字段 `WorkerOut`，只返 3 字段、不带 `id_card_no` / `phone`）+ `/pickup` 入参瘦身（司机从单据读 + **重跑** `validate_driver`）+ VO 字段裁剪 29 条。**权威路由清单是 `handler::{ROUTES, GROUP_ROUTES, DRIVERS_ROUTES}`**（单测逐条比对各自 `xxx_router()` 源码）。整域契约见 [`docs/api/delivery_note.md`](docs/api/delivery_note.md) |
+| `prod::scan` | 5 | `/api/v2/prod/scan` | `t_part` + `t_part_batch` + `t_work_type_process` + `t_shelf` + `t_process` + `t_process_chain` / `t_process_chain_step`（报工台）+ `t_worker` | **2026-10-10 新建**（按**前端消费方**立域：5 条端点的唯一消费方是 `views/production/scan/` 三页 + 扫工牌弹窗 + 队列看板一条动作）：`POST /verify-badge`（自 `prod::worker`，任意已登录）+ `GET /pickable` + `GET /held`（自 part 域，两条 URL **硬切**：`{work_type_id}` / `{worker_id}` 由 path 段改 query 参数） + `POST /worker-scan` + `POST /batches/{batch_id}/pick-up`（自 `prod::batch`）。★ **VO 按前端实际消费收敛**：`PartListItem` 40 → `ScanListItem` 17 字段（23 个恒占位字段退场）、`WorkerOut` 11 → `ScanWorkerBrief` 4 字段（`WorkerOut` 本身**不删**，worker 管理端点仍在用）。★ `?shelf_id=` 入参删除（批次 B 已让选架全自动）。★ **整域不适用域隔离护栏**（转发型域），只有 `listing/` 子模块单独装 `assert_no_foreign_domain`。整域契约见 [`docs/api/scan.md`](docs/api/scan.md) |
 | `prod::inspection` | 2 | `/api/v2/prod/inspection` | `t_assembly` + `t_part` + `t_part_batch`（另 `LEFT JOIN` `t_customer` / `t_process` / `t_shelf` / `t_worker` / `t_outsource_company` 五表：仅 `t_customer` 有软删闸门（客户名退化为 `null`），`t_process` / `t_shelf` / `t_worker` / `t_outsource_company` 四张展示用附表刻意不加） | **2026-10-05 新增**：扫码查询（`GET /scan/{serial_no}`），返回「装配件（可空）→ 全部子件 → 全部批次」三层树。命中口径先查 `t_part.serial_no`、未命中回退 `t_assembly.serial_no`，都未命中返 `20101` / HTTP 404，`serial_no` trim 后为空同样按未命中；软删闸门覆盖 part / assembly / batch 三表；★ **读全部批次不按状态过滤**（含终态，状态闸门在前端）；★ `process_name` 走 `current_process_id` 权威列（migration 004），故 `INSPECTION` / `DELIVERED` 批次**恒 `null`**（出池清该列不变式的正确结果）；`is_scanned` 是唯一内存派生字段（`t_part_batch` 无序列号列）；批次层一条 SQL（`part_id = ANY($1)`）取回整棵树、无 N+1；角色 Manager + Inspector。★ 响应规模 = 子件数 × 每件批次数，**无上限、无分页**（本端点不接受任何 query 参数）。前端待品检页扫码路径 ⏳ **建议**自 part 域 `GET /parts/by-serial/{serial_no}`（+ `/part-batches`）切来（**尚未在前端仓合入**），part 域旧端点保留兼容、一行未改；完整契约见 [`docs/api/inspection.md`](docs/api/inspection.md)。**2026-10-07 新增第 2 个端点**：`GET /queue` 待品检队列列表（13 字段窄投影 + 表头 7 列各一个筛选 + 服务端排序 + 分页 `limit∈[1,200]`），自 `prod::batch` 迁入 —— ⚠️ **破坏性路由变更**：旧路径 `GET /api/v2/prod/batches/inspection` 已下线且**无 alias**，请求 / 响应契约逐字不变（前端只需改 api 层一处 URL 常量）；迁后本域**零跨域依赖** |
 
-> 表内 11 个子模块端点求和 = 7 + 7 + 5 + 3 + 3 + 9 + 19 + 1 + 1 + 17 + 2 = **74**。计数口径：一条 `.route(path, m1)` 记 1 条、`.route(path, get(h).post(h))` 记 2 条；2026-10-09 合并 master 后逐个打开上表 11 行的 `xxx_router()` 源码复核过一遍（`prod::batch` 与 `com::delivery_note` 另有 `ROUTES` / `GROUP_ROUTES` / `DRIVERS_ROUTES` 常量互为佐证）。
+> 表内 12 个子模块端点求和 = 6 + 7 + 5 + 3 + 3 + 9 + 17 + 1 + 1 + 5 + 17 + 2 = **76**。计数口径：一条 `.route(path, m1)` 记 1 条、`.route(path, get(h).post(h))` 记 2 条；2026-10-09 合并 master 后逐个打开上表 12 行的 `xxx_router()` 源码复核过一遍（`prod::batch` 与 `com::delivery_note` 另有 `ROUTES` / `GROUP_ROUTES` / `DRIVERS_ROUTES` 常量互为佐证）。
 >
 > 逐行算式（子模块 → 端点数）：
 >
 > | 子模块 | 端点数 | 复核依据 |
 > |---|---:|---|
-> | `prod::worker` | 7 | `/` GET+POST 记 2 + `verify-badge` / `/{id}` / `{id}/update` / `{id}/deactivate` / `{id}/reactivate` 各 1 |
+> | `prod::worker` | 6 | `/` GET+POST 记 2 + `/{id}` / `{id}/update` / `{id}/deactivate` / `{id}/reactivate` 各 1（`verify-badge` 已迁往 `prod::scan`） |
 > | `prod::work_type` | 7 | `/` 2 + `/{id}` / `{id}/update` / `{id}/soft-delete` 各 1 + `/{id}/processes` GET+POST 记 2 |
 > | `prod::process` | 5 | `/` 2 + `/{id}` / `{id}/update` / `{id}/soft-delete` 各 1 |
 > | `prod::process_chain` | 3 | `/by-part/{part_id}` GET+POST 记 2 + `/{chain_id}` 1 |
 > | `prod::shelf_process` | 3 | `/` 1 + `/{shelf_id}` GET+POST 记 2 |
 > | `prod::queue` | 9 | `pending` / `dispatch` / `auto-dispatch` / `recall` / `snapshot` / `refill` / `move` / `auto-allocate` / `processes/{process_id}` 各 1（全单方法） |
-> | `prod::batch` | 19 | 19 条全单方法，与 `handler/mod.rs::ROUTES` 的 19 项逐条一致（有单测断言） |
+> | `prod::batch` | 17 | 17 条全单方法，与 `handler/mod.rs::ROUTES` 的 17 项逐条一致（有单测断言） |
 > | `prod::programming` | 1 | `/pending` |
 > | `prod::process_design` | 1 | `/parts` |
+> | `prod::scan` | 5 | `/verify-badge` / `/worker-scan` / `/pickable` / `/held` / `/batches/{batch_id}/pick-up` 各 1（全单方法；`/pickable` 与 `/held` 是 GET，其余 POST） |
 > | `prod::inspection` | 2 | `/queue` + `/scan/{serial_no}` |
 > | `com::delivery_note` | 17 | `note_router()` 12（`batch-detail` / `scan` / `scan/{serial_no}` / `/` / `{id}` 的 GET+POST 7 条按单方法计）+ `group_router()` 4（`/` GET+POST 记 2 + `{id}/update` + `{id}/soft-delete`）+ `drivers_router()` 1（`/`）= 12 + 4 + 1 |
 >
 > ⚠️ **两处顶层 nest 不计入本表**：`POST /api/v2/batches/split`（`prod::split_router()`）与 `/api/v2/outsource-queue/*`（`outsource::queue_router()`）—— 二者挂 `/api/v2` 顶层而非本表的 `/api/v2/prod/*`，见「路由声明规约」第 9 条的顶层 nest 登记。
 >
-> 求和演变：2026-10-08 `prod::worker_pool` 6 条 → `prod::queue` 9 条、`prod::batch` 27 条 → 23 条（两域间净移动 4 条，prod 域求和 62 → 61），同日在 `com` 聚合新增 `com::delivery_note` 子模块 17 条 ⇒ 61 + 17 = 78；2026-10-09 外协三端点合并为 `POST /api/v2/outsource-queue/move`（`outsource` 域）⇒ `prod::batch` 23 → 20（prod 域求和 61 → **58**），同日拆批 1 条提升为顶层共用端点（不计入本表）⇒ `prod::batch` 20 → 19（prod 域求和 **57**）⇒ 全表 **57 + 17 = 74**。
+> 求和演变：2026-10-08 `prod::worker_pool` 6 条 → `prod::queue` 9 条、`prod::batch` 27 条 → 23 条（两域间净移动 4 条，prod 域求和 62 → 61），同日在 `com` 聚合新增 `com::delivery_note` 子模块 17 条 ⇒ 61 + 17 = 78；2026-10-09 外协三端点合并为 `POST /api/v2/outsource-queue/move`（`outsource` 域）⇒ `prod::batch` 23 → 20（prod 域求和 61 → **58**），同日拆批 1 条提升为顶层共用端点（不计入本表）⇒ `prod::batch` 20 → 19（prod 域求和 **57**）⇒ 全表 **57 + 17 = 74**；2026-10-10 报工台 5 端点收拢进新建的 `prod::scan`：`prod::worker` 7 → 6、`prod::batch` 19 → 17、`part` 域两条 list 端点（不计入本表，part 无独立表）迁入 ⇒ `prod::scan` 5 条，prod 域求和 **57** → 55（−3）⇒ 全表 **55 + 17 = 72**。⚠️ 本表 12 行里含 `prod::scan` 的求和（76）与「prod 域求和 + com 域」的求和（72）是两个口径：前者按上表**列出的 12 个子模块**算（含 `com::delivery_note` 的 17 条、但不含 part / iam 各域），后者只算 prod 域自己的子模块。
 
 ### `src/modules/iam/*` 子模块清单（iam 域 = 认证 / 账号 / 货架实体）
 
@@ -193,7 +196,7 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 
 - **域外依赖 = 0**（只读 5 表 `t_part` / `t_part_batch` / `t_assembly` / `t_customer` / `t_worker`，只读跨域聚合是本仓既定 pattern，同 `statistics` / `admin`）。
   - **护栏设施**：`src/shared/domain_guard.rs`（`#[cfg(test)]` 项、不进 lib 产物，故**只有 `src/` 内单元测试能用**，`tests/` 集成测试拿不到、要靠它得先改调用方式）的 `assert_no_foreign_domain(本域路径, 本域源码目录, 域专属指引)` —— 在剥掉注释的代码区里找「域根段 + 他域路径」前缀失配；不连网不连库，单测可在无 DB 环境跑。已登记的漏报盲区与精度边界见该文件顶部 doc。
-  - **已接入共 5 处 = 整域 4 + 非整域切片 1**（与 `src/shared/domain_guard.rs` 顶部 doc 同一套口径）：整域接入的 4 处是 `modules::dashboard::tests::dashboard_domain_depends_on_no_other_domain`（扫 `src/modules/dashboard/**/*.rs`）、`modules::iam::tests::iam_domain_depends_on_no_other_domain`（扫 `src/modules/iam/**/*.rs`，含嵌套子模块 `iam::shelf`；⚠️ iam 是「**纯自有表域**」—— `t_user` / `t_user_role` / `t_menu` / `t_wx_identity` / `t_shelf` 全部归它，不需要 dashboard / statistics 那种「在本域 SQL 里跨域只读聚合」的取舍，故这条护栏只有「不许 import 别人的 service / repo」一重含义）、`modules::prod::programming::tests::programming_domain_depends_on_no_other_domain`、`modules::prod::inspection::tests::inspection_domain_depends_on_no_other_domain`（后两者分别扫 `src/modules/prod/programming/**/*.rs` 与 `src/modules/prod/inspection/**/*.rs`，本域路径为嵌套域 `prod::xxx`，**同父兄弟域 `prod::batch` 同样算跨域**）；**非整域切片接入**的 1 处是 `modules::prod::queue::board::tests::board_aggregation_depends_on_no_other_domain`（只扫 `src/modules/prod/queue/board/**/*.rs` —— queue 域整体**不适用**该护栏，它的写端点按既定 pattern 经本域 trait 转发其它域单表查询，圈出 board 这块纯聚合 SQL 单独守）。新增只读跨域聚合域时照此加一行调用即可。
+  - **已接入共 6 处 = 整域 4 + 非整域切片 2**（与 `src/shared/domain_guard.rs` 顶部 doc 同一套口径）：整域接入的 4 处是 `modules::dashboard::tests::dashboard_domain_depends_on_no_other_domain`（扫 `src/modules/dashboard/**/*.rs`）、`modules::iam::tests::iam_domain_depends_on_no_other_domain`（扫 `src/modules/iam/**/*.rs`，含嵌套子模块 `iam::shelf`；⚠️ iam 是「**纯自有表域**」—— `t_user` / `t_user_role` / `t_menu` / `t_wx_identity` / `t_shelf` 全部归它，不需要 dashboard / statistics 那种「在本域 SQL 里跨域只读聚合」的取舍，故这条护栏只有「不许 import 别人的 service / repo」一重含义）、`modules::prod::programming::tests::programming_domain_depends_on_no_other_domain`、`modules::prod::inspection::tests::inspection_domain_depends_on_no_other_domain`（后两者分别扫 `src/modules/prod/programming/**/*.rs` 与 `src/modules/prod/inspection/**/*.rs`，本域路径为嵌套域 `prod::xxx`，**同父兄弟域 `prod::batch` 同样算跨域**）；**非整域切片接入**的 2 处是 `modules::prod::queue::board::tests::board_aggregation_depends_on_no_other_domain`（只扫 `src/modules/prod/queue/board/**/*.rs` —— queue 域整体**不适用**该护栏，它的写端点按既定 pattern 经本域 trait 转发其它域单表查询）与 `modules::prod::scan::listing::tests::listing_aggregation_depends_on_no_other_domain`（只扫 `src/modules/prod/scan/listing/**/*.rs` —— `prod::scan` 是**转发型**域，`worker_scan` 必然 import `part` / `assembly` / `prod::queue` / `prod::worker` 四处域，但它的 2 条只读聚合端点完全可以零跨域；圈出可守的部分比整域不守要强）。新增只读跨域聚合域时照此加一行调用即可。
   - **元测试**：`shared::domain_guard::tests::*`（6 条，含「本域标识符非法必须 panic」与 raw string 字符串状态两组）。任一写法漏报、误报或探测器瞎了都会红。
 - `DELIVERY_STATUSES`（6 态，`repo/delivery.rs`）是「未交付」的**唯一**判据，逾期计数 / 面板 / 抽屉 / 柱状图 top+middle 四处共用；柱状图 bottom 层额外含 `DELIVERED`。**它与前端 `LAYERS[].statuses` 是人工同步关系，无编译期保障**，改一侧必须改另一侧。
 - ⚠️ **行单位**（2026-10-10）：逾期 = **工单级**；交期面板三桶 = **工单级**（装配件行**替换**其子件行，行内新增 `row_type` 标 PART / ASSEMBLY，装配件的 `quantity` 与 `delivered_quantity` 单位是**套**）；柱状图 / 抽屉 = **件级**（子件各算 1）。
@@ -392,6 +395,7 @@ t_assembly.status               ← 派生缓存
 | [`docs/api/inspection.md`](docs/api/inspection.md) | `prod::inspection`（待品检队列 + 扫码树） |
 | [`docs/api/queue.md`](docs/api/queue.md) | `prod::queue`（工序候选池 + 工人持有 + 下发 / 召回 / 移动 + 队列板聚合） |
 | [`docs/api/batch.md`](docs/api/batch.md) | `prod::batch`（批次流转，剥离中间态） |
+| [`docs/api/scan.md`](docs/api/scan.md) | `prod::scan`（报工台：扫工牌 + 取件 / 放回列表 + 放回送检 + 手动领取） |
 | [`docs/api/outsource.md`](docs/api/outsource.md) | `outsource`（外协公司 / 报价 / 发货 + 外协看板与三合一写端点；公司 7 条 / 报价 7 条 / 发货 2 条 / 看板 3 条） |
 | [`docs/api/delivery_note.md`](docs/api/delivery_note.md) | `com::delivery_note`（送货单 + 送货分组 + 司机候选，2026-10-08 平移 com + 入单收敛为扫码单一入口） |
 | [`docs/api/shelves.md`](docs/api/shelves.md) | `iam::shelf`（**iam 域下的嵌套子模块**：货架 CRUD + 负载与自动选架，5 端点；2026-10-10 自独立 shelf 域迁入 iam，URL 硬切 `/api/v2/iam/shelves/*`） |
@@ -458,8 +462,8 @@ integration test binary 已重组为 **20 binary**（8 多文件 domain 子目�
    - 所有 ID 走常量 `9_000_000_000_000_000_001+` 区段（雪花 ID epoch=2020-01-01 × instance≤1023 × 12bit seq ≈ 6×10¹⁶ 上限，物理不相交）
    - bcrypt 哈希预生成嵌入 SQL（cost=12，明文由 `ProcessChainFixture::PASSWORD` 公开），省每测试现场 hash ~250ms
    - 时间列：审计字段用 `now()`，业务日期按 fixtures 字面
-2. **Fixture struct**：`test-support/src/fixture.rs::ProcessChainFixture`（字段 + 常量 ID `pub const`），`Default` 实现给出 `manager_username` / `clerk_username` 等字符串常量
-3. **Loader 函数**：`load_<domain>_fixture(pool: &PgPool) -> <Domain>Fixture`，走 `include_str!` 编译期嵌入 + `sqlx::raw_sql` 一次性执行（multi-statement）；与 [`fixtures`](test-support/src/fixtures.rs)（动态 helper）分工：前者批量差异跨域共享，后者单条参数化差异
+2. **Fixture struct**：`test-support/src/fixture/process_chain.rs::ProcessChainFixture`（字段 + 常量 ID `pub const`），`Default` 实现给出 `manager_username` / `clerk_username` 等字符串常量
+3. **Loader 函数**：`load_<domain>_fixture(pool: &PgPool) -> <Domain>Fixture`，走 `include_str!` 编译期嵌入 + `sqlx::raw_sql` 一次性执行（multi-statement）。原先配套的 `test-support/src/fixtures.rs` 动态 INSERT helper 已随 2026-09-24 PR-C.Final 全部迁出（多数复制为各测试文件底部的本地 async fn，零调用的直接删除），故本节只剩本目录一条腿
 
 ### `test-support::snowflake` —— 进程内**唯一**取号入口（2026-10-09）
 

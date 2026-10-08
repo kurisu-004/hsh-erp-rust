@@ -474,7 +474,7 @@ impl BatchService {
         //   一套投影）。
         //
         // 读取方分工（勿越界）：`current_process_id` 的读取方严格限定为 5 条工序池
-        // SQL + `list_pickable_by_work_type` + rollup 派生；**展示类列表一律走
+        // SQL + 报工台的 pickable 列表 SQL + rollup 派生；**展示类列表一律走
         // step 派生**。完整清单见 `prod/batch/model.rs` 模块 doc。
         //
         // ⚠️ 本函数与 `GET /prod/inspection/queue` 的查询

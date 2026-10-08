@@ -36,7 +36,7 @@
 //!
 //! - `current_process_id` 的**工序池类**读取方严格限定为 **5 条工序池 SQL**（take_one /
 //!   take_specific / list_candidates / group_count / count_pool_by_shelf）与
-//!   `list_pickable_by_work_type`，外加 rollup 派生 `t_part.next_process_id`；
+//!   报工台的 pickable 列表 SQL，外加 rollup 派生 `t_part.next_process_id`；
 //!   工序池口径之外另有 1 处有意例外（见下方第 4 条）。
 //! - **展示类列表一律继续从 `current_process_step_id` → step JOIN 派生工序名**，
 //!   唯一**有意例外**是扫码树（第 4 条，已在下方登记）。完整清单（改动前请逐条

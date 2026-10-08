@@ -9,7 +9,7 @@
 //! - `POST /api/v2/prod/batches/{batch_id}/place-on-shelf` / `recall-to-pending`
 //! - `POST /api/v2/prod/batches/{batch_id}/release-from-programming`
 //! - `POST /api/v2/prod/batches/{batch_id}/complete-repair` / `repair-dispatch`
-//! - `POST /api/v2/prod/batches/{batch_id}/cancel` / `pick-up`
+//! - `POST /api/v2/prod/batches/{batch_id}/cancel`
 //!
 //! ## 2026-10-09 拆批端点迁出
 //! `POST /api/v2/prod/batches/{batch_id}/split` 提升为**顶层共用端点**
@@ -17,6 +17,12 @@
 //! 外协看板 / 零件详情页）。旧路径 404、**无 alias**，`batch_id` 改入 body，
 //! 出参由 `R<i64>` 裸数字换成 `BatchSplitOut`（全 ID 字符串 —— 旧出参被 JS
 //! 截断精度）。WS 事件名 `PART_BATCH_SPLIT` 与 payload 逐字不变。
+//!
+//! ## 2026-10-10 pick-up 迁出
+//! `POST /api/v2/prod/batches/{batch_id}/pick-up` 连同其 service 与 DTO 迁往
+//! `crate::modules::prod::scan`（新路径
+//! `POST /api/v2/prod/scan/batches/{batch_id}/pick-up`，**无 alias**；响应体
+//! `R<PartOut>` 与 WS 事件名 `PART_PICKED_UP` / `PART_BATCH_SPLIT` 逐字不变）。
 //!
 //! ## 2026-10-09 外协三端点迁出
 //! `send-to-outsource` / `receive-from-outsource` /
@@ -49,7 +55,7 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::ws_hub::WsEvent;
 use crate::modules::part::vo::PartOut;
 use crate::modules::prod::batch::dto::{
-    CancelBatchRequest, CompleteRepairRequest, CompleteRequest, DeliverRequest, PickUpRequest,
+    CancelBatchRequest, CompleteRepairRequest, CompleteRequest, DeliverRequest,
     PlaceOnShelfRequest, RepairDispatchRequest, SplitBatchByBodyRequest, StartRepairRequest,
 };
 use crate::modules::prod::batch::service::BatchService;
@@ -269,61 +275,4 @@ pub async fn cancel_batch(
         }),
     );
     Ok(Json(R::ok(out)))
-}
-
-/// `POST /api/v2/prod/batches/{batch_id}/pick-up`
-///
-/// 手动 pick-up（B 方案）：PENDING / IN_PROCESS+PRODUCTION_SHELF → IN_PROCESS+WORKER。
-/// Manager / Clerk / ShelfAccount 三角色可触发；worker 必须 active 且绑定 work_type。
-///
-/// 2026-10-03：`quantity` 支持部分领取（service 自动拆批）。**响应体形状不变**
-/// （仍 `R<PartOut>`），拆批信息只走 WS。
-pub async fn pick_up(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(batch_id): Path<i64>,
-    Json(req): Json<PickUpRequest>,
-) -> Result<Json<R<PartOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    // 2026-10-02 修正：原填 `out.id`，而 `out: PartOut` 的 `id` 是 part id，
-    // 与 `worker_id` 字段名不符。取值改回请求携带的 `req.worker_id`
-    // （在 `req` 被 service 消费前先取出）。消费方只读 `kind`，payload 修正
-    // 对现有前端无影响。
-    let worker_id = req.worker_id;
-    let outcome =
-        BatchService::pick_up(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
-    tx.commit().await?;
-    // 2026-10-03：部分领取发生了拆批 → 补发 PART_BATCH_SPLIT。
-    // 必须发：拆批把源批次的 quantity 静默扣减、并新建了一个批次行，其它端的
-    // 批次视图不收到这条事件就永远看不到「源批次余量变了 / 多了一个批次」。
-    //
-    // ⚠️ 2026-10-03 订正：本事件**不是**「与拆批端点同形」。两处共用
-    // `part_id` / `new_batch_id` 两个字段名（消费方唯一可无条件依赖的部分），
-    // 后两个是本处的增量字段。同一事件名两种 payload 的完整对照见本文件
-    // `split_batch_by_body` 与 `pick_up` 两个 handler 里的 `ws_broadcast` 调用。
-    if let Some(split) = outcome.split.as_ref() {
-        ws_broadcast(
-            &state,
-            "PART_BATCH_SPLIT",
-            json!({
-                "part_id": split.part_id.to_string(),
-                "new_batch_id": split.new_batch_id.to_string(),
-                "source_batch_id": batch_id.to_string(),
-                "quantity": split.quantity,
-            }),
-        );
-    }
-    // 2026-10-03：补 batch_id + quantity（整批路径 = 源批次 / 整批量；
-    // 部分路径 = 拆出来的新批次 / 拆走量），消费方据此知道工人领走了哪一批。
-    ws_broadcast(
-        &state,
-        "PART_PICKED_UP",
-        json!({
-            "part_id": outcome.part.id.to_string(),
-            "worker_id": worker_id.to_string(),
-            "batch_id": outcome.picked_batch_id.to_string(),
-            "quantity": outcome.picked_quantity,
-        }),
-    );
-    Ok(Json(R::ok(outcome.part)))
 }

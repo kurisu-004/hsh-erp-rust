@@ -1,11 +1,13 @@
 //! worker 域端到端集成测试
 //!
-//! ## 覆盖（Task 4 worker CRUD + verify-badge）
-//! 1. `verify_badge_inactive_returns_20202` — 工人存在但 `is_active=false` →
-//!    `verify-badge` 端点返回 400 + 20202 `BIZ_WORKER_INACTIVE`。
-//! 2. `reactivate_worker_version_conflict_returns_40901` — 服务外偷偷改
+//! ## 覆盖（Task 4 worker CRUD）
+//! 1. `reactivate_worker_version_conflict_returns_40901` — 服务外偷偷改
 //!    `t_worker.version`，reactivate 端点 → 409 + 40901 `VERSION_CONFLICT`
 //!    （Task 4 修复：与「已激活无变化」场景分流）。
+//!
+//! 2026-10-10：报工台的 `POST /prod/workers/verify-badge` 迁往
+//! `POST /prod/scan/verify-badge`，其场景（含 `ScanWorkerBrief` 出参形状与旧路径
+//! 失效的回归）随之迁往 `scan_badge.rs` —— 测试按**被测端点所在域**分组。
 //!
 //! ## 并行
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
@@ -46,61 +48,6 @@ async fn bootstrap_as_manager() -> (sqlx::PgPool, axum::Router, String, Producti
 // ===========================================================================
 //  Tests
 // ===========================================================================
-
-#[tokio::test]
-async fn verify_badge_inactive_returns_20202() {
-    let (_pool, app, token, _fx) = bootstrap_as_manager().await;
-
-    // Create worker (active by default).
-    let (s_create, env_create) = send(
-        app.clone(),
-        json_request(
-            "POST",
-            "/prod/workers",
-            Some(json!({"badge_code": "B001", "name": "Alice"})),
-            Some(&token),
-        ),
-    )
-    .await;
-    assert_eq!(s_create, StatusCode::CREATED, "create worker: {env_create}");
-    assert_eq!(env_create["code"], 0);
-    let wid = env_create["data"]["id"].as_str().unwrap().to_string();
-
-    // Deactivate (sets is_active=false + deleted_at=now()).
-    let (s_deact, env_deact) = send(
-        app.clone(),
-        json_request(
-            "POST",
-            &format!("/prod/workers/{wid}/deactivate"),
-            None,
-            Some(&token),
-        ),
-    )
-    .await;
-    assert_eq!(s_deact, StatusCode::OK, "deactivate worker: {env_deact}");
-
-    // verify-badge → 20202 (BIZ_WORKER_INACTIVE) with HTTP 400
-    let (s_verify, env_verify) = send(
-        app,
-        json_request(
-            "POST",
-            "/prod/workers/verify-badge",
-            Some(json!({"badge_code": "B001"})),
-            Some(&token),
-        ),
-    )
-    .await;
-    assert_eq!(
-        s_verify,
-        StatusCode::BAD_REQUEST,
-        "verify-badge on inactive worker should return 400; got {env_verify}"
-    );
-    assert_eq!(
-        env_verify["code"].as_i64().unwrap(),
-        20202,
-        "expected BIZ_WORKER_INACTIVE; got envelope: {env_verify}"
-    );
-}
 
 /// Task 4 修复回归：service 在 `reactivate` 返回 0 行时，必须区分
 /// 「版本冲突」(40901) 与 「已激活无变化」(BIZ_INVALID_VALUE) 两个语义。
