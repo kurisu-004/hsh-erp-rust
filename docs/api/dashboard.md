@@ -205,9 +205,12 @@ delivered_sets = MIN over c (per_set(c)) = LEAST(k, N) = k
 #### 存量违规数据的排查 SQL
 
 `t_part_batch.delivery_note_id` 是可靠的分界：**送货单 `pickup` 会原样保留**该列
-（`com::delivery_note::service::lifecycle.rs`），而上面 3 条写路径都经
-`apply_batch_status_change`，只写 status / location / holder / process，**不动**该列 ⇒
-「已交批次且 `delivery_note_id IS NULL`」= 经逐批端点交付。
+（`com::delivery_note::service::lifecycle.rs`），而上面 3 条写路径都落在
+`shared::batch::status` 上、分**两个入口** —— 路径 1 / 2 走单行的
+`apply_batch_status_change`（写 status / location / holder / process / is_repairing），
+路径 3 走批量的 `apply_bulk_batch_status_change_for_part`（只写 status / is_repairing
+与审计列）—— **两条 UPDATE 都不写 `delivery_note_id`**
+⇒「已交批次且 `delivery_note_id IS NULL`」= 经逐批端点交付。
 
 ```sql
 -- ① 可疑批次清单（未经送货单交付的已交批次）
@@ -429,7 +432,7 @@ dashboard 是**只读跨域聚合域**——这是本仓既定 pattern（`statis
 | `partial` 含 `system_delivery_date IS NULL` 的工单 | 「全部的部分已交工单」包含**没填系统交期**的工单（排序 `NULLS LAST`） | **产品决议，不处理**：既然不限时间范围，就不该把「没填交期」排除掉。前端需容忍该列 `null` 并给占位展示 |
 | **没填交期且一件没交过**的工单**不属于任何一桶** | `upcoming` 要 `sdd >= today`、`overdue` 要 `sdd < today`（两者对 NULL 皆假）、`partial` 要有已交批次 ⇒ `sdd IS NULL AND NOT EXISTS(已交批次)` 的工单三桶皆不出现 | 与原 `[today, today+7)` 窗口的形态一致（同样不显示），**非本次引入**。「三桶覆盖全部工单」的直觉读法不成立：没有交期就没有交期面板的位置。要不要补第四桶「无交期」是产品决议，本轮**不处理** |
 | `partial` 的真实语义是「有 ≥1 个已交批次 **且** 派生状态未终态」 | 桶谓词只看 `EXISTS(已交批次)` + `status ∈ 6 态`，不看交了多少。故派生状态滞后的窗口内，`partial` 里可能出现 `delivered_quantity == quantity` 的「已全交」行 | 与 `DELIVERY_STATUSES` 用派生列这一既成取舍同源（滞后窗口只影响一次刷新，§4.3 已登记同源问题）。正常流程里末批交付会同事务把 part 推入终态、不再是 6 态，故只在滞后窗口内可见。**代码侧不处理** |
-| `partial` 桶是三桶里最贵的一条查询 | 它**无时间窗口**，而 `COUNT(*) OVER ()`（无分区、无窗内排序）必须物化**全量**匹配行才能求值 ⇒ 该查询必然扫「全部处于 6 态且有已交批次」的 part / assembly 并排全序，不像 `upcoming` / `overdue` 能借交期索引收敛范围 | 规格强制要求 `total` 不受 `LIMIT` 影响，本形态是该要求的直接代价。抽屉侧已有「行查询 + `SQL_DETAILS_COUNT_*` 计数查询」的形态可参考；**是否换形态留待数据量实证后再定，本轮不改实现** |
+| `partial` 桶是三桶里最贵的一条查询 | 它**无时间窗口**，而 `COUNT(*) OVER ()`（无分区、无窗内排序）必须物化**全量**匹配行才能求值 ⇒ 该查询必然扫「全部处于 6 态且有已交批次」的 part / assembly 并排全序，不像 `upcoming` / `overdue` 能借交期索引收敛范围。⚠️ 但那两桶**同样**要在各自窗口内全量物化（只是范围被交期谓词收窄），三桶都不是「取满 30 条就收工」 | 规格强制要求 `total` 不受 `LIMIT` 影响，本形态是该要求的直接代价。抽屉侧已有「行查询 + `SQL_DETAILS_COUNT_*` 计数查询」的形态可参考；**是否换形态留待数据量实证后再定，本轮不改实现** |
 | `upcoming.total` 可能远超 `items.length()` | 每桶上限 30，`total` 是匹配总数 | 设计如此（前端按「共 N 条」展示）。**唯一例外是 0 命中**：`COUNT(*) OVER ()` 在无行时无从求值，此时 `total` 为 `0` 而非 `null` |
 | 无子件装配件的 `delivered_quantity` 恒为 0 | 该装配件无论业务上是否已交付，都会被判成「一件没交过」⇒ 落 `upcoming` / `overdue` 桶而非 `partial` | 与逾期 KPI 的行为一致（`NOT EXISTS` 子件路径同样恒真），**刻意保持**。无子件装配件本身是数据问题，不是口径问题 |
 | 装配件行落在 `partial` 桶但 `delivered_quantity` 显示 0 套 | 只在**装配件整套交付不变式被破坏**时出现（典型形态：子件 A 交满、子件 B 一件没交）。桶归属看 `EXISTS`（命中），展示值看 min 公式（0 套） | 推导见 §4.4。不变式的 3 条破坏路径见 §4.4，送货单路径有闸门；存量违规用 §4.4 的排查 SQL 定位后人工清理。**代码侧不处理** |
