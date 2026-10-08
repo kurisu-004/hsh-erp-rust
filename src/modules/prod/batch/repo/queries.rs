@@ -68,6 +68,12 @@ impl PartBatchRepo {
     /// 与 Python `list_by_delivery_note` 行为一致；本方法不 JOIN t_part，
     /// caller 需要展示字段时另调 `list_with_part_by_delivery_note`。
     ///
+    /// **返回序无契约**：本方法按 `id ASC` 返回，与展示序（`delivery_seq ASC
+    /// NULLS LAST, id ASC`，见 `list_with_part_by_delivery_note`）是同一张单的
+    /// 两条不同读路径。当前三个调用方都只取 `len()` 或 `is_empty()` + 逐条校验
+    /// `status`，故不受影响；需要展示序的 caller 一律走
+    /// `list_with_part_by_delivery_note` / `list_with_part_by_delivery_note_ids`。
+    ///
     /// 2026-09-16 PR-3 批次 step 化：删 next_process_id / placed_at，加
     /// current_process_step_id。
     pub async fn list_by_delivery_note<'e, E: PgExecutor<'e>>(
@@ -107,13 +113,22 @@ impl PartBatchRepo {
     ///
     /// ## 默认序 = 加入本单的次序（2026-10-10 新增 `pb.delivery_seq`）
     ///
-    /// `ORDER BY pb.id ASC`。`delivery_seq` 由
-    /// 挂单写点（`PartBatchRepo::attach_to_note`）按 `MAX+1` 赋值，只在
-    /// 「这一张送货单」语境内有意义；历史数据由 migration
-    /// `20261010000000_001_add_batch_delivery_seq` 按 `pb.id` 序回填，故本单
-    /// 内 `delivery_seq` 是从 1 起的不重复连续序号、`NULLS LAST` 实际只兜住
-    /// 「挂单后 seq 被外部改坏」的脏值。末尾保留 `pb.id ASC` 作 tiebreak，
-    /// 保证同 seq 时结果集仍然确定。
+    /// `ORDER BY pb.delivery_seq ASC NULLS LAST, pb.id ASC`。`delivery_seq` 由挂单
+    /// 写点（`PartBatchRepo::attach_to_note`）按 `MAX+1` 赋值，只在「这一张送货单」
+    /// 语境内有意义；历史数据由 migration `20261010000000_001_add_batch_delivery_seq`
+    /// 按 `pb.id` 序回填。
+    ///
+    /// 本单内 `delivery_seq` **不重复**，但**可能有空洞**，空洞不影响相对序（排序
+    /// 仍然正确）：
+    /// - 摘单（`delivery_note::remove_batches`）只把被摘那行置 NULL，**不重排**剩余
+    ///   行 ⇒ 摘掉 seq=2 之后本单是 1,3,4；
+    /// - 回填的 `ROW_NUMBER()` 只按 `delivery_note_id IS NOT NULL` 过滤、不看
+    ///   `deleted_at`，而本查询按 `deleted_at IS NULL` 过滤 ⇒ 表里若存在软删的批次
+    ///   行，它占的号在结果集里看不到。
+    ///
+    /// `NULLS LAST` 兜的是「`delivery_note_id` 有值而 seq 为 NULL」的脏值（如从备份
+    /// 恢复出来的库：回填 UPDATE 跑在空表上、dump 里又没有本列），末尾 `pb.id ASC`
+    /// 兜同 seq / 同 NULL 时结果集仍确定。
     pub async fn list_with_part_by_delivery_note<'e, E: PgExecutor<'e>>(
         executor: E,
         note_id: i64,
@@ -516,8 +531,10 @@ impl PartBatchRepo {
         let mut affected = 0u64;
         if let Some(note_id) = delivery_note_id {
             // 2026-10-10 新增 delivery_seq：与 `attach_to_note` 同款 `MAX+1`
-            // 赋值（本分支是它的等价写点，唯一生产调用方 `delivery_note::pickup`
-            // 与它落在同一批 OCC 串行化下）。
+            // 赋值，两条路径的 seq 语义一致。本分支当前**无**生产调用方 ——
+            // 唯一调用方 `delivery_note::pickup` 恒传 `status = Some("DELIVERED")`
+            // ⇒ 走上面那条分支；赋值语句与相邻的 `affected == 0` 分支同为纯前瞻
+            // 代码，留着是为了将来出现「不改状态、只换挂单」的调用时不必重写。
             let r = sqlx::query(
                 "UPDATE t_part_batch SET delivery_note_id = $2, \
                     delivery_seq = (SELECT COALESCE(MAX(delivery_seq), 0) + 1 \
@@ -546,11 +563,12 @@ impl PartBatchRepo {
     /// `list_with_part_by_delivery_note` 的 ORDER BY）。摘单 / 单据软删的写点
     /// 置 NULL，维持 `delivery_seq IS NULL ⟺ delivery_note_id IS NULL`。
     ///
-    /// `MAX+1` 天然产出 1,2,3…：同一事务内前几次 attach 的 UPDATE 对后续
-    /// `MAX()` 可见（READ COMMITTED 读己所写），`POST /scan` 的 Step 7 就是
+    /// `MAX+1` 天然产出「本单内递增、不重复」的序号：同一事务内前几次 attach 的 UPDATE
+    /// 对后续 `MAX()` 可见（READ COMMITTED 读己所写），`POST /scan` 的 Step 7 就是
     /// 在一个事务里循环调用本函数。并发安全依赖 Step 4 的 `note_version` OCC
     /// —— 同一张单上的并发扫码被串行化，败者整事务回滚，故同一单上不会有两条
-    /// 事务同时读到同一个 MAX。
+    /// 事务同时读到同一个 MAX。序号**可能不连续**（摘单只清被摘行、不重排，见
+    /// `list_with_part_by_delivery_note`），但相对序即挂单先后序。
     pub async fn attach_to_note<'e, E: PgExecutor<'e>>(
         executor: E,
         batch_id: i64,

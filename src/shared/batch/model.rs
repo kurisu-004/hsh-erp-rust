@@ -92,7 +92,8 @@ pub struct TPartBatch {
     pub current_process_step_id: Option<i64>,
     pub delivery_note_id: Option<i64>,
     /// 2026-10-10 新增（migration `20261010000000_001_add_batch_delivery_seq`）：
-    /// **加入当前送货单的次序**，本单内从 1 起递增。
+    /// **加入当前送货单的次序**，本单内从 1 起递增（可能不连续：摘单只清被摘行、
+    /// 不重排剩余行，详见 `PartBatchRepo::list_with_part_by_delivery_note`）。
     ///
     /// **NULL = 未挂单**（与 `delivery_note_id IS NULL` 同步：挂单写点赋值、
     /// 摘单 / 单据软删写点置 NULL）。本列**只在「这一张送货单」的语境内有意义**：

@@ -220,11 +220,13 @@ BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY`、`21420 BIZ_DELIVERY_NOTE_LOCKED_PART`
 | 判据 | 口径 |
 |---|---|
 | **为什么不用批次 id** | id 是**建批顺序**：只有拆批路径产生新批次 id（反映扫码时刻），整批直接挂单的批次用的是建批时的 id ⇒「先扫 A、后扫 B，但 A 的批次建得更早」会把 A 排到前面，与用户看到的扫码次序相反 |
-| **`delivery_seq` 怎么来** | 挂单写点（`PartBatchRepo::attach_to_note`，扫码 Step 7 在一个事务里循环调用）赋 `COALESCE(MAX(delivery_seq),0)+1`（限本单）；READ COMMITTED 下同事务内前几次 UPDATE 对后续 `MAX()` 可见 ⇒ 一次扫码天然产出连续的 1,2,3… |
+| **`delivery_seq` 怎么来** | 挂单写点（`PartBatchRepo::attach_to_note`，扫码 Step 7 在一个事务里循环调用）赋 `COALESCE(MAX(delivery_seq),0)+1`（限本单）；READ COMMITTED 下同事务内前几次 UPDATE 对后续 `MAX()` 可见 ⇒ **同一批挂单动作内部**产出连续的 1,2,3…，但整单生命周期内的 seq 不保证连续（见「序号空洞」） |
 | **并发安全** | 同一张单的并发扫码被 `POST /scan` Step 4 的 `note_version` OCC 串行化（草稿刚建出时是 Step 8 的 `note.version++` OCC），败者整事务回滚 ⇒ 同一单上不会有两条事务同时读到同一个 `MAX` |
 | **摘单 / 单据软删** | 与 `delivery_note_id = NULL` 同一条 UPDATE 置 `delivery_seq = NULL`（`remove_batches` / `soft_delete`）⇒ 不变式 `delivery_seq IS NULL ⟺ delivery_note_id IS NULL` 恒成立；重新挂单时 seq 按新单重新计 |
+| **序号空洞** | 本单内 seq **不重复**、但**可能不连续**，空洞不影响相对序（排序仍正确）：① 摘单只清被摘那行、**不重排**剩余行 ⇒ 摘掉 seq=2 之后本单是 1,3,4；② 回填的 `ROW_NUMBER()` 只按 `delivery_note_id IS NOT NULL` 过滤、不看 `deleted_at`，而展示查询按 `deleted_at IS NULL` 过滤 ⇒ 表里若有软删的批次行，它占的号在结果集里看不到。前端要行号用数组下标，不要拿 `delivery_seq` 推算 |
 | **历史数据** | migration `20261010000000_001_add_batch_delivery_seq` 按 `ROW_NUMBER() OVER (PARTITION BY delivery_note_id ORDER BY id)` 回填 ⇒ 与上线前的 `id ASC` **逐行一致**，部署无视觉跳变 |
-| **`NULLS LAST` + `id ASC` 的作用** | `NULLS LAST` 兜「挂单后 seq 被外部改坏」的脏值；末尾 `id ASC` 兜同 seq 时结果集仍确定 |
+| **⚠️ 从备份恢复的库** | `scripts/restore_from_backup.sh` 默认 `REBUILD_SCHEMA=1` = `DROP SCHEMA` → `sqlx migrate run` → 灌 dump：回填 UPDATE 跑在**空表**上、dump 里也没有本列 ⇒ 恢复出来的库里**已挂单批次的 `delivery_seq` 全为 NULL**，`line_items[].delivery_seq` 也是 null。此时展示整体退回 `id ASC`（= 上线前行为，**不是故障**）；但该单**此后新挂**的行 seq 从 1 重新起（`MAX` 只看得到新写的非 NULL 行），而 `NULLS LAST` 让非 NULL 排在前面 ⇒ 新扫的批次显示在恢复出来的旧行**上面**。要让该库的行项序正确，只能按各单 `pb.id` 序手工回填一次 |
+| **`NULLS LAST` + `id ASC` 的作用** | `NULLS LAST` 兜「`delivery_note_id` 有值而 seq 为 NULL」的脏值（外部改坏、或上面那条从备份恢复的库）；末尾 `id ASC` 兜同 seq / 同 NULL 时结果集仍确定 |
 | **⚠️ 与 `sort_order` 无关** | 本仓既有 `sort_order`（iam 菜单 / 外协公司 / 外协工序能力清单）全是**配置显示序**（人工维护的静态排列）；本列是挂单时自动递增的**业务事实**，且只在「这一张送货单」的语境内有意义（同一批次先后挂过两张单时，seq 相对各自那张单重新计） |
 
 `line_items[].delivery_seq` 走**普通 serde**（同 `batch_no`）：它是单内计数不是雪花 id，

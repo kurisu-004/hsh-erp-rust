@@ -25,7 +25,9 @@ use crate::shared::error::{AppError, code};
 
 use super::super::dto::DeliveryNoteUpdateRequest;
 use super::super::repo::SortDir;
-use super::super::vo::{DeliveryNoteDetailOut, DeliveryNoteListOut, DeliveryNoteOut};
+use super::super::vo::{
+    DeliveryNoteDetailOut, DeliveryNoteListOut, DeliveryNoteOut, delivery_seq_i32,
+};
 use super::inner::{build_note_outs, get_with_parts, note_not_found, note_version_conflict};
 use super::shippable_sets::note_shippable_sets;
 
@@ -242,9 +244,9 @@ impl DeliveryNoteService {
                     id: b.id,
                     part_id: p.id,
                     batch_no: b.batch_no,
-                    // 加入本单的次序（口径同 `inner.rs::get_with_parts`；批量详情
+                    // 加入本单的次序（bigint → i32 的收窄口径见 `delivery_seq_i32`；批量详情
                     // 逐单分桶保持 SQL 返回序，故桶内也是这个次序）
-                    delivery_seq: b.delivery_seq.map(|v| v as i32),
+                    delivery_seq: delivery_seq_i32(b.delivery_seq),
                     batch_label,
                     serial_no: p.serial_no.clone().unwrap_or_default(),
                     drawing_no: p.drawing_no.clone(),

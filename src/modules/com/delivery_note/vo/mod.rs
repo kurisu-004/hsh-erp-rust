@@ -36,7 +36,7 @@ pub use delivery_group::{
 };
 pub use delivery_note::{
     BatchDeliveryDetailData, DeliveryNoteDetailOut, DeliveryNoteLineItem, DeliveryNoteListOut,
-    DeliveryNoteOut,
+    DeliveryNoteOut, delivery_seq_i32,
 };
 pub use driver::{DeliveryDriverListOut, DeliveryDriverOption};
 pub use scan_tree::{

@@ -524,7 +524,14 @@ async fn scan_entry_orders_line_items_by_delivery_seq_not_batch_id() {
         "前置条件：后扫的批次 id 必须更小，否则本用例测不出排序键切换"
     );
 
-    let (s1, env1) = scan_entry(&app, &token, "SQ01", None, part_entry(part_scanned_first, 5)).await;
+    let (s1, env1) = scan_entry(
+        &app,
+        &token,
+        "SQ01",
+        None,
+        part_entry(part_scanned_first, 5),
+    )
+    .await;
     assert_eq!(s1, StatusCode::OK, "第一次扫码: {env1}");
     let v1 = env1["data"]["version"].as_i64().unwrap();
 
