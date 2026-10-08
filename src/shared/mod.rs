@@ -24,6 +24,14 @@ pub mod error;
 pub mod pagination;
 pub mod response;
 pub mod serial; // 2026-09-14 Phase 3：跨域序列号派发（assembly + 后续 part 域统一入口）
+// 2026-10-10 新增 shelf：货架负载聚合 + 自动选架设施（`t_shelf.capacity` 上线后，
+// 「把批次落到某个架上」不再由调用方传 shelf_id，改按 current_load / capacity 升序
+// 选）。**边界记档**：`shared::shelf` 是本仓**零域依赖**的 shared 模块 —— 只 import
+// `auth` / `infra` / `shared` / `state`，表数据一律自己写 SQL 聚合。这是本仓对
+// 「跨域只读聚合」的既定 pattern（`dashboard` / `statistics` / `prod::queue::board`
+// 三个模块同款）；与 `shared::batch` 依赖 4 个域形成对照，理由见 `shared/shelf/mod.rs`
+// 顶部注释。
+pub mod shelf;
 // 2026-10-09 新增 snowflake_guard：雪花 ID 构造护栏，把「进程内只从共享 generator 取号」
 // 从口头约定变成 CI 强制（扫 `src/` + `tests/` + `test-support/src/`，白名单只有 4 个文件：
 // 两个进程级唯一 ID 源 + 生产 instance 来源 + generator 自身的位布局单测）。
