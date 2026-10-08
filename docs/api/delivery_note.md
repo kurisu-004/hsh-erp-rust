@@ -113,7 +113,7 @@
 | 21403 | `BIZ_DELIVERY_NOTE_NOT_DRAFT` | `soft-delete` 单据非 DRAFT | 400 |
 | 21404 | `BIZ_DELIVERY_NOTE_NOT_SUBMITTED` | `recall` / `pickup` 单据非 SUBMITTED | 400 |
 | **21405** | `BIZ_DELIVERY_NOTE_PART_NOT_READY` | ★ 入单唯一允许的批次状态是 `READY_TO_SHIP`：批次状态不符**且**该零件可入单量凑不出本次要的量（作用域见 §4.1）/ DP 不可行 / `sets > entry_max_sets`；`submit` 单上有非 `READY_TO_SHIP` 批次；`pickup` 单上有非 `READY_TO_SHIP` 批次 | 400 |
-| 21406 | `BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED` | 批次已被**其它**送货单占着（活跃单 / 已领取单，两种 message 不同）**且该零件可入单量凑不出本次要的量**（作用域见 §4.1）；汇总处与 21405 二选一：失败 part 里有占用明细 ⇒ 21406，否则 21405 | 409 |
+| 21406 | `BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED` | 批次已被**其它**送货单占着（`reason` 两种字面量：「活跃单，货还在这张单上」/「已领取/已归档单，货已随该单送出，不可再次入单」）**且该零件可入单量凑不出本次要的量**（作用域与 `reason` 映射见 §4.1）；汇总处与 21405 二选一：失败 part 里有占用明细 ⇒ 21406，否则 21405 | 409 |
 | **21407** | `BIZ_DELIVERY_NOTE_PARTS_MULTIPLE_CUSTOMERS` | 零件的 L1 客户 ≠ 单据 L1 客户（同一请求混入别的 L1 的零件） | 400 |
 | 21409 | `BIZ_DELIVERY_NOTE_DRIVER_INVALID` | `validate_driver` 5 条任一不过；`pickup` 单据未指定司机 | 400 |
 | 21411 | `BIZ_DELIVERY_NOTE_INVALID_VALUE` | 空单提交 / 空单领取 | 400 |
@@ -359,8 +359,10 @@ target** 时才报 21405，并在 message 里附上被拦下的批次明细。
 批次**。占用判定不承担数据一致性职责，它值得一句提醒，但作用域只能是「本次分配实际需要的量」。
 
 **错误码二选一**：失败 part 里**只要有一条占用明细就是 21406**（409，`冲突`：货在别的单上，
-要去那张单处理），否则 21405（400，`校验不过`）。混合场景（有 part 是占用原因、有 part 只是
-状态原因）取 21406 —— 那是更可执行的一侧，且 message 里两类明细都会列全。
+要去那张单处理），否则 21405（400，`校验不过`）。判据的输入是**失败 part 集合**而非整张占用
+明细表 —— 分配成功的 part 上有占用明细**不**参与选码，用例
+`occupied_detail_on_successful_part_stays_21405` 钉死这一半。混合场景（有 part 是占用原因、
+有 part 只是状态原因）取 21406 —— 那是更可执行的一侧，且 message 里两类明细都会列全。
 
 **归因取舍**：占用批次**只**归占用桶，**不**按 status 二次归因。一个 `status = COMPLETED` 且
 被 `PICKED_UP` 单占着的批次，报给用户时只说「已在送货单 X（已随该单送出）」，不附带
