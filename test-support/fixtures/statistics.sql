@@ -28,16 +28,17 @@
 --    行会让 count_in_process_at 等「期望空库」断言失败。
 --  - part_event / pickup_skip_event 都是测试现场按 event_type / worker_id /
 --    part_id / created_at 构造，fixture 不预置避免污染。
---  - **t_worker 不预置**：worker_stats 端点按日期范围列出全部有 / 无事件的
---    工人，api.rs::workers_stats_happy_path 断言 `out.items.len() == 2`，
---    预置 1 个 worker 会让 list 出现第 3 行破坏断言；各 sub-file 用本地
+--  - **t_worker 不预置**：`StatisticsService::worker_stats` 按日期范围列出全部
+--    有 / 无事件的工人，而该方法当前**无** happy-path 集成测试（见 CLAUDE.md
+--    「覆盖空洞登记」）。不预置的理由是**前瞻约束**、不是对现有断言的描述：
+--    将来任何按行数断言 worker_stats 列表的用例，预置的 1 个 worker 都会让
+--    行数比「测试自建工人数」多出一行；各 sub-file 用本地
 --    `insert_worker(&pool, badge, name, Some(wt))` 按需造 badge / 名称 / 工种。
 --
 --  ## ID 段分配（90+）
 --  WORK_TYPE_ID         90   工种 FX-WT-STAT（baseline 共享）
---  WORKER_ID            91   （保留位号 —— 当前不预置 worker；2026-09-24
---                              workers_stats_happy_path 期望 list 严格等于
---                              测试自建工人数，预置 worker 会破坏断言）
+--  WORKER_ID            91   （保留位号 —— 当前不预置 worker；预置会让将来
+--                              任何按行数断言 worker_stats 列表的用例多出一行）
 --
 --  ## 复用 part 域基线（不在本 SQL 内，由 load_statistics_fixture 内部先
 --     load_part_fixture 加载）

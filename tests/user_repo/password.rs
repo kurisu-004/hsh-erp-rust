@@ -1,8 +1,8 @@
 //! user 域 repo 集成测试 —— 多表事务 + 事务边界 + 密码/状态 子集（PR13 Phase D 拆分）
 //!
 //! ## 拆分映射（原 1164 行 user_repo.rs → 3 文件）
-//! - basic.rs   ← UserRepo 24 例
-//! - role.rs    ← UserRoleRepo + MenuRepo + ShelfRepo 16 例
+//! - basic.rs   ← UserRepo 26 例
+//! - role.rs    ← UserRoleRepo + MenuRepo + ShelfRepo 22 例
 //! - password.rs ← 多表组合事务 2 + 事务边界 2 + 3 个补充集成测试 = 7 例（本文件）
 //!
 //! 本文件 7 例：覆盖
