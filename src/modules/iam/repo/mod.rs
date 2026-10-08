@@ -2,12 +2,14 @@ pub mod sql;
 
 pub mod model;
 
-pub use model::{Menu, Shelf, User, UserRole, WxIdentity, WxIdentityInsert};
+pub use model::{Menu, User, UserRole, WxIdentity, WxIdentityInsert};
 pub use sql::user::{UserInsert, UserPartialUpdate};
 pub use sql::user_role::{UserRoleInsert, UserRoleRow};
 
 use async_trait::async_trait;
 use chrono::NaiveDateTime;
+
+use crate::modules::iam::shelf::model::TShelf;
 
 /// 命名约定（参考用户命名表）：
 /// - 按主键查单条 → get_xxx_by_id / find_xxx_by_id
@@ -110,7 +112,9 @@ pub trait IamRepoTrait: Send {
     ) -> Result<Vec<Menu>, sqlx::Error>;
 
     // ── t_shelf（1）──
-    async fn get_shelf_by_id(&mut self, id: i64) -> Result<Option<Shelf>, sqlx::Error>;
+    /// `t_shelf` 的唯一行结构是 `iam::shelf::model::TShelf`（含 `capacity`），
+    /// 本方法直接委托货架子模块的 SQL 真源，本域不再维护第二份投影。
+    async fn get_shelf_by_id(&mut self, id: i64) -> Result<Option<TShelf>, sqlx::Error>;
 
     // ── t_wx_identity（4，2026-10-10 自 wx 域搬入）──
     async fn get_wx_identity_by_corp_and_user<'a>(

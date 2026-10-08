@@ -4,10 +4,14 @@
 //! - `user.rs`        — `t_user` 10 个 SQL fns + `UserInsert` / `UserPartialUpdate<'_>` 入参
 //! - `user_role.rs`   — `t_user_role` 6 个 SQL fns + `UserRoleInsert` / `UserRoleRow`
 //! - `menu.rs`        — `t_menu` 1 个 SQL fn
-//! - `shelf.rs`       — `t_shelf` 1 个 SQL fn（本域只读）
 //! - `wx_identity.rs` — `t_wx_identity` 4 个 SQL fns（2026-10-10 自 wx 域搬入）
 //! - `mod.rs`（本文件）— 声明子模块 + **单一** `impl IamRepoTrait for &mut PgConnection` 块
 //!   （覆盖全部 22 方法，按实体分组；call 各子文件 free fn）
+//!
+//! `t_shelf` 没有子文件：`t_shelf` 是货架子模块（`iam::shelf`）的实体，本域只作为
+//! SHELF_ACCOUNT 角色 scope 校验的**消费方**读它，故 `get_shelf_by_id` 在下面的 impl
+//! 块里直接委托 `iam::shelf::repo::ShelfRepo::get_by_id`，`t_shelf` 全仓只留一份行
+//! 结构与一份 SQL（`iam::shelf::model::TShelf` + `iam::shelf::repo::sql`）。
 //!
 //! ## 为什么不是 4 个分散 impl 块
 //! Rust coherence 规则：同 crate 内同一 trait 对同一类型至多一个 impl 块（auto trait
@@ -28,7 +32,6 @@
 //! 故说明就地留在本文件。
 
 pub mod menu;
-pub mod shelf;
 pub mod user;
 pub mod user_role;
 pub mod wx_identity;
@@ -37,10 +40,11 @@ use async_trait::async_trait;
 use chrono::NaiveDateTime;
 use sqlx::PgConnection;
 
-use crate::modules::iam::repo::model::{Menu, Shelf, User, UserRole, WxIdentity};
+use crate::modules::iam::repo::model::{Menu, User, UserRole, WxIdentity};
 use crate::modules::iam::repo::{
     IamRepoTrait, UserInsert, UserPartialUpdate, UserRoleInsert, UserRoleRow, WxIdentityInsert,
 };
+use crate::modules::iam::shelf::model::TShelf;
 
 /// 统一 `IamRepoTrait for &mut PgConnection` 实现（按实体分组，零业务逻辑）
 ///
@@ -175,8 +179,8 @@ impl IamRepoTrait for &mut PgConnection {
     }
 
     // ── t_shelf（1）──
-    async fn get_shelf_by_id(&mut self, id: i64) -> Result<Option<Shelf>, sqlx::Error> {
-        shelf::get_shelf_by_id(&mut **self, id).await
+    async fn get_shelf_by_id(&mut self, id: i64) -> Result<Option<TShelf>, sqlx::Error> {
+        crate::modules::iam::shelf::repo::ShelfRepo::get_by_id(&mut **self, id).await
     }
 
     // ── t_wx_identity（4，2026-10-10 自 wx 域搬入）──
