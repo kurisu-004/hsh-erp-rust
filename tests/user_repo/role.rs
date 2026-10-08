@@ -2,10 +2,11 @@
 //!
 //! ## 拆分映射（原 1164 行 user_repo.rs → 3 文件）
 //! - basic.rs   ← UserRepo 24 例
-//! - role.rs    ← UserRoleRepo 11 + MenuRepo 3 + ShelfRepo 2 = 16 例（本文件）
+//! - role.rs    ← UserRoleRepo 16 + MenuRepo 4 + ShelfRepo 2 = 22 例（本文件）
 //! - password.rs ← 多表组合事务 + 事务边界 + 3 个补充集成测试 7 例
 //!
-//! 本文件 16 例：覆盖 `iam/repo/sql/{user_role,menu,shelf}.rs` 共 7 个固有方法。
+//! 本文件 22 例：覆盖 `iam/repo/sql/{user_role,menu,shelf}.rs` 共 7 个固有方法，
+//! 另有 1 条针对 `seeds/menu.sql` 的自锁断言（不碰 DB）。
 //!
 //! ## 测试并行注意
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
@@ -423,8 +424,45 @@ async fn list_user_roles_by_user_ids_includes_shelf_code_and_name() {
 }
 
 // ===========================================================================
-// MenuRepo 测试 (3 例，覆盖 1 个固有方法)
+// MenuRepo 测试 (4 例，覆盖 1 个固有方法 + 1 条自锁断言)
 // ===========================================================================
+
+/// 合成菜单角色（主）：`scripts/test_nextest.sh` 建共享 template DB 时会 apply
+/// `seeds/menu.sql`，那份 seed 给 MANAGER / CLERK / INSPECTOR / CNC_PROGRAMMER /
+/// SHELF_ACCOUNT 五个真实角色授了二十余个菜单。断言 `t_role_menu` / `t_menu`
+/// 精确条数或内容时若用这五个角色反查，会把共享 seed 的菜单一起数进来
+/// （`list_active_menus_by_roles` 因此变红）。故 MenuRepo 的 3 条用例一律走
+/// 本常量这种 seed 永不授予的合成角色。
+///
+/// `t_role_menu.role` 是 `varchar(20)`，无 DB ENUM、无 `t_role` 表，
+/// 任意不超过 20 字符的字符串都合法。
+const SYNTHETIC_MENU_ROLE: &str = "TEST_MENU_ROLE";
+
+/// 合成菜单角色（辅，供 DISTINCT 用例挂同一菜单的第二条授权行）：
+/// `uk_t_role_menu_role_menu` 是 `(role, menu_id) WHERE deleted_at IS NULL` 上的
+/// UNIQUE 索引，同一菜单挂两条授权必须用**两个不同**的 role 串，
+/// 且两条都必须是合成角色（否则又会把 seed 菜单数进来）。
+const SYNTHETIC_MENU_ROLE_B: &str = "TEST_MENU_ROLE_B";
+
+/// 自锁：`seeds/menu.sql` 不得出现上面两个合成角色串。
+///
+/// 这条断言护的是「合成角色」这个前提本身：若有人把 `TEST_MENU_ROLE` 写进 seed 的
+/// 授权白名单，下面的 3 条用例会以「精确条数」失败（可见的红）；但更隐蔽的形态是
+/// 同一菜单既被 seed 授予又被测试自建、断言写成 `>=`，红不起来而覆盖已被稀释。
+/// 本断言让前提被破坏时**当场**红在 seed 文本上。
+#[test]
+fn menu_seed_never_grants_synthetic_menu_roles() {
+    // 与生产启动钩子 `src/infra/seed.rs`、测试 template DB 同一份 SQL
+    const MENU_SEED_SQL: &str = include_str!("../../seeds/menu.sql");
+
+    for role in [SYNTHETIC_MENU_ROLE, SYNTHETIC_MENU_ROLE_B] {
+        assert!(
+            !MENU_SEED_SQL.contains(role),
+            "seeds/menu.sql 出现了合成角色 {role}：它已不再是 seed 永不授予的角色，\
+             下面的 MenuRepo 用例会退化成「把 seed 菜单一起数进来」"
+        );
+    }
+}
 
 async fn seed_menu(pool: &PgPool, code: &str, sort_order: i32, is_active: bool) -> i64 {
     let id = snowflake().lock().unwrap().next_id();
@@ -463,30 +501,39 @@ async fn link_role_menu(pool: &PgPool, role: &str, menu_id: i64) {
 }
 
 /// `menu_sql::list_active_for_roles`：多个 role 共用同一菜单应去重（DISTINCT）
+///
+/// 用合成角色而非真实角色：真实角色带进 template DB 的 seed 菜单，精确条数断言会被
+/// 稀释。见 `SYNTHETIC_MENU_ROLE` 与 `menu_seed_never_grants_synthetic_menu_roles`。
 #[tokio::test]
 async fn list_active_for_roles_returns_distinct_menus() {
     let (pool, _fx) = setup().await;
     let m = seed_menu(&pool, "shared-menu", 0, true).await;
-    link_role_menu(&pool, "MANAGER", m).await;
-    link_role_menu(&pool, "CLERK", m).await;
+    link_role_menu(&pool, SYNTHETIC_MENU_ROLE, m).await;
+    link_role_menu(&pool, SYNTHETIC_MENU_ROLE_B, m).await;
 
-    let rows = menu_sql::list_active_menus_by_roles(&pool, &["MANAGER".into(), "CLERK".into()])
-        .await
-        .expect("list");
+    let rows = menu_sql::list_active_menus_by_roles(
+        &pool,
+        &[SYNTHETIC_MENU_ROLE.into(), SYNTHETIC_MENU_ROLE_B.into()],
+    )
+    .await
+    .expect("list");
     assert_eq!(rows.len(), 1, "两个 role 共用应去重");
     assert_eq!(rows[0].code, "shared-menu");
 }
 
 /// `menu_sql::list_active_for_roles`：is_active=false 的菜单被排除
+///
+/// 用合成角色而非真实角色：真实角色带进 template DB 的 seed 菜单，精确条数断言会被
+/// 稀释。见 `SYNTHETIC_MENU_ROLE` 与 `menu_seed_never_grants_synthetic_menu_roles`。
 #[tokio::test]
 async fn list_active_for_roles_excludes_inactive_menus() {
     let (pool, _fx) = setup().await;
     let active = seed_menu(&pool, "active", 0, true).await;
     let inactive = seed_menu(&pool, "inactive", 1, false).await;
-    link_role_menu(&pool, "MANAGER", active).await;
-    link_role_menu(&pool, "MANAGER", inactive).await;
+    link_role_menu(&pool, SYNTHETIC_MENU_ROLE, active).await;
+    link_role_menu(&pool, SYNTHETIC_MENU_ROLE, inactive).await;
 
-    let rows = menu_sql::list_active_menus_by_roles(&pool, &["MANAGER".into()])
+    let rows = menu_sql::list_active_menus_by_roles(&pool, &[SYNTHETIC_MENU_ROLE.into()])
         .await
         .expect("list");
     assert_eq!(rows.len(), 1);
@@ -494,6 +541,9 @@ async fn list_active_for_roles_excludes_inactive_menus() {
 }
 
 /// `menu_sql::list_active_for_roles`：按 sort_order, code 排序
+///
+/// 用合成角色而非真实角色：真实角色带进 template DB 的 seed 菜单，精确条数断言会被
+/// 稀释。见 `SYNTHETIC_MENU_ROLE` 与 `menu_seed_never_grants_synthetic_menu_roles`。
 #[tokio::test]
 async fn list_active_for_roles_ordered_by_sort_order_code() {
     let (pool, _fx) = setup().await;
@@ -501,10 +551,10 @@ async fn list_active_for_roles_ordered_by_sort_order_code() {
     let m1 = seed_menu(&pool, "a-sort-1", 10, true).await;
     let m2 = seed_menu(&pool, "b-sort-2", 20, true).await;
     for m in [m1, m2, m3] {
-        link_role_menu(&pool, "MANAGER", m).await;
+        link_role_menu(&pool, SYNTHETIC_MENU_ROLE, m).await;
     }
 
-    let rows = menu_sql::list_active_menus_by_roles(&pool, &["MANAGER".into()])
+    let rows = menu_sql::list_active_menus_by_roles(&pool, &[SYNTHETIC_MENU_ROLE.into()])
         .await
         .expect("list");
     assert_eq!(rows.len(), 3);

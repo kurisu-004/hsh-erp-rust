@@ -1,12 +1,17 @@
 //! statistics 域集成测试（2026-09-15 takeover-fill）
 //!
-//! 覆盖（≥5 用例）：
-//!   1. overview_happy_path         — MANAGER 调 overview / 200 + 必要字段
-//!   2. overview_forbidden_for_clerk — Clerk → 403
-//!   3. workers_stats_happy_path    — MANAGER 调 workers / 列表
-//!   4. worker_detail_happy_path    — MANAGER 调 worker detail
-//!   5. pickup_skips_summary        — MANAGER 调 pickup-skips summary
-//!   6. pickup_skip_detail          — MANAGER 调 pickup-skips detail（分页）
+//! 覆盖（4 用例）：
+//!   1. overview_invalid_date_range_returns_400 — date_from > date_to → BIZ 20104
+//!   2. pickup_skips_summary_happy_path         — MANAGER 调 pickup-skips summary
+//!   3. pickup_skip_detail_happy_path           — pickup-skips detail（分页）
+//!   4. count_in_process_at_date_to_boundary    — 期末在制口径（date_to 边界）
+//!
+//! ⚠️ **覆盖空洞（2026-10-10）**：`StatisticsService::overview` / `worker_stats` /
+//! `worker_detail` **无 happy-path 集成测试**。原三条把查询窗口硬编码成绝对日期、
+//! 而插入的行用 `now_naive()`，跨月后窗口里查不到行（2026-09 绿、2026-10-01 起红），
+//! 已删除而非修复——用户决定接受该覆盖清零。补回来时**不得**硬编码绝对日期窗口：
+//! 要么照 `tests/statistics/event_driven.rs` 的 `insert_delivered_event(…, at_date)`
+//! 钉住插入时间戳，要么让窗口由 `now_naive()` 推导。
 //!
 //! ## 集成测试范本（PR13 Phase H，2026-09-24）
 //! 本文件按 Phase F 范本收敛：删除 `clean_db` / `clean_business_db` /
@@ -152,32 +157,6 @@ async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
 }
 
 #[tokio::test]
-async fn overview_happy_path() {
-    let (pool, _fx) = setup().await;
-    // 插一条 part 让 created_count > 0
-    let l1 = insert_l1_customer(&pool, "客户S-1", "F").await;
-    let l2 = insert_l2_customer(&pool, l1, "子客S-1").await;
-    let _ = insert_part(&pool, l2, "p1").await;
-
-    let mut tx = pool.begin().await.unwrap();
-    let out = StatisticsService
-        .overview(
-            &mut *tx,
-            NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
-            NaiveDate::from_ymd_opt(2026, 9, 30).unwrap(),
-        )
-        .await
-        .expect("overview ok");
-    drop(tx);
-
-    assert!(out.created_count >= 1);
-    assert!(out.delivery_performance.on_time >= 0);
-    assert!(!out.status_distribution.is_empty() || out.status_distribution.is_empty()); // 允许空
-    assert_eq!(out.daily_created.len(), 30, "零填充到 30 天");
-    assert_eq!(out.daily_completed.len(), 30);
-}
-
-#[tokio::test]
 async fn overview_invalid_date_range_returns_400() {
     let (pool, _fx) = setup().await;
     let mut tx = pool.begin().await.unwrap();
@@ -196,118 +175,6 @@ async fn overview_invalid_date_range_returns_400() {
         }
         other => panic!("期望 AppError::Biz(20104)，got {other:?}"),
     }
-}
-
-#[tokio::test]
-async fn workers_stats_happy_path() {
-    let (pool, _fx) = setup().await;
-    let wt = insert_work_type(&pool, "WT-S", "机加工").await;
-    let w1 = insert_worker(&pool, "B001", "张三", Some(wt)).await;
-    let w2 = insert_worker(&pool, "B002", "李四", Some(wt)).await;
-    // 插一条 part + 2 个 PICKED_UP 事件
-    let l1 = insert_l1_customer(&pool, "客户S-2", "F").await;
-    let l2 = insert_l2_customer(&pool, l1, "子客S-2").await;
-    let part_id = insert_part(&pool, l2, "p2").await;
-    let now = now_naive();
-    // 2026-10-09：原注释「单一 snowflake 生成器避免同毫秒内 seq 撞 id」的局部 generator
-    // 已删除 —— 正确解法是全进程共享同一个对象，进程内任何两处取号都不撞。
-    // w1: 3 events quantity=1 each (total 3); w2: 7 events quantity=1 each (total 7)
-    for _ in 0..3 {
-        sqlx::query(
-            "INSERT INTO t_part_event (id, part_id, worker_id, event_type, quantity, created_at) \
-             VALUES ($1, $2, $3, 'PICKED_UP', 1, $4)",
-        )
-        .bind(shared_test_snowflake().next_id())
-        .bind(part_id)
-        .bind(w1)
-        .bind(now)
-        .execute(&pool)
-        .await
-        .expect("insert part_event");
-    }
-    for _ in 0..7 {
-        sqlx::query(
-            "INSERT INTO t_part_event (id, part_id, worker_id, event_type, quantity, created_at) \
-             VALUES ($1, $2, $3, 'PICKED_UP', 1, $4)",
-        )
-        .bind(shared_test_snowflake().next_id())
-        .bind(part_id)
-        .bind(w2)
-        .bind(now)
-        .execute(&pool)
-        .await
-        .expect("insert part_event");
-    }
-
-    let mut tx = pool.begin().await.unwrap();
-    let out = StatisticsService
-        .worker_stats(
-            &mut *tx,
-            NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
-            NaiveDate::from_ymd_opt(2026, 9, 30).unwrap(),
-        )
-        .await
-        .expect("worker_stats ok");
-    drop(tx);
-
-    assert_eq!(out.items.len(), 2, "应见 2 个工人");
-    let zhang = out
-        .items
-        .iter()
-        .find(|i| i.worker_id == w1)
-        .expect("张三在场");
-    // 3 events quantity=1 each → pickup_count=3, pickup_quantity=3
-    assert_eq!(zhang.pickup_count, 3);
-    assert_eq!(zhang.pickup_quantity, 3);
-    assert_eq!(zhang.contribution_pct, Some(30.0));
-    let li = out
-        .items
-        .iter()
-        .find(|i| i.worker_id == w2)
-        .expect("李四在场");
-    assert_eq!(li.pickup_quantity, 7);
-    assert_eq!(li.contribution_pct, Some(70.0));
-}
-
-#[tokio::test]
-async fn worker_detail_happy_path() {
-    let (pool, _fx) = setup().await;
-    let wt = insert_work_type(&pool, "WT-D", "焊工").await;
-    let w_id = insert_worker(&pool, "B003", "王五", Some(wt)).await;
-    let l1 = insert_l1_customer(&pool, "客户S-3", "F").await;
-    let l2 = insert_l2_customer(&pool, l1, "子客S-3").await;
-    let part_id = insert_part(&pool, l2, "p3").await;
-    let now = now_naive();
-    for ev_type in ["PICKED_UP", "PICKED_UP", "RETURNED"] {
-        sqlx::query(
-            "INSERT INTO t_part_event (id, part_id, worker_id, event_type, quantity, created_at) \
-             VALUES ($1, $2, $3, $4, 1, $5)",
-        )
-        .bind(shared_test_snowflake().next_id())
-        .bind(part_id)
-        .bind(w_id)
-        .bind(ev_type)
-        .bind(now)
-        .execute(&pool)
-        .await
-        .expect("insert part_event");
-    }
-    let mut tx = pool.begin().await.unwrap();
-    let out = StatisticsService
-        .worker_detail(
-            &mut *tx,
-            &w_id.to_string(),
-            NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
-            NaiveDate::from_ymd_opt(2026, 9, 30).unwrap(),
-        )
-        .await
-        .expect("worker_detail ok");
-    drop(tx);
-    assert_eq!(out.worker.id, w_id);
-    assert_eq!(out.pickup_count, 2);
-    assert_eq!(out.return_count, 1);
-    assert_eq!(out.participated_part_count, 1);
-    assert_eq!(out.parts.len(), 1);
 }
 
 #[tokio::test]
