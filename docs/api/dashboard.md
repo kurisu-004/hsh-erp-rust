@@ -109,7 +109,8 @@
 
 ## 4. 口径表
 
-`DELIVERY_STATUSES`（`repo/delivery.rs`，6 态）是「未交付」的**唯一**判据，被四处共用：
+`DELIVERY_STATUSES`（`repo/delivery.rs`，6 态）是「未交付」的**唯一**判据，被 4 类消费方共用
+（逾期计数 / 交期面板三桶 / 下钻抽屉 / 柱状图分桶）——下面的表就是它们逐条对应的 SQL 状态条件：
 
 | 用途 | SQL 状态条件 |
 |---|---|
@@ -133,8 +134,7 @@
 ⚠️ **「时间窗口不重叠」这条不变式已于 2026-10-10 作废**：`partial` 桶刻意**无时间窗口**
 （产品决议：「部分已交不应该限制时间范围，应该扫出全部的部分已交工单」），故它与 `overdue`
 在 `< today` 区间上**必然重叠** —— 一条已交一部分且已逾期的工单会同时进 KPI、overdue 排除集
-（被 NOT EXISTS 排除，故不出现在 overdue 桶）与 partial 桶。这是产品决议，不是缺陷；
-登记见 §8.3。
+（被 NOT EXISTS 排除，故不出现在 overdue 桶）与 partial 桶。这是产品决议，不是缺陷；登记见 §8.4。
 
 仍然成立的对数关系只有一条：**`overdue.total == overdue_count`**（两者同谓词），
 `overdue.items.len()` 则还要再受 30 条上限截断，故只能说 `<=`。
@@ -158,7 +158,7 @@
 「不要动它」那条禁令**只针对右列**。左列 2026-10-10 加的已交量守卫是产品口径决策，
 与右列的有意分叉并不冲突 —— 分叉点是「交期列 + 事件兜底」两处，右列两处都没动。
 
-### 4.4 装配件整套交付不变式 ⇒ 两个谓词等价（2026-10-10）
+### 4.4 装配件整套交付不变式 ⇒ `NOT EXISTS` 与 `delivered_sets` 同解（2026-10-10）
 
 **业务不变式：装配件只能整套交付，不允许单独交子件。** 送货单路径经 `entry_max_sets` 闸门
 （`com::delivery_note::service::scan_entry`，错误码 **21405**）强制这一点。
@@ -171,12 +171,13 @@ delivered_sets = MIN over c (per_set(c)) = LEAST(k, N) = k
 ⇒ delivered_sets == 0 ⟺ k == 0 ⟺ 无任何子件被交付 ⟺ NOT EXISTS(子件有已交批次)
 ```
 
-⇒ 「一件没交过」这件事有**两个等价的判据**：SQL 里的 `NOT EXISTS(已交批次)`，与
-Rust 侧算出来的 `delivered_sets == 0`。逾期 KPI（`SQL_COUNT_OVERDUE`）与
-`upcoming` / `overdue` 两桶在**散件与装配件两侧都对齐**，即
-`overdue.total == overdue_count`。
+⇒ 「一件没交过」这件事在本不变式下有**两个同解的判据**：SQL 里的 `NOT EXISTS(已交批次)`，
+与 Rust 侧算出来的 `delivered_sets == 0`。但**桶归属只看前者** —— 逾期 KPI
+（`SQL_COUNT_OVERDUE`）与 `upcoming` / `overdue` 两桶用的是**同一个** `NOT EXISTS` 谓词
+（逐字相同），`delivered_sets` 只负责填 `delivered_quantity` 这个展示值。三者因此在
+**散件与装配件两侧都对齐**，即 `overdue.total == overdue_count`。
 
-⚠️ **两个谓词字面不同、语义等价。不要把其中任何一条当成漏判「修」掉。**
+⚠️ **不要把桶的归属判据当成漏判「修」掉**，也不要把 `delivered_sets` 提上去当判据。
 
 **不变式被破坏后的实际现象**：三桶的归属判据是 SQL 里的 `NOT EXISTS` / `EXISTS`
 （**不是** `delivered_quantity` 是否为 0），所以 KPI 与三桶的**行集合**在不变式被破坏时
@@ -186,10 +187,66 @@ Rust 侧算出来的 `delivered_sets == 0`。逾期 KPI（`SQL_COUNT_OVERDUE`）
 「部分已交 / 0 套」。只有把分桶挪回 Rust 按 `delivered_quantity > 0` 判定，才会退化成
 真正的「KPI 不计但面板有行」反向差 —— **不要那样改**。
 
-**唯一破坏路径**：`POST /api/v2/prod/batches/{id}/deliver`
-（`prod::batch::repo::sql::mark_batch_delivered` 只查
-`allowed_from: &["READY_TO_SHIP"]`，**无装配件套数校验**，能单独交子件）。
-送货单路径维持不变式。存量违规数据由人工清理。
+#### 无装配件套数校验的写路径共 3 条
+
+三条都经 `shared::batch::status` 写 `t_part_batch.status`、**都不看父装配件的套数**，
+故都能单独交子件：
+
+| # | 端点 | 落到哪个 status | 为什么构不成闸门 |
+|---|---|---|---|
+| 1 | `POST /api/v2/prod/batches/{batch_id}/deliver` | `DELIVERED` | `mark_batch_delivered` 只查 `allowed_from: &["READY_TO_SHIP"]` |
+| 2 | `POST /api/v2/prod/batches/scan/deliver` | `DELIVERED` | `scan_deliver_part` 只查 `part.status == READY_TO_SHIP` 就 `mark_batch_delivered`（司机扫码发货） |
+| 3 | `POST /api/v2/parts/{part_id}/force-complete` | **`COMPLETED`** | `force_complete_all_batches_for_part` 把该 part 全部非 CANCELLED 批次强推 `COMPLETED`（逃生通道，绕状态机与 OCC）；本守卫的 `status IN ('DELIVERED','COMPLETED')` 把 `COMPLETED` 也算已交 |
+
+**不构成破坏路径的两条**：送货单路径经 `entry_max_sets` 闸门维持不变式；
+`POST /api/v2/prod/batches/{batch_id}/complete` 的 `allowed_from: &["DELIVERED"]` 要求批次
+**先已交付**才推 `COMPLETED`，造不出新的违规。存量违规数据由人工清理。
+
+#### 存量违规数据的排查 SQL
+
+`t_part_batch.delivery_note_id` 是可靠的分界：**送货单 `pickup` 会原样保留**该列
+（`com::delivery_note::service::lifecycle.rs`），而上面 3 条写路径都经
+`apply_batch_status_change`，只写 status / location / holder / process，**不动**该列 ⇒
+「已交批次且 `delivery_note_id IS NULL`」= 经逐批端点交付。
+
+```sql
+-- ① 可疑批次清单（未经送货单交付的已交批次）
+SELECT b.id AS batch_id, b.part_id, c.assembly_id, b.status, b.quantity,
+       b.delivery_note_id, b.updated_at, b.updated_by
+FROM t_part_batch b
+JOIN t_part c ON c.id = b.part_id
+WHERE c.assembly_id IS NOT NULL
+  AND c.deleted_at IS NULL
+  AND b.deleted_at IS NULL
+  AND b.status IN ('DELIVERED', 'COMPLETED')
+  AND b.delivery_note_id IS NULL
+ORDER BY c.assembly_id, b.id;
+
+-- ② 真正破了不变式的装配件：子件「有的已交、有的没交」
+SELECT c.assembly_id,
+       count(*) AS child_total,
+       count(*) FILTER (WHERE EXISTS (
+           SELECT 1 FROM t_part_batch b
+           WHERE b.part_id = c.id AND b.deleted_at IS NULL
+             AND b.status IN ('DELIVERED', 'COMPLETED'))) AS child_delivered
+FROM t_part c
+WHERE c.assembly_id IS NOT NULL
+  AND c.deleted_at IS NULL
+GROUP BY c.assembly_id
+HAVING count(*) FILTER (WHERE EXISTS (
+           SELECT 1 FROM t_part_batch b
+           WHERE b.part_id = c.id AND b.deleted_at IS NULL
+             AND b.status IN ('DELIVERED', 'COMPLETED'))) > 0
+   AND count(*) FILTER (WHERE NOT EXISTS (
+           SELECT 1 FROM t_part_batch b
+           WHERE b.part_id = c.id AND b.deleted_at IS NULL
+             AND b.status IN ('DELIVERED', 'COMPLETED'))) > 0
+ORDER BY c.assembly_id;
+```
+
+① 是嫌疑集（含合法的「先逐批交付、后补送货单」等混合场景），② 才是确凿的违规装配件。
+`t_part_event` 的 `event_type='FORCE_COMPLETED'`（`batch_id IS NULL`）与 `event_type='DELIVERED'`
+（`batch_id` 非空）可用来区分是上面 3 条里的哪一条造成的。
 
 **装配件行的 `delivered_quantity` = 已交套数**（不是件数），公式
 `LEAST(COALESCE(MIN((子件已送件数 × a.quantity) / NULLIF(c.quantity, 0)), 0), a.quantity)`
@@ -230,6 +287,7 @@ Rust 侧算出来的 `delivered_sets == 0`。逾期 KPI（`SQL_COUNT_OVERDUE`）
 | 面板的行单位 `件级` → `工单级` | 装配件开始作为面板行出场并**替换**其子件行；行单位随之从「件」变「工单」，新增 `row_type` 供前端区分 |
 | `repo::DELIVERY_WINDOW_DAYS`（`i64 = 7`） | 面板唯一的窗口上界。`upcoming` 桶不再有上界（`>= today` 全收），`partial` 桶本就无窗口 ⇒ 常量零引用 |
 | `SQL_SYSTEM_DELIVERY_ORDERS`（单条主查询 + Rust 侧分桶） | 三桶各自一条主查询（`SQL_ORDERS_UPCOMING` / `_OVERDUE` / `_PARTIAL`），判据与截断全在 SQL 内 |
+| 面板排序的 `is_urgent DESC` 次级键 | 规格只要求 `sdd ASC`，故三桶排序改为 `sdd ASC NULLS LAST, id ASC`。**面向用户的行为变化**：同一交期内「加急工单优先」不再成立，加急标记仍随行返回（`items[].is_urgent`）但不参与排序 |
 
 **破坏性变更**：前端拿到的 JSON 形状变了（键名 + 数组→对象 + 新增 `row_type`），
 按 §8.2 第 4 条同步。
@@ -369,6 +427,9 @@ dashboard 是**只读跨域聚合域**——这是本仓既定 pattern（`statis
 |---|---|---|
 | `partial` 与 `overdue_count` 的时间窗口重叠 | 一条「已交一部分 + 交期已过」的工单**不在** `overdue_count` 里（被 `NOT EXISTS` 排除），但**在** `partial` 桶里。用户若把「逾期数」与「已交一部分的逾期工单数」相加去核对总逾期，会对不上 | **产品决议，不处理**：需求原文即「部分已交不应该限制时间范围，应该扫出全部的部分已交工单」。前端不得拿 `partial` 的交期分布去推断逾期 |
 | `partial` 含 `system_delivery_date IS NULL` 的工单 | 「全部的部分已交工单」包含**没填系统交期**的工单（排序 `NULLS LAST`） | **产品决议，不处理**：既然不限时间范围，就不该把「没填交期」排除掉。前端需容忍该列 `null` 并给占位展示 |
+| **没填交期且一件没交过**的工单**不属于任何一桶** | `upcoming` 要 `sdd >= today`、`overdue` 要 `sdd < today`（两者对 NULL 皆假）、`partial` 要有已交批次 ⇒ `sdd IS NULL AND NOT EXISTS(已交批次)` 的工单三桶皆不出现 | 与原 `[today, today+7)` 窗口的形态一致（同样不显示），**非本次引入**。「三桶覆盖全部工单」的直觉读法不成立：没有交期就没有交期面板的位置。要不要补第四桶「无交期」是产品决议，本轮**不处理** |
+| `partial` 的真实语义是「有 ≥1 个已交批次 **且** 派生状态未终态」 | 桶谓词只看 `EXISTS(已交批次)` + `status ∈ 6 态`，不看交了多少。故派生状态滞后的窗口内，`partial` 里可能出现 `delivered_quantity == quantity` 的「已全交」行 | 与 `DELIVERY_STATUSES` 用派生列这一既成取舍同源（滞后窗口只影响一次刷新，§4.3 已登记同源问题）。正常流程里末批交付会同事务把 part 推入终态、不再是 6 态，故只在滞后窗口内可见。**代码侧不处理** |
+| `partial` 桶是三桶里最贵的一条查询 | 它**无时间窗口**，而 `COUNT(*) OVER ()`（无分区、无窗内排序）必须物化**全量**匹配行才能求值 ⇒ 该查询必然扫「全部处于 6 态且有已交批次」的 part / assembly 并排全序，不像 `upcoming` / `overdue` 能借交期索引收敛范围 | 规格强制要求 `total` 不受 `LIMIT` 影响，本形态是该要求的直接代价。抽屉侧已有「行查询 + `SQL_DETAILS_COUNT_*` 计数查询」的形态可参考；**是否换形态留待数据量实证后再定，本轮不改实现** |
 | `upcoming.total` 可能远超 `items.length()` | 每桶上限 30，`total` 是匹配总数 | 设计如此（前端按「共 N 条」展示）。**唯一例外是 0 命中**：`COUNT(*) OVER ()` 在无行时无从求值，此时 `total` 为 `0` 而非 `null` |
 | 无子件装配件的 `delivered_quantity` 恒为 0 | 该装配件无论业务上是否已交付，都会被判成「一件没交过」⇒ 落 `upcoming` / `overdue` 桶而非 `partial` | 与逾期 KPI 的行为一致（`NOT EXISTS` 子件路径同样恒真），**刻意保持**。无子件装配件本身是数据问题，不是口径问题 |
-| 装配件行落在 `partial` 桶但 `delivered_quantity` 显示 0 套 | 只在**装配件整套交付不变式被破坏**时出现（典型形态：子件 A 交满、子件 B 一件没交）。桶归属看 `EXISTS`（命中），展示值看 min 公式（0 套） | 推导见 §4.4。不变式的唯一破坏路径是 `POST /prod/batches/{id}/deliver`，送货单路径有闸门；存量违规数据人工清理。**代码侧不处理** |
+| 装配件行落在 `partial` 桶但 `delivered_quantity` 显示 0 套 | 只在**装配件整套交付不变式被破坏**时出现（典型形态：子件 A 交满、子件 B 一件没交）。桶归属看 `EXISTS`（命中），展示值看 min 公式（0 套） | 推导见 §4.4。不变式的 3 条破坏路径见 §4.4，送货单路径有闸门；存量违规用 §4.4 的排查 SQL 定位后人工清理。**代码侧不处理** |

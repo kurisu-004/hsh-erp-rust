@@ -18,20 +18,24 @@
 //! 只出现在 `partial` 里。「按交期切两块」的直觉读法在 `partial` 上不成立。
 //!
 //! ⚠️ 本文件全部走运行时 `sqlx::query`（与本域既有风格一致，不进 `.sqlx/` 离线缓存），
-//! 而运行时 `query` **不校验占位符个数**：SQL 少写一个 `$n` 不会编译失败、也不报错，
-//! 那个参数被静默忽略。改动本文件的 SQL 后必须重跑集成测试
-//! `delivery_order_details_total_exceeds_items_when_truncated`（`LIMIT $3` 漏写会让
-//! 截断失效）与 `system_delivery_orders_bucket_total_is_full_match_count`
-//! （三桶的 `LIMIT` 漏写会让 `total` 与 `items.len()` 一起失守）——后者是本文件
-//! 唯一的 `LIMIT` 占位符防线。
+//! 而运行时 `query` **不做编译期占位符校验**（不像 `query!` 宏）：SQL 与 `.bind()` 链的
+//! 个数 / 类型不一致时，编译与 `cargo clippy` 全部静默，要到**运行时的 Bind 阶段**才由
+//! PG 报 08P01（`bind message supplies N parameters, but prepared statement requires M`），
+//! 且会污染 sqlx 的 statement cache ⇒ 同连接上后续所有查询跟着一起失败，报错点离真凶很远。
+//! 改动本文件的 SQL 后必须重跑这三条集成测试（各自守一段不同的 SQL，故并列列出）：
+//! - `delivery_order_details_total_exceeds_items_when_truncated` —— 抽屉的
+//!   `SQL_DETAILS_*`：`LIMIT $3` 漏写会让截断失效，`total` 与 `items.len()` 一起失守；
+//! - `system_delivery_orders_caps_each_bucket` —— 三条 `SQL_ORDERS_*`：任一条的
+//!   `LIMIT $3` / `LIMIT $2` 漏写都会让 `items.len()` 失守；
+//! - `system_delivery_orders_bucket_total_is_full_match_count` —— 三条 `SQL_ORDERS_*`：
+//!   `LIMIT` 漏写还会让 `total` 从匹配总数退化成返回行数。
 //!
 //! ## 三桶排序的 tiebreaker（2026-10-10）
 //! 三条主查询都是 `ORDER BY system_delivery_date ASC NULLS LAST, id ASC`。
 //! 规格给的主排序键只有 `system_delivery_date ASC`，**`id ASC` 是必要的补充**：PG 的
 //! `ORDER BY` 对并列行**不保证稳定**，而 `LIMIT 30` 会切在并列区中间 ⇒ 同一个库两次
-//! 请求可能返回不同的 30 行，集成测试也会间歇性红。`id ASC` 让截断确定（雪花 id 单调
-//! 递增，等价于「同交期取建单最早的 30 条」，与本域旧查询的 `is_urgent DESC, id ASC`
-//! 同思路）。
+//! 请求可能返回不同的 30 行，集成测试也会间歇性红。`id ASC` 让截断确定 —— 雪花 id 单调
+//! 递增（`t_part` 与 `t_assembly` 同出一条流），故它等价于「同交期取建单最早的 30 条」。
 
 use chrono::NaiveDate;
 use sqlx::postgres::PgRow;
@@ -48,8 +52,8 @@ use crate::modules::dashboard::vo::{
 ///
 /// 柱状图 `UpcomingDeliveryChart.vue` 的 `LAYERS[].statuses` 里 top(4) + middle(2)
 /// 正是这 6 态，bottom 层额外含 DELIVERED。
-/// 2026-10-07 前端把那两块交期面板的 urgent / partial 判定改为服务端按
-/// `delivered_quantity` 判定后，6 态在前端**只剩 `LAYERS[].statuses` 这一个镜像**
+/// 交期面板三桶的已交判据（SQL 里的 `NOT EXISTS` / `EXISTS` 已交批次）与逾期 KPI 全在服务端，
+/// 6 态在前端**只剩 `LAYERS[].statuses` 这一个镜像**
 /// ——改本常量时只需核对这一处。同步关系与症状见 docs/api/dashboard.md §5。
 pub const DELIVERY_STATUSES: [&str; 6] = [
     "PENDING",
@@ -85,20 +89,33 @@ pub const DELIVERY_DETAIL_LIMIT: i64 = 200;
 /// - 只留 `NOT EXISTS`：派生滞后期内仍处 `IN_PROCESS` 的已交批次数会被重复计入；
 /// - 只留 `status = ANY`：批次被追溯改成 `CANCELLED` 的工单会凭派生列被计入。
 ///
-/// ### 为什么 `NOT EXISTS` 与面板侧的「已交量」判定等价（业务不变式）
+/// ### 为什么 `NOT EXISTS` 与 Rust 侧算出的 `delivered_sets` 同解（业务不变式）
 /// 装配件**只能整套交付、不允许单独交子件**（产品不变式）。装配件总套数 N、交 k 套 ⇒
 /// 每个子件 c 交 `k × c.quantity / N` 件，于是
 /// `per_set(c) = (子件已交 × N) / NULLIF(c.quantity, 0) = k`，
 /// `delivered_sets = MIN over c (k) = LEAST(k, N) = k`，
 /// 故 `delivered_sets == 0 ⟺ k == 0 ⟺ 无任何子件被交付 ⟺ NOT EXISTS(子件有已交批次)`。
-/// ⇒ 本 SQL（用 `NOT EXISTS`）与 `upcoming` / `overdue` 桶（用 `delivered_sets`）
-/// 在**散件和装配件两侧都对齐**。
 ///
-/// **不变式被破坏后的实际现象**（唯一破坏路径是
-/// `POST /api/v2/prod/batches/{id}/deliver` —— `prod::batch::repo::sql::mark_batch_delivered`
-/// 只查 `allowed_from: &["READY_TO_SHIP"]`，无装配件套数校验，能单独交子件；
-/// 送货单路径经 `entry_max_sets` 闸门（`com::delivery_note::service::scan_entry`，
-/// 错误码 21405）维持不变式。存量违规数据由人工清理）：
+/// ⚠️ **桶归属不靠 `delivered_sets`**：本 SQL 与 `upcoming` / `overdue` 桶用的是**同一个**
+/// `NOT EXISTS` 谓词（逐字相同，故 `overdue.total == overdue_count` 严格对数）；
+/// `delivered_sets` 只用来填 `delivered_quantity` 这个**展示值**。两者在本不变式下同解，
+/// 但桶归属永远只看 SQL 的 `NOT EXISTS` / `EXISTS` —— 不要把其中任何一条当成漏判「修」掉。
+///
+/// **不变式被破坏后的实际现象**（无装配件套数校验的写路径共 **3 条**，都经
+/// `shared::batch::status` 写批次、都不看父装配件的套数，故都能单独交子件：
+/// - `POST /api/v2/prod/batches/{batch_id}/deliver` —— `mark_batch_delivered` 只查
+///   `allowed_from: &["READY_TO_SHIP"]`；
+/// - `POST /api/v2/prod/batches/scan/deliver` —— `prod::batch::service::scan::scan_deliver_part`
+///   同样只查 `part.status == READY_TO_SHIP` 就 `mark_batch_delivered`（司机扫码发货）；
+/// - `POST /api/v2/parts/{part_id}/force-complete` —— `force_complete_all_batches_for_part`
+///   把该 part 全部非 CANCELLED 批次强推 `COMPLETED`，而本守卫的 `status IN
+///   ('DELIVERED','COMPLETED')` 把 `COMPLETED` 也算已交。
+///
+/// 另两条**不**构成破坏路径：送货单路径经 `entry_max_sets` 闸门
+/// （`com::delivery_note::service::scan_entry`，错误码 21405）维持不变式；
+/// `POST /prod/batches/{batch_id}/complete` 的 `allowed_from: &["DELIVERED"]` 要求批次
+/// 先已交付，造不出新的违规。存量违规数据的排查 SQL 见 `docs/api/dashboard.md` §4.4，
+/// 由人工清理）：
 ///
 /// 三桶的归属判据是**本文件的 `NOT EXISTS` / `EXISTS`**（不是 `delivered_quantity` 是否为 0），
 /// 故 KPI 与 `upcoming` / `overdue` / `partial` 的**行集合在破坏不变式时依然互斥**
@@ -108,8 +125,6 @@ pub const DELIVERY_DETAIL_LIMIT: i64 = 200;
 /// 若反过来把分桶挪回 Rust 按 `delivered_quantity > 0` 判定，才会出现真正的
 /// 「KPI 不计但面板有行」反向差 —— **别那样改**，判据必须留在 SQL 里（理由见
 /// `SQL_ORDERS_PARTIAL` 的 doc）。
-///
-/// ——两处谓词字面不同却语义等价，**不要**把其中任何一条当成漏判"修"掉。
 ///
 /// ⚠️ **刻意不加** `NOT EXISTS (… DELIVERED 事件)` 守卫：派生状态滞后窗口只影响
 /// 一次刷新，事件表兜底是过度设计。与 `statistics::repo::sql::count_overdue_undelivered`
@@ -501,16 +516,17 @@ impl DeliveryRepo {
     /// `.copied().unwrap_or(0)` 兜底 —— 那会让无子件装配件的 `delivered_quantity = 0`，
     /// 落进 `upcoming` / `overdue` 桶，与现状 `count_overdue` 计它的行为一致，保持不变。
     ///
-    /// ### 为什么它与 `SQL_COUNT_OVERDUE` 的 `NOT EXISTS` 等价
+    /// ### 为什么它与 `SQL_COUNT_OVERDUE` 的 `NOT EXISTS` 同解
     /// 装配件**只能整套交付、不允许单独交子件**（业务不变式）。总套数 N、交 k 套 ⇒ 每个
     /// 子件 c 交 `k × c.quantity / N` 件 ⇒ `per_set(c) = (子件已交 × N) / NULLIF(c.quantity, 0) = k`
     /// ⇒ `delivered_sets = MIN over c (k) = LEAST(k, N) = k`
     /// ⇒ `delivered_sets == 0 ⟺ k == 0 ⟺ 无任何子件被交付 ⟺ NOT EXISTS(子件有已交批次)`。
-    /// 所以「未交过」的两条判据字面不同、语义等价。**不要**把它们中的任何一条当成漏判
-    /// "修"掉 —— 三桶的归属判据是 SQL 里的 `NOT EXISTS` / `EXISTS`（不是本函数的返回值），
-    /// 本函数只负责填 `delivered_quantity` 这个展示值。
-    /// 不变式被破坏时错位的是展示值（行落 `partial` 却显示 0 套），不是 KPI ↔ 面板的行集合；
-    /// 完整推导 + 唯一破坏路径见 `SQL_COUNT_OVERDUE` 的 doc 与 `docs/api/dashboard.md` §4.4。
+    ///
+    /// 本函数**不参与桶归属**：三桶的归属判据是 SQL 里的 `NOT EXISTS` / `EXISTS`
+    /// （KPI 与 `upcoming` / `overdue` 两桶逐字相同），本函数只负责填 `delivered_quantity`
+    /// 这个展示值。不变式被破坏时错位的是展示值（行落 `partial` 却显示 0 套），不是
+    /// KPI ↔ 面板的行集合；完整推导 + 三条破坏路径 + 存量违规排查 SQL 见
+    /// `SQL_COUNT_OVERDUE` 的 doc 与 `docs/api/dashboard.md` §4.4。
     ///
     /// SQL 条数：1 条，与桶行数无关（防 N+1 往返）；扫描量是 O(本页装配件的子件总数)。
     async fn fetch_delivered_sets(

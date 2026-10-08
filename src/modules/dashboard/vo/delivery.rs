@@ -20,7 +20,7 @@
 //! | `partial` | **无窗口** | 交过一部分 | `sdd ASC NULLS LAST` |
 //!
 //! `partial` 无窗口 ⇒ 它与 `overdue` 在时间范围上**必然重叠**（这是产品决议，不是缺陷；
-//! 登记见 `docs/api/dashboard.md` §8.3）。
+//! 登记见 `docs/api/dashboard.md` §8.4）。
 
 use serde::Serialize;
 

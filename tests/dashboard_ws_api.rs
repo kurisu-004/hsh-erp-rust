@@ -1995,7 +1995,8 @@ async fn overdue_excludes_today_boundary() {
 }
 
 // ---------------------------------------------------------------------------
-// 2026-10-10 口径决策：`count_overdue` 改按**已交数量**判断，只要交过一部分就不计入
+// 2026-10-10 口径决策：`count_overdue` 改按「**有没有**已交批次」判断，
+// 只要交过一部分就不计入
 // ---------------------------------------------------------------------------
 //
 // 守卫是 `SQL_COUNT_OVERDUE` 两侧各一个 `NOT EXISTS`（`t_assembly` 侧经
@@ -2493,10 +2494,13 @@ async fn system_delivery_orders_caps_each_bucket() {
 
 #[tokio::test]
 async fn system_delivery_orders_bucket_total_is_full_match_count() {
-    // `LIMIT` 占位符守门用例：`COUNT(*) OVER ()` 在 LIMIT 之前求值，故 `total` 恒等于
-    // 真实匹配数。⚠️ 本文件三条主查询走运行时 `sqlx::query`、**不校验占位符个数** ——
-    // 若某条把 `LIMIT $3` / `LIMIT $2` 漏写掉，那条查询既不截断、`total` 也退化成
-    // 返回行数，本用例是唯一的防线（另两条 >30 桶的用例也会红，但本用例的断言最直接）。
+    // `COUNT(*) OVER ()` 在 LIMIT 之前求值，故 `total` 恒等于真实匹配数。
+    // ⚠️ 本文件三条主查询走运行时 `sqlx::query`、**不做编译期占位符校验** —— 若某条把
+    // `LIMIT $3` / `LIMIT $2` 漏写掉，多出来的那个 `.bind()` 会在**运行时的 Bind 阶段**
+    // 直接让该查询报 08P01（`bind message supplies 3 parameters, but prepared statement
+    // requires 2`），整页 500。本用例负责把失败点钉死在「三桶主查询的 LIMIT / total」
+    // 这一个口径上；`system_delivery_orders_caps_each_bucket` 从 `items.len()` 那一侧
+    // 兜同一件事（它覆盖三桶，本用例只覆盖 `upcoming`）。
     let pool = setup().await;
     let today = now_naive().date();
     let sdd = today + chrono::Duration::days(3);
