@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-> 📌 **前端对接**：后端 API 参考见 [`docs/api/`](docs/api/)。**2026-10-10 现状**：`docs/api/` 有 10 份文件，每份是一个域的**整域契约**（端点表 / 逐字段 / 口径表 / 错误码 / 移除记录 / WS 关系 / 表依赖与前端配套 / 已知偏差登记），范本是 [`dashboard.md`](docs/api/dashboard.md) 的八节骨架：
+> 📌 **前端对接**：后端 API 参考见 [`docs/api/`](docs/api/)。**2026-10-11 现状**：`docs/api/` 有 11 份文件，每份是一个域的**整域契约**（端点表 / 逐字段 / 口径表 / 错误码 / 移除记录 / WS 关系 / 表依赖与前端配套 / 已知偏差登记），范本是 [`dashboard.md`](docs/api/dashboard.md) 的八节骨架：
 > - [`docs/api/dashboard.md`](docs/api/dashboard.md) —— 大屏聚合域（3 个只读 HTTP 端点 + WS 首帧 / 增量；`DELIVERY_STATUSES` 四处共用、行单位、装配件整套交付不变式、`ts` 格式、前端配套清单）
 > - [`docs/api/programming.md`](docs/api/programming.md) —— `prod::programming` 待编程一览（part 状态闸门 + 三规则并集、part 级去重、批次锚点、排序白名单大小写不对称）
 > - [`docs/api/inspection.md`](docs/api/inspection.md) —— `prod::inspection` 待品检（队列列表 + 扫码三层树、`l1_customer_name` 与返修侧有意分叉、域隔离漏报盲区）
@@ -13,6 +13,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 > - [`docs/api/delivery_note.md`](docs/api/delivery_note.md) —— `com::delivery_note` 送货单（17 端点；扫码三层树 + DP 批次分配 / 建单判定键单键 / 移除记录 29 条 VO 字段）
 > - [`docs/api/shelves.md`](docs/api/shelves.md) —— **iam 域下的货架子模块**（2026-10-10 自独立 shelf 域迁入 iam，URL 硬切 `/api/v2/shelves/*` → `/api/v2/iam/shelves/*`、旧前缀 404；5 端点、`t_shelf.capacity` 负载上限 + `ShelfOut.current_load` 出参、自动选架算法与 `shelf_scope_for` 三分支、picker 两端点移除记录）
 > - [`docs/api/iam.md`](docs/api/iam.md) —— `iam` 认证 + 账号 + 货架子模块域（**22 端点** = session 5 + users 12 + shelves 5；4 条破坏性变更（`DELETE wx-bind` → `POST .../unbind`、`GET wx-bind` 返 `Option`、bind 删 `corp_id`、4 端点 body 必填 `version`）、`t_wx_identity` 的双向一对一与 TOCTOU 偏差、`uk_t_user_role_user_role_scope` **非 partial**、角色/scope 变更滞后一个 session TTL）
+> - [`docs/api/wx.md`](docs/api/wx.md) —— `wx` 微信小程序 BFF 域（**2026-10-11 新建**；按小程序页面切子模块：`login/` + `part_list/`；URL 硬切无 alias 5 条（`/wx/iam/wx-login` → `/wx/login/wecom`、`/wx/parts/*` → `/wx/part-list/*`、`/wx/dashboard/home` 删除）、VO 逐字对齐前端卡片模型改 camelCase、4 类 tab 折叠的静默兜底、`deliveredQty` 真值、尾斜杠 404 实测钉死）
 >
 > **其它域的契约在代码注释里**（各域 `mod.rs` / `repo.rs` / `vo` / `dto` 的模块 doc 与逐字段 doc），本仓的目录约定见本文件「`docs/api/` 目录约定」一节。⚠️ **引用不存在的文档路径是禁止的** —— 后端代码变更（新增 / 修改 / 删除端点，或修改 DTO 字段 / 错误码）必须同步更新对应域的 `docs/api/` 文件（若该域有）与代码注释。
 

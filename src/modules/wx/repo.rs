@@ -1,309 +1,36 @@
-//! 微信小程序 BFF 模块 SQL 真源（2026-09-28 新增）
+//! 微信小程序 BFF 模块 SQL 真源 —— **B3 过渡期：只剩 batch / worker**
 //!
-//! 全部 SQL 在此文件集中声明（ZST `WxRepo` + 固有静态方法），service / handler
-//! 借 `&mut PgConnection` 调用即可。**不**抽 trait — 本模块端点全是「薄」只读
-//! 聚合（无业务规则分支、无 OCC、无乐观锁），trait 抽象带来的 mock 收益小于
-//! 维护成本（按 `prod/batch/repo/queries.rs` 2026-09-22 PR2 总结的取舍）。
+//! 2026-10-11 重构：本文件原先持有 4 组结构（`PartCounts` / `PartList` /
+//! `BatchCountsAgg` / `BatchList` / `DailyEventCounts` / `WorkerStats`），其中
+//! **part 相关的 4 组已随 `wx::part_list` 子模块搬走**：
+//!
+//! | 已搬走 | 新位置 |
+//! |---|---|
+//! | `PartCounts` | [`super::part_list::repo::PartListRepo::counts_by_status`] |
+//! | `PartList`（`list` / `count` / `by_serial`） | [`super::part_list::repo::PartListRepo::list_parts`] |
+//! | `WxPartRow` | [`super::part_list::model::PartListRow`] |
+//! | `map_counts_by_status` / `row_to_wx_part` | [`super::part_list::service`]（私有） |
+//! | `DailyEventCounts` | **删除**（唯一消费者是已整域删除的 `/wx/dashboard/home`） |
+//!
+//! ⚠️ **B3（2026-10-11 之后接手）会把本文件剩余内容整体搬进
+//! `wx::production::repo`**（配合 `/wx/batches/*` + `/wx/worker/*` →
+//! `/wx/production/*` 的 URL 硬切）。届时本文件连同 `vo.rs` 的 batch/worker 部分
+//! 一并删除，`wx/mod.rs` 里的两个 `nest` 换成
+//! `.nest("/production", production::router())`。
 //!
 //! ## 2026-10-10 移出：`t_wx_identity`
 //! 该表的 SQL 真源已搬到 `modules::iam::repo::sql::wx_identity` —— 它存的是
-//! 「企业微信 userid ↔ 本系统 `t_user.id`」的**账号映射**，属 iam 域的数据；本域
+//! 「企业微信 userid ↔ 本系统 `t_user.id`」的**账号映射**，属 iam 域的数据；wx 域
 //! 只是消费方（登录时反查绑定），通过 `AccountService::resolve_wx_login_user`
-//! 开口，故 `modules/wx/` 现在对 `t_wx_identity` 零 SQL。
+//! 开口，故 wx 域现在对 `t_wx_identity` 零 SQL。
 //!
 //! ## 命名
 //! - 函数名沿用 `count_xxx` / `list_xxx` / `find_xxx` 三段式
-//! - 返回类型用 `mod vo { ... }` 内的 DTO + 必需的 FromRow 中间结构（避免污染
-//!   `vo.rs` —— 中间结构无 `Serialize`）
+//! - 返回类型用 [`super::vo`] 内的 DTO + 必需的 `FromRow` 中间结构
 
 use sqlx::{PgConnection, PgExecutor};
 
-use super::vo::{BatchCounts, CountsByStatus, MonthlyStats, WxBatchSummary, WxPartSummary};
-
-// =============================================================================
-// Part 域聚合（counts / list / by-serial）
-// =============================================================================
-
-/// 工单计数 ZST（与 `prod/batch/repo/queries.rs::PartBatchRepo` 同形：SQL 真源 + 静态方法）。
-pub struct PartCounts;
-
-impl PartCounts {
-    /// mini-program `GET /wx/parts/counts` 与 `GET /wx/dashboard/home` 共用聚合：
-    /// 一次性 `GROUP BY status` 拉全部状态计数，由 caller 字段映射到 4 个 tab。
-    ///
-    /// 返回 `Vec<(status, count)>`：每个非 0 状态一行；caller 用 HashMap 解构填
-    /// `CountsByStatus { all, pending_production, ... }`（缺位补 0）。
-    pub async fn by_status<'e, E: PgExecutor<'e>>(
-        executor: E,
-    ) -> Result<Vec<(String, i64)>, sqlx::Error> {
-        let rows = sqlx::query!(
-            r#"
-            SELECT status AS "status!", COUNT(*) AS "cnt!"
-            FROM t_part
-            WHERE deleted_at IS NULL
-            GROUP BY status
-            "#,
-        )
-        .fetch_all(executor)
-        .await?;
-        Ok(rows.into_iter().map(|r| (r.status, r.cnt)).collect())
-    }
-}
-
-/// 把 `Vec<(status, count)>` 映射到 `CountsByStatus`（与 4 个 tab 对齐）。
-///
-/// 设计见 `vo::CountsByStatus` 字段级 doc。
-pub fn map_counts_by_status(rows: Vec<(String, i64)>) -> CountsByStatus {
-    let mut out = CountsByStatus {
-        all: 0,
-        pending_production: 0,
-        in_production: 0,
-        pending_inspection: 0,
-        delivered: 0,
-    };
-    for (s, c) in rows {
-        out.all += c;
-        match s.as_str() {
-            "PENDING" => out.pending_production += c,
-            "IN_PROCESS" => out.in_production += c,
-            "INSPECTION" => out.pending_inspection += c,
-            "READY_TO_SHIP" | "DELIVERED" => out.delivered += c,
-            // PROGRAMMING / OUTSOURCE / COMPLETED / CANCELLED 仅计入 all
-            //
-            // 2026-10-01：删掉 `REPAIRING`。REPAIRING 已从 `PartStatus` 降级为
-            // `t_part_batch.is_repairing` 标记列（migration 005/006），
-            // `t_part.status` 里不再出现该值（rollup 输出恒为 `IN_PROCESS`）。
-            // 返修中的工单**自动**由上面 `"IN_PROCESS"` 臂计入
-            // `in_production` —— 这正是期望口径：返修仍在生产中，与
-            // 「生产中」tab 同属用户视角下的在厂货，拆出去单列 tab 反而会
-            // 让「生产中」少算正在返修的量。
-            _ => {}
-        }
-    }
-    out
-}
-
-/// 工单列表 / by-serial 行（FromRow 中间结构；不带 Serialize — 不进 vo.rs）。
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct WxPartRow {
-    pub id: i64,
-    pub serial_no: Option<String>,
-    pub name: String,
-    pub drawing_no: String,
-    pub quantity: i32,
-    pub status: String,
-    pub is_urgent: bool,
-    pub planned_delivery_date: chrono::NaiveDate,
-    pub customer_id: i64,
-    pub customer_name: Option<String>,
-    /// 当前活跃批次（status != COMPLETED && != CANCELLED 的非软删批次；
-    /// 多个时取 batch_no ASC 第一个）。用于详情跳转。
-    pub current_batch_id: Option<i64>,
-    pub current_batch_no: Option<i32>,
-    pub current_holder_label: Option<String>,
-    pub assembly_id: Option<i64>,
-}
-
-pub struct PartList;
-
-impl PartList {
-    /// mini-program `GET /wx/parts?status=&page=&size=`：
-    ///
-    /// - status 过滤：可选 `PENDING` / `PROGRAMMING` / `IN_PROCESS` / `INSPECTION` /
-    ///   `READY_TO_SHIP` / `DELIVERED` / `OUTSOURCE` / `COMPLETED` /
-    ///   `CANCELLED`；None 或 `"all"` 返回全部非软删件。
-    ///   2026-10-01：删掉 `REPAIRING` —— REPAIRING 已降级为
-    ///   `t_part_batch.is_repairing` 标记列（migration 005/006），
-    ///   `t_part.status` 里不再出现该值；返修中的工单按 `IN_PROCESS` 过滤即可
-    ///   （注意：小程序端**没有**按 `is_repairing` 单独过滤的口径，返修态对
-    ///   用户可见性等价于生产中）。本 SQL 的过滤是 `$1::text` 直传（无白名单
-    ///   校验），传 `REPAIRING` 只会得到空列表而非报错。
-    /// - 排序：`is_urgent DESC, planned_delivery_date ASC, id ASC`（紧急 + 交期近
-    ///   优先）。注意这是**服务端硬编码**的「紧急件优先」，与 Web 端
-    ///   `GET /prod/inspection/queue` 的表头点列排序（`is_urgent` 不参与排序，
-    ///   由前端自行标红）口径不同。
-    /// - JOIN：`t_customer`（取客户名）+ 层级 LEFT JOIN `t_part_batch` / `t_shelf` /
-    ///   `t_worker` / `t_outsource_company` 解析当前 holder 标签。
-    /// - 一次聚合（无 N+1）：对每个 part 拿「当前活跃批次」（多批次时取 batch_no ASC
-    ///   第一条 active 批次；b.deleted_at IS NULL 且 status NOT IN ('COMPLETED',
-    ///   'CANCELLED')）；并 JOIN 解析 holder。
-    ///
-    /// 已知折中（holder 多态歧义：与 `prod::batch::repo::queries` /
-    /// `prod::batch::service::repair::list_batches_matching` /
-    /// `part::service::phase1::lifecycle_helpers::list_batches` 同形，
-    /// 见 `prod::batch::repo::mod` 模块 doc 的「holder 三表 COALESCE 的多态歧义」
-    /// 一节）：本处是 `COALESCE(sh.code, w.name, oc.name)` 变体，歧义时取
-    /// `t_shelf.code`（非 name）。mini-program 不强依赖此字段精确性，仅作展示。
-    #[allow(clippy::too_many_arguments)]
-    pub async fn list<'e, E: PgExecutor<'e>>(
-        executor: E,
-        status_filter: Option<&str>,
-        customer_id: Option<i64>,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<WxPartRow>, sqlx::Error> {
-        // status_filter 为 None 或 "all" → 视为不过滤
-        let effective_status: Option<&str> = match status_filter {
-            None => None,
-            Some(s) if s.eq_ignore_ascii_case("all") => None,
-            Some(s) => Some(s),
-        };
-        let rows = sqlx::query!(
-            r#"
-            SELECT
-                p.id              AS "id!",
-                p.serial_no       AS "serial_no?",
-                p.name            AS "name!",
-                p.drawing_no      AS "drawing_no!",
-                p.quantity        AS "quantity!",
-                p.status          AS "status!",
-                p.is_urgent       AS "is_urgent!",
-                p.planned_delivery_date AS "planned_delivery_date!",
-                p.customer_id     AS "customer_id!",
-                p.assembly_id     AS "assembly_id?",
-                c.name            AS "customer_name?",
-                cb.id             AS "cb_id?",
-                cb.batch_no       AS "cb_batch_no?",
-                COALESCE(sh.code, w.name, oc.name) AS "holder_label?"
-            FROM t_part p
-            LEFT JOIN t_customer c ON c.id = p.customer_id
-            LEFT JOIN LATERAL (
-                SELECT id, batch_no, current_holder_id, location
-                FROM t_part_batch pb
-                WHERE pb.part_id = p.id
-                  AND pb.deleted_at IS NULL
-                  AND pb.status NOT IN ('COMPLETED', 'CANCELLED')
-                ORDER BY pb.batch_no ASC
-                LIMIT 1
-            ) cb ON TRUE
-            LEFT JOIN t_shelf            sh ON sh.id = cb.current_holder_id
-            LEFT JOIN t_worker           w  ON w  .id = cb.current_holder_id
-            LEFT JOIN t_outsource_company oc ON oc.id = cb.current_holder_id
-            WHERE p.deleted_at IS NULL
-              AND ($1::text IS NULL OR p.status = $1::text)
-              AND ($2::bigint IS NULL OR p.customer_id = $2::bigint)
-            ORDER BY p.is_urgent DESC, p.planned_delivery_date ASC, p.id ASC
-            LIMIT $3 OFFSET $4
-            "#,
-            effective_status,
-            customer_id,
-            limit,
-            offset,
-        )
-        .fetch_all(executor)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| WxPartRow {
-                id: r.id,
-                serial_no: r.serial_no,
-                name: r.name,
-                drawing_no: r.drawing_no,
-                quantity: r.quantity,
-                status: r.status,
-                is_urgent: r.is_urgent,
-                planned_delivery_date: r.planned_delivery_date,
-                customer_id: r.customer_id,
-                customer_name: r.customer_name,
-                current_batch_id: r.cb_id,
-                current_batch_no: r.cb_batch_no,
-                current_holder_label: r.holder_label,
-                assembly_id: r.assembly_id,
-            })
-            .collect())
-    }
-
-    /// 配套 COUNT（与 `list` 同 WHERE）。
-    pub async fn count<'e, E: PgExecutor<'e>>(
-        executor: E,
-        status_filter: Option<&str>,
-        customer_id: Option<i64>,
-    ) -> Result<i64, sqlx::Error> {
-        let effective_status: Option<&str> = match status_filter {
-            None => None,
-            Some(s) if s.eq_ignore_ascii_case("all") => None,
-            Some(s) => Some(s),
-        };
-        let n: i64 = sqlx::query_scalar!(
-            r#"
-            SELECT COUNT(*) AS "n!"
-            FROM t_part p
-            WHERE p.deleted_at IS NULL
-              AND ($1::text IS NULL OR p.status = $1::text)
-              AND ($2::bigint IS NULL OR p.customer_id = $2::bigint)
-            "#,
-            effective_status,
-            customer_id,
-        )
-        .fetch_one(executor)
-        .await?;
-        Ok(n)
-    }
-
-    /// mini-program `GET /wx/parts/by-serial/{serial_no}`：扫码定位。
-    ///
-    /// 与 `part::repo::sql::part_sql.rs::get_by_serial` 同投影（完整 25 列 TPart +
-    /// 客户名 + 当前批次 id），但为 mini-program 收窄到 WxPartSummary 字段集。
-    /// 0 行 → `Ok(None)`，由 handler 转 `40400 NOT_FOUND`。
-    pub async fn by_serial<'e, E: PgExecutor<'e>>(
-        executor: E,
-        serial_no: &str,
-    ) -> Result<Option<WxPartRow>, sqlx::Error> {
-        let row = sqlx::query!(
-            r#"
-            SELECT
-                p.id              AS "id!",
-                p.serial_no       AS "serial_no?",
-                p.name            AS "name!",
-                p.drawing_no      AS "drawing_no!",
-                p.quantity        AS "quantity!",
-                p.status          AS "status!",
-                p.is_urgent       AS "is_urgent!",
-                p.planned_delivery_date AS "planned_delivery_date!",
-                p.customer_id     AS "customer_id!",
-                p.assembly_id     AS "assembly_id?",
-                c.name            AS "customer_name?",
-                cb.id             AS "cb_id?",
-                cb.batch_no       AS "cb_batch_no?",
-                COALESCE(sh.code, w.name, oc.name) AS "holder_label?"
-            FROM t_part p
-            LEFT JOIN t_customer c ON c.id = p.customer_id
-            LEFT JOIN LATERAL (
-                SELECT id, batch_no, current_holder_id, location
-                FROM t_part_batch pb
-                WHERE pb.part_id = p.id
-                  AND pb.deleted_at IS NULL
-                  AND pb.status NOT IN ('COMPLETED', 'CANCELLED')
-                ORDER BY pb.batch_no ASC
-                LIMIT 1
-            ) cb ON TRUE
-            LEFT JOIN t_shelf            sh ON sh.id = cb.current_holder_id
-            LEFT JOIN t_worker           w  ON w  .id = cb.current_holder_id
-            LEFT JOIN t_outsource_company oc ON oc.id = cb.current_holder_id
-            WHERE p.serial_no = $1 AND p.deleted_at IS NULL
-            "#,
-            serial_no,
-        )
-        .fetch_optional(executor)
-        .await?;
-        Ok(row.map(|r| WxPartRow {
-            id: r.id,
-            serial_no: r.serial_no,
-            name: r.name,
-            drawing_no: r.drawing_no,
-            quantity: r.quantity,
-            status: r.status,
-            is_urgent: r.is_urgent,
-            planned_delivery_date: r.planned_delivery_date,
-            customer_id: r.customer_id,
-            customer_name: r.customer_name,
-            current_batch_id: r.cb_id,
-            current_batch_no: r.cb_batch_no,
-            current_holder_label: r.holder_label,
-            assembly_id: r.assembly_id,
-        }))
-    }
-}
+use super::vo::{BatchCounts, MonthlyStats, WxBatchSummary};
 
 // =============================================================================
 // Batch 域聚合（counts / list）
@@ -539,35 +266,6 @@ impl BatchList {
 }
 
 // =============================================================================
-// 当日 PICKED / DELIVERED 计数（首页聚合）
-// =============================================================================
-
-pub struct DailyEventCounts;
-
-impl DailyEventCounts {
-    /// `GET /wx/dashboard/home` 用的今日统计：
-    /// - `today_picked` = 今日 `event_type='PICKED_UP'` 事件数（DB 实际词汇；
-    ///   spec 简写为 'PICKED'——这里按 DB 真值实现）
-    /// - `today_delivered` = 今日 `event_type='DELIVERED'` 事件数
-    ///
-    /// 一次 SQL 拉两个计数（CTE + FILTER），避免 2 次 round-trip。
-    pub async fn today<'e, E: PgExecutor<'e>>(executor: E) -> Result<(i64, i64), sqlx::Error> {
-        let row = sqlx::query!(
-            r#"
-            SELECT
-                COUNT(*) FILTER (WHERE event_type = 'PICKED_UP') AS "picked!",
-                COUNT(*) FILTER (WHERE event_type = 'DELIVERED') AS "delivered!"
-            FROM t_part_event
-            WHERE created_at::date = CURRENT_DATE
-            "#,
-        )
-        .fetch_one(executor)
-        .await?;
-        Ok((row.picked, row.delivered))
-    }
-}
-
-// =============================================================================
 // Worker 月度统计（`GET /wx/worker/stats?period=YYYY-MM`）
 // =============================================================================
 
@@ -615,35 +313,6 @@ impl WorkerStats {
 // =============================================================================
 // 行 → DTO 转换 helpers（pub(super)，供各 handler 复用）
 // =============================================================================
-
-pub(super) fn row_to_wx_part(row: WxPartRow) -> WxPartSummary {
-    use crate::modules::part::statemachine::PartStatus;
-    use crate::modules::wx::vo::WxPartKind;
-    // status string → enum（DB 已校验词表；to_status 失败用 PENDING 兜底以避免 panic）
-    let status = PartStatus::from_str(&row.status).unwrap_or(PartStatus::PENDING);
-    // kind 推断：assembly_id IS NULL → workOrder；非 NULL → batch
-    // （mini-program 视图层分组用；实际 DB 无 kind 列，按 assembly 归属推断）
-    let kind = if row.assembly_id.is_some() {
-        WxPartKind::Batch
-    } else {
-        WxPartKind::WorkOrder
-    };
-    WxPartSummary {
-        id: row.id,
-        serial_no: row.serial_no,
-        name: row.name,
-        drawing_no: row.drawing_no,
-        quantity: row.quantity,
-        status,
-        is_urgent: row.is_urgent,
-        planned_delivery_date: row.planned_delivery_date,
-        customer_name: row.customer_name,
-        current_batch_id: row.current_batch_id,
-        current_batch_no: row.current_batch_no,
-        current_holder_label: row.current_holder_label,
-        kind,
-    }
-}
 
 pub(super) fn row_to_wx_batch(row: WxBatchRow) -> WxBatchSummary {
     WxBatchSummary {
