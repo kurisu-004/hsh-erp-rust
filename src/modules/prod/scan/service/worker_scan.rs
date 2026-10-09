@@ -30,6 +30,13 @@
 //!   没有品检架」，语义仍是**无权**而不是「架不存在」）
 //! - 40901 `VERSION_CONFLICT` —— 乐观锁失败
 //!
+//! ## 部分数量（`WorkerScanRequest::quantity`，2026-10-11 新增）
+//! 缺省 = 整批，行为与该字段引入前逐字一致。`0 < quantity < batch.quantity` 时先拆批，
+//! 本次流转（放回 / 送检 / 链尾自动送检）作用在**拆出来的那一批**上，响应的
+//! `scan.batch_id` 返回它；余量继承 `current_holder_id` **留在工人手上**。
+//! 拆批的落点、TAIL 分支的处理与守卫依据见 [`resolve_operated_batch`] 与
+//! [`ScanService::worker_scan_event`] 的 doc。
+//!
 //! ## 2026-10-10 三处结构变化
 //!
 //! 1. **共享前置的 shelf 校验删除**：原来第 1 步（`event_type` 分支**之前**）无条件
@@ -49,9 +56,11 @@ use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::service::PartService;
 use crate::modules::part::statemachine::PartStatus;
+use crate::modules::prod::batch::repo::PartBatchRepo;
 use crate::modules::prod::scan::dto::{WorkerScanEvent, WorkerScanRequest};
-use crate::modules::prod::scan::vo::WorkerScanCoreOut;
+use crate::modules::prod::scan::vo::{WorkerScanCoreOut, WorkerScanSplitInfo};
 use crate::modules::prod::worker::repo::WorkerRepo;
+use crate::shared::batch::TPartBatch;
 use crate::shared::error::{AppError, code};
 
 use super::ScanService;
@@ -82,6 +91,33 @@ impl ScanService {
     /// `QueueService::refill_for_worker`（同事务）。这样 scan 与 refill 共享
     /// 一个原子事务（OM-6 决议），避免扫描放回 → refill 抢批中间被并发抢走
     /// 同批的竞争窗口。
+    ///
+    /// ## 部分数量（2026-10-11 新增）的落点
+    /// `req.quantity` 的解析与拆批集中在 [`resolve_operated_batch`]，两个分支各自
+    /// 在**链位置判定之后、任何批次写入之前**调它一次，此后该分支内所有批次写入与
+    /// 事件日志都改指它返回的那一批：
+    ///
+    /// - `RETURNED`：`resolve_chain_position` 先跑（链位置只由
+    ///   `current_process_id` / `current_process_step_id` 决定，拆批不写这两列 ⇒
+    ///   拆前拆后同解），**紧接**调 `resolve_operated_batch`，然后才判 TAIL。
+    ///   TAIL 那条 early-return 因此拿到的是**新批次**而不是源批次 —— 它调的是与
+    ///   `INSPECTED` 逐字同款的 `sent_to_inspection`，拿源批次去送检就等于把整批
+    ///   都送检，本次指定的数量被静默吞掉。
+    /// - `INSPECTED`：分支入口即调（该分支没有链位置判定）。
+    ///
+    /// 拆批后 `mark_batch_returned` / `mark_batch_inspected` 的守卫依然成立：
+    /// `split_batch_for_partial_pass` 走的 `INSERT ... SELECT` 继承源批次的
+    /// `location`（`'WORKER'`）与 `status`（`'IN_PROCESS'`），`version` 恒为 0，
+    /// 而两条写入口的 WHERE 分别是
+    /// `id=$1 AND version=$2 AND status='IN_PROCESS' AND location='WORKER'`
+    /// 与 `shared::batch::status` 的 `allowed_from = {PENDING, PROGRAMMING,
+    /// IN_PROCESS}` + `expected_version` ⇒ 逐条命中。
+    ///
+    /// **余量留在工人手上**：`INSERT ... SELECT` 继承 `current_holder_id`，
+    /// 源批次的 `location` / `current_holder_id` 一行不改，只是 `quantity` 被扣减。
+    /// 它继续满足 `GET /scan/held` 的行判据（`status='IN_PROCESS'` +
+    /// `location='WORKER'` + `current_holder_id = worker_id`），仍出现在报工台
+    /// 「已持有」列表里。
     ///
     /// `WorkerScanEvent` 是 unit enum（`Copy`），所以 `req` 按值传（caller 的
     /// DTO `req.clone()` 不再需要）。
@@ -157,6 +193,11 @@ impl ScanService {
         // 父装配件 id（仅当 INSPECTED 分支触发父 status 变更时 Some）；
         // RETURNED 分支 part.status 保持 IN_PROCESS，不挂 sync。
         let mut synced_assembly_id: Option<i64> = None;
+        // 2026-10-11：部分数量拆批后，「本次实际被处理的批次」可能不是工人手上
+        // 那一批（= 拆出来的新批次）。`out_batch` / `out_split` 由两个臂各自赋值，
+        // 供 match 之后的出参使用 —— 响应 `scan.batch_id` 取 `out_batch.id`。
+        let out_batch: TPartBatch;
+        let out_split: Option<WorkerScanSplitInfo>;
         match req.event_type {
             WorkerScanEvent::RETURNED => {
                 // 解析批次在链上的位置，决定「下一道工序」是自动推导还是前端显式指定。
@@ -187,33 +228,62 @@ impl ScanService {
                     &batch,
                 )
                 .await?;
+                // 2026-10-11：部分数量拆批。落点定在**链位置判定之后、任何批次写入
+                // 之前** —— 下面的 TAIL early-return 与 `mark_batch_returned` 都必须
+                // 作用在拆出来的那一批上。
+                //
+                // 链位置在拆前判定即可：`resolve_chain_position` 只按
+                // `current_process_id` / `current_process_step_id` 在链内定位，而拆批
+                // 的 `INSERT ... SELECT` 原样继承这两列、`UPDATE` 只动 `quantity`，
+                // 拆前拆后同解。
+                let (operated, operated_qty, split) = resolve_operated_batch(
+                    &mut repo,
+                    snowflake,
+                    &part,
+                    &batch,
+                    req.quantity,
+                    current,
+                )
+                .await?;
                 // ── 链尾自动送检（2026-10-10 新增）────────────────────────────
                 //
-                // 判据是 `is_pointer_consistent(&batch) && chain_state == "TAIL"` ——
+                // 判据是 `is_pointer_consistent(&batch) && chain_state == "TAIL"` —
                 // 与紧邻其下的 NEXT 分支**同款**地要求指针一致。缺了指针一致性这一半，
                 // 一个 step 指针已经漂移的批次（`current_process_step_id` 指向别的链
                 // / 已软删 / NULL）只要它恰好落进一条单 step 链的锚链里，就会被判成
                 // 「做完了」直接送检 —— 绕过了「非顺应 ⇒ 必须显式指定下一道工序」
                 // 这道闸门。而指针漂移的成因恰恰说明链信息已经不可信，此时最不该做
                 // 的是替工人断定「这批做完了」。
+                //
+                // 2026-10-11：判据仍读源批次的指针（`operated` 与 `batch` 的
+                // `current_process_step_id` 逐字相同），而送检对象是 `operated` ——
+                // 部分数量场景下送的是本次指定的那部分，余量留在工人手上等下一次扫。
                 if position.is_pointer_consistent(&batch)
                     && position.chain_state.as_deref() == Some("TAIL")
                 {
                     // 与 `INSPECTED` 分支**逐字同款**的写入路径（同一个
                     // `sent_to_inspection` helper），故状态机守卫、OCC、
                     // part/assembly 派生、事件日志都只有一份实现。
-                    synced_assembly_id =
-                        sent_to_inspection(&mut repo, snowflake, &part, &batch, &worker, current)
-                            .await?;
+                    synced_assembly_id = sent_to_inspection(
+                        &mut repo,
+                        snowflake,
+                        &part,
+                        &operated,
+                        operated_qty,
+                        &worker,
+                        current,
+                    )
+                    .await?;
                     event_type_str = "WORKER_SCAN_INSPECTED";
                     return Ok(WorkerScanCoreOut {
                         worker_id: worker.id,
                         part_id: part.id,
-                        batch_id: batch.id,
+                        batch_id: operated.id,
                         event_type: event_type_str.to_string(),
                         synced_assembly_id,
                         work_type_id,
                         badge_code: worker.badge_code.clone(),
+                        split,
                     });
                 }
                 let (next_pid, step_id_opt): (i64, Option<i64>) = if position
@@ -310,8 +380,8 @@ impl ScanService {
                 // 同样 500）另见 `prod/shelf_process/repo.rs::find_first_shelf_for_process`。
                 let n = repo
                     .mark_batch_returned(
-                        batch.id,
-                        batch.version,
+                        operated.id,
+                        operated.version,
                         // 形参语义未变：「服务端选出来的目标架」，2026-10-10 起不再
                         // 来自请求体。
                         shelf.id,
@@ -330,39 +400,189 @@ impl ScanService {
                 // 非终态 → min-progress 推不出 part 终态，`event_id` 传 `None`
                 // （归档事件分支不可达）。
                 PartService::sync_from_batch_change(&mut repo, part.id, current, None).await?;
+                // 2026-10-11：`batch_id` / `quantity` 都指向**本次实际处理的那一批**
+                // 与**本次实际放回的数量**（拆批场景 = 新批次 + 拆走量），余量的
+                // 去向由 `SPLIT` 事件留痕。
                 repo.insert_part_event(NewPartEvent {
                     id: snowflake.next_id(),
                     part_id: part.id,
                     event_type: "RETURNED_TO_SHELF",
                     from_status: Some("IN_PROCESS"),
                     to_status: Some("IN_PROCESS"),
-                    batch_id: Some(batch.id),
-                    quantity: Some(batch.quantity),
+                    batch_id: Some(operated.id),
+                    quantity: Some(operated_qty),
                     drawing_code: Some(&part.drawing_no),
                     badge_code: Some(&worker.badge_code),
                     note: None,
                     created_by: Some(current.id),
                 })
                 .await?;
+                out_batch = operated;
+                out_split = split;
                 event_type_str = "WORKER_SCAN_RETURNED";
             }
             WorkerScanEvent::INSPECTED => {
-                synced_assembly_id =
-                    sent_to_inspection(&mut repo, snowflake, &part, &batch, &worker, current)
-                        .await?;
+                // 2026-10-11：本分支没有链位置判定，拆批就落在分支入口 ——
+                // 必须在 `sent_to_inspection` 的选架 / 状态机守卫 / 状态翻转之前。
+                let (operated, operated_qty, split) = resolve_operated_batch(
+                    &mut repo,
+                    snowflake,
+                    &part,
+                    &batch,
+                    req.quantity,
+                    current,
+                )
+                .await?;
+                synced_assembly_id = sent_to_inspection(
+                    &mut repo,
+                    snowflake,
+                    &part,
+                    &operated,
+                    operated_qty,
+                    &worker,
+                    current,
+                )
+                .await?;
+                out_batch = operated;
+                out_split = split;
                 event_type_str = "WORKER_SCAN_INSPECTED";
             }
         }
         Ok(WorkerScanCoreOut {
             worker_id: worker.id,
             part_id: part.id,
-            batch_id: batch.id,
+            batch_id: out_batch.id,
             event_type: event_type_str.to_string(),
             synced_assembly_id,
             work_type_id,
             badge_code: worker.badge_code.clone(),
+            split: out_split,
         })
     }
+}
+
+/// 部分数量（`WorkerScanRequest::quantity`）的校验 + 自动拆批，返回
+/// **本次实际被处理的那一批**。
+///
+/// 2026-10-11 新增。两个调用点：`RETURNED` 臂（链位置判定之后、TAIL 判定之前）
+/// 与 `INSPECTED` 臂入口 —— 共同性质是「在调用方任何批次写入之前」。
+///
+/// 返回 `(operated_batch, operated_qty, split_info)`：
+/// - `None` / `>= batch.quantity` ⇒ `(源批次克隆, batch.quantity, None)`，**不拆批**。
+///   这是回归基线，行为与 `quantity` 入参引入前逐字一致；
+/// - `0 < q < batch.quantity` ⇒ `(拆出来的新批次, q, Some(...))`；
+/// - `<= 0` / `> batch.quantity` / 超出 i32 ⇒ `20111 BIZ_PART_BATCH_INVALID_QUANTITY`。
+///
+/// ⚠️ **`==` 合法、`>` 才非法**，与同域 `pick_up` 同款（`==` 是「显式整批」的写法）；
+/// 与 `POST /api/v2/batches/split` 的「必须严格小于」**不同** —— 那条端点里
+/// 「等于」是「白拆一次」，故判非法。
+///
+/// ## 拆批为什么用 `split_batch_for_partial_pass`
+/// 它的 `INSERT ... SELECT` 继承源批次的 `location` / `current_holder_id` /
+/// `current_process_id` / `current_process_step_id` / `is_repairing`，`status` 由
+/// 形参指定（本处传源批次 status = `IN_PROCESS`），`version` 恒 0。三条后续守卫
+/// 逐条依赖这些继承值：
+/// - `mark_batch_returned` 的 `WHERE id=$1 AND version=$2 AND status='IN_PROCESS'
+///   AND location='WORKER' AND deleted_at IS NULL` ⇒ `location` / `status` 继承、
+///   `version` = 0；
+/// - `mark_batch_inspected` 走 `shared::batch::status` 的 `allowed_from = {PENDING,
+///   PROGRAMMING, IN_PROCESS}` + `expected_version` ⇒ 同样命中。
+/// - `PartStatus::from_str(&operated.status)`（送检的状态机守卫）读继承来的 status。
+///
+/// ## 余量的去向
+/// 源批次的 `location` / `current_holder_id` / `status` / `current_process_id`
+/// **一行不改**，只有 `_split_batch_inner` 的 UPDATE 把 `quantity` 扣减、`version`
+/// +1（拆批 OCC 写）。`location='WORKER'` + `current_holder_id` 不变 ⇒ 余量继续
+/// 出现在报工台「已持有」列表，可被下一次扫（放回 / 送检）处理。
+///
+/// ## 为什么拆完再把新批次读回来
+/// `INSERT ... SELECT` 的产出行是「源行 + 4 处覆盖」，在内存里照着拼一个
+/// `TPartBatch` 就得把这 4 处逐条手工对齐（漏一处就是一个静默错值）。拆批是低频
+/// 路径，多一次 `find_batch_by_id` 换「读库拿真行」比维护拼装逻辑便宜。
+async fn resolve_operated_batch<R: PartRepoTrait>(
+    repo: &mut R,
+    snowflake: &SnowflakeIdGenerator,
+    part: &crate::modules::part::model::TPart,
+    source: &TPartBatch,
+    requested: Option<i64>,
+    current: &CurrentUser,
+) -> Result<(TPartBatch, i32, Option<WorkerScanSplitInfo>), AppError> {
+    let requested: Option<i32> = match requested {
+        None => None,
+        Some(raw) => {
+            let qty: i32 = raw.try_into().map_err(|_| {
+                AppError::biz(
+                    code::BIZ_PART_BATCH_INVALID_QUANTITY,
+                    "quantity 超出 i32 范围",
+                )
+            })?;
+            if qty <= 0 {
+                return Err(AppError::biz(
+                    code::BIZ_PART_BATCH_INVALID_QUANTITY,
+                    format!("quantity {qty} 必须 > 0"),
+                ));
+            }
+            if qty > source.quantity {
+                return Err(AppError::biz(
+                    code::BIZ_PART_BATCH_INVALID_QUANTITY,
+                    format!("quantity {qty} 超过 batch.quantity {}", source.quantity),
+                ));
+            }
+            Some(qty)
+        }
+    };
+    // 整批路径（含 `==`）：直接用源批次，不碰 DB。
+    let Some(qty) = requested.filter(|q| *q < source.quantity) else {
+        return Ok((source.clone(), source.quantity, None));
+    };
+    let new_batch_id = PartBatchRepo::split_batch_for_partial_pass(
+        repo.conn_mut(),
+        snowflake.next_id(),
+        source.id,
+        source.version,
+        source.part_id,
+        qty,
+        &source.status,
+        Some(current.id),
+    )
+    .await
+    .map_err(|e| match e {
+        // 源批次 version 已变 / 已软删（与 pick-up 路径同款翻译）
+        sqlx::Error::RowNotFound => AppError::biz(code::VERSION_CONFLICT, "batch 版本冲突"),
+        other => AppError::from(other),
+    })?;
+    // 拆批留痕：源批次数量被静默扣减，只留 RETURNED_TO_SHELF / SENT_TO_INSPECTION
+    // 事件的话，事后只看事件流就看不出「原来 10 件、为什么源批次只剩 6 件」。
+    // 与 pick-up 路径的 SPLIT 事件同形（part 维度、`batch_id` 指向新批次）。
+    repo.insert_part_event(NewPartEvent {
+        id: snowflake.next_id(),
+        part_id: part.id,
+        event_type: "SPLIT",
+        from_status: Some(&source.status),
+        to_status: Some(&source.status),
+        batch_id: Some(new_batch_id),
+        quantity: Some(qty),
+        drawing_code: Some(&part.drawing_no),
+        badge_code: None,
+        note: Some("报工台部分数量自动拆批"),
+        created_by: Some(current.id),
+    })
+    .await?;
+    let operated = repo.find_batch_by_id(new_batch_id).await?.ok_or_else(|| {
+        AppError::biz(
+            code::BIZ_PART_BATCH_NOT_FOUND,
+            format!("拆批后查不到新批次 {new_batch_id}"),
+        )
+    })?;
+    Ok((
+        operated,
+        qty,
+        Some(WorkerScanSplitInfo {
+            source_batch_id: source.id,
+            new_batch_id,
+            quantity: qty,
+        }),
+    ))
 }
 
 /// 「送检」的完整写入路径：`选品检架 → 状态机守卫 → mark_batch_inspected → 写事件`。
@@ -379,6 +599,13 @@ impl ScanService {
 /// 返回 `synced_assembly_id`（父装配件真变了才有值），供 handler 决定是否广播
 /// `ASSEMBLY_UPDATED`。
 ///
+/// ## 形参 `quantity`（2026-10-11 新增）
+/// 「本次**实际**送出检的数量」，由 caller 经 [`resolve_operated_batch`] 解析
+/// （整批 = `batch.quantity`、拆批 = 拆走量）。写事件日志时用它而**不是**
+/// `batch.quantity` —— 拆批场景下后者是拆走量、不是送检量，两者在整批路径下相等。
+/// `batch` 形参本身已经是**拆出来的那一批**，故 `batch_id` / OCC / 状态机守卫
+/// 天然指向正确目标。
+///
 /// ## 错误码
 /// - `40301 SHELF_MISMATCH`：当前账号 scope 内没有可用的 INSPECTION 货架
 /// - `20103 BIZ_INVALID_TRANSITION` / `20104 BIZ_INVALID_VALUE`：批次状态不允许送检
@@ -388,6 +615,7 @@ async fn sent_to_inspection<R: PartRepoTrait>(
     snowflake: &SnowflakeIdGenerator,
     part: &crate::modules::part::model::TPart,
     batch: &crate::shared::batch::TPartBatch,
+    quantity: i32,
     worker: &crate::modules::prod::worker::model::TWorker,
     current: &CurrentUser,
 ) -> Result<Option<i64>, AppError> {
@@ -434,7 +662,7 @@ async fn sent_to_inspection<R: PartRepoTrait>(
         from_status: Some("IN_PROCESS"),
         to_status: Some("INSPECTION"),
         batch_id: Some(batch.id),
-        quantity: Some(batch.quantity),
+        quantity: Some(quantity),
         drawing_code: Some(&part.drawing_no),
         badge_code: Some(&worker.badge_code),
         note: None,

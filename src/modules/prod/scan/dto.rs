@@ -7,6 +7,10 @@
 //! - `prod::batch::dto::{WorkerScanRequest, PickUpRequest}`
 //! - `prod::queue::dto::WorkerScanEvent`（历史遗留：它是 worker-scan 的入参枚举，
 //!   queue 只是当初收留了它；本轮按消费方归位）
+//!
+//! 2026-10-11：`WorkerScanRequest` 加 `quantity`（部分放回 / 部分送检）。它与同域
+//! `PickUpRequest::quantity` **共用同一个 wire 形态与同一套三种落法**（见各自字段
+//! doc），差别只有一处：worker-scan 的**余量留在工人手上**，pick-up 的余量留在原处。
 
 use serde::Deserialize;
 
@@ -99,6 +103,23 @@ pub struct WorkerScanRequest {
     pub next_process_id: Option<String>,
     #[serde(default)]
     pub batch_id: Option<String>,
+    /// 本次实际操作数量；缺省 = 整批。
+    ///
+    /// 2026-10-11 新增。线上形态是 **JSON 字符串**（`deserialize_i64_opt` 只吃
+    /// `str`），例如 `"quantity": "4"`；**发数字 → axum `Json` 提取器反序列化失败 →
+    /// HTTP 422 纯文本**，不进 `R<T>` 信封。字符串形态照同域 `PickUpRequest::quantity`
+    /// —— 报工台一次操作里两个「部分数量」入参保持同形，前端不必记两套写法。
+    ///
+    /// 三种落法（范围校验在 service 层，错误码 `20111`
+    /// `BIZ_PART_BATCH_INVALID_QUANTITY`）：
+    /// - `None` / `>= batch.quantity` → **整批**，行为与本字段引入前逐字一致
+    ///   （`==` 是「显式整批」的合法写法，语义与 `None` 等价）；
+    /// - `0 < quantity < batch.quantity` → 自动拆批：拆出来的那一批走本次流转
+    ///   （放回 / 送检 / 链尾自动送检），**余量继承 `current_holder_id` 留在工人
+    ///   手上**，继续出现在报工台「已持有」列表里；
+    /// - `<= 0` / `> batch.quantity` → `20111`。
+    #[serde(default, deserialize_with = "deserialize_i64_opt")]
+    pub quantity: Option<i64>,
 }
 
 /// `POST /api/v2/prod/scan/batches/{batch_id}/pick-up` 入参（手动 pick-up 兜底）。
