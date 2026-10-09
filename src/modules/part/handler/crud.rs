@@ -320,7 +320,10 @@ async fn read_single_file_field(
 
 /// `GET /api/v2/parts/{part_id}/events`
 ///
-/// 事件历史（按 created_at DESC）。
+/// 事件历史（按 `id` DESC，**不是** `created_at` DESC —— `t_part_event.id` 空间异质：
+/// 雪花 / migration 回填的连续密集块 / 未被 nextval 用过的序列，按 `created_at` 排会
+/// 在一堆 7 月事件里夹一条迁移执行时刻的「10-01」。完整取舍见
+/// `PartService::list_events` 的 SQL 注释与 `PartEventOut` 的 doc）。
 ///
 /// 2026-09-22 PR5：只读 list 端点改 `pool.acquire()`。
 pub async fn list_part_events(

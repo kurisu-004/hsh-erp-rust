@@ -458,8 +458,12 @@ pub trait PartRepoTrait: Send {
         include_deleted: bool,
     ) -> Result<Vec<TPart>, sqlx::Error>;
     /// 订单信息三态窄写（`order_no` / `system_delivery_date` / `note`），只服务
-    /// `POST /parts/batch-update-order-info`；不复用 `update_part`（单层 `Option`
-    /// 表达不了「显式清空」，改它会波及行内编辑链路）。
+    /// `POST /parts/batch-update-order-info`；**不复用** `update_part` +
+    /// `PartUpdate`：本方法三列**恒三态**（batch 端要区分「缺省 / 清空 / 设值」，
+    /// 日期列还要逐行解析、把非法文本降级为行级失败），而 `update_part` 是「通用
+    /// 表单全量提交」语义 —— 且 2026-10-10 起 `PartUpdate` 的同名列也已改成三态，
+    /// 两条路径的入参形态与失败语义不再重合。逐列语义与完整理由见
+    /// `sql::PartRepo::update_order_info`。
     async fn update_order_info<'a>(
         &mut self,
         part_id: i64,
