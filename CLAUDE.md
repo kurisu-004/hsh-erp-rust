@@ -169,6 +169,8 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 >
 > ⚠️ **两处顶层 nest 不计入本表**：`POST /api/v2/batches/split`（`prod::split_router()`）与 `/api/v2/outsource-queue/*`（`outsource::queue_router()`）—— 二者挂 `/api/v2` 顶层而非本表的 `/api/v2/prod/*`，见「路由声明规约」第 9 条的顶层 nest 登记。
 >
+> ⚠️ **2026-10-11 新增第 3 处**不计入本表的 nest：`POST /api/v2/prod/assemblies/{assembly_id}/force-complete`（`assembly::force_complete_router()`，1 条）。装配件**域本体**仍是核心实体、不进 prod（其 10 条 CRUD / 状态机端点仍在 `/api/v2/assemblies/*`，`modules::v2_router()` 顶层 nest，一行未动）；只有这条生产链路收口的逃生端点归 `/prod` 前缀，理由见 `src/modules/prod/mod.rs` 的模块 doc 与 `src/modules/assembly/mod.rs::force_complete_router`。**本处是首处挂在 `/api/v2/prod` 下的非 prod 子模块 nest**（另两处挂 `/api/v2` 顶层，见上一段）。因它不属于上表任一 prod 子模块，**不计入求和**。
+>
 > 求和演变：2026-10-08 `prod::worker_pool` 6 条 → `prod::queue` 9 条、`prod::batch` 27 条 → 23 条（两域间净移动 4 条，prod 域求和 62 → 61），同日在 `com` 聚合新增 `com::delivery_note` 子模块 17 条 ⇒ 61 + 17 = 78；2026-10-09 外协三端点合并为 `POST /api/v2/outsource-queue/move`（`outsource` 域）⇒ `prod::batch` 23 → 20（prod 域求和 61 → **58**），同日拆批 1 条提升为顶层共用端点（不计入本表）⇒ `prod::batch` 20 → 19（prod 域求和 **57**）⇒ 全表 **57 + 17 = 74**；2026-10-10 报工台 5 端点收拢进新建的 `prod::scan`：`prod::worker` 7 → 6、`prod::batch` 19 → 17、`part` 域两条 list 端点（不计入本表，part 无独立表）迁入 ⇒ `prod::scan` 5 条，prod 域求和 **57** → 55（−3）⇒ 全表 **55 + 17 = 72**。⚠️ 本表 12 行里含 `prod::scan` 的求和（76）与「prod 域求和 + com 域」的求和（72）是两个口径：前者按上表**列出的 12 个子模块**算（含 `com::delivery_note` 的 17 条、但不含 part / iam 各域），后者只算 prod 域自己的子模块。
 
 ### `src/modules/iam/*` 子模块清单（iam 域 = 认证 / 账号 / 货架实体）
@@ -200,7 +202,7 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
   - **元测试**：`shared::domain_guard::tests::*`（6 条，含「本域标识符非法必须 panic」与 raw string 字符串状态两组）。任一写法漏报、误报或探测器瞎了都会红。
 - `DELIVERY_STATUSES`（6 态，`repo/delivery.rs`）是「未交付」的**唯一**判据，逾期计数 / 面板 / 抽屉 / 柱状图 top+middle 四处共用；柱状图 bottom 层额外含 `DELIVERED`。**它与前端 `LAYERS[].statuses` 是人工同步关系，无编译期保障**，改一侧必须改另一侧。
 - ⚠️ **行单位**（2026-10-10）：逾期 = **工单级**；交期面板三桶 = **工单级**（装配件行**替换**其子件行，行内新增 `row_type` 标 PART / ASSEMBLY，装配件的 `quantity` 与 `delivered_quantity` 单位是**套**）；柱状图 / 抽屉 = **件级**（子件各算 1）。
-- ⚠️ **装配件整套交付不变式**（2026-10-10）：逾期 KPI 与面板 `upcoming` / `overdue` 两桶用**同一个** `NOT EXISTS(已交批次)` 谓词（逐字相同 ⇒ `overdue.total == overdue_count` 严格对数）；装配件的 `delivered_sets` 只是 `delivered_quantity` 这个**展示值**的算法、**不参与桶归属**，但在该不变式下与 `NOT EXISTS` 同解（推导见 `docs/api/dashboard.md` §4.4）——不要把其中任何一条当成漏判「修」掉。无装配件套数校验的写路径共 **3 条**（`POST /prod/batches/{batch_id}/deliver`、`POST /prod/batches/scan/deliver`、`POST /parts/{part_id}/force-complete`；后者强推的是 `COMPLETED` 而守卫把 `COMPLETED` 也算已交），排查 SQL 见 §4.4。
+- ⚠️ **装配件整套交付不变式**（2026-10-10）：逾期 KPI 与面板 `upcoming` / `overdue` 两桶用**同一个** `NOT EXISTS(已交批次)` 谓词（逐字相同 ⇒ `overdue.total == overdue_count` 严格对数）；装配件的 `delivered_sets` 只是 `delivered_quantity` 这个**展示值**的算法、**不参与桶归属**，但在该不变式下与 `NOT EXISTS` 同解（推导见 `docs/api/dashboard.md` §4.4）——不要把其中任何一条当成漏判「修」掉。无装配件套数校验的写路径共 **4 条**（`POST /prod/batches/{batch_id}/deliver`、`POST /prod/batches/scan/deliver`、`POST /parts/{part_id}/force-complete`、`POST /prod/assemblies/{assembly_id}/force-complete`；后两条强推的是 `COMPLETED` 而守卫把 `COMPLETED` 也算已交），排查 SQL 见 §4.4。
 - ⚠️ 与 `statistics::repo::sql::count_overdue_undelivered` **有意分叉**（planned 口径 + DELIVERED 事件兜底，服务生产统计页）——不要动它。⚠️ 那是**另一份 SQL**；dashboard 自己这份是 system 口径 + 已交量守卫，两者分叉点只在「交期列 + 事件兜底」两处。
 - 完整契约（含每字段 SQL 来源、移除记录、WS 事件集、前端配套改动清单、已知偏差登记）见 [`docs/api/dashboard.md`](docs/api/dashboard.md)。
 
@@ -271,6 +273,12 @@ t_assembly.status               ← 派生缓存
   ⚠️ 手工补调 `PartService::sync_from_batch_change` 是**反模式**：第二次派生必为
   `NoChange`，会把响应的 `synced_assembly_id` 吞成 `null`、连带 WS 的
   `ASSEMBLY_UPDATED` 永不发。
+  ⚠️ **例外（2026-10-11 新增）**：装配件级逃生写点
+  `force_complete_all_batches_for_assembly` **只写不派生** —— 批量 UPDATE 命中
+  0 行时派生循环一次都不跑，而该端点的语义是「整体判为已交」，终态改由
+  `AssemblyRepo::force_complete_children` / `force_complete_status` 两条显式写
+  承担。职责切分与返回值用法限制见该函数 doc，不要按上面「写必派生」的口径去
+  「修」它。
 - **CI 强制**：`cargo test --lib` 的
   `shared::batch::status::write_guard_tests::no_outside_file_writes_batch_status`
   扫全 `src/**/*.rs`，除 `src/shared/batch/status.rs` 外任何文件写
@@ -417,7 +425,7 @@ integration test binary 已重组为 **20 binary**（8 多文件 domain 子目�
 |---|---:|---|
 | `tests/com/{main,union_list,delivery_note_in_use}.rs` | 5 | `com`（送货单域 2026-10-08 平移进 com 容器时目录随之更名 `delivery` → `com`；`group` / `attach_batches` / `scan` 三个 sub-file 已随端点收敛删除）|
 | `tests/part/{main,create_serial_price,batch,crud,file,inspection_batches,lifecycle,list_enrichment,pickable_by_work_type,purchase_order_import,repair,rollup_recompute,serial,to_inspection,to_process,to_ship}.rs` | 12 | `part`（sub-file 穷举，`main.rs` 为 binary 入口。★ `purchase_order_import.rs` 2026-10-06 新增：采购订单 Excel 导入两端点 —— `match-by-excel-items` 分档匹配 + `batch-update-order-info` 三态回填 / skip）|
-| `tests/assembly/{main,api,files,files_list,by_part,children,create_serial_price,status_sync}.rs` | 3 | `assembly` |
+| `tests/assembly/{main,api,files,files_list,by_part,children,create_serial_price,force_complete,status_sync}.rs` | 3 | `assembly`（**2026-10-11** 新增 `force_complete.rs`：装配件级强制完成端点 `POST /prod/assemblies/{id}/force-complete`，含「子件非取消批次为 0 条」的边角回归）|
 | `tests/iam/{main,api,middleware,bootstrap_admin_seed,menu_seed,wx_bind,shelf,shelf_deactivate}.rs` | 2 | `iam`（**2026-10-09**：原 `redis-flush` 串行组已整体删除 —— Redis 隔离改由 key 前缀承担、触发该组的 `clean_redis`（FLUSHDB）已零调用方随函数删除、两个 binary 的并行度已恢复；删除理由留档在 `.config/nextest.toml` 的注释里。**2026-10-10**：`tests/shelf/` 整体并入本 binary，用例改名 `shelf.rs`（← `api.rs`，`api.rs` 同名冲突）/ `shelf_deactivate.rs`（← `deactivate.rs`），与货架子模块迁入 iam 域同批）|
 | `tests/statistics/{main,api,event_driven}.rs` | 2 | `statistics` |
 | `tests/production/{main,work_type,process,process_chain,worker,queue,queue_auto_allocate,queue_dispatch,queue_board,pending_programming,shelf_process,pickup,process_design,inspection}.rs` | 6 | `production`（按 `src/modules/prod/*` 对齐；`shelf_process.rs` 2026-10-02 自当时的 `tests/shelf/api.rs` 迁入；**`process_design.rs` 2026-10-05 新增**，★ 核心回归是「装配件子件可见」；**`inspection.rs` 2026-10-05 新增** 13 场景，★ 核心回归是「扫子件 → 返回整棵装配件树」；**2026-10-08** `worker_pool.rs` → `queue.rs`、`worker_pool_auto_allocate.rs` → `queue_auto_allocate.rs`、`batch.rs` → `queue_dispatch.rs`，并新增 `queue_board.rs`（队列板聚合 9 场景））|

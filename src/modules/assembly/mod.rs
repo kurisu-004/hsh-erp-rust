@@ -13,6 +13,14 @@
 //!   直接 `impl for &mut PgConnection`（与 iam 2026-09-22 删 `PgIamRepo` 同步）。
 //! - 原 `service.rs`（1088 行超 1000 行上限）拆为 `service/{mod, crud, lifecycle,
 //!   sync_from_part}.rs` 4 子模块。
+//!
+//! ## 路由归属
+//! - 域本体 10 条（CRUD / 状态机 / 文件 / 子件）挂 `/api/v2/assemblies/*`
+//!   （`modules::v2_router` 的顶层 nest，见本文件 [`router`]）。
+//! - 2026-10-11 新增 1 条生产链路逃生端点
+//!   `POST /api/v2/prod/assemblies/{assembly_id}/force-complete` 挂 `/api/v2/prod/*`
+//!   下（见 [`force_complete_router`]，由 `prod::router()` nest）。前缀并存是刻意的：
+//!   域本体不进 `/prod`，只有这条收口端点归生产链路。
 pub mod dto;
 pub mod handler;
 pub mod model;
@@ -27,4 +35,19 @@ use std::sync::Arc;
 
 pub fn router() -> Router<Arc<AppState>> {
     handler::router()
+}
+
+/// 装配件域的**生产链路逃生端点**子路由（不含公共前缀；由 `prod::router()` 桥接到
+/// `/prod/assemblies`）。
+///
+/// 2026-10-11 新增，当前只含 1 条：
+/// - `POST /{assembly_id}/force-complete` —— MANAGER 单角色强推装配件 + 全部子件 +
+///   全部非 CANCELLED 批次为 `COMPLETED`（绕状态机）。
+///
+/// 为什么单开一个工厂而不并进上面的 [`router`]：装配件域**本体**是核心实体，路由仍
+/// 挂在 `/api/v2/assemblies/*`（`modules::v2_router` 的顶层 nest，10 条一行未动）；
+/// 只有这条生产链路收口的逃生端点挂在 `/api/v2/prod/assemblies/*` 下 —— 与批次 /
+/// 队列动作同属「生产执行」语义。两个前缀并存是**刻意**的分歧，不是遗漏。
+pub fn force_complete_router() -> Router<Arc<AppState>> {
+    handler::force_complete_router()
 }

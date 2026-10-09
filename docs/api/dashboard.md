@@ -187,16 +187,18 @@ delivered_sets = MIN over c (per_set(c)) = LEAST(k, N) = k
 「部分已交 / 0 套」。只有把分桶挪回 Rust 按 `delivered_quantity > 0` 判定，才会退化成
 真正的「KPI 不计但面板有行」反向差 —— **不要那样改**。
 
-#### 无装配件套数校验的写路径共 3 条
+#### 无装配件套数校验的写路径共 4 条
 
-三条都经 `shared::batch::status` 写 `t_part_batch.status`、**都不看父装配件的套数**，
-故都能单独交子件：
+四条都经 `shared::batch::status` 写 `t_part_batch.status`、**都不看父装配件的套数**。
+前三条可**单独交一个子件**；第 4 条一次推**全部子件**，不会单独交，其残留破坏形态是
+「某个子件的非 CANCELLED 批次为 0 条」——见下表末行的说明：
 
 | # | 端点 | 落到哪个 status | 为什么构不成闸门 |
 |---|---|---|---|
 | 1 | `POST /api/v2/prod/batches/{batch_id}/deliver` | `DELIVERED` | `mark_batch_delivered` 只查 `allowed_from: &["READY_TO_SHIP"]` |
 | 2 | `POST /api/v2/prod/batches/scan/deliver` | `DELIVERED` | `scan_deliver_part` 只查 `part.status == READY_TO_SHIP` 就 `mark_batch_delivered`（司机扫码发货） |
 | 3 | `POST /api/v2/parts/{part_id}/force-complete` | **`COMPLETED`** | `force_complete_all_batches_for_part` 把该 part 全部非 CANCELLED 批次强推 `COMPLETED`（逃生通道，绕状态机与 OCC）；本守卫的 `status IN ('DELIVERED','COMPLETED')` 把 `COMPLETED` 也算已交 |
+| 4 | `POST /api/v2/prod/assemblies/{assembly_id}/force-complete` | **`COMPLETED`** | `force_complete_all_batches_for_assembly` 把该装配件**全部子件**的非 CANCELLED 批次强推 `COMPLETED`，随后 `force_complete_children` / `force_complete_status` 显式把子件与父装配件写成 `COMPLETED`（逃生通道，MANAGER 单角色；不查父装配件套数）。⚠️ 它**不会**单独交一个子件，残留的破坏形态是「某个子件的非 CANCELLED 批次为 0 条」（批次全 CANCELLED 或尚未拆批）：该子件仍是 0 套、兄弟子件却已交 ⇒ 本守卫的 `EXISTS` 命中、装配件落 `partial` 桶而 `delivered_sets` 为 0 |
 
 **不构成破坏路径的两条**：送货单路径经 `entry_max_sets` 闸门维持不变式；
 `POST /api/v2/prod/batches/{batch_id}/complete` 的 `allowed_from: &["DELIVERED"]` 要求批次
@@ -205,11 +207,12 @@ delivered_sets = MIN over c (per_set(c)) = LEAST(k, N) = k
 #### 存量违规数据的排查 SQL
 
 `t_part_batch.delivery_note_id` 是可靠的分界：**送货单 `pickup` 会原样保留**该列
-（`com::delivery_note::service::lifecycle.rs`），而上面 3 条写路径都落在
-`shared::batch::status` 上、分**两个入口** —— 路径 1 / 2 走单行的
+（`com::delivery_note::service::lifecycle.rs`），而上面 4 条写路径都落在
+`shared::batch::status` 上、分**三个入口** —— 路径 1 / 2 走单行的
 `apply_batch_status_change`（写 status / location / holder / process / is_repairing），
-路径 3 走批量的 `apply_bulk_batch_status_change_for_part`（只写 status / is_repairing
-与审计列）—— **两条 UPDATE 都不写 `delivery_note_id`**
+路径 3 走批量的 `apply_bulk_batch_status_change_for_part`、路径 4 走
+`force_complete_all_batches_for_assembly`（两者都只写 status / is_repairing 与审计列）
+—— **三条 UPDATE 都不写 `delivery_note_id`**
 ⇒「已交批次且 `delivery_note_id IS NULL`」= 经逐批端点交付。
 
 ```sql
@@ -315,9 +318,18 @@ ORDER BY c.assembly_id;
 - **`WsEvent::DashboardSnapshot` 已删**（零生产方）。`WsEvent` 现在只有 `DashboardEvent { kind, payload }` 一个变体。
 - **`kind` 事件集**（后端全量 `ws_hub.broadcast` 生产方）：
 
-  `ASSEMBLY_CANCELLED` / `ASSEMBLY_CREATED` / `ASSEMBLY_DELETED` / `ASSEMBLY_UPDATED` / `BATCH_TO_INSPECTION` / `BATCH_TO_SHIP` / `PART_BATCH_WITH_PDFS_CREATED` / `PART_COMPLETED` / `PART_DELIVERED` / `PART_SOFT_DELETED` / `PART_TO_INSPECTION` / `PART_TO_PROCESS` / `PART_TO_SHIP` / `ROLLUP_RECOMPUTED` / `WORKER_POOL_AUTO_ALLOCATE_DONE` / `WORKER_POOL_EMPTY` / `WORKER_POOL_MOVE_DONE` / `WORKER_POOL_REFILL_DONE` / `DELIVERY_NOTE_CREATED` / `DELIVERY_NOTE_PARTS_ADDED` / `DELIVERY_NOTE_SUBMITTED` / `DELIVERY_NOTE_PICKED_UP` / `DELIVERY_NOTE_SCAN_ADD` / `DELIVERY_NOTE_BATCHES_ATTACHED` / `DELIVERY_NOTE_DRIVER_SET`
+  `ASSEMBLY_CANCELLED` / `ASSEMBLY_CREATED` / `ASSEMBLY_DELETED` / `ASSEMBLY_FORCE_COMPLETED` / `ASSEMBLY_UPDATED` / `BATCH_TO_INSPECTION` / `BATCH_TO_SHIP` / `PART_BATCH_WITH_PDFS_CREATED` / `PART_COMPLETED` / `PART_DELIVERED` / `PART_FORCE_COMPLETED` / `PART_SOFT_DELETED` / `PART_TO_INSPECTION` / `PART_TO_PROCESS` / `PART_TO_SHIP` / `ROLLUP_RECOMPUTED` / `WORKER_POOL_AUTO_ALLOCATE_DONE` / `WORKER_POOL_EMPTY` / `WORKER_POOL_MOVE_DONE` / `WORKER_POOL_REFILL_DONE` / `DELIVERY_NOTE_CREATED` / `DELIVERY_NOTE_PARTS_ADDED` / `DELIVERY_NOTE_SUBMITTED` / `DELIVERY_NOTE_PICKED_UP` / `DELIVERY_NOTE_SCAN_ADD` / `DELIVERY_NOTE_BATCHES_ATTACHED` / `DELIVERY_NOTE_DRIVER_SET`
 
   前端 `AFFECTS_DASHBOARD` 白名单与之人工对应（关系是**子集**：并非每个 kind 都影响大屏）。
+
+  2026-10-11 补充（装配件级强制完成端点
+  `POST /api/v2/prod/assemblies/{assembly_id}/force-complete`）：
+  - **新增** `ASSEMBLY_FORCE_COMPLETED`（payload `{ assembly_id }`，字符串化雪花）——
+    装配件整体被判为已交；
+  - **新增** `PART_FORCE_COMPLETED`（payload `{ part_id }`，字符串化雪花）—— 每个
+    被改动的子件各发一条。⚠️ 该 kind 的**既有**生产方是零件级端点
+    `POST /api/v2/parts/{part_id}/force-complete`（2026-09-30 起就在发），此前本
+    清单漏登；本次补齐，装配件级端点复用同一个 kind 而非新造。
 
   2026-10-08 两条补充：
   - **新增** `DELIVERY_NOTE_DRIVER_SET`（`com::delivery_note` 的 `POST /{id}/driver`，指定送货司机）。
@@ -435,4 +447,4 @@ dashboard 是**只读跨域聚合域**——这是本仓既定 pattern（`statis
 | `partial` 桶是三桶里最贵的一条查询 | 它**无时间窗口**，而 `COUNT(*) OVER ()`（无分区、无窗内排序）必须物化**全量**匹配行才能求值 ⇒ 该查询必然扫「全部处于 6 态且有已交批次」的 part / assembly 并排全序，不像 `upcoming` / `overdue` 能借交期索引收敛范围。⚠️ 但那两桶**同样**要在各自窗口内全量物化（只是范围被交期谓词收窄），三桶都不是「取满 30 条就收工」 | 规格强制要求 `total` 不受 `LIMIT` 影响，本形态是该要求的直接代价。抽屉侧已有「行查询 + `SQL_DETAILS_COUNT_*` 计数查询」的形态可参考；**是否换形态留待数据量实证后再定，本轮不改实现** |
 | `upcoming.total` 可能远超 `items.length()` | 每桶上限 30，`total` 是匹配总数 | 设计如此（前端按「共 N 条」展示）。**唯一例外是 0 命中**：`COUNT(*) OVER ()` 在无行时无从求值，此时 `total` 为 `0` 而非 `null` |
 | 无子件装配件的 `delivered_quantity` 恒为 0 | 该装配件无论业务上是否已交付，都会被判成「一件没交过」⇒ 落 `upcoming` / `overdue` 桶而非 `partial` | 与逾期 KPI 的行为一致（`NOT EXISTS` 子件路径同样恒真），**刻意保持**。无子件装配件本身是数据问题，不是口径问题 |
-| 装配件行落在 `partial` 桶但 `delivered_quantity` 显示 0 套 | 只在**装配件整套交付不变式被破坏**时出现（典型形态：子件 A 交满、子件 B 一件没交）。桶归属看 `EXISTS`（命中），展示值看 min 公式（0 套） | 推导见 §4.4。不变式的 3 条破坏路径见 §4.4，送货单路径有闸门；存量违规用 §4.4 的排查 SQL 定位后人工清理。**代码侧不处理** |
+| 装配件行落在 `partial` 桶但 `delivered_quantity` 显示 0 套 | 只在**装配件整套交付不变式被破坏**时出现（典型形态：子件 A 交满、子件 B 一件没交）。桶归属看 `EXISTS`（命中），展示值看 min 公式（0 套） | 推导见 §4.4。不变式的 4 条破坏路径见 §4.4，送货单路径有闸门；存量违规用 §4.4 的排查 SQL 定位后人工清理。**代码侧不处理** |

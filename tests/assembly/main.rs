@@ -19,6 +19,10 @@
 //! ## 2026-10-05 新增 1 sub-file
 //! - create_serial_price.rs ← POST /assemblies 建单期序列号派发 + 子件金额
 //!   + multipart 字段名兼容
+//!
+//! ## 2026-10-11 新增 1 sub-file
+//! - force_complete.rs ← POST /prod/assemblies/{id}/force-complete（装配件级强制完成：
+//!   MANAGER 单角色守卫 + 三步写 + 「子件非取消批次为 0 条」的边角回归）
 
 #![allow(dead_code, clippy::await_holding_lock, unused_imports)]
 
@@ -28,4 +32,5 @@ mod children;
 mod create_serial_price;
 mod files;
 mod files_list;
+mod force_complete;
 mod status_sync;
