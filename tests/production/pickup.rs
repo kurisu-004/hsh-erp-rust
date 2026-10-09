@@ -1144,3 +1144,180 @@ async fn pick_up_missing_required_fields_still_422() {
         assert_eq!(version, 0);
     }
 }
+
+/// 场景 14（2026-10-10 新增）：`GET /parts/{id}/events` 补投影 `batch_no` /
+/// `worker_name` / `operator_name` / `operator_username` 四字段
+///
+/// 根因：`PartEventOut` 从没投影过这四列，前端零件详情页时间线卡一直在读一个
+/// 后端不返的键、`v-if` 静默不渲染。SQL 侧加了 3 个 `LEFT JOIN`，本用例钉住
+/// 「键存在」+「值正确」两层。
+///
+/// 选 pick-up 路径是因为它是**当前 Rust 写入点里唯一 100% 带 `created_by` 的一类**
+/// （`current.id`），不需要为了测试去手插事件就能验证 `t_user` 那条 JOIN。
+/// `worker_name` 反过来 —— 当前 Rust 的 INSERT 不写 `worker_id`，只有 2026-07~09
+/// 的 Python 时代事件有值，所以那条 JOIN 由**手插的历史形态事件**覆盖。
+#[tokio::test]
+async fn events_project_batch_no_worker_name_and_operator_name() {
+    let ctx = bootstrap().await;
+    let worker_id = insert_active_worker(&ctx.pool, ctx.fx.work_type_a_id).await;
+    let part_id = insert_part(&ctx.pool, 10).await;
+    let batch_id =
+        insert_part_batch(&ctx.pool, part_id, 10, "IN_PROCESS", Some(ctx.shelf_id())).await;
+
+    // 期望值从库里取，不写死字符串（fixture 用户名/姓名都可能随 fixture 调整）
+    let (operator_name, operator_username, operator_id): (String, String, i64) = sqlx::query_as(
+        "SELECT full_name, username, id FROM t_user \
+         WHERE username = $1 AND deleted_at IS NULL",
+    )
+    .bind(&ctx.fx.part_manager_username)
+    .fetch_one(&ctx.pool)
+    .await
+    .expect("fixture 的 part manager 应存在于 t_user");
+
+    // 走整批领取：PICKED_UP 事件挂在 batch_id 上、batch_no = 1
+    let (s, env) = send(
+        ctx.app.clone(),
+        json_request(
+            "POST",
+            &format!("/prod/scan/batches/{batch_id}/pick-up"),
+            Some(json!({
+                "version": 0,
+                "worker_id": worker_id.to_string(),
+                "shelf_id": ctx.shelf_id().to_string(),
+            })),
+            Some(&ctx.manager),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "整批领取应 200: {env}");
+
+    let (es, ev) = fetch_events(&ctx, part_id).await;
+    assert_eq!(es, StatusCode::OK, "list events: {ev}");
+    let picked = pick_event(&ev, "PICKED_UP");
+
+    // 键存在性：本次修复的本体。前端读的就是这四个键，少一个就退回「静默不渲染」
+    for key in [
+        "batch_no",
+        "worker_name",
+        "operator_name",
+        "operator_username",
+    ] {
+        assert!(
+            picked.get(key).is_some(),
+            "事件应带 {key} 键（可为 null，但键不能缺）: {picked}"
+        );
+    }
+
+    // operator_*：来自 LEFT JOIN t_user（u.full_name / u.username）
+    assert_eq!(
+        picked["created_by"],
+        operator_id.to_string(),
+        "前置条件：pick-up 写入点应传 Some(current.id): {picked}"
+    );
+    assert_eq!(
+        picked["operator_name"], operator_name,
+        "operator_name 应逐字等于 t_user.full_name: {picked}"
+    );
+    assert_eq!(
+        picked["operator_username"], operator_username,
+        "operator_username 应等于 t_user.username: {picked}"
+    );
+
+    // batch_no：**裸 JSON number**（工单内序号，不是雪花 id）⇒ 不能是 string
+    assert_eq!(picked["batch_id"], batch_id.to_string());
+    assert!(
+        picked["batch_no"].is_number(),
+        "batch_no 应是 JSON number 而非 string: {picked}"
+    );
+    assert_eq!(
+        picked["batch_no"], 1,
+        "本 part 的首个批次 batch_no = 1: {picked}"
+    );
+
+    // worker_name：当前 Rust 写入点不写 worker_id ⇒ 这条 PICKED_UP 恒为 null
+    // （只断言「键在且为 null」，不断言「永远为 null」—— 那是写侧的口径，不是读侧的）
+    assert!(
+        picked["worker_name"].is_null(),
+        "pick-up 写入点不写 worker_id，本条 worker_name 应为 null: {picked}"
+    );
+}
+
+/// 场景 14b（2026-10-10 新增）：`worker_name` 的 **LEFT JOIN 真的接上了**
+///
+/// 场景 14 只能证明「键存在」与「无 worker_id 时为 null」，证明不了 `w.name` 这条
+/// JOIN 有没有接对。本用例手插一条 **2026-07~09 Python 时代形态**的事件
+/// （`worker_id` 有值），断言 `worker_name` 逐字等于 `t_worker.name`。
+///
+/// ⚠️ 手插 `t_part_event` 时**不要**顺手给 `worker_id` 填到别的域的 fixture 行上：
+/// `tests/statistics` 有几条 fixture 依赖 `worker_id IS NOT NULL` 过滤，本用例用
+/// 独立插入的工人，与它们物理隔离。
+#[tokio::test]
+async fn events_resolve_worker_name_for_legacy_events_with_worker_id() {
+    use hsh_erp_rust::infra::clock::now_naive;
+
+    let ctx = bootstrap().await;
+    let part_id = insert_part(&ctx.pool, 3).await;
+    let batch_id =
+        insert_part_batch(&ctx.pool, part_id, 3, "IN_PROCESS", Some(ctx.shelf_id())).await;
+
+    // 独立插入的工人（不复用 insert_active_worker：那条固定叫 PICKUP-WORKER，
+    // 用固定名断言会被别的用例的期望值掩盖）
+    let legacy_worker_id = next_id();
+    let worker_name = format!("LEGACY-WORKER-{legacy_worker_id}");
+    sqlx::query(
+        "INSERT INTO t_worker (id, badge_code, name, is_active, version, created_at, updated_at) \
+         VALUES ($1, $2, $3, true, 0, $4, $4)",
+    )
+    .bind(legacy_worker_id)
+    .bind(format!("LEGACY-BG-{legacy_worker_id}"))
+    .bind(&worker_name)
+    .bind(now_naive())
+    .execute(&ctx.pool)
+    .await
+    .expect("insert t_worker（历史形态）");
+
+    // 历史形态事件：worker_id 有值 + created_by 为 NULL（老数据里 created_by 也有空的，
+    // 正好顺带验证 LEFT JOIN t_user 在 NULL 时退化成 null 而不是丢行）
+    let event_id = next_id();
+    sqlx::query(
+        "INSERT INTO t_part_event (id, part_id, worker_id, event_type, batch_id, quantity, \
+         created_at) VALUES ($1, $2, $3, 'LEGACY_PICKED_UP', $4, 3, $5)",
+    )
+    .bind(event_id)
+    .bind(part_id)
+    .bind(legacy_worker_id)
+    .bind(batch_id)
+    .bind(now_naive())
+    .execute(&ctx.pool)
+    .await
+    .expect("insert t_part_event（历史形态）");
+
+    let (es, ev) = fetch_events(&ctx, part_id).await;
+    assert_eq!(es, StatusCode::OK, "list events: {ev}");
+    let legacy = pick_event(&ev, "LEGACY_PICKED_UP");
+
+    assert_eq!(
+        legacy["worker_name"], worker_name,
+        "worker_name 应逐字等于 t_worker.name（LEFT JOIN t_worker 生效）: {ev}"
+    );
+    // batch_id 非空 ⇒ batch_no 必解析得到，且仍是裸 number
+    assert_eq!(legacy["batch_id"], batch_id.to_string());
+    assert!(
+        legacy["batch_no"].is_number(),
+        "batch_no 应是 JSON number: {legacy}"
+    );
+    assert_eq!(legacy["batch_no"], 1);
+    // created_by 为 NULL 时 LEFT JOIN 不能把整行丢掉
+    assert!(
+        legacy["created_by"].is_null(),
+        "created_by 本就为 null: {legacy}"
+    );
+    assert!(
+        legacy["operator_name"].is_null(),
+        "无 created_by ⇒ operator_name 为 null: {legacy}"
+    );
+    assert!(
+        legacy["operator_username"].is_null(),
+        "无 created_by ⇒ operator_username 为 null: {legacy}"
+    );
+}
