@@ -134,8 +134,10 @@ pub struct DispatchSuccessItem {
     ///   见 `repo/dispatch.rs::update_batch_dispatched` 的 doc 与
     ///   `docs/api/queue.md` §3.1）。
     ///
-    /// ⚠️ **不能落成 JSON number**（2026-10-10 补）：step id 是雪花 id，量级
-    /// 8.7×10¹⁷，远超 JS 的 `Number.MAX_SAFE_INTEGER`（2^53 ≈ 9.007×10¹⁵），
+    /// ⚠️ **不能落成 JSON number**（2026-10-10 补）：step id 是雪花 id，10¹⁷ 量级
+    /// （随 epoch 取不同值，生产默认 epoch 2025-01-01 约 2.3×10¹⁷、测试 epoch
+    /// 2020-01-01 约 9.0×10¹⁷，两者都远超 JS 的 `Number.MAX_SAFE_INTEGER`
+    /// （2^53 ≈ 9.0×10¹⁵），
     /// number 进 JS 即被舍入 —— 前端即便把 Zod 改成收 number，拿到的也是错值。
     /// f9f98886 把本字段从「恒 `null`」改成真实写入值时漏加了字符串化器，
     /// 现场表现为「批次已下发成功、车间却看到下发失败」（Zod 抛在 HTTP 200 之后）。
