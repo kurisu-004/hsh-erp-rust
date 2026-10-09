@@ -68,10 +68,13 @@
 - `work_type_id` / `worker_id` 走 `deserialize_i64`（**只接受 JSON 字符串**），
   发 JSON number → axum `QueryRejection` → **HTTP 400 纯文本，不进 `R<T>` 信封**。
   漏传 → 同样 400 纯文本（无 `#[serde(default)]`）。
-- body 里的两个数量 / 消歧入参（`WorkerScanRequest.batch_id` /
-  `WorkerScanRequest.quantity`、`PickUpRequest.shelf_id` /
-  `PickUpRequest.quantity`）走 `deserialize_i64_opt`，**同样只接受 JSON 字符串**；
-  发数字 → axum `JsonRejection` → **HTTP 422 纯文本**。
+- body 里的两个**数量**入参（`WorkerScanRequest.quantity` / `PickUpRequest.quantity`）
+  与 `PickUpRequest.shelf_id` 走 `deserialize_i64_opt`，**只接受 JSON 字符串**；发数字 →
+  axum `JsonRejection` → **HTTP 422 纯文本**。
+- ⚠️ `WorkerScanRequest.batch_id` **不走** `deserialize_i64_opt`：它是裸
+  `Option<String>`，只在 service 里 `str::parse`（`service/worker_scan.rs` 的
+  `find_worker_held_batch_for_part` 调用点）。它「发数字也得到 422」是 serde 对
+  `Option<String>` 的类型不匹配，**与前一条不是同一个机制**，别把它当同款先例照抄。
 - i64 雪花主键一律序列化为 JSON **string**，防 JS `Number` 精度截断。
 - 端点 1 的两个业务出口：工牌不存在 → `20201 BIZ_WORKER_NOT_FOUND`（**HTTP 404**）；
   存在但停用 → `20202 BIZ_WORKER_INACTIVE`（**HTTP 400**）。两者靠
@@ -234,7 +237,7 @@ $ grep -rno 'worker??\.\(id\|name\|badge_code\|work_type_id\|work_type_name\|id_
 | 请求 | 结果 | 批次变化 | 事件日志 | 响应 `scan.batch_id` |
 |---|---|---|---|---|
 | 缺省 / `null` | **整批** | 源批次直接流转，不拆 | `RETURNED_TO_SHELF` 或 `SENT_TO_INSPECTION`，`quantity` = `batch.quantity` | 源批次 |
-| `>= batch.quantity` | **整批**（`==` 是「显式整批」的合法写法） | 同上，不拆 | 同上 | 源批次 |
+| `== batch.quantity` | **整批**（`==` 是「显式整批」的合法写法） | 同上，不拆 | 同上 | 源批次 |
 | `0 < q < batch.quantity` | **部分** | 拆出 `quantity = q` 的新批次走本次流转；**源批次余量继承 `current_holder_id` 留在工人手上**（`location='WORKER'`、`current_holder_id` 不变，只是 `quantity` 被扣减、`version` +1） | `SPLIT`（`quantity = q`，`batch_id` = 新批次）+ 原事件（`quantity = q`，`batch_id` = 新批次） | **新批次** |
 | `<= 0` / `> batch.quantity` / 超出 i32 | 拒收 | **零写入**（事务回滚，不拆批） | 无 | — |
 
@@ -267,7 +270,8 @@ $ grep -rno 'worker??\.\(id\|name\|badge_code\|work_type_id\|work_type_name\|id_
 
 ### 2.5 `WorkerScanOut` / `WorkerScanCoreOut`（端点 4）
 
-JSON 形状逐字不变（本轮只改 URL 与归属）：
+JSON **形状**逐字不变（键集一字未动）；`scan.batch_id` 的**取值**语义见下表
+`scan.batch_id` 行与 §2.4.1：
 
 | 字段 | 类型 | 备注 |
 |---|---|---|
@@ -393,10 +397,15 @@ step 指针与「当前工序在链内的位置」是两个独立事实，而 wo
 | `POST /scan/batches/{id}/pick-up` | `PART_BATCH_SPLIT` | 部分领取（自动拆批） |
 
 - **事件名一字不改** —— dashboard 与队列页都在监听，改名会静默断链。
-- `PART_BATCH_SPLIT` **两条写路径共用**（worker-scan 部分放回 / 部分送检与 pick-up
-  部分领取），payload 字段名**逐字同形**：
+- 本域两条拆批写路径（worker-scan 部分放回 / 部分送检、pick-up 部分领取）共用
+  `PART_BATCH_SPLIT`，payload 字段名**逐字同形**：
   `{ part_id, new_batch_id, source_batch_id, quantity }`（雪花 id 为 JSON string，
   `quantity` 为裸 number）。
+- ⚠️ **同一事件名在本域外还有第三个产出方，payload 只有 2 个键**：顶层共用拆批端点
+  `POST /api/v2/batches/split`（`prod::batch` 域）发的是
+  `{ part_id, new_batch_id }`（见 `prod/batch/handler/lifecycle.rs::split_batch_by_body`）。
+  ⇒ 消费方**只能无条件依赖 `part_id` 与 `new_batch_id` 这两个键**，
+  `source_batch_id` / `quantity` 必须写成「缺失即不更新」而不是必填。
 - ⚠️ **worker-scan 这条必须发**：拆批把源批次 `quantity` 静默扣减、并新建了一个批次
   行，而余量**仍在工人手上**（不像 pick-up 那样留在架上），其它端的批次视图收不到
   这条事件就永远看不到「持有件变多了一件 / 源数量变了」。
@@ -425,7 +434,7 @@ HTTP 响应的 `refill.shelf_id` 同步。
 | `GET /scan/pickable` | **2** | 取行 + COUNT |
 | `GET /scan/held` | **2** | 取行 + COUNT |
 | `POST /scan/verify-badge` | 1 | 按 `badge_code` 反查 |
-| `POST /scan/worker-scan` | 多次 | 状态翻转 + 事件日志 + 选架 + 同事务 refill + 派生；**部分数量另加** 链位置解析 + 拆批 3 条（`max(batch_no)` / `INSERT ... SELECT` / 扣量 `UPDATE`）+ 新批次回读 1 条 + `SPLIT` 事件 1 条 |
+| `POST /scan/worker-scan` | 多次 | 状态翻转 + 事件日志 + 选架 + 同事务 refill + 派生。RETURNED 臂**无条件**先跑 1 条链位置解析（整批路径也跑）；`0 < q < batch.quantity` 的部分数量路径**再加** 5 条：拆批 3 条（`max(batch_no)` / `INSERT ... SELECT` / 扣量 `UPDATE`）+ `SPLIT` 事件 1 条 + 新批次回读 1 条 |
 | `POST /scan/batches/{id}/pick-up` | 多次 | 拆批（可选）+ 状态翻转 + 事件日志 |
 
 两条 list 端点都**不按行数重复查**：`pickable` 一次 SQL 把「工种→工序映射 → 架 →
@@ -534,19 +543,29 @@ SQL 里聚合，一处他域的 service / repo 都不 import（连 `PartRepoTrai
    原 `src/api/parts/__tests__/scan-list.contract.spec.ts` 是它的旧名）。
 7. **`worker-scan` 的成功文案必须按响应的 `event_type` 分支**（§4.1）—— 2026-10-10
    起这条从「链尾边缘场景」变成常规路径。
-8. **i64 字符串化**：所有雪花 id 仍是 JSON string，本轮不改变该约定。
+8. **i64 字符串化**：所有雪花 id 一律序列化为 JSON string（query / body 的入参侧对应
+   「只吃字符串」，见 §1 的 deserializer 口径）。
 9. **部分数量（2026-10-11 新增）**：
    - 请求侧放回页 / 送检页各加一个数量输入，**发 JSON 字符串**（`"quantity": "4"`），
      不发数字（否则 422 纯文本）；缺省不传该键即整批，**老客户端零改动照常工作**。
+   - ⚠️ **部署顺序：后端必须先上**（与第 1 条的 URL 硬切同一个理由，但这条**不报错**）：
+     老服务端不认识 `quantity` 这个键，而本仓生产代码零 `deny_unknown_fields`
+     ⇒ 键被 serde 静默忽略 ⇒ 请求 200、**整批**流转。现场表现是「工人填了 4 件、
+     整批放回了 10 件」，零错误零告警。URL 硬切至少炸在 404 / 405（§1.2 实跑形态），
+     这条炸在**静默**，所以发布单上要单独钉一句，别只写「后端先上」就以为都覆盖了。
    - 响应侧 `scan.batch_id` 现在是「本次实际被处理的那一批」。**不要**再拿请求里
      扫到的 `batch_id` 去回显 / 去推后继动作 —— 拆批场景下它指向余量（仍在工人手上）。
-   - 成功后的列表刷新：余量批次仍在 `GET /scan/held` 里，拆出来的那批已不在 ⇒
-     「已持有」列表**行数不变**、数量变小；放回 / 送检两页都必须重拉列表，不能只
-     假定「扫掉一行」。
-   - `PART_BATCH_SPLIT` WS 事件与 pick-up 共用，payload 字段名同形
-     （§4）—— 若前端已有该事件的处理函数，worker-scan 这条**零改动**即生效。
-   - 非法数量回 `20111`（HTTP 400）+ 信封 `{ code, message, data: null }`，按既有
-     错误提示路径展示即可。
+   - 成功后的列表刷新：余量批次仍在 `GET /scan/held` 里、拆出来的那批已不在 ⇒ 被处理的
+     那一行是**数量变小**而不是消失；行数**不减**（同事务 refill 抢到料时会 **+N** 行，
+     refill 结果见 [`queue.md`](queue.md) §3 与本响应 `refill` 段）。⇒ 放回 / 送检两页
+     都必须重拉列表，不能只假定「扫掉一行」，也不能按「行数不变」做乐观更新。
+   - `PART_BATCH_SPLIT` WS 事件与 pick-up 共用，payload 字段名同形（§4）；⚠️ 顶层
+     `POST /api/v2/batches/split` 发的同事件只有 2 个键，消费方只能无条件依赖
+     `part_id` / `new_batch_id`。已有该事件的处理函数时，worker-scan 这条**零改动**即生效。
+   - ⚠️ **两种失败形态不同源，别用一个 catch 兜**：数量非法（`<= 0` / `> batch.quantity`）
+     是业务信封 `20111`（**HTTP 400**，`{ code, message, data: null }`）；
+     发数字则是 axum `JsonRejection` 的 **HTTP 422 纯文本**，**不进信封**
+     ⇒ 前者走既有 `code != 0` 的错误提示路径，后者得单独处理（否则只会拿到一句裸 422）。
 
 ## 8. 已知偏差登记
 
@@ -573,16 +592,17 @@ doc 写明「恒 null / NONE / "0" / false」。它们在那些 part 级行上�
 **`WorkerScanEvent` 的归属搬迁**
 
 它原先住在 `prod::queue::dto` —— 它是 worker-scan 的**入参枚举**，queue 只是当初收留
-了它（2026-09-30 拆 `MoveLocation` 时与下发流入参混在同一文件）。本轮按**消费方**
-归位到 `prod::scan::dto`，queue 侧删除。域归属按消费方判定，与「谁先写出来」无关。
+了它（2026-09-30 拆 `MoveLocation` 时与下发流入参混在同一文件）。现按**消费方**
+归位到 `prod::scan::dto`，queue 侧已删除。域归属按消费方判定，与「谁先写出来」无关。
 
 ---
 
 **`list_by_work_type`（`GET /parts/by-work-type/{id}`）留在 part 域**
 
 它是 part 域 list 族里唯一的「按工种列工人持有件」读端点，**零前端消费方**但有集成
-测试覆盖其 part 侧投影，故未随本轮迁走。它的取行投影已从共用 struct 拆成独立的
-`WorkTypeByWorkTypeRow`（只含它自己 SELECT 的 8 列），不再与报工台的行投影共享代码。
+测试覆盖其 part 侧投影，故未随报工台那两条 list 端点一起迁走。它的取行投影已从共用
+struct 拆成独立的 `WorkTypeByWorkTypeRow`（只含它自己 SELECT 的 8 列），不再与报工台
+的行投影共享代码。
 `?shelf_id=` 入参同步删除（该端点列的是**工人手上**的件而非架上的候选池，shelf
 过滤对它没有语义）。
 
@@ -612,3 +632,21 @@ doc 写明「恒 null / NONE / "0" / false」。它们在那些 part 级行上�
 `listing/` 那两块纯只读聚合单独装护栏。护栏为什么按**目录路径前缀**扫、被扫的代码
 必须自成一个目录：这条规则要可被 CI 执行，被扫代码就得是一个能被 `read_dir` 圈出来
 的目录。圈出可守的部分比整域不守要强。
+
+---
+
+**`PART_BATCH_SPLIT` 广播无集成断言（两条拆批写路径皆然）**
+
+本域两个会拆批的写路径（`worker-scan` 的部分放回 / 部分送检、`pick-up` 的部分领取）
+在 commit 之后都会补发 `PART_BATCH_SPLIT`（§4），但**两条都没有集成测试断言这条广播**：
+`tests/production/scan_worker_scan.rs` 与 `tests/production/pickup.rs` 断言的是 HTTP
+响应、库里 `t_part_batch` 的行形态与 `t_part_event` 的事件日志（`SPLIT` 的 `quantity`
+与 `batch_id` 都钉了），**`ws_hub` / `WsEvent` 完全不在断言面内**。
+
+后果：广播的**事件名或 payload 键名被改错不会让任何测试变红** —— 被测的那条
+`t_part_event` 的 `SPLIT` 记录与 WS 广播是两次独立的写入，前者对不后者。事件名对
+dashboard 与队列页是硬契约（改名会静默断链），而 `kind` 在后端是裸 `String`、无枚举
+保护（`src/infra/ws_hub.rs` 的 `WsEvent::DashboardEvent { kind: String, … }`），
+两侧都没有编译期约束兜底。
+
+改这两个端点的广播时，除了跑一遍端到端手动联调，别依赖现有测试给你兜底。
