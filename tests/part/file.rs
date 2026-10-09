@@ -9,7 +9,10 @@
 //!   6. list_filter_by_kind                    — 仅返回 DRAWING
 //!   7. get_url_returns_presigned_url          — 详情 + 预签 URL
 //!   8. list_includes_paired_file_id           — 列表项投影 paired_file_id（2026-09-16 补）
-//!
+//!   9. rbac_shelf_account_can_list_files — 工控机账号能列文件（2026-10-10 放开）
+//!  10. rbac_shelf_account_can_get_file_content — 工控机账号能读内容（2026-10-10 放开）
+//!  11. rbac_shelf_account_get_file_url_still_forbidden — 预签直链**不**放开给工控机
+//!  12. rbac_shelf_account_cannot_upload_or_delete — 只放开只读，写路径仍拒//!
 //! ## 集成策略
 //! 不启 axum（避免 JWT/Redis 开销），直接 service 直调；`pool.begin()` 开 tx →
 //! 传 `&mut *tx` 给 service → 显式 `tx.commit()`。
@@ -917,4 +920,229 @@ async fn read_fallback_to_legacy_key_test() {
         resolved_direct, new_key,
         "新模板 key 直接命中，无需 fallback"
     );
+}
+
+// ===== 2026-10-10 新增：工控机账号（SHELF_ACCOUNT）的图纸只读权限 =====
+//
+// 背景：报工台（前端路由 `/scan/*`）的路由守卫就是 `SHELF_ACCOUNT` —— 车间工控机
+// 用的就是这个角色账号，它的图纸预览要打本域的**列表** `GET /api/v2/part-files` 与
+// **内容** `GET /api/v2/part-files/{id}/content`。这两条原本只放 4 角色
+// （Manager / Clerk / Inspector / CncProgrammer）⇒ 工控机点预览必然 40300。
+//
+// 角色矩阵的决策与理由见 `src/modules/part_file/mod.rs` 模块 doc。关键一条：
+// **`GET /part-files/{id}/url` 刻意不给 SHELF_ACCOUNT** —— 它回 COS 预签直链
+// （1 小时有效、拿到即可脱离本后端直接 GET），而 `content` 是后端代理、每次过 RBAC。
+//
+// ⚠️ 已知安全面（产品已拍板的取舍）：owner 是多态的（PART / ASSEMBLY）+ 客户端可
+// 任意指定 `owner_id`，放开后 SHELF_ACCOUNT 能拉任意 `owner_id` 的文件，没有货架 /
+// 工单级收窄。本域的权限模型止步于角色，不含 `CurrentUser.shelf_ids` 那一层。
+//
+// 下面的 `CurrentUser` 用 `test_current_user_with_roles` 造（`shelf_ids: vec![]`、
+// `shelf_wildcard: false`）：本域的白名单是**纯角色判定**（`require_any_role`），
+// 不读货架范围字段，故无需造带 scope 的真实工控机账号。
+
+/// SHELF_ACCOUNT 能列文件（报工台预览的前置拉取）。
+#[tokio::test]
+async fn rbac_shelf_account_can_list_files() {
+    let pool = setup().await;
+    let l1 = insert_l1_customer(&pool, "客户PF-ShelfList", "F").await;
+    let l2 = insert_l2_customer(&pool, "子客PF-ShelfList", l1).await;
+    let part_id = insert_part_for_owner(&pool, l2).await;
+
+    let cos = Arc::new(NoopCos);
+    // 先由 MANAGER 造一个 DRAWING（写路径对 SHELF_ACCOUNT 仍是拒的，见下方用例）
+    let mut tx = pool.begin().await.unwrap();
+    PartFileService::new(shared_test_snowflake().clone(), cos.clone())
+        .upload_file_for_owner(
+            &mut *tx,
+            "PART",
+            part_id,
+            "DRAWING",
+            "shelf.pdf",
+            "application/pdf",
+            b"%PDF-1.5\nshelf\n%%EOF".to_vec(),
+            &test_current_user_with_roles(vec![Role::Manager]),
+        )
+        .await
+        .expect("MANAGER 上传应成功");
+    tx.commit().await.unwrap();
+
+    let shelf_account = test_current_user_with_roles(vec![Role::ShelfAccount]);
+    let query = hsh_erp_rust::modules::part_file::dto::PartFileListQuery {
+        owner_kind: Some("PART".into()),
+        owner_id: Some(part_id.to_string()),
+        kind: Some("DRAWING".into()),
+        limit: Some(50),
+        offset: Some(0),
+    };
+    let mut tx = pool.begin().await.unwrap();
+    let out = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
+        .list_files(&mut *tx, &query, &shelf_account)
+        .await
+        .expect("SHELF_ACCOUNT 应能列文件（2026-10-10 放开）");
+    drop(tx);
+
+    assert_eq!(out.items.len(), 1, "应看到那条 DRAWING");
+    assert_eq!(out.items[0].kind, "DRAWING");
+    assert_eq!(out.total, 1);
+}
+
+/// SHELF_ACCOUNT 能读文件内容（报工台预览的实际取字节动作）。
+#[tokio::test]
+async fn rbac_shelf_account_can_get_file_content() {
+    let pool = setup().await;
+    let l1 = insert_l1_customer(&pool, "客户PF-ShelfContent", "F").await;
+    let l2 = insert_l2_customer(&pool, "子客PF-ShelfContent", l1).await;
+    let part_id = insert_part_for_owner(&pool, l2).await;
+
+    let cos = Arc::new(NoopCos);
+    let mut tx = pool.begin().await.unwrap();
+    let uploaded = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
+        .upload_file_for_owner(
+            &mut *tx,
+            "PART",
+            part_id,
+            "DRAWING",
+            "shelf-content.pdf",
+            "application/pdf",
+            b"%PDF-1.5\nshelf\n%%EOF".to_vec(),
+            &test_current_user_with_roles(vec![Role::Manager]),
+        )
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let shelf_account = test_current_user_with_roles(vec![Role::ShelfAccount]);
+    let mut tx = pool.begin().await.unwrap();
+    let content = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
+        .get_file_content(
+            &mut *tx,
+            cos.clone(),
+            UPLOAD_UPLOAD_PREFIX,
+            uploaded.id,
+            &shelf_account,
+        )
+        .await
+        .expect("SHELF_ACCOUNT 应能读内容（2026-10-10 放开）");
+    drop(tx);
+
+    assert_eq!(
+        content.content_type.as_deref(),
+        Some("application/pdf"),
+        "content_type 透传"
+    );
+    // NoopCos.get_object 返回空字节（本用例只守 RBAC 放行 + content_type 透传）
+    assert!(content.bytes.is_empty(), "NoopCos 不返真实字节");
+}
+
+/// SHELF_ACCOUNT 调 `/part-files/{id}/url` **仍被拒**：COS 预签直链不在放开范围。
+#[tokio::test]
+async fn rbac_shelf_account_get_file_url_still_forbidden() {
+    let pool = setup().await;
+    let l1 = insert_l1_customer(&pool, "客户PF-ShelfURL", "F").await;
+    let l2 = insert_l2_customer(&pool, "子客PF-ShelfURL", l1).await;
+    let part_id = insert_part_for_owner(&pool, l2).await;
+
+    let cos = Arc::new(NoopCos);
+    let mut tx = pool.begin().await.unwrap();
+    let uploaded = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
+        .upload_file_for_owner(
+            &mut *tx,
+            "PART",
+            part_id,
+            "DRAWING",
+            "shelf-url.pdf",
+            "application/pdf",
+            b"%PDF-1.5\n".to_vec(),
+            &test_current_user_with_roles(vec![Role::Manager]),
+        )
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let shelf_account = test_current_user_with_roles(vec![Role::ShelfAccount]);
+    let mut tx = pool.begin().await.unwrap();
+    let err = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
+        .get_file_with_url(
+            &mut *tx,
+            cos.clone(),
+            UPLOAD_UPLOAD_PREFIX,
+            uploaded.id,
+            &shelf_account,
+        )
+        .await
+        .expect_err("预签直链不放开给 SHELF_ACCOUNT");
+    drop(tx);
+
+    match err {
+        AppError::Biz { code, .. } => assert_eq!(
+            code, 40300,
+            "FORBIDDEN：`/url` 回的是 1 小时有效的 COS 直链，拿到即可脱离本后端访问"
+        ),
+        other => panic!("期望 AppError::Biz(40300)，got {other:?}"),
+    }
+}
+
+/// SHELF_ACCOUNT 对**写路径**仍被拒：上传 + 软删。
+///
+/// 这是「只放开只读」这条边界的守门用例 —— 有人日后往白名单里加 ShelfAccount 时，
+/// 写端点若被顺手一起放开，本用例当场红。
+#[tokio::test]
+async fn rbac_shelf_account_cannot_upload_or_delete() {
+    let pool = setup().await;
+    let l1 = insert_l1_customer(&pool, "客户PF-ShelfWrite", "F").await;
+    let l2 = insert_l2_customer(&pool, "子客PF-ShelfWrite", l1).await;
+    let part_id = insert_part_for_owner(&pool, l2).await;
+
+    let cos = Arc::new(NoopCos);
+    let shelf_account = test_current_user_with_roles(vec![Role::ShelfAccount]);
+
+    // 上传：40300
+    let mut tx = pool.begin().await.unwrap();
+    let up_err = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
+        .upload_file_for_owner(
+            &mut *tx,
+            "PART",
+            part_id,
+            "DRAWING",
+            "shelf-write.pdf",
+            "application/pdf",
+            b"%PDF-1.5\n".to_vec(),
+            &shelf_account,
+        )
+        .await
+        .expect_err("SHELF_ACCOUNT 无上传权限");
+    drop(tx);
+    match up_err {
+        AppError::Biz { code, .. } => assert_eq!(code, 40300, "上传：FORBIDDEN"),
+        other => panic!("上传：期望 AppError::Biz(40300)，got {other:?}"),
+    }
+
+    // 软删：先由 MANAGER 造一个 DRAWING，SHELF_ACCOUNT 去删应 40300
+    let mut tx = pool.begin().await.unwrap();
+    let uploaded = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
+        .upload_file_for_owner(
+            &mut *tx,
+            "PART",
+            part_id,
+            "DRAWING",
+            "shelf-write.pdf",
+            "application/pdf",
+            b"%PDF-1.5\n".to_vec(),
+            &test_current_user_with_roles(vec![Role::Manager]),
+        )
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let mut tx = pool.begin().await.unwrap();
+    let del_err = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
+        .soft_delete_file(&mut *tx, uploaded.id, 0, &shelf_account)
+        .await
+        .expect_err("SHELF_ACCOUNT 无软删权限");
+    drop(tx);
+    match del_err {
+        AppError::Biz { code, .. } => assert_eq!(code, 40300, "软删：FORBIDDEN"),
+        other => panic!("软删：期望 AppError::Biz(40300)，got {other:?}"),
+    }
 }
