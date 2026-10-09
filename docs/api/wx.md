@@ -292,7 +292,7 @@ size` 这个公式，而新算法是「取 `size + 1` 条判超」（见 §3.4�
 |---|---|---|
 | `worker` | object \| **null** | `WorkerOut`；`t_user.worker_id` 未绑定时是 `null`（见 §8.7） |
 | `stats` | object | `WorkerStatsOut`，**按绑定工人**过滤（见 §9） |
-| `counts` | object | `BatchCountsOut`，**全局口径**（不受 `?tab=` 影响） |
+| `counts` | object | `BatchCountsOut`，**不受 `?tab=` 影响**（切 tab 角标固定），但**受 `?period=` 作用域约束**（period 闸门与 list 侧逐字一致，见 §3.8） |
 | `list` | array | 当前页卡片，**至多 `size` 条** |
 | `hasMore` | boolean | 见 §3.4 |
 
@@ -477,9 +477,10 @@ service 层的**同一张映射表**同时驱动过滤谓词与 counts 归桶，
   `each_tab_counts_bucket_equals_its_list_length`（**7 个 tab 逐个**验「角标 ==
   列表行数」，含 `noSystemDate`）、`counts_are_scoped_by_date`（日期作用域）。
 
-**剩下的结构性事实（不修）**：`counts` 与 `list` 仍是**两次独立查询**，首屏聚合在
-handler 层**不开事务**，跑在 read-committed 下**可以跨快照**。口径（SQL 谓词）
-一致，快照（隔离级别）不保证。端点 4 / 5 同款（见 §3.8 末段）。
+**剩下的结构性事实（不修）**：`counts` 与 `list` 是**分别独立发出**的查询（本域首屏
+实际 **3 次库**：2 次 counts + 1 次 list，见 §8.5 末段），首屏聚合在 handler 层
+**不开事务**，跑在 read-committed 下**可以跨快照**。口径（SQL 谓词）一致，快照
+（隔离级别）不保证。端点 4 / 5 同款（见 §3.8 末段）。
 
 ### 3.4 `hasMore` 算法（★ 不多打 count 查询）
 
@@ -566,8 +567,9 @@ COALESCE((
 继承**。本 worktree 的 dev 库实测该差值 **0 行**（库里 0 条软删工单关联批次），
 所以是**潜伏**偏差而非现网故障；本次对齐是**主动收口**，登记在 §8.10。
 
-**剩下的结构性事实（不修）**：`counts` 与 `list` 仍是**两次独立查询**，首屏聚合
-（`worker` / `stats` / `counts` / `list`）在 handler 层**不开事务**，跑在
+**剩下的结构性事实（不修）**：`counts` 与 `list` 是**分别独立发出**的查询（首屏聚合
+实际 **4~5 次库**：`worker` / `stats` 1~2 次、`counts` **2 次**、`list` 1 次），
+首屏聚合（`worker` / `stats` / `counts` / `list`）在 handler 层**不开事务**，跑在
 read-committed 下**可以跨快照**（例如统计查询期间有人改了批次状态，`counts` 与
 `list` 反映的是两个时刻）。这符合本仓「读端点不开事务」的既定约定（端点 2/3 的
 `counts` + `list` 同款），本轮**刻意不引入事务** —— 为纯读端点开事务会占住连接、
@@ -881,8 +883,9 @@ import」。⚠️ `t_user` 其余列（用户名 / 角色 / session）的 SQL �
 | 为什么文档原写法也算错 | 旧文档写「`list` 与 `counts` 口径**逐字一致**、本域**没有**角标 / 列表口径分叉」—— 谓词并不逐字一致（缺一条 `p.deleted_at IS NULL`），把它写成「不存在」是事实性错误。已收窄为「**period 闸门逐字一致**」并同步 §3.6 / §3.8 |
 | 钉死 | `docs/api/wx.md` §3.8（口径表 + 闸门加在哪一侧）、`production/repo.rs` 的 `batch_counts_by_period` 与 `WHERE_CLAUSE` 逐字段 doc |
 
-⚠️ 修完之后**仍有**一个结构性事实没变：两者是两次独立查询、首屏聚合不开事务 ⇒
-read-committed 下**可能跨快照**。见 §3.8 末段。
+⚠️ 修完之后**仍有**一个结构性事实没变：两者是**分别独立发出**的查询（`counts` 侧是
+**2 条**标量 SQL，不是 1 条）、首屏聚合不开事务 ⇒ read-committed 下**可能跨快照**。
+见 §3.8 末段。
 
 ### 8.11 ⚠️ `batchNo` 与前端 TS 模型的 number-vs-string 类型差（2026-10-11 review 第 1 轮登记）
 

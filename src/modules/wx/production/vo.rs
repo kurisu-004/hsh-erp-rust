@@ -207,7 +207,9 @@ pub struct ProductionHomeOut {
     /// （与「已绑定但当月零工作量」**不可区分** —— 这是登记在案的取舍，见
     /// [`WorkerOut`] 的 `avatar` 与 `docs/api/wx.md` §8.7）
     pub stats: WorkerStatsOut,
-    /// 2 个 tab 的角标（**不带 `?tab=` 过滤** —— 角标恒是全局口径，切 tab 时不变）
+    /// 2 个 tab 的角标（**不带 `?tab=` 过滤** —— 切 tab 时角标固定不变；但**带
+    /// `?period=` 作用域**，与 `list` 侧的 period 闸门逐字一致。2026-10-12 口径
+    /// 订正：原注释的「角标恒是全局口径」与代码相反，见 docs/api/wx.md §3.8）
     pub counts: BatchCountsOut,
     /// 当前页卡片（按 `?tab=` 过滤、按 `?page=` 翻页），**至多 `size` 条**
     pub list: Vec<ProductionBatchCardOut>,
