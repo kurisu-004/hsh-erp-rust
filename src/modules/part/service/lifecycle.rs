@@ -29,11 +29,14 @@
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::part::model::{NewPartEvent, TPart};
+use crate::modules::part::model::TPart;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
 use crate::modules::part::vo::PartOut;
 use crate::shared::error::{AppError, code};
+// 2026-10-12：`t_part_event` 的写侧自 part 域的事件 INSERT 上提到
+// `shared::part_event`（该表由 7 个模块写、无域归属）。
+use crate::shared::part_event::{NewPartEvent, insert};
 
 use super::PartService;
 use crate::modules::part::dto_crud::{CancelRequest, ForceCompleteRequest};
@@ -117,19 +120,24 @@ impl PartService {
         let _batches_cancelled = repo
             .cancel_all_active_batches_for_part(part_id, current.id)
             .await?;
-        repo.insert_part_event(NewPartEvent {
-            id: snowflake.next_id(),
-            part_id,
-            event_type: "CANCELLED",
-            from_status: Some(from.as_str()),
-            to_status: Some("CANCELLED"),
-            batch_id: None,
-            quantity: None,
-            drawing_code: Some(&part.drawing_no),
-            badge_code: None,
-            note: req.reason.as_deref().or(req.note.as_deref()),
-            created_by: Some(current.id),
-        })
+        insert(
+            repo.conn_mut(),
+            NewPartEvent {
+                id: snowflake.next_id(),
+                part_id,
+                event_type: "CANCELLED",
+                from_status: Some(from.as_str()),
+                to_status: Some("CANCELLED"),
+                batch_id: None,
+                quantity: None,
+                drawing_code: Some(&part.drawing_no),
+                badge_code: None,
+                worker_id: None,
+                process_id: None,
+                note: req.reason.as_deref().or(req.note.as_deref()),
+                created_by: Some(current.id),
+            },
+        )
         .await?;
         // 重读走 TPartInspected（响应只需 PartOut 最小投影）。
         let fresh = repo
@@ -200,19 +208,24 @@ impl PartService {
         // 8. 事件日志：FORCE_COMPLETED 区分常规 COMPLETED；note 加 [FORCE] 前缀。
         let note_owned = req.note.unwrap_or_default();
         let prefixed_note = format!("[FORCE] {}", note_owned);
-        repo.insert_part_event(NewPartEvent {
-            id: snowflake.next_id(),
-            part_id,
-            event_type: "FORCE_COMPLETED",
-            from_status: Some(from.as_str()),
-            to_status: Some("COMPLETED"),
-            batch_id: None,
-            quantity: None,
-            drawing_code: Some(&part.drawing_no),
-            badge_code: None,
-            note: Some(&prefixed_note),
-            created_by: Some(current.id),
-        })
+        insert(
+            repo.conn_mut(),
+            NewPartEvent {
+                id: snowflake.next_id(),
+                part_id,
+                event_type: "FORCE_COMPLETED",
+                from_status: Some(from.as_str()),
+                to_status: Some("COMPLETED"),
+                batch_id: None,
+                quantity: None,
+                drawing_code: Some(&part.drawing_no),
+                badge_code: None,
+                worker_id: None,
+                process_id: None,
+                note: Some(&prefixed_note),
+                created_by: Some(current.id),
+            },
+        )
         .await?;
         let fresh = repo
             .get_part_inspected(part_id)

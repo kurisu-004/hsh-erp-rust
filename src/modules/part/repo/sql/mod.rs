@@ -15,13 +15,14 @@
 //!   clear_part_serial_no_when_completed / serial_prefix_for_customer /
 //!   list_match_parts_by_keys / list_match_assemblies_by_keys /
 //!   list_assembly_names_by_ids / update_order_info）
-//! - `event_sql.rs` —— `t_part_event` 表 SQL（insert_part_event）
 //! - `helper_sql.rs` —— 杂项 helper（`scale_qty` 缩放公式纯函数 + 单测）
 //!
 //! 2026-10-02：`batch_sql.rs`（`t_part_batch` 表 19 个流转写点）已随
 //! `t_part_batch` 归属迁至 `crate::modules::prod::batch::repo::sql`（impl 目标由
-//! 本文件的 ZST `PartRepo` 改为 `PartBatchRepo`）。本文件现承载 `t_part` +
-//! `t_part_event` 两表的 SQL。
+//! 本文件的 ZST `PartRepo` 改为 `PartBatchRepo`）。2026-10-12：`event_sql.rs`
+//! （`t_part_event` 表唯一写点 `insert_part_event`）已随该表上提到
+//! `crate::shared::part_event`（该表由 7 个模块写、无域归属）。本文件现**只承载
+//! `t_part` 一表**的 SQL。
 //!
 //! ## 函数体零变化（PR2 约束）
 //! 文件物理拆分，**所有 SQL 文本、函数体、签名、可见性、async 修饰保持不变**——
@@ -33,15 +34,15 @@
 //! 静态方法调用——保持 12 处静态调用零修改，故 ZST struct 提升至本 mod.rs
 //! （统一暴露），各 sql_* 子文件 `impl PartRepo { ... }` 拼装。
 
-/// part 域 ZST struct（承载 `t_part` + `t_part_event` 两表全部固有静态方法；
-/// `t_part_batch` 的静态方法 2026-10-02 起在 `prod::batch::repo`）。
+/// part 域 ZST struct（承载 `t_part` 一表全部固有静态方法；
+/// `t_part_batch` 的静态方法 2026-10-02 起在 `prod::batch::repo`，
+/// `t_part_event` 的写侧 2026-10-12 起在 `shared::part_event`）。
 ///
 /// 跨模块调用方（delivery_note / assembly / outsource / part_file / statistics /
 /// shelf / prod::queue 共 7 域）继续走 `PartRepo::xxx(&mut *conn, ...)`
 /// 静态方法调用——本任务**不能**破坏 `part::repo::PartRepo` 作为 ZST 的对外身份。
 pub struct PartRepo;
 
-pub mod event_sql;
 pub mod helper_sql;
 pub mod part_sql;
 

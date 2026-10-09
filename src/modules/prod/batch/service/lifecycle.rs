@@ -12,12 +12,14 @@
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
 use crate::modules::part::vo::PartOut;
 use crate::modules::prod::batch::dto::{CompleteRequest, DeliverRequest, StartRepairRequest};
 use crate::shared::error::{AppError, code};
+// 2026-10-12：`t_part_event` 的写侧自 part 域的事件 INSERT 上提到
+// `shared::part_event`（该表由 7 个模块写、无域归属）。
+use crate::shared::part_event::{NewPartEvent, insert};
 
 use super::BatchService;
 
@@ -98,19 +100,24 @@ impl BatchService {
         //    **不再**手工调 `sync_from_batch_change`（原 `let _ =` 既冗余，又会把
         //    rollup 错误静默丢弃）。
         // 7. 事件日志：batch_id + quantity 来自操作的批次。
-        repo.insert_part_event(NewPartEvent {
-            id: snowflake.next_id(),
-            part_id,
-            event_type: "DELIVERED",
-            from_status: Some("READY_TO_SHIP"),
-            to_status: Some("DELIVERED"),
-            batch_id: Some(batch.id),
-            quantity: Some(batch.quantity),
-            drawing_code: Some(&part.drawing_no),
-            badge_code: None,
-            note: req.note.as_deref(),
-            created_by: Some(current.id),
-        })
+        insert(
+            repo.conn_mut(),
+            NewPartEvent {
+                id: snowflake.next_id(),
+                part_id,
+                event_type: "DELIVERED",
+                from_status: Some("READY_TO_SHIP"),
+                to_status: Some("DELIVERED"),
+                batch_id: Some(batch.id),
+                quantity: Some(batch.quantity),
+                drawing_code: Some(&part.drawing_no),
+                badge_code: None,
+                worker_id: None,
+                process_id: None,
+                note: req.note.as_deref(),
+                created_by: Some(current.id),
+            },
+        )
         .await?;
         let fresh = repo
             .get_part_inspected(part_id)
@@ -193,19 +200,24 @@ impl BatchService {
             )
             .await?;
         // 7. 事件日志：batch_id + quantity 来自操作的批次。
-        repo.insert_part_event(NewPartEvent {
-            id: snowflake.next_id(),
-            part_id,
-            event_type: "COMPLETED",
-            from_status: Some("DELIVERED"),
-            to_status: Some("COMPLETED"),
-            batch_id: Some(batch.id),
-            quantity: Some(batch.quantity),
-            drawing_code: Some(&part.drawing_no),
-            badge_code: None,
-            note: req.note.as_deref(),
-            created_by: Some(current.id),
-        })
+        insert(
+            repo.conn_mut(),
+            NewPartEvent {
+                id: snowflake.next_id(),
+                part_id,
+                event_type: "COMPLETED",
+                from_status: Some("DELIVERED"),
+                to_status: Some("COMPLETED"),
+                batch_id: Some(batch.id),
+                quantity: Some(batch.quantity),
+                drawing_code: Some(&part.drawing_no),
+                badge_code: None,
+                worker_id: None,
+                process_id: None,
+                note: req.note.as_deref(),
+                created_by: Some(current.id),
+            },
+        )
         .await?;
         let fresh = repo
             .get_part_inspected(part_id)
@@ -313,19 +325,24 @@ impl BatchService {
         // `IN_PROCESS → IN_PROCESS` 的事件是**真实**轨迹：状态未变、位置未变、
         // 变的是标记位与「已起修」这一事实。返修语义由 `event_type='REPAIR_
         // STARTED'` + `is_repairing` 列承载。
-        repo.insert_part_event(NewPartEvent {
-            id: snowflake.next_id(),
-            part_id,
-            event_type: "REPAIR_STARTED",
-            from_status: Some("IN_PROCESS"),
-            to_status: Some("IN_PROCESS"),
-            batch_id: Some(batch.id),
-            quantity: Some(batch.quantity),
-            drawing_code: Some(&part.drawing_no),
-            badge_code: None,
-            note: req.reason.as_deref().or(req.note.as_deref()),
-            created_by: Some(current.id),
-        })
+        insert(
+            repo.conn_mut(),
+            NewPartEvent {
+                id: snowflake.next_id(),
+                part_id,
+                event_type: "REPAIR_STARTED",
+                from_status: Some("IN_PROCESS"),
+                to_status: Some("IN_PROCESS"),
+                batch_id: Some(batch.id),
+                quantity: Some(batch.quantity),
+                drawing_code: Some(&part.drawing_no),
+                badge_code: None,
+                worker_id: None,
+                process_id: None,
+                note: req.reason.as_deref().or(req.note.as_deref()),
+                created_by: Some(current.id),
+            },
+        )
         .await?;
         let fresh = repo
             .get_part_inspected(part_id)

@@ -1154,8 +1154,10 @@ async fn pick_up_missing_required_fields_still_422() {
 ///
 /// 选 pick-up 路径是因为它是**当前 Rust 写入点里唯一 100% 带 `created_by` 的一类**
 /// （`current.id`），不需要为了测试去手插事件就能验证 `t_user` 那条 JOIN。
-/// `worker_name` 反过来 —— 当前 Rust 的 INSERT 不写 `worker_id`，只有 2026-07~09
-/// 的 Python 时代事件有值，所以那条 JOIN 由**手插的历史形态事件**覆盖。
+/// `worker_name` 由**手插的历史形态事件**覆盖（场景 14b）。
+///
+/// 2026-10-12：`worker_name` 的期望值从「恒为 null」翻转成「逐字等于
+/// `t_worker.name`」—— 写侧从本轮起真的填 `t_part_event.worker_id` 了。
 #[tokio::test]
 async fn events_project_batch_no_worker_name_and_operator_name() {
     let ctx = bootstrap().await;
@@ -1234,11 +1236,19 @@ async fn events_project_batch_no_worker_name_and_operator_name() {
         "本 part 的首个批次 batch_no = 1: {picked}"
     );
 
-    // worker_name：当前 Rust 写入点不写 worker_id ⇒ 这条 PICKED_UP 恒为 null
-    // （只断言「键在且为 null」，不断言「永远为 null」—— 那是写侧的口径，不是读侧的）
-    assert!(
-        picked["worker_name"].is_null(),
-        "pick-up 写入点不写 worker_id，本条 worker_name 应为 null: {picked}"
+    // worker_name：2026-10-12 起 pick-up 的两条事件（PICKED_UP / SPLIT）**写侧真的填
+    // `worker_id`** 了（`t_part_event.worker_id`，语义 = `t_worker.id`），故这条
+    // PICKED_UP 的 `worker_name` 不再是 null，而是接上 `t_worker.name`。
+    //
+    // ⚠️ 本条断言从「恒为 null」翻转成「逐字等于 t_worker.name」**不是给实现放水**：
+    // 改动前它断言的是**写侧的一个事实**（老 INSERT 的列清单里根本没有 `worker_id`），
+    // 而那正是本轮任务要改掉的东西。读侧要证明的东西一点没放松 —— LEFT JOIN
+    // `t_worker` 真的接上了、`worker_id` 列真的落库了，`worker_name` 键仍在、值逐字
+    // 等于该工人的名字。「无 `worker_id` 时退化成 null 而不是丢行」那一面由下一条
+    // 场景 14b（手插 `created_by IS NULL` 的历史形态事件）覆盖。
+    assert_eq!(
+        picked["worker_name"], "PICKUP-WORKER",
+        "pick-up 写侧 2026-10-12 起填 worker_id，本条 worker_name 应等于 t_worker.name: {picked}"
     );
 }
 

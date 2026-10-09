@@ -11,13 +11,16 @@
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
 use crate::modules::part::vo::PartOut;
 use crate::modules::prod::batch::repo::PartBatchRepo;
 use crate::modules::prod::scan::dto::PickUpRequest;
 use crate::shared::error::{AppError, code};
+// 2026-10-12：`t_part_event` 的写侧自 part 域的事件 INSERT 上提到
+// `shared::part_event`（该表由 7 个模块写、无域归属）；本文件的 2 处构造点同时
+// 补齐 `worker_id` / `process_id` 两个新字段（见 `part_event/mod.rs` 写入点清单）。
+use crate::shared::part_event::{NewPartEvent, insert};
 
 use super::ScanService;
 use crate::shared::batch::guards::{
@@ -271,37 +274,54 @@ impl ScanService {
         // 事件挂在 part 维度、batch_id 指向新批次，与 `batch_ops::split_batch`
         // 的 SPLIT 事件同形。
         if let Some(info) = split.as_ref() {
-            repo.insert_part_event(NewPartEvent {
-                id: snowflake.next_id(),
-                part_id,
-                event_type: "SPLIT",
-                from_status: Some(&batch.status),
-                to_status: Some(&batch.status),
-                batch_id: Some(info.new_batch_id),
-                quantity: Some(info.quantity),
-                drawing_code: Some(&part.drawing_no),
-                badge_code: None,
-                note: Some("pick-up 部分领取自动拆批"),
-                created_by: Some(current.id),
-            })
+            insert(
+                repo.conn_mut(),
+                NewPartEvent {
+                    id: snowflake.next_id(),
+                    part_id,
+                    event_type: "SPLIT",
+                    from_status: Some(&batch.status),
+                    to_status: Some(&batch.status),
+                    batch_id: Some(info.new_batch_id),
+                    quantity: Some(info.quantity),
+                    drawing_code: Some(&part.drawing_no),
+                    badge_code: None,
+                    // 2026-10-12：拆批事件挂在**新批次**上，而工序取**源批次**的 ——
+                    // `split_batch_for_partial_pass` 的 `INSERT ... SELECT` 继承了
+                    // `current_process_id`，故两者同值。工人是 `req.worker_id`（已在上面
+                    // 查库校验存在且 active）。
+                    worker_id: Some(req.worker_id),
+                    process_id: batch.current_process_id,
+                    note: Some("pick-up 部分领取自动拆批"),
+                    created_by: Some(current.id),
+                },
+            )
             .await?;
         }
         // 2026-10-03：事件指向实际被领走的那一批、数量取实际交付量
         // （整批路径 = batch.quantity，与改动前一致）。
         let picked_qty = split_qty.unwrap_or(batch.quantity);
-        repo.insert_part_event(NewPartEvent {
-            id: snowflake.next_id(),
-            part_id,
-            event_type: "PICKED_UP",
-            from_status: Some(from.as_str()),
-            to_status: Some("IN_PROCESS"),
-            batch_id: Some(target_batch_id),
-            quantity: Some(picked_qty),
-            drawing_code: Some(&part.drawing_no),
-            badge_code: None,
-            note: req.note.as_deref(),
-            created_by: Some(current.id),
-        })
+        insert(
+            repo.conn_mut(),
+            NewPartEvent {
+                id: snowflake.next_id(),
+                part_id,
+                event_type: "PICKED_UP",
+                from_status: Some(from.as_str()),
+                to_status: Some("IN_PROCESS"),
+                batch_id: Some(target_batch_id),
+                quantity: Some(picked_qty),
+                drawing_code: Some(&part.drawing_no),
+                badge_code: None,
+                // 2026-10-12：同上一处 —— `target_batch_id` 拆批时是新批次、整批时是
+                // 源批次，但两者的 `current_process_id` 同值（拆批继承 + 随后
+                // `mark_batch_with_status_and_meta` 显式透传），故统一取源批次快照。
+                worker_id: Some(req.worker_id),
+                process_id: batch.current_process_id,
+                note: req.note.as_deref(),
+                created_by: Some(current.id),
+            },
+        )
         .await?;
         let fresh = repo
             .get_part_inspected(part_id)

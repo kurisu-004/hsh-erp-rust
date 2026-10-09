@@ -6,11 +6,13 @@
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
 use crate::modules::prod::batch::dto::PlaceOnShelfRequest;
 use crate::shared::error::{AppError, code};
+// 2026-10-12：`t_part_event` 的写侧自 part 域的事件 INSERT 上提到
+// `shared::part_event`（该表由 7 个模块写、无域归属）。
+use crate::shared::part_event::{NewPartEvent, insert};
 
 use super::BatchService;
 use crate::shared::batch::guards::{
@@ -95,19 +97,24 @@ impl BatchService {
         if n == 0 {
             return Err(AppError::biz(code::VERSION_CONFLICT, "batch 版本冲突"));
         }
-        repo.insert_part_event(NewPartEvent {
-            id: snowflake.next_id(),
-            part_id,
-            event_type: "CNC_RELEASED",
-            from_status: Some("PROGRAMMING"),
-            to_status: Some("IN_PROCESS"),
-            batch_id: Some(batch.id),
-            quantity: Some(batch.quantity),
-            drawing_code: Some(&part.drawing_no),
-            badge_code: None,
-            note: req.note.as_deref(),
-            created_by: Some(current.id),
-        })
+        insert(
+            repo.conn_mut(),
+            NewPartEvent {
+                id: snowflake.next_id(),
+                part_id,
+                event_type: "CNC_RELEASED",
+                from_status: Some("PROGRAMMING"),
+                to_status: Some("IN_PROCESS"),
+                batch_id: Some(batch.id),
+                quantity: Some(batch.quantity),
+                drawing_code: Some(&part.drawing_no),
+                badge_code: None,
+                worker_id: None,
+                process_id: None,
+                note: req.note.as_deref(),
+                created_by: Some(current.id),
+            },
+        )
         .await?;
         let fresh = repo
             .get_part_inspected(part_id)

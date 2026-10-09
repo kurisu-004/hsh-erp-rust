@@ -210,7 +210,7 @@ impl QueueService {
             .take_one_from_pool(worker_id, shelf_id, &process_ids, operator_user_id)
             .await?
         {
-            // part_event.id 用 snowflake 生成（与既有 `PartRepo::insert_part_event` 调用约定一致）
+            // part_event.id 用 snowflake 生成（与既有 part_event::insert 调用约定一致）
             let event_id = snowflake.next_id();
             (&mut *conn)
                 .part_insert_part_event(
@@ -223,6 +223,14 @@ impl QueueService {
                     Some(t.quantity),
                     Some(&t.drawing_no),
                     Some(badge_code),
+                    // 2026-10-12：`worker_id` 取本函数的 `worker_id` 形参（取料 SQL 已按它
+                    // 校验过 `t_worker.id`）。`process_id` 传 None：本路径手上只有 `TakenItem`，
+                    // 而 `queue/repo/sql.rs` 的 `TakenRow` 与最终 SELECT 都不含
+                    // `pb.current_process_id` —— 补它要连带改 TakenRow + CTE + RETURNING +
+                    // TakenItem 四处并改动 /prod/queue/refill 的响应契约。且工序维度统计走
+                    // RETURNED_TO_SHELF / SENT_TO_INSPECTION，不吃这一条。
+                    Some(worker_id),
+                    None,
                     None,
                     Some(operator_user_id),
                 )
@@ -545,6 +553,12 @@ impl QueueService {
                         Some(taken.quantity),
                         Some(&taken.drawing_no),
                         Some(&worker.badge_code),
+                        // 2026-10-12：MOVED 有三个方向（POOL→WORKER / WORKER→POOL /
+                        // WORKER→WORKER），只有第一个是「开始加工」；有效工时口径只用
+                        // RETURNED_TO_SHELF + SENT_TO_INSPECTION ⇒ 填不填都不进任何聚合，
+                        // 一律 None，少一处需要推理的地方。
+                        None,
+                        None,
                         Some(req.note.as_deref().unwrap_or("move POOL→WORKER")),
                         Some(current.id),
                     )
@@ -643,6 +657,12 @@ impl QueueService {
                         Some(batch.quantity),
                         Some(&part.drawing_no),
                         Some(badge),
+                        // 2026-10-12：MOVED 有三个方向（POOL→WORKER / WORKER→POOL /
+                        // WORKER→WORKER），只有第一个是「开始加工」；有效工时口径只用
+                        // RETURNED_TO_SHELF + SENT_TO_INSPECTION ⇒ 填不填都不进任何聚合，
+                        // 一律 None，少一处需要推理的地方。
+                        None,
+                        None,
                         Some(req.note.as_deref().unwrap_or("move WORKER→POOL")),
                         Some(current.id),
                     )
@@ -763,6 +783,12 @@ impl QueueService {
                         Some(batch.quantity),
                         Some(&part.drawing_no),
                         Some(badge),
+                        // 2026-10-12：MOVED 有三个方向（POOL→WORKER / WORKER→POOL /
+                        // WORKER→WORKER），只有第一个是「开始加工」；有效工时口径只用
+                        // RETURNED_TO_SHELF + SENT_TO_INSPECTION ⇒ 填不填都不进任何聚合，
+                        // 一律 None，少一处需要推理的地方。
+                        None,
+                        None,
                         Some(req.note.as_deref().unwrap_or("move WORKER→WORKER")),
                         Some(current.id),
                     )
@@ -929,6 +955,10 @@ impl QueueService {
                                 Some(t.quantity),
                                 Some(&t.drawing_no),
                                 Some(&worker.badge_code),
+                                // 2026-10-12：同 refill 那处 —— worker_id 有值，process_id
+                                // 取不到（TakenItem 无该字段）故 None。
+                                Some(worker_id),
+                                None,
                                 Some("auto_allocate"),
                                 Some(current.id),
                             )

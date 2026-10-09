@@ -84,11 +84,14 @@ use sqlx::PgConnection;
 
 use crate::modules::assembly::repo::AssemblyRepo;
 use crate::modules::assembly::service::{AssemblyService, SyncOutcome};
-use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::sql::PartRepo;
 use crate::modules::part::statemachine::{BatchForRollup, compute_part_target};
 use crate::shared::batch::read::list_active_batches_by_part_id;
 use crate::shared::error::{AppError, code};
+// 2026-10-12：`t_part_event` 的写侧自 part 域的事件 INSERT 上提到
+// `shared::part_event`（该表由 7 个模块写、无域归属；本文件因此少了对
+// `part::repo::sql::PartRepo` 的一次依赖）。
+use crate::shared::part_event::{NewPartEvent, insert};
 
 /// 一次批次状态变更的完整意图（本模块的唯一入参形状）。
 ///
@@ -765,7 +768,7 @@ pub(crate) async fn release_part_serial_no(
     let note = format!("序列号释放归档：{original}");
     match event_id {
         Some(id) => {
-            PartRepo::insert_part_event(
+            insert(
                 &mut *conn,
                 NewPartEvent {
                     id,
@@ -777,6 +780,9 @@ pub(crate) async fn release_part_serial_no(
                     quantity: None,
                     drawing_code: None,
                     badge_code: None,
+                    // 2026-10-12：序列号归档是终态清算动作，无工人、无批次工序上下文。
+                    worker_id: None,
+                    process_id: None,
                     note: Some(&note),
                     created_by: Some(updated_by),
                 },

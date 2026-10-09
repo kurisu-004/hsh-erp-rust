@@ -17,7 +17,6 @@
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
 use crate::modules::prod::queue::dto::RecallToPendingRequest;
@@ -26,6 +25,9 @@ use crate::shared::batch::guards::{
     ensure_transition, mark_batch_with_status_and_meta, validate_batch_version,
 };
 use crate::shared::error::{AppError, code};
+// 2026-10-12：`t_part_event` 的写侧自 part 域的事件 INSERT 上提到
+// `shared::part_event`（该表由 7 个模块写、无域归属）。
+use crate::shared::part_event::{NewPartEvent, insert};
 
 use super::queue::QueueService;
 
@@ -97,19 +99,24 @@ impl QueueService {
             current.id,
         )
         .await?;
-        repo.insert_part_event(NewPartEvent {
-            id: snowflake.next_id(),
-            part_id,
-            event_type: "RECALLED",
-            from_status: Some(from.as_str()),
-            to_status: Some("PENDING"),
-            batch_id: Some(batch.id),
-            quantity: Some(batch.quantity),
-            drawing_code: Some(&part.drawing_no),
-            badge_code: None,
-            note: req.note.as_deref(),
-            created_by: Some(current.id),
-        })
+        insert(
+            repo.conn_mut(),
+            NewPartEvent {
+                id: snowflake.next_id(),
+                part_id,
+                event_type: "RECALLED",
+                from_status: Some(from.as_str()),
+                to_status: Some("PENDING"),
+                batch_id: Some(batch.id),
+                quantity: Some(batch.quantity),
+                drawing_code: Some(&part.drawing_no),
+                badge_code: None,
+                worker_id: None,
+                process_id: None,
+                note: req.note.as_deref(),
+                created_by: Some(current.id),
+            },
+        )
         .await?;
         // version + 1：写入口的 OCC UPDATE 恒 +1（拿不到新值时不重新查 ——
         // 「读回再报」会在同一次事务里多一条 SELECT，且写入口将来若改成

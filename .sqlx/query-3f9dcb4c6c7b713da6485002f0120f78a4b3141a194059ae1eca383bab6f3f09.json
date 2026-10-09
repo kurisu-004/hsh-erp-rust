@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO t_part_event (\n            id, part_id, event_type, from_status, to_status,\n            batch_id, quantity, drawing_code, badge_code,\n            worker_id, process_id, note, created_at, created_by\n        ) VALUES (\n            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now(), $13\n        )\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Int8",
+        "Int4",
+        "Varchar",
+        "Varchar",
+        "Int8",
+        "Int8",
+        "Varchar",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3f9dcb4c6c7b713da6485002f0120f78a4b3141a194059ae1eca383bab6f3f09"
+}

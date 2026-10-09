@@ -18,7 +18,7 @@
 //!
 //! | 域 | 经 shared 的哪个文件 | 读 / 写 | 入口 |
 //! |---|---|---|---|
-//! | `part` | `status` | **写** | `PartRepo::update_part_rollup`（`part` 派生列回填）+ `PartRepo::insert_part_event`（事件日志） |
+//! | `part` | `status` | **写** | `PartRepo::update_part_rollup`（`part` 派生列回填） |
 //! | `assembly` | `status` | **写** | `AssemblyService::sync_assembly_status`（父件派生级联） |
 //! | `iam` | `guards` | 读 | `ShelfRepo::get_by_id`（`validate_shelf_zone` 的存在 / 停用 / zone 三谓词在 Rust 层逐条判） |
 //! | `prod::process_chain` | `guards` | 读 | `ProcessChainRepo::resolve_step_id_by_process`（`optional_step_id`） |
@@ -34,8 +34,10 @@
 //! 两条纪律（锚链两步定位、按 `current_process_id` 重新定位）与理由见
 //! [`chain`] 的模块 doc；纪律的文本锚点由该文件的单测钉住。
 //!
-//! 前两行是**写**库，故 `shared::batch` 是本仓**唯一**经域 repo 写库的 shared 模块。
-//! **这是有意为之的例外**，理由：它是 `CLAUDE.md`「状态派生契约」三层派生图
+//! 前两行是**写**库，故 `shared::batch` 是本仓**唯一一个「经域 repo 写别域的表」的
+//! shared 模块**（2026-10-12 起 `t_part_event` 的写入也已上提到 `shared::part_event`，
+//! 但那一侧是**自己的表、不经域 repo**，故本句的「唯一」口径不变）。这是有意为之的
+//! 例外，理由：它是 `CLAUDE.md`「状态派生契约」三层派生图
 //!
 //! ```text
 //! t_part_batch.status            ← 唯一真源
@@ -55,7 +57,8 @@
 //! 每个新域反向依赖 batch（见 `guards` 模块 doc 的 `current_holder_id` 三写点清单）。
 //!
 //! 换言之：`shared::customer`（读 `t_customer`，无反向写）代表 shared 的常态，
-//! `shared::batch` 是唯一经域写库的模块、也是唯一依赖 4 个域的模块，两者的成因
+//! `shared::batch` 是唯一经域写库（且写的不是自己的表）、也是唯一依赖 4 个域的模块，
+//! `shared::part_event` 则是唯一「写自己的表」的 shared 模块；三者的成因
 //! 都是「跨域契约」而非「图省事」。
 //!
 //! ## 不放什么

@@ -5,11 +5,11 @@
 // 没有 handler/service/repo/dto/vo 五段式，详见 analytics/mod.rs 顶部注释。
 pub mod analytics;
 // 2026-10-08 新增 batch：批次公共设施层（TPartBatch / get_batch_by_id /
-// status 写入口 / 7 个守卫）。**边界记档**：`shared::batch` 是本仓唯一经域 repo
-// **写**库的 shared 模块（`PartRepo::update_part_rollup` /
-// `PartRepo::insert_part_event` / `AssemblyService::sync_assembly_status`），也是
-// 唯一依赖 **4 个域** 的 shared 模块（写 part / assembly，读 iam /
-// prod::process_chain）。成因是 CLAUDE.md「状态派生契约」三层派生图
+// status 写入口 / 7 个守卫）。**边界记档**：`shared::batch` 是本仓**依赖面最宽**
+// 的 shared 模块（依赖 4 个域：写 part / assembly，读 iam / prod::process_chain），
+// 也是**唯一一个「经域 repo 写库、且写的不是自己的表」的 shared 模块**
+// （`PartRepo::update_part_rollup` / `AssemblyService::sync_assembly_status`）。
+// 成因是 CLAUDE.md「状态派生契约」三层派生图
 // （t_part_batch.status → t_part.status/next_process_id → t_assembly.status）
 // 的实现本身天然跨域、无域可归属；留在 prod::batch 只会让 part / assembly 反向
 // 依赖 prod::batch，与逐域剥离方向相反。详见 `shared/batch/mod.rs` 顶部注释。
@@ -22,6 +22,15 @@ pub mod customer; // 2026-10-07：客户 L1/L2 id 展开（part / com::union_lis
 pub mod domain_guard;
 pub mod error;
 pub mod pagination;
+// 2026-10-12 新增 part_event：`t_part_event` 的写侧设施（NewPartEvent builder +
+// `insert`），2026-10-12 自 `modules::part` 上提（INSERT 逻辑逐字不变 +
+// 补 worker_id / process_id 两列）。**边界记档**：与 `shared::batch` 相反，
+// `shared::part_event` 是**零域依赖**的 shared 模块 —— `model.rs` 零 import、
+// `sql.rs` 只 import 自己模块的 builder + sqlx，**不经任何域 repo**（老形态是 part
+// 域 ZST 上的事件 INSERT 静态方法，表上提后那个 ZST 不再合法）。
+// 上提的理由是「无域归属」：该表由 part / prod::batch / prod::scan / prod::queue /
+// outsource / assembly / shared::batch 七方写，留任一域都让其余 6 方反向依赖它。
+pub mod part_event;
 pub mod response;
 pub mod serial; // 2026-09-14 Phase 3：跨域序列号派发（assembly + 后续 part 域统一入口）
 // 2026-10-10 新增 shelf：货架负载聚合 + 自动选架设施（`t_shelf.capacity` 上线后，

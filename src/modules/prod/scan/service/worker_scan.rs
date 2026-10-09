@@ -45,7 +45,6 @@
 use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::assembly::service::SyncOutcome;
-use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::service::PartService;
 use crate::modules::part::statemachine::PartStatus;
@@ -53,6 +52,10 @@ use crate::modules::prod::scan::dto::{WorkerScanEvent, WorkerScanRequest};
 use crate::modules::prod::scan::vo::WorkerScanCoreOut;
 use crate::modules::prod::worker::repo::WorkerRepo;
 use crate::shared::error::{AppError, code};
+// 2026-10-12：`t_part_event` 的写侧自 part 域的事件 INSERT 上提到
+// `shared::part_event`（该表由 7 个模块写、无域归属）；本文件的 2 处构造点同时
+// 补齐 `worker_id` / `process_id` 两个新字段（见 `part_event/mod.rs` 写入点清单）。
+use crate::shared::part_event::{NewPartEvent, insert};
 
 use super::ScanService;
 
@@ -330,19 +333,29 @@ impl ScanService {
                 // 非终态 → min-progress 推不出 part 终态，`event_id` 传 `None`
                 // （归档事件分支不可达）。
                 PartService::sync_from_batch_change(&mut repo, part.id, current, None).await?;
-                repo.insert_part_event(NewPartEvent {
-                    id: snowflake.next_id(),
-                    part_id: part.id,
-                    event_type: "RETURNED_TO_SHELF",
-                    from_status: Some("IN_PROCESS"),
-                    to_status: Some("IN_PROCESS"),
-                    batch_id: Some(batch.id),
-                    quantity: Some(batch.quantity),
-                    drawing_code: Some(&part.drawing_no),
-                    badge_code: Some(&worker.badge_code),
-                    note: None,
-                    created_by: Some(current.id),
-                })
+                insert(
+                    repo.conn_mut(),
+                    NewPartEvent {
+                        id: snowflake.next_id(),
+                        part_id: part.id,
+                        event_type: "RETURNED_TO_SHELF",
+                        from_status: Some("IN_PROCESS"),
+                        to_status: Some("IN_PROCESS"),
+                        batch_id: Some(batch.id),
+                        quantity: Some(batch.quantity),
+                        drawing_code: Some(&part.drawing_no),
+                        badge_code: Some(&worker.badge_code),
+                        // 2026-10-12：两个新字段的**唯一正确取值来源**。`batch` 是上面
+                        // `mark_batch_returned` 之前读进内存的快照 —— 该调用在同一事务内已把
+                        // `t_part_batch.current_process_id` 推进到 `next_pid`，事后回查批次只会
+                        // 拿到「下一道」工序，拿不到「这位工人刚做完哪道」（migration 009 的
+                        // 列 COMMENT 就是为这件事写的）。
+                        worker_id: Some(worker.id),
+                        process_id: batch.current_process_id,
+                        note: None,
+                        created_by: Some(current.id),
+                    },
+                )
                 .await?;
                 event_type_str = "WORKER_SCAN_RETURNED";
             }
@@ -427,19 +440,26 @@ async fn sent_to_inspection<R: PartRepoTrait>(
     let rollup = repo
         .mark_batch_inspected(batch.id, batch.version, target_id, Some(current.id))
         .await?;
-    repo.insert_part_event(NewPartEvent {
-        id: snowflake.next_id(),
-        part_id: part.id,
-        event_type: "SENT_TO_INSPECTION",
-        from_status: Some("IN_PROCESS"),
-        to_status: Some("INSPECTION"),
-        batch_id: Some(batch.id),
-        quantity: Some(batch.quantity),
-        drawing_code: Some(&part.drawing_no),
-        badge_code: Some(&worker.badge_code),
-        note: None,
-        created_by: Some(current.id),
-    })
+    insert(
+        repo.conn_mut(),
+        NewPartEvent {
+            id: snowflake.next_id(),
+            part_id: part.id,
+            event_type: "SENT_TO_INSPECTION",
+            from_status: Some("IN_PROCESS"),
+            to_status: Some("INSPECTION"),
+            batch_id: Some(batch.id),
+            quantity: Some(batch.quantity),
+            drawing_code: Some(&part.drawing_no),
+            badge_code: Some(&worker.badge_code),
+            // 2026-10-12：`mark_batch_inspected` 不推进工序，`batch.current_process_id`
+            // 仍是送检时那道工序；`worker` 是本函数的 `&TWorker` 形参。
+            worker_id: Some(worker.id),
+            process_id: batch.current_process_id,
+            note: None,
+            created_by: Some(current.id),
+        },
+    )
     .await?;
     // PR-B2：直接取 gate 的派生结果（不再补调 `PartService::sync_from_batch_change`
     // —— 第二次派生必然 `NoChange`，会把 `synced_assembly_id` 恒吞成 null）。
