@@ -189,15 +189,16 @@ delivered_sets = MIN over c (per_set(c)) = LEAST(k, N) = k
 
 #### 无装配件套数校验的写路径共 4 条
 
-四条都经 `shared::batch::status` 写 `t_part_batch.status`、**都不看父装配件的套数**，
-故都能单独交子件：
+四条都经 `shared::batch::status` 写 `t_part_batch.status`、**都不看父装配件的套数**。
+前三条可**单独交一个子件**；第 4 条一次推**全部子件**，不会单独交，其残留破坏形态是
+「某个子件的非 CANCELLED 批次为 0 条」——见下表末行的说明：
 
 | # | 端点 | 落到哪个 status | 为什么构不成闸门 |
 |---|---|---|---|
 | 1 | `POST /api/v2/prod/batches/{batch_id}/deliver` | `DELIVERED` | `mark_batch_delivered` 只查 `allowed_from: &["READY_TO_SHIP"]` |
 | 2 | `POST /api/v2/prod/batches/scan/deliver` | `DELIVERED` | `scan_deliver_part` 只查 `part.status == READY_TO_SHIP` 就 `mark_batch_delivered`（司机扫码发货） |
 | 3 | `POST /api/v2/parts/{part_id}/force-complete` | **`COMPLETED`** | `force_complete_all_batches_for_part` 把该 part 全部非 CANCELLED 批次强推 `COMPLETED`（逃生通道，绕状态机与 OCC）；本守卫的 `status IN ('DELIVERED','COMPLETED')` 把 `COMPLETED` 也算已交 |
-| 4 | `POST /api/v2/prod/assemblies/{assembly_id}/force-complete` | **`COMPLETED`** | `force_complete_all_batches_for_assembly` 把该装配件**全部子件**的非 CANCELLED 批次强推 `COMPLETED`，随后 `force_complete_children` / `force_complete_status` 显式把子件与父装配件写成 `COMPLETED`（逃生通道，MANAGER 单角色；不查父装配件套数，可单独把整个装配件判成已交） |
+| 4 | `POST /api/v2/prod/assemblies/{assembly_id}/force-complete` | **`COMPLETED`** | `force_complete_all_batches_for_assembly` 把该装配件**全部子件**的非 CANCELLED 批次强推 `COMPLETED`，随后 `force_complete_children` / `force_complete_status` 显式把子件与父装配件写成 `COMPLETED`（逃生通道，MANAGER 单角色；不查父装配件套数）。⚠️ 它**不会**单独交一个子件，残留的破坏形态是「某个子件的非 CANCELLED 批次为 0 条」（批次全 CANCELLED 或尚未拆批）：该子件仍是 0 套、兄弟子件却已交 ⇒ 本守卫的 `EXISTS` 命中、装配件落 `partial` 桶而 `delivered_sets` 为 0 |
 
 **不构成破坏路径的两条**：送货单路径经 `entry_max_sets` 闸门维持不变式；
 `POST /api/v2/prod/batches/{batch_id}/complete` 的 `allowed_from: &["DELIVERED"]` 要求批次

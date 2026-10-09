@@ -28,6 +28,17 @@
 //! 函数名与签名逐字保留，service 层调用点零改动 —— 于是「写状态」这件事在
 //! 类型层面就只剩一个入口，caller 没有「要不要调 sync」这个选项可选。
 //!
+//! ## ⚠️ 唯一的例外：装配件级逃生写点**只写不派生**（2026-10-11 新增）
+//!
+//! [`force_complete_all_batches_for_assembly`] 同样是本模块的 pub 写入口，但它
+//! **只执行那一条 UPDATE、不调任何派生**。这不是绕过不变式的破例，而是逃生通道的
+//! 必需语义：批量 UPDATE 命中 0 行时上文的派生循环一次都不跑（见
+//! [`apply_bulk_batch_status_change_for_part`] 末尾那条 TODO），而
+//! `POST /api/v2/prod/assemblies/{assembly_id}/force-complete` 的语义是「装配件整体
+//! 判为已交」，终态必须由后续两条显式写（`AssemblyRepo::force_complete_children` /
+//! `force_complete_status`）落下，否则端点返回 200 却什么都没改。派生与显式写的
+//! 职责切分、返回值的用法限制见该函数 doc。
+//!
 //! ## 两条派生层铁律（2026-10-01 review 第 1 轮 B1 补齐）
 //!
 //! 1. **派生层不得否决主操作**：派生写不抛错，冲突 / 守卫命中一律降级为
@@ -650,15 +661,11 @@ pub async fn apply_bulk_batch_status_change_for_part(
 ///
 /// 不走 OCC：force-complete 是逃生通道，串行化由 SQL 行锁承担。
 ///
-/// `$N` 占位符必须连续且与 `.bind()` 个数一致（见本文件 `bind_guard_tests`）。
-pub async fn force_complete_all_batches_for_assembly(
-    conn: &mut PgConnection,
-    assembly_id: i64,
-    updated_by: i64,
-) -> Result<u64, AppError> {
-    // $1 assembly_id / $2 new_status / $3 updated_by / $4 excluded_statuses
-    let res = sqlx::query(
-        r#"
+/// `$N` 占位符必须连续且与 `.bind()` 个数一致 —— 由
+/// [`FORCE_COMPLETE_ALL_BATCHES_FOR_ASSEMBLY_BIND_COUNT`] 与
+/// `bind_guard_tests::force_complete_placeholders_are_contiguous` 同时钉住
+/// （本条 SQL 的最大占位符号必须等于 bind 个数，且 `1..=N` 无跳号）。
+const FORCE_COMPLETE_ALL_BATCHES_FOR_ASSEMBLY_SQL: &str = r#"
         UPDATE t_part_batch
            SET status       = $2::varchar,
                is_repairing = false,
@@ -673,14 +680,27 @@ pub async fn force_complete_all_batches_for_assembly(
                )
            AND deleted_at IS NULL
            AND NOT (status = ANY($4::varchar[]))
-        "#,
-    )
-    .bind(assembly_id)
-    .bind("COMPLETED")
-    .bind(updated_by)
-    .bind(vec!["CANCELLED".to_string()])
-    .execute(&mut *conn)
-    .await?;
+        "#;
+
+/// 与 [`FORCE_COMPLETE_ALL_BATCHES_FOR_ASSEMBLY_SQL`] 的占位符个数严格相等
+/// （= 下方 `.bind()` 的个数）。只被 `#[cfg(test)]` 的
+/// `force_complete_placeholders_are_contiguous` 读。
+#[cfg_attr(not(test), allow(dead_code))]
+const FORCE_COMPLETE_ALL_BATCHES_FOR_ASSEMBLY_BIND_COUNT: usize = 4;
+
+pub async fn force_complete_all_batches_for_assembly(
+    conn: &mut PgConnection,
+    assembly_id: i64,
+    updated_by: i64,
+) -> Result<u64, AppError> {
+    // $1 assembly_id / $2 new_status / $3 updated_by / $4 excluded_statuses
+    let res = sqlx::query(FORCE_COMPLETE_ALL_BATCHES_FOR_ASSEMBLY_SQL)
+        .bind(assembly_id)
+        .bind("COMPLETED")
+        .bind(updated_by)
+        .bind(vec!["CANCELLED".to_string()])
+        .execute(&mut *conn)
+        .await?;
     Ok(res.rows_affected())
 }
 
@@ -853,19 +873,22 @@ fn is_terminal(status: &str) -> bool {
 ///
 /// 见 [`BATCH_STATUS_UPDATE_BIND_COUNT`] 的 rationale（review 第 1 轮踩过的坑）。
 ///
-/// TODO(2026-10-01 review 第 2 轮 NIT-3，follow-up PR)：覆盖面目前**只有**
-/// `BATCH_STATUS_UPDATE_SQL` 这一条单行 UPDATE。bulk 入口
+/// TODO(2026-10-01 review 第 2 轮 NIT-3，follow-up PR)：覆盖面目前是
+/// `BATCH_STATUS_UPDATE_SQL` 与 `FORCE_COMPLETE_ALL_BATCHES_FOR_ASSEMBLY_SQL`
+/// 两条（后者 2026-10-11 随装配件级逃生写点一并纳入）。仍未纳入的是 bulk 入口
 /// （`apply_bulk_batch_status_change_for_part` 里那条内联 `UPDATE … RETURNING`，
-/// `$1..$5`）与新增的 `t_assembly` 状态写 SQL（`AssemblyRepo::
-/// update_status_if_not_terminal` / `AssemblyRepo::cancel`）**都没有**纳入。
-/// 它们同样是「占位符编号 ↔ bind 顺序」的手工对齐点，写错时报的是
-/// `bind message supplies N parameters …` 这种与业务毫无关系的 PG 错误，
-/// 定位成本高。修法：把两条 SQL 也提成 const（与 `BATCH_STATUS_UPDATE_SQL`
-/// 同款），在本 mod 内对每条跑同一个 `max_placeholder == bind 数` +
-/// `1..=N 无跳号` 的断言。
+/// `$1..$5`）与 `t_assembly` 状态写 SQL（`AssemblyRepo::update_status_if_not_terminal`
+/// / `AssemblyRepo::cancel`）。它们同样是「占位符编号 ↔ bind 顺序」的手工对齐点，
+/// 写错时报的是 `bind message supplies N parameters …` 这种与业务毫无关系的
+/// PG 错误，定位成本高。修法：把它们也提成 const（与上面两条同款），在本 mod 内
+/// 对每条跑同一个 `max_placeholder == bind 数` + `1..=N 无跳号` 的断言。
 #[cfg(test)]
 mod bind_guard_tests {
-    use super::{BATCH_STATUS_UPDATE_BIND_COUNT, BATCH_STATUS_UPDATE_SQL};
+    use super::{
+        BATCH_STATUS_UPDATE_BIND_COUNT, BATCH_STATUS_UPDATE_SQL,
+        FORCE_COMPLETE_ALL_BATCHES_FOR_ASSEMBLY_BIND_COUNT,
+        FORCE_COMPLETE_ALL_BATCHES_FOR_ASSEMBLY_SQL,
+    };
 
     /// SQL 里出现的最大 `$n`。
     fn max_placeholder(sql: &str) -> usize {
@@ -905,6 +928,30 @@ mod bind_guard_tests {
             let needle = format!("${n}::");
             assert!(
                 BATCH_STATUS_UPDATE_SQL.contains(&needle),
+                "占位符 ${n} 在 SQL 里没有以 `{needle}` 形式出现（跳号会让 bind 顺序错位）"
+            );
+        }
+    }
+
+    /// 装配件级逃生写点（2026-10-11 新增）：与上面同款断言，钉住
+    /// [`FORCE_COMPLETE_ALL_BATCHES_FOR_ASSEMBLY_SQL`] 的占位符 ↔ bind 数。
+    /// 该 SQL 原本是函数内联、无任何护栏，doc 里却写着「见 bind_guard_tests」——
+    /// 指引不成立等于没有防护，故一并提成 const 并纳入本闸门。
+    #[test]
+    fn force_complete_placeholders_are_contiguous() {
+        let max = max_placeholder(FORCE_COMPLETE_ALL_BATCHES_FOR_ASSEMBLY_SQL);
+        assert_eq!(
+            max, FORCE_COMPLETE_ALL_BATCHES_FOR_ASSEMBLY_BIND_COUNT,
+            "装配件级逃生写点：SQL 最大占位符 ${max}，但 bind 了 \
+             {FORCE_COMPLETE_ALL_BATCHES_FOR_ASSEMBLY_BIND_COUNT} 个 —— PG 会在 Bind 阶段报 \
+             `bind message supplies N parameters, but prepared statement requires M`，\
+             且 sqlx 的 statement cache 被污染，同连接后续所有查询一起失败。\
+             请同步改 SQL 占位符与 `.bind()` 链。"
+        );
+        for n in 1..=max {
+            let needle = format!("${n}::");
+            assert!(
+                FORCE_COMPLETE_ALL_BATCHES_FOR_ASSEMBLY_SQL.contains(&needle),
                 "占位符 ${n} 在 SQL 里没有以 `{needle}` 形式出现（跳号会让 bind 顺序错位）"
             );
         }

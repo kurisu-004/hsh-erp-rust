@@ -146,6 +146,24 @@ async fn child_batch_rows(pool: &PgPool, assembly_id: i64) -> Vec<(i64, String)>
     .expect("查子件批次行")
 }
 
+/// 该装配件下全部未软删批次的 `(id, is_repairing)`。
+async fn child_batch_repairing_flags(pool: &PgPool, assembly_id: i64) -> Vec<(i64, bool)> {
+    sqlx::query_as(
+        "SELECT pb.id, pb.is_repairing FROM t_part_batch pb \
+         JOIN t_part p ON p.id = pb.part_id \
+         WHERE p.assembly_id = $1 AND pb.deleted_at IS NULL ORDER BY pb.id ASC",
+    )
+    .bind(assembly_id)
+    .fetch_all(pool)
+    .await
+    .expect("查子件批次 is_repairing")
+}
+
+/// `FORCE_COMPLETED` 事件行：`part_id` / `note` / `from_status` / `drawing_code`，
+/// 外加 `t_part.drawing_no` —— 用它校验事件里记的 `drawing_code` 确实等于该子件当时
+/// 的图纸号（而不是恰好填了个非空值）。
+type ForcedEventRow = (i64, String, Option<String>, Option<String>, String);
+
 /// `t_assembly` 的 `(status, serial_no)`。
 async fn assembly_row(pool: &PgPool, assembly_id: i64) -> (String, Option<String>) {
     sqlx::query_as("SELECT status, serial_no FROM t_assembly WHERE id = $1")
@@ -191,6 +209,21 @@ async fn force_complete_pushes_assembly_children_and_batches_to_completed() {
     assert_eq!(asm_status_before, "PENDING");
     assert!(asm_serial_before.is_some(), "父件建单时已派序列号");
 
+    // 预置一条 is_repairing=true：强推 SQL 把 `is_repairing = false` 与 status 写在
+    // 同一条 UPDATE 里，此前无用例钉住它 —— 被静默改回时该批次会留在返修池。
+    let repairing_batch_id = before_batches[0].0;
+    sqlx::query("UPDATE t_part_batch SET is_repairing = true WHERE id = $1")
+        .bind(repairing_batch_id)
+        .execute(&pool)
+        .await
+        .expect("预置 is_repairing=true");
+    assert!(
+        child_batch_repairing_flags(&pool, assembly_id)
+            .await
+            .contains(&(repairing_batch_id, true)),
+        "预置的 is_repairing=true 应真的落库（否则下面的断言是空转）"
+    );
+
     // 打本端点
     let (s, env) = send(
         app.clone(),
@@ -227,12 +260,18 @@ async fn force_complete_pushes_assembly_children_and_batches_to_completed() {
     for (bid, status) in child_batch_rows(&pool, assembly_id).await {
         assert_eq!(status, "COMPLETED", "批次 {bid} 应被强推为 COMPLETED");
     }
+    for (bid, is_repairing) in child_batch_repairing_flags(&pool, assembly_id).await {
+        assert!(
+            !is_repairing,
+            "批次 {bid} 强推 COMPLETED 时应一并清掉 is_repairing（否则它仍留在返修池）"
+        );
+    }
 
     // 事件日志：`FORCE_COMPLETED` 逐子件一行 + `SERIAL_RELEASED` 归档一行
-    let forced_events: Vec<(i64, String)> = sqlx::query_as(
-        "SELECT part_id, note FROM t_part_event e \
-         WHERE e.event_type = 'FORCE_COMPLETED' \
-           AND e.part_id IN (SELECT id FROM t_part WHERE assembly_id = $1)",
+    let forced_events: Vec<ForcedEventRow> = sqlx::query_as(
+        "SELECT e.part_id, e.note, e.from_status, e.drawing_code, p.drawing_no \
+         FROM t_part_event e JOIN t_part p ON p.id = e.part_id \
+         WHERE e.event_type = 'FORCE_COMPLETED' AND p.assembly_id = $1",
     )
     .bind(assembly_id)
     .fetch_all(&pool)
@@ -243,10 +282,21 @@ async fn force_complete_pushes_assembly_children_and_batches_to_completed() {
         2,
         "每个被改动的子件应有 1 条 FORCE_COMPLETED 归档行: {forced_events:?}"
     );
-    for (pid, note) in &forced_events {
+    for (pid, note, from_status, drawing_code, drawing_no) in &forced_events {
         assert!(
             note.starts_with("[FORCE_ASSEMBLY] "),
             "子件 {pid} 的 FORCE_COMPLETED note 应带 [FORCE_ASSEMBLY] 前缀便于审计区分，实际 {note:?}"
+        );
+        // 审计保真度：事件要能事后回答「从哪一态被强推、带的是哪张图纸」
+        assert_eq!(
+            from_status.as_deref(),
+            Some("PENDING"),
+            "子件 {pid} 建单时为 PENDING，事件应把强推前的状态记下来（留空就答不出「从哪态被推」）"
+        );
+        assert_eq!(
+            drawing_code.as_deref(),
+            Some(drawing_no.as_str()),
+            "子件 {pid} 的 FORCE_COMPLETED 事件应带上该子件当时的图纸号"
         );
     }
     let released_events: Vec<i64> = sqlx::query_scalar(

@@ -169,7 +169,7 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 >
 > ⚠️ **两处顶层 nest 不计入本表**：`POST /api/v2/batches/split`（`prod::split_router()`）与 `/api/v2/outsource-queue/*`（`outsource::queue_router()`）—— 二者挂 `/api/v2` 顶层而非本表的 `/api/v2/prod/*`，见「路由声明规约」第 9 条的顶层 nest 登记。
 >
-> ⚠️ **2026-10-11 新增第 3 处「非 prod 子模块但挂 `/api/v2/prod`」的 nest**：`POST /api/v2/prod/assemblies/{assembly_id}/force-complete`（`assembly::force_complete_router()`，1 条）。装配件**域本体**仍是核心实体、不进 prod（其 10 条 CRUD / 状态机端点仍在 `/api/v2/assemblies/*`，`modules::v2_router()` 顶层 nest，一行未动）；只有这条生产链路收口的逃生端点归 `/prod` 前缀，理由见 `src/modules/prod/mod.rs` 的模块 doc 与 `src/modules/assembly/mod.rs::force_complete_router`。因它不属于上表任一 prod 子模块，**不计入求和**。
+> ⚠️ **2026-10-11 新增第 3 处**不计入本表的 nest：`POST /api/v2/prod/assemblies/{assembly_id}/force-complete`（`assembly::force_complete_router()`，1 条）。装配件**域本体**仍是核心实体、不进 prod（其 10 条 CRUD / 状态机端点仍在 `/api/v2/assemblies/*`，`modules::v2_router()` 顶层 nest，一行未动）；只有这条生产链路收口的逃生端点归 `/prod` 前缀，理由见 `src/modules/prod/mod.rs` 的模块 doc 与 `src/modules/assembly/mod.rs::force_complete_router`。**本处是首处挂在 `/api/v2/prod` 下的非 prod 子模块 nest**（另两处挂 `/api/v2` 顶层，见上一段）。因它不属于上表任一 prod 子模块，**不计入求和**。
 >
 > 求和演变：2026-10-08 `prod::worker_pool` 6 条 → `prod::queue` 9 条、`prod::batch` 27 条 → 23 条（两域间净移动 4 条，prod 域求和 62 → 61），同日在 `com` 聚合新增 `com::delivery_note` 子模块 17 条 ⇒ 61 + 17 = 78；2026-10-09 外协三端点合并为 `POST /api/v2/outsource-queue/move`（`outsource` 域）⇒ `prod::batch` 23 → 20（prod 域求和 61 → **58**），同日拆批 1 条提升为顶层共用端点（不计入本表）⇒ `prod::batch` 20 → 19（prod 域求和 **57**）⇒ 全表 **57 + 17 = 74**；2026-10-10 报工台 5 端点收拢进新建的 `prod::scan`：`prod::worker` 7 → 6、`prod::batch` 19 → 17、`part` 域两条 list 端点（不计入本表，part 无独立表）迁入 ⇒ `prod::scan` 5 条，prod 域求和 **57** → 55（−3）⇒ 全表 **55 + 17 = 72**。⚠️ 本表 12 行里含 `prod::scan` 的求和（76）与「prod 域求和 + com 域」的求和（72）是两个口径：前者按上表**列出的 12 个子模块**算（含 `com::delivery_note` 的 17 条、但不含 part / iam 各域），后者只算 prod 域自己的子模块。
 
@@ -273,6 +273,12 @@ t_assembly.status               ← 派生缓存
   ⚠️ 手工补调 `PartService::sync_from_batch_change` 是**反模式**：第二次派生必为
   `NoChange`，会把响应的 `synced_assembly_id` 吞成 `null`、连带 WS 的
   `ASSEMBLY_UPDATED` 永不发。
+  ⚠️ **例外（2026-10-11 新增）**：装配件级逃生写点
+  `force_complete_all_batches_for_assembly` **只写不派生** —— 批量 UPDATE 命中
+  0 行时派生循环一次都不跑，而该端点的语义是「整体判为已交」，终态改由
+  `AssemblyRepo::force_complete_children` / `force_complete_status` 两条显式写
+  承担。职责切分与返回值用法限制见该函数 doc，不要按上面「写必派生」的口径去
+  「修」它。
 - **CI 强制**：`cargo test --lib` 的
   `shared::batch::status::write_guard_tests::no_outside_file_writes_batch_status`
   扫全 `src/**/*.rs`，除 `src/shared/batch/status.rs` 外任何文件写

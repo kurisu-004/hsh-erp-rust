@@ -268,15 +268,15 @@ service 规范化后由 `repo.rs::escape_like` 把用户 keyword 里的 `\ / % /
 
 前端 `useDashboardInvalidation.ts` 的 `AFFECTS_DASHBOARD` 集合是 dashboard 域的失效白名单，与本域**没有**订阅关系 —— 本域页面不消费 WS 事件。⚠️ 而 §7.1 表里的 `kind` **有一部分连 `frontend/src/types/dashboard.ts` 的 `DashboardEventType` 联合类型都没进**，遑论进白名单。
 
-⚠️ 下表是 §7.1 全部 13 个 `kind` 与该联合的**逐项差集**（2026-10-07 review 第 1 轮补全 —— 原版只列了 6 个，漏了 `PART_COMPLETED`；2026-10-11 随装配件级强制完成端点新增 `ASSEMBLY_FORCE_COMPLETED`、`PART_FORCE_COMPLETED` 两行）。⚠️ 后端 `kind` 是裸 `String`、**无枚举保护**，所以这份差集不会在任一侧编译失败，只会在「列表不动」这类症状里显形；⚠️ §7.1 每新增一个 `kind` 都要回来重算本表。
+⚠️ 下表是 §7.1 全部 13 个 `kind` 与该联合的**逐项差集**（2026-10-07 review 第 1 轮补全 —— 原版只列了 6 个，漏了 `PART_COMPLETED`；2026-10-11 随装配件级强制完成端点**新增 `ASSEMBLY_FORCE_COMPLETED` 一行**、并把 `PART_FORCE_COMPLETED` 的判定补进本表）。⚠️ 后端 `kind` 是裸 `String`、**无枚举保护**，所以这份差集不会在任一侧编译失败，只会在「列表不动」这类症状里显形；⚠️ §7.1 每新增一个 `kind` 都要回来重算本表。
 
 | §7.1 `kind` | 在 `DashboardEventType` 联合里？ |
 |---|---|
 | `PART_RELEASED_FROM_PROGRAMMING` | ❌ 不在（**本域唯一写出口**，见 §8.3 第 1 条） |
 | `PART_CANCELLED` | ❌ 不在 |
 | `PART_COMPLETED` | ❌ 不在 |
-| `PART_FORCE_COMPLETED` | ✅ 在（2026-10-11 补：前端本轮接入该 kind） |
-| `ASSEMBLY_FORCE_COMPLETED` | ✅ 在（2026-10-11 新增：前端本轮接入该 kind） |
+| `PART_FORCE_COMPLETED` | ✅ 在（2026-10-11 补进本表：前端 `feat/assembly-force-complete` 分支已接入该 kind） |
+| `ASSEMBLY_FORCE_COMPLETED` | ✅ 在（2026-10-11 新增：前端 `feat/assembly-force-complete` 分支已接入该 kind） |
 | `BATCH_PLACED_ON_SHELF` | ❌ 不在（⚠️ 易误判：联合里那个是 v1 旧事件集里的 `PLACED_ON_SHELF`，**与本 kind 不是同一个字符串**） |
 | `PART_SENT_TO_OUTSOURCE` | ❌ 不在 |
 | `PART_RECEIVED_FROM_OUTSOURCE` | ❌ 不在 |
@@ -288,7 +288,9 @@ service 规范化后由 `repo.rs::escape_like` 把用户 keyword 里的 `\ / % /
 
 ⇒ 差集共 **6 个**（`PART_RELEASED_FROM_PROGRAMMING` / `PART_CANCELLED` / `PART_COMPLETED` /
 `BATCH_PLACED_ON_SHELF` / `PART_SENT_TO_OUTSOURCE` / `PART_RECEIVED_FROM_OUTSOURCE`），交集 7 个。
-`PART_FORCE_COMPLETED` 于 2026-10-11 随装配件级强制完成端点一并接入前端联合类型。
+`PART_FORCE_COMPLETED` 与 `ASSEMBLY_FORCE_COMPLETED` 于 2026-10-11 随装配件级强制完成端点
+一并接入前端联合类型 —— ⚠️ 载体是前端**并行分支** `feat/assembly-force-complete`，frontend
+`main` 尚未合入，故上表两行的 ✅ 是「该分支的现状」而非「线上已生效」。
 
 ⚠️ 仍**未接**的已知项：`PART_CANCELLED` / `PART_COMPLETED`（见上表）与 `ROLLUP_RECOMPUTED`（后端 `kind` 已在发、但它不属于本域 §7.1 的表，两侧都没接）—— 按产品决定后续统一处理，此处只登记事实。
 

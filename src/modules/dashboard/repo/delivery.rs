@@ -101,15 +101,22 @@ pub const DELIVERY_DETAIL_LIMIT: i64 = 200;
 /// `delivered_sets` 只用来填 `delivered_quantity` 这个**展示值**。两者在本不变式下同解，
 /// 但桶归属永远只看 SQL 的 `NOT EXISTS` / `EXISTS` —— 不要把其中任何一条当成漏判「修」掉。
 ///
-/// **不变式被破坏后的实际现象**（无装配件套数校验的写路径共 **3 条**，都经
-/// `shared::batch::status` 写批次、都不看父装配件的套数，故都能单独交子件：
+/// **不变式被破坏后的实际现象**（无装配件套数校验的写路径共 **4 条**，都经
+/// `shared::batch::status` 写批次、都不看父装配件的套数）：
 /// - `POST /api/v2/prod/batches/{batch_id}/deliver` —— `mark_batch_delivered` 只查
-///   `allowed_from: &["READY_TO_SHIP"]`；
+///   `allowed_from: &["READY_TO_SHIP"]`，可**单独交一个子件**；
 /// - `POST /api/v2/prod/batches/scan/deliver` —— `prod::batch::service::scan::scan_deliver_part`
-///   同样只查 `part.status == READY_TO_SHIP` 就 `mark_batch_delivered`（司机扫码发货）；
+///   同样只查 `part.status == READY_TO_SHIP` 就 `mark_batch_delivered`（司机扫码发货），
+///   可单独交一个子件；
 /// - `POST /api/v2/parts/{part_id}/force-complete` —— `force_complete_all_batches_for_part`
 ///   把该 part 全部非 CANCELLED 批次强推 `COMPLETED`，而本守卫的 `status IN
-///   ('DELIVERED','COMPLETED')` 把 `COMPLETED` 也算已交。
+///   ('DELIVERED','COMPLETED')` 把 `COMPLETED` 也算已交，可单独交一个子件；
+/// - `POST /api/v2/prod/assemblies/{assembly_id}/force-complete` —— 同一机制但作用对象是
+///   **全部子件**（`force_complete_all_batches_for_assembly` 强推 +
+///   `force_complete_children` / `force_complete_status` 显式写终态），**不会**单独交一个
+///   子件。它残留的破坏形态是「某个子件的非 CANCELLED 批次为 0 条」（批次全 CANCELLED
+///   或尚未拆批）：该子件仍是 0 套、兄弟子件却已交 ⇒ 本守卫的 `EXISTS` 命中，装配件落
+///   `partial` 桶而 `delivered_sets` 为 0。
 ///
 /// 另两条**不**构成破坏路径：送货单路径经 `entry_max_sets` 闸门
 /// （`com::delivery_note::service::scan_entry`，错误码 21405）维持不变式；
@@ -525,7 +532,7 @@ impl DeliveryRepo {
     /// 本函数**不参与桶归属**：三桶的归属判据是 SQL 里的 `NOT EXISTS` / `EXISTS`
     /// （KPI 与 `upcoming` / `overdue` 两桶逐字相同），本函数只负责填 `delivered_quantity`
     /// 这个展示值。不变式被破坏时错位的是展示值（行落 `partial` 却显示 0 套），不是
-    /// KPI ↔ 面板的行集合；完整推导 + 三条破坏路径 + 存量违规排查 SQL 见
+    /// KPI ↔ 面板的行集合；完整推导 + 四条破坏路径 + 存量违规排查 SQL 见
     /// `SQL_COUNT_OVERDUE` 的 doc 与 `docs/api/dashboard.md` §4.4。
     ///
     /// SQL 条数：1 条，与桶行数无关（防 N+1 往返）；扫描量是 O(本页装配件的子件总数)。
