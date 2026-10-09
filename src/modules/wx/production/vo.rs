@@ -140,9 +140,10 @@ pub struct ProductionBatchCardOut {
     /// ⚠️⚠️ **与前端 TS 模型的类型差（2026-10-11 review 第 1 轮登记）**：
     /// 前端 `BatchPartCard.batchNo` 的 TS 类型是 **`string`**
     /// （`wx-app/miniprogram/mock/parts.ts`），但**这不是本 VO 的 bug**：小程序侧
-    /// 有一层映射把 number 变成字符串 —— `services/parts.ts::toPartCard` 与
-    /// `services/production.ts::toBatchCard` 都写的是
-    /// `String(it.batch_no).padStart(2, '0')`，`padStart` 是对 `String(...)` 的结果
+    /// 有一层映射把 number 变成字符串 —— `services/parts.ts::toPartCardItem` 写的是
+    /// `String(it.batchNo ?? 1).padStart(2, '0')`、`services/production.ts::toBatchCard`
+    /// 写的是 `String(it.batchNo).padStart(2, '0')`，
+    /// `padStart` 是对 `String(...)` 的结果
     /// 调的（不是对 number 直接调）；`<part-card>` 组件的模板
     /// （`part-card.wxml`）只直接渲染 `{{item.batchNo}}`，**本身不做转换**。
     ///

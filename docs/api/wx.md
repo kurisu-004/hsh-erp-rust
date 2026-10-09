@@ -747,16 +747,23 @@ read-committed 下**可能跨快照**。见 §3.8 末段。
 | 2 / 3（`part_list`，`kind=batch`） | `batchNo` | **number \| null**（`Option<i32>`） | **`string`** |
 
 **转换发生在小程序侧，且是既有映射层，不是本仓**：
-- `wx-app/miniprogram/services/parts.ts::toPartCard` → `String(it.current_batch_no ?? 1).padStart(2, '0')`
-- `wx-app/miniprogram/services/production.ts::toBatchCard` → `String(it.batch_no).padStart(2, '0')`
+- `wx-app/miniprogram/services/parts.ts::toPartCardItem` → `String(it.batchNo ?? 1).padStart(2, '0')`
+- `wx-app/miniprogram/services/production.ts::toBatchCard` → `String(it.batchNo).padStart(2, '0')`
 - 组件 `part-card.wxml` 只 `{{item.batchNo}}` **直接渲染**，自身不做转换
 
 ⇒ 本域 VO 模块 doc 里「逐字对齐前端卡片模型……前端可直接把响应塞进
 `ProductionBatchCardData`」这句话**只对字段名成立、对 `batchNo` 不成立**（旧文案
-没写这个限定，容易被读成「整条响应直连卡片模型」）。同族未登记项：`serialNo`
+没写这个限定，容易被读成「整条响应直连卡片模型」）。同族字段：`serialNo`
 后端是 `string | null`，前端 `BasePartCard.serialNo` 声明为 `string`（非可选）——
-`null` 会渲染成空白，TS 侧要靠 `?? ''` 兜（`toPartCard` 里写了 `serialNo: it.serial_no`
-直传，实际会渲染出 `null` 字面量，属前端既有行为，本轮**不联动改前端**，只登记）。
+但这个类型差**端到端不漏**：前端映射层 `services/parts.ts::toPartCardItem` 与
+`services/production.ts::toBatchCard` **都已经写了 `serialNo: it.serialNo ?? ''`**，
+`part-card.wxml:16` 又是直接 `{{item.serialNo}}` 渲染 ⇒ 后端的 `null` 在卡片上
+**渲染成空白**，不会出现字面量 `null`（与 §8.7 `worker.workType` 同一渲染口径：
+空串渲染成空白、`null` 才会渲染成字面量 `null`）。
+（2026-10-11 review 第 2 轮更正：旧文案写「映射层 `serialNo` 直传、会渲染出字面量
+`null`」，与代码不符；此处以前端 worktree 源码与
+`test/services/parts.test.ts` 的用例为准。）本轮**不联动改前端**，此处只登记
+「后端可空 / 前端声明非可选」这个类型差本身。
 
 **处置**：**不改后端**。`t_part_batch.batch_no` 是 `int`；把 JSON 改成 string 会让
 端点 4/5 与端点 2/3（同名字段、同源列）类型不一致，是拿一个类型差换另一个。真要消

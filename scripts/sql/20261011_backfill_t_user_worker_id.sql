@@ -39,8 +39,14 @@
 --   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
 --     -f scripts/sql/20261011_backfill_t_user_worker_id.sql
 --
---   ⚠️ `-v ON_ERROR_STOP=1` **不可省**：没有它，§3 的 UPDATE 一旦报错 psql 只打印
---   错误并**继续往下跑**末尾的 `COMMIT;`，把半截结果提交进库。
+--   ⚠️ `-v ON_ERROR_STOP=1` **不可省**，但理由不是「防半截结果落库」。
+--     末尾的 `BEGIN;` / `COMMIT;` 已经兜住了落库：PG 里 §3 的 UPDATE 一旦报错，
+--     事务即被 abort，末尾的 `COMMIT;` 会被降级成 `ROLLBACK;`（2026-10-11 实测：
+--     输出 `ERROR: current transaction is aborted` + `ROLLBACK`）⇒ **不会**写进半截结果。
+--     真实理由是**可观测性**：不加它时 psql 遇错只打印错误、**继续把整份脚本跑完
+--     并以 exit 0 退出**（2026-10-11 实测 exit=0）⇒ 脚本失败在 CI / 运维侧完全看不见，
+--     操作者只会看到一句 stdout 里的 ERROR 就以为跑成功了。加它才能让失败变成非 0
+--     退出码并立刻中断后续语句。
 --
 -- ## 推断规则（保守，宁可留 NULL 也不猜）
 --   候选 = `t_user.username` 与 `t_worker.badge_code` **逐字相等**且双方均未软删，

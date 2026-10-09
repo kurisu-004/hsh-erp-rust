@@ -31,7 +31,8 @@ pub struct ProductionBatchRow {
     /// `t_part_batch.batch_no`（**数字**）。
     ///
     /// ⚠️ 前端 `BatchPartCard.batchNo` 的 TS 类型是 `string` —— 转换发生在小程序侧的
-    /// 映射层（`String(it.batch_no).padStart(2, '0')`），**不是**本域。类型差登记在
+    /// 映射层（`toBatchCard` 里的 `String(it.batchNo).padStart(2, '0')`），
+    /// **不是**本域。类型差登记在
     /// `docs/api/wx.md` §8.11。
     pub batch_no: i32,
     /// `t_part_batch.quantity`（**本批次**件数，见 `vo.rs` 的口径陷阱登记）

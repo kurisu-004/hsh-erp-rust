@@ -117,7 +117,7 @@ pub struct BatchCard {
     ///
     /// ⚠️ **JSON number / 可空**（2026-10-11 review 第 1 轮登记的与前端 TS 模型的
     /// 类型差）：前端 `BatchPartCard.batchNo` 声明为 **`string`**，但小程序侧有映射
-    /// 层 `services/parts.ts::toPartCard` 做 `String(it.current_batch_no ?? 1)
+    /// 层 `services/parts.ts::toPartCardItem` 做 `String(it.batchNo ?? 1)
     /// .padStart(2, '0')` —— 注意 `?? 1` 这个**兜底默认值 1**：本字段返 `null` 时
     /// 前端渲染成 `01` 而不是空白。这是既有前端行为，本轮不改，只登记以免后人把
     /// `Option<i32>` 当成「VO 逐字对齐前端模型」的证据。详见 `docs/api/wx.md` §8.11
