@@ -260,7 +260,7 @@ size` 这个公式，而新算法是「取 `size + 1` 条判超」（见 §3.4�
 | 字段 | 类型 | 口径 |
 |---|---|---|
 | `batchCount` | number | 该工人当月发生过事件的**不同 `batch_id`** 数 |
-| `workHours` | number | 该工人当月 `PICKED_UP + RETURNED` 事件的 `SUM(quantity)`（**工作量估算**，DB 无 `work_hours` 列） |
+| `workHours` | number | 该工人当月 `PICKED_UP + RETURNED_TO_SHELF` 事件的 `SUM(quantity)`（**工作量估算**，DB 无 `work_hours` 列） |
 
 `BatchCountsOut`（2 字段）：
 
@@ -818,7 +818,7 @@ CurrentUser.id (t_user.id)
 | 字段 | SQL |
 |---|---|
 | `batchCount` | `COUNT(DISTINCT batch_id) FILTER (WHERE batch_id IS NOT NULL)`，限该工人 + 当月 `created_at` |
-| `workHours` | `COALESCE(SUM(quantity) FILTER (WHERE event_type IN ('PICKED_UP','RETURNED')), 0)`，限该工人 + 当月 `created_at` |
+| `workHours` | `COALESCE(SUM(quantity) FILTER (WHERE event_type IN ('PICKED_UP','RETURNED_TO_SHELF')), 0)`，限该工人 + 当月 `created_at` |
 
 ⚠️ `workHours` 是**工作量估算**（DB schema 无 `work_hours` 列），用「加工件数」顶替
 —— 与 `statistics` 域的同形口径一致。

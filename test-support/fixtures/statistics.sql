@@ -17,17 +17,15 @@
 --    （2026-09-24）走 service 层直调，无 JWT 登录，不需用户；user 复用仅为
 --    与其它域 fixture 形态对齐，未来若加 HTTP 契约测试可直接复用 fx_part_manager。
 --
---  ## 不预置 t_customer / t_part / t_part_batch / t_part_event /
---    t_pickup_skip_event / t_worker
+--  ## 不预置 t_customer / t_part / t_part_batch / t_part_event / t_worker
 --  statistics 域测试每个用例都按需造不同 prefix 的 L1 + 不同 status 的 part +
---    不同 event_type 的 part_event + 不同 worker_id 的 pickup_skip_event /
---    不同 badge_code 的 worker：
+--    不同 event_type 的 part_event + 不同 badge_code 的 worker：
 --  - `uq_t_customer_root_prefix` 唯一索引要求 L1 prefix 全局唯一，测试自建
 --    L1(prefix='F')，fixture 不预置避免冲突。
 --  - 状态机不允许 part 从 IN_PROCESS / COMPLETED 回退 PENDING，预置 PENDING
 --    行会让 count_in_process_at 等「期望空库」断言失败。
---  - part_event / pickup_skip_event 都是测试现场按 event_type / worker_id /
---    part_id / created_at 构造，fixture 不预置避免污染。
+--  - part_event 是测试现场按 event_type / worker_id / part_id / created_at 构造，
+--    fixture 不预置避免污染。
 --  - **t_worker 不预置**：`StatisticsService::worker_stats` 按日期范围列出全部
 --    有 / 无事件的工人，而该方法当前**无** happy-path 集成测试（见 CLAUDE.md
 --    「覆盖空洞登记」）。不预置的理由是**前瞻约束**、不是对现有断言的描述：
@@ -49,7 +47,7 @@
 
 -- ---- 工种（FX-WT-STAT；不与 part.sql FX-WT-A / production.sql FX-WTA/FX-WTB 重复）----
 -- 预置 1 工种 baseline：供 `fx.work_type_id` 强类型句柄使用；统计端点的
--- worker_stats / worker_detail / pickup_skip_* 均按 worker 维度聚合，
+-- worker_stats / worker_detail 均按 worker 维度聚合，
 -- 工种存在不引入第 3 个工人，安全。
 INSERT INTO t_work_type (id, code, name, sort_order, max_held_batches, version, created_at, updated_at)
 VALUES

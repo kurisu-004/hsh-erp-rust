@@ -870,7 +870,7 @@ async fn bound_worker_exposes_name_work_type_and_nonzero_stats() {
     assert_eq!(
         env["data"]["stats"]["workHours"],
         json!(f64::from(total_qty)),
-        "workHours = PICKED_UP + RETURNED 的 SUM(quantity)（工作量估算）: {env}"
+        "workHours = PICKED_UP + RETURNED_TO_SHELF 的 SUM(quantity)（工作量估算）: {env}"
     );
 
     // ⚠️ 未分配工种 / 工种已软删 ⇒ workType 退化成**空串**（不是 null）。
@@ -1027,7 +1027,7 @@ async fn stats_are_filtered_by_the_logged_in_users_worker() {
     assert_eq!(
         env["data"]["stats"]["workHours"],
         json!(20.0),
-        "workHours 只求和绑定工人的 PICKED_UP/RETURNED quantity（2×10；\
+        "workHours 只求和绑定工人的 PICKED_UP/RETURNED_TO_SHELF quantity（2×10；\
          上月的 999 与乙的 300 都不该进来）: {env}"
     );
 

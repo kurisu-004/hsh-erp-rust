@@ -12,6 +12,14 @@
 //! 4 个原始行 dataclass-like 结构。trait impl 统一收在 `super::mod.rs`（Rust
 //! coherence 规则：同 crate 内同一 trait 对同一类型至多一个 impl 块）。
 //! SQL 字符串与原 `repo.rs` byte-identical（PR8 硬约束 零 SQL 文本变化）。
+//!
+//! ## 2026-10-12：跳序取件（tab4）清空
+//! 删 3 个 free fn（`pickup_skip_summary` / `pickup_skip_detail` /
+//! `pickup_skip_detail_count`）+ 2 个 row struct（`PickupSkipSummaryRow` /
+//! `PickupSkipDetailRow`）⇒ 现存 13 个 free fn + 2 个 row struct。数据源表
+//! `t_pickup_skip_event` 由同批 migration 删除（写入点早已随 Python v1 退役消失）。
+//! 同时把 `worker_detail_events` 里 `'RETURNED'` 修正为 `'RETURNED_TO_SHELF'`
+//! （Rust 侧实际写的事件类型，详见该函数 doc）。
 
 use chrono::{NaiveDate, NaiveDateTime};
 use rust_decimal::Decimal;
@@ -306,6 +314,13 @@ pub async fn worker_pickup_rows<'e, E: PgExecutor<'e>>(
 // ============================================================
 
 /// 单工人 `(pickup_count, pickup_quantity, return_count)`（CASE 聚合）。
+///
+/// ⚠️ 2026-10-12：放回口径的字面量由 `'RETURNED'` 修正为 `'RETURNED_TO_SHELF'`。
+/// Rust 侧写侧落的事件类型是 `RETURNED_TO_SHELF`（`prod::scan::service::worker_scan`
+/// 写事件处），`'RETURNED'` 是 Python v1 时代的字面量、Rust 从不写 ⇒ 修正前
+/// `return_cnt` 与下方 `event_type IN (...)` 的过滤**恒为 0**（不是「没发生过
+/// 放回」，是「字面量对不上」）。已写入的历史放回事件也全部记在
+/// `RETURNED_TO_SHELF` 名下，修正后一并被统计到。
 pub async fn worker_detail_events(
     conn: &mut PgConnection,
     worker_id: i64,
@@ -316,10 +331,10 @@ pub async fn worker_detail_events(
         "SELECT \
              COALESCE(SUM(CASE WHEN event_type = 'PICKED_UP' THEN 1 ELSE 0 END), 0)::bigint AS pickup_cnt, \
              COALESCE(SUM(CASE WHEN event_type = 'PICKED_UP' THEN quantity ELSE NULL END), 0)::bigint AS pickup_qty, \
-             COALESCE(SUM(CASE WHEN event_type = 'RETURNED' THEN 1 ELSE 0 END), 0)::bigint AS return_cnt \
+             COALESCE(SUM(CASE WHEN event_type = 'RETURNED_TO_SHELF' THEN 1 ELSE 0 END), 0)::bigint AS return_cnt \
          FROM t_part_event \
          WHERE worker_id = $1 \
-           AND event_type IN ('PICKED_UP', 'RETURNED') \
+           AND event_type IN ('PICKED_UP', 'RETURNED_TO_SHELF') \
            AND created_at >= $2::timestamp \
            AND created_at < ($3::date + INTERVAL '1 day')::timestamp",
     )
@@ -415,116 +430,6 @@ pub async fn worker_parts(
 }
 
 // ============================================================
-// tab4：跳序取件
-// ============================================================
-
-/// 按工人聚合跳序次数 + 最近跳序时间。LEFT JOIN 兜底软删工人 → `(已删除)`。
-pub async fn pickup_skip_summary(
-    conn: &mut PgConnection,
-) -> Result<Vec<PickupSkipSummaryRow>, sqlx::Error> {
-    let rows = sqlx::query(
-        "SELECT p.worker_id      AS worker_id, \
-                COALESCE(w.name, '(已删除)') AS worker_name, \
-                COALESCE(w.badge_code, '')  AS badge_code, \
-                wt.name          AS work_type_name, \
-                COUNT(p.id)::bigint         AS skip_count, \
-                MAX(p.created_at) AS last_skip_at \
-         FROM t_pickup_skip_event p \
-         LEFT JOIN t_worker w ON w.id = p.worker_id \
-         LEFT JOIN t_work_type wt ON wt.id = p.work_type_id \
-         GROUP BY p.worker_id, w.name, w.badge_code, wt.name \
-         ORDER BY COUNT(p.id) DESC, MAX(p.created_at) DESC",
-    )
-    .fetch_all(conn)
-    .await?;
-    rows.into_iter()
-        .map(|r| {
-            Ok(PickupSkipSummaryRow {
-                worker_id: r.get::<i64, _>("worker_id"),
-                worker_name: r.get::<String, _>("worker_name"),
-                badge_code: r.get::<String, _>("badge_code"),
-                work_type_name: r
-                    .try_get::<Option<String>, _>("work_type_name")
-                    .ok()
-                    .flatten(),
-                skip_count: r.get::<i64, _>("skip_count"),
-                last_skip_at: r
-                    .try_get::<Option<NaiveDateTime>, _>("last_skip_at")
-                    .ok()
-                    .flatten(),
-            })
-        })
-        .collect()
-}
-
-/// 单工人跳序事件明细分页（按 created_at desc, id desc）。
-pub async fn pickup_skip_detail(
-    conn: &mut PgConnection,
-    worker_id: i64,
-    limit: i64,
-    offset: i64,
-) -> Result<Vec<PickupSkipDetailRow>, sqlx::Error> {
-    let rows = sqlx::query(
-        "SELECT p.id AS id, \
-                p.part_id   AS part_id, \
-                p.part_serial_no AS serial_no, \
-                COALESCE(pa.name, '(已删除)') AS part_name, \
-                p.batch_no  AS batch_no, \
-                p.quantity  AS quantity, \
-                p.part_planned_delivery_date  AS part_planned_delivery_date, \
-                p.skipped_earliest_date       AS skipped_earliest_date, \
-                p.created_at AS created_at \
-         FROM t_pickup_skip_event p \
-         LEFT JOIN t_part pa ON pa.id = p.part_id \
-         WHERE p.worker_id = $1 \
-         ORDER BY p.created_at DESC, p.id DESC \
-         LIMIT $2 OFFSET $3",
-    )
-    .bind(worker_id)
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(conn)
-    .await?;
-    rows.into_iter()
-        .map(|r| {
-            Ok(PickupSkipDetailRow {
-                id: r.get::<i64, _>("id"),
-                part_id: r.get::<i64, _>("part_id"),
-                serial_no: r.try_get::<Option<String>, _>("serial_no").ok().flatten(),
-                part_name: r.get::<String, _>("part_name"),
-                batch_no: r.try_get::<i32, _>("batch_no").unwrap_or(0),
-                quantity: r.try_get::<i32, _>("quantity").unwrap_or(0),
-                part_planned_delivery_date: r
-                    .try_get::<Option<NaiveDate>, _>("part_planned_delivery_date")
-                    .ok()
-                    .flatten(),
-                skipped_earliest_date: r
-                    .try_get::<Option<NaiveDate>, _>("skipped_earliest_date")
-                    .ok()
-                    .flatten(),
-                created_at: r.get::<NaiveDateTime, _>("created_at"),
-            })
-        })
-        .collect()
-}
-
-/// 单工人跳序事件总数。
-pub async fn pickup_skip_detail_count(
-    conn: &mut PgConnection,
-    worker_id: i64,
-) -> Result<i64, sqlx::Error> {
-    let row = sqlx::query(
-        "SELECT COUNT(*)::bigint AS cnt \
-         FROM t_pickup_skip_event \
-         WHERE worker_id = $1",
-    )
-    .bind(worker_id)
-    .fetch_one(conn)
-    .await?;
-    Ok(row.get::<i64, _>("cnt"))
-}
-
-// ============================================================
 // 原始行 dataclass-like 结构（service 层消费）
 // ============================================================
 
@@ -546,27 +451,4 @@ pub struct WorkerPartRow {
     pub status: String,
     pub pickup_count: i64,
     pub last_pickup_at: NaiveDateTime,
-}
-
-#[derive(Debug, Clone)]
-pub struct PickupSkipSummaryRow {
-    pub worker_id: i64,
-    pub worker_name: String,
-    pub badge_code: String,
-    pub work_type_name: Option<String>,
-    pub skip_count: i64,
-    pub last_skip_at: Option<NaiveDateTime>,
-}
-
-#[derive(Debug, Clone)]
-pub struct PickupSkipDetailRow {
-    pub id: i64,
-    pub part_id: i64,
-    pub serial_no: Option<String>,
-    pub part_name: String,
-    pub batch_no: i32,
-    pub quantity: i32,
-    pub part_planned_delivery_date: Option<NaiveDate>,
-    pub skipped_earliest_date: Option<NaiveDate>,
-    pub created_at: NaiveDateTime,
 }

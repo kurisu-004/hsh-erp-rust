@@ -8,6 +8,7 @@
 //!
 //! 2026-09-15 takeover-fill：完整化 5 端点（overview / workers / workers/{id} /
 //! pickup-skips / pickup-skips/{id}），权限统一 MANAGER-only。
+//! 2026-10-12：pickup-skips 两端点随 `t_pickup_skip_event` 删除下线，剩 3 端点。
 
 pub mod dto;
 pub mod handler;

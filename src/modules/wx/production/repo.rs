@@ -49,6 +49,10 @@ pub struct ProductionRepo;
 ///
 /// ⚠️ `work_hours` 子查询**刻意不带** `COALESCE`：`SUM` 在无匹配行时返回 NULL，
 /// 让「本月零工时」投影成 `null` 而不是 `0`（前端 `!= null` 守门依赖这个）。
+///
+/// ⚠️ 2026-10-12：事件类型字面量由 `'RETURNED'` 修正为 `'RETURNED_TO_SHELF'`。
+/// Rust 侧写侧落的事件类型是 `RETURNED_TO_SHELF`，`'RETURNED'` 是 Python v1 时代
+/// 的字面量、Rust 从不写 ⇒ 修正前放回那半边恒不计入 `work_hours`。
 const SELECT_COLS: &str = "SELECT
     b.id                            AS id,
     p.serial_no                     AS serial_no,
@@ -71,7 +75,7 @@ const SELECT_COLS: &str = "SELECT
         SELECT SUM(e_qty.quantity)::float8
         FROM t_part_event e_qty
         WHERE e_qty.batch_id = b.id
-          AND e_qty.event_type IN ('PICKED_UP', 'RETURNED')
+          AND e_qty.event_type IN ('PICKED_UP', 'RETURNED_TO_SHELF')
     )                               AS work_hours";
 
 /// FROM 子句（批次 + 工单 + 当前持有人）。
@@ -165,11 +169,22 @@ impl ProductionRepo {
     /// 工人当月工作量（`t_part_event` 单条聚合查询）。
     ///
     /// - `batch_count` = 该工人当月发生过事件的**不同 `batch_id`** 数
-    /// - `qty_sum` = 该工人当月 `PICKED_UP + RETURNED` 事件的 `SUM(quantity)`
-    ///   （工作量估算；DB schema 无 `work_hours` 列）
+    /// - `qty_sum` = 该工人当月 `PICKED_UP + RETURNED_TO_SHELF` 事件的
+    ///   `SUM(quantity)`（工作量估算；DB schema 无 `work_hours` 列）
+    ///
+    /// ⚠️ 事件类型字面量：`RETURNED_TO_SHELF` 是 Rust 侧写侧实际落库的类型
+    /// （`prod::scan::service::worker_scan` 写事件处），`'RETURNED'` 是 Python v1
+    /// 时代的字面量、Rust 从不写。2026-10-12 修正（原 `RETURNED` 使放回那半边恒不
+    /// 计入）。
     ///
     /// ⚠️ `worker_id` 参数是 **`t_worker.id`**，不是 `t_user.id` —— 旧实现传的是
     /// 后者，那正是本端点恒返 0 的原因（`find_worker_by_user` 解链后再传进来）。
+    ///
+    /// ⚠️ 另一条恒空的过滤是 `WHERE worker_id = $1` 命中 0 行：**`t_part_event.worker_id`
+    /// 从未被写入**（Rust 侧全部 INSERT 不带该列，Python v1 退役后一直是 NULL），
+    /// 与上一条的 ID 语义是两个独立问题。写侧补 `worker_id` 属生产统计重构的
+    /// 后续任务，本文件**刻意不动**这段 SQL —— 在补列落地前改 ID 语义也不会让它
+    /// 返出非 0。
     pub async fn worker_stats_by_period<'e, E: PgExecutor<'e>>(
         executor: E,
         worker_id: i64,
@@ -184,7 +199,7 @@ impl ProductionRepo {
                 COUNT(DISTINCT batch_id) FILTER (WHERE batch_id IS NOT NULL)
                     AS "batch_count!",
                 COALESCE(
-                    SUM(quantity) FILTER (WHERE event_type IN ('PICKED_UP', 'RETURNED')),
+                    SUM(quantity) FILTER (WHERE event_type IN ('PICKED_UP', 'RETURNED_TO_SHELF')),
                     0
                 )::bigint AS "qty_sum!"
             FROM t_part_event

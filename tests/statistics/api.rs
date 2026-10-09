@@ -1,10 +1,11 @@
 //! statistics 域集成测试（2026-09-15 takeover-fill）
 //!
-//! 覆盖（4 用例）：
+//! 覆盖（2 用例）：
 //!   1. overview_invalid_date_range_returns_400 — date_from > date_to → BIZ 20104
-//!   2. pickup_skips_summary_happy_path         — MANAGER 调 pickup-skips summary
-//!   3. pickup_skip_detail_happy_path           — pickup-skips detail（分页）
-//!   4. count_in_process_at_date_to_boundary    — 期末在制口径（date_to 边界）
+//!   2. count_in_process_at_date_to_boundary    — 期末在制口径（date_to 边界）
+//!
+//! 2026-10-12：`pickup_skips_summary_happy_path` / `pickup_skip_detail_happy_path`
+//! 两条随数据源表 `t_pickup_skip_event` 删除一并移除（表已不存在，测试也无从断言）。
 //!
 //! ⚠️ **覆盖空洞（2026-10-10）**：`StatisticsService::overview` / `worker_stats` /
 //! `worker_detail` **无 happy-path 集成测试**。原三条把查询窗口硬编码成绝对日期、
@@ -23,7 +24,7 @@
 //! 都要按需造不同 code / badge / prefix / name 的行（与 fixture 预置的
 //! FX-WT-STAT baseline 不同），保留本地 fn 直插。
 //!
-//! ## 不预置 part / batch / event / pickup_skip_event
+//! ## 不预置 part / batch / event
 //! statistics 域状态机不允许从 IN_PROCESS / COMPLETED 回退 PENDING，且事件行
 //! (event_type / worker_id / created_at) 由测试现场按场景构造，fixture 故不
 //! 预置这些行，保留为本地 fn 直插以避免污染「期望空库」断言。
@@ -174,100 +175,6 @@ async fn overview_invalid_date_range_returns_400() {
             assert_eq!(code, 20104, "BIZ_INVALID_VALUE");
         }
         other => panic!("期望 AppError::Biz(20104)，got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn pickup_skips_summary_happy_path() {
-    let (pool, _fx) = setup().await;
-    let wt = insert_work_type(&pool, "WT-SK", "车工").await;
-    let w_id = insert_worker(&pool, "B004", "跳序工", Some(wt)).await;
-    let l1 = insert_l1_customer(&pool, "客户S-4", "F").await;
-    let l2 = insert_l2_customer(&pool, l1, "子客S-4").await;
-    let part_id = insert_part(&pool, l2, "p-skip").await;
-    let now = now_naive();
-    let today = now.date();
-    let batch_id = shared_test_snowflake().next_id();
-    // 插 2 条 pickup_skip_event
-    for i in 0..2 {
-        sqlx::query(
-            "INSERT INTO t_pickup_skip_event \
-              (id, worker_id, part_id, batch_id, batch_no, part_serial_no, shelf_id, \
-               work_type_id, quantity, part_planned_delivery_date, skipped_earliest_date, created_at) \
-             VALUES ($1, $2, $3, $4, 1, 'X001', 1, $5, 1, $6, $7, $8)",
-        )
-        .bind(shared_test_snowflake().next_id())
-        .bind(w_id)
-        .bind(part_id)
-        .bind(batch_id)
-        .bind(wt)
-        .bind(today)
-        .bind(today)
-        .bind(now + chrono::Duration::seconds(i))
-        .execute(&pool)
-        .await
-        .expect("insert pickup_skip_event");
-    }
-    let mut tx = pool.begin().await.unwrap();
-    let out = StatisticsService
-        .pickup_skip_summary(&mut *tx)
-        .await
-        .expect("summary ok");
-    drop(tx);
-    assert!(!out.items.is_empty(), "应至少 1 行");
-    let me = out
-        .items
-        .iter()
-        .find(|i| i.worker_id == w_id)
-        .expect("该工人在 summary 中");
-    assert_eq!(me.skip_count, 2);
-    assert_eq!(me.work_type_name.as_deref(), Some("车工"));
-}
-
-#[tokio::test]
-async fn pickup_skip_detail_happy_path() {
-    let (pool, _fx) = setup().await;
-    let wt = insert_work_type(&pool, "WT-SD", "铣工").await;
-    let w_id = insert_worker(&pool, "B005", "跳序工D", Some(wt)).await;
-    let l1 = insert_l1_customer(&pool, "客户S-5", "F").await;
-    let l2 = insert_l2_customer(&pool, l1, "子客S-5").await;
-    let part_id = insert_part(&pool, l2, "p-skip-d").await;
-    let now = now_naive();
-    let today = now.date();
-    let batch_id = shared_test_snowflake().next_id();
-    for _ in 0..3 {
-        sqlx::query(
-            "INSERT INTO t_pickup_skip_event \
-              (id, worker_id, part_id, batch_id, batch_no, part_serial_no, shelf_id, \
-               work_type_id, quantity, part_planned_delivery_date, skipped_earliest_date, created_at) \
-             VALUES ($1, $2, $3, $4, 1, 'X002', 1, $5, 1, $6, $7, $8)",
-        )
-        .bind(shared_test_snowflake().next_id())
-        .bind(w_id)
-        .bind(part_id)
-        .bind(batch_id)
-        .bind(wt)
-        .bind(today)
-        .bind(today)
-        .bind(now)
-        .execute(&pool)
-        .await
-        .expect("insert pickup_skip_event");
-    }
-    let mut tx = pool.begin().await.unwrap();
-    let out = StatisticsService
-        .pickup_skip_detail(&mut *tx, &w_id.to_string(), 10, 0)
-        .await
-        .expect("detail ok");
-    drop(tx);
-    assert_eq!(out.total, 3);
-    assert_eq!(out.items.len(), 3);
-    assert_eq!(out.limit, 10);
-    assert_eq!(out.offset, 0);
-    for item in &out.items {
-        assert_eq!(item.part_id, part_id);
-        assert_eq!(item.batch_no, 1);
-        assert_eq!(item.quantity, 1);
     }
 }
 

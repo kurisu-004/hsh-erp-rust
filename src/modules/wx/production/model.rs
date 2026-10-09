@@ -46,7 +46,8 @@ pub struct ProductionBatchRow {
     pub planned_delivery_date: NaiveDate,
     /// 最近一次 `DELIVERED` 事件的日期（子查询，无该事件时 NULL）
     pub finished_date: Option<NaiveDate>,
-    /// 该批次 `PICKED_UP + RETURNED` 事件的 `SUM(quantity)`。
+    /// 该批次 `PICKED_UP + RETURNED_TO_SHELF` 事件的 `SUM(quantity)`（2026-10-12
+    /// 由 `RETURNED` 修正为 `RETURNED_TO_SHELF`，后者才是 Rust 写侧落库的类型）。
     ///
     /// ⚠️ **刻意不写 `COALESCE(..., 0)`**：旧 SQL 写了，于是「本月零事件」的批次
     /// 拿到 `0` 而不是 `null`。前端 `<part-card>` 用 `wx:if="{{item.workHours !=
@@ -81,10 +82,11 @@ pub struct WorkerRow {
 pub struct WorkerStatsRow {
     /// 该工人当月发生过事件的**不同 `batch_id`** 数（`batch_id IS NULL` 的事件不计）
     pub batch_count: i64,
-    /// 该工人当月 `PICKED_UP + RETURNED` 事件的 `SUM(quantity)`（无事件为 `0`）
+    /// 该工人当月 `PICKED_UP + RETURNED_TO_SHELF` 事件的 `SUM(quantity)`（无事件为 `0`）
     ///
     /// ⚠️ **工作量估算**，不是真实工时：DB schema 无 `work_hours` 列，用「加工
     /// 件数」顶替（沿自旧实现，也是 `statistics` 域的同形口径）。
+    /// ⚠️ 2026-10-12：事件类型字面量由 `RETURNED` 修正为 `RETURNED_TO_SHELF`。
     pub qty_sum: i64,
 }
 
