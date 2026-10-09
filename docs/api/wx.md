@@ -69,7 +69,8 @@ wx BFF 重构 **B2 + B3 两步**已完成（重构收官）。原先 `/api/v2/wx
 - 全部 HTTP 端点返回统一信封 `R { code, message, data }`（`data` 成功时非 null）。
 - 端点 2/3 的 `counts`（仅端点 2 有）：**不随 `?status=` 变**（小程序 7 个 tab 的
   角标是固定的，切 tab 不塌成 0），但**随 `?date=` 变** —— 日期导航条一切，7 个数字
-  整体换一批。见 §8.5。端点 4 的 `counts` 恒是全局口径：**不带** `?tab=` / `?period=` 过滤。
+  整体换一批。见 §8.5。端点 4 的 `counts` **不受 `?tab=` 影响**（切 tab 角标固定），
+  但**随 `?period=` 变**（period 闸门与 list 侧逐字一致，见 §3.8）。
 - 端点 2/3 的 `?date=` / `?status=`、端点 4/5 的 `?tab=` / `?period=`：
   - `?status=` 不在白名单 ⇒ `AppError::validation`（**40001** / HTTP 422，走 `R<T>` 信封）
   - `?date=` chrono 解析不出 ⇒ **HTTP 400 纯文本**（axum `Query` 提取器层，**不走** `R<T>`）。
@@ -773,13 +774,22 @@ import」。⚠️ `t_user` 其余列（用户名 / 角色 / session）的 SQL �
 ### 8.5 ★ `counts` 是**所选日期作用域**口径，不是全局口径（2026-10-12 改写）
 
 ⚠️ **旧登记「`counts` 是全局口径，与 `list` 的过滤条件独立」在 2026-10-12 已不成立**
-（仅对端点 4/5 仍成立）。准确表述：
+（仅剩 `?tab=` / `?status=` 这一维度仍成立 —— 见下表第 1 行）。准确表述：
 
 | 维度 | 端点 2/3（`part_list`） | 端点 4/5（`production`） |
 |---|---|---|
 | `?status=` / `?tab=` | **不影响** `counts`（7 个 tab 角标固定，切 tab 不塌成 0） | **不影响** `counts`（同上） |
-| `?date=` / `?period=` | ⚠️ **直接影响** `counts` —— 日期导航条一切，7 个数字整体换一批 | `counts` 不受 `?period=` 影响（该域的 period 只筛 `list`，见 §3.8） |
+| `?date=` / `?period=` | ⚠️ **直接影响** `counts` —— 日期导航条一切，7 个数字整体换一批 | ⚠️ **同样直接影响** `counts`（period 闸门与 list 侧**逐字一致**，见 §3.8） |
 | `counts` 与 `list` 的口径关系 | 两者**同日期作用域 + 同 6 状态白名单**；`list` 再叠加 `?status=` 的状态集 | 两者 period 闸门逐字一致（§3.8） |
+
+⚠️ **`tab` 与 `period` 不是一回事，不能并成「不带过滤」**（2026-10-12 review 第 1 轮
+更正）：`?tab=` 不影响 `counts` 的理由是「切 tab 角标固定、不塌成 0」——角标要回答
+「**这一天**这一类各有几件」，切 tab 只是换看哪一类，**底下的那批行没变**。而
+`?period=` 恰好相反：切 period 就是**换一批行**，角标跟着换是应该的 —— `production`
+域两条标量 count 都带 period 闸门（`b.updated_at::text LIKE $1` /
+`e.created_at::text LIKE $1`，`$1 = format!("{period}%")`，见
+`production::repo.rs::batch_counts_by_period`），§3.8 的「period 闸门逐字一致」
+正是这条的实现依据。
 
 **设计意图**：小程序「日期 × 状态」两个筛选器是**正交**的 —— 角标要回答的是
 「**这一天**各状态各有几件」，而不是「整个数据库各状态各有几件」。若 counts 不受
@@ -792,8 +802,22 @@ import」。⚠️ `t_user` 其余列（用户名 / 角色 / session）的 SQL �
 日期谓词。
 
 **钉死**：集成测试 `counts_are_scoped_by_date`（逐日断言 6 个桶 + 不变量）、
-`each_tab_counts_bucket_equals_its_list_length`（每个 tab 的角标 == 列表行数）、
-`no_system_date_tab_ignores_date_param`（切 3 个不同 `?date=`，`noSystemDate` 恒定）。
+`each_tab_counts_bucket_equals_its_list_length`（每个 tab 的角标 == 列表行数，
+**有 `?date=` / 缺省 `?date=` 两轮**）、`no_system_date_tab_ignores_date_param`
+（切 3 个不同 `?date=`，`noSystemDate` 恒定，并反查有 `?date=` 时无交期行确实
+被排除在 `all` 之外）。
+
+⚠️ **结构性事实：`counts` 由 3 条独立查询合成，首屏聚合不开事务**（2026-10-12 登记）。
+`PartCountsOut` 一次返回要打 **3 次库**：① `counts_by_status`（`GROUP BY status,
+(system_delivery_date IS NULL)` 的分组查询，产出 `all` + 5 个 dated 桶）；②
+`count_null_date`（`noSystemDate` 桶的**独立标量**查询，2026-10-12 从 ① 的
+`is_null = true` 组里拆出来，代价是多一次往返）；③ `list_parts`（带分页的列表
+查询）。三条查询在 handler 层**不开事务**，跑在 read-committed 下 ⇒ **可以跨快照**：
+并发写入落在两条查询之间时，`counts` 与 `list` 可能来自不同快照。
+
+⚠️ 因此本节（以及 §3.8 的 production 域）承诺的是「**口径**一致」，**不是「快照**
+**一致**」—— 两者的分界在这里划清。实测偏差窗口比 master 更宽（多一次往返），
+但 dev 库无并发写入、集成测试串行跑，故这**不是**可复现的故障，是结构性登记。
 
 ### 8.6 ★ `workHours` 无值时是 `null`，不是 `0`（B3 的行为变更）
 

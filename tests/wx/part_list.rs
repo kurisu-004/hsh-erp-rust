@@ -538,6 +538,30 @@ async fn no_system_date_tab_ignores_date_param() {
             "[counts?{q}] noSystemDate 恒为 3（无交期 × 6 状态白名单）: {counts}"
         );
     }
+
+    // ⚠️ 反向排除（2026-10-12 review 第 1 轮补）：上面只钉住了 `noSystemDate`
+    // 这一桶的数值，**没有**证明这 3 行无交期白名单行在**有 `?date=` 时确实被
+    // 排除在 `all` 之外** —— 假如日期谓词被误写成「NULL 行放行」，`noSystemDate`
+    // 这条断言照样绿。这里把两侧一起钉死：
+    //   缺省 ?date=  ⇒ counts.all = 5（3 行无交期 + D1 PENDING + D2 IN_PROCESS）
+    //   ?date=D1     ⇒ counts.all = 1（只有 D1 的 PENDING）
+    //   ?date=D2     ⇒ counts.all = 1（只有 D2 的 IN_PROCESS）
+    // ⚠️ 缺省那一档的 5 是有意偏离（`map_counts_by_status` 的
+    // `dated_scope_is_unbounded = true` 分支把 NULL 行也算进 dated 桶），
+    // 与有 date 时的 1/1 构成对照 —— 两者**必须**同时成立才是对的。
+    for (q, want_all) in [
+        ("", 5i64),
+        (&format!("date={D1}"), 1i64),
+        (&format!("date={D2}"), 1i64),
+    ] {
+        let counts = home(&app, &token, q).await;
+        assert_eq!(
+            counts["data"]["counts"]["all"],
+            json!(want_all),
+            "[counts?{q}] counts.all 应是 {want_all}（有 ?date= 时无交期行必须被排除）: \
+             {counts}"
+        );
+    }
 }
 
 // ===========================================================================
@@ -750,44 +774,72 @@ async fn each_tab_counts_bucket_equals_its_list_length() {
     other.system_due = Some(D2);
     insert_part(&pool, &other).await;
 
-    let counts = home(&app, &token, &format!("date={D1}")).await;
-    for (tab, key) in [
-        ("all", "all"),
-        ("pendingProduction", "pendingProduction"),
-        ("inProduction", "inProduction"),
-        ("outsource", "outsource"),
-        ("inspecting", "inspecting"),
-        ("delivered", "delivered"),
-        ("noSystemDate", "noSystemDate"),
-    ] {
-        let env = page(&app, &token, &format!("date={D1}&status={tab}&size=50")).await;
-        let want = counts["data"]["counts"][key]
-            .as_i64()
-            .expect("counts 桶必须是 number");
+    // ★ 两轮日期参数（2026-10-12 review 第 1 轮补）：`date={D1}` 与**缺省**。
+    //
+    // 缺省这一轮走的是 `map_counts_by_status` 的 `dated_scope_is_unbounded = true`
+    // 分支（`system_delivery_date IS NULL` 的行**也**计入 dated 桶）—— 那是本轮
+    // 对任务书的**有意偏离**（列表含 NULL 行 ⇒ counts 也必须含，否则角标 < 列表）。
+    // 它此前只有 `counts_are_scoped_by_date` 里的 `counts.all == 21` 一个数字钉着，
+    // 对 4 个具体 dated tab 的桶**零断言**：若该分支被误改成 `continue`，
+    // `pendingProduction` 角标会从 3 掉到 2，而缺省 `?status=pendingProduction` 的
+    // 列表仍返回 3 行（含 1 行无交期）⇒ 角标 < 列表，正是 §3.3 的老 bug 形态。
+    //
+    // 本 fixture 期望值（供改动时对照）：
+    //   有 `?date=D1`：all=6 / pending=1 / in=1 / outsource=1 / inspecting=2
+    //                   / delivered=1 / noSystemDate=1
+    //   缺省       ：all=8 / pending=3 / in=1 / outsource=1 / inspecting=2
+    //                   / delivered=1 / noSystemDate=1
+    //   （缺省多出的 2 行 = D2 的 PENDING + 1 行无交期 PENDING）
+    for dq in ["", &format!("date={D1}")] {
+        let label = if dq.is_empty() {
+            "缺省 ?date=".to_string()
+        } else {
+            format!("?{dq}")
+        };
+        let counts = home(&app, &token, dq).await;
+        for (tab, key) in [
+            ("all", "all"),
+            ("pendingProduction", "pendingProduction"),
+            ("inProduction", "inProduction"),
+            ("outsource", "outsource"),
+            ("inspecting", "inspecting"),
+            ("delivered", "delivered"),
+            ("noSystemDate", "noSystemDate"),
+        ] {
+            let list_q = if dq.is_empty() {
+                format!("status={tab}&size=50")
+            } else {
+                format!("{dq}&status={tab}&size=50")
+            };
+            let env = page(&app, &token, &list_q).await;
+            let want = counts["data"]["counts"][key]
+                .as_i64()
+                .expect("counts 桶必须是 number");
+            assert_eq!(
+                list_of(&env).len() as i64,
+                want,
+                "[{label}&status={tab}] 列表行数必须 == counts.{key}: {env} vs {counts}"
+            );
+        }
+
+        // ★ 核心不变量（同口径交叉断言）
+        let c = &counts["data"]["counts"];
+        let sum: i64 = [
+            "pendingProduction",
+            "inProduction",
+            "outsource",
+            "inspecting",
+            "delivered",
+        ]
+        .iter()
+        .map(|k| c[*k].as_i64().unwrap())
+        .sum();
         assert_eq!(
-            list_of(&env).len() as i64,
-            want,
-            "[?date={D1}&status={tab}] 列表行数必须 == counts.{key}: {env} vs {counts}"
+            c["all"].as_i64().unwrap(),
+            sum,
+            "[{label}] counts.all == 5 个 dated tab 之和: {counts}"
         );
     }
-
-    // ★ 核心不变量（同口径交叉断言）
-    let c = &counts["data"]["counts"];
-    let sum: i64 = [
-        "pendingProduction",
-        "inProduction",
-        "outsource",
-        "inspecting",
-        "delivered",
-    ]
-    .iter()
-    .map(|k| c[*k].as_i64().unwrap())
-    .sum();
-    assert_eq!(
-        c["all"].as_i64().unwrap(),
-        sum,
-        "[?date={D1}] counts.all == 5 个 dated tab 之和: {counts}"
-    );
 }
 
 // ===========================================================================
