@@ -426,7 +426,21 @@ pub struct PartListOut {
     pub offset: i64,
 }
 
-/// `GET /parts/{id}/events` 出参：工单事件日志列表（按 created_at 倒序）。
+/// `GET /parts/{id}/events` 出参：工单事件日志列表。
+///
+/// 排序口径：**按 `id` 倒序，不是按 `created_at` 倒序**（SQL 是
+/// `ORDER BY e.id DESC`）。`t_part_event.id` 的空间是**异质**的 ——
+/// 应用雪花（严格单调）、migration `20261001000200_007_serial_release.sql` 的
+/// 一段连续密集回填块、以及从未被 nextval 用过的 `t_part_event_id_seq`。
+/// 那批回填行的 `created_at` 全是迁移执行时刻而非业务真实时刻，改成按
+/// `created_at` 排会让界面上「一堆 7 月事件里夹一条 10-01」。详见
+/// `crate::shared::batch::status` 中 `release_part_serial_no` 的两段长注释。
+///
+/// 2026-10-10 新增 4 字段（`batch_no` / `worker_name` / `operator_name` /
+/// `operator_username`）：前端零件详情页「历史记录」时间线卡一直在读这四个键，
+/// 但后端此前**从没投影过**它们 —— 前端 `v-if` 静默不渲染。三列分别来自
+/// `LEFT JOIN t_part_batch` / `t_worker` / `t_user`（`operator_*` 取
+/// `u.full_name` / `u.username`；库中不存在 `display_name` 列）。
 #[derive(Debug, Clone, Serialize)]
 pub struct PartEventOut {
     #[serde(serialize_with = "serialize_i64")]
@@ -449,6 +463,26 @@ pub struct PartEventOut {
     pub created_at: NaiveDateTime,
     #[serde(serialize_with = "serialize_i64_opt")]
     pub created_by: Option<i64>,
+    /// 2026-10-10 新增：批次序号（`t_part_batch.batch_no`，工单内从 1 起）。
+    /// **裸 JSON number** —— 它不是雪花 ID，没有 `Number.MAX_SAFE_INTEGER` 精度
+    /// 风险，故**刻意不加** `serialize_i64`（加了会让前端拿到 string 而非 number，
+    /// 与 `PartBatchListItemOut::batch_no` 的口径也会不一致）。
+    #[serde(default)]
+    pub batch_no: Option<i32>,
+    /// 2026-10-10 新增：工人姓名（`t_worker.name`）。**只能救回历史数据** ——
+    /// 当前 Rust 的 INSERT 不写 `worker_id`，只有 2026-07~09 的 Python 时代事件
+    /// 有值。对新事件恒 `None`，属已知取舍（读侧补列，不动写侧）。
+    #[serde(default)]
+    pub worker_name: Option<String>,
+    /// 2026-10-10 新增：操作者姓名（`t_user.full_name`）。
+    /// 生产库 16276 行事件中 `created_by` 非空 13647 行（83.8%），且当前 Rust
+    /// 全部写入点都传 `Some(current.id)` ⇒ 新事件可 100% 恢复。
+    #[serde(default)]
+    pub operator_name: Option<String>,
+    /// 2026-10-10 新增：操作者登录名（`t_user.username`）。与 `operator_name`
+    /// 同源，姓名重名时用它区分。
+    #[serde(default)]
+    pub operator_username: Option<String>,
 }
 
 /// `GET /parts/{id}/batches` 出参：工单全部活跃批次 + holder 名称解析。

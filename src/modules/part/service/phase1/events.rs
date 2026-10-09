@@ -47,8 +47,45 @@ impl PartService {
             .get_part_inspected(part_id)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "part 不存在"))?;
+        // 2026-10-10 新增 3 个 LEFT JOIN，补投影前端时间线卡一直在读却拿不到的
+        // `batch_no` / `worker_name` / `operator_name`（+ `operator_username`）。
+        //
+        // 三条 JOIN 的关键取舍：
+        // - **全部 LEFT，绝不 INNER**：`e.worker_id` 只有 2026-07~09 的 Python 时代
+        //   数据有值，`e.created_by` 也有约 16% 为 NULL，INNER JOIN 会把整行丢掉。
+        //   本端点要展示**全部**事件。（同款前车之鉴：`statistics/repo/sql.rs`
+        //   用 INNER JOIN `t_worker` 后 62% 的事件被静默丢弃，只能另加
+        //   `AND e.worker_id IS NOT NULL` 补偿。）
+        // - **表名加 `e` 前缀别名**：原查询无别名，JOIN 后 `id` / `created_at` 等
+        //   列名会歧义。
+        // - `t_worker` 与 `t_user` 之间**没有关联列也没有 FK**，两者只是共享同一
+        //   个雪花 ID 空间 ⇒ 这是从事件行出发的两个**独立** JOIN，不是互相关联。
+        //
+        // `ORDER BY e.id DESC` 是刻意选择，**不要**改成 `created_at DESC`：
+        // `t_part_event.id` 空间异质（雪花 / migration 回填的连续密集块 / 未被
+        // nextval 用过的序列），那批回填行的 `created_at` 全是迁移执行时刻
+        // （2026-10-01）而业务真实时间在 2026-07~09，按时间排会在一堆 7 月事件里
+        // 夹一条「10-01」。详见 `PartEventOut` 的 doc 与
+        // `crate::shared::batch::status::release_part_serial_no` 的两段长注释。
+        //
+        // 用 `query_as`（运行时按 `FromRow` 映射）而非 `query!`：本条查询**不进**
+        // `.sqlx/` 缓存，改它不需要跑 `scripts/sqlx_prepare.sh`。
         let rows: Vec<EventListRow> = sqlx::query_as::<_, EventListRow>(
-            "SELECT id, event_type, from_status, to_status, batch_id, quantity,              drawing_code, badge_code, note, created_at, created_by              FROM t_part_event WHERE part_id = $1 ORDER BY id DESC",
+            r#"
+            SELECT e.id, e.event_type, e.from_status, e.to_status, e.batch_id,
+                   e.quantity, e.drawing_code, e.badge_code, e.note,
+                   e.created_at, e.created_by,
+                   b.batch_no   AS batch_no,
+                   w.name       AS worker_name,
+                   u.full_name  AS operator_name,
+                   u.username   AS operator_username
+              FROM t_part_event e
+              LEFT JOIN t_part_batch b ON b.id = e.batch_id
+              LEFT JOIN t_worker     w ON w.id = e.worker_id
+              LEFT JOIN t_user       u ON u.id = e.created_by
+             WHERE e.part_id = $1
+             ORDER BY e.id DESC
+            "#,
         )
         .bind(part_id)
         .fetch_all(repo.conn_mut())
@@ -67,6 +104,10 @@ impl PartService {
                 note: r.note,
                 created_at: r.created_at,
                 created_by: r.created_by,
+                batch_no: r.batch_no,
+                worker_name: r.worker_name,
+                operator_name: r.operator_name,
+                operator_username: r.operator_username,
             })
             .collect())
     }
