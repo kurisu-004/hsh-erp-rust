@@ -49,17 +49,23 @@ pub struct PendingBatchItem {
     /// 工单级备注（`t_part.note`）
     pub note: Option<String>,
     pub version: i32,
-    /// `current_process_step_id`（PENDING 时通常 NULL；PART 自动下发时
-    /// 已写入首道 step）。
+    /// `t_part_batch.current_process_step_id`（链内位置指针）的原样投影。
     ///
     /// **NULL 兜底语义**：DB 列 NULL 时 row → vo 投影为 0（`Option<i64> → i64`
     /// 走 `.unwrap_or(0)`）；前端按 `0 == "未设 step"`、`> 0 == "已设 step"`
-    /// 区分，故 JSON 是字符串 `"0"`、**不是** `null`。dispatch 路径写 batch 时按
-    /// 工单形态二分（2026-10-09 改，见 `QueueDispatchRepo::update_batch_dispatched`）：
-    /// 有链工单写链首 step id、无链工单清 `NULL`。但下发后批次已非 PENDING、不会留在
-    /// 本列表，故看到非 0 时该指针来自 dispatch 之外的写点。
+    /// 区分，故 JSON 是字符串 `"0"`、**不是** `null`。
+    ///
+    /// **取值范围**（2026-10-10 review 第 1 轮订正）：本列表闸门是
+    /// `status IN ('PENDING','PROGRAMMING')`（`repo/dispatch.rs::list_pending_batches`），
+    /// 而 dispatch 一落笔就写 `IN_PROCESS` ⇒ **下发过的批次不会留在本列表**，
+    /// dispatch 对该列的两种写入（有链写链首 step / 无链清 NULL，见
+    /// `QueueDispatchRepo::update_batch_dispatched`）在本列表里都观察不到。
+    /// 常规取值因此是 `"0"`，但 DB 层**没有任何约束**保证待下发行的该列恒为 NULL
+    /// —— `allowed_from` 之外的旁路写点、手工 SQL、历史脏数据都能破坏它，前端不要
+    /// 假定它恒为 `"0"`，按 `> 0` 分支走即可。
+    ///
     /// 注：本字段未走 `Option<i64>` 是为了对齐本 VO 整体扁平数字风格（与
-    /// `process_chain_id` 同形态）；语义差异由前端按 status 区分。
+    /// `process_chain_id` 同形态）。
     #[serde(serialize_with = "serialize_i64")]
     pub current_process_step_id: i64,
     /// `t_part.process_chain_id`（PR-3 step 化后新字段；PENDING 列表透传
@@ -92,11 +98,13 @@ pub struct PendingBatchListOut {
 /// 是为未来启用 partial commit 时向前兼容，**当前总是空**。
 ///
 /// `current_process_step_id` 是 `Option<i64>`：有链工单（`t_part.process_chain_id
-/// IS NOT NULL`）为链内第一道未软删 step 的 id，无链工单为 `None`（该列按写入不变式
-/// 恒为 NULL）—— 2026-10-09 起不再「恒 `None`」。
+/// IS NOT NULL`）为链内第一道未软删 step 的 id，无链工单为 `None`（无链侧是
+/// **显式清空**该列，不采用「保留原值」写法 —— 那要论证「无链 ⇒ step 恒 NULL」
+/// 这条无任何约束保证的不变式）—— 2026-10-09 起不再「恒 `None`」。
 /// `current_process_id`（2026-09-30 新增）是 `Option<i64>`：有链工单下它等于
-/// **链首 step 的工序**（= 实际下发到的那道），不是请求里的 `target_process_id`
-/// （后者只是无链时的回落值，详见本字段 doc）—— 池归属的权威依据。
+/// **链首 step 的工序**（= 实际下发到的那道）—— 池归属的权威依据；有链时请求里的
+/// `target_process_id` 被忽略，且**出参的 `target_process_id` 也被 service 用同一个
+/// 值覆盖**（见两个字段各自的 doc），只有无链工单它才等于请求值。
 #[derive(Debug, Clone, Serialize)]
 pub struct DispatchResult {
     /// 成功下发的 batch 列表（顺序与 req.targets 一致）。
@@ -121,7 +129,10 @@ pub struct DispatchSuccessItem {
     ///
     /// - 有链工单（`t_part.process_chain_id IS NOT NULL`）→ 链内第一道未软删 step 的
     ///   id（口径与端点 5 的 `first_process_id` 同源）；
-    /// - 无链工单 → `null`（该列按写入不变式恒为 NULL）。
+    /// - 无链工单 → `null`（无链侧由 dispatch **显式清空**该列；不采用「保留原值」
+    ///   写法 —— 那要论证「无链 ⇒ step 恒 NULL」这条无任何约束保证的不变式，
+    ///   见 `repo/dispatch.rs::update_batch_dispatched` 的 doc 与
+    ///   `docs/api/queue.md` §3.1）。
     ///
     /// ⚠️ **不能落成 JSON number**（2026-10-10 补）：step id 是雪花 id，量级
     /// 8.7×10¹⁷，远超 JS 的 `Number.MAX_SAFE_INTEGER`（2^53 ≈ 9.007×10¹⁵），
@@ -132,16 +143,25 @@ pub struct DispatchSuccessItem {
     pub current_process_step_id: Option<i64>,
     /// 下发后写入 `t_part_batch.current_process_id` 的值（逻辑 FK → `t_process.id`）。
     ///
-    /// ⚠️ **有链工单下它等于链首 step 的工序，不等于请求里的 `target_process_id`** ——
-    /// 后者此时只是无链时的回落值（见 `DispatchTarget::target_process_id` 的 doc）。
-    /// 前端要展示「实际下发到哪道工序」必须读本字段，读 `target_process_id` 会在
-    /// 有链时显示成用户随手传的那道。
+    /// ⚠️ **有链工单下它等于链首 step 的工序**，而不是请求里那道工序（请求里的
+    /// `target_process_id` 此时被忽略，见 `DispatchTarget::target_process_id` 的 doc）。
+    /// 前端要展示「实际下发到哪道工序」读本字段即可；不过有链时出参的
+    /// `target_process_id` 也被 service 覆盖成同一个值，两者读哪个结果一致
+    /// （口径差异见下字段的 doc）。
     ///
     /// **Option 语义**：当前 dispatch 路径恒为 `Some(..)`；保留 `Option` 是为了与
     /// `current_process_step_id` 对齐并为将来「工序落空」的分支留出 `null` 表达。
     /// None → JSON `null`，避免前端拿 `"0"` 误判为合法工序 id。
     #[serde(serialize_with = "serialize_i64_opt")]
     pub current_process_id: Option<i64>,
+    /// **不是请求字段的回声**（2026-10-10 登记）：service 解析链首时用
+    /// `let (target_process_id, …)` 遮蔽了同名形参，并把遮蔽后的值同时填进
+    /// `current_process_id` 与本字段 ⇒ **有链工单下本字段已被覆盖为链首 step 的
+    /// 工序，与 `current_process_id` 同值**；只有无链工单才等于请求里传的那道
+    /// （回落值）。
+    ///
+    /// 前端读它也能拿到「实际下发到哪道工序」，但**不能**用它复现「用户当时传了
+    /// 什么」—— 那在有链工单下已经丢失。口径表见 `docs/api/queue.md` §3.1。
     #[serde(serialize_with = "serialize_i64")]
     pub target_process_id: i64,
     #[serde(serialize_with = "serialize_i64")]

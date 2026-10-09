@@ -229,7 +229,8 @@ part 级行无从推导（没有 `#[serde(default)]`，漏赋值会编译失败�
 | `t_part.process_chain_id IS NOT NULL` | 链内第一道未软删 step 的 `process_id`（`sort_order ASC, id ASC LIMIT 1`） | 链首 step 的 id | 链首工序 |
 | `t_part.process_chain_id IS NULL`（手工工单的常态） | 请求里的 `target_process_id` | `NULL` | 请求里的 `target_process_id` |
 
-- **有链时请求里的 `target_process_id` 被忽略**（它只是无链时的回落值）。前端要展示「实际下发到哪道工序」读 `DispatchSuccessItem.current_process_id`，读 `target_process_id` 会在有链时显示成用户随手传的那道。
+- **有链时请求里的 `target_process_id` 被忽略**（它只是无链时的回落值）。前端要展示「实际下发到哪道工序」读 `DispatchSuccessItem.current_process_id` 即可。
+- ⚠️ **出参的 `target_process_id` 不是请求字段的回声**（2026-10-10 登记）：service 解析链首时用 `let (target_process_id, …)` 遮蔽了同名形参，并把遮蔽后的值**同时**填进 `current_process_id` 与 `target_process_id` 两个出参字段 ⇒ **有链工单下两者同值（都是链首工序）**，无链工单下才是请求里的回落值。读出参 `target_process_id` 也能拿到「实际下发到哪道工序」，但**不能**用它复现「用户当时传了什么」——那在有链工单下已丢失。
 - 与端点 5 `auto_dispatch_preview` 的 `first_process_id` **同源**（都取链首，见 `ProcessChainRepo::first_step_in_chain`），故「照 preview 显示的值操作」与「实际落库」一致。
 - 链首解析带**锚链软删闸门**（`ProcessChainRepo::first_step_in_chain` JOIN `t_part_process_chain` 且 `pc.deleted_at IS NULL`），与读侧 `resolve_chain_position` 的锚链 JOIN 同口径。
 - **锚链已软删**（`t_part.process_chain_id` 仍指向已删链，链内 step 未随链软删）**或**链行活跃但**链内一个未软删 step 都没有**（已清空）→ `20702 BIZ_PROCESS_CHAIN_STEP_NOT_FOUND`（HTTP 404），批次保持 `PENDING` 不被写脏，`current_process_id` / `current_process_step_id` 都不落。不新造错误码：`20702` 原语义是「链内找不到某工序」，本处是「链内一道都没有」，两者都指向同一个动作 —— 去修链。

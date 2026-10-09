@@ -429,10 +429,10 @@ impl QueueService {
 ///
 /// `planned_delivery_date` 走 `String`：DB 列 `t_part.planned_delivery_date` 是
 /// `NOT NULL DEFAULT CURRENT_DATE`（migration 001），故 row 字段必非空；service
-/// 直接 `.to_string()` 即可，无需 NULL 兜底。PENDING 时 `current_process_step_id`
+/// 直接 `.to_string()` 即可，无需 NULL 兜底。待下发行的 `current_process_step_id`
 /// 通常 NULL，但 sqlx 把它按非空 `i64` 处理（与 `process_chain_id` 同形），此处
-/// 沿用 row 的 i64 值（`0` 即"未设 step"语义；与 dispatch 写入 NULL 的差异
-/// 由前端按 status 区分）。
+/// 沿用 row 的 i64 值（`0` 即"未设 step"语义；与 dispatch 写入值（无链 `null` /
+/// 有链链首 step）的差异由前端按 status 区分）。
 fn row_to_item(r: PendingBatchRow) -> PendingBatchItem {
     PendingBatchItem {
         batch_id: r.pb_id,
