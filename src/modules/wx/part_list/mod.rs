@@ -11,7 +11,7 @@
 //! **硬切无 alias**：旧路径一律 404。
 //!
 //! ## 两个端点 = 一个页面的两种加载方式
-//! - `GET /api/v2/wx/part-list` —— **首屏聚合**：4 个 tab 角标（`counts`）+ 第 1 页
+//! - `GET /api/v2/wx/part-list` —— **首屏聚合**：7 个 tab 角标（`counts`）+ 第 1 页
 //!   卡片（`list`）。小程序首屏只需要这一次请求。
 //! - `GET /api/v2/wx/part-list/page` —— **上拉增量**：只返 `list` + `hasMore`，
 //!   **不重算角标**。两个端点**共用同一个列表查询**（`service::list_cards`），
@@ -26,33 +26,53 @@
 //!
 //! 小程序侧曾按**相反**的假设发请求并踩过 404（旧 `/wx/parts/` 同因）。
 //!
-//! ## `?status=` 语义（2026-10-11 顺带修掉两个既有 bug）
+//! ## ★ `?date=` 语义（2026-10-12 新增：小程序日期栏从装饰性变真筛选）
+//! 小程序 `pages/part-list` 的 `date-nav-bar` 此前**完全不参与**查询 —— `selectedDate`
+//! 既不进 `queryKey` 也不进 `queryFn`，后端也没有日期参数，日期栏只是个摆设。
+//! 本次接上：`?date=YYYY-MM-DD` 打 `p.system_delivery_date`
+//! （**不是** `planned_delivery_date` —— 那是「计划交期」，与小程序展示的交期对不上）。
+//!
+//! - 缺省 = 不加日期谓词（沿用本仓 `$n::T IS NULL` 惯用法）
+//! - chrono 解析不出日期（`2026-02-30` / `20260804` / `not-a-date`）⇒ **HTTP 400
+//!   纯文本**，与 `?page=abc` 同一档，**不走** `R<T>`。⚠️ chrono **不要求**月/日
+//!   零填充，`?date=2026-8-4` 是**合法**的（解析成 2026-08-04）—— 刻意不收紧
+//! - `noSystemDate` tab **忽略** `?date=`，恒取 `system_delivery_date IS NULL`
+//!
+//! ## `?status=` 语义（2026-10-11 引入 tab 白名单，2026-10-12 加外协 / 品检 / 无交期）
 //! 前端传的 `status` 是**前端的 tab 值**，不再是 DB 原值：
 //!
-//! | 前端传 | 后端过滤的 DB 状态 |
-//! |---|---|
-//! | 缺省 / `all` | 不过滤 |
-//! | `pendingProduction` | `['PENDING']` |
-//! | `inProduction` | `['IN_PROCESS']` |
-//! | `pendingInspection` | `['INSPECTION']` |
-//! | `delivered` | `['READY_TO_SHIP', 'DELIVERED']`（**两个**） |
+//! | 前端传 | 后端过滤的 DB 状态 | 日期谓词 |
+//! |---|---|---|
+//! | 缺省 / `all` | 6 状态白名单 | `= $date` |
+//! | `pendingProduction` | `['PENDING']` | `= $date` |
+//! | `inProduction` | `['IN_PROCESS']` | `= $date` |
+//! | `outsource` | `['OUTSOURCE']` | `= $date` |
+//! | `inspecting` | `['INSPECTION', 'READY_TO_SHIP']`（**两个**） | `= $date` |
+//! | `delivered` | `['DELIVERED']` | `= $date` |
+//! | `noSystemDate` | 同「全部」的 6 状态 | `IS NULL`（**忽略** `$date`） |
 //!
-//! 白名单外的值（如 DB 原值 `PENDING`）→ `AppError::validation`（40001 / HTTP 422）。
-//! ⚠️ **刻意不用** `part::statemachine::PartStatus` 做校验 —— 那正是本次要消灭的
-//! 跨域复用。
+//! 白名单外的值（如 DB 原值 `PENDING`、旧 tab 值 `pendingInspection`、注入串）
+//! → `AppError::validation`（40001 / HTTP 422），且**在拼进 SQL 之前**被拒。
+//! ⚠️ **刻意不用** `part::statemachine::PartStatus` 做校验 —— 那正是要消灭的跨域复用。
 //!
-//! ### 修掉的两个 bug
-//! 1. **口径不一致**：旧实现角标按 `READY_TO_SHIP + DELIVERED` 算（本地库实测
-//!    72 + 126 = 198），列表却只收单值 `DELIVERED`（最多 126）⇒ 角标 198、列表翻到
-//!    底也只有 126。本次由 service 层**统一拥有**映射表，两者必然一致。
-//! 2. **422 口径错位**：旧实现把前端 tab 值当 DB 状态白名单校验，前端传
-//!    `status=inProduction` 会拿到 40001。
+//! ### 2026-10-12 修掉 / 变更的语义
+//! 1. **`all` / 缺省不再是「不过滤」**：旧实现落到 `Option::None`（SQL 里
+//!    `$1::text[] IS NULL` ⇒ 无谓词），于是 `PROGRAMMING`（CNC 编程）/
+//!    `COMPLETED` / `CANCELLED` 会漏进列表与角标。现在一律落到 6 状态白名单，
+//!    **排除**这三个状态（产品已明确确认）。这也是旧 §8.1「4 类折叠的静默兜底」
+//!    变成不可达的原因。
+//! 2. **新增 3 个 tab**：`outsource`（外协中）/ `inspecting`（品检中，含
+//!    `READY_TO_SHIP`）/ `noSystemDate`（无交期）。`inspecting` 取代旧的
+//!    `pendingInspection`，`delivered` 收窄成只剩 `DELIVERED`。
+//! 3. **`counts` 不再是全局口径**：它恒按 6 状态白名单统计（不受 `?status=` 影响），
+//!    但**带 `?date=` 作用域**。见 `docs/api/wx.md` §8.5。
 //!
 //! ## 模块结构（照 `prod::process_design` / `prod::inspection` 范式）
 //! - `dto.rs` —— 入参（`PartListQuery`，Query string，两个端点共用）
 //! - `vo.rs` —— 出参（`PartCardOut` 判别联合 + 2 个分页外壳，**camelCase**）
 //! - `model.rs` —— `FromRow` 行结构（**不** `Serialize`，不进 JSON）
-//! - `repo.rs` —— SQL 真源（ZST `PartListRepo` + `counts_by_status` / `list_parts`）
+//! - `repo.rs` —— SQL 真源（ZST `PartListRepo` + `counts_by_status` /
+//!   `count_null_date` / `list_parts`）
 //! - `service.rs` —— 业务逻辑（tab↔DB 映射表 + 归桶 + row→vo 投影 + `hasMore`）
 //! - `handler.rs` —— HTTP 路由（只做参数提取 + `pool.acquire()` + `R::ok`）
 //!
