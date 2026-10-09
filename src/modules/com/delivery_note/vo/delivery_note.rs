@@ -84,6 +84,9 @@ pub struct DeliveryNoteLineItem {
     pub name: String,
     pub quantity: i32,
     pub status: String,
+    /// 申请人。**装配件子件行在自身为空时回落所属装配件的 `t_assembly.applicant_name`**
+    /// （存量大量子件的继承未落地，详见 `service::line_item::resolve_applicant_name`）；
+    /// 散件行恒只取自己的 `t_part.applicant_name`。空串一律折成 `null`。
     pub applicant_name: Option<String>,
     pub request_date: Option<NaiveDate>,
     pub planned_delivery_date: Option<NaiveDate>,
