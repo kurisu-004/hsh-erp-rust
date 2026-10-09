@@ -157,6 +157,15 @@ pub mod code {
     pub const BIZ_ASSEMBLY_CHILD_PRICE_LOCKED: i32 = 20306; // 父装配体已设总价时禁止子件改价（预留）
     pub const BIZ_ASSEMBLY_HAS_SHIPMENT: i32 = 20307; // 装配体已挂送货单，禁止 soft_delete（预留）
     pub const BIZ_CUSTOMER_NO_SERIAL_PREFIX: i32 = 20308; // L1 客户的 serial_prefix 为空（无法派发序列号）
+    // 2026-10-11 新增：装配件级 MANAGER 单角色强制完成端点
+    // （`POST /api/v2/prod/assemblies/{assembly_id}/force-complete`）的两个幂等拒绝码。
+    // 触发场景：装配件已是 COMPLETED / CANCELLED 时再调该端点。两个码位**顺延 20309 /
+    // 20310** 而非接着 `BIZ_ASSEMBLY_HAS_SHIPMENT` 排 —— 20308 已被
+    // `BIZ_CUSTOMER_NO_SERIAL_PREFIX` 占用，`constants_have_unique_values` 会因重复值
+    // 直接 panic。HTTP 409 由 `status_from_code` 表驱动映射，语义与
+    // `BIZ_PART_ALREADY_COMPLETED=20123` / `BIZ_PART_ALREADY_CANCELLED=20115` 对称。
+    pub const BIZ_ASSEMBLY_ALREADY_COMPLETED: i32 = 20309;
+    pub const BIZ_ASSEMBLY_ALREADY_CANCELLED: i32 = 20310;
 
     // 204xx 图纸文件（t_drawing_file + COS）
     pub const BIZ_DRAWING_FILE_NOT_FOUND: i32 = 20401;
@@ -563,7 +572,11 @@ fn status_from_code(c: i32) -> StatusCode {
             || c == code::BIZ_BATCH_LOCATION_MISMATCH
             // 2026-09-30 新增：force-complete 端点已 COMPLETED 幂等拒绝 → 409
             // （与 BIZ_PART_ALREADY_CANCELLED=20115 语义对称；前端按 code 区分）。
-            || c == code::BIZ_PART_ALREADY_COMPLETED =>
+            || c == code::BIZ_PART_ALREADY_COMPLETED
+            // 2026-10-11 新增：装配件级 force-complete 端点两条幂等拒绝 → 409
+            // （与零件级 20123 / 20115 语义对称）。
+            || c == code::BIZ_ASSEMBLY_ALREADY_COMPLETED
+            || c == code::BIZ_ASSEMBLY_ALREADY_CANCELLED =>
         {
             StatusCode::CONFLICT
         }
@@ -754,6 +767,15 @@ mod tests {
         (
             code::BIZ_CUSTOMER_NO_SERIAL_PREFIX,
             "BIZ_CUSTOMER_NO_SERIAL_PREFIX",
+        ),
+        // 2026-10-11 新增：装配件级 force-complete 幂等拒绝（409）
+        (
+            code::BIZ_ASSEMBLY_ALREADY_COMPLETED,
+            "BIZ_ASSEMBLY_ALREADY_COMPLETED",
+        ),
+        (
+            code::BIZ_ASSEMBLY_ALREADY_CANCELLED,
+            "BIZ_ASSEMBLY_ALREADY_CANCELLED",
         ),
         // 204xx
         (
@@ -1127,6 +1149,8 @@ mod tests {
         assert_eq!(code::BIZ_ASSEMBLY_CHILD_PRICE_LOCKED, 20306);
         assert_eq!(code::BIZ_ASSEMBLY_HAS_SHIPMENT, 20307);
         assert_eq!(code::BIZ_CUSTOMER_NO_SERIAL_PREFIX, 20308);
+        assert_eq!(code::BIZ_ASSEMBLY_ALREADY_COMPLETED, 20309);
+        assert_eq!(code::BIZ_ASSEMBLY_ALREADY_CANCELLED, 20310);
 
         // 204xx
         assert_eq!(code::BIZ_DRAWING_FILE_NOT_FOUND, 20401);
@@ -1504,6 +1528,17 @@ mod tests {
             code::BIZ_PART_ALREADY_COMPLETED,
             StatusCode::CONFLICT,
             "BIZ_PART_ALREADY_COMPLETED",
+        ),
+        // 2026-10-11 新增：装配件级 force-complete 两条幂等拒绝 → 409
+        (
+            code::BIZ_ASSEMBLY_ALREADY_COMPLETED,
+            StatusCode::CONFLICT,
+            "BIZ_ASSEMBLY_ALREADY_COMPLETED",
+        ),
+        (
+            code::BIZ_ASSEMBLY_ALREADY_CANCELLED,
+            StatusCode::CONFLICT,
+            "BIZ_ASSEMBLY_ALREADY_CANCELLED",
         ),
         // 2026-09-28 删除：相关会话域 HTTP 表覆盖（域下线，码段释放）。
         // 2xxxx 显式 409

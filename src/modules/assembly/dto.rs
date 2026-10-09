@@ -19,6 +19,25 @@ use serde::Deserializer;
 
 // ---------- 入参 ----------
 
+/// `POST /api/v2/prod/assemblies/{assembly_id}/force-complete` 的请求体。
+///
+/// 2026-10-11 新增。MANAGER **单角色**守卫（不下放 Clerk 等其它角色 —— 与零件级
+/// `POST /api/v2/parts/{part_id}/force-complete` 同款，逃生通道明确不委派）。
+///
+/// 语义：完全绕状态机，把装配件 + 全部子件 + 全部**非 CANCELLED** 批次强推
+/// `COMPLETED`。用于「实际早已送货、但没在系统录入」的工单收口；判据是 dashboard
+/// 大屏的三个交期桶与柱状图 —— `t_assembly.status` 一旦真被写成 `COMPLETED`，
+/// 该行必然从所有切片消失。
+///
+/// **不收 `version`**：逃生通道不走 OCC，并发串行化由 SQL 行锁承担
+/// （与零件级 `ForceCompleteRequest` 逐字同形）。
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ForceCompleteRequest {
+    /// 操作备注，写进 `t_part_event.note` 时加 `[FORCE_ASSEMBLY]` 前缀便于审计区分。
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct AssemblyListQuery {
     #[serde(default)]

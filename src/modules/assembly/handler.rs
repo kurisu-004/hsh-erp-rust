@@ -43,6 +43,7 @@ use crate::auth::rbac::CurrentUser;
 use crate::infra::ws_hub::WsEvent;
 use crate::modules::assembly::dto::{
     AssemblyChildAddRequest, AssemblyCreateRequest, AssemblyListQuery, AssemblyUpdateRequest,
+    ForceCompleteRequest,
 };
 use crate::modules::assembly::service::AssemblyService;
 use crate::modules::assembly::vo::{
@@ -357,6 +358,57 @@ pub async fn list_assembly_files(
     let mut conn = state.pool.acquire().await?;
     let out = AssemblyService::list_assembly_files(&mut conn, assembly_id, &current).await?;
     Ok(Json(R::ok(out)))
+}
+
+/// `POST /api/v2/prod/assemblies/{assembly_id}/force-complete` → 200 OK
+///
+/// 2026-10-11 新增。MANAGER **单角色**强推装配件 + 全部子件 + 全部非 CANCELLED
+/// 批次为 `COMPLETED`（绕状态机），用于「实际早已送货、但没在系统录入」的工单收口。
+///
+/// 路径挂在 `/api/v2/prod/assemblies/*`（**不是** `/api/v2/assemblies/*`）：它是生产
+/// 链路收口的逃生端点，与 `prod` 下其余批次 / 队列动作同属「生产执行」语义；装配件域
+/// 本体的 10 条 CRUD / 状态机端点仍在 `modules::v2_router` 的顶层 nest，一行未动。
+/// 详见 `modules::prod::router()` 的挂载注释。
+///
+/// 行为：
+/// - 事务：handler `pool.begin()` → service（`&mut *tx`）→ 显式 `tx.commit()`
+/// - WS 广播：commit 之后 1 条 `ASSEMBLY_FORCE_COMPLETED` + 每个被改动的子件各 1 条
+///   既有 `PART_FORCE_COMPLETED`（雪花 id 字符串化，雪花 ID 不能当 JSON 数字传）
+/// - 响应：`AssemblyOut`
+pub async fn force_complete_assembly(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(assembly_id): Path<i64>,
+    Json(req): Json<ForceCompleteRequest>,
+) -> Result<Json<R<AssemblyOut>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let (out, forced_part_ids) =
+        AssemblyService::force_complete(&mut tx, &state.snowflake, assembly_id, &req, &current)
+            .await?;
+    tx.commit().await?;
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: "ASSEMBLY_FORCE_COMPLETED".into(),
+        payload: json!({ "assembly_id": assembly_id.to_string() }),
+    });
+    for part_id in forced_part_ids {
+        state.ws_hub.broadcast(WsEvent::DashboardEvent {
+            kind: "PART_FORCE_COMPLETED".into(),
+            payload: json!({ "part_id": part_id.to_string() }),
+        });
+    }
+    Ok(Json(R::ok(out)))
+}
+
+/// 装配件域**生产链路逃生端点**子路由（不含公共前缀；由 `mod.rs::force_complete_router()`
+/// 转发、`prod::router()` 桥接到 `/prod/assemblies`）。
+///
+/// 与 [`router`] 是两个独立工厂：前者给装配件域本体的 10 条（顶层 `/api/v2/assemblies`），
+/// 后者只含强制完成这一条（`/api/v2/prod/assemblies`）。前缀并存是刻意的端点级归属裁决。
+pub fn force_complete_router() -> Router<Arc<AppState>> {
+    Router::new().route(
+        "/{assembly_id}/force-complete",
+        post(force_complete_assembly),
+    )
 }
 
 /// assembly 域 axum 子路由（不含公共前缀；由 `mod.rs::router()` 桥接到 `/assemblies`）。

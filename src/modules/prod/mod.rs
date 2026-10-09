@@ -76,8 +76,15 @@
 //! part 域只留「多批次动作 + 非批次动作」：`POST /parts/{part_id}/cancel`（翻转该
 //! part 全部活跃批次）、`POST /parts/{part_id}/force-complete`（全部非 CANCELLED
 //! 批次）、`POST /parts/{part_id}/soft-delete`、`GET /parts/{part_id}/batches`，
-//! 以及全部 CRUD / 文件 / Excel 工具 / 各类 list 端点。assembly 仍不进 prod
-//! （生产只是其生命周期一段）。
+//! 以及全部 CRUD / 文件 / Excel 工具 / 各类 list 端点。
+//!
+//! assembly **域本体**仍是核心实体、其 10 条 CRUD / 状态机端点不进 prod（决策不变，
+//! URL 仍在 `/api/v2/assemblies/*`，由 `modules::v2_router` 的顶层 nest 承载）。
+//! **唯一的例外**是 2026-10-11 新增的强制完成逃生端点
+//! `POST /api/v2/prod/assemblies/{assembly_id}/force-complete`：它的操作对象是
+//! 「子件 + 批次的生产执行状态」，与批次 / 队列动作同属生产链路语义，故挂
+//! `/api/v2/prod/assemblies/*`（见本文件 `router()` 末尾的 nest）。这只是端点级
+//! 的归属裁决，不构成「assembly 进 prod」的域归属变更。
 //!
 //! URL 硬切换（无 alias）：前端配套 PR 锁步迁移。端点全貌以本文件末尾的
 //! `router()` 聚合为准。
@@ -86,6 +93,7 @@ use std::sync::Arc;
 
 use axum::Router;
 
+use crate::modules::assembly;
 use crate::state::AppState;
 
 pub mod batch;
@@ -123,6 +131,10 @@ pub fn router() -> Router<Arc<AppState>> {
         .nest("/scan", scan::router())
         // 2026-10-02 新增：prod::shelf_process（货架 ↔ 工序映射，3 端点，自 shelf 域硬切）
         .nest("/shelf-processes", shelf_process::router())
+        // 2026-10-11 新增：装配件级强制完成逃生端点（1 端点，自 assembly 域带过来）。
+        // 见 [`assembly::force_complete_router`] 的 doc —— 装配件域**本体**仍是核心
+        // 实体、不进 prod（决策不变），只有这条生产链路收口的端点归 `/prod` 前缀。
+        .nest("/assemblies", assembly::force_complete_router())
 }
 
 /// 全模块共用的批次拆分工厂（挂载点 `/api/v2/batches`，见 `modules::v2_router`）。

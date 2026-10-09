@@ -48,6 +48,7 @@ use crate::infra::cos::CosClient;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::assembly::dto::{
     AssemblyChildAddRequest, AssemblyCreateRequest, AssemblyListQuery, AssemblyUpdateRequest,
+    ForceCompleteRequest,
 };
 use crate::modules::assembly::vo::{
     AssemblyCreateResult, AssemblyDetail, AssemblyListOut, AssemblyOut,
@@ -223,5 +224,22 @@ impl AssemblyService {
         current: &CurrentUser,
     ) -> Result<Vec<SyncOutcome>, AppError> {
         sync_from_part::sync_from_part_changes_dispatch(conn, part_ids, current).await
+    }
+
+    /// 2026-10-11 新增：装配件级强制完成
+    /// （`POST /api/v2/prod/assemblies/{assembly_id}/force-complete`）。
+    ///
+    /// 返回 `(AssemblyOut, 被改动的子件 id 列表)`：handler 用后者在 commit 之后逐个
+    /// 广播 `PART_FORCE_COMPLETED`，响应体取前者。
+    pub async fn force_complete(
+        conn: &mut sqlx::PgConnection,
+        snowflake: &SnowflakeIdGenerator,
+        assembly_id: i64,
+        req: &ForceCompleteRequest,
+        current: &CurrentUser,
+    ) -> Result<(AssemblyOut, Vec<i64>), AppError> {
+        AssemblyService
+            .force_complete_inner(conn, snowflake, assembly_id, req.clone(), current)
+            .await
     }
 }

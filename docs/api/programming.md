@@ -258,6 +258,7 @@ service 规范化后由 `repo.rs::escape_like` 把用户 keyword 里的 `\ / % /
 | `PART_RELEASED_FROM_PROGRAMMING` | **本域唯一写出口**发的。批次 PROGRAMMING → IN_PROCESS ⇒ 该行通常不再命中（§3.3 状态闸门） |
 | `PART_SOFT_DELETED` | `p.deleted_at` 置位 ⇒ 整行消失 |
 | `PART_CANCELLED` / `PART_COMPLETED` / `PART_DELIVERED` / `PART_FORCE_COMPLETED` | part 出 §4.2 的 3 态闸门 ⇒ 整行消失 |
+| `ASSEMBLY_FORCE_COMPLETED` | 装配件级强制完成端点 `POST /api/v2/prod/assemblies/{id}/force-complete` 把**全部子件**显式写成 `COMPLETED` ⇒ 该装配件名下的子件整行出闸门 |
 | `PART_BATCH_CANCELLED` | 批次软删 ⇒ 可能让规则 3 不再命中（若该 part 仅靠规则3 命中） |
 | `PART_BATCH_SPLIT` / `BATCH_PLACED_ON_SHELF` | 改批次集合 ⇒ 影响规则 3 与 §2.2 的批次锚点 |
 | `PART_SENT_TO_OUTSOURCE` / `PART_RECEIVED_FROM_OUTSOURCE` | 改批次状态 ⇒ 影响规则 3 的状态白名单命中 |
@@ -267,14 +268,15 @@ service 规范化后由 `repo.rs::escape_like` 把用户 keyword 里的 `\ / % /
 
 前端 `useDashboardInvalidation.ts` 的 `AFFECTS_DASHBOARD` 集合是 dashboard 域的失效白名单，与本域**没有**订阅关系 —— 本域页面不消费 WS 事件。⚠️ 而 §7.1 表里的 `kind` **有一部分连 `frontend/src/types/dashboard.ts` 的 `DashboardEventType` 联合类型都没进**，遑论进白名单。
 
-⚠️ 下表是 §7.1 全部 12 个 `kind` 与该联合的**逐项差集**（2026-10-07 review 第 1 轮补全 —— 原版只列了 6 个，漏了 `PART_COMPLETED`）。⚠️ 后端 `kind` 是裸 `String`、**无枚举保护**，所以这份差集不会在任一侧编译失败，只会在「列表不动」这类症状里显形；⚠️ §7.1 每新增一个 `kind` 都要回来重算本表。
+⚠️ 下表是 §7.1 全部 13 个 `kind` 与该联合的**逐项差集**（2026-10-07 review 第 1 轮补全 —— 原版只列了 6 个，漏了 `PART_COMPLETED`；2026-10-11 随装配件级强制完成端点新增 `ASSEMBLY_FORCE_COMPLETED`、`PART_FORCE_COMPLETED` 两行）。⚠️ 后端 `kind` 是裸 `String`、**无枚举保护**，所以这份差集不会在任一侧编译失败，只会在「列表不动」这类症状里显形；⚠️ §7.1 每新增一个 `kind` 都要回来重算本表。
 
 | §7.1 `kind` | 在 `DashboardEventType` 联合里？ |
 |---|---|
 | `PART_RELEASED_FROM_PROGRAMMING` | ❌ 不在（**本域唯一写出口**，见 §8.3 第 1 条） |
 | `PART_CANCELLED` | ❌ 不在 |
 | `PART_COMPLETED` | ❌ 不在 |
-| `PART_FORCE_COMPLETED` | ❌ 不在 |
+| `PART_FORCE_COMPLETED` | ✅ 在（2026-10-11 补：前端本轮接入该 kind） |
+| `ASSEMBLY_FORCE_COMPLETED` | ✅ 在（2026-10-11 新增：前端本轮接入该 kind） |
 | `BATCH_PLACED_ON_SHELF` | ❌ 不在（⚠️ 易误判：联合里那个是 v1 旧事件集里的 `PLACED_ON_SHELF`，**与本 kind 不是同一个字符串**） |
 | `PART_SENT_TO_OUTSOURCE` | ❌ 不在 |
 | `PART_RECEIVED_FROM_OUTSOURCE` | ❌ 不在 |
@@ -284,7 +286,13 @@ service 规范化后由 `repo.rs::escape_like` 把用户 keyword 里的 `\ / % /
 | `PART_BATCH_SPLIT` | ✅ 在 |
 | `PART_BATCH_WITH_PDFS_CREATED` | ✅ 在 |
 
-⇒ 差集共 **7 个**（前 7 行），交集 5 个。「在联合里」只保证 TS 侧能把它当 `DashboardEventType` 用，**不代表进了 `AFFECTS_DASHBOARD` 白名单** —— 后者是 `useDashboardInvalidation.ts` 里的独立集合，本域页面两条路都不走。
+⇒ 差集共 **6 个**（`PART_RELEASED_FROM_PROGRAMMING` / `PART_CANCELLED` / `PART_COMPLETED` /
+`BATCH_PLACED_ON_SHELF` / `PART_SENT_TO_OUTSOURCE` / `PART_RECEIVED_FROM_OUTSOURCE`），交集 7 个。
+`PART_FORCE_COMPLETED` 于 2026-10-11 随装配件级强制完成端点一并接入前端联合类型。
+
+⚠️ 仍**未接**的已知项：`PART_CANCELLED` / `PART_COMPLETED`（见上表）与 `ROLLUP_RECOMPUTED`（后端 `kind` 已在发、但它不属于本域 §7.1 的表，两侧都没接）—— 按产品决定后续统一处理，此处只登记事实。
+
+「在联合里」只保证 TS 侧能把它当 `DashboardEventType` 用，**不代表进了 `AFFECTS_DASHBOARD` 白名单** —— 后者是 `useDashboardInvalidation.ts` 里的独立集合，本域页面两条路都不走。
 
 **无编译期约束的后果**：任一侧新增 `kind` 不会让另一侧编译失败，只会让「看板不动 / 列表不动」这类症状极难定位。§8.3 登记了本域的具体已知偏差。
 

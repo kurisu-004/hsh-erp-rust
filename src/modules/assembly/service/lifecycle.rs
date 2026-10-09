@@ -281,6 +281,145 @@ impl AssemblyService {
             .collect();
         Ok(crate::modules::part_file::vo::PartFileListOut { items, total })
     }
+
+    // =======================================================================
+    // 强制完成：force_complete（2026-10-11 新增）
+    // =======================================================================
+
+    /// `POST /prod/assemblies/{id}/force-complete`：MANAGER 单角色强推装配件 +
+    /// 全部子件 + 全部非 CANCELLED 批次为 `COMPLETED`（绕状态机）。
+    ///
+    /// **守卫顺序**（逐条 early-fail，顺序固定）：
+    /// 1. MANAGER 单角色（不下放 Clerk —— 逃生通道）；
+    /// 2. 装配件存在且 `deleted_at IS NULL`；
+    /// 3. `status` 可被 `AssemblyStatus::from_str` 解析；
+    /// 4. 已 COMPLETED → `BIZ_ASSEMBLY_ALREADY_COMPLETED`（409，幂等拒）；
+    /// 5. 已 CANCELLED → `BIZ_ASSEMBLY_ALREADY_CANCELLED`（409，终态守护）。
+    ///
+    /// **三步写（同一事务内，顺序固定）**：
+    /// 1. 全部子件的非 CANCELLED 批次 → `COMPLETED`（走
+    ///    `shared::batch::status::force_complete_all_batches_for_assembly`，该函数
+    ///    **不派生**）；
+    /// 2. **全部**子件显式写终态（`AssemblyRepo::force_complete_children`），逐个
+    ///    归档清序列号 + 记 `FORCE_COMPLETED` 事件；
+    /// 3. 装配件显式写终态 + 清序列号（`force_complete_status` +
+    ///    `clear_serial_no_if_terminal`）。
+    ///
+    /// 第 2/3 步刻意不派生：批次 UPDATE 命中 0 行时派生循环一次都不跑（见
+    /// `shared::batch::status` 里那条 TODO），装配件级的语义是「整体判为已交」，
+    /// 终态必须显式写，否则端点返回 200 却没有把这一行移出大屏的未交 / 部分已交切片。
+    ///
+    /// **事务边界移交 handler**（与 assembly 域其余 handler 同形）：本方法收
+    /// `&mut PgConnection`，`begin` / `commit` 由 handler 负责。
+    ///
+    /// 返回 `(装配件重读结果, 被改动的子件 id 列表)`：后者供 handler 在 commit 之后
+    /// 逐个广播既有的 `PART_FORCE_COMPLETED`。HTTP 响应体仍是 `AssemblyOut`。
+    pub async fn force_complete_inner(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        snowflake: &SnowflakeIdGenerator,
+        assembly_id: i64,
+        req: crate::modules::assembly::dto::ForceCompleteRequest,
+        current: &CurrentUser,
+    ) -> Result<(AssemblyOut, Vec<i64>), AppError> {
+        use crate::modules::assembly::repo::sql::AssemblyRepo;
+        use crate::modules::part::model::NewPartEvent;
+        use crate::modules::part::repo::sql::PartRepo;
+        use crate::shared::batch::status::{
+            force_complete_all_batches_for_assembly, release_part_serial_no,
+        };
+
+        // 1. MANAGER 单角色守卫（不下放 Clerk）。
+        current.require_role(Role::Manager)?;
+        // 2. 装配件存在性（include_deleted=false ⇒ 软删行一并视为不存在）。
+        let asm = AssemblyRepo::get_by_id(&mut *conn, assembly_id, false)
+            .await?
+            .ok_or_else(|| {
+                AppError::biz(
+                    code::BIZ_ASSEMBLY_NOT_FOUND,
+                    format!("assembly {assembly_id} 不存在"),
+                )
+            })?;
+        // 3. status 解析（脏数据守卫：状态机不认识的值不做任何写入）。
+        let from = AssemblyStatus::from_str(&asm.status).ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_INVALID_VALUE,
+                format!("未知 assembly status: {}", asm.status),
+            )
+        })?;
+        // 4. 幂等拒绝：已 COMPLETED → 避免重复强推副作用。
+        if from == AssemblyStatus::COMPLETED {
+            return Err(AppError::biz(
+                code::BIZ_ASSEMBLY_ALREADY_COMPLETED,
+                "装配件已 COMPLETED",
+            ));
+        }
+        // 5. 终态守护：已 CANCELLED → 拒（与 COMPLETED 语义对称）。
+        if from == AssemblyStatus::CANCELLED {
+            return Err(AppError::biz(
+                code::BIZ_ASSEMBLY_ALREADY_CANCELLED,
+                "装配件已 CANCELLED",
+            ));
+        }
+
+        // 步骤①：全部子件的非 CANCELLED 批次强推 COMPLETED（不派生）。
+        let _affected_batches =
+            force_complete_all_batches_for_assembly(conn, assembly_id, current.id).await?;
+
+        // 步骤②：全部子件显式写终态（不是步骤①的受影响集合 —— 批次 0 条的子件
+        // 同样要判为已交），再逐个归档清序列号 + 记事件。
+        let children = PartRepo::list_by_assembly_id(&mut *conn, assembly_id, false).await?;
+        let child_ids: Vec<i64> = children.iter().map(|c| c.id).collect();
+        let changed =
+            AssemblyRepo::force_complete_children(&mut *conn, &child_ids, current.id).await?;
+
+        let prefixed_note = format!("[FORCE_ASSEMBLY] {}", req.note.unwrap_or_default());
+        for part_id in &changed {
+            // 两个事件必须各拿一个真实雪花 id：`t_part_event.id` 是 pkey，复用同一个
+            // id 会直接 23505 让整个事务回滚。
+            // - `serial_event_id` 交给 release 写 `SERIAL_RELEASED` 归档行；
+            // - `force_event_id` 给本次强推的 `FORCE_COMPLETED` 行。
+            let serial_event_id = snowflake.next_id();
+            let force_event_id = snowflake.next_id();
+            // 归档 + 清序列号（复用派生链的同一实现，见 status.rs 的 doc）。
+            release_part_serial_no(
+                conn,
+                *part_id,
+                "COMPLETED",
+                current.id,
+                Some(serial_event_id),
+            )
+            .await?;
+            PartRepo::insert_part_event(
+                &mut *conn,
+                NewPartEvent {
+                    id: force_event_id,
+                    part_id: *part_id,
+                    event_type: "FORCE_COMPLETED",
+                    from_status: None,
+                    to_status: Some("COMPLETED"),
+                    batch_id: None,
+                    quantity: None,
+                    drawing_code: None,
+                    badge_code: None,
+                    note: Some(&prefixed_note),
+                    created_by: Some(current.id),
+                },
+            )
+            .await?;
+        }
+
+        // 步骤③：装配件自身终态 + 清序列号。
+        AssemblyRepo::force_complete_status(&mut *conn, assembly_id, current.id).await?;
+        AssemblyRepo::clear_serial_no_if_terminal(&mut *conn, assembly_id, current.id).await?;
+
+        let fresh = AssemblyRepo::get_by_id(&mut *conn, assembly_id, false)
+            .await?
+            .ok_or_else(|| {
+                AppError::biz(code::BIZ_ASSEMBLY_NOT_FOUND, "force-complete 后查不到")
+            })?;
+        Ok((render_assembly_out(fresh), changed))
+    }
 }
 
 // ---------- internal helpers ----------

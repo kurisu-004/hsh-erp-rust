@@ -697,4 +697,76 @@ impl AssemblyRepo {
         .await?;
         Ok(res.rows_affected())
     }
+
+    /// 2026-10-11 新增：装配件级强制完成的**步骤②** —— 把子件显式写终态
+    /// `COMPLETED`，返回**实际被改动**的子件 id。
+    ///
+    /// 入参 `part_ids` 由 caller 给的是该装配件的**全部**未软删子件，而不是
+    /// 批次强推那条 UPDATE 的受影响集合。逃生通道的语义是「装配件整体判为已交」，
+    /// 终态必须显式写：子件的非取消批次为 0 条（新建未拆批 / 批次已全部 CANCELLED）
+    /// 时，批次那条 UPDATE 命中 0 行，靠派生把子件追平是追不平的（见
+    /// `shared::batch::status::force_complete_all_batches_for_assembly` 的 doc）。
+    ///
+    /// 终态守卫写死 `status NOT IN ('COMPLETED','CANCELLED')` ⇒ **已取消的子件不会
+    /// 被拉回已完成**（与零件级 force-complete 的口径一致），返回列表也据此只含
+    /// 真正发生状态翻转的子件 —— caller 用它决定给谁归档序列号 + 记事件、给谁发
+    /// `PART_FORCE_COMPLETED` 广播。
+    pub async fn force_complete_children<'e, E: PgExecutor<'e>>(
+        executor: E,
+        part_ids: &[i64],
+        updated_by: i64,
+    ) -> Result<Vec<i64>, sqlx::Error> {
+        if part_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // $1 = 子件 id 集合 / $2 = updated_by
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            r#"
+            UPDATE t_part
+               SET status     = 'COMPLETED',
+                   version    = version + 1,
+                   updated_at = NOW(),
+                   updated_by = $2
+             WHERE id = ANY($1)
+               AND deleted_at IS NULL
+               AND status NOT IN ('COMPLETED', 'CANCELLED')
+            RETURNING id
+            "#,
+        )
+        .bind(part_ids)
+        .bind(updated_by)
+        .fetch_all(executor)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    /// 2026-10-11 新增：装配件级强制完成的**步骤③** —— 把 `t_assembly` 显式写
+    /// 终态 `COMPLETED`（不走 OCC、不经 `update_status_if_not_terminal` 的版本闸门）。
+    ///
+    /// 返回受影响行数；调用方随后调 [`Self::clear_serial_no_if_terminal`] 清序列号。
+    /// 终态守卫与步骤② 同形：已是 COMPLETED / CANCELLED 的装配件不动（service 层
+    /// 在守卫阶段就已用 409 拒掉，这层守卫只兜并发窗口）。
+    pub async fn force_complete_status<'e, E: PgExecutor<'e>>(
+        executor: E,
+        id: i64,
+        updated_by: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query(
+            r#"
+            UPDATE t_assembly
+               SET status     = 'COMPLETED',
+                   version    = version + 1,
+                   updated_at = NOW(),
+                   updated_by = $2
+             WHERE id = $1
+               AND deleted_at IS NULL
+               AND status NOT IN ('COMPLETED', 'CANCELLED')
+            "#,
+        )
+        .bind(id)
+        .bind(updated_by)
+        .execute(executor)
+        .await?;
+        Ok(res.rows_affected())
+    }
 }

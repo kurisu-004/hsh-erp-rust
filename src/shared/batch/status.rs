@@ -626,6 +626,64 @@ pub async fn apply_bulk_batch_status_change_for_part(
     })
 }
 
+/// 装配件级强制完成：**把该装配件全部子件的非 CANCELLED 批次强推 COMPLETED**。
+///
+/// 2026-10-11 新增，唯一 caller 是 `AssemblyService::force_complete`
+/// （`POST /api/v2/prod/assemblies/{assembly_id}/force-complete`）。
+///
+/// ## 与 [`apply_bulk_batch_status_change_for_part`] 的两点差异
+///
+/// 1. **入口是装配件**：谓词从 `part_id = $1` 换成 `part_id IN (SELECT id FROM
+///    t_part WHERE assembly_id = $1)`，一条语句覆盖全部子件的批次。
+/// 2. **不派生**：本函数只执行这条 UPDATE，**不调** [`rollup_part_derived`] /
+///    [`rollup_assembly_derived`]。这不是遗漏而是逃生通道的必需语义 ——
+///    `apply_bulk_batch_status_change_for_part` 末尾那条 TODO 已写明「批量 UPDATE
+///    命中 0 行时派生循环一次都不跑，父装配件不派生」。装配件级若沿用派生路径，
+///    「子件的非取消批次恰好为 0 条」（新建未拆批 / 批次已全部 CANCELLED）时循环体
+///    一次都不进，子件与父装配件都留停在原状态、端点返回 200 却什么都没改。
+///    而本端点的语义是「装配件整体判为已交」，终态必须**显式写**：子件终态由
+///    `AssemblyRepo::force_complete_children` 写、装配件终态由
+///    `AssemblyRepo::force_complete_status` 写，两者都覆盖「批次 0 条」的情形。
+///
+/// 因此本函数的返回值只是诊断信息（影响行数），调用方**不得**据此判断子件是否已
+/// 追平 —— 子件 / 装配件的终态一律以后续两条显式写为准。
+///
+/// 不走 OCC：force-complete 是逃生通道，串行化由 SQL 行锁承担。
+///
+/// `$N` 占位符必须连续且与 `.bind()` 个数一致（见本文件 `bind_guard_tests`）。
+pub async fn force_complete_all_batches_for_assembly(
+    conn: &mut PgConnection,
+    assembly_id: i64,
+    updated_by: i64,
+) -> Result<u64, AppError> {
+    // $1 assembly_id / $2 new_status / $3 updated_by / $4 excluded_statuses
+    let res = sqlx::query(
+        r#"
+        UPDATE t_part_batch
+           SET status       = $2::varchar,
+               is_repairing = false,
+               version      = version + 1,
+               updated_at   = now(),
+               updated_by   = $3::bigint
+         WHERE part_id IN (
+                   SELECT id
+                     FROM t_part
+                    WHERE assembly_id = $1::bigint
+                      AND deleted_at IS NULL
+               )
+           AND deleted_at IS NULL
+           AND NOT (status = ANY($4::varchar[]))
+        "#,
+    )
+    .bind(assembly_id)
+    .bind("COMPLETED")
+    .bind(updated_by)
+    .bind(vec!["CANCELLED".to_string()])
+    .execute(&mut *conn)
+    .await?;
+    Ok(res.rows_affected())
+}
+
 // ---------- step 4 / step 5：终态序列号释放 ----------
 
 /// 子件（`t_part`）终态序列号释放：**先归档后清**。
@@ -659,7 +717,12 @@ pub async fn apply_bulk_batch_status_change_for_part(
 /// 2. **冲突**：该序列在生产里 `is_called = false`（Python 端一直显式传雪花），
 ///    首个 `nextval` 返回 1；若历史数据里存在序列期的小 id，就是一次 pkey 冲突
 ///    → 整个事务 500，而**消除它需要一个新 migration**（`setval`）。
-async fn release_part_serial_no(
+///
+/// 2026-10-11：可见性放开到 `pub(crate)`。新增 caller 是
+/// `AssemblyService::force_complete` —— 装配件级强制完成后要对**被改动的子件**
+/// 逐个做同样的「归档后清」，与本模块派生链共用同一条实现，避免第二条 SQL
+/// 分叉出与这里不一致的归档语义（清列谓词 / 事件 id 口径）。
+pub(crate) async fn release_part_serial_no(
     conn: &mut PgConnection,
     part_id: i64,
     new_status: &str,
