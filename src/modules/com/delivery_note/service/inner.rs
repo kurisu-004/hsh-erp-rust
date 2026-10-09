@@ -22,9 +22,8 @@ use crate::modules::prod::batch::repo::PartBatchRepo;
 use crate::shared::error::{AppError, code};
 
 use super::super::model::DeliveryNote;
-use super::super::vo::{
-    DeliveryNoteDetailOut, DeliveryNoteLineItem, DeliveryNoteOut, delivery_seq_i32,
-};
+use super::super::vo::{DeliveryNoteDetailOut, DeliveryNoteLineItem, DeliveryNoteOut};
+use super::line_item::build_line_item;
 use super::shippable_sets::note_shippable_sets;
 
 // ===========================================================================
@@ -207,57 +206,15 @@ pub(super) async fn get_with_parts(
     let sets_map = note_shippable_sets(&rows, &asm_quantity, &children_by_asm);
 
     let mut items: Vec<DeliveryNoteLineItem> = Vec::with_capacity(rows.len());
-    for (b, p) in rows {
-        let leaf = leaf_map.get(&p.customer_id);
-        let parent = leaf
-            .and_then(|l| l.parent_id)
-            .and_then(|pid| parent_map.get(&pid));
-        let leaf_name = leaf.map(|c| c.name.clone());
-        let parent_name = parent.map(|c| c.name.clone()).or_else(|| leaf_name.clone()); // L1 自指同 leaf
-        let path = match (&parent_name, &leaf_name) {
-            (Some(p), Some(l)) if p != l => Some(format!("{p} / {l}")),
-            _ => leaf_name.clone(),
-        };
-
-        let asm = p.assembly_id.and_then(|id| assembly_map.get(&id));
-
-        let batch_label = match &p.serial_no {
-            Some(s) => format!("{s}B{:02}", b.batch_no),
-            None => format!("批次{}", b.batch_no),
-        };
-
-        items.push(DeliveryNoteLineItem {
-            id: b.id,
-            part_id: p.id,
-            batch_no: b.batch_no,
-            // 加入本单的次序（bigint → i32 的收窄口径见 `delivery_seq_i32`）
-            delivery_seq: delivery_seq_i32(b.delivery_seq),
-            batch_label,
-            serial_no: p.serial_no.clone().unwrap_or_default(),
-            drawing_no: p.drawing_no.clone(),
-            name: p.name.clone(),
-            quantity: b.quantity,
-            status: b.status.clone(),
-            applicant_name: Some(p.applicant_name.clone()).filter(|s| !s.is_empty()),
-            request_date: Some(p.request_date),
-            planned_delivery_date: Some(p.planned_delivery_date),
-            system_delivery_date: p.system_delivery_date,
-            order_no: p.order_no.clone(),
-            note: p.note.clone(),
-            customer_name: leaf_name,
-            parent_customer_name: parent_name,
-            customer_path: path,
-            // 与 `leaf_map` 的查表 key 同值，不额外查库
-            customer_id: p.customer_id,
-            assembly_id: asm.map(|a| a.id),
-            assembly_serial_no: asm.and_then(|a| a.serial_no.clone()),
-            assembly_drawing_no: asm.map(|a| a.drawing_no.clone()),
-            assembly_name: asm.map(|a| a.name.clone()),
-            assembly_order_no: asm.and_then(|a| a.order_no.clone()),
-            // 2026-10-04 新增：装配件工单总套数 + 本单可出货套数（散件 None）
-            assembly_quantity: asm.map(|a| a.quantity),
-            shippable_sets: p.assembly_id.and_then(|id| sets_map.get(&id).copied()),
-        });
+    for (b, p) in &rows {
+        items.push(build_line_item(
+            b,
+            p,
+            &leaf_map,
+            &parent_map,
+            &assembly_map,
+            &sets_map,
+        ));
     }
 
     let head_vec = build_note_outs(conn, std::slice::from_ref(&n)).await?;

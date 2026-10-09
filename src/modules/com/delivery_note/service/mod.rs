@@ -15,6 +15,8 @@
 //!   模块私有，公式本体 `shippable_sets()` 只给 `scan_tree.rs` / `scan_entry.rs`
 //!   两个同域调用方用；宽类型适配壳 `note_shippable_sets()` 给 `inner.rs` /
 //!   `crud.rs` 的详情 VO 装配用）
+//! - `line_item` —— `DeliveryNoteLineItem` 的**唯一**装配点（单张详情 / 批量详情
+//!   两条出参路径共用；口径改动只改这里一处）
 //! - `inner` —— 跨子模块共享的私有 helper（`build_note_outs` / `get_with_parts` /
 //!   `validate_*` / 错误构造器）
 //!
@@ -48,6 +50,7 @@ mod find_or_create;
 mod group;
 mod inner;
 mod lifecycle;
+mod line_item;
 mod scan_entry;
 mod scan_tree;
 mod shippable_sets;

@@ -29,6 +29,13 @@
 
 ### 0.1 变更记录
 
+- **2026-10-10 `applicant_name` 加装配件回落（§2.3.2）**：行项「申请人」改为
+  **子件为空时回落所属装配件的 `t_assembly.applicant_name`**。存量数据里装配件向下
+  继承申请人这条设计**大量未落地**（开发库实测 490 条子件中 360 条 `t_part.applicant_name`
+  为空串，而 90 个 `t_assembly.applicant_name` 无一为空），直接读子件列会让这些行渲染成
+  「—」。**只做读侧回落、不回填存量**（理由见 §2.3.2）。字段本身恒定存在、前端三处渲染点
+  已在读 ⇒ **前端零改动**（§8.3 前端配套表第 19 条）。同时把单张详情与批量详情两处
+  逐字重复的行项装配收进 `service/line_item.rs::build_line_item` 一个实现，口径只维护一处。
 - **2026-10-10 行项默认序改为「加入本单的次序」（§2.3.1）**：单据详情与批量详情的
   `line_items[]` 排序键从 `t_part_batch.id` 切成 `delivery_seq ASC NULLS LAST, id ASC`
   —— 批次 id 是**建批顺序**，整批直接挂单的批次用的是建批时的 id，「先扫 A 后扫 B、
@@ -187,7 +194,7 @@ BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY`、`21420 BIZ_DELIVERY_NOTE_LOCKED_PART`
 | `name` | string | `t_part.name` |
 | `quantity` | number | `t_part_batch.quantity`（**拆批后**是新批次的量） |
 | `status` | string | `t_part_batch.status` |
-| `applicant_name` | string \| null | `t_part.applicant_name`（空串 → null） |
+| `applicant_name` | string \| null ★ | `t_part.applicant_name`；**装配件子件为空时回落 `t_assembly.applicant_name`**，见 §2.3.2。空串 → null |
 | `request_date` | string | `t_part.request_date` |
 | `planned_delivery_date` | string | `t_part.planned_delivery_date` |
 | `system_delivery_date` | string \| null | `t_part.system_delivery_date` |
@@ -231,6 +238,39 @@ BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY`、`21420 BIZ_DELIVERY_NOTE_LOCKED_PART`
 
 `line_items[].delivery_seq` 走**普通 serde**（同 `batch_no`）：它是单内计数不是雪花 id，
 不需要 `serialize_i64_opt`，也不 `skip_serializing_if` —— 字段恒定存在。
+
+#### 2.3.2 ★ `applicant_name`：子件为空时回落装配件
+
+取值优先级（实现唯一点：`com/delivery_note/service/line_item.rs::resolve_applicant_name`）：
+
+| 序 | 判据 | 取值 |
+|---|---|---|
+| 1 | `t_part.applicant_name` 非空串 | 自己的申请人（无论该行是不是装配件子件） |
+| 2 | 自己是装配件子件（`t_part.assembly_id` 非空）**且** 父装配件解析得到（`include_deleted=false`） | `t_assembly.applicant_name`（再判一次空串） |
+| 3 | 都不成立 | `null`（前端渲染「—」） |
+
+**为什么需要回落**：装配件**设计上**由父件向下继承申请人（`assembly` 域建单与
+update 级联两条写路径都会写子件），但存量数据里这条继承**大量未落地** —— 开发库实测
+490 条装配件子件中 **360 条 `t_part.applicant_name` 是空串**，而 90 个
+`t_assembly.applicant_name` **无一为空**。行项只读子件列会把这些行渲染成「—」，
+送货单打印模板 / 标签 xlsx 两处都据此渲染，等于整批单据看不到申请人。
+
+**这不是漏字段**：`applicant_name` 在两条出参路径上恒定存在，前端三处渲染点
+（详情列定义、标签工作簿、打印模板）都已在读，无需加字段、无需改前端契约。
+
+**为什么零额外 DB 往返**：装配件父行字段（`assembly_serial_no` / `assembly_drawing_no` /
+`assembly_name` / `assembly_order_no` / `assembly_quantity`）本来就已把装配件批查进
+`assembly_map`，`TAssembly` 自带 `applicant_name` ⇒ 回落只是一次内存查表。
+
+**为什么散件不回落**：`assembly_map` 只装「本单出现过的装配件」⇒ 散件行的装配件恒
+`None`，第 2 条分支对散件天然不成立，不需要额外判据。
+
+**⚠️ 只做读侧回落，不回填存量**：补写那 360 行等于凭空造一条「谁在什么时候把它同步给
+子件」的审计轨迹。若日后要清洗存量，应作为独立的数据迁移立项（按 `t_part.assembly_id`
+从父装配件回填），本口径不必跟着改 —— 回填后走的是第 1 条分支，值相同。
+
+**两条路径同源**：单张详情 `GET /{id}` 与批量详情 `GET /batch-detail` 逐字共用
+`line_item::build_line_item`，不存在「同一张单两条路径给不同申请人」的可能。
 
 ### 2.4 `DeliveryNoteListOut` / `BatchDeliveryDetailData`
 
@@ -688,6 +728,7 @@ schema 与页面都在用」。
 | 16 | **删 `delivery_dispatch` 菜单页** | ⛔ 后端已下线该菜单（`seeds/menu.sql` §3.5 软删 + §4.1 / §4.3 白名单移除 + §4.6 回收 `role_menu`），而前端 `src/views/delivery-dispatch/DispatchNoteList.vue` 仍在。**该页依赖的恰好是本轮删掉的两条端点**（`GET /pickup-pending` / `POST /{id}/pickup-scan`）⇒ 不删就是「菜单能点、页面能开、每个请求都 404」的活条目。后端无 alias，这是前端必须同步删的一页 |
 | 17 | `line_items[].customer_id` | ★ `DeliveryNoteLineItem` **新增** `customer_id: string`（L2 叶子 id，必填非空）。打印分组键从 `customer_name` 切成 `customer_id`：`t_customer.name` 只有**非唯一** btree 索引，同名 L2 会被并进同一张 sheet，而打印产物是客户签字的收货凭证。Zod schema 里加必填 `customer_id: z.string()` |
 | 18 | `line_items[].delivery_seq` | ★ `DeliveryNoteLineItem` **新增** `delivery_seq: number \| null`（**加入本单的次序**，口径见 §2.3.1）。数组顺序已由后端按它排好，前端**零改动即得「按扫码先后」的展示**；Zod schema 里加 `delivery_seq: z.number().nullable()`，供页面按需展示序号列 |
+| 19 | `applicant_name` 回落 | **零改动**（2026-10-10，§2.3.2）。字段名 / 类型 / 可空性都没动，只是「装配件子件自身为空时改用父装配件的值」。前端三处渲染点（详情列表列定义、标签 xlsx 工作簿、送货单打印模板）本就在读它 ⇒ 部署后立即见效，**不需要改 schema、不需要改列定义、不需要改模板** |
 
 ### 8.4 已知偏差登记
 
@@ -721,3 +762,11 @@ schema 与页面都在用」。
    出参已从 `SubmitDeliveryOut` 塌缩为 `String`（只有 id），handler 拿不到 `note_no` ⇒ 该
    payload 字段填的是 `path.id.to_string()`。前端只用 `delivery_note_id` 做 invalidate，无影响；
    若将来要真 no，需在 `submit` 里额外回读 `delivery_note_no`。
+8. **装配件向下继承申请人：存量未落地，读侧已回落、数据未清洗**（2026-10-10，§2.3.2）。
+   开发库实测 490 条装配件子件中 **360 条 `t_part.applicant_name` 是空串**、90 个
+   `t_assembly.applicant_name` **无一为空** ⇒ 行项已能显示装配件的申请人（读侧回落），
+   但 `t_part` 里那 360 行**仍是空串**，任何直接读该列的地方（零件一览 / 零件详情 /
+   统计报表）仍会看到空。**本轮刻意不做数据迁移**：补写等于凭空造一条「谁在什么时候
+   把它同步给子件」的审计轨迹，且回填范围与「当时父件申请人是什么」无从考证。若产品要
+   清洗，应作为独立立项（按 `t_part.assembly_id` 从父装配件回填），届时行项口径不必改 ——
+   回填后走的是「子件自身有值」那条分支，值与回落结果相同。

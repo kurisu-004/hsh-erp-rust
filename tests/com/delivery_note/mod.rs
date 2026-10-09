@@ -17,6 +17,9 @@
 //! - drivers.rs      ← 2026-10-08 新增（`GET /com/delivery/drivers` 只返送货司机）
 //! - driver.rs       ← 2026-10-08 新增（`POST /{id}/driver` + `validate_driver` 5 条
 //!   + `/pickup` 重校 + 入参不再有 `driver_worker_id`）
+//! - applicant_fallback.rs ← 2026-10-10 新增（`line_items[].applicant_name` 的装配件
+//!   回落口径：子件为空 ⇒ 回落装配件；散件仍 null；子件自带值不被覆盖；两条出参路径
+//!   同源）
 //!
 //! ## 2026-10-08 删除
 //! - `attach_batches.rs` ← 原 tests/delivery/attach_batches.rs（`POST /{id}/attach-batches`
@@ -24,6 +27,7 @@
 
 #![allow(dead_code, clippy::await_holding_lock, unused_imports)]
 
+mod applicant_fallback;
 mod batch_allocation;
 mod driver;
 mod drivers;
