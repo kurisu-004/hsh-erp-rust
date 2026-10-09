@@ -10,7 +10,23 @@
 > 所在文件，2026-10-10 起已无这两条路由）与 `src/modules/prod/scan/listing/`
 > （新址）。完整的旧 → 新对照见 §6.1 移除记录表。
 
-## 0. 2026-10-10 变更摘要
+## 0. 变更摘要
+
+### 0.1 2026-10-11：worker-scan 支持部分数量
+
+`WorkerScanRequest` 新增 `quantity`（**JSON 字符串**），让放回 / 送检都能指定
+「这次只处理这么多件」。逐字段与三种落法见 §2.4，拆批落点见 §2.4.1。
+
+- **向后兼容**：缺省即整批，行为与该字段引入前**逐字一致**；老客户端不多发这个键
+  照常工作（生产代码零 `deny_unknown_fields`）。
+- **拆批复用**已有的 `split_batch_for_partial_pass`（`prod::batch` 的共用拆批 SQL，
+  pick-up / to_ship / to_process / to_inspection 四处已在用），不新写 SQL。
+- **余量的去向与 pick-up 相反**：worker-scan 的余量继承 `current_holder_id`
+  **留在工人手上**（继续出现在「已持有」列表）；pick-up 的余量留在原处（架上）。
+- **响应** `scan.batch_id` 改为返回「**本次实际被处理的那一批**」（拆批场景 = 新
+  批次）；JSON 形状仍是那 6 个键。
+
+### 0.2 2026-10-10：报工台立域
 
 把**报工台（工人扫码台）的 5 个端点**从原先散落在三个域的状态收拢进 `prod::scan`
 一个域，URL 全部挂 `/api/v2/prod/scan/*`，**硬切、无 alias**。
@@ -41,7 +57,7 @@
 | 1 | POST | `/api/v2/prod/scan/verify-badge` | `POST /api/v2/prod/workers/verify-badge` | **任意已登录**（含 SHELF_ACCOUNT） | `{ badge_code }` | `ScanWorkerBrief` |
 | 2 | GET | `/api/v2/prod/scan/pickable?work_type_id=&limit=&offset=` | `GET /api/v2/parts/pickable-by-work-type/{work_type_id}` | Manager + Clerk + Inspector + ShelfAccount | `work_type_id` **必填**（字符串）、`limit?`（缺省 50 / clamp 1..200）、`offset?` | `ScanListOut` |
 | 3 | GET | `/api/v2/prod/scan/held?worker_id=&limit=&offset=` | `GET /api/v2/parts/by-worker/{worker_id}` | Manager + Clerk + Inspector + ShelfAccount | `worker_id` **必填**（字符串）、`limit?`、`offset?` | `ScanListOut` |
-| 4 | POST | `/api/v2/prod/scan/worker-scan` | `POST /api/v2/prod/batches/worker-scan` | Manager + ShelfAccount | `WorkerScanRequest` | `WorkerScanOut` |
+| 4 | POST | `/api/v2/prod/scan/worker-scan` | `POST /api/v2/prod/batches/worker-scan` | Manager + ShelfAccount | `WorkerScanRequest`（6 字段，`quantity?` 为 **JSON 字符串**） | `WorkerScanOut` |
 | 5 | POST | `/api/v2/prod/scan/batches/{batch_id}/pick-up` | `POST /api/v2/prod/batches/{batch_id}/pick-up` | Manager + Clerk + ShelfAccount | path `batch_id` + `PickUpRequest` | `R<PartOut>` |
 
 - 全部返回统一信封 `R { code, message, data }`。
@@ -52,6 +68,10 @@
 - `work_type_id` / `worker_id` 走 `deserialize_i64`（**只接受 JSON 字符串**），
   发 JSON number → axum `QueryRejection` → **HTTP 400 纯文本，不进 `R<T>` 信封**。
   漏传 → 同样 400 纯文本（无 `#[serde(default)]`）。
+- body 里的两个数量 / 消歧入参（`WorkerScanRequest.batch_id` /
+  `WorkerScanRequest.quantity`、`PickUpRequest.shelf_id` /
+  `PickUpRequest.quantity`）走 `deserialize_i64_opt`，**同样只接受 JSON 字符串**；
+  发数字 → axum `JsonRejection` → **HTTP 422 纯文本**。
 - i64 雪花主键一律序列化为 JSON **string**，防 JS `Number` 精度截断。
 - 端点 1 的两个业务出口：工牌不存在 → `20201 BIZ_WORKER_NOT_FOUND`（**HTTP 404**）；
   存在但停用 → `20202 BIZ_WORKER_INACTIVE`（**HTTP 400**）。两者靠
@@ -194,31 +214,84 @@ $ grep -rno 'worker??\.\(id\|name\|badge_code\|work_type_id\|work_type_name\|id_
 | `limit` | number | 裸 i64，缺省 50 / clamp 1..200 |
 | `offset` | number | 裸 i64 |
 
-### 2.4 `WorkerScanOut` / `WorkerScanCoreOut`（端点 4）
+### 2.4 `WorkerScanRequest`（端点 4，6 字段）
 
-响应形状**逐字不变**（本轮只改 URL 与归属）：
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `serial_no` | string | **是** | 工单序列号；定位 part 的主键锚 |
+| `badge_code` | string | **是** | 工人工牌码；未注册 → `20201`、停用 → `20202`、未分配工种 → `20206` |
+| `event_type` | string | **是** | `RETURNED`（放回）/ `INSPECTED`（送检），**大写**，反序列化枚举无小写别名 |
+| `next_process_id` | string | **条件** | 仅**非顺应工序**时必填（缺失 → `40001`）；`chain_state='NEXT'` 与 `TAIL` 时可省，后端按链推导 / 自动送检 |
+| `batch_id` | string | 否 | 多批次歧义消歧（`find_worker_held_batch_for_part` 的 `expected_batch_id`）；只有一批持有件时缺省 |
+| `quantity` | string | 否 | **JSON 字符串**，本次实际操作量；缺省 = 整批。口径见 §2.4.1 |
+
+`batch_id` / `quantity` 都是 **JSON 字符串**（雪花 id 精度 + 与本域既有约定一致）：
+`"batch_id": "1234"`、`"quantity": "4"`。发 JSON number → **HTTP 422 纯文本**，
+不进 `R<T>` 信封。
+
+### 2.4.1 `quantity` 的三种落法（部分放回 / 部分送检）
+
+| 请求 | 结果 | 批次变化 | 事件日志 | 响应 `scan.batch_id` |
+|---|---|---|---|---|
+| 缺省 / `null` | **整批** | 源批次直接流转，不拆 | `RETURNED_TO_SHELF` 或 `SENT_TO_INSPECTION`，`quantity` = `batch.quantity` | 源批次 |
+| `>= batch.quantity` | **整批**（`==` 是「显式整批」的合法写法） | 同上，不拆 | 同上 | 源批次 |
+| `0 < q < batch.quantity` | **部分** | 拆出 `quantity = q` 的新批次走本次流转；**源批次余量继承 `current_holder_id` 留在工人手上**（`location='WORKER'`、`current_holder_id` 不变，只是 `quantity` 被扣减、`version` +1） | `SPLIT`（`quantity = q`，`batch_id` = 新批次）+ 原事件（`quantity = q`，`batch_id` = 新批次） | **新批次** |
+| `<= 0` / `> batch.quantity` / 超出 i32 | 拒收 | **零写入**（事务回滚，不拆批） | 无 | — |
+
+- 错误码 `20111 BIZ_PART_BATCH_INVALID_QUANTITY`（HTTP **400**），与 pick-up 的
+  部分领取、`POST /api/v2/batches/split` 的非法数量同码同状态。
+- ⚠️ **`==` 合法、`>` 才非法**，与本域 `PickUpRequest::quantity` 同款；与
+  `POST /api/v2/batches/split` 的「必须严格小于」**不同** —— 那条端点里「等于」
+  是「白拆一次」，故判非法。
+- ⚠️ **拆批的落点**：`RETURNED` 分支里是「`resolve_chain_position` 之后、TAIL 判定
+  与 `mark_batch_returned` 之前」；`INSPECTED` 分支里是「分支入口」。两条都保证
+  拆批早于该分支的**任何**批次写入。链位置可以在拆前判定 ——
+  `resolve_chain_position` 只按 `current_process_id` / `current_process_step_id`
+  定位，而拆批的 `INSERT ... SELECT` 原样继承这两列、`UPDATE` 只动 `quantity`。
+- ⚠️ **TAIL（链尾自动送检）分支同样返回新批次**：它是 `RETURNED` 臂里的
+  early-return（chain_state = `TAIL`），若拆批落在它之后，那条路径送检的就是整批、
+  本次指定的数量被静默吞掉。
+- ⚠️ **新批次能满足下游守卫**：`_split_batch_inner` 的 `INSERT ... SELECT` 继承
+  `location`（`'WORKER'`）与 `status`（`'IN_PROCESS'`），`version` 恒 0，而
+  `mark_batch_returned` 的 WHERE 是
+  `id=$1 AND version=$2 AND status='IN_PROCESS' AND location='WORKER' AND
+  deleted_at IS NULL`、`mark_batch_inspected` 走 `shared::batch::status` 的
+  `allowed_from = {PENDING, PROGRAMMING, IN_PROCESS}` + `expected_version` ⇒
+  逐条命中。
+- 拆批复用 `prod::batch::repo::PartBatchRepo::split_batch_for_partial_pass`（薄包装
+  `_split_batch_inner`），与 pick-up / to_ship / to_process / to_inspection 共用同一段
+  SQL，**本域不新写拆批 SQL**。
+- 余量继续满足 `GET /scan/held` 的行判据（`status='IN_PROCESS'` +
+  `location='WORKER'` + `current_holder_id = worker_id`），仍出现在报工台「已持有」
+  列表，可被下一次扫（放回 / 送检）处理。
+
+### 2.5 `WorkerScanOut` / `WorkerScanCoreOut`（端点 4）
+
+JSON 形状逐字不变（本轮只改 URL 与归属）：
 
 | 字段 | 类型 | 备注 |
 |---|---|---|
 | `scan.worker_id` | string | |
 | `scan.part_id` | string | |
-| `scan.batch_id` | string | |
+| `scan.batch_id` | string | ⚠️ **本次实际被处理的那一批**：拆批场景（§2.4.1）= 拆出来的**新批次**，整批场景 = 工人手上那批 |
 | `scan.event_type` | string | ⚠️ **可能与请求的不同**，见 §4.1 |
 | `scan.synced_assembly_id` | string \| null | 父装配件真变了才有值（handler 据此发 `ASSEMBLY_UPDATED`） |
 | `refill` | `RefillResult` | 同事务 refill，见 [`queue.md`](queue.md) §3 |
 
-`work_type_id` / `badge_code` 是**内部管道字段**（`#[serde(skip)]`）：handler 用它
+`work_type_id` / `badge_code` / `split` 是**内部管道字段**（`#[serde(skip)]`）：前两个
 把 `worker_scan_event` 已 fetch 过的 worker 信息透传给同事务的
-`QueueService::refill_for_worker_with_work_type`，避免重复查询。不出现在 JSON 里。
+`QueueService::refill_for_worker_with_work_type`，避免重复查询；`split` 承载
+「部分数量有没有拆批」，供 handler 在 commit 之后补发 `PART_BATCH_SPLIT`。三者都不
+出现在 JSON 里。
 
-### 2.5 `PickUpRequest`（端点 5）
+### 2.6 `PickUpRequest`（端点 5）
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `version` | number | **是** | `t_part_batch.version` OCC 锚 |
 | `worker_id` | string | **是** | 持有件工人（雪花 ID 字符串） |
 | `shelf_id` | string | 否 | 传了才走 `validate_shelf_zone`（`20501` / `20512` / `20104`），缺省**完全不校验** |
-| `quantity` | string | 否 | **JSON 字符串**（前端既有约定）；缺省 = 整批 |
+| `quantity` | string | 否 | **JSON 字符串**；缺省 = 整批（口径与 §2.4.1 同款，**只有余量的去向不同**） |
 | `note` | string | 否 | 事件日志备注 |
 
 `shelf_id` 为什么可以缺省：pick-up 路径上它只进 `validate_shelf_zone`（零写），而
@@ -226,6 +299,10 @@ $ grep -rno 'worker??\.\(id\|name\|badge_code\|work_type_id\|work_type_name\|id_
 `t_part_event` 无货架列，响应 `PartOut` 无 shelf 字段 ⇒ 那条校验是**防呆断言**而非
 安全边界。⚠️ pick-up 路径**从不**校验货架↔工序映射（`20507`
 `assert_shelf_maps_process` 在这条路径一次都没被调用）。
+
+⚠️ pick-up 部分领取的**余量留在原处**（源批次 `location` / `current_holder_id` 一行
+不改），与 worker-scan 的 §2.4.1 相反 —— 现场语义不同：领取时余量应回到架上等下一个
+工人领，放回 / 送检时余量应留在**当前这个工人**手上等他下次处理。
 
 ## 3. 口径表
 
@@ -308,6 +385,7 @@ step 指针与「当前工序在链内的位置」是两个独立事实，而 wo
 | 端点 | 事件 | 触发条件 |
 |---|---|---|
 | `POST /scan/worker-scan` | `WORKER_SCAN_RETURNED` / `WORKER_SCAN_INSPECTED` | 无条件，**按响应的 `scan_out.event_type`** |
+| `POST /scan/worker-scan` | `PART_BATCH_SPLIT` | 部分数量（§2.4.1，自动拆批） |
 | `POST /scan/worker-scan` | `WORKER_POOL_REFILL_DONE` | 同事务 refill 抢到一批 |
 | `POST /scan/worker-scan` | `WORKER_POOL_EMPTY` | refill 池空 |
 | `POST /scan/worker-scan` | `ASSEMBLY_UPDATED` | 父装配件真变了 |
@@ -315,6 +393,13 @@ step 指针与「当前工序在链内的位置」是两个独立事实，而 wo
 | `POST /scan/batches/{id}/pick-up` | `PART_BATCH_SPLIT` | 部分领取（自动拆批） |
 
 - **事件名一字不改** —— dashboard 与队列页都在监听，改名会静默断链。
+- `PART_BATCH_SPLIT` **两条写路径共用**（worker-scan 部分放回 / 部分送检与 pick-up
+  部分领取），payload 字段名**逐字同形**：
+  `{ part_id, new_batch_id, source_batch_id, quantity }`（雪花 id 为 JSON string，
+  `quantity` 为裸 number）。
+- ⚠️ **worker-scan 这条必须发**：拆批把源批次 `quantity` 静默扣减、并新建了一个批次
+  行，而余量**仍在工人手上**（不像 pick-up 那样留在架上），其它端的批次视图收不到
+  这条事件就永远看不到「持有件变多了一件 / 源数量变了」。
 - 消费方是 dashboard 域（`/ws/dashboard` + 前端 `AFFECTS_DASHBOARD` 白名单），
   不是报工台自己的实时刷新。
 - 广播在 **commit 之后**（对齐 Python 延迟广播模式）。
@@ -340,7 +425,7 @@ HTTP 响应的 `refill.shelf_id` 同步。
 | `GET /scan/pickable` | **2** | 取行 + COUNT |
 | `GET /scan/held` | **2** | 取行 + COUNT |
 | `POST /scan/verify-badge` | 1 | 按 `badge_code` 反查 |
-| `POST /scan/worker-scan` | 多次 | 状态翻转 + 事件日志 + 选架 + 同事务 refill + 派生 |
+| `POST /scan/worker-scan` | 多次 | 状态翻转 + 事件日志 + 选架 + 同事务 refill + 派生；**部分数量另加** 链位置解析 + 拆批 3 条（`max(batch_no)` / `INSERT ... SELECT` / 扣量 `UPDATE`）+ 新批次回读 1 条 + `SPLIT` 事件 1 条 |
 | `POST /scan/batches/{id}/pick-up` | 多次 | 拆批（可选）+ 状态翻转 + 事件日志 |
 
 两条 list 端点都**不按行数重复查**：`pickable` 一次 SQL 把「工种→工序映射 → 架 →
@@ -450,6 +535,18 @@ SQL 里聚合，一处他域的 service / repo 都不 import（连 `PartRepoTrai
 7. **`worker-scan` 的成功文案必须按响应的 `event_type` 分支**（§4.1）—— 2026-10-10
    起这条从「链尾边缘场景」变成常规路径。
 8. **i64 字符串化**：所有雪花 id 仍是 JSON string，本轮不改变该约定。
+9. **部分数量（2026-10-11 新增）**：
+   - 请求侧放回页 / 送检页各加一个数量输入，**发 JSON 字符串**（`"quantity": "4"`），
+     不发数字（否则 422 纯文本）；缺省不传该键即整批，**老客户端零改动照常工作**。
+   - 响应侧 `scan.batch_id` 现在是「本次实际被处理的那一批」。**不要**再拿请求里
+     扫到的 `batch_id` 去回显 / 去推后继动作 —— 拆批场景下它指向余量（仍在工人手上）。
+   - 成功后的列表刷新：余量批次仍在 `GET /scan/held` 里，拆出来的那批已不在 ⇒
+     「已持有」列表**行数不变**、数量变小；放回 / 送检两页都必须重拉列表，不能只
+     假定「扫掉一行」。
+   - `PART_BATCH_SPLIT` WS 事件与 pick-up 共用，payload 字段名同形
+     （§4）—— 若前端已有该事件的处理函数，worker-scan 这条**零改动**即生效。
+   - 非法数量回 `20111`（HTTP 400）+ 信封 `{ code, message, data: null }`，按既有
+     错误提示路径展示即可。
 
 ## 8. 已知偏差登记
 
