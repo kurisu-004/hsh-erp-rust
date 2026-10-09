@@ -1,0 +1,43 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT status AS \"status!\",\n                   (system_delivery_date IS NULL) AS \"is_null!\",\n                   COUNT(*) AS \"cnt!\"\n            FROM t_part\n            WHERE deleted_at IS NULL\n              AND status = ANY($1::text[])\n              AND ($2::date IS NULL OR system_delivery_date = $2::date)\n            GROUP BY status, (system_delivery_date IS NULL)\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "status!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "is_null!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "cnt!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "Date"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "e111de12fe9aa520993b143cb3ab862e8138633c75cb402dc974db8dc0c40f27"
+}

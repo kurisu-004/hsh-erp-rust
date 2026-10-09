@@ -6,7 +6,28 @@
 > **消费方只有一个**：`wx-app` 微信小程序。Web 前端（`frontend/`）**不经本域**，走
 > 各业务域的 `/api/v2/part/*` `/api/v2/prod/*` 等端点。
 
-## 0. 2026-10-11 变更摘要（按小程序页面切子模块）
+## 0. 变更摘要
+
+### 0.1 ★ 2026-10-12：`part_list` 接上**日期 + 状态双维筛选**（端点 2 / 3）
+
+小程序 `pages/part-list` 的 `date-nav-bar`（日期）此前**完全是装饰性的**
+—— `selectedDate` 既不进 `queryKey` 也不进 `queryFn`，后端也没有日期参数，
+换一天列表纹丝不动。本次把它接成真筛选，并同步把 tab 从 4 个扩到 **7 个**。
+
+| # | 变更 | 影响 |
+|---|---|---|
+| 1 | **新增 `?date=YYYY-MM-DD`**（端点 2 / 3 共用），谓词打 `p.system_delivery_date` | 破坏性（对已有调用方是新增能力）；缺省 = 不加日期谓词 |
+| 2 | **tab 白名单 4 → 7 个**：新增 `outsource` / `inspecting` / `noSystemDate`，`pendingInspection` **作废** | ⚠️ 破坏性：传 `pendingInspection` 从 200 变 **422** |
+| 3 | `delivered` 收窄成**只有** `DELIVERED`（原 `READY_TO_SHIP` + `DELIVERED`） | ⚠️ 破坏性 |
+| 4 | ★ **`all` / 缺省不再是「不过滤」**：一律落到 6 状态白名单 | ⚠️ **破坏性**：`PROGRAMMING` / `COMPLETED` / `CANCELLED` 从列表与角标里消失（产品已明确确认） |
+| 5 | `counts` 扩到 7 键，并**带上日期作用域**（不再是「全局口径」，见 §8.5） | ⚠️ 破坏性（响应形状） |
+| 6 | 卡片 `dueDate` 数据源由 NOT NULL 的 `planned_delivery_date` 改成**可空**的 `system_delivery_date` | ⚠️ 破坏性：`noSystemDate` tab 的卡片 `dueDate` 是 JSON `null`（不再是字符串） |
+| 7 | 排序**不变**：`ORDER BY p.is_urgent DESC, p.planned_delivery_date ASC, p.id ASC`（见 §3.1 的理由登记） | 无 |
+
+钉死入口：lib 单测 21 条（`modules::wx::part_list::*`）+ 集成测试
+`tests/wx/part_list.rs` 20 条。
+
+### 0.2 2026-10-11 变更摘要（按小程序页面切子模块）
 
 wx BFF 重构 **B2 + B3 两步**已完成（重构收官）。原先 `/api/v2/wx/*` 是 **10 个平铺
 文件、零 service 层**，且**跨域复用** `iam::vo::CurrentUserOut` /
@@ -38,21 +59,23 @@ wx BFF 重构 **B2 + B3 两步**已完成（重构收官）。原先 `/api/v2/wx
 | # | 方法 | 路径 | 权限 | Query | 响应 `data` |
 |---|---|---|---|---|---|
 | 1 | POST | `/api/v2/wx/login/wecom` | **公开**（白名单） | 无（body `{code}`） | `WxLoginOut` |
-| 2 | GET | `/api/v2/wx/part-list` | 登录即可（**无角色闸门**） | `status?` `page?` `size?` | `PartListHomeOut` |
-| 3 | GET | `/api/v2/wx/part-list/page` | 登录即可 | `status?` `page?` `size?` | `PartListPageOut` |
+| 2 | GET | `/api/v2/wx/part-list` | 登录即可（**无角色闸门**） | `date?` `status?` `page?` `size?` | `PartListHomeOut` |
+| 3 | GET | `/api/v2/wx/part-list/page` | 登录即可 | `date?` `status?` `page?` `size?` | `PartListPageOut` |
 | 4 | GET | `/api/v2/wx/production` | 登录即可 | `tab`（**必填**）`period?` `page?` `size?` | `ProductionHomeOut` |
 | 5 | GET | `/api/v2/wx/production/page` | 登录即可 | `tab`（**必填**）`period?` `page?` `size?` | `ProductionPageOut` |
 
 - **端点总数 5 条**（重构前 10 条，见 §5 的硬切表）。端点 4/5 是 B3 合并三个旧端点
   （`/worker/stats` + `/batches/counts` + `/batches/`）的产物。
 - 全部 HTTP 端点返回统一信封 `R { code, message, data }`（`data` 成功时非 null）。
-- 端点 2/3 的 `counts`（仅端点 2 有）是**全局口径**：不带 `?status=` 过滤。
-  小程序 4 个 tab 的角标是固定的，不随当前选中的 tab 变。
-  端点 4 的 `counts` 同理：**不带 `?tab=` 过滤**。
-- 端点 2/3 的 `?status=`、端点 4/5 的 `?tab=` / `?period=` 非法取值 →
-  `AppError::validation`（**40001** / HTTP 422，走 `R<T>` 信封）；
-  `?page=abc` / `?size=abc` 由 axum `Query` 提取器拒绝，返 **HTTP 400 纯文本**
-  （**不走** `R<T>` 信封）。
+- 端点 2/3 的 `counts`（仅端点 2 有）：**不随 `?status=` 变**（小程序 7 个 tab 的
+  角标是固定的，切 tab 不塌成 0），但**随 `?date=` 变** —— 日期导航条一切，7 个数字
+  整体换一批。见 §8.5。端点 4 的 `counts` 恒是全局口径：**不带** `?tab=` / `?period=` 过滤。
+- 端点 2/3 的 `?date=` / `?status=`、端点 4/5 的 `?tab=` / `?period=`：
+  - `?status=` 不在白名单 ⇒ `AppError::validation`（**40001** / HTTP 422，走 `R<T>` 信封）
+  - `?date=` chrono 解析不出 ⇒ **HTTP 400 纯文本**（axum `Query` 提取器层，**不走** `R<T>`）。
+    ⚠️ chrono **不要求**月/日零填充：`?date=2026-8-4` **是合法的**（解析成 2026-08-04），
+    本域**刻意不**再收紧格式。
+  - `?page=abc` / `?size=abc` ⇒ 同为 **HTTP 400 纯文本**。
 - ⚠️ 端点 4/5 的 **`?tab=` 是必填字段**：缺字段是 serde 缺字段 ⇒ **HTTP 400 纯文本**
   （body 形如 `Failed to deserialize query string: missing field 'tab'`），与
   「传了但非法 → 422 + 40001」是**两种不同的失败**。钉死：
@@ -126,7 +149,7 @@ JSON 顶层多一个 `kind` 键，取值 `"workOrder"` 或 `"batch"`。
 | `serialNo` | string \| null | `t_part.serial_no` | ✅ | 手工工单为 null |
 | `name` | string | `t_part.name` | 否 | |
 | `code` | string | `t_part.drawing_no` | 否 | 前端叫 `code`，DB 叫 `drawing_no`（图号） |
-| `dueDate` | string | `t_part.planned_delivery_date` | 否 | 恒 `YYYY-MM-DD`（该列 NOT NULL） |
+| `dueDate` | string \| null | `t_part.system_delivery_date` | ✅ | 恒 `YYYY-MM-DD`；**2026-10-12 起可空**（无交期工单为 `null`，见 `noSystemDate` tab / 不传 `?date` 时的列表）。⚠️ 数据源由 NOT NULL 的 `planned_delivery_date` 改成 `system_delivery_date`，与 §3.2 的日期谓词**同源** |
 
 **`kind = "workOrder"` 变体**（对应前端 `WorkOrderPartCard`）：
 
@@ -135,7 +158,7 @@ JSON 顶层多一个 `kind` 键，取值 `"workOrder"` 或 `"batch"`。
 | `customer` | string \| null | `t_customer.name`（LEFT JOIN） | ✅ | |
 | `deliveredQty` | number | 子查询 | 否 | `SUM(t_part_batch.quantity)` where `status IN ('DELIVERED','COMPLETED')` 且 `deleted_at IS NULL`，无命中为 `0` |
 | `totalQty` | number | `t_part.quantity` | 否 | 工单**总**件数 |
-| `status` | string | 折叠 | 否 | 4 类 tab 值之一，见 §3.2 |
+| `status` | string | 折叠 | 否 | 6 类 tab 值之一（`pendingProduction` / `inProduction` / `outsource` / `inspecting` / `delivered`），见 §3.2 |
 
 **`kind = "batch"` 变体**（对应前端 `BatchPartCard`）：
 
@@ -153,28 +176,53 @@ JSON 顶层多一个 `kind` 键，取值 `"workOrder"` 或 `"batch"`。
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `counts` | object | `PartCountsOut`，**全局口径**（不受 `?status=` 影响） |
-| `list` | array | 当前页卡片，**至多 `size` 条** |
+| `counts` | object | `PartCountsOut`，**6 状态白名单口径**（不受 `?status=` 影响），但**受 `?date=` 作用域约束** |
+| `list` | array | 当前页卡片，**至多 `size` 条**（受 `?date=` + `?status=` 双维约束） |
 | `hasMore` | boolean | 见 §3.4 |
 
 ### 2.3 `PartListPageOut`（端点 3）
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `list` | array | 与端点 2 的 `list` **同一查询路径**：同 `?status=&page=&size=` 下逐字相同 |
+| `list` | array | 与端点 2 的 `list` **同一查询路径**：同 `?date=&status=&page=&size=` 下逐字相同 |
 | `hasMore` | boolean | 同上 |
 
-与端点 2 的**唯一**结构差异：**没有 `counts`**（上拉翻页不该每次重算 4 个 COUNT）。
+与端点 2 的**唯一**结构差异：**没有 `counts`**（上拉翻页不该每次重算 7 个角标）。
 
-### 2.4 `PartCountsOut`
+### 2.4 `PartCountsOut`（2026-10-12：5 键 → **7 键**，且带日期作用域）
 
-| 字段 | 类型 | 归桶（DB 状态） |
-|---|---|---|
-| `all` | number | **任何**未软删 `t_part.status`（含 `CANCELLED`） |
-| `pendingProduction` | number | `PENDING` |
-| `inProduction` | number | `IN_PROCESS` |
-| `pendingInspection` | number | `INSPECTION` |
-| `delivered` | number | `READY_TO_SHIP` + `DELIVERED`（**两个**状态合并） |
+| 字段 | 类型 | 归桶（DB 状态） | 日期谓词 |
+|---|---|---|---|
+| `all` | number | 6 状态白名单之和（**排除** `PROGRAMMING` / `COMPLETED` / `CANCELLED`） | `system_delivery_date = ?date` |
+| `pendingProduction` | number | `PENDING` | 同上 |
+| `inProduction` | number | `IN_PROCESS` | 同上 |
+| `outsource` | number | `OUTSOURCE` | 同上 |
+| `inspecting` | number | `INSPECTION` + `READY_TO_SHIP`（**两个**状态合并） | 同上 |
+| `delivered` | number | `DELIVERED`（**只有**这一个状态） | 同上 |
+| `noSystemDate` | number | 6 状态白名单内、`system_delivery_date IS NULL` 的行 | **无谓词**（恒与 `?date=` 无关） |
+
+**日期作用域**：
+
+- `?date=YYYY-MM-DD` ⇒ 前 6 个键都只统计 `system_delivery_date` **等于该日**的行。
+- `?date` **缺省** ⇒ 前 6 个键统计 6 状态白名单的**全部**行（**含**无交期行），
+  与 `?status=all` 列表的行数一致。
+  ⚠️ 这条是刻意选的：若缺省时把 NULL 日期行排除在 dated 桶外，
+  「不传 `?date` 时 `counts.all` < `?status=all` 列表行数」就正是 §3.3 记的那条裂缝。
+- `noSystemDate` 键**恒**是 `system_delivery_date IS NULL` 的行数，**不受 `?date=` 影响**
+  （它由**独立的标量查询** `PartListRepo::count_null_date` 出，不能从带日期谓词的
+  分组查询里取 —— 一旦 `?date` 有值，NULL 行根本不会出现在分组结果中）。
+
+★ **不变量**（lib 单测 `counts_buckets_match_the_filter_table` +
+集成测试 `counts_are_scoped_by_date` / `each_tab_counts_bucket_equals_its_list_length`
+共同钉死）：
+
+```
+all == pendingProduction + inProduction + outsource + inspecting + delivered
+```
+
+成立的前提是 6 个 DB 状态与 5 个 dated tab **严格一一归属、无重叠无遗漏**
+（`INSPECTION` / `READY_TO_SHIP` 同归 `inspecting`，其余各一）。
+`noSystemDate` 是**第 7 个**桶、是「NULL 日期」的横切口径，**不进**这条等式。
 
 ### 2.5 ❌ 没有 `total` / `page` / `size` 回显
 
@@ -344,39 +392,93 @@ camelCase。它们是**前端的 tab 名**（前端 `mock/production.ts` 声明�
 （加急 + 交期近优先）。⚠️ `is_urgent` **只参与排序、不进 VO** —— 前端按 `dueDate`
 自己在组件里算紧急度，从不读该字段。**不要**顺手把它从排序里删掉。
 
+⚠️⚠️ **2026-10-12 加了日期筛选，但排序一个字都没改** —— **不要**因为「谓词换成
+`system_delivery_date` 了」就把排序里的 `planned_delivery_date` 也换过去：
+**同一天内 `system_delivery_date` 是常量**（`noSystemDate` 那批全是 NULL），
+它做不了破平手。这一列仍是**日内**破平依据；换成 `system_delivery_date` 之后，
+同一天的工单顺序会退化成只按 `id ASC`（雪花时间序），小程序列表顺序会突变。
+这条理由同时登记在 `part_list/repo.rs` 的 `ORDER_BY_CLAUSE` 常量 doc 上。
+
 端点 4 / 5 的排序**另有一套**，见 §3.7。
 
-### 3.2 4 类 tab 折叠与 `?status=` 语义
+### 3.2 ★ 7 类 tab 折叠、`?status=` 与 `?date=` 的语义（2026-10-12 重写）
 
-| 前端传 `?status=` | SQL 状态集 | 归桶（counts） |
-|---|---|---|
-| 缺省 / `all` | 不过滤（`$1::text[] IS NULL`） | — |
-| `pendingProduction` | `['PENDING']` | `PENDING` |
-| `inProduction` | `['IN_PROCESS']` | `IN_PROCESS` |
-| `pendingInspection` | `['INSPECTION']` | `INSPECTION` |
-| `delivered` | `['READY_TO_SHIP','DELIVERED']` | `READY_TO_SHIP` + `DELIVERED` |
-| **其它一切值** | **40001 / HTTP 422** | — |
+端点 2 / 3 共用 `?date=YYYY-MM-DD&status=<tab>&page=&size=`。
+
+| 前端传 `?status=` | SQL 状态集（`p.status = ANY($1::text[])`） | 日期谓词 | `counts` 归桶 |
+|---|---|---|---|
+| 缺省 / `all` | **6 状态白名单** | `system_delivery_date = $date`（缺省时无谓词） | 6 状态之和 → `all` |
+| `pendingProduction` | `['PENDING']` | 同上 | `PENDING` |
+| `inProduction` | `['IN_PROCESS']` | 同上 | `IN_PROCESS` |
+| `outsource` | `['OUTSOURCE']` | 同上 | `OUTSOURCE` |
+| `inspecting` | `['INSPECTION','READY_TO_SHIP']`（**两个**） | 同上 | `INSPECTION` + `READY_TO_SHIP` |
+| `delivered` | `['DELIVERED']`（**只有**这一个） | 同上 | `DELIVERED` |
+| `noSystemDate` | **6 状态白名单**（与 `all` **完全相同**） | **`IS NULL`（忽略 `$date`）** | `noSystemDate`（独立的标量查询） |
+| **其它一切值** | **40001 / HTTP 422** | — | — |
+
+**6 状态白名单** = `PENDING` / `IN_PROCESS` / `OUTSOURCE` / `INSPECTION` /
+`READY_TO_SHIP` / `DELIVERED`。⚠️ **不含** `PROGRAMMING`（CNC 编程）/
+`COMPLETED` / `CANCELLED`。
+
+日期谓词在 SQL 里拆成 **3 个片段常量**（`part_list/repo.rs`：`BASE_WHERE` +
+`DATE_SCOPE_EQ` / `DATE_SCOPE_ABSENT` / `DATE_SCOPE_NULL`），由 `ignore_date` ×
+`date` 两个维度选装：
+
+| `ignore_date` | `date` | 片段 | SQL 效果 |
+|---|---|---|---|
+| `false` | `Some(d)` | `DATE_SCOPE_EQ` | `AND p.system_delivery_date = $4::date` |
+| `false` | `None` | `DATE_SCOPE_ABSENT` | `AND $4::date IS NULL`（恒真 = 无谓词） |
+| `true` | 任意（忽略） | `DATE_SCOPE_NULL` | `AND p.system_delivery_date IS NULL` |
+
+⚠️ `DATE_SCOPE_NULL` **不引用** `$4`，此时 SQL 只有 3 个参数位，`list_parts`
+用 `if !ignore_date` 条件 bind —— 改这两处必须同改，否则 PG 报
+`bind message supplies 4 parameters, but prepared statement requires 3`。
 
 - 前端传的 `status` 是**前端的 tab 值**，**不是** DB 状态值。传 DB 原值
   （`status=PENDING`）是**非法**的 —— 2026-10-11 前它反而是「唯一合法」的形态，
-  这正是旧 bug 之一。
-- 白名单在 `part_list::service::status_to_db_statuses`（私有），**刻意不用**
-  `part::statemachine::PartStatus` 做校验 —— 那正是本次要消灭的跨域复用。
+  这正是旧 bug 之一。⚠️ 白名单外的值（含旧 tab 值 `pendingInspection` 与注入串）
+  **在拼进 SQL 之前**就被拒（映射表是编译期常量，参数仍走 bind ⇒ 注入面为 0）。
+- 白名单在 `part_list::service::status_to_db_statuses`（返回
+  `PartFilter { statuses, ignore_date }`），**刻意不用**
+  `part::statemachine::PartStatus` 做校验 —— 那正是要消灭的跨域复用。
 - `REPAIRING` **不在表里**（2026-10-01 起降级为 `t_part_batch.is_repairing` 标记列，
   DB 不再产生该 status；返修中的工单 status 就是 `IN_PROCESS`，自动计入
   `in_production`）。**别加回 `REPAIRING` 分支**。
 
-### 3.3 `counts` 与 `list` 同口径（2026-10-11 修掉的 bug）
+#### ⚠️ 3.2.1 2026-10-12 的两处**破坏性语义变更**
 
-| | 旧实现 | 新实现 |
-|---|---|---|
-| `counts.delivered` | `READY_TO_SHIP + DELIVERED`（本地库实测 72 + 126 = **198**） | 同左 |
-| `list` 的 `delivered` tab | 只收**单值** `DELIVERED`（最多 **126**） | `['READY_TO_SHIP','DELIVERED']`（**198**） |
+1. **`all` / 缺省不再是「不过滤」**：旧实现落 `Option::None`（SQL 里
+   `$1::text[] IS NULL` ⇒ 无谓词），`PROGRAMMING` / `COMPLETED` / `CANCELLED`
+   会一起漏进列表和角标。现在一律落 6 状态白名单。**产品已明确确认排除**。
+2. **`pendingInspection` 作废**：品检 tab 改名 `inspecting`，且顺带吃下
+   `READY_TO_SHIP`；`delivered` 相应收窄成只剩 `DELIVERED`。
+   前端不跟着改就会拿到 **422**。
 
-⇒ 旧实现里「角标 198、列表翻到底只有 126」的自相矛盾已消除。新实现由 service 层
-的**同一张映射表**同时驱动过滤谓词与 counts 归桶；lib 单测
-`counts_buckets_match_the_filter_table` 用一组交叉断言钉死这条不变量，集成测试
-`delivered_tab_list_total_equals_counts_delivered` 走 HTTP 再验一遍。
+### 3.3 `counts` 与 `list` 同口径（2026-10-11 修掉的 bug，2026-10-12 扩到日期维度）
+
+2026-10-11 修的那条（角标 vs 列表的 tab 口径分叉）：
+
+| | 旧实现 | 2026-10-11 | 2026-10-12 |
+|---|---|---|---|
+| `counts.delivered` | `READY_TO_SHIP + DELIVERED`（dev 库实测 72 + 126 = **198**） | 同左 | **只有 `DELIVERED`**（`READY_TO_SHIP` 归 `inspecting`） |
+| `list` 的 `delivered` tab | 只收**单值** `DELIVERED`（最多 **126**） | `['READY_TO_SHIP','DELIVERED']`（**198**） | `['DELIVERED']` |
+
+⇒ 「角标 198、列表翻到底只有 126」的自相矛盾已消除。2026-10-12 把口径统一交给
+service 层的**同一张映射表**同时驱动过滤谓词与 counts 归桶，并在**日期维度**上
+同样要求两者一致。
+
+**钉死方式（两套，互相独立）**：
+- lib 单测 `counts_buckets_match_the_filter_table`：对每个 dated tab 断言
+  「counts 桶 == 按该 tab 状态集过滤后的行数」+ ★ `all == 5 个 dated tab 之和`。
+- lib 单测 `display_status_is_inverse_of_the_filter_table`：卡片 `status` 折叠是
+  过滤表的**逆映射**。
+- 集成测试 `delivered_tab_list_total_equals_counts_delivered`（翻页累计 == 角标）、
+  `each_tab_counts_bucket_equals_its_list_length`（**7 个 tab 逐个**验「角标 ==
+  列表行数」，含 `noSystemDate`）、`counts_are_scoped_by_date`（日期作用域）。
+
+**剩下的结构性事实（不修）**：`counts` 与 `list` 仍是**两次独立查询**，首屏聚合在
+handler 层**不开事务**，跑在 read-committed 下**可以跨快照**。口径（SQL 谓词）
+一致，快照（隔离级别）不保证。端点 4 / 5 同款（见 §3.8 末段）。
 
 ### 3.4 `hasMore` 算法（★ 不多打 count 查询）
 
@@ -486,8 +588,8 @@ read-committed 下**可以跨快照**（例如统计查询期间有人改了批�
 | code | HTTP | 端点 | 触发条件 |
 |---|---|---|---|
 | `0` | 200 | 全部 | 成功 |
-| `40001` | 422 | 1 / 2 / 3 / 4 / 5 | `code` 为空或 > 512 字节；`?status=` 不在白名单（2/3）；`?tab=` 不在白名单（4/5）；`?period=` 格式非法（4/5） |
-| — | 400（纯文本） | 2 / 3 / 4 / 5 | `?page=abc` / `?size=abc`（axum `Query` 提取器层 rejection，**不走 `R<T>`**）；⚠️ 4/5 **缺 `?tab=`** 也是 400 纯文本（serde 缺字段），body 形如 `Failed to deserialize query string: missing field 'tab'` |
+| `40001` | 422 | 1 / 2 / 3 / 4 / 5 | `code` 为空或 > 512 字节；`?status=` 不在 7 值白名单（2/3，含旧 tab 值 `pendingInspection`）；`?tab=` 不在白名单（4/5）；`?period=` 格式非法（4/5） |
+| — | 400（纯文本） | 2 / 3 / 4 / 5 | `?page=abc` / `?size=abc`（axum `Query` 提取器层 rejection，**不走 `R<T>`**）；**`?date=` chrono 解析不出**（`2026-02-30` / `2026-13-01` / `20260804` / `not-a-date`）同属这一档 —— ⚠️ chrono **不要求**零填充，`?date=2026-8-4` **合法**；⚠️ 4/5 **缺 `?tab=`** 也是 400 纯文本（serde 缺字段），body 形如 `Failed to deserialize query string: missing field 'tab'` |
 | `40100` | 401 | 2 / 3 / 4 / 5 | 无 / 无效 access token |
 | `40101` | 401 | 1 | 绑定指向的用户已软删 / 已停用 |
 | `40106` | 401 | 1 | 企微 `40029`（code 失效）重取 token 后仍失败；或企微返回 userid 为空 |
@@ -609,7 +711,7 @@ snake_case 的响应字段映射改成直接吃 camelCase。
 
 | 表 | 用途 | 端点 |
 |---|---|---|
-| `t_part` | 卡片主体（`serial_no` / `name` / `drawing_no` / `planned_delivery_date`） | 2 / 3 / 4 / 5 |
+| `t_part` | 卡片主体（`serial_no` / `name` / `drawing_no` / **`system_delivery_date`**：端点 2/3 的 `dueDate` **与日期筛选谓词同源**，2026-10-12 起；端点 4/5 用 `planned_delivery_date`）+ `status` 白名单闸门 | 2 / 3 / 4 / 5 |
 | `t_part_batch` | ① 端点 2/3：当前活跃批次的 `batch_no`（`LEFT JOIN LATERAL`）+ `deliveredQty` 子查询 ② 端点 4/5：卡片主体（`batch_no` / `quantity` / `status` / `location` / `current_holder_id`）+ `in_progress` 角标 | 2 / 3 / 4 / 5 |
 | `t_customer` | `customer` 字段（`LEFT JOIN`） | 2 / 3 |
 | `t_part_event` | `finished_date` / `work_hours` / `done` 角标（端点 4/5）；端点 2/3 的 `deliveredQty` 间接来源 | 4 / 5 |
@@ -637,18 +739,18 @@ import」。⚠️ `t_user` 其余列（用户名 / 角色 / session）的 SQL �
 
 ## 8. 已知偏差登记
 
-### 8.1 ★ 4 类 `status` 折叠有静默兜底（`part_list`，端点 2/3）
+### 8.1 ★ 4 类 `status` 折叠的静默兜底 —— **2026-10-12 起已不可达**（`part_list`，端点 2/3）
 
 | 项 | 内容 |
 |---|---|
-| 偏差 | DB 的 `PROGRAMMING` / `OUTSOURCE` / `COMPLETED` / `CANCELLED` 不映射到任何 tab 值 |
-| 现象 | 它们**只计入 `counts.all`**，却**不会出现在任何单个 tab 的列表里**（列表按 DB 状态集过滤，它们不在任何集合内）。在「全部」列表里 `list[].status` 填什么？**本轮决定：填 `"pendingProduction"`** |
-| 决定理由 | 与旧前端 `services/parts.ts::mapStatus` 的 catch-all 分支（`return 'pendingProduction'`）**逐字对齐**，避免小程序渲染行为突变。若改成 `COMPLETED → delivered` 之类「更贴近语义」的映射，一批工单会在改版后从「待生产」跳到别的 tab，是**面向用户的行为变化**，不该由一次后端重构悄悄引入 |
-| 处置 | **静默兜底，产品不决议**。前端可自行处理：4 类折叠是**展示口径**，不是完整的生产阶段机。要消除只能给前端加第 5 个 tab（产品决议，不在本轮范围） |
-| 钉死 | lib 单测 `display_status_silently_falls_back_to_pending_production`；文档两处（本文 §8.1 + `part_list::vo` 模块 doc） |
+| 历史偏差（2026-10-11） | DB 的 `PROGRAMMING` / `OUTSOURCE` / `COMPLETED` / `CANCELLED` 不映射到任何 tab 值：只计入 `counts.all`，却不出现在任何单个 tab 的列表里。`display_status` 的 catch-all 臂把它们**静默填成 `"pendingProduction"`** |
+| ★ 现状（2026-10-12） | **该偏差已不存在**。过滤谓词本身就是 6 状态白名单（`p.status = ANY($1::text[])`），这 4 个状态（其中 `OUTSOURCE` 已升格为 `outsource` tab）**根本进不了列表**，因此 `display_status` 的 `_` 臂**已是纯防御**（与旧前端 `services/parts.ts::mapStatus` 的 catch-all 逐字对齐的那份兜底，在本轮收口） |
+| 为什么仍留着 `_` 臂 | 「将来 DB 新增一个状态时，卡片不至于渲染成空白/字面量 `undefined`」。零成本，且与前端映射层保持逐字一致 |
+| 钉死 | lib 单测 `display_status_falls_back_to_pending_production_for_unlisted_states`（断言 `_` 臂行为）+ `display_status_is_inverse_of_the_filter_table`（断言白名单内 6 状态是过滤表的**逆映射**）；集成测试 `programming_completed_cancelled_are_excluded_from_all`（断言白名单外状态在 7 个 tab 里一个都不出现） |
+| 文档落点 | 本文 §8.1 + `part_list::service` 模块 doc + `part_list::vo` 模块 doc |
 
-⚠️ **`production` 域（端点 4/5）没有这个偏差**：2 个 tab 与过滤集一一对应，不存在
-「只计入 counts 却不在任何 tab 里」的状态。见 §3.6。
+⚠️ **`production` 域（端点 4/5）从来就没有这个偏差**：2 个 tab 与过滤集一一对应，
+不存在「只计入 counts 却不在任何 tab 里」的状态。见 §3.6。
 
 ### 8.2 `drawingUrl` 有意缺字段
 
@@ -668,11 +770,30 @@ import」。⚠️ `t_user` 其余列（用户名 / 角色 / session）的 SQL �
 
 见 §5 / §6.1。两条端点在前端均无调用方（`rg` 确认），删除不产生功能回归。
 
-### 8.5 `counts` 是全局口径，与 `list` 的过滤条件独立
+### 8.5 ★ `counts` 是**所选日期作用域**口径，不是全局口径（2026-10-12 改写）
 
-`?status=delivered`（端点 2/3）/ `?tab=done`（端点 4/5）时：`counts` 仍是全部
-tab 的数字（固定不变），只有 `list` 被过滤。这是**设计如此**（小程序 tab 角标固定），
-不是 bug。若把过滤套到 counts 上，切 tab 时角标会集体塌成 0。
+⚠️ **旧登记「`counts` 是全局口径，与 `list` 的过滤条件独立」在 2026-10-12 已不成立**
+（仅对端点 4/5 仍成立）。准确表述：
+
+| 维度 | 端点 2/3（`part_list`） | 端点 4/5（`production`） |
+|---|---|---|
+| `?status=` / `?tab=` | **不影响** `counts`（7 个 tab 角标固定，切 tab 不塌成 0） | **不影响** `counts`（同上） |
+| `?date=` / `?period=` | ⚠️ **直接影响** `counts` —— 日期导航条一切，7 个数字整体换一批 | `counts` 不受 `?period=` 影响（该域的 period 只筛 `list`，见 §3.8） |
+| `counts` 与 `list` 的口径关系 | 两者**同日期作用域 + 同 6 状态白名单**；`list` 再叠加 `?status=` 的状态集 | 两者 period 闸门逐字一致（§3.8） |
+
+**设计意图**：小程序「日期 × 状态」两个筛选器是**正交**的 —— 角标要回答的是
+「**这一天**各状态各有几件」，而不是「整个数据库各状态各有几件」。若 counts 不受
+日期约束，用户切日期后看到的是「今天生产中 3 件」却配着「全库生产中 900 件」的角标，
+对不上账。
+
+⚠️ `noSystemDate` 键是**例外中的例外**：它是「无交期」桶，**恒**是
+`system_delivery_date IS NULL` 的行数，与 `?date=` 无关（否则切日期时它会变成
+「无交期且是这天」的空集）。它由**独立的标量查询**出，不与上面 6 个键共享
+日期谓词。
+
+**钉死**：集成测试 `counts_are_scoped_by_date`（逐日断言 6 个桶 + 不变量）、
+`each_tab_counts_bucket_equals_its_list_length`（每个 tab 的角标 == 列表行数）、
+`no_system_date_tab_ignores_date_param`（切 3 个不同 `?date=`，`noSystemDate` 恒定）。
 
 ### 8.6 ★ `workHours` 无值时是 `null`，不是 `0`（B3 的行为变更）
 
