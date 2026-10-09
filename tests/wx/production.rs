@@ -26,7 +26,8 @@
 //! | 15 | 旧 `/wx/batches/*` + `/wx/worker/stats` 全 404 | [`legacy_batches_and_worker_paths_are_all_gone`] |
 //! | 16 | `part_list` / `login` 端点不受影响 | [`part_list_and_login_endpoints_still_work`] |
 //!
-//! 另有 [`tab_is_required_and_bad_page_size_clamps`]（`?tab=` 必填 + 分页 clamp）。
+//! 另有 [`tab_is_required_and_bad_page_size_clamps`]（`?tab=` 必填 + 分页 clamp）与
+//! [`counts_exclude_batches_of_soft_deleted_parts`]（review 第 1 轮 m5 回归）。
 //!
 //! ## ⚠️ period 固定为 `2026-10`（不依赖墙上时钟）
 //! 角标与列表的 period 闸门是 `updated_at::text LIKE 'YYYY-MM%'` /
@@ -702,6 +703,62 @@ async fn done_tab_list_total_equals_counts_done() {
         "done tab 翻到最后一页的累计条数必须 == counts.done"
     );
     assert_eq!(seen.len(), 7);
+}
+
+/// ★ review 第 1 轮 m5 回归：`counts` 不得计入**父工单已软删**的批次。
+///
+/// 该分叉从旧 `BatchCountsAgg::by_period` 逐字继承（旧的两条 count 标量查询只带
+/// `b.deleted_at IS NULL`，**没有** list 侧 `JOIN t_part p` 的 `p.deleted_at IS NULL`）
+/// ⇒ 修复前角标会**大于**列表实际行数。本轮给两条 count 各补了
+/// `EXISTS(… p.deleted_at IS NULL)` 闸门。口径说明见 `docs/api/wx.md` §3.8 / §8.10。
+#[tokio::test]
+async fn counts_exclude_batches_of_soft_deleted_parts() {
+    let (pool, app, token, _fx) = bootstrap().await;
+    let cid = insert_customer(&pool, "六厂").await;
+
+    // 3 个 `in_progress` 批次，全部落当月、批次自身未软删
+    let p_live = insert_part(&pool, cid).await;
+    insert_batch(&pool, p_live, &BatchSpec::in_progress(1)).await;
+
+    let p_soft = insert_part(&pool, cid).await;
+    insert_batch(&pool, p_soft, &BatchSpec::in_progress(1)).await;
+
+    let p_batch_soft = insert_part(&pool, cid).await;
+    let b_batch_soft = insert_batch(&pool, p_batch_soft, &BatchSpec::in_progress(1)).await;
+
+    // ★ 关键干扰项：软删**父工单**，批次保持未软删。修复前 counts 会把它算进去，
+    // 而 list 侧（INNER JOIN t_part + p.deleted_at IS NULL）看不到它。
+    sqlx::query("UPDATE t_part SET deleted_at = now() WHERE id = $1")
+        .bind(p_soft)
+        .execute(&pool)
+        .await
+        .expect("soft delete t_part");
+
+    // 另一个干扰项：批次自身已软删（两边都该排除）
+    sqlx::query("UPDATE t_part_batch SET deleted_at = now() WHERE id = $1")
+        .bind(b_batch_soft)
+        .execute(&pool)
+        .await
+        .expect("soft delete t_part_batch");
+
+    let counts = home(&app, &token, "tab=in_progress&period=2026-10").await;
+    assert_eq!(
+        counts["data"]["counts"]["in_progress"],
+        json!(1),
+        "counts.in_progress 只能算「父工单未软删 + 批次未软删」的 1 行: {counts}"
+    );
+
+    let list = page(&app, &token, "tab=in_progress&period=2026-10&size=50").await;
+    let ids = card_ids(list_of(&list));
+    assert_eq!(
+        ids.len(),
+        1,
+        "list 侧只该出现 1 行，counts 必须与它一致: {list}"
+    );
+    assert!(
+        !ids.iter().any(|id| *id == p_soft.to_string()),
+        "父工单已软删的批次不该出现在 list 里: {list}"
+    );
 }
 
 // ===========================================================================

@@ -26,6 +26,12 @@ wx BFF 重构 **B2 + B3 两步**已完成（重构收官）。原先 `/api/v2/wx
    被当 DB 状态白名单校验）、`delivered` 角标与列表口径不一致（198 vs 126）、
    ★ `GET /wx/worker/stats` 把 `t_user.id` 当 `t_worker.id` 查而恒返 0。
 6. 补 `deliveredQty` **真实值**（前端原先硬编码 0）。
+7. ⚠️ `VO 逐字对齐前端卡片模型` 这句话**有一处例外**：字段名全部对齐，但
+   `batchNo` 的**类型**没对齐（后端 number / 前端 TS `string`，转换在小程序映射层），
+   另 `serialNo` 可空而前端声明非可选。登记在 §8.11，**不是**本域的 bug。
+8. ⚠️ review 第 1 轮（2026-10-11）又修掉两处：`counts` 标量查询缺工单软删闸门
+   （§3.8 / §8.10）、`?period=` 年份段未校验数字导致 LIKE 通配符穿透（§3.8 前的
+   `resolve_period`，见 `production/service.rs`）。
 
 ## 1. 端点表
 
@@ -418,8 +424,9 @@ COALESCE((
   `?tab=inProduction`）在本域是**非法**的。
 - 前端传的是**前端的 tab 值**，**不是** DB 状态值。传 DB 原值（`?tab=IN_PROCESS`）
   是**非法**的。
-- `list` 与 `counts` 的 period 闸门**逐字一致**（本域**没有** `part_list` 那种
-  角标 / 列表口径分叉，见 §3.3 的对照）。
+- ⚠️ **2026-10-11 review 第 1 轮订正**：此处原写「`list` 与 `counts` 的 period 闸门
+  **逐字一致**（本域**没有**角标 / 列表口径分叉）」，其中**「没有口径分叉」是事实性
+  错误**，已改。准确表述与本次修复见 §3.8。
 - 折叠方向是过滤表的**逆映射**：`DELIVERED` / `COMPLETED` → `done`，其余 → `in_progress`。
   lib 单测 `display_status_is_inverse_of_the_filter_table` 用一组交叉断言钉死。
 - 与 §3.2 相反，本域**没有**静默兜底偏差：能在列表里出现的 DB 状态必然落在某个 tab
@@ -434,6 +441,45 @@ COALESCE((
 ⚠️ 与端点 2/3 的 `ORDER BY p.is_urgent DESC, p.planned_delivery_date ASC, p.id ASC`
 （加急 + 交期近优先）是**两套不同的排序** —— 旧 `/wx/batches/` 本来就是这样，本次
 只搬不改。
+
+### 3.8 ★ `counts` 与 `list` 的口径对齐（2026-10-11 review 第 1 轮修复）
+
+`counts` 是**两条独立的标量查询**（`ProductionRepo::batch_counts_by_period`），
+`list` 是**一条带分页的列表查询**（共用 `repo.rs` 的 4 个 SQL 片段常量）。两者
+**不能**共用同一份 WHERE（标量聚合套不上列表的 `FROM` + `ORDER BY` + 分页），
+所以「口径一致」是**靠约定 + 单测钉住的，不是靠结构保证的**。
+
+| 维度 | 旧实现（`BatchCountsAgg::by_period`，逐字继承） | 现在 |
+|---|---|---|
+| **period 闸门**（`updated_at::text LIKE 'YYYY-MM%'` / 存在当月 `DELIVERED` 事件） | 与 list 侧**逐字一致** | 不变，仍逐字一致 |
+| 批次软删（`b.deleted_at IS NULL`） | 一致 | 不变 |
+| ⚠️ **工单软删（`p.deleted_at IS NULL`）** | **counts 侧缺**（标量查询不 JOIN `t_part`）⇒ **父工单软删、批次未软删**时 `counts` 计入、`list` 不出现 | **已补**（两条 count 各加 `EXISTS(SELECT 1 FROM t_part p WHERE p.id = b.part_id AND p.deleted_at IS NULL)`） |
+
+**闸门加在 counts 侧**，用 `EXISTS`（半连接）而不是 `JOIN t_part`：这两条是标量
+`COUNT(*)`，加 `JOIN` 会改变聚合形状、且 `JOIN` 会在无匹配时把行直接滤掉（虽然这里
+语义等价，但 `EXISTS` 更贴近 list 侧 `INNER JOIN` 的「存在性」语义而不动聚合）。
+
+⚠️ **该偏差不是本次重构引入的回归** —— 它从旧 `BatchCountsAgg::by_period` **逐字
+继承**。本 worktree 的 dev 库实测该差值 **0 行**（库里 0 条软删工单关联批次），
+所以是**潜伏**偏差而非现网故障；本次对齐是**主动收口**，登记在 §8.10。
+
+**剩下的结构性事实（不修）**：`counts` 与 `list` 仍是**两次独立查询**，首屏聚合
+（`worker` / `stats` / `counts` / `list`）在 handler 层**不开事务**，跑在
+read-committed 下**可以跨快照**（例如统计查询期间有人改了批次状态，`counts` 与
+`list` 反映的是两个时刻）。这符合本仓「读端点不开事务」的既定约定（端点 2/3 的
+`counts` + `list` 同款），本轮**刻意不引入事务** —— 为纯读端点开事务会占住连接、
+并与 WS 广播的锁序纠缠。**别把这里的「口径一致」理解成「同一快照内一致」**：口径
+（SQL 谓词）一致，快照（隔离级别）不保证。
+
+### 3.9 `page` 无上限（已知限制，继承自旧实现）
+
+`OFFSET (page - 1) * size` 可任意深，**没有** `page` 上限，深翻页会让 DB 扫掉并丢弃
+前 N 行。`size` 本身是 `clamp(1, 50)`（端点 2/3/4/5 一致）。
+
+本轮**不修**：这是从旧 `/wx/batches/` / `/wx/parts/` 逐字继承的行为，且新实现少了
+`COUNT(*)`（`hasMore` 改「取 `size + 1` 条」，见 §3.4）**严格更优**；给它加上限会引入
+「页码超限时返回空列表 vs 报错」的产品语义问题，属产品决议。实测小程序两个页面都是
+首屏 + 上拉增量，`page` 到不了几十。要真限制，应连同「超限时怎么办」一起定。
 
 ## 4. 错误码
 
@@ -577,7 +623,7 @@ snake_case 的响应字段映射改成直接吃 camelCase。
 |---|---|---|
 | `t_wx_identity` | iam | `AccountService::resolve_wx_login_user` |
 | `t_user_role` / `t_menu` / `t_role_menu` | iam | `AccountService` / `SessionService` |
-| `t_shelf` | iam / shelf | `SessionService`（`shelf_ids`，仅 Web 端权限模型用） |
+| `t_shelf` | iam::shelf | **无**。⚠️ 2026-10-11 review 第 1 轮订正：B2 之前这里写「`SessionService`（`shelf_ids`）」是**误导** —— 那是 `iam::vo::LoginResponse` / `CurrentUserOut` 的出参字段，B2 已随「不复用他域 VO」一起从 wx 响应里删掉（见 `login/vo.rs`）。`login_by_user_id` **内部仍会解析货架范围**（iam 的登录流水线第 ⑤ 步，`SessionService::resolve_roles_and_scope`），故 `t_shelf` 仍会被读，但结果对 wx 域**只算不用**（算完即丢弃），前端零消费方 |
 
 ⚠️ **`t_user` 是唯一的例外**（B3 起）：`production` 域**在本域 SQL 里只读**
 `t_user.worker_id` 一列。这符合本仓既定 pattern（`statistics` / `admin` /
@@ -650,9 +696,14 @@ tab 的数字（固定不变），只有 `list` 被过滤。这是**设计如此
 | `card.assignedTo` | `string \| null` | 批次挂在货架上（`location ≠ 'WORKER'`） | 卡片可空渲染 |
 
 ⚠️ **B1 没有回填 `t_user.worker_id`**：回填脚本
-`scripts/sql/20261011_backfill_t_user_worker_id.sql` 需人工确认后手工执行。在那之前
-**绝大多数账号**（admin / 系统管理员 / `hmi-*` 等非工人账号）都会命中「未绑定」分支，
-表现为 `worker: null` + 零值 `stats` + **HTTP 200**。
+`scripts/sql/20261011_backfill_t_user_worker_id.sql` 需人工确认后手工执行（脚本本身
+已用 `BEGIN;` / `COMMIT;` 包裹，dry-run 方式见其文件头「执行方式」；⚠️ 该脚本
+**不会**被 `sqlx::migrate!()` 或任何启动钩子自动跑，仓库里没有这样的路径）。
+**上线前必须先跑完这个回填脚本** —— 否则不仅多数账号拿到 `worker: null` + 零值
+`stats`，更要紧的是 `t_user.worker_id` **至今没有任何 app 写端点**（建账号 / 改账号
+的 DTO 都还没有 `worker_id` 入口），意味着**不跑脚本就没有任何其它途径能把工人绑上**。
+在那之前**绝大多数账号**（admin / 系统管理员 / `hmi-*` 等非工人账号）都会命中「未绑定」
+分支，表现为 `worker: null` + 零值 `stats` + **HTTP 200**。
 
 ### 8.8 ⚠️⚠️ 口径陷阱：`production` 的 `batchQty` ≠ `part_list` 的 `batchQty`
 
@@ -673,6 +724,44 @@ tab 的数字（固定不变），只有 `list` 被过滤。这是**设计如此
 端点 4/5 是 `ORDER BY b.updated_at DESC, b.id DESC`（最近变更优先）；
 端点 2/3 是 `ORDER BY p.is_urgent DESC, p.planned_delivery_date ASC, p.id ASC`
 （加急 + 交期近优先）。**两套排序各自沿用旧实现**，B3 只搬不改。见 §3.7。
+
+### 8.10 ★ `counts` 曾缺工单软删闸门（2026-10-11 review 第 1 轮**已修**）
+
+| 项 | 内容 |
+|---|---|
+| 偏差 | 两条 count 标量查询只有 `b.deleted_at IS NULL`，**没有** list 侧 `JOIN t_part p` 带的 `p.deleted_at IS NULL` |
+| 现象 | 父工单已软删、批次未软删 ⇒ **`counts` 计入、`list` 不出现**（角标 > 列表实际行数） |
+| 来源 | ⚠️ **不是本次重构的回归**，从旧 `BatchCountsAgg::by_period` 逐字继承。worktree 的 dev 库实测差值 **0 行**（0 条软删工单关联批次）⇒ 潜伏偏差，非现网故障 |
+| 处置 | **已修**（review 第 1 轮）：两条 count 各补 `EXISTS(… p.deleted_at IS NULL)`，闸门加在 **counts 侧** |
+| 为什么文档原写法也算错 | 旧文档写「`list` 与 `counts` 口径**逐字一致**、本域**没有**角标 / 列表口径分叉」—— 谓词并不逐字一致（缺一条 `p.deleted_at IS NULL`），把它写成「不存在」是事实性错误。已收窄为「**period 闸门逐字一致**」并同步 §3.6 / §3.8 |
+| 钉死 | `docs/api/wx.md` §3.8（口径表 + 闸门加在哪一侧）、`production/repo.rs` 的 `batch_counts_by_period` 与 `WHERE_CLAUSE` 逐字段 doc |
+
+⚠️ 修完之后**仍有**一个结构性事实没变：两者是两次独立查询、首屏聚合不开事务 ⇒
+read-committed 下**可能跨快照**。见 §3.8 末段。
+
+### 8.11 ⚠️ `batchNo` 与前端 TS 模型的 number-vs-string 类型差（2026-10-11 review 第 1 轮登记）
+
+| 端点 | 字段 | 后端 JSON 类型 | 前端 `BatchPartCard.batchNo` 的 TS 类型 |
+|---|---|---|---|
+| 4 / 5（`production`） | `batchNo` | **number**（`i32`，恒非空） | **`string`** |
+| 2 / 3（`part_list`，`kind=batch`） | `batchNo` | **number \| null**（`Option<i32>`） | **`string`** |
+
+**转换发生在小程序侧，且是既有映射层，不是本仓**：
+- `wx-app/miniprogram/services/parts.ts::toPartCard` → `String(it.current_batch_no ?? 1).padStart(2, '0')`
+- `wx-app/miniprogram/services/production.ts::toBatchCard` → `String(it.batch_no).padStart(2, '0')`
+- 组件 `part-card.wxml` 只 `{{item.batchNo}}` **直接渲染**，自身不做转换
+
+⇒ 本域 VO 模块 doc 里「逐字对齐前端卡片模型……前端可直接把响应塞进
+`ProductionBatchCardData`」这句话**只对字段名成立、对 `batchNo` 不成立**（旧文案
+没写这个限定，容易被读成「整条响应直连卡片模型」）。同族未登记项：`serialNo`
+后端是 `string | null`，前端 `BasePartCard.serialNo` 声明为 `string`（非可选）——
+`null` 会渲染成空白，TS 侧要靠 `?? ''` 兜（`toPartCard` 里写了 `serialNo: it.serial_no`
+直传，实际会渲染出 `null` 字面量，属前端既有行为，本轮**不联动改前端**，只登记）。
+
+**处置**：**不改后端**。`t_part_batch.batch_no` 是 `int`；把 JSON 改成 string 会让
+端点 4/5 与端点 2/3（同名字段、同源列）类型不一致，是拿一个类型差换另一个。真要消
+掉，得改**前端**的 `BatchPartCard` 类型声明或映射层 —— 那是 wx-app 侧的 PR。
+**只登记**，以免后人把这当后端 bug「顺手修」。
 
 ## 9. ★ `worker` / `stats` 的数据源（2026-10-11 B3 修掉的既有 bug）
 

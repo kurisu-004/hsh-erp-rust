@@ -42,7 +42,8 @@ pub struct PartListRow {
     /// 保留是为让 model 保持「SQL 投影完整快照」，省得将来要用时再改 SQL。
     pub current_batch_id: Option<i64>,
     /// 当前活跃批次的 `t_part_batch.batch_no`（`kind=batch` 时进 VO 的 `batchNo`；
-    /// 无活跃批次时 NULL）
+    /// 无活跃批次时 NULL）。⚠️ 前端 `BatchPartCard.batchNo` 声明为 `string`，转换在
+    /// 小程序侧映射层，类型差登记在 `docs/api/wx.md` §8.11
     pub current_batch_no: Option<i32>,
     /// 已交件数（`SUM(t_part_batch.quantity)` where `status IN
     /// ('DELIVERED','COMPLETED')` 且未软删，COALESCE 0）

@@ -263,7 +263,8 @@ fn row_to_card(r: ProductionBatchRow) -> ProductionBatchCardOut {
 /// 校验规则：
 /// - 长度必须 7（`YYYY-MM`）
 /// - 第 5 字节必须是 `-`
-/// - 月份 ∈ `01..=12`
+/// - **年份 4 位且全为 ASCII 数字**（2026-10-11 review 第 1 轮新增）
+/// - **月份 2 位且全为 ASCII 数字**，且 ∈ `01..=12`
 ///
 /// 2026-09-28 review #1 的历史：曾从 batches / worker 各抽一份副本抽到 wx 模块共享，
 /// 本次反向收敛回本域单副本（三个用例也一并搬来，见文件底部）。
@@ -274,6 +275,26 @@ fn resolve_period(raw: Option<&str>) -> Result<String, AppError> {
             if s.len() != 7 || s.as_bytes()[4] != b'-' {
                 return Err(AppError::validation(format!(
                     "period {s:?} 格式非法（要求 YYYY-MM）"
+                )));
+            }
+            // ⚠️ 2026-10-11 review 第 1 轮新增：年份必须 4 位全数字。
+            // 旧校验只看「长度 7 + 第 5 字节是 `-` + 月份可 parse」，年份段形同虚设：
+            //   - `?period=%%%%-10` 会被接受 → 拼出 LIKE 模式 `%%%%-10%`，`%` 是
+            //     SQL 通配符 ⇒ 角标 / 列表**跨年份放大命中**（注入面为 0，但口径失控）；
+            //   - `?period=2026-+1` 会被 `parse::<u32>()` 接受（Rust 的 `+1` 解析成 1）。
+            // 归一后的 `s` 只由 `[0-9]{4}-[0-9]{2}` 构成，下面 `%` LIKE 之外的
+            // 任何字节都不会进入 SQL 模式串。
+            if !s.as_bytes()[..4].iter().all(u8::is_ascii_digit) {
+                return Err(AppError::validation(format!(
+                    "period {s:?} 年份非法（要求 4 位数字）"
+                )));
+            }
+            // 月份同样要求「恰好 2 位 ASCII 数字」：`" 1"` / `"+1"` 这两种写法
+            // **Rust 的 `u32::from_str` 都会接受**（允许前导空白与显式符号），落到
+            // 这里是 `month == 1` 静默通过。与年份闸门同一条理由。
+            if !s.as_bytes()[5..7].iter().all(u8::is_ascii_digit) {
+                return Err(AppError::validation(format!(
+                    "period {s:?} 月份非法（要求 2 位数字）"
                 )));
             }
             let month: u32 = s[5..7]
@@ -362,6 +383,41 @@ mod tests {
         assert!(resolve_period(Some("2026-13")).is_err()); // 月份 13
         assert!(resolve_period(Some("2026-00")).is_err()); // 月份 0
         assert!(resolve_period(Some("26-09")).is_err()); // 年份 2 位
+    }
+
+    /// 2026-10-11 review 第 1 轮新增：年份段必须是 4 位 ASCII 数字。
+    ///
+    /// 旧校验（只查长度 / 分隔符 / 月份 parse）会放过下面两类输入，它们都会被原样
+    /// 拼进 `updated_at::text LIKE $1` 的模式串：`%%%%-10` ⇒ `%%%%-10%` 让角标与列表
+    /// **跨年份放大命中**；`2026-+1` ⇒ 月份被 `parse::<u32>()` 接受成 1。
+    #[test]
+    fn resolve_period_rejects_non_numeric_year() {
+        for bad in [
+            "%%%%-10", // LIKE 通配符穿透（最危险：跨年份放大命中）
+            "20_6-10", // 下划线
+            "20 6-10", // 空格
+            "2026- 1", // 月份带前导空格
+            "-026-10", // 负号年份
+            "2026-1a", // 月份非数字
+        ] {
+            assert!(
+                resolve_period(Some(bad)).is_err(),
+                "{bad:?} 不该被接受（旧校验会把它原样拼进 LIKE 模式串）"
+            );
+        }
+        // 钉死「年份闸门没有把合法值一起拒掉」
+        assert_eq!(resolve_period(Some("0001-01")).unwrap(), "0001-01");
+        assert_eq!(resolve_period(Some("2026-01")).unwrap(), "2026-01");
+
+        // 多字节 UTF-8 不得 panic：`resolve_period` 按**字节**下标取 `s[5..7]`，
+        // 若前 4 字节含多字节字符，`s[5..7]` 就会落在非字符边界上 panic。
+        // 年份闸门把这些输入提前拒掉 —— 这条断言锁的就是「先拒后切」这个次序。
+        for bad in ["20日-10", "a日-10", "20é-10", "２０26-10", "20日-１0"] {
+            assert!(
+                resolve_period(Some(bad)).is_err(),
+                "{bad:?} 应被拒（且不得 panic）"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

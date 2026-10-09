@@ -18,6 +18,12 @@
 //! 看是否超出」判定，前端从不读 `total`（`wx::part_list` 已是这个口径，见
 //! `docs/api/wx.md` §3.4）。省掉一次 COUNT，也让两条 SQL 口径不可能再分叉。
 //!
+//! ⚠️ 但**角标 counts 仍是两条独立 SQL**（`batch_counts_by_period`），不共用
+//! [`WHERE_CLAUSE`] —— 它是标量聚合、不能套列表的 `FROM` + `ORDER BY` + 分页。
+//! 两条 count 与 list 的 **period 闸门逐字一致**，2026-10-11 review 第 1 轮又给
+//! 它们补上了 `p.deleted_at IS NULL` 闸门（见 [`ProductionRepo::batch_counts_by_period`]
+//! 的说明），使 counts 与 list 的**全部可见性口径**都对齐。
+//!
 //! ## 本域读到的 6 张表（跨域只读聚合，见 `docs/api/wx.md` §7）
 //! `t_user` / `t_worker` / `t_work_type` / `t_part` / `t_part_batch` /
 //! `t_part_event`。`t_user` 的 **SQL 真源属 iam 域**，但本域按本仓既定 pattern
@@ -86,6 +92,10 @@ const FROM_SQL: &str = "
 ///   （批次最近一次 update 进入 IN_PROCESS 落在当月）
 /// - `done` 桶 → `b.status IN ('DELIVERED','COMPLETED')` 且存在当月 `DELIVERED`
 ///   事件
+///
+/// ⚠️ 这里的 `p.deleted_at IS NULL`（配合 `FROM_SQL` 的 `JOIN t_part p`）**必须有**：
+/// 缺了它，父工单软删、批次未软删的批次会「角标计入但列表不出现」。
+/// `batch_counts_by_period` 的两条标量查询已在 2026-10-11 review 第 1 轮补上等价闸门。
 ///
 /// `$1` 是 tab 映射出来的 DB 状态数组（`text[]`），`$2` 是 `YYYY-MM%` 的 LIKE
 /// 模式串，**两个都是绑定变量** ⇒ 注入面为 0。
@@ -193,6 +203,7 @@ impl ProductionRepo {
     ///
     /// ⚠️ 两条 SQL **逐字保留**自旧 `BatchCountsAgg::by_period`，只把返回结构换成
     /// [`BatchCountsRow`]（旧版直接返 VO，制造了 repo → vo 的依赖）。
+    /// ⚠️ 唯一的改动是 2026-10-11 review 第 1 轮补的工单软删闸门（见下）。
     ///
     /// `finished_date` 派生口径：
     /// - `in_progress` = `status='IN_PROCESS'` AND `updated_at::text LIKE 'YYYY-MM%'`
@@ -202,8 +213,18 @@ impl ProductionRepo {
     ///   `created_at::text LIKE 'YYYY-MM%'`（批次在当月完成「实际送车」事件；
     ///   与 `dashboard` / `statistics` 域对齐）
     ///
-    /// ⚠️ 这两条口径必须与 [`WHERE_CLAUSE`] 的 list 侧**逐字一致**，否则角标与
-    /// 列表对不上（旧 `part_list` 域就栽在 198 vs 126 上，见 `docs/api/wx.md` §3.3）。
+    /// ⚠️ 这两条口径必须与 [`WHERE_CLAUSE`] 的 list 侧在 **period 闸门**上逐字一致，
+    /// 否则角标与列表对不上（旧 `part_list` 域就栽在 198 vs 126 上，见
+    /// `docs/api/wx.md` §3.3）。
+    ///
+    /// ⚠️⚠️ **2026-10-11 review 第 1 轮补的工单软删闸门**：这两条旧 SQL 只带
+    /// `b.deleted_at IS NULL`，**不带** list 侧 `JOIN t_part p` 的 `p.deleted_at IS
+    /// NULL`。分叉场景：**父工单已软删、批次未软删**时，`counts` 计入而 `list` 不出现
+    /// （角标 > 列表实际行数）。该偏差从旧 `BatchCountsAgg::by_period` **逐字继承**
+    /// （非本次重构引入的回归），但本次把口径收紧对齐 list 侧，并登记进
+    /// `docs/api/wx.md` §8.10。闸门加在 **counts 侧**（`EXISTS(… p.deleted_at IS
+    /// NULL)`）—— 因为这两条是**标量查询、不 JOIN `t_part`**，加 JOIN 会改变它们的
+    /// 聚合形状；`EXISTS` 是与 list 侧 `INNER JOIN` 等价的半连接。
     ///
     /// 收 `&mut PgConnection`（不走 `E: PgExecutor`）以支持两次查询复用同一连接
     /// —— 与旧 `BatchCountsAgg::by_period`、`prod/batch/repo/queries.rs::_
@@ -218,10 +239,15 @@ impl ProductionRepo {
         let in_progress: i64 = sqlx::query_scalar!(
             r#"
             SELECT COUNT(*) AS "n!"
-            FROM t_part_batch
-            WHERE status = 'IN_PROCESS'
-              AND deleted_at IS NULL
-              AND updated_at::text LIKE $1
+            FROM t_part_batch b
+            WHERE b.status = 'IN_PROCESS'
+              AND b.deleted_at IS NULL
+              AND EXISTS (
+                  SELECT 1 FROM t_part p
+                  WHERE p.id = b.part_id
+                    AND p.deleted_at IS NULL
+              )
+              AND b.updated_at::text LIKE $1
             "#,
             &pattern,
         )
@@ -234,6 +260,11 @@ impl ProductionRepo {
             FROM t_part_batch b
             WHERE b.status IN ('DELIVERED', 'COMPLETED')
               AND b.deleted_at IS NULL
+              AND EXISTS (
+                  SELECT 1 FROM t_part p
+                  WHERE p.id = b.part_id
+                    AND p.deleted_at IS NULL
+              )
               AND EXISTS (
                   SELECT 1 FROM t_part_event e
                   WHERE e.batch_id = b.id

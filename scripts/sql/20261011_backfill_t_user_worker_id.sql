@@ -21,12 +21,26 @@
 --   `restore_from_backup.sh` 等），本文件与它们同族。
 --
 -- ## 执行方式（人工，先 dry-run）
---   # 1. dry-run：把文件末尾的 COMMIT 换成 ROLLBACK（或直接在 psql 里只跑 §2 的预览
---   #    SELECT），确认 §3 的 RETURNING 只列出你预期的账号
---   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f scripts/sql/20261011_backfill_t_user_worker_id.sql
+--   ⚠️⚠️ **本文件已在首尾包裹 `BEGIN;` / `COMMIT;`**（2026-10-11 review 第 1 轮补）。
+--   包裹之前本文件**没有任何显式事务**，而 psql 对无显式事务的脚本是**逐句
+--   autocommit** —— 那时下面「把末尾 COMMIT 换成 ROLLBACK」的指引是**假的**：
+--   psql 找不到名为 `COMMIT` 的语句，照着跑的「dry-run」会**真写库**。
+--
+--   # 1. dry-run（二选一）
+--   # 1a. 最稳：把 §2 的 SELECT **单独复制**到 psql 里跑（纯读，无副作用），
+--   #     确认清单符合预期后再走第 2 步。
+--   # 1b. 整文件 dry-run：把**本文件末尾的 `COMMIT;` 换成 `ROLLBACK;`**（替换，不是
+--   #     追加 —— 两个都留会报错），再用下面的命令整文件跑。首尾的
+--   #     `BEGIN;` … `ROLLBACK;` 会把整份脚本包进一个事务，结尾回滚，不落库。
+--   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+--     -f scripts/sql/20261011_backfill_t_user_worker_id.sql
 --
 --   # 2. 真跑（幂等，重复执行无副作用）
---   同上命令。
+--   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+--     -f scripts/sql/20261011_backfill_t_user_worker_id.sql
+--
+--   ⚠️ `-v ON_ERROR_STOP=1` **不可省**：没有它，§3 的 UPDATE 一旦报错 psql 只打印
+--   错误并**继续往下跑**末尾的 `COMMIT;`，把半截结果提交进库。
 --
 -- ## 推断规则（保守，宁可留 NULL 也不猜）
 --   候选 = `t_user.username` 与 `t_worker.badge_code` **逐字相等**且双方均未软删，
@@ -42,6 +56,8 @@
 --   为什么「username = badge_code」只是个**候选**而不是结论：它是本仓目前唯一的
 --   可用线索，工牌号与登录账号在本部署里恰好都取手机号。但它已被上述「陈燕」一例
 --   证伪过一次，所以本脚本只做**机械匹配 + 人工复核**，绝不替人做判断。
+
+BEGIN;
 
 -- ============================================================================
 -- §1 排除名单（系统 / 非工人账号，宁可漏绑不可错绑）
@@ -115,3 +131,6 @@ RETURNING u.id, u.username, u.full_name, u.worker_id;
 -- 仍未绑定（这些需要人工判断，不能靠推断）：
 --   SELECT id, username, full_name, is_active FROM t_user
 --   WHERE worker_id IS NULL AND deleted_at IS NULL ORDER BY username;
+
+-- ⚠️ dry-run 时把下面这行**替换**成 `ROLLBACK;`（不是追加），见文件头「执行方式」。
+COMMIT;

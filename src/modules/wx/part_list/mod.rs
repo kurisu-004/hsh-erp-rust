@@ -77,3 +77,35 @@ pub mod vo;
 pub fn router() -> Router<Arc<AppState>> {
     handler::router()
 }
+
+#[cfg(test)]
+mod tests {
+    //! 域隔离护栏：把「零件一览页 BFF 不依赖其它域」从口头约定变成 CI 强制。
+    //!
+    //! 2026-10-11 review 第 1 轮新增（原计划只要求 `wx::production` 挂）。实测
+    //! 本域零他域 import，所以挂上是**零成本 CI 加固**：把「今后有人图省事直接
+    //! `use crate::part::…` 复用零件域的类型」当场拦住，而不是等 review 才发现。
+    //!
+    //! 本域**读** `t_part` / `t_part_batch` / `t_customer` / `t_part_event`
+    //! （`part` / `batch` / `com` 域的数据），但按本仓既定 pattern（`statistics` /
+    //! `admin` / `dashboard`）**只在本域 SQL 里只读聚合**，**不** import 他域的
+    //! service / repo —— 护栏钉死的就是这一点。
+    //!
+    //! 探测器实现（剥注释、根段 + 域路径前缀匹配、漏报盲区登记、元测试）见
+    //! [`crate::shared::domain_guard`]，本域只负责传参 + 域专属指引。
+
+    use std::path::Path;
+
+    use crate::shared::domain_guard::assert_no_foreign_domain;
+
+    #[test]
+    fn part_list_domain_depends_on_no_other_domain() {
+        assert_no_foreign_domain(
+            "wx::part_list",
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src/modules/wx/part_list"),
+            "需要别的域的数据时，正确做法是像 statistics / admin / dashboard 那样在本域 SQL 里\
+             只读聚合（t_part / t_part_batch / t_customer / t_part_event 等表，SQL 真源见 \
+             repo.rs），而不是 import 别人的 service / repo。",
+        );
+    }
+}

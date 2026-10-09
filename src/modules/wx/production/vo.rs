@@ -11,6 +11,11 @@
 //! 后前端可直接把响应塞进 `ProductionBatchCardData`，省掉一整个映射文件与它的漂移
 //! 面。做法与 `wx::part_list::vo` 一致。
 //!
+//! ⚠️ **一个例外**：`batchNo` 的**字段名**对齐了前端模型，但**类型**没对齐（前端
+//! `string` / 后端 JSON number）—— 该字段仍需经小程序侧映射层的
+//! `String(...).padStart(2, '0')`。详见 [`ProductionBatchCardOut::batch_no`] 的逐字段
+//! doc 与 `docs/api/wx.md` §8.11。
+//!
 //! ⚠️ 对照：`wx::login` 的 VO **仍**是 snake_case（`refresh_token` / `full_name`）——
 //! 那里前端 `applyLoginResponse` 逐字读那几个键。三处口径**刻意**不同，不要互相
 //! 「对齐」。
@@ -130,8 +135,25 @@ pub struct ProductionBatchCardOut {
     /// `t_part.planned_delivery_date`，格式恒为 `YYYY-MM-DD`（该列 NOT NULL）
     #[serde(rename = "dueDate")]
     pub due_date: String,
-    /// `t_part_batch.batch_no`，**JSON number**（前端自己 `padStart(2, '0')` 补零
-    /// 展示成 `01`；后端不做字符串化）
+    /// `t_part_batch.batch_no`，**JSON number**。
+    ///
+    /// ⚠️⚠️ **与前端 TS 模型的类型差（2026-10-11 review 第 1 轮登记）**：
+    /// 前端 `BatchPartCard.batchNo` 的 TS 类型是 **`string`**
+    /// （`wx-app/miniprogram/mock/parts.ts`），但**这不是本 VO 的 bug**：小程序侧
+    /// 有一层映射把 number 变成字符串 —— `services/parts.ts::toPartCard` 与
+    /// `services/production.ts::toBatchCard` 都写的是
+    /// `String(it.batch_no).padStart(2, '0')`，`padStart` 是对 `String(...)` 的结果
+    /// 调的（不是对 number 直接调）；`<part-card>` 组件的模板
+    /// （`part-card.wxml`）只直接渲染 `{{item.batchNo}}`，**本身不做转换**。
+    ///
+    /// ⇒ 「前端可直接把响应塞进 `ProductionBatchCardData`」这句话**只对字段名成立、
+    /// 对 `batchNo` 不成立**：数值类型必须过前端那层映射（且该映射是**既有**的，
+    /// 新旧 URL 切换不改变它）。若将来要让 wx 响应直连卡片模型，得改的是**前端**
+    /// 映射层或这条 TS 类型声明，**不是**把本字段序列化成字符串（DB 侧
+    /// `t_part_batch.batch_no` 是 `int`，且 `wx::part_list` 端点 2/3 也返 number，
+    /// 两域刻意一致）。
+    ///
+    /// 登记在 `docs/api/wx.md` §8.11。
     #[serde(rename = "batchNo")]
     pub batch_no: i32,
     /// `t_part_batch.quantity`（**本批次**件数）。
