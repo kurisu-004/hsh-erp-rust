@@ -49,15 +49,23 @@ pub struct PendingBatchItem {
     /// 工单级备注（`t_part.note`）
     pub note: Option<String>,
     pub version: i32,
-    /// `current_process_step_id`（PENDING 时通常 NULL；PART 自动下发时
-    /// 已写入首道 step）。
+    /// `t_part_batch.current_process_step_id`（链内位置指针）的原样投影。
     ///
     /// **NULL 兜底语义**：DB 列 NULL 时 row → vo 投影为 0（`Option<i64> → i64`
     /// 走 `.unwrap_or(0)`）；前端按 `0 == "未设 step"`、`> 0 == "已设 step"`
-    /// 区分。dispatch 路径写入 batch 时显式 `NULL`（见
-    /// `QueueDispatchRepo::update_batch_dispatched`），符合「PENDING 尚未挂 step」语义。
+    /// 区分，故 JSON 是字符串 `"0"`、**不是** `null`。
+    ///
+    /// **取值范围**（2026-10-10 review 第 1 轮订正）：本列表闸门是
+    /// `status IN ('PENDING','PROGRAMMING')`（`repo/dispatch.rs::list_pending_batches`），
+    /// 而 dispatch 一落笔就写 `IN_PROCESS` ⇒ **下发过的批次不会留在本列表**，
+    /// dispatch 对该列的两种写入（有链写链首 step / 无链清 NULL，见
+    /// `QueueDispatchRepo::update_batch_dispatched`）在本列表里都观察不到。
+    /// 常规取值因此是 `"0"`，但 DB 层**没有任何约束**保证待下发行的该列恒为 NULL
+    /// —— `allowed_from` 之外的旁路写点、手工 SQL、历史脏数据都能破坏它，前端不要
+    /// 假定它恒为 `"0"`，按 `> 0` 分支走即可。
+    ///
     /// 注：本字段未走 `Option<i64>` 是为了对齐本 VO 整体扁平数字风格（与
-    /// `process_chain_id` 同形态）；语义差异由前端按 status 区分。
+    /// `process_chain_id` 同形态）。
     #[serde(serialize_with = "serialize_i64")]
     pub current_process_step_id: i64,
     /// `t_part.process_chain_id`（PR-3 step 化后新字段；PENDING 列表透传
@@ -89,9 +97,14 @@ pub struct PendingBatchListOut {
 /// 当前实现走「任一失败 → 全回滚」语义；`failed` 字段保留为 `Vec<DispatchFailureItem>`
 /// 是为未来启用 partial commit 时向前兼容，**当前总是空**。
 ///
-/// `current_process_step_id` 是 `Option<i64>`（dispatch 路径不解析 step，存 NULL）。
-/// `current_process_id`（2026-09-30 新增）是 `Option<i64>`，值恒为
-/// `Some(target_process_id)` —— 池归属的权威依据。
+/// `current_process_step_id` 是 `Option<i64>`：有链工单（`t_part.process_chain_id
+/// IS NOT NULL`）为链内第一道未软删 step 的 id，无链工单为 `None`（无链侧是
+/// **显式清空**该列，不采用「保留原值」写法 —— 那要论证「无链 ⇒ step 恒 NULL」
+/// 这条无任何约束保证的不变式）—— 2026-10-09 起不再「恒 `None`」。
+/// `current_process_id`（2026-09-30 新增）是 `Option<i64>`：有链工单下它等于
+/// **链首 step 的工序**（= 实际下发到的那道）—— 池归属的权威依据；有链时请求里的
+/// `target_process_id` 被忽略，且**出参的 `target_process_id` 也被 service 用同一个
+/// 值覆盖**（见两个字段各自的 doc），只有无链工单它才等于请求值。
 #[derive(Debug, Clone, Serialize)]
 pub struct DispatchResult {
     /// 成功下发的 batch 列表（顺序与 req.targets 一致）。
@@ -111,25 +124,46 @@ pub struct DispatchSuccessItem {
     #[serde(serialize_with = "serialize_i64")]
     pub batch_id: i64,
     /// 下发后 `t_part_batch.current_process_step_id` 的值（逻辑 FK →
-    /// `t_process_chain_step.id`）。JSON 里是 **number**（不带字符串化器，与本 VO
-    /// 里 `batch_id` 等 id 字段不同，见各自的 `serialize_with`）。
+    /// `t_process_chain_step.id`）。JSON 里是**字符串**（`serialize_i64_opt`，
+    /// 与本 VO 里 `batch_id` 等 id 字段同形态），`None` → JSON `null`。
     ///
     /// - 有链工单（`t_part.process_chain_id IS NOT NULL`）→ 链内第一道未软删 step 的
     ///   id（口径与端点 5 的 `first_process_id` 同源）；
-    /// - 无链工单 → `null`（该列按写入不变式恒为 NULL）。
+    /// - 无链工单 → `null`（无链侧由 dispatch **显式清空**该列；不采用「保留原值」
+    ///   写法 —— 那要论证「无链 ⇒ step 恒 NULL」这条无任何约束保证的不变式，
+    ///   见 `repo/dispatch.rs::update_batch_dispatched` 的 doc 与
+    ///   `docs/api/queue.md` §3.1）。
+    ///
+    /// ⚠️ **不能落成 JSON number**（2026-10-10 补）：step id 是雪花 id，10¹⁷ 量级
+    /// （随 epoch 取不同值，生产默认 epoch 2025-01-01 约 2.3×10¹⁷、测试 epoch
+    /// 2020-01-01 约 9.0×10¹⁷，两者都远超 JS 的 `Number.MAX_SAFE_INTEGER`
+    /// （2^53 ≈ 9.0×10¹⁵），
+    /// number 进 JS 即被舍入 —— 前端即便把 Zod 改成收 number，拿到的也是错值。
+    /// f9f98886 把本字段从「恒 `null`」改成真实写入值时漏加了字符串化器，
+    /// 现场表现为「批次已下发成功、车间却看到下发失败」（Zod 抛在 HTTP 200 之后）。
+    #[serde(serialize_with = "serialize_i64_opt")]
     pub current_process_step_id: Option<i64>,
     /// 下发后写入 `t_part_batch.current_process_id` 的值（逻辑 FK → `t_process.id`）。
     ///
-    /// ⚠️ **有链工单下它等于链首 step 的工序，不等于请求里的 `target_process_id`** ——
-    /// 后者此时只是无链时的回落值（见 `DispatchTarget::target_process_id` 的 doc）。
-    /// 前端要展示「实际下发到哪道工序」必须读本字段，读 `target_process_id` 会在
-    /// 有链时显示成用户随手传的那道。
+    /// ⚠️ **有链工单下它等于链首 step 的工序**，而不是请求里那道工序（请求里的
+    /// `target_process_id` 此时被忽略，见 `DispatchTarget::target_process_id` 的 doc）。
+    /// 前端要展示「实际下发到哪道工序」读本字段即可；不过有链时出参的
+    /// `target_process_id` 也被 service 覆盖成同一个值，两者读哪个结果一致
+    /// （口径差异见下字段的 doc）。
     ///
     /// **Option 语义**：当前 dispatch 路径恒为 `Some(..)`；保留 `Option` 是为了与
     /// `current_process_step_id` 对齐并为将来「工序落空」的分支留出 `null` 表达。
     /// None → JSON `null`，避免前端拿 `"0"` 误判为合法工序 id。
     #[serde(serialize_with = "serialize_i64_opt")]
     pub current_process_id: Option<i64>,
+    /// **不是请求字段的回声**（2026-10-10 登记）：service 解析链首时用
+    /// `let (target_process_id, …)` 遮蔽了同名形参，并把遮蔽后的值同时填进
+    /// `current_process_id` 与本字段 ⇒ **有链工单下本字段已被覆盖为链首 step 的
+    /// 工序，与 `current_process_id` 同值**；只有无链工单才等于请求里传的那道
+    /// （回落值）。
+    ///
+    /// 前端读它也能拿到「实际下发到哪道工序」，但**不能**用它复现「用户当时传了
+    /// 什么」—— 那在有链工单下已经丢失。口径表见 `docs/api/queue.md` §3.1。
     #[serde(serialize_with = "serialize_i64")]
     pub target_process_id: i64,
     #[serde(serialize_with = "serialize_i64")]
@@ -220,4 +254,82 @@ pub struct RecallOut {
     pub part_id: String,
     /// 批次 `version + 1`（写入后）。前端下一次对本批次的操作必须带这个值做 OCC。
     pub version: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    //! `DispatchSuccessItem` 的 5 个 id 字段的 **wire 形态**守卫。
+    //!
+    //! 防的是「VO 层少一个 `serialize_with`」这种漂移。前端
+    //! `productionQueueSchema.ts` 对这些字段声明的是 `z.string().nullable()`，一旦
+    //! 后端某个 id 裸序列化落成 JSON **number**，Zod 就抛
+    //! `expected string, received number` —— 而这发生在 HTTP 200 **之后**：批次
+    //! 真的提交了，车间看到的却是「下发失败」，现场与根因隔了三层，谁也不会往
+    //! 「一个 serde 属性」上想。2026-10-10 这次漂移能一路溜到生产，正是因为 VO 层
+    //! 当时没有任何序列化形态断言，集成测试也只按 number 写（错误地固化了下来）。
+    //!
+    //! 用 19 位雪花 id 而非小整数：小 id 在 JS 里当 number 也不丢精度，这条断言才
+    //! 真的在测「字符串化器在不在」，而不是碰巧相等。
+    use super::DispatchSuccessItem;
+
+    /// 5 个 id 字段全部填成 `Some(…)`。
+    fn dispatch_success_item_some_ids() -> DispatchSuccessItem {
+        DispatchSuccessItem {
+            batch_id: 1590000000000000002,
+            current_process_step_id: Some(1590000000000000001),
+            current_process_id: Some(1590000000000000003),
+            target_process_id: 1590000000000000004,
+            shelf_id: 1590000000000000005,
+            version: 2,
+        }
+    }
+
+    /// 有值时 5 个 id 字段一律 JSON **字符串**，且十进制内容与传入值逐字一致。
+    #[test]
+    fn dispatch_success_item_ids_serialize_as_strings() {
+        let value = serde_json::to_value(dispatch_success_item_some_ids())
+            .expect("serialize DispatchSuccessItem");
+        for (key, raw) in [
+            ("batch_id", 1590000000000000002i64),
+            ("current_process_step_id", 1590000000000000001),
+            ("current_process_id", 1590000000000000003),
+            ("target_process_id", 1590000000000000004),
+            ("shelf_id", 1590000000000000005),
+        ] {
+            assert_eq!(
+                value[key],
+                serde_json::Value::String(raw.to_string()),
+                "{key} 必须是字符串形态的雪花 id（漏了 serialize_with 就退成 number，\
+                 前端 Zod 会炸在 HTTP 200 之后）"
+            );
+        }
+    }
+
+    /// `Option` 字段的 `None` → JSON `null`（不是 `"0"`、也不能整个键消失：
+    /// 前端 `z.string().nullable()` 两条都只认前者）。非 Option 的
+    /// `target_process_id` / `shelf_id` 恒有值，此处一并钉住它们的键不许被
+    /// `skip_serializing_if` 摘掉。
+    #[test]
+    fn dispatch_success_item_none_ids_serialize_as_null() {
+        let value = serde_json::to_value(DispatchSuccessItem {
+            current_process_step_id: None,
+            current_process_id: None,
+            ..dispatch_success_item_some_ids()
+        })
+        .expect("serialize DispatchSuccessItem");
+        let object = value
+            .as_object()
+            .expect("DispatchSuccessItem 应序列化为 JSON object");
+        for key in ["current_process_step_id", "current_process_id"] {
+            assert_eq!(
+                object.get(key),
+                Some(&serde_json::Value::Null),
+                "{key} 的 None 必须是 JSON null（键必须出现，\
+                 消失或退成 \"0\" 都会被前端 z.string().nullable() 拒收）"
+            );
+        }
+        for key in ["batch_id", "target_process_id", "shelf_id"] {
+            assert!(object.contains_key(key), "{key} 恒有值，键不许消失");
+        }
+    }
 }

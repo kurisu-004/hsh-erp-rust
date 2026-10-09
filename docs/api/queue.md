@@ -229,12 +229,13 @@ part 级行无从推导（没有 `#[serde(default)]`，漏赋值会编译失败�
 | `t_part.process_chain_id IS NOT NULL` | 链内第一道未软删 step 的 `process_id`（`sort_order ASC, id ASC LIMIT 1`） | 链首 step 的 id | 链首工序 |
 | `t_part.process_chain_id IS NULL`（手工工单的常态） | 请求里的 `target_process_id` | `NULL` | 请求里的 `target_process_id` |
 
-- **有链时请求里的 `target_process_id` 被忽略**（它只是无链时的回落值）。前端要展示「实际下发到哪道工序」读 `DispatchSuccessItem.current_process_id`，读 `target_process_id` 会在有链时显示成用户随手传的那道。
+- **有链时请求里的 `target_process_id` 被忽略**（它只是无链时的回落值）。前端要展示「实际下发到哪道工序」读 `DispatchSuccessItem.current_process_id` 即可。
+- ⚠️ **出参的 `target_process_id` 不是请求字段的回声**（2026-10-10 登记）：service 解析链首时用 `let (target_process_id, …)` 遮蔽了同名形参，并把遮蔽后的值**同时**填进 `current_process_id` 与 `target_process_id` 两个出参字段 ⇒ **有链工单下两者同值（都是链首工序）**，无链工单下才是请求里的回落值。读出参 `target_process_id` 也能拿到「实际下发到哪道工序」，但**不能**用它复现「用户当时传了什么」——那在有链工单下已丢失。
 - 与端点 5 `auto_dispatch_preview` 的 `first_process_id` **同源**（都取链首，见 `ProcessChainRepo::first_step_in_chain`），故「照 preview 显示的值操作」与「实际落库」一致。
 - 链首解析带**锚链软删闸门**（`ProcessChainRepo::first_step_in_chain` JOIN `t_part_process_chain` 且 `pc.deleted_at IS NULL`），与读侧 `resolve_chain_position` 的锚链 JOIN 同口径。
 - **锚链已软删**（`t_part.process_chain_id` 仍指向已删链，链内 step 未随链软删）**或**链行活跃但**链内一个未软删 step 都没有**（已清空）→ `20702 BIZ_PROCESS_CHAIN_STEP_NOT_FOUND`（HTTP 404），批次保持 `PENDING` 不被写脏，`current_process_id` / `current_process_step_id` 都不落。不新造错误码：`20702` 原语义是「链内找不到某工序」，本处是「链内一道都没有」，两者都指向同一个动作 —— 去修链。
 - `shared::batch::status::BATCH_STATUS_UPDATE_SQL` 的 `current_process_step_id = CASE WHEN $14 THEN NULL ELSE COALESCE($6::bigint, current_process_step_id) END` 早已支持两种写法，dispatch 侧只改传参（`new_process_step_id` / `clear_process_step_id`），**SQL 文本逐字未动**。`clear_process_step_id` 与 `new_process_step_id.is_none()` 配对：有链写链首 step（`false`）、无链清 step（`true`，与本口径改动前逐字一致）。无链侧不采用「保留原值」写法 —— 那需要论证「无链批次的 step 恒为 NULL」这条**无任何约束保证**的不变式（`allowed_from` 之外的旁路写点、手工 SQL、历史脏数据都能破坏它）。
-- 出参 `DispatchSuccessItem.current_process_step_id` 由「恒 `null`」改为**真实写入值**（JSON number，不带字符串化器，与同 VO 的 `batch_id` 等不同）。
+- 出参 `DispatchSuccessItem.current_process_step_id` 由「恒 `null`」改为**真实写入值**（JSON **字符串**，走 `serialize_i64_opt`，与同 VO 的 `batch_id` 等同形态；`None` → `null`）。⚠️ 不能落成 JSON number：step id 是雪花 id（10¹⁷ 量级，随 epoch 取不同值：生产默认 epoch 2025-01-01 约 2.3×10¹⁷、测试 epoch 2020-01-01 约 9.0×10¹⁷，均远超 JS 的 `Number.MAX_SAFE_INTEGER`（2^53 ≈ 9.0×10¹⁵）），number 进 JS 会被舍入。
 
 ## 4. 口径表
 

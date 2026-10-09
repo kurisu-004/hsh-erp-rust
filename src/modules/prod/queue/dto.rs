@@ -186,8 +186,10 @@ impl Default for ListPendingQuery {
 /// 单批次下发即 `targets.length == 1`；批量多批按 `targets` 数组顺序执行，
 /// 任一失败 → 全回滚（事务由 handler 层管）。
 ///
-/// 不带 `shelf_id` / `version`：货架由 service 按 `target_process_id` 在
-/// `t_shelf_process` 自动解析，版本号走批次当前 `version` 隐式 OCC。
+/// 不带 `shelf_id` / `version`：货架由 service 在 `t_shelf_process` 自动解析 ——
+/// **解析基准随工单形态而变**（2026-10-09）：有链工单按下发链首工序解析，无链工单
+/// 才按 `target_process_id` 解析（口径表见 `docs/api/queue.md` §3.1）。版本号走批次
+/// 当前 `version` 隐式 OCC。
 #[derive(Debug, Clone, Deserialize)]
 pub struct DispatchRequest {
     pub targets: Vec<DispatchTarget>,

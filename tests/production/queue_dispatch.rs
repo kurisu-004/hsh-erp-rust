@@ -1075,11 +1075,11 @@ async fn dispatch_chained_part_uses_chain_head_process_and_step() {
     assert_eq!(s, StatusCode::OK, "dispatch: {env}");
     let item = &env["data"]["succeeded"][0];
 
-    // 出参：step 指针 = 链首 step id（本字段是 JSON number，不带字符串化器）
+    // 出参：step 指针 = 链首 step id（雪花 id 走字符串化器，与同 VO 另 4 个 id 同形态）
     assert_eq!(
         item["current_process_step_id"],
-        json!(head_step_id),
-        "有链工单 dispatch 后 current_process_step_id 应 = 链首 step id: {env}"
+        json!(head_step_id.to_string()),
+        "有链工单 dispatch 后 current_process_step_id 应 = 链首 step id（字符串形态）: {env}"
     );
     assert_eq!(
         item["current_process_id"],
