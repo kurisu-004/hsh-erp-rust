@@ -2,17 +2,18 @@
 //!
 //! ## 结构（2026-09-23 PR8：statistics 域新增 `repo/`）
 //! - `sql.rs`：原 `repo.rs` 内的固有静态方法全部迁出为 free fn（PR8 时 16 个，
-//!   2026-10-12 删跳序取件 3 个后为 **13** 个；参数由
-//!   `&mut PgConnection` 改为 `impl PgExecutor` 仅 `worker_pickup_rows` 一例；
-//!   其余仍走 `&mut PgConnection`）。**SQL 字符串 byte-identical 与原 `repo.rs`
+//!   2026-10-12 删跳序取件 3 个后为 **13** 个，同日新增有效工时 3 个后为
+//!   **16** 个；参数由 `&mut PgConnection` 改为 `impl PgExecutor` 的是
+//!   `worker_pickup_rows` / `worker_effective_minutes_rows` 两例；其余仍走
+//!   `&mut PgConnection`）。**SQL 字符串 byte-identical 与原 `repo.rs`
 //!   1:1 平移**（PR8 硬约束 #8：零 SQL 文本变化）。
-//! - `mod.rs`（本文件）：对外暴露胖 trait `StatisticsRepoTrait`（13 方法合并单 trait），
-//!   re-export `sql.rs` 的 2 个原始行结构；并直接 `impl StatisticsRepoTrait for
+//! - `mod.rs`（本文件）：对外暴露胖 trait `StatisticsRepoTrait`（16 方法合并单 trait），
+//!   re-export `sql.rs` 的 4 个原始行结构；并直接 `impl StatisticsRepoTrait for
 //!   &mut PgConnection`——handler/service 借 `&mut *tx` / `&mut *conn` 即可，
 //!   零中间壳（与 iam 2026-09-22 删 `PgIamRepo` 同步；与 dashboard / shelf 同形）。
 //!
 //! 2026-10-12：跳序取件 3 方法 + 2 row struct 随 `t_pickup_skip_event` 删除而清空，
-//! 计数由 16 / 4 降为 13 / 2。
+//! 计数由 16 / 4 降为 13 / 2；同日有效工时维度新增 3 方法 + 2 row struct ⇒ 16 / 4。
 //!
 //! ## 为什么是胖 trait 而不是按实体拆 4 trait
 //! `&mut PgConnection` 同一作用域只能借给一个 repo 实例。胖 trait `StatisticsRepoTrait`
@@ -34,15 +35,17 @@
 
 pub mod sql;
 
-// 重导出 sql.rs 中的 2 个原始行结构（service 装配层用到）。
-pub use sql::{WorkerPartRow, WorkerPickupRow};
+// 重导出 sql.rs 中的 4 个原始行结构（service 装配层用到）。
+pub use sql::{
+    WorkerEffectiveMinutesRow, WorkerPartRow, WorkerPickupRow, WorkerProcessBreakdownRow,
+};
 
 use async_trait::async_trait;
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use sqlx::PgConnection;
 
-/// statistics 域数据访问 trait（13 个聚合方法，对应 dashboard 3 端点）。
+/// statistics 域数据访问 trait（16 个聚合方法，对应本域 3 端点）。
 ///
 /// 单 trait 而非每实体一个：`&mut PgConnection` 同一作用域只能借给一个 repo 实例，
 /// 拆分会让 service 无法同时持有多个 repo（与 iam / dashboard / shelf 同形）。
@@ -58,14 +61,17 @@ use sqlx::PgConnection;
 /// 无跨域调用故无此 accessor）。生产实现（`&mut PgConnection`）直返 `self`；
 /// mock 测试不调用此方法。
 ///
-/// ## 13 个方法按业务分组
+/// ## 16 个方法按业务分组
 /// - tab1 基础计数（9）：count_created / count_completed / count_in_process_at /
 ///   delivered_stats / daily_created_counts / daily_completed_counts /
 ///   count_repair_parts / count_overdue_undelivered / status_distribution
-/// - tab2 工人 pickup 聚合（1）：worker_pickup_rows
-/// - tab3 单工人详情（3）：worker_detail_events / worker_daily_pickups / worker_parts
+/// - tab2 工人聚合（2）：worker_pickup_rows / worker_effective_minutes_rows
+/// - tab3 单工人详情（5）：worker_detail_events / worker_daily_pickups /
+///   worker_parts / worker_effective_minutes / worker_process_breakdown
 ///
-/// 2026-10-12：原 tab4 跳序取件（3 个方法）随 `t_pickup_skip_event` 删除而清空。
+/// 2026-10-12：原 tab4 跳序取件（3 个方法）随 `t_pickup_skip_event` 删除而清空；
+/// 同日新增「有效工时」维度 3 个方法（tab2 一 + tab3 两）——三条 SQL 共用
+/// `sql.rs::effective_minutes` 的骨架常量，**改口径必须改那一处**。
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait StatisticsRepoTrait: Send {
@@ -109,14 +115,22 @@ pub trait StatisticsRepoTrait: Send {
     async fn count_overdue_undelivered(&mut self, today: NaiveDate) -> Result<i64, sqlx::Error>;
     async fn status_distribution(&mut self) -> Result<Vec<(String, i64)>, sqlx::Error>;
 
-    // ── tab2 工人 pickup 聚合（1）──
+    // ── tab2 工人聚合（2）──
     async fn worker_pickup_rows(
         &mut self,
         date_from: NaiveDate,
         date_to: NaiveDate,
     ) -> Result<Vec<WorkerPickupRow>, sqlx::Error>;
+    /// 期内每工人 `(effective_minutes, worked_process_count, worked_batch_count)`。
+    /// 口径见 `sql.rs::effective_minutes`（计入 / 不计入的事件集合、链外工序
+    /// 计 0、LATERAL 去重理由逐条写在那里）。
+    async fn worker_effective_minutes_rows(
+        &mut self,
+        date_from: NaiveDate,
+        date_to: NaiveDate,
+    ) -> Result<Vec<WorkerEffectiveMinutesRow>, sqlx::Error>;
 
-    // ── tab3 单工人详情（3）──
+    // ── tab3 单工人详情（5）──
     async fn worker_detail_events(
         &mut self,
         worker_id: i64,
@@ -135,6 +149,22 @@ pub trait StatisticsRepoTrait: Send {
         date_from: NaiveDate,
         date_to: NaiveDate,
     ) -> Result<Vec<WorkerPartRow>, sqlx::Error>;
+    /// 单工人有效工时总额（分钟整数）。与 `worker_effective_minutes_rows`
+    /// 同源口径，详见 `sql.rs::effective_minutes`。
+    async fn worker_effective_minutes(
+        &mut self,
+        worker_id: i64,
+        date_from: NaiveDate,
+        date_to: NaiveDate,
+    ) -> Result<i64, sqlx::Error>;
+    /// 单工人按工序拆分的有效工时。`process_id` / `process_name` 可空
+    /// （事件没记工序时该行代表「无工序归属的作业」，工时贡献 0）。
+    async fn worker_process_breakdown(
+        &mut self,
+        worker_id: i64,
+        date_from: NaiveDate,
+        date_to: NaiveDate,
+    ) -> Result<Vec<WorkerProcessBreakdownRow>, sqlx::Error>;
 }
 
 /// 把 `StatisticsRepoTrait` 直接对 `&mut PgConnection` 实现——handler/service 借
@@ -203,7 +233,7 @@ impl StatisticsRepoTrait for &mut PgConnection {
         sql::status_distribution(&mut **self).await
     }
 
-    // ── tab2 工人 pickup 聚合（1）──
+    // ── tab2 工人聚合（2）──
     async fn worker_pickup_rows(
         &mut self,
         date_from: NaiveDate,
@@ -211,8 +241,15 @@ impl StatisticsRepoTrait for &mut PgConnection {
     ) -> Result<Vec<WorkerPickupRow>, sqlx::Error> {
         sql::worker_pickup_rows(&mut **self, date_from, date_to).await
     }
+    async fn worker_effective_minutes_rows(
+        &mut self,
+        date_from: NaiveDate,
+        date_to: NaiveDate,
+    ) -> Result<Vec<WorkerEffectiveMinutesRow>, sqlx::Error> {
+        sql::worker_effective_minutes_rows(&mut **self, date_from, date_to).await
+    }
 
-    // ── tab3 单工人详情（3）──
+    // ── tab3 单工人详情（5）──
     async fn worker_detail_events(
         &mut self,
         worker_id: i64,
@@ -236,5 +273,21 @@ impl StatisticsRepoTrait for &mut PgConnection {
         date_to: NaiveDate,
     ) -> Result<Vec<WorkerPartRow>, sqlx::Error> {
         sql::worker_parts(&mut **self, worker_id, date_from, date_to).await
+    }
+    async fn worker_effective_minutes(
+        &mut self,
+        worker_id: i64,
+        date_from: NaiveDate,
+        date_to: NaiveDate,
+    ) -> Result<i64, sqlx::Error> {
+        sql::worker_effective_minutes(&mut **self, worker_id, date_from, date_to).await
+    }
+    async fn worker_process_breakdown(
+        &mut self,
+        worker_id: i64,
+        date_from: NaiveDate,
+        date_to: NaiveDate,
+    ) -> Result<Vec<WorkerProcessBreakdownRow>, sqlx::Error> {
+        sql::worker_process_breakdown(&mut **self, worker_id, date_from, date_to).await
     }
 }

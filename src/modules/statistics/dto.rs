@@ -13,6 +13,10 @@
 //! 2026-10-12：原 `PickupSkipSummary` / `PickupSkipDetail` 两段与入参
 //! `PickupSkipDetailQuery` 随数据源表 `t_pickup_skip_event` 删除一并清空。
 //!
+//! 2026-10-12：有效工时维度**不引入任何入参** —— 它由已有的
+//! `DateRangeQuery` 区间 + `t_part_event` 事件派生，无独立筛选条件。
+//! `WorkerProcessBreakdown` 是**出参**（`super::vo`），不在本文件。
+//!
 //! 本文件仅保留入参 DTO（axum extractor 反序列化目标）：
 //! - `DateRangeQuery` —— overview / workers / workers/{id} 端点 query
 

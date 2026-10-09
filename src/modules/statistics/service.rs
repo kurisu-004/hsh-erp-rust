@@ -6,6 +6,11 @@
 //! 2026-10-12：原「跳序取件两段（summary / detail）」随数据源表
 //! `t_pickup_skip_event` 删除一并清空（写入点早已随 Python v1 退役消失）。
 //!
+//! 2026-10-12：新增**有效工时**维度（分钟整数）。口径细则集中在
+//! `repo::sql::effective_minutes` 的骨架常量 doc（事件集合 / LATERAL 去重 /
+//! 锚链来源 / 链外工序计 0 / INNER JOIN `t_worker` 的理由逐条写在那里），
+//! service 只负责把 repo 返回的原始行装配进 VO、不做任何二次口径判断。
+//!
 //! 约定：
 //! - 日期统一转 `[date_from, date_to+1)` 半开区间做 `created_at` 比较；
 //! - 贡献度公式与零填充日计数抽离到 `shared::analytics`（2026-09-22 PR3）；
@@ -28,10 +33,12 @@ use chrono::NaiveDate;
 use crate::infra::clock::now_naive;
 use crate::modules::prod::work_type::repo::WorkTypeRepo;
 use crate::modules::prod::worker::repo::WorkerRepo;
-use crate::modules::statistics::repo::{StatisticsRepoTrait, WorkerPartRow, WorkerPickupRow};
+use crate::modules::statistics::repo::{
+    StatisticsRepoTrait, WorkerEffectiveMinutesRow, WorkerPartRow, WorkerPickupRow,
+};
 use crate::modules::statistics::vo::{
     DeliveryPerformance, OverviewOut, StatusCount, WorkerBrief, WorkerDetailOut, WorkerPartItem,
-    WorkerStatsItem, WorkerStatsListOut,
+    WorkerProcessBreakdown, WorkerStatsItem, WorkerStatsListOut,
 };
 use crate::shared::analytics::{
     daily_buckets::fill_zero_daily_counts, worker_contribution::compute_worker_contribution,
@@ -154,12 +161,21 @@ impl StatisticsService {
         let agg_map: HashMap<i64, WorkerPickupRow> =
             rows.iter().map(|r| (r.worker_id, r.clone())).collect();
 
+        // 有效工时聚合：口径见 repo::sql::effective_minutes。缺行 = 该工人区间内
+        // 没有任何「完成一道工序」的事件 ⇒ 三个字段全零填充（与 pickup 侧同款）。
+        let eff_rows = repo
+            .worker_effective_minutes_rows(date_from, date_to)
+            .await?;
+        let eff_map: HashMap<i64, WorkerEffectiveMinutesRow> =
+            eff_rows.iter().map(|r| (r.worker_id, r.clone())).collect();
+
         let contribution_map = compute_worker_contribution(&rows);
 
         let items = workers_rows
             .into_iter()
             .map(|w| {
                 let agg = agg_map.get(&w.id);
+                let eff = eff_map.get(&w.id);
                 let wt_name = w.work_type_id.and_then(|id| wt_name_map.get(&id).cloned());
                 WorkerStatsItem {
                     worker_id: w.id,
@@ -172,6 +188,9 @@ impl StatisticsService {
                     pickup_quantity: agg.map(|a| a.pickup_quantity).unwrap_or(0),
                     participated_part_count: agg.map(|a| a.participated_part_count).unwrap_or(0),
                     contribution_pct: contribution_map.get(&w.id).copied().flatten(),
+                    effective_minutes: eff.map(|a| a.effective_minutes).unwrap_or(0),
+                    worked_process_count: eff.map(|a| a.worked_process_count).unwrap_or(0),
+                    worked_batch_count: eff.map(|a| a.worked_batch_count).unwrap_or(0),
                 }
             })
             .collect();
@@ -220,6 +239,25 @@ impl StatisticsService {
         let parts_rows = repo.worker_parts(wid_int, date_from, date_to).await?;
         let daily_pickups = fill_zero_daily_counts(date_from, date_to, &daily_pickups_raw);
 
+        // 有效工时：总额 + 按工序拆分，两条 SQL 同源（同一组事件、同一 LATERAL）。
+        let effective_minutes = repo
+            .worker_effective_minutes(wid_int, date_from, date_to)
+            .await?;
+        let breakdown_rows = repo
+            .worker_process_breakdown(wid_int, date_from, date_to)
+            .await?;
+        let process_breakdown = breakdown_rows
+            .into_iter()
+            .map(|r| WorkerProcessBreakdown {
+                process_id: r.process_id,
+                // 取不到工序名（无 process_id / 工序行缺失）退 "(已删除)"，与
+                // com::delivery_note::service::group 的既有兜底同款。
+                process_name: r.process_name.unwrap_or_else(|| "(已删除)".to_string()),
+                step_count: r.step_count,
+                effective_minutes: r.effective_minutes,
+            })
+            .collect();
+
         // distinct part_id（即便 part 已软删也计数 — 与 parts 列表口径不同）
         let participated_part_count = parts_rows
             .iter()
@@ -254,6 +292,8 @@ impl StatisticsService {
             return_count,
             daily_pickups,
             parts: items,
+            effective_minutes,
+            process_breakdown,
         })
     }
 }

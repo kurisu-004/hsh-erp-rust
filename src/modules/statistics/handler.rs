@@ -7,7 +7,12 @@
 //!
 //! 2026-10-12：原 `GET /pickup-skips` / `GET /pickup-skips/{worker_id}` 两条随
 //! 数据源表 `t_pickup_skip_event` 删除而下线（写入点早已随 Python v1 退役消失，
-//! 端点只会恒返空集）。
+//! 端点只会恒返空集，**无 alias**，旧路径 404）。现存 **3** 条，与 `router()`
+//! 的 3 行 `.route` 逐条一致。
+//!
+//! 2026-10-12：`workers` / `workers/{worker_id}` 的响应体新增有效工时字段，
+//! **端点集合与入参均不变**（详见 `vo::worker` 与
+//! `docs/api/statistics.md`）。
 //!
 //! 约束：
 //! - 事务边界在 handler：

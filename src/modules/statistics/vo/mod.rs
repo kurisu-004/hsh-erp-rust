@@ -19,5 +19,6 @@ pub mod worker;
 
 pub use overview::{DayCount, DeliveryPerformance, OverviewOut, StatusCount};
 pub use worker::{
-    WorkerBrief, WorkerDetailOut, WorkerPartItem, WorkerStatsItem, WorkerStatsListOut,
+    WorkerBrief, WorkerDetailOut, WorkerPartItem, WorkerProcessBreakdown, WorkerStatsItem,
+    WorkerStatsListOut,
 };

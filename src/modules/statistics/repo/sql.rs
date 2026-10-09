@@ -20,10 +20,125 @@
 //! `t_pickup_skip_event` 由同批 migration 删除（写入点早已随 Python v1 退役消失）。
 //! 同时把 `worker_detail_events` 里 `'RETURNED'` 修正为 `'RETURNED_TO_SHELF'`
 //! （Rust 侧实际写的事件类型，详见该函数 doc）。
+//!
+//! ## 2026-10-12：有效工时维度（3 个 free fn + 2 个 row struct）
+//! 「工人完成一道工序的预计工时之和」三条聚合共用同一份骨架常量，见
+//! [`effective_minutes`] 模块 doc。三条各抄一遍必然漂移，而漂移的表现是
+//! **数字静默错**（不报错、不抛异常），故共用。现存 **16** 个 free fn +
+//! **4** 个 row struct。
 
 use chrono::{NaiveDate, NaiveDateTime};
 use rust_decimal::Decimal;
 use sqlx::{PgConnection, PgExecutor, Row};
+
+/// 有效工时三条聚合共用的 SQL 骨架片段。
+///
+/// 有效工时是「事件过滤 + 按工单锚链取工序预计工时」两层嵌套的复合口径，
+/// 三条消费点（按工人 / 单工人总额 / 按工序）必须逐字同源，故拆成常量 +
+/// [`build`] 拼装，而不是三条各写一整串字面量。
+mod effective_minutes {
+    use sqlx::AssertSqlSafe;
+
+    /// 事件谓词 + 「有工人」闸门 + 日期半开区间。
+    ///
+    /// **事件集合是「工人完成了一道工序」的唯一口径**：
+    /// - **计入**：`RETURNED_TO_SHELF`（放回顺链推进）、`SENT_TO_INSPECTION`
+    ///   （工人主动送检 = 做完当前工序）。
+    /// - **不计入**：`PICKED_UP` / `TAKEN_FROM_POOL` / `MOVED` —— 那三个是
+    ///   **开始**；一进一出都计则同一道工序被计两次。
+    ///   `INSPECTED` —— 品检员动作不是工人作业（写点在 `prod::batch` 的批次
+    ///   扫码与状态流转两处）。`DELIVERED` —— 无工序语义。
+    ///
+    /// 三个消费点的**参数序号统一为 `$1` = date_from / `$2` = date_to**
+    /// （两条单工人查询把 `worker_id` 放 `$3`），故本片段可逐字共用。
+    ///
+    /// `worker_id IS NOT NULL` 就 `JOIN t_worker w` 而言是冗余的，保留它是为了
+    /// 让部分索引 `ix_part_event_worker_type_created (worker_id, event_type,
+    /// created_at) WHERE worker_id IS NOT NULL` 可被直接选中。
+    pub const WHERE_SQL: &str = "WHERE e.event_type IN ('RETURNED_TO_SHELF', 'SENT_TO_INSPECTION') \
+           AND e.worker_id IS NOT NULL \
+           AND e.created_at >= $1::timestamp \
+           AND e.created_at < ($2::date + INTERVAL '1 day')::timestamp";
+
+    /// 公共 FROM + JOIN + LATERAL。
+    ///
+    /// ⚠️ **三处口径，逐条都是硬约束**：
+    ///
+    /// 1. **必须包在 `LEFT JOIN LATERAL (…) cs ON TRUE` 里，不能把
+    ///    `t_process_chain_step` 直接摆进 FROM 的 JOIN 列表**：该表**没有**
+    ///    `(chain_id, process_id)` 唯一约束（只有 `uq_chain_step_chain_order
+    ///    (chain_id, sort_order) WHERE deleted_at IS NULL`），写侧
+    ///    `prod::process_chain::service::upsert_chain` 也只校验链内 `sort_order`
+    ///    互不重复、**不校验 `process_id` 重复** ⇒ 同名工序在一条链里出现多次
+    ///    是后端照收的合法形态。直接 JOIN 会让这类行按命中条数**翻倍计入工时**
+    ///    且**不报错**。`ORDER BY sort_order ASC, id ASC LIMIT 1` 取唯一一行。
+    ///    （与 `shared::batch::chain` 把 `hit_count > 1` 判成 `chain_state =
+    ///    'NONE'` 是同一事实的两种处置：那边「下一道是谁」有歧义必须拒答，
+    ///    这边「这一步的预计工时」取链上第一次出现的那一步即可。）
+    /// 2. **锚链取 `p.process_chain_id` 单来源**，**不写**
+    ///    `COALESCE(p.process_chain_id, s.chain_id)`：那套 COALESCE 是
+    ///    `shared::batch::chain` 的**运行时链定位**纪律（要兼容批次 step 指针
+    ///    指向的旧链）。统计侧不需要兼容老数据，且子查询的 `chain_id` 本就取自
+    ///    `p.process_chain_id`、无从回退，写 COALESCE 只会让「无链工单」被误判成
+    ///    「有链」。
+    /// 3. **`JOIN t_worker w` 是 INNER**（同 `worker_pickup_rows`）：本维度只
+    ///    统计真有工人身份的作业事件，`worker_id` 指向已消失的工人时该行不该进
+    ///    任何统计。**不要**改成 LEFT。
+    pub const FROM_SQL: &str = "FROM t_part_event e \
+         JOIN t_worker w ON w.id = e.worker_id \
+         JOIN t_part p ON p.id = e.part_id AND p.deleted_at IS NULL \
+         LEFT JOIN LATERAL ( \
+             SELECT s.estimated_minutes \
+               FROM t_process_chain_step s \
+              WHERE s.chain_id = p.process_chain_id \
+                AND s.process_id = e.process_id \
+                AND s.deleted_at IS NULL \
+              ORDER BY s.sort_order ASC, s.id ASC \
+              LIMIT 1 \
+         ) cs ON TRUE";
+
+    /// `LEFT JOIN t_process pr`：按工序聚合的**显示名**来源。
+    ///
+    /// `pr.deleted_at IS NULL` 是**刻意的**：软删的工序在历史统计里也要留名，
+    /// 否则一次软删操作会让整段历史报表的行集体退化成无意义的 `(已删除)`。
+    pub const PROCESS_JOIN_SQL: &str = "LEFT JOIN t_process pr \
+                                        ON pr.id = e.process_id \
+                                       AND pr.deleted_at IS NULL";
+
+    /// `COALESCE(SUM(cs.estimated_minutes), 0)` 的取数表达式。
+    ///
+    /// LATERAL 无行（`process_id IS NULL` / `process_chain_id IS NULL` /
+    /// 链内找不到该工序的 step）⇒ `cs.estimated_minutes` 为 SQL NULL ⇒ 该事件
+    /// **计 0 分钟但不被丢弃**：它照常计入 `worked_process_count` /
+    /// `worked_batch_count`，只是工时为 0。⚠️ 写 `SUM(...)` 不带 `COALESCE`
+    /// 会让「该工人全部事件都在链外」这一整组产出 NULL 而不是 0。
+    pub const EFFECTIVE_MINUTES_SQL: &str = "COALESCE(SUM(cs.estimated_minutes), 0)";
+
+    /// 把 [`FROM_SQL`] / [`WHERE_SQL`] 与各消费点自己的 SELECT / JOIN / 条件
+    /// / GROUP BY 拼成一条完整语句。
+    ///
+    /// 用 `format!` 而非 `QueryBuilder`：骨架里的 `{}` 只有 `select_list` /
+    /// `process_join` / `extra_predicate` / `group_by` 四处，全是**本模块私有
+    /// 常量或调用点字面量**，不含任何外部输入 ⇒ 不存在注入面，故返回值可直接
+    /// 进 [`AssertSqlSafe`]（口径同 `shared::batch::chain::resolve_chain_position`
+    /// 与 `outsource::board::repo::sendable_dedup_sql`）。
+    ///
+    /// ⚠️ **调用点纪律**：传给本函数的四个片段只能是编译期常量或本文件里的
+    /// 字面量。**任何**来自函数入参 / `format!` 外部的值都不许拼进 SQL —— 用户
+    /// 输入一律走 `bind`。
+    pub(super) fn build(
+        select_list: &str,
+        process_join: &str,
+        extra_predicate: &str,
+        group_by: &str,
+    ) -> AssertSqlSafe<String> {
+        AssertSqlSafe(format!(
+            "{select_list} {from} {process_join} {where} {extra_predicate} {group_by}",
+            from = FROM_SQL,
+            where = WHERE_SQL,
+        ))
+    }
+}
 
 // ============================================================
 // tab1：基础计数
@@ -309,6 +424,51 @@ pub async fn worker_pickup_rows<'e, E: PgExecutor<'e>>(
         .collect()
 }
 
+/// 期内每个工人的**有效工时**聚合：
+/// `(worker_id, effective_minutes, worked_process_count, worked_batch_count)`。
+///
+/// 口径细节（事件集合 / LATERAL 去重 / 锚链来源 / 链外工序计 0 / INNER JOIN
+/// `t_worker` 的理由）逐条写在 [`effective_minutes`] 的三个骨架常量 doc 上，
+/// 本函数只负责「按工人分组」这一层。
+///
+/// ⚠️ **数据覆盖受工序链配置率限制，不是 bug**：工时取自
+/// `t_process_chain_step.estimated_minutes`，未配链的工单、以及链内没有该
+/// `process_id` 的工序，一律计 **0 分钟**。工序链配得越少，这个数字越接近 0
+/// —— 是口径的必然结果，读数时先看链配置率。
+pub async fn worker_effective_minutes_rows<'e, E: PgExecutor<'e>>(
+    executor: E,
+    date_from: NaiveDate,
+    date_to: NaiveDate,
+) -> Result<Vec<WorkerEffectiveMinutesRow>, sqlx::Error> {
+    let sql = effective_minutes::build(
+        &format!(
+            "SELECT e.worker_id AS worker_id, \
+             {}::bigint AS effective_minutes, \
+             COUNT(DISTINCT e.process_id)::bigint AS worked_process_count, \
+             COUNT(DISTINCT e.batch_id)::bigint   AS worked_batch_count",
+            effective_minutes::EFFECTIVE_MINUTES_SQL,
+        ),
+        "",
+        "",
+        "GROUP BY e.worker_id",
+    );
+    let rows = sqlx::query(sql)
+        .bind(date_from)
+        .bind(date_to)
+        .fetch_all(executor)
+        .await?;
+    rows.into_iter()
+        .map(|r| {
+            Ok(WorkerEffectiveMinutesRow {
+                worker_id: r.get::<i64, _>("worker_id"),
+                effective_minutes: r.get::<i64, _>("effective_minutes"),
+                worked_process_count: r.get::<i64, _>("worked_process_count"),
+                worked_batch_count: r.get::<i64, _>("worked_batch_count"),
+            })
+        })
+        .collect()
+}
+
 // ============================================================
 // tab3：单工人详情
 // ============================================================
@@ -429,6 +589,84 @@ pub async fn worker_parts(
         .collect()
 }
 
+/// 单工人有效工时总额（详情页顶部那一个数字）。
+///
+/// 与 [`worker_effective_minutes_rows`] 的口径**逐字同源**（共用
+/// [`effective_minutes`] 的骨架常量），区别只在多一个 `worker_id = $3` 闸门与
+/// 不分组 —— 两页对不上数只会是 service 装配错位，不会是口径漂移。
+pub async fn worker_effective_minutes(
+    conn: &mut PgConnection,
+    worker_id: i64,
+    date_from: NaiveDate,
+    date_to: NaiveDate,
+) -> Result<i64, sqlx::Error> {
+    let sql = effective_minutes::build(
+        &format!(
+            "SELECT {}::bigint AS effective_minutes",
+            effective_minutes::EFFECTIVE_MINUTES_SQL,
+        ),
+        "",
+        "AND e.worker_id = $3",
+        "",
+    );
+    let row = sqlx::query(sql)
+        .bind(date_from)
+        .bind(date_to)
+        .bind(worker_id)
+        .fetch_one(conn)
+        .await?;
+    Ok(row.get::<i64, _>("effective_minutes"))
+}
+
+/// 单工人按工序拆分的有效工时（详情页的「按工序」表）。
+///
+/// 口径与 [`worker_effective_minutes`] 同源，额外 `LEFT JOIN t_process pr` 取
+/// 显示名。⚠️ **GROUP BY 含 `pr.name` 而不只是 `e.process_id`**：`t_process.id`
+/// 是主键、一个 `process_id` 只对应一行 `t_process`，故加不加 `pr.name` 都不
+/// 改变分组结果；加上是为了让 `process_name` 进投影而不必依赖 PG 对主键的函数
+/// 依赖推断。
+///
+/// ⚠️ **`process_id IS NULL` 的事件在这里汇成一个无工序名的组**（对
+/// [`worker_effective_minutes`] 的总额贡献恒为 0）：该组不会让总额虚增，但
+/// 前端展示时应当把它读成「这批作业没有工序归属、工时 0」，而不是「一道名为
+/// `(已删除)` 的工序」。
+pub async fn worker_process_breakdown(
+    conn: &mut PgConnection,
+    worker_id: i64,
+    date_from: NaiveDate,
+    date_to: NaiveDate,
+) -> Result<Vec<WorkerProcessBreakdownRow>, sqlx::Error> {
+    let sql = effective_minutes::build(
+        &format!(
+            "SELECT e.process_id AS process_id, \
+             pr.name AS process_name, \
+             COUNT(*)::bigint AS step_count, \
+             {}::bigint AS effective_minutes",
+            effective_minutes::EFFECTIVE_MINUTES_SQL,
+        ),
+        effective_minutes::PROCESS_JOIN_SQL,
+        "AND e.worker_id = $3",
+        "GROUP BY e.process_id, pr.name \
+         ORDER BY effective_minutes DESC, step_count DESC, e.process_id ASC",
+    );
+    let rows = sqlx::query(sql)
+        .bind(date_from)
+        .bind(date_to)
+        .bind(worker_id)
+        .fetch_all(conn)
+        .await?;
+    rows.into_iter()
+        .map(|r| {
+            Ok(WorkerProcessBreakdownRow {
+                process_id: r.try_get::<Option<i64>, _>("process_id").ok().flatten(),
+                process_name: r.try_get::<Option<String>, _>("process_name").ok().flatten(),
+                step_count: r.get::<i64, _>("step_count"),
+                effective_minutes: r.get::<i64, _>("effective_minutes"),
+            })
+        })
+        .collect()
+}
+
 // ============================================================
 // 原始行 dataclass-like 结构（service 层消费）
 // ============================================================
@@ -451,4 +689,27 @@ pub struct WorkerPartRow {
     pub status: String,
     pub pickup_count: i64,
     pub last_pickup_at: NaiveDateTime,
+}
+
+/// 一行 = 一个工人在区间内的有效工时汇总（见
+/// [`worker_effective_minutes_rows`]）。
+#[derive(Debug, Clone)]
+pub struct WorkerEffectiveMinutesRow {
+    pub worker_id: i64,
+    pub effective_minutes: i64,
+    pub worked_process_count: i64,
+    pub worked_batch_count: i64,
+}
+
+/// 一行 = 一个工人在区间内的一道工序（见 [`worker_process_breakdown`]）。
+///
+/// `process_id` / `process_name` 可空：事件本身没记工序时（写侧只在
+/// `prod::scan` 的 4 个构造点落 `process_id`，其余 25 个构造点恒 `NULL`）
+/// 该行代表「无工序归属的作业」，工时贡献为 0。
+#[derive(Debug, Clone)]
+pub struct WorkerProcessBreakdownRow {
+    pub process_id: Option<i64>,
+    pub process_name: Option<String>,
+    pub step_count: i64,
+    pub effective_minutes: i64,
 }
