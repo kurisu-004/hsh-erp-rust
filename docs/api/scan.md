@@ -280,7 +280,7 @@ JSON **形状**逐字不变（键集一字未动）；`scan.batch_id` 的**取�
 | `scan.batch_id` | string | ⚠️ **本次实际被处理的那一批**：拆批场景（§2.4.1）= 拆出来的**新批次**，整批场景 = 工人手上那批 |
 | `scan.event_type` | string | ⚠️ **可能与请求的不同**，见 §4.1 |
 | `scan.synced_assembly_id` | string \| null | 父装配件真变了才有值（handler 据此发 `ASSEMBLY_UPDATED`） |
-| `refill` | `RefillResult` | 同事务 refill，见 [`queue.md`](queue.md) §3 |
+| `refill` | `RefillResult` | 同事务 refill（`QueueService::refill_for_worker_with_work_type`）。4 字段 = `worker_id` / `shelf_id`（worker-scan 路径恒 `null`，refill 无架锚）/ `taken[]` / `pool_empty`，真源 `prod/queue/vo/worker.rs::RefillResult`；⚠️ `queue.md` 只在端点表登记了它是端点 7 的响应类型，**没有逐字段章节**，别去找 |
 
 `work_type_id` / `badge_code` / `split` 是**内部管道字段**（`#[serde(skip)]`）：前两个
 把 `worker_scan_event` 已 fetch 过的 worker 信息透传给同事务的
@@ -557,7 +557,8 @@ SQL 里聚合，一处他域的 service / repo 都不 import（连 `PartRepoTrai
      扫到的 `batch_id` 去回显 / 去推后继动作 —— 拆批场景下它指向余量（仍在工人手上）。
    - 成功后的列表刷新：余量批次仍在 `GET /scan/held` 里、拆出来的那批已不在 ⇒ 被处理的
      那一行是**数量变小**而不是消失；行数**不减**（同事务 refill 抢到料时会 **+N** 行，
-     refill 结果见 [`queue.md`](queue.md) §3 与本响应 `refill` 段）。⇒ 放回 / 送检两页
+     refill 结果见本响应的 `refill` 段（`RefillResult`）—— 该 VO 在 `queue.md` 的端点表
+     里登记为端点 7 `POST /api/v2/prod/queue/refill` 的响应类型）。⇒ 放回 / 送检两页
      都必须重拉列表，不能只假定「扫掉一行」，也不能按「行数不变」做乐观更新。
    - `PART_BATCH_SPLIT` WS 事件与 pick-up 共用，payload 字段名同形（§4）；⚠️ 顶层
      `POST /api/v2/batches/split` 发的同事件只有 2 个键，消费方只能无条件依赖
