@@ -267,18 +267,51 @@ impl PartBatchRepo {
         .await
     }
 
-    /// 取 part 当前活跃 INSPECTION 批次的 id（前端轮询用）。
+    /// 取 part 当前活跃 INSPECTION 批次的 id。
     ///
-    /// 复用 [`find_inprocess_batch_for_part`] 的 None 路径（自动 COUNT
-    /// 校验唯一性）；仅当恰好 1 条 INSPECTION 批次时返回 Some(id)，其它
-    /// 情形（含 0 条 / ≥2 条歧义）返回 None —— 前端轮询接口对此宽容即可。
+    /// ## 2026-10-10：`COUNT + 再查一次` 改为「一次查询 + 确定性取一条」
+    ///
+    /// 改动前复用 [`Self::find_inprocess_batch_for_part`] 的 `None` 路径：
+    /// 先 `SELECT COUNT(*) WHERE part_id=$1 AND status='INSPECTION'`，
+    /// `0` → `None` / `1` → 取该行 id / **`≥2` → `Err(sqlx::Error::RowNotFound)`**。
+    /// 而「一个工单有两个批次同时处于 INSPECTION」是**正常业务形态**
+    /// （`POST /batches/split` 拆批、报工台部分领取自动拆批都会产生），
+    /// `RowNotFound` 不是这个语义该用的信号 —— 结果是一旦工单卡在
+    /// 「两个批次都在品检」，`GET /api/v2/parts/{part_id}`（零件详情主查询，
+    /// 本函数有 2 个调用方：`service/crud.rs` 的 `get_part` 与批量回填详情）
+    /// **整个打不开、HTTP 500**。
+    ///
+    /// 现在是单条 `ORDER BY id ASC LIMIT 1`：0 条自然返 `None`，≥1 条返 id 最小
+    /// 的那条。**取哪一条不影响现有行为** —— `current_batch_id` 是详情 VO 里的
+    /// 提示性字段，前端目前没有任何消费方；但**必须带 `ORDER BY`**：
+    /// `LIMIT 1` 不带排序时 PG 不保证返回哪一行，同输入可能得到不同输出。
+    /// 选 `ASC`（取最早建的那条）而不是 `DESC`，是为了与同文件
+    /// `find_inprocess_batch_for_part` / `find_scan_target_batch` 的消歧查询
+    /// 保持同一口径。
+    ///
+    /// 用运行时 `sqlx::query_scalar` 而非本文件惯用的 `query_scalar!`：后者要把
+    /// 新查询写进 `.sqlx/` 缓存（需连库跑 `scripts/sqlx_prepare.sh`），而这是一个
+    /// 纯读侧的确定性取值修复，不需要为此把构建与开发库绑在一起。签名与返回类型
+    /// 保持不变，调用方无感。
     pub async fn find_current_inspection_batch_id(
         conn: &mut PgConnection,
         part_id: i64,
     ) -> Result<Option<i64>, sqlx::Error> {
-        Ok(Self::find_inprocess_batch_for_part(conn, part_id, None)
-            .await?
-            .map(|b| b.id))
+        let id: Option<i64> = sqlx::query_scalar(
+            r#"
+            SELECT id
+            FROM t_part_batch
+            WHERE part_id = $1
+              AND status = 'INSPECTION'
+              AND deleted_at IS NULL
+            ORDER BY id ASC
+            LIMIT 1
+            "#,
+        )
+        .bind(part_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        Ok(id)
     }
 
     /// 按 id + 未软删定位 `t_part_batch` 行。
