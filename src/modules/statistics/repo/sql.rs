@@ -36,6 +36,12 @@ use sqlx::{PgConnection, PgExecutor, Row};
 /// 有效工时是「事件过滤 + 按工单锚链取工序预计工时」两层嵌套的复合口径，
 /// 三条消费点（按工人 / 单工人总额 / 按工序）必须逐字同源，故拆成常量 +
 /// [`build`] 拼装，而不是三条各写一整串字面量。
+///
+/// ⚠️ **代价：三条聚合都没有编译期列名校验**。它们走运行时 `sqlx::query()` 而非
+/// `query!` 宏（`format!` 拼装无法进宏），`.sqlx/` 里**没有**它们的条目 ⇒ 列名 /
+/// 表名写错、某列被改名、`GROUP BY` 漏列都只在**运行时**报 PG 错误（且 `GROUP BY`
+/// 漏列这类只在特定数据下才暴露的情形，连运行时都不一定立刻报错）。改这三处的
+/// SQL 时要么同步改本模块常量，要么自己确认一次 `cargo test` / dev 库实跑。
 mod effective_minutes {
     use sqlx::AssertSqlSafe;
 
@@ -99,11 +105,29 @@ mod effective_minutes {
 
     /// `LEFT JOIN t_process pr`：按工序聚合的**显示名**来源。
     ///
-    /// `pr.deleted_at IS NULL` 是**刻意的**：软删的工序在历史统计里也要留名，
-    /// 否则一次软删操作会让整段历史报表的行集体退化成无意义的 `(已删除)`。
-    pub const PROCESS_JOIN_SQL: &str = "LEFT JOIN t_process pr \
-                                        ON pr.id = e.process_id \
-                                       AND pr.deleted_at IS NULL";
+    /// ⚠️ **ON 上刻意不带 `pr.deleted_at IS NULL`**（与仓内**筛候选**的那批带这道
+    /// 闸门的 SQL 相反，见下面理由 3）：被聚合的行是 `t_part_event` —— 一张**没有
+    /// `deleted_at` 列**的不可变审计流水，而统计窗口又是**已过去的闭区间**。事后软删
+    /// 一道工序是对**当前工序字典**的行政操作，不该追溯抹掉历史报表里的名字，否则
+    /// 一次软删就让整段历史行集体退化成 `(已删除)`。
+    ///
+    /// 三条理由，缺一条都可能被下一个人「顺手对齐」回去：
+    ///
+    /// 1. **同一条派生在 `part::service::phase1::events` 已是这个口径** —— 那里对
+    ///    完全相同的 `t_part_event.process_id → t_process.name` 显式不过滤
+    ///    `deleted_at`（「事件行是当时的快照事实」）。同一份 diff 里对同一派生给两种
+    ///    相反口径，是漂移的起点。
+    /// 2. **分组键是 `e.process_id`（事件侧），不是字典侧** ⇒ 加不加这道闸门都不改
+    ///    分组结果，只改显示名。`t_process.id` 是主键，LEFT JOIN 至多命中一行，
+    ///    也不会因此放大行数。
+    /// 3. **仓内「LEFT JOIN 取显示名」一律不过滤**（`prod::inspection::repo` /
+    ///    `outsource::repo::sql` / `shared::shelf::pool_priority` 同款）；带
+    ///    `AND pr.deleted_at IS NULL` 的是**INNER JOIN 筛候选**的场景
+    ///    （`prod::programming` / `prod::work_type` / `prod::shelf_process`）。
+    ///
+    /// ⇒ 落到 `process_name` 为 NULL 的只剩「`process_id` 本身是 NULL」与
+    /// 「工序行物理缺失」两种，service 统一退 `(已删除)`。
+    pub const PROCESS_JOIN_SQL: &str = "LEFT JOIN t_process pr ON pr.id = e.process_id";
 
     /// `COALESCE(SUM(cs.estimated_minutes), 0)` 的取数表达式。
     ///
@@ -659,7 +683,10 @@ pub async fn worker_process_breakdown(
         .map(|r| {
             Ok(WorkerProcessBreakdownRow {
                 process_id: r.try_get::<Option<i64>, _>("process_id").ok().flatten(),
-                process_name: r.try_get::<Option<String>, _>("process_name").ok().flatten(),
+                process_name: r
+                    .try_get::<Option<String>, _>("process_name")
+                    .ok()
+                    .flatten(),
                 step_count: r.get::<i64, _>("step_count"),
                 effective_minutes: r.get::<i64, _>("effective_minutes"),
             })

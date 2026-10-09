@@ -94,8 +94,8 @@ struct EventListRow {
     /// 2026-10-10 新增（来自 `LEFT JOIN t_user u` 的 `u.username`）。
     operator_username: Option<String>,
     /// 2026-10-12 新增（来自 `e.process_id`，migration 009 新增的列）。
-    /// ⚠️ 与 `PartEventOut::process_id` 同理**历史事件恒 `None`**：该列本轮只加
-    /// 不回填，写入侧补列随生产统计重构的后续任务落地。
+    /// ⚠️ **历史事件恒 `None`**：该列加列后**不回填**，2026-10-12 起写侧才在
+    /// `prod::scan` 的 4 个构造点填它，其余写点一律 `NULL`。
     process_id: Option<i64>,
     /// 2026-10-12 新增（来自 `LEFT JOIN t_process pr` 的 `pr.name`）。
     process_name: Option<String>,

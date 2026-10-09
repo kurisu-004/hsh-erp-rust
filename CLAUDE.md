@@ -654,6 +654,8 @@ reviewer 在 iam 域重构期间实跑复现出的另外 6 条基线红（与 ia
 - `StatisticsService::overview` / `worker_stats` / `worker_detail` **无 happy-path 集成测试**（原三条硬编码日期窗口的用例已按上表删除）。`tests/statistics/api.rs` 现存 **2** 条里，走到这三个方法的只有 `overview` 的**参数校验**用例（`date_from > date_to` → `BIZ 20104`）；另一条 `count_in_process_at_date_to_boundary` 是 repo 层 `count_in_process_at` 的直调覆盖，**不经 service**，故不计入这三个方法。**有效工时维度的 3 条 repo SQL 同样无集成测试覆盖。**
 - `shared::analytics` 的两个 helper（`daily_buckets` / `worker_contribution`）仍**各保有 2 条纯函数单测**。
 - repo 层 SQL 未被上述删除波及 —— 已知的覆盖点至少有：`tests/statistics/event_driven.rs` 的 3 条（自己钉死时间戳、一直绿）+ 上面那条 `count_in_process_at_date_to_boundary`（钉 `date_to` 边界口径）。**有效工时维度的 3 条**（按工人聚合 / 单工人总额 / 按工序拆分）是零覆盖。这只是**当前已知的**覆盖点、不该当穷举读：判断某个 repo 方法有没有覆盖，要打开 `tests/statistics/` 两个 sub-file 逐个核。
+- **待补：`worker_effective_minutes` 集成测试**（`statistics::repo::sql::worker_effective_minutes`）。它是三条有效工时聚合里最容易被静默改坏的那条（总额与 `worker_process_breakdown` 各行之和必须相等，而两者**分处两条 SQL**，共用常量只保证了片段同源、不保证结果自洽）。补测试时：① 造一组「链外工序计 0」与「链内命中 step」混合的事件，断言总额等于 breakdown 各行之和；② 遵守「测试数据两条硬约定」第 2 条，**不得**硬编码绝对日期窗口。
+- ⚠️ 这 3 条聚合**没有编译期列名校验**：走运行时 `sqlx::query()` + `format!` 拼装、不进 `query!` 宏，`.sqlx/` 里没有它们的条目（代价登记在 `docs/api/statistics.md` §4.10 与 `sql.rs` 的 `effective_minutes` 模块 doc）。补上面那条集成测试是唯一能兜住「列名写错 / `GROUP BY` 漏列」的自动化手段。
 - 补 happy-path 时遵守「测试数据两条硬约定」第 2 条：**不得**硬编码绝对日期窗口。
 
 ## DB 约定（迁移与查询必须沿用）

@@ -823,6 +823,17 @@ CurrentUser.id (t_user.id)
 ⚠️ `workHours` 是**工作量估算**（DB schema 无 `work_hours` 列），用「加工件数」顶替
 —— 与 `statistics` 域的同形口径一致。
 
+⚠️⚠️ **2026-10-12 起两个字段对新事件返非 0**（跨域行为变更）：此前 `t_part_event.worker_id`
+**从未被写侧写过**（老 INSERT 的列清单里没有它，Python v1 退役后一直是 NULL），本节两条
+聚合的 `WHERE worker_id = $1` 对**任何**工人都恒命中 0 行 ⇒ 已绑定账号也一直看到
+`batchCount: 0 / workHours: 0`。2026-10-12 起写侧在 **6** 个事件构造点填 `worker_id`
+（`prod::scan::service::worker_scan` 的 `RETURNED_TO_SHELF` / `SENT_TO_INSPECTION`、
+`prod::scan::service::pickup` 的 `SPLIT` / `PICKED_UP`、`prod::queue::service::queue`
+的 2 处 `TAKEN_FROM_POOL`），逐点依据见 `crate::shared::part_event` 的模块 doc。
+⇒ **2026-10-12 之前写入的事件仍统计不到**（老数据恒 0 是正常的，不是回归）；
+本节两条 SQL 的口径一个字没改，是写侧补列带来的结果。`worker_id` 是
+`t_worker.id`（§9.3 的解链结果），不是 `t_user.id`。
+
 ### 9.5 回归测试
 
 | 测试 | 钉住什么 |

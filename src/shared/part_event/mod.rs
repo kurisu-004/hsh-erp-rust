@@ -27,14 +27,14 @@
 //! ## 为什么本表没有 `T*` 投影
 //!
 //! 仓库惯例：`T*` = 某域 **owned** 的表的全列 `#[derive(sqlx::FromRow)]` 投影。
-//! 全仓 `pub struct T*` 实测 20 个（`customer` / `applicant` / `assembly` / `part_file` /
-//! `part` / `process` / `outsource` ×5 / `worker` / `work_type` / `process_chain` ×2 /
+//! 全仓 `pub struct T*` 实测 19 个（`customer` / `applicant` / `assembly` / `part_file` /
+//! `part` ×3 / `process` / `outsource` ×5 / `worker` / `work_type` / `process_chain` ×2 /
 //! `shelf` / `shared::batch::TPartBatch`），**全部 derive FromRow、零例外**。
 //!
 //! `t_part_event` 不满足「owned」，因而也不该有 `T*` 投影：本表读侧一律走**端点私有
 //! row struct + VO** —— 零件时间线用 `modules::part::service::phase1::events` 内的
 //! `EventListRow`，statistics 域用自己的 row struct。给一张读侧人人自定义列集的表造一个
-//! 20 列的公共投影，只会让「哪一列是端点要的」这件事被投影结构掩盖。
+//! 全列的公共投影，只会让「哪一列是端点要的」这件事被投影结构掩盖。
 //!
 //! ## 为什么 builder 保留 `New` 前缀（而不是改名 `PartEvent`）
 //!
@@ -57,10 +57,10 @@
 //!
 //! | 有值 | 位置 | 取值依据 |
 //! |---|---|---|
-//! | ✅ 4 处 | `prod::scan::service::worker_scan`（`RETURNED_TO_SHELF` / `SENT_TO_INSPECTION`） | 形参 `worker: &TWorker` ⇒ `Some(worker.id)` |
+//! | ✅ 2 处 | `prod::scan::service::worker_scan`（`RETURNED_TO_SHELF` / `SENT_TO_INSPECTION`） | 形参 `worker: &TWorker` ⇒ `Some(worker.id)` |
 //! | ✅ 2 处 | `prod::scan::service::pickup`（`SPLIT` / `PICKED_UP`） | `Some(req.worker_id)` —— 该 worker 已在函数前半段查库校验存在且 active |
 //! | ✅ 2 个调用点 | `prod::queue::service::queue`（2 处 `TAKEN_FROM_POOL`） | 形参 `worker_id`（已被 worker 取料 SQL 验过 `t_worker.id`） |
-//! | ❌ 其余 25 个构造点 | 见下 | 见下 |
+//! | ❌ 其余全部写点 | 见下 | 见下 |
 //!
 //! `None` 的理由（**不是**「取不到」而是「语境里没有作业人」）：这批事件是 part 级 /
 //! 批次级的状态流转（`DELIVERED` / `INSPECTED` / `STATUS_CHANGED` / `REPAIR_*` /
@@ -78,7 +78,7 @@
 //! | ✅ 4 处 | `prod::scan::service::worker_scan`（2 处）、`prod::scan::service::pickup`（2 处） | `Some(batch.current_process_id)`，见下 |
 //! | ❌ 3 个调用点 | `prod::queue::service::queue` 的 3 处 `MOVED` | `MOVED` 有三个方向（POOL→WORKER / WORKER→POOL / WORKER→WORKER），只有第一个是「开始加工」，后两个分别是「放回」与「转手」；而有效工时口径只用 `RETURNED_TO_SHELF` + `SENT_TO_INSPECTION` ⇒ 填不填都不进任何聚合，一律 `None` 少一处需要推理的地方 |
 //! | ❌ 2 个调用点 | `prod::queue::service::queue` 的 2 处 `TAKEN_FROM_POOL` | 该路径手上只有 `TakenItem`，**取不到批次工序**（`prod::queue::repo::sql::TakenRow` / 最终 SELECT 都不含 `pb.current_process_id`，`worker_id` 能拿到而 `process_id` 拿不到）。补它要连带改 `TakenRow` + CTE + RETURNING + `TakenItem` 四个落点并改动 `/prod/queue/refill` 响应契约，超出本轮范围 |
-//! | ❌ 其余 25 个构造点 | 见下 | 这些事件发生时批次确实带着 `current_process_id`，但它们既不是「开始加工」也不是「加工完毕」⇒ 工序归属对统计无贡献；一并 `None` |
+//! | ❌ 其余全部写点 | 见下 | 这些事件发生时批次确实带着 `current_process_id`，但它们既不是「开始加工」也不是「加工完毕」⇒ 工序归属对统计无贡献；一并 `None` |
 //!
 //! 4 处「有值」为什么取 `batch.current_process_id` 就够：
 //!

@@ -79,9 +79,13 @@ impl PartService {
         //   共享同一个雪花 ID 空间 ⇒ 这是从事件行出发的三个**独立** JOIN，不是互相
         //   关联。`t_part_batch` 同样不按 `deleted_at` 过滤（事件行是当时的快照事实）。
         //
-        // ⚠️ `e.process_id` 恒 NULL **不是**投影漏了：该列由 migration 009
-        // （2026-10-12）新增且本轮不回填，写入侧补列是后续任务。在那之前
-        // `LEFT JOIN t_process` 必然落空 ⇒ `process_id` / `process_name` 双双 `None`。
+        // ⚠️ `e.process_id` 对**老事件**恒 NULL 不是投影漏了：该列由 migration
+        // 2026-10-12 新加且**不回填**。2026-10-12 起写侧在 4 个构造点填它
+        // （`prod::scan::service::worker_scan` 的 2 处 + `prod::scan::service::pickup`
+        // 的 2 处，均取事件时刻的 `batch.current_process_id` 快照），其余写点仍是
+        // `NULL` ⇒ **只有 2026-10-12 之后由报工台产生的作业类事件才有工序**，
+        // 它们的 `LEFT JOIN t_process` 命中，`process_id` / `process_name` 有值；
+        // 历史事件与工单级 / 批次级流转事件两者皆 `None`。
         //
         // `ORDER BY e.id DESC` 是刻意选择，**不要**改成 `created_at DESC`：
         // `t_part_event.id` 空间异质（雪花 / migration 回填的连续密集块 / 未被

@@ -90,19 +90,27 @@ pub struct WorkerPartItem {
 /// 一行 = 一道工序在该工人区间内的作业汇总（`GET /workers/{id}` 的
 /// `process_breakdown[]` 元素）。
 ///
-/// `process_id` **可空**不是偷懒：写侧只在 `prod::scan` 的 4 个构造点落
-/// `process_id`，其余 25 个 `t_part_event` 构造点恒为 `NULL`，这类事件在按工序
-/// 分组时汇成一个「无工序」组 —— 它对 `effective_minutes` 总额的贡献恒为 0。
-/// 雪花 ID 序列化成 JSON string（`serialize_i64`），与
-/// [`WorkerPartItem::part_id`] 同款。
+/// `process_id` **可空**不是偷懒：写侧只有 `prod::scan` 的 **4** 个事件构造点落
+/// `process_id`（`worker_scan` 的 `RETURNED_TO_SHELF` / `SENT_TO_INSPECTION` 与
+/// `pickup` 的 `SPLIT` / `PICKED_UP`，均取 `batch.current_process_id`），其余
+/// `t_part_event` 写点一律 `NULL`，这类事件在按工序分组时汇成一个「无工序」组 ——
+/// 它对 `effective_minutes` 总额的贡献恒为 0。逐点取值依据见
+/// `crate::shared::part_event` 的模块 doc。雪花 ID 序列化成 JSON string
+/// （`serialize_i64_opt`），与 [`WorkerPartItem::part_id`] 同款。
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkerProcessBreakdown {
     #[serde(serialize_with = "serialize_i64_opt")]
     pub process_id: Option<i64>,
-    /// 工序显示名。取不到时（`process_id` 为 NULL、或工序行物理缺失）退
-    /// `(已删除)` 字符串，与 `com::delivery_note::service::group` 的既有兜底
-    /// 同款。⚠️ 与 `process_id IS NULL` 的 `null` 是**两种不同的「无名」**，前端
-    /// 别混用同一个占位文案。
+    /// 工序显示名。取不到时退 `(已删除)` 字符串，与
+    /// `com::delivery_note::service::group` 的既有兜底同款。
+    ///
+    /// ⚠️ **`t_process` 行已软删**也是取得到名的那一支：breakdown 的
+    /// `LEFT JOIN t_process pr` 刻意**不**在 ON 上带 `pr.deleted_at IS NULL`
+    /// （理由见 `sql.rs` 的 `PROCESS_JOIN_SQL`）—— 事后软删是对当前工序字典的
+    /// 行政操作，不追溯抹掉历史报表里的名字。⇒ 真正落到本兜底的只剩
+    /// `process_id IS NULL` 与工序行物理缺失两种。
+    /// ⚠️ `process_id` 为 `null` 与本字段为 `(已删除)` 是**两种不同的「无名」**，
+    /// 前端别混用同一个占位文案。
     pub process_name: String,
     /// 该工序在该区间内被「完成」的次数（`COUNT(*)`，不是 distinct）。
     pub step_count: i64,

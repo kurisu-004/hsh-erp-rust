@@ -180,11 +180,17 @@ impl ProductionRepo {
     /// ⚠️ `worker_id` 参数是 **`t_worker.id`**，不是 `t_user.id` —— 旧实现传的是
     /// 后者，那正是本端点恒返 0 的原因（`find_worker_by_user` 解链后再传进来）。
     ///
-    /// ⚠️ 另一条恒空的过滤是 `WHERE worker_id = $1` 命中 0 行：**`t_part_event.worker_id`
-    /// 从未被写入**（Rust 侧全部 INSERT 不带该列，Python v1 退役后一直是 NULL），
-    /// 与上一条的 ID 语义是两个独立问题。写侧补 `worker_id` 属生产统计重构的
-    /// 后续任务，本文件**刻意不动**这段 SQL —— 在补列落地前改 ID 语义也不会让它
-    /// 返出非 0。
+    /// ⚠️ 另一条过滤 `WHERE worker_id = $1`（`t_worker.id`）的命中口径**在
+    /// 2026-10-12 变了**：`t_part_event.worker_id` 此前从未被写侧写过（老 INSERT 的
+    /// 列清单里根本没有它，Python v1 退役后一直是 NULL），本查询对**任何**工人都恒返
+    /// 0 行；2026-10-12 起写侧在 **6** 个事件构造点填 `worker_id`
+    /// （`prod::scan::service::worker_scan` 的 `RETURNED_TO_SHELF` /
+    /// `SENT_TO_INSPECTION`，`prod::scan::service::pickup` 的 `SPLIT` /
+    /// `PICKED_UP`，`prod::queue::service::queue` 的两处 `TAKEN_FROM_POOL`），其余
+    /// 写点（part / 批次级状态流转 / 外协 / 装配 / 序列号归档 …）仍是 `NULL`。
+    /// ⇒ **2026-10-12 之前写入的事件一律统计不到，`batchCount` / `workHours` 对老数据
+    /// 仍恒为 0**；口径变更登记在 `docs/api/wx.md` §9.4。逐点取值依据见
+    /// `crate::shared::part_event` 的模块 doc。
     pub async fn worker_stats_by_period<'e, E: PgExecutor<'e>>(
         executor: E,
         worker_id: i64,

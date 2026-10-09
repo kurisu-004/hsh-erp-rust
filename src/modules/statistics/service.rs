@@ -250,8 +250,9 @@ impl StatisticsService {
             .into_iter()
             .map(|r| WorkerProcessBreakdown {
                 process_id: r.process_id,
-                // 取不到工序名（无 process_id / 工序行缺失）退 "(已删除)"，与
-                // com::delivery_note::service::group 的既有兜底同款。
+                // 取不到工序名退 "(已删除)"（与 com::delivery_note::service::group
+                // 的既有兜底同款）。工序行被软删**不在**这一支里 —— breakdown 的
+                // LEFT JOIN 刻意不过滤 deleted_at（见 sql.rs::PROCESS_JOIN_SQL）。
                 process_name: r.process_name.unwrap_or_else(|| "(已删除)".to_string()),
                 step_count: r.step_count,
                 effective_minutes: r.effective_minutes,
