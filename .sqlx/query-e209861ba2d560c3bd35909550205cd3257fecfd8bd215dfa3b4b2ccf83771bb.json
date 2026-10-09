@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT u.worker_id     AS \"worker_id!\",\n                   w.name          AS \"name!\",\n                   wt.name         AS work_type_name\n            FROM t_user u\n            JOIN t_worker w\n              ON w.id = u.worker_id\n             AND w.deleted_at IS NULL\n            LEFT JOIN t_work_type wt\n              ON wt.id = w.work_type_id\n             AND wt.deleted_at IS NULL\n            WHERE u.id = $1\n              AND u.deleted_at IS NULL\n              AND u.worker_id IS NOT NULL\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "worker_id!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_user",
+            "name": "worker_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "name!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_worker",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "work_type_name",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_work_type",
+            "name": "name"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "e209861ba2d560c3bd35909550205cd3257fecfd8bd215dfa3b4b2ccf83771bb"
+}

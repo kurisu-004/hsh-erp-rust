@@ -16,8 +16,8 @@
 //!   （只返增量，不重算角标）
 //! - **VO 不复用任何他域结构**（消灭了跨域复用的 `iam::vo::CurrentUserOut` /
 //!   `iam::vo::LoginResponse` / `part::statemachine::PartStatus`）
-//! - **URL 跟页面名走**（`/login` / `/part-list` / 生产页），不再把别域的路径前缀
-//!   （`/iam`）嫁接过来
+//! - **URL 跟页面名走**（`/login` / `/part-list` / `/production`），不再把别域的
+//!   路径前缀（`/iam`）嫁接过来
 //!
 //! # 端点清单（2026-10-11 硬切，无 alias）
 //!
@@ -28,9 +28,9 @@
 //! | `GET /api/v2/wx/parts/?status=&page=&size=` | **删除** → `GET /api/v2/wx/part-list/page?status=&page=&size=` |
 //! | `GET /api/v2/wx/parts/by-serial/{serial_no}` | **删除**（前端 `fetchPartBySerial` 零消费者） |
 //! | `GET /api/v2/wx/dashboard/home` | **整域删除**（前端 `fetchHomeDashboard` 零消费者，且无 dashboard 页；随该域一起消失的还有跨域复用的 `CurrentUserOut`） |
-//! | — | `GET /api/v2/wx/batches/counts?period=YYYY-MM` **原样保留**（B3 换 `/production/*`） |
-//! | — | `GET /api/v2/wx/batches?tab=&period=&page=&size=` **原样保留**（B3 换 `/production/*`） |
-//! | — | `GET /api/v2/wx/worker/stats?period=YYYY-MM` **原样保留**（B3 换 `/production/*`） |
+//! | `GET /api/v2/wx/batches/counts?period=YYYY-MM` | **删除** → 并入 `GET /api/v2/wx/production`（见 [`production`]） |
+//! | `GET /api/v2/wx/batches/?tab=&period=&page=&size=` | **删除** → `GET /api/v2/wx/production/page?tab=&period=&page=&size=` |
+//! | `GET /api/v2/wx/worker/stats?period=YYYY-MM` | **删除** → 并入 `GET /api/v2/wx/production` |
 //!
 //! **硬切 = 旧路径一律 404，无 alias**。小程序侧必须同步切 URL。
 //!
@@ -39,7 +39,8 @@
 //! 1. **`GET /wx/parts/?…`（带尾斜杠）实际是 404**，无尾斜杠 `/wx/parts` 才命中
 //!    handler。本仓 axum 版本下 `nest("/parts") + route("/")` 只匹配**无**尾斜杠的
 //!    路径。小程序侧曾按**相反**的假设发请求并踩过 404。新契约全部**无尾斜杠**，
-//!    并由 `tests/wx/part_list.rs::trailing_slash_form_is_pinned` 钉死。
+//!    并由 `tests/wx/part_list.rs::trailing_slash_form_is_pinned` 与
+//!    `tests/wx/production.rs::trailing_slash_form_is_pinned` 双双钉死。
 //! 2. 旧 `GET /wx/dashboard/home` 依赖的 `CurrentUserOut`（跨域复用 iam 的）随该域
 //!    一起消失。
 //!
@@ -61,10 +62,15 @@
 //! │   ├── repo.rs       SQL 真源（WHERE 只写一份）
 //! │   ├── service.rs    tab↔DB 映射表 + 归桶 + 投影 + hasMore
 //! │   └── handler.rs    路由（只提取参数 + R::ok）
-//! ├── batches.rs       批次页（B3 搬进 production/，本步原样保留）
-//! ├── worker.rs        工人工作量（B3 搬进 production/，本步原样保留）
-//! ├── repo.rs          **B3 过渡期**：只剩 batch / worker 的 SQL（B3 会搬走）
-//! ├── vo.rs            **B3 过渡期**：只剩 batch / worker 的 VO（B3 会搬走）
+//! ├── production/       生产页：GET /production + /production/page
+//! │   ├── mod.rs        模块 doc + 路由转发 + 域隔离护栏
+//! │   ├── dto.rs        ProductionQuery（两端点共用）
+//! │   ├── vo.rs         WorkerOut / WorkerStatsOut / BatchCountsOut /
+//! │   │                 ProductionBatchCardOut（camelCase）+ 2 个分页外壳
+//! │   ├── model.rs      FromRow 行结构（不 Serialize）
+//! │   ├── repo.rs       SQL 真源（WHERE 只写一份；count 方法已删）
+//! │   ├── service.rs    resolve_period + tab↔DB 映射 + 工人解链 + 投影 + hasMore
+//! │   └── handler.rs    路由（只提取参数 + R::ok）
 //! └── wecom_client.rs  企业微信 API 客户端（trait + Http + Noop + mock）
 //! ```
 //!
@@ -75,30 +81,36 @@
 //! - `login` → `iam::service::{AccountService, SessionService}`（查 `t_wx_identity`、
 //!   签 token、写 Redis session）。`t_wx_identity` 的 **SQL 真源属 iam 域**
 //!   （`modules::iam::repo::sql::wx_identity`），本域对该表**零 SQL**。
-//! - `part_list` → 直接读 `t_part` / `t_part_batch` / `t_customer`（**跨域只读
-//!   聚合**，与 `dashboard` / `statistics` 同形：只 SELECT，不写）。
+//! - `part_list` / `production` → **纯跨域只读聚合**：直接读 `t_part` /
+//!   `t_part_batch` / `t_customer`（`part_list`）与 `t_user` / `t_worker` /
+//!   `t_work_type` / `t_part_event`（`production`）—— 与 `dashboard` /
+//!   `statistics` 同形：只 SELECT，不写，**零**他域 import。
 //! - ⚠️ **禁止**反向：任何域都不许 import `modules::wx::*`。唯一的跨域例外是
 //!   `state.wecom`（`Arc<dyn WeComApiClient>`）——它由 `AppState` 持有，不是 wx 域
 //!   的私有类型。
 //!
 //! # 已知偏差登记
 //!
-//! 完整清单见 [`docs/api/wx.md`](../../../docs/api/wx.md)（§8 已知偏差登记）。三条最
+//! 完整清单见 [`docs/api/wx.md`](../../../docs/api/wx.md)（§8 已知偏差登记）。四条最
 //! 要紧的：
 //!
-//! 1. **4 类 `status` 折叠有静默兜底**：DB 的 `PROGRAMMING` / `OUTSOURCE` /
-//!    `COMPLETED` / `CANCELLED` 不映射到任何 tab 值。它们只计入 `counts.all`，在
-//!    `list[].status` 里一律填 `"pendingProduction"`（与旧前端 `mapStatus` 的
-//!    catch-all 逐字对齐）。⇒ **`counts` 与 `list` 的归属不完全对齐**：这类工单只
-//!    在「全部」列表可见，点进任一具体 tab 都看不到。
+//! 1. **4 类 `status` 折叠有静默兜底**（`part_list`）：DB 的 `PROGRAMMING` /
+//!    `OUTSOURCE` / `COMPLETED` / `CANCELLED` 不映射到任何 tab 值。它们只计入
+//!    `counts.all`，在 `list[].status` 里一律填 `"pendingProduction"`（与旧前端
+//!    `mapStatus` 的 catch-all 逐字对齐）。⇒ **`counts` 与 `list` 的归属不完全
+//!    对齐**。`production` 域**没有**这个偏差（2 类 tab 与过滤集一一对应）。
 //! 2. **`drawingUrl` 有意缺字段**：`t_part` 无图纸列，后端不出该字段（也不加恒
 //!    `null` 的占位），小程序侧自己在映射时用 `/asset/drawing/{code}.png` 兜底。
 //!    等 COS 文件服务接入后单独 PR 补。
-//! 3. **旧路径 404 无 alias** + `by-serial` / `dashboard/home` 已删除（零消费者）。
+//! 3. **旧路径 404 无 alias** + `by-serial` / `dashboard/home` /
+//!    `batches/*` / `worker/stats` 已删除。
+//! 4. **`production` 的 `batchQty` 与 `part_list` 的同名字段不同义**（前者是本批次
+//!    件数、后者是工单总件数），且 `workHours` 无值时是 `null` 而非 `0`。见
+//!    `docs/api/wx.md` §8.6 / §8.8。
 //!
 //! # 事务分层
 //!
-//! - [`part_list`] 全部 read-only：`pool.acquire()` 不开事务。
+//! - [`part_list`] / [`production`] 全部 read-only：`pool.acquire()` 不开事务。
 //! - [`login`] 的 `POST /login/wecom` 是**全域唯一**有事务的端点，且外部 HTTP
 //!   **必须在事务外**（详见 `login/mod.rs` 的「事务分层」段）。
 
@@ -106,48 +118,12 @@ use std::sync::Arc;
 
 use axum::Router;
 
-use crate::shared::error::AppError;
 use crate::state::AppState;
 
-pub mod batches;
 pub mod login;
 pub mod part_list;
-pub mod repo;
-pub mod vo;
+pub mod production;
 pub mod wecom_client;
-pub mod worker;
-
-/// 把可选 `period`（YYYY-MM）归一化：`None` → 当前月；`Some(s)` → 严格校验。
-///
-/// 设计：服务端 fallback 到当前月是为了让 mini-program 端不必每次拼 query 字符
-/// 串；同时支持前端显式传 period（历史月份视图）。
-///
-/// 校验规则：
-/// - 长度必须 7（`YYYY-MM`）
-/// - 第 5 字节必须是 `-`
-/// - 月份 ∈ `01..=12`
-///
-/// 2026-09-28 review #1 修复：从 batches / worker 抽到本模块共享，原地两副本
-/// 删除。测试也一并合并到本模块（`#[cfg(test)] mod tests`），避免分散。
-pub(crate) fn resolve_period(raw: Option<&str>) -> Result<String, AppError> {
-    match raw {
-        None => Ok(chrono::Local::now().format("%Y-%m").to_string()),
-        Some(s) => {
-            if s.len() != 7 || s.as_bytes()[4] != b'-' {
-                return Err(AppError::validation(format!(
-                    "period {s:?} 格式非法（要求 YYYY-MM）"
-                )));
-            }
-            let month: u32 = s[5..7]
-                .parse()
-                .map_err(|_| AppError::validation(format!("period {s:?} 月份非法")))?;
-            if !(1..=12).contains(&month) {
-                return Err(AppError::validation(format!("period {s:?} 月份非法")));
-            }
-            Ok(s.to_string())
-        }
-    }
-}
 
 /// `/api/v2/wx/*` 入口 router 工厂。
 ///
@@ -156,45 +132,19 @@ pub(crate) fn resolve_period(raw: Option<&str>) -> Result<String, AppError> {
 /// —— `part` / `prod::queue` / `admin` —— 不适用于本次重构）。
 ///
 /// 注册顺序：
-/// 1. `login::router()`    —— `/login/wecom`（**公开**端点）
-/// 2. `part_list::router()` —— `/part-list` + `/part-list/page`
-/// 3. `batches::router()`  —— `/batches/*`（⚠️ 2026-10-11 原样保留；B3 会把
-///    3+4 一起换成 `.nest("/production", production::router())`）
-/// 4. `worker::router()`   —— `/worker/stats`（同上，B3 范围）
+/// 1. `login::router()`      —— `/login/wecom`（**公开**端点）
+/// 2. `part_list::router()`  —— `/part-list` + `/part-list/page`
+/// 3. `production::router()` —— `/production` + `/production/page`
+///
+/// 三个前缀的段名互不相同（`login` / `part-list` / `production`），**不存在
+/// catch-all**，故注册顺序无硬约束（各子模块内部的 `/page` 与 `/` 顺序才是硬
+/// 约束，见各 `handler.rs`）。
+///
+/// ⚠️ 2026-10-11（B3）：旧 `/batches/*` + `/worker/stats` 三个端点已**合并**进
+/// `production`（首屏聚合 + 上拉增量），**硬切无 alias**，旧路径一律 404。
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .nest("/login", login::router())
         .nest("/part-list", part_list::router())
-        // ↓ B3（2026-10-11 之后接手）把下面两个换成
-        //   `.nest("/production", production::router())`；本步**刻意原样保留**，
-        //   保证 `/wx/batches/*` 与 `/wx/worker/stats` 线上不断。
-        .nest("/batches", batches::router())
-        .nest("/worker", worker::router())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resolve_period_defaults_to_current_month() {
-        let p = resolve_period(None).unwrap();
-        assert_eq!(p.len(), 7);
-        assert_eq!(p.as_bytes()[4], b'-');
-    }
-
-    #[test]
-    fn resolve_period_accepts_valid() {
-        assert_eq!(resolve_period(Some("2026-09")).unwrap(), "2026-09");
-        assert_eq!(resolve_period(Some("2025-12")).unwrap(), "2025-12");
-    }
-
-    #[test]
-    fn resolve_period_rejects_invalid() {
-        assert!(resolve_period(Some("2026-9")).is_err()); // 月份 1 位
-        assert!(resolve_period(Some("2026/09")).is_err()); // 分隔符错
-        assert!(resolve_period(Some("2026-13")).is_err()); // 月份 13
-        assert!(resolve_period(Some("2026-00")).is_err()); // 月份 0
-        assert!(resolve_period(Some("26-09")).is_err()); // 年份 2 位
-    }
+        .nest("/production", production::router())
 }

@@ -8,18 +8,23 @@
 
 ## 0. 2026-10-11 变更摘要（按小程序页面切子模块）
 
-wx BFF 重构 B2 步。原先 `/api/v2/wx/*` 是 **10 个平铺文件、零 service 层**，
-且**跨域复用** `iam::vo::CurrentUserOut` / `iam::vo::LoginResponse` /
-`part::statemachine::PartStatus`。重构后：
+wx BFF 重构 **B2 + B3 两步**已完成（重构收官）。原先 `/api/v2/wx/*` 是 **10 个平铺
+文件、零 service 层**，且**跨域复用** `iam::vo::CurrentUserOut` /
+`iam::vo::LoginResponse` / `part::statemachine::PartStatus`。重构后：
 
-1. **按页面切子模块**：`login/`（登录页）+ `part_list/`（零件一览页）。
-   `batches` / `worker` 本步**原样保留**（B3 步会换成 `/wx/production/*`）。
+1. **按页面切子模块**：`login/`（登录页）+ `part_list/`（零件一览页，B2）+
+   `production/`（生产页，B3）。B3 之后 `wx/mod.rs` 下只剩这 3 个子目录 +
+   `wecom_client.rs`，4 个旧平铺文件（`batches.rs` / `worker.rs` / `repo.rs` /
+   `vo.rs`）全部删除。
 2. **URL 跟页面名走**，全部**硬切、无 alias**（见 §5）。
-3. **VO 不复用任何他域结构**：`WxLoginOut` 自建；`PartCardOut` 逐字对齐前端卡片
-   模型并改为 **camelCase**。
-4. 端点模型改为「**每页 1 个首屏聚合端点 + 1 个上拉增量端点**」。
-5. 顺带修掉两个既有 bug（详见 §3.2）：`status` 参数口径错位（前端传 tab 值被当 DB
-   状态白名单校验）、`delivered` 角标与列表口径不一致（198 vs 126）。
+3. **VO 不复用任何他域结构**：`WxLoginOut` 自建；`PartCardOut` /
+   `ProductionBatchCardOut` 逐字对齐前端卡片模型并改为 **camelCase**。
+4. 端点模型改为「**每页 1 个首屏聚合端点 + 1 个上拉增量端点**」。端点总数
+   **10 → 4**（`/login/wecom` + `/part-list` + `/part-list/page` +
+   `/production` + `/production/page`）。
+5. 顺带修掉三个既有 bug（详见 §3.3 / §9）：`status` 参数口径错位（前端传 tab 值
+   被当 DB 状态白名单校验）、`delivered` 角标与列表口径不一致（198 vs 126）、
+   ★ `GET /wx/worker/stats` 把 `t_user.id` 当 `t_worker.id` 查而恒返 0。
 6. 补 `deliveredQty` **真实值**（前端原先硬编码 0）。
 
 ## 1. 端点表
@@ -29,18 +34,23 @@ wx BFF 重构 B2 步。原先 `/api/v2/wx/*` 是 **10 个平铺文件、零 serv
 | 1 | POST | `/api/v2/wx/login/wecom` | **公开**（白名单） | 无（body `{code}`） | `WxLoginOut` |
 | 2 | GET | `/api/v2/wx/part-list` | 登录即可（**无角色闸门**） | `status?` `page?` `size?` | `PartListHomeOut` |
 | 3 | GET | `/api/v2/wx/part-list/page` | 登录即可 | `status?` `page?` `size?` | `PartListPageOut` |
-| 4 | GET | `/api/v2/wx/batches/counts` | 登录即可 | `period?` | `BatchCounts` |
-| 5 | GET | `/api/v2/wx/batches` | 登录即可 | `tab`（必填）`period?` `page?` `size?` | `WxPage<WxBatchSummary>` |
-| 6 | GET | `/api/v2/wx/worker/stats` | 登录即可 | `period?` | `MonthlyStats` |
+| 4 | GET | `/api/v2/wx/production` | 登录即可 | `tab`（**必填**）`period?` `page?` `size?` | `ProductionHomeOut` |
+| 5 | GET | `/api/v2/wx/production/page` | 登录即可 | `tab`（**必填**）`period?` `page?` `size?` | `ProductionPageOut` |
 
-- 端点 4~6 是 **B3 步的迁移对象**（→ `/api/v2/wx/production/*`），本文件在 B3 后
-  会重写对应章节；本版如实登记其现状契约。
+- **端点总数 5 条**（重构前 10 条，见 §5 的硬切表）。端点 4/5 是 B3 合并三个旧端点
+  （`/worker/stats` + `/batches/counts` + `/batches/`）的产物。
 - 全部 HTTP 端点返回统一信封 `R { code, message, data }`（`data` 成功时非 null）。
 - 端点 2/3 的 `counts`（仅端点 2 有）是**全局口径**：不带 `?status=` 过滤。
   小程序 4 个 tab 的角标是固定的，不随当前选中的 tab 变。
-- 端点 2/3 的 `?status=` 非法取值 → `AppError::validation`（**40001** / HTTP 422，
-  走 `R<T>` 信封）；`?page=abc` / `?size=abc` 由 axum `Query` 提取器拒绝，返
-  **HTTP 400 纯文本**（**不走** `R<T>` 信封）。
+  端点 4 的 `counts` 同理：**不带 `?tab=` 过滤**。
+- 端点 2/3 的 `?status=`、端点 4/5 的 `?tab=` / `?period=` 非法取值 →
+  `AppError::validation`（**40001** / HTTP 422，走 `R<T>` 信封）；
+  `?page=abc` / `?size=abc` 由 axum `Query` 提取器拒绝，返 **HTTP 400 纯文本**
+  （**不走** `R<T>` 信封）。
+- ⚠️ 端点 4/5 的 **`?tab=` 是必填字段**：缺字段是 serde 缺字段 ⇒ **HTTP 400 纯文本**
+  （body 形如 `Failed to deserialize query string: missing field 'tab'`），与
+  「传了但非法 → 422 + 40001」是**两种不同的失败**。钉死：
+  `tests/wx/production.rs::tab_is_required_and_bad_page_size_clamps`。
 - ⚠️ **端点 1 是公开路径**，加白名单必须**同步改两处**：
   `src/auth/middleware.rs::is_public_path`（免 Bearer 校验）+
   `src/middleware/idempotency.rs::is_public_idempotency_path`（不缓存响应）。
@@ -79,24 +89,23 @@ wx BFF 重构 B2 步。原先 `/api/v2/wx/*` 是 **10 个平铺文件、零 serv
 校验在 service 层显式做（**不**放 `#[serde(deserialize_with)]`）：code 不落库、
 无 schema 约束可依赖，提前拒绝比让企微返一个不可归因的 40029 更有排查价值。
 
-### 1.3 `BatchCounts` / `WxBatchSummary` / `MonthlyStats`（B3 迁移对象）
+### 1.3 ★ `ProductionQuery`（端点 4 / 5 共用）
 
-| 类型 | 字段 | 类型 | 说明 |
+| 字段 | 类型 | 必填 | 缺省 / 约束 |
 |---|---|---|---|
-| `BatchCounts` | `in_progress` / `done` | number | 当月；`done` 走 `t_part_event` 的 `DELIVERED` 事件口径 |
-| `WxBatchSummary` | `id` / `part_id` | string | 雪花 → JSON string |
-| | `serial_no` / `name` / `drawing_no` / `status` | string | 直出 `t_part` / `t_part_batch` |
-| | `batch_no` / `quantity` | number | 当前批次的 `t_part_batch` 值 |
-| | `assigned_to` | string \| null | `t_worker.name`（holder 且 `location='WORKER'`） |
-| | `work_hours` | number \| null | 该批次 `PICKED_UP + RETURNED` 事件的 SUM(quantity)（**工作量估算**，DB 无工时列） |
-| | `finished_date` / `due_date` | string \| null | `YYYY-MM-DD` |
-| | `drawing_url` | string \| null | **恒 `null`**（本仓未接文件服务；与端点 2/3 的「不出该字段」是不同处置，见 §8.2） |
-| `MonthlyStats` | `batch_count` / `work_hours` | number | 当月；`batch_count` = 有事件的不同 `batch_id` 数 |
+| `tab` | string | **是** | 白名单 `in_progress` / `done`。**缺字段 → HTTP 400 纯文本**；传了但非法 → **40001 / 422** |
+| `period` | string | 否 | 缺省 = 当前月（`chrono::Local::now() %Y-%m`）；格式恒 `YYYY-MM`（长度 7、第 5 字节 `-`、月份 `01..=12`），否则 **40001 / 422** |
+| `page` | number | 否 | 缺省 1，`max(1)`（0 与负数都归 1） |
+| `size` | number | 否 | 缺省 10，`clamp(1, 50)` |
 
-分页外壳 `WxPage<T> = { items, total, page, size, has_more }`，`has_more = total >
-page * size`。⚠️ **端点 2/3 不用这个外壳**（见 §2.5）。
+`tab` 白名单在 `production::service::tab_to_db_statuses`（私有），**刻意不用**
+`part::statemachine::PartStatus` 做校验 —— 那正是本次要消灭的跨域复用。
 
-## 2. 逐字段（端点 2 / 3）
+`resolve_period`（旧 `wx::resolve_period`，`pub(crate)`）于 2026-10-11 随 B3 搬进
+`production::service` 并**降级为私有函数**（连同它的 3 个单测）。B3 之后 wx 域只剩
+本域一个消费者，继续挂在聚合层只是徒增耦合面。
+
+## 2. 逐字段（端点 2 / 3 / 4 / 5）
 
 ### 2.1 `PartCardOut`（判别联合，`#[serde(tag = "kind")]`）
 
@@ -163,17 +172,173 @@ JSON 顶层多一个 `kind` 键，取值 `"workOrder"` 或 `"batch"`。
 
 ### 2.5 ❌ 没有 `total` / `page` / `size` 回显
 
-小程序两张页面（零件一览 / 生产）都**从未读取** `total`。故端点 2/3 的响应里
-**没有** `total`、`page`、`size` 三个字段，只回 `list` + `hasMore`。端点 5 的
-`WxPage<T>` 仍带 `total`（那套外壳本步不动，B3 迁 `production` 时再议）。
+小程序两张页面（零件一览 / 生产）都**从未读取** `total`。故端点 2/3/4/5 的响应里
+**没有** `total`、`page`、`size` 三个字段，只回 `list` + `hasMore`。
+
+⚠️ 旧 `WxPage<T> = { items, total, page, size, has_more }` 外壳（`wx/vo.rs`，B3
+随该文件一起删除）**不再被任何端点使用**。它的 3 个单测
+（`has_more_true_when_more_pages_exist` / `has_more_false_on_last_page` /
+`has_more_false_when_empty`）随之消失 —— 那三条断言的是 `has_more = total > page *
+size` 这个公式，而新算法是「取 `size + 1` 条判超」（见 §3.4），公式不再存在。
+新算法的钉死方式改成了 4 条：lib 单测 `counts_keys_stay_snake_case_tab_names` 不涉及
+它，由集成测试 `pagination_has_no_overlap_or_gap`（7 行 / size 3 → 3 页，累计 7 行、
+无重复、末页 `hasMore == false`）与端点 2/3 的同款用例共同承担。
+
+### 2.6 `ProductionHomeOut`（端点 4）
+
+**实测 wire 形态**（`worker` **未绑定**）：
+
+```json
+{
+  "code": 0,
+  "message": "ok",
+  "data": {
+    "worker": null,
+    "stats": { "batchCount": 0, "workHours": 0.0 },
+    "counts": { "in_progress": 1, "done": 1 },
+    "list": [
+      {
+        "id": "896273840442003456",
+        "serialNo": "F25226240",
+        "name": "法兰盘 DN80",
+        "code": "FL-25226240",
+        "dueDate": "2026-10-20",
+        "batchNo": 1,
+        "batchQty": 7,
+        "status": "in_progress",
+        "assignedTo": "李润",
+        "workHours": 12.0,
+        "finishedDate": null
+      }
+    ],
+    "hasMore": false
+  }
+}
+```
+
+**实测 wire 形态**（`worker` **已绑定**，与上面同一个数据集，只改了
+`t_user.worker_id`）：
+
+```json
+{
+  "code": 0,
+  "message": "ok",
+  "data": {
+    "worker": { "name": "李润", "workType": "CNC 车工", "avatar": null },
+    "stats": { "batchCount": 1, "workHours": 12.0 },
+    "counts": { "in_progress": 1, "done": 1 },
+    "list": [ /* 与上面逐字相同 */ ],
+    "hasMore": false
+  }
+}
+```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `worker` | object \| **null** | `WorkerOut`；`t_user.worker_id` 未绑定时是 `null`（见 §8.7） |
+| `stats` | object | `WorkerStatsOut`，**按绑定工人**过滤（见 §9） |
+| `counts` | object | `BatchCountsOut`，**全局口径**（不受 `?tab=` 影响） |
+| `list` | array | 当前页卡片，**至多 `size` 条** |
+| `hasMore` | boolean | 见 §3.4 |
+
+`WorkerOut`（3 字段）：
+
+| 字段 | 类型 | 来源 | 可空 |
+|---|---|---|---|
+| `name` | string | `t_worker.name` | 否 |
+| `workType` | string | `t_work_type.name`（经 `t_worker.work_type_id`） | 否（未绑定时为**空串 `""`**，见 §8.7） |
+| `avatar` | string \| null | **恒 `null`**（`t_worker` 无头像列，见 §8.7） | ✅ |
+
+`WorkerStatsOut`（2 字段）：
+
+| 字段 | 类型 | 口径 |
+|---|---|---|
+| `batchCount` | number | 该工人当月发生过事件的**不同 `batch_id`** 数 |
+| `workHours` | number | 该工人当月 `PICKED_UP + RETURNED` 事件的 `SUM(quantity)`（**工作量估算**，DB 无 `work_hours` 列） |
+
+`BatchCountsOut`（2 字段）：
+
+| 字段 | 类型 | 口径 |
+|---|---|---|
+| `in_progress` | number | 当月 `t_part_batch.status='IN_PROCESS'` **且** `updated_at` 落当月 |
+| `done` | number | 当月 `status IN ('DELIVERED','COMPLETED')` **且**存在当月 `DELIVERED` 事件 |
+
+⚠️⚠️ `counts` 的两个键**保持 snake_case**（`in_progress` / `done`），**不**转
+camelCase。它们是**前端的 tab 名**（前端 `mock/production.ts` 声明为
+`Record<BatchStatus, number>`，`BatchStatus = 'in_progress' | 'done'`），不是卡片字段
+—— 与同响应里 camelCase 的 `workHours` / `hasMore` / `batchCount` 是两类东西。
+转成 `inProgress` 会直接打断小程序角标渲染。钉死：lib 单测
+`counts_keys_stay_snake_case_tab_names`。
+
+### 2.7 `ProductionPageOut`（端点 5）
+
+**实测 wire 形态**：
+
+```json
+{
+  "code": 0,
+  "message": "ok",
+  "data": {
+    "list": [
+      {
+        "id": "896273840458780672",
+        "serialNo": "F54586368",
+        "name": "法兰盘 DN80",
+        "code": "FL-54586368",
+        "dueDate": "2026-10-20",
+        "batchNo": 2,
+        "batchQty": 4,
+        "status": "done",
+        "assignedTo": null,
+        "workHours": null,
+        "finishedDate": "2026-10-05"
+      }
+    ],
+    "hasMore": false
+  }
+}
+```
+
+与端点 4 的**唯一**结构差异：**没有** `worker` / `stats` / `counts` —— 上拉翻页不该
+每次重查 `t_user` / `t_part_event` 聚合、也不该每次重算 4 个 COUNT。
+
+`list` 与端点 4 是**同一个查询路径**（`production::service::list_cards`），故同一
+`?tab=&period=&page=&size=` 下逐字相同。
+
+### 2.8 `ProductionBatchCardOut`（端点 4 / 5 共用）
+
+逐字对齐前端 `ProductionBatchCardData extends BatchPartCard`
+（`wx-app/miniprogram/mock/production.ts`）。**恰好 11 个键**。
+
+| 字段 | 类型 | 来源 | 可空 | 口径 |
+|---|---|---|---|---|
+| `id` | string | `t_part_batch.id` | 否 | ⚠️ 是**批次** id 不是零件 id；雪花 → JSON string |
+| `serialNo` | string \| null | `t_part.serial_no` | ✅ | 手工工单为 null |
+| `name` | string | `t_part.name` | 否 | |
+| `code` | string | `t_part.drawing_no` | 否 | 前端叫 `code`，DB 叫 `drawing_no`（图号） |
+| `dueDate` | string | `t_part.planned_delivery_date` | 否 | 恒 `YYYY-MM-DD`（该列 NOT NULL） |
+| `batchNo` | number | `t_part_batch.batch_no` | 否 | **JSON number**；前端自己 `padStart(2,'0')` 补零展示 |
+| `batchQty` | number | `t_part_batch.quantity` | 否 | ⚠️⚠️ **本批次**件数，**不是**工单总件数 —— 见 §8.8 |
+| `status` | string | 折叠 | 否 | **只有 2 类**：`in_progress` / `done`（见 §3.6） |
+| `assignedTo` | string \| null | `t_worker.name` | ✅ | 批次挂在货架上（`location ≠ 'WORKER'`）时为 null |
+| `workHours` | number \| null | `SUM(quantity)` | ✅ | ⚠️ **无值是 `null` 不是 `0`** —— 见 §8.6 |
+| `finishedDate` | string \| null | `DELIVERED` 事件日 | ✅ | `YYYY-MM-DD`；从未送车过则 null |
+
+❌ **没有 `drawingUrl`**（§8.2）、❌ **没有 `part_id`**（前端声明但从不读）。
+
+⚠️ 旧 VO 的 `drawing_no` / `serial_no` / `batch_no` / `quantity` / `assigned_to` /
+`work_hours` / `finished_date` / `due_date`（snake_case）与 `part_id` / `drawing_url`
+**全部删除或改名**，见 §6.2。
 
 ## 3. 口径表
 
-### 3.1 排序
+### 3.1 排序（端点 2 / 3）
 
 `ORDER BY p.is_urgent DESC, p.planned_delivery_date ASC, p.id ASC`
 （加急 + 交期近优先）。⚠️ `is_urgent` **只参与排序、不进 VO** —— 前端按 `dueDate`
 自己在组件里算紧急度，从不读该字段。**不要**顺手把它从排序里删掉。
+
+端点 4 / 5 的排序**另有一套**，见 §3.7。
 
 ### 3.2 4 类 tab 折叠与 `?status=` 语义
 
@@ -210,7 +375,8 @@ JSON 顶层多一个 `kind` 键，取值 `"workOrder"` 或 `"batch"`。
 ### 3.4 `hasMore` 算法（★ 不多打 count 查询）
 
 取 `size + 1` 条，**超出** `size` 即 `true`。响应里没有 `total`，前端不读，
-因此**没有**为了算 `hasMore` 而额外打一条 `SELECT COUNT(*)` 的理由。
+因此**没有**为了算 `hasMore` 而额外打一条 `SELECT COUNT(*)` 的理由。端点 4/5 与
+端点 2/3 同款。
 
 `page` 缺省 1、`max(1)`；`size` 缺省 10、`clamp(1, 50)`。
 
@@ -238,14 +404,45 @@ COALESCE((
 ⇒ 该字段真的有信息量，不是恒 0。⚠️ 该子查询**只 SELECT**（与 CI 护栏
 `no_outside_file_writes_batch_status` 无关，那条只拦 `UPDATE t_part_batch SET status`）。
 
+### 3.6 ★ 2 类 `status` 折叠与 `?tab=` 语义（端点 4 / 5）
+
+| 前端传 `?tab=` | SQL 状态集 | `counts` 归桶（period 闸门） |
+|---|---|---|
+| `in_progress` | `['IN_PROCESS']` | `updated_at::text LIKE 'YYYY-MM%'` |
+| `done` | `['DELIVERED','COMPLETED']`（**两个**） | 存在当月 `DELIVERED` 事件 |
+| **缺 `?tab=`** | **HTTP 400 纯文本**（serde 缺字段） | — |
+| **其它一切值** | **40001 / HTTP 422** | — |
+
+- ⚠️ 本域的 tab 值是 `in_progress` / `done`，**与端点 2/3 的
+  `inProduction` / `pendingProduction` …不同**。跨域传 tab 名（如
+  `?tab=inProduction`）在本域是**非法**的。
+- 前端传的是**前端的 tab 值**，**不是** DB 状态值。传 DB 原值（`?tab=IN_PROCESS`）
+  是**非法**的。
+- `list` 与 `counts` 的 period 闸门**逐字一致**（本域**没有** `part_list` 那种
+  角标 / 列表口径分叉，见 §3.3 的对照）。
+- 折叠方向是过滤表的**逆映射**：`DELIVERED` / `COMPLETED` → `done`，其余 → `in_progress`。
+  lib 单测 `display_status_is_inverse_of_the_filter_table` 用一组交叉断言钉死。
+- 与 §3.2 相反，本域**没有**静默兜底偏差：能在列表里出现的 DB 状态必然落在某个 tab
+  集合内（`part_list` 的 `PROGRAMMING` / `OUTSOURCE` / `CANCELLED` 不落任何 tab，
+  所以那边需要兜底）。`_ => "in_progress"` 臂只为「将来新增 tab 时忘了改这里」兜底。
+
+### 3.7 `production` 的排序
+
+`ORDER BY b.updated_at DESC, b.id DESC`（最近变更优先，`id DESC` 兜底保证同秒变更的
+行之间顺序稳定）。逐字沿用旧实现。
+
+⚠️ 与端点 2/3 的 `ORDER BY p.is_urgent DESC, p.planned_delivery_date ASC, p.id ASC`
+（加急 + 交期近优先）是**两套不同的排序** —— 旧 `/wx/batches/` 本来就是这样，本次
+只搬不改。
+
 ## 4. 错误码
 
 | code | HTTP | 端点 | 触发条件 |
 |---|---|---|---|
 | `0` | 200 | 全部 | 成功 |
-| `40001` | 422 | 1 / 2 / 3 | `code` 为空或 > 512 字节；`?status=` 不在白名单；`?period=` 格式非法（端点 4/5/6） |
-| — | 400（纯文本） | 2 / 3 / 5 | `?page=abc` / `?size=abc`（axum `Query` 提取器层 rejection，**不走 `R<T>`**） |
-| `40100` | 401 | 2~6 | 无 / 无效 access token |
+| `40001` | 422 | 1 / 2 / 3 / 4 / 5 | `code` 为空或 > 512 字节；`?status=` 不在白名单（2/3）；`?tab=` 不在白名单（4/5）；`?period=` 格式非法（4/5） |
+| — | 400（纯文本） | 2 / 3 / 4 / 5 | `?page=abc` / `?size=abc`（axum `Query` 提取器层 rejection，**不走 `R<T>`**）；⚠️ 4/5 **缺 `?tab=`** 也是 400 纯文本（serde 缺字段），body 形如 `Failed to deserialize query string: missing field 'tab'` |
+| `40100` | 401 | 2 / 3 / 4 / 5 | 无 / 无效 access token |
 | `40101` | 401 | 1 | 绑定指向的用户已软删 / 已停用 |
 | `40106` | 401 | 1 | 企微 `40029`（code 失效）重取 token 后仍失败；或企微返回 userid 为空 |
 | `40107` | 403 | 1 | corpid 与本地配置不符（防跨企业串号）；或 userid 未在 `t_wx_identity` 预绑定 |
@@ -263,15 +460,35 @@ iam 域，经 `AccountService::resolve_wx_login_user` 开口）。
 
 | 旧 | 新 | 备注 |
 |---|---|---|
-| `POST /api/v2/wx/iam/wx-login` | `POST /api/v2/wx/login/wecom` | 公开端点；两处白名单同步改 |
-| `GET /api/v2/wx/parts/counts` | 并入 `GET /api/v2/wx/part-list` | 首屏聚合 |
-| `GET /api/v2/wx/parts/?status=&page=&size=` | `GET /api/v2/wx/part-list/page?…` | |
-| `GET /api/v2/wx/parts/by-serial/{serial_no}` | **删除** | 前端 `fetchPartBySerial` 零消费者 |
-| `GET /api/v2/wx/dashboard/home` | **删除** | 前端 `fetchHomeDashboard` 零消费者，且小程序无 dashboard 页；随该域一起消失的还有跨域复用的 `iam::vo::CurrentUserOut` |
+| `POST /api/v2/wx/iam/wx-login` | `POST /api/v2/wx/login/wecom` | 公开端点；两处白名单同步改（B2） |
+| `GET /api/v2/wx/parts/counts` | 并入 `GET /api/v2/wx/part-list` | 首屏聚合（B2） |
+| `GET /api/v2/wx/parts/?status=&page=&size=` | `GET /api/v2/wx/part-list/page?…` | （B2） |
+| `GET /api/v2/wx/parts/by-serial/{serial_no}` | **删除** | 前端 `fetchPartBySerial` 零消费者（B2） |
+| `GET /api/v2/wx/dashboard/home` | **删除** | 前端 `fetchHomeDashboard` 零消费者，且小程序无 dashboard 页；随该域一起消失的还有跨域复用的 `iam::vo::CurrentUserOut`（B2） |
+| `GET /api/v2/wx/worker/stats?period=YYYY-MM` | 并入 `GET /api/v2/wx/production` | ⚠️ **顺带修掉了恒返 0 的 bug**，见 §9（**B3**） |
+| `GET /api/v2/wx/batches/counts?period=YYYY-MM` | 并入 `GET /api/v2/wx/production` | 两个 tab 的角标一次性返回（**B3**） |
+| `GET /api/v2/wx/batches/?tab=&period=&page=&size=` | `GET /api/v2/wx/production/page?tab=&period=&page=&size=` | ⚠️ **尾斜杠去掉了**（**B3**） |
+
+**实测（2026-10-11，wire 形态逐字）**：B3 的三条旧路径与 `/wx/production/` 带尾斜杠
+形态**完全一致** —— **HTTP 404 + 空 body**（axum 默认 fallback，不走 `R<T>` 信封）：
+
+| 请求 | 实测 |
+|---|---|
+| `GET /api/v2/wx/batches/counts` | 404，body `""` |
+| `GET /api/v2/wx/batches/` | 404，body `""` |
+| `GET /api/v2/wx/worker/stats` | 404，body `""` |
+| `GET /api/v2/wx/production/` | 404，body `""` |
+| `GET /api/v2/wx/production/page/` | 404，body `""` |
+
+⚠️ **小程序侧必须同步改**：`wx-app/miniprogram/services/production.ts` 现在发的是
+`/wx/worker/stats`、`/wx/batches/counts`、`/wx/batches/`（**带**尾斜杠，见该文件
+2026-09-28 注释），三个都要换成 `/wx/production?tab=…&period=…` 与
+`/wx/production/page?tab=…&period=…&page=…&size=…`（**无**尾斜杠），并把
+snake_case 的响应字段映射改成直接吃 camelCase。
 
 ### 5.1 ⚠️ 尾斜杠（2026-10-11 实测钉死）
 
-**实测结论**：本仓 axum 版本下，`nest("/part-list")` + 内层 `route("/")` **只匹配
+**实测结论**：本仓 axum 版本下，`nest("<prefix>")` + 内层 `route("/")` **只匹配
 无尾斜杠**的路径。
 
 | 请求 | 实测 |
@@ -280,15 +497,22 @@ iam 域，经 `AccountService::resolve_wx_login_user` 开口）。
 | `GET /api/v2/wx/part-list/` | **404**，axum 默认 fallback，**空 body**（不走 `R<T>` 信封） |
 | `GET /api/v2/wx/part-list/page` | **200**，走 `handler::page` |
 | `GET /api/v2/wx/part-list/page/` | **404**（同上） |
+| `GET /api/v2/wx/production` | **200**，走 `handler::home` |
+| `GET /api/v2/wx/production/` | **404 空 body**（同上） |
+| `GET /api/v2/wx/production/page` | **200**，走 `handler::page` |
+| `GET /api/v2/wx/production/page/` | **404 空 body**（同上） |
 
-小程序侧曾按**相反**的假设发请求并踩过 404（旧 `/wx/parts/?…` 同因）。
-**新契约全部无尾斜杠。** 回归：`tests/wx/part_list.rs::trailing_slash_form_is_pinned`
-（把四种形态全钉死，防 axum 升级 / nest 改写后行为漂移）。
+小程序侧曾按**相反**的假设发请求并踩过 404（旧 `/wx/parts/?…`、旧 `/wx/batches/?…`
+同因）。**新契约全部无尾斜杠。** 回归：`tests/wx/part_list.rs::trailing_slash_form_is_pinned`
+与 `tests/wx/production.rs::trailing_slash_form_is_pinned`（各把四种形态全钉死，
+防 axum 升级 / nest 改写后行为漂移）。
 
 ### 5.2 路由顺序硬约束
 
-`part_list::handler::router()` 里 `.route("/page", …)` **必须先于** `.route("/", …)`
-注册（matchit 静态段优先于兜底）。顺序反了静态路径会被兜底路由抢走。
+`part_list::handler::router()` 与 `production::handler::router()` 里
+`.route("/page", …)` **必须先于** `.route("/", …)` 注册（matchit 静态段优先于兜底）。
+顺序反了静态路径会被兜底路由抢走。`wx/mod.rs` 顶层三个 nest 的段名互不相同、
+无 catch-all，顶层顺序无硬约束。
 
 ## 6. 移除记录
 
@@ -315,37 +539,59 @@ iam 域，经 `AccountService::resolve_wx_login_user` 开口）。
 | SQL 里 3 条 LEFT JOIN（`t_shelf` / `t_worker` / `t_outsource_company`）+ `COALESCE(sh.code, w.name, oc.name)` | 只为 `current_holder_label` 而存在 |
 | `repo::DailyEventCounts` | 唯一消费者是已删除的 `/wx/dashboard/home` |
 
-### 6.2 待 B3 处理
+### 6.2 2026-10-11（B3）
 
-| 项 | 说明 |
+| 被移除项 | 原因 |
 |---|---|
-| `/wx/batches/*` + `/wx/worker/stats` → `/wx/production/*` | B3 步的 URL 硬切；本步刻意保留，线上不断 |
-| `wx/repo.rs` + `wx/vo.rs` 剩余内容 → `production/repo.rs` + `production/vo.rs` | 这两个文件本步被裁到只剩 batch / worker（part 相关已搬进 `part_list/`），B3 整体搬走后删除 |
+| `GET /wx/worker/stats` 端点 | 并入首屏聚合端点 `GET /wx/production`（少 2 次 HTTP；且顺带修掉恒返 0 的 bug） |
+| `GET /wx/batches/counts` 端点 | 并入 `GET /wx/production` |
+| `GET /wx/batches/` 端点 | 迁到 `/wx/production/page` |
+| `src/modules/wx/batches.rs` / `worker.rs` | 搬进 `production/{handler,service}.rs` 后删除 |
+| `src/modules/wx/repo.rs` / `vo.rs` | 搬进 `production/{repo,model,vo}.rs` 后删除（B2 已把 part 相关搬进 `part_list/`，B3 把剩下的搬完） |
+| `wx::resolve_period`（`pub(crate)`，带 3 个单测） | 降级为 `production::service::resolve_period`（私有，3 个单测同搬）；B3 之后 wx 域只剩本域一个消费者 |
+| `repo::BatchList::count` | `hasMore` 改「取 `size + 1` 条」判定，前端不读 `total` ⇒ 少一次 COUNT |
+| `repo::BatchList::list` / `repo::BatchCountsAgg::by_period` 的两份重复 WHERE | 合成 `repo.rs` 的 4 个 SQL 常量（`SELECT_COLS` / `FROM_SQL` / `WHERE_CLAUSE` / `ORDER_BY_CLAUSE`），`count` 直接删除 |
+| VO 字段 `part_id` | 前端 `ProductionBatchCardData` 声明了但**从不读取**（小程序无「跳零件详情」跳转） |
+| VO 字段 `drawing_url`（**恒 `null` 的占位**） | `t_part` 无图纸列，后端无数据源；与端点 2/3 的「不出该字段」**统一处置**，见 §8.2 |
+| VO `WxPage<T>`（`items` / `total` / `page` / `size` / `has_more`）+ 3 个单测 | 前端从不读 `total` / `page` / `size`；改为只回 `list` + `hasMore`，与端点 2/3 同款 |
+| VO `BatchStatus`（`type = String`） | 无消费方：`list[].status` 只可能是 `in_progress` / `done` 两个字面量，折叠逻辑在 service 层 |
+| 卡片字段 `drawing_no`（snake_case） | 逐字对齐前端 → 改名 `code` |
+| 卡片字段 `serial_no` / `batch_no` / `quantity` / `assigned_to` / `work_hours` / `finished_date` / `due_date`（snake_case） | 同上 → `serialNo` / `batchNo` / `batchQty` / `assignedTo` / `workHours` / `finishedDate` / `dueDate`（camelCase） |
+| VO `BatchCounts` / `MonthlyStats` / `WxBatchSummary` | 被 `production::vo::{BatchCountsOut, WorkerStatsOut, ProductionBatchCardOut}` 取代 |
 
 ## 7. 表依赖
 
 | 表 | 用途 | 端点 |
 |---|---|---|
-| `t_part` | 卡片主体（12 列投影） | 2 / 3 |
-| `t_part_batch` | ① 当前活跃批次的 `batch_no`（`LEFT JOIN LATERAL`）② `deliveredQty` 子查询 | 2 / 3 |
+| `t_part` | 卡片主体（`serial_no` / `name` / `drawing_no` / `planned_delivery_date`） | 2 / 3 / 4 / 5 |
+| `t_part_batch` | ① 端点 2/3：当前活跃批次的 `batch_no`（`LEFT JOIN LATERAL`）+ `deliveredQty` 子查询 ② 端点 4/5：卡片主体（`batch_no` / `quantity` / `status` / `location` / `current_holder_id`）+ `in_progress` 角标 | 2 / 3 / 4 / 5 |
 | `t_customer` | `customer` 字段（`LEFT JOIN`） | 2 / 3 |
-| `t_part_event` | 批次 `finished_date` / `work_hours` / 工人工作量 | 4 / 5 / 6 |
-| `t_worker` | `assigned_to`（`LEFT JOIN`） | 5 |
+| `t_part_event` | `finished_date` / `work_hours` / `done` 角标（端点 4/5）；端点 2/3 的 `deliveredQty` 间接来源 | 4 / 5 |
+| `t_worker` | ① 端点 4/5：`assignedTo`（`LEFT JOIN … AND location='WORKER'`）② 端点 4/5：`worker.name` + `worker.work_type_id` | 4 / 5 |
+| `t_work_type` | `worker.workType`（`LEFT JOIN … AND deleted_at IS NULL`） | 4 |
+| `t_user` | `worker_id`（解 `CurrentUser.id → t_worker.id` 的唯一一跳，见 §9） | 4 |
 
 **wx 域对以下表零 SQL**（跨域只读 / 开口消费）：
 
 | 表 | 归属域 | 开口 |
 |---|---|---|
 | `t_wx_identity` | iam | `AccountService::resolve_wx_login_user` |
-| `t_user` / `t_user_role` / `t_menu` / `t_role_menu` | iam | `AccountService` / `SessionService` |
+| `t_user_role` / `t_menu` / `t_role_menu` | iam | `AccountService` / `SessionService` |
 | `t_shelf` | iam / shelf | `SessionService`（`shelf_ids`，仅 Web 端权限模型用） |
+
+⚠️ **`t_user` 是唯一的例外**（B3 起）：`production` 域**在本域 SQL 里只读**
+`t_user.worker_id` 一列。这符合本仓既定 pattern（`statistics` / `admin` /
+`dashboard` 都在本域 SQL 里只读聚合），**不是**跨域 import —— 护栏
+`production::production_domain_depends_on_no_other_domain` 钉死「代码区零他域
+import」。⚠️ `t_user` 其余列（用户名 / 角色 / session）的 SQL 真源仍属 iam 域，
+本域**不碰**。
 
 依赖方向单向：`wx → 他域`。**禁止**反向 import `modules::wx::*`。唯一跨域类型是
 `state.wecom: Arc<dyn WeComApiClient>`（由 `AppState` 持有，不属于 wx 域私有类型）。
 
 ## 8. 已知偏差登记
 
-### 8.1 ★ 4 类 `status` 折叠有静默兜底（`counts` 与 `list` 的归属不完全对齐）
+### 8.1 ★ 4 类 `status` 折叠有静默兜底（`part_list`，端点 2/3）
 
 | 项 | 内容 |
 |---|---|
@@ -355,14 +601,17 @@ iam 域，经 `AccountService::resolve_wx_login_user` 开口）。
 | 处置 | **静默兜底，产品不决议**。前端可自行处理：4 类折叠是**展示口径**，不是完整的生产阶段机。要消除只能给前端加第 5 个 tab（产品决议，不在本轮范围） |
 | 钉死 | lib 单测 `display_status_silently_falls_back_to_pending_production`；文档两处（本文 §8.1 + `part_list::vo` 模块 doc） |
 
+⚠️ **`production` 域（端点 4/5）没有这个偏差**：2 个 tab 与过滤集一一对应，不存在
+「只计入 counts 却不在任何 tab 里」的状态。见 §3.6。
+
 ### 8.2 `drawingUrl` 有意缺字段
 
 | 项 | 内容 |
 |---|---|
-| 偏差 | 前端 `BasePartCard` 有 `drawingUrl`，端点 2/3 **不产出该字段** |
+| 偏差 | 前端 `BasePartCard` 有 `drawingUrl`，端点 2/3/4/5 **都不产出该字段** |
 | 原因 | `t_part` **无图纸列**，后端没有可信数据源。**刻意不加恒 `null` 的占位字段**（那只会让前端多一条永假的分支） |
 | 处置 | 小程序侧在自己的映射层用 `/asset/drawing/{code}.png` 本地兜底。等 COS 文件服务接入后**单独 PR** 补 |
-| ⚠️ 对照 | 端点 5 的 `WxBatchSummary.drawing_url` 是**恒 `null` 的占位字段**（历史形态，本步未动）。两处处置不同：B3 迁 `production` 时请统一 |
+| ⚠️ B3 前的对照 | 旧 `WxBatchSummary.drawing_url` 是**恒 `null` 的占位字段**（旧 `repo.rs` 里 `drawing_url: None, // 本 PR 不拉图`）。B3 已把它**连同占位一起删掉**，与端点 2/3 的处置统一 |
 
 ### 8.3 旧路径 404 无 alias
 
@@ -375,6 +624,114 @@ iam 域，经 `AccountService::resolve_wx_login_user` 开口）。
 
 ### 8.5 `counts` 是全局口径，与 `list` 的过滤条件独立
 
-`?status=delivered` 时：`counts` 仍是全部 5 个 tab 的数字（固定不变），只有 `list`
-被过滤。这是**设计如此**（小程序 4 个 tab 的角标固定），不是 bug。若把过滤套到
-counts 上，切 tab 时角标会集体塌成 0。
+`?status=delivered`（端点 2/3）/ `?tab=done`（端点 4/5）时：`counts` 仍是全部
+tab 的数字（固定不变），只有 `list` 被过滤。这是**设计如此**（小程序 tab 角标固定），
+不是 bug。若把过滤套到 counts 上，切 tab 时角标会集体塌成 0。
+
+### 8.6 ★ `workHours` 无值时是 `null`，不是 `0`（B3 的行为变更）
+
+| 项 | 内容 |
+|---|---|
+| 旧行为 | `repo::BatchList::list` 的子查询写的是 `COALESCE(SUM(quantity), 0)::float8` ⇒ **本月零事件的批次拿到 `0`** |
+| 新行为 | 去掉 `COALESCE`：`SUM(quantity)::float8` 在无匹配行时是 NULL ⇒ VO 里是 `null` |
+| 为什么改 | 前端 `<part-card>` 用 `wx:if="{{item.workHours != null}}"` 守门决定是否渲染工时行；给 `0` 会把「本月没干过活」渲染成「干了 0 小时」 |
+| 影响面 | 只影响**响应值**，不影响 `counts`（角标走另外两条 SQL，与此无关） |
+| 钉死 | lib 单测 `null_fields_serialize_as_null_not_zero` / `row_projection_keeps_missing_work_hours_as_null`；集成测试 `missing_work_hours_and_finished_date_are_null` |
+
+### 8.7 ★ 恒缺 / 可空字段登记（`production` 域）
+
+| 字段 | 形态 | 为什么 | 前端怎么活下来 |
+|---|---|---|---|
+| `worker` | `object \| null` | `t_user.worker_id IS NULL`（非工人账号 / 未绑定 / 指向已软删工人） | `production-stats.ts` 的 observer 写 `worker?.avatar \|\| ''`；模板直接 `{{worker.workType}}` 渲染，`null` 会在模板里被 `?.` / 默认值挡住 |
+| `worker.avatar` | **恒 `null`** | `t_worker` **无头像列** | 组件 `wx:if="{{avatarSrc}}"` 为假 ⇒ 渲染 `t-icon` 用户占位。等头像服务接入后单独 PR 补。**刻意保留字段而不是删掉**（前端已声明并读取它） |
+| `worker.workType` | `string`，未绑定工种 / 工种已软删时是**空串 `""`** | `t_worker.work_type_id IS NULL` 或 `t_work_type` 行已软删 | 模板直接 `{{worker.workType}}`：空串渲染成空白，`null` 反而会渲染成字面量 `null`。且前端 `WorkerInfo.workType` 的 TS 类型是 `string`（非可选），空串不破坏类型 |
+| `stats` | **不区分**「未绑定」与「已绑定但当月零工作量」 | 两者都是零值 | 判别标志是 `worker` 是否为 `null`。⚠️ 若将来要区分，得在 `t_user` 上再加一个「已绑定」标记位，本轮不做 |
+| `card.workHours` / `card.finishedDate` | `number \| null` / `string \| null` | 无事件 | `wx:if="{{item.workHours != null}}"` 守门，见 §8.6 |
+| `card.assignedTo` | `string \| null` | 批次挂在货架上（`location ≠ 'WORKER'`） | 卡片可空渲染 |
+
+⚠️ **B1 没有回填 `t_user.worker_id`**：回填脚本
+`scripts/sql/20261011_backfill_t_user_worker_id.sql` 需人工确认后手工执行。在那之前
+**绝大多数账号**（admin / 系统管理员 / `hmi-*` 等非工人账号）都会命中「未绑定」分支，
+表现为 `worker: null` + 零值 `stats` + **HTTP 200**。
+
+### 8.8 ⚠️⚠️ 口径陷阱：`production` 的 `batchQty` ≠ `part_list` 的 `batchQty`
+
+| 端点 | 字段 | 取值 | 语义 |
+|---|---|---|---|
+| 4 / 5（`production`） | `batchQty` | `t_part_batch.quantity` | **本批次**件数 |
+| 2 / 3（`part_list`，`kind=batch`） | `batchQty` | `t_part.quantity` | **工单总**件数 |
+
+**两个字段同名、不同义。** 这是**既有行为的延续**（旧 `/wx/batches/` 与旧
+`/wx/parts/` 本来就是两套口径），本次**刻意不改**：统一它需要产品先回答「批次卡片上
+该显示本批件数还是工单总件数」，那是产品决议不是后端重构的顺带事项。
+
+⚠️ 后人**不要**「顺手统一」—— 会静默改变其中一端小程序卡片的显示值。登记在此以免
+被当成写错了。
+
+### 8.9 `production` 的排序与 `part_list` 不同
+
+端点 4/5 是 `ORDER BY b.updated_at DESC, b.id DESC`（最近变更优先）；
+端点 2/3 是 `ORDER BY p.is_urgent DESC, p.planned_delivery_date ASC, p.id ASC`
+（加急 + 交期近优先）。**两套排序各自沿用旧实现**，B3 只搬不改。见 §3.7。
+
+## 9. ★ `worker` / `stats` 的数据源（2026-10-11 B3 修掉的既有 bug）
+
+### 9.1 旧实现为什么恒返 0
+
+旧 `GET /api/v2/wx/worker/stats` 的 repo 方法签名是
+`WorkerStats::by_user_period(executor, user_id, period)`，SQL 是
+`WHERE worker_id = $1`，而 handler 传的是 `CurrentUser.id` —— **那是 `t_user.id`**。
+但 `t_part_event.worker_id` 的语义是 **`t_worker.id`**，两表之间**没有任何映射**，
+只是「碰巧共用同一个雪花 ID 空间」（migration 071 起的统一雪花）。
+
+**实测证据**：dev 库 5750 条 `t_part_event` 的 13 个 `worker_id` **全部只命中
+`t_worker`、零命中 `t_user`**。⇒ 该端点对任何真实用户**恒返 `batch_count: 0`**。
+
+旧 `worker.rs` 的注释把这一点写成「如果发现 worker 表的 worker_id 是 user 表的
+子集 / 独立空间，这里需要调整」——事实上它**已经是**独立空间。
+
+### 9.2 修复后的链路
+
+```text
+CurrentUser.id (t_user.id)
+  → t_user.worker_id        ← B1（migration 20261011120000_001）新增的列（无物理 FK）
+  → t_worker.id            ← stats 查询的过滤锚点
+  → t_work_type.name       ← worker.workType 的来源（LEFT JOIN + deleted_at IS NULL）
+```
+
+为什么新增列而不是在查询里现推：`t_user.username = t_worker.badge_code` 这种推断
+在真实数据上已被证伪（`13350114794` 的工人工牌是 `13359114794`，号段笔误；另有工人
+在 `t_worker` 里查无此人）。绑定关系是**业务事实**，必须由人确认后落库。
+
+### 9.3 「未绑定」的判定与形态
+
+`production::repo::find_worker_by_user` 返回 `None`（⇒ `worker: null` + 零值
+`stats`，**HTTP 仍 200**）的情形：
+
+| 情形 | SQL 判据 |
+|---|---|
+| `t_user.worker_id IS NULL` | `AND u.worker_id IS NOT NULL`（绝大多数账号） |
+| `worker_id` 指向的工人行不存在 | `JOIN t_worker w ON w.id = u.worker_id`（仓库**无物理 FK**，允许悬挂） |
+| 工人行已软删 | `AND w.deleted_at IS NULL` |
+
+`worker` 是 `Option` 而非「永远有值」：绝大多数系统账号本来就没有对应工人，把它做成
+401/403 会让非工人账号**连批次列表都看不了**，而列表与工人身份无关。
+
+### 9.4 `stats` 的口径
+
+| 字段 | SQL |
+|---|---|
+| `batchCount` | `COUNT(DISTINCT batch_id) FILTER (WHERE batch_id IS NOT NULL)`，限该工人 + 当月 `created_at` |
+| `workHours` | `COALESCE(SUM(quantity) FILTER (WHERE event_type IN ('PICKED_UP','RETURNED')), 0)`，限该工人 + 当月 `created_at` |
+
+⚠️ `workHours` 是**工作量估算**（DB schema 无 `work_hours` 列），用「加工件数」顶替
+—— 与 `statistics` 域的同形口径一致。
+
+### 9.5 回归测试
+
+| 测试 | 钉住什么 |
+|---|---|
+| `tests/wx/production.rs::stats_are_filtered_by_the_logged_in_users_worker` | ★ **核心回归**：两个工人各有当月事件（甲 2 批 × 10 件、另加 1 条 `quantity IS NULL` 事件 + 1 条上月事件；乙 3 批 × 100 件），账号绑甲 ⇒ 只统计甲；再把绑定切到乙 ⇒ 只统计乙。旧实现会返 0，漏过滤会返全表量 |
+| `tests/wx/production.rs::bound_worker_exposes_name_work_type_and_nonzero_stats` | 已绑定 ⇒ `name` / `workType` / `avatar: null` / `batchCount > 0`；未分配工种 / 工种软删 ⇒ `workType == ""`；绑到已软删工人 ⇒ 收敛成 `worker: null` |
+| `tests/wx/production.rs::unbound_worker_yields_null_worker_and_zero_stats` | 未绑定 ⇒ `worker: null` + 零值 stats + **HTTP 200**，且列表数据不受影响 |
+| `src/modules/wx/production/mod.rs::production_domain_depends_on_no_other_domain` | 本域**零他域 import**（`t_user` / `t_worker` / `t_work_type` 只能在本域 SQL 里只读聚合） |
