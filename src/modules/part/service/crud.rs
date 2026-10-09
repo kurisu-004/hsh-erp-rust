@@ -524,10 +524,14 @@ impl PartService {
                     drawing_no: req.drawing_no.as_deref(),
                     applicant_name: req.applicant_name.as_deref(),
                     quantity: req.quantity,
-                    order_no: req.order_no.as_deref(),
+                    // 2026-10-10：三态透传（缺省 / 显式 null / 设值）。不能直接写
+                    // `req.order_no.as_deref()` —— 那是 `Option<Option<&str>>`，
+                    // 需要 `.as_ref().map(|v| v.as_deref())` 把内层 `Option<String>`
+                    // 借成 `Option<&str>` 而**保住外层态**。
+                    order_no: req.order_no.as_ref().map(|v| v.as_deref()),
                     system_delivery_date: req.system_delivery_date,
                     planned_delivery_date: req.planned_delivery_date,
-                    note: req.note.as_deref(),
+                    note: req.note.as_ref().map(|v| v.as_deref()),
                     is_urgent: req.is_urgent,
                     unit_price: req.unit_price,
                     total_price: req.total_price,
