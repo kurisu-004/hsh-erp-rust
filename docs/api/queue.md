@@ -234,7 +234,7 @@ part 级行无从推导（没有 `#[serde(default)]`，漏赋值会编译失败�
 - 链首解析带**锚链软删闸门**（`ProcessChainRepo::first_step_in_chain` JOIN `t_part_process_chain` 且 `pc.deleted_at IS NULL`），与读侧 `resolve_chain_position` 的锚链 JOIN 同口径。
 - **锚链已软删**（`t_part.process_chain_id` 仍指向已删链，链内 step 未随链软删）**或**链行活跃但**链内一个未软删 step 都没有**（已清空）→ `20702 BIZ_PROCESS_CHAIN_STEP_NOT_FOUND`（HTTP 404），批次保持 `PENDING` 不被写脏，`current_process_id` / `current_process_step_id` 都不落。不新造错误码：`20702` 原语义是「链内找不到某工序」，本处是「链内一道都没有」，两者都指向同一个动作 —— 去修链。
 - `shared::batch::status::BATCH_STATUS_UPDATE_SQL` 的 `current_process_step_id = CASE WHEN $14 THEN NULL ELSE COALESCE($6::bigint, current_process_step_id) END` 早已支持两种写法，dispatch 侧只改传参（`new_process_step_id` / `clear_process_step_id`），**SQL 文本逐字未动**。`clear_process_step_id` 与 `new_process_step_id.is_none()` 配对：有链写链首 step（`false`）、无链清 step（`true`，与本口径改动前逐字一致）。无链侧不采用「保留原值」写法 —— 那需要论证「无链批次的 step 恒为 NULL」这条**无任何约束保证**的不变式（`allowed_from` 之外的旁路写点、手工 SQL、历史脏数据都能破坏它）。
-- 出参 `DispatchSuccessItem.current_process_step_id` 由「恒 `null`」改为**真实写入值**（JSON number，不带字符串化器，与同 VO 的 `batch_id` 等不同）。
+- 出参 `DispatchSuccessItem.current_process_step_id` 由「恒 `null`」改为**真实写入值**（JSON **字符串**，走 `serialize_i64_opt`，与同 VO 的 `batch_id` 等同形态；`None` → `null`）。⚠️ 不能落成 JSON number：step id 是雪花 id（量级 8.7×10¹⁷），远超 JS 的 `Number.MAX_SAFE_INTEGER`（2^53 ≈ 9.007×10¹⁵），number 进 JS 会被舍入。
 
 ## 4. 口径表
 
