@@ -47,10 +47,12 @@ use sqlx::PgConnection;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepo;
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
 use crate::shared::error::{AppError, code};
+// 2026-10-12：`t_part_event` 的写侧自 part 域的事件 INSERT 上提到
+// `shared::part_event`（该表由 7 个模块写、无域归属）。
+use crate::shared::part_event::{NewPartEvent, insert};
 
 use super::queue::QueueService;
 use crate::modules::prod::queue::repo::dispatch::{PendingBatchRow, QueueDispatchRepo};
@@ -121,7 +123,7 @@ impl QueueService {
     ///    故 `None` 含「有映射但货架全不可用 / 不在当前账号 scope 内」，仍复用 20508
     ///    不新造码
     /// 6. `update_batch_dispatched`（OCC）→ 0 行 → `VERSION_CONFLICT` 抛错
-    /// 7. `PartRepo::insert_part_event('PLACED_ON_SHELF')`
+    /// 7. `shared::part_event::insert('PLACED_ON_SHELF')`
     ///
     /// 当前实现：保留原 bulk_dispatch 「任一失败 → 全回滚」语义。
     /// `succeeded` / `failed` 数组实际只在全部成功时填 succeeded；失败路径
@@ -295,7 +297,7 @@ impl QueueService {
                 )
             })?;
         let event_id = snowflake.next_id();
-        PartRepo::insert_part_event(
+        insert(
             &mut *conn,
             NewPartEvent {
                 id: event_id,
@@ -309,6 +311,9 @@ impl QueueService {
                 quantity: Some(quantity),
                 drawing_code: Some(&part.drawing_no),
                 badge_code: None,
+                // 2026-10-12：管理员/系统下发，无作业工人、无批次工序上下文。
+                worker_id: None,
+                process_id: None,
                 note,
                 created_by: Some(current.id),
             },

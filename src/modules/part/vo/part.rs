@@ -442,11 +442,18 @@ pub struct PartListOut {
 /// `LEFT JOIN t_part_batch` / `t_worker` / `t_user`（`operator_*` 取
 /// `u.full_name` / `u.username`；库中不存在 `display_name` 列）。
 ///
+/// 2026-10-12 再新增 2 字段（`process_id` / `process_name`，共 17 字段）：事件
+/// 发生时批次所处的工序，读列来自新增的 `t_part_event.process_id`
+/// （migration `20261011130000_009_add_part_event_process_id.sql`，**加列后不回填**）
+/// 与 `LEFT JOIN t_process`。写侧自 2026-10-12 起在 `prod::scan` 的 5 个构造点填
+/// `process_id` ⇒ **只有 2026-10-12 之后由报工台产生的作业类事件**两字段有值，
+/// 历史事件与工单级 / 批次级流转事件恒 `None`。
+///
 /// ⚠️ 本 struct 上的 `#[serde(default)]` 是**空操作**：`default` 只对
 /// `Deserialize` 生效，而这里只 `derive(Serialize)`（既有字段早于 2026-10-10 就
-/// 带着它，新增 4 字段沿用同一写法）。读它的人别以为「缺字段会自动补 None」——
+/// 带着它，后续新增字段沿用同一写法）。读它的人别以为「缺字段会自动补 None」——
 /// 出参的字段有无完全由 mapper 决定。要清掉的话是**整 struct 一次清干净**，
-/// 不要只删新增字段（那会让同一 struct 里 8 个有、4 个无，比现状更难读）。
+/// 不要只删某次新增的字段（那会让同一 struct 里一部分有、一部分无，比现状更难读）。
 #[derive(Debug, Clone, Serialize)]
 pub struct PartEventOut {
     #[serde(serialize_with = "serialize_i64")]
@@ -475,9 +482,13 @@ pub struct PartEventOut {
     /// 与 `PartBatchListItemOut::batch_no` 的口径也会不一致）。
     #[serde(default)]
     pub batch_no: Option<i32>,
-    /// 2026-10-10 新增：工人姓名（`t_worker.name`）。**只能救回历史数据** ——
-    /// 当前 Rust 的 INSERT 不写 `worker_id`，只有 2026-07~09 的 Python 时代事件
-    /// 有值。对新事件恒 `None`，属已知取舍（读侧补列，不动写侧）。
+    /// 2026-10-10 新增：工人姓名（`t_worker.name`）。
+    /// **2026-10-12 之前的事件恒 `None`** —— 那是写侧从不填 `worker_id` 造成的
+    /// （该列在 Python v1 退役后一直是 NULL，`LEFT JOIN t_worker w` 必然落空），
+    /// 不是读侧没补列。2026-10-12 起写侧在 7 个事件构造点填 `worker_id`
+    /// （逐点依据见 `crate::shared::part_event` 的模块 doc）⇒ **本字段对新事件
+    /// 才有值**；其余写点（批次级 / 工单级流转、外协、装配、序列号归档 …）写的
+    /// 事件上，它仍是 `None`。
     #[serde(default)]
     pub worker_name: Option<String>,
     /// 2026-10-10 新增：操作者姓名（`t_user.full_name`）。
@@ -496,6 +507,23 @@ pub struct PartEventOut {
     /// 同源，姓名重名时用它区分。
     #[serde(default)]
     pub operator_username: Option<String>,
+    /// 2026-10-12 新增：事件发生时批次所处的工序（`t_part_event.process_id`，
+    /// 逻辑指向 `t_process.id`）。**2026-10-12 之前的事件恒 `None`** —— 该列由
+    /// migration `20261011130000_009_add_part_event_process_id.sql` 新加、
+    /// **不回填**；2026-10-12 起写侧在 `prod::scan` 的 5 个构造点填它（取事件时刻
+    /// 的批次工序快照），其余写点一律 `NULL`。
+    ///
+    /// **JSON string 而非 number**（雪花 ID 精度，见 `serialize_i64_opt`）。
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub process_id: Option<i64>,
+    /// 2026-10-12 新增：工序名（`t_process.name`，经 `LEFT JOIN t_process`）。
+    /// 与 `process_id` 同时为空 —— 无名有**两种**，别混成一个占位文案：`process_id`
+    /// 为 `None` = 「这条事件没记工序」（历史事件 + 非作业类写点），
+    /// `process_name` 为 `None` = 「记了工序 id 但取不到名」（工序行物理缺失）。
+    /// ⚠️ 工序**软删不影响显名**（SQL 刻意不过滤 `t_process.deleted_at`）；但
+    /// **改名会显新名** —— `t_part_event` 只快照 `process_id`、不快照工序名。
+    #[serde(default)]
+    pub process_name: Option<String>,
 }
 
 /// `GET /parts/{id}/batches` 出参：工单全部活跃批次 + holder 名称解析。

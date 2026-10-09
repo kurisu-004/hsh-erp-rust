@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-> 📌 **前端对接**：后端 API 参考见 [`docs/api/`](docs/api/)。**2026-10-11 现状**：`docs/api/` 有 11 份文件，每份是一个域的**整域契约**（端点表 / 逐字段 / 口径表 / 错误码 / 移除记录 / WS 关系 / 表依赖与前端配套 / 已知偏差登记），范本是 [`dashboard.md`](docs/api/dashboard.md) 的八节骨架：
+> 📌 **前端对接**：后端 API 参考见 [`docs/api/`](docs/api/)。**2026-10-12 现状**：`docs/api/` 有 12 份文件，每份是一个域的**整域契约**（端点表 / 逐字段 / 口径表 / 错误码 / 移除记录 / WS 关系 / 表依赖与前端配套 / 已知偏差登记），范本是 [`dashboard.md`](docs/api/dashboard.md) 的八节骨架：
 > - [`docs/api/dashboard.md`](docs/api/dashboard.md) —— 大屏聚合域（3 个只读 HTTP 端点 + WS 首帧 / 增量；`DELIVERY_STATUSES` 四处共用、行单位、装配件整套交付不变式、`ts` 格式、前端配套清单）
 > - [`docs/api/programming.md`](docs/api/programming.md) —— `prod::programming` 待编程一览（part 状态闸门 + 三规则并集、part 级去重、批次锚点、排序白名单大小写不对称）
 > - [`docs/api/inspection.md`](docs/api/inspection.md) —— `prod::inspection` 待品检（队列列表 + 扫码三层树、`l1_customer_name` 与返修侧有意分叉、域隔离漏报盲区）
@@ -14,6 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 > - [`docs/api/shelves.md`](docs/api/shelves.md) —— **iam 域下的货架子模块**（2026-10-10 自独立 shelf 域迁入 iam，URL 硬切 `/api/v2/shelves/*` → `/api/v2/iam/shelves/*`、旧前缀 404；5 端点、`t_shelf.capacity` 负载上限 + `ShelfOut.current_load` 出参、自动选架算法与 `shelf_scope_for` 三分支、picker 两端点移除记录）
 > - [`docs/api/iam.md`](docs/api/iam.md) —— `iam` 认证 + 账号 + 货架子模块域（**22 端点** = session 5 + users 12 + shelves 5；4 条破坏性变更（`DELETE wx-bind` → `POST .../unbind`、`GET wx-bind` 返 `Option`、bind 删 `corp_id`、4 端点 body 必填 `version`）、`t_wx_identity` 的双向一对一与 TOCTOU 偏差、`uk_t_user_role_user_role_scope` **非 partial**、角色/scope 变更滞后一个 session TTL）
 > - [`docs/api/wx.md`](docs/api/wx.md) —— `wx` 微信小程序 BFF 域（**2026-10-11 新建**；按小程序页面切子模块：`login/` + `part_list/`；URL 硬切无 alias 5 条（`/wx/iam/wx-login` → `/wx/login/wecom`、`/wx/parts/*` → `/wx/part-list/*`、`/wx/dashboard/home` 删除）、VO 逐字对齐前端卡片模型改 camelCase、`deliveredQty` 真值、尾斜杠 404 实测钉死、★ 2026-10-12 `part_list` 接上日期 + 7 类 tab 双维筛选（`?date=` 打 `system_delivery_date`、`all` 不再是「不过滤」））
+> - [`docs/api/statistics.md`](docs/api/statistics.md) —— `statistics` 生产统计域（**2026-10-12 新建**；3 个 MANAGER-only 只读端点、有效工时口径表、链外工序计 0、`LEFT JOIN LATERAL … LIMIT 1` 的去重理由与「数据覆盖受工序链配置率限制」的登记）
 >
 > **其它域的契约在代码注释里**（各域 `mod.rs` / `repo.rs` / `vo` / `dto` 的模块 doc 与逐字段 doc），本仓的目录约定见本文件「`docs/api/` 目录约定」一节。⚠️ **引用不存在的文档路径是禁止的** —— 后端代码变更（新增 / 修改 / 删除端点，或修改 DTO 字段 / 错误码）必须同步更新对应域的 `docs/api/` 文件（若该域有）与代码注释。
 
@@ -207,6 +208,100 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 - ⚠️ 与 `statistics::repo::sql::count_overdue_undelivered` **有意分叉**（planned 口径 + DELIVERED 事件兜底，服务生产统计页）——不要动它。⚠️ 那是**另一份 SQL**；dashboard 自己这份是 system 口径 + 已交量守卫，两者分叉点只在「交期列 + 事件兜底」两处。
 - 完整契约（含每字段 SQL 来源、移除记录、WS 事件集、前端配套改动清单、已知偏差登记）见 [`docs/api/dashboard.md`](docs/api/dashboard.md)。
 
+### `src/modules/statistics/` 域（生产统计，只读报表，MANAGER-only，3 个端点）
+
+| 端点 | 权限 | 说明 |
+|---|---|---|
+| `GET /api/v2/statistics/overview` | **Manager 独占** | 生产概览：`created_count` / `completed_count` / `in_process_count` / 交付三分类 / 每日新建与完成（零填充）/ 状态分布；入参 `date_from` + `date_to`（**必填**） |
+| `GET /api/v2/statistics/workers` | **Manager 独占** | 工人一览：一行一工人，含贡献度百分比 + **有效工时 3 字段**；区间内无事件的工人也列出（零填充） |
+| `GET /api/v2/statistics/workers/{worker_id}` | **Manager 独占** | 单工人详情：领取 / 放回 / 参与工单 + **有效工时总额与按工序拆分** |
+
+- **端点 3 条**（跳序取件两条已随 `t_pickup_skip_event` 删除下线，**无 alias**，旧路径 404）。完整契约见 [`docs/api/statistics.md`](docs/api/statistics.md)。
+- **纯只读域**：3 个 handler 全走 `pool.acquire()`，不开事务、**不发也不消费 WS 事件**（没有失效通道，新鲜度靠前端自身的 query 策略）。
+- ⚠️ **角色守卫下沉在 handler 第一行**（三个 handler 逐字 `require_role(Role::Manager)`）。本域错误码只有两个：`20104`（`date_from > date_to`，或 path `{worker_id}` 非数字）与 `20201`（工人不存在**或已软删**）。
+- ⚠️ **本域零跨域模块依赖**（读别域的表是既定 pattern）：唯一例外是 `worker_stats` / `worker_detail` 经 `repo.conn_mut()` 借位调 `prod::worker::repo::WorkerRepo` 与 `prod::work_type::repo::WorkTypeRepo`，与 `DeliveryNoteRepoTrait::conn_mut` 同形。
+- ⚠️ **`count_overdue_undelivered` 与 dashboard 的逾期口径有意分叉**（本域 planned 口径 + DELIVERED 事件兜底），不要动它，见上一节末条。
+
+#### 有效工时维度
+
+> 定义：区间内该工人**完成了一道工序**的次数 × 该工序在工单锚链上的
+> `t_process_chain_step.estimated_minutes`，求和。**单位是分钟整数**，不是小时、
+> 不是浮点。
+
+- **计入**只有两种事件：`RETURNED_TO_SHELF`（放回顺链推进）与 `SENT_TO_INSPECTION`
+  （工人主动送检）。**不计入**：`PICKED_UP` / `TAKEN_FROM_POOL` / `MOVED`（那是
+  **开始**，一进一出都计则同一道工序被计两次）、`INSPECTED`（**品检员**动作，写点在
+  `prod::batch` 的批次扫码与状态流转两处）、`DELIVERED`（无工序语义）。
+  判据是「一进一出只认『出』的那一次」，不是「凡有工人的事件都算」。
+- ⚠️ **链外工序计 0 分钟，不是丢弃该行**：`e.process_id IS NULL` /
+  `p.process_chain_id IS NULL` / 锚链内找不到该 `process_id` 的 step，三种情况一律
+  工时贡献 0，但该行照常进 `worked_process_count` / `worked_batch_count` 的统计集合。
+- ⚠️ **取工时必须用 `LEFT JOIN LATERAL (…) ON TRUE` + `ORDER BY sort_order ASC,
+  id ASC LIMIT 1`，严禁直接 `JOIN t_process_chain_step`**：`t_process_chain_step`
+  **没有** `(chain_id, process_id)` 唯一约束（唯一索引只有 `uq_chain_step_chain_order
+  (chain_id, sort_order) WHERE deleted_at IS NULL`），写侧 `upsert_chain` 也**只校验
+  `sort_order` 不重复、不校验 `process_id` 不重复** ⇒ 同名工序在一条链里出现多次是
+  后端照收的合法形态。直接 JOIN 会让工时**按命中条数翻倍且不报错**。这与
+  `shared::batch::chain` 把 `hit_count > 1` 判成 `chain_state = 'NONE'` 是同一事实的
+  两种处置：那边「下一道是谁」有歧义必须拒答，这边「这一步的预计工时」取链上第一次
+  出现的那一步即可。
+- ⚠️ **锚链取 `p.process_chain_id` 单来源，不写 `COALESCE(p.process_chain_id,
+  step.chain_id)`**：那套 COALESCE 是 `shared::batch::chain` 的**运行时链定位**纪律
+  （兼容批次 step 指针指向旧链），统计侧不需要兼容老数据，且 LATERAL 子查询的
+  `chain_id` 本就取自 `p.process_chain_id`、无从回退。
+- ⚠️ **数据覆盖受工序链配置率限制**：`effective_minutes` 只在**已配工序链**的工单上
+  有值。开发库绝大多数工单无 `process_chain_id` ⇒ 该指标恒为 0，**是口径的必然结果
+  不是回归**。要它有意义，前提是工单普遍配了链**且**链上配了 `estimated_minutes`。
+  不要为了让数字好看而给无链工单兜默认工时。
+- **三条 SQL 共用一份骨架常量**（按工人聚合 / 单工人总额 / 按工序拆分）——
+  `repo/sql.rs` 的 `effective_minutes` 模块 + `build()`。**改口径必须改那一处**：
+  三条各抄一遍必然漂移，而漂移的表现是数字静默错（不报错）。拼装走 `format!` +
+  `AssertSqlSafe`，注入面为 0（填进去的全是模块私有常量或字面量，用户输入一律
+  `bind`）。
+- ⚠️ **`JOIN t_worker w` 是 INNER**（与既有 `worker_pickup_rows` 同款）：只统计真有
+  工人身份的作业事件。**不要**改成 LEFT。
+- `WorkerProcessBreakdown.process_id` **可空**（写侧只在 `prod::scan` 的 5 个构造点落
+  `process_id`，其余构造点恒 `NULL`），这类事件汇成一个「无工序」组、对工时总额贡献恒
+  为 0。⚠️ `process_id: null` 与 `process_name: "(已删除)"` 是**两种不同的「无名」**。
+
+#### `t_part_event` 的两个新列（statistics 侧的消费方）
+
+`worker_id` / `process_id` 两列此前**从未被 Rust 写侧写过**（老 INSERT 的列清单里根本
+没有它们），补写后 statistics 域才第一次有「按工人 + 按工序」可聚合的数据：
+
+| 列 | 语义 | 统计侧怎么用 |
+|---|---|---|
+| `worker_id` | `t_worker.id`（**不是** `t_user.id`） | 全部按工人聚合的 GROUP BY 键。⚠️ 两者共用雪花 ID 空间但**无映射表**，混填 `created_by` 会让统计到从未做过活的账号上 |
+| `process_id` | 事件时刻的**工序快照** | 有效工时的链内查键 + breakdown 的分组键 |
+
+⚠️ **`worker_id` 的写入点只有「真有工人语境」的那几个**：其余 part 级 / 批次级状态
+流转（`DELIVERED` / `INSPECTED` / `STATUS_CHANGED` / `REPAIR_*` / `BATCH_CANCELLED` /
+`RECALLED` / `SERIAL_RELEASED` / `FORCE_COMPLETED` / `CANCELLED` / `SOFT_DELETED` /
+`PLACED_ON_SHELF` / `CNC_RELEASED` / `SPLIT` / `MOVED`）恒为 `NULL`，因为发起者是
+管理员账号或系统调度而非工人。⇒ **工时类指标天然只覆盖工人主动作业**，不是全量。
+
+#### 为什么 `NewPartEvent` 上提 `shared::part_event`
+
+`t_part_event` 是工单级事件流水，**7 个模块都在写，且没有一个是 owner**（`part` /
+`prod::batch` / `prod::scan` / `prod::queue` / `outsource` / `assembly` /
+`shared::batch`，各自的写入点见 `shared/part_event/mod.rs` 的模块 doc 表）。留在
+`part` 域的后果就是其余 6 个写方全部**反向依赖** `modules::part`，与逐域剥离方向
+相反；留在任何单一「用例域」（比如 `prod::batch`）后果相同。故与 `shared::batch`
+（批次公共语义）同批上提到 `shared`，依赖方向变成 **域 → shared**。
+
+#### 为什么本表**没有** `T*` 投影
+
+仓库惯例：`T*` = 某域 **owned** 的表的全列 `#[derive(sqlx::FromRow)]` 投影（全仓
+`pub struct T*` 全部 derive FromRow、零例外）。`t_part_event` 不满足「owned」（7 个
+写方、没有 owner），因而也不该有 `T*` 投影 —— 本表读侧一律走**端点私有 row struct +
+VO**：零件时间线用 `part::service::phase1::events` 的 `EventListRow`，statistics 域用
+自己的 row struct（`sql.rs` 底部 4 个）。给一张读侧人人自定义列集的表造一个 15 列的
+公共投影，只会让「哪一列是端点要的」这件事被投影结构掩盖。
+
+⚠️ **`statistics` 域的 3 条有效工时 repo SQL 目前零集成测试覆盖**（该域三个 service
+方法的 happy-path 用例早已删除，见上文「覆盖空洞登记」一节）。补测试时遵守「插入行用
+`now_naive()` 时查询窗口不得硬编码绝对日期」的约定。
+
 **2026-10-02 shelf 域拆分**（依据「货架自身包括了账号的部分和工序映射相关的部分，
 应拆分到 iam 域和 prod 域」）：
 - **账号部分 = 消除**：`ShelfOut.account_count` + `ShelfRepo::count_accounts_by_shelf`
@@ -395,7 +490,7 @@ t_assembly.status               ← 派生缓存
 
 ## `docs/api/` 目录约定（2026-10-07 确立）
 
-**现状**：`docs/api/` 有 **11 份**文件（与本文件顶部「📌 前端对接」一节同口径；2026-10-11 review 第 1 轮订正——此前此处写「9 份」而同文件顶部已写「11 份」，且表格漏登 `wx.md`，两处自相矛盾），每份 = **一个域的整域契约**：
+**现状**：`docs/api/` 有 **12 份**文件（与本文件顶部「📌 前端对接」一节同口径；2026-10-11 review 第 1 轮订正过「9 份 / 11 份」两处自相矛盾与漏登 `wx.md`，2026-10-12 新建 `statistics.md` 后为 12），每份 = **一个域的整域契约**：
 
 | 文件 | 覆盖域 |
 |---|---|
@@ -410,6 +505,7 @@ t_assembly.status               ← 派生缓存
 | [`docs/api/shelves.md`](docs/api/shelves.md) | `iam::shelf`（**iam 域下的嵌套子模块**：货架 CRUD + 负载与自动选架，5 端点；2026-10-10 自独立 shelf 域迁入 iam，URL 硬切 `/api/v2/iam/shelves/*`） |
 | [`docs/api/iam.md`](docs/api/iam.md) | `iam`（认证 + 账号 + 企业微信绑定 + 货架子模块，**22 端点**；session 5 + users 12 + shelves 5，4 条破坏性变更与 OCC 锚点） |
 | [`docs/api/wx.md`](docs/api/wx.md) | `wx` 微信小程序 BFF（**2026-10-11 新建**；**按小程序页面切子模块**：`login/` + `part_list/` + `production/`；5 端点；URL 硬切无 alias 5 条、VO camelCase 逐字对齐前端卡片模型、`deliveredQty` 真值、尾斜杠 404 实测钉死、`counts` / `list` 口径对齐、★ 2026-10-12 `part_list` 日期 + 7 类 tab 双维筛选） |
+| [`docs/api/statistics.md`](docs/api/statistics.md) | `statistics` 生产统计（**2026-10-12 新建**；3 个 MANAGER-only 只读端点、有效工时口径表与数据覆盖登记、跳序取件域清空的移除记录） |
 
 **约定**：
 
@@ -555,9 +651,11 @@ reviewer 在 iam 域重构期间实跑复现出的另外 6 条基线红（与 ia
 
 ⚠️ 写 statistics 相关代码前先知道这件事，否则会误以为该层已被集成测试守住：
 
-- `StatisticsService::overview` / `worker_stats` / `worker_detail` **无 happy-path 集成测试**（原三条硬编码日期窗口的用例已按上表删除）。`tests/statistics/api.rs` 现存 4 条里，走到这三个方法的只有 `overview` 的**参数校验**用例（`date_from > date_to` → `BIZ 20104`）与两条 pickup-skip 用例（那两条的 service 调用根本不接日期窗口，与 `overview` / `worker_stats` / `worker_detail` 是不同代码路径）；第 4 条 `count_in_process_at_date_to_boundary` 是 repo 层 `count_in_process_at` 的直调覆盖，**不经 service**，故不计入这三个方法。
+- `StatisticsService::overview` / `worker_stats` / `worker_detail` **无 happy-path 集成测试**（原三条硬编码日期窗口的用例已按上表删除）。`tests/statistics/api.rs` 现存 **2** 条里，走到这三个方法的只有 `overview` 的**参数校验**用例（`date_from > date_to` → `BIZ 20104`）；另一条 `count_in_process_at_date_to_boundary` 是 repo 层 `count_in_process_at` 的直调覆盖，**不经 service**，故不计入这三个方法。**有效工时维度的 3 条 repo SQL 同样无集成测试覆盖。**
 - `shared::analytics` 的两个 helper（`daily_buckets` / `worker_contribution`）仍**各保有 2 条纯函数单测**。
-- repo 层 SQL 未被上述删除波及 —— 已知的覆盖点至少有：`tests/statistics/event_driven.rs` 的 3 条（自己钉死时间戳、一直绿）+ 上面那条 `count_in_process_at_date_to_boundary`（钉 `date_to` 边界口径）。这只是**当前已知的**覆盖点、不该当穷举读：判断某个 repo 方法有没有覆盖，要打开 `tests/statistics/` 两个 sub-file 逐个核。
+- repo 层 SQL 未被上述删除波及 —— 已知的覆盖点至少有：`tests/statistics/event_driven.rs` 的 3 条（自己钉死时间戳、一直绿）+ 上面那条 `count_in_process_at_date_to_boundary`（钉 `date_to` 边界口径）。**有效工时维度的 3 条**（按工人聚合 / 单工人总额 / 按工序拆分）是零覆盖。这只是**当前已知的**覆盖点、不该当穷举读：判断某个 repo 方法有没有覆盖，要打开 `tests/statistics/` 两个 sub-file 逐个核。
+- **待补：`worker_effective_minutes` 集成测试**（`statistics::repo::sql::worker_effective_minutes`）。它是三条有效工时聚合里最容易被静默改坏的那条（总额与 `worker_process_breakdown` 各行之和必须相等，而两者**分处两条 SQL**，共用常量只保证了片段同源、不保证结果自洽）。补测试时：① 造一组「链外工序计 0」与「链内命中 step」混合的事件，断言总额等于 breakdown 各行之和；② 遵守「测试数据两条硬约定」第 2 条，**不得**硬编码绝对日期窗口。
+- ⚠️ 这 3 条聚合**没有编译期列名校验**：走运行时 `sqlx::query()` + `format!` 拼装、不进 `query!` 宏，`.sqlx/` 里没有它们的条目（代价登记在 `docs/api/statistics.md` §4.10 与 `sql.rs` 的 `effective_minutes` 模块 doc）。补上面那条集成测试是唯一能兜住「列名写错 / `GROUP BY` 漏列」的自动化手段。
 - 补 happy-path 时遵守「测试数据两条硬约定」第 2 条：**不得**硬编码绝对日期窗口。
 
 ## DB 约定（迁移与查询必须沿用）

@@ -1,0 +1,29 @@
+-- ============================================================================
+-- 2026-10-12：DROP TABLE public.t_pickup_skip_event（跳序取件审计）
+--              （生产统计重构第 1 批，第 2 条）
+-- ============================================================================
+-- 为什么可以整表删：
+--   全仓已**无任何写入点**。该表由 Python v1 的 repository 写入，那套 repository
+--   已于 2026-09-24 随 v1 退役删除；Rust 侧从未接过它的 INSERT（生产统计重构把
+--   读侧一并清空，见同批 `src/modules/statistics/` 的 tab4 收敛）。
+--   最新数据停在 **2026-09-24**，共 **1806 行**，删除即终态。
+--
+-- 归档：DDL（含全部列定义与 10 条 COMMENT ON COLUMN）已 pg_dump 到主 checkout 的
+--   `db_backup/t_pickup_skip_event_archive.sql`（该目录被 .gitignore 忽略、不入库）。
+--   ⚠️ **归档必须先于本迁移落库完成** —— DROP 一旦执行，列注释里的业务口径
+--   （如 `part_serial_no` 为何必须快照、`skipped_earliest_date` 的 NULL 语义）
+--   在库里就再也读不回来了，而重建表时没人记得它们是什么。
+--
+-- 随表级联删除、不单独 DROP 的对象：
+--   - 序列 `t_pickup_skip_event_id_seq`：baseline 的
+--     `ALTER SEQUENCE ... OWNED BY public.t_pickup_skip_event.id`（OWNED BY）使它
+--     随表 DROP 一起消失。**不要**先单独 DROP 序列 —— 那会报
+--     "cannot drop sequence ... because other objects depend on it"。
+--   - 两个索引 `ix_t_pickup_skip_event_created_at` / `ix_t_pickup_skip_event_worker_id`
+--     与主键 `t_pickup_skip_event_pkey`：索引是表的自带对象，随表级联。
+--
+-- `IF EXISTS`：本仓所有 DROP 迁移一律带 `IF EXISTS`（baseline 单文件模式下生产库
+-- 可能已由历史路径手工删过），避免「重复部署时迁移失败」。
+-- ============================================================================
+
+DROP TABLE IF EXISTS public.t_pickup_skip_event;

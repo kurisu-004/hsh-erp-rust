@@ -1,7 +1,15 @@
 //! statistics 域业务逻辑（2026-09-15 takeover-fill + 2026-09-23 PR8 重构）
 //!
 //! 对应 Python myERP/service/statistics.py。三段：overview / worker_stats /
-//! worker_detail + 跳序取件两段（summary / detail）。
+//! worker_detail。
+//!
+//! 2026-10-12：原「跳序取件两段（summary / detail）」随数据源表
+//! `t_pickup_skip_event` 删除一并清空（写入点早已随 Python v1 退役消失）。
+//!
+//! 2026-10-12：新增**有效工时**维度（分钟整数）。口径细则集中在
+//! `repo::sql::effective_minutes` 的骨架常量 doc（事件集合 / LATERAL 去重 /
+//! 锚链来源 / 链外工序计 0 / INNER JOIN `t_worker` 的理由逐条写在那里），
+//! service 只负责把 repo 返回的原始行装配进 VO、不做任何二次口径判断。
 //!
 //! 约定：
 //! - 日期统一转 `[date_from, date_to+1)` 半开区间做 `created_at` 比较；
@@ -26,12 +34,11 @@ use crate::infra::clock::now_naive;
 use crate::modules::prod::work_type::repo::WorkTypeRepo;
 use crate::modules::prod::worker::repo::WorkerRepo;
 use crate::modules::statistics::repo::{
-    PickupSkipDetailRow, PickupSkipSummaryRow, StatisticsRepoTrait, WorkerPartRow, WorkerPickupRow,
+    StatisticsRepoTrait, WorkerEffectiveMinutesRow, WorkerPartRow, WorkerPickupRow,
 };
 use crate::modules::statistics::vo::{
-    DeliveryPerformance, OverviewOut, PickupSkipDetailItem, PickupSkipDetailOut,
-    PickupSkipSummaryItem, PickupSkipSummaryOut, StatusCount, WorkerBrief, WorkerDetailOut,
-    WorkerPartItem, WorkerStatsItem, WorkerStatsListOut,
+    DeliveryPerformance, OverviewOut, StatusCount, WorkerBrief, WorkerDetailOut, WorkerPartItem,
+    WorkerProcessBreakdown, WorkerStatsItem, WorkerStatsListOut,
 };
 use crate::shared::analytics::{
     daily_buckets::fill_zero_daily_counts, worker_contribution::compute_worker_contribution,
@@ -154,12 +161,21 @@ impl StatisticsService {
         let agg_map: HashMap<i64, WorkerPickupRow> =
             rows.iter().map(|r| (r.worker_id, r.clone())).collect();
 
+        // 有效工时聚合：口径见 repo::sql::effective_minutes。缺行 = 该工人区间内
+        // 没有任何「完成一道工序」的事件 ⇒ 三个字段全零填充（与 pickup 侧同款）。
+        let eff_rows = repo
+            .worker_effective_minutes_rows(date_from, date_to)
+            .await?;
+        let eff_map: HashMap<i64, WorkerEffectiveMinutesRow> =
+            eff_rows.iter().map(|r| (r.worker_id, r.clone())).collect();
+
         let contribution_map = compute_worker_contribution(&rows);
 
         let items = workers_rows
             .into_iter()
             .map(|w| {
                 let agg = agg_map.get(&w.id);
+                let eff = eff_map.get(&w.id);
                 let wt_name = w.work_type_id.and_then(|id| wt_name_map.get(&id).cloned());
                 WorkerStatsItem {
                     worker_id: w.id,
@@ -172,6 +188,9 @@ impl StatisticsService {
                     pickup_quantity: agg.map(|a| a.pickup_quantity).unwrap_or(0),
                     participated_part_count: agg.map(|a| a.participated_part_count).unwrap_or(0),
                     contribution_pct: contribution_map.get(&w.id).copied().flatten(),
+                    effective_minutes: eff.map(|a| a.effective_minutes).unwrap_or(0),
+                    worked_process_count: eff.map(|a| a.worked_process_count).unwrap_or(0),
+                    worked_batch_count: eff.map(|a| a.worked_batch_count).unwrap_or(0),
                 }
             })
             .collect();
@@ -220,6 +239,26 @@ impl StatisticsService {
         let parts_rows = repo.worker_parts(wid_int, date_from, date_to).await?;
         let daily_pickups = fill_zero_daily_counts(date_from, date_to, &daily_pickups_raw);
 
+        // 有效工时：总额 + 按工序拆分，两条 SQL 同源（同一组事件、同一 LATERAL）。
+        let effective_minutes = repo
+            .worker_effective_minutes(wid_int, date_from, date_to)
+            .await?;
+        let breakdown_rows = repo
+            .worker_process_breakdown(wid_int, date_from, date_to)
+            .await?;
+        let process_breakdown = breakdown_rows
+            .into_iter()
+            .map(|r| WorkerProcessBreakdown {
+                process_id: r.process_id,
+                // 取不到工序名退 "(已删除)"（与 com::delivery_note::service::group
+                // 的既有兜底同款）。工序行被软删**不在**这一支里 —— breakdown 的
+                // LEFT JOIN 刻意不过滤 deleted_at（见 sql.rs::PROCESS_JOIN_SQL）。
+                process_name: r.process_name.unwrap_or_else(|| "(已删除)".to_string()),
+                step_count: r.step_count,
+                effective_minutes: r.effective_minutes,
+            })
+            .collect();
+
         // distinct part_id（即便 part 已软删也计数 — 与 parts 列表口径不同）
         let participated_part_count = parts_rows
             .iter()
@@ -254,66 +293,8 @@ impl StatisticsService {
             return_count,
             daily_pickups,
             parts: items,
-        })
-    }
-
-    // ============================================================
-    // tab4 跳序取件
-    // ============================================================
-
-    pub async fn pickup_skip_summary<R: StatisticsRepoTrait>(
-        &self,
-        mut repo: R,
-    ) -> Result<PickupSkipSummaryOut, AppError> {
-        let rows = repo.pickup_skip_summary().await?;
-        let items = rows
-            .into_iter()
-            .map(|r: PickupSkipSummaryRow| PickupSkipSummaryItem {
-                worker_id: r.worker_id,
-                worker_name: r.worker_name,
-                badge_code: r.badge_code,
-                work_type_name: r.work_type_name,
-                skip_count: r.skip_count,
-                last_skip_at: r.last_skip_at,
-            })
-            .collect();
-        Ok(PickupSkipSummaryOut { items })
-    }
-
-    pub async fn pickup_skip_detail<R: StatisticsRepoTrait>(
-        &self,
-        mut repo: R,
-        worker_id_str: &str,
-        limit: i64,
-        offset: i64,
-    ) -> Result<PickupSkipDetailOut, AppError> {
-        let wid_int = Self::parse_worker_id(worker_id_str)?;
-        let limit = limit.clamp(1, 200);
-        let offset = offset.max(0);
-
-        let rows = repo.pickup_skip_detail(wid_int, limit, offset).await?;
-        let total = repo.pickup_skip_detail_count(wid_int).await?;
-
-        let items = rows
-            .into_iter()
-            .map(|r: PickupSkipDetailRow| PickupSkipDetailItem {
-                id: r.id,
-                part_id: r.part_id,
-                serial_no: r.serial_no,
-                part_name: r.part_name,
-                batch_no: r.batch_no,
-                quantity: r.quantity,
-                part_planned_delivery_date: r.part_planned_delivery_date,
-                skipped_earliest_date: r.skipped_earliest_date,
-                created_at: r.created_at,
-            })
-            .collect();
-
-        Ok(PickupSkipDetailOut {
-            items,
-            total,
-            limit,
-            offset,
+            effective_minutes,
+            process_breakdown,
         })
     }
 }

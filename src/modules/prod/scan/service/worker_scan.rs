@@ -52,7 +52,6 @@
 use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::assembly::service::SyncOutcome;
-use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::service::PartService;
 use crate::modules::part::statemachine::PartStatus;
@@ -62,6 +61,11 @@ use crate::modules::prod::scan::vo::{WorkerScanCoreOut, WorkerScanSplitInfo};
 use crate::modules::prod::worker::repo::WorkerRepo;
 use crate::shared::batch::TPartBatch;
 use crate::shared::error::{AppError, code};
+// 2026-10-12：`t_part_event` 的写侧自 part 域的事件 INSERT 上提到
+// `shared::part_event`（该表由 7 个模块写、无域归属）；本文件的 3 处构造点
+// （`RETURNED_TO_SHELF` / `SENT_TO_INSPECTION` / 部分数量拆批的 `SPLIT`）同时
+// 补齐 `worker_id` / `process_id` 两个新字段（见 `part_event/mod.rs` 写入点清单）。
+use crate::shared::part_event::{NewPartEvent, insert};
 
 use super::ScanService;
 
@@ -241,6 +245,7 @@ impl ScanService {
                     snowflake,
                     &part,
                     &batch,
+                    &worker,
                     req.quantity,
                     current,
                 )
@@ -403,19 +408,35 @@ impl ScanService {
                 // 2026-10-11：`batch_id` / `quantity` 都指向**本次实际处理的那一批**
                 // 与**本次实际放回的数量**（拆批场景 = 新批次 + 拆走量），余量的
                 // 去向由 `SPLIT` 事件留痕。
-                repo.insert_part_event(NewPartEvent {
-                    id: snowflake.next_id(),
-                    part_id: part.id,
-                    event_type: "RETURNED_TO_SHELF",
-                    from_status: Some("IN_PROCESS"),
-                    to_status: Some("IN_PROCESS"),
-                    batch_id: Some(operated.id),
-                    quantity: Some(operated_qty),
-                    drawing_code: Some(&part.drawing_no),
-                    badge_code: Some(&worker.badge_code),
-                    note: None,
-                    created_by: Some(current.id),
-                })
+                //
+                // 2026-10-12：两个新字段的取值锚一律是 `operated`，**不是**上面判链
+                // 用的 `batch` —— `operated` 才是事件 `batch_id` 指向的那一批、也是
+                // `mark_batch_returned` 实际推进的那一批（拆批路径下它是拆完从库里
+                // 重读的真行）。`mark_batch_returned` 已在同一事务内把它推进到
+                // `next_pid`，而 `operated` 是**推进前**读进内存的快照 ⇒
+                // `operated.current_process_id` 正是「这位工人刚做完哪道工序」
+                // （migration 009 的列 COMMENT 就是为这件事写的）；事后回查批次只会
+                // 拿到「下一道」。
+                insert(
+                    repo.conn_mut(),
+                    NewPartEvent {
+                        id: snowflake.next_id(),
+                        part_id: part.id,
+                        event_type: "RETURNED_TO_SHELF",
+                        from_status: Some("IN_PROCESS"),
+                        to_status: Some("IN_PROCESS"),
+                        batch_id: Some(operated.id),
+                        quantity: Some(operated_qty),
+                        drawing_code: Some(&part.drawing_no),
+                        badge_code: Some(&worker.badge_code),
+                        // 形参来源的作业人：拆批是这位工人扫码的副产物，
+                        // 与同路径 `sent_to_inspection` 同款。
+                        worker_id: Some(worker.id),
+                        process_id: operated.current_process_id,
+                        note: None,
+                        created_by: Some(current.id),
+                    },
+                )
                 .await?;
                 out_batch = operated;
                 out_split = split;
@@ -429,6 +450,7 @@ impl ScanService {
                     snowflake,
                     &part,
                     &batch,
+                    &worker,
                     req.quantity,
                     current,
                 )
@@ -495,6 +517,10 @@ impl ScanService {
 /// +1（拆批 OCC 写）。`location='WORKER'` + `current_holder_id` 不变 ⇒ 余量继续
 /// 出现在报工台「已持有」列表，可被下一次扫（放回 / 送检）处理。
 ///
+/// ## 形参 `worker`（2026-10-12 新增）
+/// 只为拆批那条 `SPLIT` 事件的 `worker_id` —— 拆批是这次扫码的副产物，作业人在场。
+/// 整批路径不写任何事件，该形参随之不使用。
+///
 /// ## 为什么拆完再把新批次读回来
 /// `INSERT ... SELECT` 的产出行是「源行 + 4 处覆盖」，在内存里照着拼一个
 /// `TPartBatch` 就得把这 4 处逐条手工对齐（漏一处就是一个静默错值）。拆批是低频
@@ -504,6 +530,7 @@ async fn resolve_operated_batch<R: PartRepoTrait>(
     snowflake: &SnowflakeIdGenerator,
     part: &crate::modules::part::model::TPart,
     source: &TPartBatch,
+    worker: &crate::modules::prod::worker::model::TWorker,
     requested: Option<i64>,
     current: &CurrentUser,
 ) -> Result<(TPartBatch, i32, Option<WorkerScanSplitInfo>), AppError> {
@@ -554,19 +581,29 @@ async fn resolve_operated_batch<R: PartRepoTrait>(
     // 拆批留痕：源批次数量被静默扣减，只留 RETURNED_TO_SHELF / SENT_TO_INSPECTION
     // 事件的话，事后只看事件流就看不出「原来 10 件、为什么源批次只剩 6 件」。
     // 与 pick-up 路径的 SPLIT 事件同形（part 维度、`batch_id` 指向新批次）。
-    repo.insert_part_event(NewPartEvent {
-        id: snowflake.next_id(),
-        part_id: part.id,
-        event_type: "SPLIT",
-        from_status: Some(&source.status),
-        to_status: Some(&source.status),
-        batch_id: Some(new_batch_id),
-        quantity: Some(qty),
-        drawing_code: Some(&part.drawing_no),
-        badge_code: None,
-        note: Some("报工台部分数量自动拆批"),
-        created_by: Some(current.id),
-    })
+    //
+    // 2026-10-12：两个新字段与 `pickup` 那条 SPLIT **同口径** —— 事件挂在**新批次**
+    // 上而工序取**源批次**的（`split_batch_for_partial_pass` 的 `INSERT ... SELECT`
+    // 继承了 `current_process_id`，故两者同值；取不到新批次行时源快照就是唯一可取值），
+    // 工人是本次扫码的作业人（拆批是这次扫码的副产物，人在场）。
+    insert(
+        repo.conn_mut(),
+        NewPartEvent {
+            id: snowflake.next_id(),
+            part_id: part.id,
+            event_type: "SPLIT",
+            from_status: Some(&source.status),
+            to_status: Some(&source.status),
+            batch_id: Some(new_batch_id),
+            quantity: Some(qty),
+            drawing_code: Some(&part.drawing_no),
+            badge_code: None,
+            worker_id: Some(worker.id),
+            process_id: source.current_process_id,
+            note: Some("报工台部分数量自动拆批"),
+            created_by: Some(current.id),
+        },
+    )
     .await?;
     let operated = repo.find_batch_by_id(new_batch_id).await?.ok_or_else(|| {
         AppError::biz(
@@ -655,19 +692,32 @@ async fn sent_to_inspection<R: PartRepoTrait>(
     let rollup = repo
         .mark_batch_inspected(batch.id, batch.version, target_id, Some(current.id))
         .await?;
-    repo.insert_part_event(NewPartEvent {
-        id: snowflake.next_id(),
-        part_id: part.id,
-        event_type: "SENT_TO_INSPECTION",
-        from_status: Some("IN_PROCESS"),
-        to_status: Some("INSPECTION"),
-        batch_id: Some(batch.id),
-        quantity: Some(quantity),
-        drawing_code: Some(&part.drawing_no),
-        badge_code: Some(&worker.badge_code),
-        note: None,
-        created_by: Some(current.id),
-    })
+    // 2026-10-11：`quantity` 取形参（= 本次**实际**送检量，拆批场景下拆走量），
+    // 不是 `batch.quantity`；`batch_id` 取形参 `batch` —— 它已经是**拆出来的那一批**
+    // （整批路径下就是源批次），故无需再指 `source`。
+    //
+    // 2026-10-12：`batch` 既是事件锚（`batch_id` / OCC / 状态机守卫都用它），
+    // 自然也是两个新字段的取值锚 —— `mark_batch_inspected` 不推进工序，
+    // `batch.current_process_id` 仍是送检时那道工序；`worker` 是本函数的
+    // `&TWorker` 形参。
+    insert(
+        repo.conn_mut(),
+        NewPartEvent {
+            id: snowflake.next_id(),
+            part_id: part.id,
+            event_type: "SENT_TO_INSPECTION",
+            from_status: Some("IN_PROCESS"),
+            to_status: Some("INSPECTION"),
+            batch_id: Some(batch.id),
+            quantity: Some(quantity),
+            drawing_code: Some(&part.drawing_no),
+            badge_code: Some(&worker.badge_code),
+            worker_id: Some(worker.id),
+            process_id: batch.current_process_id,
+            note: None,
+            created_by: Some(current.id),
+        },
+    )
     .await?;
     // PR-B2：直接取 gate 的派生结果（不再补调 `PartService::sync_from_batch_change`
     // —— 第二次派生必然 `NoChange`，会把 `synced_assembly_id` 恒吞成 null）。

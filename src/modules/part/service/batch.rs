@@ -662,7 +662,3 @@ pub(super) async fn prepare_binding_head_copy(
         content_type: binding.content_type.clone(),
     })
 }
-
-// 仅为消除未用导入警告（类型由 impl 块自然带回）
-#[allow(unused_imports)]
-use crate::modules::part::model::NewPartEvent as _NewPartEventShim;

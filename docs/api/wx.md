@@ -309,7 +309,7 @@ size` 这个公式，而新算法是「取 `size + 1` 条判超」（见 §3.4�
 | 字段 | 类型 | 口径 |
 |---|---|---|
 | `batchCount` | number | 该工人当月发生过事件的**不同 `batch_id`** 数 |
-| `workHours` | number | 该工人当月 `PICKED_UP + RETURNED` 事件的 `SUM(quantity)`（**工作量估算**，DB 无 `work_hours` 列） |
+| `workHours` | number | 该工人当月 `PICKED_UP + RETURNED_TO_SHELF` 事件的 `SUM(quantity)`（**工作量估算**，DB 无 `work_hours` 列） |
 
 `BatchCountsOut`（2 字段）：
 
@@ -966,10 +966,31 @@ CurrentUser.id (t_user.id)
 | 字段 | SQL |
 |---|---|
 | `batchCount` | `COUNT(DISTINCT batch_id) FILTER (WHERE batch_id IS NOT NULL)`，限该工人 + 当月 `created_at` |
-| `workHours` | `COALESCE(SUM(quantity) FILTER (WHERE event_type IN ('PICKED_UP','RETURNED')), 0)`，限该工人 + 当月 `created_at` |
+| `workHours` | `COALESCE(SUM(quantity) FILTER (WHERE event_type IN ('PICKED_UP','RETURNED_TO_SHELF')), 0)`，限该工人 + 当月 `created_at` |
 
 ⚠️ `workHours` 是**工作量估算**（DB schema 无 `work_hours` 列），用「加工件数」顶替
 —— 与 `statistics` 域的同形口径一致。
+
+⚠️⚠️ **2026-10-12 起两个字段对新事件返非 0**（跨域行为变更）：此前 `t_part_event.worker_id`
+**从未被写侧写过**（老 INSERT 的列清单里没有它，Python v1 退役后一直是 NULL），本节两条
+聚合的 `WHERE worker_id = $1` 对**任何**工人都恒命中 0 行 ⇒ 已绑定账号也一直看到
+`batchCount: 0 / workHours: 0`。2026-10-12 起写侧在 **7** 个事件构造点填 `worker_id`
+（`prod::scan::service::worker_scan` 的 `RETURNED_TO_SHELF` / `SENT_TO_INSPECTION`
+与部分数量拆批的 `SPLIT`、`prod::scan::service::pickup` 的 `SPLIT` / `PICKED_UP`、
+`prod::queue::service::queue` 的 2 处 `TAKEN_FROM_POOL`），逐点依据见
+`crate::shared::part_event` 的模块 doc。⚠️ `batchCount` 不按 `event_type` 过滤，新增的
+`SPLIT` 事件因此也进该计数，但它的 `batch_id` 与紧随其后的放回 / 送检事件是同一批 ⇒
+`COUNT(DISTINCT batch_id)` 不受影响；`workHours` 有 `event_type IN ('PICKED_UP',
+'RETURNED_TO_SHELF')` 过滤，`SPLIT` 不进。
+⇒ **2026-10-12 之前写入的事件仍统计不到**（老数据恒 0 是正常的，不是回归）；
+本节两条 SQL 的口径一个字没改，是写侧补列带来的结果。`worker_id` 是
+`t_worker.id`（§9.3 的解链结果），不是 `t_user.id`。
+
+⚠️ 读到这里若与 §9.5 的「核心回归用例断言 `batchCount > 0`」对不上：不矛盾 ——
+上面说的「恒命中 0 行」说的是**修复前**（`worker_id` 全表为 NULL）的线上状态，而
+§9.5 的用例用测试 helper `insert_event` **直插 SQL、显式给 `worker_id`**，绕开
+Rust 写侧那两个补列点（补列点本身要过扫码 / 队列取料链路，测试里搭不出来），
+所以它从一开始就能命中行、不受这条限制影响。
 
 ### 9.5 回归测试
 

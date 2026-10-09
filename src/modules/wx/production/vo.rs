@@ -75,10 +75,12 @@ pub struct WorkerStatsOut {
     /// 该工人当月发生过事件的**不同批次**数
     #[serde(rename = "batchCount")]
     pub batch_count: i64,
-    /// 该工人当月 `PICKED_UP + RETURNED` 事件的 `SUM(quantity)`。
+    /// 该工人当月 `PICKED_UP + RETURNED_TO_SHELF` 事件的 `SUM(quantity)`。
     ///
     /// ⚠️ **工作量估算**，不是真实工时（DB schema 无 `work_hours` 列）。前端
     /// `production-stats.wxml` 把它渲染成「累计工时 (h)」。
+    /// ⚠️ 2026-10-12：事件类型字面量由 `RETURNED` 修正为 `RETURNED_TO_SHELF`
+    /// （Rust 侧写侧实际落库的类型，`RETURNED` 是 Python v1 遗留、Rust 从不写）。
     #[serde(rename = "workHours")]
     pub work_hours: f64,
 }
@@ -174,12 +176,14 @@ pub struct ProductionBatchCardOut {
     /// （SQL 的 `location = 'WORKER'` 闸门，见 `super::repo::FROM_SQL`）
     #[serde(rename = "assignedTo")]
     pub assigned_to: Option<String>,
-    /// 该批次 `PICKED_UP + RETURNED` 事件的 `SUM(quantity)`。
+    /// 该批次 `PICKED_UP + RETURNED_TO_SHELF` 事件的 `SUM(quantity)`。
     ///
     /// ⚠️ **无值时是 `null`，不是 `0`**：前端 `<part-card>` 用
     /// `wx:if="{{item.workHours != null}}"` 守门决定是否渲染工时行，给 `0` 会把
     /// 「本月没干过活」渲染成「干了 0 小时」。SQL 侧对应的 `COALESCE` 已删
     /// （旧实现有 `COALESCE(SUM(quantity), 0)`），登记在 `docs/api/wx.md` §8.6。
+    /// ⚠️ 2026-10-12：事件类型字面量由 `RETURNED` 修正为 `RETURNED_TO_SHELF`
+    /// （Rust 侧写侧实际落库的类型，`RETURNED` 是 Python v1 遗留、Rust 从不写）。
     #[serde(rename = "workHours")]
     pub work_hours: Option<f64>,
     /// 最近一次 `DELIVERED` 事件的日期 `YYYY-MM-DD`；从未送车过则 `null`。

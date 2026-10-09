@@ -306,3 +306,22 @@ t_assembly.status               ← 派生缓存
   ⚠️ **2026-10-10 起该码在全仓零触发点** —— 最后一个触发点（`prod::queue::move` 的
   WORKER→POOL 映射校验）随 `to` 侧货架入参移除一并退场，只剩 `shared::error` 里的
   常量与码名测试。前端若还有分支 20507 的代码，那是死分支。
+
+## 9. 跨域登记：`GET /api/v2/parts/{id}/events` 响应体扩展（2026-10-12）
+
+该端点属 **part（工单）域**、不是 `prod::batch` 域，而 part 域**没有自己的
+`docs/api/` 文件** ⇒ 它的契约载体是代码注释
+`src/modules/part/vo/part.rs::PartEventOut`，这里只登记**跨域可见的响应体变更**，
+供前端查契约时不必翻 Rust 源码。
+
+| 项 | 变更 |
+|---|---|
+| 出参字段 | `process_id`（**string \| null**，雪花 ID 字符串化）+ `process_name`（**string \| null**），`PartEventOut` 由 15 字段 → **17 字段**。端点、入参、排序（`ORDER BY e.id DESC`）逐字未变，是**纯响应体扩展** |
+| 取值来源 | `t_part_event.process_id`（migration `20261011130000_009_add_part_event_process_id.sql`，**加列后不回填**）+ `LEFT JOIN t_process pr` 取 `pr.name` |
+| 覆盖范围 | 写侧自 2026-10-12 起在 `prod::scan` 的 **5** 个事件构造点填 `process_id`（`worker_scan` 的 `RETURNED_TO_SHELF` / `SENT_TO_INSPECTION` 与部分数量拆批的 `SPLIT`、`pickup` 的 `SPLIT` / `PICKED_UP`，均取事件时刻的批次工序快照）⇒ **只有 2026-10-12 之后由报工台产生的作业类事件**两字段有值；历史事件与工单级 / 批次级流转事件两者皆 `null` |
+| 软删口径 | 该 JOIN **刻意不过滤 `t_process.deleted_at`** —— 事后软删是对当前工序字典的行政操作，不追溯抹掉历史时间线里的名字（同款取舍见 `docs/api/statistics.md` §4.9）。⚠️ 工序**改名会显新名**（事件行只快照 `process_id`，不快照工序名） |
+| ⚠️ 前端占位文案纪律 | `process_id === null`（「这条事件没记工序」）与 `process_name === null`（「记了工序 id 但工序行物理缺失」）是**两种不同的无名**，不得混用同一个占位文案 |
+
+⚠️ **部署顺序对前端无害**：本扩展是纯加字段，老前端 Zod strip 掉即可；新前端声明成
+`.nullish()` 时，后端未先上也只是这两段静默不渲染（与本文件 §7 登记的
+`batch_no` / `worker_name` 等四字段同款取舍）。

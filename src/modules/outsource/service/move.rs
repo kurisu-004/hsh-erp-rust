@@ -50,7 +50,7 @@ use crate::modules::outsource::dto::{OutsourceLocation, OutsourceMoveRequest};
 use crate::modules::outsource::repo::OutsourceRepoTrait;
 use crate::modules::outsource::repo::sql::NEXT_PROCESS_LATERAL_SQL;
 use crate::modules::outsource::vo::OutsourceMoveResult;
-use crate::modules::part::model::{NewPartEvent, TPartInspected};
+use crate::modules::part::model::TPartInspected;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
 use crate::shared::batch::TPartBatch;
@@ -59,6 +59,9 @@ use crate::shared::batch::guards::{
     validate_batch_version,
 };
 use crate::shared::error::{AppError, code};
+// 2026-10-12：`t_part_event` 的写侧自 part 域的事件 INSERT 上提到
+// `shared::part_event`（该表由 7 个模块写、无域归属）。
+use crate::shared::part_event::{NewPartEvent, insert};
 
 /// DIRECT（免审批直发）自动创建的占位报价 `note` 固定文案 —— 让对账页一眼看出
 /// 「这行单价 0 不是漏填，是免审批直发自动建的占位报价」。
@@ -977,8 +980,9 @@ async fn write_part_event(
     note: Option<&str>,
     current: &CurrentUser,
 ) -> Result<(), AppError> {
-    (&mut *conn)
-        .insert_part_event(NewPartEvent {
+    insert(
+        &mut *conn,
+        NewPartEvent {
             id: snowflake.next_id(),
             part_id: batch.part_id,
             event_type,
@@ -989,9 +993,12 @@ async fn write_part_event(
             quantity: Some(batch.quantity),
             drawing_code: Some(&part.drawing_no),
             badge_code: None,
+            worker_id: None,
+            process_id: None,
             note,
             created_by: Some(current.id),
-        })
-        .await?;
+        },
+    )
+    .await?;
     Ok(())
 }

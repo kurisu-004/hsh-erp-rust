@@ -32,7 +32,6 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::assembly::service::AssemblyService;
 use crate::modules::com::customer::repo::CustomerRepo;
-use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::repo::{NewPartCreate, PartListFilters, PartUpdate};
 use crate::modules::part::vo::{
@@ -45,6 +44,9 @@ use crate::modules::prod::batch::repo::{NewInitialBatch, PartBatchRepo};
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
 use crate::shared::customer::expand_customer_id;
 use crate::shared::error::{AppError, code};
+// 2026-10-12：`t_part_event` 的写侧自 part 域的事件 INSERT 上提到
+// `shared::part_event`（该表由 7 个模块写、无域归属）。
+use crate::shared::part_event::{NewPartEvent, insert};
 use crate::state::AppState;
 
 use super::PartService;
@@ -587,19 +589,24 @@ impl PartService {
                     ProcessChainRepo::unlink_part_from_chain(repo.conn_mut(), chain_id, current.id)
                         .await?;
                 }
-                repo.insert_part_event(NewPartEvent {
-                    id: snowflake.next_id(),
-                    part_id,
-                    event_type: "SOFT_DELETED",
-                    from_status: None,
-                    to_status: None,
-                    batch_id: None,
-                    quantity: None,
-                    drawing_code: None,
-                    badge_code: None,
-                    note: Some("manager soft-delete"),
-                    created_by: Some(current.id),
-                })
+                insert(
+                    repo.conn_mut(),
+                    NewPartEvent {
+                        id: snowflake.next_id(),
+                        part_id,
+                        event_type: "SOFT_DELETED",
+                        from_status: None,
+                        to_status: None,
+                        batch_id: None,
+                        quantity: None,
+                        drawing_code: None,
+                        badge_code: None,
+                        worker_id: None,
+                        process_id: None,
+                        note: Some("manager soft-delete"),
+                        created_by: Some(current.id),
+                    },
+                )
                 .await?;
                 Ok(())
             }

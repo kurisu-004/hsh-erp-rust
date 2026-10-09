@@ -1,26 +1,29 @@
 //! part 域 repo 层（SQL 真源 + 胖 trait + PG 实现）
 //!
 //! ## 结构（2026-09-22 D-6 重构对齐 iam / shelf / customer / part_batch / queue 范本）
-//! - `sql/`（原 `sql.rs`，已按表拆 `part_sql.rs` / `event_sql.rs` /
-//!   `helper_sql.rs` + `mod.rs`）：SQL 全文，
-//!   25 个 pub 固有静态方法（t_part 24 + t_part_event 1）
+//! - `sql/`（原 `sql.rs`，已按表拆 `part_sql.rs` / `helper_sql.rs` + `mod.rs`）：
+//!   `t_part` 表 SQL 全文，
+//!   24 个 pub 固有静态方法
 //!   + sqlx `query!` 宏。ZST struct `PartRepo` 收 `impl PgExecutor<'_>` 形参。
-//! - `mod.rs`（本文件）：对外暴露胖 trait `PartRepoTrait`（44 方法合并单 trait，
+//! - `mod.rs`（本文件）：对外暴露胖 trait `PartRepoTrait`（43 方法合并单 trait，
 //!   口径见下文「方法计数口径」），并直接 `impl PartRepoTrait for &mut PgConnection`
 //!   ——handler/service 借 `&mut *tx` / `&mut *conn` 即可，零中间壳。
+//!
+//! 2026-10-12：`t_part_event` 表的 builder + INSERT 随该表上提到
+//! `crate::shared::part_event`（该表由 7 个模块写、无域归属），本文件随之删掉
+//! `insert_part_event` 的 trait 声明与 impl、`sql/event_sql.rs` 与 2 个 re-export。
 //!
 //! ## 方法计数口径
 //! 「trait 方法数」= `pub trait PartRepoTrait` 花括号内声明的 `fn` 签名条数；
 //! `conn_mut` 这类工具方法计入，`#[allow(...)]` / doc 注释不计；`#[async_trait]`
-//! 展开出的生命周期形参不算独立方法。44 = `conn_mut` 1 + t_part 18 +
-//! t_part_batch 17 + t_part_event 1 + 跨域 helper 2 +
+//! 展开出的生命周期形参不算独立方法。43 = `conn_mut` 1 + t_part 18 +
+//! t_part_batch 17 + 跨域 helper 2 +
 //! 采购订单 Excel 匹配 + 订单信息回填 5：
 //!
 //! - `conn_mut` 1 —— 工具方法，暴露 `&mut PgConnection`
 //! - t_part 18 —— 查询 5 + CRUD 6 + assembly 子件 4 + rollup 3（一行委托 `sql::PartRepo`）
 //! - t_part_batch 17 —— 查询 6 + mark_* 品检 4 + lifecycle 6 + split 1（一行委托
 //!   `prod::batch::repo::PartBatchRepo` / `shared::batch::status`）
-//! - t_part_event 1 —— `insert_part_event`（委托 `sql::PartRepo`）
 //! - 跨域 helper 2 —— `part_batch_has_active_on_delivery_note`（委托 `PartBatchRepo`）
 //!   + `serial_prefix_for_customer`（2026-10-05 新增，查 `t_customer`，委托
 //!     `sql::PartRepo`；建单派发序列号的前置）
@@ -30,7 +33,7 @@
 //!   `update_order_info`。上 trait 的**唯一动机是可 mock**：旧实现走
 //!   `conn_mut()` 内联 sqlx，匹配分档只能靠集成测试守护。
 //!
-//! ⚠️ trait 方法数 **不等于** `sql/` 静态方法数（25）：`t_part_batch` 段（17）与跨域 helper
+//! ⚠️ trait 方法数 **不等于** `sql/` 静态方法数（24）：`t_part_batch` 段（17）与跨域 helper
 //! 中的一项转发到 `prod::batch` 域的 ZST 静态方法，`conn_mut` 则无对应 SQL 方法。
 //! 2026-10-06 起 `sql::PartRepo` 的**全部**静态方法都已上 trait（此前
 //! `list_children_by_assemblies` 是唯一漏项，由匹配链路补上）。
@@ -44,14 +47,14 @@
 //! 故 trait 改名 `PartRepoTrait`（与 shelf / customer / part_batch 范本同形）：
 //!
 //! - `part::repo::PartRepo` —— ZST struct（在 `sql/mod.rs` 内，通过 `pub use sql::PartRepo;`
-//!   重新导出至本模块），保留 25 个静态方法签名不变（cross-module 调用方零修改）。
-//! - `part::repo::PartRepoTrait` —— 本文件的胖 trait（44 方法合并单 trait），part 域
+//!   重新导出至本模块），保留 24 个静态方法签名不变（cross-module 调用方零修改）。
+//! - `part::repo::PartRepoTrait` —— 本文件的胖 trait（43 方法合并单 trait），part 域
 //!   内部 service 用 `<R: PartRepoTrait>` 收。
 //!
 //! ## 为什么是胖 trait 而非按表拆 3 trait
 //! `&mut PgConnection` 同一作用域只能借给一个 repo 实例；service 同时需要
-//! `get_part_detail`（t_part）+ `find_batch_by_id`（t_part_batch）+ `insert_part_event`
-//! （t_part_event）时无法表达「同连接三次借用」。胖 trait 是单借位，service 签名
+//! `get_part_detail`（t_part）+ `find_batch_by_id`（t_part_batch）时无法表达
+//! 「同连接两次借用」。胖 trait 是单借位，service 签名
 //! `<R: PartRepoTrait>(&self, mut repo: R, ...)` 一次收下（by-value；生产 `R = &mut
 //! PgConnection`，单测 `R = MockPartRepoTrait`）。
 //!
@@ -86,13 +89,13 @@
 //!   按 conventions.md §4.1 含 IO 不强求 100%。
 //!
 //! ## 错误类型
-//! 44 个方法里 34 个返回 `sqlx::Error`、9 个返回 `AppError`
+//! 43 个方法里 33 个返回 `sqlx::Error`、9 个返回 `AppError`
 //! （`t_part_batch.status` 写点 8 个 —— 契约是「没写成 = `VERSION_CONFLICT`」，
 //! 转 `sqlx::Error` 会把 409 降级成 500；`serial_prefix_for_customer` 1 个 ——
 //! 20308 / 20104 / 20102 三个业务码要原样透出）、`conn_mut` 无返回值。
 //! 按委托目标分三处——**都是零翻译**，但 1:1 的对象不同：
-//! - 25 个 1:1 委托 `sql::PartRepo`（t_part 18 + t_part_event 1 + 跨域 helper 1
-//!   + 采购订单 Excel 匹配 5 = 恰好等于 `sql/` 静态方法数 25；其中 24 个返回
+//! - 24 个 1:1 委托 `sql::PartRepo`（t_part 18 + 跨域 helper 1
+//!   + 采购订单 Excel 匹配 5 = 恰好等于 `sql/` 静态方法数 24；其中 23 个返回
 //!     `sqlx::Error`，只有 `serial_prefix_for_customer` 返回 `AppError`）
 //! - 18 个 1:1 委托 `prod::batch::PartBatchRepo`（t_part_batch 段 17 + 跨域 helper 1
 //!   = 10 个返回 `sqlx::Error` + 8 个 status 写点返回 `AppError`）
@@ -131,18 +134,19 @@ pub mod sql;
 // repo 层只留纯 SQL。
 
 // 重导出 sql.rs 中的 ZST struct / builder / row 与 model 表行类型，让上层继续用
-// `super::repo::{TPart, TPartInspected, TPartEvent, NewPartEvent, PartUpdate, PartListFilters,
+// `super::repo::{TPart, TPartInspected, PartUpdate, PartListFilters,
 //  NewPartCreate, ChildInheritFields, PartRepo}` 这种路径不破（cross-module 调用方都依赖这条路径）。
-pub use crate::modules::part::model::{
-    NewPartEvent, TPart, TPartEvent, TPartInspected, TPartRollupState,
-};
+// 2026-10-12：`NewPartEvent` 与 `t_part_event` 的 FromRow 投影已随该表上提到
+// `crate::shared::part_event`，不再从这里转出（实测零调用方走这条 re-export 路径，
+// 全部直连 `part::model`）。
+pub use crate::modules::part::model::{TPart, TPartInspected, TPartRollupState};
 pub use sql::{
     AssemblyMatchRow, ChildInheritFields, NewPartCreate, PartListFilters, PartRepo, PartUpdate,
     scale_qty,
 };
 
-/// part 域数据访问 trait（44 方法 = `conn_mut` 1 + t_part 18 + t_part_batch 17 +
-/// t_part_event 1 + 跨域 helper 2 + 采购订单 Excel 匹配 5；
+/// part 域数据访问 trait（43 方法 = `conn_mut` 1 + t_part 18 + t_part_batch 17 +
+/// 跨域 helper 2 + 采购订单 Excel 匹配 5；
 /// 计数口径见模块头「方法计数口径」小节）。
 ///
 /// 单 trait 而非按表拆 3 trait：`&mut PgConnection` 同一作用域只能借给一个 repo 实例，
@@ -410,9 +414,6 @@ pub trait PartRepoTrait: Send {
         new_batch_status: &'a str,
         current_user_id: Option<i64>,
     ) -> Result<i64, sqlx::Error>;
-
-    // ── t_part_event 事件日志（1）──
-    async fn insert_part_event<'a>(&mut self, e: NewPartEvent<'a>) -> Result<(), sqlx::Error>;
 
     // ── 跨域 helper（2）── 委托其它域 / 其它表，避免 service 收第二个 conn
     /// part 任一活跃批次是否已挂送货单（委托 `PartBatchRepo::has_active_batch_on_delivery_note`）。
@@ -919,11 +920,6 @@ impl PartRepoTrait for &mut PgConnection {
             current_user_id,
         )
         .await
-    }
-
-    // ── t_part_event 事件日志（1）──
-    async fn insert_part_event<'b>(&mut self, e: NewPartEvent<'b>) -> Result<(), sqlx::Error> {
-        PartRepo::insert_part_event(&mut **self, e).await
     }
 
     // ── 跨域 helper（2）── 委托其它域 / 其它表 ──────────

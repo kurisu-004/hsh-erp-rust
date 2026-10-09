@@ -329,11 +329,13 @@ impl AssemblyService {
         current: &CurrentUser,
     ) -> Result<(AssemblyOut, Vec<i64>), AppError> {
         use crate::modules::assembly::repo::sql::AssemblyRepo;
-        use crate::modules::part::model::NewPartEvent;
         use crate::modules::part::repo::sql::PartRepo;
         use crate::shared::batch::status::{
             force_complete_all_batches_for_assembly, release_part_serial_no,
         };
+        // 2026-10-12：`t_part_event` 的写侧自 part 域的事件 INSERT 上提到
+        // `shared::part_event::insert`（该表由 7 个模块写、无域归属）。
+        use crate::shared::part_event::{NewPartEvent, insert};
 
         // 1. MANAGER 单角色守卫（不下放 Clerk）。
         current.require_role(Role::Manager)?;
@@ -411,7 +413,7 @@ impl AssemblyService {
                 Some(serial_event_id),
             )
             .await?;
-            PartRepo::insert_part_event(
+            insert(
                 &mut *conn,
                 NewPartEvent {
                     id: force_event_id,
@@ -423,6 +425,9 @@ impl AssemblyService {
                     quantity: None,
                     drawing_code,
                     badge_code: None,
+                    // 2026-10-12：管理员强制完成，无作业工人、无批次工序上下文。
+                    worker_id: None,
+                    process_id: None,
                     note: Some(&prefixed_note),
                     created_by: Some(current.id),
                 },

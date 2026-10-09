@@ -44,7 +44,7 @@
 //! - part_batch (2)：`part_batch_count_held_by_worker` / `part_batch_get_by_id`
 //! - part (3)：`part_get_by_id` / `part_find_inprocess_batch_by_id_and_holder` /
 //!   `part_mark_batch_returned`
-//! - part_event (1)：`part_insert_part_event`
+//! - part_event (1)：`part_insert_part_event`（委托 `shared::part_event::insert`）
 //! - inline SQL helper (1)：`count_pool_by_shelf_and_process`（service 中
 //!   `compute_state` 内的 `sqlx::query_scalar!` 块下沉到本 trait；2026-09-30 起
 //!   按 `t_part_batch.current_process_id` 普通过滤，已无 t_process_chain_step JOIN）
@@ -70,11 +70,15 @@
 use async_trait::async_trait;
 use sqlx::PgConnection;
 
-use crate::modules::part::model::{NewPartEvent, TPart};
+use crate::modules::part::model::TPart;
 use crate::modules::prod::process::model::TProcess;
 use crate::modules::prod::work_type::model::TWorkType;
 use crate::modules::prod::worker::model::TWorker;
 use crate::shared::batch::TPartBatch;
+// 2026-10-12：`t_part_event` 的写侧自 part 域的事件 INSERT 上提到
+// `shared::part_event`（该表由 7 个模块写、无域归属）⇒ 本转发器不再依赖
+// `part::repo::PartRepo`，只依赖 shared 的自由函数。
+use crate::shared::part_event::{NewPartEvent, insert as insert_part_event};
 
 pub mod dispatch;
 pub mod sql;
@@ -230,8 +234,13 @@ pub trait QueueRepoTrait: Send {
     ) -> Result<u64, sqlx::Error>;
 
     // ── part_event helper（1）──
-    /// 写 part 事件日志（`PartRepo::insert_part_event`，PartRepo::insert_part_event
-    /// 是 part 域 ZST 静态方法，定义在 `part/repo/event.rs`）。
+    /// 写 part 事件日志（2026-10-12 起委托 `shared::part_event::insert`；
+    /// 更早的落点是 part 域 ZST 上的事件 INSERT 静态方法，它随 `t_part_event`
+    /// 表一并上提到 shared）。
+    ///
+    /// `worker_id` / `process_id` 是 2026-10-12 新增的两个形参（转发到
+    /// `NewPartEvent` 的同名字段）。`MOVED` 三个方向一律传 `None, None`，
+    /// 理由见 `service/queue.rs` 三处调用点的注释。
     #[allow(clippy::too_many_arguments)]
     async fn part_insert_part_event<'a>(
         &mut self,
@@ -244,6 +253,8 @@ pub trait QueueRepoTrait: Send {
         quantity: Option<i32>,
         drawing_code: Option<&'a str>,
         badge_code: Option<&'a str>,
+        worker_id: Option<i64>,
+        process_id: Option<i64>,
         note: Option<&'a str>,
         created_by: Option<i64>,
     ) -> Result<(), sqlx::Error>;
@@ -486,7 +497,7 @@ impl QueueRepoTrait for &mut PgConnection {
         .await
     }
 
-    // ── part_event helper（走 PartRepo::insert_part_event）──
+    // ── part_event helper（走 shared::part_event::insert）──
     #[allow(clippy::too_many_arguments)]
     async fn part_insert_part_event<'a>(
         &mut self,
@@ -499,10 +510,11 @@ impl QueueRepoTrait for &mut PgConnection {
         quantity: Option<i32>,
         drawing_code: Option<&'a str>,
         badge_code: Option<&'a str>,
+        worker_id: Option<i64>,
+        process_id: Option<i64>,
         note: Option<&'a str>,
         created_by: Option<i64>,
     ) -> Result<(), sqlx::Error> {
-        use crate::modules::part::repo::PartRepo;
         let new = NewPartEvent {
             id,
             part_id,
@@ -513,9 +525,11 @@ impl QueueRepoTrait for &mut PgConnection {
             quantity,
             drawing_code,
             badge_code,
+            worker_id,
+            process_id,
             note,
             created_by,
         };
-        PartRepo::insert_part_event(&mut **self, new).await
+        insert_part_event(&mut **self, new).await
     }
 }

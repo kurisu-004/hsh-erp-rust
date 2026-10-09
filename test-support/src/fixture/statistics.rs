@@ -18,15 +18,15 @@
 //! 是为保持跨域 fixture 形态一致 + 未来若加 HTTP 契约测试可直接复用 fx_part_manager。
 //!
 //! ## 为什么 fixture 极简（仅 1 工种）
-//! statistics 域 7 个场景（api.rs 4 + event_driven.rs 3）全部走 service 层直调，
+//! statistics 域场景（api.rs 2 + event_driven.rs 3）全部走 service 层直调，
 //! 每个用例都要按需造不同 prefix 的 L1 + 不同 status / event_type 的 part /
 //! event / 不同 badge 的 worker：
 //! - `uq_t_customer_root_prefix` 唯一索引要求 L1 prefix 全局唯一，测试自建
 //!   L1(prefix='F')，fixture 预置会冲突；
 //! - 状态机不允许 part 从 IN_PROCESS / COMPLETED 回退 PENDING，预置 PENDING 行
 //!   会让 `count_in_process_at` 等「期望空库」断言失败；
-//! - part_event / pickup_skip_event 都是测试现场按 event_type / worker_id /
-//!   part_id / created_at 构造，fixture 不预置避免污染；
+//! - part_event 是测试现场按 event_type / worker_id / part_id / created_at 构造，
+//!   fixture 不预置避免污染；
 //! - **t_worker 不预置**：`StatisticsService::worker_stats` 按日期范围列出全部工人，
 //!   而该方法当前**无** happy-path 集成测试（见 `CLAUDE.md`「覆盖空洞登记」）。
 //!   不预置的理由是**前瞻约束**、不是对现有断言的描述：将来任何按行数断言
@@ -45,14 +45,14 @@ use sqlx::PgPool;
 /// 字段名采用「原 tests/statistics/ 内曾出现过的字段名」最小集，避免与 fixture
 /// 字段名重构产生 churn；常量 ID 与 SQL INSERT 字面值逐字对应。
 ///
-/// **不预置 t_customer / t_part / t_part_batch / t_part_event /
-/// t_pickup_skip_event / t_worker**：fixture 只放「不可变共享」基线（1 工种）。
+/// **不预置 t_customer / t_part / t_part_batch / t_part_event / t_worker**：
+/// fixture 只放「不可变共享」基线（1 工种）。
 /// statistics 域测试需要按需造不同 L1 prefix / 不同 part status / 不同
 /// event_type / 不同 badge 的 worker，状态机不允许从 IN_PROCESS 回退 PENDING，
 /// worker_stats 端点按日期范围列全部工人不能预置 worker；预置行会让
 /// count_in_process_at / worker_stats 等「期望空库 / 期望严格
 /// 行数」断言失败。各 sub-file 按需用 sqlx::query 直插 customer / part /
-/// batch / event / pickup_skip_event / worker。
+/// batch / event / worker。
 #[allow(dead_code)]
 pub struct StatisticsFixture {
     /// 复用 PartFixture：L1 客户 id（带 serial_prefix='P'，statistics 域测试如
@@ -74,7 +74,7 @@ pub struct StatisticsFixture {
     /// 复用 PartFixture：MANAGER 用户名
     pub part_manager_username: String,
     /// statistics 自有：工种 FX-WT-STAT id（baseline 共享，worker_stats /
-    /// pickup_skip_summary 端点按 worker 聚合，工种存在不引入额外工人）
+    /// worker_detail 端点按 worker 聚合，工种存在不引入额外工人）
     pub work_type_id: i64,
 }
 

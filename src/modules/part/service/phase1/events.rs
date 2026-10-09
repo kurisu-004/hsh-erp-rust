@@ -49,8 +49,10 @@ impl PartService {
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "part 不存在"))?;
         // 2026-10-10 新增 3 个 LEFT JOIN，补投影前端时间线卡一直在读却拿不到的
         // `batch_no` / `worker_name` / `operator_name`（+ `operator_username`）。
+        // 2026-10-12 再加第 4 个 `LEFT JOIN t_process` + 选 `e.process_id`，
+        // 补出「事件发生时批次所处的工序」。
         //
-        // 三条 JOIN 的关键取舍：
+        // 四条 JOIN 的关键取舍：
         // - **全部 LEFT，绝不 INNER**：`e.worker_id` / `e.batch_id` 在历史数据上大量
         //   为 NULL，`e.created_by` 的 DB COMMENT 就是「操作者 `t_user.id`
         //   （NULL = 系统调度 / 历史数据）」—— INNER JOIN 会把整行丢掉，而本端点要
@@ -67,11 +69,24 @@ impl PartService {
         //   的审计语义自相矛盾）。`iam/repo/sql/user.rs` 各查询带的
         //   `deleted_at IS NULL` 是**账号管理**口径（那个场景下软删账号不该再被
         //   选中），两处口径不同、各自成立，**不要**互相「顺手对齐」。
+        // - **`t_process` 同样不过滤 `deleted_at`**：与 `t_part_batch` / `t_user` 同理，
+        //   事件行是当时的快照事实，工序后来被软删不该让历史行的工序列整个查不到名。
+        //   ⚠️ 但**改名会显新名**——`t_part_event` 只快照 `process_id`、不快照工序名，
+        //   要显旧名得在事件行另存 name 快照（不在本轮范围）。
         // - **表名加 `e` 前缀别名**：原查询无别名，JOIN 后 `id` / `created_at` 等
         //   列名会歧义。
-        // - `t_worker` 与 `t_user` 之间**没有关联列也没有 FK**，两者只是共享同一
-        //   个雪花 ID 空间 ⇒ 这是从事件行出发的两个**独立** JOIN，不是互相关联。
-        //   同理 `t_part_batch` 也不按 `deleted_at` 过滤（事件行是当时的快照事实）。
+        // - `t_worker` / `t_user` / `t_process` 之间**没有关联列也没有 FK**，只是
+        //   共享同一个雪花 ID 空间 ⇒ 这是从事件行出发的三个**独立** JOIN，不是互相
+        //   关联。`t_part_batch` 同样不按 `deleted_at` 过滤（事件行是当时的快照事实）。
+        //
+        // ⚠️ `e.process_id` 对**老事件**恒 NULL 不是投影漏了：该列由 migration
+        // 2026-10-12 新加且**不回填**。2026-10-12 起写侧在 5 个构造点填它
+        // （`prod::scan::service::worker_scan` 的 3 处 + `prod::scan::service::pickup`
+        // 的 2 处，均取事件时刻的批次工序快照；worker_scan 那三处取事件锚那一批，
+        // pickup 那两处取源批次），其余写点仍是
+        // `NULL` ⇒ **只有 2026-10-12 之后由报工台产生的作业类事件才有工序**，
+        // 它们的 `LEFT JOIN t_process` 命中，`process_id` / `process_name` 有值；
+        // 历史事件与工单级 / 批次级流转事件两者皆 `None`。
         //
         // `ORDER BY e.id DESC` 是刻意选择，**不要**改成 `created_at DESC`：
         // `t_part_event.id` 空间异质（雪花 / migration 回填的连续密集块 / 未被
@@ -90,11 +105,14 @@ impl PartService {
                    b.batch_no   AS batch_no,
                    w.name       AS worker_name,
                    u.full_name  AS operator_name,
-                   u.username   AS operator_username
+                   u.username   AS operator_username,
+                   e.process_id AS process_id,
+                   pr.name      AS process_name
               FROM t_part_event e
               LEFT JOIN t_part_batch b ON b.id = e.batch_id
               LEFT JOIN t_worker     w ON w.id = e.worker_id
               LEFT JOIN t_user       u ON u.id = e.created_by
+              LEFT JOIN t_process   pr ON pr.id = e.process_id
              WHERE e.part_id = $1
              ORDER BY e.id DESC
             "#,
@@ -120,6 +138,8 @@ impl PartService {
                 worker_name: r.worker_name,
                 operator_name: r.operator_name,
                 operator_username: r.operator_username,
+                process_id: r.process_id,
+                process_name: r.process_name,
             })
             .collect())
     }

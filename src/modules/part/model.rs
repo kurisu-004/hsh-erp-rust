@@ -9,7 +9,11 @@
 //!
 //! Phase PR-CRUD 增量：
 //! - TPart 25 列完整投影（含 NUMERIC 金额列 `unit_price` / `total_price`）
-//! - TPartEvent / NewPartEvent：保持不变（已对齐 migration 010）
+//!
+//! 2026-10-12：`t_part_event` 的 `FromRow` 投影（14 列，零读点）与 INSERT
+//! builder `NewPartEvent` 一并随表上提到 `crate::shared::part_event` —— 该表由
+//! 7 个模块写（part / prod::batch / prod::scan / prod::queue / outsource /
+//! assembly / shared::batch）、无域归属。两个类型都已从本文件删除。
 //!
 //! 2026-09-27 part 域前后端字段对齐：
 //! - TPart 加 `unit_price` / `total_price`（NUMERIC(12,2) / NUMERIC(14,2) NOT NULL
@@ -117,47 +121,6 @@ pub struct TPartInspected {
     pub order_no: Option<String>,
     pub updated_at: NaiveDateTime,
     pub updated_by: Option<i64>,
-}
-
-/// `t_part_event` 行（`FromRow` 投影；实际写入走 `NewPartEvent<'a>` builder）。
-///
-/// 列对齐 migration 010（含 0018/0020 增列）。
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct TPartEvent {
-    pub id: i64,
-    pub part_id: i64,
-    pub worker_id: Option<i64>,
-    pub event_type: String,
-    pub from_status: Option<String>,
-    pub to_status: Option<String>,
-    pub drawing_code: Option<String>,
-    pub badge_code: Option<String>,
-    pub note: Option<String>,
-    pub created_at: NaiveDateTime,
-    pub created_by: Option<i64>,
-    pub outsource_company_id: Option<i64>,
-    pub batch_id: Option<i64>,
-    pub quantity: Option<i32>,
-}
-
-/// 新事件 builder —— 由 service 层在事务内构造，repo 负责 INSERT。
-///
-/// `id` 由调用方用 `SnowflakeIdGenerator::next_id()` 预生成；
-/// `created_at` 走 DB 默认 `now()`（保持与其它写入路径一致）。
-/// 其余可选字段在不需要时传 `None`。
-pub struct NewPartEvent<'a> {
-    pub id: i64,
-    pub part_id: i64,
-    /// 事件类型，如 `"STATUS_CHANGED"` / `"BATCH_PASSED"` 等。
-    pub event_type: &'a str,
-    pub from_status: Option<&'a str>,
-    pub to_status: Option<&'a str>,
-    pub batch_id: Option<i64>,
-    pub quantity: Option<i32>,
-    pub drawing_code: Option<&'a str>,
-    pub badge_code: Option<&'a str>,
-    pub note: Option<&'a str>,
-    pub created_by: Option<i64>,
 }
 
 /// `t_part` rollup 派生列投影（PR-B2 `sync_from_batch_change` 用）。
