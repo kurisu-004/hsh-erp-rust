@@ -47,9 +47,17 @@
 //! ## 与 WS 的关系
 //! `worker-scan` 在 commit 后广播 `WORKER_SCAN_RETURNED` /
 //! `WORKER_SCAN_INSPECTED`（按**响应**的 `event_type`，不是请求的那个）+
-//! `WORKER_POOL_REFILL_DONE` / `WORKER_POOL_EMPTY`；`pick-up` 广播
+//! `WORKER_POOL_REFILL_DONE` / `WORKER_POOL_EMPTY`，**部分数量拆批时另发
+//! `PART_BATCH_SPLIT`**（与 `pick-up` 那条同名同 payload 字段）；`pick-up` 广播
 //! `PART_PICKED_UP`（部分领取时另发 `PART_BATCH_SPLIT`）。**事件名一字不改** ——
 //! dashboard 与队列页在监听，改名会静默断链。
+//!
+//! ## 部分数量（2026-10-11 新增）
+//! `worker-scan` 的 `RETURNED` / `INSPECTED` 与同域 `pick-up` 一样支持 `quantity`
+//! 指定本次操作量：缺省 = 整批，`0 < q < batch.quantity` 自动拆批并作用在拆出来的
+//! 那一批上（响应 `scan.batch_id` 返回它），`<= 0` / `>` 返 `20111`。**两处的差别
+//! 只有一处**：worker-scan 的**余量继承 `current_holder_id` 留在工人手上**（继续
+//! 出现在「已持有」列表），pick-up 的余量留在原处。
 //!
 //! 契约文档见 `docs/api/scan.md`。
 
