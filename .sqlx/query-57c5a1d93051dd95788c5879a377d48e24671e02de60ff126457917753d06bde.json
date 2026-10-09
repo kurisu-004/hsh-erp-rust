@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT COUNT(*) AS \"n!\"\n            FROM t_part_batch b\n            WHERE b.status IN ('DELIVERED', 'COMPLETED')\n              AND b.deleted_at IS NULL\n              AND EXISTS (\n                  SELECT 1 FROM t_part p\n                  WHERE p.id = b.part_id\n                    AND p.deleted_at IS NULL\n              )\n              AND EXISTS (\n                  SELECT 1 FROM t_part_event e\n                  WHERE e.batch_id = b.id\n                    AND e.event_type = 'DELIVERED'\n                    AND e.created_at::text LIKE $1\n              )\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "n!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "57c5a1d93051dd95788c5879a377d48e24671e02de60ff126457917753d06bde"
+}

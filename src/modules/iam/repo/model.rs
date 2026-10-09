@@ -1,4 +1,10 @@
-// iam 域数据模型
+//! iam 域数据模型
+//!
+//! 2026-10-11（wx BFF 重构 B1）：`User` 新增 `worker_id: Option<i64>` —— 系统账号
+//! 「正式绑定」到 `t_worker.id`，取代此前把 `t_user.id` 直接当 `t_worker.id` 用的
+//! 错误假设。详见该字段的 doc 与
+//! `migrations/20261011120000_001_add_user_worker_id.sql`。
+
 use chrono::NaiveDateTime;
 
 /// `t_user` 行
@@ -12,6 +18,23 @@ pub struct User {
     pub is_active: bool,
     pub last_login_at: Option<NaiveDateTime>,
     pub refresh_token_version: i32,
+    /// 该系统账号绑定的工人（`t_worker.id`）；`None` = 非工人账号 / 尚未绑定。
+    ///
+    /// 2026-10-11 随 wx BFF 重构新增。此前 `t_user` 与 `t_worker` 之间**没有任何
+    /// 映射**，`GET /api/v2/wx/worker/stats` 只能把 `t_user.id` 直接当
+    /// `t_part_event.worker_id`（语义上是 `t_worker.id`）用，实测对任何真实用户
+    /// 恒返 `batch_count = 0`；本列是正式绑定关系（见
+    /// `migrations/20261011120000_001_add_user_worker_id.sql`）。
+    ///
+    /// - **无物理外键**（仓库铁律）：普通 `bigint` + partial 索引
+    ///   `ix_t_user_worker_id`，指向的工人是否存在 / 是否软删由 service 层校验；
+    /// - 该列**跨域**指向 `prod::worker` 域的 `t_worker`，但 iam 侧只作为
+    ///   「账号自身属性」存读，不在本域 SQL 里 JOIN `t_worker`，故不违反
+    ///   `iam_domain_depends_on_no_other_domain` 域隔离护栏；
+    /// - **当前无回填**：一次性回填脚本是
+    ///   `scripts/sql/20261011_backfill_t_user_worker_id.sql`（须人工确认后手工
+    ///   执行），库中存量账号的该列一律为 NULL。
+    pub worker_id: Option<i64>,
     pub version: i32,
     pub created_at: NaiveDateTime,
     pub created_by: Option<i64>,

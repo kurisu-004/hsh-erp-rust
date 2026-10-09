@@ -4,21 +4,25 @@
 //! admin 都不 import 别域的 service / repo，而是各自在本域 SQL 里聚合），但口头
 //! 约定挡不住回退，故用单测在源码层兜住。
 //!
-//! 已接入共 **6 处**，分两类：
-//! - **整域接入 4 处**：`dashboard`（扫 `src/modules/dashboard`）、`iam`（扫
+//! 已接入共 **7 处**，分两类：
+//! - **整域接入 5 处**：`dashboard`（扫 `src/modules/dashboard`）、`iam`（扫
 //!   `src/modules/iam`，含嵌套子模块 `iam::shelf`）、`prod::programming`（扫
 //!   `src/modules/prod/programming`）、`prod::inspection`（扫
 //!   `src/modules/prod/inspection`）—— 后两域是**嵌套域**，同父兄弟域
-//!   （`prod::batch`）同样算跨域，由前缀匹配而非「首段相同即本域」判定。
-//! - **非整域切片接入 2 处**：`prod::queue::board`（只扫
+//!   （`prod::batch`）同样算跨域，由前缀匹配而非「首段相同即本域」判定 —— 以及
+//!   `wx::production`（扫 `src/modules/wx/production`，2026-10-11 新增）。
+//! - **非整域切片接入 3 处**：`prod::queue::board`（只扫
 //!   `src/modules/prod/queue/board`）与 `prod::scan::listing`（只扫
 //!   `src/modules/prod/scan/listing`）—— 这两个域整体**不适用**该护栏
 //!   （queue 的写端点按既定 pattern 经本域 trait 转发他域单表查询；scan 是
 //!   转发型域，其 `worker_scan` 必然 import 四处域），故各只圈出那块纯只读
-//!   聚合 SQL 单独守。
+//!   聚合 SQL 单独守；以及 `wx::part_list`（只扫
+//!   `src/modules/wx/part_list`）—— `wx` 域**整体**不适用（它的 `login` 子模块
+//!   必然 import `iam::service::account`），故只圈出 `part_list` 这块纯只读聚合
+//!   切片（2026-10-11 新增）。
 //!
-//! 计数口径：**6 处 = 4 整域 + 2 非整域切片**。说「已接入的 N 域」时只数整域那 4
-//! 处（切片不是域）；说「已接入 N 处调用」时才是 6。
+//! 计数口径：**7 处 = 5 整域 + 3 非整域切片**。说「已接入的 N 域」时只数整域那 5
+//! 处（切片不是域）；说「已接入 N 处调用」时才是 7。
 //!
 //! ## 探测口径
 //! 在**剥掉注释**的代码区里找「跨域根段 + 双冒号 + 一个域路径」，该路径不是本域即违规。

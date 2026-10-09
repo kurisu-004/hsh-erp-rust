@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-> 📌 **前端对接**：后端 API 参考见 [`docs/api/`](docs/api/)。**2026-10-10 现状**：`docs/api/` 有 10 份文件，每份是一个域的**整域契约**（端点表 / 逐字段 / 口径表 / 错误码 / 移除记录 / WS 关系 / 表依赖与前端配套 / 已知偏差登记），范本是 [`dashboard.md`](docs/api/dashboard.md) 的八节骨架：
+> 📌 **前端对接**：后端 API 参考见 [`docs/api/`](docs/api/)。**2026-10-11 现状**：`docs/api/` 有 11 份文件，每份是一个域的**整域契约**（端点表 / 逐字段 / 口径表 / 错误码 / 移除记录 / WS 关系 / 表依赖与前端配套 / 已知偏差登记），范本是 [`dashboard.md`](docs/api/dashboard.md) 的八节骨架：
 > - [`docs/api/dashboard.md`](docs/api/dashboard.md) —— 大屏聚合域（3 个只读 HTTP 端点 + WS 首帧 / 增量；`DELIVERY_STATUSES` 四处共用、行单位、装配件整套交付不变式、`ts` 格式、前端配套清单）
 > - [`docs/api/programming.md`](docs/api/programming.md) —— `prod::programming` 待编程一览（part 状态闸门 + 三规则并集、part 级去重、批次锚点、排序白名单大小写不对称）
 > - [`docs/api/inspection.md`](docs/api/inspection.md) —— `prod::inspection` 待品检（队列列表 + 扫码三层树、`l1_customer_name` 与返修侧有意分叉、域隔离漏报盲区）
@@ -13,6 +13,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 > - [`docs/api/delivery_note.md`](docs/api/delivery_note.md) —— `com::delivery_note` 送货单（17 端点；扫码三层树 + DP 批次分配 / 建单判定键单键 / 移除记录 29 条 VO 字段）
 > - [`docs/api/shelves.md`](docs/api/shelves.md) —— **iam 域下的货架子模块**（2026-10-10 自独立 shelf 域迁入 iam，URL 硬切 `/api/v2/shelves/*` → `/api/v2/iam/shelves/*`、旧前缀 404；5 端点、`t_shelf.capacity` 负载上限 + `ShelfOut.current_load` 出参、自动选架算法与 `shelf_scope_for` 三分支、picker 两端点移除记录）
 > - [`docs/api/iam.md`](docs/api/iam.md) —— `iam` 认证 + 账号 + 货架子模块域（**22 端点** = session 5 + users 12 + shelves 5；4 条破坏性变更（`DELETE wx-bind` → `POST .../unbind`、`GET wx-bind` 返 `Option`、bind 删 `corp_id`、4 端点 body 必填 `version`）、`t_wx_identity` 的双向一对一与 TOCTOU 偏差、`uk_t_user_role_user_role_scope` **非 partial**、角色/scope 变更滞后一个 session TTL）
+> - [`docs/api/wx.md`](docs/api/wx.md) —— `wx` 微信小程序 BFF 域（**2026-10-11 新建**；按小程序页面切子模块：`login/` + `part_list/`；URL 硬切无 alias 5 条（`/wx/iam/wx-login` → `/wx/login/wecom`、`/wx/parts/*` → `/wx/part-list/*`、`/wx/dashboard/home` 删除）、VO 逐字对齐前端卡片模型改 camelCase、4 类 tab 折叠的静默兜底、`deliveredQty` 真值、尾斜杠 404 实测钉死）
 >
 > **其它域的契约在代码注释里**（各域 `mod.rs` / `repo.rs` / `vo` / `dto` 的模块 doc 与逐字段 doc），本仓的目录约定见本文件「`docs/api/` 目录约定」一节。⚠️ **引用不存在的文档路径是禁止的** —— 后端代码变更（新增 / 修改 / 删除端点，或修改 DTO 字段 / 错误码）必须同步更新对应域的 `docs/api/` 文件（若该域有）与代码注释。
 
@@ -198,7 +199,7 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 
 - **域外依赖 = 0**（只读 5 表 `t_part` / `t_part_batch` / `t_assembly` / `t_customer` / `t_worker`，只读跨域聚合是本仓既定 pattern，同 `statistics` / `admin`）。
   - **护栏设施**：`src/shared/domain_guard.rs`（`#[cfg(test)]` 项、不进 lib 产物，故**只有 `src/` 内单元测试能用**，`tests/` 集成测试拿不到、要靠它得先改调用方式）的 `assert_no_foreign_domain(本域路径, 本域源码目录, 域专属指引)` —— 在剥掉注释的代码区里找「域根段 + 他域路径」前缀失配；不连网不连库，单测可在无 DB 环境跑。已登记的漏报盲区与精度边界见该文件顶部 doc。
-  - **已接入共 6 处 = 整域 4 + 非整域切片 2**（与 `src/shared/domain_guard.rs` 顶部 doc 同一套口径）：整域接入的 4 处是 `modules::dashboard::tests::dashboard_domain_depends_on_no_other_domain`（扫 `src/modules/dashboard/**/*.rs`）、`modules::iam::tests::iam_domain_depends_on_no_other_domain`（扫 `src/modules/iam/**/*.rs`，含嵌套子模块 `iam::shelf`；⚠️ iam 是「**纯自有表域**」—— `t_user` / `t_user_role` / `t_menu` / `t_wx_identity` / `t_shelf` 全部归它，不需要 dashboard / statistics 那种「在本域 SQL 里跨域只读聚合」的取舍，故这条护栏只有「不许 import 别人的 service / repo」一重含义）、`modules::prod::programming::tests::programming_domain_depends_on_no_other_domain`、`modules::prod::inspection::tests::inspection_domain_depends_on_no_other_domain`（后两者分别扫 `src/modules/prod/programming/**/*.rs` 与 `src/modules/prod/inspection/**/*.rs`，本域路径为嵌套域 `prod::xxx`，**同父兄弟域 `prod::batch` 同样算跨域**）；**非整域切片接入**的 2 处是 `modules::prod::queue::board::tests::board_aggregation_depends_on_no_other_domain`（只扫 `src/modules/prod/queue/board/**/*.rs` —— queue 域整体**不适用**该护栏，它的写端点按既定 pattern 经本域 trait 转发其它域单表查询）与 `modules::prod::scan::listing::tests::listing_aggregation_depends_on_no_other_domain`（只扫 `src/modules/prod/scan/listing/**/*.rs` —— `prod::scan` 是**转发型**域，`worker_scan` 必然 import `part` / `assembly` / `prod::queue` / `prod::worker` 四处域，但它的 2 条只读聚合端点完全可以零跨域；圈出可守的部分比整域不守要强）。新增只读跨域聚合域时照此加一行调用即可。
+  - **已接入共 7 处 = 整域 5 + 非整域切片 3**（2026-10-11 review 第 1 轮由 6 = 4 + 2 订正：wx BFF 重构新增 `wx::production` 整域接入 + `wx::part_list` 切片接入。与 `src/shared/domain_guard.rs` 顶部 doc 同一套口径）：整域接入的 5 处是 `modules::dashboard::tests::dashboard_domain_depends_on_no_other_domain`（扫 `src/modules/dashboard/**/*.rs`）、`modules::iam::tests::iam_domain_depends_on_no_other_domain`（扫 `src/modules/iam/**/*.rs`，含嵌套子模块 `iam::shelf`；⚠️ iam 是「**纯自有表域**」—— `t_user` / `t_user_role` / `t_menu` / `t_wx_identity` / `t_shelf` 全部归它，不需要 dashboard / statistics 那种「在本域 SQL 里跨域只读聚合」的取舍，故这条护栏只有「不许 import 别人的 service / repo」一重含义）、`modules::prod::programming::tests::programming_domain_depends_on_no_other_domain`、`modules::prod::inspection::tests::inspection_domain_depends_on_no_other_domain`（后两者分别扫 `src/modules/prod/programming/**/*.rs` 与 `src/modules/prod/inspection/**/*.rs`，本域路径为嵌套域 `prod::xxx`，**同父兄弟域 `prod::batch` 同样算跨域**）、`modules::wx::production::tests::production_domain_depends_on_no_other_domain`（扫 `src/modules/wx/production/**/*.rs`；本域读 `t_user` / `t_worker` / `t_work_type` 但按既定 pattern 在本域 SQL 里只读聚合，不 import `iam::service::account`）；**非整域切片接入**的 3 处是 `modules::prod::queue::board::tests::board_aggregation_depends_on_no_other_domain`（只扫 `src/modules/prod/queue/board/**/*.rs` —— queue 域整体**不适用**该护栏，它的写端点按既定 pattern 经本域 trait 转发其它域单表查询）、`modules::prod::scan::listing::tests::listing_aggregation_depends_on_no_other_domain`（只扫 `src/modules/prod/scan/listing/**/*.rs` —— `prod::scan` 是**转发型**域，`worker_scan` 必然 import `part` / `assembly` / `prod::queue` / `prod::worker` 四处域，但它的 2 条只读聚合端点完全可以零跨域；圈出可守的部分比整域不守要强）与 `modules::wx::part_list::tests::part_list_domain_depends_on_no_other_domain`（只扫 `src/modules/wx/part_list/**/*.rs` —— `wx` 域整体**不适用**该护栏，其 `login` 子模块必然 import `iam::service::account`，但 `part_list` 这块只读聚合完全可以零跨域）。新增只读跨域聚合域时照此加一行调用即可。
   - **元测试**：`shared::domain_guard::tests::*`（6 条，含「本域标识符非法必须 panic」与 raw string 字符串状态两组）。任一写法漏报、误报或探测器瞎了都会红。
 - `DELIVERY_STATUSES`（6 态，`repo/delivery.rs`）是「未交付」的**唯一**判据，逾期计数 / 面板 / 抽屉 / 柱状图 top+middle 四处共用；柱状图 bottom 层额外含 `DELIVERED`。**它与前端 `LAYERS[].statuses` 是人工同步关系，无编译期保障**，改一侧必须改另一侧。
 - ⚠️ **行单位**（2026-10-10）：逾期 = **工单级**；交期面板三桶 = **工单级**（装配件行**替换**其子件行，行内新增 `row_type` 标 PART / ASSEMBLY，装配件的 `quantity` 与 `delivered_quantity` 单位是**套**）；柱状图 / 抽屉 = **件级**（子件各算 1）。
@@ -394,7 +395,7 @@ t_assembly.status               ← 派生缓存
 
 ## `docs/api/` 目录约定（2026-10-07 确立）
 
-**现状**：`docs/api/` 有 9 份文件，每份 = **一个域的整域契约**：
+**现状**：`docs/api/` 有 **11 份**文件（与本文件顶部「📌 前端对接」一节同口径；2026-10-11 review 第 1 轮订正——此前此处写「9 份」而同文件顶部已写「11 份」，且表格漏登 `wx.md`，两处自相矛盾），每份 = **一个域的整域契约**：
 
 | 文件 | 覆盖域 |
 |---|---|
@@ -408,6 +409,7 @@ t_assembly.status               ← 派生缓存
 | [`docs/api/delivery_note.md`](docs/api/delivery_note.md) | `com::delivery_note`（送货单 + 送货分组 + 司机候选，2026-10-08 平移 com + 入单收敛为扫码单一入口） |
 | [`docs/api/shelves.md`](docs/api/shelves.md) | `iam::shelf`（**iam 域下的嵌套子模块**：货架 CRUD + 负载与自动选架，5 端点；2026-10-10 自独立 shelf 域迁入 iam，URL 硬切 `/api/v2/iam/shelves/*`） |
 | [`docs/api/iam.md`](docs/api/iam.md) | `iam`（认证 + 账号 + 企业微信绑定 + 货架子模块，**22 端点**；session 5 + users 12 + shelves 5，4 条破坏性变更与 OCC 锚点） |
+| [`docs/api/wx.md`](docs/api/wx.md) | `wx` 微信小程序 BFF（**2026-10-11 新建**；**按小程序页面切子模块**：`login/` + `part_list/` + `production/`；5 端点；URL 硬切无 alias 5 条、VO camelCase 逐字对齐前端卡片模型、4 类 tab 折叠的静默兜底、`deliveredQty` 真值、尾斜杠 404 实测钉死、`counts` / `list` 口径对齐） |
 
 **约定**：
 

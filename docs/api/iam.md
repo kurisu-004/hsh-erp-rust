@@ -3,8 +3,11 @@
 > 本文件是 iam 域的**唯一**契约来源。任何字段 / 端点变更必须同步本文件。
 > 覆盖域：`src/modules/iam/`（`handler` / `dto` / `vo` / `service` / `repo`）+
 > 嵌套子模块 `src/modules/iam/shelf/`（**货架子模块**，见 §1.4）。
-> 域外有一处开口：`modules/wx/auth.rs` 的 `POST /api/v2/wx/iam/wx-login` 经
-> `AccountService::resolve_wx_login_user` 反查本域的 `t_wx_identity`（见 §5）。
+> 域外有一处开口：`modules/wx/login/handler.rs` 的 `POST /api/v2/wx/login/wecom`
+> 经 `AccountService::resolve_wx_login_user` 反查本域的 `t_wx_identity`（见 §5）。
+> ⚠️ 2026-10-11 更新：该端点原为 `modules/wx/auth.rs` 的
+> `POST /api/v2/wx/iam/wx-login`，B2 随 wx 域按页面切子模块时**硬切为**
+> `/api/v2/wx/login/wecom`（旧路径 **404 无 alias**，见 `docs/api/wx.md` §5）。
 
 ## 1. 端点表
 
@@ -229,7 +232,9 @@ CRUD 完全独立 —— 本表只覆盖 session / users 两段。
 | `GET /iam/users/{id}/wx-bind` 的「账号存在性校验」 | 无 | 查不存在的账号返 `data: null` 而非 404（端点语义就是「查绑定」） |
 | 3 个 wx service 方法的 `&mut PgConnection` 签名 | 泛型 `R: IamRepoTrait` | 进 trait 后才拿到单测 mock 面；`t_wx_identity` 的 SQL 真源同步从 `modules/wx/repo.rs` 搬进 `modules/iam/repo/sql/wx_identity.rs` |
 
-**域外开口**（不是移除，是收口）：`modules/wx/auth.rs` 的 wx-login 过去直接调
+**域外开口**（不是移除，是收口）：`modules/wx/login/` 的 `POST /api/v2/wx/login/wecom`
+（2026-10-11 B2 前为已删除的 `modules/wx/auth.rs` 的 `POST /api/v2/wx/iam/wx-login`）
+过去直接调
 `WxIdentityRepo::get_by_corp_and_user` + `iam::repo::sql::user::get_user_by_id`，
 现在两步合进 `AccountService::resolve_wx_login_user`。**错误码语义逐字未变**
 （未绑定 40107、账号已软删 40101）：`tests/wecom_login.rs` 的 10 个 `wx_login_*`

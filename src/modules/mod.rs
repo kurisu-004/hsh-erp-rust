@@ -132,6 +132,9 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .nest("/outsource-queue", outsource::queue_router())
         .nest("/statistics", statistics::router())
         // 2026-09-28 新增：微信小程序 BFF 域（聚合端点 + 复用 IAM 鉴权）
+        // 2026-10-11 重构：按小程序页面切子模块（`/login` + `/part-list`），
+        //   URL 跟页面名走，旧 `/wx/iam/*` / `/wx/parts*` / `/wx/dashboard*`
+        //   **硬切无 alias**（一律 404），端点清单见 `modules/wx/mod.rs`。
         .nest("/wx", wx::router())
         // 2026-09-14 新增：e2e 测试 seed hook（dev/test 默认启用，release profile 硬关）
         .nest("/_e2e", _e2e::router())

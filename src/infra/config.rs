@@ -319,7 +319,8 @@ impl Default for PythonBackendConfig {
 /// 2026-09-29 新增：企业微信小程序登录（自建应用 `jscode2session`）配置。
 ///
 /// ## 触发场景
-/// `POST /api/v2/wx/iam/wx-login` 用小程序 `wx.login()` 拿到的**一次性 code**
+/// `POST /api/v2/wx/login/wecom`（2026-10-11 硬切，旧 `/api/v2/wx/iam/wx-login`
+/// 已 404）用小程序 `wx.login()` 拿到的**一次性 code**
 /// 换企业微信 `userid`，再按 `t_wx_identity` 预绑定表反查系统账号。
 /// 走企业微信的 `/cgi-bin/miniprogram/jscode2session`（**不是**微信的
 /// `api.weixin.qq.com/sns/jscode2session`），因此 `access_token` 必须用

@@ -401,10 +401,11 @@ fn extract_key(headers: &HeaderMap) -> Option<String> {
 /// infra 中间件层，auth 是 modules 之上层；调用方向反了）。两份白名单必须
 /// 同步演化——新增公开路径时同时改这里与 auth 侧 `is_public_path`。
 ///
-/// 2026-09-29 新增 `/wx/iam/wx-login`（企业微信小程序登录）。**这是最容易漏的
+/// 2026-09-29 新增 wx 登录端点；**2026-10-11 硬切改名**为
+/// `/wx/login/wecom`（旧 `/wx/iam/wx-login` 无 alias、已 404）。**这是最容易漏的
 /// 一处**：wx-login 响应体含 `token` / `refresh_token`，若被本中间件缓存，
 /// 攻击者只要复用同一个 `Idempotency-Key` 就能拿到别人的 access token。
-/// 集成测试 `tests/wecom_login.rs::idem_key_does_not_cache_wx_login_response`
+/// 集成测试 `tests/wecom_login.rs::wx_login_idempotency_key_does_not_cache_jwt_response`
 /// 就是为了钉死这条不变量。
 ///
 /// 路径形式：生产 nest `/api/v2` + 模块子路径（`/api/v2/iam/login`）；测试
@@ -415,8 +416,9 @@ fn is_public_idempotency_path(path: &str) -> bool {
     stripped == "/health"
         || stripped == "/iam/login"
         || stripped == "/iam/refresh"
-        // 2026-09-29：企业微信小程序登录（响应含 JWT，**不可**缓存）
-        || stripped == "/wx/iam/wx-login"
+        // 2026-09-29 新增 / 2026-10-11 硬切改名：企业微信小程序登录
+        // （响应含 JWT，**不可**缓存）
+        || stripped == "/wx/login/wecom"
         || stripped == "/_e2e"
         || stripped.starts_with("/_e2e/")
 }
@@ -539,12 +541,18 @@ mod tests {
     }
 
     /// 公开路径闸门的既有语义保持不变（登录响应含 JWT，绝不可缓存）。
+    ///
+    /// ⚠️ `/api/v2/wx/login/wecom` 这一行是 **2026-10-11 硬切后的新 URL**（旧
+    /// `/api/v2/wx/iam/wx-login` 已 404）。同时断言旧路径**不再**是公开路径 ——
+    /// 它虽然已无 handler，但白名单里留着一条死条目会让人误以为旧路径还活着。
     #[test]
     fn public_path_gate_still_rejects_auth_endpoints() {
         assert!(is_public_idempotency_path("/api/v2/iam/login"));
         assert!(is_public_idempotency_path("/iam/login"));
         assert!(is_public_idempotency_path("/api/v2/iam/refresh"));
-        assert!(is_public_idempotency_path("/api/v2/wx/iam/wx-login"));
+        assert!(is_public_idempotency_path("/api/v2/wx/login/wecom"));
+        // 2026-10-11 硬切：旧路径不再是公开路径
+        assert!(!is_public_idempotency_path("/api/v2/wx/iam/wx-login"));
         assert!(!is_public_idempotency_path(
             "/api/v2/delivery-notes/1/print"
         ));

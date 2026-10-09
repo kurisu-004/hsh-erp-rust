@@ -102,6 +102,8 @@ pub fn sample_user(id: i64, username: &str) -> crate::modules::iam::repo::User {
         is_active: true,
         last_login_at: None,
         refresh_token_version: 0,
+        // 2026-10-11 新增列：mock 行默认不绑定工人（与「非工人账号」一致）
+        worker_id: None,
         version: 1,
         created_at: now,
         created_by: Some(1),

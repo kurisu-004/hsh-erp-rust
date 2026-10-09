@@ -93,7 +93,7 @@ impl AccountService {
     // =======================================================================
 
     /// 把「企业微信 `(corp_id, wx_user_id)`」解析成系统账号，供 wx 域的
-    /// `POST /api/v2/wx/iam/wx-login` 调（该 handler 随后把 `User` 交给
+    /// `POST /api/v2/wx/login/wecom` 调（该 handler 随后把 `User` 交给
     /// `SessionService::login_by_user_id`）。
     ///
     /// ## 错误码（对外契约，勿改文案）

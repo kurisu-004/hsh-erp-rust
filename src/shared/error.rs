@@ -51,7 +51,8 @@ pub mod code {
     pub const REFRESH_INVALID: i32 = 40103; // refresh token 失效/版本不匹配/用户停用
     pub const OLD_PASSWORD_MISMATCH: i32 = 40104; // 修改密码时旧密码错误
     pub const SESSION_REVOKED: i32 = 40105; // 服务端 Redis session 不存在（已 logout/改密/吊销）
-    // 2026-09-29 新增：企业微信小程序登录（`/api/v2/wx/iam/wx-login`）4 个码。
+    // 2026-09-29 新增：企业微信小程序登录（2026-10-11 起 URL 为
+    // `/api/v2/wx/login/wecom`）4 个码。
     //
     // 槽位选择：40105 之后顺延（401xx = 鉴权语义层，与 iam 登录失败同族）。
     // 语义边界：40106/40109 是「登录请求本身失败」；40107/40108 是「绑定关系

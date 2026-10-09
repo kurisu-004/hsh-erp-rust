@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT COUNT(*) AS \"n!\"\n            FROM t_part_batch b\n            WHERE b.status = 'IN_PROCESS'\n              AND b.deleted_at IS NULL\n              AND EXISTS (\n                  SELECT 1 FROM t_part p\n                  WHERE p.id = b.part_id\n                    AND p.deleted_at IS NULL\n              )\n              AND b.updated_at::text LIKE $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "n!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "015606ffdf588bcc045ad7068802d610ad052a78c53749143aa6a4993b4b02f8"
+}

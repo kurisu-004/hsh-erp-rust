@@ -1,7 +1,11 @@
-//! 企业微信小程序登录（`POST /api/v2/wx/iam/wx-login`）集成测试（2026-09-29 新增）
+//! 企业微信小程序登录（`POST /api/v2/wx/login/wecom`）集成测试（2026-09-29 新增，
+//! 2026-10-11 URL 硬切改名：旧 `/api/v2/wx/iam/wx-login` **无 alias、已 404**）
 //!
 //! 覆盖 15 条 HTTP 契约：
 //!  1. 成功 → 200 + `data.token` 非空 + `data.user.roles` 正确
+//!     （★ 2026-10-11 起响应体只有 6 个字段，不带 `expires_in` / `is_active` /
+//!     `shelf_ids` / `menus`；逐字段断言见
+//!     `tests/wx/part_list.rs::wx_login_response_only_exposes_six_fields`）
 //!  2. 企微返 40029 → 40106
 //!  3. userid 未预绑定 → 40107
 //!  4. corpid 与配置不符 → 40107
@@ -48,7 +52,7 @@ use hsh_erp_test_support::{
 };
 
 /// wx-login 端点路径（测试直接挂 `v2_router`，无 `/api/v2` 前缀）。
-const WX_LOGIN: &str = "/wx/iam/wx-login";
+const WX_LOGIN: &str = "/wx/login/wecom";
 
 // ===========================================================================
 // Helpers
