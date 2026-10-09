@@ -33,6 +33,18 @@
 //! | `GET /part-files/{id}/url` | M / C / I / CNC | **刻意不含 SHELF**，见下 |
 //! | `POST /part-files`（上传） | M / C / CNC（`bind_uploaded_file` 只 M / C） | 未动 |
 //! | `POST /part-files/{id}/delete` | 按 kind 派生（图纸类 M / C，G_CODE M / CNC） | 未动 |
+//! | `GET /part-files/parts/{id}/files` | M / C / I / CNC | **handler 级**闸门，比 service 严 |
+//! | `GET /part-files/parts/{id}/cnc-programs` | M / C / I / CNC | 同上 |
+//! | `GET /part-files/parts/{id}/setup-sheets` | M / C / I / CNC | 同上 |
+//!
+//! **闸门分两层，不是巧合**：零件维度的三条嵌套列表端点各自在 handler 里先过一道
+//! 4 角色（`handler.rs` 的 `list_part_files_for_part` / `list_part_cnc_programs` /
+//! `list_part_setup_sheets`），再进 `PartFileService::list_files`（5 角色）。**取交集
+//! ⇒ 4 角色**，SHELF_ACCOUNT 进不去。放开只发生在顶层 `GET /part-files` 一条上。
+//! ⚠️ handler 这道闸门是本域的既有形状（`list_part_files_for_part` 一直有，另两条
+//! 补齐后三条一致），**不是**为工控机账号新加的一层；前端对这三条的列表消费早已切走
+//! （零件 / 装配件文件列表统一走 `GET /part-files?owner_id=…&kind=…`），现存消费方
+//! 都在那些页面上、与 SHELF_ACCOUNT 无关。
 //!
 //! ### 为什么 `/url` 不跟着放开
 //!

@@ -12,13 +12,18 @@
 //!   9. rbac_shelf_account_can_list_files — 工控机账号能列文件（2026-10-10 放开）
 //!  10. rbac_shelf_account_can_get_file_content — 工控机账号能读内容（2026-10-10 放开）
 //!  11. rbac_shelf_account_get_file_url_still_forbidden — 预签直链**不**放开给工控机
-//!  12. rbac_shelf_account_cannot_upload_or_delete — 只放开只读，写路径仍拒//!
+//!  12. rbac_shelf_account_cannot_upload_or_delete — 只放开只读，写路径仍拒
+//!  13. rbac_shelf_account_rejects_part_nested_lists — 零件维度三条嵌套列表端点仍拒
+//!
 //! ## 集成策略
-//! 不启 axum（避免 JWT/Redis 开销），直接 service 直调；`pool.begin()` 开 tx →
+//! 主体是**直接 service 直调**（避免 JWT/Redis 开销）：`pool.begin()` 开 tx →
 //! 传 `&mut *tx` 给 service → 显式 `tx.commit()`。
+//! 例外是钉 **handler 级**角色闸门的用例（`rbac_shelf_account_rejects_part_nested_lists`）——
+//! handler 闸门在 service 之上，直调 service 结构上测不到，故那一条起 axum 走真实路由。
 
 use std::sync::Arc;
 
+use axum::http::StatusCode;
 use hsh_erp_rust::auth::rbac::{CurrentUser, Role};
 use hsh_erp_rust::infra::cos::NoopCos;
 use hsh_erp_rust::modules::part_file::service::PartFileService;
@@ -1144,5 +1149,65 @@ async fn rbac_shelf_account_cannot_upload_or_delete() {
     match del_err {
         AppError::Biz { code, .. } => assert_eq!(code, 40300, "软删：FORBIDDEN"),
         other => panic!("软删：期望 AppError::Biz(40300)，got {other:?}"),
+    }
+}
+
+/// 零件维度的三条**嵌套**列表端点对 SHELF_ACCOUNT **仍拒**。
+///
+/// `PartFileService::list_files` 的白名单已含 `ShelfAccount`（供报工台预览图纸），
+/// 放开的只有顶层 `GET /part-files` 一条。零件维度这三条在 handler 里各自先过一道
+/// 4 角色闸门，取交集 ⇒ 4 角色，SHELF_ACCOUNT 进不去。闸门在 handler 层 ⇒ 本用例
+/// **必须走真实路由**（直调 service 测不到它）。
+///
+/// 顺带钉住正向对照：MANAGER 打同三条是 200 —— 证明闸门只挡 SHELF，不是「全员拒」。
+#[tokio::test]
+async fn rbac_shelf_account_rejects_part_nested_lists() {
+    let pool = test_pool().await;
+    let fx = load_part_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+    let l1 = insert_l1_customer(&pool, "客户PF-NestedList", "F").await;
+    let l2 = insert_l2_customer(&pool, "子客PF-NestedList", l1).await;
+    let part_id = insert_part_for_owner(&pool, l2).await;
+
+    let paths = [
+        "/part-files/parts/{part_id}/files",
+        "/part-files/parts/{part_id}/cnc-programs",
+        "/part-files/parts/{part_id}/setup-sheets",
+    ];
+
+    let shelf_token = login_token(&app, &fx.shelf_account_username, PartFixture::PASSWORD).await;
+    for p in paths {
+        let (status, env) = send(
+            app.clone(),
+            json_request(
+                "GET",
+                &p.replace("{part_id}", &part_id.to_string()),
+                None,
+                Some(&shelf_token),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "SHELF_ACCOUNT 不该能列 {p}: {env}"
+        );
+        assert_eq!(env["code"], 40300, "{p} 应为 FORBIDDEN: {env}");
+    }
+
+    // 正向对照：闸门只挡 SHELF_ACCOUNT，MANAGER 打同三条仍 200。
+    let mgr_token = login_token(&app, &fx.manager_username, PartFixture::PASSWORD).await;
+    for p in paths {
+        let (status, env) = send(
+            app.clone(),
+            json_request(
+                "GET",
+                &p.replace("{part_id}", &part_id.to_string()),
+                None,
+                Some(&mgr_token),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "MANAGER 应能列 {p}: {env}");
     }
 }
