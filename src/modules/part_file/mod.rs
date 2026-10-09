@@ -52,7 +52,8 @@
 //! 这是为「工控机看图纸」这个刚需做的显式取舍；真要收窄需要先给 `t_part_file` 加
 //! owner 侧的范围索引（哪张单 / 哪个货架），属独立立项，不在本次范围。
 //!
-//! 本域**没有** `docs/api/part_file.md`（`docs/api/` 只覆盖 9 个域），故角色集合的
+//! 本域不在 `docs/api/` 的整域覆盖清单内（该目录只覆盖部分域，判据见
+//! `CLAUDE.md` 的「docs/api/ 目录约定」一节；`ls docs/api/` 复核），故角色集合的
 //! 真源就是本模块 doc + 各 service / handler 端点 doc。
 pub mod dto;
 pub mod handler;
