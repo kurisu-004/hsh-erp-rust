@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, username, password_hash, full_name, phone, is_active,\n               last_login_at, refresh_token_version, version,\n               created_at, created_by, updated_at, updated_by, deleted_at\n        FROM t_user\n        WHERE username = $1 AND deleted_at IS NULL\n        ",
+  "query": "\n        SELECT id, username, password_hash, full_name, phone, is_active,\n               last_login_at, refresh_token_version, worker_id, version,\n               created_at, created_by, updated_at, updated_by, deleted_at\n        FROM t_user\n        WHERE username = $1 AND deleted_at IS NULL\n        ",
   "describe": {
     "columns": [
       {
@@ -93,6 +93,17 @@
       },
       {
         "ordinal": 8,
+        "name": "worker_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_user",
+            "name": "worker_id"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
         "name": "version",
         "type_info": "Int4",
         "origin": {
@@ -103,7 +114,7 @@
         }
       },
       {
-        "ordinal": 9,
+        "ordinal": 10,
         "name": "created_at",
         "type_info": "Timestamp",
         "origin": {
@@ -114,7 +125,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 11,
         "name": "created_by",
         "type_info": "Int8",
         "origin": {
@@ -125,7 +136,7 @@
         }
       },
       {
-        "ordinal": 11,
+        "ordinal": 12,
         "name": "updated_at",
         "type_info": "Timestamp",
         "origin": {
@@ -136,7 +147,7 @@
         }
       },
       {
-        "ordinal": 12,
+        "ordinal": 13,
         "name": "updated_by",
         "type_info": "Int8",
         "origin": {
@@ -147,7 +158,7 @@
         }
       },
       {
-        "ordinal": 13,
+        "ordinal": 14,
         "name": "deleted_at",
         "type_info": "Timestamp",
         "origin": {
@@ -172,6 +183,7 @@
       false,
       true,
       false,
+      true,
       false,
       false,
       true,
@@ -180,5 +192,5 @@
       true
     ]
   },
-  "hash": "98962b95ff00a175fab023efbc614aa192b0b694314336dc736f60a24f132632"
+  "hash": "01840d92aa4cb4ec028c37d3b19505c4ca64d9355bc59966c471db887be75a3e"
 }

@@ -61,6 +61,21 @@ mod tests {
     /// `statistics` / `admin` 的 pattern 在本域 SQL 里只读聚合（护栏仍然成立），
     /// 要么把本域降级为与 `prod::queue` 同形的「经本域 trait 转发他域单表查询」的
     /// 域并显式登记例外。
+    ///
+    /// ### 2026-10-11 补充：`t_user.worker_id` 跨域指向 `t_worker`，护栏仍成立
+    /// 上文「全部自有」指的是**表**归属，不是列的指向。`t_user` 新增的
+    /// `worker_id` 列指向 `prod::worker` 域的 `t_worker.id`，但不构成护栏违规：
+    /// - 本域只把 `worker_id` 当 `User` 行的**自有属性**存读，**不在本域 SQL 里
+    ///   JOIN `t_worker`**（`repo/sql/user.rs` 三条 `query_as!` 已复核，无跨域 JOIN）；
+    /// - 护栏探测的是**代码区里的跨域 Rust 路径**（`crate::modules::<他域>::…`），
+    ///   SQL 文本里的表名不在探测口径内，故新增一个列名不会触发它。
+    ///
+    /// ⚠️ 若将来要在 iam 侧**校验该工人是否存在 / 未软删**，那才是真跨域读，正确
+    /// 做法有两条（都要按本节开头的老规矩先改这里的 doc）：
+    ///   1. 按 `statistics` / `admin` 的 pattern，在本域 SQL 里只读聚合 `t_worker`
+    ///      做存在性判定（护栏仍然成立）；或
+    ///   2. 走 `wx` BFF 层（`modules/wx/`，B2 起的重构目标）在本域之外解析绑定，
+    ///      iam 只负责存 `t_user.worker_id` 这个值本身。
     #[test]
     fn iam_domain_depends_on_no_other_domain() {
         assert_no_foreign_domain(

@@ -3,6 +3,11 @@
 //! 与 SQL 紧耦合的入参 DTO（`UserInsert` / `UserPartialUpdate`）也在本文件定义。
 //! 2026-09-22 重构 #2：原 `sql.rs::UserRepo` struct 改为 free fn。
 //!
+//! 2026-10-11（wx BFF 重构 B1）：3 条 `query_as!` 的列清单补 `worker_id`
+//! （`t_user.worker_id` = 绑定的 `t_worker.id`）。写端点（INSERT / UPDATE）**不**动
+//! 本列 —— 建账号与改账号的 DTO 都还没有 worker_id 入口，绑定关系由 B2 起的人工
+//! 维护路径写入；在此之前该列恒为 NULL。
+//!
 //! impl 块统一收在 `super::mod.rs`（Rust coherence 规则：同 crate 内同一 trait 对同一类型
 //! 至多一个 impl 块，跨文件分散 4 个会 E0119）。本文件仅放 SQL 真源。
 
@@ -57,7 +62,7 @@ pub async fn get_user_by_id<'e, E: PgExecutor<'e>>(
         User,
         r#"
         SELECT id, username, password_hash, full_name, phone, is_active,
-               last_login_at, refresh_token_version, version,
+               last_login_at, refresh_token_version, worker_id, version,
                created_at, created_by, updated_at, updated_by, deleted_at
         FROM t_user
         WHERE id = $1 AND deleted_at IS NULL
@@ -77,7 +82,7 @@ pub async fn get_user_by_username<'e, E: PgExecutor<'e>>(
         User,
         r#"
         SELECT id, username, password_hash, full_name, phone, is_active,
-               last_login_at, refresh_token_version, version,
+               last_login_at, refresh_token_version, worker_id, version,
                created_at, created_by, updated_at, updated_by, deleted_at
         FROM t_user
         WHERE username = $1 AND deleted_at IS NULL
@@ -101,7 +106,7 @@ pub async fn list_users_with_filters<'e, E: PgExecutor<'e>>(
         User,
         r#"
         SELECT id, username, password_hash, full_name, phone, is_active,
-               last_login_at, refresh_token_version, version,
+               last_login_at, refresh_token_version, worker_id, version,
                created_at, created_by, updated_at, updated_by, deleted_at
         FROM t_user
         WHERE deleted_at IS NULL
