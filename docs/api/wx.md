@@ -809,7 +809,7 @@ import」。⚠️ `t_user` 其余列（用户名 / 角色 / session）的 SQL �
 （切 3 个不同 `?date=`，`noSystemDate` 恒定，并反查有 `?date=` 时无交期行确实
 被排除在 `all` 之外）。
 
-⚠️ **结构性事实：`counts` 由 3 条独立查询合成，首屏聚合不开事务**（2026-10-12 登记）。
+⚠️ **结构性事实：首屏响应由 3 条独立查询合成（其中 2 条合成 `counts`），首屏聚合不开事务**（2026-10-12 登记）。
 `PartCountsOut` 一次返回要打 **3 次库**：① `counts_by_status`（`GROUP BY status,
 (system_delivery_date IS NULL)` 的分组查询，产出 `all` + 5 个 dated 桶）；②
 `count_null_date`（`noSystemDate` 桶的**独立标量**查询，2026-10-12 从 ① 的
