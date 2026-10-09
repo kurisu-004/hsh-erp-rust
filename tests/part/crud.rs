@@ -618,6 +618,227 @@ async fn update_part_404_soft_deleted() {
     assert_eq!(env["code"], 40901, "VERSION_CONFLICT: {env}");
 }
 
+/// POST /parts/{id}/update —— **三态**：`order_no` / `system_delivery_date` /
+/// `note` 显式 `null` 真正把 DB 列清成 NULL（2026-10-10 新增）
+///
+/// 根因：这三列此前声明成单层 `Option<T>`，serde 把**显式 `null` 与字段缺省归一成
+/// 同一个 `None`** ⇒ service 的动态 SQL 拼装（`if let Some(v) = upd.X`）根本不把
+/// 这三列放进 SET 子句 ⇒ 用户清空后保存「没有任何反应，值还在」。前端一直在正确
+/// 地发 `null`，是后端接不住。
+///
+/// 本用例覆盖三态的**全部三格**（缺省 / 显式 null / 给值），只覆盖两格的话，
+/// 「把 `if let` 写反成 `if let None`」这类改法一样能骗过断言：
+/// - 第一格：字段**缺省** ⇒ 三列原封不动（SET 子句不出现，不是写 NULL）
+/// - 第二格：显式 **`null`** ⇒ 三列被写成 SQL NULL
+/// - 第三格：**给值** ⇒ 三列被覆盖成新值（确保改完之后写入路径仍通）
+#[tokio::test]
+async fn update_part_tristate_columns_absent_null_and_value() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let pid = insert_part(&pool, "P0", fx.customer_l2_id, Some("P000"), "PENDING").await;
+
+    // 读三列当前值（(Option<String>, Option<NaiveDate>, Option<String>)）
+    async fn read3(
+        pool: &PgPool,
+        pid: i64,
+    ) -> (Option<String>, Option<chrono::NaiveDate>, Option<String>) {
+        sqlx::query_as("SELECT order_no, system_delivery_date, note FROM t_part WHERE id = $1")
+            .bind(pid)
+            .fetch_one(pool)
+            .await
+            .expect("read t_part 三列")
+    }
+
+    sqlx::query(
+        "UPDATE t_part SET order_no = $2, system_delivery_date = CAST($3 AS date), \
+         note = $4 WHERE id = $1",
+    )
+    .bind(pid)
+    .bind("PO-2026-0001")
+    .bind("2026-12-31")
+    .bind("初始备注")
+    .execute(&pool)
+    .await
+    .expect("预置三列初值");
+    assert_eq!(
+        read3(&pool, pid).await,
+        (
+            Some("PO-2026-0001".to_string()),
+            chrono::NaiveDate::from_ymd_opt(2026, 12, 31),
+            Some("初始备注".to_string())
+        ),
+        "前置：三列应有初值"
+    );
+
+    // ── 第一格：字段缺省（body 里根本没有这三个键）⇒ 三列都不动 ──
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/update"),
+            // ⚠️ 刻意不带 order_no / system_delivery_date / note
+            Some(json!({ "version": 0, "name": "renamed-absent" })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "缺省三态应 200: {env}");
+    assert_eq!(env["data"]["version"], 1, "version 应自增 0→1: {env}");
+    assert_eq!(
+        read3(&pool, pid).await,
+        (
+            Some("PO-2026-0001".to_string()),
+            chrono::NaiveDate::from_ymd_opt(2026, 12, 31),
+            Some("初始备注".to_string())
+        ),
+        "字段缺省时三列必须原封不动（SET 子句应整个不出现，而不是写成 NULL）"
+    );
+
+    // ── 第二格：显式 null ⇒ 三列真的被清成 SQL NULL ──
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/update"),
+            Some(json!({
+                "version": 1,
+                "name": "renamed-cleared",
+                "order_no": null,
+                "system_delivery_date": null,
+                "note": null,
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "显式 null 应 200: {env}");
+    assert_eq!(env["data"]["version"], 2, "version 应自增 1→2: {env}");
+    // 响应体里也应已回落为 null（update_part 返的是重读后的详情）
+    assert!(
+        env["data"]["order_no"].is_null(),
+        "响应 order_no 应为 null: {env}"
+    );
+    assert!(
+        env["data"]["system_delivery_date"].is_null(),
+        "响应 system_delivery_date 应为 null: {env}"
+    );
+    assert!(env["data"]["note"].is_null(), "响应 note 应为 null: {env}");
+    // **这才是本用例的核心断言**：DB 里那三列必须是 NULL，不只是响应体好看
+    let (order_no, sys_date, note) = read3(&pool, pid).await;
+    assert!(
+        order_no.is_none(),
+        "显式 null 必须把 t_part.order_no 清成 NULL（实际 {order_no:?}）"
+    );
+    assert!(
+        sys_date.is_none(),
+        "显式 null 必须把 t_part.system_delivery_date 清成 NULL（实际 {sys_date:?}）"
+    );
+    assert!(
+        note.is_none(),
+        "显式 null 必须把 t_part.note 清成 NULL（实际 {note:?}）"
+    );
+
+    // ── 第三格：给值 ⇒ 三列被覆盖成新值（清空后仍能写回） ──
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/update"),
+            Some(json!({
+                "version": 2,
+                "order_no": "PO-2026-0002",
+                "system_delivery_date": "2027-01-15",
+                "note": "回填后的备注",
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "给值应 200: {env}");
+    assert_eq!(
+        read3(&pool, pid).await,
+        (
+            Some("PO-2026-0002".to_string()),
+            chrono::NaiveDate::from_ymd_opt(2027, 1, 15),
+            Some("回填后的备注".to_string())
+        ),
+        "给值应写入新值：{env}"
+    );
+}
+
+/// GET /parts/{id} —— 同一工单有**两个 INSPECTION 批次**时仍应 200（2026-10-10 新增）
+///
+/// 根因：`find_current_inspection_batch_id` 此前是「先 `COUNT(status='INSPECTION')`
+/// 再取那一行」，`COUNT >= 2` 走 `Err(sqlx::Error::RowNotFound)` ⇒ HTTP 500，
+/// **零件详情页整个打不开**。而两个批次同时处于 INSPECTION 是**正常业务形态**
+/// （`POST /batches/split` 拆批、报工台部分领取自动拆批都会产生），`RowNotFound`
+/// 不是这个语义该用的信号。
+///
+/// 现在是单条 `ORDER BY id ASC LIMIT 1`。本用例同时钉住**返回值确定性**：
+/// 两次 GET 拿到的 `current_batch_id` 必须一致，且是 id 最小的那条
+/// （`LIMIT 1` 不带 `ORDER BY` 时 PG 不保证返回哪一行，同输入可能得到不同输出）。
+#[tokio::test]
+async fn detail_with_two_inspection_batches_returns_200() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let pid = insert_part(&pool, "P0", fx.customer_l2_id, Some("P000"), "INSPECTION").await;
+    let first = insert_batch(&pool, pid, 1, 5, "INSPECTION").await;
+    let second = insert_batch(&pool, pid, 2, 5, "INSPECTION").await;
+    assert!(
+        first < second,
+        "共享雪花生成器保证 first.id < second.id（ORDER BY id ASC 取 first）"
+    );
+    assert_eq!(
+        count_inspection_batches(&pool, pid).await,
+        2,
+        "前置：本 part 名下确有 2 个 INSPECTION 批次"
+    );
+
+    let (s, env) = send(
+        app.clone(),
+        json_request("GET", &format!("/parts/{pid}"), None, Some(&token)),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "两个 INSPECTION 批次不应让详情 500: {env}"
+    );
+    assert_eq!(env["code"], 0, "{env}");
+    assert_eq!(
+        env["data"]["current_batch_id"],
+        first.to_string(),
+        "current_batch_id 取 id 最小的那条（确定性）：{env}"
+    );
+
+    // 确定性：同输入两次查询必须同输出
+    let (s2, env2) = send(
+        app,
+        json_request("GET", &format!("/parts/{pid}"), None, Some(&token)),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK, "{env2}");
+    assert_eq!(
+        env2["data"]["current_batch_id"], env["data"]["current_batch_id"],
+        "同输入两次 GET 的 current_batch_id 必须一致（不能靠 LIMIT 1 的不确定序）"
+    );
+    assert_ne!(
+        env["data"]["current_batch_id"],
+        second.to_string(),
+        "不该取到 id 较大的那条：{env}"
+    );
+}
+
+/// 该 part 名下未软删的 INSPECTION 批次行数（构造多批次歧义的前置断言）。
+async fn count_inspection_batches(pool: &PgPool, part_id: i64) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM t_part_batch \
+         WHERE part_id = $1 AND status = 'INSPECTION' AND deleted_at IS NULL",
+    )
+    .bind(part_id)
+    .fetch_one(pool)
+    .await
+    .expect("count INSPECTION 批次")
+}
+
 /// POST /parts/{id}/soft-delete —— MANAGER 成功 → 200 / R.ok (data=null)。
 #[tokio::test]
 async fn soft_delete_part_manager_ok() {

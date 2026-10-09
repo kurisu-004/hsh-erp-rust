@@ -47,8 +47,57 @@ impl PartService {
             .get_part_inspected(part_id)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "part 不存在"))?;
+        // 2026-10-10 新增 3 个 LEFT JOIN，补投影前端时间线卡一直在读却拿不到的
+        // `batch_no` / `worker_name` / `operator_name`（+ `operator_username`）。
+        //
+        // 三条 JOIN 的关键取舍：
+        // - **全部 LEFT，绝不 INNER**：`e.worker_id` / `e.batch_id` 在历史数据上大量
+        //   为 NULL，`e.created_by` 的 DB COMMENT 就是「操作者 `t_user.id`
+        //   （NULL = 系统调度 / 历史数据）」—— INNER JOIN 会把整行丢掉，而本端点要
+        //   展示**全部**事件。⚠️ 这两个 NULL 率会随数据增长漂移，**不要**把某次统计
+        //   抄进注释（要算就查库：`SELECT count(*) FILTER (WHERE created_by IS NULL)
+        //   ::float / count(*) FROM t_part_event;`）。同款前车之鉴：
+        //   `statistics/repo/sql.rs` 的 `PICKED_UP` 聚合用 INNER JOIN `t_worker`，
+        //   只能另加 `AND e.worker_id IS NOT NULL` 补偿 —— 那是在**统计**口径上
+        //   明知会丢行仍接受（分母本来就只要有工人的事件），与本端点要的「全量时间
+        //   线」不同，所以这里不能照抄它的 INNER。
+        // - **`t_user` 不按 `deleted_at` 过滤 —— 刻意**：本端点是工单的审计流水，
+        //   操作者账号被停用 / 软删后，时间线上必须仍能显名（否则「谁做的」直接消失，
+        //   与 `t_part_event` 自身**不软删**（该表只有 `created_at`，无 `deleted_at`）
+        //   的审计语义自相矛盾）。`iam/repo/sql/user.rs` 各查询带的
+        //   `deleted_at IS NULL` 是**账号管理**口径（那个场景下软删账号不该再被
+        //   选中），两处口径不同、各自成立，**不要**互相「顺手对齐」。
+        // - **表名加 `e` 前缀别名**：原查询无别名，JOIN 后 `id` / `created_at` 等
+        //   列名会歧义。
+        // - `t_worker` 与 `t_user` 之间**没有关联列也没有 FK**，两者只是共享同一
+        //   个雪花 ID 空间 ⇒ 这是从事件行出发的两个**独立** JOIN，不是互相关联。
+        //   同理 `t_part_batch` 也不按 `deleted_at` 过滤（事件行是当时的快照事实）。
+        //
+        // `ORDER BY e.id DESC` 是刻意选择，**不要**改成 `created_at DESC`：
+        // `t_part_event.id` 空间异质（雪花 / migration 回填的连续密集块 / 未被
+        // nextval 用过的序列），那批回填行的 `created_at` 全是迁移执行时刻
+        // （2026-10-01）而业务真实时间在 2026-07~09，按时间排会在一堆 7 月事件里
+        // 夹一条「10-01」。详见 `PartEventOut` 的 doc 与
+        // `crate::shared::batch::status::release_part_serial_no` 的两段长注释。
+        //
+        // 用 `query_as`（运行时按 `FromRow` 映射）而非 `query!`：本条查询**不进**
+        // `.sqlx/` 缓存，改它不需要跑 `scripts/sqlx_prepare.sh`。
         let rows: Vec<EventListRow> = sqlx::query_as::<_, EventListRow>(
-            "SELECT id, event_type, from_status, to_status, batch_id, quantity,              drawing_code, badge_code, note, created_at, created_by              FROM t_part_event WHERE part_id = $1 ORDER BY id DESC",
+            r#"
+            SELECT e.id, e.event_type, e.from_status, e.to_status, e.batch_id,
+                   e.quantity, e.drawing_code, e.badge_code, e.note,
+                   e.created_at, e.created_by,
+                   b.batch_no   AS batch_no,
+                   w.name       AS worker_name,
+                   u.full_name  AS operator_name,
+                   u.username   AS operator_username
+              FROM t_part_event e
+              LEFT JOIN t_part_batch b ON b.id = e.batch_id
+              LEFT JOIN t_worker     w ON w.id = e.worker_id
+              LEFT JOIN t_user       u ON u.id = e.created_by
+             WHERE e.part_id = $1
+             ORDER BY e.id DESC
+            "#,
         )
         .bind(part_id)
         .fetch_all(repo.conn_mut())
@@ -67,6 +116,10 @@ impl PartService {
                 note: r.note,
                 created_at: r.created_at,
                 created_by: r.created_by,
+                batch_no: r.batch_no,
+                worker_name: r.worker_name,
+                operator_name: r.operator_name,
+                operator_username: r.operator_username,
             })
             .collect())
     }
@@ -409,10 +462,14 @@ impl PartService {
     /// `POST /parts/batch-update-order-info`：批量回填 order_no / system_delivery_date / note。
     ///
     /// 2026-10-06 重做：
-    /// - 走专用窄写 `PartRepo::update_order_info`（三态列）而不是 `update_part`
-    ///   + `PartUpdate`（单层 `Option` 表达不了「显式清空」，改它会波及行内编辑链路）。
+    /// - 走专用窄写 `PartRepo::update_order_info`（三态列）而不是 `update_part` + `PartUpdate`。
     /// - 响应改 `{updated_count, failed, skipped_count}`（`skip = true` 的行不写库）。
     /// - **永远 200 + 信封**，全部失败也不抛业务错误（前端依赖部分成功语义）。
+    ///
+    /// **不复用 `update_part` 的理由**（与 `sql::PartRepo::update_order_info` 的 doc 同一
+    /// 口径）：batch 端每一列都要求区分「缺省 / 清空 / 设值」，日期列还要把非法文本降级为
+    /// 行级失败，而 `update_part` 是「通用表单全量提交」语义；且 2026-10-10 起 `PartUpdate`
+    /// 的同名列也已改成三态，两条路径的入参形态与失败语义不再重合。
     ///
     /// 2026-10-06 review 第 1 轮新增两条闸门（都在**进循环之前**，超限整单拒、
     /// 不发一条 UPDATE）：

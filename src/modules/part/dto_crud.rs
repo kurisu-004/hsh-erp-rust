@@ -152,6 +152,28 @@ pub struct PartBatchCreateRequest {
 /// （`Option<Decimal>`）。DB 列 `t_part.unit_price` / `t_part.total_price`
 /// 为 NUMERIC(12,2) / NUMERIC(14,2) NOT NULL DEFAULT 0，由 rust_decimal
 /// 反序列化为 string → Decimal 避免 JS 浮点丢精度。
+///
+/// ## 三个「可清空」列的三态语义（2026-10-10 新增）
+///
+/// `order_no` / `system_delivery_date` / `note` 声明为 `Option<Option<_>>` +
+/// `deserialize_some`，三态分别是：
+/// - **字段缺省** → `None` ⇒ 该列的 SET 子句**整个不出现**，DB 旧值原封不动；
+/// - **显式 `null`** → `Some(None)` ⇒ 该列被写成 **SQL NULL**（清空）；
+/// - **给值** → `Some(Some(v))` ⇒ 覆盖为 `v`。
+///
+/// **为什么必须三态**：这三个字段在详情页 / 行内编辑里都有「清空」这个动作，而
+/// 单层 `Option` 下 serde 把**显式 `null` 与字段缺省归一成同一个 `None`**，
+/// service 的动态 SQL 拼装（`if let Some(v) = upd.X`）因此根本不会把这三列放进
+/// SET 子句 ⇒ 用户清空后保存「没有任何反应，值还在」。前端一直在正确地发
+/// `null`，是后端接不住。范本：同文件 `BatchUpdateOrderInfoItem` 的同名字段
+/// （`batch-update-order-info` 端点，2026-10-06 已修）与 assembly 域
+/// `AssemblyUpdate`。
+///
+/// **其余 `Option<T>` 字段保持单层不动**（`name` / `drawing_no` /
+/// `applicant_name` / `quantity` / `is_urgent` / `unit_price` / `total_price` /
+/// `planned_delivery_date`）—— 它们在 UI 上没有「清空」动作，单层够用。两条
+/// 前端链路（详情页 `usePartDetail` / 列表行内编辑 `usePartInlineEdit`）对这些
+/// 字段都是**恒发值**，改三态对它们无行为差异。
 #[derive(Debug, Clone, Deserialize)]
 pub struct PartUpdateRequest {
     pub version: i32,
@@ -163,14 +185,20 @@ pub struct PartUpdateRequest {
     pub applicant_name: Option<String>,
     #[serde(default)]
     pub quantity: Option<i32>,
-    #[serde(default)]
-    pub order_no: Option<String>,
-    #[serde(default)]
-    pub system_delivery_date: Option<chrono::NaiveDate>,
+    /// 三态：缺省 = 不改该列；`null` = 清空成 NULL；给值 = 写入。
+    /// 2026-10-10 新增（详见本 struct 的 doc 注释）。
+    #[serde(default, deserialize_with = "crate::shared::types::deserialize_some")]
+    pub order_no: Option<Option<String>>,
+    /// 三态：缺省 = 不改该列；`null` = 清空成 NULL；给值 = 写入。
+    /// 2026-10-10 新增（详见本 struct 的 doc 注释）。
+    #[serde(default, deserialize_with = "crate::shared::types::deserialize_some")]
+    pub system_delivery_date: Option<Option<chrono::NaiveDate>>,
     #[serde(default)]
     pub planned_delivery_date: Option<chrono::NaiveDate>,
-    #[serde(default)]
-    pub note: Option<String>,
+    /// 三态：缺省 = 不改该列；`null` = 清空成 NULL；给值 = 写入。
+    /// 2026-10-10 新增（详见本 struct 的 doc 注释）。
+    #[serde(default, deserialize_with = "crate::shared::types::deserialize_some")]
+    pub note: Option<Option<String>>,
     #[serde(default)]
     pub is_urgent: Option<bool>,
     /// 2026-09-27 新增：单价（NUMERIC(12,2)）。`None` = DB 不动，`Some(v)` = 覆盖。

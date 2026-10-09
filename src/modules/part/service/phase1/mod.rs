@@ -82,6 +82,17 @@ struct EventListRow {
     note: Option<String>,
     created_at: chrono::NaiveDateTime,
     created_by: Option<i64>,
+    /// 2026-10-10 新增（来自 `LEFT JOIN t_part_batch b` 的 `b.batch_no`）。
+    /// ⚠️ 字段名必须与 SQL 别名**逐字一致**：`FromRow` 按列名映射，SELECT 了别名
+    /// 而 struct 里没有对应字段时该列被**静默丢弃**、零报错 —— 正是本次要修的那类
+    /// 「前端读一个后端不返的键」的同款 bug。
+    batch_no: Option<i32>,
+    /// 2026-10-10 新增（来自 `LEFT JOIN t_worker w` 的 `w.name`）。
+    worker_name: Option<String>,
+    /// 2026-10-10 新增（来自 `LEFT JOIN t_user u` 的 `u.full_name`）。
+    operator_name: Option<String>,
+    /// 2026-10-10 新增（来自 `LEFT JOIN t_user u` 的 `u.username`）。
+    operator_username: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]

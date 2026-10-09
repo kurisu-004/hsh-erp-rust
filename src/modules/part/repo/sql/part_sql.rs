@@ -91,15 +91,24 @@ pub struct NewPartCreate<'a> {
 /// 2026-09-27 part 域前后端字段对齐：增 `unit_price` / `total_price` 字段
 /// （NUMERIC(12,2) / NUMERIC(14,2) NOT NULL DEFAULT 0）。Option 语义：
 /// `None` = DB 不动；`Some(v)` = 覆盖为 `v`。
+///
+/// 2026-10-10：`order_no` / `system_delivery_date` / `note` 三列改**三态**
+/// （`Option<Option<_>>`，SET 子句拼装复用本文件已有的 `push_tristate_text` /
+/// `push_tristate_date`）。改这三列**不波及**其它字段：它们是本 struct 的
+/// **唯一**构造点（`PartService::update_part`），没有第二个调用方。
 pub struct PartUpdate<'a> {
     pub name: Option<&'a str>,
     pub drawing_no: Option<&'a str>,
     pub applicant_name: Option<&'a str>,
     pub quantity: Option<i32>,
-    pub order_no: Option<&'a str>,
-    pub system_delivery_date: Option<chrono::NaiveDate>,
+    /// 三态（2026-10-10）：`None` = 不改该列；`Some(None)` = 写 NULL；
+    /// `Some(Some(v))` = 写 v。
+    pub order_no: Option<Option<&'a str>>,
+    /// 三态（2026-10-10）：语义同 [`PartUpdate::order_no`]。
+    pub system_delivery_date: Option<Option<chrono::NaiveDate>>,
     pub planned_delivery_date: Option<chrono::NaiveDate>,
-    pub note: Option<&'a str>,
+    /// 三态（2026-10-10）：语义同 [`PartUpdate::order_no`]。
+    pub note: Option<Option<&'a str>>,
     pub is_urgent: Option<bool>,
     /// 2026-09-27 新增：单价（NUMERIC(12,2)）。
     pub unit_price: Option<rust_decimal::Decimal>,
@@ -494,18 +503,15 @@ impl PartRepo {
         if let Some(v) = upd.quantity {
             qb.push(", quantity = ").push_bind(v);
         }
-        if let Some(v) = upd.order_no {
-            qb.push(", order_no = ").push_bind(v.to_string());
-        }
-        if let Some(v) = upd.system_delivery_date {
-            qb.push(", system_delivery_date = ").push_bind(v);
-        }
+        // 2026-10-10：三列改走三态拼装（复用 update_order_info 那一对 helper）。
+        // 单层 `Option` 下「显式 null」与「字段缺省」同为 `None`，用户清空这三个
+        // 字段后保存会「没有任何反应」——SET 子句压根不出现，旧值原封不动。
+        push_tristate_text(&mut qb, "order_no", upd.order_no);
+        push_tristate_date(&mut qb, "system_delivery_date", upd.system_delivery_date);
         if let Some(v) = upd.planned_delivery_date {
             qb.push(", planned_delivery_date = ").push_bind(v);
         }
-        if let Some(v) = upd.note {
-            qb.push(", note = ").push_bind(v.to_string());
-        }
+        push_tristate_text(&mut qb, "note", upd.note);
         if let Some(v) = upd.is_urgent {
             qb.push(", is_urgent = ").push_bind(v);
         }
@@ -1386,10 +1392,11 @@ impl PartRepo {
     /// 采购订单 Excel 导入的**专用窄写**：只改 `order_no` /
     /// `system_delivery_date` / `note` 三列，三个列各自三态。
     ///
-    /// 2026-10-06 新增。**不复用** `update_part` + `PartUpdate`：`PartUpdate`
-    /// 的字段是单层 `Option`（`None` 一律「不改列」），表达不了「显式清空」；
-    /// 把它改成 `Option<Option<_>>` 会波及 `POST /parts/{id}/update` 那条重度
-    /// 使用的行内编辑链路（另一个 `PartUpdate` 构造点）。故按本仓
+    /// 2026-10-06 新增。**不复用** `update_part` + `PartUpdate`：本方法三列**恒三态**
+    /// （batch 端每一列都要求区分「缺省 / 清空 / 设值」，`system_delivery_date`
+    /// 还要放宽成 `String` 逐行解析、把非法文本降级为行级失败），而 `update_part`
+    /// 是「通用表单全量提交」语义 —— 且 2026-10-10 起 `PartUpdate` 的同名列也已
+    /// 改成三态，两条路径的入参形态与失败语义不再重合。故按本仓
     /// `update_part_rollup` / `mark_batch_*` 的「专用窄写方法」风格另起一个，
     /// 只服务 `POST /parts/batch-update-order-info`。
     ///
