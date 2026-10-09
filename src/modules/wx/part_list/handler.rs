@@ -15,6 +15,17 @@
 //! - `GET /api/v2/wx/part-list` —— 首屏聚合（`counts` + `list` + `hasMore`）
 //! - `GET /api/v2/wx/part-list/page` —— 上拉增量（`list` + `hasMore`）
 //!
+//! ## Query 参数（两个端点**完全共用** `dto::PartListQuery`）
+//! | 参数 | 缺省 | 非法值行为 |
+//! |---|---|---|
+//! | `date` | 不加日期谓词（全部 6 状态 × 任意日期） | chrono 解析不出日期 ⇒ **HTTP 400 纯文本**（**不走** `R<T>`；⚠️ `2026-8-4` 这种不零填充形态 chrono **是接受的**） |
+//! | `status` | `all`（6 状态白名单） | 白名单外 ⇒ **40001 / HTTP 422**（`R<T>`） |
+//! | `page` | 1（`max(1)`） | `?page=abc` ⇒ **HTTP 400 纯文本**（axum `Query` 提取器） |
+//! | `size` | 10（`clamp(1, 50)`） | 同上 |
+//!
+//! ⚠️ **两种 400/422 的分界**在 `date` / `page` / `size`（提取器层 400 纯文本）
+//! 与 `status`（service 层 40001 / 422）之间 —— 契约见 `docs/api/wx.md` §4。
+//!
 //! ## 事务边界
 //! 纯读端点：`pool.acquire()` 不开事务（不开 tx、不发 WS 广播），与
 //! `prod::process_design` 范式一致。

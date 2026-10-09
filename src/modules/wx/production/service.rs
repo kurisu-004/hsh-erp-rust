@@ -54,8 +54,11 @@ impl ProductionService {
     /// `GET /api/v2/wx/production` 业务逻辑：工人 + 统计 + 2 tab 角标 + 第 1 页卡片。
     ///
     /// 查询顺序：**先解链拿工人与统计**（未绑定直接给零值，省掉统计查询），再取
-    /// 角标，最后取卡片。⚠️ 角标 `counts` 是**全局口径**（不带 `?tab=` 过滤）——
-    /// 小程序两个 tab 的角标是固定的，切 tab 时不变。
+    /// 角标，最后取卡片。⚠️ 角标 `counts` **不带 `?tab=` 过滤**（小程序两个 tab 的
+    /// 角标是固定的，切 tab 时不变）；但它**带 `?period=` 作用域** —— 两条标量
+    /// count 都按 period 过滤（`ProductionRepo::batch_counts_by_period`）。2026-10-12
+    /// 口径订正：原注释写的「全局口径」与代码相反（period 闸门逐字见
+    /// docs/api/wx.md §3.8 / §8.5）。
     pub async fn home(
         conn: &mut PgConnection,
         user_id: i64,

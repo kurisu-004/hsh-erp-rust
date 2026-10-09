@@ -11,10 +11,10 @@
 //! ## 形状不变的两处
 //!
 //! - 入参仍是**泛型 executor**（`E: PgExecutor<'e>`）而不是 `&mut PgConnection`：
-//!   29 个 `insert()` 调用点里有的传 `&mut *conn`、有的传 `repo.conn_mut()`，泛型形态
-//!   两边都收。（「29」是 `insert()` 调用点数 = 28 处直接构造 + `prod::queue`
+//!   30 个 `insert()` 调用点里有的传 `&mut *conn`、有的传 `repo.conn_mut()`，泛型形态
+//!   两边都收。（「30」是 `insert()` 调用点数 = 29 处直接构造 + `prod::queue`
 //!   转发器 `part_insert_part_event` 体内那一处；数的时候按 `insert()` 调用点数，不是
-//!   builder 字面量数 —— `rg "NewPartEvent {"` 直接得 **29**，因为转发器体内那处
+//!   builder 字面量数 —— `rg "NewPartEvent {"` 直接得 **30**，因为转发器体内那处
 //!   `NewPartEvent` 字面量也算在内。）
 //! - `created_at` 仍是**字面量 `now()`**、不是 bind：它不在
 //!   [`crate::shared::part_event::model::NewPartEvent`] 里（builder 是 15 列的子集），

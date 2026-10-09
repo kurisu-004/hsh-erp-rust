@@ -5,6 +5,11 @@
 //! **无 alias**，新路径 `POST /api/v2/prod/scan/worker-scan`）。
 //!
 //! 响应形状逐字不变：仍是 `R<WorkerScanOut>`，`scan` + `refill` 两段。
+//!
+//! 2026-10-11：worker-scan 支持部分数量后，`scan.batch_id` 的取值从「工人手上那批」
+//! 变成「**本次实际被处理的那一批**」（拆批场景 = 拆出来的新批次），并新增一个
+//! **不进 JSON** 的内部管道字段 `split`（与 `work_type_id` / `badge_code` 同类）。
+//! JSON 形状本身仍是那 6 个键。
 
 use serde::Serialize;
 
@@ -27,6 +32,9 @@ pub struct WorkerScanCoreOut {
     pub worker_id: i64,
     #[serde(serialize_with = "serialize_i64")]
     pub part_id: i64,
+    /// **本次实际被处理的那个批次**：拆批场景（`quantity` 落在 `0 < q <
+    /// batch.quantity`）下是拆出来的**新批次**，整批场景下是工人手上那批。
+    /// 消费方（前端「已处理哪一件」的回显与后继动作锚点）据此刷新。
     #[serde(serialize_with = "serialize_i64")]
     pub batch_id: i64,
     /// ⚠️ **可能与请求的 `event_type` 不同**：批次在工序链上是最后一道时，
@@ -42,6 +50,26 @@ pub struct WorkerScanCoreOut {
     /// 内部：refill 写 `TAKEN_FROM_POOL` 事件日志需要 badge_code。
     #[serde(skip)]
     pub badge_code: String,
+    /// 内部：部分数量自动拆批信息（整批路径为 `None`），供 handler 在 commit
+    /// 之后补发 `PART_BATCH_SPLIT`。**不进 JSON** —— 与本 struct 的另两个内部管道
+    /// 字段同类，「响应体形状不变」是本端点的既有契约。
+    #[serde(skip)]
+    pub split: Option<WorkerScanSplitInfo>,
+}
+
+/// 部分数量（`WorkerScanRequest::quantity`）触发自动拆批时带回 service 的拆批事实。
+///
+/// 2026-10-11 新增，字段与 pick-up 侧的
+/// [`crate::modules::prod::scan::service::pickup::PickUpSplitInfo`] 同构，两处共用
+/// `PART_BATCH_SPLIT` 事件名与 payload 字段名。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerScanSplitInfo {
+    /// 被扣减的源批次 id（余量留在这里，仍在工人手上）。
+    pub source_batch_id: i64,
+    /// 拆出来、被本次流转处理的那一批的雪花 id（= 响应的 `scan.batch_id`）。
+    pub new_batch_id: i64,
+    /// 拆给本次操作的数量（= 新批次 quantity = 事件日志的 `quantity`）。
+    pub quantity: i32,
 }
 
 /// worker-scan 端点出参：`scan` + 同事务 refill 结果。

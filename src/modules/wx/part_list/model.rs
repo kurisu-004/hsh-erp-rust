@@ -28,10 +28,15 @@ pub struct PartListRow {
     pub drawing_no: String,
     /// `t_part.quantity`（工单总件数 → 前端 `totalQty` / `batchQty`）
     pub quantity: i32,
-    /// `t_part.status`（DB 原值；VO 里会被折叠成 4 类 tab 值）
+    /// `t_part.status`（DB 原值；VO 里会被折叠成 7 类 tab 值）
     pub status: String,
-    /// `t_part.planned_delivery_date`（NOT NULL）
-    pub planned_delivery_date: NaiveDate,
+    /// `t_part.system_delivery_date`（**可空**：无交期工单是 NULL）
+    ///
+    /// 2026-10-12 变更：原字段取 `p.planned_delivery_date`（NOT NULL），本次
+    /// 随筛选谓词一起改打 `system_delivery_date` —— 小程序 `date-nav-bar` 展示的
+    /// 是「系统交期」，用它当谓词才能让日期栏真正生效。VO 的 `dueDate` 随之改成
+    /// `Option<String>`（`noSystemDate` tab 的行必须是 JSON `null`）。
+    pub system_delivery_date: Option<NaiveDate>,
     /// `t_customer.name`（`LEFT JOIN`，可为 NULL）
     pub customer_name: Option<String>,
     /// `t_part.assembly_id`（非空 = 装配件子件 ⇒ 卡片按 `kind=batch` 呈现）

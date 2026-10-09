@@ -11,7 +11,8 @@
 //! ## 事务边界 + WS 广播
 //! 事务边界在 handler（`pool.begin()` → service → `tx.commit()`）；WS 广播在
 //! commit 之后（对齐 Python 延迟广播模式）。事件名逐字不变 —— dashboard 与队列
-//! 页都在监听，改名会静默断链。
+//! 页都在监听，改名会静默断链。唯一新增的是 `PART_BATCH_SPLIT`：2026-10-11
+//! worker-scan 支持部分数量后与 pick-up 共用它，payload 字段名逐字同形。
 
 use std::sync::Arc;
 
@@ -55,16 +56,22 @@ fn ws_broadcast_assembly_updated(state: &AppState, assembly_id: i64) {
 ///
 /// 行为：
 /// - 权限：`Manager` 或 `ShelfAccount`（不是 Inspector——工人持有件自有工人操作）
-/// - 入参：`WorkerScanRequest { serial_no, badge_code, event_type, next_process_id?, batch_id? }`
+/// - 入参：`WorkerScanRequest { serial_no, badge_code, event_type, next_process_id?,
+///   batch_id?, quantity? }`
 ///   主键是 `serial_no`，`batch_id` 仅用于多批次消歧。**没有任何货架字段**
-///   （2026-10-10 起两个货架字段都被删除，目标架由服务端按负载自动选）
+///   （2026-10-10 起两个货架字段都被删除，目标架由服务端按负载自动选）。
+///   `quantity`（2026-10-11 新增）是 **JSON 字符串**，缺省 = 整批
 /// - 业务流转：
 ///   - `RETURNED`：worker 把 IN_PROCESS+WORKER 批次放回**服务端选出的**生产架
 ///     （`next_process_id` 仅非顺应工序时必填）；**批次在链尾时改走送检**（自动送检）
 ///   - `INSPECTED`：worker 把持有件直接送检（品检架服务端自动选）
 ///   - 任一成功后同事务 `QueueService::refill_for_worker_with_work_type`
-///     （**跨全部映射架取料**，无架锚）。
+///     （**跨全部映射架取料**，无架锚）
+/// - 部分数量（`0 < quantity < batch.quantity`）：service 先拆批，本次流转作用在
+///   **拆出来的那一批**上 ⇒ 响应 `scan.batch_id` 是新批次；余量继承
+///   `current_holder_id` 留在工人手上，仍出现在 `GET /scan/held` 列表里
 /// - WS 广播：commit 后
+///   - `PART_BATCH_SPLIT`（部分数量拆批时；payload 与 pick-up 那条**同形**）
 ///   - `WORKER_SCAN_RETURNED` / `WORKER_SCAN_INSPECTED`（依 **`scan_out.event_type`**，
 ///     即**响应**里那个值而非请求里的值 —— 链尾自动送检会让「请求 `RETURNED` /
 ///     响应 `WORKER_SCAN_INSPECTED`」成立，而 dashboard 两条事件都监听，故广播
@@ -73,7 +80,8 @@ fn ws_broadcast_assembly_updated(state: &AppState, assembly_id: i64) {
 ///   - `WORKER_POOL_EMPTY`（refill 池空）。
 ///
 /// 本端点一笔事务改 2 个批次（扫的那个 + 同事务从工人池补的），是全仓唯一的
-/// 跨 part 批次写点，但动作语义仍是「以批次为对象的工人报工」。
+/// 跨 part 批次写点；部分数量场景下拆批本身再加 1 笔 `t_part_batch` 写入。
+/// 动作语义仍是「以批次为对象的工人报工」。
 pub async fn worker_scan(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -111,6 +119,23 @@ pub async fn worker_scan(
     // commit 之后广播（对齐 Python 延迟广播模式）
     if let Some(aid) = scan_out.synced_assembly_id {
         ws_broadcast_assembly_updated(&state, aid);
+    }
+    // 2026-10-11：部分数量拆批 → 补发 PART_BATCH_SPLIT，payload 与 pick-up 那条
+    // **逐字同形**（同一个事件名 + 同一组字段名），两处共用消费方。
+    // 必须发：拆批把源批次的 quantity 静默扣减、并新建了一个批次行，源批次在
+    // worker-scan 场景下**仍留在工人手上**（不像 pick-up 那样留在架上），其它端的
+    // 批次视图不收到这条事件就永远看不到「持有件变多了 / 数量变了」。
+    if let Some(split) = scan_out.split.as_ref() {
+        ws_broadcast(
+            &state,
+            "PART_BATCH_SPLIT",
+            json!({
+                "part_id": scan_out.part_id.to_string(),
+                "new_batch_id": split.new_batch_id.to_string(),
+                "source_batch_id": split.source_batch_id.to_string(),
+                "quantity": split.quantity,
+            }),
+        );
     }
     state.ws_hub.broadcast(WsEvent::DashboardEvent {
         kind: scan_out.event_type.clone(),

@@ -23,13 +23,13 @@
 //! 卡片呈现**（`batchNo` / `batchQty` 取代 `customer` / `deliveredQty` /
 //! `totalQty` / `status`）。该口径来自旧 `repo.rs::row_to_wx_part`，本次只是搬位置。
 //!
-//! ## ⚠️ 4 类 `status` 折叠的静默兜底
-//! 前端只有 4 个 tab 值，`status` 字段也只可能取这 4 个之一。但 DB 的
-//! `PROGRAMMING` / `OUTSOURCE` / `COMPLETED` / `CANCELLED` 不映射到任何 tab。**它们
-//! 在 `list[].status` 里一律填 `"pendingProduction"`**（与旧前端 `mapStatus` 的
-//! catch-all 分支逐字对齐，避免小程序渲染行为突变）——这是**静默兜底**：这类工单
-//! 只计入 `counts.all`，却不会出现在任何单个 tab 的列表里。详见
-//! [`docs/api/wx.md`](../../../../docs/api/wx.md) §8 已知偏差登记。
+//! ## ⚠️ 7 类 `status` 折叠的 catch-all 兜底（2026-10-12 起**已不可达**）
+//! DB 的 `PROGRAMMING` / `COMPLETED` / `CANCELLED` 三个状态不落在任何 tab 的
+//! 6 状态白名单内，2026-10-12 起**根本进不了列表**（过滤谓词就是白名单）。它们
+//! 在 `list[].status` 里填 `"pendingProduction"` 的那枚 `_` 臂因此**已是纯防御**
+//! （与旧前端 `services/parts.ts::mapStatus` 的 catch-all 逐字对齐的那份兜底，
+//! 在本轮收口）。留着的唯一理由是「将来 DB 新增状态时卡片不至于渲染成空白」。
+//! 详见 [`docs/api/wx.md`](../../../../docs/api/wx.md) §8 已知偏差登记。
 
 use serde::Serialize;
 
@@ -74,9 +74,11 @@ pub struct WorkOrderCard {
     /// `t_part.drawing_no`（前端卡片里的「图号」，叫 `code`）
     #[serde(rename = "code")]
     pub code: String,
-    /// `t_part.planned_delivery_date`，格式恒为 `YYYY-MM-DD`（该列 NOT NULL）
+    /// `t_part.system_delivery_date`，格式恒为 `YYYY-MM-DD`；**可空** —— 无交期工单
+    /// 是 `null`（2026-10-12：数据源由 NOT NULL 的 `planned_delivery_date` 改成
+    /// 可空的 `system_delivery_date`，与日期筛选谓词同源）
     #[serde(rename = "dueDate")]
-    pub due_date: String,
+    pub due_date: Option<String>,
     /// `t_customer.name`（`LEFT JOIN t_customer`，可为 null）
     pub customer: Option<String>,
     /// **已交付件数**：`SUM(t_part_batch.quantity)` where 批次
@@ -86,9 +88,10 @@ pub struct WorkOrderCard {
     /// `t_part.quantity`（工单总件数）
     #[serde(rename = "totalQty")]
     pub total_qty: i32,
-    /// **4 类 tab 值之一**：`pendingProduction` / `inProduction` /
-    /// `pendingInspection` / `delivered`。DB 里其余状态静默折叠成
-    /// `pendingProduction`（见模块 doc 的「4 类折叠的静默兜底」）
+    /// **6 类 tab 值之一**：`pendingProduction` / `inProduction` / `outsource` /
+    /// `inspecting` / `delivered`。DB 里 6 状态白名单以外的状态（`PROGRAMMING` /
+    /// `COMPLETED` / `CANCELLED`）**不会出现在列表里**；`display_status` 的
+    /// catch-all 只作纯防御（见模块 doc）
     pub status: String,
 }
 
@@ -110,9 +113,9 @@ pub struct BatchCard {
     /// `t_part.drawing_no`
     #[serde(rename = "code")]
     pub code: String,
-    /// `t_part.planned_delivery_date`，格式恒为 `YYYY-MM-DD`
+    /// `t_part.system_delivery_date`，格式恒为 `YYYY-MM-DD`；**可空**（同上）
     #[serde(rename = "dueDate")]
-    pub due_date: String,
+    pub due_date: Option<String>,
     /// 当前活跃批次的 `batch_no`（`LEFT JOIN LATERAL`，无可活跃批次时 null）。
     ///
     /// ⚠️ **JSON number / 可空**（2026-10-11 review 第 1 轮登记的与前端 TS 模型的
@@ -134,37 +137,57 @@ pub struct BatchCard {
 // 计数
 // =============================================================================
 
-/// 4 个 tab 的计数 + 全部。对应前端 `CountsByStatus`（`Record<'all' | PartStatus, number>`）。
+/// 7 个 tab 的计数。对应前端 `CountsByStatus`（`Record<TabValue, number>`）。
+///
+/// ⚠️ **角标不随 `?status=` 变，但随 `?date=` 变**（2026-10-12）：小程序 7 个 tab
+/// 的数字是固定的（切 tab 不会让角标塌成 0），但日期导航条一变，7 个数字就整体
+/// 换一批数 —— 那是日期作用域，不是 tab 作用域。
 ///
 /// ⚠️ 归桶口径与 [`PartListHomeOut::counts`] 的 `status` 过滤**同源于 service 层
 /// 的映射表**（`service::status_to_db_statuses` / `service::map_counts_by_status`），
 /// 这是 2026-10-11 修掉的既有 bug：旧实现角标按 `READY_TO_SHIP + DELIVERED`
 /// （实测 72 + 126 = 198）算，列表却只收单值 `DELIVERED`（最多 126），两边对不上。
+///
+/// ★ **不变量（lib 单测钉死）**：
+/// `all == pendingProduction + inProduction + outsource + inspecting + delivered`。
+/// 它成立的前提是 6 个 DB 状态与 5 个 dated tab 严格一一归属、无重叠无遗漏
+/// （`INSPECTION` / `READY_TO_SHIP` 同归 `inspecting`，其余各一）。`noSystemDate`
+/// 是**第 7 个**桶，**不进**这条等式 —— 它是「NULL 日期」的横切口径，与状态无关。
 #[derive(Debug, Clone, Serialize)]
 pub struct PartCountsOut {
-    /// 全部未软删工单数（**任何** DB 状态都计入，含 `CANCELLED`）
+    /// 6 状态白名单里、`system_delivery_date = ?date` 的行数（`?date` 缺省时 =
+    /// 6 状态白名单的**全部**行，含 NULL 日期）。**排除** `PROGRAMMING` /
+    /// `COMPLETED` / `CANCELLED`（2026-10-12 语义变更）
     pub all: i64,
-    /// `t_part.status = 'PENDING'` 的行数
+    /// `t_part.status = 'PENDING'` 且 `system_delivery_date = ?date` 的行数
     #[serde(rename = "pendingProduction")]
     pub pending_production: i64,
-    /// `t_part.status = 'IN_PROCESS'` 的行数
+    /// `t_part.status = 'IN_PROCESS'` 且 `system_delivery_date = ?date` 的行数
     #[serde(rename = "inProduction")]
     pub in_production: i64,
-    /// `t_part.status = 'INSPECTION'` 的行数
-    #[serde(rename = "pendingInspection")]
-    pub pending_inspection: i64,
-    /// `t_part.status IN ('READY_TO_SHIP','DELIVERED')` 的行数（**两个**状态合并）
+    /// `t_part.status = 'OUTSOURCE'` 且 `system_delivery_date = ?date` 的行数
+    #[serde(rename = "outsource")]
+    pub outsource: i64,
+    /// `t_part.status IN ('INSPECTION','READY_TO_SHIP')` 且 `system_delivery_date = ?date`
+    /// 的行数（**两个**状态合并）
+    #[serde(rename = "inspecting")]
+    pub inspecting: i64,
+    /// `t_part.status = 'DELIVERED'` 且 `system_delivery_date = ?date` 的行数
     pub delivered: i64,
+    /// `system_delivery_date IS NULL` 的行数（6 状态白名单内），**与 `?date=` 无关**
+    #[serde(rename = "noSystemDate")]
+    pub no_system_date: i64,
 }
 
 // =============================================================================
 // 分页外壳
 // =============================================================================
 
-/// `GET /api/v2/wx/part-list` 出参：4 tab 角标 + 第 1 页卡片（**首屏聚合**）。
+/// `GET /api/v2/wx/part-list` 出参：7 tab 角标 + 第 1 页卡片（**首屏聚合**）。
 #[derive(Debug, Clone, Serialize)]
 pub struct PartListHomeOut {
-    /// 4 个 tab 的计数（**不带 `status` 过滤** —— 角标恒是全局口径）
+    /// 7 个 tab 的计数（**不带 `status` 过滤** —— 角标恒是 6 状态白名单口径；
+    /// 但**带** `date` 作用域）
     pub counts: PartCountsOut,
     /// 当前页卡片（按 `?status=` 过滤、按 `?page=` 翻页）
     pub list: Vec<PartCardOut>,
@@ -199,7 +222,7 @@ mod tests {
             serial_no: Some("F2256".into()),
             name: "壳体".into(),
             code: "E4201".into(),
-            due_date: "2026-08-04".into(),
+            due_date: Some("2026-08-04".into()),
             customer: Some("六厂".into()),
             delivered_qty: 3,
             total_qty: 8,
@@ -231,7 +254,7 @@ mod tests {
             serial_no: None,
             name: "法兰".into(),
             code: "FL-DN80".into(),
-            due_date: "2026-09-01".into(),
+            due_date: Some("2026-09-01".into()),
             batch_no: Some(2),
             batch_qty: 4,
         });
@@ -270,7 +293,7 @@ mod tests {
             serial_no: None,
             name: "n".into(),
             code: "c".into(),
-            due_date: "2026-01-01".into(),
+            due_date: Some("2026-01-01".into()),
             customer: None,
             delivered_qty: 0,
             total_qty: 1,
@@ -280,15 +303,54 @@ mod tests {
         assert!(!v.as_object().unwrap().contains_key("drawingUrl"));
     }
 
-    /// `PartCountsOut` 的 5 个键名必须与前端 tab 值逐字一致（camelCase）。
+    /// 2026-10-12 新增：两个变体的 `dueDate` 在「无交期」工单上必须是
+    /// **JSON `null`**（`system_delivery_date IS NULL`），不能是空串、不能缺键 ——
+    /// 小程序按 `item.dueDate` 直接渲染，`null` 才不会被兜底成 1970 之类的怪值。
+    #[test]
+    fn due_date_serializes_as_json_null_when_system_delivery_date_is_null() {
+        let wo = PartCardOut::WorkOrder(WorkOrderCard {
+            id: 7,
+            serial_no: None,
+            name: "n".into(),
+            code: "c".into(),
+            due_date: None,
+            customer: None,
+            delivered_qty: 0,
+            total_qty: 1,
+            status: "pendingProduction".into(),
+        });
+        let v = serde_json::to_value(&wo).unwrap();
+        assert_eq!(v["dueDate"], json!(null));
+        assert!(
+            v.as_object().unwrap().contains_key("dueDate"),
+            "键必须在位（值是 null），不能整个省略"
+        );
+
+        let batch = PartCardOut::Batch(BatchCard {
+            id: 8,
+            serial_no: None,
+            name: "n".into(),
+            code: "c".into(),
+            due_date: None,
+            batch_no: None,
+            batch_qty: 1,
+        });
+        let v = serde_json::to_value(&batch).unwrap();
+        assert_eq!(v["dueDate"], json!(null));
+        assert!(v.as_object().unwrap().contains_key("dueDate"));
+    }
+
+    /// `PartCountsOut` 的 7 个键名必须与前端 tab 值逐字一致（camelCase）。
     #[test]
     fn counts_keys_are_camel_case_tab_values() {
         let c = PartCountsOut {
             all: 1901,
             pending_production: 300,
             in_production: 900,
-            pending_inspection: 500,
+            outsource: 120,
+            inspecting: 500,
             delivered: 198,
+            no_system_date: 42,
         };
         let v = serde_json::to_value(c).unwrap();
         assert_eq!(
@@ -297,8 +359,10 @@ mod tests {
                 "all": 1901,
                 "pendingProduction": 300,
                 "inProduction": 900,
-                "pendingInspection": 500,
-                "delivered": 198
+                "outsource": 120,
+                "inspecting": 500,
+                "delivered": 198,
+                "noSystemDate": 42
             })
         );
     }
@@ -311,8 +375,10 @@ mod tests {
                 all: 0,
                 pending_production: 0,
                 in_production: 0,
-                pending_inspection: 0,
+                outsource: 0,
+                inspecting: 0,
                 delivered: 0,
+                no_system_date: 0,
             },
             list: Vec::new(),
             has_more: true,

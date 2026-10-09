@@ -106,7 +106,7 @@ service 的 `validate_date_range` 判，不是提取器判 ⇒ 端点 1/2/3 三�
 
 | 字段 | 类型 | SQL 来源 | 口径 |
 |---|---|---|---|
-| `process_id` | string \| null | `e.process_id` | 雪花 ID 字符串化（`serialize_i64_opt`）。⚠️ **可空**：写侧只在 `prod::scan` 的 4 个构造点落 `process_id`，其余构造点恒 `NULL`；这类事件在此汇成一个「无工序」组，**对 `effective_minutes` 总额的贡献恒为 0** |
+| `process_id` | string \| null | `e.process_id` | 雪花 ID 字符串化（`serialize_i64_opt`）。⚠️ **可空**：写侧只在 `prod::scan` 的 5 个构造点落 `process_id`，其余构造点恒 `NULL`；这类事件在此汇成一个「无工序」组，**对 `effective_minutes` 总额的贡献恒为 0** |
 | `process_name` | string | `pr.name`（`LEFT JOIN t_process`） | 取不到名时退 **`(已删除)`** 字符串。⚠️ 该 JOIN **刻意不过滤 `t_process.deleted_at`** —— 事后软删是对当前工序字典的行政操作，不追溯抹掉历史报表里的名字（理由见 §4.9）；工序行被软删**仍显原名**。真正落到 `(已删除)` 的只剩「`process_id` 是 NULL」与「工序行物理缺失」 |
 | `step_count` | number | `COUNT(*)` | 该工序在该区间内被「完成」的**次数**（⚠️ 不是 distinct） |
 | `effective_minutes` | number | §4.1 | 该工序贡献的有效工时（分钟整数） |

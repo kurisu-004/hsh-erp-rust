@@ -90,9 +90,10 @@ pub struct WorkerPartItem {
 /// 一行 = 一道工序在该工人区间内的作业汇总（`GET /workers/{id}` 的
 /// `process_breakdown[]` 元素）。
 ///
-/// `process_id` **可空**不是偷懒：写侧只有 `prod::scan` 的 **4** 个事件构造点落
-/// `process_id`（`worker_scan` 的 `RETURNED_TO_SHELF` / `SENT_TO_INSPECTION` 与
-/// `pickup` 的 `SPLIT` / `PICKED_UP`，均取 `batch.current_process_id`），其余
+/// `process_id` **可空**不是偷懒：写侧只有 `prod::scan` 的 **5** 个事件构造点落
+/// `process_id`（`worker_scan` 的 `RETURNED_TO_SHELF` / `SENT_TO_INSPECTION` /
+/// 部分数量拆批的 `SPLIT`，取事件锚那一批的工序快照；`pickup` 的 `SPLIT` /
+/// `PICKED_UP`，取源批次的），其余
 /// `t_part_event` 写点一律 `NULL`，这类事件在按工序分组时汇成一个「无工序」组 ——
 /// 它对 `effective_minutes` 总额的贡献恒为 0。逐点取值依据见
 /// `crate::shared::part_event` 的模块 doc。雪花 ID 序列化成 JSON string

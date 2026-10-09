@@ -31,6 +31,13 @@
 //! ## 约束
 //! - 统一响应信封：`Result<Json<R<T>>, AppError>`。
 //! - 权限在 service 层（`current.require_any_role(...)` 守卫）。
+//!   ⚠️ 3 个 alias 端点**逐字共用** `PartFileService` 的方法 ⇒ 权限集合与
+//!   `part-files` 同名端点**恒等**，本域没有自己的白名单可改：
+//!   `GET /{file_id}/content` 随 `part_file::service` 2026-10-10 的放开一并接受
+//!   `SHELF_ACCOUNT`（工控机看图纸）；`GET /{file_id}/download-url` 仍只 4 角色
+//!   （COS 预签直链不在放开范围，理由见 `src/modules/part_file/mod.rs` 模块 doc 的
+//!   角色矩阵）。
+//!   要改这两条的角色集合，去 `part_file/service.rs`。
 //! - WS 广播：本域不上报 WS 事件。
 
 use std::sync::Arc;

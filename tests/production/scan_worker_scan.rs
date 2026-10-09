@@ -24,12 +24,26 @@
 //! - `refill_takes_across_all_shelves_without_shelf_anchor`（2026-10-10）—
 //!   refill 跨全部映射架取料、候选池不限架
 //!
+//! 2026-10-11 追加（部分数量 `WorkerScanRequest::quantity`，6 个用例）：
+//! - `worker_scan_returned_without_quantity_keeps_whole_batch` —— 缺省 = 整批的
+//!   回归基线
+//! - `worker_scan_returned_quantity_equal_batch_quantity_is_whole_batch` ——
+//!   `==` 是「显式整批」，不拆批
+//! - `worker_scan_returned_partial_splits_batch_and_keeps_remainder_on_worker` ——
+//!   RETURNED 部分放回
+//! - `worker_scan_inspected_partial_splits_batch_and_keeps_remainder_on_worker` ——
+//!   INSPECTED 部分送检
+//! - `worker_scan_returned_at_chain_tail_with_partial_quantity_sends_only_split_part`
+//!   —— TAIL early-return 分支下的部分放回（最容易漏的那条）
+//! - `worker_scan_invalid_quantity_returns_20111` —— `<= 0` / `>` 两条边界
+//!
 //! ## 复用的 fixture
 //! 全部从 `super::queue` 借（那边是 worker_pool 场景的 fixture 大本营）：本文件
 //! 不复制一份，避免同款 fixture 在两处漂移。
 
 use axum::http::StatusCode;
 use serde_json::{Value, json};
+use sqlx::PgPool;
 
 use hsh_erp_test_support::{json_request, login_token, send};
 
@@ -977,5 +991,553 @@ async fn refill_takes_across_all_shelves_without_shelf_anchor() {
     assert!(
         batch_ids.contains(&batch_b.to_string()),
         "必须取到 B 架的批次 {batch_b}（证明不限架）: {env}"
+    );
+}
+
+// ===========================================================================
+//  2026-10-11：部分数量（`WorkerScanRequest::quantity`）
+//
+//  与同域 `pickup.rs` 的部分领取同款三种落法（缺省 / `==` 整批、`0 < q <
+//  batch.quantity` 拆批、`<= 0` 或 `>` 报 20111），**唯一差别**是余量的去向：
+//  worker-scan 的余量继承 `current_holder_id` **留在工人手上**，而不是像 pick-up
+//  那样留在原处（架上）。下面每条拆批用例都逐字断言这一点。
+// ===========================================================================
+
+/// 读批次的 5 个关键列（quantity / status / location / holder / version）。
+async fn read_batch_row(
+    pool: &PgPool,
+    batch_id: i64,
+) -> (i32, String, Option<String>, Option<i64>, i32) {
+    sqlx::query_as(
+        "SELECT quantity, status, location, current_holder_id, version \
+         FROM t_part_batch WHERE id = $1",
+    )
+    .bind(batch_id)
+    .fetch_one(pool)
+    .await
+    .expect("read t_part_batch")
+}
+
+/// 该 part 名下未软删的批次行数（拆批残留检查）。
+async fn count_batches(pool: &PgPool, part_id: i64) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM t_part_batch WHERE part_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(part_id)
+    .fetch_one(pool)
+    .await
+    .expect("count t_part_batch")
+}
+
+/// 拆批产出：新批次（`id <> source_id` 的那一个）。
+async fn find_split_batch(pool: &PgPool, part_id: i64, source_id: i64) -> i64 {
+    sqlx::query_scalar(
+        "SELECT id FROM t_part_batch \
+         WHERE part_id = $1 AND deleted_at IS NULL AND id <> $2",
+    )
+    .bind(part_id)
+    .bind(source_id)
+    .fetch_one(pool)
+    .await
+    .expect("部分数量应拆出一个新批次")
+}
+
+/// 按 `event_type` 取该 part 名下事件的 `quantity`（没有则 panic）。
+async fn event_quantity(pool: &PgPool, part_id: i64, event_type: &str) -> Option<i32> {
+    sqlx::query_scalar(
+        "SELECT quantity FROM t_part_event \
+         WHERE part_id = $1 AND event_type = $2 ORDER BY id DESC",
+    )
+    .bind(part_id)
+    .bind(event_type)
+    .fetch_optional(pool)
+    .await
+    .expect("query t_part_event")
+}
+
+async fn event_count(pool: &PgPool, part_id: i64, event_type: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM t_part_event WHERE part_id = $1 AND event_type = $2")
+        .bind(part_id)
+        .bind(event_type)
+        .fetch_one(pool)
+        .await
+        .expect("count t_part_event")
+}
+
+/// 造「非顺应 ⇒ 显式 `next_process_id`」的形态：清掉 step 指针。
+///
+/// fixture 造的链是单 step 链，指针一致时 `chain_state == "TAIL"` ⇒ RETURNED 会被
+/// 「链尾自动送检」接管（那条由本节最后一条用例专门覆盖）。
+async fn clear_step_pointer(pool: &PgPool, batch_id: i64) {
+    sqlx::query("UPDATE t_part_batch SET current_process_step_id = NULL WHERE id = $1")
+        .bind(batch_id)
+        .execute(pool)
+        .await
+        .expect("clear step pointer");
+}
+
+/// 缺省 `quantity` ⇒ 整批，行为与该字段引入前**逐字一致**。
+///
+/// 钉住三件事：响应 `scan.batch_id` 仍是源批次（不是某个新拆出来的）、批次数仍为 1
+/// （没拆）、数量不变（10 → 10）。
+#[tokio::test]
+async fn worker_scan_returned_without_quantity_keeps_whole_batch() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "QDEF").await;
+    let proc_a = seed_process(&pool, "QD-P1", "QD1").await;
+    let proc_b = seed_process(&pool, "QD-P2", "QD2").await;
+    let wt = insert_work_type(&pool, "QD-WT", "QD工种", Some(0)).await;
+    link_work_type_to_process(&pool, wt, proc_a).await;
+    let prod_shelf = insert_shelf(&pool, "QD-SH", "QD架", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc_b).await;
+
+    let worker = insert_worker(&pool, "QD-W1", "QD工人", Some(wt)).await;
+    let (held_part, held_batch, _step) =
+        insert_worker_held_part(&pool, customer, "QD-HELD", worker, proc_a, 10, false).await;
+    clear_step_pointer(&pool, held_batch).await;
+
+    let (app, token, _pool) = login_shelf_account(pool.clone(), "qd-user", &[prod_shelf]).await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/scan/worker-scan",
+            // body 里**没有** quantity 这个 key（不是 null）
+            Some(json!({
+                "serial_no": "QD-HELD",
+                "badge_code": "QD-W1",
+                "event_type": "RETURNED",
+                "next_process_id": proc_b.to_string(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "缺省 quantity 应整批放回: {env}");
+    assert_eq!(
+        env["data"]["scan"]["batch_id"],
+        json!(held_batch.to_string()),
+        "整批路径的 scan.batch_id 应仍是工人手上那批: {env}"
+    );
+    assert_eq!(
+        count_batches(&pool, held_part).await,
+        1,
+        "缺省 quantity 不得拆批"
+    );
+    let (qty, status, location, holder, _v) = read_batch_row(&pool, held_batch).await;
+    assert_eq!(qty, 10, "整批放回不改数量");
+    assert_eq!(status, "IN_PROCESS");
+    assert_eq!(location.as_deref(), Some("PRODUCTION_SHELF"));
+    assert_eq!(holder, Some(prod_shelf));
+    assert_eq!(
+        event_count(&pool, held_part, "SPLIT").await,
+        0,
+        "整批路径不得写 SPLIT 事件"
+    );
+    assert_eq!(
+        event_quantity(&pool, held_part, "RETURNED_TO_SHELF").await,
+        Some(10),
+        "RETURNED_TO_SHELF.quantity = 整批量"
+    );
+}
+
+/// `quantity == batch.quantity` ⇒ **合法**，等同整批（不拆批）。
+///
+/// 与 `POST /api/v2/batches/split`（要求严格小于）的语义差异必须钉住：`==` 在
+/// worker-scan / pick-up 上是「显式整批」的写法，在那条拆批端点上才是非法。
+#[tokio::test]
+async fn worker_scan_returned_quantity_equal_batch_quantity_is_whole_batch() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "QEQ").await;
+    let proc_a = seed_process(&pool, "QE-P1", "QE1").await;
+    let proc_b = seed_process(&pool, "QE-P2", "QE2").await;
+    let wt = insert_work_type(&pool, "QE-WT", "QE工种", Some(0)).await;
+    link_work_type_to_process(&pool, wt, proc_a).await;
+    let prod_shelf = insert_shelf(&pool, "QE-SH", "QE架", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc_b).await;
+
+    let worker = insert_worker(&pool, "QE-W1", "QE工人", Some(wt)).await;
+    let (held_part, held_batch, _step) =
+        insert_worker_held_part(&pool, customer, "QE-HELD", worker, proc_a, 8, false).await;
+    clear_step_pointer(&pool, held_batch).await;
+
+    let (app, token, _pool) = login_shelf_account(pool.clone(), "qe-user", &[prod_shelf]).await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/scan/worker-scan",
+            Some(json!({
+                "serial_no": "QE-HELD",
+                "badge_code": "QE-W1",
+                "event_type": "RETURNED",
+                "next_process_id": proc_b.to_string(),
+                "quantity": "8",
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "quantity == batch.quantity 应等同整批放回（不是非法值）: {env}"
+    );
+    assert_eq!(
+        env["data"]["scan"]["batch_id"],
+        json!(held_batch.to_string())
+    );
+    assert_eq!(
+        count_batches(&pool, held_part).await,
+        1,
+        "quantity == 总量时不得拆批"
+    );
+    let (qty, _s, location, holder, _v) = read_batch_row(&pool, held_batch).await;
+    assert_eq!(qty, 8, "整批放回不改数量");
+    assert_eq!(location.as_deref(), Some("PRODUCTION_SHELF"));
+    assert_eq!(holder, Some(prod_shelf));
+    assert_eq!(event_count(&pool, held_part, "SPLIT").await, 0);
+}
+
+/// RETURNED 部分放回：拆出 4 件走放回，余下 6 件**留在工人手上**。
+///
+/// 断言清单：
+/// - 响应 `scan.batch_id` = **新批次**（不是源批次）
+/// - 新批次：quantity 4、location=PRODUCTION_SHELF、holder=选出的生产架、
+///   `current_process_id` 推进到 `next_process_id`
+/// - 源批次：quantity 6、**location 仍是 WORKER**、holder 仍是该工人、version +1
+///   （拆批 OCC 写）；与 pick-up 的「余量留架上」形成对照
+/// - 批次数 = 2、两批数量之和 == 10
+/// - 事件：`SPLIT`（quantity 4）+ `RETURNED_TO_SHELF`（quantity 4）都指向新批次
+#[tokio::test]
+async fn worker_scan_returned_partial_splits_batch_and_keeps_remainder_on_worker() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "QPR").await;
+    let proc_a = seed_process(&pool, "QP-P1", "QP1").await;
+    let proc_b = seed_process(&pool, "QP-P2", "QP2").await;
+    let wt = insert_work_type(&pool, "QP-WT", "QP工种", Some(0)).await;
+    link_work_type_to_process(&pool, wt, proc_a).await;
+    let prod_shelf = insert_shelf(&pool, "QP-SH", "QP架", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc_b).await;
+
+    let worker = insert_worker(&pool, "QP-W1", "QP工人", Some(wt)).await;
+    let (held_part, held_batch, _step) =
+        insert_worker_held_part(&pool, customer, "QP-HELD", worker, proc_a, 10, false).await;
+    clear_step_pointer(&pool, held_batch).await;
+
+    let (app, token, _pool) = login_shelf_account(pool.clone(), "qp-user", &[prod_shelf]).await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/scan/worker-scan",
+            Some(json!({
+                "serial_no": "QP-HELD",
+                "badge_code": "QP-W1",
+                "event_type": "RETURNED",
+                "next_process_id": proc_b.to_string(),
+                "quantity": "4",
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "部分放回应 200: {env}");
+
+    let new_id = find_split_batch(&pool, held_part, held_batch).await;
+    assert_eq!(
+        env["data"]["scan"]["batch_id"],
+        json!(new_id.to_string()),
+        "响应 scan.batch_id 必须是**被处理的那一个新批次**: {env}"
+    );
+    assert_ne!(new_id, held_batch, "新批次不能是源批次本身");
+
+    // 新批次：拆走的那 4 件被放回生产架并推进到下一道工序
+    let (n_qty, n_status, n_loc, n_holder, _n_v) = read_batch_row(&pool, new_id).await;
+    assert_eq!(n_qty, 4, "新批次数量 = 本次实际操作量");
+    assert_eq!(n_status, "IN_PROCESS");
+    assert_eq!(n_loc.as_deref(), Some("PRODUCTION_SHELF"));
+    assert_eq!(n_holder, Some(prod_shelf));
+    let n_proc: Option<i64> =
+        sqlx::query_scalar("SELECT current_process_id FROM t_part_batch WHERE id = $1")
+            .bind(new_id)
+            .fetch_one(&pool)
+            .await
+            .expect("query new batch process");
+    assert_eq!(
+        n_proc,
+        Some(proc_b),
+        "RETURNED 的工序推进必须作用在新批次上（源批次不进 P2 池）"
+    );
+
+    // 源批次：余量**留在工人手上**
+    let (s_qty, s_status, s_loc, s_holder, s_ver) = read_batch_row(&pool, held_batch).await;
+    assert_eq!(s_qty, 6, "源批次应剩 10 - 4 = 6");
+    assert_eq!(s_status, "IN_PROCESS");
+    assert_eq!(
+        s_loc.as_deref(),
+        Some("WORKER"),
+        "余量必须留在工人手上（worker-scan 与 pick-up 的唯一差别）"
+    );
+    assert_eq!(
+        s_holder,
+        Some(worker),
+        "余量的 current_holder_id 不变 ⇒ 仍出现在报工台「已持有」列表"
+    );
+    assert_eq!(s_ver, 1, "拆批那笔 UPDATE 的 version = version + 1");
+    assert_eq!(
+        count_batches(&pool, held_part).await,
+        2,
+        "部分数量应恰好拆成两批"
+    );
+    assert_eq!(n_qty + s_qty, 10, "两批数量之和必须等于原数量");
+
+    // 余量确实还在「已持有」列表的取行口径里（location=WORKER + holder=worker）
+    assert_eq!(
+        count_held_by_worker(&pool, worker).await,
+        1,
+        "余量批次仍算工人持有件"
+    );
+
+    // 事件：SPLIT + RETURNED_TO_SHELF 都挂新批次、数量都是 4
+    assert_eq!(
+        event_count(&pool, held_part, "SPLIT").await,
+        1,
+        "拆批必须留痕（SPLIT）"
+    );
+    assert_eq!(event_quantity(&pool, held_part, "SPLIT").await, Some(4));
+    assert_eq!(
+        event_quantity(&pool, held_part, "RETURNED_TO_SHELF").await,
+        Some(4),
+        "RETURNED_TO_SHELF.quantity = 本次实际放回量（不是批次全量）"
+    );
+    let ev_batch: Vec<i64> = sqlx::query_scalar(
+        "SELECT DISTINCT batch_id FROM t_part_event \
+         WHERE part_id = $1 AND event_type IN ('SPLIT', 'RETURNED_TO_SHELF')",
+    )
+    .bind(held_part)
+    .fetch_all(&pool)
+    .await
+    .expect("query event batch ids");
+    assert_eq!(ev_batch, vec![new_id], "两条事件都应挂在被处理的新批次上");
+}
+
+/// INSPECTED 部分送检：拆出 3 件去品检，余下 5 件**留在工人手上**。
+#[tokio::test]
+async fn worker_scan_inspected_partial_splits_batch_and_keeps_remainder_on_worker() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "QPI").await;
+    let proc_a = seed_process(&pool, "QI-P1", "QI1").await;
+    let wt = insert_work_type(&pool, "QI-WT", "QI工种", Some(0)).await;
+    link_work_type_to_process(&pool, wt, proc_a).await;
+    let prod_shelf = insert_shelf(&pool, "QI-SH", "QI架", "PRODUCTION").await;
+    let insp_shelf = insert_shelf(&pool, "QI-INSP", "QI品检架", "INSPECTION").await;
+
+    let worker = insert_worker(&pool, "QI-W1", "QI工人", Some(wt)).await;
+    let (held_part, held_batch, _step) =
+        insert_worker_held_part(&pool, customer, "QI-HELD", worker, proc_a, 8, false).await;
+
+    let (app, token, _pool) =
+        login_shelf_account(pool.clone(), "qi-user", &[prod_shelf, insp_shelf]).await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/scan/worker-scan",
+            Some(json!({
+                "serial_no": "QI-HELD",
+                "badge_code": "QI-W1",
+                "event_type": "INSPECTED",
+                "quantity": "3",
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "部分送检应 200: {env}");
+    assert_eq!(env["data"]["scan"]["event_type"], "WORKER_SCAN_INSPECTED");
+
+    let new_id = find_split_batch(&pool, held_part, held_batch).await;
+    assert_eq!(
+        env["data"]["scan"]["batch_id"],
+        json!(new_id.to_string()),
+        "响应 scan.batch_id 必须是送检的那一个新批次: {env}"
+    );
+
+    let (n_qty, n_status, n_loc, n_holder, _n_v) = read_batch_row(&pool, new_id).await;
+    assert_eq!(n_qty, 3, "新批次数量 = 本次实际送检量");
+    assert_eq!(n_status, "INSPECTION");
+    assert_eq!(n_loc.as_deref(), Some("INSPECTION_SHELF"));
+    assert_eq!(n_holder, Some(insp_shelf), "应落服务端自动选出的品检架");
+
+    // 源批次：余量仍 IN_PROCESS + WORKER
+    let (s_qty, s_status, s_loc, s_holder, _s_v) = read_batch_row(&pool, held_batch).await;
+    assert_eq!(s_qty, 5, "源批次应剩 8 - 3 = 5");
+    assert_eq!(s_status, "IN_PROCESS", "余量不进品检流");
+    assert_eq!(s_loc.as_deref(), Some("WORKER"));
+    assert_eq!(s_holder, Some(worker));
+    assert_eq!(count_batches(&pool, held_part).await, 2);
+    assert_eq!(n_qty + s_qty, 8);
+
+    assert_eq!(event_count(&pool, held_part, "SPLIT").await, 1);
+    assert_eq!(
+        event_quantity(&pool, held_part, "SENT_TO_INSPECTION").await,
+        Some(3),
+        "SENT_TO_INSPECTION.quantity = 本次实际送检量"
+    );
+}
+
+/// **TAIL（链尾自动送检）分支**下的部分放回 —— 最容易漏的那条。
+///
+/// `worker_scan_event` 的 RETURNED 臂里 TAIL 是一条 **early-return**（链位置判定
+/// 之后、`mark_batch_returned` 之前就返回）。若拆批插在它之后，这条 early-return
+/// 拿到的仍是源批次 ⇒ 送检的是整批，本次指定的 4 件被静默吞掉。本用例钉死：
+/// 送检的是新批次（4 件），余下 6 件仍留在工人手上。
+///
+/// fixture 用**单 step 链 + 指针一致**造出 TAIL（`with_chain = true`）。
+#[tokio::test]
+async fn worker_scan_returned_at_chain_tail_with_partial_quantity_sends_only_split_part() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "QT").await;
+    let proc_only = seed_process(&pool, "QT-P", "QT唯一工序").await;
+    let wt = insert_work_type(&pool, "QT-WT", "QT工种", Some(0)).await;
+    link_work_type_to_process(&pool, wt, proc_only).await;
+
+    let prod_shelf = insert_shelf(&pool, "QT-SH", "QT架", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc_only).await;
+    let insp_shelf = insert_shelf(&pool, "QT-INSP", "QT品检架", "INSPECTION").await;
+
+    let worker = insert_worker(&pool, "QT-W1", "QT工人", Some(wt)).await;
+    let (held_part, held_batch, _step) =
+        insert_worker_held_part(&pool, customer, "QT-HELD", worker, proc_only, 10, true).await;
+
+    let (app, token, _pool) =
+        login_shelf_account(pool.clone(), "qt-user", &[prod_shelf, insp_shelf]).await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/scan/worker-scan",
+            // 刻意不传 next_process_id：链尾没有下一道，它本来就该可省
+            Some(json!({
+                "serial_no": "QT-HELD",
+                "badge_code": "QT-W1",
+                "event_type": "RETURNED",
+                "quantity": "4",
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "链尾部分放回应自动送检: {env}");
+    assert_eq!(
+        env["data"]["scan"]["event_type"], "WORKER_SCAN_INSPECTED",
+        "链尾放回仍按响应分支（与请求的 RETURNED 不同）: {env}"
+    );
+
+    let new_id = find_split_batch(&pool, held_part, held_batch).await;
+    assert_eq!(
+        env["data"]["scan"]["batch_id"],
+        json!(new_id.to_string()),
+        "TAIL early-return 必须作用在拆出来的新批次上: {env}"
+    );
+
+    let (n_qty, n_status, n_loc, n_holder, _n_v) = read_batch_row(&pool, new_id).await;
+    assert_eq!(n_qty, 4, "送检的应只是本次指定的 4 件");
+    assert_eq!(n_status, "INSPECTION");
+    assert_eq!(n_loc.as_deref(), Some("INSPECTION_SHELF"));
+    assert_eq!(n_holder, Some(insp_shelf));
+
+    let (s_qty, s_status, s_loc, s_holder, _s_v) = read_batch_row(&pool, held_batch).await;
+    assert_eq!(s_qty, 6, "源批次应剩 10 - 4 = 6（若整批被送检这里会是 10）");
+    assert_eq!(s_status, "IN_PROCESS", "余量不能跟着进品检流");
+    assert_eq!(s_loc.as_deref(), Some("WORKER"));
+    assert_eq!(s_holder, Some(worker));
+    assert_eq!(count_batches(&pool, held_part).await, 2);
+    assert_eq!(event_count(&pool, held_part, "SPLIT").await, 1);
+}
+
+/// `quantity <= 0` / `> batch.quantity` ⇒ `20111 BIZ_PART_BATCH_INVALID_QUANTITY`，
+/// 且**一个字节都不许写**（不拆批、不写事件、批次原封不动）。
+///
+/// 逐条覆盖两个 `event_type` × 三种非法值。用单 step 链（TAIL 形态）跑 RETURNED
+/// 的理由：那条路径在拆批前就通过了链位置判定，不需要 `next_process_id` ⇒ 非法
+/// `quantity` 一定是被数量校验拦下，而不是被 40001 抢先拒掉。
+#[tokio::test]
+async fn worker_scan_invalid_quantity_returns_20111() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "QIV").await;
+    let proc_only = seed_process(&pool, "QV-P", "QV唯一工序").await;
+    let wt = insert_work_type(&pool, "QV-WT", "QV工种", Some(0)).await;
+    link_work_type_to_process(&pool, wt, proc_only).await;
+    let prod_shelf = insert_shelf(&pool, "QV-SH", "QV架", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc_only).await;
+    let insp_shelf = insert_shelf(&pool, "QV-INSP", "QV品检架", "INSPECTION").await;
+
+    let worker = insert_worker(&pool, "QV-W1", "QV工人", Some(wt)).await;
+    let (held_part, held_batch, _step) =
+        insert_worker_held_part(&pool, customer, "QV-HELD", worker, proc_only, 10, true).await;
+
+    let (app, token, _pool) =
+        login_shelf_account(pool.clone(), "qv-user", &[prod_shelf, insp_shelf]).await;
+    for (idx, (event_type, qty)) in [
+        ("RETURNED", json!("0")),
+        ("RETURNED", json!("-3")),
+        ("RETURNED", json!("11")),
+        ("INSPECTED", json!("0")),
+        ("INSPECTED", json!("-3")),
+        ("INSPECTED", json!("11")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (s, env) = send(
+            app.clone(),
+            json_request(
+                "POST",
+                "/prod/scan/worker-scan",
+                Some(json!({
+                    "serial_no": "QV-HELD",
+                    "badge_code": "QV-W1",
+                    "event_type": event_type,
+                    "quantity": qty,
+                })),
+                Some(&token),
+            ),
+        )
+        .await;
+        // 20111 在本仓映射 HTTP 400（与 POST .../split / pick-up 的数量非法同码同状态）
+        assert_eq!(
+            s,
+            StatusCode::BAD_REQUEST,
+            "[{idx}] {event_type} quantity={qty} 应 400: {env}"
+        );
+        assert_eq!(
+            env["code"], 20111,
+            "[{idx}] {event_type} quantity={qty} 应 BIZ_PART_BATCH_INVALID_QUANTITY: {env}"
+        );
+
+        // 校验失败 ⇒ 事务回滚，一个字节都不许写
+        assert_eq!(
+            count_batches(&pool, held_part).await,
+            1,
+            "[{idx}] {event_type} quantity={qty}：非法数量不得拆批"
+        );
+        let (bq, bs, bl, bh, bv) = read_batch_row(&pool, held_batch).await;
+        assert_eq!(bq, 10, "[{idx}] {event_type} quantity={qty}：数量不应被改");
+        assert_eq!(bs, "IN_PROCESS");
+        assert_eq!(bl.as_deref(), Some("WORKER"));
+        assert_eq!(bh, Some(worker));
+        assert_eq!(bv, 0, "[{idx}] version 不应被改");
+        assert_eq!(
+            event_count(&pool, held_part, "SPLIT").await,
+            0,
+            "[{idx}] 非法数量不得留 SPLIT 事件"
+        );
+    }
+    assert_eq!(
+        event_count(&pool, held_part, "SENT_TO_INSPECTION").await,
+        0,
+        "非法数量不得写送检事件"
     );
 }

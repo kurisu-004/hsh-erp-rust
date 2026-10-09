@@ -6,24 +6,33 @@
 //! - `GET /wx/part-list/page` —— 上拉增量（`list` + `hasMore`）
 //! - `POST /wx/login/wecom` —— 企业微信登录（响应字段集断言）
 //!
-//! ## 覆盖清单（与 B2 任务的验收标准逐条对应）
+//! 两个列表端点共用 `?date=YYYY-MM-DD&status=<tab>&page=&size=`（2026-10-12
+//! 新增 `?date=`：小程序 `date-nav-bar` 的日期此前是**纯装饰**的，本轮接成真筛选）。
+//!
+//! ## 覆盖清单（2026-10-12 重排：tab 4 → 7 个，新增日期维度）
 //!
 //! | # | 场景 | 用例 |
 //! |---|---|---|
 //! | 1 | 无 Authorization → 401 / 40100 | [`home_requires_auth`] |
-//! | 2 | `?status=all` 与不传 `status` 结果一致 | [`all_tab_equals_absent_status`] |
-//! | 3 | 4 个 tab 值各自命中，且每张卡片 `status` == tab 名 | [`four_tabs_each_return_matching_status`] |
-//! | 4 | **★ delivered 口径一致**：翻到最后一页累计条数 == `counts.delivered` | [`delivered_tab_list_total_equals_counts_delivered`] |
-//! | 5 | 非法 `status` → 422 + 40001 | [`invalid_status_is_validation_error`] |
-//! | 6 | **★ 尾斜杠形态钉死** | [`trailing_slash_form_is_pinned`] |
-//! | 7 | 4 条旧路径全部 404 | [`legacy_wx_paths_are_all_gone`] |
-//! | 8 | `/page?page=2` 与 `/?page=2` 的 `list` 逐字一致 | [`page_endpoint_matches_home_endpoint_at_same_page`] |
-//! | 9 | 分页不重不漏 | [`pagination_has_no_overlap_or_gap`] |
-//! | 10 | **★ `deliveredQty` 真值** | [`delivered_qty_reflects_delivered_batches`] |
-//! | 11 | 登录响应只含 6 个字段 | [`wx_login_response_only_exposes_six_fields`] |
+//! | 2 | `?status=all` 与不传 `status` 结果一致，且都排除白名单外状态 | [`all_tab_equals_absent_status`] |
+//! | 3 | 7 个 tab 值各自命中，且每张卡片 `status` == tab 名 | [`seven_tabs_each_return_matching_status`] |
+//! | 3b | ★ `outsource` tab 只返 `OUTSOURCE` 行 | [`outsource_tab_returns_only_outsource_rows`] |
+//! | 3c | ★ `noSystemDate` tab **忽略** `?date=`，`dueDate` 是 JSON `null` | [`no_system_date_tab_ignores_date_param`] |
+//! | 3d | ★ `counts` 带**日期作用域** + ★ `all == 5 个 dated tab 之和` | [`counts_are_scoped_by_date`] |
+//! | 3e | ★ `PROGRAMMING` / `COMPLETED` / `CANCELLED` 被 6 状态白名单排除 | [`programming_completed_cancelled_are_excluded_from_all`] |
+//! | 4 | ★ 每个 tab 的 counts 桶 == 按该 tab 过滤后的**行数**（同口径交叉断言） | [`each_tab_counts_bucket_equals_its_list_length`] |
+//! | 5 | ★ `delivered` 口径一致：翻到最后一页累计 == `counts.delivered` | [`delivered_tab_list_total_equals_counts_delivered`] |
+//! | 6 | 非法 `status` → 422 + 40001 | [`invalid_status_is_validation_error`] |
+//! | 6b | ★ 非法 `?date=` 格式 → **HTTP 400 纯文本**（提取器层，不走 `R<T>`） | [`malformed_date_is_rejected_by_the_query_extractor`] |
+//! | 7 | **★ 尾斜杠形态钉死** | [`trailing_slash_form_is_pinned`] |
+//! | 8 | 4 条旧路径全部 404 | [`legacy_wx_paths_are_all_gone`] |
+//! | 9 | `/page?page=2` 与 `/?page=2` 的 `list` 逐字一致 | [`page_endpoint_matches_home_endpoint_at_same_page`] |
+//! | 10 | 分页不重不漏 | [`pagination_has_no_overlap_or_gap`] |
+//! | 11 | **★ `deliveredQty` 真值** | [`delivered_qty_reflects_delivered_batches`] |
+//! | 12 | 登录响应只含 6 个字段 | [`wx_login_response_only_exposes_six_fields`] |
 //!
 //! 另有两个「形状」用例：[`home_response_shape_matches_contract`]（首屏响应逐字段
-//! 形态）、[`batch_kind_card_for_assembly_children`]（`kind=batch` 变体）。
+//! 形态、counts 7 键）、[`batch_kind_card_for_assembly_children`]（`kind=batch` 变体）。
 //!
 //! ## 串行化
 //! `test_pool()` 每次 fresh database（DB 间 schema 完全独立），无需 Mutex /
@@ -91,8 +100,8 @@ async fn insert_customer(pool: &PgPool, name: &str) -> i64 {
 #[derive(Debug, Clone)]
 struct PartSpec<'a> {
     customer_id: i64,
-    /// DB 原值状态（`PENDING` / `IN_PROCESS` / `INSPECTION` / `READY_TO_SHIP` /
-    /// `DELIVERED` / `PROGRAMMING` / …）
+    /// DB 原值状态（`PENDING` / `IN_PROCESS` / `OUTSOURCE` / `INSPECTION` /
+    /// `READY_TO_SHIP` / `DELIVERED` / `PROGRAMMING` / `COMPLETED` / `CANCELLED`）
     status: &'a str,
     quantity: i32,
     /// `t_part.serial_no` 走**唯一索引** `uk_t_part_serial_no`；缺省 `None`
@@ -101,8 +110,15 @@ struct PartSpec<'a> {
     serial_no: Option<String>,
     /// `Some(x)` ⇒ `assembly_id = x` ⇒ 卡片按 `kind=batch` 呈现
     assembly_id: Option<i64>,
-    /// `YYYY-MM-DD`
+    /// `YYYY-MM-DD`（`t_part.planned_delivery_date`，NOT NULL）
     due: &'a str,
+    /// `YYYY-MM-DD`（`t_part.system_delivery_date`，**可空**）。
+    /// 2026-10-12 新增：端点 2/3 的日期筛选谓词与卡片 `dueDate` 都打这一列。
+    /// `None` ⇒ 列写 NULL（「无交期」工单，卡片 `dueDate` 序列化成 JSON `null`）。
+    ///
+    /// ⚠️ 改 `due` **不会**顺带改 `system_due`（两者语义不同：一个是计划交期、
+    /// 一个是系统交期）。本文件 `new()` 刻意给两者同一个缺省值，让既有用例不必改。
+    system_due: Option<&'a str>,
     is_urgent: bool,
     deleted: bool,
 }
@@ -116,28 +132,37 @@ impl<'a> PartSpec<'a> {
             serial_no: None,
             assembly_id: None,
             due: "2026-08-04",
+            system_due: Some("2026-08-04"),
             is_urgent: false,
             deleted: false,
         }
     }
 }
 
+/// 常用日期字面量（`?date=` 与 `system_delivery_date` 共用）。
+const D1: &str = "2026-08-04";
+const D2: &str = "2026-08-05";
+
 /// 插一行 `t_part`（软删闸门用 `deleted` 控制）。
 async fn insert_part(pool: &PgPool, s: &PartSpec<'_>) -> i64 {
     let id = next_id();
     let due: chrono::NaiveDate = s.due.parse().expect("due 是 YYYY-MM-DD");
+    let system_due: Option<chrono::NaiveDate> = s
+        .system_due
+        .map(|d| d.parse().expect("system_due 是 YYYY-MM-DD"));
     sqlx::query(
         "INSERT INTO t_part (id, serial_no, name, drawing_no, applicant_name, quantity, \
-         request_date, planned_delivery_date, status, is_urgent, customer_id, assembly_id, \
-         version, created_at, updated_at, deleted_at) \
-         VALUES ($1, $2, '测试件', $3, 'T', $4, $5, $5, $6, $7, $8, $9, 0, now(), now(), \
-                 CASE WHEN $10 THEN now() ELSE NULL END)",
+         request_date, planned_delivery_date, system_delivery_date, status, is_urgent, \
+         customer_id, assembly_id, version, created_at, updated_at, deleted_at) \
+         VALUES ($1, $2, '测试件', $3, 'T', $4, $5, $5, $6, $7, $8, $9, $10, 0, now(), \
+                 now(), CASE WHEN $11 THEN now() ELSE NULL END)",
     )
     .bind(id)
     .bind(s.serial_no.as_deref())
     .bind(format!("D-{id}"))
     .bind(s.quantity)
     .bind(due)
+    .bind(system_due)
     .bind(s.status)
     .bind(s.is_urgent)
     .bind(s.customer_id)
@@ -277,15 +302,29 @@ async fn home_requires_auth() {
 }
 
 // ===========================================================================
-//  2. `?status=all` 与不传 `status` 结果一致
+//  2. `?status=all` 与不传 `status` 结果一致（且都落到 6 状态白名单）
 // ===========================================================================
 
+/// ⚠️ 2026-10-12 **语义变更**：`all` / 缺省不再表示「不过滤」，两者都落到
+/// 6 状态白名单 —— 因此 `PROGRAMMING` / `COMPLETED` / `CANCELLED` **不出现**
+/// 在「全部」里（旧实现会把它们一起漏出来）。
 #[tokio::test]
 async fn all_tab_equals_absent_status() {
     let (pool, app, token) = bootstrap().await;
     let cid = insert_customer(&pool, "六厂").await;
-    for st in ["PENDING", "IN_PROCESS", "INSPECTION", "DELIVERED"] {
+    for st in [
+        "PENDING",
+        "IN_PROCESS",
+        "OUTSOURCE",
+        "INSPECTION",
+        "DELIVERED",
+    ] {
         insert_part(&pool, &PartSpec::new(cid, st)).await;
+    }
+    // 白名单外的 3 个状态：即便 system_delivery_date 有值也不该出现
+    let mut excluded = Vec::new();
+    for st in ["PROGRAMMING", "COMPLETED", "CANCELLED"] {
+        excluded.push(insert_part(&pool, &PartSpec::new(cid, st)).await);
     }
 
     let absent = home(&app, &token, "").await;
@@ -298,40 +337,61 @@ async fn all_tab_equals_absent_status() {
     );
     assert_eq!(
         absent["data"]["counts"], all["data"]["counts"],
-        "counts 是全局口径，两次必须一致"
+        "counts 同样与 ?status= 无关，两次必须一致"
     );
-    assert_eq!(list_of(&all).len(), 4, "4 行全在「全部」里: {all}");
+    assert_eq!(
+        list_of(&all).len(),
+        5,
+        "5 行白名单状态全在「全部」里: {all}"
+    );
+
+    let ids = card_ids(list_of(&all));
+    for id in excluded {
+        assert!(
+            !ids.contains(&id.to_string()),
+            "PROGRAMMING / COMPLETED / CANCELLED 不在 6 状态白名单内（id={id}）: {all}"
+        );
+    }
+    assert_eq!(
+        all["data"]["counts"]["all"],
+        json!(5),
+        "counts.all 同样排除白名单外的 3 个状态: {all}"
+    );
 }
 
 // ===========================================================================
-//  3. 4 个 tab 值各自命中，且每张卡片 status == tab 名
+//  3. 7 个 tab 值各自命中，且每张卡片 status == tab 名
 // ===========================================================================
 
+/// 2026-10-12：`inspecting` 吃两个 DB 状态（`INSPECTION` + `READY_TO_SHIP`）、
+/// `delivered` 收窄成只剩 `DELIVERED`、新增 `outsource` 与 `noSystemDate`。
 #[tokio::test]
-async fn four_tabs_each_return_matching_status() {
+async fn seven_tabs_each_return_matching_status() {
     let (pool, app, token) = bootstrap().await;
     let cid = insert_customer(&pool, "六厂").await;
 
-    // 每个 DB 状态各 1 行（delivered tab 用 DELIVERED + READY_TO_SHIP 两行，
-    // 顺带证「delivered 是两个状态」）
-    let mut expect = Vec::new();
-    for (db, count) in [
-        ("PENDING", 1),
-        ("IN_PROCESS", 1),
-        ("INSPECTION", 1),
-        ("DELIVERED", 1),
-        ("READY_TO_SHIP", 1),
+    // 每个 DB 状态各 1 行
+    for db in [
+        "PENDING",
+        "IN_PROCESS",
+        "OUTSOURCE",
+        "INSPECTION",
+        "DELIVERED",
+        "READY_TO_SHIP",
     ] {
-        for _ in 0..count {
-            expect.push(insert_part(&pool, &PartSpec::new(cid, db)).await);
-        }
+        insert_part(&pool, &PartSpec::new(cid, db)).await;
     }
+    // 「无交期」行：system_delivery_date IS NULL
+    let mut undated = PartSpec::new(cid, "PENDING");
+    undated.system_due = None;
+    insert_part(&pool, &undated).await;
 
     for (tab, want_db) in [
         ("pendingProduction", vec!["PENDING"]),
         ("inProduction", vec!["IN_PROCESS"]),
-        ("pendingInspection", vec!["INSPECTION"]),
-        ("delivered", vec!["DELIVERED", "READY_TO_SHIP"]),
+        ("outsource", vec!["OUTSOURCE"]),
+        ("inspecting", vec!["INSPECTION", "READY_TO_SHIP"]),
+        ("delivered", vec!["DELIVERED"]),
     ] {
         let env = page(&app, &token, &format!("status={tab}&size=50")).await;
         let list = list_of(&env);
@@ -359,34 +419,453 @@ async fn four_tabs_each_return_matching_status() {
         }
     }
 
-    // 反向确认：5 行里没有 PROGRAMMING/COMPLETED 之类的「无 tab 状态」，
-    // 故「全部」tab = 5 行 = 4 个 tab 各自去重后的并集
+    // noSystemDate tab：恒显示 system_delivery_date 为 NULL 的 6 状态行
+    let ns = page(&app, &token, "status=noSystemDate&size=50").await;
+    assert_eq!(list_of(&ns).len(), 1, "[noSystemDate] 只该有那 1 行: {ns}");
+    assert_eq!(
+        list_of(&ns)[0]["dueDate"],
+        Value::Null,
+        "无交期行的 dueDate 必须是 JSON null: {ns}"
+    );
+
+    // 反向确认：6 行有交期 + 1 行无交期 = 「全部」tab 的全部（缺省无日期谓词）
     let all = page(&app, &token, "size=50").await;
-    assert_eq!(list_of(&all).len(), expect.len());
+    assert_eq!(
+        list_of(&all).len(),
+        7,
+        "「全部」= 6 有交期 + 1 无交期: {all}"
+    );
 }
 
 // ===========================================================================
-//  4. ★ delivered tab 口径一致：翻到最后一页累计 == counts.delivered
+//  3b. ★ 外协中 tab 只返 OUTSOURCE 行（2026-10-12 新增 tab）
 // ===========================================================================
 
+#[tokio::test]
+async fn outsource_tab_returns_only_outsource_rows() {
+    let (pool, app, token) = bootstrap().await;
+    let cid = insert_customer(&pool, "六厂").await;
+
+    let out_id = insert_part(&pool, &PartSpec::new(cid, "OUTSOURCE")).await;
+    let mut others = Vec::new();
+    for db in [
+        "PENDING",
+        "IN_PROCESS",
+        "INSPECTION",
+        "READY_TO_SHIP",
+        "DELIVERED",
+        "PROGRAMMING",
+        "COMPLETED",
+        "CANCELLED",
+    ] {
+        others.push(insert_part(&pool, &PartSpec::new(cid, db)).await);
+    }
+
+    let env = page(&app, &token, "status=outsource&size=50").await;
+    let ids = card_ids(list_of(&env));
+    assert_eq!(
+        ids,
+        vec![out_id.to_string()],
+        "outsource tab 只能有 OUTSOURCE 行: {env}"
+    );
+    assert_eq!(list_of(&env)[0]["status"], json!("outsource"));
+
+    // 角标同样只有 1
+    let counts = home(&app, &token, "").await;
+    assert_eq!(counts["data"]["counts"]["outsource"], json!(1), "{counts}");
+}
+
+// ===========================================================================
+//  3c. ★ 无交期 tab 忽略 ?date=（2026-10-12 新增 tab）
+// ===========================================================================
+
+/// `noSystemDate` 的谓词是 `system_delivery_date IS NULL`，与 `?date=` 选哪天
+/// **无关**：两个不同日期各查一次，结果必须逐字相同；且**不能**混入任何有交期的行。
+#[tokio::test]
+async fn no_system_date_tab_ignores_date_param() {
+    let (pool, app, token) = bootstrap().await;
+    let cid = insert_customer(&pool, "六厂").await;
+
+    // 无交期行：3 个白名单状态 + 1 个白名单外状态（后者不该出现）
+    let mut undated_ids = Vec::new();
+    for db in ["PENDING", "IN_PROCESS", "OUTSOURCE"] {
+        let mut s = PartSpec::new(cid, db);
+        s.system_due = None;
+        undated_ids.push(insert_part(&pool, &s).await);
+    }
+    let mut banned = PartSpec::new(cid, "COMPLETED");
+    banned.system_due = None;
+    let banned_id = insert_part(&pool, &banned).await;
+
+    // 有交期行（D1 / D2 各若干）：不该出现在 noSystemDate tab 里
+    for (due, st) in [(D1, "PENDING"), (D2, "IN_PROCESS")] {
+        let mut s = PartSpec::new(cid, st);
+        s.system_due = Some(due);
+        insert_part(&pool, &s).await;
+    }
+
+    let mut expect: Vec<String> = undated_ids.iter().map(|i| i.to_string()).collect();
+    expect.sort();
+
+    for q in [
+        "status=noSystemDate&size=50",
+        &format!("status=noSystemDate&size=50&date={D1}"),
+        &format!("status=noSystemDate&size=50&date={D2}"),
+    ] {
+        let env = page(&app, &token, q).await;
+        let mut got = card_ids(list_of(&env));
+        got.sort();
+        assert_eq!(got, expect, "[{q}] noSystemDate 必须忽略 ?date=: {env}");
+        assert!(
+            !got.contains(&banned_id.to_string()),
+            "[{q}] 白名单外状态不该出现"
+        );
+        for c in list_of(&env) {
+            assert_eq!(
+                c["dueDate"],
+                Value::Null,
+                "[{q}] 无交期行 dueDate 必须是 null"
+            );
+        }
+    }
+
+    // 角标 noSystemDate 与 ?date= 无关，且不含白名单外状态
+    for q in ["", &format!("date={D1}"), &format!("date={D2}")] {
+        let counts = home(&app, &token, q).await;
+        assert_eq!(
+            counts["data"]["counts"]["noSystemDate"],
+            json!(3),
+            "[counts?{q}] noSystemDate 恒为 3（无交期 × 6 状态白名单）: {counts}"
+        );
+    }
+
+    // ⚠️ 反向排除（2026-10-12 review 第 1 轮补）：上面只钉住了 `noSystemDate`
+    // 这一桶的数值，**没有**证明这 3 行无交期白名单行在**有 `?date=` 时确实被
+    // 排除在 `all` 之外** —— 假如日期谓词被误写成「NULL 行放行」，`noSystemDate`
+    // 这条断言照样绿。这里把两侧一起钉死：
+    //   缺省 ?date=  ⇒ counts.all = 5（3 行无交期 + D1 PENDING + D2 IN_PROCESS）
+    //   ?date=D1     ⇒ counts.all = 1（只有 D1 的 PENDING）
+    //   ?date=D2     ⇒ counts.all = 1（只有 D2 的 IN_PROCESS）
+    // ⚠️ 缺省那一档的 5 是有意偏离（`map_counts_by_status` 的
+    // `dated_scope_is_unbounded = true` 分支把 NULL 行也算进 dated 桶），
+    // 与有 date 时的 1/1 构成对照 —— 两者**必须**同时成立才是对的。
+    for (q, want_all) in [
+        ("", 5i64),
+        (&format!("date={D1}"), 1i64),
+        (&format!("date={D2}"), 1i64),
+    ] {
+        let counts = home(&app, &token, q).await;
+        assert_eq!(
+            counts["data"]["counts"]["all"],
+            json!(want_all),
+            "[counts?{q}] counts.all 应是 {want_all}（有 ?date= 时无交期行必须被排除）: \
+             {counts}"
+        );
+    }
+}
+
+// ===========================================================================
+//  3d. ★ counts 带日期作用域（2026-10-12）
+// ===========================================================================
+
+/// 同一天造 5 个白名单状态 × 2 天，另加无交期行。逐天断言 `counts` 各桶，
+/// 并钉死 **★ 不变量**：`counts.all == 5 个 dated tab 之和`。
+#[tokio::test]
+async fn counts_are_scoped_by_date() {
+    let (pool, app, token) = bootstrap().await;
+    let cid = insert_customer(&pool, "六厂").await;
+
+    // D1：6 状态各 1 行；D2：6 状态各 2 行
+    // ⚠️ `t_part.serial_no` 是 varchar(15) 且有唯一索引，序列号一律用**短串**。
+    let mut seq = 0usize;
+    for (due, n) in [(D1, 1usize), (D2, 2usize)] {
+        for db in [
+            "PENDING",
+            "IN_PROCESS",
+            "OUTSOURCE",
+            "INSPECTION",
+            "READY_TO_SHIP",
+            "DELIVERED",
+        ] {
+            for _ in 0..n {
+                let mut s = PartSpec::new(cid, db);
+                s.system_due = Some(due);
+                s.serial_no = Some(format!("FX-S{seq}"));
+                seq += 1;
+                insert_part(&pool, &s).await;
+            }
+        }
+    }
+    // 无交期行：另造 3 行（与日期无关，用来验 noSystemDate 桶）
+    for _ in 0..3 {
+        let mut s = PartSpec::new(cid, "PENDING");
+        s.system_due = None;
+        s.serial_no = Some(format!("FX-N{seq}"));
+        seq += 1;
+        insert_part(&pool, &s).await;
+    }
+
+    // 期望值（bucket, D1, D2）
+    let expect: [(&str, i64, i64); 6] = [
+        // 6 状态 D1 各 1、D2 各 2；inspecting 吃 INSPECTION + READY_TO_SHIP
+        ("pendingProduction", 1, 2),
+        ("inProduction", 1, 2),
+        ("outsource", 1, 2),
+        ("inspecting", 2, 4),
+        ("delivered", 1, 2),
+        ("all", 6, 12),
+    ];
+
+    for (due, col) in [(D1, 1usize), (D2, 2usize)] {
+        let env = home(&app, &token, &format!("date={due}&status=all")).await;
+        for (key, d1, d2) in expect {
+            let want = if col == 1 { d1 } else { d2 };
+            assert_eq!(
+                env["data"]["counts"][key],
+                json!(want),
+                "[?date={due}] counts.{key} 应是 {want}: {env}"
+            );
+        }
+        // ★ 不变量：all == 5 个 dated tab 之和（noSystemDate **不进**这条等式）
+        let c = &env["data"]["counts"];
+        let sum: i64 = [
+            "pendingProduction",
+            "inProduction",
+            "outsource",
+            "inspecting",
+            "delivered",
+        ]
+        .iter()
+        .map(|k| c[*k].as_i64().unwrap())
+        .sum();
+        assert_eq!(
+            c["all"].as_i64().unwrap(),
+            sum,
+            "[?date={due}] counts.all 必须恒等于 5 个 dated tab 之和: {env}"
+        );
+        // noSystemDate 恒为 3（无交期行数），与 ?date= 无关
+        assert_eq!(c["noSystemDate"], json!(3), "[?date={due}]: {env}");
+    }
+
+    // ?date= 缺省：日期谓词退化为无谓词 ⇒ counts.all 是 6 状态白名单的全量
+    // （D1 6 行 + D2 12 行 + 3 行无交期 = 21；含无交期行，否则「不传 date 时
+    // counts.all < ?status=all 的列表行数」正是 §3.3 记的那条裂缝）
+    let none = home(&app, &token, "status=all").await;
+    assert_eq!(
+        none["data"]["counts"]["all"],
+        json!(21),
+        "不传 ?date 时 counts.all 必须是 6 状态白名单的全量行数: {none}"
+    );
+    assert_eq!(none["data"]["counts"]["noSystemDate"], json!(3), "{none}");
+
+    // 列表同样受日期作用域约束
+    let l1 = page(&app, &token, &format!("date={D1}&size=50")).await;
+    assert_eq!(
+        list_of(&l1).len(),
+        6,
+        "[?date={D1}] 列表只应是当天 6 行: {l1}"
+    );
+    let l2 = page(&app, &token, &format!("date={D2}&size=50")).await;
+    assert_eq!(
+        list_of(&l2).len(),
+        12,
+        "[?date={D2}] 列表只应是当天 12 行: {l2}"
+    );
+    let l0 = page(&app, &token, "size=50").await;
+    assert_eq!(
+        list_of(&l0).len(),
+        21,
+        "不传 ?date 时列表是全量 21 行（含 3 行无交期）: {l0}"
+    );
+}
+
+// ===========================================================================
+//  3e. ★ PROGRAMMING / COMPLETED / CANCELLED 被排除（2026-10-12 语义变更）
+// ===========================================================================
+
+#[tokio::test]
+async fn programming_completed_cancelled_are_excluded_from_all() {
+    let (pool, app, token) = bootstrap().await;
+    let cid = insert_customer(&pool, "六厂").await;
+
+    let mut kept = Vec::new();
+    for db in [
+        "PENDING",
+        "IN_PROCESS",
+        "OUTSOURCE",
+        "INSPECTION",
+        "READY_TO_SHIP",
+        "DELIVERED",
+    ] {
+        kept.push(insert_part(&pool, &PartSpec::new(cid, db)).await);
+    }
+    let mut banned = Vec::new();
+    for db in ["PROGRAMMING", "COMPLETED", "CANCELLED"] {
+        banned.push(insert_part(&pool, &PartSpec::new(cid, db)).await);
+    }
+
+    // 7 个 tab（含 all / noSystemDate）逐个查：白名单外的 3 个状态一条都不许出现
+    for tab in [
+        "all",
+        "pendingProduction",
+        "inProduction",
+        "outsource",
+        "inspecting",
+        "delivered",
+        "noSystemDate",
+    ] {
+        let env = page(&app, &token, &format!("status={tab}&size=50")).await;
+        let ids = card_ids(list_of(&env));
+        for id in &banned {
+            assert!(
+                !ids.contains(&id.to_string()),
+                "[{tab}] PROGRAMMING/COMPLETED/CANCELLED 已被 6 状态白名单排除 \
+                 （泄漏 id={id}）: {env}"
+            );
+        }
+    }
+
+    // all 恰好是 6 行白名单状态
+    let all = page(&app, &token, "status=all&size=50").await;
+    let mut want: Vec<String> = kept.iter().map(|i| i.to_string()).collect();
+    want.sort();
+    let mut got = card_ids(list_of(&all));
+    got.sort();
+    assert_eq!(got, want, "[all] 应恰好是 6 个白名单状态的行: {all}");
+
+    // 角标侧同样排除
+    let counts = home(&app, &token, "").await;
+    assert_eq!(counts["data"]["counts"]["all"], json!(6), "{counts}");
+}
+
+// ===========================================================================
+//  4. ★ 每个 dated tab 的 counts 桶 == 按该 tab 过滤后的行数
+// ===========================================================================
+
+/// 逐 tab 交叉断言：**角标 == 列表实际行数**。这是本仓 §3.3 记的那类
+/// 「角标 198、列表 126」裂缝的通用防线；本次由 6 状态白名单 + 日期作用域
+/// 共同保证，故必须对 5 个 dated tab 与 `noSystemDate` 全部验一遍。
+#[tokio::test]
+async fn each_tab_counts_bucket_equals_its_list_length() {
+    let (pool, app, token) = bootstrap().await;
+    let cid = insert_customer(&pool, "六厂").await;
+
+    // D1 上铺满 6 状态各 1 行，另造 1 行无交期 + 3 行白名单外状态做干扰
+    for db in [
+        "PENDING",
+        "IN_PROCESS",
+        "OUTSOURCE",
+        "INSPECTION",
+        "READY_TO_SHIP",
+        "DELIVERED",
+    ] {
+        let mut s = PartSpec::new(cid, db);
+        s.system_due = Some(D1);
+        insert_part(&pool, &s).await;
+    }
+    let mut undated = PartSpec::new(cid, "PENDING");
+    undated.system_due = None;
+    insert_part(&pool, &undated).await;
+    for db in ["PROGRAMMING", "COMPLETED", "CANCELLED"] {
+        insert_part(&pool, &PartSpec::new(cid, db)).await;
+    }
+    // 另一天的行：验证日期作用域没有漏进角标
+    let mut other = PartSpec::new(cid, "PENDING");
+    other.system_due = Some(D2);
+    insert_part(&pool, &other).await;
+
+    // ★ 两轮日期参数（2026-10-12 review 第 1 轮补）：`date={D1}` 与**缺省**。
+    //
+    // 缺省这一轮走的是 `map_counts_by_status` 的 `dated_scope_is_unbounded = true`
+    // 分支（`system_delivery_date IS NULL` 的行**也**计入 dated 桶）—— 那是本轮
+    // 对任务书的**有意偏离**（列表含 NULL 行 ⇒ counts 也必须含，否则角标 < 列表）。
+    // 它此前只有 `counts_are_scoped_by_date` 里的 `counts.all == 21` 一个数字钉着，
+    // 对 4 个具体 dated tab 的桶**零断言**：若该分支被误改成 `continue`，
+    // `pendingProduction` 角标会从 3 掉到 2，而缺省 `?status=pendingProduction` 的
+    // 列表仍返回 3 行（含 1 行无交期）⇒ 角标 < 列表，正是 §3.3 的老 bug 形态。
+    //
+    // 本 fixture 期望值（供改动时对照）：
+    //   有 `?date=D1`：all=6 / pending=1 / in=1 / outsource=1 / inspecting=2
+    //                   / delivered=1 / noSystemDate=1
+    //   缺省       ：all=8 / pending=3 / in=1 / outsource=1 / inspecting=2
+    //                   / delivered=1 / noSystemDate=1
+    //   （缺省多出的 2 行 = D2 的 PENDING + 1 行无交期 PENDING）
+    for dq in ["", &format!("date={D1}")] {
+        let label = if dq.is_empty() {
+            "缺省 ?date=".to_string()
+        } else {
+            format!("?{dq}")
+        };
+        let counts = home(&app, &token, dq).await;
+        for (tab, key) in [
+            ("all", "all"),
+            ("pendingProduction", "pendingProduction"),
+            ("inProduction", "inProduction"),
+            ("outsource", "outsource"),
+            ("inspecting", "inspecting"),
+            ("delivered", "delivered"),
+            ("noSystemDate", "noSystemDate"),
+        ] {
+            let list_q = if dq.is_empty() {
+                format!("status={tab}&size=50")
+            } else {
+                format!("{dq}&status={tab}&size=50")
+            };
+            let env = page(&app, &token, &list_q).await;
+            let want = counts["data"]["counts"][key]
+                .as_i64()
+                .expect("counts 桶必须是 number");
+            assert_eq!(
+                list_of(&env).len() as i64,
+                want,
+                "[{label}&status={tab}] 列表行数必须 == counts.{key}: {env} vs {counts}"
+            );
+        }
+
+        // ★ 核心不变量（同口径交叉断言）
+        let c = &counts["data"]["counts"];
+        let sum: i64 = [
+            "pendingProduction",
+            "inProduction",
+            "outsource",
+            "inspecting",
+            "delivered",
+        ]
+        .iter()
+        .map(|k| c[*k].as_i64().unwrap())
+        .sum();
+        assert_eq!(
+            c["all"].as_i64().unwrap(),
+            sum,
+            "[{label}] counts.all == 5 个 dated tab 之和: {counts}"
+        );
+    }
+}
+
+// ===========================================================================
+//  5. ★ delivered tab 口径一致：翻到最后一页累计 == counts.delivered
+// ===========================================================================
+
+/// 2026-10-12：`delivered` 收窄成**只有** `DELIVERED`（`READY_TO_SHIP` 被
+/// `inspecting` 接管）。角标若是 `READY_TO_SHIP + DELIVERED` 就会与本用例的
+/// 期望值 7 差出一截。
 #[tokio::test]
 async fn delivered_tab_list_total_equals_counts_delivered() {
     let (pool, app, token) = bootstrap().await;
     let cid = insert_customer(&pool, "六厂").await;
 
-    // 造出「跨多页」的 delivered 桶：7 DELIVERED + 3 READY_TO_SHIP = 10，
-    // page size=4 → 3 页。角标口径若是单值 DELIVERED，就会露出 10 vs 7 的裂缝。
+    // 造出「跨多页」的 delivered 桶：7 DELIVERED，page size=4 → 2 页。
     for i in 0..7 {
         let mut s = PartSpec::new(cid, "DELIVERED");
         s.serial_no = Some(format!("FX-D{i}"));
         insert_part(&pool, &s).await;
     }
+    // 干扰项：READY_TO_SHIP 归 inspecting，不再进 delivered
     for i in 0..3 {
         let mut s = PartSpec::new(cid, "READY_TO_SHIP");
         s.serial_no = Some(format!("FX-R{i}"));
         insert_part(&pool, &s).await;
     }
-    // 干扰项：非 delivered 状态不该进这个 tab
     for st in ["PENDING", "IN_PROCESS", "INSPECTION"] {
         insert_part(&pool, &PartSpec::new(cid, st)).await;
     }
@@ -396,8 +875,13 @@ async fn delivered_tab_list_total_equals_counts_delivered() {
         .as_i64()
         .expect("counts.delivered 必须是 number");
     assert_eq!(
-        delivered_count, 10,
-        "角标 delivered 应是 READY_TO_SHIP + DELIVERED = 7 + 3: {counts}"
+        delivered_count, 7,
+        "角标 delivered 2026-10-12 起**只有** DELIVERED（READY_TO_SHIP 归 inspecting）: {counts}"
+    );
+    assert_eq!(
+        counts["data"]["counts"]["inspecting"],
+        json!(4),
+        "READY_TO_SHIP 3 + INSPECTION 1 = 4: {counts}"
     );
 
     // 一直翻到 hasMore == false，累计条数必须等于角标
@@ -433,11 +917,11 @@ async fn delivered_tab_list_total_equals_counts_delivered() {
         delivered_count,
         "delivered tab 翻到最后一页的累计条数必须 == counts.delivered（旧实现的 198 vs 126 裂缝）"
     );
-    assert_eq!(seen.len(), 10);
+    assert_eq!(seen.len(), 7);
 }
 
 // ===========================================================================
-//  5. 非法 `status` → 422 + 40001
+//  6. 非法 `status` → 422 + 40001
 // ===========================================================================
 
 #[tokio::test]
@@ -447,8 +931,13 @@ async fn invalid_status_is_validation_error() {
     for bad in [
         "PENDING", // DB 原值不被接受（前端传的是 tab 值）
         "IN_PROCESS",
+        "OUTSOURCE",
+        "INSPECTION",
         "READY_TO_SHIP",
+        "DELIVERED",
         "GARBAGE",
+        // 旧 tab 值：2026-10-12 品检 tab 更名 inspecting，外协 tab 是新增的
+        "pendingInspection",
         // 注入串（**URL 编码**：空格 / 分号不是合法 URI 字符）
         "%3B%20DROP%20TABLE%20t_part",
         "pendingproduction", // 大小写敏感
@@ -465,13 +954,64 @@ async fn invalid_status_is_validation_error() {
 
     // 增量端点同样守白名单
     let uri = format!("{PAGE_URI}?status=PENDING");
-    let (status, env) = send(app, json_request("GET", &uri, None, Some(&token))).await;
+    let (status, env) = send(app.clone(), json_request("GET", &uri, None, Some(&token))).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "/page: {env}");
+    assert_eq!(env["code"], 40001);
+
+    // ⚠️ 白名单校验**优先于**日期作用域：非法 status 即使带合法 ?date 也得 422
+    let uri = format!("{HOME_URI}?status=GARBAGE&date={D1}");
+    let (status, env) = send(app, json_request("GET", &uri, None, Some(&token))).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{uri}: {env}");
     assert_eq!(env["code"], 40001);
 }
 
 // ===========================================================================
-//  6. ★ 尾斜杠形态钉死
+//  6b. 非法 `?date=` 格式 → HTTP 400 纯文本（提取器层，不走 R<T>）
+// ===========================================================================
+
+/// 非法 `?date=` 落 axum `Query` 提取器层 ⇒ **HTTP 400 纯文本**（与 `?page=abc`
+/// 同档），**不是** `AppError::validation` 的 40001 / 422。
+///
+/// ⚠️ 2026-10-12 **实测**：chrono 的 `NaiveDate` 反序列化**不要求**月/日零填充，
+/// `?date=2026-8-4` 是**合法**的（解析成 2026-08-04）⇒ 本域接受宽格式，
+/// 只拒**解析不出日期**的串。契约见 `docs/api/wx.md` §4。
+#[tokio::test]
+async fn malformed_date_is_rejected_by_the_query_extractor() {
+    let (pool, app, token) = bootstrap().await;
+    let cid = insert_customer(&pool, "六厂").await;
+    insert_part(&pool, &PartSpec::new(cid, "PENDING")).await;
+
+    for bad in [
+        "2026-02-30",
+        "2026-13-01",
+        "not-a-date",
+        "20260804",
+        "2026-08-32",
+    ] {
+        let uri = format!("{HOME_URI}?date={bad}");
+        let (status, raw) =
+            send_raw(app.clone(), json_request("GET", &uri, None, Some(&token))).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "[?date={bad}] 应 400: raw={raw:?}"
+        );
+        assert!(
+            !raw.contains("40001"),
+            "[?date={bad}] 应是提取器层 400 纯文本、不是 R<T> 信封: raw={raw:?}"
+        );
+    }
+
+    // 反向确认：合法日期正常放行。⚠️ `2026-8-4`（不零填充）chrono 也接受，
+    // 本域据此**刻意不**对格式再收紧 —— 收紧会把小程序某一端可能发来的宽格式
+    // 打成 400，是比「格式不严」严重得多的失败。
+    for good in [D1, D2, "2026-8-4"] {
+        get_ok(&app, &format!("{HOME_URI}?date={good}"), &token).await;
+    }
+}
+
+// ===========================================================================
+//  7. ★ 尾斜杠形态钉死
 // ===========================================================================
 
 /// 2026-10-11 **实测**：本仓 axum 版本下 `nest("/part-list")` + 内层 `route("/")`
@@ -522,7 +1062,7 @@ async fn trailing_slash_form_is_pinned() {
 }
 
 // ===========================================================================
-//  7. 旧路径全部 404（硬切无 alias）
+//  8. 旧路径全部 404（硬切无 alias）
 // ===========================================================================
 
 #[tokio::test]
@@ -551,7 +1091,7 @@ async fn legacy_wx_paths_are_all_gone() {
 }
 
 // ===========================================================================
-//  8. `/page?page=2` 与 `/?page=2` 的 list 逐字一致
+//  9. `/page?page=2` 与 `/?page=2` 的 list 逐字一致
 // ===========================================================================
 
 #[tokio::test]
@@ -590,7 +1130,7 @@ async fn page_endpoint_matches_home_endpoint_at_same_page() {
 }
 
 // ===========================================================================
-//  9. 分页不重不漏
+//  10. 分页不重不漏
 // ===========================================================================
 
 #[tokio::test]
@@ -650,7 +1190,7 @@ async fn pagination_has_no_overlap_or_gap() {
 }
 
 // ===========================================================================
-//  10. ★ deliveredQty 真值
+//  11. ★ deliveredQty 真值
 // ===========================================================================
 
 #[tokio::test]
@@ -723,7 +1263,7 @@ async fn delivered_qty_reflects_delivered_batches() {
 }
 
 // ===========================================================================
-//  11. 登录响应只含 6 个字段
+//  12. 登录响应只含 6 个字段
 // ===========================================================================
 
 /// `POST /wx/login/wecom` 的响应体必须**只有** `{token, refresh_token, user{id,
@@ -812,7 +1352,7 @@ async fn wx_login_response_only_exposes_six_fields() {
 }
 
 // ===========================================================================
-//  12. 首屏响应形状（逐字段形态）
+//  13. 首屏响应形状（逐字段形态）
 // ===========================================================================
 
 #[tokio::test]
@@ -838,7 +1378,7 @@ async fn home_response_shape_matches_contract() {
         "首屏响应顶层只该有 counts / list / hasMore（无 total / page / size）: {env}"
     );
 
-    // counts 的 5 个键
+    // counts 的 7 个键
     let counts = data["counts"].as_object().expect("counts");
     let mut ckeys: Vec<&str> = counts.keys().map(String::as_str).collect();
     ckeys.sort_unstable();
@@ -848,10 +1388,12 @@ async fn home_response_shape_matches_contract() {
             "all",
             "delivered",
             "inProduction",
-            "pendingInspection",
+            "inspecting",
+            "noSystemDate",
+            "outsource",
             "pendingProduction"
         ],
-        "counts 的键名必须是前端 tab 值（camelCase）: {env}"
+        "counts 的键名必须是前端 tab 值（camelCase），2026-10-12 起是 7 个: {env}"
     );
 
     // 卡片形态
@@ -897,7 +1439,7 @@ async fn home_response_shape_matches_contract() {
 }
 
 // ===========================================================================
-//  13. kind=batch 变体（装配件子件）
+//  14. kind=batch 变体（装配件子件）
 // ===========================================================================
 
 #[tokio::test]

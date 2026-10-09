@@ -184,6 +184,11 @@ impl PartFileService {
     }
 
     /// 列表：按 owner_kind + owner_id + kind 过滤 + 分页。
+    ///
+    /// 权限（2026-10-10 新增 `Role::ShelfAccount`）：5 角色。放开给工控机账号是因为
+    /// 报工台（`/scan/*`，路由守卫就是 `SHELF_ACCOUNT`）的图纸预览要拉这份列表。
+    /// ⚠️ **只读端点**：上传 `upload_file_for_owner` 与软删 `soft_delete_file` 的角色
+    /// 白名单**不含** `ShelfAccount`，两者是写路径、不在本次放开范围。
     pub async fn list_files<R: PartFileRepoTrait>(
         &self,
         mut repo: R,
@@ -195,6 +200,7 @@ impl PartFileService {
             Role::Clerk,
             Role::Inspector,
             Role::CncProgrammer,
+            Role::ShelfAccount,
         ])?;
         let limit = query.limit.unwrap_or(50).clamp(1, 500);
         let offset = query.offset.unwrap_or(0).max(0);
@@ -228,6 +234,11 @@ impl PartFileService {
     /// 读端点 fallback：先尝试 `head_object(db_key)`，若 NoSuch 且 db_key 可被
     /// `parse_legacy_key` 解析，则按新模板重写 key 再 head 一次；若新模板 key
     /// 存在则用其生成 presigned URL（保证浏览器拿到的 URL 在桶内有效）。
+    ///
+    /// ⚠️ **白名单刻意不含 `Role::ShelfAccount`**（2026-10-10）：本端点回的是 **COS
+    /// 预签直链**（有效期 1 小时），拿到即可绕过本后端任意访问、直链可外传。报工台
+    /// 预览用的是同域的 `get_file_content`（走后端代理、同样能看内容），不需要预签。
+    /// 要放开「工控机看图纸」时放开 content 即可，不要顺带放开这里。
     #[allow(clippy::too_many_arguments)]
     pub async fn get_file_with_url<R: PartFileRepoTrait>(
         &self,
@@ -550,7 +561,11 @@ impl PartFileService {
 
 /// 后端代理文件二进制流：拉 `object_key` → COS `get_object` → 透传 content_type。
 ///
-/// 权限：4 角色任意已登录（与 `get_file_with_url` 一致）。
+/// 权限：`get_file_content` 的 5 角色白名单
+/// （Manager / Clerk / Inspector / CncProgrammer / **ShelfAccount**，2026-10-10 新增
+/// ShelfAccount —— 报工台工控机账号预览图纸）。⚠️ 与 `get_file_with_url` **同角色集合
+/// 但不同风险面**：本端点由后端代理、经 RBAC 逐次把关；`/url` 回的是 COS 预签直链，
+/// 拿到即可脱离本后端直接访问。
 pub struct PartFileContent {
     pub bytes: Vec<u8>,
     pub content_type: Option<String>,
@@ -561,6 +576,10 @@ impl PartFileService {
     ///
     /// 2026-09-29 扁平化：与 `get_file_with_url` 同款 legacy→新模板 fallback，
     /// 详见 `resolve_effective_key`。
+    ///
+    /// 权限（2026-10-10 新增 `Role::ShelfAccount`）：与 `list_files` 同一套 5 角色。
+    /// 报工台（`/scan/*`）跑的就是 `SHELF_ACCOUNT` 账号，其图纸预览打的是本端点
+    /// （后端代理二进制流）—— 不放开则预览必然 403（业务码 40300）。
     pub async fn get_file_content<R: PartFileRepoTrait>(
         &self,
         mut repo: R,
@@ -574,6 +593,7 @@ impl PartFileService {
             Role::Clerk,
             Role::Inspector,
             Role::CncProgrammer,
+            Role::ShelfAccount,
         ])?;
         let row = repo.get_by_id(file_id, false).await?.ok_or_else(|| {
             AppError::biz(

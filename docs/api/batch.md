@@ -318,7 +318,7 @@ t_assembly.status               ← 派生缓存
 |---|---|
 | 出参字段 | `process_id`（**string \| null**，雪花 ID 字符串化）+ `process_name`（**string \| null**），`PartEventOut` 由 15 字段 → **17 字段**。端点、入参、排序（`ORDER BY e.id DESC`）逐字未变，是**纯响应体扩展** |
 | 取值来源 | `t_part_event.process_id`（migration `20261011130000_009_add_part_event_process_id.sql`，**加列后不回填**）+ `LEFT JOIN t_process pr` 取 `pr.name` |
-| 覆盖范围 | 写侧自 2026-10-12 起在 `prod::scan` 的 **4** 个事件构造点填 `process_id`（`worker_scan` 的 `RETURNED_TO_SHELF` / `SENT_TO_INSPECTION`、`pickup` 的 `SPLIT` / `PICKED_UP`，均取事件时刻的 `batch.current_process_id` 快照）⇒ **只有 2026-10-12 之后由报工台产生的作业类事件**两字段有值；历史事件与工单级 / 批次级流转事件两者皆 `null` |
+| 覆盖范围 | 写侧自 2026-10-12 起在 `prod::scan` 的 **5** 个事件构造点填 `process_id`（`worker_scan` 的 `RETURNED_TO_SHELF` / `SENT_TO_INSPECTION` 与部分数量拆批的 `SPLIT`、`pickup` 的 `SPLIT` / `PICKED_UP`，均取事件时刻的批次工序快照）⇒ **只有 2026-10-12 之后由报工台产生的作业类事件**两字段有值；历史事件与工单级 / 批次级流转事件两者皆 `null` |
 | 软删口径 | 该 JOIN **刻意不过滤 `t_process.deleted_at`** —— 事后软删是对当前工序字典的行政操作，不追溯抹掉历史时间线里的名字（同款取舍见 `docs/api/statistics.md` §4.9）。⚠️ 工序**改名会显新名**（事件行只快照 `process_id`，不快照工序名） |
 | ⚠️ 前端占位文案纪律 | `process_id === null`（「这条事件没记工序」）与 `process_name === null`（「记了工序 id 但工序行物理缺失」）是**两种不同的无名**，不得混用同一个占位文案 |
 

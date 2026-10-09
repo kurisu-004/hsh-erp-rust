@@ -57,7 +57,7 @@
 //!
 //! | 有值 | 位置 | 取值依据 |
 //! |---|---|---|
-//! | ✅ 2 处 | `prod::scan::service::worker_scan`（`RETURNED_TO_SHELF` / `SENT_TO_INSPECTION`） | 形参 `worker: &TWorker` ⇒ `Some(worker.id)` |
+//! | ✅ 3 处 | `prod::scan::service::worker_scan`（`RETURNED_TO_SHELF` / `SENT_TO_INSPECTION` / 部分数量拆批的 `SPLIT`） | 形参 `worker: &TWorker`（`resolve_operated_batch` 也按此补了形参）⇒ `Some(worker.id)` |
 //! | ✅ 2 处 | `prod::scan::service::pickup`（`SPLIT` / `PICKED_UP`） | `Some(req.worker_id)` —— 该 worker 已在函数前半段查库校验存在且 active |
 //! | ✅ 2 个调用点 | `prod::queue::service::queue`（2 处 `TAKEN_FROM_POOL`） | 形参 `worker_id`（已被 worker 取料 SQL 验过 `t_worker.id`） |
 //! | ❌ 其余全部写点 | 见下 | 见下 |
@@ -65,34 +65,51 @@
 //! `None` 的理由（**不是**「取不到」而是「语境里没有作业人」）：这批事件是 part 级 /
 //! 批次级的状态流转（`DELIVERED` / `INSPECTED` / `STATUS_CHANGED` / `REPAIR_*` /
 //! `BATCH_CANCELLED` / `RECALLED` / `SERIAL_RELEASED` / `FORCE_COMPLETED` /
-//! `CANCELLED` / `SOFT_DELETED` / `PLACED_ON_SHELF` / `CNC_RELEASED` / `SPLIT` /
-//! `MOVED`），发起者是**管理员账号或系统调度**而非工人。上下文里拿得到的是操作者
-//! `t_user.id`（`created_by` 那一列），与 `t_worker.id` 是**两回事**——两者共用雪花
-//! ID 空间但无映射表，statistics 侧 `JOIN t_worker w ON w.id = e.worker_id` 命中不了
-//! 就是 0 行。混填 `created_by` 会让「按工人聚合」统计到从未做过活的账号上。
+//! `CANCELLED` / `SOFT_DELETED` / `PLACED_ON_SHELF` / `CNC_RELEASED` / `MOVED`，
+//! 以及 `prod::batch` 那条**手工**拆批 `SPLIT`（`POST /batches/split`，管理员发起），
+//! 发起者是**管理员账号或系统调度**而非工人。上下文里拿得到的是操作者 `t_user.id`
+//! （`created_by` 那一列），与 `t_worker.id` 是**两回事**——两者共用雪花 ID 空间但无
+//! 映射表，statistics 侧 `JOIN t_worker w ON w.id = e.worker_id` 命中不了就是 0 行。
+//! 混填 `created_by` 会让「按工人聚合」统计到从未做过活的账号上。
 //!
 //! ### `process_id`（事件时刻的工序快照，migration 009）
 //!
 //! | 有值 | 位置 | 取值依据 |
 //! |---|---|---|
-//! | ✅ 4 处 | `prod::scan::service::worker_scan`（2 处）、`prod::scan::service::pickup`（2 处） | `Some(batch.current_process_id)`，见下 |
+//! | ✅ 5 处 | `worker_scan` 3 处、`pickup` 2 处 | 取值来源分两档，见下 |
 //! | ❌ 3 个调用点 | `prod::queue::service::queue` 的 3 处 `MOVED` | `MOVED` 有三个方向（POOL→WORKER / WORKER→POOL / WORKER→WORKER），只有第一个是「开始加工」，后两个分别是「放回」与「转手」；而有效工时口径只用 `RETURNED_TO_SHELF` + `SENT_TO_INSPECTION` ⇒ 填不填都不进任何聚合，一律 `None` 少一处需要推理的地方 |
 //! | ❌ 2 个调用点 | `prod::queue::service::queue` 的 2 处 `TAKEN_FROM_POOL` | 该路径手上只有 `TakenItem`，**取不到批次工序**（`prod::queue::repo::sql::TakenRow` / 最终 SELECT 都不含 `pb.current_process_id`，`worker_id` 能拿到而 `process_id` 拿不到）。补它要连带改 `TakenRow` + CTE + RETURNING + `TakenItem` 四个落点并改动 `/prod/queue/refill` 响应契约，超出本轮范围 |
 //! | ❌ 其余全部写点 | 见下 | 这些事件发生时批次确实带着 `current_process_id`，但它们既不是「开始加工」也不是「加工完毕」⇒ 工序归属对统计无贡献；一并 `None` |
 //!
-//! 4 处「有值」为什么取 `batch.current_process_id` 就够：
+//! 5 处「有值」分两档取值，判据是**「手上有没有事件锚（`batch_id` 指向）那一批的行」**：
 //!
-//! - `RETURNED_TO_SHELF`：`mark_batch_returned` 在**同一事务内**已把
-//!   `t_part_batch.current_process_id` 推进到 `next_pid`，但手上看的是**推进前**读进
-//!   内存的 `batch` 快照 ⇒ `batch.current_process_id` 正是「这位工人刚做完哪道工序」。
-//!   这正是 migration 009 要快照的原因。
-//! - `SENT_TO_INSPECTION`：`mark_batch_inspected` 不推进工序，值不变。
-//! - `pickup` 的 2 处：部分领取走 `split_batch_for_partial_pass`，该 SQL
-//!   `INSERT ... SELECT` **继承**源批次的 `current_process_id`（另见
-//!   `prod::scan::service::pickup` 处 `pick_up` 的「部分领取语义」段），且随后的
-//!   `mark_batch_with_status_and_meta(..., batch.current_process_step_id,
-//!   batch.current_process_id, ...)` 又显式把它透传给新批次 ⇒ 拆批前后同值，
-//!   `SPLIT` / `PICKED_UP` 两条事件取源批次的 `batch.current_process_id` 即可。
+//! **一档 · 有事件锚那一批的行，取它（`worker_scan` 的 `RETURNED_TO_SHELF` /
+//! `SENT_TO_INSPECTION`）**：
+//!
+//! - `RETURNED_TO_SHELF`：取 `operated.current_process_id` —— `operated` 就是事件
+//!   `batch_id` 指向的那一批、也是 `mark_batch_returned` 实际推进的那一批（部分数量
+//!   拆批路径下它是拆完 `find_batch_by_id` 重读的真行）。该调用在同一事务内已把这行
+//!   的 `current_process_id` 推进到 `next_pid`，而 `operated` 是**推进前**读进内存的
+//!   快照 ⇒ 该值正是「这位工人刚做完哪道工序」，这正是 migration 009 要快照的原因；
+//!   事后回查批次只会拿到「下一道」。
+//! - `SENT_TO_INSPECTION`：取形参 `batch.current_process_id` —— 形参本身就是事件锚
+//!   （`batch_id` / OCC / 状态机守卫都用它），且 `mark_batch_inspected` 不推进工序，
+//!   值不变。
+//!
+//! **二档 · 手上只有源批次（拆出来的新批次只有 id、没有行），取源批次的
+//! `current_process_id`（`worker_scan` 的拆批 `SPLIT`、`pickup` 的 2 处）**：
+//!
+//! `split_batch_for_partial_pass` 的 `INSERT ... SELECT` **继承**源批次的
+//! `current_process_id`，源批次的 UPDATE 又只动 `quantity` + `version`
+//! （`pickup` 侧还经 `mark_batch_with_status_and_meta(..., batch.
+//! current_process_step_id, batch.current_process_id, ...)` 显式透传）⇒ 新旧两批
+//! 同工序，故取源快照与取事件锚等价。`worker_scan` 的拆批 `SPLIT` 尤其如此：它写事件
+//! 时新批次行还没被读回来（`find_batch_by_id` 在事件之后），源快照是唯一可取值 ——
+//! 与 `pickup` 那条 `SPLIT` **逐字同口径**。
+//!
+//! **为什么分两档而不是统一取源批次**：两档的**运行结果**一致（拆批只继承、不改工序），
+//! 区别在抗漂移。一档那两处的源批次仍在作用域内，一旦有人给源批次的 UPDATE 加上工序
+//! 推进，「取源批次」会静默记成「下一道工序」；取事件锚那一批的推进前快照天然免疫。
 
 pub mod model;
 pub mod sql;

@@ -731,7 +731,7 @@ pub struct WorkerEffectiveMinutesRow {
 /// 一行 = 一个工人在区间内的一道工序（见 [`worker_process_breakdown`]）。
 ///
 /// `process_id` / `process_name` 可空：事件本身没记工序时（写侧只有 `prod::scan` 的
-/// 4 个构造点落 `process_id`，其余 `t_part_event` 写点一律 `NULL`）该行代表「无工序归属的
+/// 5 个构造点落 `process_id`，其余 `t_part_event` 写点一律 `NULL`）该行代表「无工序归属的
 /// 作业」，工时贡献为 0。
 #[derive(Debug, Clone)]
 pub struct WorkerProcessBreakdownRow {
