@@ -1,8 +1,9 @@
-# iam 域 API（认证 + 账号 + 企业微信绑定 + 货架实体）
+# iam 域 API（认证 + 账号 + 企业微信绑定 + 货架实体 + 角色权限）
 
 > 本文件是 iam 域的**唯一**契约来源。任何字段 / 端点变更必须同步本文件。
 > 覆盖域：`src/modules/iam/`（`handler` / `dto` / `vo` / `service` / `repo`）+
-> 嵌套子模块 `src/modules/iam/shelf/`（**货架子模块**，见 §1.4）。
+> 嵌套子模块 `src/modules/iam/shelf/`（**货架子模块**，见 §1.4）+
+> `src/modules/iam/rbac/`（**角色权限子模块**，8 条端点见 §9）。
 > 域外有一处开口：`modules/wx/login/handler.rs` 的 `POST /api/v2/wx/login/wecom`
 > 经 `AccountService::resolve_wx_login_user` 反查本域的 `t_wx_identity`（见 §5）。
 > ⚠️ 2026-10-11 更新：该端点原为 `modules/wx/auth.rs` 的
@@ -173,12 +174,12 @@ jti 写入黑名单（TTL 对齐旧 token 剩余有效期），旧 jti 再次使
   `shelf_wildcard = true`，可访问全部货架）。⚠️ **本仓写端点写不出这种行**：
   `validate_role_scope` 对 SHELF_ACCOUNT 强制要求 `scope_id`，缺了直接 40001。
   库里若存在，是 Python 端或人工写入的存量数据，本仓只读兼容（§8.1）。
-- **scope / 角色变更不在请求即刻生效于鉴权层**：`CurrentUser` 的 `shelf_ids` /
-  `roles` 来自 **Redis session 缓存**，不是请求时读 DB。管理端改完角色后最长滞后
-  一个 session TTL（`REDIS_SESSION_TTL_SECONDS`，代码缺省 900 秒；**现网 `.env` 实配
-  43200 秒 = 12 小时**）；执行一次
-  `/iam/refresh` 会按 DB 重算并重写缓存，因而立即生效。`/iam/me` 每次都重读 DB，
-  但它**不**改写缓存 —— 界面上看到的角色列表与鉴权实际生效的角色在 TTL 内可能不一致。
+- **角色 / 授权变更提交后立即踢持有者下线**（2026-10-14 起）：`CurrentUser` 的
+  `permissions` / `roles` / `shelf_ids` 来自 **Redis session 缓存**，不是请求时读 DB。
+  RBAC 写操作（授予 / 撤销用户角色、改角色 grants、删自定义角色、改角色信息）在事务
+  提交后调 `delete_all_user_sessions`，目标用户**下一跳**即按新授权判定，不再等
+  session TTL。踢下线语义表见 §9.4。`/iam/refresh` 仍可按 DB 重算并重写缓存；
+  `/iam/me` 每次都重读 DB，但它**不**改写缓存。
 
 ## 4. 错误码表
 
@@ -251,8 +252,9 @@ CRUD 完全独立 —— 本表只覆盖 session / users 两段。
   调用 —— 鉴权上下文走 Redis session，轮转即刻生效，不需要推送；
 - 账号 / 角色的变化由前端在下一次请求（或一次 refresh）时重新拉 `/iam/me` 得到。
 
-推论：前端**不要**指望 WS 推「你的权限变了」。权限相关的实时性靠 §3 说的
-session TTL / refresh。
+推论：前端**不要**指望 WS 推「你的权限变了」。角色 / 授权变更由后端在提交后
+**踢持有者下线**（§9.4）—— 目标用户下一跳请求即 40105（重新登录后拿到新授权）；
+`/iam/refresh` 也可按 DB 重算并重写缓存。
 
 ## 7. 表依赖
 
@@ -260,7 +262,8 @@ session TTL / refresh。
 |---|---|---|---|
 | `t_user` | 登录、账号 CRUD、`/me`、refresh | 建号、更新、软删停用、密码、戳 `last_login_at`、轮转 `refresh_token_version` | 无物理外键，存在性由 service 校验 |
 | `t_user_role` | 角色解析、账号角色组装、查重 | 授予、软删撤销 | 唯一约束**非 partial**，见 §8.3 |
-| `t_menu` + `t_role_menu` | 按角色取可见菜单并组树 | — | `seeds/menu.sql` 是菜单的权威源 |
+| `t_menu` + `t_role_menu` | 按角色取可见菜单并组树 | RBAC 面板的 grants 整包替换（授权行软删 + 重插） | `seeds/menu.sql` 是菜单的权威源；ADMIN 不写行（§9.3） |
+| `t_role` / `t_permission` / `t_role_permission`（2026-10-14 新增） | 角色列表 / grants / 权限点清单 / 登录装载权限码 | 角色 CRUD 与 grants 整包替换 | 三表零外键；基线由 `seeds/rbac.sql` 无条件加载；ADMIN 不写 `t_role_permission` |
 | `t_shelf` | SHELF_ACCOUNT 的 scope 校验 + 登录态货架范围解析 + 端点 18~22 的 CRUD | 建架、改架、软删停用 | **2026-10-10 起写端点在本域内**（货架子模块自独立 shelf 域迁入，`ShelfRepo` 是本域自有 repo）；字段口径见 [`shelves.md`](shelves.md) |
 | `t_wx_identity` | 绑定查询、wx-login 反查、system → wx 一对一判定（读该账号全部活跃行） | 绑定、解绑软删 | 唯一索引 `uk_wx_identity_corp_user` 是 **partial**（软删行不参与） |
 
@@ -345,8 +348,144 @@ userid 不区分大小写、统一转为小写。⚠️ **不是**登录流程�
 故不存在「保留行被推进 version」的状态，首行 / 非首行的取值差异今天不可观测。
 若将来新增「改绑定而不删行」的写入口（从而推进保留行的 version），本节口径要跟着复核。
 
-### 8.6 权限上下文滞后一个 session TTL
+### 8.6 RBAC 变更与 session 缓存的关系
 
-角色 / 货架 scope 的变更不在请求即刻生效于鉴权层（走 Redis 缓存，
-`REDIS_SESSION_TTL_SECONDS` 代码缺省 900 秒、**现网 `.env` 实配 43200 秒 = 12 小时**）。
-详见 §3。要立即生效需执行一次 `/iam/refresh`。
+`permissions` / `roles` / `shelf_ids` 都装在 Redis session 缓存里，改角色 / 授权后
+若不作废缓存就没有生效通道。2026-10-14 起所有会改变判定的写操作都在**提交后踢
+持有者下线**（§9.4），因此不再依赖 session TTL 收敛。踢人失败只记 warn（DB 已
+提交，不因 Redis 抖动回滚），此时最坏回退到旧行为：等 session 自然过期
+（`REDIS_SESSION_TTL_SECONDS`）或一次 `/iam/refresh`。
+
+## 9. RBAC（角色 / 权限点 / 授权，2026-10-14 新增）
+
+> **部署顺序：后端必须先上。** `CurrentUser` / Redis session 缓存自本次起多出
+> `permissions` 必填字段，且 `GET /iam/roles` 等 8 条端点只在后端新版本里存在：
+> - 旧前端 + 新后端：无感（旧前端不读 `permissions`，新端点没人调）；
+> - **新前端 + 旧后端（反序）**：`/iam/me` 响应缺 `permissions` ⇒ 前端 Zod 守门抛
+>   ZodError ⇒ `/iam/me` 复核失败 ⇒ 路由守卫把全员踢回登录页形成循环。
+>
+> 另：旧 Redis session entry 没有 `permissions` 字段，反序列化会失败（50000），
+> 首次部署新后端前需清空 session DB（`FLUSHDB` 或选择性删 `session:tok:*` /
+> `sessions:user:*`），见 `src/auth/session.rs::CachedUserProfile` 的字段 doc。
+
+域归属 `iam::rbac`（`src/modules/iam/rbac/`），URL 挂 `/api/v2/iam` **根**
+（`/iam/roles`，不是 `/iam/rbac/*`）。数据基线由 `seeds/rbac.sql` 无条件加载
+（6 个系统角色 + 权限点 + 授权矩阵）；菜单树仍归 `seeds/menu.sql`，两者关注点分离。
+
+`t_role.code` 与 Rust `auth::rbac::Role` 枚举是**两张表**：6 个系统角色一一对应
+（`ADMIN / MANAGER / CLERK / INSPECTOR / CNC_PROGRAMMER / SHELF_ACCOUNT`）；
+管理端新建的自定义角色只进 varchar，不进枚举 —— 授权判定时 `parse_role_string`
+对自定义 code 返回 `None`，但登录态 `roles` 列表与用户详情返回**原始大写字符串**。
+
+### 9.1 端点表（8）
+
+8 条全部挂在 `/api/v2/iam`，权限一律 `require_role(Manager)`（理由见 §9.2）。
+
+| # | 方法 | 路径 | 权限 | 入参 | 响应 `data` |
+|---|---|---|---|---|---|
+| 23 | GET | `/iam/roles` | Manager | — | `RoleDef[]`（`is_system DESC, code ASC`，ADMIN 置顶） |
+| 24 | POST | `/iam/roles` | Manager | `{ code, name, description? }` | `RoleDef`（**201**） |
+| 25 | POST | `/iam/roles/{id}/update` | Manager | `{ version, code?, name, description? }` | `RoleDef` |
+| 26 | POST | `/iam/roles/{id}/deactivate` | Manager | `{ version, delete? }` | `RoleDeactivateOut` |
+| 27 | GET | `/iam/roles/{id}/grants` | Manager | — | `RoleGrants` |
+| 28 | POST | `/iam/roles/{id}/grants` | Manager | `{ version, menu_codes: string[], permission_codes: string[] }` | `RoleGrants` |
+| 29 | GET | `/iam/permissions` | Manager | — | `PermissionGroup[]` |
+| 30 | GET | `/iam/menus` | Manager | — | `MenuNodeOut[]`（与 `/iam/me` 的 `menus` **同形**） |
+
+出参键：
+- `RoleDef`：`id`（string，雪花）、`code`、`name`、`description`（可空）、
+  `is_system`、`is_active`、`version`（OCC 锚）、`user_count`（在册持有人数，
+  `t_user.is_active` 且授权行未软删）。
+- `RoleGrants`：`role_id`（string）、`role_code`、`is_system`、`version`（OCC 锚，
+  与角色信息更新**共用** `t_role.version`）、`menu_codes[]`、`permission_codes[]`
+  （整包语义：提交什么就是什么，未出现即软删）。
+- `RoleDeactivateOut`：`affected_user_count`（**本次被踢下线的用户数** = 被连带
+  软删的 `t_user_role` 行数；`delete=false` 恒为 0，因为停用不删授权行、也不踢人）。
+- `PermissionGroup`：`{ domain, items: [{ code, name, description, is_active }] }`。
+
+入参要点：`version` 一律必填（缺 → axum 提取器 **422 纯文本**）；`code` 归一化为
+大写、`[A-Z0-9_]`、≤ 20 字符；`is_system=true` 的角色不可改 code、不可删（可停用）；
+自定义角色改 code 会在**同一事务**级联 `t_user_role` / `t_role_menu` /
+`t_role_permission` 三张表。
+
+`roles_list` 菜单（`/iam/roles`）只授 MANAGER —— 菜单可见性与端点守卫逐格一致。
+
+### 9.2 为什么守卫是 `require_role(Manager)` 而不是权限点
+
+这个面板自己就是**权限真源**：若用「进入面板」这个权限点守它，管理员一旦把这个点
+从自己身上撤掉，唯一能把它加回去的出口（正是这个面板）就被自己关掉了 —— 自锁且
+无救。同理，`MANAGER` 角色本身不可删、不可改 code，但它的菜单 / 权限点 grants
+可以被改，全撤掉也就自锁了。⇒ 守卫下沉到**不会被本面板改动的**角色。
+
+ADMIN 用户由元角色通配天然放行（见 §9.3）。
+
+业务端点的权限点（首批 3 个，2026-10-14 注册）：
+
+| 权限点 | domain | 守卫的端点 | 授权矩阵（`t_role_permission`） |
+|---|---|---|---|
+| `part.drawing.print` | `part` | `GET /parts/{id}/print-drawing`、`POST /parts/print-drawing-batch` | MANAGER / CLERK / INSPECTOR / CNC_PROGRAMMER |
+| `queue.dispatch` | `queue` | `POST /prod/queue/dispatch`（写路径；读端点仍角色守卫） | MANAGER / CLERK |
+| `delivery_note.print` | `delivery_note` | **无**（前端-only） | MANAGER / CLERK / INSPECTOR |
+
+- 三个权限点对 `SHELF_ACCOUNT` **全部不授**；矩阵逐格等于迁移前的角色守卫集合。
+- **`delivery_note.print` 是前端-only**：后端送货单打印端点已于 2026-10-08 下线
+  （打印改前端 hucre 本地生成），后端无守卫可迁、也不新增端点/死代码；矩阵照前端
+  `frontend/src/utils/deliveryNotePermissions.ts::canPrint` 的放行集合登记，供前端
+  按钮显隐使用。
+- 权限装载：登录 / `/iam/refresh` 时按用户**全部角色 code**（含自定义）联查
+  `t_role_permission`，写进 Redis session 缓存；改授权靠踢持有者下线生效（§9.4）。
+
+### 9.3 ADMIN 是元角色
+
+- **代码级通配**：`has_role` 命中 ADMIN 时对任意角色 / 权限点 / 货架放行，四个鉴权
+  原语（`require_role` / `require_any_role` / `require_permission` / `can_access_shelf`）
+  全部短路；
+- **不进 `t_role_menu` / `t_role_permission`**：`GET /roles/{ADMIN}/grants` 返回**全量**
+  active 菜单码 / 权限码（面板要能整页渲染），`POST /roles/{ADMIN}/grants` 一律
+  **400**（拒绝写入元角色授权数据）；
+- ADMIN 用户的 `permissions` 恒为空 vec（通配不靠数据）；登录态菜单由
+  `menus_for_roles` / `list_menus` 的全量分支给出；
+- 角色行由 `seeds/rbac.sql` 保证存在，`is_system=true`：可停用、不可删、code 不可改。
+
+### 9.4 踢下线语义表
+
+踢人一律在 `tx.commit()` **之后**（Redis 不在 DB 事务内，先踢会在回滚时误踢）。
+踢人失败只 warn，不回滚已提交的写。
+
+| 动作 | 踢谁 | 不踢谁 / 备注 |
+|---|---|---|
+| 改角色 grants（端点 28） | 该角色**全部在册持有人** | 其他角色持有人不受影响；`ADMIN` 拒写（400） |
+| 删自定义角色（端点 26，`delete=true`） | 该角色**全部在册持有人**（`affected_user_count` 即人数） | 停用（`delete=false`）不删授权行、不踢任何人 |
+| 授予 / 撤销用户角色（端点 13 / 14） | **目标用户**（恒 1 人） | 护栏拒绝路径（400）不踢；操作者恰为目标时自己也下线 |
+| 新建 / 改名 / 改描述（端点 24 / 25） | 新建：**不踢任何人**（无持有人）；改名 / 改描述：踢该角色**全部在册持有人** | 改 name / description 也踢：OCC 锚与 grants 共用 `t_role.version`，不踢会让持有者拿着旧 version 提交被拒且不知原因 |
+
+⚠️ ADMIN 用户提交的变更若**波及自己**（例如改自己另外持有的角色 / 其 grants），
+提交成功后自己也会被踢下线（踢人名单含操作者本人）—— 重新登录即可，不是 bug。
+`ADMIN` 角色自身的 grants 不可写（400）。
+
+### 9.5 ADMIN 自锁护栏（三种 400）
+
+下列操作若会使「active 且持有 ADMIN 的用户数」归零 → **HTTP 400**（`40000
+BAD_REQUEST`），且**不调** `delete_all_user_sessions`：
+
+1. 停用 / 删除 ADMIN 角色本身（端点 26）；
+2. 撤销用户在册 ADMIN 角色（端点 14）；
+3. 停用持有 ADMIN 的在册用户（端点 11 `deactivate`）。
+
+判据统一为「`t_user.is_active` 且 ADMIN 授权行未软删的用户数 ≤ 1」（当前只剩目标
+自己）。两个及以上管理员时降级到 1 不构成自锁，放行。
+
+### 9.6 错误码补充
+
+| code | 名称 | HTTP | 触发场景 |
+|---:|---|---:|---|
+| 40000 | `BAD_REQUEST` | 400 | 策略拒绝：三种自锁护栏、ADMIN grants 拒写、系统角色改 code / 删除、**授予未知或已停用角色码**（2026-10-14 起 add_role 的角色码校验由枚举 parse 放宽为「`t_role` 存在且 `is_active`」，自定义角色由此可授予） |
+| 40400 | `NOT_FOUND` | 404 | 角色 id 不存在（含软删） |
+| 20605 | `BIZ_USER_ROLE_NOT_FOUND` | 404 | 撤销的角色行不存在或不属于该用户 |
+| 40901 | `VERSION_CONFLICT` | 409 | 角色 / grants 的 OCC 冲突（共用 `t_role.version`） |
+| 40001 | `VALIDATION_ERROR` | 422 | 入参形态错（code 超长 / 非大写、未知菜单码或权限码、非 SHELF 角色带 scope……） |
+
+已知偏差：登录要求用户至少有一个**枚举可识别**的角色（`login` / `refresh` 对
+「枚举角色为空」的用户返 `20606 BIZ_USER_NO_ROLE`）。⇒ 只持有自定义角色的账号
+当前**无法登录**，自定义角色需与一个内置角色搭配使用。授权矩阵与菜单均为登录后
+才生效，故这是组合限制而非授权缺陷。
