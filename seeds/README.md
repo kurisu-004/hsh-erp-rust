@@ -6,7 +6,32 @@
 ## 当前内容
 
 - `menu.sql` —— 菜单树（t_menu + t_role_menu）声明式种子
+- `rbac.sql` —— RBAC 基线（2026-10-14 新增）：内置角色（t_role）+ 权限点
+  （t_permission）+ 系统角色授权矩阵（t_role_permission），**无条件加载**
 - `admin.sql` —— 可选初始管理员账号种子（2026-09-26 新增），由 `BOOTSTRAP_ADMIN_ENABLED` 门控
+
+### RBAC seed（无条件，2026-10-14 新增）
+
+**文件**：`seeds/rbac.sql`
+**应用**：启动钩子在 `seeds/menu.sql` 之后无条件加载（`src/infra/seed.rs::run_seeds`），
+与 `BOOTSTRAP_ADMIN_ENABLED` 解耦 —— 关掉初始管理员开关后 `t_role` 仍有 6 行系统角色。
+
+**内容**：6 个内置角色 `ADMIN / MANAGER / CLERK / INSPECTOR / CNC_PROGRAMMER /
+SHELF_ACCOUNT`（均 `is_system=true`），以及各系统角色的权限点授权矩阵。
+
+**`t_role.code` 与 Rust `Role` 枚举是两张表**：6 个系统角色一一对应（枚举只覆盖这
+6 项，`auth::rbac::Role`）；管理端新建的自定义角色只进 `t_role.code` varchar
+（并入 `t_user_role.role` / `t_role_menu.role` / `t_role_permission.role_code`），
+**不进枚举** —— 授权判定时 `parse_role_string` 对自定义 code 返回 `None`，但登录态
+的 `roles` 列表与用户详情返回原始大写字符串，自定义角色照常可见。
+
+**`ADMIN` 是元角色**：代码级通配全部菜单与权限，不写任何授权行；后端拒写其 grants。
+给它灌 `t_role_permission` / `t_role_menu` 行会把「通配」降级成「逐项勾选」，漏改
+一行即静默失效。
+
+**幂等语义**：`t_role` / `t_permission` 走 `ON CONFLICT (code) WHERE deleted_at IS
+NULL DO NOTHING`（不覆盖管理端改名 / 停用）；`t_role_permission` 走
+`WHERE NOT EXISTS` + `ON CONFLICT DO NOTHING`（不复活管理端已撤销的授权）。
 
 ### 初始管理员 seed（可选）
 
@@ -14,7 +39,7 @@
 
 **文件**：`seeds/admin.sql`
 **门控**：环境变量 `BOOTSTRAP_ADMIN_ENABLED`（默认 `false`）
-**语义**：开启后，启动钩子会在 `seeds/menu.sql` 之后插入一条 `username=admin / password=changeme / role=MANAGER` 的用户及其 MANAGER 角色行（id 静态常量 `900000000000000001` / `900000000000000002`）。
+**语义**：开启后，启动钩子会在 `seeds/menu.sql` / `seeds/rbac.sql` 之后插入一条 `username=admin / password=changeme / role=ADMIN` 的用户及其 ADMIN 角色行（id 静态常量 `900000000000000001` / `900000000000000002`）。ADMIN 为元角色（代码级通配全部菜单与权限）；从旧版 seed 升级上来的库会保留原 MANAGER 行，`admin.sql` 不删它（删除用户既有授权是危险动作），如需收敛在角色面板里撤销。
 
 **首次启用流程**（仅适用于从零建库后的首次启动）：
 
