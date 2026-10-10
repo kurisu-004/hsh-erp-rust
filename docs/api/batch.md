@@ -186,7 +186,7 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
 | `POST /api/v2/prod/batches/worker-scan` | `POST /api/v2/prod/scan/worker-scan` | 路径（响应形状与 WS 事件名逐字不变） | 2026-10-10 |
 | `POST /api/v2/prod/batches/{batch_id}/pick-up` | `POST /api/v2/prod/scan/batches/{batch_id}/pick-up` | 路径（响应 `R<PartOut>` 与 WS 事件名逐字不变） | 2026-10-10 |
 
-**全部无 alias**，旧路径 404。契约细节见 [`queue.md`](queue.md) §1 与 §5.1、[`outsource.md`](outsource.md)。
+**全部无 alias**，旧路径 404。契约细节见 [`queue.md`](queue.md) §1（端点表）/ §4（口径表，含候选池与工人持有判据）/ §7（WS 关系）、[`outsource.md`](outsource.md)。
 
 2026-10-07 一行迁走的是待品检队列读的整条链路（`dto` / `vo` / `model` 行结构 / `repo/list.rs` / `service/list.rs`）→ `prod::inspection`，契约见 [`inspection.md`](inspection.md)。
 
@@ -325,7 +325,7 @@ t_assembly.status               ← 派生缓存
 
 | # | 读侧 | 受影响的字段 / 端点 | 变化方向 |
 |---|---|---|---|
-| A-1 | `part::service::list_enrichment::enrich_part_list_with_location_and_holder` 的 min-progress 目标批次选择 —— 只排除 `CANCELLED` / `COMPLETED`，**不排除 `DELIVERED`** | `PartOut.location` / `holder_name`。⚠️ 只有**两条 list 路径**注入它：`GET /api/v2/parts` 与 `GET /api/v2/com/union-list` 的 PART 段（`GET /parts/{id}` 返的是 `PartDetailOut`；各 part 写端点的 `PartOut` 由 `From<TPart>` 恒填 `null` ⇒ 都不走这条派生） | 「只剩一条 `DELIVERED` 批次且原本停在品检架」的工单：由「品检架 + 架名」变 `null`。**修正** |
+| A-1 | `part::service::list_enrichment::enrich_part_list_with_location_and_holder` 的 min-progress 目标批次选择 —— 只排除 `CANCELLED` / `COMPLETED`，**不排除 `DELIVERED`** | `PartListItem.location` / `holder_name`。⚠️ 只有**两条 list 路径**注入它：`GET /api/v2/parts` 与 `GET /api/v2/com/union-list` 的 PART 段（`GET /parts/{id}` 返的是 `PartDetailOut`，不是本 VO）；同 VO 的其余 **5 处返回点**（4 个列表端点 + `POST /assemblies/{id}/children` 返回的单对象 `R<PartListItem>`）走 `impl From<TPart>`，**构造默认就是 `None`、从不覆写**（登记见 `part::vo::part` 的 `PartListItem` 逐字段 doc） | 「只剩一条 `DELIVERED` 批次且原本停在品检架」的工单：由「品检架 + 架名」变 `null`。**修正** |
 | A-2 | `part::repo::sql::part_sql` 的 `list_with_filters` / `count_with_filters` 里 `locations` / `holder_ids` 两个 `EXISTS`（只有 `pb.deleted_at IS NULL`） | `GET /api/v2/parts?locations=…&holder_ids=…` 的**结果集**（items 与 total 各一份 SQL） | 命中集变小。**修正** |
 | A-3 | `com::union_list::repo::sql::list_union_all_with_filters` 的 `$7::text[]`（location）/ `$8::bigint[]`（holder）两个 `EXISTS`（同样只有软删闸门） | `GET /api/v2/com/union-list?locations=…&holder_ids=…` 的结果集 | 同 A-2。**修正** |
 | A-4 | `prod::batch::repo::queries::list_held_by_worker` | **无端点** —— 全仓**零调用方**（仅 trait 声明 + impl），死代码 | 不适用；接线前必须先补 `status='IN_PROCESS'`（见 [`queue.md`](queue.md) §4.3） |

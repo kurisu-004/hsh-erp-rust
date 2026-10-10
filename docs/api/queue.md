@@ -478,14 +478,22 @@ migration `20261014000001_001_fix_max_held_batches_column_comment` 订正（appe
 - **queue 域不订阅 WS。** 本域的两个读端点都是 HTTP `pool.acquire()` 拉取，前端靠 TanStack Query 的 staleTime + `POST /queue/move` 成功后的失效编排来刷新。
 - **但本域的写端点会发广播**（都是 `WsEvent::DashboardEvent { kind, payload }`，**commit 之后**发）：
 
-| 写端点 | `kind` | 条件 |
-|---|---|---|
-| `POST /queue/recall` | `PART_RECALLED` | 无条件（payload `{ part_id }`） |
-| `POST /queue/dispatch` | `BATCH_PLACED_ON_SHELF` | `succeeded` 非空 |
-| `POST /queue/refill` | `WORKER_POOL_REFILL_DONE` | `taken` 非空 |
-| `POST /queue/refill` | `WORKER_POOL_EMPTY` | ⚠️ **2026-10-14 起收窄**：`stopped_reason == "POOL_EMPTY"`（见下） |
-| `POST /queue/move` | `WORKER_POOL_MOVE_DONE` | 无条件 |
-| `POST /queue/auto-allocate` | `WORKER_POOL_AUTO_ALLOCATE_DONE` | 无条件 |
+| 写端点 | `kind` | 条件 | payload 形状 |
+|---|---|---|---|
+| `POST /queue/recall` | `PART_RECALLED` | 无条件 | `{ part_id }` |
+| `POST /queue/dispatch` | `BATCH_PLACED_ON_SHELF` | `succeeded` 非空 | `serde_json::to_value(&DispatchResult)` |
+| `POST /queue/refill` | `WORKER_POOL_REFILL_DONE` | `taken` 非空 | `RefillResult`（`serde_json::to_value`，§3.2） |
+| `POST /queue/refill` | `WORKER_POOL_EMPTY` | ⚠️ **2026-10-14 起收窄**：`stopped_reason == "POOL_EMPTY"`（见下） | ⚠️ **手拼 `json!` 4 键**：`worker_id` / `shelf_id` / `pool_empty` / `stopped_reason`，逐字段见 [`scan.md`](scan.md) §4.2 |
+| `POST /queue/move` | `WORKER_POOL_MOVE_DONE` | 无条件 | `MoveResult`（`serde_json::to_value`） |
+| `POST /queue/auto-allocate` | `WORKER_POOL_AUTO_ALLOCATE_DONE` | 无条件 | `AutoAllocateResult`（`serde_json::to_value`） |
+
+⚠️ **`WORKER_POOL_EMPTY` 的 payload 逐字段以 [`scan.md`](scan.md) §4.2 为正典**（那里有
+完整四键表）；本节**不重复**该表，只登记「本域这一份与 scan 域那一份必须逐字同形」
+这条约束。⚠️ **2026-10-14 review 第 2 轮 MAJOR-N2**：本域这一份此前只有 3 键（缺
+`stopped_reason`），而 §4.2 声称「三键两边同形」—— 对 `stopped_reason` **为假**。原因
+是上一轮只改了缺键的那一侧。**两处都是手拼 `json!`、没有共享构造器**（故意的：本域
+`shelf_id` 填架 id、scan 域恒 `null`，共用一个 builder 会诱使后人把差异抹平），代价就是
+这条「改一同步二」纪律必须靠两侧注释 + 本表登记来兜。
 
 - **消费方是 dashboard 域**（`/ws/dashboard` + 前端 `AFFECTS_DASHBOARD` 白名单），不是 queue 域自己的实时刷新。
 - ⚠️ **`WORKER_POOL_EMPTY` 的广播条件在 2026-10-14 收窄（有意协议行为变更）**：此前条件是 `pool_empty`，而 `pool_empty` 对「池空」与「**工人已拿满**」两种成因**都为 `true`**（`take_one_from_pool` 对两者都返回 `None`，SQL 层失败形态一样）。于是「这个工人已经拿满了」也会向所有订阅端推一条名为 `POOL_EMPTY` 的事件 —— 事件名会误导看板把原因归给「池里没货」。

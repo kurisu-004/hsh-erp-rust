@@ -544,8 +544,17 @@ step 指针与「当前工序在链内的位置」是两个独立事实，而 wo
 事实，看板每个工人格子各自刷新自己的 `current_held`，不需要一条全局广播。
 
 ⚠️ 两处 payload 的 `shelf_id` **形态不同**：本域恒 `null`（worker-scan 的 refill
-跨架取料、无架锚），queue 域填请求里的架 id。`stopped_reason` / `pool_empty` /
-`worker_id` 三个键两边同形。
+跨架取料、无架锚），queue 域填请求里的架 id。
+
+⇒ **4 个键两边同名同形，只有 `shelf_id` 的值形态不同**：`worker_id`（字符串）/ `pool_empty`
+（恒 `true`）/ `stopped_reason`（恒 `"POOL_EMPTY"`）三键两边逐字相同。
+⚠️ **2026-10-14 review 第 2 轮 MAJOR-N2 订正**：本节此前写「`stopped_reason` /
+`pool_empty` / `worker_id` **三个**键两边同形」，而 `prod::queue` 那一侧当时**根本没
+有 `stopped_reason` 键**（上一轮只把键加到了 scan 侧）⇒ 同一事件名两个 payload 形状。
+现已补齐，本节改为「4 个键同名、3 个键同形、`shelf_id` 值形态不同」。
+⚠️ 两处都是**手拼 `json!`、没有共享构造器** —— 刻意的（`shelf_id` 的差异是真实业务
+差异，共用 builder 会诱使后人把差异抹平）。代价：改键集合必须**两侧同时改**，纪律
+写在两侧代码注释 + [`queue.md`](queue.md) §7 的 payload 列登记里。
 
 ## 5. SQL 条数
 

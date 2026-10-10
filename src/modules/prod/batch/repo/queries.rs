@@ -461,6 +461,40 @@ impl PartBatchRepo {
     /// 被忽略），使 trait 声明里「0 行 → 由 service 转 `VERSION_CONFLICT` 409」
     /// 变成一句谎言、`delivery_note/service/lifecycle.rs` 的 `if affected == 0`
     /// 变成死代码。
+    ///
+    /// ## 2026-10-14：「终态批次不在任何位置」不变式的写点清单（共 **6** 个）
+    ///
+    /// **不变式**（`CLAUDE.md`「状态派生契约」一节 / `docs/api/batch.md` §6.1）：
+    /// 批次进入终态（`CANCELLED` / `COMPLETED` / `DELIVERED`）时 `location` 与
+    /// `current_holder_id` **一并清 NULL**。存量由 append-only migration
+    /// `20261013000002_001_clear_terminal_batch_location` 回补；下表保证**以后不再
+    /// 产生**。两者互补、缺一不可。
+    ///
+    /// | # | 写点 | 目标态 | `clear_location` / `clear_holder_id` |
+    /// |---|---|---|---|
+    /// | 1 | `shared::batch::guards::mark_batch_status_only` | `CANCELLED` | `true`（**只对 `CANCELLED` 特判**） |
+    /// | 2 | `shared::batch::status::apply_bulk_batch_status_change_for_part` | `CANCELLED` / `COMPLETED` | 无条件清（常量 `= NULL`） |
+    /// | 3 | `shared::batch::status::FORCE_COMPLETE_ALL_BATCHES_FOR_ASSEMBLY_SQL` | `COMPLETED` | 无条件清（常量 `= NULL`） |
+    /// | 4 | `prod::batch::repo::sql::mark_batch_delivered` | `DELIVERED` | `true` |
+    /// | 5 | `prod::batch::repo::sql::mark_batch_completed` | `COMPLETED` | `true` |
+    /// | **6** | **本函数（`PartBatchRepo::update`，`delivery_note::pickup`）** | `DELIVERED` | `true`（按目标态驱动，2026-10-14 review 第 2 轮 MAJOR-N1 补上） |
+    ///
+    /// ⚠️ **第 1 个之外不要动 `mark_batch_status_only` 的特判**：它还服务
+    /// `READY_TO_SHIP` / `IN_PROCESS` 两个**非终态**目标，那两处的 `location`
+    /// 是有业务含义的落点（理由见 `shared::batch::guards` 该函数 doc）。
+    ///
+    /// ⚠️ **本轮之前漏的正是第 6 个**：唯一生产调用方
+    /// `com::delivery_note::service::lifecycle::pickup` 只在**内存 struct** 上把
+    /// `b.current_holder_id / b.location` 清了（那是响应 / 后续 `sync` 用的），真正
+    /// 的 DB 写走本函数 ⇒ 落库的行仍是 `location='INSPECTION_SHELF' +
+    /// current_holder_id=<shelf_id>` —— 正是 migration `20261013000002` 判据要清的
+    /// 那一类行。**历史清了、以后继续产生**。回归测试：
+    /// `tests/com/delivery_note/driver.rs::pickup_uses_assigned_driver_and_flips_batches_to_delivered`。
+    ///
+    /// ⚠️ **清单不穷尽于「本文件」** —— 它只覆盖 `t_part_batch.status` 的写入口。
+    /// 新增终态写点时必须在这张表里加一行，否则 `CLAUDE.md` 的不变式 bullet 会
+    /// 让人以为「CANCELLED 那侧已统一处理过」（真实事故：本轮第 6 个就是被这句话
+    /// 掩盖的）。
     #[allow(clippy::too_many_arguments)]
     pub async fn update(
         conn: &mut PgConnection,
@@ -473,6 +507,16 @@ impl PartBatchRepo {
         let updated_by = updated_by.unwrap_or(0);
         // 1) status → shared::batch::status（唯一写入口；0 行 = VERSION_CONFLICT）
         if let Some(target) = status {
+            // 2026-10-14 review 第 2 轮 MAJOR-N1：**「终态清位置」不变式的第 6 个
+            // 写点，此前漏改**（逐个写点的清单见本函数 doc 的末节）。
+            //
+            // 写成防御式（`target` 驱动）而不是硬编码 `true`：本形参是通用的
+            // `&str`，`allowed_from` 恒为 `["READY_TO_SHIP"]` 只说明**当前**唯一
+            // 可达目标态是 `DELIVERED`，不构成「永远只有这一个目标态」的保证。
+            // 硬编码 `true` 的写法在将来加目标态时会静默带上清位置副作用
+            // （可能是错的），而按目标态驱动至少让「加新终态目标」这件事必须经过
+            // 这一行 —— 改这里时能看见。
+            let is_delivered = target == "DELIVERED";
             batch_status::apply_batch_status_change(
                 conn,
                 StatusChange {
@@ -488,11 +532,24 @@ impl PartBatchRepo {
                     // READY_TO_SHIP（service 层逐批守过）。
                     allowed_from: &["READY_TO_SHIP"],
                     updated_by,
-                    clear_location: false,
-                    clear_holder_id: false,
+                    clear_location: is_delivered,
+                    clear_holder_id: is_delivered,
                     clear_process_id: false,
                     clear_process_step_id: false,
-                    // 目标状态 DELIVERED 不是终态 → 终态归档事件分支不可达（M4）
+                    // `event_id: None` 的真实理由（2026-10-14 review 第 2 轮订正，
+                    // 原文「目标状态 DELIVERED 不是终态」两处都不准，见下）：
+                    // ① **DELIVERED 就是批次终态**（终态清位置不变式与 migration
+                    //    `20261013000002` 的判据都把它算进去）；
+                    // ② 归档分支的闸门不是批次目标态，而是
+                    //    `rollup_part_derived` 的 step 4
+                    //    `part_status_changed && is_terminal(&target.status)` ——
+                    //    `is_terminal` = `COMPLETED | CANCELLED`（part 级终态，
+                    //    见 `status.rs`），而 pickup 把该 part 派生到的是
+                    //    `DELIVERED` ⇒ 归档分支确实不可达，但**理由是 part 的
+                    //    派生态**、不是批次的终态性；
+                    // ③ pickup 路径上 `delivery_note::repo` 拿不到
+                    //    `SnowflakeIdGenerator`，本就该按 M4「caller 拿不到
+                    //    生成器 ⇒ 传 None」的约定走。
                     event_id: None,
                 },
             )

@@ -85,10 +85,30 @@ pub async fn admin_refill(
     } else if r.stopped_reason.as_deref() == Some(queue_vo::stopped_reason::POOL_EMPTY) {
         state.ws_hub.broadcast(WsEvent::DashboardEvent {
             kind: "WORKER_POOL_EMPTY".into(),
+            // ⚠️ **改一同步二：`WORKER_POOL_EMPTY` 全仓有两个产出点，两处 payload
+            // 必须逐字同形**（同一个事件名 + 同一组键）：
+            // ① 本处 `prod::queue::handler::pool::admin_refill`
+            //    （`POST /api/v2/prod/queue/refill`）；
+            // ② `prod::scan::handler::transition::worker_scan`
+            //    （`POST /api/v2/prod/scan/worker-scan`，其 refill 在同事务内跑）。
+            // 逐字段对照见 `docs/api/scan.md` §4.2；**改键集合时两边都要改**。
+            //
+            // ⚠️ 2026-10-14 review 第 2 轮 MAJOR-N2：本处此前只有 3 键
+            // （`worker_id` / `shelf_id` / `pool_empty`），**缺 `stopped_reason`** ——
+            // 上一轮只把键加到了 ② 侧，两侧形状分叉而 `docs/api/scan.md` §4.2 末段
+            // 却写着「`stopped_reason` / `pool_empty` / `worker_id` 三个键两边同形」。
+            //
+            // ⚠️ 与 ② 侧**唯一有意不同形**的是 `shelf_id`：worker-scan 的 refill
+            // 跨架取料、无架锚，恒为 `null`；本域保留架锚（Manager 端点专属操作），
+            // 填请求里的架 id。类型也不同（string vs null）。
             payload: json!({
                 "worker_id": req.worker_id.to_string(),
                 "shelf_id": req.shelf_id.to_string(),
                 "pool_empty": true,
+                // 走这条分支时该字段恒为 `Some("POOL_EMPTY")`（条件即由它推出），
+                // 但**仍然写进 payload**：让消费方能确认这条事件确实来自「池空」，
+                // 与 ② 侧形状一致。类型 `Option<String>` 与 ② 侧逐字相同。
+                "stopped_reason": r.stopped_reason,
             }),
         });
     }

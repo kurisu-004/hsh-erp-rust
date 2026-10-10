@@ -168,15 +168,24 @@ pub async fn worker_scan(
     } else if refill_out.stopped_reason.as_deref() == Some(queue_vo::stopped_reason::POOL_EMPTY) {
         state.ws_hub.broadcast(WsEvent::DashboardEvent {
             kind: "WORKER_POOL_EMPTY".into(),
-            // 2026-10-10：`shelf_id` 键删除（refill 已无架锚，worker-scan 也不再收它）。
-            // WS payload 与 HTTP 响应的 `refill.shelf_id` 同步为 `null`。
-            // 2026-10-14：补 `stopped_reason` 键（字符串）—— 让消费方能确认这条事件
-            // 确实来自「池空」而不是「工人已拿满」。走这条分支时该字段恒为
-            // `Some("POOL_EMPTY")`（条件即由它推出）。
             payload: json!({
                 "worker_id": scan_out.worker_id.to_string(),
                 "shelf_id": serde_json::Value::Null,
                 "pool_empty": true,
+                // 2026-10-10：`shelf_id` 键删除（refill 已无架锚，worker-scan 也不再收它）。
+                // WS payload 与 HTTP 响应的 `refill.shelf_id` 同步为 `null`。
+                // 2026-10-14：补 `stopped_reason` 键（字符串）—— 让消费方能确认这条事件
+                // 确实来自「池空」而不是「工人已拿满」。走这条分支时该字段恒为
+                // `Some("POOL_EMPTY")`（条件即由它推出）。
+                //
+                // ⚠️ **改一同步二：本 payload 与
+                // `prod::queue::handler::pool::admin_refill` 那份必须逐字同形**
+                // （同一个 `WORKER_POOL_EMPTY` 事件名 + 同一组 4 个键）。
+                // ⚠️ 2026-10-14 review 第 2 轮 MAJOR-N2：上一轮**只**把
+                // `stopped_reason` 加到了本侧，另一侧仍是 3 键 ⇒ 同一个事件名两个
+                // payload 形状，而 `docs/api/scan.md` §4.2 却声称三键同形。改键集合时
+                // **两边都要改**；唯一有意不同形的是 `shelf_id`（本侧恒 `null`，
+                // queue 侧填架 id）。逐字段对照见 `docs/api/scan.md` §4.2。
                 "stopped_reason": refill_out.stopped_reason,
             }),
         });
