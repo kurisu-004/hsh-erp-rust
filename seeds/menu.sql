@@ -128,11 +128,11 @@ INSERT INTO t_menu (
     -- 2026-10-04 移除：workers_list 从 auth_group 移到 production_group 下（前端视图
     -- 搬到 frontend/src/views/production/，路由随之前端搬到 /production/worker-list）。
     (9000000000000202, (SELECT id FROM t_menu WHERE code = 'auth_group'         AND deleted_at IS NULL), 'users_list',                '账号管理',      '/users',                       'List',         20, true, 0, now(), 0, now(), 0),
-    -- 2026-10-14 新增：RBAC 角色面板（角色 / 权限点 / 授权整包，iam::rbac 的 8 条
-    -- 端点）。sort_order=25 插在 users_list=20 与 shelves_list=30 之间；path 与
-    -- 前端路由 /iam/roles 一致。
-    (9000000000000204, (SELECT id FROM t_menu WHERE code = 'auth_group'         AND deleted_at IS NULL), 'roles_list',                '角色权限',      '/iam/roles',                   'Lock',         25, true, 0, now(), 0, now(), 0),
     (9000000000000203, (SELECT id FROM t_menu WHERE code = 'auth_group'         AND deleted_at IS NULL), 'shelves_list',              '货架管理',      '/shelves',                     'Platform',     30, true, 0, now(), 0, now(), 0),
+    -- 2026-10-14 新增：RBAC 角色面板（角色 / 权限点 / 授权整包，iam::rbac 的 8 条
+    -- 端点）。sort_order=40 接在 shelves_list=30 之后（与前端 dummy 模式侧栏的
+    -- users → shelves → roles 顺序一致）；path 与前端路由 /iam/roles 一致。
+    (9000000000000204, (SELECT id FROM t_menu WHERE code = 'auth_group'         AND deleted_at IS NULL), 'roles_list',                '角色权限',      '/iam/roles',                   'Lock',         40, true, 0, now(), 0, now(), 0),
 
     -- customer_management 下
     (9000000000000401, (SELECT id FROM t_menu WHERE code = 'customer_management' AND deleted_at IS NULL), 'customers_list',         '客户一览',      '/customers',                   'Connection',   10, true, 0, now(), 0, now(), 0),
