@@ -515,6 +515,27 @@ pub async fn get_part_file_preview(
     Ok(Json(R::ok(out)))
 }
 
+/// `files::part_file` 子模块 router 注册的全部路由（`METHOD /path`，相对
+/// `/api/v2/files/objects`）。
+///
+/// 2026-10-13 review 第 1 轮 NIT 新增。此前本域的端点数（7）分散在
+/// `src/modules/files/mod.rs` 的端点表、`CLAUDE.md` 的子模块清单、本文件 doc
+/// 三处**手工维护** —— 下加一条端点必然漂移（且漂移的表现是「文档说有、实际没有」
+/// 或反之，不报错）。本常量是那三处的**唯一真源**，`mod tests` 逐条比对
+/// `router()` 源码，加/删端点忘同步会当场红。
+///
+/// 计数口径与全仓一致：一条 `.route(path, m1)` 记 1 条；
+/// `.route(path, get(h).post(h))` 记 2 条。
+pub const ROUTES: &[&str] = &[
+    "GET /",
+    "POST /",
+    "POST /confirm",
+    "GET /{file_id}/url",
+    "GET /{file_id}/content",
+    "POST /{file_id}/delete",
+    "GET /{file_id}/preview",
+];
+
 /// `files::part_file` 子模块 axum 子路由。
 ///
 /// 2026-10-13 PR1b：`POST /` 的上传端点复活并通用化（与 part / assembly 侧三条旧
@@ -532,4 +553,81 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{file_id}/content", get(get_part_file_content))
         .route("/{file_id}/delete", post(soft_delete_part_file))
         .route("/{file_id}/preview", get(get_part_file_preview))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ROUTES;
+
+    /// 从 `router()` 源码里抠出全部 `METHOD /path`。
+    ///
+    /// 解析规则与 `prod::batch::handler::mod::tests` 同款（对本文件的书写方式足够，
+    /// 且不引入构建期依赖）：
+    /// - 以 `.route(` 为锚点，跳过空白后读一个 `"…"` 字面量作 path；
+    /// - 从该字面量末尾到**下一个** `.route(`（或函数末）之间出现 `get(` 记 GET、
+    ///   出现 `post(` 记 POST；两者都出现则**各记一条**（本域的 `"/"` 正是这种
+    ///   `get(h).post(h)`，与 batch 域一路由一方法的约定不同）。
+    fn routes_in_router_source() -> Vec<String> {
+        let src = include_str!("handler.rs");
+        let body = src
+            .split_once("pub fn router()")
+            .expect("本文件必须有 pub fn router()")
+            .1;
+        // ⚠️ **必须切到 `router()` 的收尾大括号**：`include_str!` 拿到的是整个文件，
+        // 下面的 `mod tests` 自己的 doc 里也出现了 `.route(` 字面量，不切就会把
+        // 测试代码当成路由表解析（本轮首次跑就是这么红的）。
+        let body = &body[..body.find("\n}\n").expect("router() 必须有收尾大括号")];
+        let mut out = Vec::new();
+        let mut rest = body;
+        while let Some(at) = rest.find(".route(") {
+            rest = &rest[at + ".route(".len()..];
+            let after_ws = rest.trim_start();
+            assert!(
+                after_ws.starts_with('"'),
+                ".route( 后必须紧跟字符串字面量 path；实测：{after_ws:.40}"
+            );
+            let after_quote = &after_ws[1..];
+            let end = after_quote.find('"').expect("path 字面量必须有闭合引号");
+            let path = &after_quote[..end];
+            let tail = &after_quote[end..];
+            let seg_end = tail.find(".route(").unwrap_or(tail.len());
+            let seg = &tail[..seg_end];
+            assert!(
+                !seg.contains("put(") && !seg.contains("delete(") && !seg.contains("patch("),
+                "本域只用 get/post；实测到别的 MethodRouter：{seg:.60}"
+            );
+            if seg.contains("get(") {
+                out.push(format!("GET {path}"));
+            }
+            if seg.contains("post(") {
+                out.push(format!("POST {path}"));
+            }
+            rest = &tail[seg_end..];
+        }
+        out
+    }
+
+    /// `ROUTES` 必须与 `router()` 源码**逐条**一致（不多、不少、同序）。
+    #[test]
+    fn routes_declared_in_router() {
+        let actual = routes_in_router_source();
+        assert_eq!(
+            actual.len(),
+            ROUTES.len(),
+            "`router()` 注册了 {} 条路由，ROUTES 只列了 {} 条（新增端点忘了登记？）\n\
+             router(): {:?}\nROUTES: {:?}",
+            actual.len(),
+            ROUTES.len(),
+            actual,
+            ROUTES,
+        );
+        for (got, want) in actual.iter().zip(ROUTES.iter()) {
+            assert_eq!(
+                got,
+                want,
+                "`router()` 与 ROUTES 的第 {} 条不一致",
+                ROUTES.len()
+            );
+        }
+    }
 }

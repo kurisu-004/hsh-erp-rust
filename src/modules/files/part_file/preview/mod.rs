@@ -46,16 +46,33 @@
 //! **零 IO** 返回的请求变成一次重复的 CI 提交（CI 按页计费 = 重复花钱）。这条
 //! 谓词是「READY 不打任何外部依赖」那条契约的**唯一**实现点，改它前先想清楚。
 //!
-//! ### ⚠️ 并发下**不重复提交** CI job 的唯一机制是唯一索引
+//! ### ⚠️ 并发下不重复提交 CI job：**两道闸**，各管一段
 //!
-//! 两个请求同时 cache miss 时，两边都会 `find_by_seed` = None。若靠应用层
-//! 「先查再插」防重复，两边都会以为自己该提交 ⇒ **同一个内容提交两个 CI job**，
-//! 而 CI 按页计费 ⇒ 真金白银的重复开销。
+//! ⚠️ **2026-10-13 review 第 1 轮 MAJOR-1 订正**：本节此前的头条声称「唯一索引是
+//! **唯一**机制」，但 `insert_pending` 只在「首次登记」那一条路径被调用 ——
+//! 「行已存在」的两条路径完全裸奔：
 //!
-//! 故 `insert_pending` 用 **`ON CONFLICT (preview_seed) WHERE deleted_at IS NULL
-//! DO NOTHING`**，把裁决权交给 `uk_t_file_preview_seed`：只有 `rows_affected == 1`
-//! 的那个调用才是「登记者」，才允许提交；`0` 行的那个直接返 PENDING。
-//! 这也是建表注释里说「独立成表」的第二个理由。
+//! | 闸 | 管的路径 | 机制 | 漏了会怎样 |
+//! |---|---|---|---|
+//! | `uk_t_file_preview_seed` 唯一索引 | **首次登记** | `insert_pending` 的 `ON CONFLICT DO NOTHING`，`rows == 1` 的才是登记者、才允许提交 | —— |
+//! | `PreviewRepo::claim_submit` **条件 UPDATE 认领** | **重试** 与 **自愈** | 谓词 `state='PENDING' AND (ci_job_id IS NULL OR ci_job_id LIKE '__claiming__:%')`，只有 `rows == 1` 才允许打 python | 两个 CI job，按页计费 ⇒ **双份钱**，先写的那个变孤儿 |
+//!
+//! 两条裸奔路径（**这才是唯一索引帮不上忙的地方**）：
+//!
+//! - **路径 A（提交失败后的重试）**：行 = `PENDING / ci_job_id IS NULL /
+//!   next_poll_at = T`。T 到点后两个请求同时读到「due + NULL」，**都**进 3d、
+//!   **都** POST `/doc_jobs`。
+//! - **路径 B（FAILED 自愈）**：`reset_to_pending` 的返回值此前**被丢弃**。T1 重置
+//!   成功并提交了新 job；T2 重置得 **0 行**（状态已被 T1 改掉）却不看行数、
+//!   无条件把内存行改成 `PENDING / ci_job_id = None`，继续走 3d **再提交一个**。
+//!
+//! 认领的标准写法就是「**条件 UPDATE 抢占**」而不是「先查再打 python」—— 后者
+//! 查与打之间没有任何闸，是教科书式的 TOCTOU。认领成功后 `ci_job_id` 被写成
+//! `__claiming__:<snowflake>` 占位 token（`service::CLAIM_TOKEN_PREFIX`），进程若
+//! 在此与 `mark_submitted` 之间挂掉，下一次调用靠 3d 的 `needs_submit` 判据
+//! （认 token 为「尚未提交」）恢复。
+//!
+//! 建表注释里说「独立成表」的第二个理由正是这个内容寻址 + 唯一索引的组合。
 //!
 //! ### 退避常数
 //!
@@ -125,10 +142,16 @@
 //! | **风险 1** | 预览图永久公开可读，无过期时间、无撤销手段（除改 COS ACL） |
 //! | **风险 2** | `t_part_file` 的 owner 是多态的（`PART` / `ASSEMBLY`）+ 客户端可任意指定 `file_id` ⇒ 工控机账号能取**任意**零件的预览，没有货架级 / 工单级收窄（本域权限模型止步于角色） |
 //! | **风险 3** | 预览图等价于图纸的完整视觉副本，**绕过 COS 源 PDF 的任何权限** |
-//! | **补偿 1** | 图纸本来就是 5 个角色（含 `ShelfAccount` 的报工台账号）都能看的；预览不扩大「谁能看图纸」这个集合，只放大「拿到手的东西能不能外发」 |
+//! | **风险 4** | ⚠️ **`POST /objects/{id}/delete` 不回收预览**：该端点只软删
+//! | `t_part_file` + 异步删 COS 上的**源对象**；`previews/<seed>/` 下的 JPG 与
+//! | `t_file_preview` 行**都不动** ⇒ 图纸「删除」后，一份完整的视觉副本仍以
+//! | public-read **永久可读**（攻击者只要事先存过 URL 就一直有效）。本表**只增
+//! | 不减**，**无 TTL / 无 GC / 无级联** |
+//! | **补偿 1** | 图纸本来就是 5 角色（含 `ShelfAccount` 的报工台账号）都能看的；预览不扩大「谁能看图纸」这个集合，只放大「拿到手的东西能不能外发」 |
 //! | **补偿 2** | 路径里绝不带文件名（上一节）⇒ 不可枚举 |
 //! | **补偿 3** | `preview_seed` 是内容哈希，不可反推 `object_key` / 图号 |
 //! | **补偿 4** | 可回收：`previews/` 前缀的 ACL 是**单独**一条，不动它就只影响预览图；关掉它即断链（源 PDF 走 `obj/` 前缀的预签，**不受影响**） |
+//! | **补偿 5（对应风险 4）** | 缓解只在**可发现性**层面：路径不含文件名 ⇒ 删图后没人能重新算出那个 URL。⚠️ **已持有 URL 的人不受影响**（这正是 public-read 无撤销的固有代价，与风险 1 同源） |
 //!
 //! ⚠️ **反向的操作风险**：本端点**没有** `POST` / `DELETE` 侧的配套端点，
 //! 即无法「只为某个零件关闭预览」。要按零件收窄只能改代码或整条关 ACL ——
@@ -236,7 +259,9 @@
 //! | 5 | 预览图 public-read **无过期、无撤销**（除改 COS ACL）；且无法按零件关闭 | **有意保留 + 已登记**（用户拍板选项 A；见「安全取舍反转」一节） |
 //! | 6 | **CI 终局失败的落点是 `FAILED` + 21117，不静默重提 job**（`NotExist` / `Cancel` / `Pause` 三者同判）。代价：`Pause` 若在 CI 侧存在「自动恢复」的场景会被**过早判死**（多跑一个 job 而非永远失败） | **有意 + 已论证**（见「CI 终局失败的落点」一节，含「为什么不会变成无限提交 job」的论证） |
 //! | 7 | **跨仓词表缺口（2026-10-13 review 第 1 轮已修 rust 侧）**：`NotExist` 是 python **合成**的词（CI 官方六态里没有），python 侧**只负责产出、不抛 404、不加 `exists` 位**；**识别与落点全部由 rust 负责**（`parse_ci_status`）。此前 rust 只认 `Success`/`Failed`，其余全落「进行中」⇒ `NotExist` / `Cancel` / `Pause` 会**无限轮询** | **已修（rust 侧）**；**python 侧需同步 doc**（把 `NotExist` 从「CI 官方状态」改述为「本仓合成」，位置清单见本节末） |
-//! | 8 | **状态字段名跨仓两种写法**：`forward_ci_describe` 的契约 doc 与既有实现读 `status`，python 侧文档称 `state`。本仓**两个键都读、`status` 优先**（读错 ⇒ 空串 ⇒ 落 `Running` 兜底 ⇒ 无限轮询） | **已在本仓兜住**；两侧收敛到同一键名后可删掉 `state` 那一支 |
+//! | 8 | **状态字段名跨仓两种写法**：`forward_ci_describe` 的响应模型字段是 **`state`**（python `CiPreviewJobStatus.state`，模块 docstring 的线上样例也是它），`status` 键在 python 侧**根本不存在**。本仓**两个键都读、`state` 优先**（读错 ⇒ 空串 ⇒ 落 `Running` 兜底 ⇒ 无限轮询）。⚠️ 2026-10-13 review 第 1 轮 MINOR-1 订正：此前实现是 `status` 优先、**顺序反了** | **已在本仓兜住**；两侧收敛到同一键名后可删掉 `status` 那一支 |
+//! | 9 | **提交请求体的跨仓字段名错配（2026-10-13 review 第 1 轮 BLOCKER，已修）**：本仓发 `{src_object_key, preview_prefix, preview_seed}`，python 的 `CiPreviewJobRequest` 只有 `{src_object_key, dst_prefix}` 且 `dst_prefix` **必填** ⇒ pydantic 静默丢掉两个多余键 + FastAPI **422** ⇒ **每一次 submit 都失败**，行永远停在 `PENDING / ci_job_id IS NULL` | **已修**（body 改为 `dst_prefix` + 抽出与 `preview_urls` 同源的 `preview_object_prefix` 真源；跨仓契约由 `tests/files/preview.rs::submit_request_body_matches_python_schema` 钉死） |
+//! | 10 | **`Success` 但 `total_page_count == 0` ⇒ 永远 PENDING 且每 2s 真打一次 python**（护栏的代价）：CI 若**永久**不返回页数（如 python 侧 `DocProcessResult` 结构变更导致该字段恒缺），行会**永不停**地以固定 2s 打 python（无递增退避，见 #4）⇒ **一次打不开的预览 = 一个永不停歇的 python 探针**。⚠️ **跨仓义务（前端）**：收到 **21117 / 21118** 时**必须停止自动重试**并回落 `GET /objects/{id}/content`（原始 PDF），**不得**按 `retry_after_ms` 无限重调 —— 每一次重试在「提交失败后自愈」这条路径上都是**一次新的 CI job**（按页计费） | **未修（有意）**：改成「N 次后判 FAILED」要改 schema（加轮询计数字段）。**该义务落在前端**，本仓已在 `PreviewOut` 的 `retry_after_ms` 语义与本表登记 |
 //!
 //! ### 需要 `backend-python` 同步的位置（本 PR 无法触及，python 在另一 worktree）
 //!
@@ -244,8 +269,9 @@
 //! |---|---|
 //! | `core/ci.py` 的模块 / 函数 doc | 凡是把 `NotExist` 称作「CI 官方状态 / CI 六态之一」的地方，改述为「**本仓合成值**」并写明 3 个触发条件（`NonExistJobIds` 节点 / `JobsDetail.Code` 码 / 记录超期） |
 //! | `api/v1/ci_preview.py` 的端点 doc | 同上；并建议在响应字段说明里注明「`state` 的取值集合 = CI 官方六态 ∪ {`NotExist`}，识别方（rust）以该集合为准」 |
-//! | 两处 doc 的字段名 | 确认 `describe` 响应里状态字段到底叫 `state` 还是 `status`，与 rust 侧收敛成一个（rust 现读 `status` 优先、`state` 兜底，见偏差 #8） |
+//! | 两处 doc 的字段名 | 确认 `describe` 响应里状态字段到底叫 `state` 还是 `status`，与 rust 侧收敛成一个（rust 现读 **`state` 优先**、`status` 兜底，见偏差 #8） |
 //! | 两处 doc 的终态语义 | 注明「`Pause` 在 rust 侧被判为终局失败（21117）且不自动重提」，避免 python 侧以为「发 `Pause` 会有人来 Resume」 |
+//! | `core/ci.py` 的 `DocProcessResult` | ⚠️ 偏差 #10 的对照面：**`total_page_count` 必须恒有值**（哪怕是 0）。若 python 侧改结构导致该字段缺失，rust 的 0 页护栏会把预览永久挂在 PENDING 上反复打 python |
 //!
 //! ## 表依赖
 //!
@@ -262,8 +288,9 @@
 //!
 //! ## 模块内文件
 //!
-//! - `repo.rs` —— `t_file_preview` 的全部读写（6 个静态方法，**用 `query!` 宏**，
-//!   理由见该文件模块 doc）
+//! - `repo.rs` —— `t_file_preview` 的全部读写（**8 个静态方法**，**用 `query!`
+//!   宏**，理由见该文件模块 doc）。2026-10-13 review 第 1 轮补 `claim_submit`
+//!   （条件 UPDATE 认领）与 `release_claim`（提交失败归还认领）⇒ 6 → 8
 //! - `model.rs` —— `TFilePreview` 行结构
 //! - `service.rs` —— 状态机 + seed 推导 + URL 拼接 + python 转发
 //! - `dto.rs` —— `PreviewOut` 出参

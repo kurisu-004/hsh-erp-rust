@@ -20,6 +20,33 @@ use crate::modules::files::part_file::preview::model::TFilePreview;
 use crate::modules::files::part_file::preview::repo::{PreviewRepo, state};
 use crate::shared::error::{AppError, code};
 
+/// 认领占位 token 的前缀（打 python **之前**写进 `ci_job_id` 的那枚标记）。
+///
+/// ⚠️ **为什么需要一个占位 token**：`ci_job_id IS NULL` 是「尚未提交成功」的判据，
+/// 而并发下两个请求都能读到 NULL。要在**打 python 之前**独占「我来提交」，就必须
+/// 先把这一列写上点什么 —— 写占位 token 是最小改动（不改 schema、不加列）。
+///
+/// ⚠️ **前缀不可省、且必须可识别**：进程在「认领 → `mark_submitted`」之间挂掉时，
+/// 行会停在「token 占位」态。下一次调用的 3d 分支要能认出「这是占位、不是真 job
+/// id」并重新认领（而不是拿着 token 去 `describe` 打 python —— 那会拿到一个
+/// python 侧不存在的 job id）。真 job id 由 CI 侧生成，不以本前缀开头。
+pub const CLAIM_TOKEN_PREFIX: &str = "__claiming__:";
+
+/// 认领**租约**时长（秒）：认领成功后 `next_poll_at` 被推到 `now + 本值`，
+/// 在此之前**别的请求抢不走这枚 token**。
+///
+/// ⚠️ **必须显著大于 [`POLL_BACKOFF_SECONDS`]（2s）**：认领之后紧接着是一次
+/// `POST /doc_jobs` 的**同步往返**，python 侧要落队列、要调 CI，耗时可能好几秒。
+/// 若租约只有 2s，第二个请求会在第一次还在飞的时候把认领抢走 ⇒ 两个都提交 ⇒
+/// **重复计费**（本方法存在的全部意义就是防这个）。
+///
+/// 取 **30s** 的取舍：够覆盖一次 CI 提交往返；又不至于让「认领者进程崩溃」之后
+/// 这份预览长时间无人接管（租约一过，下一次调用的 3d 分支就能重提）。
+///
+/// ⚠️ 改这个值前先确认 `PyBackendClient::forward_ci_submit` 的超时
+/// （`PythonBackendConfig::timeout_ms`，缺省 10s）仍 < 本值。
+pub const CLAIM_LEASE_SECONDS: i64 = 30;
+
 /// 轮询节流：首次登记后 / 提交后到下一次允许轮询的间隔（秒）。
 ///
 /// 取 **2s** 的理由：CI 光栅化一页 PDF 的典型耗时是几百毫秒到数秒，2s 足以让
@@ -72,10 +99,21 @@ impl PreviewService {
     /// | seed 未命中 | INSERT PENDING（`ON CONFLICT DO NOTHING`）→ **登记成功才**提交 CI → 返 PENDING | 提交 1 次 |
     /// | seed 未命中但 INSERT 冲突（并发，别的请求已登记） | 返 PENDING | **无** |
     /// | `PENDING` 且 `now < next_poll_at` | 返 PENDING（节流） | **无** |
-    /// | `PENDING` 且到期、`ci_job_id` 为空 | 当作未提交补一次提交 → 返 PENDING | 提交 ≤1 次 |
-    /// | `PENDING` 且到期且有 job id | describe：Success → READY；**四种终局失败**（`Failed` / `Cancel` / `Pause` / `NotExist`）→ FAILED(21117)；其余 → 推进 `next_poll_at` 返 PENDING | 查询 1 次 |
+    /// | `PENDING` 且到期、**无真 job id**（NULL 或认领占位 token） | **条件认领**（`claim_submit` 抢到才继续）→ 打 python → 返 PENDING | 提交 ≤1 次 |
+    /// | 认领失败（并发，别人正在提交 / 行已非 PENDING） | 返 PENDING，**绝不自己打 python** | **无** |
+    /// | `PENDING` 且到期且有真 job id | describe：Success → READY；**四种终局失败**（`Failed` / `Cancel` / `Pause` / `NotExist`）→ FAILED(21117)；其余 → 推进 `next_poll_at` 返 PENDING | 查询 1 次 |
     /// | `READY` | 直接返 `pages` | **无**（不打 python、不打 COS） |
-    /// | `FAILED` | 重置为 PENDING 后按 PENDING 处理（自愈） | 见上 |
+    /// | `FAILED` 且重置 1 行 | 自愈重置为 PENDING 后按 PENDING 处理 | 见上 |
+    /// | `FAILED` 但重置 **0 行**（并发，别人已推进） | 读回真实状态按它走，**绝不自己提交** | 见上 |
+    ///
+    /// ## ⚠️ 并发不重复提交 CI job 是**两道闸**，各管一段（review 第 1 轮 MAJOR-1）
+    ///
+    /// | 闸 | 管哪条路径 | 机制 |
+    /// |---|---|---|
+    /// | `uk_t_file_preview_seed` 唯一索引 | **首次登记** | `insert_pending` 的 `ON CONFLICT DO NOTHING`，`rows==1` 才是登记者 |
+    /// | [`PreviewRepo::claim_submit`] 条件 UPDATE | **重试** 与 **自愈** | 「行已存在 + 无真 job id + 到期」，两个请求都能读到；认领抢到才允许打 python |
+    ///
+    /// 只靠唯一索引会漏掉后两条路径（详见该方法的 doc）。
     ///
     /// ## 权限（2026-10-13 PR2）
     ///
@@ -158,12 +196,39 @@ impl PreviewService {
 
         // 3b. FAILED → 自愈重置为 PENDING 后重走下面的推进流程。
         //     ⚠️ **只判 FAILED、不碰 READY**（READY 已在 3a 返回）。
+        //
+        //     ⚠️⚠️ `reset_to_pending` 的**返回值必须判**（2026-10-13 review 第 1 轮
+        //     MAJOR-1）：0 行不是错误，而是「并发下别人已把这行推进走了」。此前本处
+        //     **丢弃**了行数、无条件把内存行改成 `PENDING / ci_job_id = None`，
+        //     然后继续走 3d → **再提交一个 CI job**。CI 按页计费 ⇒ 两个并存 job、
+        //     先写的那个变孤儿、钱两份都花了。症状与 B-1 同款迷惑：调用方拿到
+        //     PENDING，看起来一切正常，只是账单翻倍。
         if row.state == state::FAILED {
-            PreviewRepo::reset_to_pending(&mut *conn, row.id, current.id).await?;
-            row.state = state::PENDING.to_string();
-            row.ci_job_id = None;
-            row.page_count = 0;
-            row.error_message = None;
+            let reset = PreviewRepo::reset_to_pending(&mut *conn, row.id, current.id).await?;
+            if reset == 0 {
+                // 认输：按**别人推进后的真实状态**走，绝不自己提交。
+                // 重新读回（可能已是 PENDING + 别人的新 job id，也可能是 READY）。
+                let Some(fresh) = PreviewRepo::find_by_seed(&mut *conn, &seed).await? else {
+                    // 行被软删了（本仓 preview 侧零 DELETE，理论上不会发生）：
+                    // 退化成「不推进」，让前端下轮再来。
+                    return Ok(Self::pending_out(row, &now));
+                };
+                *row = fresh;
+                // 重新过 3a：可能已被别人推到 READY，那就该零 IO 直接返。
+                if row.state == state::READY {
+                    return Ok(Self::ready_out(row, preview_base_url, preview_prefix));
+                }
+                // 仍是 FAILED（别人又把它打失败了）⇒ 本调用不参与自愈，返 PENDING。
+                if row.state == state::FAILED {
+                    return Ok(Self::pending_out(row, &now));
+                }
+                // 否则是 PENDING ⇒ 继续走下面的 3c / 3d（3d 有条件认领，不会重复提交）
+            } else {
+                row.state = state::PENDING.to_string();
+                row.ci_job_id = None;
+                row.page_count = 0;
+                row.error_message = None;
+            }
         }
 
         // 3c. PENDING & 未到期 → 节流返回（不打 python）
@@ -171,11 +236,45 @@ impl PreviewService {
             return Ok(Self::pending_out(row, &now));
         }
 
-        // 3d. 尚无 job id → 补提交（首次登记的正常延续，或上次提交失败后的重试）
-        if row.ci_job_id.is_none() {
+        // 3d. 尚无真 job id → **条件认领**后补提交
+        //     （首次登记的正常延续 / 上次提交失败后的重试 / 自愈后的重新提交）
+        //
+        //     ⚠️ **认领先于打 python**（review 第 1 轮 MAJOR-1）：唯一索引只闸首次
+        //     登记，这两条路径是「行已存在」，两个请求会同时读到「due + 无 job id」。
+        //     「先查再打 python」是 TOCTOU ⇒ 两个 CI job（按页计费）。标准写法是
+        //     用一条带谓词的 UPDATE 认领，只有抢到的那个才允许打 python。
+        //
+        //     ⚠️ 判据是「**没有真 job id**」而不是「`ci_job_id IS NULL`」：认领期间
+        //     该列被写成 [`CLAIM_TOKEN_PREFIX`] 占位 token，必须一并认作「尚未提交」
+        //     （进程在认领与 mark_submitted 之间挂掉时，下一次调用靠这条恢复）。
+        let needs_submit = match row.ci_job_id.as_deref() {
+            None => true,
+            Some(id) => id.starts_with(CLAIM_TOKEN_PREFIX),
+        };
+        if needs_submit {
+            let claim_token = format!("{CLAIM_TOKEN_PREFIX}{}", self.snowflake.next_id());
+            // 租约**不是**节流戳：它只用来在「认领 → POST → mark_submitted」这段
+            // 窗口内挡住别的请求（见 CLAIM_LEASE_SECONDS 的 doc）。
+            let lease_until = now + chrono::Duration::seconds(CLAIM_LEASE_SECONDS);
+            // ⚠️ `now` 一并传入：租约到期比较用**应用时钟**，不用 SQL 的 `now()`
+            //    （DB 会话时区与应用时钟是两个东西，理由见 repo 的 doc）
+            let claimed = PreviewRepo::claim_submit(
+                &mut *conn,
+                row.id,
+                &claim_token,
+                lease_until,
+                now,
+                current.id,
+            )
+            .await?;
+            if !claimed {
+                // 认领失败 = 别人正在提交（租约未过）/ 行已不是 PENDING
+                // ⇒ **绝不自己打 python**。返 PENDING 让前端按 retry_after_ms 再来。
+                return Ok(Self::pending_out(row, &now));
+            }
+            let next_poll = now + Self::backoff();
             match Self::submit(py_backend, preview_prefix, &seed, &file.object_key, current).await {
                 Ok(job_id) => {
-                    let next_poll = now + Self::backoff();
                     PreviewRepo::mark_submitted(&mut *conn, row.id, &job_id, next_poll, current.id)
                         .await?;
                     // ⚠️ **两处都要更新**：`pending_out` 读的是内存里这一行的
@@ -196,6 +295,13 @@ impl PreviewService {
                         error = %e,
                         "CI 预览任务提交失败，行保持 PENDING 待重试"
                     );
+                    // ⚠️ **归还认领**（`ci_job_id` 清回 NULL），不能留着占位 token：
+                    // 留着虽然也能被下一轮 3d 重新认领（谓词认 token），但该列上挂一个
+                    // python 侧不存在的值，会误导任何将来直接读这一列的排障代码。
+                    // 用独立方法而非改 `touch_poll`：`touch_poll` 还有一个调用点
+                    // （3e 的 Running 分支）**必须保留真 job id**，两处语义相反。
+                    PreviewRepo::release_claim(&mut *conn, row.id, &claim_token, current.id)
+                        .await?;
                     // 节流：至少等一个 backoff 再重试，避免前端对着一个必然失败的
                     // 上游连打（错误原样抛给调用方 → 21118 / HTTP 502）。
                     PreviewRepo::touch_poll(&mut *conn, row.id, now + Self::backoff(), current.id)
@@ -205,10 +311,13 @@ impl PreviewService {
             }
         }
 
-        // 3e. 有 job id 且到期 → describe
-        //     ⚠️ 走到这里时 `ci_job_id` 必非 None（3d 已把 None 分支 return 掉），
+        // 3e. 有真 job id 且到期 → describe
+        //     ⚠️ 走到这里时 `ci_job_id` 必非 None（3d 已把「无真 job id」return 掉），
         //     故这里用 `expect` 而不是 `unwrap_or_default()` —— 后者会把「状态机
         //     被改坏」静默变成「打 python 一个空 job id 的 URL」，故障现场难查。
+        //     ⚠️⚠️ **改 3d 分支结构时必须同步改这里**：3d 现在多认了一种
+        //     `CLAIM_TOKEN_PREFIX` 占位值，若 3d 的放行条件被放宽而本处没跟着把
+        //     占位值滤掉，就会拿一个 python 侧不存在的 job id 去 describe。
         let job_id = row
             .ci_job_id
             .as_deref()
@@ -311,24 +420,52 @@ impl PreviewService {
         source.chars().take(PREVIEW_SEED_HEX_LEN).collect()
     }
 
+    /// 预览对象在 COS 里的**相对前缀**（不含站点根、不含页文件名）：
+    /// `"{prefix}/{seed}"`。
+    ///
+    /// ## 唯一真源（跨仓契约的交汇点，2026-10-13 review 第 1 轮）
+    ///
+    /// 这个字符串被**两处**消费，缺一不可：
+    ///
+    /// 1. [`Self::submit`] 的请求体 `dst_prefix` —— python 侧 CI 按
+    ///    `{dst_prefix}/p{Page}.jpg` **写**对象；
+    /// 2. [`Self::preview_urls`] —— 前端按 `{base}/{prefix}/{seed}/p{n}.jpg`
+    ///    **读**对象。
+    ///
+    /// 两处各拼一遍必然漂移（拼错一个字符的症状是「CI 成功、URL 404」，因为两边
+    /// 都在成功路径上）。故只此一处拼装。
+    ///
+    /// ## ⚠️ `prefix` 的 `trim_matches('/')` 是必需的，不是洁癖
+    ///
+    /// `config.rs` 的缺省值是 `previews`（**无**尾斜杠），而同结构体的
+    /// `upload_prefix` / `tmp_prefix` 缺省都**带**尾斜杠 —— 三者形态不一致，
+    /// 运维照着 `COS_UPLOAD_PREFIX=obj/` 的习惯把 `COS_PREVIEW_PREFIX` 配成
+    /// `previews/` 是极自然的事。不 trim 就产出 `previews//<seed>/`：
+    /// COS 的 key 里 `//` 是**实打实的两个字符**，不会像 URL 那样被规范化 ⇒
+    /// CI 写到 `previews//x/p1.jpg`、前端去取 `previews/x/p1.jpg`，两边都
+    /// 「看起来对」但 404。故这里对**首尾**都 trim（首部同理：配成
+    /// `/previews` 会产出 `/previews/<seed>`，python 侧的
+    /// `CiPreviewJobRequest._check_object_path` 会因「不得以 / 开头」直接
+    /// 抛 422）。
+    pub fn preview_object_prefix(prefix: &str, seed: &str) -> String {
+        format!("{}/{}", prefix.trim_matches('/'), seed)
+    }
+
     /// 预览图 URL 列表：`{base}/{prefix}/{seed}/p{n}.jpg`，`n ∈ [1, page_count]`。
     ///
     /// ⚠️ **页码从 1 起**：CI 产出的对象名是 `p1.jpg` / `p2.jpg` / …（人类可读的
     /// 1-based），不是 `p0.jpg`。这个约定必须与 python 侧 CI 配置一致。
     ///
+    /// ⚠️ 中段走 [`Self::preview_object_prefix`]（与 `submit` 的 `dst_prefix`
+    /// 同一真源）而不是就地拼 `prefix` —— 否则「写了哪个前缀」与「读哪个前缀」
+    /// 会各自演化，`previews/` 那种尾斜杠配置就会一边 `//` 一边 `/`。
+    ///
     /// `page_count <= 0` 返回空 vec（不该发生：`mark_ready` 只在 CI 报正页数时调，
     /// 而 service 在 `Success` 分支上把 0 页当 Running 处理，见 [`CiStatus`] 解析）。
     pub fn preview_urls(base_url: &str, prefix: &str, seed: &str, page_count: i64) -> Vec<String> {
+        let mid = Self::preview_object_prefix(prefix, seed);
         (1..=page_count.max(0))
-            .map(|n| {
-                format!(
-                    "{}/{}/{}/p{}.jpg",
-                    base_url.trim_end_matches('/'),
-                    prefix,
-                    seed,
-                    n
-                )
-            })
+            .map(|n| format!("{}/{}/p{}.jpg", base_url.trim_end_matches('/'), mid, n))
             .collect()
     }
 
@@ -393,6 +530,33 @@ impl PreviewService {
     }
 
     /// 转发 CI 任务提交，取回 `job_id`。
+    ///
+    /// ## ⚠️⚠️ 请求体**只有两个键**，与 python 侧 `CiPreviewJobRequest` 逐字对齐
+    ///
+    /// ```python
+    /// class CiPreviewJobRequest(BaseModel):
+    ///     src_object_key: str
+    ///     dst_prefix: str = Field(min_length=1, max_length=512)   # 必填，无默认值
+    /// ```
+    ///
+    /// ⚠️ **2026-10-13 review 第 1 轮 BLOCKER**：本函数此前发的是
+    /// `{src_object_key, preview_prefix, preview_seed}` —— 后两个键 **python 侧根本
+    /// 不存在**。pydantic v2 默认 `extra="ignore"` 会**静默丢掉**它们，而必填的
+    /// `dst_prefix` 缺失 ⇒ FastAPI 直接返 **422** ⇒ 本函数 `parse_envelope` 立刻
+    /// 21118/502。症状极具迷惑性：行永远停在 `PENDING / ci_job_id IS NULL`，
+    /// 2s 后再试、再失败 —— **既烧不出图，也不报成「CI 失败」**（因为压根没到 CI）。
+    ///
+    /// ⚠️ 之所以此前 19 条集成测试全绿：所有 submit mock 都写成
+    /// `.returning(|_b, _h| …)`，**body 参数整个被丢弃、零断言**。跨仓请求体契约
+    /// 现在由 `tests/files/preview.rs::submit_request_body_matches_python_schema`
+    /// 用 `withf` 钉死（断言键集合**恰好**两个 + `dst_prefix` 的逐字形状）。
+    ///
+    /// ## `dst_prefix` 必须与 `preview_urls` 逐字对齐
+    ///
+    /// CI 按 `{dst_prefix}/p{Page}.jpg` 落对象，而本端点 READY 时返的 URL 是
+    /// `{base}/{prefix}/{seed}/p{n}.jpg`。两者由同一个
+    /// [`Self::preview_object_prefix`] 产出（唯一真源），所以「写到哪里」与
+    /// 「前端去哪里取」**不可能分叉**。
     async fn submit(
         py_backend: &Arc<dyn PyBackendClient>,
         preview_prefix: &str,
@@ -402,8 +566,7 @@ impl PreviewService {
     ) -> Result<String, AppError> {
         let body = json!({
             "src_object_key": src_object_key,
-            "preview_prefix": preview_prefix,
-            "preview_seed": seed,
+            "dst_prefix": Self::preview_object_prefix(preview_prefix, seed),
         });
         let resp = py_backend
             .forward_ci_submit(body, Self::fwd_headers(current))
@@ -431,16 +594,18 @@ impl PreviewService {
             .forward_ci_describe(job_id, Self::fwd_headers(current))
             .await?;
         let data = Self::parse_envelope(&resp.body, &resp.status, "describe")?;
-        // ⚠️ **状态字段名跨仓有两种写法**（2026-10-13 review 第 1 轮核对时发现）：
-        // `PyBackendClient::forward_ci_describe` 的契约 doc 与既有实现读的是
-        // `status`，而 python 侧的模块 doc / 交付说明把 job 状态称作 `state`。
-        // 两个键都读、`status` 优先 —— **键名读错的后果是空串 → 落 `Running`
-        // 兜底 → 无限轮询**，正是本轮要消灭的形态，所以宁可多读一个键。
-        // ⚠️ 两侧收敛到同一个键名后删掉 `state` 那一支（登记见 [`super::mod`]
+        // ⚠️ **状态字段名跨仓有两种写法，且 `state` 才是真源**（2026-10-13 review
+        // 第 1 轮订正：此前本行是 `status` 优先、`state` 兜底，**顺序反了**）。
+        // python 侧的响应模型 `CiPreviewJobStatus` 字段就叫 **`state`**
+        // （`api/v1/ci_preview.py`），其模块 docstring 给的线上样例也是
+        // `{"data":{"state":"Running", ...}}`；`status` 键在 python 侧**根本不存在**。
+        // 两个键都读、`state` 优先 —— 键名读错的后果是空串 → 落 `Running` 兜底 →
+        // **无限轮询**，正是本轮要消灭的形态，所以宁可多读一个键。
+        // ⚠️ 两侧收敛到同一个键名后删掉 `status` 那一支（登记见 [`super::mod`]
         // 已知偏差 #8）。
         let status = data
-            .get("status")
-            .or_else(|| data.get("state"))
+            .get("state")
+            .or_else(|| data.get("status"))
             .and_then(Value::as_str)
             .unwrap_or("");
         let page_count = data

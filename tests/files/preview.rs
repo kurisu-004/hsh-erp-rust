@@ -3,7 +3,7 @@
 //! 被测端点：`GET /api/v2/files/objects/{file_id}/preview`
 //! （COS CI 图纸预览，惰性轮询、零后台任务）。
 //!
-//! ## 覆盖场景（12 条，与任务书逐条对应）
+//! ## 覆盖场景（**20 条编号** + 6 条不编号护栏，2026-10-13 review 第 1 轮复核）
 //!
 //! | # | 用例 | 断言要点 |
 //! |---|---|---|
@@ -14,9 +14,9 @@
 //! | 5 | `pending_not_due_returns_pending_without_python` | 未到期 → 直接 PENDING（**不打 python**） |
 //! | 6 | `pending_due_describe_success_marks_ready` | 到期 + Success → READY + `pages.len() == total_page_count` + URL 逐条正确 |
 //! | 7 | `describe_failed_returns_21117` | Failed → 21117 / HTTP 502 |
-//! | 8 | `submit_forward_failure_returns_21118` | 提交失败 → 21118 / HTTP 502 |
+//! | 8 | `submit_forward_failure_returns_21118` | 提交失败 → 21118 / HTTP 502（且**归还认领**，`ci_job_id` 回 NULL） |
 //! | 9 | `non_pdf_and_non_drawing_kind_return_21116` | 3D_MODEL / 非 PDF → 21116 / HTTP 400 |
-//! | 10 | `concurrent_misses_submit_only_one_job` | 并发两次 → **只提交 1 个 job**（唯一索引闸门） |
+//! | 10 | `concurrent_misses_submit_only_one_job` | 并发两次 **首次登记** → 只提交 1 个 job（唯一索引闸门） |
 //! | 11 | `failed_state_restarts_on_next_call` | FAILED → 下次调用自愈重启为 PENDING |
 //! | 12 | `shelf_account_can_get_preview` | SHELF_ACCOUNT 能拿到 preview（锁选项 A 的角色矩阵） |
 //! | 13 | `describe_not_exist_returns_21117_and_row_failed` | python 合成态 `NotExist` ⇒ 21117 + 行落 FAILED，**且本次调用零 submit** |
@@ -24,14 +24,24 @@
 //! | 15 | `describe_cancel_returns_21117` | CI 官方 `Cancel` ⇒ 21117 + 行落 FAILED |
 //! | 16 | `describe_pause_returns_21117` | CI 官方 `Pause` ⇒ 21117 + 行落 FAILED |
 //! | 17 | `describe_success_with_zero_pages_stays_pending` | **回归护栏**：`Success` 但 0 页仍当 Running（不落 READY） |
-//! | 18 | `describe_reads_state_key_as_well_as_status` | 状态字段名 `state` / `status` 两种写法都认（跨仓兜底） |
+//! | 18 | `describe_prefers_state_key_over_status` + `describe_reads_status_key_as_well` | 状态字段名 `state`（python 真源，**优先**）/ `status`（兜底）两支都认 |
+//! | 19 | `concurrent_due_retries_submit_only_one_job` | **路径 A**：行已存在 + 到期 + 无 job id ⇒ 并发**只提交 1 个**（条件 UPDATE 认领闸门） |
+//! | 20 | `failed_heal_losing_racer_does_not_submit_again` | **路径 B**：自愈输家（`reset_to_pending` 得 0 行）**不再提交** |
 //!
-//! 另有 3 条护栏（不编号）：
+//! 另有 **6 条护栏**（不编号）：
 //! - `preview_route_is_not_swallowed_by_sibling_catch_alls` —— **matchit 冲突的实测**
 //!   （见下节）
 //! - `preview_urls_shape_is_stable` —— `preview_urls` 纯函数断言
 //! - `parse_ci_status_word_table_is_exhaustive` —— **跨仓 CI 终态词表的表驱动断言**
 //!   （review 第 1 轮新增；含 `NotExist` / `Pause` / `Cancel` 与大小写别名）
+//! - `submit_request_body_matches_python_schema` —— **跨仓请求体契约**
+//!   （review 第 1 轮 BLOCKER 的护栏；见下节）
+//! - `preview_object_prefix_tolerates_trailing_slash` —— `dst_prefix` / `pages` 中段
+//!   同源 + 尾斜杠容忍
+//! - `claim_submit_predicate_admits_exactly_one_concurrent_claimer` —— 认领谓词的
+//!   **确定性**并发断言（service 层的 `join!` 版本验不了，见该用例 doc）
+//! - `concurrent_takeover_of_expired_claim_submits_once` —— 过期认领的并发接管只提一次
+//! - `live_claim_blocks_all_python_calls_until_lease_expiry` —— 租约期内零 python 调用
 //!
 //! ## matchit 冲突的验证方式（本文件最重要的一条护栏）
 //!
@@ -43,6 +53,23 @@
 //! 故 `preview_route_is_not_swallowed_by_sibling_catch_alls` 做**双向对照**：
 //! 同一个 `file_id` 分别打 `/preview` 与 `/url`，**两条都必须命中各自的 handler**
 //! （`/preview` 返信封、`/url` 返信封），任一条变成 400 / 404 即红。
+//!
+//! ## ⚠️ 测试分层：哪些能证伪，哪些只是回归护栏（2026-10-13 review 第 1 轮）
+//!
+//! 并发相关的 5 条用例分两层，**能证伪的能力不同**，别混为一谈：
+//!
+//! - **repo 层直调（能证伪）**：`claim_submit_predicate_admits_exactly_one_concurrent_claimer`
+//!   直接 `join!` 两个 [`PreviewRepo::claim_submit`]，两次 UPDATE 真正同时进入
+//!   PG。实测把租约那半谓词删掉后它立刻红（`left: 2, right: 1`）。
+//! - **service 层 `join!`（主要是回归护栏）**：`concurrent_misses_*` /
+//!   `concurrent_due_retries_*` / `failed_heal_losing_racer_*` /
+//!   `concurrent_takeover_*` 走完整 HTTP 路径，但两次调用在本地 PG 上**通常
+//!   串行完成**（A 认领 + 提交 + mark_submitted 在 B 读到行之前就跑完）⇒ 它们
+//!   能钉住「行为不许回退」，但**证明不了谓词的并发原子性**（实测：删掉租约
+//!   谓词后 `join!` 版本照样全绿）。
+//!
+//! 这是本仓其它并发用例的通用读法，`failed_heal_losing_racer_does_not_submit_again`
+//! 甚至刻意**不并发**——它验的是「0 行被尊重」这个判据本身，确定性更高。
 //!
 //! ## 测试栈
 //!
@@ -80,10 +107,6 @@ use hsh_erp_test_support::{
 const PREVIEW_BASE_URL: &str = "https://test-bucket.cos.ap-shanghai.myqcloud.com";
 /// test-support `test_state` 里的 `cos.preview_prefix`。
 const PREVIEW_PREFIX: &str = "previews";
-/// 与 `part_file.rs` 同款：测试自造的 cfg 上传前缀。
-const UPLOAD_UPLOAD_PREFIX: &str = "uploads";
-const UPLOAD_MAX_FILE_SIZE: usize = 300 * 1024 * 1024;
-
 /// 一份最小可预览 PDF 的字节（内容只要求「非空 + sha256 可算」，本端点不解析 PDF）。
 const PDF_BYTES: &[u8] = b"%PDF-1.5\npreview fixture\n%%EOF";
 
@@ -429,7 +452,7 @@ async fn pending_due_describe_success_marks_ready() {
         .times(1)
         .withf(|job_id, _h| job_id == "job-003")
         .returning(|_job_id, _headers| {
-            Ok(ci_ok(json!({"status": "Success", "total_page_count": 3})))
+            Ok(ci_ok(json!({"state": "Success", "total_page_count": 3})))
         });
 
     let mut state = test_state(pool.clone()).await;
@@ -482,7 +505,7 @@ async fn describe_failed_returns_21117() {
         .times(1)
         .withf(|job_id, _h| job_id == "job-fail")
         .returning(|_job_id, _headers| {
-            Ok(ci_ok(json!({"status": "Failed", "message": "CI 渲染超时"})))
+            Ok(ci_ok(json!({"state": "Failed", "message": "CI 渲染超时"})))
         });
 
     let mut state = test_state(pool.clone()).await;
@@ -870,7 +893,7 @@ async fn describe_not_exist_returns_21117_and_row_failed() {
         &pool,
         &file,
         "job-notexist",
-        json!({"status": "NotExist", "total_page_count": 0}),
+        json!({"state": "NotExist", "total_page_count": 0}),
     )
     .await
     .expect_err("NotExist 是确定性终局，必须报错而不是继续返 PENDING（无限轮询的老坑）");
@@ -914,7 +937,7 @@ async fn describe_not_exist_lowercase_also_recognized() {
         &pool,
         &file,
         "job-notexist-lc",
-        json!({"status": "notexist", "total_page_count": 0}),
+        json!({"state": "notexist", "total_page_count": 0}),
     )
     .await
     .expect_err("小写 notexist 同样必须识别为终局");
@@ -940,7 +963,7 @@ async fn describe_cancel_returns_21117() {
         &pool,
         &file,
         "job-cancel",
-        json!({"status": "Cancel", "total_page_count": 0}),
+        json!({"state": "Cancel", "total_page_count": 0}),
     )
     .await
     .expect_err("Cancel 是 CI 确定性终态，必须报错而不是永远转圈");
@@ -975,7 +998,7 @@ async fn describe_pause_returns_21117() {
         &pool,
         &file,
         "job-pause",
-        json!({"status": "Pause", "total_page_count": 0}),
+        json!({"state": "Pause", "total_page_count": 0}),
     )
     .await
     .expect_err("Pause 在本系统等同终局，必须报错而不是永远转圈");
@@ -1015,7 +1038,7 @@ async fn describe_success_with_zero_pages_stays_pending() {
         &pool,
         &file,
         "job-zeropage",
-        json!({"status": "Success", "total_page_count": 0}),
+        json!({"state": "Success", "total_page_count": 0}),
     )
     .await
     .expect("0 页的 Success 不该报错");
@@ -1031,13 +1054,16 @@ async fn describe_success_with_zero_pages_stays_pending() {
     assert_eq!(pages, 0);
 }
 
-/// 场景 18：状态字段名写 `state`（而非 `status`）时同样识别。
+/// 场景 18：状态字段名 **`state`（python 真源）优先**，`status` 兜底。
 ///
-/// ⚠️ 跨仓兜底：`forward_ci_describe` 的契约 doc 读的是 `status`，python 侧文档
-/// 称 `state`，两侧未收敛。**键名读错的后果是空串 → 落 `Running` 兜底 → 无限
-/// 轮询**，所以 rust 侧两个键都读（`status` 优先）。登记见模块 doc 已知偏差 #8。
+/// ⚠️ 跨仓兜底（2026-10-13 review 第 1 轮 MINOR-1 **订正了优先级**）：python 侧
+/// 响应模型 `CiPreviewJobStatus` 的字段是 **`state`**（`status` 键根本不存在），
+/// 此前实现却是 `status` 优先、`state` 兜底 —— **顺序反了**。键名读错的后果是
+/// 空串 → 落 `Running` 兜底 → **无限轮询**。登记见模块 doc 已知偏差 #8。
+///
+/// 本条用 `state` 键喂 `NotExist`，实测它**被识别**（⇒ `state` 分支可用）。
 #[tokio::test]
-async fn describe_reads_state_key_as_well_as_status() {
+async fn describe_prefers_state_key_over_status() {
     let pool = test_pool().await;
     let file_id = insert_part_file(
         &pool,
@@ -1056,8 +1082,546 @@ async fn describe_reads_state_key_as_well_as_status() {
         json!({"state": "NotExist", "total_page_count": 0}),
     )
     .await
-    .expect_err("键名 `state` 也必须能读到状态词");
+    .expect_err("键名 `state` 必须能读到状态词");
     assert_eq!(err.code(), 21117);
+}
+
+/// 场景 18b：`status` 键（兜底那一支）同样可用。
+///
+/// 与上一条成对：两支都得有覆盖，否则「把 `or_else` 那一支删掉」不会被任何测试
+/// 发现 —— 而删掉它恰恰是两侧键名收敛后该做的事（那时才允许删，现在不许）。
+#[tokio::test]
+async fn describe_reads_status_key_as_well() {
+    let pool = test_pool().await;
+    let file_id = insert_part_file(
+        &pool,
+        "DRAWING",
+        "PDF",
+        "statuskey.pdf",
+        Some(&"d2".repeat(32)),
+    )
+    .await;
+    let file = fetch_row(&pool, file_id).await;
+
+    let err = describe_once(
+        &pool,
+        &file,
+        "job-statuskey",
+        json!({"status": "NotExist", "total_page_count": 0}),
+    )
+    .await
+    .expect_err("兜底的 `status` 键也必须能读到状态词");
+    assert_eq!(err.code(), 21117);
+}
+
+// ===========================================================================
+//  19-20：并发重复提交的两道闸（2026-10-13 review 第 1 轮 MAJOR-1）
+// ===========================================================================
+
+/// **路径 A 护栏**：行已存在（`PENDING / ci_job_id IS NULL / next_poll_at` 已到期）
+/// 时并发两个请求 ⇒ **只提交 1 个 CI job**。
+///
+/// ⚠️ 唯一索引在这里**帮不上忙**：这一行早已存在，`insert_pending` 根本不会被调用
+/// （`find_by_seed` 命中 ⇒ 不走登记分支）。两个请求都读到「due + 无 job id」，
+/// 修复前都进 3d、都 POST `/doc_jobs` ⇒ 两个 job（按页计费 = 双份钱）。
+///
+/// 本条钉的是修复后引入的**条件 UPDATE 认领**（`PreviewRepo::claim_submit`）。
+#[tokio::test]
+async fn concurrent_due_retries_submit_only_one_job() {
+    let pool = test_pool().await;
+    let file_id = insert_part_file(
+        &pool,
+        "DRAWING",
+        "PDF",
+        "retry-race.pdf",
+        Some(&"a2".repeat(32)),
+    )
+    .await;
+    let file = fetch_row(&pool, file_id).await;
+    let seed = PreviewService::preview_seed(&file);
+
+    // 预置一条「提交失败后重试」的典型行：PENDING / 无 job id / **已到期**
+    sqlx::query(
+        "INSERT INTO t_file_preview \
+           (id, preview_seed, src_object_key, ci_job_id, state, page_count, next_poll_at, \
+            created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, $3, NULL, 'PENDING', 0, now() - interval '1 minute', \
+                 now(), 1, now(), 1)",
+    )
+    .bind(shared_test_snowflake().next_id())
+    .bind(&seed)
+    .bind(&file.object_key)
+    .execute(&pool)
+    .await
+    .unwrap();
+    force_poll_due(&pool, &seed).await;
+
+    // `.times(1)` 是本条的**全部**断言：认领失败的那个绝不允许打 python
+    let mut mock = MockPyBackendClient::new();
+    mock.expect_forward_ci_submit()
+        .times(1)
+        .returning(|_b, _h| Ok(ci_ok(json!({"job_id": "job-retry-race"}))));
+    mock.expect_forward_ci_describe().never();
+
+    let mut state = test_state(pool.clone()).await;
+    let _app = app_with_mock(&mut state, mock);
+    let svc = PreviewService::new(shared_test_snowflake().clone());
+    let user = test_user(vec![Role::Manager]);
+
+    let (a, b) = tokio::join!(
+        svc.get_preview(
+            &pool,
+            &state.py_backend,
+            PREVIEW_PREFIX,
+            PREVIEW_BASE_URL,
+            &file,
+            &user
+        ),
+        svc.get_preview(
+            &pool,
+            &state.py_backend,
+            PREVIEW_PREFIX,
+            PREVIEW_BASE_URL,
+            &file,
+            &user
+        ),
+    );
+    assert_eq!(a.expect("并发 A").state, "PENDING");
+    assert_eq!(b.expect("并发 B").state, "PENDING");
+
+    let (state_s, job_id, _) = read_state(&pool, &seed).await.unwrap();
+    assert_eq!(state_s, "PENDING");
+    assert_eq!(
+        job_id.as_deref(),
+        Some("job-retry-race"),
+        "只应有**一个**真 job id 落库"
+    );
+}
+
+/// **路径 B 护栏**：`FAILED` 行被并发自愈时，`reset_to_pending` 得 0 行的那一方
+/// **绝不自己再提交一个 job**。
+///
+/// ⚠️ 修复前该调用方**丢弃**了 `rows_affected`、无条件把内存行改成
+/// `PENDING / ci_job_id = None` 并继续走 3d ⇒ 与赢家并存两个 CI job。
+///
+/// 构造方式：先把行推成 PENDING + 真 job id（模拟赢家已经提交），再让本调用
+/// 拿着**旧的 FAILED 快照**去走 3b —— 此时它的 `reset_to_pending` 必得 0 行。
+/// 单测里做不到真正的并发交错，但**「0 行必须被尊重」这个判据本身**能确定性地钉住。
+#[tokio::test]
+async fn failed_heal_losing_racer_does_not_submit_again() {
+    let pool = test_pool().await;
+    let file_id = insert_part_file(
+        &pool,
+        "DRAWING",
+        "PDF",
+        "heal-race.pdf",
+        Some(&"b2".repeat(32)),
+    )
+    .await;
+    let file = fetch_row(&pool, file_id).await;
+    let seed = PreviewService::preview_seed(&file);
+
+    sqlx::query(
+        "INSERT INTO t_file_preview \
+           (id, preview_seed, src_object_key, ci_job_id, state, page_count, error_message, \
+            created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, $3, 'job-old', 'FAILED', 0, 'CI 挂了', now(), 1, now(), 1)",
+    )
+    .bind(shared_test_snowflake().next_id())
+    .bind(&seed)
+    .bind(&file.object_key)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // 赢家：自愈 + 提交一个新 job
+    // ⚠️ `app_with_mock` 要 `Arc::get_mut`，state 的强计数必须是 1 —— 所以**每次
+    // 都从 `test_state` 现造一份**，不能 clone 上一份（`test_app` 也会多存一份）。
+    let svc = PreviewService::new(shared_test_snowflake().clone());
+    let user = test_user(vec![Role::Manager]);
+
+    let mut mock_win = MockPyBackendClient::new();
+    mock_win
+        .expect_forward_ci_submit()
+        .times(1)
+        .returning(|_b, _h| Ok(ci_ok(json!({"job_id": "job-healed-first"}))));
+    mock_win.expect_forward_ci_describe().never();
+    let mut state_win = test_state(pool.clone()).await;
+    let _app = app_with_mock(&mut state_win, mock_win);
+
+    // 让「赢家」先跑完：它把行改成 PENDING + 新 job id
+    let out = svc
+        .get_preview(
+            &pool,
+            &state_win.py_backend,
+            PREVIEW_PREFIX,
+            PREVIEW_BASE_URL,
+            &file,
+            &user,
+        )
+        .await
+        .expect("赢家应自愈成功");
+    assert_eq!(out.state, "PENDING");
+    assert_eq!(
+        read_state(&pool, &seed).await.unwrap().1.as_deref(),
+        Some("job-healed-first")
+    );
+
+    // 输家：再来一次 —— 此时行已是 PENDING + **真 job id**（赢家写的）。
+    // ⚠️ 这里**不能**直接断言走到 3e：赢家刚 `mark_submitted`，`next_poll_at` 是
+    // 「2s 后」，输家这次调用会在 3c 被节流挡掉（返 PENDING，零 python 调用）——
+    // 这本身就是正确行为。故先把节流戳推到过去，**逼它走到 3d/3e 那一支**，
+    // 那才是「会不会重复提交」的分水岭。
+    force_poll_due(&pool, &seed).await;
+
+    let mut mock_lose = MockPyBackendClient::new();
+    mock_lose.expect_forward_ci_submit().never(); // ← 本条的核心断言
+    mock_lose
+        .expect_forward_ci_describe()
+        .times(1)
+        .withf(|jid, _h| jid == "job-healed-first")
+        .returning(|_j, _h| Ok(ci_ok(json!({"state": "Success", "total_page_count": 2}))));
+    let mut state_lose = test_state(pool.clone()).await;
+    let _app2 = app_with_mock(&mut state_lose, mock_lose);
+
+    let out2 = svc
+        .get_preview(
+            &pool,
+            &state_lose.py_backend,
+            PREVIEW_PREFIX,
+            PREVIEW_BASE_URL,
+            &file,
+            &user,
+        )
+        .await
+        .expect("应走 describe 收敛成 READY");
+    assert_eq!(out2.state, "READY", "不该再提交，直接 describe 收敛");
+    assert_eq!(
+        read_state(&pool, &seed).await.unwrap().1.as_deref(),
+        Some("job-healed-first"),
+        "job id 不该被第二个 job 覆盖"
+    );
+}
+
+/// **认领租约护栏**：过期认领被**两个并发请求**同时接管时，只有**一个**能提交。
+///
+/// ⚠️ 钉的是 [`PreviewRepo::claim_submit`] 谓词里
+/// `ci_job_id LIKE '__claiming__:%' AND next_poll_at <= $6` 这一支的**并发语义**：
+/// 认领成功会把 `next_poll_at` 推到「未来」，于是后到者的谓词在 UPDATE 的原子
+/// 求值时不再成立 ⇒ 0 行 ⇒ 放弃提交。
+///
+/// ⚠️ 若谓词只写 `ci_job_id LIKE '__claiming__:%'`（**不判租约**），两个并发请求
+/// 都能认领成功、都 POST python ⇒ **重复计费** —— 也就是本方法本要防的那个失败
+/// 模式换个形式重现。本条就是那半条谓词的牙齿。
+///
+/// ⚠️ 为什么不另写一条「租约未过期时抢不走」的用例：那条**到不了认领**—— 认领者
+/// 写入的租约戳就是 `next_poll_at`，service 的 3c（`poll_due`）会**先**把它挡掉、
+/// 返 PENDING（零 python 调用）。租约未过期这一侧由 3c 保证，认领谓词里的那半
+/// 条件只负责**并发原子性**（两个都已过 3c 的请求之间的裁决）。
+#[tokio::test]
+async fn concurrent_takeover_of_expired_claim_submits_once() {
+    let pool = test_pool().await;
+    let file_id = insert_part_file(
+        &pool,
+        "DRAWING",
+        "PDF",
+        "takeover-race.pdf",
+        Some(&"c3".repeat(32)),
+    )
+    .await;
+    let file = fetch_row(&pool, file_id).await;
+    let seed = PreviewService::preview_seed(&file);
+
+    // 认领者崩了：token 留着、租约戳停在过去（= 已过期，故 3c 不拦）
+    let stale = now_naive() - chrono::Duration::minutes(5);
+    sqlx::query(
+        "INSERT INTO t_file_preview \
+           (id, preview_seed, src_object_key, ci_job_id, state, page_count, next_poll_at, \
+            created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, $3, '__claiming__:crashed', 'PENDING', 0, $4, now(), 1, now(), 1)",
+    )
+    .bind(shared_test_snowflake().next_id())
+    .bind(&seed)
+    .bind(&file.object_key)
+    .bind(stale)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // `.times(1)` 是本条的**全部**断言：两个并发接管者里只有一个允许打 python
+    let mut mock = MockPyBackendClient::new();
+    mock.expect_forward_ci_submit()
+        .times(1)
+        .returning(|_b, _h| Ok(ci_ok(json!({"job_id": "job-takeover"}))));
+    mock.expect_forward_ci_describe().never();
+
+    let mut state = test_state(pool.clone()).await;
+    let _app = app_with_mock(&mut state, mock);
+    let svc = PreviewService::new(shared_test_snowflake().clone());
+    let user = test_user(vec![Role::Manager]);
+
+    let (a, b) = tokio::join!(
+        svc.get_preview(
+            &pool,
+            &state.py_backend,
+            PREVIEW_PREFIX,
+            PREVIEW_BASE_URL,
+            &file,
+            &user
+        ),
+        svc.get_preview(
+            &pool,
+            &state.py_backend,
+            PREVIEW_PREFIX,
+            PREVIEW_BASE_URL,
+            &file,
+            &user
+        ),
+    );
+    assert_eq!(a.expect("接管 A").state, "PENDING");
+    assert_eq!(b.expect("接管 B").state, "PENDING");
+    assert_eq!(
+        read_state(&pool, &seed).await.unwrap().1.as_deref(),
+        Some("job-takeover"),
+        "过期认领必须能被接管重提，且**只重提一次**（否则进程崩溃 = 这份预览卡死，\
+         或并发接管 = 重复计费）"
+    );
+}
+
+/// **租约未过期时一个 python 调用都不许有**（3c 节流闸门的护栏）。
+///
+/// 认领者写入的租约戳落在 `next_poll_at` 这一列上，所以「认领在飞」这个窗口是由
+/// 3c（`poll_due`）挡住的 —— 认领谓词根本不会被执行到。本条钉住这个分工：并发请求
+/// 既不提交、也**不**去 describe（行里那枚 token 不是真 job id，拿去打 python 只会
+/// 拿到一个不存在的 job），且 token 分毫不动。
+#[tokio::test]
+async fn live_claim_blocks_all_python_calls_until_lease_expiry() {
+    use hsh_erp_rust::modules::files::part_file::preview::service::CLAIM_TOKEN_PREFIX;
+
+    let pool = test_pool().await;
+    let file_id =
+        insert_part_file(&pool, "DRAWING", "PDF", "lease.pdf", Some(&"c2".repeat(32))).await;
+    let file = fetch_row(&pool, file_id).await;
+    let seed = PreviewService::preview_seed(&file);
+
+    // 预置「认领者已认领、POST 还在飞」的行：token + **未来**的租约戳
+    let lease_until = now_naive() + chrono::Duration::seconds(30);
+    sqlx::query(
+        "INSERT INTO t_file_preview \
+           (id, preview_seed, src_object_key, ci_job_id, state, page_count, next_poll_at, \
+            created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, $3, $4, 'PENDING', 0, $5, now(), 1, now(), 1)",
+    )
+    .bind(shared_test_snowflake().next_id())
+    .bind(&seed)
+    .bind(&file.object_key)
+    .bind(format!("{CLAIM_TOKEN_PREFIX}999"))
+    .bind(lease_until)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mut mock = MockPyBackendClient::new();
+    mock.expect_forward_ci_submit().never();
+    mock.expect_forward_ci_describe().never();
+
+    let mut state = test_state(pool.clone()).await;
+    let _app = app_with_mock(&mut state, mock);
+
+    let out = call_preview(&pool, &state, &file).await;
+    assert_eq!(out.state, "PENDING");
+    assert!(
+        out.retry_after_ms > 0,
+        "租约未过期 ⇒ 必须给出正的节流值，不能让前端立刻重调"
+    );
+    let (_, job_id, _) = read_state(&pool, &seed).await.unwrap();
+    assert_eq!(
+        job_id,
+        Some(format!("{CLAIM_TOKEN_PREFIX}999")),
+        "租约期内认领 token 不该被任何人改写（更不该被换成真 job id）"
+    );
+}
+
+/// **认领谓词的确定性并发测试**（repo 层直调）。
+///
+/// ⚠️ **为什么 service 层的 `tokio::join!` 版本不足以证明谓词正确**：两次 service
+/// 调用各自 `pool.acquire()` 后是**真并发**的，但在本地 PG 上「A 认领 + 提交 +
+/// mark_submitted」通常在 B 读到行之前就跑完了 ⇒ 串行化 ⇒ 即使把租约那一半谓词
+/// 删掉（= 允许抢活着的认领），`join!` 版本**照样全绿**（实测：删掉后仍 PASS）。
+/// 所以谓词的并发原子性必须**单独**在 repo 层验。
+///
+/// 本条直调 [`PreviewRepo::claim_submit`] 两次，两次拿到**各自独立的连接**
+/// （`tokio::join!` 两个 future 同时进入 UPDATE），断言**恰好一个**返回 `true`。
+#[tokio::test]
+async fn claim_submit_predicate_admits_exactly_one_concurrent_claimer() {
+    use hsh_erp_rust::modules::files::part_file::preview::repo::PreviewRepo;
+
+    let pool = test_pool().await;
+    let seed = "claim_race_seed";
+    sqlx::query("DELETE FROM t_file_preview WHERE preview_seed = $1")
+        .bind(seed)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let row_id = shared_test_snowflake().next_id();
+    // 过期认领（= 认领者崩溃的形态）：token 在、租约戳在过去
+    sqlx::query(
+        "INSERT INTO t_file_preview \
+           (id, preview_seed, src_object_key, ci_job_id, state, page_count, next_poll_at, \
+            created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, 'k.pdf', '__claiming__:crashed', 'PENDING', 0, \
+                 now() - interval '1 minute', now(), 1, now(), 1)",
+    )
+    .bind(row_id)
+    .bind(seed)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let now = now_naive();
+    let lease = now + chrono::Duration::seconds(30);
+    let (a, b) = tokio::join!(
+        PreviewRepo::claim_submit(&pool, row_id, "__claiming__:A", lease, now, 1),
+        PreviewRepo::claim_submit(&pool, row_id, "__claiming__:B", lease, now, 1),
+    );
+    let (a, b) = (a.expect("认领 A"), b.expect("认领 B"));
+    assert_eq!(
+        usize::from(a) + usize::from(b),
+        1,
+        "两个并发认领者里**恰好一个**该成功（否则两个都 POST python = 重复计费）"
+    );
+
+    // 且库里最终只有一枚 token —— 后到者覆盖不了先到者
+    let (job_id,): (Option<String>,) =
+        sqlx::query_as("SELECT ci_job_id FROM t_file_preview WHERE preview_seed=$1")
+            .bind(seed)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        matches!(
+            job_id.as_deref(),
+            Some("__claiming__:A") | Some("__claiming__:B")
+        ),
+        "认领后应只剩一枚 token，实际：{job_id:?}"
+    );
+}
+
+// ===========================================================================
+//  护栏 C：跨仓请求体契约（2026-10-13 review 第 1 轮 BLOCKER）
+// ===========================================================================
+
+/// **跨仓契约护栏**：提交给 python 的请求体**恰好**是
+/// `{"src_object_key", "dst_prefix"}` 两个键。
+///
+/// ## 为什么这条测试存在（本轮唯一能防住 B-1 的东西）
+///
+/// 此前所有 submit mock 都写成 `.returning(|_b, _h| …)` —— **body 参数整个被丢弃、
+/// 零断言**。于是请求体可以是任何形状而 19 条测试全绿，包括一个让 python 侧
+/// **每次都返 422** 的形状：
+///
+/// ```python
+/// class CiPreviewJobRequest(BaseModel):
+///     src_object_key: str
+///     dst_prefix: str = Field(min_length=1, max_length=512)   # 必填、无默认值
+/// ```
+///
+/// pydantic v2 默认 `extra="ignore"` ⇒ 本仓多发的 `preview_prefix` / `preview_seed`
+/// 被**静默丢弃**，而必填的 `dst_prefix` 缺失 ⇒ FastAPI **422** ⇒ `parse_envelope`
+/// 立刻 21118/502。行永远停在 `PENDING / ci_job_id IS NULL`，2s 后重试、再失败 ——
+/// **既烧不出图，也不报成「CI 失败」**（压根没到 CI）。
+///
+/// 断言方式刻意是 **`withf` + 键集合等值**，而不是「断言某个键存在」：后者挡不住
+/// 「多发一个键」这个方向，而多发键正是本轮的实际故障。
+#[tokio::test]
+async fn submit_request_body_matches_python_schema() {
+    let pool = test_pool().await;
+    let file_id = insert_part_file(
+        &pool,
+        "DRAWING",
+        "PDF",
+        "contract.pdf",
+        Some(&"f0".repeat(32)),
+    )
+    .await;
+    let file = fetch_row(&pool, file_id).await;
+    let seed = PreviewService::preview_seed(&file);
+    // 闭包要 `'static` ⇒ seed / key 各 move 一份进去（`seed` 后面断言还要用）
+    let want_src = file.object_key.clone();
+    let want_dst = format!("{PREVIEW_PREFIX}/{seed}");
+
+    let mut mock = MockPyBackendClient::new();
+    mock.expect_forward_ci_submit()
+        .times(1)
+        .withf(move |body, _h| {
+            // ① 键集合**恰好**两个 —— python 侧 `CiPreviewJobRequest` 只有这两个字段
+            let obj = body.as_object().expect("请求体必须是 JSON object");
+            let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                vec!["dst_prefix", "src_object_key"],
+                "⚠️ 跨仓契约错位：请求体键集合必须与 python 的 CiPreviewJobRequest \
+                 逐字一致（多发的键会被 pydantic extra=ignore 静默丢弃，而缺失的 \
+                 dst_prefix 会让 FastAPI 返 422 ⇒ 每次 submit 都失败）。实际：{body}"
+            );
+            // ② `src_object_key` = 源对象完整 key
+            assert_eq!(obj["src_object_key"], want_src.as_str());
+            // ③ `dst_prefix` = `{prefix}/{seed}`，且与 `preview_urls` 的中段**逐字**
+            //    相同 —— 「CI 写到哪里」与「前端从哪里取」必须是同一串
+            assert_eq!(
+                obj["dst_prefix"],
+                want_dst.as_str(),
+                "dst_prefix 必须与 preview_urls 的中段同源（否则 CI 写到 A、\
+                 前端去取 B，两边都'成功'但全 404）"
+            );
+            true
+        })
+        .returning(|_b, _h| Ok(ci_ok(json!({"job_id": "job-contract"}))));
+    mock.expect_forward_ci_describe().never();
+
+    let mut state = test_state(pool.clone()).await;
+    let _app = app_with_mock(&mut state, mock);
+
+    let out = call_preview(&pool, &state, &file).await;
+    assert_eq!(out.state, "PENDING");
+
+    // 落库的 job id 证明 submit 真的走完了（不是被 mock 静默吞掉）
+    let (_, job_id, _) = read_state(&pool, &seed).await.unwrap();
+    assert_eq!(job_id.as_deref(), Some("job-contract"));
+}
+
+/// `preview_object_prefix` 与 `preview_urls` 的同源性 + 尾斜杠容忍。
+///
+/// ⚠️ `COS_PREVIEW_PREFIX` 的缺省是 `previews`（**无**尾斜杠），而同结构体的
+/// `COS_UPLOAD_PREFIX` / `COS_TMP_PREFIX` 缺省都**带** —— 运维照着后两者的习惯
+/// 配成 `previews/` 是极自然的事。COS 的 key 里 `//` 是实打实的两个字符（不像 URL
+/// 那样被规范化），不 trim 就是「CI 写到 `previews//x/`、前端去取 `previews/x/`」。
+#[test]
+fn preview_object_prefix_tolerates_trailing_slash() {
+    for configured in ["previews", "previews/", "/previews", "previews//"] {
+        assert_eq!(
+            PreviewService::preview_object_prefix(configured, "abc"),
+            "previews/abc",
+            "prefix={configured:?} 归一后必须与无尾斜杠形态逐字相同"
+        );
+    }
+
+    // ⚠️ `preview_urls` 的中段必须**逐字**等于 submit 的 `dst_prefix`
+    let urls = PreviewService::preview_urls("https://cdn.example.com", "previews/", "abc", 2);
+    let dst_prefix = PreviewService::preview_object_prefix("previews/", "abc");
+    assert!(
+        urls[0].contains(&dst_prefix),
+        "pages URL 中段必须等于 dst_prefix"
+    );
+    assert_eq!(
+        urls,
+        vec![
+            "https://cdn.example.com/previews/abc/p1.jpg".to_string(),
+            "https://cdn.example.com/previews/abc/p2.jpg".to_string(),
+        ],
+        "尾斜杠配置不得产出 `//`"
+    );
 }
 
 // ===========================================================================

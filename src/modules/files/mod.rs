@@ -37,6 +37,11 @@
 //! 各端点的逐字段契约、角色矩阵理由、移除记录见 `part_file/mod.rs` 与
 //! `part_file/cnc/mod.rs` 的模块 doc。
 //!
+//! ⚠️ **本表的计数真源是各 `router()` 的 `ROUTES` 常量**（2026-10-13 review 第 1
+//! 轮 NIT 新增）：`part_file::handler::ROUTES`（7 条，`mod tests` 逐条比对
+//! `router()` 源码）、`part_file::cnc::handler::ROUTES`（1 条）。加端点忘改本表
+//! **不会红**（本表是人读的），但忘了改 `ROUTES` 会当场红。
+//!
 //! ## ⚠️ 硬切记录（2026-10-13）
 //!
 //! 本次重组把两个独立域收编进来，URL 一律**硬切、无 alias、旧前缀 404**：

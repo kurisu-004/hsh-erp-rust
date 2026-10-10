@@ -124,9 +124,26 @@ pub trait PyBackendClient: Send + Sync {
     /// 2026-10-13 PR2 新增：提交一个 CI 预览渲染任务
     /// → python `POST /api/v1/files/ci-preview-jobs`。
     ///
-    /// - `body`：`{"src_object_key": "...", "preview_prefix": "...", "preview_seed": "..."}`
-    ///   —— 三个字段由 `PreviewService` 组装，**`preview_seed` 恒为纯哈希**
-    ///   （见 `files::part_file::preview` 的安全条款：路径里绝不能带文件名）。
+    /// ## ⚠️ 请求体**恰好两个键**（2026-10-13 review 第 1 轮 BLOCKER 订正）
+    ///
+    /// ```json
+    /// {"src_object_key": "<源对象 key>", "dst_prefix": "<previews/<seed>>"}
+    /// ```
+    ///
+    /// 对齐 python 侧的 `api/v1/ci_preview.py::CiPreviewJobRequest`，该模型只有
+    /// `src_object_key` 与 `dst_prefix`（后者**必填、无默认值**）。
+    ///
+    /// ⚠️ **此前本仓发的是 `{src_object_key, preview_prefix, preview_seed}`** ——
+    /// 后两个键 python 侧不存在，pydantic 默认 `extra="ignore"` 静默丢弃，
+    /// 必填的 `dst_prefix` 缺失 ⇒ FastAPI **422** ⇒ 每次 submit 都失败，行永远
+    /// 停在 `PENDING / ci_job_id IS NULL`。**改这两个键名前先打开 python 的
+    /// `CiPreviewJobRequest` 核一遍**（`dst_prefix` 还有两条字段校验：
+    /// 不得为空白、不得以 `/` 开头、不得含 `..` 段）。
+    ///
+    /// - `dst_prefix` 由 `PreviewService::preview_object_prefix` 产出，与前端读的
+    ///   `preview_urls` 中段**同一真源** ⇒ 写到哪里 / 从哪里取不可能分叉。
+    /// - 路径里**绝不含文件名**：`preview_seed` 恒为纯哈希（见
+    ///   `files::part_file::preview` 的安全条款）。
     /// - `headers`：与 STS / 打印同款，鉴权头由 impl 过滤后注入
     ///   `X-Forwarded-User-Id`（调用方 [`crate::modules::files::part_file::preview`]
     ///   的 handler 负责注入）。
@@ -144,8 +161,14 @@ pub trait PyBackendClient: Send + Sync {
     ///
     /// - `job_id`：`mark_submitted` 落库的那个标识，原样拼进 URL 段。
     ///
-    /// 成功时响应体是 python 信封，`data` 里含 `status`（`Success` / `Failed` /
-    /// 进行中若干形态）、`total_page_count`、`message`（失败原因）。
+    /// 成功时响应体是 python 信封，`data` 里含：
+    ///
+    /// | 字段 | 说明 |
+    /// |---|---|
+    /// | **`state`** | ⚠️ **状态字段就叫 `state`**（python `CiPreviewJobStatus.state`）。此前本仓的 doc 写 `status`、实现也优先读 `status`，**已订正为 `state` 优先**（review 第 1 轮 MINOR-1）。`status` 仅作兜底，两侧收敛后可删 |
+    /// | `total_page_count` | 总页数。⚠️ `Success` 但该值为 0 时**仍当进行中**（快照可能先于对象落盘，理由见 `preview/mod.rs`） |
+    /// | `message` | 失败原因（`Failed` 时有效） |
+    ///
     /// 网络层失败 → 502 + 21118（与 submit 共用错误码：两者都是「打 python 失败」，
     /// 细分对排查无帮助，合并可让前端只需处理一个「上游不可用」）。
     async fn forward_ci_describe(

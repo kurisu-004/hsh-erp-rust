@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE public.t_file_preview\n            SET ci_job_id = NULL, updated_at = now(), updated_by = $3\n            WHERE id = $1 AND state = 'PENDING' AND deleted_at IS NULL AND ci_job_id = $2\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3e381f68b1b9bc1ef8542b12f48718b9d29dfe2dc08c93c8364502fc3505b42c"
+}

@@ -57,7 +57,13 @@ CREATE TABLE public.t_file_preview (
     -- 源对象在 COS 的完整 key（`t_part_file.object_key` 的原样副本）。CI 需要它去
     -- 拉源 PDF；单独存一份是为了 python 回调 / 排障时不必 JOIN 回 t_part_file。
     src_object_key varchar(500) NOT NULL,
-    -- python 侧 CI job id；NULL = 尚未提交成功（提交失败即整条记录被删，见下）。
+    -- python 侧 CI job id；NULL = 尚未提交成功。
+    -- ⚠️ 2026-10-13 review 第 1 轮 MINOR-3 订正：本列注释此前写着「提交失败即整条
+    --    记录被删，见下」—— **那是假陈述**，全模块零 DELETE。提交失败时行**保留**、
+    --    `ci_job_id` 留 NULL、`state` 仍是 PENDING，由 `touch_poll` 推进节流戳等
+    --    下一轮调用重试（自愈）。
+    --    ⚠️ 另一个非空取值：`__claiming__:<snowflake>` —— 打 python **之前**的并发
+    --    认领占位 token（见 `PreviewRepo::claim_submit`），python 侧不存在这个 job。
     ci_job_id      varchar(64),
     -- PENDING / READY / FAILED（本仓无 DB ENUM，合法性由 Rust 侧状态机保证）。
     state          varchar(20)  NOT NULL DEFAULT 'PENDING',

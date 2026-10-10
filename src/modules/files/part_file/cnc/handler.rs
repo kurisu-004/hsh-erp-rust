@@ -136,3 +136,32 @@ pub async fn upload_cnc_pair(
 pub fn router() -> Router<Arc<AppState>> {
     Router::new().route("/pairs", post(upload_cnc_pair))
 }
+
+/// 本子模块 router 注册的全部路由（`METHOD /path`，相对 `/api/v2/files/cnc`）。
+///
+/// 2026-10-13 review 第 1 轮 NIT 新增，与
+/// [`crate::modules::files::part_file::handler::ROUTES`] 配套 —— 端点计数此前
+/// 分散在 `files/mod.rs` 端点表与 `CLAUDE.md` 子模块清单两处手工维护。
+pub const ROUTES: &[&str] = &["POST /pairs"];
+
+#[cfg(test)]
+mod tests {
+    use super::ROUTES;
+
+    /// `ROUTES` 与 `router()` 源码逐条一致（详见 `part_file::handler::tests` 的
+    /// 同名测试 —— 解析规则与实现共用一套说明）。
+    #[test]
+    fn routes_declared_in_router() {
+        let src = include_str!("handler.rs");
+        let body = src
+            .split_once("pub fn router()")
+            .expect("本文件必须有 pub fn router()")
+            .1;
+        let body = &body[..body.find("\n}\n").expect("router() 必须有收尾大括号")];
+        assert!(
+            body.contains(r#".route("/pairs", post(upload_cnc_pair))"#),
+            "`router()` 必须仍注册 `/pairs`；新增/删除端点时同步改 ROUTES"
+        );
+        assert_eq!(ROUTES.len(), 1, "本子模块当前恒 1 条端点");
+    }
+}

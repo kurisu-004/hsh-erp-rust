@@ -567,7 +567,7 @@ impl AppConfig {
                 let region = env_or("COS_REGION", "ap-shanghai");
                 let bucket = env_required("COS_BUCKET")?;
                 let scheme = env_or("COS_SCHEME", "https");
-                let preview_base_url = env_or(
+                let preview_base_url = env_or_non_empty(
                     "COS_PREVIEW_BASE_URL",
                     // ⚠️ 刻意**不**用 `COS_ENDPOINT`：那是 OpenDAL 的 S3 endpoint
                     // （可能带私有化路径），浏览器直链的站点根与之不是一回事。
@@ -745,6 +745,26 @@ pub fn build_redis_url() -> String {
 
 fn env_or(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// 2026-10-13 review 第 1 轮 MAJOR-2 新增：与 [`env_or`] 同款，但**空值也回落缺省**。
+///
+/// ## 为什么需要它（`env_or` 的坑）
+///
+/// `env::var` 对「变量**存在但为空**」返回 `Ok("")`，**不触发** `unwrap_or_else`
+/// 的缺省分支。而部署方把某行**留在文件里、只清空值**（`COS_PREVIEW_BASE_URL=`）
+/// 是极常见的做法 —— 那正是 `.env.example` 模板里「可选项留空 = 用缺省」这一惯例
+/// 诱导出来的。
+///
+/// 于是 `preview_base_url = ""` ⇒ `preview_urls` 产出
+/// `/previews/<seed>/p1.jpg` —— **协议相对 URL，指向前端自己的源站**，不是 COS。
+/// 生产表现是「预览全是裂图」且**日志里看不出任何异常**（一切都成功，只是 URL 指错
+/// 了地方）。任何照抄 `.env.example` 起服务的部署都会中招。
+fn env_or_non_empty(key: &str, default: &str) -> String {
+    match env::var(key) {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => default.to_string(),
+    }
 }
 
 /// 2026-10-01 新增：解析 WS 存活检测的两个环境变量
