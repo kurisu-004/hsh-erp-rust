@@ -15,14 +15,21 @@
 //! 10. `preview_with_both_sections_off_returns_21704`（⚠️ 见文末偏差登记）
 //! 11. `preview_never_writes_log_row`
 //!
-//! ## 本文件钉住的三处「实现与注释/直觉不符」（已在 §8.3 登记）
+//! ## 本文件钉住的三处「实现与注释/直觉不符」
+//!
+//! ⚠️ 2026-10-13 review 第 2 轮 #9：原先这三条一律冠以「已在 §8.3 登记」，但其中
+//! **只有两条**在 §8.3——「未知列」那条不在（它不是「注释说错了」，而是 M7 改正之后
+//! 注释已与实现一致，无偏差可登记）。逐条指向真实位置：
 //! - **未知列不是「忽略」而是 21704**：渲染层的 `filter_known_columns` 收到的是
-//!   已解析的枚举，白名单解析在更上游就拒了。
+//!   已解析的枚举，白名单解析在更上游就拒了。登记在 **§2.3**（`visible_columns`
+//!   「未知项 → 21704（**不静默丢弃**）」）与 `template.rs` 的 `filter_known_columns`
+//!   doc —— M7 已把那句「剔除未知列」的错注释改正，故**不在** §8.3。
 //! - **两节都关一律 21704**：不会渲出「无符合条件的工单」；那句文案只在
-//!   「节开着但窗口内无行」时出现。
+//!   「节开着但窗口内无行」时出现。登记在 **§8.3「实现与注释不符」第 3 条**。
 //! - **节开关真的不渲染该节**（2026-10-13 review 第 1 轮 M5 修复）：修复前
 //!   `render()` 无条件渲染两节，关掉的节因为没查库而拿到空切片，于是信里照样出现
-//!   「已逾期（…）（0 条）/ 本节无符合条件的工单」。
+//!   「已逾期（…）（0 条）/ 本节无符合条件的工单」。登记在
+//!   **§8.3「实现与注释不符」第 5 条**（该条已标 ✅ 修复完毕）。
 
 use axum::http::StatusCode;
 use serde_json::{Value, json};
@@ -494,6 +501,10 @@ async fn preview_section_toggles_hide_each_section() {
 
     let (status, env) = preview(&ctx, json!({ "include_overdue": false })).await;
     assert_eq!(status, StatusCode::OK, "{env}");
+    // ⚠️ 2026-10-13 review 第 2 轮 #2：`overdue_count` 仍是 0，这是**契约**、不是缺陷
+    // —— 关掉的节 service 层不查库 ⇒ 行数恒 0，流水表与预览共用这个口径（docs §2.5）。
+    // 关键是这个 0 **不表示「没有逾期工单」**；原先把它当成一句事实断言、把正文里
+    // 那句误导性的「逾期 0 条」也一起放过，现在正文那半由下面的断言单独钉住。
     assert_eq!(env["data"]["overdue_count"], 0, "{env}");
     assert_eq!(env["data"]["upcoming_count"], 1, "{env}");
     let html = env["data"]["html"].as_str().unwrap();
@@ -508,6 +519,14 @@ async fn preview_section_toggles_hide_each_section() {
         "关掉的逾期节不应出现任何字样（含标题行）：{env}"
     );
     assert!(html.contains("即将到期"), "开着的未来节必须渲染：{env}");
+    // ⚠️ 2026-10-13 review 第 2 轮 #2：概览行**只列已启用的节**。M5 把空节修掉了，
+    // 但概览行当时仍无条件打「逾期 0 条 / 未来 1 条」——那 0 是「这节没启用」，
+    // 与空节是同一种误读（像统计口径坏了），只是从整节缩到了一个数字。
+    assert!(
+        !html.contains("逾期 0 条"),
+        "关掉的逾期节不该在概览行报「逾期 0 条」：{env}"
+    );
+    assert!(html.contains("未来 1 条"), "开着的未来节必须报数：{env}");
 
     let (status, env) = preview(&ctx, json!({ "include_upcoming": false })).await;
     assert_eq!(status, StatusCode::OK, "{env}");

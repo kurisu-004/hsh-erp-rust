@@ -69,7 +69,7 @@ pub async fn get_config(
 /// 提取器返 **HTTP 422 纯文本**，不是业务信封）。
 ///
 /// 成功后由 handler 调 [`crate::task::mail_digest::reschedule`] 热重载 cron ——
-// 改完配置立刻生效，不必重启进程。热重载失败**不回滚配置**：配置已经落库是对的，
+/// 改完配置立刻生效，不必重启进程。热重载失败**不回滚配置**：配置已经落库是对的，
 /// 只是这一次的调度没换上；日志里 warn 并让下一次重启 / 下一次改配置再试。
 pub async fn save_config(
     State(state): State<Arc<AppState>>,

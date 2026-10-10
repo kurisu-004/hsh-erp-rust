@@ -79,7 +79,9 @@ use crate::state::AppState;
 
 /// `/api/v2/mail-digest/*` 端点（6 条，全部 Manager 独占）。
 ///
-/// 挂载点登记在 [`crate::modules::mod::v2_router`] 的 `.nest("/mail-digest", …)`。
+/// 挂载点登记在 [`crate::modules::v2_router`] 的 `.nest("/mail-digest", …)`。
+/// （2026-10-13 review 第 2 轮 #11：原先写成 [`crate::modules::mod::v2_router`]，
+/// `mod` 是关键字，rustdoc 解析不了；仓内其它域一律写不带 `mod` 的形式，见 `wx/mod.rs`。）
 pub fn router() -> Router<Arc<AppState>> {
     handler::router()
 }

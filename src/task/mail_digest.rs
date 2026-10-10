@@ -66,7 +66,8 @@
 //! - 另：`SCHEDULED` 触发时的**准备阶段失败也会落流水**（`status='FAILED'`），
 //!   见 `service::send_scheduled` 的 doc。
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::future::Future;
+use std::sync::{Arc, OnceLock};
 
 use tokio_cron_scheduler::{Job, JobScheduler};
 use tokio_util::sync::CancellationToken;
@@ -101,14 +102,72 @@ use crate::state::AppState;
 /// ## 多副本部署不防重（有意）
 /// 与 `auto_complete` 同一现状：部署 N 个副本 ⇒ 同一时刻可能发 N 封信。
 /// 要防重需要分布式锁 / 领导者选举，登记为独立重构。
+///
+/// ### ⚠️ 与上一条是**两层**不同的问题：进程内互斥只保证「单副本内不漏 job」
+///
+/// ⚠️ 2026-10-13（review 第 2 轮 M1）：本文件靠 [`swap_job`] 持有的
+/// `tokio::sync::Mutex` 保证**同一时刻只有一次 remove→add 在跑**，解决的是
+/// **单进程内**两个并发 `POST /config`（axum 的 handler 是并发执行的）互相插队，
+/// 导致「旧 job 永久泄漏、此后每天多发一封」的问题。
+///
+/// - **本条（进程内互斥）管的是**：一个进程内 N 个并发请求 ⇒ 调度器里恒 ≤ 1 个 job。
+/// - **上一条（多副本不防重）管的是**：N 个进程各发各的 ⇒ 需要分布式锁 / 领导者选举。
+///
+/// ⚠️ 两层都不可省，也**不要**互相替代：用「进程内互斥」冒充「多副本防重」，或反过来
+/// 用「多副本不防重」当作「进程内可以不互斥」的理由，都会漏掉真实故障。
 struct MailDigestScheduler {
     scheduler: JobScheduler,
     /// 当前已注册的 job id（`None` = 未注册：`enabled=false` 或 `MANUAL_ONLY`）。
     ///
-    /// 用 `Mutex<Option<Uuid>>` 而不是「每次 reschedule 都重建一个 scheduler」：
-    /// 重建会让旧 scheduler 的 `start()` 循环永远挂着，且 job 会**叠加**
-    /// （改 5 次配置 = 5 个 job 同时在跑，一天发 5 封信）。
-    job_id: Mutex<Option<uuid::Uuid>>,
+    /// 用「槽 + 锁」而不是「每次 reschedule 都重建一个 scheduler」：重建会让旧
+    /// scheduler 的 `start()` 循环永远挂着，且 job 会**叠加**（改 5 次配置 = 5 个
+    /// job 同时在跑，一天发 5 封信）。
+    ///
+    /// ⚠️ **这个锁同时就是串行闸**（2026-10-13 review 第 2 轮 M1）：拿住 guard
+    /// 即代表「本进程正在做 remove→add」，别的 [`swap_job`] / [`remove_job`] 进不来。
+    /// 原先它是 `std::sync::Mutex<Option<Uuid>>` 且**只锁「取 id」这一个动作**，
+    /// 中间的 DB 往返 + `add` 全裸奔 ⇒ 两个 Manager 同时保存时，A 取走旧 id、B 拿到
+    /// `None` 直接返回、两份配置各自 `add` 出一个 job，而槽里只记后一个 ⇒ 先注册
+    /// 那个**永远摘不掉**，直到进程重启。改用 `tokio::sync` 是必须的：临界区跨
+    /// `.await`（`pool.acquire()` / `add`），`std::sync::Mutex` 的 guard 跨 `.await`
+    /// 会直接 panic。
+    job_id: tokio::sync::Mutex<Option<uuid::Uuid>>,
+}
+
+/// [`swap_job`] 真正用到的两个调度器操作（生产 = [`JobScheduler`]，单测 = 记录调用的
+/// 假实现）。
+///
+/// ⚠️ 为什么要这一层（2026-10-13 review 第 2 轮 M1）：tokio-cron-scheduler 0.15
+/// **没有**「列举当前所有 job」的公开 API（`MetaDataStorage` 只有 `get` /
+/// `add_or_update` / `delete` 三件套），所以在真实 `JobScheduler` 上**数不出**
+/// 「还剩几个 job」⇒ M1 的核心不变量「remove→add 之间不能插队」无法被直接观测。
+/// 把边界收窄成两个可替换方法后，单测就能记录调用序列并断言「调度器里恰好 1 个 job」。
+trait JobRegistry {
+    fn remove<'a>(&'a self, id: &'a uuid::Uuid) -> impl Future<Output = Result<(), String>> + 'a;
+    fn add(&self, job: Job) -> impl Future<Output = Result<uuid::Uuid, String>> + '_;
+}
+
+impl JobRegistry for JobScheduler {
+    async fn remove(&self, id: &uuid::Uuid) -> Result<(), String> {
+        JobScheduler::remove(self, id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+    async fn add(&self, job: Job) -> Result<uuid::Uuid, String> {
+        JobScheduler::add(self, job)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// 一次待注册的 job（连同写 `info!` 需要的上下文）。
+///
+/// 单独抽成结构体是为了让 [`swap_job`] 与「读库产出 job」那段逻辑解耦：临界区只管
+/// 闸与挂载，产出 job 的部分由调用方用闭包表达，单测则直接喂一个假 job。
+struct NewJob {
+    job: Job,
+    cron: String,
+    frequency: &'static str,
 }
 
 /// 进程内单例（配合 [`scheduler_cell`] 承担异步初始化）。
@@ -130,8 +189,8 @@ pub async fn run(state: Arc<AppState>, token: CancellationToken) {
         "mail_digest: 交期汇总邮件定时任务已启动"
     );
 
-    let scheduler = match ensure_scheduler().await {
-        Ok(s) => s.scheduler.clone(),
+    let s = match ensure_scheduler().await {
+        Ok(s) => s,
         Err(e) => {
             warn!(error = %e, "mail_digest: 调度器启动失败，本进程不再注册定时任务");
             return;
@@ -139,7 +198,7 @@ pub async fn run(state: Arc<AppState>, token: CancellationToken) {
     };
 
     // start() 是**永不返回**的循环，必须 spawn，否则下面的 reschedule 永远跑不到。
-    let start_handle = scheduler.clone();
+    let start_handle = s.scheduler.clone();
     tokio::spawn(async move {
         if let Err(e) = start_handle.start().await {
             warn!(error = %e, "mail_digest: 调度器主循环退出");
@@ -147,10 +206,10 @@ pub async fn run(state: Arc<AppState>, token: CancellationToken) {
     });
 
     // 首次装载配置（读库失败不致命：任务照常在跑，只是这一次没注册 job）
-    reschedule_inner(&state, &scheduler).await;
+    reschedule_inner(&state, s).await;
 
     // watcher：收到取消令牌 → 关掉调度器，让 start() 循环退出、进程能干净地停。
-    let shutdown_handle = scheduler.clone();
+    let shutdown_handle = s.scheduler.clone();
     tokio::spawn(async move {
         token.cancelled().await;
         let mut s = shutdown_handle;
@@ -179,7 +238,7 @@ async fn ensure_scheduler() -> Result<&'static MailDigestScheduler, String> {
         .map_err(|e| format!("JobScheduler::new 失败：{e}"))?;
     SCHEDULER.get_or_init(|| MailDigestScheduler {
         scheduler: scheduler.clone(),
-        job_id: Mutex::new(None),
+        job_id: tokio::sync::Mutex::new(None),
     });
     Ok(SCHEDULER.get().expect("get_or_init 刚写入，必然可读"))
 }
@@ -202,111 +261,354 @@ fn scheduler_cell() -> &'static tokio::sync::OnceCell<JobScheduler> {
 /// 落库，不该因为「调度没换上」而让保存接口返 500。
 pub async fn reschedule(state: &Arc<AppState>) {
     if !state.config.mail.is_enabled() {
-        // env 侧被关掉 ⇒ 把已注册的 job 也摘掉（可能有旧配置留下的 job）
+        // env 侧被关掉 ⇒ 把已注册的 job 也摘掉（可能有旧配置留下的 job）。
+        // ⚠️ 与 [`reschedule_inner`] 走**同一个闸**（`job_id` 锁）：本分支与并发
+        // 的另一次 `reschedule_inner` 若各摘各的，会出现「删了一个 job、另一个
+        // reschedule 又挂上一个」而槽里记的却是刚被删掉的那个 ⇒ 同样泄漏
+        // （review 第 2 轮 M1 的同源问题）。
         if let Ok(s) = ensure_scheduler().await {
-            remove_job(&s.scheduler).await;
+            remove_job(&s.scheduler, &s.job_id).await;
         }
         return;
     }
     let Ok(s) = ensure_scheduler().await else {
         return;
     };
-    reschedule_inner(state, &s.scheduler).await;
+    reschedule_inner(state, s).await;
 }
 
-/// 真正读库 + 注册 / 替换 job。
-async fn reschedule_inner(state: &Arc<AppState>, scheduler: &JobScheduler) {
+/// 真正读库 + 注册 / 替换 job（**整个函数体都在 [`swap_job`] 的闸内**）。
+async fn reschedule_inner(state: &Arc<AppState>, s: &'static MailDigestScheduler) {
+    swap_job(&s.scheduler, &s.job_id, async {
+        // 读库 → 规范化 → cron → Job。这段**含 DB 往返**，闸在此期间**不释放**
+        // —— 这正是 M1 修复的全部要点。
+        let mut conn = match state.pool.acquire().await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "mail_digest: 热重载读配置失败（连接池）");
+                return None;
+            }
+        };
+        let cfg = match service::current_normalized(&mut conn).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "mail_digest: 热重载读配置失败（解析）");
+                return None;
+            }
+        };
+        drop(conn);
+
+        if !cfg.enabled {
+            info!("mail_digest: 配置未启用（enabled=false），不注册定时 job");
+            return None;
+        }
+        if cfg.frequency == Frequency::ManualOnly {
+            info!("mail_digest: 频率为 MANUAL_ONLY（仅手动），不注册定时 job");
+            return None;
+        }
+
+        let cron = match schedule::to_cron(&NormalizedScheduleInput {
+            frequency: cfg.frequency,
+            send_hour: cfg.send_hour,
+            send_minute: cfg.send_minute,
+            weekday: cfg.weekday,
+            day_of_month: cfg.day_of_month,
+        }) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "mail_digest: cron 生成失败，不注册定时 job");
+                return None;
+            }
+        };
+
+        // 时区**显式传** Asia/Shanghai，不依赖进程本地时区 / `TZ` 环境变量（模块 doc）。
+        let job_state = state.clone();
+        let job = Job::new_async_tz(
+            cron.clone(),
+            chrono_tz::Asia::Shanghai,
+            move |_uuid, _sched| {
+                let st = job_state.clone();
+                Box::pin(async move {
+                    service::send_scheduled(&st).await;
+                })
+            },
+        );
+        match job {
+            Ok(job) => Some(NewJob {
+                job,
+                cron,
+                frequency: cfg.frequency.as_str(),
+            }),
+            Err(e) => {
+                warn!(error = %e, cron = %cron, "mail_digest: cron 表达式非法，不注册定时 job");
+                None
+            }
+        }
+    })
+    .await;
+}
+
+/// reschedule 的**临界区**：摘掉旧 job → 造新 job → 注册新 job → 写回槽。
+///
+/// ⚠️ **2026-10-13 review 第 2 轮 M1 的修复本体**。`job_id` 的 guard 从
+/// 「摘旧」一直持有到「写回新」，中间隔着 `make_new` 里的 DB 往返 —— 整段串行。
+///
+/// 修复前的时序（两个 Manager 同时点保存即命中）：
+/// ```text
+/// A: remove_job → take() 取走 id_old          B: remove_job → 拿到 None，直接 return
+/// A: 读库…（await）                           B: 读库…（await）
+/// A: add → id_a；槽 = id_a                    B: add → id_b；槽 = id_b
+/// ⇒ 调度器里同时挂着 id_a 与 id_b，槽里只记 id_b；此后任何一次 reschedule
+///    只会摘掉 id_b，id_a 永远留在调度器里 ⇒ 每天在旧时刻多发一封，且直到进程重启都不消失。
+/// ```
+///
+/// **死锁检查（2026-10-13 review 第 2 轮）**：本函数只持有 `job_id` 这一把锁，
+/// `JobRegistry` 的两个方法内部不再取本模块的任何锁；`make_new` 闭包走的是
+/// `service::current_normalized`，它**不反向依赖 `task::mail_digest`**（域内唯一
+/// 的调用方 `handler::save_config` 是在 service 返回**之后**才调 [`reschedule`]）
+/// ⇒ 锁序是一条直线，无环。
+///
+/// ⚠️ 闸用 `tokio::sync::Mutex` 而非 `std::sync::Mutex`：临界区跨 `.await`，
+/// std 版 guard 跨 `.await` 会 panic。
+async fn swap_job<R: JobRegistry>(
+    reg: &R,
+    job_id: &tokio::sync::Mutex<Option<uuid::Uuid>>,
+    make_new: impl Future<Output = Option<NewJob>>,
+) {
+    let mut slot = job_id.lock().await;
+
     // 无论本次成败，**先摘掉旧 job**：否则「改了一次配置但没换上」会变成两个 job
     // 同时跑，一天发两封 —— 比不发严重得多。
-    remove_job(scheduler).await;
-
-    let mut conn = match state.pool.acquire().await {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(error = %e, "mail_digest: 热重载读配置失败（连接池）");
-            return;
+    if let Some(old) = slot.take() {
+        match reg.remove(&old).await {
+            Ok(()) => info!("mail_digest: 旧定时 job 已摘除"),
+            Err(e) => warn!(error = %e, "mail_digest: 摘除旧定时 job 失败"),
         }
-    };
-    let cfg = match service::current_normalized(&mut conn).await {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(error = %e, "mail_digest: 热重载读配置失败（解析）");
-            return;
-        }
-    };
-    drop(conn);
-
-    if !cfg.enabled {
-        info!("mail_digest: 配置未启用（enabled=false），不注册定时 job");
-        return;
-    }
-    if cfg.frequency == Frequency::ManualOnly {
-        info!("mail_digest: 频率为 MANUAL_ONLY（仅手动），不注册定时 job");
-        return;
     }
 
-    let cron = match schedule::to_cron(&NormalizedScheduleInput {
-        frequency: cfg.frequency,
-        send_hour: cfg.send_hour,
-        send_minute: cfg.send_minute,
-        weekday: cfg.weekday,
-        day_of_month: cfg.day_of_month,
-    }) {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(error = %e, "mail_digest: cron 生成失败，不注册定时 job");
-            return;
-        }
+    let Some(new) = make_new.await else {
+        return;
     };
-
-    // 时区**显式传** Asia/Shanghai，不依赖进程本地时区 / `TZ` 环境变量（模块 doc）。
-    let job_state = state.clone();
-    let job = Job::new_async_tz(
-        cron.clone(),
-        chrono_tz::Asia::Shanghai,
-        move |_uuid, _sched| {
-            let st = job_state.clone();
-            Box::pin(async move {
-                service::send_scheduled(&st).await;
-            })
-        },
-    );
-    let job = match job {
-        Ok(j) => j,
-        Err(e) => {
-            warn!(error = %e, cron = %cron, "mail_digest: cron 表达式非法，不注册定时 job");
-            return;
-        }
-    };
-
-    match scheduler.add(job).await {
+    match reg.add(new.job).await {
         Ok(id) => {
-            if let Some(s) = SCHEDULER.get()
-                && let Ok(mut slot) = s.job_id.lock()
-            {
-                *slot = Some(id);
-            }
+            *slot = Some(id);
             info!(
-                cron = %cron,
-                frequency = cfg.frequency.as_str(),
+                cron = %new.cron,
+                frequency = new.frequency,
                 timezone = "Asia/Shanghai",
                 "mail_digest: 定时 job 已注册"
             );
         }
-        Err(e) => warn!(error = %e, cron = %cron, "mail_digest: 注册定时 job 失败"),
+        Err(e) => warn!(error = %e, cron = %new.cron, "mail_digest: 注册定时 job 失败"),
     }
 }
 
 /// 摘掉已注册的 job（幂等：没注册过就是空操作）。
-async fn remove_job(scheduler: &JobScheduler) {
-    let Some(s) = SCHEDULER.get() else {
+///
+/// 与 [`swap_job`] 取**同一把闸** ⇒ 不会与并发的 `reschedule_inner` 交错。
+async fn remove_job<R: JobRegistry>(reg: &R, job_id: &tokio::sync::Mutex<Option<uuid::Uuid>>) {
+    let mut slot = job_id.lock().await;
+    let Some(id) = slot.take() else {
         return;
     };
-    let Some(id) = s.job_id.lock().ok().and_then(|mut slot| slot.take()) else {
-        return;
-    };
-    match scheduler.remove(&id).await {
+    match reg.remove(&id).await {
         Ok(()) => info!("mail_digest: 旧定时 job 已摘除"),
         Err(e) => warn!(error = %e, "mail_digest: 摘除旧定时 job 失败"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! M1（review 第 2 轮）的并发回归。
+    //!
+    //! 为什么用假注册表而不是真 `JobScheduler`：tokio-cron-scheduler 0.15 **没有**
+    //! 「列举当前所有 job」的公开 API（`MetaDataStorage` 只有 `get` /
+    //! `add_or_update` / `delete`），所以在真实调度器上**数不出**「还剩几个 job」。
+    //! [`FakeRegistry`] 维护一个「在架 job 集合」，等价于那个计数，且能在 `remove`
+    //! 里人为放大时序窗口，让插队**必然**发生（而不是靠运气撞上）。
+
+    use std::collections::HashSet;
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
+    use std::time::Duration;
+
+    use super::*;
+
+    const FAKE_CRON: &str = "0 0 9 * * *";
+
+    /// 假调度器：记录调用序列 + 维护「在架 job 集合」。
+    struct FakeRegistry {
+        /// 调用序列（`remove:<id>` / `add:<id>`），用来断言「先摘后挂」严格成对。
+        events: StdArc<StdMutex<Vec<String>>>,
+        /// 模拟「调度器里当前挂着的 job」—— 即本测试要数的那个数。
+        live: StdArc<StdMutex<HashSet<uuid::Uuid>>>,
+        next_id: StdArc<StdMutex<u128>>,
+    }
+
+    impl FakeRegistry {
+        fn new() -> Self {
+            Self {
+                events: StdArc::new(StdMutex::new(Vec::new())),
+                live: StdArc::new(StdMutex::new(HashSet::new())),
+                next_id: StdArc::new(StdMutex::new(0)),
+            }
+        }
+
+        fn events(&self) -> Vec<String> {
+            self.events.lock().unwrap().clone()
+        }
+
+        /// 只取操作名（`remove` / `add`），断言交替顺序时用。
+        fn ops(&self) -> Vec<String> {
+            self.events()
+                .iter()
+                .map(|e| e.split(':').next().unwrap().to_string())
+                .collect()
+        }
+
+        fn live_count(&self) -> usize {
+            self.live.lock().unwrap().len()
+        }
+
+        fn live_set(&self) -> HashSet<uuid::Uuid> {
+            self.live.lock().unwrap().clone()
+        }
+    }
+
+    impl JobRegistry for FakeRegistry {
+        fn remove<'a>(
+            &'a self,
+            id: &'a uuid::Uuid,
+        ) -> impl Future<Output = Result<(), String>> + 'a {
+            let events = self.events.clone();
+            let live = self.live.clone();
+            let id = *id;
+            async move {
+                events.lock().unwrap().push(format!("remove:{id}"));
+                // ⚠️ 人为放大时序窗口：没有这道 sleep，两次并发调用很可能**碰巧**
+                // 串行，测试就成了「测运气」；有它则无闸版本**必然**插队。
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                live.lock().unwrap().remove(&id);
+                Ok(())
+            }
+        }
+
+        fn add(&self, _job: Job) -> impl Future<Output = Result<uuid::Uuid, String>> + '_ {
+            let events = self.events.clone();
+            let live = self.live.clone();
+            async move {
+                let id = {
+                    let mut g = self.next_id.lock().unwrap();
+                    *g += 1;
+                    uuid::Uuid::from_u128(*g)
+                };
+                events.lock().unwrap().push(format!("add:{id}"));
+                live.lock().unwrap().insert(id);
+                Ok(id)
+            }
+        }
+    }
+
+    /// 造一个必然成功的假 `NewJob`（cron 内容不参与断言，只占位）。
+    async fn fake_new_job() -> Option<NewJob> {
+        let job = Job::new_async_tz(
+            String::from(FAKE_CRON),
+            chrono_tz::Asia::Shanghai,
+            |_uuid, _sched| Box::pin(async {}),
+        )
+        .expect("构造 job 不应失败");
+        Some(NewJob {
+            job,
+            cron: String::from(FAKE_CRON),
+            frequency: "DAILY",
+        })
+    }
+
+    /// ★ M1 主回归：两个 Manager 同时保存 ⇒ 调度器里**恰好 1 个** job，槽与调度器一致。
+    ///
+    /// 修复前这个用例会红：两次 reschedule 各自 remove→add，第二次 remove 拿到
+    /// `None` 直接返回，于是两个 job 都在架上而槽里只记后一个 ⇒ 先注册那个永远摘不掉。
+    #[tokio::test]
+    async fn concurrent_swap_leaves_exactly_one_job() {
+        let reg = FakeRegistry::new();
+        let job_id = tokio::sync::Mutex::new(None);
+
+        // 先挂一个（模拟「进程启动时已注册过一次」）
+        swap_job(&reg, &job_id, fake_new_job()).await;
+        assert_eq!(reg.live_count(), 1, "预热后就应有 1 个 job");
+
+        // 两个并发保存
+        tokio::join!(
+            swap_job(&reg, &job_id, fake_new_job()),
+            swap_job(&reg, &job_id, fake_new_job())
+        );
+
+        assert_eq!(
+            reg.live_count(),
+            1,
+            "两个并发 reschedule 后调度器里必须恰好剩 1 个 job（原先会剩 2 个，\
+             先注册那个永远摘不掉）：调用序列 = {:?}",
+            reg.events()
+        );
+
+        // 槽里记的必须就是「在架的那个」——否则下一次 reschedule 会摘错 job。
+        let Some(slot) = *job_id.lock().await else {
+            panic!("槽不该为空");
+        };
+        assert_eq!(
+            reg.live_set(),
+            HashSet::from([slot]),
+            "槽里记的 id 必须与在架 job 一致，否则下次 reschedule 摘的是另一个"
+        );
+
+        // 调用序列严格「先摘后挂」成对（无闸版本会变成 remove,remove,add,add）
+        assert_eq!(
+            reg.ops(),
+            vec!["add", "remove", "add", "remove", "add"],
+            "remove 与 add 必须严格交替成对"
+        );
+    }
+
+    /// `remove_job` 与 `swap_job` 取**同一把闸**（覆盖 reviewer 点名的第二条路径：
+    /// `reschedule` 的 env-disabled 分支会直接摘 job）。
+    ///
+    /// 断言的是「槽与调度器永远一致」这个不变量，而不是某一种先后顺序的结果。
+    #[tokio::test]
+    async fn remove_job_and_swap_share_the_same_gate() {
+        let reg = FakeRegistry::new();
+        let job_id = tokio::sync::Mutex::new(None);
+        swap_job(&reg, &job_id, fake_new_job()).await;
+        assert_eq!(reg.live_count(), 1);
+
+        tokio::join!(
+            remove_job(&reg, &job_id),
+            swap_job(&reg, &job_id, fake_new_job())
+        );
+
+        // 终态只可能是「槽有值 ⇔ 调度器里 1 个」；绝不允许「槽空而调度器还挂着 job」。
+        let slot = *job_id.lock().await;
+        assert_eq!(
+            slot.is_some(),
+            reg.live_count() == 1,
+            "槽与调度器必须一致：slot={slot:?}, live_count={}, 序列={:?}",
+            reg.live_count(),
+            reg.events()
+        );
+        if let Some(slot) = slot {
+            assert_eq!(reg.live_set(), HashSet::from([slot]), "槽记的必须在架");
+        }
+    }
+
+    /// `make_new` 返回 `None`（未启用 / MANUAL_ONLY / 读库失败）⇒ 只摘不挂。
+    #[tokio::test]
+    async fn swap_with_no_new_job_only_removes() {
+        let reg = FakeRegistry::new();
+        let job_id = tokio::sync::Mutex::new(None);
+        swap_job(&reg, &job_id, fake_new_job()).await;
+        assert_eq!(reg.live_count(), 1);
+
+        swap_job(&reg, &job_id, async { None }).await;
+        assert_eq!(reg.live_count(), 0, "不该挂新 job");
+        assert!(job_id.lock().await.is_none(), "槽应被清空");
+        assert_eq!(reg.ops(), vec!["add", "remove"]);
     }
 }

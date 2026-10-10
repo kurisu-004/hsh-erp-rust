@@ -16,7 +16,7 @@
 //! | `.tls(Tls::Wrapper(TlsParameters))` / `Tls::Opportunistic(..)` / `Tls::None` | builder 的 `AsyncSmtpTransportBuilder::tls`；`Tls` 定义在 `transport::smtp::client::tls` |
 //! | `.build::<Tokio1Executor>()` | builder 的 `AsyncSmtpTransportBuilder::build` |
 //! | `Message::builder().from(Mailbox).to(..).cc(..).subject(..).header(ContentType::TEXT_HTML).body(html)` | `message::MessageBuilder` 的 `builder` / `from` / `to` / `cc` / `subject` / `header` / `body` |
-//! | `SinglePart::html(String)` | `message::single_part::SinglePart::html`（`charset` feature 在 0.11 已无条件生效） |
+//! | `SinglePart::html(String)` | `lettre::message::SinglePart::html`（类型定义在 crate 的 `message::mimebody`，经 `message` 模块重导出；`charset` feature 在 0.11 已无条件生效）。⚠️ **没有 `message::single_part` 这个模块** —— 本行原先写的就是那个不存在的路径（review 第 2 轮 #8） |
 //! | `AsyncTransport::send(&Message).await` | `transport::AsyncTransport` trait |
 //!
 //! ⚠️ **0.11 没有 `charset` feature**（0.10 有）：`cargo add lettre --features charset` 会直接

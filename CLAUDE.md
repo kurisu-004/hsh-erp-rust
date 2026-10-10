@@ -15,7 +15,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 > - [`docs/api/iam.md`](docs/api/iam.md) —— `iam` 认证 + 账号 + 货架子模块域（**22 端点** = session 5 + users 12 + shelves 5；4 条破坏性变更（`DELETE wx-bind` → `POST .../unbind`、`GET wx-bind` 返 `Option`、bind 删 `corp_id`、4 端点 body 必填 `version`）、`t_wx_identity` 的双向一对一与 TOCTOU 偏差、`uk_t_user_role_user_role_scope` **非 partial**、角色/scope 变更滞后一个 session TTL）
 > - [`docs/api/wx.md`](docs/api/wx.md) —— `wx` 微信小程序 BFF 域（**2026-10-11 新建**；按小程序页面切子模块：`login/` + `part_list/`；URL 硬切无 alias 5 条（`/wx/iam/wx-login` → `/wx/login/wecom`、`/wx/parts/*` → `/wx/part-list/*`、`/wx/dashboard/home` 删除）、VO 逐字对齐前端卡片模型改 camelCase、`deliveredQty` 真值、尾斜杠 404 实测钉死、★ 2026-10-12 `part_list` 接上日期 + 7 类 tab 双维筛选（`?date=` 打 `system_delivery_date`、`all` 不再是「不过滤」））
 > - [`docs/api/statistics.md`](docs/api/statistics.md) —— `statistics` 生产统计域（**2026-10-12 新建**；3 个 MANAGER-only 只读端点、有效工时口径表、链外工序计 0、`LEFT JOIN LATERAL … LIMIT 1` 的去重理由与「数据覆盖受工序链配置率限制」的登记）
-> - [`docs/api/mail_digest.md`](docs/api/mail_digest.md) —— `mail_digest` 交期汇总邮件域（**2026-10-13 新建**；6 个 MANAGER-only 端点、SMTP 凭据只走 env 不进 DB、`DELIVERY_STATUSES` 与 dashboard 共用、行单位工单级 / 刻意 `LIMIT 30` 分叉、频率→**6 段带秒** cron 与 WEEKLY 减 1、217xx 错误码、失败也落流水、三处「实现与注释不符」的偏差登记）
+> - [`docs/api/mail_digest.md`](docs/api/mail_digest.md) —— `mail_digest` 交期汇总邮件域（**2026-10-13 新建**；6 个 MANAGER-only 端点、SMTP 凭据只走 env 不进 DB、`DELIVERY_STATUSES` 与 dashboard 共用、行单位工单级 / 刻意 `LIMIT 30` 分叉、频率→**6 段带秒** cron 与 WEEKLY 减 1、217xx 错误码、失败也落流水、**五处**「实现与注释不符」的偏差登记（其中第 5 条已修））
 >
 > **其它域的契约在代码注释里**（各域 `mod.rs` / `repo.rs` / `vo` / `dto` 的模块 doc 与逐字段 doc），本仓的目录约定见本文件「`docs/api/` 目录约定」一节。⚠️ **引用不存在的文档路径是禁止的** —— 后端代码变更（新增 / 修改 / 删除端点，或修改 DTO 字段 / 错误码）必须同步更新对应域的 `docs/api/` 文件（若该域有）与代码注释。
 
@@ -369,7 +369,7 @@ VO**：零件时间线用 `part::service::phase1::events` 的 `EventListRow`，s
 - **域隔离护栏：不适用**（与 `dashboard` / `statistics` 不同）：本域读 `t_part` / `t_assembly` / `t_part_batch` / `t_customer` 四张别域的表（只读聚合是既定 pattern，统计 SQL 完全在本域内写全、**不 import** 他域 service / repo），唯一的「引用他域符号」是**共用常量** `dashboard::repo::DELIVERY_STATUSES` —— 硬要绕开反而会逼出一份副本常量，那才是真正的漂移源。
 - ⚠️ **与 dashboard 的口径分叉登记**（逐条理由见 [`docs/api/mail_digest.md`](docs/api/mail_digest.md) §4）：**共用** `DELIVERY_STATUSES` 六态 / 行单位工单级 / 已交量守卫 `NOT EXISTS … status IN ('DELIVERED','COMPLETED')`（含 `COMPLETED` 是因为 force-complete 端点强推它）；**刻意不同** = dashboard 每桶 `LIMIT 30` 而本域**无 LIMIT**（邮件必须给全量）/ 本域多取 `drawing_no` / `order_no` 两列 / 本域未来节有 `[today, today+N)` 上界（`N` clamp 1..60）。**窗口下界取形参 `today`，SQL 里绝不写 `CURRENT_DATE`**（DB 会话时区与 `now_naive()` 是两个时钟，Shanghai 00:00–08:00 会整体偏移一天）。
 - ⚠️ **cron 是 6 段带秒**（tokio-cron-scheduler 0.15 内部 `croner` 固定 `Seconds::Required`），且 **`WEEKLY` 必减 1**（本域 `weekday` 用 ISO `1`=周一，cron 第 6 段 `0`=周日；漏减不报错，只会把邮件安静挪到隔一天）。时区**显式传 `Asia/Shanghai`**：`Job::new_async()` 的默认值是 **UTC**，不是本地时区。`JobScheduler::new()` 在 0.15 是 **`async fn`**。
-- ⚠️ **多副本部署不防重**（沿用 `task::auto_complete` 同一现状，N 个副本可能同一时刻发 N 封信）；**`/send` 无频控**（唯一护栏是 MANAGER 角色 + 两道 enabled 闸）。两者均登记为后续独立重构。
+- ⚠️ **多副本部署不防重**（沿用 `task::auto_complete` 同一现状，N 个副本可能同一时刻发 N 封信）；**`/send` 无频控**（唯一护栏是 MANAGER 角色 + 两道 enabled 闸）。两者均登记为后续独立重构。⚠️ **与「进程内互斥」是两层不同的问题（2026-10-13 review 第 2 轮 M1）**：`task::mail_digest::swap_job` 用一把 `tokio::sync::Mutex` 把「摘旧 → 读库 → 注册新」整段串行，保证**单进程内**调度器里恒 ≤ 1 个 job（原先只有「取 job id」受保护，两个并发 `POST /config` 会各注册一个、先注册那个**永远摘不掉**）；多副本防重**仍需**分布式锁 / 领导者选举，两者不要互相替代。
 - **覆盖空洞**：`/send` 的**成功路径**（`status='SUCCESS'` 流水行 / 真实投递）**无集成测试** —— 测试环境无可达 SMTP 且刻意不引入 lettre mock transport。替代覆盖：`/preview` 覆盖渲染 + 统计 SQL、「必失败」路径覆盖落流水、`mailer.rs` lib 单测覆盖 TLS 映射表与收件人解析。详见 [`docs/api/mail_digest.md`](docs/api/mail_digest.md) §8.3。
 
 ### 状态派生契约（2026-10-01）
@@ -532,7 +532,7 @@ t_assembly.status               ← 派生缓存
 | [`docs/api/iam.md`](docs/api/iam.md) | `iam`（认证 + 账号 + 企业微信绑定 + 货架子模块，**22 端点**；session 5 + users 12 + shelves 5，4 条破坏性变更与 OCC 锚点） |
 | [`docs/api/wx.md`](docs/api/wx.md) | `wx` 微信小程序 BFF（**2026-10-11 新建**；**按小程序页面切子模块**：`login/` + `part_list/` + `production/`；5 端点；URL 硬切无 alias 5 条、VO camelCase 逐字对齐前端卡片模型、`deliveredQty` 真值、尾斜杠 404 实测钉死、`counts` / `list` 口径对齐、★ 2026-10-12 `part_list` 日期 + 7 类 tab 双维筛选） |
 | [`docs/api/statistics.md`](docs/api/statistics.md) | `statistics` 生产统计（**2026-10-12 新建**；3 个 MANAGER-only 只读端点、有效工时口径表与数据覆盖登记、跳序取件域清空的移除记录） |
-| [`docs/api/mail_digest.md`](docs/api/mail_digest.md) | `mail_digest` 交期汇总邮件（**2026-10-13 新建**；6 个 MANAGER-only 端点 + 定时任务；SMTP 凭据只走 env；6 段带秒 cron 与 WEEKLY 减 1；217xx 错误码；失败也落流水；与 dashboard 的口径分叉与三处偏差登记） |
+| [`docs/api/mail_digest.md`](docs/api/mail_digest.md) | `mail_digest` 交期汇总邮件（**2026-10-13 新建**；6 个 MANAGER-only 端点 + 定时任务；SMTP 凭据只走 env；6 段带秒 cron 与 WEEKLY 减 1；217xx 错误码；失败也落流水；与 dashboard 的口径分叉与**五处**偏差登记（第 5 条已修）） |
 
 **约定**：
 

@@ -44,6 +44,13 @@ use crate::modules::mail_digest::repo::DigestRow;
 /// 「已逾期（系统交期早于今日）（0 条） / 本节无符合条件的工单」。管理员关掉逾期节却
 /// 在信里看到一条空节，**第一反应是「统计口径是不是坏了」**而不是「这节我没要」——
 /// 这是会直接变成工单的问题。⇒ 节开关现在真的作用于正文。
+///
+/// ⚠️ **行数与 `cfg.include_*` 同源**（2026-10-13 review 第 2 轮 #12）：「关掉的节
+/// 行数恒 0」这条不变式由 `service::fetch_rows` 保证（`if cfg.include_x { 查库 } else
+/// { Vec::new() }`），渲染层不重复判定。本文件因此**不**把 `overdue_count` /
+/// `upcoming_count` 写成「实际渲染了几行」——对当前两个生产构造点（`service::preview`
+/// 与 `service::deliver`）两者恒相等，而流水表（§2.5）沿用「节关掉则该 count 恒 0」
+/// 的口径，**不是**「没有逾期工单」；分叉会让同一份数据有两个解释。
 #[derive(Debug, Clone)]
 pub struct RenderInput<'a> {
     pub cfg: &'a NormalizedConfig,
@@ -60,7 +67,7 @@ pub struct RenderedMail {
     pub html: String,
     pub overdue_count: i32,
     pub upcoming_count: i32,
-    /// 实际参与渲染的列（**已剔除**未知列，见 [`filter_known_columns`]）。
+    /// 实际参与渲染的列（**空列白名单会退回缺省 8 列**，见 [`filter_known_columns`]）。
     pub columns: Vec<String>,
 }
 
@@ -105,15 +112,36 @@ pub fn render(input: &RenderInput) -> RenderedMail {
     let mut html = String::with_capacity(8192);
     html.push_str(HTML_HEAD);
 
-    // ── 概览行 ──
+    // ── 概览行：**只列已启用的节**（2026-10-13 review 第 2 轮 m2）──
+    // 关掉的节 service 层没查库 ⇒ 行数恒 0，若照旧打「逾期 0 条」，管理员关掉逾期节
+    // 后信的第一行仍是「…逾期 0 条 / 未来 12 条」—— 那与 M5 修掉的「空节」是同一种
+    // 误读（看起来像统计口径坏了），只是从整节缩到了一个数字。故直接不列。
+    let overdue_txt = if input.cfg.include_overdue {
+        format!("逾期 {} 条", input.overdue_rows.len())
+    } else {
+        String::new()
+    };
+    let upcoming_txt = if input.cfg.include_upcoming {
+        format!("未来 {} 条", input.upcoming_rows.len())
+    } else {
+        String::new()
+    };
+    let counts = [overdue_txt, upcoming_txt]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" / ");
+    let counts = if counts.is_empty() {
+        "（本邮件未启用任何内容节）".to_string()
+    } else {
+        counts
+    };
     html.push_str(&format!(
         "<tr><td style=\"padding:12px 16px;font-size:13px;color:#606266;\">\
          统计口径：系统交期；今日 = {}；未来窗口 = {} 天；\
-         逾期 {} 条 / 未来 {} 条</td></tr>",
+         {counts}</td></tr>",
         html_escape(&input.today.format("%Y-%m-%d").to_string()),
         input.cfg.upcoming_days,
-        input.overdue_rows.len(),
-        input.upcoming_rows.len(),
     ));
     html.push_str(HR);
 
@@ -551,6 +579,75 @@ mod tests {
         assert!(!out.html.contains("即将到期"), "{}", out.html);
         assert!(out.html.contains("已逾期"));
         assert!(out.html.contains("DWG-O"));
+    }
+
+    /// ⚠️ 回归（2026-10-13 review 第 2 轮 #2）：**概览行只列已启用的节**。
+    ///
+    /// M5 把「关掉的节整段不渲染」修掉了，但概览行当时仍无条件打
+    /// 「逾期 {} 条 / 未来 {} 条」⇒ 管理员关掉逾期节后，信的第一行还是
+    /// 「…逾期 0 条 / 未来 12 条」。那 0 **不是**「没有逾期工单」，而是「这节没启用」，
+    /// 与 M5 修掉的空节是同一种误读（看起来像统计口径坏了），只是从整节缩到了一个数字。
+    #[test]
+    fn overview_line_lists_only_enabled_sections() {
+        let one_overdue = vec![row("DWG-O", Some("2026-10-09"), false)];
+        let one_upcoming = vec![row("DWG-U", Some("2026-10-15"), false)];
+        let overview = |html: &str| {
+            html.split("统计口径：")
+                .nth(1)
+                .unwrap_or("")
+                .split("</td>")
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
+        let both_on = NormalizedConfig::default();
+
+        // ① 两节开、都无行
+        let out = render(&input(&both_on, &[], &[]));
+        assert_eq!(
+            overview(&out.html),
+            "系统交期；今日 = 2026-10-13；未来窗口 = 14 天；逾期 0 条 / 未来 0 条"
+        );
+
+        // ② 只开逾期节（未来节关掉）
+        let only_overdue = NormalizedConfig {
+            include_upcoming: false,
+            ..NormalizedConfig::default()
+        };
+        let out = render(&input(&only_overdue, &one_overdue, &[]));
+        let line = overview(&out.html);
+        assert!(line.ends_with("逾期 1 条"), "{line}");
+        // 「未来窗口 = N 天」是**统计口径**（恒出现），不是节；被禁的是「未来 N 条」
+        assert!(
+            !line.contains("未来 0 条"),
+            "关掉的未来节不该在概览行报「未来 0 条」：{line}"
+        );
+
+        // ③ 只开未来节（逾期节关掉）—— 本条就是 #2 的核心场景
+        let only_upcoming = NormalizedConfig {
+            include_overdue: false,
+            ..NormalizedConfig::default()
+        };
+        let out = render(&input(&only_upcoming, &[], &one_upcoming));
+        let line = overview(&out.html);
+        assert!(line.ends_with("未来 1 条"), "{line}");
+        assert!(
+            !line.contains("逾期 0 条"),
+            "关掉的逾期节不该在概览行报「逾期 0 条」：{line}"
+        );
+
+        // ④ 两节全关（配置层已被 21704 拒；渲染层兜底）
+        let none_on = NormalizedConfig {
+            include_overdue: false,
+            include_upcoming: false,
+            ..NormalizedConfig::default()
+        };
+        let out = render(&input(&none_on, &[], &[]));
+        let line = overview(&out.html);
+        assert!(line.ends_with("（本邮件未启用任何内容节）"), "{line}");
+        assert!(!line.contains("逾期"), "{line}");
+        assert!(!line.contains("未来 0 条"), "{line}");
     }
 
     /// 组标题的 `colspan` 必须是真实列数（原先写字面量 `"*"`，客户端回落到 1）。
