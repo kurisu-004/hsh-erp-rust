@@ -189,6 +189,26 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 >
 > ⚠️ **`t_shelf` 全仓只有一份行结构**：`iam::shelf::model::TShelf`（14 列含 `capacity`）。iam 账号侧原有的 13 列投影已删除，`IamRepoTrait::get_shelf_by_id` 改为委托 `ShelfRepo::get_by_id`（两条 SQL 谓词逐字相同：都只过滤 `deleted_at`、不过滤 `is_active`）。
 
+### `src/modules/files/*` 子模块清单（files 域 = 文件资源容器域，2026-10-13 新建）
+
+| 子模块 | 端点数 | URL 前缀 | 表 | 说明 |
+|---|---:|---|---|---|
+| （容器自带） | 1 | `/api/v2/files/sts-tmp-keys` | 无（薄壳鉴权转发到 python） | 2026-09-28 新增，逐字未动 |
+| `files::part_file` | 6 | `/api/v2/files/objects` | `t_part_file`（自有） | `POST /objects`（**上传四合一**）/ `GET /objects`（列表）/ `POST /objects/confirm`（STS 直传回执）/ `GET /objects/{id}/url` / `GET /objects/{id}/content` / `POST /objects/{id}/delete` |
+| `files::part_file::cnc` | 1 | `/api/v2/files/cnc` | 复用 `t_part_file`（无 repo 层） | `POST /cnc/pairs`：G_CODE + 工艺卡配对写入 |
+
+> 端点求和 = 1 + 6 + 1 = **8**，与 `src/modules/files/mod.rs` 模块 doc 的端点表恒等。计数口径同 iam 表。
+>
+> **2026-10-13 两批硬切**（均**无 alias**、旧前缀一律 404）：
+> - PR1a：`part_file` / `cnc_program` 两个独立域收编成 `files` 容器域及其嵌套子模块。URL `/api/v2/part-files/*` → `/api/v2/files/objects/*`、`/api/v2/cnc-programs/*` → `/api/v2/files/cnc/*`；同批删除 12 条零调用方端点（part_file 8 + cnc 4）与两张死表（`t_cnc_program` / `t_drawing_file`）。
+> - PR1b：part / assembly 侧的文件端点收编 —— 5 条旧端点（`POST /parts/{id}/upload-drawing`、`POST /parts/{id}/upload-3d-model`、`POST /assemblies/{id}/files`、`POST /parts/{id}/files/confirm`、`GET /assemblies/{id}/files`）**并成 2 条**（`POST /files/objects` 四合一 + `POST /files/objects/confirm`），`GET /assemblies/{id}/files` 直接删除。⇒ files 域是**全仓唯一**持有 `t_part_file` 写入路径的域。
+>
+> ⚠️ **COS 对象 key 前缀统一 `obj/`（2026-10-13）**：`COS_UPLOAD_PREFIX` 此前有两套实际取值（生产 `.env` 的 `drawings/` 与 `upload_file_for_owner` 硬编码空串 ⇒ 桶根），现统一为 `obj/`（`config.rs` 缺省值 / `.env.example` / 代码回退三处同步）。**不需要数据迁移、不要跑 `src/bin/cos_key_migrate.rs`**：`t_part_file.object_key` 存完整 key，读端点 `PartFileService::resolve_effective_key` 先 `head_object(db_object_key)` 优先命中，历史对象原地不动，只有新上传改落 `obj/`。
+>
+> ⚠️ **刻意留在别的域的两处文件写入**：`POST /api/v2/parts/batch` 的 **bindings 分支**（端点本体是「批量建零件」，文件只是可选入参）；`POST /api/v2/parts/batch-with-pdfs` / `POST /api/v2/assemblies` 的 **multipart PDF**（只喂 `lopdf` 数页数，不入库不上 COS）。
+>
+> ⚠️ `files` 域**不在** `docs/api/` 的整域覆盖清单里（该目录只覆盖部分域，判据见本文件「`docs/api/` 目录约定」一节），契约真源是各级模块 doc。
+
 ### `src/modules/dashboard/` 域（只读大屏聚合，2026-10-07 VO 重构后 3 个端点）
 
 | 端点 | 权限 | 说明 |
@@ -523,13 +543,13 @@ integration test binary 已重组为 **20 binary**（10 多文件 domain 子目�
 |---|---:|---|
 | `tests/com/{main,union_list,delivery_note_in_use}.rs` | 5 | `com`（送货单域 2026-10-08 平移进 com 容器时目录随之更名 `delivery` → `com`；`group` / `attach_batches` / `scan` 三个 sub-file 已随端点收敛删除）|
 | `tests/part/{main,create_serial_price,batch,crud,inspection_batches,lifecycle,list_enrichment,purchase_order_import,repair,rollup_recompute,serial,to_inspection,to_process,to_ship}.rs` | 12 | `part`（sub-file 穷举，**14 个文件**，2026-10-13 逐 `ls` 核对；`main.rs` 为 binary 入口。★ `purchase_order_import.rs` 2026-10-06 新增：采购订单 Excel 导入两端点 —— `match-by-excel-items` 分档匹配 + `batch-update-order-info` 三态回填 / skip。⚠️ **两个 sub-file 已迁出、枚举里不再有**：`file.rs` → `tests/files/part_file.rs`（**2026-10-13**，随 part_file 域收编进 files 域，与 `tests/part/main.rs` 的拆分映射同批记）；`pickable_by_work_type.rs` → `tests/production/scan_listing.rs`（**2026-10-10**，报工台两条 list 端点迁往 `prod::scan` 时带走））|
-| `tests/assembly/{main,api,files,files_list,by_part,children,create_serial_price,force_complete,status_sync}.rs` | 3 | `assembly`（**2026-10-11** 新增 `force_complete.rs`：装配件级强制完成端点 `POST /prod/assemblies/{id}/force-complete`，含「子件非取消批次为 0 条」的边角回归）|
+| `tests/assembly/{main,api,lifecycle,by_part,children,create_serial_price,force_complete,status_sync}.rs` | 3 | `assembly`（**2026-10-11** 新增 `force_complete.rs`：装配件级强制完成端点 `POST /prod/assemblies/{id}/force-complete`，含「子件非取消批次为 0 条」的边角回归；⚠️ **2026-10-13 PR1b 两个 sub-file 已不在枚举里**：`files.rs` → **更名 `lifecycle.rs`**（其中 2 条文件上传用例迁往 `tests/files/upload.rs`，剩下 4 条生命周期用例留在本 binary —— 是更名不是搬家）；`files_list.rs`（D-09 `GET /assemblies/{id}/files` 的 4 条用例）→ **整文件删除**，端点已下线）|
 | `tests/iam/{main,api,middleware,bootstrap_admin_seed,menu_seed,wx_bind,shelf,shelf_deactivate}.rs` | 2 | `iam`（**2026-10-09**：原 `redis-flush` 串行组已整体删除 —— Redis 隔离改由 key 前缀承担、触发该组的 `clean_redis`（FLUSHDB）已零调用方随函数删除、两个 binary 的并行度已恢复；删除理由留档在 `.config/nextest.toml` 的注释里。**2026-10-10**：`tests/shelf/` 整体并入本 binary，用例改名 `shelf.rs`（← `api.rs`，`api.rs` 同名冲突）/ `shelf_deactivate.rs`（← `deactivate.rs`），与货架子模块迁入 iam 域同批）|
 | `tests/statistics/{main,api,event_driven}.rs` | 2 | `statistics` |
 | `tests/production/{main,work_type,process,process_chain,worker,queue,queue_auto_allocate,queue_dispatch,queue_board,pending_programming,shelf_process,pickup,process_design,inspection,scan_badge,scan_listing,scan_worker_scan}.rs` | 6 | `production`（按 `src/modules/prod/*` 对齐；`shelf_process.rs` 2026-10-02 自当时的 `tests/shelf/api.rs` 迁入；**`process_design.rs` 2026-10-05 新增**，★ 核心回归是「装配件子件可见」；**`inspection.rs` 2026-10-05 新增** 13 场景，★ 核心回归是「扫子件 → 返回整棵装配件树」；**2026-10-08** `worker_pool.rs` → `queue.rs`、`worker_pool_auto_allocate.rs` → `queue_auto_allocate.rs`、`batch.rs` → `queue_dispatch.rs`，并新增 `queue_board.rs`（队列板聚合 9 场景）；**2026-10-10** 新增报工台三 sub-file：`scan_badge.rs`（`verify-badge`，★ 核心回归是出参恰好 4 个 key）/ `scan_listing.rs`（取件 / 持有两页列表）/ `scan_worker_scan.rs`（放回顺链推进 + 触发 refill 联动））|
 | `tests/outsource/{main,company,quote,quotable,send_receive,shipment,pool}.rs` | 3 | `outsource` |
 | `tests/user_repo/{main,basic,role,password}.rs` | 1 → 3 sub-file | `user_repo` |
-| `tests/files/{main,part_file,cnc,sts}.rs` | 2 → 1 binary | `files`（**2026-10-13 新建**：由 2 个原单文件 binary `tests/cnc_program_api.rs`（→ `cnc.rs`）/ `tests/files_sts_tmp_keys.rs`（→ `sts.rs`）合并而来；⚠️ 另有 1 个 sub-file 自 `part` binary 迁入 —— `tests/part/file.rs` → `part_file.rs`，它**从来不是独立 binary**（在 `part` 里只是个 sub-file），故不计入本列；★ 核心回归是 `part_file.rs` 的硬切 404 守卫（`old_part_files_prefix_returns_404` 等 3 条，含旧前缀整段 / 数字段 / 旧 CNC 前缀））|
+| `tests/files/{main,part_file,upload,cnc,sts}.rs` | 2 → 1 binary | `files`（**2026-10-13 新建**：由 2 个原单文件 binary `tests/cnc_program_api.rs`（→ `cnc.rs`）/ `tests/files_sts_tmp_keys.rs`（→ `sts.rs`）合并而来；⚠️ 另有 2 个 sub-file 自别的 binary 迁入 —— `tests/part/file.rs` → `part_file.rs`（它从来不是独立 binary，在 `part` 里只是 sub-file）与 `tests/assembly/files.rs` 的 2 条文件上传用例 → `upload.rs`（**2026-10-13 PR1b**：端点 `POST /assemblies/{id}/files` 下线后改测 `PartFileService::upload_file_for_owner(owner_kind=ASSEMBLY)`），两者均不计入本列的 binary 数；★ 核心回归是 `part_file.rs` 的硬切 404 守卫 —— PR1a 3 条（`old_part_files_prefix_returns_404` 等，含旧前缀整段 / 数字段 / 旧 CNC 前缀）+ **PR1b 4 条**（`old_part_upload_drawing_returns_404` / `old_part_upload_3d_model_returns_404` / `old_part_files_confirm_returns_404` / `old_assembly_files_returns_404`），共 7 条）|
 | `tests/wx/{main,part_list,production}.rs` | 1 → 1 binary | `wx`（**2026-10-13 补记**：2026-10-11「BFF 按页面切子模块」时建的 binary，此前本表漏登记；本次一并补上并按 `cargo metadata --no-deps` 复核计数）|
 | 单文件保留：_e2e_api / applicant_api / auto_complete_api / cos_opendal_api / cos_real_smoke / customer_api / dashboard_ws_api / idempotency_api / print_forward / wecom_login | 10 | （各自原 binary 名；⚠️ 原清单里的 `cnc_program_api` / `files_sts_tmp_keys` 已于 2026-10-13 并入上表 `files` binary）|
 | **合计** | — | **20 binary**（10 子目录 + 10 单文件；`cargo metadata --no-deps` 实测，2026-10-13 复核）|

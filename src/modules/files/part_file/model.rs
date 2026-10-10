@@ -1,10 +1,10 @@
 //! part_file 域数据模型（Phase PR-CRUD 2026-08-25）
 //!
 //! 对齐 `migrations/20260811100007_007_create_file_tables.sql:12-31` 16 列完整投影。
-//! `part_id` 是 polymorphic（指向 `t_part.id` 或 `t_assembly.id`），本轮只处理 `t_part`
-//! 路径（kind='DRAWING' 上传）。
+//! `part_id` 是 polymorphic（指向 `t_part.id` 或 `t_assembly.id`）—— 2026-10-13 PR1b
+//! 起两条 owner 都由本域的 `POST /api/v2/files/objects` 一个端点写入。
 //!
-//! 序列化：`Serialize` 给 upload-drawing handler 出参；`created_by` / `updated_by`
+//! 序列化：`Serialize` 给本域 handler 出参；`created_by` / `updated_by`
 //! / `paired_file_id` 三个 i64 字段走 `serialize_i64_opt`（Global Constraint #3）。
 
 use serde::Serialize;

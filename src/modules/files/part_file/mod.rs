@@ -26,11 +26,51 @@
 //!   **无 alias，旧前缀 404**。原因是 URL 语义从「零件文件」改为「文件对象」——
 //!   `t_part_file` 的 owner 本来就是多态的（`owner_kind ∈ {PART, ASSEMBLY}`），
 //!   `/part-files` 这个名字与实际承载面不符。
-//! - 端点 12 条 → **4 条**（详见 `handler.rs` 模块 doc 的移除记录表）；
-//!   写路径（HTTP 上传）不在本子模块，走 STS 直传 + part 域
-//!   `POST /api/v2/parts/{part_id}/files/confirm`。
+//! - 端点 12 条 → **4 条**（详见 `handler.rs` 模块 doc 的移除记录表）。
 //!
-//! ## 角色矩阵（4 条存活端点；2026-10-10 新增 `Role::ShelfAccount` 的两条只读端点）
+//! ## 2026-10-13 PR1b：写路径收编进来（5 条旧端点 → 2 条）
+//!
+//! 端点 **4 条 → 6 条**。旧路径**全部无 alias、一律 404**，逐条清单见
+//! `handler.rs` 模块 doc：
+//!
+//! | 旧 URL | 新 URL |
+//! |---|---|
+//! | `POST /api/v2/parts/{part_id}/upload-drawing` | `POST /api/v2/files/objects` |
+//! | `POST /api/v2/parts/{part_id}/upload-3d-model` | `POST /api/v2/files/objects` |
+//! | `POST /api/v2/assemblies/{assembly_id}/files` | `POST /api/v2/files/objects` |
+//! | `POST /api/v2/part-files/`（PR1a 下线，本轮复活并通用化） | `POST /api/v2/files/objects` |
+//! | `POST /api/v2/parts/{part_id}/files/confirm` | `POST /api/v2/files/objects/confirm` |
+//! | `GET /api/v2/assemblies/{assembly_id}/files` | 删（0 调用方） |
+//!
+//! ⇒ 本子模块自此是**全仓唯一**持有 `t_part_file` 写入路径的域。
+//!
+//! ### COS key 前缀统一 `obj/`（2026-10-13）
+//!
+//! 写入路径的 CAS key 前缀读 `cfg.cos.upload_prefix`（缺省 `obj/`）。此前
+//! `upload_file_for_owner` 把前缀硬编码成空串（新对象落桶根）、part 域旧上传读
+//! 配置（生产 `.env` 配 `drawings/`），同一张表的对象分散在两处。
+//!
+//! ⚠️ **不需要数据迁移，更不要跑 `src/bin/cos_key_migrate.rs`**：
+//! `t_part_file.object_key` 存的是**完整 key**，读端点
+//! `PartFileService::resolve_effective_key` 先 `head_object(db_object_key)`
+//! 优先命中 ⇒ 历史对象原地不动，本轮只让**新上传**统一落 `obj/`。
+//!
+//! ### ⚠️ 装配件上传的**响应形状变更**
+//!
+//! 旧 `POST /api/v2/assemblies/{id}/files` 回 `Vec<AssemblyFileRef>`
+//! （`{id, original_filename, page_count}`），`POST /files/objects` 回
+//! `PartFileOut`（18 字段），**`page_count` 键消失**。无信息损失：那条上传路径
+//! 本就把 `page_count` 硬编码成 `None`（`assembly/service/lifecycle.rs`），
+//! PDF 页数由读时 `lopdf` 重算。
+//!
+//! ⚠️ 另一处行为差异（去重判据）见 `service.rs::upload_file_for_owner` 的对照表；
+//! 装配件侧的实际影响是：`uk_t_part_file_single` 含 `ASSEMBLY_MASTER` ⇒
+//! **一个装配件只有一条活跃的 ASSEMBLY_MASTER**，第二个**内容不同**的 PDF 会被
+//! 撞唯一索引（service 映射成 21108 `BIZ_PART_FILE_DUPLICATE`；旧实现这里是裸
+//! `sqlx::Error` → 500）。旧 handler 名义上支持「一次传多个 file」，实际上第 2 个
+//! 就已经会失败 —— 合并只是把那个 500 换成了一个业务码。
+//!
+//! ## 角色矩阵（6 条存活端点；2026-10-10 新增 `Role::ShelfAccount` 的两条只读端点）
 //!
 //! 报工台（前端路由 `/scan/*`）的路由守卫就是 `SHELF_ACCOUNT` —— 车间工控机用的
 //! 就是这个角色账号；它的图纸预览打的是本子模块的**列表** `GET /api/v2/files/objects`
@@ -39,10 +79,21 @@
 //!
 //! | 端点 | 角色集合 | 备注 |
 //! |---|---|---|
+//! | `POST /files/objects`（上传） | M / C / CNC | 四合一；白名单取 4 条旧上传端点的**并集** |
+//! | `POST /files/objects/confirm` | M / C | 逐字沿用旧 `POST /parts/{id}/files/confirm` |
 //! | `GET /files/objects`（列表） | M / C / I / CNC / **SHELF** | 2026-10-10 放开 SHELF |
 //! | `GET /files/objects/{id}/content` | M / C / I / CNC / **SHELF** | 2026-10-10 放开 SHELF |
 //! | `GET /files/objects/{id}/url` | M / C / I / CNC | **刻意不含 SHELF**，见下 |
 //! | `POST /files/objects/{id}/delete` | 按 kind 派生（图纸类 M / C，G_CODE M / CNC） | 未动 |
+//!
+//! ### ⚠️ 上传四合一带来的**唯一一处权限面放大**
+//!
+//! 4 条旧上传端点的白名单并不一致：`upload-drawing` / `upload-3d-model` 是 M+C
+//! （`CRUD_PART_ROLES`）、`assemblies/{id}/files` 是 M+C、PR1a 下线又复活的
+//! `POST /part-files/` 是 M+C+CNC。合并成一个端点后白名单取**并集** M+C+CNC
+//! ⇒ 能传 CNC 程序（G_CODE + 工艺卡）的人现在也能传图纸 / 3D 模型 / 装配件 PDF。
+//! 这是并集本身的直接后果，不是遗漏；要收紧就按 kind 派生（但那会让
+//! 「一个端点一种 kind」的白名单重新分裂，与本轮合并的目的相反）。
 //!
 //! ### 2026-10-13：零件维度三条嵌套列表端点下线 ⇒ 不再有「两层闸门取交集」
 //!
@@ -51,6 +102,12 @@
 //! **这三条已随零调用方端点清理整体下线**（见 `handler.rs` 移除记录），故本域现在
 //! 不再有「handler 级闸门与 service 白名单分叉」这件事：每个端点只有一层闸门，且
 //! 那层闸门就在 service 里。角色矩阵回到「一个端点一行、集合唯一」的状态。
+//!
+//! ### 为什么 `POST /files/objects` 不放开 SHELF
+//!
+//! 写路径沿用 2026-10-10 的边界：SHELF_ACCOUNT 只放开**只读**端点（列表 + content），
+//! 上传 / confirm / 软删三条写路径一律拒（回归用例
+//! `tests/files/part_file.rs::rbac_shelf_account_cannot_upload_or_delete`）。
 //!
 //! ### 为什么 `/url` 不跟着放开
 //!

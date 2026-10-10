@@ -3,8 +3,8 @@
 //! ## 结构（2026-09-22 重构）
 //! - `sql.rs`：原 `repo.rs` 全文搬迁，11 个 pub 固有静态方法 + sqlx `query!` 宏，
 //!   **内容零 diff**（`.sqlx/query-*.json` 哈希不变）。
-//! - `mod.rs`（本文件）：对外暴露胖 trait `AssemblyRepoTrait`（16 方法合并单 trait；
-//!   含 t_assembly CRUD 9 + sync hook helper 2 + 跨域 helper 5），并直接
+//! - `mod.rs`（本文件）：对外暴露胖 trait `AssemblyRepoTrait`（**14 方法**合并单 trait；
+//!   含 t_assembly CRUD 9 + sync hook helper 2 + 跨域 helper 3），并直接
 //!   `impl AssemblyRepoTrait for &mut PgConnection`——handler/service 借 `&mut *tx` /
 //!   `&mut *conn` 即可，零中间壳。
 //!
@@ -18,7 +18,13 @@
 //! - `assembly::repo::AssemblyRepo` —— ZST struct（在 `sql.rs` 内，通过 `pub use sql::AssemblyRepo;`
 //!   重新导出至本模块），保留 11 个 t_assembly 静态方法签名不变（cross-module 调用方零修改）。
 //! - `assembly::repo::AssemblyRepoTrait` —— 本文件新加的胖 trait，assembly 域内部 service 用
-//!   `<R: AssemblyRepoTrait>` 收。trait 方法数 16（t_assembly 11 + 跨域 helper 5）。
+//!   `<R: AssemblyRepoTrait>` 收。
+//!
+//! 2026-10-13 PR1b：跨域 helper 5 → **3**（删 `part_file_get_by_owner_kind_sha`
+//! CAS 去重查 / `part_file_create` INSERT，两者的唯一调用方是被删的
+//! `POST /assemblies/{id}/files` 上传端点）。剩下 3 个跨域 helper 全是
+//! `t_customer` / `t_part` / `t_part_batch` 的只读 + 写，`t_part_file` 只剩
+//! `list_part_files_by_owner`（详情 `files[]` 用）。
 //!
 //! ## 为什么是胖 trait 而不是按实体拆 trait
 //! `&mut PgConnection` 同一作用域只能借给一个 repo 实例；如果按实体拆，service 同时使用
@@ -42,10 +48,11 @@
 //! repo trait 方法 → `sqlx::Error`（与 sql.rs 签名 1:1）。
 //!
 //! ## 跨域 helper 设计
-//! assembly service 在创建 / 更新 / 详情 / 文件上传 / 同步钩子中需要查 `t_customer`
+//! assembly service 在创建 / 更新 / 详情 / 同步钩子中需要查 `t_customer`
 //! （L1 展开 + parent_id 校验 + serial_prefix 派发）、`t_part`（子件列表 + 父件级联 +
-//! 套数缩放 + 子件创建）、`t_part_file`（CAS 去重 + 列表 + INSERT）、`t_part_batch`
-//! （current_batch_id 派生）。这些跨域 SQL 通过本 trait 收口：
+//! 套数缩放 + 子件创建）、`t_part_file`（**只剩列表** —— 文件写入 2026-10-13 PR1b
+//! 起全部归 `files::part_file`）、`t_part_batch`（current_batch_id 派生）。
+//! 这些跨域 SQL 通过本 trait 收口：
 //! - trait 方法体 = `PartRepo::xxx(&mut **self, ...)` / `PartFileRepo::xxx(&mut **self, ...)`
 //!   或直接 sqlx::query_as 单条 SQL；
 //! - service 不再持有 `&mut PgConnection`（除了 trait 借出的隐式连接），无法跨域调静态方法。
@@ -58,7 +65,7 @@ use sqlx::PgConnection;
 
 use super::model::TAssembly;
 use crate::modules::files::part_file::model::TPartFile;
-use crate::modules::files::part_file::repo::{NewPartFile, PartFileRepo};
+use crate::modules::files::part_file::repo::PartFileRepo;
 use crate::modules::part::model::TPart;
 use crate::modules::part::repo::PartRepo;
 use crate::modules::part::repo::part::{ChildInheritFields, NewPartCreate};
@@ -229,18 +236,12 @@ pub trait AssemblyRepoTrait: Send {
         updated_by: i64,
     ) -> Result<u64, sqlx::Error>;
 
-    /// part_file CAS 去重查（`PartFileRepo::get_by_owner_kind_sha`）。
-    async fn part_file_get_by_owner_kind_sha<'a>(
-        &mut self,
-        owner_id: i64,
-        kind: &'a str,
-        sha: &'a str,
-    ) -> Result<Option<TPartFile>, sqlx::Error>;
-
-    /// part_file INSERT（`PartFileRepo::create_part_file`）。
-    async fn part_file_create<'a>(&mut self, nf: NewPartFile<'a>) -> Result<i64, sqlx::Error>;
-
     /// part_file 列表（`PartFileRepo::list_by_owner`）。
+    ///
+    /// ⚠️ 2026-10-13 PR1b：同组另两个 helper（`part_file_get_by_owner_kind_sha`
+    /// CAS 去重查 / `part_file_create` INSERT）随 `POST /assemblies/{id}/files`
+    /// 端点下线一并删除 —— 本 trait 自此只剩这一个 part_file 跨域 helper，
+    /// 唯一调用方是 `service/crud.rs` 的 `GET /assemblies/{id}` 详情（`files[]`）。
     async fn list_part_files_by_owner<'a>(
         &mut self,
         owner_kind: &'a str,
@@ -611,19 +612,6 @@ impl AssemblyRepoTrait for &mut PgConnection {
     ) -> Result<u64, sqlx::Error> {
         PartRepo::scale_children_quantity(&mut **self, assembly_id, old_qty, new_qty, updated_by)
             .await
-    }
-
-    async fn part_file_get_by_owner_kind_sha<'b>(
-        &mut self,
-        owner_id: i64,
-        kind: &'b str,
-        sha: &'b str,
-    ) -> Result<Option<TPartFile>, sqlx::Error> {
-        PartFileRepo::get_by_owner_kind_sha(&mut **self, owner_id, kind, sha).await
-    }
-
-    async fn part_file_create<'b>(&mut self, nf: NewPartFile<'b>) -> Result<i64, sqlx::Error> {
-        PartFileRepo::create_part_file(&mut **self, nf).await
     }
 
     async fn list_part_files_by_owner<'b>(

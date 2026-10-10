@@ -62,18 +62,21 @@ use crate::state::AppState;
 // 那条第二入口随 part_file 域收编进 files 域**整段下线**（连同
 // `part_nested_router()` 一并删除；旧 URL **无 alias**，`/part-files/*` 一律 404）。
 // ⚠️ 判定「某条 part 端点算不算 part_file 域的东西」时按**写不写 `t_part_file`** 判，
-// 不是按「挂在哪个域」判 —— 本域既有与 part_file 毫无关系的端点，也有挂着 part 前缀
-// 却写 `t_part_file` 的端点：
+// 不是按「挂在哪个域」判 —— 这条口径**继续有效**，只是本域的命中项在 PR1b 之后
+// 变成了**零条独立文件端点**（判定口径留给后续重组用，别连口径一起删掉）：
 // - 与 part_file **无关**：`print-drawing` / `print-drawing-batch`（纯 BFF 转发到 python
-//   出 PDF）、`batch-with-pdfs`（PDF 只喂 `lopdf` 数页数）。
-// - 与 part_file **相关**：`POST /{part_id}/files/confirm`（STS 直传链路的回执，见下方
-//   路由表最后一条）；⚠️ 还有 `upload-drawing` / `upload-3d-model` —— **虽是 part 域端点
-//   却写 `t_part_file`**（handler → `PartService::upload_drawing` / `upload_3d_model` →
-//   两者都转调 `upload_part_file`，kind 分别 `DRAWING` / `3D_MODEL`，出参就是
-//   `TPartFile` → `PartFileRepo::create_part_file`）。PR1b 会把它们合并进
-//   `POST /files/objects`，别按「part 域自有端点」把它们排除在外。
+//   出 PDF）、`batch-with-pdfs`（PDF 只喂 `lopdf` 数页数、不入库不上 COS）。
+// - 与 part_file **相关**（PR1b 前）：`upload-drawing` / `upload-3d-model`（虽挂在 part
+//   域却写 `t_part_file`）、`files/confirm`（STS 直传回执）。二者已分别并入
+//   `POST /api/v2/files/objects` 与硬切到 `POST /api/v2/files/objects/confirm`。
+// - 仍留在本域的**条件性**文件写入：`POST /parts/batch` 的 bindings 分支
+//   （`service/batch.rs::prepare_binding_head_copy`）—— 它命中上面的口径
+//   （确实写 `t_part_file`），但端点本体是「批量建零件」，文件只是可选入参，
+//   故按「一条端点的目标域按前端消费方判定」的约定留在 part 域。
 // 下线的 8 条端点逐条清单见 `src/modules/files/part_file/handler.rs` 的模块 doc
-// 「2026-10-13 同批下线的 8 条端点（移除记录，防后人重建）」一节。
+// 「2026-10-13 同批下线的 8 条端点（移除记录，防后人重建）」一节；PR1b 的 3 条
+// （upload-drawing / upload-3d-model / files/confirm）见同一文件的
+// 「2026-10-13 PR1b：写路径搬进本子模块（上传四合一）」一节。
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -111,8 +114,6 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{part_id}", get(handler::get_part_detail))
         .route("/{part_id}/update", post(handler::update_part))
         .route("/{part_id}/soft-delete", post(handler::soft_delete_part))
-        .route("/{part_id}/upload-drawing", post(handler::upload_drawing))
-        .route("/{part_id}/upload-3d-model", post(handler::upload_3d_model)) // 2026-09-11 新增：3D 模型上传
         // 2026-10-03 新增：单件零件图纸打印（图纸正面 + 条码背面的双面 PDF）。
         // 纯 BFF 转发到 python `GET /api/v1/parts/{id}/print`（v2/v1 路径不同名）。
         .route(
@@ -128,11 +129,14 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{part_id}/batches", get(handler::list_part_batches))
         // ---- 2026-09-25 D-08 api-drift-fix：按 part 反查所属装配体 ----
         .route("/{part_id}/assembly", get(handler::get_assembly_by_part))
-        // ---- 2026-10-13：part 维度文件路由整段下线（cad-files / cnc-programs /
-        //      setup-sheets / cnc-pair / files 共 8 条，无 alias，旧路径 404）。
-        //      与 part_file 相关的入口见上方模块级注记（`files/confirm` 之外，
-        //      `upload-drawing` / `upload-3d-model` 也写 `t_part_file`），
-        //      移除记录见 `src/modules/files/part_file/handler.rs`。
-        // ---- 2026-09-16 M2-B 新增：直传 COS 链路 confirm 端点（POST /parts/{id}/files/confirm）----
-        .route("/{part_id}/files/confirm", post(handler::confirm_part_file))
+    // ---- 2026-10-13：part 维度的全部文件端点下线（三批，见上方模块级注记）----
+    //   ① PR1a：cad-files / cnc-programs / setup-sheets / cnc-pair / files 共 8 条；
+    //   ② PR1b：`upload-drawing` / `upload-3d-model` 并入
+    //      `POST /api/v2/files/objects`（四合一）；
+    //   ③ PR1b：`files/confirm` 硬切到 `POST /api/v2/files/objects/confirm`。
+    //   三批**均无 alias，旧路径 404**；移除记录见
+    //   `src/modules/files/part_file/handler.rs` 的模块 doc。
+    // ⚠️ 刻意保留在本域的：**`POST /parts/batch` 的 bindings 分支**
+    // （service/batch.rs::prepare_binding_head_copy）—— 端点本体是「批量建零件」，
+    // 文件只是可选入参，不是一条独立的文件端点。
 }

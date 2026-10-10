@@ -21,9 +21,21 @@
 //!
 //! `content_type` 取客户端声明（multipart 头），扩展名从 `filename` 提取。
 //!
-//! ## 与 part 域的耦合
-//! 装配体 PDF（kind='ASSEMBLY_MASTER'）走相同上传通道，owner_kind='ASSEMBLY'，
-//! 由 assembly 域在创建流程或单独的 `POST /assemblies/{id}/files` 端点调用。
+//! ## 与 part / assembly 域的耦合
+//! 2026-10-13 PR1b 起**恒为「零」**：两条上传 / 一条 confirm 端点全部收进本子模块
+//! （`POST /api/v2/files/objects` 四合一 + `POST /api/v2/files/objects/confirm`），
+//! part 域与 assembly 域不再持有任何 `t_part_file` 的写入路径。
+//! 装配体 PDF（`kind='ASSEMBLY_MASTER'`）走同一条通道，`owner_kind='ASSEMBLY'`。
+//! ⚠️ `POST /api/v2/parts/batch` 的 bindings 分支（`service/batch.rs::
+//! prepare_binding_head_copy`）**刻意留在 part 域**：它的端点本体是「批量建零件」，
+//! 文件只是可选入参，不是一条独立的文件端点。
+//!
+//! ## 2026-10-13 PR1b：COS key 前缀统一 `obj/`
+//! 上传写入的 CAS key 前缀取自 `cfg.cos.upload_prefix`（缺省 `obj/`），读端点的
+//! legacy fallback 用**同一份**配置。⚠️ **不需要跑 `cos_key_migrate` 做数据迁移**：
+//! `t_part_file.object_key` 存的是完整 key，`resolve_effective_key` 先
+//! `head_object(db_object_key)`、命中就直接返回 ⇒ 历史上落在 `drawings/` 或桶根的
+//! 对象原地不动，本轮只是让**新上传**统一落 `obj/`。
 //!
 //! ## 2026-09-16 M2-B → 2026-09-18 STS 会话域拆分
 //! - 原 `upload_intents` 业务函数（场景 A/B 一次性签 STS + CAS 去重命中复用）
@@ -81,15 +93,30 @@ impl PartFileService {
     ///
     /// 返回新建的 `PartFileOut`（含 id）。
     ///
-    /// ⚠️ **2026-10-13：HTTP 端点已下线，本方法作为通用上传原语保留。**
-    /// `POST /part-files/`（multipart 上传）随零调用方端点清理下线，前端走
-    /// STS 直传 + `POST /parts/{part_id}/files/confirm`。本方法当前**仅集成测试在用**，
-    /// 见 `tests/files/part_file.rs` 用它铺 fixture —— 删掉要把 17 处调用改写成多行
-    /// `PartFileRepo::create_part_file` + `cos.put_object`，纯工作量零收益。
+    /// ## 2026-10-13 PR1b：本方法是**全仓唯一的上传实现**
+    ///
+    /// 旧的 5 套并存的写法（part 域 `PartService::upload_part_file` /
+    /// `upload_drawing` / `upload_3d_model` + assembly 域
+    /// `AssemblyService::upload_assembly_files` + PR1a 下线的
+    /// `POST /api/v2/part-files/`）全部并到本方法，四者收敛为**一个** HTTP 端点
+    /// `POST /api/v2/files/objects`。详见 `handler.rs` 的端点 doc。
+    ///
+    /// ## ⚠️ 与被删的 `PartService::upload_part_file` 的去重语义差异（本轮裁决）
+    ///
+    /// | | `upload_part_file`（已删） | 本方法（保留） |
+    /// |---|---|---|
+    /// | 去重判据 | `PartFileRepo::get_by_part_kind(owner, kind)` —— **不看内容**，命中即复用旧行 | `get_by_owner_kind_sha(owner, kind, sha)` —— 看内容，**同内容**才复用 |
+    /// | 同 owner+kind 换内容 | 复用旧行并 `PUT` 新对象（DB 仍指旧 key）⇒ 读到的可能是旧内容 | 落新行；撞 `uk_t_part_file_single` 时由 service 映射成 21108 |
+    /// | 同内容不同文件名 | 复用旧行 | 复用旧行（同 sha），返回旧 `original_filename` |
+    ///
+    /// 取舍：**以本方法为准**（它是 files 域 canonical，且 sha 去重能真正省掉一次
+    /// COS PUT）。被判据 `uk_t_part_file_single` 兜住的是「一个 owner 一个 kind 只有
+    /// 一条活跃行」，两条实现的这条不变式其实一致，差别只在**撞的是哪种情况**时报什么。
     #[allow(clippy::too_many_arguments)]
     pub async fn upload_file_for_owner<R: PartFileRepoTrait>(
         &self,
         mut repo: R,
+        cfg_upload_prefix: &str,
         owner_kind: &str,
         owner_id: i64,
         kind: &str,
@@ -147,7 +174,9 @@ impl PartFileService {
 
         // 6. 上传 COS（2026-09-29 扁平化：key 模板五段→两段 `{prefix}{sha16}_{safe_filename}`，
         //    owner_kind/owner_id/KIND 信息已在 t_part_file DB 行外键索引，不再写进 key）。
-        let object_key = cos_key::build_cas_key("", &sha, original_filename);
+        //    2026-10-13 PR1b：prefix 由硬编码 `""` 改为读 `cfg.cos.upload_prefix`
+        //    （缺省 `obj/`）—— 上传写入与读端点的 legacy fallback 共用同一份配置。
+        let object_key = cos_key::build_cas_key(cfg_upload_prefix, &sha, original_filename);
         self.cos
             .put_object(&object_key, bytes.clone(), content_type)
             .await?;
@@ -378,46 +407,49 @@ impl PartFileService {
 // 2026-10-13：`list_part_files_for_owner`（原 `#[allow(dead_code)]`，本就是 0 调用方）
 // 已删除。要列某 owner 的 part_file 直接走 `PartFileRepo::list_by_owner(conn, kind, id)`。
 
-// ===== 2026-09-16 M2-B 业务层：bind_uploaded_file（confirm + batch_create 共享） ==============
+// ===== 2026-09-16 M2-B 业务层：bind_uploaded_file（STS 直传回执） ==============
 //
 // 2026-09-18 注：原 `upload_intents` 业务函数已**删除**（迁移至相关 STS 会话域）。
 // 2026-09-28 备注：相关 STS 会话域整体下线；该函数不再有任何归属。
-// 保留 `bind_uploaded_file` 给 confirm handler + batch_create service 共用：
-// head/copy 在 tx 之外，事务内只做 soft_delete + INSERT。
+// 2026-10-13 PR1b：调用方只剩本子模块的 confirm 端点 handler（原 part 域
+// `part/handler/batch.rs::confirm_part_file` 随端点搬来）。part 域
+// `service/batch.rs::prepare_binding_head_copy` **不**调本方法 —— 它自带一份
+// head/copy 预处理（DB 写入由 batch_create 第二遍在事务内做），只共用
+// `util::cos_key::build_cas_key` 与 `dto::validate` 两处 helper。
 //
 // 2026-09-22 重构说明：本方法是「事务由 service 自管」的特例——
-// - 调用方：`part/handler/batch.rs::confirm_part_file`（part 域，不在本 worktree 范围）
-//   + `part/service/batch.rs::prepare_binding_head_copy`（part 域，同样不在范围）。
-// - 两者当前都是 `PartFileService::bind_uploaded_file(...)` 静态调用风格（无 `&self`）。
-// - 为避免改动 part 域（spec §禁区 #7：禁止碰其他 13 域），本方法保持原签名
-//   （pool / snowflake / cos 全部参数化），由 service 自行 `pool.begin()` 开 tx；
-//   tx 内 DB 操作仍走 trait 模式（`&mut *tx` 直接喂给 `PartFileRepoTrait`）。
-// - 这是 handler 移交事务范式的**唯一例外**，余下 5 个 part_file 端点
-//   （upload/list/get_url/get_content/soft_delete）均按 handler 管 tx 范式改造。
+// - 调用方是 confirm handler，它不开 tx（head/copy 是外部 IO，不该包在事务里）。
+// - 本方法保持原签名（pool / snowflake / cos 全部参数化），由 service 自行
+//   `pool.begin()` 开 tx；tx 内 DB 操作仍走 trait 模式（`&mut *tx` 直接喂给
+//   `PartFileRepoTrait`）。
+// - 这是 handler 移交事务范式的**唯一例外**，余下 6 个 part_file 端点
+//   （upload/list/get_url/get_content/soft_delete/delete）均按 handler 管 tx 范式改造。
 
 impl PartFileService {
-    /// 共享 service：把已上传到 COS tmp 区的一个对象绑定到 owner（INSERT t_part_file）。
+    /// 把已上传到 COS tmp 区的一个对象绑定到 owner（INSERT t_part_file）。
     ///
-    /// 调用方：`confirm handler`（T2.6）+ `batch_create service`（T2.7）。
+    /// 调用方：`POST /api/v2/files/objects/confirm` 的 handler。
     ///
     /// 流程：
-    /// 1. `tmp_key` 前缀防呆：必须以 `cfg_tmp_prefix` 开头（防客户端乱传 key 读到别人文件）
-    /// 2. `head_object` 校验对象存在 + size 与声明一致：
+    /// 1. owner 存在性校验（`owner_kind ∈ {PART, ASSEMBLY}`；2026-10-13 PR1b 新增，
+    ///    旧形态 owner 在 path 段恒 PART、无需校验）
+    /// 2. `tmp_key` 前缀防呆：必须以 `cfg_tmp_prefix` 开头（防客户端乱传 key 读到别人文件）
+    /// 3. `head_object` 校验对象存在 + size 与声明一致：
     ///    - 不存在 → `BIZ_PART_FILE_TMP_OBJECT_MISSING` 21114
     ///    - size 不一致 → `BIZ_PART_FILE_SIZE_MISMATCH` 21115
-    /// 3. 派生 CAS key：`util::cos_key::build_cas_key(prefix, "part", owner_id, kind, sha16, filename)`
-    /// 4. `cos.copy_object(tmp_key, cas_key)` —— 走 PermanentCos（不走 STS）
-    /// 5. copy_object 成功后**立刻 spawn** best-effort delete_object(tmp_key) 早期清理
-    /// 6. 开 tx：soft_delete 旧活跃行（`uk_t_part_file_single` 部分唯一约束） + INSERT 新行
-    /// 7. commit
-    /// 8. 返回 `(PartFileOut, tmp_key)` —— caller 拿到 tmp_key 后**已 commit**，再
+    /// 4. 派生 CAS key：`util::cos_key::build_cas_key(prefix, sha16, filename)`
+    /// 5. `cos.copy_object(tmp_key, cas_key)` —— 走 PermanentCos（不走 STS）
+    /// 6. copy_object 成功后**立刻 spawn** best-effort delete_object(tmp_key) 早期清理
+    /// 7. 开 tx：soft_delete 旧活跃行（`uk_t_part_file_single` 部分唯一约束） + INSERT 新行
+    /// 8. commit
+    /// 9. 返回 `(PartFileOut, tmp_key)` —— caller 拿到 tmp_key 后**已 commit**，再
     ///    spawn 异步 delete_object(tmp_key) 兜底清理
     ///
     /// **重要**：head/copy 是外部 IO，**不**放进事务 tx 里——tx 里只做 DB（事务回滚时
-    /// IO 已发生难恢复），依赖 5 / 8 两层 spawn 双层防护。
+    /// IO 已发生难恢复），依赖 6 / 9 两层 spawn 双层防护。
     ///
     /// 注：pool 直接传（不是 `&mut tx`）—— head/copy 用 pool 直连，确保与 tx 隔离。
-    /// 本方法自管 tx（part 域 caller 不开 tx），不依赖 handler 借连接——是事务范式的
+    /// 本方法自管 tx（handler 不开 tx），不依赖 handler 借连接——是事务范式的
     /// 唯一例外（详见模块 doc-comment）。
     #[allow(clippy::too_many_arguments)]
     pub async fn bind_uploaded_file(
@@ -426,6 +458,7 @@ impl PartFileService {
         cos: Arc<dyn CosClient>,
         cfg_upload_prefix: &str,
         cfg_tmp_prefix: &str,
+        owner_kind: &str,
         owner_id: i64,
         kind: &str,
         tmp_key: &str,
@@ -437,6 +470,12 @@ impl PartFileService {
     ) -> Result<(PartFileOut, String), AppError> {
         // 1. 权限（按 kind 派生：DRAWING / 3D_MODEL → M+C；与 multipart 端点一致）
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
+        // 1b. owner 存在性（2026-10-13 PR1b 新增：owner 改由 body 携带，见 dto::ConfirmFileIn）
+        {
+            let mut conn = pool.acquire().await?;
+            let mut repo: &mut sqlx::PgConnection = &mut conn;
+            Self::assert_owner_exists(&mut repo, owner_kind, owner_id).await?;
+        }
 
         // 2. 字段校验（kind/sha/filename/size/content_type）
         let max_file_size = 300 * 1024 * 1024usize;
@@ -512,8 +551,10 @@ impl PartFileService {
 
         // 7. 开 tx：soft_delete 旧 + INSERT 新 + readback（事务范式特例：本方法自管 tx）
         let mut tx = pool.begin().await?;
-        // 单文件 kind（DRAWING / 3D_MODEL）下，旧活跃行要先 soft_delete
-        // （`uk_t_part_file_single` 部分唯一约束）。
+        // 单文件 kind（DRAWING / 3D_MODEL / ASSEMBLY_MASTER / CAD_2D）下，旧活跃行
+        // 要先 soft_delete（`uk_t_part_file_single` 部分唯一约束，谓词按
+        // `(part_id, kind)` 走 —— 2026-10-13 PR1b 起 owner 可能是 ASSEMBLY，但该列
+        // 装的就是 owner id，故这行 SQL 对两种 owner 等价）。
         let mut repo: &mut sqlx::PgConnection = &mut tx;
         let _ = PartFileRepoTrait::soft_delete_active_by_part_kind(
             &mut repo, owner_id, current.id, kind,
@@ -525,7 +566,7 @@ impl PartFileService {
             NewPartFile {
                 id: new_id,
                 part_id: owner_id,
-                owner_kind: "PART",
+                owner_kind,
                 kind,
                 file_type,
                 object_key: &cas_key,
@@ -549,7 +590,7 @@ impl PartFileService {
         let row = PartFileRepoTrait::get_by_id(&mut repo, new_id, true)
             .await?
             .ok_or_else(|| AppError::internal("刚 INSERT 的 part_file 查不到"))?;
-        let out = Self::render_out(&row, "PART");
+        let out = Self::render_out(&row, owner_kind);
         tx.commit().await?;
 
         Ok((out, tmp_key.to_string()))
@@ -571,7 +612,7 @@ pub struct PartFileContent {
 }
 
 impl PartFileService {
-    /// `GET /api/v2/part-files/{file_id}/content`。
+    /// `GET /api/v2/files/objects/{file_id}/content`。
     ///
     /// 2026-09-29 扁平化：与 `get_file_with_url` 同款 legacy→新模板 fallback，
     /// 详见 `resolve_effective_key`。
@@ -609,7 +650,7 @@ impl PartFileService {
         })
     }
 
-    /// `POST /api/v2/part-files/{file_id}/delete`。
+    /// `POST /api/v2/files/objects/{file_id}/delete`。
     ///
     /// 权限：按 `kind` 派生（DRAWING / 3D_MODEL / CAD_2D / SETUP_SHEET → M+C；
     /// G_CODE → M+CNC）。

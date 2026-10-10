@@ -12,6 +12,12 @@
 //! / cos_real_smoke）。2026-10-05 新增 `inspection` 子模块（prod::inspection
 //! 扫码端点 1 端点，服务 tests/production/inspection.rs）。
 //!
+//! ⚠️ 2026-10-13：上表里的 `cnc_program` **不再对应独立 binary** —— cnc_program 域收编
+//! 进 `files` 域（`src/modules/files/part_file/cnc/`），其原单文件 binary
+//! `tests/cnc_program_api.rs` 随之改名为 `tests/files/cnc.rs` 并入 `files` binary。
+//! 子模块本身保留（`CncProgramFixture` 仍被那 5 个用例使用），只是下面那条「文件名 =
+//! binary 名」的约定对它已不成立。
+//!
 //! ## 子模块命名约定
 //! - 每个子文件名 = 对应 binary 名（如 `part.rs` 服务 `cargo nextest run --filter-binary part`）
 //! - 每个子模块导出 `<Binary>Fixture` struct + `load_<binary>_fixture` 函数

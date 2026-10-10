@@ -1,4 +1,4 @@
-//! part 域批量创建 + 直传 COS confirm handler
+//! part 域批量创建 handler
 //!
 //! 对应：
 //! - `POST /api/v2/parts/batch` —— 批量创建（共享 `customer_id`）；per-item 失败
@@ -6,11 +6,15 @@
 //!   COS 链路，2026-09-16 M2-B 新增）。
 //! - `POST /api/v2/parts/batch-with-pdfs` (multipart) —— 多 PDF 自动派生子件
 //!   （page1 = master + page2..N = children），2026-09-14 Phase 3 完整化。
-//! - `POST /api/v2/parts/{part_id}/files/confirm` —— 直传 COS 链路的"提交绑定"端点：
-//!   客户端 PUT 到 tmp 区成功后，调用本端点把 tmp 对象 copy 到 CAS key +
-//!   INSERT `t_part_file` + 异步清理 tmp 对象。
 //!
-//! ## 错误码
+//! 2026-10-13 PR1b：`POST /api/v2/parts/{part_id}/files/confirm` **自本文件删除**，
+//! 硬切为 `POST /api/v2/files/objects/confirm`（**无 alias，旧路径 404**），
+//! handler 与 service 调用一并搬进 `files::part_file::handler`。⚠️ 本域仍保留
+//! `POST /parts/batch` 的 **bindings 分支**（`service/batch.rs::
+//! prepare_binding_head_copy`）—— 它的端点本体是「批量建零件」，文件只是可选入参，
+//! 不是一条独立的文件端点，故刻意留在 part 域。
+//!
+//! ## 错误码（batch 的 bindings 分支）
 //! - 21114 `BIZ_PART_FILE_TMP_OBJECT_MISSING` — head_object 失败（tmp 不存在）
 //! - 21115 `BIZ_PART_FILE_SIZE_MISMATCH` — head size 与声明 size 不一致
 //! - 21108 `BIZ_PART_FILE_DUPLICATE` — 同 part + kind + sha256 撞唯一索引
@@ -19,18 +23,17 @@
 //! - batch_create_parts：head/copy 成功的 tmp_keys **全部** 透出到
 //!   `out.cleanup_tmp_keys`（无论 per-item DB 结果如何），handler commit 后
 //!   **统一** spawn delete 兜底；commit 失败时也 spawn（DB 未持久化时 tmp 必须删）。
-//! - confirm_part_file：commit 后 spawn delete 单个 tmp_key（CAS 已绑定，删 tmp 无害）。
+//! - confirm 端点（同款纪律）的 handler 已搬至 `files::part_file::handler::
+//! confirm_file_object`：commit 后 spawn delete 单个 tmp_key。
 
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Multipart, Path, State};
+use axum::extract::{Multipart, State};
 use serde_json::json;
 
 use crate::auth::rbac::CurrentUser;
 use crate::infra::ws_hub::WsEvent;
-use crate::modules::files::part_file::dto::ConfirmFileIn;
-use crate::modules::files::part_file::vo::PartFileOut;
 use crate::modules::part::dto_crud::{BatchWithPdfsRequest, PartBatchCreateRequest};
 use crate::modules::part::service::PartService;
 use crate::modules::part::vo::{PartBatchCreateOut, PartDetailOut};
@@ -142,57 +145,6 @@ pub async fn batch_create_parts(
         Ok((out, _keys)) => Ok(Json(R::ok(out))),
         Err((e, _keys)) => Err(e),
     }
-}
-
-/// `POST /api/v2/parts/{part_id}/files/confirm`
-///
-/// 直传 COS 链路的"提交绑定"端点：客户端 PUT 到 tmp 区成功后，调用本端点把
-/// tmp 对象 copy 到 CAS key + INSERT `t_part_file` + 异步清理 tmp 对象。
-///
-/// 流程：
-/// 1. 权限（service 内 `require_any_role(Manager + Clerk)`，按 kind 派生）
-/// 2. 入参校验（kind / sha / filename / size / content_type）
-/// 3. `PartFileService::bind_uploaded_file` —— head/copy 在 pool（不在 tx），
-///    tx 内只做 soft_delete 旧 + INSERT 新
-/// 4. **commit 后** spawn 异步 `cos.delete_object(tmp_key)` 兜底清理（与
-///    `soft_delete_part_file` 模式一致，避免 commit 失败却触发 COS 删除）
-///
-/// 2026-09-16 M2-B 新增。
-pub async fn confirm_part_file(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(part_id): Path<i64>,
-    Json(req): Json<ConfirmFileIn>,
-) -> Result<Json<R<PartFileOut>>, AppError> {
-    let (out, tmp_key) =
-        crate::modules::files::part_file::service::PartFileService::bind_uploaded_file(
-            &state.pool,
-            &state.snowflake,
-            state.cos.clone(),
-            &state.config.cos.upload_prefix,
-            &state.config.cos.tmp_prefix,
-            part_id,
-            &req.kind,
-            &req.tmp_key,
-            &req.content_sha256,
-            &req.original_filename,
-            req.file_size,
-            &req.content_type,
-            &current,
-        )
-        .await?;
-    // commit 已由 service 内 `tx.commit()` 完成；这里 spawn 异步清理 tmp
-    let cos = state.cos.clone();
-    tokio::spawn(async move {
-        if let Err(e) = cos.delete_object(&tmp_key).await {
-            tracing::warn!(
-                tmp_key = %tmp_key,
-                error = %e,
-                "confirm_part_file COS tmp 异步清理失败（已绑定到 part_file，不影响 API 返回）"
-            );
-        }
-    });
-    Ok(Json(R::ok(out)))
 }
 
 /// `POST /api/v2/parts/batch-with-pdfs` (multipart)

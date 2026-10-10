@@ -3,12 +3,12 @@
 //! 对齐 Python 后端 `core/_file_kind_policy.py`（2026-09-11 新增）。
 //!
 //! ## 用途
-//! - service 层 `upload_part_file` 通用函数在落库前做扩展名校验：
+//! - service 层 `upload_file_for_owner` 通用函数在落库前做扩展名校验：
 //!   1. 取扩展名（`ext_of`），缺扩展名 → 拒绝
 //!   2. 在 `allowed_exts(kind)` 白名单内 → 否则拒绝
 //!   3. `content_type` 在 `expected_content_types_for_ext(&ext)` 白名单内 → 否则拒绝
-//! - file_type 由 `file_type_for_ext(&ext)` 推导（`step`/`stp` → `"STEP"` 等）
-//!   避免 `upload_3d_model` 在 service 里再写一遍映射。
+//! - file_type 由 `file_type_for_ext(&ext)` 推导（`step`/`stp` → `"STEP"` 等），
+//!   避免调用方在 service 里再写一遍映射。
 
 use std::path::Path;
 
@@ -16,11 +16,24 @@ use std::path::Path;
 ///
 /// 扩展名作为静态切片返回，service 层用 `contains` 判断。
 ///
+/// 2026-10-13 **新增 `ASSEMBLY_MASTER`**：上传四合一（`POST /files/objects`
+/// 同时承接 part 与 assembly 两条 owner）之后，装配件 PDF 也走
+/// `upload_file_for_owner`，而本白名单原先**只认 DRAWING / 3D_MODEL** ⇒
+/// `owner_kind=ASSEMBLY` 的上传会一律撞 21102。取值 `&["pdf"]` 与被删的
+/// `AssemblyService::upload_assembly_files` 的判定（`ext != "pdf"` 即拒）逐字等价。
+/// 连带效果：`dto::validate::check_kind` 此前会把 `ASSEMBLY_MASTER` 判成「未知 kind」
+/// 一并拒掉，`POST /files/objects/confirm` 现在也接受该 kind。
+///
+/// ⚠️ **仍未覆盖**：CAD_2D / G_CODE / SETUP_SHEET 三个 kind 不在本白名单里 ——
+/// 它们只经 CNC 配对端点（`POST /files/cnc/pairs`，走 `cnc/service.rs` 的专用
+/// 分支）写入，不经过本函数，故不受影响。
+///
 /// 2026-09-11 新增
 pub fn allowed_exts(kind: &str) -> &'static [&'static str] {
     match kind {
         "DRAWING" => &["pdf"],
         "3D_MODEL" => &["step", "stp", "iges", "igs", "stl", "obj", "3mf"],
+        "ASSEMBLY_MASTER" => &["pdf"],
         _ => &[],
     }
 }
@@ -111,6 +124,15 @@ mod tests {
         assert!(exts.contains(&"stl"));
         assert!(exts.contains(&"obj"));
         assert!(exts.contains(&"3mf"));
+    }
+
+    #[test]
+    fn allowed_exts_assembly_master_only_pdf() {
+        // 2026-10-13：上传四合一后装配件 PDF 也走 upload_file_for_owner，
+        // 该白名单必须认 ASSEMBLY_MASTER，否则 assembly owner 的上传一律 21102。
+        assert_eq!(allowed_exts("ASSEMBLY_MASTER"), &["pdf"]);
+        // 与被删的 upload_assembly_files 判定逐字等价：只收 PDF
+        assert!(!allowed_exts("ASSEMBLY_MASTER").contains(&"step"));
     }
 
     #[test]

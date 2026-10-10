@@ -9,6 +9,17 @@
 //! 的 object_key 列重写 + 服务端读端点 `resolve_effective_key` fallback
 //! 双层保险。
 //!
+//! ## ⚠️ 2026-10-13：前缀统一到 `obj/` **与本 bin 无关，不要为它跑本 bin**
+//!
+//! 本 bin 处理的只是**段数**（五段→两段），prefix 一律从每行自己的历史 key 里
+//! 解析出来（见 `rewrite_legacy_key`：取「除最后 3 段 owner 信息以外」的全部段），
+//! **没有**任何硬编码的 prefix 常量可同步。2026-10-13 把 `COS_UPLOAD_PREFIX`
+//! 从 `drawings/` 收敛为 `obj/` 之后，历史行的 object_key 仍然有效
+//! —— `PartFileService::resolve_effective_key` 先 `head_object(db_object_key)`
+//! 优先命中，原地不动；只有**新上传**改落 `obj/`。
+//! 若真要把历史行的前缀一并改成 `obj/`，那是「改 key 内容」而非「改段数」，
+//! 需另立脚本并配套迁移 COS 对象，不在本 bin 的职责内。
+//!
 //! ## 运行模式
 //! - `--dry-run`（默认）：SELECT 全表，对每行打印迁移前后 object_key，
 //!   **不 UPDATE**。用于人工核对。

@@ -216,16 +216,22 @@ pub struct CosConfig {
     /// 整体作为 virtual-host 第一段。
     pub endpoint: String,
     pub scheme: String,
-    /// COS 桶内上传前缀（保留兼容 .env 旧值）。
+    /// COS 桶内上传前缀（env `COS_UPLOAD_PREFIX`，`.env.example` 缺省 `obj/`）。
     ///
     /// 2026-09-29 扁平化：CAS key 模板已从五段简化为两段
-    /// `{prefix}{sha16}_{safe_filename}`，新模板的 prefix 仅在新 key 写入路径
-    /// (`util::cos_key::build_cas_key`) 使用一次。后续会切到 bin 迁移历史 DB
-    /// 行的 object_key 后彻底删除（迁移 bin 见 §cos_key_migrate.rs）。
+    /// `{prefix}{sha16}_{safe_filename}` —— prefix 只在新 key 的写入路径
+    /// (`util::cos_key::build_cas_key`) 与读端点的 legacy fallback
+    /// (`PartFileService::resolve_effective_key`) 各用一次。
     ///
-    /// 当前阶段：保留 `upload_prefix` 字段以兼容 .env / tests 的 `uploads` 或
-    /// `uploads/` 旧值不报错，标记 `dead_code` 允许编译器跳过 unused 警告。
-    #[allow(dead_code)]
+    /// 2026-10-13：字段**恢复为活字段**（去掉 `#[allow(dead_code)]`）。此前它是死字段
+    /// 的原因是 `upload_file_for_owner` 把 prefix 硬编码成 `""`（新对象落桶根），
+    /// 而 part 域那条上传路径在读配置 —— 两套并存导致同一张表的对象一半在 `drawings/`
+    /// 一半在桶根。本轮把那处硬编码改成读本字段，两个写入点就此统一。
+    ///
+    /// ⚠️ **改本字段不需要数据迁移**：`t_part_file.object_key` 存的是**完整 key**，
+    /// 读端点先 `head_object(db_object_key)` 优先命中 ⇒ 历史对象原地不动，
+    /// 只是新上传改落新前缀。别为此跑 `src/bin/cos_key_migrate.rs`（那是 2026-09-29
+    /// 五段→两段的迁移，与前缀无关）。
     pub upload_prefix: String,
     pub presign_expire_seconds: u32,
     pub max_file_size: usize,
@@ -532,7 +538,10 @@ impl AppConfig {
                     app_id: env_or("COS_APP_ID", ""),
                     endpoint: env_or("COS_ENDPOINT", ""),
                     scheme: env_or("COS_SCHEME", "https"),
-                    upload_prefix: env_or("COS_UPLOAD_PREFIX", "uploads"),
+                    // 2026-10-13：缺省值与 `.env.example` / compose 的
+                    // `COS_UPLOAD_PREFIX` 同步为 `obj/`（此前是 `uploads`，与
+                    // `.env` 的 `drawings/` 又不同 —— 前缀三套并存正是本轮要收敛的）。
+                    upload_prefix: env_or("COS_UPLOAD_PREFIX", "obj/"),
                     presign_expire_seconds: env_parse("COS_PRESIGN_EXPIRE", 3600)?,
                     max_file_size: env_parse("COS_MAX_FILE_SIZE", 300 * 1024 * 1024)?,
                     // 2026-09-20 迁移：删 `sts_duration_seconds` 字段（spike 已记

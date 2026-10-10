@@ -2,7 +2,8 @@
 //!
 //! 覆盖 12 个新端点 + 4 个 lifecycle 流转：
 //!   - list / detail / create / batch_create / update / soft_delete
-//!   - upload-drawing (multipart 单独 #[ignore])
+//!   - 上传（2026-10-13 PR1b：端点已迁往 `POST /api/v2/files/objects`，本文件
+//!     剩下的 4 条 `#[ignore]` 用例改调 `PartFileService::upload_file_for_owner`）
 //!   - by-serial / deliver / cancel / complete / start-repair
 //!
 //! ## 并行 / 认证
@@ -14,8 +15,10 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 
+use hsh_erp_rust::infra::cos::NoopCos;
 use hsh_erp_rust::modules::files::part_file::policy;
 use hsh_erp_rust::modules::files::part_file::repo::PartFileRepo;
+use hsh_erp_rust::modules::files::part_file::service::PartFileService;
 use hsh_erp_rust::modules::part::service::PartService;
 use hsh_erp_rust::shared::error::code;
 use hsh_erp_test_support::*;
@@ -1467,18 +1470,29 @@ async fn cancel_delivery_note_locked_409() {
 }
 
 // ===========================================================================
-//  Tests — Part 6: upload-drawing (multipart, #[ignore] for this round)
+//  Tests — Part 6.5: 上传 service 层
+//
+//  ⚠️ 2026-10-13 PR1b：原 5 条用例直调 `PartService::upload_drawing` /
+//  `upload_3d_model`，两条 service 方法随端点 `POST /parts/{id}/upload-drawing` /
+//  `upload-3d-model` 下线一并删除（上传并入 `POST /api/v2/files/objects`）。
+//  下面改调 files 域的唯一上传实现 `PartFileService::upload_file_for_owner`。
+//
+//  三点差异（原用例的断言口径已随之改写，见各条注释）：
+//  1. CAS key 前缀由测试自造的 `UPLOAD_UPLOAD_PREFIX` 提供（生产读
+//     `config.cos.upload_prefix`）；两段模板 `{prefix}{sha16}_{safe_filename}`
+//     自 2026-09-29 起就是这样，本组用例的 `uploads/part/{id}/DRAWING/`
+//     五段断言是**陈旧的**，一并更正。
+//  2. 出参从 `TPartFile` 变成 `PartFileOut`（`part_id` 字段名改为 `owner_id`，
+//     多出 `owner_kind` / `version` / `created_at` 等）。
+//  3. 这 5 条**仍是 `#[ignore]` 占位**（2026-09-11 起就如此，非本轮引入）。
+//     真正跑得起来的上传覆盖在 `tests/files/part_file.rs` 与
+//     `tests/files/upload.rs`（本组留着是为了保留「零件维度上传」这条意图的
+//     现场记录；哪天要复活，改调点已经指向正确实现）。
 // ===========================================================================
 
-#[tokio::test]
-#[ignore = "multipart body 构造需 reqwest client，本轮占位"]
-async fn upload_drawing_integration() {
-    // 占位
-}
-
-// ===========================================================================
-//  Tests — Part 6.5: 上传 service 层（2026-09-11 新增）
-// ===========================================================================
+/// 上传 CAS key 的 cfg 前缀（测试自造；生产读 `config.cos.upload_prefix`，
+/// 2026-10-13 起缺省 `obj/`）。与 `tests/files/part_file.rs` 的同名常量同款。
+const UPLOAD_UPLOAD_PREFIX: &str = "uploads";
 
 /// 构造 Manager 角色 CurrentUser（service 层直调需要 current 参数）
 fn manager_current(id: i64) -> hsh_erp_rust::auth::rbac::CurrentUser {
@@ -1508,43 +1522,43 @@ async fn upload_drawing_service_integration() {
     let pool = test_pool().await;
     let fx = load_part_fixture(&pool).await;
 
-    let state = test_state_with_disabled_session(pool.clone());
-    // 2026-10-09：原为 `new(1_577_836_800_000, 99)`，行尾注释写「99 区分测试进程」——
-    // 该说法已失效：instance 不同确实位段不同、不会撞，但它是次优权宜之计（instance
-    // 仅 10 bit = 1024 槽）。现直接传共享 generator 的引用。
-
     // fixture 不预置 part（避免 PENDING 状态污染 list_parts_basic 等期望空库测试）；
     // 这里动态插一个 PENDING part 给 service upload 用。
     let part_id = insert_part(&pool, "P-DRAW", fx.customer_l2_id, None, "PENDING").await;
+    let cos = std::sync::Arc::new(NoopCos);
 
     let bytes = fake_pdf_bytes();
-    let mut conn = state.pool.begin().await.unwrap();
-    let pf = PartService::upload_drawing(
-        &mut *conn,
-        shared_test_snowflake().as_ref(),
-        &state,
-        part_id,
-        &bytes,
-        "drawing.pdf",
-        "application/pdf",
-        &manager_current(1),
-    )
-    .await
-    .expect("upload_drawing 应成功");
+    let mut conn = pool.begin().await.unwrap();
+    let pf = PartFileService::new(shared_test_snowflake().clone(), cos)
+        .upload_file_for_owner(
+            &mut *conn,
+            UPLOAD_UPLOAD_PREFIX,
+            "PART",
+            part_id,
+            "DRAWING",
+            "drawing.pdf",
+            "application/pdf",
+            bytes.clone(),
+            &manager_current(1),
+        )
+        .await
+        .expect("上传图纸应成功");
     conn.commit().await.unwrap();
 
     assert_eq!(pf.kind, "DRAWING");
     assert_eq!(pf.file_type, "PDF");
-    assert_eq!(pf.part_id, part_id);
+    assert_eq!(pf.owner_id, part_id);
+    assert_eq!(pf.owner_kind, "PART");
     assert_eq!(pf.original_filename, "drawing.pdf");
     assert_eq!(pf.file_size, bytes.len() as i64);
     assert_eq!(pf.content_type, "application/pdf");
     assert_eq!(pf.upload_status, "READY");
     assert!(pf.content_sha256.is_some());
+    // 2026-10-13：两段模板 `{prefix}{sha16}_{safe_filename}`（原断言写的
+    // `uploads/part/{id}/DRAWING/` 是 2026-09-29 扁平化**之前**的形态）
     assert!(
-        pf.object_key
-            .starts_with(&format!("uploads/part/{part_id}/DRAWING/")),
-        "CAS key 格式不符: {}",
+        pf.object_key.starts_with("uploads/"),
+        "CAS key 应带 cfg 前缀: {}",
         pf.object_key
     );
     assert!(pf.object_key.ends_with("_drawing.pdf"));
@@ -1561,36 +1575,34 @@ async fn upload_drawing_service_integration() {
 async fn upload_3d_model_service_integration() {
     let pool = test_pool().await;
     let fx = load_part_fixture(&pool).await;
-
-    let state = test_state_with_disabled_session(pool.clone());
+    let cos = std::sync::Arc::new(NoopCos);
 
     let part_id = insert_part(&pool, "P-3D", fx.customer_l2_id, None, "PENDING").await;
 
     let bytes = fake_step_bytes();
-    let mut conn = state.pool.begin().await.unwrap();
-    let pf = PartService::upload_3d_model(
-        &mut *conn,
-        shared_test_snowflake().as_ref(),
-        &state,
-        part_id,
-        &bytes,
-        "bracket.step",
-        "application/step",
-        &manager_current(1),
-    )
-    .await
-    .expect("upload_3d_model 应成功");
+    let mut conn = pool.begin().await.unwrap();
+    let pf = PartFileService::new(shared_test_snowflake().clone(), cos)
+        .upload_file_for_owner(
+            &mut *conn,
+            UPLOAD_UPLOAD_PREFIX,
+            "PART",
+            part_id,
+            "3D_MODEL",
+            "bracket.step",
+            "application/step",
+            bytes.clone(),
+            &manager_current(1),
+        )
+        .await
+        .expect("上传 3D 模型应成功");
     conn.commit().await.unwrap();
 
     assert_eq!(pf.kind, "3D_MODEL");
     assert_eq!(pf.file_type, "STEP");
-    assert_eq!(pf.part_id, part_id);
+    assert_eq!(pf.owner_id, part_id);
     assert_eq!(pf.original_filename, "bracket.step");
     assert_eq!(pf.file_size, bytes.len() as i64);
-    assert!(
-        pf.object_key
-            .starts_with(&format!("uploads/part/{part_id}/3D_MODEL/"))
-    );
+    assert!(pf.object_key.starts_with("uploads/"));
     assert!(pf.object_key.ends_with("_bracket.step"));
 
     let row = PartFileRepo::get_by_part_kind(&pool, part_id, "3D_MODEL")
@@ -1606,22 +1618,24 @@ async fn upload_3d_model_service_integration() {
 async fn upload_bad_extension_rejected() {
     let pool = test_pool().await;
     let fx = load_part_fixture(&pool).await;
-    let state = test_state_with_disabled_session(pool.clone());
+    let cos = std::sync::Arc::new(NoopCos);
     let part_id = insert_part(&pool, "P-BAD", fx.customer_l2_id, None, "PENDING").await;
 
-    let mut conn = state.pool.begin().await.unwrap();
-    let err = PartService::upload_drawing(
-        &mut *conn,
-        shared_test_snowflake().as_ref(),
-        &state,
-        part_id,
-        b"junk".to_vec().as_slice(),
-        "evil.step",
-        "application/step",
-        &manager_current(1),
-    )
-    .await
-    .expect_err("应被扩展名白名单拦截");
+    let mut conn = pool.begin().await.unwrap();
+    let err = PartFileService::new(shared_test_snowflake().clone(), cos)
+        .upload_file_for_owner(
+            &mut *conn,
+            UPLOAD_UPLOAD_PREFIX,
+            "PART",
+            part_id,
+            "DRAWING",
+            "evil.step",
+            "application/step",
+            b"junk".to_vec(),
+            &manager_current(1),
+        )
+        .await
+        .expect_err("应被扩展名白名单拦截");
     conn.rollback().await.unwrap();
 
     assert_eq!(
@@ -1636,22 +1650,24 @@ async fn upload_bad_extension_rejected() {
 async fn upload_content_type_mismatch_rejected() {
     let pool = test_pool().await;
     let fx = load_part_fixture(&pool).await;
-    let state = test_state_with_disabled_session(pool.clone());
+    let cos = std::sync::Arc::new(NoopCos);
     let part_id = insert_part(&pool, "P-CT", fx.customer_l2_id, None, "PENDING").await;
 
-    let mut conn = state.pool.begin().await.unwrap();
-    let err = PartService::upload_drawing(
-        &mut *conn,
-        shared_test_snowflake().as_ref(),
-        &state,
-        part_id,
-        b"junk".to_vec().as_slice(),
-        "drawing.pdf",
-        "image/png",
-        &manager_current(1),
-    )
-    .await
-    .expect_err("应被 content_type 校验拦截");
+    let mut conn = pool.begin().await.unwrap();
+    let err = PartFileService::new(shared_test_snowflake().clone(), cos)
+        .upload_file_for_owner(
+            &mut *conn,
+            UPLOAD_UPLOAD_PREFIX,
+            "PART",
+            part_id,
+            "DRAWING",
+            "drawing.pdf",
+            "image/png",
+            b"junk".to_vec(),
+            &manager_current(1),
+        )
+        .await
+        .expect_err("应被 content_type 校验拦截");
     conn.rollback().await.unwrap();
 
     assert_eq!(err.code(), code::BIZ_PART_FILE_BAD_TYPE);

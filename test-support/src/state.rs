@@ -153,7 +153,7 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
         bootstrap_admin_enabled: false,
         // 2026-09-28 新增：rust → python 后端转发配置（薄壳鉴权转发 STS）。
         // 测试默认 `enabled=false` 走 Noop；需要 mock 的测试 fixture 走
-        // `Arc::make_mut` 局部 patch 或自构 AppState（详见 `tests/files_sts_tmp_keys.rs`）。
+        // `Arc::make_mut` 局部 patch 或自构 AppState（详见 `tests/files/sts.rs`）。
         python_backend: PythonBackendConfig::default(),
         // 2026-09-29 新增：企业微信登录配置默认未配置（enabled=false）。
         wecom: WeComConfig::default(),

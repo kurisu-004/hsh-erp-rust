@@ -17,12 +17,20 @@
 //!  13. old_part_files_prefix_returns_404 — 硬切守卫（2026-10-13 新增）
 //!  14. old_part_files_numeric_path_returns_404 — 硬切守卫（2026-10-13 新增）
 //!  15. old_cnc_programs_prefix_returns_404 — 硬切守卫（2026-10-13 新增）
+//!  16. old_part_upload_drawing_returns_404 — PR1b 硬切守卫（part 侧上传）
+//!  17. old_part_upload_3d_model_returns_404 — PR1b 硬切守卫（part 侧 3D 上传）
+//!  18. old_part_files_confirm_returns_404 — PR1b 硬切守卫（confirm 搬家）
+//!  19. old_assembly_files_returns_404 — PR1b 硬切守卫（assembly 侧 POST + GET）
 //!
 //! ## 集成策略
 //! 主体是**直接 service 直调**（避免 JWT/Redis 开销）：`pool.begin()` 开 tx →
 //! 传 `&mut *tx` 给 service → 显式 `tx.commit()`。
-//! 例外是末尾 3 条**硬切守卫**（2026-10-13）：它们打的是真实 HTTP 路由，
-//! 断言旧前缀 404 —— 这是 URL 硬切的回归护栏，service 直调结构上测不到。
+//! 例外是末尾 7 条**硬切守卫**（2026-10-13 PR1a 3 条 + PR1b 4 条）：它们打的是真实
+//! HTTP 路由，断言旧前缀 404 —— 这是 URL 硬切的回归护栏，service 直调结构上测不到。
+//!
+//! ⚠️ 2026-10-13 PR1b：`upload_file_for_owner` / `bind_uploaded_file` 各多收一个
+//! 形参（前者的 cfg 前缀、后者的 `owner_kind`），本文件全部调用点已同步。
+//! 装配件 owner（`owner_kind=ASSEMBLY`）的上传用例在 `upload.rs`。
 //!
 //! ## 2026-10-13 随端点下线删除的用例
 //! `rbac_shelf_account_rejects_part_nested_lists` —— 它断言的是零件维度三条嵌套列表
@@ -152,6 +160,7 @@ async fn upload_pdf_happy_path() {
     let out = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_file_for_owner(
             &mut *tx,
+            UPLOAD_UPLOAD_PREFIX,
             "PART",
             part_id,
             "DRAWING",
@@ -189,6 +198,7 @@ async fn upload_invalid_kind_returns_21102() {
     let err = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_file_for_owner(
             &mut *tx,
+            UPLOAD_UPLOAD_PREFIX,
             "PART",
             part_id,
             "DRAWING", // DRAWING 不接受 step
@@ -224,6 +234,7 @@ async fn upload_cas_dedup_skips_cos() {
     let out1 = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_file_for_owner(
             &mut *tx,
+            UPLOAD_UPLOAD_PREFIX,
             "PART",
             part_id,
             "DRAWING",
@@ -241,6 +252,7 @@ async fn upload_cas_dedup_skips_cos() {
     let out2 = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_file_for_owner(
             &mut *tx,
+            UPLOAD_UPLOAD_PREFIX,
             "PART",
             part_id,
             "DRAWING",
@@ -270,6 +282,7 @@ async fn upload_owner_not_found_returns_21105() {
     let err = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_file_for_owner(
             &mut *tx,
+            UPLOAD_UPLOAD_PREFIX,
             "PART",
             nonexistent,
             "DRAWING",
@@ -302,6 +315,7 @@ async fn rbac_inspector_can_upload_returns_403() {
     let err = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_file_for_owner(
             &mut *tx,
+            UPLOAD_UPLOAD_PREFIX,
             "PART",
             part_id,
             "DRAWING",
@@ -348,6 +362,7 @@ async fn list_filter_by_kind() {
         PartFileService::new(shared_test_snowflake().clone(), cos.clone())
             .upload_file_for_owner(
                 &mut *tx,
+                UPLOAD_UPLOAD_PREFIX,
                 "PART",
                 part_id,
                 kind,
@@ -393,6 +408,7 @@ async fn get_url_returns_presigned_url() {
     let out = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_file_for_owner(
             &mut *tx,
+            UPLOAD_UPLOAD_PREFIX,
             "PART",
             part_id,
             "DRAWING",
@@ -524,6 +540,7 @@ async fn content_happy_path() {
     let out = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_file_for_owner(
             &mut *tx,
+            UPLOAD_UPLOAD_PREFIX,
             "PART",
             part_id,
             "DRAWING",
@@ -568,6 +585,7 @@ async fn soft_delete_happy_path() {
     let out = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_file_for_owner(
             &mut *tx,
+            UPLOAD_UPLOAD_PREFIX,
             "PART",
             part_id,
             "DRAWING",
@@ -619,6 +637,7 @@ async fn soft_delete_version_conflict() {
     let out = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_file_for_owner(
             &mut *tx,
+            UPLOAD_UPLOAD_PREFIX,
             "PART",
             part_id,
             "DRAWING",
@@ -667,6 +686,9 @@ async fn confirm_tmp_missing_returns_21114() {
     let tmp_key = "tmp/test/missing.pdf";
     let sha = "c".repeat(64);
     let req = ConfirmFileIn {
+        // 2026-10-13 PR1b：owner 改由 body 携带（旧端点的 part_id 在 path 段）
+        owner_kind: "PART".into(),
+        owner_id: part_id.to_string(),
         kind: "DRAWING".into(),
         tmp_key: tmp_key.into(),
         content_sha256: sha,
@@ -681,6 +703,7 @@ async fn confirm_tmp_missing_returns_21114() {
         cos.clone(),
         UPLOAD_UPLOAD_PREFIX,
         UPLOAD_TMP_PREFIX,
+        "PART",
         part_id,
         &req.kind,
         &req.tmp_key,
@@ -722,6 +745,9 @@ async fn confirm_size_mismatch_returns_21115() {
     cos.set_head(tmp_key, 2048);
     let sha = "d".repeat(64);
     let req = ConfirmFileIn {
+        // 2026-10-13 PR1b：owner 改由 body 携带（旧端点的 part_id 在 path 段）
+        owner_kind: "PART".into(),
+        owner_id: part_id.to_string(),
         kind: "DRAWING".into(),
         tmp_key: tmp_key.into(),
         content_sha256: sha,
@@ -736,6 +762,7 @@ async fn confirm_size_mismatch_returns_21115() {
         cos.clone(),
         UPLOAD_UPLOAD_PREFIX,
         UPLOAD_TMP_PREFIX,
+        "PART",
         part_id,
         &req.kind,
         &req.tmp_key,
@@ -776,6 +803,7 @@ async fn confirm_replace_old_single_returns_ready() {
         cos.clone(),
         UPLOAD_UPLOAD_PREFIX,
         UPLOAD_TMP_PREFIX,
+        "PART",
         part_id,
         "DRAWING",
         tmp_key_1,
@@ -800,6 +828,7 @@ async fn confirm_replace_old_single_returns_ready() {
         cos.clone(),
         UPLOAD_UPLOAD_PREFIX,
         UPLOAD_TMP_PREFIX,
+        "PART",
         part_id,
         "DRAWING",
         tmp_key_2,
@@ -872,6 +901,7 @@ async fn tmp_to_parts_copy_test() {
         cos.clone(),
         UPLOAD_UPLOAD_PREFIX,
         UPLOAD_TMP_PREFIX,
+        "PART",
         part_id,
         "DRAWING",
         tmp_key,
@@ -976,6 +1006,7 @@ async fn rbac_shelf_account_can_list_files() {
     PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_file_for_owner(
             &mut *tx,
+            UPLOAD_UPLOAD_PREFIX,
             "PART",
             part_id,
             "DRAWING",
@@ -1021,6 +1052,7 @@ async fn rbac_shelf_account_can_get_file_content() {
     let uploaded = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_file_for_owner(
             &mut *tx,
+            UPLOAD_UPLOAD_PREFIX,
             "PART",
             part_id,
             "DRAWING",
@@ -1069,6 +1101,7 @@ async fn rbac_shelf_account_get_file_url_still_forbidden() {
     let uploaded = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_file_for_owner(
             &mut *tx,
+            UPLOAD_UPLOAD_PREFIX,
             "PART",
             part_id,
             "DRAWING",
@@ -1123,6 +1156,7 @@ async fn rbac_shelf_account_cannot_upload_or_delete() {
     let up_err = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_file_for_owner(
             &mut *tx,
+            UPLOAD_UPLOAD_PREFIX,
             "PART",
             part_id,
             "DRAWING",
@@ -1144,6 +1178,7 @@ async fn rbac_shelf_account_cannot_upload_or_delete() {
     let uploaded = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_file_for_owner(
             &mut *tx,
+            UPLOAD_UPLOAD_PREFIX,
             "PART",
             part_id,
             "DRAWING",
@@ -1213,6 +1248,7 @@ async fn bootstrap_hardcut_guard() -> (PgPool, axum::Router, String, i64, i64) {
     let out = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .upload_file_for_owner(
             &mut *tx,
+            UPLOAD_UPLOAD_PREFIX,
             "PART",
             part_id,
             "DRAWING",
@@ -1375,6 +1411,229 @@ async fn old_cnc_programs_prefix_returns_404() {
             status,
             StatusCode::NOT_FOUND,
             "旧前缀 {method} /api/v2{uri} 必须 404（硬切无 alias）: {status} {raw}"
+        );
+    }
+}
+
+// ===========================================================================
+//  2026-10-13 PR1b 硬切守卫：part / assembly 侧的文件端点整体下线且无 alias
+//
+//  与上方 PR1a 的三条守卫同源：整段路径消失后**不得落进 catch-all 变 400**。
+//  判据仍是 HTTP 404，且不能被 40100 / 40300 / 400 解释掉 —— 四条都带合法
+//  MANAGER token，且先造出真实的 part / assembly / t_part_file 行，保证「404」
+//  不是「资源本来就不存在」造成的。
+//
+//  覆盖的 5 条旧 URL（`POST|GET /assemblies/{id}/files` 一条端点两种方法）：
+//  - POST /api/v2/parts/{数字}/upload-drawing
+//  - POST /api/v2/parts/{数字}/upload-3d-model
+//  - POST /api/v2/parts/{数字}/files/confirm
+//  - POST /api/v2/assemblies/{数字}/files
+//  - GET  /api/v2/assemblies/{数字}/files
+//
+//  ⚠️ 其中 `POST /parts/{id}/files/confirm` 是 4 段、`upload-*` 是 3 段，而 part 域
+//  的 `/{part_id}` catch-all 只有 **2 段**（`/{part_id}/xxx`），段数够不着 ⇒ matchit
+//  无命中 ⇒ 干净 404。assembly 域的 `/{assembly_id}/files` 是 3 段，**曾经**注册过，
+//  本轮整条从 router 删除后同样落空。若哪天有人加回 catch-all，这四条会当场红。
+// ===========================================================================
+
+/// 为 PR1b 守卫共用的 bootstrap：真实 part + **真实 assembly** + 真实 t_part_file
+/// 行 + MANAGER token。
+///
+/// 比 `bootstrap_hardcut_guard` 多造一个 `t_assembly`：assembly 的两条旧端点挂在
+/// 装配件 id 上，没有真实装配件行时「404」可能被误读成「路由对了、实体没了」。
+async fn bootstrap_pr1b_hardcut_guard() -> (PgPool, axum::Router, String, i64, i64) {
+    use hsh_erp_rust::infra::clock::now_naive;
+    let pool = test_pool().await;
+    let fx = load_part_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+    let token = login_token(&app, &fx.manager_username, PartFixture::PASSWORD).await;
+
+    let l1 = insert_l1_customer(&pool, "客户PF-HardCutB", "F").await;
+    let l2 = insert_l2_customer(&pool, "子客PF-HardCutB", l1).await;
+    let part_id = insert_part_for_owner(&pool, l2).await;
+
+    // 真实装配件行（直接 SQL；assembly 的建单链要 serial_counter，不属本用例关注点）
+    let asm_id = shared_test_snowflake().next_id();
+    let now = now_naive();
+    let today = now.date();
+    sqlx::query(
+        "INSERT INTO t_assembly (id, drawing_no, name, customer_id, request_date, \
+         planned_delivery_date, is_urgent, status, version, \
+         created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, $3, $4, $5, $5, false, 'PENDING', 0, $6, NULL, $6, NULL)",
+    )
+    .bind(asm_id)
+    .bind("DWG-HARDCUT-B")
+    .bind("asm-hardcut-b")
+    .bind(l2)
+    .bind(today)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert t_assembly");
+
+    // 再给装配件造一条真实的 ASSEMBLY_MASTER 文件行（owner_kind=ASSEMBLY）
+    let cos = Arc::new(NoopCos);
+    let mut tx = pool.begin().await.unwrap();
+    PartFileService::new(shared_test_snowflake().clone(), cos)
+        .upload_file_for_owner(
+            &mut *tx,
+            UPLOAD_UPLOAD_PREFIX,
+            "ASSEMBLY",
+            asm_id,
+            "ASSEMBLY_MASTER",
+            "hardcut-master.pdf",
+            "application/pdf",
+            b"%PDF-1.5\nhardcut master\n%%EOF".to_vec(),
+            &test_current_user_with_roles(vec![Role::Manager]),
+        )
+        .await
+        .expect("MANAGER 上传装配件 PDF 应成功");
+    tx.commit().await.unwrap();
+
+    (pool, app, token, part_id, asm_id)
+}
+
+/// `POST /api/v2/parts/{数字}/upload-drawing` → 404（并入 `POST /files/objects`）。
+#[tokio::test]
+async fn old_part_upload_drawing_returns_404() {
+    let (_pool, app, token, part_id, _asm_id) = bootstrap_pr1b_hardcut_guard().await;
+
+    // 正向对照：新端点必须存在（multipart 缺 body → 400/422 业务错误，而不是 404），
+    // 证明守卫打的确实是「旧路径消失」而不是「本域整体坏了」。
+    let (new_status, new_raw) = send_raw(
+        app.clone(),
+        json_request("POST", "/files/objects", Some(json!({})), Some(&token)),
+    )
+    .await;
+    assert_ne!(
+        new_status,
+        StatusCode::NOT_FOUND,
+        "新路径 POST /files/objects 必须命中路由: {new_status} {new_raw:?}"
+    );
+
+    let (status, raw) = send_raw(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/parts/{part_id}/upload-drawing"),
+            Some(json!({})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "旧端点 POST /api/v2/parts/{{part_id}}/upload-drawing 必须 404（硬切无 alias）: {status} {raw}"
+    );
+}
+
+/// `POST /api/v2/parts/{数字}/upload-3d-model` → 404（并入 `POST /files/objects`）。
+#[tokio::test]
+async fn old_part_upload_3d_model_returns_404() {
+    let (_pool, app, token, part_id, _asm_id) = bootstrap_pr1b_hardcut_guard().await;
+
+    let (status, raw) = send_raw(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/parts/{part_id}/upload-3d-model"),
+            Some(json!({})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "旧端点 POST /api/v2/parts/{{part_id}}/upload-3d-model 必须 404（硬切无 alias）: {status} {raw}"
+    );
+}
+
+/// `POST /api/v2/parts/{数字}/files/confirm` → 404（硬切到 `POST /files/objects/confirm`）。
+#[tokio::test]
+async fn old_part_files_confirm_returns_404() {
+    let (_pool, app, token, part_id, _asm_id) = bootstrap_pr1b_hardcut_guard().await;
+
+    // 正向对照：新 confirm 端点必须命中路由（缺字段 → 422 纯文本 / 业务错误）。
+    let (new_status, new_raw) = send_raw(
+        app.clone(),
+        json_request(
+            "POST",
+            "/files/objects/confirm",
+            Some(json!({})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_ne!(
+        new_status,
+        StatusCode::NOT_FOUND,
+        "新端点 POST /files/objects/confirm 必须命中路由: {new_status} {new_raw:?}"
+    );
+
+    let (status, raw) = send_raw(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/parts/{part_id}/files/confirm"),
+            Some(json!({})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "旧端点 POST /api/v2/parts/{{part_id}}/files/confirm 必须 404（硬切无 alias）: {status} {raw}"
+    );
+}
+
+/// `POST|GET /api/v2/assemblies/{数字}/files` → **均** 404（上传并入
+/// `POST /files/objects`；列表等价于 `GET /files/objects?owner_kind=ASSEMBLY&…`）。
+#[tokio::test]
+async fn old_assembly_files_returns_404() {
+    let (_pool, app, token, _part_id, asm_id) = bootstrap_pr1b_hardcut_guard().await;
+
+    // 正向对照：等价的读端点（query 形态）必须 200，证明「装配件文件仍可读」这件事
+    // 没被端点下线误伤 —— 404 守的是**旧路径**，不是这个能力。
+    let (list_status, list_raw) = send_raw(
+        app.clone(),
+        json_request(
+            "GET",
+            &format!("/files/objects?owner_kind=ASSEMBLY&owner_id={asm_id}"),
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        list_status,
+        StatusCode::OK,
+        "新路径 GET /files/objects?owner_kind=ASSEMBLY 应 200（正向对照）: {list_status} {list_raw}"
+    );
+
+    for method in ["POST", "GET"] {
+        let body = if method == "GET" {
+            None
+        } else {
+            Some(json!({}))
+        };
+        let (status, raw) = send_raw(
+            app.clone(),
+            json_request(
+                method,
+                &format!("/assemblies/{asm_id}/files"),
+                body,
+                Some(&token),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "旧端点 {method} /api/v2/assemblies/{{assembly_id}}/files 必须 404（硬切无 alias）: {status} {raw}"
         );
     }
 }

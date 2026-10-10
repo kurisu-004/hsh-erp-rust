@@ -25,6 +25,22 @@ pub struct DeletePartFileRequest {
     pub version: i32,
 }
 
+/// `POST /api/v2/files/objects` multipart 的 `data` 文本字段（JSON 序列化本结构）。
+///
+/// 2026-10-13 PR1b **复活**：本结构在 PR1a 随 `POST /api/v2/part-files/` 端点下线
+/// 一并删除，本轮四合一上传端点（`POST /files/objects`）把它原样接回来 —— 复用旧
+/// 契约，不是新设计。四个旧入口（`upload-drawing` / `upload-3d-model` /
+/// `assemblies/{id}/files` / `POST /part-files/`）现在共用这一个形态。
+#[derive(Debug, Clone, Deserialize)]
+pub struct UploadFileData {
+    pub owner_kind: String, // PART / ASSEMBLY
+    /// 雪花 id 的**字符串**形式（`shared::types` 的 serde helper 约定：i64 主键
+    /// 一律以 string 出入参，防 JS 精度截断）。handler 侧 parse 成 i64 后交给
+    /// service。
+    pub owner_id: String,
+    pub kind: String, // DRAWING / 3D_MODEL / ASSEMBLY_MASTER / CAD_2D / …
+}
+
 // ===== 2026-09-16 M2-B 业务层：ConfirmFileIn（保留） =====
 //
 // 2026-09-18 注：原 `UploadIntentsIn` / `UploadIntentsOut` / `UploadIntentItemIn` /
@@ -32,8 +48,11 @@ pub struct DeletePartFileRequest {
 // 2026-09-28 备注：相关 STS 会话域已下线，前端改为单 uploader 触发时单 HTTP 调用
 // python `sts-tmp-keys` 数组入参直签。本文件不再涉及任何 STS / 会话相关 DTO。
 //
-// confirm 端点（`POST /api/v2/parts/{id}/files/confirm`）仍保留，其入参：
-///
+// confirm 端点仍保留，其入参：
+//
+// 2026-10-13 PR1b：confirm 端点自 part 域 `POST /api/v2/parts/{id}/files/confirm`
+// 搬进本子模块，硬切为 `POST /api/v2/files/objects/confirm`（**无 alias，旧路径 404**）；
+// path 段的 `part_id` 拆成 body 的 `owner_kind` + `owner_id` 两字段。
 /// 2026-09-29 扁平化：新增 `ext` 字段（client 声明）。CAS key 模板五段→两段后，
 /// key 已不再含 owner_kind / owner_id / KIND 段，kind 信息需 client 在 confirm
 /// 时显式回传（其实 kind 已在 ConfirmFileIn 里，但 ext 是新模板隐式依赖的
@@ -41,6 +60,15 @@ pub struct DeletePartFileRequest {
 /// confirm 上行，便于 service 校验 file_type 与 ext 一致）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConfirmFileIn {
+    /// 2026-10-13 PR1b 新增：owner 类别（`PART` / `ASSEMBLY`）。
+    ///
+    /// ⚠️ 旧端点 `POST /api/v2/parts/{part_id}/files/confirm` 的 owner 是 path 段
+    /// 隐含的（恒 PART），搬家到 `POST /api/v2/files/objects/confirm` 后 path 段消失，
+    /// owner 改由 body 显式携带 —— 与同端点群 `POST /files/objects` 的 multipart
+    /// `data.owner_kind` **逐字对称**（同名字段、同取值域、同序列化形态）。
+    pub owner_kind: String,
+    /// 2026-10-13 PR1b 新增：owner 雪花 id 字符串（同上，替代旧 path 段的 `part_id`）。
+    pub owner_id: String,
     pub kind: String,
     pub tmp_key: String,
     pub content_sha256: String,
@@ -291,6 +319,8 @@ mod tests {
     #[test]
     fn check_confirm_file_in_happy_path() {
         let req = ConfirmFileIn {
+            owner_kind: "PART".into(), // 2026-10-13 PR1b 新增字段
+            owner_id: "1001".into(),   // 2026-10-13 PR1b 新增字段
             kind: "3D_MODEL".into(),
             tmp_key: "tmp/batch/seq_step.stp".into(),
             content_sha256: "b".repeat(64),

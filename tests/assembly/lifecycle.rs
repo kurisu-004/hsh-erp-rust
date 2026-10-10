@@ -1,19 +1,16 @@
-//! assembly_files 域集成测试（2026-09-14 Phase 3）
+//! assembly 域**生命周期**集成测试（2026-09-14 Phase 3 建；2026-10-13 PR1b 更名）
 //!
-//! 覆盖 deferred #1（PDF 上传到 COS）、#4（start 端点）、#3（soft_delete HAS_SHIPMENT）、
-//! #2（三态 NULL clear）、#7（child current_batch_id）。
+//! ⚠️ **本文件 2026-10-13 自 `files.rs` 更名**：原文件里两条装配件**文件上传**用例
+//! （`upload_files_happy_path` / `upload_files_ext_must_be_pdf`）随端点
+//! `POST /api/v2/assemblies/{id}/files` 下线迁往 `tests/files/upload.rs`（改测
+//! `PartFileService::upload_file_for_owner`）。剩下的全是生命周期用例，与文件无关，
+//! 故本文件更名为 `lifecycle.rs` —— 叫 `files.rs` 会是一句假陈述。
 //!
-//! 测试用例：
-//!   1. upload_files_happy_path                  — multipart PDF 上传 → 201
-//!   2. upload_files_ext_must_be_pdf             — 扩展名 .step → 21102
-//!   3. upload_files_rbac_clerk_forbidden        — Inspector 无 upload 权限
-//!   4. start_pending_to_in_process              — PENDING → IN_PROCESS
-//!   5. start_invalid_transition_returns_20103   — COMPLETED → IN_PROCESS → 20103
-//!   6. soft_delete_has_shipment_returns_20307   — 子件挂送货单 → 20307
-//!   7. soft_delete_no_shipment_succeeds         — 无挂单 → 成功
-//!   8. three_state_note_clear_to_null           — Some(None) 置 NULL
-//!   9. three_state_note_overwrite               — Some(Some(v)) 覆盖
-//!  10. child_current_batch_id_in_detail         — 子件有活跃 batch → current_batch_id 非空
+//! ## 覆盖场景（文件迁出后剩 4 条）
+//!   1. start_pending_to_in_process              — PENDING → IN_PROCESS
+//!   2. soft_delete_has_shipment_returns_20307   — 子件挂送货单 → 20307
+//!   3. three_state_note_clear_to_null           — Some(None) 置 NULL
+//!   4. child_current_batch_id_in_detail         — 子件有活跃 batch → current_batch_id 非空
 //!
 //! PR13 Phase H（2026-09-24）fixture 范本化：
 //! - 删除 `clean_db` / `clean_business_db` / `ensure_database_exists`（from
@@ -25,19 +22,17 @@
 //! - 本 sub-file 仍保留 `insert_l1_customer` / `insert_l2_customer` /
 //!   `insert_serial_counter` / `make_pdf_bytes` / `make_pdf_2_pages` /
 //!   `seed_assembly` / `test_current_user` 等本地 helper：每测试需要
-//!   assembly 的不同生命周期 / 状态 / 附件。
+//!   assembly 的不同生命周期 / 状态。
 //!
 //! PR-C.Final retry（2026-09-24）：删除 `mod common;` + `use common::test_pool;`，改走
-//! `use hsh_erp_test_support::test_pool;` 直接引入；facade `tests/common/mod.rs` 在 3 个
-//! binary 全部迁移后删除。
+//! `use hsh_erp_test_support::test_pool;` 直接引入。
 //!
-//! 2026-10-09：本文件 8 处用例内 `SnowflakeIdGenerator::new(1_577_836_800_000, 1)`
+//! 2026-10-09：本文件用例内 `SnowflakeIdGenerator::new(1_577_836_800_000, 1)`
 //! 全删 —— 传给 `AssemblyService` 的实参改为 `shared_test_snowflake().as_ref()`，
 //! helper 自取号改为 `shared_test_snowflake().next_id()`。未改任何 `src/` 服务函数签名。
 
 use hsh_erp_rust::auth::rbac::{CurrentUser, Role};
 use hsh_erp_rust::infra::clock::now_naive;
-use hsh_erp_rust::infra::cos::NoopCos;
 use hsh_erp_rust::modules::assembly::dto::AssemblyUpdateRequest;
 use hsh_erp_rust::modules::assembly::service::AssemblyService;
 use hsh_erp_rust::shared::error::AppError;
@@ -197,137 +192,6 @@ async fn seed_assembly(pool: &PgPool) -> (i64, i64, i64) {
 // ===========================================================================
 //  Tests
 // ===========================================================================
-
-#[tokio::test]
-async fn upload_files_happy_path() {
-    let (pool, _fx) = setup().await;
-    let (l1, l2, _) = seed_assembly(&pool).await;
-    let cos = Arc::new(NoopCos);
-
-    // 建一个不传 PDF 的装配体（建单端点仍会派发 serial_no，PDF 只用于页数校验）
-    let mut tx = pool.begin().await.unwrap();
-    let req = hsh_erp_rust::modules::assembly::dto::AssemblyCreateRequest {
-        drawing_no: "D-AF-1".into(),
-        name: "asm-files-1".into(),
-        applicant_name: None,
-        customer_id: l2.to_string(),
-        request_date: None,
-        planned_delivery_date: None,
-        is_urgent: Some(false),
-        quantity: Some(1),
-        unit_price: None,
-        total_price: None,
-        order_no: None,
-        system_delivery_date: None,
-        note: None,
-        children: vec![],
-    };
-    let current = test_current_user(vec![Role::Manager]);
-    let asm = AssemblyService::create_assembly(
-        &mut tx,
-        shared_test_snowflake().as_ref(),
-        &req,
-        vec![],
-        &current,
-    )
-    .await
-    .unwrap();
-    tx.commit().await.unwrap();
-    let asm_id = asm.assembly.id;
-
-    // 上传 PDF
-    let pdf_bytes = make_pdf_bytes();
-    let mut tx = pool.begin().await.unwrap();
-    let out = AssemblyService::upload_assembly_files(
-        &mut tx,
-        shared_test_snowflake().as_ref(),
-        cos,
-        asm_id,
-        vec![(
-            pdf_bytes,
-            "master.pdf".to_string(),
-            "application/pdf".to_string(),
-        )],
-        &current,
-    )
-    .await
-    .expect("upload ok");
-    tx.commit().await.unwrap();
-
-    assert_eq!(out.len(), 1);
-    assert_eq!(out[0].original_filename, "master.pdf");
-
-    // 详情应返回 file
-    let mut tx = pool.begin().await.unwrap();
-    let detail = AssemblyService::get_assembly(&mut tx, asm_id, &current)
-        .await
-        .unwrap();
-    drop(tx);
-    assert_eq!(detail.files.len(), 1);
-    assert_eq!(detail.files[0].original_filename, "master.pdf");
-
-    // 抑制 unused
-    let _ = l1;
-}
-
-#[tokio::test]
-async fn upload_files_ext_must_be_pdf() {
-    let (pool, _fx) = setup().await;
-    let (l1, l2, _) = seed_assembly(&pool).await;
-    let cos = Arc::new(NoopCos);
-
-    let mut tx = pool.begin().await.unwrap();
-    let req = hsh_erp_rust::modules::assembly::dto::AssemblyCreateRequest {
-        drawing_no: "D-AF-2".into(),
-        name: "asm-files-2".into(),
-        applicant_name: None,
-        customer_id: l2.to_string(),
-        request_date: None,
-        planned_delivery_date: None,
-        is_urgent: Some(false),
-        quantity: Some(1),
-        unit_price: None,
-        total_price: None,
-        order_no: None,
-        system_delivery_date: None,
-        note: None,
-        children: vec![],
-    };
-    let current = test_current_user(vec![Role::Manager]);
-    let asm = AssemblyService::create_assembly(
-        &mut tx,
-        shared_test_snowflake().as_ref(),
-        &req,
-        vec![],
-        &current,
-    )
-    .await
-    .unwrap();
-    tx.commit().await.unwrap();
-
-    let mut tx = pool.begin().await.unwrap();
-    let err = AssemblyService::upload_assembly_files(
-        &mut tx,
-        shared_test_snowflake().as_ref(),
-        cos,
-        asm.assembly.id,
-        vec![(
-            b"data".to_vec(),
-            "master.step".to_string(),
-            "application/octet-stream".to_string(),
-        )],
-        &current,
-    )
-    .await
-    .expect_err("非 PDF 扩展名应被拒");
-    drop(tx);
-
-    match err {
-        AppError::Biz { code, .. } => assert_eq!(code, 21102),
-        other => panic!("期望 AppError::Biz(21102)，got {other:?}"),
-    }
-    let _ = l1;
-}
 
 #[tokio::test]
 async fn start_pending_to_in_process() {
