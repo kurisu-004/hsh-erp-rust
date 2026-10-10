@@ -2,9 +2,11 @@
 --
 -- ## 为什么需要这个 migration
 --
--- `t_part_batch` 的三个终态写点（取消 CANCELLED / 强制完成 COMPLETED / 交付
--- DELIVERED）此前**都不清** `location` + `current_holder_id`。于是被判终态的批次
--- 仍以 `location='WORKER' + current_holder_id=<某工人>` 的形态留在表里：
+-- `t_part_batch` 的三个终态状态下共 6 个写点（取消 CANCELLED / 强制完成
+-- COMPLETED / 交付 DELIVERED；逐点清单见 `docs/api/batch.md` §6.1 与
+-- `PartBatchRepo::update` 的函数 doc）此前**都不清** `location` +
+-- `current_holder_id`。于是被判终态的批次仍以
+-- `location='WORKER' + current_holder_id=<某工人>` 的形态留在表里：
 --
 --   - 容量校验（`prod::batch::repo::queries::count_held_by_worker`）把它们**算数**
 --     —— 工人手上的「幽灵批次」永久吃掉 `t_work_type.max_held_batches` 的额度，

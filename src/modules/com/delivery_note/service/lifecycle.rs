@@ -397,8 +397,6 @@ impl DeliveryNoteService {
                 // `part_status_changed && is_terminal(part_target)`，而
                 // `is_terminal` = `COMPLETED | CANCELLED`）。pickup 把该 part
                 // 派生到的是 `DELIVERED` ⇒ 归档分支不可达。
-                // 另：pickup 路径上 repo 层拿不到雪花生成器，按 M4「caller 拿不到
-                // 生成器 ⇒ 传 None」的约定本就该是 `None`。
                 PartService::sync_from_batch_change_with_conn(
                     &mut *repo.conn_mut(),
                     pid,

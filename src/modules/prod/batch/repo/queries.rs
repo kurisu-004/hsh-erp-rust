@@ -510,13 +510,11 @@ impl PartBatchRepo {
             // 2026-10-14 review 第 2 轮 MAJOR-N1：**「终态清位置」不变式的第 6 个
             // 写点，此前漏改**（逐个写点的清单见本函数 doc 的末节）。
             //
-            // 写成防御式（`target` 驱动）而不是硬编码 `true`：本形参是通用的
-            // `&str`，`allowed_from` 恒为 `["READY_TO_SHIP"]` 只说明**当前**唯一
-            // 可达目标态是 `DELIVERED`，不构成「永远只有这一个目标态」的保证。
-            // 硬编码 `true` 的写法在将来加目标态时会静默带上清位置副作用
-            // （可能是错的），而按目标态驱动至少让「加新终态目标」这件事必须经过
-            // 这一行 —— 改这里时能看见。
-            let is_delivered = target == "DELIVERED";
+            // 按目标态驱动（不是硬编码 `true`），且把三个批次终态都列全：当前
+            // 唯一可达目标态是 `DELIVERED`，由**调用方 + 状态机**保证。**新增
+            // 终态目标必须同步本 match 与上方 6 点写点清单** —— 漏列会让新终态
+            // 静默不清位置，回到本 PR 要消灭的那类幽灵行。
+            let target_is_terminal = matches!(target, "DELIVERED" | "COMPLETED" | "CANCELLED");
             batch_status::apply_batch_status_change(
                 conn,
                 StatusChange {
@@ -532,8 +530,8 @@ impl PartBatchRepo {
                     // READY_TO_SHIP（service 层逐批守过）。
                     allowed_from: &["READY_TO_SHIP"],
                     updated_by,
-                    clear_location: is_delivered,
-                    clear_holder_id: is_delivered,
+                    clear_location: target_is_terminal,
+                    clear_holder_id: target_is_terminal,
                     clear_process_id: false,
                     clear_process_step_id: false,
                     // `event_id: None` 的真实理由（2026-10-14 review 第 2 轮订正，
@@ -546,10 +544,7 @@ impl PartBatchRepo {
                     //    `is_terminal` = `COMPLETED | CANCELLED`（part 级终态，
                     //    见 `status.rs`），而 pickup 把该 part 派生到的是
                     //    `DELIVERED` ⇒ 归档分支确实不可达，但**理由是 part 的
-                    //    派生态**、不是批次的终态性；
-                    // ③ pickup 路径上 `delivery_note::repo` 拿不到
-                    //    `SnowflakeIdGenerator`，本就该按 M4「caller 拿不到
-                    //    生成器 ⇒ 传 None」的约定走。
+                    //    派生态**、不是批次的终态性。
                     event_id: None,
                 },
             )
@@ -1079,9 +1074,10 @@ impl PartBatchRepo {
     /// AND current_holder_id = …`。本函数此前**只判后两列**，是校验 SQL 单方面偏离了
     /// 自己的域契约。
     ///
-    /// 为什么必须带 status：三个终态写点（取消 / 强制完成 / 交付）此前都不清
-    /// `location` + `current_holder_id`，于是被取消的批次仍以
-    /// `location='WORKER'` 留在表里 —— 校验算数、队列板看板
+    /// 为什么必须带 status：三个终态状态下共 6 个写点（取消 / 强制完成 / 交付；
+    /// 逐点清单见本文件 `PartBatchRepo::update` 的函数 doc 与
+    /// `docs/api/batch.md` §6.1）此前都不清 `location` + `current_holder_id`，
+    /// 于是被取消的批次仍以 `location='WORKER'` 留在表里 —— 校验算数、队列板看板
     /// （`board/repo.rs::SQL_HELD_BATCHES_BY_WORKERS`，同样按 `status='IN_PROCESS'`
     /// 过滤）看不见。这类行永久累积，取消得越多工人越被卡死。
     ///

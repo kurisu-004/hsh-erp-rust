@@ -546,7 +546,7 @@ step 指针与「当前工序在链内的位置」是两个独立事实，而 wo
 ⚠️ 两处 payload 的 `shelf_id` **形态不同**：本域恒 `null`（worker-scan 的 refill
 跨架取料、无架锚），queue 域填请求里的架 id。
 
-⇒ **4 个键两边同名同形，只有 `shelf_id` 的值形态不同**：`worker_id`（字符串）/ `pool_empty`
+⇒ **4 个键两边同名**，只有 `shelf_id` 的值形态不同：`worker_id`（字符串）/ `pool_empty`
 （恒 `true`）/ `stopped_reason`（恒 `"POOL_EMPTY"`）三键两边逐字相同。
 ⚠️ **2026-10-14 review 第 2 轮 MAJOR-N2 订正**：本节此前写「`stopped_reason` /
 `pool_empty` / `worker_id` **三个**键两边同形」，而 `prod::queue` 那一侧当时**根本没

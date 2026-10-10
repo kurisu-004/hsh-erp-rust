@@ -84,7 +84,8 @@ impl QueueRepo {
     /// 判据的权威定义是 `docs/api/queue.md` §4.3「工人持有判据」，本 CTE 此前
     /// 只判 `current_holder_id` + `location = 'WORKER'` 两列，把
     /// `status = 'IN_PROCESS'` 漏掉了 —— 于是被取消 / 强制完成的批次（三个终态
-    /// 写点都不清位置）照样吃工容量，**取消得越多工人越被卡死**，而队列板
+    /// 状态下共 6 个写点此前都不清位置，逐点清单见 `docs/api/batch.md` §6.1）
+    /// 照样吃工容量，**取消得越多工人越被卡死**，而队列板
     /// （`board/repo.rs::SQL_HELD_BATCHES_BY_WORKERS`，判据带 status）看不见它们。
     /// 现在本 CTE 与看板、`batch/repo/queries.rs::count_held_by_worker` 三处
     /// **逐字一致**。
@@ -120,7 +121,8 @@ impl QueueRepo {
                 -- AND current_holder_id，**逐字**对齐看板
                 -- `board/repo.rs::SQL_HELD_BATCHES_BY_WORKERS` 的 WHERE 与
                 -- `batch/repo/queries.rs::count_held_by_worker`。此前本 CTE 只判
-                -- 后两列，被取消 / 强制完成的批次（三个终态写点不清位置）仍算数，
+                -- 后两列，被取消 / 强制完成的批次（三个终态状态下共 6 个写点此前
+                -- 都不清位置；逐点清单见 `docs/api/batch.md` §6.1）仍算数，
                 -- 取消得越多工人越被卡死。
                 SELECT COUNT(*)::int AS n FROM t_part_batch
                 WHERE current_holder_id = $1

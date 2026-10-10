@@ -275,7 +275,8 @@ t_assembly.status               ← 派生缓存
 > 批次进入终态（`CANCELLED` / `COMPLETED` / `DELIVERED`）时，`location` 与
 > `current_holder_id` **一并清 NULL**。
 
-**为什么**：此前三个终态写点都只改 `status`、不清位置列，于是被判终态的批次仍以
+**为什么**：此前三个终态状态下共 6 个写点（逐点清单见下表）都只改 `status`、不清
+位置列，于是被判终态的批次仍以
 `location='WORKER' + current_holder_id=<某工人>` 的形态留在表里 —— **幽灵行**。它们
 队列板看板看不见（判据带 `status='IN_PROCESS'`），却在判据漏 `status` 时吃工人容量，
 **取消得越多工人越被卡死**，且运维看着「面板显示还有额度」完全无法解释。这类行
