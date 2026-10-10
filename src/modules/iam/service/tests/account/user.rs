@@ -504,6 +504,9 @@ async fn deactivate_user_happy_path_returns_deactivated_user() {
     let mut mock = MockIamRepoTrait::new();
     mock.expect_get_user_by_id()
         .returning(move |_| Ok(Some(u.clone())));
+    // 2026-10-14：deactivate_user 的 ADMIN 护栏快筛 —— 该用户不是管理员
+    mock.expect_has_active_admin_grants()
+        .returning(|_| Ok(false));
     mock.expect_soft_delete_user().returning(|_, _, _, _| Ok(1));
     mock.expect_list_user_roles_by_user_id()
         .returning(|_| Ok(vec![]));
@@ -527,6 +530,8 @@ async fn deactivate_user_already_inactive_returns_version_conflict() {
     let mut mock = MockIamRepoTrait::new();
     mock.expect_get_user_by_id()
         .returning(move |_| Ok(Some(u.clone())));
+    mock.expect_has_active_admin_grants()
+        .returning(|_| Ok(false));
     mock.expect_soft_delete_user().returning(|_, _, _, _| Ok(0)); // 0 行 → 已并发被改
     let svc = make_account_service();
 
@@ -617,4 +622,38 @@ async fn change_own_password_forbidden_for_other_user() {
         AppError::Biz { code, .. } => assert_eq!(code, code::FORBIDDEN),
         other => panic!("expected Biz FORBIDDEN, got {:?}", other),
     }
+}
+
+/// 2026-10-14：**停用最后一个 active ADMIN 被拒**。
+///
+/// 护栏路径返回 Err ⇒ handler 未 commit ⇒ 也不会踢下线（mockall 对未预期的
+/// `soft_delete_user` 调用会 panic，这就是「绝不触达软删」的断言）。
+#[tokio::test]
+async fn deactivate_last_active_admin_is_rejected() {
+    let u = sample_user(101, "root");
+    let mut mock = MockIamRepoTrait::new();
+    mock.expect_get_user_by_id()
+        .returning(move |_| Ok(Some(u.clone())));
+    // 该账号持有 ADMIN，且只剩它一个 active 管理员
+    mock.expect_has_active_admin_grants()
+        .returning(|_| Ok(true));
+    mock.expect_list_active_admin_user_ids()
+        .returning(|| Ok(vec![101]));
+
+    let svc = make_account_service();
+    let err = svc
+        .deactivate_user(mock, 101, 1, &current_manager())
+        .await
+        .expect_err("停用最后一个管理员应 Err");
+
+    assert_eq!(
+        err.code(),
+        code::BAD_REQUEST,
+        "护栏拒绝应是 HTTP 400 / 40000（不是 422 的 validation），实得 {err:?}"
+    );
+    assert_eq!(
+        err.http_status(),
+        axum::http::StatusCode::BAD_REQUEST,
+        "护栏拒绝的 HTTP 状态必须是 400，实得 {err:?}"
+    );
 }

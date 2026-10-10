@@ -9,6 +9,7 @@ pub use sql::user_role::{UserRoleInsert, UserRoleRow};
 use async_trait::async_trait;
 use chrono::NaiveDateTime;
 
+use crate::modules::iam::rbac::model::TRole;
 use crate::modules::iam::shelf::model::TShelf;
 
 /// 命名约定（参考用户命名表）：
@@ -105,11 +106,18 @@ pub trait IamRepoTrait: Send {
         updated_by: Option<i64>,
     ) -> Result<u64, sqlx::Error>;
 
-    // ── t_menu（1）──
+    // ── t_menu（2，2026-10-14 第 2 条为 ADMIN 补）──
     async fn list_active_menus_by_roles<'a>(
         &mut self,
         roles: &'a [String],
     ) -> Result<Vec<Menu>, sqlx::Error>;
+
+    /// 全部启用中的菜单，**不经角色过滤**。
+    ///
+    /// ADMIN 是元角色：它不进 `t_role_menu`（通配在代码里），登录态菜单树因此
+    /// 不能走 `list_active_menus_by_roles(["ADMIN"])`（那会返回空树 ⇒ 管理员
+    /// 登录后全站无入口）。`AccountService::menus_for_roles` 据此分支。
+    async fn list_all_active_menus(&mut self) -> Result<Vec<Menu>, sqlx::Error>;
 
     // ── t_role_permission（1，2026-10-14 新增）──
     /// 按**全部角色 code**联查该用户的权限码集合（登录 / refresh 时装载进
@@ -121,6 +129,29 @@ pub trait IamRepoTrait: Send {
         &mut self,
         roles: &'a [String],
     ) -> Result<Vec<String>, sqlx::Error>;
+
+    // ── t_role（2，2026-10-14 新增）──
+    /// 按 code 查**未软删**的角色行（授予时判「存在且启用」用）。
+    ///
+    /// ⚠️ **只过滤 `deleted_at`、不过滤 `is_active`**：service 要把「不存在」
+    ///    与「已停用」分成两条文案（现场排障时「角色不存在」和「角色被停用了」
+    ///    是完全不同的问题），合并成一条 `Option` 就丢了这条信息。
+    async fn get_active_role_by_code<'a>(
+        &mut self,
+        code: &'a str,
+    ) -> Result<Option<TRole>, sqlx::Error>;
+
+    /// active 且持有 ADMIN 角色的用户 id 列表（ADMIN 自锁护栏的唯一判据）。
+    ///
+    /// 与 `RbacRepo::list_active_user_ids_by_role_code` 同一条 SQL（角色域
+    /// 与用户域两侧都要用，护栏阈值只写在 rbac 侧一处）。
+    async fn list_active_admin_user_ids(&mut self) -> Result<Vec<i64>, sqlx::Error>;
+
+    /// 该用户当前是否持有 ADMIN 角色（`t_user_role` 未软删行）。
+    ///
+    /// `deactivate_user` 的护栏先用它做快筛：**不是**管理员的账号走不到计数
+    /// 查询（停用普通账号是最高频的运维动作，不该每次都数一遍管理员）。
+    async fn has_active_admin_grants(&mut self, user_id: i64) -> Result<bool, sqlx::Error>;
 
     // ── t_shelf（1）──
     /// `t_shelf` 的唯一行结构是 `iam::shelf::model::TShelf`（含 `capacity`），

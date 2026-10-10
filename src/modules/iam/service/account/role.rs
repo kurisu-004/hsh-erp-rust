@@ -1,4 +1,4 @@
-//! `AccountService` 的 `t_user_role` 子块：角色列表 / 授予 / 撤销 + SHELF_ACCOUNT scope 校验
+//! `AccountService` 的 `t_user_role` 子块：角色列表 / 授予 / 撤销 + scope 校验
 //!
 //! `add_role` 是纯 INSERT（新行没有 version），故无 OCC 锚点；`remove_role` 的 OCC
 //! 锚点是 `expected_version`（客户端在 body 里显式传该行 `UserRoleOut.version`）。
@@ -7,9 +7,32 @@
 //! 约束 `uk_t_user_role_user_role_scope` 是**普通 UNIQUE** 而非 partial：PG 视 NULL
 //! 互不相等，`(user_id, role, NULL, NULL)` 这类组合索引拦不住。详见
 //! `docs/api/iam.md` 的「已知偏差登记」。
+//!
+//! ## 角色码是原始字符串，不是枚举（2026-10-14）
+//! 入参 `UserAddRoleRequest::role` 由 `Role` 枚举改成 `String`。`t_user_role.role`
+//! 是无 FK varchar、能存 `t_role` 里的自定义角色码；用枚举时 serde 会在进入
+//! handler **之前**就把未知码拒成 422，自定义角色根本没法被授予。
+//!
+//! 合法性改由 [`Self::validate_role_exists`] 查 `t_role` 判定（存在且
+//! `is_active = true`）。枚举只在**需要 scope 规则**与**ADMIN 护栏**两处用
+//! `parse_role_string` 认一下：认不出（如 `QC_LEAD`）就走「自定义角色」分支。
+//!
+//! ## 踢下线
+//! `add_role` / `remove_role` 都返回 `KickList`（= 目标用户 id，恒长度 ≤ 1），
+//! 由 **handler 在 `tx.commit()` 之后**调 `delete_all_user_sessions`。理由：
+//! 授权数据装在 Redis session 缓存里，不踢就等于这次授予/撤销对目标无效
+//! 直到 session 自然过期；而 Redis 不在 DB 事务内，先踢会在事务回滚时把
+//! 用户误踢下线。
+//!
+//! ## ADMIN 自锁护栏
+//! 下列两种操作若会让「active 且持有 ADMIN 的用户数」归零 → 400，且因返回
+//! `Err`（handler 未 commit）**不会**触发踢下线：
+//! 1. 撤销用户的 ADMIN 角色（本文件 `remove_role`）；
+//! 2. 停用持有 ADMIN 的用户（`user::deactivate_user`）。
 
-use crate::auth::rbac::{CurrentUser, Role};
+use crate::auth::rbac::{CurrentUser, Role, parse_role_string};
 use crate::infra::clock::now_naive;
+use crate::modules::iam::rbac::service::ADMIN_ROLE_CODE;
 use crate::shared::error::{AppError, code};
 
 use super::super::super::dto::UserAddRoleRequest;
@@ -40,19 +63,24 @@ impl AccountService {
     }
 
     /// `POST /api/v2/iam/users/{id}/roles`：授予一个角色（纯 INSERT，无 OCC）。
+    ///
+    /// 返回 `(UserRoleOut, KickList)`；`KickList` 恒为 `[user_id]`
+    /// （新增授权必然改变该用户的权限集），handler 在 commit 后踢其 session。
     pub async fn add_role<R: IamRepoTrait>(
         &self,
         mut repo: R,
         user_id: i64,
         req: &UserAddRoleRequest,
         current: &CurrentUser,
-    ) -> Result<UserRoleOut, AppError> {
+    ) -> Result<(UserRoleOut, Vec<i64>), AppError> {
         current.require_role(Role::Manager)?;
 
         repo.get_user_by_id(user_id)
             .await?
             .ok_or_else(|| user_not_found(user_id))?;
 
+        // 合法性 = `t_role` 里存在且 is_active（自定义角色由此可被授予）
+        Self::validate_role_exists(&mut repo, &req.role).await?;
         Self::validate_role_scope(&mut repo, req).await?;
 
         let role_str = req.role.as_str();
@@ -91,14 +119,20 @@ impl AccountService {
             .map_err(map_duplicate_role)?;
 
         let rows = repo.list_user_roles_by_user_id(user_id).await?;
-        rows.iter()
+        let out = rows
+            .iter()
             .find(|r| r.id == insert.id)
             .map(to_role_out)
-            .ok_or_else(|| AppError::internal("创建后回读角色失败"))
+            .ok_or_else(|| AppError::internal("创建后回读角色失败"))?;
+        Ok((out, vec![user_id]))
     }
 
     /// `POST /api/v2/iam/users/{id}/roles/{role_id}/remove`：撤销一个角色。
     /// OCC 锚点 = `expected_version`（客户端传该角色行当前的 version）。
+    ///
+    /// 返回 `KickList`（恒 `[user_id]`），handler 在 commit 后踢其 session。
+    /// **撤销最后一个 ADMIN 会被护栏拒绝**（见 [`Self::guard_admin_lockout`]），
+    /// 此时返回 `Err` ⇒ handler 未 commit ⇒ 不会踢任何人。
     pub async fn remove_role<R: IamRepoTrait>(
         &self,
         mut repo: R,
@@ -106,7 +140,7 @@ impl AccountService {
         role_id: i64,
         expected_version: i32,
         current: &CurrentUser,
-    ) -> Result<(), AppError> {
+    ) -> Result<Vec<i64>, AppError> {
         current.require_role(Role::Manager)?;
 
         repo.get_user_by_id(user_id)
@@ -125,26 +159,90 @@ impl AccountService {
             }
         };
 
+        // ADMIN 自锁护栏：撤的是 ADMIN 且撤完就没有 active 管理员了 → 400
+        if r.role == ADMIN_ROLE_CODE {
+            Self::guard_admin_lockout(&mut repo).await?;
+        }
+
         let affected = repo
             .soft_delete_user_role(r.id, expected_version, now_naive(), Some(current.id))
             .await?;
         if affected == 0 {
             return Err(version_conflict());
         }
-        Ok(())
+        Ok(vec![user_id])
     }
 
     // =======================================================================
     // 内部
     // =======================================================================
 
-    /// 校验 SHELF_ACCOUNT 角色的 scope 形态、货架存在、zone 白名单、is_active。
+    /// **ADMIN 自锁护栏**（用户域版）：若「当前 active 且持有 ADMIN 的用户数」
+    /// ≤ 1（即这次撤销会把它打成 0），返 400。
+    ///
+    /// 与 `iam::rbac::service::RbacService::guard_admin_lockout` 是**同一判据
+    /// 的两个入口**（用户域 / 角色域）。判据逻辑（`<= 1`）本身只写在 rbac
+    /// 侧，本函数委托过去，避免两处阈值各写一遍后漂移；错误形态也走 rbac 侧
+    /// 的 `policy_reject`（HTTP 400，不是 `AppError::validation` 的 422）。
+    pub(crate) async fn guard_admin_lockout<R: IamRepoTrait>(repo: &mut R) -> Result<(), AppError> {
+        let n =
+            crate::modules::iam::rbac::service::RbacService::count_active_users_holding_admin(repo)
+                .await?;
+        if n <= 1 {
+            return Err(crate::modules::iam::rbac::service::policy_reject(
+                "不能撤销最后一个系统管理员的 ADMIN 角色",
+            ));
+        }
+        Ok(())
+    }
+
+    /// 校验角色码在 `t_role` 中存在且启用。
+    ///
+    /// 取代原先「`Role` 枚举 parse 成功即合法」的判据：枚举只覆盖内置 6 项，
+    /// 自定义角色（`is_system=false`）必须能被授予。停用（`is_active=false`）
+    /// 的角色不可**新**授予 —— 存量授予行不受影响（登录时按 `t_user_role`
+    /// 现存行判定）。
+    ///
+    /// 错误形态：HTTP 400（`policy_reject`）。「角色代码不是可用值」是业务规则
+    /// 拒绝而非请求形态错误，与 ADMIN 护栏同一族。
+    async fn validate_role_exists<R: IamRepoTrait>(
+        repo: &mut R,
+        role: &str,
+    ) -> Result<(), AppError> {
+        let r = repo.get_active_role_by_code(role).await?.ok_or_else(|| {
+            crate::modules::iam::rbac::service::policy_reject(format!("角色 {role} 不存在或已停用"))
+        })?;
+        if r.is_active {
+            Ok(())
+        } else {
+            // get_active_role_by_code 只按 code 过滤 deleted_at；is_active 单独判，
+            // 让「存在但停用」与「不存在」返回不同文案便于现场排障。
+            Err(crate::modules::iam::rbac::service::policy_reject(format!(
+                "角色 {role} 已停用，不能授予"
+            )))
+        }
+    }
+
+    /// 校验 scope 形态、货架存在、zone 白名单、is_active。
+    ///
     /// 收 `&mut R` 而非 `&mut uow`：调用方把 repo 借进来，helper 只取 shelf_repo。
+    ///
+    /// ## ADMIN 与自定义角色的 scope 语义（2026-10-14 补）
+    /// - **ADMIN**：不接 scope。与其它非货架角色同规则（scope 必须为空）——
+    ///   ADMIN 的「全店通行」由 `has_role` 的元角色通配承担，不靠 `scope_type`；
+    /// - **自定义角色（如 `QC_LEAD`）**：不接 scope，scope 填 `NULL`。它们没有
+    ///   任何货架绑定语义，`scope_type`/`scope_id` 一律留空。**不要**因为它
+    ///   「不在 6 个已知角色里」就套用 SHELF_ACCOUNT 的必填规则 —— 那会让
+    ///   自定义角色一律授不进去。
     async fn validate_role_scope<R: IamRepoTrait>(
         repo: &mut R,
         req: &UserAddRoleRequest,
     ) -> Result<(), AppError> {
-        if req.role == Role::ShelfAccount {
+        // 仅 SHELF_ACCOUNT 走「scope 必填」这一支；其余角色（含自定义）走
+        // 「scope 必须为空」。判定用枚举 parse，认不出的自定义码自然落到
+        // else 分支 —— 正是想要的语义。
+        let known = parse_role_string(&req.role);
+        if known == Some(Role::ShelfAccount) {
             // 校验顺序与 Python `_validate_role_scope` 一致：
             // scope 形态 → 货架存在 → zone 白名单 → is_active
             if req.scope_type.as_deref() != Some(SCOPE_TYPE_SHELF) || req.scope_id.is_none() {
@@ -169,7 +267,8 @@ impl AccountService {
                 ));
             }
         } else if req.scope_type.is_some() || req.scope_id.is_some() {
-            // MANAGER / CLERK / INSPECTOR / CNC_PROGRAMMER 暂不接 scope
+            // MANAGER / ADMIN / CLERK / INSPECTOR / CNC_PROGRAMMER / 自定义角色
+            // 一律不接 scope
             return Err(AppError::validation(format!(
                 "role {} does not accept scope",
                 req.role.as_str()

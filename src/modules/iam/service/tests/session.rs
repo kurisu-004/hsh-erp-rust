@@ -107,7 +107,11 @@ async fn login_happy_path_returns_pending() {
         .returning(|_, _| Ok(()));
     mock_repo
         .expect_list_active_menus_by_roles()
-        .returning(|_| Ok(vec![])); // 菜单：空
+        .returning(|_| Ok(vec![]));
+    // 2026-10-14 新增：登录时装载 permissions（按全部角色 code 联查 t_role_permission）
+    mock_repo
+        .expect_list_permission_codes_by_roles()
+        .returning(|_| Ok(vec![]));
 
     // 不需要 SessionStore：login 第一阶段不写 Redis
     let mock_session = MockSessionStore::new();
@@ -250,6 +254,9 @@ async fn me_happy_returns_current_user_out() {
         .returning(move |_| Ok(vec![role_row.clone()]));
     mock_repo
         .expect_list_active_menus_by_roles()
+        .returning(|_| Ok(vec![]));
+    mock_repo
+        .expect_list_permission_codes_by_roles()
         .returning(|_| Ok(vec![]));
     let mock_session = MockSessionStore::new();
     let svc = make_session_service(mock_session);
@@ -457,6 +464,9 @@ async fn refresh_happy_returns_pending_with_new_pair() {
         .returning(move |_| Ok(Some(u_after.clone())));
     mock_repo
         .expect_list_active_menus_by_roles()
+        .returning(|_| Ok(vec![]));
+    mock_repo
+        .expect_list_permission_codes_by_roles()
         .returning(|_| Ok(vec![]));
 
     // SessionStore：黑名单未命中（happy path）

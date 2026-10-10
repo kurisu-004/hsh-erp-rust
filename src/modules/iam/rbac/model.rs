@@ -30,6 +30,29 @@ pub struct TRole {
     pub deleted_at: Option<NaiveDateTime>,
 }
 
+#[cfg(test)]
+impl TRole {
+    /// 单测用最小行构造（service 单测 mock `get_active_role_by_code` 的返回值）。
+    pub fn dummy(code: &str) -> Self {
+        let now =
+            NaiveDateTime::parse_from_str("2026-10-14T00:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        Self {
+            id: 1,
+            code: code.to_string(),
+            name: "测试角色".into(),
+            description: None,
+            is_system: false,
+            is_active: true,
+            version: 0,
+            created_at: now,
+            created_by: None,
+            updated_at: now,
+            updated_by: None,
+            deleted_at: None,
+        }
+    }
+}
+
 /// `t_permission` 行
 #[derive(Debug, Clone, FromRow)]
 pub struct TPermission {

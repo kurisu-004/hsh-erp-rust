@@ -55,12 +55,23 @@ use crate::modules::iam::rbac::repo::{RbacRepo, RoleInsert, RolePartialUpdate, R
 use crate::modules::iam::rbac::vo::{
     PermissionGroup, PermissionItem, RoleDeactivateOut, RoleDef, RoleGrants,
 };
+use crate::modules::iam::repo::IamRepoTrait;
 use crate::modules::iam::repo::sql as iam_repo;
 use crate::modules::iam::vo::MenuNodeOut;
 use crate::shared::error::{AppError, code};
 
 /// ADMIN 元角色的 code —— 「通配 / 拒写 / 自锁护栏」三处判据的唯一来源。
 pub const ADMIN_ROLE_CODE: &str = "ADMIN";
+
+/// **策略拒绝**（护栏 / 元角色保护）的统一错误构造：HTTP 400 + `40000 BAD_REQUEST`。
+///
+/// 刻意不用 `AppError::validation`（本仓映射 HTTP **422**）：422 的语义是「请求体
+/// 形态不合法」（如缺 `version`、code 过长），而这些拒绝与请求形态无关 —— 请求
+/// 完全合法，只是**业务规则**不允许（会自锁 / 元角色不接受授权数据写入）。
+/// 用 400 让前端能把它与「表单填错」区分开。
+pub(crate) fn policy_reject(msg: impl Into<String>) -> AppError {
+    AppError::biz(code::BAD_REQUEST, msg)
+}
 
 /// RBAC service。字段仅 `snowflake`（事务与 Redis 副作用都在 handler）。
 pub struct RbacService {
@@ -186,8 +197,8 @@ impl RbacService {
                 if c == role.code {
                     None // 与现值相同 —— 不触发级联，也不算「带了 code」
                 } else if role.is_system {
-                    return Err(AppError::validation(
-                        "系统角色的 code 不可修改（可停用，不可改名）".to_string(),
+                    return Err(policy_reject(
+                        "系统角色的 code 不可修改（可停用，不可改名）",
                     ));
                 } else {
                     Some(c)
@@ -266,9 +277,7 @@ impl RbacService {
 
         let role = role_or_not_found(RbacRepo::get_role_by_id(&mut *conn, id).await?, id)?;
         if req.delete && role.is_system {
-            return Err(AppError::validation(
-                "系统角色不可删除（如需下线请用停用）".to_string(),
-            ));
+            return Err(policy_reject("系统角色不可删除（如需下线请用停用）"));
         }
         if role.code == ADMIN_ROLE_CODE {
             Self::guard_admin_lockout(conn, "系统管理员角色不可停用或删除").await?;
@@ -365,8 +374,8 @@ impl RbacService {
 
         let role = role_or_not_found(RbacRepo::get_role_by_id(&mut *conn, id).await?, id)?;
         if role.code == ADMIN_ROLE_CODE {
-            return Err(AppError::validation(
-                "系统管理员角色是元角色（代码级通配），不接受授权数据写入".to_string(),
+            return Err(policy_reject(
+                "系统管理员角色是元角色（代码级通配），不接受授权数据写入",
             ));
         }
 
@@ -509,7 +518,7 @@ impl RbacService {
     ) -> Result<(), AppError> {
         let n = Self::count_active_users_holding(conn, ADMIN_ROLE_CODE).await?;
         if n <= 1 {
-            return Err(AppError::validation(reason.to_string()));
+            return Err(policy_reject(reason.to_string()));
         }
         Ok(())
     }
@@ -521,6 +530,21 @@ impl RbacService {
     ) -> Result<i64, AppError> {
         let ids = RbacRepo::list_active_user_ids_by_role_code(&mut *conn, role_code).await?;
         Ok(ids.len() as i64)
+    }
+
+    /// ADMIN 自锁护栏判据的**trait 泛型版**（供用户域 `AccountService` 调用）。
+    ///
+    /// 用户域的 `AccountService` 方法签名收 `R: IamRepoTrait`（为了单测可注入
+    /// mock），不能直接吃 `&mut PgConnection`。两边走的是**同一条 SQL**
+    /// （`IamRepoTrait::list_active_admin_user_ids` 委托到
+    /// `RbacRepo::list_active_user_ids_by_role_code`）与**同一个阈值**（`<= 1`）。
+    ///
+    /// 为什么要单点：两处各写一遍阈值后漂移的表现是「角色域拦得住、用户域拦
+    /// 不住」，而后者恰好是最容易自锁的那条路（撤销最后一个管理员的 ADMIN）。
+    pub(crate) async fn count_active_users_holding_admin<R: IamRepoTrait>(
+        repo: &mut R,
+    ) -> Result<i64, AppError> {
+        Ok(repo.list_active_admin_user_ids().await?.len() as i64)
     }
 }
 

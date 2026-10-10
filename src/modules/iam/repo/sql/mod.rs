@@ -60,6 +60,7 @@ use async_trait::async_trait;
 use chrono::NaiveDateTime;
 use sqlx::PgConnection;
 
+use crate::modules::iam::rbac::model::TRole;
 use crate::modules::iam::repo::model::{Menu, User, UserRole, WxIdentity};
 use crate::modules::iam::repo::{
     IamRepoTrait, UserInsert, UserPartialUpdate, UserRoleInsert, UserRoleRow, WxIdentityInsert,
@@ -190,12 +191,15 @@ impl IamRepoTrait for &mut PgConnection {
         user_role::soft_delete_user_role(&mut **self, id, version, when, updated_by).await
     }
 
-    // ── t_menu（1）──
+    // ── t_menu（2）──
     async fn list_active_menus_by_roles<'b>(
         &mut self,
         roles: &'b [String],
     ) -> Result<Vec<Menu>, sqlx::Error> {
         menu::list_active_menus_by_roles(&mut **self, roles).await
+    }
+    async fn list_all_active_menus(&mut self) -> Result<Vec<Menu>, sqlx::Error> {
+        menu::list_all_active_menus(&mut **self).await
     }
 
     // ── t_role_permission（1）──
@@ -208,6 +212,26 @@ impl IamRepoTrait for &mut PgConnection {
             roles,
         )
         .await
+    }
+
+    // ── t_role（2）──
+    async fn get_active_role_by_code<'b>(
+        &mut self,
+        code: &'b str,
+    ) -> Result<Option<TRole>, sqlx::Error> {
+        crate::modules::iam::rbac::repo::RbacRepo::get_role_by_code(&mut **self, code).await
+    }
+    async fn list_active_admin_user_ids(&mut self) -> Result<Vec<i64>, sqlx::Error> {
+        crate::modules::iam::rbac::repo::RbacRepo::list_active_user_ids_by_role_code(
+            &mut **self,
+            crate::modules::iam::rbac::service::ADMIN_ROLE_CODE,
+        )
+        .await
+    }
+
+    async fn has_active_admin_grants(&mut self, user_id: i64) -> Result<bool, sqlx::Error> {
+        crate::modules::iam::rbac::repo::RbacRepo::user_has_role(&mut **self, user_id, "ADMIN")
+            .await
     }
 
     // ── t_shelf（1）──

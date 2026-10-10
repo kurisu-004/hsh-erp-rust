@@ -84,3 +84,58 @@ fn account_service_construction_does_not_panic() {
     let svc = AccountService::new(crate::modules::iam::service::tests::test_snowflake());
     let _: &AccountService = &svc;
 }
+
+/// `menus_for_roles` 的 mock 返回值构造（`t_menu` 行投影）。
+pub(crate) fn sample_menu(
+    id: i64,
+    parent_id: Option<i64>,
+    code: &str,
+    sort_order: i32,
+) -> crate::modules::iam::repo::model::Menu {
+    let now = chrono::NaiveDate::from_ymd_opt(2026, 10, 14)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap();
+    crate::modules::iam::repo::model::Menu {
+        id,
+        parent_id,
+        code: code.to_string(),
+        title: format!("菜单 {code}"),
+        path: Some(format!("/{code}")),
+        icon: None,
+        sort_order,
+        is_active: true,
+        version: 0,
+        created_at: now,
+        created_by: None,
+        updated_at: now,
+        updated_by: None,
+        deleted_at: None,
+    }
+}
+
+/// **ADMIN 元角色的登录态菜单通配（2026-10-14 补）**：持有 ADMIN 时必须走
+/// 「全量启用中菜单」查询，而不是按 `role_code='ADMIN'` 联查 `t_role_menu`。
+///
+/// 后者恒为空（ADMIN 不进授权表）⇒ 管理员登录后 `/iam/me` 的 `menus` 是空树，
+/// 前端全站无入口，连角色面板自己的菜单都点不到。这条用例钉住分支存在：
+/// 删掉分支后 `list_all_active_menus` 的期望未满足、mock 直接 panic。
+#[tokio::test]
+async fn menus_for_roles_admin_uses_all_active_menus() {
+    use crate::auth::rbac::Role;
+    use crate::modules::iam::repo::MockIamRepoTrait;
+
+    let mut mock = MockIamRepoTrait::new();
+    mock.expect_list_all_active_menus()
+        .returning(|| Ok(vec![sample_menu(1, None, "home", 10)]));
+    // 刻意不挂 `expect_list_active_menus_by_roles`：ADMIN 分支若误走联查会 panic
+    let svc = AccountService::new(crate::modules::iam::service::tests::test_snowflake());
+
+    let tree = svc
+        .menus_for_roles(&mut mock, &[Role::Admin])
+        .await
+        .expect("ADMIN 的 menus_for_roles 应 Ok");
+
+    assert_eq!(tree.len(), 1, "ADMIN 应拿到全量菜单：{tree:?}");
+    assert_eq!(tree[0].code, "home");
+}

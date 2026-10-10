@@ -2,8 +2,6 @@
 
 use serde::Deserialize;
 
-use crate::auth::rbac::Role;
-
 /// POST /api/v2/iam/users 入参
 #[derive(Debug, Clone, Deserialize)]
 pub struct UserCreateRequest {
@@ -66,11 +64,17 @@ pub struct UserListQuery {
     pub offset: Option<i64>,
 }
 
-/// 添加角色入参。`role` 反序列化自大写字符串（MANAGER/CLERK/...，见 `auth::rbac::Role`）。
-/// SHELF_ACCOUNT 必须带 `scope_type = "shelf"` + `scope_id`；其余角色两者必须为空。
+/// 添加角色入参。
+///
+/// - `role`：**原始大写字符串**（2026-10-14 由 `Role` 枚举改为 `String`）。
+///   `t_user_role.role` 是无 FK 的 varchar、能存 `t_role` 里的自定义角色码
+///   （如 `QC_LEAD`），而入参用枚举时 serde 会**在进入 handler 之前**就把未知
+///   码拒成 422 —— 自定义角色根本没法被授予。合法性改由 service 查 `t_role`
+///   校验（存在且 `is_active`），见 [`AccountService::add_role`]。
+/// - `SHELF_ACCOUNT` 必须带 `scope_type = "shelf"` + `scope_id`；其余角色两者必须为空。
 #[derive(Debug, Clone, Deserialize)]
 pub struct UserAddRoleRequest {
-    pub role: Role,
+    pub role: String,
     #[serde(default)]
     pub scope_type: Option<String>,
     #[serde(default)]

@@ -78,13 +78,24 @@ impl AccountService {
     // =======================================================================
 
     /// 取角色可见菜单并组树（供 SessionService 复用）。调用方传 `repo`，helper 不自管事务。
+    ///
+    /// **ADMIN 元角色通配**（2026-10-14 补）：持有 ADMIN 时返**全量**启用中菜单。
+    /// ADMIN 不进 `t_role_menu`（通配在代码里），若照常走 `list_active_menus_by_roles`
+    /// 会拿到空树 ⇒ 管理员登录后全站无入口、`/iam/roles` 面板自己也进不去。
+    /// 通配判定用 `Role::Admin` 枚举（`has_role` 的唯一实现点在 `auth::rbac`，
+    /// 但这里收的是角色列表而非 `CurrentUser`，故直接判成员，与
+    /// `CurrentUser::has_role` 同语义）。
     pub async fn menus_for_roles<R: IamRepoTrait>(
         &self,
         repo: &mut R,
         roles: &[Role],
     ) -> Result<Vec<MenuNodeOut>, AppError> {
-        let role_strs: Vec<String> = roles.iter().map(|r| r.as_str().to_string()).collect();
-        let menus = repo.list_active_menus_by_roles(&role_strs).await?;
+        let menus = if roles.contains(&Role::Admin) {
+            repo.list_all_active_menus().await?
+        } else {
+            let role_strs: Vec<String> = roles.iter().map(|r| r.as_str().to_string()).collect();
+            repo.list_active_menus_by_roles(&role_strs).await?
+        };
         Ok(build_menu_tree(menus))
     }
 

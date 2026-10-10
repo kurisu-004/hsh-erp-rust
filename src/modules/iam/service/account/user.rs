@@ -222,6 +222,11 @@ impl AccountService {
 
     /// `POST /api/v2/iam/users/{id}/deactivate`：停用账号 = 软删
     /// （置 `deleted_at` + `is_active = false`）。OCC 锚点 = `expected_version`。
+    ///
+    /// 2026-10-14：**ADMIN 自锁护栏** —— 目标是最后一个 active ADMIN 时返 400。
+    /// 判据与 `remove_role` 侧共用 `RbacService::count_active_users_holding_admin`
+    /// （同一条 SQL、同一个阈值 `<= 1`）。护栏路径返回 `Err` ⇒ handler 未 commit、
+    /// 也不会踢下线（该账号的 session 原样保留，管理员不会被自己踢出系统）。
     pub async fn deactivate_user<R: IamRepoTrait>(
         &self,
         mut repo: R,
@@ -235,6 +240,13 @@ impl AccountService {
             .get_user_by_id(user_id)
             .await?
             .ok_or_else(|| user_not_found(user_id))?;
+
+        // 停用会让该账号不再是 active 管理员 ⇒ 若它是最后一个，先拦下。
+        // 用 `u.is_active` 而非无条件判：停用一个已停用账号不构成新的自锁风险，
+        // 而那个账号本来就进不了 `list_active_user_ids_by_role_code` 的结果集。
+        if u.is_active && repo.has_active_admin_grants(user_id).await? {
+            Self::guard_admin_lockout(&mut repo).await?;
+        }
 
         let affected = repo
             .soft_delete_user(user_id, expected_version, now_naive(), Some(current.id))

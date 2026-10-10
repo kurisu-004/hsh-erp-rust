@@ -342,6 +342,29 @@ impl RbacRepo {
         .await
     }
 
+    /// 该用户当前是否持有某角色（`t_user_role` 有未软删行）。
+    ///
+    /// `deactivate_user` 的 ADMIN 护栏快筛用：停用非管理员账号是最高频的运维
+    /// 动作，不该每次都跑一遍「数管理员」的查询。
+    pub async fn user_has_role<'e, E: PgExecutor<'e>>(
+        executor: E,
+        user_id: i64,
+        role_code: &str,
+    ) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar!(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM t_user_role
+                WHERE user_id = $1 AND role = $2 AND deleted_at IS NULL
+            ) AS "exists!"
+            "#,
+            user_id,
+            role_code,
+        )
+        .fetch_one(executor)
+        .await
+    }
+
     // =======================================================================
     // t_permission
     // =======================================================================
