@@ -186,7 +186,7 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
 | `POST /api/v2/prod/batches/worker-scan` | `POST /api/v2/prod/scan/worker-scan` | 路径（响应形状与 WS 事件名逐字不变） | 2026-10-10 |
 | `POST /api/v2/prod/batches/{batch_id}/pick-up` | `POST /api/v2/prod/scan/batches/{batch_id}/pick-up` | 路径（响应 `R<PartOut>` 与 WS 事件名逐字不变） | 2026-10-10 |
 
-**全部无 alias**，旧路径 404。契约细节见 [`queue.md`](queue.md) §1 与 §5.1、[`outsource.md`](outsource.md)。
+**全部无 alias**，旧路径 404。契约细节见 [`queue.md`](queue.md) §1（端点表）/ §4（口径表，含候选池与工人持有判据）/ §7（WS 关系）、[`outsource.md`](outsource.md)。
 
 2026-10-07 一行迁走的是待品检队列读的整条链路（`dto` / `vo` / `model` 行结构 / `repo/list.rs` / `service/list.rs`）→ `prod::inspection`，契约见 [`inspection.md`](inspection.md)。
 
@@ -269,6 +269,102 @@ t_assembly.status               ← 派生缓存
 - **CI 强制**：`cargo test --lib` 的 `shared::batch::status::write_guard_tests::no_outside_file_writes_batch_status` 扫全 `src/**/*.rs`，除 `src/shared/batch/status.rs` 外任何文件写 `UPDATE t_part_batch SET status …` 即失败。该测试的允许路径是一处字面量常量，**写入口再搬家时必须同步改它**。
 - **派生层不得覆盖主操作**：`t_part` 已由主操作写成终态时，min-progress 不许写回去（SQL 层 `AND status NOT IN ('COMPLETED','CANCELLED')` 兜底）。
 - 兜底对账端点 `POST /api/v2/admin/recompute-rollup`（Manager）复用同一套 rollup 函数，**幂等**。
+
+### 6.1 写入不变式：终态批次不在任何位置、也不在任何人手上（2026-10-14 新增）
+
+> 批次进入终态（`CANCELLED` / `COMPLETED` / `DELIVERED`）时，`location` 与
+> `current_holder_id` **一并清 NULL**。
+
+**为什么**：此前三个终态状态下共 6 个写点（逐点清单见下表）都只改 `status`、不清
+位置列，于是被判终态的批次仍以
+`location='WORKER' + current_holder_id=<某工人>` 的形态留在表里 —— **幽灵行**。它们
+队列板看板看不见（判据带 `status='IN_PROCESS'`），却在判据漏 `status` 时吃工人容量，
+**取消得越多工人越被卡死**，且运维看着「面板显示还有额度」完全无法解释。这类行
+**永久累积**（无任何清理路径）。
+
+**逐个写点（改前的状态 → 改后）**：
+
+| 写点 | 目标态 | 改前 | 改后 |
+|---|---|---|---|
+| `shared::batch::guards::mark_batch_status_only` | `CANCELLED` | 不清 | **清** |
+| `shared::batch::guards::mark_batch_status_only` | `READY_TO_SHIP` / `IN_PROCESS` | 不清 | 不清（**刻意**，见下） |
+| `shared::batch::status::apply_bulk_batch_status_change_for_part` | `CANCELLED` / `COMPLETED` | 不清 | **清**（part 级批量取消 / 强推完成） |
+| `shared::batch::status::FORCE_COMPLETE_ALL_BATCHES_FOR_ASSEMBLY_SQL` | `COMPLETED` | 不清 | **清**（装配件级强推完成） |
+| `prod::batch::repo::sql::mark_batch_delivered` | `DELIVERED` | 不清 | **清** |
+| `prod::batch::repo::sql::mark_batch_completed` | `COMPLETED` | 不清 | **清** |
+| `prod::batch::repo::queries::PartBatchRepo::update` | `DELIVERED` | 不清 | **清**（送货单 `/pickup` 路径；2026-10-14 review 第 2 轮 MAJOR-N1 补上） |
+
+⚠️ **末行是「本表曾经只有 6 行」的真实事故**：`PartBatchRepo::update` 的唯一生产调用方
+`com::delivery_note::service::lifecycle::pickup` 只在**内存 struct** 上清了
+`current_holder_id` / `location`（供响应与随后的 `sync` 读），真正的 DB 写走该函数而它的
+`clear_location` 是 `false` ⇒ 落库的行仍停在 `location='INSPECTION_SHELF' +
+current_holder_id=<shelf_id>`，正是 migration `20261013000002` 判据要清的那一类行
+⇒ **历史清了、以后继续产生**。回归测试：
+`tests/com/delivery_note/driver.rs::pickup_uses_assigned_driver_and_flips_batches_to_delivered`。
+
+📌 **正典清单在代码里**：`prod::batch::repo::queries::PartBatchRepo::update` 的 doc 有一张
+同内容的 6 行表 + 「新增终态写点必须加一行」的纪律。本表是它的文档镜像，**改动必须
+两侧同改** —— 上一轮的漏改正是因为这份镜像与 `CLAUDE.md` 的不变式 bullet 都说了「已统一
+处理过」，而代码里第 6 个写点根本没跟上。
+
+⚠️ **另一个不在表内的写点**：`prod::batch::repo::sql::mark_batch_cancelled` 的两个
+`clear_*` 仍是 `false`，**因为它全仓零调用方**（死代码，`allowed_from` 不含
+`IN_PROCESS`，接回去也够不到工人手上的批次）。接回调用前必须先改成 `true`；
+理由与 `list_held_by_worker` 同款自我标注，见该函数 doc。
+
+⚠️ **`mark_batch_status_only` 只对 `CANCELLED` 特判，绝不能改成无条件清** —— 它还服务
+两个**非终态**目标，而它们的 `location` 是**有业务含义**的：
+
+- `READY_TO_SHIP`（scan-inspect pass）：批次此刻停在 `INSPECTION_SHELF`，那就是
+  「品检完待发运」的物理落点。清掉它会让「待发运」列表（按
+  `location='INSPECTION_SHELF'` 查）空掉；
+- `IN_PROCESS`（scan-inspect FAIL，返修重入）：批次还要回到工人手上，位置与持有人
+  是**下一步动作的落点**，清掉等于凭空蒸发。
+
+而 `CANCELLED` 之所以是泄漏入口：`status_guard_for_target` 对它的源状态白名单是
+「全状态减两个终态」，**`IN_PROCESS` 在其中** ⇒ 「工人正在加工的那一批」可以被
+`POST /prod/batches/{id}/cancel` 直接取消。
+
+**存量的回补**由 append-only migration
+`20261013000002_001_clear_terminal_batch_location` 一次性完成（只清数据、不改判据）；
+上表的写侧修复保证**以后不再产生**。两者是互补的两道，缺一不可。
+
+⚠️ **判据侧也必须改**（否则新产生的同类行仍吃额度）：`count_held_by_worker` 与
+`take_one_from_pool` 的 `held` CTE 补 `status = 'IN_PROCESS'`，口径见
+[`queue.md`](queue.md) §4.3 / §8.4。
+
+**读侧影响**：⚠️ 下面按「判据有没有 `status` 过滤」分两组。**B 组**（带 `status` 过滤）
+对本不变式**零影响** —— 终态行本来看不见；**A 组**（不带 `status` 过滤）会随清位置
+改变结果，**方向都是修正**，且**已由那条 migration 在存量上造成过同样的差异**（写侧修复
+只是不再生产该形态的行）。
+
+⚠️ **清单不穷尽。** 它登记的是「逐个查过」的部分，**不是覆盖面证明** —— 新增同类读侧
+时必须自己判断「这个判据要不要带 `status`」，不要因为本节没列它就以为不受影响。
+
+**A 组：不过滤 `status`、结果会变（4 处）**
+
+| # | 读侧 | 受影响的字段 / 端点 | 变化方向 |
+|---|---|---|---|
+| A-1 | `part::service::list_enrichment::enrich_part_list_with_location_and_holder` 的 min-progress 目标批次选择 —— 只排除 `CANCELLED` / `COMPLETED`，**不排除 `DELIVERED`** | `PartListItem.location` / `holder_name`。⚠️ 只有**两条 list 路径**注入它：`GET /api/v2/parts` 与 `GET /api/v2/com/union-list` 的 PART 段（`GET /parts/{id}` 返的是 `PartDetailOut`，不是本 VO）；同 VO 的其余 **5 处返回点**（4 个列表端点 + `POST /assemblies/{id}/children` 返回的单对象 `R<PartListItem>`）走 `impl From<TPart>`，**构造默认就是 `None`、从不覆写**（登记见 `part::vo::part` 的 `PartListItem` 逐字段 doc） | 「只剩一条 `DELIVERED` 批次且原本停在品检架」的工单：由「品检架 + 架名」变 `null`。**修正** |
+| A-2 | `part::repo::sql::part_sql` 的 `list_with_filters` / `count_with_filters` 里 `locations` / `holder_ids` 两个 `EXISTS`（只有 `pb.deleted_at IS NULL`） | `GET /api/v2/parts?locations=…&holder_ids=…` 的**结果集**（items 与 total 各一份 SQL） | 命中集变小。**修正** |
+| A-3 | `com::union_list::repo::sql::list_union_all_with_filters` 的 `$7::text[]`（location）/ `$8::bigint[]`（holder）两个 `EXISTS`（同样只有软删闸门） | `GET /api/v2/com/union-list?locations=…&holder_ids=…` 的结果集 | 同 A-2。**修正** |
+| A-4 | `prod::batch::repo::queries::list_held_by_worker` | **无端点** —— 全仓**零调用方**（仅 trait 声明 + impl），死代码 | 不适用；接线前必须先补 `status='IN_PROCESS'`（见 [`queue.md`](queue.md) §4.3） |
+
+**另有 2 处方向性变化已由本轮前一版 doc 登记，谓词自带 `status NOT IN ('CANCELLED','COMPLETED')`（不含 `DELIVERED`）**：
+
+1. `part::service::phase1::events::location_tree` 的货架计数 —— 「品检架有 N 件」下降
+   （已交付的货不该占着品检架）；
+2. `wx::production` 的 `assigned_to`（`done` tab 展示 `DELIVERED` / `COMPLETED` 行）——
+   由「工人名」变 `null`（已交付批次不该显示「谁持有」）。
+
+**B 组：带 `status` 过滤、本不变式零影响** —— 队列板看板 / 候选池、外协看板两处、容量校验
+`count_held_by_worker`、`prod::worker::repo::sql::count_in_use_parts` 三个子查询、
+`iam::shelf::repo::sql::count_in_use_parts` 两个子查询、dashboard `in_process[]`、
+`prod::scan` 的 pickable / held。逐条审计见
+`src/modules/prod/batch/repo/sql.rs::mark_batch_delivered` 的 doc。
+
+⚠️ **A-2 / A-3 本轮只登记、不改代码**：给筛选器补 `status` 过滤会改变端点语义
+（「任一批次停在某位置」变成「有活跃批次停在某位置」），属独立任务。
 
 ## 7. 移除记录
 

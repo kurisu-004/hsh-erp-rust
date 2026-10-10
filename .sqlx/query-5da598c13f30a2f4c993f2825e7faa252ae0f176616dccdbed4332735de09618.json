@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT COUNT(*) AS \"n!\"\n            FROM t_part_batch\n            WHERE current_holder_id = $1\n              AND location = 'WORKER'\n              AND status = 'IN_PROCESS'\n              AND deleted_at IS NULL\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "n!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "5da598c13f30a2f4c993f2825e7faa252ae0f176616dccdbed4332735de09618"
+}
