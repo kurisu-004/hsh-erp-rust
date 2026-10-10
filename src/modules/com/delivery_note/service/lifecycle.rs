@@ -341,7 +341,16 @@ impl DeliveryNoteService {
 
         let now = now_naive();
 
-        // 把每个批次的 status 推到 DELIVERED，清 holder/location，version++
+        // 把每个批次的 status 推到 DELIVERED，清 holder/location，version++。
+        //
+        // ⚠️ 2026-10-14 review 第 2 轮 MAJOR-N1：**下面 `b.current_holder_id = None`
+        // / `b.location = None` 只清的是内存里的 struct**（供响应构造与随后的
+        // `sync_from_batch_change_with_conn` 读），**DB 侧的清理由
+        // `PartBatchRepo::update` 内部的 `clear_location` / `clear_holder_id`
+        // 承担**（那是「终态清位置」不变式的第 6 个写点）。本循环原先把两件事都
+        // 记成「清 holder/location」，读代码的人会以为 DB 侧也被清了 —— 实际没有，
+        // 落库的行仍停在 `INSPECTION_SHELF + <shelf_id>`，是 migration
+        // `20261013000002` 要清的幽灵行。
         let mut affected_part_ids: Vec<i64> = Vec::new();
         for b in &mut note_batches {
             b.status = "DELIVERED".to_string();
@@ -382,8 +391,12 @@ impl DeliveryNoteService {
         let mut seen = std::collections::HashSet::new();
         for pid in affected_part_ids {
             if seen.insert(pid) {
-                // `event_id=None`（M4）：pickup 把批次推到 DELIVERED（非终态），
-                // min-progress 推不出 part 终态，归档事件分支不可达。
+                // `event_id=None`（M4）：**DELIVERED 是批次终态**（终态清位置
+                // 不变式与 migration `20261013000002` 都含它），但归档分支的闸门
+                // 判的是 **part 的派生状态**（`rollup_part_derived` step 4：
+                // `part_status_changed && is_terminal(part_target)`，而
+                // `is_terminal` = `COMPLETED | CANCELLED`）。pickup 把该 part
+                // 派生到的是 `DELIVERED` ⇒ 归档分支不可达。
                 PartService::sync_from_batch_change_with_conn(
                     &mut *repo.conn_mut(),
                     pid,

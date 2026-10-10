@@ -15,6 +15,7 @@ use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
 use crate::modules::part::vo::PartOut;
 use crate::modules::prod::batch::repo::PartBatchRepo;
+use crate::modules::prod::queue::service::QueueService;
 use crate::modules::prod::scan::dto::PickUpRequest;
 use crate::shared::error::{AppError, code};
 // 2026-10-12：`t_part_event` 的写侧自 part 域的事件 INSERT 上提到
@@ -189,6 +190,47 @@ impl ScanService {
         if let Some(shelf_id) = req.shelf_id {
             validate_shelf_zone(repo.conn_mut(), shelf_id, "PRODUCTION").await?;
         }
+        // 2026-10-14 新增：容量守卫（修「报工台取件无上限」bug）。
+        //
+        // 本端点此前**完全没有** `max_held_batches` 守卫 —— 工人在队列板上被
+        // `held < max` 卡着，从报工台取件页却可以无限往手上加，`move_batch` /
+        // `take_one_from_pool` 两条路径的容量契约在这里形同虚设。
+        //
+        // 守卫调 `QueueService::ensure_worker_has_capacity`（queue 域的**单一来源**，
+        // 与 `move_batch` 两个分支同一处），判据 = `docs/api/queue.md` §4.3 的
+        // 「工人持有」，超限返 `BIZ_WORKER_HOLD_LIMIT_EXCEEDED`；工种未配上限返
+        // `BIZ_WORK_TYPE_MAX_HELD_NOT_SET`（NULL 时该工种**不可取件**，与
+        // `take_one_from_pool` 把 `COALESCE(max_held_batches, 0)` 当 cap 0 同口径）。
+        //
+        // ⚠️ **位置是硬约束**，不要挪动（两条边界 + 一条次序理由）：
+        // - 必须在上面 worker `is_active` / `work_type_id` 校验**之后** —— 本守卫
+        //   只收 `work_type_id`，重复校验 worker 是噪声；`wt_id` 的 `is_none()`
+        //   分支已提前 return，故此处恒为 `Some`；
+        // - 必须在 `split_batch_for_partial_pass` **之前** —— 否则「部分领取」会
+        //   先把批次拆出一个新批次、随即撞容量守卫失败，留下一个没人认领的孤儿
+        //   新批次（源批次数量已被扣减）。**这条是本守卫存在价值的一半**：光校验
+        //   不够，必须保证失败发生在任何写动作之前；
+        // - **刻意排在 `validate_shelf_zone` 之后**：守卫是本轮**新增**的检查，
+        //   不得插队到既有检查之前改变错误码优先级 —— 「非法 shelf + 工种未配
+        //   上限」这种组合在改动前只会返回货架错误（20501 / 20512 / 20104），
+        //   插队会让它变成 20904，属于本轮范围外的破坏性变更。
+        // - 仍在事务内（handler 的 `state.pool.begin()`），守卫失败时 tx drop
+        //   隐式回滚。
+        //
+        // ⚠️ 跨域 import 是允许的：`prod::scan` 是**转发型域**，整域不适用域隔离
+        //   护栏（只有 `listing/` 子模块适用，且那条护栏扫不到本文件）。
+        //   同款依赖先例：`prod::scan::handler::transition` 已 import
+        //   `QueueService::refill_for_worker_with_work_type`。
+        //
+        // ⚠️ 返回值 `(current_held, max_held)` 是给 `QueueService::move_batch`
+        //   填 `MoveResult` 展示字段用的，本端点不关心 ⇒ 显式 `let _ =` 丢弃。
+        //   **不要**写成 `.await?;` 然后指望能用到它 —— 那是笔误，会被
+        //   clippy 的 `let_underscore_must_use` 之外的手段漏过去；`let _ =` 在
+        //   本仓是「刻意丢弃」的既有写法。
+        let work_type_id = wt_id.expect("wt_id 已由上方 is_none 分支保证非空");
+        let _ =
+            QueueService::ensure_worker_has_capacity(repo.conn_mut(), req.worker_id, work_type_id)
+                .await?;
         // 2026-10-03 新增：部分领取 —— 翻状态**之前**先把要交出去的那部分拆成
         // 新批次；之后所有针对批次的写入都改指新批次（version 恒为 0）。
         //

@@ -1,13 +1,15 @@
 //! prod::queue::auto_allocate 端到端集成测试（part-worker-pool-federated-rocket 2026-09-11）
 //!
-//! 覆盖 7 个场景：
+//! 覆盖 8 个场景：
 //!   1. COUNT mode happy：fill_ratio=1.0 抢到 max_held_batches 个批次
-//!   2. COUNT mode fill_ratio=0.0 抢到 0 批
+//!   2. COUNT mode fill_ratio=0.0 → 抢 0 批
 //!   3. TIME mode happy：max_held_minutes=120、fill_ratio=0.5 → target=60 分钟
 //!   4. TIME mode 但 max_held_minutes IS NULL → 20703 BIZ_WORK_TYPE_MAX_HELD_MINUTES_NOT_SET
 //!   5. fill_ratio ∉ [0.0, 1.0] → 20704 BIZ_AUTO_ALLOCATE_INVALID_RATIO
 //!   6. 池空 → pool_empty=true，filled.len() = 0
 //!   7. process_id 不存在 → 20801 BIZ_PROCESS_NOT_FOUND
+//!   8. TIME mode 且 max_held_batches IS NULL → skipped_reason=MAX_BATCHES_NOT_SET
+//!      （2026-10-14 review 第 1 轮 MINOR-1：既不是池空也不是工人满，是上限未配置）
 //!
 //! ## 串行化
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
@@ -693,4 +695,59 @@ async fn auto_allocate_process_not_found() {
     .await;
     assert_eq!(s, StatusCode::NOT_FOUND, "无 process 应 404: {env}");
     assert_eq!(env["code"], 20801, "BIZ_PROCESS_NOT_FOUND: {env}");
+}
+
+/// 场景 8（2026-10-14 review 第 1 轮 MINOR-1）: TIME mode 且 `max_held_batches`
+/// **未配置** ⇒ `skipped_reason == "MAX_BATCHES_NOT_SET"`。
+///
+/// 本用例把**两个既有取值都排除掉**，所以断言是有判别力的：
+/// - 池里放了 **1 件**货 ⇒ 报 `POOL_EMPTY` 是谎报；
+/// - 工人持有 **0** 件、且 cap 是 `NULL` 而非 0 ⇒ 报 `WORKER_FULL` 是把
+///   「忘了配上限」误导成「工人满了」。
+///
+/// 成因链：TIME 模式的 `target` 只由 `max_held_minutes` 算出、**不校验** batch 上限
+/// （COUNT 模式在入口就 `ok_or_else` 抛 `20904`，refill 路径同样如此）；而
+/// `take_one_from_pool` 的 `max_batches` CTE 是 `COALESCE(max_held_batches, 0)`
+/// ⇒ 未配置即 cap 0 ⇒ `held < 0` 恒不通过 ⇒ 一次都抢不到。
+/// 此前该处把 `None` 折成 `0` 再比 `held >= 0`（恒真）⇒ 无脑填 `WORKER_FULL`。
+#[tokio::test]
+async fn auto_allocate_time_mode_max_batches_not_set() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "AC8").await;
+    let proc = seed_process(&pool, "PROC-AC8", "工序").await;
+    // `max_held_batches = NULL`（未配置），但 TIME 模式只要求 `max_held_minutes`
+    let wt = insert_work_type(&pool, "WT-AC8", "工种", None, Some(120)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let shelf = insert_shelf(&pool, "PROD-AC8", "PROD-AC8", "PRODUCTION").await;
+    link_shelf_to_process(&pool, shelf, proc).await;
+    // 池里放 1 件 —— 「池空」这个解释被排除
+    insert_pool_part(&pool, customer, "AC8-SN-1", shelf, proc, 5).await;
+    insert_worker(&pool, "BC-AC8", "工", Some(wt)).await;
+
+    let (app, token) = login_manager_with_username(&pool, "mgr_ac8").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/queue/auto-allocate",
+            Some(json!({
+                "process_id": proc.to_string(),
+                "shelf_id": shelf.to_string(),
+                "mode": "TIME",
+                "fill_ratio": 1.0,
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "auto_allocate TIME + 上限未配置: {env}");
+    let filled = env["data"]["filled"].as_array().unwrap();
+    assert_eq!(filled[0]["target"], 120, "max=120, ratio=1.0 → target=120");
+    assert_eq!(filled[0]["filled_count"], 0, "cap 0 ⇒ 一次都抢不到: {env}");
+    // 该字段只回答「有没有人没抢够」、不回答「为什么」
+    assert_eq!(env["data"]["pool_empty"], true, "没抢够 ⇒ pool_empty=true");
+    assert_eq!(
+        filled[0]["skipped_reason"], "MAX_BATCHES_NOT_SET",
+        "池里有货、工人持有 0 件 ⇒ 真实成因是「上限未配置」，不能报 POOL_EMPTY / WORKER_FULL: {env}"
+    );
 }

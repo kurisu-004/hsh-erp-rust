@@ -262,7 +262,8 @@ SQL 在本层聚合。理由与对照（`shared::batch` 为什么反而依赖 4 
   `RETURNED` / 广播 `WORKER_SCAN_INSPECTED`」成立，链路因此自动正确）；
 - `OUTSOURCE_MOVE_DONE`（外协移动端点）；
 - `WORKER_POOL_REFILL_DONE` / `WORKER_POOL_EMPTY`（refill；`WORKER_POOL_EMPTY` 的
-  payload 里 `shelf_id` 自 2026-10-10 起恒为 `null`）。
+  payload 里 `shelf_id` 在 worker-scan 产出点自 2026-10-10 起恒为 `null`，
+  另一产出点 `POST /queue/refill` 为架 id 字符串）。
 
 dashboard 侧对以上事件名的监听与处理见 [`dashboard.md`](dashboard.md)。
 

@@ -345,6 +345,42 @@ pub async fn mark_batch_with_status_and_meta(
 ///
 /// `allowed_from` 由目标状态反查（`status_guard_for_target`）——原实现
 /// 「无源状态守卫」，本实现补上；等价性由该函数的 doc 逐目标状态论证。
+///
+/// ## 2026-10-14：`CANCELLED` 目标额外清 `location` + `current_holder_id`
+///
+/// **不变式**：批次进入终态时不在任何位置、也不在任何人手上。
+///
+/// ## 为什么只对 `CANCELLED` 特判，其余目标仍清 `false`
+///
+/// 本函数有 3 个调用方，两个目标态**必须保留** `location`：
+/// - `prod::scan` / `prod::batch::service::scan.rs` 的 scan-inspect pass → 目标
+///   `READY_TO_SHIP`：批次此刻停在 `INSPECTION_SHELF`（品检架），**位置是有业务
+///   含义的**——它就是「品检完待发运」这个状态的物理落点。清掉它等于让待发运批次
+///   凭空消失，UI 上「待发运」列表（按 `location='INSPECTION_SHELF'` 查）会空掉；
+/// - 同上 FAIL 分支 → 目标 `IN_PROCESS`（返修重入），批次还要回到工人手上，
+///   `location` / `current_holder_id` 是**下一步动作的落点**，清掉等于凭空蒸发。
+///
+/// 所以**不能**改成无条件清 —— 那会把上面两条路径一起打坏。只有 `CANCELLED`
+/// 是真正的「该批次作废、不在任何地方」。
+///
+/// ## `CANCELLED` 这条为何就是幽灵行的泄漏入口
+///
+/// [`status_guard_for_target`] 对非 `READY_TO_SHIP`/`IN_PROCESS` 目标返回
+/// 「全状态减两个终态」的白名单，**`IN_PROCESS` 在其中** ⇒ 「工人正在加工的那
+/// 一批」可以被 `POST /prod/batches/{id}/cancel` 直接取消。而它此刻的形态正是
+/// `status='IN_PROCESS' AND location='WORKER' AND current_holder_id=<某工人>`。
+/// 旧写法（无条件 `clear_*: false`）让这行取消后仍然停在工人名下 ⇒
+///
+/// - 队列板看板（`prod::queue::board::repo::SQL_HELD_BATCHES_BY_WORKERS`，判据
+///   带 `status='IN_PROCESS'`）**看不见**它；
+/// - 容量校验（`prod::batch::repo::queries::count_held_by_worker`、2026-10-14 起
+///   同样带 status 过滤）**也不算**它。
+///
+/// ⇒ 改完之后两端一致，工人每取消一批就立刻拿回一格额度，不会出现「面板显示还有
+/// 额度但取件被拒」这类无法解释的现象。
+///
+/// 存量脏行由 migration `20261013000002_001_clear_terminal_batch_location`
+/// 一次性回补；本处是判据侧 / 写侧的第一道防线，两者都需要。
 pub async fn mark_batch_status_only(
     conn: &mut PgConnection,
     batch_id: i64,
@@ -354,6 +390,10 @@ pub async fn mark_batch_status_only(
     updated_by: i64,
     event_id: Option<i64>,
 ) -> Result<u64, AppError> {
+    // 2026-10-14：只有 CANCELLED 是「作废、不在任何位置」的目标态（完整理由见本
+    // 函数 doc 的两节）。READY_TO_SHIP / IN_PROCESS 必须保留 location 与 holder ——
+    // 它们分别是「品检完待发运的物理落点」与「返修重入的下一步落点」。
+    let is_cancelling = new_status == "CANCELLED";
     apply_batch_status_change(
         conn,
         StatusChange {
@@ -367,8 +407,8 @@ pub async fn mark_batch_status_only(
             expected_version: Some(expected_version),
             allowed_from: status_guard_for_target(new_status),
             updated_by,
-            clear_location: false,
-            clear_holder_id: false,
+            clear_location: is_cancelling,
+            clear_holder_id: is_cancelling,
             clear_process_id: false,
             clear_process_step_id: false,
             // 2026-10-01 review 第 1 轮 M4：只有 `new_status='CANCELLED'` 会让
