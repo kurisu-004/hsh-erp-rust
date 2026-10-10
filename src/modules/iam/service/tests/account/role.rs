@@ -529,3 +529,43 @@ async fn add_role_disabled_role_code_returns_400() {
         "「存在但停用」与「不存在」文案应可区分：{err:?}"
     );
 }
+
+/// **SHELF_ACCOUNT 的 scope 强制规则不变**（BE-4 验收 7）：缺
+/// `scope_type='shelf'` / `scope_id` → 422 的入参校验拒绝，而不是被
+/// 「角色码合法性」新分支改变行为。
+///
+/// 校验顺序：先 `validate_role_exists`（SHELF_ACCOUNT 由 seed 保证存在），
+/// 再 `validate_role_scope` 的必填分支 —— 本用例钉住后者仍会命中。
+#[tokio::test]
+async fn add_role_shelf_account_without_scope_returns_validation_error() {
+    let u = sample_user(101, "alice");
+    let mut mock = MockIamRepoTrait::new();
+    mock.expect_get_user_by_id()
+        .returning(move |_| Ok(Some(u.clone())));
+    mock.expect_get_active_role_by_code().returning(|_| {
+        Ok(Some(crate::modules::iam::rbac::model::TRole::dummy(
+            "SHELF_ACCOUNT",
+        )))
+    });
+    let svc = make_account_service();
+    let req = UserAddRoleRequest {
+        role: "SHELF_ACCOUNT".into(),
+        scope_type: None,
+        scope_id: None,
+    };
+
+    let err = svc
+        .add_role(mock, 101, &req, &current_manager())
+        .await
+        .expect_err("SHELF_ACCOUNT 缺 scope 应 Err");
+
+    match err {
+        crate::shared::error::AppError::Validation(msg) => {
+            assert!(
+                msg.contains("SHELF_ACCOUNT"),
+                "应是 scope 必填的校验失败，got: {msg}"
+            );
+        }
+        other => panic!("expected Validation，got {other:?}"),
+    }
+}
