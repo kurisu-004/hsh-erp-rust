@@ -711,14 +711,23 @@ mod tests {
     }
 
     /// 构造一个最小的 `CurrentUser` 用于 service 直调（绕开 JWT 解析）。
+    ///
+    /// `permissions` 按**迁移后**的权限点矩阵给（2026-10-14）：`queue.dispatch`
+    /// 只授 MANAGER / CLERK（`seeds/rbac.sql`），其余角色空 —— 与生产登录时
+    /// 装载进 session 的快照一致。写路径改权限点后，不这样给会让所有 Manager
+    /// 用例在守卫处 403；而 Inspector 守卫用例仍能命中 40300（它本就不在矩阵里）。
     fn make_current(user_id: i64, role: Role) -> CurrentUser {
+        let permissions = match role {
+            Role::Manager | Role::Clerk => vec!["queue.dispatch".to_string()],
+            _ => Vec::new(),
+        };
         CurrentUser {
             id: user_id,
             username: "test".to_string(),
             roles: vec![role],
             shelf_ids: vec![],
             shelf_wildcard: false,
-            permissions: Vec::new(),
+            permissions,
         }
     }
 
