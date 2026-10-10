@@ -38,6 +38,38 @@ pub fn allowed_exts(kind: &str) -> &'static [&'static str] {
     }
 }
 
+/// `owner_kind` × `kind` 允许对（2026-10-13 PR1b review 第 1 轮 MINOR-3）。
+///
+/// **为什么需要这张表**：四合一之前，`owner_kind` 与 `kind` 的配对是**服务端结构
+/// 决定的** —— `upload-drawing` 端点在 path 上钉死「owner 是 part、kind 是
+/// DRAWING」，`POST /assemblies/{id}/files` 钉死「owner 是装配件、kind 恒
+/// ASSEMBLY_MASTER」。合并成一个端点后两个字段都改由 client 在 multipart `data`
+/// 里提供，而 `allowed_exts` 只按 `kind` 判 ⇒ `owner_kind=PART` +
+/// `kind=ASSEMBLY_MASTER`、`owner_kind=ASSEMBLY` + `kind=DRAWING` 都会被放行。
+/// 后者造出「装配件的图纸」这种无意义行，前者更糟：造出的
+/// **part + ASSEMBLY_MASTER** 行在 `soft_delete_file` 的 kind 分派里长期不可删
+/// （见 `part_file/mod.rs` 的角色矩阵 / 软删一节），等于「写得了、删不了」的
+/// 永久垃圾数据。故配对由服务端**重新强制**。
+///
+/// **与 `allowed_exts` 的分工**：本表管「谁（owner）能挂哪种文件」，`allowed_exts`
+/// 管「这种文件能是什么格式」。两张表都过了才进扩展名 / content_type 校验。
+///
+/// **fail-safe 方向**：不在表内的组合一律 `false`。将来若给 `allowed_exts` 加了
+/// 新的 kind（CAD_2D / G_CODE / SETUP_SHEET 走 CNC 配对端点写入，不经本函数），
+/// 本表**不会**自动放行它 —— 那是有意的：新 kind 必须先在这里显式声明它挂哪种
+/// owner，避免又出现「能写不能删」的行。
+///
+/// 2026-10-13 新增
+pub fn owner_kind_allows_kind(owner_kind: &str, kind: &str) -> bool {
+    match owner_kind {
+        "PART" => matches!(kind, "DRAWING" | "3D_MODEL"),
+        "ASSEMBLY" => matches!(kind, "ASSEMBLY_MASTER"),
+        // 未知 owner_kind 由 `PartFileService::assert_owner_exists` 报 20104，
+        // 这里直接 false（不区分错误码，两道守卫都拒即可）。
+        _ => false,
+    }
+}
+
 /// 扩展名（小写，不含点） → file_type 字符串（如 `"PDF"` / `"STEP"`）。
 ///
 /// **大小写不敏感**：传入 `"STL"` / `"stl"` 等价。
@@ -138,6 +170,36 @@ mod tests {
     #[test]
     fn allowed_exts_unknown_kind_returns_empty() {
         assert_eq!(allowed_exts("UNKNOWN"), &[] as &[&str]);
+    }
+
+    #[test]
+    fn owner_kind_allows_kind_normal_pairs() {
+        // PART owner 只能挂零件自己的两类文件
+        assert!(owner_kind_allows_kind("PART", "DRAWING"));
+        assert!(owner_kind_allows_kind("PART", "3D_MODEL"));
+        // ASSEMBLY owner 只能挂装配件整图
+        assert!(owner_kind_allows_kind("ASSEMBLY", "ASSEMBLY_MASTER"));
+    }
+
+    #[test]
+    fn owner_kind_allows_kind_rejects_cross_pairs() {
+        // ★ 这两组正是四合一后被放行的「脏组合」：
+        //   前者造出永不可删的 part 行（soft_delete_file 的 kind 分派不含 ASSEMBLY_MASTER）
+        //   后者造出语义上不存在的「装配件的零件图纸」
+        assert!(!owner_kind_allows_kind("PART", "ASSEMBLY_MASTER"));
+        assert!(!owner_kind_allows_kind("ASSEMBLY", "DRAWING"));
+        assert!(!owner_kind_allows_kind("ASSEMBLY", "3D_MODEL"));
+    }
+
+    #[test]
+    fn owner_kind_allows_kind_rejects_cnc_kinds_and_unknowns() {
+        // CAD_2D / G_CODE / SETUP_SHEET 只经 `POST /files/cnc/pairs` 写入，
+        // 两条写路径都不该收它们
+        for k in ["CAD_2D", "G_CODE", "SETUP_SHEET"] {
+            assert!(!owner_kind_allows_kind("PART", k), "PART 不该收 {k}");
+        }
+        assert!(!owner_kind_allows_kind("PART", "UNKNOWN"));
+        assert!(!owner_kind_allows_kind("PART_FILE", "DRAWING"));
     }
 
     #[test]

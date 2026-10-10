@@ -73,8 +73,8 @@ use crate::state::AppState;
 //   （`service/batch.rs::prepare_binding_head_copy`）—— 它命中上面的口径
 //   （确实写 `t_part_file`），但端点本体是「批量建零件」，文件只是可选入参，
 //   故按「一条端点的目标域按前端消费方判定」的约定留在 part 域。
-// 下线的 8 条端点逐条清单见 `src/modules/files/part_file/handler.rs` 的模块 doc
-// 「2026-10-13 同批下线的 8 条端点（移除记录，防后人重建）」一节；PR1b 的 3 条
+// 下线的 7 条端点逐条清单见 `src/modules/files/part_file/handler.rs` 的模块 doc
+// 「2026-10-13 同批下线的 7 条端点（移除记录，防后人重建）」一节；PR1b 的 3 条
 // （upload-drawing / upload-3d-model / files/confirm）见同一文件的
 // 「2026-10-13 PR1b：写路径搬进本子模块（上传四合一）」一节。
 
@@ -130,13 +130,23 @@ pub fn router() -> Router<Arc<AppState>> {
         // ---- 2026-09-25 D-08 api-drift-fix：按 part 反查所属装配体 ----
         .route("/{part_id}/assembly", get(handler::get_assembly_by_part))
     // ---- 2026-10-13：part 维度的全部文件端点下线（三批，见上方模块级注记）----
-    //   ① PR1a：cad-files / cnc-programs / setup-sheets / cnc-pair / files 共 8 条；
+    //   ① PR1a：cad-files / cnc-programs / setup-sheets / cnc-pair / files 共 **7** 条
+    //      （2026-10-13 review 第 1 轮 NIT-9 订正：原文写 8 是把同批复活的
+    //      `POST /part-files/` 数了进去）；
     //   ② PR1b：`upload-drawing` / `upload-3d-model` 并入
     //      `POST /api/v2/files/objects`（四合一）；
     //   ③ PR1b：`files/confirm` 硬切到 `POST /api/v2/files/objects/confirm`。
     //   三批**均无 alias，旧路径 404**；移除记录见
     //   `src/modules/files/part_file/handler.rs` 的模块 doc。
+    // ⚠️ ② 的**响应形状与状态码也变了**（2026-10-13 review 第 1 轮 MINOR-5 登记，
+    // 此前 part 侧这处变更三处 doc 都查不到）：HTTP 200 → **201**；
+    // 出参 `R<TPartFile>` → `R<PartFileOut>`；owner 键 `part_id` → `owner_id`
+    // （并新增 `owner_kind` 回显）；丢 `updated_at` / `updated_by` / `deleted_at`。
+    // 逐字段对照见 `files/part_file/mod.rs` 的「零件侧上传的响应形状与状态码变更」一节。
     // ⚠️ 刻意保留在本域的：**`POST /parts/batch` 的 bindings 分支**
     // （service/batch.rs::prepare_binding_head_copy）—— 端点本体是「批量建零件」，
     // 文件只是可选入参，不是一条独立的文件端点。
+    // ⚠️ 该分支仍把 size 上限写死成 300MB（同 `bind_uploaded_file` 的老写法，
+    // 2026-10-13 review 第 1 轮已在 files 域那侧改成读配置，本侧未动）；
+    // 登记见 `files/part_file/mod.rs` 的「已知偏差登记」第 5 条。
 }

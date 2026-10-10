@@ -1472,9 +1472,12 @@ async fn cancel_delivery_note_locked_409() {
 // ===========================================================================
 //  Tests — Part 6.5: 上传 service 层
 //
-//  ⚠️ 2026-10-13 PR1b：原 5 条用例直调 `PartService::upload_drawing` /
+//  ⚠️ 2026-10-13 PR1b：原 5 条用例里 4 条直调 `PartService::upload_drawing` /
 //  `upload_3d_model`，两条 service 方法随端点 `POST /parts/{id}/upload-drawing` /
-//  `upload-3d-model` 下线一并删除（上传并入 `POST /api/v2/files/objects`）。
+//  `upload-3d-model` 下线一并删除（上传并入 `POST /api/v2/files/objects`），
+//  剩下改调 files 域的唯一上传实现 `PartFileService::upload_file_for_owner`；
+//  第 5 条（`upload_drawing_integration`，走 HTTP multipart）随端点下线整条删除
+//  （它打的是已经不存在的 URL，见 `tests/files/part_file.rs` 的 HTTP 层用例）。
 //  下面改调 files 域的唯一上传实现 `PartFileService::upload_file_for_owner`。
 //
 //  三点差异（原用例的断言口径已随之改写，见各条注释）：
@@ -1484,7 +1487,10 @@ async fn cancel_delivery_note_locked_409() {
 //     五段断言是**陈旧的**，一并更正。
 //  2. 出参从 `TPartFile` 变成 `PartFileOut`（`part_id` 字段名改为 `owner_id`，
 //     多出 `owner_kind` / `version` / `created_at` 等）。
-//  3. 这 5 条**仍是 `#[ignore]` 占位**（2026-09-11 起就如此，非本轮引入）。
+//  3. **本组 4 条仍是 `#[ignore]` 占位**（2026-09-11 起就如此，非本轮引入）。
+//     ⚠️ 计数口径（2026-10-13 review 第 1 轮 NIT-13 订正）：本组是 **4** 条
+//     `#[ignore]`，不含 `policy_unit_smoke_integration`（另一处 `#[ignore]`，
+//     走 policy 白名单、不经 `upload_file_for_owner`）。
 //     真正跑得起来的上传覆盖在 `tests/files/part_file.rs` 与
 //     `tests/files/upload.rs`（本组留着是为了保留「零件维度上传」这条意图的
 //     现场记录；哪天要复活，改调点已经指向正确实现）。
@@ -1493,6 +1499,10 @@ async fn cancel_delivery_note_locked_409() {
 /// 上传 CAS key 的 cfg 前缀（测试自造；生产读 `config.cos.upload_prefix`，
 /// 2026-10-13 起缺省 `obj/`）。与 `tests/files/part_file.rs` 的同名常量同款。
 const UPLOAD_UPLOAD_PREFIX: &str = "uploads";
+
+/// 上传 size 上限（2026-10-13 review 第 1 轮 MAJOR-1：`upload_file_for_owner` 新增收
+/// `cfg_max_file_size` 形参）。与 `test_state` 的 `CosConfig.max_file_size` 一致。
+const UPLOAD_MAX_FILE_SIZE: usize = 300 * 1024 * 1024;
 
 /// 构造 Manager 角色 CurrentUser（service 层直调需要 current 参数）
 fn manager_current(id: i64) -> hsh_erp_rust::auth::rbac::CurrentUser {
@@ -1533,6 +1543,7 @@ async fn upload_drawing_service_integration() {
         .upload_file_for_owner(
             &mut *conn,
             UPLOAD_UPLOAD_PREFIX,
+            UPLOAD_MAX_FILE_SIZE,
             "PART",
             part_id,
             "DRAWING",
@@ -1585,6 +1596,7 @@ async fn upload_3d_model_service_integration() {
         .upload_file_for_owner(
             &mut *conn,
             UPLOAD_UPLOAD_PREFIX,
+            UPLOAD_MAX_FILE_SIZE,
             "PART",
             part_id,
             "3D_MODEL",
@@ -1626,6 +1638,7 @@ async fn upload_bad_extension_rejected() {
         .upload_file_for_owner(
             &mut *conn,
             UPLOAD_UPLOAD_PREFIX,
+            UPLOAD_MAX_FILE_SIZE,
             "PART",
             part_id,
             "DRAWING",
@@ -1658,6 +1671,7 @@ async fn upload_content_type_mismatch_rejected() {
         .upload_file_for_owner(
             &mut *conn,
             UPLOAD_UPLOAD_PREFIX,
+            UPLOAD_MAX_FILE_SIZE,
             "PART",
             part_id,
             "DRAWING",

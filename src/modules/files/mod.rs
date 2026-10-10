@@ -48,7 +48,7 @@
 //! ### 第二批（2026-10-13 PR1b）：part / assembly 的文件端点收编
 //!
 //! 本域自此是**全仓唯一**持有 `t_part_file` 写入路径的域（旧 part 域 3 条 +
-//! assembly 域 1 条上传端点 + part 域 1 条 confirm 端点，共 5 条 → 2 条）：
+//! assembly 域 1 条上传端点 + part 域 1 条 confirm 端点，共 **6** 条 → **2** 条）：
 //!
 //! | 旧 URL | 新 URL | 处置 |
 //! |---|---|---|
@@ -59,16 +59,25 @@
 //! | `POST /api/v2/parts/{part_id}/files/confirm` | `POST /api/v2/files/objects/confirm` | 搬家 + body 加 `owner_kind` / `owner_id` |
 //! | `GET /api/v2/assemblies/{assembly_id}/files` | — | 删（0 调用方） |
 //!
-//! 五条旧路径**均无 alias、旧路径 404**。
+//! **6 条旧端点 → 2 条**，均无 alias、旧路径 404。
+//! （2026-10-13 review 第 1 轮 NIT-11 订正：原文写「五条旧路径」，但上表 6 行；
+//! 且「路径」与「端点」混用 —— 搬家类 1 条、删除类 1 条、四合一类 4 条。）
 //!
-//! ### ⚠️ COS 对象 key 前缀统一 `obj/`（2026-10-13）
+//! ### ⚠️ COS 对象 key 前缀：代码侧统一 `obj/`，**容器部署下仍未统一**
 //!
 //! `COS_UPLOAD_PREFIX` 此前有两套实际取值（生产 `.env` 的 `drawings/` 与
-//! `upload_file_for_owner` 硬编码的空串 ⇒ 桶根），现统一为 `obj/`
-//! （`config.cos.upload_prefix` 缺省 / `.env.example` / 代码回退值三处同步）。
+//! `upload_file_for_owner` 硬编码的空串 ⇒ 桶根）。本轮把**代码侧**（`config.rs`
+//! 缺省 / `.env.example` / 代码回退值三处）统一为 `obj/`。
+//!
+//! ⚠️ 2026-10-13 review 第 1 轮 MAJOR-2：**闭环没合上** ——
+//! `docker-compose{,-local,-staging}.yml` 的 `${COS_UPLOAD_PREFIX:-drawings/}`
+//! 共 6 处仍在**根仓**（backend-rust 仓外，本 PR 结构上无法触及），
+//! **容器部署下前缀仍落 `drawings/`**；代码回退值 `obj/` 只在**不经 compose** 的
+//! `cargo run` 场景生效。根仓那 6 处待单独提交。
+//!
 //! ⚠️ **不需要数据迁移、不需要跑 `cos_key_migrate`**：`t_part_file.object_key`
 //! 存的是完整 key，读端点先 `head_object(db_object_key)` 优先命中 ⇒ 历史对象
-//! 原地不动，只有新上传改落 `obj/`。
+//! 原地不动，只有新上传改落配置里的那个前缀。
 //!
 //! ### 刻意留在别的域的两处文件写入
 //!

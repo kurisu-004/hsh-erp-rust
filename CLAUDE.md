@@ -200,14 +200,17 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 > 端点求和 = 1 + 6 + 1 = **8**，与 `src/modules/files/mod.rs` 模块 doc 的端点表恒等。计数口径同 iam 表。
 >
 > **2026-10-13 两批硬切**（均**无 alias**、旧前缀一律 404）：
-> - PR1a：`part_file` / `cnc_program` 两个独立域收编成 `files` 容器域及其嵌套子模块。URL `/api/v2/part-files/*` → `/api/v2/files/objects/*`、`/api/v2/cnc-programs/*` → `/api/v2/files/cnc/*`；同批删除 12 条零调用方端点（part_file 8 + cnc 4）与两张死表（`t_cnc_program` / `t_drawing_file`）。
-> - PR1b：part / assembly 侧的文件端点收编 —— 5 条旧端点（`POST /parts/{id}/upload-drawing`、`POST /parts/{id}/upload-3d-model`、`POST /assemblies/{id}/files`、`POST /parts/{id}/files/confirm`、`GET /assemblies/{id}/files`）**并成 2 条**（`POST /files/objects` 四合一 + `POST /files/objects/confirm`），`GET /assemblies/{id}/files` 直接删除。⇒ files 域是**全仓唯一**持有 `t_part_file` 写入路径的域。
+> - PR1a：`part_file` / `cnc_program` 两个独立域收编成 `files` 容器域及其嵌套子模块。URL `/api/v2/part-files/*` → `/api/v2/files/objects/*`、`/api/v2/cnc-programs/*` → `/api/v2/files/cnc/*`；同批删除 12 条零调用方端点（part_file 8 = 7 条零件维度嵌套 + 同批删除的 `POST /part-files/` 上传〔PR1b 又复活并入四合一〕；cnc 4 = 3 条 alias + 1 条配对列表）与两张死表（`t_cnc_program` / `t_drawing_file`）。⚠️ 计数别与 `files/part_file/handler.rs` 移除记录表的 **7** 条混：那张表只列嵌套的 7 条，不含已复活的 `POST /part-files/`（review 第 1 轮 NIT-9）。
+> - PR1b：part / assembly 侧的文件端点收编 —— **6 条旧端点**（`POST /parts/{id}/upload-drawing`、`POST /parts/{id}/upload-3d-model`、`POST /assemblies/{id}/files`、`POST /part-files/`（PR1a 下线又复活）、`POST /parts/{id}/files/confirm`、`GET /assemblies/{id}/files`）**并成 2 条**（`POST /files/objects` 四合一 + `POST /files/objects/confirm`），其中 `GET /assemblies/{id}/files` 是**直接删除**。⇒ files 域是**全仓唯一**持有 `t_part_file` 写入路径的域。（2026-10-13 review 第 1 轮 NIT-11 订正：原文写「5 条旧端点」，漏数了复活那条；且把「端点」与「路径」混用。）
+>   ★ **part 侧的响应形状与状态码也变了**（MINOR-5 登记，此前三处 doc 都查不到）：HTTP **200 → 201**；出参 `R<TPartFile>` → `R<PartFileOut>`；owner 键 `part_id` → `owner_id`（新增 `owner_kind` 回显）；丢 `updated_at` / `updated_by` / `deleted_at`。逐字段对照见 `src/modules/files/part_file/mod.rs` 的「零件侧上传的响应形状与状态码变更」一节。
 >
-> ⚠️ **COS 对象 key 前缀统一 `obj/`（2026-10-13）**：`COS_UPLOAD_PREFIX` 此前有两套实际取值（生产 `.env` 的 `drawings/` 与 `upload_file_for_owner` 硬编码空串 ⇒ 桶根），现统一为 `obj/`（`config.rs` 缺省值 / `.env.example` / 代码回退三处同步）。**不需要数据迁移、不要跑 `src/bin/cos_key_migrate.rs`**：`t_part_file.object_key` 存完整 key，读端点 `PartFileService::resolve_effective_key` 先 `head_object(db_object_key)` 优先命中，历史对象原地不动，只有新上传改落 `obj/`。
+> ⚠️ **COS 对象 key 前缀：代码侧统一 `obj/`，容器部署下仍未统一（2026-10-13）**：`COS_UPLOAD_PREFIX` 此前有两套实际取值（生产 `.env` 的 `drawings/` 与 `upload_file_for_owner` 硬编码空串 ⇒ 桶根），代码侧现已收敛为 `obj/`（`config.rs` 缺省值 / `.env.example` / 代码回退三处同步）。**但 `docker-compose{,-local,-staging}.yml` 的 `${COS_UPLOAD_PREFIX:-drawings/}` 共 6 处仍在根仓**（backend-rust 仓外，本 PR 结构上无法触及）⇒ **容器部署下前缀仍落 `drawings/`**，代码回退值 `obj/` 只在不经 compose 的 `cargo run` 场景生效；根仓那 6 处待单独提交。**不要**在本文件或代码注释里写成「前缀已统一」（2026-10-13 review 第 1 轮 MAJOR-2）。**不需要数据迁移、不要跑 `src/bin/cos_key_migrate.rs`**：`t_part_file.object_key` 存完整 key，读端点 `PartFileService::resolve_effective_key` 先 `head_object(db_object_key)` 优先命中，历史对象原地不动，只有新上传改落配置里的那个前缀。
+>
+> ⚠️ **写路径的两处守卫别再弄丢**（review 第 1 轮 MAJOR-1 回归）：`POST /files/objects` 与 `POST /files/objects/confirm` 都从配置读 `COS_MAX_FILE_SIZE`（`.env.example` = 100MB），0 字节 → 40001、超限 → 21103；两条路径**同时**校验 `owner_kind` × `kind` 配对（`PART` 只收 DRAWING / 3D_MODEL，`ASSEMBLY` 只收 ASSEMBLY_MASTER，否则 20104）。已知例外：`POST /parts/batch` 的 bindings 分支仍写死 300MB（part 域、本 PR 未触碰，登记在 `files/part_file/mod.rs` 的「已知偏差登记」第 5 条）。
 >
 > ⚠️ **刻意留在别的域的两处文件写入**：`POST /api/v2/parts/batch` 的 **bindings 分支**（端点本体是「批量建零件」，文件只是可选入参）；`POST /api/v2/parts/batch-with-pdfs` / `POST /api/v2/assemblies` 的 **multipart PDF**（只喂 `lopdf` 数页数，不入库不上 COS）。
 >
-> ⚠️ `files` 域**不在** `docs/api/` 的整域覆盖清单里（该目录只覆盖部分域，判据见本文件「`docs/api/` 目录约定」一节），契约真源是各级模块 doc。
+> ⚠️ `files` 域**不在** `docs/api/` 的整域覆盖清单里（该目录只覆盖部分域，判据见本文件「`docs/api/` 目录约定」一节），契约真源是各级模块 doc；「已知偏差登记」节落在 `src/modules/files/part_file/mod.rs` 的模块 doc 末尾。
 
 ### `src/modules/dashboard/` 域（只读大屏聚合，2026-10-07 VO 重构后 3 个端点）
 

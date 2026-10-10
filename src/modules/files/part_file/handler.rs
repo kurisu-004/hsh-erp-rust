@@ -54,7 +54,7 @@
 //! `/confirm` 是 3 段（`files/objects/confirm`），与 `/{file_id}/url` 等 4 段 catch-all
 //! 段数不同，**天然无冲突**；`/`（0 段内的 root）同样不与之竞争。
 //!
-//! ## 2026-10-13 同批下线的 8 条端点（移除记录，防后人重建）
+//! ## 2026-10-13 同批下线的 7 条端点（移除记录，防后人重建）
 //!
 //! 原「零件维度嵌套」第二入口 `/part-files/parts/{part_id}/<file>...` 整段下线
 //! （`part_nested_router()` 一并删除），已核实零前端调用方：
@@ -70,8 +70,11 @@
 //! 连带删除的死代码：`read_part_file_multipart`（private helper，4 个调用方全删）、
 //! `PartFilesQuery`。
 //!
-//! ⚠️ 上表里的 `POST /part-files/` **不在本表**：它在本轮（PR1b）以
-//! `POST /files/objects` 的形态**复活并通用化**了，别按本表把它当已删端点。
+//! ⚠️ 上表**没有** `POST /part-files/`：它在 PR1b 以 `POST /files/objects` 的形态
+//! **复活并通用化**了，别按本表把它当已删端点。
+//! （2026-10-13 review 第 1 轮 NIT-9 订正：原文标题写「8 条」是因为把复活的
+//! `POST /part-files/` 也数了进去；实际下线的是上表 **7** 条。原文那句
+//! 「`POST /part-files/` 不在本表」也自相矛盾，已改成「上表**没有**」。）
 //!
 //! ## 事务边界（2026-09-22 重构对齐 iam 范式，2026-10-13 收编时不变）
 //! handler 负责 `pool.begin()` / `tx.commit()` —— service 不知事务：
@@ -133,11 +136,39 @@ use crate::state::AppState;
 /// （Manager / Clerk / CncProgrammer）—— 与三条旧端点**合并后取并集**：
 /// 旧 `upload-drawing` / `upload-3d-model` 是 M+C（`CRUD_PART_ROLES`）、旧
 /// `assemblies/{id}/files` 是 M+C、旧 multipart 端点是 M+C+CNC，故白名单含 CNC。
-/// ⚠️ 这是四合一带来的**唯一一处权限面放大**：能传 CNC 程序的人现在也能传图纸 /
-/// 装配件 PDF（旧 multipart 端点已经是这个白名单，本轮只是让另三条与之看齐）。
+///
+/// ⚠️ **权限面到底放大了什么**（2026-10-13 review 第 1 轮存疑点 4 订正，别再笼统
+/// 写成「CNC 现在也能传图纸 / 3D 模型」——那句话不准确）：
+/// - **DRAWING / 3D_MODEL：没有放大**。CNC 在 PR1b 之前就已经能传这两类（旧
+///   `POST /part-files/` 的白名单本就是 M+C+CNC，且 `policy::allowed_exts` 当时
+///   已经认这两个 kind）。变的只是**入口 URL**（原来要打 M+C 的
+///   `upload-drawing` / `upload-3d-model`，现在打合并后的同一个端点），能力没变。
+/// - **ASSEMBLY_MASTER：这是唯一真实新增的能力面**。该 kind 的扩展名白名单
+///   （`&["pdf"]`）是本轮为让装配件 PDF 走本端点而加的，加了之后 CNC 也就跟着能
+///   写装配件整图了 —— 旧 `POST /assemblies/{id}/files` 是 M+C-only。
+///
+/// ⚠️ **不收紧**：按 kind 派生角色会让「一个端点一种 kind」的白名单重新分裂，
+/// 与本轮合并的目的相反。要限制「谁能传装配件 PDF」应另开按 kind 的授权规则，
+/// 不该在这次合并里顺手做。
 ///
 /// 权限守卫在读 multipart **之前**（避免未授权请求触发整包内存分配），与 part 域
 /// 旧 handler 的 Finding B 纪律一致；service 内再校验一次（双层守卫）。
+///
+/// ## 错误码（按校验顺序，先命中先返回）
+///
+/// | 码 | 条件 | 位置 |
+/// |---|---|---|
+/// | 40300 | 角色不在 M / C / CNC 内 | handler（读 multipart 前）+ service 双层 |
+/// | 20104 | `data` / `file` / filename 缺失、`data` JSON 解析失败、`owner_id` 非数字、`owner_kind` × `kind` 组合非法 | handler（前三项）+ service（末项） |
+/// | 21105 | owner 不存在（`owner_kind ∈ {PART, ASSEMBLY}` 但 id 查不到） | service `assert_owner_exists` |
+/// | 40001 | **0 字节文件** | service（2026-10-13 review 第 1 轮 MAJOR-1 补回，被删的 `upload_part_file` 有这道） |
+/// | 21103 | **超过 `config.cos.max_file_size`**（`COS_MAX_FILE_SIZE`，`.env.example` = 100MB） | service（同上补回；HTTP 413 语义走信封里的 400） |
+/// | 21102 | 无扩展名 / 扩展名不在 `policy::allowed_exts(kind)` / content_type 与扩展名不匹配 | service |
+/// | 21108 | 撞 `uk_t_part_file_single`（同 owner + kind 已有活跃行且内容不同） | service |
+///
+/// ⚠️ HTTP 状态码：成功是 **201 Created**；2xxxx 业务码一律映射成 **400**（信封内
+/// 带真实业务码），40001 是 422。空字节走 40001（422）而不是 21103（400）—— 与被删
+/// 实现的取舍一致：空文件是「无效输入」，不是「太大」。
 pub async fn upload_part_file(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -204,6 +235,10 @@ pub async fn upload_part_file(
         .upload_file_for_owner(
             &mut *tx,
             &state.config.cos.upload_prefix,
+            // 2026-10-13 review 第 1 轮 MAJOR-1：size 上限由配置下发（.env 的
+            // `COS_MAX_FILE_SIZE`，`.env.example` = 100MB），不再由全局 body limit
+            // （`MAX_REQUEST_BODY_SIZE`，300MB）隐式兜底。
+            state.config.cos.max_file_size,
             &data.owner_kind,
             owner_id,
             &data.kind,
@@ -247,6 +282,9 @@ pub async fn confirm_file_object(
         state.cos.clone(),
         &state.config.cos.upload_prefix,
         &state.config.cos.tmp_prefix,
+        // 2026-10-13 review 第 1 轮 MAJOR-1：原先 service 内写死 300MB，
+        // `COS_MAX_FILE_SIZE` 解析了从没被这条路径读过；改为配置下发。
+        state.config.cos.max_file_size,
         &req.owner_kind,
         owner_id,
         &req.kind,
@@ -367,8 +405,9 @@ pub async fn get_part_file_content(
 /// `POST /api/v2/files/objects/{file_id}/delete` —— 软删 + COS 异步清理。
 ///
 /// 入参（JSON）：`{ version: i32 }`（OCC）。
-/// 权限：按 kind 派生角色（DRAWING / 3D_MODEL / CAD_2D / SETUP_SHEET → M+C；
-/// G_CODE → M+CNC）。
+/// 权限：按 kind 派生角色（DRAWING / 3D_MODEL / CAD_2D / SETUP_SHEET /
+/// **ASSEMBLY_MASTER** → M+C；G_CODE → M+CNC）。`ASSEMBLY_MASTER` 是
+/// 2026-10-13 review 第 1 轮 MINOR-6 补进分派的，详见 `service.rs::soft_delete_file`。
 ///
 /// 2026-09-15 review A2 修：service 返回 `object_key` 后，handler 必须
 /// 先 `tx.commit()` 再 `tokio::spawn(cos.delete_object(...))`，避免

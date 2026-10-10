@@ -3,8 +3,15 @@
 //! 对应 Python myERP/service/part_file_service.py + service/_file_kind_policy.py。
 //!
 //! ## 上传核心逻辑（`upload_file_for_owner`）
+//! 0. `owner_kind` × `kind` 配对校验（`policy::owner_kind_allows_kind`；2026-10-13
+//!    review 第 1 轮 MINOR-3 补）—— 四合一之前这层配对由各端点的 path 段结构性保证，
+//!    合并后两个字段都来自 client ⇒ 服务端重新强制
 //! 1. 取 `owner_kind`（PART / ASSEMBLY），校验存在性（21105 OWNER_NOT_FOUND）—— 走
 //!    `repo.part_owner_exists` / `repo.assembly_owner_exists`
+//!    - **空字节 / 超限守卫**（2026-10-13 review 第 1 轮 MAJOR-1 补）：0 字节 → 40001；
+//!      超 `cfg_max_file_size`（handler 传 `state.config.cos.max_file_size`）→ 21103。
+//!      这两道是被删的 `PartService::upload_part_file` 带过的，PR1b 合并时漏了
+//!    - **`owner_kind` × `kind` 配对**（MINOR-3 补，见步骤 0）
 //! 2. 校验 `kind` 在白名单内（policy::allowed_exts）
 //! 3. 校验扩展名（policy::ext_of）—— 无扩展名 / 不在白名单 → 21102 BAD_TYPE
 //! 4. 校验 content_type（policy::expected_content_types_for_ext）—— 不匹配 → 21102
@@ -112,11 +119,28 @@ impl PartFileService {
     /// 取舍：**以本方法为准**（它是 files 域 canonical，且 sha 去重能真正省掉一次
     /// COS PUT）。被判据 `uk_t_part_file_single` 兜住的是「一个 owner 一个 kind 只有
     /// 一条活跃行」，两条实现的这条不变式其实一致，差别只在**撞的是哪种情况**时报什么。
+    ///
+    /// ## ⚠️ 2026-10-13 review 第 1 轮 MAJOR-1：文件大小与空字节两道守卫
+    ///
+    /// 本方法此前**没有**任何 size 判据（PR1b 合并时把被删的
+    /// `PartService::upload_part_file` 里的两道守卫一起丢了）。后果有三条：
+    /// - 有效上限从 `cfg.cos.max_file_size`（`.env.example` = 100MB）放宽到
+    ///   `max_request_body_size`（300MB）且改由全局 layer 兜底；
+    /// - 0 字节文件能一路过 ext / content_type 两关 → `put_object` 写 0 字节对象
+    ///   + INSERT `file_size = 0` 的行；
+    /// - `21103 BIZ_PART_FILE_TOO_LARGE` 在 multipart 上传路径上彻底不可达。
+    ///
+    /// `cfg_max_file_size` 由 handler 传 `state.config.cos.max_file_size`
+    /// （与被删实现同源）；**不要**在 service 里写死数值。守卫位置在「owner 存在性」
+    /// 之后 —— 错误码优先级即校验顺序：`40300`（角色）→ `20104`（owner_kind × kind
+    /// 配对）→ `21105`（owner 不存在）→ `40001`（空字节）→ `21103`（超限）→
+    /// `21102`（扩展名 / content_type）。
     #[allow(clippy::too_many_arguments)]
     pub async fn upload_file_for_owner<R: PartFileRepoTrait>(
         &self,
         mut repo: R,
         cfg_upload_prefix: &str,
+        cfg_max_file_size: usize,
         owner_kind: &str,
         owner_id: i64,
         kind: &str,
@@ -127,8 +151,32 @@ impl PartFileService {
     ) -> Result<PartFileOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::CncProgrammer])?;
 
+        // 0. owner_kind × kind 配对（2026-10-13 review 第 1 轮 MINOR-3）：四合一
+        //    之前这层配对由「各端点自己的 path 段 + 硬编码 kind」在结构上保证，
+        //    合并后两个字段都来自 multipart `data` ⇒ 必须由服务端重新强制。
+        //    纯内存判断，放在最前面（不花一次 DB 往返）。
+        Self::assert_owner_kind_matches_kind(owner_kind, kind)?;
+
         // 1. owner 存在性校验（走 trait helper）
         Self::assert_owner_exists(&mut repo, owner_kind, owner_id).await?;
+
+        // 1b. 空字节 / 超限守卫（2026-10-13 review 第 1 轮 MAJOR-1，与被删的
+        //     `PartService::upload_part_file` 逐字等价）。
+        //     ⚠️ 空字节**不是**「过大」而是「无效输入」：用 VALIDATION_ERROR (40001)
+        //     而不是 BIZ_PART_FILE_TOO_LARGE (21103)。
+        if bytes.is_empty() {
+            return Err(AppError::validation(format!("{kind} 字节为空")));
+        }
+        if bytes.len() > cfg_max_file_size {
+            return Err(AppError::biz(
+                code::BIZ_PART_FILE_TOO_LARGE,
+                format!(
+                    "{kind} {} bytes 超过上限 {cfg_max_file_size}（{}MB）",
+                    bytes.len(),
+                    cfg_max_file_size / 1024 / 1024
+                ),
+            ));
+        }
 
         // 2. kind 白名单（policy::allowed_exts 自动挡掉未知 kind）
         let ext = policy::ext_of(original_filename).ok_or_else(|| {
@@ -345,6 +393,29 @@ impl PartFileService {
         Ok(db_object_key.to_string())
     }
 
+    /// `owner_kind` × `kind` 配对守卫（2026-10-13 review 第 1 轮 MINOR-3）。
+    ///
+    /// 允许对见 [`policy::owner_kind_allows_kind`]（表与理由都在那里）。
+    /// 错误码用 `BIZ_INVALID_VALUE`（20104），与「`owner_kind` 不在
+    /// `{PART, ASSEMBLY}`」那道守卫同款 —— 两者都是「请求里这对字段的组合非法」，
+    /// 而不是文件本身有问题（后者才是 21102 `BIZ_PART_FILE_BAD_TYPE`）。
+    ///
+    /// 两条写路径（`upload_file_for_owner` multipart 上传 / `bind_uploaded_file`
+    /// STS 直传回执）都调它：`policy::allowed_exts` 新增 `ASSEMBLY_MASTER` 顺带把
+    /// confirm 路径的接受面一起放大了（`dto::validate::check_kind` 复用同一张
+    /// 白名单），不放这里的话 confirm 能造出同样的「写得了、删不了」行。
+    fn assert_owner_kind_matches_kind(owner_kind: &str, kind: &str) -> Result<(), AppError> {
+        if !policy::owner_kind_allows_kind(owner_kind, kind) {
+            return Err(AppError::biz(
+                code::BIZ_INVALID_VALUE,
+                format!(
+                    "owner_kind={owner_kind:?} 与 kind={kind:?} 不是允许的组合（PART 收 DRAWING / 3D_MODEL，ASSEMBLY 收 ASSEMBLY_MASTER）"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// 校验 owner 存在性（polymorphic，走 trait helper）。
     async fn assert_owner_exists<R: PartFileRepoTrait>(
         repo: &mut R,
@@ -422,8 +493,10 @@ impl PartFileService {
 // - 本方法保持原签名（pool / snowflake / cos 全部参数化），由 service 自行
 //   `pool.begin()` 开 tx；tx 内 DB 操作仍走 trait 模式（`&mut *tx` 直接喂给
 //   `PartFileRepoTrait`）。
-// - 这是 handler 移交事务范式的**唯一例外**，余下 6 个 part_file 端点
-//   （upload/list/get_url/get_content/soft_delete/delete）均按 handler 管 tx 范式改造。
+// - 这是 handler 移交事务范式的**唯一例外**，余下 **5** 个 part_file 端点
+//   （upload / list / get_url / get_content / soft_delete）均按 handler 管 tx 范式改造。
+//   （2026-10-13 review 第 1 轮 NIT-10 订正：原文写「6 个」并把 `soft_delete` 与
+//   `delete` 拆成两条数，实际它们是同一条端点 `POST /files/objects/{file_id}/delete`。）
 
 impl PartFileService {
     /// 把已上传到 COS tmp 区的一个对象绑定到 owner（INSERT t_part_file）。
@@ -431,19 +504,30 @@ impl PartFileService {
     /// 调用方：`POST /api/v2/files/objects/confirm` 的 handler。
     ///
     /// 流程：
+    /// 0. 角色守卫（M+C）
     /// 1. owner 存在性校验（`owner_kind ∈ {PART, ASSEMBLY}`；2026-10-13 PR1b 新增，
     ///    旧形态 owner 在 path 段恒 PART、无需校验）
+    ///    ＋ `owner_kind` × `kind` 配对校验（2026-10-13 review 第 1 轮 MINOR-3）
     /// 2. `tmp_key` 前缀防呆：必须以 `cfg_tmp_prefix` 开头（防客户端乱传 key 读到别人文件）
     /// 3. `head_object` 校验对象存在 + size 与声明一致：
     ///    - 不存在 → `BIZ_PART_FILE_TMP_OBJECT_MISSING` 21114
     ///    - size 不一致 → `BIZ_PART_FILE_SIZE_MISMATCH` 21115
-    /// 4. 派生 CAS key：`util::cos_key::build_cas_key(prefix, sha16, filename)`
+    ///    - 超 `cfg_max_file_size`（handler 传 `state.config.cos.max_file_size`）
+    ///      → `BIZ_PART_FILE_TOO_LARGE` 21103（2026-10-13 review 第 1 轮 MAJOR-1：
+    ///      原先此处写死 300MB，改由配置下发）    /// 4. 派生 CAS key：`util::cos_key::build_cas_key(prefix, sha16, filename)`
     /// 5. `cos.copy_object(tmp_key, cas_key)` —— 走 PermanentCos（不走 STS）
     /// 6. copy_object 成功后**立刻 spawn** best-effort delete_object(tmp_key) 早期清理
     /// 7. 开 tx：soft_delete 旧活跃行（`uk_t_part_file_single` 部分唯一约束） + INSERT 新行
     /// 8. commit
     /// 9. 返回 `(PartFileOut, tmp_key)` —— caller 拿到 tmp_key 后**已 commit**，再
     ///    spawn 异步 delete_object(tmp_key) 兜底清理
+    ///
+    /// ⚠️ **`ASSEMBLY_MASTER` 的确认面**（2026-10-13 PR1b 计划外扩大）：`check_kind`
+    /// 复用 `policy::allowed_exts`，而该白名单本轮为 multipart 上传新增了
+    /// `ASSEMBLY_MASTER` ⇒ confirm 端点**顺带**开始接受这个 kind。四合一的本意
+    /// 只是让 assembly 的 PDF 能走上传端点，confirm 侧一并放开是复用的副作用，
+    /// 不是设计意图；保留（两条路径对 kind 的接受面一致，是同一张白名单的必然结果），
+    /// 但已在 `part_file/mod.rs` 与 `files/mod.rs` 的移除记录里显式登记。
     ///
     /// **重要**：head/copy 是外部 IO，**不**放进事务 tx 里——tx 里只做 DB（事务回滚时
     /// IO 已发生难恢复），依赖 6 / 9 两层 spawn 双层防护。
@@ -458,6 +542,7 @@ impl PartFileService {
         cos: Arc<dyn CosClient>,
         cfg_upload_prefix: &str,
         cfg_tmp_prefix: &str,
+        cfg_max_file_size: usize,
         owner_kind: &str,
         owner_id: i64,
         kind: &str,
@@ -476,13 +561,21 @@ impl PartFileService {
             let mut repo: &mut sqlx::PgConnection = &mut conn;
             Self::assert_owner_exists(&mut repo, owner_kind, owner_id).await?;
         }
+        // 1c. owner_kind × kind 配对（2026-10-13 review 第 1 轮 MINOR-3）：
+        //     `check_kind` 只认 kind 白名单、不看 owner ⇒ 这里补上另一半，
+        //     否则 confirm 也能造出「part + ASSEMBLY_MASTER」这种永不可删的行。
+        Self::assert_owner_kind_matches_kind(owner_kind, kind)?;
 
         // 2. 字段校验（kind/sha/filename/size/content_type）
-        let max_file_size = 300 * 1024 * 1024usize;
+        // ⚠️ 2026-10-13 review 第 1 轮 MAJOR-1：原先这里是硬编码的
+        // `300 * 1024 * 1024`，与 `cfg_upload_prefix` 同源的 `cfg_max_file_size`
+        // 形参一起由 handler 传 `state.config.cos.max_file_size` 下来 —— 这是
+        // CLAUDE.md 已登记的「`COS_MAX_FILE_SIZE` 解析了从没被读」的同一件事。
         validate::check_kind(kind)?;
+
         validate::check_sha256(sha256)?;
         validate::check_filename(original_filename)?;
-        validate::check_file_size(file_size, max_file_size)?;
+        validate::check_file_size(file_size, cfg_max_file_size)?;
         validate::check_content_type(content_type, original_filename)?;
 
         // 3. tmp_key 前缀防呆
@@ -652,14 +745,30 @@ impl PartFileService {
 
     /// `POST /api/v2/files/objects/{file_id}/delete`。
     ///
-    /// 权限：按 `kind` 派生（DRAWING / 3D_MODEL / CAD_2D / SETUP_SHEET → M+C；
-    /// G_CODE → M+CNC）。
+    /// 权限：按 `kind` 派生（DRAWING / 3D_MODEL / CAD_2D / SETUP_SHEET /
+    /// **ASSEMBLY_MASTER** → M+C；G_CODE → M+CNC）。
     ///
     /// 行为：乐观锁守；UPDATE `deleted_at = now()` + `version = version + 1`。
     ///
     /// 返回软删行的 `object_key`，由 **handler 在 `tx.commit()` 之后** 异步
     /// `tokio::spawn(cos.delete_object(...))`——避免 commit 失败却已触发
     /// COS 删除、孤儿对象风险（2026-09-15 review 第 1 轮 A2 修）。
+    ///
+    /// ### ⚠️ 2026-10-13 review 第 1 轮 MINOR-6：`ASSEMBLY_MASTER` 补进分派
+    ///
+    /// 分派表原先**不含** `ASSEMBLY_MASTER`，于是「能被上传、永远删不掉」的
+    /// `t_part_file` 行是造的（`POST /files/objects` 与 PR1b 之前的
+    /// `POST /assemblies/{id}/files` 两条老入口都收 `kind=ASSEMBLY_MASTER`，
+    /// 删除侧只认其余 4 种）。该缺口在 `master` 上就存在（分派逐字相同）、
+    /// PR1b 未改动删除路径，**不是本 PR 的回归**；但 PR1b 把 files 域变成
+    /// `t_part_file` 的**唯一**写入域之后，「写得了、删不了」成了**该域自身**的
+    /// 缺陷，故本轮闭合。
+    ///
+    /// **零角色面变化**：并入的是既有那一支 `M + C`（Manager / Clerk），而
+    /// `ASSEMBLY_MASTER` 行本来就只有 Manager / Clerk / CncProgrammer 能造出来
+    /// （上传端点白名单 M+C+CNC）——没有引入任何新角色，对 CNC 只是补上
+    /// 「自己能造的行自己能删」。⚠️ 不要再拿「会放宽写端点角色面」当不改的理由：
+    /// 那是把「新增一个角色」与「新增一个 kind 落进既有角色的桶」混为一谈。
     pub async fn soft_delete_file<R: PartFileRepoTrait>(
         &self,
         mut repo: R,
@@ -677,7 +786,7 @@ impl PartFileService {
         let object_key = row.object_key.clone();
         // 按 kind 派生权限
         match kind.as_str() {
-            "DRAWING" | "3D_MODEL" | "CAD_2D" | "SETUP_SHEET" => {
+            "DRAWING" | "3D_MODEL" | "CAD_2D" | "SETUP_SHEET" | "ASSEMBLY_MASTER" => {
                 current.require_any_role(&[Role::Manager, Role::Clerk])?;
             }
             "G_CODE" => {
@@ -687,7 +796,7 @@ impl PartFileService {
                 return Err(AppError::biz(
                     code::BIZ_PART_FILE_BAD_TYPE,
                     format!(
-                        "kind={other:?} 不可软删（仅 DRAWING / 3D_MODEL / CAD_2D / SETUP_SHEET / G_CODE）"
+                        "kind={other:?} 不可软删（仅 DRAWING / 3D_MODEL / CAD_2D / SETUP_SHEET / ASSEMBLY_MASTER / G_CODE）"
                     ),
                 ));
             }

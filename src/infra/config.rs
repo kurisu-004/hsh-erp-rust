@@ -216,7 +216,7 @@ pub struct CosConfig {
     /// 整体作为 virtual-host 第一段。
     pub endpoint: String,
     pub scheme: String,
-    /// COS 桶内上传前缀（env `COS_UPLOAD_PREFIX`，`.env.example` 缺省 `obj/`）。
+    /// COS 桶内上传前缀（env `COS_UPLOAD_PREFIX`，代码缺省 `obj/`）。
     ///
     /// 2026-09-29 扁平化：CAS key 模板已从五段简化为两段
     /// `{prefix}{sha16}_{safe_filename}` —— prefix 只在新 key 的写入路径
@@ -232,6 +232,15 @@ pub struct CosConfig {
     /// 读端点先 `head_object(db_object_key)` 优先命中 ⇒ 历史对象原地不动，
     /// 只是新上传改落新前缀。别为此跑 `src/bin/cos_key_migrate.rs`（那是 2026-09-29
     /// 五段→两段的迁移，与前缀无关）。
+    ///
+    /// ### ⚠️ 2026-10-13 review 第 1 轮 MAJOR-2：容器部署下前缀**仍未**统一
+    ///
+    /// 代码侧（`config.rs` 缺省 / `.env.example` / 代码回退三处）已是 `obj/`，但
+    /// **`docker-compose{,-local,-staging}.yml` 的 `${COS_UPLOAD_PREFIX:-drawings/}`
+    /// 共 6 处仍在根仓**（backend-rust 仓外，本 PR 结构上无法触及）⇒
+    /// **容器部署下前缀仍落 `drawings/`**，代码回退值 `obj/` 只在**不经 compose** 的
+    /// `cargo run` 场景生效。根仓那 6 处待单独提交改掉，本仓不要在文档里声称
+    /// 「前缀已统一」——那会让后人以为闭环已合上。
     pub upload_prefix: String,
     pub presign_expire_seconds: u32,
     pub max_file_size: usize,

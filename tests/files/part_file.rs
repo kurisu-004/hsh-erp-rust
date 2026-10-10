@@ -21,6 +21,10 @@
 //!  17. old_part_upload_3d_model_returns_404 — PR1b 硬切守卫（part 侧 3D 上传）
 //!  18. old_part_files_confirm_returns_404 — PR1b 硬切守卫（confirm 搬家）
 //!  19. old_assembly_files_returns_404 — PR1b 硬切守卫（assembly 侧 POST + GET）
+//!  20. list_assembly_owner_filters_by_kind_and_owner — ASSEMBLY owner 列表**内容**
+//!      断言（review 第 1 轮 MINOR-7：被删的 `tests/assembly/files_list.rs` 留下的空洞）
+//!  21. soft_delete_assembly_master_happy_path — `ASSEMBLY_MASTER` 可软删
+//!      （review 第 1 轮 MINOR-6 回归：闭合前是「能造不能删」）
 //!
 //! ## 集成策略
 //! 主体是**直接 service 直调**（避免 JWT/Redis 开销）：`pool.begin()` 开 tx →
@@ -30,6 +34,8 @@
 //!
 //! ⚠️ 2026-10-13 PR1b：`upload_file_for_owner` / `bind_uploaded_file` 各多收一个
 //! 形参（前者的 cfg 前缀、后者的 `owner_kind`），本文件全部调用点已同步。
+//! 2026-10-13 review 第 1 轮 MAJOR-1：两者又各多收 `cfg_max_file_size`（原先
+//! `bind_uploaded_file` 写死 300MB），调用点同样已同步。
 //! 装配件 owner（`owner_kind=ASSEMBLY`）的上传用例在 `upload.rs`。
 //!
 //! ## 2026-10-13 随端点下线删除的用例
@@ -161,6 +167,7 @@ async fn upload_pdf_happy_path() {
         .upload_file_for_owner(
             &mut *tx,
             UPLOAD_UPLOAD_PREFIX,
+            UPLOAD_MAX_FILE_SIZE,
             "PART",
             part_id,
             "DRAWING",
@@ -199,6 +206,7 @@ async fn upload_invalid_kind_returns_21102() {
         .upload_file_for_owner(
             &mut *tx,
             UPLOAD_UPLOAD_PREFIX,
+            UPLOAD_MAX_FILE_SIZE,
             "PART",
             part_id,
             "DRAWING", // DRAWING 不接受 step
@@ -235,6 +243,7 @@ async fn upload_cas_dedup_skips_cos() {
         .upload_file_for_owner(
             &mut *tx,
             UPLOAD_UPLOAD_PREFIX,
+            UPLOAD_MAX_FILE_SIZE,
             "PART",
             part_id,
             "DRAWING",
@@ -253,6 +262,7 @@ async fn upload_cas_dedup_skips_cos() {
         .upload_file_for_owner(
             &mut *tx,
             UPLOAD_UPLOAD_PREFIX,
+            UPLOAD_MAX_FILE_SIZE,
             "PART",
             part_id,
             "DRAWING",
@@ -283,6 +293,7 @@ async fn upload_owner_not_found_returns_21105() {
         .upload_file_for_owner(
             &mut *tx,
             UPLOAD_UPLOAD_PREFIX,
+            UPLOAD_MAX_FILE_SIZE,
             "PART",
             nonexistent,
             "DRAWING",
@@ -316,6 +327,7 @@ async fn rbac_inspector_can_upload_returns_403() {
         .upload_file_for_owner(
             &mut *tx,
             UPLOAD_UPLOAD_PREFIX,
+            UPLOAD_MAX_FILE_SIZE,
             "PART",
             part_id,
             "DRAWING",
@@ -363,6 +375,7 @@ async fn list_filter_by_kind() {
             .upload_file_for_owner(
                 &mut *tx,
                 UPLOAD_UPLOAD_PREFIX,
+                UPLOAD_MAX_FILE_SIZE,
                 "PART",
                 part_id,
                 kind,
@@ -409,6 +422,7 @@ async fn get_url_returns_presigned_url() {
         .upload_file_for_owner(
             &mut *tx,
             UPLOAD_UPLOAD_PREFIX,
+            UPLOAD_MAX_FILE_SIZE,
             "PART",
             part_id,
             "DRAWING",
@@ -541,6 +555,7 @@ async fn content_happy_path() {
         .upload_file_for_owner(
             &mut *tx,
             UPLOAD_UPLOAD_PREFIX,
+            UPLOAD_MAX_FILE_SIZE,
             "PART",
             part_id,
             "DRAWING",
@@ -586,6 +601,7 @@ async fn soft_delete_happy_path() {
         .upload_file_for_owner(
             &mut *tx,
             UPLOAD_UPLOAD_PREFIX,
+            UPLOAD_MAX_FILE_SIZE,
             "PART",
             part_id,
             "DRAWING",
@@ -638,6 +654,7 @@ async fn soft_delete_version_conflict() {
         .upload_file_for_owner(
             &mut *tx,
             UPLOAD_UPLOAD_PREFIX,
+            UPLOAD_MAX_FILE_SIZE,
             "PART",
             part_id,
             "DRAWING",
@@ -673,6 +690,14 @@ use hsh_erp_rust::modules::files::part_file::repo::PartFileRepo;
 const UPLOAD_TMP_PREFIX: &str = "tmp/";
 const UPLOAD_UPLOAD_PREFIX: &str = "uploads";
 
+/// 上传 / confirm 两条写路径的 size 上限（2026-10-13 review 第 1 轮 MAJOR-1：
+/// 两条路径都改成收 handler 下发的 `config.cos.max_file_size`）。
+///
+/// 取值与 `test_state` 的 `CosConfig.max_file_size` **逐字一致**（300MB），使本文件
+/// 既有用例的行为与走 HTTP handler 的路径保持同一条上限；想测「超限」分支请显式传
+/// 一个更小的值（见 `upload_over_max_file_size_returns_21103`），别依赖改这里。
+const UPLOAD_MAX_FILE_SIZE: usize = 300 * 1024 * 1024;
+
 #[tokio::test]
 async fn confirm_tmp_missing_returns_21114() {
     let pool = setup().await;
@@ -703,6 +728,7 @@ async fn confirm_tmp_missing_returns_21114() {
         cos.clone(),
         UPLOAD_UPLOAD_PREFIX,
         UPLOAD_TMP_PREFIX,
+        UPLOAD_MAX_FILE_SIZE,
         "PART",
         part_id,
         &req.kind,
@@ -762,6 +788,7 @@ async fn confirm_size_mismatch_returns_21115() {
         cos.clone(),
         UPLOAD_UPLOAD_PREFIX,
         UPLOAD_TMP_PREFIX,
+        UPLOAD_MAX_FILE_SIZE,
         "PART",
         part_id,
         &req.kind,
@@ -803,6 +830,7 @@ async fn confirm_replace_old_single_returns_ready() {
         cos.clone(),
         UPLOAD_UPLOAD_PREFIX,
         UPLOAD_TMP_PREFIX,
+        UPLOAD_MAX_FILE_SIZE,
         "PART",
         part_id,
         "DRAWING",
@@ -828,6 +856,7 @@ async fn confirm_replace_old_single_returns_ready() {
         cos.clone(),
         UPLOAD_UPLOAD_PREFIX,
         UPLOAD_TMP_PREFIX,
+        UPLOAD_MAX_FILE_SIZE,
         "PART",
         part_id,
         "DRAWING",
@@ -901,6 +930,7 @@ async fn tmp_to_parts_copy_test() {
         cos.clone(),
         UPLOAD_UPLOAD_PREFIX,
         UPLOAD_TMP_PREFIX,
+        UPLOAD_MAX_FILE_SIZE,
         "PART",
         part_id,
         "DRAWING",
@@ -1007,6 +1037,7 @@ async fn rbac_shelf_account_can_list_files() {
         .upload_file_for_owner(
             &mut *tx,
             UPLOAD_UPLOAD_PREFIX,
+            UPLOAD_MAX_FILE_SIZE,
             "PART",
             part_id,
             "DRAWING",
@@ -1053,6 +1084,7 @@ async fn rbac_shelf_account_can_get_file_content() {
         .upload_file_for_owner(
             &mut *tx,
             UPLOAD_UPLOAD_PREFIX,
+            UPLOAD_MAX_FILE_SIZE,
             "PART",
             part_id,
             "DRAWING",
@@ -1102,6 +1134,7 @@ async fn rbac_shelf_account_get_file_url_still_forbidden() {
         .upload_file_for_owner(
             &mut *tx,
             UPLOAD_UPLOAD_PREFIX,
+            UPLOAD_MAX_FILE_SIZE,
             "PART",
             part_id,
             "DRAWING",
@@ -1157,6 +1190,7 @@ async fn rbac_shelf_account_cannot_upload_or_delete() {
         .upload_file_for_owner(
             &mut *tx,
             UPLOAD_UPLOAD_PREFIX,
+            UPLOAD_MAX_FILE_SIZE,
             "PART",
             part_id,
             "DRAWING",
@@ -1179,6 +1213,7 @@ async fn rbac_shelf_account_cannot_upload_or_delete() {
         .upload_file_for_owner(
             &mut *tx,
             UPLOAD_UPLOAD_PREFIX,
+            UPLOAD_MAX_FILE_SIZE,
             "PART",
             part_id,
             "DRAWING",
@@ -1249,6 +1284,7 @@ async fn bootstrap_hardcut_guard() -> (PgPool, axum::Router, String, i64, i64) {
         .upload_file_for_owner(
             &mut *tx,
             UPLOAD_UPLOAD_PREFIX,
+            UPLOAD_MAX_FILE_SIZE,
             "PART",
             part_id,
             "DRAWING",
@@ -1479,6 +1515,7 @@ async fn bootstrap_pr1b_hardcut_guard() -> (PgPool, axum::Router, String, i64, i
         .upload_file_for_owner(
             &mut *tx,
             UPLOAD_UPLOAD_PREFIX,
+            UPLOAD_MAX_FILE_SIZE,
             "ASSEMBLY",
             asm_id,
             "ASSEMBLY_MASTER",
@@ -1636,4 +1673,232 @@ async fn old_assembly_files_returns_404() {
             "旧端点 {method} /api/v2/assemblies/{{assembly_id}}/files 必须 404（硬切无 alias）: {status} {raw}"
         );
     }
+}
+
+// ===========================================================================
+//  2026-10-13 review 第 1 轮 MINOR-7 / MINOR-6：ASSEMBLY owner 的内容级覆盖
+//
+//  MINOR-7：原 `tests/assembly/files_list.rs` 整文件删除后，「按 owner_kind=ASSEMBLY
+//  列出 + 按 kind 过滤」的**内容**断言归零 —— 替代覆盖只有硬切守卫里一条
+//  `assert_eq!(list_status, OK)` 的**状态码**正向对照（`send_raw` 不解 JSON，压根没看
+//  items），而 `list_filter_by_kind` 走的是 PART owner。下面补回内容断言。
+//
+//  MINOR-6：`ASSEMBLY_MASTER` 行原先能被上传、永远删不掉（soft_delete 的 kind 分派
+//  缺口，本轮已闭合）。补一条软删回归，把「能造出来的 kind 就得能删」钉死。
+// ===========================================================================
+
+/// 造一条最小 `t_assembly` 行（直写 SQL：assembly 建单链要 serial_counter，
+/// 不属这两条用例的关注点）。
+async fn insert_assembly_row(pool: &PgPool, label: &str, customer_id: i64) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+    let id = shared_test_snowflake().next_id();
+    let now = now_naive();
+    let today = now.date();
+    sqlx::query(
+        "INSERT INTO t_assembly (id, drawing_no, name, customer_id, request_date, \
+         planned_delivery_date, is_urgent, status, version, \
+         created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, $3, $4, $5, $5, false, 'PENDING', 0, $6, NULL, $6, NULL)",
+    )
+    .bind(id)
+    .bind(format!("DWG-{label}"))
+    .bind(format!("asm-{label}"))
+    .bind(customer_id)
+    .bind(today)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_assembly");
+    id
+}
+
+fn asm_list_query(
+    owner_kind: &str,
+    owner_id: i64,
+    kind: Option<&str>,
+) -> hsh_erp_rust::modules::files::part_file::dto::PartFileListQuery {
+    hsh_erp_rust::modules::files::part_file::dto::PartFileListQuery {
+        owner_kind: Some(owner_kind.into()),
+        owner_id: Some(owner_id.to_string()),
+        kind: kind.map(str::to_string),
+        limit: Some(50),
+        offset: Some(0),
+    }
+}
+
+/// `list_files` 的薄壳（service 直调 + 自开自提交 tx），供上面两条用例复用。
+async fn asm_list(
+    pool: &PgPool,
+    cos: &Arc<NoopCos>,
+    current: &CurrentUser,
+    q: hsh_erp_rust::modules::files::part_file::dto::PartFileListQuery,
+) -> hsh_erp_rust::modules::files::part_file::vo::PartFileListOut {
+    let mut tx = pool.begin().await.unwrap();
+    let out = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
+        .list_files(&mut *tx, &q, current)
+        .await
+        .unwrap();
+    drop(tx);
+    out
+}
+
+/// `owner_kind=ASSEMBLY` 的列表**内容**断言 + 按 kind 过滤。
+///
+/// MINOR-7 的替代覆盖。用两个装配件：A 传过 `ASSEMBLY_MASTER`，B 什么都没有。
+///
+/// ⚠️ **本用例刻意不覆盖「跨 owner_kind 隔离」**：`t_part_file` 没有 owner 类型列，
+/// `owner_id` 装在 `part_id` 列里，`list_with_filters` 的 `owner_kind` 形参被显式
+/// 忽略（见 `src/modules/files/part_file/repo/sql.rs` 该函数上方的注释：
+/// 「owner_kind 仅作语义标签，不参与 SQL」）⇒ 拿 ASSEMBLY 的 id 当 `owner_kind=PART`
+/// 查，当前**仍会返回该行**。这是 schema 层的既有形状、不是本 PR 引入的，本 PR 也
+/// 没改删除/查询路径；要真隔离得给 `t_part_file` 加 owner 类型列（独立立项）。
+#[tokio::test]
+async fn list_assembly_owner_filters_by_kind_and_owner() {
+    let pool = setup().await;
+    let l1 = insert_l1_customer(&pool, "客户PF-AsmList", "F").await;
+    let l2 = insert_l2_customer(&pool, "子客PF-AsmList", l1).await;
+    let asm_a = insert_assembly_row(&pool, "ASM-LIST-A", l2).await;
+    let asm_b = insert_assembly_row(&pool, "ASM-LIST-B", l2).await;
+
+    let current = test_current_user_with_roles(vec![Role::Manager]);
+    let cos = Arc::new(NoopCos);
+
+    let mut tx = pool.begin().await.unwrap();
+    let out = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
+        .upload_file_for_owner(
+            &mut *tx,
+            UPLOAD_UPLOAD_PREFIX,
+            UPLOAD_MAX_FILE_SIZE,
+            "ASSEMBLY",
+            asm_a,
+            "ASSEMBLY_MASTER",
+            "master-a.pdf",
+            "application/pdf",
+            b"%PDF-1.5\nasm list a\n%%EOF".to_vec(),
+            &current,
+        )
+        .await
+        .expect("装配件上传应成功");
+    tx.commit().await.unwrap();
+
+    // ① 按 owner_kind=ASSEMBLY + owner_id 命中，且 items 内容正确
+    let r = asm_list(
+        &pool,
+        &cos,
+        &current,
+        asm_list_query("ASSEMBLY", asm_a, None),
+    )
+    .await;
+    assert_eq!(r.items.len(), 1, "A 应恰好列出 1 条");
+    assert_eq!(r.total, 1);
+    let item = &r.items[0];
+    assert_eq!(item.id, out.id);
+    assert_eq!(
+        item.owner_kind, "ASSEMBLY",
+        "出参 owner_kind 应回显 ASSEMBLY"
+    );
+    assert_eq!(item.owner_id, asm_a, "出参 owner_id 应是装配件 id");
+    assert_eq!(item.kind, "ASSEMBLY_MASTER");
+    assert_eq!(item.original_filename, "master-a.pdf");
+
+    // ② 没有文件的装配件 → 空列表（不能被别的 owner 的行污染）
+    assert_eq!(
+        asm_list(
+            &pool,
+            &cos,
+            &current,
+            asm_list_query("ASSEMBLY", asm_b, None)
+        )
+        .await
+        .items
+        .len(),
+        0
+    );
+
+    // ③ 按 kind 过滤：命中 / 不命中
+    assert_eq!(
+        asm_list(
+            &pool,
+            &cos,
+            &current,
+            asm_list_query("ASSEMBLY", asm_a, Some("ASSEMBLY_MASTER"))
+        )
+        .await
+        .items
+        .len(),
+        1
+    );
+    assert_eq!(
+        asm_list(
+            &pool,
+            &cos,
+            &current,
+            asm_list_query("ASSEMBLY", asm_a, Some("DRAWING"))
+        )
+        .await
+        .items
+        .len(),
+        0,
+        "装配件上不该有 DRAWING 行"
+    );
+
+    // ④ ⚠️ **不做**跨 owner_kind 隔离断言，理由见函数 doc —— `owner_kind` 不参与
+    //    SQL（`repo/sql.rs::list_with_filters` 的 `_owner_kind` 形参被显式忽略），
+    //    所以「拿 ASSEMBLY 的 id 当 PART 查」当前仍会返回该行。断言它返回 0 是
+    //    断言一个**不存在**的行为；断言它返回 1 等于给一条已知偏差盖合法章。
+    //    正确做法是等 schema 有 owner 侧类型列之后再补隔离断言（独立立项）。
+}
+
+/// `ASSEMBLY_MASTER` 行可被软删（MINOR-6 回归）。
+///
+/// 闭合前这条会拿到 21102 `BIZ_PART_FILE_BAD_TYPE`（kind 不可软删）—— 也就是
+/// 「能造出来的 kind 却删不掉」。同时钉住角色面：Manager 可删（与 DRAWING 同款 M+C）。
+#[tokio::test]
+async fn soft_delete_assembly_master_happy_path() {
+    let pool = setup().await;
+    let l1 = insert_l1_customer(&pool, "客户PF-AsmDel", "F").await;
+    let l2 = insert_l2_customer(&pool, "子客PF-AsmDel", l1).await;
+    let asm_id = insert_assembly_row(&pool, "ASM-DEL", l2).await;
+
+    let current = test_current_user_with_roles(vec![Role::Manager]);
+    let cos = Arc::new(NoopCos);
+
+    let mut tx = pool.begin().await.unwrap();
+    let out = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
+        .upload_file_for_owner(
+            &mut *tx,
+            UPLOAD_UPLOAD_PREFIX,
+            UPLOAD_MAX_FILE_SIZE,
+            "ASSEMBLY",
+            asm_id,
+            "ASSEMBLY_MASTER",
+            "master-del.pdf",
+            "application/pdf",
+            b"%PDF-1.5\nasm del\n%%EOF".to_vec(),
+            &current,
+        )
+        .await
+        .expect("装配件上传应成功");
+    tx.commit().await.unwrap();
+
+    let mut tx = pool.begin().await.unwrap();
+    let object_key = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
+        .soft_delete_file(&mut *tx, out.id, out.version, &current)
+        .await
+        .expect("ASSEMBLY_MASTER 应可软删（与 DRAWING 同款 M+C 角色面）");
+    tx.commit().await.unwrap();
+    assert_eq!(object_key, out.object_key, "返回的应是软删行的 CAS key");
+
+    // 取证：行真的软删了（get_by_id(deleted_at IS NULL) 查不到）
+    let mut tx = pool.begin().await.unwrap();
+    let after = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
+        .list_files(
+            &mut *tx,
+            &asm_list_query("ASSEMBLY", asm_id, None),
+            &current,
+        )
+        .await
+        .unwrap();
+    drop(tx);
+    assert_eq!(after.items.len(), 0, "软删后列表不应再有该行");
 }

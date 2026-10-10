@@ -4,8 +4,14 @@
 //! `part_id` 是 polymorphic（指向 `t_part.id` 或 `t_assembly.id`）—— 2026-10-13 PR1b
 //! 起两条 owner 都由本域的 `POST /api/v2/files/objects` 一个端点写入。
 //!
-//! 序列化：`Serialize` 给本域 handler 出参；`created_by` / `updated_by`
-//! / `paired_file_id` 三个 i64 字段走 `serialize_i64_opt`（Global Constraint #3）。
+//! 序列化：`Serialize` 历史上是给本域 handler 出参用的；⚠️ **2026-10-13 PR1b 之后
+//! 已无任何 handler 输出 `TPartFile`**（上传 / 列表 / 详情 / 预签 URL 全部走
+//! `PartFileOut` / `PartFileWithUrlOut` 侧的窄投影 VO，见 `super::vo`）——
+//! `Serialize` 现在只作为 `FromRow` 行结构的常规派生留着，出参一律走 VO。
+//! （2026-10-13 review 第 1 轮 NIT-12 订正：原文写「给本域 handler 出参」，
+//! 那是 PR1b 之前的状态。）
+//! `created_by` / `updated_by` / `paired_file_id` 三个 i64 字段走
+//! `serialize_i64_opt`（Global Constraint #3）。
 
 use serde::Serialize;
 
