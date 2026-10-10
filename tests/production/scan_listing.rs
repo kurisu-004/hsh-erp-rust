@@ -1680,13 +1680,12 @@ async fn held_exposes_capacity_fields() {
 
     // FX-WTA 的 max_held_batches：共享 fixture 自 2026-10-14 起为 10
     // （此前是 NULL，而 NULL 的语义是「未配置」）。
-    let expected_max: i32 = sqlx::query_scalar(
-        "SELECT max_held_batches FROM t_work_type WHERE id = $1",
-    )
-    .bind(fx.work_type_a_id)
-    .fetch_one(&pool)
-    .await
-    .expect("read work_type.max_held_batches");
+    let expected_max: i32 =
+        sqlx::query_scalar("SELECT max_held_batches FROM t_work_type WHERE id = $1")
+            .bind(fx.work_type_a_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read work_type.max_held_batches");
     assert_eq!(expected_max, 10, "共享 fixture 的 FX-WTA 应配上限 10");
 
     let uri = format!("{HELD_URI_PREFIX}?worker_id={worker_id}");
@@ -1722,7 +1721,10 @@ async fn held_exposes_capacity_fields() {
     // 前 4 个字段逐字不变（前端读 items / total / limit / offset 的代码不受影响）
     for key in ["items", "total", "limit", "offset"] {
         assert!(
-            env["data"].as_object().expect("data 是 object").contains_key(key),
+            env["data"]
+                .as_object()
+                .expect("data 是 object")
+                .contains_key(key),
             "HeldListOut 必须保留分页字段 {key}: {env}"
         );
     }

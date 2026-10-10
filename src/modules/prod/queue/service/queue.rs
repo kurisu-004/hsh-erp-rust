@@ -74,7 +74,7 @@ use crate::modules::prod::queue::dto::{
     AutoAllocateMode, AutoAllocateRequest, MoveFromLocation, MoveRequest, MoveToLocation,
 };
 use crate::modules::prod::queue::vo::worker::{
-    stopped_reason, AutoAllocateResult, MoveResult, RefillResult, TakenItem, WorkerFillItem,
+    AutoAllocateResult, MoveResult, RefillResult, TakenItem, WorkerFillItem, stopped_reason,
 };
 
 /// queue 域 service（2026-09-22 D-2 重构后）
@@ -271,13 +271,11 @@ impl QueueService {
                 .part_batch_count_held_by_worker(worker_id)
                 .await?;
             let max_held = work_type.max_held_batches.unwrap_or_default();
-            Some(
-                if held >= max_held as i64 {
-                    stopped_reason::WORKER_FULL.to_string()
-                } else {
-                    stopped_reason::POOL_EMPTY.to_string()
-                },
-            )
+            Some(if held >= max_held as i64 {
+                stopped_reason::WORKER_FULL.to_string()
+            } else {
+                stopped_reason::POOL_EMPTY.to_string()
+            })
         } else {
             None
         };

@@ -228,8 +228,9 @@ impl ScanService {
         //   clippy 的 `let_underscore_must_use` 之外的手段漏过去；`let _ =` 在
         //   本仓是「刻意丢弃」的既有写法。
         let work_type_id = wt_id.expect("wt_id 已由上方 is_none 分支保证非空");
-        let _ = QueueService::ensure_worker_has_capacity(repo.conn_mut(), req.worker_id, work_type_id)
-            .await?;
+        let _ =
+            QueueService::ensure_worker_has_capacity(repo.conn_mut(), req.worker_id, work_type_id)
+                .await?;
         // 2026-10-03 新增：部分领取 —— 翻状态**之前**先把要交出去的那部分拆成
         // 新批次；之后所有针对批次的写入都改指新批次（version 恒为 0）。
         //

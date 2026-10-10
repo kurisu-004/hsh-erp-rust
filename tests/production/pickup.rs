@@ -1430,7 +1430,11 @@ async fn pick_up_work_type_without_max_held_returns_20904() {
         1,
         "失败后不应拆出新批次"
     );
-    assert_eq!(count_held(&ctx.pool, worker_id).await, 0, "失败后工人不该持有");
+    assert_eq!(
+        count_held(&ctx.pool, worker_id).await,
+        0,
+        "失败后工人不该持有"
+    );
 }
 
 /// G3：worker 满时 `pick-up` 返 `20204`，**且批次未被拆批**。
@@ -1448,8 +1452,14 @@ async fn pick_up_when_worker_full_returns_20204_without_splitting() {
 
     // 第 1 批：正常领取，用来占额度
     let held_part_id = insert_part(&ctx.pool, 10).await;
-    let held_batch_id =
-        insert_part_batch(&ctx.pool, held_part_id, 10, "IN_PROCESS", Some(ctx.shelf_id())).await;
+    let held_batch_id = insert_part_batch(
+        &ctx.pool,
+        held_part_id,
+        10,
+        "IN_PROCESS",
+        Some(ctx.shelf_id()),
+    )
+    .await;
     let (s0, env0) = send(
         ctx.app.clone(),
         json_request(

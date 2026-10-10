@@ -2747,7 +2747,12 @@ async fn has_process_chain_reflects_chain_and_pointer_state() {
 /// 把一批 IN_PROCESS+WORKER 的批次取消掉（`POST /prod/batches/{id}/cancel`）。
 ///
 /// 返回 HTTP 状态 + 信封，供调用方断言。
-async fn cancel_batch(app: axum::Router, token: &str, batch_id: i64, version: i32) -> (StatusCode, Value) {
+async fn cancel_batch(
+    app: axum::Router,
+    token: &str,
+    batch_id: i64,
+    version: i32,
+) -> (StatusCode, Value) {
     send(
         app,
         json_request(
@@ -2762,13 +2767,11 @@ async fn cancel_batch(app: axum::Router, token: &str, batch_id: i64, version: i3
 
 /// 读批次的 (status, location, current_holder_id)。
 async fn read_batch_state(pool: &PgPool, batch_id: i64) -> (String, Option<String>, Option<i64>) {
-    sqlx::query_as(
-        "SELECT status, location, current_holder_id FROM t_part_batch WHERE id = $1",
-    )
-    .bind(batch_id)
-    .fetch_one(pool)
-    .await
-    .expect("read t_part_batch state")
+    sqlx::query_as("SELECT status, location, current_holder_id FROM t_part_batch WHERE id = $1")
+        .bind(batch_id)
+        .fetch_one(pool)
+        .await
+        .expect("read t_part_batch state")
 }
 
 /// G2（Bug 1 回归）：取消掉手上的 1 批后，**仍能继续下发到第 10 批**。
@@ -2851,17 +2854,22 @@ async fn cancelling_one_held_batch_releases_capacity_for_the_next() {
     // 取消第 1 批 → 额度必须释放
     // ⚠️ cancel 端点也要客户端 OCC 锚，且 move 那一步已把 version 推到 1 —— 必须现读
     let cancelled = pool_batches[0];
-    let cancelled_version: i32 = sqlx::query_scalar("SELECT version FROM t_part_batch WHERE id = $1")
-        .bind(cancelled)
-        .fetch_one(&pool)
-        .await
-        .expect("read batch version");
+    let cancelled_version: i32 =
+        sqlx::query_scalar("SELECT version FROM t_part_batch WHERE id = $1")
+            .bind(cancelled)
+            .fetch_one(&pool)
+            .await
+            .expect("read batch version");
     assert_eq!(
         cancelled_version, 1,
         "move 的 OCC 应把 version 推到 1（cancel 时不能用 fixture 的初值 0）"
     );
     let (s, env) = cancel_batch(app.clone(), &token, cancelled, cancelled_version).await;
-    assert_eq!(s, StatusCode::OK, "取消持批中的第 1 批应成功（IN_PROCESS 是 CANCELLED 的合法源）: {env}");
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "取消持批中的第 1 批应成功（IN_PROCESS 是 CANCELLED 的合法源）: {env}"
+    );
 
     // D1 不变式：终态批次的位置与持有人一并清掉
     let (status, location, holder) = read_batch_state(&pool, cancelled).await;
@@ -2901,7 +2909,10 @@ async fn cancelling_one_held_batch_releases_capacity_for_the_next() {
         MAX_HELD as i64,
         "补发后应重新持满 {MAX_HELD}"
     );
-    assert_eq!(env["data"]["current_held"], MAX_HELD, "MoveResult 应报补发后的持有数");
+    assert_eq!(
+        env["data"]["current_held"], MAX_HELD,
+        "MoveResult 应报补发后的持有数"
+    );
     assert_eq!(env["data"]["max_held"], MAX_HELD);
 }
 
@@ -2938,9 +2949,10 @@ async fn part_level_cancel_releases_worker_capacity() {
     let worker = insert_worker(&pool, "BC-PTC", "工PTC", Some(wt)).await;
 
     // 手工造上面那种混合形态（`insert_pool_part` 造的是单批 IN_PROCESS+架上）
-    let (part_id, b_held, b_insp) =
-        insert_mixed_state_part(&pool, customer, "PTC-001", proc, prod_shelf, insp_shelf, worker)
-            .await;
+    let (part_id, b_held, b_insp) = insert_mixed_state_part(
+        &pool, customer, "PTC-001", proc, prod_shelf, insp_shelf, worker,
+    )
+    .await;
 
     assert_eq!(
         count_held_by_worker(&pool, worker).await,
@@ -2966,11 +2978,7 @@ async fn part_level_cancel_releases_worker_capacity() {
         ),
     )
     .await;
-    assert_eq!(
-        s,
-        StatusCode::CONFLICT,
-        "满员时下发应 409（20204）: {env}"
-    );
+    assert_eq!(s, StatusCode::CONFLICT, "满员时下发应 409（20204）: {env}");
     assert_eq!(env["code"], 20204, "BIZ_WORKER_HOLD_LIMIT_EXCEEDED: {env}");
 
     // part 级取消（源状态 INSPECTION，合法）
@@ -3146,7 +3154,10 @@ async fn refill_when_worker_full_reports_worker_full() {
         "已满不应再抢到: {env}"
     );
     // `pool_empty` 语义一个字都没改（既有 wire 契约，前端在读）
-    assert_eq!(env["data"]["pool_empty"], true, "pool_empty 仍为 true: {env}");
+    assert_eq!(
+        env["data"]["pool_empty"], true,
+        "pool_empty 仍为 true: {env}"
+    );
     assert_eq!(
         env["data"]["stopped_reason"], "WORKER_FULL",
         "池里明明还有货 ⇒ 停止原因必须是 WORKER_FULL 而非 POOL_EMPTY: {env}"
@@ -3186,7 +3197,10 @@ async fn refill_when_pool_empty_reports_pool_empty() {
     .await;
     assert_eq!(s, StatusCode::OK, "refill 永远返 200: {env}");
     assert_eq!(env["data"]["taken"].as_array().unwrap().len(), 0);
-    assert_eq!(env["data"]["pool_empty"], true, "pool_empty 语义不变: {env}");
+    assert_eq!(
+        env["data"]["pool_empty"], true,
+        "pool_empty 语义不变: {env}"
+    );
     assert_eq!(
         env["data"]["stopped_reason"], "POOL_EMPTY",
         "池里没货且工人没满 ⇒ POOL_EMPTY: {env}"
@@ -3228,7 +3242,10 @@ async fn refill_success_omits_stopped_reason() {
     .await;
     assert_eq!(s, StatusCode::OK, "refill 应成功: {env}");
     assert!(
-        !env["data"].as_object().expect("data 是 object").contains_key("stopped_reason"),
+        !env["data"]
+            .as_object()
+            .expect("data 是 object")
+            .contains_key("stopped_reason"),
         "抢到东西时 stopped_reason 应整个 key 不出现（skip_serializing_if）: {env}"
     );
 }
