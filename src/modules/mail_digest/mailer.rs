@@ -2,18 +2,22 @@
 //!
 //! ## lettre 0.11 的确切 API（**实读 crate 源码核对**，不是凭记忆）
 //!
-//! | 用法 | 源码位置 |
+//! ⚠️ 本表**按符号名 + crate 版本引用，不写源码行号**（2026-10-13 review 第 1 轮
+//! m11）——行号随 patch 升级即漂，而本仓的 `Cargo.lock` 会随其它依赖一起升级，
+//! 一旦漂了就没人知道这些结论是在哪个版本上核对的。
+//!
+//! | 用法 | lettre 0.11 中的符号 / 位置 |
 //! |---|---|
-//! | `lettre::AsyncSmtpTransport` | `src/lib.rs:361` 的 `pub use crate::transport::smtp::AsyncSmtpTransport` |
-//! | `lettre::Tokio1Executor` | `src/lib.rs:329`（由 feature `tokio1` 启用） |
-//! | `AsyncSmtpTransport::<Tokio1Executor>::relay(host) -> Result<AsyncSmtpTransportBuilder, Error>` | `transport/smtp/async_transport.rs:135` |
-//! | `.credentials(Credentials::new(String, String))` | builder `async_transport.rs:381` + `authentication.rs:22` |
-//! | `.port(u16)` | builder `async_transport.rs:404` |
-//! | `.tls(Tls::Wrapper(TlsParameters))` / `Tls::Opportunistic(..)` / `Tls::None` | builder `async_transport.rs:440`；`Tls` 定义在 `transport/smtp/client/tls.rs:78`（由 `client/mod.rs:40` 重导出） |
-//! | `.build::<Tokio1Executor>()` | builder `async_transport.rs:456` |
-//! | `Message::builder().from(Mailbox).to(..).cc(..).subject(..).header(ContentType::TEXT_HTML).body(html)` | `message/mod.rs:503 / 255 / 295 / 302 / 328 / 367 / 458` |
-//! | `SinglePart::html(String)` | `message/single_part.rs::html`（`charset` feature 在 0.11 已无条件生效） |
-//! | `AsyncTransport::send(&Message).await` | `transport/mod.rs` 的 `AsyncTransport` trait |
+//! | `lettre::AsyncSmtpTransport` | crate 根的重导出（源自 `transport::smtp`） |
+//! | `lettre::Tokio1Executor` | crate 根的重导出（由 feature `tokio1` 启用） |
+//! | `AsyncSmtpTransport::<Tokio1Executor>::relay(host) -> Result<AsyncSmtpTransportBuilder, Error>` | `transport::smtp::AsyncSmtpTransport::relay` |
+//! | `.credentials(Credentials::new(String, String))` | builder 的 `AsyncSmtpTransportBuilder::credentials` + `transport::smtp::authentication::Credentials::new` |
+//! | `.port(u16)` | builder 的 `AsyncSmtpTransportBuilder::port` |
+//! | `.tls(Tls::Wrapper(TlsParameters))` / `Tls::Opportunistic(..)` / `Tls::None` | builder 的 `AsyncSmtpTransportBuilder::tls`；`Tls` 定义在 `transport::smtp::client::tls` |
+//! | `.build::<Tokio1Executor>()` | builder 的 `AsyncSmtpTransportBuilder::build` |
+//! | `Message::builder().from(Mailbox).to(..).cc(..).subject(..).header(ContentType::TEXT_HTML).body(html)` | `message::MessageBuilder` 的 `builder` / `from` / `to` / `cc` / `subject` / `header` / `body` |
+//! | `SinglePart::html(String)` | `message::single_part::SinglePart::html`（`charset` feature 在 0.11 已无条件生效） |
+//! | `AsyncTransport::send(&Message).await` | `transport::AsyncTransport` trait |
 //!
 //! ⚠️ **0.11 没有 `charset` feature**（0.10 有）：`cargo add lettre --features charset` 会直接
 //! 报 `unrecognized feature`。charset 在 0.11 是无条件编译的，别再往 Cargo.toml 里加。
@@ -94,7 +98,12 @@ pub async fn send(
         // ⚠️ 只打 SMTP 服务器 / 端口 / 错误种类，**不打凭据**：lettre 的错误文本
         // 不含 password（认证失败是 `535`，不回显密码），且这里连 `MailConfig`
         // 整个结构都没打（它的 Debug 才做屏蔽）。
-        .map_err(|e| format!("SMTP 发送失败（host={} port={}）：{e}", mail.host, mail.port))
+        .map_err(|e| {
+            format!(
+                "SMTP 发送失败（host={} port={}）：{e}",
+                mail.host, mail.port
+            )
+        })
 }
 
 /// 依 `MAIL_SMTP_TLS_MODE` 构造 transport。
@@ -111,7 +120,7 @@ fn build_transport(mail: &MailConfig) -> Result<AsyncSmtpTransport<Tokio1Executo
         MailTlsModeKind::Wrapped => {
             // ⚠️ lettre 0.11 的 `TlsParameters` **没有** `Default()`
             // （只有 `new(domain)` / `new_rustls(domain)` 两个构造器，实读
-            // `transport/smtp/client/tls.rs:598 / 617` 核实）。本仓用 rustls 栈
+            // `transport::smtp::client::tls` 的 `TlsParameters` 核实）。本仓用 rustls 栈
             // （`tokio1-rustls-tls`，见 Cargo.toml）⇒ 必须用 `new_rustls`。
             // 参数是 **SNI 域名**，用 `MAIL_SMTP_HOST` —— 证书校验靠它，
             // 填错会握手失败。
@@ -151,10 +160,22 @@ mod tests {
     fn tls_mode_maps_to_lettre_variants() {
         // 只验证「模式 → 用的哪个 lettre 变体」的映射表本身可读、不 panic；
         // 真正建连接需要网络，不在单测里做。
-        assert_eq!(MailTlsModeKind::LEGAL_VALUES, &["WRAPPED", "STARTTLS", "NONE"]);
-        assert_eq!(MailTlsModeKind::parse("wrapped").unwrap(), MailTlsModeKind::Wrapped);
-        assert_eq!(MailTlsModeKind::parse("  StartTLS ").unwrap(), MailTlsModeKind::StartTls);
-        assert_eq!(MailTlsModeKind::parse("NONE").unwrap(), MailTlsModeKind::None);
+        assert_eq!(
+            MailTlsModeKind::LEGAL_VALUES,
+            &["WRAPPED", "STARTTLS", "NONE"]
+        );
+        assert_eq!(
+            MailTlsModeKind::parse("wrapped").unwrap(),
+            MailTlsModeKind::Wrapped
+        );
+        assert_eq!(
+            MailTlsModeKind::parse("  StartTLS ").unwrap(),
+            MailTlsModeKind::StartTls
+        );
+        assert_eq!(
+            MailTlsModeKind::parse("NONE").unwrap(),
+            MailTlsModeKind::None
+        );
         // 非法值 → 报错且错误信息带合法值清单
         let err = MailTlsModeKind::parse("ssl").unwrap_err().to_string();
         assert!(err.contains("WRAPPED") && err.contains("STARTTLS") && err.contains("NONE"));

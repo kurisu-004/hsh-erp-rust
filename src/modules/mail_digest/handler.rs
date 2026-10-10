@@ -255,7 +255,10 @@ mod tests {
                 out.push(format!("POST {path}"));
                 hit = true;
             }
-            assert!(hit, "`.route(\"{path}\")` 后既无 get( 也无 post(：{seg:.60}");
+            assert!(
+                hit,
+                "`.route(\"{path}\")` 后既无 get( 也无 post(：{seg:.60}"
+            );
             rest = &tail[seg_end..];
         }
         out

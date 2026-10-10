@@ -10,7 +10,7 @@
 //! run(state, token)
 //!   ├─ MailConfig::is_enabled() == false → info! + 直接 return（不注册任何 job）
 //!   ├─ JobScheduler::new()（0.15 已改成 async）+ spawn(scheduler.start())
-//!   ├─ reschedule_from_db()：读配置 → schedule::to_cron() → 注册 / 替换 job
+//!   ├─ reschedule_inner()：读配置 → schedule::to_cron() → 注册 / 替换 job
 //!   └─ spawn(watcher)：await token.cancelled() → scheduler.shutdown()
 //! ```
 //!
@@ -25,7 +25,8 @@
 //!
 //! ### `Job::new_async()` 的默认值是 **UTC**，不是本地时区
 //!
-//! ⚠️ 实读 tokio-cron-scheduler 0.15.1 源码（`src/job/mod.rs`）逐字核实：
+//! ⚠️ 实读 tokio-cron-scheduler 0.15.1 源码逐字核实（**按函数名引用、不写源码行号**
+//! ——行号随 patch 升级即漂，2026-10-13 review 第 1 轮 m11）：
 //! ```text
 //! pub fn new_async<S, T>(schedule: S, run: T) -> Result<Self, JobSchedulerError> {
 //!     Self::new_async_tz(schedule, Utc, run)      // ← 默认 UTC，不是 localtime
@@ -38,8 +39,8 @@
 //!
 //! ### 结论：显式传 `Asia/Shanghai`
 //!
-//! - `Job::new_async_tz(cron, chrono_tz::Asia::Shanghai, run)` 在 0.15.1 中
-//!   确实存在（`src/job/mod.rs:208`），形参 `TZ: chrono::TimeZone`，
+//! - `Job::new_async_tz(cron, chrono_tz::Asia::Shanghai, run)` 在 0.15.1 中确实存在
+//!   （定义在 crate 的 `job` 模块），形参 `TZ: chrono::TimeZone`，
 //!   `chrono_tz::Asia::Shanghai` 直接满足。
 //! - 因此 `Cargo.toml` 里 `chrono-tz = "0.10"` 是**必需的直接依赖**
 //!   （它虽是 `tokio-cron-scheduler` 自带的传递依赖，但不显式声明就拿不到
@@ -48,17 +49,22 @@
 //!
 //! ### 已知偏差登记
 //!
-//! ⚠️ **本节目前只存在于代码注释里**：`docs/api/` 目录下尚无 `mail_digest.md`
-//! （本域 2026-10-13 新建，整域契约文档由紧随其后的文档任务补齐）。按
-//! CLAUDE.md「`docs/api/` 目录约定」第 3 条，此处**不写成文档链接**（指向不存在
-//! 的文件会让人无法判断是漏提交还是信息本就在注释里），只在下面点名该文档的**待建
-//! 路径**。文档补齐后，`docs/api/mail_digest.md` §8「已知偏差登记」应照抄以下两条：
+//! ⚠️ **整域契约见 [`docs/api/mail_digest.md`](../../docs/api/mail_digest.md)**
+//! ——本文件原先在这里写了一段「`docs/api/` 目录下尚无 `mail_digest.md`，故按
+//! CLAUDE.md「`docs/api/` 目录约定」第 3 条此处不写成文档链接」的说明（2026-10-13
+//! review 第 1 轮 M2 删除），但同一分支的 `6211d0f` 已经提交了那份文档——**注释里
+//! 「文档不存在」比文档不存在更糟**，它会让后人以为链接是笔误而去删掉已提交的文档。
+//! 本节只留本文件的读者真正需要的指针：
 //!
-//! 1. `JobScheduler::new()` 在 0.15 是 **`async fn`**（0.14 及以前是同步 `new()`）
-//!    ⇒ 本文件用 `tokio::sync::OnceCell::get_or_try_init` 承担异步初始化。
-//! 2. `Scheduler::new(CoordinationMode)` 与 `job.run_at(ScheduleType::Cron(..))`
-//!    在 0.15 **不存在**（那是更早版本的签名）—— 0.15 用
-//!    `new_async` / `new_async_tz` / `new_once` 三个构造器。照旧签名写会编译不过。
+//! - `docs/api/mail_digest.md` §8.3「已知偏差登记」→「依赖库版本相关的实测结论」
+//!   第 1、2 条即下面这两条（全文还含本域设计取舍与「实现与注释不符」若干条，本文件
+//!   不复述，避免两份副本漂移）：
+//!   1. `JobScheduler::new()` 在 0.15 是 **`async fn`**（0.14 及以前是同步 `new()`）
+//!      ⇒ 本文件用 `tokio::sync::OnceCell::get_or_try_init` 承担异步初始化。
+//!   2. `Job::new_async()` 的默认值是 **UTC 而不是本地时区** ⇒ 必须显式传
+//!      `chrono_tz::Asia::Shanghai`（`new_async_tz`），不依赖 `TZ` 环境变量。
+//! - 另：`SCHEDULED` 触发时的**准备阶段失败也会落流水**（`status='FAILED'`），
+//!   见 `service::send_scheduled` 的 doc。
 
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -75,10 +81,16 @@ use crate::state::AppState;
 ///
 /// ## 为什么走 `OnceLock` 而**不**给 `AppState` 加字段
 ///
-/// - `AppState` 已有 27 个字段，且**测试侧有 4 处 `AppState::new` 字面量**
-///   （`test-support/src/state.rs` 的 3 个 `test_state*`，加 `tests/dashboard_ws_api.rs`
-///   与 `tests/_e2e_api.rs` 各 1 处）。加字段要么每处补一行，要么给 `AppState`
-///   加 `Default` + builder —— 都是**与本需求无关的改动面**。
+/// - `AppState` 已有 27 个字段，且**全仓有多处 `AppConfig { … }` 全量字面量**要跟着改
+///   ——绝大多数在 `test-support/src/state.rs` 的几个 `test_state*` 构造函数里，另在
+///   `src/modules/iam/service/tests` 与 `tests/idempotency_api.rs` 里。加字段要么每处补
+///   一行，要么给 `AppState` 加 `Default` + builder —— 都是**与本需求无关的改动面**。
+///   （2026-10-13 review 第 1 轮 m4：本条原先写的是「测试侧有 4 处 `AppState::new`
+///   字面量（test-support 的 3 个 + dashboard_ws_api 与 _e2e_api 各 1 处）」——① 算式
+///   自相矛盾（3+1+1=5≠4）；② 那些是 `AppState::new(…)` **调用**不是 struct 字面量，
+///   加字段根本不用改它们；③ 真正要改的是 `AppConfig {` 字面量。改成不写死条数，
+///   是因为条数会随别人的改动漂 —— 这正是 CLAUDE.md「测试数据两条硬约定」禁的那类
+///   立刻过期的数字。）
 /// - 调度器本身是**纯进程级单例**：它不依赖请求上下文，一个进程只该有一个。
 ///   `OnceLock` 正好表达这件事，且懒创建语义天然覆盖「先收到一次 `POST /config`
 ///   才启动任务」这种顺序。
@@ -106,7 +118,9 @@ static SCHEDULER: OnceLock<MailDigestScheduler> = OnceLock::new();
 pub async fn run(state: Arc<AppState>, token: CancellationToken) {
     // 第一道闸在 env（总闸 + 三项凭据），第二道在 DB（`t_mail_digest_config.enabled`）。
     if !state.config.mail.is_enabled() {
-        info!("mail_digest: SMTP 未配置（MAIL_DIGEST_ENABLED / MAIL_SMTP_USERNAME / MAIL_SMTP_PASSWORD / 发件人地址），定时任务跳过");
+        info!(
+            "mail_digest: SMTP 未配置（MAIL_DIGEST_ENABLED / MAIL_SMTP_USERNAME / MAIL_SMTP_PASSWORD / 发件人地址），定时任务跳过"
+        );
         return;
     }
     info!(
@@ -167,9 +181,7 @@ async fn ensure_scheduler() -> Result<&'static MailDigestScheduler, String> {
         scheduler: scheduler.clone(),
         job_id: Mutex::new(None),
     });
-    Ok(SCHEDULER
-        .get()
-        .expect("get_or_init 刚写入，必然可读"))
+    Ok(SCHEDULER.get().expect("get_or_init 刚写入，必然可读"))
 }
 
 /// 异步初始化用的 `OnceCell`（与 [`SCHEDULER`] 配对，生命周期同进程）。

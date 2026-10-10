@@ -26,8 +26,8 @@ use tokio_util::sync::CancellationToken;
 
 use hsh_erp_rust::auth::session::{RedisSessionStore, SessionStore};
 use hsh_erp_rust::infra::config::{
-    AppConfig, AutoCompleteConfig, CosBackend, CosConfig, JwtConfig, PythonBackendConfig,
-    MailConfig, RedisConfig as AppRedisConfig, SnowflakeConfig, WeComConfig,
+    AppConfig, AutoCompleteConfig, CosBackend, CosConfig, JwtConfig, MailConfig,
+    PythonBackendConfig, RedisConfig as AppRedisConfig, SnowflakeConfig, WeComConfig,
 };
 use hsh_erp_rust::infra::cos::{CosClient, NoopCos, ObjectMeta};
 // 2026-09-28 新增：rust → python 后端转发客户端（薄壳鉴权转发 STS）。

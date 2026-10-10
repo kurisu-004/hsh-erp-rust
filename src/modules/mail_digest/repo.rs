@@ -59,9 +59,8 @@ use crate::modules::mail_digest::model::{TMailDigestConfig, TMailDigestLog};
 /// ⚠️ 取值仍直接来自 dashboard 那个常量（不复制字面量）—— 一处改、两处生效，
 /// 这正是 CLAUDE.md 要求四处共用同一个 `DELIVERY_STATUSES` 的意义。
 fn delivery_statuses_vec() -> &'static [String] {
-    static VEC: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
-        DELIVERY_STATUSES.iter().map(|s| s.to_string()).collect()
-    });
+    static VEC: std::sync::LazyLock<Vec<String>> =
+        std::sync::LazyLock::new(|| DELIVERY_STATUSES.iter().map(|s| s.to_string()).collect());
     &VEC
 }
 
@@ -255,9 +254,7 @@ pub async fn list_upcoming(
 /// `LIMIT 1` 而非不加：唯一索引 `uk_t_mail_digest_config_alive` 保证至多一行，
 /// 但加上它能让「唯一索引被人手工 drop 掉」这种脏库的异常表现为「取第一行」
 /// 而不是「取到多行直接报错」—— 邮件配置是单例，取第一行继续跑比整个页面 500 好。
-pub async fn get_config(
-    conn: &mut PgConnection,
-) -> Result<Option<TMailDigestConfig>, sqlx::Error> {
+pub async fn get_config(conn: &mut PgConnection) -> Result<Option<TMailDigestConfig>, sqlx::Error> {
     sqlx::query_as!(
         TMailDigestConfig,
         r#"
@@ -328,8 +325,18 @@ pub async fn insert_config(
 /// `WHERE id=$1 AND version=$2` 是本仓 OCC 的标准形态；`rows_affected == 0`
 /// 表示「版本对不上」⇒ 调用方返 `40901 VERSION_CONFLICT`。
 ///
-/// ⚠️ 用 `&mut *conn` 的 **autocommit**（不开事务），与其它写端点一致 ——
-/// 见 CLAUDE.md §1「事务边界在 handler」的例外说明：这里只改一行且 UPDATE 自身原子。
+/// ⚠️ 用 `&mut *conn` 的 **autocommit**（不开事务），与其它写端点一致。
+///
+/// **为什么不进 CLAUDE.md §1 的例外清单**（2026-10-13 review 第 1 轮 NIT 补记）：
+/// 那份清单里的四条**例外**各自都有「开事务反而更糟」的具体理由（逐行部分成功、
+/// fixture 自管、只读端点、逃生通道），本函数**不属于**它们中的任何一类 ——
+/// 它就是常规的「单行 UPDATE + 立刻判 `rows_affected`」，与全仓其它 OCC 写端点同形，
+/// 本来就不需要进例外清单（进清单的门槛是「与默认约定**不同**且需要理由」）。
+/// 真正值得注意的是它**没有**的事：全量覆写**不**级联写任何其它表（不碰
+/// `t_part` / `t_part_batch` / `t_mail_digest_log`），所以不存在「必须同事务」的第二个写。
+/// ⚠️ 若将来给配置加出「改一次要连带改多张表」的效果，这里必须同时改 handler 的事务
+/// 边界（`service::save_config` 现在是「UPDATE → 读回新 version」两段，跨两段时
+/// 读回可能读到别人的值）。
 pub async fn update_config(
     conn: &mut PgConnection,
     id: i64,
@@ -373,7 +380,12 @@ pub async fn update_config(
     .bind(cfg.include_overdue)
     .bind(cfg.include_upcoming)
     .bind(cfg.upcoming_days)
-    .bind(cfg.visible_columns.iter().map(|c| c.as_str()).collect::<Vec<&str>>())
+    .bind(
+        cfg.visible_columns
+            .iter()
+            .map(|c| c.as_str())
+            .collect::<Vec<&str>>(),
+    )
     .bind(cfg.subject_template.as_deref())
     .bind(now)
     .bind(operator)

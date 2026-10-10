@@ -26,16 +26,24 @@ use hsh_erp_test_support::{json_request, send, send_raw};
 use crate::{Ctx, assert_biz_code, bootstrap, config_body, today};
 
 /// `POST /config` → 返回 `(status, 信封)`。
-async fn save_config(ctx: &Ctx, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+pub(crate) async fn save_config(
+    ctx: &Ctx,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
     send(
         ctx.app.clone(),
-        json_request("POST", "/mail-digest/config", Some(body), Some(&ctx.manager_token)),
+        json_request(
+            "POST",
+            "/mail-digest/config",
+            Some(body),
+            Some(&ctx.manager_token),
+        ),
     )
     .await
 }
 
 /// `GET /config` → 返回 `(status, 信封)`。
-async fn get_config(ctx: &Ctx) -> (StatusCode, serde_json::Value) {
+pub(crate) async fn get_config(ctx: &Ctx) -> (StatusCode, serde_json::Value) {
     send(
         ctx.app.clone(),
         json_request("GET", "/mail-digest/config", None, Some(&ctx.manager_token)),
@@ -100,7 +108,9 @@ async fn config_empty_table_returns_defaults_with_zero_version() {
 async fn config_save_without_version_field_returns_422_plain_text() {
     let ctx = bootstrap().await;
     let mut body = config_body(0);
-    body.as_object_mut().expect("config_body 是对象").remove("version");
+    body.as_object_mut()
+        .expect("config_body 是对象")
+        .remove("version");
 
     let (status, raw) = send_raw(
         ctx.app.clone(),
@@ -195,7 +205,7 @@ async fn monthly_day_of_month_31_returns_21704() {
 /// 理由（`service::validate_save_request`）：`weekday` 对这些频率不参与 cron 拼装，
 /// 留着是「脏值」——读侧会照单全收地拼 cron。写侧选择主动清 NULL 而不是拒，
 /// 代价是「多填了字段」这件事**不**在写侧暴露给前端。
-/// ⇒ 见 `docs/api/mail_digest.md` §8.3「已知偏差登记」第 1 条。
+/// ⇒ 见 `docs/api/mail_digest.md` §8.3「实现与注释不符」第 2 条。
 #[tokio::test]
 async fn daily_with_weekday_field_is_cleared_not_rejected() {
     let ctx = bootstrap().await;
@@ -204,7 +214,11 @@ async fn daily_with_weekday_field_is_cleared_not_rejected() {
     body["weekday"] = json!(3);
 
     let (status, env) = save_config(&ctx, body).await;
-    assert_eq!(status, StatusCode::OK, "DAILY + weekday 应被清空而非拒：{env}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "DAILY + weekday 应被清空而非拒：{env}"
+    );
     assert_eq!(env["data"]["weekday"], serde_json::Value::Null, "{env}");
 
     // 复读确认真的落库成 NULL（不是响应层临时抹掉）
@@ -217,7 +231,11 @@ async fn daily_with_weekday_field_is_cleared_not_rejected() {
     body2["weekday"] = json!(5);
     body2["day_of_month"] = json!(9);
     let (status, env2) = save_config(&ctx, body2).await;
-    assert_eq!(status, StatusCode::OK, "MANUAL_ONLY + weekday 应被清空：{env2}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "MANUAL_ONLY + weekday 应被清空：{env2}"
+    );
     assert_eq!(env2["data"]["weekday"], serde_json::Value::Null);
     assert_eq!(env2["data"]["day_of_month"], serde_json::Value::Null);
 }
@@ -228,7 +246,7 @@ async fn daily_with_weekday_field_is_cleared_not_rejected() {
 /// 但写侧只清 `weekday` / `day_of_month`；`send_hour` / `send_minute` 是**原样透传**，
 /// 且 `validate_time` 对 `MANUAL_ONLY` 直接早退 ⇒ 连 `0..23` 都不查（能存进 99）。
 /// 危害有限（`MANUAL_ONLY` 永不产生 cron，这两个字段不会被读），但文档与列注释
-/// 需按实现订正。⇒ `docs/api/mail_digest.md` §8.3 偏差 4。
+/// 需按实现订正。⇒ `docs/api/mail_digest.md` §8.3「实现与注释不符」第 4 条。
 #[tokio::test]
 async fn manual_only_keeps_send_time_unchecked() {
     let ctx = bootstrap().await;
@@ -298,7 +316,7 @@ async fn recipient_with_crlf_returns_21703() {
 /// 即「收件人非空」这条业务不变量**只**在发送路径上生效，配置页可以先存一份
 /// 空配置（编辑中途的正常形态）。`service::validate_save_request` 的模块 doc 与
 /// `NormalizedConfig::default` 的注释都写着「空数组会被 POST /config 校验当场拦下」，
-/// 与实现不符 ⇒ 见 `docs/api/mail_digest.md` §8.3「已知偏差登记」第 2 条。
+/// 与实现不符 ⇒ 见 `docs/api/mail_digest.md` §8.3「实现与注释不符」第 1 条。
 /// 本用例把**实际**行为两侧都钉死，让这条偏差在测试层可见而不是只存在于文档里。
 #[tokio::test]
 async fn config_accepts_empty_recipients_but_send_rejects_it() {
@@ -315,11 +333,20 @@ async fn config_accepts_empty_recipients_but_send_rejects_it() {
     // 发送路径才是真正的闸：空收件人 → 21704，且**不**产生流水
     let (status, env) = send(
         ctx.app.clone(),
-        json_request("POST", "/mail-digest/send", Some(json!({})), Some(&ctx.manager_token)),
+        json_request(
+            "POST",
+            "/mail-digest/send",
+            Some(json!({})),
+            Some(&ctx.manager_token),
+        ),
     )
     .await;
     assert_biz_code(status, &env, 21704, StatusCode::BAD_REQUEST);
-    assert_eq!(crate::count_logs(&ctx.pool).await, 0, "校验失败不得落流水：{env}");
+    assert_eq!(
+        crate::count_logs(&ctx.pool).await,
+        0,
+        "校验失败不得落流水：{env}"
+    );
 }
 
 // ===========================================================================
@@ -334,14 +361,20 @@ async fn upcoming_days_999_is_clamped_to_60() {
     body["upcoming_days"] = json!(999);
     let (status, env) = save_config(&ctx, body).await;
     assert_eq!(status, StatusCode::OK, "{env}");
-    assert_eq!(env["data"]["upcoming_days"], 60, "999 应被 clamp 到 60：{env}");
+    assert_eq!(
+        env["data"]["upcoming_days"], 60,
+        "999 应被 clamp 到 60：{env}"
+    );
 
     // 下界同理（0 → 1）
     let mut body2 = config_body(0);
     body2["upcoming_days"] = json!(0);
     let (status, env2) = save_config(&ctx, body2).await;
     assert_eq!(status, StatusCode::OK, "{env2}");
-    assert_eq!(env2["data"]["upcoming_days"], 1, "0 应被 clamp 到 1：{env2}");
+    assert_eq!(
+        env2["data"]["upcoming_days"], 1,
+        "0 应被 clamp 到 1：{env2}"
+    );
 }
 
 // ===========================================================================
@@ -449,11 +482,19 @@ async fn date_window_is_relative_to_runtime_today() {
     let _ = id;
     let (status, env) = send(
         ctx.app.clone(),
-        json_request("POST", "/mail-digest/preview", Some(json!({})), Some(&ctx.manager_token)),
+        json_request(
+            "POST",
+            "/mail-digest/preview",
+            Some(json!({})),
+            Some(&ctx.manager_token),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{env}");
-    assert_eq!(env["data"]["overdue_count"], 1, "today-3 的件应在逾期节：{env}");
+    assert_eq!(
+        env["data"]["overdue_count"], 1,
+        "today-3 的件应在逾期节：{env}"
+    );
 }
 
 /// `now_naive().date()` 的本地别名（避免在断言里混用两套时间来源）。

@@ -223,28 +223,6 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 - ⚠️ **本域零跨域模块依赖**（读别域的表是既定 pattern）：唯一例外是 `worker_stats` / `worker_detail` 经 `repo.conn_mut()` 借位调 `prod::worker::repo::WorkerRepo` 与 `prod::work_type::repo::WorkTypeRepo`，与 `DeliveryNoteRepoTrait::conn_mut` 同形。
 - ⚠️ **`count_overdue_undelivered` 与 dashboard 的逾期口径有意分叉**（本域 planned 口径 + DELIVERED 事件兜底），不要动它，见上一节末条。
 
-### `src/modules/mail_digest/` 域（交期到期汇总邮件，MANAGER-only，6 个端点，**2026-10-13 新建**）
-
-| 端点 | 权限 | 说明 |
-|---|---|---|
-| `GET /api/v2/mail-digest/config` | **Manager 独占** | 读配置**单例**；表空时返**全部默认值 + `version=0` + `id="0"`**（**不是 404**，配置页要能在「还没配过」时打开） |
-| `POST /api/v2/mail-digest/config` | **Manager 独占** | **全量覆写**；body **必含 `version`**（缺失 → axum `Json` 提取器返 **HTTP 422 纯文本**，不是业务信封）；成功后调 `task::mail_digest::reschedule` 热重载 cron（**失败不回滚配置**，只 warn） |
-| `GET /api/v2/mail-digest/meta` | **Manager 独占** | 表单的**全部**选项源：频率枚举（含三个 `needs_*`）/ 列白名单 / `upcoming_days_range` / 缺省值 / SMTP 公开信息（**绝不含 username / password**） |
-| `POST /api/v2/mail-digest/preview` | **Manager 独占** | 按「当前配置 + 临时覆盖」渲染 HTML；**不发送、不落流水**；空体 `{}` = 完全用当前配置 |
-| `POST /api/v2/mail-digest/send` | **Manager 独占** | 手动触发：渲染 + 真发 + 落流水（**成败都落**） |
-| `GET /api/v2/mail-digest/logs` | **Manager 独占** | 发送历史分页（`sent_at DESC, id DESC`；`limit` clamp `[1,200]`、缺省 20；`offset` clamp `>=0`；`total` 不受 `limit` 截断） |
-
-- **只用 GET / POST**（全仓零 PUT/PATCH/DELETE）；挂 `/api/v2/mail-digest`，登记在 `src/modules/mod.rs::v2_router()` 的 `.nest("/mail-digest", …)`（顶层 nest、kebab-case 单段）。**权威路由清单是 `handler::ROUTES`**（lib 单测逐条比对 `router()` 源码）。⚠️ 6 条路由**全是静态段**（无 `Path` 参数）⇒ 不受「静态段先于 catch-all」的 matchit 约束。
-- **角色守卫下沉在 handler 第一行**（6 个 handler 逐字 `require_role(Role::Manager)`；菜单亦仅授予 `MANAGER`，`seeds/menu.sql` 的 `mail_group` → `mail_digest`，路径 `/mail/digest`）。**错误码新开 `217xx` 段**：`21701` 未配置 SMTP（**503**，与 `40109` 同款）/ `21702` 发信失败（**502**，SMTP 是外部依赖）/ `21703` 邮箱非法（含 CR/LF 注入）/ `21704` 配置组合非法 / `21705` 配置不存在（**保留位，当前无生产方**）。
-- 🔒 **SMTP 凭据只走 env、不进 DB**（`infra::config::MailConfig`，手写 `Debug` 屏蔽 password）：密码落库就跟着备份走，且任何有只读库权限的人都能捞走。**双闸**：`MAIL_DIGEST_ENABLED`（env 总闸）+ `t_mail_digest_config.enabled`（DB），两者都 true 才注册 cron job；**未配置时后端照常启动**（定时任务 info 一行后返回，手动触发返 `21701`），与 `WECOM_*` 同一降级范式。
-- ⚠️ **落流水在发送之后、且不分成败**：只记成功会让「定时任务每天都在失败」完全不可观测。`t_mail_digest_log` 存**收件人快照**（逗号分隔，不 join 配置表）与 `config_version` 快照 —— 配置改了之后仍要看「当时发给谁、用的哪版配置」。该表**刻意无 `deleted_at` / `version`**（只增的审计流水）。
-- ⚠️ **配置单例靠表达式唯一索引** `uk_t_mail_digest_config_alive ON t_mail_digest_config ((true)) WHERE deleted_at IS NULL` 兜底并发首次初始化（两个请求都看到 `version=0`）⇒ 后到者撞 23505 → service **转成 OCC 冲突**（符合「40901 只表达 OCC」）。
-- **域隔离护栏：不适用**（与 `dashboard` / `statistics` 不同）：本域读 `t_part` / `t_assembly` / `t_part_batch` / `t_customer` 四张别域的表（只读聚合是既定 pattern，统计 SQL 完全在本域内写全、**不 import** 他域 service / repo），唯一的「引用他域符号」是**共用常量** `dashboard::repo::DELIVERY_STATUSES` —— 硬要绕开反而会逼出一份副本常量，那才是真正的漂移源。
-- ⚠️ **与 dashboard 的口径分叉登记**（逐条理由见 [`docs/api/mail_digest.md`](docs/api/mail_digest.md) §4）：**共用** `DELIVERY_STATUSES` 六态 / 行单位工单级 / 已交量守卫 `NOT EXISTS … status IN ('DELIVERED','COMPLETED')`（含 `COMPLETED` 是因为 force-complete 端点强推它）；**刻意不同** = dashboard 每桶 `LIMIT 30` 而本域**无 LIMIT**（邮件必须给全量）/ 本域多取 `drawing_no` / `order_no` 两列 / 本域未来节有 `[today, today+N)` 上界（`N` clamp 1..60）。**窗口下界取形参 `today`，SQL 里绝不写 `CURRENT_DATE`**（DB 会话时区与 `now_naive()` 是两个时钟，Shanghai 00:00–08:00 会整体偏移一天）。
-- ⚠️ **cron 是 6 段带秒**（tokio-cron-scheduler 0.15 内部 `croner` 固定 `Seconds::Required`），且 **`WEEKLY` 必减 1**（本域 `weekday` 用 ISO `1`=周一，cron 第 6 段 `0`=周日；漏减不报错，只会把邮件安静挪到隔一天）。时区**显式传 `Asia/Shanghai`**：`Job::new_async()` 的默认值是 **UTC**，不是本地时区。`JobScheduler::new()` 在 0.15 是 **`async fn`**。
-- ⚠️ **多副本部署不防重**（沿用 `task::auto_complete` 同一现状，N 个副本可能同一时刻发 N 封信）；**`/send` 无频控**（唯一护栏是 MANAGER 角色 + 两道 enabled 闸）。两者均登记为后续独立重构。
-- **覆盖空洞**：`/send` 的**成功路径**（`status='SUCCESS'` 流水行 / 真实投递）**无集成测试** —— 测试环境无可达 SMTP 且刻意不引入 lettre mock transport。替代覆盖：`/preview` 覆盖渲染 + 统计 SQL、「必失败」路径覆盖落流水、`mailer.rs` lib 单测覆盖 TLS 映射表与收件人解析。详见 [`docs/api/mail_digest.md`](docs/api/mail_digest.md) §8.3。
-
 #### 有效工时维度
 
 > 定义：区间内该工人**完成了一道工序**的次数 × 该工序在工单锚链上的
@@ -369,6 +347,30 @@ VO**：零件时间线用 `part::service::phase1::events` 的 `EventListRow`，s
   `/api/v2/iam/shelves/for-return` 仍落进 `/iam/shelves/{id}` 的 `Path<i64>` 提取器 ⇒
   **400 纯文本**；不带 `/iam` 前缀的整段旧路径 ⇒ **干净 404**（连 catch-all 都没了）。
   两条用例分别钉死，别把 400 当成「旧路由还在」。
+
+### `src/modules/mail_digest/` 域（交期到期汇总邮件，MANAGER-only，6 个端点，**2026-10-13 新建**）
+
+| 端点 | 权限 | 说明 |
+|---|---|---|
+| `GET /api/v2/mail-digest/config` | **Manager 独占** | 读配置**单例**；表空时返**全部默认值 + `version=0` + `id="0"`**（**不是 404**，配置页要能在「还没配过」时打开） |
+| `POST /api/v2/mail-digest/config` | **Manager 独占** | **全量覆写**；body **必含 `version`**（缺失 → axum `Json` 提取器返 **HTTP 422 纯文本**，不是业务信封）；成功后调 `task::mail_digest::reschedule` 热重载 cron（**失败不回滚配置**，只 warn） |
+| `GET /api/v2/mail-digest/meta` | **Manager 独占** | 表单的**全部**选项源：频率枚举（含三个 `needs_*`）/ 列白名单 / `upcoming_days_range` / 缺省值 / SMTP 公开信息（**绝不含 username / password**） |
+| `POST /api/v2/mail-digest/preview` | **Manager 独占** | 按「当前配置 + 临时覆盖」渲染 HTML；**不发送、不落流水**；空体 `{}` = 完全用当前配置 |
+| `POST /api/v2/mail-digest/send` | **Manager 独占** | 手动触发：渲染 + 真发 + 落流水（**成败都落**） |
+| `GET /api/v2/mail-digest/logs` | **Manager 独占** | 发送历史分页（`sent_at DESC, id DESC`；`limit` clamp `[1,200]`、缺省 20；`offset` clamp `>=0`；`total` 不受 `limit` 截断） |
+
+- **只用 GET / POST**（全仓零 PUT/PATCH/DELETE）；挂 `/api/v2/mail-digest`，登记在 `src/modules/mod.rs::v2_router()` 的 `.nest("/mail-digest", …)`（顶层 nest、kebab-case 单段）。**权威路由清单是 `handler::ROUTES`**（lib 单测逐条比对 `router()` 源码）。⚠️ 6 条路由**全是静态段**（无 `Path` 参数）⇒ 不受「静态段先于 catch-all」的 matchit 约束。
+- **角色守卫下沉在 handler 第一行**（6 个 handler 逐字 `require_role(Role::Manager)`；菜单亦仅授予 `MANAGER`，`seeds/menu.sql` 的 `mail_group` → `mail_digest`，路径 `/mail/digest`）。**错误码新开 `217xx` 段**：`21701` 未配置 SMTP（**503**，与 `40109` 同款）/ `21702` 发信失败（**502**，SMTP 是外部依赖）/ `21703` 邮箱非法（含 CR/LF 注入）/ `21704` 配置组合非法 / `21705` 配置不存在（**保留位，当前无生产方**）。
+- 🔒 **SMTP 凭据只走 env、不进 DB**（`infra::config::MailConfig`，手写 `Debug` 屏蔽 password）：密码落库就跟着备份走，且任何有只读库权限的人都能捞走。**双闸**：`MAIL_DIGEST_ENABLED`（env 总闸）+ `t_mail_digest_config.enabled`（DB），两者都 true 才注册 cron job；**未配置时后端照常启动**（定时任务 info 一行后返回，手动触发返 `21701`），与 `WECOM_*` 同一降级范式。
+- ⚠️ **落流水在发送之后、且不分成败**：只记成功会让「定时任务每天都在失败」完全不可观测。`t_mail_digest_log` 存**收件人快照**（逗号分隔，不 join 配置表）与 `config_version` 快照 —— 配置改了之后仍要看「当时发给谁、用的哪版配置」。该表**刻意无 `deleted_at` / `version`**（只增的审计流水）。
+- ⚠️ **`SCHEDULED` 的准备阶段失败也落流水**（2026-10-13）：定时路径下「读配置解析失败 / 收件人为空」发生在 `deliver` **之前**，原先直接 `return` ⇒ 流水表里查不到，「每天都在失败」只剩一行会被轮转掉的 `tracing::warn!`。现在补一行 `status='FAILED'`（`subject` 空串、`html_bytes=0`、两个 count 为 0）。唯一落不了的是 `pool.acquire()` 本身。`MANUAL` 路径不变（失败有 HTTP 错误码给调用方看，21701/21703/21704 仍不落流水）。
+- ⚠️ **节开关真的作用于正文**（2026-10-13）：`include_overdue=false` 时正文**完全不出现**该节（不是「出现标题 + 0 条」）；空态由渲染着的那一节自己的「本节无符合条件的工单」承担，不再叠一句全局空态。
+- ⚠️ **配置单例靠表达式唯一索引** `uk_t_mail_digest_config_alive ON t_mail_digest_config ((true)) WHERE deleted_at IS NULL` 兜底并发首次初始化（两个请求都看到 `version=0`）⇒ 后到者撞 23505 → service **转成 OCC 冲突**（符合「40901 只表达 OCC」）。
+- **域隔离护栏：不适用**（与 `dashboard` / `statistics` 不同）：本域读 `t_part` / `t_assembly` / `t_part_batch` / `t_customer` 四张别域的表（只读聚合是既定 pattern，统计 SQL 完全在本域内写全、**不 import** 他域 service / repo），唯一的「引用他域符号」是**共用常量** `dashboard::repo::DELIVERY_STATUSES` —— 硬要绕开反而会逼出一份副本常量，那才是真正的漂移源。
+- ⚠️ **与 dashboard 的口径分叉登记**（逐条理由见 [`docs/api/mail_digest.md`](docs/api/mail_digest.md) §4）：**共用** `DELIVERY_STATUSES` 六态 / 行单位工单级 / 已交量守卫 `NOT EXISTS … status IN ('DELIVERED','COMPLETED')`（含 `COMPLETED` 是因为 force-complete 端点强推它）；**刻意不同** = dashboard 每桶 `LIMIT 30` 而本域**无 LIMIT**（邮件必须给全量）/ 本域多取 `drawing_no` / `order_no` 两列 / 本域未来节有 `[today, today+N)` 上界（`N` clamp 1..60）。**窗口下界取形参 `today`，SQL 里绝不写 `CURRENT_DATE`**（DB 会话时区与 `now_naive()` 是两个时钟，Shanghai 00:00–08:00 会整体偏移一天）。
+- ⚠️ **cron 是 6 段带秒**（tokio-cron-scheduler 0.15 内部 `croner` 固定 `Seconds::Required`），且 **`WEEKLY` 必减 1**（本域 `weekday` 用 ISO `1`=周一，cron 第 6 段 `0`=周日；漏减不报错，只会把邮件安静挪到隔一天）。时区**显式传 `Asia/Shanghai`**：`Job::new_async()` 的默认值是 **UTC**，不是本地时区。`JobScheduler::new()` 在 0.15 是 **`async fn`**。
+- ⚠️ **多副本部署不防重**（沿用 `task::auto_complete` 同一现状，N 个副本可能同一时刻发 N 封信）；**`/send` 无频控**（唯一护栏是 MANAGER 角色 + 两道 enabled 闸）。两者均登记为后续独立重构。
+- **覆盖空洞**：`/send` 的**成功路径**（`status='SUCCESS'` 流水行 / 真实投递）**无集成测试** —— 测试环境无可达 SMTP 且刻意不引入 lettre mock transport。替代覆盖：`/preview` 覆盖渲染 + 统计 SQL、「必失败」路径覆盖落流水、`mailer.rs` lib 单测覆盖 TLS 映射表与收件人解析。详见 [`docs/api/mail_digest.md`](docs/api/mail_digest.md) §8.3。
 
 ### 状态派生契约（2026-10-01）
 

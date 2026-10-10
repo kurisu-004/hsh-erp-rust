@@ -33,6 +33,18 @@ use crate::shared::error::{AppError, code};
 /// 校验错误要带业务语义的错误码与提示文案）；它只对 `WEEKLY` / `MONTHLY`
 /// 缺字段报错。
 pub fn to_cron(cfg: &NormalizedScheduleInput) -> Result<String, AppError> {
+    // ⚠️ `MANUAL_ONLY` **必须**早于下面的时刻检查（2026-10-13 review 第 1 轮 NIT：
+    // 顺序反了的话，`MANUAL_ONLY` + 无时刻会先撞上「频率 MANUAL_ONLY 需要填写发送时刻」
+    // ——而这个频率按定义**就不需要时刻**，错误文案自相矛盾）。生产路径上 `to_cron`
+    // 根本不会被 MANUAL_ONLY 调到这里（`task::mail_digest::reschedule_inner` 已先早退），
+    // 本函数是纯函数、自带兜底，这个顺序保证兜底也说对话。
+    if cfg.frequency == Frequency::ManualOnly {
+        return Err(AppError::biz(
+            code::BIZ_MAIL_CONFIG_INVALID,
+            "MANUAL_ONLY（仅手动）不产生 cron 表达式：定时任务不应为它注册 job",
+        ));
+    }
+
     let (Some(hour), Some(minute)) = (cfg.send_hour, cfg.send_minute) else {
         return Err(AppError::biz(
             code::BIZ_MAIL_CONFIG_INVALID,
@@ -44,8 +56,9 @@ pub fn to_cron(cfg: &NormalizedScheduleInput) -> Result<String, AppError> {
     };
 
     Ok(match cfg.frequency {
-        // DAILY / WEEKLY / MONTHLY 分支都需要上面的 hour+minute，故这里只处理
-        // MANUAL_ONLY 的早退与三种 cron 的拼装。
+        // `MANUAL_ONLY` 已在函数开头早退（理由见上），故这里只剩三种需要时刻的频率。
+        // 该分支对编译器仍是必需的（match 必须穷尽）——**不可达**，真被走到说明
+        // 函数开头那道早退被误删了。
         Frequency::ManualOnly => {
             return Err(AppError::biz(
                 code::BIZ_MAIL_CONFIG_INVALID,
@@ -110,7 +123,11 @@ mod tests {
     fn daily_cron_has_six_fields_and_fixed_second_zero() {
         let cron = to_cron(&input(Frequency::Daily, Some(8), Some(30), None, None)).unwrap();
         assert_eq!(cron, "0 30 8 * * *");
-        assert_eq!(cron.split_whitespace().count(), 6, "croner 要求 6 段（含秒）");
+        assert_eq!(
+            cron.split_whitespace().count(),
+            6,
+            "croner 要求 6 段（含秒）"
+        );
     }
 
     /// WEEKLY 的**减 1** 边界：ISO 1（周一）⇒ cron 0（周日）；ISO 7（周日）⇒ cron 6（周六）。
@@ -161,6 +178,14 @@ mod tests {
         // 即便时刻字段齐全也照样拒 —— 语义是「仅手动」，不是「缺字段才拒」
         let err2 = to_cron(&input(Frequency::ManualOnly, None, None, None, None)).unwrap_err();
         assert_eq!(err2.code(), code::BIZ_MAIL_CONFIG_INVALID);
+        // ⚠️ 2026-10-13 review 第 1 轮 NIT：无时刻的 MANUAL_ONLY 早退**不得**说
+        // 「需要填写发送时刻」——这个频率按定义就不需要时刻，那句话自相矛盾。
+        let msg = err2.to_string();
+        assert!(msg.contains("MANUAL_ONLY"), "文案应指向频率本身：{msg}");
+        assert!(
+            !msg.contains("需要填写发送时刻"),
+            "MANUAL_ONLY 不该被要求填时刻：{msg}"
+        );
     }
 
     /// WEEKLY 缺 weekday / MONTHLY 缺 day_of_month → 21704（不是 500）。

@@ -34,9 +34,9 @@ use crate::shared::error::{AppError, code};
 use crate::state::AppState;
 
 use super::dto::{
-    ConfigDefaultsOut, ConfigOut, Frequency, LogListQuery, LogListOut, NormalizedConfig,
+    ConfigDefaultsOut, ConfigOut, Frequency, LogListOut, LogListQuery, NormalizedConfig,
     PreviewOut, PreviewRequest, SaveConfigRequest, SendResultOut, SendStatus, TriggerSource,
-    UPCOMING_DAYS_MAX, UPCOMING_DAYS_MIN, VisibleColumn, parse_visible_columns,
+    UPCOMING_DAYS_MAX, UPCOMING_DAYS_MIN, parse_visible_columns,
 };
 use super::model::{TMailDigestConfig, TMailDigestLog};
 use super::repo::{self, NewDigestLog};
@@ -51,10 +51,7 @@ use super::template::{self, RenderInput};
 /// 表里无行时返回**全部默认值 + `version=0` + `id="0"`**（而不是 404）：配置页必须
 /// 能在「还没配过」的状态下正常打开并提交首次配置，返 404 会让前端多写一套
 /// 「404 ⇒ 空表单」的分支。
-pub async fn get_config(
-    conn: &mut PgConnection,
-    mail: &MailConfig,
-) -> Result<ConfigOut, AppError> {
+pub async fn get_config(conn: &mut PgConnection, mail: &MailConfig) -> Result<ConfigOut, AppError> {
     match repo::get_config(conn).await? {
         Some(row) => Ok(ConfigOut::from_row(&row, mail)),
         None => Ok(ConfigOut::default_out(mail)),
@@ -62,10 +59,7 @@ pub async fn get_config(
 }
 
 /// `GET /logs`：发送历史分页。
-pub async fn list_logs(
-    conn: &mut PgConnection,
-    q: &LogListQuery,
-) -> Result<LogListOut, AppError> {
+pub async fn list_logs(conn: &mut PgConnection, q: &LogListQuery) -> Result<LogListOut, AppError> {
     // limit clamp 到 [1,200]：0 / 负数会让 `LIMIT` 报错或恒空，超大值等于没分页。
     let limit = q.limit.clamp(1, super::dto::LOGS_LIMIT_MAX);
     let offset = q.offset.max(0);
@@ -114,15 +108,8 @@ pub async fn save_config(
             }
         }
         Some(row) => {
-            let ok = repo::update_config(
-                conn,
-                row.id,
-                req.version,
-                &normalized,
-                current.id,
-                now,
-            )
-            .await?;
+            let ok = repo::update_config(conn, row.id, req.version, &normalized, current.id, now)
+                .await?;
             if !ok {
                 return Err(version_conflict());
             }
@@ -131,9 +118,7 @@ pub async fn save_config(
 
     // 读回最新行（含自增后的 version）返回，避免前端拿一个「提交前的 version」
     // 做下一次提交 → 立刻撞一次假的 OCC 冲突。
-    let fresh = repo::get_config(conn)
-        .await?
-        .ok_or_else(version_conflict)?;
+    let fresh = repo::get_config(conn).await?.ok_or_else(version_conflict)?;
     Ok(ConfigOut::from_row(&fresh, mail))
 }
 
@@ -297,13 +282,24 @@ pub fn validate_save_request(req: &SaveConfigRequest) -> Result<NormalizedConfig
         cc_recipients: validate_recipients(&req.cc_recipients)?,
         include_overdue: req.include_overdue,
         include_upcoming: req.include_upcoming,
-        upcoming_days: req.upcoming_days.clamp(UPCOMING_DAYS_MIN, UPCOMING_DAYS_MAX),
+        upcoming_days: req
+            .upcoming_days
+            .clamp(UPCOMING_DAYS_MIN, UPCOMING_DAYS_MAX),
         visible_columns: parse_visible_columns(&req.visible_columns)?,
         subject_template: validate_subject_template(req.subject_template.as_deref())?,
     })
 }
 
 /// 时段校验：`MANUAL_ONLY` 不需要时刻；其余频率必须给全 `hour` + `minute`。
+///
+/// ⚠️ **`MANUAL_ONLY` 直接早退是**有意的**（2026-10-13 review 第 1 轮 M6 附带的
+/// 正面登记）：这两个字段在 `MANUAL_ONLY` 之下**永不被读**（不产生 cron、不注册 job），
+/// 为它们加范围校验只会给「切到仅手动」这个最高频操作平白增加一条报错路径。
+/// 代价是能存进 `99` —— 这与 migration 列注释「`MANUAL_ONLY` → 写侧一律清 NULL」
+/// 不符（写侧只清 `weekday` / `day_of_month`，时刻字段是原样透传），
+/// `docs/api/mail_digest.md` §8.3「实现与注释不符」第 4 条已登记，
+/// 回归用例 `manual_only_keeps_send_time_unchecked`。migration 是 append-only、
+/// `COMMENT ON COLUMN` 已进版本库，故**能改的只有文档与本注释**。
 fn validate_time(
     frequency: Frequency,
     hour: Option<i16>,
@@ -367,7 +363,13 @@ fn validate_day_of_month(v: Option<i16>) -> Result<i16, AppError> {
     }
 }
 
-/// 收件人列表校验：`recipients` 必填非空；逐个做基本格式校验。
+/// 收件人列表校验：逐个做基本格式校验；**空数组在这里是合法的**。
+///
+/// ⚠️ **本函数不判非空**（2026-10-13 review 第 1 轮 M6：原 doc 写的是「`recipients`
+/// 必填非空」，与实现相反）。判空在**发送路径**的 [`deliver`] 里 —— 配置页
+/// 「先存草稿、后填收件人」是正常编辑形态，为它报错等于逼用户先填真实收件人才能保存。
+/// `docs/api/mail_digest.md` §8.3「实现与注释不符」第 1 条已登记，回归用例
+/// `config_accepts_empty_recipients_but_send_rejects_it` 同时钉住两侧。
 ///
 /// ⚠️ **拒含 CR / LF 的地址**：这是 SMTP **header 注入**面 —— 攻击者把
 /// `a@b.com\r\nBcc: victim@x.com` 塞进收件人，就能让本系统替他发信给任意第三方。
@@ -412,7 +414,10 @@ pub fn validate_email(addr: &str) -> Result<(), AppError> {
     if local.is_empty() {
         return reject("@ 之前为空");
     }
-    if domain.is_empty() || !domain.contains('.') || domain.starts_with('.') || domain.ends_with('.')
+    if domain.is_empty()
+        || !domain.contains('.')
+        || domain.starts_with('.')
+        || domain.ends_with('.')
     {
         return reject("域名部分不像域名（应有且仅有一个主分隔点，两端非空）");
     }
@@ -484,10 +489,7 @@ pub async fn effective_config(
             Some(cols) => parse_visible_columns(cols)?,
             None => base.visible_columns,
         },
-        subject_template: overrides
-            .subject_template
-            .clone()
-            .or(base.subject_template),
+        subject_template: overrides.subject_template.clone().or(base.subject_template),
     };
     // 合并结果走同一套校验（把 NormalizedConfig 还原成「请求体」形态复用校验逻辑）
     validate_normalized(&merged)
@@ -577,7 +579,10 @@ pub async fn preview(
 }
 
 /// `POST /send`：手动触发（渲染 + 真发 + 落流水）。
-pub async fn send_manual(state: &Arc<AppState>, req: &PreviewRequest) -> Result<SendResultOut, AppError> {
+pub async fn send_manual(
+    state: &Arc<AppState>,
+    req: &PreviewRequest,
+) -> Result<SendResultOut, AppError> {
     let mut conn = state.pool.acquire().await?;
     let cfg = effective_config(&mut conn, req).await?;
     deliver(state, &mut conn, &cfg, TriggerSource::Manual).await
@@ -587,21 +592,123 @@ pub async fn send_manual(state: &Arc<AppState>, req: &PreviewRequest) -> Result<
 ///
 /// 与手动触发的差别只有 `TriggerSource`；失败**不**向上抛（后台任务没有调用方，
 /// 抛了也只会被 tokio 吞掉），只 `warn!` + 记流水。
+///
+/// ## ⚠️ 「准备阶段」的失败**也**落流水（2026-10-13 review 第 1 轮 M8）
+///
+/// 本函数分两段：**准备**（取连接 → 读配置并规范化 → 判收件人非空）与**投递**
+/// （渲染 → 调 lettre → 落流水）。原实现里准备段失败直接 `return`，`deliver` 根本没
+/// 被调用 ⇒ `t_mail_digest_log` 里查不到任何东西，于是「定时任务每天都在失败」这件事
+/// **只剩一行 `tracing::warn!`**——而容器日志恰恰是最容易被轮转掉、最难按时间线回看
+/// 的那一份。可观测性的价值几乎全在流水表上（它是只增的、带 `config_version` 与收件人
+/// 快照的审计表），所以准备段的失败也补一行 `status='FAILED'`。
+///
+/// 唯一落不了的失败是 `pool.acquire()` 本身——没有连接就没有地方写。见
+/// [`log_prepare_failure`] 的 doc。
 pub async fn send_scheduled(state: &Arc<AppState>) {
-    let result = async {
-        let mut conn = state.pool.acquire().await?;
-        let cfg = current_normalized(&mut conn).await?;
-        deliver(state, &mut conn, &cfg, TriggerSource::Scheduled).await
+    let mut conn = match state.pool.acquire().await {
+        Ok(c) => c,
+        Err(e) => {
+            // 唯一一类「明知道失败了却落不了流水」的情形：连接都拿不到。
+            tracing::warn!(error = %e, "mail_digest: 定时汇总邮件取连接失败（无连接可落流水）");
+            return;
+        }
+    };
+
+    let cfg = match current_normalized(&mut conn).await {
+        Ok(c) => c,
+        Err(e) => {
+            log_prepare_failure(state, &mut conn, None, &e).await;
+            tracing::warn!(error = %e, "mail_digest: 定时汇总邮件准备失败（读配置/解析），流水已落库");
+            return;
+        }
+    };
+
+    // 收件人为空属**准备阶段**失败：手动路径有调用方看 HTTP 错误码，定时路径没有。
+    if cfg.recipients.is_empty() {
+        let e = empty_recipients_err();
+        log_prepare_failure(state, &mut conn, Some(&cfg), &e).await;
+        tracing::warn!(error = %e, "mail_digest: 定时汇总邮件准备失败（收件人为空），流水已落库");
+        return;
     }
-    .await;
-    match result {
-        Ok(out) => tracing::info!(
-            log_id = out.log_id,
-            overdue_count = out.overdue_count,
-            upcoming_count = out.upcoming_count,
-            "mail_digest: 定时汇总邮件已发出"
+
+    match deliver(state, &mut conn, &cfg, TriggerSource::Scheduled).await {
+        Ok(out) => {
+            tracing::info!(
+                log_id = out.log_id,
+                overdue_count = out.overdue_count,
+                upcoming_count = out.upcoming_count,
+                "mail_digest: 定时汇总邮件已发出"
+            );
+        }
+        Err(e) => tracing::warn!(error = %e, "mail_digest: 定时汇总邮件发送失败（流水已落库）"),
+    }
+}
+
+/// 「准备阶段」失败的流水：**没有** `subject` / `html_bytes`（压根没渲染）。
+///
+/// `cfg` 传 `None` 表示连配置都没解析出来（脏 `frequency` / 脏 `visible_columns`）——
+/// 此时尽力从**原始行**捞版本号与收件人快照，捞不到就记 0 / 空串：流水表的这几列是
+/// **快照**（配置改了之后仍要看「当时发给谁、用的哪版配置」），拿不到时留空比编一个
+/// 更诚实。
+///
+/// ⚠️ 本函数**永不**向上返回错误：它存在的意义是「失败也要留下痕迹」，若它自己失败
+/// 就静默 `warn!`（调用方随后仍会 `warn!` 原始原因，两条日志互补）。
+///
+/// ⚠️ `error_message` 存的是 `AppError` 的 `Display`（`[21704] …`，**带码前缀**），
+/// 与 §8.3「本域设计上的已知取舍」第 4 条那条「落库存裸文本」的纪律**故意不同**：
+/// 那条纪律针对的是 `mailer::send` 的失败文本——它同时出现在 HTTP `message` 与流水里，
+/// 两边都带前缀才是真的重复前缀。而准备阶段失败**没有 HTTP 对应物**（定时任务没有调用
+/// 方），前缀里的错误码在这里是**净收益**：`21704` 承载四种成因，光看裸文案容易把
+/// 「两节都关」与「收件人为空」搞混。
+async fn log_prepare_failure(
+    state: &Arc<AppState>,
+    conn: &mut PgConnection,
+    cfg: Option<&NormalizedConfig>,
+    err: &AppError,
+) {
+    let (config_version, to_recipients, cc_recipients) = match cfg {
+        Some(c) => (
+            cfg_version_of(conn).await.unwrap_or(0),
+            c.recipients.join(","),
+            c.cc_recipients.join(","),
         ),
-        Err(e) => tracing::warn!(error = %e, "mail_digest: 定时汇总邮件发送/准备失败（流水已落库）"),
+        None => match repo::get_config(conn).await {
+            Ok(Some(row)) => (
+                row.version,
+                row.recipients.join(","),
+                row.cc_recipients.join(","),
+            ),
+            Ok(None) => (0, String::new(), String::new()),
+            Err(e) => {
+                tracing::warn!(error = %e, "mail_digest: 准备失败流水连原始配置行都读不到，记 0/空");
+                (0, String::new(), String::new())
+            }
+        },
+    };
+
+    let inserted = repo::insert_log(
+        conn,
+        &state.snowflake,
+        &NewDigestLog {
+            config_version,
+            trigger_source: TriggerSource::Scheduled.as_str(),
+            to_recipients,
+            cc_recipients,
+            // 没渲染 ⇒ 没有主题。留空串而不是编一个：`GET /logs` 的前端据此知道
+            // 「这次根本没走到渲染」，而不是「主题恰好是空」。
+            subject: String::new(),
+            overdue_count: 0,
+            upcoming_count: 0,
+            html_bytes: 0,
+            status: SendStatus::Failed.as_str(),
+            error_message: Some(truncate_chars(&err.to_string(), 500)),
+            sent_at: now_ts(),
+        },
+    )
+    .await;
+    match inserted {
+        Ok(log) => tracing::info!(log_id = log.id, "mail_digest: 准备阶段失败流水已落库"),
+        Err(e) => tracing::warn!(error = %e, "mail_digest: 准备阶段失败流水落库失败"),
     }
 }
 
@@ -624,6 +731,18 @@ async fn fetch_rows(
     Ok((overdue, upcoming))
 }
 
+/// 「收件人为空」的错误。
+///
+/// ⚠️ **判空只在发送路径**（本函数 + [`send_scheduled`] 的准备段），**不在** `POST /config`
+/// ——见 [`validate_recipients`] 的 doc 与 §8.3「实现与注释不符」第 1 条。
+/// [`deliver`] 与定时准备段共用这一处构造，避免两条路径的文案漂移。
+fn empty_recipients_err() -> AppError {
+    AppError::biz(
+        code::BIZ_MAIL_CONFIG_INVALID,
+        "收件人为空：请先在「交期汇总邮件」配置里填写至少一个收件人",
+    )
+}
+
 /// 渲染 → 发信 → **无论成败都**落流水。
 ///
 /// 返回 `Ok(SendResultOut)` 表示信已发出；`Err(21702)` 表示 SMTP 层失败
@@ -644,10 +763,7 @@ async fn deliver(
         ));
     }
     if cfg.recipients.is_empty() {
-        return Err(AppError::biz(
-            code::BIZ_MAIL_CONFIG_INVALID,
-            "收件人为空：请先在「交期汇总邮件」配置里填写至少一个收件人",
-        ));
+        return Err(empty_recipients_err());
     }
 
     let today = now_naive().date();
@@ -660,8 +776,7 @@ async fn deliver(
     });
     let html_bytes = rendered.html.len() as i32;
 
-    let send_result =
-        super::mailer::send(mail, cfg, &rendered.subject, &rendered.html).await;
+    let send_result = super::mailer::send(mail, cfg, &rendered.subject, &rendered.html).await;
 
     let status = match &send_result {
         Ok(()) => SendStatus::Success,
@@ -719,7 +834,10 @@ async fn deliver(
 
 /// 读当前配置行版本（流水快照用；表空时记 `0`）。
 async fn cfg_version_of(conn: &mut PgConnection) -> Result<i32, AppError> {
-    Ok(repo::get_config(conn).await?.map(|r| r.version).unwrap_or(0))
+    Ok(repo::get_config(conn)
+        .await?
+        .map(|r| r.version)
+        .unwrap_or(0))
 }
 
 /// 按**字符**截断（不是字节）—— 字节截断可能把一个多字节汉字劈成非法 UTF-8，
@@ -752,9 +870,4 @@ pub fn mask_recipients(list: &[String]) -> String {
 /// `GET /meta` 的 `defaults` 段（纯函数，不查库）。
 pub fn config_defaults() -> ConfigDefaultsOut {
     ConfigDefaultsOut::from(&NormalizedConfig::default())
-}
-
-/// `VisibleColumn` 的缺省集合（`GET /meta` 与 `template` 共用同一份真源）。
-pub fn default_columns() -> &'static [VisibleColumn] {
-    VisibleColumn::DEFAULT_SET
 }

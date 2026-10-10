@@ -57,6 +57,9 @@ use hsh_erp_test_support::{
 pub(crate) struct Ctx {
     pub pool: PgPool,
     pub app: axum::Router,
+    /// `AppState` 本体：唯一需要**直调 service** 的用例用（`send_scheduled` 没有
+    /// HTTP 端点，只能像 cron job 那样直接调）。其余用例走 `app`。
+    pub state: Arc<hsh_erp_rust::state::AppState>,
     pub manager_token: String,
     pub clerk_token: String,
     pub customer_id: i64,
@@ -81,13 +84,14 @@ pub(crate) async fn bootstrap_with_mail(mail: MailConfig) -> Ctx {
         let old_cfg = (*inner.config).clone();
         inner.config = Arc::new(AppConfig { mail, ..old_cfg });
     }
-    let app = test_app(state);
+    let app = test_app(state.clone());
     let manager_token = login_token(&app, &fx.manager_username, PartFixture::PASSWORD).await;
     let clerk_token = login_token(&app, &fx.clerk_username, PartFixture::PASSWORD).await;
     let customer_id = insert_customer(&pool, "汇总邮件测试客户").await;
     Ctx {
         pool,
         app,
+        state,
         manager_token,
         clerk_token,
         customer_id,
@@ -300,7 +304,12 @@ pub(crate) fn unreachable_smtp() -> MailConfig {
 }
 
 /// 断言信封里的业务码。
-pub(crate) fn assert_biz_code(status: StatusCode, env: &Value, want_code: i32, want_http: StatusCode) {
+pub(crate) fn assert_biz_code(
+    status: StatusCode,
+    env: &Value,
+    want_code: i32,
+    want_http: StatusCode,
+) {
     assert_eq!(
         status, want_http,
         "HTTP 状态不符；信封={env}（want_http={want_http} want_code={want_code}）"

@@ -80,7 +80,10 @@ fn visible_column_whitelist_is_closed_and_labels_unique() {
 
     // 缺省 8 列必须是全量白名单的子集
     for c in VisibleColumn::DEFAULT_SET {
-        assert!(VisibleColumn::ALL.contains(c), "缺省列 {c:?} 不在全量白名单里");
+        assert!(
+            VisibleColumn::ALL.contains(c),
+            "缺省列 {c:?} 不在全量白名单里"
+        );
     }
 }
 
@@ -168,7 +171,10 @@ fn monthly_requires_day_of_month_in_range_1_to_28() {
     let mut r = req();
     r.frequency = "MONTHLY".into();
     r.day_of_month = None;
-    assert_eq!(service::validate_save_request(&r).unwrap_err().code(), 21704);
+    assert_eq!(
+        service::validate_save_request(&r).unwrap_err().code(),
+        21704
+    );
 
     // 上界 28 是刻意的（避开 2 月末 / 30-31 日短月）
     for bad in [Some(0), Some(29), Some(31), Some(-1)] {
@@ -186,7 +192,10 @@ fn daily_clears_weekday_and_day_of_month() {
     r.weekday = Some(3);
     r.day_of_month = Some(9);
     let n = service::validate_save_request(&r).unwrap();
-    assert_eq!(n.weekday, None, "DAILY 之下 weekday 必须清 NULL（不留脏值）");
+    assert_eq!(
+        n.weekday, None,
+        "DAILY 之下 weekday 必须清 NULL（不留脏值）"
+    );
     assert_eq!(n.day_of_month, None, "DAILY 之下 day_of_month 必须清 NULL");
 }
 
@@ -245,11 +254,22 @@ fn hour_and_minute_bounds_are_enforced() {
 
 #[test]
 fn upcoming_days_are_clamped_to_1_to_60() {
-    for (raw, want) in [(-5, 1), (0, 1), (1, 1), (14, 14), (60, 60), (61, 60), (9999, 60)] {
+    for (raw, want) in [
+        (-5, 1),
+        (0, 1),
+        (1, 1),
+        (14, 14),
+        (60, 60),
+        (61, 60),
+        (9999, 60),
+    ] {
         let mut r = req();
         r.upcoming_days = raw;
         let n = service::validate_save_request(&r).unwrap();
-        assert_eq!(n.upcoming_days, want, "upcoming_days={raw} 应 clamp 到 {want}");
+        assert_eq!(
+            n.upcoming_days, want,
+            "upcoming_days={raw} 应 clamp 到 {want}"
+        );
     }
 }
 
@@ -264,12 +284,8 @@ fn both_sections_off_is_rejected() {
 
 #[test]
 fn recipients_whitespace_is_trimmed_and_blank_entries_dropped() {
-    let out = service::validate_recipients(&[
-        "  a@x.com ".into(),
-        "   ".into(),
-        "b@x.com".into(),
-    ])
-    .unwrap();
+    let out = service::validate_recipients(&["  a@x.com ".into(), "   ".into(), "b@x.com".into()])
+        .unwrap();
     assert_eq!(out, vec!["a@x.com".to_string(), "b@x.com".to_string()]);
 }
 
@@ -343,7 +359,11 @@ fn subject_template_rejects_crlf_and_overlong() {
     assert_eq!(e.code(), 21704);
     // 超长按**字符**算（不是字节）：80 个中文 = 240 字节但 80 字，应通过
     let cn80 = "标".repeat(80);
-    assert!(service::validate_subject_template(Some(&cn80)).unwrap().is_some());
+    assert!(
+        service::validate_subject_template(Some(&cn80))
+            .unwrap()
+            .is_some()
+    );
     let cn201 = "标".repeat(201);
     let e = service::validate_subject_template(Some(&cn201)).unwrap_err();
     assert_eq!(e.code(), 21704);

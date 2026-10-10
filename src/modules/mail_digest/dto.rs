@@ -91,11 +91,6 @@ impl Frequency {
     pub fn needs_day_of_month(self) -> bool {
         matches!(self, Self::Monthly)
     }
-
-    /// 由字面量解析（写侧读 DB 时用）。
-    pub fn from_db(raw: &str) -> Result<Self, AppError> {
-        raw.parse()
-    }
 }
 
 impl std::str::FromStr for Frequency {
@@ -109,9 +104,7 @@ impl std::str::FromStr for Frequency {
             "MANUAL_ONLY" => Ok(Self::ManualOnly),
             other => Err(AppError::biz(
                 code::BIZ_MAIL_CONFIG_INVALID,
-                format!(
-                    "频率取值非法：{other}；合法值只有 DAILY / WEEKLY / MONTHLY / MANUAL_ONLY"
-                ),
+                format!("频率取值非法：{other}；合法值只有 DAILY / WEEKLY / MONTHLY / MANUAL_ONLY"),
             )),
         }
     }
@@ -132,7 +125,8 @@ impl Serialize for Frequency {
 /// ⚠️ **这是封闭枚举**：新增列必须同时改①本枚举 ②`template.rs` 的取值函数
 /// ③`GET /meta` 的输出（后两者都由本枚举派生，改一处即可）。未知列一律
 /// `21704 BIZ_MAIL_CONFIG_INVALID`，**不静默丢弃** —— 配置错误应当当场暴露，
-/// 静默丢弃会让人以为列已经生效（见 `service::validate_visible_columns`）。
+/// 静默丢弃会让人以为列已经生效。真正的解析入口是本文件的 [`parse_visible_columns`]
+/// （写侧 `service::validate_save_request` 与读侧 `service::normalize_row` 都走它）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VisibleColumn {
     SerialNo,
@@ -442,8 +436,16 @@ impl Default for NormalizedConfig {
     /// `POST /config` 首次初始化前的基准，三者共用这一份）。
     ///
     /// ⚠️ `recipients` 刻意**为空**而不是塞一个占位地址：占位地址会让人以为
-    /// 「配好了」，而空数组会被 `POST /config` 的校验（21704）当场拦下，
-    /// 逼着先填真实收件人。`enabled` 缺省 `false`，同理。
+    /// 「配好了」（然后真发出一封没人收的信，或更糟：被人当成真地址加进客户名册）。
+    ///
+    /// ⚠️ **空数组在本结构里是合法值**：`POST /config` **允许**存一份空收件人的配置
+    /// （编辑中途的正常形态），非空不变量**只**在发送路径上生效
+    /// （`service::deliver` / `service::send_scheduled` 的准备段）。
+    /// 原注释写的是「空数组会被 `POST /config` 的校验（21704）当场拦下」，**与实现相反**
+    /// ——2026-10-13 review 第 1 轮 M6 订正，见
+    /// `docs/api/mail_digest.md` §8.3「实现与注释不符」第 1 条与回归用例
+    /// `config_accepts_empty_recipients_but_send_rejects_it`。
+    /// `enabled` 缺省 `false`，同理（少发一封信永远好过多发一封）。
     fn default() -> Self {
         Self {
             enabled: false,

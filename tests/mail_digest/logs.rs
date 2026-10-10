@@ -17,9 +17,7 @@ use serde_json::{Value, json};
 
 use hsh_erp_test_support::{json_request, send};
 
-use crate::{
-    Ctx, bootstrap_with_mail, config_body, insert_log_row, unreachable_smtp,
-};
+use crate::{Ctx, bootstrap_with_mail, config_body, insert_log_row, unreachable_smtp};
 
 /// `GET /logs?query` → `(status, 信封)`。
 async fn get_logs(ctx: &Ctx, query: &str) -> (StatusCode, Value) {
@@ -88,15 +86,27 @@ async fn logs_paginates_with_limit_and_offset_and_reports_total() {
     let items = env["data"]["items"].as_array().expect("items 是数组");
     assert_eq!(items.len(), 2, "{env}");
     // 倒序：最新在前
-    assert_eq!(items[0]["to_recipients"], json!(["new@example.com"]), "{env}");
-    assert_eq!(items[1]["to_recipients"], json!(["mid@example.com"]), "{env}");
+    assert_eq!(
+        items[0]["to_recipients"],
+        json!(["new@example.com"]),
+        "{env}"
+    );
+    assert_eq!(
+        items[1]["to_recipients"],
+        json!(["mid@example.com"]),
+        "{env}"
+    );
 
     // 第二页 1 条（offset 生效）
     let (status, env) = get_logs(&ctx, "?limit=2&offset=2").await;
     assert_eq!(status, StatusCode::OK, "{env}");
     let items = env["data"]["items"].as_array().expect("items 是数组");
     assert_eq!(items.len(), 1, "{env}");
-    assert_eq!(items[0]["to_recipients"], json!(["old@example.com"]), "{env}");
+    assert_eq!(
+        items[0]["to_recipients"],
+        json!(["old@example.com"]),
+        "{env}"
+    );
     assert_eq!(env["data"]["total"], 3, "{env}");
 
     // 缺省 limit = 20
@@ -113,7 +123,10 @@ async fn logs_clamps_out_of_range_pagination_params() {
     assert_eq!(env["data"]["limit"], 200, "超上限 clamp 到 200：{env}");
 
     let (_, env) = get_logs(&ctx, "?limit=0").await;
-    assert_eq!(env["data"]["limit"], 1, "下界 clamp 到 1（0 会让 SQL LIMIT 报错）：{env}");
+    assert_eq!(
+        env["data"]["limit"], 1,
+        "下界 clamp 到 1（0 会让 SQL LIMIT 报错）：{env}"
+    );
 
     let (_, env) = get_logs(&ctx, "?limit=-5").await;
     assert_eq!(env["data"]["limit"], 1, "{env}");
@@ -143,7 +156,12 @@ async fn log_snapshots_recipients_at_send_time() {
     // 真发一次（必失败 ⇒ 落一行流水）
     let (status, env) = send(
         ctx.app.clone(),
-        json_request("POST", "/mail-digest/send", Some(json!({})), Some(&ctx.manager_token)),
+        json_request(
+            "POST",
+            "/mail-digest/send",
+            Some(json!({})),
+            Some(&ctx.manager_token),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{env}");
@@ -170,7 +188,11 @@ async fn log_snapshots_recipients_at_send_time() {
         json_request("GET", "/mail-digest/config", None, Some(&ctx.manager_token)),
     )
     .await;
-    assert_eq!(env4["data"]["recipients"], json!(["new@example.com"]), "{env4}");
+    assert_eq!(
+        env4["data"]["recipients"],
+        json!(["new@example.com"]),
+        "{env4}"
+    );
 }
 
 // ===========================================================================
@@ -189,7 +211,12 @@ async fn log_records_config_version_at_send_time() {
     // 发一次 → 流水应记 version=0
     let (status, _) = send(
         ctx.app.clone(),
-        json_request("POST", "/mail-digest/send", Some(json!({})), Some(&ctx.manager_token)),
+        json_request(
+            "POST",
+            "/mail-digest/send",
+            Some(json!({})),
+            Some(&ctx.manager_token),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);

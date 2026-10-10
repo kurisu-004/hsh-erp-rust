@@ -36,8 +36,14 @@ use crate::modules::mail_digest::repo::DigestRow;
 /// 渲染入参。
 ///
 /// `overdue_rows` / `upcoming_rows` 由 service 层按 `include_overdue` /
-/// `include_upcoming` 决定**是否去查**（关掉的节不查，省一次 SQL）；
-/// 渲染层对空切片与「节被关掉」不做区分 —— 两者都输出「无符合条件的工单」。
+/// `include_upcoming` 决定**是否去查**（关掉的节不查，省一次 SQL）—— 但
+/// **渲染层自己也按 `cfg.include_*` 决定渲不渲染**，不靠「切片恰好是空的」来推断。
+///
+/// ⚠️ 2026-10-13（review 第 1 轮 M5）两处原本是「不区分」的：`render()` 无条件调用
+/// 两次 `render_section`，而关掉的节因为没查库而拿到空切片，于是正文里照样出现
+/// 「已逾期（系统交期早于今日）（0 条） / 本节无符合条件的工单」。管理员关掉逾期节却
+/// 在信里看到一条空节，**第一反应是「统计口径是不是坏了」**而不是「这节我没要」——
+/// 这是会直接变成工单的问题。⇒ 节开关现在真的作用于正文。
 #[derive(Debug, Clone)]
 pub struct RenderInput<'a> {
     pub cfg: &'a NormalizedConfig,
@@ -111,29 +117,37 @@ pub fn render(input: &RenderInput) -> RenderedMail {
     ));
     html.push_str(HR);
 
-    // ── 逾期节 ──
-    html.push_str(&render_section(
-        "已逾期（系统交期早于今日）",
-        input.overdue_rows,
-        &columns,
-        input.today,
-        true,
-    ));
+    // ── 逾期节 / 未来节：关掉的节**整段不输出**（2026-10-13 M5）──
+    // 节开关直接读 `cfg.include_*`，不新增 `RenderInput` 字段：那里已经有了同一对
+    // 开关的来源，再抄一份进 `RenderInput` 只会给「两者不一致」开一个口子。
+    if input.cfg.include_overdue {
+        html.push_str(&render_section(
+            "已逾期（系统交期早于今日）",
+            input.overdue_rows,
+            &columns,
+            input.today,
+            true,
+        ));
+    }
 
-    // ── 未来节 ──
-    html.push_str(&render_section(
-        "即将到期（今日起未来窗口内）",
-        input.upcoming_rows,
-        &columns,
-        input.today,
-        false,
-    ));
+    if input.cfg.include_upcoming {
+        html.push_str(&render_section(
+            "即将到期（今日起未来窗口内）",
+            input.upcoming_rows,
+            &columns,
+            input.today,
+            false,
+        ));
+    }
 
-    // ── 空态：两节都无行时给一句人话，而不是一张空表 ──
-    if input.overdue_rows.is_empty() && input.upcoming_rows.is_empty() {
+    // ── 空态：**一节都没渲染**时才给一句人话（2026-10-13 m2）──
+    // 只要渲染了至少一节，空态就由那一节自己的「本节无符合条件的工单」承担；两节都开
+    // 且都无行时再补一句全局空态，是同一件事说三遍（原先正是 4 段连续冗余文案）。
+    // 「两节都关」在配置层已被 21704 拒掉，这里是渲染层对纯函数调用的优雅兜底。
+    if !input.cfg.include_overdue && !input.cfg.include_upcoming {
         html.push_str(
             "<tr><td style=\"padding:24px 16px;text-align:center;color:#909399;\">\
-             无符合条件的工单</td></tr>",
+             本邮件未启用任何内容节</td></tr>",
         );
     }
 
@@ -147,15 +161,18 @@ pub fn render(input: &RenderInput) -> RenderedMail {
     }
 }
 
-/// 剔除未知列（DB 里可能是历史遗留的、或手工塞进去的脏值）。
+/// 兜底「全空白名单 → 退回缺省 8 列」，**不是**「剔除未知列」。
 ///
-/// ⚠️ 写侧（`POST /config`）对未知列**直接报 21704**，不静默丢弃（配置错误要当场
-/// 暴露）；这里仍做一次过滤，是**纵深防御**：DB 是 `varchar[]`、绕过 API 的直连写入
-/// 或将来某个 seed 都能塞进脏值，若渲染层不认它就会在正文里留一列空白。
-/// 命中即 `tracing::warn!` —— 说明有脏数据，需要有人去查源头。
+/// ⚠️ 2026-10-13（review 第 1 轮 M7）本函数的 doc 原先写的是「剔除未知列…命中即
+/// `tracing::warn!`」，那是**抄错了路径**：形参是 `&[VisibleColumn]` —— **已解析过的
+/// 枚举**，结构上就装不进未知值。脏值（DB 里 `visible_columns` 里的陌生列名）的真实
+/// 处置在 `service::normalize_row → dto::parse_visible_columns`，那里直接返 `21704`
+/// 硬错（配置错误要当场暴露，**不静默丢弃**），根本走不到渲染层。
+///
+/// 所以这里只兜**一种**情形：白名单为空数组（绕过 API 的直连写入 / 将来某个 seed）。
+/// 空列白名单会让正文没有任何数据列，一张只有表头的表格毫无意义 ⇒ 退回缺省集合并
+/// `warn!`（命中即说明有脏数据，需要有人去查源头）。
 fn filter_known_columns(cols: &[VisibleColumn]) -> Vec<VisibleColumn> {
-    // 入参已是 `VisibleColumn`（写侧已解析过），故这里只处理「全空」的极端情形：
-    // 空白名单会让正文没有任何数据列，一个只有表头的表格毫无意义 —— 退到缺省集合。
     if cols.is_empty() {
         tracing::warn!(
             "mail_digest: visible_columns 为空，渲染退回缺省 8 列（DB 里可能存了空数组）"
@@ -213,7 +230,13 @@ fn render_section(
                 out.push_str("</table></td></tr><tr><td colspan=\"");
                 out.push_str(&columns.len().to_string());
                 out.push_str("\" style=\"padding-left:0;\">");
-                out.push_str(&group_header("无交期", is_overdue, today, None));
+                out.push_str(&group_header(
+                    "无交期",
+                    is_overdue,
+                    today,
+                    None,
+                    columns.len(),
+                ));
                 out.push_str("<table width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"border-collapse:collapse;\">");
                 current = None;
             }
@@ -231,6 +254,7 @@ fn render_section(
                 is_overdue,
                 today,
                 Some(date),
+                columns.len(),
             ));
             out.push_str("<table width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"border-collapse:collapse;\">");
             current = Some(date);
@@ -242,10 +266,22 @@ fn render_section(
 }
 
 /// 组标题行：日期 + 逾期天数 / 剩余天数标注。
-fn group_header(label: &str, is_overdue: bool, today: NaiveDate, date: Option<NaiveDate>) -> String {
+///
+/// ⚠️ `colspan` **必须**是真实列数（`2026-10-13` review 第 1 轮 m1）：原先这里写的是
+/// 字面量 `"*"`，而 HTML 的 `colspan="*"` 不是合法取值、客户端一律**回落到 1** ——
+/// 日期组标题行于是只盖住第一列，不再横跨整张表。形参 `colspan` 由
+/// [`render_section`] 传 `columns.len()`（同一函数里另外两处 `<td colspan="…">` 本来
+/// 就是这么写的）。
+fn group_header(
+    label: &str,
+    is_overdue: bool,
+    today: NaiveDate,
+    date: Option<NaiveDate>,
+    colspan: usize,
+) -> String {
     let Some(date) = date else {
         return format!(
-            "<tr><td colspan=\"*\" style=\"{GROUP_STYLE}\">{}</td></tr>",
+            "<tr><td colspan=\"{colspan}\" style=\"{GROUP_STYLE}\">{}</td></tr>",
             html_escape(label)
         );
     };
@@ -260,7 +296,7 @@ fn group_header(label: &str, is_overdue: bool, today: NaiveDate, date: Option<Na
         (format!("剩余 {} 天", delta), COLOR_INFO)
     };
     format!(
-        "<tr><td colspan=\"*\" style=\"{GROUP_STYLE}\">{} <span style=\"color:{color};\">（{note}）</span></td></tr>",
+        "<tr><td colspan=\"{colspan}\" style=\"{GROUP_STYLE}\">{} <span style=\"color:{color};\">（{note}）</span></td></tr>",
         html_escape(label)
     )
 }
@@ -403,11 +439,15 @@ mod tests {
             is_urgent: false,
             order_no: Some("PO-9".into()),
             customer_name: Some("某某机械".into()),
-            row_type: if asm { "ASSEMBLY" } else { "PART" } .into(),
+            row_type: if asm { "ASSEMBLY" } else { "PART" }.into(),
         }
     }
 
-    fn input<'a>(cfg: &'a NormalizedConfig, o: &'a [DigestRow], u: &'a [DigestRow]) -> RenderInput<'a> {
+    fn input<'a>(
+        cfg: &'a NormalizedConfig,
+        o: &'a [DigestRow],
+        u: &'a [DigestRow],
+    ) -> RenderInput<'a> {
         RenderInput {
             cfg,
             overdue_rows: o,
@@ -458,15 +498,76 @@ mod tests {
         );
     }
 
-    /// 空体（两节都无行）输出「无符合条件的工单」而不是一张空表。
+    /// 空体（两节都开着但都无行）→ **只**由各节自己的「本节无符合条件的工单」承担
+    /// 空态，不再补一句全局的「无符合条件的工单」（2026-10-13 m2：原先是 5 段同义文案）。
     #[test]
     fn empty_input_renders_empty_state_not_blank_table() {
         let cfg = NormalizedConfig::default();
         let out = render(&input(&cfg, &[], &[]));
         assert_eq!(out.overdue_count, 0);
         assert_eq!(out.upcoming_count, 0);
-        assert!(out.html.contains("无符合条件的工单"));
+        assert_eq!(
+            out.html.matches("本节无符合条件的工单").count(),
+            2,
+            "两节各一句，**没有**多余的全局空态：{}",
+            out.html
+        );
         assert!(!out.html.contains("<th"), "无数据时不应渲染表头");
+    }
+
+    /// ⚠️ 回归（2026-10-13 review 第 1 轮 M5）：**节开关真的不渲染该节**。
+    ///
+    /// 原先 `render()` 无条件调用两次 `render_section`，关掉的节因没查库而拿到空切片，
+    /// 于是正文里照样出现「已逾期（…）（0 条）/ 本节无符合条件的工单」——管理员关掉
+    /// 逾期节却在信里看到一条空节，第一反应是「统计口径是不是坏了」。
+    #[test]
+    fn closed_section_is_not_rendered_at_all() {
+        let rows = vec![row("DWG-U", Some("2026-10-15"), false)];
+        let cfg = NormalizedConfig {
+            include_overdue: false,
+            ..NormalizedConfig::default()
+        };
+        let out = render(&input(&cfg, &[], &rows));
+        assert!(
+            !out.html.contains("已逾期"),
+            "关掉的逾期节不应出现任何字样：{}",
+            out.html
+        );
+        assert!(out.html.contains("即将到期"), "开着的未来节必须渲染");
+        assert!(out.html.contains("DWG-U"));
+        assert_eq!(out.overdue_count, 0);
+        assert_eq!(out.upcoming_count, 1);
+    }
+
+    /// 反向：关掉未来节时，未来节也不渲染（另一半开关）。
+    #[test]
+    fn closed_upcoming_section_is_not_rendered_at_all() {
+        let rows = vec![row("DWG-O", Some("2026-10-09"), false)];
+        let cfg = NormalizedConfig {
+            include_upcoming: false,
+            ..NormalizedConfig::default()
+        };
+        let out = render(&input(&cfg, &rows, &[]));
+        assert!(!out.html.contains("即将到期"), "{}", out.html);
+        assert!(out.html.contains("已逾期"));
+        assert!(out.html.contains("DWG-O"));
+    }
+
+    /// 组标题的 `colspan` 必须是真实列数（原先写字面量 `"*"`，客户端回落到 1）。
+    #[test]
+    fn group_header_colspan_equals_column_count() {
+        let cfg = NormalizedConfig {
+            visible_columns: vec![VisibleColumn::DrawingNo, VisibleColumn::Name],
+            ..NormalizedConfig::default()
+        };
+        let rows = vec![row("DWG-1", Some("2026-10-15"), false)];
+        let out = render(&input(&cfg, &[], &rows));
+        assert!(
+            out.html.contains("colspan=\"2\""),
+            "2 列 ⇒ 组标题 colspan 应为 2，且不得出现非法的 \"*\"：{}",
+            out.html
+        );
+        assert!(!out.html.contains("colspan=\"*\""));
     }
 
     /// 逾期节的交期标红并带「已逾期 N 天」标注。
@@ -552,7 +653,10 @@ mod tests {
         };
         let rows = vec![row("DWG-9", Some("2026-10-15"), false)];
         let out = render(&input(&cfg, &[], &rows));
-        assert_eq!(out.columns, vec!["drawing_no".to_string(), "name".to_string()]);
+        assert_eq!(
+            out.columns,
+            vec!["drawing_no".to_string(), "name".to_string()]
+        );
         assert!(out.html.contains("图号"));
         assert!(!out.html.contains("序列号"), "未选中的列不应出现表头");
         assert!(!out.html.contains("SN-001"), "未选中的列不应出现数据");
@@ -599,10 +703,19 @@ mod tests {
         let cfg = NormalizedConfig::default();
         let rows = vec![row("DWG-1", Some("2026-10-15"), false)];
         let out = render(&input(&cfg, &[], &rows));
-        assert!(!out.html.contains("<style"), "出现了 <style> 块（客户端会剥掉）");
+        assert!(
+            !out.html.contains("<style"),
+            "出现了 <style> 块（客户端会剥掉）"
+        );
         assert!(!out.html.contains("<img"), "出现了外部/内嵌图片");
-        assert!(!out.html.contains("http://") && !out.html.contains("https://"), "出现外链");
+        assert!(
+            !out.html.contains("http://") && !out.html.contains("https://"),
+            "出现外链"
+        );
         // charset 必须是第一个 meta，否则 Outlook / 企业邮按 GBK 解码会乱码
-        assert!(out.html.starts_with("<!DOCTYPE html><html><head><meta charset=\"UTF-8\">"));
+        assert!(
+            out.html
+                .starts_with("<!DOCTYPE html><html><head><meta charset=\"UTF-8\">")
+        );
     }
 }

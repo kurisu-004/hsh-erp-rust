@@ -1082,23 +1082,14 @@ mod tests {
             "BIZ_OUTSOURCE_SHIPMENT_QUANTITY_EXCEEDS",
         ),
         // 217xx 交期汇总邮件（2026-10-13 新增）
-        (
-            code::BIZ_MAIL_NOT_CONFIGURED,
-            "BIZ_MAIL_NOT_CONFIGURED",
-        ),
+        (code::BIZ_MAIL_NOT_CONFIGURED, "BIZ_MAIL_NOT_CONFIGURED"),
         (code::BIZ_MAIL_SEND_FAILED, "BIZ_MAIL_SEND_FAILED"),
         (
             code::BIZ_MAIL_RECIPIENT_INVALID,
             "BIZ_MAIL_RECIPIENT_INVALID",
         ),
-        (
-            code::BIZ_MAIL_CONFIG_INVALID,
-            "BIZ_MAIL_CONFIG_INVALID",
-        ),
-        (
-            code::BIZ_MAIL_CONFIG_NOT_FOUND,
-            "BIZ_MAIL_CONFIG_NOT_FOUND",
-        ),
+        (code::BIZ_MAIL_CONFIG_INVALID, "BIZ_MAIL_CONFIG_INVALID"),
+        (code::BIZ_MAIL_CONFIG_NOT_FOUND, "BIZ_MAIL_CONFIG_NOT_FOUND"),
         // 207xx 工艺链（worker-pool auto-allocate 阶段新增）
         (
             code::BIZ_PROCESS_CHAIN_NOT_FOUND,

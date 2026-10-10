@@ -48,14 +48,14 @@
 | `version` | number | OCC 版本；表空时恒 `0`（= 首次初始化提交值）；每次 `POST /config` 自增 1 | 否 |
 | `enabled` | bool | **定时任务第二道闸**（第一道是 env 的 `MAIL_DIGEST_ENABLED`）。`false` 时不注册 cron job，但 `POST /send` 手动触发**仍可用** | 否 |
 | `frequency` | string | `DAILY` / `WEEKLY` / `MONTHLY` / `MANUAL_ONLY`（无 DB ENUM，Rust 枚举校验；解析失败 → `21704`） | 否 |
-| `send_hour` | number | `0..23`；**非** `MANUAL_ONLY` 时必填且校验。⚠️ `MANUAL_ONLY` 之下**不清空也不校验**（见 §8.3 偏差 4） | 是 |
+| `send_hour` | number | `0..23`；**非** `MANUAL_ONLY` 时必填且校验。⚠️ `MANUAL_ONLY` 之下**不清空也不校验**（见 §8.3「实现与注释不符」第 4 条） | 是 |
 | `send_minute` | number | `0..59`；同上 | 是 |
 | `weekday` | number | `1..7`，**ISO：1=周一 .. 7=周日**；非 `WEEKLY` 恒 `null` | 是 |
 | `day_of_month` | number | `1..28`（**刻意上限 28**，避开 2 月末与 30/31 日短月）；非 `MONTHLY` 恒 `null` | 是 |
-| `recipients` | string[] | 收件人 To；**发送路径要求非空**（空 → `21704`，见 §8.3 偏差 2） | 否（数组本身） |
+| `recipients` | string[] | 收件人 To；**发送路径要求非空**（空 → `21704`，见 §8.3「实现与注释不符」第 2 条）。⚠️ **配置页允许存空数组**（编辑中途的正常形态） | 否（数组本身） |
 | `cc_recipients` | string[] | 抄送 Cc；可空数组 | 否（数组本身） |
-| `include_overdue` | bool | 是否渲染「已逾期」节；与 `include_upcoming` **不能同时 false**（→ `21704`） | 否 |
-| `include_upcoming` | bool | 是否渲染「未来 N 天」节 | 否 |
+| `include_overdue` | bool | 是否**渲染**「已逾期」节；关掉时正文里**完全不出现**该节（2026-10-13 M5）。与 `include_upcoming` **不能同时 false**（→ `21704`） | 否 |
+| `include_upcoming` | bool | 是否**渲染**「未来 N 天」节；关掉时**完全不出现**该节（2026-10-13 M5） | 否 |
 | `upcoming_days` | number | 未来节窗口天数，**clamp 到 `1..60`**（不是拒绝），缺省 `14` | 否 |
 | `visible_columns` | string[] | 正文表格列白名单，**封闭枚举**（§2.3）；未知项 → `21704`（**不静默丢弃**）；空数组在渲染层退回缺省 8 列 | 否 |
 | `subject_template` | string | 主题模板；`null` = 用缺省主题。`{date}` / `{days}` 两个占位符，未知 `{xxx}` 原样保留 | 是 |
@@ -71,9 +71,9 @@
 | `enabled` | bool | 否（缺省 `false`） | 同出参 |
 | `frequency` | string | **必填** | 4 个预设之一 |
 | `send_hour` / `send_minute` | number | 否 | 非 `MANUAL_ONLY` 时**必须给全**，缺一即 `21704` |
-| `weekday` | number | 否 | `WEEKLY` 必填，否则 `21704`；其余频率**被清空**（见 §8.3 偏差 1） |
+| `weekday` | number | 否 | `WEEKLY` 必填，否则 `21704`；其余频率**被清空**（见 §8.3「实现与注释不符」第 1 条） |
 | `day_of_month` | number | 否 | `MONTHLY` 必填，否则 `21704`；其余频率被清空 |
-| `recipients` | string[] | **必填** | 逐项校验：拒 CR/LF（`21703`）、缺 `@`、含空白/分隔符/尖括号、域名形态（§8.3 偏差 3） |
+| `recipients` | string[] | **必填** | 逐项校验：拒 CR/LF（`21703`）、缺 `@`、含空白/分隔符/尖括号、域名形态。⚠️ **允许空数组**（判非空只在发送路径，见 §8.3「实现与注释不符」第 2 条） |
 | `cc_recipients` | string[] | 否（缺省 `[]`） | 同上校验 |
 | `include_overdue` / `include_upcoming` | bool | 否（缺省 `true`） | 同时 false → `21704` |
 | `upcoming_days` | number | 否（缺省 `14`） | clamp `1..60` |
@@ -122,15 +122,36 @@
 | `config_version` | number | **发送当时**的配置版本（快照，不追认后续改动） |
 | `trigger_source` | string | `SCHEDULED`（cron）/ `MANUAL`（本端点恒 `MANUAL`） |
 | `status` | string | `SUCCESS` / `FAILED` |
-| `subject` | string | 本次主题快照 |
+| `subject` | string | 本次主题快照。⚠️ **`SCHEDULED` 的「准备阶段失败」行为空串**（压根没渲染，见下方说明） |
 | `to_recipients` / `cc_recipients` | string[] | **快照**（不 join 配置表） |
-| `overdue_count` / `upcoming_count` | number | 两节行数（工单级） |
-| `html_bytes` | number | 正文字节数（UTF-8）；正文本体不入库，复现走 `/preview` |
+| `overdue_count` / `upcoming_count` | number | 两节行数（工单级）；准备阶段失败恒 `0` |
+| `html_bytes` | number | 正文字节数（UTF-8）；正文本体不入库，复现走 `/preview`。准备阶段失败恒 `0` |
 | `sent_at` | string | `YYYY-MM-DD HH:MM:SS` |
 | `error_message` | string | 失败原因（**截断到 500 字符**）；成功时 `null` |
 
 `GET /logs` 出参 = `{ items: SendResultOut[], total, limit, offset }`。
 `total` 是匹配总数，**不受** `limit` 截断影响。
+
+#### ⚠️ `SCHEDULED` 的**准备阶段失败也落流水**（2026-10-13 review 第 1 轮 M8 修复）
+
+`service::send_scheduled` 分两段：**准备**（取连接 → 读配置并规范化 → 判收件人非空）与
+**投递**（渲染 → 调 lettre → 落流水）。修复前准备段失败直接 `return`，`deliver` 根本没被
+调用 ⇒ `t_mail_digest_log` 里**查不到任何东西**，「定时任务每天都在失败」只剩一行
+`tracing::warn!`——而容器日志恰恰是最容易被轮转掉、最难按时间线回看的那一份。
+
+现在准备段的两种失败也会补一行 `status='FAILED'`（`trigger_source='SCHEDULED'`）：
+
+| 准备阶段失败 | `subject` / `html_bytes` / 两个 count | `to_recipients` 快照 |
+|---|---|---|
+| 配置解析失败（脏 `frequency` / 脏 `visible_columns`） | 空串 / `0` / `0` | **尽力**从原始行捞；读不到记空串 |
+| 收件人为空 | 空串 / `0` / `0` | 从已解析配置取（即空串） |
+
+⚠️ **唯一落不了的失败**是 `pool.acquire()` 本身——没有连接就没有地方写，此时只有
+`tracing::warn!`。**手动路径（`MANUAL`）的行为不变**：`/send` 的失败以 HTTP 错误码返回给
+调用方，且 21701 / 21703 / 21704 三条**校验/前置失败不落流水**（回归用例
+`send_without_smtp_config_returns_21701_and_writes_no_log` 等三条钉住）——有调用方看得见
+就不必在流水里重复。回归用例
+`tests/mail_digest/send.rs::scheduled_prepare_failure_still_writes_failed_log`。
 
 ### 2.6 `GET /meta` 出参
 
@@ -149,7 +170,7 @@
 | `DAILY` | `0 {send_minute} {send_hour} * * *` | `send_hour` + `send_minute` |
 | `WEEKLY` | `0 {send_minute} {send_hour} * * {weekday - 1}` | 上述 + `weekday` |
 | `MONTHLY` | `0 {send_minute} {send_hour} {day_of_month} * *` | 上述 + `day_of_month` |
-| `MANUAL_ONLY` | **不产生 cron**（定时任务不注册 job） | 无（时刻字段写侧清 NULL） |
+| `MANUAL_ONLY` | **不产生 cron**（定时任务不注册 job） | 无（时刻字段**既不清空也不校验**，见 §2.1 与 §8.3「实现与注释不符」第 4 条） |
 
 - **cron 是 6 段不是 5 段**：tokio-cron-scheduler 0.15 内部用 `croner`，解析器固定
   `Seconds::Required` + `dom_and_dow(true)`。写成常见的五段 `分 时 日 月 周` 会在
@@ -206,10 +227,23 @@
   远程内容），表格布局（不吃 flex/grid），关键底色 `bgcolor` 与 `background-color` 两处都写。
 - **XSS**：图号 / 名称 / 客户名 / 订单号 / 序列号**每一个插值点**都过 `html_escape`
   （`& < > " '` 五个字符，`&` 必须**第一个**替换，否则 `&lt;` 会被二次转义成 `&amp;lt;`）。
-- **空态**：两节都无行 ⇒ 「无符合条件的工单」；单节无行 ⇒ 「本节无符合条件的工单」，
-  **不是**空表格（无数据时连表头都不渲染）。
+- ⚠️ **节开关真的作用于正文（2026-10-13 review 第 1 轮 M5 修复）**：`include_overdue=false`
+  时正文里**完全不出现**「已逾期」那一节（标题行 + 空态文案一并消失），未来节同理。
+  修复前 `render()` 无条件渲染两节、关掉的节因为没查库而拿到空切片，于是信里照样出现
+  「已逾期（系统交期早于今日）（0 条）/ 本节无符合条件的工单」——管理员关掉逾期节却在信里
+  看到一条空节，第一反应是「统计口径是不是坏了」，这是会直接变成工单的问题。
+  回归用例：`tests/mail_digest/preview.rs::preview_section_toggles_hide_each_section`
+  + `template.rs` 的 lib 单测 `closed_section_is_not_rendered_at_all` /
+  `closed_upcoming_section_is_not_rendered_at_all`。
+- **空态**：至少渲染了一节时，空态由**那一节自己**的「本节无符合条件的工单」承担；**不**
+  再补一句全局的「无符合条件的工单」（修复前两节都开着且都无行时，正文里会连续出现
+  5 段同义文案，2026-10-13 m2）。单节无行 ⇒ 「本节无符合条件的工单」，**不是**空表格
+  （无数据时连表头都不渲染）。两节都关在配置层已被 `21704` 拒掉，渲染层对纯函数调用仍
+  有一句「本邮件未启用任何内容节」的兜底。
 - **按 `system_delivery_date` 分组**：组标题带「已逾期 N 天」/「今天到期」/「明天到期」
   /「剩余 N 天」。SQL 已按 `(交期 ASC, id ASC)` 排好，渲染层**不**二次排序（避免口径分叉）。
+  组标题的 `colspan` 取**真实列数**（2026-10-13 m1 修复：原为字面量 `"*"`，而 HTML 的
+  `colspan="*"` 非法、客户端一律回落到 1，标题行于是只盖住第一列）。
 
 ## 5. 状态域约定（无编译期保障）
 
@@ -237,7 +271,7 @@
 | SMTP 凭据入库 | 跟着备份走 + 任何只读库权限的人都能捞走 |
 | 流水表软删 / `version` 列 | 只增的审计流水；软删会让「定时任务是不是在偷偷重发」永远查不清 |
 | 分角色（不止 Manager） | 端点会对**真实收件人发信**，属配置型 + 有外发副作用的操作，只归管理员 |
-| `send` 的幂等键 / 频控 | 见 §8.3 偏差 7 |
+| `send` 的幂等键 / 频控 | 见 §8.3「本域设计上的已知取舍」第 3 条 |
 
 ## 7. 与 WS 的关系
 
@@ -285,6 +319,19 @@
 
 ### 8.3 已知偏差登记
 
+⚠️ **本节分三组，编号在每组内各自从 1 重新开始**（2026-10-13 review 第 1 轮 M4：
+本节原先是一串 1..15 的连续编号，正文里却按「偏差 1/2/3/4」这种裸数字引用它们，
+而那些偏差实际是第 10/11/12/13 条 —— 按数字跳过去落到的是 tokio-cron-scheduler 的 API
+结论与 217xx 段位决策上，完全无关）。**正文引用一律写成「§8.3『组名』第 N 条」**，
+组名三选一：
+
+| 组名 | 覆盖 |
+|---|---|
+| 「依赖库版本相关的实测结论」 | 1–4 |
+| 「本域设计上的已知取舍」 | 1–7 |
+| 「实现与注释不符」 | 1–4（改实现前先改文档或先改测试） |
+| 「覆盖空洞」 | 1–2 |
+
 **依赖库版本相关的实测结论（2026-10-13，实读 crate 源码核对，不是凭记忆）：**
 
 1. **`tokio-cron-scheduler` 0.15 的 API 与旧教程不同**：`JobScheduler::new()` 在 0.15 是
@@ -307,52 +354,73 @@
 
 **本域设计上的已知取舍：**
 
-5. **渲染无行数上限**：SQL 不分页，一封邮件可能包含窗口内全部逾期工单。已把
+1. **渲染无行数上限**：SQL 不分页，一封邮件可能包含窗口内全部逾期工单。已把
    `html_bytes` 记进流水以便事后评估；实测字节数过大时需重估（加 `LIMIT` 或分节
    多封信），**不要**在渲染层静默截断 —— 那会让收件人以为「就这些」。
-6. **多副本部署不防重**：与既有 `task::auto_complete` 同一现状，部署 N 个副本就可能在
+2. **多副本部署不防重**：与既有 `task::auto_complete` 同一现状，部署 N 个副本就可能在
    同一时刻发 N 封信。要防重需要分布式锁 / 领导者选举，登记为独立重构。⚠️ **不要**用
    「加个 DB 唯一索引当半个防重」——那会让第二个副本发信失败被记成流水里的 `FAILED`，
    污染审计。
-7. **`/send` 无频控**：它会对**真实收件人**发信。当前唯一的护栏是
+3. **`/send` 无频控**：它会对**真实收件人**发信。当前唯一的护栏是
    `MANAGER` 角色 + `enabled` 闸 + `MAIL_DIGEST_ENABLED` 总闸。
-8. **`mailer::send` 返回裸 `String` 而不是 `AppError`**：同一段失败文本有两个去处
+4. **`mailer::send` 返回裸 `String` 而不是 `AppError`**：同一段失败文本有两个去处
    （`t_mail_digest_log.error_message` 与 HTTP `message`）。若在这里就包成
    `AppError`，落库拿到的是 `Display`（带 `[21702] ` 前缀）⇒ 流水里会存下
    「[21702] [21702] …」这种重复前缀。返回裸文本后，落库存裸文本、HTTP 层再加码。
-9. **热重载失败不回滚配置**：`POST /config` 成功后调 `task::mail_digest::reschedule`，
+5. **热重载失败不回滚配置**：`POST /config` 成功后调 `task::mail_digest::reschedule`，
    它**永不 panic、永不把错误抛给调用方**（失败只 `warn!`）。配置已经落库是对的，
    只是这一次的调度没换上；下一次改配置 / 重启会再试。
+6. ⚠️ **`21704` 是「配置不可用」的汇总裁决码，不是一因一码**（2026-10-13 review 第 1
+    轮 m12）：同一个码目前承载**四种**互不相干的成因 ——
+    ① `POST /config` 的配置组合非法（枚举 / 列白名单 / 时段 / 周几 / 几号）；② 两节都关；
+    ③ `upcoming_days` 越界（仅 `/preview`、`/send` 路径不 clamp 而报错）；④ `deliver` /
+    定时准备阶段发现收件人为空。⇒ **前端只能读 `message` 文本区分**，按码分支的写法在
+    本域不成立。新增第五种成因时请一并更新本条，不要以为撞了同一个码就是同一个问题。
+7. ⚠️ **`GET /logs` 每页都跑一次 `SELECT COUNT(*)`**（2026-10-13 review 第 1 轮 m8）：
+    `repo::list_logs` 为了让 `total` 不受 `limit` 截断影响，除了取当页还要全表计数。
+    该表**只增不减**（审计流水，无软删），也没有任何分页索引 ⇒ 行数涨上去后 `COUNT(*)`
+    会成为这条端点的第一个瓶颈（随页码线性变慢）。**优化方向是它的第一个候选**，不是
+    「先加索引」—— 索引救不了全表计数。若将来引入保留期/归档，优先做那件事。
 
 **实现与注释/直觉不符的四处（测试已把实际行为钉死，改实现前先改文档或先改测试）：**
+**（2026-10-13 review 第 1 轮扩到五条：新增第 5 条是 M5「节开关不作用于正文」，
+该项已在该轮**修掉**，保留在登记里是为了说明「这条曾经是偏差」以及防回归。）**
 
-10. ⚠️ **`POST /config` 接受空 `recipients`**：`service::validate_save_request` 的模块 doc
+1. ⚠️ **`POST /config` 接受空 `recipients`**：`service::validate_save_request` 的模块 doc
     与 `NormalizedConfig::default` 的注释都写着「空数组会被 `POST /config` 的校验（21704）
     当场拦下」，**与实现不符** —— 实际只有**发送路径**（`deliver`）才判非空。配置页先存
     一份空配置（编辑中途的正常形态）是允许的。回归用例
     `config_accepts_empty_recipients_but_send_rejects_it`。
-11. ⚠️ **非专属频率多填 `weekday` / `day_of_month` 是「清空」而不是 `21704`**：
+2. ⚠️ **非专属频率多填 `weekday` / `day_of_month` 是「清空」而不是 `21704`**：
     `DAILY` / `MANUAL_ONLY` / `MONTHLY` 之下 `weekday` 会被主动写 NULL（避免脏值被读侧
     照单全收地拼 cron），代价是「多填了字段」这件事**不**在写侧暴露。回归用例
     `daily_with_weekday_field_is_cleared_not_rejected`。
-12. ⚠️ **「两节都关」一律 `21704`**，不会渲出「无符合条件的工单」：`/config`、`/preview`、
+3. ⚠️ **「两节都关」一律 `21704`**，不会渲出「无符合条件的工单」：`/config`、`/preview`、
     `/send` 三处都拒。「无符合条件的工单」那句文案只在「节开着但窗口内无行」时出现。回归用例
     `preview_with_both_sections_off_returns_21704`。
-13. ⚠️ **`MANUAL_ONLY` 之下 `send_hour` / `send_minute` 既不清空也不校验**：migration 的列
+4. ⚠️ **`MANUAL_ONLY` 之下 `send_hour` / `send_minute` 既不清空也不校验**：migration 的列
     注释写的是「`MANUAL_ONLY` → 四个字段全部不参与，写侧一律清 NULL」，但写侧只清
     `weekday` / `day_of_month`，`send_hour` / `send_minute` 是**原样透传**的，
     `validate_time` 对 `MANUAL_ONLY` 直接早退 ⇒ 连 `0..23` 范围都不查（能存进 99）。
     危害有限（`MANUAL_ONLY` 永不产生 cron，这两个字段不会被读），但**文档与列注释
     均需按实现订正**。回归用例 `manual_only_keeps_send_time_unchecked`。
+5. ✅ **【已于 2026-10-13 review 第 1 轮 M5 修复】节开关曾不作用于正文**：
+    `include_overdue=false` 时 `render()` 仍无条件渲染「已逾期」节，只是因为 service 层
+    关掉的节不查库、拿到空切片，于是正文里出现「已逾期（系统交期早于今日）（0 条）/
+    本节无符合条件的工单」。§2.1 当时把它描述成「是否**渲染**节」、需求原文是
+    「内容可选 ① 节开关」，而这一半没兑现。**现状**：渲染层按 `cfg.include_*` 决定渲不
+    渲染，关掉的节整段不出现（§4.4）。登记在此是为了防回归
+    ——`preview.rs::preview_section_toggles_hide_each_section` 与 `template.rs` 的两条
+    `closed_*_section_is_not_rendered_at_all` 单测各钉一半。
 
 **覆盖空洞：**
 
-14. **`/send` 的成功路径（`status='SUCCESS'` 的流水行 / 真实投递）无集成测试**：
+1. **`/send` 的成功路径（`status='SUCCESS'` 的流水行 / 真实投递）无集成测试**：
     测试环境没有可达的 SMTP，且刻意**不**引入 lettre 的 mock transport（那会给生产依赖树
     加一层只为测试存在的构造）。当前替代覆盖：渲染 + 统计 SQL 由 `/preview` 全部用例覆盖
     （同一段 `template::render` + 同一对统计 SQL）；落流水由「必失败」路径覆盖
     （落流水在调 lettre **之后**、**无论成败**，两分支共用同一段代码）；TLS 三档映射表与
     收件人解析由 `mailer.rs` 的 lib 单测覆盖。补齐需要一个本地假 SMTP 或进程内 mock
     transport，登记为后续增强。
-15. **`21705 BIZ_MAIL_CONFIG_NOT_FOUND` 是保留位，当前无生产方**：`GET /config` 在表空时
+2. **`21705 BIZ_MAIL_CONFIG_NOT_FOUND` 是保留位，当前无生产方**：`GET /config` 在表空时
     返回默认值 + `version=0`，不返本码；`status_from_code` 已把它映射到 404 以备将来使用。

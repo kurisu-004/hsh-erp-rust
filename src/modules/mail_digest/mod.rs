@@ -18,8 +18,13 @@
 //! 权威路由清单是 [`handler::ROUTES`]（`handler::tests` 断言它与 [`router`] 源码逐条一致）。
 //!
 //! ## 硬约束记录
-//! - **只用 GET / POST**：本仓 HTTP 方法**零** PUT/PATCH/DELETE（全仓现状
-//!   `206 × .get(` + `18 × .post(`），配置写入走 `POST /config` 而非 `PUT /config/{id}`。
+//! - **只用 GET / POST**：本仓 HTTP 路由**零** PUT/PATCH/DELETE（全仓 `.put(` /
+//!   `.patch(` / `.delete(` 的命中只有 opendal / redis 客户端调用，没有一处是路由方法
+//!   ——2026-10-13 review 第 1 轮 m10 实测核实）。配置写入走 `POST /config` 而非
+//!   `PUT /config/{id}`。
+//!   （本条原先还写着 `206 × .get(` + `18 × .post(` ——reviewer 实测 `.get(` 是 300 处，
+//!   且这种「全仓路由方法计数」无法手工稳定复现、随别人的改动立刻过期，故删除；
+//!   **零 PUT/PATCH/DELETE** 这半句是结论性事实，留着。）
 //! - **SMTP 凭据只走 env，不进 DB**：`t_mail_digest_config` 只存收件人 / 内容口径 /
 //!   调度；密码进 DB 就跟着备份走、且任何有只读库权限的人都能捞走。
 //!   env 侧见 [`crate::infra::config::MailConfig`]。

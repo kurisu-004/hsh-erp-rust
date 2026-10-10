@@ -512,9 +512,12 @@ impl MailConfig {
     /// - `username` / `password` 任一为空 ⇒ 没凭据，发信必然失败，不如提前拒；
     /// - `from_address` 为空 ⇒ 构造不出合法的 `From` 头（部分服务器还会拒收无 From 的信）。
     ///
-    /// ⚠️ **不 trim 后再判**（与 `WeComConfig` 同纪律）：`" "` 这种纯空格占位
-    /// 判为「已配置」后会真打 SMTP 并拿一个难以定位的握手失败。代价是运维必须
-    /// 真的把值删干净。
+    /// ⚠️ **三个凭据都 `trim()` 后再判空**（2026-10-13 review 第 1 轮 A3：本 doc 原先
+    /// 写的是「**不** trim 后再判（与 `WeComConfig` 同纪律）：`" "` 这种纯空格占位判为
+    /// 「已配置」…」，与紧跟的代码 `!self.username.trim().is_empty()` **正好相反**）。
+    /// 实现与 lib 单测 `is_enabled_requires_all_three_credentials_plus_switch` 一致：
+    /// **纯空格占位判为「未配置」**，不会真打一次 SMTP 拿一个难以定位的握手失败。
+    /// （`WeComConfig::is_enabled` 走的是另一套字段，判法不同，别把两者的结论互推。）
     pub fn is_enabled(&self) -> bool {
         self.digest_enabled
             && !self.username.trim().is_empty()

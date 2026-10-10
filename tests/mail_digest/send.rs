@@ -24,13 +24,21 @@ use serde_json::{Value, json};
 
 use hsh_erp_test_support::{json_request, send};
 
-use crate::{Ctx, assert_biz_code, bootstrap, bootstrap_with_mail, config_body, insert_part, unreachable_smtp};
+use crate::{
+    Ctx, assert_biz_code, bootstrap, bootstrap_with_mail, config_body, insert_part,
+    unreachable_smtp,
+};
 
 /// `POST /send` → `(status, 信封)`。
 async fn send_mail(ctx: &Ctx, body: Value) -> (StatusCode, Value) {
     send(
         ctx.app.clone(),
-        json_request("POST", "/mail-digest/send", Some(body), Some(&ctx.manager_token)),
+        json_request(
+            "POST",
+            "/mail-digest/send",
+            Some(body),
+            Some(&ctx.manager_token),
+        ),
     )
     .await
 }
@@ -39,7 +47,12 @@ async fn send_mail(ctx: &Ctx, body: Value) -> (StatusCode, Value) {
 async fn get_logs(ctx: &Ctx, query: &str) -> (StatusCode, Value) {
     send(
         ctx.app.clone(),
-        json_request("GET", &format!("/mail-digest/logs{query}"), None, Some(&ctx.manager_token)),
+        json_request(
+            "GET",
+            &format!("/mail-digest/logs{query}"),
+            None,
+            Some(&ctx.manager_token),
+        ),
     )
     .await
 }
@@ -137,7 +150,10 @@ async fn send_to_unreachable_smtp_returns_21702_and_records_failed_log() {
         !err_msg.starts_with("[21702]"),
         "流水存裸文本，不带 AppError 的 `[21702] ` 前缀（否则会与 HTTP 层重复）：{env}"
     );
-    assert!(item["html_bytes"].as_i64().unwrap() > 0, "应记录正文字节数：{env}");
+    assert!(
+        item["html_bytes"].as_i64().unwrap() > 0,
+        "应记录正文字节数：{env}"
+    );
 }
 
 /// 连不通时**不得**出现 `SUCCESS` 流水行（否则「失败被记成成功」不可排查）。
@@ -238,6 +254,120 @@ async fn save_config_survives_scheduler_reschedule() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "热重载失败不得让保存接口 500：{env}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "热重载失败不得让保存接口 500：{env}"
+    );
     assert_eq!(env["data"]["frequency"], "DAILY", "{env}");
+}
+// ===========================================================================
+//  6. 定时路径的准备阶段失败**也**落流水（2026-10-13 review 第 1 轮 M8）
+// ===========================================================================
+
+/// ★ `SCHEDULED` 触发时**准备阶段**失败（配置解析失败 / 收件人为空），必须留下
+/// 一行 `status='FAILED'` 的流水。
+///
+/// 修复前这条路径直接 `return`，`deliver` 根本没被调用 ⇒ `t_mail_digest_log` 里查不到
+/// 任何东西，「定时任务每天都在失败」只剩一行 `tracing::warn!` —— 而容器日志恰恰是
+/// 最容易被轮转掉、最难按时间线回看的那一份。
+///
+/// 本用例直调 `service::send_scheduled`（cron job 闭包就是调它，没有 HTTP 端点），
+/// 并**绕过 API 直连 UPDATE** 把 `frequency` 改成脏值来制造「准备阶段失败」——
+/// 走 API 是改不出脏值的（写侧会拒），这正是「真实脏数据」的样子。
+#[tokio::test]
+async fn scheduled_prepare_failure_still_writes_failed_log() {
+    let ctx = bootstrap_with_mail(unreachable_smtp()).await;
+
+    // 先存一份合法配置，再绕过写侧把 frequency 改成非法值（写侧永远不会产生这种行）
+    let (status, env) = send(
+        ctx.app.clone(),
+        json_request(
+            "POST",
+            "/mail-digest/config",
+            Some(config_body(0)),
+            Some(&ctx.manager_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "前置：合法配置应保存成功：{env}");
+    sqlx::query("UPDATE t_mail_digest_config SET frequency = 'EVERY_2_HOURS'")
+        .execute(&ctx.pool)
+        .await
+        .expect("把 frequency 改成脏值");
+
+    assert_eq!(
+        crate::count_logs(&ctx.pool).await,
+        0,
+        "前置：此刻还没有任何流水"
+    );
+
+    // cron job 闭包调的就是这个函数
+    hsh_erp_rust::modules::mail_digest::service::send_scheduled(&ctx.state).await;
+
+    // ★ 核心断言：准备阶段失败**也**落了一行 FAILED 流水
+    assert_eq!(
+        crate::count_logs(&ctx.pool).await,
+        1,
+        "定时准备阶段失败必须落流水，否则「每天都在失败」不可观测"
+    );
+    let (status, env) = get_logs(&ctx, "").await;
+    assert_eq!(status, StatusCode::OK, "{env}");
+    let item = &env["data"]["items"][0];
+    assert_eq!(item["status"], "FAILED", "{item}");
+    assert_eq!(item["trigger_source"], "SCHEDULED", "{item}");
+    assert_eq!(item["html_bytes"], 0, "没渲染 ⇒ 无正文字节：{item}");
+    assert_eq!(item["overdue_count"], 0, "{item}");
+    assert_eq!(item["upcoming_count"], 0, "{item}");
+    assert_eq!(item["subject"], "", "没渲染 ⇒ 无主题快照：{item}");
+    let msg = item["error_message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("EVERY_2_HOURS"),
+        "error_message 应带上原始失败原因：{msg}"
+    );
+}
+
+/// 准备阶段的第二种失败：**收件人为空**。同样必须落流水。
+///
+/// 与上一条的区别：`current_normalized` 成功（配置合法）、失败点在 `deliver` 之前
+/// 的收件人非空检查 —— 这正是「配置页允许先存空收件人」的代价，定时路径下没有调用方
+/// 看得见错误码，流水是唯一的痕迹。
+#[tokio::test]
+async fn scheduled_empty_recipients_still_writes_failed_log() {
+    let ctx = bootstrap_with_mail(unreachable_smtp()).await;
+
+    let (status, env) = send(
+        ctx.app.clone(),
+        json_request(
+            "POST",
+            "/mail-digest/config",
+            Some(config_body(0)),
+            Some(&ctx.manager_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{env}");
+
+    // 配置页**允许**存空收件人（编辑中途的正常形态，§8.3「实现与注释不符」第 1 条）
+    let (_, env) = crate::config::get_config(&ctx).await;
+    let version = env["data"]["version"].as_i64().unwrap() as i32;
+    let mut body = config_body(version);
+    body["recipients"] = json!([]);
+    let (status, env) = crate::config::save_config(&ctx, body).await;
+    assert_eq!(status, StatusCode::OK, "配置页允许空收件人：{env}");
+
+    hsh_erp_rust::modules::mail_digest::service::send_scheduled(&ctx.state).await;
+
+    assert_eq!(
+        crate::count_logs(&ctx.pool).await,
+        1,
+        "定时发现收件人为空也必须落流水"
+    );
+    let (status, env) = get_logs(&ctx, "").await;
+    assert_eq!(status, StatusCode::OK, "{env}");
+    let item = &env["data"]["items"][0];
+    assert_eq!(item["status"], "FAILED", "{item}");
+    assert_eq!(item["trigger_source"], "SCHEDULED", "{item}");
+    let msg = item["error_message"].as_str().unwrap_or_default();
+    assert!(msg.contains("收件人为空"), "{msg}");
 }
