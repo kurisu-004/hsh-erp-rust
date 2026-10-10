@@ -61,10 +61,17 @@ use crate::state::AppState;
 // `/api/v2/part-files/parts/{part_id}/<file>...` 对外暴露」的说明**已整体作废** ——
 // 那条第二入口随 part_file 域收编进 files 域**整段下线**（连同
 // `part_nested_router()` 一并删除；旧 URL **无 alias**，`/part-files/*` 一律 404）。
-// 本域现在与 part_file 相关的入口只剩 STS 直传链路的
-// `POST /api/v2/parts/{part_id}/files/confirm`（见下方 `router()` 路由表最后一条）；
-// ⚠️ 别把本域自有的 `upload-drawing` / `upload-3d-model` / `print-drawing*` /
-// `batch-with-pdfs` 也算进来 —— 那些是零件域自己的端点，与 part_file 无关。
+// ⚠️ 判定「某条 part 端点算不算 part_file 域的东西」时按**写不写 `t_part_file`** 判，
+// 不是按「挂在哪个域」判 —— 本域既有与 part_file 毫无关系的端点，也有挂着 part 前缀
+// 却写 `t_part_file` 的端点：
+// - 与 part_file **无关**：`print-drawing` / `print-drawing-batch`（纯 BFF 转发到 python
+//   出 PDF）、`batch-with-pdfs`（PDF 只喂 `lopdf` 数页数）。
+// - 与 part_file **相关**：`POST /{part_id}/files/confirm`（STS 直传链路的回执，见下方
+//   路由表最后一条）；⚠️ 还有 `upload-drawing` / `upload-3d-model` —— **虽是 part 域端点
+//   却写 `t_part_file`**（handler → `PartService::upload_drawing` / `upload_3d_model` →
+//   两者都转调 `upload_part_file`，kind 分别 `DRAWING` / `3D_MODEL`，出参就是
+//   `TPartFile` → `PartFileRepo::create_part_file`）。PR1b 会把它们合并进
+//   `POST /files/objects`，别按「part 域自有端点」把它们排除在外。
 // 下线的 8 条端点逐条清单见 `src/modules/files/part_file/handler.rs` 的模块 doc
 // 「2026-10-13 同批下线的 8 条端点（移除记录，防后人重建）」一节。
 
@@ -123,8 +130,9 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{part_id}/assembly", get(handler::get_assembly_by_part))
         // ---- 2026-10-13：part 维度文件路由整段下线（cad-files / cnc-programs /
         //      setup-sheets / cnc-pair / files 共 8 条，无 alias，旧路径 404）。
-        //      与 part_file 相关的入口仅剩下方 `POST /{part_id}/files/confirm`（STS 直传
-        //      链路的回执），移除记录见 `src/modules/files/part_file/handler.rs`。
+        //      与 part_file 相关的入口见上方模块级注记（`files/confirm` 之外，
+        //      `upload-drawing` / `upload-3d-model` 也写 `t_part_file`），
+        //      移除记录见 `src/modules/files/part_file/handler.rs`。
         // ---- 2026-09-16 M2-B 新增：直传 COS 链路 confirm 端点（POST /parts/{id}/files/confirm）----
         .route("/{part_id}/files/confirm", post(handler::confirm_part_file))
 }
