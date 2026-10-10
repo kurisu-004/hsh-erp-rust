@@ -946,9 +946,13 @@ async fn read_fallback_to_legacy_key_test() {
 // **内容** `GET /api/v2/part-files/{id}/content`。这两条原本只放 4 角色
 // （Manager / Clerk / Inspector / CncProgrammer）⇒ 工控机点预览必然 40300。
 //
-// 角色矩阵的决策与理由见 `src/modules/part_file/mod.rs` 模块 doc。关键一条：
+// 角色矩阵的决策与理由见 `src/modules/files/part_file/mod.rs` 模块 doc。关键一条：
 // **`GET /part-files/{id}/url` 刻意不给 SHELF_ACCOUNT** —— 它回 COS 预签直链
 // （1 小时有效、拿到即可脱离本后端直接 GET），而 `content` 是后端代理、每次过 RBAC。
+//
+// ⚠️ 上面两条 URL 写的是 2026-10-10 加角色时的历史路径；2026-10-13 起已硬切为
+// `GET /api/v2/files/objects/{id}/url` 与 `GET /api/v2/files/objects/{id}/content`
+// （**无 alias**），角色矩阵逐字未变。
 //
 // ⚠️ 已知安全面（产品已拍板的取舍）：owner 是多态的（PART / ASSEMBLY）+ 客户端可
 // 任意指定 `owner_id`，放开后 SHELF_ACCOUNT 能拉任意 `owner_id` 的文件，没有货架 /
@@ -1189,8 +1193,12 @@ async fn rbac_shelf_account_cannot_upload_or_delete() {
 
 /// 为三条 404 守卫共用的 bootstrap：造真实 part + 真实 t_part_file 行 + MANAGER token。
 ///
-/// 返回 `(pool, app, token, file_id)`；`file_id` 是真实存在的那条文件的雪花 id。
-async fn bootstrap_hardcut_guard() -> (PgPool, axum::Router, String, i64) {
+/// 返回 `(pool, app, token, file_id, part_id)`：
+/// - `file_id` 是真实存在的那条文件的雪花 id（404 守卫用它拼旧 URL）；
+/// - `part_id` 是那条文件的 **owner id**（`owner_kind='PART'`）—— 列表端点的
+///   `?owner_kind=PART&owner_id=…` 必须传它，**不是** `file_id`（两者都是雪花，
+///   传错不会报错、只会让「正向对照」这条断言悄悄失去意义）。
+async fn bootstrap_hardcut_guard() -> (PgPool, axum::Router, String, i64, i64) {
     let pool = test_pool().await;
     let fx = load_part_fixture(&pool).await;
     let app = test_app(test_state(pool.clone()).await);
@@ -1217,13 +1225,13 @@ async fn bootstrap_hardcut_guard() -> (PgPool, axum::Router, String, i64) {
         .expect("MANAGER 上传应成功（保证 404 不是「资源不存在」造成的）");
     tx.commit().await.unwrap();
 
-    (pool, app, token, out.id)
+    (pool, app, token, out.id, part_id)
 }
 
 /// `GET /api/v2/part-files`（旧前缀整段）→ 404。
 #[tokio::test]
 async fn old_part_files_prefix_returns_404() {
-    let (_pool, app, token, file_id) = bootstrap_hardcut_guard().await;
+    let (_pool, app, token, file_id, part_id) = bootstrap_hardcut_guard().await;
 
     // 先钉正向对照：新路径对同一个 file_id 必须 200 —— 证明守卫打的确实是旧前缀，
     // 而不是「这个域整体坏了」。
@@ -1254,11 +1262,15 @@ async fn old_part_files_prefix_returns_404() {
     // 「`GET /api/v2/part-files/` → `GET /api/v2/files/objects/`」中的尾斜杠来自
     // 路由注册串 `.route("/", …)`，不是 wire 上的 URL；前端照旧用**无尾斜杠**即可。
     // 这里把两种写法都钉死，避免后人「顺手补个尾斜杠 alias」。
+    //
+    // ⚠️ `owner_id` 传的是 **part_id**（`owner_kind=PART` 下的 owner），不是上面那条
+    // 文件自己的 `file_id` —— 两者都是雪花 id，传错**不会报错**（列表只按 owner 过滤，
+    // 命不中就是空数组），只会让「正向对照」悄悄变成「拿空结果证明路由活着」。
     let (list_status, list_raw) = send_raw(
         app.clone(),
         json_request(
             "GET",
-            &format!("/files/objects?owner_kind=PART&owner_id={file_id}"),
+            &format!("/files/objects?owner_kind=PART&owner_id={part_id}"),
             None,
             Some(&token),
         ),
@@ -1274,7 +1286,7 @@ async fn old_part_files_prefix_returns_404() {
         app.clone(),
         json_request(
             "GET",
-            &format!("/files/objects/?owner_kind=PART&owner_id={file_id}"),
+            &format!("/files/objects/?owner_kind=PART&owner_id={part_id}"),
             None,
             Some(&token),
         ),
@@ -1316,7 +1328,7 @@ async fn old_part_files_prefix_returns_404() {
 /// 先于其它用例报警。
 #[tokio::test]
 async fn old_part_files_numeric_path_returns_404() {
-    let (_pool, app, token, _file_id) = bootstrap_hardcut_guard().await;
+    let (_pool, app, token, _file_id, _part_id) = bootstrap_hardcut_guard().await;
 
     for path in [
         "/part-files/999999999999/content",
@@ -1342,7 +1354,7 @@ async fn old_part_files_numeric_path_returns_404() {
 /// `GET /api/v2/cnc-programs`（CNC 域旧前缀整段）→ 404。
 #[tokio::test]
 async fn old_cnc_programs_prefix_returns_404() {
-    let (_pool, app, token, file_id) = bootstrap_hardcut_guard().await;
+    let (_pool, app, token, file_id, _part_id) = bootstrap_hardcut_guard().await;
 
     for method_path in [
         ("GET", "/cnc-programs".to_string()),

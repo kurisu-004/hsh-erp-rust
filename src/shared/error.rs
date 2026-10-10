@@ -168,14 +168,20 @@ pub mod code {
     pub const BIZ_ASSEMBLY_ALREADY_COMPLETED: i32 = 20309;
     pub const BIZ_ASSEMBLY_ALREADY_CANCELLED: i32 = 20310;
 
-    // 204xx 图纸文件（对象存储 + COS；2026-10-13 注：`t_drawing_file` 表随
-    // `migrations/20261013000000_001_drop_legacy_file_tables.sql` 一并 DROP，
-    // 这四个 204xx 码位保留 —— 它们是 COS 上传/读取错误的历史分段位，
-    // Python 端旧前端仍可能读到，删掉会让 code 值跳变）
+    // 204xx 图纸文件（对象存储 + COS）
+    //
+    // ⚠️ 2026-10-13 注：`t_drawing_file` 表随
+    // `migrations/20261013000000_001_drop_legacy_file_tables.sql` 一并 DROP，但下面
+    // **这 4 个 DRAWING_FILE 码位（20401–20404）保留不删**（理由紧跟 20404 之后）；
+    // ⚠️ 同段的 20406 / 20407（STS / 打印转发失败）是**活跃码**，不在此列。
     pub const BIZ_DRAWING_FILE_NOT_FOUND: i32 = 20401;
     pub const BIZ_DRAWING_FILE_BAD_TYPE: i32 = 20402; // 扩展名不在 COS_ALLOWED_TYPES 白名单
     pub const BIZ_DRAWING_FILE_TOO_LARGE: i32 = 20403; // 文件大小 ≤0 或 > cos_max_file_size_bytes
     pub const BIZ_DRAWING_UPLOAD_FAILED: i32 = 20404; // COS SDK 抛错
+    // ⚠️ 保留码位的理由（2026-10-13）：上面 4 个 DRAWING_FILE 码位随 `t_drawing_file`
+    // 表一起失去调用方，但仍保留 —— 它们是 COS 上传/读取错误的历史分段位，Python 端旧
+    // 前端仍可能读到；code 值是对外契约，删掉会让 code 值跳变。
+    // 下方 20406 / 20407 是活跃码，不属于这一列。
     // 2026-09-28 新增：rust → python 薄壳鉴权转发 STS 失败。
     // 触发场景：`POST /api/v2/files/sts-tmp-keys` 鉴权通过后调
     // `HttpPyBackend::forward_sts_tmp_keys` 失败（网络层超时 / 连接拒 / 读取 body 失败）。

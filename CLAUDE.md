@@ -481,7 +481,7 @@ t_assembly.status               ← 派生缓存
    }
    ```
 
-   - **仓内多数域用转发式**（`outsource` / `cnc_program` / `part_file` / `assembly` / `statistics` / `delivery_note` / `iam`），少数用 `mod.rs` 内联（`part` / `prod::queue` / `admin`）。转发式是多数形态，新域与重构域一律按转发式。（2026-10-10 订正：原清单里的 `shelf` 已不是一级域 —— 货架子模块于同日迁入 iam，仍是转发式。）
+   - **仓内多数域用转发式**（`outsource` / `files` / `assembly` / `statistics` / `delivery_note` / `iam`），少数用 `mod.rs` 内联（`part` / `prod::queue` / `admin`）。转发式是多数形态，新域与重构域一律按转发式。（2026-10-10 订正：原清单里的 `shelf` 已不是一级域 —— 货架子模块于同日迁入 iam，仍是转发式。**2026-10-13 订正**：原清单里的 `part_file` / `cnc_program` 也已不是一级域 —— 两者于同日收编成 `files` 容器域及其嵌套子模块，URL 硬切到 `/files/objects/*` 与 `/files/cnc/*`，`files` 本身是转发式。）
    - **一个前缀一个 router 工厂**。多个独立顶层前缀时用多个 `xxx_router()`（`outsource` 有 4 个），而不是一个工厂返回合并 router —— 合并后 matchit 的注册顺序约束会跨前缀纠缠，排查困难。
    - **`handler.rs` > 600 行或工厂数 > 4 时拆 `handler/<子域>.rs`**，`handler.rs` 退化为聚合器。`prod/queue/handler/`、`prod/batch/handler/` 是范本。
    - **`mod.rs` 的模块 doc 逐条列出端点表与硬切记录**；域改名/URL 硬切必须写「旧路径 404，无 alias」。
@@ -517,7 +517,7 @@ t_assembly.status               ← 派生缓存
 
 ## 集成测试目录结构（2026-09-23 PR13 重构后）
 
-integration test binary 已重组为 **20 binary**（8 多文件 domain 子目录化 + 12 single-file 保留；**2026-10-10** 原 `shelf` binary 并入 `iam` binary）—— 数字以 `cargo metadata --no-deps` 列出的 test target 为准逐个复核过（2026-10-10）：
+integration test binary 已重组为 **20 binary**（10 多文件 domain 子目录化 + 10 single-file 保留；**2026-10-10** 原 `shelf` binary 并入 `iam` binary；**2026-10-13** 原 `cnc_program_api` 与 `files_sts_tmp_keys` 两个单文件 binary 并成新 `files` 目录域 binary）—— 数字以 `cargo metadata --no-deps` 列出的 test target 为准逐个复核过（**2026-10-13**）：
 
 | 新结构 | 拆前 binary 数 | 拆后 binary 名（nextest filter） |
 |---|---:|---|
@@ -529,8 +529,10 @@ integration test binary 已重组为 **20 binary**（8 多文件 domain 子目�
 | `tests/production/{main,work_type,process,process_chain,worker,queue,queue_auto_allocate,queue_dispatch,queue_board,pending_programming,shelf_process,pickup,process_design,inspection}.rs` | 6 | `production`（按 `src/modules/prod/*` 对齐；`shelf_process.rs` 2026-10-02 自当时的 `tests/shelf/api.rs` 迁入；**`process_design.rs` 2026-10-05 新增**，★ 核心回归是「装配件子件可见」；**`inspection.rs` 2026-10-05 新增** 13 场景，★ 核心回归是「扫子件 → 返回整棵装配件树」；**2026-10-08** `worker_pool.rs` → `queue.rs`、`worker_pool_auto_allocate.rs` → `queue_auto_allocate.rs`、`batch.rs` → `queue_dispatch.rs`，并新增 `queue_board.rs`（队列板聚合 9 场景））|
 | `tests/outsource/{main,company,quote,quotable,send_receive,shipment,pool}.rs` | 3 | `outsource` |
 | `tests/user_repo/{main,basic,role,password}.rs` | 1 → 3 sub-file | `user_repo` |
-| 单文件保留：_e2e_api / applicant_api / auto_complete_api / cnc_program_api / cos_opendal_api / cos_real_smoke / customer_api / dashboard_ws_api / files_sts_tmp_keys / idempotency_api / print_forward / wecom_login | 12 | （各自原 binary 名）|
-| **合计** | — | **20 binary**（8 子目录 + 12 单文件；`cargo metadata --no-deps` 实测）|
+| `tests/files/{main,part_file,cnc,sts}.rs` | 3 → 1 binary | `files`（**2026-10-13 新建**：随 part_file / cnc_program 两域收编进 files 域合并而成，原单文件 binary `tests/cnc_program_api.rs`（→ `cnc.rs`）/ `tests/files_sts_tmp_keys.rs`（→ `sts.rs`）与 `tests/part/file.rs`（→ `part_file.rs`，其前身是更早的 `tests/part_file_api.rs`）全部搬进来；★ 核心回归是 `part_file.rs` 的硬切 404 守卫（`old_part_files_prefix_returns_404` 等 3 条，含旧前缀整段 / 数字段 / 旧 CNC 前缀））|
+| `tests/wx/{main,part_list,production}.rs` | 1 → 1 binary | `wx`（**2026-10-13 补记**：2026-10-11「BFF 按页面切子模块」时建的 binary，此前本表漏登记；本次一并补上并按 `cargo metadata --no-deps` 复核计数）|
+| 单文件保留：_e2e_api / applicant_api / auto_complete_api / cos_opendal_api / cos_real_smoke / customer_api / dashboard_ws_api / idempotency_api / print_forward / wecom_login | 10 | （各自原 binary 名；⚠️ 原清单里的 `cnc_program_api` / `files_sts_tmp_keys` 已于 2026-10-13 并入上表 `files` binary）|
+| **合计** | — | **20 binary**（10 子目录 + 10 单文件；`cargo metadata --no-deps` 实测，2026-10-13 复核）|
 
 **关键约定**：
 - cargo 1.98.1 **不识别** `tests/<dir>/mod.rs`，只识别 `tests/<dir>/main.rs`（binary 名 = `<dir>`）。新 domain 一律用 `main.rs`。

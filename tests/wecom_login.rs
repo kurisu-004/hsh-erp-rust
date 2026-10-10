@@ -25,7 +25,7 @@
 //!   `t_wx_identity` 预绑定），常量 ID 区段 110-118 / 120-124。
 //!
 //! ## 不用 test_app / v2_router 的历史坑
-//! `tests/files_sts_tmp_keys.rs` 头部记录过「`v2_router()` 因 wx 模块路由重叠
+//! `tests/files/sts.rs` 头部记录过「`v2_router()` 因 wx 模块路由重叠
 //! panic」的历史 bug。2026-09-29 实测 `v2_router()` 已可正常构造（该 bug 已修），
 //! 故本文件直接用 `test_support::test_app` 走生产同形路由——白名单两条断言
 //! （第 8 / 9 条）**必须**在真实 `v2_router` 上跑才有意义。

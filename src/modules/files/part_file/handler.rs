@@ -25,7 +25,8 @@
 //!   `POST /api/v2/parts/{part_id}/files/confirm`（入参 `ConfirmFileIn`，service 走
 //!   `PartFileService::bind_uploaded_file`）
 //! - `PartFileService::upload_file_for_owner` 作为**通用上传原语**保留（当前只有
-//!   集成测试在用，HTTP 端点已下线，见 step 5 的 doc 注记）
+//!   集成测试在用，HTTP 端点已下线，见 `service.rs` 里 `upload_file_for_owner` 的
+//!   ⚠️ doc 注记）
 //!
 //! ## 2026-10-13 同批下线的 8 条端点（移除记录，防后人重建）
 //!

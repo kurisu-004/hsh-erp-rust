@@ -5,20 +5,24 @@
 //!   `sqlx::query` / `sqlx::query_scalar`（**不**用 `query!` 宏，本域 SQL 改动频繁），
 //!   **内容零 diff**（part_file 本无 `.sqlx/query-*.json` 缓存故无哈希影响）。
 //! - `mod.rs`（本文件）：对外暴露胖 trait `PartFileRepoTrait`（12 方法合并单 trait；
-//!   含 sql.rs 6 方法 trait 化 + 跨域 owner 校验 2 + 软删 2 + cnc_program 互写
+//!   含 sql.rs 6 方法 trait 化 + 跨域 owner 校验 2 + 软删 2 + cnc 配对互写
 //!   paired_file_id 2），并直接 `impl PartFileRepoTrait for &mut PgConnection` ——
 //!   handler/service 借 `&mut *tx` / `&mut *conn` 即可，零中间壳。
 //!
 //! ## 为什么 trait 命名为 `PartFileRepoTrait`（带 `Trait` 后缀）
-//! `assembly` / `part` / `cnc_program` 共 6+ 处直接 `PartFileRepo::xxx(&mut *conn, ...)`
-//! 走 ZST 静态方法（assembly/service.rs ×3、part/service/batch.rs ×1、part/service/crud.rs ×2、
-//! cnc_program/service.rs ×3），属于其他 worktree 范围（Group A/B/C/D/E），本任务**不能**
-//! 破坏 `part_file::repo::PartFileRepo` 作为 ZST 的对外身份。故：
+//! 域外调用方 `assembly` / `part` 共 6 处直接调 `PartFileRepo::xxx(&mut *conn, ...)`
+//! 走 ZST 静态方法（`assembly/repo/mod.rs` ×3、`part/service/crud.rs` ×2、
+//! `part/service/batch.rs` ×1），故 ZST 形态是对外身份的一部分，不能只留 trait。故：
 //! - `part_file::repo::PartFileRepo` —— ZST struct（在 `sql.rs` 内，通过
 //!   `pub use sql::PartFileRepo;` 重新导出至本模块），保留 6 个 pub 静态方法签名不变
-//!   （cross-module 调用方零修改）。
+//!   （上述跨域调用方零修改）。
 //! - `part_file::repo::PartFileRepoTrait` —— 本文件新加的胖 trait（12 方法），part_file 域
 //!   内部 service 用 `<R: PartFileRepoTrait>` 收。
+//!
+//! ⚠️ 2026-10-13 收编进 files 域时订正：原写的跨域调用方清单里含 `cnc_program`
+//! （`cnc_program/service.rs` ×3）—— 该域已随本批收编为 `files::part_file::cnc` 子模块，
+//! 且已改走本 trait（其自带的 `CncProgramRepoTrait` 与整个 `cnc/repo/` 目录随批删除），
+//! **不再**直接调 ZST 静态方法，故不在此列。
 //!
 //! ## 为什么是胖 trait 而不是按表拆
 //! 与 iam 范本同形（见 `iam/repo/mod.rs` §「为什么是胖 trait」）：`&mut PgConnection` 同一
@@ -39,15 +43,16 @@
 //!   AND version=$3 AND deleted_at IS NULL`
 //! - `soft_delete_active_by_part_kind` —— 替代原 service `bind_uploaded_file` 内的
 //!   inline SQL（单文件 kind 的旧活跃行 soft_delete）
-//! - `insert_setup_sheet_with_paired` / `set_paired_file_id` —— 给 cnc_program 域
-//!   `upload_cnc_pair` 用：原 service 内 inline `INSERT INTO t_part_file ... SETUP_SHEET
+//! - `insert_setup_sheet_with_paired` / `set_paired_file_id` —— 给本域的
+//!   `files::part_file::cnc` 子模块 `CncProgramService::upload_cnc_pair` 用：原
+//!   `cnc_program::service` 内 inline `INSERT INTO t_part_file ... SETUP_SHEET
 //!   ... paired_file_id = $9` 与 `UPDATE t_part_file SET paired_file_id = $2 ...`
 //!   SQL 字符串零 diff 迁入 trait impl。
 //!
 //! ## automock
 //! `#[cfg_attr(test, mockall::automock)]` 在 trait 上声明，生成 `MockPartFileRepoTrait`
 //! 供 service 单测注入。part_file 域当前无内联 mod tests（service 全部走
-//! `tests/part_file_api.rs` + `tests/parts_api.rs` + `tests/assembly_api.rs` 集成测试守护），
+//! `tests/files/part_file.rs` + `tests/files/cnc.rs` 集成测试守护），
 //! 故未建 `part_file/service_tests/` 目录——按 conventions.md §4.1 含 IO 不强求 100%。
 //!
 //! ## 错误类型
@@ -147,9 +152,10 @@ pub trait PartFileRepoTrait: Send {
         kind: &'a str,
     ) -> Result<u64, sqlx::Error>;
 
-    // ── cnc_pair 写入 helper（2）── 从 cnc_program::service 迁来（SQL 字符串零 diff）
+    // ── cnc_pair 写入 helper（2）── 从 `files::part_file::cnc::service` 迁来
+    //    （SQL 字符串零 diff）
     /// `INSERT INTO t_part_file ... SETUP_SHEET ... paired_file_id = $9, ...`。
-    /// cnc_program::upload_cnc_pair 写 SETUP_SHEET 行专用。
+    /// `CncProgramService::upload_cnc_pair` 写 SETUP_SHEET 行专用。
     #[allow(clippy::too_many_arguments)]
     async fn insert_setup_sheet_with_paired<'a>(
         &mut self,
@@ -165,8 +171,8 @@ pub trait PartFileRepoTrait: Send {
         created_by: i64,
     ) -> Result<(), sqlx::Error>;
     /// `UPDATE t_part_file SET paired_file_id = $2, updated_at = now(), updated_by = $3
-    /// WHERE id = $1 AND deleted_at IS NULL` —— cnc_program::upload_cnc_pair 互写
-    /// paired_file_id 专用。
+    /// WHERE id = $1 AND deleted_at IS NULL` —— `CncProgramService::upload_cnc_pair`
+    /// 互写 paired_file_id 专用。
     async fn set_paired_file_id(
         &mut self,
         g_code_id: i64,
@@ -297,7 +303,8 @@ impl PartFileRepoTrait for &mut PgConnection {
         Ok(rows_affected)
     }
 
-    // ── cnc_pair 写入 helper（2）── inline SQL（迁自 cnc_program::service，零 diff）
+    // ── cnc_pair 写入 helper（2）── inline SQL（迁自 `files::part_file::cnc::service`，
+    //    零 diff）
     #[allow(clippy::too_many_arguments)]
     async fn insert_setup_sheet_with_paired<'b>(
         &mut self,

@@ -30,9 +30,10 @@ pub mod crud;
 pub mod lifecycle;
 pub mod print;
 
-// 2026-09-15 followup-cleanup A8：原 part 文件路由（cad-files / cnc-programs /
-// setup-sheets / cnc-pair / files）已迁出到 `src/modules/part_file/handler.rs::part_nested_router()`，
-// 在 `super::router()` nest 进来，保持历史 URL `/api/v2/parts/{part_id}/<file>...`。
+// 2026-10-13：原 part 维度文件路由（cad-files / cnc-programs / setup-sheets /
+// cnc-pair / files）随 part_file 域收编进 files 域**整段下线**（8 条，无 alias，
+// 旧路径 404），本文件不再有对应 handler；逐条移除记录见
+// `src/modules/files/part_file/handler.rs` 的模块 doc。
 
 // 2026-09-16 M2-C：handler 模块按 docs/conventions.md §2 拆分为 crud / lifecycle /
 // inspection / batch 四个文件。为避免上层 `part::router()` 与既有测试需要改动全部

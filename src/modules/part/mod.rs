@@ -55,10 +55,18 @@ use std::sync::Arc;
 use crate::state::AppState;
 
 // 2026-09-29 修复：移除 2026-09-15 followup-cleanup A8 的兼容 nest。
-// part 维度文件路由（cad-files / cnc-programs / setup-sheets / cnc-pair / files）
-// 仅通过 part_file 域 canonical 第二入口
-// `/api/v2/part-files/parts/{part_id}/<file>...` 对外暴露（见
-// `backend-rust/src/modules/part_file/handler.rs::router()`）。
+//
+// 2026-10-13：上面那条「part 维度文件路由（cad-files / cnc-programs / setup-sheets /
+// cnc-pair / files）仅通过 part_file 域 canonical 第二入口
+// `/api/v2/part-files/parts/{part_id}/<file>...` 对外暴露」的说明**已整体作废** ——
+// 那条第二入口随 part_file 域收编进 files 域**整段下线**（连同
+// `part_nested_router()` 一并删除；旧 URL **无 alias**，`/part-files/*` 一律 404）。
+// 本域现在与 part_file 相关的入口只剩 STS 直传链路的
+// `POST /api/v2/parts/{part_id}/files/confirm`（见下方 `router()` 路由表最后一条）；
+// ⚠️ 别把本域自有的 `upload-drawing` / `upload-3d-model` / `print-drawing*` /
+// `batch-with-pdfs` 也算进来 —— 那些是零件域自己的端点，与 part_file 无关。
+// 下线的 8 条端点逐条清单见 `src/modules/files/part_file/handler.rs` 的模块 doc
+// 「2026-10-13 同批下线的 8 条端点（移除记录，防后人重建）」一节。
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -113,11 +121,10 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{part_id}/batches", get(handler::list_part_batches))
         // ---- 2026-09-25 D-08 api-drift-fix：按 part 反查所属装配体 ----
         .route("/{part_id}/assembly", get(handler::get_assembly_by_part))
-        // ---- 2026-09-29 修复：移除 2026-09-15 followup-cleanup A8 的兼容 nest。
-        //      part 维度文件路由（cad-files / cnc-programs / setup-sheets / cnc-pair / files）
-        //      仅通过 part_file 域 canonical 第二入口
-        //      `/api/v2/part-files/parts/{part_id}/<file>...` 对外暴露（per
-        //      backend-rust/src/modules/part_file/handler.rs::router() 注释）。
+        // ---- 2026-10-13：part 维度文件路由整段下线（cad-files / cnc-programs /
+        //      setup-sheets / cnc-pair / files 共 8 条，无 alias，旧路径 404）。
+        //      与 part_file 相关的入口仅剩下方 `POST /{part_id}/files/confirm`（STS 直传
+        //      链路的回执），移除记录见 `src/modules/files/part_file/handler.rs`。
         // ---- 2026-09-16 M2-B 新增：直传 COS 链路 confirm 端点（POST /parts/{id}/files/confirm）----
         .route("/{part_id}/files/confirm", post(handler::confirm_part_file))
 }

@@ -25,7 +25,7 @@
 //! 真实收到的 header。
 
 // 现场造带角色的用户时要抢 `pool_snowflake()` 的 std Mutex（test-support 既有
-// 签名），guard 会跨 await。与 `tests/files_sts_tmp_keys.rs` 同款豁免。
+// 签名），guard 会跨 await。与 `tests/files/sts.rs` 同款豁免。
 #![allow(clippy::await_holding_lock)]
 
 use std::sync::Arc;

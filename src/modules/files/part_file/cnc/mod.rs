@@ -41,11 +41,13 @@
 //! - `service.rs`：`CncProgramService` 仍是带字段结构（`Arc<SnowflakeIdGenerator>` +
 //!   `Arc<dyn CosClient>`），方法签名泛型参数由 `CncProgramRepoTrait` 换成
 //!   `parent::repo::PartFileRepoTrait`（`<R: PartFileRepoTrait>(&self, mut repo: R, ...)`）。
-//! - `dto.rs`：仅入参（`CncPairUploadRequest`）。
+//! - 入参：**没有 `dto.rs`** —— handler 在 `handler.rs` 里 inline 了
+//!   `PairUploadData`（multipart `data` JSON 字段的反序列化目标）直接用。原
+//!   `dto.rs` 的 `CncPairUploadRequest` **全仓零引用**（master 继承的死类型），随本批
+//!   2026-10-13 删除，别再按旧注释「dto.rs：仅入参」重建。
 //! - `vo/cnc_pair.rs`：仅出参（`CncFileRef` / `CncPairOut`）。
 //! - ⚠️ 2026-10-13：`model.rs`（7 行占位，全文是「本文件目前为占位」）随本批删除，
 //!   本子模块没有自己的表行模型。
-pub mod dto;
 pub mod handler;
 pub mod service;
 pub mod vo;

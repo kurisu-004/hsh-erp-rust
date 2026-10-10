@@ -18,14 +18,18 @@
 //! 字符串不变（见 `repo/mod.rs` 注释）。
 //!
 //! ## 为什么保留 `PartFileRepo` ZST 名
-//! `assembly` / `part` / `cnc_program` 共 6+ 处直接 `PartFileRepo::xxx(&mut *conn, ...)`
-//! 走 ZST 静态方法（assembly/service.rs ×3、part/service/batch.rs ×1、part/service/crud.rs ×2、
-//! cnc_program/service.rs ×3），属于其他 worktree 范围（Group A/B/C/D/E），本任务**不能**
-//! 破坏 `part_file::repo::PartFileRepo` 作为 ZST 的对外身份。故：
+//! 域外调用方 `assembly` / `part` 共 6 处直接调 `PartFileRepo::xxx(&mut *conn, ...)`
+//! 走 ZST 静态方法（`assembly/repo/mod.rs` ×3、`part/service/crud.rs` ×2、
+//! `part/service/batch.rs` ×1），故 ZST 形态是对外身份的一部分。故：
 //! - `part_file::repo::PartFileRepo` —— ZST struct，保留 6 个 pub 静态方法签名不变
-//!   （cross-module 调用方零修改）。
+//!   （上述跨域调用方零修改）。
 //! - `part_file::repo::PartFileRepoTrait` —— `mod.rs` 新加的胖 trait（含跨域 helper），
 //!   part_file 域内部 service 用 `<R: PartFileRepoTrait>` 收。
+//!
+//! ⚠️ 2026-10-13 收编进 files 域时订正：原写的跨域调用方清单里含 `cnc_program`
+//! （`cnc_program/service.rs` ×3）—— 该域已随本批收编为 `files::part_file::cnc` 子模块，
+//! 并改走 `PartFileRepoTrait`（其自带的 `CncProgramRepoTrait` 与整个 `cnc/repo/` 目录
+//! 随批删除），**不再**直接调 ZST 静态方法。
 
 use sqlx::PgExecutor;
 
