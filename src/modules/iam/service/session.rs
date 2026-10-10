@@ -301,6 +301,7 @@ impl SessionService {
             roles: roles.iter().map(|r| role_as_str(*r).to_string()).collect(),
             shelf_ids: shelf_ids.clone(),
             shelf_wildcard,
+            permissions: Vec::new(),
         };
         let ttl = self.config.redis.session_ttl_seconds;
         // 2026-09-23 重构：Redis session key 直接使用 JWT 自带 jti（UUID v4）。
@@ -526,6 +527,7 @@ impl SessionService {
             roles: roles.iter().map(|r| role_as_str(*r).to_string()).collect(),
             shelf_ids: shelf_ids.clone(),
             shelf_wildcard,
+            permissions: Vec::new(),
         };
         let ttl = self.config.redis.session_ttl_seconds;
         // 2026-09-23 重构：Redis session key 直接使用 JWT 自带 jti（UUID v4）。

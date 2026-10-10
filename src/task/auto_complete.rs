@@ -164,6 +164,7 @@ pub(crate) fn system_current_user() -> CurrentUser {
         roles: vec![Role::Manager],
         shelf_ids: Vec::new(),
         shelf_wildcard: true,
+        permissions: Vec::new(),
     }
 }
 

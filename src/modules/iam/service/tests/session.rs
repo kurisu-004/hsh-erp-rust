@@ -60,13 +60,8 @@ pub fn sample_user_role_full(id: i64, user_id: i64, role: Role) -> UserRole {
         .unwrap()
         .and_hms_opt(0, 0, 0)
         .unwrap();
-    let role_str = match role {
-        Role::Manager => "MANAGER",
-        Role::Clerk => "CLERK",
-        Role::Inspector => "INSPECTOR",
-        Role::CncProgrammer => "CNC_PROGRAMMER",
-        Role::ShelfAccount => "SHELF_ACCOUNT",
-    };
+    // 2026-10-14：走 `Role::as_str`（唯一真源），新增 Admin 变体时本处不会漏改
+    let role_str = role.as_str();
     UserRole {
         id,
         user_id,
@@ -264,6 +259,7 @@ async fn me_happy_returns_current_user_out() {
         roles: vec![Role::Manager],
         shelf_ids: vec![],
         shelf_wildcard: false,
+        permissions: Vec::new(),
     };
 
     // Act

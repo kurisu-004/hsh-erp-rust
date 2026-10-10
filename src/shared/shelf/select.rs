@@ -467,6 +467,7 @@ mod tests {
             roles,
             shelf_wildcard: wildcard,
             shelf_ids: ids,
+            permissions: Vec::new(),
         };
         // ① wildcard / Manager → 不限
         assert!(shelf_scope_for(&mk(vec![Role::ShelfAccount], true, vec![])).is_none());

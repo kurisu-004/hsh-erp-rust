@@ -22,6 +22,9 @@
 //! **不动** —— `CurrentUser::require_role(Role::Manager)?` 仍在 service / handler 层调用，
 //! 符合 `backend-rust/CLAUDE.md` 约定 #4「权限在服务层」。
 //!
+//! 2026-10-14：ADMIN 元角色通配在 `CurrentUser::has_role` 一处实现，
+//! 本层只负责把 `permissions` 从 session 缓存透传进 `CurrentUser`，不参与判定。
+//!
 //! ## 滑动 TTL
 //! `touch_session` 失败仅 `tracing::warn!`，不阻断请求 —— 业务连续性 > 严格 TTL 滑动。
 //!
@@ -185,7 +188,11 @@ pub async fn verify_session_token(
     }
 
     // 6) 从 cached.profile.{...} 拼装 CurrentUser（id/username/roles/shelf_ids/
-    //    shelf_wildcard）；注意字段名是 `profile`，不是 `cached`（2026-09-22 重命名）。
+    //    shelf_wildcard/permissions）；注意字段名是 `profile`，不是 `cached`
+    //    （2026-09-22 重命名）。
+    //
+    //    2026-10-14：`permissions` 直接透传缓存里的集合（每请求不查库）。
+    //    ADMIN 用户该字段恒为空 vec，通配在 `CurrentUser::require_permission` 里。
     Ok((
         CurrentUser {
             id: cached.user_id,
@@ -193,6 +200,7 @@ pub async fn verify_session_token(
             roles,
             shelf_ids: cached.profile.shelf_ids,
             shelf_wildcard: cached.profile.shelf_wildcard,
+            permissions: cached.profile.permissions,
         },
         jti,
     ))

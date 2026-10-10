@@ -320,6 +320,7 @@ async fn revoke_session_clears_redis_user_set() {
                 roles: vec!["MANAGER".into()],
                 shelf_ids: vec![],
                 shelf_wildcard: false,
+                permissions: Vec::new(),
             },
         )
         .await

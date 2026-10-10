@@ -61,6 +61,7 @@ pub fn current_with_role(role: Role) -> CurrentUser {
         roles: vec![role],
         shelf_ids: vec![],
         shelf_wildcard: false,
+        permissions: Vec::new(),
     }
 }
 

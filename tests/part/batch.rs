@@ -596,6 +596,7 @@ async fn batch_create_with_bindings_object_key_test() {
         roles: vec![Role::Manager],
         shelf_ids: vec![],
         shelf_wildcard: false,
+        permissions: Vec::new(),
     };
     let cos = std::sync::Arc::new(MockCos::new());
 
