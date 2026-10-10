@@ -205,6 +205,8 @@
 //! | 3 | **`ASSEMBLY_MASTER` 曾「能造不能删」**：软删 kind 分派漏了该 kind | **已闭合**（review 第 1 轮 MINOR-6；缺口本身是旧的，`master` 上分派逐字相同，不是 PR1b 的回归） |
 //! | 4 | **上传端点角色面并集含 CNC** | **有意保留 + 已登记**（真实新增面只有「CNC 能写 ASSEMBLY_MASTER」一项；见上文「唯一一处权限面放大」） |
 //! | 5 | **`POST /parts/batch` 的 bindings 分支仍写死 300MB 上限**（`part/service/batch.rs::prepare_binding_head_copy`）：与本轮修掉的 `bind_uploaded_file` 硬编码同源，但那是 part 域的端点、本 PR 未触碰 | **未修**（要修需把 config 穿进 part 域 batch service，属另一次改动；此处登记以免后人以为「全仓都已读 `COS_MAX_FILE_SIZE`」） |
+//! | 6 | **`POST /files/objects/confirm` 的 size 上限由硬编码 300MB 改为读 `COS_MAX_FILE_SIZE`**（`.env.example` = 100MB ⇒ 按样例配置部署时**上限下降**）。副作用：`validate::check_file_size` 排在 step 2，**早于** step 3 的 `cos.head_object` 与 step 6 的 best-effort `delete_object` spawn ⇒ 100–300MB 区间的 STS 直传会在 confirm 被 21103 拒、**tmp 对象留在桶里**，只能等 COS lifecycle 回收 | **有意保留 + 已登记**（与 `POST /files/objects` 同读一份配置是本轮 MAJOR-1 的目的；review 第 2 轮 MINOR-C 补登记。⚠️ 降级/上限调整时注意这条副作用，且它与第 5 条**互不相干**：第 5 条是 part 域另一条写路径，既不读配置也不做 owner_kind 配对） |
+//! | 7 | **`GET /files/objects` 的 `owner_kind` 过滤是空操作，且响应里的 `owner_kind` 从请求参数回显**（`service::render_out(&row, owner_kind)` 取形参、不取行上任何列 —— schema 压根没有 owner 类型列） | **有意保留 + 已登记**（读侧不构成隔离，见 `repo/sql.rs::list_with_filters` / `list_by_owner` 顶部注释；review 第 2 轮 MINOR-C 补登记。⚠️ **本条最易误导后人**：**写侧本轮新加了 `owner_kind` × `kind` 强制配对**（20104）而**读侧全无对应隔离** ⇒ 拿 `owner_kind=PART` 去查装配件 owner id 仍会返回 ASSEMBLY_MASTER 行，不要据响应里的 `owner_kind` 认定这些行真属该类型） |
 pub mod cnc;
 pub mod dto;
 pub mod handler;

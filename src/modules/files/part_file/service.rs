@@ -160,8 +160,17 @@ impl PartFileService {
         // 1. owner 存在性校验（走 trait helper）
         Self::assert_owner_exists(&mut repo, owner_kind, owner_id).await?;
 
-        // 1b. 空字节 / 超限守卫（2026-10-13 review 第 1 轮 MAJOR-1，与被删的
-        //     `PartService::upload_part_file` 逐字等价）。
+        // 1b. 空字节 / 超限守卫（2026-10-13 review 第 1 轮 MAJOR-1 补回）。
+        //     **判定与错误码逐字等价**于被删的 `PartService::upload_part_file`
+        //     （`bytes.is_empty()` → 40001、`len() > cfg_max_file_size` → 21103），
+        //     两处有意的不同，勿当漏改：
+        //     ① 消息 token 由 `file_type` 换成 `kind`（旧 "PDF 字节为空" →
+        //        新 "DRAWING 字节为空"，信息量更高），超限措辞同理改为报实际
+        //        bytes 数 + 上限 MB（旧的 `{file_type} > {max} bytes` 连被超的
+        //        实际大小都没报）；
+        //     ② 位置后移：被删实现在角色守卫之后紧接这两道，本实现前面还排着
+        //        `owner_kind` × `kind` 配对（step 0）与 owner 存在性（step 1），
+        //        非法组合先被 20104 / 21105 拦下、不再走到 size 判定。
         //     ⚠️ 空字节**不是**「过大」而是「无效输入」：用 VALIDATION_ERROR (40001)
         //     而不是 BIZ_PART_FILE_TOO_LARGE (21103)。
         if bytes.is_empty() {

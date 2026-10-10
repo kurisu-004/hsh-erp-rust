@@ -206,7 +206,7 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 >
 > ⚠️ **COS 对象 key 前缀：代码侧统一 `obj/`，容器部署下仍未统一（2026-10-13）**：`COS_UPLOAD_PREFIX` 此前有两套实际取值（生产 `.env` 的 `drawings/` 与 `upload_file_for_owner` 硬编码空串 ⇒ 桶根），代码侧现已收敛为 `obj/`（`config.rs` 缺省值 / `.env.example` / 代码回退三处同步）。**但 `docker-compose{,-local,-staging}.yml` 的 `${COS_UPLOAD_PREFIX:-drawings/}` 共 6 处仍在根仓**（backend-rust 仓外，本 PR 结构上无法触及）⇒ **容器部署下前缀仍落 `drawings/`**，代码回退值 `obj/` 只在不经 compose 的 `cargo run` 场景生效；根仓那 6 处待单独提交。**不要**在本文件或代码注释里写成「前缀已统一」（2026-10-13 review 第 1 轮 MAJOR-2）。**不需要数据迁移、不要跑 `src/bin/cos_key_migrate.rs`**：`t_part_file.object_key` 存完整 key，读端点 `PartFileService::resolve_effective_key` 先 `head_object(db_object_key)` 优先命中，历史对象原地不动，只有新上传改落配置里的那个前缀。
 >
-> ⚠️ **写路径的两处守卫别再弄丢**（review 第 1 轮 MAJOR-1 回归）：`POST /files/objects` 与 `POST /files/objects/confirm` 都从配置读 `COS_MAX_FILE_SIZE`（`.env.example` = 100MB），0 字节 → 40001、超限 → 21103；两条路径**同时**校验 `owner_kind` × `kind` 配对（`PART` 只收 DRAWING / 3D_MODEL，`ASSEMBLY` 只收 ASSEMBLY_MASTER，否则 20104）。已知例外：`POST /parts/batch` 的 bindings 分支仍写死 300MB（part 域、本 PR 未触碰，登记在 `files/part_file/mod.rs` 的「已知偏差登记」第 5 条）。
+> ⚠️ **files 域的两条写路径别再弄丢**（review 第 1 轮 MAJOR-1 回归）：`POST /files/objects` 与 `POST /files/objects/confirm` 都从配置读 `COS_MAX_FILE_SIZE`（`.env.example` = 100MB），0 字节 → 40001、超限 → 21103；两条路径**同时**校验 `owner_kind` × `kind` 配对（`PART` 只收 DRAWING / 3D_MODEL，`ASSEMBLY` 只收 ASSEMBLY_MASTER，否则 20104）。已知例外：`POST /parts/batch` 的 bindings 分支仍写死 300MB（part 域、本 PR 未触碰，登记在 `files/part_file/mod.rs` 的「已知偏差登记」第 5 条）。
 >
 > ⚠️ **刻意留在别的域的两处文件写入**：`POST /api/v2/parts/batch` 的 **bindings 分支**（端点本体是「批量建零件」，文件只是可选入参）；`POST /api/v2/parts/batch-with-pdfs` / `POST /api/v2/assemblies` 的 **multipart PDF**（只喂 `lopdf` 数页数，不入库不上 COS）。
 >

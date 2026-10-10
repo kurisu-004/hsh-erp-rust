@@ -177,7 +177,9 @@ impl PartFileRepo {
         offset: i64,
     ) -> Result<(Vec<TPartFile>, i64), sqlx::Error> {
         // 由于 schema 用 part_id 单列（不开 polymorphic 列），这里按 part_id + kind 组合查。
-        // owner_kind 仅作语义标签，不参与 SQL（part_file 域当前主要服务 PART）。
+        // owner_kind 仅作语义标签，不参与 SQL —— schema 用 `part_id` 单列装 owner
+        // （无 owner 类型列）；历史遗留，读侧不构成隔离，见 `part_file/mod.rs`
+        // 已知偏差登记表。
         let rows = sqlx::query_as::<_, TPartFile>(
             "SELECT id, part_id, kind, file_type, object_key, original_filename, \
                     file_size, content_type, upload_status, content_sha256, \
@@ -210,6 +212,9 @@ impl PartFileRepo {
     }
 
     /// 列出 owner 下全部 part_file（不分 kind），按创建时间降序。
+    ///
+    /// 注：`owner_kind` 同样不参与 SQL —— schema 用 `part_id` 单列装 owner
+    /// （无 owner 类型列），读侧不构成隔离，见 `part_file/mod.rs` 已知偏差登记表。
     pub async fn list_by_owner<'e, E: PgExecutor<'e>>(
         executor: E,
         _owner_kind: &str,

@@ -162,7 +162,7 @@ use crate::state::AppState;
 /// | 20104 | `data` / `file` / filename 缺失、`data` JSON 解析失败、`owner_id` 非数字、`owner_kind` × `kind` 组合非法 | handler（前三项）+ service（末项） |
 /// | 21105 | owner 不存在（`owner_kind ∈ {PART, ASSEMBLY}` 但 id 查不到） | service `assert_owner_exists` |
 /// | 40001 | **0 字节文件** | service（2026-10-13 review 第 1 轮 MAJOR-1 补回，被删的 `upload_part_file` 有这道） |
-/// | 21103 | **超过 `config.cos.max_file_size`**（`COS_MAX_FILE_SIZE`，`.env.example` = 100MB） | service（同上补回；HTTP 413 语义走信封里的 400） |
+/// | 21103 | **超过 `config.cos.max_file_size`**（`COS_MAX_FILE_SIZE`，`.env.example` = 100MB） | service（同上补回；HTTP 400 —— `status_from_code` 对 2xxxx 的兜底） |
 /// | 21102 | 无扩展名 / 扩展名不在 `policy::allowed_exts(kind)` / content_type 与扩展名不匹配 | service |
 /// | 21108 | 撞 `uk_t_part_file_single`（同 owner + kind 已有活跃行且内容不同） | service |
 ///
