@@ -251,6 +251,80 @@ impl QueueService {
         })
     }
 
+    /// 2026-10-14 新增（**容量守卫的唯一单一来源**）：校验「把第 N+1 批交给
+    /// `worker_id` 会不会超容量」，超了抛 `BIZ_WORKER_HOLD_LIMIT_EXCEEDED`。
+    ///
+    /// 抽出来是因为 `move_batch` 的两个分支（POOL→WORKER / WORKER→WORKER）
+    /// 此前各抄了一份完全相同的「取 work_type → 取 `max_held_batches` →
+    /// `count_held_by_worker` → 比较」，而报工台取件
+    /// （`prod::scan::service::pick_up`）**一份都没有** —— 那条路径没有容量守卫，
+    /// 工人可以在报工台无限累积批次（`POST /api/v2/prod/scan/batches/{id}/pick-up`）。
+    /// 三处判据同源之后，新增取件路径不会再漏。
+    ///
+    /// ## 判据的权威定义
+    ///
+    /// 「工人当前持有」= `status='IN_PROCESS' AND location='WORKER' AND
+    /// current_holder_id=$1`（见 `docs/api/queue.md` §4.3「工人持有判据」，
+    /// 与队列板 `board/repo.rs::SQL_HELD_BATCHES_BY_WORKERS`、
+    /// `batch/repo/queries.rs::count_held_by_worker` 逐字一致）。本函数
+    /// **不自己判**，只调 `part_batch_count_held_by_worker`。
+    ///
+    /// ## ⚠️ 这是 service 级非原子守卫，与 `move_batch` 现状同形
+    ///
+    /// 「count → compare」是两条语句，中间没有锁 ⇒ **并发双取仍可能超发 1 批**。
+    /// 这是既有设计取舍，本轮不动，理由与去处：
+    /// - [`crate::modules::prod::queue::repo::QueueRepo::take_one_from_pool`] 的
+    ///   `held < max` 守卫在**单条 SQL 内**（`FOR UPDATE SKIP LOCKED`）⇒ 抢料
+    ///   （refill / auto-allocate）路径是原子的，不受此影响；
+    /// - `take_specific_from_pool` 的 doc 早已声明「**不做** `held < max` 守卫，
+    ///   该守卫下沉到 service 层」，本函数就是那个 service 层；
+    /// - 要把「指定批次取件」也做成原子，需要把判据灌进那条 SQL 的 WHERE（与
+    ///   `take_one_from_pool` 同形），属独立重构，不在本轮范围。
+    ///
+    /// ## 调用点顺序约束
+    ///
+    /// caller **必须**已校验 `worker.is_active` 与 `worker.work_type_id`
+    /// 非 NULL —— 本函数只收 `work_type_id`，不重复查 worker。`prod::scan`
+    /// 的 `pick_up` 已在 worker 校验之后调用本函数。
+    ///
+    /// ## 错误码
+    /// - `BIZ_WORK_TYPE_NOT_FOUND` —— `work_type_id` 查不到（悬空 / 已软删）
+    /// - `BIZ_WORK_TYPE_MAX_HELD_NOT_SET` —— 工种未配 `max_held_batches`
+    ///   （NULL ⇒ 该工种**不可取件**，与 `take_one_from_pool` 里
+    ///   `COALESCE(max_held_batches, 0)` 当 cap 0 的口径一致）
+    /// - `BIZ_WORKER_HOLD_LIMIT_EXCEEDED` —— `held >= max_held`
+    pub async fn ensure_worker_has_capacity(
+        conn: &mut PgConnection,
+        worker_id: i64,
+        work_type_id: i64,
+    ) -> Result<(), AppError> {
+        let work_type = (&mut *conn)
+            .work_type_get_by_id(work_type_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::biz(
+                    code::BIZ_WORK_TYPE_NOT_FOUND,
+                    format!("work_type {work_type_id} 不存在"),
+                )
+            })?;
+        let max_held = work_type.max_held_batches.ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_WORK_TYPE_MAX_HELD_NOT_SET,
+                format!("work_type {work_type_id} max_held_batches 未设置"),
+            )
+        })?;
+        let held = (&mut *conn)
+            .part_batch_count_held_by_worker(worker_id)
+            .await?;
+        if held >= max_held as i64 {
+            return Err(AppError::biz(
+                code::BIZ_WORKER_HOLD_LIMIT_EXCEEDED,
+                format!("worker {worker_id} 已持有 {held} 批次，工种上限 {max_held} 触顶"),
+            ));
+        }
+        Ok(())
+    }
+
     /// `POST /api/v2/prod/queue/move` 业务逻辑（2026-09-30 新增）。
     ///
     /// 通用移动端点：覆盖 POOL ↔ WORKER + WORKER ↔ WORKER 三方向；取代原
@@ -463,21 +537,6 @@ impl QueueService {
                         format!("目标 worker {worker_id} 未分配工种"),
                     )
                 })?;
-                let work_type = (&mut *conn)
-                    .work_type_get_by_id(work_type_id)
-                    .await?
-                    .ok_or_else(|| {
-                        AppError::biz(
-                            code::BIZ_WORK_TYPE_NOT_FOUND,
-                            format!("work_type {work_type_id} 不存在"),
-                        )
-                    })?;
-                let max_held_val = work_type.max_held_batches.ok_or_else(|| {
-                    AppError::biz(
-                        code::BIZ_WORK_TYPE_MAX_HELD_NOT_SET,
-                        format!("work_type {work_type_id} max_held_batches 未设置"),
-                    )
-                })?;
 
                 // 工序资格校验：worker 的 work_type 必须包含 batch 当前所属工序
                 if let Some(spid) = step_process_id {
@@ -492,17 +551,35 @@ impl QueueService {
                     }
                 }
 
+                // 2026-10-14：容量守卫改调单一来源
+                // [`Self::ensure_worker_has_capacity`]。本分支与 WORKER→WORKER
+                // 分支此前各抄了一份逐字相同的「取 work_type → 取 max_held →
+                // count held → 比较」，抄两份必然漂移；而报工台取件
+                // （`prod::scan::service::pick_up`）此前一份都没有。
+                //
+                // ⚠️ 位置在工序资格校验**之后**：这是既有错误码顺序（先说「这批你
+                // 做不了」，再说「你已经拿满了」），不要为对齐 B1 把它挪到前面。
+                Self::ensure_worker_has_capacity(conn, *worker_id, work_type_id).await?;
+
+                // ⚠️ 以下两行**只为填 `MoveResult` 的展示字段**（`current_held` /
+                // `max_held`），**不是第二道守卫** —— 判据仍然只有上面那一次调用，
+                // 这里的 SQL 里不含任何谓词。之所以要多读一次，是
+                // `ensure_worker_has_capacity` 的签名只返回 `()`。
                 let current_held_val = (&mut *conn)
                     .part_batch_count_held_by_worker(*worker_id)
                     .await?;
-                if current_held_val >= max_held_val as i64 {
-                    return Err(AppError::biz(
-                        code::BIZ_WORKER_HOLD_LIMIT_EXCEEDED,
-                        format!(
-                            "worker {worker_id} 已持有 {current_held_val} 批次，工种上限 {max_held_val} 触顶"
-                        ),
-                    ));
-                }
+                let max_held_val = (&mut *conn)
+                    .work_type_get_by_id(work_type_id)
+                    .await?
+                    .and_then(|wt| wt.max_held_batches)
+                    // 守卫刚通过仍取不到 ⇒ 只可能是并发把该列改成了 NULL，
+                    // 按既有语义返错而不是静默填 0。
+                    .ok_or_else(|| {
+                        AppError::biz(
+                            code::BIZ_WORK_TYPE_MAX_HELD_NOT_SET,
+                            format!("work_type {work_type_id} max_held_batches 未设置"),
+                        )
+                    })?;
 
                 // take_specific_from_pool（OCC + WHERE pb.version = $exp）
                 // 0 行 → 与 WORKER→POOL / WORKER→WORKER 分支统一返 40901 VERSION_CONFLICT
@@ -708,21 +785,6 @@ impl QueueService {
                         format!("目标 worker {dst_worker_id} 未分配工种"),
                     )
                 })?;
-                let work_type = (&mut *conn)
-                    .work_type_get_by_id(work_type_id)
-                    .await?
-                    .ok_or_else(|| {
-                        AppError::biz(
-                            code::BIZ_WORK_TYPE_NOT_FOUND,
-                            format!("work_type {work_type_id} 不存在"),
-                        )
-                    })?;
-                let max_held_val = work_type.max_held_batches.ok_or_else(|| {
-                    AppError::biz(
-                        code::BIZ_WORK_TYPE_MAX_HELD_NOT_SET,
-                        format!("work_type {work_type_id} max_held_batches 未设置"),
-                    )
-                })?;
 
                 if let Some(spid) = step_process_id {
                     let process_ids = (&mut *conn)
@@ -736,17 +798,29 @@ impl QueueService {
                     }
                 }
 
+                // 2026-10-14：容量守卫改调单一来源
+                // [`Self::ensure_worker_has_capacity`]（与 POOL→WORKER 分支同一处，
+                // 此前两分支各抄一份）。⚠️ 文案由「目标 worker {id} 已持有 …」
+                // 统一成「worker {id} 已持有 …」—— 单一来源之后两处文案不同本身就是
+                // 漂移；本分支是 `move` 端点内唯一的 WORKER→WORKER 分支，调用方看
+                // 错误文案时已有 `MoveResult` / 请求上下文可定位目标工人。
+                Self::ensure_worker_has_capacity(conn, *dst_worker_id, work_type_id).await?;
+
+                // ⚠️ 与 POOL→WORKER 分支同款：以下两行只为填 `MoveResult` 的展示
+                // 字段，**不是第二道守卫**（SQL 里不含任何谓词）。
                 let current_held_val = (&mut *conn)
                     .part_batch_count_held_by_worker(*dst_worker_id)
                     .await?;
-                if current_held_val >= max_held_val as i64 {
-                    return Err(AppError::biz(
-                        code::BIZ_WORKER_HOLD_LIMIT_EXCEEDED,
-                        format!(
-                            "目标 worker {dst_worker_id} 已持有 {current_held_val} 批次，工种上限 {max_held_val} 触顶"
-                        ),
-                    ));
-                }
+                let max_held_val = (&mut *conn)
+                    .work_type_get_by_id(work_type_id)
+                    .await?
+                    .and_then(|wt| wt.max_held_batches)
+                    .ok_or_else(|| {
+                        AppError::biz(
+                            code::BIZ_WORK_TYPE_MAX_HELD_NOT_SET,
+                            format!("work_type {work_type_id} max_held_batches 未设置"),
+                        )
+                    })?;
 
                 let rows = (&mut *conn)
                     .move_worker_to_worker(

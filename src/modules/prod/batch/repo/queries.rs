@@ -1014,6 +1014,28 @@ impl PartBatchRepo {
     /// 工人当前持有批次数（worker-pool used/max 校验）。
     /// 复用 `ix_t_part_batch_holder_location`（Task 1 已建）覆盖
     /// `(current_holder_id, location)` 谓词。
+    ///
+    /// ## 2026-10-14 补 `AND status = 'IN_PROCESS'`（修「容量误报」bug）
+    ///
+    /// **判据的权威定义在 `docs/api/queue.md` §4.3「工人持有判据」**：
+    /// `status = 'IN_PROCESS' AND location = 'WORKER'
+    /// AND current_holder_id = …`。本函数此前**只判后两列**，是校验 SQL 单方面偏离了
+    /// 自己的域契约。
+    ///
+    /// 为什么必须带 status：三个终态写点（取消 / 强制完成 / 交付）此前都不清
+    /// `location` + `current_holder_id`，于是被取消的批次仍以
+    /// `location='WORKER'` 留在表里 —— 校验算数、队列板看板
+    /// （`board/repo.rs::SQL_HELD_BATCHES_BY_WORKERS`，同样按 `status='IN_PROCESS'`
+    /// 过滤）看不见。这类行永久累积，取消得越多工人越被卡死。
+    ///
+    /// ⚠️ 现在这条判据与看板 `SQL_HELD_BATCHES_BY_WORKERS` 的 WHERE 逐字一致
+    /// （`status = 'IN_PROCESS' AND location = 'WORKER' AND current_holder_id` +
+    /// `deleted_at IS NULL`）。**改一处必须改另一处**，否则「看板显示还能取 N 件、
+    /// 实际取件被拒」这类难查的问题会回来。
+    ///
+    /// ⚠️ 存量脏行的**清理由 migration `20261013000002_001_clear_terminal_batch_location`
+    /// 负责**（只清数据不改判据）；本函数的 status 过滤是判据侧的第一道防线，
+    /// 两者都需要。
     pub async fn count_held_by_worker<'e, E: PgExecutor<'e>>(
         executor: E,
         worker_id: i64,
@@ -1024,6 +1046,7 @@ impl PartBatchRepo {
             FROM t_part_batch
             WHERE current_holder_id = $1
               AND location = 'WORKER'
+              AND status = 'IN_PROCESS'
               AND deleted_at IS NULL
             "#,
             worker_id,

@@ -13,7 +13,7 @@ use axum::extract::{Query, State};
 use crate::auth::rbac::CurrentUser;
 use crate::modules::prod::scan::dto::{HeldQuery, PickableQuery};
 use crate::modules::prod::scan::listing::ScanListingService;
-use crate::modules::prod::scan::vo::ScanListOut;
+use crate::modules::prod::scan::vo::{HeldListOut, ScanListOut};
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
@@ -46,11 +46,15 @@ pub async fn list_pickable(
 /// - 权限：Manager + Clerk + Inspector + ShelfAccount
 /// - `worker_id` **必填** query 参数（JSON string 形态）
 /// - 不做货架 scope 收窄：行已在工人手上，不是架上的候选池
+/// - 出参是 `HeldListOut`（2026-10-14 起）= `ScanListOut` 的 4 个分页字段**逐字
+///   相同、顺序不变** + `current_held` / `max_held_batches` 两个裸 number；
+///   前端读 `items` / `total` 的代码不受影响。`/pickable` 仍返 `ScanListOut`
+///   （它按工种作用域，根本不知道是哪个工人，容量字段对它无意义）。
 pub async fn list_held(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Query(query): Query<HeldQuery>,
-) -> Result<Json<R<ScanListOut>>, AppError> {
+) -> Result<Json<R<HeldListOut>>, AppError> {
     let mut conn = state.pool.acquire().await?;
     let out = ScanListingService::list_held(&mut conn, query.worker_id, &query, &current).await?;
     Ok(Json(R::ok(out)))

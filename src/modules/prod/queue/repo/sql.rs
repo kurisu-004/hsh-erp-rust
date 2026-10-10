@@ -79,6 +79,24 @@ impl QueueRepo {
     ///    于是「看板上看到的顺序」与「工人实际抢到的顺序」对不上。
     /// 3. **新增 `LEFT JOIN t_process pr`**（供上面那条片段的第 4 层判 `is_cnc`）。
     ///
+    /// ## 2026-10-14 一处变化：`held` CTE 补 `status = 'IN_PROCESS'`
+    ///
+    /// 判据的权威定义是 `docs/api/queue.md` §4.3「工人持有判据」，本 CTE 此前
+    /// 只判 `current_holder_id` + `location = 'WORKER'` 两列，把
+    /// `status = 'IN_PROCESS'` 漏掉了 —— 于是被取消 / 强制完成的批次（三个终态
+    /// 写点都不清位置）照样吃工容量，**取消得越多工人越被卡死**，而队列板
+    /// （`board/repo.rs::SQL_HELD_BATCHES_BY_WORKERS`，判据带 status）看不见它们。
+    /// 现在本 CTE 与看板、`batch/repo/queries.rs::count_held_by_worker` 三处
+    /// **逐字一致**。
+    ///
+    /// ⚠️ **守卫 `AND (SELECT n FROM held) < (SELECT max_held FROM max_batches)`
+    /// 必须留在 SQL 内、不得上提到 Rust 层**：它承担的是**原子性** —— 单条 SQL 内
+    /// 计算容量 + 选候选 + `FOR UPDATE SKIP LOCKED` 锁行 + UPDATE。拆成
+    /// 「先 count 后 UPDATE」两步后，并发双抢会双双看到 `held = max-1` 然后双双
+    /// 放行，超发。`take_specific_from_pool` 反过来是**刻意不做**这个守卫的
+    /// （它由 service 层 `QueueService::ensure_worker_has_capacity` 承担），差别在
+    /// 于那条 SQL 不带 `FOR UPDATE`、无法在单条语句内锁住容量。
+    ///
     /// ## 为什么从 `query_as!` 改成运行时 `query` + `AssertSqlSafe`
     ///
     /// `POOL_PRIORITY_ORDER_SQL` 是一个**编译期常量**，但它要插进 CTE 的 `ORDER BY`
@@ -97,9 +115,18 @@ impl QueueRepo {
             r#"
             WITH
             held AS (
+                -- 2026-10-14 补 status 过滤（修「容量误报」bug）：判据权威定义在
+                -- `docs/api/queue.md` §4.3 = status='IN_PROCESS' AND location='WORKER'
+                -- AND current_holder_id，**逐字**对齐看板
+                -- `board/repo.rs::SQL_HELD_BATCHES_BY_WORKERS` 的 WHERE 与
+                -- `batch/repo/queries.rs::count_held_by_worker`。此前本 CTE 只判
+                -- 后两列，被取消 / 强制完成的批次（三个终态写点不清位置）仍算数，
+                -- 取消得越多工人越被卡死。
                 SELECT COUNT(*)::int AS n FROM t_part_batch
                 WHERE current_holder_id = $1
-                  AND location = 'WORKER' AND deleted_at IS NULL
+                  AND location = 'WORKER'
+                  AND status = 'IN_PROCESS'
+                  AND deleted_at IS NULL
             ),
             max_batches AS (
                 SELECT COALESCE(wt.max_held_batches, 0) AS max_held

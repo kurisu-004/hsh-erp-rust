@@ -6,8 +6,8 @@
 //!
 //! ## 分组
 //! - `worker.rs` —— `ScanWorkerBrief`（扫工牌 1 端点、4 字段）
-//! - `listing.rs` —— `ScanListItem` / `ScanListOut` / `ScanChainState`
-//!   （两条只读聚合端点的分页行）
+//! - `listing.rs` —— `ScanListItem` / `ScanListOut` / `HeldListOut` / `ScanChainState`
+//!   （两条只读聚合端点的分页行；`HeldListOut` 是 `/held` 专用的「+ 容量两字段」信封）
 //! - `transition.rs` —— `WorkerScanCoreOut` / `WorkerScanOut` / `WorkerScanSplitInfo`
 //!   （放回 / 送检）
 //!
@@ -20,6 +20,6 @@ pub mod listing;
 pub mod transition;
 pub mod worker;
 
-pub use listing::{ScanChainState, ScanListItem, ScanListOut};
+pub use listing::{HeldListOut, ScanChainState, ScanListItem, ScanListOut};
 pub use transition::{WorkerScanCoreOut, WorkerScanOut, WorkerScanSplitInfo};
 pub use worker::ScanWorkerBrief;
