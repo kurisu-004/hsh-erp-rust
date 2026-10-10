@@ -1056,8 +1056,17 @@ impl PartBatchRepo {
         Ok(n)
     }
 
-    /// 工人当前持有批次列表（worker-pool state 端点用）。
-    /// 同样命中 `ix_t_part_batch_holder_location`。
+    /// 工人当前持有批次列表（**死代码**）。同样命中 `ix_t_part_batch_holder_location`。
+    ///
+    /// ⚠️ **全仓零调用方**（2026-10-14 实测：只有本函数与 `PartBatchRepoTrait` 的
+    /// 声明 / 转发 impl 提到它；它服务的 worker-pool `state` 端点早已随该域更名删除）。
+    /// 它是公开 trait 方法，删除要动域边界（`prod::batch` → `prod::queue` 剥离的
+    /// 中间态），故留着不动 —— **但不要因此以为它在服务谁**。
+    ///
+    /// ⚠️ **本查询无 `status` 过滤，与 [`Self::count_held_by_worker`] 分叉**：那个
+    /// 同门函数已按 `docs/api/queue.md` §4.3 补 `status = 'IN_PROCESS'`，本函数仍是
+    /// 「只要 `location='WORKER'` 就算」⇒ 被取消 / 强制完成的批次会混进结果。**接线前
+    /// 必须先补 `status='IN_PROCESS'`**，否则同一份「工人持有」会出现两个口径。
     ///
     /// 2026-09-16 PR-3 批次 step 化：删 next_process_id / placed_at，加
     /// current_process_step_id。

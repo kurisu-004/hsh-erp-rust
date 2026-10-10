@@ -66,21 +66,40 @@ pub struct RefillResult {
     ///
     /// 抢到任何一批时为 `None`，且因 `skip_serializing_if` 而**整个 key 不出现**
     /// （与本 struct 内 `MoveResult.shelf_id` 的既有写法同款）。
+    ///
+    /// ⚠️ **改一同步二：`WORKER_POOL_EMPTY` 的两个 WS 产出点都必须读本字段，
+    /// 不许读 [`Self::pool_empty`]**（`prod::queue::handler::pool::admin_refill`
+    /// 与 `prod::scan::handler::transition::worker_scan`）。`pool_empty` 对
+    /// 「池空」与「工人已拿满」都为 `true`，读它就等于把这两条判据重新分叉 ——
+    /// 而 `pool_empty` 本身的语义一个字都不许改（既有 wire 契约）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stopped_reason: Option<String>,
 }
 
 /// [`RefillResult::stopped_reason`] / [`WorkerFillItem::skipped_reason`] 的取值常量。
 ///
-/// ⚠️ **改一同步二义务**：`RefillResult.stopped_reason` 与
-/// `AutoAllocateResult` 里填 `skipped_reason` 的地方共用这两个字面量
-/// （见 `QueueService::refill_for_worker_with_work_type` 与
-/// `auto_allocate_for_process`）。前端按字面量做分支，不要随手改。
+/// ⚠️ **改一同步二**：
+/// 1. `RefillResult.stopped_reason` 与 `AutoAllocateResult` 里填 `skipped_reason`
+///    的地方共用这几个字面量（见 `QueueService::refill_for_worker_with_work_type`
+///    与 `auto_allocate_for_process`）。前端按字面量做分支，不要随手改；
+/// 2. ⚠️ [`MAX_BATCHES_NOT_SET`] **只在 `skipped_reason` 里出现过**（refill 路径在
+///    入口就以 `20904` 早退，走不到诊断）。本模块是共用常量表，别因为它不在
+///    `RefillResult` 里出现就当成死值删掉。
 pub mod stopped_reason {
     /// 候选池里没有可抢的批次。
     pub const POOL_EMPTY: &str = "POOL_EMPTY";
-    /// 工人容量已触顶（`held >= max_held_batches`），或工种未配上限（按 cap 0 拦死）。
+    /// 工人容量已触顶（`held >= max_held_batches`，含配成 0 的工种）。
     pub const WORKER_FULL: &str = "WORKER_FULL";
+    /// **工种未配 `max_held_batches`**（`NULL`）⇒ `take_one_from_pool` 按 cap 0
+    /// 守卫把抢料路径整个拦死。
+    ///
+    /// ⚠️ 这是 `WORKER_FULL` 的**兄弟**而不是它自己：`held >= 0` 恒真只是巧合，
+    /// 真实成因是「忘了配上限」。refill 路径对同一情形抛
+    /// `20904 BIZ_WORK_TYPE_MAX_HELD_NOT_SET`（入口即早退），二者是
+    /// 「一条路报错、一条路给字面量」的同一语义，故本值只在
+    /// `WorkerFillItem.skipped_reason` 出现（`POST /queue/auto-allocate` 的
+    /// **Time** 模式 —— Count 模式要求配上限，早被 `ok_or_else` 挡掉）。
+    pub const MAX_BATCHES_NOT_SET: &str = "MAX_BATCHES_NOT_SET";
 }
 
 /// 单个 worker 的自动分配填充结果。
@@ -93,8 +112,9 @@ pub struct WorkerFillItem {
     /// 实际抢到的批次 / 累计分钟数
     pub filled_count: i32,
     /// 因业务错跳过该 worker 时填原因；
-    /// 2026-10-14 起 ALSO 覆盖「没抢够」：本 worker 因池空 / 已拿满而提前 `break`
-    /// 时填 [`stopped_reason::POOL_EMPTY`] / [`stopped_reason::WORKER_FULL`]
+    /// 2026-10-14 起 ALSO 覆盖「没抢够」：本 worker 因池空 / 已拿满 / 上限未配而
+    /// 提前 `break` 时填 [`stopped_reason::POOL_EMPTY`] /
+    /// [`stopped_reason::WORKER_FULL`] / [`stopped_reason::MAX_BATCHES_NOT_SET`]
     /// （此前恒 `None`，见 `QueueService::auto_allocate_for_process`）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skipped_reason: Option<String>,

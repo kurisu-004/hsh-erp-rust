@@ -32,7 +32,9 @@
 -- ## 判据
 --
 -- - `location IN ('WORKER','PRODUCTION_SHELF','INSPECTION_SHELF','OUTSOURCE_COMPANY')`
---   —— 即「除 OFFICE 之外的全部 5 种位置」。三种货架 / 外协位置上挂着
+--   —— 即「除 OFFICE 之外的**全部 4 种**位置」（baseline 的列注释共列 5 种：
+--   OFFICE / PRODUCTION_SHELF / WORKER / INSPECTION_SHELF / OUTSOURCE_COMPANY）。
+--   三种货架 / 外协位置上挂着
 --   `current_holder_id` 是正常的（货架 id 就存在 `current_holder_id` 列里，见
 --   `ix_t_part_batch_holder_location`），终态批次残留其中同样要清；
 -- - `current_holder_id IS NOT NULL` —— 无持有人的行本来就是 NULL，不动；

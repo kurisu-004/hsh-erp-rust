@@ -24,6 +24,9 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::ws_hub::WsEvent;
 use crate::modules::part::vo::PartOut;
 use crate::modules::prod::queue::service::QueueService;
+// 2026-10-14：`WORKER_POOL_EMPTY` 的广播条件与 `prod::queue::handler::pool`
+// 共用同一个停机原因常量（见本文件 `worker_scan` 处的「改一同步二」注释）。
+use crate::modules::prod::queue::vo::worker as queue_vo;
 use crate::modules::prod::scan::dto::{PickUpRequest, WorkerScanRequest};
 use crate::modules::prod::scan::service::ScanService;
 use crate::modules::prod::scan::vo::WorkerScanOut;
@@ -77,7 +80,23 @@ fn ws_broadcast_assembly_updated(state: &AppState, assembly_id: i64) {
 ///     响应 `WORKER_SCAN_INSPECTED`」成立，而 dashboard 两条事件都监听，故广播
 ///     链路无需改动即成立）；
 ///   - `WORKER_POOL_REFILL_DONE`（refill 抢到一批）或
-///   - `WORKER_POOL_EMPTY`（refill 池空）。
+///   - `WORKER_POOL_EMPTY`（**2026-10-14 起收窄**：`stopped_reason ==
+///     "POOL_EMPTY"`，即真的池空。工人已拿满时**不广播**，见下）。
+///
+/// ⚠️ **改一同步二：`WORKER_POOL_EMPTY` 全仓有两个产出点，两处都必须读
+/// `stopped_reason`，不许读 `pool_empty`。** 另一处是
+/// `prod::queue::handler::pool::admin_refill`（`POST /queue/refill`）。
+///
+/// 改造前两处的条件都是 `pool_empty`，而 `pool_empty` 对「池空」与「**工人已经拿满**
+/// `max_held_batches`**」两种成因**都为 `true`**（`take_one_from_pool` 对两者都返回
+/// `None`，SQL 层失败形态一样）⇒ 工人拿满时也会推一条名为 `WORKER_POOL_EMPTY` 的事件，
+/// 看板照样把原因归给「池里没货」，而真实原因是「这个工人满了」。这正是本仓要消灭的
+/// 那类病（一条容量契约两套判据），只是漂移到了 WS 广播条件上。**任一处漏改，现象
+/// 原样复活。**
+///
+/// 行为与 `prod::queue` 那处逐字一致：**已决策不新增 WS event kind**（用户 2026-10-14
+/// 拍板）⇒ 「工人已拿满」这条状态在 WS 上没有信号，只有触发方自己看 HTTP 响应里的
+/// `refill.stopped_reason` 才知道。
 ///
 /// 本端点一笔事务改 2 个批次（扫的那个 + 同事务从工人池补的），是全仓唯一的
 /// 跨 part 批次写点；部分数量场景下拆批本身再加 1 笔 `t_part_batch` 写入。
@@ -146,15 +165,19 @@ pub async fn worker_scan(
             kind: "WORKER_POOL_REFILL_DONE".into(),
             payload: serde_json::to_value(&refill_out).unwrap_or_default(),
         });
-    } else if refill_out.pool_empty {
+    } else if refill_out.stopped_reason.as_deref() == Some(queue_vo::stopped_reason::POOL_EMPTY) {
         state.ws_hub.broadcast(WsEvent::DashboardEvent {
             kind: "WORKER_POOL_EMPTY".into(),
             // 2026-10-10：`shelf_id` 键删除（refill 已无架锚，worker-scan 也不再收它）。
             // WS payload 与 HTTP 响应的 `refill.shelf_id` 同步为 `null`。
+            // 2026-10-14：补 `stopped_reason` 键（字符串）—— 让消费方能确认这条事件
+            // 确实来自「池空」而不是「工人已拿满」。走这条分支时该字段恒为
+            // `Some("POOL_EMPTY")`（条件即由它推出）。
             payload: json!({
                 "worker_id": scan_out.worker_id.to_string(),
                 "shelf_id": serde_json::Value::Null,
                 "pool_empty": true,
+                "stopped_reason": refill_out.stopped_reason,
             }),
         });
     }

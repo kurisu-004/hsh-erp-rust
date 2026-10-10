@@ -14,13 +14,24 @@
 
 ### 0.0 2026-10-14：`/held` 容量可见 + pick-up 容量守卫
 
-**两处前端契约变更**：
+**三处前端契约变更**：
 
 1. **`GET /scan/held` 出参由 `ScanListOut` 改为 `HeldListOut`**（§2.3.1）—— 新增
    `current_held` / `max_held_batches` 两个**裸 number**。前 4 个分页字段逐字不变。
    `/pickable` **不**携带这两个字段。
 2. **`POST /scan/batches/{id}/pick-up` 新增两条错误码**（§2.6.1）：`20204`
    （容量触顶，**HTTP 409**）/ `20904`（工种未配上限，**HTTP 400**）。
+3. **`POST /scan/worker-scan` 响应的 `refill` 段多出第三个可选键
+   `refill.stopped_reason`**（§2.5）—— `refill` 是内嵌的 `RefillResult`
+   （`prod::scan::vo::transition::WorkerScanOut::refill`），与
+   `POST /queue/refill` 的响应体**同一个 VO**：refill 一批也没抢到时该键出现，取
+   `"POOL_EMPTY"`（真·池空）/ `"WORKER_FULL"`（工人已拿满）；抢到东西时**整个键不出现**
+   （`skip_serializing_if`）。逐字段、判据与那条「诊断只在没抢到时执行」的性能口径见
+   [`queue.md`](queue.md) §3.2。⇒ **向后兼容**：不读该键的客户端零改动照常工作。
+
+   ⚠️ 同一改动还**收窄了本端点的 WS 行为**：refill 因「工人已拿满」停下时**不再**广播
+   `WORKER_POOL_EMPTY`（§4.2）—— 前端若靠该事件提示「没抢到料」，现在会收不到，
+   改读本响应里的 `refill.stopped_reason`。
 
 **为什么**：报工台取件页此前拿不到「还能不能再取件」，只能在提交后吃一个 `20204`；
 而 pick-up 这条路径**完全没有**容量守卫，工人在队列板上被 `held < max` 卡着、从
@@ -335,7 +346,7 @@ JSON **形状**逐字不变（键集一字未动）；`scan.batch_id` 的**取�
 | `scan.batch_id` | string | ⚠️ **本次实际被处理的那一批**：拆批场景（§2.4.1）= 拆出来的**新批次**，整批场景 = 工人手上那批 |
 | `scan.event_type` | string | ⚠️ **可能与请求的不同**，见 §4.1 |
 | `scan.synced_assembly_id` | string \| null | 父装配件真变了才有值（handler 据此发 `ASSEMBLY_UPDATED`） |
-| `refill` | `RefillResult` | 同事务 refill（`QueueService::refill_for_worker_with_work_type`）。4 字段 = `worker_id` / `shelf_id`（worker-scan 路径恒 `null`，refill 无架锚）/ `taken[]` / `pool_empty`，真源 `prod/queue/vo/worker.rs::RefillResult`；⚠️ `queue.md` 只在端点表登记了它是端点 7 的响应类型，**没有逐字段章节**，别去找 |
+| `refill` | `RefillResult` | 同事务 refill（`QueueService::refill_for_worker_with_work_type`）。**2026-10-14 起 5 字段** = `worker_id` / `shelf_id`（worker-scan 路径恒 `null`，refill 无架锚）/ `taken[]` / `pool_empty` / **`stopped_reason`**（可选键：refill 一批也没抢到时出现，取 `"POOL_EMPTY"` / `"WORKER_FULL"`，抢到东西时**整个键不出现**）。逐字段与判据见 [`queue.md`](queue.md) §3.2；真源 `prod/queue/vo/worker.rs::RefillResult` |
 
 `work_type_id` / `badge_code` / `split` 是**内部管道字段**（`#[serde(skip)]`）：前两个
 把 `worker_scan_event` 已 fetch 过的 worker 信息透传给同事务的
@@ -472,7 +483,7 @@ step 指针与「当前工序在链内的位置」是两个独立事实，而 wo
 | `POST /scan/worker-scan` | `WORKER_SCAN_RETURNED` / `WORKER_SCAN_INSPECTED` | 无条件，**按响应的 `scan_out.event_type`** |
 | `POST /scan/worker-scan` | `PART_BATCH_SPLIT` | 部分数量（§2.4.1，自动拆批） |
 | `POST /scan/worker-scan` | `WORKER_POOL_REFILL_DONE` | 同事务 refill 抢到一批 |
-| `POST /scan/worker-scan` | `WORKER_POOL_EMPTY` | refill 池空 |
+| `POST /scan/worker-scan` | `WORKER_POOL_EMPTY` | refill **池空**。⚠️ **2026-10-14 起收窄**：`stopped_reason == "POOL_EMPTY"`，工人已拿满时不广播（见 §4.2） |
 | `POST /scan/worker-scan` | `ASSEMBLY_UPDATED` | 父装配件真变了 |
 | `POST /scan/batches/{id}/pick-up` | `PART_PICKED_UP` | 无条件 |
 | `POST /scan/batches/{id}/pick-up` | `PART_BATCH_SPLIT` | 部分领取（自动拆批） |
@@ -503,10 +514,38 @@ step 指针与「当前工序在链内的位置」是两个独立事实，而 wo
 更清楚批次做完了没有。handler 按 `scan_out.event_type` 广播，所以 WS 链路自动成立、
 无需为它单独改 handler。
 
-### 4.2 `WORKER_POOL_EMPTY` 的 payload
+### 4.2 `WORKER_POOL_EMPTY` 的 payload 与 2026-10-14 的广播条件收窄
 
-`shelf_id` 键恒为 `null`（refill 已无架锚，worker-scan 也不再收它）；WS payload 与
-HTTP 响应的 `refill.shelf_id` 同步。
+| 键 | 类型 | 说明 |
+|---|---|---|
+| `worker_id` | string | 触发 refill 的工人 |
+| `shelf_id` | null | 恒为 `null`（refill 已无架锚，worker-scan 也不再收它）；WS payload 与 HTTP 响应的 `refill.shelf_id` 同步 |
+| `pool_empty` | bool | 恒 `true`（能走到这条分支就意味着 `taken` 为空） |
+| `stopped_reason` | string | **2026-10-14 新增**。走这条分支时恒为 `"POOL_EMPTY"`（条件即由它推出） |
+
+⚠️ **2026-10-14 有意的协议行为变更：工人拿满时不再广播。**
+改造前的条件是 `pool_empty`，而 `pool_empty` 对「池空」与「**工人已拿满
+`max_held_batches`**」两种成因**都为 `true`**（`take_one_from_pool` 对两者都返回
+`None`，SQL 层失败形态一样）⇒ 工人在报工台放回 / 送检时即便「是自己已经拿满了」，
+也会向所有订阅端推一条名为 `WORKER_POOL_EMPTY` 的事件，看板照样把停机原因归给
+「池里没货」。现在改读 `refill.stopped_reason == "POOL_EMPTY"`，与
+[`queue.md`](queue.md) §7 的 `POST /queue/refill` 逐字同款。
+
+**两个 WS 产出点，都要读它**（漏一处就重新引入两套判据）：
+
+| 产出点 | 端点 | payload 里的 `worker_id` |
+|---|---|---|
+| `prod::scan::handler::transition::worker_scan` | `POST /api/v2/prod/scan/worker-scan` | `scan_out.worker_id` |
+| `prod::queue::handler::pool::admin_refill` | `POST /api/v2/prod/queue/refill` | 请求体 `worker_id` |
+
+⚠️ **已决策不新增 WS event kind**（2026-10-14）。代价是「工人已拿满」这条状态在 WS 上
+**完全没有信号** —— 只有直接看 `POST /scan/worker-scan` 响应的 `refill.stopped_reason`
+（或 `POST /queue/refill` 响应体）才知道。接受的理由同 queue 域：拿满是**按工人维度**的
+事实，看板每个工人格子各自刷新自己的 `current_held`，不需要一条全局广播。
+
+⚠️ 两处 payload 的 `shelf_id` **形态不同**：本域恒 `null`（worker-scan 的 refill
+跨架取料、无架锚），queue 域填请求里的架 id。`stopped_reason` / `pool_empty` /
+`worker_id` 三个键两边同形。
 
 ## 5. SQL 条数
 
@@ -667,6 +706,17 @@ SQL 里聚合，一处他域的 service / repo 都不 import（连 `PartRepoTrai
      是业务信封 `20111`（**HTTP 400**，`{ code, message, data: null }`）；
      发数字则是 axum `JsonRejection` 的 **HTTP 422 纯文本**，**不进信封**
      ⇒ 前者走既有 `code != 0` 的错误提示路径，后者得单独处理（否则只会拿到一句裸 422）。
+10. **2026-10-14 的三条契约（摘要见 §0.0，逐字段见对应小节）**：
+    - `GET /scan/held` 换成 `HeldListOut`，新增 `current_held` / `max_held_batches`
+      两个**裸 number**（§2.3.1）—— 取件页要显示「已拿 N / 上限 M」并据此禁用取件按钮；
+    - `POST /scan/batches/{id}/pick-up` 新增 `20204`（容量触顶，HTTP 409）/ `20904`
+      （工种未配上限，HTTP 400）两条错误码（§2.6.1）—— 都得单独给文案，**别落进
+      通用 500 提示**；
+    - `POST /scan/worker-scan` 的 `refill` 段新增可选键 `stopped_reason`（§2.5，语义与
+      判据见 [`queue.md`](queue.md) §3.2），同时 ⚠️ `WORKER_POOL_EMPTY` 的广播被
+      **收窄**为「真·池空」（§4.2）：「工人已拿满」这条状态 WS 上不再有信号，前端只能
+      从**本响应体**拿 —— 放回 / 送检两页的「没抢到料」提示必须改读
+      `refill.stopped_reason`，不能只依赖 WS 事件。
 
 ## 8. 已知偏差登记
 

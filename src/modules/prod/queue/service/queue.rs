@@ -108,7 +108,9 @@ impl QueueService {
     /// 4. 循环调 `QueueRepoTrait::take_one_from_pool`，每抢到一批写
     ///    `TAKEN_FROM_POOL` 事件日志 + `PartService::sync_from_batch_change` 同步
     ///    part 派生列（事务内由 handler commit）；
-    /// 5. 返回 `RefillResult { worker_id, shelf_id, taken, pool_empty }`。
+    /// 5. 返回 `RefillResult { worker_id, shelf_id, taken, pool_empty,
+    ///    stopped_reason }`（`stopped_reason` 是 2026-10-14 新增，区分「池空」与
+    ///    「工人已拿满」，见 [`RefillResult::stopped_reason`]）。
     ///
     /// `shelf_id`（2026-10-10 起 `Option<i64>`）：`None` = **跨全部映射该工种工序的
     /// 活跃生产架取料**（worker-scan 路径）。旧实现要求「工人站在某个架上」并把该架
@@ -1074,25 +1076,41 @@ impl QueueService {
                     None => {
                         // 2026-10-14：`None` 有两种成因（SELECT 无行 / `held < max`
                         // 守卫不通过），`pool_empty_any` 只记「没抢够」这个事实，
-                        // 这里补上**具体原因**填进本 worker 的 `skipped_reason` ——
-                        // 判据与 `refill_for_worker_with_work_type` 的诊断完全同款
-                        // （同一张 `t_part_batch`、同一列、同一比较），两处口径必须
-                        // 一致，否则同一个工人在 refill 里显示 `POOL_EMPTY`、在
-                        // auto-allocate 里显示 `WORKER_FULL`，没人能解释。
+                        // 这里补上**具体原因**填进本 worker 的 `skipped_reason`。
                         //
-                        // ⚠️ 这条诊断**同样只在早退（没抢够）时执行**，每个 worker
+                        // ⚠️ 与 refill 路径的诊断**不是**「完全同款」：那边的
+                        // `max_held` 由 `refill_for_worker_with_work_type` 开头那句
+                        // `work_type.max_held_batches.ok_or_else(20904)` 保证非 NULL
+                        // （NULL 直接早退，**根本走不到**诊断）⇒ 那边只有
+                        // `POOL_EMPTY` / `WORKER_FULL` 两种取值。本函数则只有
+                        // **Time 模式**可能拿到 `None`（Count 模式同样已被
+                        // `ok_or_else` 挡掉）⇒ 有第三种成因，见下面 `max_batches`
+                        // 的三分支。
+                        //
+                        // ⚠️ 这条诊断**只在早退（没抢够）时执行**，每个 worker
                         // 至多多打 1 次查询；抢满 target 的 worker 一次都不多打。
                         let held = (&mut *conn)
                             .part_batch_count_held_by_worker(worker_id)
                             .await?;
-                        let max_held = max_batches.unwrap_or_default();
-                        stop_reason = Some(
-                            if held >= max_held as i64 {
+                        stop_reason = Some(match max_batches {
+                            // 2026-10-14 订正：Time 模式下 `max_held_batches` **允许
+                            // 未配置**，而 `take_one_from_pool` 的 `max_batches` CTE
+                            // 用 `COALESCE(max_held_batches, 0)` ⇒ 未配置即 cap 0 ⇒
+                            // `held < 0` 恒不通过 ⇒ 这个 worker 一个批次都抢不到，
+                            // **每一次** `None` 的真实成因都是「上限未配置」，
+                            // 既不是池空也不是「工人拿满了」。此前这里写
+                            // `max_batches.unwrap_or_default()`，把 `None` 折成 0，
+                            // `held >= 0` 恒真 ⇒ 无脑填 `WORKER_FULL` —— 与 refill
+                            // 路径在同样情形下抛 `20904` 的行为对不上。
+                            // 处置：填本域第三个字面量（真实成因），让运维一眼看出
+                            // 该去配 `t_work_type.max_held_batches`，而不是去查工人
+                            // 是不是满了。
+                            None => stopped_reason::MAX_BATCHES_NOT_SET.to_string(),
+                            Some(max_held) if held >= max_held as i64 => {
                                 stopped_reason::WORKER_FULL.to_string()
-                            } else {
-                                stopped_reason::POOL_EMPTY.to_string()
-                            },
-                        );
+                            }
+                            Some(_) => stopped_reason::POOL_EMPTY.to_string(),
+                        });
                         pool_empty_any = true;
                         break;
                     }

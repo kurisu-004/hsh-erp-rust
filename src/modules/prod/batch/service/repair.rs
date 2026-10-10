@@ -607,10 +607,22 @@ enum BatchListFilter<'a> {
     ///
     /// 额外排除 `status IN ('COMPLETED','CANCELLED')`：正常路径下终态批次不会
     /// 带 `is_repairing = true`（`complete_repair` / `repair_dispatch` /
-    /// `cancel_batch` 都清标记），但 part 级批量取消走的
-    /// `batch_status::apply_bulk_batch_status_change_for_part` **只写 status**，
-    /// 会留下一批 `CANCELLED + is_repairing=true` 的行。把它们排除掉，
-    /// 「待返修列表」就不会列出已作废的批次（否则用户点进去才发现货早没了）。
-    /// 该兜底在 bulk 写点补上标记写入后可去掉。
+    /// `cancel_batch` 都清标记，part 级批量取消
+    /// `batch_status::apply_bulk_batch_status_change_for_part` 自 2026-10-01
+    /// review 第 1 轮 m10 起也显式传 `is_repairing: Some(false)`）。
+    ///
+    /// ⚠️ **2026-10-14 订正：本条此前把那个 bulk 入口写成「只写 status / 不清标记、
+    /// 会留下一批 `CANCELLED + is_repairing=true` 的行」—— 该陈述已不成立**
+    /// （两个 bulk caller 都传 `Some(false)`，见
+    /// `batch/repo/sql.rs::cancel_all_active_batches_for_part` 与
+    /// `batch_ops.rs` 的同款登记）。⚠️ 那次改动给 bulk 入口追加的还有
+    /// **清 `location` / `current_holder_id`**（终态批次不在任何位置、不在任何人手上，
+    /// 见 `shared::batch::status::apply_bulk_batch_status_change_for_part` 的 doc
+    /// 与 `docs/api/batch.md` §6.1）。
+    ///
+    /// ⇒ 这条 `status IN (...)` 排除现在是**纯防御**（历史脏数据 / 未来新增写点
+    /// 忘了清标记时的兜底），**不是**「当前一定会发生」的补偿。仍保留：它零成本，
+    /// 且「待返修列表」不该列出已作废的批次——那个症状（用户点进去才发现货早没了）
+    /// 一旦发生极难排查。
     Repairing,
 }

@@ -313,21 +313,38 @@ t_assembly.status               ← 派生缓存
 `take_one_from_pool` 的 `held` CTE 补 `status = 'IN_PROCESS'`，口径见
 [`queue.md`](queue.md) §4.3 / §8.4。
 
-**读侧影响**：两处会有可见数字变化，方向都是**修正**，且**已由那条 migration 在存量上
-造成过同样的差异**（写侧修复只是不再生产该形态的行）：
+**读侧影响**：⚠️ 下面按「判据有没有 `status` 过滤」分两组。**B 组**（带 `status` 过滤）
+对本不变式**零影响** —— 终态行本来看不见；**A 组**（不带 `status` 过滤）会随清位置
+改变结果，**方向都是修正**，且**已由那条 migration 在存量上造成过同样的差异**（写侧修复
+只是不再生产该形态的行）。
 
-1. `part::service::phase1::events::location_tree` 的货架计数谓词是
-   `status NOT IN ('CANCELLED','COMPLETED')` —— **不含 `DELIVERED`**，故此前已交付
-   且停在品检架上的批次被算进「品检架有 N 件」，清位置后该计数下降；
-2. `wx::production` 的 `assigned_to`（`done` tab 展示 `DELIVERED` / `COMPLETED` 行）
-   由「工人名」变 `null`。
+⚠️ **清单不穷尽。** 它登记的是「逐个查过」的部分，**不是覆盖面证明** —— 新增同类读侧
+时必须自己判断「这个判据要不要带 `status`」，不要因为本节没列它就以为不受影响。
 
-⚠️ 其余按 `location` 过滤的读侧（队列板看板 / 候选池、外协看板、容量校验、
-`count_in_use_parts`、dashboard `in_process[]`、`prod::scan` 的 pickable / held）
-**全部带 `status` 过滤**，逐条审计见
+**A 组：不过滤 `status`、结果会变（4 处）**
+
+| # | 读侧 | 受影响的字段 / 端点 | 变化方向 |
+|---|---|---|---|
+| A-1 | `part::service::list_enrichment::enrich_part_list_with_location_and_holder` 的 min-progress 目标批次选择 —— 只排除 `CANCELLED` / `COMPLETED`，**不排除 `DELIVERED`** | `PartOut.location` / `holder_name`。⚠️ 只有**两条 list 路径**注入它：`GET /api/v2/parts` 与 `GET /api/v2/com/union-list` 的 PART 段（`GET /parts/{id}` 返的是 `PartDetailOut`；各 part 写端点的 `PartOut` 由 `From<TPart>` 恒填 `null` ⇒ 都不走这条派生） | 「只剩一条 `DELIVERED` 批次且原本停在品检架」的工单：由「品检架 + 架名」变 `null`。**修正** |
+| A-2 | `part::repo::sql::part_sql` 的 `list_with_filters` / `count_with_filters` 里 `locations` / `holder_ids` 两个 `EXISTS`（只有 `pb.deleted_at IS NULL`） | `GET /api/v2/parts?locations=…&holder_ids=…` 的**结果集**（items 与 total 各一份 SQL） | 命中集变小。**修正** |
+| A-3 | `com::union_list::repo::sql::list_union_all_with_filters` 的 `$7::text[]`（location）/ `$8::bigint[]`（holder）两个 `EXISTS`（同样只有软删闸门） | `GET /api/v2/com/union-list?locations=…&holder_ids=…` 的结果集 | 同 A-2。**修正** |
+| A-4 | `prod::batch::repo::queries::list_held_by_worker` | **无端点** —— 全仓**零调用方**（仅 trait 声明 + impl），死代码 | 不适用；接线前必须先补 `status='IN_PROCESS'`（见 [`queue.md`](queue.md) §4.3） |
+
+**另有 2 处方向性变化已由本轮前一版 doc 登记，谓词自带 `status NOT IN ('CANCELLED','COMPLETED')`（不含 `DELIVERED`）**：
+
+1. `part::service::phase1::events::location_tree` 的货架计数 —— 「品检架有 N 件」下降
+   （已交付的货不该占着品检架）；
+2. `wx::production` 的 `assigned_to`（`done` tab 展示 `DELIVERED` / `COMPLETED` 行）——
+   由「工人名」变 `null`（已交付批次不该显示「谁持有」）。
+
+**B 组：带 `status` 过滤、本不变式零影响** —— 队列板看板 / 候选池、外协看板两处、容量校验
+`count_held_by_worker`、`prod::worker::repo::sql::count_in_use_parts` 三个子查询、
+`iam::shelf::repo::sql::count_in_use_parts` 两个子查询、dashboard `in_process[]`、
+`prod::scan` 的 pickable / held。逐条审计见
 `src/modules/prod/batch/repo/sql.rs::mark_batch_delivered` 的 doc。
-`prod::batch::repo::queries::list_held_by_worker` 是唯一无 `status` 过滤的同类查询 ——
-全仓**零调用方**（仅 trait 声明 + impl），死代码。
+
+⚠️ **A-2 / A-3 本轮只登记、不改代码**：给筛选器补 `status` 过滤会改变端点语义
+（「任一批次停在某位置」变成「有活跃批次停在某位置」），属独立任务。
 
 ## 7. 移除记录
 

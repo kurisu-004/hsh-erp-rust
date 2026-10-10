@@ -845,10 +845,17 @@ impl PartBatchRepo {
     /// 同一次改动的另一半）**恰好清的就是这种行** ⇒ 不改本函数就是
     /// 「历史清了、以后继续产生」，两边永久不一致。
     ///
-    /// ### 读侧影响逐条审计（改前逐个查过，无一依赖）
+    /// ### 读侧影响逐条审计（改前逐个查过；**清单不穷尽**，勿当覆盖面证明）
+    ///
+    /// 按「判据有没有 `status` 过滤」分两组。**B 组**（带 `status` 过滤）的行，
+    /// 本写点产生的终态行本来看不见 ⇒ 零影响；**A 组**（不带 `status` 过滤）会被清位置
+    /// 改变结果。⚠️ 新增同类读侧时**必须自己判断**「这个判据要不要带 `status`」，
+    /// 不要因为「本 doc 没列它」就以为不受影响。
+    ///
+    /// **B 组 —— 带 `status` 过滤，本写点的终态行看不见（零影响）：**
     ///
     /// - 队列板看板 `board/repo.rs::SQL_HELD_BATCHES_BY_WORKERS`（`location='WORKER'`）
-    ///   —— 带 `status='IN_PROCESS'`，本写点的终态行本就看不见；
+    ///   —— 带 `status='IN_PROCESS'`；
     /// - 队列板候选池 `SQL_POOL_*`（`location='PRODUCTION_SHELF'`）—— 同带
     ///   `status='IN_PROCESS'`；
     /// - 外协看板 `outsource/board/repo.rs` 两处（`location='OUTSOURCE_COMPANY'`）
@@ -857,24 +864,49 @@ impl PartBatchRepo {
     ///   `status='IN_PROCESS'`；
     /// - `prod/worker/repo/sql.rs::count_in_use_parts`（工人停用前的引用计数）——
     ///   三个子查询分别硬编码 `IN_PROCESS` / `INSPECTION` / `RETURNED`；
+    /// - `iam/shelf/repo/sql.rs::count_in_use_parts`（货架不可软删守卫）—— 两个
+    ///   子查询分别硬编码 `IN_PROCESS` / `INSPECTION`；
     /// - `dashboard/repo/sql.rs` 的 `in_process[]` —— 带 `status='IN_PROCESS'`；
     /// - `prod/scan/listing/repo.rs` 的 pickable / held —— 均带
-    ///   `status='IN_PROCESS'`；
-    /// - `prod::batch::repo::queries::list_held_by_worker`（**唯一无 status 过滤**
-    ///   的同类查询）—— 全仓**零调用方**（仅 trait 声明 + impl），死代码。
+    ///   `status='IN_PROCESS'`。
     ///
-    /// ⇒ 两处会有可见数字变化的读侧，都**不是**新增差异，而是 migration 已经
+    /// **A 组 —— 不带 `status` 过滤，清位置会改结果（4 处）：**
+    ///
+    /// 1. `part::service::list_enrichment::enrich_part_list_with_location_and_holder`
+    ///    的 min-progress 目标批次选择：只排除 `CANCELLED` / `COMPLETED`，**不排除
+    ///    `DELIVERED`** ⇒ 「只剩一条 DELIVERED 批次」的工单仍以它为目标批次。受影响
+    ///    的是 `PartOut.location` / `holder_name`，且**只有两条 list 路径**注入它
+    ///    （`GET /parts` 与 `GET /com/union-list` 的 PART 段；`GET /parts/{id}` 返的是
+    ///    `PartDetailOut`，各 part 写端点的 `PartOut` 由 `From<TPart>` 恒填 `null`，
+    ///    都不走这条派生）。变化：原本停在品检架的 `DELIVERED` 行，由「品检架 + 架名」
+    ///    变 `null`。方向是修正。
+    /// 2. `part/repo/sql/part_sql.rs` 的 `list_with_filters` 与 `count_with_filters`
+    ///    里 `locations` / `holder_ids` 两个 `EXISTS`（只有 `pb.deleted_at IS NULL`）
+    ///    ⇒ `GET /parts?locations=…&holder_ids=…` 的结果集变小。方向是修正。
+    /// 3. `com/union_list/repo/sql.rs::list_union_all_with_filters` 的
+    ///    `$7::text[]`（location）/ `$8::bigint[]`（holder）两个 `EXISTS`
+    ///    （同样只有软删闸门）⇒ `GET /com/union-list` 的结果集变小。方向是修正。
+    /// 4. `prod::batch::repo::queries::list_held_by_worker` —— 全仓**零调用方**
+    ///    （仅 trait 声明 + impl），死代码；接线前必须先补 `status='IN_PROCESS'`
+    ///    （与本函数 doc 同款的自我标注见该函数 doc）。
+    ///
+    /// ⇒ 有可见数字变化的读侧共 3 处（A-1 + 下面两条），都**不是**新增差异，
+    /// 而是 migration 已经
     /// 引入过的同一处差异（本函数只是不再生产该形态的行）：
-    /// 1. `part::service::phase1::events::location_tree` 的货架计数谓词是
+    /// 1. A-1 —— `PartOut.location` / `holder_name` 变 `null`；
+    /// 2. `part::service::phase1::events::location_tree` 的货架计数谓词是
     ///    `status NOT IN ('CANCELLED','COMPLETED')` —— **不含 `DELIVERED`**，
     ///    故此前 `DELIVERED` 且停在品检架上的批次会被算进「品检架有 N 件」，
     ///    清位置后这个计数下降。方向是修正（已交付的货不该占着品检架），且
     ///    migration 已在存量上造成同样效果；
-    /// 2. `wx::production` 的 `assigned_to` 由
+    /// 3. `wx::production` 的 `assigned_to` 由
     ///    `LEFT JOIN t_worker w ON w.id = b.current_holder_id AND b.location='WORKER'`
     ///    派生 —— `done` tab 展示 `status IN ('DELIVERED','COMPLETED')` 的行，
     ///    清位置后这些行的 `assignedTo` 由「工人名」变 `null`。方向同样是修正
     ///    （已交付批次不该显示「谁持有」），且同样已由 migration 在存量上造成。
+    ///
+    /// ⚠️ **A-2 / A-3 本轮只登记、不改代码**：给筛选器补 `status` 过滤会改变端点语义
+    /// （「任一批次停在某位置」变成「有活跃批次停在某位置」），属独立任务。
     pub async fn mark_batch_delivered(
         conn: &mut PgConnection,
         batch_id: i64,

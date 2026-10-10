@@ -438,6 +438,21 @@ t_assembly.status               ← 派生缓存
   `clear_process_step_id` 显式表达。出池（召回 / 送检 / 外协收回 / 返修出池）
   必须同时清 `location` + `current_holder_id` + `current_process_id` +
   `current_process_step_id`，否则 UI 会显示「待投产的工单还压在生产架上」。
+- **终态批次一律不在任何位置、也不在任何人手上**（**2026-10-14 新增不变式**）：
+  `CANCELLED` / `COMPLETED` / `DELIVERED` 三个终态写点都必须把 `location` +
+  `current_holder_id` **一并清 NULL**（`clear_location` / `clear_holder_id`，或 bulk
+  入口与装配件级强推的 UPDATE 常量赋值）。此前三个写点都只改 `status`，留下
+  `location='WORKER' + current_holder_id=<某工人>` 的「幽灵行」—— 永久吃掉工人
+  `max_held_batches` 的额度且没有任何清理路径。存量由 append-only migration
+  `20261013000002_001_clear_terminal_batch_location` 回补（只清数据、不改判据），
+  两者互补、缺一不可。⚠️ **`mark_batch_status_only` 只对 `CANCELLED` 特判**、绝不
+  无条件清 —— 它还服务 `READY_TO_SHIP` / `IN_PROCESS` 两个**非终态**目标，那两处的
+  `location` 是有业务含义的落点。完整读侧影响清单（**含 4 处不过滤 `status` 的读侧**，
+  且清单不穷尽）见 [`docs/api/batch.md`](docs/api/batch.md) §6.1。
+- ⚠️ **`t_work_type.max_held_batches` 的 `NULL` = 「未配置」，不是「不限」**
+  （2026-10-14 订正列注释，migration `20261014000001_001_fix_max_held_batches_column_comment`）：
+  `move` / `refill` / 报工台 `pick-up` 返 `20904`，`take_one_from_pool` 的 CTE 按
+  **cap 0** 拦死。完整三路径对照见 [`docs/api/queue.md`](docs/api/queue.md) §4.7。
 - **终态序列号归档事件的 id 必须是真实雪花**（`StatusChange::event_id`，由 caller 从
   `SnowflakeIdGenerator` 透传）：`GET /parts/{id}/events` 是 `ORDER BY id DESC`，
   拿 `part_id` 之类的建单期 id 顶替会把归档事件排到时间线最底部，且二次进终态时
