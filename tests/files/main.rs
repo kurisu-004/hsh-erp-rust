@@ -15,6 +15,9 @@
 //!   `POST /api/v2/cnc-programs/pairs` 硬切到 `POST /api/v2/files/cnc/pairs`。
 //! - sts.rs         ← 2026-10-13 自 `tests/files_sts_tmp_keys.rs` 迁入。
 //!   `POST /api/v2/files/sts-tmp-keys` 的 BFF 转发用例（URL 未变）。
+//! - preview.rs     ← **2026-10-13 PR2 新建**：COS CI 图纸预览
+//!   `GET /api/v2/files/objects/{id}/preview`（惰性轮询、零后台任务；12 条场景 +
+//!   matchit 冲突实测 + `preview_urls` 纯函数护栏）。
 //!
 //! ⚠️ `sts.rs` 自建了一个最小 Router（`.nest("/files", files::router())` + iam nest），
 //! 2026-10-13 起它会顺带挂上本域新的对象 / CNC 路由，但该文件一条都不打 —— 保留原样。
@@ -31,5 +34,6 @@
 
 mod cnc;
 mod part_file;
+mod preview;
 mod sts;
 mod upload;

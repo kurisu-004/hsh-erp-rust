@@ -275,6 +275,11 @@ pub mod code {
     // 同步释放码段；与 Python 错误码表的"STS 失败"对齐责任由 STS 签发链路实端承担）。
     pub const BIZ_PART_FILE_TMP_OBJECT_MISSING: i32 = 21114; // tmp_key 在 COS 不存在 / size=0（前端直传未成功落地）
     pub const BIZ_PART_FILE_SIZE_MISMATCH: i32 = 21115; // tmp_key size 与 client 声明的 size_bytes 不一致
+    // 2026-10-13 PR2：`files::part_file::preview`（GET /files/objects/{id}/preview）三条。
+    // 槽位 21116 是 2026-09-28 随 STS 会话域下线释放的（原 BIZ_STS_ISSUE_FAILED），本轮复用。
+    pub const BIZ_PART_FILE_PREVIEW_UNSUPPORTED: i32 = 21116; // 该文件不做预览（kind 非图纸类 / file_type ≠ PDF）→ HTTP 400
+    pub const BIZ_PART_FILE_PREVIEW_FAILED: i32 = 21117; // CI job 终态 Failed → HTTP 502
+    pub const BIZ_PART_FILE_PREVIEW_FORWARD_FAILED: i32 = 21118; // 打 python / CI 转发失败（网络层 + NoopPyBackend 占位）→ HTTP 502
     // 21110 → 21407 的 deprecated 别名：旧调用点收敛后移除（详见模块 docstring）
     #[deprecated(
         since = "0.1.0",
@@ -596,10 +601,25 @@ fn status_from_code(c: i32) -> StatusCode {
             StatusCode::UNPROCESSABLE_ENTITY
         }
 
+        // ---- 2xxxx 业务码：400 (客户端错误，与 2xxxx 兜底同值，显式登记以钉住契约) ----
+        // 2026-10-13 PR2：`files::part_file::preview` 对「这份文件不做预览」
+        // （kind 非图纸类 DRAWING / ASSEMBLY_MASTER，或 file_type ≠ PDF）返 400。
+        // 与兜底分支同值，**显式列出**而非靠 `20000..30000` 兜住：这条是前端要按
+        // code 分流「不弹重试、提示换文件」的契约，不该随兜底规则漂移而无声改变。
+        c if c == code::BIZ_PART_FILE_PREVIEW_UNSUPPORTED => StatusCode::BAD_REQUEST,
+
         // ---- 2xxxx 业务码：502 (上游网关失败，nginx upstream 同形) ----
         // 2026-09-28 新增：rust → python 薄壳鉴权转发 STS 失败 = 502 BAD_GATEWAY。
         // 2026-10-03 新增：打印转发失败同为 502（与 nginx upstream fail 同语义）。
-        c if c == code::BIZ_STS_FORWARD_FAILED || c == code::BIZ_PRINT_FORWARD_FAILED => {
+        // 2026-10-13 PR2 新增：CI 预览 job 终态 Failed（21117）/ 打 python 的 CI 转发
+        // 失败（21118）同为 502 —— 两者都是「上游（python / CI）没能把活干完」，
+        // 与 STS / 打印转发同族。BIZ_PART_FILE_PREVIEW_UNSUPPORTED（21116）**不**在
+        // 这里：那是「这个文件压根不该做预览」的客户端错误，走下方 2xxxx 兜底 400。
+        c if c == code::BIZ_STS_FORWARD_FAILED
+            || c == code::BIZ_PRINT_FORWARD_FAILED
+            || c == code::BIZ_PART_FILE_PREVIEW_FAILED
+            || c == code::BIZ_PART_FILE_PREVIEW_FORWARD_FAILED =>
+        {
             StatusCode::BAD_GATEWAY
         }
 
@@ -897,6 +917,19 @@ mod tests {
             "BIZ_PART_FILE_SIZE_MISMATCH",
         ),
         // 2026-09-28 删除：BIZ_STS_ISSUE_FAILED 常量项（21116 码段释放）。
+        // 2026-10-13 PR2：21116 由 `files::part_file::preview` 复用（预览不支持的文件类型）。
+        (
+            code::BIZ_PART_FILE_PREVIEW_UNSUPPORTED,
+            "BIZ_PART_FILE_PREVIEW_UNSUPPORTED",
+        ),
+        (
+            code::BIZ_PART_FILE_PREVIEW_FAILED,
+            "BIZ_PART_FILE_PREVIEW_FAILED",
+        ),
+        (
+            code::BIZ_PART_FILE_PREVIEW_FORWARD_FAILED,
+            "BIZ_PART_FILE_PREVIEW_FORWARD_FAILED",
+        ),
         // 212xx
         (
             code::BIZ_OUTSOURCE_COMPANY_NOT_FOUND,
@@ -1228,6 +1261,10 @@ mod tests {
         // 2026-09-16 M2-A：前端直传 COS + STS 错误码数值契约
         assert_eq!(code::BIZ_PART_FILE_TMP_OBJECT_MISSING, 21114);
         assert_eq!(code::BIZ_PART_FILE_SIZE_MISMATCH, 21115);
+        // 2026-10-13 PR2：COS CI 预览三码（21116 是 2026-09-28 释放的 STS 槽位）
+        assert_eq!(code::BIZ_PART_FILE_PREVIEW_UNSUPPORTED, 21116);
+        assert_eq!(code::BIZ_PART_FILE_PREVIEW_FAILED, 21117);
+        assert_eq!(code::BIZ_PART_FILE_PREVIEW_FORWARD_FAILED, 21118);
         assert_eq!(code::BIZ_DELIVERY_PARTS_MULTIPLE_CUSTOMERS, 21407);
 
         // 212xx
@@ -1765,6 +1802,24 @@ mod tests {
             code::BIZ_PRINT_FORWARD_FAILED,
             StatusCode::BAD_GATEWAY,
             "BIZ_PRINT_FORWARD_FAILED",
+        ),
+        // 2026-10-13 PR2：CI 预览不支持的文件类型 → 400（显式登记，不靠 2xxxx 兜底）
+        (
+            code::BIZ_PART_FILE_PREVIEW_UNSUPPORTED,
+            StatusCode::BAD_REQUEST,
+            "BIZ_PART_FILE_PREVIEW_UNSUPPORTED",
+        ),
+        // 2026-10-13 PR2：CI job 终态 Failed → 502（与 STS / 打印转发同族）
+        (
+            code::BIZ_PART_FILE_PREVIEW_FAILED,
+            StatusCode::BAD_GATEWAY,
+            "BIZ_PART_FILE_PREVIEW_FAILED",
+        ),
+        // 2026-10-13 PR2：打 python 的 CI 转发失败 → 502
+        (
+            code::BIZ_PART_FILE_PREVIEW_FORWARD_FAILED,
+            StatusCode::BAD_GATEWAY,
+            "BIZ_PART_FILE_PREVIEW_FORWARD_FAILED",
         ),
     ];
 

@@ -3,7 +3,7 @@
 //! 与 `iam`（含嵌套子模块 `iam::shelf`）、`com`、`prod` 同一形态：一个容器域，
 //! 底下挂若干嵌套子模块，各自带自己的 repo / service / 路由表。
 //!
-//! ## 端点表（8 条，全部挂在 `/api/v2/files/*`）
+//! ## 端点表（9 条，全部挂在 `/api/v2/files/*`）
 //!
 //! | 方法 | URL | 角色 | 归属子模块 |
 //! |---|---|---|---|
@@ -14,7 +14,14 @@
 //! | `GET` | `/api/v2/files/objects/{id}/url` | M / C / I / CNC | `part_file` |
 //! | `GET` | `/api/v2/files/objects/{id}/content` | M / C / I / CNC / **SHELF** | `part_file` |
 //! | `POST` | `/api/v2/files/objects/{id}/delete` | 按 kind 派生 | `part_file` |
+//! | `GET` | `/api/v2/files/objects/{id}/preview` | M / C / I / CNC / **SHELF** | `part_file::preview`（**2026-10-13 PR2 新增**，COS CI 预览） |
 //! | `POST` | `/api/v2/files/cnc/pairs` | M / CNC | `part_file::cnc` |
+//!
+//! ⚠️ **`/preview` 与 `/url` 的角色集合看似矛盾，实为有意**：`/url` 回的是 COS 预签
+//! 直链（1 小时有效），**刻意排除** SHELF；`/preview` 回的是 `previews/` 前缀下的
+//! **永久公开读**直链，**放开** SHELF。后者比前者**更宽**却仍选择放开，是用户拍板的
+//! 安全取舍反转（目的是让报工台工控机看图纸预览），完整理由 / 风险 / 补偿见
+//! `part_file/preview/mod.rs` 的「安全取舍反转」一节。**不要**「顺手把两者对齐」。
 //!
 //! ### ⚠️ 列表端点**不带尾斜杠**（`GET /api/v2/files/objects`，不是 `.../objects/`）
 //!

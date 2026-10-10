@@ -226,6 +226,9 @@ pub fn test_app_config() -> Arc<AppConfig> {
             presign_expire_seconds: 0,
             max_file_size: 0,
             tmp_prefix: String::new(),
+            // 2026-10-13 PR2：CI 预览图 URL 拼接两件套（iam 单测不涉及，取字面量即可）
+            preview_prefix: String::new(),
+            preview_base_url: String::new(),
         },
         snowflake: crate::infra::config::SnowflakeConfig {
             instance: 1,

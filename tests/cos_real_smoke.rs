@@ -52,6 +52,9 @@ fn build_cos_config() -> CosConfig {
         presign_expire_seconds: 900,
         max_file_size: 100 * 1024 * 1024,
         tmp_prefix: "tmp/".into(),
+        // 2026-10-13 PR2：CI 预览图 URL 拼接两件套（本 binary 不打预览端点，取字面量即可）
+        preview_prefix: "previews".into(),
+        preview_base_url: "https://test-bucket.cos.ap-shanghai.myqcloud.com".into(),
         backend: CosBackend::OpenDal,
     }
 }

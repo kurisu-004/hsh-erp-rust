@@ -125,7 +125,8 @@
 //! G_CODE / SETUP_SHEET 走 CNC 配对端点）时**不会**自动放行 —— 必须先在这里显式
 //! 声明它挂哪种 owner。
 //!
-//! ## 角色矩阵（6 条存活端点；2026-10-10 新增 `Role::ShelfAccount` 的两条只读端点）
+//! ## 角色矩阵（7 条存活端点；2026-10-10 新增 `Role::ShelfAccount` 的两条只读端点，
+//! 2026-10-13 PR2 新增预览端点）
 //!
 //! 报工台（前端路由 `/scan/*`）的路由守卫就是 `SHELF_ACCOUNT` —— 车间工控机用的
 //! 就是这个角色账号；它的图纸预览打的是本子模块的**列表** `GET /api/v2/files/objects`
@@ -139,6 +140,7 @@
 //! | `GET /files/objects`（列表） | M / C / I / CNC / **SHELF** | 2026-10-10 放开 SHELF |
 //! | `GET /files/objects/{id}/content` | M / C / I / CNC / **SHELF** | 2026-10-10 放开 SHELF |
 //! | `GET /files/objects/{id}/url` | M / C / I / CNC | **刻意不含 SHELF**，见下 |
+//! | `GET /files/objects/{id}/preview` | M / C / I / CNC / **SHELF** | 2026-10-13 PR2 新增；⚠️ **含 SHELF 是对上一行的有意反转**，见下 |
 //! | `POST /files/objects/{id}/delete` | 按 kind 派生（图纸类 + `ASSEMBLY_MASTER` M / C，G_CODE M / CNC） | `ASSEMBLY_MASTER` 是 2026-10-13 review 第 1 轮 MINOR-6 补进分派的 |
 //!
 //! ### ⚠️ 上传四合一的**唯一一处权限面放大**（2026-10-13 review 第 1 轮存疑点 4 订正）
@@ -181,6 +183,31 @@
 //! 重新过一次 RBAC。工控机预览需要的是「看得到图纸字节」，content 已足够 ⇒ 放开
 //! content 即达成目标，`/url` 无需、也不应一并放开。
 //!
+//! ### ⚠️⚠️ 为什么 `/preview` **反而**放开 SHELF（对上一节的**有意反转**，2026-10-13 PR2）
+//!
+//! 上一节论证「`/url` 不放开 SHELF」时，理由是「预签直链拿到就能脱离本后端直接 GET
+//! 并外发」。新增的 `GET /objects/{id}/preview` 返回的是 COS `previews/` 前缀下的
+//! **永久不过期 public-read 直链** —— **比 1 小时预签窗口更宽**（预签到期即失效，
+//! 公开读永不过期）。按上一节的同款论证，它本该**更**不该放开。
+//!
+//! **本端点仍然放开 SHELF_ACCOUNT**，因为：
+//!
+//! 1. 报工台（前端路由 `/scan/*` 的守卫就是 `SHELF_ACCOUNT`）的工控机**必须**能看到
+//!    图纸 —— 这是刚需，不是顺手放开的权限面；
+//! 2. 预览图是**逐页 JPG**，不经后端代理、也不受源 PDF 的任何权限约束，
+//!    但它承载的信息量与源 PDF 相同 ⇒ 放开它**没有扩大「谁能看图纸」这个集合**
+//!    （`GET /objects` 列表与 `GET /objects/{id}/content` 早就放开了）；
+//! 3. 补偿措施齐备：路径里**绝不带文件名**（文件名=图号、可枚举）、seed 是内容哈希、
+//!    `previews/` 的 ACL 是**单独一条**、关掉它即断链而不影响源 PDF。
+//!
+//! ⚠️ **本段是留档，不是「设计如此」的辩解**：后人若要收紧，正确做法是**连同
+//! `content` / 列表两条一起**重新评估（否则工控机立刻失去预览能力），
+//! 而**不是**只把 `/preview` 关掉 —— 那只会让前端拿到 403 而不是更安全。
+//!
+//! **风险与补偿的完整表格、CDN 契约、以及「无法按零件关闭预览」这条反向操作风险**
+//! 见 `preview/mod.rs` 的「安全取舍反转」一节 —— 本段只钉住「这是有意的、与 `/url`
+//! 的差异是刻意的」这个事实。
+//!
 //! ### ⚠️ 已知安全面（**产品已拍板的取舍，不是待办**）
 //!
 //! `t_part_file` 的 owner 是**多态**的（`owner_kind ∈ {PART, ASSEMBLY}` +
@@ -207,11 +234,13 @@
 //! | 5 | **`POST /parts/batch` 的 bindings 分支仍写死 300MB 上限**（`part/service/batch.rs::prepare_binding_head_copy`）：与本轮修掉的 `bind_uploaded_file` 硬编码同源，但那是 part 域的端点、本 PR 未触碰 | **未修**（要修需把 config 穿进 part 域 batch service，属另一次改动；此处登记以免后人以为「全仓都已读 `COS_MAX_FILE_SIZE`」） |
 //! | 6 | **`POST /files/objects/confirm` 的 size 上限由硬编码 300MB 改为读 `COS_MAX_FILE_SIZE`**（`.env.example` = 100MB ⇒ 按样例配置部署时**上限下降**）。副作用：`validate::check_file_size` 排在 step 2，**早于** step 3 的 `cos.head_object` 与 step 6 的 best-effort `delete_object` spawn ⇒ 100–300MB 区间的 STS 直传会在 confirm 被 21103 拒、**tmp 对象留在桶里**，只能等 COS lifecycle 回收 | **有意保留 + 已登记**（与 `POST /files/objects` 同读一份配置是本轮 MAJOR-1 的目的；review 第 2 轮 MINOR-C 补登记。⚠️ 降级/上限调整时注意这条副作用，且它与第 5 条**互不相干**：第 5 条是 part 域另一条写路径，既不读配置也不做 owner_kind 配对） |
 //! | 7 | **`GET /files/objects` 的 `owner_kind` 过滤是空操作，且响应里的 `owner_kind` 从请求参数回显**（`service::render_out(&row, owner_kind)` 取形参、不取行上任何列 —— schema 压根没有 owner 类型列） | **有意保留 + 已登记**（读侧不构成隔离，见 `repo/sql.rs::list_with_filters` / `list_by_owner` 顶部注释；review 第 2 轮 MINOR-C 补登记。⚠️ **本条最易误导后人**：**写侧本轮新加了 `owner_kind` × `kind` 强制配对**（20104）而**读侧全无对应隔离** ⇒ 拿 `owner_kind=PART` 去查装配件 owner id 仍会返回 ASSEMBLY_MASTER 行，不要据响应里的 `owner_kind` 认定这些行真属该类型） |
+//! | 8 | **`GET /files/objects/{id}/preview` 返回永久 public-read 直链并放开 `SHELF_ACCOUNT`**：比 `/url` 的 1 小时预签窗口更宽、且**无过期、无撤销**（除改 `previews/` 的 COS ACL），也无法按零件关闭 | **有意保留 + 已登记**（用户拍板选项 A；取舍全文与补偿表见 `preview/mod.rs` 的「安全取舍反转」一节。⚠️ 它与第 6 行「`owner_kind` 过滤是空操作」同源：读侧仍无 owner 级范围判定） |
 pub mod cnc;
 pub mod dto;
 pub mod handler;
 pub mod model;
 pub mod policy;
+pub mod preview;
 pub mod repo;
 pub mod service;
 pub mod vo;

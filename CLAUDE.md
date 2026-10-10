@@ -194,10 +194,17 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 | 子模块 | 端点数 | URL 前缀 | 表 | 说明 |
 |---|---:|---|---|---|
 | （容器自带） | 1 | `/api/v2/files/sts-tmp-keys` | 无（薄壳鉴权转发到 python） | 2026-09-28 新增，逐字未动 |
-| `files::part_file` | 6 | `/api/v2/files/objects` | `t_part_file`（自有） | `POST /objects`（**上传四合一**）/ `GET /objects`（列表）/ `POST /objects/confirm`（STS 直传回执）/ `GET /objects/{id}/url` / `GET /objects/{id}/content` / `POST /objects/{id}/delete` |
+| `files::part_file` | 7 | `/api/v2/files/objects` | `t_part_file`（自有） | `POST /objects`（**上传四合一**）/ `GET /objects`（列表）/ `POST /objects/confirm`（STS 直传回执）/ `GET /objects/{id}/url` / `GET /objects/{id}/content` / `POST /objects/{id}/delete` / `GET /objects/{id}/preview`（**2026-10-13 PR2**：COS CI 预览，惰性轮询零后台任务） |
 | `files::part_file::cnc` | 1 | `/api/v2/files/cnc` | 复用 `t_part_file`（无 repo 层） | `POST /cnc/pairs`：G_CODE + 工艺卡配对写入 |
 
-> 端点求和 = 1 + 6 + 1 = **8**，与 `src/modules/files/mod.rs` 模块 doc 的端点表恒等。计数口径同 iam 表。
+> 端点求和 = 1 + 7 + 1 = **9**，与 `src/modules/files/mod.rs` 模块 doc 的端点表恒等。计数口径同 iam 表。
+>
+> **2026-10-13 PR2 新增 `files::part_file::preview`**（`GET /objects/{id}/preview`，1 条）：COS CI 逐页光栅化预览。三条必须知道的事实：
+> ① **惰性轮询、零后台任务、零新增 cron** —— 状态推进完全由前端下一次调用驱动（`PENDING & 到期 → describe`），代价是「没人调就没人推进」；
+> ② **内容寻址 + 独立表** —— `t_file_preview` 按 `preview_seed`（内容哈希）去重而非按 `t_part_file` 行去重，因为 CI **按页计费**，同一份 PDF 的 N 份拷贝只该跑 1 次 job；`uk_t_file_preview_seed` 同时是**并发不重复提交**的唯一机制（应用层「先查再插」有 TOCTOU）；
+> ③ ⚠️ **安全取舍反转**：本端点**放开 `SHELF_ACCOUNT`** 且返回**永久 public-read 直链**，比 `/url` 的 1 小时预签窗口**更宽** —— 这是用户拍板的选项 A，取舍全文 / 风险补偿见 `src/modules/files/part_file/preview/mod.rs` 的「安全取舍反转」一节。**不要**「顺手把 `/preview` 与 `/url` 的角色集合对齐」。
+>
+> ⚠️ **`preview_seed char(64)` 有空白填充陷阱**：PG 的 `bpchar` 会把 32 位种子右侧填空格到 64，读出来带 32 个尾随空格。`WHERE preview_seed = $1` 不受影响（bpchar 比较忽略尾随空格），但**拼进 URL 就是 404**。故 `PreviewRepo::find_by_seed` 是本表唯一的读出口并在此统一 `trim_end()` —— 新增读路径必须走它，不要自己写 SQL 读该列。
 >
 > **2026-10-13 两批硬切**（均**无 alias**、旧前缀一律 404）：
 > - PR1a：`part_file` / `cnc_program` 两个独立域收编成 `files` 容器域及其嵌套子模块。URL `/api/v2/part-files/*` → `/api/v2/files/objects/*`、`/api/v2/cnc-programs/*` → `/api/v2/files/cnc/*`；同批删除 12 条零调用方端点（part_file 8 = 7 条零件维度嵌套 + 同批删除的 `POST /part-files/` 上传〔PR1b 又复活并入四合一〕；cnc 4 = 3 条 alias + 1 条配对列表）与两张死表（`t_cnc_program` / `t_drawing_file`）。⚠️ 计数别与 `files/part_file/handler.rs` 移除记录表的 **7** 条混：那张表只列嵌套的 7 条，不含已复活的 `POST /part-files/`（review 第 1 轮 NIT-9）。

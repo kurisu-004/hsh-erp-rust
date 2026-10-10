@@ -11,10 +11,29 @@
 //! | `POST /api/v2/files/sts-tmp-keys` | `POST /api/v1/files/sts-tmp-keys` | `BIZ_STS_FORWARD_FAILED` = 20406 |
 //! | `GET /api/v2/parts/{id}/print-drawing` | `GET /api/v1/parts/{id}/print` | `BIZ_PRINT_FORWARD_FAILED` = 20407 |
 //! | `POST /api/v2/parts/print-drawing-batch` | `POST /api/v1/parts/print-batch` | 同上 |
+//! | （无对外端点，由 `files::part_file::preview` 内部调用）<br>`forward_ci_submit` | `POST /api/v1/files/ci-preview-jobs` | `BIZ_PART_FILE_PREVIEW_FORWARD_FAILED` = 21118 |
+//! | （同上）`forward_ci_describe` | `GET /api/v1/files/ci-preview-jobs/{job_id}` | 同上 |
 //!
 //! v2 → v1 的 URL 拼装**只存在于 [`HttpPyBackend`] 的 impl 里**（每方法 1 行
 //! `format!`）；零件端点与 python 端路径不同名（`print-drawing` → `print`、
 //! `print-drawing-batch` → `print-batch`），映射差异集中在那两行，改名只动那里。
+//!
+//! ## 2026-10-13 PR2：CI 预览两个方法（`files::part_file::preview`）
+//!
+//! CI 渲染跑在 python 侧（腾讯云 CI 按**页**计费，且是异步任务）。rust 侧的
+//! `preview` 子模块只做「惰性提交 + 惰性轮询」，两个动作各对应一个转发方法。
+//!
+//! ⚠️ **这两个方法没有对应的 v2 端点** —— 调用方是 `PreviewService`（内部服务层），
+//! 不是 handler。列入本表只为让「rust → python 的全部出口」在一处可查。
+//!
+//! ⚠️ **走默认 10s 档（`self.timeout`），刻意不用 `print_timeout`**：CI 提交 /
+//! 查询都是**单次快 HTTP**（提交返回 job id、查询返回状态快照，都不等待渲染完成）。
+//! 渲染是异步的、完成信号靠轮询拿 —— 那是 `preview` 端点每次调用至多几十毫秒的
+//! 事，给它 600s 档会让「python 卡住」表现成「rust 挂 10 分钟」。
+//!
+//! ⚠️ **python 侧这两个端点在本仓之外**：截至 2026-10-13，`backend-python/`
+//! 尚无 `ci-preview-jobs` 实现。未部署 python 端时 `NoopPyBackend` 分支直接返
+//! 21118（HTTP 502），不会静默成功。
 //!
 //! ## 2026-10-08：送货单打印转发整体下线
 //!
@@ -99,6 +118,39 @@ pub trait PyBackendClient: Send + Sync {
     async fn forward_part_print_pdf_batch(
         &self,
         body: Value,
+        headers: HeaderMap,
+    ) -> Result<PyBackendResponse, AppError>;
+
+    /// 2026-10-13 PR2 新增：提交一个 CI 预览渲染任务
+    /// → python `POST /api/v1/files/ci-preview-jobs`。
+    ///
+    /// - `body`：`{"src_object_key": "...", "preview_prefix": "...", "preview_seed": "..."}`
+    ///   —— 三个字段由 `PreviewService` 组装，**`preview_seed` 恒为纯哈希**
+    ///   （见 `files::part_file::preview` 的安全条款：路径里绝不能带文件名）。
+    /// - `headers`：与 STS / 打印同款，鉴权头由 impl 过滤后注入
+    ///   `X-Forwarded-User-Id`（调用方 [`crate::modules::files::part_file::preview`]
+    ///   的 handler 负责注入）。
+    ///
+    /// 成功时响应体是 python 信封，`data.job_id` 为 CI job 标识；
+    /// 网络层失败（超时 / 连接拒 / 读 body 失败）→ 502 + 21118。
+    async fn forward_ci_submit(
+        &self,
+        body: Value,
+        headers: HeaderMap,
+    ) -> Result<PyBackendResponse, AppError>;
+
+    /// 2026-10-13 PR2 新增：查询一个 CI 预览任务的当前状态
+    /// → python `GET /api/v1/files/ci-preview-jobs/{job_id}`。
+    ///
+    /// - `job_id`：`mark_submitted` 落库的那个标识，原样拼进 URL 段。
+    ///
+    /// 成功时响应体是 python 信封，`data` 里含 `status`（`Success` / `Failed` /
+    /// 进行中若干形态）、`total_page_count`、`message`（失败原因）。
+    /// 网络层失败 → 502 + 21118（与 submit 共用错误码：两者都是「打 python 失败」，
+    /// 细分对排查无帮助，合并可让前端只需处理一个「上游不可用」）。
+    async fn forward_ci_describe(
+        &self,
+        job_id: &str,
         headers: HeaderMap,
     ) -> Result<PyBackendResponse, AppError>;
 }
@@ -381,6 +433,44 @@ impl PyBackendClient for HttpPyBackend {
         )
         .await
     }
+
+    // 2026-10-13 PR2 新增：CI 预览两方法。走默认 `self.timeout`（10s 档），
+    // 刻意不用 print_timeout —— 提交 / 查询都是单次快 HTTP，渲染完成信号靠轮询拿。
+    async fn forward_ci_submit(
+        &self,
+        body: Value,
+        headers: HeaderMap,
+    ) -> Result<PyBackendResponse, AppError> {
+        let url = format!("{}/api/v1/files/ci-preview-jobs", self.base_url);
+        self.send(
+            reqwest::Method::POST,
+            url,
+            Some(body),
+            None,
+            headers,
+            self.timeout,
+            code::BIZ_PART_FILE_PREVIEW_FORWARD_FAILED,
+        )
+        .await
+    }
+
+    async fn forward_ci_describe(
+        &self,
+        job_id: &str,
+        headers: HeaderMap,
+    ) -> Result<PyBackendResponse, AppError> {
+        let url = format!("{}/api/v1/files/ci-preview-jobs/{job_id}", self.base_url);
+        self.send(
+            reqwest::Method::GET,
+            url,
+            None,
+            None,
+            headers,
+            self.timeout,
+            code::BIZ_PART_FILE_PREVIEW_FORWARD_FAILED,
+        )
+        .await
+    }
 }
 
 /// `PYTHON_BACKEND_ENABLED=false` 时的静默占位实现（与 `NoopCos` 同形）。
@@ -433,6 +523,30 @@ impl PyBackendClient for NoopPyBackend {
         warn!("[NoopPyBackend] 跳过零件图纸批量打印转发（PYTHON_BACKEND_ENABLED=false）");
         Err(AppError::biz(
             code::BIZ_PRINT_FORWARD_FAILED,
+            "PYTHON_BACKEND_BASE_URL 未配置（NoopPyBackend 占位）",
+        ))
+    }
+
+    async fn forward_ci_submit(
+        &self,
+        _body: Value,
+        _headers: HeaderMap,
+    ) -> Result<PyBackendResponse, AppError> {
+        warn!("[NoopPyBackend] 跳过 CI 预览任务提交转发（PYTHON_BACKEND_ENABLED=false）");
+        Err(AppError::biz(
+            code::BIZ_PART_FILE_PREVIEW_FORWARD_FAILED,
+            "PYTHON_BACKEND_BASE_URL 未配置（NoopPyBackend 占位）",
+        ))
+    }
+
+    async fn forward_ci_describe(
+        &self,
+        _job_id: &str,
+        _headers: HeaderMap,
+    ) -> Result<PyBackendResponse, AppError> {
+        warn!("[NoopPyBackend] 跳过 CI 预览任务查询转发（PYTHON_BACKEND_ENABLED=false）");
+        Err(AppError::biz(
+            code::BIZ_PART_FILE_PREVIEW_FORWARD_FAILED,
             "PYTHON_BACKEND_BASE_URL 未配置（NoopPyBackend 占位）",
         ))
     }

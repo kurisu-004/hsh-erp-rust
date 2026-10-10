@@ -106,6 +106,10 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
             presign_expire_seconds: 3600,
             max_file_size: 314_572_800,
             tmp_prefix: "tmp/".into(),
+            // 2026-10-13 PR2：CI 预览图 URL 拼接两件套。测试值取固定字面量，
+            // 让 `tests/files/preview.rs` 能逐条断言拼出来的 URL。
+            preview_prefix: "previews".into(),
+            preview_base_url: "https://test-bucket.cos.ap-shanghai.myqcloud.com".into(),
         },
         snowflake: SnowflakeConfig {
             epoch_ms: 1_577_836_800_000,
@@ -292,6 +296,10 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
             presign_expire_seconds: 3600,
             max_file_size: 314_572_800,
             tmp_prefix: "tmp/".into(),
+            // 2026-10-13 PR2：CI 预览图 URL 拼接两件套。测试值取固定字面量，
+            // 让 `tests/files/preview.rs` 能逐条断言拼出来的 URL。
+            preview_prefix: "previews".into(),
+            preview_base_url: "https://test-bucket.cos.ap-shanghai.myqcloud.com".into(),
         },
         snowflake: SnowflakeConfig {
             epoch_ms: 1_577_836_800_000,
@@ -445,6 +453,10 @@ pub async fn test_state_with_cos(
             presign_expire_seconds: 3600,
             max_file_size: 314_572_800,
             tmp_prefix: "tmp/".into(),
+            // 2026-10-13 PR2：CI 预览图 URL 拼接两件套。测试值取固定字面量，
+            // 让 `tests/files/preview.rs` 能逐条断言拼出来的 URL。
+            preview_prefix: "previews".into(),
+            preview_base_url: "https://test-bucket.cos.ap-shanghai.myqcloud.com".into(),
         },
         snowflake: SnowflakeConfig {
             epoch_ms: 1_577_836_800_000,

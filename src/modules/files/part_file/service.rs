@@ -319,6 +319,30 @@ impl PartFileService {
         Ok(PartFileListOut { items, total })
     }
 
+    /// 取单条 `t_part_file` 行（软删闸门），供**域内其它只读子模块**复用。
+    ///
+    /// 2026-10-13 PR2 新增，为 `files::part_file::preview` 而加：预览的 seed 推导
+    /// 需要 `content_sha256` / `object_key` / `kind` / `file_type` 四个字段，而
+    /// 现有读端点返回的都是**出参 VO**（`PartFileOut` / `PartFileWithUrlOut`），
+    /// 形态对不上。
+    ///
+    /// ⚠️ **刻意不收 `CurrentUser`、也不做角色判定**：本方法只是「取一行」，权限由
+    /// 调用方（预览 service）自己的 `require_any_role` 承担。在这里判会把预览的
+    /// 角色矩阵（5 角色，含与 `/url` 相反的 `ShelfAccount`）和 part_file 的其它
+    /// 端点搅在一起。
+    pub async fn get_file_row<R: PartFileRepoTrait>(
+        &self,
+        mut repo: R,
+        file_id: i64,
+    ) -> Result<TPartFile, AppError> {
+        repo.get_by_id(file_id, false).await?.ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_PART_FILE_NOT_FOUND,
+                format!("part_file {file_id} 不存在"),
+            )
+        })
+    }
+
     /// 单条详情 + 预签下载 URL。
     ///
     /// 2026-09-29 扁平化：DB 历史行 object_key 仍是五段（legacy），但 COS 桶内

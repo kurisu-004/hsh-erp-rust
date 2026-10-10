@@ -249,6 +249,30 @@ pub struct CosConfig {
     ///
     /// 可通过 `COS_TMP_PREFIX` env 覆盖，缺省 `tmp/`。
     pub tmp_prefix: String,
+    /// COS 桶内 **CI 预览图** 前缀（env `COS_PREVIEW_PREFIX`，代码缺省 `previews`）。
+    ///
+    /// 2026-10-13 PR2 新增。只被 `files::part_file::preview` 的 URL 拼接读一次
+    /// （`PreviewService::preview_urls`），是**读端**配置 —— rust 侧不往这个前缀写
+    /// 任何东西，JPG 由 python 侧的 CI 任务产出。
+    ///
+    /// ⚠️ **该前缀必须是 public-read**，否则返回给前端的是「永久不过期的公开读
+    /// 直链」这个安全取舍就落不了地（取取舍的理由与补偿见
+    /// `src/modules/files/part_file/preview/mod.rs` 的模块 doc）。
+    ///
+    /// ⚠️ **绝不能在这里拼文件名**：路径成分只有 `<preview_prefix>/<preview_seed>/p{n}.jpg`，
+    /// 其中 `preview_seed` 是纯哈希。`t_part_file.object_key` 的 `{sha16}_{原文件名}`
+    /// 里那半截文件名（图号）**可枚举**，public-read 前缀下拼进去等于公开图号清单。
+    pub preview_prefix: String,
+    /// CI 预览图的对外站点根（env `COS_PREVIEW_BASE_URL`）。
+    ///
+    /// 2026-10-13 PR2 新增。**缺省回退到 COS 源站域名**
+    /// `"{scheme}://{bucket}.cos.{region}.myqcloud.com"`（照本结构体已有的
+    /// `scheme` / `bucket` / `region` 三字段拼），所以不配也能跑 —— 配它只是为了
+    /// 允许前面挂 CDN 或换加速域名。
+    ///
+    /// ⚠️ 回退值**不读** `endpoint` 字段：那个字段是 OpenDAL 的 S3 endpoint
+    /// （可能带私有化路径），与浏览器直链的站点根不是一回事。
+    pub preview_base_url: String,
 }
 
 /// 雪花 ID 配置（位布局对齐 myERP Python `snowflake-id` 包）：
@@ -537,16 +561,28 @@ impl AppConfig {
                 } else {
                     (String::new(), String::new())
                 };
+                // 2026-10-13 PR2：预览站点根的**代码回退值**。先算出来再进结构体
+                // 字面量，让 `preview_base_url` 永远是可直接拼 URL 的站点根
+                // （不含尾斜杠），下游 `PreviewService::preview_urls` 无需再判空。
+                let region = env_or("COS_REGION", "ap-shanghai");
+                let bucket = env_required("COS_BUCKET")?;
+                let scheme = env_or("COS_SCHEME", "https");
+                let preview_base_url = env_or(
+                    "COS_PREVIEW_BASE_URL",
+                    // ⚠️ 刻意**不**用 `COS_ENDPOINT`：那是 OpenDAL 的 S3 endpoint
+                    // （可能带私有化路径），浏览器直链的站点根与之不是一回事。
+                    &format!("{scheme}://{bucket}.cos.{region}.myqcloud.com"),
+                );
                 CosConfig {
                     backend,
                     enabled: cos_enabled,
-                    region: env_or("COS_REGION", "ap-shanghai"),
-                    bucket: env_required("COS_BUCKET")?,
+                    region,
+                    bucket,
                     secret_id,
                     secret_key,
                     app_id: env_or("COS_APP_ID", ""),
                     endpoint: env_or("COS_ENDPOINT", ""),
-                    scheme: env_or("COS_SCHEME", "https"),
+                    scheme,
                     // 2026-10-13：缺省值与 `.env.example` / compose 的
                     // `COS_UPLOAD_PREFIX` 同步为 `obj/`（此前是 `uploads`，与
                     // `.env` 的 `drawings/` 又不同 —— 前缀三套并存正是本轮要收敛的）。
@@ -554,8 +590,11 @@ impl AppConfig {
                     presign_expire_seconds: env_parse("COS_PRESIGN_EXPIRE", 3600)?,
                     max_file_size: env_parse("COS_MAX_FILE_SIZE", 300 * 1024 * 1024)?,
                     // 2026-09-20 迁移：删 `sts_duration_seconds` 字段（spike 已记
-                    // 「未来清理」）；STS 链路与 COS 对象存储解耦。
+                    // 「将来清理」）；STS 链路与 COS 对象存储解耦。
                     tmp_prefix: env_or("COS_TMP_PREFIX", "tmp/"),
+                    // 2026-10-13 PR2：`files::part_file::preview` 的 URL 拼接两件套
+                    preview_prefix: env_or("COS_PREVIEW_PREFIX", "previews"),
+                    preview_base_url,
                 }
             },
 

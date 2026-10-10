@@ -4,7 +4,7 @@
 //!
 //! 对应 Python myERP/api/v1/part_file.py。
 //!
-//! ## 端点（6 条，挂在 `/api/v2/files/objects`，由 `files::handler::router()` 的
+//! ## 端点（7 条，挂在 `/api/v2/files/objects`，由 `files::handler::router()` 的
 //! `.nest("/objects", …)` 桥接）
 //!   - `POST /`                    —— 单文件上传（multipart：`data` JSON + `file` 二进制）
 //!   - `GET  /`                    —— 列表查询 + 分页（`owner_kind` / `owner_id` / `kind` 过滤）
@@ -12,6 +12,8 @@
 //!   - `GET  /{file_id}/url`       —— 单条详情 + COS 预签下载 URL
 //!   - `GET  /{file_id}/content`   —— 后端代理文件内容
 //!   - `POST /{file_id}/delete`    —— 软删 + COS 异步清理
+//!   - `GET  /{file_id}/preview`   —— COS CI 图纸预览（**2026-10-13 PR2 新增**，
+//!     逻辑全在 `preview` 子模块；本文件只做路由 + 一次取行）
 //!
 //! ⚠️ 列表 / 上传端点在 wire 上是 `POST|GET /api/v2/files/objects`（**无尾斜杠**）：
 //! axum 0.8 的 `nest` 把内层 `.route("/", …)` 注册成 `<prefix>` 本身。迁移前的
@@ -114,6 +116,7 @@ use crate::auth::rbac::CurrentUser;
 use crate::modules::files::part_file::dto::{
     ConfirmFileIn, DeletePartFileRequest, PartFileListQuery, UploadFileData,
 };
+use crate::modules::files::part_file::preview::dto::PreviewOut;
 use crate::modules::files::part_file::service::PartFileService;
 use crate::modules::files::part_file::vo::{PartFileListOut, PartFileOut, PartFileWithUrlOut};
 use crate::shared::error::{AppError, code};
@@ -439,11 +442,88 @@ pub async fn soft_delete_part_file(
     Ok(Json(R::ok_empty()))
 }
 
+/// `GET /api/v2/files/objects/{file_id}/preview` —— COS CI 图纸预览（惰性轮询）。
+///
+/// 2026-10-13 PR2 新增。**唯一端点**是本子模块 `preview` 子模块的入口，
+/// 其状态机 / seed 推导 / 安全取舍见 `part_file::preview` 的模块 doc。
+///
+/// ## 事务边界
+///
+/// **handler 不开事务**（与本文件 `confirm_file_object` 同款「service 自管」的
+/// 例外）：预览状态机要跨多次 python HTTP 往返，把整条链包在 PG 事务里会让连接
+/// 被外部 IO 长时间占住。service 走 `pool.acquire()` 借一个连接跑完整条链。
+///
+/// ## 错误码
+///
+/// | 码 | HTTP | 条件 |
+/// |---|---|---|
+/// | 40300 | 403 | 角色不在 M / C / I / CNC / **SHELF** 内 |
+/// | 21101 | 404 | `file_id` 不存在（或已软删） |
+/// | 21116 | 400 | 该文件不可预览（kind 非图纸类 / `file_type ≠ PDF`） |
+/// | 21117 | 502 | CI job 终态 `Failed` |
+/// | 21118 | 502 | 打 python / CI 转发失败（含 `NoopPyBackend` 占位） |
+///
+/// `PENDING` 走 **200 + `state: "PENDING"`**（不是 202）：它是正常中间态而非错误，
+/// 详见 `preview::dto::PreviewOut` 的三态契约表。
+///
+/// ## ⚠️ matchit 注册顺序：**无冲突**（2026-10-13 实测）
+///
+/// `/{file_id}/preview` 是 3 段，与本 router 内其它路由逐一比对：
+///
+/// | 路由 | 段数 | 与 `/preview` 的关系 |
+/// |---|---|---|
+/// | `/` | 0 | 段数不同 |
+/// | `/confirm` | 1 | 段数不同 |
+/// | `/{file_id}/url` | 2 | 段数不同 |
+/// | `/{file_id}/content` | 2 | 段数不同 |
+/// | `/{file_id}/delete` | 2 | 段数不同 |
+/// | **`/{file_id}/preview`** | **2** | **同段数，且同为 `{file_id}` 捕获段** |
+///
+/// 与 `/confirm`（1 段静态）的历史踩坑不同：这里 `/preview` 与 `/{file_id}/url` 等
+/// **位置完全平行** —— 二者的第 2 段一个是字面量 `preview`、一个是捕获段，
+/// matchit 对「同层静态段 vs 捕获段」按静态优先匹配，**没有歧义**。
+///
+/// 实测证据见 `tests/files/preview.rs::preview_route_is_not_swallowed_by_sibling_catch_alls`
+/// —— 它逐条打 `/objects/{id}/preview` 与 `/objects/{id}/url`，两条都必须命中
+/// 各自的 handler（不是 400 / 404）。**别只靠读源码判断**（CLAUDE.md 路由声明
+/// 规约第 9 条的老踩坑就是「同段数静态段被 catch-all 吞成 400」）。
+pub async fn get_part_file_preview(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(file_id): Path<i64>,
+) -> Result<Json<R<PreviewOut>>, AppError> {
+    let file = {
+        let mut tx = state.pool.begin().await?;
+        let file = state
+            .part_file_service
+            .get_file_row(&mut *tx, file_id)
+            .await?;
+        tx.commit().await?;
+        file
+    };
+    let out = state
+        .preview_service
+        .get_preview(
+            &state.pool,
+            &state.py_backend,
+            &state.config.cos.preview_prefix,
+            &state.config.cos.preview_base_url,
+            &file,
+            &current,
+        )
+        .await?;
+    Ok(Json(R::ok(out)))
+}
+
 /// `files::part_file` 子模块 axum 子路由。
 ///
 /// 2026-10-13 PR1b：`POST /` 的上传端点复活并通用化（与 part / assembly 侧三条旧
 /// 端点四合一），`POST /confirm` 自 part 域搬入；`.nest("/parts/{part_id}",
 /// part_nested_router())` 仍是 PR1a 删除后不复存在的形态。
+///
+/// 2026-10-13 PR2：新增 `/{file_id}/preview`（COS CI 预览）。⚠️ 注册位置与
+/// `/{file_id}/url` 等**平行**而非「先于」—— matchit 对同层静态段本就静态优先，
+/// 顺序无关（实测钉死见 `get_part_file_preview` 的 doc 与对应测试）。
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", get(list_part_files).post(upload_part_file))
@@ -451,4 +531,5 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{file_id}/url", get(get_part_file_url))
         .route("/{file_id}/content", get(get_part_file_content))
         .route("/{file_id}/delete", post(soft_delete_part_file))
+        .route("/{file_id}/preview", get(get_part_file_preview))
 }
