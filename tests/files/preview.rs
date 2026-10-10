@@ -19,11 +19,19 @@
 //! | 10 | `concurrent_misses_submit_only_one_job` | 并发两次 → **只提交 1 个 job**（唯一索引闸门） |
 //! | 11 | `failed_state_restarts_on_next_call` | FAILED → 下次调用自愈重启为 PENDING |
 //! | 12 | `shelf_account_can_get_preview` | SHELF_ACCOUNT 能拿到 preview（锁选项 A 的角色矩阵） |
+//! | 13 | `describe_not_exist_returns_21117_and_row_failed` | python 合成态 `NotExist` ⇒ 21117 + 行落 FAILED，**且本次调用零 submit** |
+//! | 14 | `describe_not_exist_lowercase_also_recognized` | `notexist` 小写变体同判（大小写不敏感） |
+//! | 15 | `describe_cancel_returns_21117` | CI 官方 `Cancel` ⇒ 21117 + 行落 FAILED |
+//! | 16 | `describe_pause_returns_21117` | CI 官方 `Pause` ⇒ 21117 + 行落 FAILED |
+//! | 17 | `describe_success_with_zero_pages_stays_pending` | **回归护栏**：`Success` 但 0 页仍当 Running（不落 READY） |
+//! | 18 | `describe_reads_state_key_as_well_as_status` | 状态字段名 `state` / `status` 两种写法都认（跨仓兜底） |
 //!
-//! 另有 2 条护栏（不编号）：
+//! 另有 3 条护栏（不编号）：
 //! - `preview_route_is_not_swallowed_by_sibling_catch_alls` —— **matchit 冲突的实测**
 //!   （见下节）
 //! - `preview_urls_shape_is_stable` —— `preview_urls` 纯函数断言
+//! - `parse_ci_status_word_table_is_exhaustive` —— **跨仓 CI 终态词表的表驱动断言**
+//!   （review 第 1 轮新增；含 `NotExist` / `Pause` / `Cancel` 与大小写别名）
 //!
 //! ## matchit 冲突的验证方式（本文件最重要的一条护栏）
 //!
@@ -767,6 +775,292 @@ async fn shelf_account_can_get_preview() {
 }
 
 // ===========================================================================
+//  13-18：跨仓 CI 终态词表（2026-10-13 review 第 1 轮）
+// ===========================================================================
+
+/// 跑一遍完整的「登记 → 提交 → 强制到期 → describe」，返回**第二次**调用的结果。
+///
+/// ⚠️ `expect_forward_ci_submit().times(1)` 是本 helper 的**隐含断言**：两次调用
+/// 合起来只允许提交 **1 个** CI job。若被测代码在终局失败时「静默重提」，这里
+/// 会直接 panic —— 这正是 review 第 1 轮要求钉死的「不得变成无限提交 job」。
+///
+/// `describe_data` 原样作为 python `describe` 的 `data`，由各用例自己决定
+/// `status` / `total_page_count` / `message` 三者的组合。
+async fn describe_once(
+    pool: &PgPool,
+    file: &TPartFile,
+    job_id: &str,
+    describe_data: Value,
+) -> Result<PreviewOut, hsh_erp_rust::shared::error::AppError> {
+    // mockall 的 `returning` 闭包要求 `'static` ⇒ 参数收进 owned 值再 move 进去。
+    let job_id = job_id.to_string();
+    let submit_job_id = job_id.clone();
+    let mut mock = MockPyBackendClient::new();
+    mock.expect_forward_ci_submit()
+        .times(1)
+        .returning(move |_b, _h| Ok(ci_ok(json!({ "job_id": submit_job_id }))));
+    mock.expect_forward_ci_describe()
+        .times(1)
+        .withf(move |jid, _h| jid == job_id)
+        .returning(move |_jid, _h| Ok(ci_ok(describe_data.clone())));
+
+    let mut state = test_state(pool.clone()).await;
+    let _app = app_with_mock(&mut state, mock);
+    let svc = PreviewService::new(shared_test_snowflake().clone());
+    let user = test_user(vec![Role::Manager]);
+
+    // 第 1 次：新 seed ⇒ 登记 + 提交 ⇒ PENDING
+    svc.get_preview(
+        pool,
+        &state.py_backend,
+        PREVIEW_PREFIX,
+        PREVIEW_BASE_URL,
+        file,
+        &user,
+    )
+    .await?;
+
+    // 把 `next_poll_at` 写死到过去 ⇒ 第 2 次到期（不硬编码绝对日期）
+    force_poll_due(pool, &PreviewService::preview_seed(file)).await;
+
+    // 第 2 次：到期 ⇒ describe
+    svc.get_preview(
+        pool,
+        &state.py_backend,
+        PREVIEW_PREFIX,
+        PREVIEW_BASE_URL,
+        file,
+        &user,
+    )
+    .await
+}
+
+/// 读回 `t_file_preview` 某 seed 的 `error_message`（供终局失败原因断言）。
+async fn read_error_message(pool: &PgPool, seed: &str) -> Option<String> {
+    sqlx::query_scalar::<_, Option<String>>(
+        "SELECT error_message FROM t_file_preview \
+         WHERE preview_seed = $1 AND deleted_at IS NULL",
+    )
+    .bind(seed)
+    .fetch_optional(pool)
+    .await
+    .expect("读回 error_message")
+    .flatten()
+}
+
+/// 场景 13：python 合成的 `NotExist` ⇒ **21117 + 行落 FAILED**（不静默重提 job）。
+///
+/// 决策与论证见 `src/modules/files/part_file/preview/mod.rs` 的
+/// 「CI 终局失败的落点」一节；此处只钉行为。
+#[tokio::test]
+async fn describe_not_exist_returns_21117_and_row_failed() {
+    let pool = test_pool().await;
+    let file_id = insert_part_file(
+        &pool,
+        "DRAWING",
+        "PDF",
+        "notexist.pdf",
+        Some(&"8".repeat(64)),
+    )
+    .await;
+    let file = fetch_row(&pool, file_id).await;
+    let seed = PreviewService::preview_seed(&file);
+
+    let err = describe_once(
+        &pool,
+        &file,
+        "job-notexist",
+        json!({"status": "NotExist", "total_page_count": 0}),
+    )
+    .await
+    .expect_err("NotExist 是确定性终局，必须报错而不是继续返 PENDING（无限轮询的老坑）");
+
+    assert_eq!(err.code(), 21117, "NotExist 应返 21117");
+    assert_eq!(
+        err.http_status(),
+        StatusCode::BAD_GATEWAY,
+        "CI 侧查不到 job 是上游问题 ⇒ 502"
+    );
+
+    let (state_s, _job, _pages) = read_state(&pool, &seed).await.unwrap();
+    assert_eq!(
+        state_s, "FAILED",
+        "NotExist 必须落 FAILED（下次调用经 reset_to_pending 自愈重提）"
+    );
+    let msg = read_error_message(&pool, &seed)
+        .await
+        .expect("FAILED 行必须有原因");
+    assert!(
+        msg.contains("不存在"),
+        "error_message 应说明是「任务记录不存在」，实际：{msg}"
+    );
+}
+
+/// 场景 14：`notexist` 小写变体同样识别（大小写不敏感）。
+#[tokio::test]
+async fn describe_not_exist_lowercase_also_recognized() {
+    let pool = test_pool().await;
+    let file_id = insert_part_file(
+        &pool,
+        "DRAWING",
+        "PDF",
+        "notexist-lc.pdf",
+        Some(&"9".repeat(64)),
+    )
+    .await;
+    let file = fetch_row(&pool, file_id).await;
+
+    let err = describe_once(
+        &pool,
+        &file,
+        "job-notexist-lc",
+        json!({"status": "notexist", "total_page_count": 0}),
+    )
+    .await
+    .expect_err("小写 notexist 同样必须识别为终局");
+    assert_eq!(err.code(), 21117);
+}
+
+/// 场景 15：CI 官方终态 `Cancel` ⇒ 21117 + 行落 FAILED。
+#[tokio::test]
+async fn describe_cancel_returns_21117() {
+    let pool = test_pool().await;
+    let file_id = insert_part_file(
+        &pool,
+        "DRAWING",
+        "PDF",
+        "cancel.pdf",
+        Some(&"a1".repeat(32)),
+    )
+    .await;
+    let file = fetch_row(&pool, file_id).await;
+    let seed = PreviewService::preview_seed(&file);
+
+    let err = describe_once(
+        &pool,
+        &file,
+        "job-cancel",
+        json!({"status": "Cancel", "total_page_count": 0}),
+    )
+    .await
+    .expect_err("Cancel 是 CI 确定性终态，必须报错而不是永远转圈");
+    assert_eq!(err.code(), 21117);
+    assert_eq!(err.http_status(), StatusCode::BAD_GATEWAY);
+
+    let (state_s, _, _) = read_state(&pool, &seed).await.unwrap();
+    assert_eq!(state_s, "FAILED");
+    let msg = read_error_message(&pool, &seed)
+        .await
+        .expect("FAILED 行必须有原因");
+    assert!(
+        msg.contains("取消"),
+        "error_message 应说明被取消，实际：{msg}"
+    );
+}
+
+/// 场景 16：CI 官方终态 `Pause`（队列暂停）⇒ 21117 + 行落 FAILED。
+///
+/// ⚠️ 与 `Cancel` 分开断言，因为两者的**理由不同**：`Cancel` 无论如何都不会再变；
+/// `Pause` 是「CI 理论上可 Resume、但本系统两侧都不会去 Resume」，判终局是有意
+/// 取舍（论证见模块 doc「CI 终局失败的落点」一节 + 已知偏差 #5）。
+#[tokio::test]
+async fn describe_pause_returns_21117() {
+    let pool = test_pool().await;
+    let file_id =
+        insert_part_file(&pool, "DRAWING", "PDF", "pause.pdf", Some(&"b1".repeat(32))).await;
+    let file = fetch_row(&pool, file_id).await;
+    let seed = PreviewService::preview_seed(&file);
+
+    let err = describe_once(
+        &pool,
+        &file,
+        "job-pause",
+        json!({"status": "Pause", "total_page_count": 0}),
+    )
+    .await
+    .expect_err("Pause 在本系统等同终局，必须报错而不是永远转圈");
+    assert_eq!(err.code(), 21117);
+
+    let (state_s, _, _) = read_state(&pool, &seed).await.unwrap();
+    assert_eq!(state_s, "FAILED");
+    let msg = read_error_message(&pool, &seed)
+        .await
+        .expect("FAILED 行必须有原因");
+    assert!(
+        msg.contains("暂停"),
+        "error_message 应说明被暂停，实际：{msg}"
+    );
+}
+
+/// 场景 17（**回归护栏**）：`Success` 但 `total_page_count == 0` ⇒ **仍当进行中**。
+///
+/// ⚠️ 这是 implementor 特意做的判断，**本轮不得破坏**：CI 的 Success 快照可能
+/// 先于对象落盘，此刻若判 Success，`mark_ready(0)` 会返回**空 pages 的 READY**，
+/// 且该行已是终态、永远不会自愈。
+#[tokio::test]
+async fn describe_success_with_zero_pages_stays_pending() {
+    let pool = test_pool().await;
+    let file_id = insert_part_file(
+        &pool,
+        "DRAWING",
+        "PDF",
+        "zeropage.pdf",
+        Some(&"c1".repeat(32)),
+    )
+    .await;
+    let file = fetch_row(&pool, file_id).await;
+    let seed = PreviewService::preview_seed(&file);
+
+    let out = describe_once(
+        &pool,
+        &file,
+        "job-zeropage",
+        json!({"status": "Success", "total_page_count": 0}),
+    )
+    .await
+    .expect("0 页的 Success 不该报错");
+    assert_eq!(
+        out.state, "PENDING",
+        "Success 但 0 页必须继续轮询，绝不能落成空 pages 的 READY"
+    );
+    assert!(out.pages.is_empty());
+    assert!(out.retry_after_ms > 0, "仍是进行中 ⇒ 必须给前端节流值");
+
+    let (state_s, _, pages) = read_state(&pool, &seed).await.unwrap();
+    assert_eq!(state_s, "PENDING", "行必须留在 PENDING 等下一轮");
+    assert_eq!(pages, 0);
+}
+
+/// 场景 18：状态字段名写 `state`（而非 `status`）时同样识别。
+///
+/// ⚠️ 跨仓兜底：`forward_ci_describe` 的契约 doc 读的是 `status`，python 侧文档
+/// 称 `state`，两侧未收敛。**键名读错的后果是空串 → 落 `Running` 兜底 → 无限
+/// 轮询**，所以 rust 侧两个键都读（`status` 优先）。登记见模块 doc 已知偏差 #8。
+#[tokio::test]
+async fn describe_reads_state_key_as_well_as_status() {
+    let pool = test_pool().await;
+    let file_id = insert_part_file(
+        &pool,
+        "DRAWING",
+        "PDF",
+        "statekey.pdf",
+        Some(&"d1".repeat(32)),
+    )
+    .await;
+    let file = fetch_row(&pool, file_id).await;
+
+    let err = describe_once(
+        &pool,
+        &file,
+        "job-statekey",
+        json!({"state": "NotExist", "total_page_count": 0}),
+    )
+    .await
+    .expect_err("键名 `state` 也必须能读到状态词");
+    assert_eq!(err.code(), 21117);
+}
+
+// ===========================================================================
 //  护栏 A：matchit 冲突的实测
 // ===========================================================================
 
@@ -885,5 +1179,69 @@ fn preview_urls_shape_is_stable() {
         PreviewService::preview_urls("https://cdn.example.com", "previews", "abc123", -1)
             .is_empty(),
         "负页数不得产出 URL"
+    );
+}
+
+/// **跨仓 CI 终态词表**的表驱动断言（2026-10-13 review 第 1 轮）。
+///
+/// ⚠️ 本条是「python 改了 `state` 取值 / CI 改了官方词」时的**第一道响**：
+/// 新词若不在表里，多半会落进最后一行的 `Running` 兜底 ⇒ 回到无限轮询的老坑。
+/// 完整跨仓契约（哪个词是谁合成的、谁负责识别）见
+/// `src/modules/files/part_file/preview/mod.rs` 的「跨仓 CI 终态词表」一节。
+#[test]
+fn parse_ci_status_word_table_is_exhaustive() {
+    use hsh_erp_rust::modules::files::part_file::preview::service::CiStatus;
+
+    /// `(原始词, total_page_count, 期望归一)`
+    const CASES: &[(&str, i64, CiStatus)] = &[
+        // ── CI 官方成功。⚠️ **0 页仍当进行中是回归护栏，勿改**
+        ("Success", 3, CiStatus::Success),
+        ("success", 3, CiStatus::Success),
+        ("SUCCESS", 1, CiStatus::Success),
+        ("  Success  ", 2, CiStatus::Success),
+        ("Success", 0, CiStatus::Running),
+        ("success", 0, CiStatus::Running),
+        // ── CI 官方失败
+        ("Failed", 0, CiStatus::Failed),
+        ("failure", 0, CiStatus::Failed),
+        ("FAILED", 0, CiStatus::Failed),
+        // ── CI 官方终态：被取消（review 第 1 轮新增，此前落兜底 ⇒ 无限轮询）
+        ("Cancel", 0, CiStatus::Canceled),
+        ("canceled", 0, CiStatus::Canceled),
+        ("CANCELLED", 0, CiStatus::Canceled),
+        // ── CI 官方终态：队列暂停（同上）
+        ("Pause", 0, CiStatus::Paused),
+        ("paused", 0, CiStatus::Paused),
+        // ── ⚠️ **python 自己合成**的 NotExist（CI 官方六态里没有），大小写 / 别名都要认
+        ("NotExist", 0, CiStatus::NotExist),
+        ("notexist", 0, CiStatus::NotExist),
+        ("NOTEXIST", 0, CiStatus::NotExist),
+        ("  notexist  ", 0, CiStatus::NotExist),
+        ("Not_Exist", 0, CiStatus::NotExist),
+        ("NonExist", 0, CiStatus::NotExist),
+        // ── 进行中 + 兜底（⚠️ 兜底不认识跨仓新增的词，这是本表的维护理由）
+        ("Submitted", 0, CiStatus::Running),
+        ("Running", 0, CiStatus::Running),
+        ("Processing", 0, CiStatus::Running),
+        ("Pending", 0, CiStatus::Running),
+        ("", 0, CiStatus::Running),
+        ("   ", 0, CiStatus::Running),
+        ("WhoKnowsThis", 0, CiStatus::Running),
+    ];
+
+    for (word, pages, want) in CASES {
+        assert_eq!(
+            PreviewService::parse_ci_status(word, *pages),
+            *want,
+            "原始词 {word:?}（{pages} 页）应归一为 {want:?}"
+        );
+    }
+
+    // ⚠️ 一条反向断言：`Success` **带页数**时绝不能落 `Running`（否则预览永远
+    // 收敛不了，只是上一条护栏的另一面）。
+    assert_eq!(
+        PreviewService::parse_ci_status("Success", 1),
+        CiStatus::Success,
+        "Success + 1 页必须收敛成 Success，不能被 0 页护栏误伤"
     );
 }

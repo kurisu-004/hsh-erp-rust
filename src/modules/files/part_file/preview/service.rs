@@ -73,7 +73,7 @@ impl PreviewService {
     /// | seed 未命中但 INSERT 冲突（并发，别的请求已登记） | 返 PENDING | **无** |
     /// | `PENDING` 且 `now < next_poll_at` | 返 PENDING（节流） | **无** |
     /// | `PENDING` 且到期、`ci_job_id` 为空 | 当作未提交补一次提交 → 返 PENDING | 提交 ≤1 次 |
-    /// | `PENDING` 且到期且有 job id | describe：Success → READY；Failed → FAILED(21117)；进行中 → 推进 `next_poll_at` 返 PENDING | 查询 1 次 |
+    /// | `PENDING` 且到期且有 job id | describe：Success → READY；**四种终局失败**（`Failed` / `Cancel` / `Pause` / `NotExist`）→ FAILED(21117)；其余 → 推进 `next_poll_at` 返 PENDING | 查询 1 次 |
     /// | `READY` | 直接返 `pages` | **无**（不打 python、不打 COS） |
     /// | `FAILED` | 重置为 PENDING 后按 PENDING 处理（自愈） | 见上 |
     ///
@@ -225,8 +225,25 @@ impl PreviewService {
                 row.next_poll_at = None;
                 Ok(Self::ready_out(row, preview_base_url, preview_prefix))
             }
-            CiStatus::Failed => {
-                let msg = Self::truncate_error(describe.message.as_deref());
+            CiStatus::Failed | CiStatus::Canceled | CiStatus::Paused | CiStatus::NotExist => {
+                // ⚠️ **四个变体逐个列出、刻意不写 `_`**：编译器会在本函数新增
+                // `CiStatus` 变体时把这里变红，防止新词又悄悄落进兜底变无限轮询。
+                //
+                // 四者统一落 `FAILED` + 21117（含 `NotExist`），**不静默重提 job**
+                // —— 决策理由与「为什么不会变成无限提交 job」的论证见
+                // [`super::mod`] 的「CI 终局失败的落点」一节。
+                let mut msg = describe.status.failure_reason().to_string();
+                if let Some(reason) = describe.message.as_deref().filter(|m| !m.trim().is_empty()) {
+                    msg.push('：');
+                    msg.push_str(reason.trim());
+                }
+                let msg = Self::truncate_error(Some(&msg));
+                warn!(
+                    seed = %seed,
+                    job_id = %job_id,
+                    ci_state = %describe.status.as_str(),
+                    "CI 预览任务落入终局失败态，行打 FAILED（下次调用自愈重提）"
+                );
                 PreviewRepo::mark_failed(&mut *conn, row.id, &msg, current.id).await?;
                 Err(AppError::biz(
                     code::BIZ_PART_FILE_PREVIEW_FAILED,
@@ -238,7 +255,13 @@ impl PreviewService {
                 let next_poll = now + Self::backoff();
                 PreviewRepo::touch_poll(&mut *conn, row.id, next_poll, current.id).await?;
                 row.next_poll_at = Some(next_poll);
-                Ok(Self::pending_out(row, &next_poll))
+                // ⚠️ **传 `&now` 而不是 `&next_poll`**（2026-10-13 review 第 1 轮修）：
+                // 与 3d 分支同一纪律 —— `pending_out` 算的是 `next_poll_at - 传入时刻`
+                // 即「距现在还有多久」，传 `&next_poll` 会让结果恒为 **0** ⇒ 前端
+                // 拿 `retry_after_ms = 0` 立刻重调，退避形同虚设（变成**忙轮询**，
+                // 每个请求都真打一次 python）。这正是「无限轮询」在**合法 Running
+                // 路径**上的同款症状：越是非法终局被识别出来，这条路径越要真的节流。
+                Ok(Self::pending_out(row, &now))
             }
         }
     }
@@ -408,7 +431,18 @@ impl PreviewService {
             .forward_ci_describe(job_id, Self::fwd_headers(current))
             .await?;
         let data = Self::parse_envelope(&resp.body, &resp.status, "describe")?;
-        let status = data.get("status").and_then(Value::as_str).unwrap_or("");
+        // ⚠️ **状态字段名跨仓有两种写法**（2026-10-13 review 第 1 轮核对时发现）：
+        // `PyBackendClient::forward_ci_describe` 的契约 doc 与既有实现读的是
+        // `status`，而 python 侧的模块 doc / 交付说明把 job 状态称作 `state`。
+        // 两个键都读、`status` 优先 —— **键名读错的后果是空串 → 落 `Running`
+        // 兜底 → 无限轮询**，正是本轮要消灭的形态，所以宁可多读一个键。
+        // ⚠️ 两侧收敛到同一个键名后删掉 `state` 那一支（登记见 [`super::mod`]
+        // 已知偏差 #8）。
+        let status = data
+            .get("status")
+            .or_else(|| data.get("state"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
         let page_count = data
             .get("total_page_count")
             .and_then(Value::as_i64)
@@ -417,31 +451,79 @@ impl PreviewService {
             .get("message")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let status = match status {
-            // ⚠️ **大小写不敏感**：python / CI 两侧对终态用词历史上不一致
-            // （`Success` / `success` 都出现过），按小写归一后再判。
-            s if s.eq_ignore_ascii_case("success") => {
-                // 报 0 页视为「还没真跑完」（CI 的 Success 快照可能先于对象落盘），
-                // 继续按进行中处理并等下一轮，避免返回一个空 pages 的 READY。
-                if page_count > 0 {
-                    CiStatus::Success
-                } else {
-                    CiStatus::Running
-                }
-            }
-            s if s.eq_ignore_ascii_case("failed") || s.eq_ignore_ascii_case("failure") => {
-                CiStatus::Failed
-            }
-            // 其余一切形态（Pending / Running / Processing / 空串 / 未知值）一律
-            // 当「还在跑」：未知终态时继续等是 fail-safe 的（最坏是多轮询几次），
-            // 猜成 Failed 会让正常预览报 502。
-            _ => CiStatus::Running,
-        };
+        let status = Self::parse_ci_status(status, page_count);
         Ok(CiDescribe {
             status,
             page_count: page_count.clamp(0, i32::MAX as i64) as i32,
             message,
         })
+    }
+
+    /// **跨仓 CI 终态词表的唯一判据**：python / CI 传来的原始词 → [`CiStatus`]。
+    ///
+    /// `pub` 是为了能被 `tests/files/preview.rs` 直接做表驱动断言（与既有的
+    /// `pub fn preview_urls` 同款取舍：纯函数、无 IO、无副作用，值得被单测钉死）。
+    ///
+    /// ## 词表（2026-10-13 review 第 1 轮补齐）
+    ///
+    /// | 原始词（大小写不敏感） | → | 归属 |
+    /// |---|---|---|
+    /// | `success` 且 `total_page_count > 0` | `Success` | CI 官方 |
+    /// | `success` 但 `total_page_count == 0` | `Running` | 刻意，见下 |
+    /// | `failed` / `failure` | `Failed` | CI 官方 |
+    /// | `cancel` / `canceled` / `cancelled` | `Canceled` | CI 官方 |
+    /// | `pause` / `paused` | `Paused` | CI 官方（对本系统等同终局） |
+    /// | `notexist` / `not_exist` / `not_exists` / `nonexist` | `NotExist` | ⚠️ **python 合成** |
+    /// | 其余一切（`submitted` / `running` / `processing` / 空串 / 未知） | `Running` | 兜底 |
+    ///
+    /// ## 为什么 `Success` 且 0 页仍算 `Running`（**护栏，勿改**）
+    ///
+    /// CI 的 Success 快照**可能先于对象落盘**：报成功的那一刻 `total_page_count`
+    /// 还是 0。此时若直接判 `Success`，`mark_ready(page_count=0)` 会让端点返回
+    /// 一个 **`pages` 为空的 READY** —— 前端拿到「渲染成功」却一张图都渲染不出来，
+    /// 且该行已是终态、**永远不会自愈**。判 `Running` 则下一轮就会重查。
+    ///
+    /// ## 兜底为什么留 `Running`（而不是猜失败）
+    ///
+    /// 未知词时继续等是 fail-safe 的：最坏是多轮询几次（节流 2s/次），而猜成终局
+    /// 失败会让**正常预览直接报 502**。⚠️ 代价是这条兜底**不会自动识别跨仓新增
+    /// 的词** —— python 侧改 `state` 取值时必须同步本函数（词表真源见
+    /// [`super::mod`] 的「跨仓 CI 终态词表」一节）。
+    pub fn parse_ci_status(raw_state: &str, page_count: i64) -> CiStatus {
+        let s = raw_state.trim();
+        // ⚠️ **大小写不敏感 + 先 trim**：python 发的是 CI 官方拼写（`Success` /
+        // `NotExist` …），但 CI 与 python 历史上都出现过全小写 / 带空白的形态，
+        // 两边对齐比猜「上游到底发哪一种」便宜。
+        if s.eq_ignore_ascii_case("success") {
+            return if page_count > 0 {
+                CiStatus::Success
+            } else {
+                CiStatus::Running
+            };
+        }
+        if s.eq_ignore_ascii_case("failed") || s.eq_ignore_ascii_case("failure") {
+            return CiStatus::Failed;
+        }
+        // ↓ 以下三支是 2026-10-13 review 第 1 轮补的跨仓契约缺口：
+        //   此前它们全落进下面的 `_ => Running` 兜底 ⇒ 每轮 `touch_poll` 再等 2s，
+        //   **永远返回 PENDING** ⇒ 前端无限轮询直到自己超限。
+        if s.eq_ignore_ascii_case("cancel")
+            || s.eq_ignore_ascii_case("canceled")
+            || s.eq_ignore_ascii_case("cancelled")
+        {
+            return CiStatus::Canceled;
+        }
+        if s.eq_ignore_ascii_case("pause") || s.eq_ignore_ascii_case("paused") {
+            return CiStatus::Paused;
+        }
+        if s.eq_ignore_ascii_case("notexist")
+            || s.eq_ignore_ascii_case("not_exist")
+            || s.eq_ignore_ascii_case("not_exists")
+            || s.eq_ignore_ascii_case("nonexist")
+        {
+            return CiStatus::NotExist;
+        }
+        CiStatus::Running
     }
 
     /// 解 python 信封 `{code, message, data}` 并取出 `data`。
@@ -488,11 +570,60 @@ impl PreviewService {
     }
 }
 
-/// CI 查询结果的三态。
-enum CiStatus {
+/// CI 查询结果的**归一化**状态（本仓内部语义，**不是** CI 的原始词表）。
+///
+/// ⚠️ **词表的唯一真源是 [`PreviewService::parse_ci_status`]**，跨仓契约全文
+/// （CI 官方六态 / python 合成态 / 大小写与别名 / 谁负责识别）见
+/// [`super::mod`] 的「跨仓 CI 终态词表」一节。改任何一侧都要改另一侧。
+///
+/// `pub` 的唯一理由：它是 `pub fn parse_ci_status` 的返回类型，且集成测试要拿它
+/// 做表驱动断言（同 `pub fn preview_urls` 的取舍）。**变体本身不构成对外 HTTP
+/// 契约** —— 前端看到的只有 `PreviewOut.state`（`PENDING` / `READY`）与 502 信封。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CiStatus {
+    /// 终态成功，**且 `total_page_count > 0`**。
     Success,
+    /// 终态失败（CI 官方 `Failed` / `Failure`）。
     Failed,
+    /// 终态被取消（CI 官方 `Cancel` / `Canceled` / `Cancelled`）。
+    Canceled,
+    /// 队列暂停（CI 官方 `Pause` / `Paused`）。⚠️ CI 侧理论上可 Resume，
+    /// 但**本系统两侧都没有任何一侧会去做 Resume**（零后台任务、纯惰性轮询），
+    /// 故对本状态机而言它等同终局 —— 理由与残留风险见 [`super::mod`]。
+    Paused,
+    /// job 记录**丢失**（**`NotExist` 是 python 自己合成的值，CI 官方六态里
+    /// 没有它**）。触发条件有三种：响应带 `NonExistJobIds` 节点 /
+    /// `JobsDetail.Code ∈ {NotExistJobId, NoSuchJob, NotFound, …}` / CI 记录
+    /// 超一个月被清理。
+    NotExist,
+    /// 还在跑：`Submitted` / `Running` / `Processing` / **报 0 页的 `Success`** /
+    /// 空串 / 任何未知词。
     Running,
+}
+
+impl CiStatus {
+    /// 落进 `t_file_preview.error_message` 与 21117 `message` 的中文原因短语。
+    fn failure_reason(self) -> &'static str {
+        match self {
+            CiStatus::Failed => "CI 渲染失败",
+            CiStatus::Canceled => "CI 任务被取消",
+            CiStatus::Paused => "CI 任务被暂停（队列暂停，需在 CI 控制台人工 Resume）",
+            CiStatus::NotExist => "CI 任务记录不存在（CI 侧已查不到该 job）",
+            CiStatus::Success | CiStatus::Running => "非失败态",
+        }
+    }
+
+    /// 日志 / 排障用的规范拼写（对齐 python 发来的原词，不是本枚举变体名）。
+    fn as_str(self) -> &'static str {
+        match self {
+            CiStatus::Success => "Success",
+            CiStatus::Failed => "Failed",
+            CiStatus::Canceled => "Cancel",
+            CiStatus::Paused => "Pause",
+            CiStatus::NotExist => "NotExist",
+            CiStatus::Running => "Running",
+        }
+    }
 }
 
 /// [`CiStatus`] + 页数 + 失败原因的具名三元组。

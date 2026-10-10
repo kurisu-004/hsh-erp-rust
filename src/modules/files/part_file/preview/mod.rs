@@ -37,7 +37,7 @@
 //! | seed 未命中 · 登记冲突 | `insert_pending` 返 0 行（撞 `uk_t_file_preview_seed`） | **直接返 PENDING，绝不自己提交** | **无** |
 //! | PENDING · 未到期 | `now() < next_poll_at` | 返 PENDING（节流） | **无** |
 //! | PENDING · 到期 · 无 job id | `ci_job_id IS NULL` | 补提交 → `mark_submitted` → 返 PENDING | 提交 ≤1 |
-//! | PENDING · 到期 · 有 job id | `ci_job_id IS NOT NULL` | describe：Success → READY；Failed → 21117；其余 → `touch_poll` 退避 → PENDING | 查询 ×1 |
+//! | PENDING · 到期 · 有 job id | `ci_job_id IS NOT NULL` | describe：Success → READY；**四种终局失败**（`Failed` / `Cancel` / `Pause` / `NotExist`）→ FAILED + 21117；其余 → `touch_poll` 退避 → PENDING | 查询 ×1 |
 //! | READY | `state = 'READY'` | 直接返 `pages` | **无**（不打 python、不打 COS） |
 //! | FAILED | `state = 'FAILED'` | `reset_to_pending` 后按 PENDING 处理（**自愈**） | 见上 |
 //!
@@ -64,12 +64,21 @@
 //! （本表没有「已轮询次数」列，加递增要改 schema，而 CI 通常几秒内收敛）；
 //! 上限常量是给「将来加递增退避」预留的接缝。
 //!
+//! ⚠️ `retry_after_ms` 在**所有**返 PENDING 的分支上都必须传「距**现在**还差多久」
+//! （即 `next_poll_at - now`），不能传 `next_poll_at - next_poll_at` —— 后者恒为
+//! **0**，前端会立刻重调，退避形同虚设（忙轮询，每个请求都真打一次 python）。
+//! `service.rs` 的 3d / 3e 两个分支各自都有这条纪律的注释。
+//!
 //! ### `FAILED` 是**可恢复**的
 //!
 //! `mark_failed` 打的是终态，但它**不终止这份预览**：下次调用走 `reset_to_pending`
 //! 重新排队。所以「CI 失败一次」不会让用户永远看到失败 —— 重新点一次预览就重来。
 //! 反之「提交失败」（打 python 失败）**不**写 `FAILED`（那是 CI 的终态语义，
 //! 这里只是这次没送出去），行保持 `PENDING` / `ci_job_id IS NULL`，下轮自动重试。
+//!
+//! ⚠️ **「重新点一次」的次数由用户控制，不由轮询次数控制** —— 这是
+//! `Failed` / `Cancel` / `Pause` / `NotExist` 四种终局失败统一判 `FAILED`
+//! 的关键（详见下一节「CI 终局失败的落点」）。
 //!
 //! ## ⚠️⚠️ 安全条款：预览路径里**绝不能带文件名**
 //!
@@ -136,6 +145,86 @@
 //!   就是另一个 seed ⇒ 另一个目录。唯一残留风险是「同内容重渲」（CI 版本升级导致
 //!   同一 PDF 渲出不同图）URL 不变 —— 记在下方「已知偏差」第 1 条。
 //!
+//! ## 跨仓 CI 终态词表（2026-10-13 review 第 1 轮建立）
+//!
+//! python 的 `describe`（`GET /api/v1/files/ci-preview-jobs/{job_id}`）返的
+//! 状态词，本模块**逐个识别**。判据的**唯一真源是**
+//! [`service::PreviewService::parse_ci_status`]（纯函数，表驱动单测钉死在
+//! `tests/files/preview.rs::parse_ci_status_word_table_is_exhaustive`）。
+//!
+//! | 原始词（大小写不敏感） | 本仓归一 | 词从哪来 | 谁负责识别 |
+//! |---|---|---|---|
+//! | `success` | `Success`（**仅当 `total_page_count > 0`**） | CI 官方 | rust |
+//! | `failed` / `failure` | `Failed` | CI 官方 | rust |
+//! | `cancel` / `canceled` / `cancelled` | `Canceled` | CI 官方 | rust |
+//! | `pause` / `paused` | `Paused` | CI 官方 | rust |
+//! | `notexist` / `not_exist` / `not_exists` / `nonexist` | `NotExist` | ⚠️ **python 自己合成**，CI 官方六态里**没有**这个值 | rust |
+//! | `submitted` / `running` / `processing` / 空串 / 任何未知词 | `Running` | CI 官方进行中态 + 本仓兜底 | rust |
+//!
+//! ### ⚠️ `NotExist` 是 python **合成**的，不是 CI 的状态（跨仓契约，两边都必须知道）
+//!
+//! CI 官方六态只有 `Submitted` / `Running` / `Success` / `Failed` / `Pause` /
+//! `Cancel`。python 侧把三种「查不到这个 job」的情形**合成为** `NotExist`：
+//!
+//! 1. 响应根节点带 `NonExistJobIds`（CI 对不存在 job 的固定返回）；
+//! 2. `JobsDetail/Code ∈ {NotExistJobId, NoSuchJob, NotFound, …}`；
+//! 3. CI 的任务记录**只保留一个月**，过期后查询即「查不到」。
+//!
+//! python **刻意不抛 404** 而是合成这个值（理由：「记录过期是确定性终局，rust
+//! 轮询撞上它应按『查不到』处理而非无限重试」），且响应 schema 严格保持 5 字段
+//! （**没加** `exists: bool`）⇒ 这个语义**只能由 `state` 承载**，前端与 rust
+//! 都必须自己认这个词。
+//!
+//! ⚠️ **由此派生的仓间义务**：python 侧**只负责产出**这个词（不抛错、不改字段名、
+//! 不加布尔位）；**识别与落点是 rust 的责任**。python 未来若新增合成词，必须
+//! 同步本表与 [`service::PreviewService::parse_ci_status`] —— 本仓的兜底是
+//! 「未知词当进行中」，代价是**不会自动识别新词**（落进无限轮询的老坑）。
+//!
+//! ## CI 终局失败的落点：`NotExist` / `Cancel` / `Pause` 一律 **FAILED + 21117**
+//!
+//! 三者都打 `FAILED`、返 21117 / HTTP 502，**不静默重提 job**（2026-10-13
+//! review 第 1 轮的设计决策）。论证：
+//!
+//! **为什么不是「静默重提一个新 job」**（题面给的另一个选项）：
+//!
+//! - ⚠️ **钱**：CI **按页计费**。「`NotExist` 就重提」在「CI 系统性返回
+//!   `NotExist`」（桶没开通 CI / python 侧映射写错 / 凭据失效）时会变成
+//!   **无限提交 job** —— 每轮轮询提交一次，每次都真金白银，而用户一次图也
+//!   看不到。本模块现有的三处省钱护栏（唯一索引并发闸门、`READY` 绝不重置、
+//!   登记冲突方绝不自己提交）全部指向同一个取舍：**宁可不提交，也不要重复提交**。
+//! - ✅ **成本上限明确**：判成 `FAILED` 后，本次调用**一次 submit 都不会发生**。
+//!   「重新提交」只在**下一次调用**经 `reset_to_pending` 自愈路径发生 ⇒ 上限是
+//!   **「用户点一次 = 最多一个 job」**，是用户驱动的，不是轮询驱动的。
+//!   前端拿到的是 502（错误）而不是 `PENDING`，**轮询循环被打断** ⇒ 不存在
+//!   「后端自己把自己打成无限提交」。
+//! - ✅ **可观测**：静默重提会把「job 莫名消失」这类上游异常变成只留一行会被
+//!   轮转掉的 `tracing::warn!`；判成 `FAILED` 则每次都 `mark_failed` 落
+//!   `error_message`（含原因短语）+ 返 21117，排障时能直接查库。
+//!
+//! **`NotExist` 的主因判断**（决定了「该重试还是该报错」）：题面给的触发条件里
+//! 「记录过期（> 1 个月）」在本项目**基本不可能是主因** —— `t_file_preview`
+//! 的行生命周期远短于一个月（预览通常几分钟内收敛），而 job 是**登记当时**就
+//! 提交的。故撞上 `NotExist` 更可能是 **CI 侧 job 记录异常丢失**，那是一件
+//! **需要人看**的事，报出来比静默重试更合适。即便真是过期，判 `FAILED` 也
+//! 不亏：下一次调用会重提，新 job 是新鲜的、必然查得到。
+//!
+//! **`Cancel` / `Pause` 不与 `NotExist` 混为一谈**：
+//!
+//! - `Cancel`（被取消）是 CI 的确定性终态，**不会自行变化** ⇒ 判 FAILED 显然正确。
+//! - `Pause`（队列暂停）CI 侧**理论上可被 Resume**，但本系统**两侧都没有任何
+//!   一侧会去做 Resume**（零后台任务、纯惰性轮询、没有运维控制台接进本模块）
+//!   ⇒ 对本状态机而言它就是终点。判 `Running` 的后果是「永久转圈」，判
+//!   `FAILED` 的后果是「一次 21117 + 用户再点一次自动重来」，后者有自愈路径兜底。
+//!   ⚠️ **残留风险已登记**（见下方已知偏差 #5）：若 CI 存在「无需人工、某次
+//!   `Pause` 会自动恢复」的场景，本判法会**过早判死**一份本可成功的预览；代价是
+//!   「多跑一个 job」而不是「永远失败」。
+//!
+//! ## ⚠️ `Success` 但 0 页仍当进行中（**护栏，勿改**）
+//!
+//! CI 的 Success 快照**可能先于对象落盘**：报成功的那一刻 `total_page_count`
+//! 还是 0。此时若直接判 `Success`，`mark_ready(0)` 会返回**空 `pages` 的 READY**
+//! —— 前端拿到「渲染成功」却一张图都没有，且该行已是终态、**永远不会自愈**。
+//!
 //! ## ⚠️ 已知偏差登记
 //!
 //! | # | 偏差 | 状态 |
@@ -145,6 +234,18 @@
 //! | 3 | `preview_seed` 在 `content_sha256 IS NULL` 的历史行上**退回按 `object_key` 哈希**，非内容寻址 ⇒ 同一份内容挂不同文件名会重复跑 CI | **未修**（要回填历史行哈希得重读 COS 对象，属独立立项） |
 //! | 4 | `next_poll_at` 的退避**固定 2s、无递增**，长文档（大 PDF 几百页）渲染超过 ~10s 时前端会持续轮询到收敛 | **未修**（本表无「轮询次数」列；上限常数 `POLL_BACKOFF_MAX_SECONDS=5s` 已预留接缝） |
 //! | 5 | 预览图 public-read **无过期、无撤销**（除改 COS ACL）；且无法按零件关闭 | **有意保留 + 已登记**（用户拍板选项 A；见「安全取舍反转」一节） |
+//! | 6 | **CI 终局失败的落点是 `FAILED` + 21117，不静默重提 job**（`NotExist` / `Cancel` / `Pause` 三者同判）。代价：`Pause` 若在 CI 侧存在「自动恢复」的场景会被**过早判死**（多跑一个 job 而非永远失败） | **有意 + 已论证**（见「CI 终局失败的落点」一节，含「为什么不会变成无限提交 job」的论证） |
+//! | 7 | **跨仓词表缺口（2026-10-13 review 第 1 轮已修 rust 侧）**：`NotExist` 是 python **合成**的词（CI 官方六态里没有），python 侧**只负责产出、不抛 404、不加 `exists` 位**；**识别与落点全部由 rust 负责**（`parse_ci_status`）。此前 rust 只认 `Success`/`Failed`，其余全落「进行中」⇒ `NotExist` / `Cancel` / `Pause` 会**无限轮询** | **已修（rust 侧）**；**python 侧需同步 doc**（把 `NotExist` 从「CI 官方状态」改述为「本仓合成」，位置清单见本节末） |
+//! | 8 | **状态字段名跨仓两种写法**：`forward_ci_describe` 的契约 doc 与既有实现读 `status`，python 侧文档称 `state`。本仓**两个键都读、`status` 优先**（读错 ⇒ 空串 ⇒ 落 `Running` 兜底 ⇒ 无限轮询） | **已在本仓兜住**；两侧收敛到同一键名后可删掉 `state` 那一支 |
+//!
+//! ### 需要 `backend-python` 同步的位置（本 PR 无法触及，python 在另一 worktree）
+//!
+//! | 文件 | 要改什么 |
+//! |---|---|
+//! | `core/ci.py` 的模块 / 函数 doc | 凡是把 `NotExist` 称作「CI 官方状态 / CI 六态之一」的地方，改述为「**本仓合成值**」并写明 3 个触发条件（`NonExistJobIds` 节点 / `JobsDetail.Code` 码 / 记录超期） |
+//! | `api/v1/ci_preview.py` 的端点 doc | 同上；并建议在响应字段说明里注明「`state` 的取值集合 = CI 官方六态 ∪ {`NotExist`}，识别方（rust）以该集合为准」 |
+//! | 两处 doc 的字段名 | 确认 `describe` 响应里状态字段到底叫 `state` 还是 `status`，与 rust 侧收敛成一个（rust 现读 `status` 优先、`state` 兜底，见偏差 #8） |
+//! | 两处 doc 的终态语义 | 注明「`Pause` 在 rust 侧被判为终局失败（21117）且不自动重提」，避免 python 侧以为「发 `Pause` 会有人来 Resume」 |
 //!
 //! ## 表依赖
 //!
