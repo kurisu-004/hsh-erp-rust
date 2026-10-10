@@ -27,7 +27,7 @@ use crate::modules::assembly::model::TAssembly;
 use crate::modules::assembly::repo::AssemblyRepoTrait;
 use crate::modules::assembly::statemachine::AssemblyStatus;
 use crate::modules::assembly::vo::AssemblyOut;
-use crate::modules::part_file::repo::{NewPartFile, hash_bytes};
+use crate::modules::files::part_file::repo::{NewPartFile, hash_bytes};
 use crate::shared::error::{AppError, code};
 
 use super::AssemblyService;
@@ -67,7 +67,7 @@ pub(crate) async fn list_assembly_files_dispatch(
     conn: &mut sqlx::PgConnection,
     assembly_id: i64,
     current: &CurrentUser,
-) -> Result<crate::modules::part_file::vo::PartFileListOut, AppError> {
+) -> Result<crate::modules::files::part_file::vo::PartFileListOut, AppError> {
     AssemblyService
         .list_assembly_files_inner(conn, assembly_id, current)
         .await
@@ -159,7 +159,7 @@ impl AssemblyService {
         let mut out = Vec::with_capacity(files.len());
         for (bytes, filename, content_type) in files {
             // 扩展名校验（仅允许 PDF）
-            let ext = crate::modules::part_file::policy::ext_of(&filename)
+            let ext = crate::modules::files::part_file::policy::ext_of(&filename)
                 .ok_or_else(|| AppError::biz(code::BIZ_PART_FILE_BAD_TYPE, "文件缺少扩展名"))?;
             if ext != "pdf" {
                 return Err(AppError::biz(
@@ -234,7 +234,7 @@ impl AssemblyService {
         mut repo: R,
         assembly_id: i64,
         current: &CurrentUser,
-    ) -> Result<crate::modules::part_file::vo::PartFileListOut, AppError> {
+    ) -> Result<crate::modules::files::part_file::vo::PartFileListOut, AppError> {
         current.require_any_role(&[
             Role::Manager,
             Role::Clerk,
@@ -259,10 +259,10 @@ impl AssemblyService {
             .map_err(AppError::from)?;
         // 3. 投影到 PartFileOut（kind 过滤在 SQL 后再做，list_by_owner 不带 kind）
         let total = rows.len() as i64;
-        let items: Vec<crate::modules::part_file::vo::PartFileOut> = rows
+        let items: Vec<crate::modules::files::part_file::vo::PartFileOut> = rows
             .into_iter()
             .filter(|r| r.kind == "ASSEMBLY_MASTER")
-            .map(|r| crate::modules::part_file::vo::PartFileOut {
+            .map(|r| crate::modules::files::part_file::vo::PartFileOut {
                 id: r.id,
                 owner_id: r.part_id,
                 owner_kind: "ASSEMBLY".to_string(),
@@ -280,7 +280,7 @@ impl AssemblyService {
                 created_by: r.created_by,
             })
             .collect();
-        Ok(crate::modules::part_file::vo::PartFileListOut { items, total })
+        Ok(crate::modules::files::part_file::vo::PartFileListOut { items, total })
     }
 
     // =======================================================================

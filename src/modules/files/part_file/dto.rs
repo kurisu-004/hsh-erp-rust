@@ -1,16 +1,29 @@
-//! part_file 域 DTO（2026-09-16 M2-B → 2026-09-18 上传会话拆分 + 2026-09-22 PR4 拆分）
+//! `files::part_file` 子模块 DTO（2026-09-16 M2-B → 2026-09-18 上传会话拆分
+//! + 2026-09-22 PR4 拆分 + 2026-10-13 收编进 files 域）
 //!
 //! 对应 Python myERP/schema/part_file.py。
 //!
 //! ## DTO/VO 边界（2026-09-22 PR4 重构）
 //! 本文件仅含入参（Deserialize）；出参结构（`PartFileOut` / `PartFileWithUrlOut` /
-//! `PartFileListOut`）已迁移至 `super::vo`。
+//! `PartFileListOut`）在 `super::vo`。
+//!
+//! 2026-10-13：`DeletePartFileRequest` 自 `parent::handler` 移入本文件（与
+//! `ConfirmFileIn` 做邻居）。原因是它原先被 `cnc` 子模块的 handler import ——
+//! 全仓唯一一处 handler → handler 跨模块 import；子模块化之后那条依赖线读起来像
+//! 「cnc 依赖 part_file 的 handler 层」，而 DTO 归 dto.rs 才是本仓既有约定
+//! （见上文 DTO/VO 边界）。
 
 use serde::Deserialize;
 
-use crate::modules::part_file::policy;
+use crate::modules::files::part_file::policy;
 use crate::shared::error::{AppError, code};
 use crate::shared::types::deserialize_i64;
+
+/// `POST /api/v2/files/objects/{file_id}/delete` 入参：版本号 OCC。
+#[derive(Debug, Deserialize)]
+pub struct DeletePartFileRequest {
+    pub version: i32,
+}
 
 // ===== 2026-09-16 M2-B 业务层：ConfirmFileIn（保留） =====
 //

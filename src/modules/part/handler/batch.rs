@@ -29,11 +29,11 @@ use serde_json::json;
 
 use crate::auth::rbac::CurrentUser;
 use crate::infra::ws_hub::WsEvent;
+use crate::modules::files::part_file::dto::ConfirmFileIn;
+use crate::modules::files::part_file::vo::PartFileOut;
 use crate::modules::part::dto_crud::{BatchWithPdfsRequest, PartBatchCreateRequest};
 use crate::modules::part::service::PartService;
 use crate::modules::part::vo::{PartBatchCreateOut, PartDetailOut};
-use crate::modules::part_file::dto::ConfirmFileIn;
-use crate::modules::part_file::vo::PartFileOut;
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
@@ -164,22 +164,23 @@ pub async fn confirm_part_file(
     Path(part_id): Path<i64>,
     Json(req): Json<ConfirmFileIn>,
 ) -> Result<Json<R<PartFileOut>>, AppError> {
-    let (out, tmp_key) = crate::modules::part_file::service::PartFileService::bind_uploaded_file(
-        &state.pool,
-        &state.snowflake,
-        state.cos.clone(),
-        &state.config.cos.upload_prefix,
-        &state.config.cos.tmp_prefix,
-        part_id,
-        &req.kind,
-        &req.tmp_key,
-        &req.content_sha256,
-        &req.original_filename,
-        req.file_size,
-        &req.content_type,
-        &current,
-    )
-    .await?;
+    let (out, tmp_key) =
+        crate::modules::files::part_file::service::PartFileService::bind_uploaded_file(
+            &state.pool,
+            &state.snowflake,
+            state.cos.clone(),
+            &state.config.cos.upload_prefix,
+            &state.config.cos.tmp_prefix,
+            part_id,
+            &req.kind,
+            &req.tmp_key,
+            &req.content_sha256,
+            &req.original_filename,
+            req.file_size,
+            &req.content_type,
+            &current,
+        )
+        .await?;
     // commit 已由 service 内 `tx.commit()` 完成；这里 spawn 异步清理 tmp
     let cos = state.cos.clone();
     tokio::spawn(async move {

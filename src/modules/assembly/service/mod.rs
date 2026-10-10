@@ -190,7 +190,7 @@ impl AssemblyService {
         conn: &mut sqlx::PgConnection,
         assembly_id: i64,
         current: &CurrentUser,
-    ) -> Result<crate::modules::part_file::vo::PartFileListOut, AppError> {
+    ) -> Result<crate::modules::files::part_file::vo::PartFileListOut, AppError> {
         lifecycle::list_assembly_files_dispatch(conn, assembly_id, current).await
     }
 

@@ -27,12 +27,12 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::cos::CosClient;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::com::customer::repo::CustomerRepo;
+use crate::modules::files::part_file::policy;
+use crate::modules::files::part_file::repo::{NewPartFile, PartFileRepo};
 use crate::modules::part::dto_crud::{FileBindingIn, PartBatchCreateRequest};
 use crate::modules::part::repo::NewPartCreate;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::vo::{PartBatchCreateOut, PartDetailOut};
-use crate::modules::part_file::policy;
-use crate::modules::part_file::repo::{NewPartFile, PartFileRepo};
 use crate::modules::prod::batch::repo::{NewInitialBatch, PartBatchRepo};
 use crate::shared::error::{AppError, code};
 
@@ -594,7 +594,7 @@ pub(super) async fn prepare_binding_head_copy(
     kind: &str,
     binding: &FileBindingIn,
 ) -> Result<PreparedBinding, AppError> {
-    use crate::modules::part_file::dto::validate;
+    use crate::modules::files::part_file::dto::validate;
     let max_file_size = 300 * 1024 * 1024usize;
     validate::check_kind(kind)?;
     validate::check_sha256(&binding.content_sha256)?;

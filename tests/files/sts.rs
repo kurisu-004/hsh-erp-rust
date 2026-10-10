@@ -1,23 +1,30 @@
-//! files 域 BFF（`POST /api/v2/files/sts-tmp-keys`）集成测试（2026-09-28 新增）
+//! files 域 BFF（`POST /api/v2/files/sts-tmp-keys`）集成测试
+//! （2026-09-28 新增为 `tests/files_sts_tmp_keys.rs`；2026-10-13 随 files 域升格为
+//! 文件资源容器域迁入本 binary）
 //!
 //! 覆盖：
 //! 1. 未带 token → 40100 UNAUTHORIZED（middleware 自动）
 //! 2. 带 MANAGER token + MockPyBackend 返回 200 + 信封 body → 200 + body 透传
 //! 3. 带 MANAGER token + MockPyBackend 返回 502 → 502 + BIZ_STS_FORWARD_FAILED=20406
+//! 4. handler 注入 `X-Forwarded-User-Id` / 不漏 `Authorization`（2026-09-29 新增）
+//!
+//! ⚠️ **URL 未变**：本端点是 files 域唯一不参与 2026-10-13 硬切的那条。
 //!
 //! ## 背景
 //! 修复 python `POST /api/v1/files/sts-tmp-keys` 裸开鉴权漏洞——rust 端新增
-//! 薄壳鉴权转发端点 `POST /api/v2/files/sts-tmp-keys`（详见
-//! `/Users/ren/.claude/plans/sts-session-uploader-sts-sts-sequential-globe.md`）。
+//! 薄壳鉴权转发端点 `POST /api/v2/files/sts-tmp-keys`。
 //!
 //! ## 测试栈
 //! - `tokio::test` + `tower::ServiceExt::oneshot` 直接调 Router
 //! - `MockPyBackendClient`（mockall automock）替换 `state.py_backend` 模拟 python 后端响应
 //!
 //! ## 不走 test_app / v2_router 的原因
-//! `v2_router` 当前因 wx 模块合并 bug（pre-existing）会在构造时 panic；
 //! 本测试单独构造一个最小 Router（仅 `authenticate_middleware` + `/files` nest），
-//! 避开 wx 模块的影响。鉴权与生产路径完全一致（同一 `authenticate_middleware`）。
+//! 避开构造 v2_router 时的其它域影响。鉴权与生产路径完全一致（同一
+//! `authenticate_middleware`）。
+//! ⚠️ 2026-10-13：`/files` nest 现在顺带挂上了本域新的对象 / CNC 路由
+//! （`.nest("/objects", …)` + `.nest("/cnc", …)`）。本文件一条都不打它们 ——
+//! 保留原样，不做改动。
 
 #![allow(clippy::await_holding_lock)]
 
@@ -47,13 +54,14 @@ async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
 /// 构造最小 Router：仅含 `authenticate_middleware` + `/files` nest + iam login 路由。
 ///
 /// ## 为什么不用 `test_app` / `v2_router`？
-/// 2026-09-28 wx 模块合并有 pre-existing 路由重叠 bug（`parts::router()` 与
-/// `batches::router()` 都注册 `GET /counts`），导致 `v2_router()` 在所有用
-/// `test_app` 启的 integration test 里 panic。本测试独立构造最小 Router：
+/// 本测试独立构造最小 Router：
 /// - 鉴权用 `auth::middleware::authenticate_middleware`（与生产路径同源）
 /// - `/files` nest 由 `modules::files::router()` 提供
 /// - `/iam/login` + `/iam/me` 用于 login_token helper + middleware 鉴权白名单
-/// - 不挂 wx / dashboard / ws 等其它 nest，避免触发 wx panic
+/// - 不挂其它 nest，避免引入无关模块的影响
+///
+/// ⚠️ 2026-10-13：`files::router()` 现在还会 nest `part_file`（`/objects`）与
+/// `cnc` 两个子模块。本文件一条都不打它们的端点（保留原样）。
 async fn build_minimal_app(state: Arc<hsh_erp_rust::state::AppState>) -> axum::Router {
     use axum::{Router, middleware};
     Router::new()

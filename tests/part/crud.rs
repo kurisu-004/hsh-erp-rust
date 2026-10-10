@@ -14,9 +14,9 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 
+use hsh_erp_rust::modules::files::part_file::policy;
+use hsh_erp_rust::modules::files::part_file::repo::PartFileRepo;
 use hsh_erp_rust::modules::part::service::PartService;
-use hsh_erp_rust::modules::part_file::policy;
-use hsh_erp_rust::modules::part_file::repo::PartFileRepo;
 use hsh_erp_rust::shared::error::code;
 use hsh_erp_test_support::*;
 

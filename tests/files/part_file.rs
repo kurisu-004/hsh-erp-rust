@@ -1,4 +1,5 @@
-//! part_file 域集成测试（2026-09-14 Phase 3）
+//! `files::part_file` 子模块集成测试（2026-09-14 Phase 3 建，2026-10-13 自
+//! `tests/part/file.rs` 迁入本 binary）
 //!
 //! 覆盖：
 //!   1. upload_pdf_happy_path                  — Manager 上传 PDF → 201 / 含 sha
@@ -13,21 +14,31 @@
 //!  10. rbac_shelf_account_can_get_file_content — 工控机账号能读内容（2026-10-10 放开）
 //!  11. rbac_shelf_account_get_file_url_still_forbidden — 预签直链**不**放开给工控机
 //!  12. rbac_shelf_account_cannot_upload_or_delete — 只放开只读，写路径仍拒
-//!  13. rbac_shelf_account_rejects_part_nested_lists — 零件维度三条嵌套列表端点仍拒
+//!  13. old_part_files_prefix_returns_404 — 硬切守卫（2026-10-13 新增）
+//!  14. old_part_files_numeric_path_returns_404 — 硬切守卫（2026-10-13 新增）
+//!  15. old_cnc_programs_prefix_returns_404 — 硬切守卫（2026-10-13 新增）
 //!
 //! ## 集成策略
 //! 主体是**直接 service 直调**（避免 JWT/Redis 开销）：`pool.begin()` 开 tx →
 //! 传 `&mut *tx` 给 service → 显式 `tx.commit()`。
-//! 例外是钉 **handler 级**角色闸门的用例（`rbac_shelf_account_rejects_part_nested_lists`）——
-//! handler 闸门在 service 之上，直调 service 结构上测不到，故那一条起 axum 走真实路由。
+//! 例外是末尾 3 条**硬切守卫**（2026-10-13）：它们打的是真实 HTTP 路由，
+//! 断言旧前缀 404 —— 这是 URL 硬切的回归护栏，service 直调结构上测不到。
+//!
+//! ## 2026-10-13 随端点下线删除的用例
+//! `rbac_shelf_account_rejects_part_nested_lists` —— 它断言的是零件维度三条嵌套列表
+//! 端点（`GET /part-files/parts/{id}/{files,cnc-programs,setup-sheets}`）对
+//! SHELF_ACCOUNT 返回 403。这三条端点本身已随零调用方清理下线，端点不存在了、
+//! 「handler 级闸门比 service 严」这个分叉也不再存在，故整条用例删除
+//! （角色矩阵的「`/url` 不放开给 SHELF」部分由本文件第 11 条独立守住）。
 
 use std::sync::Arc;
 
 use axum::http::StatusCode;
 use hsh_erp_rust::auth::rbac::{CurrentUser, Role};
 use hsh_erp_rust::infra::cos::NoopCos;
-use hsh_erp_rust::modules::part_file::service::PartFileService;
+use hsh_erp_rust::modules::files::part_file::service::PartFileService;
 use hsh_erp_rust::shared::error::AppError;
+use serde_json::json;
 use sqlx::PgPool;
 
 use hsh_erp_test_support::*;
@@ -351,7 +362,7 @@ async fn list_filter_by_kind() {
     }
 
     // list 仅 DRAWING（只上传了 1 个 DRAWING）
-    let query = hsh_erp_rust::modules::part_file::dto::PartFileListQuery {
+    let query = hsh_erp_rust::modules::files::part_file::dto::PartFileListQuery {
         owner_kind: Some("PART".into()),
         owner_id: Some(part_id.to_string()),
         kind: Some("DRAWING".into()),
@@ -461,7 +472,7 @@ async fn list_includes_paired_file_id() {
     }
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let query = hsh_erp_rust::modules::part_file::dto::PartFileListQuery {
+    let query = hsh_erp_rust::modules::files::part_file::dto::PartFileListQuery {
         owner_kind: Some("PART".into()),
         owner_id: Some(part_id.to_string()),
         kind: None,
@@ -585,10 +596,11 @@ async fn soft_delete_happy_path() {
 
     // 再次查应 not found（include_deleted=false）
     let mut tx = pool.begin().await.unwrap();
-    let row =
-        hsh_erp_rust::modules::part_file::repo::PartFileRepo::get_by_id(&mut *tx, out.id, false)
-            .await
-            .unwrap();
+    let row = hsh_erp_rust::modules::files::part_file::repo::PartFileRepo::get_by_id(
+        &mut *tx, out.id, false,
+    )
+    .await
+    .unwrap();
     drop(tx);
     assert!(row.is_none(), "软删后应查不到");
 }
@@ -636,8 +648,8 @@ async fn soft_delete_version_conflict() {
 
 // ===== 2026-09-18 takeover：confirm 端点测试 =====
 
-use hsh_erp_rust::modules::part_file::dto::ConfirmFileIn;
-use hsh_erp_rust::modules::part_file::repo::PartFileRepo;
+use hsh_erp_rust::modules::files::part_file::dto::ConfirmFileIn;
+use hsh_erp_rust::modules::files::part_file::repo::PartFileRepo;
 
 const UPLOAD_TMP_PREFIX: &str = "tmp/";
 const UPLOAD_UPLOAD_PREFIX: &str = "uploads";
@@ -973,7 +985,7 @@ async fn rbac_shelf_account_can_list_files() {
     tx.commit().await.unwrap();
 
     let shelf_account = test_current_user_with_roles(vec![Role::ShelfAccount]);
-    let query = hsh_erp_rust::modules::part_file::dto::PartFileListQuery {
+    let query = hsh_erp_rust::modules::files::part_file::dto::PartFileListQuery {
         owner_kind: Some("PART".into()),
         owner_id: Some(part_id.to_string()),
         kind: Some("DRAWING".into()),
@@ -1152,62 +1164,205 @@ async fn rbac_shelf_account_cannot_upload_or_delete() {
     }
 }
 
-/// 零件维度的三条**嵌套**列表端点对 SHELF_ACCOUNT **仍拒**。
+// ===========================================================================
+//  2026-10-13 files 域重组硬切守卫：旧前缀 404、无 alias
+//
+//  三条用例的共同判据是 **HTTP 404**，且不能被 40100 / 40300 / 400 解释掉：
+//
+//  - 不是 40100：`v2_router` 的 `authenticate_middleware` 是 `route_layer`（只作用于
+//    已匹配路由），路由匹配阶段就落空的请求不会被鉴权吃掉（见
+//    `tests/iam/middleware.rs` 的同款不变量用例）。三条都带合法 MANAGER token。
+//  - 不是 40300：同样带 MANAGER token，且守卫在 service 层、真落进端点必 200/4xx 业务码。
+//  - 不是 400：`iam::shelf` 迁移时踩过「旧路径带前缀仍落在 `/iam/shelves/{id}` 的
+//    `Path<i64>` 提取器 ⇒ 400 纯文本」的坑 —— 那里是**部分前缀**残留导致的 catch-all
+//    命中。本域是整段前缀（`/part-files` + `/cnc-programs`）从 `v2_router` 上删除，
+//    连 catch-all 都没有，故必须是干净的 404。若哪天有人「贴心地」加一个
+//    `/part-files/*path` 之类的兜底，这三条会当场红。
+//
+//  ⚠️ 用 `send_raw`（不解析 JSON）而不是 `send`：404 的 body 是**空**，
+//  `send` 的 JSON 解析会 panic（`EOF while parsing a value`）。与 `tests/iam/shelf.rs`
+//  的 404 守卫同款做法。
+//
+//  ⚠️ 每条都先造一条**真实** `t_part_file` 行，让「404」不能被「资源本来就不存在」
+//  解释掉（`tests/iam/shelf.rs::old_shelf_paths_are_gone` 的同款取证手法）。
+// ===========================================================================
+
+/// 为三条 404 守卫共用的 bootstrap：造真实 part + 真实 t_part_file 行 + MANAGER token。
 ///
-/// `PartFileService::list_files` 的白名单已含 `ShelfAccount`（供报工台预览图纸），
-/// 放开的只有顶层 `GET /part-files` 一条。零件维度这三条在 handler 里各自先过一道
-/// 4 角色闸门，取交集 ⇒ 4 角色，SHELF_ACCOUNT 进不去。闸门在 handler 层 ⇒ 本用例
-/// **必须走真实路由**（直调 service 测不到它）。
-///
-/// 顺带钉住正向对照：MANAGER 打同三条是 200 —— 证明闸门只挡 SHELF，不是「全员拒」。
-#[tokio::test]
-async fn rbac_shelf_account_rejects_part_nested_lists() {
+/// 返回 `(pool, app, token, file_id)`；`file_id` 是真实存在的那条文件的雪花 id。
+async fn bootstrap_hardcut_guard() -> (PgPool, axum::Router, String, i64) {
     let pool = test_pool().await;
     let fx = load_part_fixture(&pool).await;
     let app = test_app(test_state(pool.clone()).await);
-    let l1 = insert_l1_customer(&pool, "客户PF-NestedList", "F").await;
-    let l2 = insert_l2_customer(&pool, "子客PF-NestedList", l1).await;
+    let token = login_token(&app, &fx.manager_username, PartFixture::PASSWORD).await;
+
+    let l1 = insert_l1_customer(&pool, "客户PF-HardCut", "F").await;
+    let l2 = insert_l2_customer(&pool, "子客PF-HardCut", l1).await;
     let part_id = insert_part_for_owner(&pool, l2).await;
 
-    let paths = [
-        "/part-files/parts/{part_id}/files",
-        "/part-files/parts/{part_id}/cnc-programs",
-        "/part-files/parts/{part_id}/setup-sheets",
-    ];
-
-    let shelf_token = login_token(&app, &fx.shelf_account_username, PartFixture::PASSWORD).await;
-    for p in paths {
-        let (status, env) = send(
-            app.clone(),
-            json_request(
-                "GET",
-                &p.replace("{part_id}", &part_id.to_string()),
-                None,
-                Some(&shelf_token),
-            ),
+    let cos = Arc::new(NoopCos);
+    let mut tx = pool.begin().await.unwrap();
+    let out = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
+        .upload_file_for_owner(
+            &mut *tx,
+            "PART",
+            part_id,
+            "DRAWING",
+            "hardcut.pdf",
+            "application/pdf",
+            b"%PDF-1.5\nhardcut\n%%EOF".to_vec(),
+            &test_current_user_with_roles(vec![Role::Manager]),
         )
-        .await;
+        .await
+        .expect("MANAGER 上传应成功（保证 404 不是「资源不存在」造成的）");
+    tx.commit().await.unwrap();
+
+    (pool, app, token, out.id)
+}
+
+/// `GET /api/v2/part-files`（旧前缀整段）→ 404。
+#[tokio::test]
+async fn old_part_files_prefix_returns_404() {
+    let (_pool, app, token, file_id) = bootstrap_hardcut_guard().await;
+
+    // 先钉正向对照：新路径对同一个 file_id 必须 200 —— 证明守卫打的确实是旧前缀，
+    // 而不是「这个域整体坏了」。
+    // ⚠️ 用 `send_raw`：`/content` 回的是二进制流（测试里是 NoopCos 的空字节），
+    // 不是 JSON 信封，`send` 会 panic。
+    let (new_status, new_raw) = send_raw(
+        app.clone(),
+        json_request(
+            "GET",
+            &format!("/files/objects/{file_id}/content"),
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        new_status,
+        StatusCode::OK,
+        "新路径 GET /files/objects/{{id}}/content 应 200（正向对照）: {new_status} {new_raw:?}"
+    );
+
+    // 列表端点的正向对照：`GET /api/v2/files/objects`（**无尾斜杠**）必须命中。
+    //
+    // ⚠️ 尾斜杠形态（`/files/objects/`）是 404 —— 这**不是**本次引入的行为：
+    // axum 0.8 的 `nest` 把内层 `.route("/", …)` 注册成 `<prefix>` 本身（不带尾斜杠），
+    // 迁移前的 `GET /api/v2/part-files/` 同样是 404（2026-10-13 用等价路由形状的
+    // 对照探针实测过 old/new 两侧逐条一致）。任务书端点映射表里写的
+    // 「`GET /api/v2/part-files/` → `GET /api/v2/files/objects/`」中的尾斜杠来自
+    // 路由注册串 `.route("/", …)`，不是 wire 上的 URL；前端照旧用**无尾斜杠**即可。
+    // 这里把两种写法都钉死，避免后人「顺手补个尾斜杠 alias」。
+    let (list_status, list_raw) = send_raw(
+        app.clone(),
+        json_request(
+            "GET",
+            &format!("/files/objects?owner_kind=PART&owner_id={file_id}"),
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        list_status,
+        StatusCode::OK,
+        "新路径 GET /files/objects 应 200（正向对照）: {list_status} {list_raw}"
+    );
+
+    let (slash_status, slash_raw) = send_raw(
+        app.clone(),
+        json_request(
+            "GET",
+            &format!("/files/objects/?owner_kind=PART&owner_id={file_id}"),
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        slash_status,
+        StatusCode::NOT_FOUND,
+        "尾斜杠形态 /files/objects/ 迁移前后都是 404（axum 0.8 nest 语义，未变）: {slash_status} {slash_raw}"
+    );
+
+    for method_path in [
+        ("GET", "/part-files".to_string()),
+        ("POST", "/part-files".to_string()),
+        ("GET", format!("/part-files/{file_id}/url")),
+        ("GET", format!("/part-files/{file_id}/content")),
+        ("POST", format!("/part-files/{file_id}/delete")),
+    ] {
+        let (method, uri) = method_path;
+        let body = if method == "GET" {
+            None
+        } else {
+            Some(json!({}))
+        };
+        let (status, raw) =
+            send_raw(app.clone(), json_request(method, &uri, body, Some(&token))).await;
         assert_eq!(
             status,
-            StatusCode::FORBIDDEN,
-            "SHELF_ACCOUNT 不该能列 {p}: {env}"
+            StatusCode::NOT_FOUND,
+            "旧前缀 {method} /api/v2{uri} 必须 404（硬切无 alias）: {status} {raw}"
         );
-        assert_eq!(env["code"], 40300, "{p} 应为 FORBIDDEN: {env}");
     }
+}
 
-    // 正向对照：闸门只挡 SHELF_ACCOUNT，MANAGER 打同三条仍 200。
-    let mgr_token = login_token(&app, &fx.manager_username, PartFixture::PASSWORD).await;
-    for p in paths {
-        let (status, env) = send(
-            app.clone(),
-            json_request(
-                "GET",
-                &p.replace("{part_id}", &part_id.to_string()),
-                None,
-                Some(&mgr_token),
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "MANAGER 应能列 {p}: {env}");
+/// `GET /api/v2/part-files/{数字}/content`（旧前缀 + 数字段）→ 404，**不是** 400。
+///
+/// 这一条专门钉「旧前缀不落进任何 `Path<i64>` catch-all」：如果将来有人把
+/// `/part-files` nest 加回来却只注册了 `/{file_id}/content` 之外的形状，这一条会
+/// 先于其它用例报警。
+#[tokio::test]
+async fn old_part_files_numeric_path_returns_404() {
+    let (_pool, app, token, _file_id) = bootstrap_hardcut_guard().await;
+
+    for path in [
+        "/part-files/999999999999/content",
+        "/part-files/abc/content",
+        "/part-files/1/update",
+        "/part-files/parts/1/files",
+        // 2026-10-13：子模块挂载段曾一度写成 `/files/part-files/*`（把旧 URL 的
+        // 路径段原样带进了新 nest）。此处钉死它**同样**不可达 —— 新 URL 只有
+        // `/files/objects/*` 一个形状。
+        "/files/part-files/999999999999/content",
+        "/files/part-files",
+    ] {
+        let (status, raw) =
+            send_raw(app.clone(), json_request("GET", path, None, Some(&token))).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "GET {path} 应是干净的 404（不得落进 Path<i64> 变 400）: {status} {raw}"
+        );
+    }
+}
+
+/// `GET /api/v2/cnc-programs`（CNC 域旧前缀整段）→ 404。
+#[tokio::test]
+async fn old_cnc_programs_prefix_returns_404() {
+    let (_pool, app, token, file_id) = bootstrap_hardcut_guard().await;
+
+    for method_path in [
+        ("GET", "/cnc-programs".to_string()),
+        ("POST", "/cnc-programs/pairs".to_string()),
+        ("GET", format!("/cnc-programs/{file_id}/download-url")),
+        ("GET", format!("/cnc-programs/{file_id}/content")),
+        ("POST", format!("/cnc-programs/{file_id}/delete")),
+    ] {
+        let (method, uri) = method_path;
+        let body = if method == "GET" {
+            None
+        } else {
+            Some(json!({}))
+        };
+        let (status, raw) =
+            send_raw(app.clone(), json_request(method, &uri, body, Some(&token))).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "旧前缀 {method} /api/v2{uri} 必须 404（硬切无 alias）: {status} {raw}"
+        );
     }
 }

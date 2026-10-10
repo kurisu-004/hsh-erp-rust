@@ -1,42 +1,51 @@
-//! cnc_program 域业务逻辑（2026-09-14 Phase 3 + 2026-09-15 takeover-fill + 2026-09-22 对齐 iam 范式）
+//! `part_file::cnc` 子模块业务逻辑（2026-09-14 Phase 3 + 2026-09-15 takeover-fill
+//! + 2026-09-22 对齐 iam 范式 + 2026-10-13 收编进 files 域）
 //!
 //! 对应 Python myERP/service/cnc_program_service.py。
 //!
 //! ## 配对上传（cnc-pair）
 //! 一次提交 G_CODE + SETUP_SHEET 两个文件：
-//! 1. 校验 part 存在（`repo.part_exists`）
-//! 2. 计算两份 sha256 → 各自走 CAS 去重（命中则复用 object_key，委托 `PartFileRepo`）
+//! 1. 校验 part 存在（`repo.part_owner_exists`）
+//! 2. 计算两份 sha256 → 各自走 CAS 去重（命中则复用 object_key）
 //! 3. 上传 COS（按 sha + owner_key 模板）
 //! 4. 插入两条 `t_part_file` 行，`paired_file_id` 互相指向
 //!
-//! ## 列表（按 part 过滤）
-//! G_CODE created_at DESC + 通过 `paired_file_id` 反查 SETUP_SHEET。
+//! ## 2026-10-13：repo 层取消，本子模块直接用父模块 repo
 //!
-//! ## 3 个 alias 端点的处理（2026-09-22 重构）
-//! 原 `CncProgramService::get_download_url` / `get_content` / `delete` 三个 alias
-//! 方法**已删除**——handler 直接调用 `state.part_file_service.method(&mut tx, ...)`，
-//! 不再走 `CncProgramService` 转发（spec §C-1 决策点 1：避免 handler 收两个 service；
-//! 与 shelf picker 跨域 helper 模式区分）。
+//! 原独立的 `CncProgramRepoTrait`（6 方法）整目录删除，泛型参数换成本模块的父模块
+//! trait `parent::repo::PartFileRepoTrait`。方法对照：
 //!
-//! ## 事务边界（2026-09-22 重构对齐 iam 范式）
+//! | 旧 `CncProgramRepoTrait` 方法 | 新对应物 |
+//! |---|---|
+//! | `part_exists` | `PartFileRepoTrait::part_owner_exists`（SQL 逐字相同） |
+//! | `part_file_get_by_owner_kind_sha` | `PartFileRepoTrait::get_by_owner_kind_sha` |
+//! | `part_file_create_part_file` | `PartFileRepoTrait::create_part_file` |
+//! | `insert_setup_sheet_with_paired` | `PartFileRepoTrait::insert_setup_sheet_with_paired` |
+//! | `set_paired_file_id` | `PartFileRepoTrait::set_paired_file_id` |
+//! | `list_pairs_for_part` | **删除**（端点已下线，见 `mod.rs` 移除记录） |
+//!
+//! ⚠️ 后两条的 SQL 字符串原本在 `cnc/repo/mod.rs` 与 `parent::repo/mod.rs` **两个
+//! trait impl 内逐字重复**（2026-09-22 重构时的一致性约定，本就是同一份 SQL 写两遍）。
+//! 删掉一侧后只剩 `parent::repo` 一份真源。
+//!
+//! ## 事务边界（2026-09-22 重构对齐 iam 范式，2026-10-13 不变）
 //! 事务移交 handler：service 仅业务逻辑，所有跨 repo 操作经 `repo: R`（by-value；
-//! `R: CncProgramRepoTrait`）参数传入——handler/service 借 `&mut *tx` / `&mut *conn`
+//! `R: PartFileRepoTrait`）参数传入——handler/service 借 `&mut *tx` / `&mut *conn`
 //! 喂给 trait（trait 已直接 `impl for &mut PgConnection`）。service 不知事务——
 //! handler `pool.begin()` + `tx.commit()` 包外。
 //!
 //! `CncProgramService` 字段仅 `snowflake` + `cos`（事务已移交 handler）；实例为轻壳，
 //! 可直接 `Arc<CncProgramService>` 存 `AppState`；方法签名
-//! `<R: CncProgramRepoTrait>(&self, mut repo: R, ...)`，生产 `R = &mut PgConnection`。
+//! `<R: PartFileRepoTrait>(&self, mut repo: R, ...)`，生产 `R = &mut PgConnection`。
 
 use std::sync::Arc;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::cos::CosClient;
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::cnc_program::repo::CncProgramRepoTrait;
-use crate::modules::cnc_program::vo::{CncFileRef, CncPairListItem, CncPairListOut, CncPairOut};
-use crate::modules::part_file::policy;
-use crate::modules::part_file::repo::{NewPartFile, hash_bytes};
+use crate::modules::files::part_file::cnc::vo::{CncFileRef, CncPairOut};
+use crate::modules::files::part_file::policy;
+use crate::modules::files::part_file::repo::{NewPartFile, PartFileRepoTrait, hash_bytes};
 use crate::shared::error::{AppError, code};
 
 pub struct CncProgramService {
@@ -55,7 +64,7 @@ impl CncProgramService {
     ///
     /// Returns `CncPairOut { g_code, setup_sheet }`。
     #[allow(clippy::too_many_arguments)]
-    pub async fn upload_cnc_pair<R: CncProgramRepoTrait>(
+    pub async fn upload_cnc_pair<R: PartFileRepoTrait>(
         &self,
         mut repo: R,
         part_id: i64,
@@ -70,7 +79,7 @@ impl CncProgramService {
         current.require_any_role(&[Role::Manager, Role::CncProgrammer])?;
 
         // 1. 校验 part 存在（走 trait helper）
-        if !repo.part_exists(part_id).await? {
+        if !repo.part_owner_exists(part_id).await? {
             return Err(AppError::biz(
                 code::BIZ_PART_NOT_FOUND,
                 format!("part {part_id} 不存在"),
@@ -108,10 +117,10 @@ impl CncProgramService {
         let s_sha = hash_bytes(&setup_bytes);
 
         let g_existing = repo
-            .part_file_get_by_owner_kind_sha(part_id, "G_CODE", &g_sha)
+            .get_by_owner_kind_sha(part_id, "G_CODE", &g_sha)
             .await?;
         let s_existing = repo
-            .part_file_get_by_owner_kind_sha(part_id, "SETUP_SHEET", &s_sha)
+            .get_by_owner_kind_sha(part_id, "SETUP_SHEET", &s_sha)
             .await?;
 
         // 4. COS 上传（CAS 命中跳过）
@@ -166,7 +175,7 @@ impl CncProgramService {
                     created_by: current.id,
                 };
                 // 先插 G_CODE（拿到 id 写 SETUP_SHEET.paired_file_id）
-                repo.part_file_create_part_file(nf_g).await?;
+                repo.create_part_file(nf_g).await?;
                 // 再插 SETUP_SHEET，paired_file_id = g_id_new（走 trait helper）
                 repo.insert_setup_sheet_with_paired(
                     s_id_new,
@@ -217,41 +226,14 @@ impl CncProgramService {
             },
         })
     }
-
-    /// 列出 part 全部 CNC 配对（G_CODE created_at DESC + 反查 SETUP_SHEET）。
-    pub async fn list_pairs_for_part<R: CncProgramRepoTrait>(
-        &self,
-        mut repo: R,
-        part_id: i64,
-        current: &CurrentUser,
-    ) -> Result<CncPairListOut, AppError> {
-        current.require_any_role(&[
-            Role::Manager,
-            Role::Clerk,
-            Role::CncProgrammer,
-            Role::Inspector,
-        ])?;
-        let pairs = repo.list_pairs_for_part(part_id).await?;
-        let mut items = Vec::with_capacity(pairs.len());
-        for (g, s_opt) in pairs {
-            let (s_id, s_filename) = match s_opt {
-                Some(s) => (s.id, s.original_filename),
-                None => (0, String::new()),
-            };
-            items.push(CncPairListItem {
-                g_code_id: g.id,
-                setup_sheet_id: s_id,
-                g_code_filename: g.original_filename,
-                setup_sheet_filename: s_filename,
-                created_at: g.created_at,
-            });
-        }
-        let total = items.len() as i64;
-        // 预签 URL 不入列表（懒加载）；单独端点取详情时再生成
-        let _ = &self.cos; // suppress unused
-        Ok(CncPairListOut { items, total })
-    }
 }
+
+// 2026-10-13：`list_pairs_for_part`（CNC 配对列表）随 `GET /cnc-programs/parts/{part_id}`
+// 端点下线一并删除 —— 零前端调用方，前端配对分组改由
+// `GET /files/objects?owner_kind=PART&owner_id=…&kind=G_CODE` 驱动（列表项带
+// `paired_file_id`）。本方法原是本子模块唯一用到 `self.cos` 之外的路径，删除后
+// `CncProgramService` 的 `cos` 字段仍被 `upload_cnc_pair` 的 `put_object` /
+// `presigned_get_url` 使用。
 
 fn sanitize_filename(name: &str) -> String {
     let mut out = String::with_capacity(name.len());

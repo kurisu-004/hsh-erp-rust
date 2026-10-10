@@ -48,16 +48,16 @@
 
 use std::sync::Arc;
 
-use sqlx::{PgConnection, PgPool};
+use sqlx::PgPool;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::cos::CosClient;
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::part_file::dto::{PartFileListQuery, validate};
-use crate::modules::part_file::model::TPartFile;
-use crate::modules::part_file::policy;
-use crate::modules::part_file::repo::{NewPartFile, PartFileRepoTrait, hash_bytes};
-use crate::modules::part_file::vo::{PartFileListOut, PartFileOut, PartFileWithUrlOut};
+use crate::modules::files::part_file::dto::{PartFileListQuery, validate};
+use crate::modules::files::part_file::model::TPartFile;
+use crate::modules::files::part_file::policy;
+use crate::modules::files::part_file::repo::{NewPartFile, PartFileRepoTrait, hash_bytes};
+use crate::modules::files::part_file::vo::{PartFileListOut, PartFileOut, PartFileWithUrlOut};
 use crate::shared::error::{AppError, code};
 use crate::util::cos_key;
 
@@ -80,6 +80,12 @@ impl PartFileService {
     /// 客户端声明的 MIME；`bytes` 是文件二进制。
     ///
     /// 返回新建的 `PartFileOut`（含 id）。
+    ///
+    /// ⚠️ **2026-10-13：HTTP 端点已下线，本方法作为通用上传原语保留。**
+    /// `POST /part-files/`（multipart 上传）随零调用方端点清理下线，前端走
+    /// STS 直传 + `POST /parts/{part_id}/files/confirm`。本方法当前**仅集成测试在用**，
+    /// 见 `tests/files/part_file.rs` 用它铺 fixture —— 删掉要把 17 处调用改写成多行
+    /// `PartFileRepo::create_part_file` + `cos.put_object`，纯工作量零收益。
     #[allow(clippy::too_many_arguments)]
     pub async fn upload_file_for_owner<R: PartFileRepoTrait>(
         &self,
@@ -369,15 +375,8 @@ impl PartFileService {
 // 2026-09-29 扁平化：旧的本地 `sanitize_filename` 函数 + 其单元测试已删除，
 // 统一走 `util::cos_key::safe_filename` 单一真相源。
 
-/// 公开给装配体 upload-files 端点用的辅助：列出某 owner 的 part_file（不限定 kind）。
-#[allow(dead_code)]
-pub async fn list_part_files_for_owner(
-    conn: &mut PgConnection,
-    owner_kind: &str,
-    owner_id: i64,
-) -> Result<Vec<TPartFile>, sqlx::Error> {
-    crate::modules::part_file::repo::PartFileRepo::list_by_owner(conn, owner_kind, owner_id).await
-}
+// 2026-10-13：`list_part_files_for_owner`（原 `#[allow(dead_code)]`，本就是 0 调用方）
+// 已删除。要列某 owner 的 part_file 直接走 `PartFileRepo::list_by_owner(conn, kind, id)`。
 
 // ===== 2026-09-16 M2-B 业务层：bind_uploaded_file（confirm + batch_create 共享） ==============
 //

@@ -652,7 +652,7 @@ async fn batch_create_with_bindings_object_key_test() {
     // 直接查 DB 找 part_file 行：按 owner_id + kind 找出刚生成的 part_file
     let new_part_id = out.created[0].part.id;
     let mut tx = pool.begin().await.unwrap();
-    let rows = hsh_erp_rust::modules::part_file::repo::PartFileRepo::list_by_owner(
+    let rows = hsh_erp_rust::modules::files::part_file::repo::PartFileRepo::list_by_owner(
         &mut *tx,
         "PART",
         new_part_id,

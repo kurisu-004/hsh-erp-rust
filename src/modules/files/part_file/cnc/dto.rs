@@ -1,4 +1,5 @@
-//! cnc_program 域 DTO（2026-09-14 Phase 3 + 2026-09-22 PR4 拆分）
+//! `part_file::cnc` 子模块 DTO（2026-09-14 Phase 3 + 2026-09-22 PR4 拆分
+//! + 2026-10-13 收编进 files 域）
 //!
 //! 对应 Python myERP/schema/cnc_program.py。
 //!
@@ -6,8 +7,8 @@
 //! 形成一对（`paired_file_id` 互相指向对方）。
 //!
 //! ## DTO/VO 边界（2026-09-22 PR4 重构）
-//! 本文件仅含入参（Deserialize）；出参结构（`CncPairOut` / `CncFileRef` /
-//! `CncPairListItem` / `CncPairListOut`）已迁移至 `super::vo`。
+//! 本文件仅含入参（Deserialize）；出参结构（`CncPairOut` / `CncFileRef`）在
+//! `super::vo`。
 
 use serde::Deserialize;
 

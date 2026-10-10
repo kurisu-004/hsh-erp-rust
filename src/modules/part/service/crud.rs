@@ -32,14 +32,14 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::assembly::service::AssemblyService;
 use crate::modules::com::customer::repo::CustomerRepo;
+use crate::modules::files::part_file::model::TPartFile;
+use crate::modules::files::part_file::policy; // 2026-09-11 新增：kind → 扩展名 / content_type 白名单
+use crate::modules::files::part_file::repo::{NewPartFile, PartFileRepo, hash_bytes};
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::repo::{NewPartCreate, PartListFilters, PartUpdate};
 use crate::modules::part::vo::{
     PartBatchScanOut, PartDetailOut, PartListItem, PartListOut, PartScanContextOut, PartScanInfoOut,
 };
-use crate::modules::part_file::model::TPartFile;
-use crate::modules::part_file::policy; // 2026-09-11 新增：kind → 扩展名 / content_type 白名单
-use crate::modules::part_file::repo::{NewPartFile, PartFileRepo, hash_bytes};
 use crate::modules::prod::batch::repo::{NewInitialBatch, PartBatchRepo};
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
 use crate::shared::customer::expand_customer_id;

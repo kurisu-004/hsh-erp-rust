@@ -29,7 +29,7 @@
 
 use sqlx::PgExecutor;
 
-use crate::modules::part_file::model::TPartFile;
+use crate::modules::files::part_file::model::TPartFile;
 
 /// `create_part_file` 输入：service 层用 builder 模式注入。
 ///

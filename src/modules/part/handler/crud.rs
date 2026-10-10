@@ -22,6 +22,7 @@ use serde_json::json;
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::ws_hub::WsEvent;
 use crate::modules::assembly::vo::AssemblyDetail;
+use crate::modules::files::part_file::model::TPartFile;
 use crate::modules::part::dto_crud::{
     BatchUpdateOrderInfoRequest, MatchByExcelItemsRequest, PartCreateRequest, PartListQuery,
     PartSoftDeleteRequest, PartUpdateRequest,
@@ -31,7 +32,6 @@ use crate::modules::part::vo::{
     BatchUpdateOrderInfoOut, LocationTreeOut, MatchByExcelItemResult, PartBatchListItemOut,
     PartDetailOut, PartEventOut, PartListOut, PartScanContextOut,
 };
-use crate::modules::part_file::model::TPartFile;
 use crate::shared::error::{AppError, code};
 use crate::shared::response::R;
 use crate::state::AppState;

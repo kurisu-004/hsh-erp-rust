@@ -1,14 +1,35 @@
-//! files 域 HTTP handler
+//! files 域 HTTP handler（路由表 + STS 转发端点）
 //!
-//! 2026-09-28 新增：`POST /api/v2/files/sts-tmp-keys` —— 强制 JWT 鉴权 +
-//! Role 检查 + 透明转发到 python `/api/v1/files/sts-tmp-keys`。
+//! ## 路由表（2026-10-13 起本文件是 files 域的**唯一**路由声明处）
+//!
+//! ```text
+//! /sts-tmp-keys   → forward_sts_tmp_keys      （2026-09-28 起，逐字未变）
+//! /objects/*      → part_file::router()       （嵌套子模块 part_file）
+//! /cnc/*          → part_file::cnc::router()  （嵌套子模块 part_file::cnc）
+//! ```
+//!
+//! 完整路径（叠加 `modules::v2_router()` 的 `.nest("/files", …)`）：
+//! `/api/v2/files/sts-tmp-keys` / `/api/v2/files/objects/*` / `/api/v2/files/cnc/*`。
+//!
+//! ⚠️ **为什么 nest 段写 `/objects` 而不是模块名 `part_file`**：URL 对外语义是
+//! 「文件对象」而非「零件文件」—— `t_part_file` 的 owner 本来就是多态的
+//! （`owner_kind ∈ {PART, ASSEMBLY}`），装配件文件也走这里。模块归 `part_file`
+//! （它 own 这张表）、URL 说对象，两者有意不同。
+//!
+//! ⚠️ **matchit 注册顺序**：1 段静态 `/sts-tmp-keys` vs 2~3 段的两个 nest，
+//! 段数不同天然无冲突，**不需要**「静态段先于 `Path<i64>` catch-all」的处理。
+//!
+//! ## 端点 `POST /api/v2/files/sts-tmp-keys`
+//!
+//! 2026-09-28 新增：强制 JWT 鉴权 + Role 检查 + 透明转发到 python
+//! `/api/v1/files/sts-tmp-keys`。
 //!
 //! 2026-09-29 追加：rust 端在转发前注入 `X-Forwarded-User-Id: <CurrentUser.id>`
 //! 头（clone 原 HeaderMap 后再插入，不污染原 extractor 形参）。python 端 STS
-//! service 信任此 header 取得真实 user_id（替代此前「依赖 rust JWT 二
-//! 次验签」的反向泄露风险）。
+//! service 信任此 header 取得真实 user_id（替代此前「依赖 rust JWT 二次验签」的
+//! 反向泄露风险）。
 //!
-//! 详见 [`mod.rs`](mod.rs) 模块 doc 与 plan `/Users/ren/.claude/plans/sts-session-uploader-sts-sts-sequential-globe.md`。
+//! 详见 [`mod.rs`](mod.rs) 模块 doc。
 //!
 //! ## 事务边界
 //! 纯转发，无 DB 操作 —— `handler` 不开事务（与「非持久化写」端点同形）。
@@ -29,14 +50,25 @@
 use std::sync::Arc;
 
 use axum::Json;
+use axum::Router;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
+use axum::routing::post;
 use serde_json::Value;
 
 use crate::auth::rbac::{CurrentUser, Role};
+use crate::modules::files::part_file;
 use crate::shared::error::AppError;
 use crate::state::AppState;
+
+/// files 域路由表。
+pub fn router() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/sts-tmp-keys", post(forward_sts_tmp_keys))
+        .nest("/objects", part_file::router())
+        .nest("/cnc", part_file::cnc::router())
+}
 
 /// `POST /api/v2/files/sts-tmp-keys` —— 鉴权 + 转发
 ///

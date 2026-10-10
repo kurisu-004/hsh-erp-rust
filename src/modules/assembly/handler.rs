@@ -49,8 +49,8 @@ use crate::modules::assembly::service::AssemblyService;
 use crate::modules::assembly::vo::{
     AssemblyCreateResult, AssemblyDetail, AssemblyListOut, AssemblyOut,
 };
+use crate::modules::files::part_file::vo::PartFileListOut;
 use crate::modules::part::vo::PartListItem;
-use crate::modules::part_file::vo::PartFileListOut;
 use crate::shared::error::{AppError, code};
 use crate::shared::response::R;
 use crate::state::AppState;
