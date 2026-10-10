@@ -270,6 +270,65 @@ t_assembly.status               ← 派生缓存
 - **派生层不得覆盖主操作**：`t_part` 已由主操作写成终态时，min-progress 不许写回去（SQL 层 `AND status NOT IN ('COMPLETED','CANCELLED')` 兜底）。
 - 兜底对账端点 `POST /api/v2/admin/recompute-rollup`（Manager）复用同一套 rollup 函数，**幂等**。
 
+### 6.1 写入不变式：终态批次不在任何位置、也不在任何人手上（2026-10-14 新增）
+
+> 批次进入终态（`CANCELLED` / `COMPLETED` / `DELIVERED`）时，`location` 与
+> `current_holder_id` **一并清 NULL**。
+
+**为什么**：此前三个终态写点都只改 `status`、不清位置列，于是被判终态的批次仍以
+`location='WORKER' + current_holder_id=<某工人>` 的形态留在表里 —— **幽灵行**。它们
+队列板看板看不见（判据带 `status='IN_PROCESS'`），却在判据漏 `status` 时吃工人容量，
+**取消得越多工人越被卡死**，且运维看着「面板显示还有额度」完全无法解释。这类行
+**永久累积**（无任何清理路径）。
+
+**逐个写点（改前的状态 → 改后）**：
+
+| 写点 | 目标态 | 改前 | 改后 |
+|---|---|---|---|
+| `shared::batch::guards::mark_batch_status_only` | `CANCELLED` | 不清 | **清** |
+| `shared::batch::guards::mark_batch_status_only` | `READY_TO_SHIP` / `IN_PROCESS` | 不清 | 不清（**刻意**，见下） |
+| `shared::batch::status::apply_bulk_batch_status_change_for_part` | `CANCELLED` / `COMPLETED` | 不清 | **清**（part 级批量取消 / 强推完成） |
+| `shared::batch::status::FORCE_COMPLETE_ALL_BATCHES_FOR_ASSEMBLY_SQL` | `COMPLETED` | 不清 | **清**（装配件级强推完成） |
+| `prod::batch::repo::sql::mark_batch_delivered` | `DELIVERED` | 不清 | **清** |
+| `prod::batch::repo::sql::mark_batch_completed` | `COMPLETED` | 不清 | **清** |
+
+⚠️ **`mark_batch_status_only` 只对 `CANCELLED` 特判，绝不能改成无条件清** —— 它还服务
+两个**非终态**目标，而它们的 `location` 是**有业务含义**的：
+
+- `READY_TO_SHIP`（scan-inspect pass）：批次此刻停在 `INSPECTION_SHELF`，那就是
+  「品检完待发运」的物理落点。清掉它会让「待发运」列表（按
+  `location='INSPECTION_SHELF'` 查）空掉；
+- `IN_PROCESS`（scan-inspect FAIL，返修重入）：批次还要回到工人手上，位置与持有人
+  是**下一步动作的落点**，清掉等于凭空蒸发。
+
+而 `CANCELLED` 之所以是泄漏入口：`status_guard_for_target` 对它的源状态白名单是
+「全状态减两个终态」，**`IN_PROCESS` 在其中** ⇒ 「工人正在加工的那一批」可以被
+`POST /prod/batches/{id}/cancel` 直接取消。
+
+**存量的回补**由 append-only migration
+`20261013000002_001_clear_terminal_batch_location` 一次性完成（只清数据、不改判据）；
+上表的写侧修复保证**以后不再产生**。两者是互补的两道，缺一不可。
+
+⚠️ **判据侧也必须改**（否则新产生的同类行仍吃额度）：`count_held_by_worker` 与
+`take_one_from_pool` 的 `held` CTE 补 `status = 'IN_PROCESS'`，口径见
+[`queue.md`](queue.md) §4.3 / §8.4。
+
+**读侧影响**：两处会有可见数字变化，方向都是**修正**，且**已由那条 migration 在存量上
+造成过同样的差异**（写侧修复只是不再生产该形态的行）：
+
+1. `part::service::phase1::events::location_tree` 的货架计数谓词是
+   `status NOT IN ('CANCELLED','COMPLETED')` —— **不含 `DELIVERED`**，故此前已交付
+   且停在品检架上的批次被算进「品检架有 N 件」，清位置后该计数下降；
+2. `wx::production` 的 `assigned_to`（`done` tab 展示 `DELIVERED` / `COMPLETED` 行）
+   由「工人名」变 `null`。
+
+⚠️ 其余按 `location` 过滤的读侧（队列板看板 / 候选池、外协看板、容量校验、
+`count_in_use_parts`、dashboard `in_process[]`、`prod::scan` 的 pickable / held）
+**全部带 `status` 过滤**，逐条审计见
+`src/modules/prod/batch/repo/sql.rs::mark_batch_delivered` 的 doc。
+`prod::batch::repo::queries::list_held_by_worker` 是唯一无 `status` 过滤的同类查询 ——
+全仓**零调用方**（仅 trait 声明 + impl），死代码。
+
 ## 7. 移除记录
 
 | 被移除项 | 原因 |

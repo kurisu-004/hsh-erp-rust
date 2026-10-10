@@ -1,0 +1,50 @@
+-- 订正 `t_work_type.max_held_batches` 的列注释（2026-10-14）
+--
+-- ## 为什么需要
+--
+-- baseline migration 给该列写的是：
+--
+--   COMMENT ON COLUMN public.t_work_type.max_held_batches
+--     IS '工种工人最多可同时持有批次数；NULL=不限';
+--
+-- **「NULL=不限」是错的**，而且错得很贵：本次排查 `max_held_batches` 容量契约的
+-- 两个 bug（读侧判据漏 `status` 过滤、报工台取件无守卫）时，这条错误注释让排查
+-- 多绕了一圈 —— 按它的说法，「NULL = 不限」意味着不配上限的工种**任何人都能无限
+-- 取件**，于是「为什么这个工人明明没配上限却取不到」看起来像是 bug 而不是既定语义。
+--
+-- ## 实际语义（三处实现一致，**只有注释是错的**）
+--
+-- NULL = **未配置**，该工种**不可取件**：
+--
+-- 1. `POST /api/v2/prod/queue/move` 与
+--    `QueueService::ensure_worker_has_capacity`
+--    → `20904 BIZ_WORK_TYPE_MAX_HELD_NOT_SET`；
+-- 2. `POST /api/v2/prod/queue/refill`
+--    → 同一个 `20904`（`refill_for_worker_with_work_type` 的 `ok_or_else`），
+--    有一条**刻意的回归测试**钉住：
+--    `tests/production/queue.rs::max_held_null_returns_error`；
+-- 3. `QueueRepo::take_one_from_pool` 的 `max_batches` CTE 里
+--    `COALESCE(wt.max_held_batches, 0)` ⇒ NULL 被当成 **cap 0**，
+--    于是 `AND held < max` 守卫恒不通过 ⇒ 抢料路径**直接拦死**。
+--
+-- 生产库的真实工种全是 10（见 `test-support/fixtures/production.sql`
+-- 2026-10-14 起的同值 fixture），NULL 是「忘了配」而非一种可选配置。
+--
+-- ## append-only
+--
+-- 按 CLAUDE.md「新变更走追加新 migration，永不改已有文件」：**本文件是新增，
+-- 不修改 `migrations/20260925000000_001_baseline.sql`**。baseline 里那句错误注释
+-- 仍留在文件里（历史文件即历史），但**运行时 schema 的注释**由本条覆盖 ——
+-- `COMMENT ON COLUMN` 作用于当前库，不追溯 migration 文件文本。
+--
+-- ## 幂等
+--
+-- 重跑一次是同一条 `COMMENT ON` 语句，结果相同、不依赖任何一次性假设。
+--
+-- ## 顺带说明：为什么第 1 轮的清数据 migration 没覆盖到这类行
+--
+-- `20261013000002_001_clear_terminal_batch_location` 清的是「终态批次仍挂在
+-- 位置 / 持有人上」，与本条无关；本条**只改注释、不动任何数据**。
+
+COMMENT ON COLUMN public.t_work_type.max_held_batches IS
+  '工种工人最多可同时持有批次数；NULL = 未配置（取件/下发返 20904，取料按 cap 0 拦死），不是「不限」';

@@ -52,8 +52,35 @@ pub struct RefillResult {
     #[serde(serialize_with = "serialize_i64_opt")]
     pub shelf_id: Option<i64>,
     pub taken: Vec<TakenItem>,
-    /// 一批也没抢到（池空）。handler 据此广播 `WORKER_POOL_EMPTY`。
+    /// **一批也没抢到**。⚠️ **语义一个字都不许改** —— 它是既有 wire 契约、前端
+    /// 已在读（`handler/pool.rs` 的 WS 广播条件历史上就是直接读它）。
+    ///
+    /// ⚠️ 它**无法区分**「池里没有可抢的」与「工人已经拿满了」两种截然不同的
+    /// 情况：`take_one_from_pool` 对两者**都**返回 `None`（前者是 SELECT 无行，
+    /// 后者是 `held < max` 守卫不通过）。2026-10-14 之前两者在响应里长得一模一样，
+    /// 运维只能对着代码猜。区分靠新增的 [`Self::stopped_reason`]，**不改本字段**。
     pub pool_empty: bool,
+    /// 2026-10-14 新增：`taken` 为空时的**具体**停止原因，取值二选一：
+    /// - `"POOL_EMPTY"` —— 候选池里没有该工种可加工、且在架上的批次；
+    /// - `"WORKER_FULL"` —— 工人已持有 `max_held_batches` 批，容量守卫拦死。
+    ///
+    /// 抢到任何一批时为 `None`，且因 `skip_serializing_if` 而**整个 key 不出现**
+    /// （与本 struct 内 `MoveResult.shelf_id` 的既有写法同款）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stopped_reason: Option<String>,
+}
+
+/// [`RefillResult::stopped_reason`] / [`WorkerFillItem::skipped_reason`] 的取值常量。
+///
+/// ⚠️ **改一同步二义务**：`RefillResult.stopped_reason` 与
+/// `AutoAllocateResult` 里填 `skipped_reason` 的地方共用这两个字面量
+/// （见 `QueueService::refill_for_worker_with_work_type` 与
+/// `auto_allocate_for_process`）。前端按字面量做分支，不要随手改。
+pub mod stopped_reason {
+    /// 候选池里没有可抢的批次。
+    pub const POOL_EMPTY: &str = "POOL_EMPTY";
+    /// 工人容量已触顶（`held >= max_held_batches`），或工种未配上限（按 cap 0 拦死）。
+    pub const WORKER_FULL: &str = "WORKER_FULL";
 }
 
 /// 单个 worker 的自动分配填充结果。
@@ -65,7 +92,10 @@ pub struct WorkerFillItem {
     pub target: i32,
     /// 实际抢到的批次 / 累计分钟数
     pub filled_count: i32,
-    /// 因业务错跳过该 worker 时填原因
+    /// 因业务错跳过该 worker 时填原因；
+    /// 2026-10-14 起 ALSO 覆盖「没抢够」：本 worker 因池空 / 已拿满而提前 `break`
+    /// 时填 [`stopped_reason::POOL_EMPTY`] / [`stopped_reason::WORKER_FULL`]
+    /// （此前恒 `None`，见 `QueueService::auto_allocate_for_process`）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skipped_reason: Option<String>,
 }
@@ -81,7 +111,15 @@ pub struct AutoAllocateResult {
     pub mode: crate::modules::prod::queue::dto::AutoAllocateMode,
     pub fill_ratio: f64,
     pub filled: Vec<WorkerFillItem>,
-    /// 任一 worker 的 `take_one_from_pool` 返回 `None`（池空）⇒ `pool_empty=true`
+    /// **任一** worker 的 `take_one_from_pool` 返回 `None`（早退）⇒ `true`。
+    ///
+    /// ⚠️ **2026-10-14 订正**：本字段此前的 doc 写「（池空）」，但
+    /// `take_one_from_pool` 返回 `None` 有**两种**成因 —— SELECT 无行（池空）
+    /// 与 `held < max` 守卫不通过（工人已拿满）。两种情况都置 `true`。
+    /// **判据的修正在 service 层逐 worker 填 [`WorkerFillItem::skipped_reason`]**
+    /// （`POOL_EMPTY` / `WORKER_FULL`）；本字段只回答「有没有人没抢够」，
+    /// 不回答「为什么」—— 它与 [`RefillResult::pool_empty`] 是同一形状的既有契约，
+    /// 不改。
     pub pool_empty: bool,
 }
 

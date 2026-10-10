@@ -221,8 +221,14 @@ impl ScanService {
         //   护栏（只有 `listing/` 子模块适用，且那条护栏扫不到本文件）。
         //   同款依赖先例：`prod::scan::handler::transition` 已 import
         //   `QueueService::refill_for_worker_with_work_type`。
+        //
+        // ⚠️ 返回值 `(current_held, max_held)` 是给 `QueueService::move_batch`
+        //   填 `MoveResult` 展示字段用的，本端点不关心 ⇒ 显式 `let _ =` 丢弃。
+        //   **不要**写成 `.await?;` 然后指望能用到它 —— 那是笔误，会被
+        //   clippy 的 `let_underscore_must_use` 之外的手段漏过去；`let _ =` 在
+        //   本仓是「刻意丢弃」的既有写法。
         let work_type_id = wt_id.expect("wt_id 已由上方 is_none 分支保证非空");
-        QueueService::ensure_worker_has_capacity(repo.conn_mut(), req.worker_id, work_type_id)
+        let _ = QueueService::ensure_worker_has_capacity(repo.conn_mut(), req.worker_id, work_type_id)
             .await?;
         // 2026-10-03 新增：部分领取 —— 翻状态**之前**先把要交出去的那部分拆成
         // 新批次；之后所有针对批次的写入都改指新批次（version 恒为 0）。

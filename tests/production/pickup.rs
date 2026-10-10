@@ -1331,3 +1331,188 @@ async fn events_resolve_worker_name_for_legacy_events_with_worker_id() {
         "无 created_by ⇒ operator_username 为 null: {legacy}"
     );
 }
+
+// ===========================================================================
+//  2026-10-14：容量守卫（Bug 2）
+// ===========================================================================
+
+/// 直插一个工种。`max_held_batches` 传 `None` ⇒ 该列 NULL（= 「未配置」）。
+///
+/// 用途：把「工种未配上限」这条语义在 **pick-up** 上也钉住。共享 fixture 的
+/// `FX-WTA` / `FX-WTB` 自 2026-10-14 起是 10（与生产一致），所以「NULL = 未配置
+/// ⇒ 不可取件」必须由**自建**工种覆盖，不能靠共享 fixture 的默认值。
+async fn insert_work_type(pool: &PgPool, code: &str, max_held_batches: Option<i32>) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+    let id = next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_work_type (id, code, name, sort_order, max_held_batches, version, \
+         created_at, updated_at) VALUES ($1, $2, $2, 0, $3, 0, $4, $4)",
+    )
+    .bind(id)
+    .bind(code)
+    .bind(max_held_batches)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_work_type");
+    id
+}
+
+/// 某工种工人「持有中」的批次数（判据与生产实现逐字一致：
+/// `status='IN_PROCESS' AND location='WORKER' AND current_holder_id=$1`）。
+async fn count_held(pool: &PgPool, worker_id: i64) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM t_part_batch \
+         WHERE current_holder_id = $1 AND location = 'WORKER' \
+           AND status = 'IN_PROCESS' AND deleted_at IS NULL",
+    )
+    .bind(worker_id)
+    .fetch_one(pool)
+    .await
+    .expect("count held")
+}
+
+/// G0 附加：`pick-up` 遇 `max_held_batches = NULL` 的工种 → `20904`。
+///
+/// **把「NULL = 未配置，不是『不限』」这条语义在 pick-up 上钉死。**
+/// 这条语义此前只有 `tests/production/queue.rs::max_held_null_returns_error`
+/// （走 `/refill`）钉住，而 pick-up 这条路径是 2026-10-14 **新增**的守卫 ——
+/// 没有这条测试，「NULL 时放行」与「NULL 时拒取件」两种实现都能让现有用例全绿。
+///
+/// 三处一致性（判据同源，语义必须同口径）：
+/// - `/prod/queue/move` + `ensure_worker_has_capacity` → `20904`；
+/// - `/prod/queue/refill` → `20904`（上述既有测试）；
+/// - `take_one_from_pool` 的 `COALESCE(max_held_batches, 0)` 当 cap 0 ⇒ 拦死抢料。
+#[tokio::test]
+async fn pick_up_work_type_without_max_held_returns_20904() {
+    let ctx = bootstrap().await;
+    let wt = insert_work_type(&ctx.pool, "PICKUP-NO-MAX", None).await;
+    let worker_id = insert_active_worker(&ctx.pool, wt).await;
+    let part_id = insert_part(&ctx.pool, 10).await;
+    let batch_id =
+        insert_part_batch(&ctx.pool, part_id, 10, "IN_PROCESS", Some(ctx.shelf_id())).await;
+
+    let (s, env) = send(
+        ctx.app.clone(),
+        json_request(
+            "POST",
+            &format!("/prod/scan/batches/{batch_id}/pick-up"),
+            Some(json!({
+                "version": 0,
+                "worker_id": worker_id.to_string(),
+                "shelf_id": ctx.shelf_id().to_string(),
+            })),
+            Some(&ctx.manager),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "工种未配上限应 400（BIZ 业务错默认 400）: {env}"
+    );
+    assert_eq!(env["code"], 20904, "BIZ_WORK_TYPE_MAX_HELD_NOT_SET: {env}");
+
+    // ⚠️ 守卫失败必须**零写副作用**：批次一个字节都不许动。
+    let (quantity, status, location, holder, version) = read_batch(&ctx.pool, batch_id).await;
+    assert_eq!(quantity, 10, "失败后数量不应变");
+    assert_eq!(status, "IN_PROCESS", "失败后状态不应变");
+    assert_eq!(
+        location.as_deref(),
+        Some("PRODUCTION_SHELF"),
+        "失败后批次不应被搬到工人手上: {location:?}"
+    );
+    assert_eq!(holder, Some(ctx.shelf_id()), "失败后持有人不应变");
+    assert_eq!(version, 0, "失败后 OCC version 不应 +1");
+    assert_eq!(
+        count_batches(&ctx.pool, part_id).await,
+        1,
+        "失败后不应拆出新批次"
+    );
+    assert_eq!(count_held(&ctx.pool, worker_id).await, 0, "失败后工人不该持有");
+}
+
+/// G3：worker 满时 `pick-up` 返 `20204`，**且批次未被拆批**。
+///
+/// 拆掉「守卫必须排在 `split_batch_for_partial_pass` 之前」这条硬约束的回归：
+/// 本用例带 `quantity = "4"`（会触发拆批），若守卫被挪到拆批之后，源批次数量会先
+/// 被扣成 6、随即守卫失败 ⇒ 留下一个没人认领的孤儿新批次、源批次白白少 4 件。
+/// 所以这里既要断言错误码，也要断言 `count_batches == 1` 与源批次数量不变。
+#[tokio::test]
+async fn pick_up_when_worker_full_returns_20204_without_splitting() {
+    let ctx = bootstrap().await;
+    // 上限 1：先抢一批占满额度
+    let wt = insert_work_type(&ctx.pool, "PICKUP-MAX-1", Some(1)).await;
+    let worker_id = insert_active_worker(&ctx.pool, wt).await;
+
+    // 第 1 批：正常领取，用来占额度
+    let held_part_id = insert_part(&ctx.pool, 10).await;
+    let held_batch_id =
+        insert_part_batch(&ctx.pool, held_part_id, 10, "IN_PROCESS", Some(ctx.shelf_id())).await;
+    let (s0, env0) = send(
+        ctx.app.clone(),
+        json_request(
+            "POST",
+            &format!("/prod/scan/batches/{held_batch_id}/pick-up"),
+            Some(json!({
+                "version": 0,
+                "worker_id": worker_id.to_string(),
+                "shelf_id": ctx.shelf_id().to_string(),
+            })),
+            Some(&ctx.manager),
+        ),
+    )
+    .await;
+    assert_eq!(s0, StatusCode::OK, "第 1 批应领取成功: {env0}");
+    assert_eq!(
+        count_held(&ctx.pool, worker_id).await,
+        1,
+        "第 1 批后工人应持有 1 批（= 上限）"
+    );
+
+    // 第 2 批：工人已满 ⇒ 20204 BIZ_WORKER_HOLD_LIMIT_EXCEEDED
+    let part_id = insert_part(&ctx.pool, 10).await;
+    let batch_id =
+        insert_part_batch(&ctx.pool, part_id, 10, "IN_PROCESS", Some(ctx.shelf_id())).await;
+    let (s, env) = send(
+        ctx.app.clone(),
+        json_request(
+            "POST",
+            &format!("/prod/scan/batches/{batch_id}/pick-up"),
+            Some(json!({
+                "version": 0,
+                "worker_id": worker_id.to_string(),
+                "shelf_id": ctx.shelf_id().to_string(),
+                // 关键：带 quantity 会触发拆批路径，守卫必须早于它失败
+                "quantity": "4",
+            })),
+            Some(&ctx.manager),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "满员时应 409（20204）: {env}");
+    assert_eq!(env["code"], 20204, "BIZ_WORKER_HOLD_LIMIT_EXCEEDED: {env}");
+
+    // ★ 核心断言：批次未被拆批、数量未被扣减、没落到工人名下
+    assert_eq!(
+        count_batches(&ctx.pool, part_id).await,
+        1,
+        "守卫失败后不应拆出新批次（守卫必须早于 split_batch_for_partial_pass）"
+    );
+    let (quantity, status, location, holder, version) = read_batch(&ctx.pool, batch_id).await;
+    assert_eq!(quantity, 10, "失败后源批次数量不应被扣减");
+    assert_eq!(status, "IN_PROCESS");
+    assert_eq!(
+        location.as_deref(),
+        Some("PRODUCTION_SHELF"),
+        "失败后批次不应离开生产架: {location:?}"
+    );
+    assert_eq!(holder, Some(ctx.shelf_id()), "失败后持有人不应变");
+    assert_eq!(version, 0, "失败后 OCC version 不应 +1");
+    assert_eq!(
+        count_held(&ctx.pool, worker_id).await,
+        1,
+        "失败后工人仍只持有第 1 批"
+    );
+}

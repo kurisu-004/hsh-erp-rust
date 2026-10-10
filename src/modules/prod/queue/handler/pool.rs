@@ -34,13 +34,28 @@ use crate::state::AppState;
 
 use crate::modules::prod::queue::dto::{AdminRefillRequest, AutoAllocateRequest, MoveRequest};
 use crate::modules::prod::queue::service::queue::QueueService;
+use crate::modules::prod::queue::vo::worker as queue_vo;
 use crate::modules::prod::queue::vo::worker::{AutoAllocateResult, MoveResult, RefillResult};
 
 /// POST /api/v2/prod/queue/refill
 ///
 /// Manager role 守卫。Commit 后：
 /// - `taken.len() > 0` → 广播 `WORKER_POOL_REFILL_DONE`
-/// - `pool_empty`（没抢到任何一批） → 广播 `WORKER_POOL_EMPTY`
+/// - `stopped_reason == Some("POOL_EMPTY")` → 广播 `WORKER_POOL_EMPTY`
+///
+/// ⚠️ **2026-10-14 有意的协议行为变更：工人满时不再广播。**
+/// 改造前的条件是 `else if r.pool_empty`，而 `pool_empty` 对「池空」与「工人已拿满」
+/// **两种**成因都为 `true`（`take_one_from_pool` 对两者都返 `None`，SQL 层失败形态
+/// 一样）。于是「这个工人已经拿满了 10 件」也会向所有订阅端推一条
+/// `WORKER_POOL_EMPTY` —— 该事件名会误导看板把原因归给「池里没货」，而真实原因
+/// 是「这个工人满了」。现在改读新增的 `stopped_reason`，只在该确为池空时广播。
+///
+/// **已决策：不新增 WS event kind**（用户 2026-10-14 拍板）。代价是「工人满」这条
+/// 状态在 WS 上**完全没有信号** —— 只有直接看 `POST /refill` 的响应体才知道。
+/// 接受这个代价的理由：(a) 「拿满了」本来就是按工人维度的事实，看板每个工人格子
+/// 各自刷新自己的 `current_held`，不需要一条全局广播；(b) 新增 kind 会要求前端
+/// 同步加分支，成本高于收益；(c) 响应体里的 `stopped_reason` 已足够前端在**触发
+/// 这次 refill 的那个视图**里给出即时提示。
 ///
 /// 纯写端点（① 形态）：`pool.begin() → service → commit`。
 pub async fn admin_refill(
@@ -67,7 +82,7 @@ pub async fn admin_refill(
             kind: "WORKER_POOL_REFILL_DONE".into(),
             payload: serde_json::to_value(&r).unwrap_or_default(),
         });
-    } else if r.pool_empty {
+    } else if r.stopped_reason.as_deref() == Some(queue_vo::stopped_reason::POOL_EMPTY) {
         state.ws_hub.broadcast(WsEvent::DashboardEvent {
             kind: "WORKER_POOL_EMPTY".into(),
             payload: json!({

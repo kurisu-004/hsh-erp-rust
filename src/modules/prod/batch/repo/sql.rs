@@ -834,6 +834,47 @@ impl PartBatchRepo {
     // ===== Phase PR-CRUD 新增：8 个 lifecycle mark_* =====
 
     /// 批次 READY_TO_SHIP → DELIVERED —— **2026-10-01 起为 shared::batch::status 薄包装**。
+    ///
+    /// ## 2026-10-14：`DELIVERED` 目标追加清 `location` + `current_holder_id`
+    ///
+    /// **不变式**：批次进入终态时不在任何位置、也不在任何人手上。
+    ///
+    /// 本写点此前只改 `status`，位置列原样留着 ⇒ `DELIVERED` 行仍以
+    /// `location='INSPECTION_SHELF' + current_holder_id=<shelf_id>` 的形态占在表里。
+    /// 而 migration `20261013000002_001_clear_terminal_batch_location`（2026-10-14，
+    /// 同一次改动的另一半）**恰好清的就是这种行** ⇒ 不改本函数就是
+    /// 「历史清了、以后继续产生」，两边永久不一致。
+    ///
+    /// ### 读侧影响逐条审计（改前逐个查过，无一依赖）
+    ///
+    /// - 队列板看板 `board/repo.rs::SQL_HELD_BATCHES_BY_WORKERS`（`location='WORKER'`）
+    ///   —— 带 `status='IN_PROCESS'`，本写点的终态行本就看不见；
+    /// - 队列板候选池 `SQL_POOL_*`（`location='PRODUCTION_SHELF'`）—— 同带
+    ///   `status='IN_PROCESS'`；
+    /// - 外协看板 `outsource/board/repo.rs` 两处（`location='OUTSOURCE_COMPANY'`）
+    ///   —— 都带 `status='OUTSOURCE'`；
+    /// - 容量校验 `batch/repo/queries.rs::count_held_by_worker` —— 带
+    ///   `status='IN_PROCESS'`；
+    /// - `prod/worker/repo/sql.rs::count_in_use_parts`（工人停用前的引用计数）——
+    ///   三个子查询分别硬编码 `IN_PROCESS` / `INSPECTION` / `RETURNED`；
+    /// - `dashboard/repo/sql.rs` 的 `in_process[]` —— 带 `status='IN_PROCESS'`；
+    /// - `prod/scan/listing/repo.rs` 的 pickable / held —— 均带
+    ///   `status='IN_PROCESS'`；
+    /// - `prod::batch::repo::queries::list_held_by_worker`（**唯一无 status 过滤**
+    ///   的同类查询）—— 全仓**零调用方**（仅 trait 声明 + impl），死代码。
+    ///
+    /// ⇒ 两处会有可见数字变化的读侧，都**不是**新增差异，而是 migration 已经
+    /// 引入过的同一处差异（本函数只是不再生产该形态的行）：
+    /// 1. `part::service::phase1::events::location_tree` 的货架计数谓词是
+    ///    `status NOT IN ('CANCELLED','COMPLETED')` —— **不含 `DELIVERED`**，
+    ///    故此前 `DELIVERED` 且停在品检架上的批次会被算进「品检架有 N 件」，
+    ///    清位置后这个计数下降。方向是修正（已交付的货不该占着品检架），且
+    ///    migration 已在存量上造成同样效果；
+    /// 2. `wx::production` 的 `assigned_to` 由
+    ///    `LEFT JOIN t_worker w ON w.id = b.current_holder_id AND b.location='WORKER'`
+    ///    派生 —— `done` tab 展示 `status IN ('DELIVERED','COMPLETED')` 的行，
+    ///    清位置后这些行的 `assignedTo` 由「工人名」变 `null`。方向同样是修正
+    ///    （已交付批次不该显示「谁持有」），且同样已由 migration 在存量上造成。
     pub async fn mark_batch_delivered(
         conn: &mut PgConnection,
         batch_id: i64,
@@ -855,8 +896,10 @@ impl PartBatchRepo {
                 updated_by: current_user_id,
                 // 2026-10-01 review 第 1 轮 M2：本包装函数的 `None` 一律是
                 // 「保持原值」，清空语义由同名 clear_* 显式表达。
-                clear_location: false,
-                clear_holder_id: false,
+                // 2026-10-14：DELIVERED 是终态 ⇒ 无条件清位置 / 持有人
+                // （读侧审计见本函数 doc）。
+                clear_location: true,
+                clear_holder_id: true,
                 clear_process_id: false,
                 clear_process_step_id: false,
                 // 2026-10-01 review 第 1 轮 M4：归档事件 id 由 caller 透传。
@@ -877,6 +920,13 @@ impl PartBatchRepo {
     /// `event_id`（2026-10-01 review 第 1 轮 M4）：本函数是**能让 part 新进
     /// COMPLETED** 的写点之一，故必须由 caller 传一个真实雪花 id 供终态序列号
     /// 归档事件（`SERIAL_RELEASED`）使用。
+    ///
+    /// ## 2026-10-14：`COMPLETED` 目标追加清 `location` + `current_holder_id`
+    ///
+    /// 与 [`Self::mark_batch_delivered`] 同款理由与同款读侧审计（终态批次不在
+    /// 任何位置、也不在任何人手上；migration
+    /// `20261013000002_001_clear_terminal_batch_location` 清的存量行里就包含
+    /// `COMPLETED`，不写侧补上就是「历史清了、以后继续产生」）。
     pub async fn mark_batch_completed(
         conn: &mut PgConnection,
         batch_id: i64,
@@ -899,8 +949,10 @@ impl PartBatchRepo {
                 updated_by: current_user_id,
                 // 2026-10-01 review 第 1 轮 M2：本包装函数的 `None` 一律是
                 // 「保持原值」，清空语义由同名 clear_* 显式表达。
-                clear_location: false,
-                clear_holder_id: false,
+                // 2026-10-14：COMPLETED 是终态 ⇒ 无条件清位置 / 持有人
+                // （读侧审计见 `mark_batch_delivered` 的 doc）。
+                clear_location: true,
+                clear_holder_id: true,
                 clear_process_id: false,
                 clear_process_step_id: false,
                 // 2026-10-01 review 第 1 轮 M4：终态归档事件 id 由 caller 透传。

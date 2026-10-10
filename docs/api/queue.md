@@ -220,6 +220,32 @@ part 级行无从推导（没有 `#[serde(default)]`，漏赋值会编译失败�
 - `AutoDispatchResult`：`{ items: AutoDispatchItem[] }`。`skip_reason` ∈ `NOT_FOUND` / `NO_PROCESS_CHAIN` / `NO_PROCESS_STEP` / `NO_SHELF` / `null`（可下发）。
 - `RecallOut`：**3 字段** `{ batch_id: string, part_id: string, version: number }`。`version` 是写入后的 `version + 1`（OCC 锚），前端下一次对本批次的操作必须带这个值。
 
+### 3.2 `POST /queue/refill` 的出参（2026-10-14 新增 `stopped_reason`）
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `worker_id` | string | 雪花 ID 字符串 |
+| `shelf_id` | string \| null | `null` = 跨全部映射架取料（worker-scan 路径） |
+| `taken` | `TakenItem[]` | 抢到的批次 |
+| `pool_empty` | bool | ⚠️ **语义一个字都没改**（既有 wire 契约，前端在读）= 「一批也没抢到」 |
+| `stopped_reason` | string | **新增**。`taken` 为空时为 `"POOL_EMPTY"` 或 `"WORKER_FULL"`；抢到东西时**整个 key 不出现**（`skip_serializing_if`） |
+
+⚠️ **`pool_empty` 无法区分两种截然不同的停机原因**：`take_one_from_pool` 返回 `None`
+有**两种**可能 —— SELECT 无行（池里没货）与 `held < max` 守卫不通过（工人已拿满），
+两者在响应里长得一模一样，运维只能对着代码猜。`stopped_reason` 就是为了区分它们，
+判据是「工人已持有数 `>= max_held` ⇒ `WORKER_FULL`，否则 `POOL_EMPTY`」，与
+`take_one_from_pool` 内部那条守卫同源同口径。
+
+⚠️ 这条诊断**只在没抢到任何东西时执行**（happy path 一分额外的库往返都不多打）。
+并发导致的「刚好在这一刻被填满」可能被报成 `POOL_EMPTY` —— 那是**快照的固有性质**，
+不是 bug：诊断字段描述的是「这一次调用的观察」，不是断言。
+
+**同款诊断也补在 `POST /queue/auto-allocate`**：每个没抢够的 worker 在
+`WorkerFillItem.skipped_reason` 里填 `POOL_EMPTY` / `WORKER_FULL`（此前恒 `None`）。
+⚠️ `AutoAllocateResult.pool_empty` 的 doc 此前写「（池空）」，实际也可能是工人满；
+该字段只回答「有没有人没抢够」、不回答「为什么」，形状不变，答案在
+`skipped_reason`。
+
 ### 3.1 端点 4 的下发口径（2026-10-09）
 
 **有链时按下发链首工序 + 指针落链首 step；无链时回落 `target_process_id`。**
@@ -317,7 +343,46 @@ pb.status IN ('PENDING', 'PROGRAMMING') AND pb.deleted_at IS NULL AND p.deleted_
 status = 'IN_PROCESS' AND location = 'WORKER' AND current_holder_id = ANY($worker_ids)
 ```
 
-`location = 'WORKER'` 是「在手加工」的语义边界（批次已从货架 / 品检区出池、压在工人手上）。工位容量按这两列实时 COUNT，召回时把两列一起清 NULL 即完成回收，无需额外动作。
+`location = 'WORKER'` 是「在手加工」的语义边界（批次已从货架 / 品检区出池、压在工人手上）。工位容量按这三列实时 COUNT，召回时把两列一起清 NULL 即完成回收，无需额外动作。
+
+⚠️ **2026-10-14：`pick_up` 与 `move_batch` 现在共用同一判据与同一个守卫函数。**
+本节的判据此前**只对读侧生效**（看板 `SQL_HELD_BATCHES_BY_WORKERS`），
+**校验 SQL 漏了 `status` 这一列**，于是：
+
+- `prod::batch::repo::queries::count_held_by_worker` 与
+  `prod::queue::repo::sql::take_one_from_pool` 的 `held` CTE 此前只判
+  `location + current_holder_id`，被取消 / 强制完成的批次照样吃工容量；
+- 报工台取件（`POST /api/v2/prod/scan/batches/{id}/pick-up`，**属 `prod::scan` 域**，
+  契约见 [`scan.md`](scan.md) §2.6.1）此前**完全没有**容量守卫。
+
+三处判据现由 **`QueueService::ensure_worker_has_capacity`** 一处统一（它是
+「守卫 + 展示值」的**唯一单一来源**，`move` / `pick-up` / `refill` 的语义都挂在它
+上面），并与看板 SQL **逐字一致**。⚠️ **改一处必须改另一处**，否则「看板显示还能取
+N 件、实际取件被拒」这类难查的问题会回来。回归测试见本节末。
+
+⚠️ **`ensure_worker_has_capacity` 是 service 级非原子守卫**（count 与 compare 是两条
+语句、中间无锁 ⇒ 并发双取仍可能超发 1 批）。这是既有设计取舍，本轮不动：
+`take_one_from_pool` 的 `held < max` 守卫在**单条 SQL 内**（`FOR UPDATE SKIP LOCKED`），
+故 **refill / auto-allocate 路径是原子的**；只有「指定批次取件」（`move` / `pick-up`）
+走这条非原子路径。要把它做成原子需要把判据灌进那条 SQL 的 WHERE，属独立重构。
+
+### 4.7 `max_held_batches` 为 NULL 的语义（2026-10-14 订正）
+
+⚠️ **`NULL = 未配置`，不是「不限」。** 三处实现一致：
+
+| 路径 | 行为 |
+|---|---|
+| `POST /queue/move` + `ensure_worker_has_capacity` | `20904 BIZ_WORK_TYPE_MAX_HELD_NOT_SET`（**HTTP 400**） |
+| `POST /queue/refill` | 同一个 `20904`（回归：`tests/production/queue.rs::max_held_null_returns_error`） |
+| `QueueRepo::take_one_from_pool` 的 `max_batches` CTE | `COALESCE(wt.max_held_batches, 0)` 当 **cap 0** ⇒ `held < max` 恒不通过 ⇒ **拦死** |
+
+⚠️ **列注释曾经是错的**：baseline migration 给该列写的是「NULL=不限」。已由
+migration `20261014000001_001_fix_max_held_batches_column_comment` 订正（append-only，
+不改 baseline 文件）。这条错误注释让 2026-10-14 的排查多绕了一圈。
+
+⚠️ **队列板的 `max_held` 对未配上限的工种发 `0` 而不是 `null`**（既有约定
+`w.max_held.unwrap_or(0)`，见 §2.3）—— 发 `null` 有让前端渲染成「不限」的风险。
+`prod::scan` 的 `/held` 出参 `max_held_batches` 沿用同一约定。
 
 
 ### 4.4 N+1 的消除：旧路径 vs 新路径
@@ -400,11 +465,14 @@ M = 10 时：12 个 HTTP 请求 → 1 个。
 | `POST /queue/recall` | `PART_RECALLED` | 无条件（payload `{ part_id }`） |
 | `POST /queue/dispatch` | `BATCH_PLACED_ON_SHELF` | `succeeded` 非空 |
 | `POST /queue/refill` | `WORKER_POOL_REFILL_DONE` | `taken` 非空 |
-| `POST /queue/refill` | `WORKER_POOL_EMPTY` | 一批也没抢到 |
+| `POST /queue/refill` | `WORKER_POOL_EMPTY` | ⚠️ **2026-10-14 起收窄**：`stopped_reason == "POOL_EMPTY"`（见下） |
 | `POST /queue/move` | `WORKER_POOL_MOVE_DONE` | 无条件 |
 | `POST /queue/auto-allocate` | `WORKER_POOL_AUTO_ALLOCATE_DONE` | 无条件 |
 
 - **消费方是 dashboard 域**（`/ws/dashboard` + 前端 `AFFECTS_DASHBOARD` 白名单），不是 queue 域自己的实时刷新。
+- ⚠️ **`WORKER_POOL_EMPTY` 的广播条件在 2026-10-14 收窄（有意协议行为变更）**：此前条件是 `pool_empty`，而 `pool_empty` 对「池空」与「**工人已拿满**」两种成因**都为 `true`**（`take_one_from_pool` 对两者都返回 `None`，SQL 层失败形态一样）。于是「这个工人已经拿满了」也会向所有订阅端推一条名为 `POOL_EMPTY` 的事件 —— 事件名会误导看板把原因归给「池里没货」。
+  现在改读新增的 `RefillResult.stopped_reason`（见 §3.2），**只在该确为池空时广播**。
+- ⚠️ **已决策：不新增 WS event kind**（用户 2026-10-14 拍板）。代价是「工人满」这条状态在 WS 上**完全没有信号** —— 只有直接看 `POST /refill` 的响应体才知道。接受这个代价的理由：(a)「拿满了」本来就是按工人维度的事实，看板每个工人格子各自刷新自己的 `current_held`，不需要一条全局广播；(b) 新增 kind 会要求前端同步加分支，成本高于收益；(c) 响应体里的 `stopped_reason` 已足够前端在**触发这次 refill 的那个视图**里给出即时提示。
 - `ts` 时间戳：两个聚合端点出参的 `ts` 走 `infra::clock::now_shanghai_iso()`，恒为 RFC 3339 带固定偏移 `YYYY-MM-DDTHH:MM:SS[.小数秒]+08:00`。小数秒位数按纳秒有效位自适应（0 / 3 / 6 / 9 位），**不保证逐字等长** —— 前端不要按固定小数位数做字符串截取比较。**禁止**改用 `chrono::Local::now()`（那会让时间戳跟宿主时区走）。
 
 ## 8. 表依赖与前端配套
@@ -445,6 +513,51 @@ queue 域**整体不适用**域隔离护栏：它继承 worker_pool 的「经本
 11. **`POST /queue/move` 的 `version` 升为必填**（2026-10-09）：此前三个方向都由 service 用「本次事务里刚读到的 `batch.version`」当 `expected_version`，等价于**没有 OCC** —— 看板数据是 30s 缓存的快照，期间他人改过批次时「用户看到 5 件 → 实际移动 3 件」会静默成功。值取候选卡 / 持有卡的 `version`；漏传 → **HTTP 422 纯文本**（`version` 无 `#[serde(default)]`）。
 
 ### 8.4 已知偏差登记
+
+---
+
+**校验 SQL 曾与本文档 §4.3 分叉（2026-10-14 修复）**
+
+⚠️ **本节是本域 bug 能长期潜伏的结构原因，值得完整读一遍。**
+
+本文件 §4.3「工人持有判据」写的是三列
+（`status='IN_PROCESS' AND location='WORKER' AND current_holder_id`），但**校验 SQL
+只判后两列**：
+
+| 位置 | 修复前 | 后果 |
+|---|---|---|
+| `prod::batch::repo::queries::count_held_by_worker` | 漏 `status` | 被取消 / 强制完成的批次（终态写点都不清 `location`）永久占额度，**取消得越多工人越被卡死** |
+| `prod::queue::repo::sql::take_one_from_pool` 的 `held` CTE | 漏 `status` | 同上（`refill` / `auto-allocate` 路径） |
+| 队列板看板 `board/repo.rs::SQL_HELD_BATCHES_BY_WORKERS` | **判据正确**（带 `status`） | 看板上明明显示还有额度，实际取件一律被拒 ⇒ 运维完全无法解释 |
+| `prod::scan` 的 `pick-up` | **完全没有容量守卫** | 工人在队列板被卡着，从报工台却能无限往手上加 |
+
+而**判据侧漏列的写法是从本文档复制过去的** —— 文档说三列，SQL 写两列，没有
+任何机制能发现二者漂移。三处判据现已由 `QueueService::ensure_worker_has_capacity`
+统一并与看板逐字对齐（§4.3）。
+
+⚠️ **测试为什么没抓到**：`tests/production/queue.rs` 里有个**自建的**
+`count_held_by_worker` helper，它抄的正是**修复前的错误谓词**，全仓 16 处调用点
+用的都是它、与生产实现零关联 ⇒ 生产 SQL 改了、测试断言纹丝不动，测试一直在给错误
+判据背书。2026-10-14 已把该 helper 补成与生产逐字一致。
+
+**修复的另一半**：终态写点（取消 / 强制完成 / 交付）此前都不清
+`location` + `current_holder_id`，于是判据补上 `status` 之后，那些历史脏行虽然不再
+吃额度，却仍以「终态批次挂在工人 / 货架名下」的形态留在表里。两道修复是**互补**的：
+判据修复保证同类行再产生时不被算进容量，写侧修复 + migration
+`20261013000002_001_clear_terminal_batch_location` 保证存量与新增都不产生。写侧
+不变式的逐条清单见 [`batch.md`](batch.md)。
+
+---
+
+**`t_work_type.max_held_batches` 的列注释曾是错的（2026-10-14 订正）**
+
+baseline migration 写的是「NULL=不限」，**实际语义是「NULL = 未配置 ⇒ 不可取件」**。
+三处实现一致（§4.7 有表），**只有注释是错的**。这条错误注释让本次排查多绕了一圈
+—— 按它的说法，「NULL = 不限」意味着不配上限的工种任何人都能无限取件，于是「为什么
+这个工人明明没配上限却取不到」看起来像 bug 而不像既定语义。
+
+已由 append-only migration `20261014000001_001_fix_max_held_batches_column_comment`
+订正（**不改** baseline 文件，只覆盖运行时 schema 的注释）。
 
 ---
 

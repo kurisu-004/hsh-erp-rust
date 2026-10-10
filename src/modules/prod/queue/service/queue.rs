@@ -74,7 +74,7 @@ use crate::modules::prod::queue::dto::{
     AutoAllocateMode, AutoAllocateRequest, MoveFromLocation, MoveRequest, MoveToLocation,
 };
 use crate::modules::prod::queue::vo::worker::{
-    AutoAllocateResult, MoveResult, RefillResult, TakenItem, WorkerFillItem,
+    stopped_reason, AutoAllocateResult, MoveResult, RefillResult, TakenItem, WorkerFillItem,
 };
 
 /// queue 域 service（2026-09-22 D-2 重构后）
@@ -243,11 +243,49 @@ impl QueueService {
         }
 
         let pool_empty = taken.is_empty();
+
+        // 2026-10-14：把「一批也没抢到」拆成两种成因填进 `stopped_reason`。
+        //
+        // `take_one_from_pool` 返回 `None` 有**两种**可能，SQL 层的失败**形态完全
+        // 一样**（都是没选出候选行）：池里没有可抢的 / 工人已经拿满（`held < max`
+        // 守卫不通过）。改造前两者在响应里长得一模一样（`pool_empty: true`），
+        // 运维对着代码也猜不出来。⚠️ **`pool_empty` 字段本身一个字都没改**
+        // （既有 wire 契约，前端在读），只**新增** `stopped_reason`。
+        //
+        // ⚠️ **这条诊断查询只在没抢到任何东西时执行**（`pool_empty == true`
+        //  才进）—— happy path 拿满就走，一分额外的库往返都不多打。
+        //
+        // 判据：工人已持有数 `>= max_held` ⇒ `WORKER_FULL`，否则 `POOL_EMPTY`。
+        // 与 `take_one_from_pool` 内部那条 `AND (SELECT n FROM held) <
+        // (SELECT max_held FROM max_batches)` 守卫**同源同口径**（同一张
+        // `t_part_batch`、同一列、同一判据），故二者不会打架；若是并发导致的
+        // 「刚好在这一刻被填满」，本函数可能把它报成 `POOL_EMPTY` —— 那是**快照
+        // 的固有性质**，不是 bug：诊断字段描述的是「这一次调用的观察」，不是断言。
+        //
+        // `max_held` 在上方已由 `let _ = work_type.max_held_batches.ok_or_else(...)`
+        // 保证非 NULL（走到这里一定是 `Some`），直接 unwrap 到 i32 展示值。
+        let stopped_reason = if pool_empty {
+            let held = (&mut *conn)
+                .part_batch_count_held_by_worker(worker_id)
+                .await?;
+            let max_held = work_type.max_held_batches.unwrap_or_default();
+            Some(
+                if held >= max_held as i64 {
+                    stopped_reason::WORKER_FULL.to_string()
+                } else {
+                    stopped_reason::POOL_EMPTY.to_string()
+                },
+            )
+        } else {
+            None
+        };
+
         Ok(RefillResult {
             worker_id,
             shelf_id,
             taken,
             pool_empty,
+            stopped_reason,
         })
     }
 
@@ -293,11 +331,27 @@ impl QueueService {
     ///   （NULL ⇒ 该工种**不可取件**，与 `take_one_from_pool` 里
     ///   `COALESCE(max_held_batches, 0)` 当 cap 0 的口径一致）
     /// - `BIZ_WORKER_HOLD_LIMIT_EXCEEDED` —— `held >= max_held`
+    ///
+    /// ## 返回值 = `(current_held, max_held)`（2026-10-14）
+    ///
+    /// 这两个值**就是**比较用的那两个，**不是**额外查询的结果。调用方**不要**
+    /// 为了填展示字段再查一遍 —— 那正是本函数第一版签名返回 `()` 时留下的坑：
+    /// `move_batch` 的两个分支在守卫通过后**又各查了一遍** `count_held_by_worker`
+    /// 与 `work_type_get_by_id`，`/queue/move` 每次白白多 2 条 SELECT。
+    ///
+    /// 签名为 `Result<(), _>` 时「守卫」与「取展示值」被迫分成两轮 SQL，而
+    /// 两轮之间存在时间差 ⇒ `current_held` 甚至可能与刚刚通过比较的值不一致。
+    /// 返回值把两者绑成**同一个**快照，也省掉那两条查询。
+    ///
+    /// 返回的 `current_held` 是**比较那一刻**的值（**不含**本次将要交出去的那
+    /// 批），`MoveResult.current_held` 的语义是「移动后 worker 的 current_held
+    /// （含本批次）」—— 调用方填 `current_held + 1`。这与改造前的行为逐字一致
+    /// （原先也是「守卫读到的值 + 1」），不是本轮引入的语义变化。
     pub async fn ensure_worker_has_capacity(
         conn: &mut PgConnection,
         worker_id: i64,
         work_type_id: i64,
-    ) -> Result<(), AppError> {
+    ) -> Result<(i64, i32), AppError> {
         let work_type = (&mut *conn)
             .work_type_get_by_id(work_type_id)
             .await?
@@ -322,7 +376,7 @@ impl QueueService {
                 format!("worker {worker_id} 已持有 {held} 批次，工种上限 {max_held} 触顶"),
             ));
         }
-        Ok(())
+        Ok((held, max_held))
     }
 
     /// `POST /api/v2/prod/queue/move` 业务逻辑（2026-09-30 新增）。
@@ -559,27 +613,12 @@ impl QueueService {
                 //
                 // ⚠️ 位置在工序资格校验**之后**：这是既有错误码顺序（先说「这批你
                 // 做不了」，再说「你已经拿满了」），不要为对齐 B1 把它挪到前面。
-                Self::ensure_worker_has_capacity(conn, *worker_id, work_type_id).await?;
-
-                // ⚠️ 以下两行**只为填 `MoveResult` 的展示字段**（`current_held` /
-                // `max_held`），**不是第二道守卫** —— 判据仍然只有上面那一次调用，
-                // 这里的 SQL 里不含任何谓词。之所以要多读一次，是
-                // `ensure_worker_has_capacity` 的签名只返回 `()`。
-                let current_held_val = (&mut *conn)
-                    .part_batch_count_held_by_worker(*worker_id)
-                    .await?;
-                let max_held_val = (&mut *conn)
-                    .work_type_get_by_id(work_type_id)
-                    .await?
-                    .and_then(|wt| wt.max_held_batches)
-                    // 守卫刚通过仍取不到 ⇒ 只可能是并发把该列改成了 NULL，
-                    // 按既有语义返错而不是静默填 0。
-                    .ok_or_else(|| {
-                        AppError::biz(
-                            code::BIZ_WORK_TYPE_MAX_HELD_NOT_SET,
-                            format!("work_type {work_type_id} max_held_batches 未设置"),
-                        )
-                    })?;
+                //
+                // ⚠️ 两个返回值**直接喂给 `MoveResult`**（下方 `+1` 后填
+                // `current_held`），**不要**再补一条查询去重取 —— 守卫与展示值
+                // 必须是同一个快照（详见该函数 doc「返回值」一节）。
+                let (current_held_val, max_held_val) =
+                    Self::ensure_worker_has_capacity(conn, *worker_id, work_type_id).await?;
 
                 // take_specific_from_pool（OCC + WHERE pb.version = $exp）
                 // 0 行 → 与 WORKER→POOL / WORKER→WORKER 分支统一返 40901 VERSION_CONFLICT
@@ -804,23 +843,10 @@ impl QueueService {
                 // 统一成「worker {id} 已持有 …」—— 单一来源之后两处文案不同本身就是
                 // 漂移；本分支是 `move` 端点内唯一的 WORKER→WORKER 分支，调用方看
                 // 错误文案时已有 `MoveResult` / 请求上下文可定位目标工人。
-                Self::ensure_worker_has_capacity(conn, *dst_worker_id, work_type_id).await?;
-
-                // ⚠️ 与 POOL→WORKER 分支同款：以下两行只为填 `MoveResult` 的展示
-                // 字段，**不是第二道守卫**（SQL 里不含任何谓词）。
-                let current_held_val = (&mut *conn)
-                    .part_batch_count_held_by_worker(*dst_worker_id)
-                    .await?;
-                let max_held_val = (&mut *conn)
-                    .work_type_get_by_id(work_type_id)
-                    .await?
-                    .and_then(|wt| wt.max_held_batches)
-                    .ok_or_else(|| {
-                        AppError::biz(
-                            code::BIZ_WORK_TYPE_MAX_HELD_NOT_SET,
-                            format!("work_type {work_type_id} max_held_batches 未设置"),
-                        )
-                    })?;
+                //
+                // ⚠️ 同 POOL→WORKER 分支：返回值直接喂 `MoveResult`，不再补查询。
+                let (current_held_val, max_held_val) =
+                    Self::ensure_worker_has_capacity(conn, *dst_worker_id, work_type_id).await?;
 
                 let rows = (&mut *conn)
                     .move_worker_to_worker(
@@ -1009,6 +1035,8 @@ impl QueueService {
             }
 
             let mut filled_count = 0i32;
+            // 2026-10-14：没抢够时的具体原因；抢满 target 则恒 `None`。
+            let mut stop_reason: Option<String> = None;
             for _ in 0..target {
                 match (&mut *conn)
                     // 管理员显式指定货架（「为该工序在某架上抢料」）⇒ 限架。
@@ -1044,6 +1072,27 @@ impl QueueService {
                         filled_count += 1;
                     }
                     None => {
+                        // 2026-10-14：`None` 有两种成因（SELECT 无行 / `held < max`
+                        // 守卫不通过），`pool_empty_any` 只记「没抢够」这个事实，
+                        // 这里补上**具体原因**填进本 worker 的 `skipped_reason` ——
+                        // 判据与 `refill_for_worker_with_work_type` 的诊断完全同款
+                        // （同一张 `t_part_batch`、同一列、同一比较），两处口径必须
+                        // 一致，否则同一个工人在 refill 里显示 `POOL_EMPTY`、在
+                        // auto-allocate 里显示 `WORKER_FULL`，没人能解释。
+                        //
+                        // ⚠️ 这条诊断**同样只在早退（没抢够）时执行**，每个 worker
+                        // 至多多打 1 次查询；抢满 target 的 worker 一次都不多打。
+                        let held = (&mut *conn)
+                            .part_batch_count_held_by_worker(worker_id)
+                            .await?;
+                        let max_held = max_batches.unwrap_or_default();
+                        stop_reason = Some(
+                            if held >= max_held as i64 {
+                                stopped_reason::WORKER_FULL.to_string()
+                            } else {
+                                stopped_reason::POOL_EMPTY.to_string()
+                            },
+                        );
                         pool_empty_any = true;
                         break;
                     }
@@ -1054,7 +1103,8 @@ impl QueueService {
                 worker_id,
                 target,
                 filled_count,
-                skipped_reason: None,
+                // 没早退时恒 `None`（key 不出现）；早退时是上面对两种成因的判定。
+                skipped_reason: stop_reason,
             });
         }
 
