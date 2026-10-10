@@ -594,7 +594,7 @@ async fn custom_role_lifecycle_create_update_deactivate_delete() {
     assert_eq!(env["code"], 40901, "应为 VERSION_CONFLICT：{env}");
 
     // 系统角色不可删（delete=true 一律 400，与 version 无关）
-    let (admin_id, _) = role_row(&pool, "ADMIN").await;
+    let (admin_id, admin_version) = role_row(&pool, "ADMIN").await;
     let (status, env) = post(
         &app,
         &format!("/iam/roles/{admin_id}/deactivate"),
@@ -603,6 +603,36 @@ async fn custom_role_lifecycle_create_update_deactivate_delete() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "系统角色不可删：{env}");
+    assert_eq!(env["code"], 40000);
+
+    // 系统角色 code 不可改 → 400
+    let (status, env) = post(
+        &app,
+        &format!("/iam/roles/{admin_id}/update"),
+        json!({ "code": "ADMIN_2", "name": "超级管理员", "version": admin_version }),
+        &token,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "系统角色 code 不可改：{env}"
+    );
+    assert_eq!(env["code"], 40000);
+
+    // 停用 ADMIN 角色本身会触发自锁护栏 → 400（ADR 元角色守卫；fresh 库无 ADMIN 持有人）
+    let (status, env) = post(
+        &app,
+        &format!("/iam/roles/{admin_id}/deactivate"),
+        json!({ "version": admin_version, "delete": false }),
+        &token,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "ADMIN 自锁护栏应 400：{env}"
+    );
     assert_eq!(env["code"], 40000);
 
     // 停用（delete=false；version 1 → 2）
