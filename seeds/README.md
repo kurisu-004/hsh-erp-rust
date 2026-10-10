@@ -69,14 +69,56 @@ cargo run
 - **t_menu.id 用静态 ID**：`9000000000xxx` 段（15 位）。
   - 已存在的雪花 ID 行 `ON CONFLICT` 后保留原 ID，只更新其他字段
   - 与生产雪花 ID（~2×10¹⁷）和 fixture ID（`9_xxx_xxx_xxx_xxx_xxx_xxx`，18 位）物理不相交
-- **t_role_menu.id 同样用静态 ID**：`9000001000xxx` 段
+- **t_role_menu.id 用派生 ID**：`9100000000000000 + 角色序号×10¹² + md5(role,code) 低 48bit`，
+  角色序号 `MANAGER=0 / CLERK=1 / INSPECTOR=2 / CNC_PROGRAMMER=3 / SHELF_ACCOUNT=4`。
+  - **绝不能用 `基址 + row_number() OVER ()`**（2026-10-13 事故，见下节）
+  - 旧 seed 静态段 `900000000100{0..4}xxx` 的**存量行仍在库里、ID 不动**，只是不再发这个段的新号
+- **t_role_menu 授权是「进白名单即生效」**：4.0 段先把白名单内**已软删**的授权**复活**
+  （`deleted_at = NULL`, `version + 1`），4.1-4.5 段再补真正缺失的行。
+  - 必需的原因：`uk_t_role_menu_role_menu` 是 **partial** 唯一索引（`WHERE deleted_at IS NULL`），
+    被 4.7 段软删过的行**不在索引里** ⇒ 4.1-4.5 的 `ON CONFLICT` 命中不到它 ⇒ 缺 4.0 段时
+    把 code 加回白名单会**插出第二行**，授权簿记翻倍
+  - 4.0 的 61 条元组必须与 4.1-4.5 白名单**逐条镜像**
+    （`tests/iam/menu_seed.rs` 用例 ⑤ 断言 D 机械核对）
+  - 顺序契约：4.0 在前、4.7 在后 → 「既在白名单又在 4.7 回收名单」的 code 最终是软删
 - **不自动删"未在文件声明的菜单"**：菜单下线必须显式列在第 3 节 soft-delete 区段
   （防止误删生产手工加的菜单）
-- **t_role_menu 授权同样是纯增量**：第 4 节 `ON CONFLICT ... DO NOTHING`，
+- **t_role_menu 授权同样是纯增量**：第 4.1-4.5 段 `ON CONFLICT ... DO NOTHING`，
   从角色白名单里删 code **不等于**回收已存在的授权行。收紧权限必须显式列在
   4.7 回收区段（软删 + `version + 1`）
 - **`include_str!` 编译期嵌入**：`src/infra/seed.rs` 把整个 SQL 文件嵌进二进制，
   启动时直接 `sqlx::raw_sql` 执行，不走 IO
+
+## 2026-10-13 事故：`duplicate key value violates unique constraint "t_role_menu_pkey"`
+
+4.1-4.5 段原来这样发号：
+
+```sql
+-- ✗ 已废弃：按「行位置」发号
+9000000001000001 + row_number() OVER ()
+```
+
+4.1 的 MANAGER 白名单新增 `mail_group` / `mail_digest`（交期汇总邮件菜单）后，两行在
+SELECT 结果里换了位置、拿到 `9000000001000030 / ...031`，而 `...030` 已被
+`MANAGER/workers_list` 占用 → PK 冲突。叠加两个放大因素：
+
+1. `row_number() OVER ()` **没有 `ORDER BY`**，PG 不保证行序（实测走 Seq Scan 按物理序），
+   `VACUUM` / 换执行计划 / `pg_restore` 重建后发号结果就变 → 撞哪一行不可预测
+2. `ON CONFLICT (role, menu_id) WHERE deleted_at IS NULL` 只声明了
+   `uk_t_role_menu_role_menu` 这一个 arbiter；`t_role_menu_pkey` 是**另一个**，
+   撞它不会被 `DO NOTHING` 吞掉，整条 INSERT 直接失败
+
+又因为 seed 是 `BEGIN … COMMIT` 单事务，**第 1/2 节的 `t_menu` 插入一并回滚** ——
+最终表现为「migration `20261013000000_001_mail_digest` 成功、`t_menu` 里却没有
+`mail_*` 菜单」的半吊状态。
+
+**修法**：`t_role_menu.id` 改为由「授权身份 `(role, code)`」唯一决定（见上「派生 ID」）。
+与白名单顺序、增删、其他角色完全无关，因此反复跑 / 中途增删 code 都不会撞号。
+62 条组合已实测 seed 内部 0 重复、与存量 0 撞号。
+
+回归护栏在 `tests/iam/menu_seed.rs` 用例 ⑥ `menu_seed_revives_soft_deleted_grants`：
+文本层钉死 5 段派生表达式形态（`row_number()` 一改回来就红），库层独立重算 md5 期望 id
+并检查全库 live 行 id 两两不等。
 
 ## 应用时机
 

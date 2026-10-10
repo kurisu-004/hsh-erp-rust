@@ -39,6 +39,29 @@
 //!    文本现场解析**出来断言，并断言「4.7 回收元组 ∩ 白名单 == ∅」。关的是前 4 个用例的
 //!    盲区：**只从白名单删 code、忘了写进 4.7 段**，在「测试库继承 template 的 live 行」
 //!    的前提下不改变任何 live 矩阵 → 前 4 个用例全绿而线上菜单没收紧。
+//! 6. **`menu_seed_revives_soft_deleted_grants`**（2026-10-13 新增）—— 钉住 4.0 复活段：
+//!    白名单内已被软删的授权行，重跑 seed 后必须**原地复活**（同一个 `id`、`version + 1`），
+//!    且**总行数不变**。缺 4.0 段时会插出第二行 —— `uk_t_role_menu_role_menu` 是 partial
+//!    （`WHERE deleted_at IS NULL`），软删行不在索引里，`ON CONFLICT` 根本命中不到它。
+//!    同一条用例顺带钉住 4.1-4.5 段的**派生 id**：跑完之后所有 live 授权行的 `id` 必须
+//!    落在 `9100000000000000..9104999999999999` 派生段内，且两两不等 —— 这正是
+//!    2026-10-13 那次 `t_role_menu_pkey` 冲突的回归护栏（见下节）。
+//!
+//! ## 2026-10-13 事故：`duplicate key value violates unique constraint "t_role_menu_pkey"`
+//!
+//! 4.1-4.5 段原来用 `900000000100{n}001 + row_number() OVER ()` 发号，那是**按行位置**
+//! 而不是按授权身份发号。4.1 的 MANAGER 白名单新增 `mail_group` / `mail_digest` 两个 code
+//! 后，两行在 SELECT 结果里换了位置、拿到 `9000000001000030/031`，而 030 已被
+//! `MANAGER/workers_list` 占用 → PK 冲突。
+//!
+//! 关键点：**为什么 `ON CONFLICT` 没兜住** —— `ON CONFLICT (role, menu_id) WHERE
+//! deleted_at IS NULL` 只声明了 `uk_t_role_menu_role_menu` 这一个 arbiter；
+//! `t_role_menu_pkey` 是另一个，撞它不会被 `DO NOTHING` 吞掉，整条 INSERT 直接失败。
+//! 又因为 seed 是 `BEGIN … COMMIT` 单事务，**第 1/2 节的 `t_menu` 插入一并回滚** ——
+//! 表现为「migration 成功、菜单却没有」的半吊状态。
+//!
+//! 修法：id 改为按 `(role, code)` 唯一决定（`9100000000000000 + 角色序号 × 1e12 +
+//! md5(role,code) 低 48bit`），与白名单顺序、增删、其他角色完全无关。用例 ⑥ 钉住它。
 //!
 //! ## 维护约定（改 `seeds/menu.sql` 前必读，2026-10-05 新增）
 //!
@@ -57,6 +80,11 @@
 //! 2. 改 **4.7 段回收元组**时，**必须同步** `REVOKED_PAIRS`（用例 ⑤ 的断言 C 会直接
 //!    比对两处来源）。用例会伪造这些 `(role, code)` 的 legacy 存量行来验回收生效，
 //!    两处不一致 = 要么伪造的行没被回收、要么期望的期望值错了。
+//!    - 同一批改动里，若还动到了 **4.1-4.5 段白名单**，**必须同步 4.0 段的复活元组
+//!      列表**（用例 ⑤ 的断言 D 会比对「4.0 名单 == 4.1-4.5 白名单」）。4.0 的 61 条
+//!      元组是白名单的手工复制：少了 → 该 code 被软删后再加回白名单时会插出第二行；
+//!      多了 → 4.7 回收名单里的 code 会被误复活（当前 4.7 在 4.0 之后跑、同一事务，
+//!      净结果仍是软删，但那段顺序契约一改就静默失效）。
 //! 3. 白名单与 4.7 回收段**必须成对变更**：第 4 节是 **add-only** 语义，只删白名单
 //!    **不会**回收存量授权行，生产库菜单不会消失。用例 ⑤ 的断言 A 就是为了钉住这条
 //!    契约（`live == 白名单 − 已软删菜单`）；断言 A 的独立价值在**存量库 / 老 template
@@ -67,13 +95,17 @@
 //!    - 4.1-4.5 段角色授权必须**恒为 5 段**（`WHITELIST_SECTIONS`）：加第 6 个角色段
 //!      或删掉某段会先 panic「应恰有 5 段…请先修解析器（**不是** seed 写错了）」，
 //!      改法是先把 `EXPECTED_SNAPSHOT` 补上，再改 `WHITELIST_SECTIONS`；
-//!    - 全文件**只允许 1 处** `AND (rm.role, m.code) IN (`（4.7 回收段）：多写一处回收段
-//!      会 panic「应恰有 1 处」，需先把两处合并，或改解析器并拆分 `REVOKED_PAIRS` 的
-//!      分段表达；
+//!    - **`AND (rm.role, m.code) IN (` 现在有两处**（4.0 复活段 + 4.7 回收段）。
+//!      `revoked_re` / `revived_re` 因此**额外锚定** `AND rm.deleted_at IS NULL` /
+//!      `IS NOT NULL` 来区分两段。只靠元组列表形状会把 4.0 的 61 条白名单误读成回收
+//!      名单。多写/少写任一段都会 panic「应恰有 1 处…请先修解析器」；
 //!    - code 字面量必须匹配 `^[a-z_]+$`：引号写错位置 / 混入非小写字符会 panic。
 //!    - 附：code 列表**中间**的 `--` 注释行由 `strip_sql_line_comments` 剥除后才交给
 //!      `quoted_re`，所以注释里可自由出现单引号；但注释里若出现 ASCII `)`，
 //!      `whitelist_re` 的 `[^)]*` 会提前截断（表现为「缺失若干 code」的 fail-loud）。
+//!    - 4.0/4.7 段元组列表里的 `-- 角色（对应 4.x）` 分组注释行会被
+//!      `strip_sql_line_comments` 剥除后解析；**注释里不能出现 `('ROLE', 'code')` 形状**，
+//!      否则会被当成真元组计进断言 D。
 //! 5. **为什么没有「生产升级演练」用例**（2026-10-05 review 第 2 轮 MINOR-1，决定不
 //!    做，故记在这里备查）：reviewer 建议在 `test-support/fixtures/` 放一份上一版
 //!    `menu.sql` 快照 + 加第 6 个用例，理由是「快照与 seed 一起改 → 白名单删了 + 快照
@@ -248,7 +280,9 @@ const REVOKED_PAIRS: [(&str, &str); 5] = [
 ];
 
 /// 伪造 legacy 授权行用的自定义 id 段（2026-10-05）。物理上与三方 ID 段都不相交：
-/// - seed 静态段 `900000000100{0..4}xxx`（4.1-4.5 段的 `900000000100{role}001 + row_number()`）
+/// - seed 派生段 `9100000000000xxx`（4.1-4.5 段，`9100000000000000 + 角色序号×1e12 + md5`）
+/// - 旧 seed 静态段 `900000000100{0..4}xxx`（2026-10-13 之前的 `row_number()` 方案；
+///   存量行仍用这个段，但 seed 已不再发这个段的新号）
 /// - `t_menu` 静态段 `9000000000xxx`
 /// - fixture 段 `9_000_000_000_000_000_1xx`（1e18 量级，雪花 ID 空间）
 const LEGACY_GRANT_ID_BASE: i64 = 9_000_000_009_000_001;
@@ -267,16 +301,22 @@ const INSPECTOR_USER_ROLE_ID: i64 = 9_000_000_009_000_101;
 //
 // 5 段 role_menu INSERT 的骨架是固定的（见 seeds/menu.sql 第 4.1-4.5 段）：
 //   INSERT INTO t_role_menu (id, role, ...)
-//   SELECT  900000000100{n}001 + row_number() OVER (),  '<ROLE>',  m.id,  ...
+//   SELECT  9100000000000000 + {角色序号} * 1000000000000 + md5(role,code) 低 48bit,
+//           '<ROLE>',  m.id,  ...
 //   FROM t_menu m
 //   WHERE m.code IN ( 'a', 'b', ... )  AND m.deleted_at IS NULL
 //   ON CONFLICT (role, menu_id) WHERE deleted_at IS NULL DO NOTHING;
-// 4.6 段是 DELETE、4.7 段是 UPDATE，均不含 `INSERT INTO t_role_menu`，故不会误匹配。
+// 4.0 / 4.6 / 4.7 段分别是 UPDATE / DELETE / UPDATE，均不含 `INSERT INTO t_role_menu`，
+// 故不会误匹配。
+//
+// 2026-10-13 更新：4.1-4.5 段的 id 表达式已从 `900000000100{n}001 + row_number() OVER ()`
+// 改成「按 (role, code) 派生」。`whitelist_re` 只锚定 `'<ROLE>', m.id,` 这一段，对 id
+// 表达式不敏感，故解析结果不变。
 
 /// 角色 → 白名单 code 集合（4.1-4.5 段解析结果）。
 type Whitelist = BTreeMap<String, BTreeSet<String>>;
 
-/// `('CLERK', 'process_work_type')` 形式的回收二元组。
+/// `('CLERK', 'process_work_type')` 形式的二元组（4.0 复活名单 / 4.7 回收名单共用）。
 type RevokedPairs = BTreeSet<(String, String)>;
 
 /// 段数 = 5（MANAGER / CLERK / INSPECTOR / CNC_PROGRAMMER / SHELF_ACCOUNT）。
@@ -293,7 +333,13 @@ fn whitelist_re() -> &'static Regex {
     })
 }
 
-/// 4.7 段的 `AND (rm.role, m.code) IN ( ... )` 元组列表。
+/// 4.0 复活段 / 4.7 回收段的 `AND (rm.role, m.code) IN ( ... )` 元组列表。
+///
+/// ⚠️ 2026-10-13：4.0 新增了同一形状的元组列表（`AND rm.deleted_at IS NOT NULL` + 同一个
+/// `IN (...)`），所以只锚 `AND (rm.role, m.code) IN (` 会**同时命中两段**、把 4.0 的 61 条
+/// 白名单误当成回收名单。必须再锚定 `AND rm.deleted_at IS NULL` —— 4.0 用的是
+/// `IS NOT NULL`（复活 live 之外的那些），4.7 用的是 `IS NULL`（只回收 live 行），
+/// 两者互斥且不会互相误匹配。这一锚点同时顺带钉住了 4.7 的幂等守卫。
 ///
 /// 终止锚点是语句末的 `\n\s*);`（不是 `)`）—— 元组本身带括号，用 `[^)]*` 会在第一个
 /// `('CLERK',` 处就截断。锚点失配时 `captures_iter` 命中 0 处 → `parse_revoked_pairs`
@@ -301,8 +347,46 @@ fn whitelist_re() -> &'static Regex {
 fn revoked_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"(?s)AND \(rm\.role, m\.code\) IN \((?P<tuples>.*?)\n\s*\);")
-            .expect("4.7 段元组列表正则编译失败")
+        Regex::new(
+            r"(?s)AND rm\.deleted_at IS NULL\s*\n\s*AND \(rm\.role, m\.code\) IN \((?P<tuples>.*?)\n\s*\);",
+        )
+        .expect("4.7 段元组列表正则编译失败")
+    })
+}
+
+/// 4.0 复活段的元组列表（`AND rm.deleted_at IS NOT NULL` + 同一个 `IN (...)`）。
+///
+/// 与 `revoked_re` 的区别只在 `IS NOT NULL` / `IS NULL`，从而把 4.0 和 4.7 分开命中。
+fn revived_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?s)AND rm\.deleted_at IS NOT NULL\s*\n\s*AND \(rm\.role, m\.code\) IN \((?P<tuples>.*?)\n\s*\);",
+        )
+        .expect("4.0 段元组列表正则编译失败")
+    })
+}
+
+/// 4.1-4.5 段的**派生 id 表达式**（2026-10-13 新增；`t_role_menu_pkey` 事故的回归护栏）。
+///
+/// 必须逐段匹配：
+/// ```text
+/// 9100000000000000 + <ord> * 1000000000000
+///     + (('x' || substr(md5('t_role_menu:<ROLE>:' || m.code), 1, 15))::bit(60)::bigint % 1000000000000)
+/// ```
+/// 只锚定到 `md5('t_role_menu:<ROLE>:'` 为止 —— 尾部是纯表达式、无需逐字钉，锚到这
+/// 里已足够把「按 (role, code) 唯一决定」和「按行位置发号（`row_number() OVER ()`）」、
+/// 「角色序号写错」三种形态区分开。
+///
+/// 匹配数必须恒为 5（`WHITELIST_SECTIONS`），与 `whitelist_re` 互为交叉校验：前者钉 id
+/// 表达式形态，后者钉角色与白名单。
+fn grant_id_expr_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"9100000000000000 \+ (?P<ord>[0-9]) \* 1000000000000\s*\+\s*\(\('x' \|\| substr\(md5\('t_role_menu:(?P<role>[A-Z_]+):'",
+        )
+        .expect("派生 id 表达式正则编译失败")
     })
 }
 
@@ -422,23 +506,11 @@ fn parse_code_list(body: &str, role: &str) -> BTreeSet<String> {
     out
 }
 
-/// 从 4.7 段解析出 `('ROLE', 'code')` 回收二元组集合。
-fn parse_revoked_pairs(sql: &str) -> RevokedPairs {
-    let caps: Vec<_> = revoked_re().captures_iter(sql).collect();
-    assert_eq!(
-        caps.len(),
-        1,
-        "seeds/menu.sql 应恰有 1 处 `AND (rm.role, m.code) IN (...)`（4.7 段回收清单），\
-         实际解析出 {} 处 —— 解析器已与 seed 骨架脱节（**不是**「4.7 段可以为空」），\
-         请先修解析器",
-        caps.len()
-    );
-    let tuples = caps[0]
-        .name("tuples")
-        .expect("匹配必带 tuples 捕获组")
-        .as_str();
+/// 把一段 `('ROLE', 'code')` 元组列表文本解析成二元组集合。
+fn parse_pair_tuples(tuples: &str, what: &str) -> RevokedPairs {
+    let stripped = strip_sql_line_comments(tuples);
     let mut out: RevokedPairs = BTreeSet::new();
-    for cap in revoked_pair_re().captures_iter(tuples) {
+    for cap in revoked_pair_re().captures_iter(&stripped) {
         out.insert((
             cap.name("role").expect("必带 role 组").as_str().to_string(),
             cap.name("code").expect("必带 code 组").as_str().to_string(),
@@ -446,9 +518,52 @@ fn parse_revoked_pairs(sql: &str) -> RevokedPairs {
     }
     assert!(
         !out.is_empty(),
-        "4.7 段元组列表解析出 0 个 ('ROLE', 'code') —— 片段：{tuples:?}"
+        "{what} 元组列表解析出 0 个 ('ROLE', 'code') —— 片段：{stripped:?}"
     );
     out
+}
+
+/// 从 4.7 段解析出 `('ROLE', 'code')` 回收二元组集合。
+fn parse_revoked_pairs(sql: &str) -> RevokedPairs {
+    let caps: Vec<_> = revoked_re().captures_iter(sql).collect();
+    assert_eq!(
+        caps.len(),
+        1,
+        "seeds/menu.sql 应恰有 1 处「`AND rm.deleted_at IS NULL` + `AND (rm.role, m.code) \
+         IN (...)`」（4.7 段回收清单），实际解析出 {} 处 —— 解析器已与 seed 骨架脱节\
+         （**不是**「4.7 段可以为空」），请先修解析器",
+        caps.len()
+    );
+    parse_pair_tuples(
+        caps[0]
+            .name("tuples")
+            .expect("匹配必带 tuples 捕获组")
+            .as_str(),
+        "4.7 段",
+    )
+}
+
+/// 从 4.0 复活段解析出 `('ROLE', 'code')` 复活二元组集合。
+///
+/// 4.0 段的元组列表必须与 4.1-4.5 白名单**逐条镜像**（见 `assert_revive_list_mirrors_
+/// whitelist`），所以这里只负责解析，"镜像" 的判定留给那条断言。
+fn parse_revived_pairs(sql: &str) -> RevokedPairs {
+    let caps: Vec<_> = revived_re().captures_iter(sql).collect();
+    assert_eq!(
+        caps.len(),
+        1,
+        "seeds/menu.sql 应恰有 1 处「`AND rm.deleted_at IS NOT NULL` + `AND (rm.role, \
+         m.code) IN (...)`」（4.0 段复活清单），实际解析出 {} 处 —— 解析器已与 seed 骨架\
+         脱节（**不是**「4.0 段可以为空」），请先修解析器",
+        caps.len()
+    );
+    parse_pair_tuples(
+        caps[0]
+            .name("tuples")
+            .expect("匹配必带 tuples 捕获组")
+            .as_str(),
+        "4.0 段",
+    )
 }
 
 // ===========================================================================
@@ -555,6 +670,40 @@ fn assert_code_set(role: &str, actual: &BTreeSet<String>, expected: &[&str]) {
          \x20 实际全集（排序）: {actual:?}",
         actual.len(),
         expected.len()
+    );
+}
+
+/// 断言 4.0 复活名单与 4.1-4.5 白名单**逐条镜像**（2026-10-13）。
+///
+/// 4.0 段的 61 条元组是 4.1-4.5 五段白名单的手工复制。两份必须完全一致：
+/// - 少了 → 白名单里的授权被软删后再加回白名单时不会被复活，会插出**第二行**
+///   （`uk_t_role_menu_role_menu` 是 partial，软删行不在索引里，ON CONFLICT 命中不到）；
+/// - 多了 → 4.7 回收名单里的 code 会被 4.0 复活。4.7 在 4.0 之后跑、同一事务，
+///   当前配置下净结果仍是软删，但两段的先后契约一改就静默失效。
+///
+/// 判定放在这里而不是让 4.0 段直接查库，是为了把「声明式文本自身一致」这条不变量
+/// 与 DB 状态解耦：即便 fresh 库恰好没触发问题，文本漂移也会立刻炸。
+fn assert_revive_list_mirrors_whitelist(whitelist: &Whitelist) {
+    let revived = parse_revived_pairs(MENU_SEED_SQL);
+
+    let from_whitelist: RevokedPairs = whitelist
+        .iter()
+        .flat_map(|(role, codes)| codes.iter().map(move |c| (role.clone(), c.clone())))
+        .collect();
+
+    if revived == from_whitelist {
+        return;
+    }
+    let only_in_revive: Vec<&(String, String)> = revived.difference(&from_whitelist).collect();
+    let only_in_whitelist: Vec<&(String, String)> = from_whitelist.difference(&revived).collect();
+    panic!(
+        "seeds/menu.sql 4.0 复活名单与 4.1-4.5 白名单不镜像：\n\
+         \x20 4.0 段 {} 条 / 4.1-4.5 白名单 {} 条\n\
+         \x20 只在 4.0 复活名单里（会被误复活）: {only_in_revive:?}\n\
+         \x20 只在 4.1-4.5 白名单里（不会被复活 = 加回白名单时会插出第二行）: {only_in_whitelist:?}\n\
+         \x20 改白名单时务必同步 4.0 段的元组列表",
+        revived.len(),
+        from_whitelist.len()
     );
 }
 
@@ -867,6 +1016,222 @@ async fn read_revoked_rows(pool: &PgPool) -> Vec<(Option<NaiveDateTime>, i32)> {
     out
 }
 
+/// 库里的 live 授权行 id（按 id 升序）。
+async fn live_grant_ids(pool: &PgPool) -> Vec<i64> {
+    sqlx::query_scalar("SELECT id FROM t_role_menu WHERE deleted_at IS NULL ORDER BY id")
+        .fetch_all(pool)
+        .await
+        .expect("查 live 授权行 id")
+}
+
+// ===========================================================================
+// 用例 ⑥：4.0 复活段 + 4.1-4.5 段的派生 id（2026-10-13 新增）
+// ===========================================================================
+// 这条用例是 `t_role_menu_pkey` 事故的回归护栏，同时覆盖修复的**两半**：
+//
+// ① **派生 id**（治「撞 PK」本体）——4.1-4.5 段改用 `9100000000000000 + 角色序号×1e12 +
+//    md5(role,code) 低 48bit` 发号。断言 fresh 库里每一条 live 授权行的 id 都落在这个
+//    派生段内（`INSERT 0 2` 时新插入的 mail_* 两行正是这条的产物），且两两不等。
+//    只要有人把 id 表达式改回任何「按行位置发号」的写法（如 `row_number() OVER ()`），
+//    这里就会红。
+//
+// ② **复活段**（治「插出第二行」）——`uk_t_role_menu_role_menu` 是 **partial** 唯一索引
+//    （`WHERE deleted_at IS NULL`），一条被软删的授权行**不在**索引里 ⇒ 4.1-4.5 段的
+//    `ON CONFLICT (role, menu_id) WHERE deleted_at IS NULL` 命中不到它 ⇒ 缺 4.0 段时
+//    重跑 seed 会**再插一行**，同一 (role, menu_id) 出现两条（一条 live 一条软删）。
+//    用例把一条白名单内的授权软删掉，重跑，断言它被**原地复活**（同一个 `id`、
+//    `version + 1`）且总行数不变。
+//
+// 选 (CLERK, parts_list) 作为软删对象的原因：它在 4.2 白名单里、不在 4.7 回收名单里，
+// 且不是 `production_group` 的子菜单（不给 `children_of` 断言添变量）。
+#[tokio::test]
+async fn menu_seed_revives_soft_deleted_grants() {
+    let pool = test_pool().await;
+
+    // ── 1. 先跑一次 seed，把 fresh DB 置于「本轮 seed 建出来的状态」──
+    apply_menu_seed(&pool).await;
+
+    // ── 2. 前提：目标授权行存在且是 live 的 ──
+    let target_id: i64 = sqlx::query_scalar(
+        "SELECT rm.id FROM t_role_menu rm JOIN t_menu m ON m.id = rm.menu_id \
+         WHERE rm.role = 'CLERK' AND m.code = 'parts_list' AND rm.deleted_at IS NULL",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("查 CLERK/parts_list 授权行")
+    .expect("CLERK/parts_list 必须有一条 live 授权（否则本用例前提不成立）");
+
+    let rows_before = total_grant_rows(&pool).await;
+
+    // ── 3. 人为把它软删（模拟「被回收过」或「管理员手工收回」）──
+    sqlx::query("UPDATE t_role_menu SET deleted_at = now(), version = version + 1 WHERE id = $1")
+        .bind(target_id)
+        .execute(&pool)
+        .await
+        .expect("软删 CLERK/parts_list 授权行");
+    let (deleted_at, version_before) = read_grant(&pool, target_id).await;
+    assert!(
+        deleted_at.is_some(),
+        "前提校验：id={target_id} (CLERK/parts_list) 应已被软删"
+    );
+
+    // ── 4. 重跑 seed —— 4.0 段应当原地复活它 ──
+    apply_menu_seed(&pool).await;
+
+    // ── 5. 断言复活：live、`version + 1`、**id 不变** ──
+    let (deleted_at, version_after) = read_grant(&pool, target_id).await;
+    assert!(
+        deleted_at.is_none(),
+        "4.0 复活段必须把白名单内已软删的授权行复活（deleted_at IS NULL）；\
+         id={target_id} (CLERK/parts_list) 仍为软删 —— 说明复活段没生效，\
+         或该 code 没被列进 4.0 的元组列表（断言 D 会同时报出镜像漂移）"
+    );
+    assert_eq!(
+        version_after,
+        version_before + 1,
+        "复活应恰好 bump 一次 version（{version_before} → {}），id={target_id} \
+         (CLERK/parts_list)",
+        version_before + 1
+    );
+
+    // ── 6. 断言没有插出第二行（缺 4.0 段时这一步就会红）──
+    let rows_after = total_grant_rows(&pool).await;
+    assert_eq!(
+        rows_after, rows_before,
+        "复活只允许改 deleted_at，不允许增删 t_role_menu 行（复活前 {rows_before} / \
+         复活后 {rows_after}）—— 多出一行说明 4.0 复活段缺失，4.1-4.5 的 ON CONFLICT \
+         命中不到软删行、插了重复授权"
+    );
+    let dupes: Vec<(String, String, i64)> = sqlx::query(
+        "SELECT rm.role, m.code, count(*) AS n FROM t_role_menu rm \
+         JOIN t_menu m ON m.id = rm.menu_id \
+         GROUP BY rm.role, m.code HAVING count(*) > 1 ORDER BY 1, 2",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("查重复 (role, code) 授权行")
+    .into_iter()
+    .map(|r| (r.get("role"), r.get("code"), r.get("n")))
+    .collect();
+    assert!(
+        dupes.is_empty(),
+        "t_role_menu 不应存在同一 (role, menu_id) 的多行（live + 软删合计），实际 {dupes:?}"
+    );
+
+    // ── 7. 断言派生 id（治「撞 PK」本体）──
+    //    7a. seed 文本层面：5 段 id 表达式必须逐段符合派生式，且**不含任何按行位置发号的
+    //        写法**。这是 2026-10-13 事故的直接回归护栏 —— `row_number() OVER ()` 一旦被
+    //        改回来，正则立刻失配。
+    //    7b. 库层面：派生段内的行，其 id 必须**逐条等于**按 (role, code) 独立算出的期望值
+    //        （不依赖 seed 文本，直接在 DB 侧重算），且全库 live 行 id 两两不等。
+    let exprs: Vec<(&str, char)> = grant_id_expr_re()
+        .captures_iter(MENU_SEED_SQL)
+        .map(|c| {
+            (
+                c.name("role").expect("必带 role 组").as_str(),
+                c.name("ord")
+                    .expect("必带 ord 组")
+                    .as_str()
+                    .chars()
+                    .next()
+                    .expect("ord 非空"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        exprs.len(),
+        WHITELIST_SECTIONS,
+        "seeds/menu.sql 应恰有 5 段符合派生式的 t_role_menu.id 表达式，实际解析出 {} 段 —— \
+         4.1-4.5 段的 id 必须写成 \
+         `9100000000000000 + <角色序号> * 1000000000000 + md5('t_role_menu:<ROLE>:' || m.code) \
+         低 48bit`，**绝不能**用 `基址 + row_number() OVER ()`（按行位置发号，白名单增删 \
+         code 会让整段位移、撞 t_role_menu_pkey —— 2026-10-13 事故）",
+        exprs.len()
+    );
+    let expected_ord: BTreeMap<&str, char> = [
+        ("MANAGER", '0'),
+        ("CLERK", '1'),
+        ("INSPECTOR", '2'),
+        ("CNC_PROGRAMMER", '3'),
+        ("SHELF_ACCOUNT", '4'),
+    ]
+    .into_iter()
+    .collect();
+    for (role, ord) in &exprs {
+        let want = expected_ord
+            .get(role)
+            .unwrap_or_else(|| panic!("4.1-4.5 段出现了未知角色 {role} 的 id 表达式"));
+        assert_eq!(
+            ord, want,
+            "角色 {role} 的 id 表达式用了角色序号 {ord}，应为 {want} \
+             （序号错位会让两个角色的派生 id 段交叠）"
+        );
+    }
+
+    let derived_rows: Vec<(String, String, i64)> = sqlx::query(
+        "SELECT rm.role, m.code, rm.id FROM t_role_menu rm JOIN t_menu m ON m.id = rm.menu_id \
+         WHERE rm.deleted_at IS NULL \
+           AND rm.id BETWEEN 9100000000000000 AND 9104999999999999",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("查派生段内的 live 授权行")
+    .into_iter()
+    .map(|r| (r.get("role"), r.get("code"), r.get("id")))
+    .collect();
+    assert!(
+        !derived_rows.is_empty(),
+        "派生 id 段（9100000000000000..9104999999999999）里一条 live 授权行都没有 —— \
+         4.1-4.5 段是不是把 id 表达式改回去了？"
+    );
+
+    // 逐条独立重算期望 id（SQL 里直接算 md5，不复用 seed 文本）
+    let mismatched: Vec<(String, String, i64)> = sqlx::query(
+        "SELECT rm.role, m.code, rm.id FROM t_role_menu rm JOIN t_menu m ON m.id = rm.menu_id \
+         WHERE rm.deleted_at IS NULL \
+           AND rm.id BETWEEN 9100000000000000 AND 9104999999999999 \
+           AND rm.id <> 9100000000000000 \
+                 + (CASE rm.role WHEN 'MANAGER' THEN 0 WHEN 'CLERK' THEN 1 \
+                                 WHEN 'INSPECTOR' THEN 2 WHEN 'CNC_PROGRAMMER' THEN 3 \
+                                 WHEN 'SHELF_ACCOUNT' THEN 4 END) * 1000000000000 \
+                 + (('x' || substr(md5('t_role_menu:' || rm.role || ':' || m.code), 1, 15)) \
+                    ::bit(60)::bigint % 1000000000000)",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("重算派生 id")
+    .into_iter()
+    .map(|r| (r.get("role"), r.get("code"), r.get("id")))
+    .collect();
+    assert!(
+        mismatched.is_empty(),
+        "派生段内的授权行 id 与「按 (role, code) 独立重算」的期望值不符：{mismatched:?} —— \
+         发号必须只由 (role, code) 决定"
+    );
+
+    let mut sorted_ids = live_grant_ids(&pool).await;
+    let total = sorted_ids.len();
+    sorted_ids.sort_unstable();
+    sorted_ids.dedup();
+    assert_eq!(
+        sorted_ids.len(),
+        total,
+        "live 授权行里出现重复 id —— 发号必须由 (role, code) 唯一决定，不能按行位置发号 \
+         （2026-10-13 t_role_menu_pkey 事故）"
+    );
+
+    // ── 8. 再跑一次：复活是一次性动作，已 live 的行不得被反复 bump version ──
+    let (still_live, v_after_rerun) = read_grant(&pool, target_id).await;
+    apply_menu_seed(&pool).await;
+    let (_, v_final) = read_grant(&pool, target_id).await;
+    assert!(still_live.is_none(), "sanity：id={target_id} 应保持 live");
+    assert_eq!(
+        v_final, v_after_rerun,
+        "4.0 复活段缺 `AND rm.deleted_at IS NOT NULL` 幂等守卫：已 live 的行每次重跑 \
+         都会被 bump version（{v_after_rerun} → {v_final}）"
+    );
+}
+
 // ===========================================================================
 // 用例 ④：端到端 —— 登录后 `/iam/me` 返回的菜单树
 // ===========================================================================
@@ -1101,4 +1466,7 @@ async fn menu_seed_live_matrix_matches_whitelist() {
         "seeds/menu.sql 4.7 段的回收元组与本文件 REVOKED_PAIRS 常量不一致（两处独立来源 \
          必须同步改）：4.7 段新增/删除了回收项时，务必同步 REVOKED_PAIRS"
     );
+
+    // ── 断言 D：4.0 复活名单 == 4.1-4.5 白名单（逐条镜像，见 seeds/menu.sql 4.0 段头）──
+    assert_revive_list_mirrors_whitelist(&whitelist);
 }

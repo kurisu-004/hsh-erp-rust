@@ -11,7 +11,14 @@
 --   * parent_id 通过子查询按 code 反查，不写死雪花 ID（环境间 ID 可不同）
 --   * t_menu.id 用静态 ID（9000000000xxx 段），便于识别"seed 灌的"行；
 --     已存在的雪花 ID 行 ON CONFLICT 后保留原 ID，只更新其他字段
---   * t_role_menu 同样用静态 ID（9000001000xxx 段）
+--   * t_role_menu.id 用**派生 ID**（9100000000000xxx 段，见第 4 节头注释）——
+--     绝不能用 `基址 + row_number() OVER ()`：那是"按行位置"发号，白名单里
+--     加/删任何一个 code，后面所有 code 的位置全部位移，新行就撞上别人已占的
+--     `t_role_menu_pkey`（2026-10-13 加 mail_group/mail_digest 时真实炸过一次）。
+--     `ON CONFLICT (role, menu_id) WHERE deleted_at IS NULL` 只兜 partial 唯一索引，
+--     兜不住 PK —— PK 是另一个 arbiter，撞了直接终止整条 INSERT
+--   * t_role_menu 的授权是「进白名单即生效」：第 4.0 段先把白名单内已软删的授权
+--     **复活**，再由 4.1-4.5 补真正缺失的行。收紧权限才走 4.7 段显式回收。
 --   * 不自动删"未在本文件声明的菜单"——菜单下线必须**显式**列在第 3 节
 --     "soft-delete 区段"（防止误删生产手工加的菜单）
 --
@@ -21,6 +28,8 @@
 -- 域内校验：
 --   * t_menu.code 唯一（uk_t_menu_code WHERE deleted_at IS NULL）
 --   * t_role_menu (role, menu_id) 唯一（uk_t_role_menu_role_menu WHERE deleted_at IS NULL）
+--   * t_role_menu.id 是 PRIMARY KEY（t_role_menu_pkey），**不在**上面那条
+--     partial 唯一索引的覆盖范围内 —— 派生 ID 时必须保证全局不撞
 -- ============================================================================
 
 BEGIN;
@@ -216,11 +225,143 @@ WHERE code = 'delivery_dispatch' AND deleted_at IS NULL;
 -- ============================================================================
 -- 注：assemblies_list 虽是 is_active=false 但仍挂在 CLERK/INSPECTOR/MANAGER 的
 -- 授权表里（保留 prod 现状，未来如重新启用不必再补 role_menu）。
+--
+-- ---------------------------------------------------------------------------
+-- 【发号规则】t_role_menu.id 必须由「授权身份 (role, code)」唯一决定
+-- ---------------------------------------------------------------------------
+--   9100000000000000
+--     + <角色序号> * 1000000000000
+--     + md5('t_role_menu:' || role || ':' || code) 的低 48 bit
+--
+-- 角色序号：MANAGER=0 / CLERK=1 / INSPECTOR=2 / CNC_PROGRAMMER=3 / SHELF_ACCOUNT=4。
+--
+-- 为什么不能沿用旧写法 `900000000100{role}001 + row_number() OVER ()`：
+--   ① row_number() OVER () **没有 ORDER BY**，PG 不保证行序 —— 实测走 Seq Scan
+--      按物理序返回（EXPLAIN 确认），VACUUM / 换执行计划 / pg_restore 重建后
+--      物理序就变，发号结果随之变。
+--   ② 更致命的是「位置」本身会随白名单增删而**整体位移**：白名单里加一个 code，
+--      排在它后面的每个 code 的序号都 +1，于是新行拿到别人的 id。
+--   ③ `ON CONFLICT (role, menu_id) WHERE deleted_at IS NULL` 只声明了
+--      uk_t_role_menu_role_menu 这一个 arbiter；`t_role_menu_pkey` 是另一个，
+--      撞它不会被 DO NOTHING 吞掉，整条 INSERT 直接失败 → 整个 seed 回滚。
+--
+-- 2026-10-13 实证：4.1 MANAGER 白名单加 mail_group/mail_digest，两行按物理序
+-- 落到 9000000001000030 / ...031，而 030 已被 MANAGER/workers_list 占用 →
+-- `duplicate key value violates unique constraint "t_role_menu_pkey"`，
+-- BEGIN/COMMIT 整段回滚，mail_group / mail_digest 连 t_menu 都没插进去。
+--
+-- 派生 ID 的性质：与白名单顺序、增删、其他角色**完全无关**，只由 (role, code)
+-- 决定，因此反复跑 / 中途增删 code 都不会撞号。62 条现有组合已实测
+-- seed 内部 0 重复、与存量 0 撞号。md5 碰撞概率 ~1e-11，且真撞了是硬报错
+-- （不会静默丢授权）—— 这是想要的行为。
+--
+-- ID 段物理不相交（避免与存量行、其它 ID 空间打架）：
+--   - 9100000000000xxx   本文件派生段（~9.1e15）
+--   - 9000000001000xxx   2026-10-13 之前的旧 seed 静态段（存量行仍用，不动）
+--   - 9000000000000xxx   t_menu 静态段（~9.0e15）
+--   - ≥ 2.07e17          生产雪花 ID / fixture ID（~2.2e17 与 9.0e18）
+
+-- ---------------------------------------------------------------------------
+-- 4.0 复活已软删的授权行（2026-10-13 新增）
+-- ---------------------------------------------------------------------------
+-- 为什么需要：uk_t_role_menu_role_menu 是 **partial** 唯一索引
+-- （`WHERE deleted_at IS NULL`）。一条被 4.7 段软删（deleted_at NOT NULL）的
+-- 授权行不在该索引里 ⇒ 4.1-4.5 的 `ON CONFLICT (role, menu_id) WHERE
+-- deleted_at IS NULL` **命中不到它** ⇒ 将来把这个 code 加回白名单时会插出
+-- **第二行**，旧行还留着，授权簿记翻倍、审计对不上账。
+--
+-- 语义对称于第 0 节对 t_menu 的处理：「进白名单 = 生效；下线 = 显式回收」。
+-- 所以先复活（把白名单内已软删的行拉回 live，version + 1），再由 4.1-4.5
+-- 只补真正缺失的行。
+--
+-- 顺序要求：本段必须在 4.7 回收段**之前**跑完 —— 一个 code 同时在白名单和
+-- 4.7 回收名单里的话，语义上「回收」是后手、最终应为软删。
+--
+-- `AND rm.deleted_at IS NOT NULL` 是幂等守卫：缺了它每次重跑都会给已 live 的
+-- 行 bump version（与 4.7 段的 `AND rm.deleted_at IS NULL` 同一套道理）。
+-- ---------------------------------------------------------------------------
+UPDATE t_role_menu rm
+SET deleted_at = NULL,
+    updated_at = now(),
+    version    = rm.version + 1
+FROM t_menu m
+WHERE rm.menu_id = m.id
+  AND rm.deleted_at IS NOT NULL
+  AND (rm.role, m.code) IN (
+      -- 以下五组逐条镜像 4.1-4.5 段白名单（改白名单必须同步改这里）
+      -- MANAGER（对应 4.1）
+      ('MANAGER', 'home'),
+      ('MANAGER', 'production_stats'),
+      ('MANAGER', 'customer_management'),
+      ('MANAGER', 'customers_list'),
+      ('MANAGER', 'applicants_list'),
+      ('MANAGER', 'order_group'),
+      ('MANAGER', 'parts_list'),
+      ('MANAGER', 'parts_new'),
+      ('MANAGER', 'delivery_notes_manage'),
+      ('MANAGER', 'inspection_pending'),
+      ('MANAGER', 'repair_receive'),
+      ('MANAGER', 'assemblies_list'),
+      ('MANAGER', 'pending_programming'),
+      ('MANAGER', 'production_group'),
+      ('MANAGER', 'process_work_type'),
+      ('MANAGER', 'part_process_chain'),
+      ('MANAGER', 'worker_queue'),
+      ('MANAGER', 'template_management'),
+      ('MANAGER', 'print_templates_designer'),
+      ('MANAGER', 'auth_group'),
+      ('MANAGER', 'workers_list'),
+      ('MANAGER', 'users_list'),
+      ('MANAGER', 'shelves_list'),
+      ('MANAGER', 'outsource_list'),
+      ('MANAGER', 'outsource_companies_list'),
+      ('MANAGER', 'outsource_quotes_list'),
+      ('MANAGER', 'outsource_send_receive_list'),
+      ('MANAGER', 'floor_group'),
+      ('MANAGER', 'settings_root'),
+      ('MANAGER', 'mail_group'),
+      ('MANAGER', 'mail_digest'),
+      -- CLERK（对应 4.2）
+      ('CLERK', 'home'),
+      ('CLERK', 'customer_management'),
+      ('CLERK', 'customers_list'),
+      ('CLERK', 'applicants_list'),
+      ('CLERK', 'order_group'),
+      ('CLERK', 'parts_list'),
+      ('CLERK', 'parts_new'),
+      ('CLERK', 'delivery_notes_manage'),
+      ('CLERK', 'assemblies_list'),
+      ('CLERK', 'production_group'),
+      ('CLERK', 'worker_queue'),
+      ('CLERK', 'outsource_list'),
+      ('CLERK', 'outsource_companies_list'),
+      ('CLERK', 'outsource_quotes_list'),
+      ('CLERK', 'outsource_send_receive_list'),
+      ('CLERK', 'repair_receive'),
+      -- INSPECTOR（对应 4.3）
+      ('INSPECTOR', 'home'),
+      ('INSPECTOR', 'parts_list'),
+      ('INSPECTOR', 'delivery_notes_manage'),
+      ('INSPECTOR', 'assemblies_list'),
+      ('INSPECTOR', 'production_group'),
+      ('INSPECTOR', 'outsource_send_receive_list'),
+      ('INSPECTOR', 'inspection_pending'),
+      ('INSPECTOR', 'repair_receive'),
+      -- CNC_PROGRAMMER（对应 4.4）
+      ('CNC_PROGRAMMER', 'home'),
+      ('CNC_PROGRAMMER', 'parts_list'),
+      ('CNC_PROGRAMMER', 'pending_programming'),
+      -- SHELF_ACCOUNT（对应 4.5）
+      ('SHELF_ACCOUNT', 'home'),
+      ('SHELF_ACCOUNT', 'scan_badge'),
+      ('SHELF_ACCOUNT', 'floor_group')
+  );
 
 -- 4.1 MANAGER：除「扫码台」（HMI 专用）外几乎全权
 INSERT INTO t_role_menu (id, role, menu_id, version, created_at, created_by, updated_at, updated_by)
 SELECT
-    9000000001000001 + row_number() OVER (),
+    9100000000000000 + 0 * 1000000000000
+        + (('x' || substr(md5('t_role_menu:MANAGER:' || m.code), 1, 15))::bit(60)::bigint % 1000000000000),
     'MANAGER',
     m.id,
     0, now(), 0, now(), 0
@@ -249,7 +390,8 @@ ON CONFLICT (role, menu_id) WHERE deleted_at IS NULL DO NOTHING;
 -- 4.2 CLERK：业务操作员（无 auth_group 域、无 template_management）
 INSERT INTO t_role_menu (id, role, menu_id, version, created_at, created_by, updated_at, updated_by)
 SELECT
-    9000000001001001 + row_number() OVER (),
+    9100000000000000 + 1 * 1000000000000
+        + (('x' || substr(md5('t_role_menu:CLERK:' || m.code), 1, 15))::bit(60)::bigint % 1000000000000),
     'CLERK',
     m.id,
     0, now(), 0, now(), 0
@@ -272,7 +414,8 @@ ON CONFLICT (role, menu_id) WHERE deleted_at IS NULL DO NOTHING;
 -- 4.3 INSPECTOR：品检员（无 order_group、auth_group、template_management，但保留外协收发）
 INSERT INTO t_role_menu (id, role, menu_id, version, created_at, created_by, updated_at, updated_by)
 SELECT
-    9000000001002001 + row_number() OVER (),
+    9100000000000000 + 2 * 1000000000000
+        + (('x' || substr(md5('t_role_menu:INSPECTOR:' || m.code), 1, 15))::bit(60)::bigint % 1000000000000),
     'INSPECTOR',
     m.id,
     0, now(), 0, now(), 0
@@ -297,7 +440,8 @@ ON CONFLICT (role, menu_id) WHERE deleted_at IS NULL DO NOTHING;
 -- 4.4 CNC_PROGRAMMER：编程员（仅首页 + 零件 + 待编程）
 INSERT INTO t_role_menu (id, role, menu_id, version, created_at, created_by, updated_at, updated_by)
 SELECT
-    9000000001003001 + row_number() OVER (),
+    9100000000000000 + 3 * 1000000000000
+        + (('x' || substr(md5('t_role_menu:CNC_PROGRAMMER:' || m.code), 1, 15))::bit(60)::bigint % 1000000000000),
     'CNC_PROGRAMMER',
     m.id,
     0, now(), 0, now(), 0
@@ -309,7 +453,8 @@ ON CONFLICT (role, menu_id) WHERE deleted_at IS NULL DO NOTHING;
 -- 4.5 SHELF_ACCOUNT：HMI 一体机扫码台
 INSERT INTO t_role_menu (id, role, menu_id, version, created_at, created_by, updated_at, updated_by)
 SELECT
-    9000000001004001 + row_number() OVER (),
+    9100000000000000 + 4 * 1000000000000
+        + (('x' || substr(md5('t_role_menu:SHELF_ACCOUNT:' || m.code), 1, 15))::bit(60)::bigint % 1000000000000),
     'SHELF_ACCOUNT',
     m.id,
     0, now(), 0, now(), 0
@@ -321,6 +466,10 @@ ON CONFLICT (role, menu_id) WHERE deleted_at IS NULL DO NOTHING;
 -- 4.6 清理：seed 删的菜单（settings_root + 3 子菜单 + assemblies_new + 2026-10-08
 --     下线的 delivery_dispatch 等）相关 role_menu 一并清
 --     （即便菜单软删，role_menu 残留不影响功能，但显式清理便于审计）
+-- ⚠️ 4.0 复活段会把白名单内的授权拉回 live，其中包含 ('MANAGER','settings_root')。
+--    但 §3.1 已把该菜单软删 ⇒ 4.1 的 `m.deleted_at IS NULL` 过滤掉它，不会重插；
+--    本段的硬删负责把存量行（含被 4.0 复活的那一条）清干净。同事务内完成，
+--    净效果仍是「这些授权不存在」，无残留。
 DELETE FROM t_role_menu rm
 USING t_menu m
 WHERE rm.menu_id = m.id
@@ -352,6 +501,11 @@ WHERE rm.menu_id = m.id
 --    渲染层 SQL 已按 `m.deleted_at IS NULL` 过滤，且第 4.6 段会硬删 settings_root 等
 --    特定 code 的 role_menu 行；② 回收段求的是「最大化覆盖」，宁可多软删一条不可见
 --    的授权，也不依赖「菜单永远不会被软删」这个上游不变式。
+--
+-- 2026-10-13：4.0 复活段引入后，本段与它构成一对「复活 / 回收」，**顺序不可调换**
+--    —— 4.0 在前、4.7 在后，于是「既在 4.1-4.5 白名单里、又在 4.7 回收名单里」的
+--    code 最终状态是软删（回收是后手）。当前两份名单无交集，此说明只是把隐含契约
+--    写明，防止将来有人调换段落顺序。
 UPDATE t_role_menu rm
 SET deleted_at = now(),
     updated_at = now(),
