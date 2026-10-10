@@ -111,6 +111,17 @@ pub trait IamRepoTrait: Send {
         roles: &'a [String],
     ) -> Result<Vec<Menu>, sqlx::Error>;
 
+    // ── t_role_permission（1，2026-10-14 新增）──
+    /// 按**全部角色 code**联查该用户的权限码集合（登录 / refresh 时装载进
+    /// Redis session 缓存）。
+    ///
+    /// 走 `role_code = ANY($1)` 一条 SQL 而非逐角色查（N 个角色 N 次的写法
+    /// 在登录路径上没必要）。
+    async fn list_permission_codes_by_roles<'a>(
+        &mut self,
+        roles: &'a [String],
+    ) -> Result<Vec<String>, sqlx::Error>;
+
     // ── t_shelf（1）──
     /// `t_shelf` 的唯一行结构是 `iam::shelf::model::TShelf`（含 `capacity`），
     /// 本方法直接委托货架子模块的 SQL 真源，本域不再维护第二份投影。

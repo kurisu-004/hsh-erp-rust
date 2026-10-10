@@ -26,6 +26,12 @@
 --   读侧的 `JOIN t_permission ON ... WHERE p.deleted_at IS NULL` 会自然过滤掉，
 --   不会把孤儿 code 喂给前端。
 --
+-- ### 1.1）三张表都有 `_pkey` 主键
+-- 与全仓每张表一致（`t_menu_pkey` / `t_role_menu_pkey` / …）。除常规理由外，
+-- 本轮还**实际依赖**它：`GET /roles` 的 `GROUP BY r.id` 靠 PG 的函数依赖推断
+-- （主键 ⇒ 其余列可自由出现在 SELECT）——没有主键时那条 SQL 直接报
+-- `column "r.code" must appear in the GROUP BY clause`。
+--
 -- ### 2）雪花 ID 由应用层生成
 -- `id` 一律是 App 侧 `SnowflakeIdGenerator` 生成，不在 DB 里取号，也不建
 -- `DEFAULT nextval(...)` —— 与 `t_shelf` / `t_menu` / `t_part` 等表一致。
@@ -85,6 +91,8 @@ COMMENT ON COLUMN public.t_role.is_system IS '内置角色标记；true 时 code
 COMMENT ON COLUMN public.t_role.is_active IS '停用位；false 时不可被新授予，存量用户下次登录起取不到该角色的授权';
 COMMENT ON COLUMN public.t_role.version IS '乐观锁版本号；POST /roles/{id}/update 与 grants 整包替换共用此锚点，冲突抛 BIZ_VERSION_CONFLICT 409';
 
+ALTER TABLE ONLY public.t_role ADD CONSTRAINT t_role_pkey PRIMARY KEY (id);
+
 CREATE UNIQUE INDEX uk_t_role_code ON public.t_role USING btree (code) WHERE (deleted_at IS NULL);
 
 -- ---------------------------------------------------------------------------
@@ -120,6 +128,9 @@ COMMENT ON COLUMN public.t_permission.code IS '权限码；前端角色面板按
 COMMENT ON COLUMN public.t_permission.domain IS '业务域（code 首段）；GET /iam/permissions 按此分组';
 COMMENT ON COLUMN public.t_permission.is_active IS '下线位；false 时不进面板可选清单，存量授权行读侧联查时一并过滤';
 
+ALTER TABLE ONLY public.t_permission
+    ADD CONSTRAINT t_permission_pkey PRIMARY KEY (id);
+
 CREATE UNIQUE INDEX uk_t_permission_code ON public.t_permission USING btree (code) WHERE (deleted_at IS NULL);
 CREATE INDEX ix_t_permission_domain ON public.t_permission USING btree (domain) WHERE (deleted_at IS NULL);
 
@@ -149,6 +160,9 @@ CREATE TABLE public.t_role_permission (
 COMMENT ON TABLE  public.t_role_permission IS '角色→权限点授权（iam::rbac 域）；ADMIN 元角色不写行，通配在代码里';
 COMMENT ON COLUMN public.t_role_permission.role_code IS '角色码 varchar（无 FK），与 t_role.code / t_user_role.role 同源';
 COMMENT ON COLUMN public.t_role_permission.permission_code IS '权限码 varchar（无 FK），与 t_permission.code 同源';
+
+ALTER TABLE ONLY public.t_role_permission
+    ADD CONSTRAINT t_role_permission_pkey PRIMARY KEY (id);
 
 CREATE UNIQUE INDEX uk_t_role_permission_role_perm
     ON public.t_role_permission USING btree (role_code, permission_code)

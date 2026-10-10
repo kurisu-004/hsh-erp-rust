@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT p.code\n            FROM t_role_permission rp\n            JOIN t_permission p ON p.code = rp.permission_code\n            WHERE rp.role_code = $1\n              AND rp.deleted_at IS NULL\n              AND p.is_active = TRUE\n              AND p.deleted_at IS NULL\n            ORDER BY p.code\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "code",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_permission",
+            "name": "code"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "62a316b23d9d6e026caf031d86e9ddada7d608c8e40f6cfc959a6fdcbb1438cb"
+}

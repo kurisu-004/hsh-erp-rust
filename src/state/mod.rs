@@ -30,6 +30,7 @@ use crate::modules::com::applicant::service::ApplicantService;
 use crate::modules::com::customer::service::CustomerService;
 use crate::modules::com::delivery_note::service::{DeliveryGroupService, DeliveryNoteService};
 use crate::modules::dashboard::service::DashboardService;
+use crate::modules::iam::rbac::service::RbacService;
 use crate::modules::iam::service::{AccountService, SessionService};
 use crate::modules::outsource::service::OutsourceService;
 use crate::modules::part_file::service::PartFileService;
@@ -65,6 +66,9 @@ pub struct AppState {
     /// login / refresh / me / logout / change-password（service::SessionService，原 AuthService）。
     /// 2026-09-21 事务分层重构：字段去掉 `uow_provider`；handler 借连接传入 repo。
     pub session_service: Arc<SessionService>,
+    /// 2026-10-14 新增：iam::rbac service（角色 / 权限点 / 授权整包，8 端点）。
+    /// 字段仅 `snowflake`（事务与 Redis 踢下线都在 handler）。
+    pub rbac_service: Arc<RbacService>,
     /// 2026-09-22 新增：com/customer service（CRUD）。字段仅 `snowflake`；handler
     /// 借 `&mut *tx` / `&mut *conn` 喂给 `CustomerRepo` trait。
     pub customer_service: Arc<CustomerService>,
@@ -173,6 +177,8 @@ impl AppState {
             session.clone(),
             account_service.clone(),
         ));
+        // 2026-10-14 iam::rbac service 装线：仅需 snowflake（事务与 Redis 踢下线都在 handler）。
+        let rbac_service = Arc::new(RbacService::new(snowflake.clone()));
         // 2026-09-22 com/customer + com/applicant service 装线：仅需 snowflake。
         let customer_service = Arc::new(CustomerService::new(snowflake.clone()));
         let applicant_service = Arc::new(ApplicantService::new(snowflake.clone()));
@@ -220,6 +226,7 @@ impl AppState {
             session,
             account_service,
             session_service,
+            rbac_service,
             customer_service,
             applicant_service,
             process_chain_service,
