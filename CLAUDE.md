@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-> 📌 **前端对接**：后端 API 参考见 [`docs/api/`](docs/api/)。**2026-10-12 现状**：`docs/api/` 有 12 份文件，每份是一个域的**整域契约**（端点表 / 逐字段 / 口径表 / 错误码 / 移除记录 / WS 关系 / 表依赖与前端配套 / 已知偏差登记），范本是 [`dashboard.md`](docs/api/dashboard.md) 的八节骨架：
+> 📌 **前端对接**：后端 API 参考见 [`docs/api/`](docs/api/)。**2026-10-13 现状**：`docs/api/` 有 13 份文件，每份是一个域的**整域契约**（端点表 / 逐字段 / 口径表 / 错误码 / 移除记录 / WS 关系 / 表依赖与前端配套 / 已知偏差登记），范本是 [`dashboard.md`](docs/api/dashboard.md) 的八节骨架：
 > - [`docs/api/dashboard.md`](docs/api/dashboard.md) —— 大屏聚合域（3 个只读 HTTP 端点 + WS 首帧 / 增量；`DELIVERY_STATUSES` 四处共用、行单位、装配件整套交付不变式、`ts` 格式、前端配套清单）
 > - [`docs/api/programming.md`](docs/api/programming.md) —— `prod::programming` 待编程一览（part 状态闸门 + 三规则并集、part 级去重、批次锚点、排序白名单大小写不对称）
 > - [`docs/api/inspection.md`](docs/api/inspection.md) —— `prod::inspection` 待品检（队列列表 + 扫码三层树、`l1_customer_name` 与返修侧有意分叉、域隔离漏报盲区）
@@ -15,6 +15,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 > - [`docs/api/iam.md`](docs/api/iam.md) —— `iam` 认证 + 账号 + 货架子模块域（**22 端点** = session 5 + users 12 + shelves 5；4 条破坏性变更（`DELETE wx-bind` → `POST .../unbind`、`GET wx-bind` 返 `Option`、bind 删 `corp_id`、4 端点 body 必填 `version`）、`t_wx_identity` 的双向一对一与 TOCTOU 偏差、`uk_t_user_role_user_role_scope` **非 partial**、角色/scope 变更滞后一个 session TTL）
 > - [`docs/api/wx.md`](docs/api/wx.md) —— `wx` 微信小程序 BFF 域（**2026-10-11 新建**；按小程序页面切子模块：`login/` + `part_list/`；URL 硬切无 alias 5 条（`/wx/iam/wx-login` → `/wx/login/wecom`、`/wx/parts/*` → `/wx/part-list/*`、`/wx/dashboard/home` 删除）、VO 逐字对齐前端卡片模型改 camelCase、`deliveredQty` 真值、尾斜杠 404 实测钉死、★ 2026-10-12 `part_list` 接上日期 + 7 类 tab 双维筛选（`?date=` 打 `system_delivery_date`、`all` 不再是「不过滤」））
 > - [`docs/api/statistics.md`](docs/api/statistics.md) —— `statistics` 生产统计域（**2026-10-12 新建**；3 个 MANAGER-only 只读端点、有效工时口径表、链外工序计 0、`LEFT JOIN LATERAL … LIMIT 1` 的去重理由与「数据覆盖受工序链配置率限制」的登记）
+> - [`docs/api/mail_digest.md`](docs/api/mail_digest.md) —— `mail_digest` 交期汇总邮件域（**2026-10-13 新建**；6 个 MANAGER-only 端点、SMTP 凭据只走 env 不进 DB、`DELIVERY_STATUSES` 与 dashboard 共用、行单位工单级 / 刻意 `LIMIT 30` 分叉、频率→**6 段带秒** cron 与 WEEKLY 减 1、217xx 错误码、失败也落流水、三处「实现与注释不符」的偏差登记）
 >
 > **其它域的契约在代码注释里**（各域 `mod.rs` / `repo.rs` / `vo` / `dto` 的模块 doc 与逐字段 doc），本仓的目录约定见本文件「`docs/api/` 目录约定」一节。⚠️ **引用不存在的文档路径是禁止的** —— 后端代码变更（新增 / 修改 / 删除端点，或修改 DTO 字段 / 错误码）必须同步更新对应域的 `docs/api/` 文件（若该域有）与代码注释。
 
@@ -221,6 +222,28 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 - ⚠️ **角色守卫下沉在 handler 第一行**（三个 handler 逐字 `require_role(Role::Manager)`）。本域错误码只有两个：`20104`（`date_from > date_to`，或 path `{worker_id}` 非数字）与 `20201`（工人不存在**或已软删**）。
 - ⚠️ **本域零跨域模块依赖**（读别域的表是既定 pattern）：唯一例外是 `worker_stats` / `worker_detail` 经 `repo.conn_mut()` 借位调 `prod::worker::repo::WorkerRepo` 与 `prod::work_type::repo::WorkTypeRepo`，与 `DeliveryNoteRepoTrait::conn_mut` 同形。
 - ⚠️ **`count_overdue_undelivered` 与 dashboard 的逾期口径有意分叉**（本域 planned 口径 + DELIVERED 事件兜底），不要动它，见上一节末条。
+
+### `src/modules/mail_digest/` 域（交期到期汇总邮件，MANAGER-only，6 个端点，**2026-10-13 新建**）
+
+| 端点 | 权限 | 说明 |
+|---|---|---|
+| `GET /api/v2/mail-digest/config` | **Manager 独占** | 读配置**单例**；表空时返**全部默认值 + `version=0` + `id="0"`**（**不是 404**，配置页要能在「还没配过」时打开） |
+| `POST /api/v2/mail-digest/config` | **Manager 独占** | **全量覆写**；body **必含 `version`**（缺失 → axum `Json` 提取器返 **HTTP 422 纯文本**，不是业务信封）；成功后调 `task::mail_digest::reschedule` 热重载 cron（**失败不回滚配置**，只 warn） |
+| `GET /api/v2/mail-digest/meta` | **Manager 独占** | 表单的**全部**选项源：频率枚举（含三个 `needs_*`）/ 列白名单 / `upcoming_days_range` / 缺省值 / SMTP 公开信息（**绝不含 username / password**） |
+| `POST /api/v2/mail-digest/preview` | **Manager 独占** | 按「当前配置 + 临时覆盖」渲染 HTML；**不发送、不落流水**；空体 `{}` = 完全用当前配置 |
+| `POST /api/v2/mail-digest/send` | **Manager 独占** | 手动触发：渲染 + 真发 + 落流水（**成败都落**） |
+| `GET /api/v2/mail-digest/logs` | **Manager 独占** | 发送历史分页（`sent_at DESC, id DESC`；`limit` clamp `[1,200]`、缺省 20；`offset` clamp `>=0`；`total` 不受 `limit` 截断） |
+
+- **只用 GET / POST**（全仓零 PUT/PATCH/DELETE）；挂 `/api/v2/mail-digest`，登记在 `src/modules/mod.rs::v2_router()` 的 `.nest("/mail-digest", …)`（顶层 nest、kebab-case 单段）。**权威路由清单是 `handler::ROUTES`**（lib 单测逐条比对 `router()` 源码）。⚠️ 6 条路由**全是静态段**（无 `Path` 参数）⇒ 不受「静态段先于 catch-all」的 matchit 约束。
+- **角色守卫下沉在 handler 第一行**（6 个 handler 逐字 `require_role(Role::Manager)`；菜单亦仅授予 `MANAGER`，`seeds/menu.sql` 的 `mail_group` → `mail_digest`，路径 `/mail/digest`）。**错误码新开 `217xx` 段**：`21701` 未配置 SMTP（**503**，与 `40109` 同款）/ `21702` 发信失败（**502**，SMTP 是外部依赖）/ `21703` 邮箱非法（含 CR/LF 注入）/ `21704` 配置组合非法 / `21705` 配置不存在（**保留位，当前无生产方**）。
+- 🔒 **SMTP 凭据只走 env、不进 DB**（`infra::config::MailConfig`，手写 `Debug` 屏蔽 password）：密码落库就跟着备份走，且任何有只读库权限的人都能捞走。**双闸**：`MAIL_DIGEST_ENABLED`（env 总闸）+ `t_mail_digest_config.enabled`（DB），两者都 true 才注册 cron job；**未配置时后端照常启动**（定时任务 info 一行后返回，手动触发返 `21701`），与 `WECOM_*` 同一降级范式。
+- ⚠️ **落流水在发送之后、且不分成败**：只记成功会让「定时任务每天都在失败」完全不可观测。`t_mail_digest_log` 存**收件人快照**（逗号分隔，不 join 配置表）与 `config_version` 快照 —— 配置改了之后仍要看「当时发给谁、用的哪版配置」。该表**刻意无 `deleted_at` / `version`**（只增的审计流水）。
+- ⚠️ **配置单例靠表达式唯一索引** `uk_t_mail_digest_config_alive ON t_mail_digest_config ((true)) WHERE deleted_at IS NULL` 兜底并发首次初始化（两个请求都看到 `version=0`）⇒ 后到者撞 23505 → service **转成 OCC 冲突**（符合「40901 只表达 OCC」）。
+- **域隔离护栏：不适用**（与 `dashboard` / `statistics` 不同）：本域读 `t_part` / `t_assembly` / `t_part_batch` / `t_customer` 四张别域的表（只读聚合是既定 pattern，统计 SQL 完全在本域内写全、**不 import** 他域 service / repo），唯一的「引用他域符号」是**共用常量** `dashboard::repo::DELIVERY_STATUSES` —— 硬要绕开反而会逼出一份副本常量，那才是真正的漂移源。
+- ⚠️ **与 dashboard 的口径分叉登记**（逐条理由见 [`docs/api/mail_digest.md`](docs/api/mail_digest.md) §4）：**共用** `DELIVERY_STATUSES` 六态 / 行单位工单级 / 已交量守卫 `NOT EXISTS … status IN ('DELIVERED','COMPLETED')`（含 `COMPLETED` 是因为 force-complete 端点强推它）；**刻意不同** = dashboard 每桶 `LIMIT 30` 而本域**无 LIMIT**（邮件必须给全量）/ 本域多取 `drawing_no` / `order_no` 两列 / 本域未来节有 `[today, today+N)` 上界（`N` clamp 1..60）。**窗口下界取形参 `today`，SQL 里绝不写 `CURRENT_DATE`**（DB 会话时区与 `now_naive()` 是两个时钟，Shanghai 00:00–08:00 会整体偏移一天）。
+- ⚠️ **cron 是 6 段带秒**（tokio-cron-scheduler 0.15 内部 `croner` 固定 `Seconds::Required`），且 **`WEEKLY` 必减 1**（本域 `weekday` 用 ISO `1`=周一，cron 第 6 段 `0`=周日；漏减不报错，只会把邮件安静挪到隔一天）。时区**显式传 `Asia/Shanghai`**：`Job::new_async()` 的默认值是 **UTC**，不是本地时区。`JobScheduler::new()` 在 0.15 是 **`async fn`**。
+- ⚠️ **多副本部署不防重**（沿用 `task::auto_complete` 同一现状，N 个副本可能同一时刻发 N 封信）；**`/send` 无频控**（唯一护栏是 MANAGER 角色 + 两道 enabled 闸）。两者均登记为后续独立重构。
+- **覆盖空洞**：`/send` 的**成功路径**（`status='SUCCESS'` 流水行 / 真实投递）**无集成测试** —— 测试环境无可达 SMTP 且刻意不引入 lettre mock transport。替代覆盖：`/preview` 覆盖渲染 + 统计 SQL、「必失败」路径覆盖落流水、`mailer.rs` lib 单测覆盖 TLS 映射表与收件人解析。详见 [`docs/api/mail_digest.md`](docs/api/mail_digest.md) §8.3。
 
 #### 有效工时维度
 
@@ -487,10 +510,11 @@ t_assembly.status               ← 派生缓存
    - **`mod.rs` 的模块 doc 逐条列出端点表与硬切记录**；域改名/URL 硬切必须写「旧路径 404，无 alias」。
    - **matchit 注册顺序是硬约束**：同段数时静态段必须先于 `Path<i64>` catch-all，否则静态路径被吞成 **400**（不是 404）。历史踩坑：`outsource` 旧 `pool_router` 的 `/counts`、`quote_router` 的 `/quotable-parts`，`prod/shelf_process` 的 `/by-process/{id}`。段数不同则天然无冲突（`/move` 1 段 vs `/processes/{id}` 2 段）。
    - **顶层 nest 集中登记在 `src/modules/mod.rs::v2_router()`**，一个前缀一行 + 注释说明归属域与硬切日期。跨域共用的端点也在这里登记，并在**拥有它的域**的 `mod.rs` doc 里注明「本域有 N 处挂载」。
+     - **2026-10-13 新增**：`.nest("/mail-digest", mail_digest::router())`（`mail_digest` 域，6 端点，**顶层 nest、kebab-case 单段**，与 `/part-files` / `/cnc-programs` / `/outsource-queue` 同款；无硬切记录，本域新立）。本域 6 条路由**全是静态段**（无 `Path` 参数）⇒ 不受上面那条 matchit 排序约束。
 
 ## `docs/api/` 目录约定（2026-10-07 确立）
 
-**现状**：`docs/api/` 有 **12 份**文件（与本文件顶部「📌 前端对接」一节同口径；2026-10-11 review 第 1 轮订正过「9 份 / 11 份」两处自相矛盾与漏登 `wx.md`，2026-10-12 新建 `statistics.md` 后为 12），每份 = **一个域的整域契约**：
+**现状**：`docs/api/` 有 **13 份**文件（与本文件顶部「📌 前端对接」一节同口径；2026-10-11 review 第 1 轮订正过「9 份 / 11 份」两处自相矛盾与漏登 `wx.md`，2026-10-12 新建 `statistics.md` 后为 12，**2026-10-13 新建 `mail_digest.md` 后为 13**），每份 = **一个域的整域契约**：
 
 | 文件 | 覆盖域 |
 |---|---|
@@ -506,6 +530,7 @@ t_assembly.status               ← 派生缓存
 | [`docs/api/iam.md`](docs/api/iam.md) | `iam`（认证 + 账号 + 企业微信绑定 + 货架子模块，**22 端点**；session 5 + users 12 + shelves 5，4 条破坏性变更与 OCC 锚点） |
 | [`docs/api/wx.md`](docs/api/wx.md) | `wx` 微信小程序 BFF（**2026-10-11 新建**；**按小程序页面切子模块**：`login/` + `part_list/` + `production/`；5 端点；URL 硬切无 alias 5 条、VO camelCase 逐字对齐前端卡片模型、`deliveredQty` 真值、尾斜杠 404 实测钉死、`counts` / `list` 口径对齐、★ 2026-10-12 `part_list` 日期 + 7 类 tab 双维筛选） |
 | [`docs/api/statistics.md`](docs/api/statistics.md) | `statistics` 生产统计（**2026-10-12 新建**；3 个 MANAGER-only 只读端点、有效工时口径表与数据覆盖登记、跳序取件域清空的移除记录） |
+| [`docs/api/mail_digest.md`](docs/api/mail_digest.md) | `mail_digest` 交期汇总邮件（**2026-10-13 新建**；6 个 MANAGER-only 端点 + 定时任务；SMTP 凭据只走 env；6 段带秒 cron 与 WEEKLY 减 1；217xx 错误码；失败也落流水；与 dashboard 的口径分叉与三处偏差登记） |
 
 **约定**：
 
@@ -517,7 +542,13 @@ t_assembly.status               ← 派生缓存
 
 ## 集成测试目录结构（2026-09-23 PR13 重构后）
 
-integration test binary 已重组为 **20 binary**（8 多文件 domain 子目录化 + 12 single-file 保留；**2026-10-10** 原 `shelf` binary 并入 `iam` binary）—— 数字以 `cargo metadata --no-deps` 列出的 test target 为准逐个复核过（2026-10-10）：
+integration test binary 已重组为 **21 binary**（9 多文件 domain 子目录化 + 12 single-file 保留；**2026-10-10** 原 `shelf` binary 并入 `iam` binary，**2026-10-13** 新增 `mail_digest`）—— 数字以 `cargo metadata --no-deps` 列出的 test target 为准逐个复核过（2026-10-10；2026-10-13 只订正本轮 +1）：
+
+> ⚠️ **2026-10-13 实测出入（登记，本轮不擅自重排别人的账）**：`cargo metadata --no-deps`
+> 现在列出 **22** 个 test target —— 比本表的 21 多一个 `wx`（`tests/wx/`）。
+> `wx` binary 是随 `wx` 域（2026-09-28 建、2026-10-11 重构）落地的，**本表的
+> single-file 清单一直漏登记它**。本轮按任务只补 `mail_digest`（20 → 21），
+> `wx` 的补登记留给下一次改动本表的提交一并处理。
 
 | 新结构 | 拆前 binary 数 | 拆后 binary 名（nextest filter） |
 |---|---:|---|
@@ -526,11 +557,12 @@ integration test binary 已重组为 **20 binary**（8 多文件 domain 子目�
 | `tests/assembly/{main,api,files,files_list,by_part,children,create_serial_price,force_complete,status_sync}.rs` | 3 | `assembly`（**2026-10-11** 新增 `force_complete.rs`：装配件级强制完成端点 `POST /prod/assemblies/{id}/force-complete`，含「子件非取消批次为 0 条」的边角回归）|
 | `tests/iam/{main,api,middleware,bootstrap_admin_seed,menu_seed,wx_bind,shelf,shelf_deactivate}.rs` | 2 | `iam`（**2026-10-09**：原 `redis-flush` 串行组已整体删除 —— Redis 隔离改由 key 前缀承担、触发该组的 `clean_redis`（FLUSHDB）已零调用方随函数删除、两个 binary 的并行度已恢复；删除理由留档在 `.config/nextest.toml` 的注释里。**2026-10-10**：`tests/shelf/` 整体并入本 binary，用例改名 `shelf.rs`（← `api.rs`，`api.rs` 同名冲突）/ `shelf_deactivate.rs`（← `deactivate.rs`），与货架子模块迁入 iam 域同批）|
 | `tests/statistics/{main,api,event_driven}.rs` | 2 | `statistics` |
+| `tests/mail_digest/{main,config,preview,send,logs}.rs` | — | `mail_digest`（**2026-10-13 新建**，与新域同批；4 个 sub-file 按端点切分：`config.rs` 读/写配置与校验矩阵、`preview.rs` 渲染与统计口径、`send.rs` 三条失败路径 + 「失败也落流水」、`logs.rs` 分页与快照语义。★ 核心回归是「装配件只出一行」「`COMPLETED` 也算已交」「CR/LF 收件人被拒」「XSS 转义」；⚠️ 本 binary 走 HTTP 登录，**需要 Redis**（同全仓其它 HTTP 契约测试））|
 | `tests/production/{main,work_type,process,process_chain,worker,queue,queue_auto_allocate,queue_dispatch,queue_board,pending_programming,shelf_process,pickup,process_design,inspection}.rs` | 6 | `production`（按 `src/modules/prod/*` 对齐；`shelf_process.rs` 2026-10-02 自当时的 `tests/shelf/api.rs` 迁入；**`process_design.rs` 2026-10-05 新增**，★ 核心回归是「装配件子件可见」；**`inspection.rs` 2026-10-05 新增** 13 场景，★ 核心回归是「扫子件 → 返回整棵装配件树」；**2026-10-08** `worker_pool.rs` → `queue.rs`、`worker_pool_auto_allocate.rs` → `queue_auto_allocate.rs`、`batch.rs` → `queue_dispatch.rs`，并新增 `queue_board.rs`（队列板聚合 9 场景））|
 | `tests/outsource/{main,company,quote,quotable,send_receive,shipment,pool}.rs` | 3 | `outsource` |
 | `tests/user_repo/{main,basic,role,password}.rs` | 1 → 3 sub-file | `user_repo` |
 | 单文件保留：_e2e_api / applicant_api / auto_complete_api / cnc_program_api / cos_opendal_api / cos_real_smoke / customer_api / dashboard_ws_api / files_sts_tmp_keys / idempotency_api / print_forward / wecom_login | 12 | （各自原 binary 名）|
-| **合计** | — | **20 binary**（8 子目录 + 12 单文件；`cargo metadata --no-deps` 实测）|
+| **合计** | — | **21 binary**（9 子目录 + 12 单文件；**2026-10-13** 新增 `tests/mail_digest/` 后由 20 → 21；⚠️ `cargo metadata --no-deps` 实测是 22，多出的 `wx` binary 是本表一直漏登记的，见本节开头的出入登记）|
 
 **关键约定**：
 - cargo 1.98.1 **不识别** `tests/<dir>/mod.rs`，只识别 `tests/<dir>/main.rs`（binary 名 = `<dir>`）。新 domain 一律用 `main.rs`。
