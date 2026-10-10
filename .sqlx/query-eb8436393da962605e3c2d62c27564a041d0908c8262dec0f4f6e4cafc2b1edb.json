@@ -1,0 +1,183 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO t_mail_digest_log (\n            id, config_version, trigger_source, to_recipients, cc_recipients,\n            subject, overdue_count, upcoming_count, html_bytes, status,\n            error_message, sent_at, created_at\n        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)\n        RETURNING id, config_version, trigger_source, to_recipients, cc_recipients,\n                  subject, overdue_count, upcoming_count, html_bytes, status,\n                  error_message, sent_at, created_at\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_mail_digest_log",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "config_version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_mail_digest_log",
+            "name": "config_version"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "trigger_source",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_mail_digest_log",
+            "name": "trigger_source"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "to_recipients",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "t_mail_digest_log",
+            "name": "to_recipients"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "cc_recipients",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "t_mail_digest_log",
+            "name": "cc_recipients"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "subject",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_mail_digest_log",
+            "name": "subject"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "overdue_count",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_mail_digest_log",
+            "name": "overdue_count"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "upcoming_count",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_mail_digest_log",
+            "name": "upcoming_count"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "html_bytes",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_mail_digest_log",
+            "name": "html_bytes"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "status",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_mail_digest_log",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "error_message",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_mail_digest_log",
+            "name": "error_message"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "sent_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_mail_digest_log",
+            "name": "sent_at"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "created_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_mail_digest_log",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int4",
+        "Varchar",
+        "Text",
+        "Text",
+        "Varchar",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Varchar",
+        "Varchar",
+        "Timestamp"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "eb8436393da962605e3c2d62c27564a041d0908c8262dec0f4f6e4cafc2b1edb"
+}

@@ -138,7 +138,8 @@ const TARGET_CODES: [&str; 3] = ["process_work_type", "part_process_chain", "wor
 
 /// `seeds/menu.sql` 第 4.1 段 MANAGER 白名单去掉两条已 soft-delete 的菜单
 /// （第 3.1 节的 `settings_root`、第 3.5 节的 `delivery_dispatch`）后的全量 live 授权
-/// code 快照，**28 项**。
+/// code 快照，**30 项**（2026-10-13 新增 `mail_group` + `mail_digest`：交期汇总邮件
+/// 的顶级分组与子菜单，域 `mail_digest` 的 6 端点全部 MANAGER 独占，只归管理员）。
 const MANAGER_EXPECTED: &[&str] = &[
     "applicants_list",
     "assemblies_list",
@@ -149,6 +150,8 @@ const MANAGER_EXPECTED: &[&str] = &[
     "floor_group",
     "home",
     "inspection_pending",
+    "mail_digest",
+    "mail_group",
     "order_group",
     "outsource_companies_list",
     "outsource_list",
@@ -211,7 +214,8 @@ const CNC_PROGRAMMER_EXPECTED: &[&str] = &["home", "parts_list", "pending_progra
 /// 第 4.5 段 SHELF_ACCOUNT 白名单，**3 项**。
 const SHELF_ACCOUNT_EXPECTED: &[&str] = &["floor_group", "home", "scan_badge"];
 
-/// 5 份快照 = 28 + 16 + 8 + 3 + 3 = **58 条 live 授权**。
+/// 5 份快照 = 30 + 16 + 8 + 3 + 3 = **60 条 live 授权**（30 = 28 + 2026-10-13 新增
+/// 的 `mail_group` / `mail_digest`）。
 const EXPECTED_SNAPSHOT: [(&str, &[&str]); 5] = [
     ("MANAGER", MANAGER_EXPECTED),
     ("CLERK", CLERK_EXPECTED),

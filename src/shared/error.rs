@@ -15,7 +15,8 @@
 //! - `2xxxx`      业务域错误：200xx 用户/订单、201xx 零件/客户、202xx 工人、203xx 装配体、
 //!   204xx 图纸文件、205xx 货架、206xx 账号、208xx 工序、209xx 工种、210xx 申请人、
 //!   211xx 零件文件、212xx 外协公司、213xx 外协报价、214xx 送货单、215xx 外协发货、
-//!   216xx 上传会话（Redis 共享 STS 凭证机制）。
+//!   217xx 交期汇总邮件（2026-10-13 新增；216xx 上传会话域 2026-09-28 下线后**未复用**，
+//!   理由见 `code` 模块内 217xx 段的注释）。
 //!
 //!   错误码段位归属（2026-09-19 prod 聚合后）：
 //!   - `prod::worker` / `prod::queue` → `202xx` 工人段（共享；queue 的 `WORKER_POOL_EMPTY`/`NO_WORK_TYPE` 等复用 `20205`/`20206`）
@@ -344,6 +345,34 @@ pub mod code {
 
     // 2026-09-28 删除：216xx 相关会话域错误码（域整体下线，码段释放）。
 
+    // 217xx 交期汇总邮件（mail_digest 域，2026-10-13 新增）
+    //
+    // ⚠️ **为什么不是 215xx**：任务书原定 215xx，但该段在 2026-09-13 已被
+    // `outsource::shipment` 占用（`BIZ_OUTSOURCE_SHIPMENT_*` = 21501..21504，
+    // 至今在用）。`216xx`（上传会话）已于 2026-09-28 随域下线**释放**，但复用
+    // 一个「已用过又被回收」的段位有风险：老客户端 / 旧日志里可能还残留 216xx 的
+    // 映射，撞码比撞段更隐蔽。故取**全新段 217xx**，与 CLAUDE.md §3
+    // 「新增域错误码先入对应段、每域一段」的约定一致。
+    //
+    // 21701 = 未配置 SMTP（`MailConfig::is_enabled()` 为 false：总闸关，或
+    //   `MAIL_SMTP_USERNAME` / `MAIL_SMTP_PASSWORD` / 发件人地址任一为空）。
+    //   语义上更接近「服务未就绪」→ 映射 HTTP 503（与 `BIZ_WX_NOT_CONFIGURED`
+    //   40109 → 503 同款），不是「调用方无权」。
+    // 21702 = lettre SMTP 层报错（连接 / 认证 / 拒收 / 握手）。⚠️ 触达本码时
+    //   `t_mail_digest_log` **已经落了一行** `status='FAILED'` + error_message，
+    //   信息不会因为返错而丢失。
+    // 21703 = 邮箱地址格式非法，或含 CR / LF（SMTP header 注入面，见
+    //   `mail_digest::service::validate_email`）。
+    // 21704 = 配置组合非法：WEEKLY 缺 weekday、MONTHLY 缺 day_of_month、
+    //   未知 visible_columns 列名、两节都关闭、`upcoming_days` 越界等。
+    // 21705 = 配置行不存在**且不可自动初始化**的语义保留位（当前
+    //   `GET /config` 在表空时返回默认值 + `version=0`，不返本码）。
+    pub const BIZ_MAIL_NOT_CONFIGURED: i32 = 21701;
+    pub const BIZ_MAIL_SEND_FAILED: i32 = 21702;
+    pub const BIZ_MAIL_RECIPIENT_INVALID: i32 = 21703;
+    pub const BIZ_MAIL_CONFIG_INVALID: i32 = 21704;
+    pub const BIZ_MAIL_CONFIG_NOT_FOUND: i32 = 21705;
+
     // 系统错误
     pub const INTERNAL: i32 = 50000;
     pub const DATABASE: i32 = 50001;
@@ -526,9 +555,24 @@ fn status_from_code(c: i32) -> StatusCode {
             || c == code::BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND
             || c == code::BIZ_PROCESS_CHAIN_NOT_FOUND
             || c == code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND
-            || c == code::BIZ_BATCH_NOT_FOUND =>
+            || c == code::BIZ_BATCH_NOT_FOUND
+            || c == code::BIZ_MAIL_CONFIG_NOT_FOUND =>
         {
             StatusCode::NOT_FOUND
+        }
+
+        // 2026-10-13 新增（mail_digest 域）：
+        // - 21701 未配置 SMTP → 503「服务未就绪」，与 `BIZ_WX_NOT_CONFIGURED`
+        //   (40109) 同款；**不是** 403/400（调用方没做错任何事，是运维没配）。
+        // - 21702 发信失败 → 502 Bad Gateway（SMTP 是外部依赖，它挂了；
+        //   本服务的入参校验全过了，失败发生在下游）。⚠️ 必须显式登记：
+        //   下面 `(20000..30000) => BAD_REQUEST` 的兜底会把它变成 400，
+        //   前端就会把「SMTP 挂了」显示成「你填错了」——两者排查方向完全相反。
+        // - 21703 邮箱非法 / 21704 配置组合非法 → 400（纯入参问题，含 CR/LF 注入）。
+        c if c == code::BIZ_MAIL_NOT_CONFIGURED => StatusCode::SERVICE_UNAVAILABLE,
+        c if c == code::BIZ_MAIL_SEND_FAILED => StatusCode::BAD_GATEWAY,
+        c if c == code::BIZ_MAIL_RECIPIENT_INVALID || c == code::BIZ_MAIL_CONFIG_INVALID => {
+            StatusCode::BAD_REQUEST
         }
 
         // ---- 2xxxx 业务码：409 (状态冲突 / 重复 / 占用 / 锁) ----
@@ -1037,6 +1081,15 @@ mod tests {
             code::BIZ_OUTSOURCE_SHIPMENT_QUANTITY_EXCEEDS,
             "BIZ_OUTSOURCE_SHIPMENT_QUANTITY_EXCEEDS",
         ),
+        // 217xx 交期汇总邮件（2026-10-13 新增）
+        (code::BIZ_MAIL_NOT_CONFIGURED, "BIZ_MAIL_NOT_CONFIGURED"),
+        (code::BIZ_MAIL_SEND_FAILED, "BIZ_MAIL_SEND_FAILED"),
+        (
+            code::BIZ_MAIL_RECIPIENT_INVALID,
+            "BIZ_MAIL_RECIPIENT_INVALID",
+        ),
+        (code::BIZ_MAIL_CONFIG_INVALID, "BIZ_MAIL_CONFIG_INVALID"),
+        (code::BIZ_MAIL_CONFIG_NOT_FOUND, "BIZ_MAIL_CONFIG_NOT_FOUND"),
         // 207xx 工艺链（worker-pool auto-allocate 阶段新增）
         (
             code::BIZ_PROCESS_CHAIN_NOT_FOUND,
@@ -1274,7 +1327,14 @@ mod tests {
         // 2026-09-16 PR-3 批次 step 化：part 无工艺链时禁上生产流
         assert_eq!(code::BIZ_PROCESS_CHAIN_REQUIRED, 20706);
 
-        // 2026-09-28 删除：216xx 相关会话域断言（域下线，码段释放）。
+        // 2026-09-28 删除：216xx 相关会话域断言（域下线，码段**未复用**）。
+
+        // 217xx（mail_digest，2026-10-13 新增）
+        assert_eq!(code::BIZ_MAIL_NOT_CONFIGURED, 21701);
+        assert_eq!(code::BIZ_MAIL_SEND_FAILED, 21702);
+        assert_eq!(code::BIZ_MAIL_RECIPIENT_INVALID, 21703);
+        assert_eq!(code::BIZ_MAIL_CONFIG_INVALID, 21704);
+        assert_eq!(code::BIZ_MAIL_CONFIG_NOT_FOUND, 21705);
     }
 
     /// 数据驱动的 HTTP 表覆盖测试：每个 (code, expected_http, name) 一行。
@@ -1333,6 +1393,33 @@ mod tests {
             code::BIZ_WX_NOT_CONFIGURED,
             StatusCode::SERVICE_UNAVAILABLE,
             "BIZ_WX_NOT_CONFIGURED",
+        ),
+        // 2026-10-13 新增（mail_digest 域 217xx）：未配置 SMTP → 503（与 40109 同款）；
+        // 发信失败 → 502（外部依赖挂了，不是入参问题）；邮箱/配置非法 → 400。
+        (
+            code::BIZ_MAIL_NOT_CONFIGURED,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "BIZ_MAIL_NOT_CONFIGURED",
+        ),
+        (
+            code::BIZ_MAIL_SEND_FAILED,
+            StatusCode::BAD_GATEWAY,
+            "BIZ_MAIL_SEND_FAILED",
+        ),
+        (
+            code::BIZ_MAIL_RECIPIENT_INVALID,
+            StatusCode::BAD_REQUEST,
+            "BIZ_MAIL_RECIPIENT_INVALID",
+        ),
+        (
+            code::BIZ_MAIL_CONFIG_INVALID,
+            StatusCode::BAD_REQUEST,
+            "BIZ_MAIL_CONFIG_INVALID",
+        ),
+        (
+            code::BIZ_MAIL_CONFIG_NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            "BIZ_MAIL_CONFIG_NOT_FOUND",
         ),
         (code::FORBIDDEN, StatusCode::FORBIDDEN, "FORBIDDEN"),
         (

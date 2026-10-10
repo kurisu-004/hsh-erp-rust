@@ -1,0 +1,624 @@
+//! mail_digest 域 DTO：入参请求体 + 表单选项源枚举
+//!
+//! 出参 VO 也放在本文件（`ConfigOut` / `PreviewOut` / `SendResultOut` / `LogListOut`
+//! / `MetaOut` …）—— 理由见文件末尾「为什么没有单独的 vo.rs」。
+//!
+//! ## 三态枚举的取值域即 DB 的 varchar 取值域
+//! 本仓无 DB ENUM（`varchar` + Rust 枚举校验），所以下面三个枚举的 `as_str()`
+//! 与 `from_str` 必须与 `migrations/20261013000000_001_mail_digest.sql` 里
+//! `frequency` / `trigger_source` / `status` 三列的注释**逐字对齐**：
+//! - `frequency`：`DAILY` / `WEEKLY` / `MONTHLY` / `MANUAL_ONLY`
+//! - `trigger_source`：`SCHEDULED` / `MANUAL`
+//! - `t_mail_digest_log.status`：`SUCCESS` / `FAILED`
+//!
+//! 解析一律用 `FromStr`（`Err` 带合法值清单），**不用 `serde` 的 `rename_all` 反序列化**
+//! ——后者只能给出「unknown variant」这种不带候选项的信息，运维看到无从下手。
+
+use serde::{Deserialize, Serialize};
+
+use crate::shared::error::{AppError, code};
+
+/// 未来节窗口天数下限（与 `dashboard::dto::DASHBOARD_MIN_DAYS` 同档）。
+pub const UPCOMING_DAYS_MIN: i32 = 1;
+/// 未来节窗口天数上限（与 `dashboard::dto::DASHBOARD_MAX_DAYS` 同档）。
+pub const UPCOMING_DAYS_MAX: i32 = 60;
+
+/// 未来节窗口天数缺省值。
+pub const UPCOMING_DAYS_DEFAULT: i32 = 14;
+
+/// `GET /logs` 单页最大条数（`limit∈[1,200]`）。
+pub const LOGS_LIMIT_MAX: i64 = 200;
+/// `GET /logs` 缺省单页条数。
+pub const LOGS_LIMIT_DEFAULT: i64 = 20;
+
+// ============================================================================
+// 频率枚举
+// ============================================================================
+
+/// 发送频率（产品决议：只给 4 个预设，**没有**「每隔 N 小时」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Frequency {
+    /// 每天一次。
+    Daily,
+    /// 每周一次（`weekday` 生效，ISO 1=周一 .. 7=周日）。
+    Weekly,
+    /// 每月一次（`day_of_month` 生效，1..28）。
+    Monthly,
+    /// 仅手动（`POST /send`）；定时任务**不注册** job。
+    ManualOnly,
+}
+
+impl Frequency {
+    /// 全部取值的字面量（`GET /meta` 的 `frequencies[]` 与写侧校验共用这一份）。
+    pub const ALL: &'static [Frequency] = &[
+        Frequency::Daily,
+        Frequency::Weekly,
+        Frequency::Monthly,
+        Frequency::ManualOnly,
+    ];
+
+    /// DB / JSON 的字面量。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Daily => "DAILY",
+            Self::Weekly => "WEEKLY",
+            Self::Monthly => "MONTHLY",
+            Self::ManualOnly => "MANUAL_ONLY",
+        }
+    }
+
+    /// 中文标签（`GET /meta` 的 `label`，前端直接渲染，不在前端另存一份映射）。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Daily => "每天",
+            Self::Weekly => "每周",
+            Self::Monthly => "每月",
+            Self::ManualOnly => "仅手动",
+        }
+    }
+
+    /// 是否需要用户填「几点几分」（MANUAL_ONLY 不需要）。
+    pub fn needs_time(self) -> bool {
+        !matches!(self, Self::ManualOnly)
+    }
+
+    /// 是否需要填「星期几」（仅 WEEKLY）。
+    pub fn needs_weekday(self) -> bool {
+        matches!(self, Self::Weekly)
+    }
+
+    /// 是否需要填「几号」（仅 MONTHLY）。
+    pub fn needs_day_of_month(self) -> bool {
+        matches!(self, Self::Monthly)
+    }
+}
+
+impl std::str::FromStr for Frequency {
+    type Err = AppError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "DAILY" => Ok(Self::Daily),
+            "WEEKLY" => Ok(Self::Weekly),
+            "MONTHLY" => Ok(Self::Monthly),
+            "MANUAL_ONLY" => Ok(Self::ManualOnly),
+            other => Err(AppError::biz(
+                code::BIZ_MAIL_CONFIG_INVALID,
+                format!("频率取值非法：{other}；合法值只有 DAILY / WEEKLY / MONTHLY / MANUAL_ONLY"),
+            )),
+        }
+    }
+}
+
+impl Serialize for Frequency {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+// ============================================================================
+// 列白名单枚举
+// ============================================================================
+
+/// 正文表格可选列（内容可选 ②）。
+///
+/// ⚠️ **这是封闭枚举**：新增列必须同时改①本枚举 ②`template.rs` 的取值函数
+/// ③`GET /meta` 的输出（后两者都由本枚举派生，改一处即可）。未知列一律
+/// `21704 BIZ_MAIL_CONFIG_INVALID`，**不静默丢弃** —— 配置错误应当当场暴露，
+/// 静默丢弃会让人以为列已经生效。真正的解析入口是本文件的 [`parse_visible_columns`]
+/// （写侧 `service::validate_save_request` 与读侧 `service::normalize_row` 都走它）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisibleColumn {
+    SerialNo,
+    DrawingNo,
+    Name,
+    Quantity,
+    CustomerName,
+    Status,
+    SystemDeliveryDate,
+    RemainingDays,
+    RowType,
+    IsUrgent,
+    OrderNo,
+}
+
+impl VisibleColumn {
+    /// 全量白名单，顺序 = `GET /meta` 的展示顺序 = 缺省配置顺序。
+    pub const ALL: &'static [VisibleColumn] = &[
+        VisibleColumn::SerialNo,
+        VisibleColumn::DrawingNo,
+        VisibleColumn::Name,
+        VisibleColumn::Quantity,
+        VisibleColumn::CustomerName,
+        VisibleColumn::Status,
+        VisibleColumn::SystemDeliveryDate,
+        VisibleColumn::RemainingDays,
+        VisibleColumn::RowType,
+        VisibleColumn::IsUrgent,
+        VisibleColumn::OrderNo,
+    ];
+
+    /// 缺省配置使用的 8 列（`t_mail_digest_config.visible_columns` 的列默认值）。
+    ///
+    /// ⚠️ **改这一处必须同步 migration 里的列 DEFAULT 字面量** —— migration 是
+    /// append-only、不会被改写，已经建过表的环境不会跟着变。
+    pub const DEFAULT_SET: &'static [VisibleColumn] = &[
+        VisibleColumn::SerialNo,
+        VisibleColumn::DrawingNo,
+        VisibleColumn::Name,
+        VisibleColumn::Quantity,
+        VisibleColumn::CustomerName,
+        VisibleColumn::Status,
+        VisibleColumn::SystemDeliveryDate,
+        VisibleColumn::RemainingDays,
+    ];
+
+    /// DB / JSON 的字面量（与 migration 的 `visible_columns` 列取值域一致）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SerialNo => "serial_no",
+            Self::DrawingNo => "drawing_no",
+            Self::Name => "name",
+            Self::Quantity => "quantity",
+            Self::CustomerName => "customer_name",
+            Self::Status => "status",
+            Self::SystemDeliveryDate => "system_delivery_date",
+            Self::RemainingDays => "remaining_days",
+            Self::RowType => "row_type",
+            Self::IsUrgent => "is_urgent",
+            Self::OrderNo => "order_no",
+        }
+    }
+
+    /// 中文表头（邮件正文与前端预览共用，前端不另存一份映射）。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SerialNo => "序列号",
+            Self::DrawingNo => "图号",
+            Self::Name => "名称",
+            Self::Quantity => "数量",
+            Self::CustomerName => "客户",
+            Self::Status => "状态",
+            Self::SystemDeliveryDate => "系统交期",
+            Self::RemainingDays => "剩余天数",
+            Self::RowType => "工单类型",
+            Self::IsUrgent => "是否紧急",
+            Self::OrderNo => "订单号",
+        }
+    }
+
+    /// 由字面量解析。
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|c| c.as_str() == raw)
+    }
+}
+
+/// 由字符串切片解析成列白名单；任一项未知即返 `21704`（含候选项清单）。
+pub fn parse_visible_columns(raw: &[String]) -> Result<Vec<VisibleColumn>, AppError> {
+    let mut out = Vec::with_capacity(raw.len());
+    for key in raw {
+        match VisibleColumn::parse(key) {
+            Some(col) => out.push(col),
+            None => {
+                let legal: Vec<&str> = VisibleColumn::ALL.iter().map(|c| c.as_str()).collect();
+                return Err(AppError::biz(
+                    code::BIZ_MAIL_CONFIG_INVALID,
+                    format!("未知的表格列 `{key}`；合法列名只有 {}", legal.join(" / ")),
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+// ============================================================================
+// 触发来源 / 发送结果
+// ============================================================================
+
+/// 触发来源（`t_mail_digest_log.trigger_source`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerSource {
+    /// cron 定时任务（`task::mail_digest` 的 job）。
+    Scheduled,
+    /// 人工点「立即发送」（`POST /api/v2/mail-digest/send`）。
+    Manual,
+}
+
+impl TriggerSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Scheduled => "SCHEDULED",
+            Self::Manual => "MANUAL",
+        }
+    }
+}
+
+impl std::str::FromStr for TriggerSource {
+    type Err = AppError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "SCHEDULED" => Ok(Self::Scheduled),
+            "MANUAL" => Ok(Self::Manual),
+            other => Err(AppError::biz(
+                code::BIZ_MAIL_SEND_FAILED,
+                format!("触发来源取值非法：{other}；合法值只有 SCHEDULED / MANUAL"),
+            )),
+        }
+    }
+}
+
+impl Serialize for TriggerSource {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+/// 发送结果（`t_mail_digest_log.status`）。**成败都落库**，故这是流水的主状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendStatus {
+    Success,
+    Failed,
+}
+
+impl SendStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "SUCCESS",
+            Self::Failed => "FAILED",
+        }
+    }
+}
+
+impl std::str::FromStr for SendStatus {
+    type Err = AppError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "SUCCESS" => Ok(Self::Success),
+            "FAILED" => Ok(Self::Failed),
+            other => Err(AppError::biz(
+                code::BIZ_MAIL_SEND_FAILED,
+                format!("发送状态取值非法：{other}；合法值只有 SUCCESS / FAILED"),
+            )),
+        }
+    }
+}
+
+impl Serialize for SendStatus {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+// ============================================================================
+// 请求体
+// ============================================================================
+
+/// `POST /api/v2/mail-digest/config` 请求体：**全量覆写**。
+///
+/// ⚠️ `version` **必填、无 `#[serde(default)]`**（CLAUDE.md §8 硬约定）：
+/// 缺失时 axum `Json` 提取器直接返 **HTTP 422 纯文本**，不是业务信封。
+/// 「读-再-比」式隐式 OCC 被明令禁止：前端表单可能开着 30s，隐式 OCC 下
+/// 「你看到的配置已被别人改过」会静默成功。
+#[derive(Debug, Clone, Deserialize)]
+pub struct SaveConfigRequest {
+    /// 乐观锁锚点。首次初始化传 `0`（表里无行）。
+    pub version: i32,
+    #[serde(default)]
+    pub enabled: bool,
+    pub frequency: String,
+    #[serde(default)]
+    pub send_hour: Option<i16>,
+    #[serde(default)]
+    pub send_minute: Option<i16>,
+    #[serde(default)]
+    pub weekday: Option<i16>,
+    #[serde(default)]
+    pub day_of_month: Option<i16>,
+    pub recipients: Vec<String>,
+    #[serde(default)]
+    pub cc_recipients: Vec<String>,
+    #[serde(default = "default_true")]
+    pub include_overdue: bool,
+    #[serde(default = "default_true")]
+    pub include_upcoming: bool,
+    #[serde(default = "default_upcoming_days")]
+    pub upcoming_days: i32,
+    pub visible_columns: Vec<String>,
+    #[serde(default)]
+    pub subject_template: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_upcoming_days() -> i32 {
+    UPCOMING_DAYS_DEFAULT
+}
+
+/// `POST /preview` / `POST /send` 请求体：**配置的部分覆盖**。
+///
+/// - **不含 `version`**：这两个端点**不改配置**，只是拿「当前配置 + 临时覆盖」
+///   渲一封信出来试排版 / 真发一封，OCC 对它们没有意义（覆盖值不落库）。
+/// - 全部字段 `#[serde(default)]`：空体 `{}` = 完全用当前配置，语义最自然。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PreviewRequest {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub frequency: Option<String>,
+    #[serde(default)]
+    pub send_hour: Option<i16>,
+    #[serde(default)]
+    pub send_minute: Option<i16>,
+    #[serde(default)]
+    pub weekday: Option<i16>,
+    #[serde(default)]
+    pub day_of_month: Option<i16>,
+    #[serde(default)]
+    pub recipients: Option<Vec<String>>,
+    #[serde(default)]
+    pub cc_recipients: Option<Vec<String>>,
+    #[serde(default)]
+    pub include_overdue: Option<bool>,
+    #[serde(default)]
+    pub include_upcoming: Option<bool>,
+    #[serde(default)]
+    pub upcoming_days: Option<i32>,
+    #[serde(default)]
+    pub visible_columns: Option<Vec<String>>,
+    #[serde(default)]
+    pub subject_template: Option<String>,
+}
+
+/// `GET /logs` query：`limit∈[1,200]` + `offset≥0`。
+#[derive(Debug, Clone, Deserialize)]
+pub struct LogListQuery {
+    #[serde(default = "default_logs_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+}
+
+fn default_logs_limit() -> i64 {
+    LOGS_LIMIT_DEFAULT
+}
+
+// ============================================================================
+// 出参
+// ============================================================================
+
+/// 配置的**规范化形态**：读侧与写侧共用的中间表示（已过校验、已清无用字段）。
+///
+/// `service` 内部一律拿它传给 `template::render` / `schedule::to_cron`，
+/// 避免「DB 行 / 请求体 / 覆盖后配置」三套形状在渲染层反复转换。
+#[derive(Debug, Clone)]
+pub struct NormalizedConfig {
+    pub enabled: bool,
+    pub frequency: Frequency,
+    pub send_hour: Option<i16>,
+    pub send_minute: Option<i16>,
+    pub weekday: Option<i16>,
+    pub day_of_month: Option<i16>,
+    pub recipients: Vec<String>,
+    pub cc_recipients: Vec<String>,
+    pub include_overdue: bool,
+    pub include_upcoming: bool,
+    pub upcoming_days: i32,
+    pub visible_columns: Vec<VisibleColumn>,
+    pub subject_template: Option<String>,
+}
+
+impl Default for NormalizedConfig {
+    /// 缺省配置（`GET /config` 在表空时返的、`GET /meta` 的 `defaults` 段、
+    /// `POST /config` 首次初始化前的基准，三者共用这一份）。
+    ///
+    /// ⚠️ `recipients` 刻意**为空**而不是塞一个占位地址：占位地址会让人以为
+    /// 「配好了」（然后真发出一封没人收的信，或更糟：被人当成真地址加进客户名册）。
+    ///
+    /// ⚠️ **空数组在本结构里是合法值**：`POST /config` **允许**存一份空收件人的配置
+    /// （编辑中途的正常形态），非空不变量**只**在发送路径上生效
+    /// （`service::deliver` / `service::send_scheduled` 的准备段）。
+    /// 原注释写的是「空数组会被 `POST /config` 的校验（21704）当场拦下」，**与实现相反**
+    /// ——2026-10-13 review 第 1 轮 M6 订正，见
+    /// `docs/api/mail_digest.md` §8.3「实现与注释不符」第 1 条与回归用例
+    /// `config_accepts_empty_recipients_but_send_rejects_it`。
+    /// `enabled` 缺省 `false`，同理（少发一封信永远好过多发一封）。
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            frequency: Frequency::Daily,
+            send_hour: Some(8),
+            send_minute: Some(0),
+            weekday: None,
+            day_of_month: None,
+            recipients: Vec::new(),
+            cc_recipients: Vec::new(),
+            include_overdue: true,
+            include_upcoming: true,
+            upcoming_days: UPCOMING_DAYS_DEFAULT,
+            visible_columns: VisibleColumn::DEFAULT_SET.to_vec(),
+            subject_template: None,
+        }
+    }
+}
+
+/// `GET /config` / `POST /config` 响应体。
+///
+/// `id` 是 JSON **string**（雪花 ID 防 JS 精度截断，`shared::types::serialize_i64`）。
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigOut {
+    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
+    pub id: i64,
+    pub version: i32,
+    pub enabled: bool,
+    pub frequency: String,
+    pub send_hour: Option<i16>,
+    pub send_minute: Option<i16>,
+    pub weekday: Option<i16>,
+    pub day_of_month: Option<i16>,
+    pub recipients: Vec<String>,
+    pub cc_recipients: Vec<String>,
+    pub include_overdue: bool,
+    pub include_upcoming: bool,
+    pub upcoming_days: i32,
+    pub visible_columns: Vec<String>,
+    pub subject_template: Option<String>,
+    /// env 侧是否已具备发信能力（`MailConfig::is_enabled()`）。
+    /// 前端据此灰掉「立即发送」并提示去配 `MAIL_SMTP_*`。
+    pub smtp_configured: bool,
+    /// naive timestamp（Asia/Shanghai），格式 `YYYY-MM-DD HH:MM:SS`。
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// `GET /config` 的默认值形态：**不含** `id` / `version` / 时间戳 / `smtp_configured`
+/// （`GET /meta` 的 `defaults` 段用）。
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigDefaultsOut {
+    pub enabled: bool,
+    pub frequency: String,
+    pub send_hour: Option<i16>,
+    pub send_minute: Option<i16>,
+    pub weekday: Option<i16>,
+    pub day_of_month: Option<i16>,
+    pub recipients: Vec<String>,
+    pub cc_recipients: Vec<String>,
+    pub include_overdue: bool,
+    pub include_upcoming: bool,
+    pub upcoming_days: i32,
+    pub visible_columns: Vec<String>,
+    pub subject_template: Option<String>,
+}
+
+impl From<&NormalizedConfig> for ConfigDefaultsOut {
+    fn from(c: &NormalizedConfig) -> Self {
+        Self {
+            enabled: c.enabled,
+            frequency: c.frequency.as_str().to_string(),
+            send_hour: c.send_hour,
+            send_minute: c.send_minute,
+            weekday: c.weekday,
+            day_of_month: c.day_of_month,
+            recipients: c.recipients.clone(),
+            cc_recipients: c.cc_recipients.clone(),
+            include_overdue: c.include_overdue,
+            include_upcoming: c.include_upcoming,
+            upcoming_days: c.upcoming_days,
+            visible_columns: c
+                .visible_columns
+                .iter()
+                .map(|c| c.as_str().to_string())
+                .collect(),
+            subject_template: c.subject_template.clone(),
+        }
+    }
+}
+
+/// `GET /meta` 的频率选项。
+#[derive(Debug, Clone, Serialize)]
+pub struct FrequencyOption {
+    pub value: String,
+    pub label: String,
+    pub needs_time: bool,
+    pub needs_weekday: bool,
+    pub needs_day_of_month: bool,
+}
+
+/// `GET /meta` 的列选项。
+#[derive(Debug, Clone, Serialize)]
+pub struct ColumnOption {
+    pub key: String,
+    pub label: String,
+}
+
+/// `GET /meta` 的取值范围。
+#[derive(Debug, Clone, Serialize)]
+pub struct RangeOut {
+    pub min: i32,
+    pub max: i32,
+}
+
+/// `GET /meta` 的 SMTP 公开信息。
+///
+/// ⚠️ **绝不含 username / password**：本段会原样进前端页面。发件地址与主机名
+/// 是排障必需的（收不到信时第一件事就是看发件人），凭据不是。
+#[derive(Debug, Clone, Serialize)]
+pub struct SmtpPublicOut {
+    pub configured: bool,
+    pub host: String,
+    pub port: u16,
+    pub tls_mode: String,
+    pub from_address: String,
+    pub from_name: String,
+}
+
+/// `GET /meta` 响应体（前端表单的**全部**选项源都在这一个端点里）。
+#[derive(Debug, Clone, Serialize)]
+pub struct MetaOut {
+    pub frequencies: Vec<FrequencyOption>,
+    pub columns: Vec<ColumnOption>,
+    pub defaults: ConfigDefaultsOut,
+    pub upcoming_days_range: RangeOut,
+    pub smtp: SmtpPublicOut,
+}
+
+/// `POST /preview` 响应体：**不发送、不落 log**。
+#[derive(Debug, Clone, Serialize)]
+pub struct PreviewOut {
+    pub subject: String,
+    pub html: String,
+    pub overdue_count: i32,
+    pub upcoming_count: i32,
+    pub columns: Vec<String>,
+}
+
+/// `POST /send` 响应体（= 流水行视图 + 本次计数）。
+#[derive(Debug, Clone, Serialize)]
+pub struct SendResultOut {
+    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
+    pub log_id: i64,
+    pub config_version: i32,
+    pub trigger_source: TriggerSource,
+    pub status: SendStatus,
+    pub subject: String,
+    pub to_recipients: Vec<String>,
+    pub cc_recipients: Vec<String>,
+    pub overdue_count: i32,
+    pub upcoming_count: i32,
+    pub html_bytes: i32,
+    pub sent_at: String,
+    pub error_message: Option<String>,
+}
+
+/// `GET /logs` 响应体。
+#[derive(Debug, Clone, Serialize)]
+pub struct LogListOut {
+    pub items: Vec<SendResultOut>,
+    /// 匹配总数，**不受** `limit` 截断影响。
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}

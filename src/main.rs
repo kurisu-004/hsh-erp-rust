@@ -161,6 +161,15 @@ async fn main() -> anyhow::Result<()> {
         task::auto_complete::run(task_state, task_token).await;
     });
 
+    // 2026-10-13 新增：交期汇总邮件定时任务。与 auto_complete 一样挂在同一枚
+    // `shutdown` 令牌上（优雅退出一并生效）。未配置 SMTP 时它自己打一行
+    // info 后直接返回，不注册任何 job —— 后端照常启动。
+    let mail_state = state.clone();
+    let mail_token = shutdown.clone();
+    tokio::spawn(async move {
+        task::mail_digest::run(mail_state, mail_token).await;
+    });
+
     // 10. 路由组装
     let max_body = state.config.max_request_body_size;
     // 2026-10-03 新增：请求级超时改为按路径分档（替换 `tower_http::timeout::TimeoutLayer`）。
