@@ -262,6 +262,8 @@ pub fn test_app_config() -> Arc<AppConfig> {
         python_backend: crate::infra::config::PythonBackendConfig::default(),
         // 2026-09-29 新增：企业微信登录配置（session service 不读，占位默认值）
         wecom: crate::infra::config::WeComConfig::default(),
+        // 2026-10-13 新增：SMTP 配置（session service 不读，占位默认值）
+        mail: crate::infra::config::MailConfig::default(),
     })
 }
 

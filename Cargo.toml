@@ -144,6 +144,31 @@ uuid = { version = "1", features = ["v4"] }
 # 最新 1.x 仍为 1.10.x）。`[[bin]]` 块**不接受** dev-deps，所以 regex 必须上移
 # 到主依赖（即便主程序 lib 实际不引用，仅 bin 编译用）。
 regex = "1.10"
+# 2026-10-13 新增：交期汇总邮件（mail_digest 域 + task::mail_digest 后台任务）。
+#
+# lettre：SMTP 客户端。`default-features = false` 关掉默认的 `native-tls`
+#   （系统 OpenSSL），改走 `tokio1-rustls-tls` —— 与本仓 reqwest / opendal 的
+#   TLS 栈保持一致，免得同一进程里并存两套 TLS 后端。
+#   ⚠️ 实测（cargo add）：lettre 0.11 **没有** `charset` feature（0.10 时代有），
+#      charset 在 0.11 是无条件编译的，报 `unrecognized feature for crate lettre: charset`。
+#      `tokio1-rustls-tls` 会连带 enable `tokio1` + `rustls-tls` + `smtp-transport`。
+lettre = { version = "0.11", default-features = false, features = [
+    "builder",
+    "smtp-transport",
+    "tokio1-rustls-tls",
+] }
+
+# tokio-cron-scheduler：cron 调度器。⚠️ 0.15 的 `Job::new_async()` 内部写死
+#   `Utc`（源码 `Self::new_async_tz(schedule, Utc, run)`），而 `JobScheduler::new()`
+#   在 0.15 已改成 **async**。要按本地时区跑必须用 `Job::new_async_tz(cron, tz, run)`，
+#   它的 `TZ` 形参是 `chrono::TimeZone` ⇒ 直接把 `chrono_tz::Asia::Shanghai` 传进去。
+#   不依赖 `TZ` 环境变量（`docker-compose.yml` 有设、`cargo run` 的开发机未必）。
+tokio-cron-scheduler = "0.15"
+
+# chrono-tz：上面那个 `new_async_tz` 的时区实参（tokio-cron-scheduler 自带的传递依赖，
+#   但直接用它的类型必须在主依赖里显式声明，否则拿不到 `chrono_tz::Asia::Shanghai`）。
+#   版本与 tokio-cron-scheduler 的 `chrono-tz = "0.10"` 对齐（cargo 会 unify 成一份）。
+chrono-tz = "0.10"
 
 # 2026-09-29 CAS key 扁平化迁移 bin：从 src/bin/cos_key_migrate.rs 暴露
 # `cargo run --bin cos-key-migrate -- --dry-run` / `--apply` 入口。

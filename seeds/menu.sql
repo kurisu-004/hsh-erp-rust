@@ -56,7 +56,11 @@ WHERE deleted_at IS NOT NULL
     'print_templates_designer',
     -- 2026-09-29 新增：复活待编程（pending_programming）和待品检（inspection_pending）子项，
     -- 它们从顶级/order_group 移到 production_group 下；软删态要复活才能命中 ON CONFLICT。
-    'pending_programming'
+    'pending_programming',
+    -- 2026-10-13 新增：交期汇总邮件（mail_group 顶级 + mail_digest 子菜单）。
+    -- 放进复活清单的理由同上：软删态下不会被 uk_t_menu_code 的 partial 索引命中，
+    -- ON CONFLICT 失效后会直接 INSERT 撞 PK。
+    'mail_group', 'mail_digest'
   );
 
 -- ============================================================================
@@ -78,6 +82,11 @@ INSERT INTO t_menu (
     (9000000000000009, NULL, 'auth_group',           '权限管理',   NULL,                  'Key',            30, true, 0, now(), 0, now(), 0),
     (9000000000000010, NULL, 'outsource_list',       '外协管理',   NULL,                  'Promotion',      35, true, 0, now(), 0, now(), 0),
     (9000000000000011, NULL, 'floor_group',          '车间',       NULL,                  'Tools',          40, true, 0, now(), 0, now(), 0),
+    -- 2026-10-13 新增：交期汇总邮件的一级菜单。sort_order=45 —— 刻意插在
+    -- floor_group(40) 与 settings_root(50) 之间：一级菜单从左到右按 sort_order
+    -- 排，「车间」是生产执行侧入口、「设置」是系统配置侧入口，邮件定时任务属于
+    -- 两者之间的「运维自动化」，放 45 会正好卡在两组之间，两边都不挤。
+    (9000000000000013, NULL, 'mail_group',           '定时任务/邮件', NULL,                'Clock',          45, true, 0, now(), 0, now(), 0),
     (9000000000000012, NULL, 'settings_root',        '设置',       NULL,                  'Setting',        50, true, 0, now(), 0, now(), 0)
 ON CONFLICT (code) WHERE deleted_at IS NULL DO UPDATE SET
     parent_id  = EXCLUDED.parent_id,
@@ -134,6 +143,10 @@ INSERT INTO t_menu (
     -- 2026-09-29 新增：待品检（inspection_pending）从 order_group 移到 production_group；
     -- 原 id（9000000000000105）保留；sort_order 从 50 改为 30（在 worker_queue 之后）。
     (9000000000000105, (SELECT id FROM t_menu WHERE code = 'production_group'  AND deleted_at IS NULL), 'inspection_pending',        '待品检',        '/inspection/pending',          'CircleCheck',  30, true, 0, now(), 0, now(), 0),
+
+    -- 2026-10-13 新增：mail_group 下。交期汇总邮件（域 mail_digest，6 端点
+    -- 全部 MANAGER 独占）。path 与前端视图名一致（/mail/digest）。
+    (9000000000000901, (SELECT id FROM t_menu WHERE code = 'mail_group'       AND deleted_at IS NULL), 'mail_digest',               '交期汇总邮件',  '/mail/digest',                 'Message',     10, true, 0, now(), 0, now(), 0),
 
     -- template_management 下（023）
     (9000000000000701, (SELECT id FROM t_menu WHERE code = 'template_management' AND deleted_at IS NULL), 'print_templates_designer','模板编辑',     '/print-templates',             'Document',     10, true, 0, now(), 0, now(), 0)
@@ -223,7 +236,12 @@ WHERE m.code IN (
     'template_management', 'print_templates_designer',
     'auth_group', 'workers_list', 'users_list', 'shelves_list',
     'outsource_list', 'outsource_companies_list', 'outsource_quotes_list', 'outsource_send_receive_list',
-    'floor_group', 'settings_root'
+    'floor_group', 'settings_root',
+    -- 2026-10-13 新增：交期汇总邮件。**仅 MANAGER** —— 4.2 CLERK / 4.3 INSPECTOR /
+    -- 4.4 CNC_PROGRAMMER / 4.5 SHELF_ACCOUNT 四段**都不加**这两个 code。理由与
+    -- 2026-10-05 收紧 process_work_type / part_process_chain 同款：邮件定时任务
+    -- 会**对真实收件人发信**，属配置型 + 有外发副作用的操作，只归管理员。
+    'mail_group', 'mail_digest'
 )
 AND m.deleted_at IS NULL
 ON CONFLICT (role, menu_id) WHERE deleted_at IS NULL DO NOTHING;
