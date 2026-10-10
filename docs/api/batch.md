@@ -291,6 +291,25 @@ t_assembly.status               ← 派生缓存
 | `shared::batch::status::FORCE_COMPLETE_ALL_BATCHES_FOR_ASSEMBLY_SQL` | `COMPLETED` | 不清 | **清**（装配件级强推完成） |
 | `prod::batch::repo::sql::mark_batch_delivered` | `DELIVERED` | 不清 | **清** |
 | `prod::batch::repo::sql::mark_batch_completed` | `COMPLETED` | 不清 | **清** |
+| `prod::batch::repo::queries::PartBatchRepo::update` | `DELIVERED` | 不清 | **清**（送货单 `/pickup` 路径；2026-10-14 review 第 2 轮 MAJOR-N1 补上） |
+
+⚠️ **末行是「本表曾经只有 6 行」的真实事故**：`PartBatchRepo::update` 的唯一生产调用方
+`com::delivery_note::service::lifecycle::pickup` 只在**内存 struct** 上清了
+`current_holder_id` / `location`（供响应与随后的 `sync` 读），真正的 DB 写走该函数而它的
+`clear_location` 是 `false` ⇒ 落库的行仍停在 `location='INSPECTION_SHELF' +
+current_holder_id=<shelf_id>`，正是 migration `20261013000002` 判据要清的那一类行
+⇒ **历史清了、以后继续产生**。回归测试：
+`tests/com/delivery_note/driver.rs::pickup_uses_assigned_driver_and_flips_batches_to_delivered`。
+
+📌 **正典清单在代码里**：`prod::batch::repo::queries::PartBatchRepo::update` 的 doc 有一张
+同内容的 6 行表 + 「新增终态写点必须加一行」的纪律。本表是它的文档镜像，**改动必须
+两侧同改** —— 上一轮的漏改正是因为这份镜像与 `CLAUDE.md` 的不变式 bullet 都说了「已统一
+处理过」，而代码里第 6 个写点根本没跟上。
+
+⚠️ **另一个不在表内的写点**：`prod::batch::repo::sql::mark_batch_cancelled` 的两个
+`clear_*` 仍是 `false`，**因为它全仓零调用方**（死代码，`allowed_from` 不含
+`IN_PROCESS`，接回去也够不到工人手上的批次）。接回调用前必须先改成 `true`；
+理由与 `list_held_by_worker` 同款自我标注，见该函数 doc。
 
 ⚠️ **`mark_batch_status_only` 只对 `CANCELLED` 特判，绝不能改成无条件清** —— 它还服务
 两个**非终态**目标，而它们的 `location` 是**有业务含义**的：
