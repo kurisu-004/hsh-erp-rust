@@ -108,9 +108,10 @@ pub async fn create_role(
     Ok((StatusCode::CREATED, Json(R::ok(out))))
 }
 
-/// `POST /api/v2/iam/roles/{id}/update` —— 改名 / 改描述，提交后踢该角色持有者。
+/// `POST /api/v2/iam/roles/{id}/update` —— 改名称 / 描述 / code。
 ///
-/// 改 code 时同事务级联三张关联表（service 内完成）。
+/// 仅 **code 变更**时提交后踢该角色持有者（改名会级联三张关联表并改变持有者
+/// session 缓存里的角色串）；只改名称 / 描述不踢。
 pub async fn update_role(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -127,10 +128,9 @@ pub async fn update_role(
     Ok(Json(R::ok(out)))
 }
 
-/// `POST /api/v2/iam/roles/{id}/deactivate` —— 停用 / 软删。
+/// `POST /api/v2/iam/roles/{id}/deactivate` —— 停用（`delete=false`）或软删。
 ///
-/// 护栏场景（ADMIN 会导致管理员数归零）在此之前就以 400 返回，
-/// `kicks` 为空 ⇒ 不会触发任何 `delete_all_user_sessions`。
+/// 两者都会踢该角色的全部在册持有者（停用即降权）。ADMIN 角色一律 400。
 pub async fn deactivate_role(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -177,10 +177,10 @@ async fn kick_sessions(state: &Arc<AppState>, kicks: &KickList, ctx: &str) {
 
 /// 本模块路由表（8 条），由 `iam::handler::router()` merge 进 `/api/v2/iam`。
 ///
-/// 路由注册顺序：`/{id}` catch-all 排在三条**同段静态路由**之后
-/// （axum matchit 0.8 按注册顺序消歧，见 `iam::handler::router` 的说明）。
-/// 本表的 8 条里静态段是 `/roles` / `/permissions` / `/menus`（1 段），
-/// catch-all 是 `/{id}`（1 段）—— 顺序上**有约束**，故静态三条在前。
+/// 本表**没有裸 `/{id}` catch-all**：静态段是 `/permissions` / `/menus` /
+/// `/roles`（1 段），三条角色写端点都是 `/roles/{id}/…`（2 段以上）。与
+/// `users` 的 `/{id}` 由 nest 前缀（`/users` vs 根）隔离，merge 顺序不影响
+/// 匹配结果。
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/permissions", get(list_permissions))

@@ -1,4 +1,4 @@
-//! `AccountService` 的 `t_user` 子块单测（20 用例）
+//! `AccountService` 的 `t_user` 子块单测（21 用例）
 //!
 //! 覆盖矩阵：
 //! - happy path（每个方法 1 个）
@@ -637,6 +637,9 @@ async fn deactivate_last_active_admin_is_rejected() {
     // 该账号持有 ADMIN，且只剩它一个 active 管理员
     mock.expect_has_active_admin_grants()
         .returning(|_| Ok(true));
+    // 护栏先取 t_role ADMIN 行锁再计数（2026-10-14 并发串行化）
+    mock.expect_lock_admin_role_for_update()
+        .returning(|| Ok(()));
     mock.expect_list_active_admin_user_ids()
         .returning(|| Ok(vec![101]));
 

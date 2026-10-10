@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use crate::auth::rbac::Role;
 use crate::infra::snowflake::SnowflakeIdGenerator;
+use crate::modules::iam::rbac::service::ADMIN_ROLE_CODE;
 use crate::shared::error::{AppError, code};
 
 // `iam/service/` 子目录中 dto / vo / repo 是 sibling 的兄弟模块 —— 用 `super::super::` 跨级
@@ -79,22 +80,27 @@ impl AccountService {
 
     /// 取角色可见菜单并组树（供 SessionService 复用）。调用方传 `repo`，helper 不自管事务。
     ///
+    /// 入参是**原始大写角色码**（不是 `Role` 枚举）：`t_role_menu` 按 varchar 授权，
+    /// 自定义角色（如 `QC_LEAD`）在枚举里不存在，用枚举会让它们被角色面板勾选的
+    /// 菜单在 `/iam/me` 里**永远不出现**（且零报错）。枚举只用于授权判定，
+    /// 菜单装载必须用原始串。
+    ///
     /// **ADMIN 元角色通配**（2026-10-14 补）：持有 ADMIN 时返**全量**启用中菜单。
-    /// ADMIN 不进 `t_role_menu`（通配在代码里），若照常走 `list_active_menus_by_roles`
+    /// ADMIN 不进 `t_role_menu`（通配在代码里），照常走 `list_active_menus_by_roles`
     /// 会拿到空树 ⇒ 管理员登录后全站无入口、`/iam/roles` 面板自己也进不去。
-    /// 通配判定用 `Role::Admin` 枚举（`has_role` 的唯一实现点在 `auth::rbac`，
-    /// 但这里收的是角色列表而非 `CurrentUser`，故直接判成员，与
-    /// `CurrentUser::has_role` 同语义）。
+    /// 判据用 `ADMIN_ROLE_CODE` 常量（与 `has_role` 的元角色语义同源）。
+    ///
+    /// 停用角色不下发菜单：调用方（`resolve_roles_and_scope`）已把停用角色的
+    /// code 滤掉，菜单查询的输入只含启用中角色。
     pub async fn menus_for_roles<R: IamRepoTrait>(
         &self,
         repo: &mut R,
-        roles: &[Role],
+        role_codes: &[String],
     ) -> Result<Vec<MenuNodeOut>, AppError> {
-        let menus = if roles.contains(&Role::Admin) {
+        let menus = if role_codes.iter().any(|c| c == ADMIN_ROLE_CODE) {
             repo.list_all_active_menus().await?
         } else {
-            let role_strs: Vec<String> = roles.iter().map(|r| r.as_str().to_string()).collect();
-            repo.list_active_menus_by_roles(&role_strs).await?
+            repo.list_active_menus_by_roles(role_codes).await?
         };
         Ok(build_menu_tree(menus))
     }

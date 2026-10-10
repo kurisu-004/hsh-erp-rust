@@ -19,9 +19,10 @@
 //! - shelf_deactivate.rs   ← 2026-10-10 自 `tests/shelf/deactivate.rs` 迁入：
 //!   停用守卫回归（20503 / 20203）
 //! - rbac.rs               ← 2026-10-14 新增：iam::rbac 子模块 8 端点 + 用户域
-//!   角色授予/撤销联动（13 用例：角色列表 / MANAGER-only / grants 整包 / ADMIN
-//!   元角色读全量写拒绝 / 菜单通配 / 自定义角色 CRUD 与改 code 级联 / ADMIN 自锁
-//!   护栏 / 变更踢下线）
+//!   角色授予/撤销联动（18 用例：角色列表 / MANAGER-only / grants 整包与重复码
+//!   拒绝 / ADMIN 元角色读全量写拒绝 / 菜单通配与配置用全量树 / 自定义角色 CRUD
+//!   与改 code 级联 / 停用即降权（滤角色 + 踢持有人）/ ADMIN 自锁护栏 /
+//!   变更踢下线 / 权限点矩阵）
 
 #![allow(dead_code, clippy::await_holding_lock, unused_imports)]
 

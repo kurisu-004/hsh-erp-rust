@@ -24,19 +24,24 @@
 //! ## ADMIN 元角色：读全量、写拒绝
 //! - `get_role_grants`：`code == "ADMIN"` 时两个数组返**全量** active 菜单码 /
 //!   权限码（面板要能整页渲染，返空会让管理员以为「ADMIN 什么都没有」）；
-//! - `set_role_grants` / `deactivate_role` / `update_role`（改 code）：一律拒绝。
+//! - `set_role_grants` / `deactivate_role` / `update_role`（带 code）：一律拒绝。
 //!
-//! ## 三条「ADMIN 自锁护栏」
-//! 下面三种操作若会让「active 且持有 ADMIN 的用户数」归零 → 400，**且不调**
-//! `delete_all_user_sessions`：
-//! 1. 停用 / 删除 ADMIN 角色本身；
-//! 2. 撤销用户的 ADMIN 角色（BE-4，用户域）；
-//! 3. 停用持有 ADMIN 的用户（BE-4，用户域）。
+//! ## ADMIN 自锁护栏
+//! **ADMIN 角色本身不可停用 / 删除**（固定 400，不做计数）：停用生效后（登录侧
+//! 只认 `t_role.is_active = true` 的角色），停用 ADMIN = 所有管理员立即失去唯一
+//! 能恢复它的元角色 —— count >= 2 时同样会导致全员降权。删除本就因 `is_system`
+//! 被拒，合并为同一条文案。
 //!
-//! 判据都是 [`Self::count_active_users_holding`]：统计 `t_user.is_active AND
-//! t_user_role.role = <code> AND t_user_role.deleted_at IS NULL`。**护栏只在
-//! 「操作对象就是 ADMIN」时触发**，其它角色一律不管 —— 否则管理员连删一个
-//! 自定义角色都要先算「还剩几个管理员」，那是产品决策不是护栏。
+//! 另外两条**计数护栏**在「会让 active 且持有 ADMIN 的用户数归零」时返 400，
+//! **且不调** `delete_all_user_sessions`：
+//! 1. 撤销用户的 ADMIN 角色（用户域 `remove_role`）；
+//! 2. 停用持有 ADMIN 的用户（用户域 `deactivate_user`）。
+//!
+//! 判据是「`t_user.is_active` 且 ADMIN 授权行未软删的用户数 <= 1」，且**只在
+//! 操作对象就是 ADMIN 时触发** —— 其它角色一律不管，否则管理员连删一个自定义
+//! 角色都要先算「还剩几个管理员」，那是产品决策不是护栏。计数与写入之间由用户域
+//! 对 `t_role` ADMIN 行的行锁串行化（见 `IamRepoTrait::lock_admin_role_for_update`），
+//! 修复「并发撤销两个管理员时双双放行」的窗口。
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -130,7 +135,7 @@ impl RbacService {
             .await?
             .is_some()
         {
-            return Err(AppError::validation(format!("角色码 {code} 已存在")));
+            return Err(policy_reject(format!("角色码 {code} 已存在")));
         }
 
         let id = self.snowflake.next_id();
@@ -164,16 +169,15 @@ impl RbacService {
     // C3 POST /api/v2/iam/roles/{id}/update
     // =======================================================================
 
-    /// 改角色。返回 `KickList` = 本次该被踢的用户（改名或改描述时）。
+    /// 改角色。返回 `KickList` = 本次该被踢的用户。
+    ///
+    /// **仅 code 变更才踢**：`t_user_role.role` 级联改名后，持有者 Redis session
+    /// 缓存里的角色串（`CachedUserProfile.roles`）已与 DB 脱节，必须踢掉重登；
+    /// name / description 不进 session 缓存（权限 / 菜单都按 code 组装），改名
+    /// 不改码不打断任何人的登录。
     ///
     /// **改 code 会同事务级联三张关联表**（`t_user_role` / `t_role_menu` /
-    /// `t_role_permission`），级联完再踢该角色的全部持有者 —— 不踢的话，持有者
-    /// 的 session 缓存里仍是旧 role code 的一份数据。
-    ///
-    /// ⚠️ 改 name / description **也踢**：OCC 锚在 `t_role.version`，而
-    /// `grants` 的整包替换同样 bump 这个 version。不踢的后果是「A 改完名字，
-    /// B 的面板还按旧 version 提交 grants 却被拒」，且 B 完全不知道自己被拒的
-    /// 原因（他没改任何授权）。
+    /// `t_role_permission`），级联会 bump `t_user_role.version`（该行的 OCC 锚点）。
     pub async fn update_role(
         &self,
         conn: &mut PgConnection,
@@ -194,17 +198,28 @@ impl RbacService {
             Some(raw) => {
                 let c = normalize_code(raw)?;
                 validate_code_shape(&c)?;
-                if c == role.code {
-                    None // 与现值相同 —— 不触发级联，也不算「带了 code」
-                } else if role.is_system {
+                // 系统角色**一律**不接受 code 入参 —— 无论是否等于现值。等于现值
+                // 时若按「没带」放行，面板与手工调用会误以为系统角色可改名。
+                if role.is_system {
                     return Err(policy_reject(
-                        "系统角色的 code 不可修改（可停用，不可改名）",
+                        "系统角色的 code 不可改（名称/描述可改，可停用）",
                     ));
+                }
+                if c == role.code {
+                    None // 与现值相同 —— 不触发级联
                 } else {
                     Some(c)
                 }
             }
         };
+
+        // 与 create 同口径的显式查重（partial unique 索引仍是并发兜底），撞索引
+        // 时经 `map_duplicate_role_code` 翻成 400 而非 500。
+        if let Some(c) = &new_code
+            && RbacRepo::get_role_by_code(&mut *conn, c).await?.is_some()
+        {
+            return Err(policy_reject(format!("角色码 {c} 已存在")));
+        }
 
         let affected = RbacRepo::update_role(
             &mut *conn,
@@ -218,11 +233,13 @@ impl RbacService {
                 updated_by: Some(current.id),
             },
         )
-        .await?;
+        .await
+        .map_err(map_duplicate_role_code)?;
         if affected == 0 {
             return Err(version_conflict());
         }
 
+        let code_changed = new_code.is_some();
         let final_code = new_code.clone().unwrap_or_else(|| role.code.clone());
         if let Some(new_code) = &new_code {
             RbacRepo::cascade_rename_role_code(
@@ -232,10 +249,16 @@ impl RbacService {
                 now_naive(),
                 Some(current.id),
             )
-            .await?;
+            .await
+            .map_err(map_cascade_rename_conflict)?;
         }
 
-        let kicks = RbacRepo::list_active_user_ids_by_role_code(&mut *conn, &final_code).await?;
+        let holders = RbacRepo::list_active_user_ids_by_role_code(&mut *conn, &final_code).await?;
+        let kicks = if code_changed {
+            holders.clone()
+        } else {
+            Vec::new()
+        };
 
         Ok((
             RoleDef {
@@ -248,7 +271,7 @@ impl RbacService {
                 // version 恒 +1（OCC UPDATE 必然发生，affected==0 已提前返回）。
                 is_active: role.is_active,
                 version: req.version + 1,
-                user_count: kicks.len() as i64,
+                user_count: holders.len() as i64,
             },
             kicks,
         ))
@@ -263,9 +286,13 @@ impl RbacService {
     /// - `delete=true` 仅 `is_system=false` 可用（系统角色可停用不可删）；
     /// - `delete=true` 同事务连带软删该角色的 `t_user_role` /
     ///   `t_role_menu` / `t_role_permission`；
-    /// - `affected_user_count` = 被连带软删的 `t_user_role` 行数 = 本次该踢的
-    ///   用户数；
-    /// - ADMIN 角色：走护栏（见 [`Self::count_active_users_holding`]）。
+    /// - **停用与删除都会踢该角色的全部在册持有者**（`KickList`）：停用即降权，
+    ///   登录 / refresh / me 的角色解析只认 `t_role.is_active = true` 的角色；
+    ///   不踢则持有者的 session 缓存（roles / permissions / menus）会按旧角色
+    ///   继续判定到自然过期；
+    /// - `affected_user_count` = 被连带软删的 `t_user_role` 行数（`delete=false`
+    ///   恒为 0，但 `KickList` 仍非空）；
+    /// - **ADMIN 角色一律 400**（停用 / 删除都不允许，见模块头）。
     pub async fn deactivate_role(
         &self,
         conn: &mut PgConnection,
@@ -276,11 +303,13 @@ impl RbacService {
         current.require_role(Role::Manager)?;
 
         let role = role_or_not_found(RbacRepo::get_role_by_id(&mut *conn, id).await?, id)?;
+        // ADMIN 是元角色：停用即全员降权且没有恢复出口（唯一能改它的面板由
+        // has_role 的通配守着），故不做计数护栏、一律拒绝。
+        if role.code == ADMIN_ROLE_CODE {
+            return Err(policy_reject("系统管理员角色不可停用或删除"));
+        }
         if req.delete && role.is_system {
             return Err(policy_reject("系统角色不可删除（如需下线请用停用）"));
-        }
-        if role.code == ADMIN_ROLE_CODE {
-            Self::guard_admin_lockout(conn, "系统管理员角色不可停用或删除").await?;
         }
 
         let now = now_naive();
@@ -397,18 +426,29 @@ impl RbacService {
             return Err(version_conflict());
         }
 
-        // 入参校验：只接受启用中的菜单码 / 权限码（去重 + 排序由 SQL 给出）
+        // 入参校验①：重复项**显式拒绝**（整包语义 = 集合，重复项无意义；静默去重
+        // 会让前端把「按错」提交成成功）。错误走 40000 policy_reject —— 与「码不
+        // 存在 / 已停用」的 422 形态校验分开，前端能区分「表单填错」与「提交里有
+        // 重复项」。
+        if req.menu_codes.len() != dedup_len(&req.menu_codes) {
+            return Err(policy_reject("menu_codes 含重复的菜单码"));
+        }
+        if req.permission_codes.len() != dedup_len(&req.permission_codes) {
+            return Err(policy_reject("permission_codes 含重复的权限码"));
+        }
+
+        // 入参校验②：只接受启用中的菜单码 / 权限码（去重 + 排序由 SQL 给出）
         let menu_codes = RbacRepo::filter_active_menu_codes(&mut *conn, &req.menu_codes).await?;
-        if menu_codes.len() != dedup_len(&req.menu_codes) {
+        if menu_codes.len() != req.menu_codes.len() {
             return Err(AppError::validation(
-                "menu_codes 含不存在 / 已停用 / 重复的菜单码".to_string(),
+                "menu_codes 含不存在 / 已停用的菜单码".to_string(),
             ));
         }
         let permission_codes =
             RbacRepo::filter_active_permission_codes(&mut *conn, &req.permission_codes).await?;
-        if permission_codes.len() != dedup_len(&req.permission_codes) {
+        if permission_codes.len() != req.permission_codes.len() {
             return Err(AppError::validation(
-                "permission_codes 含不存在 / 已停用 / 重复的权限码".to_string(),
+                "permission_codes 含不存在 / 已停用的权限码".to_string(),
             ));
         }
 
@@ -476,12 +516,12 @@ impl RbacService {
     // C8 GET /api/v2/iam/menus
     // =======================================================================
 
-    /// 菜单树。出参与 `GET /iam/me` 的 `menus` **逐字段同形**（复用同一个
-    /// `MenuNodeOut` + 同一个 `build_menu_tree` 纯函数）。
+    /// 菜单树，**全量启用中菜单**。出参与 `GET /iam/me` 的 `menus` **逐字段
+    /// 同形**（复用同一个 `MenuNodeOut` + 同一个 `build_menu_tree` 纯函数）。
     ///
-    /// ADMIN → 全量启用中菜单；其余 → 本人角色被授权的菜单。
-    /// 这里读的是**调用者自己**的菜单（不是被编辑角色的），因为端点是
-    /// 「管理员配置界面上要显示一棵完整的菜单勾选树」。
+    /// 这是管理员的**配置界面**用树：必须能看到全部菜单（含自己没被授权的，
+    /// 如只授 `SHELF_ACCOUNT` 的 `scan_badge`），否则无法给任何角色勾选 / 收回。
+    /// 可见范围已由 `require_role(Manager)` 收口，不再按调用者的角色授权收窄。
     pub async fn list_menus(
         &self,
         conn: &mut PgConnection,
@@ -489,16 +529,7 @@ impl RbacService {
     ) -> Result<Vec<MenuNodeOut>, AppError> {
         current.require_role(Role::Manager)?;
 
-        let menus = if current.has_role(Role::Admin) {
-            iam_repo::list_all_active_menus(&mut *conn).await?
-        } else {
-            let role_strs: Vec<String> = current
-                .roles
-                .iter()
-                .map(|r| r.as_str().to_string())
-                .collect();
-            iam_repo::list_active_menus_by_roles(&mut *conn, &role_strs).await?
-        };
+        let menus = iam_repo::list_all_active_menus(&mut *conn).await?;
         Ok(crate::modules::iam::service::build_menu_tree(menus))
     }
 
@@ -506,41 +537,14 @@ impl RbacService {
     // 内部 helper
     // =======================================================================
 
-    /// **ADMIN 自锁护栏**：若「当前 active 且持有 ADMIN 的用户数」≤ 1（即这次
-    /// 操作会把它打成 0），返 400。
-    ///
-    /// 调用方已确认「操作对象与 ADMIN 有关」，本函数只数数。阈值取 `<= 1`：
-    /// 只有一个管理员时任何降级动作都会归零，两个及以上时降级到 1 不构成自锁
-    /// （还剩人能恢复）。
-    pub(crate) async fn guard_admin_lockout(
-        conn: &mut PgConnection,
-        reason: &str,
-    ) -> Result<(), AppError> {
-        let n = Self::count_active_users_holding(conn, ADMIN_ROLE_CODE).await?;
-        if n <= 1 {
-            return Err(policy_reject(reason.to_string()));
-        }
-        Ok(())
-    }
-
-    /// active 且持有某角色的用户数（`t_user.is_active AND 授权行未软删`）。
-    pub(crate) async fn count_active_users_holding(
-        conn: &mut PgConnection,
-        role_code: &str,
-    ) -> Result<i64, AppError> {
-        let ids = RbacRepo::list_active_user_ids_by_role_code(&mut *conn, role_code).await?;
-        Ok(ids.len() as i64)
-    }
-
     /// ADMIN 自锁护栏判据的**trait 泛型版**（供用户域 `AccountService` 调用）。
     ///
     /// 用户域的 `AccountService` 方法签名收 `R: IamRepoTrait`（为了单测可注入
-    /// mock），不能直接吃 `&mut PgConnection`。两边走的是**同一条 SQL**
-    /// （`IamRepoTrait::list_active_admin_user_ids` 委托到
-    /// `RbacRepo::list_active_user_ids_by_role_code`）与**同一个阈值**（`<= 1`）。
-    ///
-    /// 为什么要单点：两处各写一遍阈值后漂移的表现是「角色域拦得住、用户域拦
-    /// 不住」，而后者恰好是最容易自锁的那条路（撤销最后一个管理员的 ADMIN）。
+    /// mock），不能直接吃 `&mut PgConnection`。判据是
+    /// `IamRepoTrait::list_active_admin_user_ids`（委托到
+    /// `RbacRepo::list_active_user_ids_by_role_code`）；阈值 `<= 1` 与行锁收在
+    /// 用户域的 `AccountService::guard_admin_lockout` 一处 —— 撤销 ADMIN 是唯一
+    /// 需要计数的降权入口（ADMIN 角色本身已固定不可停用），阈值不再有第二个副本。
     pub(crate) async fn count_active_users_holding_admin<R: IamRepoTrait>(
         repo: &mut R,
     ) -> Result<i64, AppError> {
@@ -610,10 +614,27 @@ fn group_by_domain(perms: Vec<TPermission>) -> Vec<PermissionGroup> {
     groups
 }
 
-/// 唯一索引兜底：并发建同名角色时翻成 400 而非 500。
+/// 唯一索引兜底：并发建同名角色 / 改名撞 `uk_t_role_code` 时翻成 400 而非 500。
+///
+/// 用 `policy_reject`（40000 → HTTP 400）与显式查重同码：重复的角色码是业务规则
+/// 拒绝，不是请求形态错（计划口径要的是 400，不是 422）。
 fn map_duplicate_role_code(e: sqlx::Error) -> AppError {
     if matches!(&e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23505")) {
-        AppError::validation("角色码已存在".to_string())
+        policy_reject("角色码已存在")
+    } else {
+        AppError::from(e)
+    }
+}
+
+/// 改名级联撞唯一索引（数据异常）时翻成明确 400 而非 500。
+///
+/// 正常路径下新 code 上不会已有同型授权行（`get_role_by_code` 预检 + 唯一索引
+/// 兜底），但 `uk_t_user_role_user_role_scope` **不是 partial 索引**：软删的历史
+/// 行仍占索引位，级联 UPDATE 改出来的一行可能撞上它（`t_role_menu` /
+/// `t_role_permission` 同理）。这类冲突没有可自动收敛的方向，明确拒绝并提示先清理。
+fn map_cascade_rename_conflict(e: sqlx::Error) -> AppError {
+    if matches!(&e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23505")) {
+        policy_reject("角色码改名冲突：目标 code 上已存在同型授权行（数据异常），请先排查重复数据")
     } else {
         AppError::from(e)
     }

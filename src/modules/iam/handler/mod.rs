@@ -69,11 +69,9 @@ pub fn router() -> Router<Arc<AppState>> {
     // 2026-10-10：货架子模块迁入 iam，路由自 `/api/v2/shelves/*` 硬切到
     // `/api/v2/iam/shelves/*`（无 alias，旧路径 404）。
     // 2026-10-14：RBAC 子模块挂 `/iam` 根（与 session 端点同层，不是 `/iam/rbac`）。
-    // ⚠️ 注册顺序：本 merge 必须排在 `users` nest **之后** —— `users` 下的
-    //    `/{id}` 与本模块的 `/roles` / `/permissions` / `/menus` 同为 1 段，
-    //    matchit 0.8 按注册顺序消歧；两者被各自的前缀（`/users` vs 根）隔开，
-    //    nest 边界之下互不竞争，故本 merge 放前放后都不改变匹配结果，但保持
-    //    「先 session / users / shelves，末尾追加新子域」的可读顺序。
+    // 本域没有 1 段 catch-all：`users` nest 下的 `/{id}` 与 rbac 的 `/roles` 等
+    // 同段静态路由被各自的前缀（`/users` vs 根）隔开，互不竞争；merge 顺序只按
+    // 「先 session / users / shelves，末尾追加新子域」的可读顺序排列。
     Router::new()
         .merge(session)
         .nest("/users", users)

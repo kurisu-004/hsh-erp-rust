@@ -122,7 +122,6 @@ pub(crate) fn sample_menu(
 /// 删掉分支后 `list_all_active_menus` 的期望未满足、mock 直接 panic。
 #[tokio::test]
 async fn menus_for_roles_admin_uses_all_active_menus() {
-    use crate::auth::rbac::Role;
     use crate::modules::iam::repo::MockIamRepoTrait;
 
     let mut mock = MockIamRepoTrait::new();
@@ -132,7 +131,7 @@ async fn menus_for_roles_admin_uses_all_active_menus() {
     let svc = AccountService::new(crate::modules::iam::service::tests::test_snowflake());
 
     let tree = svc
-        .menus_for_roles(&mut mock, &[Role::Admin])
+        .menus_for_roles(&mut mock, &["ADMIN".to_string()])
         .await
         .expect("ADMIN 的 menus_for_roles 应 Ok");
 

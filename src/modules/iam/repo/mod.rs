@@ -130,7 +130,7 @@ pub trait IamRepoTrait: Send {
         roles: &'a [String],
     ) -> Result<Vec<String>, sqlx::Error>;
 
-    // ── t_role（2，2026-10-14 新增）──
+    // ── t_role（4，2026-10-14 新增）──
     /// 按 code 查**未软删**的角色行（授予时判「存在且启用」用）。
     ///
     /// ⚠️ **只过滤 `deleted_at`、不过滤 `is_active`**：service 要把「不存在」
@@ -141,10 +141,26 @@ pub trait IamRepoTrait: Send {
         code: &'a str,
     ) -> Result<Option<TRole>, sqlx::Error>;
 
+    /// 一批角色 code 里哪些是**启用中且未软删**的（登录侧「停用即降权」用）。
+    ///
+    /// 登录 / refresh / me 的角色解析先过这里，把停用角色的授权行整体滤掉：
+    /// 该角色的权限 / 菜单 / 货架 scope 一并失效；重新启用后下次登录恢复。
+    async fn list_active_role_codes<'a>(
+        &mut self,
+        codes: &'a [String],
+    ) -> Result<Vec<String>, sqlx::Error>;
+
+    /// 对 `t_role` 的 ADMIN 行取行锁（`SELECT … FOR UPDATE`），把自锁护栏的
+    /// 「计数 → 判定 → 写」串行化（2026-10-14 新增）。
+    ///
+    /// 并发窗口：两个请求同时各撤销一个管理员时，各自数到 2 → 双双放行 → 归零。
+    /// 行锁让第二个事务的计数在第一个提交之后执行（READ COMMITTED 逐语句快照）。
+    async fn lock_admin_role_for_update(&mut self) -> Result<(), sqlx::Error>;
+
     /// active 且持有 ADMIN 角色的用户 id 列表（ADMIN 自锁护栏的唯一判据）。
     ///
-    /// 与 `RbacRepo::list_active_user_ids_by_role_code` 同一条 SQL（角色域
-    /// 与用户域两侧都要用，护栏阈值只写在 rbac 侧一处）。
+    /// 与 `RbacRepo::list_active_user_ids_by_role_code` 同一条 SQL（用户域
+    /// 与角色域两侧都要用，护栏阈值只写在用户域一处）。
     async fn list_active_admin_user_ids(&mut self) -> Result<Vec<i64>, sqlx::Error>;
 
     /// 该用户当前是否持有 ADMIN 角色（`t_user_role` 未软删行）。

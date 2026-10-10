@@ -41,26 +41,33 @@
 //!   `CurrentUser::require_permission` 内做，不靠数据。写满行反而会让通配
 //!   悄悄降级成逐项勾选。
 //!
-//! ## 三条「ADMIN 自锁护栏」
-//! 下列操作若会让「active 且持有 ADMIN 的用户数」归零 → 400，且**不调**
-//! `delete_all_user_sessions`：
-//! 1. 撤销用户的 ADMIN 角色（`iam::service::account::role::remove_role`）；
-//! 2. 停用持有 ADMIN 的用户（`…::user::deactivate_user`）；
-//! 3. 停用 / 删除 ADMIN 角色本身（本模块 `deactivate_role`）。
+//! ## ADMIN 自锁护栏
+//! 1. **ADMIN 角色本身不可停用 / 删除**（本模块 `deactivate_role` 固定 400）：
+//!    停用生效后（登录侧只认 `t_role.is_active = true` 的角色），停用 ADMIN =
+//!    所有管理员立即失去唯一能恢复它的元角色；
+//! 2. 撤销用户的 ADMIN 角色（`iam::service::account::role::remove_role`）；
+//! 3. 停用持有 ADMIN 的用户（`…::user::deactivate_user`）。
 //!
-//! 阈值是 `<= 1`（不是 `< 2`）的等价写法：两个及以上管理员时降级到 1 不构成
-//! 自锁，还剩人能恢复。
+//! 2 / 3 是「active 且持有 ADMIN 的用户数」**计数护栏**：会归零 → 400，且
+//! **不调** `delete_all_user_sessions`。阈值是 `<= 1`（不是 `< 2`）的等价写法：
+//! 两个及以上管理员时降级到 1 不构成自锁，还剩人能恢复。计数与写入之间由
+//! 用户域对 `t_role` ADMIN 行的行锁串行化（`IamRepoTrait::lock_admin_role_for_update`），
+//! 堵住「并发撤销两个管理员双双放行」的窗口。
 //!
-//! ## 路由挂载与注册顺序
+//! ## 停用即降权
+//! 登录 / refresh / me 的角色解析只取 `t_role.is_active = true AND deleted_at IS
+//! NULL` 的角色行（`resolve_roles_and_scope`），该角色的权限 / 菜单 / 货架 scope
+//! 一并失效；停用 / 删除角色都会踢全部在册持有者，重新启用后下次登录恢复。
+//!
+//! ## 路由挂载
 //! 本模块路由挂在 **`/api/v2/iam` 根**（`/iam/roles`、`/iam/permissions`、
 //! `/iam/menus`），由 `iam::handler::router()` merge 进 session router，
 //! **不是** `/iam/rbac/*` —— 它是 iam 域的一等公民，与 `/iam/users`（子域
 //! nest）、`/iam/shelves`（子域 nest）并列。
 //!
-//! ⚠️ matchit 注册顺序：`/roles` / `/permissions` / `/menus` 是 1 段静态，
-//!   与 users 路由里的 `/{id}` 同段 → **静态段必须先注册**。`iam::handler`
-//! 里 `users` nest 在前、`rbac` merge 在后，正是靠 nest 边界隔离了两者的
-//! `/{id}`；本模块内部的三条静态路由仍按「静态先于 catch-all」排列。
+//! 本模块 8 条路由里没有裸 `/{id}` catch-all（三条角色写端点都是
+//! `/roles/{id}/…` 的两段以上路径），与 `users` nest 下的 `/{id}` 由前缀隔离、
+//! 互不竞争；merge 顺序不影响匹配结果（见 `iam::handler::router`）。
 //!
 //! ## 域隔离
 //! 本模块只读 `t_role` / `t_permission` / `t_role_permission` / `t_user` /
@@ -68,9 +75,10 @@
 //! `iam_domain_depends_on_no_other_domain` 护栏内（它扫 `src/modules/iam/**`）。
 //!
 //! ## 踢下线的时机
-//! 授权数据装在 Redis session 缓存（`CachedUserProfile.permissions`），
-//! 所以**改 grants / 删角色 / 改角色信息**提交后必须踢持有者，否则本次变更
-//! 对所有人无效直到 session 自然过期。踢人一律在 `tx.commit()` **之后**执行
+//! 授权数据装在 Redis session 缓存（`CachedUserProfile.permissions` /
+//! `roles`），所以**改 grants / 停用或删除角色 / 改角色 code**提交后必须踢
+//! 持有者，否则本次变更对所有人无效直到 session 自然过期。仅改角色名称 / 描述
+//! 不踢（不进 session 缓存）。踢人一律在 `tx.commit()` **之后**执行
 //! （Redis 不在 DB 事务内），见 [`handler::kick_sessions`]。
 //!
 //! ## 子模块结构（照 `iam::shelf` 的嵌套子模块范本）

@@ -1,7 +1,7 @@
 //! iam 域 RBAC 子模块端到端集成测试（2026-10-14 新增，BE-7）
 //!
 //! 覆盖 `src/modules/iam/rbac/` 的 8 条端点 + 用户域角色授予 / 撤销的联动语义。
-//! 13 条用例（名字固定，便于机械核对）：
+//! 18 条用例（名字固定，便于机械核对）：
 //!
 //! | # | 用例 | 钉住什么 |
 //! |---|---|---|
@@ -11,13 +11,18 @@
 //! | 4 | `grants_on_admin_role_is_rejected` | ADMIN grants 读全量、写 400（元角色） |
 //! | 5 | `admin_sees_all_menus_and_permissions` | ADMIN 元角色的菜单通配（/iam/me 与 /iam/menus 同树）+ grants 权限全量 |
 //! | 6 | `non_admin_sees_only_granted_menus` | 普通角色菜单 = t_role_menu 授权集，看不到 roles_list |
-//! | 7 | `custom_role_lifecycle_create_update_deactivate_delete` | 自定义角色 CRUD + 系统角色不可删 |
-//! | 8 | `rename_custom_role_code_cascades_to_user_role` | 改 code 三表级联（t_user_role / t_role_menu / t_role_permission） |
+//! | 7 | `custom_role_lifecycle_create_update_deactivate_delete` | 自定义角色 CRUD + 系统角色不可删 / 不可带 code + 角色码重复 400 |
+//! | 8 | `rename_custom_role_code_cascades_to_user_role` | 改 code 三表级联 + bump t_user_role.version；仅改名称不踢、改 code 才踢 |
 //! | 9 | `deactivating_last_admin_user_is_rejected` | 停用最后 ADMIN 用户 400；有替补时放行 |
 //! | 10 | `revoking_admin_role_from_last_admin_is_rejected` | 撤销最后 ADMIN 400 且不踢人；有替补时撤销并踢 |
 //! | 11 | `grants_change_kicks_holders_sessions` | 改 grants 后持有人旧 token 40105 |
 //! | 12 | `user_role_grant_kicks_target_session` | 授予 / 撤销用户角色后目标旧 token 40105 |
 //! | 13 | `custom_role_grant_does_not_trigger_scope_validation` | 自定义角色无 scope 可授予；未知 code 400 |
+//! | 14 | `permission_matrix_matches_legacy_roles` | 六身份 × 3 权限点的放行矩阵逐格等于迁移前角色守卫集合 |
+//! | 15 | `panel_menu_tree_is_full_for_manager` | `GET /menus` 对非 ADMIN 的 MANAGER 也返全量 active 菜单树（配置面板用） |
+//! | 16 | `custom_role_menu_grant_visible_after_login` | 给自定义角色授菜单 → 目标登录后 /iam/me 可见（raw role code 进菜单装载） |
+//! | 17 | `deactivated_role_is_filtered_from_next_login` | 停用即降权：停用踢持有人、重登后该角色的菜单消失 |
+//! | 18 | `grants_rejects_duplicate_codes` | grants 入参含重复码 → 400（不静默去重） |
 //!
 //! ## 测试基建
 //! - fresh DB（`test_pool()`，从灌过 seeds/menu.sql + seeds/rbac.sql 的 template 克隆）；
@@ -593,6 +598,36 @@ async fn custom_role_lifecycle_create_update_deactivate_delete() {
     assert_eq!(status, StatusCode::CONFLICT, "过期 version 应 409：{env}");
     assert_eq!(env["code"], 40901, "应为 VERSION_CONFLICT：{env}");
 
+    // 重复 code：create → 400（计划口径 400，不是 422；事务回滚不动任何行）
+    let (status, env) = post(
+        &app,
+        "/iam/roles",
+        json!({ "code": "qc_lead", "name": "重复角色" }),
+        &token,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "重复 code 创建应 400：{env}"
+    );
+    assert_eq!(env["code"], 40000, "策略拒绝用 40000：{env}");
+
+    // 重复 code：update 改成已有角色 code → 同样 400（与 create 同口径预检）
+    let (status, env) = post(
+        &app,
+        &update_uri,
+        json!({ "code": "CLERK", "name": "品检组长（改）", "version": 1 }),
+        &token,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "改名撞已有 code 应 400：{env}"
+    );
+    assert_eq!(env["code"], 40000, "策略拒绝用 40000：{env}");
+
     // 系统角色不可删（delete=true 一律 400，与 version 无关）
     let (admin_id, admin_version) = role_row(&pool, "ADMIN").await;
     let (status, env) = post(
@@ -620,7 +655,24 @@ async fn custom_role_lifecycle_create_update_deactivate_delete() {
     );
     assert_eq!(env["code"], 40000);
 
-    // 停用 ADMIN 角色本身会触发自锁护栏 → 400（ADR 元角色守卫；fresh 库无 ADMIN 持有人）
+    // 系统角色带**与现值相同**的 code 也一律 400（严格口径：不接受 code 入参）
+    let (status, env) = post(
+        &app,
+        &format!("/iam/roles/{admin_id}/update"),
+        json!({ "code": "ADMIN", "name": "超级管理员", "version": admin_version }),
+        &token,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "系统角色带相同 code 也应 400：{env}"
+    );
+    assert_eq!(env["code"], 40000);
+
+    // 停用 ADMIN 角色本身一律 400（不做计数：停用生效后全员的元角色都会失效；
+    // fresh 库无 ADMIN 持有人，旧实现只会因计数 0 命中护栏 —— 本断言改为
+    // 覆盖「固定拒绝」路径）
     let (status, env) = post(
         &app,
         &format!("/iam/roles/{admin_id}/deactivate"),
@@ -631,7 +683,7 @@ async fn custom_role_lifecycle_create_update_deactivate_delete() {
     assert_eq!(
         status,
         StatusCode::BAD_REQUEST,
-        "ADMIN 自锁护栏应 400：{env}"
+        "ADMIN 角色不可停用应 400：{env}"
     );
     assert_eq!(env["code"], 40000);
 
@@ -782,20 +834,42 @@ async fn rename_custom_role_code_cascades_to_user_role() {
         "t_role_permission 的 role_code 应级联为新 code"
     );
 
-    // 改 code 后原持有者的旧 session 应被踢
+    // m9：级联改名 bump `t_user_role.version`（该行的 OCC 锚点，remove_role 收它）
+    let (_, renamed_row_version) = user_role_row(&pool, fx.target_user_id, "QC_LEAD_2").await;
+    assert_eq!(
+        renamed_row_version, 1,
+        "级联改名应把持有行 version 从 0 推到 1"
+    );
+
+    // M4：仅改名称 / 描述**不踢**持有者
     let target_token = login_token(&app, IamFixture::TARGET_USERNAME, IamFixture::PASSWORD).await;
-    let (status, _env) = post(
+    let (status, env) = post(
         &app,
         &format!("/iam/roles/{role_id}/update"),
         json!({ "name": "品检组长（再改）", "version": 2 }),
         &token,
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "仅改名称应 200：{env}");
+    assert_eq!(
+        me_status(&app, &target_token).await,
+        StatusCode::OK,
+        "仅改名称 / 描述不得踢持有者（session 缓存按 code 组装）"
+    );
+
+    // 再改 code（version 3 → 4）：这次必须踢
+    let (status, env) = post(
+        &app,
+        &format!("/iam/roles/{role_id}/update"),
+        json!({ "code": "QC_LEAD_3", "name": "品检组长（再改）", "version": 3 }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "再改 code 应 200：{env}");
     assert_eq!(
         me_status(&app, &target_token).await,
         StatusCode::UNAUTHORIZED,
-        "改角色信息后持有者旧 token 应 40105"
+        "改 code 后持有者旧 token 应 40105"
     );
 }
 
@@ -1124,4 +1198,172 @@ async fn permission_matrix_matches_legacy_roles() {
             );
         }
     }
+}
+
+// ===========================================================================
+// ⑮ panel_menu_tree_is_full_for_manager（M1，2026-10-14）
+// ===========================================================================
+/// `GET /iam/menus` 是**配置界面**用树：MANAGER（非 ADMIN）也必须拿到**全量**
+/// active 菜单 —— 否则「只授给某角色的菜单」（如只授 SHELF_ACCOUNT 的
+/// `scan_badge`）在面板里看不见，管理员无法给任何角色勾选 / 收回。
+#[tokio::test]
+async fn panel_menu_tree_is_full_for_manager() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let all_menus = all_active_menu_codes(&pool).await;
+    assert!(
+        all_menus.contains("roles_list"),
+        "前提：template 菜单基线应含 roles_list"
+    );
+
+    let (status, env) = get(&app, "/iam/menus", &token).await;
+    assert_eq!(status, StatusCode::OK, "GET /iam/menus 应 200：{env}");
+    let mut codes = BTreeSet::new();
+    collect_menu_codes(&env["data"], &mut codes);
+    assert_eq!(
+        codes, all_menus,
+        "MANAGER 的配置树必须是全量 active 菜单（不得按调用者已授权集合收窄）"
+    );
+}
+
+// ===========================================================================
+// ⑯ custom_role_menu_grant_visible_after_login（M2，2026-10-14）
+// ===========================================================================
+/// 给**自定义角色**（`parse_role_string` 认不出的 code）授一个菜单 → 持有该
+/// 角色的用户登录后 `/iam/me` 必须能看见。
+///
+/// 回归点：菜单装载过去用枚举化的 `roles`，自定义角色的 `t_role_menu` 行
+/// 永远不会进 `/iam/me`（且零报错）。探针用 `roles_list`（CLERK 未被授予，
+/// 见 ⑥），保证它出现在菜单树里只能来自自定义角色的授权。
+#[tokio::test]
+async fn custom_role_menu_grant_visible_after_login() {
+    let (_pool, app, token, fx) = bootstrap_as_manager().await;
+
+    let role_id = create_role(&app, &token, "QC_LEAD", "品检组长").await;
+    let (status, env) = post(
+        &app,
+        &format!("/iam/roles/{role_id}/grants"),
+        json!({ "menu_codes": ["roles_list"], "permission_codes": [], "version": 0 }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "自定义角色 grants 应 200：{env}");
+
+    // 搭配 CLERK：login 要求至少一个枚举可识别的角色（见 iam.md 已知偏差）
+    for role in ["CLERK", "QC_LEAD"] {
+        let (status, env) = post(
+            &app,
+            &format!("/iam/users/{}/roles", fx.target_user_id),
+            json!({ "role": role }),
+            &token,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "授予 {role} 应 201：{env}");
+    }
+
+    let target = login_token(&app, IamFixture::TARGET_USERNAME, IamFixture::PASSWORD).await;
+    let codes = me_menu_codes(&app, &target).await;
+    assert!(
+        codes.contains("roles_list"),
+        "自定义角色被勾选的菜单必须在 /iam/me 里出现：{codes:?}"
+    );
+}
+
+// ===========================================================================
+// ⑰ deactivated_role_is_filtered_from_next_login（M3，2026-10-14）
+// ===========================================================================
+/// **停用即降权**：停用角色会踢在册持有人；持有者重新登录后该角色被整体滤掉
+/// （其菜单 / 权限 / 货架 scope 一并失效），其它启用角色不受影响。
+#[tokio::test]
+async fn deactivated_role_is_filtered_from_next_login() {
+    let (_pool, app, token, fx) = bootstrap_as_manager().await;
+
+    let role_id = create_role(&app, &token, "QC_LEAD", "品检组长").await;
+    let (status, env) = post(
+        &app,
+        &format!("/iam/roles/{role_id}/grants"),
+        json!({ "menu_codes": ["roles_list"], "permission_codes": [], "version": 0 }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "自定义角色 grants 应 200：{env}");
+    for role in ["CLERK", "QC_LEAD"] {
+        let (status, _) = post(
+            &app,
+            &format!("/iam/users/{}/roles", fx.target_user_id),
+            json!({ "role": role }),
+            &token,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    let target = login_token(&app, IamFixture::TARGET_USERNAME, IamFixture::PASSWORD).await;
+    assert!(
+        me_menu_codes(&app, &target).await.contains("roles_list"),
+        "前提：停用前自定义角色的菜单可见"
+    );
+
+    // 停用 QC_LEAD（version 1 → 2）：必须踢在册持有人，且不删授权行
+    let (status, env) = post(
+        &app,
+        &format!("/iam/roles/{role_id}/deactivate"),
+        json!({ "version": 1, "delete": false }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "停用角色应 200：{env}");
+    assert_eq!(env["data"]["affected_user_count"], 0, "停用不删授权行");
+    assert_eq!(
+        me_status(&app, &target).await,
+        StatusCode::UNAUTHORIZED,
+        "停用后持有者旧 token 应 40105"
+    );
+
+    // 重登：QC_LEAD 被滤掉 ⇒ 它的菜单不再出现；CLERK 仍能登录且菜单不受影响
+    let target_after = login_token(&app, IamFixture::TARGET_USERNAME, IamFixture::PASSWORD).await;
+    let codes = me_menu_codes(&app, &target_after).await;
+    assert!(
+        !codes.contains("roles_list"),
+        "停用角色的菜单不得再下发：{codes:?}"
+    );
+    assert!(
+        codes.contains("home"),
+        "启用中角色的菜单不受影响：{codes:?}"
+    );
+}
+
+// ===========================================================================
+// ⑱ grants_rejects_duplicate_codes（m8，2026-10-14）
+// ===========================================================================
+/// grants 入参里的重复码**显式拒绝**（400），不静默去重 —— 与错误文案 /
+/// 「整包 = 集合」语义一致。
+#[tokio::test]
+async fn grants_rejects_duplicate_codes() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    insert_permission(&pool, "rbac_test.probe", "rbac_test").await;
+
+    let role_id = create_role(&app, &token, "QC_LEAD", "品检组长").await;
+    let grants_uri = format!("/iam/roles/{role_id}/grants");
+
+    // 菜单重复
+    let (status, env) = post(
+        &app,
+        &grants_uri,
+        json!({ "menu_codes": ["home", "home"], "permission_codes": [], "version": 0 }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "重复菜单码应 400：{env}");
+    assert_eq!(env["code"], 40000, "策略拒绝用 40000：{env}");
+
+    // 权限点重复（用**存在**的权限码，证明拒绝来自重复检查而非存在性检查）
+    let (status, env) = post(
+        &app,
+        &grants_uri,
+        json!({ "menu_codes": [], "permission_codes": ["rbac_test.probe", "rbac_test.probe"], "version": 0 }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "重复权限码应 400：{env}");
+    assert_eq!(env["code"], 40000, "策略拒绝用 40000：{env}");
 }

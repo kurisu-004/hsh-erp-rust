@@ -128,6 +128,55 @@ impl RbacRepo {
         .await
     }
 
+    /// 一批角色 code 里哪些是**启用中且未软删**的（登录侧「停用即降权」用）。
+    ///
+    /// 登录 / refresh / me 的角色解析先过这里，把停用角色的 `t_user_role` 行整体
+    /// 滤掉：该角色的权限 / 菜单 / 货架 scope 一并失效，重新启用后下次登录恢复。
+    pub async fn list_active_role_codes<'e, E: PgExecutor<'e>>(
+        executor: E,
+        codes: &[String],
+    ) -> Result<Vec<String>, sqlx::Error> {
+        if codes.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_scalar!(
+            r#"
+            SELECT code FROM t_role
+            WHERE code = ANY($1) AND is_active = TRUE AND deleted_at IS NULL
+            ORDER BY code
+            "#,
+            codes,
+        )
+        .fetch_all(executor)
+        .await
+    }
+
+    /// 锁 `t_role` 的指定 code 行（`SELECT … FOR UPDATE`）——ADMIN 自锁护栏的
+    /// 串行化锚点。
+    ///
+    /// 护栏是「数管理员 → 判定 → 写」的复合操作：两个请求并发各撤销一个管理员
+    /// 时可能各自数到 2 而双双放行。先取行锁，第二个事务的计数排在第一个提交
+    /// 之后（READ COMMITTED 逐语句快照），看到的是最新管理员数。
+    ///
+    /// 行不存在（如 seed 未跑）时锁不到任何行、护栏退化为无锁；基线 seed 保证
+    /// ADMIN 恒存在，此处不做额外兜底。
+    pub async fn lock_role_by_code_for_update<'e, E: PgExecutor<'e>>(
+        executor: E,
+        code: &str,
+    ) -> Result<(), sqlx::Error> {
+        let _ = sqlx::query_scalar!(
+            r#"
+            SELECT id FROM t_role
+            WHERE code = $1 AND deleted_at IS NULL
+            FOR UPDATE
+            "#,
+            code,
+        )
+        .fetch_optional(executor)
+        .await?;
+        Ok(())
+    }
+
     pub async fn create_role<'e, E: PgExecutor<'e>>(
         executor: E,
         ins: &RoleInsert<'_>,
@@ -243,6 +292,11 @@ impl RbacRepo {
     ///
     /// 只改 `deleted_at IS NULL` 的行 —— 已软删的授权行留原 code 是有意的
     /// 审计痕迹（它们不会再被读侧联查命中）。
+    ///
+    /// ⚠️ 只给 `t_user_role` bump `version`：该列是 `remove_role` 收的 OCC 锚点，
+    /// 行内容（role）变了必须推进版本，否则持有者拿着旧 version 撤销会命中刚被
+    /// 改过但版本没动的行。`t_role_menu` / `t_role_permission` 的 version 不是
+    /// 对外 OCC 锚点（grants 的锚在 `t_role.version`），不 bump。
     pub async fn cascade_rename_role_code(
         conn: &mut PgConnection,
         old_code: &str,
@@ -251,7 +305,8 @@ impl RbacRepo {
         updated_by: Option<i64>,
     ) -> Result<(), sqlx::Error> {
         for sql in [
-            r#"UPDATE t_user_role SET role = $2, updated_at = $3, updated_by = $4
+            r#"UPDATE t_user_role SET role = $2, updated_at = $3, updated_by = $4,
+                                      version = version + 1
                WHERE role = $1 AND deleted_at IS NULL"#,
             r#"UPDATE t_role_menu SET role = $2, updated_at = $3, updated_by = $4
                WHERE role = $1 AND deleted_at IS NULL"#,
@@ -316,6 +371,10 @@ impl RbacRepo {
 
     /// 按**全部**角色 code 联查权限码集合（登录 / refresh 装载 session 缓存用）。
     ///
+    /// ⚠️ 联查 `t_role` 并过滤 `is_active AND deleted_at IS NULL`：停用角色即降权，
+    /// 其权限点不再下发（与登录侧的角色解析同一口径）。调用方传进来的 code 通常
+    /// 已过滤过一次，这里是 SQL 层的兜底。
+    ///
     /// ⚠️ ADMIN **不写行**（通配在 `require_permission` 里），故 ADMIN 用户的
     /// 本方法天然返回空 vec —— 这正是 BE-2 要的口径，不额外特判。
     pub async fn list_permission_codes_by_roles<'e, E: PgExecutor<'e>>(
@@ -330,10 +389,13 @@ impl RbacRepo {
             SELECT DISTINCT p.code
             FROM t_role_permission rp
             JOIN t_permission p ON p.code = rp.permission_code
+            JOIN t_role r ON r.code = rp.role_code
             WHERE rp.role_code = ANY($1)
               AND rp.deleted_at IS NULL
               AND p.is_active = TRUE
               AND p.deleted_at IS NULL
+              AND r.is_active = TRUE
+              AND r.deleted_at IS NULL
             ORDER BY p.code
             "#,
             roles,

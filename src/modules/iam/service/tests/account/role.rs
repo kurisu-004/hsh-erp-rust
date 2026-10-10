@@ -359,7 +359,10 @@ async fn role_kick_撤销最后_admin被拒() {
         .returning(move |_| Ok(Some(u.clone())));
     mock.expect_get_user_role_by_id()
         .returning(move |_| Ok(Some(r.clone())));
-    // 只有一个 active 管理员 ⇒ 撤销会自锁
+    // 只有一个 active 管理员 ⇒ 撤销会自锁。护栏先取 t_role ADMIN 行锁再计数
+    // （2026-10-14 并发串行化）。
+    mock.expect_lock_admin_role_for_update()
+        .returning(|| Ok(()));
     mock.expect_list_active_admin_user_ids()
         .returning(|| Ok(vec![101]));
     // ⚠️ 不 expect_soft_delete_user_role：mockall 会对未预期调用 panic，
@@ -402,6 +405,8 @@ async fn role_kick_还有别的管理员时撤销_admin放行() {
         .returning(move |_| Ok(Some(u.clone())));
     mock.expect_get_user_role_by_id()
         .returning(move |_| Ok(Some(r.clone())));
+    mock.expect_lock_admin_role_for_update()
+        .returning(|| Ok(()));
     mock.expect_list_active_admin_user_ids()
         .returning(|| Ok(vec![101, 102]));
     mock.expect_soft_delete_user_role()
@@ -414,6 +419,42 @@ async fn role_kick_还有别的管理员时撤销_admin放行() {
         .expect("还有别的管理员时撤销 ADMIN 应 Ok");
 
     assert_eq!(kicks, vec![101], "撤销成功后同样要踢目标用户");
+}
+
+/// **目标用户已停用时跳过 ADMIN 自锁护栏**（2026-10-14，与 `deactivate_user`
+/// 的 `u.is_active` 快筛同口径）：停用账号不在 active 管理员计数里，撤销它的
+/// ADMIN 不可能把计数打成 0，不该被 400 拦下（否则这些行永远清不掉）。
+///
+/// mockall 对未预期的 `lock_admin_role_for_update` / `list_active_admin_user_ids`
+/// 调用会 panic —— 不挂这两条 expectation 就是「护栏路径未被触达」的断言。
+#[tokio::test]
+async fn remove_role_from_inactive_user_skips_admin_guard() {
+    let mut u = sample_user(101, "alice");
+    u.is_active = false; // 已停用
+    let r = crate::modules::iam::repo::UserRole {
+        id: 201,
+        user_id: 101,
+        role: "ADMIN".into(),
+        scope_type: None,
+        scope_id: None,
+        version: 1,
+        ..make_user_role_dummy(201)
+    };
+    let mut mock = MockIamRepoTrait::new();
+    mock.expect_get_user_by_id()
+        .returning(move |_| Ok(Some(u.clone())));
+    mock.expect_get_user_role_by_id()
+        .returning(move |_| Ok(Some(r.clone())));
+    mock.expect_soft_delete_user_role()
+        .returning(|_, _, _, _| Ok(1));
+
+    let svc = make_account_service();
+    let kicks = svc
+        .remove_role(mock, 101, 201, 1, &current_manager())
+        .await
+        .expect("停用用户的 ADMIN 角色应可直接撤销");
+
+    assert_eq!(kicks, vec![101]);
 }
 
 /// 自定义角色（`parse_role_string` 认不出）**不被 scope 校验拒**：

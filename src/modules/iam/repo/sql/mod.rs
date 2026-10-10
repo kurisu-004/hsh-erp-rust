@@ -214,12 +214,25 @@ impl IamRepoTrait for &mut PgConnection {
         .await
     }
 
-    // ── t_role（2）──
+    // ── t_role（4）──
     async fn get_active_role_by_code<'b>(
         &mut self,
         code: &'b str,
     ) -> Result<Option<TRole>, sqlx::Error> {
         crate::modules::iam::rbac::repo::RbacRepo::get_role_by_code(&mut **self, code).await
+    }
+    async fn list_active_role_codes<'b>(
+        &mut self,
+        codes: &'b [String],
+    ) -> Result<Vec<String>, sqlx::Error> {
+        crate::modules::iam::rbac::repo::RbacRepo::list_active_role_codes(&mut **self, codes).await
+    }
+    async fn lock_admin_role_for_update(&mut self) -> Result<(), sqlx::Error> {
+        crate::modules::iam::rbac::repo::RbacRepo::lock_role_by_code_for_update(
+            &mut **self,
+            crate::modules::iam::rbac::service::ADMIN_ROLE_CODE,
+        )
+        .await
     }
     async fn list_active_admin_user_ids(&mut self) -> Result<Vec<i64>, sqlx::Error> {
         crate::modules::iam::rbac::repo::RbacRepo::list_active_user_ids_by_role_code(
@@ -230,8 +243,12 @@ impl IamRepoTrait for &mut PgConnection {
     }
 
     async fn has_active_admin_grants(&mut self, user_id: i64) -> Result<bool, sqlx::Error> {
-        crate::modules::iam::rbac::repo::RbacRepo::user_has_role(&mut **self, user_id, "ADMIN")
-            .await
+        crate::modules::iam::rbac::repo::RbacRepo::user_has_role(
+            &mut **self,
+            user_id,
+            crate::modules::iam::rbac::service::ADMIN_ROLE_CODE,
+        )
+        .await
     }
 
     // ── t_shelf（1）──

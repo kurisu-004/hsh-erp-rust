@@ -49,7 +49,8 @@
 -- ## `is_system` 的作用
 -- `t_role.is_system = true` 标记**内置角色**（ADMIN / MANAGER / CLERK /
 -- INSPECTOR / CNC_PROGRAMMER / SHELF_ACCOUNT，六个，见 `seeds/rbac.sql`）。
--- 内置角色可停用不可删、code 不可改；自定义角色（`is_system = false`）code 可改，
+-- 内置角色可停用不可删、code 不可改（ADMIN 例外：停用 / 删除都一律 400，
+-- 停用生效后它一停全员失去元角色）；自定义角色（`is_system = false`）code 可改，
 -- 改名时三张关联表同事务级联。
 --
 -- ## 与 `seeds/menu.sql` 的分工
@@ -62,7 +63,9 @@
 -- t_role：角色定义
 -- ---------------------------------------------------------------------------
 -- `is_system` 区分内置 / 自定义（见文件头说明）；`is_active` 停用位与软删
--- `deleted_at` 分开：停用保留行、只是不能被授予与登录，删除才带审计痕迹。
+-- `deleted_at` 分开：停用保留行，但**停用即降权** —— 登录 / refresh / me 的角色
+-- 解析只认 `is_active = true` 的角色，该角色的权限 / 菜单 / 货架 scope 一并失效，
+-- 且停用时踢全部在册持有者（重新启用后下次登录恢复）；删除才带审计痕迹。
 CREATE TABLE public.t_role (
     id          bigint NOT NULL,
     -- 角色码（大写）。partial unique `uk_t_role_code` 保证未软删行内唯一。
@@ -72,7 +75,8 @@ CREATE TABLE public.t_role (
     description text,
     -- 内置角色标记（true = 代码级语义，改名改 code 都受限）
     is_system   boolean DEFAULT false NOT NULL,
-    -- 停用位；false 时不能被授予新用户（存量授予行不受影响，但登录取不到权限）
+    -- 停用位；false 时不可被新授予，且登录 / refresh / me 不再解析该角色
+    -- （权限 / 菜单 / 货架 scope 一并失效），停用时踢在册持有者
     is_active   boolean DEFAULT true NOT NULL,
     version     integer DEFAULT 0 NOT NULL,
 
@@ -87,8 +91,8 @@ COMMENT ON TABLE  public.t_role IS '角色定义（iam::rbac 域）；is_system=
 COMMENT ON COLUMN public.t_role.id IS '雪花主键，App 侧生成';
 COMMENT ON COLUMN public.t_role.code IS '角色码（大写 varchar）；与 t_user_role.role / t_role_menu.role 同源；Rust 侧 auth::rbac::Role 枚举只覆盖内置六项';
 COMMENT ON COLUMN public.t_role.name IS '中文展示名';
-COMMENT ON COLUMN public.t_role.is_system IS '内置角色标记；true 时 code 不可改、不可删除（只可停用）';
-COMMENT ON COLUMN public.t_role.is_active IS '停用位；false 时不可被新授予，存量用户下次登录起取不到该角色的授权';
+COMMENT ON COLUMN public.t_role.is_system IS '内置角色标记；true 时 code 不可改、不可删除（只可停用；ADMIN 连停用也不可）';
+COMMENT ON COLUMN public.t_role.is_active IS '停用位；false 时不可被新授予，登录 / refresh / me 不再解析该角色（权限 / 菜单 / 货架 scope 失效）并踢在册持有者，重新启用后下次登录恢复';
 COMMENT ON COLUMN public.t_role.version IS '乐观锁版本号；POST /roles/{id}/update 与 grants 整包替换共用此锚点，冲突抛 BIZ_VERSION_CONFLICT 409';
 
 ALTER TABLE ONLY public.t_role ADD CONSTRAINT t_role_pkey PRIMARY KEY (id);

@@ -143,7 +143,8 @@ impl AccountService {
     ) -> Result<Vec<i64>, AppError> {
         current.require_role(Role::Manager)?;
 
-        repo.get_user_by_id(user_id)
+        let u = repo
+            .get_user_by_id(user_id)
             .await?
             .ok_or_else(|| user_not_found(user_id))?;
 
@@ -159,8 +160,10 @@ impl AccountService {
             }
         };
 
-        // ADMIN 自锁护栏：撤的是 ADMIN 且撤完就没有 active 管理员了 → 400
-        if r.role == ADMIN_ROLE_CODE {
+        // ADMIN 自锁护栏：撤的是 ADMIN 且撤完就没有 active 管理员了 → 400。
+        // 目标用户已停用时跳过（它不在 active 管理员计数里，撤其 ADMIN 不构成
+        // 新的自锁风险）—— 与 `deactivate_user` 的 `u.is_active` 快筛同口径。
+        if r.role == ADMIN_ROLE_CODE && u.is_active {
             Self::guard_admin_lockout(&mut repo).await?;
         }
 
@@ -180,11 +183,15 @@ impl AccountService {
     /// **ADMIN 自锁护栏**（用户域版）：若「当前 active 且持有 ADMIN 的用户数」
     /// ≤ 1（即这次撤销会把它打成 0），返 400。
     ///
-    /// 与 `iam::rbac::service::RbacService::guard_admin_lockout` 是**同一判据
-    /// 的两个入口**（用户域 / 角色域）。判据逻辑（`<= 1`）本身只写在 rbac
-    /// 侧，本函数委托过去，避免两处阈值各写一遍后漂移；错误形态也走 rbac 侧
-    /// 的 `policy_reject`（HTTP 400，不是 `AppError::validation` 的 422）。
+    /// 判据（`<= 1`）只有 rbac 侧一处实现，本函数委托过去，避免两处阈值各写一遍
+    /// 后漂移；错误形态也走 rbac 侧的 `policy_reject`（HTTP 400，不是
+    /// `AppError::validation` 的 422）。
+    ///
+    /// **先取 `t_role` ADMIN 行的行锁再计数**：护栏是「计数 → 判定 → 写」的复合
+    /// 操作，两个并发请求各撤销一个管理员时可能双双数到 2 而放行。行锁让第二个
+    /// 事务的计数排在第一个提交之后（READ COMMITTED 逐语句快照）。
     pub(crate) async fn guard_admin_lockout<R: IamRepoTrait>(repo: &mut R) -> Result<(), AppError> {
+        repo.lock_admin_role_for_update().await?;
         let n =
             crate::modules::iam::rbac::service::RbacService::count_active_users_holding_admin(repo)
                 .await?;

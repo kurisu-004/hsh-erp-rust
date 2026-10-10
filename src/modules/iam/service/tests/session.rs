@@ -1,7 +1,8 @@
-//! SessionService 单元测试（13 用例，2026-09-23 新增）
+//! SessionService 单元测试（16 用例，2026-09-23 新增）
 //!
 //! 用例覆盖矩阵：
-//! - login：happy / wrong_password / inactive_user / bcrypt_error
+//! - login：happy / wrong_password / inactive_user / bcrypt_error /
+//!   raw_role_codes_for_menus_and_permissions / filters_deactivated_roles
 //! - me：happy
 //! - logout：happy
 //! - change_password：happy / wrong_old / forbidden_for_other_user（委托给 AccountService）
@@ -105,6 +106,10 @@ async fn login_happy_path_returns_pending() {
     mock_repo
         .expect_touch_user_last_login_at()
         .returning(|_, _| Ok(()));
+    // 2026-10-14：角色解析先过滤停用角色（本用例 MANAGER 启用中）
+    mock_repo
+        .expect_list_active_role_codes()
+        .returning(|codes| Ok(codes.to_vec()));
     mock_repo
         .expect_list_active_menus_by_roles()
         .returning(|_| Ok(vec![]));
@@ -133,6 +138,131 @@ async fn login_happy_path_returns_pending() {
     assert!(!pending.pair.refresh_token.is_empty());
     assert!(!pending.pair.access_jti.is_empty());
     assert!(!pending.pair.refresh_jti.is_empty());
+}
+
+/// **自定义角色 code 必须进菜单 / 权限装载的输入**（2026-10-14 修复）：
+/// `t_role_menu` / `t_role_permission` 按 varchar 授权，自定义角色（`QC_LEAD`）
+/// 不被 `Role` 枚举识别；若菜单装载只用枚举化的 `roles`，面板给自定义角色勾选
+/// 的菜单在 `/iam/me` 里**永远不会出现**（且零报错）。本用例钉住 `role_codes`
+/// （原始串）才是菜单 / 权限查询的输入。
+#[tokio::test]
+async fn login_uses_raw_role_codes_for_menus_and_permissions() {
+    // Arrange
+    let hash = password::hash("correct").expect("bcrypt hash");
+    let u = crate::modules::iam::repo::User {
+        id: 42,
+        password_hash: hash,
+        is_active: true,
+        ..sample_user(42, "alice")
+    };
+    let clerk_row = sample_user_role(1, 42, "CLERK");
+    let qc_row = sample_user_role(2, 42, "QC_LEAD");
+    let mut mock_repo = MockIamRepoTrait::new();
+    mock_repo
+        .expect_get_user_by_username()
+        .returning(move |_| Ok(Some(u.clone())));
+    mock_repo
+        .expect_list_user_roles_by_user_id()
+        .returning(move |_| Ok(vec![clerk_row.clone(), qc_row.clone()]));
+    mock_repo
+        .expect_list_active_role_codes()
+        .returning(|codes| Ok(codes.to_vec()));
+    // 菜单 / 权限查询的输入必须含 QC_LEAD（用枚举化 roles 时它会被丢掉）
+    mock_repo
+        .expect_list_active_menus_by_roles()
+        .withf(|codes: &[String]| {
+            codes.iter().map(String::as_str).collect::<Vec<_>>() == vec!["CLERK", "QC_LEAD"]
+        })
+        .returning(|_| Ok(vec![]));
+    mock_repo
+        .expect_list_permission_codes_by_roles()
+        .withf(|codes: &[String]| {
+            codes.iter().map(String::as_str).collect::<Vec<_>>() == vec!["CLERK", "QC_LEAD"]
+        })
+        .returning(|_| Ok(vec![]));
+    mock_repo
+        .expect_touch_user_last_login_at()
+        .returning(|_, _| Ok(()));
+
+    // Act
+    let svc = make_session_service(MockSessionStore::new());
+    let pending = svc
+        .login(
+            mock_repo,
+            crate::modules::iam::dto::LoginRequest {
+                username: "alice".into(),
+                password: "correct".into(),
+            },
+        )
+        .await
+        .expect("login 应 Ok");
+
+    // Assert
+    assert_eq!(pending.roles, vec![Role::Clerk], "枚举只认内置角色");
+    assert_eq!(
+        pending.role_codes,
+        vec!["CLERK".to_string(), "QC_LEAD".to_string()],
+        "原始 code 必须保留（供菜单 / 权限 / 出参使用）"
+    );
+}
+
+/// **停用即降权**（2026-10-14）：`t_role.is_active = false` 的角色行在登录解析时
+/// 被整体滤掉 —— 枚举角色、原始 code、菜单 / 权限装载的输入都不含它。
+#[tokio::test]
+async fn login_filters_deactivated_roles() {
+    // Arrange
+    let hash = password::hash("correct").expect("bcrypt hash");
+    let u = crate::modules::iam::repo::User {
+        id: 42,
+        password_hash: hash,
+        is_active: true,
+        ..sample_user(42, "alice")
+    };
+    let manager_row = sample_user_role(1, 42, "MANAGER");
+    let qc_row = sample_user_role(2, 42, "QC_LEAD");
+    let mut mock_repo = MockIamRepoTrait::new();
+    mock_repo
+        .expect_get_user_by_username()
+        .returning(move |_| Ok(Some(u.clone())));
+    mock_repo
+        .expect_list_user_roles_by_user_id()
+        .returning(move |_| Ok(vec![manager_row.clone(), qc_row.clone()]));
+    // QC_LEAD 已停用 ⇒ 只有 MANAGER 算「启用中」
+    mock_repo
+        .expect_list_active_role_codes()
+        .returning(|_| Ok(vec!["MANAGER".to_string()]));
+    mock_repo
+        .expect_list_active_menus_by_roles()
+        .withf(|codes: &[String]| {
+            codes.iter().map(String::as_str).collect::<Vec<_>>() == vec!["MANAGER"]
+        })
+        .returning(|_| Ok(vec![]));
+    mock_repo
+        .expect_list_permission_codes_by_roles()
+        .withf(|codes: &[String]| {
+            codes.iter().map(String::as_str).collect::<Vec<_>>() == vec!["MANAGER"]
+        })
+        .returning(|_| Ok(vec![]));
+    mock_repo
+        .expect_touch_user_last_login_at()
+        .returning(|_, _| Ok(()));
+
+    // Act
+    let svc = make_session_service(MockSessionStore::new());
+    let pending = svc
+        .login(
+            mock_repo,
+            crate::modules::iam::dto::LoginRequest {
+                username: "alice".into(),
+                password: "correct".into(),
+            },
+        )
+        .await
+        .expect("login 应 Ok");
+
+    // Assert
+    assert_eq!(pending.roles, vec![Role::Manager]);
+    assert_eq!(pending.role_codes, vec!["MANAGER".to_string()]);
 }
 
 #[tokio::test]
@@ -252,6 +382,9 @@ async fn me_happy_returns_current_user_out() {
     mock_repo
         .expect_list_user_roles_by_user_id()
         .returning(move |_| Ok(vec![role_row.clone()]));
+    mock_repo
+        .expect_list_active_role_codes()
+        .returning(|codes| Ok(codes.to_vec()));
     mock_repo
         .expect_list_active_menus_by_roles()
         .returning(|_| Ok(vec![]));
@@ -462,6 +595,9 @@ async fn refresh_happy_returns_pending_with_new_pair() {
     mock_repo
         .expect_get_user_by_id()
         .returning(move |_| Ok(Some(u_after.clone())));
+    mock_repo
+        .expect_list_active_role_codes()
+        .returning(|codes| Ok(codes.to_vec()));
     mock_repo
         .expect_list_active_menus_by_roles()
         .returning(|_| Ok(vec![]));
