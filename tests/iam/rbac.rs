@@ -975,3 +975,123 @@ async fn custom_role_grant_does_not_trigger_scope_validation() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "未知角色码应 400：{env}");
     assert_eq!(env["code"], 40000, "应为 BAD_REQUEST：{env}");
 }
+
+// ===========================================================================
+// ⑭ permission_matrix_matches_legacy_roles（BE-8，2026-10-14）
+// ===========================================================================
+/// 六身份 × 3 个权限点的放行矩阵，**逐格等于迁移前**的角色守卫集合。
+///
+/// 迁移前集合的来源（照代码，不猜）：
+/// - `part.drawing.print`   ← `part::handler::print` 原 `require_any_role`
+///   （MANAGER / CLERK / INSPECTOR / CNC_PROGRAMMER）
+/// - `queue.dispatch`       ← `dispatch_batch` 原 `require_any_role`（MANAGER / CLERK）
+/// - `delivery_note.print`  ← 前端 `canPrint`（MANAGER / CLERK / INSPECTOR；后端打印
+///   端点已下线，本点只登记矩阵）
+///
+/// 三层断言：
+/// 1. 数据层：`t_role_permission` 的 live 行逐角色精确等于矩阵（不多不少），
+///    ADMIN 无行、SHELF_ACCOUNT 三点全无；
+/// 2. 判定层：按角色构造 `CurrentUser`（非 ADMIN 的 permissions 取自 DB），逐点跑
+///    `require_permission`，放行结果恰好等于矩阵 —— ADMIN 刻意给**空** permissions
+///    也必须全放行（元角色通配在代码里，不靠数据）；
+/// 3. 端点层（不在本用例内重复）：`part.drawing.print` 由 `tests/print_forward.rs`
+///    的角色闸门用例覆盖，`queue.dispatch` 由 `tests/production/queue_dispatch.rs`
+///    的 Inspector 403 用例覆盖。
+#[tokio::test]
+async fn permission_matrix_matches_legacy_roles() {
+    use hsh_erp_rust::auth::rbac::{CurrentUser, Role, parse_role_string};
+
+    const POINTS: [&str; 3] = [
+        "part.drawing.print",
+        "queue.dispatch",
+        "delivery_note.print",
+    ];
+    /// (身份, 期望放行集合)。ADMIN 由通配全放行；SHELF_ACCOUNT 三点全不授。
+    const MATRIX: [(&str, &[&str]); 6] = [
+        ("ADMIN", &POINTS),
+        (
+            "MANAGER",
+            &[
+                "part.drawing.print",
+                "queue.dispatch",
+                "delivery_note.print",
+            ],
+        ),
+        (
+            "CLERK",
+            &[
+                "part.drawing.print",
+                "queue.dispatch",
+                "delivery_note.print",
+            ],
+        ),
+        ("INSPECTOR", &["part.drawing.print", "delivery_note.print"]),
+        ("CNC_PROGRAMMER", &["part.drawing.print"]),
+        ("SHELF_ACCOUNT", &[]),
+    ];
+
+    let pool = test_pool().await;
+
+    // 权限点本体必须已由 seeds/rbac.sql 注册（模板库）
+    for code in POINTS {
+        let active: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM t_permission \
+             WHERE code = $1 AND is_active AND deleted_at IS NULL)",
+        )
+        .bind(code)
+        .fetch_one(&pool)
+        .await
+        .expect("查 t_permission");
+        assert!(active, "权限点 {code} 应已注册且启用");
+    }
+
+    for (role, expected) in MATRIX {
+        // ① 数据层：该角色的 live 授权 == 期望集合
+        let granted: BTreeSet<String> = sqlx::query_scalar::<_, String>(
+            "SELECT rp.permission_code FROM t_role_permission rp \
+             JOIN t_permission p ON p.code = rp.permission_code \
+             WHERE rp.role_code = $1 AND rp.deleted_at IS NULL \
+               AND p.is_active AND p.deleted_at IS NULL",
+        )
+        .bind(role)
+        .fetch_all(&pool)
+        .await
+        .expect("查 t_role_permission")
+        .into_iter()
+        .collect();
+        let expected_set: BTreeSet<String> = expected.iter().map(|s| s.to_string()).collect();
+        // 数据层：ADMIN 不写行（元角色通配在代码里），其余角色逐格等于矩阵
+        let db_expected: BTreeSet<String> = if role == "ADMIN" {
+            BTreeSet::new()
+        } else {
+            expected_set.clone()
+        };
+        assert_eq!(
+            granted, db_expected,
+            "角色 {role} 的权限矩阵与迁移前集合不符（多授权 / 少授权都算回归）"
+        );
+
+        // ② 判定层：permissions 取自 DB → 逐点放行结果 == 期望
+        let roles = if role == "ADMIN" {
+            vec![Role::Admin]
+        } else {
+            vec![parse_role_string(role).expect("内置角色应可枚举化")]
+        };
+        let user = CurrentUser {
+            id: 1,
+            username: role.to_string(),
+            roles,
+            shelf_ids: vec![],
+            shelf_wildcard: false,
+            // ADMIN 刻意空：通配不靠数据（若实现改成逐点查数据本断言会红）
+            permissions: granted.into_iter().collect(),
+        };
+        for point in POINTS {
+            assert_eq!(
+                user.require_permission(point).is_ok(),
+                expected.contains(&point),
+                "身份 {role} 对权限点 {point} 的放行结果与迁移前不符"
+            );
+        }
+    }
+}

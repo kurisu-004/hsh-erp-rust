@@ -67,4 +67,60 @@ INSERT INTO t_role (
     (9200000000000006, 'SHELF_ACCOUNT',  '货架一体机', '扫码台专用账号，必须绑定具体货架',                                   true, true, 0, now(), 0, now(), 0)
 ON CONFLICT (code) WHERE deleted_at IS NULL DO NOTHING;
 
+-- ---------------------------------------------------------------------------
+-- 2. t_permission：权限点（按钮级操作码）
+-- ---------------------------------------------------------------------------
+-- 点分形态 `<域>.<操作>`。三个权限点的角色矩阵（第 3 节）逐格照抄迁移前的
+-- 端点守卫 / 前端放行集合，不新增也不收紧：
+--   * `part.drawing.print`  ← part::handler::print 原 require_any_role
+--     （MANAGER / CLERK / INSPECTOR / CNC_PROGRAMMER；CNC 岗要看图纸编程序）
+--   * `queue.dispatch`      ← prod::queue::service::dispatch::dispatch_batch 原
+--     require_any_role（MANAGER / CLERK；读端点 list_pending / auto-dispatch
+--     预览**保持角色守卫不动**，不迁权限点）
+--   * `delivery_note.print` ← **前端-only** 权限点：后端打印端点已于 2026-10-08
+--     下线（打印改前端本地 hucre 生成），后端零守卫可迁；矩阵照现有前端
+--     `frontend/src/utils/deliveryNotePermissions.ts::canPrint` 的放行集合
+--     （MANAGER / CLERK / INSPECTOR）登记，供前端 hasPermission 使用。
+INSERT INTO t_permission (
+    id, code, name, domain, description, is_active,
+    version, created_at, created_by, updated_at, updated_by
+) VALUES
+    (9300000000000001, 'part.drawing.print',  '零件图纸打印', 'part',          '零件图纸（单件 / 批量）打印转发端点',             true, 0, now(), 0, now(), 0),
+    (9300000000000002, 'queue.dispatch',      '生产队列下发', 'queue',         '待下发批次的批量下发写路径',                     true, 0, now(), 0, now(), 0),
+    (9300000000000003, 'delivery_note.print', '送货单打印',   'delivery_note', '前端本地生成送货单打印件（后端无打印端点，仅登记）', true, 0, now(), 0, now(), 0)
+ON CONFLICT (code) WHERE deleted_at IS NULL DO NOTHING;
+
+-- ---------------------------------------------------------------------------
+-- 3. t_role_permission：系统角色 → 权限点授权矩阵
+-- ---------------------------------------------------------------------------
+-- 逐格等于迁移前的角色守卫集合（见第 2 节注释），SHELF_ACCOUNT 三点全不授；
+-- ADMIN 不写行（元角色通配）。
+--
+-- `WHERE NOT EXISTS` + `ON CONFLICT ... DO NOTHING`：只补缺失的基线行，**不复活**
+-- 管理端已撤销的授权（撤销必须在重启后仍然生效），也避开「已软删行仍在、静态 id
+-- 撞 PK」的坑（partial 唯一索引命中不到软删行的说明见文件头）。
+INSERT INTO t_role_permission (
+    id, role_code, permission_code, version, created_at, created_by, updated_at, updated_by
+)
+SELECT v.id, v.role_code, v.permission_code, 0, now(), 0, now(), 0
+FROM (VALUES
+    -- part.drawing.print：照 print.rs 原 require_any_role 的角色集合
+    (9400000000000001::bigint, 'MANAGER',        'part.drawing.print'),
+    (9400000000000002::bigint, 'CLERK',          'part.drawing.print'),
+    (9400000000000003::bigint, 'INSPECTOR',      'part.drawing.print'),
+    (9400000000000004::bigint, 'CNC_PROGRAMMER', 'part.drawing.print'),
+    -- queue.dispatch：照 dispatch_batch 原 require_any_role 的角色集合
+    (9400000000000005::bigint, 'MANAGER',        'queue.dispatch'),
+    (9400000000000006::bigint, 'CLERK',          'queue.dispatch'),
+    -- delivery_note.print：前端-only，矩阵照前端 canPrint 放行集合
+    (9400000000000007::bigint, 'MANAGER',        'delivery_note.print'),
+    (9400000000000008::bigint, 'CLERK',          'delivery_note.print'),
+    (9400000000000009::bigint, 'INSPECTOR',      'delivery_note.print')
+) AS v(id, role_code, permission_code)
+WHERE NOT EXISTS (
+    SELECT 1 FROM t_role_permission rp
+    WHERE rp.role_code = v.role_code AND rp.permission_code = v.permission_code
+)
+ON CONFLICT (role_code, permission_code) WHERE deleted_at IS NULL DO NOTHING;
+
 COMMIT;

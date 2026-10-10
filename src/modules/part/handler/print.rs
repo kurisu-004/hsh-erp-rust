@@ -8,15 +8,17 @@
 //!
 //! ## handler 语义
 //! 1. `authenticate_middleware` 已强制 JWT 校验（未带 token → 40100）；
-//! 2. `require_any_role` 限制 `MANAGER / CLERK / INSPECTOR / CNC_PROGRAMMER`；
-//!    不通过 → 40300。`SHELF_ACCOUNT`（货架终端）不放行——它只该扫码；
+//! 2. `require_permission("part.drawing.print")` 闸门（2026-10-14 起）：
+//!    权限点由 `seeds/rbac.sql` 授予 MANAGER / CLERK / INSPECTOR / CNC_PROGRAMMER，
+//!    SHELF_ACCOUNT（货架终端，只该扫码）不在其中；ADMIN 由元角色通配放行。
+//!    不通过 → 40300。迁移前的角色白名单见 [`require_print_role`] 的 doc；
 //! 3. clone `headers` 后注入 `X-Forwarded-User-Id: <CurrentUser.id>`；
 //! 4. 调 `state.py_backend.forward_part_print_pdf{,_batch}(...)`，拿
 //!    `(status, headers, body)` 三元组原样拼 `Response`。
 //!
 //! ## 与送货单打印的 RBAC 差异
 //! 图纸打印额外放行 `CNC_PROGRAMMER`：CNC 编程岗要看图纸才能编程序，
-//! 送货单是单据打印、编程岗用不上。
+//! 送货单是单据打印、编程岗用不上（`delivery_note.print` 的矩阵不含 CNC）。
 //!
 //! ## 三条关键取舍
 //! - **不开事务**：纯转发，不读写 DB。
@@ -36,18 +38,18 @@ use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 
-use crate::auth::rbac::{CurrentUser, Role};
+use crate::auth::rbac::CurrentUser;
 use crate::shared::error::AppError;
 use crate::state::AppState;
 
-/// 零件图纸打印允许的角色集：`MANAGER` / `CLERK` / `INSPECTOR` / `CNC_PROGRAMMER`。
+/// 零件图纸打印闸门：权限点 `part.drawing.print`（2026-10-14 由角色白名单迁移）。
+///
+/// 权限点授权矩阵（`seeds/rbac.sql`，逐格等于迁移前的 `require_any_role` 集合）：
+/// `MANAGER` / `CLERK` / `INSPECTOR` / `CNC_PROGRAMMER`；`SHELF_ACCOUNT` 不授；
+/// ADMIN 元角色在 `require_permission` 内短路放行。两条打印 handler 共用本函数，
+/// 调用点不变。
 fn require_print_role(current: &CurrentUser) -> Result<(), AppError> {
-    current.require_any_role(&[
-        Role::Manager,
-        Role::Clerk,
-        Role::Inspector,
-        Role::CncProgrammer,
-    ])
+    current.require_permission("part.drawing.print")
 }
 
 /// clone `headers` 并注入 `X-Forwarded-User-Id`。

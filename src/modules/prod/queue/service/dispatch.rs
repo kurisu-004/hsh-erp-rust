@@ -22,9 +22,12 @@
 //! `preview_auto_dispatch` / `update_batch_dispatched` 与本文件 `dispatch_single`，
 //! 五处必须同步。
 //!
-//! ## 事务 + 角色守卫
-//! 角色守卫下沉到 service（与本域 `move_batch` 同形）：handler 仅做权限分发；
-//! service 入口第一行 `current.require_any_role(...)`。
+//! ## 事务 + 守卫（2026-10-14 权限点迁移）
+//! 守卫下沉到 service（与本域 `move_batch` 同形）：handler 仅做权限分发。
+//! - **写路径** `dispatch_batch`：`require_permission("queue.dispatch")`（迁移自
+//!   原 `require_any_role(&[Manager, Clerk])`，权限点矩阵逐格等于原集合）；
+//! - **读路径** `list_pending` / `auto_dispatch_preview`：保持
+//!   `require_any_role` 不动（本次迁移只针对写路径）。
 //!
 //! 事务边界在 handler：handler `pool.begin()` → service 收 `&mut PgConnection`
 //! → handler `commit()`。
@@ -110,7 +113,7 @@ impl QueueService {
     ///
     /// 事务内流程（每条 target 顺序执行，任一硬失败 → service 抛 AppError，
     /// handler tx Drop 自动回滚全部 succeeded 写入）：
-    /// 1. 角色守卫：Manager + Clerk
+    /// 1. 守卫：`require_permission("queue.dispatch")`（迁移自 Manager + Clerk 白名单）
     /// 2. fetch batch → `None` → `BIZ_BATCH_NOT_FOUND` 抛错
     /// 3. 校验 `batch.status ∈ {'PENDING', 'PROGRAMMING'}` → 否则
     ///    `BIZ_BATCH_INVALID_STATUS` 抛错（2026-10-06：纳入已废弃的 `PROGRAMMING`，
@@ -135,7 +138,9 @@ impl QueueService {
         snowflake: &SnowflakeIdGenerator,
         current: &CurrentUser,
     ) -> Result<DispatchResult, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk])?;
+        // 2026-10-14：写路径迁权限点 `queue.dispatch`（矩阵 = 原 Manager + Clerk）。
+        // 读端点（list_pending / auto_dispatch_preview）**保持**角色守卫不动。
+        current.require_permission("queue.dispatch")?;
         if batch_ids_targets.is_empty() {
             return Err(AppError::validation(
                 "dispatch targets 不能为空（至少 1 条）",
