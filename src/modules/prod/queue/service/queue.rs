@@ -3,7 +3,9 @@
 //! 对应 Python myERP/service/queue_service.py。
 //!
 //! ## 阶段 worker-pool-take（Task 7）
-//! - `refill_for_worker` —— admin 触发「为某 worker 从其工序池抢满 max_held_batches」循环；
+//! - `refill_for_worker` —— admin 触发「为某 worker 从其工序池补料」循环
+//!   （2026-10-15 起补到**工种自动上限**`auto_allocate_limit`，未配置时兜底
+//!   `max_held_batches`；见 [`refill_for_worker_with_work_type`]）；
 //!   内部循环调 `QueueRepoTrait::take_one_from_pool`，直到池空或达到上限；
 //!   每抢到一批写一条 `TAKEN_FROM_POOL` 事件日志（commit 由 handler 负责）。
 //!
@@ -71,7 +73,7 @@ use crate::modules::prod::queue::repo::QueueRepoTrait;
 use crate::shared::error::{AppError, code};
 
 use crate::modules::prod::queue::dto::{
-    AutoAllocateMode, AutoAllocateRequest, MoveFromLocation, MoveRequest, MoveToLocation,
+    AutoAllocateRequest, MoveFromLocation, MoveRequest, MoveToLocation,
 };
 use crate::modules::prod::queue::vo::worker::{
     AutoAllocateResult, MoveResult, RefillResult, TakenItem, WorkerFillItem, stopped_reason,
@@ -98,19 +100,21 @@ impl QueueService {
         Self
     }
 
-    /// 为 worker 从其货架候选池抢满 `max_held_batches`。
+    /// 为 worker 从其货架候选池补料（2026-10-15 起：补到**工种自动上限**
+    /// `auto_allocate_limit`，未配置时兜底 `max_held_batches`）。
     ///
     /// 流程：
     /// 1. 取 worker（带 work_type_id），校验 `is_active`；
-    /// 2. 取 work_type（必须设置 `max_held_batches`）；
+    /// 2. 取 work_type（必须设置 `max_held_batches`；`auto_allocate_limit` 可空）；
     /// 3. 取工种可加工工序 id 列表（process_ids），空 → 业务错
     ///    `BIZ_WORK_TYPE_NO_PROCESS_MAPPING`；
-    /// 4. 循环调 `QueueRepoTrait::take_one_from_pool`，每抢到一批写
-    ///    `TAKEN_FROM_POOL` 事件日志 + `PartService::sync_from_batch_change` 同步
-    ///    part 派生列（事务内由 handler commit）；
+    /// 4. 循环调 `QueueRepoTrait::take_one_from_pool`（cap = 自动上限兜底 max），
+    ///    每抢到一批写 `TAKEN_FROM_POOL` 事件日志 + `PartService::sync_from_batch_change`
+    ///    同步 part 派生列（事务内由 handler commit）；
     /// 5. 返回 `RefillResult { worker_id, shelf_id, taken, pool_empty,
     ///    stopped_reason }`（`stopped_reason` 是 2026-10-14 新增，区分「池空」与
-    ///    「工人已拿满」，见 [`RefillResult::stopped_reason`]）。
+    ///    「工人已拿满」；2026-10-15 增加 `AUTO_LIMIT_REACHED`，见
+    ///    [`RefillResult::stopped_reason`]）。
     ///
     /// `shelf_id`（2026-10-10 起 `Option<i64>`）：`None` = **跨全部映射该工种工序的
     /// 活跃生产架取料**（worker-scan 路径）。旧实现要求「工人站在某个架上」并把该架
@@ -189,13 +193,22 @@ impl QueueService {
                     format!("work_type {work_type_id} 不存在"),
                 )
             })?;
-        // 存在性校验：NULL → 业务错（cap 由 SQL CTE 强制，不在 Rust 端使用）
-        let _ = work_type.max_held_batches.ok_or_else(|| {
+        // 存在性校验：`max_held_batches` NULL → 业务错（该工种**不可取件**，
+        // 与 `move` / `pick-up` 的 `ensure_worker_has_capacity` 同码同语义）。
+        // 2026-10-15：本早退保留 —— auto 有值而 max NULL 的组合在 work_type
+        // create / update 的校验矩阵就被拦掉，故此处 NULL 只可能是「两者都未
+        // 配置（或历史脏数据）」。
+        let max_held = work_type.max_held_batches.ok_or_else(|| {
             AppError::biz(
                 code::BIZ_WORK_TYPE_MAX_HELD_NOT_SET,
                 format!("work_type {work_type_id} max_held_batches 未设置"),
             )
         })?;
+
+        // 2026-10-15：自动路径的目标 = 工种自动补料上限，未配置兜底 max。
+        // cap 显式传给 `take_one_from_pool`（SQL 内原 `max_batches` CTE 已删除，
+        // 容量守卫的判据来源上移到本层）。
+        let cap = work_type.auto_allocate_limit.unwrap_or(max_held);
 
         let process_ids = (&mut *conn)
             .work_type_list_process_ids(work_type_id)
@@ -209,7 +222,7 @@ impl QueueService {
 
         let mut taken = Vec::new();
         while let Some(t) = (&mut *conn)
-            .take_one_from_pool(worker_id, shelf_id, &process_ids, operator_user_id)
+            .take_one_from_pool(worker_id, shelf_id, &process_ids, cap, operator_user_id)
             .await?
         {
             // part_event.id 用 snowflake 生成（与既有 part_event::insert 调用约定一致）
@@ -246,35 +259,41 @@ impl QueueService {
 
         let pool_empty = taken.is_empty();
 
-        // 2026-10-14：把「一批也没抢到」拆成两种成因填进 `stopped_reason`。
+        // 2026-10-14：把「一批也没抢到」拆成成因填进 `stopped_reason`。
+        // 2026-10-15：成因由两种扩为三种（+ `AUTO_LIMIT_REACHED`）。
         //
-        // `take_one_from_pool` 返回 `None` 有**两种**可能，SQL 层的失败**形态完全
-        // 一样**（都是没选出候选行）：池里没有可抢的 / 工人已经拿满（`held < max`
-        // 守卫不通过）。改造前两者在响应里长得一模一样（`pool_empty: true`），
+        // `take_one_from_pool` 返回 `None` 有**多种**可能，SQL 层的失败**形态完全
+        // 一样**（都是没选出候选行）：池里没有可抢的 / 工人已达自动上限（cap）/
+        // 工人已达硬上限 max。改造前这些在响应里长得一模一样（`pool_empty: true`），
         // 运维对着代码也猜不出来。⚠️ **`pool_empty` 字段本身一个字都没改**
         // （既有 wire 契约，前端在读），只**新增** `stopped_reason`。
         //
         // ⚠️ **这条诊断查询只在没抢到任何东西时执行**（`pool_empty == true`
         //  才进）—— happy path 拿满就走，一分额外的库往返都不多打。
         //
-        // 判据：工人已持有数 `>= max_held` ⇒ `WORKER_FULL`，否则 `POOL_EMPTY`。
-        // 与 `take_one_from_pool` 内部那条 `AND (SELECT n FROM held) <
-        // (SELECT max_held FROM max_batches)` 守卫**同源同口径**（同一张
-        // `t_part_batch`、同一列、同一判据），故二者不会打架；若是并发导致的
-        // 「刚好在这一刻被填满」，本函数可能把它报成 `POOL_EMPTY` —— 那是**快照
-        // 的固有性质**，不是 bug：诊断字段描述的是「这一次调用的观察」，不是断言。
+        // 判据顺序（**刻意，勿调换**）：
+        // 1. `auto` 有值且 `held >= auto` ⇒ `AUTO_LIMIT_REACHED`（自动路径的更严
+        //    目标先触顶；**即使 held 同时也 ≥ max**也报它 —— 这是刻意口径：报出
+        //    真正卡住自动路径的那个约束）；
+        // 2. 否则 `held >= max` ⇒ `WORKER_FULL`（硬上限触顶，手动路径也取不到）；
+        // 3. 否则 `POOL_EMPTY`。
+        // 与 `take_one_from_pool` 内部那条 `AND (SELECT n FROM held) < $4`
+        // 守卫**同源同口径**（同一张 `t_part_batch`、同一列、同一判据），故二者
+        // 不会打架；若是并发导致的「刚好在这一刻被填满」，本函数可能把它报成
+        // `POOL_EMPTY` —— 那是**快照的固有性质**，不是 bug：诊断字段描述的是
+        // 「这一次调用的观察」，不是断言。
         //
-        // `max_held` 在上方已由 `let _ = work_type.max_held_batches.ok_or_else(...)`
-        // 保证非 NULL（走到这里一定是 `Some`），直接 unwrap 到 i32 展示值。
+        // `max_held` 在上方已由 `ok_or_else(20904)` 保证非 NULL（走到这里一定是
+        // `Some` → 已解包为 i32）。
         let stopped_reason = if pool_empty {
             let held = (&mut *conn)
                 .part_batch_count_held_by_worker(worker_id)
                 .await?;
-            let max_held = work_type.max_held_batches.unwrap_or_default();
-            Some(if held >= max_held as i64 {
-                stopped_reason::WORKER_FULL.to_string()
-            } else {
-                stopped_reason::POOL_EMPTY.to_string()
+            let auto = work_type.auto_allocate_limit;
+            Some(match auto {
+                Some(auto) if held >= auto as i64 => stopped_reason::AUTO_LIMIT_REACHED.to_string(),
+                _ if held >= max_held as i64 => stopped_reason::WORKER_FULL.to_string(),
+                _ => stopped_reason::POOL_EMPTY.to_string(),
             })
         } else {
             None
@@ -312,12 +331,20 @@ impl QueueService {
     /// 「count → compare」是两条语句，中间没有锁 ⇒ **并发双取仍可能超发 1 批**。
     /// 这是既有设计取舍，本轮不动，理由与去处：
     /// - [`crate::modules::prod::queue::repo::QueueRepo::take_one_from_pool`] 的
-    ///   `held < max` 守卫在**单条 SQL 内**（`FOR UPDATE SKIP LOCKED`）⇒ 抢料
-    ///   （refill / auto-allocate）路径是原子的，不受此影响；
-    /// - `take_specific_from_pool` 的 doc 早已声明「**不做** `held < max` 守卫，
+    ///   `held < cap` 守卫在**单条 SQL 内**（`FOR UPDATE SKIP LOCKED`），**但它只
+    ///   保证「同一事务内顺序取料」的原子性**（循环里第 N 次取料能看见前 N-1 次
+    ///   的自写行）—— **不是**「跨事务并发安全」：两个并发事务对同一 worker 的
+    ///   语句快照都早于对方 commit，`SKIP LOCKED` 只让两边锁不同候选行 ⇒ 双方都
+    ///   可能通过守卫、合计超发 1 批。**2026-10-15 订正**：此前本 doc 与
+    ///   `docs/api/queue.md` §4.3 把这条守卫描述成「抢料路径是原子的」，
+    ///   把同一事务内的顺序性误当成了跨事务互斥；
+    /// - `take_specific_from_pool` 的 doc 早已声明「**不做** `held < cap` 守卫，
     ///   该守卫下沉到 service 层」，本函数就是那个 service 层；
-    /// - 要把「指定批次取件」也做成原子，需要把判据灌进那条 SQL 的 WHERE（与
-    ///   `take_one_from_pool` 同形），属独立重构，不在本轮范围。
+    /// - 要让两条路径都真正跨事务串行化，需要 worker 级锁（`SELECT … FOR UPDATE`
+    ///   锁 worker 行或 advisory lock）包住「count → take」整段，而非把判据灌进
+    ///   SQL WHERE（WHERE 相比现在只多拦住候选行、拦不住「两笔各拿一批」）。
+    ///   与 `take_specific_from_pool` 的同类问题同属**独立重构**，本轮只登记、
+    ///   不发散实现。
     ///
     /// ## 调用点顺序约束
     ///
@@ -328,9 +355,15 @@ impl QueueService {
     /// ## 错误码
     /// - `BIZ_WORK_TYPE_NOT_FOUND` —— `work_type_id` 查不到（悬空 / 已软删）
     /// - `BIZ_WORK_TYPE_MAX_HELD_NOT_SET` —— 工种未配 `max_held_batches`
-    ///   （NULL ⇒ 该工种**不可取件**，与 `take_one_from_pool` 里
-    ///   `COALESCE(max_held_batches, 0)` 当 cap 0 的口径一致）
+    ///   （NULL ⇒ 该工种**不可取件**；自动路径 `refill` 在入口以同码早退，
+    ///   `auto-allocate` 则逐 worker 记 `MAX_BATCHES_NOT_SET` 继续跑其余人）
     /// - `BIZ_WORKER_HOLD_LIMIT_EXCEEDED` —— `held >= max_held`
+    ///
+    /// ⚠️ **本函数只按 `max_held_batches`（手动单批路径的硬上限）判**，与
+    /// `auto_allocate_limit`（自动补料上限）无关 —— `move` / `pick-up` 手动路径
+    /// 不受自动上限约束，那是三条自动路径自己的 cap（见
+    /// [`Self::refill_for_worker_with_work_type`] 与
+    /// [`Self::auto_allocate_for_process`]）。
     ///
     /// ## 返回值 = `(current_held, max_held)`（2026-10-14）
     ///
@@ -923,7 +956,23 @@ impl QueueService {
 
     /// `POST /api/v2/prod/queue/auto-allocate` 业务逻辑。
     ///
-    /// 按 `process_id + shelf_id` 范围，对每个匹配 worker 计算 target 并循环 refill。
+    /// 按 `process_id + shelf_id` 范围，对每个匹配 worker 计算 target 并循环取料。
+    ///
+    /// ## 2026-10-15：删除旧「模式 / 比例」入参，target 改为工种自动上限
+    ///
+    /// - 入参只剩 `{ process_id, shelf_id }`；旧模式枚举（COUNT / TIME）与比例
+    ///   入参一并下线，TIME 模式依赖的**工时上限列**在 Rust 侧的全部引用同步
+    ///   清除（DB 列保留、不改 baseline，见 migration
+    ///   `20261015000001_001_add_work_type_auto_allocate_limit` 的说明）。
+    /// - 每个 worker 的 `target = auto_allocate_limit.unwrap_or(max_held_batches)`
+    ///   —— 与 [`Self::refill_for_worker_with_work_type`] 的 cap **同一口径**。
+    /// - `max_held_batches` 为 NULL ⇒ 该 worker **不可自动补料**：**不报错**
+    ///   （批量端点一个未配的工种不该让整批失败），记
+    ///   `MAX_BATCHES_NOT_SET` + `target: 0`，继续跑其余 worker。与 refill
+    ///   路径的 `20904` 早退是**刻意**的两种表现。
+    /// - 没抢够时 `skipped_reason` 判定与 refill **同序**：
+    ///   auto 有值且 `held >= auto` ⇒ `AUTO_LIMIT_REACHED`；否则
+    ///   `held >= max` ⇒ `WORKER_FULL`；否则 `POOL_EMPTY`。
     pub async fn auto_allocate_for_process(
         conn: &mut PgConnection,
         snowflake: &SnowflakeIdGenerator,
@@ -932,15 +981,7 @@ impl QueueService {
     ) -> Result<AutoAllocateResult, AppError> {
         current.require_role(Role::Manager)?;
 
-        // 1. 校验 fill_ratio
-        if !(0.0..=1.0).contains(&req.fill_ratio) {
-            return Err(AppError::biz(
-                code::BIZ_AUTO_ALLOCATE_INVALID_RATIO,
-                format!("fill_ratio 必须在 [0.0, 1.0]，当前 {}", req.fill_ratio),
-            ));
-        }
-
-        // 2. process 存在性
+        // 1. process 存在性
         let _process = (&mut *conn)
             .process_get_by_id(req.process_id, false)
             .await?
@@ -951,7 +992,7 @@ impl QueueService {
                 )
             })?;
 
-        // 3. process 映射的 work_types
+        // 2. process 映射的 work_types
         let work_types = (&mut *conn)
             .work_type_list_work_types_by_process_id(req.process_id)
             .await?;
@@ -961,12 +1002,14 @@ impl QueueService {
                 format!("process {} 未映射工种", req.process_id),
             ));
         }
-        // work_type_id → (max_held_batches, max_held_minutes)
-        let mut wt_max: std::collections::HashMap<i64, (Option<i32>, Option<i32>)> =
+        // work_type_id → (max_held_batches, auto_allocate_limit)
+        //
+        // 2026-10-15：不再逐工种查旧的工时上限（TIME 模式专用 helper 已删）；
+        // 两个上限随 `list_work_types_by_process_id` 的 5 元组一次带回。
+        let mut wt_limits: std::collections::HashMap<i64, (Option<i32>, Option<i32>)> =
             std::collections::HashMap::new();
-        for (wt_id, _code, _name, max_held_batches) in work_types {
-            let max_minutes = (&mut *conn).work_type_get_max_held_minutes(wt_id).await?;
-            wt_max.insert(wt_id, (max_held_batches, max_minutes));
+        for (wt_id, _code, _name, max_held_batches, auto_allocate_limit) in work_types {
+            wt_limits.insert(wt_id, (max_held_batches, auto_allocate_limit));
         }
 
         // 4. 货架上的 active worker 列表（含 work_type_id）
@@ -987,7 +1030,7 @@ impl QueueService {
                 });
                 continue;
             }
-            let (max_batches, max_minutes) = match wt_max.get(&work_type_id) {
+            let (max_batches, auto_limit) = match wt_limits.get(&work_type_id) {
                 Some(v) => *v,
                 None => continue,
             };
@@ -1000,32 +1043,25 @@ impl QueueService {
                 continue;
             }
 
-            let target: i32 = match req.mode {
-                AutoAllocateMode::Count => {
-                    let max = max_batches.ok_or_else(|| {
-                        AppError::biz(
-                            code::BIZ_WORK_TYPE_MAX_HELD_NOT_SET,
-                            format!(
-                                "work_type {} max_held_batches 未设置（COUNT 模式）",
-                                work_type_id
-                            ),
-                        )
-                    })?;
-                    ((max as f64) * req.fill_ratio).ceil() as i32
-                }
-                AutoAllocateMode::Time => {
-                    let max = max_minutes.ok_or_else(|| {
-                        AppError::biz(
-                            code::BIZ_WORK_TYPE_MAX_HELD_MINUTES_NOT_SET,
-                            format!(
-                                "work_type {} max_held_minutes 未设置（TIME 模式）",
-                                work_type_id
-                            ),
-                        )
-                    })?;
-                    ((max as f64) * req.fill_ratio).ceil() as i32
+            // 2026-10-15：工种未配 max（NULL）⇒ 本 worker 不可自动补料。与
+            // refill 路径同语义，但表现刻意不同（见本函数 doc）。
+            let max = match max_batches {
+                Some(v) => v,
+                None => {
+                    filled.push(WorkerFillItem {
+                        worker_id,
+                        target: 0,
+                        filled_count: 0,
+                        skipped_reason: Some(stopped_reason::MAX_BATCHES_NOT_SET.to_string()),
+                    });
+                    // 没抢够的一种（哪怕真实成因是「没配上限」）：与其余早退
+                    // 分支一致地置 `pool_empty_any`。
+                    pool_empty_any = true;
+                    continue;
                 }
             };
+            // target = 工种自动补料上限，未配置兜底 max（与 refill 的 cap 同式）。
+            let target: i32 = auto_limit.unwrap_or(max);
 
             let process_ids = (&mut *conn)
                 .work_type_list_process_ids(work_type_id)
@@ -1041,7 +1077,13 @@ impl QueueService {
                 match (&mut *conn)
                     // 管理员显式指定货架（「为该工序在某架上抢料」）⇒ 限架。
                     // 与 worker-scan 的跨架取料是两种口径，这里**刻意保留**架锚。
-                    .take_one_from_pool(worker_id, Some(req.shelf_id), &process_ids, current.id)
+                    .take_one_from_pool(
+                        worker_id,
+                        Some(req.shelf_id),
+                        &process_ids,
+                        target,
+                        current.id,
+                    )
                     .await?
                 {
                     Some(t) => {
@@ -1072,42 +1114,31 @@ impl QueueService {
                         filled_count += 1;
                     }
                     None => {
-                        // 2026-10-14：`None` 有两种成因（SELECT 无行 / `held < max`
+                        // 2026-10-14：`None` 有多种成因（SELECT 无行 / `held < cap`
                         // 守卫不通过），`pool_empty_any` 只记「没抢够」这个事实，
                         // 这里补上**具体原因**填进本 worker 的 `skipped_reason`。
                         //
-                        // ⚠️ 与 refill 路径的诊断**不是**「完全同款」：那边的
-                        // `max_held` 由 `refill_for_worker_with_work_type` 开头那句
-                        // `work_type.max_held_batches.ok_or_else(20904)` 保证非 NULL
-                        // （NULL 直接早退，**根本走不到**诊断）⇒ 那边只有
-                        // `POOL_EMPTY` / `WORKER_FULL` 两种取值。本函数则只有
-                        // **Time 模式**可能拿到 `None`（Count 模式同样已被
-                        // `ok_or_else` 挡掉）⇒ 有第三种成因，见下面 `max_batches`
-                        // 的三分支。
+                        // ⚠️ 与 refill 路径的**唯一不同**：refill 在入口就保证
+                        // `max_held_batches` 非 NULL（NULL 抛 20904 早退，走不到
+                        // 诊断），故那边只有三种取值；本函数在 worker 循环里已把
+                        // NULL 的 worker 单独记 `MAX_BATCHES_NOT_SET` 跳过，走到
+                        // 本分支的 worker 其 max 必非 NULL。
                         //
                         // ⚠️ 这条诊断**只在早退（没抢够）时执行**，每个 worker
                         // 至多多打 1 次查询；抢满 target 的 worker 一次都不多打。
+                        //
+                        // 判据顺序与 refill **同序**（刻意，勿调换）：auto 有值且
+                        // held ≥ auto ⇒ AUTO_LIMIT_REACHED；否则 held ≥ max ⇒
+                        // WORKER_FULL；否则 POOL_EMPTY。
                         let held = (&mut *conn)
                             .part_batch_count_held_by_worker(worker_id)
                             .await?;
-                        stop_reason = Some(match max_batches {
-                            // 2026-10-14 订正：Time 模式下 `max_held_batches` **允许
-                            // 未配置**，而 `take_one_from_pool` 的 `max_batches` CTE
-                            // 用 `COALESCE(max_held_batches, 0)` ⇒ 未配置即 cap 0 ⇒
-                            // `held < 0` 恒不通过 ⇒ 这个 worker 一个批次都抢不到，
-                            // **每一次** `None` 的真实成因都是「上限未配置」，
-                            // 既不是池空也不是「工人拿满了」。此前这里写
-                            // `max_batches.unwrap_or_default()`，把 `None` 折成 0，
-                            // `held >= 0` 恒真 ⇒ 无脑填 `WORKER_FULL` —— 与 refill
-                            // 路径在同样情形下抛 `20904` 的行为对不上。
-                            // 处置：填本域第三个字面量（真实成因），让运维一眼看出
-                            // 该去配 `t_work_type.max_held_batches`，而不是去查工人
-                            // 是不是满了。
-                            None => stopped_reason::MAX_BATCHES_NOT_SET.to_string(),
-                            Some(max_held) if held >= max_held as i64 => {
-                                stopped_reason::WORKER_FULL.to_string()
+                        stop_reason = Some(match auto_limit {
+                            Some(auto) if held >= auto as i64 => {
+                                stopped_reason::AUTO_LIMIT_REACHED.to_string()
                             }
-                            Some(_) => stopped_reason::POOL_EMPTY.to_string(),
+                            _ if held >= max as i64 => stopped_reason::WORKER_FULL.to_string(),
+                            _ => stopped_reason::POOL_EMPTY.to_string(),
                         });
                         pool_empty_any = true;
                         break;
@@ -1119,7 +1150,7 @@ impl QueueService {
                 worker_id,
                 target,
                 filled_count,
-                // 没早退时恒 `None`（key 不出现）；早退时是上面对两种成因的判定。
+                // 没早退时恒 `None`（key 不出现）；早退时是上面对成因的判定。
                 skipped_reason: stop_reason,
             });
         }
@@ -1127,8 +1158,6 @@ impl QueueService {
         Ok(AutoAllocateResult {
             process_id: req.process_id,
             shelf_id: req.shelf_id,
-            mode: req.mode,
-            fill_ratio: req.fill_ratio,
             filled,
             pool_empty: pool_empty_any,
         })

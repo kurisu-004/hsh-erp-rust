@@ -199,8 +199,13 @@ impl ScanService {
         // 守卫调 `QueueService::ensure_worker_has_capacity`（queue 域的**单一来源**，
         // 与 `move_batch` 两个分支同一处），判据 = `docs/api/queue.md` §4.3 的
         // 「工人持有」，超限返 `BIZ_WORKER_HOLD_LIMIT_EXCEEDED`；工种未配上限返
-        // `BIZ_WORK_TYPE_MAX_HELD_NOT_SET`（NULL 时该工种**不可取件**，与
-        // `take_one_from_pool` 把 `COALESCE(max_held_batches, 0)` 当 cap 0 同口径）。
+        // `BIZ_WORK_TYPE_MAX_HELD_NOT_SET`（NULL 时该工种**不可取件**）。
+        //
+        // ⚠️ **本守卫只按 `max_held_batches`（硬上限）判，与 `auto_allocate_limit`
+        // （自动补料上限，2026-10-15 新增）无关**：pick-up 是**手动单批路径**，
+        // 自动上限只约束 refill / auto-allocate / worker-scan 同事务 refill 三条
+        // 自动路径。语义上「自动补料只补到 auto、人工仍可手动领到 max」是刻意的
+        // 分工，不要为本端点补 auto 校验。
         //
         // ⚠️ **位置是硬约束**，不要挪动（两条边界 + 一条次序理由）：
         // - 必须在上面 worker `is_active` / `work_type_id` 校验**之后** —— 本守卫

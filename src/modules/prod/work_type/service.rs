@@ -6,6 +6,9 @@
 //! ## 业务约束（service 层 enforce）
 //! - `code` 业务唯一键，update 不允许改（20104）
 //! - `max_held_batches` 三态编码：None = 不动；Some(None) = 清空；Some(Some(v)) = 改值，v ≥ 1
+//! - `auto_allocate_limit`（2026-10-15 新增）三态编码同上；与 `max_held_batches`
+//!   共用同一处合并校验矩阵 `validate_held_limits`（auto 有值 ⇒ ≥1 且 max 非空
+//!   且 auto ≤ max；create / update 两条路径同源）
 //! - 软删前查 `t_worker.work_type_id` + `t_work_type_process` 引用，>0 ⇒ 20903 拒
 //!
 //! ## mapping 端点
@@ -62,11 +65,54 @@ fn to_work_type_out(wt: TWorkType, process_ids: Vec<String>) -> WorkTypeOut {
         description: wt.description,
         sort_order: wt.sort_order,
         max_held_batches: wt.max_held_batches,
+        auto_allocate_limit: wt.auto_allocate_limit,
         process_ids,
         version: wt.version,
         created_at: wt.created_at,
         updated_at: wt.updated_at,
     }
+}
+
+/// 2026-10-15 新增：`max_held_batches` / `auto_allocate_limit` 的**合并后**
+/// 校验矩阵（create 与 update 共用同一处，两条路径不许各写一遍 —— 一处漂移
+/// 就会让「只改 max 不改 auto」绕过 `auto ≤ max`）。
+///
+/// 入参是「改后的最终值」（update 侧由三态合并得到，见 `update_work_type`）：
+/// - `max` 有值 ⇒ 必须 ≥ 1（NULL = 未配置，允许）；
+/// - `auto` 有值 ⇒ 必须 ≥ 1；且 `max` 必须非空；且 `auto ≤ max`。
+///
+/// 错误码复用 `BIZ_INVALID_VALUE`（与既有 `max_held_batches 必须 ≥ 1` 同码，
+/// 不新开错误码）。
+fn validate_held_limits(max: Option<i32>, auto: Option<i32>) -> Result<(), AppError> {
+    if let Some(v) = max
+        && v < 1
+    {
+        return Err(AppError::biz(
+            code::BIZ_INVALID_VALUE,
+            "max_held_batches 必须 ≥ 1",
+        ));
+    }
+    if let Some(v) = auto {
+        if v < 1 {
+            return Err(AppError::biz(
+                code::BIZ_INVALID_VALUE,
+                "auto_allocate_limit 必须 ≥ 1",
+            ));
+        }
+        let max = max.ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_INVALID_VALUE,
+                "auto_allocate_limit 需要先配置 max_held_batches",
+            )
+        })?;
+        if v > max {
+            return Err(AppError::biz(
+                code::BIZ_INVALID_VALUE,
+                format!("auto_allocate_limit ({v}) 不能超过 max_held_batches ({max})"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// 把 i64 转 String；按 `process_ids` JSON 形态输出（前端不需要 i64 防精度截断）。
@@ -201,15 +247,11 @@ impl WorkTypeService {
             .map(str::trim)
             .filter(|s| !s.is_empty());
         let sort_order = req.sort_order.unwrap_or(0);
+        // 2026-10-15：max / auto 走同一处合并校验矩阵（auto 有值 ⇒ ≥1 且
+        // max 非空且 auto ≤ max）。
         let max_held_batches = req.max_held_batches;
-        if let Some(v) = max_held_batches
-            && v < 1
-        {
-            return Err(AppError::biz(
-                code::BIZ_INVALID_VALUE,
-                "max_held_batches 必须 ≥ 1",
-            ));
-        }
+        let auto_allocate_limit = req.auto_allocate_limit;
+        validate_held_limits(max_held_batches, auto_allocate_limit)?;
 
         let id = self.snowflake.next_id();
         let wt = repo
@@ -220,6 +262,7 @@ impl WorkTypeService {
                 description,
                 sort_order,
                 max_held_batches,
+                auto_allocate_limit,
                 current.id,
             )
             .await
@@ -280,23 +323,40 @@ impl WorkTypeService {
             }
         };
 
-        // max_held_batches 三态：None ⇒ 不改；Some(None) ⇒ 清空（SET NULL，NULL=不限）；
-        // Some(Some(v)) ⇒ 改值，校验 v ≥ 1
+        // max_held_batches / auto_allocate_limit 三态：None ⇒ 不改；Some(None) ⇒ 清空；
+        // Some(Some(v)) ⇒ 改值。
+        //
+        // 2026-10-15：**先把两个字段的三态合并出「改后的 (max, auto)」，再走同一
+        // 校验矩阵**（`validate_held_limits`），不再各字段分别校验 —— 否则
+        // 「只改 max、不动 auto」或「清 max」这类请求会绕过 `auto ≤ max`。
+        // 合并语义：字段缺省 ⇒ 沿用 `existing` 现值；显式给出 ⇒ 用改后值（含清空）。
         let new_mhb_owned: Option<i32>;
         let mhb_update: Option<Option<i32>> = match &req.max_held_batches {
             None => None,
             Some(None) => Some(None),
             Some(Some(v)) => {
-                if *v < 1 {
-                    return Err(AppError::biz(
-                        code::BIZ_INVALID_VALUE,
-                        "max_held_batches 必须 ≥ 1",
-                    ));
-                }
                 new_mhb_owned = Some(*v);
                 Some(new_mhb_owned)
             }
         };
+        let new_auto_owned: Option<i32>;
+        let auto_update: Option<Option<i32>> = match &req.auto_allocate_limit {
+            None => None,
+            Some(None) => Some(None),
+            Some(Some(v)) => {
+                new_auto_owned = Some(*v);
+                Some(new_auto_owned)
+            }
+        };
+        let merged_max = match mhb_update {
+            None => existing.max_held_batches,
+            Some(v) => v,
+        };
+        let merged_auto = match auto_update {
+            None => existing.auto_allocate_limit,
+            Some(v) => v,
+        };
+        validate_held_limits(merged_max, merged_auto)?;
 
         let affected = repo
             .update(
@@ -306,6 +366,7 @@ impl WorkTypeService {
                 desc_update,
                 req.sort_order,
                 mhb_update,
+                auto_update,
                 current.id,
             )
             .await?;

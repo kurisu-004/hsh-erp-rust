@@ -25,7 +25,7 @@
 | 6 | POST | `/api/v2/prod/queue/recall` | Manager + Clerk | `{ batch_id, version, note? }` | `RecallOut` |
 | 7 | POST | `/api/v2/prod/queue/refill` | **Manager 独占** | `{ worker_id, shelf_id }` | `RefillResult` |
 | 8 | POST | `/api/v2/prod/queue/move` | **Manager 独占** | `{ batch_id: string, version: number, from, to, note? }`（`from` / `to` 是**两个不同**的 tagged enum，见 §2.8） | `MoveResult` |
-| 9 | POST | `/api/v2/prod/queue/auto-allocate` | **Manager 独占** | `{ process_id, shelf_id, mode, fill_ratio }` | `AutoAllocateResult` |
+| 9 | POST | `/api/v2/prod/queue/auto-allocate` | **Manager 独占** | `{ process_id, shelf_id }`（2026-10-15：删 `mode` / `fill_ratio`，见 §4.8） | `AutoAllocateResult` |
 
 - 全部返回统一信封 `R { code, message, data }`。
 - 端点 1 / 2 **不接受**任何 query 参数。端点 3 只接 `limit` / `offset`，传别的 query 参数不会报错但被忽略。
@@ -245,13 +245,22 @@ part 级行无从推导（没有 `#[serde(default)]`，漏赋值会编译失败�
 | `shelf_id` | string \| null | `null` = 跨全部映射架取料（worker-scan 路径） |
 | `taken` | `TakenItem[]` | 抢到的批次 |
 | `pool_empty` | bool | ⚠️ **语义一个字都没改**（既有 wire 契约，前端在读）= 「一批也没抢到」 |
-| `stopped_reason` | string | **新增**。`taken` 为空时为 `"POOL_EMPTY"` 或 `"WORKER_FULL"`；抢到东西时**整个 key 不出现**（`skip_serializing_if`） |
+| `stopped_reason` | string | **新增**。`taken` 为空时为 `"POOL_EMPTY"` / `"WORKER_FULL"` / **`"AUTO_LIMIT_REACHED"`**（2026-10-15 新增，见下）；抢到东西时**整个 key 不出现**（`skip_serializing_if`） |
 
-⚠️ **`pool_empty` 无法区分两种截然不同的停机原因**：`take_one_from_pool` 返回 `None`
-有**两种**可能 —— SELECT 无行（池里没货）与 `held < max` 守卫不通过（工人已拿满），
-两者在响应里长得一模一样，运维只能对着代码猜。`stopped_reason` 就是为了区分它们，
-判据是「工人已持有数 `>= max_held` ⇒ `WORKER_FULL`，否则 `POOL_EMPTY`」，与
-`take_one_from_pool` 内部那条守卫同源同口径。
+⚠️ **`pool_empty` 无法区分停机原因**：`take_one_from_pool` 返回 `None`
+有多种可能 —— SELECT 无行（池里没货）/ `held < cap` 守卫不通过（已达自动上限 /
+已达硬上限），它们在响应里长得一模一样，运维只能对着代码猜。`stopped_reason`
+就是为了区分它们，判据顺序（**刻意，勿调换**）：
+
+| `stopped_reason` | 触发条件 |
+|---|---|
+| `AUTO_LIMIT_REACHED` | 工种配了 `auto_allocate_limit` 且 `held >= auto`（**即使同时 `held >= max` 也报它** —— 报出真正卡住自动路径的约束；手动路径此时仍可能可取） |
+| `WORKER_FULL` | 否则 `held >= max_held_batches`（硬上限触顶，含配成 0 的工种） |
+| `POOL_EMPTY` | 否则（池里没有该工种可加工的候选） |
+
+⚠️ **本文件的路径不产生 `MAX_BATCHES_NOT_SET`**：`refill` 对「工种未配
+`max_held_batches`」在入口就抛 `20904` 早退，走不到诊断（那一个字面量只在
+`auto-allocate` 的 `skipped_reason` 出现，见下）。
 
 ⚠️ 这条诊断**只在没抢到任何东西时执行**（happy path 一分额外的库往返都不多打）。
 并发导致的「刚好在这一刻被填满」可能被报成 `POOL_EMPTY` —— 那是**快照的固有性质**，
@@ -259,28 +268,24 @@ part 级行无从推导（没有 `#[serde(default)]`，漏赋值会编译失败�
 
 **同款诊断也补在 `POST /queue/auto-allocate`**：每个没抢够的 worker 在
 `WorkerFillItem.skipped_reason` 里填具体原因（此前恒 `None`）。⚠️ `AutoAllocateResult.pool_empty`
-的 doc 此前写「（池空）」，实际也可能是工人满；该字段只回答「有没有人没抢够」、不回答
+的 doc 此前写「（池空）」，实际也可能是触顶 / 未配置；该字段只回答「有没有人没抢够」、不回答
 「为什么」，形状不变，答案在 `skipped_reason`。
 
-⚠️ **`skipped_reason` 比 `stopped_reason` 多一个取值**（2026-10-14 订正）：
+⚠️ **`skipped_reason` 与 `stopped_reason` 共用同一张字面量表（`vo/worker.rs::stopped_reason`）**，
+2026-10-15 起各取值的触发条件：
 
 | `skipped_reason` | 触发条件 |
 |---|---|
-| `POOL_EMPTY` | `held < max_held_batches`，抢料 SQL 选不出候选行 |
+| `POOL_EMPTY` | 抢料 SQL 选不出候选行（且未触顶自动 / 硬上限） |
+| `AUTO_LIMIT_REACHED` | 工种配了 `auto_allocate_limit` 且 `held >= auto`（2026-10-15 新增） |
 | `WORKER_FULL` | `held >= max_held_batches`（**含配成 0 的工种** —— 那是真·已满） |
-| `MAX_BATCHES_NOT_SET` | 该工种 `max_held_batches` 为 `NULL`（**未配置**） |
+| `MAX_BATCHES_NOT_SET` | 该工种 `max_held_batches` 为 `NULL`（**未配置**）⇒ `target` 填 **0**、跳过该 worker |
 
-只有 **`mode=Time`** 能走到第三种：Time 模式的 `target` 只由 `max_held_minutes` 算出，
-**不校验** `max_held_batches`（Count 模式在入口就 `ok_or_else` 抛 `20904`）。而
-`take_one_from_pool` 的 `max_batches` CTE 是 `COALESCE(wt.max_held_batches, 0)` ⇒
-未配置即 cap 0 ⇒ 该 worker 一个批次都抢不到。
-
-⚠️ 这三种的**相对关系不是同一种修复**：refill 路径对「未配置」是**抛 `20904`**（入口即
+⚠️ 前两种在 auto-allocate 的判定顺序与 refill **同序**（auto 先于硬上限）。
+第四种的**相对关系不是同一种修复**：refill 路径对「未配置」是**抛 `20904`**（入口即
 早退，根本走不到诊断），auto-allocate 则是**继续跑完其余 worker**、只在本 worker 的
 `skipped_reason` 里报。因此同一个「未配置」在两条路径上表现不同（一条 400、一条字面量），
-这是**刻意**的：auto-allocate 是批量端点，一个未配的工种不该让整批失败。诊断代码曾把
-`None` 折成 `0` 再比 `held >= 0`（恒真）⇒ 无脑填 `WORKER_FULL`，把「去配上上限」误导成
-「去查工人是不是满了」，已订正。
+这是**刻意**的：auto-allocate 是批量端点，一个未配的工种不该让整批失败。
 
 ## 4. 口径表
 
@@ -380,10 +385,20 @@ status = 'IN_PROCESS' AND location = 'WORKER' AND current_holder_id = ANY($worke
 N 件、实际取件被拒」这类难查的问题会回来。回归测试见本节末。
 
 ⚠️ **`ensure_worker_has_capacity` 是 service 级非原子守卫**（count 与 compare 是两条
-语句、中间无锁 ⇒ 并发双取仍可能超发 1 批）。这是既有设计取舍，本轮不动：
-`take_one_from_pool` 的 `held < max` 守卫在**单条 SQL 内**（`FOR UPDATE SKIP LOCKED`），
-故 **refill / auto-allocate 路径是原子的**；只有「指定批次取件」（`move` / `pick-up`）
-走这条非原子路径。要把它做成原子需要把判据灌进那条 SQL 的 WHERE，属独立重构。
+语句、中间无锁 ⇒ 并发双取仍可能超发 1 批）。这是既有设计取舍，本轮不动。
+
+⚠️ **2026-10-15 订正：`take_one_from_pool` 的 SQL 内守卫也**不是**「跨事务原子」**。
+此前本节写「`take_one_from_pool` 的 `held < max` 守卫在**单条 SQL 内**
+（`FOR UPDATE SKIP LOCKED`），故 **refill / auto-allocate 路径是原子的**」——
+这是把「同一事务内顺序取料的原子性」误当成了「跨事务互斥」：
+
+- 该守卫确实保证**同一事务内**循环取料的自洽（第 N 次取料看得见前 N-1 次的自写行）；
+- 但**两个并发事务**对同一 worker 的语句快照都早于对方 commit，`SKIP LOCKED`
+  只让两边锁**不同候选行** ⇒ 双方都可能通过守卫、合计超发 1 批；
+- 真正串行化需要 **worker 级锁**（锁 `t_worker` 行 / advisory lock）包住
+  「count → take」整段，而不是把判据灌进 SQL WHERE（WHERE 拦不住「两笔各拿一批」）。
+  与 `take_specific_from_pool`（`move` / `pick-up` 走的非原子路径）的同类问题
+  同属**独立重构**，本轮只登记、不发散实现。
 
 ### 4.4 N+1 的消除：旧路径 vs 新路径
 
@@ -421,7 +436,14 @@ M = 10 时：12 个 HTTP 请求 → 1 个。
 |---|---|
 | `POST /queue/move` + `ensure_worker_has_capacity` | `20904 BIZ_WORK_TYPE_MAX_HELD_NOT_SET`（**HTTP 400**） |
 | `POST /queue/refill` | 同一个 `20904`（回归：`tests/production/queue.rs::max_held_null_returns_error`） |
-| `QueueRepo::take_one_from_pool` 的 `max_batches` CTE | `COALESCE(wt.max_held_batches, 0)` 当 **cap 0** ⇒ `held < max` 恒不通过 ⇒ **拦死** |
+| `POST /queue/auto-allocate` | 逐 worker 记 `skipped_reason = MAX_BATCHES_NOT_SET` + `target: 0`，**不报错**、继续跑其余 worker（批量端点语义） |
+| 报工台 `POST /scan/batches/{id}/pick-up` 与 `POST /scan/worker-scan` 的同事务 refill | 分别同 `move` / `refill`（前者走 `ensure_worker_has_capacity`、后者入口早退） |
+
+⚠️ **2026-10-15 订正：`take_one_from_pool` 不再自己判 `max_held_batches`** ——
+原 `max_batches` CTE 的 `COALESCE(wt.max_held_batches, 0)`（NULL 当 cap 0 拦死）
+已随「自动分配上限」特性删除，cap 改由 service 计算传入
+（`auto_allocate_limit` 兜底 `max_held_batches`）。「未配 max ⇒ 不可取件」现在由
+上表四条路径各自的 **service 入口**把关（auto-allocate 是唯一不报错、只记字面量的）。
 
 ⚠️ **列注释曾经是错的**：baseline migration 给该列写的是「NULL=不限」。已由
 migration `20261014000001_001_fix_max_held_batches_column_comment` 订正（append-only，
@@ -430,6 +452,30 @@ migration `20261014000001_001_fix_max_held_batches_column_comment` 订正（appe
 ⚠️ **队列板的 `max_held` 对未配上限的工种发 `0` 而不是 `null`**（既有约定
 `w.max_held.unwrap_or(0)`，见 §2.3）—— 发 `null` 有让前端渲染成「不限」的风险。
 `prod::scan` 的 `/held` 出参 `max_held_batches` 沿用同一约定。
+
+### 4.8 自动分配上限 `auto_allocate_limit`（2026-10-15 新增）
+
+`t_work_type.auto_allocate_limit`（migration `20261015000001_001_...`）是**三条自动
+补料路径**的目标上限：`POST /queue/refill`、`POST /queue/auto-allocate`、报工台
+`POST /scan/worker-scan` 的同事务 refill。
+
+| 维度 | 口径 |
+|---|---|
+| 适用路径 | 只约束**自动**路径（上表三条）；**不约束手动单批路径**（`move` 的 POOL→WORKER 方向、`pick-up`） |
+| `NULL` | **未配置** ⇒ 自动路径兜底 `max_held_batches`（行为与引入本列前逐字一致） |
+| 有值 | 须 `1..=max_held_batches`（create / update 走同一处合并校验矩阵，错误码复用 `20104 BIZ_INVALID_VALUE`） |
+| 三条路径的目标 | `cap = auto_allocate_limit.unwrap_or(max_held_batches)`，由 service 算出后传给 `take_one_from_pool`（SQL 不再查 `t_work_type`，原 `max_batches` CTE 已删） |
+| 触顶的表现 | refill / worker-scan 的 `stopped_reason`、auto-allocate 的 `skipped_reason` 报 `AUTO_LIMIT_REACHED`（见 §3.2） |
+| 与手动路径分工 | 触顶后 `move` / `pick-up` 仍按 `max_held_batches` 放行（`ensure_worker_has_capacity` 只读 max）——「自动补料只补到 auto、人工可临时手动领到 max」是刻意的产品分工 |
+| 校验矩阵 | auto 有值 ⇒ ≥1 且 max 非空且 auto ≤ max；**update 先合并两个字段的三态再过矩阵**（只改 max / 清 max 也要按改后的组合判），不做单字段分别校验 |
+
+⚠️ **admin refill 的目标也变了**：`POST /queue/refill` 此前语义是「补满
+`max_held_batches`」，现在补到 auto（兜底 max）。前端若要展示「本次补料目标」，
+读响应 `taken` 长度或工种配置，不要再用 max 硬推。
+
+⚠️ **列注释是权威语义来源**（`COMMENT ON COLUMN` 由 migration 写入），本表是它的
+口径展开。交叉校验的实现在 `prod::work_type::service::validate_held_limits`
+（create / update 同一处）。
 
 ## 5. 状态域约定（无编译期保障）
 
@@ -473,6 +519,17 @@ migration `20261014000001_001_fix_max_held_batches_column_comment` 订正（appe
 | `QueueDispatchRepo::part_get_process_chain_id` | 零调用（同上） |
 | `QueueRepoTrait` 4 个只读 helper | 只服务已删的 3 个读端点，等价能力在 `board/repo.rs` 的聚合 SQL 里 |
 
+### 6.4 字段与错误码（2026-10-15：自动分配上限改造）
+
+| 被移除项 | 原因 / 去处 |
+|---|---|
+| `AutoAllocateRequest.mode`（`AutoAllocateMode` 的 COUNT / TIME） | target 改为工种自动上限（§4.8），不再由客户端选模式。**无 alias**：新服务端对本字段**静默忽略**（本仓零 `deny_unknown_fields`）；**老服务端**缺 `mode` / `fill_ratio` 会 422 纯文本 ⇒ 部署顺序必须后端先上 |
+| `AutoAllocateRequest.fill_ratio` | 同上 |
+| `AutoAllocateResult.mode` / `AutoAllocateResult.fill_ratio` | 出参同步删除（**破坏性 wire 变更**；`WORKER_POOL_AUTO_ALLOCATE_DONE` 的 payload 同步少两键，见 §7） |
+| TIME 模式本身 | 依赖 `t_work_type.max_held_minutes`；该**列保留在 DB**（不 DROP、不改 baseline、不进 restore 脚本），但 Rust 侧全部引用删除（`work_type_get_max_held_minutes` helper 一并删） |
+| 错误码 `20703 BIZ_WORK_TYPE_MAX_HELD_MINUTES_NOT_SET` | TIME 模式下线后无生产方，**释放码位、未复用**（`src/shared/error.rs` 原地留注释） |
+| 错误码 `20704 BIZ_AUTO_ALLOCATE_INVALID_RATIO` | `fill_ratio` 下线后无生产方，**释放码位、未复用** |
+
 ## 7. 与 WS 的关系
 
 - **queue 域不订阅 WS。** 本域的两个读端点都是 HTTP `pool.acquire()` 拉取，前端靠 TanStack Query 的 staleTime + `POST /queue/move` 成功后的失效编排来刷新。
@@ -485,7 +542,7 @@ migration `20261014000001_001_fix_max_held_batches_column_comment` 订正（appe
 | `POST /queue/refill` | `WORKER_POOL_REFILL_DONE` | `taken` 非空 | `RefillResult`（`serde_json::to_value`，§3.2） |
 | `POST /queue/refill` | `WORKER_POOL_EMPTY` | ⚠️ **2026-10-14 起收窄**：`stopped_reason == "POOL_EMPTY"`（见下） | ⚠️ **手拼 `json!` 4 键**：`worker_id` / `shelf_id` / `pool_empty` / `stopped_reason`，逐字段见 [`scan.md`](scan.md) §4.2 |
 | `POST /queue/move` | `WORKER_POOL_MOVE_DONE` | 无条件 | `MoveResult`（`serde_json::to_value`） |
-| `POST /queue/auto-allocate` | `WORKER_POOL_AUTO_ALLOCATE_DONE` | 无条件 | `AutoAllocateResult`（`serde_json::to_value`） |
+| `POST /queue/auto-allocate` | `WORKER_POOL_AUTO_ALLOCATE_DONE` | 无条件 | `AutoAllocateResult`（`serde_json::to_value`；**2026-10-15 起少 `mode` / `fill_ratio` 两键**） |
 
 ⚠️ **`WORKER_POOL_EMPTY` 的 payload 逐字段以 [`scan.md`](scan.md) §4.2 为正典**（那里有
 完整四键表）；本节**不重复**该表，只登记「本域这一份与 scan 域那一份必须逐字同形」
@@ -543,6 +600,12 @@ queue 域**整体不适用**域隔离护栏：它继承 worker_pool 的「经本
 9. **代码里残留的 `WORKER_POOL_*` WS 事件名不变**（`kind` 是 WS 协议的一部分，改它要同步 dashboard 域的白名单与前端 `AFFECTS_DASHBOARD`）。本域改的只是 URL 与类型名。
 10. **4 处卡片 DTO 新增 `has_process_chain`（boolean）**（2026-10-09）：`QueuePoolItem` / `QueueHeldBatch` / `OutsourceQueueCandidate` / `ScanListItem`。第四处原先是 `PartListItem`，2026-10-10 随报工台两条 list 端点迁往 `prod::scan`（行 VO 换成 `ScanListItem`）后它在 part 域恒为 `false`，字段保留只为不动其余复用该 VO 的域的 wire 形状。它是**绿色左边框的判据**，判据见 §2.6。zod 侧按 `z.boolean()` 声明 —— 前端不要按「工单有没有绑链」重新在前端推一遍（后端已经算好，且未定位批次走的是另一个分支）。
 11. **`POST /queue/move` 的 `version` 升为必填**（2026-10-09）：此前三个方向都由 service 用「本次事务里刚读到的 `batch.version`」当 `expected_version`，等价于**没有 OCC** —— 看板数据是 30s 缓存的快照，期间他人改过批次时「用户看到 5 件 → 实际移动 3 件」会静默成功。值取候选卡 / 持有卡的 `version`；漏传 → **HTTP 422 纯文本**（`version` 无 `#[serde(default)]`）。
+12. **工种新增 `auto_allocate_limit`（自动分配上限，2026-10-15）**：工种 create / update 请求与 list / get / create 响应都多了这个字段（`number | null`）。表单「留空 = 不配置（自动路径兜底 max）」；`0` / `超过 max` 前端可预校验，后端同样返 `20104`。语义与三条自动路径见 §4.8。
+13. **`POST /queue/auto-allocate` 请求 / 响应变更（2026-10-15，破坏性）**：
+    - 请求删 `mode` / `fill_ratio`，只发 `{ process_id, shelf_id }`；
+    - 响应删 `mode` / `fill_ratio` 两键；`filled[].target` 语义改为「工种自动上限（未配置兜底 max）」；`filled[].skipped_reason` 可能取新值 `AUTO_LIMIT_REACHED`；
+    - ⚠️ **部署顺序必须后端先上**：新服务端对多发的老键**静默忽略**（本仓零 `deny_unknown_fields`），而**老服务端**缺 `mode` / `fill_ratio` 会返 422 纯文本。
+14. **`refill` / worker-scan 的诊断新增 `AUTO_LIMIT_REACHED`（2026-10-15）**：`refill.stopped_reason` 从二值扩三值；⚠️ `WORKER_POOL_EMPTY` 的**广播条件不变**（仍只认 `POOL_EMPTY`，见 §7）。前端「没抢到料」的分支按三值处理：`AUTO_LIMIT_REACHED` 应提示「自动补料已到上限，可手动领取」，不要落进「池里没货」文案。
 
 ### 8.4 已知偏差登记
 

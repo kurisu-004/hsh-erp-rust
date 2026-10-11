@@ -9,7 +9,8 @@
 //!   WORKER ↔ WORKER 三方向，取代旧 `admin_remove` / `admin_assign`）。commit 后
 //!   广播 `WORKER_POOL_MOVE_DONE`。
 //! - `POST /api/v2/prod/queue/auto-allocate` —— 按 `process_id + shelf_id` 范围
-//!   自动为每个匹配 worker 抢批次数 / 累计工时。commit 后广播
+//!   自动为每个匹配 worker 补料到**工种自动上限**（`auto_allocate_limit`，
+//!   未配置兜底 `max_held_batches`）。commit 后广播
 //!   `WORKER_POOL_AUTO_ALLOCATE_DONE`。
 //!
 //! ## 事务 + WS 广播
@@ -42,6 +43,10 @@ use crate::modules::prod::queue::vo::worker::{AutoAllocateResult, MoveResult, Re
 /// Manager role 守卫。Commit 后：
 /// - `taken.len() > 0` → 广播 `WORKER_POOL_REFILL_DONE`
 /// - `stopped_reason == Some("POOL_EMPTY")` → 广播 `WORKER_POOL_EMPTY`
+///
+/// ⚠️ **广播条件只认 `POOL_EMPTY`**：`AUTO_LIMIT_REACHED`（2026-10-15 新增）
+/// 与 `WORKER_FULL`、`MAX_BATCHES_NOT_SET` 都**不广播** `WORKER_POOL_EMPTY`
+/// —— 事件名表达的是「池里没货」，其余成因广播它会把看板归因带偏。
 ///
 /// ⚠️ **2026-10-14 有意的协议行为变更：工人满时不再广播。**
 /// 改造前的条件是 `else if r.pool_empty`，而 `pool_empty` 对「池空」与「工人已拿满」
@@ -117,10 +122,13 @@ pub async fn admin_refill(
 
 /// POST /api/v2/prod/queue/auto-allocate
 ///
-/// 按 `process_id + shelf_id` 范围自动为每个匹配 worker 抢批次数 / 累计工时。
+/// 按 `process_id + shelf_id` 范围自动为每个匹配 worker 补料到**工种自动上限**
+/// （`auto_allocate_limit`，未配置兜底 `max_held_batches`；工种未配 max 的
+/// worker 记 `MAX_BATCHES_NOT_SET` 跳过，不中断整批）。
 ///
 /// Manager 角色守卫下沉到 service（`auto_allocate_for_process` 内部 `require_role`）。
-/// Commit 后广播 `WORKER_POOL_AUTO_ALLOCATE_DONE`（payload = `AutoAllocateResult`）。
+/// Commit 后广播 `WORKER_POOL_AUTO_ALLOCATE_DONE`（payload = `AutoAllocateResult`，
+/// 2026-10-15 起少旧「模式 / 比例」两键）。
 ///
 /// 纯写端点（① 形态）：`pool.begin() → service → commit`。
 pub async fn auto_allocate(

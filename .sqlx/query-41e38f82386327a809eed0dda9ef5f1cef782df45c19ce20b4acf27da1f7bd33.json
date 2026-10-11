@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO t_work_type (id, code, name, description, sort_order,\n                                     max_held_batches, created_by, updated_by)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $7)\n            RETURNING id, code, name, description, sort_order, version,\n                      created_at, created_by, updated_at, updated_by, deleted_at,\n                      max_held_batches\n            ",
+  "query": "\n            SELECT id, code, name, description, sort_order, version,\n                   created_at, created_by, updated_at, updated_by, deleted_at,\n                   max_held_batches, auto_allocate_limit\n            FROM t_work_type\n            WHERE id = $1 AND deleted_at IS NULL\n            ",
   "describe": {
     "columns": [
       {
@@ -134,16 +134,21 @@
             "name": "max_held_batches"
           }
         }
+      },
+      {
+        "ordinal": 12,
+        "name": "auto_allocate_limit",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_work_type",
+            "name": "auto_allocate_limit"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
-        "Int8",
-        "Varchar",
-        "Varchar",
-        "Varchar",
-        "Int4",
-        "Int4",
         "Int8"
       ]
     },
@@ -159,8 +164,9 @@
       false,
       true,
       true,
+      true,
       true
     ]
   },
-  "hash": "5692bba434fc1e34d267ee879145c73bc904c62c1aed61a24bf4d7f57140a7aa"
+  "hash": "41e38f82386327a809eed0dda9ef5f1cef782df45c19ce20b4acf27da1f7bd33"
 }

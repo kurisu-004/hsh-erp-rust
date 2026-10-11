@@ -60,9 +60,13 @@ pub struct RefillResult {
     /// 后者是 `held < max` 守卫不通过）。2026-10-14 之前两者在响应里长得一模一样，
     /// 运维只能对着代码猜。区分靠新增的 [`Self::stopped_reason`]，**不改本字段**。
     pub pool_empty: bool,
-    /// 2026-10-14 新增：`taken` 为空时的**具体**停止原因，取值二选一：
+    /// 2026-10-14 新增：`taken` 为空时的**具体**停止原因，取值三选一：
     /// - `"POOL_EMPTY"` —— 候选池里没有该工种可加工、且在架上的批次；
-    /// - `"WORKER_FULL"` —— 工人已持有 `max_held_batches` 批，容量守卫拦死。
+    /// - `"WORKER_FULL"` —— 工人已持有 `max_held_batches` 批，容量守卫拦死；
+    /// - `"AUTO_LIMIT_REACHED"` —— **2026-10-15 新增**：工种配了
+    ///   `auto_allocate_limit` 且工人已达该自动上限（但可能仍低于
+    ///   `max_held_batches`）⇒ 自动路径停下，**工人仍可走手动路径
+    ///   （move / pick-up）取到 max**。
     ///
     /// 抢到任何一批时为 `None`，且因 `skip_serializing_if` 而**整个 key 不出现**
     /// （与本 struct 内 `MoveResult.shelf_id` 的既有写法同款）。
@@ -90,15 +94,22 @@ pub mod stopped_reason {
     pub const POOL_EMPTY: &str = "POOL_EMPTY";
     /// 工人容量已触顶（`held >= max_held_batches`，含配成 0 的工种）。
     pub const WORKER_FULL: &str = "WORKER_FULL";
-    /// **工种未配 `max_held_batches`**（`NULL`）⇒ `take_one_from_pool` 按 cap 0
-    /// 守卫把抢料路径整个拦死。
+    /// **2026-10-15 新增**：工种配了 `auto_allocate_limit` 且工人已达该自动
+    /// 上限（`held >= auto`）⇒ 自动路径（refill / auto-allocate）停下。
     ///
-    /// ⚠️ 这是 `WORKER_FULL` 的**兄弟**而不是它自己：`held >= 0` 恒真只是巧合，
-    /// 真实成因是「忘了配上限」。refill 路径对同一情形抛
-    /// `20904 BIZ_WORK_TYPE_MAX_HELD_NOT_SET`（入口即早退），二者是
-    /// 「一条路报错、一条路给字面量」的同一语义，故本值只在
-    /// `WorkerFillItem.skipped_reason` 出现（`POST /queue/auto-allocate` 的
-    /// **Time** 模式 —— Count 模式要求配上限，早被 `ok_or_else` 挡掉）。
+    /// ⚠️ 与 [`WORKER_FULL`] 的分工：本值触发时工人**未必**触顶硬上限
+    /// （`held < max_held_batches` 也可能出现本值），**手动路径（move /
+    /// pick-up）仍按 `max_held_batches` 放行** —— 这不是错误，是自动路径与
+    /// 手动路径的刻意分工。判定顺序上二者都成立时先报本值（见 service）。
+    pub const AUTO_LIMIT_REACHED: &str = "AUTO_LIMIT_REACHED";
+    /// **工种未配 `max_held_batches`**（`NULL`）⇒ 不可取件（该列 NULL 的语义
+    /// 是「未配置」不是「不限」，见 `docs/api/queue.md` §4.7）。
+    ///
+    /// ⚠️ 这是 `WORKER_FULL` 的**兄弟**而不是它自己：真实成因是「忘了配上限」。
+    /// refill 路径对同一情形抛 `20904 BIZ_WORK_TYPE_MAX_HELD_NOT_SET`（入口即
+    /// 早退），auto-allocate 路径则**逐 worker 记本字面量、继续跑其余 worker**
+    /// （批量端点不因一个未配的工种整体失败）—— 二者是「一条路报错、一条路给
+    /// 字面量」的同一语义，故本值只在 `WorkerFillItem.skipped_reason` 出现。
     pub const MAX_BATCHES_NOT_SET: &str = "MAX_BATCHES_NOT_SET";
 }
 
@@ -107,13 +118,17 @@ pub mod stopped_reason {
 pub struct WorkerFillItem {
     #[serde(serialize_with = "serialize_i64")]
     pub worker_id: i64,
-    /// 该 worker 的目标（按 mode 计算）
+    /// 该 worker 的目标 = 工种自动补料上限
+    /// （`auto_allocate_limit`，未配置兜底 `max_held_batches`；两者都未配的
+    /// worker 走 `MAX_BATCHES_NOT_SET` 分支、`target` 填 **0**）。
+    /// 2026-10-15 起不再是「按 mode 计算」。
     pub target: i32,
-    /// 实际抢到的批次 / 累计分钟数
+    /// 实际抢到的批次数（TIME 模式已下线，2026-10-15 起恒为批次计数）。
     pub filled_count: i32,
     /// 因业务错跳过该 worker 时填原因；
-    /// 2026-10-14 起 ALSO 覆盖「没抢够」：本 worker 因池空 / 已拿满 / 上限未配而
-    /// 提前 `break` 时填 [`stopped_reason::POOL_EMPTY`] /
+    /// 2026-10-14 起 ALSO 覆盖「没抢够」：本 worker 因池空 / 已触顶自动上限 /
+    /// 已拿满硬上限 / 上限未配而提前 `break` 时填
+    /// [`stopped_reason::POOL_EMPTY`] / [`stopped_reason::AUTO_LIMIT_REACHED`] /
     /// [`stopped_reason::WORKER_FULL`] / [`stopped_reason::MAX_BATCHES_NOT_SET`]
     /// （此前恒 `None`，见 `QueueService::auto_allocate_for_process`）。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -121,23 +136,26 @@ pub struct WorkerFillItem {
 }
 
 /// `POST /api/v2/prod/queue/auto-allocate` 出参。
+///
+/// 2026-10-15：删除旧「模式 / 比例」两个字段（入参侧一并删除，见
+/// `dto::AutoAllocateRequest`）—— 这是**破坏性 wire 变更**，前端配套见
+/// `docs/api/queue.md` §6.4 / §8.3。
 #[derive(Debug, Clone, Serialize)]
 pub struct AutoAllocateResult {
     #[serde(serialize_with = "serialize_i64")]
     pub process_id: i64,
     #[serde(serialize_with = "serialize_i64")]
     pub shelf_id: i64,
-    /// mode 从 `dto::AutoAllocateMode` 透传（该 enum 双向 derive，留在 `dto/`）
-    pub mode: crate::modules::prod::queue::dto::AutoAllocateMode,
-    pub fill_ratio: f64,
     pub filled: Vec<WorkerFillItem>,
-    /// **任一** worker 的 `take_one_from_pool` 返回 `None`（早退）⇒ `true`。
+    /// **任一** worker 没抢够（`take_one_from_pool` 返回 `None`，或工种
+    /// `max_held_batches` 未配被跳过）⇒ `true`。
     ///
-    /// ⚠️ **2026-10-14 订正**：本字段此前的 doc 写「（池空）」，但
-    /// `take_one_from_pool` 返回 `None` 有**两种**成因 —— SELECT 无行（池空）
-    /// 与 `held < max` 守卫不通过（工人已拿满）。两种情况都置 `true`。
+    /// ⚠️ **2026-10-14 订正**：本字段此前的 doc 写「（池空）」，但导致「没抢够」
+    /// 的成因有**多种** —— SELECT 无行（池空）/ `held < cap` 守卫不通过
+    /// （auto 上限触顶 / 硬上限触顶）/ 工种未配上限被跳过。全部置 `true`。
     /// **判据的修正在 service 层逐 worker 填 [`WorkerFillItem::skipped_reason`]**
-    /// （`POOL_EMPTY` / `WORKER_FULL`）；本字段只回答「有没有人没抢够」，
+    /// （`POOL_EMPTY` / `AUTO_LIMIT_REACHED` / `WORKER_FULL` /
+    /// `MAX_BATCHES_NOT_SET`）；本字段只回答「有没有人没抢够」，
     /// 不回答「为什么」—— 它与 [`RefillResult::pool_empty`] 是同一形状的既有契约，
     /// 不改。
     pub pool_empty: bool,
