@@ -22,12 +22,15 @@
 //! `preview_auto_dispatch` / `update_batch_dispatched` 与本文件 `dispatch_single`，
 //! 五处必须同步。
 //!
-//! ## 事务 + 守卫（2026-10-14 权限点迁移）
+//! ## 事务 + 守卫（2026-10-14 写路径迁权限点；2026-10-15 第二批全量迁点）
 //! 守卫下沉到 service（与本域 `move_batch` 同形）：handler 仅做权限分发。
-//! - **写路径** `dispatch_batch`：`require_permission("queue.dispatch")`（迁移自
+//! - 写路径 `dispatch_batch`：`require_permission("queue.dispatch")`（迁移自
 //!   原 `require_any_role(&[Manager, Clerk])`，权限点矩阵逐格等于原集合）；
-//! - **读路径** `list_pending` / `auto_dispatch_preview`：保持
-//!   `require_any_role` 不动（本次迁移只针对写路径）。
+//! - 读路径 `list_pending`：`require_permission("queue.view")`（迁移自
+//!   原 `require_any_role(M,C,I)`，逐格相同）；
+//! - 读路径 `auto_dispatch_preview`：`require_permission("queue.dispatch")`
+//!   —— 2026-10-15 **有意回改**：上批「读端点保持角色守卫不动」被用户定稿
+//!   推翻（预览与下发是同一动作的两步，守卫集合统一为 M,C）。
 //!
 //! 事务边界在 handler：handler `pool.begin()` → service 收 `&mut PgConnection`
 //! → handler `commit()`。
@@ -48,7 +51,7 @@
 
 use sqlx::PgConnection;
 
-use crate::auth::rbac::{CurrentUser, Role};
+use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::part::repo::PartRepo;
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
@@ -67,7 +70,7 @@ use crate::modules::prod::queue::vo::queue::{
 impl QueueService {
     /// `GET /api/v2/prod/queue/pending` 业务逻辑。
     ///
-    /// 角色守卫：Manager + Clerk + Inspector。
+    /// 权限：`queue.view`（M,C,I，2026-10-15 自角色守卫迁移，逐格相同）。
     /// 读路径（`pool.acquire()`）：handler 不开事务，service 借 `&mut PgConnection`
     /// 调 `list_pending_batches` + `count_pending_batches` 两条 SQL。
     pub async fn list_pending(
@@ -76,7 +79,7 @@ impl QueueService {
         limit: i64,
         offset: i64,
     ) -> Result<PendingBatchListOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
+        current.require_permission("queue.view")?;
 
         // 防御：limit / offset 边界
         let limit = limit.clamp(1, 500);
@@ -139,7 +142,8 @@ impl QueueService {
         current: &CurrentUser,
     ) -> Result<DispatchResult, AppError> {
         // 2026-10-14：写路径迁权限点 `queue.dispatch`（矩阵 = 原 Manager + Clerk）。
-        // 读端点（list_pending / auto_dispatch_preview）**保持**角色守卫不动。
+        // 读端点（list_pending / auto_dispatch_preview）的守卫见各自函数 doc
+        // （2026-10-15 第二批已全量迁点）。
         current.require_permission("queue.dispatch")?;
         if batch_ids_targets.is_empty() {
             return Err(AppError::validation(
@@ -342,7 +346,9 @@ impl QueueService {
     /// `POST /api/v2/prod/queue/auto-dispatch` 业务逻辑（只读查询，2026-09-30 重构）。
     ///
     /// 流程（不开事务）：
-    /// 1. 角色守卫：Manager + Clerk
+    /// 1. 权限守卫：`queue.dispatch`（2026-10-15 自角色守卫 M,C **迁点**，
+    ///    与 `dispatch_batch` 同点 —— 预览与下发是同一动作的两步；该迁点是对
+    ///    上一批「读端点保持角色守卫不动」的**有意回改**，用户定稿）
     /// 2. 空 batch_ids → `40001 VALIDATION_ERROR`
     /// 3. 调 `preview_auto_dispatch` 单 SQL 拉待下发白名单
     ///    （`PENDING` / `PROGRAMMING`）内 batch 的 preview 元数据（白名单口径见
@@ -361,7 +367,7 @@ impl QueueService {
         current: &CurrentUser,
         batch_ids: Vec<i64>,
     ) -> Result<AutoDispatchResult, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk])?;
+        current.require_permission("queue.dispatch")?;
         if batch_ids.is_empty() {
             return Err(AppError::validation("auto-dispatch batch_ids 不能为空"));
         }
@@ -712,13 +718,18 @@ mod tests {
 
     /// 构造一个最小的 `CurrentUser` 用于 service 直调（绕开 JWT 解析）。
     ///
-    /// `permissions` 按**迁移后**的权限点矩阵给（2026-10-14）：`queue.dispatch`
-    /// 只授 MANAGER / CLERK（`seeds/rbac.sql`），其余角色空 —— 与生产登录时
-    /// 装载进 session 的快照一致。写路径改权限点后，不这样给会让所有 Manager
-    /// 用例在守卫处 403；而 Inspector 守卫用例仍能命中 40300（它本就不在矩阵里）。
+    /// `permissions` 按**迁移后**的权限点矩阵给（2026-10-15 第二批）：
+    /// `queue.dispatch` 授 MANAGER / CLERK、`queue.view` 授 MANAGER / CLERK /
+    /// INSPECTOR（`seeds/rbac.sql`），其余角色空 —— 与生产登录时装载进 session
+    /// 的快照一致。不这样给会让对应角色的用例在守卫处 403；而 Inspector 调
+    /// dispatch 的守卫用例仍能命中 40300（它本就不在 `queue.dispatch` 矩阵里）。
     fn make_current(user_id: i64, role: Role) -> CurrentUser {
         let permissions = match role {
-            Role::Manager | Role::Clerk => vec!["queue.dispatch".to_string()],
+            Role::Manager | Role::Clerk => vec![
+                "queue.dispatch".to_string(),
+                "queue.view".to_string(),
+            ],
+            Role::Inspector => vec!["queue.view".to_string()],
             _ => Vec::new(),
         };
         CurrentUser {

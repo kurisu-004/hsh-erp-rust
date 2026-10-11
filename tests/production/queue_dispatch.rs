@@ -1628,3 +1628,52 @@ async fn dispatch_prefers_configured_capacity_over_unbounded_shelf() {
     );
     let _ = unbounded;
 }
+
+// ===========================================================================
+//  权限点闸门（2026-10-15 新增）
+// ===========================================================================
+
+/// 场景 11：auto-dispatch 预览迁 `queue.dispatch`（2026-10-15 有意回改）——
+/// Inspector ⇒ 40300；Clerk ⇒ 200（与 dispatch 同点：预览与下发是一个动作两步）。
+///
+/// Inspector 侧刻意传空 `batch_ids`：权限闸门在 service 首行、先于参数校验，
+/// 空数组也应先 40300（若有人把守卫挪到参数校验之后，本断言会拿到 422 而不是 403）。
+#[tokio::test]
+async fn auto_dispatch_preview_forbidden_for_inspector_and_allowed_for_clerk() {
+    // ---- Inspector：40300 ----
+    let (_pool, app, token, _fx) = bootstrap_as_inspector().await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/queue/auto-dispatch",
+            Some(json!({ "batch_ids": [] })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "Inspector 应 403: {env}");
+    assert_eq!(env["code"], 40300, "应为 FORBIDDEN: {env}");
+
+    // ---- Clerk：200（NO_PROCESS_CHAIN 的合法预览） ----
+    let (pool, app, token, _fx) = bootstrap_as_clerk().await;
+    let customer_id = insert_customer_l2(&pool, "ACME").await;
+    let part_id = insert_part(&pool, customer_id).await;
+    let batch_id = insert_part_batch(&pool, part_id).await;
+
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/queue/auto-dispatch",
+            Some(json!({ "batch_ids": [batch_id.to_string()] })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "Clerk 应 200: {env}");
+    assert_eq!(
+        env["data"]["items"][0]["skip_reason"], "NO_PROCESS_CHAIN",
+        "Clerk 预览应正常返回 skip_reason: {env}"
+    );
+}

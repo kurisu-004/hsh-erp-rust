@@ -13,6 +13,12 @@
 //!   未配置兜底 `max_held_batches`）。commit 后广播
 //!   `WORKER_POOL_AUTO_ALLOCATE_DONE`。
 //!
+//! ## 权限（2026-10-15 第二批迁点）
+//! 三个端点统一走权限点 `queue.allocate`（M,C；自原 Manager 独占**有意放宽**，
+//! 用户定稿）。守卫分层：
+//! - `refill`：**handler 层**（worker-scan 同事务复用的 service 入口不能受限）；
+//! - `move` / `auto-allocate`：service 内部（handler 仅分发）。
+//!
 //! ## 事务 + WS 广播
 //! 事务边界在 handler：`state.pool.begin()` → 传 `&mut tx` 给 service → 显式
 //! `tx.commit()`；提前 return（`?`）时 `Transaction` 的 Drop 自动回滚。
@@ -27,7 +33,7 @@ use axum::Json;
 use axum::extract::State;
 use serde_json::json;
 
-use crate::auth::rbac::{CurrentUser, Role};
+use crate::auth::rbac::CurrentUser;
 use crate::infra::ws_hub::WsEvent;
 use crate::shared::error::AppError;
 use crate::shared::response::R;
@@ -40,7 +46,12 @@ use crate::modules::prod::queue::vo::worker::{AutoAllocateResult, MoveResult, Re
 
 /// POST /api/v2/prod/queue/refill
 ///
-/// Manager role 守卫。Commit 后：
+/// 权限（2026-10-15）：`queue.allocate`（M,C）—— 自原 `require_role(Manager)`
+/// **有意放宽给 Clerk**（用户定稿）。守卫留在 handler 层：worker-scan 的
+/// 同事务 refill（`prod::scan::service::worker_scan`）直调 service 的
+/// `refill_for_worker_with_work_type`，下沉到 service 会误伤该内部路径。
+///
+/// Commit 后：
 /// - `taken.len() > 0` → 广播 `WORKER_POOL_REFILL_DONE`
 /// - `stopped_reason == Some("POOL_EMPTY")` → 广播 `WORKER_POOL_EMPTY`
 ///
@@ -68,7 +79,9 @@ pub async fn admin_refill(
     current: CurrentUser,
     Json(req): Json<AdminRefillRequest>,
 ) -> Result<Json<R<RefillResult>>, AppError> {
-    current.require_role(Role::Manager)?;
+    // 2026-10-15：迁权限点 `queue.allocate`（M,C；自 Manager 独占**有意放宽**，
+    // 用户定稿）。守 handler 不守 service，理由见本 handler doc。
+    current.require_permission("queue.allocate")?;
     let mut tx = state.pool.begin().await?;
     let r = QueueService::refill_for_worker(
         &mut tx,
@@ -126,7 +139,8 @@ pub async fn admin_refill(
 /// （`auto_allocate_limit`，未配置兜底 `max_held_batches`；工种未配 max 的
 /// worker 记 `MAX_BATCHES_NOT_SET` 跳过，不中断整批）。
 ///
-/// Manager 角色守卫下沉到 service（`auto_allocate_for_process` 内部 `require_role`）。
+/// 权限（2026-10-15）：`queue.allocate` 在 service 内守卫
+/// （`auto_allocate_for_process`；自 Manager 独占**有意放宽**为 M,C，用户定稿）。
 /// Commit 后广播 `WORKER_POOL_AUTO_ALLOCATE_DONE`（payload = `AutoAllocateResult`，
 /// 2026-10-15 起少旧「模式 / 比例」两键）。
 ///
@@ -152,7 +166,8 @@ pub async fn auto_allocate(
 /// 通用移动端点：覆盖 POOL ↔ WORKER + WORKER ↔ WORKER 三方向。
 /// 取代原 `admin_remove`（WORKER→POOL 单边）+ `admin_assign`（POOL→WORKER 单边）。
 ///
-/// Manager 角色守卫下沉到 service（`move_batch` 内部 `require_role`）。
+/// 权限（2026-10-15）：`queue.allocate` 在 service 内守卫（`move_batch`；
+/// 自 Manager 独占**有意放宽**为 M,C，用户定稿）。
 /// Commit 后统一广播 `WORKER_POOL_MOVE_DONE`（payload 含 from/to 让前端推断方向）。
 ///
 /// 纯写端点（① 形态）：`pool.begin() → service → commit`。

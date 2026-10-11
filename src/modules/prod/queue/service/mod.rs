@@ -14,8 +14,11 @@
 //! worker-scan 路径直接调 `QueueService::refill_for_worker_with_work_type`）
 //! 沿用 ZST 静态 + 显式 snowflake 的旧形态，改成 trait 注入式要动 batch 域。
 //!
-//! ## 事务 / 角色守卫
-//! 事务边界在 handler；角色守卫在 service 入口第一行（handler 只做权限分发）。
+//! ## 事务 / 权限守卫
+//! 事务边界在 handler；权限守卫在 service 入口第一行（handler 只做权限分发）。
+//! 2026-10-15 第二批起本域全量权限点：`queue.view` / `queue.recall` /
+//! `queue.allocate` / `queue.dispatch`；唯一例外是 `refill`（守卫在 handler，
+//! worker-scan 同事务复用其 service 入口）。
 
 #![allow(deprecated, clippy::too_many_arguments, clippy::type_complexity)]
 

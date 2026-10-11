@@ -1,6 +1,6 @@
 //! prod::queue 队列板装配 service（2026-10-08 新增）
 //!
-//! service 层零 SQL：只做角色守卫 + 分组 + 派生字段计算。SQL 全在
+//! service 层零 SQL：只做权限守卫 + 分组 + 派生字段计算。SQL 全在
 //! [`super::repo::QueueBoardRepo`]。
 //!
 //! ## 派生字段在 service 算、不在 SQL 算
@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use sqlx::PgConnection;
 
-use crate::auth::rbac::{CurrentUser, Role};
+use crate::auth::rbac::CurrentUser;
 use crate::infra::clock::now_shanghai_iso;
 use crate::shared::error::AppError;
 
@@ -42,13 +42,14 @@ impl QueueBoardService {
         Self
     }
 
-    /// 工序序列板。角色守卫：Manager + Clerk + Inspector（沿用被取代的
-    /// `GET /pool/counts` 口径 —— admin 视角但不止 Manager）。
+    /// 工序序列板。权限（2026-10-15）：`queue.view`（M,C,I，沿用被取代的
+    /// `GET /pool/counts` 口径 —— admin 视角但不止 Manager；矩阵逐格等于原
+    /// require_any_role 集合）。
     pub async fn build_snapshot(
         conn: &mut PgConnection,
         current: &CurrentUser,
     ) -> Result<QueueBoardSnapshot, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
+        current.require_permission("queue.view")?;
         let (counts, meta, pending) = QueueBoardRepo::board_snapshot(&mut *conn).await?;
         // process_id → 元数据。查不到的（工序已软删）走占位名，计数仍要显示。
         let mut meta_by_id: HashMap<i64, ProcessMetaRow> =
@@ -83,13 +84,13 @@ impl QueueBoardService {
         })
     }
 
-    /// 单工序队列板。角色守卫同 [`Self::build_snapshot`]。
+    /// 单工序队列板。权限守卫同 [`Self::build_snapshot`]（`queue.view`）。
     pub async fn build_process_detail(
         conn: &mut PgConnection,
         current: &CurrentUser,
         process_id: i64,
     ) -> Result<QueueProcessBoardDetail, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
+        current.require_permission("queue.view")?;
         let data = QueueBoardRepo::board_process_detail(&mut *conn, process_id).await?;
 
         // 持有批次按 worker 分组（一次 ANY 查询结果的服务端分组，不是第二次查询）
