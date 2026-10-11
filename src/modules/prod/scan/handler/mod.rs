@@ -14,8 +14,13 @@
 //! 写端点统一在 handler：`state.pool.begin()` → 传 `&mut tx` 给 service → 显式
 //! `tx.commit()`；提前 return（`?`）时 `Transaction` 的 Drop 自动回滚。
 //! 三条读端点（`pickable` / `held` / `locate`）是只读的，走 `pool.acquire()` 不开事务。
-//! 统一响应信封：`Result<Json<R<T>>, AppError>`。权限在 handler 与 service 双层守卫
-//! （`verify-badge` 例外：任意已登录用户可调，只有 `CurrentUser` extractor 一层）。
+//! 统一响应信封：`Result<Json<R<T>>, AppError>`。角色守卫**逐端点分层**（2026-10-15
+//! review 第 2 轮订正，与 `service/mod.rs` 的「事务 / 角色守卫」段同源）：
+//! `take-over` / `outsource-receive` 为 handler + service **双层**；`pick-up` 为
+//! **service 单层**；`worker-scan` 为 **handler 单层**的历史形态；`verify-badge`
+//! 任意已登录、**无角色守卫**（只有 `CurrentUser` extractor 一层）；三条读端点
+//! （`pickable` / `held` / `locate`）的角色白名单 `SCAN_LIST_ROLES` 在
+//! **service 单层**（`listing/service.rs`）。
 
 use std::sync::Arc;
 

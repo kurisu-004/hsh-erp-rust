@@ -29,9 +29,10 @@
 //! 因为它不写任何批次表。
 //!
 //! ## 事务 / 角色守卫
-//! 事务边界在 handler；角色守卫在 handler 与 service 双层（`pickup` / `transfer` /
-//! `outsource_receive` 已双层；`worker_scan` 仍为 handler 单层的历史形态；`badge`
-//! 任意已登录）。
+//! 事务边界在 handler；角色守卫**逐端点分层**（2026-10-15 review 第 2 轮订正）：
+//! `transfer` / `outsource_receive` 为 handler + service **双层**；`pickup` 为
+//! **service 单层**；`worker_scan` 为 **handler 单层**的历史形态；`badge`
+//! （verify-badge）任意已登录、**无角色守卫**。
 //!
 //! ## 依赖方向
 //! 本域是**转发型**域：`worker_scan` 必然 import `part`（repo / 事件日志 /
