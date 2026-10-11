@@ -2,8 +2,9 @@
 //!
 //! 2026-10-15 新增（第 6 条端点）。工人扫图纸序列号 → 返回该 part **全部未软删
 //! 批次**（**含终态**）的位置事实 + 针对指定工人的可行动作 `action` / 失败原因
-//! `disabled_reason`。这是「扫码找件 · 自助恢复」三件套的第一件（S1 只读诊断），
-//! 后续 S2 / S3 会再加 take-over / outsource-receive 两个写端点。
+//! `disabled_reason`。这是「扫码找件 · 自助恢复」三件套的第一件（S1 只读诊断）。
+//! **2026-10-15 同日 S2 已落地**（[`LocateAction::TakeOver`] 对应的
+//! `POST /scan/take-over`），S3（外协收回）仍待落地。
 //!
 //! ## 与 `ScanListItem`（`listing.rs`）的关系：刻意不复用
 //!
@@ -59,7 +60,9 @@ pub enum LocateAction {
     /// `IN_PROCESS + WORKER` 且持有人就是该工人 —— 件已在自己手上（放回 / 送检流）。
     /// **不受任何闸门影响**（容量触顶 / 工种未绑定都不改变「这是我手上的件」）。
     Mine,
-    /// `IN_PROCESS + WORKER` 且持有人是**别的**工人 → 接手（S2 写端点，尚未落地）。
+    /// `IN_PROCESS + WORKER` 且持有人是**别的**工人 → 接手（S2 写端点
+    /// `POST /scan/take-over`，**2026-10-15 已落地**；写侧判据与 `take_over_gate`
+    /// 同源）。⚠️ holder 为 NULL 的脏形态**不在此列**（落 `UNKNOWN`，写侧同形态拒）。
     TakeOver,
     /// `OUTSOURCE + OUTSOURCE_COMPANY` → 外协收回（S3 写端点，尚未落地）。
     ReceiveFromOutsource,

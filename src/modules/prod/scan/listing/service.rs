@@ -242,13 +242,14 @@ struct LocateWorkerCtx {
 /// 与决策表逐行对应；**不在表内的组合一律落 `Disabled(Unknown)`**（保守出口：
 /// 宁可不给按钮，也不给一个写侧不认的按钮）。
 enum LocateClass {
-    /// `PENDING`（未下发；写侧 S2 的手填下一道流）。
+    /// `PENDING`（未下发；写侧 = S2-B 的链首落位流，无链则两列 NULL）。
     Pending,
     /// `IN_PROCESS + PRODUCTION_SHELF`（架上可领，写侧 pick-up 的 IN_PROCESS 分支）。
     Shelf,
     /// `IN_PROCESS + WORKER` 且持有人是该工人。
     Mine,
-    /// `IN_PROCESS + WORKER` 且持有人是别的工人（S2 接手）。
+    /// `IN_PROCESS + WORKER` 且持有人是**非空**的别的工人（S2 接手；holder 为 NULL
+    /// 的脏形态落 `Disabled(Unknown)`，见 `classify_batch`）。
     TakeOver,
     /// `OUTSOURCE + OUTSOURCE_COMPANY`（S3 外协收回）。
     Outsource,
@@ -262,9 +263,15 @@ fn classify_batch(row: &LocateBatchRow, worker_id: i64) -> LocateClass {
         "PENDING" => LocateClass::Pending,
         "IN_PROCESS" => match row.location.as_deref() {
             Some("PRODUCTION_SHELF") => LocateClass::Shelf,
-            // 注：holder 为 NULL 时落 `TakeOver`（与决策表「holder≠我」同向）；
-            // 这类既非我持有的 WORKER 行在数据上不会出现，判成可接手由写侧兜底。
             Some("WORKER") if row.current_holder_id == Some(worker_id) => LocateClass::Mine,
+            // 2026-10-15 S2 订正：`location='WORKER'` 但 holder 为 NULL 是**数据异常**
+            // （任何写路径都不会产出这种形态），写侧 `take_over` 对同形态拒 `20103`
+            // （「挂在别人手上」是接管的前提，从 Nobody 手上无法接管）⇒ 读侧不给
+            // `TAKE_OVER`（否则是「写侧会拒绝的却显示可点按钮」）。落保守出口
+            // `UNKNOWN`：出现即说明数据需要人工对账。
+            Some("WORKER") if row.current_holder_id.is_none() => {
+                LocateClass::Disabled(LocateDisabledReason::Unknown)
+            }
             Some("WORKER") => LocateClass::TakeOver,
             _ => LocateClass::Disabled(LocateDisabledReason::Unknown),
         },
@@ -302,18 +309,25 @@ fn capacity_gate(ctx: &LocateWorkerCtx) -> Option<LocateDisabledReason> {
 
 /// `PENDING` 的闸门：链首判定（写侧 S2 的对位）→ 容量。
 ///
-/// 「无活跃 step ⇒ `PROCESS_CHAIN_STEP_NOT_FOUND`（写侧 `20702`）」用
-/// `HAS_PROCESS_CHAIN_EXPR` 的投影判定：PENDING 形态下 `current_process_id` 为
-/// NULL ⇒ 该表达式退化为「工单已绑链 且 链内有未软删 step」，与 `head` LATERAL
-/// 取不到链首**等价**（两者都要求链内有活跃 step）。链首存在后再判它是否命中
-/// 工种的活跃工序映射（对位写侧 S2 的 `20104`）。
+/// 「链不可解析 / 链内无活跃 step ⇒ `PROCESS_CHAIN_STEP_NOT_FOUND`（写侧 `20702`）」
+/// 读 `has_usable_chain_head` —— 它与写侧 PENDING 落位用的
+/// `ProcessChainRepo::first_step_in_chain` **逐谓词对齐**（链行未软删 + 至少一个
+/// 未软删 step）。
 ///
-/// ⚠️ 已知残余失败组合（登记在 `docs/api/scan.md` §8）：链首 ∈ 工种映射但**链内
-/// 同一工序重复 / 指针漂移**等写侧另有一轮校验的形态，本闸门放行 ⇒ 前端仍可能吃
-/// 到写侧错误码（前端弹手填兜底）。
+/// ⚠️ **2026-10-15 S2-B 订正**：此前读 `has_process_chain`
+/// （`HAS_PROCESS_CHAIN_EXPR` 投影），该表达式**不带链行软删闸门** ⇒
+/// 「链行已软删但 step 仍活跃」的脏数据形态读侧给 `PICK_UP`，而写侧
+/// `first_step_in_chain` 返 `None`（`20702`）必拒 —— 读放行、写必拒的分叉。
+/// 链首存在后再判它是否命中工种的活跃工序映射（对位写侧 S2 的 `20104`）。
+///
+/// ⚠️ **残余失败面（登记在 `docs/api/scan.md` §8）**：本闸门与 S2-B 写侧
+/// （`resolve_pending_chain_head`）已逐谓词对齐，PENDING 形态**不再有**「读侧放行、
+/// 写侧必拒」的确定性组合；仅剩两类非确定形态：① 诊断与执行之间数据被并发改动；
+/// ② 「链问题 + 容量问题」并存时本函数先报链类 reason、写侧按既有优先级先报容量类
+/// 错误（两侧都拒，只是 reason 不同）。
 fn pending_gate(row: &LocateBatchRow, ctx: &LocateWorkerCtx) -> Option<LocateDisabledReason> {
     if row.has_chain {
-        if !row.has_process_chain.unwrap_or(false) {
+        if !row.has_usable_chain_head {
             return Some(LocateDisabledReason::ProcessChainStepNotFound);
         }
         if !row.chain_head_in_work_type {

@@ -30,6 +30,18 @@
 //!  12. `"shelf_id": null` ≡ 字段缺省（`deserialize_i64_opt` 输入行为矩阵的第四格）
 //!  13. 缺 `version` / 缺 `worker_id` → 仍 422（钉住「本改动只放宽 `shelf_id`」）
 //!
+//! ## 2026-10-15 S2-B：PENDING 起点的链首落位（用例组 15-19）
+//!
+//!  15. PENDING + 有链 → 领取后两列 = **链首**（process + step），`PICKED_UP` 事件
+//!      `process_id` = 链首
+//!  16. PENDING + 有链 + **部分领取** → 拆出来的新批次两列 = 链首，`SPLIT` /
+//!      `PICKED_UP` 两条事件 `process_id` 均为链首；源批次保持 PENDING 两列 NULL
+//!  17. PENDING + 有链、链首 ∉ 工种映射 → `20104` 且**零写入**（不得拆出孤儿批次）
+//!  18. PENDING + 无链 → 两列保持 NULL（回归基线：无链行为逐字不变）
+//!  19. PENDING + 有链但链内无活跃 step → `20702` 且零写入
+//!      （另有一条守「新检查不得插队改变既有错误码优先级」：链问题 + 容量问题并存时
+//!      仍返回容量错误）
+//!
 //! ## 集成测试范本（PR13 Phase F）
 //! 所有 HTTP / fixture helper 一律 `use hsh_erp_test_support::{...}`，**不保留
 //! 本地副本**。本文件独享的 raw SQL 构造（`insert_part` / `insert_part_batch` /
@@ -1621,4 +1633,363 @@ async fn pick_up_is_not_limited_by_auto_allocate_limit() {
         2,
         "工人应持有 2 批（auto=1 不约束手动路径）"
     );
+}
+
+// ===========================================================================
+//  2026-10-15 S2-B：PENDING 起点的链首落位
+// ===========================================================================
+
+/// 给 part 建一条链并绑定：`process_ids` 按数组顺序占 sort_order 10/20/30…（稀疏）。
+///
+/// 返回 `(chain_id, step_ids)`；传空数组 = 只建链头、链内无 step（覆盖 `20702`）。
+/// 与 `tests/production/queue.rs::append_chain_step` 同款稀疏密度：读写的「下一道」
+/// 都按 `sort_order > 当前` 取，稀疏才是判别性输入。
+async fn attach_chain(pool: &PgPool, part_id: i64, process_ids: &[i64]) -> (i64, Vec<i64>) {
+    use hsh_erp_rust::infra::clock::now_naive;
+    let chain_id = next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, \
+         updated_at, updated_by) VALUES ($1, $2, 0, $3, 0, $3, 0)",
+    )
+    .bind(chain_id)
+    .bind(format!("pickup-chain-{chain_id}"))
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_part_process_chain");
+    let mut step_ids = Vec::new();
+    for (i, process_id) in process_ids.iter().enumerate() {
+        let step_id = next_id();
+        sqlx::query(
+            "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, \
+             estimated_minutes, version, created_at, created_by, updated_at, updated_by) \
+             VALUES ($1, $2, $3, $4, 30, 0, $5, 0, $5, 0)",
+        )
+        .bind(step_id)
+        .bind(chain_id)
+        .bind((i as i32 + 1) * 10)
+        .bind(*process_id)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert t_process_chain_step");
+        step_ids.push(step_id);
+    }
+    sqlx::query("UPDATE t_part SET process_chain_id = $1 WHERE id = $2")
+        .bind(chain_id)
+        .bind(part_id)
+        .execute(pool)
+        .await
+        .expect("bind part to chain");
+    (chain_id, step_ids)
+}
+
+/// 读批次的工序两列（S2-B 用例专用；`read_batch` 不含这两列）。
+async fn read_process_columns(pool: &PgPool, batch_id: i64) -> (Option<i64>, Option<i64>) {
+    sqlx::query_as(
+        "SELECT current_process_id, current_process_step_id FROM t_part_batch WHERE id = $1",
+    )
+    .bind(batch_id)
+    .fetch_one(pool)
+    .await
+    .expect("read process columns")
+}
+
+/// S2-B 场景 15：PENDING + 有链 → 领取后两列 = **链首**（process + step），
+/// `PICKED_UP` 事件的 `process_id` 也快照链首。
+#[tokio::test]
+async fn pick_up_pending_with_chain_sets_chain_head() {
+    let ctx = bootstrap().await;
+    let worker_id = insert_active_worker(&ctx.pool, ctx.fx.work_type_a_id).await;
+    let part_id = insert_part(&ctx.pool, 5).await;
+    // 链 [proc_a, proc_b]：链首 proc_a 命中 FX-WTA 的活跃映射（fixture 自带）。
+    let (_chain, steps) = attach_chain(
+        &ctx.pool,
+        part_id,
+        &[ctx.fx.process_a_id, ctx.fx.process_b_id],
+    )
+    .await;
+    let batch_id = insert_part_batch(&ctx.pool, part_id, 5, "PENDING", None).await;
+
+    let (s, env) = send(
+        ctx.app.clone(),
+        json_request(
+            "POST",
+            &format!("/prod/scan/batches/{batch_id}/pick-up"),
+            Some(json!({
+                "version": 0,
+                "worker_id": worker_id.to_string(),
+            })),
+            Some(&ctx.manager),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "PENDING + 链首可落位应 200: {env}");
+
+    let (quantity, status, location, holder, version) = read_batch(&ctx.pool, batch_id).await;
+    assert_eq!(quantity, 5);
+    assert_eq!(status, "IN_PROCESS");
+    assert_eq!(location.as_deref(), Some("WORKER"));
+    assert_eq!(holder, Some(worker_id));
+    assert_eq!(version, 1);
+    let (process, step) = read_process_columns(&ctx.pool, batch_id).await;
+    assert_eq!(
+        process,
+        Some(ctx.fx.process_a_id),
+        "current_process_id = 链首工序"
+    );
+    assert_eq!(
+        step,
+        Some(steps[0]),
+        "current_process_step_id = 链首 step（两列成对落位）"
+    );
+
+    let (es, ev) = fetch_events(&ctx, part_id).await;
+    assert_eq!(es, StatusCode::OK, "{ev}");
+    let picked = pick_event(&ev, "PICKED_UP");
+    assert_eq!(
+        picked["process_id"],
+        ctx.fx.process_a_id.to_string(),
+        "PICKED_UP 事件应快照链首工序: {picked}"
+    );
+}
+
+/// S2-B 场景 16：PENDING + 有链 + **部分领取** → 拆出来的新批次两列 = 链首，
+/// `SPLIT` / `PICKED_UP` 两条事件 `process_id` 均为链首；源批次保持 PENDING、
+/// 两列维持 NULL。
+#[tokio::test]
+async fn pick_up_pending_partial_with_chain_records_head_in_events() {
+    let ctx = bootstrap().await;
+    let worker_id = insert_active_worker(&ctx.pool, ctx.fx.work_type_a_id).await;
+    let part_id = insert_part(&ctx.pool, 6).await;
+    let (_chain, steps) = attach_chain(&ctx.pool, part_id, &[ctx.fx.process_a_id]).await;
+    let batch_id = insert_part_batch(&ctx.pool, part_id, 6, "PENDING", None).await;
+
+    let (s, env) = send(
+        ctx.app.clone(),
+        json_request(
+            "POST",
+            &format!("/prod/scan/batches/{batch_id}/pick-up"),
+            Some(json!({
+                "version": 0,
+                "worker_id": worker_id.to_string(),
+                "quantity": "2",
+            })),
+            Some(&ctx.manager),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "PENDING 部分领取应 200: {env}");
+
+    let new_id: i64 = sqlx::query_scalar(
+        "SELECT id FROM t_part_batch WHERE part_id = $1 AND deleted_at IS NULL AND id <> $2",
+    )
+    .bind(part_id)
+    .bind(batch_id)
+    .fetch_one(&ctx.pool)
+    .await
+    .expect("部分领取应拆出新批次");
+    let (new_process, new_step) = read_process_columns(&ctx.pool, new_id).await;
+    assert_eq!(new_process, Some(ctx.fx.process_a_id), "新批次落链首工序");
+    assert_eq!(new_step, Some(steps[0]), "新批次落链首 step");
+
+    // 源批次：数量递减、状态不变、工序两列仍 NULL（链首只落在被领走的新批次上）。
+    let (src_qty, src_status, _src_loc, _src_holder, src_ver) =
+        read_batch(&ctx.pool, batch_id).await;
+    assert_eq!(src_qty, 4);
+    assert_eq!(src_status, "PENDING");
+    assert_eq!(src_ver, 1);
+    let (src_process, src_step) = read_process_columns(&ctx.pool, batch_id).await;
+    assert_eq!(src_process, None, "源 PENDING 批次两列维持 NULL");
+    assert_eq!(src_step, None);
+
+    let (es, ev) = fetch_events(&ctx, part_id).await;
+    assert_eq!(es, StatusCode::OK, "{ev}");
+    let split_ev = pick_event(&ev, "SPLIT");
+    assert_eq!(
+        split_ev["process_id"],
+        ctx.fx.process_a_id.to_string(),
+        "SPLIT 事件应快照链首工序（新批次的落位）: {split_ev}"
+    );
+    let picked_ev = pick_event(&ev, "PICKED_UP");
+    assert_eq!(
+        picked_ev["process_id"],
+        ctx.fx.process_a_id.to_string(),
+        "PICKED_UP 事件应快照链首工序: {picked_ev}"
+    );
+}
+
+/// S2-B 场景 17：PENDING + 有链、链首 ∉ 工种映射 → `20104` 且**零写入**
+/// （批次行数 / 数量 / status / location / holder / version / 工序两列全不变，
+/// 尤其不得留下拆批孤儿）。
+#[tokio::test]
+async fn pick_up_pending_with_chain_head_not_in_work_type_returns_20104_without_writes() {
+    let ctx = bootstrap().await;
+    // 工人是 FX-WTA（只映射 proc_a）；链首是 proc_b ⇒ 不匹配。
+    let worker_id = insert_active_worker(&ctx.pool, ctx.fx.work_type_a_id).await;
+    let part_id = insert_part(&ctx.pool, 8).await;
+    let (_chain, _steps) = attach_chain(
+        &ctx.pool,
+        part_id,
+        &[ctx.fx.process_b_id, ctx.fx.process_a_id],
+    )
+    .await;
+    let batch_id = insert_part_batch(&ctx.pool, part_id, 8, "PENDING", None).await;
+
+    let (s, env) = send(
+        ctx.app.clone(),
+        json_request(
+            "POST",
+            &format!("/prod/scan/batches/{batch_id}/pick-up"),
+            Some(json!({
+                "version": 0,
+                "worker_id": worker_id.to_string(),
+                "quantity": "3",
+            })),
+            Some(&ctx.manager),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "链首 ∉ 工种映射应 400: {env}");
+    assert_eq!(env["code"], 20104, "BIZ_INVALID_VALUE: {env}");
+
+    assert_eq!(
+        count_batches(&ctx.pool, part_id).await,
+        1,
+        "20104 必须在拆批前拒，不得留下孤儿新批次"
+    );
+    let (quantity, status, location, holder, version) = read_batch(&ctx.pool, batch_id).await;
+    assert_eq!(quantity, 8, "数量不应被扣");
+    assert_eq!(status, "PENDING");
+    assert_eq!(location, None);
+    assert_eq!(holder, None);
+    assert_eq!(version, 0, "version 不应被改");
+    let (process, step) = read_process_columns(&ctx.pool, batch_id).await;
+    assert_eq!(process, None);
+    assert_eq!(step, None);
+}
+
+/// S2-B 场景 18（回归基线）：PENDING + **无链** → 两列保持 NULL，行为与改动前
+/// 逐字一致（`PICKED_UP` 事件的 `process_id` 也为 null）。
+#[tokio::test]
+async fn pick_up_pending_without_chain_keeps_process_columns_null() {
+    let ctx = bootstrap().await;
+    let worker_id = insert_active_worker(&ctx.pool, ctx.fx.work_type_a_id).await;
+    let part_id = insert_part(&ctx.pool, 4).await;
+    let batch_id = insert_part_batch(&ctx.pool, part_id, 4, "PENDING", None).await;
+
+    let (s, env) = send(
+        ctx.app.clone(),
+        json_request(
+            "POST",
+            &format!("/prod/scan/batches/{batch_id}/pick-up"),
+            Some(json!({
+                "version": 0,
+                "worker_id": worker_id.to_string(),
+            })),
+            Some(&ctx.manager),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "无链 PENDING 领取应 200: {env}");
+
+    let (_q, status, location, holder, version) = read_batch(&ctx.pool, batch_id).await;
+    assert_eq!(status, "IN_PROCESS");
+    assert_eq!(location.as_deref(), Some("WORKER"));
+    assert_eq!(holder, Some(worker_id));
+    assert_eq!(version, 1);
+    let (process, step) = read_process_columns(&ctx.pool, batch_id).await;
+    assert_eq!(
+        process, None,
+        "无链时 current_process_id 维持 NULL（已知口径）"
+    );
+    assert_eq!(step, None, "无链时 current_process_step_id 维持 NULL");
+
+    let (es, ev) = fetch_events(&ctx, part_id).await;
+    assert_eq!(es, StatusCode::OK, "{ev}");
+    let picked = pick_event(&ev, "PICKED_UP");
+    assert_eq!(
+        picked["process_id"],
+        Value::Null,
+        "无链时事件 process_id 也为 null（逐字不变）: {picked}"
+    );
+}
+
+/// S2-B 场景 19：PENDING + 有链但**链内无活跃 step** → `20702` 且零写入
+/// （对位 locate 的 `PROCESS_CHAIN_STEP_NOT_FOUND`）。
+#[tokio::test]
+async fn pick_up_pending_with_chain_but_no_active_step_returns_20702() {
+    let ctx = bootstrap().await;
+    let worker_id = insert_active_worker(&ctx.pool, ctx.fx.work_type_a_id).await;
+    let part_id = insert_part(&ctx.pool, 3).await;
+    // 空链：只建链头、链内一个 step 都没有。
+    let (_chain, _steps) = attach_chain(&ctx.pool, part_id, &[]).await;
+    let batch_id = insert_part_batch(&ctx.pool, part_id, 3, "PENDING", None).await;
+
+    let (s, env) = send(
+        ctx.app.clone(),
+        json_request(
+            "POST",
+            &format!("/prod/scan/batches/{batch_id}/pick-up"),
+            Some(json!({
+                "version": 0,
+                "worker_id": worker_id.to_string(),
+            })),
+            Some(&ctx.manager),
+        ),
+    )
+    .await;
+    // 20702 在 `status_from_code` 里归「资源缺失」组 ⇒ HTTP 404。
+    assert_eq!(s, StatusCode::NOT_FOUND, "空链应 404: {env}");
+    assert_eq!(
+        env["code"], 20702,
+        "BIZ_PROCESS_CHAIN_STEP_NOT_FOUND: {env}"
+    );
+    assert_eq!(count_batches(&ctx.pool, part_id).await, 1);
+    let (quantity, status, _location, _holder, version) = read_batch(&ctx.pool, batch_id).await;
+    assert_eq!(quantity, 3, "20702 必须零写入");
+    assert_eq!(status, "PENDING");
+    assert_eq!(version, 0);
+}
+
+/// S2-B 附加（位置硬约束的回归钉子）：链问题与容量问题并存时，**仍按既有优先级
+/// 返回容量错误**。
+///
+/// 链首落位是**新增**检查，按设计排在容量守卫**之后** —— 不得插队到既有检查之前
+/// 改变错误码优先级（「PENDING + 空链 + 工种未配上限」在改动前返回 `20904`）。
+/// 本用例构造「工种 max=NULL（20904 触发）+ 链内无 step（20702 形态）」，断言
+/// 拿到的是 `20904`。把新检查挪到容量守卫之前，这条会立刻变红。
+#[tokio::test]
+async fn pick_up_pending_chain_check_keeps_capacity_error_priority() {
+    let ctx = bootstrap().await;
+    let wt = insert_work_type(&ctx.pool, "PICKUP-S2B-NOMAX", None).await;
+    let worker_id = insert_active_worker(&ctx.pool, wt).await;
+    let part_id = insert_part(&ctx.pool, 2).await;
+    // 空链（若链检查先跑会是 20702）
+    let (_chain, _steps) = attach_chain(&ctx.pool, part_id, &[]).await;
+    let batch_id = insert_part_batch(&ctx.pool, part_id, 2, "PENDING", None).await;
+
+    let (s, env) = send(
+        ctx.app.clone(),
+        json_request(
+            "POST",
+            &format!("/prod/scan/batches/{batch_id}/pick-up"),
+            Some(json!({
+                "version": 0,
+                "worker_id": worker_id.to_string(),
+            })),
+            Some(&ctx.manager),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{env}");
+    assert_eq!(
+        env["code"], 20904,
+        "容量守卫（既有检查）必须先于新增的链检查返回: {env}"
+    );
+    let (quantity, status, _location, _holder, version) = read_batch(&ctx.pool, batch_id).await;
+    assert_eq!(quantity, 2);
+    assert_eq!(status, "PENDING");
+    assert_eq!(version, 0);
 }

@@ -464,6 +464,34 @@ async fn locate_held_by_other_returns_take_over() {
     assert_eq!(b["disabled_reason"], Value::Null);
 }
 
+/// `IN_PROCESS + WORKER` 但 **holder 为 NULL**（数据异常）→ `NONE + UNKNOWN`。
+///
+/// 2026-10-15 S2 订正：写侧 `take_over` 对同形态拒 `20103`（「挂在别人手上」是接管
+/// 的前提），读侧因此**不得**给 `TAKE_OVER`（否则是「写侧会拒绝的却显示可点按钮」）。
+#[tokio::test]
+async fn locate_worker_location_without_holder_returns_none_unknown() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "LOCATE-NOH").await;
+    let proc = seed_process(&pool, "LOC-NOH", "工序").await;
+    let wt = insert_work_type(&pool, "WT-NOH", "工种", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let holder = insert_worker(&pool, "BC-NOH", "工", Some(wt)).await;
+    let (_part, batch, _step) =
+        insert_worker_held_part(&pool, customer, "SN-NOH", holder, proc, 1, true).await;
+    sqlx::query("UPDATE t_part_batch SET current_holder_id = NULL WHERE id = $1")
+        .bind(batch)
+        .execute(&pool)
+        .await
+        .expect("clear holder");
+
+    let (s, env) = locate(&app, &token, "SN-NOH", Some(holder)).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let b = first_batch(&env);
+    assert_eq!(b["location"], "WORKER");
+    assert_eq!(b["action"], Value::Null);
+    assert_eq!(b["disabled_reason"], "UNKNOWN");
+}
+
 /// `TAKE_OVER` 的工序闸门：链 `NEXT` 且指针一致、推导出的下一道**不**在我工种
 /// 映射里 → `NONE + PROCESS_NOT_IN_WORK_TYPE`（对位写侧 S2 派生分支的 20104）。
 #[tokio::test]
@@ -575,6 +603,45 @@ async fn locate_pending_with_empty_chain_returns_none_with_step_not_found() {
     let b = first_batch(&env);
     assert_eq!(b["chain_state"], "NONE");
     assert_eq!(b["action"], Value::Null);
+    assert_eq!(b["disabled_reason"], "PROCESS_CHAIN_STEP_NOT_FOUND");
+}
+
+/// PENDING + 链行**已软删**但链内 step 仍活跃 → `NONE + PROCESS_CHAIN_STEP_NOT_FOUND`。
+///
+/// 2026-10-15 S2-B 订正的分叉回归：写侧 PENDING 落位走
+/// `ProcessChainRepo::first_step_in_chain`，它**带链行软删闸门**（链行已删 ⇒ `None`
+/// ⇒ `20702`）；读侧原用 `HAS_PROCESS_CHAIN_EXPR`（无链行闸门）会把该形态判成
+/// 可领取。本用例钉住两者重新对齐：链行软删时读侧也不给 `PICK_UP`。
+#[tokio::test]
+async fn locate_pending_with_soft_deleted_chain_returns_none_with_step_not_found() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "LOCATE-P-DELCH").await;
+    let proc = seed_process(&pool, "LOC-P-DC", "工序").await;
+    let wt = insert_work_type(&pool, "WT-P-DC", "工种", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let worker = insert_worker(&pool, "BC-P-DC", "工", Some(wt)).await;
+    let (part, _batch, _steps) =
+        insert_pending_part_with_chain(&pool, customer, "SN-P-DELCH", &[proc]).await;
+    // 软删链行（step 保持活跃）：写侧 first_step_in_chain 的链行闸门会返 None。
+    let chain = part_chain_id(&pool, part).await.expect("part 应有链");
+    sqlx::query("UPDATE t_part_process_chain SET deleted_at = now() WHERE id = $1")
+        .bind(chain)
+        .execute(&pool)
+        .await
+        .expect("soft delete chain");
+
+    let (s, env) = locate(&app, &token, "SN-P-DELCH", Some(worker)).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let b = first_batch(&env);
+    assert_eq!(
+        b["chain_state"], "NONE",
+        "锚链软删 ⇒ 链位置派生落 NONE: {env}"
+    );
+    assert_eq!(
+        b["action"],
+        Value::Null,
+        "写侧必拒 20702，读侧不得给按钮: {env}"
+    );
     assert_eq!(b["disabled_reason"], "PROCESS_CHAIN_STEP_NOT_FOUND");
 }
 

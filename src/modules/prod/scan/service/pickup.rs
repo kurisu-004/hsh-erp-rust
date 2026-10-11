@@ -8,6 +8,15 @@
 //! 业务逻辑逐字不变。
 //!
 //! 部分领取（`quantity` 缺省 = 整批）见 [`ScanService::pick_up`] 的「部分领取语义」段。
+//!
+//! ## 2026-10-15 S2-B：PENDING 起点的链首落位
+//!
+//! PENDING 批次此前是**透传** `current_process_id` / `current_process_step_id`
+//! （PENDING 行两列恒 NULL）⇒ 领到手的新 IN_PROCESS 批次工序信息缺失，落不进任何
+//! 工序候选池。现在 PENDING 分支在**容量守卫之后、拆批之前**解析链首
+//! （[`resolve_pending_chain_head`]）：有链 ⇒ 落链首 step + process（链首 ∉ 工种
+//! ⇒ `20104`，链不可解析 ⇒ `20702`）；无链 ⇒ 两列维持 NULL（已知口径）。
+//! IN_PROCESS 分支与部分领取的余量去向**一行不动**。
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
@@ -89,6 +98,15 @@ impl ScanService {
     /// OCC 仍锚**源批次**（`validate_batch_version(batch.id, req.version, …)` 在
     /// 最前、拆批 SQL 的 `src_version` 也传 `req.version`）；新批次由
     /// `_split_batch_inner` 建出来时 `version` 恒为 0，后续写入按 0 锚。
+    ///
+    /// ## 2026-10-15 S2-B：PENDING 起点的链首落位与两条新错误码
+    ///
+    /// PENDING 起点不再透传 NULL 工序：有链时落**链首**
+    /// （[`resolve_pending_chain_head`]，位置在容量守卫之后、拆批之前）——
+    /// - `20702 BIZ_PROCESS_CHAIN_STEP_NOT_FOUND`：链行已软删 / 链内无活跃 step；
+    /// - `20104 BIZ_INVALID_VALUE`：链首 ∉ 该工种的活跃工序映射。
+    ///
+    /// 无链时两列仍为 NULL（已知口径，与改动前逐字一致）；IN_PROCESS 起点一行不动。
     pub async fn pick_up<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
@@ -236,6 +254,27 @@ impl ScanService {
         let _ =
             QueueService::ensure_worker_has_capacity(repo.conn_mut(), req.worker_id, work_type_id)
                 .await?;
+        // 2026-10-15 S2-B 新增：PENDING 起点的**链首落位**（见 [`resolve_pending_chain_head`]）。
+        //
+        // ⚠️ 位置是硬约束（两条边界 + 一条次序理由）：
+        // - 必须在上面容量守卫**之后** —— 这是本轮**新增**的检查，不得插队到既有
+        //   检查之前改变错误码优先级（「PENDING + 链不可解析 + 工人已满」在改动前
+        //   返回容量错误，插队会把它变成 20702，属本轮范围外的破坏性变更）；
+        // - 必须在 `split_batch_for_partial_pass` **之前** —— 否则「部分领取」会先
+        //   拆出一个新批次、随即撞链校验失败，留下一个没人认领的孤儿新批次（源批次
+        //   数量已被扣减）。与容量守卫同款的存在价值；
+        // - IN_PROCESS 起点**不解析**：翻状态不写这两列（见下方 inline SQL 的注释），
+        //   事件取源批次现值 ⇒ 行为与改动前逐字一致。
+        //
+        // 判据与读侧 `locate` 的 PENDING 闸门同源（`has_usable_chain_head` /
+        // `chain_head_in_work_type` 两个投影与 [`resolve_pending_chain_head`] 逐谓词
+        // 对齐），避免「读侧给 PICK_UP、写侧必拒」的分叉。
+        let (placed_step_id, placed_process_id): (Option<i64>, Option<i64>) =
+            if from == PartStatus::PENDING {
+                resolve_pending_chain_head(repo.conn_mut(), part_id, work_type_id).await?
+            } else {
+                (batch.current_process_step_id, batch.current_process_id)
+            };
         // 2026-10-03 新增：部分领取 —— 翻状态**之前**先把要交出去的那部分拆成
         // 新批次；之后所有针对批次的写入都改指新批次（version 恒为 0）。
         //
@@ -280,9 +319,11 @@ impl ScanService {
             None => (batch.id, req.version),
         };
         // 翻状态：PENDING → IN_PROCESS+WORKER；IN_PROCESS+PRODUCTION_SHELF → IN_PROCESS+WORKER
-        // PR-3：保留 batch.current_process_step_id（pick-up 不改 step，只换 holder）
-        // 2026-09-30：同理透传 batch.current_process_id（池归属权威依据；
-        // pick-up 不改工序，只换 holder）
+        //
+        // 2026-10-15 S2-B：PENDING 分支的两列改用 [`resolve_pending_chain_head`] 的
+        // 解析值（有链 = 链首 step / process，无链 = 两列 NULL）；IN_PROCESS 分支
+        // 依旧一行不动（只翻 location+holder，status 与工序列保持原值 —— 池内领取
+        // 「不推进工序」的既有语义）。
         let n = if from == PartStatus::PENDING {
             mark_batch_with_status_and_meta(
                 repo.conn_mut(),
@@ -291,8 +332,8 @@ impl ScanService {
                 "IN_PROCESS",
                 Some("WORKER"),
                 Some(req.worker_id),
-                batch.current_process_step_id,
-                batch.current_process_id,
+                placed_step_id,
+                placed_process_id,
                 current.id,
             )
             .await?
@@ -333,12 +374,14 @@ impl ScanService {
                     quantity: Some(info.quantity),
                     drawing_code: Some(&part.drawing_no),
                     badge_code: None,
-                    // 2026-10-12：拆批事件挂在**新批次**上，而工序取**源批次**的 ——
-                    // `split_batch_for_partial_pass` 的 `INSERT ... SELECT` 继承了
-                    // `current_process_id`，故两者同值。工人是 `req.worker_id`（已在上面
-                    // 查库校验存在且 active）。
+                    // 2026-10-12：拆批事件挂在**新批次**上，工序取 `placed_process_id`。
+                    // 2026-10-15 S2-B：`placed_process_id` 对 PENDING 起点是**链首**
+                    // （新批次随后在翻状态里落位到它，事件快照与批次终态一致）；
+                    // 对 IN_PROCESS 起点是源批次现值（拆批继承，两者同值）。无链的
+                    // PENDING 仍为 None（与改动前逐字一致）。工人是 `req.worker_id`
+                    // （已在上面查库校验存在且 active）。
                     worker_id: Some(req.worker_id),
-                    process_id: batch.current_process_id,
+                    process_id: placed_process_id,
                     note: Some("pick-up 部分领取自动拆批"),
                     created_by: Some(current.id),
                 },
@@ -361,10 +404,10 @@ impl ScanService {
                 drawing_code: Some(&part.drawing_no),
                 badge_code: None,
                 // 2026-10-12：同上一处 —— `target_batch_id` 拆批时是新批次、整批时是
-                // 源批次，但两者的 `current_process_id` 同值（拆批继承 + 随后
-                // `mark_batch_with_status_and_meta` 显式透传），故统一取源批次快照。
+                // 源批次，`placed_process_id` 对两种起点都是「批次落位后的工序」
+                // （PENDING = 链首 / NULL，IN_PROCESS = 源批次现值）。
                 worker_id: Some(req.worker_id),
-                process_id: batch.current_process_id,
+                process_id: placed_process_id,
                 note: req.note.as_deref(),
                 created_by: Some(current.id),
             },
@@ -381,4 +424,62 @@ impl ScanService {
             split,
         })
     }
+}
+
+/// PENDING 起点领取时的**链首落位**（2026-10-15 S2-B 新增）。
+///
+/// 返回 `(step_id, process_id)`：
+/// - **无链**（`t_part.process_chain_id IS NULL`，手写工单常态）→ `(None, None)`：
+///   两列维持 NULL（登记为已知口径，与改动前逐字一致）；
+/// - **有链** → 链内第一个未软删 step（`ProcessChainRepo::first_step_in_chain`，
+///   链行软删闸门在它内部）：
+///   - 取不到（链行已软删 / 链内无活跃 step）→ `20702 BIZ_PROCESS_CHAIN_STEP_NOT_FOUND`；
+///   - 链首工序 ∉ 该工种的活跃工序映射 → `20104 BIZ_INVALID_VALUE`（判据与
+///     `queue/move` POOL→WORKER 分支的 `WorkTypeRepo::list_process_ids` 同源）。
+///
+/// ## 位置硬约束（caller 侧）
+/// 必须在**容量守卫之后、`split_batch_for_partial_pass` 之前**调用，理由见
+/// [`ScanService::pick_up`] 内的调用点注释（不改变既有错误码优先级 + 失败不得
+/// 留下拆批孤儿）。
+///
+/// ## 与读侧 `locate` 的同源关系
+/// `locate` 的 PENDING 闸门读 `LocateBatchRow.has_usable_chain_head`（= 本节
+/// 「链行未软删且链内有活跃 step」）与 `chain_head_in_work_type`（= 本节的映射
+/// 校验），三者逐谓词对齐 —— 读侧给 `PICK_UP` 的形状写侧不会拒（残余失败组合见
+/// `docs/api/scan.md` §8）。
+async fn resolve_pending_chain_head(
+    conn: &mut sqlx::PgConnection,
+    part_id: i64,
+    work_type_id: i64,
+) -> Result<(Option<i64>, Option<i64>), AppError> {
+    let Some(chain_id) = crate::shared::batch::optional_process_chain(conn, part_id).await? else {
+        // 无链：两列维持 NULL（PENDING 行本来就是 NULL，随后 mark_* 传 None 即
+        // 「写 NULL」，与改动前逐字一致）。
+        return Ok((None, None));
+    };
+    let (step_id, process_id) =
+        crate::modules::prod::process_chain::repo::ProcessChainRepo::first_step_in_chain(
+            &mut *conn, chain_id,
+        )
+        .await?
+        .ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND,
+                format!(
+                    "chain {chain_id} 不可解析（已软删）或链内没有活跃 step，PENDING 领取无处落位"
+                ),
+            )
+        })?;
+    let process_ids = crate::modules::prod::work_type::repo::WorkTypeRepo::list_process_ids(
+        &mut *conn,
+        work_type_id,
+    )
+    .await?;
+    if !process_ids.contains(&process_id) {
+        return Err(AppError::biz(
+            code::BIZ_INVALID_VALUE,
+            format!("工种 {work_type_id} 不含链首工序 {process_id}（PENDING 领取落位）"),
+        ));
+    }
+    Ok((Some(step_id), Some(process_id)))
 }

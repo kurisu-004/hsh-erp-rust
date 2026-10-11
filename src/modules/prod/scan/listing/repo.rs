@@ -545,12 +545,17 @@ impl ScanListingRepo {
     ///   pb.current_process_step_id` 在「指针为 NULL」时为 SQL NULL（三值逻辑），
     ///   非可空 `bool` 解码会 500 ⇒ 由转换侧 `unwrap_or(false)` 落保守值。
     ///   仅供 service 的 action 判定消费，**不出现在响应里**；
-    /// - **`has_process_chain`**：`HAS_PROCESS_CHAIN_EXPR` 原样投影（held 同款
-    ///   消费方式，`Option<bool>` 安全网同因）；`locate` 只用它判 PENDING 的
-    ///   「链内有没有可落的 step」；
+    /// - **`has_usable_chain_head`**：**「锚链行未软删且链内有未软删 step」**
+    ///   的合取（2026-10-15 S2-B 订正）。它刻意**不是** `HAS_PROCESS_CHAIN_EXPR`
+    ///   的投影 —— 后者不带链行软删闸门，对「链行已软删但 step 仍活跃」的脏数据
+    ///   形态会判 true，而写侧 PENDING 落位走的 `first_step_in_chain` 对同一形态
+    ///   返 `None`（`20702`）⇒ 读侧放行、写侧必拒。本列与 `first_step_in_chain`
+    ///   逐谓词对齐：链行 `deleted_at IS NULL` + step 未软删 + 至少一条。
+    ///   仅供 PENDING 分支消费，**不出现在响应里**；
     /// - **PENDING 的链首**：`head` LATERAL 取链内第一个未软删 step
-    ///   （`ORDER BY sort_order ASC, id ASC LIMIT 1`），配 `$2`（工种 id）的
-    ///   `EXISTS t_work_type_process` 直接判「链首是否命中该工种的活跃映射」；
+    ///   （`ORDER BY sort_order ASC, id ASC LIMIT 1`，链行带软删闸门），配
+    ///   `$2`（工种 id）的 `EXISTS t_work_type_process` 直接判「链首是否命中该
+    ///   工种的活跃映射」；
     /// - **外协在途**：`company_name` = 持有人公司行名（**仅 `status='OUTSOURCE'`
     ///   时投影**，非外协批次恒 NULL）；`sent_at` = 该批次开口 shipment 的发出
     ///   时间（`LEFT JOIN LATERAL … status='OUTSOURCING' ORDER BY sent_at DESC,
@@ -576,15 +581,15 @@ impl ScanListingRepo {
     /// ## 其余纪律
     ///
     /// - `p.serial_no` 等可空列一律 `Option` 解码（同 `WorkTypeListRow`）；
-    /// - `LEFT JOIN t_process_chain_step cs` 是 `HAS_PROCESS_CHAIN_EXPR` 的
-    ///   契约要求（表达式引用 `cs.process_id`）；列表一律 LEFT JOIN，INNER 会让
-    ///   无 step 指针的批次从结果里消失；
+    /// - 本函数**不投影** `HAS_PROCESS_CHAIN_EXPR`（`locate` 只用 PENDING 的
+    ///   「链首可用性」，见上一条），故也没有它要求的
+    ///   `LEFT JOIN t_process_chain_step cs` —— 该表达式仍被 `fetch_pickable` /
+    ///   `fetch_held` 两条列表 SQL 消费，别把常量本身当成「全文件共用」；
     /// - `$2` 是**工种 id**（可为 NULL，未传 `worker_id` / 工人未绑工种时）：
     ///   `wtp.work_type_id = NULL` 恒假 ⇒ 两个 EXISTS 投影 false，service 不会在
     ///   这些形态下消费它们；
-    /// - **注入面为 0**：`format!` 只填 `HAS_PROCESS_CHAIN_EXPR` 与
-    ///   `CHAIN_POSITION_LATERAL_SQL` 两个编译期常量，`part_id` / `work_type_id`
-    ///   走 bind，`AssertSqlSafe` 安全。
+    /// - **注入面为 0**：`format!` 只填 `CHAIN_POSITION_LATERAL_SQL` 一个编译期
+    ///   常量，`part_id` / `work_type_id` 走 bind，`AssertSqlSafe` 安全。
     pub(crate) async fn fetch_locate_batches(
         conn: &mut PgConnection,
         part_id: i64,
@@ -601,7 +606,7 @@ impl ScanListingRepo {
                     CASE WHEN pb.status = 'OUTSOURCE' THEN oc.name END AS company_name, \
                     CASE WHEN pb.status = 'OUTSOURCE' THEN ship.sent_at END AS sent_at, \
                     (p.process_chain_id IS NOT NULL) AS has_chain, \
-                    {} AS has_process_chain, \
+                    (head.head_process_id IS NOT NULL) AS has_usable_chain_head, \
                     (nx.current_step_id IS NOT NULL \
                      AND nx.current_step_id = pb.current_process_step_id) AS pointer_consistent, \
                     EXISTS (SELECT 1 FROM t_work_type_process wtp \
@@ -617,8 +622,6 @@ impl ScanListingRepo {
              LEFT JOIN t_shelf sh ON sh.id = pb.current_holder_id \
              LEFT JOIN t_worker w ON w.id = pb.current_holder_id \
              LEFT JOIN t_outsource_company oc ON oc.id = pb.current_holder_id \
-             LEFT JOIN t_process_chain_step cs \
-               ON cs.id = pb.current_process_step_id AND cs.deleted_at IS NULL \
              LEFT JOIN LATERAL ( {} ) nx ON TRUE \
              LEFT JOIN t_process cp \
                ON cp.id = pb.current_process_id AND cp.deleted_at IS NULL \
@@ -627,6 +630,8 @@ impl ScanListingRepo {
              LEFT JOIN LATERAL ( \
                SELECT csh.process_id AS head_process_id \
                FROM t_process_chain_step csh \
+               JOIN t_part_process_chain ch \
+                 ON ch.id = csh.chain_id AND ch.deleted_at IS NULL \
                WHERE csh.chain_id = p.process_chain_id \
                  AND csh.deleted_at IS NULL \
                ORDER BY csh.sort_order ASC, csh.id ASC \
@@ -643,7 +648,6 @@ impl ScanListingRepo {
              ) ship ON TRUE \
              WHERE pb.part_id = $1 AND pb.deleted_at IS NULL \
              ORDER BY pb.batch_no ASC, pb.id ASC",
-            crate::shared::batch::chain::HAS_PROCESS_CHAIN_EXPR,
             crate::shared::batch::chain::CHAIN_POSITION_LATERAL_SQL
         );
         sqlx::query_as(sqlx::AssertSqlSafe(sql))
@@ -699,9 +703,11 @@ pub struct LocateWorkerRow {
 /// 决策表（`listing/service.rs`）算出后与这些事实一起折成 [`crate::modules::prod::scan::vo::LocateBatchItem`]。
 /// 字段按「SQL 投影了什么」收敛成一处事实（同 [`WorkTypeListRow`] 的理由）。
 ///
-/// `has_process_chain` 与 `pointer_consistent` 按 `Option<bool>` 收是**解码侧
-/// 的安全网**：两个表达式在特定形态下会产出 SQL NULL（三值逻辑），解进非可空
-/// `bool` 会整页 500。消费侧统一 `unwrap_or(false)` 落保守值。
+/// `pointer_consistent` 按 `Option<bool>` 收是**解码侧的安全网**：该表达式在
+/// 「指针为 NULL」时产出 SQL NULL（三值逻辑），解进非可空 `bool` 会整页 500。
+/// 消费侧统一 `unwrap_or(false)` 落保守值。（2026-10-15 S2-B 起
+/// `has_usable_chain_head` 换成 `head.head_process_id IS NOT NULL` 投影 —— 它是
+/// 三值逻辑封闭的 `bool`，不再需要 `Option` 安全网。）
 #[derive(Debug, sqlx::FromRow)]
 pub struct LocateBatchRow {
     pub(crate) batch_id: i64,
@@ -727,13 +733,17 @@ pub struct LocateBatchRow {
     /// 仅 `status='OUTSOURCE'` 时投影（其余恒 `None`）。
     pub(crate) sent_at: Option<NaiveDateTime>,
     /// `t_part.process_chain_id IS NOT NULL`（工单**是否绑链**）。
-    /// ⚠️ 与 `has_process_chain` **不是同一判据**：前者只看工单有没有链，后者还要求
-    /// 「链内定位得到」（见 `HAS_PROCESS_CHAIN_EXPR` 的三种分叉形态）。外协收回 /
-    /// PENDING 的分支判定用的是**本列**。
+    /// ⚠️ 与 `has_usable_chain_head` **不是同一判据**：前者只看工单有没有链，后者还
+    /// 要求「链行未软删 **且** 链内有未软删 step」（与写侧 `first_step_in_chain`
+    /// 逐谓词对齐）。外协收回的分支判定用的是**本列**；PENDING 用后者。
     pub(crate) has_chain: bool,
-    /// `HAS_PROCESS_CHAIN_EXPR` 的投影；`locate` 只在 PENDING 分支消费
-    /// （该形态下等价于「链内有未软删 step」）。
-    pub(crate) has_process_chain: Option<bool>,
+    /// **链首可用性**（2026-10-15 S2-B 订正，替代原先的 `has_process_chain` 投影）：
+    /// 「链行未软删 **且** 链内至少有一个未软删 step」—— 即写侧
+    /// `ProcessChainRepo::first_step_in_chain` 的 `Option::is_some()`。它直接对应
+    /// 写侧 PENDING 落位的 `20702`（链不可解析 / 无活跃 step）与成功放行两态，
+    /// 且修掉了 `HAS_PROCESS_CHAIN_EXPR` 缺链行软删闸门的分叉（见 `fetch_locate_batches`
+    /// 的 doc）。
+    pub(crate) has_usable_chain_head: bool,
     /// 写侧 `is_pointer_consistent` 的纯 SQL 表达，仅 TAKE_OVER 分支消费。
     pub(crate) pointer_consistent: Option<bool>,
     /// 链首（链内第一个未软删 step）是否命中 `$2` 工种（`None` 工种时恒 false）。

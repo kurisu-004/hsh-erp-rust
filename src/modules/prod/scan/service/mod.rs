@@ -9,7 +9,10 @@
 //! - `worker_scan.rs` —— 报工台主入口（`POST /scan/worker-scan`，RETURNED /
 //!   INSPECTED 二合一 + 链尾自动送检 + 同事务 refill 编排所需的核心）
 //! - `pickup.rs` —— 手动 pick-up（`POST /scan/batches/{batch_id}/pick-up`，
-//!   含部分领取自动拆批）
+//!   含部分领取自动拆批；2026-10-15 S2-B 起 PENDING 起点落链首工序）
+//! - `transfer.rs` —— 扫码接管（`POST /scan/take-over`，**2026-10-15 新增 S2**；
+//!   holder worker → worker + 工序顺推的原子写，与 S1 `locate` 的 `TAKE_OVER`
+//!   判定同源）
 //!
 //! 两条只读聚合端点（`/scan/pickable` / `/scan/held`）**不在本目录**：它们在
 //! [`super::listing`] 子模块里（该子模块受域隔离护栏覆盖，必须零跨域依赖）。
@@ -34,6 +37,7 @@
 
 pub mod badge;
 pub mod pickup;
+pub mod transfer;
 pub mod worker_scan;
 
 /// `prod::scan` service（ZST，与 `prod::batch` / `prod::queue` 的范本一致）。

@@ -206,3 +206,40 @@ pub struct PickUpRequest {
     #[serde(default)]
     pub note: Option<String>,
 }
+
+/// `POST /api/v2/prod/scan/take-over` 入参（扫码接管，2026-10-15 新增 S2）。
+///
+/// 场景：批次仍挂在**别的**工人名下（`IN_PROCESS + location='WORKER'` +
+/// `current_holder_id != 我`），但图纸 / 实物已经流转到这位工人手里 ⇒ 扫工牌一键
+/// 接管：holder 换成我、顺手推进到我工种下的下一道工序，同一事务原子完成。
+///
+/// ## 与 worker-scan 的入参形态关系
+/// `batch_id` / `next_process_id` 两个键在两条端点上**同形**（都是雪花 id 的
+/// **JSON 字符串**）：
+/// - `batch_id` 走 `deserialize_i64`（只吃 `str`；发数字 → axum `Json` 提取器
+///   **HTTP 422 纯文本**，不进 `R<T>` 信封）；
+/// - `next_process_id` 保持 `Option<String>` 不改 wire（与 `WorkerScanRequest`
+///   逐字同款），service 内 `str::parse`，非法值 → `40001 VALIDATION_ERROR`。
+///   它**仅在链位置推导不出下一道时必填**（详见 service 的判据顺序）。
+///
+/// `version` 是**批次 OCC 锚**且**必填**（无 `#[serde(default)]`）：缺失 → 422
+/// 纯文本。`badge_code` 是接管人（不是旧持有人）—— 旧持有人由 `batch_id` 行上的
+/// `current_holder_id` 决定，客户端不需要、也不应该指定它。
+#[derive(Debug, Clone, Deserialize)]
+pub struct TakeOverRequest {
+    /// 批次锚（雪花 id 的 JSON 字符串）。
+    #[serde(deserialize_with = "deserialize_i64")]
+    pub batch_id: i64,
+    /// 接管人的工牌码（`t_worker.badge_code`）；反查不到 → `20201`。
+    pub badge_code: String,
+    /// 批次 OCC 锚（客户端传值；与 `t_part_batch.version` 不一致 → `40901`）。
+    pub version: i32,
+    /// 接管后要推进到的工序；**仅链位置推导不出下一道时必填**（缺失 → `40001`，
+    /// 有链但链内定位不到 → `20702`）。JSON 字符串形态（与 worker-scan 同款）。
+    #[serde(default)]
+    pub next_process_id: Option<String>,
+    /// `t_part_event.note` 的附加备注。缺省时事件备注自动写
+    /// `"接管自 worker {旧持有人 id}"`；有值时拼成 `"接管自 worker {id}：{note}"`。
+    #[serde(default)]
+    pub note: Option<String>,
+}
