@@ -10,7 +10,8 @@
 //!   实现（见 `repo/mod.rs`）；handler 借 `&mut *tx` 喂给 service。
 //! - 统一响应信封：返回 `Result<Json<R<T>>, AppError>`，错误由 `AppError::into_response()`
 //!   装进同一个 `R` 信封。
-//! - 权限在 service 层（`current.require_any_role` / `require_role`），此处不重复校验。
+//! - 权限在 service 层（`require_permission` / `require_role`），此处不重复校验。
+//!   2026-10-15：读 2 条走 `production.view`（M,C,CNC,SA,I）。
 
 use std::sync::Arc;
 

@@ -274,11 +274,11 @@ fn chain_to_out(
     }
 }
 
+/// 读工艺链的公共闸门（`get_by_part` / `get_chain_by_id` 两个调用点共用）。
+///
+/// 2026-10-15：迁权限点 `production.view`（矩阵 M,C,CNC,SA,I）。原为
+/// M,C,I,CNC，**SA 并入是有意并集**（用户定稿）—— 与 work_type / process /
+/// shelf_process 三个域的读守卫统一为同一集合。
 fn require_any_read(current: &CurrentUser) -> Result<(), AppError> {
-    current.require_any_role(&[
-        Role::Manager,
-        Role::Clerk,
-        Role::Inspector,
-        Role::CncProgrammer,
-    ])
+    current.require_permission("production.view")
 }
