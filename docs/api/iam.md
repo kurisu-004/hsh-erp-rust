@@ -153,7 +153,8 @@ jti 写入黑名单（TTL 对齐旧 token 剩余有效期），旧 jti 再次使
 
 组树规则：根与每层 children 按 `(sort_order, code)` 升序；`parent_id` 指向**不在
 可见集合内**的父节点时该节点提升为根（孤儿兜底）。菜单与角色的对应在
-`t_role_menu`，`seeds/menu.sql` 是其权威源。
+`t_role_menu`，权威源是 RBAC 面板（`POST /iam/roles/{id}/grants` 整包替换）；
+基线由 `seeds/rbac.sql` §4 首次灌入。
 
 ## 3. 角色与货架 scope 口径
 
@@ -263,7 +264,7 @@ CRUD 完全独立 —— 本表只覆盖 session / users 两段。
 |---|---|---|---|
 | `t_user` | 登录、账号 CRUD、`/me`、refresh | 建号、更新、软删停用、密码、戳 `last_login_at`、轮转 `refresh_token_version` | 无物理外键，存在性由 service 校验 |
 | `t_user_role` | 角色解析、账号角色组装、查重 | 授予、软删撤销 | 唯一约束**非 partial**，见 §8.3 |
-| `t_menu` + `t_role_menu` | 按角色取可见菜单并组树 | RBAC 面板的 grants 整包替换（授权行软删 + 重插） | `seeds/menu.sql` 是菜单的权威源；ADMIN 不写行（§9.3） |
+| `t_menu` + `t_role_menu` | 按角色取可见菜单并组树 | RBAC 面板的 grants 整包替换（授权行软删 + 重插） | 菜单目录归 `seeds/menu.sql`，角色→菜单授权基线归 `seeds/rbac.sql`（首次灌入后由面板管理）；ADMIN 不写行（§9.3） |
 | `t_role` / `t_permission` / `t_role_permission`（2026-10-14 新增） | 角色列表 / grants / 权限点清单 / 登录装载权限码 | 角色 CRUD 与 grants 整包替换 | 三表零外键；基线由 `seeds/rbac.sql` 无条件加载；ADMIN 不写 `t_role_permission` |
 | `t_shelf` | SHELF_ACCOUNT 的 scope 校验 + 登录态货架范围解析 + 端点 18~22 的 CRUD | 建架、改架、软删停用 | **2026-10-10 起写端点在本域内**（货架子模块自独立 shelf 域迁入，`ShelfRepo` 是本域自有 repo）；字段口径见 [`shelves.md`](shelves.md) |
 | `t_wx_identity` | 绑定查询、wx-login 反查、system → wx 一对一判定（读该账号全部活跃行） | 绑定、解绑软删 | 唯一索引 `uk_wx_identity_corp_user` 是 **partial**（软删行不参与） |
@@ -371,7 +372,8 @@ userid 不区分大小写、统一转为小写。⚠️ **不是**登录流程�
 
 域归属 `iam::rbac`（`src/modules/iam/rbac/`），URL 挂 `/api/v2/iam` **根**
 （`/iam/roles`，不是 `/iam/rbac/*`）。数据基线由 `seeds/rbac.sql` 无条件加载
-（6 个系统角色 + 权限点 + 授权矩阵）；菜单树仍归 `seeds/menu.sql`，两者关注点分离。
+（6 个系统角色 + 权限点 + 授权矩阵 + 角色→菜单首次基线）；菜单目录仍归
+`seeds/menu.sql`，两者关注点分离。
 
 `t_role.code` 与 Rust `auth::rbac::Role` 枚举是**两张表**：6 个系统角色一一对应
 （`ADMIN / MANAGER / CLERK / INSPECTOR / CNC_PROGRAMMER / SHELF_ACCOUNT`）；

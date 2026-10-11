@@ -7,7 +7,9 @@
 //!
 //! 修改菜单曾经是"改 migration 文件 + 算 SHA384 + 同步 _sqlx_migrations.checksum
 //! + 部署"四步曲，每次都要担心硬编码 ID 撞号、ON CONFLICT 守卫、optimistic
-//!   lock +1。重构后改为"改 seeds/menu.sql + 重启 app"两步，零摩擦。
+//!   lock +1。重构后改为"改 seeds + 重启 app"两步，零摩擦：菜单目录 → seeds/menu.sql，
+//!   角色 / 权限点 / 授权基线 → seeds/rbac.sql（t_role_menu 首次基线自 2026-10-15 起归
+//!   此文件，见下「RBAC 基线 seed」）。
 //!
 //! seeds/menu.sql 是声明式的：
 //!   * INSERT ... ON CONFLICT (code) WHERE deleted_at IS NULL DO UPDATE
@@ -25,19 +27,21 @@
 //! ## RBAC 基线 seed（2026-10-14 新增）
 //!
 //! seeds/rbac.sql 装载 RBAC 基线数据：6 个内置角色（`t_role`），BE-8 起追加权限点
-//! 与系统角色授权矩阵（`t_permission` / `t_role_permission`）。**无条件加载**，
-//! 与 `BOOTSTRAP_ADMIN_ENABLED` 解耦：角色/权限点是面板与业务端点的判定基线，
-//! 初始管理员账号只是可选的开户动作。
+//! 与系统角色授权矩阵（`t_permission` / `t_role_permission`），2026-10-15 起并入
+//! 角色→菜单**首次基线**（`t_role_menu`）。**无条件加载**，与
+//! `BOOTSTRAP_ADMIN_ENABLED` 解耦：角色 / 权限点 / 授权基线是面板与业务端点的
+//! 判定基线，初始管理员账号只是可选的开户动作。
 //!
-//! 与 menu.sql 的关注点分离：menu.sql 管「看得见的入口」（菜单树 + 角色→菜单），
-//! rbac.sql 管「能做什么操作」（角色定义 + 角色→权限点）。两份都幂等，改动只需
+//! 与 menu.sql 的关注点分离：menu.sql 管「菜单目录」（t_menu 菜单树，部署配置、
+//! 与前端路由耦合），rbac.sql 管「角色 / 权限点 / 授权基线」（角色定义 + 权限点 +
+//! 角色→权限点基线 + 角色→菜单首次基线）。两份都幂等，改动只需
 //! 重启（`sqlx::raw_sql`，不走 `query!`，无需 `sqlx prepare`）。
 //!
 //! ## 应用时机
 //!
 //! `run_seeds()` 由 `src/main.rs` 在 `sqlx::migrate!()` 之后调用，启动即跑一次。
-//! 种子文件本身幂等（多次跑结果一致），可手工 `psql $DATABASE_URL -f seeds/menu.sql`
-//! 触发（见 scripts/seed_apply.sh）。
+//! 种子文件本身幂等（多次跑结果一致），可手工跑 scripts/seed_apply.sh 触发
+//! （默认按序应用 menu → rbac，与启动钩子一致）。
 //!
 //! ## 编译期 SQL 校验
 //!

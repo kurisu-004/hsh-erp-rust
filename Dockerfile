@@ -42,7 +42,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # ---- 真实源码（.sqlx 与 migrations 都是编译期宏的输入）----
 COPY .sqlx ./.sqlx
 COPY migrations ./migrations
-# seeds/ 同理：src/infra/seed.rs 用 include_str! 编译期内嵌 menu.sql / admin.sql
+# seeds/ 同理：src/infra/seed.rs 用 include_str! 编译期内嵌 menu.sql / rbac.sql / admin.sql
 COPY seeds ./seeds
 COPY src ./src
 
