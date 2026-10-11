@@ -5,16 +5,15 @@
 //! 2026-10-07 新增：待品检队列读 [`InspectionQueueService::list_queue`]（自
 //! `prod::batch::service::list` 迁入，规范化口径与 SQL 逐字未变），与扫码读同域。
 //!
-//! ## 角色守卫
-//! 下沉到 service 第一行（沿 `prod::batch` 的 `TO_XXX_ROLES` 范本），
-//! `current.require_any_role(READ_ROLES)`；handler 仅做
+//! ## 权限守卫（2026-10-15 迁权限点）
+//! 下沉到 service 第一行：`current.require_permission("inspection.view")`
+//! （矩阵 M,I —— 逐格等于原 `READ_ROLES` 角色集合）；handler 仅做
 //! 参数提取，不重复校验。
 //!
-//! 白名单**只有 2 个角色**（与 `GET /api/v2/prod/inspection/queue` 及
-//! `to-ship` / `to-inspection` / `to-process` 三个写端点同一组）：扫码树是
-//! 品检动作的前置上下文，放行 `Clerk` / `CncProgrammer` / `ShelfAccount` 会
-//! 让它们看到本该看不到的批次明细。队列读的白名单逐字相同（迁前就是同一组，
-//! 常量 [`READ_ROLES`] 现由两个 service 共用，改白名单只需改这一处）。
+//! 白名单**只有 Manager + Inspector**（与 `to-ship` / `to-inspection` /
+//! `to-process` 三个写端点同一组）：扫码树是品检动作的前置上下文，放行
+//! `Clerk` / `CncProgrammer` / `ShelfAccount` 会让它们看到本该看不到的批次
+//! 明细。队列读的白名单逐字相同（两个 service 共用同一权限点）。
 //!
 //! ## 事务边界
 //! 读端点不开事务（handler `pool.acquire()` 借 `&mut PgConnection`）。纯读，
@@ -37,7 +36,7 @@ use std::collections::HashMap;
 
 use sqlx::PgConnection;
 
-use crate::auth::rbac::{CurrentUser, Role};
+use crate::auth::rbac::CurrentUser;
 use crate::modules::prod::inspection::dto::InspectionQueueQuery;
 use crate::modules::prod::inspection::model::{ScanAssemblyRow, ScanBatchRow, ScanPartRow};
 use crate::modules::prod::inspection::repo::{
@@ -49,12 +48,6 @@ use crate::modules::prod::inspection::vo::{
 };
 use crate::shared::customer::expand_customer_id;
 use crate::shared::error::{AppError, code};
-
-/// 本域两个读端点（`GET /scan/{serial_no}` / `GET /queue`）允许的角色：Manager 或 Inspector。
-///
-/// 与 `prod::batch::handler::transition` 的 `TO_XXX_ROLES` 同一组 —— 扫码树与
-/// 队列里的批次就是那三个写端点的操作对象，能看就必须能操作。
-const READ_ROLES: &[Role] = &[Role::Manager, Role::Inspector];
 
 /// `hit_kind` 出参的取值白名单。
 ///
@@ -99,7 +92,9 @@ impl InspectionScanService {
         current: &CurrentUser,
         serial_no: &str,
     ) -> Result<ScanTreeOut, AppError> {
-        current.require_any_role(READ_ROLES)?;
+        // 2026-10-15：迁权限点 `inspection.view`（M,I；矩阵逐格等于原
+        // READ_ROLES 集合）。
+        current.require_permission("inspection.view")?;
 
         // 扫码枪偶发尾随空白 / 空格；空串等价于「没扫到东西」，按未命中收口。
         let serial_no = serial_no.trim();
@@ -329,7 +324,9 @@ impl InspectionQueueService {
         query: &InspectionQueueQuery,
         current: &CurrentUser,
     ) -> Result<InspectionQueueListOut, AppError> {
-        current.require_any_role(READ_ROLES)?;
+        // 2026-10-15：迁权限点 `inspection.view`（M,I；矩阵逐格等于原
+        // READ_ROLES 集合）。
+        current.require_permission("inspection.view")?;
 
         let limit = query.limit.unwrap_or(DEFAULT_QUEUE_LIMIT).clamp(1, 200);
         let offset = query.offset.unwrap_or(0).max(0);

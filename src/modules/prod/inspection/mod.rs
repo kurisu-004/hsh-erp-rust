@@ -101,9 +101,9 @@
 //! `t_worker` / `t_outsource_company` 四张表**不加**闸门（与 `prod::batch::repo`
 //! 既有写法一致，展示用附加信息照常显示最后的样子）。
 //!
-//! ## 角色
-//! `Manager` + `Inspector`（service 内 `require_any_role`），两个读端点共用
-//! `service.rs` 的 `READ_ROLES`，与 `prod::batch` 三个 `to-XXX` 写端点同一组。
+//! ## 权限（2026-10-15 迁权限点）
+//! `inspection.view`（矩阵 M,I；service 内 `require_permission`），两个读端点
+//! 共用同一点，与 `prod::batch` 三个 `to-XXX` 写端点的角色集合同形。
 //!
 //! ## 队列端点（`GET /queue`）
 //! 2026-10-07 自 `prod::batch` 迁入。口径如下（迁前逐字保留，判定依据见 `repo.rs`）：
@@ -145,8 +145,8 @@
 //! - `repo.rs` —— SQL 真源，**两个 ZST**：`InspectionScanRepo`（5 个静态方法，
 //!   2~4 条 SQL 走完一次扫码请求，无 N+1）+ `InspectionQueueRepo`（list / count，
 //!   共用私有 WHERE 拼装器）
-//! - `service.rs` —— 业务逻辑：`InspectionScanService`（角色守卫 + 两表回退命中 +
-//!   内存分组挂树）+ `InspectionQueueService`（角色守卫 + limit/offset clamp +
+//! - `service.rs` —— 业务逻辑：`InspectionScanService`（权限守卫 + 两表回退命中 +
+//!   内存分组挂树）+ `InspectionQueueService`（权限守卫 + limit/offset clamp +
 //!   **排序白名单映射** + ILIKE 通配符拒绝 + row→vo 投影）
 //! - `handler.rs` —— HTTP 路由 2 条（只做参数提取 + `pool.acquire()` + `R::ok`）
 //!

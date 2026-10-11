@@ -12,8 +12,8 @@
 //! ## 事务边界
 //! 读端点：`pool.acquire()` 不开事务，**不发** WS 广播（纯查询，无业务流转）。
 //!
-//! ## 角色守卫
-//! 在 service 第一行下沉（沿 `prod::batch` 范本），handler 不重复校验。
+//! ## 权限守卫（2026-10-15 迁权限点）
+//! 在 service 第一行下沉（`inspection.view`，M,I），handler 不重复校验。
 //!
 //! ## 路径参数
 //! `serial_no` 是 `Path<String>`（不是 `ni64!` 那类数值提取器）：序列号是
@@ -52,7 +52,7 @@ use super::vo::{InspectionQueueListOut, ScanTreeOut};
 ///
 /// 扫码查询：返回「装配件（可空）→ 全部子件 → 全部批次」三层树。
 ///
-/// 角色：Manager + Inspector（service 内守卫）。
+/// 权限：`inspection.view`（M,I；service 内守卫）。
 /// 读端点：`pool.acquire()` 不开事务，不发 WS 广播。
 /// ⚠️ `serial_no` 含 URL 保留字符时前端必须 `encodeURIComponent`（含 `/` 未编码会在路由
 /// 层 404 且**响应体为空**、拿不到信封），详见模块 doc 的「路径参数」节。
