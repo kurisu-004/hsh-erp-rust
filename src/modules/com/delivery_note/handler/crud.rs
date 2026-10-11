@@ -22,8 +22,12 @@
 //!   - ② 写 + post-commit Redis / WS（broadcast 落 handler，service 不持有 WsHub）`pool.begin() → service → commit → state.ws_hub.broadcast(...)`；
 //!   - ③ 读端点（list_*/get_*）`pool.acquire() → service`，不开事务。
 //! - 统一响应信封：`Result<Json<R<T>>, AppError>`。
-//! - 权限在 service 层（`current.require_any_role(...)`）；handler 这里只解析
-//!   query / path / body。
+//! - 权限**默认**在 service 层（`current.require_any_role(...)` /
+//!   `require_permission(...)`）；handler 这里只解析 query / path / body。
+//!   ⚠️ 2026-10-15 例外：本文件 `batch_get_delivery_notes` 与 `get_delivery_note`
+//!   在 handler 首行守 `delivery_note.view` —— 同域 `scan_entry.rs` 的扫码入单
+//!   （写路径）在事务内复用 `service/inner.rs::get_with_parts`，把守卫压到那层
+//!   会让「写已提交、响应 403」变成可达态。
 
 use std::sync::Arc;
 
@@ -56,9 +60,12 @@ const BATCH_DETAIL_MAX_IDS: usize = 200;
 /// 入参顺序返回存在的那部分）。
 pub async fn batch_get_delivery_notes(
     State(state): State<Arc<AppState>>,
-    _current: crate::auth::rbac::CurrentUser,
+    current: crate::auth::rbac::CurrentUser,
     Query(q): Query<DeliveryNoteBatchDetailQuery>,
 ) -> Result<Json<R<BatchDeliveryDetailData>>, AppError> {
+    // 2026-10-15：本点为原**零守卫**读，补 `delivery_note.view`（M,C,I）。
+    // 守卫留在 handler（不压到 `service/inner::get_with_parts`，理由见文件头）。
+    current.require_permission("delivery_note.view")?;
     // 解析：split + trim + filter empty + 保留首次出现顺序 dedupe
     let raw = q.ids.as_deref().unwrap_or("");
     let mut seen = std::collections::HashSet::new();
@@ -152,9 +159,12 @@ pub async fn list_delivery_notes(
 /// GET /api/v2/com/delivery/note/{id}
 pub async fn get_delivery_note(
     State(state): State<Arc<AppState>>,
-    _current: crate::auth::rbac::CurrentUser,
+    current: crate::auth::rbac::CurrentUser,
     Path(path): Path<DeliveryNotePath>,
 ) -> Result<Json<R<DeliveryNoteDetailOut>>, AppError> {
+    // 2026-10-15：本点为原**零守卫**读，补 `delivery_note.view`（M,C,I）。
+    // 守卫留在 handler（不压到 `service/inner::get_with_parts`，理由见文件头）。
+    current.require_permission("delivery_note.view")?;
     // 读端点：pool.acquire() → service → drop。
     let mut conn = state.pool.acquire().await?;
     let out = state
