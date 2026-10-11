@@ -1830,7 +1830,7 @@ async fn board_process_detail_process_not_found() {
     assert_eq!(env["code"], 20801, "BIZ_PROCESS_NOT_FOUND: {env}");
 }
 
-/// 场景 H3: ShelfAccount 角色 → 40300 FORBIDDEN（service 守卫：Manager/Clerk/Inspector only）
+/// 场景 H3: ShelfAccount 角色 → 40300 FORBIDDEN（权限点 `queue.view`，矩阵 M,C,I）
 #[tokio::test]
 async fn board_process_detail_forbidden_for_shelf_account() {
     let (pool, _app, _token, _fx) = bootstrap_as_manager().await;

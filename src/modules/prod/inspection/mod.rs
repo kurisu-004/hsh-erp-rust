@@ -4,8 +4,8 @@
 //! - `GET /api/v2/prod/inspection/queue` —— 队列列表（表头筛选 + 服务端排序 + 分页）
 //! - `GET /api/v2/prod/inspection/scan/{serial_no}` —— 扫码弹窗的三层树
 //!
-//! 两个端点读的是同一批数据（`status='INSPECTION'` 的活跃批次）、同一组角色，
-//! 故同域；队列读自 `prod::batch` 迁入后，本域**零跨域依赖**（护栏见
+//! 两个端点读的是同一批数据（`status='INSPECTION'` 的活跃批次）、同一权限点
+//! （`inspection.view`），故同域；队列读自 `prod::batch` 迁入后，本域**零跨域依赖**（护栏见
 //! [`crate::shared::domain_guard`] 与本文件末尾的 `mod tests`）。
 //!
 //! 2026-10-05 新增：扫码端点 `GET /api/v2/prod/inspection/scan/{serial_no}`。
@@ -103,7 +103,7 @@
 //!
 //! ## 权限（2026-10-15 迁权限点）
 //! `inspection.view`（矩阵 M,I；service 内 `require_permission`），两个读端点
-//! 共用同一点，与 `prod::batch` 三个 `to-XXX` 写端点的角色集合同形。
+//! 共用同一点，与 `prod::batch` 三个 `to-XXX` 写端点的 `batch.transition` 矩阵同形。
 //!
 //! ## 队列端点（`GET /queue`）
 //! 2026-10-07 自 `prod::batch` 迁入。口径如下（迁前逐字保留，判定依据见 `repo.rs`）：
@@ -132,7 +132,7 @@
 //!
 //! ## 模块结构（平级单文件，与 `prod::process_design` / `prod::programming` 平行）
 //! 本域**两个端点共一层文件**（不是「一端点一目录」）：端点之间的耦合只有「共用
-//! 角色白名单 / 共用批次表」这一层，按层切文件比按端点切目录更贴近全仓形态，且
+//! 权限点（`inspection.view`）/ 共用批次表」这一层，按层切文件比按端点切目录更贴近全仓形态，且
 //! 两个 repo / 两个 service 的**类型名**自带 `InspectionScan` / `InspectionQueue`
 //! 前缀区分（方法名则是 `scan` 与 `list_queue`），不会混。
 //! - `dto.rs` —— 入参（仅队列读的 `InspectionQueueQuery`，Query string；

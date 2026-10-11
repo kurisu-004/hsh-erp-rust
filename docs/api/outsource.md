@@ -659,7 +659,7 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 - **`detail.process` 无 `category` 字段**（单工序详情不展示类别，与 `prod::queue` 的 `QueueProcessMeta` 对齐），而 `snapshot.processes[]` 有。
 - **§1.5 的「静态段必须先于 catch-all 注册」是硬约束，没有编译期保障。** 公司 router 里加一条新的 1 段静态路由而放到 `/{id}` 之后 ⇒ 该路径返 **400**（不是 404），症状与「路由没注册」不同，极易误判。（quote router 暂时无此约束，因为 `/{id}` 已下线。）
 - **公司 / 报价两域的 `version` 必填是**「422 纯文本」**而不是业务信封**，前端错误处理要按 HTTP 状态码分支，不能假设响应必有 `code` 字段。同理 `Path<i64>` 抽不出数字时的 400。
-- **看板两个端点的权限面比旧 `/outsource-pool/state` 宽了半档（2026-10-09 收敛的连带后果）。** 旧 `state` 端点是 **Manager + Clerk**，而它吐的 `unit_price` 与客户 / 申请人名属于外协域的商务敏感读面；收敛后 `held_batches[].price`（同一列的另一种叫法）被内联进 `GET /outsource-queue/processes/{id}` 的 `companies[]`，而该端点为了让 Inspector 能收货/发料给了 **Manager + Clerk + Inspector**。⇒ **`held_batches[].price` 与客户 / 申请人名对 Inspector 打开了**，这是本轮有意接受的暴露面变化（代价：旧端点那点保护没了；收益：收货角色不必再靠两次请求拼看板）。若产品不接受，正确修法是给 `price` 单独加字段级脱敏（按角色置 `null`），而不是把整个端点退回 Manager + Clerk —— 那会让 Inspector 看不到自己经手的在途卡。角色口径与理由记在 `src/modules/outsource/handler/board.rs` 的模块 doc。
+- **看板两个端点的权限面比旧 `/outsource-pool/state` 宽了半档（2026-10-09 收敛的连带后果）。** 旧 `state` 端点是 **Manager + Clerk**，而它吐的 `unit_price` 与客户 / 申请人名属于外协域的商务敏感读面；收敛后 `held_batches[].price`（同一列的另一种叫法）被内联进 `GET /outsource-queue/processes/{id}` 的 `companies[]`，而该端点为了让 Inspector 能收货/发料给了 **Manager + Clerk + Inspector**。⇒ **`held_batches[].price` 与客户 / 申请人名对 Inspector 打开了**，这是本轮有意接受的暴露面变化（代价：旧端点那点保护没了；收益：收货角色不必再靠两次请求拼看板）。若产品不接受，正确修法是给 `price` 单独加字段级脱敏（按角色置 `null`），而不是把整个端点退回 Manager + Clerk —— 那会让 Inspector 看不到自己经手的在途卡。权限口径与理由记在 `src/modules/outsource/handler/board.rs` 的模块 doc。
 
 ## 9. 错误码分段（`src/shared/error.rs::code`）
 
@@ -689,6 +689,6 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 | `21503` / `21504` | `BIZ_OUTSOURCE_SHIPMENT_NO_OPEN` / `..._QUANTITY_EXCEEDS` | 找不到开口 shipment / 接收数量超开口量 |
 | `40901` | `VERSION_CONFLICT` | OCC 冲突 |
 | `40001` | `VALIDATION_ERROR` | 请求形状错误（同 kind 移动） |
-| `40300` | `FORBIDDEN` | 权限守卫（`require_permission` 失败） |
+| `40300` | `FORBIDDEN` | 权限 / 角色守卫失败（`require_permission`，或对账三端点的 `require_any_role`） |
 
 ⚠️ `40901 VERSION_CONFLICT` 只表达 OCC，不得用于业务唯一键冲突（全仓规约见 `CLAUDE.md` §8）。本域的公司重名 / 报价三元组重复都有专用码（`21202`/`21214` / `21303`）。

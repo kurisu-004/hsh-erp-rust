@@ -8,7 +8,7 @@
 //! ## 并行 / 认证
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
 //! 完全独立，无需 Mutex 串行化。
-//! 每个用例 INSPECTOR token（白名单）。
+//! 每个用例 INSPECTOR token（在 `batch.transition` 矩阵内）。
 
 use axum::http::StatusCode;
 use serde_json::json;

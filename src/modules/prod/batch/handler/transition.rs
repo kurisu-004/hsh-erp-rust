@@ -283,7 +283,7 @@ pub async fn scan_deliver_part(
 
 /// `GET /api/v2/prod/batches/repair`
 ///
-/// DELIVERED 批次列表（Manager + Inspector）。只读端点：
+/// DELIVERED 批次列表（权限点 `batch.repair`，M,C,I）。只读端点：
 /// `pool.acquire()` 不开事务。
 pub async fn list_repair_batches(
     State(state): State<Arc<AppState>>,
@@ -297,8 +297,8 @@ pub async fn list_repair_batches(
 
 /// `GET /api/v2/prod/batches/repairing`
 ///
-/// 返修中批次列表（`t_part_batch.is_repairing = true`，Manager + Inspector）。
-/// 判据是 `is_repairing = true`（REPAIRING 降级为标记列，不是状态）。
+/// 返修中批次列表（`t_part_batch.is_repairing = true`；权限点 `batch.repair`，
+/// M,C,I）。判据是 `is_repairing = true`（REPAIRING 降级为标记列，不是状态）。
 /// 只读端点：`pool.acquire()` 不开事务。
 pub async fn list_repairing_batches(
     State(state): State<Arc<AppState>>,

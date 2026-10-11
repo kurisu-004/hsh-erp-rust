@@ -24,11 +24,13 @@
 //! 装进同一个 `R` 信封。
 //!
 //! ## 权限（2026-10-15 第二批迁点后）
-//! 权限守卫在 service 层（`current.require_permission` / `require_role`），
-//! handler 不重复校验。本批迁入：`outsource.view`（看板读 / 报价读 / 公司读，
-//! 公司读收紧去 CNC）、`outsource.quote.edit`、`outsource.quote.approve`、
-//! `outsource.move`、`outsource.company.manage`。对账（shipment）两端点保持
-//! 角色守卫不动。
+//! 权限守卫在 service 层（`current.require_permission`；对账三端点仍是
+//! `require_any_role`），handler 不重复校验。本批迁入：`outsource.view`（看板读 /
+//! 报价读 / 公司读，公司读收紧去 CNC）、`outsource.quote.edit`、
+//! `outsource.quote.approve`、`outsource.move`、`outsource.company.manage`。
+//! 对账（shipment）三端点保持角色守卫不动：`GET /outsource-companies/{id}/sent-parts`
+//! 与 `POST /outsource-shipments/{id}/reconcile-update`（M,C）、
+//! `GET /outsource-shipments/in-flight`（M,C,I）。
 //!
 //! ## 子模块
 //! - `board.rs` —— 外协看板只读聚合 2 端点（`snapshot` / `processes/{process_id}`）
@@ -48,8 +50,8 @@
 //! - `POST   /outsource-quotes`                 — 新建 DRAFT
 //! - `GET    /outsource-quotes/quotable-parts`  — 报价 picker
 //! - `POST   /outsource-quotes/{id}/submit`     — DRAFT → SUBMITTED（OCC）
-//! - `POST   /outsource-quotes/{id}/approve`    — SUBMITTED → APPROVED (MANAGER-only)
-//! - `POST   /outsource-quotes/{id}/reject`     — SUBMITTED → REJECTED (MANAGER-only)
+//! - `POST   /outsource-quotes/{id}/approve`    — SUBMITTED → APPROVED（权限点 `outsource.quote.approve`，矩阵 M）
+//! - `POST   /outsource-quotes/{id}/reject`     — SUBMITTED → REJECTED（权限点 `outsource.quote.approve`，矩阵 M）
 //! - `POST   /outsource-quotes/{id}/soft-delete` — 软删 DRAFT/REJECTED（OCC）
 //!
 //! - `GET    /outsource-shipments/in-flight`    — 在途批次一览
@@ -274,7 +276,7 @@ pub async fn submit_quote(
     Ok(Json(R::ok(out)))
 }
 
-/// POST /outsource-quotes/{id}/approve  (MANAGER-only via service) —— 纯写端点
+/// POST /outsource-quotes/{id}/approve  (权限点 `outsource.quote.approve` via service) —— 纯写端点
 pub async fn approve_quote(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -296,7 +298,7 @@ pub async fn approve_quote(
     Ok(Json(R::ok(out)))
 }
 
-/// POST /outsource-quotes/{id}/reject  (MANAGER-only via service) —— 纯写端点
+/// POST /outsource-quotes/{id}/reject  (权限点 `outsource.quote.approve` via service) —— 纯写端点
 pub async fn reject_quote(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,

@@ -4,8 +4,10 @@
 //! - list_quotes       — 列表 + 过滤 + 分页
 //! - create_quote      — 创建 DRAFT（part/company/process 必填校验 + 重复检查）
 //! - submit_quote      — DRAFT → SUBMITTED（OCC）
-//! - approve_quote     — SUBMITTED → APPROVED（MANAGER-only；自动 reject 竞争报价）
-//! - reject_quote      — SUBMITTED → REJECTED（review_note 必填；MANAGER-only）
+//! - approve_quote     — SUBMITTED → APPROVED（权限点 `outsource.quote.approve`，
+//!   矩阵 M；自动 reject 竞争报价）
+//! - reject_quote      — SUBMITTED → REJECTED（review_note 必填；权限点
+//!   `outsource.quote.approve`，矩阵 M）
 //! - soft_delete_quote — 软删（DRAFT / REJECTED 状态才允许；OCC）
 //! - list_quotable_parts   — 报价 picker（还没下发的零件，
 //!   一零件一行；同日由「零件 × OUTSOURCE 工序」简化而来）。此前路由未注册，
@@ -281,7 +283,7 @@ impl OutsourceService {
     ) -> Result<QuotablePartListOut, AppError> {
         // 2026-10-15：迁权限点 `outsource.quote.edit`（M,C；矩阵逐格等于原
         // `require_any_role` 集合；可报价零件列表是报价工作流的辅助读，归本点
-        // 不推动 `outsource.view` 的角色集合）。
+        // 不推动 `outsource.view` 的矩阵）。
         current.require_permission("outsource.quote.edit")?;
         let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
         let offset = query.offset.unwrap_or(0).max(0);
@@ -325,7 +327,7 @@ impl OutsourceService {
     ) -> Result<OutsourceQuoteOut, AppError> {
         // 2026-10-15：迁权限点 `outsource.quote.edit`（M,C；矩阵逐格等于原
         // `require_any_role` 集合；可报价零件列表是报价工作流的辅助读，归本点
-        // 不推动 `outsource.view` 的角色集合）。
+        // 不推动 `outsource.view` 的矩阵）。
         current.require_permission("outsource.quote.edit")?;
         let part_id = parse_snowflake_id(&req.part_id, "part_id")?;
         let company_id = parse_snowflake_id(&req.outsource_company_id, "outsource_company_id")?;
@@ -423,7 +425,7 @@ impl OutsourceService {
     ) -> Result<OutsourceQuoteOut, AppError> {
         // 2026-10-15：迁权限点 `outsource.quote.edit`（M,C；矩阵逐格等于原
         // `require_any_role` 集合；可报价零件列表是报价工作流的辅助读，归本点
-        // 不推动 `outsource.view` 的角色集合）。
+        // 不推动 `outsource.view` 的矩阵）。
         current.require_permission("outsource.quote.edit")?;
         let q = repo
             .quote_get_by_id(id, false)
@@ -481,7 +483,6 @@ impl OutsourceService {
         version: i32,
         current: &CurrentUser,
     ) -> Result<OutsourceQuoteOut, AppError> {
-        // MANAGER-only
         // 2026-10-15：迁权限点 `outsource.quote.approve`（M；矩阵逐格等于原
         // `require_role(Manager)`）。
         current.require_permission("outsource.quote.approve")?;
@@ -606,7 +607,7 @@ impl OutsourceService {
     ) -> Result<(), AppError> {
         // 2026-10-15：迁权限点 `outsource.quote.edit`（M,C；矩阵逐格等于原
         // `require_any_role` 集合；可报价零件列表是报价工作流的辅助读，归本点
-        // 不推动 `outsource.view` 的角色集合）。
+        // 不推动 `outsource.view` 的矩阵）。
         current.require_permission("outsource.quote.edit")?;
         let q = repo
             .quote_get_by_id(id, false)

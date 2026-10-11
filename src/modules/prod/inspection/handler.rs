@@ -6,8 +6,8 @@
 //! 迁到本域 `GET /api/v2/prod/inspection/queue`）。
 //!
 //! ## 端点
-//! - `GET /api/v2/prod/inspection/scan/{serial_no}` —— Manager + Inspector
-//! - `GET /api/v2/prod/inspection/queue` —— Manager + Inspector
+//! - `GET /api/v2/prod/inspection/scan/{serial_no}` —— 权限点 `inspection.view`（M,I）
+//! - `GET /api/v2/prod/inspection/queue` —— 权限点 `inspection.view`（M,I）
 //!
 //! ## 事务边界
 //! 读端点：`pool.acquire()` 不开事务，**不发** WS 广播（纯查询，无业务流转）。
@@ -68,7 +68,7 @@ pub async fn scan(
 
 /// `GET /api/v2/prod/inspection/queue`
 ///
-/// 待品检队列列表（Manager + Inspector）。只读端点：`pool.acquire()` 不开事务。
+/// 待品检队列列表（权限点 `inspection.view`，M,I）。只读端点：`pool.acquire()` 不开事务。
 ///
 /// 2026-10-07 自 `GET /api/v2/prod/batches/inspection` 迁入本域：出参切到
 /// `InspectionQueueListOut`（13 字段），查询参数是 `InspectionQueueQuery`

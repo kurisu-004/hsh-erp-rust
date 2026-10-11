@@ -144,7 +144,7 @@
 | 21419 | `BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT` | `recall` 时该 L1 已有另一张 DRAFT | 409 |
 | 21421 | `BIZ_DELIVERY_BATCH_STATE_INVALID` | `submit` 时单上批次被旁路改成 `READY_TO_SHIP` 之外的状态 | 400 |
 | 40100 | `AUTH_*` | 未带 token / token 失效（中间件层） | 401 |
-| 40300 | `FORBIDDEN` | 角色不足（含 `ShelfAccount` 访问本域任意端点） | 403 |
+| 40300 | `FORBIDDEN` | 权限 / 角色守卫失败（三条读的 `delivery_note.view` 权限不足，或未迁端点的角色不足；含 `ShelfAccount` 访问本域任意端点） | 403 |
 | 40901 | `VERSION_CONFLICT` | 任一写端点 OCC 不匹配 | 409 |
 
 **已不使用的码**（随端点下线留空，勿复用）：`21408 BIZ_DELIVERY_NOTE_SCAN_MISMATCH`

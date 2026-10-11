@@ -645,7 +645,7 @@ async fn i64_ids_are_serialized_as_json_strings() {
 
 /// 场景 10: 权限守卫（`inspection.view`）—— MANAGER / INSPECTOR 放行；三个角色 403 + 40300。
 #[tokio::test]
-async fn role_guard_allows_manager_and_inspector_rejects_other_three() {
+async fn permission_guard_allows_manager_and_inspector_rejects_other_three() {
     let (_pool, app, _token, fx) = bootstrap().await;
 
     for (label, username) in [

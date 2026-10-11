@@ -29,7 +29,7 @@
 //! - `service/` —— 全部业务用例（`impl BatchService`，按流拆文件，见该目录 mod doc）
 //! - `dto.rs` —— 全部入参（`Deserialize`）
 //! - `vo.rs` —— 全部出参（`Serialize`）
-//! - `handler/{transition,lifecycle}.rs` —— HTTP 路由 + 角色守卫 + WS 广播
+//! - `handler/{transition,lifecycle}.rs` —— HTTP 路由 + 权限守卫 + WS 广播
 //!   （`handler/dispatch.rs` 已迁 `prod::queue`）
 //!
 //! ## 2026-10-08：三处公共设施已上移到 `shared::batch`

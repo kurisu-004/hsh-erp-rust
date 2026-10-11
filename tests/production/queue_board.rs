@@ -270,7 +270,7 @@ async fn board_snapshot_pending_count_matches_pending_endpoint() {
     assert_eq!(total, 3, "pending.total 应为 3: {env2}");
 }
 
-/// ShelfAccount → 40300（service 守卫：Manager / Clerk / Inspector only）。
+/// ShelfAccount → 40300（权限点 `queue.view`，矩阵 M,C,I）。
 #[tokio::test]
 async fn board_snapshot_forbidden_for_shelf_account() {
     let (pool, _app, _token, _fx) = bootstrap_as_manager().await;

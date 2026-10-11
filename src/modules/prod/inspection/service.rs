@@ -10,10 +10,10 @@
 //! （矩阵 M,I —— 逐格等于原 `READ_ROLES` 角色集合）；handler 仅做
 //! 参数提取，不重复校验。
 //!
-//! 白名单**只有 Manager + Inspector**（与 `to-ship` / `to-inspection` /
-//! `to-process` 三个写端点同一组）：扫码树是品检动作的前置上下文，放行
-//! `Clerk` / `CncProgrammer` / `ShelfAccount` 会让它们看到本该看不到的批次
-//! 明细。队列读的白名单逐字相同（两个 service 共用同一权限点）。
+//! 矩阵**只有 Manager + Inspector**（与 `batch.transition` 覆盖的 `to-ship` /
+//! `to-inspection` / `to-process` 三个写端点同一组）：扫码树是品检动作的前置
+//! 上下文，放行 `Clerk` / `CncProgrammer` / `ShelfAccount` 会让它们看到本该看不到
+//! 的批次明细。队列读的矩阵逐字相同（两个 service 共用同一权限点）。
 //!
 //! ## 事务边界
 //! 读端点不开事务（handler `pool.acquire()` 借 `&mut PgConnection`）。纯读，

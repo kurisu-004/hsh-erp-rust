@@ -874,7 +874,7 @@ async fn snapshot_empty_returns_zeroed_totals() {
     assert_eq!(env["data"]["in_flight_total"], 0, "{env}");
 }
 
-/// 权限口径：两个看板读端点都是 Manager + Clerk + Inspector，CLERK 在集合内。
+/// 权限口径：两个看板读端点共用权限点 `outsource.view`（矩阵 M,C,I），CLERK 在矩阵内。
 #[tokio::test]
 async fn snapshot_allows_clerk_role() {
     let (_pool, app, token, _fx) = bootstrap_as_clerk().await;
