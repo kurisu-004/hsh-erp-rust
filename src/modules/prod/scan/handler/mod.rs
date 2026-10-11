@@ -3,13 +3,14 @@
 //! ## 子文件
 //! - `badge.rs` —— 扫工牌（`POST /scan/verify-badge`）
 //! - `listing.rs` —— 两条只读聚合端点（`GET /scan/pickable` / `GET /scan/held`）
+//! - `locate.rs` —— 扫码找件 · 诊断（`GET /scan/locate`，**2026-10-15 新增**）
 //! - `transition.rs` —— 放回 / 送检（`POST /scan/worker-scan`）+ 手动 pick-up
 //!   （`POST /scan/batches/{batch_id}/pick-up`）
 //!
 //! ## 事务边界
 //! 写端点统一在 handler：`state.pool.begin()` → 传 `&mut tx` 给 service → 显式
 //! `tx.commit()`；提前 return（`?`）时 `Transaction` 的 Drop 自动回滚。
-//! 两条 list 端点是只读的，走 `pool.acquire()` 不开事务。
+//! 三条读端点（`pickable` / `held` / `locate`）是只读的，走 `pool.acquire()` 不开事务。
 //! 统一响应信封：`Result<Json<R<T>>, AppError>`。权限在 handler 与 service 双层守卫
 //! （`verify-badge` 例外：任意已登录用户可调，只有 `CurrentUser` extractor 一层）。
 
@@ -22,6 +23,7 @@ use crate::state::AppState;
 
 pub mod badge;
 pub mod listing;
+pub mod locate;
 pub mod transition;
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -31,8 +33,9 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/worker-scan", post(transition::worker_scan))
         .route("/pickable", get(listing::list_pickable))
         .route("/held", get(listing::list_held))
+        .route("/locate", get(locate::locate))
         // ---- 2 段：首段静态 `batches` + 动态 `{batch_id}` ----
-        // 本域只有这一条 2 段以上路由，与上面 4 条 1 段静态路由**段数不同** ⇒
+        // 本域只有这一条 2 段以上路由，与上面 5 条 1 段静态路由**段数不同** ⇒
         // `matchit` 结构上不可能冲突，注册顺序不影响结果（实测
         // `POST /scan/batches/pick-up` 与 `POST /scan/batches/1/pick-up` 都按
         // 本条命中）。将来新增 2 段首段动态路由时，静态组才必须在前（先例见

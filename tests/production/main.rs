@@ -26,6 +26,9 @@
 //!   pickable_by_work_type.rs 迁来，URL 与行 VO 一并换成 `ScanListItem`）
 //! - scan_worker_scan.rs       ← 2026-10-10 自 queue.rs 搬出 worker-scan 场景
 //!   （`POST /prod/scan/worker-scan`；refill 那一半仍留在 queue.rs）
+//! - scan_locate.rs            ← **2026-10-15 新增**（`prod::scan` 第 6 条端点
+//!   `GET /prod/scan/locate` 扫码找件 · 诊断；★ 核心回归是「action 决策表与写侧
+//!   守卫同源」—— 写侧会成功的绝不显示 NONE、会拒绝的绝不显示可点按钮）
 //! - pending_programming.rs     ← 2026-10-01 新增（prod::programming 待编程一览 1 端点，10 场景）
 //! - shelf_process.rs          ← 2026-10-02 新增（prod::shelf_process 3 端点；自
 //!   tests/shelf/api.rs 迁入整组替换场景 + 补全集查询 / 20505 / 旧路径 404 场景）
@@ -54,6 +57,7 @@ mod queue_board;
 mod queue_dispatch;
 mod scan_badge;
 mod scan_listing;
+mod scan_locate;
 mod scan_worker_scan;
 mod shelf_process;
 mod work_type;

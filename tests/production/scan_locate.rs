@@ -1,0 +1,976 @@
+//! `prod::scan` 扫码找件 · 诊断端点（`GET /prod/scan/locate`）集成测试
+//!
+//! 2026-10-15 新增（第 6 条端点，S1 只读诊断）。覆盖：
+//! - 命中 / 错误路径：未知序列号、空白序列号、**装配件序列号不回退**、未知工人、
+//!   停用工人；
+//! - 「无 `worker_id` ⇒ action / disabled_reason 均 null」的纯位置事实形态
+//!   （含终态批次）；
+//! - action 决策表（与写侧守卫同源的 16 个形态，逐条见各用例 doc）；
+//! - 字段契约（逐键 + 雪花 string + `chain_state` 三字面量）。
+//!
+//! ## fixture 复用
+//! 全部从 `super::queue` 借（`bootstrap_as_manager` / `insert_work_type` /
+//! `link_work_type_to_process` / `insert_worker` / `insert_worker_held_part` /
+//! `insert_pending_part_with_chain` / `insert_pool_part` / `append_chain_step` /
+//! `part_chain_id` / `insert_shelf` 等），不在本文件复制同款 fixture 避免漂移。
+//! 本文件独享的 raw SQL 构造（批次任意状态直插 / 外协公司 / shipment / 装配件）
+//! 按仓库惯例保留为本地 `async fn`。
+
+use axum::http::StatusCode;
+use serde_json::{Value, json};
+use sqlx::PgPool;
+
+use hsh_erp_test_support::fixture::PartFixture;
+use hsh_erp_test_support::{
+    ProductionFixture, json_request, load_production_fixture, login_token, pool_snowflake, send,
+    send_raw, test_app, test_pool, test_state,
+};
+
+use super::queue::{
+    append_chain_step, bootstrap_as_manager, insert_customer_l2, insert_pending_part_with_chain,
+    insert_pool_part, insert_work_type, insert_worker, insert_worker_held_part,
+    link_work_type_to_process, part_chain_id, seed_process,
+};
+
+/// locate 路径（测试 app 不带 `/api/v2`）。
+const LOCATE_URI: &str = "/prod/scan/locate";
+
+// ===========================================================================
+//  本 sub-file 独享 raw SQL 构造
+// ===========================================================================
+
+fn next_id() -> i64 {
+    pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .next_id()
+}
+
+/// 直插一条任意状态 / 位置 / 持有人的批次（诊断端点要覆盖全状态矩阵，
+/// `insert_pool_part` / `insert_worker_held_part` 只给两个固定形态）。
+#[allow(clippy::too_many_arguments)]
+async fn insert_batch(
+    pool: &PgPool,
+    part_id: i64,
+    batch_no: i32,
+    status: &str,
+    location: Option<&str>,
+    holder_id: Option<i64>,
+    process_id: Option<i64>,
+    step_id: Option<i64>,
+    quantity: i32,
+) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+    let id = next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
+         current_holder_id, current_process_id, current_process_step_id, version, \
+         created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, $10, $10)",
+    )
+    .bind(id)
+    .bind(part_id)
+    .bind(batch_no)
+    .bind(quantity)
+    .bind(status)
+    .bind(location)
+    .bind(holder_id)
+    .bind(process_id)
+    .bind(step_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_part_batch");
+    id
+}
+
+/// 把既有批次改成任意状态 / 位置 / 持有人（外协 / 品检 / 终态场景用；
+/// 只动状态列，不碰工序指针）。
+async fn force_batch_state(
+    pool: &PgPool,
+    batch_id: i64,
+    status: &str,
+    location: Option<&str>,
+    holder_id: Option<i64>,
+) {
+    sqlx::query(
+        "UPDATE t_part_batch SET status = $2, location = $3, current_holder_id = $4 \
+         WHERE id = $1",
+    )
+    .bind(batch_id)
+    .bind(status)
+    .bind(location)
+    .bind(holder_id)
+    .execute(pool)
+    .await
+    .expect("force batch state");
+}
+
+/// 直插一条外协公司。
+async fn insert_outsource_company(pool: &PgPool, name: &str) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+    let id = next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_outsource_company (id, name, is_active, version, created_at, updated_at) \
+         VALUES ($1, $2, true, 0, $3, $3)",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_outsource_company");
+    id
+}
+
+/// 直插一条开口（`OUTSOURCING`）外协 shipment；`quote_id` 不与任何行关联
+/// （表上无物理外键，本用例只读 `sent_at`）。
+async fn insert_open_shipment(
+    pool: &PgPool,
+    part_id: i64,
+    batch_id: i64,
+    company_id: i64,
+    process_id: i64,
+    sent_at: chrono::NaiveDateTime,
+) -> i64 {
+    let id = next_id();
+    sqlx::query(
+        "INSERT INTO t_outsource_shipment (id, quote_id, part_id, batch_id, \
+         outsource_company_id, process_id, quantity, unit_price, status, sent_at, \
+         created_by, updated_by) \
+         VALUES ($1, $2, $3, $4, $5, $6, 1, 1.00, 'OUTSOURCING', $7, 0, 0)",
+    )
+    .bind(id)
+    .bind(next_id())
+    .bind(part_id)
+    .bind(batch_id)
+    .bind(company_id)
+    .bind(process_id)
+    .bind(sent_at)
+    .execute(pool)
+    .await
+    .expect("insert t_outsource_shipment");
+    id
+}
+
+/// 直插一个带序列号的装配件（「不回退 t_assembly」用例要有一个真实可命中的
+/// assembly 行，才能证明 locate 是**刻意**不查它）。
+async fn insert_assembly(pool: &PgPool, customer_id: i64, serial_no: &str) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+    let id = next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_assembly (id, drawing_no, name, customer_id, request_date, \
+         planned_delivery_date, serial_no, version, created_at, updated_at) \
+         VALUES ($1, 'D-ASM', '装配件', $2, $3, $3, $4, 0, $5, $5)",
+    )
+    .bind(id)
+    .bind(customer_id)
+    .bind(now.date())
+    .bind(serial_no)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_assembly");
+    id
+}
+
+// ===========================================================================
+//  HTTP helper
+// ===========================================================================
+
+/// 打一次 locate（`worker_id` 传 `Some` 时附上字符串形态）。
+async fn locate(
+    app: &axum::Router,
+    token: &str,
+    serial_no: &str,
+    worker_id: Option<i64>,
+) -> (StatusCode, Value) {
+    let uri = match worker_id {
+        Some(w) => format!("{LOCATE_URI}?serial_no={serial_no}&worker_id={w}"),
+        None => format!("{LOCATE_URI}?serial_no={serial_no}"),
+    };
+    send(app.clone(), json_request("GET", &uri, None, Some(token))).await
+}
+
+/// 取响应里 `data.batches[0]`。
+fn first_batch(env: &Value) -> &Value {
+    env["data"]["batches"]
+        .as_array()
+        .and_then(|b| b.first())
+        .unwrap_or_else(|| panic!("响应缺 data.batches[0]: {env}"))
+}
+
+// ===========================================================================
+//  命中 / 错误路径
+// ===========================================================================
+
+/// 未知序列号 → `20101` / HTTP 404（不进 `t_assembly` 回退）。
+#[tokio::test]
+async fn locate_unknown_serial_returns_20101() {
+    let (_pool, app, token, _fx) = bootstrap_as_manager().await;
+    let (s, env) = locate(&app, &token, "SN-DOES-NOT-EXIST", None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{env}");
+    assert_eq!(env["code"], 20101);
+}
+
+/// `serial_no` trim 后为空 → 同样按未命中 `20101`（不是 400）。
+#[tokio::test]
+async fn locate_blank_serial_returns_20101() {
+    let (_pool, app, token, _fx) = bootstrap_as_manager().await;
+    // `%20%20` = 两个空格：走 trim 分支而不是「字段缺失」的 400
+    let (s, env) = locate(&app, &token, "%20%20", None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{env}");
+    assert_eq!(env["code"], 20101);
+}
+
+/// 装配件序列号**不回退 `t_assembly`**：即使 assembly 行真实存在也返 `20101`
+/// （报工台的找件对象始终是可作业的子件批次；口径差登记在 `docs/api/scan.md` §8）。
+#[tokio::test]
+async fn locate_assembly_serial_not_fallback_returns_20101() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    insert_assembly(&pool, fx.part_customer_l1_id, "ASM-LOCATE-1").await;
+    let (s, env) = locate(&app, &token, "ASM-LOCATE-1", None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{env}");
+    assert_eq!(env["code"], 20101, "locate 不得回退 t_assembly: {env}");
+}
+
+/// `worker_id` 查不到（不存在或已软删）→ `20201` / HTTP 404。
+#[tokio::test]
+async fn locate_unknown_worker_returns_20201() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "LOCATE-UNK-W").await;
+    let proc = seed_process(&pool, "LOC-UNK-W", "工序").await;
+    let (_part, _batch) = insert_pool_part(
+        &pool,
+        customer,
+        "SN-UNK-W",
+        PartFixture::PRODUCTION_SHELF_ID,
+        proc,
+        1,
+    )
+    .await;
+    let (s, env) = locate(&app, &token, "SN-UNK-W", Some(999_999_999)).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{env}");
+    assert_eq!(env["code"], 20201);
+}
+
+/// 工人存在但已停用 → `20202` / HTTP 400（与写路径对齐：诊断不能诊断出一个
+/// 「点了就会失败」的按钮）。
+#[tokio::test]
+async fn locate_inactive_worker_returns_20202() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "LOCATE-INACT").await;
+    let proc = seed_process(&pool, "LOC-INACT", "工序").await;
+    let wt = insert_work_type(&pool, "WT-INACT", "工种", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let worker = insert_worker(&pool, "BC-INACT", "停用工", Some(wt)).await;
+    sqlx::query("UPDATE t_worker SET is_active = false WHERE id = $1")
+        .bind(worker)
+        .execute(&pool)
+        .await
+        .expect("deactivate worker");
+    let (_part, _batch) = insert_pool_part(
+        &pool,
+        customer,
+        "SN-INACT",
+        PartFixture::PRODUCTION_SHELF_ID,
+        proc,
+        1,
+    )
+    .await;
+    let (s, env) = locate(&app, &token, "SN-INACT", Some(worker)).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{env}");
+    assert_eq!(env["code"], 20202);
+}
+
+/// 提取器层 rejection：`worker_id` 非数字（`abc`）/ 漏传 `serial_no`
+/// → `QueryRejection` 400 **纯文本**（不进 `R<T>` 信封）。
+///
+/// ⚠️ 这里是「非数字」而不是「发 JSON number」：query string 里所有值天然是
+/// 字符串，`worker_id=123` 会被 `deserialize_i64_opt` 正常解析成 `123`
+/// （本文件其余用例正是这么传的）；能触达 rejection 的只有**解析失败**与
+/// **必填字段缺失**两种。
+#[tokio::test]
+async fn locate_bad_query_returns_400_plain_text() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "LOCATE-NUM").await;
+    let proc = seed_process(&pool, "LOC-NUM", "工序").await;
+    let (_part, _batch) = insert_pool_part(
+        &pool,
+        customer,
+        "SN-NUM",
+        PartFixture::PRODUCTION_SHELF_ID,
+        proc,
+        1,
+    )
+    .await;
+    for uri in [
+        format!("{LOCATE_URI}?serial_no=SN-NUM&worker_id=abc"),
+        // 漏传必填的 serial_no
+        format!("{LOCATE_URI}?worker_id=123"),
+    ] {
+        let (s, body) = send_raw(app.clone(), json_request("GET", &uri, None, Some(&token))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{uri}: {body}");
+        assert!(
+            !body.starts_with('{'),
+            "应是不进信封的纯文本 400（{uri}），实得: {body}"
+        );
+    }
+}
+
+// ===========================================================================
+//  无 worker_id：纯位置事实
+// ===========================================================================
+
+/// 不传 `worker_id` ⇒ 全部批次的 `action` / `disabled_reason` 均为 `null`；
+/// 批次含**终态**（CANCELLED），并按 `batch_no ASC` 排序。
+#[tokio::test]
+async fn locate_returns_all_batches_including_terminal_with_null_action_when_no_worker() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "LOCATE-ALL").await;
+    let proc = seed_process(&pool, "LOC-ALL", "工序").await;
+    let worker = insert_worker(&pool, "BC-ALL", "工", None).await;
+    // 1 号批：IN_PROCESS+WORKER（正常持有），2 号批：CANCELLED（终态，仍要出现在结果里）
+    let (part, batch1, _step) =
+        insert_worker_held_part(&pool, customer, "SN-ALL", worker, proc, 2, true).await;
+    let batch2 = insert_batch(&pool, part, 2, "CANCELLED", None, None, None, None, 1).await;
+
+    let (s, env) = locate(&app, &token, "SN-ALL", None).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(env["code"], 0);
+    assert_eq!(env["data"]["part"]["id"], part.to_string());
+    assert_eq!(env["data"]["part"]["serial_no"], "SN-ALL");
+    assert_eq!(env["data"]["part"]["name"], "held-item");
+    assert_eq!(env["data"]["part"]["drawing_no"], "D-HELD");
+    let batches = env["data"]["batches"].as_array().expect("batches");
+    assert_eq!(batches.len(), 2, "含终态批次: {env}");
+    assert_eq!(batches[0]["batch_id"], batch1.to_string());
+    assert_eq!(batches[1]["batch_id"], batch2.to_string());
+    assert_eq!(batches[1]["status"], "CANCELLED");
+    for b in batches {
+        assert_eq!(b["action"], Value::Null, "未传 worker_id 时 action 恒 null");
+        assert_eq!(
+            b["disabled_reason"],
+            Value::Null,
+            "未传 worker_id 时 disabled_reason 恒 null"
+        );
+    }
+}
+
+// ===========================================================================
+//  action 决策表
+// ===========================================================================
+
+/// 架上批次（`IN_PROCESS + PRODUCTION_SHELF`）→ `PICK_UP`。
+#[tokio::test]
+async fn locate_shelf_batch_in_work_type_returns_pick_up() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "LOCATE-SHELF").await;
+    let proc = seed_process(&pool, "LOC-SHELF", "工序").await;
+    let wt = insert_work_type(&pool, "WT-SHELF", "工种", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let worker = insert_worker(&pool, "BC-SHELF", "工", Some(wt)).await;
+    insert_pool_part(
+        &pool,
+        customer,
+        "SN-SHELF",
+        PartFixture::PRODUCTION_SHELF_ID,
+        proc,
+        2,
+    )
+    .await;
+
+    let (s, env) = locate(&app, &token, "SN-SHELF", Some(worker)).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let b = first_batch(&env);
+    assert_eq!(b["action"], "PICK_UP");
+    assert_eq!(b["disabled_reason"], Value::Null);
+    assert_eq!(b["location"], "PRODUCTION_SHELF");
+}
+
+/// 架上批次的工序**不在**我工种映射里 → **仍是 `PICK_UP`**（写侧 pick-up 的
+/// IN_PROCESS 分支不校验工序归属，读侧也不许校验 —— 防「假阻挡」）。
+#[tokio::test]
+async fn locate_shelf_batch_outside_work_type_still_returns_pick_up() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "LOCATE-OUT-WT").await;
+    let proc_a = seed_process(&pool, "LOC-A", "工序A").await;
+    let proc_b = seed_process(&pool, "LOC-B", "工序B").await;
+    let wt = insert_work_type(&pool, "WT-OUT", "工种", Some(5)).await;
+    // 工种只映射 proc_b，批次当前工序是 proc_a
+    link_work_type_to_process(&pool, wt, proc_b).await;
+    let worker = insert_worker(&pool, "BC-OUT", "工", Some(wt)).await;
+    insert_pool_part(
+        &pool,
+        customer,
+        "SN-OUT-WT",
+        PartFixture::PRODUCTION_SHELF_ID,
+        proc_a,
+        1,
+    )
+    .await;
+
+    let (s, env) = locate(&app, &token, "SN-OUT-WT", Some(worker)).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let b = first_batch(&env);
+    assert_eq!(
+        b["action"], "PICK_UP",
+        "架上批次不许因工序不匹配假阻挡: {env}"
+    );
+    assert_eq!(b["disabled_reason"], Value::Null);
+}
+
+/// 件在我手上（`IN_PROCESS + WORKER` + holder==我）→ `MINE`，
+/// **且不受任何闸门影响**（本例工人甚至没绑工种）。
+#[tokio::test]
+async fn locate_held_by_me_returns_mine() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "LOCATE-MINE").await;
+    let proc = seed_process(&pool, "LOC-MINE", "工序").await;
+    // 刻意不绑工种：MINE 必须绕过 WORK_TYPE_NOT_SET
+    let worker = insert_worker(&pool, "BC-MINE", "工", None).await;
+    insert_worker_held_part(&pool, customer, "SN-MINE", worker, proc, 1, true).await;
+
+    let (s, env) = locate(&app, &token, "SN-MINE", Some(worker)).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let b = first_batch(&env);
+    assert_eq!(b["action"], "MINE");
+    assert_eq!(
+        b["disabled_reason"],
+        Value::Null,
+        "MINE 不受任何闸门影响: {env}"
+    );
+}
+
+/// 件在别的工人手上 → `TAKE_OVER`（单链 TAIL、推不出下一道 ⇒ 仅过容量闸门）。
+#[tokio::test]
+async fn locate_held_by_other_returns_take_over() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "LOCATE-TK").await;
+    let proc = seed_process(&pool, "LOC-TK", "工序").await;
+    let wt = insert_work_type(&pool, "WT-TK", "工种", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let holder = insert_worker(&pool, "BC-TK-H", "持有人", Some(wt)).await;
+    let other = insert_worker(&pool, "BC-TK-O", "接手人", Some(wt)).await;
+    insert_worker_held_part(&pool, customer, "SN-TK", holder, proc, 1, true).await;
+
+    let (s, env) = locate(&app, &token, "SN-TK", Some(other)).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let b = first_batch(&env);
+    assert_eq!(b["action"], "TAKE_OVER");
+    assert_eq!(b["disabled_reason"], Value::Null);
+}
+
+/// `TAKE_OVER` 的工序闸门：链 `NEXT` 且指针一致、推导出的下一道**不**在我工种
+/// 映射里 → `NONE + PROCESS_NOT_IN_WORK_TYPE`（对位写侧 S2 派生分支的 20104）。
+#[tokio::test]
+async fn locate_take_over_derived_next_not_in_work_type_returns_none_with_reason() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "LOCATE-TK-NEXT").await;
+    let proc1 = seed_process(&pool, "LOC-TK-1", "工序1").await;
+    let proc2 = seed_process(&pool, "LOC-TK-2", "工序2").await;
+    // 接手人只映射 proc1；链 [proc1, proc2] 的下一道 proc2 不在映射里
+    let wt = insert_work_type(&pool, "WT-TK-N", "工种", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc1).await;
+    let holder = insert_worker(&pool, "BC-TKN-H", "持有人", None).await;
+    let other = insert_worker(&pool, "BC-TKN-O", "接手人", Some(wt)).await;
+    let (part, _batch, _step) =
+        insert_worker_held_part(&pool, customer, "SN-TK-NEXT", holder, proc1, 1, true).await;
+    let chain = part_chain_id(&pool, part).await.expect("part 应有链");
+    append_chain_step(&pool, chain, proc2, 20).await;
+
+    let (s, env) = locate(&app, &token, "SN-TK-NEXT", Some(other)).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let b = first_batch(&env);
+    assert_eq!(b["chain_state"], "NEXT", "前置：链应推导出下一道: {env}");
+    assert_eq!(b["next_process_id"], proc2.to_string());
+    assert_eq!(b["action"], Value::Null);
+    assert_eq!(b["disabled_reason"], "PROCESS_NOT_IN_WORK_TYPE");
+}
+
+/// PENDING + 无链 → `PICK_UP`（链首判定不适用，仅过容量闸门）。
+#[tokio::test]
+async fn locate_pending_without_chain_returns_pick_up() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "LOCATE-P-NOCH").await;
+    let proc = seed_process(&pool, "LOC-P-NC", "工序").await;
+    let wt = insert_work_type(&pool, "WT-P-NC", "工种", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let worker = insert_worker(&pool, "BC-P-NC", "工", Some(wt)).await;
+    let (part, _batch, _steps) =
+        insert_pending_part_with_chain(&pool, customer, "SN-P-NOCH", &[proc]).await;
+    // 把工单的链解绑（模拟「手写工单没制定工艺链」的常态）
+    sqlx::query("UPDATE t_part SET process_chain_id = NULL WHERE id = $1")
+        .bind(part)
+        .execute(&pool)
+        .await
+        .expect("unbind chain");
+
+    let (s, env) = locate(&app, &token, "SN-P-NOCH", Some(worker)).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let b = first_batch(&env);
+    assert_eq!(b["status"], "PENDING");
+    assert_eq!(b["action"], "PICK_UP");
+    assert_eq!(b["disabled_reason"], Value::Null);
+}
+
+/// PENDING + 有链、链首 ∈ 我工种映射 → `PICK_UP`。
+#[tokio::test]
+async fn locate_pending_with_chain_head_in_work_type_returns_pick_up() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "LOCATE-P-OK").await;
+    let proc1 = seed_process(&pool, "LOC-P-1", "工序1").await;
+    let proc2 = seed_process(&pool, "LOC-P-2", "工序2").await;
+    let wt = insert_work_type(&pool, "WT-P-OK", "工种", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc1).await;
+    let worker = insert_worker(&pool, "BC-P-OK", "工", Some(wt)).await;
+    insert_pending_part_with_chain(&pool, customer, "SN-P-OK", &[proc1, proc2]).await;
+
+    let (s, env) = locate(&app, &token, "SN-P-OK", Some(worker)).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let b = first_batch(&env);
+    assert_eq!(b["action"], "PICK_UP");
+    assert_eq!(b["disabled_reason"], Value::Null);
+}
+
+/// PENDING + 有链、链首 ∉ 我工种映射 → `NONE + PROCESS_NOT_IN_WORK_TYPE`
+/// （对位写侧 S2 将加的 20104 闸门）。
+#[tokio::test]
+async fn locate_pending_with_chain_head_not_in_work_type_returns_none_with_reason() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "LOCATE-P-BAD").await;
+    let proc1 = seed_process(&pool, "LOC-P-B1", "工序1").await;
+    let proc2 = seed_process(&pool, "LOC-P-B2", "工序2").await;
+    // 工种只映射 proc2；链首是 proc1
+    let wt = insert_work_type(&pool, "WT-P-BAD", "工种", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc2).await;
+    let worker = insert_worker(&pool, "BC-P-BAD", "工", Some(wt)).await;
+    insert_pending_part_with_chain(&pool, customer, "SN-P-BAD", &[proc1, proc2]).await;
+
+    let (s, env) = locate(&app, &token, "SN-P-BAD", Some(worker)).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let b = first_batch(&env);
+    assert_eq!(b["action"], Value::Null);
+    assert_eq!(b["disabled_reason"], "PROCESS_NOT_IN_WORK_TYPE");
+}
+
+/// PENDING + 有链但**链内无活跃 step** → `NONE + PROCESS_CHAIN_STEP_NOT_FOUND`
+/// （对位写侧 20702：有链却无处可落）。
+#[tokio::test]
+async fn locate_pending_with_empty_chain_returns_none_with_step_not_found() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "LOCATE-P-EMPTY").await;
+    let proc = seed_process(&pool, "LOC-P-EM", "工序").await;
+    let wt = insert_work_type(&pool, "WT-P-EM", "工种", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let worker = insert_worker(&pool, "BC-P-EM", "工", Some(wt)).await;
+    // 空链：part 绑了链但链内一个 step 都没有
+    insert_pending_part_with_chain(&pool, customer, "SN-P-EMPTY", &[]).await;
+
+    let (s, env) = locate(&app, &token, "SN-P-EMPTY", Some(worker)).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let b = first_batch(&env);
+    assert_eq!(b["chain_state"], "NONE");
+    assert_eq!(b["action"], Value::Null);
+    assert_eq!(b["disabled_reason"], "PROCESS_CHAIN_STEP_NOT_FOUND");
+}
+
+/// 工人已持有数 ≥ 工种上限 → `NONE + WORKER_HOLD_LIMIT_EXCEEDED`（对位写侧 20204）。
+#[tokio::test]
+async fn locate_when_worker_full_returns_none_with_hold_limit_reason() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "LOCATE-FULL").await;
+    let proc = seed_process(&pool, "LOC-FULL", "工序").await;
+    let wt = insert_work_type(&pool, "WT-FULL", "工种", Some(1)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let worker = insert_worker(&pool, "BC-FULL", "工", Some(wt)).await;
+    // 工人已经拿满 1/1
+    insert_worker_held_part(&pool, customer, "SN-FULL-HELD", worker, proc, 1, true).await;
+    // 目标：另一件架上可领批次
+    insert_pool_part(
+        &pool,
+        customer,
+        "SN-FULL-TARGET",
+        PartFixture::PRODUCTION_SHELF_ID,
+        proc,
+        1,
+    )
+    .await;
+
+    let (s, env) = locate(&app, &token, "SN-FULL-TARGET", Some(worker)).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let b = first_batch(&env);
+    assert_eq!(b["action"], Value::Null);
+    assert_eq!(b["disabled_reason"], "WORKER_HOLD_LIMIT_EXCEEDED");
+}
+
+/// 工种未配 `max_held_batches`（`NULL` = 未配置）→ `NONE + WORK_TYPE_MAX_HELD_NOT_SET`
+/// （对位写侧 20904）。
+#[tokio::test]
+async fn locate_when_work_type_max_not_set_returns_none_with_reason() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "LOCATE-NO-MAX").await;
+    let proc = seed_process(&pool, "LOC-NM", "工序").await;
+    let wt = insert_work_type(&pool, "WT-NM", "工种", None).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let worker = insert_worker(&pool, "BC-NM", "工", Some(wt)).await;
+    insert_pool_part(
+        &pool,
+        customer,
+        "SN-NO-MAX",
+        PartFixture::PRODUCTION_SHELF_ID,
+        proc,
+        1,
+    )
+    .await;
+
+    let (s, env) = locate(&app, &token, "SN-NO-MAX", Some(worker)).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let b = first_batch(&env);
+    assert_eq!(b["action"], Value::Null);
+    assert_eq!(b["disabled_reason"], "WORK_TYPE_MAX_HELD_NOT_SET");
+}
+
+/// 工人未绑工种 → 除 `MINE` 外一切可行动作落 `NONE + WORK_TYPE_NOT_SET`。
+#[tokio::test]
+async fn locate_worker_without_work_type_returns_none_with_reason() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "LOCATE-NO-WT").await;
+    let proc = seed_process(&pool, "LOC-NW", "工序").await;
+    let worker = insert_worker(&pool, "BC-NW", "工", None).await;
+    insert_pool_part(
+        &pool,
+        customer,
+        "SN-NO-WT",
+        PartFixture::PRODUCTION_SHELF_ID,
+        proc,
+        1,
+    )
+    .await;
+
+    let (s, env) = locate(&app, &token, "SN-NO-WT", Some(worker)).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let b = first_batch(&env);
+    assert_eq!(b["action"], Value::Null);
+    assert_eq!(b["disabled_reason"], "WORK_TYPE_NOT_SET");
+}
+
+/// 外协批次（`OUTSOURCE + OUTSOURCE_COMPANY`、无链）→ `RECEIVE_FROM_OUTSOURCE`，
+/// 且 `company_name` / `sent_at` 带上在途公司与开口 shipment 的发出时间。
+#[tokio::test]
+async fn locate_outsource_batch_returns_receive_action_with_company_and_sent_at() {
+    use chrono::NaiveDate;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "LOCATE-OS").await;
+    let proc = seed_process(&pool, "LOC-OS", "工序").await;
+    let wt = insert_work_type(&pool, "WT-OS", "工种", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let worker = insert_worker(&pool, "BC-OS", "工", Some(wt)).await;
+    let company = insert_outsource_company(&pool, "外协公司-甲").await;
+    let (part, batch, _step) =
+        insert_worker_held_part(&pool, customer, "SN-OS", worker, proc, 1, false).await;
+    force_batch_state(
+        &pool,
+        batch,
+        "OUTSOURCE",
+        Some("OUTSOURCE_COMPANY"),
+        Some(company),
+    )
+    .await;
+    let sent_at = NaiveDate::from_ymd_opt(2026, 6, 1)
+        .unwrap()
+        .and_hms_opt(8, 30, 0)
+        .unwrap();
+    insert_open_shipment(&pool, part, batch, company, proc, sent_at).await;
+
+    let (s, env) = locate(&app, &token, "SN-OS", Some(worker)).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let b = first_batch(&env);
+    assert_eq!(b["action"], "RECEIVE_FROM_OUTSOURCE");
+    assert_eq!(b["disabled_reason"], Value::Null);
+    assert_eq!(b["company_name"], "外协公司-甲");
+    assert_eq!(b["holder_display"], "外协公司-甲");
+    assert_eq!(
+        b["sent_at"],
+        serde_json::to_value(sent_at).unwrap(),
+        "sent_at 必须是开口 shipment 的发出时间: {env}"
+    );
+}
+
+/// 外协批次 + 有链且 `NEXT`、推导出的下一道 ∉ 我工种映射
+/// → `NONE + PROCESS_NOT_IN_WORK_TYPE`（对位 S3 写侧将加的闸门）。
+#[tokio::test]
+async fn locate_outsource_chain_next_not_in_work_type_returns_none_with_reason() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "LOCATE-OS-NEXT").await;
+    let proc1 = seed_process(&pool, "LOC-OS-1", "工序1").await;
+    let proc2 = seed_process(&pool, "LOC-OS-2", "工序2").await;
+    let wt = insert_work_type(&pool, "WT-OS-N", "工种", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc1).await;
+    let worker = insert_worker(&pool, "BC-OS-N", "工", Some(wt)).await;
+    let company = insert_outsource_company(&pool, "外协公司-乙").await;
+    // 有链 [proc1, proc2]、批次当前工序 proc1 + 指针一致 ⇒ NEXT
+    let (part, batch, _step) =
+        insert_worker_held_part(&pool, customer, "SN-OS-NEXT", worker, proc1, 1, true).await;
+    let chain = part_chain_id(&pool, part).await.expect("part 应有链");
+    append_chain_step(&pool, chain, proc2, 20).await;
+    force_batch_state(
+        &pool,
+        batch,
+        "OUTSOURCE",
+        Some("OUTSOURCE_COMPANY"),
+        Some(company),
+    )
+    .await;
+
+    let (s, env) = locate(&app, &token, "SN-OS-NEXT", Some(worker)).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let b = first_batch(&env);
+    assert_eq!(b["chain_state"], "NEXT", "前置：链应推导出下一道: {env}");
+    assert_eq!(b["action"], Value::Null);
+    assert_eq!(b["disabled_reason"], "PROCESS_NOT_IN_WORK_TYPE");
+}
+
+/// 外协批次 + 有链但推导不出 `NEXT`（当前工序已被清空）
+/// → `NONE + PROCESS_CHAIN_REQUIRED`（对位写侧 20706）。
+#[tokio::test]
+async fn locate_outsource_chain_without_position_returns_none_with_chain_required() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "LOCATE-OS-NOPOS").await;
+    let proc = seed_process(&pool, "LOC-OS-NP", "工序").await;
+    let wt = insert_work_type(&pool, "WT-OS-NP", "工种", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let worker = insert_worker(&pool, "BC-OS-NP", "工", Some(wt)).await;
+    let company = insert_outsource_company(&pool, "外协公司-丙").await;
+    let (part, batch, _step) =
+        insert_worker_held_part(&pool, customer, "SN-OS-NOPOS", worker, proc, 1, true).await;
+    force_batch_state(
+        &pool,
+        batch,
+        "OUTSOURCE",
+        Some("OUTSOURCE_COMPANY"),
+        Some(company),
+    )
+    .await;
+    // 出池清工序不变式：外协批次的当前工序与 step 指针都为 NULL
+    sqlx::query(
+        "UPDATE t_part_batch SET current_process_id = NULL, current_process_step_id = NULL \
+         WHERE id = $1",
+    )
+    .bind(batch)
+    .execute(&pool)
+    .await
+    .expect("clear process columns");
+    // 前置：工单仍然绑着链
+    assert!(part_chain_id(&pool, part).await.is_some());
+
+    let (s, env) = locate(&app, &token, "SN-OS-NOPOS", Some(worker)).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let b = first_batch(&env);
+    assert_eq!(b["chain_state"], "NONE");
+    assert_eq!(b["action"], Value::Null);
+    assert_eq!(b["disabled_reason"], "PROCESS_CHAIN_REQUIRED");
+}
+
+/// 品检中批次 → `NONE + INSPECTION`（指引找品检）。
+#[tokio::test]
+async fn locate_inspection_batch_returns_none_inspection_reason() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "LOCATE-INSP").await;
+    let proc = seed_process(&pool, "LOC-INSP", "工序").await;
+    let wt = insert_work_type(&pool, "WT-INSP", "工种", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let worker = insert_worker(&pool, "BC-INSP", "工", Some(wt)).await;
+    let (_part, batch, _step) =
+        insert_worker_held_part(&pool, customer, "SN-INSP", worker, proc, 1, true).await;
+    force_batch_state(&pool, batch, "INSPECTION", Some("INSPECTION_SHELF"), None).await;
+
+    let (s, env) = locate(&app, &token, "SN-INSP", Some(worker)).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let b = first_batch(&env);
+    assert_eq!(b["status"], "INSPECTION");
+    assert_eq!(b["action"], Value::Null);
+    assert_eq!(b["disabled_reason"], "INSPECTION");
+}
+
+/// 终态批次（CANCELLED）→ `NONE + TERMINAL`。
+#[tokio::test]
+async fn locate_terminal_batch_returns_none_terminal_reason() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "LOCATE-TERM").await;
+    let proc = seed_process(&pool, "LOC-TERM", "工序").await;
+    let wt = insert_work_type(&pool, "WT-TERM", "工种", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let worker = insert_worker(&pool, "BC-TERM", "工", Some(wt)).await;
+    let (part, _batch, _step) =
+        insert_worker_held_part(&pool, customer, "SN-TERM", worker, proc, 1, true).await;
+    insert_batch(&pool, part, 2, "CANCELLED", None, None, None, None, 1).await;
+
+    let (s, env) = locate(&app, &token, "SN-TERM", Some(worker)).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let batches = env["data"]["batches"].as_array().expect("batches");
+    let cancelled = batches
+        .iter()
+        .find(|b| b["status"] == "CANCELLED")
+        .expect("应有 CANCELLED 行");
+    assert_eq!(cancelled["action"], Value::Null);
+    assert_eq!(cancelled["disabled_reason"], "TERMINAL");
+}
+
+/// 待编程批次 → `NONE + PROGRAMMING`（指引找 CNC 编程）。
+#[tokio::test]
+async fn locate_programming_batch_returns_none_programming_reason() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "LOCATE-PROG").await;
+    let proc = seed_process(&pool, "LOC-PROG", "工序").await;
+    let wt = insert_work_type(&pool, "WT-PROG", "工种", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let worker = insert_worker(&pool, "BC-PROG", "工", Some(wt)).await;
+    let (_part, batch, _step) =
+        insert_worker_held_part(&pool, customer, "SN-PROG", worker, proc, 1, true).await;
+    force_batch_state(&pool, batch, "PROGRAMMING", None, None).await;
+
+    let (s, env) = locate(&app, &token, "SN-PROG", Some(worker)).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let b = first_batch(&env);
+    assert_eq!(b["status"], "PROGRAMMING");
+    assert_eq!(b["action"], Value::Null);
+    assert_eq!(b["disabled_reason"], "PROGRAMMING");
+}
+
+// ===========================================================================
+//  字段契约
+// ===========================================================================
+
+/// 逐键断言 `LocatePartBrief` / `LocateBatchItem` 的全部键 + 雪花 id 的
+/// string 形态 + `chain_state` 的三个字面量全部可达（NONE / TAIL / NEXT）。
+#[tokio::test]
+async fn locate_field_contract_pins_every_key() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "LOCATE-KEYS").await;
+    let proc1 = seed_process(&pool, "LOC-K1", "工序1").await;
+    let proc2 = seed_process(&pool, "LOC-K2", "工序2").await;
+    let wt = insert_work_type(&pool, "WT-KEYS", "工种", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc1).await;
+    let worker = insert_worker(&pool, "BC-KEYS", "工", Some(wt)).await;
+
+    // 三形态：NONE（清掉 step 指针）/ TAIL（单链）/ NEXT（双链且当前在第一道）
+    let (part_none, batch_none, _s1) =
+        insert_worker_held_part(&pool, customer, "SN-KEYS-NONE", worker, proc1, 1, true).await;
+    // ⚠️ fixture 的 `with_chain=false` 会留下**孤儿链 + step 指针**，而链位置派生的
+    // 锚链是 `COALESCE(p.process_chain_id, cur.chain_id)`（回退到指针所属链）⇒ 那样
+    // 反而得 TAIL。真正的 `NONE` 形态是「指针为 NULL」：清掉它。
+    sqlx::query("UPDATE t_part_batch SET current_process_step_id = NULL WHERE id = $1")
+        .bind(batch_none)
+        .execute(&pool)
+        .await
+        .expect("clear step pointer");
+    let (_part_tail, batch_tail, _s2) =
+        insert_worker_held_part(&pool, customer, "SN-KEYS-TAIL", worker, proc1, 1, true).await;
+    let (part_next, batch_next, _s3) =
+        insert_worker_held_part(&pool, customer, "SN-KEYS-NEXT", worker, proc1, 1, true).await;
+    let chain_next = part_chain_id(&pool, part_next).await.expect("part 应有链");
+    append_chain_step(&pool, chain_next, proc2, 20).await;
+
+    // ---- 逐键断言（取无链那一件，action 非空也要逐键出现）----
+    let (s, env) = locate(&app, &token, "SN-KEYS-NONE", Some(worker)).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(env["data"]["part"]["id"], part_none.to_string());
+    assert_eq!(env["data"]["part"]["serial_no"], "SN-KEYS-NONE");
+    assert_eq!(env["data"]["part"]["name"], "held-item");
+    assert_eq!(env["data"]["part"]["drawing_no"], "D-HELD");
+    assert_eq!(env["data"]["part"]["is_urgent"], false);
+    assert!(env["data"]["part"]["planned_delivery_date"].is_string());
+    // fixture（`insert_worker_held_part`）把系统交期写成当天 ⇒ 非 null
+    assert!(env["data"]["part"]["system_delivery_date"].is_string());
+    let mut part_keys: Vec<&str> = env["data"]["part"]
+        .as_object()
+        .expect("part 是对象")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    part_keys.sort_unstable();
+    assert_eq!(
+        part_keys,
+        [
+            "drawing_no",
+            "id",
+            "is_urgent",
+            "name",
+            "planned_delivery_date",
+            "serial_no",
+            "system_delivery_date",
+        ],
+        "LocatePartBrief 字段集变了（同步前端 schema）: {env}"
+    );
+
+    let b = first_batch(&env);
+    assert_eq!(b["batch_id"], batch_none.to_string());
+    assert_eq!(b["batch_no"], 1);
+    assert_eq!(b["quantity"], 1);
+    assert_eq!(b["status"], "IN_PROCESS");
+    assert_eq!(b["version"], 0);
+    assert_eq!(b["location"], "WORKER");
+    assert_eq!(b["holder_display"], "工");
+    assert_eq!(b["current_process_name"], "工序1");
+    assert_eq!(b["chain_state"], "NONE");
+    assert_eq!(b["next_process_id"], Value::Null);
+    assert_eq!(b["next_process_name"], Value::Null);
+    assert!(b["updated_at"].is_string());
+    assert_eq!(b["company_name"], Value::Null);
+    assert_eq!(b["sent_at"], Value::Null);
+    assert_eq!(b["action"], "MINE");
+    assert_eq!(b["disabled_reason"], Value::Null);
+    let mut item_keys: Vec<&str> = b
+        .as_object()
+        .expect("batch 行是对象")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    item_keys.sort_unstable();
+    assert_eq!(
+        item_keys,
+        [
+            "action",
+            "batch_id",
+            "batch_no",
+            "chain_state",
+            "company_name",
+            "current_process_name",
+            "disabled_reason",
+            "holder_display",
+            "location",
+            "next_process_id",
+            "next_process_name",
+            "quantity",
+            "sent_at",
+            "status",
+            "updated_at",
+            "version",
+        ],
+        "LocateBatchItem 字段集变了（同步前端 schema）: {env}"
+    );
+
+    // ---- chain_state 三字面量全部可达 ----
+    let mut seen = Vec::new();
+    for (serial, batch_id) in [
+        ("SN-KEYS-NONE", batch_none),
+        ("SN-KEYS-TAIL", batch_tail),
+        ("SN-KEYS-NEXT", batch_next),
+    ] {
+        let (s, env) = locate(&app, &token, serial, Some(worker)).await;
+        assert_eq!(s, StatusCode::OK, "{serial}: {env}");
+        let b = first_batch(&env);
+        assert_eq!(b["batch_id"], batch_id.to_string());
+        seen.push(b["chain_state"].as_str().unwrap_or_default().to_string());
+    }
+    seen.sort();
+    assert_eq!(
+        seen,
+        ["NEXT", "NONE", "TAIL"],
+        "三字面量必须都可达: {seen:?}"
+    );
+}

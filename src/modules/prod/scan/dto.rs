@@ -55,6 +55,22 @@ pub struct HeldQuery {
     pub offset: Option<i64>,
 }
 
+/// `GET /api/v2/prod/scan/locate` 查询参数（2026-10-15 新增，扫码找件 · 诊断端点）。
+///
+/// - `serial_no` **必填**（图纸序列号）。缺省 → axum `QueryRejection` →
+///   **HTTP 400 纯文本**；`trim()` 后为空串由 service 按「未命中」处理（`20101`）。
+/// - `worker_id` **可选**：传了才计算可行动作 `action` / 失败原因
+///   `disabled_reason`（针对该工人的可行动作），不传则两者恒 `null`（纯位置事实）。
+///   线上形态是 **JSON 字符串**（`deserialize_i64_opt` 只吃 `str`，与同域
+///   `HeldQuery.worker_id` / `PickUpRequest.quantity` 同款）；发数字 →
+///   `QueryRejection` → **HTTP 400 纯文本**。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LocateQuery {
+    pub serial_no: String,
+    #[serde(default, deserialize_with = "deserialize_i64_opt")]
+    pub worker_id: Option<i64>,
+}
+
 /// worker-scan 的动作类型（`RETURNED` 放回 / `INSPECTED` 直接送检）。
 ///
 /// 2026-10-10 自 `prod::queue::dto` 搬来 —— 它是 `WorkerScanRequest` 的入参枚举，

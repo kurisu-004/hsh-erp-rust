@@ -1,26 +1,32 @@
-//! prod::scan 报工台两条只读聚合端点的取行 SQL + 行投影
+//! prod::scan 报工台只读聚合端点的取行 SQL + 行投影
 //!
 //! 2026-10-10 自 `part::service::phase1::work_type` 逐字搬来（只改返回类型与
-//! 参数形态）。
+//! 参数形态）；2026-10-15 `locate`（扫码找件 · 诊断）迁入本子模块，三条端点共用
+//! 一份「零跨域依赖」纪律。
 //!
-//! ## 两条端点
+//! ## 三条端点
 //! - `pickable` —— `GET /api/v2/prod/scan/pickable?work_type_id=&limit=&offset=`
 //! - `held` —— `GET /api/v2/prod/scan/held?worker_id=&limit=&offset=`
+//! - `locate` —— `GET /api/v2/prod/scan/locate?serial_no=&worker_id=`（**2026-10-15
+//!   新增**：扫图纸序列号 → 该 part 全部批次的位置事实 + 针对指定工人的动作诊断）
 //!
 //! ## 为什么这个目录必须零跨域依赖
 //!
 //! 本文件是纯只读聚合：取行 SQL 只碰 `t_part` / `t_part_batch` /
 //! `t_work_type_process` / `t_shelf` / `t_process` / `t_process_chain` /
-//! `t_process_chain_step`，一处他域的 service / repo 都不 import。守护这条规则的
-//! 是 [`super`] 模块 doc 里提到的域隔离护栏（`listing/mod.rs` 的 `mod tests`）。
+//! `t_process_chain_step`，2026-10-15 起 `locate` 另加 `t_worker` / `t_work_type`
+//! （工人 + 工种容量上限）与 `t_outsource_company` / `t_outsource_shipment`
+//! （外协在途公司与发出时间），一处他域的 service / repo 都不 import。守护这条
+//! 规则的，是 [`super`] 模块 doc 里提到的域隔离护栏（`listing/mod.rs` 的
+//! `mod tests`）。
 //!
 //! 这也是它**不能**借 `PartRepoTrait` 的原因 —— 那是一个 part 域的胖 trait，
 //! import 它就等于把 part 域拖进来。本模块直接收 `&mut PgConnection`。
 
-use chrono::NaiveDate;
+use chrono::{NaiveDate, NaiveDateTime};
 use sqlx::PgConnection;
 
-use crate::modules::prod::scan::vo::{ScanChainState, ScanListItem};
+use crate::modules::prod::scan::vo::{LocatePartBrief, ScanChainState, ScanListItem};
 
 /// 报工台两条 list 端点共用的取行投影。
 ///
@@ -445,4 +451,293 @@ impl ScanListingRepo {
         .await
         .map(|opt| opt.unwrap_or(0))
     }
+
+    // =====================================================================
+    //  locate —— GET /api/v2/prod/scan/locate（2026-10-15 新增）
+    //
+    //  固定 4 条 SQL 以内（与 part 的批次数 / 工人数无关）：
+    //    1. fetch_locate_part   —— 按 serial_no 命中工单（未命中 ⇒ service 返 20101）
+    //    2. fetch_locate_worker —— 工人 active / work_type / 工种容量上限（仅传了
+    //       `worker_id` 时执行）
+    //    3. count_held          —— 「该工人当前持有」的容量计数（**复用 `/held` 的
+    //       同一条 SQL**，谓词 = 写侧 `ensure_worker_has_capacity` 的同一判据）
+    //    4. fetch_locate_batches—— 取行（一条 SQL 把位置 / 链位置 / 工种映射 /
+    //       外协在途全链 JOIN 完，不按行数重复查）
+    // =====================================================================
+
+    /// `GET /scan/locate` 的工单命中（`serial_no` 唯一化 + 软删闸门）。
+    ///
+    /// ⚠️ **只查 `t_part`，不回退 `t_assembly`**（与 `prod::inspection` 的扫码树
+    /// 口径**有意分叉**）：报工台的「找件」对象始终是**可作业的子件批次**，装配件
+    /// 序列号本身没有批次。未命中的文案在 service 层提示「如为装配件，请扫子件序列
+    /// 号」。该分叉登记在 `docs/api/scan.md` §8。
+    ///
+    /// ⚠️ `t_part.serial_no` **不是全量唯一**：`uk_t_part_serial_no` 是部分唯一索引
+    /// （`WHERE serial_no IS NOT NULL AND deleted_at IS NULL AND status <>
+    /// 'CANCELLED'`），故「已取消工单 + 同号重建」可以同号并存。`ORDER BY
+    /// (status = 'CANCELLED') ASC, id DESC LIMIT 1` 与 `prod::inspection` 的
+    /// `find_part_by_serial` 同款：取消行排最后、其余按主键取新 —— 两处口径一致，
+    /// 且已取消工单**照样能扫到**（不做 `status <> 'CANCELLED'` 过滤）。
+    pub(crate) async fn fetch_locate_part(
+        conn: &mut PgConnection,
+        serial_no: &str,
+    ) -> Result<Option<LocatePartRow>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT id, serial_no, name, drawing_no, is_urgent, \
+                    planned_delivery_date, system_delivery_date \
+             FROM t_part \
+             WHERE serial_no = $1 AND deleted_at IS NULL \
+             ORDER BY (status = 'CANCELLED') ASC, id DESC \
+             LIMIT 1",
+        )
+        .bind(serial_no)
+        .fetch_optional(conn)
+        .await
+    }
+
+    /// `GET /scan/locate` 的工人上下文：`is_active` + `work_type_id` +
+    /// 工种容量上限（`t_worker LEFT JOIN t_work_type`，一条 SQL 出）。
+    ///
+    /// ⚠️ **必须裸写这条 SQL，不许 import `prod::worker` / `prod::work_type` /
+    /// `prod::queue` 的 repo**：本目录受域隔离护栏扫（读他域的表是允许的既定
+    /// pattern，import 他域的符号才违规）。谓词与 `prod::worker::service` 的
+    /// `get_worker`（存在性）/ `pick_up` 的 worker 校验（`is_active` +
+    /// `work_type_id`）**逐条同形**：都只过滤 `deleted_at`。
+    ///
+    /// `max_held_batches` 走 LEFT JOIN 且**不 COALESCE、不筛 `deleted_at`**：
+    /// 本行只向 service 递「原始事实」，`NULL` = 未配置的语义由 service 的容量
+    /// 闸门（`WORK_TYPE_MAX_HELD_NOT_SET`）表达。与 `fetch_max_held_batches` 的
+    /// `COALESCE(..., 0)` 是**两种不同出参口径**（那边是展示值，缺省发 0；这边
+    /// 是闸门判据，缺省必须保持可区分）—— 不要为「统一」把这条也 COALESCE 成 0。
+    ///
+    /// 注意 `fetch_optional` + service 映射 `20201`：**查不到（含已软删）**返
+    /// `None`，与 `/held` 的「查不到返空列表」刻意不同 —— 这是诊断端点，工人写错
+    /// 工牌必须显式报错而不是假装「他一件也没拿」。
+    pub(crate) async fn fetch_locate_worker(
+        conn: &mut PgConnection,
+        worker_id: i64,
+    ) -> Result<Option<LocateWorkerRow>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT w.is_active, w.work_type_id, wt.max_held_batches \
+             FROM t_worker w \
+             LEFT JOIN t_work_type wt ON wt.id = w.work_type_id \
+             WHERE w.id = $1 AND w.deleted_at IS NULL",
+        )
+        .bind(worker_id)
+        .fetch_optional(conn)
+        .await
+    }
+
+    /// `GET /scan/locate` 的批次取行：该 part 的**全部未软删批次**（含终态），
+    /// `ORDER BY batch_no ASC, pb.id ASC`。
+    ///
+    /// ## 一条 SQL 交出的原始事实
+    ///
+    /// - **位置**：`location` / `current_holder_id` + 三表 `COALESCE` 的
+    ///   `holder_display`（见下方多态歧义登记）；
+    /// - **链位置**：`CHAIN_POSITION_LATERAL_SQL`（读写共用片段，别名 `p` / `pb`）
+    ///   派生的 `chain_state` / `next_process_id` + 外层 `LEFT JOIN t_process np`
+    ///   取的下一道工序名（与 held 侧同一套「片段导 id、外层取名」写法与软删
+    ///   闸门纪律）；
+    /// - **`pointer_consistent`**：写侧 `ChainPosition::is_pointer_consistent`
+    ///   的纯 SQL 表达 —— 「锚链内按 `current_process_id` 唯一定位到的 step 就是
+    ///   批次指针指向的 step」。它是 **`Option<bool>`**：`nx.current_step_id =
+    ///   pb.current_process_step_id` 在「指针为 NULL」时为 SQL NULL（三值逻辑），
+    ///   非可空 `bool` 解码会 500 ⇒ 由转换侧 `unwrap_or(false)` 落保守值。
+    ///   仅供 service 的 action 判定消费，**不出现在响应里**；
+    /// - **`has_process_chain`**：`HAS_PROCESS_CHAIN_EXPR` 原样投影（held 同款
+    ///   消费方式，`Option<bool>` 安全网同因）；`locate` 只用它判 PENDING 的
+    ///   「链内有没有可落的 step」；
+    /// - **PENDING 的链首**：`head` LATERAL 取链内第一个未软删 step
+    ///   （`ORDER BY sort_order ASC, id ASC LIMIT 1`），配 `$2`（工种 id）的
+    ///   `EXISTS t_work_type_process` 直接判「链首是否命中该工种的活跃映射」；
+    /// - **外协在途**：`company_name` = 持有人公司行名（**仅 `status='OUTSOURCE'`
+    ///   时投影**，非外协批次恒 NULL）；`sent_at` = 该批次开口 shipment 的发出
+    ///   时间（`LEFT JOIN LATERAL … status='OUTSOURCING' ORDER BY sent_at DESC,
+    ///   id DESC LIMIT 1`，同样仅外协批次投影）。
+    ///
+    /// ## ⚠️ 已知缺陷：holder 三表 COALESCE 的多态歧义（**全仓第 7 处**）
+    ///
+    /// `holder_display` 沿用 `COALESCE(sh.name, w.name, oc.name)`（`t_shelf` /
+    /// `t_worker` / `t_outsource_company` 三张表各 LEFT JOIN 一次），该写法
+    /// **假定** holder id 在三表 PK 空间里互不重叠；一旦某 id 同时命中其中两表，
+    /// 取到的是 `t_shelf.name`。登记写法与不修理由**逐条沿用**
+    /// `prod::inspection::repo` 的「holder 三表 COALESCE 的多态歧义」一节（全仓
+    /// 该形态的逐处清单见 [`crate::modules::prod::inspection`] 与
+    /// `prod::batch::repo::queries` 的说明）：修这一处会让同一 holder 在不同端点
+    /// 显示不同名字，**必须全部一起改**，属独立改动；本次刻意不修。
+    ///
+    /// 三个 JOIN **不过滤 `deleted_at`**：holder 名是「被软删也照常显示最后的样子」
+    /// 的展示信息（与 `prod::batch::repo::queries::list_active_by_part_id_with_holder`
+    /// 同款），与 `t_process` 两处 JOIN 的软删闸门**刻意不同**（工序名消失比
+    /// holder 名消失信息量大）。外协两列（`company_name` / `sent_at`）的投影谓词
+    /// 见上。
+    ///
+    /// ## 其余纪律
+    ///
+    /// - `p.serial_no` 等可空列一律 `Option` 解码（同 `WorkTypeListRow`）；
+    /// - `LEFT JOIN t_process_chain_step cs` 是 `HAS_PROCESS_CHAIN_EXPR` 的
+    ///   契约要求（表达式引用 `cs.process_id`）；列表一律 LEFT JOIN，INNER 会让
+    ///   无 step 指针的批次从结果里消失；
+    /// - `$2` 是**工种 id**（可为 NULL，未传 `worker_id` / 工人未绑工种时）：
+    ///   `wtp.work_type_id = NULL` 恒假 ⇒ 两个 EXISTS 投影 false，service 不会在
+    ///   这些形态下消费它们；
+    /// - **注入面为 0**：`format!` 只填 `HAS_PROCESS_CHAIN_EXPR` 与
+    ///   `CHAIN_POSITION_LATERAL_SQL` 两个编译期常量，`part_id` / `work_type_id`
+    ///   走 bind，`AssertSqlSafe` 安全。
+    pub(crate) async fn fetch_locate_batches(
+        conn: &mut PgConnection,
+        part_id: i64,
+        work_type_id: Option<i64>,
+    ) -> Result<Vec<LocateBatchRow>, sqlx::Error> {
+        let sql = format!(
+            "SELECT pb.id AS batch_id, pb.batch_no, pb.quantity, pb.status, pb.version, \
+                    pb.location, pb.current_holder_id, \
+                    COALESCE(sh.name, w.name, oc.name) AS holder_display, \
+                    cp.name AS current_process_name, \
+                    COALESCE(nx.chain_state, 'NONE') AS chain_state, \
+                    nx.next_process_id, np.name AS next_process_name, \
+                    pb.updated_at, \
+                    CASE WHEN pb.status = 'OUTSOURCE' THEN oc.name END AS company_name, \
+                    CASE WHEN pb.status = 'OUTSOURCE' THEN ship.sent_at END AS sent_at, \
+                    (p.process_chain_id IS NOT NULL) AS has_chain, \
+                    {} AS has_process_chain, \
+                    (nx.current_step_id IS NOT NULL \
+                     AND nx.current_step_id = pb.current_process_step_id) AS pointer_consistent, \
+                    EXISTS (SELECT 1 FROM t_work_type_process wtp \
+                            WHERE wtp.work_type_id = $2 \
+                              AND wtp.process_id = head.head_process_id \
+                              AND wtp.deleted_at IS NULL) AS chain_head_in_work_type, \
+                    EXISTS (SELECT 1 FROM t_work_type_process wtp2 \
+                            WHERE wtp2.work_type_id = $2 \
+                              AND wtp2.process_id = nx.next_process_id \
+                              AND wtp2.deleted_at IS NULL) AS next_process_in_work_type \
+             FROM t_part_batch pb \
+             JOIN t_part p ON p.id = pb.part_id \
+             LEFT JOIN t_shelf sh ON sh.id = pb.current_holder_id \
+             LEFT JOIN t_worker w ON w.id = pb.current_holder_id \
+             LEFT JOIN t_outsource_company oc ON oc.id = pb.current_holder_id \
+             LEFT JOIN t_process_chain_step cs \
+               ON cs.id = pb.current_process_step_id AND cs.deleted_at IS NULL \
+             LEFT JOIN LATERAL ( {} ) nx ON TRUE \
+             LEFT JOIN t_process cp \
+               ON cp.id = pb.current_process_id AND cp.deleted_at IS NULL \
+             LEFT JOIN t_process np \
+               ON np.id = nx.next_process_id AND np.deleted_at IS NULL \
+             LEFT JOIN LATERAL ( \
+               SELECT csh.process_id AS head_process_id \
+               FROM t_process_chain_step csh \
+               WHERE csh.chain_id = p.process_chain_id \
+                 AND csh.deleted_at IS NULL \
+               ORDER BY csh.sort_order ASC, csh.id ASC \
+               LIMIT 1 \
+             ) head ON TRUE \
+             LEFT JOIN LATERAL ( \
+               SELECT s.sent_at \
+               FROM t_outsource_shipment s \
+               WHERE s.batch_id = pb.id \
+                 AND s.status = 'OUTSOURCING' \
+                 AND s.deleted_at IS NULL \
+               ORDER BY s.sent_at DESC, s.id DESC \
+               LIMIT 1 \
+             ) ship ON TRUE \
+             WHERE pb.part_id = $1 AND pb.deleted_at IS NULL \
+             ORDER BY pb.batch_no ASC, pb.id ASC",
+            crate::shared::batch::chain::HAS_PROCESS_CHAIN_EXPR,
+            crate::shared::batch::chain::CHAIN_POSITION_LATERAL_SQL
+        );
+        sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .bind(part_id)
+            .bind(work_type_id)
+            .fetch_all(conn)
+            .await
+    }
+}
+
+/// `GET /scan/locate` 的工单行（7 列，与 [`LocatePartBrief`] 一一对应）。
+#[derive(Debug, sqlx::FromRow)]
+pub struct LocatePartRow {
+    /// `service` 取批次的入参（`fetch_locate_batches` 的 `part_id`），故对模块可见。
+    pub(crate) id: i64,
+    serial_no: Option<String>,
+    name: String,
+    drawing_no: String,
+    is_urgent: bool,
+    planned_delivery_date: NaiveDate,
+    system_delivery_date: Option<NaiveDate>,
+}
+
+impl LocatePartRow {
+    /// 投影行 → [`LocatePartBrief`]（穷尽 struct 字面量：加字段时在这里编译失败）。
+    pub(crate) fn into_part_brief(self) -> LocatePartBrief {
+        LocatePartBrief {
+            id: self.id,
+            serial_no: self.serial_no,
+            name: self.name,
+            drawing_no: self.drawing_no,
+            is_urgent: self.is_urgent,
+            planned_delivery_date: self.planned_delivery_date,
+            system_delivery_date: self.system_delivery_date,
+        }
+    }
+}
+
+/// `GET /scan/locate` 的工人行（`fetch_locate_worker` 的一条 SQL）。
+///
+/// 字段名即 SQL 别名（`FromRow` 按列名匹配）。`max_held_batches` 保持
+/// `Option`（`NULL` = 工种未配置，service 转 `WORK_TYPE_MAX_HELD_NOT_SET`）。
+#[derive(Debug, sqlx::FromRow)]
+pub struct LocateWorkerRow {
+    pub(crate) is_active: bool,
+    pub(crate) work_type_id: Option<i64>,
+    pub(crate) max_held_batches: Option<i32>,
+}
+
+/// `GET /scan/locate` 的批次行：**action 判定所需的全部原始事实**。
+///
+/// 本 struct 刻意不直接映射成出参 —— `action` / `disabled_reason` 由 service 按
+/// 决策表（`listing/service.rs`）算出后与这些事实一起折成 [`crate::modules::prod::scan::vo::LocateBatchItem`]。
+/// 字段按「SQL 投影了什么」收敛成一处事实（同 [`WorkTypeListRow`] 的理由）。
+///
+/// `has_process_chain` 与 `pointer_consistent` 按 `Option<bool>` 收是**解码侧
+/// 的安全网**：两个表达式在特定形态下会产出 SQL NULL（三值逻辑），解进非可空
+/// `bool` 会整页 500。消费侧统一 `unwrap_or(false)` 落保守值。
+#[derive(Debug, sqlx::FromRow)]
+pub struct LocateBatchRow {
+    pub(crate) batch_id: i64,
+    pub(crate) batch_no: i32,
+    pub(crate) quantity: i32,
+    /// `t_part_batch.status` 原文（分类在 service，不在 SQL）。
+    pub(crate) status: String,
+    pub(crate) version: i32,
+    pub(crate) location: Option<String>,
+    /// `current_holder_id` 的**原始 id**：service 用它判「`WORKER` 形态下是不是
+    /// 我持有的那批」（`holder_display` 是名称、判不了）。
+    pub(crate) current_holder_id: Option<i64>,
+    pub(crate) holder_display: Option<String>,
+    pub(crate) current_process_name: Option<String>,
+    /// 取行 SQL 侧已 `COALESCE(nx.chain_state, 'NONE')`，故恒为 `Some`；
+    /// 按 `Option` 收只是兜底（同 `WorkTypeListRow`）。
+    pub(crate) chain_state: Option<String>,
+    pub(crate) next_process_id: Option<i64>,
+    pub(crate) next_process_name: Option<String>,
+    pub(crate) updated_at: NaiveDateTime,
+    /// 仅 `status='OUTSOURCE'` 时投影（其余恒 `None`）。
+    pub(crate) company_name: Option<String>,
+    /// 仅 `status='OUTSOURCE'` 时投影（其余恒 `None`）。
+    pub(crate) sent_at: Option<NaiveDateTime>,
+    /// `t_part.process_chain_id IS NOT NULL`（工单**是否绑链**）。
+    /// ⚠️ 与 `has_process_chain` **不是同一判据**：前者只看工单有没有链，后者还要求
+    /// 「链内定位得到」（见 `HAS_PROCESS_CHAIN_EXPR` 的三种分叉形态）。外协收回 /
+    /// PENDING 的分支判定用的是**本列**。
+    pub(crate) has_chain: bool,
+    /// `HAS_PROCESS_CHAIN_EXPR` 的投影；`locate` 只在 PENDING 分支消费
+    /// （该形态下等价于「链内有未软删 step」）。
+    pub(crate) has_process_chain: Option<bool>,
+    /// 写侧 `is_pointer_consistent` 的纯 SQL 表达，仅 TAKE_OVER 分支消费。
+    pub(crate) pointer_consistent: Option<bool>,
+    /// 链首（链内第一个未软删 step）是否命中 `$2` 工种（`None` 工种时恒 false）。
+    pub(crate) chain_head_in_work_type: bool,
+    /// `nx.next_process_id` 是否命中 `$2` 工种（无下一道 / 未传工种时恒 false）。
+    pub(crate) next_process_in_work_type: bool,
 }

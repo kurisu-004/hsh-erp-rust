@@ -8,6 +8,9 @@
 //! - `worker.rs` —— `ScanWorkerBrief`（扫工牌 1 端点、4 字段）
 //! - `listing.rs` —— `ScanListItem` / `ScanListOut` / `HeldListOut` / `ScanChainState`
 //!   （两条只读聚合端点的分页行；`HeldListOut` 是 `/held` 专用的「+ 容量两字段」信封）
+//! - `locate.rs` —— `LocateOut` / `LocatePartBrief` / `LocateBatchItem` /
+//!   `LocateAction` / `LocateDisabledReason`（2026-10-15 新增的诊断端点
+//!   `GET /scan/locate`；`chain_state` 复用 `listing.rs` 的 `ScanChainState`）
 //! - `transition.rs` —— `WorkerScanCoreOut` / `WorkerScanOut` / `WorkerScanSplitInfo`
 //!   （放回 / 送检）
 //!
@@ -17,9 +20,11 @@
 //! `service/pickup.rs`。
 
 pub mod listing;
+pub mod locate;
 pub mod transition;
 pub mod worker;
 
 pub use listing::{HeldListOut, ScanChainState, ScanListItem, ScanListOut};
+pub use locate::{LocateAction, LocateBatchItem, LocateDisabledReason, LocateOut, LocatePartBrief};
 pub use transition::{WorkerScanCoreOut, WorkerScanOut, WorkerScanSplitInfo};
 pub use worker::ScanWorkerBrief;
