@@ -191,23 +191,25 @@ impl AccountService {
         let set_phone = req.phone.is_some();
         let phone = req.phone.as_deref().and_then(trimmed_or_none);
 
-        // 管理员在此改密**不**轮转 refresh_token_version（对齐 Python update_user）
-        let password_hash = match req.password.as_deref() {
-            Some("") => return Err(AppError::validation("password 不能为空")),
-            Some(p) => Some(password::hash(p)?),
-            None => None,
-        };
-
         // ADMIN 自锁护栏：把 active 账号改为停用时与 `deactivate_user` 同款 ——
         // 先 `has_active_admin_grants` 快筛（非管理员账号不跑计数），再过同一
         // `guard_admin_lockout`（行锁 + 计数 + 阈值）。已停用账号跳过（它不在
         // active 管理员计数里，不构成新的自锁风险）。
+        //
+        // 放在 bcrypt 之前：被护栏拒绝的请求不该白算一次 cost=12 的哈希。
         if req.is_active == Some(false)
             && u.is_active
             && repo.has_active_admin_grants(user_id).await?
         {
             Self::guard_admin_lockout(&mut repo).await?;
         }
+
+        // 管理员在此改密**不**轮转 refresh_token_version（对齐 Python update_user）
+        let password_hash = match req.password.as_deref() {
+            Some("") => return Err(AppError::validation("password 不能为空")),
+            Some(p) => Some(password::hash(p)?),
+            None => None,
+        };
 
         let affected = repo
             .update_user_partial(

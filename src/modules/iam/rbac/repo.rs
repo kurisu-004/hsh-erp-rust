@@ -411,8 +411,9 @@ impl RbacRepo {
 
     /// 该用户当前是否持有某角色（`t_user_role` 有未软删行）。
     ///
-    /// `deactivate_user` 的 ADMIN 护栏快筛用：停用非管理员账号是最高频的运维
-    /// 动作，不该每次都跑一遍「数管理员」的查询。
+    /// `deactivate_user` 与 `update_user`（置 `is_active=false`）的 ADMIN 护栏
+    /// 共用它做快筛：停用非管理员账号是最高频的运维动作，不该每次都跑一遍
+    /// 「数管理员」的查询。
     pub async fn user_has_role<'e, E: PgExecutor<'e>>(
         executor: E,
         user_id: i64,

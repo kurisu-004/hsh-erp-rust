@@ -165,8 +165,9 @@ pub trait IamRepoTrait: Send {
 
     /// 该用户当前是否持有 ADMIN 角色（`t_user_role` 未软删行）。
     ///
-    /// `deactivate_user` 的护栏先用它做快筛：**不是**管理员的账号走不到计数
-    /// 查询（停用普通账号是最高频的运维动作，不该每次都数一遍管理员）。
+    /// `deactivate_user` 与 `update_user`（置 `is_active=false`）的 ADMIN 护栏
+    /// 共用它做快筛：**不是**管理员的账号走不到计数查询（停用普通账号是最高频的
+    /// 运维动作，不该每次都数一遍管理员）。
     async fn has_active_admin_grants(&mut self, user_id: i64) -> Result<bool, sqlx::Error>;
 
     // ── t_shelf（1）──

@@ -25,10 +25,11 @@
 //! 用户误踢下线。
 //!
 //! ## ADMIN 自锁护栏
-//! 下列两种操作若会让「active 且持有 ADMIN 的用户数」归零 → 400，且因返回
+//! 下列三个入口若会让「active 且持有 ADMIN 的用户数」归零 → 400，且因返回
 //! `Err`（handler 未 commit）**不会**触发踢下线：
 //! 1. 撤销用户的 ADMIN 角色（本文件 `remove_role`）；
-//! 2. 停用持有 ADMIN 的用户（`user::deactivate_user`）。
+//! 2. 停用持有 ADMIN 的用户（`user::deactivate_user`）；
+//! 3. 更新持有 ADMIN 的用户并置 `is_active=false`（`user::update_user`）。
 
 use crate::auth::rbac::{CurrentUser, Role, parse_role_string};
 use crate::infra::clock::now_naive;
@@ -197,7 +198,7 @@ impl AccountService {
                 .await?;
         if n <= 1 {
             return Err(crate::modules::iam::rbac::service::policy_reject(
-                "不能撤销最后一个系统管理员的 ADMIN 角色",
+                "不能使最后一个系统管理员失去 ADMIN 角色",
             ));
         }
         Ok(())

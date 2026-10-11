@@ -91,7 +91,7 @@ COMMENT ON TABLE  public.t_role IS '角色定义（iam::rbac 域）；is_system=
 COMMENT ON COLUMN public.t_role.id IS '雪花主键，App 侧生成';
 COMMENT ON COLUMN public.t_role.code IS '角色码（大写 varchar）；与 t_user_role.role / t_role_menu.role 同源；Rust 侧 auth::rbac::Role 枚举只覆盖内置六项';
 COMMENT ON COLUMN public.t_role.name IS '中文展示名';
-COMMENT ON COLUMN public.t_role.is_system IS '内置角色标记；true 时 code 不可改、不可删除（只可停用；ADMIN 连停用也不可）';
+COMMENT ON COLUMN public.t_role.is_system IS '内置角色标记；true 时 code 不可改、不可删除（只可停用；ADMIN / MANAGER 连停用也不可）';
 COMMENT ON COLUMN public.t_role.is_active IS '停用位；false 时不可被新授予，登录 / refresh / me 不再解析该角色（权限 / 菜单 / 货架 scope 失效）并踢在册持有者；停用为终态（当前无启用端点，恢复需改库）';
 COMMENT ON COLUMN public.t_role.version IS '乐观锁版本号；POST /roles/{id}/update 与 grants 整包替换共用此锚点，冲突抛 BIZ_VERSION_CONFLICT 409';
 

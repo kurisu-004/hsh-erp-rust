@@ -362,8 +362,10 @@ async fn role_kick_撤销最后_admin被拒() {
     // 只有一个 active 管理员 ⇒ 撤销会自锁。护栏先取 t_role ADMIN 行锁再计数
     // （2026-10-14 并发串行化）。
     mock.expect_lock_admin_role_for_update()
+        .times(1)
         .returning(|| Ok(()));
     mock.expect_list_active_admin_user_ids()
+        .times(1)
         .returning(|| Ok(vec![101]));
     // ⚠️ 不 expect_soft_delete_user_role：mockall 会对未预期调用 panic，
     // 这就是「护栏路径绝不触达软删」的断言。
@@ -406,8 +408,10 @@ async fn role_kick_还有别的管理员时撤销_admin放行() {
     mock.expect_get_user_role_by_id()
         .returning(move |_| Ok(Some(r.clone())));
     mock.expect_lock_admin_role_for_update()
+        .times(1)
         .returning(|| Ok(()));
     mock.expect_list_active_admin_user_ids()
+        .times(1)
         .returning(|| Ok(vec![101, 102]));
     mock.expect_soft_delete_user_role()
         .returning(|_, _, _, _| Ok(1));

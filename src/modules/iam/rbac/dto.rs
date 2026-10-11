@@ -46,7 +46,7 @@ pub struct RoleUpdateRequest {
 
 /// `POST /api/v2/iam/roles/{id}/deactivate`：停用 / 软删。
 ///
-/// `delete` 的三态语义：
+/// `delete` 的二态语义：
 /// - `false`：只停用（内置角色只允许这一支 —— 可停用、不可删；ADMIN / MANAGER
 ///   例外：停用 / 删除都一律 400）
 /// - `true`：软删 `t_role` + 同事务连带软删该角色的 `t_user_role` /
@@ -88,10 +88,12 @@ pub(crate) const NAME_MAX_LEN: usize = 50;
 /// 角色码形态：`[A-Z0-9_]`、1..=20 字符。**要求已是大写** —— 归一在
 /// service 层做（`trim` + `to_uppercase`），本函数只校验结果。
 pub(crate) fn validate_code_shape(code: &str) -> Result<(), AppError> {
-    if code.is_empty() || code.len() > CODE_MAX_LEN {
+    // 长度与报错口径统一按**字符数**（与列宽校验同一量纲；多字节字符在长度
+    // 闸门与报错里必须给出同一个数，否则「收到 N」与实际判定对不上）。
+    let n = code.chars().count();
+    if n == 0 || n > CODE_MAX_LEN {
         return Err(AppError::validation(format!(
-            "code 长度须为 1..={CODE_MAX_LEN}，收到 '{}'",
-            code.chars().count()
+            "code 长度须为 1..={CODE_MAX_LEN}，收到 '{n}'"
         )));
     }
     if !code

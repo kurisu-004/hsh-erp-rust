@@ -441,8 +441,10 @@ async fn update_user_deactivating_last_active_admin_is_rejected() {
         .returning(|_| Ok(true));
     // 护栏先取 t_role ADMIN 行锁再计数（与 deactivate_user 同款）
     mock.expect_lock_admin_role_for_update()
+        .times(1)
         .returning(|| Ok(()));
     mock.expect_list_active_admin_user_ids()
+        .times(1)
         .returning(|| Ok(vec![101]));
     let svc = make_account_service();
     let req = UserUpdateRequest {
@@ -737,8 +739,10 @@ async fn deactivate_last_active_admin_is_rejected() {
         .returning(|_| Ok(true));
     // 护栏先取 t_role ADMIN 行锁再计数（2026-10-14 并发串行化）
     mock.expect_lock_admin_role_for_update()
+        .times(1)
         .returning(|| Ok(()));
     mock.expect_list_active_admin_user_ids()
+        .times(1)
         .returning(|| Ok(vec![101]));
 
     let svc = make_account_service();
