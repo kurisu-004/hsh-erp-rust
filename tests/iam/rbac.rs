@@ -18,7 +18,7 @@
 //! | 11 | `grants_change_kicks_holders_sessions` | 改 grants 后持有人旧 token 40105 |
 //! | 12 | `user_role_grant_kicks_target_session` | 授予 / 撤销用户角色后目标旧 token 40105 |
 //! | 13 | `custom_role_grant_does_not_trigger_scope_validation` | 自定义角色无 scope 可授予；未知 code 400 |
-//! | 14 | `permission_matrix_matches_legacy_roles` | 六身份 × 3 权限点的放行矩阵逐格等于迁移前角色守卫集合 |
+//! | 14 | `permission_matrix_matches_legacy_roles` | 六身份 × 20 权限点的放行矩阵逐格等于迁移前角色守卫集合（第二批 17 点 2026-10-15 并入） |
 //! | 15 | `panel_menu_tree_is_full_for_manager` | `GET /menus` 对非 ADMIN 的 MANAGER 也返全量 active 菜单树（配置面板用） |
 //! | 16 | `custom_role_menu_grant_visible_after_login` | 给自定义角色授菜单 → 目标登录后 /iam/me 可见（raw role code 进菜单装载） |
 //! | 17 | `deactivated_role_is_filtered_from_next_login` | 停用即降权：停用踢持有人、重登后该角色的菜单消失 |
@@ -1119,9 +1119,9 @@ async fn custom_role_grant_does_not_trigger_scope_validation() {
 }
 
 // ===========================================================================
-// ⑭ permission_matrix_matches_legacy_roles（BE-8，2026-10-14）
+// ⑭ permission_matrix_matches_legacy_roles（BE-8，2026-10-14；2026-10-15 扩至 20 点）
 // ===========================================================================
-/// 六身份 × 3 个权限点的放行矩阵，**逐格等于迁移前**的角色守卫集合。
+/// 六身份 × 20 个权限点的放行矩阵，**逐格等于迁移前的角色守卫集合**。
 ///
 /// 迁移前集合的来源（照代码，不猜）：
 /// - `part.drawing.print`   ← `part::handler::print` 原 `require_any_role`
@@ -1131,29 +1131,48 @@ async fn custom_role_grant_does_not_trigger_scope_validation() {
 /// - `queue.dispatch`       ← `dispatch_batch` 原 `require_any_role`（MANAGER / CLERK）
 /// - `delivery_note.print`  ← 前端 `canPrint`（MANAGER / CLERK / INSPECTOR；后端打印
 ///   端点已下线，本点只登记矩阵）
+/// - 第二批 17 点（2026-10-15）← 各域迁移前守卫，见 `seeds/rbac.sql` 第 2 节逐点
+///   来源注释；三处与迁移前守卫**有意不同**（用户定稿，同 seeds 注释）：
+///   ① `queue.allocate` 自 Manager 独占放宽为 M,C；② `delivery_note.view` 去 CNC、
+///   `outsource.view` 的公司读去 CNC；③ `production.view` 是两条读集合的并集
+///   （对 process_chain 原集合多授 SA）。
 ///
 /// 三层断言：
 /// 1. 数据层：`t_role_permission` 的 live 行逐角色精确等于矩阵（不多不少），
-///    ADMIN 无行、SHELF_ACCOUNT 三点全无；
+///    ADMIN 无行、SHELF_ACCOUNT 仅 `production.view` 一格；
 /// 2. 判定层：按角色构造 `CurrentUser`（非 ADMIN 的 permissions 取自 DB），逐点跑
 ///    `require_permission`，放行结果恰好等于矩阵 —— ADMIN 刻意给**空** permissions
 ///    也必须全放行（元角色通配在代码里，不靠数据）；
-/// 3. 端点层（不在本用例内重复）：`part.drawing.print` 的打印端由
-///    `tests/print_forward.rs` 的角色闸门用例覆盖、`/url` 端由
-///    `tests/part/file.rs` 的 `get_url_requires_permission_point` /
-///    `rbac_shelf_account_get_file_url_still_forbidden` 覆盖，
-///    `queue.dispatch` 由 `tests/production/queue_dispatch.rs` 的 Inspector 403
-///    用例覆盖。
+/// 3. 端点层（不在本用例内重复）：各端点由对应域的集成测试覆盖（如
+///    `tests/production/queue_dispatch.rs` 的 403 / 放行用例、`tests/outsource/` 与
+///    `tests/com/delivery_note/` 的越权用例）。
 #[tokio::test]
 async fn permission_matrix_matches_legacy_roles() {
     use hsh_erp_rust::auth::rbac::{CurrentUser, Role, parse_role_string};
 
-    const POINTS: [&str; 3] = [
+    const POINTS: [&str; 20] = [
         "part.drawing.print",
         "queue.dispatch",
         "delivery_note.print",
+        "production.view",
+        "production.config",
+        "queue.view",
+        "queue.recall",
+        "queue.allocate",
+        "batch.split",
+        "batch.transition",
+        "batch.deliver",
+        "batch.cancel",
+        "batch.repair",
+        "inspection.view",
+        "delivery_note.view",
+        "outsource.view",
+        "outsource.quote.edit",
+        "outsource.quote.approve",
+        "outsource.move",
+        "outsource.company.manage",
     ];
-    /// (身份, 期望放行集合)。ADMIN 由通配全放行；SHELF_ACCOUNT 三点全不授。
+    /// (身份, 期望放行集合)。ADMIN 由通配全放行；SHELF_ACCOUNT 仅 production.view。
     const MATRIX: [(&str, &[&str]); 6] = [
         ("ADMIN", &POINTS),
         (
@@ -1162,6 +1181,23 @@ async fn permission_matrix_matches_legacy_roles() {
                 "part.drawing.print",
                 "queue.dispatch",
                 "delivery_note.print",
+                "production.view",
+                "production.config",
+                "queue.view",
+                "queue.recall",
+                "queue.allocate",
+                "batch.split",
+                "batch.transition",
+                "batch.deliver",
+                "batch.cancel",
+                "batch.repair",
+                "inspection.view",
+                "delivery_note.view",
+                "outsource.view",
+                "outsource.quote.edit",
+                "outsource.quote.approve",
+                "outsource.move",
+                "outsource.company.manage",
             ],
         ),
         (
@@ -1170,11 +1206,41 @@ async fn permission_matrix_matches_legacy_roles() {
                 "part.drawing.print",
                 "queue.dispatch",
                 "delivery_note.print",
+                "production.view",
+                "queue.view",
+                "queue.recall",
+                "queue.allocate",
+                "batch.split",
+                "batch.deliver",
+                "batch.cancel",
+                "batch.repair",
+                "delivery_note.view",
+                "outsource.view",
+                "outsource.quote.edit",
+                "outsource.move",
+                "outsource.company.manage",
             ],
         ),
-        ("INSPECTOR", &["part.drawing.print", "delivery_note.print"]),
-        ("CNC_PROGRAMMER", &["part.drawing.print"]),
-        ("SHELF_ACCOUNT", &[]),
+        (
+            "INSPECTOR",
+            &[
+                "part.drawing.print",
+                "delivery_note.print",
+                "production.view",
+                "queue.view",
+                "batch.transition",
+                "batch.repair",
+                "inspection.view",
+                "delivery_note.view",
+                "outsource.view",
+                "outsource.move",
+            ],
+        ),
+        (
+            "CNC_PROGRAMMER",
+            &["part.drawing.print", "production.view"],
+        ),
+        ("SHELF_ACCOUNT", &["production.view"]),
     ];
 
     let pool = test_pool().await;
