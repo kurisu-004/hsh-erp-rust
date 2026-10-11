@@ -335,8 +335,10 @@ pub mod code {
     // 207xx 工艺链（t_part_process_chain + t_process_chain_step）
     pub const BIZ_PROCESS_CHAIN_NOT_FOUND: i32 = 20701;
     pub const BIZ_PROCESS_CHAIN_STEP_NOT_FOUND: i32 = 20702;
-    pub const BIZ_WORK_TYPE_MAX_HELD_MINUTES_NOT_SET: i32 = 20703;
-    pub const BIZ_AUTO_ALLOCATE_INVALID_RATIO: i32 = 20704;
+    // 20703 / 20704 随 TIME / fill_ratio 移除释放（2026-10-15）：
+    // 两码此前分别为「工种工时上限未配」与「自动分配比例非法」，已随
+    // auto-allocate 的 TIME 模式 / 比例入参一并删除；当前无生产方、**未复用**
+    // （保留空位防撞码）。
     // 2026-09-16 新增（FK 翻转 PR-1）：part.status 非 PENDING 时禁止制定/修改工艺链
     pub const BIZ_PROCESS_CHAIN_PART_NOT_PENDING: i32 = 20705;
     // 2026-09-16 新增（PR-3 批次 step 化）：批次进入生产流（place-on-shelf /
@@ -1099,14 +1101,8 @@ mod tests {
             code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND,
             "BIZ_PROCESS_CHAIN_STEP_NOT_FOUND",
         ),
-        (
-            code::BIZ_WORK_TYPE_MAX_HELD_MINUTES_NOT_SET,
-            "BIZ_WORK_TYPE_MAX_HELD_MINUTES_NOT_SET",
-        ),
-        (
-            code::BIZ_AUTO_ALLOCATE_INVALID_RATIO,
-            "BIZ_AUTO_ALLOCATE_INVALID_RATIO",
-        ),
+        // 20703 / 20704 已随 auto-allocate TIME / fill_ratio 移除释放（2026-10-15），
+        // 见常量声明处的注释。
         (
             code::BIZ_PROCESS_CHAIN_PART_NOT_PENDING,
             "BIZ_PROCESS_CHAIN_PART_NOT_PENDING",
@@ -1321,8 +1317,7 @@ mod tests {
         // 207xx
         assert_eq!(code::BIZ_PROCESS_CHAIN_NOT_FOUND, 20701);
         assert_eq!(code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND, 20702);
-        assert_eq!(code::BIZ_WORK_TYPE_MAX_HELD_MINUTES_NOT_SET, 20703);
-        assert_eq!(code::BIZ_AUTO_ALLOCATE_INVALID_RATIO, 20704);
+        // 20703 / 20704 已释放（2026-10-15，见常量声明处注释），无断言。
         assert_eq!(code::BIZ_PROCESS_CHAIN_PART_NOT_PENDING, 20705);
         // 2026-09-16 PR-3 批次 step 化：part 无工艺链时禁上生产流
         assert_eq!(code::BIZ_PROCESS_CHAIN_REQUIRED, 20706);

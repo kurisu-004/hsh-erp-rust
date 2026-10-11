@@ -37,6 +37,11 @@
 //!   —— TAIL early-return 分支下的部分放回（最容易漏的那条）
 //! - `worker_scan_invalid_quantity_returns_20111` —— `<= 0` / `>` 两条边界
 //!
+//! 2026-10-15 追加（1 个用例）：
+//! - `worker_scan_refill_respects_auto_allocate_limit` —— 同事务 refill 只补到
+//!   工种自动上限 `auto_allocate_limit`（未配置兜底 `max_held_batches`）；
+//!   auto=2 / max=5 / 池 10 ⇒ 只抢 2 件。
+//!
 //! ## 复用的 fixture
 //! 全部从 `super::queue` 借（那边是 worker_pool 场景的 fixture 大本营）：本文件
 //! 不复制一份，避免同款 fixture 在两处漂移。
@@ -50,8 +55,9 @@ use hsh_erp_test_support::{json_request, login_token, send};
 use super::queue::{
     append_chain_step, bootstrap_as_manager, count_held_by_worker, insert_customer_l2,
     insert_pending_part_with_chain, insert_pool_part, insert_shelf, insert_work_type,
-    insert_worker, insert_worker_held_part, link_shelf_to_process, link_work_type_to_process,
-    login_manager_with_username, login_shelf_account, part_chain_id, seed_process,
+    insert_work_type_with_auto, insert_worker, insert_worker_held_part, link_shelf_to_process,
+    link_work_type_to_process, login_manager_with_username, login_shelf_account, part_chain_id,
+    seed_process,
 };
 
 /// 场景 1: worker-scan INSPECTED → 自动 refill
@@ -107,6 +113,60 @@ async fn worker_scan_inspected_triggers_refill() {
     // 验证 worker 持有数 = 1（放回 1 + 抢到 1）
     let held = count_held_by_worker(&pool, worker).await;
     assert_eq!(held, 1, "worker 应持有 1 件（refill 后）");
+}
+
+/// 2026-10-15 新增：worker-scan 的**同事务 refill 只补到工种自动上限**。
+///
+/// auto=2 < max=5、池里 10 件：INSPECTED 把手上那批送检后，refill 只抢 2 件
+/// （按 max 会抢 5 件 ⇒ 断言有判别力）。
+#[tokio::test]
+async fn worker_scan_refill_respects_auto_allocate_limit() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "POOL-AUTO").await;
+    let proc = seed_process(&pool, "PROC-AUTO", "工序AUTO").await;
+    let wt = insert_work_type_with_auto(&pool, "WT-AUTO", "工种AUTO", Some(5), Some(2)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let prod_shelf = insert_shelf(&pool, "PROD-AUTO", "PROD-AUTO", "PRODUCTION").await;
+    let insp_shelf = insert_shelf(&pool, "INSP-AUTO", "INSP-AUTO", "INSPECTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc).await;
+
+    let worker = insert_worker(&pool, "BC-AUTO", "工AUTO", Some(wt)).await;
+    // worker 当前持 1 件（待送检）；池里 10 件待补
+    let (_held_part, _held_batch, _step) =
+        insert_worker_held_part(&pool, customer, "H-AUTO", worker, proc, 1, true).await;
+    for i in 0..10 {
+        let sn = format!("AUTO-P-{:03}", i);
+        insert_pool_part(&pool, customer, &sn, prod_shelf, proc, 1).await;
+    }
+
+    let (app, token, _pool) =
+        login_shelf_account(pool.clone(), "user_auto", &[prod_shelf, insp_shelf]).await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/scan/worker-scan",
+            Some(json!({
+                "serial_no": "H-AUTO",
+                "badge_code": "BC-AUTO",
+                "event_type": "INSPECTED",
+                "shelf_id": prod_shelf.to_string(),
+                "target_inspection_shelf_id": insp_shelf.to_string(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "scan INSPECTED: {env}");
+    let taken = env["data"]["refill"]["taken"]
+        .as_array()
+        .expect("refill.taken");
+    assert_eq!(
+        taken.len(),
+        2,
+        "auto=2 ⇒ 同事务 refill 只补 2 件（不是 max=5）: {env}"
+    );
+    assert_eq!(count_held_by_worker(&pool, worker).await, 2);
 }
 
 /// 场景 2: worker-scan RETURNED → 自动 refill

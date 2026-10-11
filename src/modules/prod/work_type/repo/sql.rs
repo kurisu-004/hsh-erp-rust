@@ -40,7 +40,7 @@ impl WorkTypeRepo {
             r#"
             SELECT id, code, name, description, sort_order, version,
                    created_at, created_by, updated_at, updated_by, deleted_at,
-                   max_held_batches
+                   max_held_batches, auto_allocate_limit
             FROM t_work_type
             WHERE id = $1 AND deleted_at IS NULL
             "#,
@@ -60,7 +60,7 @@ impl WorkTypeRepo {
             r#"
             SELECT id, code, name, description, sort_order, version,
                    created_at, created_by, updated_at, updated_by, deleted_at,
-                   max_held_batches
+                   max_held_batches, auto_allocate_limit
             FROM t_work_type
             WHERE code = $1 AND deleted_at IS NULL
             "#,
@@ -105,7 +105,7 @@ impl WorkTypeRepo {
             r#"
             SELECT id, code, name, description, sort_order, version,
                    created_at, created_by, updated_at, updated_by, deleted_at,
-                   max_held_batches
+                   max_held_batches, auto_allocate_limit
             FROM t_work_type
             WHERE id = ANY($1) AND deleted_at IS NULL
             ORDER BY id ASC
@@ -128,7 +128,7 @@ impl WorkTypeRepo {
         let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
             "SELECT id, code, name, description, sort_order, version, \
              created_at, created_by, updated_at, updated_by, deleted_at, \
-             max_held_batches \
+             max_held_batches, auto_allocate_limit \
              FROM t_work_type WHERE deleted_at IS NULL",
         );
         if let Some(needle) = code_like {
@@ -166,6 +166,9 @@ impl WorkTypeRepo {
 
     /// 插入新工种。雪花 id 由调用方（service）生成；created_by / updated_by
     /// 共用 `created_by`，后续 UPDATE 才更新 updated_by。
+    ///
+    /// 2026-10-15：新增 `auto_allocate_limit`（自动补料上限），交叉校验
+    /// （有值须 1..=max_held_batches）在 service 层，见 `service.rs`。
     #[allow(clippy::too_many_arguments)]
     pub async fn create<'e, E: PgExecutor<'e>>(
         executor: E,
@@ -175,17 +178,19 @@ impl WorkTypeRepo {
         description: Option<&str>,
         sort_order: i32,
         max_held_batches: Option<i32>,
+        auto_allocate_limit: Option<i32>,
         created_by: i64,
     ) -> Result<TWorkType, sqlx::Error> {
         sqlx::query_as!(
             TWorkType,
             r#"
             INSERT INTO t_work_type (id, code, name, description, sort_order,
-                                     max_held_batches, created_by, updated_by)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+                                     max_held_batches, auto_allocate_limit,
+                                     created_by, updated_by)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
             RETURNING id, code, name, description, sort_order, version,
                       created_at, created_by, updated_at, updated_by, deleted_at,
-                      max_held_batches
+                      max_held_batches, auto_allocate_limit
             "#,
             snowflake_id,
             code,
@@ -193,6 +198,7 @@ impl WorkTypeRepo {
             description,
             sort_order,
             max_held_batches,
+            auto_allocate_limit,
             created_by,
         )
         .fetch_one(executor)
@@ -201,12 +207,22 @@ impl WorkTypeRepo {
 
     /// 部分更新（OCC）：带乐观锁。`code` 不允许改（业务唯一键，由 service 层 enforce）。
     ///
-    /// 三态编码：
-    /// - `name` / `sort_order`：二态 `Option<&str / Option<i32>`，None ⇒ 不修改
-    /// - `description` / `max_held_batches`：三态 `Option<Option<T>>`：
+    /// 三态编码（⚠️ **三列的 wire 可达性不同**，2026-10-15 复核）：
+    /// - `name` / `sort_order`：二态 `Option<&str / Option<i32>>`，None ⇒ 不修改
+    /// - `max_held_batches` / `auto_allocate_limit`（2026-10-15 新增）：真三态
+    ///   `Option<Option<T>>`（dto 侧挂 `deserialize_some`）：
     ///   - `None` ⇒ 字段缺省，不修改
     ///   - `Some(None)` ⇒ 显式清空（SET NULL）
     ///   - `Some(Some(v))` ⇒ 改值
+    /// - `description`：本函数签名形如三态，但 dto 侧只有 `#[serde(default)]`、
+    ///   无 `deserialize_some` ⇒ 显式 JSON `null` 与字段缺省都折成 `None`
+    ///   （= 不修改），`Some(None)` **自 wire 不可达** ⇒ **当前没有清空路径**
+    ///   （已知偏差，登记在 `dto.rs::WorkTypeUpdateRequest.description`；
+    ///   不要按上两列的三态口径理解本字段）。
+    ///
+    /// `max_held_batches` 与 `auto_allocate_limit` 的**合并后交叉校验**
+    /// （auto 有值 ⇒ ≥1 且 max 非空且 auto ≤ max）在 service 层完成，见
+    /// `service.rs::update_work_type`。
     #[allow(clippy::too_many_arguments)]
     pub async fn update<'e, E: PgExecutor<'e>>(
         executor: E,
@@ -216,12 +232,15 @@ impl WorkTypeRepo {
         description: Option<Option<&str>>,
         sort_order: Option<i32>,
         max_held_batches: Option<Option<i32>>,
+        auto_allocate_limit: Option<Option<i32>>,
         updated_by: i64,
     ) -> Result<u64, sqlx::Error> {
         let set_description = description.is_some();
         let new_description = description.flatten();
         let set_max_held_batches = max_held_batches.is_some();
         let new_max_held_batches = max_held_batches.flatten();
+        let set_auto_allocate_limit = auto_allocate_limit.is_some();
+        let new_auto_allocate_limit = auto_allocate_limit.flatten();
         sqlx::query!(
             r#"
             UPDATE t_work_type
@@ -229,9 +248,10 @@ impl WorkTypeRepo {
                 description     = CASE WHEN $4::bool THEN $5::varchar ELSE description END,
                 sort_order      = COALESCE($6::integer, sort_order),
                 max_held_batches = CASE WHEN $7::bool THEN $8::integer ELSE max_held_batches END,
+                auto_allocate_limit = CASE WHEN $9::bool THEN $10::integer ELSE auto_allocate_limit END,
                 version         = version + 1,
                 updated_at      = now(),
-                updated_by      = $9
+                updated_by      = $11
             WHERE id = $1 AND version = $2 AND deleted_at IS NULL
             "#,
             id,
@@ -242,6 +262,8 @@ impl WorkTypeRepo {
             sort_order,
             set_max_held_batches,
             new_max_held_batches,
+            set_auto_allocate_limit,
+            new_auto_allocate_limit,
             updated_by,
         )
         .execute(executor)
@@ -306,7 +328,7 @@ impl WorkTypeRepo {
     }
 
     /// 列出映射该 process 的所有 work_type（DISTINCT 自然语义：t_work_type_process 是单表）。SQL：
-    /// SELECT wt.id, wt.code, wt.name, wt.max_held_batches
+    /// SELECT wt.id, wt.code, wt.name, wt.max_held_batches, wt.auto_allocate_limit
     ///   FROM t_work_type wt
     ///   JOIN t_work_type_process wtp ON wtp.work_type_id = wt.id
     ///  WHERE wtp.process_id = $1 AND wt.deleted_at IS NULL AND wtp.deleted_at IS NULL
@@ -318,12 +340,17 @@ impl WorkTypeRepo {
     /// 跨模块静态调用方 `prod::queue::service` 直接走 ZST 静态方法 +
     /// `AppError` 自动 `?`，不能破坏其调用形态。
     /// 胖 trait `WorkTypeRepoTrait` 也对应返回 `AppError`（见 `repo/mod.rs`）。
+    ///
+    /// 2026-10-15：元组末位新增 `auto_allocate_limit`（自动补料上限），4 元组 →
+    /// 5 元组。⚠️ 本查询走运行时 `sqlx::query_as`，**列清单无编译期校验** ——
+    /// 增删列时必须人工同步 SELECT 与元组类型，否则运行时静默列错位。
+    #[allow(clippy::type_complexity)]
     pub async fn list_work_types_by_process_id<'e, E: PgExecutor<'e>>(
         executor: E,
         process_id: i64,
-    ) -> Result<Vec<(i64, String, String, Option<i32>)>, AppError> {
-        let rows: Vec<(i64, String, String, Option<i32>)> = sqlx::query_as(
-            r#"SELECT wt.id, wt.code, wt.name, wt.max_held_batches
+    ) -> Result<Vec<(i64, String, String, Option<i32>, Option<i32>)>, AppError> {
+        let rows: Vec<(i64, String, String, Option<i32>, Option<i32>)> = sqlx::query_as(
+            r#"SELECT wt.id, wt.code, wt.name, wt.max_held_batches, wt.auto_allocate_limit
                FROM t_work_type wt
                JOIN t_work_type_process wtp ON wtp.work_type_id = wt.id
                WHERE wtp.process_id = $1 AND wt.deleted_at IS NULL AND wtp.deleted_at IS NULL

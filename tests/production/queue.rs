@@ -8,6 +8,8 @@
 //!   （`refill_*` / `WORKER_POOL_*` 事件）仍由本文件守。
 //! - `refill_when_pool_empty_returns_empty`
 //! - `refill_caps_at_max_held_batches`
+//! - `refill_respects_auto_allocate_limit`（2026-10-15：auto=2 < max=5，第一次 refill
+//!   恰好 2 批、第二次 `AUTO_LIMIT_REACHED`、`move` 仍可手动移动第 3 批）
 //! - `concurrent_refill_no_double_pick` [`#[ignore]`：需 app-level 并发基建]
 //! - `refill_respects_shelf_scope`
 //! - `refill_skips_concurrently_modified_batch` [`#[ignore]`：需并发模拟基建]
@@ -316,11 +318,24 @@ pub(crate) async fn login_manager_with_username(
 //  worker-pool fixture helpers（worker_pool 独享，跨 binary 不迁移）
 // ===========================================================================
 
+/// 不带自动上限的工种（`auto_allocate_limit` 留 NULL ⇒ 自动路径兜底 max）。
 pub(crate) async fn insert_work_type(
     pool: &PgPool,
     code: &str,
     name: &str,
     max_held: Option<i32>,
+) -> i64 {
+    insert_work_type_with_auto(pool, code, name, max_held, None).await
+}
+
+/// 2026-10-15 新增：可指定 `auto_allocate_limit`（自动补料上限）的工种。
+/// `insert_work_type` 是本函数的 `auto=None` 薄包装，既有调用方零改动。
+pub(crate) async fn insert_work_type_with_auto(
+    pool: &PgPool,
+    code: &str,
+    name: &str,
+    max_held: Option<i32>,
+    auto_allocate_limit: Option<i32>,
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
     let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
@@ -328,12 +343,13 @@ pub(crate) async fn insert_work_type(
     let now = now_naive();
     sqlx::query!(
         "INSERT INTO t_work_type (id, code, name, sort_order, version, \
-         max_held_batches, created_at, updated_at) \
-         VALUES ($1, $2, $3, 0, 0, $4, $5, $5)",
+         max_held_batches, auto_allocate_limit, created_at, updated_at) \
+         VALUES ($1, $2, $3, 0, 0, $4, $5, $6, $6)",
         id,
         code,
         name,
         max_held,
+        auto_allocate_limit,
         now,
     )
     .execute(pool)
@@ -860,6 +876,108 @@ async fn refill_caps_at_max_held_batches() {
     assert_eq!(taken.len(), 5, "max=5，应 taken=5: {env}");
     let held = count_held_by_worker(&pool, worker).await;
     assert_eq!(held, 5, "worker 持有 = 5");
+}
+
+/// 场景 4b（2026-10-15 新增）: refill 受工种**自动上限**约束，手动路径不受影响。
+///
+/// auto=2 < max=5，池里 10 件：
+/// 1. 第一次 refill 恰好抢 2（补到 auto，不是 max）；
+/// 2. 第二次 refill → `stopped_reason=AUTO_LIMIT_REACHED`（不是 WORKER_FULL ——
+///    硬上限还有名额）；
+/// 3. `POST /queue/move` 仍能把下一批手动移到工人手上（move 走
+///    `ensure_worker_has_capacity`，只按 max=5 判）——「自动上限只管自动路径」
+///    这条分工的回归锚点。
+#[tokio::test]
+async fn refill_respects_auto_allocate_limit() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "POOL4B").await;
+    let proc = seed_process(&pool, "PROC-DB", "工序DB").await;
+    // auto=2 < max=5：自动路径目标 2，手动路径仍可到 5
+    let wt = insert_work_type_with_auto(&pool, "WT-DB", "工种DB", Some(5), Some(2)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let prod_shelf = insert_shelf(&pool, "PROD-DB", "PROD-DB", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc).await;
+
+    let worker = insert_worker(&pool, "BC004B", "工4B", Some(wt)).await;
+    for i in 0..10 {
+        let sn = format!("PDB-{:03}", i);
+        insert_pool_part(&pool, customer, &sn, prod_shelf, proc, 1).await;
+    }
+
+    // 1) 第一次 refill：补到 auto=2
+    let (app, token) = login_manager_with_username(&pool, "admin4B").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/queue/refill",
+            Some(json!({
+                "worker_id": worker.to_string(),
+                "shelf_id": prod_shelf.to_string(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "admin refill: {env}");
+    assert_eq!(
+        env["data"]["taken"].as_array().unwrap().len(),
+        2,
+        "auto=2 ⇒ 第一次 refill 恰好 2 批（不是 max=5）: {env}"
+    );
+    assert_eq!(count_held_by_worker(&pool, worker).await, 2);
+
+    // 2) 第二次 refill：池里还有 8 件候选，但已到 auto 上限 ⇒ AUTO_LIMIT_REACHED
+    let (app, token) = login_manager_with_username(&pool, "admin4Bb").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/queue/refill",
+            Some(json!({
+                "worker_id": worker.to_string(),
+                "shelf_id": prod_shelf.to_string(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "refill 永远返 200: {env}");
+    assert_eq!(env["data"]["taken"].as_array().unwrap().len(), 0);
+    assert_eq!(env["data"]["pool_empty"], true);
+    assert_eq!(
+        env["data"]["stopped_reason"], "AUTO_LIMIT_REACHED",
+        "池里有货、held(2) < max(5) ⇒ 成因是自动上限: {env}"
+    );
+
+    // 3) 手动路径不受 auto 影响：move 第 3 批到该工人（held=2 < max=5 ⇒ 放行）
+    let (_part3, batch3) = insert_pool_part(&pool, customer, "PDB-MV1", prod_shelf, proc, 1).await;
+    let (app, token) = login_manager_with_username(&pool, "admin4Bc").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/queue/move",
+            Some(json!({
+                "batch_id": batch3.to_string(),
+                "version": 0,
+                "from": { "kind": "POOL", "shelf_id": prod_shelf.to_string() },
+                "to":   { "kind": "WORKER", "worker_id": worker.to_string() },
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "move 是手动路径，只按 max=5 判 ⇒ 第 3 批应放行: {env}"
+    );
+    assert_eq!(
+        env["data"]["max_held"], 5,
+        "响应仍按硬上限报 max_held: {env}"
+    );
+    assert_eq!(count_held_by_worker(&pool, worker).await, 3);
 }
 
 /// 场景 5: 并发 refill 不双抢（`#[ignore]`：缺并发 app 基建）

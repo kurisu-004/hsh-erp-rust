@@ -83,6 +83,13 @@ fn ws_broadcast_assembly_updated(state: &AppState, assembly_id: i64) {
 ///   - `WORKER_POOL_EMPTY`（**2026-10-14 起收窄**：`stopped_reason ==
 ///     "POOL_EMPTY"`，即真的池空。工人已拿满时**不广播**，见下）。
 ///
+/// ⚠️ **`refill.stopped_reason` 的取值三选一（2026-10-15 起）**：
+/// `"POOL_EMPTY"` / `"WORKER_FULL"` / **`"AUTO_LIMIT_REACHED"`**（工种自动
+/// 上限 `auto_allocate_limit` 触顶、工人仍低于 `max_held_batches` 时走手动
+/// 路径可取）。**广播条件只认 `"POOL_EMPTY"`** —— `AUTO_LIMIT_REACHED` 与
+/// `WORKER_FULL`、`MAX_BATCHES_NOT_SET` 都不广播 `WORKER_POOL_EMPTY`
+/// （事件名表达的是「池里没货」，其余成因广播它会把看板归因带偏）。
+///
 /// ⚠️ **改一同步二：`WORKER_POOL_EMPTY` 全仓有两个产出点，两处都必须读
 /// `stopped_reason`，不许读 `pool_empty`。** 另一处是
 /// `prod::queue::handler::pool::admin_refill`（`POST /queue/refill`）。

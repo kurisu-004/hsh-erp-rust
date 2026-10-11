@@ -246,7 +246,7 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
 ### 5.2 仍留在 batch 域的
 
 - `repo/queries.rs`（ZST `PartBatchRepo`，`t_part_batch` 通用 SQL 真源）
-- `repo/sql.rs`（inspection / lifecycle 流转的 19 个定位 + 写点，全部是写入口之上的薄包装）
+- `repo/sql.rs`（inspection / lifecycle 流转的 18 个定位 + 写点，全部是写入口之上的薄包装）
 - `repo/trait.rs`（胖 trait `PartBatchRepoTrait` + `impl for &mut PgConnection`）
 - `model.rs`（2 个**窄投影**行结构：`RecentBatchRow` / `PartBatchScanRow`）
 - `service/`（除已剥离的 `dispatch.rs`、`outsource.rs` 与 `shelf.rs::recall_to_pending` 外的全部用例；返修两条集合读的 SQL 在 `service/repair.rs::list_batches_matching` 内联自建）
@@ -307,11 +307,6 @@ current_holder_id=<shelf_id>`，正是 migration `20261013000002` 判据要清�
 两侧同改** —— 上一轮的漏改正是因为这份镜像与 `CLAUDE.md` 的不变式 bullet 都说了「已统一
 处理过」，而代码里第 6 个写点根本没跟上。
 
-⚠️ **另一个不在表内的写点**：`prod::batch::repo::sql::mark_batch_cancelled` 的两个
-`clear_*` 仍是 `false`，**因为它全仓零调用方**（死代码，`allowed_from` 不含
-`IN_PROCESS`，接回去也够不到工人手上的批次）。接回调用前必须先改成 `true`；
-理由与 `list_held_by_worker` 同款自我标注，见该函数 doc。
-
 ⚠️ **`mark_batch_status_only` 只对 `CANCELLED` 特判，绝不能改成无条件清** —— 它还服务
 两个**非终态**目标，而它们的 `location` 是**有业务含义**的：
 
@@ -341,14 +336,16 @@ current_holder_id=<shelf_id>`，正是 migration `20261013000002` 判据要清�
 ⚠️ **清单不穷尽。** 它登记的是「逐个查过」的部分，**不是覆盖面证明** —— 新增同类读侧
 时必须自己判断「这个判据要不要带 `status`」，不要因为本节没列它就以为不受影响。
 
-**A 组：不过滤 `status`、结果会变（4 处）**
+**A 组：不过滤 `status`、结果会变（3 处）**
 
 | # | 读侧 | 受影响的字段 / 端点 | 变化方向 |
 |---|---|---|---|
 | A-1 | `part::service::list_enrichment::enrich_part_list_with_location_and_holder` 的 min-progress 目标批次选择 —— 只排除 `CANCELLED` / `COMPLETED`，**不排除 `DELIVERED`** | `PartListItem.location` / `holder_name`。⚠️ 只有**两条 list 路径**注入它：`GET /api/v2/parts` 与 `GET /api/v2/com/union-list` 的 PART 段（`GET /parts/{id}` 返的是 `PartDetailOut`，不是本 VO）；同 VO 的其余 **5 处返回点**（4 个列表端点 + `POST /assemblies/{id}/children` 返回的单对象 `R<PartListItem>`）走 `impl From<TPart>`，**构造默认就是 `None`、从不覆写**（登记见 `part::vo::part` 的 `PartListItem` 逐字段 doc） | 「只剩一条 `DELIVERED` 批次且原本停在品检架」的工单：由「品检架 + 架名」变 `null`。**修正** |
 | A-2 | `part::repo::sql::part_sql` 的 `list_with_filters` / `count_with_filters` 里 `locations` / `holder_ids` 两个 `EXISTS`（只有 `pb.deleted_at IS NULL`） | `GET /api/v2/parts?locations=…&holder_ids=…` 的**结果集**（items 与 total 各一份 SQL） | 命中集变小。**修正** |
 | A-3 | `com::union_list::repo::sql::list_union_all_with_filters` 的 `$7::text[]`（location）/ `$8::bigint[]`（holder）两个 `EXISTS`（同样只有软删闸门） | `GET /api/v2/com/union-list?locations=…&holder_ids=…` 的结果集 | 同 A-2。**修正** |
-| A-4 | `prod::batch::repo::queries::list_held_by_worker` | **无端点** —— 全仓**零调用方**（仅 trait 声明 + impl），死代码 | 不适用；接线前必须先补 `status='IN_PROCESS'`（见 [`queue.md`](queue.md) §4.3） |
+
+> 2026-10-15：原 A-4（`prod::batch::repo::queries` 下一处全仓零调用方的死代码读侧）
+> 已随其删除下线，4 处 → 3 处。
 
 **另有 2 处方向性变化已由本轮前一版 doc 登记，谓词自带 `status NOT IN ('CANCELLED','COMPLETED')`（不含 `DELIVERED`）**：
 

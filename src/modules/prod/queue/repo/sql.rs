@@ -4,11 +4,12 @@
 //! `&mut PgConnection`（CTE 内含多条 SQL，发射多次借用同一连接）。
 //!
 //! - `take_one_from_pool` —— 工人「抢一批」原子 SQL。CTE + FOR UPDATE SKIP LOCKED，
-//!   单条 SQL 内同时原子地完成：(1) 计算「已持批次数 < max_held_batches」守卫；
+//!   单条 SQL 内同时原子地完成：(1) 计算「已持批次数 < cap」守卫（cap 由 service
+//!   传入，2026-10-15 起 = 工种自动补料上限兜底 `max_held_batches`）；
 //!   (2) 从候选池按 `shared::shelf::pool_priority::POOL_PRIORITY_ORDER_SQL`
 //!   （加急 → 系统交期 → 计划交期 → CNC 已编程）取一批；(3) UPDATE t_part_batch
 //!   与 t_part 的 holder/location/version。
-//!   0 行 → 池空或达上限，返回 Ok(None)，由 service 决定是否抛容量/空池业务错。
+//!   0 行 → 池空或达 cap，返回 Ok(None)，由 service 决定是否抛容量/空池业务错。
 //!   2026-10-10：`shelf_id` 形参改 `Option<i64>`，`None` = 跨全部货架取料。
 //! - `take_specific_from_pool` —— 同上，但指定 batch_id（POOL→WORKER 移动用）
 //! - `move_worker_to_worker` —— worker ↔ worker 移动（OCC）
@@ -45,7 +46,7 @@ struct TakenRow {
 pub struct QueueRepo;
 
 impl QueueRepo {
-    /// 工人「抢一批」（单 SQL 原子：held<max 守卫 + FOR UPDATE SKIP LOCKED）。
+    /// 工人「抢一批」（单 SQL 原子：held<cap 守卫 + FOR UPDATE SKIP LOCKED）。
     ///
     /// 参数：
     /// - `conn`：调用方持有事务（handler 的 `state.pool.begin()`），repo 不 commit。
@@ -54,9 +55,17 @@ impl QueueRepo {
     ///   显式「为某工人在某架上抢料」）；`None` **跨全部货架**取料。
     /// - `process_ids`：工人可加工工序 id 列表（`t_process.id`），候选池按
     ///   `t_part_batch.current_process_id = ANY($3)` 过滤。
+    /// - `cap`：**2026-10-15 新增**：本次取料的目标持有上限（`held < cap` 守卫）。
+    ///   由 service 计算：`auto_allocate_limit.unwrap_or(max_held_batches)`。
+    ///   ⚠️ **NULL 语义与来源全在 service** —— 本 SQL 不再 JOIN `t_work_type`
+    ///   查 `max_held_batches`：`max` 为 NULL 时 service 在入口就用
+    ///   `20904 BIZ_WORK_TYPE_MAX_HELD_NOT_SET` 早退（refill / auto-allocate 的
+    ///   auto=NULL 兜底也由 service 完成），**不存在「SQL 按 cap 0 拦死」这条
+    ///   路径**（旧 `max_batches` CTE 的 `COALESCE(max_held_batches, 0)` 已随
+    ///   本改动删除）。
     /// - `operator_user_id`：审计字段 `updated_by`，由 service 透传（一般是 manager 自己）。
     ///
-    /// 返回 `Ok(None)` 当且仅当：候选池为空 / 工人已达 `max_held_batches`。
+    /// 返回 `Ok(None)` 当且仅当：候选池为空 / 工人已达 `cap`。
     /// 不映射为 VersionConflict（其它并发抢同一批的事务会被 SKIP LOCKED 跳过，本事务拿到 0 行视为池空）。
     ///
     /// 2026-09-30 修复「下发后不入池」bug：候选 CTE 原本 INNER JOIN
@@ -90,13 +99,25 @@ impl QueueRepo {
     /// 现在本 CTE 与看板、`batch/repo/queries.rs::count_held_by_worker` 三处
     /// **逐字一致**。
     ///
-    /// ⚠️ **守卫 `AND (SELECT n FROM held) < (SELECT max_held FROM max_batches)`
-    /// 必须留在 SQL 内、不得上提到 Rust 层**：它承担的是**原子性** —— 单条 SQL 内
-    /// 计算容量 + 选候选 + `FOR UPDATE SKIP LOCKED` 锁行 + UPDATE。拆成
-    /// 「先 count 后 UPDATE」两步后，并发双抢会双双看到 `held = max-1` 然后双双
-    /// 放行，超发。`take_specific_from_pool` 反过来是**刻意不做**这个守卫的
-    /// （它由 service 层 `QueueService::ensure_worker_has_capacity` 承担），差别在
-    /// 于那条 SQL 不带 `FOR UPDATE`、无法在单条语句内锁住容量。
+    /// ## 2026-10-15 一处变化：cap 由 service 传入（原 `max_batches` CTE 删除）
+    ///
+    /// 守卫从 `AND (SELECT n FROM held) < (SELECT max_held FROM max_batches)`
+    /// 改为 `AND (SELECT n FROM held) < $4`，`max_batches` CTE 与其对
+    /// `t_work_type` 的 LEFT JOIN 一并删除。新语义：cap = 工种自动补料上限
+    /// （`auto_allocate_limit`，NULL 时兜底 `max_held_batches`），由三条自动路径
+    /// 的 service 统一算出；**工种未配 `max_held_batches` 的 20904 早退也在
+    /// service**，SQL 层不再有「NULL 折 0 拦死」这条路径。手动单批路径
+    /// （`take_specific_from_pool` / `pick-up`）仍按 `max_held_batches` 由
+    /// `ensure_worker_has_capacity` 守卫，与 `cap` 无关。
+    ///
+    /// ⚠️ **守卫必须留在 SQL 内、不得上提到 Rust 层**：它承担的是**同一事务内
+    /// 顺序取料的原子性** —— 单条语句内计算容量 + 选候选 + `FOR UPDATE SKIP
+    /// LOCKED` 锁行 + UPDATE，循环里的第 N 次取料能看到前 N-1 次已 commit 的
+    /// 自写行。⚠️ **但它不保证「跨事务并发下工人不会超发 1 批」**：两个并发事务
+    /// 各自语句的 `held` 快照都早于对方 commit，`SKIP LOCKED` 只让两边锁不同
+    /// 候选行 ⇒ 均可能通过守卫。真正串行化需要 worker 级锁（行锁 / advisory
+    /// lock），与 `take_specific_from_pool` 的同类问题一起登记为独立重构，
+    /// 见 `QueueService::ensure_worker_has_capacity` 的 doc。
     ///
     /// ## 为什么从 `query_as!` 改成运行时 `query` + `AssertSqlSafe`
     ///
@@ -110,6 +131,7 @@ impl QueueRepo {
         worker_id: i64,
         shelf_id: Option<i64>,
         process_ids: &[i64],
+        cap: i32,
         operator_user_id: i64,
     ) -> Result<Option<TakenItem>, AppError> {
         let sql = format!(
@@ -130,11 +152,6 @@ impl QueueRepo {
                   AND status = 'IN_PROCESS'
                   AND deleted_at IS NULL
             ),
-            max_batches AS (
-                SELECT COALESCE(wt.max_held_batches, 0) AS max_held
-                FROM t_worker w LEFT JOIN t_work_type wt ON wt.id = w.work_type_id
-                WHERE w.id = $1
-            ),
             candidate AS (
                 SELECT pb.id, pb.version, pb.part_id,
                        -- 已上传 G_CODE → TRUE。透传给 `TakenItem.has_cnc_program`
@@ -154,7 +171,9 @@ impl QueueRepo {
                   AND pb.current_process_id = ANY($3)
                   AND pb.deleted_at IS NULL
                   AND p.deleted_at IS NULL
-                  AND (SELECT n FROM held) < (SELECT max_held FROM max_batches)
+                  -- 2026-10-15：cap 由 service 传入（auto_allocate_limit 兜底
+                  -- max_held_batches），见函数 doc。
+                  AND (SELECT n FROM held) < $4
                 ORDER BY {POOL_PRIORITY_ORDER_SQL}
                 LIMIT 1
                 FOR UPDATE OF pb SKIP LOCKED
@@ -163,7 +182,7 @@ impl QueueRepo {
                 UPDATE t_part_batch pb
                 SET current_holder_id = $1, location = 'WORKER',
                     version = pb.version + 1,
-                    updated_at = NOW(), updated_by = $4
+                    updated_at = NOW(), updated_by = $5
                 FROM candidate
                 WHERE pb.id = candidate.id
                   AND pb.version = candidate.version
@@ -188,6 +207,7 @@ impl QueueRepo {
             .bind(worker_id)
             .bind(shelf_id)
             .bind(process_ids)
+            .bind(cap)
             .bind(operator_user_id)
             .fetch_optional(&mut *conn)
             .await
@@ -365,8 +385,7 @@ impl QueueRepo {
     ///   WORKER 持有时 current_holder_id = worker_id 非 shelf_id，故 shelf_code
     ///   通常为 None
     ///
-    /// 排序：按 `t_part_batch.id ASC`（与 `list_held_by_worker` 保持一致；前端按
-    /// batch_id 稳定展示）。
+    /// 排序：按 `t_part_batch.id ASC`（前端按 batch_id 稳定展示）。
     ///
     /// 索引命中：`ix_t_part_batch_holder_location` 覆盖 `(current_holder_id,
     /// location)` 谓词；JOIN t_part 走主键 `t_part.id`；JOIN t_customer / t_applicant

@@ -25,9 +25,11 @@
    `refill.stopped_reason`**（§2.5）—— `refill` 是内嵌的 `RefillResult`
    （`prod::scan::vo::transition::WorkerScanOut::refill`），与
    `POST /queue/refill` 的响应体**同一个 VO**：refill 一批也没抢到时该键出现，取
-   `"POOL_EMPTY"`（真·池空）/ `"WORKER_FULL"`（工人已拿满）；抢到东西时**整个键不出现**
-   （`skip_serializing_if`）。逐字段、判据与那条「诊断只在没抢到时执行」的性能口径见
-   [`queue.md`](queue.md) §3.2。⇒ **向后兼容**：不读该键的客户端零改动照常工作。
+   **`"POOL_EMPTY"`（真·池空）/ `"WORKER_FULL"`（工人已拿满硬上限）/
+   `"AUTO_LIMIT_REACHED"`（2026-10-15 新增：工种自动上限触顶，工人仍可手动多领）**；
+   抢到东西时**整个键不出现**（`skip_serializing_if`）。逐字段、判据与那条「诊断只在没抢到时执行」
+   的性能口径见 [`queue.md`](queue.md) §3.2 / §4.8。⇒ **向后兼容**：不读该键的客户端
+   零改动照常工作。
 
    ⚠️ 同一改动还**收窄了本端点的 WS 行为**：refill 因「工人已拿满」停下时**不再**广播
    `WORKER_POOL_EMPTY`（§4.2）—— 前端若靠该事件提示「没抢到料」，现在会收不到，
@@ -273,9 +275,11 @@ $ grep -rno 'worker??\.\(id\|name\|badge_code\|work_type_id\|work_type_name\|id_
    这个名字本身不承诺这件事）。**不要**为它另发一条查询。
 2. **`max_held_batches` 为 NULL 时发 `0` 而不是 `null`** —— 沿用队列板
    `prod::queue::board::service.rs` 的 `w.max_held.unwrap_or(0)` 既有约定。语义正确：
-   NULL 的含义是「**未配置**」而非「不限」（见 `docs/api/queue.md` §4.7），此时
-   `pick-up` 返 `20904`、`take_one_from_pool` 当 cap 0，即「该工种不可取件」；发
-   `null` 反而有让前端渲染成「不限」的风险。
+   NULL 的含义是「**未配置**」而非「不限」（见 `docs/api/queue.md` §4.7），工种未配
+   max ⇒ 各路径在**服务入口即早退**（`pick-up` / `move` / `refill` 返 `20904`，
+   auto-allocate 逐 worker 记 `MAX_BATCHES_NOT_SET` 跳过），`take_one_from_pool`
+   自 **2026-10-15** 起不再读工种上限（`max_batches` CTE 已删）；发 `null` 反而有让
+   前端渲染成「不限」的风险。
 3. 两个计数都是**裸 number**（本仓约定：只有雪花 id 才转 string）。
 
 ⚠️ **`/pickable`（端点 2）不携带这两个字段** —— 它按 `work_type_id` 作用域，
@@ -346,7 +350,7 @@ JSON **形状**逐字不变（键集一字未动）；`scan.batch_id` 的**取�
 | `scan.batch_id` | string | ⚠️ **本次实际被处理的那一批**：拆批场景（§2.4.1）= 拆出来的**新批次**，整批场景 = 工人手上那批 |
 | `scan.event_type` | string | ⚠️ **可能与请求的不同**，见 §4.1 |
 | `scan.synced_assembly_id` | string \| null | 父装配件真变了才有值（handler 据此发 `ASSEMBLY_UPDATED`） |
-| `refill` | `RefillResult` | 同事务 refill（`QueueService::refill_for_worker_with_work_type`）。**2026-10-14 起 5 字段** = `worker_id` / `shelf_id`（worker-scan 路径恒 `null`，refill 无架锚）/ `taken[]` / `pool_empty` / **`stopped_reason`**（可选键：refill 一批也没抢到时出现，取 `"POOL_EMPTY"` / `"WORKER_FULL"`，抢到东西时**整个键不出现**）。逐字段与判据见 [`queue.md`](queue.md) §3.2；真源 `prod/queue/vo/worker.rs::RefillResult` |
+| `refill` | `RefillResult` | 同事务 refill（`QueueService::refill_for_worker_with_work_type`）。**2026-10-14 起 5 字段** = `worker_id` / `shelf_id`（worker-scan 路径恒 `null`，refill 无架锚）/ `taken[]` / `pool_empty` / **`stopped_reason`**（可选键：refill 一批也没抢到时出现，取 `"POOL_EMPTY"` / `"WORKER_FULL"` / **`"AUTO_LIMIT_REACHED"`**（2026-10-15 新增），抢到东西时**整个键不出现**）。⭐ **2026-10-15：refill 的目标口径改为「补到工种自动上限 `auto_allocate_limit`（未配置兜底 `max_held_batches`）」**（逐条见 [`queue.md`](queue.md) §4.8）。逐字段与判据见 [`queue.md`](queue.md) §3.2；真源 `prod/queue/vo/worker.rs::RefillResult` |
 
 `work_type_id` / `badge_code` / `split` 是**内部管道字段**（`#[serde(skip)]`）：前两个
 把 `worker_scan_event` 已 fetch 过的 worker 信息透传给同事务的
@@ -530,6 +534,11 @@ step 指针与「当前工序在链内的位置」是两个独立事实，而 wo
 也会向所有订阅端推一条名为 `WORKER_POOL_EMPTY` 的事件，看板照样把停机原因归给
 「池里没货」。现在改读 `refill.stopped_reason == "POOL_EMPTY"`，与
 [`queue.md`](queue.md) §7 的 `POST /queue/refill` 逐字同款。
+
+⚠️ **广播条件只认 `"POOL_EMPTY"`（2026-10-15 复核，未变）**：`WORKER_FULL`、
+**`AUTO_LIMIT_REACHED`**（自动上限触顶）、`MAX_BATCHES_NOT_SET` 都**不广播**
+`WORKER_POOL_EMPTY` —— 事件名表达的是「池里没货」，其余成因广播它会把看板归因带偏；
+这些成因只有触发方从 HTTP 响应里看得到。
 
 **两个 WS 产出点，都要读它**（漏一处就重新引入两套判据）：
 
@@ -726,6 +735,16 @@ SQL 里聚合，一处他域的 service / repo 都不 import（连 `PartRepoTrai
       **收窄**为「真·池空」（§4.2）：「工人已拿满」这条状态 WS 上不再有信号，前端只能
       从**本响应体**拿 —— 放回 / 送检两页的「没抢到料」提示必须改读
       `refill.stopped_reason`，不能只依赖 WS 事件。
+11. **2026-10-15：`refill.stopped_reason` 扩三值 + refill 目标口径变更**
+    （`prod::queue` 的自动分配上限特性，整域口径见 [`queue.md`](queue.md) §4.8）：
+    - `refill`（本端点内嵌的那段与 `POST /queue/refill` 同 VO）现在**补到工种自动上限**
+      `t_work_type.auto_allocate_limit`（未配置兜底 `max_held_batches`）；
+    - `stopped_reason` 新增 `"AUTO_LIMIT_REACHED"`：工种配了自动上限且工人已达该上限
+      （但**未**触顶 `max_held_batches`）⇒ 自动补料停下，**工人仍可走手动路径
+      （pick-up / move）取到 max**。放回 / 送检两页的「没抢到料」提示按三值分支，
+      `AUTO_LIMIT_REACHED` 应提示「自动补料已到上限，可手动领取」；
+    - ⚠️ `WORKER_POOL_EMPTY` 的广播条件**不变**（仍只认 `POOL_EMPTY`，见 §4.2）；
+    - pick-up 的容量守卫**不受自动上限影响**（仍只按 `max_held_batches` 判，§2.6.1）。
 
 ## 8. 已知偏差登记
 

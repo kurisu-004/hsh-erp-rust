@@ -140,12 +140,12 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 | 子模块 | 端点数 | URL 前缀 | 表 | 说明 |
 |---|---:|---|---|---|
 | `prod::worker` | 6 | `/api/v2/prod/workers` | `t_worker` | 工人档案主数据（**2026-10-10** 报工台的 `POST /verify-badge` 迁往 `prod::scan`，旧路径 `/prod/workers/verify-badge` **405** —— 落进 `/{id}` 而那条只注册 GET） |
-| `prod::work_type` | 7 | `/api/v2/prod/work-types` | `t_work_type` + `t_work_type_process` | 工种 CRUD 5 + 工种↔工序映射 2 |
+| `prod::work_type` | 7 | `/api/v2/prod/work-types` | `t_work_type` + `t_work_type_process` | 工种 CRUD 5 + 工种↔工序映射 2。**2026-10-15** 新增 `auto_allocate_limit`（自动补料上限：NULL 兜底 max、有值须 1..=max，create / update 合并校验） |
 | `prod::process` | 5 | `/api/v2/prod/processes` | `t_process` | 工序主数据（INHOUSE/OUTSOURCE）；**2026-10-02 订正**：文档原写 6，逐 router 复核为 5（`/` 的 GET+POST 算 2 条 route） |
 | `prod::process_chain` | 3 | `/api/v2/prod/process-chains` | `t_part_process_chain` + `t_process_chain_step` | 工单工艺链 |
 | `prod::shelf_process` | 3 | `/api/v2/prod/shelf-processes` | `t_shelf_process` | **2026-10-02 新增**：货架 ↔ 工序映射，2026-10-02 自当时的 shelf 域搬入（`t_shelf_process` 关联的是 prod 域实体 `t_process`，故归 prod 而非 iam）。旧路径 `GET|POST /api/v2/shelves/{id}/processes` + `GET /api/v2/shelves/processes` 已删除（**无 alias**；⚠️ 2026-10-10 起这三条在 wire 上的形态统一变成 404 —— `/api/v2/shelves` 整段前缀随货架子模块迁入 iam 而下线）。这 3 个端点请求 / 响应契约逐字不变；前端配套改动清单见 `src/modules/prod/shelf_process/mod.rs` 的模块 doc |
 | ⚠️ **货架本体不在本表**：货架子模块 `iam::shelf`（5 端点）是 iam 域下的嵌套子模块，见下表 |
-| `prod::queue` | 9 | `/api/v2/prod/queue` | `t_part_batch`（候选池视图）+ `t_process` / `t_worker` / `t_work_type` / `t_shelf`（板聚合只读） | **2026-10-08** `prod::worker_pool` 更名（URL `/pool` → `/queue`，**硬切无 alias**）+ 从 `prod::batch` 吸收下发流 3 条（`pending` / `dispatch` / `auto-dispatch`）+ 召回 1 条（`{batch_id}/recall-to-pending` → `POST /queue/recall`，`batch_id` 改入 body）+ 新增队列板聚合 2 条（`GET /snapshot` / `GET /processes/{id}`，消掉 `/state` `/counts` `/{process_id}` 三条旧读）。整域契约见 [`docs/api/queue.md`](docs/api/queue.md) |
+| `prod::queue` | 9 | `/api/v2/prod/queue` | `t_part_batch`（候选池视图）+ `t_process` / `t_worker` / `t_work_type` / `t_shelf`（板聚合只读） | **2026-10-08** `prod::worker_pool` 更名（URL `/pool` → `/queue`，**硬切无 alias**）+ 从 `prod::batch` 吸收下发流 3 条（`pending` / `dispatch` / `auto-dispatch`）+ 召回 1 条（`{batch_id}/recall-to-pending` → `POST /queue/recall`，`batch_id` 改入 body）+ 新增队列板聚合 2 条（`GET /snapshot` / `GET /processes/{id}`，消掉 `/state` `/counts` `/{process_id}` 三条旧读）。整域契约见 [`docs/api/queue.md`](docs/api/queue.md)。**2026-10-15**：`refill` / `auto-allocate` / worker-scan 同事务 refill 的 target 改为工种自动上限 `auto_allocate_limit`（兜底 `max_held_batches`），`auto-allocate` 删除 `mode` / `fill_ratio`（入参只剩 `{ process_id, shelf_id }`） |
 | `prod::batch` | 17 | `/api/v2/prod/batches` | `t_part_batch` | 批次流转域（**2026-10-08** 下发流 3 条 + 召回 1 条剥离往 `prod::queue` 后剩 23 条；**2026-10-09** 外协三端点合并为 `POST /api/v2/outsource-queue/move`（`outsource` 域）后剩 20 条，同日**拆批 1 条提升为顶层共用端点 `POST /api/v2/batches/split`**（`batch_id` 入 body、三处消费）后剩 19 条；2026-10-07 待品检队列读 `GET /inspection` 迁往 `prod::inspection`；**2026-10-10 报工台 2 条 `POST /worker-scan` + `POST /{batch_id}/pick-up` 迁往 `prod::scan`** 后剩 **17** 条）。⚠️ **本域有 2 处挂载**：本行的域内前缀 + 顶层 `/api/v2/batches`（拆批，经 `prod::split_router()` 转发，登记在 `src/modules/mod.rs::v2_router()`）。**权威路由清单是 `src/modules/prod/batch/handler/mod.rs::ROUTES`**（`mod tests` 断言它与 `router()` 源码逐条一致），域整体处于逐端点剥离的中间态、尚未删除；剥离登记表见 `STRIP_TARGETS` 与 [`docs/api/batch.md`](docs/api/batch.md) |
 | `prod::programming` | 1 | `/api/v2/prod/programming` | `t_part` + `t_part_batch` + chain | 待编程一览（2026-10-01 新增） |
 | `prod::process_design` | 1 | `/api/v2/prod/process-design` | `t_part` | **2026-10-05 新增**：制定工序页零件列表。软删闸门 + `status = 'PENDING'` 闸门，7 字段最小集，**刻意不加** `AND assembly_id IS NULL` 守卫（part 域 `GET /parts` 带 `part_only: true` 会把装配件子件全部排除）故**含装配件子件**；入参只有 `sort_dir` / `limit` / `offset`。前端「制定工序」页自 part 域 `GET /api/v2/parts?status=PENDING` 切来，part 域旧端点保留兼容、一行未改 |
@@ -456,8 +456,23 @@ t_assembly.status               ← 派生缓存
   且清单不穷尽）见 [`docs/api/batch.md`](docs/api/batch.md) §6.1。
 - ⚠️ **`t_work_type.max_held_batches` 的 `NULL` = 「未配置」，不是「不限」**
   （2026-10-14 订正列注释，migration `20261014000001_001_fix_max_held_batches_column_comment`）：
-  `move` / `refill` / 报工台 `pick-up` 返 `20904`，`take_one_from_pool` 的 CTE 按
-  **cap 0** 拦死。完整三路径对照见 [`docs/api/queue.md`](docs/api/queue.md) §4.7。
+  `move` / `refill` / 报工台 `pick-up` 返 `20904`，`auto-allocate` 逐 worker 记
+  `MAX_BATCHES_NOT_SET` 跳过。「未配 max ⇒ 不可取件」由各路径的 service 入口把关
+  （**2026-10-15** 起 `take_one_from_pool` 不再自己查 max，cap 由 service 算出传入）。
+  完整四路径对照见 [`docs/api/queue.md`](docs/api/queue.md) §4.7。
+- ⚠️ **`t_work_type.auto_allocate_limit`（自动分配上限，2026-10-15 新增）**：
+  三条自动补料路径（`POST /prod/queue/refill`、`POST /prod/queue/auto-allocate`、
+  报工台 worker-scan 的同事务 refill）的 target =
+  `auto_allocate_limit.unwrap_or(max_held_batches)`；`NULL` = 未配置 ⇒ 兜底 max；
+  有值须 `1..=max_held_batches`（create / update 同一处合并校验矩阵，错误码
+  `20104`）；**`move` / `pick-up` 手动单批路径只按 `max_held_batches` 判、不受自动
+  上限约束**（「自动补料只补到 auto、人工可临时手动领到 max」是刻意分工）；自动路径
+  触顶的诊断字面量是 `AUTO_LIMIT_REACHED`（`stopped_reason` / `skipped_reason`；
+  ⚠️ `WORKER_POOL_EMPTY` 的 WS 广播条件不变、仍只认 `POOL_EMPTY`）。同一轮删除
+  auto-allocate 的 `mode` / `fill_ratio`（TIME 模式下线，`max_held_minutes` 列保留
+  但不被 Rust 引用；`20703` / `20704` 错误码释放）。完整口径见
+  [`docs/api/queue.md`](docs/api/queue.md) §3.2 / §4.8 与
+  [`docs/api/scan.md`](docs/api/scan.md) §2.5 / §4.2。
 - **终态序列号归档事件的 id 必须是真实雪花**（`StatusChange::event_id`，由 caller 从
   `SnowflakeIdGenerator` 透传）：`GET /parts/{id}/events` 是 `ORDER BY id DESC`，
   拿 `part_id` 之类的建单期 id 顶替会把归档事件排到时间线最底部，且二次进终态时

@@ -408,9 +408,13 @@ impl ScanListingRepo {
     ///
     /// `t_worker LEFT JOIN t_work_type` + `COALESCE(wt.max_held_batches, 0)`：
     /// 与队列板 `prod::queue::board::service.rs` 的 `w.max_held.unwrap_or(0)` 是
-    /// **同一个约定** —— 工种未配上限时按 0 发，而不是 `null`（语义正确：此时
-    /// `pick-up` 返 `BIZ_WORK_TYPE_MAX_HELD_NOT_SET`、`take_one_from_pool` 当 cap 0，
-    /// 即「该工种不可取件」；发 `null` 有让前端渲染成「不限」的风险）。
+    /// **同一个约定** —— 工种未配上限时按 0 发，而不是 `null`（语义正确：工种未配
+    /// max ⇒ 各路径在**服务入口即早退** —— `pick-up` / `move` / `refill` 返
+    /// `20904 BIZ_WORK_TYPE_MAX_HELD_NOT_SET`、auto-allocate 逐 worker 记
+    /// `MAX_BATCHES_NOT_SET` 跳过，即「该工种不可取件」；发 `null` 有让前端渲染成
+    /// 「不限」的风险）。⚠️ `take_one_from_pool` 自 **2026-10-15** 起**不再读工种
+    /// 上限**（原 `max_batches` CTE 已删，cap 改由 service 传入），上面这条早退
+    /// 判据只活在 service 层。
     /// LEFT JOIN 同时覆盖「工种被软删」—— `t_work_type` 无软删闸门、`t_worker` 有，
     /// 悬空 `work_type_id` 取不到就落到 COALESCE 的 0。
     ///
@@ -419,8 +423,10 @@ impl ScanListingRepo {
     /// listing_aggregation_depends_on_no_other_domain` 扫（`assert_no_foreign_domain`
     /// 在剥掉注释后的代码区里找「跨域根段 + `::`」），任何他域 import 都会让它变红。
     /// 读他域的**表**是允许的既定 pattern（本文件本来就读 `t_part_batch` 等），
-    /// import 他域的**符号**才违规。同款 `COALESCE(..., 0)` 写法在
-    /// `crate::modules::prod::queue::repo::sql` 的 `max_batches` CTE 里已是既有形状。
+    /// import 他域的**符号**才违规。本处 `COALESCE(..., 0)` 只服务本出参的「未配
+    /// 上限发 0」约定，**不要**据此在 `prod::queue::repo::sql` 复活已删的
+    /// `max_batches` CTE —— 容量守卫的 cap 由 service 算出后传入（见该函数
+    /// 2026-10-15 的 doc）。
     ///
     /// `fetch_optional` + `unwrap_or(0)` 兜「worker 不存在 / 已软删」——
     /// `/held` 对不存在的 worker 返回**空列表**而不是报错（既有行为，本次改动

@@ -48,8 +48,13 @@ VALUES
 --    BIZ_WORK_TYPE_MAX_HELD_NOT_SET；
 --  - `/prod/queue/refill` → `20904`（刻意回归
 --    `tests/production/queue.rs::max_held_null_returns_error`）；
---  - `take_one_from_pool` 的 CTE 里 `COALESCE(max_held_batches, 0)` 当 cap 0
---    ⇒ 直接拦死抢料。
+--  - `POST /queue/auto-allocate` → 逐 worker 记 `MAX_BATCHES_NOT_SET`（不报错）。
+--  ⚠️ 2026-10-15 订正：此前这里写「`take_one_from_pool` 的 CTE 里
+--  `COALESCE(max_held_batches, 0)` 当 cap 0 ⇒ 直接拦死抢料」—— 那个 `max_batches`
+--  CTE 已随「自动分配上限」特性删除，cap 改由 service 计算后传入
+--  （`auto_allocate_limit` 兜底 `max_held_batches`），SQL 内不再有 cap 0。
+--  本 fixture **不配 `auto_allocate_limit`**（留 NULL）：自动路径兜底 max=10，
+--  与引入该列前的行为逐字一致。
 --  此前 fixture 把两个工种都设成 NULL，等于让**所有**建在这两个工种上的
 --  取件/下发用例隐式编码「无守卫」的旧行为（2026-10-14 补 pick-up 守卫后
 --  `tests/production/pickup.rs` 集体转红 9 条）。生产库真实工种全是 10，

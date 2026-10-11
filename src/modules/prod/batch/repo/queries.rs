@@ -1,8 +1,9 @@
 //! `t_part_batch` SQL 真源 ZST `PartBatchRepo` + 固有静态方法。
 //!
 //! 2026-10-02 随 `t_part_batch` 归属迁入 prod 域（生产执行单元 = 批次）。
-//! 本文件是 `t_part_batch` 的 **SQL 真源**，16 个 `PartBatchRepo::xxx` 静态方法
-//! （通用 `get_by_id` 已上移 `shared::batch::read`，见下方小节）；
+//! 本文件是 `t_part_batch` 的 **SQL 真源**，15 个 `PartBatchRepo::xxx` 静态方法
+//! （通用 `get_by_id` 已上移 `shared::batch::read`，见下方小节；
+//! 2026-10-15 删一处全仓零调用方的死代码读侧方法，16 → 15）；
 //! 跨域调用方（part / assembly / delivery_note / wx / prod::queue / task）
 //! 走 `PartBatchRepo::xxx(&mut *conn, ...)` 静态调用形态。
 //!
@@ -1107,44 +1108,6 @@ impl PartBatchRepo {
         .fetch_one(executor)
         .await?;
         Ok(n)
-    }
-
-    /// 工人当前持有批次列表（**死代码**）。同样命中 `ix_t_part_batch_holder_location`。
-    ///
-    /// ⚠️ **全仓零调用方**（2026-10-14 实测：只有本函数与 `PartBatchRepoTrait` 的
-    /// 声明 / 转发 impl 提到它；它服务的 worker-pool `state` 端点早已随该域更名删除）。
-    /// 它是公开 trait 方法，删除要动域边界（`prod::batch` → `prod::queue` 剥离的
-    /// 中间态），故留着不动 —— **但不要因此以为它在服务谁**。
-    ///
-    /// ⚠️ **本查询无 `status` 过滤，与 [`Self::count_held_by_worker`] 分叉**：那个
-    /// 同门函数已按 `docs/api/queue.md` §4.3 补 `status = 'IN_PROCESS'`，本函数仍是
-    /// 「只要 `location='WORKER'` 就算」⇒ 被取消 / 强制完成的批次会混进结果。**接线前
-    /// 必须先补 `status='IN_PROCESS'`**，否则同一份「工人持有」会出现两个口径。
-    ///
-    /// 2026-09-16 PR-3 批次 step 化：删 next_process_id / placed_at，加
-    /// current_process_step_id。
-    pub async fn list_held_by_worker<'e, E: PgExecutor<'e>>(
-        executor: E,
-        worker_id: i64,
-    ) -> Result<Vec<TPartBatch>, sqlx::Error> {
-        sqlx::query_as!(
-            TPartBatch,
-            r#"
-            SELECT id, part_id, batch_no, quantity, status, location,
-                   current_holder_id, current_process_id, current_process_step_id,
-                   delivery_note_id, delivery_seq, parent_batch_id,
-                   is_repairing,
-                   version, created_at, created_by, updated_at, updated_by, deleted_at
-            FROM t_part_batch
-            WHERE current_holder_id = $1
-              AND location = 'WORKER'
-              AND deleted_at IS NULL
-            ORDER BY id ASC
-            "#,
-            worker_id,
-        )
-        .fetch_all(executor)
-        .await
     }
 
     /// DELIVERED 状态且 DELIVERED 事件 `created_at` 早于 threshold 的批次 ID 列表。

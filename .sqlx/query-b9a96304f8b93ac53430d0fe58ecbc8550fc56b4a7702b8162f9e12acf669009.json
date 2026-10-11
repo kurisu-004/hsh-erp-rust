@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, code, name, description, sort_order, version,\n                   created_at, created_by, updated_at, updated_by, deleted_at,\n                   max_held_batches\n            FROM t_work_type\n            WHERE code = $1 AND deleted_at IS NULL\n            ",
+  "query": "\n            SELECT id, code, name, description, sort_order, version,\n                   created_at, created_by, updated_at, updated_by, deleted_at,\n                   max_held_batches, auto_allocate_limit\n            FROM t_work_type\n            WHERE id = ANY($1) AND deleted_at IS NULL\n            ORDER BY id ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -134,11 +134,22 @@
             "name": "max_held_batches"
           }
         }
+      },
+      {
+        "ordinal": 12,
+        "name": "auto_allocate_limit",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_work_type",
+            "name": "auto_allocate_limit"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
-        "Text"
+        "Int8Array"
       ]
     },
     "nullable": [
@@ -153,8 +164,9 @@
       false,
       true,
       true,
+      true,
       true
     ]
   },
-  "hash": "44cd48213d3c4fef2d3250bbdd6039630f6cadb7e40d19663009f0feb082faed"
+  "hash": "b9a96304f8b93ac53430d0fe58ecbc8550fc56b4a7702b8162f9e12acf669009"
 }

@@ -1383,7 +1383,16 @@ async fn count_held(pool: &PgPool, worker_id: i64) -> i64 {
 /// 三处一致性（判据同源，语义必须同口径）：
 /// - `/prod/queue/move` + `ensure_worker_has_capacity` → `20904`；
 /// - `/prod/queue/refill` → `20904`（上述既有测试）；
-/// - `take_one_from_pool` 的 `COALESCE(max_held_batches, 0)` 当 cap 0 ⇒ 拦死抢料。
+/// - `POST /queue/auto-allocate` → 逐 worker 记 `MAX_BATCHES_NOT_SET` + `target: 0`
+///   （批量端点不因一个未配的工种整体失败）。
+///
+/// ⚠️ **2026-10-15 订正**：此前这里写「`take_one_from_pool` 的
+/// `COALESCE(max_held_batches, 0)` 当 cap 0 拦死抢料」—— 那个 `max_batches` CTE
+/// 已随「自动分配上限」特性删除，cap 改由 service 计算后传入
+/// （`auto_allocate_limit` 兜底 `max_held_batches`）；「未配 max ⇒ 不可取件」
+/// 现在由三条路径各自的 service 入口把关，SQL 内不再有 cap 0。
+/// ⚠️ `ensure_worker_has_capacity` **只按 `max_held_batches`（硬上限）判，与
+/// `auto_allocate_limit`（自动上限）无关** —— pick-up 是手动单批路径。
 #[tokio::test]
 async fn pick_up_work_type_without_max_held_returns_20904() {
     let ctx = bootstrap().await;
@@ -1524,5 +1533,92 @@ async fn pick_up_when_worker_full_returns_20204_without_splitting() {
         count_held(&ctx.pool, worker_id).await,
         1,
         "失败后工人仍只持有第 1 批"
+    );
+}
+
+/// 2026-10-15：带自动补料上限的工种（`insert_work_type` 的 auto 版，本文件独享）。
+async fn insert_work_type_with_auto(
+    pool: &PgPool,
+    code: &str,
+    max_held_batches: Option<i32>,
+    auto_allocate_limit: Option<i32>,
+) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+    let id = next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_work_type (id, code, name, sort_order, max_held_batches, \
+         auto_allocate_limit, version, created_at, updated_at) \
+         VALUES ($1, $2, $2, 0, $3, $4, 0, $5, $5)",
+    )
+    .bind(id)
+    .bind(code)
+    .bind(max_held_batches)
+    .bind(auto_allocate_limit)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_work_type");
+    id
+}
+
+/// G4（2026-10-15）：`pick-up` **不受自动上限约束** —— auto=1 / max=3 的工种，
+/// 工人已持 1 批（= auto）仍可取第 2 批（< max）。
+///
+/// 「自动补料只到 auto、人工手动仍可领到 max」是刻意分工（见
+/// `prod::scan::service::pickup` 的容量守卫注释）；本用例把 pick-up 这一半钉死
+/// —— 若有人在 `ensure_worker_has_capacity` 里补上 auto 校验，本用例转红。
+#[tokio::test]
+async fn pick_up_is_not_limited_by_auto_allocate_limit() {
+    let ctx = bootstrap().await;
+    let wt = insert_work_type_with_auto(&ctx.pool, "PICKUP-AUTO-1", Some(3), Some(1)).await;
+    let worker_id = insert_active_worker(&ctx.pool, wt).await;
+
+    // 第 1 批：正常领取，占满 auto=1（仍低于 max=3）
+    let part1 = insert_part(&ctx.pool, 10).await;
+    let batch1 = insert_part_batch(&ctx.pool, part1, 10, "IN_PROCESS", Some(ctx.shelf_id())).await;
+    let (s1, env1) = send(
+        ctx.app.clone(),
+        json_request(
+            "POST",
+            &format!("/prod/scan/batches/{batch1}/pick-up"),
+            Some(json!({
+                "version": 0,
+                "worker_id": worker_id.to_string(),
+                "shelf_id": ctx.shelf_id().to_string(),
+            })),
+            Some(&ctx.manager),
+        ),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK, "第 1 批应领取成功: {env1}");
+    assert_eq!(count_held(&ctx.pool, worker_id).await, 1);
+
+    // 第 2 批：已到 auto=1，但 pick-up 只按 max=3 判 ⇒ 仍放行
+    let part2 = insert_part(&ctx.pool, 10).await;
+    let batch2 = insert_part_batch(&ctx.pool, part2, 10, "IN_PROCESS", Some(ctx.shelf_id())).await;
+    let (s2, env2) = send(
+        ctx.app.clone(),
+        json_request(
+            "POST",
+            &format!("/prod/scan/batches/{batch2}/pick-up"),
+            Some(json!({
+                "version": 0,
+                "worker_id": worker_id.to_string(),
+                "shelf_id": ctx.shelf_id().to_string(),
+            })),
+            Some(&ctx.manager),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s2,
+        StatusCode::OK,
+        "pick-up 是手动路径，只按 max=3 判 ⇒ 第 2 批应放行: {env2}"
+    );
+    assert_eq!(
+        count_held(&ctx.pool, worker_id).await,
+        2,
+        "工人应持有 2 批（auto=1 不约束手动路径）"
     );
 }
