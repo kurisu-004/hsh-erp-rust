@@ -13,6 +13,9 @@
 //! - `transfer.rs` —— 扫码接管（`POST /scan/take-over`，**2026-10-15 新增 S2**；
 //!   holder worker → worker + 工序顺推的原子写，与 S1 `locate` 的 `TAKE_OVER`
 //!   判定同源）
+//! - `outsource_receive.rs` —— 外协确认收回（`POST /scan/outsource-receive`，
+//!   **2026-10-15 新增 S3**；回收臂内核复用 outsource 域的
+//!   `receive_from_outsource_inner`，stage② 复用本域 `pick_up` 的原子编排）
 //!
 //! 两条只读聚合端点（`/scan/pickable` / `/scan/held`）**不在本目录**：它们在
 //! [`super::listing`] 子模块里（该子模块受域隔离护栏覆盖，必须零跨域依赖）。
@@ -36,6 +39,7 @@
 #![allow(deprecated, clippy::too_many_arguments, clippy::type_complexity)]
 
 pub mod badge;
+pub mod outsource_receive;
 pub mod pickup;
 pub mod transfer;
 pub mod worker_scan;

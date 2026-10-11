@@ -802,9 +802,12 @@ async fn locate_outsource_chain_next_not_in_work_type_returns_none_with_reason()
 }
 
 /// 外协批次 + 有链但推导不出 `NEXT`（当前工序已被清空）
-/// → `NONE + PROCESS_CHAIN_REQUIRED`（对位写侧 20706）。
+/// → **仍给 `RECEIVE_FROM_OUTSOURCE`**（2026-10-15 S3 订正：此前给
+/// `NONE + PROCESS_CHAIN_REQUIRED`，是**假阻挡** —— 写端点
+/// `POST /scan/outsource-receive` 支持前端手填 `next_process_id`，
+/// 推导不出只是「前端要弹手填」，不是「不能点」）。
 #[tokio::test]
-async fn locate_outsource_chain_without_position_returns_none_with_chain_required() {
+async fn locate_outsource_chain_without_position_still_returns_receive_action() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let customer = insert_customer_l2(&pool, "LOCATE-OS-NOPOS").await;
     let proc = seed_process(&pool, "LOC-OS-NP", "工序").await;
@@ -838,8 +841,50 @@ async fn locate_outsource_chain_without_position_returns_none_with_chain_require
     assert_eq!(s, StatusCode::OK, "{env}");
     let b = first_batch(&env);
     assert_eq!(b["chain_state"], "NONE");
-    assert_eq!(b["action"], Value::Null);
-    assert_eq!(b["disabled_reason"], "PROCESS_CHAIN_REQUIRED");
+    assert_eq!(
+        b["action"], "RECEIVE_FROM_OUTSOURCE",
+        "推不出下一道不是不能点（写侧支持手填 next_process_id）: {env}"
+    );
+    assert_eq!(b["disabled_reason"], Value::Null);
+}
+
+/// 外协批次 + **无链** + 工人容量已满 → `NONE + WORKER_HOLD_LIMIT_EXCEEDED`。
+///
+/// 2026-10-15 S3 回归：放开「推不出下一道」的链判定后，容量闸门仍必须在 ——
+/// 无链形态走「前端手填下一道」的流，但手填之前工人得还有额度
+/// （对位写侧 `POST /scan/outsource-receive` 的容量预检 `20204` / `20904`）。
+#[tokio::test]
+async fn locate_outsource_manual_next_capacity_gate_still_applies() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "LOCATE-OS-MAN").await;
+    let proc = seed_process(&pool, "LOC-OS-MAN", "工序").await;
+    let wt = insert_work_type(&pool, "WT-OS-MAN", "工种", Some(1)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let worker = insert_worker(&pool, "BC-OS-MAN", "工", Some(wt)).await;
+    let company = insert_outsource_company(&pool, "外协公司-丁").await;
+    // 工人已经拿满 1/1
+    insert_worker_held_part(&pool, customer, "SN-OS-MAN-HELD", worker, proc, 1, true).await;
+    // 目标：无链外协在途批次（手填下一道形态）
+    let (_part, batch, _step) =
+        insert_worker_held_part(&pool, customer, "SN-OS-MAN", worker, proc, 1, false).await;
+    force_batch_state(
+        &pool,
+        batch,
+        "OUTSOURCE",
+        Some("OUTSOURCE_COMPANY"),
+        Some(company),
+    )
+    .await;
+
+    let (s, env) = locate(&app, &token, "SN-OS-MAN", Some(worker)).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let b = first_batch(&env);
+    assert_eq!(
+        b["action"],
+        Value::Null,
+        "容量触顶时不得给可点按钮（哪怕链判定已放开）: {env}"
+    );
+    assert_eq!(b["disabled_reason"], "WORKER_HOLD_LIMIT_EXCEEDED");
 }
 
 /// 品检中批次 → `NONE + INSPECTION`（指引找品检）。

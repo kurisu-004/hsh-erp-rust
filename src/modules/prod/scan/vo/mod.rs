@@ -15,6 +15,9 @@
 //!   （放回 / 送检）
 //! - `take_over.rs` —— `TakeOverOut`（2026-10-15 新增的第 7 条端点
 //!   `POST /scan/take-over` 扫码接管；`synced_assembly_id` 是内部管道字段，不进 JSON）
+//! - `outsource_receive.rs` —— `OutsourceReceiveOut`（2026-10-15 新增的第 8 条端点
+//!   `POST /scan/outsource-receive` 外协确认收回；`picked_quantity` 是内部管道字段，
+//!   不进 JSON）
 //!
 //! pick-up 端点的出参**不在本模块**：它的 HTTP 响应体是 `R<PartOut>`（10 字段的
 //! part 级最小投影，与 to-XXX 三流共用），本次迁移只改 URL 与 handler / service
@@ -23,12 +26,14 @@
 
 pub mod listing;
 pub mod locate;
+pub mod outsource_receive;
 pub mod take_over;
 pub mod transition;
 pub mod worker;
 
 pub use listing::{HeldListOut, ScanChainState, ScanListItem, ScanListOut};
 pub use locate::{LocateAction, LocateBatchItem, LocateDisabledReason, LocateOut, LocatePartBrief};
+pub use outsource_receive::OutsourceReceiveOut;
 pub use take_over::TakeOverOut;
 pub use transition::{WorkerScanCoreOut, WorkerScanOut, WorkerScanSplitInfo};
 pub use worker::ScanWorkerBrief;

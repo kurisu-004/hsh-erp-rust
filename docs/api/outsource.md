@@ -99,6 +99,7 @@ router 工厂始终是 **4 个**（`company_router` / `quote_router` / `shipment
 - `process_id` 不存在或已软删（端点 4.2）→ `20801 BIZ_PROCESS_NOT_FOUND`（**HTTP 404**）。
 - i64 雪花主键一律序列化为 JSON **string**；Decimal（`price` / `unit_price` / `total_price`）一律**字符串**。
 - 端点 4.3 的 `version` **无 `#[serde(default)]`**：缺失 → HTTP **422 纯文本**（axum `Json` 提取器），不是业务信封。
+- ⚠️ **2026-10-15：回收臂内核被 `prod::scan` 复用**（`POST /api/v2/prod/scan/outsource-receive`，见 [`scan.md`](scan.md) §2.9）：`OUTSOURCE_COMPANY → PRODUCTION_SHELF` 臂的全部写入（选架 → 批次落位 → 关开口 shipment → `RECEIVED_FROM_OUTSOURCE` 事件）已抽成 `pub(crate)` 的 `service::move.rs::receive_from_outsource_inner`，供本端点与 scan 端点两处调用。**本端点的行为逐字未变**：角色守卫仍在 `move_batch` 第一行（Manager + Clerk + Inspector），下一道解析仍走同文件 `pub(crate)` 的 `resolve_receive_next_process`（其两段 `20706` 文案不变）。
 
 ### 1.5 路由注册顺序（硬约束，见 handler 源码注释）
 
@@ -486,6 +487,8 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 
 `ensure_transition` 依赖 `PartStatus::can_transition_to`（`part::statemachine` 的内存迁移表）。发送方向用到的两条边是 `PENDING → OUTSOURCE` 与 `IN_PROCESS → OUTSOURCE`；⚠️ `IN_PROCESS → OUTSOURCE` 这条边**曾经缺失**，导致「可发送一览的行（几乎全是 `IN_PROCESS` 源）发一单就被 `20103` 拒」，端到端实测下外协发送 100% 不可用。状态机补边后守卫 6b 才真正承担 location 不变式 —— 别因为「守卫 6 已经能拒」就把它删掉。
 
+⚠️ **2026-10-15：回收臂内核抽离（不改守卫）**。`OUTSOURCE_COMPANY → PRODUCTION_SHELF` 的写入段抽成 `service/move.rs::receive_from_outsource_inner`（`pub(crate)`，逐行搬移、判据与文案零改动），供 `prod::scan` 的 `POST /scan/outsource-receive` 复用；`resolve_receive_next_process` 同步改 `pub(crate)`。**守卫 1–6 仍全部留在 `move_batch` 内**（角色守卫在第一行，位置未动），本节的守卫顺序 / 错误码逐条不变。
+
 ### 5.2 出池不变式（回收直送品检方向已下线）
 
 该方向的 `OUTSOURCE → INSPECTION` 是**出池**（`current_process_id` 与
@@ -591,6 +594,8 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 ### 8.2 跨域依赖登记
 
 本域**整体不适用**域隔离护栏：它继承既定的「经本域 trait 转发其它域单表查询」pattern（`OutsourceRepoTrait` 转发 `t_part` / `t_part_batch` / `t_process`），并调用 `shared::batch::guards`（批次状态写入口的薄包装）。
+
+⚠️ **2026-10-15**：`move` 的回收臂内核（`receive_from_outsource_inner`）与下一道推导（`resolve_receive_next_process`）改为 `pub(crate)`，被 `prod::scan` 的 `POST /scan/outsource-receive` 复用 —— 这是**反向暴露**（本域主动供他域调用），不是本域新增对他域的依赖；两条回收路径共用同一份实现，避免选架口径 / 关单 / 事件字面量漂移。
 
 ### 8.3 前端配套改动清单（外协看板接线）
 

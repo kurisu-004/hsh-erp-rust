@@ -68,7 +68,7 @@ pub enum LocateAction {
     ReceiveFromOutsource,
 }
 
-/// 「不能点」的原因（`LocateBatchItem.disabled_reason` 的非空取值，10 个字面量钉死）。
+/// 「不能点」的原因（`LocateBatchItem.disabled_reason` 的非空取值，9 个字面量钉死）。
 ///
 /// 分组（与 service 的判定优先级同序：状态类 → 工种未绑定 → 工序 ∉ 工种 → 容量）：
 /// - 状态类（**写侧没有任何按钮可点**，前端只做指引）：`PROGRAMMING`（待编程，
@@ -76,8 +76,10 @@ pub enum LocateAction {
 ///   `UNKNOWN`（无法归类的状态 / 位置组合）；
 /// - 资格类：`WORK_TYPE_NOT_SET`（工人未绑工种）→ `PROCESS_NOT_IN_WORK_TYPE`
 ///   （链首 / 推导出的下一道不在该工种的活跃工序映射里）→
-///   `PROCESS_CHAIN_STEP_NOT_FOUND`（有链但链内无活跃 step，写侧无处可落）→
-///   `PROCESS_CHAIN_REQUIRED`（有链但推不出下一道，写侧 20706）；
+///   `PROCESS_CHAIN_STEP_NOT_FOUND`（有链但链内无活跃 step，写侧无处可落）。
+///   ⚠️ 原第 4 个资格类 `PROCESS_CHAIN_REQUIRED` 已于 **2026-10-15 S3 删除**：
+///   外协收回写端点支持「前端手填 `next_process_id`」，把「有链但推不出下一道」
+///   判成不可点是**假阻挡**（详见 `listing/service.rs::outsource_gate` 的 doc）；
 /// - 容量类：`WORK_TYPE_MAX_HELD_NOT_SET`（工种未配 `max_held_batches` ⇒ 该工种
 ///   不可取件）→ `WORKER_HOLD_LIMIT_EXCEEDED`（已达 `max_held_batches`）。
 ///
@@ -99,8 +101,6 @@ pub enum LocateDisabledReason {
     ProcessNotInWorkType,
     /// 有链但链内没有未软删 step ⇒ 写侧没有可落的链首（对位写侧 `20702`）。
     ProcessChainStepNotFound,
-    /// 有链但推不出下一道（指针漂移 / 当前工序不在链内等）⇒ 对位写侧 `20706`。
-    ProcessChainRequired,
     /// 该工人持有的批次已达工种上限 `max_held_batches`（对位写侧 `20204`）。
     WorkerHoldLimitExceeded,
     /// 工种未配 `max_held_batches`（`NULL` = 未配置 ⇒ 不可取件，对位写侧 `20904`）。
@@ -336,10 +336,13 @@ mod tests {
         }
     }
 
-    /// `disabled_reason` 的 **10 个** wire 字面量逐字钉死。
+    /// `disabled_reason` 的 **9 个** wire 字面量逐字钉死。
     ///
     /// 少一个都会让前端落到 `else` 分支静默显示错误文案；`SCREAMING_SNAKE_CASE`
     /// 的大小写本身也是契约（与 `chain_state` 的 `UPPERCASE` 同款纪律）。
+    ///
+    /// 2026-10-15 S3：`PROCESS_CHAIN_REQUIRED` 随外协收回写端点落地被删除
+    /// （假阻挡，见 `listing/service.rs::outsource_gate`），10 → 9。
     #[test]
     fn locate_disabled_reason_literals_are_pinned() {
         for (reason, want) in [
@@ -357,10 +360,6 @@ mod tests {
             (
                 LocateDisabledReason::ProcessChainStepNotFound,
                 "\"PROCESS_CHAIN_STEP_NOT_FOUND\"",
-            ),
-            (
-                LocateDisabledReason::ProcessChainRequired,
-                "\"PROCESS_CHAIN_REQUIRED\"",
             ),
             (
                 LocateDisabledReason::WorkerHoldLimitExceeded,

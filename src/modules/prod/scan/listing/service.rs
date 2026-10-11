@@ -351,19 +351,24 @@ fn take_over_gate(row: &LocateBatchRow, ctx: &LocateWorkerCtx) -> Option<LocateD
     capacity_gate(ctx)
 }
 
-/// 外协收回的闸门：有链且 `NEXT` ⇒ 校验「下一道 ∈ 我工种映射」（对位 S3 写侧）；
-/// 有链但推不出 `NEXT` ⇒ `PROCESS_CHAIN_REQUIRED`（对位写侧 `20706` —— 自动推导
-/// 路径推不出下一道时拒收，运营手填即可）；**无链 ⇒ 放行**（前端收下一道，
-/// S3 写侧按显式 `next_process_id` 接收）。最后过容量。
+/// 外协收回的闸门：**有链且 `NEXT`** ⇒ 校验「下一道 ∈ 我工种映射」（对位 S3 写侧
+/// `POST /scan/outsource-receive` 的 `20104`）；**其余形态（无链 / 有链但推不出
+/// `NEXT`）一律放行** —— 写侧对这两种形态走「前端手填 `next_process_id`」的流
+/// （无链时写侧缺省必拒 `40001`、有链推不出按其 `20706` 文案拒），前端弹手填即可。
+///
+/// ⚠️ **2026-10-15 S3 订正（假阻挡）**：此前「有链但推不出 NEXT」返回
+/// `PROCESS_CHAIN_REQUIRED`（`NONE`），但写侧 `receive_from_outsource_inner` 的
+/// `next_process_id` 显式分支**原样放行**、其 `20706` 文案本身就写「请手填」——
+/// 即会点成功的操作被读侧藏掉了按钮。该 reason 变体已随之删除。
+///
+/// `next_process_in_work_type` 投影的谓词是「**链内推导出的下一道** ∈ 工种映射」，
+/// 只在 `NEXT` 形态下被消费。最后过容量。
 fn outsource_gate(row: &LocateBatchRow, ctx: &LocateWorkerCtx) -> Option<LocateDisabledReason> {
-    if row.has_chain {
-        if chain_state_of(row) == ScanChainState::Next {
-            if !row.next_process_in_work_type {
-                return Some(LocateDisabledReason::ProcessNotInWorkType);
-            }
-        } else {
-            return Some(LocateDisabledReason::ProcessChainRequired);
-        }
+    if row.has_chain
+        && chain_state_of(row) == ScanChainState::Next
+        && !row.next_process_in_work_type
+    {
+        return Some(LocateDisabledReason::ProcessNotInWorkType);
     }
     capacity_gate(ctx)
 }

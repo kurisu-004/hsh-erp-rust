@@ -5,6 +5,8 @@
 //! - `listing.rs` —— 两条只读聚合端点（`GET /scan/pickable` / `GET /scan/held`）
 //! - `locate.rs` —— 扫码找件 · 诊断（`GET /scan/locate`，**2026-10-15 新增**）
 //! - `take_over.rs` —— 扫码接管（`POST /scan/take-over`，**2026-10-15 新增 S2**）
+//! - `outsource_receive.rs` —— 外协确认收回（`POST /scan/outsource-receive`，
+//!   **2026-10-15 新增 S3**）
 //! - `transition.rs` —— 放回 / 送检（`POST /scan/worker-scan`）+ 手动 pick-up
 //!   （`POST /scan/batches/{batch_id}/pick-up`）
 //!
@@ -25,6 +27,7 @@ use crate::state::AppState;
 pub mod badge;
 pub mod listing;
 pub mod locate;
+pub mod outsource_receive;
 pub mod take_over;
 pub mod transition;
 
@@ -38,8 +41,13 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/locate", get(locate::locate))
         // 2026-10-15 S2：扫码接管（第 7 条端点）。同为 1 段静态，注册顺序无关。
         .route("/take-over", post(take_over::take_over))
+        // 2026-10-15 S3：外协确认收回（第 8 条端点）。同为 1 段静态，注册顺序无关。
+        .route(
+            "/outsource-receive",
+            post(outsource_receive::outsource_receive),
+        )
         // ---- 2 段：首段静态 `batches` + 动态 `{batch_id}` ----
-        // 本域只有这一条 2 段以上路由，与上面 6 条 1 段静态路由**段数不同** ⇒
+        // 本域只有这一条 2 段以上路由，与上面 7 条 1 段静态路由**段数不同** ⇒
         // `matchit` 结构上不可能冲突，注册顺序不影响结果（实测
         // `POST /scan/batches/pick-up` 与 `POST /scan/batches/1/pick-up` 都按
         // 本条命中）。将来新增 2 段首段动态路由时，静态组才必须在前（先例见

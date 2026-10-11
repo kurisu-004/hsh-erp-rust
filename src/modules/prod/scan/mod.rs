@@ -28,6 +28,21 @@
 //! 方法不匹配 405；两条 batch 域旧路径整段路由已不存在 ⇒ 404。⚠️「落进 catch-all
 //! ⇒ 400」这个直觉不总成立，段的**数量**是分水岭，详见 §1.2 的「教训登记」。
 //!
+//! ## 2026-10-15：扫码找件 · 自助恢复三件套（第 6 / 7 / 8 条端点，纯新增）
+//!
+//! | 端点 | 说明 |
+//! |---|---|
+//! | `GET /scan/locate?serial_no=&worker_id=` | S1：只读诊断（位置事实 + 针对该工人的 `action` / `disabled_reason`） |
+//! | `POST /scan/take-over` | S2：扫码接管（holder worker → worker + 工序顺推的原子写） |
+//! | `POST /scan/outsource-receive` | S3：外协确认收回（收回落自动选架 + 立刻交到扫码工人，同一事务） |
+//!
+//! 三条端点的判据都与对应写侧守卫**同源**（会成功的绝不显示 `NONE`、会拒绝的绝不
+//! 显示可点按钮），逐条对照见 `docs/api/scan.md` §3.6。S3 的「收回落架」内核复用
+//! `outsource::service::move_svc::receive_from_outsource_inner`（`pub(crate)`）。
+//! ⚠️ S3 修正了 S1 的一处**假阻挡**：`locate` 此前对有链但推不出 `NEXT` 的外协
+//! 批次给 `NONE`，而写侧支持手填 `next_process_id` ⇒ 该硬阻挡与
+//! `LocateDisabledReason::ProcessChainRequired` 变体已一并删除。
+//!
 //! ## 模块结构
 //! - `dto.rs` —— 5 条端点的全部入参（`VerifyBadgeRequest` / `PickableQuery` /
 //!   `HeldQuery` / `WorkerScanEvent` / `WorkerScanRequest` / `PickUpRequest`）
