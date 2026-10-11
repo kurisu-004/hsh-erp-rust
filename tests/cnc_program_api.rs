@@ -33,12 +33,19 @@ async fn setup() -> PgPool {
 }
 
 fn test_current_user(roles: Vec<Role>) -> CurrentUser {
+    test_current_user_with_perms(roles, &[])
+}
+
+/// 同 [`test_current_user`]，另装权限点（2026-10-14：`/download-url` alias 随
+/// `get_file_with_url` 迁到权限点 `part.drawing.print` 后按需构造持有者）。
+fn test_current_user_with_perms(roles: Vec<Role>, perms: &[&str]) -> CurrentUser {
     CurrentUser {
         id: 1,
         username: "cnc_tester".into(),
         roles,
         shelf_ids: vec![],
         shelf_wildcard: false,
+        permissions: perms.iter().map(|s| s.to_string()).collect(),
     }
 }
 
@@ -248,7 +255,9 @@ async fn list_pairs_for_part() {
 async fn alias_download_url_returns_part_file_with_url() {
     let pool = setup().await;
     let part_id = CncProgramFixture::PART_ID;
-    let current = test_current_user(vec![Role::Manager]);
+    // `get_file_with_url` 的守卫是权限点 `part.drawing.print`（2026-10-14 迁移），
+    // alias 端点逐字共用 ⇒ fixture 同时装角色与点。
+    let current = test_current_user_with_perms(vec![Role::Manager], &["part.drawing.print"]);
     let cos = Arc::new(NoopCos);
 
     let mut tx = pool.begin().await.unwrap();

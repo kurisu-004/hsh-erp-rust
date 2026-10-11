@@ -17,7 +17,10 @@
    find-or-create + DP 分配 + 拆批 + 挂单），删 7 条端点；新增只读扫码三层树
    `GET /scan/{serial_no}`；新增 DP 批次分配算法。
 4. **打印链路全删**（前端改 hucre 本地生成 xlsx）+ 新增 `POST /{id}/driver` 与 `GET /drivers`
-   + `/pickup` 入参瘦身并重跑司机校验。
+   + `/pickup` 入参瘦身并重跑司机校验。⚠️ 2026-10-14 起 RBAC 里登记了 **前端-only** 权限点
+   `delivery_note.print`（后端打印端点已删、无守卫可迁；授权矩阵照前端
+   `frontend/src/utils/deliveryNotePermissions.ts::canPrint` 的放行集合：
+   MANAGER / CLERK / INSPECTOR），前端按钮显隐以该权限点为准。
 5. **VO 字段裁剪 29 个** + `RemoveParts` → `RemoveBatches` 改名 + `SubmitDeliveryOut` 塌缩为
    `R<String>`。
 6. **菜单 `delivery_dispatch` 下线**（`seeds/menu.sql`，非 migration —— seed 每次启动重放）：
@@ -722,7 +725,7 @@ schema 与页面都在用」。
 | 10 | 领取请求瘦身 | `POST /{id}/pickup` body 只发 `{ version }`；先调 `POST /{id}/driver` 指定司机 |
 | 11 | 提交返回类型 | `POST /{id}/submit` 的 `data` 从 `SubmitDeliveryOut` 改成 **string**（单据 id） |
 | 12 | 移除批次路径 | `POST /{id}/remove-parts` → `POST /{id}/remove-batches` |
-| 13 | 打印改本地生成 | 删 `POST /{id}/print` / `print-labels` 两个请求，xlsx 由前端 **hucre** 本地生成 |
+| 13 | 打印改本地生成 | 删 `POST /{id}/print` / `print-labels` 两个请求，xlsx 由前端 **hucre** 本地生成；按钮显隐改用权限点 `delivery_note.print`（2026-10-14 注册，矩阵＝原 `canPrint` 的 MANAGER / CLERK / INSPECTOR，后端零守卫） |
 | 14 | 分组权限 | `/group` 的 3 个写端点现在也接受 Inspector 角色（前端 `canEditGroup` 的角色白名单要加 Inspector） |
 | 15 | VO 字段裁剪 | 从 Zod schema 里删 §6.2 的 29 个字段（多余字段若非 `.strict()` 会静默通过，删 schema 才是真删） |
 | 16 | **删 `delivery_dispatch` 菜单页** | ⛔ 后端已下线该菜单（`seeds/menu.sql` §3.5 软删 + §4.1 / §4.3 白名单移除 + §4.6 回收 `role_menu`），而前端 `src/views/delivery-dispatch/DispatchNoteList.vue` 仍在。**该页依赖的恰好是本轮删掉的两条端点**（`GET /pickup-pending` / `POST /{id}/pickup-scan`）⇒ 不删就是「菜单能点、页面能开、每个请求都 404」的活条目。后端无 alias，这是前端必须同步删的一页 |

@@ -101,6 +101,15 @@ async fn login_success_returns_token_pair_and_stamps_last_login() {
     assert!(data["refresh_token"].as_str().unwrap().len() > 20);
     assert_eq!(data["user"]["username"], fx.manager_username);
     assert_eq!(data["user"]["roles"][0], "MANAGER");
+    // 2026-10-14：权限点 code 全集随登录下发（前端 `hasPermission` 的输入）——
+    // 必填键恒存在，MANAGER 按 seeds/rbac.sql 矩阵至少含 part.drawing.print
+    let perms = data["user"]["permissions"]
+        .as_array()
+        .expect("user.permissions 必填键必须存在（无权限时应为 [] 而不是缺键）");
+    assert!(
+        perms.iter().any(|p| p == "part.drawing.print"),
+        "MANAGER 应装载 part.drawing.print: {perms:?}"
+    );
     // id 序列化为字符串
     let id_str = data["user"]["id"].as_str().expect("user.id 是字符串");
     assert_eq!(id_str.parse::<i64>().unwrap(), fx.manager_user_id);
@@ -154,7 +163,7 @@ async fn login_user_with_no_roles_returns_403_20606() {
 }
 
 // ===========================================================================
-// 2. me (2)
+// 2. me (3)
 // ===========================================================================
 
 #[tokio::test]
@@ -172,6 +181,69 @@ async fn me_success_returns_full_user_view() {
     assert_eq!(
         env["data"]["id"].as_str().unwrap().parse::<i64>().unwrap(),
         fx.manager_user_id
+    );
+    // 2026-10-14：`/iam/me` 从 DB 重算权限码，同样带 permissions 必填键
+    let perms = env["data"]["permissions"]
+        .as_array()
+        .expect("/iam/me 的 permissions 必填键必须存在（无权限时应为 [] 而不是缺键）");
+    assert!(
+        perms.iter().any(|p| p == "part.drawing.print"),
+        "/iam/me 应装载 MANAGER 的 part.drawing.print: {perms:?}"
+    );
+}
+
+/// `permissions` 键**恒存在**（2026-10-14 新增字段，前端 `currentUserSchema`
+/// 声明为必填）：无权限点时为 `[]` 而不是缺键。
+///
+/// 用 target 用户加挂 SHELF_ACCOUNT 验证空数组形态（默认矩阵对该角色不授任何
+/// 权限点）；MANAGER 的非空形态在 `login_success_*` / `me_success_*` 断言。
+#[tokio::test]
+async fn empty_permissions_is_empty_array_not_missing_key() {
+    let (pool, app, fx) = bootstrap().await;
+    let (_, login_env) = login_admin(app, &fx.manager_username, IamFixture::PASSWORD).await;
+    let mgr = login_env["data"]["token"].as_str().unwrap().to_string();
+
+    // target 原本无角色；授 SHELF_ACCOUNT（带货架 scope）后即可登录
+    let app2 = fresh_app(&pool).await;
+    let (status, env) = send(
+        app2,
+        json_request(
+            "POST",
+            &format!("/iam/users/{}/roles", fx.target_user_id),
+            Some(json!({ "role": "SHELF_ACCOUNT", "scope_type": "shelf", "scope_id": fx.shelf_a_id })),
+            Some(&mgr),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "add_role: {env}");
+
+    // 登录：permissions 必须是空数组，键不得缺
+    let app3 = fresh_app(&pool).await;
+    let (status, env) = login_admin(app3, &fx.target_username, IamFixture::PASSWORD).await;
+    assert_eq!(status, StatusCode::OK, "target 登录: {env}");
+    let perms = env["data"]["user"]["permissions"]
+        .as_array()
+        .expect("user.permissions 必填键必须存在（无权限时应为 [] 而不是缺键）");
+    assert!(
+        perms.is_empty(),
+        "SHELF_ACCOUNT 无权限点，应为 []: {perms:?}"
+    );
+    let target_token = env["data"]["token"].as_str().unwrap().to_string();
+
+    // /iam/me 同口径（me 从 DB 重算，不读请求 token 里的 session 缓存）
+    let app4 = fresh_app(&pool).await;
+    let (status, env) = send(
+        app4,
+        json_request("GET", "/iam/me", None, Some(&target_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "me: {env}");
+    let perms = env["data"]["permissions"]
+        .as_array()
+        .expect("/iam/me 的 permissions 必填键必须存在（无权限时应为 [] 而不是缺键）");
+    assert!(
+        perms.is_empty(),
+        "SHELF_ACCOUNT 无权限点，应为 []: {perms:?}"
     );
 }
 

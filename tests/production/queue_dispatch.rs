@@ -10,7 +10,8 @@
 //!   7. auto-dispatch_preview 无 chain 的 batch → skip_reason=NO_PROCESS_CHAIN（只读，不写库）
 //!   8. auto-dispatch_preview 空 batch_ids → 40001 VALIDATION_ERROR (HTTP 422)
 //!   9. OCC 40901 VERSION_CONFLICT（双事务并发，A 持有 tx 占用 batch 行，B 调 dispatch 应 40901）
-//!  10. 角色守卫：Inspector 调 dispatch → 40300 FORBIDDEN
+//!  10. 角色 / 权限守卫：Inspector 调 dispatch → 40300 FORBIDDEN；
+//!      CLERK（持有 `queue.dispatch`）→ 成功（2026-10-14 权限点迁移后补正向）
 //!  11. GET pending：unauth → 40100
 //!  12. 回归（2026-09-30 review 第 3 轮 L5）：**无工序链工单** dispatch 后出现在
 //!      `GET /prod/queue/{process_id}` + `/prod/queue/counts`（用户报告的原始 bug）
@@ -41,8 +42,8 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 
 use hsh_erp_test_support::{
-    ProductionFixture, json_request, load_production_fixture, login_token, send, test_app,
-    test_pool, test_state,
+    PartFixture, ProductionFixture, json_request, load_production_fixture, login_token, send,
+    test_app, test_pool, test_state,
 };
 
 // ===========================================================================
@@ -57,6 +58,23 @@ async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, ProductionFixt
     let fx = load_production_fixture(&pool).await;
     let app = test_app(test_state(pool.clone()).await);
     let token = login_token(&app, &fx.part_manager_username, ProductionFixture::PASSWORD).await;
+    (pool, app, token, fx)
+}
+
+/// 起一份 fresh database + 加载 production fixture + 以 CLERK 身份登录。
+///
+/// CLERK 由 part fixture 提供（`fx_part_clerk`），持有 `queue.dispatch`
+/// 权限点（seeds/rbac.sql 矩阵），用于 dispatch 的**正向**权限用例。
+async fn bootstrap_as_clerk() -> (PgPool, axum::Router, String, ProductionFixture) {
+    let pool = test_pool().await;
+    let fx = load_production_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+    let token = login_token(
+        &app,
+        PartFixture::CLERK_USERNAME,
+        ProductionFixture::PASSWORD,
+    )
+    .await;
     (pool, app, token, fx)
 }
 
@@ -851,6 +869,55 @@ async fn dispatch_forbidden_for_inspector() {
     .await;
     assert_eq!(s, StatusCode::FORBIDDEN, "Inspector 应 403: {env}");
     assert_eq!(env["code"], 40300, "FORBIDDEN: {env}");
+}
+
+/// 场景 10b（2026-10-14）: CLERK 调 dispatch → 成功。
+///
+/// 写路径迁到权限点 `queue.dispatch` 后，矩阵是 MANAGER + CLERK；此前端点级
+/// 只有 MANAGER 的成功用例与 Inspector 的 403，CLERK 的正向放行没有走过 HTTP
+/// 全链路（单测层的 `make_current` 直造 `permissions`，绕开了登录装载）。
+#[tokio::test]
+async fn dispatch_succeeds_for_clerk() {
+    let (pool, app, token, fx) = bootstrap_as_clerk().await;
+    let process_a = fx.process_a_id;
+
+    let customer_id = insert_customer_l2(&pool, "ACME").await;
+    let part_id = insert_part(&pool, customer_id).await;
+    let batch_id = insert_part_batch(&pool, part_id).await;
+    let _shelf_id = insert_shelf_process_mapping(&pool, process_a).await;
+
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/queue/dispatch",
+            Some(json!({
+                "targets": [{
+                    "batch_id": batch_id.to_string(),
+                    "target_process_id": process_a.to_string(),
+                }]
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "CLERK 调 dispatch 应成功: {env}");
+    assert_eq!(
+        env["data"]["succeeded"]
+            .as_array()
+            .map(|a| a.len())
+            .unwrap_or(0),
+        1,
+        "应下发成功 1 条: {env}"
+    );
+
+    // DB 侧：批次进入 IN_PROCESS（与 MANAGER happy path 同一结果口径）
+    let status: String = sqlx::query_scalar("SELECT status FROM t_part_batch WHERE id = $1")
+        .bind(batch_id)
+        .fetch_one(&pool)
+        .await
+        .expect("读 batch.status");
+    assert_eq!(status, "IN_PROCESS");
 }
 
 /// 场景 11: GET pending 未登录 → 40100 UNAUTHORIZED

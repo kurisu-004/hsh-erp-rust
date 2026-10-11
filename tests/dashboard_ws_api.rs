@@ -746,6 +746,7 @@ async fn mint_test_token_with_ttl(
         roles: vec!["MANAGER".into()],
         shelf_ids: vec![],
         shelf_wildcard: true,
+        permissions: Vec::new(),
     };
     state
         .session

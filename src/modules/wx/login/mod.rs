@@ -52,13 +52,14 @@
 //! 由 `tests/wecom_login.rs::wx_login_issued_token_works_on_iam_me` 钉死。
 //!
 //! ## 不复用 `iam::vo::LoginResponse`（2026-10-11 新增决策）
-//! 旧实现直接返回 `iam::vo::LoginResponse`（8 字段：`token` / `refresh_token` +
-//! `user{id, username, full_name, is_active, roles, shelf_ids, menus}`）。本子模块
+//! iam 的 `LoginResponse` 是 9 字段：`token` / `refresh_token` +
+//! `user{id, username, full_name, is_active, roles, permissions, shelf_ids, menus}`。本子模块
 //! 改出自己的 [`vo::WxLoginOut`]（6 字段），理由见 `vo.rs` 的模块 doc：前端的
 //! `applyLoginResponse`（`wx-app/miniprogram/services/auth.ts:78-87`）只读 6 个
-//! 字段，`expires_in` / `is_active` / `shelf_ids` / `menus` 小程序全用不到，而
-//! `shelf_ids` / `menus` 是 Web 端货架范围与菜单树的载体，对小程序是**多余负载**。
-//! iam 域的结构在 [`service`] 层只作为**中间值**存在，不作为响应类型。
+//! 字段，`expires_in` / `is_active` / `shelf_ids` / `menus` / `permissions` 小程序
+//! 全用不到，而 `shelf_ids` / `menus` / `permissions` 是 Web 端货架范围、菜单树
+//! 与权限点的载体，对小程序是**多余负载**。iam 域的结构在 [`service`] 层只作为
+//! **中间值**存在，不作为响应类型。
 //!
 //! ## 模块结构（照 `prod::process_design` / `prod::inspection` 范式）
 //! - `dto.rs` —— 入参（仅 `Deserialize`；校验在 service 层显式做，见 `dto.rs` doc）

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::routing::{get, post};
 
-use crate::modules::iam::shelf;
+use crate::modules::iam::{rbac, shelf};
 use crate::state::AppState;
 
 mod account;
@@ -13,12 +13,16 @@ mod session;
 
 /// iam 域 router（挂在 `/api/v2/iam`，见 `modules::v2_router`）
 ///
-/// 端点拆分（account 12 + session 5 + shelf 5 = 22）：
+/// 端点拆分（account 12 + session 5 + shelf 5 + rbac 8 = 30）：
 /// - session 端点（`session.rs`，5 个）：挂在 `/iam` 根
 /// - account 端点（`account.rs`，12 个）：挂在 `/iam/users`
 ///   （9 个账号 CRUD/角色/改密 + 3 个企业微信绑定）
 /// - shelf 端点（`iam::shelf::handler`，5 个）：挂在 `/iam/shelves`，
 ///   由嵌套子模块自带 router 工厂，本文件只做挂载（详见 `iam/shelf/mod.rs`）
+/// - rbac 端点（`iam::rbac::handler`，**2026-10-14 新增** 8 个）：挂在 `/iam`
+///   **根**（`/iam/roles`、`/iam/permissions`、`/iam/menus`）—— 与 session 端点
+///   同层而非 `/iam/rbac/*`，它是 iam 域的一等公民。守卫用
+///   `require_role(Manager)` 而非权限点（防自锁）的理由见 `iam/rbac/mod.rs`
 ///
 /// ## 硬切记录（2026-10-10）
 /// - 5 条货架端点自 `/api/v2/shelves/*` 迁到 `/api/v2/iam/shelves/*`，
@@ -64,8 +68,13 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{id}/wx-bind/unbind", post(account::unbind_wx_identity));
     // 2026-10-10：货架子模块迁入 iam，路由自 `/api/v2/shelves/*` 硬切到
     // `/api/v2/iam/shelves/*`（无 alias，旧路径 404）。
+    // 2026-10-14：RBAC 子模块挂 `/iam` 根（与 session 端点同层，不是 `/iam/rbac`）。
+    // 本域没有 1 段 catch-all：`users` nest 下的 `/{id}` 与 rbac 的 `/roles` 等
+    // 同段静态路由被各自的前缀（`/users` vs 根）隔开，互不竞争；merge 顺序只按
+    // 「先 session / users / shelves，末尾追加新子域」的可读顺序排列。
     Router::new()
         .merge(session)
         .nest("/users", users)
         .nest("/shelves", shelf::router())
+        .merge(rbac::router())
 }
