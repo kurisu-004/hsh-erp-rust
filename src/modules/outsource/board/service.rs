@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use sqlx::PgConnection;
 
-use crate::auth::rbac::{CurrentUser, Role};
+use crate::auth::rbac::CurrentUser;
 use crate::infra::clock::now_shanghai_iso;
 use crate::modules::outsource::service::sendable::{
     can_send_of, decode_company_options, send_mode_of,
@@ -51,7 +51,9 @@ impl OutsourceQueueService {
         conn: &mut PgConnection,
         current: &CurrentUser,
     ) -> Result<OutsourceQueueSnapshot, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
+        // 2026-10-15：迁权限点 `outsource.view`（M,C,I；矩阵逐格等于原
+        // `require_any_role` 集合）。
+        current.require_permission("outsource.view")?;
         let (sendable, in_flight, meta) = OutsourceQueueRepo::snapshot(&mut *conn).await?;
 
         // 两侧计数求并集（任一非零都出 tab）。BTreeMap 保证 `process_id ASC` 稳定序。
@@ -98,7 +100,9 @@ impl OutsourceQueueService {
         current: &CurrentUser,
         process_id: i64,
     ) -> Result<OutsourceQueueProcessDetail, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
+        // 2026-10-15：迁权限点 `outsource.view`（M,C,I；矩阵逐格等于原
+        // `require_any_role` 集合）。
+        current.require_permission("outsource.view")?;
         let data = OutsourceQueueRepo::process_detail(&mut *conn, process_id).await?;
 
         // 在途批次按公司分组（一次查询结果的服务端分组，不是第二次查询）

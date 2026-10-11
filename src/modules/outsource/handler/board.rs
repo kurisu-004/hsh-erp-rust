@@ -6,7 +6,8 @@
 //! 两个都是**纯读**：handler `pool.acquire()` 不开事务，不发 WS 广播。
 //!
 //! ## 角色守卫
-//! 下沉到 service（`OutsourceQueueService::build_*` 入口 `require_any_role`），handler
+//! 下沉到 service（`OutsourceQueueService::build_*` 入口 `require_permission`
+//! `outsource.view`；2026-10-15 迁自角色守卫 M,C,I），handler
 //! 不重复校验 —— 与 work_type / assembly 域惯例一致。两个端点都是 Manager + Clerk +
 //! Inspector（旧 `/outsource-pool/state` 曾经是 Manager + Clerk 的更窄口径：它吐
 //! `unit_price` 与客户 / 申请人名，是外协域的敏感读面；看板把单价内联进公司列后，

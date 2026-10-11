@@ -44,7 +44,7 @@
 
 use sqlx::{AssertSqlSafe, PgConnection};
 
-use crate::auth::rbac::{CurrentUser, Role};
+use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::outsource::dto::{OutsourceLocation, OutsourceMoveRequest};
 use crate::modules::outsource::repo::OutsourceRepoTrait;
@@ -161,7 +161,9 @@ impl OutsourceMoveService {
         current: &CurrentUser,
     ) -> Result<OutsourceMoveResult, AppError> {
         // ① 角色守卫（service 入口第一行）
-        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
+        // 2026-10-15：迁权限点 `outsource.move`（M,C,I；发送 + 回收同一端点，
+        // 矩阵逐格等于原 `require_any_role` 集合）。
+        current.require_permission("outsource.move")?;
 
         let from_kind = location_kind(&req.from);
         let to_kind = location_kind(&req.to);

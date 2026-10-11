@@ -29,7 +29,8 @@
 //! 序列化在 commit 之前 —— 序列化的失败路径必须是回滚而不是「广播一个空 payload」。
 //!
 //! ## 角色守卫
-//! 下沉到 service（`OutsourceMoveService::move_batch` 入口 `require_any_role`），handler
+//! 下沉到 service（`OutsourceMoveService::move_batch` 入口 `require_permission`
+//! `outsource.move`；2026-10-15 迁自角色守卫 M,C,I），handler
 //! 不重复校验 —— 与本域其它端点一致。
 //!
 //! ## WS 事件名 `OUTSOURCE_MOVE_DONE`

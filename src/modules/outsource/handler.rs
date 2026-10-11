@@ -23,8 +23,12 @@
 //! handler 返回 `Result<Json<R<T>>, AppError>`，错误由 `AppError::into_response()`
 //! 装进同一个 `R` 信封。
 //!
-//! ## 权限
-//! 权限守卫在 service 层（`current.require_any_role`），handler 不重复校验。
+//! ## 权限（2026-10-15 第二批迁点后）
+//! 权限守卫在 service 层（`current.require_permission` / `require_role`），
+//! handler 不重复校验。本批迁入：`outsource.view`（看板读 / 报价读 / 公司读，
+//! 公司读收紧去 CNC）、`outsource.quote.edit`、`outsource.quote.approve`、
+//! `outsource.move`、`outsource.company.manage`。对账（shipment）两端点保持
+//! 角色守卫不动。
 //!
 //! ## 子模块
 //! - `board.rs` —— 外协看板只读聚合 2 端点（`snapshot` / `processes/{process_id}`）

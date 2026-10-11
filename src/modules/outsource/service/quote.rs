@@ -30,7 +30,7 @@
 
 use std::collections::HashMap;
 
-use crate::auth::rbac::{CurrentUser, Role};
+use crate::auth::rbac::CurrentUser;
 use crate::modules::outsource::dto::{
     OutsourceQuotablePartListQuery, OutsourceQuoteCreateRequest, OutsourceQuoteListQuery,
     OutsourceQuoteSoftDeleteRequest, OutsourceQuoteSubmitRequest,
@@ -149,7 +149,9 @@ impl OutsourceService {
         query: &OutsourceQuoteListQuery,
         current: &CurrentUser,
     ) -> Result<OutsourceQuoteListOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
+        // 2026-10-15：迁权限点 `outsource.view`（M,C,I；矩阵逐格等于原
+        // `require_any_role` 集合）。
+        current.require_permission("outsource.view")?;
         let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
         let offset = query.offset.unwrap_or(0).max(0);
         let sort_by = query.sort_by.as_deref().unwrap_or("CREATED_AT");
@@ -277,7 +279,10 @@ impl OutsourceService {
         query: &OutsourceQuotablePartListQuery,
         current: &CurrentUser,
     ) -> Result<QuotablePartListOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk])?;
+        // 2026-10-15：迁权限点 `outsource.quote.edit`（M,C；矩阵逐格等于原
+        // `require_any_role` 集合；可报价零件列表是报价工作流的辅助读，归本点
+        // 不推动 `outsource.view` 的角色集合）。
+        current.require_permission("outsource.quote.edit")?;
         let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
         let offset = query.offset.unwrap_or(0).max(0);
         let pat = keyword_pattern(query.keyword.as_deref());
@@ -318,7 +323,10 @@ impl OutsourceService {
         req: &OutsourceQuoteCreateRequest,
         current: &CurrentUser,
     ) -> Result<OutsourceQuoteOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk])?;
+        // 2026-10-15：迁权限点 `outsource.quote.edit`（M,C；矩阵逐格等于原
+        // `require_any_role` 集合；可报价零件列表是报价工作流的辅助读，归本点
+        // 不推动 `outsource.view` 的角色集合）。
+        current.require_permission("outsource.quote.edit")?;
         let part_id = parse_snowflake_id(&req.part_id, "part_id")?;
         let company_id = parse_snowflake_id(&req.outsource_company_id, "outsource_company_id")?;
         let process_id = parse_snowflake_id(&req.process_id, "process_id")?;
@@ -413,7 +421,10 @@ impl OutsourceService {
         req: &OutsourceQuoteSubmitRequest,
         current: &CurrentUser,
     ) -> Result<OutsourceQuoteOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk])?;
+        // 2026-10-15：迁权限点 `outsource.quote.edit`（M,C；矩阵逐格等于原
+        // `require_any_role` 集合；可报价零件列表是报价工作流的辅助读，归本点
+        // 不推动 `outsource.view` 的角色集合）。
+        current.require_permission("outsource.quote.edit")?;
         let q = repo
             .quote_get_by_id(id, false)
             .await?
@@ -471,7 +482,9 @@ impl OutsourceService {
         current: &CurrentUser,
     ) -> Result<OutsourceQuoteOut, AppError> {
         // MANAGER-only
-        current.require_role(Role::Manager)?;
+        // 2026-10-15：迁权限点 `outsource.quote.approve`（M；矩阵逐格等于原
+        // `require_role(Manager)`）。
+        current.require_permission("outsource.quote.approve")?;
         let q = repo
             .quote_get_by_id(id, false)
             .await?
@@ -531,7 +544,9 @@ impl OutsourceService {
         version: i32,
         current: &CurrentUser,
     ) -> Result<OutsourceQuoteOut, AppError> {
-        current.require_role(Role::Manager)?;
+        // 2026-10-15：迁权限点 `outsource.quote.approve`（M；矩阵逐格等于原
+        // `require_role(Manager)`）。
+        current.require_permission("outsource.quote.approve")?;
         if review_note.trim().is_empty() {
             return Err(AppError::biz(code::BIZ_INVALID_VALUE, "review_note 必填"));
         }
@@ -589,7 +604,10 @@ impl OutsourceService {
         req: &OutsourceQuoteSoftDeleteRequest,
         current: &CurrentUser,
     ) -> Result<(), AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk])?;
+        // 2026-10-15：迁权限点 `outsource.quote.edit`（M,C；矩阵逐格等于原
+        // `require_any_role` 集合；可报价零件列表是报价工作流的辅助读，归本点
+        // 不推动 `outsource.view` 的角色集合）。
+        current.require_permission("outsource.quote.edit")?;
         let q = repo
             .quote_get_by_id(id, false)
             .await?
