@@ -178,7 +178,7 @@ pub trait QueueRepoTrait: Send {
         include_deleted: bool,
     ) -> Result<Option<TProcess>, sqlx::Error>;
 
-    // ── process_chain 域 helper（2）──
+    // ── process_chain 域 helper（1）──
     /// 解析 chain 上 process 对应的 step_id（`ProcessChainRepo::resolve_step_id_by_process`）。
     async fn process_chain_resolve_step_id_by_process(
         &mut self,
