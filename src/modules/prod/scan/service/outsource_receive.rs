@@ -67,8 +67,8 @@ use super::ScanService;
 impl ScanService {
     /// `POST /api/v2/prod/scan/outsource-receive`：外协确认收回 + 立刻交到扫码工人。
     ///
-    /// 角色 / 事务边界都在 handler（Manager + ShelfAccount，与 `worker-scan` /
-    /// `take-over` 同款）；本函数只收 `&mut PgConnection`（stage① 与 stage② 共用
+    /// 角色守卫在 handler 与 service 双层（Manager + ShelfAccount，与 take-over 对齐）；
+    /// 事务边界在 handler。本函数只收 `&mut PgConnection`（stage① 与 stage② 共用
     /// 同一连接 / 事务，`pick_up` 接受 `&mut PgConnection` 作为 `R: PartRepoTrait`）。
     /// 判据顺序见本文件模块 doc 的表。
     pub async fn outsource_receive(
@@ -77,9 +77,9 @@ impl ScanService {
         req: OutsourceReceiveRequest,
         current: &CurrentUser,
     ) -> Result<OutsourceReceiveOut, AppError> {
-        // ── 1. 角色守卫（service 入口第一行，与 take-over / worker-scan 对齐）────
+        // ── 0. 角色守卫（service 入口第一行，与 take-over / pickup 对齐；handler 侧已有同名守卫）──
         current.require_any_role(&[Role::Manager, Role::ShelfAccount])?;
-        // ── 2. 工牌 → worker（与 worker-scan / take-over 逐条同形）──────────────
+        // ── 1. 工牌 → worker（与 worker-scan / take-over 逐条同形）──────────────
         let worker = WorkerRepo::get_by_badge_code(&mut *conn, &req.badge_code, false)
             .await?
             .ok_or_else(|| {
@@ -100,7 +100,7 @@ impl ScanService {
                 format!("worker {} 未分配工种", worker.id),
             )
         })?;
-        // ── 3. 批次 + part ──────────────────────────────────────────────────────
+        // ── 2. 批次 + part ──────────────────────────────────────────────────────
         let batch = (&mut *conn)
             .find_batch_by_id(req.batch_id)
             .await?
@@ -119,9 +119,9 @@ impl ScanService {
                     format!("part {} 不存在或已软删", batch.part_id),
                 )
             })?;
-        // ── 4. OCC（客户端传值，禁止「读-再-比」的隐式 OCC）─────────────────────
+        // ── 3. OCC（客户端传值，禁止「读-再-比」的隐式 OCC）─────────────────────
         validate_batch_version(batch.id, req.version, batch.version)?;
-        // ── 5. 状态 / 位置 / 在途公司（收回前 holder）──────────────────────────
+        // ── 4. 状态 / 位置 / 在途公司（收回前 holder）──────────────────────────
         if batch.status != "OUTSOURCE" {
             return Err(AppError::biz(
                 code::BIZ_INVALID_TRANSITION,
@@ -152,7 +152,7 @@ impl ScanService {
                 ),
             )
         })?;
-        // ── 6. 下一道解析 ───────────────────────────────────────────────────────
+        // ── 5. 下一道解析 ───────────────────────────────────────────────────────
         // 显式值**覆盖链推导**（与 `resolve_receive_next_process` 的 `given` 分支
         // 同义，语义逐字一致）；缺省时才按链走 outsource 域的同一份推导。
         let next_process = match req.next_process_id.as_deref() {
@@ -171,7 +171,7 @@ impl ScanService {
                 resolve_receive_next_process(&mut *conn, batch.id, None).await?
             }
         };
-        // ── 7. 下一道 ∈ 扫码工种的活跃工序映射（本端点唯一的工种资格闸门）──────
+        // ── 6. 下一道 ∈ 扫码工种的活跃工序映射（本端点唯一的工种资格闸门）──────
         let process_ids = crate::modules::prod::work_type::repo::WorkTypeRepo::list_process_ids(
             &mut *conn,
             work_type_id,
@@ -186,10 +186,10 @@ impl ScanService {
                 ),
             ));
         }
-        // ── 8. 容量预检（fail-fast，**先于任何写**：失败时零写入、不留半收回顾虑）──
+        // ── 7. 容量预检（fail-fast，**先于任何写**：失败时零写入、不留半收回顾虑）──
         let _ =
             QueueService::ensure_worker_has_capacity(&mut *conn, worker.id, work_type_id).await?;
-        // ── 9. stage①：收回落自动选架（与 move 回收臂同一内核）─────────────────
+        // ── 8. stage①：收回落自动选架（与 move 回收臂同一内核）─────────────────
         // `note: None` —— 本端点 body 没有 note 字段（事件备注由下游事件本身承担）。
         let _shelf_id = receive_from_outsource_inner(
             &mut *conn,
@@ -201,7 +201,7 @@ impl ScanService {
             current,
         )
         .await?;
-        // ── 10. 读回批次拿**真实新 version**（不手算 +1）→ stage② ────────────────
+        // 读回批次拿**真实新 version**（不手算 +1）→ stage②
         let fresh = (&mut *conn)
             .find_batch_by_id(batch.id)
             .await?
@@ -228,8 +228,8 @@ impl ScanService {
             current,
         )
         .await?;
-        // ── 11. 写完再读回最终 version（**不手算 +2**：两次 OCC 写各 +1 是内部
-        // 事实，但版本推进必须由库回答；与 `move_batch` 的写后读回同款纪律）──────
+        // 写完再读回最终 version（**不手算 +2**：两次 OCC 写各 +1 是内部
+        // 事实，但版本推进必须由库回答；与 `move_batch` 的写后读回同款纪律）。
         let final_row = (&mut *conn)
             .find_batch_by_id(batch.id)
             .await?

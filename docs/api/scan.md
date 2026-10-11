@@ -864,7 +864,7 @@ SQL 里（不 import `prod::worker` / `prod::queue` / `outsource` 任何符号�
 | `POST /scan/outsource-receive` | `PART_PICKED_UP` | **无条件**（2026-10-15 S3；payload 与 `pick-up` 逐字同形，见下） |
 
 - **事件名一字不改** —— dashboard 与队列页都在监听，改名会静默断链。
-- **`PART_TRANSFERRED`（2026-10-15 S2 新增，本域第 7 条写端点的唯一产出点）**：
+- **`PART_TRANSFERRED`（2026-10-15 S2 新增，本域第 7 条端点 `POST /scan/take-over` 的唯一产出点）**：
   payload 四键**全部 JSON 字符串**（雪花精度约定）：
   `{ part_id, batch_id, from_worker_id, to_worker_id }`。
   语义 = 「这一批换人了」；消费方（dashboard / 队列看板）据此刷新「工人持有」格子。
@@ -1258,7 +1258,7 @@ struct 拆成独立的 `WorkTypeByWorkTypeRow`（只含它自己 SELECT 的 8 �
 **跨域护栏只覆盖 `listing/`**
 
 `prod::scan` 整域**不适用** `assert_no_foreign_domain`（转发型域，见 §7.1），只有
-`listing/` 那两块纯只读聚合单独装护栏。护栏为什么按**目录路径前缀**扫、被扫的代码
+`listing/` 那三块纯只读聚合单独装护栏。护栏为什么按**目录路径前缀**扫、被扫的代码
 必须自成一个目录：这条规则要可被 CI 执行，被扫代码就得是一个能被 `read_dir` 圈出来
 的目录。圈出可守的部分比整域不守要强。
 

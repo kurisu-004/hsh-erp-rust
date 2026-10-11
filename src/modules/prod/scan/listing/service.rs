@@ -16,7 +16,7 @@ use crate::modules::prod::scan::vo::{
 };
 use crate::shared::error::{AppError, code};
 
-/// 两条端点共用的角色白名单。
+/// 三条端点（pickable / held / locate）共用的角色白名单。
 const SCAN_LIST_ROLES: &[Role] = &[
     Role::Manager,
     Role::Clerk,

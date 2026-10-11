@@ -19,7 +19,7 @@
 //!   **2026-10-15 新增 S3**；回收臂内核复用 outsource 域的
 //!   `receive_from_outsource_inner`，stage② 复用本域 `pick_up` 的原子编排）
 //!
-//! 两条只读聚合端点（`/scan/pickable` / `/scan/held`）**不在本目录**：它们在
+//! 3 条只读聚合端点（`/scan/pickable` / `/scan/held` / `/scan/locate`）**不在本目录**：它们在
 //! [`super::listing`] 子模块里（该子模块受域隔离护栏覆盖，必须零跨域依赖）。
 //!
 //! ## 签名约定

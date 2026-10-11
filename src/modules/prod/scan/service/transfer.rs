@@ -69,8 +69,8 @@ use super::ScanService;
 impl ScanService {
     /// `POST /api/v2/prod/scan/take-over`：扫码接管（2026-10-15 新增，S2）。
     ///
-    /// 角色守卫在 handler 与 service 双层（2026-10-15 review 订正，与 pickup /
-    /// outsource_receive 对齐）；事务边界在 handler。判据顺序见本文件模块 doc 的表。
+    /// 角色守卫在 handler 与 service 双层（2026-10-15 review 订正，与 outsource_receive
+    /// 对齐）；事务边界在 handler。判据顺序见本文件模块 doc 的表。
     pub async fn take_over<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
