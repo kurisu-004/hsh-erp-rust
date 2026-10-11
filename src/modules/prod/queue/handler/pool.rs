@@ -4,10 +4,11 @@
 //! `handler/board.rs`）。
 //!
 //! ## 端点
-//! - `POST /api/v2/prod/queue/refill` —— Manager 触发 `refill_for_worker`。
-//! - `POST /api/v2/prod/queue/move` —— Manager 通用移动端点（POOL ↔ WORKER +
-//!   WORKER ↔ WORKER 三方向，取代旧 `admin_remove` / `admin_assign`）。commit 后
-//!   广播 `WORKER_POOL_MOVE_DONE`。
+//! - `POST /api/v2/prod/queue/refill` —— 权限点 `queue.allocate`（M,C）触发
+//!   `refill_for_worker`。
+//! - `POST /api/v2/prod/queue/move` —— 权限点 `queue.allocate`（M,C）通用移动端点
+//!   （POOL ↔ WORKER + WORKER ↔ WORKER 三方向，取代旧 `admin_remove` /
+//!   `admin_assign`）。commit 后广播 `WORKER_POOL_MOVE_DONE`。
 //! - `POST /api/v2/prod/queue/auto-allocate` —— 按 `process_id + shelf_id` 范围
 //!   自动为每个匹配 worker 补料到**工种自动上限**（`auto_allocate_limit`，
 //!   未配置兜底 `max_held_batches`）。commit 后广播
@@ -87,8 +88,8 @@ pub async fn admin_refill(
         &mut tx,
         &state.snowflake,
         req.worker_id,
-        // 管理员端点**保留**架锚：它是「为某工人在某架上抢料」的显式操作（Manager
-        // only、前端零消费方）。worker-scan 走的是另一条路径，传 `None`（跨架取料）。
+        // 管理员端点**保留**架锚：它是「为某工人在某架上抢料」的显式操作（权限点
+        // `queue.allocate`，Clerk 现可调）。worker-scan 走的是另一条路径，传 `None`（跨架取料）。
         Some(req.shelf_id),
         current.id,
         &current,
@@ -117,8 +118,8 @@ pub async fn admin_refill(
             // 却写着「`stopped_reason` / `pool_empty` / `worker_id` 三个键两边同形」。
             //
             // ⚠️ 与 ② 侧**唯一有意不同形**的是 `shelf_id`：worker-scan 的 refill
-            // 跨架取料、无架锚，恒为 `null`；本域保留架锚（Manager 端点专属操作），
-            // 填请求里的架 id。类型也不同（string vs null）。
+            // 跨架取料、无架锚，恒为 `null`；本域保留架锚（权限点 `queue.allocate`，
+            // Clerk 现可调），填请求里的架 id。类型也不同（string vs null）。
             payload: json!({
                 "worker_id": req.worker_id.to_string(),
                 "shelf_id": req.shelf_id.to_string(),

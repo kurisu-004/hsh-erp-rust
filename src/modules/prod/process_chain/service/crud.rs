@@ -44,7 +44,8 @@ impl ProcessChainService {
 
     /// 读 part 绑定的工艺链（header + steps）。
     /// 无链 → 20701 `BIZ_PROCESS_CHAIN_NOT_FOUND`（HTTP 404）。
-    /// 权限：任意已登录用户可读（车间排产视角：Manager/Clerk/Inspector/CncProgrammer）。
+    /// 权限：权限点 `production.view`（矩阵 Manager/Clerk/CncProgrammer/ShelfAccount/
+    /// Inspector；2026-10-15 迁自 `require_any_read`，ShelfAccount 并入为有意并集）。
     pub async fn get_by_part<R: ProcessChainRepoTrait>(
         &self,
         mut repo: R,
@@ -66,7 +67,7 @@ impl ProcessChainService {
     /// 按链 id 读工艺链（header + steps）。2026-09-16 FK 翻转新增：
     /// 前端在「工序制定」页点击零件后，按 `part.process_chain_id` 调本端点。
     /// 无链 / 已软删 → 20701 `BIZ_PROCESS_CHAIN_NOT_FOUND`（HTTP 404）。
-    /// 权限：与 `get_by_part` 相同。
+    /// 权限：与 `get_by_part` 相同（同一权限点 `production.view`）。
     pub async fn get_chain_by_id<R: ProcessChainRepoTrait>(
         &self,
         mut repo: R,

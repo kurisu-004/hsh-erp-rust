@@ -464,8 +464,9 @@ ADMIN 用户由元角色通配天然放行（见 §9.3）。
 - `SHELF_ACCOUNT` 在第二批矩阵里只有 `production.view` 一格（其余点零行）；
   `ADMIN` 全表零行（元角色通配，§9.3）。
 - **明确不迁（保持角色守卫）**：`place-on-shelf` / `release-from-programming`
-  （废弃端点）、`scan/deliver` / `worker-scan` / `pick-up` / `verify-badge`
-  （设备流）、RBAC 8 端点（§9.2 设计如此）、dashboard / wx / statistics /
+  （废弃端点）、`scan/deliver` / `worker-scan` / `pick-up`（设备流）、
+  `verify-badge`（任意已登录，本就无角色闸门）、RBAC 8 端点（§9.2 设计如此）、
+  dashboard / wx / statistics /
   mail_digest / iam 其余、`outsource` 对账三端点（`GET /outsource-companies/{id}/sent-parts`
   与 `POST /outsource-shipments/{id}/reconcile-update` 保持 M,C，
   `GET /outsource-shipments/in-flight` 保持 M,C,I —— 计划内保持）。
