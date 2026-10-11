@@ -105,9 +105,14 @@
 //! - 写端点：handler `state.pool.begin()` → service → `tx.commit()` → WS 广播
 //! - 读端点（`/repair` / `/repairing`）：handler `pool.acquire()` 不开事务
 //!
-//! ## 角色守卫
-//! - GET repair / repairing: Manager + Inspector
-//! - to-XXX 三流 + 批量两流: Manager + Inspector
+//! ## 权限（2026-10-15 第二批全量迁点后）
+//! - GET repair / repairing: `batch.repair`（M,C,I）
+//! - to-XXX 三流 + 批量两流: `batch.transition`（M,I）
+//! - deliver / complete: `batch.deliver`（M,C，handler + service 双层）
+//! - start-repair / complete-repair / repair-dispatch: `batch.repair`（M,C,I）
+//! - split: `batch.split` / cancel: `batch.cancel`（M,C）
+//! - place-on-shelf / release-from-programming: 废弃端点，角色守卫保持现状不动；
+//!   `scan/deliver`（司机扫码，设备流）同样不动
 //! - 报工台两条端点（已迁往 `prod::scan`）：worker-scan 是 Manager + ShelfAccount，
 //!   pick-up 是 Manager + Clerk + ShelfAccount
 

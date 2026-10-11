@@ -542,3 +542,30 @@ async fn to_process_rejects_repairing_batch() {
     assert!(is_repairing, "被拒的请求不得清/改返修标记");
     assert_eq!(location, None, "被拒的请求不得把批次挂到生产架");
 }
+
+// ===========================================================================
+//  权限点闸门（2026-10-15 新增）
+// ===========================================================================
+
+/// to-process 迁 `batch.transition`（M,I）—— Clerk 无该点 ⇒ 40300。
+///
+/// 闸门在 handler 首行、先于 service：body 只需能过 DTO 解析（`version` 必填），
+/// 不需要真实批次。
+#[tokio::test]
+async fn to_process_forbidden_for_clerk() {
+    let (_pool, app, _token, fx) = bootstrap_as_inspector().await;
+    let clerk = login_token(&app, &fx.clerk_username, PartFixture::PASSWORD).await;
+
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/batches/123456789/to-process",
+            Some(json!({ "version": 0, "next_process_id": "1" })),
+            Some(&clerk),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "Clerk to-process 应 403: {env}");
+    assert_eq!(env["code"], 40300, "应为 FORBIDDEN: {env}");
+}

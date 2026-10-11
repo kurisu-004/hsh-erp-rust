@@ -53,9 +53,10 @@
 //!    改走 `prod::batch::service` / `shared::batch::status` —— **前提是先把这 2 条端点重路由
 //!    到 prod 域**，否则 part 域无法在不自建反向依赖的前提下完成多批次动作。
 //!
-//! ## 事务 / 角色守卫
-//! 事务边界在 handler；角色守卫在 handler 与 service 双层（handler 做权限分发，
-//! service 入口第一行再 `require_any_role`）。
+//! ## 事务 / 权限守卫
+//! 事务边界在 handler；权限守卫在 handler 与 service 双层（handler 做权限分发，
+//! service 入口第一行再 `require_permission`；2026-10-15 第二批自角色守卫迁移，
+//! 仅 `scan_deliver_part` 与两个废弃端点保持角色守卫）。
 
 #![allow(deprecated, clippy::too_many_arguments, clippy::type_complexity)]
 
