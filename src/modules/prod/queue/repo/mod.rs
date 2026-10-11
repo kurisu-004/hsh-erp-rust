@@ -206,23 +206,30 @@ pub trait QueueRepoTrait: Send {
         include_deleted: bool,
     ) -> Result<Option<TPart>, sqlx::Error>;
 
-    /// 查 worker 持有中的某 batch（`PartRepo::find_inprocess_batch_by_id_and_holder`）。
+    /// 查 worker 持有中的某 batch（`PartBatchRepo::find_inprocess_batch_by_id_and_holder`）。
+    ///
+    /// 2026-10-15 订正符号引用：原写的 `PartRepo::find_inprocess_batch_by_id_and_holder`
+    /// 已从 part 域删除（注记见 `part/repo/mod.rs` 模块 doc），本转发器的实际
+    /// 委托目标见本文件 `impl QueueRepoTrait for &mut PgConnection`。
     async fn part_find_inprocess_batch_by_id_and_holder(
         &mut self,
         batch_id: i64,
         worker_id: i64,
     ) -> Result<Option<TPartBatch>, sqlx::Error>;
 
-    /// 切 holder 到 shelf（`PartRepo::mark_batch_returned`）。
+    /// 切 holder 到 shelf（`PartBatchRepo::mark_batch_returned`）。
     ///
     /// 2026-09-30：本转发器**恒传 `None`** 作
     /// `advance_to_process_id` —— move WORKER→POOL 是池内移动、工序不变
     /// （写入不变式），批次归还货架后仍属原工序候选池。推进工序是 worker-scan
-    /// RETURNED 的职责，它直连 `PartRepo::mark_batch_returned` 不经本转发器。
+    /// RETURNED 的职责，它直连 `PartRepoTrait::mark_batch_returned` 不经本转发器
+    /// （2026-10-15 订正符号引用：worker-scan 在
+    /// `prod/scan/service/worker_scan.rs` 收 `R: PartRepoTrait`，其生产实现
+    /// `&mut PgConnection` 内部再委托 `PartBatchRepo::mark_batch_returned`）。
     /// `step_id` 形参同样恒传 `None`（转发给 `current_process_step_id`）：**主动
     /// 退回不改工序归属**，故链内位置指针保持原值（SQL 侧 `COALESCE(.., 原值)`）。
     /// 2026-10-09 起该列会被真实写入（不再是「形参被 SQL 丢弃」），但本路径仍刻意
-    /// 不传 —— 见 `PartRepo::mark_batch_returned` doc 的「推进不是无条件的」段。
+    /// 不传 —— 见 `PartBatchRepo::mark_batch_returned` doc 的「推进不是无条件的」段。
     async fn part_mark_batch_returned(
         &mut self,
         batch_id: i64,
@@ -447,7 +454,7 @@ impl QueueRepoTrait for &mut PgConnection {
         crate::shared::batch::get_batch_by_id(&mut **self, id, include_deleted).await
     }
 
-    // ── part helper（直接走 PartRepo ZST 静态方法；D-6 未重构）──
+    // ── part helper（直接走 ZST 静态方法，逐方法见 doc；D-6 未重构）──
     async fn part_get_by_id(
         &mut self,
         id: i64,
