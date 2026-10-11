@@ -5,9 +5,9 @@
 
 ## 当前内容
 
-- `menu.sql` —— 菜单树（t_menu + t_role_menu）声明式种子
+- `menu.sql` —— 菜单目录（t_menu）声明式种子
 - `rbac.sql` —— RBAC 基线（2026-10-14 新增）：内置角色（t_role）+ 权限点
-  （t_permission）+ 系统角色授权矩阵（t_role_permission），**无条件加载**
+  （t_permission）+ 授权基线（t_role_permission / t_role_menu），**无条件加载**
 - `admin.sql` —— 可选初始管理员账号种子（2026-09-26 新增），由 `BOOTSTRAP_ADMIN_ENABLED` 门控
 
 ### RBAC seed（无条件，2026-10-14 新增）
@@ -17,7 +17,8 @@
 与 `BOOTSTRAP_ADMIN_ENABLED` 解耦 —— 关掉初始管理员开关后 `t_role` 仍有 6 行系统角色。
 
 **内容**：6 个内置角色 `ADMIN / MANAGER / CLERK / INSPECTOR / CNC_PROGRAMMER /
-SHELF_ACCOUNT`（均 `is_system=true`），以及各系统角色的权限点授权矩阵。
+SHELF_ACCOUNT`（均 `is_system=true`），各系统角色的权限点授权矩阵，以及角色→菜单
+**首次基线**（`t_role_menu`，2026-10-15 自 menu.sql 迁入）。
 2026-10-15 第二批共 20 个权限点（首批 3 + 生产流转 / 外协 / 送货单 / 品检读 17）；
 其中三处与迁移前守卫**有意偏差**（用户定稿）：`queue.allocate` 自 Manager 独占有意
 放宽为 M,C、`delivery_note.view` 与 `outsource.view` 的公司读收紧去 CNC、
@@ -35,8 +36,9 @@ SHELF_ACCOUNT`（均 `is_system=true`），以及各系统角色的权限点授�
 一行即静默失效。
 
 **幂等语义**：`t_role` / `t_permission` 走 `ON CONFLICT (code) WHERE deleted_at IS
-NULL DO NOTHING`（不覆盖管理端改名 / 停用）；`t_role_permission` 走
-`WHERE NOT EXISTS` + `ON CONFLICT DO NOTHING`（不复活管理端已撤销的授权）。
+NULL DO NOTHING`（不覆盖管理端改名 / 停用）；`t_role_permission` / `t_role_menu` 走
+`WHERE NOT EXISTS` + `ON CONFLICT DO NOTHING` —— 只补「该组合从未有过任何行（含软删）」
+的基线，不复活 / 不回补管理端已撤销的授权。
 
 ### 初始管理员 seed（可选）
 
@@ -99,23 +101,19 @@ cargo run
 - **t_menu.id 用静态 ID**：`9000000000xxx` 段（15 位）。
   - 已存在的雪花 ID 行 `ON CONFLICT` 后保留原 ID，只更新其他字段
   - 与生产雪花 ID（~2×10¹⁷）和 fixture ID（`9_xxx_xxx_xxx_xxx_xxx_xxx`，18 位）物理不相交
-- **t_role_menu.id 用派生 ID**：`9100000000000000 + 角色序号×10¹² + md5(role,code) 低 48bit`，
-  角色序号 `MANAGER=0 / CLERK=1 / INSPECTOR=2 / CNC_PROGRAMMER=3 / SHELF_ACCOUNT=4`。
+- **t_role_menu.id 用派生 ID**（`seeds/rbac.sql` §4）：`9100000000000000 + 角色序号×10¹²
+  + md5(role,code) 低 48bit`，角色序号 `MANAGER=0 / CLERK=1 / INSPECTOR=2 /
+  CNC_PROGRAMMER=3 / SHELF_ACCOUNT=4`。
   - **绝不能用 `基址 + row_number() OVER ()`**（2026-10-13 事故，见下节）
   - 旧 seed 静态段 `900000000100{0..4}xxx` 的**存量行仍在库里、ID 不动**，只是不再发这个段的新号
-- **t_role_menu 授权是「进白名单即生效」**：4.0 段先把白名单内**已软删**的授权**复活**
-  （`deleted_at = NULL`, `version + 1`），4.1-4.5 段再补真正缺失的行。
-  - 必需的原因：`uk_t_role_menu_role_menu` 是 **partial** 唯一索引（`WHERE deleted_at IS NULL`），
-    被 4.7 段软删过的行**不在索引里** ⇒ 4.1-4.5 的 `ON CONFLICT` 命中不到它 ⇒ 缺 4.0 段时
-    把 code 加回白名单会**插出第二行**，授权簿记翻倍
-  - 4.0 的 62 条元组必须与 4.1-4.5 白名单**逐条镜像**
-    （`tests/iam/menu_seed.rs` 用例 ⑤ 断言 D 机械核对）
-  - 顺序契约：4.0 在前、4.7 在后 → 「既在白名单又在 4.7 回收名单」的 code 最终是软删
+- **t_role_menu 授权基线在 `seeds/rbac.sql` §4**：判据是 `WHERE NOT EXISTS`
+  （该 `(role, menu_id)` 从未有过任何行，含软删）+ `ON CONFLICT DO NOTHING` ——
+  只补**首次基线**。RBAC 面板（`POST /iam/roles/{id}/grants` 整包替换）是授权的唯一
+  持续管理者：面板的增 / 删重启后全部保留，seed **不复活**软删行、**不回补**被移除的组合。
 - **不自动删"未在文件声明的菜单"**：菜单下线必须显式列在第 3 节 soft-delete 区段
   （防止误删生产手工加的菜单）
-- **t_role_menu 授权同样是纯增量**：第 4.1-4.5 段 `ON CONFLICT ... DO NOTHING`，
-  从角色白名单里删 code **不等于**回收已存在的授权行。收紧权限必须显式列在
-  4.7 回收区段（软删 + `version + 1`）
+- **`seeds/rbac.sql` §5 只做已下线菜单的授权残留清理**（不是授权决策）：菜单软删由
+  `seeds/menu.sql` §3 完成，故 rbac.sql 必须在 menu.sql 之后应用（启动钩子顺序亦然）
 - **`include_str!` 编译期嵌入**：`src/infra/seed.rs` 把整个 SQL 文件嵌进二进制，
   启动时直接 `sqlx::raw_sql` 执行，不走 IO
 
@@ -144,11 +142,14 @@ SELECT 结果里换了位置、拿到 `9000000001000030 / ...031`，而 `...030`
 
 **修法**：`t_role_menu.id` 改为由「授权身份 `(role, code)`」唯一决定（见上「派生 ID」）。
 与白名单顺序、增删、其他角色完全无关，因此反复跑 / 中途增删 code 都不会撞号。
-现有组合已实测 seed 内部 0 重复、与存量 0 撞号（用例 ⑥ 每次运行复核库侧 id 两两不等）。
+现有组合已实测 seed 内部 0 重复、与存量 0 撞号（用例 ⑦ 每次运行复核库侧 id 两两不等）。
 
-回归护栏在 `tests/iam/menu_seed.rs` 用例 ⑥ `menu_seed_revives_soft_deleted_grants`：
-文本层钉死 5 段派生表达式形态（`row_number()` 一改回来就红），库层独立重算 md5 期望 id
-并检查全库 live 行 id 两两不等。
+回归护栏在 `tests/iam/menu_seed.rs`：
+- 文本层：用例 ⑦ `seed_fills_missing_baseline` 钉死 5 段派生表达式形态
+  （`row_number()` 一改回来就红）；
+- 库层：同用例独立重算 md5 期望 id 并检查全库 live 行 id 两两不等；
+- 行为层：用例 ⑤ `seed_does_not_touch_panel_managed_grants` / ⑥
+  `seed_does_not_restore_removed_grant` 钉住「面板行不被碰 / 被移除的不回补」。
 
 ## 应用时机
 
@@ -163,7 +164,8 @@ seed::run_seeds(&pool).await?;  // 这里
 手工触发入口：`scripts/seed_apply.sh`
 
 ```bash
-psql $DATABASE_URL -v ON_ERROR_STOP=1 -f seeds/menu.sql
+psql $DATABASE_URL -v ON_ERROR_STOP=1 -f seeds/menu.sql   # 菜单目录（先）
+psql $DATABASE_URL -v ON_ERROR_STOP=1 -f seeds/rbac.sql   # 角色 / 权限点 / 授权基线（后）
 ```
 
 ## 验证清单（新增/修改 seed 后必跑）
@@ -183,5 +185,5 @@ psql $DATABASE_URL -c "SELECT code, sort_order FROM t_menu WHERE parent_id IS NU
 
 ## 不重跑 `sqlx_prepare`
 
-seeds 用 `sqlx::raw_sql`，**不走** `query!` 编译期校验宏，因此改动 `seeds/menu.sql`
-不需要重跑 `./scripts/sqlx_prepare.sh`。
+seeds 用 `sqlx::raw_sql`，**不走** `query!` 编译期校验宏，因此改动 `seeds/menu.sql` /
+`seeds/rbac.sql` 不需要重跑 `./scripts/sqlx_prepare.sh`。
