@@ -187,7 +187,7 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 | `iam::shelf` | 5 | `/api/v2/iam/shelves` | `t_shelf`（自有）+ `t_part_batch`（负载聚合）+ `t_shelf_process`（选架工序过滤，只读） | **2026-10-10 自独立 shelf 域迁入**的嵌套子模块，URL 硬切自 `/api/v2/shelves/*`、**无 alias**（旧前缀 404），请求 / 响应 / 错误码 / OCC 契约逐字不变。逐字段 / 口径表 / 选架算法 / 前端配套清单见 [`docs/api/shelves.md`](docs/api/shelves.md) |
 | `iam::rbac` | 8 | `/api/v2/iam`（根） | `t_role` + `t_permission` + `t_role_permission`（+ `t_role_menu` 授权读写） | **2026-10-14 新增**角色与权限面板：`/iam/roles`（CRUD + grants 整包）/ `/iam/permissions` / `/iam/menus`，8 条全部 `require_role(Manager)` 硬切（面板是权限真源、用权限点守它会自锁）；ADMIN 是代码级通配的元角色（不进授权表、grants 拒写）；停用角色即降权并踢持有者。整域契约见 [`docs/api/iam.md`](docs/api/iam.md) §9 |
 
-> 端点求和 = 5 + 12 + 5 + 8 = **30**，与 [`docs/api/iam.md`](docs/api/iam.md) §1 的四张端点表恒等。计数口径同 prod 表（一条 `.route(path, m1)` 记 1 条、`.route(path, get(h).post(h))` 记 2 条）。
+> 端点求和 = 5 + 12 + 5 + 8 = **30**，与 [`docs/api/iam.md`](docs/api/iam.md) §1 的三张端点表 + §9.1 的 RBAC 一张恒等。计数口径同 prod 表（一条 `.route(path, m1)` 记 1 条、`.route(path, get(h).post(h))` 记 2 条）。
 >
 > ⚠️ **货架归 iam 而不是 prod**：账号与货架同属「谁能碰什么」的权限资源 —— `t_user_role` 里 `SHELF_ACCOUNT` 角色的 `scope_id` 指向某个货架，货架实体是这套权限体系的落点；5 条写端点又全部 MANAGER 独占，与账号 / 角色管理同一批授权动作。**工序映射**（`prod::shelf_process`）因关联 prod 域实体 `t_process` 仍归 prod；**选架设施**（`shared::shelf`）是跨域设施层、无域归属，两者都不在 iam。
 >

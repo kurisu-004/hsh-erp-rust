@@ -74,9 +74,9 @@ pub struct PermissionGroup {
 /// `POST /roles/{id}/deactivate` 出参。
 #[derive(Debug, Clone, Serialize)]
 pub struct RoleDeactivateOut {
-    /// **本次被踢下线的用户数**（= 被连带软删的 `t_user_role` 行数）。
+    /// `delete=true` 时被连带软删的 `t_user_role` 行数；`delete=false` 恒为 0。
     ///
-    /// 只在 `delete=true` 时有意义（停用不连带删授权行，见端点契约）；
-    /// 前端据此提示「N 个账号将失去该角色并被强制下线」。
+    /// **不是踢下线名单** —— 停用与删除都会踢该角色的全部在册持有者，踢人名
+    /// 单不走本字段（见端点契约）；前端据此提示「N 个账号将失去该角色」。
     pub affected_user_count: i64,
 }

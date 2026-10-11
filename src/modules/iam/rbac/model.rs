@@ -19,7 +19,8 @@ pub struct TRole {
     pub code: String,
     pub name: String,
     pub description: Option<String>,
-    /// 内置角色标记。`true` ⇒ code 不可改、不可删除（只可停用）。
+    /// 内置角色标记。`true` ⇒ code 不可改、不可删除（一般只可停用；
+    /// ADMIN / MANAGER 连停用也固定 400）。
     pub is_system: bool,
     pub is_active: bool,
     pub version: i32,

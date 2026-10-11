@@ -98,7 +98,7 @@
 | `username` | string | `t_user.username` | 建号时 trim + 转小写，唯一 |
 | `full_name` | string | `t_user.full_name` | 建号必填非空；更新传空串 → 40001 |
 | `phone` | string \| null | `t_user.phone` | 传空串 = **显式清空**（`None` 才是「不修改」） |
-| `is_active` | boolean | `t_user.is_active` | 端点 11 软删后恒 `false` |
+| `is_active` | boolean | `t_user.is_active` | 端点 9 传 `is_active=false` 置 `false`；端点 11 软删后恒 `false` |
 | `last_login_at` | string \| null | `t_user.last_login_at` | 每次 login / refresh / wx-login 戳一次（不动 `version`） |
 | `created_at` / `updated_at` | string | 对应列 | naive timestamp（Asia/Shanghai），序列化为 RFC3339 无时区后缀 |
 | `roles` | `UserRoleOut[]` | `t_user_role` LEFT JOIN `t_shelf` | 端点 6 走**一次**批量查询（`WHERE user_id = ANY($1)`）后按 `user_id` 分桶，非逐行查 |
@@ -406,11 +406,14 @@ userid 不区分大小写、统一转为小写。⚠️ **不是**登录流程�
 
 入参要点：`version` 一律必填（缺 → axum 提取器 **422 纯文本**）；`code` 归一化为
 大写、`[A-Z0-9_]`、≤ 20 字符；`is_system=true` 的角色**带 `code` 一律 400**
-（无论是否等于现值；名称 / 描述可改，可停用）；ADMIN 角色连停用也 400；
-自定义角色改 code 会在**同一事务**级联 `t_user_role` / `t_role_menu` /
-`t_role_permission` 三张表（并 bump `t_user_role.version`），且只在该次改名后
-踢持有者；仅改名称 / 描述不踢。创建 / 改名撞重复 code 一律 400（显式预检 +
-唯一索引兜底同码），grants 入参含重复码同样 400。
+（无论是否等于现值；名称 / 描述可改）；ADMIN / MANAGER 角色连停用也 400（见
+§9.5）；其余角色可停用（系统角色不可删）—— **停用为终态：没有启用（反向）端点**，
+停用后如需恢复只能改库把 `is_active` 置回 `true`（`seeds/rbac.sql` 的
+`ON CONFLICT DO NOTHING` 不覆盖管理端状态）；自定义角色改 code 会在**同一事务**
+级联 `t_user_role` / `t_role_menu` / `t_role_permission` 三张表（并 bump
+`t_user_role.version`），且只在该次改名后踢持有者；仅改名称 / 描述不踢。
+创建 / 改名撞重复 code 一律 400（显式预检 + 唯一索引兜底同码），grants 入参含
+重复码同样 400。
 
 `roles_list` 菜单（`/iam/roles`）只授 MANAGER —— 菜单可见性与端点守卫逐格一致。
 
@@ -418,8 +421,9 @@ userid 不区分大小写、统一转为小写。⚠️ **不是**登录流程�
 
 这个面板自己就是**权限真源**：若用「进入面板」这个权限点守它，管理员一旦把这个点
 从自己身上撤掉，唯一能把它加回去的出口（正是这个面板）就被自己关掉了 —— 自锁且
-无救。同理，`MANAGER` 角色本身不可删、不可改 code，但它的菜单 / 权限点 grants
-可以被改，全撤掉也就自锁了。⇒ 守卫下沉到**不会被本面板改动的**角色。
+无救。⇒ 守卫下沉到**不会被本面板改动的**角色（`MANAGER`）：它的停用 / 删除在
+RBAC 端点固定 400（§9.5），面板无法把守卫角色本身关掉；它的菜单 / 权限点 grants
+仍可改，但那不影响 `require_role` 的判定。
 
 ADMIN 用户由元角色通配天然放行（见 §9.3）。
 
@@ -450,7 +454,8 @@ ADMIN 用户由元角色通配天然放行（见 §9.3）。
 - ADMIN 用户的 `permissions` 恒为空 vec（通配不靠数据）；登录态菜单由
   `menus_for_roles` 的全量分支给出；
 - 角色行由 `seeds/rbac.sql` 保证存在，`is_system=true`：**不可停用、不可删、
-  code 不可改**（停用会使全体管理员立即失去元角色，故比其它内置角色更严）。
+  code 不可改**（停用会使全体管理员立即失去元角色）。MANAGER 同受「停用 / 删除
+  固定 400」保护（面板守卫角色，§9.5）；其余内置角色可停用、不可删。
 
 ### 9.4 踢下线语义表
 
@@ -460,7 +465,7 @@ ADMIN 用户由元角色通配天然放行（见 §9.3）。
 | 动作 | 踢谁 | 不踢谁 / 备注 |
 |---|---|---|
 | 改角色 grants（端点 28） | 该角色**全部在册持有人** | 其他角色持有人不受影响；`ADMIN` 拒写（400） |
-| 停用 / 删除角色（端点 26） | 该角色**全部在册持有人** | 停用（`delete=false`）不删授权行（`affected_user_count` 恒 0）但**照常踢人**：停用即降权，不踢则 session 缓存继续按旧角色判定 |
+| 停用 / 删除角色（端点 26） | 该角色**全部在册持有人** | 停用（`delete=false`）不删授权行（`affected_user_count` 恒 0）但**照常踢人**：停用即降权，不踢则 session 缓存继续按旧角色判定；ADMIN / MANAGER 固定 400（§9.5），到不了本行 |
 | 授予 / 撤销用户角色（端点 13 / 14） | **目标用户**（恒 1 人） | 护栏拒绝路径（400）不踢；操作者恰为目标时自己也下线 |
 | 改角色 code（端点 25） | 该角色**全部在册持有人** | code 级联改变持有者 session 缓存里的角色串 |
 | 新建 / 仅改名称 / 改描述（端点 24 / 25） | **不踢任何人** | 新建无持有人；名称 / 描述不进 session 缓存（权限 / 菜单都按 code 组装） |
@@ -469,28 +474,38 @@ ADMIN 用户由元角色通配天然放行（见 §9.3）。
 提交成功后自己也会被踢下线（踢人名单含操作者本人）—— 重新登录即可，不是 bug。
 `ADMIN` 角色自身的 grants 不可写（400）。
 
-### 9.5 ADMIN 自锁护栏（三种 400）
+⚠️ **踢人名单只覆盖 `t_user.is_active = true` 的在册持有者**：停用账号若持有未
+过期 session，其缓存权限会在 session TTL 内继续生效（用户域既有边界 —— 端点 9 /
+11 把账号置停用时本身也不清 session）。
 
+### 9.5 系统角色保护与 ADMIN 自锁护栏（400）
+
+**固定 400（不做计数）**：
 1. **停用 / 删除 ADMIN 角色本身（端点 26）→ 一律 400**：ADMIN 是代码级元角色，
-   停用生效后全体管理员立即失去唯一能恢复它的入口（唯一能改它的面板由 ADMIN
-   通配守着），故不做计数、直接拒绝（删除本就因 `is_system` 被拒）。
-2. 撤销用户在册 ADMIN 角色（端点 14）；
-3. 停用持有 ADMIN 的在册用户（端点 11 `deactivate`）。
+   停用生效后全体管理员立即失去唯一能恢复它的元角色，故直接拒绝（删除本就因
+   `is_system` 被拒）。
+2. **停用 / 删除 MANAGER 角色本身（端点 26）→ 一律 400**：MANAGER 是权限面板的
+   守卫角色（§9.2），停用后面板对所有 MANAGER 关闭，而当前没有启用（反向）端点
+   能把角色重新启回去 —— 只能改库。
 
-2 / 3 是计数护栏：若会使「active 且持有 ADMIN 的用户数」归零 → **HTTP 400**
-（`40000 BAD_REQUEST`），且**不调** `delete_all_user_sessions`。判据统一为
-「`t_user.is_active` 且 ADMIN 授权行未软删的用户数 ≤ 1」（当前只剩目标自己）；
-两个及以上管理员时降级到 1 不构成自锁，放行。
+**计数护栏**（使「active 且持有 ADMIN 的用户数」归零时 → **HTTP 400**
+`40000 BAD_REQUEST`，且**不调** `delete_all_user_sessions`），三个入口：
+1. 撤销用户在册 ADMIN 角色（端点 14 `remove`）；
+2. 停用持有 ADMIN 的在册用户（端点 11 `deactivate`）；
+3. 更新持有 ADMIN 的在册用户并置 `is_active=false`（端点 9 `update`）。
+
+判据统一为「`t_user.is_active` 且 ADMIN 授权行未软删的用户数 ≤ 1」（当前只剩目标
+自己）；两个及以上管理员时降级到 1 不构成自锁，放行。
 
 护栏的「计数 → 判定 → 写」由 `t_role` ADMIN 行的 `SELECT … FOR UPDATE` 串行化
-（用户域两个入口共用 `AccountService::guard_admin_lockout`），并发撤销两个管理员
+（用户域三个入口共用 `AccountService::guard_admin_lockout`），并发撤销两个管理员
 不会双双放行。
 
 ### 9.6 错误码补充
 
 | code | 名称 | HTTP | 触发场景 |
 |---:|---|---:|---|
-| 40000 | `BAD_REQUEST` | 400 | 策略拒绝：ADMIN 角色停用 / 删除、两类自锁护栏、ADMIN grants 拒写、系统角色带 code、**角色码重复（create / update）**、grants 入参含重复码、**授予未知或已停用角色码**（2026-10-14 起 add_role 的角色码校验由枚举 parse 放宽为「`t_role` 存在且 `is_active`」，自定义角色由此可授予） |
+| 40000 | `BAD_REQUEST` | 400 | 策略拒绝：ADMIN / MANAGER 角色停用 / 删除、三类自锁护栏、ADMIN grants 拒写、系统角色带 code、**角色码重复（create / update）**、grants 入参含重复码、**授予未知或已停用角色码**（2026-10-14 起 add_role 的角色码校验由枚举 parse 放宽为「`t_role` 存在且 `is_active`」，自定义角色由此可授予） |
 | 40400 | `NOT_FOUND` | 404 | 角色 id 不存在（含软删） |
 | 20605 | `BIZ_USER_ROLE_NOT_FOUND` | 404 | 撤销的角色行不存在或不属于该用户 |
 | 40901 | `VERSION_CONFLICT` | 409 | 角色 / grants 的 OCC 冲突（共用 `t_role.version`） |

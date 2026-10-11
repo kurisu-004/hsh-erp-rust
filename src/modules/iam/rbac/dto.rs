@@ -33,7 +33,7 @@ pub struct RoleCreateRequest {
 /// - `name` 必填（角色名是面板主标识，没有「不传就沿用」的必要，省掉一个
 ///   「忘了传导致整次编辑白做」的分支）；
 /// - `is_system=true` 的角色**带 `code`（无论是否等于现值）→ 400**
-///   （code 不可改；名称 / 描述可改，可停用）。
+///   （code 不可改；名称 / 描述可改）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct RoleUpdateRequest {
     #[serde(default)]
@@ -47,12 +47,13 @@ pub struct RoleUpdateRequest {
 /// `POST /api/v2/iam/roles/{id}/deactivate`：停用 / 软删。
 ///
 /// `delete` 的三态语义：
-/// - `false`：只停用（内置角色只允许这一支 —— 可停用、不可删；ADMIN 例外：
-///   停用 / 删除都一律 400）
+/// - `false`：只停用（内置角色只允许这一支 —— 可停用、不可删；ADMIN / MANAGER
+///   例外：停用 / 删除都一律 400）
 /// - `true`：软删 `t_role` + 同事务连带软删该角色的 `t_user_role` /
 ///   `t_role_menu` / `t_role_permission`（仅 `is_system=false` 可用）
 ///
-/// 两支都会踢该角色的全部在册持有者（停用即降权）。
+/// 两支都会踢该角色的全部在册持有者（停用即降权）。**停用为终态**：没有启用
+/// （反向）端点，恢复只能改库。
 #[derive(Debug, Clone, Deserialize)]
 pub struct RoleDeactivateRequest {
     pub version: i32,

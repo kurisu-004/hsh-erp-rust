@@ -156,6 +156,10 @@ impl AccountService {
     }
 
     /// `POST /api/v2/iam/users/{id}/update`：部分更新，OCC 锚点 = `req.version`。
+    ///
+    /// 2026-10-14：`is_active=false` 与 `deactivate_user` 是同一降权动作，走同一
+    /// ADMIN 自锁护栏 —— 否则本端点可绕过 `deactivate` 把最后一个 active 管理员
+    /// 归零，护栏会成摆设。
     pub async fn update_user<R: IamRepoTrait>(
         &self,
         mut repo: R,
@@ -165,8 +169,9 @@ impl AccountService {
     ) -> Result<UserOut, AppError> {
         current.require_role(Role::Manager)?;
 
-        // 只用于 404 归因：账号不存在 vs 存在但 version 过期，两者的响应码不同
-        repo.get_user_by_id(user_id)
+        // 只用于 404 归因与停用护栏：账号不存在 vs 存在但 version 过期，响应码不同
+        let u = repo
+            .get_user_by_id(user_id)
             .await?
             .ok_or_else(|| user_not_found(user_id))?;
 
@@ -192,6 +197,17 @@ impl AccountService {
             Some(p) => Some(password::hash(p)?),
             None => None,
         };
+
+        // ADMIN 自锁护栏：把 active 账号改为停用时与 `deactivate_user` 同款 ——
+        // 先 `has_active_admin_grants` 快筛（非管理员账号不跑计数），再过同一
+        // `guard_admin_lockout`（行锁 + 计数 + 阈值）。已停用账号跳过（它不在
+        // active 管理员计数里，不构成新的自锁风险）。
+        if req.is_active == Some(false)
+            && u.is_active
+            && repo.has_active_admin_grants(user_id).await?
+        {
+            Self::guard_admin_lockout(&mut repo).await?;
+        }
 
         let affected = repo
             .update_user_partial(

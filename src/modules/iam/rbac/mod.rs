@@ -22,12 +22,13 @@
 //! ## 为什么守卫是 `require_role(Role::Manager)` 而不是权限点
 //! **防自锁**：这个面板自己就是权限真源。若用「进入面板」这个权限点守它，
 //! 管理员一旦把这个点从自己身上去掉，就**再也没有人能把它加回去** ——
-//! 唯一的出口（这个面板）正是被自己关掉的那个。角色码同理：`MANAGER` 这个
-//! 角色本身不可删，但它持有的菜单/权限点可以改，全撤掉也就自锁了。
+//! 唯一的出口（这个面板）正是被自己关掉的那个。
 //!
-//! ⇒ 守卫下沉一层，用**不会被本面板改动的**角色（`MANAGER`）守它。ADMIN
-//!   用户由 `CurrentUser::has_role` 的元角色通配天然放行（ADMIN 通配在
-//!   `auth::rbac`，唯一实现点）。
+//! ⇒ 守卫下沉一层，用**不会被本面板改动**的角色（`MANAGER`）守它：MANAGER
+//!   的停用 / 删除在本模块固定 400（与 ADMIN 同等保护），面板无法把守卫角色
+//!   本身关掉。它的菜单 / 权限点 grants 仍可改 —— 那只影响菜单可见性与业务
+//!   端点权限，不改 `require_role` 的判定。ADMIN 用户由 `CurrentUser::has_role`
+//!   的元角色通配天然放行（ADMIN 通配在 `auth::rbac`，唯一实现点）。
 //!
 //! 权限点真正生效的地方是**业务端点**（如 `part.drawing.print` 守图纸打印），
 //! 见 `part::handler::print::require_print_role`。
@@ -41,14 +42,22 @@
 //!   `CurrentUser::require_permission` 内做，不靠数据。写满行反而会让通配
 //!   悄悄降级成逐项勾选。
 //!
-//! ## ADMIN 自锁护栏
+//! ## 系统角色保护（固定 400，不做计数）
 //! 1. **ADMIN 角色本身不可停用 / 删除**（本模块 `deactivate_role` 固定 400）：
 //!    停用生效后（登录侧只认 `t_role.is_active = true` 的角色），停用 ADMIN =
 //!    所有管理员立即失去唯一能恢复它的元角色；
-//! 2. 撤销用户的 ADMIN 角色（`iam::service::account::role::remove_role`）；
-//! 3. 停用持有 ADMIN 的用户（`…::user::deactivate_user`）。
+//! 2. **MANAGER 角色本身不可停用 / 删除**：它是本面板的守卫角色，停用后
+//!    面板对所有 MANAGER 关闭，而当前没有启用端点能把角色重新启回去。
 //!
-//! 2 / 3 是「active 且持有 ADMIN 的用户数」**计数护栏**：会归零 → 400，且
+//! 其余系统角色与自定义角色可停用（`delete=false`），只有自定义角色可删
+//! （`delete=true`）；**停用为终态** —— 没有启用（反向）端点，恢复只能改库。
+//!
+//! ## ADMIN 自锁护栏（计数）
+//! 1. 撤销用户的 ADMIN 角色（`iam::service::account::role::remove_role`）；
+//! 2. 停用持有 ADMIN 的用户（`…::user::deactivate_user`）；
+//! 3. 更新持有 ADMIN 的用户并置 `is_active=false`（`…::user::update_user`）。
+//!
+//! 三者是「active 且持有 ADMIN 的用户数」**计数护栏**：会归零 → 400，且
 //! **不调** `delete_all_user_sessions`。阈值是 `<= 1`（不是 `< 2`）的等价写法：
 //! 两个及以上管理员时降级到 1 不构成自锁，还剩人能恢复。计数与写入之间由
 //! 用户域对 `t_role` ADMIN 行的行锁串行化（`IamRepoTrait::lock_admin_role_for_update`），
@@ -57,7 +66,8 @@
 //! ## 停用即降权
 //! 登录 / refresh / me 的角色解析只取 `t_role.is_active = true AND deleted_at IS
 //! NULL` 的角色行（`resolve_roles_and_scope`），该角色的权限 / 菜单 / 货架 scope
-//! 一并失效；停用 / 删除角色都会踢全部在册持有者，重新启用后下次登录恢复。
+//! 一并失效；停用 / 删除角色都会踢全部在册持有者。**停用为终态**：本模块没有
+//! 启用（反向）端点，停用后如需恢复只能改库把 `is_active` 置回 `true`。
 //!
 //! ## 路由挂载
 //! 本模块路由挂在 **`/api/v2/iam` 根**（`/iam/roles`、`/iam/permissions`、

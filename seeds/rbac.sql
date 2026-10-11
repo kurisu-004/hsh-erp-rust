@@ -51,7 +51,8 @@ BEGIN;
 -- ---------------------------------------------------------------------------
 -- 1. t_role：内置角色（恰 6 行，is_system = true）
 -- ---------------------------------------------------------------------------
--- 管理端可停用系统角色、不可删除、不可改 code（RbacService::update_role 硬切）。
+-- 管理端可停用系统角色（ADMIN / MANAGER 除外 —— 两者停用 / 删除固定 400，
+-- 见 rbac::service 模块头）、不可删除、不可改 code（RbacService::update_role 硬切）。
 -- name / description 是角色面板展示文案，改这里对已存在的库不生效（DO NOTHING）。
 -- 6 行与 Rust `Role` 枚举一一对应：ADMIN / MANAGER / CLERK / INSPECTOR /
 -- CNC_PROGRAMMER / SHELF_ACCOUNT。

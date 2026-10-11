@@ -28,6 +28,9 @@ pub struct UserUpdateRequest {
     pub phone: Option<String>,
     #[serde(default)]
     pub password: Option<String>,
+    /// 置 `false` = 停用账号（与端点 11 `deactivate` 是同一降权动作，走同一
+    /// ADMIN 自锁护栏 —— 见 `docs/api/iam.md` §9.5）；`true` / `None` 不构成
+    /// 降权，直写。
     #[serde(default)]
     pub is_active: Option<bool>,
 }

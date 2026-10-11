@@ -130,7 +130,8 @@ pub async fn update_role(
 
 /// `POST /api/v2/iam/roles/{id}/deactivate` —— 停用（`delete=false`）或软删。
 ///
-/// 两者都会踢该角色的全部在册持有者（停用即降权）。ADMIN 角色一律 400。
+/// 两者都会踢该角色的全部在册持有者（停用即降权）。ADMIN / MANAGER 角色一律
+/// 400（元角色与面板守卫角色，见 `super::service` 模块头）。
 pub async fn deactivate_role(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,

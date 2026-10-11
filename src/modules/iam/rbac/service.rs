@@ -26,16 +26,24 @@
 //!   权限码（面板要能整页渲染，返空会让管理员以为「ADMIN 什么都没有」）；
 //! - `set_role_grants` / `deactivate_role` / `update_role`（带 code）：一律拒绝。
 //!
-//! ## ADMIN 自锁护栏
-//! **ADMIN 角色本身不可停用 / 删除**（固定 400，不做计数）：停用生效后（登录侧
-//! 只认 `t_role.is_active = true` 的角色），停用 ADMIN = 所有管理员立即失去唯一
-//! 能恢复它的元角色 —— count >= 2 时同样会导致全员降权。删除本就因 `is_system`
-//! 被拒，合并为同一条文案。
+//! ## 系统角色保护（固定 400，不做计数）
+//! - **ADMIN 角色不可停用 / 删除**：停用生效后（登录侧只认 `t_role.is_active =
+//!   true` 的角色），所有管理员立即失去唯一能恢复它的元角色 —— count >= 2 时
+//!   同样会导致全员降权。删除本就因 `is_system` 被拒，合并为同一条文案；
+//! - **MANAGER 角色不可停用 / 删除**：它是本面板的守卫角色（`require_role(Manager)`），
+//!   停用后面板对所有 MANAGER 关闭，而当前没有启用端点能把角色重新启回去。
+//!   删除同样因 `is_system` 被拒。
 //!
-//! 另外两条**计数护栏**在「会让 active 且持有 ADMIN 的用户数归零」时返 400，
+//! 其余系统角色与自定义角色可停用（`delete=false`），只有自定义角色可删
+//! （`delete=true`）；**停用为终态** —— 当前没有启用（反向）端点，如需恢复
+//! 只能改库把 `is_active` 置回 `true`。
+//!
+//! ## ADMIN 自锁护栏（计数）
+//! 三条**计数护栏**在「会让 active 且持有 ADMIN 的用户数归零」时返 400，
 //! **且不调** `delete_all_user_sessions`：
 //! 1. 撤销用户的 ADMIN 角色（用户域 `remove_role`）；
-//! 2. 停用持有 ADMIN 的用户（用户域 `deactivate_user`）。
+//! 2. 停用持有 ADMIN 的用户（用户域 `deactivate_user`）；
+//! 3. 更新持有 ADMIN 的用户并置 `is_active=false`（用户域 `update_user`）。
 //!
 //! 判据是「`t_user.is_active` 且 ADMIN 授权行未软删的用户数 <= 1」，且**只在
 //! 操作对象就是 ADMIN 时触发** —— 其它角色一律不管，否则管理员连删一个自定义
@@ -67,6 +75,10 @@ use crate::shared::error::{AppError, code};
 
 /// ADMIN 元角色的 code —— 「通配 / 拒写 / 自锁护栏」三处判据的唯一来源。
 pub const ADMIN_ROLE_CODE: &str = "ADMIN";
+
+/// MANAGER 角色的 code —— 本面板守卫（`require_role(Manager)`）的角色，
+/// 「不可停用 / 删除」固定 400 判据的唯一来源。
+pub const MANAGER_ROLE_CODE: &str = "MANAGER";
 
 /// **策略拒绝**（护栏 / 元角色保护）的统一错误构造：HTTP 400 + `40000 BAD_REQUEST`。
 ///
@@ -201,9 +213,7 @@ impl RbacService {
                 // 系统角色**一律**不接受 code 入参 —— 无论是否等于现值。等于现值
                 // 时若按「没带」放行，面板与手工调用会误以为系统角色可改名。
                 if role.is_system {
-                    return Err(policy_reject(
-                        "系统角色的 code 不可改（名称/描述可改，可停用）",
-                    ));
+                    return Err(policy_reject("系统角色的 code 不可改（名称 / 描述可改）"));
                 }
                 if c == role.code {
                     None // 与现值相同 —— 不触发级联
@@ -283,7 +293,8 @@ impl RbacService {
 
     /// 停用（`delete=false`）或软删（`delete=true`）角色。
     ///
-    /// - `delete=true` 仅 `is_system=false` 可用（系统角色可停用不可删）；
+    /// - `delete=true` 仅 `is_system=false` 可用（系统角色可停用不可删，
+    ///   ADMIN / MANAGER 见下一条）；
     /// - `delete=true` 同事务连带软删该角色的 `t_user_role` /
     ///   `t_role_menu` / `t_role_permission`；
     /// - **停用与删除都会踢该角色的全部在册持有者**（`KickList`）：停用即降权，
@@ -292,7 +303,8 @@ impl RbacService {
     ///   继续判定到自然过期；
     /// - `affected_user_count` = 被连带软删的 `t_user_role` 行数（`delete=false`
     ///   恒为 0，但 `KickList` 仍非空）；
-    /// - **ADMIN 角色一律 400**（停用 / 删除都不允许，见模块头）。
+    /// - **ADMIN / MANAGER 角色一律 400**（停用 / 删除都不允许，见模块头）；
+    /// - 其余角色**停用为终态**：当前没有启用（反向）端点，恢复只能改库。
     pub async fn deactivate_role(
         &self,
         conn: &mut PgConnection,
@@ -303,10 +315,12 @@ impl RbacService {
         current.require_role(Role::Manager)?;
 
         let role = role_or_not_found(RbacRepo::get_role_by_id(&mut *conn, id).await?, id)?;
-        // ADMIN 是元角色：停用即全员降权且没有恢复出口（唯一能改它的面板由
-        // has_role 的通配守着），故不做计数护栏、一律拒绝。
-        if role.code == ADMIN_ROLE_CODE {
-            return Err(policy_reject("系统管理员角色不可停用或删除"));
+        // ADMIN 是元角色、MANAGER 是本面板的守卫角色：停用生效后（登录侧只认
+        // is_active 的角色）前者让所有管理员失去唯一能恢复它的元角色，后者让
+        // 面板对所有 MANAGER 关闭；两者都没有启用端点能恢复，故不做计数护栏、
+        // 一律拒绝。
+        if role.code == ADMIN_ROLE_CODE || role.code == MANAGER_ROLE_CODE {
+            return Err(policy_reject("系统管理员 / 管理角色不可停用或删除"));
         }
         if req.delete && role.is_system {
             return Err(policy_reject("系统角色不可删除（如需下线请用停用）"));
@@ -543,8 +557,8 @@ impl RbacService {
     /// mock），不能直接吃 `&mut PgConnection`。判据是
     /// `IamRepoTrait::list_active_admin_user_ids`（委托到
     /// `RbacRepo::list_active_user_ids_by_role_code`）；阈值 `<= 1` 与行锁收在
-    /// 用户域的 `AccountService::guard_admin_lockout` 一处 —— 撤销 ADMIN 是唯一
-    /// 需要计数的降权入口（ADMIN 角色本身已固定不可停用），阈值不再有第二个副本。
+    /// 用户域的 `AccountService::guard_admin_lockout` 一处 —— 用户域的降权入口
+    /// （撤销 ADMIN / 停用账号 / 更新账号置停用）共用同一 guard，rbac 侧不再计数。
     pub(crate) async fn count_active_users_holding_admin<R: IamRepoTrait>(
         repo: &mut R,
     ) -> Result<i64, AppError> {

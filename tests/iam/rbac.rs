@@ -11,9 +11,9 @@
 //! | 4 | `grants_on_admin_role_is_rejected` | ADMIN grants 读全量、写 400（元角色） |
 //! | 5 | `admin_sees_all_menus_and_permissions` | ADMIN 元角色的菜单通配（/iam/me 与 /iam/menus 同树）+ grants 权限全量 |
 //! | 6 | `non_admin_sees_only_granted_menus` | 普通角色菜单 = t_role_menu 授权集，看不到 roles_list |
-//! | 7 | `custom_role_lifecycle_create_update_deactivate_delete` | 自定义角色 CRUD + 系统角色不可删 / 不可带 code + 角色码重复 400 |
+//! | 7 | `custom_role_lifecycle_create_update_deactivate_delete` | 自定义角色 CRUD + 系统角色不可删 / 不可带 code / ADMIN+MANAGER 不可停用 + 角色码重复 400 |
 //! | 8 | `rename_custom_role_code_cascades_to_user_role` | 改 code 三表级联 + bump t_user_role.version；仅改名称不踢、改 code 才踢 |
-//! | 9 | `deactivating_last_admin_user_is_rejected` | 停用最后 ADMIN 用户 400；有替补时放行 |
+//! | 9 | `deactivating_last_admin_user_is_rejected` | 端点 11 / 端点 9 停用最后 ADMIN 用户均 400；有替补时放行 |
 //! | 10 | `revoking_admin_role_from_last_admin_is_rejected` | 撤销最后 ADMIN 400 且不踢人；有替补时撤销并踢 |
 //! | 11 | `grants_change_kicks_holders_sessions` | 改 grants 后持有人旧 token 40105 |
 //! | 12 | `user_role_grant_kicks_target_session` | 授予 / 撤销用户角色后目标旧 token 40105 |
@@ -687,6 +687,23 @@ async fn custom_role_lifecycle_create_update_deactivate_delete() {
     );
     assert_eq!(env["code"], 40000);
 
+    // 停用 MANAGER 角色本身一律 400（2026-10-14：它是面板守卫角色，停用会把面板
+    // 对所有 MANAGER 关死，而当前没有启用端点能恢复；与 ADMIN 合并为固定拒绝）
+    let (manager_id, manager_version) = role_row(&pool, "MANAGER").await;
+    let (status, env) = post(
+        &app,
+        &format!("/iam/roles/{manager_id}/deactivate"),
+        json!({ "version": manager_version, "delete": false }),
+        &token,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "MANAGER 角色不可停用应 400：{env}"
+    );
+    assert_eq!(env["code"], 40000);
+
     // 停用（delete=false；version 1 → 2）
     let (status, env) = post(
         &app,
@@ -906,6 +923,27 @@ async fn deactivating_last_admin_user_is_rejected() {
         .expect("读 target.is_active");
     assert!(still_active, "护栏拒绝后账号必须保持 active");
     let (_, _) = user_role_row(&pool, fx.target_user_id, "ADMIN").await;
+
+    // 端点 9 `update` 也能置 `is_active=false`：同一降权必须被同一护栏拦住
+    let (status, env) = post(
+        &app,
+        &format!("/iam/users/{}/update", fx.target_user_id),
+        json!({ "version": target_version, "is_active": false }),
+        &token,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "update 置停用同样不得绕过最后一个管理员护栏：{env}"
+    );
+    assert_eq!(env["code"], 40000);
+    let still_active: bool = sqlx::query_scalar("SELECT is_active FROM t_user WHERE id = $1")
+        .bind(fx.target_user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("读 target.is_active");
+    assert!(still_active, "update 护栏拒绝后账号必须保持 active");
 
     // 有替补管理员时放行：再给 clerk 挂 ADMIN
     insert_user_role(&pool, fx.clerk_user_id, "ADMIN").await;

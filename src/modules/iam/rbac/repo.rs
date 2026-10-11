@@ -131,7 +131,8 @@ impl RbacRepo {
     /// 一批角色 code 里哪些是**启用中且未软删**的（登录侧「停用即降权」用）。
     ///
     /// 登录 / refresh / me 的角色解析先过这里，把停用角色的 `t_user_role` 行整体
-    /// 滤掉：该角色的权限 / 菜单 / 货架 scope 一并失效，重新启用后下次登录恢复。
+    /// 滤掉：该角色的权限 / 菜单 / 货架 scope 一并失效。停用为终态（当前没有
+    /// 启用端点，恢复需改库）。
     pub async fn list_active_role_codes<'e, E: PgExecutor<'e>>(
         executor: E,
         codes: &[String],
@@ -348,6 +349,10 @@ impl RbacRepo {
     }
 
     /// 持有某角色的**在册用户 id**（踢下线用）。
+    ///
+    /// ⚠️ 名单只含 `u.is_active = TRUE` 的持有者：停用账号若持有未过期 session，
+    /// 其缓存权限会在 session TTL 内继续生效（用户域既有边界 —— 停用账号的两个
+    /// 端点本身也不清 session，见 `docs/api/iam.md` §9.4）。
     pub async fn list_active_user_ids_by_role_code<'e, E: PgExecutor<'e>>(
         executor: E,
         role_code: &str,
@@ -601,8 +606,11 @@ impl RbacRepo {
 
     /// 整包替换的第二步：批量插入新的菜单授权行。
     ///
-    /// `id` 与 `code` 一一对应（`ids[i]` 是 `codes[i]` 这条授权的雪花主键），
+    /// `id` 与 `code` 一一对应（`ids[i]` 是 `menu_codes[i]` 这条授权的雪花主键），
     /// `menu_id` 由 SQL 侧按 code 反查 —— 授权表存的是 `menu_id` 不是 `code`。
+    /// `menu_codes` 由调用方按 `code ASC` 给出（`filter_active_menu_codes` 的
+    /// `ORDER BY code`），反查也按 `code ASC` ⇒ `resolved[i]` 即 `menu_codes[i]`
+    /// 对应的菜单行。
     ///
     /// ⚠️ 反查少一行就整条失败（`Protocol` 错误）：入参已由
     ///    `filter_active_menu_codes` 校验过全部存在，走到这一步只能是被并发删除，
@@ -622,6 +630,7 @@ impl RbacRepo {
             r#"
             SELECT id FROM t_menu
             WHERE code = ANY($1) AND is_active = TRUE AND deleted_at IS NULL
+            ORDER BY code
             "#,
             menu_codes,
         )

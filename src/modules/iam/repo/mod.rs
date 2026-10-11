@@ -144,7 +144,7 @@ pub trait IamRepoTrait: Send {
     /// 一批角色 code 里哪些是**启用中且未软删**的（登录侧「停用即降权」用）。
     ///
     /// 登录 / refresh / me 的角色解析先过这里，把停用角色的授权行整体滤掉：
-    /// 该角色的权限 / 菜单 / 货架 scope 一并失效；重新启用后下次登录恢复。
+    /// 该角色的权限 / 菜单 / 货架 scope 一并失效；停用为终态（当前无启用端点）。
     async fn list_active_role_codes<'a>(
         &mut self,
         codes: &'a [String],

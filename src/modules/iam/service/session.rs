@@ -672,7 +672,8 @@ impl SessionService {
 /// ## 停用即降权（2026-10-14）
 /// 先按 `t_role.is_active = true AND deleted_at IS NULL` 过滤掉**停用角色**的
 /// `t_user_role` 行：该角色的枚举角色、原始 code、货架 scope 全部不生效，后续的
-/// 权限 / 菜单装载（输入都是过滤后的 `role_codes`）随之失效；重新启用后下次登录恢复。
+/// 权限 / 菜单装载（输入都是过滤后的 `role_codes`）随之失效。停用为终态（当前
+/// 没有启用端点，恢复需改库）。
 ///
 /// 规则与 account_service.validate_role_scope / shelf_repo.get_by_id 一脉相承。
 async fn resolve_roles_and_scope<R: IamRepoTrait>(
