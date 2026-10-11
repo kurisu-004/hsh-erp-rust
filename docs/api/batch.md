@@ -246,7 +246,7 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
 ### 5.2 仍留在 batch 域的
 
 - `repo/queries.rs`（ZST `PartBatchRepo`，`t_part_batch` 通用 SQL 真源）
-- `repo/sql.rs`（inspection / lifecycle 流转的 19 个定位 + 写点，全部是写入口之上的薄包装）
+- `repo/sql.rs`（inspection / lifecycle 流转的 18 个定位 + 写点，全部是写入口之上的薄包装）
 - `repo/trait.rs`（胖 trait `PartBatchRepoTrait` + `impl for &mut PgConnection`）
 - `model.rs`（2 个**窄投影**行结构：`RecentBatchRow` / `PartBatchScanRow`）
 - `service/`（除已剥离的 `dispatch.rs`、`outsource.rs` 与 `shelf.rs::recall_to_pending` 外的全部用例；返修两条集合读的 SQL 在 `service/repair.rs::list_batches_matching` 内联自建）

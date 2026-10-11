@@ -449,6 +449,10 @@ M = 10 时：12 个 HTTP 请求 → 1 个。
 migration `20261014000001_001_fix_max_held_batches_column_comment` 订正（append-only，
 不改 baseline 文件）。这条错误注释让 2026-10-14 的排查多绕了一圈。
 
+⚠️ **2026-10-15 追加订正**：上述注释里「取料按 cap 0 拦死」的措辞已随 `max_batches`
+CTE 删除而过期（cap 改由 service 传入），由 migration `20261015000002_001` 一并覆盖
+（与 `max_held_minutes` 的注释订正同批；`20261014000001_001` 是已应用文件、不修改）。
+
 ⚠️ **队列板的 `max_held` 对未配上限的工种发 `0` 而不是 `null`**（既有约定
 `w.max_held.unwrap_or(0)`，见 §2.3）—— 发 `null` 有让前端渲染成「不限」的风险。
 `prod::scan` 的 `/held` 出参 `max_held_batches` 沿用同一约定。
@@ -461,7 +465,7 @@ migration `20261014000001_001_fix_max_held_batches_column_comment` 订正（appe
 
 | 维度 | 口径 |
 |---|---|
-| 适用路径 | 只约束**自动**路径（上表三条）；**不约束手动单批路径**（`move` 的 POOL→WORKER 方向、`pick-up`） |
+| 适用路径 | 只约束**自动**路径（上文三条路径）；**不约束手动单批路径**（`move` 的 POOL→WORKER 方向、`pick-up`） |
 | `NULL` | **未配置** ⇒ 自动路径兜底 `max_held_batches`（行为与引入本列前逐字一致） |
 | 有值 | 须 `1..=max_held_batches`（create / update 走同一处合并校验矩阵，错误码复用 `20104 BIZ_INVALID_VALUE`） |
 | 三条路径的目标 | `cap = auto_allocate_limit.unwrap_or(max_held_batches)`，由 service 算出后传给 `take_one_from_pool`（SQL 不再查 `t_work_type`，原 `max_batches` CTE 已删） |
@@ -600,7 +604,7 @@ queue 域**整体不适用**域隔离护栏：它继承 worker_pool 的「经本
 9. **代码里残留的 `WORKER_POOL_*` WS 事件名不变**（`kind` 是 WS 协议的一部分，改它要同步 dashboard 域的白名单与前端 `AFFECTS_DASHBOARD`）。本域改的只是 URL 与类型名。
 10. **4 处卡片 DTO 新增 `has_process_chain`（boolean）**（2026-10-09）：`QueuePoolItem` / `QueueHeldBatch` / `OutsourceQueueCandidate` / `ScanListItem`。第四处原先是 `PartListItem`，2026-10-10 随报工台两条 list 端点迁往 `prod::scan`（行 VO 换成 `ScanListItem`）后它在 part 域恒为 `false`，字段保留只为不动其余复用该 VO 的域的 wire 形状。它是**绿色左边框的判据**，判据见 §2.6。zod 侧按 `z.boolean()` 声明 —— 前端不要按「工单有没有绑链」重新在前端推一遍（后端已经算好，且未定位批次走的是另一个分支）。
 11. **`POST /queue/move` 的 `version` 升为必填**（2026-10-09）：此前三个方向都由 service 用「本次事务里刚读到的 `batch.version`」当 `expected_version`，等价于**没有 OCC** —— 看板数据是 30s 缓存的快照，期间他人改过批次时「用户看到 5 件 → 实际移动 3 件」会静默成功。值取候选卡 / 持有卡的 `version`；漏传 → **HTTP 422 纯文本**（`version` 无 `#[serde(default)]`）。
-12. **工种新增 `auto_allocate_limit`（自动分配上限，2026-10-15）**：工种 create / update 请求与 list / get / create 响应都多了这个字段（`number | null`）。表单「留空 = 不配置（自动路径兜底 max）」；`0` / `超过 max` 前端可预校验，后端同样返 `20104`。语义与三条自动路径见 §4.8。
+12. **工种新增 `auto_allocate_limit`（自动分配上限，2026-10-15）**：工种 create / update 请求与 list / get / create 响应都多了这个字段（`number | null`）。表单「留空 = 不配置（自动路径兜底 max）」；`0` / `超过 max` 前端可预校验，后端同样返 `20104`。语义与三条自动路径见 §4.8。⚠️ update 端 `max_held_batches: null` 语义由「不修改」改为「清空」（2026-10-15 补 `deserialize_some`），**表单整字段发送时注意**；`auto_allocate_limit: null` 同理。
 13. **`POST /queue/auto-allocate` 请求 / 响应变更（2026-10-15，破坏性）**：
     - 请求删 `mode` / `fill_ratio`，只发 `{ process_id, shelf_id }`；
     - 响应删 `mode` / `fill_ratio` 两键；`filled[].target` 语义改为「工种自动上限（未配置兜底 max）」；`filled[].skipped_reason` 可能取新值 `AUTO_LIMIT_REACHED`；

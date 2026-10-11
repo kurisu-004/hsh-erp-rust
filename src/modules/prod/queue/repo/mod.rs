@@ -91,7 +91,7 @@ use crate::modules::prod::queue::vo::worker::TakenItem;
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait QueueRepoTrait: Send {
-    // ── t_queue 域（本域 4 方法）──
+    // ── t_queue 域（本域 3 方法）──
     /// 2026-10-10：`shelf_id` 改 `Option<i64>`，`None` = 跨全部货架取料
     /// （worker-scan 路径不再有架锚；负载均衡在放回时的 `pick_least_loaded` 一侧）。
     /// 2026-10-15：`cap` 由 service 传入（工种自动补料上限兜底
@@ -269,7 +269,7 @@ pub trait QueueRepoTrait: Send {
 /// `sql::XxxRepo::yyy` 须写 `&mut **self`（reborrow，避免 move 引用本身）。
 #[async_trait]
 impl QueueRepoTrait for &mut PgConnection {
-    // ── 本域 4 方法 ──
+    // ── 本域 3 方法 ──
     /// 2026-10-10：`shelf_id` 改 `Option<i64>`，`None` = 跨全部货架取料
     /// （worker-scan 路径不再有架锚；负载均衡在放回时的 `pick_least_loaded` 一侧）。
     /// 2026-10-15：`cap` 由 service 传入（工种自动补料上限兜底

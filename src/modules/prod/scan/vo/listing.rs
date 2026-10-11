@@ -218,9 +218,11 @@ pub struct ScanListOut {
 ///    里两个字段绑成同一个局部变量的写法。
 /// 2. **`max_held_batches`：`t_work_type.max_held_batches` 为 NULL 时发 `0`**
 ///    （沿用队列板 `prod::queue::board::service.rs` 的 `w.max_held.unwrap_or(0)`
-///    既有约定）。语义正确：NULL 时 `pick-up` 返 `BIZ_WORK_TYPE_MAX_HELD_NOT_SET`、
-///    `take_one_from_pool` 当 cap 0，即「该工种不可取件」；发 `null` 反而有让前端
-///    渲染成「不限」的风险。
+///    既有约定）。语义正确：工种未配 max ⇒ 各路径在**服务入口即早退**（`pick-up`
+///    / `move` / `refill` 返 `20904`，auto-allocate 逐 worker 记
+///    `MAX_BATCHES_NOT_SET` 跳过），`take_one_from_pool` 自 **2026-10-15** 起不再
+///    读工种上限（`max_batches` CTE 已删）；发 `null` 反而有让前端渲染成「不限」的
+///    风险。
 /// 3. **两个计数都是裸 `i64` / `i32` ⇒ JSON number** —— 沿用 `ScanListOut` 的
 ///    方向（本仓的约定是**雪花 id 才转 string**，这两个是计数不是 id；
 ///    与 `prod::inspection` 域的 string 计数方向相反，是有意的）。

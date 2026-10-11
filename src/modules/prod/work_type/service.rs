@@ -311,7 +311,11 @@ impl WorkTypeService {
             None => None,
         };
 
-        // description 三态：None ⇒ 不改；Some(None) ⇒ 清空；Some(Some(v)) ⇒ 改值
+        // description：**当前不是三态**（2026-10-15 复核登记为已知偏差）——
+        // dto 侧只有 `#[serde(default)]`、无 `deserialize_some` ⇒ 显式 JSON `null`
+        // 与字段缺省都落 `None`（= 不修改），`Some(None)` 分支自 wire 不可达 ⇒
+        // **当前没有清空路径**。勿按下方 max_held_batches / auto_allocate_limit 的
+        // 真三态口径理解本字段；补清空路径是独立的行为决策。
         let new_desc_owned: Option<String>;
         let desc_update: Option<Option<&str>> = match &req.description {
             None => None,

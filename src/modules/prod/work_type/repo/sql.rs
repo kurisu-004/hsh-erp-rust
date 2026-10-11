@@ -207,13 +207,18 @@ impl WorkTypeRepo {
 
     /// 部分更新（OCC）：带乐观锁。`code` 不允许改（业务唯一键，由 service 层 enforce）。
     ///
-    /// 三态编码：
+    /// 三态编码（⚠️ **三列的 wire 可达性不同**，2026-10-15 复核）：
     /// - `name` / `sort_order`：二态 `Option<&str / Option<i32>>`，None ⇒ 不修改
-    /// - `description` / `max_held_batches` / `auto_allocate_limit`（2026-10-15
-    ///   新增）：三态 `Option<Option<T>>`：
+    /// - `max_held_batches` / `auto_allocate_limit`（2026-10-15 新增）：真三态
+    ///   `Option<Option<T>>`（dto 侧挂 `deserialize_some`）：
     ///   - `None` ⇒ 字段缺省，不修改
     ///   - `Some(None)` ⇒ 显式清空（SET NULL）
     ///   - `Some(Some(v))` ⇒ 改值
+    /// - `description`：本函数签名形如三态，但 dto 侧只有 `#[serde(default)]`、
+    ///   无 `deserialize_some` ⇒ 显式 JSON `null` 与字段缺省都折成 `None`
+    ///   （= 不修改），`Some(None)` **自 wire 不可达** ⇒ **当前没有清空路径**
+    ///   （已知偏差，登记在 `dto.rs::WorkTypeUpdateRequest.description`；
+    ///   不要按上两列的三态口径理解本字段）。
     ///
     /// `max_held_batches` 与 `auto_allocate_limit` 的**合并后交叉校验**
     /// （auto 有值 ⇒ ≥1 且 max 非空且 auto ≤ max）在 service 层完成，见

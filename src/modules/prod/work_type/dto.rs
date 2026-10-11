@@ -34,6 +34,11 @@ pub struct WorkTypeUpdateRequest {
     pub code: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
+    /// ⚠️ **当前不是三态**（2026-10-15 复核登记为已知偏差）：只有 `#[serde(default)]`、
+    /// 没有 `deserialize_some` ⇒ 显式 JSON `null` 与「字段缺省」都被折成外层 `None`
+    /// （= 不修改），`Some(None)` **自 wire 不可达** ⇒ **没有清空路径**。
+    /// 与下方 `max_held_batches` / `auto_allocate_limit` 的真三态写法不一致，
+    /// 勿按后两者口径理解本字段；补清空路径是独立的行为决策。
     #[serde(default)]
     pub description: Option<Option<String>>,
     #[serde(default)]

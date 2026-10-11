@@ -57,7 +57,10 @@ pub struct RefillResult {
     ///
     /// ⚠️ 它**无法区分**「池里没有可抢的」与「工人已经拿满了」两种截然不同的
     /// 情况：`take_one_from_pool` 对两者**都**返回 `None`（前者是 SELECT 无行，
-    /// 后者是 `held < max` 守卫不通过）。2026-10-14 之前两者在响应里长得一模一样，
+    /// 后者是 `held < cap` 守卫不通过；cap = 工种自动补料上限
+    /// `auto_allocate_limit`、未配置兜底 `max_held_batches`，2026-10-15 起由
+    /// service 算出后传入，见 [`super::super::repo::QueueRepoTrait::take_one_from_pool`]）。
+    /// 2026-10-14 之前两者在响应里长得一模一样，
     /// 运维只能对着代码猜。区分靠新增的 [`Self::stopped_reason`]，**不改本字段**。
     pub pool_empty: bool,
     /// 2026-10-14 新增：`taken` 为空时的**具体**停止原因，取值三选一：

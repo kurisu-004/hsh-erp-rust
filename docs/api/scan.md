@@ -275,9 +275,11 @@ $ grep -rno 'worker??\.\(id\|name\|badge_code\|work_type_id\|work_type_name\|id_
    这个名字本身不承诺这件事）。**不要**为它另发一条查询。
 2. **`max_held_batches` 为 NULL 时发 `0` 而不是 `null`** —— 沿用队列板
    `prod::queue::board::service.rs` 的 `w.max_held.unwrap_or(0)` 既有约定。语义正确：
-   NULL 的含义是「**未配置**」而非「不限」（见 `docs/api/queue.md` §4.7），此时
-   `pick-up` 返 `20904`、`take_one_from_pool` 当 cap 0，即「该工种不可取件」；发
-   `null` 反而有让前端渲染成「不限」的风险。
+   NULL 的含义是「**未配置**」而非「不限」（见 `docs/api/queue.md` §4.7），工种未配
+   max ⇒ 各路径在**服务入口即早退**（`pick-up` / `move` / `refill` 返 `20904`，
+   auto-allocate 逐 worker 记 `MAX_BATCHES_NOT_SET` 跳过），`take_one_from_pool`
+   自 **2026-10-15** 起不再读工种上限（`max_batches` CTE 已删）；发 `null` 反而有让
+   前端渲染成「不限」的风险。
 3. 两个计数都是**裸 number**（本仓约定：只有雪花 id 才转 string）。
 
 ⚠️ **`/pickable`（端点 2）不携带这两个字段** —— 它按 `work_type_id` 作用域，
