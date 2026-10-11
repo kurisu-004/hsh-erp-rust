@@ -428,15 +428,45 @@ RBAC 端点固定 400（§9.5），面板无法把守卫角色本身关掉；它
 
 ADMIN 用户由元角色通配天然放行（见 §9.3）。
 
-业务端点的权限点（首批 3 个，2026-10-14 注册）：
+业务端点的权限点（首批 3 个 2026-10-14 + 第二批 17 个 2026-10-15，共 20）：
 
 | 权限点 | domain | 守卫的端点 | 授权矩阵（`t_role_permission`） |
 |---|---|---|---|
 | `part.drawing.print` | `part` | `GET /parts/{id}/print-drawing`、`POST /parts/print-drawing-batch`、`GET /part-files/{id}/url`（+ 同 service 的 alias `GET /cnc-programs/{id}/download-url`） | MANAGER / CLERK / INSPECTOR / CNC_PROGRAMMER |
-| `queue.dispatch` | `queue` | `POST /prod/queue/dispatch`（写路径；读端点仍角色守卫） | MANAGER / CLERK |
+| `queue.dispatch` | `queue` | `POST /prod/queue/dispatch`、`POST /prod/queue/auto-dispatch`（2026-10-15 迁入，见下） | MANAGER / CLERK |
 | `delivery_note.print` | `delivery_note` | **无**（前端-only） | MANAGER / CLERK / INSPECTOR |
+| `production.view` | `production` | `GET /prod/processes`（2）、`GET /prod/work-types`（3，含工种↔工序映射读）、`GET /prod/shelf-processes`（2）、`GET /prod/process-chains/by-part/{part_id}` 与 `/{chain_id}`（2） | MANAGER / CLERK / CNC_PROGRAMMER / SHELF_ACCOUNT / INSPECTOR |
+| `production.config` | `production` | `POST /prod/work-types/{id}/processes`、`POST /prod/shelf-processes/{shelf_id}`（两处原**零守卫**，本轮补闸） | MANAGER |
+| `queue.view` | `queue` | `GET /prod/queue/pending`、`GET /prod/queue/snapshot`、`GET /prod/queue/processes/{id}` | MANAGER / CLERK / INSPECTOR |
+| `queue.recall` | `queue` | `POST /prod/queue/recall` | MANAGER / CLERK |
+| `queue.allocate` | `queue` | `POST /prod/queue/refill`、`POST /prod/queue/move`、`POST /prod/queue/auto-allocate` | MANAGER / CLERK（⚠️ **有意放宽**：原 Manager 独占，用户定稿） |
+| `batch.split` | `batch` | `POST /api/v2/batches/split`（顶层共用） | MANAGER / CLERK |
+| `batch.transition` | `batch` | `POST /prod/batches/{id}/to-ship` / `to-process` / `to-inspection`、`POST /prod/batches/to-ship` / `to-inspection`（批量）、`POST /prod/batches/{id}/scan-inspect` | MANAGER / INSPECTOR |
+| `batch.deliver` | `batch` | `POST /prod/batches/{id}/deliver` / `complete`（含后台 `task::auto_complete` 的系统身份 —— 伪身份显式带码） | MANAGER / CLERK |
+| `batch.cancel` | `batch` | `POST /prod/batches/{id}/cancel` | MANAGER / CLERK |
+| `batch.repair` | `batch` | 读 `GET /prod/batches/repair` / `repairing` + 写 `POST /prod/batches/{id}/start-repair` / `complete-repair` / `repair-dispatch` | MANAGER / CLERK / INSPECTOR |
+| `inspection.view` | `inspection` | `GET /prod/inspection/queue`、`GET /prod/inspection/scan/{serial_no}` | MANAGER / INSPECTOR |
+| `delivery_note.view` | `delivery_note` | `GET /com/delivery/note`、`GET /com/delivery/note/{id}`、`GET /com/delivery/note/batch-detail`（后两条原**零守卫**，本轮补闸） | MANAGER / CLERK / INSPECTOR（⚠️ 列表**收紧去 CNC**，用户定稿） |
+| `outsource.view` | `outsource` | `GET /outsource-queue/snapshot` / `processes/{id}`、`GET /outsource-quotes`、`GET /outsource-companies` / `{id}` / `by-process/{process_id}` | MANAGER / CLERK / INSPECTOR（⚠️ 公司读**收紧去 CNC**，用户定稿） |
+| `outsource.quote.edit` | `outsource` | `GET /outsource-quotes/quotable-parts`、`POST /outsource-quotes` / `{id}/submit` / `{id}/soft-delete` | MANAGER / CLERK |
+| `outsource.quote.approve` | `outsource` | `POST /outsource-quotes/{id}/approve` / `{id}/reject` | MANAGER |
+| `outsource.move` | `outsource` | `POST /outsource-queue/move`（发送 + 回收同一端点） | MANAGER / CLERK / INSPECTOR |
+| `outsource.company.manage` | `outsource` | `POST /outsource-companies` / `{id}/update` / `{id}/soft-delete` | MANAGER / CLERK |
 
-- 三个权限点对 `SHELF_ACCOUNT` **全部不授**；矩阵逐格等于迁移前的角色守卫集合。
+- 首批 3 点的说明见下（`part.drawing.print` / `delivery_note.print` 两条仍有效）。
+- **第二批 17 点（2026-10-15）**矩阵逐格等于迁移前的端点守卫，**三处有意偏差**
+  （用户定稿，`seeds/rbac.sql` 第 2 节逐点注释同源）：
+  1. `queue.allocate` 自 Manager 独占**放宽**为 M,C（refill / move / auto-allocate）；
+  2. `delivery_note.view` 去 CNC、`outsource.view` 的公司读去 CNC（两处**收紧**）；
+  3. `production.view` 是 work_type / process / shelf_process 三条读（原 M,C,CNC,SA,I）
+     与 process_chain 的 `require_any_read`（原 M,C,I,CNC）的**并集** ⇒ 对
+     process_chain 而言多授 SHELF_ACCOUNT。
+- `SHELF_ACCOUNT` 在第二批矩阵里只有 `production.view` 一格（其余点零行）；
+  `ADMIN` 全表零行（元角色通配，§9.3）。
+- **明确不迁（保持角色守卫）**：`place-on-shelf` / `release-from-programming`
+  （废弃端点）、`scan/deliver` / `worker-scan` / `pick-up` / `verify-badge`
+  （设备流）、RBAC 8 端点（§9.2 设计如此）、dashboard / wx / statistics /
+  mail_digest / iam 其余、`outsource` 对账（shipment）两端点。
 - `part.drawing.print` 守的三条后端端点共用一张矩阵：两条打印端点是纯转发
   （`part::handler::print`），`GET /part-files/{id}/url` 是图纸下载直链
   （2026-10-14 由同集合的 4 角色白名单迁移；`GET /cnc-programs/{id}/download-url`
@@ -448,6 +478,11 @@ ADMIN 用户由元角色通配天然放行（见 §9.3）。
 - 权限装载：登录 / `/iam/refresh` 时按用户**全部角色 code**（含自定义）联查
   `t_role_permission`，写进 Redis session 缓存；`/iam/me` 按同一规则从 DB 重查并直接出参
   （不改写缓存）；改授权靠踢持有者下线生效（§9.4）。
+- ⚠️ **存量会话部署注记（2026-10-15 起）**：`permissions` 装在 Redis session 里，
+  新 seed 行**不会**进入已登录用户的缓存 —— 后端部署第二批后，迁移端点对存量会话
+  返 40300，直到该 token 自然刷新（≤ 900s TTL，保活定时器按 `exp − 300s` 提前续期）
+  或用户重登为止。ADMIN 不受影响（元角色通配在代码里，不查 `permissions`）。
+  部署窗口内不要据此判断「权限没生效」，先让用户刷新 / 重登再复核。
 
 ### 9.3 ADMIN 是元角色
 
