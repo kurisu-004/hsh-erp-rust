@@ -1,7 +1,7 @@
 //! iam 域 RBAC 子模块端到端集成测试（2026-10-14 新增，BE-7）
 //!
 //! 覆盖 `src/modules/iam/rbac/` 的 8 条端点 + 用户域角色授予 / 撤销的联动语义。
-//! 18 条用例（名字固定，便于机械核对）：
+//! 19 条用例（名字固定，便于机械核对）：
 //!
 //! | # | 用例 | 钉住什么 |
 //! |---|---|---|
@@ -23,6 +23,7 @@
 //! | 16 | `custom_role_menu_grant_visible_after_login` | 给自定义角色授菜单 → 目标登录后 /iam/me 可见（raw role code 进菜单装载） |
 //! | 17 | `deactivated_role_is_filtered_from_next_login` | 停用即降权：停用踢持有人、重登后该角色的菜单消失 |
 //! | 18 | `grants_rejects_duplicate_codes` | grants 入参含重复码 → 400（不静默去重） |
+//! | 19 | `grants_edits_survive_seed_rerun` | seed 重跑不回退面板授权（基线只补从未有过的组合） |
 //!
 //! ## 测试基建
 //! - fresh DB（`test_pool()`，从灌过 seeds/menu.sql + seeds/rbac.sql 的 template 克隆）；
@@ -45,6 +46,10 @@ use hsh_erp_test_support::{
     IamFixture, json_request, load_iam_fixture, login_token, send as ts_send, test_app, test_pool,
     test_state,
 };
+
+/// 编译期嵌入与生产启动钩子同一份 seed（用例 ⑲ 重跑验「面板授权不被基线回退」）。
+const MENU_SEED_SQL: &str = include_str!("../../seeds/menu.sql");
+const RBAC_SEED_SQL: &str = include_str!("../../seeds/rbac.sql");
 
 // ===========================================================================
 // Bootstrap / HTTP helpers
@@ -1475,4 +1480,85 @@ async fn grants_rejects_duplicate_codes() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "重复权限码应 400：{env}");
     assert_eq!(env["code"], 40000, "策略拒绝用 40000：{env}");
+}
+
+// ===========================================================================
+// ⑲ grants_edits_survive_seed_rerun（2026-10-15）
+// ===========================================================================
+/// seed 只负责 `t_role_menu` 的**首次基线**（`WHERE NOT EXISTS`），面板是唯一持续
+/// 管理者。本用例走完整链路：面板整包替换系统角色 CLERK 的菜单集合 → 同库按生产
+/// `run_seeds` 顺序重跑两个 seed → 面板结果必须原样保留（seed 不复活旧行、不回补
+/// 被移除的组合）。
+///
+/// 选「只留 `roles_list`」：它不在 CLERK 基线的 16 项里（新增），而 `home` /
+/// `parts_list` 等在基线里（被面板移除）—— seed 一旦回退任一方向都会在本用例红。
+#[tokio::test]
+async fn grants_edits_survive_seed_rerun() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let (clerk_id, clerk_version) = role_row(&pool, "CLERK").await;
+    let grants_uri = format!("/iam/roles/{clerk_id}/grants");
+
+    // 面板整包替换：CLERK 只保留 roles_list
+    let (status, env) = post(
+        &app,
+        &grants_uri,
+        json!({
+            "menu_codes": ["roles_list"],
+            "permission_codes": [],
+            "version": clerk_version,
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "CLERK grants 提交应 200：{env}");
+    assert_eq!(
+        str_set(&env["data"]["menu_codes"]),
+        BTreeSet::from(["roles_list".to_string()])
+    );
+
+    // 同库重跑两个 seed（与生产 run_seeds 同序）：必须不报错
+    sqlx::raw_sql(MENU_SEED_SQL)
+        .execute(&pool)
+        .await
+        .expect("重跑 seeds/menu.sql");
+    sqlx::raw_sql(RBAC_SEED_SQL)
+        .execute(&pool)
+        .await
+        .expect("重跑 seeds/rbac.sql");
+
+    // 读回：面板结果未被 seed 回退
+    let (status, env) = get(&app, &grants_uri, &token).await;
+    assert_eq!(status, StatusCode::OK, "GET grants 应 200：{env}");
+    assert_eq!(
+        str_set(&env["data"]["menu_codes"]),
+        BTreeSet::from(["roles_list".to_string()]),
+        "seed 重跑不得回退面板授权（基线只补从未有过的组合）"
+    );
+    assert!(
+        env["data"]["permission_codes"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "面板清空的权限点不得被 seed 回补：{env}"
+    );
+
+    // 库侧：CLERK 的 live 授权恰为整包后的 1 条；基线里被移除的 home 不得复活
+    let live_menus: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM t_role_menu WHERE role = 'CLERK' AND deleted_at IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count CLERK live t_role_menu");
+    assert_eq!(
+        live_menus, 1,
+        "整包替换后 CLERK 只剩 roles_list 一条 live 授权"
+    );
+    let home_live: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM t_role_menu rm JOIN t_menu m ON m.id = rm.menu_id \
+         WHERE rm.role = 'CLERK' AND m.code = 'home' AND rm.deleted_at IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count CLERK/home live t_role_menu");
+    assert_eq!(home_live, 0, "被面板移除的基线组合不得被 seed 回补");
 }

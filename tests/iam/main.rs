@@ -9,11 +9,12 @@
 //! - bootstrap_admin_seed.rs ← 2026-09-26 新增：seeds/admin.sql + BOOTSTRAP_ADMIN_ENABLED 门控
 //! - wx_bind.rs            ← 2026-09-29 新增：`/iam/users/{id}/wx-bind` 3 端点
 //!   （企业微信身份预绑定；wx-login 主链路在 `tests/wecom_login.rs`）
-//! - menu_seed.rs          ← 2026-10-05 新增：seeds/menu.sql 授权矩阵回归护栏
-//!   （6 用例钉住「工序工种/制定工序=仅 MANAGER，生产队列=MANAGER+CLERK，品检都看不到」：
-//!   角色矩阵快照 / 4.7 段回收作用于存量行 / 幂等 / `/iam/me` 渲染树端到端 /
-//!   白名单↔4.7 回收对账 + 4.0 复活名单镜像 / 4.0 复活 + 派生 id（2026-10-13
-//!   `t_role_menu_pkey` 事故的回归护栏））
+//! - menu_seed.rs          ← 2026-10-05 新增：seeds 种子回归护栏
+//!   （seeds/menu.sql 菜单目录 + seeds/rbac.sql 授权基线（首次基线语义）；
+//!   7 用例钉住「工序工种/制定工序=仅 MANAGER，生产队列=MANAGER+CLERK，品检都看不到」：
+//!   角色矩阵快照 / 幂等（面板软删行零动作）/ `/iam/me` 渲染树端到端 /
+//!   白名单↔live 对账 / 基线语义三条（面板行不被碰、被移除的不回补、从未有过的补回，
+//!   含 2026-10-13 `t_role_menu_pkey` 事故的派生 id 回归护栏））
 //! - shelf.rs              ← 2026-10-10 自 `tests/shelf/api.rs` 迁入：货架子模块的
 //!   5 条 CRUD 端点（URL 自 `/api/v2/shelves/*` 硬切到 `/api/v2/iam/shelves/*`）
 //! - shelf_deactivate.rs   ← 2026-10-10 自 `tests/shelf/deactivate.rs` 迁入：
