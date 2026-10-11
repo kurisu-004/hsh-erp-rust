@@ -80,10 +80,12 @@ impl PartService {
         //   关联。`t_part_batch` 同样不按 `deleted_at` 过滤（事件行是当时的快照事实）。
         //
         // ⚠️ `e.process_id` 对**老事件**恒 NULL 不是投影漏了：该列由 migration
-        // 2026-10-12 新加且**不回填**。2026-10-12 起写侧在 5 个构造点填它
-        // （`prod::scan::service::worker_scan` 的 3 处 + `prod::scan::service::pickup`
-        // 的 2 处，均取事件时刻的批次工序快照；worker_scan 那三处取事件锚那一批，
-        // pickup 那两处取源批次），其余写点仍是
+        // 2026-10-12 新加且**不回填**。2026-10-12 起写侧在构造点填它（2026-10-15
+        // 起共 6 个：`prod::scan::service::worker_scan` 的 3 处 +
+        // `prod::scan::service::pickup` 的 2 处 + `prod::scan::service::transfer`
+        // 的 1 处（`TRANSFERRED`），均取事件时刻的批次工序快照；worker_scan 那三处
+        // 取事件锚那一批，pickup 那两处取源批次，transfer 取接管后的目标工序），
+        // 其余写点仍是
         // `NULL` ⇒ **只有 2026-10-12 之后由报工台产生的作业类事件才有工序**，
         // 它们的 `LEFT JOIN t_process` 命中，`process_id` / `process_name` 有值；
         // 历史事件与工单级 / 批次级流转事件两者皆 `None`。

@@ -767,6 +767,52 @@ async fn locate_outsource_batch_returns_receive_action_with_company_and_sent_at(
     );
 }
 
+/// 外协批次 `OUTSOURCE + OUTSOURCE_COMPANY` 但 **holder 为 NULL**（数据异常）
+/// → `NONE + UNKNOWN`（2026-10-15 收尾订正）。
+///
+/// 写侧 `outsource_receive` 从 holder 取 `company_id`，同形态取不到 ⇒ 拒 `20122`；
+/// 读侧此前只看 location、仍给 `RECEIVE_FROM_OUTSOURCE`（假按钮）。本用例钉住两侧
+/// 对齐：读侧同样不给按钮，落保守出口 `UNKNOWN`（与
+/// `locate_worker_location_without_holder_returns_none_unknown` 同款纪律）。
+#[tokio::test]
+async fn locate_outsource_holder_null_returns_unknown() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "LOCATE-OS-NOH").await;
+    let proc = seed_process(&pool, "LOC-OS-NOH", "工序").await;
+    let wt = insert_work_type(&pool, "WT-OS-NOH", "工种", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let worker = insert_worker(&pool, "BC-OS-NOH", "工", Some(wt)).await;
+    let company = insert_outsource_company(&pool, "外协公司-戊").await;
+    let (_part, batch, _step) =
+        insert_worker_held_part(&pool, customer, "SN-OS-NOH", worker, proc, 1, false).await;
+    force_batch_state(
+        &pool,
+        batch,
+        "OUTSOURCE",
+        Some("OUTSOURCE_COMPANY"),
+        Some(company),
+    )
+    .await;
+    // 制造数据异常形态：外协在途但无持有人（写侧从此处取不到 company_id）。
+    sqlx::query("UPDATE t_part_batch SET current_holder_id = NULL WHERE id = $1")
+        .bind(batch)
+        .execute(&pool)
+        .await
+        .expect("clear holder");
+
+    let (s, env) = locate(&app, &token, "SN-OS-NOH", Some(worker)).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let b = first_batch(&env);
+    assert_eq!(b["status"], "OUTSOURCE");
+    assert_eq!(b["location"], "OUTSOURCE_COMPANY");
+    assert_eq!(
+        b["action"],
+        Value::Null,
+        "holder 为 NULL 时写侧拒 20122，读侧不得给按钮: {env}"
+    );
+    assert_eq!(b["disabled_reason"], "UNKNOWN");
+}
+
 /// 外协批次 + 有链且 `NEXT`、推导出的下一道 ∉ 我工种映射
 /// → `NONE + PROCESS_NOT_IN_WORK_TYPE`（对位 S3 写侧将加的闸门）。
 #[tokio::test]

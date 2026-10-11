@@ -1,7 +1,8 @@
 //! prod::scan 的扫码接管：`POST /api/v2/prod/scan/take-over`（2026-10-15 新增 S2）
 //!
 //! 「扫码找件 · 自助恢复」三件套的第二件（S1 = 只读诊断 `GET /scan/locate`，
-//! S3 = 外协收回，尚未落地）。场景：批次仍挂在**别的**工人名下
+//! S3 = 外协收回 `POST /scan/outsource-receive`，**2026-10-15 已落地**）。场景：
+//! 批次仍挂在**别的**工人名下
 //! （`IN_PROCESS + location='WORKER'` + `current_holder_id != 我`），但图纸 / 实物
 //! 已经流转到这位工人手里 ⇒ 扫工牌一键接管：holder 换成我、顺手推进到我工种下的
 //! 下一道工序，同一事务原子完成。

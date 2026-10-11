@@ -127,7 +127,8 @@ pub fn router() -> Router<Arc<AppState>> {
         .nest("/inspection", inspection::router())
         // 2026-10-10 新增：prod::scan（报工台：扫工牌 + 取件 / 放回列表 +
         // worker-scan + pick-up 共 5 端点，自 prod::worker / part / prod::batch
-        // 三域硬切迁入，**无 alias**）
+        // 三域硬切迁入，**无 alias**；2026-10-15 扫码找件 · 自助恢复三件套
+        // locate / take-over / outsource-receive 再加入 ⇒ 共 8 端点）
         .nest("/scan", scan::router())
         // 2026-10-02 新增：prod::shelf_process（货架 ↔ 工序映射，3 端点，自 shelf 域硬切）
         .nest("/shelf-processes", shelf_process::router())

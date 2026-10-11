@@ -974,10 +974,11 @@ CurrentUser.id (t_user.id)
 ⚠️⚠️ **2026-10-12 起两个字段对新事件返非 0**（跨域行为变更）：此前 `t_part_event.worker_id`
 **从未被写侧写过**（老 INSERT 的列清单里没有它，Python v1 退役后一直是 NULL），本节两条
 聚合的 `WHERE worker_id = $1` 对**任何**工人都恒命中 0 行 ⇒ 已绑定账号也一直看到
-`batchCount: 0 / workHours: 0`。2026-10-12 起写侧在 **7** 个事件构造点填 `worker_id`
+`batchCount: 0 / workHours: 0`。2026-10-12 起写侧在 **8** 个事件构造点填 `worker_id`
 （`prod::scan::service::worker_scan` 的 `RETURNED_TO_SHELF` / `SENT_TO_INSPECTION`
 与部分数量拆批的 `SPLIT`、`prod::scan::service::pickup` 的 `SPLIT` / `PICKED_UP`、
-`prod::queue::service::queue` 的 2 处 `TAKEN_FROM_POOL`），逐点依据见
+`prod::scan::service::transfer` 的 `TRANSFERRED`（2026-10-15 扫码接管新增，填的是
+**接管人**）、`prod::queue::service::queue` 的 2 处 `TAKEN_FROM_POOL`），逐点依据见
 `crate::shared::part_event` 的模块 doc。⚠️ `batchCount` 不按 `event_type` 过滤，新增的
 `SPLIT` 事件因此也进该计数，但它的 `batch_id` 与紧随其后的放回 / 送检事件是同一批 ⇒
 `COUNT(DISTINCT batch_id)` 不受影响；`workHours` 有 `event_type IN ('PICKED_UP',

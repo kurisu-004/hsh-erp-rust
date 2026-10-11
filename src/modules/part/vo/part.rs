@@ -445,8 +445,9 @@ pub struct PartListOut {
 /// 2026-10-12 再新增 2 字段（`process_id` / `process_name`，共 17 字段）：事件
 /// 发生时批次所处的工序，读列来自新增的 `t_part_event.process_id`
 /// （migration `20261011130000_009_add_part_event_process_id.sql`，**加列后不回填**）
-/// 与 `LEFT JOIN t_process`。写侧自 2026-10-12 起在 `prod::scan` 的 5 个构造点填
-/// `process_id` ⇒ **只有 2026-10-12 之后由报工台产生的作业类事件**两字段有值，
+/// 与 `LEFT JOIN t_process`。写侧自 2026-10-12 起在 `prod::scan` 的构造点填
+/// `process_id`（2026-10-15 起共 6 个：worker_scan 3 + pickup 2 + `TRANSFERRED` 1）
+/// ⇒ **只有 2026-10-12 之后由报工台产生的作业类事件**两字段有值，
 /// 历史事件与工单级 / 批次级流转事件恒 `None`。
 ///
 /// ⚠️ 本 struct 上的 `#[serde(default)]` 是**空操作**：`default` 只对
@@ -485,8 +486,10 @@ pub struct PartEventOut {
     /// 2026-10-10 新增：工人姓名（`t_worker.name`）。
     /// **2026-10-12 之前的事件恒 `None`** —— 那是写侧从不填 `worker_id` 造成的
     /// （该列在 Python v1 退役后一直是 NULL，`LEFT JOIN t_worker w` 必然落空），
-    /// 不是读侧没补列。2026-10-12 起写侧在 7 个事件构造点填 `worker_id`
-    /// （逐点依据见 `crate::shared::part_event` 的模块 doc）⇒ **本字段对新事件
+    /// 不是读侧没补列。2026-10-12 起写侧在 8 个事件构造点填 `worker_id`
+    /// （2026-10-15 起；worker_scan 3 + pickup 2 + `TRANSFERRED` 1 + queue 的
+    /// `TAKEN_FROM_POOL` 2，逐点依据见 `crate::shared::part_event` 的模块 doc）
+    /// ⇒ **本字段对新事件
     /// 才有值**；其余写点（批次级 / 工单级流转、外协、装配、序列号归档 …）写的
     /// 事件上，它仍是 `None`。
     #[serde(default)]
@@ -510,7 +513,8 @@ pub struct PartEventOut {
     /// 2026-10-12 新增：事件发生时批次所处的工序（`t_part_event.process_id`，
     /// 逻辑指向 `t_process.id`）。**2026-10-12 之前的事件恒 `None`** —— 该列由
     /// migration `20261011130000_009_add_part_event_process_id.sql` 新加、
-    /// **不回填**；2026-10-12 起写侧在 `prod::scan` 的 5 个构造点填它（取事件时刻
+    /// **不回填**；2026-10-12 起写侧在 `prod::scan` 的构造点填它（2026-10-15 起共
+    /// 6 个：worker_scan 3 + pickup 2 + `TRANSFERRED` 1，取事件时刻
     /// 的批次工序快照），其余写点一律 `NULL`。
     ///
     /// **JSON string 而非 number**（雪花 ID 精度，见 `serialize_i64_opt`）。

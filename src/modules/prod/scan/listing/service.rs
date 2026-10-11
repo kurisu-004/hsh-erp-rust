@@ -251,7 +251,8 @@ enum LocateClass {
     /// `IN_PROCESS + WORKER` 且持有人是**非空**的别的工人（S2 接手；holder 为 NULL
     /// 的脏形态落 `Disabled(Unknown)`，见 `classify_batch`）。
     TakeOver,
-    /// `OUTSOURCE + OUTSOURCE_COMPANY`（S3 外协收回）。
+    /// `OUTSOURCE + OUTSOURCE_COMPANY` 且 holder **非空**（S3 外协收回；holder 为
+    /// NULL 的脏形态落 `Disabled(Unknown)`，见 `classify_batch` 的 OUTSOURCE 分支）。
     Outsource,
     /// 状态类原因（写侧没有对应按钮，只有指引文案）。
     Disabled(LocateDisabledReason),
@@ -276,7 +277,14 @@ fn classify_batch(row: &LocateBatchRow, worker_id: i64) -> LocateClass {
             _ => LocateClass::Disabled(LocateDisabledReason::Unknown),
         },
         "OUTSOURCE" => match row.location.as_deref() {
-            Some("OUTSOURCE_COMPANY") => LocateClass::Outsource,
+            // 2026-10-15 收尾订正：`location='OUTSOURCE_COMPANY'` 但 holder 为 NULL 是
+            // **数据异常**（写侧 `outsource_receive` 从 holder 取 `company_id`，同形态
+            // 拒 `20122`）⇒ 读侧不得给 `RECEIVE_FROM_OUTSOURCE`（否则是「写侧会拒绝
+            // 的却显示可点按钮」）。落保守出口 `UNKNOWN`，与上方 WORKER 分支同款纪律。
+            Some("OUTSOURCE_COMPANY") if row.current_holder_id.is_some() => LocateClass::Outsource,
+            Some("OUTSOURCE_COMPANY") if row.current_holder_id.is_none() => {
+                LocateClass::Disabled(LocateDisabledReason::Unknown)
+            }
             _ => LocateClass::Disabled(LocateDisabledReason::Unknown),
         },
         "PROGRAMMING" => LocateClass::Disabled(LocateDisabledReason::Programming),

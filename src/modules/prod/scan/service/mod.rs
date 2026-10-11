@@ -1,8 +1,10 @@
 //! prod::scan 域业务逻辑（`impl ScanService` 拆文件）
 //!
-//! 2026-10-10 自 `prod::worker` / `prod::batch` 搬入：报工台的 4 条写路径按
+//! 2026-10-10 自 `prod::worker` / `prod::batch` 搬入：报工台的写路径按
 //! **前端消费方**（`views/production/scan/` 三页 + 扫工牌弹窗）归到一域，不再散落在
-//! `prod::worker` / `prod::batch` / `part` 三处。
+//! `prod::worker` / `prod::batch` / `part` 三处；2026-10-15 扫码找件 · 自助恢复
+//! 三件套（S2 `transfer` / S3 `outsource_receive`）落地后本目录共 **5 条写路径**
+//! （badge / worker_scan / pickup / transfer / outsource_receive，见「文件分工」）。
 //!
 //! ## 文件分工
 //! - `badge.rs` —— 扫工牌（`POST /scan/verify-badge`）
