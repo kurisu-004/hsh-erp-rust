@@ -7,7 +7,9 @@
 //!
 //! 修改菜单曾经是"改 migration 文件 + 算 SHA384 + 同步 _sqlx_migrations.checksum
 //! + 部署"四步曲，每次都要担心硬编码 ID 撞号、ON CONFLICT 守卫、optimistic
-//!   lock +1。重构后改为"改 seeds/menu.sql + 重启 app"两步，零摩擦。
+//!   lock +1。重构后改为"改 seeds + 重启 app"两步，零摩擦：菜单目录 → seeds/menu.sql，
+//!   角色 / 权限点 / 授权基线 → seeds/rbac.sql（t_role_menu 首次基线自 2026-10-15 起归
+//!   此文件，见下「RBAC 基线 seed」）。
 //!
 //! seeds/menu.sql 是声明式的：
 //!   * INSERT ... ON CONFLICT (code) WHERE deleted_at IS NULL DO UPDATE

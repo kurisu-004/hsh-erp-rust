@@ -24,9 +24,10 @@
 5. **VO 字段裁剪 29 个** + `RemoveParts` → `RemoveBatches` 改名 + `SubmitDeliveryOut` 塌缩为
    `R<String>`。
 6. **菜单 `delivery_dispatch` 下线**（`seeds/menu.sql`，非 migration —— seed 每次启动重放）：
-   §0 复活清单 / §2 INSERT / §4.1 + §4.3 白名单全部移除，§3.5 显式软删既有行，§4.6 回收
-   `t_role_menu`。该菜单的目标页依赖的恰好是本轮删掉的 `GET /pickup-pending` /
-   `POST /{id}/pickup-scan` ⇒ 前端必须同步删页（§8.3 第 16 行）。
+   `seeds/menu.sql` §3.5 显式软删既有行，§0 复活清单 / §2 INSERT 同步不再声明该 code；
+   `seeds/rbac.sql` §5 回收 `t_role_menu` 残留，§4 授权基线不再声明该菜单。该菜单的目标页
+   依赖的恰好是本轮删掉的 `GET /pickup-pending` / `POST /{id}/pickup-scan` ⇒ 前端必须
+   同步删页（§8.3 第 16 行）。
 7. **`DeliveryNoteLineItem` 新增 `customer_id`**（L2 叶子 id，必填非空）：打印分组键由
    `customer_name` 切到 id —— `t_customer.name` 非唯一，同名 L2 会被并进同一张 sheet。
 

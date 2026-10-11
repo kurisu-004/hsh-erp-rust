@@ -601,12 +601,16 @@ UNION ALL SELECT 't_menu='||count(*) FROM t_menu;" | sed 's/^/    /'
 
 # ---------------------------------------------------------------------------- 9) seed（菜单目录 + 授权基线）
 # 默认按启动钩子同序应用两个 seed；SEED_FILE 环境变量可覆盖为自定义清单（空格分隔）。
+# 清单中任一文件缺失即硬失败（与 seed_apply.sh 同口径）：静默跳过会留下「菜单目录灌
+# 了、授权基线没灌」的半残库，而这是恢复流程里最难察觉的错。
 SEED_FILES="${SEED_FILE:-seeds/menu.sql seeds/rbac.sql}"
 for seed_file in $SEED_FILES; do
-    if [ -f "$seed_file" ]; then
-        echo "-> apply seed: $seed_file (idempotent)"
-        psql_in -f - < "$seed_file" >/dev/null
+    if [ ! -f "$seed_file" ]; then
+        echo "✗ seed 文件不存在: $seed_file" >&2
+        exit 1
     fi
+    echo "-> apply seed: $seed_file (idempotent)"
+    psql_in -f - < "$seed_file" >/dev/null
 done
 echo "   t_menu=$(psql_q 'SELECT count(*) FROM t_menu'), t_role_menu=$(psql_q 'SELECT count(*) FROM t_role_menu')"
 
