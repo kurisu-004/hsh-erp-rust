@@ -15,8 +15,12 @@
 //!   `BATCH_PLACED_ON_SHELF`（payload = succeeded 列表）
 //! - 只读端点（auto-dispatch）：`pool.acquire()` 不开事务，不发 WS
 //!
-//! ## 角色守卫
-//! 在 service 第一行下沉（沿本域 `move_batch` 范本），handler 仅做权限分发。
+//! ## 权限守卫（2026-10-14 写路径迁权限点）
+//! 守卫在 service 第一行下沉（沿本域 `move_batch` 范本），handler 仅做权限分发：
+//! - **写路径** `dispatch`：权限点 `queue.dispatch`；
+//! - **读路径** `pending` / `auto-dispatch`：角色守卫（`require_any_role`）不动。
+//!
+//! 两处口径见 `service/dispatch.rs` 模块头「事务 + 守卫」一节。
 
 use std::sync::Arc;
 
@@ -61,7 +65,8 @@ pub async fn list_pending(
 
 /// `POST /api/v2/prod/queue/dispatch`
 ///
-/// 角色：Manager + Clerk（service 内守卫）。
+/// 权限：`queue.dispatch`（service 内守卫；2026-10-14 自 Manager + Clerk 角色
+/// 守卫迁移，矩阵逐格等于原集合）。
 ///
 /// 2026-09-30 重构：入参改为 bulk-only 形态（`DispatchRequest { targets, note? }`）。
 /// 单条下发即 `targets.length == 1`；handler 把 targets 解构为 `(batch_id, target_process_id)`

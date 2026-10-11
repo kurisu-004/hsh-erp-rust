@@ -18,8 +18,14 @@
 //!
 //! 目录形态：`dto/` `handler/` `repo/` `service/` `vo/` 是账号与会话的扁平结构，
 //! `service/account/` 是子目录先例；本域端点全挂在 `/api/v2/iam` 下。
+//!
+//! **2026-10-14 新增 `rbac` 嵌套子模块**（`src/modules/iam/rbac/`，8 端点，URL
+//! `/api/v2/iam/{roles,permissions,menus}`）：角色 / 权限点 / 授权整包。与
+//! `shelf` 同样是嵌套子模块（域内的 `dto` / `handler` / `service` / `vo` 目录里
+//! 已全是账号与会话文件，RBAC 的 8 条端点摊进去会与之混作一团）。
 pub mod dto;
 pub mod handler;
+pub mod rbac;
 pub mod repo;
 pub mod service;
 pub mod shelf;

@@ -19,23 +19,23 @@
 //!   `Arc<dyn CosClient>`），方法签名 `<R: PartFileRepoTrait>(&self, mut repo: R, ...)`
 //!   by-value；handler 借 `&mut *tx` / `&mut *conn` 喂给 trait。
 //!
-//! ## 角色矩阵（2026-10-10 新增 `Role::ShelfAccount` 的两条只读端点）
+//! ## 端点守卫矩阵
 //!
 //! 报工台（前端路由 `/scan/*`）的路由守卫就是 `SHELF_ACCOUNT` —— 车间工控机用的
 //! 就是这个角色账号；它的图纸预览打的是本域的**列表** `GET /api/v2/part-files` 与
-//! **内容** `GET /api/v2/part-files/{id}/content`。这两条原本只放 4 角色
-//! （Manager / Clerk / Inspector / CncProgrammer）⇒ 工控机点预览必然 403（40300）。
+//! **内容** `GET /api/v2/part-files/{id}/content`，这两条均对 `SHELF_ACCOUNT`
+//! 放行（否则工控机点预览必然 403（40300））。
 //!
-//! | 端点 | 角色集合 | 备注 |
+//! | 端点 | 守卫 | 备注 |
 //! |---|---|---|
-//! | `GET /part-files`（列表） | M / C / I / CNC / **SHELF** | 2026-10-10 放开 SHELF |
-//! | `GET /part-files/{id}/content` | M / C / I / CNC / **SHELF** | 2026-10-10 放开 SHELF |
-//! | `GET /part-files/{id}/url` | M / C / I / CNC | **刻意不含 SHELF**，见下 |
-//! | `POST /part-files`（上传） | M / C / CNC（`bind_uploaded_file` 只 M / C） | 未动 |
+//! | `GET /part-files`（列表） | 角色 M / C / I / CNC / **SHELF** | 2026-10-10 放开 SHELF |
+//! | `GET /part-files/{id}/content` | 角色 M / C / I / CNC / **SHELF** | 2026-10-10 放开 SHELF |
+//! | `GET /part-files/{id}/url` | 权限点 `part.drawing.print`（默认矩阵 = M / C / I / CNC） | 2026-10-14 由角色白名单迁移；SHELF 默认不授，见下 |
+//! | `POST /part-files`（上传） | 角色 M / C / CNC（`bind_uploaded_file` 只 M / C） | 未动 |
 //! | `POST /part-files/{id}/delete` | 按 kind 派生（图纸类 M / C，G_CODE M / CNC） | 未动 |
-//! | `GET /part-files/parts/{id}/files` | M / C / I / CNC | **handler 级**闸门，比 service 严 |
-//! | `GET /part-files/parts/{id}/cnc-programs` | M / C / I / CNC | 同上 |
-//! | `GET /part-files/parts/{id}/setup-sheets` | M / C / I / CNC | 同上 |
+//! | `GET /part-files/parts/{id}/files` | 角色 M / C / I / CNC | **handler 级**闸门，比 service 严 |
+//! | `GET /part-files/parts/{id}/cnc-programs` | 角色 M / C / I / CNC | 同上 |
+//! | `GET /part-files/parts/{id}/setup-sheets` | 角色 M / C / I / CNC | 同上 |
 //!
 //! **闸门分两层，不是巧合**：零件维度的三条嵌套列表端点各自在 handler 里先过一道
 //! 4 角色（`handler.rs` 的 `list_part_files_for_part` / `list_part_cnc_programs` /
@@ -46,7 +46,12 @@
 //! （零件 / 装配件文件列表统一走 `GET /part-files?owner_id=…&kind=…`），现存消费方
 //! 都在那些页面上、与 SHELF_ACCOUNT 无关。
 //!
-//! ### 为什么 `/url` 不跟着放开
+//! ### 为什么 `/url` 的默认矩阵不含 `SHELF_ACCOUNT`
+//!
+//! 2026-10-14 起 `/url` 的守卫是**权限点 `part.drawing.print`**（不再硬编码角色
+//! 集合）：默认矩阵逐格等于迁移前的 4 角色，故 `SHELF_ACCOUNT` 默认仍进不来；
+//! 管理员在角色面板把该点授给 `SHELF_ACCOUNT` 后本端点对它放行 —— 授权归面板管，
+//! 代码只认点。下面是「默认不给」的取舍。
 //!
 //! `get_file_with_url` 回的是 **COS 预签直链**（`presigned_get_url`，
 //! `url_expires_in_seconds = 3600`）：链接一旦到手就能**脱离本后端**直接 GET，

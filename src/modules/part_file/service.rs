@@ -229,16 +229,22 @@ impl PartFileService {
 
     /// 单条详情 + 预签下载 URL。
     ///
+    /// 权限：**权限点 `part.drawing.print`**（2026-10-14 由 4 角色白名单迁移；
+    /// 与 `part` 域图纸打印端点共用同一点）。默认矩阵逐格等于迁移前集合
+    /// （MANAGER / CLERK / INSPECTOR / CNC_PROGRAMMER，见 `seeds/rbac.sql`），
+    /// 但矩阵归管理员管：授权后放行、收回后拒绝都发生在面板改矩阵之后。
+    /// **SHELF_ACCOUNT 默认不在矩阵内** —— 报工台工控机预览走同域的
+    /// `get_file_content`（后端代理）即可。
+    ///
+    /// ⚠️ 本端点回的是 **COS 预签直链**（有效期 1 小时），拿到即可绕过本后端任意
+    /// 访问、直链可外传。content 不同：字节流由后端代理、每次访问都重新过 RBAC。
+    /// 要放开「工控机看图纸」时放开 content 即可，不要顺带把这里的授权也发出去。
+    ///
     /// 2026-09-29 扁平化：DB 历史行 object_key 仍是五段（legacy），但 COS 桶内
     /// 真实对象可能按新模板存储（同一文件内容 sha16 一致 → 新模板 key 一致）。
     /// 读端点 fallback：先尝试 `head_object(db_key)`，若 NoSuch 且 db_key 可被
     /// `parse_legacy_key` 解析，则按新模板重写 key 再 head 一次；若新模板 key
     /// 存在则用其生成 presigned URL（保证浏览器拿到的 URL 在桶内有效）。
-    ///
-    /// ⚠️ **白名单刻意不含 `Role::ShelfAccount`**（2026-10-10）：本端点回的是 **COS
-    /// 预签直链**（有效期 1 小时），拿到即可绕过本后端任意访问、直链可外传。报工台
-    /// 预览用的是同域的 `get_file_content`（走后端代理、同样能看内容），不需要预签。
-    /// 要放开「工控机看图纸」时放开 content 即可，不要顺带放开这里。
     #[allow(clippy::too_many_arguments)]
     pub async fn get_file_with_url<R: PartFileRepoTrait>(
         &self,
@@ -248,12 +254,7 @@ impl PartFileService {
         file_id: i64,
         current: &CurrentUser,
     ) -> Result<PartFileWithUrlOut, AppError> {
-        current.require_any_role(&[
-            Role::Manager,
-            Role::Clerk,
-            Role::Inspector,
-            Role::CncProgrammer,
-        ])?;
+        current.require_permission("part.drawing.print")?;
         let row = repo.get_by_id(file_id, false).await?.ok_or_else(|| {
             AppError::biz(
                 code::BIZ_PART_FILE_NOT_FOUND,
@@ -563,9 +564,10 @@ impl PartFileService {
 ///
 /// 权限：`get_file_content` 的 5 角色白名单
 /// （Manager / Clerk / Inspector / CncProgrammer / **ShelfAccount**，2026-10-10 新增
-/// ShelfAccount —— 报工台工控机账号预览图纸）。⚠️ 与 `get_file_with_url` **同角色集合
-/// 但不同风险面**：本端点由后端代理、经 RBAC 逐次把关；`/url` 回的是 COS 预签直链，
-/// 拿到即可脱离本后端直接访问。
+/// ShelfAccount —— 报工台工控机账号预览图纸）。⚠️ 与 `get_file_with_url` **同为按 id
+/// 取文件的读端点，但守卫与风险面不同**：本端点由后端代理、经 RBAC 逐次把关、对
+/// ShelfAccount 放行；`/url` 的守卫是权限点 `part.drawing.print`（默认矩阵不含
+/// ShelfAccount），回的是 COS 预签直链，拿到即可脱离本后端直接访问。
 pub struct PartFileContent {
     pub bytes: Vec<u8>,
     pub content_type: Option<String>,

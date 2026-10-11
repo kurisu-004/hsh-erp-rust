@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE t_user_role\n            SET deleted_at = $2, updated_at = $2, updated_by = $3, version = version + 1\n            WHERE role = $1 AND deleted_at IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Timestamp",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a81a83b3320d20d4234ee1fa081b5469d6849d275c46ee4059f44120704d9cb8"
+}

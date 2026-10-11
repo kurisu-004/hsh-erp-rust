@@ -160,6 +160,15 @@ docker exec -i -e PGPASSWORD=postgres "$CID" \
     psql -U postgres -d "$TEMPLATE_DB" -v ON_ERROR_STOP=1 -f - \
     < seeds/menu.sql >/dev/null
 
+# 2026-10-14：RBAC 基线种子（6 个内置角色 + 权限点 + 授权矩阵）同样灌 template ——
+# 与生产启动钩子 run_seeds 的装载范围对齐（menu → rbac）。不灌的话：
+# ① /iam/users/{id}/roles 授予内置角色会被「角色不存在」拒（BE-4 起查 t_role）；
+# ② 角色权限点的端点守卫（BE-8 起）在测试库里全是 403。
+# admin seed 仍不灌（BOOTSTRAP_ADMIN_ENABLED 门控，测试各自按需触发）。
+docker exec -i -e PGPASSWORD=postgres "$CID" \
+    psql -U postgres -d "$TEMPLATE_DB" -v ON_ERROR_STOP=1 -f - \
+    < seeds/rbac.sql >/dev/null
+
 # 注入 TEST_DATABASE_BASE_URL（指向 template；caller 用 TEMPLATE 派生 fresh DB）
 PORT=$(docker port "$CID" 5432/tcp | head -n1 | awk -F: '{print $NF}')
 export TEST_DATABASE_BASE_URL="postgres://postgres:postgres@127.0.0.1:${PORT}/${TEMPLATE_DB}"

@@ -77,11 +77,13 @@
 //!    - `menu_seed_rendered_tree_per_role` 里 3 处 `children_of(...)` 的**精确子节点
 //!      集合**断言（MANAGER 6 个 / CLERK 1 个 / INSPECTOR 1 个）—— 给
 //!      `production_group` 加一个子菜单就会在这里红。
+//!      2026-10-14 起 MANAGER 还多一处 `auth_group` 子节点断言（users_list /
+//!      shelves_list / roles_list），给 `auth_group` 增删子菜单同理必红。
 //! 2. 改 **4.7 段回收元组**时，**必须同步** `REVOKED_PAIRS`（用例 ⑤ 的断言 C 会直接
 //!    比对两处来源）。用例会伪造这些 `(role, code)` 的 legacy 存量行来验回收生效，
 //!    两处不一致 = 要么伪造的行没被回收、要么期望的期望值错了。
 //!    - 同一批改动里，若还动到了 **4.1-4.5 段白名单**，**必须同步 4.0 段的复活元组
-//!      列表**（用例 ⑤ 的断言 D 会比对「4.0 名单 == 4.1-4.5 白名单」）。4.0 的 61 条
+//!      列表**（用例 ⑤ 的断言 D 会比对「4.0 名单 == 4.1-4.5 白名单」）。4.0 的 62 条
 //!      元组是白名单的手工复制：少了 → 该 code 被软删后再加回白名单时会插出第二行；
 //!      多了 → 4.7 回收名单里的 code 会被误复活（当前 4.7 在 4.0 之后跑、同一事务，
 //!      净结果仍是软删，但那段顺序契约一改就静默失效）。
@@ -97,7 +99,7 @@
 //!      改法是先把 `EXPECTED_SNAPSHOT` 补上，再改 `WHITELIST_SECTIONS`；
 //!    - **`AND (rm.role, m.code) IN (` 现在有两处**（4.0 复活段 + 4.7 回收段）。
 //!      `revoked_re` / `revived_re` 因此**额外锚定** `AND rm.deleted_at IS NULL` /
-//!      `IS NOT NULL` 来区分两段。只靠元组列表形状会把 4.0 的 61 条白名单误读成回收
+//!      `IS NOT NULL` 来区分两段。只靠元组列表形状会把 4.0 的 62 条白名单误读成回收
 //!      名单。多写/少写任一段都会 panic「应恰有 1 处…请先修解析器」；
 //!    - code 字面量必须匹配 `^[a-z_]+$`：引号写错位置 / 混入非小写字符会 panic。
 //!    - 附：code 列表**中间**的 `--` 注释行由 `strip_sql_line_comments` 剥除后才交给
@@ -170,8 +172,9 @@ const TARGET_CODES: [&str; 3] = ["process_work_type", "part_process_chain", "wor
 
 /// `seeds/menu.sql` 第 4.1 段 MANAGER 白名单去掉两条已 soft-delete 的菜单
 /// （第 3.1 节的 `settings_root`、第 3.5 节的 `delivery_dispatch`）后的全量 live 授权
-/// code 快照，**30 项**（2026-10-13 新增 `mail_group` + `mail_digest`：交期汇总邮件
-/// 的顶级分组与子菜单，域 `mail_digest` 的 6 端点全部 MANAGER 独占，只归管理员）。
+/// code 快照，**31 项**（2026-10-13 新增 `mail_group` + `mail_digest`：交期汇总邮件
+/// 的顶级分组与子菜单，域 `mail_digest` 的 6 端点全部 MANAGER 独占，只归管理员；
+/// 2026-10-14 新增 `roles_list`：RBAC 角色面板，8 端点同样 MANAGER 独占）。
 const MANAGER_EXPECTED: &[&str] = &[
     "applicants_list",
     "assemblies_list",
@@ -198,6 +201,7 @@ const MANAGER_EXPECTED: &[&str] = &[
     "production_group",
     "production_stats",
     "repair_receive",
+    "roles_list",
     "shelves_list",
     "template_management",
     "users_list",
@@ -246,8 +250,8 @@ const CNC_PROGRAMMER_EXPECTED: &[&str] = &["home", "parts_list", "pending_progra
 /// 第 4.5 段 SHELF_ACCOUNT 白名单，**3 项**。
 const SHELF_ACCOUNT_EXPECTED: &[&str] = &["floor_group", "home", "scan_badge"];
 
-/// 5 份快照 = 30 + 16 + 8 + 3 + 3 = **60 条 live 授权**（30 = 28 + 2026-10-13 新增
-/// 的 `mail_group` / `mail_digest`）。
+/// 5 份快照 = 31 + 16 + 8 + 3 + 3 = **61 条 live 授权**（31 = 28 + 2026-10-13 新增
+/// 的 `mail_group` / `mail_digest` + 2026-10-14 新增的 `roles_list`）。
 const EXPECTED_SNAPSHOT: [(&str, &[&str]); 5] = [
     ("MANAGER", MANAGER_EXPECTED),
     ("CLERK", CLERK_EXPECTED),
@@ -336,7 +340,7 @@ fn whitelist_re() -> &'static Regex {
 /// 4.0 复活段 / 4.7 回收段的 `AND (rm.role, m.code) IN ( ... )` 元组列表。
 ///
 /// ⚠️ 2026-10-13：4.0 新增了同一形状的元组列表（`AND rm.deleted_at IS NOT NULL` + 同一个
-/// `IN (...)`），所以只锚 `AND (rm.role, m.code) IN (` 会**同时命中两段**、把 4.0 的 61 条
+/// `IN (...)`），所以只锚 `AND (rm.role, m.code) IN (` 会**同时命中两段**、把 4.0 的 62 条
 /// 白名单误当成回收名单。必须再锚定 `AND rm.deleted_at IS NULL` —— 4.0 用的是
 /// `IS NOT NULL`（复活 live 之外的那些），4.7 用的是 `IS NULL`（只回收 live 行），
 /// 两者互斥且不会互相误匹配。这一锚点同时顺带钉住了 4.7 的幂等守卫。
@@ -675,7 +679,7 @@ fn assert_code_set(role: &str, actual: &BTreeSet<String>, expected: &[&str]) {
 
 /// 断言 4.0 复活名单与 4.1-4.5 白名单**逐条镜像**（2026-10-13）。
 ///
-/// 4.0 段的 61 条元组是 4.1-4.5 五段白名单的手工复制。两份必须完全一致：
+/// 4.0 段的 62 条元组是 4.1-4.5 五段白名单的手工复制。两份必须完全一致：
 /// - 少了 → 白名单里的授权被软删后再加回白名单时不会被复活，会插出**第二行**
 ///   （`uk_t_role_menu_role_menu` 是 partial，软删行不在索引里，ON CONFLICT 命中不到）；
 /// - 多了 → 4.7 回收名单里的 code 会被 4.0 复活。4.7 在 4.0 之后跑、同一事务，
@@ -1289,6 +1293,17 @@ async fn menu_seed_rendered_tree_per_role() {
             "workers_list".to_string(),
         ]),
         "MANAGER 的 production_group 子节点集合不符（6 个：工序工种/制定工序/待编程/生产队列/工人一览/待品检）"
+    );
+    // 结构断言：2026-10-14 新增的 RBAC 角色面板（roles_list）必须挂在 auth_group
+    // 下，而不是被 build_menu_tree 当作孤儿提升为顶级。
+    assert_eq!(
+        children_of(&mgr_tree, "auth_group"),
+        BTreeSet::from([
+            "users_list".to_string(),
+            "shelves_list".to_string(),
+            "roles_list".to_string(),
+        ]),
+        "MANAGER 的 auth_group 子节点集合不符（3 个：账号管理/货架管理/角色权限）"
     );
 
     // ── CLERK：只有 worker_queue 在，另两个收回了 ──

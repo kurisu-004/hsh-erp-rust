@@ -129,7 +129,11 @@ pub async fn list_user_roles(
     Ok(Json(R::ok(out)))
 }
 
-/// POST /api/v2/iam/users/{id}/roles → 201 —— 纯写端点
+/// POST /api/v2/iam/users/{id}/roles → 201 —— 写端点 + post-commit 踢下线
+///
+/// 2026-10-14：授予后**必须**踢目标用户的 session —— 权限与角色都装在 Redis
+/// session 缓存（`CachedUserProfile`）里，不踢则这次授予对目标无效直到 session
+/// 自然过期。踢人在 `tx.commit()` **之后**（Redis 不在 DB 事务内）。
 pub async fn add_role(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -137,17 +141,21 @@ pub async fn add_role(
     Json(req): Json<UserAddRoleRequest>,
 ) -> Result<(StatusCode, Json<R<UserRoleOut>>), AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = state
+    let (out, kicks) = state
         .account_service
         .add_role(&mut *tx, id, &req, &current)
         .await?;
     tx.commit().await?;
+    kick_role_sessions(&state, &kicks, "add_role").await;
     Ok((StatusCode::CREATED, Json(R::ok(out))))
 }
 
-/// POST /api/v2/iam/users/{id}/roles/{role_id}/remove —— 纯写端点
+/// POST /api/v2/iam/users/{id}/roles/{role_id}/remove —— 写端点 + post-commit 踢下线
 ///
 /// OCC 锚点 = `req.version`（被撤销那一行自己的 version，客户端必填）。
+/// 2026-10-14：撤销后踢目标用户 session（同 add_role）。**撤销最后一个 ADMIN
+/// 会被护栏拒成 400** —— 此时 service 返回 Err、handler 未 commit、也**不会**
+/// 调 `delete_all_user_sessions`。
 pub async fn remove_role(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -155,12 +163,25 @@ pub async fn remove_role(
     Json(req): Json<UserRemoveRoleRequest>,
 ) -> Result<Json<R<()>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    state
+    let kicks = state
         .account_service
         .remove_role(&mut *tx, id, role_id, req.version, &current)
         .await?;
     tx.commit().await?;
+    kick_role_sessions(&state, &kicks, "remove_role").await;
     Ok(Json(R::ok_empty()))
+}
+
+/// 角色授予 / 撤销后踢下线的统一出口（best-effort：失败只 warn）。
+///
+/// ⚠️ 必须在 `tx.commit()` 之后调：Redis 不在 DB 事务内，先踢会在事务回滚
+/// 时把仍持有原授权的用户误踢下线。
+async fn kick_role_sessions(state: &Arc<AppState>, kicks: &[i64], ctx: &str) {
+    for user_id in kicks {
+        if let Err(e) = state.session.delete_all_user_sessions(*user_id).await {
+            tracing::warn!(error = %e, user_id, ctx, "角色变更后踢下线失败");
+        }
+    }
 }
 /// POST /api/v2/iam/users/{id}/wx-bind —— 写端点（`state.pool.begin()`）
 ///

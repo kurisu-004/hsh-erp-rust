@@ -1544,6 +1544,7 @@ mod tests {
             roles: vec![role],
             shelf_ids: vec![],
             shelf_wildcard: false,
+            permissions: Vec::new(),
         }
     }
 

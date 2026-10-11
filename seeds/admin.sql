@@ -7,7 +7,11 @@
 --   2. 手工：BOOTSTRAP_ADMIN_ENABLED=true 后 psql $DATABASE_URL -v ON_ERROR_STOP=1 -f seeds/admin.sql
 --
 -- 编写约定：
---   * 初始管理员账号固定 username=admin / password=changeme / role=MANAGER（无 scope）
+--   * 初始管理员账号固定 username=admin / password=changeme / role=ADMIN（无 scope）。
+--     role 自 2026-10-14 起由 MANAGER 改为 ADMIN（元角色，代码级通配全部菜单与权限；
+--     ADMIN 角色行由 seeds/rbac.sql 无条件保证存在，与本文件的门控无关）。
+--     从旧版 seed 升级上来的库会保留原 MANAGER 行，本文件**不删**（删除用户既有
+--     授权是危险动作）；如需收敛，在角色面板里撤销。
 --   * id 用静态常量 900000000000000001 / 900000000000000002（与 production 雪花 ID 段物理不相交）
 --   * bcrypt 哈希字面值复用 test-support/fixtures/iam.sql（同 cost=12、同明文）
 --   * ON CONFLICT 幂等：t_user ON CONFLICT (username) WHERE deleted_at IS NULL DO NOTHING；
@@ -39,7 +43,7 @@ INSERT INTO t_user (
 )
 ON CONFLICT (username) WHERE deleted_at IS NULL DO NOTHING;
 
--- ---- 初始管理员角色（MANAGER，无 scope）----
+-- ---- 初始管理员角色（ADMIN 元角色，无 scope；角色行由 seeds/rbac.sql 提供）----
 INSERT INTO t_user_role (
     id, user_id, role, scope_type, scope_id,
     version, created_at, created_by,
@@ -47,7 +51,7 @@ INSERT INTO t_user_role (
 ) VALUES (
     900000000000000002,
     900000000000000001,
-    'MANAGER',
+    'ADMIN',
     NULL, NULL,
     0, now(), NULL,
     now(), NULL

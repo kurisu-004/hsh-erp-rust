@@ -1268,7 +1268,7 @@ async fn delivered_qty_reflects_delivered_batches() {
 
 /// `POST /wx/login/wecom` 的响应体必须**只有** `{token, refresh_token, user{id,
 /// username, full_name, roles}}` —— **不带** iam 域 `LoginResponse` 的
-/// `expires_in` / `is_active` / `shelf_ids` / `menus`。
+/// `expires_in` / `is_active` / `shelf_ids` / `menus` / `permissions`。
 ///
 /// 本用例只验**形状**（白名单 + 禁列），成功路径的 token / 40106 / 40107 /
 /// 40109 等 15 条既有用例在 `tests/wecom_login.rs`（同一端点、同一 mock）。
@@ -1327,10 +1327,16 @@ async fn wx_login_response_only_exposes_six_fields() {
     assert_eq!(
         ukeys,
         vec!["full_name", "id", "roles", "username"],
-        "user 只该有 4 个键（is_active / shelf_ids / menus 是 Web 端专用，必须缺席）: {env}"
+        "user 只该有 4 个键（is_active / shelf_ids / menus / permissions 是 Web 端专用，必须缺席）: {env}"
     );
 
-    for banned in ["expires_in", "is_active", "shelf_ids", "menus"] {
+    for banned in [
+        "expires_in",
+        "is_active",
+        "shelf_ids",
+        "menus",
+        "permissions",
+    ] {
         assert!(
             !user.contains_key(banned),
             "user 不该含 {banned}（小程序零消费 + 多余负载）: {env}"

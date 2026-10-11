@@ -273,6 +273,7 @@ mod tests {
             roles: vec![Role::Manager],
             shelf_ids: vec![],
             shelf_wildcard: false,
+            permissions: Vec::new(),
         }
     }
 
@@ -284,6 +285,7 @@ mod tests {
             roles: vec![Role::Clerk],
             shelf_ids: vec![],
             shelf_wildcard: false,
+            permissions: Vec::new(),
         }
     }
 

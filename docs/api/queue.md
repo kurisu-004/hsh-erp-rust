@@ -20,7 +20,7 @@
 | 1 | GET | `/api/v2/prod/queue/snapshot` | Manager + Clerk + Inspector | 无 | `QueueBoardSnapshot` |
 | 2 | GET | `/api/v2/prod/queue/processes/{process_id}` | Manager + Clerk + Inspector | path `process_id`（雪花 ID 字符串） | `QueueProcessBoardDetail` |
 | 3 | GET | `/api/v2/prod/queue/pending` | Manager + Clerk + Inspector | `limit?`（缺省 200，clamp 1..500）、`offset?` | `PendingBatchListOut` |
-| 4 | POST | `/api/v2/prod/queue/dispatch` | Manager + Clerk | `{ targets: [{batch_id, target_process_id}], note? }` | `DispatchResult` |
+| 4 | POST | `/api/v2/prod/queue/dispatch` | 权限点 `queue.dispatch`（矩阵 = Manager + Clerk；ADMIN 通配） | `{ targets: [{batch_id, target_process_id}], note? }` | `DispatchResult` |
 | 5 | POST | `/api/v2/prod/queue/auto-dispatch` | Manager + Clerk | `{ batch_ids?: string[] }` | `AutoDispatchResult` |
 | 6 | POST | `/api/v2/prod/queue/recall` | Manager + Clerk | `{ batch_id, version, note? }` | `RecallOut` |
 | 7 | POST | `/api/v2/prod/queue/refill` | **Manager 独占** | `{ worker_id, shelf_id }` | `RefillResult` |
@@ -33,6 +33,10 @@
 - 端点 1 / 2 是**纯读**（`pool.acquire()` 不开事务、不发 WS 广播）；端点 3 / 5 同。端点 4 / 6 / 7 / 8 / 9 开事务，**广播在 commit 之后**。
 - 端点 2 工序不存在或已软删 → `20801 BIZ_PROCESS_NOT_FOUND`（**HTTP 404**）。`{process_id}` 抽不出数字时走 axum 的 `PathRejection` → **HTTP 400 纯文本，不进 `R<T>` 信封**（全仓 `Path<i64>` 端点的统一行为，非本端点特例）。
 - 端点 1 / 2 / 3 被 SHELF_ACCOUNT 访问 → `40300`（角色守卫下沉在 service 第一行）。
+- **2026-10-14 权限点迁移**：端点 4（下发写路径）的守卫由角色白名单
+  `require_any_role(Manager, Clerk)` 迁到 `require_permission("queue.dispatch")`，
+  放行矩阵逐格不变（授权在 `seeds/rbac.sql`）；端点 5（auto-dispatch 预览）是
+  只读查询，**保持角色守卫不动**。ADMIN 由元角色通配放行。
 - i64 雪花主键一律序列化为 JSON **string**（`"1590000000000000001"`），防 JS `Number` 精度截断。
 
 ### 1.1 路由注册顺序（当前无硬约束）

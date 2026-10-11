@@ -59,6 +59,8 @@ WHERE deleted_at IS NOT NULL
     -- 2026-10-08 下线 delivery_dispatch：端点已删，故意留在复活清单外
     'inspection_pending', 'repair_receive',
     'workers_list', 'users_list', 'shelves_list',
+    -- 2026-10-14 新增：RBAC 角色面板（auth_group 子菜单，仅 MANAGER）
+    'roles_list',
     'customers_list', 'applicants_list',
     'outsource_companies_list', 'outsource_quotes_list', 'outsource_send_receive_list',
     'process_work_type', 'part_process_chain', 'worker_queue',
@@ -127,6 +129,10 @@ INSERT INTO t_menu (
     -- 搬到 frontend/src/views/production/，路由随之前端搬到 /production/worker-list）。
     (9000000000000202, (SELECT id FROM t_menu WHERE code = 'auth_group'         AND deleted_at IS NULL), 'users_list',                '账号管理',      '/users',                       'List',         20, true, 0, now(), 0, now(), 0),
     (9000000000000203, (SELECT id FROM t_menu WHERE code = 'auth_group'         AND deleted_at IS NULL), 'shelves_list',              '货架管理',      '/shelves',                     'Platform',     30, true, 0, now(), 0, now(), 0),
+    -- 2026-10-14 新增：RBAC 角色面板（角色 / 权限点 / 授权整包，iam::rbac 的 8 条
+    -- 端点）。sort_order=40 接在 shelves_list=30 之后（与前端 dummy 模式侧栏的
+    -- users → shelves → roles 顺序一致）；path 与前端路由 /iam/roles 一致。
+    (9000000000000204, (SELECT id FROM t_menu WHERE code = 'auth_group'         AND deleted_at IS NULL), 'roles_list',                '角色权限',      '/iam/roles',                   'Lock',         40, true, 0, now(), 0, now(), 0),
 
     -- customer_management 下
     (9000000000000401, (SELECT id FROM t_menu WHERE code = 'customer_management' AND deleted_at IS NULL), 'customers_list',         '客户一览',      '/customers',                   'Connection',   10, true, 0, now(), 0, now(), 0),
@@ -251,8 +257,8 @@ WHERE code = 'delivery_dispatch' AND deleted_at IS NULL;
 -- BEGIN/COMMIT 整段回滚，mail_group / mail_digest 连 t_menu 都没插进去。
 --
 -- 派生 ID 的性质：与白名单顺序、增删、其他角色**完全无关**，只由 (role, code)
--- 决定，因此反复跑 / 中途增删 code 都不会撞号。62 条现有组合已实测
--- seed 内部 0 重复、与存量 0 撞号。md5 碰撞概率 ~1e-11，且真撞了是硬报错
+-- 决定，因此反复跑 / 中途增删 code 都不会撞号。现有组合已实测
+-- seed 内部 0 重复、与存量 0 撞号（tests/iam/menu_seed.rs 用例 ⑥ 每次运行复核）。md5 碰撞概率 ~1e-11，且真撞了是硬报错
 -- （不会静默丢授权）—— 这是想要的行为。
 --
 -- ID 段物理不相交（避免与存量行、其它 ID 空间打架）：
@@ -312,6 +318,7 @@ WHERE rm.menu_id = m.id
       ('MANAGER', 'auth_group'),
       ('MANAGER', 'workers_list'),
       ('MANAGER', 'users_list'),
+      ('MANAGER', 'roles_list'),
       ('MANAGER', 'shelves_list'),
       ('MANAGER', 'outsource_list'),
       ('MANAGER', 'outsource_companies_list'),
@@ -376,6 +383,10 @@ WHERE m.code IN (
     'production_group', 'process_work_type', 'part_process_chain', 'worker_queue',
     'template_management', 'print_templates_designer',
     'auth_group', 'workers_list', 'users_list', 'shelves_list',
+    -- 2026-10-14 新增：RBAC 角色面板。**仅 MANAGER** —— 它的 8 条端点全部
+    -- require_role Manager 硬切（面板是权限真源，用权限点守它会自锁），
+    -- 菜单可见性必须跟端点守卫逐格一致。
+    'roles_list',
     'outsource_list', 'outsource_companies_list', 'outsource_quotes_list', 'outsource_send_receive_list',
     'floor_group', 'settings_root',
     -- 2026-10-13 新增：交期汇总邮件。**仅 MANAGER** —— 4.2 CLERK / 4.3 INSPECTOR /

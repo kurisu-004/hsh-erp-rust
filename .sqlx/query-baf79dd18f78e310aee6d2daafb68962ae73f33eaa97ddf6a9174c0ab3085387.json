@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT code FROM t_permission\n            WHERE is_active = TRUE AND deleted_at IS NULL\n            ORDER BY code\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "code",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_permission",
+            "name": "code"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "baf79dd18f78e310aee6d2daafb68962ae73f33eaa97ddf6a9174c0ab3085387"
+}

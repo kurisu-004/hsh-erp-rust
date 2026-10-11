@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE t_role\n            SET code        = COALESCE($3, code),\n                name        = $4,\n                description = $5,\n                updated_at  = $6,\n                updated_by  = $7,\n                version     = version + 1\n            WHERE id = $1 AND version = $2 AND deleted_at IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int4",
+        "Varchar",
+        "Varchar",
+        "Text",
+        "Timestamp",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c80a11aa053d626696f1a84e0ffb7d40e4ec0cf5264af6ae93855f3b04a6afe0"
+}

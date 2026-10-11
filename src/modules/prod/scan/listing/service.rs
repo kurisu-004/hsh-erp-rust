@@ -148,6 +148,7 @@ mod tests {
             roles,
             shelf_wildcard: wildcard,
             shelf_ids: ids,
+            permissions: Vec::new(),
         }
     }
 

@@ -884,6 +884,7 @@ mod tests {
             roles: vec![Role::Manager],
             shelf_ids: vec![],
             shelf_wildcard: false,
+            permissions: Vec::new(),
         }
     }
 
@@ -895,6 +896,7 @@ mod tests {
             roles: vec![Role::Inspector],
             shelf_ids: vec![],
             shelf_wildcard: false,
+            permissions: Vec::new(),
         }
     }
 
