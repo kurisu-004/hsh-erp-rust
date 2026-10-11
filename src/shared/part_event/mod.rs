@@ -13,7 +13,7 @@
 //! |---|---|
 //! | `part` | `CANCELLED` / `FORCE_COMPLETED` / `SOFT_DELETED` |
 //! | `prod::batch` | `INSPECTED` / `BATCH_PASSED` / `INSPECTION_FAILED` / `DELIVERED` / `COMPLETED` / `REPAIR_STARTED` / `REPAIR_COMPLETED` / `SPLIT` / `BATCH_CANCELLED` / `PLACED_ON_SHELF` / `CNC_RELEASED` / `STATUS_CHANGED` |
-//! | `prod::scan` | `PICKED_UP` / `SPLIT` / `RETURNED_TO_SHELF` / `SENT_TO_INSPECTION` |
+//! | `prod::scan` | `PICKED_UP` / `SPLIT` / `RETURNED_TO_SHELF` / `SENT_TO_INSPECTION` / `TRANSFERRED` |
 //! | `prod::queue` | `TAKEN_FROM_POOL` / `MOVED` / `RECALLED` / `PLACED_ON_SHELF` |
 //! | `outsource` | `OUTSOURCE_*` 三条流转字面量（`write_part_event`） |
 //! | `assembly` | `FORCE_COMPLETED`（子件强制完成） |
@@ -59,6 +59,7 @@
 //! |---|---|---|
 //! | ✅ 3 处 | `prod::scan::service::worker_scan`（`RETURNED_TO_SHELF` / `SENT_TO_INSPECTION` / 部分数量拆批的 `SPLIT`） | 形参 `worker: &TWorker`（`resolve_operated_batch` 也按此补了形参）⇒ `Some(worker.id)` |
 //! | ✅ 2 处 | `prod::scan::service::pickup`（`SPLIT` / `PICKED_UP`） | `Some(req.worker_id)` —— 该 worker 已在函数前半段查库校验存在且 active |
+//! | ✅ 1 处 | `prod::scan::service::transfer`（`TRANSFERRED`，2026-10-15 扫码接管新增） | 形参 `worker`（工牌反查出的**接管人**）⇒ `Some(worker.id)`；旧持有人只进 `note` 文本，不填本列 |
 //! | ✅ 2 个调用点 | `prod::queue::service::queue`（2 处 `TAKEN_FROM_POOL`） | 形参 `worker_id`（已被 worker 取料 SQL 验过 `t_worker.id`） |
 //! | ❌ 其余全部写点 | 见下 | 见下 |
 //!
@@ -76,12 +77,12 @@
 //!
 //! | 有值 | 位置 | 取值依据 |
 //! |---|---|---|
-//! | ✅ 5 处 | `worker_scan` 3 处、`pickup` 2 处 | 取值来源分两档，见下 |
+//! | ✅ 6 处 | `worker_scan` 3 处、`pickup` 2 处、`transfer` 1 处 | 取值来源分三档，见下 |
 //! | ❌ 3 个调用点 | `prod::queue::service::queue` 的 3 处 `MOVED` | `MOVED` 有三个方向（POOL→WORKER / WORKER→POOL / WORKER→WORKER），只有第一个是「开始加工」，后两个分别是「放回」与「转手」；而有效工时口径只用 `RETURNED_TO_SHELF` + `SENT_TO_INSPECTION` ⇒ 填不填都不进任何聚合，一律 `None` 少一处需要推理的地方 |
 //! | ❌ 2 个调用点 | `prod::queue::service::queue` 的 2 处 `TAKEN_FROM_POOL` | 该路径手上只有 `TakenItem`，**取不到批次工序**（`prod::queue::repo::sql::TakenRow` / 最终 SELECT 都不含 `pb.current_process_id`，`worker_id` 能拿到而 `process_id` 拿不到）。补它要连带改 `TakenRow` + CTE + RETURNING + `TakenItem` 四个落点并改动 `/prod/queue/refill` 响应契约，超出本轮范围 |
 //! | ❌ 其余全部写点 | 见下 | 这些事件发生时批次确实带着 `current_process_id`，但它们既不是「开始加工」也不是「加工完毕」⇒ 工序归属对统计无贡献；一并 `None` |
 //!
-//! 5 处「有值」分两档取值，判据是**「手上有没有事件锚（`batch_id` 指向）那一批的行」**：
+//! 6 处「有值」分三档取值，判据是**「手上有没有事件锚（`batch_id` 指向）那一批的行」**：
 //!
 //! **一档 · 有事件锚那一批的行，取它（`worker_scan` 的 `RETURNED_TO_SHELF` /
 //! `SENT_TO_INSPECTION`）**：
@@ -100,14 +101,23 @@
 //! `current_process_id`（`worker_scan` 的拆批 `SPLIT`、`pickup` 的 2 处）**：
 //!
 //! `split_batch_for_partial_pass` 的 `INSERT ... SELECT` **继承**源批次的
-//! `current_process_id`，源批次的 UPDATE 又只动 `quantity` + `version`
-//! （`pickup` 侧还经 `mark_batch_with_status_and_meta(..., batch.
-//! current_process_step_id, batch.current_process_id, ...)` 显式透传）⇒ 新旧两批
+//! `current_process_id`，源批次的 UPDATE 又只动 `quantity` + `version` ⇒ 新旧两批
 //! 同工序，故取源快照与取事件锚等价。`worker_scan` 的拆批 `SPLIT` 尤其如此：它写事件
 //! 时新批次行还没被读回来（`find_batch_by_id` 在事件之后），源快照是唯一可取值 ——
 //! 与 `pickup` 那条 `SPLIT` **逐字同口径**。
 //!
-//! **为什么分两档而不是统一取源批次**：两档的**运行结果**一致（拆批只继承、不改工序），
+//! ⚠️ **2026-10-15 S2-B 起 `pickup` 的 PENDING 分支是一个刻意例外**：链首落位解析出的
+//! `placed_process_id` 既不是源批次现值（PENDING 行两列恒 NULL）、也不是拆批继承 ——
+//! 它是这批货领取后的**目标工序**（链首）。写侧直接取 `placed_process_id`，故
+//! 「新旧两批同工序」这个前提在「PENDING + 有链」时不成立（源批次保持 NULL、
+//! 新批次落链首）。IN_PROCESS 起点与无链 PENDING 仍与改动前逐字一致。
+//!
+//! **三档 · 目标工序（扫码接管，`transfer` 1 处）**：`TRANSFERRED` 取接管后的目标工序
+//! `next_pid`（链上推导或前端显式指定）—— 接管动作的本质是「这一批从现在起在新工序上
+//! 开工」，与 RETURNED 的「刚做完哪道」方向相反。它不进有效工时聚合（口径只认
+//! `RETURNED_TO_SHELF` / `SENT_TO_INSPECTION`），值只服务 breakdown / 时间线显示。
+//!
+//! **为什么一、二档不统一取源批次**：两档的**运行结果**一致（拆批只继承、不改工序），
 //! 区别在抗漂移。一档那两处的源批次仍在作用域内，一旦有人给源批次的 UPDATE 加上工序
 //! 推进，「取源批次」会静默记成「下一道工序」；取事件锚那一批的推进前快照天然免疫。
 

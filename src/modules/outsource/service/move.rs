@@ -311,60 +311,16 @@ impl OutsourceMoveService {
             ) => {
                 let next_process =
                     resolve_receive_next_process(conn, batch.id, *next_process_id).await?;
-                // 2026-10-10：目标生产架改由服务端选（`current_load / capacity` 升序）。
-                // 「货架必须映射该工序」这条守卫**已被选架本身覆盖** —— 选架的候选集
-                // 只含 `t_shelf_process` 里映射了该工序的行（带软删闸门），选出来的
-                // 架必然映射它，不再需要 20507 的单独判定。
-                // `None` ⇒ `20508`：该工序无可用生产货架（没配映射 / 映射的架全停用
-                // 或软删 / 全非 PRODUCTION / 都不在当前账号 scope 内）。
-                let shelf_id = crate::shared::shelf::select::pick_least_loaded(
-                    conn,
-                    "PRODUCTION",
-                    Some(next_process),
-                    crate::shared::shelf::select::shelf_scope_for(current),
-                )
-                .await?
-                .ok_or_else(|| {
-                    AppError::biz(
-                        code::BIZ_SHELF_PROCESS_NOT_FOUND,
-                        format!(
-                            "process {next_process} 无可用生产货架（无 active 映射，\
-                             或命中的映射其货架均已软删 / 已停用 / 非 PRODUCTION 区 / \
-                             不在当前账号 scope 内）"
-                        ),
-                    )
-                })?
-                .id;
-                let chain_id = optional_process_chain(conn, part_id).await?;
-                let step_id = optional_step_id(conn, chain_id, next_process).await?;
-                mark_batch_with_status_and_meta(
-                    conn,
-                    batch.id,
-                    batch.version,
-                    "IN_PROCESS",
-                    Some("PRODUCTION_SHELF"),
-                    Some(shelf_id),
-                    step_id,
-                    Some(next_process),
-                    current.id,
-                )
-                .await?;
-                close_open_outsource_shipment(
-                    conn,
-                    snowflake,
-                    batch.id,
-                    req.note.as_deref(),
-                    current,
-                )
-                .await?;
-                write_part_event(
+                // 2026-10-15：回收臂的全部写入抽成 `receive_from_outsource_inner`
+                // （`pub(crate)`），供 `prod::scan` 的 `POST /scan/outsource-receive`
+                // 复用 —— 两条路径的选架 / 关单 / 事件字面量必须是**同一份实现**。
+                // 本臂只留「解析下一道 → 回填出参增量」，行为逐字不变。
+                let shelf_id = receive_from_outsource_inner(
                     conn,
                     snowflake,
                     &batch,
                     &part,
-                    EVENT_RECEIVED_FROM_OUTSOURCE,
-                    "OUTSOURCE",
-                    "IN_PROCESS",
+                    next_process,
                     req.note.as_deref(),
                     current,
                 )
@@ -405,6 +361,92 @@ impl OutsourceMoveService {
             new_process_id,
         })
     }
+}
+
+/// 回收臂的内核：外协公司 → 生产架（`to.kind = PRODUCTION_SHELF`）的全部写入。
+///
+/// 2026-10-15 自 [`OutsourceMoveService::move_batch`] 的回收臂**逐行搬移**（行为逐字
+/// 不变），供 `prod::scan` 的 `POST /scan/outsource-receive` 复用 —— 那个端点的
+/// 「stage①：收回落架」必须与 `/outsource-queue/move` 的回收方向共用**同一份实现**，
+/// 否则选架口径 / 开口 shipment 的关闭 / `RECEIVED_FROM_OUTSOURCE` 事件会各自漂移。
+///
+/// ## 职责边界
+/// 只做「选架 → 批次落位 → 关开口 shipment → 写 part 事件」四件事；
+/// **不解析下一道工序** —— `next_process` 由 caller 解析好传入（两条 caller 的
+/// 解析路径不同：`move_batch` 走 [`resolve_receive_next_process`] 的「显式或链推导」，
+/// scan 端点另有无链必须手填的前置判定）。
+///
+/// ## 守卫不在本函数
+/// 状态 / 位置 / OCC / 角色等守卫全部留在各 caller（`move_batch` 的守卫 ①–⑥ 与
+/// scan 端点的判据 ①–⑧）。本函数 `pub(crate)`，仓内只有上述两个调用点。
+///
+/// ## 写入顺序（同事务，任一失败整体回滚）
+/// 选架（读）→ `mark_batch_with_status_and_meta`（状态 / 位置 / 持有人 / 工序 / step）
+/// → `close_open_outsource_shipment`（含 quote `RECEIVED` 事件）→ part 事件
+/// `RECEIVED_FROM_OUTSOURCE`。
+///
+/// 返回**选中的生产架 id**（= 批次落点，caller 的 `new_holder_id`）。
+pub(crate) async fn receive_from_outsource_inner(
+    conn: &mut PgConnection,
+    snowflake: &SnowflakeIdGenerator,
+    batch: &TPartBatch,
+    part: &TPartInspected,
+    next_process: i64,
+    note: Option<&str>,
+    current: &CurrentUser,
+) -> Result<i64, AppError> {
+    // 2026-10-10：目标生产架改由服务端选（`current_load / capacity` 升序）。
+    // 「货架必须映射该工序」这条守卫**已被选架本身覆盖** —— 选架的候选集
+    // 只含 `t_shelf_process` 里映射了该工序的行（带软删闸门），选出来的
+    // 架必然映射它，不再需要 20507 的单独判定。
+    // `None` ⇒ `20508`：该工序无可用生产货架（没配映射 / 映射的架全停用
+    // 或软删 / 全非 PRODUCTION / 都不在当前账号 scope 内）。
+    let shelf_id = crate::shared::shelf::select::pick_least_loaded(
+        conn,
+        "PRODUCTION",
+        Some(next_process),
+        crate::shared::shelf::select::shelf_scope_for(current),
+    )
+    .await?
+    .ok_or_else(|| {
+        AppError::biz(
+            code::BIZ_SHELF_PROCESS_NOT_FOUND,
+            format!(
+                "process {next_process} 无可用生产货架（无 active 映射，\
+                 或命中的映射其货架均已软删 / 已停用 / 非 PRODUCTION 区 / \
+                 不在当前账号 scope 内）"
+            ),
+        )
+    })?
+    .id;
+    let chain_id = optional_process_chain(conn, batch.part_id).await?;
+    let step_id = optional_step_id(conn, chain_id, next_process).await?;
+    mark_batch_with_status_and_meta(
+        conn,
+        batch.id,
+        batch.version,
+        "IN_PROCESS",
+        Some("PRODUCTION_SHELF"),
+        Some(shelf_id),
+        step_id,
+        Some(next_process),
+        current.id,
+    )
+    .await?;
+    close_open_outsource_shipment(conn, snowflake, batch.id, note, current).await?;
+    write_part_event(
+        conn,
+        snowflake,
+        batch,
+        part,
+        EVENT_RECEIVED_FROM_OUTSOURCE,
+        "OUTSOURCE",
+        "IN_PROCESS",
+        note,
+        current,
+    )
+    .await?;
+    Ok(shelf_id)
 }
 
 /// `location` 的 `kind` 字面（= `t_part_batch.location` 取值，DTO doc 的对齐前提）。
@@ -492,12 +534,17 @@ fn assert_from_matches_batch(
 
 /// 回收方向的目标工序：调用方给了就用，没给就按工序链推导，推不出返 `20706`。
 ///
+/// 2026-10-15 由 `fn` 改 `pub(crate)`：`prod::scan` 的 `POST /scan/outsource-receive`
+/// 在「body 没带 `next_process_id` 且工单有链」时**复用本函数**推导，两条路径的
+/// 推导 SQL 与 `20706` 文案因此逐字同源（内层仍走 [`SQL_DERIVE_NEXT_PROCESS`] +
+/// [`NEXT_PROCESS_LATERAL_SQL`]）。
+///
 /// **文案按「推不出的成因」分两段**（三合一端点里 `next_process_id` 只存在于回收方向
 /// —— 旧两个端点中「发送侧」压根不吃这个字段，故两种成因都落在回收这一步）：
 /// - 压根没有锚链（零件未绑工艺链 / 批次无 step 指针可回退）⇒「请先制定工序链」；
 /// - 有锚链但推不出下一 step（链内当前工序缺失、指针漂移、已是最后一步）⇒「无法推导
 ///   下一道工序，请手填」—— 这类批次运营自己知道该进哪道工序，手填即可。
-async fn resolve_receive_next_process(
+pub(crate) async fn resolve_receive_next_process(
     conn: &mut PgConnection,
     batch_id: i64,
     given: Option<i64>,

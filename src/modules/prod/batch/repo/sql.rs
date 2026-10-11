@@ -4,9 +4,10 @@
 //! `part/repo/sql/batch_sql.rs` 搬来，impl 目标由 part 域 ZST `PartRepo` 改为
 //! 本域 ZST `PartBatchRepo`（`t_part_batch` 的 SQL 真源在 `queries.rs`）。
 //!
-//! ## 承载方法（18 个）
+//! ## 承载方法（19 个）
 //!
-//! 2026-10-15：删一处全仓零调用方的死代码写点，19 → 18。
+//! 2026-10-15：删一处全仓零调用方的死代码写点，19 → 18；同日新增
+//! `transfer_to_worker`（`prod::scan` 扫码接管 S2 的原子写点），18 → 19。
 //!
 //! ### find_*（7）
 //! - `find_inprocess_batch_for_part` / `find_scan_target_batch`
@@ -26,6 +27,10 @@
 //!
 //! ### split（1）
 //! - `split_batch_for_partial_pass`（薄包装 `PartBatchRepo::_split_batch_inner`）
+//!
+//! ### worker → worker 转移（1，2026-10-15 新增）
+//! - `transfer_to_worker`（`prod::scan` 的 `POST /scan/take-over` 专用；与
+//!   `mark_batch_returned` 并列的第二条**不改 status**的批次写点）
 //!
 //! ## 2026-10-02 去 part 化
 //! `find_inspection_batch_for_fail` 更名 `find_inspection_batch_by_id` 并**去掉
@@ -68,6 +73,36 @@ const MARK_BATCH_RETURNED_SQL: &str = r#"
            updated_by              = $4
      WHERE id = $1 AND version = $2
        AND status = 'IN_PROCESS' AND location = 'WORKER'
+       AND deleted_at IS NULL
+    "#;
+
+/// `transfer_to_worker` 的单行 UPDATE（2026-10-15 新增，`prod::scan` 扫码接管 S2）。
+///
+/// 与 [`MARK_BATCH_RETURNED_SQL`] 的两处结构性差别：
+/// 1. **不写 `status`** —— 接管是 WORKER 位置内部的持有人转移（`IN_PROCESS` 保持），
+///    本 SQL 因此不是 `shared::batch::status` 的写点（那条唯一写入口按「SET 里有没有
+///    `status` 列」判定，见 `shared::batch/status.rs` 的 `write_guard_tests`）；
+/// 2. `current_process_step_id` 是**直写**而不是 `COALESCE` 条件写：接管必须把
+///    「当前工序 + step 指针」**成对推进到目标工序**（无链时 step 为 NULL），不存在
+///    「保持原值」这一态。这与 `mark_batch_returned` 的「池内移动 / 无链回退传 None
+///    保持原值」刻意不同。
+///
+/// `$3` 是**旧持有人**（`Option<i64>`），WHERE 用 `IS NOT DISTINCT FROM` 做 NULL 安全
+/// 比较（service 层已拒 NULL 持有人的行，此处仍按 NULL 安全收口，避免将来放宽 service
+/// 判断时静默匹配到 NULL 行）。抽成模块级 const 的目的同 `MARK_BATCH_RETURNED_SQL`：
+/// 让本文件末尾的 `sql_placeholder_guard_tests` 能扫它的文本钉住占位符 / bind 对齐。
+const TRANSFER_TO_WORKER_SQL: &str = r#"
+    UPDATE t_part_batch
+       SET current_holder_id       = $4,
+           location                = 'WORKER',
+           current_process_id      = $5,
+           current_process_step_id = $6,
+           version                 = version + 1,
+           updated_at              = now(),
+           updated_by              = $7
+     WHERE id = $1 AND version = $2
+       AND status = 'IN_PROCESS' AND location = 'WORKER'
+       AND current_holder_id IS NOT DISTINCT FROM $3
        AND deleted_at IS NULL
     "#;
 
@@ -697,6 +732,44 @@ impl PartBatchRepo {
         Ok(result.rows_affected())
     }
 
+    /// 扫码接管（`POST /api/v2/prod/scan/take-over`）的原子写：旧持有人 → 新持有人
+    /// （`location` 恒 `'WORKER'`）+ 当前工序与 step 指针**成对推进**（OCC）。
+    ///
+    /// 2026-10-15 新增（S2「扫码找件 · 自助恢复」的第二件）。`WHERE` 上的守卫是
+    /// service 层判据的 SQL 层兜底，四者缺一不可：
+    /// - `version = $2`：客户端 OCC 锚（禁止「读-再-比」的隐式 OCC）；
+    /// - `status = 'IN_PROCESS' AND location = 'WORKER'`：只允许持有中的批次被接管；
+    /// - `current_holder_id IS NOT DISTINCT FROM $3`：**只允许从预期的那位旧持有人
+    ///   手上接管**（并发下若已被别人接管走，本行不命中 ⇒ 0 行 ⇒ `40901`）。
+    ///
+    /// 0 行 → `40901 VERSION_CONFLICT`（由 service 层映射）。
+    /// **不写 `status`**（`IN_PROCESS` 保持）、**不写 `is_repairing`**（接管不改变
+    /// 返修标记，`mark_batch_with_status_and_meta` 那个会无条件清标记的漏斗在这里
+    /// 是禁用的）。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn transfer_to_worker(
+        conn: &mut PgConnection,
+        batch_id: i64,
+        expected_version: i32,
+        expected_holder_id: Option<i64>,
+        to_worker_id: i64,
+        next_process_id: i64,
+        next_process_step_id: Option<i64>,
+        current_user_id: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(TRANSFER_TO_WORKER_SQL)
+            .bind(batch_id) // $1
+            .bind(expected_version) // $2
+            .bind(expected_holder_id) // $3：旧持有人（UPDATE 守卫）
+            .bind(to_worker_id) // $4：新持有人（接管人）
+            .bind(next_process_id) // $5：推进到的目标工序
+            .bind(next_process_step_id) // $6：目标工序在链内的 step（无链 = NULL）
+            .bind(current_user_id) // $7
+            .execute(&mut *conn)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
     /// 定位 worker 持有的 IN_PROCESS 批次（worker-scan 用）。
     ///
     /// 与 `find_inprocess_batch_for_part` 同形：
@@ -1222,10 +1295,11 @@ impl PartBatchRepo {
 /// 故文本断言足够且确定。
 #[cfg(test)]
 mod sql_placeholder_guard_tests {
-    use super::MARK_BATCH_RETURNED_SQL;
+    use super::{MARK_BATCH_RETURNED_SQL, TRANSFER_TO_WORKER_SQL};
 
-    /// 与 `.bind()` 链的个数严格相等（改 SQL 加占位符时**必须**同步改这里）。
-    const BIND_COUNT: usize = 6;
+    /// 与 `MARK_BATCH_RETURNED_SQL` 的 `.bind()` 链个数严格相等（改 SQL 加占位符时
+    /// **必须**同步改这里）。
+    const MARK_BATCH_RETURNED_BIND_COUNT: usize = 6;
 
     /// 取 SQL 文本里出现的最大 `$n`（`$10` 要按 10 解析，故不能按「`$` 后两位」切）。
     fn max_placeholder(sql: &str) -> usize {
@@ -1243,12 +1317,12 @@ mod sql_placeholder_guard_tests {
     fn mark_batch_returned_placeholders_match_bind_count() {
         let max = max_placeholder(MARK_BATCH_RETURNED_SQL);
         assert_eq!(
-            max, BIND_COUNT,
-            "mark_batch_returned：SQL 最大占位符 ${max}，但 bind 了 {BIND_COUNT} 个 —— \
+            max, MARK_BATCH_RETURNED_BIND_COUNT,
+            "mark_batch_returned：SQL 最大占位符 ${max}，但 bind 了 {MARK_BATCH_RETURNED_BIND_COUNT} 个 —— \
              PG 会在 Bind 阶段报 `bind message supplies N parameters, but prepared \
              statement requires M`，且 sqlx 的 statement cache 被污染，同连接后续所有 \
              查询一起失败。请同步改 SQL 占位符与 `.bind()` 链（每个 `.bind()` 后已标注 \
-             它对应哪个 $n），并同步 BIND_COUNT。"
+             它对应哪个 $n），并同步 MARK_BATCH_RETURNED_BIND_COUNT。"
         );
         // 1..=N 每个占位符都必须真的被用到（跳号会让 bind 顺序错位）
         for n in 1..=max {
@@ -1268,6 +1342,49 @@ mod sql_placeholder_guard_tests {
         assert!(
             MARK_BATCH_RETURNED_SQL.contains("COALESCE($6::bigint, current_process_id)"),
             "current_process_id 必须是条件写入（COALESCE），None 表示「不推进」"
+        );
+    }
+
+    /// 与 `transfer_to_worker` 的 `.bind()` 链个数严格相等（2026-10-15 新增）。
+    const TRANSFER_BIND_COUNT: usize = 7;
+
+    /// `transfer_to_worker` 的占位符 / bind 对齐 + 两条语义钉子（2026-10-15 新增）：
+    /// 1. **SET 子句严禁出现 `status`** —— 本 SQL 是「不改 status 的批次写点」，
+    ///    状态写入口只有 `shared::batch::status`（`no_outside_file_writes_batch_status`
+    ///    是第二道防线，这里在文本层先钉一次）；
+    /// 2. WHERE 必须同时有「旧 holder（NULL 安全）」与「目标 location」两个守卫 ——
+    ///    少了前者会让并发下的「从别人手上接管已易主批次」静默命中；少了后者会把
+    ///    架上批次直接拖到工人手上（绕过 `mark_batch_with_status_and_meta` 的出池语义）。
+    #[test]
+    fn transfer_to_worker_placeholders_match_bind_count() {
+        let max = max_placeholder(TRANSFER_TO_WORKER_SQL);
+        assert_eq!(
+            max, TRANSFER_BIND_COUNT,
+            "transfer_to_worker：SQL 最大占位符 ${max}，但 bind 了 {TRANSFER_BIND_COUNT} 个 —— \
+             请同步改 SQL 占位符与 `.bind()` 链（每个 `.bind()` 后已标注它对应哪个 $n），\
+             并同步 TRANSFER_BIND_COUNT。"
+        );
+        for n in 1..=max {
+            assert!(
+                TRANSFER_TO_WORKER_SQL.contains(&format!("${n}")),
+                "占位符 ${n} 在 SQL 里没有出现（跳号会让 bind 顺序错位）"
+            );
+        }
+        let (set_clause, _) = TRANSFER_TO_WORKER_SQL
+            .split_once("WHERE")
+            .expect("TRANSFER_TO_WORKER_SQL 必须含 WHERE");
+        assert!(
+            !set_clause.contains("status"),
+            "SET 子句出现 `status`：本 SQL 严禁改批次状态（状态写入口只有 \
+             shared::batch::status），且 `no_outside_file_writes_batch_status` 会直接变红"
+        );
+        assert!(
+            TRANSFER_TO_WORKER_SQL.contains("current_holder_id IS NOT DISTINCT FROM $3"),
+            "WHERE 必须带旧 holder 守卫（NULL 安全比较），否则并发下可接管已易主批次"
+        );
+        assert!(
+            TRANSFER_TO_WORKER_SQL.contains("status = 'IN_PROCESS' AND location = 'WORKER'"),
+            "WHERE 必须带 `status='IN_PROCESS' AND location='WORKER'` 守卫"
         );
     }
 }

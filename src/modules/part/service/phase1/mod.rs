@@ -95,7 +95,8 @@ struct EventListRow {
     operator_username: Option<String>,
     /// 2026-10-12 新增（来自 `e.process_id`，migration 009 新增的列）。
     /// ⚠️ **历史事件恒 `None`**：该列加列后**不回填**，2026-10-12 起写侧才在
-    /// `prod::scan` 的 5 个构造点填它，其余写点一律 `NULL`。
+    /// `prod::scan` 的构造点填它（2026-10-15 起共 6 个：worker_scan 3 + pickup 2 +
+    /// 扫码接管的 `TRANSFERRED` 1），其余写点一律 `NULL`。
     process_id: Option<i64>,
     /// 2026-10-12 新增（来自 `LEFT JOIN t_process pr` 的 `pr.name`）。
     process_name: Option<String>,
