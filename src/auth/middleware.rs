@@ -192,7 +192,7 @@ pub async fn verify_session_token(
     //    （2026-09-22 重命名）。
     //
     //    2026-10-14：`permissions` 直接透传缓存里的集合（每请求不查库）。
-    //    ADMIN 用户该字段恒为空 vec，通配在 `CurrentUser::require_permission` 里。
+    //    ADMIN 角色不贡献权限码，通配在 `CurrentUser::require_permission` 里。
     Ok((
         CurrentUser {
             id: cached.user_id,

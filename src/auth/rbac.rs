@@ -23,9 +23,10 @@
 //! - `has_role(任意角色)` 在用户持有 ADMIN 时恒返 `true`；四个鉴权原语
 //!   （`require_role` / `require_any_role` / `require_permission` /
 //!   `can_access_shelf`）因此自动放行；
-//! - ADMIN 用户装载的 `permissions` **恒为空 vec** —— 通配在
-//!   `require_permission` 内做短路，不靠数据。若改成往 `t_role_permission`
-//!   里灌满行，通配语义就退化成「逐项勾选」，漏改一行即静默失效；
+//! - ADMIN **角色**不贡献权限码（`t_role_permission` 无行）—— 通配在
+//!   `require_permission` 内做短路，不靠数据。纯 ADMIN 账号装载的 `permissions`
+//!   为空 vec，账号兼持其它已授权角色时仍带那些码。若改成往
+//!   `t_role_permission` 里灌满行，通配语义就退化成「逐项勾选」，漏改一行即静默失效；
 //! - 后端 `POST /iam/roles/{id}/grants` **拒写** ADMIN 的 grants（400），
 //!   `GET` 则返回全量 active 菜单 / 权限点（面板要能整页渲染，不能返空）。
 //!
@@ -178,9 +179,10 @@ pub struct CurrentUser {
     /// 请求查库，改 grants 的提交与生效之间有一段「改了但仍按旧授权放行」的
     /// 窗口，且这段窗口没有任何机制能收敛。
     ///
-    /// ⚠️ **ADMIN 用户的这个字段恒为空 vec**：ADMIN 是代码级通配
-    ///   （`require_permission` 内短路），不靠数据。写成满行反而会让通配语义
-    ///   悄悄降级成逐项勾选。
+    /// ⚠️ **ADMIN 角色不给这个字段贡献权限码**（`t_role_permission` 无行）：
+    ///   ADMIN 是代码级通配（`require_permission` 内短路），不靠数据；纯 ADMIN
+    ///   账号为空 vec，账号兼持其它已授权角色时仍带那些码。写成满行反而会让
+    ///   通配语义悄悄降级成逐项勾选。
     pub permissions: Vec<String>,
 }
 
@@ -220,7 +222,7 @@ impl CurrentUser {
     /// 权限点闸门（2026-10-14 新增）：`permissions` 里含 `code` 即放行。
     ///
     /// **ADMIN 元角色短路**：`has_role(Role::Admin)` 时直接放行，不查
-    /// `permissions`（ADMIN 用户该字段恒空 vec，不靠数据授权）。
+    /// `permissions`（ADMIN 角色不贡献权限码，不靠数据授权）。
     pub fn require_permission(&self, code: &str) -> Result<(), AppError> {
         if self.has_role(Role::Admin) || self.permissions.iter().any(|p| p == code) {
             Ok(())
@@ -264,7 +266,7 @@ mod tests {
     /// 钉住。
     #[test]
     fn admin_passes_all_primitives() {
-        // ⚠️ permissions 恒空：ADMIN 的通配不靠数据
+        // 刻意给空 permissions：ADMIN 的通配不靠数据（不依赖字段内容即可全放行）
         let admin = user_with(vec![Role::Admin], &[]);
 
         // 原语 ①：require_role —— 对任意目标角色都放行

@@ -380,8 +380,9 @@ impl RbacRepo {
     /// 其权限点不再下发（与登录侧的角色解析同一口径）。调用方传进来的 code 通常
     /// 已过滤过一次，这里是 SQL 层的兜底。
     ///
-    /// ⚠️ ADMIN **不写行**（通配在 `require_permission` 里），故 ADMIN 用户的
-    /// 本方法天然返回空 vec —— 这正是 BE-2 要的口径，不额外特判。
+    /// ⚠️ ADMIN **不写行**（通配在 `require_permission` 里），故 ADMIN **角色**
+    /// 对这些查询零贡献；纯 ADMIN 账号得到空 vec，账号兼持其它已授权角色时仍按
+    /// 那些角色出码 —— 不额外特判。
     pub async fn list_permission_codes_by_roles<'e, E: PgExecutor<'e>>(
         executor: E,
         roles: &[String],

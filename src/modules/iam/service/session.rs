@@ -75,7 +75,8 @@ pub struct LoginPending {
     /// 两者职责不混。
     pub role_codes: Vec<String>,
     /// 该用户经全部角色 code 联查得到的权限码（写进 Redis session 缓存）。
-    /// ADMIN 恒为空 vec（通配在 `require_permission`）。
+    /// ADMIN **角色**不贡献权限码（通配在 `require_permission`）；纯 ADMIN 账号为空
+    /// vec，账号同时持有其它已授权角色时带那些码。
     pub permissions: Vec<String>,
     pub shelf_ids: Vec<i64>,
     pub shelf_wildcard: bool,
@@ -101,7 +102,8 @@ pub struct RefreshPending {
     /// 原始大写角色码（同 [`LoginPending::role_codes`]）
     pub role_codes: Vec<String>,
     /// 该用户经全部角色 code 联查得到的权限码（写进 Redis session 缓存）。
-    /// ADMIN 恒为空 vec（通配在 `require_permission`）。
+    /// ADMIN **角色**不贡献权限码（通配在 `require_permission`）；纯 ADMIN 账号为空
+    /// vec，账号同时持有其它已授权角色时带那些码。
     pub permissions: Vec<String>,
     pub shelf_ids: Vec<i64>,
     pub shelf_wildcard: bool,
@@ -761,7 +763,7 @@ fn build_current_user_out(
         is_active: u.is_active,
         // 原始大写码（含自定义角色）—— `Role` 枚举只用于授权判定，不用于出参
         roles: role_codes.to_vec(),
-        // 与写进 Redis session 缓存的是同一份（ADMIN 恒空 vec）
+        // 与写进 Redis session 缓存的是同一份（ADMIN 角色不贡献权限码）
         permissions: permissions.to_vec(),
         shelf_ids: shelf_ids.iter().map(|v| v.to_string()).collect(),
         menus,

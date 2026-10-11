@@ -96,8 +96,9 @@ pub struct CachedUserProfile {
     /// 权限码集合（2026-10-14 新增）：登录 / refresh 时按用户**全部**角色 code
     /// 联查 `t_role_permission` 取回，与 roles / shelf_ids 一样是快照。
     ///
-    /// ⚠️ **ADMIN 用户恒为空 vec**：ADMIN 是代码级通配（`require_permission`
-    ///   内短路），不靠数据授权。
+    /// ⚠️ **ADMIN 角色不贡献权限码**：ADMIN 是代码级通配（`require_permission`
+    ///   内短路），不写授权行。纯 ADMIN 账号为空 vec，账号兼持其它已授权角色时
+    ///   仍带那些码。
     ///
     /// ⚠️ **必填字段，无 `#[serde(default)]`**：线上已存在的 Redis session entry
     ///   （本字段加入前写入的 JSON）反序列化会失败，那些用户的请求会拿到

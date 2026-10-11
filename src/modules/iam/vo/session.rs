@@ -14,8 +14,9 @@ pub struct CurrentUserOut {
     pub is_active: bool,
     pub roles: Vec<String>,
     /// 权限点 code 全集（2026-10-14 新增，与 `roles` / `menus` 并列的账号能力视图；
-    /// 前端 `hasPermission` 的输入）。ADMIN 恒空 vec —— 通配在
-    /// `require_permission` 代码里，不靠数据。
+    /// 前端 `hasPermission` 的输入）。ADMIN **角色**不贡献权限码（`t_role_permission`
+    /// 无行，通配在 `require_permission` 里短路），纯 ADMIN 账号为 `[]`；
+    /// 账号同时持有其它已授权角色时仍会带出那些码。
     pub permissions: Vec<String>,
     pub shelf_ids: Vec<String>,
     pub menus: Vec<MenuNodeOut>,

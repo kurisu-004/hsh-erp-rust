@@ -7,7 +7,7 @@
 //! 1. [`WxLoginService::exchange_wecom_identity`] —— **事务外**的外部 HTTP + 入参
 //!    校验 + corpid 比对 + userid 归一化
 //! 2. [`WxLoginService::project_login`] —— 把 iam 域的 `LoginResponse` **投影**成本
-//!    子模块的 [`WxLoginOut`]（砍掉 `is_active` / `shelf_ids` / `menus`）
+//!    子模块的 [`WxLoginOut`]（砍掉 `is_active` / `shelf_ids` / `menus` / `permissions`）
 //!
 //! ## ⚠️ 本层**不知道事务**
 //! 仓库硬约束：事务边界在 handler（`pool.begin()` / `tx.commit()`），service 收

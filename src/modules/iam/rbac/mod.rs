@@ -38,9 +38,10 @@
 //! - **不进 `t_role_menu` / `t_role_permission`**：`GET /roles/{ADMIN}/grants`
 //!   返回**全量** active 菜单码 / 权限码（面板要能整页渲染），但
 //!   `POST /roles/{ADMIN}/grants` 一律 400；
-//! - **ADMIN 用户的 `permissions` 恒为空 vec**：通配在
-//!   `CurrentUser::require_permission` 内做，不靠数据。写满行反而会让通配
-//!   悄悄降级成逐项勾选。
+//! - **ADMIN 角色不贡献权限码**（`t_role_permission` 无行）：通配在
+//!   `CurrentUser::require_permission` 内做，不靠数据；纯 ADMIN 账号的出参为空
+//!   vec，账号兼持其它已授权角色时仍带那些码。写满行反而会让通配悄悄降级成
+//!   逐项勾选。
 //!
 //! ## 系统角色保护（固定 400，不做计数）
 //! 1. **ADMIN 角色本身不可停用 / 删除**（本模块 `deactivate_role` 固定 400）：

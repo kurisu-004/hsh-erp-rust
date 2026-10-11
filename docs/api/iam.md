@@ -134,7 +134,7 @@
 | `id` | string | `t_user.id` | i64 → string |
 | `username` / `full_name` / `is_active` | string / string / boolean | `t_user` | 与 `UserOut` 同源 |
 | `roles` | string[] | `t_user_role.role` | 大写；未知值 warn 后**跳过**（宁可不识别也不 panic） |
-| `permissions` | string[] | `t_role_permission` 按用户全部角色 code 联查 | 权限点 code 全集（前端 `hasPermission` 的输入）；ADMIN 恒 `[]`（通配在代码里） |
+| `permissions` | string[] | `t_role_permission` 按用户全部角色 code 联查 | 权限点 code 全集（前端 `hasPermission` 的输入）；ADMIN 角色不贡献权限码（通配在代码里），纯 ADMIN 账号为 `[]`，兼持其它已授权角色时仍带那些码 |
 | `shelf_ids` | string[] | SHELF_ACCOUNT 行的 `scope_id` | 只保留**货架 active 且 zone ∈ 白名单**的；i64 → string |
 | `menus` | `MenuNodeOut[]` | `t_menu` JOIN `t_role_menu` | 已组树（见 §2.6） |
 
@@ -457,7 +457,8 @@ ADMIN 用户由元角色通配天然放行（见 §9.3）。
 - **不进 `t_role_menu` / `t_role_permission`**：`GET /roles/{ADMIN}/grants` 返回**全量**
   active 菜单码 / 权限码（面板要能整页渲染），`POST /roles/{ADMIN}/grants` 一律
   **400**（拒绝写入元角色授权数据）；
-- ADMIN 用户的 `permissions` 恒为空 vec（通配不靠数据）；登录态菜单由
+- ADMIN **角色**不贡献权限码（`t_role_permission` 无行，通配不靠数据）：纯 ADMIN
+  账号的出参为 `[]`，账号兼持其它已授权角色时仍带那些码；登录态菜单由
   `menus_for_roles` 的全量分支给出；
 - 角色行由 `seeds/rbac.sql` 保证存在，`is_system=true`：**不可停用、不可删、
   code 不可改**（停用会使全体管理员立即失去元角色）。MANAGER 同受「停用 / 删除
