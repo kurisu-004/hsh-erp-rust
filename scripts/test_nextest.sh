@@ -8,7 +8,7 @@
 #
 # 与 test_runner.sh 的关系：
 # - test_nextest.sh 起 1 个 session 容器 → 在容器内 CREATE DATABASE hsh_erp_template
-#   → 按字典序逐个 apply migrations/*.sql + seeds/menu.sql 到 template
+#   → 按字典序逐个 apply migrations/*.sql + seeds/menu.sql + seeds/rbac.sql 到 template
 #   → 注入 TEST_DATABASE_BASE_URL →
 #   cargo nextest run（不要 exec：exec 会替换 shell 让 EXIT trap 失效）
 # - nextest 调每个测试时 .cargo/config.toml 的 runner (test_runner.sh) 触发转义
@@ -131,7 +131,7 @@ export JWT_TEST_PRIVATE_PEM_PATH="$JWT_KEYS_TMPDIR/priv.pem"
 export JWT_TEST_PUBLIC_PEMS_DIR="$JWT_KEYS_TMPDIR/pub"
 
 # 2026-09-20 plan 2 + 2026-09-25 改造：在容器内 CREATE DATABASE hsh_erp_template，
-# 跑全部迁移 + seeds/menu.sql，让测试 DB 共享同一份 schema + 菜单 baseline。
+# 跑全部迁移 + seeds/menu.sql + seeds/rbac.sql，让测试 DB 共享同一份 schema + 菜单 / 授权基线。
 TEMPLATE_DB=hsh_erp_template
 docker exec -e PGPASSWORD=postgres "$CID" \
     psql -U postgres -c "CREATE DATABASE \"$TEMPLATE_DB\"" \
@@ -155,10 +155,22 @@ done
 
 # 跑菜单种子到 template（幂等；test 路径下也走同一份声明式菜单树，
 # 与 production 一致；测试自身的 seed_* helper 不受 seed IDs 干扰，
-# 因为 seed ID 段 9000000000xxx 与 fixture/snowflake 物理不相交）
+# 因为 seed ID 段（t_menu 9000000000xxx / t_role_menu 9100000000xxx / 角色 92… 等）
+# 与 fixture/snowflake 物理不相交）
 docker exec -i -e PGPASSWORD=postgres "$CID" \
     psql -U postgres -d "$TEMPLATE_DB" -v ON_ERROR_STOP=1 -f - \
     < seeds/menu.sql >/dev/null
+
+# 2026-10-14：RBAC 基线种子（6 个内置角色 + 权限点 + 授权矩阵；2026-10-15 并入
+# 角色→菜单首次基线）同样灌 template ——
+# 与生产启动钩子 run_seeds 的装载范围对齐（menu → rbac）。不灌的话：
+# ① /iam/users/{id}/roles 授予内置角色会被「角色不存在」拒（BE-4 起查 t_role）；
+# ② 角色权限点的端点守卫（BE-8 起）在测试库里全是 403；
+# ③ 非 ADMIN 角色的菜单在 /iam/me 里全空（t_role_menu 基线缺失）。
+# admin seed 仍不灌（BOOTSTRAP_ADMIN_ENABLED 门控，测试各自按需触发）。
+docker exec -i -e PGPASSWORD=postgres "$CID" \
+    psql -U postgres -d "$TEMPLATE_DB" -v ON_ERROR_STOP=1 -f - \
+    < seeds/rbac.sql >/dev/null
 
 # 注入 TEST_DATABASE_BASE_URL（指向 template；caller 用 TEMPLATE 派生 fresh DB）
 PORT=$(docker port "$CID" 5432/tcp | head -n1 | awk -F: '{print $NF}')

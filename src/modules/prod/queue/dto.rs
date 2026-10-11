@@ -13,13 +13,11 @@
 //! `DispatchRequest` / `DispatchTarget` / `AutoDispatchRequest` /
 //! `RecallToPendingRequest`）—— 它们的唯一消费方是队列页的下发 / 召回动作。
 //!
-//! ## `AutoAllocateMode` 双向 derive 说明
-//! `mode` 字段在入参（`AutoAllocateRequest::mode` 反序列化）和出参
-//! （`AutoAllocateResult::mode` 序列化）双向使用，故保留双向
-//! Deserialize + Serialize derive —— 按 vo-template.md 第 12 条硬约束，
-//! 「同一 struct 同时 derive Serialize + Deserialize 被禁，但按业务确实需要的
-//! 跨方向 enum 在 doc comment 注明」即视作合理偏离，本域 `AutoAllocateMode`
-//! 是这种 enum 模式。
+//! ## 2026-10-15：旧「模式枚举」下线
+//! `POST /queue/auto-allocate` 删除模式枚举（COUNT / TIME）与比例入参，
+//! target 改为工种自动上限（见 `service/queue.rs::auto_allocate_for_process`）。
+//! 模块内原有的「模式枚举双向 derive」说明随 enum 一并删除；完整移除记录见
+//! `docs/api/queue.md` §6.4。
 //!
 //! ## `from` / `to` 两个 tagged enum（2026-09-30 重构；2026-10-10 拆分）
 //! 原 `admin_remove` / `admin_assign` 合并为通用 `POST /api/v2/prod/pool/move`，
@@ -32,11 +30,12 @@
 //!
 //! 不支持 `POOL → POOL`（视为非法，service 返回 `40001 VALIDATION_ERROR`）。
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::shared::types::deserialize_i64;
 
-/// `POST /api/v2/prod/queue/refill` 入参（Manager only，前端零消费方）。
+/// `POST /api/v2/prod/queue/refill` 入参（权限点 `queue.allocate`（M,C；2026-10-15
+/// 自 Manager 独占有意放宽））。
 ///
 /// `shelf_id` **2026-10-10 起保留必填**：它是「为某工人在某架上抢料」这条**显式
 /// 管理员操作**的架锚，与 worker-scan 的跨架取料（`shelf_id = null`）是两种口径。
@@ -50,17 +49,11 @@ pub struct AdminRefillRequest {
     pub shelf_id: i64,
 }
 
-/// 自动分配模式：`COUNT` 按批次数填满；`TIME` 按累计预估工时填满。
-///
-/// 双向 derive —— 见模块头注释。
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "UPPERCASE")]
-pub enum AutoAllocateMode {
-    Count,
-    Time,
-}
-
 /// `POST /api/v2/prod/pool/auto-allocate`
+///
+/// 2026-10-15：删除模式枚举（COUNT / TIME）与比例入参 —— target 改为「工种自动
+/// 补料上限（`auto_allocate_limit`，NULL 兜底 `max_held_batches`）」，由 service
+/// 对每个 worker 计算，客户端不再表达「填多少比例的意图」。
 #[derive(Debug, Clone, Deserialize)]
 pub struct AutoAllocateRequest {
     #[serde(deserialize_with = "deserialize_i64")]
@@ -69,8 +62,6 @@ pub struct AutoAllocateRequest {
     /// 「按工序 + 架自动分配」是管理员的显式批量操作，架锚是它的语义的一部分。
     #[serde(deserialize_with = "deserialize_i64")]
     pub shelf_id: i64,
-    pub mode: AutoAllocateMode,
-    pub fill_ratio: f64,
 }
 
 /// `POST /api/v2/prod/pool/move` —— 通用移动端点。

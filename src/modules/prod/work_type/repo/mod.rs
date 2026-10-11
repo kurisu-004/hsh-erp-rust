@@ -107,6 +107,7 @@ pub trait WorkTypeRepoTrait: Send {
         description: Option<&'a str>,
         sort_order: i32,
         max_held_batches: Option<i32>,
+        auto_allocate_limit: Option<i32>,
         created_by: i64,
     ) -> Result<TWorkType, sqlx::Error>;
     #[allow(clippy::too_many_arguments)]
@@ -118,6 +119,7 @@ pub trait WorkTypeRepoTrait: Send {
         description: Option<Option<&'a str>>,
         sort_order: Option<i32>,
         max_held_batches: Option<Option<i32>>,
+        auto_allocate_limit: Option<Option<i32>>,
         updated_by: i64,
     ) -> Result<u64, sqlx::Error>;
     async fn soft_delete(
@@ -130,11 +132,14 @@ pub trait WorkTypeRepoTrait: Send {
 
     /// 保留 `Result<_, AppError>` 返回类型（与原 `repo.rs` 一致），让跨模块静态
     /// 调用方 `prod::queue::service` 走 ZST 调用路径时 `?` 自动转换。
+    ///
+    /// 2026-10-15：元组末位新增 `auto_allocate_limit`（自动补料上限），4 元组 →
+    /// 5 元组。
     #[allow(clippy::type_complexity)]
     async fn list_work_types_by_process_id(
         &mut self,
         process_id: i64,
-    ) -> Result<Vec<(i64, String, String, Option<i32>)>, crate::shared::error::AppError>;
+    ) -> Result<Vec<(i64, String, String, Option<i32>, Option<i32>)>, crate::shared::error::AppError>;
 
     // ── 跨域 helper（2）── 委托到 process 域 ZST 静态方法 ────────────
     /// 单条查 process（活跃行）。供本域 `WorkTypeProcessService::set_work_type_processes`
@@ -224,6 +229,7 @@ impl WorkTypeRepoTrait for &mut PgConnection {
         description: Option<&'b str>,
         sort_order: i32,
         max_held_batches: Option<i32>,
+        auto_allocate_limit: Option<i32>,
         created_by: i64,
     ) -> Result<TWorkType, sqlx::Error> {
         WorkTypeRepo::create(
@@ -234,6 +240,7 @@ impl WorkTypeRepoTrait for &mut PgConnection {
             description,
             sort_order,
             max_held_batches,
+            auto_allocate_limit,
             created_by,
         )
         .await
@@ -248,6 +255,7 @@ impl WorkTypeRepoTrait for &mut PgConnection {
         description: Option<Option<&'b str>>,
         sort_order: Option<i32>,
         max_held_batches: Option<Option<i32>>,
+        auto_allocate_limit: Option<Option<i32>>,
         updated_by: i64,
     ) -> Result<u64, sqlx::Error> {
         WorkTypeRepo::update(
@@ -258,6 +266,7 @@ impl WorkTypeRepoTrait for &mut PgConnection {
             description,
             sort_order,
             max_held_batches,
+            auto_allocate_limit,
             updated_by,
         )
         .await
@@ -279,7 +288,8 @@ impl WorkTypeRepoTrait for &mut PgConnection {
     async fn list_work_types_by_process_id(
         &mut self,
         process_id: i64,
-    ) -> Result<Vec<(i64, String, String, Option<i32>)>, crate::shared::error::AppError> {
+    ) -> Result<Vec<(i64, String, String, Option<i32>, Option<i32>)>, crate::shared::error::AppError>
+    {
         WorkTypeRepo::list_work_types_by_process_id(&mut **self, process_id).await
     }
 

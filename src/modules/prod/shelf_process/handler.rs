@@ -12,8 +12,9 @@
 //! 装进同一个 `R` 信封。
 //!
 //! ## 权限
-//! 权限守卫在 service 层（`current.require_any_role` / `require_role`），handler
-//! 不重复校验。
+//! 权限守卫在 service 层（`require_permission`），handler 不重复校验。
+//! 2026-10-15：读 2 条走 `production.view`（M,C,CNC,SA,I）、`set_shelf_processes`
+//! 由原零守卫补 `production.config`（M）。
 //!
 //! ## 3 端点（2026-10-02 自当时的 shelf 域硬切，旧路径无 alias）
 //! 读 2：`GET /api/v2/prod/shelf-processes`（全集）/

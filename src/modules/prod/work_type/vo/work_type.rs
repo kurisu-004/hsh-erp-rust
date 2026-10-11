@@ -14,6 +14,9 @@ pub struct WorkTypeOut {
     pub description: Option<String>,
     pub sort_order: i32,
     pub max_held_batches: Option<i32>,
+    /// 2026-10-15 新增：自动补料上限。`null` = 未配置 ⇒ 自动路径兜底
+    /// `max_held_batches`（口径见 `docs/api/queue.md` §4）。
+    pub auto_allocate_limit: Option<i32>,
     /// 该工种被映射的工序 id 列表（JSON 序列化为 `["123", "456"]`）。空 = 未映射任何工序。
     pub process_ids: Vec<String>,
     pub version: i32,

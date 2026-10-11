@@ -41,10 +41,30 @@ VALUES
 
 -- ---- 工种（FX-WTA / FX-WTB） ----
 --  注：code 不能与 part.sql 的 FX-WT-A 重复（id=13 已用）
+--
+--  ⚠️ 2026-10-14：`max_held_batches` 由 NULL 改为 **10**（与生产库真实工种一致）。
+--  NULL 的语义**不是**「不限」，而是「未配置」⇒ 该工种**不可取件**：
+--  - `/prod/queue/move` 与 `QueueService::ensure_worker_has_capacity` → `20904`
+--    BIZ_WORK_TYPE_MAX_HELD_NOT_SET；
+--  - `/prod/queue/refill` → `20904`（刻意回归
+--    `tests/production/queue.rs::max_held_null_returns_error`）；
+--  - `POST /queue/auto-allocate` → 逐 worker 记 `MAX_BATCHES_NOT_SET`（不报错）。
+--  ⚠️ 2026-10-15 订正：此前这里写「`take_one_from_pool` 的 CTE 里
+--  `COALESCE(max_held_batches, 0)` 当 cap 0 ⇒ 直接拦死抢料」—— 那个 `max_batches`
+--  CTE 已随「自动分配上限」特性删除，cap 改由 service 计算后传入
+--  （`auto_allocate_limit` 兜底 `max_held_batches`），SQL 内不再有 cap 0。
+--  本 fixture **不配 `auto_allocate_limit`**（留 NULL）：自动路径兜底 max=10，
+--  与引入该列前的行为逐字一致。
+--  此前 fixture 把两个工种都设成 NULL，等于让**所有**建在这两个工种上的
+--  取件/下发用例隐式编码「无守卫」的旧行为（2026-10-14 补 pick-up 守卫后
+--  `tests/production/pickup.rs` 集体转红 9 条）。生产库真实工种全是 10，
+--  fixture 应当反映生产形态 ⇒ 取件用例走「配了上限」的正常路径。
+--  「工种未配上限 → 拒取件」这条语义由各用例**自建** NULL 工种来覆盖
+--  （同 `max_held_null_returns_error` 的写法），不靠共享 fixture 的默认值。
 INSERT INTO t_work_type (id, code, name, sort_order, max_held_batches, version, created_at, updated_at)
 VALUES
-  (9000000000000000062, 'FX-WTA', 'FX 工种 A', 0, NULL, 0, now(), now()),
-  (9000000000000000063, 'FX-WTB', 'FX 工种 B', 0, NULL, 0, now(), now());
+  (9000000000000000062, 'FX-WTA', 'FX 工种 A', 0, 10, 0, now(), now()),
+  (9000000000000000063, 'FX-WTB', 'FX 工种 B', 0, 10, 0, now(), now());
 
 -- ---- 工种 ↔ 工序 映射（work_type_A ↔ process_A；work_type_B ↔ process_B） ----
 INSERT INTO t_work_type_process (id, work_type_id, process_id, sort_order, version, created_at, updated_at)

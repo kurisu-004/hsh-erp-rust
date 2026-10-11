@@ -1513,6 +1513,7 @@ fn manager_current(id: i64) -> hsh_erp_rust::auth::rbac::CurrentUser {
         roles: vec![Role::Manager],
         shelf_ids: vec![],
         shelf_wildcard: false,
+        permissions: Vec::new(),
     }
 }
 

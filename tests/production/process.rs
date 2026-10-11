@@ -7,6 +7,8 @@
 //! 4. OUTSOURCE 类别保留 `requires_approval = true`（默认）
 //! 5. soft-delete 检查引用 → 20803 BIZ_PROCESS_IN_USE（挂 part.next_process_id）
 //! 6. soft-delete 检查引用 → 20803 BIZ_PROCESS_IN_USE（挂 t_process_chain_step.process_id）
+//! 7. `list_processes_allows_shelf_account` —— 2026-10-15：读端点迁
+//!    `production.view` 后 SA（原集合成员）仍 200
 
 // ## 并行
 // 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
@@ -622,5 +624,29 @@ async fn soft_delete_process_referenced_by_chain_step_returns_20803() {
         env2["code"].as_i64().unwrap(),
         20803,
         "expected BIZ_PROCESS_IN_USE; got: {env2}"
+    );
+}
+
+// ===========================================================================
+//  权限点闸门（2026-10-15 新增）
+// ===========================================================================
+
+/// `GET /prod/processes`：迁 `production.view` 后的正向 —— SHELF_ACCOUNT 在原
+/// `require_any_role` 集合里（M,C,CNC,SA,I），逐格保留 ⇒ 200。
+#[tokio::test]
+async fn list_processes_allows_shelf_account() {
+    let (_pool, app, _token, _fx) = bootstrap_as_manager().await;
+    let sa = login_token(
+        &app,
+        hsh_erp_test_support::PartFixture::SHELF_ACCOUNT_USERNAME,
+        ProductionFixture::PASSWORD,
+    )
+    .await;
+
+    let (s, env) = send(app, json_request("GET", "/prod/processes", None, Some(&sa))).await;
+    assert_eq!(s, StatusCode::OK, "SHELF_ACCOUNT 应 200: {env}");
+    assert!(
+        env["data"]["items"].as_array().is_some(),
+        "items 必须是数组: {env}"
     );
 }

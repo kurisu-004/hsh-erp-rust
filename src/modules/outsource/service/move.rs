@@ -44,7 +44,7 @@
 
 use sqlx::{AssertSqlSafe, PgConnection};
 
-use crate::auth::rbac::{CurrentUser, Role};
+use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::outsource::dto::{OutsourceLocation, OutsourceMoveRequest};
 use crate::modules::outsource::repo::OutsourceRepoTrait;
@@ -127,8 +127,8 @@ impl OutsourceMoveService {
     ///
     /// ## 守卫顺序（逐条带错误码，顺序本身是契约）
     ///
-    /// 1. **角色**（Manager + Clerk + Inspector，沿用被取代的三个旧端点口径）→
-    ///    `40301`；service 入口第一行。
+    /// 1. **权限点 `outsource.move`**（M,C,I，沿用被取代的三个旧端点口径；
+    ///    2026-10-15 迁自角色守卫，矩阵逐格相同）→ `40300`；service 入口第一行。
     /// 2. **`from.kind == to.kind`** → `40001 VALIDATION_ERROR`（照
     ///    `prod::queue::service::queue::move_batch` 的同款判定）。**在查批次之前判**：
     ///    同 kind 移动是**请求本身的形状错误**，与哪一批货无关 —— 先查库会让「批次不
@@ -160,8 +160,10 @@ impl OutsourceMoveService {
         req: OutsourceMoveRequest,
         current: &CurrentUser,
     ) -> Result<OutsourceMoveResult, AppError> {
-        // ① 角色守卫（service 入口第一行）
-        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
+        // ① 权限守卫（service 入口第一行）
+        // 2026-10-15：迁权限点 `outsource.move`（M,C,I；发送 + 回收同一端点，
+        // 矩阵逐格等于原 `require_any_role` 集合）。
+        current.require_permission("outsource.move")?;
 
         let from_kind = location_kind(&req.from);
         let to_kind = location_kind(&req.to);

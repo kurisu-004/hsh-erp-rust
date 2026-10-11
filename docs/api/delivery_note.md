@@ -17,13 +17,17 @@
    find-or-create + DP 分配 + 拆批 + 挂单），删 7 条端点；新增只读扫码三层树
    `GET /scan/{serial_no}`；新增 DP 批次分配算法。
 4. **打印链路全删**（前端改 hucre 本地生成 xlsx）+ 新增 `POST /{id}/driver` 与 `GET /drivers`
-   + `/pickup` 入参瘦身并重跑司机校验。
+   + `/pickup` 入参瘦身并重跑司机校验。⚠️ 2026-10-14 起 RBAC 里登记了 **前端-only** 权限点
+   `delivery_note.print`（后端打印端点已删、无守卫可迁；授权矩阵照前端
+   `frontend/src/utils/deliveryNotePermissions.ts::canPrint` 的放行集合：
+   MANAGER / CLERK / INSPECTOR），前端按钮显隐以该权限点为准。
 5. **VO 字段裁剪 29 个** + `RemoveParts` → `RemoveBatches` 改名 + `SubmitDeliveryOut` 塌缩为
    `R<String>`。
 6. **菜单 `delivery_dispatch` 下线**（`seeds/menu.sql`，非 migration —— seed 每次启动重放）：
-   §0 复活清单 / §2 INSERT / §4.1 + §4.3 白名单全部移除，§3.5 显式软删既有行，§4.6 回收
-   `t_role_menu`。该菜单的目标页依赖的恰好是本轮删掉的 `GET /pickup-pending` /
-   `POST /{id}/pickup-scan` ⇒ 前端必须同步删页（§8.3 第 16 行）。
+   `seeds/menu.sql` §3.5 显式软删既有行，§0 复活清单 / §2 INSERT 同步不再声明该 code；
+   `seeds/rbac.sql` §5 回收 `t_role_menu` 残留，§4 授权基线不再声明该菜单。该菜单的目标页
+   依赖的恰好是本轮删掉的 `GET /pickup-pending` / `POST /{id}/pickup-scan` ⇒ 前端必须
+   同步删页（§8.3 第 16 行）。
 7. **`DeliveryNoteLineItem` 新增 `customer_id`**（L2 叶子 id，必填非空）：打印分组键由
    `customer_name` 切到 id —— `t_customer.name` 非唯一，同名 L2 会被并进同一张 sheet。
 
@@ -63,11 +67,11 @@
 
 | # | 方法 | 路径 | 权限 | 入参 | 响应 `data` |
 |---|---|---|---|---|---|
-| 1 | GET | `/` | Mgr+Clerk+Insp+CncProg | `DeliveryNoteListQuery` | `DeliveryNoteListOut` |
-| 2 | GET | `/batch-detail?ids=` | Mgr+Clerk+Insp | `ids` 逗号串（1..=200） | `BatchDeliveryDetailData` |
+| 1 | GET | `/` | 权限点 `delivery_note.view`（Mgr+Clerk+Insp；⚠️ 2026-10-15 **收紧去 CncProg**） | `DeliveryNoteListQuery` | `DeliveryNoteListOut` |
+| 2 | GET | `/batch-detail?ids=` | 权限点 `delivery_note.view`（2026-10-15 补闸，原**零守卫**） | `ids` 逗号串（1..=200） | `BatchDeliveryDetailData` |
 | 3 | GET | `/scan/{serial_no}` ★新增 | Mgr+Clerk+Insp | 路径参数（**原样，序列号可含 `-`**） | `DeliveryScanTreeOut` |
 | 4 | POST | `/scan` ★重写 | Mgr+Clerk+Insp | `ScanEntryRequest` | `DeliveryNoteDetailOut` |
-| 5 | GET | `/{id}` | Mgr+Clerk+Insp | — | `DeliveryNoteDetailOut` |
+| 5 | GET | `/{id}` | 权限点 `delivery_note.view`（2026-10-15 补闸，原**零守卫**） | — | `DeliveryNoteDetailOut` |
 | 6 | POST | `/{id}/update` | Mgr+Clerk+Insp | `DeliveryNoteUpdateRequest` | `DeliveryNoteOut` |
 | 7 | POST | `/{id}/remove-batches` ★改名 | Mgr+Clerk+Insp | `DeliveryNoteRemoveBatchesRequest` | `DeliveryNoteDetailOut` |
 | 8 | POST | `/{id}/driver` ★新增 | Mgr+Clerk+Insp | `DeliveryNoteDriverRequest` | `DeliveryNoteOut` |
@@ -76,7 +80,9 @@
 | 11 | POST | `/{id}/pickup` ★入参瘦身 | 任意已登录账号 | `DeliveryNotePickupRequest` | `DeliveryNoteOut` |
 | 12 | POST | `/{id}/soft-delete` | Mgr+Clerk+Insp | `DeliveryNoteVersionedRequest` | `null` |
 
-`GET /` 的权限含 `CncProgrammer`（编程岗要看单据列表）；其余 11 条是 Mgr+Clerk+Insp。
+2026-10-15：`GET /`、`GET /batch-detail`、`GET /{id}` 三条读统一走权限点
+`delivery_note.view`（矩阵 Mgr+Clerk+Insp）—— 列表自原 `Mgr+Clerk+Insp+CncProg`
+**收紧去 `CncProgrammer`**（用户定稿），后两条由零守卫补闸；其余端点权限不变。
 
 ### 1.2 `/api/v2/com/delivery/group`（4 个）
 
@@ -139,7 +145,7 @@
 | 21419 | `BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT` | `recall` 时该 L1 已有另一张 DRAFT | 409 |
 | 21421 | `BIZ_DELIVERY_BATCH_STATE_INVALID` | `submit` 时单上批次被旁路改成 `READY_TO_SHIP` 之外的状态 | 400 |
 | 40100 | `AUTH_*` | 未带 token / token 失效（中间件层） | 401 |
-| 40300 | `FORBIDDEN` | 角色不足（含 `ShelfAccount` 访问本域任意端点） | 403 |
+| 40300 | `FORBIDDEN` | 权限 / 角色守卫失败（三条读的 `delivery_note.view` 权限不足，或未迁端点的角色不足；含 `ShelfAccount` 访问本域任意端点） | 403 |
 | 40901 | `VERSION_CONFLICT` | 任一写端点 OCC 不匹配 | 409 |
 
 **已不使用的码**（随端点下线留空，勿复用）：`21408 BIZ_DELIVERY_NOTE_SCAN_MISMATCH`
@@ -722,13 +728,14 @@ schema 与页面都在用」。
 | 10 | 领取请求瘦身 | `POST /{id}/pickup` body 只发 `{ version }`；先调 `POST /{id}/driver` 指定司机 |
 | 11 | 提交返回类型 | `POST /{id}/submit` 的 `data` 从 `SubmitDeliveryOut` 改成 **string**（单据 id） |
 | 12 | 移除批次路径 | `POST /{id}/remove-parts` → `POST /{id}/remove-batches` |
-| 13 | 打印改本地生成 | 删 `POST /{id}/print` / `print-labels` 两个请求，xlsx 由前端 **hucre** 本地生成 |
+| 13 | 打印改本地生成 | 删 `POST /{id}/print` / `print-labels` 两个请求，xlsx 由前端 **hucre** 本地生成；按钮显隐改用权限点 `delivery_note.print`（2026-10-14 注册，矩阵＝原 `canPrint` 的 MANAGER / CLERK / INSPECTOR，后端零守卫） |
 | 14 | 分组权限 | `/group` 的 3 个写端点现在也接受 Inspector 角色（前端 `canEditGroup` 的角色白名单要加 Inspector） |
 | 15 | VO 字段裁剪 | 从 Zod schema 里删 §6.2 的 29 个字段（多余字段若非 `.strict()` 会静默通过，删 schema 才是真删） |
-| 16 | **删 `delivery_dispatch` 菜单页** | ⛔ 后端已下线该菜单（`seeds/menu.sql` §3.5 软删 + §4.1 / §4.3 白名单移除 + §4.6 回收 `role_menu`），而前端 `src/views/delivery-dispatch/DispatchNoteList.vue` 仍在。**该页依赖的恰好是本轮删掉的两条端点**（`GET /pickup-pending` / `POST /{id}/pickup-scan`）⇒ 不删就是「菜单能点、页面能开、每个请求都 404」的活条目。后端无 alias，这是前端必须同步删的一页 |
+| 16 | **删 `delivery_dispatch` 菜单页** | ⛔ 后端已下线该菜单（`seeds/menu.sql` §3.5 软删菜单 + `seeds/rbac.sql` §5 清理其授权残留），而前端 `src/views/delivery-dispatch/DispatchNoteList.vue` 仍在。**该页依赖的恰好是本轮删掉的两条端点**（`GET /pickup-pending` / `POST /{id}/pickup-scan`）⇒ 不删就是「菜单能点、页面能开、每个请求都 404」的活条目。后端无 alias，这是前端必须同步删的一页 |
 | 17 | `line_items[].customer_id` | ★ `DeliveryNoteLineItem` **新增** `customer_id: string`（L2 叶子 id，必填非空）。打印分组键从 `customer_name` 切成 `customer_id`：`t_customer.name` 只有**非唯一** btree 索引，同名 L2 会被并进同一张 sheet，而打印产物是客户签字的收货凭证。Zod schema 里加必填 `customer_id: z.string()` |
 | 18 | `line_items[].delivery_seq` | ★ `DeliveryNoteLineItem` **新增** `delivery_seq: number \| null`（**加入本单的次序**，口径见 §2.3.1）。数组顺序已由后端按它排好，前端**零改动即得「按扫码先后」的展示**；Zod schema 里加 `delivery_seq: z.number().nullable()`，供页面按需展示序号列 |
 | 19 | `applicant_name` 回落 | **零改动**（2026-10-10，§2.3.2）。字段名 / 类型 / 可空性都没动，只是「装配件子件自身为空时改用父装配件的值」。前端三处渲染点（详情列表列定义、标签 xlsx 工作簿、送货单打印模板）本就在读它 ⇒ 部署后立即见效，**不需要改 schema、不需要改列定义、不需要改模板** |
+| 20 | 三条读的权限点（2026-10-15） | `GET /`（列表）、`GET /{id}`（详情）、`GET /batch-detail` 统一走权限点 `delivery_note.view`（矩阵 Mgr+Clerk+Insp）。⚠️ 列表自原 `Mgr+Clerk+Insp+CncProg` **收紧去 `CncProgrammer`**（用户定稿）—— 对 CNC 账号列表入口应改按 `hasPermission('delivery_note.view')` 显隐；详情与 batch-detail 原零守卫、本轮补闸。存量会话部署窗口见 `iam.md` §9.2 注记 |
 
 ### 8.4 已知偏差登记
 

@@ -2,7 +2,7 @@
 //!
 //! - login：username 归一化、bcrypt 校验、角色/shelf 范围解析、签发双 token、`last_login_at` 戳更新
 //! - refresh：decode refresh → 校验版本 → 轮转 `refresh_token_version` → 重签双 token
-//! - me：从 DB 重读当前用户 + 角色 + shelf 范围 + 菜单，返回最新视图
+//! - me：从 DB 重读当前用户 + 角色 + shelf 范围 + 权限码 + 菜单，返回最新视图
 //! - change_password：自助改密复用 `AccountService::change_own_password`
 //!
 //! ## 实施约定（2026-09-21 事务分层重构）
@@ -37,6 +37,7 @@
 //!   max(0, old_refresh_expires_at - now))` 把旧 jti 入黑名单，TTL 与 refresh 自身有效期对齐。
 //! - `RefreshPending` 携带 `old_refresh_expires_at` 字段供 `complete_refresh` 计算 TTL。
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::auth::jwt::{TokenPair, decode_refresh, issue_token_pair};
@@ -64,6 +65,19 @@ pub struct LoginPending {
     pub pair: TokenPair,
     pub user: User,
     pub roles: Vec<Role>,
+    /// **原始**大写角色码（含自定义角色如 `QC_LEAD`；停用角色已滤掉）。
+    ///
+    /// 2026-10-14 新增：`roles` 只装 `Role` 枚举可识别的 6 项，自定义角色在
+    /// `parse_role_string` 里被打 warn 后丢弃。这份原始串承担三处消费：
+    /// ① `/iam/me` 出参的 `roles` 字段（若用 `roles`，自定义角色会**全部消失
+    /// 且零报错**）；② 权限码装载（`t_role_permission` 按 varchar 关联）；
+    /// ③ 菜单装载（`t_role_menu` 同理）。授权判定仍用 `roles`（枚举），
+    /// 两者职责不混。
+    pub role_codes: Vec<String>,
+    /// 该用户经全部角色 code 联查得到的权限码（写进 Redis session 缓存）。
+    /// ADMIN **角色**不贡献权限码（通配在 `require_permission`）；纯 ADMIN 账号为空
+    /// vec，账号同时持有其它已授权角色时带那些码。
+    pub permissions: Vec<String>,
     pub shelf_ids: Vec<i64>,
     pub shelf_wildcard: bool,
     pub menus: Vec<MenuNodeOut>,
@@ -85,6 +99,12 @@ pub struct RefreshPending {
     pub pair: TokenPair,
     pub user: User,
     pub roles: Vec<Role>,
+    /// 原始大写角色码（同 [`LoginPending::role_codes`]）
+    pub role_codes: Vec<String>,
+    /// 该用户经全部角色 code 联查得到的权限码（写进 Redis session 缓存）。
+    /// ADMIN **角色**不贡献权限码（通配在 `require_permission`）；纯 ADMIN 账号为空
+    /// vec，账号同时持有其它已授权角色时带那些码。
+    pub permissions: Vec<String>,
     pub shelf_ids: Vec<i64>,
     pub shelf_wildcard: bool,
     pub menus: Vec<MenuNodeOut>,
@@ -166,14 +186,19 @@ impl SessionService {
         }
 
         // 5. 解析角色枚举 + shelf 范围；委托 account_service 取菜单
-        let (roles, shelf_ids, shelf_wildcard) =
+        let (roles, role_codes, shelf_ids, shelf_wildcard) =
             resolve_roles_and_scope(&mut repo, &role_rows).await?;
+        // 权限码：按**原始** role code 联查（含自定义角色 —— 它们在 t_role 里
+        // 也可能有授权行，枚举认不出不代表没有权限）
+        let permissions = repo.list_permission_codes_by_roles(&role_codes).await?;
         if roles.is_empty() {
             return Err(AppError::biz(code::NO_ROLE, "账号未分配角色"));
         }
+        // 菜单：按**原始** role code 取（含自定义角色 —— 它们在 `t_role_menu` 里
+        // 的授权行是角色面板的可写对象；用枚举 `roles` 会把这些菜单全部丢掉）
         let menus = self
             .account_service
-            .menus_for_roles(&mut repo, &roles)
+            .menus_for_roles(&mut repo, &role_codes)
             .await?;
 
         // 6. 签发双 token（2026-09-22 重构：删业务字段参数，新增 audience；
@@ -197,6 +222,8 @@ impl SessionService {
             pair,
             user: u,
             roles,
+            role_codes,
+            permissions,
             shelf_ids,
             shelf_wildcard,
             menus,
@@ -248,14 +275,19 @@ impl SessionService {
         }
 
         // ⑤ 解析角色枚举 + shelf 范围；委托 account_service 取菜单
-        let (roles, shelf_ids, shelf_wildcard) =
+        let (roles, role_codes, shelf_ids, shelf_wildcard) =
             resolve_roles_and_scope(&mut repo, &role_rows).await?;
+        // 权限码：按**原始** role code 联查（含自定义角色 —— 它们在 t_role 里
+        // 也可能有授权行，枚举认不出不代表没有权限）
+        let permissions = repo.list_permission_codes_by_roles(&role_codes).await?;
         if roles.is_empty() {
             return Err(AppError::biz(code::NO_ROLE, "账号未分配角色"));
         }
+        // 菜单：按**原始** role code 取（含自定义角色 —— 它们在 `t_role_menu` 里
+        // 的授权行是角色面板的可写对象；用枚举 `roles` 会把这些菜单全部丢掉）
         let menus = self
             .account_service
-            .menus_for_roles(&mut repo, &roles)
+            .menus_for_roles(&mut repo, &role_codes)
             .await?;
 
         // ⑥ 签发双 token（参数与 `login()` 逐字相同）
@@ -277,6 +309,8 @@ impl SessionService {
             pair,
             user,
             roles,
+            role_codes,
+            permissions,
             shelf_ids,
             shelf_wildcard,
             menus,
@@ -289,6 +323,8 @@ impl SessionService {
             pair,
             user: u,
             roles,
+            role_codes,
+            permissions,
             shelf_ids,
             shelf_wildcard,
             menus,
@@ -301,6 +337,7 @@ impl SessionService {
             roles: roles.iter().map(|r| role_as_str(*r).to_string()).collect(),
             shelf_ids: shelf_ids.clone(),
             shelf_wildcard,
+            permissions,
         };
         let ttl = self.config.redis.session_ttl_seconds;
         // 2026-09-23 重构：Redis session key 直接使用 JWT 自带 jti（UUID v4）。
@@ -311,7 +348,8 @@ impl SessionService {
             .create_session(&pair.refresh_jti, u.id, TokenKind::Refresh, ttl, &profile)
             .await?;
 
-        let user_out = build_current_user_out(&u, &roles, &shelf_ids, menus);
+        let user_out =
+            build_current_user_out(&u, &role_codes, &shelf_ids, &profile.permissions, menus);
 
         Ok(LoginResponse {
             token: pair.access_token,
@@ -413,14 +451,19 @@ impl SessionService {
         if role_rows.is_empty() {
             return Err(AppError::biz(code::NO_ROLE, "账号未分配角色"));
         }
-        let (roles, shelf_ids, shelf_wildcard) =
+        let (roles, role_codes, shelf_ids, shelf_wildcard) =
             resolve_roles_and_scope(&mut repo, &role_rows).await?;
+        // 权限码：按**原始** role code 联查（含自定义角色 —— 它们在 t_role 里
+        // 也可能有授权行，枚举认不出不代表没有权限）
+        let permissions = repo.list_permission_codes_by_roles(&role_codes).await?;
         if roles.is_empty() {
             return Err(AppError::biz(code::NO_ROLE, "账号未分配角色"));
         }
+        // 菜单：按**原始** role code 取（含自定义角色 —— 它们在 `t_role_menu` 里
+        // 的授权行是角色面板的可写对象；用枚举 `roles` 会把这些菜单全部丢掉）
         let menus = self
             .account_service
-            .menus_for_roles(&mut repo, &roles)
+            .menus_for_roles(&mut repo, &role_codes)
             .await?;
 
         // 4. 轮转 refresh_token_version（带乐观锁；0 行 → 409）
@@ -457,6 +500,8 @@ impl SessionService {
             pair,
             user: u,
             roles,
+            role_codes,
+            permissions,
             shelf_ids,
             shelf_wildcard,
             menus,
@@ -477,6 +522,8 @@ impl SessionService {
             pair,
             user: u,
             roles,
+            role_codes,
+            permissions,
             shelf_ids,
             shelf_wildcard,
             menus,
@@ -526,6 +573,7 @@ impl SessionService {
             roles: roles.iter().map(|r| role_as_str(*r).to_string()).collect(),
             shelf_ids: shelf_ids.clone(),
             shelf_wildcard,
+            permissions,
         };
         let ttl = self.config.redis.session_ttl_seconds;
         // 2026-09-23 重构：Redis session key 直接使用 JWT 自带 jti（UUID v4）。
@@ -536,7 +584,8 @@ impl SessionService {
             .create_session(&pair.refresh_jti, u.id, TokenKind::Refresh, ttl, &profile)
             .await?;
 
-        let user_out = build_current_user_out(&u, &roles, &shelf_ids, menus);
+        let user_out =
+            build_current_user_out(&u, &role_codes, &shelf_ids, &profile.permissions, menus);
 
         Ok(LoginResponse {
             token: pair.access_token,
@@ -549,7 +598,7 @@ impl SessionService {
     // me（读端点）
     // =======================================================================
 
-    /// `/iam/me`：从 DB 重读当前用户 + 角色 + shelf 范围 + 菜单。
+    /// `/iam/me`：从 DB 重读当前用户 + 角色 + shelf 范围 + 权限码 + 菜单。
     /// 读端点，handler `pool.acquire()` 不开事务，service 借到的 `repo` 用完即 drop。
     pub async fn me<R: IamRepoTrait>(
         &self,
@@ -565,15 +614,29 @@ impl SessionService {
             return Err(AppError::biz(code::UNAUTHORIZED, "用户不存在或已停用"));
         }
 
-        // 2. 重查角色 + shelf 范围 + 菜单（不走 JWT 里的 stale 数据）
+        // 2. 重查角色 + shelf 范围 + 权限码 + 菜单（不走 JWT 里的 stale 数据）
         let role_rows = repo.list_user_roles_by_user_id(u.id).await?;
-        let (roles, shelf_ids, _wildcard) = resolve_roles_and_scope(&mut repo, &role_rows).await?;
+        // 枚举 `roles` 在 me 里用不到（出参的 roles 用原始串）；仍要跑解析，
+        // 因为它同时算出 role_codes 与 shelf scope
+        let (_roles, role_codes, shelf_ids, _wildcard) =
+            resolve_roles_and_scope(&mut repo, &role_rows).await?;
+        // 权限码：按**原始** role code 联查（含自定义角色 —— 它们在 t_role 里
+        // 也可能有授权行，枚举认不出不代表没有权限）
+        let permissions = repo.list_permission_codes_by_roles(&role_codes).await?;
+        // 菜单：按**原始** role code 取（含自定义角色 —— 它们在 `t_role_menu` 里
+        // 的授权行是角色面板的可写对象；用枚举 `roles` 会把这些菜单全部丢掉）
         let menus = self
             .account_service
-            .menus_for_roles(&mut repo, &roles)
+            .menus_for_roles(&mut repo, &role_codes)
             .await?;
 
-        Ok(build_current_user_out(&u, &roles, &shelf_ids, menus))
+        Ok(build_current_user_out(
+            &u,
+            &role_codes,
+            &shelf_ids,
+            &permissions,
+            menus,
+        ))
     }
 
     // =======================================================================
@@ -614,19 +677,52 @@ impl SessionService {
 
 /// 解析 UserRole 行集合为登录态三件套：
 /// 1. `Vec<Role>`：转换得到的角色枚举（顺带跳过无法识别的字符串）
-/// 2. `Vec<i64>`：可访问的 shelf_id 列表（仅 SHELF_ACCOUNT 角色 + 货架 active + zone∈白名单）
-/// 3. `bool`：shelf_wildcard——任意一条 SHELF_ACCOUNT 行的 scope_id 为 NULL 时为 true
+/// 2. `Vec<String>`：**原始**大写角色码（含自定义角色；去重）——
+///    `/iam/me` 出参与菜单 / 权限装载的输入
+/// 3. `Vec<i64>`：可访问的 shelf_id 列表（仅 SHELF_ACCOUNT 角色 + 货架 active + zone∈白名单）
+/// 4. `bool`：shelf_wildcard——任意一条 SHELF_ACCOUNT 行的 scope_id 为 NULL 时为 true
+///
+/// ## 停用即降权（2026-10-14）
+/// 先按 `t_role.is_active = true AND deleted_at IS NULL` 过滤掉**停用角色**的
+/// `t_user_role` 行：该角色的枚举角色、原始 code、货架 scope 全部不生效，后续的
+/// 权限 / 菜单装载（输入都是过滤后的 `role_codes`）随之失效。停用为终态（当前
+/// 没有启用端点，恢复需改库）。
 ///
 /// 规则与 account_service.validate_role_scope / shelf_repo.get_by_id 一脉相承。
 async fn resolve_roles_and_scope<R: IamRepoTrait>(
     repo: &mut R,
     rows: &[UserRoleRow],
-) -> Result<(Vec<Role>, Vec<i64>, bool), AppError> {
+) -> Result<(Vec<Role>, Vec<String>, Vec<i64>, bool), AppError> {
+    // 先取一次「这批 code 里哪些角色启用中」，后面逐行过滤；空 rows 时 repo 侧
+    // 短路、不发 SQL。
+    let mut all_codes: Vec<String> = Vec::with_capacity(rows.len());
+    for r in rows {
+        if !all_codes.contains(&r.role) {
+            all_codes.push(r.role.clone());
+        }
+    }
+    let active_codes: HashSet<String> = repo
+        .list_active_role_codes(&all_codes)
+        .await?
+        .into_iter()
+        .collect();
+
     let mut roles: Vec<Role> = Vec::with_capacity(rows.len());
+    // 原始大写串：**全部**（启用中的）role 行都进（含 `parse_role` 认不出的
+    // 自定义角色），去重后供 `/iam/me` 出参 / 菜单 / 权限装载使用
+    // （见 LoginPending::role_codes 的说明）。
+    let mut role_codes: Vec<String> = Vec::with_capacity(rows.len());
     let mut shelf_ids: Vec<i64> = Vec::new();
     let mut shelf_wildcard = false;
 
     for r in rows {
+        // 停用角色的行整体跳过（不认角色 / code / scope）
+        if !active_codes.contains(&r.role) {
+            continue;
+        }
+        if !role_codes.contains(&r.role) {
+            role_codes.push(r.role.clone());
+        }
         // 未知 role 值由 `parse_role_string` 内部打 warn（带 `role` 字段），此处只跳过
         let Some(role) = parse_role(&r.role) else {
             continue;
@@ -648,15 +744,16 @@ async fn resolve_roles_and_scope<R: IamRepoTrait>(
         roles.push(role);
     }
 
-    Ok((roles, shelf_ids, shelf_wildcard))
+    Ok((roles, role_codes, shelf_ids, shelf_wildcard))
 }
 
 /// 直接从 DB User + 解析后的角色/shelf 拼 `CurrentUserOut`，避免绕路 account helper（该 helper
 /// 依赖 `CurrentUser` 形参的角色/shelf，会把 stale 数据带进出参）。
 fn build_current_user_out(
     u: &User,
-    roles: &[Role],
+    role_codes: &[String],
     shelf_ids: &[i64],
+    permissions: &[String],
     menus: Vec<MenuNodeOut>,
 ) -> CurrentUserOut {
     CurrentUserOut {
@@ -664,7 +761,10 @@ fn build_current_user_out(
         username: u.username.clone(),
         full_name: u.full_name.clone(),
         is_active: u.is_active,
-        roles: roles.iter().map(|r| role_as_str(*r).to_string()).collect(),
+        // 原始大写码（含自定义角色）—— `Role` 枚举只用于授权判定，不用于出参
+        roles: role_codes.to_vec(),
+        // 与写进 Redis session 缓存的是同一份（ADMIN 角色不贡献权限码）
+        permissions: permissions.to_vec(),
         shelf_ids: shelf_ids.iter().map(|v| v.to_string()).collect(),
         menus,
     }

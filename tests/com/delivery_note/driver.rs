@@ -107,13 +107,21 @@ async fn insert_submitted_note_with_batch(pool: &PgPool, l1_id: i64) -> (i64, i3
     .await
     .expect("insert part");
 
+    // 2026-10-14 review 第 2 轮 MAJOR-N1：**必须是带 holder 的真实形态**。
+    // `READY_TO_SHIP` 批次在业务上的落点是品检架（`INSPECTION_SHELF` +
+    // `current_holder_id = <shelf_id>`，见 `shared::batch::guards::mark_batch_status_only`
+    // 里「为什么 READY_TO_SHIP 不清位置」的论证）。原先这里写的是
+    // `PRODUCTION_SHELF` 且**不带 `current_holder_id`** ⇒ 对
+    // 「领取后 current_holder_id IS NULL」的断言会**恒真**（本来就是 NULL），
+    // 等于没测。
     sqlx::query(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
-         delivery_note_id, version, created_at, created_by, updated_at, updated_by) \
-         VALUES ($1, $2, 1, 4, 'READY_TO_SHIP', 'PRODUCTION_SHELF', $3, 0, $4, NULL, $4, NULL)",
+         current_holder_id, delivery_note_id, version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, 1, 4, 'READY_TO_SHIP', 'INSPECTION_SHELF', $3, $4, 0, $5, NULL, $5, NULL)",
     )
     .bind(batch_id)
     .bind(part_id)
+    .bind(PartFixture::INSPECTION_SHELF_ID)
     .bind(note_id)
     .bind(now)
     .execute(pool)
@@ -361,7 +369,12 @@ async fn set_driver_on_missing_note_returns_21401() {
 //  3~5. /pickup
 // ===========================================================================
 
-/// 正常领取：已指定司机 ⇒ `PICKED_UP`，批次翻 `DELIVERED`。
+/// 正常领取：已指定司机 ⇒ `PICKED_UP`，批次翻 `DELIVERED` **且清空位置列**。
+///
+/// ★ 后半段是 2026-10-14 review 第 2 轮 MAJOR-N1 的回归：「终态批次不在任何位置」
+/// 不变式的第 6 个写点（`PartBatchRepo::update`，本端点唯一生产调用方）。此前它
+/// 只在内存 struct 上清位置、DB 侧写 `clear_location: false` ⇒ 落库的行停在
+/// `INSPECTION_SHELF + <shelf_id>`，正是 migration `20261013000002` 要清的幽灵行。
 #[tokio::test]
 async fn pickup_uses_assigned_driver_and_flips_batches_to_delivered() {
     let (pool, app, token) = bootstrap_as_manager().await;
@@ -371,6 +384,28 @@ async fn pickup_uses_assigned_driver_and_flips_batches_to_delivered() {
     let wt = work_type(&pool, "送货司机", "送货司机").await;
     let driver = insert_worker(&pool, "DR41", "辛司机", Some(wt), true, false).await;
 
+    // 前置态断言：必须证明 fixture 造的**确实带位置 + 持有人**，否则下面的
+    // 「领取后两列都为 NULL」会恒真、等于没测（这正是 review 抓到的坑）。
+    let (pre_status, pre_loc, pre_holder): (String, Option<String>, Option<i64>) = sqlx::query_as(
+        "SELECT status, location, current_holder_id FROM t_part_batch \
+         WHERE delivery_note_id = $1 LIMIT 1",
+    )
+    .bind(note_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read batch pre-state");
+    assert_eq!(pre_status, "READY_TO_SHIP");
+    assert_eq!(
+        pre_loc.as_deref(),
+        Some("INSPECTION_SHELF"),
+        "fixture 必须造出真实的品检架落点，否则本用例的清位置断言恒真"
+    );
+    assert_eq!(
+        pre_holder,
+        Some(PartFixture::INSPECTION_SHELF_ID),
+        "fixture 必须带 current_holder_id，否则「领取后为 NULL」的断言恒真"
+    );
+
     let (_, env1) = set_driver(&app, &token, note_id, driver, v0).await;
     let v1 = env1["data"]["version"].as_i64().unwrap() as i32;
 
@@ -379,13 +414,23 @@ async fn pickup_uses_assigned_driver_and_flips_batches_to_delivered() {
     assert_eq!(env["data"]["status"], "PICKED_UP");
     assert_eq!(env["data"]["driver_worker_name"], "辛司机");
 
-    let batch_status: String =
-        sqlx::query_scalar("SELECT status FROM t_part_batch WHERE delivery_note_id = $1 LIMIT 1")
-            .bind(note_id)
-            .fetch_one(&pool)
-            .await
-            .expect("read batch status");
+    let (batch_status, location, holder): (String, Option<String>, Option<i64>) = sqlx::query_as(
+        "SELECT status, location, current_holder_id FROM t_part_batch \
+         WHERE delivery_note_id = $1 LIMIT 1",
+    )
+    .bind(note_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read batch status");
     assert_eq!(batch_status, "DELIVERED");
+    assert_eq!(
+        location, None,
+        "DELIVERED 是终态 ⇒ location 必须清 NULL（MAJOR-N1 的写点 6）"
+    );
+    assert_eq!(
+        holder, None,
+        "DELIVERED 是终态 ⇒ current_holder_id 必须清 NULL（MAJOR-N1 的写点 6）"
+    );
 }
 
 /// 未指定司机 ⇒ 21409（领取的前提是「已有合法司机」）。

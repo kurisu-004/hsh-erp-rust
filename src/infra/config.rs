@@ -95,6 +95,12 @@ pub struct AppConfig {
     /// 2026-09-29 新增：企业微信小程序登录配置（自建应用 `jscode2session`）。
     /// 环境变量 `WECOM_CORPID` / `WECOM_CORPSECRET`（两者都非空才 enabled）。
     pub wecom: WeComConfig,
+    /// 2026-10-13 新增：SMTP 发信配置（交期汇总邮件，域 `mail_digest`）。
+    /// **SMTP 凭据只走 env、不进 DB**（与 `wecom` 同一条安全纪律）：`t_mail_digest_config`
+    /// 只存收件人 / 内容口径 / 调度，密码一旦落库就跟着备份走、且能被任何有只读库
+    /// 权限的人捞走。DB 侧的 `enabled` 只是**第二道闸**，第一道是本字段的
+    /// [`MailConfig::is_enabled`]。
+    pub mail: MailConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -442,6 +448,155 @@ impl Default for WeComConfig {
     }
 }
 
+/// 2026-10-13 新增：SMTP 发信配置（交期汇总邮件定时任务的**第一道闸**）。
+///
+/// ## 触发场景
+/// `mail_digest` 域（`POST /api/v2/mail-digest/send` 手动触发 + `task::mail_digest`
+/// 的 cron 定时触发）在真正调 lettre 之前先问 [`MailConfig::is_enabled`]；为 false
+/// 时手动触发返 `21701 BIZ_MAIL_NOT_CONFIGURED`、定时任务根本不注册 job。
+///
+/// ## env
+/// - `MAIL_SMTP_HOST`：SMTP 服务器，缺省 `smtp.exmail.qq.com`（企业邮）。
+/// - `MAIL_SMTP_PORT`：端口，缺省 `465`（隐式 TLS）。
+/// - `MAIL_SMTP_USERNAME` / `MAIL_SMTP_PASSWORD`：登录凭据。**任一为空 ⇒ 未配置**。
+/// - `MAIL_SMTP_TLS_MODE`：`WRAPPED`（隐式 TLS / 465，默认）/ `STARTTLS`（587）/ `NONE`（明文）。
+///   解析失败**报错并提示合法值**（不像凭据那样静默降级 —— TLS 模式配错的后果是
+///   「凭据发到明文连接上」或「握手直接失败」，静默猜一个比启动失败危险得多）。
+/// - `MAIL_FROM_ADDRESS`：发件人地址，缺省回退到 `MAIL_SMTP_USERNAME`；为空 ⇒ 未配置。
+/// - `MAIL_FROM_NAME`：发件人显示名，缺省 `汇森 ERP`。
+/// - `MAIL_DIGEST_ENABLED`：交期汇总邮件的**全局总闸**，缺省 `false`。
+///
+/// ## 为什么用 `env_or(.., "")` 而**不是** `env_required`
+/// 降级范式与 [`WeComConfig`] 逐条同源：未配置时 `is_enabled()` 为 false，后端
+/// **照常启动**，只是定时任务打一行 info 后退出、`/send` 返 21701。若用
+/// `env_required`，运维在还没申请企业邮授权码之前就无法启动整个 ERP 后端。
+///
+/// ## 安全
+/// `password` 绝不出现在任何 `tracing` 日志 / `Debug` 输出里 —— 手写 `Debug`
+/// （见下方 impl）把它固定输出成 `***`，**不靠「调用方记得别打印整个 struct」这条约定**。
+///
+/// ## TLS 模式三态
+/// [`MailTlsModeKind`] 单独抽成 enum 而不是裸 `String`：模式决定 lettre 侧走
+/// `Tls::Wrapper` / `Tls::Opportunistic` / `Tls::None` 三条完全不同的握手路径，
+/// 裸串会让「模式配错」这件事推迟到发信那一刻才炸，且报错来自网络层、与配置无关。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MailTlsModeKind {
+    /// 隐式 TLS：连接建立即 TLS（典型端口 465）。**默认档**。
+    Wrapped,
+    /// 先明文连上、再 `STARTTLS` 升级（典型端口 587）。
+    StartTls,
+    /// 明文（仅本地调试用；会把凭据裸传）。
+    None,
+}
+
+impl MailTlsModeKind {
+    /// `MAIL_SMTP_TLS_MODE` 的合法值清单（错误信息里逐条列出，省得运维对着猜）。
+    pub const LEGAL_VALUES: &'static [&'static str] = &["WRAPPED", "STARTTLS", "NONE"];
+
+    /// 解析 env 值（大小写不敏感、前后空白忽略）。失败时错误信息带合法值清单。
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_uppercase().as_str() {
+            "WRAPPED" => Ok(Self::Wrapped),
+            "STARTTLS" => Ok(Self::StartTls),
+            "NONE" => Ok(Self::None),
+            other => Err(anyhow!(
+                "MAIL_SMTP_TLS_MODE 取值非法：{other}；合法值只有 {}",
+                Self::LEGAL_VALUES.join(" / ")
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for MailTlsModeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Wrapped => "WRAPPED",
+            Self::StartTls => "STARTTLS",
+            Self::None => "NONE",
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct MailConfig {
+    /// SMTP 服务器主机名。缺省 `smtp.exmail.qq.com`。
+    pub host: String,
+    /// SMTP 端口。缺省 `465`（隐式 TLS）。
+    ///
+    /// ⚠️ 刻意**不**随 `tls_mode` 变（`STARTTLS` 不自动切 587、`NONE` 不自动切 25）：
+    /// 「模式」与「端口」是两个独立的人工决策项，猜端口会让「587 + WRAPPED」这类
+    /// 真实存在的组合被静默改写。配错了握手会失败，而失败信息比静默改写更容易查。
+    pub port: u16,
+    /// SMTP 登录用户名。空串 = 未配置。
+    pub username: String,
+    /// SMTP 登录密码 / 企业邮授权码。空串 = 未配置。**禁止**进日志。
+    pub password: String,
+    /// TLS 模式（`MAIL_SMTP_TLS_MODE`）。
+    pub tls_mode: MailTlsModeKind,
+    /// 发件人地址（回退 = `username`）。空串 = 未配置。
+    pub from_address: String,
+    /// 发件人显示名（`MAIL_FROM_NAME`，缺省 `汇森 ERP`）。
+    pub from_name: String,
+    /// 全局总闸（`MAIL_DIGEST_ENABLED`，缺省 `false`）。与 DB 侧
+    /// `t_mail_digest_config.enabled` 是**两道闸**，两者都 true 才注册定时 job。
+    pub digest_enabled: bool,
+}
+
+impl MailConfig {
+    /// 是否「本进程具备发信能力」。
+    ///
+    /// 判定式（逐条都有理由，不要随手简化）：
+    /// `digest_enabled && !username.is_empty() && !password.is_empty() && !from_address.is_empty()`
+    /// - `digest_enabled` 是运维的总闸：即便 SMTP 配好了，不显式打开就不发信；
+    /// - `username` / `password` 任一为空 ⇒ 没凭据，发信必然失败，不如提前拒；
+    /// - `from_address` 为空 ⇒ 构造不出合法的 `From` 头（部分服务器还会拒收无 From 的信）。
+    ///
+    /// ⚠️ **三个凭据都 `trim()` 后再判空**（2026-10-13 review 第 1 轮 A3：本 doc 原先
+    /// 写的是「**不** trim 后再判（与 `WeComConfig` 同纪律）：`" "` 这种纯空格占位判为
+    /// 「已配置」…」，与紧跟的代码 `!self.username.trim().is_empty()` **正好相反**）。
+    /// 实现与 lib 单测 `is_enabled_requires_all_three_credentials_plus_switch` 一致：
+    /// **纯空格占位判为「未配置」**，不会真打一次 SMTP 拿一个难以定位的握手失败。
+    /// （`WeComConfig::is_enabled` 走的是另一套字段，判法不同，别把两者的结论互推。）
+    pub fn is_enabled(&self) -> bool {
+        self.digest_enabled
+            && !self.username.trim().is_empty()
+            && !self.password.trim().is_empty()
+            && !self.from_address.trim().is_empty()
+    }
+}
+
+/// 手写 `Debug`：屏蔽 `password`（2026-10-13，与 `WeComConfig` 同一手法）。
+impl std::fmt::Debug for MailConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MailConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            // ⚠️ 永远输出 `***`，即使 password 为空串也不回显原值
+            .field("password", &"***")
+            .field("tls_mode", &self.tls_mode)
+            .field("from_address", &self.from_address)
+            .field("from_name", &self.from_name)
+            .field("digest_enabled", &self.digest_enabled)
+            .finish()
+    }
+}
+
+impl Default for MailConfig {
+    fn default() -> Self {
+        Self {
+            host: "smtp.exmail.qq.com".to_string(),
+            port: 465,
+            username: String::new(),
+            password: String::new(),
+            tls_mode: MailTlsModeKind::Wrapped,
+            from_address: String::new(),
+            from_name: "汇森 ERP".to_string(),
+            digest_enabled: false,
+        }
+    }
+}
+
 impl AppConfig {
     pub fn from_env(env_file: &str) -> Result<Self> {
         // 加载 .env（不存在不报错）
@@ -681,6 +836,36 @@ impl AppConfig {
                     // 只有企微没回 expires_in 时才用这个值
                     token_ttl_seconds: env_parse("WECOM_TOKEN_TTL", 6000u64)?,
                     http_timeout_ms: env_parse("WECOM_HTTP_TIMEOUT_MS", 5000u64)?,
+                }
+            },
+            // 2026-10-13 新增：SMTP 发信（交期汇总邮件）。与 wecom 同一条降级纪律 ——
+            // 凭据用 `env_or(.., "")` 而非 `env_required`：未配置 → is_enabled()=false，
+            // 后端照常启动，定时任务打一行 info 后返回、`/mail-digest/send` 返 21701。
+            //
+            // ⚠️ 唯一**不**降级的是 `MAIL_SMTP_TLS_MODE`：解析失败直接 bail 并列出
+            //    合法值。TLS 模式配错的后果不是「发不出去」而是「凭据可能发到明文连接
+            //    上」，静默猜一个默认值比启动失败危险得多（详见 MailConfig 的 doc）。
+            mail: {
+                let username = env_or("MAIL_SMTP_USERNAME", "");
+                let password = env_or("MAIL_SMTP_PASSWORD", "");
+                // 发件人地址缺省回退到登录名：企业邮的授权码账号本身就是可发信地址。
+                let from_address = {
+                    let explicit = env_or("MAIL_FROM_ADDRESS", "");
+                    if explicit.trim().is_empty() {
+                        username.clone()
+                    } else {
+                        explicit
+                    }
+                };
+                MailConfig {
+                    host: env_or("MAIL_SMTP_HOST", "smtp.exmail.qq.com"),
+                    port: env_parse("MAIL_SMTP_PORT", 465u16)?,
+                    username,
+                    password,
+                    tls_mode: MailTlsModeKind::parse(&env_or("MAIL_SMTP_TLS_MODE", "WRAPPED"))?,
+                    from_address,
+                    from_name: env_or("MAIL_FROM_NAME", "汇森 ERP"),
+                    digest_enabled: env_bool("MAIL_DIGEST_ENABLED", false)?,
                 }
             },
         })

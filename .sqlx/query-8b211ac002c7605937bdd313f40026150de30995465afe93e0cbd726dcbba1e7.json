@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO t_work_type (id, code, name, description, sort_order,\n                                     max_held_batches, created_by, updated_by)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $7)\n            RETURNING id, code, name, description, sort_order, version,\n                      created_at, created_by, updated_at, updated_by, deleted_at,\n                      max_held_batches\n            ",
+  "query": "\n            SELECT id, code, name, description, is_system, is_active, version,\n                   created_at, created_by, updated_at, updated_by, deleted_at\n            FROM t_role\n            WHERE id = $1 AND deleted_at IS NULL\n            ",
   "describe": {
     "columns": [
       {
@@ -9,7 +9,7 @@
         "type_info": "Int8",
         "origin": {
           "Table": {
-            "table": "t_work_type",
+            "table": "t_role",
             "name": "id"
           }
         }
@@ -20,7 +20,7 @@
         "type_info": "Varchar",
         "origin": {
           "Table": {
-            "table": "t_work_type",
+            "table": "t_role",
             "name": "code"
           }
         }
@@ -31,7 +31,7 @@
         "type_info": "Varchar",
         "origin": {
           "Table": {
-            "table": "t_work_type",
+            "table": "t_role",
             "name": "name"
           }
         }
@@ -39,111 +39,105 @@
       {
         "ordinal": 3,
         "name": "description",
-        "type_info": "Varchar",
+        "type_info": "Text",
         "origin": {
           "Table": {
-            "table": "t_work_type",
+            "table": "t_role",
             "name": "description"
           }
         }
       },
       {
         "ordinal": 4,
-        "name": "sort_order",
-        "type_info": "Int4",
+        "name": "is_system",
+        "type_info": "Bool",
         "origin": {
           "Table": {
-            "table": "t_work_type",
-            "name": "sort_order"
+            "table": "t_role",
+            "name": "is_system"
           }
         }
       },
       {
         "ordinal": 5,
-        "name": "version",
-        "type_info": "Int4",
+        "name": "is_active",
+        "type_info": "Bool",
         "origin": {
           "Table": {
-            "table": "t_work_type",
-            "name": "version"
+            "table": "t_role",
+            "name": "is_active"
           }
         }
       },
       {
         "ordinal": 6,
-        "name": "created_at",
-        "type_info": "Timestamp",
+        "name": "version",
+        "type_info": "Int4",
         "origin": {
           "Table": {
-            "table": "t_work_type",
-            "name": "created_at"
+            "table": "t_role",
+            "name": "version"
           }
         }
       },
       {
         "ordinal": 7,
-        "name": "created_by",
-        "type_info": "Int8",
+        "name": "created_at",
+        "type_info": "Timestamp",
         "origin": {
           "Table": {
-            "table": "t_work_type",
-            "name": "created_by"
+            "table": "t_role",
+            "name": "created_at"
           }
         }
       },
       {
         "ordinal": 8,
-        "name": "updated_at",
-        "type_info": "Timestamp",
+        "name": "created_by",
+        "type_info": "Int8",
         "origin": {
           "Table": {
-            "table": "t_work_type",
-            "name": "updated_at"
+            "table": "t_role",
+            "name": "created_by"
           }
         }
       },
       {
         "ordinal": 9,
-        "name": "updated_by",
-        "type_info": "Int8",
+        "name": "updated_at",
+        "type_info": "Timestamp",
         "origin": {
           "Table": {
-            "table": "t_work_type",
-            "name": "updated_by"
+            "table": "t_role",
+            "name": "updated_at"
           }
         }
       },
       {
         "ordinal": 10,
-        "name": "deleted_at",
-        "type_info": "Timestamp",
+        "name": "updated_by",
+        "type_info": "Int8",
         "origin": {
           "Table": {
-            "table": "t_work_type",
-            "name": "deleted_at"
+            "table": "t_role",
+            "name": "updated_by"
           }
         }
       },
       {
         "ordinal": 11,
-        "name": "max_held_batches",
-        "type_info": "Int4",
+        "name": "deleted_at",
+        "type_info": "Timestamp",
         "origin": {
           "Table": {
-            "table": "t_work_type",
-            "name": "max_held_batches"
+            "table": "t_role",
+            "name": "deleted_at"
           }
         }
       }
     ],
     "parameters": {
       "Left": [
-        "Int8",
-        "Varchar",
-        "Varchar",
-        "Varchar",
-        "Int4",
-        "Int4",
         "Int8"
       ]
     },
@@ -155,12 +149,12 @@
       false,
       false,
       false,
-      true,
       false,
       true,
+      false,
       true,
       true
     ]
   },
-  "hash": "5692bba434fc1e34d267ee879145c73bc904c62c1aed61a24bf4d7f57140a7aa"
+  "hash": "8b211ac002c7605937bdd313f40026150de30995465afe93e0cbd726dcbba1e7"
 }

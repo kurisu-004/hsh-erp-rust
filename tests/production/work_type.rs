@@ -6,6 +6,8 @@
 //! 2. `set_processes_replaces_group_and_get_returns_only_active` — 2026-10-02 新增：
 //!    `POST`↔`GET` 整组替换往返（set [P1,P2] → set [P2] → set []），钉死「读路径只返回
 //!    active 映射」；末尾顺带断言工种列表的 `process_ids` 出参同步收窄。
+//! 3. `set_work_type_processes_forbidden_without_production_config` — 2026-10-15 新增：
+//!    mapping 端点由原零守卫补 `production.config`（M），SA ⇒ 40300。
 //!
 //! ## 并行
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
@@ -134,6 +136,8 @@ async fn create_work_type_then_set_processes_then_soft_delete_in_use() {
                 "description": "5-axis CNC",
                 "sort_order": 10,
                 "max_held_batches": 3,
+                // 2026-10-15 新增字段：自动补料上限（≤ max）
+                "auto_allocate_limit": 2,
             })),
             Some(&token),
         ),
@@ -152,6 +156,10 @@ async fn create_work_type_then_set_processes_then_soft_delete_in_use() {
     assert_eq!(env_create["data"]["description"], "5-axis CNC");
     assert_eq!(env_create["data"]["sort_order"], 10);
     assert_eq!(env_create["data"]["max_held_batches"], 3);
+    assert_eq!(
+        env_create["data"]["auto_allocate_limit"], 2,
+        "2026-10-15：响应必须带 auto_allocate_limit: {env_create}"
+    );
 
     // 2) 直接 raw SQL 插 `t_work_type_process` 行：seed 2 个工序 + 插映射
     let p1 = seed_process(&pool, "WT-CNC-P1", "CNC step 1").await;
@@ -343,4 +351,226 @@ async fn set_processes_replaces_group_and_get_returns_only_active() {
         pids.is_empty(),
         "清空映射后工种列表的 process_ids 应同步为空（不过滤软删行会残留 P1/P2）; got: {pids:?}"
     );
+}
+
+// ===========================================================================
+//  2026-10-15：auto_allocate_limit 校验矩阵
+// ===========================================================================
+
+/// `auto_allocate_limit` 与 `max_held_batches` 的**合并校验矩阵**（create / update
+/// 同一处 service 逻辑）：auto 有值 ⇒ ≥1 且 max 非空且 auto ≤ max；错误码复用
+/// `20104 BIZ_INVALID_VALUE`（与 max<1 同码）。
+///
+/// 覆盖 8 个格子：
+/// 1. create auto=0 → 拒
+/// 2. create auto 有值而 max 缺省 → 拒
+/// 3. create auto > max → 拒
+/// 4. update 只改 max 使其 < 已存 auto → 拒（**不是单字段分别校验**的核心回归）
+/// 5. update 清 max 而 auto 有值 → 拒
+/// 6. update 同请求同时改两字段（合法组合）→ 通过
+/// 7. update 清 auto → 通过
+/// 8. update 清 max（auto 已为 null）→ 通过
+#[tokio::test]
+async fn work_type_auto_allocate_limit_validation_matrix() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+
+    // 0) 锚工种：max=5 / auto=3
+    let (s_create, env_create) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/prod/work-types",
+            Some(json!({
+                "code": "WT-AA-MATRIX",
+                "name": "AA Matrix",
+                "max_held_batches": 5,
+                "auto_allocate_limit": 3,
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s_create, StatusCode::CREATED, "create anchor: {env_create}");
+    let wt_id = env_create["data"]["id"].as_str().unwrap().to_string();
+    let update_uri = format!("/prod/work-types/{wt_id}/update");
+    let assert_bad_request = |s: StatusCode, env: &serde_json::Value, what: &str| {
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{what}: {env}");
+        assert_eq!(env["code"], 20104, "{what} 应 BIZ_INVALID_VALUE: {env}");
+    };
+
+    // 1) create auto=0 → 拒
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/prod/work-types",
+            Some(json!({
+                "code": "WT-AA-BAD1",
+                "name": "bad1",
+                "max_held_batches": 5,
+                "auto_allocate_limit": 0,
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_bad_request(s, &env, "auto=0");
+
+    // 2) create auto 有值而 max 缺省 → 拒
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/prod/work-types",
+            Some(json!({
+                "code": "WT-AA-BAD2",
+                "name": "bad2",
+                "auto_allocate_limit": 3,
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_bad_request(s, &env, "auto 有值而 max 缺省");
+
+    // 3) create auto > max → 拒
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/prod/work-types",
+            Some(json!({
+                "code": "WT-AA-BAD3",
+                "name": "bad3",
+                "max_held_batches": 5,
+                "auto_allocate_limit": 6,
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_bad_request(s, &env, "auto > max");
+
+    // 4) update 只改 max 使其 < 已存 auto（3）→ 拒
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &update_uri,
+            Some(json!({ "max_held_batches": 2 })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_bad_request(s, &env, "只改 max 使其 < 已存 auto");
+
+    // 5) update 清 max 而 auto 有值 → 拒
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &update_uri,
+            Some(json!({ "max_held_batches": null })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_bad_request(s, &env, "清 max 而 auto 有值");
+
+    // 6) update 同请求同时改两字段（合法组合）→ 通过
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &update_uri,
+            Some(json!({ "max_held_batches": 4, "auto_allocate_limit": 4 })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "同请求双字段合法组合: {env}");
+    assert_eq!(env["data"]["max_held_batches"], 4, "{env}");
+    assert_eq!(env["data"]["auto_allocate_limit"], 4, "{env}");
+
+    // 7) update 清 auto → 通过（回到「自动路径兜底 max」）
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &update_uri,
+            Some(json!({ "auto_allocate_limit": null })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "清 auto: {env}");
+    assert_eq!(env["data"]["auto_allocate_limit"], serde_json::Value::Null);
+    assert_eq!(env["data"]["max_held_batches"], 4, "{env}");
+
+    // 8) update 清 max（auto 已为 null）→ 通过
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &update_uri,
+            Some(json!({ "max_held_batches": null })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "清 max（auto 已 null）: {env}");
+    assert_eq!(env["data"]["max_held_batches"], serde_json::Value::Null);
+    assert_eq!(env["data"]["auto_allocate_limit"], serde_json::Value::Null);
+
+    // 收尾：GET 复核落库值与响应一致（防只读回读缓存）
+    let (s, env) = send(
+        app,
+        json_request(
+            "GET",
+            &format!("/prod/work-types/{wt_id}"),
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "get after clears: {env}");
+    assert_eq!(env["data"]["max_held_batches"], serde_json::Value::Null);
+    assert_eq!(env["data"]["auto_allocate_limit"], serde_json::Value::Null);
+    let _ = pool;
+}
+
+// ===========================================================================
+//  权限点闸门（2026-10-15 新增）
+// ===========================================================================
+
+/// `POST /prod/work-types/{id}/processes`：由原**零守卫**补 `production.config`（M）。
+///
+/// 无该点的 SHELF_ACCOUNT ⇒ 40300；MANAGER 对照 200（证明闸门只拦无授权身份，
+/// 不是把端点整个打坏）。
+#[tokio::test]
+async fn set_work_type_processes_forbidden_without_production_config() {
+    let (_pool, app, token, fx) = bootstrap_as_manager().await;
+    let sa = login_token(
+        &app,
+        &fx.part_shelf_account_username,
+        ProductionFixture::PASSWORD,
+    )
+    .await;
+    let uri = format!("/prod/work-types/{}/processes", fx.work_type_a_id);
+
+    let (s, env) = send(
+        app.clone(),
+        json_request("POST", &uri, Some(json!({ "items": [] })), Some(&sa)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "SHELF_ACCOUNT 应 403: {env}");
+    assert_eq!(env["code"], 40300, "应为 FORBIDDEN: {env}");
+
+    // 对照：MANAGER 同请求放行（items: [] = 清空映射，合法写）。
+    let (s, env) = send(
+        app,
+        json_request("POST", &uri, Some(json!({ "items": [] })), Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "MANAGER 应 200: {env}");
 }

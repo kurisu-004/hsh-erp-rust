@@ -1,4 +1,8 @@
-//! prod::scan 报工台**列表行**出参 VO（`GET /scan/pickable` / `GET /scan/held` 共用）
+//! prod::scan 报工台**列表行**出参 VO（`GET /scan/pickable` / `GET /scan/held`）
+//!
+//! 行本身（`ScanListItem`）两条端点共用；**分页信封不共用** —— `/pickable` 返
+//! `ScanListOut`，`/held` 返 `HeldListOut`（多两个容量字段，2026-10-14 起，理由
+//! 见 `HeldListOut` 的 doc）。
 //!
 //! 2026-10-10 自 `part::vo::PartListItem`（40 字段）收敛而来。收敛判据是「报工台
 //! 三页真正渲染 / 真正拿它发写请求的字段」，而不是「`t_part` 有这一列」。
@@ -187,6 +191,51 @@ pub struct ScanListOut {
     pub total: i64,
     pub limit: i64,
     pub offset: i64,
+}
+
+/// `GET /api/v2/prod/scan/held` 的分页信封（= `ScanListOut` + 容量两字段）。
+/// 前 4 字段与 `ScanListOut` 逐字相同、顺序不变 ⇒ 读 items/total 的调用方不受影响。
+///
+/// 2026-10-14 新增。此前 `/held` 复用 `ScanListOut`，报工台拿不到「这个工人还能
+/// 不能再取件」，只能在提交后吃一个 `20204`（工种容量触顶）。`/pickable` 是按
+/// `work_type_id` 作用域的，它**根本不知道是哪个工人**，容量字段对它结构性无意义。
+///
+/// ## 为什么不复用 `ScanListOut`（而是新增一个结构体）
+///
+/// 两个端点的**消费者不同**：前端在 zod 的 strip 模式下按各自 schema 解析响应，
+/// `/held` 的 schema 带两个容量字段、`/pickable` 的不带。硬塞进一个结构体 →
+/// `/pickable` 的响应里凭空多两个恒无意义的字段（取件页按工种查，不知道给谁取），
+/// 两套 schema 的差异也会被抹平。两套结构体让「哪个端点承诺了什么」在类型上自证。
+///
+/// ## 字段口径
+///
+/// 1. **`current_held` 与 `total` 恒等** —— 两者是**同一次查询**的同一个值
+///    （`ScanListingRepo::count_held`），都是「该工人当前持有的
+///    `IN_PROCESS + WORKER + 未软删` 批次数」。冗余暴露是为了让前端不必推断
+///    `total` 在这个端点上恰好等于容量计数（`total` 这个名字本身不承诺这件事），
+///    也让「还能再取几批 = `max_held_batches - current_held`」不必在前端绕一道
+///    减法。**不要**为 `current_held` 另发一条查询 —— 见 `listing/service.rs::list_held`
+///    里两个字段绑成同一个局部变量的写法。
+/// 2. **`max_held_batches`：`t_work_type.max_held_batches` 为 NULL 时发 `0`**
+///    （沿用队列板 `prod::queue::board::service.rs` 的 `w.max_held.unwrap_or(0)`
+///    既有约定）。语义正确：工种未配 max ⇒ 各路径在**服务入口即早退**（`pick-up`
+///    / `move` / `refill` 返 `20904`，auto-allocate 逐 worker 记
+///    `MAX_BATCHES_NOT_SET` 跳过），`take_one_from_pool` 自 **2026-10-15** 起不再
+///    读工种上限（`max_batches` CTE 已删）；发 `null` 反而有让前端渲染成「不限」的
+///    风险。
+/// 3. **两个计数都是裸 `i64` / `i32` ⇒ JSON number** —— 沿用 `ScanListOut` 的
+///    方向（本仓的约定是**雪花 id 才转 string**，这两个是计数不是 id；
+///    与 `prod::inspection` 域的 string 计数方向相反，是有意的）。
+#[derive(Debug, Clone, Serialize)]
+pub struct HeldListOut {
+    pub items: Vec<ScanListItem>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+    /// 当前持有批次数（= `total`，同一次查询的同一个值）。
+    pub current_held: i64,
+    /// 工种容量上限；`t_work_type.max_held_batches` 为 NULL 时发 `0`。
+    pub max_held_batches: i32,
 }
 
 #[cfg(test)]

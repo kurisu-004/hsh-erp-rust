@@ -14,7 +14,8 @@
 //! ## 约定（2026-09-22 D-1 重构对齐 iam / shelf / customer 范本）
 //! - 事务边界在 handler：`state.pool.begin()` → 传 `&mut tx` 给 service → 显式 `tx.commit()`
 //! - 统一响应信封：`Result<Json<R<T>>, AppError>`
-//! - 权限在 service 层（`current.require_role` / `require_any_role`）
+//! - 权限在 service 层（`require_role` / `require_permission`）
+//!   2026-10-15：读 2 条走 `production.view`（M,C,CNC,SA,I；SA 并入是有意并集）。
 //! - handler 三形态：
 //!   - ① 纯写端点：`pool.begin() → service → tx.commit()`（`upsert`）
 //!   - ② 写 + post-commit 副作用：本域无（process_chain 不写 Redis / WS）

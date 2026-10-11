@@ -156,6 +156,10 @@ impl AccountService {
     }
 
     /// `POST /api/v2/iam/users/{id}/update`：部分更新，OCC 锚点 = `req.version`。
+    ///
+    /// 2026-10-14：`is_active=false` 与 `deactivate_user` 是同一降权动作，走同一
+    /// ADMIN 自锁护栏 —— 否则本端点可绕过 `deactivate` 把最后一个 active 管理员
+    /// 归零，护栏会成摆设。
     pub async fn update_user<R: IamRepoTrait>(
         &self,
         mut repo: R,
@@ -165,8 +169,9 @@ impl AccountService {
     ) -> Result<UserOut, AppError> {
         current.require_role(Role::Manager)?;
 
-        // 只用于 404 归因：账号不存在 vs 存在但 version 过期，两者的响应码不同
-        repo.get_user_by_id(user_id)
+        // 只用于 404 归因与停用护栏：账号不存在 vs 存在但 version 过期，响应码不同
+        let u = repo
+            .get_user_by_id(user_id)
             .await?
             .ok_or_else(|| user_not_found(user_id))?;
 
@@ -185,6 +190,19 @@ impl AccountService {
         // phone 提供空串 = 显式清空（Python `.strip() or None`）
         let set_phone = req.phone.is_some();
         let phone = req.phone.as_deref().and_then(trimmed_or_none);
+
+        // ADMIN 自锁护栏：把 active 账号改为停用时与 `deactivate_user` 同款 ——
+        // 先 `has_active_admin_grants` 快筛（非管理员账号不跑计数），再过同一
+        // `guard_admin_lockout`（行锁 + 计数 + 阈值）。已停用账号跳过（它不在
+        // active 管理员计数里，不构成新的自锁风险）。
+        //
+        // 放在 bcrypt 之前：被护栏拒绝的请求不该白算一次 cost=12 的哈希。
+        if req.is_active == Some(false)
+            && u.is_active
+            && repo.has_active_admin_grants(user_id).await?
+        {
+            Self::guard_admin_lockout(&mut repo).await?;
+        }
 
         // 管理员在此改密**不**轮转 refresh_token_version（对齐 Python update_user）
         let password_hash = match req.password.as_deref() {
@@ -222,6 +240,11 @@ impl AccountService {
 
     /// `POST /api/v2/iam/users/{id}/deactivate`：停用账号 = 软删
     /// （置 `deleted_at` + `is_active = false`）。OCC 锚点 = `expected_version`。
+    ///
+    /// 2026-10-14：**ADMIN 自锁护栏** —— 目标是最后一个 active ADMIN 时返 400。
+    /// 判据与 `remove_role` 侧共用 `RbacService::count_active_users_holding_admin`
+    /// （同一条 SQL、同一个阈值 `<= 1`）。护栏路径返回 `Err` ⇒ handler 未 commit、
+    /// 也不会踢下线（该账号的 session 原样保留，管理员不会被自己踢出系统）。
     pub async fn deactivate_user<R: IamRepoTrait>(
         &self,
         mut repo: R,
@@ -235,6 +258,13 @@ impl AccountService {
             .get_user_by_id(user_id)
             .await?
             .ok_or_else(|| user_not_found(user_id))?;
+
+        // 停用会让该账号不再是 active 管理员 ⇒ 若它是最后一个，先拦下。
+        // 用 `u.is_active` 而非无条件判：停用一个已停用账号不构成新的自锁风险，
+        // 而那个账号本来就进不了 `list_active_user_ids_by_role_code` 的结果集。
+        if u.is_active && repo.has_active_admin_grants(user_id).await? {
+            Self::guard_admin_lockout(&mut repo).await?;
+        }
 
         let affected = repo
             .soft_delete_user(user_id, expected_version, now_naive(), Some(current.id))

@@ -17,9 +17,10 @@
 //! - `POST /api/v2/prod/queue/dispatch` —— 下发批次到车间
 //! - `POST /api/v2/prod/queue/auto-dispatch` —— 下发预览（只读）
 //! - `POST /api/v2/prod/queue/recall` —— 召回（batch_id 走 body）
-//! - `POST /api/v2/prod/queue/refill` —— 为工人抢满 max_held
+//! - `POST /api/v2/prod/queue/refill` —— 为工人补到工种自动上限（兜底 max_held）
 //! - `POST /api/v2/prod/queue/move` —— 通用移动（POOL ↔ WORKER + WORKER ↔ WORKER）
-//! - `POST /api/v2/prod/queue/auto-allocate` —— 按工序自动分配
+//! - `POST /api/v2/prod/queue/auto-allocate` —— 按工序自动分配（同自动上限口径，
+//!   2026-10-15 起入参只剩 `{ process_id, shelf_id }`）
 //!
 //! ## 路由注册顺序
 //! 1 段组（`/pending` `/dispatch` `/auto-dispatch` `/recall` `/refill` `/move`

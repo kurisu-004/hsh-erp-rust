@@ -1,4 +1,4 @@
-//! `AccountService` 的 `t_user` 子块单测（20 用例）
+//! `AccountService` 的 `t_user` 子块单测（23 用例）
 //!
 //! 覆盖矩阵：
 //! - happy path（每个方法 1 个）
@@ -316,7 +316,7 @@ async fn create_user_forbidden_for_non_manager() {
 }
 
 // ===========================================================================
-// update_user（3 用例）
+// update_user（5 用例）
 // ===========================================================================
 
 #[tokio::test]
@@ -425,6 +425,106 @@ async fn update_user_version_conflict_returns_409() {
     }
 }
 
+/// 2026-10-14：**端点 9 的 `is_active=false` 与端点 11 共用同一 ADMIN 自锁护栏**。
+///
+/// 护栏拒绝路径返回 Err ⇒ handler 未 commit（mockall 对未预期的
+/// `update_user_partial` 调用会 panic，这就是「绝不触达写入」的断言）。
+#[tokio::test]
+async fn update_user_deactivating_last_active_admin_is_rejected() {
+    // Arrange
+    let u = sample_user(101, "root");
+    let mut mock = MockIamRepoTrait::new();
+    mock.expect_get_user_by_id()
+        .returning(move |_| Ok(Some(u.clone())));
+    // 该账号持有 ADMIN，且只剩它一个 active 管理员
+    mock.expect_has_active_admin_grants()
+        .returning(|_| Ok(true));
+    // 护栏先取 t_role ADMIN 行锁再计数（与 deactivate_user 同款）
+    mock.expect_lock_admin_role_for_update()
+        .times(1)
+        .returning(|| Ok(()));
+    mock.expect_list_active_admin_user_ids()
+        .times(1)
+        .returning(|| Ok(vec![101]));
+    let svc = make_account_service();
+    let req = UserUpdateRequest {
+        version: 1,
+        full_name: None,
+        phone: None,
+        password: None,
+        is_active: Some(false),
+    };
+
+    // Act
+    let err = svc
+        .update_user(mock, 101, &req, &current_manager())
+        .await
+        .expect_err("update 停用最后一个管理员应 Err");
+
+    // Assert
+    assert_eq!(
+        err.code(),
+        code::BAD_REQUEST,
+        "护栏拒绝应是 HTTP 400 / 40000（不是 422 的 validation），实得 {err:?}"
+    );
+    assert_eq!(
+        err.http_status(),
+        axum::http::StatusCode::BAD_REQUEST,
+        "护栏拒绝的 HTTP 状态必须是 400，实得 {err:?}"
+    );
+}
+
+/// 非管理员账号置 `is_active=false`：`has_active_admin_grants` 快筛 false ⇒
+/// 不取行锁、不计数，直接写（mock 未注册锁 / 计数 expectation，被调即 panic）。
+#[tokio::test]
+async fn update_user_deactivating_non_admin_skips_lockout_count() {
+    // Arrange — service 调 2 次 get_user_by_id：第 1 次拿原 user，第 2 次拿更新后 user
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let u = sample_user(101, "alice");
+    let u_updated = crate::modules::iam::repo::User {
+        is_active: false,
+        version: 2,
+        ..sample_user(101, "alice")
+    };
+    let mut mock = MockIamRepoTrait::new();
+    let u_clone1 = u.clone();
+    let u_updated_clone = u_updated.clone();
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let cc_clone = call_count.clone();
+    mock.expect_get_user_by_id().returning(move |_| {
+        let n = cc_clone.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            Ok(Some(u_clone1.clone()))
+        } else {
+            Ok(Some(u_updated_clone.clone()))
+        }
+    });
+    mock.expect_has_active_admin_grants()
+        .returning(|_| Ok(false));
+    mock.expect_update_user_partial().returning(|_, _, _| Ok(1));
+    mock.expect_list_user_roles_by_user_id()
+        .returning(|_| Ok(vec![]));
+    let svc = make_account_service();
+    let req = UserUpdateRequest {
+        version: 1,
+        full_name: None,
+        phone: None,
+        password: None,
+        is_active: Some(false),
+    };
+
+    // Act
+    let out = svc
+        .update_user(mock, 101, &req, &current_manager())
+        .await
+        .expect("非管理员置停用应 Ok");
+
+    // Assert
+    assert!(!out.is_active);
+    assert_eq!(out.version, 2);
+}
+
 // ===========================================================================
 // admin_reset_password（3 用例）
 // ===========================================================================
@@ -504,6 +604,9 @@ async fn deactivate_user_happy_path_returns_deactivated_user() {
     let mut mock = MockIamRepoTrait::new();
     mock.expect_get_user_by_id()
         .returning(move |_| Ok(Some(u.clone())));
+    // 2026-10-14：deactivate_user 的 ADMIN 护栏快筛 —— 该用户不是管理员
+    mock.expect_has_active_admin_grants()
+        .returning(|_| Ok(false));
     mock.expect_soft_delete_user().returning(|_, _, _, _| Ok(1));
     mock.expect_list_user_roles_by_user_id()
         .returning(|_| Ok(vec![]));
@@ -527,6 +630,8 @@ async fn deactivate_user_already_inactive_returns_version_conflict() {
     let mut mock = MockIamRepoTrait::new();
     mock.expect_get_user_by_id()
         .returning(move |_| Ok(Some(u.clone())));
+    mock.expect_has_active_admin_grants()
+        .returning(|_| Ok(false));
     mock.expect_soft_delete_user().returning(|_, _, _, _| Ok(0)); // 0 行 → 已并发被改
     let svc = make_account_service();
 
@@ -617,4 +722,43 @@ async fn change_own_password_forbidden_for_other_user() {
         AppError::Biz { code, .. } => assert_eq!(code, code::FORBIDDEN),
         other => panic!("expected Biz FORBIDDEN, got {:?}", other),
     }
+}
+
+/// 2026-10-14：**停用最后一个 active ADMIN 被拒**。
+///
+/// 护栏路径返回 Err ⇒ handler 未 commit ⇒ 也不会踢下线（mockall 对未预期的
+/// `soft_delete_user` 调用会 panic，这就是「绝不触达软删」的断言）。
+#[tokio::test]
+async fn deactivate_last_active_admin_is_rejected() {
+    let u = sample_user(101, "root");
+    let mut mock = MockIamRepoTrait::new();
+    mock.expect_get_user_by_id()
+        .returning(move |_| Ok(Some(u.clone())));
+    // 该账号持有 ADMIN，且只剩它一个 active 管理员
+    mock.expect_has_active_admin_grants()
+        .returning(|_| Ok(true));
+    // 护栏先取 t_role ADMIN 行锁再计数（2026-10-14 并发串行化）
+    mock.expect_lock_admin_role_for_update()
+        .times(1)
+        .returning(|| Ok(()));
+    mock.expect_list_active_admin_user_ids()
+        .times(1)
+        .returning(|| Ok(vec![101]));
+
+    let svc = make_account_service();
+    let err = svc
+        .deactivate_user(mock, 101, 1, &current_manager())
+        .await
+        .expect_err("停用最后一个管理员应 Err");
+
+    assert_eq!(
+        err.code(),
+        code::BAD_REQUEST,
+        "护栏拒绝应是 HTTP 400 / 40000（不是 422 的 validation），实得 {err:?}"
+    );
+    assert_eq!(
+        err.http_status(),
+        axum::http::StatusCode::BAD_REQUEST,
+        "护栏拒绝的 HTTP 状态必须是 400，实得 {err:?}"
+    );
 }

@@ -11,6 +11,10 @@
 //!   8. 非 PENDING part upsert → 20705 BIZ_PROCESS_CHAIN_PART_NOT_PENDING (HTTP 409)
 //!   9. GET /process-chains/{chain_id} 命中 / 未命中（2026-09-16 FK 翻转新增端点）
 //!  10. soft_delete_part 级联：链 + steps 软删、part.process_chain_id 置 NULL（026 翻转）
+//!  11. `process_chain_read_allows_shelf_account` —— 2026-10-15：读端点迁
+//!      `production.view` 后 SA（有意并集）放行（无链 ⇒ 404 / 20701）
+//!  12. `process_chain_read_forbidden_after_grant_revoked` —— 2026-10-15：软删
+//!      CLERK 的 production.view 授权行 + 重登 ⇒ 40300
 //!
 //! ## 串行化
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
@@ -595,4 +599,129 @@ async fn soft_delete_part_cascades_chain() {
     .await;
     assert_eq!(s4, StatusCode::NOT_FOUND, "软删后 by-id 应 404: {env4}");
     assert_eq!(env4["code"], 20701, "BIZ_PROCESS_CHAIN_NOT_FOUND: {env4}");
+}
+
+// ===========================================================================
+//  权限点闸门（2026-10-15 新增）
+// ===========================================================================
+
+/// 现场建一个 SHELF_ACCOUNT 用户（+ 一个 PRODUCTION 货架并绑定 scope），
+/// 供 `production.view` 正向用例登录。fixture 只有 manager / clerk。
+async fn insert_shelf_account_user(pool: &PgPool, username: &str) {
+    use hsh_erp_rust::auth::password;
+    use hsh_erp_rust::infra::clock::now_naive;
+
+    let sf = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
+    let shelf_id = sf.next_id();
+    let user_id = sf.next_id();
+    let role_id = sf.next_id();
+    drop(sf);
+    let now = now_naive();
+
+    sqlx::query(
+        "INSERT INTO t_shelf (id, code, name, zone, is_active, display_order, \
+         version, created_at, updated_at) \
+         VALUES ($1, $2, $2, 'PRODUCTION', true, 0, 0, $3, $3)",
+    )
+    .bind(shelf_id)
+    .bind(format!("FX-PC-{username}"))
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_shelf");
+
+    let hash = password::hash("changeme").expect("bcrypt");
+    sqlx::query(
+        "INSERT INTO t_user (id, username, password_hash, full_name, is_active, \
+         refresh_token_version, version, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, true, 0, 0, $5, $5)",
+    )
+    .bind(user_id)
+    .bind(username.to_lowercase())
+    .bind(hash)
+    .bind(username)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_user");
+
+    sqlx::query(
+        "INSERT INTO t_user_role (id, user_id, role, scope_type, scope_id, version, \
+         created_at, updated_at) \
+         VALUES ($1, $2, 'SHELF_ACCOUNT', 'shelf', $3, 0, $4, $4)",
+    )
+    .bind(role_id)
+    .bind(user_id)
+    .bind(shelf_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_user_role");
+}
+
+/// `GET /prod/process-chains/by-part/{part_id}`：迁 `production.view` 后的正向 ——
+/// SHELF_ACCOUNT 是新集合并入的成员（原 `require_any_read` 为 M,C,I,CNC，**SA 并入
+/// 是有意并集**，用户定稿），应放行。
+///
+/// 放行判据：fixture 的 `part_pending` 无链 ⇒ 404 / 20701（走到 service），
+/// 与 40300 严格区分。
+#[tokio::test]
+async fn process_chain_read_allows_shelf_account() {
+    let pool = test_pool().await;
+    let fx = load_process_chain_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+
+    insert_shelf_account_user(&pool, "fx_pc_shelf").await;
+    let sa = login_token(&app, "fx_pc_shelf", "changeme").await;
+
+    let (s, env) = send(
+        app,
+        json_request(
+            "GET",
+            &format!("/prod/process-chains/by-part/{}", fx.part_pending),
+            None,
+            Some(&sa),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "SA 应放行（无链 ⇒ 404）: {env}");
+    assert_eq!(
+        env["code"], 20701,
+        "应为 BIZ_PROCESS_CHAIN_NOT_FOUND: {env}"
+    );
+}
+
+/// 撤权负向：软删 CLERK 的 `production.view` 授权行 → 重登（新 session 装载新
+/// permissions）→ 40300。
+///
+/// 钉住「`t_role_permission` 是真源、守卫真的读 session 装载的 permissions」——
+/// 只改矩阵数据而不重登不会改变本 token 的行为（permissions 在 session 里）。
+#[tokio::test]
+async fn process_chain_read_forbidden_after_grant_revoked() {
+    let pool = test_pool().await;
+    let fx = load_process_chain_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+    let uri = format!("/prod/process-chains/by-part/{}", fx.part_pending);
+
+    // 前提：CLERK 有 production.view（矩阵）⇒ 放行（无链 ⇒ 404 / 20701）。
+    let clerk = login_token(&app, &fx.clerk_username, ProcessChainFixture::PASSWORD).await;
+    let (s, env) = send(app.clone(), json_request("GET", &uri, None, Some(&clerk))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "撤权前 CLERK 应放行: {env}");
+    assert_eq!(env["code"], 20701);
+
+    // 撤权：软删授权行（与 RBAC 面板 grants 整包替换同语义）。
+    sqlx::query(
+        "UPDATE t_role_permission SET deleted_at = now() \
+         WHERE role_code = 'CLERK' AND permission_code = 'production.view' \
+           AND deleted_at IS NULL",
+    )
+    .execute(&pool)
+    .await
+    .expect("revoke production.view from CLERK");
+
+    // 重登：新 session 装载新 permissions。
+    let clerk2 = login_token(&app, &fx.clerk_username, ProcessChainFixture::PASSWORD).await;
+    let (s, env) = send(app, json_request("GET", &uri, None, Some(&clerk2))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "撤权重登后应 403: {env}");
+    assert_eq!(env["code"], 40300, "应为 FORBIDDEN: {env}");
 }

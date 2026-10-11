@@ -14,13 +14,14 @@
 //!   3. 表头筛选：`drawing_no` / `name` / `system_delivery_date_from|to` /
 //!      `customer_id`（L1 展开）各自命中预期行。
 //!   4. 服务端排序：`sort_by` 白名单 7 值 + `sort_dir` + 非法值退化。
-//!   5. 角色守卫：白名单外的角色 → 403 / 40300 FORBIDDEN（**本文件是该守卫的唯一
-//!      覆盖**，守卫在 `prod::inspection::service::InspectionQueueService::list_queue`
-//!      第一行）。
-//!      brief 原话「Worker role」并不存在，本仓库 5 角色中 ShelfAccount 是唯一合法
-//!      登录、但不在队列读白名单（`prod/inspection/service.rs` 的模块私有常量
-//!      `READ_ROLES` = Manager + Inspector）内的角色；
-//!      `PartFixture::SHELF_ACCOUNT_USERNAME` + SHELF_ACCOUNT role 提供该登录态。
+//!   5. 权限守卫（`inspection.view`）：矩阵外的角色 → 403 / 40300 FORBIDDEN（**本文件
+//!      是该守卫的唯一覆盖**，守卫在
+//!      `prod::inspection::service::InspectionQueueService::list_queue` 第一行）。
+//!      brief 原话「Worker role」并不存在，本仓库 5 角色中不在矩阵（Manager +
+//!      Inspector）内的可登录角色有 Clerk / CncProgrammer / ShelfAccount 三个；
+//!      本文件用 ShelfAccount 模拟越权（`PartFixture::SHELF_ACCOUNT_USERNAME`
+//!      提供该登录态），另两个角色对同一权限点的越权覆盖在
+//!      `tests/production/inspection.rs` 场景 10（扫码端点）。
 //!   6. 分页：`limit + offset` 切分 items，且 `total` 恒等于**过滤后**的实际条数
 //!      （锁住「list / count 共用同一 WHERE 拼装器」这个核心主张）。
 //!
@@ -1040,19 +1041,20 @@ async fn inspection_batches_filters_by_system_delivery_date_range() {
     );
 }
 
-/// 角色守卫：白名单外的角色 → 403 / 40300 FORBIDDEN。
+/// 权限守卫：矩阵外的角色 → 403 / 40300 FORBIDDEN。
 ///
 /// brief 原话「Worker role」并不存在（本仓库 5 角色：Manager / Clerk / Inspector /
-/// CncProgrammer / ShelfAccount）。队列读白名单 = Manager + Inspector，即
-/// `prod/inspection/service.rs` 的模块私有常量 `READ_ROLES`（取值 Manager +
-/// Inspector）；集成测试拿不到该私有项，故此处只描述取值、不做代码级引用。
-/// ShelfAccount 是「能登录但在白名单外」的唯一角色，故用它模拟越权。
-/// 守卫在 service 层第一行（`require_any_role`），**本文件是该守卫的唯一覆盖**。
+/// CncProgrammer / ShelfAccount）。不在 `inspection.view` 矩阵（Manager + Inspector，
+/// `seeds/rbac.sql`）内的可登录角色有 Clerk / CncProgrammer / ShelfAccount 三个；
+/// 本用例用 ShelfAccount 模拟越权（`PartFixture` 提供它的登录态），另两个的越权覆盖
+/// 在 `tests/production/inspection.rs` 场景 10（扫码端点，共用同一权限点）。
+/// 守卫在 service 层第一行（`require_permission("inspection.view")`），
+/// **本文件是该守卫的唯一覆盖**。
 #[tokio::test]
-async fn inspection_batches_role_guard_rejects_shelf_account() {
+async fn inspection_batches_permission_guard_rejects_shelf_account() {
     let (pool, app, token, _fx) = bootstrap_as_shelf_account().await;
 
-    // 造 1 条 INSPECTION 批次：让 list 在权限通过时返回非空，确保拒绝原因确实是角色
+    // 造 1 条 INSPECTION 批次：让 list 在权限通过时返回非空，确保拒绝原因确实是权限
     let (_part_id, _batch_id) = insert_part_with_insp_batch(
         &pool,
         "PART_RG",
@@ -1074,9 +1076,9 @@ async fn inspection_batches_role_guard_rejects_shelf_account() {
     );
     assert_eq!(
         body["code"], 40300,
-        "白名单外角色应得 40300 FORBIDDEN: body={body}"
+        "矩阵外角色应得 40300 FORBIDDEN: body={body}"
     );
-    // message 形态由 require_any_role 决定，含「无权限」
+    // message 形态由 require_permission 决定，含「无权限」
     let msg = body["message"].as_str().expect("message 应为 string");
     assert!(
         msg.contains("无权限") || msg.contains("40300") || msg.contains("forbidden"),

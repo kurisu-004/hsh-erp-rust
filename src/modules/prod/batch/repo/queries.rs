@@ -1,8 +1,9 @@
 //! `t_part_batch` SQL 真源 ZST `PartBatchRepo` + 固有静态方法。
 //!
 //! 2026-10-02 随 `t_part_batch` 归属迁入 prod 域（生产执行单元 = 批次）。
-//! 本文件是 `t_part_batch` 的 **SQL 真源**，16 个 `PartBatchRepo::xxx` 静态方法
-//! （通用 `get_by_id` 已上移 `shared::batch::read`，见下方小节）；
+//! 本文件是 `t_part_batch` 的 **SQL 真源**，15 个 `PartBatchRepo::xxx` 静态方法
+//! （通用 `get_by_id` 已上移 `shared::batch::read`，见下方小节；
+//! 2026-10-15 删一处全仓零调用方的死代码读侧方法，16 → 15）；
 //! 跨域调用方（part / assembly / delivery_note / wx / prod::queue / task）
 //! 走 `PartBatchRepo::xxx(&mut *conn, ...)` 静态调用形态。
 //!
@@ -461,6 +462,40 @@ impl PartBatchRepo {
     /// 被忽略），使 trait 声明里「0 行 → 由 service 转 `VERSION_CONFLICT` 409」
     /// 变成一句谎言、`delivery_note/service/lifecycle.rs` 的 `if affected == 0`
     /// 变成死代码。
+    ///
+    /// ## 2026-10-14：「终态批次不在任何位置」不变式的写点清单（共 **6** 个）
+    ///
+    /// **不变式**（`CLAUDE.md`「状态派生契约」一节 / `docs/api/batch.md` §6.1）：
+    /// 批次进入终态（`CANCELLED` / `COMPLETED` / `DELIVERED`）时 `location` 与
+    /// `current_holder_id` **一并清 NULL**。存量由 append-only migration
+    /// `20261013000002_001_clear_terminal_batch_location` 回补；下表保证**以后不再
+    /// 产生**。两者互补、缺一不可。
+    ///
+    /// | # | 写点 | 目标态 | `clear_location` / `clear_holder_id` |
+    /// |---|---|---|---|
+    /// | 1 | `shared::batch::guards::mark_batch_status_only` | `CANCELLED` | `true`（**只对 `CANCELLED` 特判**） |
+    /// | 2 | `shared::batch::status::apply_bulk_batch_status_change_for_part` | `CANCELLED` / `COMPLETED` | 无条件清（常量 `= NULL`） |
+    /// | 3 | `shared::batch::status::FORCE_COMPLETE_ALL_BATCHES_FOR_ASSEMBLY_SQL` | `COMPLETED` | 无条件清（常量 `= NULL`） |
+    /// | 4 | `prod::batch::repo::sql::mark_batch_delivered` | `DELIVERED` | `true` |
+    /// | 5 | `prod::batch::repo::sql::mark_batch_completed` | `COMPLETED` | `true` |
+    /// | **6** | **本函数（`PartBatchRepo::update`，`delivery_note::pickup`）** | `DELIVERED` | `true`（按目标态驱动，2026-10-14 review 第 2 轮 MAJOR-N1 补上） |
+    ///
+    /// ⚠️ **第 1 个之外不要动 `mark_batch_status_only` 的特判**：它还服务
+    /// `READY_TO_SHIP` / `IN_PROCESS` 两个**非终态**目标，那两处的 `location`
+    /// 是有业务含义的落点（理由见 `shared::batch::guards` 该函数 doc）。
+    ///
+    /// ⚠️ **本轮之前漏的正是第 6 个**：唯一生产调用方
+    /// `com::delivery_note::service::lifecycle::pickup` 只在**内存 struct** 上把
+    /// `b.current_holder_id / b.location` 清了（那是响应 / 后续 `sync` 用的），真正
+    /// 的 DB 写走本函数 ⇒ 落库的行仍是 `location='INSPECTION_SHELF' +
+    /// current_holder_id=<shelf_id>` —— 正是 migration `20261013000002` 判据要清的
+    /// 那一类行。**历史清了、以后继续产生**。回归测试：
+    /// `tests/com/delivery_note/driver.rs::pickup_uses_assigned_driver_and_flips_batches_to_delivered`。
+    ///
+    /// ⚠️ **清单不穷尽于「本文件」** —— 它只覆盖 `t_part_batch.status` 的写入口。
+    /// 新增终态写点时必须在这张表里加一行，否则 `CLAUDE.md` 的不变式 bullet 会
+    /// 让人以为「CANCELLED 那侧已统一处理过」（真实事故：本轮第 6 个就是被这句话
+    /// 掩盖的）。
     #[allow(clippy::too_many_arguments)]
     pub async fn update(
         conn: &mut PgConnection,
@@ -473,6 +508,14 @@ impl PartBatchRepo {
         let updated_by = updated_by.unwrap_or(0);
         // 1) status → shared::batch::status（唯一写入口；0 行 = VERSION_CONFLICT）
         if let Some(target) = status {
+            // 2026-10-14 review 第 2 轮 MAJOR-N1：**「终态清位置」不变式的第 6 个
+            // 写点，此前漏改**（逐个写点的清单见本函数 doc 的末节）。
+            //
+            // 按目标态驱动（不是硬编码 `true`），且把三个批次终态都列全：当前
+            // 唯一可达目标态是 `DELIVERED`，由**调用方 + 状态机**保证。**新增
+            // 终态目标必须同步本 match 与上方 6 点写点清单** —— 漏列会让新终态
+            // 静默不清位置，回到本 PR 要消灭的那类幽灵行。
+            let target_is_terminal = matches!(target, "DELIVERED" | "COMPLETED" | "CANCELLED");
             batch_status::apply_batch_status_change(
                 conn,
                 StatusChange {
@@ -488,11 +531,21 @@ impl PartBatchRepo {
                     // READY_TO_SHIP（service 层逐批守过）。
                     allowed_from: &["READY_TO_SHIP"],
                     updated_by,
-                    clear_location: false,
-                    clear_holder_id: false,
+                    clear_location: target_is_terminal,
+                    clear_holder_id: target_is_terminal,
                     clear_process_id: false,
                     clear_process_step_id: false,
-                    // 目标状态 DELIVERED 不是终态 → 终态归档事件分支不可达（M4）
+                    // `event_id: None` 的真实理由（2026-10-14 review 第 2 轮订正，
+                    // 原文「目标状态 DELIVERED 不是终态」两处都不准，见下）：
+                    // ① **DELIVERED 就是批次终态**（终态清位置不变式与 migration
+                    //    `20261013000002` 的判据都把它算进去）；
+                    // ② 归档分支的闸门不是批次目标态，而是
+                    //    `rollup_part_derived` 的 step 4
+                    //    `part_status_changed && is_terminal(&target.status)` ——
+                    //    `is_terminal` = `COMPLETED | CANCELLED`（part 级终态，
+                    //    见 `status.rs`），而 pickup 把该 part 派生到的是
+                    //    `DELIVERED` ⇒ 归档分支确实不可达，但**理由是 part 的
+                    //    派生态**、不是批次的终态性。
                     event_id: None,
                 },
             )
@@ -1014,6 +1067,29 @@ impl PartBatchRepo {
     /// 工人当前持有批次数（worker-pool used/max 校验）。
     /// 复用 `ix_t_part_batch_holder_location`（Task 1 已建）覆盖
     /// `(current_holder_id, location)` 谓词。
+    ///
+    /// ## 2026-10-14 补 `AND status = 'IN_PROCESS'`（修「容量误报」bug）
+    ///
+    /// **判据的权威定义在 `docs/api/queue.md` §4.3「工人持有判据」**：
+    /// `status = 'IN_PROCESS' AND location = 'WORKER'
+    /// AND current_holder_id = …`。本函数此前**只判后两列**，是校验 SQL 单方面偏离了
+    /// 自己的域契约。
+    ///
+    /// 为什么必须带 status：三个终态状态下共 6 个写点（取消 / 强制完成 / 交付；
+    /// 逐点清单见本文件 `PartBatchRepo::update` 的函数 doc 与
+    /// `docs/api/batch.md` §6.1）此前都不清 `location` + `current_holder_id`，
+    /// 于是被取消的批次仍以 `location='WORKER'` 留在表里 —— 校验算数、队列板看板
+    /// （`board/repo.rs::SQL_HELD_BATCHES_BY_WORKERS`，同样按 `status='IN_PROCESS'`
+    /// 过滤）看不见。这类行永久累积，取消得越多工人越被卡死。
+    ///
+    /// ⚠️ 现在这条判据与看板 `SQL_HELD_BATCHES_BY_WORKERS` 的 WHERE 逐字一致
+    /// （`status = 'IN_PROCESS' AND location = 'WORKER' AND current_holder_id` +
+    /// `deleted_at IS NULL`）。**改一处必须改另一处**，否则「看板显示还能取 N 件、
+    /// 实际取件被拒」这类难查的问题会回来。
+    ///
+    /// ⚠️ 存量脏行的**清理由 migration `20261013000002_001_clear_terminal_batch_location`
+    /// 负责**（只清数据不改判据）；本函数的 status 过滤是判据侧的第一道防线，
+    /// 两者都需要。
     pub async fn count_held_by_worker<'e, E: PgExecutor<'e>>(
         executor: E,
         worker_id: i64,
@@ -1024,6 +1100,7 @@ impl PartBatchRepo {
             FROM t_part_batch
             WHERE current_holder_id = $1
               AND location = 'WORKER'
+              AND status = 'IN_PROCESS'
               AND deleted_at IS NULL
             "#,
             worker_id,
@@ -1031,35 +1108,6 @@ impl PartBatchRepo {
         .fetch_one(executor)
         .await?;
         Ok(n)
-    }
-
-    /// 工人当前持有批次列表（worker-pool state 端点用）。
-    /// 同样命中 `ix_t_part_batch_holder_location`。
-    ///
-    /// 2026-09-16 PR-3 批次 step 化：删 next_process_id / placed_at，加
-    /// current_process_step_id。
-    pub async fn list_held_by_worker<'e, E: PgExecutor<'e>>(
-        executor: E,
-        worker_id: i64,
-    ) -> Result<Vec<TPartBatch>, sqlx::Error> {
-        sqlx::query_as!(
-            TPartBatch,
-            r#"
-            SELECT id, part_id, batch_no, quantity, status, location,
-                   current_holder_id, current_process_id, current_process_step_id,
-                   delivery_note_id, delivery_seq, parent_batch_id,
-                   is_repairing,
-                   version, created_at, created_by, updated_at, updated_by, deleted_at
-            FROM t_part_batch
-            WHERE current_holder_id = $1
-              AND location = 'WORKER'
-              AND deleted_at IS NULL
-            ORDER BY id ASC
-            "#,
-            worker_id,
-        )
-        .fetch_all(executor)
-        .await
     }
 
     /// DELIVERED 状态且 DELIVERED 事件 `created_at` 早于 threshold 的批次 ID 列表。

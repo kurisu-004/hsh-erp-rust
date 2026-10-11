@@ -21,7 +21,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::auth::rbac::{CurrentUser, Role};
+use crate::auth::rbac::CurrentUser;
 use crate::modules::outsource::dto::{
     OutsourceCompanyCreateRequest, OutsourceCompanyListQuery, OutsourceCompanySoftDeleteRequest,
     OutsourceCompanyUpdateRequest,
@@ -201,12 +201,9 @@ impl OutsourceService {
         query: &OutsourceCompanyListQuery,
         current: &CurrentUser,
     ) -> Result<OutsourceCompanyListOut, AppError> {
-        current.require_any_role(&[
-            Role::Manager,
-            Role::Clerk,
-            Role::CncProgrammer,
-            Role::Inspector,
-        ])?;
+        // 2026-10-15：迁权限点 `outsource.view`，自原 `require_any_role` 集合
+        // （M,C,CNC,I）**有意收紧去 CNC**（用户定稿）。
+        current.require_permission("outsource.view")?;
         let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
         let offset = query.offset.unwrap_or(0).max(0);
         let rows = repo
@@ -230,12 +227,9 @@ impl OutsourceService {
         id: i64,
         current: &CurrentUser,
     ) -> Result<OutsourceCompanyWithProcessesOut, AppError> {
-        current.require_any_role(&[
-            Role::Manager,
-            Role::Clerk,
-            Role::CncProgrammer,
-            Role::Inspector,
-        ])?;
+        // 2026-10-15：迁权限点 `outsource.view`，自原 `require_any_role` 集合
+        // （M,C,CNC,I）**有意收紧去 CNC**（用户定稿）。
+        current.require_permission("outsource.view")?;
         let company = repo
             .company_get_by_id(id, false)
             .await?
@@ -252,12 +246,9 @@ impl OutsourceService {
         process_id: i64,
         current: &CurrentUser,
     ) -> Result<Vec<OutsourceCompanyOptionOut>, AppError> {
-        current.require_any_role(&[
-            Role::Manager,
-            Role::Clerk,
-            Role::CncProgrammer,
-            Role::Inspector,
-        ])?;
+        // 2026-10-15：迁权限点 `outsource.view`，自原 `require_any_role` 集合
+        // （M,C,CNC,I）**有意收紧去 CNC**（用户定稿）。
+        current.require_permission("outsource.view")?;
         let ids = repo
             .junction_list_company_ids_by_process(process_id)
             .await?;
@@ -289,7 +280,9 @@ impl OutsourceService {
         req: &OutsourceCompanyCreateRequest,
         current: &CurrentUser,
     ) -> Result<(), AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk])?;
+        // 2026-10-15：迁权限点 `outsource.company.manage`（M,C；矩阵逐格等于原
+        // `require_any_role` 集合）。
+        current.require_permission("outsource.company.manage")?;
         let name = req.name.trim();
         if name.is_empty() {
             return Err(AppError::biz(code::BIZ_INVALID_VALUE, "name 不能为空"));
@@ -356,7 +349,9 @@ impl OutsourceService {
         req: &OutsourceCompanyUpdateRequest,
         current: &CurrentUser,
     ) -> Result<OutsourceCompanyWithProcessesOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk])?;
+        // 2026-10-15：迁权限点 `outsource.company.manage`（M,C；矩阵逐格等于原
+        // `require_any_role` 集合）。
+        current.require_permission("outsource.company.manage")?;
         let company = repo
             .company_get_by_id(id, false)
             .await?
@@ -454,7 +449,9 @@ impl OutsourceService {
         req: &OutsourceCompanySoftDeleteRequest,
         current: &CurrentUser,
     ) -> Result<(), AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk])?;
+        // 2026-10-15：迁权限点 `outsource.company.manage`（M,C；矩阵逐格等于原
+        // `require_any_role` 集合）。
+        current.require_permission("outsource.company.manage")?;
         let company = repo
             .company_get_by_id(id, false)
             .await?

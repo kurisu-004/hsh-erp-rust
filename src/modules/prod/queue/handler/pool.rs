@@ -4,13 +4,21 @@
 //! `handler/board.rs`）。
 //!
 //! ## 端点
-//! - `POST /api/v2/prod/queue/refill` —— Manager 触发 `refill_for_worker`。
-//! - `POST /api/v2/prod/queue/move` —— Manager 通用移动端点（POOL ↔ WORKER +
-//!   WORKER ↔ WORKER 三方向，取代旧 `admin_remove` / `admin_assign`）。commit 后
-//!   广播 `WORKER_POOL_MOVE_DONE`。
+//! - `POST /api/v2/prod/queue/refill` —— 权限点 `queue.allocate`（M,C）触发
+//!   `refill_for_worker`。
+//! - `POST /api/v2/prod/queue/move` —— 权限点 `queue.allocate`（M,C）通用移动端点
+//!   （POOL ↔ WORKER + WORKER ↔ WORKER 三方向，取代旧 `admin_remove` /
+//!   `admin_assign`）。commit 后广播 `WORKER_POOL_MOVE_DONE`。
 //! - `POST /api/v2/prod/queue/auto-allocate` —— 按 `process_id + shelf_id` 范围
-//!   自动为每个匹配 worker 抢批次数 / 累计工时。commit 后广播
+//!   自动为每个匹配 worker 补料到**工种自动上限**（`auto_allocate_limit`，
+//!   未配置兜底 `max_held_batches`）。commit 后广播
 //!   `WORKER_POOL_AUTO_ALLOCATE_DONE`。
+//!
+//! ## 权限（2026-10-15 第二批迁点）
+//! 三个端点统一走权限点 `queue.allocate`（M,C；自原 Manager 独占**有意放宽**，
+//! 用户定稿）。守卫分层：
+//! - `refill`：**handler 层**（worker-scan 同事务复用的 service 入口不能受限）；
+//! - `move` / `auto-allocate`：service 内部（handler 仅分发）。
 //!
 //! ## 事务 + WS 广播
 //! 事务边界在 handler：`state.pool.begin()` → 传 `&mut tx` 给 service → 显式
@@ -26,7 +34,7 @@ use axum::Json;
 use axum::extract::State;
 use serde_json::json;
 
-use crate::auth::rbac::{CurrentUser, Role};
+use crate::auth::rbac::CurrentUser;
 use crate::infra::ws_hub::WsEvent;
 use crate::shared::error::AppError;
 use crate::shared::response::R;
@@ -34,13 +42,37 @@ use crate::state::AppState;
 
 use crate::modules::prod::queue::dto::{AdminRefillRequest, AutoAllocateRequest, MoveRequest};
 use crate::modules::prod::queue::service::queue::QueueService;
+use crate::modules::prod::queue::vo::worker as queue_vo;
 use crate::modules::prod::queue::vo::worker::{AutoAllocateResult, MoveResult, RefillResult};
 
 /// POST /api/v2/prod/queue/refill
 ///
-/// Manager role 守卫。Commit 后：
+/// 权限（2026-10-15）：`queue.allocate`（M,C）—— 自原 `require_role(Manager)`
+/// **有意放宽给 Clerk**（用户定稿）。守卫留在 handler 层：worker-scan 的
+/// 同事务 refill（`prod::scan::service::worker_scan`）直调 service 的
+/// `refill_for_worker_with_work_type`，下沉到 service 会误伤该内部路径。
+///
+/// Commit 后：
 /// - `taken.len() > 0` → 广播 `WORKER_POOL_REFILL_DONE`
-/// - `pool_empty`（没抢到任何一批） → 广播 `WORKER_POOL_EMPTY`
+/// - `stopped_reason == Some("POOL_EMPTY")` → 广播 `WORKER_POOL_EMPTY`
+///
+/// ⚠️ **广播条件只认 `POOL_EMPTY`**：`AUTO_LIMIT_REACHED`（2026-10-15 新增）
+/// 与 `WORKER_FULL`、`MAX_BATCHES_NOT_SET` 都**不广播** `WORKER_POOL_EMPTY`
+/// —— 事件名表达的是「池里没货」，其余成因广播它会把看板归因带偏。
+///
+/// ⚠️ **2026-10-14 有意的协议行为变更：工人满时不再广播。**
+/// 改造前的条件是 `else if r.pool_empty`，而 `pool_empty` 对「池空」与「工人已拿满」
+/// **两种**成因都为 `true`（`take_one_from_pool` 对两者都返 `None`，SQL 层失败形态
+/// 一样）。于是「这个工人已经拿满了 10 件」也会向所有订阅端推一条
+/// `WORKER_POOL_EMPTY` —— 该事件名会误导看板把原因归给「池里没货」，而真实原因
+/// 是「这个工人满了」。现在改读新增的 `stopped_reason`，只在该确为池空时广播。
+///
+/// **已决策：不新增 WS event kind**（用户 2026-10-14 拍板）。代价是「工人满」这条
+/// 状态在 WS 上**完全没有信号** —— 只有直接看 `POST /refill` 的响应体才知道。
+/// 接受这个代价的理由：(a) 「拿满了」本来就是按工人维度的事实，看板每个工人格子
+/// 各自刷新自己的 `current_held`，不需要一条全局广播；(b) 新增 kind 会要求前端
+/// 同步加分支，成本高于收益；(c) 响应体里的 `stopped_reason` 已足够前端在**触发
+/// 这次 refill 的那个视图**里给出即时提示。
 ///
 /// 纯写端点（① 形态）：`pool.begin() → service → commit`。
 pub async fn admin_refill(
@@ -48,14 +80,16 @@ pub async fn admin_refill(
     current: CurrentUser,
     Json(req): Json<AdminRefillRequest>,
 ) -> Result<Json<R<RefillResult>>, AppError> {
-    current.require_role(Role::Manager)?;
+    // 2026-10-15：迁权限点 `queue.allocate`（M,C；自 Manager 独占**有意放宽**，
+    // 用户定稿）。守 handler 不守 service，理由见本 handler doc。
+    current.require_permission("queue.allocate")?;
     let mut tx = state.pool.begin().await?;
     let r = QueueService::refill_for_worker(
         &mut tx,
         &state.snowflake,
         req.worker_id,
-        // 管理员端点**保留**架锚：它是「为某工人在某架上抢料」的显式操作（Manager
-        // only、前端零消费方）。worker-scan 走的是另一条路径，传 `None`（跨架取料）。
+        // 管理员端点**保留**架锚：它是「为某工人在某架上抢料」的显式操作（权限点
+        // `queue.allocate`，Clerk 现可调）。worker-scan 走的是另一条路径，传 `None`（跨架取料）。
         Some(req.shelf_id),
         current.id,
         &current,
@@ -67,13 +101,33 @@ pub async fn admin_refill(
             kind: "WORKER_POOL_REFILL_DONE".into(),
             payload: serde_json::to_value(&r).unwrap_or_default(),
         });
-    } else if r.pool_empty {
+    } else if r.stopped_reason.as_deref() == Some(queue_vo::stopped_reason::POOL_EMPTY) {
         state.ws_hub.broadcast(WsEvent::DashboardEvent {
             kind: "WORKER_POOL_EMPTY".into(),
+            // ⚠️ **改一同步二：`WORKER_POOL_EMPTY` 全仓有两个产出点，两处 payload
+            // 必须逐字同形**（同一个事件名 + 同一组键）：
+            // ① 本处 `prod::queue::handler::pool::admin_refill`
+            //    （`POST /api/v2/prod/queue/refill`）；
+            // ② `prod::scan::handler::transition::worker_scan`
+            //    （`POST /api/v2/prod/scan/worker-scan`，其 refill 在同事务内跑）。
+            // 逐字段对照见 `docs/api/scan.md` §4.2；**改键集合时两边都要改**。
+            //
+            // ⚠️ 2026-10-14 review 第 2 轮 MAJOR-N2：本处此前只有 3 键
+            // （`worker_id` / `shelf_id` / `pool_empty`），**缺 `stopped_reason`** ——
+            // 上一轮只把键加到了 ② 侧，两侧形状分叉而 `docs/api/scan.md` §4.2 末段
+            // 却写着「`stopped_reason` / `pool_empty` / `worker_id` 三个键两边同形」。
+            //
+            // ⚠️ 与 ② 侧**唯一有意不同形**的是 `shelf_id`：worker-scan 的 refill
+            // 跨架取料、无架锚，恒为 `null`；本域保留架锚（权限点 `queue.allocate`，
+            // Clerk 现可调），填请求里的架 id。类型也不同（string vs null）。
             payload: json!({
                 "worker_id": req.worker_id.to_string(),
                 "shelf_id": req.shelf_id.to_string(),
                 "pool_empty": true,
+                // 走这条分支时该字段恒为 `Some("POOL_EMPTY")`（条件即由它推出），
+                // 但**仍然写进 payload**：让消费方能确认这条事件确实来自「池空」，
+                // 与 ② 侧形状一致。类型 `Option<String>` 与 ② 侧逐字相同。
+                "stopped_reason": r.stopped_reason,
             }),
         });
     }
@@ -82,10 +136,14 @@ pub async fn admin_refill(
 
 /// POST /api/v2/prod/queue/auto-allocate
 ///
-/// 按 `process_id + shelf_id` 范围自动为每个匹配 worker 抢批次数 / 累计工时。
+/// 按 `process_id + shelf_id` 范围自动为每个匹配 worker 补料到**工种自动上限**
+/// （`auto_allocate_limit`，未配置兜底 `max_held_batches`；工种未配 max 的
+/// worker 记 `MAX_BATCHES_NOT_SET` 跳过，不中断整批）。
 ///
-/// Manager 角色守卫下沉到 service（`auto_allocate_for_process` 内部 `require_role`）。
-/// Commit 后广播 `WORKER_POOL_AUTO_ALLOCATE_DONE`（payload = `AutoAllocateResult`）。
+/// 权限（2026-10-15）：`queue.allocate` 在 service 内守卫
+/// （`auto_allocate_for_process`；自 Manager 独占**有意放宽**为 M,C，用户定稿）。
+/// Commit 后广播 `WORKER_POOL_AUTO_ALLOCATE_DONE`（payload = `AutoAllocateResult`，
+/// 2026-10-15 起少旧「模式 / 比例」两键）。
 ///
 /// 纯写端点（① 形态）：`pool.begin() → service → commit`。
 pub async fn auto_allocate(
@@ -109,7 +167,8 @@ pub async fn auto_allocate(
 /// 通用移动端点：覆盖 POOL ↔ WORKER + WORKER ↔ WORKER 三方向。
 /// 取代原 `admin_remove`（WORKER→POOL 单边）+ `admin_assign`（POOL→WORKER 单边）。
 ///
-/// Manager 角色守卫下沉到 service（`move_batch` 内部 `require_role`）。
+/// 权限（2026-10-15）：`queue.allocate` 在 service 内守卫（`move_batch`；
+/// 自 Manager 独占**有意放宽**为 M,C，用户定稿）。
 /// Commit 后统一广播 `WORKER_POOL_MOVE_DONE`（payload 含 from/to 让前端推断方向）。
 ///
 /// 纯写端点（① 形态）：`pool.begin() → service → commit`。

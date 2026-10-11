@@ -93,6 +93,23 @@ pub struct CachedUserProfile {
     pub roles: Vec<String>,
     pub shelf_ids: Vec<i64>,
     pub shelf_wildcard: bool,
+    /// 权限码集合（2026-10-14 新增）：登录 / refresh 时按用户**全部**角色 code
+    /// 联查 `t_role_permission` 取回，与 roles / shelf_ids 一样是快照。
+    ///
+    /// ⚠️ **ADMIN 角色不贡献权限码**：ADMIN 是代码级通配（`require_permission`
+    ///   内短路），不写授权行。纯 ADMIN 账号为空 vec，账号兼持其它已授权角色时
+    ///   仍带那些码。
+    ///
+    /// ⚠️ **必填字段，无 `#[serde(default)]`**：线上已存在的 Redis session entry
+    ///   （本字段加入前写入的 JSON）反序列化会失败，那些用户的请求会拿到
+    ///   `50000 INTERNAL` 直到 session 自然过期。部署时必须清空 Redis session
+    ///   DB（`FLUSHDB` 或选择性删 `session:tok:*` / `sessions:user:*`），见
+    ///   `docs/api/iam.md` 的部署顺序一节。
+    ///
+    /// 放在缓存里而不是每请求查库：改 grants 的语义是「提交后踢持有者下线」，
+    /// 靠的就是这份缓存能被一次性作废（`delete_all_user_sessions`），
+    /// 详见 `CurrentUser::permissions` 的 doc。
+    pub permissions: Vec<String>,
 }
 
 /// 从 JWT claims.jwt_id 提取的 UUID v4，即 Redis session key `session:tok:<jti>`

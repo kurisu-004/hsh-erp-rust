@@ -6,12 +6,19 @@
 --   1. App 启动钩子自动跑（见 src/infra/seed.rs）—— 默认开启
 --   2. 手工：psql $DATABASE_URL -v ON_ERROR_STOP=1 -f seeds/menu.sql
 --
+-- 职责范围（2026-10-15 起）：
+--   * 本文件只声明 `t_menu` 菜单目录 —— 部署配置，与前端路由耦合；
+--   * 角色→菜单授权基线（t_role_menu）与已下线菜单的授权清理见
+--     `seeds/rbac.sql`（§4 首次基线 / §5 清理授权残留），本文件不再写
+--     t_role_menu。派生 ID 规则随授权段迁至该文件。
+--   * 应用顺序必须是本文件在前、rbac.sql 在后：rbac.sql §5 的清理依赖
+--     本文件 §3 的菜单软删结果。
+--
 -- 编写约定：
 --   * 所有菜单走 INSERT ... ON CONFLICT (code) DO UPDATE，按 code 幂等
 --   * parent_id 通过子查询按 code 反查，不写死雪花 ID（环境间 ID 可不同）
 --   * t_menu.id 用静态 ID（9000000000xxx 段），便于识别"seed 灌的"行；
 --     已存在的雪花 ID 行 ON CONFLICT 后保留原 ID，只更新其他字段
---   * t_role_menu 同样用静态 ID（9000001000xxx 段）
 --   * 不自动删"未在本文件声明的菜单"——菜单下线必须**显式**列在第 3 节
 --     "soft-delete 区段"（防止误删生产手工加的菜单）
 --
@@ -20,7 +27,6 @@
 --
 -- 域内校验：
 --   * t_menu.code 唯一（uk_t_menu_code WHERE deleted_at IS NULL）
---   * t_role_menu (role, menu_id) 唯一（uk_t_role_menu_role_menu WHERE deleted_at IS NULL）
 -- ============================================================================
 
 BEGIN;
@@ -50,13 +56,19 @@ WHERE deleted_at IS NOT NULL
     -- 2026-10-08 下线 delivery_dispatch：端点已删，故意留在复活清单外
     'inspection_pending', 'repair_receive',
     'workers_list', 'users_list', 'shelves_list',
+    -- 2026-10-14 新增：RBAC 角色面板（auth_group 子菜单，仅 MANAGER）
+    'roles_list',
     'customers_list', 'applicants_list',
     'outsource_companies_list', 'outsource_quotes_list', 'outsource_send_receive_list',
     'process_work_type', 'part_process_chain', 'worker_queue',
     'print_templates_designer',
     -- 2026-09-29 新增：复活待编程（pending_programming）和待品检（inspection_pending）子项，
     -- 它们从顶级/order_group 移到 production_group 下；软删态要复活才能命中 ON CONFLICT。
-    'pending_programming'
+    'pending_programming',
+    -- 2026-10-13 新增：交期汇总邮件（mail_group 顶级 + mail_digest 子菜单）。
+    -- 放进复活清单的理由同上：软删态下不会被 uk_t_menu_code 的 partial 索引命中，
+    -- ON CONFLICT 失效后会直接 INSERT 撞 PK。
+    'mail_group', 'mail_digest'
   );
 
 -- ============================================================================
@@ -78,6 +90,11 @@ INSERT INTO t_menu (
     (9000000000000009, NULL, 'auth_group',           '权限管理',   NULL,                  'Key',            30, true, 0, now(), 0, now(), 0),
     (9000000000000010, NULL, 'outsource_list',       '外协管理',   NULL,                  'Promotion',      35, true, 0, now(), 0, now(), 0),
     (9000000000000011, NULL, 'floor_group',          '车间',       NULL,                  'Tools',          40, true, 0, now(), 0, now(), 0),
+    -- 2026-10-13 新增：交期汇总邮件的一级菜单。sort_order=45 —— 刻意插在
+    -- floor_group(40) 与 settings_root(50) 之间：一级菜单从左到右按 sort_order
+    -- 排，「车间」是生产执行侧入口、「设置」是系统配置侧入口，邮件定时任务属于
+    -- 两者之间的「运维自动化」，放 45 会正好卡在两组之间，两边都不挤。
+    (9000000000000013, NULL, 'mail_group',           '定时任务/邮件', NULL,                'Clock',          45, true, 0, now(), 0, now(), 0),
     (9000000000000012, NULL, 'settings_root',        '设置',       NULL,                  'Setting',        50, true, 0, now(), 0, now(), 0)
 ON CONFLICT (code) WHERE deleted_at IS NULL DO UPDATE SET
     parent_id  = EXCLUDED.parent_id,
@@ -109,6 +126,10 @@ INSERT INTO t_menu (
     -- 搬到 frontend/src/views/production/，路由随之前端搬到 /production/worker-list）。
     (9000000000000202, (SELECT id FROM t_menu WHERE code = 'auth_group'         AND deleted_at IS NULL), 'users_list',                '账号管理',      '/users',                       'List',         20, true, 0, now(), 0, now(), 0),
     (9000000000000203, (SELECT id FROM t_menu WHERE code = 'auth_group'         AND deleted_at IS NULL), 'shelves_list',              '货架管理',      '/shelves',                     'Platform',     30, true, 0, now(), 0, now(), 0),
+    -- 2026-10-14 新增：RBAC 角色面板（角色 / 权限点 / 授权整包，iam::rbac 的 8 条
+    -- 端点）。sort_order=40 接在 shelves_list=30 之后（与前端 dummy 模式侧栏的
+    -- users → shelves → roles 顺序一致）；path 与前端路由 /iam/roles 一致。
+    (9000000000000204, (SELECT id FROM t_menu WHERE code = 'auth_group'         AND deleted_at IS NULL), 'roles_list',                '角色权限',      '/iam/roles',                   'Lock',         40, true, 0, now(), 0, now(), 0),
 
     -- customer_management 下
     (9000000000000401, (SELECT id FROM t_menu WHERE code = 'customer_management' AND deleted_at IS NULL), 'customers_list',         '客户一览',      '/customers',                   'Connection',   10, true, 0, now(), 0, now(), 0),
@@ -129,11 +150,15 @@ INSERT INTO t_menu (
     (9000000000000603, (SELECT id FROM t_menu WHERE code = 'production_group'  AND deleted_at IS NULL), 'worker_queue',              '生产队列',      '/production/worker-queue',    'Operation',    20, true, 0, now(), 0, now(), 0),
     -- 2026-10-04 新增（自 auth_group 迁入）：工人档案管理，路由随前端视图搬到
     -- /production/worker-list；sort_order=25（插在 worker_queue=20 与 inspection_pending=30 之间）。
-    -- 换父分组不改授权：t_role_menu 仍是扁平 code 列表，workers_list 仅 MANAGER 持有。
+    -- 换父分组不改授权：授权基线仍是扁平 code 列表（见 seeds/rbac.sql §4），workers_list 仅 MANAGER 持有。
     (9000000000000201, (SELECT id FROM t_menu WHERE code = 'production_group'  AND deleted_at IS NULL), 'workers_list',              '工人一览',      '/production/worker-list',     'User',         25, true, 0, now(), 0, now(), 0),
     -- 2026-09-29 新增：待品检（inspection_pending）从 order_group 移到 production_group；
     -- 原 id（9000000000000105）保留；sort_order 从 50 改为 30（在 worker_queue 之后）。
     (9000000000000105, (SELECT id FROM t_menu WHERE code = 'production_group'  AND deleted_at IS NULL), 'inspection_pending',        '待品检',        '/inspection/pending',          'CircleCheck',  30, true, 0, now(), 0, now(), 0),
+
+    -- 2026-10-13 新增：mail_group 下。交期汇总邮件（域 mail_digest，6 端点
+    -- 全部 MANAGER 独占）。path 与前端视图名一致（/mail/digest）。
+    (9000000000000901, (SELECT id FROM t_menu WHERE code = 'mail_group'       AND deleted_at IS NULL), 'mail_digest',               '交期汇总邮件',  '/mail/digest',                 'Message',     10, true, 0, now(), 0, now(), 0),
 
     -- template_management 下（023）
     (9000000000000701, (SELECT id FROM t_menu WHERE code = 'template_management' AND deleted_at IS NULL), 'print_templates_designer','模板编辑',     '/print-templates',             'Document',     10, true, 0, now(), 0, now(), 0)
@@ -187,166 +212,16 @@ WHERE code = 'assemblies_list' AND deleted_at IS NULL AND is_active = true;
 --     两条端点删掉了，前端目标页 /delivery-dispatch 仍在（删页属前端仓范围）⇒ 不下线
 --     的话是「菜单能点进去、页面能打开、每个请求都 404」的活条目。
 --     走「seed 不再声明 + 显式软删」而不是硬删：t_menu.code 的唯一索引是
---     uk_t_menu_code WHERE deleted_at IS NULL，硬删会与 4.6 段 `m.deleted_at IS NOT
---     NULL` 的 role_menu 回收、以及本文件 §0 的复活机制三方打架。
---     配套：§0 复活清单已移除该 code、§4.1 / §4.3 白名单已移除、4.6 段负责回收存量
---     role_menu 行。
+--     uk_t_menu_code WHERE deleted_at IS NULL，硬删会与本文件 §0 的复活机制、
+--     以及 seeds/rbac.sql §5 的授权清理（按 m.deleted_at IS NOT NULL 回收残留）
+--     三方打架。
+--     配套：§0 复活清单已移除该 code；授权基线（seeds/rbac.sql §4）不再声明它，
+--     其存量授权残留由 rbac.sql §5 清理。
 UPDATE t_menu
 SET deleted_at = now(),
     is_active  = false,
     updated_at = now(),
     version    = version + 1
 WHERE code = 'delivery_dispatch' AND deleted_at IS NULL;
-
--- ============================================================================
--- 第 4 节：角色授权（t_role_menu）
--- ============================================================================
--- 注：assemblies_list 虽是 is_active=false 但仍挂在 CLERK/INSPECTOR/MANAGER 的
--- 授权表里（保留 prod 现状，未来如重新启用不必再补 role_menu）。
-
--- 4.1 MANAGER：除「扫码台」（HMI 专用）外几乎全权
-INSERT INTO t_role_menu (id, role, menu_id, version, created_at, created_by, updated_at, updated_by)
-SELECT
-    9000000001000001 + row_number() OVER (),
-    'MANAGER',
-    m.id,
-    0, now(), 0, now(), 0
-FROM t_menu m
-WHERE m.code IN (
-    'home', 'production_stats',
-    'customer_management', 'customers_list', 'applicants_list',
-    'order_group', 'parts_list', 'parts_new', 'delivery_notes_manage',
-    'inspection_pending', 'repair_receive',
-    'assemblies_list',
-    'pending_programming',
-    'production_group', 'process_work_type', 'part_process_chain', 'worker_queue',
-    'template_management', 'print_templates_designer',
-    'auth_group', 'workers_list', 'users_list', 'shelves_list',
-    'outsource_list', 'outsource_companies_list', 'outsource_quotes_list', 'outsource_send_receive_list',
-    'floor_group', 'settings_root'
-)
-AND m.deleted_at IS NULL
-ON CONFLICT (role, menu_id) WHERE deleted_at IS NULL DO NOTHING;
-
--- 4.2 CLERK：业务操作员（无 auth_group 域、无 template_management）
-INSERT INTO t_role_menu (id, role, menu_id, version, created_at, created_by, updated_at, updated_by)
-SELECT
-    9000000001001001 + row_number() OVER (),
-    'CLERK',
-    m.id,
-    0, now(), 0, now(), 0
-FROM t_menu m
-WHERE m.code IN (
-    'home',
-    'customer_management', 'customers_list', 'applicants_list',
-    'order_group', 'parts_list', 'parts_new', 'delivery_notes_manage',
-    'assemblies_list',
-    -- 2026-10-05 权限收紧：CLERK 收回 process_work_type / part_process_chain
-    -- （配置型菜单，改为 MANAGER 专有），保留 production_group（worker_queue 需要）与
-    -- worker_queue 本身。已存在的授权行由 4.7 段显式软删回收，本段只管增量。
-    'production_group', 'worker_queue',
-    'outsource_list', 'outsource_companies_list', 'outsource_quotes_list', 'outsource_send_receive_list',
-    'repair_receive'
-)
-AND m.deleted_at IS NULL
-ON CONFLICT (role, menu_id) WHERE deleted_at IS NULL DO NOTHING;
-
--- 4.3 INSPECTOR：品检员（无 order_group、auth_group、template_management，但保留外协收发）
-INSERT INTO t_role_menu (id, role, menu_id, version, created_at, created_by, updated_at, updated_by)
-SELECT
-    9000000001002001 + row_number() OVER (),
-    'INSPECTOR',
-    m.id,
-    0, now(), 0, now(), 0
-FROM t_menu m
-WHERE m.code IN (
-    'home',
-    'parts_list', 'delivery_notes_manage',
-    'assemblies_list',
-    -- 2026-10-05 权限收紧：INSPECTOR 收回 production_group 下的 3 个子菜单
-    -- （process_work_type / part_process_chain / worker_queue）——前两个是生产管理
-    -- **配置型**菜单，worker_queue（生产执行看板）不是配置型，一并收回是因为品检
-    -- 不参与生产执行。品检不应看到生产管理的这些入口。
-    -- production_group 本身**必须保留**——其子菜单 inspection_pending（待品检）要挂上去，
-    -- 丢了会变孤儿节点被 build_menu_tree 提升为顶级。
-    'production_group',
-    'outsource_send_receive_list',
-    'inspection_pending', 'repair_receive'
-)
-AND m.deleted_at IS NULL
-ON CONFLICT (role, menu_id) WHERE deleted_at IS NULL DO NOTHING;
-
--- 4.4 CNC_PROGRAMMER：编程员（仅首页 + 零件 + 待编程）
-INSERT INTO t_role_menu (id, role, menu_id, version, created_at, created_by, updated_at, updated_by)
-SELECT
-    9000000001003001 + row_number() OVER (),
-    'CNC_PROGRAMMER',
-    m.id,
-    0, now(), 0, now(), 0
-FROM t_menu m
-WHERE m.code IN ('home', 'parts_list', 'pending_programming')
-  AND m.deleted_at IS NULL
-ON CONFLICT (role, menu_id) WHERE deleted_at IS NULL DO NOTHING;
-
--- 4.5 SHELF_ACCOUNT：HMI 一体机扫码台
-INSERT INTO t_role_menu (id, role, menu_id, version, created_at, created_by, updated_at, updated_by)
-SELECT
-    9000000001004001 + row_number() OVER (),
-    'SHELF_ACCOUNT',
-    m.id,
-    0, now(), 0, now(), 0
-FROM t_menu m
-WHERE m.code IN ('home', 'scan_badge', 'floor_group')
-  AND m.deleted_at IS NULL
-ON CONFLICT (role, menu_id) WHERE deleted_at IS NULL DO NOTHING;
-
--- 4.6 清理：seed 删的菜单（settings_root + 3 子菜单 + assemblies_new + 2026-10-08
---     下线的 delivery_dispatch 等）相关 role_menu 一并清
---     （即便菜单软删，role_menu 残留不影响功能，但显式清理便于审计）
-DELETE FROM t_role_menu rm
-USING t_menu m
-WHERE rm.menu_id = m.id
-  AND m.code IN ('settings_root', 'work_types_list', 'processes_list', 'work_type_processes_list',
-                 'delivery_dispatch')
-  AND m.deleted_at IS NOT NULL;
-
--- ============================================================================
--- 4.7 角色授权回收（2026-10-05 权限收紧：工序工种 / 制定工序改 MANAGER 专有、
---     生产队列改 MANAGER + CLERK，品检三项全收回）
--- ============================================================================
--- ⚠️ 第 4 节的授权是**纯增量**（ON CONFLICT ... DO NOTHING），从白名单里删 code
---    **不会**回收生产库已存在的 t_role_menu 行。收紧权限必须在本节显式列出来。
---    与第 3 节 t_menu soft-delete 同一哲学：变更显式化，不做「白名单之外一律删」。
---
--- 本次收紧（用户需求：工序工种/制定工序 → MANAGER；生产队列 → MANAGER+CLERK；
--- 品检三个都看不到）——覆盖两个角色，不止品检：
---   CLERK     − process_work_type、part_process_chain（CLERK 保留 worker_queue）
---   INSPECTOR − process_work_type、part_process_chain、worker_queue
---   INSPECTOR 仍保留 production_group（其 inspection_pending 子菜单需要）
---
--- 软删而非硬删：留审计，与 t_menu 一致；`AND rm.deleted_at IS NULL` 保证重跑
--- 幂等、不每次启动都 bump version。
--- ⚠️ `version = rm.version + 1` 必须带表名限定：本 UPDATE 带 `FROM t_menu m`，而
---    两张表都有 version 列，不限定会被 PG 判为 ambiguous 直接报错。
---
--- 2026-10-05（review 第 1 轮 NIT-2）：本段**刻意不加** `AND m.deleted_at IS NULL`
---    （4.1-4.5 各段都有，与此处不对称）。原因：① 菜单若已软删，其授权行留着也无害——
---    渲染层 SQL 已按 `m.deleted_at IS NULL` 过滤，且第 4.6 段会硬删 settings_root 等
---    特定 code 的 role_menu 行；② 回收段求的是「最大化覆盖」，宁可多软删一条不可见
---    的授权，也不依赖「菜单永远不会被软删」这个上游不变式。
-UPDATE t_role_menu rm
-SET deleted_at = now(),
-    updated_at = now(),
-    version    = rm.version + 1
-FROM t_menu m
-WHERE rm.menu_id = m.id
-  AND rm.deleted_at IS NULL
-  AND (rm.role, m.code) IN (
-      ('CLERK',     'process_work_type'),
-      ('CLERK',     'part_process_chain'),
-      ('INSPECTOR', 'process_work_type'),
-      ('INSPECTOR', 'part_process_chain'),
-      ('INSPECTOR', 'worker_queue')
-  );
 
 COMMIT;

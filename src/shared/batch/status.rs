@@ -570,6 +570,35 @@ pub(crate) async fn rollup_assembly_derived(
 /// `is_repairing`：2026-10-01 review 第 1 轮 m10 —— 批量推入终态时**必须**同时
 /// 清返修标记，否则会留下 `status='CANCELLED'/'COMPLETED' AND is_repairing=true`
 /// 的自相矛盾行（终态批次不可能还在返修）。
+///
+/// ## 2026-10-14：UPDATE 追加 `location = NULL, current_holder_id = NULL`
+///
+/// **不变式**：批次进入终态时不在任何位置、也不在任何人手上。
+///
+/// 本函数的两个 caller **都是把批次推进终态**（part 级批量取消 → `CANCELLED`；
+/// part 级强推完成 → `COMPLETED`），而它们此前只改 `status` / `is_repairing`，
+/// 位置列原样留着 ⇒ 被取消 / 被强推完成的批次仍以
+/// `location='WORKER' + current_holder_id=<某工人>`（或 `INSPECTION_SHELF + shelf_id`）
+/// 的形态占在表里，形成「幽灵行」：
+///
+/// - 队列板看板按 `status='IN_PROCESS'` 过滤，**看不见**它们；
+/// - 容量校验（`prod::batch::repo::queries::count_held_by_worker`、
+///   `prod::queue::repo::sql` 的 `held` CTE，2026-10-14 起同样带 status 过滤）
+///   也**不算**它们。
+///
+/// ⇒ 工人手上的额度被幽灵批次吃掉，且这种行**永久累积**（无任何清理路径），
+/// 取消得越多工人越被卡死。
+///
+/// ⚠️ **为什么这里可以无条件清，而 `shared::batch::guards::mark_batch_status_only`
+/// 只对 `CANCELLED` 特判**：本入口**只有终态目标**（两个 caller 传的都是
+/// `CANCELLED` / `COMPLETED`，无第三个调用方），故「进终态」与「清位置」等价。
+/// 单行入口 `mark_batch_status_only` 还服务 `READY_TO_SHIP` / `IN_PROCESS`
+/// 两个非终态目标（品检待发运的物理落点 / 返修重入的落点），那里必须保留
+/// location —— 特判的理由与因果链见该函数 doc。
+///
+/// ⚠️ 本 UPDATE 不带 OCC（bulk 模式既有设计，走 `excluded_statuses` 反向白名单），
+/// 加两列常量赋值不影响其并发语义：`location` / `current_holder_id` 不参与
+/// 本函数的任何判据或返回值。
 pub async fn apply_bulk_batch_status_change_for_part(
     conn: &mut PgConnection,
     ch: BulkStatusChange<'_>,
@@ -579,6 +608,11 @@ pub async fn apply_bulk_batch_status_change_for_part(
         UPDATE t_part_batch
            SET status       = $2::varchar,
                is_repairing = COALESCE($5::boolean, is_repairing),
+               -- 2026-10-14：终态批次不在任何位置、也不在任何人手上（理由见
+               -- 本函数 doc）。存量脏行由 migration
+               -- `20261013000002_001_clear_terminal_batch_location` 回补。
+               location     = NULL,
+               current_holder_id = NULL,
                version      = version + 1,
                updated_at   = now(),
                updated_by   = $3::bigint
@@ -668,10 +702,23 @@ pub async fn apply_bulk_batch_status_change_for_part(
 /// [`FORCE_COMPLETE_ALL_BATCHES_FOR_ASSEMBLY_BIND_COUNT`] 与
 /// `bind_guard_tests::force_complete_placeholders_are_contiguous` 同时钉住
 /// （本条 SQL 的最大占位符号必须等于 bind 个数，且 `1..=N` 无跳号）。
+///
+/// ## 2026-10-14：追加 `location = NULL, current_holder_id = NULL`
+///
+/// 同 [`apply_bulk_batch_status_change_for_part`]：本 SQL 只把批次强推成终态
+/// `COMPLETED`，此前不清位置列 ⇒ 工人名下 / 货架上的终态批次成为幽灵行，
+/// 队列板看不见却占着工人额度（详见该函数 doc 的不变式与因果链）。
+/// 本入口目标态恒为 `COMPLETED`（终态），故**无条件**清是正确的。
+///
+/// ⚠️ 占位符个数不变（仍是 4）—— 新增两列是常量 `NULL` 赋值，不引入 bind。
 const FORCE_COMPLETE_ALL_BATCHES_FOR_ASSEMBLY_SQL: &str = r#"
         UPDATE t_part_batch
            SET status       = $2::varchar,
                is_repairing = false,
+               -- 2026-10-14：终态批次不在任何位置、也不在任何人手上（理由见
+               -- `apply_bulk_batch_status_change_for_part` 的 doc）
+               location     = NULL,
+               current_holder_id = NULL,
                version      = version + 1,
                updated_at   = now(),
                updated_by   = $3::bigint

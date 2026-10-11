@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT m.code\n            FROM t_role_menu rm\n            JOIN t_menu m ON m.id = rm.menu_id\n            WHERE rm.role = $1\n              AND rm.deleted_at IS NULL\n              AND m.is_active = TRUE\n              AND m.deleted_at IS NULL\n            ORDER BY m.code\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "code",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_menu",
+            "name": "code"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "a6c37c34119673ec3e46a6a8822d0f165e0fcc0528d51aa5186812a8466f4d9c"
+}

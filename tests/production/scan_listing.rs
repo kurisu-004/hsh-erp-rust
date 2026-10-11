@@ -1645,3 +1645,172 @@ async fn old_scan_paths_are_gone() {
         );
     }
 }
+
+// ===========================================================================
+//  2026-10-14：`/held` 容量字段（`HeldListOut`）
+// ===========================================================================
+//
+// 报工台取件页此前**拿不到**「这个工人还能不能再取件」，只能在提交后吃一个
+// `20204`（工种容量触顶）。2026-10-14 起 `/held` 出参由 `ScanListOut` 改为
+// `HeldListOut` = 原 4 个分页字段**逐字相同、顺序不变** + `current_held` /
+// `max_held_batches` 两个**裸 number**（前端契约变更）。
+//
+// 本节钉三件事：
+// 1. `current_held == total`（两者是同一次 COUNT 的同一个值）；
+// 2. `max_held_batches` 取自 `t_work_type`，取值正确；
+// 3. 工种上限为 NULL ⇒ 返 **0**（不是 `null`）—— 发 `null` 有让前端渲染成
+//    「不限」的风险，而 NULL 的真实语义是「未配置 ⇒ 该工种不可取件」。
+
+/// G4-1：`current_held == total` 且 `max_held_batches` 取自工种。
+#[tokio::test]
+async fn held_exposes_capacity_fields() {
+    let (pool, app, token, fx) = bootstrap().await;
+    let worker_id = insert_active_worker(&pool, fx.work_type_a_id, "WK-CAP").await;
+    for i in 0..3 {
+        let part_id = insert_part(
+            &pool,
+            fx.part_customer_l1_id,
+            "容量用例件",
+            "D-CAP",
+            Some(&format!("CAP-{i:03}")),
+        )
+        .await;
+        insert_worker_held_batch(&pool, part_id, worker_id, 1).await;
+    }
+
+    // FX-WTA 的 max_held_batches：共享 fixture 自 2026-10-14 起为 10
+    // （此前是 NULL，而 NULL 的语义是「未配置」）。
+    let expected_max: i32 =
+        sqlx::query_scalar("SELECT max_held_batches FROM t_work_type WHERE id = $1")
+            .bind(fx.work_type_a_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read work_type.max_held_batches");
+    assert_eq!(expected_max, 10, "共享 fixture 的 FX-WTA 应配上限 10");
+
+    let uri = format!("{HELD_URI_PREFIX}?worker_id={worker_id}");
+    let (status, env) = send(
+        app.clone(),
+        json_request("GET", &uri, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {env}");
+    assert_eq!(env["code"], 0, "{uri}: {env}");
+
+    assert_eq!(
+        env["data"]["current_held"], 3,
+        "current_held 应为持有的 IN_PROCESS+WORKER 批次数: {env}"
+    );
+    assert_eq!(
+        env["data"]["total"], 3,
+        "current_held 与 total 是同一次 COUNT 的同一个值: {env}"
+    );
+    assert_eq!(
+        env["data"]["max_held_batches"], 10,
+        "max_held_batches 应取自 t_work_type: {env}"
+    );
+    // ⚠️ 两个计数都是**裸 number**（本仓约定：只有雪花 id 才转 string）
+    assert!(
+        env["data"]["current_held"].is_number(),
+        "current_held 应是 JSON number: {env}"
+    );
+    assert!(
+        env["data"]["max_held_batches"].is_number(),
+        "max_held_batches 应是 JSON number: {env}"
+    );
+    // 前 4 个字段逐字不变（前端读 items / total / limit / offset 的代码不受影响）
+    for key in ["items", "total", "limit", "offset"] {
+        assert!(
+            env["data"]
+                .as_object()
+                .expect("data 是 object")
+                .contains_key(key),
+            "HeldListOut 必须保留分页字段 {key}: {env}"
+        );
+    }
+}
+
+/// G4-2：工种 `max_held_batches = NULL` → `max_held_batches` 返 **0**（不是 null）。
+///
+/// 与队列板 `prod::queue::board::service.rs` 的 `w.max_held.unwrap_or(0)` 同一个约定。
+#[tokio::test]
+async fn held_reports_zero_when_work_type_has_no_max() {
+    let (pool, app, token, fx) = bootstrap().await;
+    // 自建一个未配上限的工种（共享 fixture 自 2026-10-14 起配了 10）
+    let wt_id = {
+        use hsh_erp_rust::infra::clock::now_naive;
+        let id = pool_snowflake()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .next_id();
+        let now = now_naive();
+        sqlx::query(
+            "INSERT INTO t_work_type (id, code, name, sort_order, max_held_batches, version, \
+             created_at, updated_at) VALUES ($1, 'SCAN-NO-MAX', 'SCAN 未配上限', 0, NULL, 0, $2, $2)",
+        )
+        .bind(id)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert t_work_type（未配上限）");
+        id
+    };
+    let worker_id = insert_active_worker(&pool, wt_id, "WK-NO-MAX").await;
+    // 真的放一批在工人手上，验证 current_held 与 max 是**独立**的两条查询
+    let part_id = insert_part(
+        &pool,
+        fx.part_customer_l1_id,
+        "未配上限工种的持有件",
+        "D-NOMAX",
+        Some("NOMAX-001"),
+    )
+    .await;
+    insert_worker_held_batch(&pool, part_id, worker_id, 4).await;
+
+    let uri = format!("{HELD_URI_PREFIX}?worker_id={worker_id}");
+    let (status, env) = send(
+        app.clone(),
+        json_request("GET", &uri, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {env}");
+    assert_eq!(
+        env["data"]["current_held"], 1,
+        "持有 1 批（即便上限为 0，已持有的行照样列出来）: {env}"
+    );
+    assert_eq!(
+        env["data"]["max_held_batches"], 0,
+        "工种未配上限应返 0 而不是 null（发 null 有让前端渲染成「不限」的风险）: {env}"
+    );
+    assert!(
+        env["data"]["max_held_batches"].is_number(),
+        "必须是 number 不是 null: {env}"
+    );
+}
+
+/// G4-3：`/pickable` **不**携带容量字段。
+///
+/// `/pickable` 按 `work_type_id` 作用域，它**根本不知道是哪个工人**，容量字段对它
+/// 结构性无意义。新增两个字段只加在 `/held` 上 —— 用例钉住「别顺手也加到 pickable」。
+#[tokio::test]
+async fn pickable_does_not_carry_capacity_fields() {
+    let (pool, app, token, fx) = bootstrap().await;
+    let part_id = insert_part(
+        &pool,
+        fx.part_customer_l1_id,
+        "取件用例件",
+        "D-PICK",
+        Some("PICK-001"),
+    )
+    .await;
+    insert_pickable_batch(&pool, part_id, PRODUCTION_SHELF_ID, fx.process_a_id, 2).await;
+
+    let env = get_pickable(&app, &token, fx.work_type_a_id).await;
+    let keys = env["data"].as_object().expect("data 是 object");
+    for key in ["current_held", "max_held_batches", "stopped_reason"] {
+        assert!(
+            !keys.contains_key(key),
+            "/pickable 不应携带 {key}（它按工种作用域，不知道给谁取件）: {env}"
+        );
+    }
+}

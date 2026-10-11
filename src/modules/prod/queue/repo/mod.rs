@@ -1,7 +1,7 @@
 //! queue 域 repo 层（SQL 真源 + 胖 trait + PG 实现）
 //!
 //! ## 结构（2026-09-22 D-2 重构对齐 iam / shelf / customer / worker 范本）
-//! - `sql.rs`：原 `repo.rs` 全文搬迁，4 个 pub 固有静态方法 + sqlx `query!` 宏，
+//! - `sql.rs`：原 `repo.rs` 全文搬迁，3 个 pub 固有静态方法 + sqlx `query!` 宏，
 //!   **内容零 diff**（`.sqlx/query-*.json` 哈希不变）。
 //! - `mod.rs`（本文件）：对外暴露胖 trait `QueueRepoTrait`（本域 3 方法 + 跨域
 //!   helper），并直接 `impl QueueRepoTrait for &mut PgConnection`
@@ -16,16 +16,18 @@
 //! 命名 `*Trait` 后缀——未来跨模块调用方零修改成本（trait 改名比 ZST 改名风险低）。
 //!
 //! - `prod::queue::repo::QueueRepo` —— ZST struct（在 `sql.rs` 内，通过
-//!   `pub use sql::QueueRepo;` 重新导出至本模块），保留 4 个 pub 静态方法签名
+//!   `pub use sql::QueueRepo;` 重新导出至本模块），保留 3 个 pub 静态方法签名
 //!   不变（任何未来 cross-module 调用方零修改）。
 //! - `prod::queue::repo::QueueRepoTrait` —— 本文件新加的胖 trait
-//!   （18 方法 = 本域 4 + 跨域 helper 14），queue 域内部 service 用
-//!   `<R: QueueRepoTrait>` 收。跨域 helper 的实时清单见下方「跨域 helper 清单」。
+//!   （**16 方法 = 本域 3 + 跨域 helper 13**，2026-10-15 实测重算；换算依据
+//!   = `rg -c 'async fn'` ÷ 2（trait 声明 + impl 各一份）），queue 域内部
+//!   service 用 `<R: QueueRepoTrait>` 收。跨域 helper 的实时清单见下方
+//!   「跨域 helper 清单」。
 //!
 //! ## 为什么是胖 trait（含本域 + 跨域 helper）
 //! queue 是跨域核心（CLAUDE.md §「part 是跨域枢纽」的兄弟节点）——同 service
-//! 方法（`refill_for_worker_with_work_type` / `compute_state` / `admin_remove_held_batch` /
-//! `auto_allocate_for_process` / `assign_batch_to_worker`）需交替访问
+//! 方法（`refill_for_worker_with_work_type` / `move_batch` /
+//! `auto_allocate_for_process`）需交替访问
 //! t_queue（本域）+ t_worker + t_work_type + t_process + t_process_chain_step +
 //! t_part_batch + t_part 共 7 表。
 //!
@@ -33,21 +35,17 @@
 //! helper 方法，trait impl 一行委托到对应 ZST 静态方法（已重构域）或原 ZST 静态方法
 //! （part 域，D-6 未做）。
 //!
-//! ## 跨域 helper 清单（11）
-//! - worker (3)：`worker_get_by_id` / `worker_list_active_by_process_id` /
-//!   `worker_list_with_filters_for_seed`
-//!   （实际只前 2 个被 service 调用；第 3 个预留 forward-compat）
-//! - work_type (4)：`work_type_get_by_id` / `work_type_list_process_ids` /
-//!   `work_type_list_work_types_by_process_id` / `work_type_get_max_held_minutes`
+//! ## 跨域 helper 清单（13，2026-10-15 实测重算）
+//! - worker (2)：`worker_get_by_id` / `worker_list_active_by_process_id`
+//! - work_type (3)：`work_type_get_by_id` / `work_type_list_process_ids` /
+//!   `work_type_list_work_types_by_process_id`
+//!   （2026-10-15 删一个随 auto-allocate TIME 模式下线的 helper，4 → 3）
 //! - process (1)：`process_get_by_id`
 //! - process_chain (1)：`process_chain_resolve_step_id_by_process`
 //! - part_batch (2)：`part_batch_count_held_by_worker` / `part_batch_get_by_id`
 //! - part (3)：`part_get_by_id` / `part_find_inprocess_batch_by_id_and_holder` /
 //!   `part_mark_batch_returned`
 //! - part_event (1)：`part_insert_part_event`（委托 `shared::part_event::insert`）
-//! - inline SQL helper (1)：`count_pool_by_shelf_and_process`（service 中
-//!   `compute_state` 内的 `sqlx::query_scalar!` 块下沉到本 trait；2026-09-30 起
-//!   按 `t_part_batch.current_process_id` 普通过滤，已无 t_process_chain_step JOIN）
 //!
 //! 2026-10-08 删掉 3 个全仓零调用方：`process_chain_step_get_process_id`
 //! （`move_batch` 早已改直读 `batch.current_process_id`）/
@@ -93,14 +91,17 @@ use crate::modules::prod::queue::vo::worker::TakenItem;
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait QueueRepoTrait: Send {
-    // ── t_queue 域（本域 4 方法）──
+    // ── t_queue 域（本域 3 方法）──
     /// 2026-10-10：`shelf_id` 改 `Option<i64>`，`None` = 跨全部货架取料
     /// （worker-scan 路径不再有架锚；负载均衡在放回时的 `pick_least_loaded` 一侧）。
+    /// 2026-10-15：`cap` 由 service 传入（工种自动补料上限兜底
+    /// `max_held_batches`），SQL 不再自己查 `t_work_type`。
     async fn take_one_from_pool(
         &mut self,
         worker_id: i64,
         shelf_id: Option<i64>,
         process_ids: &[i64],
+        cap: i32,
         operator_user_id: i64,
     ) -> Result<Option<TakenItem>, sqlx::Error>;
 
@@ -160,16 +161,14 @@ pub trait QueueRepoTrait: Send {
 
     /// 列工序映射工种列表（`WorkTypeRepo::list_work_types_by_process_id`）。
     /// 保留 `Result<_, AppError>` 返回类型，与原 `repo.rs` 签名一致。
+    ///
+    /// 2026-10-15：元组末位新增 `auto_allocate_limit`（自动补料上限），4 元组 →
+    /// 5 元组（与 `WorkTypeRepo` 的签名同步）。
     #[allow(clippy::type_complexity)]
     async fn work_type_list_work_types_by_process_id(
         &mut self,
         process_id: i64,
-    ) -> Result<Vec<(i64, String, String, Option<i32>)>, crate::shared::error::AppError>;
-
-    /// 单条查 work_type 的 max_held_minutes（auto-allocate TIME 模式用）。
-    /// 原 `service.rs:509` 的 `sqlx::query_as` 内联 SQL 下沉。
-    async fn work_type_get_max_held_minutes(&mut self, id: i64)
-    -> Result<Option<i32>, sqlx::Error>;
+    ) -> Result<Vec<(i64, String, String, Option<i32>, Option<i32>)>, crate::shared::error::AppError>;
 
     // ── process 域 helper（1）──
     /// 单条查 process（`ProcessRepo::get_by_id`）。
@@ -179,7 +178,7 @@ pub trait QueueRepoTrait: Send {
         include_deleted: bool,
     ) -> Result<Option<TProcess>, sqlx::Error>;
 
-    // ── process_chain 域 helper（2）──
+    // ── process_chain 域 helper（1）──
     /// 解析 chain 上 process 对应的 step_id（`ProcessChainRepo::resolve_step_id_by_process`）。
     async fn process_chain_resolve_step_id_by_process(
         &mut self,
@@ -207,23 +206,30 @@ pub trait QueueRepoTrait: Send {
         include_deleted: bool,
     ) -> Result<Option<TPart>, sqlx::Error>;
 
-    /// 查 worker 持有中的某 batch（`PartRepo::find_inprocess_batch_by_id_and_holder`）。
+    /// 查 worker 持有中的某 batch（`PartBatchRepo::find_inprocess_batch_by_id_and_holder`）。
+    ///
+    /// 2026-10-15 订正符号引用：原写的 `PartRepo::find_inprocess_batch_by_id_and_holder`
+    /// 已从 part 域删除（注记见 `part/repo/mod.rs` 模块 doc），本转发器的实际
+    /// 委托目标见本文件 `impl QueueRepoTrait for &mut PgConnection`。
     async fn part_find_inprocess_batch_by_id_and_holder(
         &mut self,
         batch_id: i64,
         worker_id: i64,
     ) -> Result<Option<TPartBatch>, sqlx::Error>;
 
-    /// 切 holder 到 shelf（`PartRepo::mark_batch_returned`）。
+    /// 切 holder 到 shelf（`PartBatchRepo::mark_batch_returned`）。
     ///
     /// 2026-09-30：本转发器**恒传 `None`** 作
     /// `advance_to_process_id` —— move WORKER→POOL 是池内移动、工序不变
     /// （写入不变式），批次归还货架后仍属原工序候选池。推进工序是 worker-scan
-    /// RETURNED 的职责，它直连 `PartRepo::mark_batch_returned` 不经本转发器。
+    /// RETURNED 的职责，它直连 `PartRepoTrait::mark_batch_returned` 不经本转发器
+    /// （2026-10-15 订正符号引用：worker-scan 在
+    /// `prod/scan/service/worker_scan.rs` 收 `R: PartRepoTrait`，其生产实现
+    /// `&mut PgConnection` 内部再委托 `PartBatchRepo::mark_batch_returned`）。
     /// `step_id` 形参同样恒传 `None`（转发给 `current_process_step_id`）：**主动
     /// 退回不改工序归属**，故链内位置指针保持原值（SQL 侧 `COALESCE(.., 原值)`）。
     /// 2026-10-09 起该列会被真实写入（不再是「形参被 SQL 丢弃」），但本路径仍刻意
-    /// 不传 —— 见 `PartRepo::mark_batch_returned` doc 的「推进不是无条件的」段。
+    /// 不传 —— 见 `PartBatchRepo::mark_batch_returned` doc 的「推进不是无条件的」段。
     async fn part_mark_batch_returned(
         &mut self,
         batch_id: i64,
@@ -270,14 +276,17 @@ pub trait QueueRepoTrait: Send {
 /// `sql::XxxRepo::yyy` 须写 `&mut **self`（reborrow，避免 move 引用本身）。
 #[async_trait]
 impl QueueRepoTrait for &mut PgConnection {
-    // ── 本域 4 方法 ──
+    // ── 本域 3 方法 ──
     /// 2026-10-10：`shelf_id` 改 `Option<i64>`，`None` = 跨全部货架取料
     /// （worker-scan 路径不再有架锚；负载均衡在放回时的 `pick_least_loaded` 一侧）。
+    /// 2026-10-15：`cap` 由 service 传入（工种自动补料上限兜底
+    /// `max_held_batches`），SQL 不再自己查 `t_work_type`。
     async fn take_one_from_pool(
         &mut self,
         worker_id: i64,
         shelf_id: Option<i64>,
         process_ids: &[i64],
+        cap: i32,
         operator_user_id: i64,
     ) -> Result<Option<TakenItem>, sqlx::Error> {
         QueueRepo::take_one_from_pool(
@@ -285,6 +294,7 @@ impl QueueRepoTrait for &mut PgConnection {
             worker_id,
             shelf_id,
             process_ids,
+            cap,
             operator_user_id,
         )
         .await
@@ -385,7 +395,8 @@ impl QueueRepoTrait for &mut PgConnection {
     async fn work_type_list_work_types_by_process_id(
         &mut self,
         process_id: i64,
-    ) -> Result<Vec<(i64, String, String, Option<i32>)>, crate::shared::error::AppError> {
+    ) -> Result<Vec<(i64, String, String, Option<i32>, Option<i32>)>, crate::shared::error::AppError>
+    {
         Ok(
             crate::modules::prod::work_type::repo::WorkTypeRepo::list_work_types_by_process_id(
                 &mut **self,
@@ -393,18 +404,6 @@ impl QueueRepoTrait for &mut PgConnection {
             )
             .await?,
         )
-    }
-
-    async fn work_type_get_max_held_minutes(
-        &mut self,
-        id: i64,
-    ) -> Result<Option<i32>, sqlx::Error> {
-        let row: Option<(Option<i32>,)> =
-            sqlx::query_as("SELECT max_held_minutes FROM t_work_type WHERE id = $1")
-                .bind(id)
-                .fetch_optional(&mut **self)
-                .await?;
-        Ok(row.and_then(|(v,)| v))
     }
 
     // ── process helper ──
@@ -455,7 +454,7 @@ impl QueueRepoTrait for &mut PgConnection {
         crate::shared::batch::get_batch_by_id(&mut **self, id, include_deleted).await
     }
 
-    // ── part helper（直接走 PartRepo ZST 静态方法；D-6 未重构）──
+    // ── part helper（直接走 ZST 静态方法，逐方法见 doc；D-6 未重构）──
     async fn part_get_by_id(
         &mut self,
         id: i64,

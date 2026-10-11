@@ -4,7 +4,7 @@
 //! 覆盖 15 条 HTTP 契约：
 //!  1. 成功 → 200 + `data.token` 非空 + `data.user.roles` 正确
 //!     （★ 2026-10-11 起响应体只有 6 个字段，不带 `expires_in` / `is_active` /
-//!     `shelf_ids` / `menus`；逐字段断言见
+//!     `shelf_ids` / `menus` / `permissions`；逐字段断言见
 //!     `tests/wx/part_list.rs::wx_login_response_only_exposes_six_fields`）
 //!  2. 企微返 40029 → 40106
 //!  3. userid 未预绑定 → 40107

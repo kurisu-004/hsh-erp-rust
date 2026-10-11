@@ -25,6 +25,8 @@
 //!      断言（review 第 1 轮 MINOR-7：被删的 `tests/assembly/files_list.rs` 留下的空洞）
 //!  21. soft_delete_assembly_master_happy_path — `ASSEMBLY_MASTER` 可软删
 //!      （review 第 1 轮 MINOR-6 回归：闭合前是「能造不能删」）
+//!  22. get_url_requires_permission_point          — `/url` 守卫是权限点，Manager 未持点也
+//!      403（2026-10-14 迁到 `part.drawing.print`，随域收编迁到 `/files/objects/{id}/url`）
 //!
 //! ## 集成策略
 //! 主体是**直接 service 直调**（避免 JWT/Redis 开销）：`pool.begin()` 开 tx →
@@ -138,12 +140,19 @@ async fn setup() -> PgPool {
 // ===========================================================================
 
 fn test_current_user_with_roles(roles: Vec<Role>) -> CurrentUser {
+    test_current_user_with_roles_and_perms(roles, &[])
+}
+
+/// 同 [`test_current_user_with_roles`]，另装权限点（2026-10-14：`/url` 的守卫
+/// 从 4 角色白名单迁到权限点 `part.drawing.print` 后按需构造持有者）。
+fn test_current_user_with_roles_and_perms(roles: Vec<Role>, perms: &[&str]) -> CurrentUser {
     CurrentUser {
         id: 1,
         username: "tester".into(),
         roles,
         shelf_ids: vec![],
         shelf_wildcard: false,
+        permissions: perms.iter().map(|s| s.to_string()).collect(),
     }
 }
 
@@ -414,7 +423,10 @@ async fn get_url_returns_presigned_url() {
     let l2 = insert_l2_customer(&pool, "子客PF-URL", l1).await;
     let part_id = insert_part_for_owner(&pool, l2).await;
 
-    let current = test_current_user_with_roles(vec![Role::Manager]);
+    // 2026-10-14：`/url` 的守卫是权限点 `part.drawing.print`（默认矩阵授 MANAGER），
+    // fixture 同时装角色与点。
+    let current =
+        test_current_user_with_roles_and_perms(vec![Role::Manager], &["part.drawing.print"]);
     let cos = Arc::new(NoopCos);
 
     let mut tx = pool.begin().await.unwrap();
@@ -451,6 +463,61 @@ async fn get_url_returns_presigned_url() {
     assert_eq!(detail.kind, "DRAWING");
     assert!(detail.download_url.contains(&out.object_key));
     assert_eq!(detail.url_expires_in_seconds, 3600);
+}
+
+/// 守卫是**权限点**而不是角色：同为 MANAGER（原白名单内角色），未持
+/// `part.drawing.print` 即 40300（2026-10-14 迁移的回归锚）。
+///
+/// 这正是跨仓权限点迁移要消灭的分叉 —— 前端按 `hasPermission` 显隐、后端按同一
+/// 权限点放行；角色本身不再单独决定访问权（自定义角色持点同样放行）。
+#[tokio::test]
+async fn get_url_requires_permission_point() {
+    let pool = setup().await;
+    let l1 = insert_l1_customer(&pool, "客户PF-URL-Perm", "F").await;
+    let l2 = insert_l2_customer(&pool, "子客PF-URL-Perm", l1).await;
+    let part_id = insert_part_for_owner(&pool, l2).await;
+
+    let cos = Arc::new(NoopCos);
+    let mut tx = pool.begin().await.unwrap();
+    let uploaded = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
+        .upload_file_for_owner(
+            &mut *tx,
+            UPLOAD_UPLOAD_PREFIX,
+            UPLOAD_MAX_FILE_SIZE,
+            "PART",
+            part_id,
+            "DRAWING",
+            "perm.pdf",
+            "application/pdf",
+            b"%PDF-1.5\n".to_vec(),
+            &test_current_user_with_roles_and_perms(vec![Role::Manager], &["part.drawing.print"]),
+        )
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    // Manager 角色在手、权限点未授 ⇒ 40300
+    let manager_no_perm = test_current_user_with_roles(vec![Role::Manager]);
+    let mut tx = pool.begin().await.unwrap();
+    let err = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
+        .get_file_with_url(
+            &mut *tx,
+            cos.clone(),
+            UPLOAD_UPLOAD_PREFIX,
+            uploaded.id,
+            &manager_no_perm,
+        )
+        .await
+        .expect_err("未持 part.drawing.print 即应拒绝，哪怕角色是 MANAGER");
+    drop(tx);
+
+    match err {
+        AppError::Biz { code, .. } => assert_eq!(
+            code, 40300,
+            "FORBIDDEN：守卫是权限点 `part.drawing.print`，角色不再单独决定访问权"
+        ),
+        other => panic!("期望 AppError::Biz(40300)，got {other:?}"),
+    }
 }
 
 // ===== 2026-09-16 补：paired_file_id 投影测试（前端 CNC 配对分组契约字段） =====
@@ -1006,9 +1073,11 @@ async fn read_fallback_to_legacy_key_test() {
 // **内容** `GET /api/v2/part-files/{id}/content`。这两条原本只放 4 角色
 // （Manager / Clerk / Inspector / CncProgrammer）⇒ 工控机点预览必然 40300。
 //
-// 角色矩阵的决策与理由见 `src/modules/files/part_file/mod.rs` 模块 doc。关键一条：
-// **`GET /part-files/{id}/url` 刻意不给 SHELF_ACCOUNT** —— 它回 COS 预签直链
-// （1 小时有效、拿到即可脱离本后端直接 GET），而 `content` 是后端代理、每次过 RBAC。
+// 守卫矩阵的决策与理由见 `src/modules/files/part_file/mod.rs` 模块 doc。关键一条：
+// **`GET /files/objects/{id}/url` 默认矩阵不含 SHELF_ACCOUNT**（2026-10-14 起守卫是
+// 权限点 `part.drawing.print`）—— 它回 COS 预签直链（1 小时有效、拿到即可脱离本
+// 后端直接 GET），而 `content` 是后端代理、每次过 RBAC。
+
 //
 // ⚠️ 上面两条 URL 写的是 2026-10-10 加角色时的历史路径；2026-10-13 起已硬切为
 // `GET /api/v2/files/objects/{id}/url` 与 `GET /api/v2/files/objects/{id}/content`
@@ -1120,7 +1189,8 @@ async fn rbac_shelf_account_can_get_file_content() {
     assert!(content.bytes.is_empty(), "NoopCos 不返真实字节");
 }
 
-/// SHELF_ACCOUNT 调 `/part-files/{id}/url` **仍被拒**：COS 预签直链不在放开范围。
+/// SHELF_ACCOUNT 调 `/part-files/{id}/url` **仍被拒**：`part.drawing.print` 的默认
+/// 矩阵不含它（COS 预签直链不在放开范围）。
 #[tokio::test]
 async fn rbac_shelf_account_get_file_url_still_forbidden() {
     let pool = setup().await;
@@ -1164,7 +1234,7 @@ async fn rbac_shelf_account_get_file_url_still_forbidden() {
     match err {
         AppError::Biz { code, .. } => assert_eq!(
             code, 40300,
-            "FORBIDDEN：`/url` 回的是 1 小时有效的 COS 直链，拿到即可脱离本后端访问"
+            "FORBIDDEN：`/url` 回的是 1 小时有效的 COS 直链，默认矩阵不含 SHELF_ACCOUNT"
         ),
         other => panic!("期望 AppError::Biz(40300)，got {other:?}"),
     }

@@ -7,8 +7,8 @@
 //!
 //! 本文件 22 例：覆盖 `iam/repo/sql/{user_role,menu}.rs` 共 7 个固有方法
 //! （user_role 6 + menu 1）+ `t_shelf` SQL 真源（`iam::shelf::repo::sql`）1 个方法。
-//! 22 例**已含**针对 `seeds/menu.sql` 的那条自锁断言（`MenuRepo` 4 例之一，不碰
-//! DB），不是 22 之外再加的第 23 条。
+//! 22 例**已含**针对 `seeds/menu.sql` + `seeds/rbac.sql` 两个 seed 文本的那条自锁
+//! 断言（`MenuRepo` 4 例之一，不碰 DB），不是 22 之外再加的第 23 条。
 //!
 //! ## 测试并行注意
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
@@ -431,10 +431,10 @@ async fn list_user_roles_by_user_ids_includes_shelf_code_and_name() {
 // MenuRepo 测试 (4 例，覆盖 1 个固有方法 + 1 条自锁断言)
 // ===========================================================================
 
-/// 合成菜单角色（主）：`scripts/test_nextest.sh` 建共享 template DB 时会 apply
-/// `seeds/menu.sql`，那份 seed 给 MANAGER / CLERK / INSPECTOR / CNC_PROGRAMMER /
-/// SHELF_ACCOUNT 五个真实角色授了若干菜单。断言 `t_role_menu` / `t_menu`
-/// 精确条数或内容时若用这五个角色反查，会把共享 seed 的菜单一起数进来
+/// 合成菜单角色（主）：`scripts/test_nextest.sh` 建共享 template DB 时会按序 apply
+/// `seeds/menu.sql` + `seeds/rbac.sql`，那份授权基线给 MANAGER / CLERK / INSPECTOR /
+/// CNC_PROGRAMMER / SHELF_ACCOUNT 五个真实角色授了若干菜单。断言 `t_role_menu` /
+/// `t_menu` 精确条数或内容时若用这五个角色反查，会把共享 seed 的菜单一起数进来
 /// （`list_active_menus_by_roles` 因此变红）。故 MenuRepo 的 3 条用例一律走
 /// 本常量这种 seed 永不授予的合成角色。
 ///
@@ -448,16 +448,17 @@ const SYNTHETIC_MENU_ROLE: &str = "TEST_MENU_ROLE";
 /// 且两条都必须是合成角色（否则又会把 seed 菜单数进来）。
 const SYNTHETIC_MENU_ROLE_B: &str = "TEST_MENU_ROLE_B";
 
-/// 自锁：`seeds/menu.sql` 不得出现上面两个合成角色串。
+/// 自锁：`seeds/menu.sql` / `seeds/rbac.sql` 两份 seed 文本都不得出现上面两个合成角色串。
 ///
 /// 这条断言护的是「合成角色」这个前提本身：若有人把 `TEST_MENU_ROLE` 写进 seed 的
-/// 授权白名单，下面的 3 条用例会以「精确条数」失败（可见的红）；但更隐蔽的形态是
-/// 同一菜单既被 seed 授予又被测试自建、断言写成 `>=`，红不起来而覆盖已被稀释。
-/// 本断言让前提被破坏时**当场**红在 seed 文本上。
+/// 授权白名单（menu.sql 不再有授权段，实际风险在 rbac.sql §4），下面的 3 条用例会以
+/// 「精确条数」失败（可见的红）；但更隐蔽的形态是同一菜单既被 seed 授予又被测试自建、
+/// 断言写成 `>=`，红不起来而覆盖已被稀释。本断言让前提被破坏时**当场**红在 seed 文本上。
 ///
-/// ⚠️ **边界（2026-10-10 登记）**：本断言只读 `seeds/menu.sql` 这一份**文本**。
+/// ⚠️ **边界（2026-10-10 登记；2026-10-15 随授权迁入 rbac.sql 扩为扫两份文本）**：
+/// 本断言只读 `seeds/menu.sql` + `seeds/rbac.sql` 这两份**文本**。
 /// ① 若日后 template DB 改灌别的 seed 文件、或新增别的含授权的 seed，则
-/// 「模板库只带这一份 seed」这个前提已破，而本断言仍会绿 —— 届时的失效形态是
+/// 「模板库只带这两份 seed」这个前提已破，而本断言仍会绿 —— 届时的失效形态是
 /// 下方 3 条用例的精确条数被数错，不会红在 seed 文本上。改 template DB 的灌库
 /// 清单（`scripts/test_nextest.sh`）时必须回来补这份前提的护栏。
 /// ② 反方向偏严、无漏报：`contains` 是子串匹配，`TEST_MENU_ROLE_X` 这类**包含**
@@ -466,13 +467,19 @@ const SYNTHETIC_MENU_ROLE_B: &str = "TEST_MENU_ROLE_B";
 fn menu_seed_never_grants_synthetic_menu_roles() {
     // 与生产启动钩子 `src/infra/seed.rs`、测试 template DB 同一份 SQL
     const MENU_SEED_SQL: &str = include_str!("../../seeds/menu.sql");
+    const RBAC_SEED_SQL: &str = include_str!("../../seeds/rbac.sql");
 
-    for role in [SYNTHETIC_MENU_ROLE, SYNTHETIC_MENU_ROLE_B] {
-        assert!(
-            !MENU_SEED_SQL.contains(role),
-            "seeds/menu.sql 出现了合成角色 {role}：它已不再是 seed 永不授予的角色，\
-             下面的 MenuRepo 用例会退化成「把 seed 菜单一起数进来」"
-        );
+    for (seed_file, sql) in [
+        ("seeds/menu.sql", MENU_SEED_SQL),
+        ("seeds/rbac.sql", RBAC_SEED_SQL),
+    ] {
+        for role in [SYNTHETIC_MENU_ROLE, SYNTHETIC_MENU_ROLE_B] {
+            assert!(
+                !sql.contains(role),
+                "{seed_file} 出现了合成角色 {role}：它已不再是 seed 永不授予的角色，\
+                 下面的 MenuRepo 用例会退化成「把 seed 菜单一起数进来」"
+            );
+        }
     }
 }
 

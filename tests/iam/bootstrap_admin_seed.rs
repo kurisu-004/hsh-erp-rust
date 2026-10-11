@@ -1,7 +1,7 @@
 //! 初始管理员 seed 集成测试（2026-09-26 新增）
 //!
 //! 覆盖 `seeds/admin.sql` + `BOOTSTRAP_ADMIN_ENABLED` env 门控 + 启动钩子
-//! `src/infra/seed.rs::run_seeds(pool, bootstrap_admin_enabled)` 的 4 个核心场景：
+//! `src/infra/seed.rs::run_seeds(pool, bootstrap_admin_enabled)` 的 5 个核心场景：
 //!
 //! 1. **`bootstrap_admin_seed_disabled_returns_401`** —— `BOOTSTRAP_ADMIN_ENABLED=false`
 //!    默认行为：admin 不存在，`POST /iam/login` 走 40101 BIZ_AUTH_INVALID（用户不存在）
@@ -11,13 +11,22 @@
 //!    且被手动改过 password_hash 后，重跑 seed ON CONFLICT DO NOTHING 不会被覆盖
 //! 4. **`bootstrap_admin_seed_coexists_with_iam_fixture`** —— admin seed 与既有
 //!    iam fixture 不冲突，admin + fx_iam_manager 共存
+//! 5. **`bootstrap_admin_seed_disabled_keeps_rbac_roles`**（2026-10-14 新增）——
+//!    `BOOTSTRAP_ADMIN_ENABLED=false` 时 `t_role` 仍有 6 行系统角色：RBAC 基线
+//!    seed 与 admin seed 解耦（前者无条件加载，后者门控）
+//!
+//! ## admin 的角色是 ADMIN 元角色（2026-10-14 起）
+//!
+//! 旧版 admin.sql 给的是 MANAGER；现行版给 `ADMIN`（代码级通配全部菜单与权限，
+//! 角色行由 `seeds/rbac.sql` 无条件保证）。本文件断言随之改口径。
 //!
 //! ## 测试策略
 //!
 //! 不依赖 `src/main.rs` 启动钩子（避免测试间并行导致 fresh-database 里 admin
 //! 行意外泄露到其它用例），**测试内直接用 `sqlx::raw_sql(include_str!(...))` 触发**
 //! admin seed —— 与生产路径等价（同样 SQL 文件 + 同样 raw_sql 执行），但启动
-//! 时序可控、不污染 fresh db 的默认状态。
+//! 时序可控、不污染 fresh db 的默认状态。场景 5 直接调 `run_seeds(false)`，验的是
+//! 「门控关掉时 RBAC 基线照样加载」这条组合语义。
 //!
 //! ## Fixture 复用
 //!
@@ -125,16 +134,16 @@ async fn bootstrap_admin_seed_enabled_login_success() {
         "seed 后 admin 行必须存在（id={ADMIN_USER_ID}）"
     );
 
-    // 断言 MANAGER role 已落库
+    // 断言 ADMIN role 已落库（2026-10-14 起 admin 是 ADMIN 元角色，不再是 MANAGER）
     let role_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM t_user_role \
-         WHERE user_id = $1 AND role = 'MANAGER' AND scope_type IS NULL AND deleted_at IS NULL",
+         WHERE user_id = $1 AND role = 'ADMIN' AND scope_type IS NULL AND deleted_at IS NULL",
     )
     .bind(ADMIN_USER_ID)
     .fetch_one(&pool)
     .await
     .expect("count role");
-    assert_eq!(role_count, 1, "admin 必须拥有 1 条 MANAGER role");
+    assert_eq!(role_count, 1, "admin 必须拥有 1 条 ADMIN role");
 
     // 复用 test-support helper 登录拿 token（内部已断言 200 + data.token 存在）。
     let token = login_token(&app, ADMIN_USERNAME, ADMIN_PASSWORD).await;
@@ -220,7 +229,7 @@ async fn bootstrap_admin_seed_idempotent_preserves_manual_hash() {
 
     // 5. 顺带断言：role 行也未被重复写入（ON CONFLICT DO NOTHING 同样生效）
     let role_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM t_user_role WHERE user_id = $1 AND role = 'MANAGER' \
+        "SELECT count(*) FROM t_user_role WHERE user_id = $1 AND role = 'ADMIN' \
          AND scope_type IS NULL",
     )
     .bind(ADMIN_USER_ID)
@@ -264,4 +273,70 @@ async fn bootstrap_admin_seed_coexists_with_iam_fixture() {
 
     // 额外 sanity：fixture MANAGER 用户（仍是 fx_iam_manager / changeme）也能登录
     let _fx_token = login_token(&app, IamFixture::MANAGER_USERNAME, IamFixture::PASSWORD).await;
+}
+
+// ===========================================================================
+// 场景 5（2026-10-14 新增）：BOOTSTRAP_ADMIN_ENABLED=false 不阻断 RBAC 基线
+// ===========================================================================
+// RBAC 基线 seed（seeds/rbac.sql，6 个内置角色 + 权限点 + 授权矩阵）与 admin seed
+// 是两件事：前者无条件加载（业务端点与角色面板的判定基线），后者由门控开关。
+// 这条用例直接调生产入口 `run_seeds(&pool, false)`，验的就是这个组合语义。
+#[tokio::test]
+async fn bootstrap_admin_seed_disabled_keeps_rbac_roles() {
+    let (pool, _app) = bootstrap().await;
+
+    // 模拟生产启动：BOOTSTRAP_ADMIN_ENABLED=false
+    hsh_erp_rust::infra::seed::run_seeds(&pool, false)
+        .await
+        .expect("run_seeds(false) 应成功");
+
+    // ① admin 账号仍不存在（门控关掉的是账号 seed）
+    let admin_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM t_user WHERE username = $1 AND deleted_at IS NULL",
+    )
+    .bind(ADMIN_USERNAME)
+    .fetch_one(&pool)
+    .await
+    .expect("count admin");
+    assert_eq!(
+        admin_count, 0,
+        "BOOTSTRAP_ADMIN_ENABLED=false 不应创建 admin 用户"
+    );
+
+    // ② 6 个内置角色一条不少、全部 is_system + is_active
+    let role_codes: Vec<String> = sqlx::query_scalar(
+        "SELECT code FROM t_role WHERE is_system AND is_active AND deleted_at IS NULL \
+         ORDER BY code",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("查询 t_role 内置角色");
+    assert_eq!(
+        role_codes,
+        vec![
+            "ADMIN",
+            "CLERK",
+            "CNC_PROGRAMMER",
+            "INSPECTOR",
+            "MANAGER",
+            "SHELF_ACCOUNT"
+        ],
+        "关掉 admin 门控后 6 个内置角色仍必须存在（RBAC seed 无条件加载）"
+    );
+    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM t_role WHERE deleted_at IS NULL")
+        .fetch_one(&pool)
+        .await
+        .expect("count t_role");
+    assert_eq!(total, 6, "fresh 库的 t_role 恰 6 行（尚未建自定义角色）");
+
+    // ③ 幂等：重跑一次结果不变（ON CONFLICT code WHERE deleted_at IS NULL）
+    hsh_erp_rust::infra::seed::run_seeds(&pool, false)
+        .await
+        .expect("run_seeds(false) 重跑应成功");
+    let total_again: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM t_role WHERE deleted_at IS NULL")
+            .fetch_one(&pool)
+            .await
+            .expect("count t_role after rerun");
+    assert_eq!(total_again, 6, "重跑 RBAC seed 不得插出重复角色");
 }

@@ -596,6 +596,7 @@ async fn batch_create_with_bindings_object_key_test() {
         roles: vec![Role::Manager],
         shelf_ids: vec![],
         shelf_wildcard: false,
+        permissions: Vec::new(),
     };
     let cos = std::sync::Arc::new(MockCos::new());
 
@@ -675,4 +676,86 @@ async fn batch_create_with_bindings_object_key_test() {
         !pf.object_key.contains("/part/") && !pf.object_key.contains("/DRAWING/"),
         "object_key 不应再含 owner_kind 'part/' 或 KIND 'DRAWING/'"
     );
+}
+
+// ===========================================================================
+//  权限点闸门（2026-10-15 新增）
+// ===========================================================================
+
+/// split / cancel 迁权限点（2026-10-15）—— `batch.split` / `batch.cancel` 矩阵
+/// 均为 M,C：Inspector ⇒ 40300；Clerk ⇒ 200（正向留痕，自原 `require_any_role`
+/// 集合逐格迁移）。
+#[tokio::test]
+async fn split_and_cancel_permission_matrix() {
+    let (pool, app, _token, fx) = bootstrap_as_manager().await;
+    let insp = login_token(&app, &fx.inspector_username, PartFixture::PASSWORD).await;
+    let clerk = login_token(&app, &fx.clerk_username, PartFixture::PASSWORD).await;
+
+    let (_pid, bid) =
+        insert_part_with_batch(&pool, "P-RBAC", fx.customer_l2_id, "PENDING", 10).await;
+    let version = batch_version(&pool, bid).await;
+
+    // ---- Inspector：split / cancel 均 40300 ----
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/batches/split",
+            Some(json!({
+                "batch_id": bid.to_string(),
+                "version": version,
+                "quantity": 3,
+            })),
+            Some(&insp),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "Inspector split 应 403: {env}");
+    assert_eq!(env["code"], 40300, "应为 FORBIDDEN: {env}");
+
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/prod/batches/{bid}/cancel"),
+            Some(json!({ "version": version })),
+            Some(&insp),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "Inspector cancel 应 403: {env}");
+    assert_eq!(env["code"], 40300, "应为 FORBIDDEN: {env}");
+
+    // ---- Clerk：split 200 ----
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/batches/split",
+            Some(json!({
+                "batch_id": bid.to_string(),
+                "version": version,
+                "quantity": 3,
+            })),
+            Some(&clerk),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "Clerk split 应 200（放宽后）: {env}");
+
+    // ---- Clerk：cancel 200（另起一条批次，避免与前一步的拆批状态纠缠）----
+    let (_pid2, bid2) =
+        insert_part_with_batch(&pool, "P-RBAC2", fx.customer_l2_id, "PENDING", 5).await;
+    let v2 = batch_version(&pool, bid2).await;
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/prod/batches/{bid2}/cancel"),
+            Some(json!({ "version": v2 })),
+            Some(&clerk),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "Clerk cancel 应 200（放宽后）: {env}");
 }

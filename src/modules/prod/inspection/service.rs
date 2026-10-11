@@ -5,16 +5,15 @@
 //! 2026-10-07 新增：待品检队列读 [`InspectionQueueService::list_queue`]（自
 //! `prod::batch::service::list` 迁入，规范化口径与 SQL 逐字未变），与扫码读同域。
 //!
-//! ## 角色守卫
-//! 下沉到 service 第一行（沿 `prod::batch` 的 `TO_XXX_ROLES` 范本），
-//! `current.require_any_role(READ_ROLES)`；handler 仅做
+//! ## 权限守卫（2026-10-15 迁权限点）
+//! 下沉到 service 第一行：`current.require_permission("inspection.view")`
+//! （矩阵 M,I —— 逐格等于原 `READ_ROLES` 角色集合）；handler 仅做
 //! 参数提取，不重复校验。
 //!
-//! 白名单**只有 2 个角色**（与 `GET /api/v2/prod/inspection/queue` 及
-//! `to-ship` / `to-inspection` / `to-process` 三个写端点同一组）：扫码树是
-//! 品检动作的前置上下文，放行 `Clerk` / `CncProgrammer` / `ShelfAccount` 会
-//! 让它们看到本该看不到的批次明细。队列读的白名单逐字相同（迁前就是同一组，
-//! 常量 [`READ_ROLES`] 现由两个 service 共用，改白名单只需改这一处）。
+//! 矩阵**只有 Manager + Inspector**（与 `batch.transition` 覆盖的 `to-ship` /
+//! `to-inspection` / `to-process` 三个写端点同一组）：扫码树是品检动作的前置
+//! 上下文，放行 `Clerk` / `CncProgrammer` / `ShelfAccount` 会让它们看到本该看不到
+//! 的批次明细。队列读的矩阵逐字相同（两个 service 共用同一权限点）。
 //!
 //! ## 事务边界
 //! 读端点不开事务（handler `pool.acquire()` 借 `&mut PgConnection`）。纯读，
@@ -37,7 +36,7 @@ use std::collections::HashMap;
 
 use sqlx::PgConnection;
 
-use crate::auth::rbac::{CurrentUser, Role};
+use crate::auth::rbac::CurrentUser;
 use crate::modules::prod::inspection::dto::InspectionQueueQuery;
 use crate::modules::prod::inspection::model::{ScanAssemblyRow, ScanBatchRow, ScanPartRow};
 use crate::modules::prod::inspection::repo::{
@@ -49,12 +48,6 @@ use crate::modules::prod::inspection::vo::{
 };
 use crate::shared::customer::expand_customer_id;
 use crate::shared::error::{AppError, code};
-
-/// 本域两个读端点（`GET /scan/{serial_no}` / `GET /queue`）允许的角色：Manager 或 Inspector。
-///
-/// 与 `prod::batch::handler::transition` 的 `TO_XXX_ROLES` 同一组 —— 扫码树与
-/// 队列里的批次就是那三个写端点的操作对象，能看就必须能操作。
-const READ_ROLES: &[Role] = &[Role::Manager, Role::Inspector];
 
 /// `hit_kind` 出参的取值白名单。
 ///
@@ -92,14 +85,16 @@ pub struct InspectionScanService;
 impl InspectionScanService {
     /// `GET /api/v2/prod/inspection/scan/{serial_no}` 业务逻辑。
     ///
-    /// 流程：角色守卫 → 序列号 trim + 空值兜底 → 命中（part → assembly 回退）→
-    /// 定位装配件节点与零件层 → **一条** SQL 取全部批次 → 内存分组挂树。
+    /// 流程：权限守卫（`inspection.view`）→ 序列号 trim + 空值兜底 → 命中（part →
+    /// assembly 回退）→ 定位装配件节点与零件层 → **一条** SQL 取全部批次 → 内存分组挂树。
     pub async fn scan(
         conn: &mut PgConnection,
         current: &CurrentUser,
         serial_no: &str,
     ) -> Result<ScanTreeOut, AppError> {
-        current.require_any_role(READ_ROLES)?;
+        // 2026-10-15：迁权限点 `inspection.view`（M,I；矩阵逐格等于原
+        // READ_ROLES 集合）。
+        current.require_permission("inspection.view")?;
 
         // 扫码枪偶发尾随空白 / 空格；空串等价于「没扫到东西」，按未命中收口。
         let serial_no = serial_no.trim();
@@ -318,8 +313,8 @@ impl InspectionQueueService {
     /// 返回 `status='INSPECTION'` 的全部活跃批次，出参严格对齐前端待品检页的 7 个
     /// 数据列 + 操作列锚点。
     ///
-    /// 流程：角色守卫 → limit/offset 规范化 → `customer_id` 展开为 L1+L2 ids →
-    /// 3 个表头文本筛选 trim + 拒通配符 + 拼 `%…%` → 排序白名单映射 →
+    /// 流程：权限守卫（`inspection.view`）→ limit/offset 规范化 → `customer_id` 展开为
+    /// L1+L2 ids → 3 个表头文本筛选 trim + 拒通配符 + 拼 `%…%` → 排序白名单映射 →
     /// `list_inspection_queue` + `count_inspection_queue` 两条 SQL（同 WHERE 拼装器）。
     ///
     /// 排序非法值**不报错**：非法 `sort_by` 退化为系统交期、非法 `sort_dir` 退化为
@@ -329,7 +324,9 @@ impl InspectionQueueService {
         query: &InspectionQueueQuery,
         current: &CurrentUser,
     ) -> Result<InspectionQueueListOut, AppError> {
-        current.require_any_role(READ_ROLES)?;
+        // 2026-10-15：迁权限点 `inspection.view`（M,I；矩阵逐格等于原
+        // READ_ROLES 集合）。
+        current.require_permission("inspection.view")?;
 
         let limit = query.limit.unwrap_or(DEFAULT_QUEUE_LIMIT).clamp(1, 200);
         let offset = query.offset.unwrap_or(0).max(0);

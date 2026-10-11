@@ -139,7 +139,7 @@
 //! | `POST /files/objects/confirm` | M / C | 逐字沿用旧 `POST /parts/{id}/files/confirm` |
 //! | `GET /files/objects`（列表） | M / C / I / CNC / **SHELF** | 2026-10-10 放开 SHELF |
 //! | `GET /files/objects/{id}/content` | M / C / I / CNC / **SHELF** | 2026-10-10 放开 SHELF |
-//! | `GET /files/objects/{id}/url` | M / C / I / CNC | **刻意不含 SHELF**，见下 |
+//! | `GET /files/objects/{id}/url` | 权限点 `part.drawing.print`（默认矩阵 M / C / I / CNC） | **默认矩阵刻意不含 SHELF**，见下 |
 //! | `GET /files/objects/{id}/preview` | M / C / I / CNC / **SHELF** | 2026-10-13 PR2 新增；⚠️ **含 SHELF 是对上一行的有意反转**，见下 |
 //! | `POST /files/objects/{id}/delete` | 按 kind 派生（图纸类 + `ASSEMBLY_MASTER` M / C，G_CODE M / CNC） | `ASSEMBLY_MASTER` 是 2026-10-13 review 第 1 轮 MINOR-6 补进分派的 |
 //!
@@ -175,6 +175,9 @@
 //! `tests/files/part_file.rs::rbac_shelf_account_cannot_upload_or_delete`）。
 //!
 //! ### 为什么 `/url` 不跟着放开
+//!
+//! ⚠️ `/url` 的守卫 2026-10-14 起是**权限点** `part.drawing.print`（默认矩阵
+//! M / C / I / CNC），不是角色白名单；下面的论证对两者同样成立。
 //!
 //! `get_file_with_url` 回的是 **COS 预签直链**（`presigned_get_url`，
 //! `url_expires_in_seconds = 3600`）：链接一旦到手就能**脱离本后端**直接 GET，

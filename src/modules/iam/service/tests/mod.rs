@@ -1,6 +1,6 @@
 //! iam 域 service 层单元测试公共 fixture（2026-09-23 新增）
 //!
-//! 为 `account/`（`user` 20 + `role` 8 + `wx` 16 用例）+ `session.rs`（14 用例）提供：
+//! 为 `account/`（`user` 23 + `role` 16 + `wx` 16 用例）+ `session.rs`（16 用例）提供：
 //! - `MockIamRepoTrait` 注入（mockall 0.15 automock 自动生成于 `iam/repo/mod.rs`）
 //! - `test_snowflake()`：**lib 单测进程内唯一**的雪花 ID 生成器（2026-10-09 起
 //!   转发到 `crate::shared::test_snowflake::shared_test_snowflake()`）
@@ -61,6 +61,7 @@ pub fn current_with_role(role: Role) -> CurrentUser {
         roles: vec![role],
         shelf_ids: vec![],
         shelf_wildcard: false,
+        permissions: Vec::new(),
     }
 }
 
@@ -265,6 +266,8 @@ pub fn test_app_config() -> Arc<AppConfig> {
         python_backend: crate::infra::config::PythonBackendConfig::default(),
         // 2026-09-29 新增：企业微信登录配置（session service 不读，占位默认值）
         wecom: crate::infra::config::WeComConfig::default(),
+        // 2026-10-13 新增：SMTP 配置（session service 不读，占位默认值）
+        mail: crate::infra::config::MailConfig::default(),
     })
 }
 

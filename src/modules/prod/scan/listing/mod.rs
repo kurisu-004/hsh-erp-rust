@@ -2,7 +2,7 @@
 //!
 //! 两个只读端点的实现：
 //! - `GET /api/v2/prod/scan/pickable` —— 该工种在生产架上可领取的批次
-//! - `GET /api/v2/prod/scan/held` —— 某工人当前持有的批次（含工序链位置）
+//! - `GET /api/v2/prod/scan/held` —— 某工人当前持有的批次（含工序链位置 + 容量）
 //!
 //! 2026-10-10 自 `part::service::phase1::work_type` 搬来（硬切无 alias）。
 //!
@@ -17,15 +17,25 @@
 //!
 //! ## SQL 条数（与工人数 / 批次数无关）
 //! - `pickable`：**2 条**（取行 / COUNT）
-//! - `held`：**2 条**（取行 / COUNT）
+//! - `held`：**3 条**（取行 / COUNT / 工种上限）
 //!
 //! 两条端点都不按行数重复查（`pickable` 一次 SQL 把「工种→工序映射 → 架 → 批次」
 //! 全链 JOIN 完；`held` 一次 SQL 把链位置派生挂在 `LEFT JOIN LATERAL` 上）。
 //!
+//! 2026-10-14：`held` 的第 3 条是 `fetch_max_held_batches`（`t_worker LEFT JOIN
+//! t_work_type` 取 `max_held_batches`，供 `HeldListOut` 的容量展示）。它是
+//! 「工人维度」的量，与取行 / COUNT 的「批次维度」量互不覆盖、无法合并 —— 合并
+//! 就得把 `t_worker` 拖进那条已经 JOIN 了 `t_part` / `t_part_batch` / 链 step 的
+//! 大 SQL 里，让分页 COUNT 为一个非分页的常量付出代价。
+//!
+//! ⚠️ `list_held` 的 `total` 与 `current_held` **复用同一次 COUNT 的同一个值**
+//! （不是两条 SQL 两次查询）—— 见 `service.rs::list_held`。
+//!
 //! ## 表依赖
 //! `t_part` / `t_part_batch` / `t_work_type_process` / `t_shelf` / `t_process` /
-//! `t_process_chain` / `t_process_chain_step`。全部经本目录的 SQL 直读，一处他域的
-//! service / repo 都不 import。
+//! `t_process_chain` / `t_process_chain_step`，外加 2026-10-14 起 `/held` 容量字段
+//! 所需的 `t_worker` / `t_work_type`（`fetch_max_held_batches` 的一条
+//! `LEFT JOIN`）。全部经本目录的 SQL 直读，一处他域的 service / repo 都不 import。
 
 pub mod repo;
 pub mod service;
@@ -45,8 +55,9 @@ mod tests {
     use crate::shared::domain_guard::assert_no_foreign_domain;
 
     /// listing 聚合 SQL 需要的数据（工单 / 批次 / 工种↔工序映射 / 货架 / 工序 /
-    /// 工艺链 step）全部在 `listing/repo.rs` 的 SQL 里聚合，代码区不应出现任何
-    /// 其它域路径（含 `part` / `prod::batch` / `prod::worker` 等同父兄弟域）。
+    /// 工艺链 step / 工人 + 工种容量上限）全部在 `listing/repo.rs` 的 SQL 里聚合，
+    /// 代码区不应出现任何其它域路径（含 `part` / `prod::batch` / `prod::worker`
+    /// 等同父兄弟域）。
     ///
     /// 这条护栏是 `prod::scan` **唯一的**域隔离约束 —— 整域其余部分（写路径）
     /// 是转发型，本来就不适用。

@@ -119,6 +119,10 @@ impl ShelfProcessService {
         items: &[SetShelfProcessesItem],
         current: &CurrentUser,
     ) -> Result<(), AppError> {
+        // 2026-10-15：补权限点 `production.config`（矩阵 M）—— 本端点是原
+        // **零守卫**的配置写路径之一，本轮补闸。
+        current.require_permission("production.config")?;
+
         // 1. shelf 存在性 + 软删 + 停用 + zone 守卫（2026-10-04 复用 prod::batch 的
         // `validate_shelf_zone`，与 place_on_shelf / pickup / outsource 等生产流
         // 端点**同源同码**：20501 → 20512 → 20104，不另造判定）。
@@ -212,19 +216,14 @@ impl ShelfProcessService {
     ///
     /// 2026-10-02 自 `shelf::service::ShelfService::list_all_process_mappings`
     /// 平移（原端点 `GET /shelves/processes` 已硬切到 `/api/v2/prod/shelf-processes`）。
-    /// 单条 SQL JOIN（防 N+1）。任意已登录可调。
+    /// 单条 SQL JOIN（防 N+1）。权限（2026-10-15）：`production.view`
+    /// （矩阵 M,C,CNC,SA,I，逐格等于原 require_any_role 集合）。
     pub async fn list_all_mappings(
         &self,
         conn: &mut PgConnection,
         current: &CurrentUser,
     ) -> Result<AllShelfProcessMappingOut, AppError> {
-        current.require_any_role(&[
-            crate::auth::rbac::Role::Manager,
-            crate::auth::rbac::Role::Clerk,
-            crate::auth::rbac::Role::CncProgrammer,
-            crate::auth::rbac::Role::ShelfAccount,
-            crate::auth::rbac::Role::Inspector,
-        ])?;
+        current.require_permission("production.view")?;
 
         let rows = ShelfProcessRepo::list_all_active_mappings(&mut *conn).await?;
 
@@ -251,14 +250,8 @@ impl ShelfProcessService {
         shelf_id: i64,
         current: &CurrentUser,
     ) -> Result<ShelfProcessMappingOut, AppError> {
-        // 权限：与 list_shelves 一致（任意已登录）
-        current.require_any_role(&[
-            crate::auth::rbac::Role::Manager,
-            crate::auth::rbac::Role::Clerk,
-            crate::auth::rbac::Role::CncProgrammer,
-            crate::auth::rbac::Role::ShelfAccount,
-            crate::auth::rbac::Role::Inspector,
-        ])?;
+        // 2026-10-15：迁权限点 `production.view`（与 list_all_mappings 同集合）。
+        current.require_permission("production.view")?;
 
         // shelf 存在性 / scope 校验
         let shelf = ShelfRepo::get_by_id(&mut *conn, shelf_id)

@@ -9,13 +9,21 @@
 //! - bootstrap_admin_seed.rs ← 2026-09-26 新增：seeds/admin.sql + BOOTSTRAP_ADMIN_ENABLED 门控
 //! - wx_bind.rs            ← 2026-09-29 新增：`/iam/users/{id}/wx-bind` 3 端点
 //!   （企业微信身份预绑定；wx-login 主链路在 `tests/wecom_login.rs`）
-//! - menu_seed.rs          ← 2026-10-05 新增：seeds/menu.sql 授权矩阵回归护栏
-//!   （4 用例钉住「工序工种/制定工序=仅 MANAGER，生产队列=MANAGER+CLERK，品检都看不到」：
-//!   （角色矩阵快照 / 4.7 段回收作用于存量行 / 幂等 / `/iam/me` 渲染树端到端）
+//! - menu_seed.rs          ← 2026-10-05 新增：seeds 种子回归护栏
+//!   （seeds/menu.sql 菜单目录 + seeds/rbac.sql 授权基线（首次基线语义）；
+//!   7 用例钉住「工序工种/制定工序=仅 MANAGER，生产队列=MANAGER+CLERK，品检都看不到」：
+//!   角色矩阵快照 / 幂等（面板软删行零动作）/ `/iam/me` 渲染树端到端 /
+//!   白名单↔live 对账 / 基线语义三条（面板行不被碰、被移除的不回补、从未有过的补回，
+//!   含 2026-10-13 `t_role_menu_pkey` 事故的派生 id 回归护栏））
 //! - shelf.rs              ← 2026-10-10 自 `tests/shelf/api.rs` 迁入：货架子模块的
 //!   5 条 CRUD 端点（URL 自 `/api/v2/shelves/*` 硬切到 `/api/v2/iam/shelves/*`）
 //! - shelf_deactivate.rs   ← 2026-10-10 自 `tests/shelf/deactivate.rs` 迁入：
 //!   停用守卫回归（20503 / 20203）
+//! - rbac.rs               ← 2026-10-14 新增：iam::rbac 子模块 8 端点 + 用户域
+//!   角色授予/撤销联动（18 用例：角色列表 / MANAGER-only / grants 整包与重复码
+//!   拒绝 / ADMIN 元角色读全量写拒绝 / 菜单通配与配置用全量树 / 自定义角色 CRUD
+//!   与改 code 级联 / 停用即降权（滤角色 + 踢持有人）/ ADMIN 自锁护栏 /
+//!   变更踢下线 / 权限点矩阵）
 
 #![allow(dead_code, clippy::await_holding_lock, unused_imports)]
 
@@ -23,6 +31,7 @@ mod api;
 mod bootstrap_admin_seed;
 mod menu_seed;
 mod middleware;
+mod rbac;
 mod shelf;
 mod shelf_deactivate;
 mod wx_bind;

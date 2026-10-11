@@ -41,8 +41,9 @@
 # ============================ 已知可忽略错误 ======================================
 #   - 其它表的 "duplicate key"  — 上次残留数据，RESET 后干净；仅原地模式容忍
 #   - t_menu duplicate key      — 仅 INCLUDE_MENU=1 且与 seeds/menu.sql 冲突时
-#   关于 t_menu / t_role_menu：seeds/menu.sql 是权威源（ON CONFLICT (code) DO UPDATE
-#   幂等 upsert）。默认从 dump 跳过这两张表的 DATA 行，由第 9 步 seed 重建。
+#   关于 t_menu / t_role_menu：菜单目录归 seeds/menu.sql（ON CONFLICT (code) DO UPDATE
+#   幂等 upsert），角色→菜单授权基线归 seeds/rbac.sql（NOT EXISTS 只补从未有过的组合）。
+#   默认从 dump 跳过这两张表的 DATA 行，由第 9 步按序 seed 重建。
 #
 # ============================ 显式列映射表（改 schema 契约先改这里）=================
 # ① rename 映射（dump 老列 → baseline 新列；老列因此**不算**丢失）
@@ -469,10 +470,10 @@ fi
 # 7b) 排除不进 restore 的表：迁移表 / dump 有目标无 / 已走 stage / t_menu（可选）
 if [ "$INCLUDE_MENU" = "1" ]; then
     EXCLUDE_DATA="_sqlx_migrations alembic_version $SKIP_TABLES $STAGE_TABLES"
-    echo "  → INCLUDE_MENU=1：同时灌 dump 里的 t_menu / t_role_menu（可能与 seeds/menu.sql 冲突）"
+    echo "  → INCLUDE_MENU=1：同时灌 dump 里的 t_menu / t_role_menu（可能与 seeds 的菜单目录 / 授权基线冲突）"
 else
     EXCLUDE_DATA="_sqlx_migrations alembic_version t_menu t_role_menu $SKIP_TABLES $STAGE_TABLES"
-    echo "  → 默认跳过 t_menu / t_role_menu DATA 行（seeds/menu.sql 会重建）"
+    echo "  → 默认跳过 t_menu / t_role_menu DATA 行（第 9 步按序灌 seeds/menu.sql + seeds/rbac.sql 重建）"
 fi
 data_group=""
 for t in $EXCLUDE_DATA; do
@@ -598,13 +599,20 @@ UNION ALL SELECT 't_part_event='||count(*) FROM t_part_event
 UNION ALL SELECT 't_part_file='||count(*) FROM t_part_file
 UNION ALL SELECT 't_menu='||count(*) FROM t_menu;" | sed 's/^/    /'
 
-# ---------------------------------------------------------------------------- 9) menu seed
-SEED_FILE="${SEED_FILE:-seeds/menu.sql}"
-if [ -f "$SEED_FILE" ]; then
-    echo "-> apply seed: $SEED_FILE (idempotent)"
-    psql_in -f - < "$SEED_FILE" >/dev/null
-    echo "   t_menu=$(psql_q 'SELECT count(*) FROM t_menu'), t_role_menu=$(psql_q 'SELECT count(*) FROM t_role_menu')"
-fi
+# ---------------------------------------------------------------------------- 9) seed（菜单目录 + 授权基线）
+# 默认按启动钩子同序应用两个 seed；SEED_FILE 环境变量可覆盖为自定义清单（空格分隔）。
+# 清单中任一文件缺失即硬失败（与 seed_apply.sh 同口径）：静默跳过会留下「菜单目录灌
+# 了、授权基线没灌」的半残库，而这是恢复流程里最难察觉的错。
+SEED_FILES="${SEED_FILE:-seeds/menu.sql seeds/rbac.sql}"
+for seed_file in $SEED_FILES; do
+    if [ ! -f "$seed_file" ]; then
+        echo "✗ seed 文件不存在: $seed_file" >&2
+        exit 1
+    fi
+    echo "-> apply seed: $seed_file (idempotent)"
+    psql_in -f - < "$seed_file" >/dev/null
+done
+echo "   t_menu=$(psql_q 'SELECT count(*) FROM t_menu'), t_role_menu=$(psql_q 'SELECT count(*) FROM t_role_menu')"
 
 # ---------------------------------------------------------------------------- 10) 目标新列告警 + 清理
 GAPS=$(awk -F'|' '$6 != "" { printf "    %-24s %s\n", $1, $6 }' "$DECISIONS")

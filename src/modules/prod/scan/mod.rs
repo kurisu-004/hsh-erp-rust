@@ -47,7 +47,11 @@
 //! ## 与 WS 的关系
 //! `worker-scan` 在 commit 后广播 `WORKER_SCAN_RETURNED` /
 //! `WORKER_SCAN_INSPECTED`（按**响应**的 `event_type`，不是请求的那个）+
-//! `WORKER_POOL_REFILL_DONE` / `WORKER_POOL_EMPTY`，**部分数量拆批时另发
+//! `WORKER_POOL_REFILL_DONE` / `WORKER_POOL_EMPTY`（**2026-10-14 起后者只在
+//! `stopped_reason == "POOL_EMPTY"` 时发**，「工人已拿满」不再冒充池空；判据与
+//! 另一产出点 `prod::queue` 的「改一同步二」见
+//! `handler/transition.rs::worker_scan` 的 doc），
+//! **部分数量拆批时另发
 //! `PART_BATCH_SPLIT`**（与 `pick-up` 那条同名同 payload 字段）；`pick-up` 广播
 //! `PART_PICKED_UP`（部分领取时另发 `PART_BATCH_SPLIT`）。**事件名一字不改** ——
 //! dashboard 与队列页在监听，改名会静默断链。

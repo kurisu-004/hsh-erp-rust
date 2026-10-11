@@ -47,12 +47,19 @@ async fn setup() -> PgPool {
 }
 
 fn test_current_user(roles: Vec<Role>) -> CurrentUser {
+    test_current_user_with_perms(roles, &[])
+}
+
+/// 同 [`test_current_user`]，另装权限点（`get_file_with_url` 的守卫是权限点
+/// `part.drawing.print` 后按需构造持有者）。
+fn test_current_user_with_perms(roles: Vec<Role>, perms: &[&str]) -> CurrentUser {
     CurrentUser {
         id: 1,
         username: "cnc_tester".into(),
         roles,
         shelf_ids: vec![],
         shelf_wildcard: false,
+        permissions: perms.iter().map(|s| s.to_string()).collect(),
     }
 }
 

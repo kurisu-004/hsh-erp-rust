@@ -334,10 +334,12 @@ pub async fn list_part_files(
 
 /// `GET /api/v2/files/objects/{file_id}/url` → 200 OK
 ///
-/// 权限：`PartFileService::get_file_with_url` 的 4 角色（Manager / Clerk / Inspector /
-/// CncProgrammer）—— **刻意不含 `ShelfAccount`**。本端点回的是 COS 预签直链
-/// （`url_expires_in_seconds = 3600`），拿到即可脱离本后端直接访问、直链可外传；
-/// 工控机账号的图纸预览走 `get_part_file_content`（后端代理、逐次过 RBAC）即可。
+/// 权限：`PartFileService::get_file_with_url` 的守卫是**权限点**
+/// `part.drawing.print`（2026-10-14 随 RBAC 面板迁移；默认矩阵 Manager / Clerk /
+/// Inspector / CncProgrammer，见 `seeds/rbac.sql`）—— **默认矩阵刻意不含
+/// `ShelfAccount`**。本端点回的是 COS 预签直链（`url_expires_in_seconds = 3600`），
+/// 拿到即可脱离本后端直接访问、直链可外传；工控机账号的图纸预览走
+/// `get_part_file_content`（后端代理、逐次过 RBAC）即可。
 /// 详见 `part_file/mod.rs` 模块 doc 的角色矩阵。
 pub async fn get_part_file_url(
     State(state): State<Arc<AppState>>,

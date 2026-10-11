@@ -179,6 +179,7 @@ fn test_current_user(roles: Vec<Role>) -> CurrentUser {
         roles,
         shelf_ids: vec![],
         shelf_wildcard: false,
+        permissions: Vec::new(),
     }
 }
 

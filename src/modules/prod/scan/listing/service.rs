@@ -8,7 +8,7 @@ use sqlx::PgConnection;
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::modules::prod::scan::dto::{HeldQuery, PickableQuery};
 use crate::modules::prod::scan::listing::repo::ScanListingRepo;
-use crate::modules::prod::scan::vo::ScanListOut;
+use crate::modules::prod::scan::vo::{HeldListOut, ScanListOut};
 use crate::shared::error::AppError;
 
 /// 两条端点共用的角色白名单。
@@ -95,25 +95,37 @@ impl ScanListingService {
 
     /// `GET /api/v2/prod/scan/held`：工人当前持有件。
     ///
-    /// 放回 / 送检页的**唯一**数据源，故出参比 `pickable` 多承担一层语义：
-    /// 批次的工序链位置（`chain_state` 三值 + `chain_next_process_*`）。
-    /// 货架 scope 收窄不适用（行已在工人手上，不是架上的候选池）。
+    /// 放回 / 送检页的**唯一**数据源，故出参比 `pickable` 多承担两层语义：
+    /// 批次的工序链位置（`chain_state` 三值 + `chain_next_process_*`）、以及
+    /// **容量**（`current_held` / `max_held_batches`，2026-10-14 新增，让前端能
+    /// 直接显示「已拿 2/5」并在触顶前置灰取件按钮）。货架 scope 收窄不适用
+    /// （行已在工人手上，不是架上的候选池）。
     pub async fn list_held(
         conn: &mut PgConnection,
         worker_id: i64,
         query: &HeldQuery,
         current: &CurrentUser,
-    ) -> Result<ScanListOut, AppError> {
+    ) -> Result<HeldListOut, AppError> {
         current.require_any_role(SCAN_LIST_ROLES)?;
         let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
         let offset = query.offset.unwrap_or(0).max(0);
         let items = ScanListingRepo::fetch_held(conn, worker_id, limit, offset).await?;
-        let total = ScanListingRepo::count_held(conn, worker_id).await?;
-        Ok(ScanListOut {
+        // ⚠️ `total` 与 `current_held` **绑成同一个局部变量**，让「两者恒等」在代码
+        // 里自证：它们是同一次 COUNT 的同一个值（都是「该工人当前持有的
+        // IN_PROCESS+WORKER+未软删 批次数」）。冗余暴露 `current_held` 是为了让
+        // 前端不必推断 `total` 在本端点恰好等于容量计数（见
+        // `vo::listing::HeldListOut` 的字段口径 ①）。
+        // ⚠️ **不要**为 `current_held` 再查一次 —— 那既多一条 SQL，又让两个字段
+        // 在并发下可能出现「total 与 current_held 差 1」的诡异现象。
+        let held_count = ScanListingRepo::count_held(conn, worker_id).await?;
+        let max_held = ScanListingRepo::fetch_max_held_batches(conn, worker_id).await?;
+        Ok(HeldListOut {
             items,
-            total,
+            total: held_count,
             limit,
             offset,
+            current_held: held_count,
+            max_held_batches: max_held,
         })
     }
 }
@@ -136,6 +148,7 @@ mod tests {
             roles,
             shelf_wildcard: wildcard,
             shelf_ids: ids,
+            permissions: Vec::new(),
         }
     }
 

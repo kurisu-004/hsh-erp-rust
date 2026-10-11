@@ -33,6 +33,10 @@ pub mod files;
 // 2026-09-19 IAM 域收尾（PR-4）：旧 alias `/auth` + `/users` nest 已下线，
 // `/api/v2/iam/*` 成为 IAM 域唯一对外接口。
 pub mod iam;
+// 2026-10-13 新增 mail_digest 域：交期到期汇总邮件的配置 + 预览 + 手动触发
+// （6 端点，全部 Manager 独占）+ 后台定时任务（`task::mail_digest`）。
+// SMTP 凭据只走 env（`MAIL_SMTP_*`），本域只管收件人 / 内容口径 / 调度配置（存 DB）。
+pub mod mail_digest;
 pub mod outsource;
 pub mod part;
 // 2026-10-02 域归属定案：原 `part_batch` 域（1866 行 helper，无独立 URL）整体
@@ -142,6 +146,11 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // 「候选 + 公司列 + 内联在途批次」的整块看板与它的移动写端点。
         .nest("/outsource-queue", outsource::queue_router())
         .nest("/statistics", statistics::router())
+        // 2026-10-13 新增：mail_digest 域（交期汇总邮件）。6 端点全部 Manager 独占，
+        // 角色守卫写在各 handler 第一行（`require_role(Role::Manager)`），此处不挂 role layer。
+        // 前缀 `/mail-digest`：本仓顶层 nest 惯例是 kebab-case 单段（`/part-files` /
+        // `/cnc-programs` / `/outsource-queue`），域名 `mail_digest` 直接连字符化。
+        .nest("/mail-digest", mail_digest::router())
         // 2026-09-28 新增：微信小程序 BFF 域（聚合端点 + 复用 IAM 鉴权）
         // 2026-10-11 重构：按小程序页面切子模块（`/login` + `/part-list`），
         //   URL 跟页面名走，旧 `/wx/iam/*` / `/wx/parts*` / `/wx/dashboard*`

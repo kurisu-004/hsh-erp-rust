@@ -2,7 +2,7 @@
 //!
 //! 覆盖：
 //! - create DRAFT happy path + DRAFT→SUBMITTED→APPROVED 状态机
-//! - approve MANAGER-only（CLERK 拒绝 403）
+//! - approve 权限点 `outsource.quote.approve`（矩阵 M；CLERK 拒绝 403）
 //! - reject SUBMITTED → REJECTED（review_note 必填）
 //! - submit DRAFT only（SUBMITTED 状态再 submit → 400）+ `version` 必填
 //! - soft-delete 仅 DRAFT / REJECTED 可删 + `version` 必填
@@ -652,7 +652,7 @@ async fn quote_full_lifecycle_draft_submit_approve() {
     assert_eq!(env_sub["data"]["status"], "SUBMITTED");
     assert!(env_sub["data"]["submitted_at"].is_string());
 
-    // approve (MANAGER-only — token 是 manager)
+    // approve（权限点 `outsource.quote.approve`，矩阵 M — token 是 manager）
     let (s_app, env_app) = send(
         app,
         json_request(

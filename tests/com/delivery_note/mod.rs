@@ -20,6 +20,8 @@
 //! - applicant_fallback.rs ← 2026-10-10 新增（`line_items[].applicant_name` 的装配件
 //!   回落口径：子件为空 ⇒ 回落装配件；散件仍 null；子件自带值不被覆盖；两条出参路径
 //!   同源）
+//! - view_permission.rs ← 2026-10-15 新增（`delivery_note.view` 三条读闸门矩阵：
+//!   list 收紧去 CNC + 详情 / batch-detail 补闸）
 //!
 //! ## 2026-10-08 删除
 //! - `attach_batches.rs` ← 原 tests/delivery/attach_batches.rs（`POST /{id}/attach-batches`
@@ -36,3 +38,4 @@ mod group;
 mod note;
 mod scan;
 mod scan_tree;
+mod view_permission;

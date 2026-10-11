@@ -123,7 +123,7 @@ pub struct OutsourceQuoteCreateRequest {
     pub note: Option<String>,
 }
 
-/// 审批通过（MANAGER-only）。
+/// 审批通过（权限点 `outsource.quote.approve`，矩阵 M）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct OutsourceQuoteApproveRequest {
     #[serde(default)]
@@ -131,7 +131,7 @@ pub struct OutsourceQuoteApproveRequest {
     pub version: i32,
 }
 
-/// 审批拒绝（MANAGER-only）。
+/// 审批拒绝（权限点 `outsource.quote.approve`，矩阵 M）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct OutsourceQuoteRejectRequest {
     pub review_note: String,

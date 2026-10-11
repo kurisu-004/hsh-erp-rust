@@ -7,7 +7,7 @@
 //! 1. [`WxLoginService::exchange_wecom_identity`] —— **事务外**的外部 HTTP + 入参
 //!    校验 + corpid 比对 + userid 归一化
 //! 2. [`WxLoginService::project_login`] —— 把 iam 域的 `LoginResponse` **投影**成本
-//!    子模块的 [`WxLoginOut`]（砍掉 `is_active` / `shelf_ids` / `menus`）
+//!    子模块的 [`WxLoginOut`]（砍掉 `is_active` / `shelf_ids` / `menus` / `permissions`）
 //!
 //! ## ⚠️ 本层**不知道事务**
 //! 仓库硬约束：事务边界在 handler（`pool.begin()` / `tx.commit()`），service 收
@@ -94,7 +94,7 @@ impl WxLoginService {
     /// iam 域 `LoginResponse` → [`WxLoginOut`] 投影（**本子模块 VO 不复用 iam 结构**）。
     ///
     /// 只取 4 个用户字段：`id` / `username` / `full_name` / `roles`。iam 侧的
-    /// `is_active` / `shelf_ids` / `menus` **一律不带**（理由见
+    /// `is_active` / `shelf_ids` / `menus` / `permissions` **一律不带**（理由见
     /// [`super::vo`] 模块 doc 的「为什么砍掉 4 个字段」表）。
     ///
     /// iam 域的 `LoginResponse` 在这里是**中间值**：`complete_login` 的返回类型
@@ -128,13 +128,16 @@ mod tests {
                 full_name: "n".into(),
                 is_active: true,
                 roles: vec!["MANAGER".into()],
+                // 非空：投影若误搬该字段，下面的 user 键集断言立刻失败
+                permissions: vec!["part.drawing.print".into()],
                 shelf_ids: vec!["7".into()],
                 menus: Vec::new(),
             },
         }
     }
 
-    /// 投影必须**只**搬 4 个用户字段，iam 侧那 3 个 Web 端字段不得泄漏进响应结构。
+    /// 投影必须**只**搬 4 个用户字段，iam 侧那 4 个 Web 端字段
+    /// （`is_active` / `shelf_ids` / `menus` / `permissions`）不得泄漏进响应结构。
     #[test]
     fn project_login_drops_web_only_user_fields() {
         let out = WxLoginService::project_login(login_response());
@@ -159,6 +162,12 @@ mod tests {
         let mut ukeys: Vec<&str> = user.keys().map(String::as_str).collect();
         ukeys.sort_unstable();
         assert_eq!(ukeys, vec!["full_name", "id", "roles", "username"]);
+
+        // 显式点名 permissions（fixture 里非空）—— 防止有人把「全集断言」改成子集断言后漏网
+        assert!(
+            !user.contains_key("permissions"),
+            "Web 端权限点不得进小程序登录响应: {user:?}"
+        );
 
         // 雪花 id 走 JSON string（防 JS 精度截断）
         assert_eq!(user.get("id").and_then(|i| i.as_str()), Some("42"));

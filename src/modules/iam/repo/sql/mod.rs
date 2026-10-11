@@ -27,7 +27,7 @@
 //! 用它等于把引用 move 出借来的内容（编译报 cannot move out of borrowed content）；
 //! `&mut **self` 才是 **reborrow** —— 重新借一层 `&mut PgConnection` 交给子文件
 //! free fn（其首参与之一致），`self` 本身保持可用。
-//! **22 个方法 = 22 处 reborrow**，与本文件 impl 块的方法数、`repo/mod.rs` 里 trait
+//! **方法数 = 处 reborrow 数**，与本文件 impl 块的方法数、`repo/mod.rs` 里 trait
 //! 的方法数三者恒等。`repo/mod.rs` 只承担 trait 声明与命名约定，不承载这个实现细节，
 //! 故说明就地留在本文件。
 
@@ -36,10 +36,31 @@ pub mod user;
 pub mod user_role;
 pub mod wx_identity;
 
+/// `t_menu` 按角色取启用中菜单（薄转发，2026-10-14 新增）。
+///
+/// 与 [`list_all_active_menus`] 同款：让 `iam::rbac` 消费菜单时不必 import
+/// `repo::sql::menu` 子模块路径（service 直连 SQL 子模块会绕过 `repo/mod.rs`
+/// 的命名约定层）。
+pub async fn list_active_menus_by_roles<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    roles: &[String],
+) -> Result<Vec<crate::modules::iam::repo::model::Menu>, sqlx::Error> {
+    menu::list_active_menus_by_roles(executor, roles).await
+}
+
+/// `t_menu` 全量启用中菜单（2026-10-14 新增，供 `iam::rbac` 的 `GET /iam/menus`
+/// 给 ADMIN 渲染完整勾选树）。
+pub async fn list_all_active_menus<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+) -> Result<Vec<crate::modules::iam::repo::model::Menu>, sqlx::Error> {
+    menu::list_all_active_menus(executor).await
+}
+
 use async_trait::async_trait;
 use chrono::NaiveDateTime;
 use sqlx::PgConnection;
 
+use crate::modules::iam::rbac::model::TRole;
 use crate::modules::iam::repo::model::{Menu, User, UserRole, WxIdentity};
 use crate::modules::iam::repo::{
     IamRepoTrait, UserInsert, UserPartialUpdate, UserRoleInsert, UserRoleRow, WxIdentityInsert,
@@ -170,12 +191,64 @@ impl IamRepoTrait for &mut PgConnection {
         user_role::soft_delete_user_role(&mut **self, id, version, when, updated_by).await
     }
 
-    // ── t_menu（1）──
+    // ── t_menu（2）──
     async fn list_active_menus_by_roles<'b>(
         &mut self,
         roles: &'b [String],
     ) -> Result<Vec<Menu>, sqlx::Error> {
         menu::list_active_menus_by_roles(&mut **self, roles).await
+    }
+    async fn list_all_active_menus(&mut self) -> Result<Vec<Menu>, sqlx::Error> {
+        menu::list_all_active_menus(&mut **self).await
+    }
+
+    // ── t_role_permission（1）──
+    async fn list_permission_codes_by_roles<'b>(
+        &mut self,
+        roles: &'b [String],
+    ) -> Result<Vec<String>, sqlx::Error> {
+        crate::modules::iam::rbac::repo::RbacRepo::list_permission_codes_by_roles(
+            &mut **self,
+            roles,
+        )
+        .await
+    }
+
+    // ── t_role（4）──
+    async fn get_active_role_by_code<'b>(
+        &mut self,
+        code: &'b str,
+    ) -> Result<Option<TRole>, sqlx::Error> {
+        crate::modules::iam::rbac::repo::RbacRepo::get_role_by_code(&mut **self, code).await
+    }
+    async fn list_active_role_codes<'b>(
+        &mut self,
+        codes: &'b [String],
+    ) -> Result<Vec<String>, sqlx::Error> {
+        crate::modules::iam::rbac::repo::RbacRepo::list_active_role_codes(&mut **self, codes).await
+    }
+    async fn lock_admin_role_for_update(&mut self) -> Result<(), sqlx::Error> {
+        crate::modules::iam::rbac::repo::RbacRepo::lock_role_by_code_for_update(
+            &mut **self,
+            crate::modules::iam::rbac::service::ADMIN_ROLE_CODE,
+        )
+        .await
+    }
+    async fn list_active_admin_user_ids(&mut self) -> Result<Vec<i64>, sqlx::Error> {
+        crate::modules::iam::rbac::repo::RbacRepo::list_active_user_ids_by_role_code(
+            &mut **self,
+            crate::modules::iam::rbac::service::ADMIN_ROLE_CODE,
+        )
+        .await
+    }
+
+    async fn has_active_admin_grants(&mut self, user_id: i64) -> Result<bool, sqlx::Error> {
+        crate::modules::iam::rbac::repo::RbacRepo::user_has_role(
+            &mut **self,
+            user_id,
+            crate::modules::iam::rbac::service::ADMIN_ROLE_CODE,
+        )
+        .await
     }
 
     // ── t_shelf（1）──

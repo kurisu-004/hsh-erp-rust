@@ -8,6 +8,8 @@
 //!   （`refill_*` / `WORKER_POOL_*` 事件）仍由本文件守。
 //! - `refill_when_pool_empty_returns_empty`
 //! - `refill_caps_at_max_held_batches`
+//! - `refill_respects_auto_allocate_limit`（2026-10-15：auto=2 < max=5，第一次 refill
+//!   恰好 2 批、第二次 `AUTO_LIMIT_REACHED`、`move` 仍可手动移动第 3 批）
 //! - `concurrent_refill_no_double_pick` [`#[ignore]`：需 app-level 并发基建]
 //! - `refill_respects_shelf_scope`
 //! - `refill_skips_concurrently_modified_batch` [`#[ignore]`：需并发模拟基建]
@@ -312,15 +314,53 @@ pub(crate) async fn login_manager_with_username(
     (app2, token)
 }
 
+/// CLERK user：以新 username 登入 + CLERK role。
+///
+/// 2026-10-15：`queue.allocate` 自 Manager 独占放宽为 M,C 的**放宽留痕用例**
+/// （refill / move 的 Clerk 正向）需要 Clerk token；与 `login_manager_with_username`
+/// 同形、只换角色。
+pub(crate) async fn login_clerk_with_username(
+    pool: &PgPool,
+    username: &str,
+) -> (axum::Router, String) {
+    let uid = insert_user_with_password(pool, username, "changeme").await;
+    add_role(pool, uid, "CLERK", None, None).await;
+    let state = test_state(pool.clone()).await;
+    let app = test_app(state.clone());
+    let req = json_request(
+        "POST",
+        "/iam/login",
+        Some(json!({"username": username, "password": "changeme"})),
+        None,
+    );
+    let (_, env) = send(app, req).await;
+    let token = env["data"]["token"].as_str().unwrap().to_string();
+    let app2 = test_app(state);
+    (app2, token)
+}
+
 // ===========================================================================
 //  worker-pool fixture helpers（worker_pool 独享，跨 binary 不迁移）
 // ===========================================================================
 
+/// 不带自动上限的工种（`auto_allocate_limit` 留 NULL ⇒ 自动路径兜底 max）。
 pub(crate) async fn insert_work_type(
     pool: &PgPool,
     code: &str,
     name: &str,
     max_held: Option<i32>,
+) -> i64 {
+    insert_work_type_with_auto(pool, code, name, max_held, None).await
+}
+
+/// 2026-10-15 新增：可指定 `auto_allocate_limit`（自动补料上限）的工种。
+/// `insert_work_type` 是本函数的 `auto=None` 薄包装，既有调用方零改动。
+pub(crate) async fn insert_work_type_with_auto(
+    pool: &PgPool,
+    code: &str,
+    name: &str,
+    max_held: Option<i32>,
+    auto_allocate_limit: Option<i32>,
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
     let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
@@ -328,12 +368,13 @@ pub(crate) async fn insert_work_type(
     let now = now_naive();
     sqlx::query!(
         "INSERT INTO t_work_type (id, code, name, sort_order, version, \
-         max_held_batches, created_at, updated_at) \
-         VALUES ($1, $2, $3, 0, 0, $4, $5, $5)",
+         max_held_batches, auto_allocate_limit, created_at, updated_at) \
+         VALUES ($1, $2, $3, 0, 0, $4, $5, $6, $6)",
         id,
         code,
         name,
         max_held,
+        auto_allocate_limit,
         now,
     )
     .execute(pool)
@@ -659,11 +700,28 @@ pub(crate) async fn part_chain_id(pool: &PgPool, part_id: i64) -> Option<i64> {
 }
 
 /// 把 part_id 给定批次标为 worker 持有（针对 pool→worker 流转后的批次）。
+///
+/// ## 2026-10-14：补 `AND status = 'IN_PROCESS'`
+///
+/// ⚠️ **本 helper 抄的正是修复前生产实现的错误谓词**（漏 `status` 过滤），
+/// 而它是本仓「容量误报」bug 能长期潜伏的结构原因：全仓 16 处调用点用的都是这个
+/// **自建 helper**，与生产实现零关联 —— 生产 SQL 改了、测试断言纹丝不动，于是测试
+/// 一直在给错误判据背书，「读侧判据与 `docs/api/queue.md` §4.3 分叉」这件事
+/// 整整一轮都没被测出来。
+///
+/// 现在与生产侧三处**逐字对齐**（`prod::batch::repo::queries::count_held_by_worker`、
+/// `prod::queue::board::repo::SQL_HELD_BATCHES_BY_WORKERS`、
+/// `prod::queue::repo::sql::take_one_from_pool` 的 `held` CTE）：
+/// `status = 'IN_PROCESS' AND location = 'WORKER' AND current_holder_id = $1
+/// AND deleted_at IS NULL`。
+///
+/// ⚠️ 这条谓词**有测试被它改成红**：造出「终态批次却仍挂在工人名下」的幽灵行去
+/// 断言容量的用例，断言的是修复前的错误行为。处置见各用例注释。
 pub(crate) async fn count_held_by_worker(pool: &PgPool, worker_id: i64) -> i64 {
     sqlx::query_scalar!(
         r#"SELECT COUNT(*) AS "n!"
         FROM t_part_batch
-        WHERE current_holder_id = $1 AND location = 'WORKER' AND deleted_at IS NULL"#,
+        WHERE current_holder_id = $1 AND location = 'WORKER' AND status = 'IN_PROCESS' AND deleted_at IS NULL"#,
         worker_id,
     )
     .fetch_one(pool)
@@ -843,6 +901,108 @@ async fn refill_caps_at_max_held_batches() {
     assert_eq!(taken.len(), 5, "max=5，应 taken=5: {env}");
     let held = count_held_by_worker(&pool, worker).await;
     assert_eq!(held, 5, "worker 持有 = 5");
+}
+
+/// 场景 4b（2026-10-15 新增）: refill 受工种**自动上限**约束，手动路径不受影响。
+///
+/// auto=2 < max=5，池里 10 件：
+/// 1. 第一次 refill 恰好抢 2（补到 auto，不是 max）；
+/// 2. 第二次 refill → `stopped_reason=AUTO_LIMIT_REACHED`（不是 WORKER_FULL ——
+///    硬上限还有名额）；
+/// 3. `POST /queue/move` 仍能把下一批手动移到工人手上（move 走
+///    `ensure_worker_has_capacity`，只按 max=5 判）——「自动上限只管自动路径」
+///    这条分工的回归锚点。
+#[tokio::test]
+async fn refill_respects_auto_allocate_limit() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "POOL4B").await;
+    let proc = seed_process(&pool, "PROC-DB", "工序DB").await;
+    // auto=2 < max=5：自动路径目标 2，手动路径仍可到 5
+    let wt = insert_work_type_with_auto(&pool, "WT-DB", "工种DB", Some(5), Some(2)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let prod_shelf = insert_shelf(&pool, "PROD-DB", "PROD-DB", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc).await;
+
+    let worker = insert_worker(&pool, "BC004B", "工4B", Some(wt)).await;
+    for i in 0..10 {
+        let sn = format!("PDB-{:03}", i);
+        insert_pool_part(&pool, customer, &sn, prod_shelf, proc, 1).await;
+    }
+
+    // 1) 第一次 refill：补到 auto=2
+    let (app, token) = login_manager_with_username(&pool, "admin4B").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/queue/refill",
+            Some(json!({
+                "worker_id": worker.to_string(),
+                "shelf_id": prod_shelf.to_string(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "admin refill: {env}");
+    assert_eq!(
+        env["data"]["taken"].as_array().unwrap().len(),
+        2,
+        "auto=2 ⇒ 第一次 refill 恰好 2 批（不是 max=5）: {env}"
+    );
+    assert_eq!(count_held_by_worker(&pool, worker).await, 2);
+
+    // 2) 第二次 refill：池里还有 8 件候选，但已到 auto 上限 ⇒ AUTO_LIMIT_REACHED
+    let (app, token) = login_manager_with_username(&pool, "admin4Bb").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/queue/refill",
+            Some(json!({
+                "worker_id": worker.to_string(),
+                "shelf_id": prod_shelf.to_string(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "refill 永远返 200: {env}");
+    assert_eq!(env["data"]["taken"].as_array().unwrap().len(), 0);
+    assert_eq!(env["data"]["pool_empty"], true);
+    assert_eq!(
+        env["data"]["stopped_reason"], "AUTO_LIMIT_REACHED",
+        "池里有货、held(2) < max(5) ⇒ 成因是自动上限: {env}"
+    );
+
+    // 3) 手动路径不受 auto 影响：move 第 3 批到该工人（held=2 < max=5 ⇒ 放行）
+    let (_part3, batch3) = insert_pool_part(&pool, customer, "PDB-MV1", prod_shelf, proc, 1).await;
+    let (app, token) = login_manager_with_username(&pool, "admin4Bc").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/queue/move",
+            Some(json!({
+                "batch_id": batch3.to_string(),
+                "version": 0,
+                "from": { "kind": "POOL", "shelf_id": prod_shelf.to_string() },
+                "to":   { "kind": "WORKER", "worker_id": worker.to_string() },
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "move 是手动路径，只按 max=5 判 ⇒ 第 3 批应放行: {env}"
+    );
+    assert_eq!(
+        env["data"]["max_held"], 5,
+        "响应仍按硬上限报 max_held: {env}"
+    );
+    assert_eq!(count_held_by_worker(&pool, worker).await, 3);
 }
 
 /// 场景 5: 并发 refill 不双抢（`#[ignore]`：缺并发 app 基建）
@@ -1670,7 +1830,7 @@ async fn board_process_detail_process_not_found() {
     assert_eq!(env["code"], 20801, "BIZ_PROCESS_NOT_FOUND: {env}");
 }
 
-/// 场景 H3: ShelfAccount 角色 → 40300 FORBIDDEN（service 守卫：Manager/Clerk/Inspector only）
+/// 场景 H3: ShelfAccount 角色 → 40300 FORBIDDEN（权限点 `queue.view`，矩阵 M,C,I）
 #[tokio::test]
 async fn board_process_detail_forbidden_for_shelf_account() {
     let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
@@ -2722,3 +2882,588 @@ async fn has_process_chain_reflects_chain_and_pointer_state() {
 // ===========================================================================
 //  2026-10-10：worker-scan 自动选架 / 链尾自动送检 / refill 跨架取料
 // ===========================================================================
+
+// ===========================================================================
+//  2026-10-14：容量契约回归（Bug 1 读侧判据 / Bug 2 取件守卫 / F 诊断字段）
+// ===========================================================================
+
+/// 把一批 IN_PROCESS+WORKER 的批次取消掉（`POST /prod/batches/{id}/cancel`）。
+///
+/// 返回 HTTP 状态 + 信封，供调用方断言。
+async fn cancel_batch(
+    app: axum::Router,
+    token: &str,
+    batch_id: i64,
+    version: i32,
+) -> (StatusCode, Value) {
+    send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/batches/{batch_id}/cancel"),
+            Some(json!({ "version": version })),
+            Some(token),
+        ),
+    )
+    .await
+}
+
+/// 读批次的 (status, location, current_holder_id)。
+async fn read_batch_state(pool: &PgPool, batch_id: i64) -> (String, Option<String>, Option<i64>) {
+    sqlx::query_as("SELECT status, location, current_holder_id FROM t_part_batch WHERE id = $1")
+        .bind(batch_id)
+        .fetch_one(pool)
+        .await
+        .expect("read t_part_batch state")
+}
+
+/// G2（Bug 1 回归）：取消掉手上的 1 批后，**仍能继续下发到第 10 批**。
+///
+/// 这条是「读侧判据补 `status` 过滤」+「CANCELLED 清位置」两道修复合起来的
+/// 端到端验证。修复前有两道独立的坎，任一道没过都表现为「工人莫名其妙拿不满」：
+/// 1. 判据只判 `location + holder` ⇒ 被取消的批次**永久**占着额度（即使它已经
+///    不在工人手上了），取消得越多工人越被卡死；
+/// 2. `mark_batch_status_only` 不清位置 ⇒ 被取消的批次仍以 `location='WORKER'`
+///    的形态留在表里，与第 1 条叠加。
+///
+/// 走 `move` POOL→WORKER 分支逐批下发到上限 10，再取消其中 1 批，第 11 批必须
+/// 仍然发得出去。
+#[tokio::test]
+async fn cancelling_one_held_batch_releases_capacity_for_the_next() {
+    const MAX_HELD: i32 = 10;
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "POOL-CAP").await;
+    let proc = seed_process(&pool, "PROC-CAP", "工序CAP").await;
+    let wt = insert_work_type(&pool, "WT-CAP", "工种CAP", Some(MAX_HELD)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let prod_shelf = insert_shelf(&pool, "PROD-CAP", "PROD-CAP", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc).await;
+    let worker = insert_worker(&pool, "BC-CAP", "工CAP", Some(wt)).await;
+
+    // 池里备 12 件（10 + 取消后再发 1 + 1 富余）
+    let mut pool_batches = Vec::new();
+    for i in 0..12 {
+        let sn = format!("CAP-{i:03}");
+        let (_p, b) = insert_pool_part(&pool, customer, &sn, prod_shelf, proc, 1).await;
+        pool_batches.push(b);
+    }
+
+    let (app, token) = login_manager_with_username(&pool, "admin_cap").await;
+
+    // 逐批下发到上限
+    for (i, batch_id) in pool_batches.iter().take(MAX_HELD as usize).enumerate() {
+        let (s, env) = send(
+            app.clone(),
+            json_request(
+                "POST",
+                "/prod/queue/move",
+                Some(json!({
+                    "batch_id": batch_id.to_string(),
+                    "version": 0,
+                    "from": { "kind": "POOL",   "shelf_id": prod_shelf.to_string() },
+                    "to":   { "kind": "WORKER", "worker_id": worker.to_string() },
+                })),
+                Some(&token),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "第 {} 批下发应成功: {env}", i + 1);
+    }
+    assert_eq!(
+        count_held_by_worker(&pool, worker).await,
+        MAX_HELD as i64,
+        "下发 {MAX_HELD} 批后应正好持满"
+    );
+
+    // 第 11 批此时必须被拒（额度用尽）
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/prod/queue/move",
+            Some(json!({
+                "batch_id": pool_batches[MAX_HELD as usize].to_string(),
+                "version": 0,
+                "from": { "kind": "POOL",   "shelf_id": prod_shelf.to_string() },
+                "to":   { "kind": "WORKER", "worker_id": worker.to_string() },
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "满员时第 11 批应被拒: {env}");
+    assert_eq!(env["code"], 20204, "BIZ_WORKER_HOLD_LIMIT_EXCEEDED: {env}");
+
+    // 取消第 1 批 → 额度必须释放
+    // ⚠️ cancel 端点也要客户端 OCC 锚，且 move 那一步已把 version 推到 1 —— 必须现读
+    let cancelled = pool_batches[0];
+    let cancelled_version: i32 =
+        sqlx::query_scalar("SELECT version FROM t_part_batch WHERE id = $1")
+            .bind(cancelled)
+            .fetch_one(&pool)
+            .await
+            .expect("read batch version");
+    assert_eq!(
+        cancelled_version, 1,
+        "move 的 OCC 应把 version 推到 1（cancel 时不能用 fixture 的初值 0）"
+    );
+    let (s, env) = cancel_batch(app.clone(), &token, cancelled, cancelled_version).await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "取消持批中的第 1 批应成功（IN_PROCESS 是 CANCELLED 的合法源）: {env}"
+    );
+
+    // D1 不变式：终态批次的位置与持有人一并清掉
+    let (status, location, holder) = read_batch_state(&pool, cancelled).await;
+    assert_eq!(status, "CANCELLED");
+    assert_eq!(location, None, "终态批次不应留在任何位置");
+    assert_eq!(holder, None, "终态批次不应留在任何人名下");
+
+    assert_eq!(
+        count_held_by_worker(&pool, worker).await,
+        MAX_HELD as i64 - 1,
+        "取消 1 批后应释放一格额度"
+    );
+
+    // 第 11 批现在必须发得出去（修复前到这里会被 20204 拒）
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/prod/queue/move",
+            Some(json!({
+                "batch_id": pool_batches[MAX_HELD as usize].to_string(),
+                "version": 0,
+                "from": { "kind": "POOL",   "shelf_id": prod_shelf.to_string() },
+                "to":   { "kind": "WORKER", "worker_id": worker.to_string() },
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "取消 1 批后第 11 批应下发成功（回归点）: {env}"
+    );
+    assert_eq!(
+        count_held_by_worker(&pool, worker).await,
+        MAX_HELD as i64,
+        "补发后应重新持满 {MAX_HELD}"
+    );
+    assert_eq!(
+        env["data"]["current_held"], MAX_HELD,
+        "MoveResult 应报补发后的持有数"
+    );
+    assert_eq!(env["data"]["max_held"], MAX_HELD);
+}
+
+/// G5：part 级批量取消后，工人容量被正确释放。
+///
+/// 覆盖 D2（`apply_bulk_batch_status_change_for_part` 的 UPDATE 追加
+/// `location = NULL, current_holder_id = NULL`）—— 那条 bulk 写点此前不清位置，
+/// 于是 `POST /parts/{id}/cancel` 级联取消的批次仍挂在工人名下，额度不释放。
+///
+/// ## ⚠️ 为什么造「一 part 两批次、一条在工人手上」的混合形态
+///
+/// `mark_part_cancelled` 的合法源状态是 `PENDING / PROGRAMMING / INSPECTION /
+/// READY_TO_SHIP / DELIVERED` —— **`IN_PROCESS` 不在其中**（在产工单不许取消）。
+/// 所以「整 part 都在工人手上」这种形态**根本取消不了**，本用例必须造出真实可达的
+/// 形态：
+///
+/// - 批次 A：`IN_PROCESS` + `location='WORKER'` + `current_holder_id=<工人>`（在加工）
+/// - 批次 B：`INSPECTION` + `location='INSPECTION_SHELF'`
+/// - part 派生状态 = min-progress = `INSPECTION`（`INSPECTION` 的 progress 4 >
+///   `IN_PROCESS` 的 2，见 `part::statemachine::part_status_progress`）⇒ **可取消**
+///
+/// part 级取消级联把 A、B 一起打成 `CANCELLED`。若 D2 没做，A 会仍以
+/// `location='WORKER'` 挂在该工人名下 ⇒ 额度不释放，正是本次要修的 bug。
+#[tokio::test]
+async fn part_level_cancel_releases_worker_capacity() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "POOL-PTC").await;
+    let proc = seed_process(&pool, "PROC-PTC", "工序PTC").await;
+    let wt = insert_work_type(&pool, "WT-PTC", "工种PTC", Some(1)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let prod_shelf = insert_shelf(&pool, "PROD-PTC", "PROD-PTC", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc).await;
+    let insp_shelf = insert_shelf(&pool, "INSP-PTC", "INSP-PTC", "INSPECTION").await;
+    let worker = insert_worker(&pool, "BC-PTC", "工PTC", Some(wt)).await;
+
+    // 手工造上面那种混合形态（`insert_pool_part` 造的是单批 IN_PROCESS+架上）
+    let (part_id, b_held, b_insp) = insert_mixed_state_part(
+        &pool, customer, "PTC-001", proc, prod_shelf, insp_shelf, worker,
+    )
+    .await;
+
+    assert_eq!(
+        count_held_by_worker(&pool, worker).await,
+        1,
+        "前置：工人应持有 1 批（上限也是 1，已满）"
+    );
+
+    // 容量已满 ⇒ 先确认发不进去（证明本用例确实在测「额度释放」而不是空跑）
+    let (_p4, b4) = insert_pool_part(&pool, customer, "PTC-004", prod_shelf, proc, 1).await;
+    let (app, token) = login_manager_with_username(&pool, "admin_ptc").await;
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/prod/queue/move",
+            Some(json!({
+                "batch_id": b4.to_string(),
+                "version": 0,
+                "from": { "kind": "POOL",   "shelf_id": prod_shelf.to_string() },
+                "to":   { "kind": "WORKER", "worker_id": worker.to_string() },
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "满员时下发应 409（20204）: {env}");
+    assert_eq!(env["code"], 20204, "BIZ_WORKER_HOLD_LIMIT_EXCEEDED: {env}");
+
+    // part 级取消（源状态 INSPECTION，合法）
+    let version: i32 = sqlx::query_scalar("SELECT version FROM t_part WHERE id = $1")
+        .bind(part_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read part version");
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/parts/{part_id}/cancel"),
+            Some(json!({ "version": version })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "part 级取消应成功: {env}");
+
+    // D2 不变式：两条批次的 location / holder 都应被清成 NULL
+    for (b, what) in [(b_held, "工人手上那条"), (b_insp, "品检架那条")] {
+        let (status, location, holder) = read_batch_state(&pool, b).await;
+        assert_eq!(status, "CANCELLED", "{what}应被级联取消");
+        assert_eq!(location, None, "D2：终态批次不应留在任何位置（{what}）");
+        assert_eq!(holder, None, "D2：终态批次不应留在任何人名下（{what}）");
+    }
+    assert_eq!(
+        count_held_by_worker(&pool, worker).await,
+        0,
+        "part 级批量取消后工人额度应全部释放"
+    );
+
+    // 额度释放后可以再发一批（端到端对数）
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/queue/move",
+            Some(json!({
+                "batch_id": b4.to_string(),
+                "version": 0,
+                "from": { "kind": "POOL",   "shelf_id": prod_shelf.to_string() },
+                "to":   { "kind": "WORKER", "worker_id": worker.to_string() },
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "额度释放后应能再下发一批: {env}");
+    assert_eq!(count_held_by_worker(&pool, worker).await, 1);
+}
+
+/// 造一个 part + 两条批次（见 `part_level_cancel_releases_worker_capacity` 的 doc
+/// 解释为什么必须是这个混合形态）：
+/// - 批次 1 = `IN_PROCESS` + `WORKER` + 挂在该工人名下
+/// - 批次 2 = `INSPECTION` + `INSPECTION_SHELF`
+/// - part 派生状态写死 `INSPECTION`（min-progress）⇒ 可取消
+///
+/// 返回 `(part_id, held_batch_id, inspection_batch_id)`。
+async fn insert_mixed_state_part(
+    pool: &PgPool,
+    customer_id: i64,
+    serial_no: &str,
+    process_id: i64,
+    _prod_shelf: i64,
+    inspection_shelf: i64,
+    worker_id: i64,
+) -> (i64, i64, i64) {
+    use hsh_erp_rust::infra::clock::now_naive;
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
+    let now = now_naive();
+    let today = now.date();
+    let part_id = snowflake.next_id();
+    sqlx::query!(
+        "INSERT INTO t_part (id, serial_no, name, drawing_no, applicant_name, \
+         request_date, planned_delivery_date, system_delivery_date, status, \
+         is_urgent, customer_id, quantity, version, created_at, updated_at) \
+         VALUES ($1, $2, 'mixed-state-item', 'D-MIX', $2, $3, $3, $3, 'INSPECTION', \
+         false, $4, 1, 0, $5, $5)",
+        part_id,
+        serial_no,
+        today,
+        customer_id,
+        now,
+    )
+    .execute(pool)
+    .await
+    .expect("insert mixed-state t_part");
+
+    let held_batch_id = snowflake.next_id();
+    sqlx::query!(
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
+         current_holder_id, current_process_id, version, created_at, updated_at) \
+         VALUES ($1, $2, 1, 1, 'IN_PROCESS', 'WORKER', $3, $4, 0, $5, $5)",
+        held_batch_id,
+        part_id,
+        worker_id,
+        process_id,
+        now,
+    )
+    .execute(pool)
+    .await
+    .expect("insert mixed-state batch（工人手上）");
+
+    let insp_batch_id = snowflake.next_id();
+    sqlx::query!(
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
+         current_holder_id, current_process_id, version, created_at, updated_at) \
+         VALUES ($1, $2, 2, 1, 'INSPECTION', 'INSPECTION_SHELF', $3, $4, 0, $5, $5)",
+        insp_batch_id,
+        part_id,
+        inspection_shelf,
+        process_id,
+        now,
+    )
+    .execute(pool)
+    .await
+    .expect("insert mixed-state batch（品检架）");
+    (part_id, held_batch_id, insp_batch_id)
+}
+
+/// G6-a：`/refill` 触顶（工人满）时 `stopped_reason == "WORKER_FULL"`。
+///
+/// F 的核心回归：改造前「池空」与「工人满」在响应里**长得一模一样**
+/// （`pool_empty: true`），运维无从判断 `/refill` 为什么什么都没干。
+#[tokio::test]
+async fn refill_when_worker_full_reports_worker_full() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "POOL-WF").await;
+    let proc = seed_process(&pool, "PROC-WF", "工序WF").await;
+    // 上限 1，池里 3 件 ⇒ 抢满后仍剩候选，但工人已满
+    let wt = insert_work_type(&pool, "WT-WF", "工种WF", Some(1)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let prod_shelf = insert_shelf(&pool, "PROD-WF", "PROD-WF", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc).await;
+    let worker = insert_worker(&pool, "BC-WF", "工WF", Some(wt)).await;
+    for i in 0..3 {
+        insert_pool_part(&pool, customer, &format!("WF-{i:03}"), prod_shelf, proc, 1).await;
+    }
+
+    let (app, token) = login_manager_with_username(&pool, "admin_wf").await;
+    let refill = || async {
+        send(
+            app.clone(),
+            json_request(
+                "POST",
+                "/prod/queue/refill",
+                Some(json!({
+                    "worker_id": worker.to_string(),
+                    "shelf_id": prod_shelf.to_string(),
+                })),
+                Some(&token),
+            ),
+        )
+        .await
+    };
+
+    let (s, env) = refill().await;
+    assert_eq!(s, StatusCode::OK, "第 1 次 refill 应成功: {env}");
+    assert_eq!(
+        env["data"]["taken"].as_array().unwrap().len(),
+        1,
+        "上限 1 应只抢 1 批: {env}"
+    );
+
+    // 第 2 次：池里还有 2 件候选，但工人已满 ⇒ WORKER_FULL（不是 POOL_EMPTY）
+    let (s, env) = refill().await;
+    assert_eq!(s, StatusCode::OK, "refill 永远返 200（不是错误）: {env}");
+    assert_eq!(
+        env["data"]["taken"].as_array().unwrap().len(),
+        0,
+        "已满不应再抢到: {env}"
+    );
+    // `pool_empty` 语义一个字都没改（既有 wire 契约，前端在读）
+    assert_eq!(
+        env["data"]["pool_empty"], true,
+        "pool_empty 仍为 true: {env}"
+    );
+    assert_eq!(
+        env["data"]["stopped_reason"], "WORKER_FULL",
+        "池里明明还有货 ⇒ 停止原因必须是 WORKER_FULL 而非 POOL_EMPTY: {env}"
+    );
+}
+
+/// G6-b：`/refill` 池空时 `stopped_reason == "POOL_EMPTY"`。
+///
+/// 与 G6-a 成对：证明诊断**真的在区分两种成因**，而不是恒填一个值。
+#[tokio::test]
+async fn refill_when_pool_empty_reports_pool_empty() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    // ⚠️ 客户造了但**一个 part 都不造** —— 这正是「池空」的定义。
+    // G6-a 里同一个位置会造 3 个 `insert_pool_part`；两者的唯一区别就是这一行。
+    let _customer = insert_customer_l2(&pool, "POOL-PE").await;
+    let proc = seed_process(&pool, "PROC-PE", "工序PE").await;
+    let wt = insert_work_type(&pool, "WT-PE", "工种PE", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let prod_shelf = insert_shelf(&pool, "PROD-PE", "PROD-PE", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc).await;
+    let worker = insert_worker(&pool, "BC-PE", "工PE", Some(wt)).await;
+    // ⚠️ **池里一件都不放** —— 这是与 G6-a 的唯一区别
+
+    let (app, token) = login_manager_with_username(&pool, "admin_pe").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/queue/refill",
+            Some(json!({
+                "worker_id": worker.to_string(),
+                "shelf_id": prod_shelf.to_string(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "refill 永远返 200: {env}");
+    assert_eq!(env["data"]["taken"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        env["data"]["pool_empty"], true,
+        "pool_empty 语义不变: {env}"
+    );
+    assert_eq!(
+        env["data"]["stopped_reason"], "POOL_EMPTY",
+        "池里没货且工人没满 ⇒ POOL_EMPTY: {env}"
+    );
+    // 该 worker 此时持有 0（远未满 5）⇒ 排除「误判成 WORKER_FULL」
+    assert_eq!(count_held_by_worker(&pool, worker).await, 0);
+}
+
+/// G6-c：`/refill` 抢到东西时 `stopped_reason` 整个 key **不出现**。
+///
+/// `skip_serializing_if = "Option::is_none"` 的契约：不许在 happy path 上多发一个
+/// 恒为 `null` 的 key（前端 zod strip 模式下两种都能过，但显式省略让「没诊断信息」
+/// 这件事在 wire 上自证，也避免占用响应体）。
+#[tokio::test]
+async fn refill_success_omits_stopped_reason() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "POOL-SR").await;
+    let proc = seed_process(&pool, "PROC-SR", "工序SR").await;
+    let wt = insert_work_type(&pool, "WT-SR", "工种SR", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let prod_shelf = insert_shelf(&pool, "PROD-SR", "PROD-SR", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc).await;
+    let worker = insert_worker(&pool, "BC-SR", "工SR", Some(wt)).await;
+    insert_pool_part(&pool, customer, "SR-001", prod_shelf, proc, 1).await;
+
+    let (app, token) = login_manager_with_username(&pool, "admin_sr").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/queue/refill",
+            Some(json!({
+                "worker_id": worker.to_string(),
+                "shelf_id": prod_shelf.to_string(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "refill 应成功: {env}");
+    assert!(
+        !env["data"]
+            .as_object()
+            .expect("data 是 object")
+            .contains_key("stopped_reason"),
+        "抢到东西时 stopped_reason 应整个 key 不出现（skip_serializing_if）: {env}"
+    );
+}
+
+// ===========================================================================
+//  权限点闸门（2026-10-15 新增）
+// ===========================================================================
+
+/// 场景 12：refill 守卫迁 `queue.allocate` 后**放宽留痕** —— 原 Manager 独占
+/// 放宽为 M,C（用户定稿），Clerk 应能真正取走料。
+#[tokio::test]
+async fn refill_allows_clerk_after_allocation_widening() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "POOL12").await;
+    let proc = seed_process(&pool, "PROC-CLK", "工序CLK").await;
+    let wt = insert_work_type(&pool, "WT-CLK", "工种CLK", Some(10)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let prod_shelf = insert_shelf(&pool, "PROD-CLK", "PROD-CLK", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc).await;
+    let worker = insert_worker(&pool, "BC-CLK", "工CLK", Some(wt)).await;
+    let (_p, _b) = insert_pool_part(&pool, customer, "P-CLK", prod_shelf, proc, 1).await;
+
+    let (app, token) = login_clerk_with_username(&pool, "clerk_refill").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/queue/refill",
+            Some(json!({
+                "worker_id": worker.to_string(),
+                "shelf_id": prod_shelf.to_string(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "Clerk refill 应 200（放宽后）: {env}");
+    let taken = env["data"]["taken"].as_array().expect("data.taken");
+    assert_eq!(taken.len(), 1, "Clerk 应能真正取走 1 批: {env}");
+}
+
+/// 场景 13：move 守卫迁 `queue.allocate` 后**放宽留痕** —— Clerk 的
+/// POOL→WORKER 调度应放行（原 Manager 独占）。
+#[tokio::test]
+async fn move_allows_clerk_after_allocation_widening() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "POOL13").await;
+    let proc = seed_process(&pool, "PROC-CLK2", "工序CLK2").await;
+    let wt = insert_work_type(&pool, "WT-CLK2", "工种CLK2", Some(10)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let prod_shelf = insert_shelf(&pool, "PROD-CLK2", "PROD-CLK2", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc).await;
+    let worker = insert_worker(&pool, "BC-CLK2", "工CLK2", Some(wt)).await;
+    let (_p, pool_batch) = insert_pool_part(&pool, customer, "P-CLK2", prod_shelf, proc, 1).await;
+
+    let (app, token) = login_clerk_with_username(&pool, "clerk_move").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/queue/move",
+            Some(json!({
+                "batch_id": pool_batch.to_string(),
+                "version": 0,
+                "from": { "kind": "POOL", "shelf_id": prod_shelf.to_string() },
+                "to":   { "kind": "WORKER", "worker_id": worker.to_string() },
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "Clerk move 应 200（放宽后）: {env}");
+    assert_eq!(
+        count_held_by_worker(&pool, worker).await,
+        1,
+        "批次应真的移到工人手上"
+    );
+}

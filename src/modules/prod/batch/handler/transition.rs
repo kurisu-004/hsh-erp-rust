@@ -28,6 +28,13 @@
 //! `POST /api/v2/prod/scan/worker-scan`，**无 alias**）。本文件保留批量流转 +
 //! 单件 to-XXX + 扫码品检 / 司机发货 + 集合读。
 //!
+//! ## 权限（2026-10-15）
+//! to-XXX 流 5 条（单件 to-ship / to-inspection / to-process + 批量 to-ship /
+//! to-inspection）统一 `batch.transition`（M,I；迁自 `TO_XXX_ROLES` 角色守卫，
+//! 矩阵逐格相同，常量与 `Role` import 随迁移删除）；`scan-inspect` 的守卫在
+//! service（同点）。`scan/deliver`（司机扫码，设备流）保持角色守卫不动；
+//! 集合读 `/repair` / `/repairing` 走 `batch.repair`。
+//!
 //! ## 2026-10-02 语义变更
 //! 子资源 19 条的 `batch_id` 从**请求体**移到**路径参数**。事件 `kind` 字符串
 //! （`PART_TO_SHIP` / `PART_TO_INSPECTION` / `PART_TO_PROCESS` 等）逐字不变，
@@ -40,7 +47,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use serde_json::json;
 
-use crate::auth::rbac::{CurrentUser, Role};
+use crate::auth::rbac::CurrentUser;
 use crate::infra::ws_hub::WsEvent;
 use crate::modules::part::vo::PartOut;
 use crate::modules::prod::batch::dto::{
@@ -55,9 +62,6 @@ use crate::modules::prod::batch::vo::{BatchToXxxOut, InspectionBatchListOut, ToX
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
-
-/// to-XXX 流均允许的角色：Manager 或 Inspector。
-const TO_XXX_ROLES: &[Role] = &[Role::Manager, Role::Inspector];
 
 /// to-ship WS 广播事件（commit 后调用）。
 fn ws_broadcast_to_ship(state: &AppState, part_id: i64) {
@@ -98,7 +102,7 @@ fn ws_broadcast_assembly_updated(state: &AppState, assembly_id: i64) {
 /// `POST /api/v2/prod/batches/{batch_id}/to-ship`
 ///
 /// 行为：
-/// - 权限：`Manager` 或 `Inspector`
+/// - 权限：`batch.transition`（2026-10-15 迁自 Manager / Inspector 角色守卫）
 /// - 入参：path `batch_id` + body `ToShipRequest`（`version` 必填）
 /// - 业务流转：`INSPECTION` → `READY_TO_SHIP`（含多批次 rollup 守卫 + 批次级 OCC）
 /// - WS 广播：commit 后 `PART_TO_SHIP`
@@ -109,7 +113,9 @@ pub async fn to_ship(
     Path(batch_id): Path<i64>,
     Json(req): Json<ToShipRequest>,
 ) -> Result<Json<R<ToXxxOut>>, AppError> {
-    current.require_any_role(TO_XXX_ROLES)?;
+    // 2026-10-15：迁权限点 `batch.transition`（M,I；矩阵逐格等于原
+    // TO_XXX_ROLES 集合）。
+    current.require_permission("batch.transition")?;
     let mut tx = state.pool.begin().await?;
     let out = BatchService::to_ship(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
     tx.commit().await?;
@@ -126,7 +132,7 @@ pub async fn to_ship(
 /// 后续 item，失败原因收集到 `failed` Vec（与 service 内契约一致）。
 ///
 /// 行为：
-/// - 权限：`Manager` 或 `Inspector`
+/// - 权限：`batch.transition`（2026-10-15 迁自 Manager / Inspector 角色守卫）
 /// - 入参：`{ items: [{ batch_id, quantity? }, ...] }`
 /// - 入参 shape 校验：handler 先做一次（兜底），service 再做一次（防御性双校验）
 /// - 业务流转：per-item 独立 `to_ship_core`（共享事务）
@@ -137,7 +143,9 @@ pub async fn batch_to_ship(
     current: CurrentUser,
     Json(req): Json<BatchToShipRequest>,
 ) -> Result<Json<R<BatchToXxxOut>>, AppError> {
-    current.require_any_role(TO_XXX_ROLES)?;
+    // 2026-10-15：迁权限点 `batch.transition`（M,I；矩阵逐格等于原
+    // TO_XXX_ROLES 集合）。
+    current.require_permission("batch.transition")?;
     if req.items.is_empty() {
         return Err(AppError::validation("items 不能为空"));
     }
@@ -174,7 +182,7 @@ pub async fn batch_to_ship(
 /// 单件送检（`PENDING / PROGRAMMING / IN_PROCESS` → `INSPECTION`）。
 ///
 /// 行为：
-/// - 权限：`Manager` 或 `Inspector`
+/// - 权限：`batch.transition`（2026-10-15 迁自 Manager / Inspector 角色守卫）
 /// - 入参：path `batch_id` + body `ToInspectionRequest`（`version` 必填）
 /// - 业务流转：见 service `to_inspection_core`（含批次级 OCC）
 /// - WS 广播：commit 后 `PART_TO_INSPECTION`
@@ -185,7 +193,9 @@ pub async fn to_inspection(
     Path(batch_id): Path<i64>,
     Json(req): Json<ToInspectionRequest>,
 ) -> Result<Json<R<ToXxxOut>>, AppError> {
-    current.require_any_role(TO_XXX_ROLES)?;
+    // 2026-10-15：迁权限点 `batch.transition`（M,I；矩阵逐格等于原
+    // TO_XXX_ROLES 集合）。
+    current.require_permission("batch.transition")?;
     let mut tx = state.pool.begin().await?;
     let out =
         BatchService::to_inspection(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
@@ -202,7 +212,7 @@ pub async fn to_inspection(
 /// 单件品检打回（`INSPECTION` → `IN_PROCESS`，推荐需求 3）。
 ///
 /// 行为：
-/// - 权限：`Manager` 或 `Inspector`
+/// - 权限：`batch.transition`（2026-10-15 迁自 Manager / Inspector 角色守卫）
 /// - 入参：path `batch_id` + body `ToProcessRequest`（`version` 必填）
 /// - 业务流转：见 service `to_process_core`（含批次级 OCC）
 /// - WS 广播：commit 后 `PART_TO_PROCESS`
@@ -213,7 +223,9 @@ pub async fn to_process(
     Path(batch_id): Path<i64>,
     Json(req): Json<ToProcessRequest>,
 ) -> Result<Json<R<ToXxxOut>>, AppError> {
-    current.require_any_role(TO_XXX_ROLES)?;
+    // 2026-10-15：迁权限点 `batch.transition`（M,I；矩阵逐格等于原
+    // TO_XXX_ROLES 集合）。
+    current.require_permission("batch.transition")?;
     let mut tx = state.pool.begin().await?;
     let out = BatchService::to_process(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
     tx.commit().await?;
@@ -271,7 +283,7 @@ pub async fn scan_deliver_part(
 
 /// `GET /api/v2/prod/batches/repair`
 ///
-/// DELIVERED 批次列表（Manager + Inspector）。只读端点：
+/// DELIVERED 批次列表（权限点 `batch.repair`，M,C,I）。只读端点：
 /// `pool.acquire()` 不开事务。
 pub async fn list_repair_batches(
     State(state): State<Arc<AppState>>,
@@ -285,8 +297,8 @@ pub async fn list_repair_batches(
 
 /// `GET /api/v2/prod/batches/repairing`
 ///
-/// 返修中批次列表（`t_part_batch.is_repairing = true`，Manager + Inspector）。
-/// 判据是 `is_repairing = true`（REPAIRING 降级为标记列，不是状态）。
+/// 返修中批次列表（`t_part_batch.is_repairing = true`；权限点 `batch.repair`，
+/// M,C,I）。判据是 `is_repairing = true`（REPAIRING 降级为标记列，不是状态）。
 /// 只读端点：`pool.acquire()` 不开事务。
 pub async fn list_repairing_batches(
     State(state): State<Arc<AppState>>,
@@ -303,7 +315,7 @@ pub async fn list_repairing_batches(
 /// 批量送检（共享品检架 + per-item `to_inspection_core`）。
 ///
 /// 行为：
-/// - 权限：`Manager` 或 `Inspector`
+/// - 权限：`batch.transition`（2026-10-15 迁自 Manager / Inspector 角色守卫）
 /// - 入参：`{ target_inspection_shelf_id, items: [...] }`（无 Path extractor）
 /// - 业务流转：service `batch_to_inspection`（共享外层事务 + per-item 独立 core）
 /// - WS 广播：commit 后 `BATCH_TO_INSPECTION`
@@ -313,7 +325,9 @@ pub async fn batch_to_inspection(
     current: CurrentUser,
     Json(req): Json<BatchToInspectionRequest>,
 ) -> Result<Json<R<BatchToXxxOut>>, AppError> {
-    current.require_any_role(TO_XXX_ROLES)?;
+    // 2026-10-15：迁权限点 `batch.transition`（M,I；矩阵逐格等于原
+    // TO_XXX_ROLES 集合）。
+    current.require_permission("batch.transition")?;
     if req.items.is_empty() {
         return Err(AppError::validation("items 不能为空"));
     }
