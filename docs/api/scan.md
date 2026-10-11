@@ -1166,8 +1166,14 @@ repo 都不 import（连 `PartRepoTrait` 都不借 —— 那是一个 part 域�
 13. **2026-10-15 S3：外协确认收回前端接入 + `locate` 假阻挡订正**（§0.0 / §2.9 / §3.6）：
     - **新端点** `POST /api/v2/prod/scan/outsource-receive`（Manager / ShelfAccount）：
       `locate` 给出 `RECEIVE_FROM_OUTSOURCE` 的批次用「诊断行的 `batch_id` +
-      `version`」直接发起；`chain_state != "NEXT"`（含无链）时**必须弹手填工序**
-      （缺省且无链 → `40001`）。成功后可拿响应的 `version` 继续做 OCC 锚。
+      `version`」直接发起；工序参数两条形态（2026-10-15 review 订正）：
+      `chain_state != "NEXT"`（含无链）时**必须弹手填工序**（缺省且无链 →
+      `40001`）；`chain_state == "NEXT"` 时也**必须把 locate 行返回的
+      `next_process_id` 原样回传**（不得省略）—— 写侧缺省推导的
+      `NEXT_PROCESS_LATERAL_SQL` 口径是 `sort_order = 当前 + 1`，与读侧
+      `sort_order > 当前 LIMIT 1` **在稀疏链上不等价**，仅当写侧可推导时才可省略
+      （两类形态与根因见 §8 残余失败组合第 4 条）。成功后可拿响应的 `version`
+      继续做 OCC 锚。
       错误码矩阵见 §2.9 —— 注意 `40001` → HTTP **422**、`20702` / `20508` / `20122`
       都是 **404 / 409**（本仓集中映射的结果，别按「业务错一律 400」处理）。
     - **`disabled_reason` 字面量集合 10 → 9**：`"PROCESS_CHAIN_REQUIRED"` 已删除 ——
@@ -1328,6 +1334,25 @@ LEFT JOIN 一次），该写法**假定** holder id 在三表 PK 空间里互不
    可拿去对工种映射）；**有链且手填工序不在链内 ⇒ `20702`**。另有读侧完全不预判的
    **`20508`**（收回时该工序无可用生产架 —— 选架只在写入时发生）。三者都在写侧有
    显式错误码且失败**零写入**，前端必须保留错误分支（逐条登记见下文）。
+4. **外协收回的「读侧给 `NEXT`、写侧缺省推不出」（S3，2026-10-15 review 补登记）**：
+   `locate` 的 `chain_state` / `next_process_id` 取自
+   `shared::batch::chain::CHAIN_POSITION_LATERAL_SQL`（下一道按
+   `sort_order > 当前 ORDER BY ASC LIMIT 1`），而 `POST /scan/outsource-receive`
+   缺省 `next_process_id` 时走 outsource 域的 `NEXT_PROCESS_LATERAL_SQL`
+   （`sort_order = 当前 + 1`）+ `optional_process_chain`（只读
+   `t_part.process_chain_id`）—— 以下两类形态读侧可推、写侧缺省必推不出：
+   - **(a) 稀疏链**（如 `[10, 20]`、批次在 10）：读侧 `>` 推得出 ⇒
+     `chain_state == "NEXT"` 且 `next_process_id` 有值；写侧 `= 当前 + 1` 无行 ⇒
+     缺省返 **`20706`**。前端按 §7.2 第 13 条把 locate 行的 `next_process_id`
+     显式回传即可绕过。根因在 outsource 域 `src/modules/outsource/repo/sql.rs`
+     的 `NEXT_PROCESS_LATERAL_SQL`（同样影响 `/outsource-queue/move` 的回收推导
+     与看板 `chain_resolvable`），**属 outsource 域独立改动，本功能不动**。
+   - **(b) part 无链但批次 step 指针存活**（两处锚链表达式都是
+     `COALESCE(p.process_chain_id, cur.chain_id)` 的回退形态，legacy 恢复数据可达）：
+     读侧锚到指针所属活跃链、可给 `NEXT`；写侧缺省预检 `optional_process_chain`
+     只看 part 列 ⇒ `None` ⇒ 缺省必拒 **`40001`**。显式回传 locate 行的
+     `next_process_id` 同样绕过（写侧显式值不做链归属校验，step 落 NULL）；
+     **无写路径可产出该形态**，登记为已知偏差。
 
 `locate` 是**诊断**不是**预演**：它按当前读到的数据回答「大概率能做什么」，
 最终裁决永远在写端点。上述组合若在真机上频繁出现，正确处置是**补一手写侧闸门的

@@ -177,6 +177,51 @@ async fn insert_assembly(pool: &PgPool, customer_id: i64, serial_no: &str) -> i6
     id
 }
 
+/// 插一个 `t_user` + 指定角色并登录，返回 access token（与
+/// `tests/production/pending_programming.rs::login_user_with_role` 同款写法）。
+///
+/// 403 用例需要一个**非白名单**角色：fixture 预置的 4 个账号（Manager / Clerk /
+/// Inspector / ShelfAccount）全部命中 `SCAN_LIST_ROLES`，故现场造 `CNC_PROGRAMMER`。
+async fn login_user_with_role(
+    pool: &PgPool,
+    app: &axum::Router,
+    username: &str,
+    role: &str,
+) -> String {
+    use hsh_erp_rust::auth::password;
+    use hsh_erp_rust::infra::clock::now_naive;
+
+    let hash = password::hash(ProductionFixture::PASSWORD).expect("bcrypt hash");
+    let user_id = next_id();
+    let role_id = next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_user (id, username, password_hash, full_name, is_active, \
+         refresh_token_version, version, created_at, updated_at) \
+         VALUES ($1, $2, $3, $2, true, 0, 0, $4, $4)",
+    )
+    .bind(user_id)
+    .bind(username)
+    .bind(hash)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_user");
+    sqlx::query(
+        "INSERT INTO t_user_role (id, user_id, role, scope_type, scope_id, version, \
+         created_at, updated_at) VALUES ($1, $2, $3, NULL, NULL, 0, $4, $4)",
+    )
+    .bind(role_id)
+    .bind(user_id)
+    .bind(role)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_user_role");
+
+    login_token(app, username, ProductionFixture::PASSWORD).await
+}
+
 // ===========================================================================
 //  HTTP helper
 // ===========================================================================
@@ -284,6 +329,22 @@ async fn locate_inactive_worker_returns_20202() {
     let (s, env) = locate(&app, &token, "SN-INACT", Some(worker)).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{env}");
     assert_eq!(env["code"], 20202);
+}
+
+/// 角色门禁：非白名单角色（`CNC_PROGRAMMER`）→ `40300` / HTTP 403。
+///
+/// `locate` 只读诊断也守白名单（Manager / Clerk / Inspector / ShelfAccount）——
+/// 同批 `take-over` / `outsource-receive` 都有 403 用例，本端点此前缺位；本用例
+/// 钉住「漏掉守卫」或「白名单被放宽」都会让它变红。
+#[tokio::test]
+async fn locate_non_whitelisted_role_returns_40300() {
+    let (pool, app, _manager, _fx) = bootstrap_as_manager().await;
+    // fixture 预置的 4 个账号都是白名单角色；现场造一个 CNC_PROGRAMMER 账号。
+    let token = login_user_with_role(&pool, &app, "locate_cnc_programmer", "CNC_PROGRAMMER").await;
+
+    let (s, env) = locate(&app, &token, "SN-LOCATE-403", None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "CNC_PROGRAMMER 应 403: {env}");
+    assert_eq!(env["code"], 40300, "FORBIDDEN: {env}");
 }
 
 /// 提取器层 rejection：`worker_id` 非数字（`abc`）/ 漏传 `serial_no`

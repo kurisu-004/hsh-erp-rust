@@ -50,7 +50,7 @@
 //! **只调一次**（part 派生 + 父装配件级联），再写 `TRANSFERRED` 事件留痕。
 //! 不做部分数量 —— 接管是整批动作。
 
-use crate::auth::rbac::CurrentUser;
+use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::assembly::service::SyncOutcome;
 use crate::modules::part::repo::PartRepoTrait;
@@ -69,14 +69,17 @@ use super::ScanService;
 impl ScanService {
     /// `POST /api/v2/prod/scan/take-over`：扫码接管（2026-10-15 新增，S2）。
     ///
-    /// 角色守卫在 handler（Manager + ShelfAccount，与 worker-scan 同款）；
-    /// 事务边界亦在 handler。判据顺序见本文件模块 doc 的表。
+    /// 角色守卫在 handler 与 service 双层（2026-10-15 review 订正，与 pickup /
+    /// outsource_receive 对齐）；事务边界在 handler。判据顺序见本文件模块 doc 的表。
     pub async fn take_over<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
         req: TakeOverRequest,
         current: &CurrentUser,
     ) -> Result<TakeOverOut, AppError> {
+        // ── 0. 角色守卫（service 入口第一行，2026-10-15 review 补，与 pickup /
+        //    outsource_receive 对齐；handler 侧已有同名守卫，行为逐字不变）──────
+        current.require_any_role(&[Role::Manager, Role::ShelfAccount])?;
         // ── 1. 工牌 → worker（与 worker-scan 逐条同形，include_deleted=false）──
         let worker = WorkerRepo::get_by_badge_code(repo.conn_mut(), &req.badge_code, false)
             .await?

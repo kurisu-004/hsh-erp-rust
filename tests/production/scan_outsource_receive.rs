@@ -412,6 +412,99 @@ async fn outsource_receive_manual_next_not_in_work_type_returns_20104() {
     assert_eq!(count_part_events(&pool, st.part_id).await, 0);
 }
 
+/// 有链但**当前工序 / 指针均被清空** + 缺省 `next_process_id` → `20706`
+/// （HTTP 409，零写入）。
+///
+/// 出池清工序不变式下外协批次两列均为 NULL；此时锚链仍在（part 绑着链），写侧
+/// `NEXT_PROCESS_LATERAL_SQL` 推不出下一道 ⇒ `20706`（两段文案的「有链推不出」段）。
+/// 与 §8 残余失败组合第 4 条对位：显式回传 `next_process_id` 可绕过本形态。
+#[tokio::test]
+async fn outsource_receive_chain_without_position_returns_20706() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let st = setup_receive(&pool, "OR-NOPOS", true, true).await;
+    sqlx::query(
+        "UPDATE t_part_batch SET current_process_id = NULL, current_process_step_id = NULL \
+         WHERE id = $1",
+    )
+    .bind(st.batch_id)
+    .execute(&pool)
+    .await
+    .expect("clear process columns");
+    assert!(
+        part_chain_id(&pool, st.part_id).await.is_some(),
+        "前置：工单仍绑着链（否则会落到无链的 40001 分支）"
+    );
+
+    let (s, env) = receive(&app, &token, body(&st, 0, None)).await;
+    assert_eq!(s, StatusCode::CONFLICT, "20706 归 409 段: {env}");
+    assert_eq!(env["code"], 20706, "BIZ_PROCESS_CHAIN_REQUIRED: {env}");
+    assert!(
+        env["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("无法推导下一道工序"),
+        "有链推不出 ⇒ 文案应为「请手填」段: {env}"
+    );
+    let (status, location, holder, _p, _step, version, _q) = read_batch(&pool, st.batch_id).await;
+    assert_eq!(status, "OUTSOURCE", "20706 必须零写入");
+    assert_eq!(location.as_deref(), Some("OUTSOURCE_COMPANY"));
+    assert_eq!(holder, Some(st.company_id));
+    assert_eq!(version, 0);
+    assert_eq!(count_part_events(&pool, st.part_id).await, 0);
+}
+
+// ===========================================================================
+//  stage① 选架失败（20508）的零写入
+// ===========================================================================
+
+/// 下一道工序**无可用生产架**（唯一映射被软删）→ stage① 选架落空返 `20508`
+/// （HTTP 404，零写入）。
+///
+/// 判据 1–8 全部**先于任何写**：失败时批次仍 `OUTSOURCE + OUTSOURCE_COMPANY`、
+/// 开口 shipment 仍 `OUTSOURCING`、零 part 事件、version 不变。
+#[tokio::test]
+async fn outsource_receive_no_shelf_for_next_process_returns_20508() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let st = setup_receive(&pool, "OR-NOSH", true, true).await;
+    let (sid, _qid) = insert_open_shipment(
+        &pool,
+        st.part_id,
+        st.batch_id,
+        st.company_id,
+        st.current_process_id,
+    )
+    .await;
+    // 唯一映射「下一道」的货架映射软删 ⇒ 选架候选集为空（写侧 20508）。
+    sqlx::query("UPDATE t_shelf_process SET deleted_at = now() WHERE shelf_id = $1")
+        .bind(st.shelf_id)
+        .execute(&pool)
+        .await
+        .expect("soft delete shelf mapping");
+
+    let (s, env) = receive(&app, &token, body(&st, 0, Some(st.next_process_id))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "20508 归 404 段: {env}");
+    assert_eq!(env["code"], 20508, "BIZ_SHELF_PROCESS_NOT_FOUND: {env}");
+    // ---- 零写入逐项 ----
+    let (status, location, holder, _p, _step, version, _q) = read_batch(&pool, st.batch_id).await;
+    assert_eq!(status, "OUTSOURCE", "20508 必须零写入（批次状态）");
+    assert_eq!(location.as_deref(), Some("OUTSOURCE_COMPANY"));
+    assert_eq!(holder, Some(st.company_id), "在途公司不变");
+    assert_eq!(version, 0, "version 不变");
+    let (shipment_status, received_at): (String, Option<chrono::NaiveDateTime>) =
+        sqlx::query_as("SELECT status, received_at FROM t_outsource_shipment WHERE id = $1")
+            .bind(sid)
+            .fetch_one(&pool)
+            .await
+            .expect("read shipment");
+    assert_eq!(shipment_status, "OUTSOURCING", "shipment 必须仍开口");
+    assert_eq!(received_at, None);
+    assert_eq!(
+        count_part_events(&pool, st.part_id).await,
+        0,
+        "20508 必须零 part 事件"
+    );
+}
+
 // ===========================================================================
 //  批次形态 / OCC / 工牌
 // ===========================================================================
@@ -436,6 +529,43 @@ async fn outsource_receive_wrong_status_20103() {
     let (status, _loc, _h, _p, _step, version, _q) = read_batch(&pool, st.batch_id).await;
     assert_eq!(status, "IN_PROCESS", "20103 必须零写入");
     assert_eq!(version, 0);
+}
+
+/// `OUTSOURCE + OUTSOURCE_COMPANY` 但 **holder 为 NULL**（数据异常）→ `20122`
+/// （HTTP 409，零写入）。
+///
+/// 在途公司 = 批次行上的持有人；NULL 时写侧取不到 `company_id`，与「位置对不上」
+/// 同类拒 `20122`（与 S1 `locate` 的 `locate_outsource_holder_null_returns_unknown`
+/// 同一条订正）。
+#[tokio::test]
+async fn outsource_receive_holder_null_returns_20122() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let st = setup_receive(&pool, "OR-NOH", true, true).await;
+    force_batch_state(
+        &pool,
+        st.batch_id,
+        "OUTSOURCE",
+        Some("OUTSOURCE_COMPANY"),
+        None,
+    )
+    .await;
+
+    let (s, env) = receive(&app, &token, body(&st, 0, Some(st.next_process_id))).await;
+    assert_eq!(s, StatusCode::CONFLICT, "20122 归 409 段: {env}");
+    assert_eq!(env["code"], 20122, "BIZ_BATCH_LOCATION_MISMATCH: {env}");
+    assert!(
+        env["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("没有持有人"),
+        "文案应指向「数据异常：没有持有人（公司）」: {env}"
+    );
+    let (status, location, holder, _p, _step, version, _q) = read_batch(&pool, st.batch_id).await;
+    assert_eq!(status, "OUTSOURCE", "20122 必须零写入");
+    assert_eq!(location.as_deref(), Some("OUTSOURCE_COMPANY"));
+    assert_eq!(holder, None, "holder 保持 NULL");
+    assert_eq!(version, 0);
+    assert_eq!(count_part_events(&pool, st.part_id).await, 0);
 }
 
 /// 批次 location 不是 `OUTSOURCE_COMPANY` → `20122`（HTTP 409，零写入）。

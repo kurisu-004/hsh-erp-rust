@@ -422,6 +422,46 @@ async fn take_over_wrong_location_returns_20103() {
     assert_eq!(version, 0);
 }
 
+/// `IN_PROCESS + WORKER` 但 **holder 为 NULL**（数据异常）→ `20103`（零写入）。
+///
+/// 接管的前提是「批次挂在别人手上」；无人持有则无对象可接管 —— 写侧因此拒 `20103`
+/// （与 S1 `locate` 的 `classify_batch`「holder 为 NULL 不给 TAKE_OVER」同一条订正）。
+#[tokio::test]
+async fn take_over_worker_holder_null_returns_20103() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let (_part, batch, _holder, _taker, _proc2, _step2) =
+        setup_derivable(&pool, "TO-NOH", true).await;
+    // 制造数据异常形态：位置还在 WORKER，持有人已被清空。
+    sqlx::query("UPDATE t_part_batch SET current_holder_id = NULL WHERE id = $1")
+        .bind(batch)
+        .execute(&pool)
+        .await
+        .expect("clear holder");
+
+    let (s, env) = take_over(
+        &app,
+        &token,
+        json!({
+            "batch_id": batch.to_string(),
+            "badge_code": "TO-NOH-T",
+            "version": 0,
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{env}");
+    assert_eq!(env["code"], 20103, "BIZ_INVALID_TRANSITION: {env}");
+    assert!(
+        env["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("没有持有人"),
+        "文案应指向「数据异常：没有持有人」: {env}"
+    );
+    let (_st, _loc, h, _p, _step, version, _q, _r) = read_batch(&pool, batch).await;
+    assert_eq!(h, None, "20103 必须零写入");
+    assert_eq!(version, 0);
+}
+
 /// 工牌未注册 → `20201`（HTTP 404）。
 #[tokio::test]
 async fn take_over_badge_not_found_20201() {
