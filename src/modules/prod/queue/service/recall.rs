@@ -15,7 +15,7 @@
 //! commit 后仍发 `PART_RECALLED`（payload = `{"part_id": "…"}`）—— 大屏
 //! （`/ws/dashboard`）消费该事件刷新在制清单，改事件名会让大屏静默失联。
 
-use crate::auth::rbac::{CurrentUser, Role};
+use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
@@ -34,6 +34,9 @@ use super::queue::QueueService;
 impl QueueService {
     /// `POST /api/v2/prod/queue/recall`：召回待下发。
     ///
+    /// 权限（2026-10-15）：`queue.recall`（M,C；矩阵逐格等于原
+    /// `require_any_role` 集合）。
+    ///
     /// 源状态：`IN_PROCESS`（位置限 `PRODUCTION_SHELF` 或 `WORKER`）或
     /// `PROGRAMMING` → `PENDING`。副作用是把 `location` / `current_holder_id` /
     /// `current_process_id` / `current_process_step_id` 四列一起清 NULL
@@ -44,7 +47,7 @@ impl QueueService {
         req: RecallToPendingRequest,
         current: &CurrentUser,
     ) -> Result<RecallOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk])?;
+        current.require_permission("queue.recall")?;
         let batch = repo
             .find_batch_by_id(req.batch_id)
             .await?

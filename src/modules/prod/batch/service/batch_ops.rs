@@ -9,7 +9,7 @@
 //! max+1 / INSERT / UPDATE 三条 SQL，OCC 守源批次），service 层再加
 //! `BIZ_PART_BATCH_INVALID_QUANTITY` 防御性校验。
 
-use crate::auth::rbac::{CurrentUser, Role};
+use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
@@ -53,13 +53,16 @@ impl BatchService {
     /// 顶层共用端点 `POST /api/v2/batches/split`（三个消费方：生产队列看板 /
     /// 外协看板 / 零件详情页），故 `batch_id` 改从入参 DTO 取、不再走路径参数。
     /// 守卫链、OCC、数量守卫与 WS payload 一律不变。
+    /// 权限（2026-10-15）：`batch.split`（M,C）。
     pub async fn split_batch<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
         req: SplitBatchByBodyRequest,
         current: &CurrentUser,
     ) -> Result<SplitBatchOutcome, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk])?;
+        // 2026-10-15：迁权限点 `batch.split`（M,C；矩阵逐格等于原
+        // `require_any_role` 集合）。
+        current.require_permission("batch.split")?;
         let batch = repo
             .find_batch_by_id(req.batch_id)
             .await?
@@ -150,7 +153,9 @@ impl BatchService {
         req: CancelBatchRequest,
         current: &CurrentUser,
     ) -> Result<crate::modules::part::vo::PartOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk])?;
+        // 2026-10-15：迁权限点 `batch.cancel`（M,C；矩阵逐格等于原
+        // `require_any_role` 集合）。
+        current.require_permission("batch.cancel")?;
         let batch = repo
             .find_batch_by_id(batch_id)
             .await?

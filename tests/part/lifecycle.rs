@@ -1528,3 +1528,29 @@ async fn by_work_type_tolerates_null_serial_no() {
         "同页有序列号的行不受影响: {env}"
     );
 }
+
+// ===========================================================================
+//  权限点闸门（2026-10-15 新增）
+// ===========================================================================
+
+/// deliver / complete 迁 `batch.deliver`（M,C；2026-10-15 自角色守卫迁移）——
+/// Inspector 无该点 ⇒ 40300。
+///
+/// 守卫在 handler 首行（先于 service），故不需要真实 batch / part；路径上的
+/// 数字 id 只过 `Path<i64>` 解析。
+#[tokio::test]
+async fn deliver_and_complete_forbidden_for_inspector() {
+    let (_pool, app, token, _fx) = bootstrap_as_inspector().await;
+    for uri in [
+        "/prod/batches/123456789/deliver",
+        "/prod/batches/123456789/complete",
+    ] {
+        let (s, env) = send(
+            app.clone(),
+            json_request("POST", uri, Some(json!({ "version": 0 })), Some(&token)),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{uri} Inspector 应 403: {env}");
+        assert_eq!(env["code"], 40300, "{uri} 应 40300: {env}");
+    }
+}

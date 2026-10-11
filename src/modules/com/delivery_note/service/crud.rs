@@ -51,12 +51,9 @@ impl DeliveryNoteService {
         offset: i64,
         current: &CurrentUser,
     ) -> Result<DeliveryNoteListOut, AppError> {
-        current.require_any_role(&[
-            Role::Manager,
-            Role::Clerk,
-            Role::Inspector,
-            Role::CncProgrammer,
-        ])?;
+        // 2026-10-15：迁权限点 `delivery_note.view`（矩阵 M,C,I），自原
+        // `require_any_role(M,C,I,CNC)` **收紧去 CNC**（用户定稿）。
+        current.require_permission("delivery_note.view")?;
 
         let rows = repo
             .note_list_with_filters(

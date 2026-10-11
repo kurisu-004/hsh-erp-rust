@@ -21,7 +21,7 @@
 
 use sqlx::PgConnection;
 
-use crate::auth::rbac::{CurrentUser, Role};
+use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
@@ -57,7 +57,9 @@ impl BatchService {
         req: CompleteRepairRequest,
         current: &CurrentUser,
     ) -> Result<crate::modules::part::vo::PartOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
+        // 2026-10-15：迁权限点 `batch.repair`（M,C,I；矩阵逐格等于原
+        // `require_any_role` 集合）。
+        current.require_permission("batch.repair")?;
         let batch = repo
             .find_batch_by_id(batch_id)
             .await?
@@ -246,7 +248,9 @@ impl BatchService {
         req: RepairDispatchRequest,
         current: &CurrentUser,
     ) -> Result<crate::modules::part::vo::PartOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
+        // 2026-10-15：迁权限点 `batch.repair`（M,C,I；矩阵逐格等于原
+        // `require_any_role` 集合）。
+        current.require_permission("batch.repair")?;
         let batch = repo
             .find_batch_by_id(batch_id)
             .await?
@@ -406,7 +410,9 @@ impl BatchService {
         query: &RepairBatchListQuery,
         current: &CurrentUser,
     ) -> Result<InspectionBatchListOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
+        // 2026-10-15：迁权限点 `batch.repair`（M,C,I；矩阵逐格等于原
+        // `require_any_role` 集合）。
+        current.require_permission("batch.repair")?;
         Self::list_batches_matching(
             repo.conn_mut(),
             query,
@@ -435,7 +441,9 @@ impl BatchService {
         query: &RepairBatchListQuery,
         current: &CurrentUser,
     ) -> Result<InspectionBatchListOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
+        // 2026-10-15：迁权限点 `batch.repair`（M,C,I；矩阵逐格等于原
+        // `require_any_role` 集合）。
+        current.require_permission("batch.repair")?;
         Self::list_batches_matching(repo.conn_mut(), query, BatchListFilter::Repairing, current)
             .await
     }

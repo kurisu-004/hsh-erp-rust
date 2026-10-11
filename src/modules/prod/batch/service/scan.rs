@@ -41,7 +41,10 @@ impl BatchService {
         req: ScanInspectRequest,
         current: &CurrentUser,
     ) -> Result<crate::modules::part::vo::PartOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Inspector])?;
+        // 2026-10-15：迁权限点 `batch.transition`（M,I；矩阵逐格等于原
+        // `require_any_role` 集合）。`scan_deliver_part`（司机扫码，设备流）
+        // 保持角色守卫不动。
+        current.require_permission("batch.transition")?;
         let batch = repo
             .find_batch_by_id(batch_id)
             .await?

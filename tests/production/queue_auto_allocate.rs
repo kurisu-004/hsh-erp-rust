@@ -233,6 +233,27 @@ async fn login_manager_with_username(pool: &PgPool, username: &str) -> (axum::Ro
     (app2, token)
 }
 
+/// CLERK user：与 `login_manager_with_username` 同形、只换角色。
+///
+/// 2026-10-15：`queue.allocate` 自 Manager 独占放宽为 M,C 的**放宽留痕用例**
+/// 需要 Clerk token。
+async fn login_clerk_with_username(pool: &PgPool, username: &str) -> (axum::Router, String) {
+    let uid = insert_user_with_password(pool, username, "changeme").await;
+    add_role(pool, uid, "CLERK", None, None).await;
+    let state = test_state(pool.clone()).await;
+    let app = test_app(state.clone());
+    let req = json_request(
+        "POST",
+        "/iam/login",
+        Some(json!({"username": username, "password": "changeme"})),
+        None,
+    );
+    let (_, env) = send(app, req).await;
+    let token = env["data"]["token"].as_str().unwrap().to_string();
+    let app2 = test_app(state);
+    (app2, token)
+}
+
 // ===========================================================================
 //  worker-pool auto_allocate fixture helpers（本 sub-file 独享，跨 binary 不迁移）
 // ===========================================================================
@@ -686,4 +707,47 @@ async fn auto_allocate_process_not_found() {
     .await;
     assert_eq!(s, StatusCode::NOT_FOUND, "无 process 应 404: {env}");
     assert_eq!(env["code"], 20801, "BIZ_PROCESS_NOT_FOUND: {env}");
+}
+
+// ===========================================================================
+//  权限点闸门（2026-10-15 新增）
+// ===========================================================================
+
+/// 场景 7：auto-allocate 守卫迁 `queue.allocate` 后**放宽留痕** —— 原 Manager
+/// 独占放宽为 M,C（用户定稿），Clerk 应能触发补料并真的补到上限。
+#[tokio::test]
+async fn auto_allocate_allows_clerk_after_allocation_widening() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "AC7").await;
+    let proc = seed_process(&pool, "PROC-AC7", "工序").await;
+    let wt = insert_work_type(&pool, "WT-AC7", "工种", Some(5), Some(2)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let shelf = insert_shelf(&pool, "PROD-AC7", "PROD-AC7", "PRODUCTION").await;
+    link_shelf_to_process(&pool, shelf, proc).await;
+
+    let worker = insert_worker(&pool, "BC-AC7", "工", Some(wt)).await;
+    for i in 0..10 {
+        let sn = format!("AC7-P-{:03}", i);
+        insert_pool_part(&pool, customer, &sn, shelf, proc, 1).await;
+    }
+
+    let (app, token) = login_clerk_with_username(&pool, "clerk_ac7").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/queue/auto-allocate",
+            Some(json!({
+                "process_id": proc.to_string(),
+                "shelf_id": shelf.to_string(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "Clerk auto-allocate 应 200（放宽后）: {env}");
+    let filled = env["data"]["filled"].as_array().expect("filled array");
+    assert_eq!(filled.len(), 1);
+    assert_eq!(filled[0]["worker_id"], worker.to_string());
+    assert_eq!(filled[0]["filled_count"], 2, "Clerk 应能补到 auto 上限: {env}");
 }

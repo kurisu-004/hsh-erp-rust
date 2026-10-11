@@ -35,10 +35,12 @@
 //! `RECEIVED_FROM_OUTSOURCE` 逐字保留（第三个 `RECEIVED_TO_INSPECTION` 随 2026-10-10
 //! 的 `OUTSOURCE_COMPANY → INSPECTION_SHELF` 方向下线而不再被写入）。
 //!
-//! ## 权限模式
-//! - deliver / complete / place-on-shelf / recall-to-pending / split / cancel：
-//!   Manager + Clerk
-//! - complete-repair / repair-dispatch / start-repair：Manager + Clerk + Inspector
+//! ## 权限模式（2026-10-15 第二批迁点后）
+//! - deliver / complete：`batch.deliver`（M,C；handler + service 双层）
+//! - start-repair：`batch.repair`（M,C,I；handler + service 双层）
+//! - complete-repair / repair-dispatch：`batch.repair`（service 内单层，本轮只换点）
+//! - split：`batch.split`、cancel：`batch.cancel`（service 内单层）
+//! - place-on-shelf / release-from-programming：废弃端点，守卫保持现状不动
 //!
 //! ## 事务边界 + WS 广播
 //! 事务边界在 handler（`pool.begin()` → service → `tx.commit()`）；WS 广播在
@@ -51,7 +53,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 use serde_json::json;
 
-use crate::auth::rbac::{CurrentUser, Role};
+use crate::auth::rbac::CurrentUser;
 use crate::infra::ws_hub::WsEvent;
 use crate::modules::part::vo::PartOut;
 use crate::modules::prod::batch::dto::{
@@ -82,7 +84,9 @@ pub async fn deliver(
     Path(batch_id): Path<i64>,
     Json(req): Json<DeliverRequest>,
 ) -> Result<Json<R<PartOut>>, AppError> {
-    current.require_any_role(&[Role::Manager, Role::Clerk])?;
+    // 2026-10-15：迁权限点 `batch.deliver`（M,C；handler 与 service 双层
+    // 守卫同步换，矩阵逐格等于原集合）。
+    current.require_permission("batch.deliver")?;
     let mut tx = state.pool.begin().await?;
     let out = BatchService::deliver(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
     tx.commit().await?;
@@ -103,7 +107,9 @@ pub async fn complete(
     Path(batch_id): Path<i64>,
     Json(req): Json<CompleteRequest>,
 ) -> Result<Json<R<PartOut>>, AppError> {
-    current.require_any_role(&[Role::Manager, Role::Clerk])?;
+    // 2026-10-15：迁权限点 `batch.deliver`（M,C；handler 与 service 双层
+    // 守卫同步换，矩阵逐格等于原集合）。
+    current.require_permission("batch.deliver")?;
     let mut tx = state.pool.begin().await?;
     let out = BatchService::complete(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
     tx.commit().await?;
@@ -126,7 +132,9 @@ pub async fn start_repair(
     Path(batch_id): Path<i64>,
     Json(req): Json<StartRepairRequest>,
 ) -> Result<Json<R<PartOut>>, AppError> {
-    current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
+    // 2026-10-15：迁权限点 `batch.repair`（M,C,I；handler 与 service 双层
+    // 守卫同步换，矩阵逐格等于原集合）。
+    current.require_permission("batch.repair")?;
     let mut tx = state.pool.begin().await?;
     let out =
         BatchService::start_repair(&mut *tx, &state.snowflake, batch_id, req, &current).await?;

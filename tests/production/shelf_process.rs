@@ -22,6 +22,8 @@
 //! 8. `set_shelf_processes_allows_clearing_inspection_zone_mappings` —— 2026-10-04
 //!    review 第 1 轮 B1：`items: []`（清空）**豁免** zone / is_active 守卫 —— 存量
 //!    非法映射必须留有 API 清理路径，否则「只读诊断 SQL ② 列出的行清不掉」
+//! 9. `set_shelf_processes_forbidden_without_production_config` —— 2026-10-15：
+//!    写端点由原零守卫补 `production.config`（M），SA ⇒ 40300
 //!
 //! ## fixture 选择（2026-10-02 判定）
 //! 用 **production fixture**（`load_production_fixture`）而非 shelf fixture：
@@ -632,4 +634,40 @@ async fn set_shelf_processes_allows_clearing_inspection_zone_mappings() {
         soft_deleted_at.is_some(),
         "清空应走软删（deleted_at 置位）而非物理删除"
     );
+}
+
+// ===========================================================================
+//  权限点闸门（2026-10-15 新增）
+// ===========================================================================
+
+/// `POST /prod/shelf-processes/{shelf_id}`：由原**零守卫**补 `production.config`（M）。
+///
+/// 无该点的 SHELF_ACCOUNT ⇒ 40300（权限先于 shelf 存在性 / zone 校验）；
+/// MANAGER 对照 200（items: [] = 清空映射，合法写）。
+#[tokio::test]
+async fn set_shelf_processes_forbidden_without_production_config() {
+    let (_pool, app, token, _fx) = bootstrap_as_manager().await;
+    let sa = login_token(
+        &app,
+        PartFixture::SHELF_ACCOUNT_USERNAME,
+        ProductionFixture::PASSWORD,
+    )
+    .await;
+    let uri = format!("/prod/shelf-processes/{}", PartFixture::PRODUCTION_SHELF_ID);
+
+    let (s, env) = send(
+        app.clone(),
+        json_request("POST", &uri, Some(json!({ "items": [] })), Some(&sa)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "SHELF_ACCOUNT 应 403: {env}");
+    assert_eq!(env["code"], 40300, "应为 FORBIDDEN: {env}");
+
+    // 对照：MANAGER 同请求放行。
+    let (s, env) = send(
+        app,
+        json_request("POST", &uri, Some(json!({ "items": [] })), Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "MANAGER 应 200: {env}");
 }

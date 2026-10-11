@@ -34,7 +34,8 @@ use serde::Deserialize;
 
 use crate::shared::types::deserialize_i64;
 
-/// `POST /api/v2/prod/queue/refill` 入参（Manager only，前端零消费方）。
+/// `POST /api/v2/prod/queue/refill` 入参（权限点 `queue.allocate`（M,C；2026-10-15
+/// 自 Manager 独占有意放宽））。
 ///
 /// `shelf_id` **2026-10-10 起保留必填**：它是「为某工人在某架上抢料」这条**显式
 /// 管理员操作**的架锚，与 worker-scan 的跨架取料（`shelf_id = null`）是两种口径。

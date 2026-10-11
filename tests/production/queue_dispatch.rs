@@ -10,7 +10,7 @@
 //!   7. auto-dispatch_preview 无 chain 的 batch → skip_reason=NO_PROCESS_CHAIN（只读，不写库）
 //!   8. auto-dispatch_preview 空 batch_ids → 40001 VALIDATION_ERROR (HTTP 422)
 //!   9. OCC 40901 VERSION_CONFLICT（双事务并发，A 持有 tx 占用 batch 行，B 调 dispatch 应 40901）
-//!  10. 角色 / 权限守卫：Inspector 调 dispatch → 40300 FORBIDDEN；
+//!  10. 权限守卫：Inspector 调 dispatch → 40300 FORBIDDEN；
 //!      CLERK（持有 `queue.dispatch`）→ 成功（2026-10-14 权限点迁移后补正向）
 //!  11. GET pending：unauth → 40100
 //!  12. 回归（2026-09-30 review 第 3 轮 L5）：**无工序链工单** dispatch 后出现在
@@ -840,7 +840,7 @@ async fn dispatch_after_external_version_bump_succeeds_with_new_version() {
     );
 }
 
-/// 场景 10: 角色守卫 —— Inspector 调 dispatch → 40300 FORBIDDEN
+/// 场景 10: 权限守卫 —— Inspector 调 dispatch → 40300 FORBIDDEN
 #[tokio::test]
 async fn dispatch_forbidden_for_inspector() {
     let (pool, app, token, fx) = bootstrap_as_inspector().await;
@@ -1627,4 +1627,53 @@ async fn dispatch_prefers_configured_capacity_over_unbounded_shelf() {
         "「不限」架恒排最后，即使它是空架；应落 capacity=100 且 80% 负载的那个"
     );
     let _ = unbounded;
+}
+
+// ===========================================================================
+//  权限点闸门（2026-10-15 新增）
+// ===========================================================================
+
+/// 场景 11：auto-dispatch 预览迁 `queue.dispatch`（2026-10-15 有意回改）——
+/// Inspector ⇒ 40300；Clerk ⇒ 200（与 dispatch 同点：预览与下发是一个动作两步）。
+///
+/// Inspector 侧刻意传空 `batch_ids`：权限闸门在 service 首行、先于参数校验，
+/// 空数组也应先 40300（若有人把守卫挪到参数校验之后，本断言会拿到 422 而不是 403）。
+#[tokio::test]
+async fn auto_dispatch_preview_forbidden_for_inspector_and_allowed_for_clerk() {
+    // ---- Inspector：40300 ----
+    let (_pool, app, token, _fx) = bootstrap_as_inspector().await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/queue/auto-dispatch",
+            Some(json!({ "batch_ids": [] })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "Inspector 应 403: {env}");
+    assert_eq!(env["code"], 40300, "应为 FORBIDDEN: {env}");
+
+    // ---- Clerk：200（NO_PROCESS_CHAIN 的合法预览） ----
+    let (pool, app, token, _fx) = bootstrap_as_clerk().await;
+    let customer_id = insert_customer_l2(&pool, "ACME").await;
+    let part_id = insert_part(&pool, customer_id).await;
+    let batch_id = insert_part_batch(&pool, part_id).await;
+
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/queue/auto-dispatch",
+            Some(json!({ "batch_ids": [batch_id.to_string()] })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "Clerk 应 200: {env}");
+    assert_eq!(
+        env["data"]["items"][0]["skip_reason"], "NO_PROCESS_CHAIN",
+        "Clerk 预览应正常返回 skip_reason: {env}"
+    );
 }

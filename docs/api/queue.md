@@ -17,26 +17,36 @@
 
 | # | 方法 | 路径 | 权限 | 入参 | 响应 |
 |---|---|---|---|---|---|
-| 1 | GET | `/api/v2/prod/queue/snapshot` | Manager + Clerk + Inspector | 无 | `QueueBoardSnapshot` |
-| 2 | GET | `/api/v2/prod/queue/processes/{process_id}` | Manager + Clerk + Inspector | path `process_id`（雪花 ID 字符串） | `QueueProcessBoardDetail` |
-| 3 | GET | `/api/v2/prod/queue/pending` | Manager + Clerk + Inspector | `limit?`（缺省 200，clamp 1..500）、`offset?` | `PendingBatchListOut` |
+| 1 | GET | `/api/v2/prod/queue/snapshot` | 权限点 `queue.view`（矩阵 = Manager + Clerk + Inspector；ADMIN 通配） | 无 | `QueueBoardSnapshot` |
+| 2 | GET | `/api/v2/prod/queue/processes/{process_id}` | 权限点 `queue.view`（同端点 1） | path `process_id`（雪花 ID 字符串） | `QueueProcessBoardDetail` |
+| 3 | GET | `/api/v2/prod/queue/pending` | 权限点 `queue.view`（同端点 1） | `limit?`（缺省 200，clamp 1..500）、`offset?` | `PendingBatchListOut` |
 | 4 | POST | `/api/v2/prod/queue/dispatch` | 权限点 `queue.dispatch`（矩阵 = Manager + Clerk；ADMIN 通配） | `{ targets: [{batch_id, target_process_id}], note? }` | `DispatchResult` |
-| 5 | POST | `/api/v2/prod/queue/auto-dispatch` | Manager + Clerk | `{ batch_ids?: string[] }` | `AutoDispatchResult` |
-| 6 | POST | `/api/v2/prod/queue/recall` | Manager + Clerk | `{ batch_id, version, note? }` | `RecallOut` |
-| 7 | POST | `/api/v2/prod/queue/refill` | **Manager 独占** | `{ worker_id, shelf_id }` | `RefillResult` |
-| 8 | POST | `/api/v2/prod/queue/move` | **Manager 独占** | `{ batch_id: string, version: number, from, to, note? }`（`from` / `to` 是**两个不同**的 tagged enum，见 §2.8） | `MoveResult` |
-| 9 | POST | `/api/v2/prod/queue/auto-allocate` | **Manager 独占** | `{ process_id, shelf_id }`（2026-10-15：删 `mode` / `fill_ratio`，见 §4.8） | `AutoAllocateResult` |
+| 5 | POST | `/api/v2/prod/queue/auto-dispatch` | 权限点 `queue.dispatch`（2026-10-15 迁入，见下） | `{ batch_ids?: string[] }` | `AutoDispatchResult` |
+| 6 | POST | `/api/v2/prod/queue/recall` | 权限点 `queue.recall`（矩阵 = Manager + Clerk） | `{ batch_id, version, note? }` | `RecallOut` |
+| 7 | POST | `/api/v2/prod/queue/refill` | 权限点 `queue.allocate`（矩阵 = Manager + Clerk；⚠️ **有意放宽**，见下） | `{ worker_id, shelf_id }` | `RefillResult` |
+| 8 | POST | `/api/v2/prod/queue/move` | 权限点 `queue.allocate`（同端点 7） | `{ batch_id: string, version: number, from, to, note? }`（`from` / `to` 是**两个不同**的 tagged enum，见 §2.8） | `MoveResult` |
+| 9 | POST | `/api/v2/prod/queue/auto-allocate` | 权限点 `queue.allocate`（同端点 7） | `{ process_id, shelf_id }`（2026-10-15：删 `mode` / `fill_ratio`，见 §4.8） | `AutoAllocateResult` |
 
 - 全部返回统一信封 `R { code, message, data }`。
 - 端点 1 / 2 **不接受**任何 query 参数。端点 3 只接 `limit` / `offset`，传别的 query 参数不会报错但被忽略。
 - 端点 4 / 5 是**契约变更**：`POST /api/v2/prod/batches/{batch_id}/recall-to-pending` 改为 `POST /api/v2/prod/queue/recall`，`batch_id` 由 path 参数改为 **body 字段**，出参由 `PartOut`（工单全量投影）改为 `RecallOut`（3 字段）。⚠️ 旧路径 404，**无 alias**。
 - 端点 1 / 2 是**纯读**（`pool.acquire()` 不开事务、不发 WS 广播）；端点 3 / 5 同。端点 4 / 6 / 7 / 8 / 9 开事务，**广播在 commit 之后**。
 - 端点 2 工序不存在或已软删 → `20801 BIZ_PROCESS_NOT_FOUND`（**HTTP 404**）。`{process_id}` 抽不出数字时走 axum 的 `PathRejection` → **HTTP 400 纯文本，不进 `R<T>` 信封**（全仓 `Path<i64>` 端点的统一行为，非本端点特例）。
-- 端点 1 / 2 / 3 被 SHELF_ACCOUNT 访问 → `40300`（角色守卫下沉在 service 第一行）。
+- 端点 1 / 2 / 3 被 SHELF_ACCOUNT 访问 → `40300`（权限守卫下沉在 service 第一行；`queue.view` 矩阵不含 SHELF_ACCOUNT，行为与角色守卫时代逐格相同）。
 - **2026-10-14 权限点迁移**：端点 4（下发写路径）的守卫由角色白名单
   `require_any_role(Manager, Clerk)` 迁到 `require_permission("queue.dispatch")`，
-  放行矩阵逐格不变（授权在 `seeds/rbac.sql`）；端点 5（auto-dispatch 预览）是
-  只读查询，**保持角色守卫不动**。ADMIN 由元角色通配放行。
+  放行矩阵逐格不变（授权在 `seeds/rbac.sql`）。
+- **2026-10-15 第二批全量迁点**（用户定稿，矩阵见 `seeds/rbac.sql`）：
+  - 端点 1 / 2 / 3 → `queue.view`（M,C,I，逐格等于原角色守卫）；端点 6 → `queue.recall`（M,C）；
+  - 端点 5（auto-dispatch 预览）→ `queue.dispatch` —— ⚠️ **有意回改**：上一批
+    「读端点保持角色守卫不动」的决策被推翻，预览与下发是同一动作的两步，守卫集合
+    统一为 M,C（与端点 4 同点）；
+  - 端点 7 / 8 / 9 → `queue.allocate`，自 **Manager 独占有意放宽为 M,C**（用户定稿；
+    `refill` 的闸门留在 handler 层 —— worker-scan 在同事务内复用其 service 入口，
+    不能受限）。ADMIN 由元角色通配放行。
+- ⚠️ **部署注记**：`permissions` 装在 Redis session 里，新 seed 行不进已登录用户
+  缓存 —— 部署后迁移端点对存量会话 40300，直到 token 刷新（≤ 900s）或重登；
+  ADMIN 不受影响（详见 `docs/api/iam.md` §9.2 同条注记）。
 - i64 雪花主键一律序列化为 JSON **string**（`"1590000000000000001"`），防 JS `Number` 精度截断。
 
 ### 1.1 路由注册顺序（当前无硬约束）

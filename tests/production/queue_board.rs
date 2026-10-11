@@ -10,7 +10,7 @@
 //!    ★ `pending_count` 与 `GET /queue/pending` 的 `total` 恒等（两个数字在同一个
 //!    页面上并排显示，不一致会被立刻看见）
 //! 5. `board_snapshot_forbidden_for_shelf_account` /
-//!    `board_process_detail_forbidden_for_shelf_account` —— 角色守卫 40300
+//!    `board_process_detail_forbidden_for_shelf_account` —— 权限守卫 40300
 //! 6. `board_process_detail_unknown_process_returns_404` —— 20801 / HTTP 404
 //! 7. `board_process_detail_held_batches_complete_for_ten_workers` ——
 //!    ★ **10 个工人的工序板**：一次请求返回 10 个 worker、每个 worker 的
@@ -270,7 +270,7 @@ async fn board_snapshot_pending_count_matches_pending_endpoint() {
     assert_eq!(total, 3, "pending.total 应为 3: {env2}");
 }
 
-/// ShelfAccount → 40300（service 守卫：Manager / Clerk / Inspector only）。
+/// ShelfAccount → 40300（权限点 `queue.view`，矩阵 M,C,I）。
 #[tokio::test]
 async fn board_snapshot_forbidden_for_shelf_account() {
     let (pool, _app, _token, _fx) = bootstrap_as_manager().await;

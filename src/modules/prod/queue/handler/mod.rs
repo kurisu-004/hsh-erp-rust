@@ -11,8 +11,8 @@
 //! `tx.commit()`；提前 return（`?`）时 `Transaction` 的 Drop 自动回滚。
 //! 纯读端点（`pending` / `auto-dispatch` / `snapshot` / `processes/{id}`）走
 //! `pool.acquire()` 不开事务。
-//! 统一响应信封：`Result<Json<R<T>>, AppError>`。角色守卫在 service 入口
-//! （handler 只做权限分发 + 事务 + 广播）。
+//! 统一响应信封：`Result<Json<R<T>>, AppError>`。权限守卫在 service 入口
+//! （`refill` 例外，见 `pool.rs` 的权限一节；handler 只做权限分发 + 事务 + 广播）。
 
 pub mod board;
 pub mod dispatch;

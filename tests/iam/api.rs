@@ -195,22 +195,25 @@ async fn me_success_returns_full_user_view() {
 /// `permissions` 键**恒存在**（2026-10-14 新增字段，前端 `currentUserSchema`
 /// 声明为必填）：无权限点时为 `[]` 而不是缺键。
 ///
-/// 用 target 用户加挂 SHELF_ACCOUNT 验证空数组形态（默认矩阵对该角色不授任何
-/// 权限点）；MANAGER 的非空形态在 `login_success_*` / `me_success_*` 断言。
+/// 2026-10-15 改写：原用 SHELF_ACCOUNT 验证空数组 —— 第二批矩阵给该角色并入
+/// `production.view`（有意并集，见 seeds/rbac.sql）后它不再零权限；改用
+/// **ADMIN 元角色**（`t_role_permission` 无行、不贡献权限码，通配在代码里）
+/// 继续钉住 `[]` 形态。MANAGER 的非空形态在 `login_success_*` / `me_success_*`
+/// 断言。
 #[tokio::test]
 async fn empty_permissions_is_empty_array_not_missing_key() {
     let (pool, app, fx) = bootstrap().await;
     let (_, login_env) = login_admin(app, &fx.manager_username, IamFixture::PASSWORD).await;
     let mgr = login_env["data"]["token"].as_str().unwrap().to_string();
 
-    // target 原本无角色；授 SHELF_ACCOUNT（带货架 scope）后即可登录
+    // target 原本无角色；授 ADMIN（元角色，无 scope 要求）后即可登录
     let app2 = fresh_app(&pool).await;
     let (status, env) = send(
         app2,
         json_request(
             "POST",
             &format!("/iam/users/{}/roles", fx.target_user_id),
-            Some(json!({ "role": "SHELF_ACCOUNT", "scope_type": "shelf", "scope_id": fx.shelf_a_id })),
+            Some(json!({ "role": "ADMIN" })),
             Some(&mgr),
         ),
     )
@@ -226,7 +229,7 @@ async fn empty_permissions_is_empty_array_not_missing_key() {
         .expect("user.permissions 必填键必须存在（无权限时应为 [] 而不是缺键）");
     assert!(
         perms.is_empty(),
-        "SHELF_ACCOUNT 无权限点，应为 []: {perms:?}"
+        "ADMIN 不贡献权限码（元角色通配在代码里），应为 []: {perms:?}"
     );
     let target_token = env["data"]["token"].as_str().unwrap().to_string();
 
@@ -243,7 +246,7 @@ async fn empty_permissions_is_empty_array_not_missing_key() {
         .expect("/iam/me 的 permissions 必填键必须存在（无权限时应为 [] 而不是缺键）");
     assert!(
         perms.is_empty(),
-        "SHELF_ACCOUNT 无权限点，应为 []: {perms:?}"
+        "ADMIN 不贡献权限码（元角色通配在代码里），应为 []: {perms:?}"
     );
 }
 
