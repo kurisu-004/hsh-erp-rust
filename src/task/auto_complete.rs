@@ -10,8 +10,11 @@
 //!
 //! Phase 0 实现要点：
 //! - 单事务包住「扫描 + 逐个 complete」：commit 后再广播 WS 事件（CLAUDE.md §架构 6）。
-//! - 构造伪 `CurrentUser`（id=0, username="system"）承担后台身份——
-//   `BatchService::complete` 要求 MANAGER/CLERK 角色；后续接 RBAC 时再升级。
+//! - 构造伪 `CurrentUser`（id=0, username="system"）承担后台身份 ——
+//!   `BatchService::complete` 的守卫是权限点 `batch.deliver`（2026-10-15 迁自
+//!   MANAGER/CLERK 角色），**伪系统身份不过 http、不会走登录装载链**，故
+//!   `permissions` 必须显式带 `batch.deliver`（`require_permission` 不认
+//!   Manager 角色；漏了这句后台完工会在守卫处静默 403、每轮 log 一行 skip）。
 //! - 单批失败 log 继续（与 Python `_run_once` 一致），不影响后续批次。
 //!
 //! 2026-09-16 PR-3 批次 step 化（migration 028）：阈值口径由
@@ -151,12 +154,14 @@ pub async fn run_once(state: &Arc<AppState>, threshold_days: u32) -> anyhow::Res
     Ok(())
 }
 
-/// 构造后台伪 CurrentUser：id=0 / username="system" / MANAGER 角色。
+/// 构造后台伪 CurrentUser：id=0 / username="system" / MANAGER 角色 +
+/// 显式 `batch.deliver` 权限码。
 ///
-/// `BatchService::complete` 要求 `Manager` / `Clerk` 角色（见
-/// `prod::batch::service::lifecycle` 的 `complete`）。
-/// 系统身份用 MANAGER——与 Python `service/auto_complete.py` 等价（Python
-/// 不走 service 的角色守卫，后台循环直接调 service）。
+/// `BatchService::complete` 的守卫是权限点 `batch.deliver`（见
+/// `prod::batch::service::lifecycle` 的 `complete`，2026-10-15 自
+/// MANAGER/CLERK 角色守卫迁移）。伪系统身份**不过 http**（不会经登录装载
+/// session permissions），`require_permission` 也不认 Manager 角色 ⇒ 必须在此
+/// 显式带码；MANAGER 角色保留是因为其余角色原语（如 `can_access_shelf`）仍走它。
 pub(crate) fn system_current_user() -> CurrentUser {
     CurrentUser {
         id: 0,
@@ -164,7 +169,9 @@ pub(crate) fn system_current_user() -> CurrentUser {
         roles: vec![Role::Manager],
         shelf_ids: Vec::new(),
         shelf_wildcard: true,
-        permissions: Vec::new(),
+        // 2026-10-15：`complete` 迁权限点 `batch.deliver` 后必须显式带码，
+        // 否则后台自动完工每批都被 40300 拒（log 只有一行 skip，无告警）。
+        permissions: vec!["batch.deliver".to_string()],
     }
 }
 
@@ -186,16 +193,22 @@ async fn complete_one(
 mod tests {
     use super::*;
 
-    /// `system_current_user` 构造合法性：id=0 / MANAGER 角色。
-    /// 关键约束：`BatchService::complete` 走 `require_any_role(Manager|Clerk)`，
-    /// 系统身份必须满足其一；这里选 MANAGER（与 Python 等价的「最高权限」路径）。
+    /// `system_current_user` 构造合法性：id=0 / MANAGER 角色 / 显式 `batch.deliver`。
+    /// 关键约束：`BatchService::complete` 走 `require_permission("batch.deliver")`
+    /// （2026-10-15 迁点），伪身份不过 http、必须自己带码 —— 漏了即后台完工静默失效。
     #[test]
-    fn system_current_user_has_manager_role() {
+    fn system_current_user_has_batch_deliver_permission() {
         let u = system_current_user();
         assert_eq!(u.id, 0);
         assert_eq!(u.username, "system");
         assert!(u.has_role(Role::Manager));
         assert!(u.shelf_wildcard);
+        assert!(
+            u.permissions.iter().any(|p| p == "batch.deliver"),
+            "系统身份必须显式带 batch.deliver 权限码"
+        );
+        u.require_permission("batch.deliver")
+            .expect("系统身份应通过 batch.deliver 闸门");
     }
 
     /// threshold 计算：`now_naive() - days` 必须严格早于 `now_naive()`。

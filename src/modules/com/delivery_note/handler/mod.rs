@@ -30,8 +30,13 @@
 //!   - ② 写 + post-commit Redis / WS（broadcast 落 handler，service 不持有 WsHub）`pool.begin() → service → commit → state.ws_hub.broadcast(...)`；
 //!   - ③ 读端点（list_*/get_*）`pool.acquire() → service`，不开事务。
 //! - 统一响应信封：`Result<Json<R<T>>, AppError>`。
-//! - 权限在 service 层（`current.require_any_role(...)`）；handler 这里只解析
-//!   query / path / body。
+//! - 权限**默认**在 service 层（`current.require_any_role(...)` /
+//!   `require_permission(...)`）；handler 这里只解析 query / path / body。
+//!   ⚠️ 2026-10-15 例外：`delivery_note.view` 的三条读（list / 详情 /
+//!   batch-detail）闸门落在 **handler** —— 同域 `scan_entry.rs` 的扫码入单
+//!   （写路径）在事务内复用 `service/inner.rs::get_with_parts`，把守卫压到那层
+//!   会让「写已提交、响应 403」变成可达态。list 的守卫留在 service（唯一调用方
+//!   是 handler）。
 //!
 //! ## axum 0.8 path 占位符
 //! `matchit` 风格 `{id}`（不再用 axum 0.7 的 `:id`）。

@@ -1,5 +1,5 @@
 //! prod::queue 下发流 3 端点（`pending` / `dispatch` / `auto-dispatch`）的 HTTP
-//! 路由 + 角色守卫 + WS 广播。2026-10-08 自 `prod::batch::handler::dispatch` 搬入
+//! 路由 + 权限守卫 + WS 广播。2026-10-08 自 `prod::batch::handler::dispatch` 搬入
 //! （URL 由 `/prod/batches/*` 硬切到 `/prod/queue/*`，无 alias）。
 //!
 //! 待下发源状态白名单 = `PENDING` / `PROGRAMMING`（已废弃的 `PROGRAMMING` 只存量
@@ -15,12 +15,15 @@
 //!   `BATCH_PLACED_ON_SHELF`（payload = succeeded 列表）
 //! - 只读端点（auto-dispatch）：`pool.acquire()` 不开事务，不发 WS
 //!
-//! ## 权限守卫（2026-10-14 写路径迁权限点）
+//! ## 权限守卫（2026-10-14 写路径迁权限点；2026-10-15 第二批全量迁点）
 //! 守卫在 service 第一行下沉（沿本域 `move_batch` 范本），handler 仅做权限分发：
-//! - **写路径** `dispatch`：权限点 `queue.dispatch`；
-//! - **读路径** `pending` / `auto-dispatch`：角色守卫（`require_any_role`）不动。
+//! - `dispatch`：`queue.dispatch`（2026-10-14）；
+//! - `pending`：`queue.view`（2026-10-15 自角色守卫迁移）；
+//! - `auto-dispatch`：`queue.dispatch`（2026-10-15 **有意回改** —— 上批「读端点
+//!   保持角色守卫不动」的决策被用户定稿推翻：预览与下发是同一个动作的两步，
+//!   守卫集合统一为 M,C，权限点与 `dispatch` 一致）。
 //!
-//! 两处口径见 `service/dispatch.rs` 模块头「事务 + 守卫」一节。
+//! 逐点口径见 `service/dispatch.rs` 模块头「事务 + 守卫」一节。
 
 use std::sync::Arc;
 
@@ -51,7 +54,8 @@ fn ws_broadcast(state: &AppState, kind: &str, payload: serde_json::Value) {
 
 /// `GET /api/v2/prod/queue/pending`
 ///
-/// 角色：Manager + Clerk + Inspector（service 内守卫）。
+/// 权限：`queue.view`（service 内守卫；2026-10-15 自角色守卫 M,C,I 迁移，
+/// 矩阵逐格相同）。
 /// 读端点：`pool.acquire()` 不开事务。
 pub async fn list_pending(
     State(state): State<Arc<AppState>>,
@@ -118,7 +122,8 @@ pub async fn dispatch(
 
 /// `POST /api/v2/prod/queue/auto-dispatch`
 ///
-/// 角色：Manager + Clerk（service 内守卫）。
+/// 权限：`queue.dispatch`（service 内守卫；2026-10-15 自角色守卫 M,C **迁点**，
+/// 集合逐格相同 —— 与 `dispatch` 是同一动作的两步，见文件头「有意回改」）。
 ///
 /// 2026-09-30 重构：只读查询（不开事务、不发 WS 广播）。
 /// 返回每个 batch 的「首道工序 + 首货架」+ skip_reason，caller 据此构造

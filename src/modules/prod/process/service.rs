@@ -127,13 +127,9 @@ impl ProcessService {
         query: &ProcessListQuery,
         user: &CurrentUser,
     ) -> Result<ProcessListOut, AppError> {
-        user.require_any_role(&[
-            Role::Manager,
-            Role::Clerk,
-            Role::CncProgrammer,
-            Role::ShelfAccount,
-            Role::Inspector,
-        ])?;
+        // 2026-10-15：迁权限点 `production.view`（矩阵 M,C,CNC,SA,I，逐格等于
+        // 原 require_any_role 集合）。
+        user.require_permission("production.view")?;
 
         let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
         let offset = query.offset.unwrap_or(0).max(0);
@@ -167,13 +163,8 @@ impl ProcessService {
         id: i64,
         user: &CurrentUser,
     ) -> Result<ProcessOut, AppError> {
-        user.require_any_role(&[
-            Role::Manager,
-            Role::Clerk,
-            Role::CncProgrammer,
-            Role::ShelfAccount,
-            Role::Inspector,
-        ])?;
+        // 2026-10-15：迁权限点 `production.view`（同 list_processes）。
+        user.require_permission("production.view")?;
 
         let p = repo
             .get_by_id(id, false)

@@ -39,26 +39,31 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
 
 全部挂 `/api/v2/prod/batches`。`/{batch_id}` 是 path 段；`to-ship` / `to-inspection` / `repair` / `repairing` / `scan/deliver` 是静态段（**无 Path extractor**）。
 
-| # | 方法 | 路径（相对 `/api/v2/prod/batches`） | 权限 |
+| # | 方法 | 路径（相对 `/api/v2/prod/batches`） | 权限（2026-10-15 按代码现状重写） |
 |---|---|---|---|
-| 1 | POST | `/to-ship` | Manager + Inspector |
-| 2 | POST | `/to-inspection` | Manager + Inspector |
-| 3 | GET | `/repair` | Manager + Inspector |
-| 4 | GET | `/repairing` | Manager + Inspector |
-| 5 | POST | `/scan/deliver` | Manager + Inspector |
-| 6 | POST | `/{batch_id}/to-inspection` | Manager + Inspector |
-| 7 | POST | `/{batch_id}/to-ship` | Manager + Inspector |
-| 8 | POST | `/{batch_id}/to-process` | Manager + Inspector |
-| 9 | POST | `/{batch_id}/scan-inspect` | Manager + Inspector |
-| 10 | POST | `/{batch_id}/deliver` | Manager + Inspector |
-| 11 | POST | `/{batch_id}/complete` | Manager + Inspector |
-| 12 | POST | `/{batch_id}/start-repair` | Manager + Inspector |
-| 13 | POST | `/{batch_id}/place-on-shelf` | Manager + Clerk |
-| 14 | POST | `/{batch_id}/release-from-programming` | Manager + Clerk |
-| 15 | POST | `/{batch_id}/complete-repair` | Manager + Clerk |
-| 16 | POST | `/{batch_id}/repair-dispatch` | Manager + Clerk |
-| 17 | POST | `/{batch_id}/cancel` | Manager + Clerk |
+| 1 | POST | `/to-ship` | 权限点 `batch.transition`（M,I） |
+| 2 | POST | `/to-inspection` | 权限点 `batch.transition`（M,I） |
+| 3 | GET | `/repair` | 权限点 `batch.repair`（M,C,I） |
+| 4 | GET | `/repairing` | 权限点 `batch.repair`（M,C,I） |
+| 5 | POST | `/scan/deliver` | Manager + ShelfAccount（设备流，未迁权限点） |
+| 6 | POST | `/{batch_id}/to-inspection` | 权限点 `batch.transition`（M,I） |
+| 7 | POST | `/{batch_id}/to-ship` | 权限点 `batch.transition`（M,I） |
+| 8 | POST | `/{batch_id}/to-process` | 权限点 `batch.transition`（M,I） |
+| 9 | POST | `/{batch_id}/scan-inspect` | 权限点 `batch.transition`（M,I；service 内守卫） |
+| 10 | POST | `/{batch_id}/deliver` | 权限点 `batch.deliver`（M,C；handler + service 双层） |
+| 11 | POST | `/{batch_id}/complete` | 权限点 `batch.deliver`（M,C；handler + service 双层） |
+| 12 | POST | `/{batch_id}/start-repair` | 权限点 `batch.repair`（M,C,I；handler + service 双层） |
+| 13 | POST | `/{batch_id}/place-on-shelf` | Manager + Clerk（废弃端点，未迁权限点） |
+| 14 | POST | `/{batch_id}/release-from-programming` | Manager + CncProgrammer（废弃端点，未迁权限点） |
+| 15 | POST | `/{batch_id}/complete-repair` | 权限点 `batch.repair`（M,C,I；service 内守卫） |
+| 16 | POST | `/{batch_id}/repair-dispatch` | 权限点 `batch.repair`（M,C,I；service 内守卫） |
+| 17 | POST | `/{batch_id}/cancel` | 权限点 `batch.cancel`（M,C；service 内守卫） |
 
+- **2026-10-15 权限点迁移**（用户定稿，矩阵见 `seeds/rbac.sql`）：本表旧版权限列多处
+  与代码不符（deliver / complete / start-repair 写「Manager + Inspector」等），本次
+  按代码现状整体重写。`batch.transition` / `batch.repair` / `batch.deliver` /
+  `batch.cancel` 四个权限点的矩阵与迁移前角色集合逐格相同（scan/deliver 设备流与
+  两个废弃端点保持角色守卫，不迁）。
 - 全部返回统一信封 `R { code, message, data }`。
 - 写端点的事务边界在 handler（`state.pool.begin()` → service → `tx.commit()`），**WS 广播在 commit 之后**。
 - 读端点（`/repair` `/repairing`）走 `pool.acquire()` 不开事务。
@@ -152,7 +157,7 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
 
 | 方法 | 路径 | 权限 | 入参 | 出参 |
 |---|---|---|---|---|
-| POST | `/api/v2/batches/split` | Manager + Clerk | `{ batch_id: string, version: number, quantity: number, note? }` | `BatchSplitOut` |
+| POST | `/api/v2/batches/split` | 权限点 `batch.split`（M,C；2026-10-15 迁自角色守卫，逐格相同） | `{ batch_id: string, version: number, quantity: number, note? }` | `BatchSplitOut` |
 
 **入参形态逐字段**（2026-10-09 订正）——同一份请求体里字符串 / 数字**混用**，不是笔误：
 

@@ -11,7 +11,9 @@
 //!   `&mut *tx` 喂给 service。
 //! - 统一响应信封：返回 `Result<Json<R<T>>, AppError>`，错误由 `AppError::into_response()`
 //!   装进同一个 `R` 信封。
-//! - 权限在 service 层（`current.require_any_role` / `require_role`），此处不重复校验。
+//! - 权限在 service 层（`require_permission` / `require_role`），此处不重复校验。
+//!   2026-10-15：读 3 条走 `production.view`（M,C,CNC,SA,I）、写 4 条 M 独占
+//!   （其中 `set_work_type_processes` 由原零守卫补 `production.config`）。
 //!
 //! ## 7 端点
 //! 读 3：list_work_types / get_work_type / list_work_type_processes

@@ -357,7 +357,7 @@ async fn batch_to_ship_clerk_forbidden() {
 
 /// 单件 to-ship happy path：1 个 INSPECTION 工单 → 200 / part.status=READY_TO_SHIP。
 ///
-/// 使用 INSPECTOR 角色验证「Manager 或 Inspector」白名单。
+/// 使用 INSPECTOR 角色验证权限点 `batch.transition`（矩阵 M,I）。
 #[tokio::test]
 async fn single_to_ship_happy_path() {
     let (pool, app, token, fx) = bootstrap_as_inspector().await;

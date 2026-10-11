@@ -692,3 +692,82 @@ async fn repairing_batches_derives_next_process_from_step_not_stale_cpid() {
     );
     let _ = part_id;
 }
+
+// ===========================================================================
+//  权限点闸门（2026-10-15 新增）
+// ===========================================================================
+
+/// 现场建一个 CNC_PROGRAMMER 用户（bcrypt 现场生成）—— fixture 四身份里没有
+/// CNC，而 `batch.repair` 的越权断言需要它。
+async fn insert_cnc_user(pool: &PgPool, username: &str) {
+    use hsh_erp_rust::auth::password;
+    use hsh_erp_rust::infra::clock::now_naive;
+
+    let snowflake = hsh_erp_test_support::pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let user_id = snowflake.next_id();
+    let role_id = snowflake.next_id();
+    drop(snowflake);
+    let now = now_naive();
+    let hash = password::hash("changeme").expect("bcrypt");
+    sqlx::query(
+        "INSERT INTO t_user (id, username, password_hash, full_name, is_active, \
+         refresh_token_version, version, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, true, 0, 0, $5, $5)",
+    )
+    .bind(user_id)
+    .bind(username.to_lowercase())
+    .bind(hash)
+    .bind(username)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_user");
+    sqlx::query(
+        "INSERT INTO t_user_role (id, user_id, role, scope_type, scope_id, version, \
+         created_at, updated_at) \
+         VALUES ($1, $2, 'CNC_PROGRAMMER', NULL, NULL, 0, $3, $3)",
+    )
+    .bind(role_id)
+    .bind(user_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_user_role");
+}
+
+/// `batch.repair`（M,C,I）的越权矩阵（2026-10-15）—— CNC / SHELF_ACCOUNT ⇒ 40300。
+///
+/// 覆盖两条守卫路径：读 `GET /prod/batches/repair` 与写
+/// `POST /prod/batches/{id}/start-repair`（handler + service 双层）。
+#[tokio::test]
+async fn repair_endpoints_forbidden_for_cnc_and_shelf_account() {
+    let (pool, app, _token, fx) = bootstrap_as_manager().await;
+    insert_cnc_user(&pool, "fx_repair_cnc").await;
+    let cnc = login_token(&app, "fx_repair_cnc", "changeme").await;
+    let sa = login_token(&app, &fx.shelf_account_username, PartFixture::PASSWORD).await;
+
+    // CNC：读 repair 列表 → 40300
+    let (s, env) = send(
+        app.clone(),
+        json_request("GET", "/prod/batches/repair", None, Some(&cnc)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "CNC repair 列表应 403: {env}");
+    assert_eq!(env["code"], 40300, "应为 FORBIDDEN: {env}");
+
+    // SA：写 start-repair → 40300
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/prod/batches/123456789/start-repair",
+            Some(json!({ "version": 0 })),
+            Some(&sa),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "SA start-repair 应 403: {env}");
+    assert_eq!(env["code"], 40300, "应为 FORBIDDEN: {env}");
+}

@@ -314,6 +314,31 @@ pub(crate) async fn login_manager_with_username(
     (app2, token)
 }
 
+/// CLERK user：以新 username 登入 + CLERK role。
+///
+/// 2026-10-15：`queue.allocate` 自 Manager 独占放宽为 M,C 的**放宽留痕用例**
+/// （refill / move 的 Clerk 正向）需要 Clerk token；与 `login_manager_with_username`
+/// 同形、只换角色。
+pub(crate) async fn login_clerk_with_username(
+    pool: &PgPool,
+    username: &str,
+) -> (axum::Router, String) {
+    let uid = insert_user_with_password(pool, username, "changeme").await;
+    add_role(pool, uid, "CLERK", None, None).await;
+    let state = test_state(pool.clone()).await;
+    let app = test_app(state.clone());
+    let req = json_request(
+        "POST",
+        "/iam/login",
+        Some(json!({"username": username, "password": "changeme"})),
+        None,
+    );
+    let (_, env) = send(app, req).await;
+    let token = env["data"]["token"].as_str().unwrap().to_string();
+    let app2 = test_app(state);
+    (app2, token)
+}
+
 // ===========================================================================
 //  worker-pool fixture helpers（worker_pool 独享，跨 binary 不迁移）
 // ===========================================================================
@@ -1805,7 +1830,7 @@ async fn board_process_detail_process_not_found() {
     assert_eq!(env["code"], 20801, "BIZ_PROCESS_NOT_FOUND: {env}");
 }
 
-/// 场景 H3: ShelfAccount 角色 → 40300 FORBIDDEN（service 守卫：Manager/Clerk/Inspector only）
+/// 场景 H3: ShelfAccount 角色 → 40300 FORBIDDEN（权限点 `queue.view`，矩阵 M,C,I）
 #[tokio::test]
 async fn board_process_detail_forbidden_for_shelf_account() {
     let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
@@ -3365,5 +3390,81 @@ async fn refill_success_omits_stopped_reason() {
             .expect("data 是 object")
             .contains_key("stopped_reason"),
         "抢到东西时 stopped_reason 应整个 key 不出现（skip_serializing_if）: {env}"
+    );
+}
+
+// ===========================================================================
+//  权限点闸门（2026-10-15 新增）
+// ===========================================================================
+
+/// 场景 12：refill 守卫迁 `queue.allocate` 后**放宽留痕** —— 原 Manager 独占
+/// 放宽为 M,C（用户定稿），Clerk 应能真正取走料。
+#[tokio::test]
+async fn refill_allows_clerk_after_allocation_widening() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "POOL12").await;
+    let proc = seed_process(&pool, "PROC-CLK", "工序CLK").await;
+    let wt = insert_work_type(&pool, "WT-CLK", "工种CLK", Some(10)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let prod_shelf = insert_shelf(&pool, "PROD-CLK", "PROD-CLK", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc).await;
+    let worker = insert_worker(&pool, "BC-CLK", "工CLK", Some(wt)).await;
+    let (_p, _b) = insert_pool_part(&pool, customer, "P-CLK", prod_shelf, proc, 1).await;
+
+    let (app, token) = login_clerk_with_username(&pool, "clerk_refill").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/queue/refill",
+            Some(json!({
+                "worker_id": worker.to_string(),
+                "shelf_id": prod_shelf.to_string(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "Clerk refill 应 200（放宽后）: {env}");
+    let taken = env["data"]["taken"].as_array().expect("data.taken");
+    assert_eq!(taken.len(), 1, "Clerk 应能真正取走 1 批: {env}");
+}
+
+/// 场景 13：move 守卫迁 `queue.allocate` 后**放宽留痕** —— Clerk 的
+/// POOL→WORKER 调度应放行（原 Manager 独占）。
+#[tokio::test]
+async fn move_allows_clerk_after_allocation_widening() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "POOL13").await;
+    let proc = seed_process(&pool, "PROC-CLK2", "工序CLK2").await;
+    let wt = insert_work_type(&pool, "WT-CLK2", "工种CLK2", Some(10)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let prod_shelf = insert_shelf(&pool, "PROD-CLK2", "PROD-CLK2", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc).await;
+    let worker = insert_worker(&pool, "BC-CLK2", "工CLK2", Some(wt)).await;
+    let (_p, pool_batch) =
+        insert_pool_part(&pool, customer, "P-CLK2", prod_shelf, proc, 1).await;
+
+    let (app, token) = login_clerk_with_username(&pool, "clerk_move").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/queue/move",
+            Some(json!({
+                "batch_id": pool_batch.to_string(),
+                "version": 0,
+                "from": { "kind": "POOL", "shelf_id": prod_shelf.to_string() },
+                "to":   { "kind": "WORKER", "worker_id": worker.to_string() },
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "Clerk move 应 200（放宽后）: {env}");
+    assert_eq!(
+        count_held_by_worker(&pool, worker).await,
+        1,
+        "批次应真的移到工人手上"
     );
 }

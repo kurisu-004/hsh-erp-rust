@@ -6,6 +6,8 @@
 //! 2. `set_processes_replaces_group_and_get_returns_only_active` — 2026-10-02 新增：
 //!    `POST`↔`GET` 整组替换往返（set [P1,P2] → set [P2] → set []），钉死「读路径只返回
 //!    active 映射」；末尾顺带断言工种列表的 `process_ids` 出参同步收窄。
+//! 3. `set_work_type_processes_forbidden_without_production_config` — 2026-10-15 新增：
+//!    mapping 端点由原零守卫补 `production.config`（M），SA ⇒ 40300。
 //!
 //! ## 并行
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
@@ -535,4 +537,40 @@ async fn work_type_auto_allocate_limit_validation_matrix() {
     assert_eq!(env["data"]["max_held_batches"], serde_json::Value::Null);
     assert_eq!(env["data"]["auto_allocate_limit"], serde_json::Value::Null);
     let _ = pool;
+}
+
+// ===========================================================================
+//  权限点闸门（2026-10-15 新增）
+// ===========================================================================
+
+/// `POST /prod/work-types/{id}/processes`：由原**零守卫**补 `production.config`（M）。
+///
+/// 无该点的 SHELF_ACCOUNT ⇒ 40300；MANAGER 对照 200（证明闸门只拦无授权身份，
+/// 不是把端点整个打坏）。
+#[tokio::test]
+async fn set_work_type_processes_forbidden_without_production_config() {
+    let (_pool, app, token, fx) = bootstrap_as_manager().await;
+    let sa = login_token(
+        &app,
+        &fx.part_shelf_account_username,
+        ProductionFixture::PASSWORD,
+    )
+    .await;
+    let uri = format!("/prod/work-types/{}/processes", fx.work_type_a_id);
+
+    let (s, env) = send(
+        app.clone(),
+        json_request("POST", &uri, Some(json!({ "items": [] })), Some(&sa)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "SHELF_ACCOUNT 应 403: {env}");
+    assert_eq!(env["code"], 40300, "应为 FORBIDDEN: {env}");
+
+    // 对照：MANAGER 同请求放行（items: [] = 清空映射，合法写）。
+    let (s, env) = send(
+        app,
+        json_request("POST", &uri, Some(json!({ "items": [] })), Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "MANAGER 应 200: {env}");
 }

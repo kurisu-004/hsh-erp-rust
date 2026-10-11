@@ -18,6 +18,11 @@
 
 **内容**：6 个内置角色 `ADMIN / MANAGER / CLERK / INSPECTOR / CNC_PROGRAMMER /
 SHELF_ACCOUNT`（均 `is_system=true`），以及各系统角色的权限点授权矩阵。
+2026-10-15 第二批共 20 个权限点（首批 3 + 生产流转 / 外协 / 送货单 / 品检读 17）；
+其中三处与迁移前守卫**有意偏差**（用户定稿）：`queue.allocate` 自 Manager 独占有意
+放宽为 M,C、`delivery_note.view` 与 `outsource.view` 的公司读收紧去 CNC、
+`production.view` 是两条读集合的并集（对 process_chain 多授 SHELF_ACCOUNT）——
+逐点来源与偏差说明见 `rbac.sql` 第 2 / 3 节注释，矩阵全表见 `docs/api/iam.md` §9.2。
 
 **`t_role.code` 与 Rust `Role` 枚举是两张表**：6 个系统角色一一对应（枚举只覆盖这
 6 项，`auth::rbac::Role`）；管理端新建的自定义角色只进 `t_role.code` varchar

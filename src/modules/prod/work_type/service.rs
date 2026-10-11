@@ -146,13 +146,9 @@ impl WorkTypeService {
         query: &WorkTypeListQuery,
         current: &CurrentUser,
     ) -> Result<WorkTypeListOut, AppError> {
-        current.require_any_role(&[
-            Role::Manager,
-            Role::Clerk,
-            Role::CncProgrammer,
-            Role::ShelfAccount,
-            Role::Inspector,
-        ])?;
+        // 2026-10-15：迁权限点 `production.view`（矩阵 M,C,CNC,SA,I，逐格等于
+        // 原 require_any_role 集合）。
+        current.require_permission("production.view")?;
 
         let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
         let offset = query.offset.unwrap_or(0).max(0);
@@ -201,13 +197,8 @@ impl WorkTypeService {
         id: i64,
         current: &CurrentUser,
     ) -> Result<WorkTypeOut, AppError> {
-        current.require_any_role(&[
-            Role::Manager,
-            Role::Clerk,
-            Role::CncProgrammer,
-            Role::ShelfAccount,
-            Role::Inspector,
-        ])?;
+        // 2026-10-15：迁权限点 `production.view`（同 list_work_types）。
+        current.require_permission("production.view")?;
 
         let wt = repo.get_by_id(id).await?.ok_or_else(work_type_not_found)?;
 
@@ -562,6 +553,9 @@ impl WorkTypeProcessService {
     ///
     /// 整组事务由 caller 保证（handler 层 `state.pool.begin()` + commit）。
     ///
+    /// 权限（2026-10-15 新增）：`production.config`（矩阵 M）—— 本端点是原
+    /// **零守卫**的配置写路径之一，本轮补闸。
+    ///
     /// 错误码：
     /// - 20901 `BIZ_WORK_TYPE_NOT_FOUND`
     /// - 20801 `BIZ_PROCESS_NOT_FOUND` —— items 里有 process_id 不存在
@@ -574,6 +568,8 @@ impl WorkTypeProcessService {
         items: &[crate::modules::prod::work_type::dto::SetWorkTypeProcessesItem],
         current: &CurrentUser,
     ) -> Result<(), AppError> {
+        // 2026-10-15：补权限点 `production.config`（矩阵 M；原零守卫）。
+        current.require_permission("production.config")?;
         // 1. work_type 存在性 + 软删校验（已软删 → 404）
         let wt = repo.get_by_id(work_type_id).await?.ok_or_else(|| {
             AppError::biz(
@@ -636,14 +632,8 @@ impl WorkTypeProcessService {
         work_type_id: i64,
         current: &CurrentUser,
     ) -> Result<WorkTypeProcessMappingOut, AppError> {
-        // 权限：与 list_work_types 一致（任意已登录）
-        current.require_any_role(&[
-            crate::auth::rbac::Role::Manager,
-            crate::auth::rbac::Role::Clerk,
-            crate::auth::rbac::Role::CncProgrammer,
-            crate::auth::rbac::Role::ShelfAccount,
-            crate::auth::rbac::Role::Inspector,
-        ])?;
+        // 2026-10-15：迁权限点 `production.view`（与 list_work_types 同集合）。
+        current.require_permission("production.view")?;
 
         // work_type 存在性校验
         let wt = repo.get_by_id(work_type_id).await?.ok_or_else(|| {

@@ -21,6 +21,7 @@
 #![allow(dead_code, clippy::await_holding_lock, unused_imports)]
 
 mod company;
+mod permissions;
 mod pool;
 mod quotable;
 mod quote;

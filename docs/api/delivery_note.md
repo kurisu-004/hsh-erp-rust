@@ -66,11 +66,11 @@
 
 | # | 方法 | 路径 | 权限 | 入参 | 响应 `data` |
 |---|---|---|---|---|---|
-| 1 | GET | `/` | Mgr+Clerk+Insp+CncProg | `DeliveryNoteListQuery` | `DeliveryNoteListOut` |
-| 2 | GET | `/batch-detail?ids=` | Mgr+Clerk+Insp | `ids` 逗号串（1..=200） | `BatchDeliveryDetailData` |
+| 1 | GET | `/` | 权限点 `delivery_note.view`（Mgr+Clerk+Insp；⚠️ 2026-10-15 **收紧去 CncProg**） | `DeliveryNoteListQuery` | `DeliveryNoteListOut` |
+| 2 | GET | `/batch-detail?ids=` | 权限点 `delivery_note.view`（2026-10-15 补闸，原**零守卫**） | `ids` 逗号串（1..=200） | `BatchDeliveryDetailData` |
 | 3 | GET | `/scan/{serial_no}` ★新增 | Mgr+Clerk+Insp | 路径参数（**原样，序列号可含 `-`**） | `DeliveryScanTreeOut` |
 | 4 | POST | `/scan` ★重写 | Mgr+Clerk+Insp | `ScanEntryRequest` | `DeliveryNoteDetailOut` |
-| 5 | GET | `/{id}` | Mgr+Clerk+Insp | — | `DeliveryNoteDetailOut` |
+| 5 | GET | `/{id}` | 权限点 `delivery_note.view`（2026-10-15 补闸，原**零守卫**） | — | `DeliveryNoteDetailOut` |
 | 6 | POST | `/{id}/update` | Mgr+Clerk+Insp | `DeliveryNoteUpdateRequest` | `DeliveryNoteOut` |
 | 7 | POST | `/{id}/remove-batches` ★改名 | Mgr+Clerk+Insp | `DeliveryNoteRemoveBatchesRequest` | `DeliveryNoteDetailOut` |
 | 8 | POST | `/{id}/driver` ★新增 | Mgr+Clerk+Insp | `DeliveryNoteDriverRequest` | `DeliveryNoteOut` |
@@ -79,7 +79,9 @@
 | 11 | POST | `/{id}/pickup` ★入参瘦身 | 任意已登录账号 | `DeliveryNotePickupRequest` | `DeliveryNoteOut` |
 | 12 | POST | `/{id}/soft-delete` | Mgr+Clerk+Insp | `DeliveryNoteVersionedRequest` | `null` |
 
-`GET /` 的权限含 `CncProgrammer`（编程岗要看单据列表）；其余 11 条是 Mgr+Clerk+Insp。
+2026-10-15：`GET /`、`GET /batch-detail`、`GET /{id}` 三条读统一走权限点
+`delivery_note.view`（矩阵 Mgr+Clerk+Insp）—— 列表自原 `Mgr+Clerk+Insp+CncProg`
+**收紧去 `CncProgrammer`**（用户定稿），后两条由零守卫补闸；其余端点权限不变。
 
 ### 1.2 `/api/v2/com/delivery/group`（4 个）
 
@@ -142,7 +144,7 @@
 | 21419 | `BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT` | `recall` 时该 L1 已有另一张 DRAFT | 409 |
 | 21421 | `BIZ_DELIVERY_BATCH_STATE_INVALID` | `submit` 时单上批次被旁路改成 `READY_TO_SHIP` 之外的状态 | 400 |
 | 40100 | `AUTH_*` | 未带 token / token 失效（中间件层） | 401 |
-| 40300 | `FORBIDDEN` | 角色不足（含 `ShelfAccount` 访问本域任意端点） | 403 |
+| 40300 | `FORBIDDEN` | 权限 / 角色守卫失败（三条读的 `delivery_note.view` 权限不足，或未迁端点的角色不足；含 `ShelfAccount` 访问本域任意端点） | 403 |
 | 40901 | `VERSION_CONFLICT` | 任一写端点 OCC 不匹配 | 409 |
 
 **已不使用的码**（随端点下线留空，勿复用）：`21408 BIZ_DELIVERY_NOTE_SCAN_MISMATCH`
@@ -732,6 +734,7 @@ schema 与页面都在用」。
 | 17 | `line_items[].customer_id` | ★ `DeliveryNoteLineItem` **新增** `customer_id: string`（L2 叶子 id，必填非空）。打印分组键从 `customer_name` 切成 `customer_id`：`t_customer.name` 只有**非唯一** btree 索引，同名 L2 会被并进同一张 sheet，而打印产物是客户签字的收货凭证。Zod schema 里加必填 `customer_id: z.string()` |
 | 18 | `line_items[].delivery_seq` | ★ `DeliveryNoteLineItem` **新增** `delivery_seq: number \| null`（**加入本单的次序**，口径见 §2.3.1）。数组顺序已由后端按它排好，前端**零改动即得「按扫码先后」的展示**；Zod schema 里加 `delivery_seq: z.number().nullable()`，供页面按需展示序号列 |
 | 19 | `applicant_name` 回落 | **零改动**（2026-10-10，§2.3.2）。字段名 / 类型 / 可空性都没动，只是「装配件子件自身为空时改用父装配件的值」。前端三处渲染点（详情列表列定义、标签 xlsx 工作簿、送货单打印模板）本就在读它 ⇒ 部署后立即见效，**不需要改 schema、不需要改列定义、不需要改模板** |
+| 20 | 三条读的权限点（2026-10-15） | `GET /`（列表）、`GET /{id}`（详情）、`GET /batch-detail` 统一走权限点 `delivery_note.view`（矩阵 Mgr+Clerk+Insp）。⚠️ 列表自原 `Mgr+Clerk+Insp+CncProg` **收紧去 `CncProgrammer`**（用户定稿）—— 对 CNC 账号列表入口应改按 `hasPermission('delivery_note.view')` 显隐；详情与 batch-detail 原零守卫、本轮补闸。存量会话部署窗口见 `iam.md` §9.2 注记 |
 
 ### 8.4 已知偏差登记
 

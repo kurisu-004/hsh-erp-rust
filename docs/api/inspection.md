@@ -6,14 +6,14 @@
 
 | # | 方法 | 路径 | 权限 | 入参 | 响应 |
 |---|---|---|---|---|---|
-| 1 | GET | `/api/v2/prod/inspection/queue` | Manager + Inspector | `InspectionQueueQuery`（见 §3.1） | `InspectionQueueListOut` |
-| 2 | GET | `/api/v2/prod/inspection/scan/{serial_no}` | Manager + Inspector | 路径参数 `serial_no`（`Path<String>`） | `ScanTreeOut` |
+| 1 | GET | `/api/v2/prod/inspection/queue` | 权限点 `inspection.view`（矩阵 = Manager + Inspector；2026-10-15 迁自角色守卫，逐格相同） | `InspectionQueueQuery`（见 §3.1） | `InspectionQueueListOut` |
+| 2 | GET | `/api/v2/prod/inspection/scan/{serial_no}` | 权限点 `inspection.view`（同端点 1） | 路径参数 `serial_no`（`Path<String>`） | `ScanTreeOut` |
 
 路由注册链：`src/modules/mod.rs` 的 `/api/v2` nest → `src/modules/prod/mod.rs` 的 `.nest("/inspection", inspection::router())` → 本域 `mod.rs` 的 `/queue` + `/scan/{serial_no}`。
 
 - 两个端点返回统一信封 `R { code, message, data }`。
 - 两个端点都**纯读**：`pool.acquire()` 不开事务，**不发** WS 广播。
-- ⚠️ 角色守卫**下沉在 service 第一行**（`require_any_role(READ_ROLES)`），handler 不重复校验。`READ_ROLES` 是 `service.rs` 里的 `[Role::Manager, Role::Inspector]`，**两个 service 共用同一常量**，改白名单只改这一处。放行 `Clerk` / `CncProgrammer` / `ShelfAccount` 会让它们看到本该看不到的批次明细。
+- ⚠️ 权限守卫**下沉在 service 第一行**（`require_permission("inspection.view")`，2026-10-15 自 `require_any_role(READ_ROLES)` 迁移），handler 不重复校验。矩阵是 `{Manager, Inspector}`（`seeds/rbac.sql`），**两个 service 共用同一权限点**，改矩阵即同时改两处。放行 `Clerk` / `CncProgrammer` / `ShelfAccount` 会让它们看到本该看不到的批次明细。
 - ⚠️ 两条路由段数不同（`/queue` 1 段静态、`/scan/{serial_no}` 2 段），matchit 无同段位争用，注册顺序无关。
 - ⚠️ 端点 2 的 `serial_no` 是 `Path<String>` 而非数值提取器：序列号是字符串且可能含 `-`（子件 `{asm}-{i:02d}`）。**前端必须 `encodeURIComponent`** —— 含 `/` 未编码时 axum 路由在该段就把它当路径分隔符拆开 ⇒ 匹配不到路由 ⇒ **HTTP 404 且响应体为空**（本仓 `v2_router()` 未挂 `.fallback(...)`，拿不到任何信封，前端 `res.json()` 直接抛解析异常）。含 `?` / `#` 未编码则在客户端或代理层被截断。后端**不做**解码侧兜底（无法区分「用户真敲了一个 `%`」与「前端忘了编码」）。
 
@@ -260,7 +260,7 @@ JOIN 只有 3 张：`t_part_batch` JOIN `t_part` JOIN `t_customer`（L2）+ `t_c
 
 | 码 | HTTP | 端点 | 触发条件 | 出处 |
 |---|---|---|---|---|
-| `40300` `FORBIDDEN` | 403 | 两者 | 角色不在 `{Manager, Inspector}` 内 | `CurrentUser::require_any_role` |
+| `40300` `FORBIDDEN` | 403 | 两者 | 调用者无 `inspection.view` 权限点（矩阵 = `{Manager, Inspector}`） | `CurrentUser::require_permission` |
 | `40100` `UNAUTHORIZED` | 401 | 两者 | 缺 / 坏 Bearer token、签名失败、claims 不合规 | `src/auth/middleware.rs` + `src/auth/extractor.rs` |
 | `40102` `TOKEN_EXPIRED` | 401 | 两者 | JWT `ExpiredSignature` | `src/auth/middleware.rs` |
 | `40105` `SESSION_REVOKED` | 401 | 两者 | Redis session 查不到 / jti 命中吊销黑名单 | `src/auth/middleware.rs` |
@@ -286,7 +286,7 @@ JOIN 只有 3 张：`t_part_batch` JOIN `t_part` JOIN `t_customer`（L2）+ `t_c
 | 出参 | `InspectionQueueListOut` | `InspectionQueueListOut` **逐字未变**（字段名、`items[*]` 恰好 13 个 key、计数为 JSON **string** 而非 number） |
 | 入参 | `InspectionQueueQuery` | `InspectionQueueQuery` **逐字未变**（9 个 query 参数） |
 
-因为出参逐字未变，**前端 Zod schema 无需改动**。迁入范围：SQL 落到 `repo.rs` 的 `InspectionQueueRepo`（与 `InspectionScanRepo` 并列的第二个 ZST）+ 私有 `push_inspection_queue_where` + 常量 `INSPECTION_QUEUE_SELECT` / `INSPECTION_QUEUE_COUNT_FROM`；行结构 `InspectionQueueRow` 落到 `model.rs`；VO 落到 `vo.rs`；DTO `InspectionQueueQuery` 落到 `dto.rs`；service `InspectionQueueService` + 共用的 `READ_ROLES` 落到 `service.rs`；handler `queue` 落到 `handler.rs`。
+因为出参逐字未变，**前端 Zod schema 无需改动**。迁入范围：SQL 落到 `repo.rs` 的 `InspectionQueueRepo`（与 `InspectionScanRepo` 并列的第二个 ZST）+ 私有 `push_inspection_queue_where` + 常量 `INSPECTION_QUEUE_SELECT` / `INSPECTION_QUEUE_COUNT_FROM`；行结构 `InspectionQueueRow` 落到 `model.rs`；VO 落到 `vo.rs`；DTO `InspectionQueueQuery` 落到 `dto.rs`；service `InspectionQueueService` 落到 `service.rs`（与 `InspectionScanService` 共用 `inspection.view` 权限点）；handler `queue` 落到 `handler.rs`。
 
 ⇒ 迁后本域**零跨域依赖**，这是本次迁移的主要收益。
 

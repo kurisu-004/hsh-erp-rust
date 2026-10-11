@@ -66,7 +66,7 @@
 
 use sqlx::PgConnection;
 
-use crate::auth::rbac::{CurrentUser, Role};
+use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::part::service::PartService;
 use crate::modules::prod::queue::repo::QueueRepoTrait;
@@ -419,7 +419,8 @@ impl QueueService {
     /// 两个单边端点。同 kind 移动（POOL→POOL）视为非法。
     ///
     /// 流程：
-    /// 1. 角色守卫：Manager（service 内）
+    /// 1. 权限守卫：`queue.allocate`（service 内；2026-10-15 自 Manager 独占
+    ///    **有意放宽**为 M,C，用户定稿）
     /// 2. 同 kind 移动校验（POOL→POOL / WORKER→WORKER 同位置）→ `40001`
     /// 3. 取 batch（`status='IN_PROCESS'` + 未软删）→ 不存在 → `20121 BIZ_BATCH_NOT_FOUND`
     /// 4. 校验 `from` 与 batch 当前 `(location, current_holder_id)` 一致：
@@ -455,7 +456,7 @@ impl QueueService {
     /// - `from` 必与 batch 当前状态匹配（→ 40904）
     ///
     /// 守卫顺序（2026-10-09 起固定，调换会让错误码语义漂移）：
-    /// 角色 → 同 kind 40001 → 批次存在 → status → `from` 匹配 → 分方向校验。
+    /// 权限 → 同 kind 40001 → 批次存在 → status → `from` 匹配 → 分方向校验。
     #[allow(clippy::too_many_arguments)]
     pub async fn move_batch(
         conn: &mut PgConnection,
@@ -463,17 +464,18 @@ impl QueueService {
         req: MoveRequest,
         current: &CurrentUser,
     ) -> Result<MoveResult, AppError> {
-        current.require_role(Role::Manager)?;
+        // 2026-10-15：迁权限点 `queue.allocate`，自 `require_role(Role::Manager)`
+        // **有意放宽**为 M,C（用户定稿）。
+        current.require_permission("queue.allocate")?;
         // ⚠️ 2026-10-04 判定：这里**刻意不加** `can_access_shelf` / 40301 scope 校验。
-        // `CurrentUser::can_access_shelf` 的实现是
-        // `shelf_wildcard || shelf_ids.contains(id) || has_role(Role::Manager)`
-        // —— 本端点角色白名单是 Manager 独占（`require_role(Role::Manager)`，无
-        // `require_any_role` 分支），故该判定对本端点的**每一个** caller 恒为 true，
-        // 加上去是可证明的死代码。scope 收窄只对 SHELF_ACCOUNT 有意义，而 SHELF_ACCOUNT
-        // 进不来本端点。
+        // `queue.allocate` 矩阵是 M,C，两者都不是 SHELF_ACCOUNT ——
+        // `shelf_scope_for` 对非 SA 一律返 `None`（不限），故选架路径不受调用者
+        // scope 影响；`from` 侧校验的是批次**真实所在位置**（与调用者权限无关）。
+        // scope 收窄只对 SHELF_ACCOUNT 有意义，而它不在本矩阵里 ⇒ 加 scope 判定
+        // 只会误拒 Clerk 的合法调度，不构成有效收窄。
         //
-        // 2026-10-10：WORKER→POOL 分支改走自动选架后，`shelf_scope_for(&current)` 按上述
-        // 同一条理由对本端点的每一个 caller 恒返 `None`（Manager）—— 传它是形态一致
+        // 2026-10-10：WORKER→POOL 分支走自动选架，`shelf_scope_for(&current)` 按上述
+        // 同一条理由对本端点的每一个 caller 恒返 `None` —— 传它是形态一致
         // （选架的 scope 形参必填，不是可选参数），**不是**新增了一条有效校验。选不出
         // 架时因此报 20508 而不是 40301。
 
@@ -745,9 +747,10 @@ impl QueueService {
                 // 的自救路径不被堵死。
                 //
                 // 选不出时用 `20508 BIZ_SHELF_PROCESS_NOT_FOUND` 而不是 40301：本端点
-                // 角色闸门是 `require_role(Role::Manager)` 独占，`shelf_scope_for` 对它
-                // 恒返 `None`（不限），所以「候选为空」**只可能**是「没有可用生产架 /
-                // 没有架映射这道工序」，永远不会是 scope 问题 —— 说成「无权」是错的。
+                // 权限闸门是 `queue.allocate`（M,C，均非 SHELF_ACCOUNT），
+                // `shelf_scope_for` 对它恒返 `None`（不限），所以「候选为空」**只可能**
+                // 是「没有可用生产架 / 没有架映射这道工序」，永远不会是 scope 问题 ——
+                // 说成「无权」是错的。
                 let shelf_id = crate::shared::shelf::select::pick_least_loaded(
                     &mut *conn,
                     "PRODUCTION",
@@ -979,7 +982,9 @@ impl QueueService {
         req: AutoAllocateRequest,
         current: &CurrentUser,
     ) -> Result<AutoAllocateResult, AppError> {
-        current.require_role(Role::Manager)?;
+        // 2026-10-15：迁权限点 `queue.allocate`，自 `require_role(Role::Manager)`
+        // **有意放宽**为 M,C（用户定稿）。
+        current.require_permission("queue.allocate")?;
 
         // 1. process 存在性
         let _process = (&mut *conn)
@@ -1538,13 +1543,19 @@ mod tests {
     }
 
     fn make_current(user_id: i64, role: Role) -> CurrentUser {
+        // 2026-10-15：`move_batch` 迁权限点 `queue.allocate`（M,C）—— 本文件的
+        // service 直调用例全用 Manager，给对应权限码即可（与生产 session 快照一致）。
+        let permissions = match role {
+            Role::Manager | Role::Clerk => vec!["queue.allocate".to_string()],
+            _ => Vec::new(),
+        };
         CurrentUser {
             id: user_id,
             username: "test".to_string(),
             roles: vec![role],
             shelf_ids: vec![],
             shelf_wildcard: false,
-            permissions: Vec::new(),
+            permissions,
         }
     }
 

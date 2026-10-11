@@ -10,7 +10,7 @@
 //! part 域的 `cancel` / `force-complete` 留在 `part::service::lifecycle` —— 它们的
 //! 操作对象是 part（一个 part 的全部活跃批次），不是单个批次。
 
-use crate::auth::rbac::{CurrentUser, Role};
+use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
@@ -36,7 +36,9 @@ impl BatchService {
         req: DeliverRequest,
         current: &CurrentUser,
     ) -> Result<PartOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk])?;
+        // 2026-10-15：迁权限点 `batch.deliver`（M,C；矩阵逐格等于原
+        // `require_any_role` 集合；`complete` 另服务后台 auto_complete 的系统身份）。
+        current.require_permission("batch.deliver")?;
         // 2026-10-02：batch_id 来自 URL 路径参数（`POST /prod/batches/{batch_id}/…`），
         // part_id 由批次行反查；原先的 `batch.part_id != part_id` 断言恒真，已删。
         let batch = repo.find_batch_by_id(batch_id).await?.ok_or_else(|| {
@@ -133,7 +135,9 @@ impl BatchService {
         req: CompleteRequest,
         current: &CurrentUser,
     ) -> Result<PartOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk])?;
+        // 2026-10-15：迁权限点 `batch.deliver`（M,C；矩阵逐格等于原
+        // `require_any_role` 集合；`complete` 另服务后台 auto_complete 的系统身份）。
+        current.require_permission("batch.deliver")?;
         // 2026-10-02：batch_id 来自 URL 路径参数（`POST /prod/batches/{batch_id}/…`），
         // part_id 由批次行反查；原先的 `batch.part_id != part_id` 断言恒真，已删。
         let batch = repo.find_batch_by_id(batch_id).await?.ok_or_else(|| {
@@ -233,7 +237,9 @@ impl BatchService {
         req: StartRepairRequest,
         current: &CurrentUser,
     ) -> Result<PartOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
+        // 2026-10-15：迁权限点 `batch.repair`（M,C,I；矩阵逐格等于原
+        // `require_any_role` 集合）。
+        current.require_permission("batch.repair")?;
         // 2026-10-02：batch_id 来自 URL 路径参数（`POST /prod/batches/{batch_id}/…`），
         // part_id 由批次行反查；原先的 `batch.part_id != part_id` 断言恒真，已删。
         let batch = repo.find_batch_by_id(batch_id).await?.ok_or_else(|| {
