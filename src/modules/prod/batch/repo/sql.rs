@@ -4,7 +4,9 @@
 //! `part/repo/sql/batch_sql.rs` 搬来，impl 目标由 part 域 ZST `PartRepo` 改为
 //! 本域 ZST `PartBatchRepo`（`t_part_batch` 的 SQL 真源在 `queries.rs`）。
 //!
-//! ## 承载方法（19 个）
+//! ## 承载方法（18 个）
+//!
+//! 2026-10-15：删一处全仓零调用方的死代码写点，19 → 18。
 //!
 //! ### find_*（7）
 //! - `find_inprocess_batch_for_part` / `find_scan_target_batch`
@@ -16,9 +18,9 @@
 //! - `mark_batch_passed_inspection` / `mark_batch_inspected`
 //! - `mark_batch_failed_inspection` / `mark_batch_returned`
 //!
-//! ### mark_*_lifecycle / cancel_all（6）
+//! ### mark_*_lifecycle / cancel_all（5）
 //! - `mark_batch_delivered` / `mark_batch_completed`
-//! - `mark_part_cancelled` / `mark_batch_cancelled`
+//! - `mark_part_cancelled`
 //! - `mark_batch_repairing` / `cancel_all_active_batches_for_part`
 //! - （另有 `force_complete_all_batches_for_part`）
 //!
@@ -870,7 +872,7 @@ impl PartBatchRepo {
     /// - `prod/scan/listing/repo.rs` 的 pickable / held —— 均带
     ///   `status='IN_PROCESS'`。
     ///
-    /// **A 组 —— 不带 `status` 过滤，清位置会改结果（4 处）：**
+    /// **A 组 —— 不带 `status` 过滤，清位置会改结果（3 处）：**
     ///
     /// 1. `part::service::list_enrichment::enrich_part_list_with_location_and_holder`
     ///    的 min-progress 目标批次选择：只排除 `CANCELLED` / `COMPLETED`，**不排除
@@ -890,9 +892,8 @@ impl PartBatchRepo {
     /// 3. `com/union_list/repo/sql.rs::list_union_all_with_filters` 的
     ///    `$7::text[]`（location）/ `$8::bigint[]`（holder）两个 `EXISTS`
     ///    （同样只有软删闸门）⇒ `GET /com/union-list` 的结果集变小。方向是修正。
-    /// 4. `prod::batch::repo::queries::list_held_by_worker` —— 全仓**零调用方**
-    ///    （仅 trait 声明 + impl），死代码；接线前必须先补 `status='IN_PROCESS'`
-    ///    （与本函数 doc 同款的自我标注见该函数 doc）。
+    ///
+    /// （2026-10-15：原 A-4 死代码读侧已随其在 `queries.rs` 的删除下线，4 处 → 3 处。）
     ///
     /// ⇒ 有可见数字变化的读侧共 3 处（A-1 + 下面两条），都**不是**新增差异，
     /// 而是 migration 已经
@@ -1035,74 +1036,6 @@ impl PartBatchRepo {
         .execute(executor)
         .await?;
         Ok(r.rows_affected())
-    }
-
-    /// 批次取消（OCC UPDATE t_part_batch）：白名单 5 状态
-    /// —— **2026-10-01 起为 shared::batch::status 薄包装**。
-    ///
-    /// `event_id`：本函数能让 part 新进 CANCELLED（它是该 part 最后一条活跃
-    /// 批次时），故按 M4 由 caller 透传归档事件雪花 id。
-    ///
-    /// ## ⚠️ 死代码 + 与「终态清位置」不变式**不一致**（2026-10-14 review 第 2 轮 MINOR-N4）
-    ///
-    /// **全仓零调用方**（`rg mark_batch_cancelled src/ tests/` 只命中本定义 +
-    /// 2 处历史 doc）。同款自我标注的范本见
-    /// `prod::batch::repo::queries::list_held_by_worker`（「死代码 + 与
-    /// `count_held_by_worker` 分叉」）。
-    ///
-    /// **但 `clear_location` / `clear_holder_id` 仍是 `false`**，与
-    /// `CLAUDE.md`「状态派生契约」的新不变式（终态批次一律不在任何位置、也不在
-    /// 任何人手上；写点清单见 `docs/api/batch.md`
-    /// §6.1 与 `prod::batch::repo::queries::PartBatchRepo::update` 的 doc 表）
-    /// **不一致**。该函数**不在那张表的 6 个写点里** —— 因为它没有调用方。
-    ///
-    /// 为什么现在不一致还无害：`allowed_from` 是
-    /// `PENDING / PROGRAMMING / INSPECTION / READY_TO_SHIP / DELIVERED`，**不含
-    /// `IN_PROCESS`** ⇒ 即便接回去也够不到「工人手上的批次」那种幽灵行。
-    /// `CLAUDE.md` 那条 bullet 里的「`CANCELLED` 那侧已统一处理过」指的是
-    /// `mark_batch_status_only` 与 bulk 入口，**不是**本函数。
-    ///
-    /// 🔒 **接回调用前必须先把两个 `clear_*` 改成 `true`** —— 否则本 PR 要消灭的
-    /// 幽灵行会原样复活，而且因为「`CANCELLED` 不含 `IN_PROCESS`」这层保护一旦
-    /// 有人放宽 `allowed_from` 就会静默失效。
-    pub async fn mark_batch_cancelled(
-        conn: &mut PgConnection,
-        batch_id: i64,
-        expected_version: i32,
-        current_user_id: i64,
-        event_id: Option<i64>,
-    ) -> Result<u64, AppError> {
-        batch_status::apply_batch_status_change(
-            conn,
-            StatusChange {
-                batch_id,
-                new_status: "CANCELLED",
-                new_location: None,
-                new_holder_id: None,
-                new_process_id: None,
-                new_process_step_id: None,
-                is_repairing: None,
-                expected_version: Some(expected_version),
-                allowed_from: &[
-                    "PENDING",
-                    "PROGRAMMING",
-                    "INSPECTION",
-                    "READY_TO_SHIP",
-                    "DELIVERED",
-                ],
-                updated_by: current_user_id,
-                // 2026-10-01 review 第 1 轮 M2：本包装函数的 `None` 一律是
-                // 「保持原值」，清空语义由同名 clear_* 显式表达。
-                clear_location: false,
-                clear_holder_id: false,
-                clear_process_id: false,
-                clear_process_step_id: false,
-                // 2026-10-01 review 第 1 轮 M4：终态归档事件 id 由 caller 透传。
-                event_id,
-            },
-        )
-        .await
-        .map(|_| 1u64)
     }
 
     /// 批次 IN_PROCESS → REPAIRING。

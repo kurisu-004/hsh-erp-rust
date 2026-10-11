@@ -1,7 +1,9 @@
-//! 胖 trait `PartBatchRepoTrait`（17 方法）+ `impl for &mut PgConnection`。
+//! 胖 trait `PartBatchRepoTrait`（16 方法）+ `impl for &mut PgConnection`。
 //!
 //! 2026-10-02 随 `t_part_batch` 归属迁入 prod 域，从单文件 `prod/batch/repo/queries.rs`
 //! 拆出（单文件已超 conventions.md §2 的 1000 行上限）。签名零变化。
+//!
+//! 2026-10-15：删一处全仓零调用方的死代码读侧方法，17 → 16 方法。
 //!
 //! 2026-10-03 集合读收口：删掉 2 条 `list.rs` 的镜像声明与转发 —— 原
 //! `list_batches_with_part` / `count_batches_with_part`（待品检端点迁移后零调用方）。
@@ -105,8 +107,6 @@ pub trait PartBatchRepoTrait: Send {
         limit: i64,
     ) -> Result<Vec<RecentBatchRow>, sqlx::Error>;
     async fn count_held_by_worker(&mut self, worker_id: i64) -> Result<i64, sqlx::Error>;
-    async fn list_held_by_worker(&mut self, worker_id: i64)
-    -> Result<Vec<TPartBatch>, sqlx::Error>;
     async fn find_delivered_older_than(
         &mut self,
         threshold: NaiveDateTime,
@@ -246,13 +246,6 @@ impl PartBatchRepoTrait for &mut PgConnection {
 
     async fn count_held_by_worker(&mut self, worker_id: i64) -> Result<i64, sqlx::Error> {
         PartBatchRepo::count_held_by_worker(&mut **self, worker_id).await
-    }
-
-    async fn list_held_by_worker(
-        &mut self,
-        worker_id: i64,
-    ) -> Result<Vec<TPartBatch>, sqlx::Error> {
-        PartBatchRepo::list_held_by_worker(&mut **self, worker_id).await
     }
 
     async fn find_delivered_older_than(
