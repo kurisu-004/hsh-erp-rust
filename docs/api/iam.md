@@ -433,7 +433,7 @@ ADMIN 用户由元角色通配天然放行（见 §9.3）。
 | 权限点 | domain | 守卫的端点 | 授权矩阵（`t_role_permission`） |
 |---|---|---|---|
 | `part.drawing.print` | `part` | `GET /parts/{id}/print-drawing`、`POST /parts/print-drawing-batch`、`GET /part-files/{id}/url`（+ 同 service 的 alias `GET /cnc-programs/{id}/download-url`） | MANAGER / CLERK / INSPECTOR / CNC_PROGRAMMER |
-| `queue.dispatch` | `queue` | `POST /prod/queue/dispatch`、`POST /prod/queue/auto-dispatch`（2026-10-15 迁入，见下） | MANAGER / CLERK |
+| `queue.dispatch` | `queue` | `POST /prod/queue/dispatch`、`POST /prod/queue/auto-dispatch`（2026-10-15 回改并入同点，见 `queue.md` §1） | MANAGER / CLERK |
 | `delivery_note.print` | `delivery_note` | **无**（前端-only） | MANAGER / CLERK / INSPECTOR |
 | `production.view` | `production` | `GET /prod/processes`（2）、`GET /prod/work-types`（3，含工种↔工序映射读）、`GET /prod/shelf-processes`（2）、`GET /prod/process-chains/by-part/{part_id}` 与 `/{chain_id}`（2） | MANAGER / CLERK / CNC_PROGRAMMER / SHELF_ACCOUNT / INSPECTOR |
 | `production.config` | `production` | `POST /prod/work-types/{id}/processes`、`POST /prod/shelf-processes/{shelf_id}`（两处原**零守卫**，本轮补闸） | MANAGER |
@@ -466,7 +466,9 @@ ADMIN 用户由元角色通配天然放行（见 §9.3）。
 - **明确不迁（保持角色守卫）**：`place-on-shelf` / `release-from-programming`
   （废弃端点）、`scan/deliver` / `worker-scan` / `pick-up` / `verify-badge`
   （设备流）、RBAC 8 端点（§9.2 设计如此）、dashboard / wx / statistics /
-  mail_digest / iam 其余、`outsource` 对账（shipment）两端点。
+  mail_digest / iam 其余、`outsource` 对账三端点（`GET /outsource-companies/{id}/sent-parts`
+  与 `POST /outsource-shipments/{id}/reconcile-update` 保持 M,C，
+  `GET /outsource-shipments/in-flight` 保持 M,C,I —— 计划内保持）。
 - `part.drawing.print` 守的三条后端端点共用一张矩阵：两条打印端点是纯转发
   （`part::handler::print`），`GET /part-files/{id}/url` 是图纸下载直链
   （2026-10-14 由同集合的 4 角色白名单迁移；`GET /cnc-programs/{id}/download-url`

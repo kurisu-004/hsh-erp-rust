@@ -27,7 +27,7 @@ use crate::state::AppState;
 
 /// `POST /api/v2/prod/queue/recall`
 ///
-/// 角色：Manager + Clerk（service 内守卫）。
+/// 权限：`queue.recall`（service 内守卫；矩阵 Manager + Clerk）。
 pub async fn recall(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,

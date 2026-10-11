@@ -1,5 +1,5 @@
 //! prod::queue 下发流 3 端点（`pending` / `dispatch` / `auto-dispatch`）的 HTTP
-//! 路由 + 角色守卫 + WS 广播。2026-10-08 自 `prod::batch::handler::dispatch` 搬入
+//! 路由 + 权限守卫 + WS 广播。2026-10-08 自 `prod::batch::handler::dispatch` 搬入
 //! （URL 由 `/prod/batches/*` 硬切到 `/prod/queue/*`，无 alias）。
 //!
 //! 待下发源状态白名单 = `PENDING` / `PROGRAMMING`（已废弃的 `PROGRAMMING` 只存量

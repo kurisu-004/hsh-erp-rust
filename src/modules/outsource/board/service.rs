@@ -1,6 +1,6 @@
 //! outsource 外协看板装配 service（2026-10-09 新增）
 //!
-//! service 层零 SQL：只做角色守卫 + 内存分组 + VO 装配。SQL 全在
+//! service 层零 SQL：只做权限守卫（`outsource.view`）+ 内存分组 + VO 装配。SQL 全在
 //! [`super::repo::OutsourceQueueRepo`]。
 //!
 //! ## 为什么派生字段一律在 service 算
@@ -45,8 +45,8 @@ impl OutsourceQueueService {
         Self
     }
 
-    /// 工序序列板。角色守卫：Manager + Clerk + Inspector（沿用被取代的
-    /// `GET /outsource-pool/counts` 口径 —— admin 视角但不止 Manager）。
+    /// 工序序列板。权限守卫 `outsource.view`（Manager + Clerk + Inspector，沿用
+    /// 被取代的 `GET /outsource-pool/counts` 口径 —— admin 视角但不止 Manager）。
     pub async fn build_snapshot(
         conn: &mut PgConnection,
         current: &CurrentUser,
@@ -94,7 +94,7 @@ impl OutsourceQueueService {
         })
     }
 
-    /// 单工序看板。角色守卫同 [`Self::build_snapshot`]。
+    /// 单工序看板。权限守卫（`outsource.view`）同 [`Self::build_snapshot`]。
     pub async fn build_process_detail(
         conn: &mut PgConnection,
         current: &CurrentUser,

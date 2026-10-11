@@ -471,7 +471,7 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 
 | # | 守卫 | 错误码 |
 |---|---|---|
-| 1 | 权限点 `outsource.move`（Mgr+Clerk+Insp；2026-10-15 迁自角色守卫，矩阵逐格相同；service 入口第一行） | `40301` |
+| 1 | 权限点 `outsource.move`（Mgr+Clerk+Insp；2026-10-15 迁自角色守卫，矩阵逐格相同；service 入口第一行） | `40300 FORBIDDEN` |
 | 2 | `from.kind == to.kind` → 拒绝（**在查批次之前判**，同 kind 是请求形状错误） | `40001 VALIDATION_ERROR` |
 | 3 | 批次存在（软删视为不存在） | `20109 BIZ_PART_BATCH_NOT_FOUND` |
 | 4 | OCC：`validate_batch_version(batch.id, req.version, batch.version)` | `40901 VERSION_CONFLICT` |
@@ -638,7 +638,9 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 - **公司读的权限收紧去 `CncProgrammer`（2026-10-15，用户定稿）**：公司列表 / 详情 /
   `by-process` 三个读端点自原 `Mgr+Clerk+CncProg+Insp` 迁入权限点 `outsource.view`
   （矩阵 `Mgr+Clerk+Insp`）⇒ 对 CNC 岗**关闭**。这是与本批「矩阵逐格等于迁移前守卫」
-  总口径的三处有意偏差之一（另两处：`queue.allocate` 放宽、`delivery_note.view` 去 CNC）。
+  总口径的有意偏差之一，与 `delivery_note.view` 同属「收紧去 CNC」一类；三处偏差
+  全表（另两处为 `queue.allocate` 放宽、`production.view` 并集多授 SHELF_ACCOUNT）
+  见 `iam.md` §9.2。
   存量会话部署窗口见 `iam.md` §9.2 注记。
 
 - **对账页（`sent-parts`）的每一行不再带零件 id（`part_id` 已删）。** 后端判断是「前端对账页只展示 `part_drawing_no` / `part_name`，零件 id 无消费方」；代价是若将来要在这张表里做「点零件跳详情」，得先补回 `part_id` 或另开一个按 shipment 取零件的端点。这是**有意**的字段删减，不是遗漏。
@@ -687,6 +689,6 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 | `21503` / `21504` | `BIZ_OUTSOURCE_SHIPMENT_NO_OPEN` / `..._QUANTITY_EXCEEDS` | 找不到开口 shipment / 接收数量超开口量 |
 | `40901` | `VERSION_CONFLICT` | OCC 冲突 |
 | `40001` | `VALIDATION_ERROR` | 请求形状错误（同 kind 移动） |
-| `40301` | — | 权限守卫（`require_permission` 失败） |
+| `40300` | `FORBIDDEN` | 权限守卫（`require_permission` 失败） |
 
 ⚠️ `40901 VERSION_CONFLICT` 只表达 OCC，不得用于业务唯一键冲突（全仓规约见 `CLAUDE.md` §8）。本域的公司重名 / 报价三元组重复都有专用码（`21202`/`21214` / `21303`）。

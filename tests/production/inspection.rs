@@ -18,8 +18,8 @@
 //!      `t_part.version` 不同
 //!   9. **i64 序列化为 JSON string**：`children[].id` / `children[].children[].id`
 //!      都是 string
-//!  10. **角色守卫**：MANAGER / INSPECTOR 各 200；CLERK / CNC_PROGRAMMER /
-//!      SHELF_ACCOUNT 各 403 + `code == 40300`
+//!  10. **权限守卫（`inspection.view`）**：MANAGER / INSPECTOR 各 200；CLERK /
+//!      CNC_PROGRAMMER / SHELF_ACCOUNT 各 403 + `code == 40300`
 //!  11. **`process_name`**：`INSPECTION` / `READY_TO_SHIP` 批次恒 `null`（出池清
 //!      `current_process_id` 不变式的正确结果），`IN_PROCESS` 批次取到工序名
 //!  12. **`is_repairing`** 标记透传
@@ -643,7 +643,7 @@ async fn i64_ids_are_serialized_as_json_strings() {
     );
 }
 
-/// 场景 10: 角色守卫 —— MANAGER / INSPECTOR 放行；三个角色 403 + 40300。
+/// 场景 10: 权限守卫（`inspection.view`）—— MANAGER / INSPECTOR 放行；三个角色 403 + 40300。
 #[tokio::test]
 async fn role_guard_allows_manager_and_inspector_rejects_other_three() {
     let (_pool, app, _token, fx) = bootstrap().await;

@@ -5,9 +5,10 @@
 //!
 //! 两个都是**纯读**：handler `pool.acquire()` 不开事务，不发 WS 广播。
 //!
-//! ## 角色守卫
-//! 下沉到 service（`QueueBoardService::build_*` 入口 `require_any_role`），
-//! handler 不重复校验 —— 与 work_type / assembly 域惯例一致。
+//! ## 权限守卫
+//! 下沉到 service（`QueueBoardService::build_*` 入口
+//! `require_permission("queue.view")`；2026-10-15 自角色守卫 M,C,I 迁点，矩阵
+//! 逐格相同），handler 不重复校验 —— 与 work_type / assembly 域惯例一致。
 //!
 //! ## 取代关系（**无 alias**，旧路径 404）
 //! - `GET /queue/counts` → `/queue/snapshot`（后者多工序元数据 + `pending_count`）
@@ -28,8 +29,8 @@ use crate::state::AppState;
 
 /// `GET /api/v2/prod/queue/snapshot`
 ///
-/// 取代原 `GET /prod/pool/counts`。角色：Manager + Clerk + Inspector（service 内
-/// 守卫）。3 条 SQL，与工序数无关。
+/// 取代原 `GET /prod/pool/counts`。权限：`queue.view`（service 内守卫；矩阵
+/// Manager + Clerk + Inspector）。3 条 SQL，与工序数无关。
 pub async fn board_snapshot(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -42,8 +43,8 @@ pub async fn board_snapshot(
 /// `GET /api/v2/prod/queue/processes/{process_id}`
 ///
 /// 取代原 `GET /prod/pool/{process_id}` + 逐 worker 的 `GET /prod/pool/state`。
-/// 角色：Manager + Clerk + Inspector（service 内守卫）。**固定 4 条 SQL**，
-/// 与工人数无关（见 `board/repo.rs::board_process_detail` doc）。
+/// 权限：`queue.view`（service 内守卫；矩阵 Manager + Clerk + Inspector）。
+/// **固定 4 条 SQL**，与工人数无关（见 `board/repo.rs::board_process_detail` doc）。
 ///
 /// ⚠️ `Path<i64>` 抽不出数字时走 axum 的 `PathRejection`，返 **HTTP 400 纯文本**，
 /// 不进 `R<T>` 信封（与本仓其它带 `Path<i64>` 的端点同款，是全仓行为而非本端点

@@ -85,8 +85,8 @@ pub struct InspectionScanService;
 impl InspectionScanService {
     /// `GET /api/v2/prod/inspection/scan/{serial_no}` 业务逻辑。
     ///
-    /// 流程：角色守卫 → 序列号 trim + 空值兜底 → 命中（part → assembly 回退）→
-    /// 定位装配件节点与零件层 → **一条** SQL 取全部批次 → 内存分组挂树。
+    /// 流程：权限守卫（`inspection.view`）→ 序列号 trim + 空值兜底 → 命中（part →
+    /// assembly 回退）→ 定位装配件节点与零件层 → **一条** SQL 取全部批次 → 内存分组挂树。
     pub async fn scan(
         conn: &mut PgConnection,
         current: &CurrentUser,
@@ -313,8 +313,8 @@ impl InspectionQueueService {
     /// 返回 `status='INSPECTION'` 的全部活跃批次，出参严格对齐前端待品检页的 7 个
     /// 数据列 + 操作列锚点。
     ///
-    /// 流程：角色守卫 → limit/offset 规范化 → `customer_id` 展开为 L1+L2 ids →
-    /// 3 个表头文本筛选 trim + 拒通配符 + 拼 `%…%` → 排序白名单映射 →
+    /// 流程：权限守卫（`inspection.view`）→ limit/offset 规范化 → `customer_id` 展开为
+    /// L1+L2 ids → 3 个表头文本筛选 trim + 拒通配符 + 拼 `%…%` → 排序白名单映射 →
     /// `list_inspection_queue` + `count_inspection_queue` 两条 SQL（同 WHERE 拼装器）。
     ///
     /// 排序非法值**不报错**：非法 `sort_by` 退化为系统交期、非法 `sort_dir` 退化为

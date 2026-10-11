@@ -480,7 +480,7 @@ fn row_to_item(r: PendingBatchRow) -> PendingBatchItem {
 // 覆盖以下场景：
 // - list_pending_batches: 正常返回 + 排序 + 排除 IN_PROCESS / 已软删
 // - dispatch_batch: bulk 成功路径 + 二次 dispatch 40903 + 不存在 batch_id 40404 +
-//   并发冲突 40901 + t_shelf_process 多结果取 LIMIT 1 + Inspector 角色守卫
+//   并发冲突 40901 + t_shelf_process 多结果取 LIMIT 1 + Inspector 权限守卫
 // - auto_dispatch_preview: 无 chain → NO_PROCESS_CHAIN；无 step → NO_PROCESS_STEP；
 //   完整链路 → first_process_id / first_shelf_id 透传；NOT_FOUND 兜底
 

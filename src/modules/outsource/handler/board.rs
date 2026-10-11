@@ -5,7 +5,7 @@
 //!
 //! 两个都是**纯读**：handler `pool.acquire()` 不开事务，不发 WS 广播。
 //!
-//! ## 角色守卫
+//! ## 权限守卫
 //! 下沉到 service（`OutsourceQueueService::build_*` 入口 `require_permission`
 //! `outsource.view`；2026-10-15 迁自角色守卫 M,C,I），handler
 //! 不重复校验 —— 与 work_type / assembly 域惯例一致。两个端点都是 Manager + Clerk +
@@ -34,8 +34,9 @@ use crate::state::AppState;
 
 /// `GET /api/v2/outsource-queue/snapshot`
 ///
-/// 取代原 `GET /outsource-pool/counts`。角色：Manager + Clerk + Inspector（service 内
-/// 守卫）。**固定 3 条 SQL**，与工序数无关（见 `board/repo.rs` 的 `snapshot` doc）。
+/// 取代原 `GET /outsource-pool/counts`。权限：`outsource.view`（service 内守卫；
+/// 矩阵 Manager + Clerk + Inspector）。**固定 3 条 SQL**，与工序数无关（见
+/// `board/repo.rs` 的 `snapshot` doc）。
 pub async fn snapshot(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -48,8 +49,8 @@ pub async fn snapshot(
 /// `GET /api/v2/outsource-queue/processes/{process_id}`
 ///
 /// 取代原 `GET /outsource-pool/{process_id}` + 逐公司的 `GET /outsource-pool/state`。
-/// 角色：Manager + Clerk + Inspector（service 内守卫）。**固定 4 条 SQL**，与公司数 /
-/// 批次数无关（见 `board/repo.rs::process_detail` 的 doc）。
+/// 权限：`outsource.view`（service 内守卫；矩阵 Manager + Clerk + Inspector）。
+/// **固定 4 条 SQL**，与公司数 / 批次数无关（见 `board/repo.rs::process_detail` 的 doc）。
 ///
 /// ⚠️ `Path<i64>` 抽不出数字时走 axum 的 `PathRejection`，返 **HTTP 400 纯文本**，
 /// 不进 `R<T>` 信封（与本仓其它带 `Path<i64>` 的端点同款，是全仓行为而非本端点的

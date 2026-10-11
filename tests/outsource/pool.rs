@@ -887,8 +887,8 @@ async fn snapshot_allows_clerk_role() {
 
 /// 权限负向回归：SHELF scope 账号被 snapshot 拒（403）。
 ///
-/// 只测正向的话，将来有人删掉 `build_snapshot` 里的 `require_any_role` 这条用例
-/// 仍然全绿。
+/// 只测正向的话，将来有人删掉 `build_snapshot` 里的 `require_permission("outsource.view")`
+/// 这条用例仍然全绿。
 #[tokio::test]
 async fn snapshot_forbidden_for_shelf_account() {
     let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
@@ -898,7 +898,7 @@ async fn snapshot_forbidden_for_shelf_account() {
     let co = insert_company(&pool, "FbCo", true).await;
     link_company_process(&pool, co, proc_id).await;
 
-    // scope 必须给才能登录；给了也仍然被 service 的 role 守卫拒。
+    // scope 必须给才能登录；给了也仍然被 service 的权限守卫拒。
     let (app, token) =
         login_shelf_account(pool.clone(), "shelf_user_queue_snapshot", &[shelf]).await;
 

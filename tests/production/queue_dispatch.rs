@@ -10,7 +10,7 @@
 //!   7. auto-dispatch_preview 无 chain 的 batch → skip_reason=NO_PROCESS_CHAIN（只读，不写库）
 //!   8. auto-dispatch_preview 空 batch_ids → 40001 VALIDATION_ERROR (HTTP 422)
 //!   9. OCC 40901 VERSION_CONFLICT（双事务并发，A 持有 tx 占用 batch 行，B 调 dispatch 应 40901）
-//!  10. 角色 / 权限守卫：Inspector 调 dispatch → 40300 FORBIDDEN；
+//!  10. 权限守卫：Inspector 调 dispatch → 40300 FORBIDDEN；
 //!      CLERK（持有 `queue.dispatch`）→ 成功（2026-10-14 权限点迁移后补正向）
 //!  11. GET pending：unauth → 40100
 //!  12. 回归（2026-09-30 review 第 3 轮 L5）：**无工序链工单** dispatch 后出现在
@@ -840,7 +840,7 @@ async fn dispatch_after_external_version_bump_succeeds_with_new_version() {
     );
 }
 
-/// 场景 10: 角色守卫 —— Inspector 调 dispatch → 40300 FORBIDDEN
+/// 场景 10: 权限守卫 —— Inspector 调 dispatch → 40300 FORBIDDEN
 #[tokio::test]
 async fn dispatch_forbidden_for_inspector() {
     let (pool, app, token, fx) = bootstrap_as_inspector().await;

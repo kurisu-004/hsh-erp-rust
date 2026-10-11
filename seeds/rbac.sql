@@ -79,8 +79,8 @@ ON CONFLICT (code) WHERE deleted_at IS NULL DO NOTHING;
 --     2026-10-14 同点接管 part_file::service::get_file_with_url（图纸下载直链，
 --     原白名单逐格相同；cnc-programs/{id}/download-url alias 随之一并走点）
 --   * `queue.dispatch`      ← prod::queue::service::dispatch::dispatch_batch 原
---     require_any_role（MANAGER / CLERK；读端点 list_pending / auto-dispatch
---     预览**保持角色守卫不动**，不迁权限点）
+--     require_any_role（MANAGER / CLERK）；auto-dispatch 预览 2026-10-15 回改并入
+--     同点（见 docs/api/queue.md §1）；list_pending 归第二批 `queue.view`
 --   * `delivery_note.print` ← **前端-only** 权限点：后端打印端点已于 2026-10-08
 --     下线（打印改前端本地 hucre 生成），后端零守卫可迁；矩阵照现有前端
 --     `frontend/src/utils/deliveryNotePermissions.ts::canPrint` 的放行集合
@@ -95,7 +95,8 @@ ON CONFLICT (code) WHERE deleted_at IS NULL DO NOTHING;
 --     `POST /prod/shelf-processes/{shelf_id}` 两条**原先零守卫**的配置写路径
 --     补闸（M）。
 --   * `queue.view`                ← list_pending / 队列板 snapshot + 工序详情
---     （M,C,I，原 require_any_role 逐格相同）。
+--     （M,C,I，原 require_any_role 逐格相同；auto-dispatch 预览**不**归本点，
+--     2026-10-15 回改同 `queue.dispatch`，见 docs/api/queue.md §1）。
 --   * `queue.recall`              ← recall_to_pending（M,C，原集合相同）。
 --   * `queue.allocate`            ← refill / move_batch / auto_allocate_for_process
 --     三条**原 Manager 独占**的人工投放写路径；⚠️ **有意放宽为 M,C**（用户
