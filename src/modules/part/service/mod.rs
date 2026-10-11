@@ -5,9 +5,10 @@
 //! 本模块自此只承载 part 级用例。
 //!
 //! - `crud.rs`：单件 CRUD（create_part / get_part / list_parts / update_part /
-//!   soft_delete_part / upload_part_file / upload_drawing / upload_3d_model /
-//!   get_part_batches_by_serial）+ helpers（map_create_error /
-//!   lookup_customer_names；客户 id 展开走 `crate::shared::customer`）
+//!   soft_delete_part / get_part_batches_by_serial）+ helpers（map_create_error /
+//!   lookup_customer_names；客户 id 展开走 `crate::shared::customer`）。
+//!   2026-10-13 PR1b：三条上传（upload_part_file / upload_drawing /
+//!   upload_3d_model）删除，迁往 `files::part_file`
 //! - `batch.rs`：批量创建（batch_create_parts legacy + batch_create_parts_with_bindings +
 //!   prepare_binding_head_copy + PreparedBinding），2026-09-16 M2-B + M2-C 重构
 //! - `lifecycle.rs`：part 级多批次终态（cancel / force_complete）

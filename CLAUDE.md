@@ -193,6 +193,42 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 >
 > ⚠️ **`t_shelf` 全仓只有一份行结构**：`iam::shelf::model::TShelf`（14 列含 `capacity`）。iam 账号侧原有的 13 列投影已删除，`IamRepoTrait::get_shelf_by_id` 改为委托 `ShelfRepo::get_by_id`（两条 SQL 谓词逐字相同：都只过滤 `deleted_at`、不过滤 `is_active`）。
 
+### `src/modules/files/*` 子模块清单（files 域 = 文件资源容器域，2026-10-13 新建）
+
+| 子模块 | 端点数 | URL 前缀 | 表 | 说明 |
+|---|---:|---|---|---|
+| （容器自带） | 1 | `/api/v2/files/sts-tmp-keys` | 无（薄壳鉴权转发到 python） | 2026-09-28 新增，逐字未动 |
+| `files::part_file` | 7 | `/api/v2/files/objects` | `t_part_file`（自有） | `POST /objects`（**上传四合一**）/ `GET /objects`（列表）/ `POST /objects/confirm`（STS 直传回执）/ `GET /objects/{id}/url` / `GET /objects/{id}/content` / `POST /objects/{id}/delete` / `GET /objects/{id}/preview`（**2026-10-13 PR2**：COS CI 预览，惰性轮询零后台任务） |
+| `files::part_file::cnc` | 1 | `/api/v2/files/cnc` | 复用 `t_part_file`（无 repo 层） | `POST /cnc/pairs`：G_CODE + 工艺卡配对写入 |
+
+> 端点求和 = 1 + 7 + 1 = **9**，与 `src/modules/files/mod.rs` 模块 doc 的端点表恒等。计数口径同 iam 表。
+>
+> ★ **权威路由清单是三张 `ROUTES` 常量**（2026-10-13 review 第 2 轮 N-3 / N-10 补齐）：`files::handler::ROUTES`（1 条 `sts-tmp-keys`）/ `part_file::handler::ROUTES`（7）/ `part_file::cnc::handler::ROUTES`（1）。三者由**同一个**比对器 `src/modules/files/route_guard.rs::routes_in_router_source` 逐条核对各自的 `router()` 源码（单测 `routes_declared_in_router`）—— 加 / 删端点忘同步 `ROUTES` 会当场红。⚠️ 各 `.nest(...)` 的路由清单归**子模块**自己的 `ROUTES`，不在父级重复计数。
+>
+> **2026-10-13 PR2 新增 `files::part_file::preview`**（`GET /objects/{id}/preview`，1 条）：COS CI 逐页光栅化预览。三条必须知道的事实：
+> ① **惰性轮询、零后台任务、零新增 cron** —— 状态推进完全由前端下一次调用驱动（`PENDING & 到期 → describe`），代价是「没人调就没人推进」；
+> ② **内容寻址 + 独立表** —— `t_file_preview` 按 `preview_seed`（内容哈希）去重而非按 `t_part_file` 行去重，因为 CI **按页计费**，同一份 PDF 的 N 份拷贝只该跑 1 次 job。⚠️ **并发不重复提交是「两道闸」不是一道**（2026-10-13 review 第 1 轮 MAJOR-1 订正）：`uk_t_file_preview_seed` 唯一索引只闸**首次登记**；「行已存在 + 无真 job id」的**重试**与**自愈**两条路径靠 `PreviewRepo::claim_submit` 的**条件 UPDATE 认领**（占位 token `__claiming__:<snowflake>` + 30s 租约），只有 `rows == 1` 的调用才允许 POST `/doc_jobs`。⚠️ 「先查再插 / 先查再打」在这两条路径上是 TOCTOU，会重复计费；
+> ③ ⚠️ **安全取舍反转**：本端点**放开 `SHELF_ACCOUNT`** 且返回**永久 public-read 直链**，比 `/url` 的 1 小时预签窗口**更宽** —— 这是用户拍板的选项 A，取舍全文 / 风险补偿见 `src/modules/files/part_file/preview/mod.rs` 的「安全取舍反转」一节。**不要**「顺手把 `/preview` 与 `/url` 的角色集合对齐」。
+>
+> ⚠️ **`POST /objects/{id}/delete` 不回收预览**（2026-10-13 review 第 1 轮 m-7 登记）：该端点只软删 `t_part_file` + 异步删 COS **源对象**，`previews/<seed>/` 下的 JPG 与 `t_file_preview` 行**都不动** ⇒ 图纸「删除」后完整视觉副本仍 public-read 永久可读，且该表只增不减、无 TTL / GC / 级联。
+>
+> ⚠️ **两套时钟的纪律**（2026-10-13 review 第 2 轮 N-7 登记）：`next_poll_at` **进谓词**（`claim_submit` 的租约判据）⇒ **必须 bind** `infra::clock::now_naive()`，**不得**写 SQL `now()`（DB 会话时区与应用时钟是两个时钟，容器里可能 UTC，差 8h ⇒ 过期认领永远接管不了）；`updated_at` 是**纯审计**列、不进任何谓词 ⇒ 沿用全仓既有的 `now()`，**不要**「顺手统一」。同款纪律见 `CLAUDE.md`「状态派生契约」与 mail_digest 一节的 `CURRENT_DATE` 提醒。
+>
+> ⚠️ **`preview_seed char(64)` 有空白填充陷阱**：PG 的 `bpchar` 会把 32 位种子右侧填空格到 64，读出来带 32 个尾随空格。`WHERE preview_seed = $1` 不受影响（bpchar 比较忽略尾随空格），但**拼进 URL 就是 404**。故 `PreviewRepo::find_by_seed` 是本表唯一的读出口并在此统一 `trim_end()` —— 新增读路径必须走它，不要自己写 SQL 读该列。
+>
+> **2026-10-13 两批硬切**（均**无 alias**、旧前缀一律 404）：
+> - PR1a：`part_file` / `cnc_program` 两个独立域收编成 `files` 容器域及其嵌套子模块。URL `/api/v2/part-files/*` → `/api/v2/files/objects/*`、`/api/v2/cnc-programs/*` → `/api/v2/files/cnc/*`；同批删除 12 条零调用方端点（part_file 8 = 7 条零件维度嵌套 + 同批删除的 `POST /part-files/` 上传〔PR1b 又复活并入四合一〕；cnc 4 = 3 条 alias + 1 条配对列表）与两张死表（`t_cnc_program` / `t_drawing_file`）。⚠️ 计数别与 `files/part_file/handler.rs` 移除记录表的 **7** 条混：那张表只列嵌套的 7 条，不含已复活的 `POST /part-files/`（review 第 1 轮 NIT-9）。
+> - PR1b：part / assembly 侧的文件端点收编 —— **6 条旧端点**（`POST /parts/{id}/upload-drawing`、`POST /parts/{id}/upload-3d-model`、`POST /assemblies/{id}/files`、`POST /part-files/`（PR1a 下线又复活）、`POST /parts/{id}/files/confirm`、`GET /assemblies/{id}/files`）**并成 2 条**（`POST /files/objects` 四合一 + `POST /files/objects/confirm`），其中 `GET /assemblies/{id}/files` 是**直接删除**。⇒ files 域是**全仓唯一**持有 `t_part_file` 写入路径的域。（2026-10-13 review 第 1 轮 NIT-11 订正：原文写「5 条旧端点」，漏数了复活那条；且把「端点」与「路径」混用。）
+>   ★ **part 侧的响应形状与状态码也变了**（MINOR-5 登记，此前三处 doc 都查不到）：HTTP **200 → 201**；出参 `R<TPartFile>` → `R<PartFileOut>`；owner 键 `part_id` → `owner_id`（新增 `owner_kind` 回显）；丢 `updated_at` / `updated_by` / `deleted_at`。逐字段对照见 `src/modules/files/part_file/mod.rs` 的「零件侧上传的响应形状与状态码变更」一节。
+>
+> ⚠️ **COS 对象 key 前缀：代码侧统一 `obj/`，容器部署下仍未统一（2026-10-13）**：`COS_UPLOAD_PREFIX` 此前有两套实际取值（生产 `.env` 的 `drawings/` 与 `upload_file_for_owner` 硬编码空串 ⇒ 桶根），代码侧现已收敛为 `obj/`（`config.rs` 缺省值 / `.env.example` / 代码回退三处同步）。**但 `docker-compose{,-local,-staging}.yml` 的 `${COS_UPLOAD_PREFIX:-drawings/}` 共 6 处仍在根仓**（backend-rust 仓外，本 PR 结构上无法触及）⇒ **容器部署下前缀仍落 `drawings/`**，代码回退值 `obj/` 只在不经 compose 的 `cargo run` 场景生效；根仓那 6 处待单独提交。**不要**在本文件或代码注释里写成「前缀已统一」（2026-10-13 review 第 1 轮 MAJOR-2）。**不需要数据迁移、不要跑 `src/bin/cos_key_migrate.rs`**：`t_part_file.object_key` 存完整 key，读端点 `PartFileService::resolve_effective_key` 先 `head_object(db_object_key)` 优先命中，历史对象原地不动，只有新上传改落配置里的那个前缀。
+>
+> ⚠️ **files 域的两条写路径别再弄丢**（review 第 1 轮 MAJOR-1 回归）：`POST /files/objects` 与 `POST /files/objects/confirm` 都从配置读 `COS_MAX_FILE_SIZE`（`.env.example` = 100MB），0 字节 → 40001、超限 → 21103；两条路径**同时**校验 `owner_kind` × `kind` 配对（`PART` 只收 DRAWING / 3D_MODEL，`ASSEMBLY` 只收 ASSEMBLY_MASTER，否则 20104）。已知例外：`POST /parts/batch` 的 bindings 分支仍写死 300MB（part 域、本 PR 未触碰，登记在 `files/part_file/mod.rs` 的「已知偏差登记」第 5 条）。
+>
+> ⚠️ **刻意留在别的域的两处文件写入**：`POST /api/v2/parts/batch` 的 **bindings 分支**（端点本体是「批量建零件」，文件只是可选入参）；`POST /api/v2/parts/batch-with-pdfs` / `POST /api/v2/assemblies` 的 **multipart PDF**（只喂 `lopdf` 数页数，不入库不上 COS）。
+>
+> ⚠️ `files` 域**不在** `docs/api/` 的整域覆盖清单里（该目录只覆盖部分域，判据见本文件「`docs/api/` 目录约定」一节），契约真源是各级模块 doc；「已知偏差登记」节落在 `src/modules/files/part_file/mod.rs` 的模块 doc 末尾。
+
 ### `src/modules/dashboard/` 域（只读大屏聚合，2026-10-07 VO 重构后 3 个端点）
 
 | 端点 | 权限 | 说明 |
@@ -541,7 +577,7 @@ t_assembly.status               ← 派生缓存
    }
    ```
 
-   - **仓内多数域用转发式**（`outsource` / `cnc_program` / `part_file` / `assembly` / `statistics` / `delivery_note` / `iam`），少数用 `mod.rs` 内联（`part` / `prod::queue` / `admin`）。转发式是多数形态，新域与重构域一律按转发式。（2026-10-10 订正：原清单里的 `shelf` 已不是一级域 —— 货架子模块于同日迁入 iam，仍是转发式。）
+   - **仓内多数域用转发式**（`outsource` / `files` / `assembly` / `statistics` / `iam`），少数用 `mod.rs` 内联（`part` / `com` / `prod::queue` / `admin`）。转发式是多数形态，新域与重构域一律按转发式。（2026-10-10 订正：原清单里的 `shelf` 已不是一级域 —— 货架子模块于同日迁入 iam，仍是转发式。**2026-10-13 订正**：`part_file` / `cnc_program` 也已不是一级域 —— 两者于同日收编成 `files` 容器域及其嵌套子模块，URL 硬切到 `/files/objects/*` 与 `/files/cnc/*`，`files` 本身是转发式；⚠️ **同批再订正 `delivery_note`** —— 它自 **2026-10-08** 起是 `com::delivery_note`（原清单里写它时它还是一级域），容器 `com` 走 `mod.rs` 内联（`com/mod.rs::router()` 直接 `.nest(…)`），故已从转发式清单移到内联侧。）
    - **一个前缀一个 router 工厂**。多个独立顶层前缀时用多个 `xxx_router()`（`outsource` 有 4 个），而不是一个工厂返回合并 router —— 合并后 matchit 的注册顺序约束会跨前缀纠缠，排查困难。
    - **`handler.rs` > 600 行或工厂数 > 4 时拆 `handler/<子域>.rs`**，`handler.rs` 退化为聚合器。`prod/queue/handler/`、`prod/batch/handler/` 是范本。
    - **`mod.rs` 的模块 doc 逐条列出端点表与硬切记录**；域改名/URL 硬切必须写「旧路径 404，无 alias」。
@@ -579,27 +615,23 @@ t_assembly.status               ← 派生缓存
 
 ## 集成测试目录结构（2026-09-23 PR13 重构后）
 
-integration test binary 已重组为 **21 binary**（9 多文件 domain 子目录化 + 12 single-file 保留；**2026-10-10** 原 `shelf` binary 并入 `iam` binary，**2026-10-13** 新增 `mail_digest`）—— 数字以 `cargo metadata --no-deps` 列出的 test target 为准逐个复核过（2026-10-10；2026-10-13 只订正本轮 +1）：
-
-> ⚠️ **2026-10-13 实测出入（登记，本轮不擅自重排别人的账）**：`cargo metadata --no-deps`
-> 现在列出 **22** 个 test target —— 比本表的 21 多一个 `wx`（`tests/wx/`）。
-> `wx` binary 是随 `wx` 域（2026-09-28 建、2026-10-11 重构）落地的，**本表的
-> single-file 清单一直漏登记它**。本轮按任务只补 `mail_digest`（20 → 21），
-> `wx` 的补登记留给下一次改动本表的提交一并处理。
+integration test binary 已重组为 **21 binary**（11 多文件 domain 子目录化 + 10 single-file 保留；**2026-10-10** 原 `shelf` binary 并入 `iam` binary；**2026-10-13** 原 `cnc_program_api` 与 `files_sts_tmp_keys` 两个单文件 binary 并成新 `files` 目录域 binary，同日 master 侧新增 `mail_digest`）—— 数字以 `cargo metadata --no-deps` 列出的 test target 为准逐个复核过（**2026-10-13**）：
 
 | 新结构 | 拆前 binary 数 | 拆后 binary 名（nextest filter） |
 |---|---:|---|
 | `tests/com/{main,union_list,delivery_note_in_use}.rs` | 5 | `com`（送货单域 2026-10-08 平移进 com 容器时目录随之更名 `delivery` → `com`；`group` / `attach_batches` / `scan` 三个 sub-file 已随端点收敛删除）|
-| `tests/part/{main,create_serial_price,batch,crud,file,inspection_batches,lifecycle,list_enrichment,pickable_by_work_type,purchase_order_import,repair,rollup_recompute,serial,to_inspection,to_process,to_ship}.rs` | 12 | `part`（sub-file 穷举，`main.rs` 为 binary 入口。★ `purchase_order_import.rs` 2026-10-06 新增：采购订单 Excel 导入两端点 —— `match-by-excel-items` 分档匹配 + `batch-update-order-info` 三态回填 / skip）|
-| `tests/assembly/{main,api,files,files_list,by_part,children,create_serial_price,force_complete,status_sync}.rs` | 3 | `assembly`（**2026-10-11** 新增 `force_complete.rs`：装配件级强制完成端点 `POST /prod/assemblies/{id}/force-complete`，含「子件非取消批次为 0 条」的边角回归）|
+| `tests/part/{main,create_serial_price,batch,crud,inspection_batches,lifecycle,list_enrichment,purchase_order_import,repair,rollup_recompute,serial,to_inspection,to_process,to_ship}.rs` | 12 | `part`（sub-file 穷举，**14 个文件**，2026-10-13 逐 `ls` 核对；`main.rs` 为 binary 入口。★ `purchase_order_import.rs` 2026-10-06 新增：采购订单 Excel 导入两端点 —— `match-by-excel-items` 分档匹配 + `batch-update-order-info` 三态回填 / skip。⚠️ **两个 sub-file 已迁出、枚举里不再有**：`file.rs` → `tests/files/part_file.rs`（**2026-10-13**，随 part_file 域收编进 files 域，与 `tests/part/main.rs` 的拆分映射同批记）；`pickable_by_work_type.rs` → `tests/production/scan_listing.rs`（**2026-10-10**，报工台两条 list 端点迁往 `prod::scan` 时带走））|
+| `tests/assembly/{main,api,lifecycle,by_part,children,create_serial_price,force_complete,status_sync}.rs` | 3 | `assembly`（**2026-10-11** 新增 `force_complete.rs`：装配件级强制完成端点 `POST /prod/assemblies/{id}/force-complete`，含「子件非取消批次为 0 条」的边角回归；⚠️ **2026-10-13 PR1b 两个 sub-file 已不在枚举里**：`files.rs` → **更名 `lifecycle.rs`**（其中 2 条文件上传用例迁往 `tests/files/upload.rs`，剩下 4 条生命周期用例留在本 binary —— 是更名不是搬家）；`files_list.rs`（D-09 `GET /assemblies/{id}/files` 的 4 条用例）→ **整文件删除**，端点已下线）|
 | `tests/iam/{main,api,middleware,bootstrap_admin_seed,menu_seed,wx_bind,shelf,shelf_deactivate}.rs` | 2 | `iam`（**2026-10-09**：原 `redis-flush` 串行组已整体删除 —— Redis 隔离改由 key 前缀承担、触发该组的 `clean_redis`（FLUSHDB）已零调用方随函数删除、两个 binary 的并行度已恢复；删除理由留档在 `.config/nextest.toml` 的注释里。**2026-10-10**：`tests/shelf/` 整体并入本 binary，用例改名 `shelf.rs`（← `api.rs`，`api.rs` 同名冲突）/ `shelf_deactivate.rs`（← `deactivate.rs`），与货架子模块迁入 iam 域同批）|
 | `tests/statistics/{main,api,event_driven}.rs` | 2 | `statistics` |
+| `tests/production/{main,work_type,process,process_chain,worker,queue,queue_auto_allocate,queue_dispatch,queue_board,pending_programming,shelf_process,pickup,process_design,inspection,scan_badge,scan_listing,scan_worker_scan}.rs` | 6 | `production`（按 `src/modules/prod/*` 对齐；`shelf_process.rs` 2026-10-02 自当时的 `tests/shelf/api.rs` 迁入；**`process_design.rs` 2026-10-05 新增**，★ 核心回归是「装配件子件可见」；**`inspection.rs` 2026-10-05 新增** 13 场景，★ 核心回归是「扫子件 → 返回整棵装配件树」；**2026-10-08** `worker_pool.rs` → `queue.rs`、`worker_pool_auto_allocate.rs` → `queue_auto_allocate.rs`、`batch.rs` → `queue_dispatch.rs`，并新增 `queue_board.rs`（队列板聚合 9 场景）；**2026-10-10** 新增报工台三 sub-file：`scan_badge.rs`（`verify-badge`，★ 核心回归是出参恰好 4 个 key）/ `scan_listing.rs`（取件 / 持有两页列表）/ `scan_worker_scan.rs`（放回顺链推进 + 触发 refill 联动））|
 | `tests/mail_digest/{main,config,preview,send,logs}.rs` | — | `mail_digest`（**2026-10-13 新建**，与新域同批；4 个 sub-file 按端点切分：`config.rs` 读/写配置与校验矩阵、`preview.rs` 渲染与统计口径、`send.rs` 三条失败路径 + 「失败也落流水」、`logs.rs` 分页与快照语义。★ 核心回归是「装配件只出一行」「`COMPLETED` 也算已交」「CR/LF 收件人被拒」「XSS 转义」；⚠️ 本 binary 走 HTTP 登录，**需要 Redis**（同全仓其它 HTTP 契约测试））|
-| `tests/production/{main,work_type,process,process_chain,worker,queue,queue_auto_allocate,queue_dispatch,queue_board,pending_programming,shelf_process,pickup,process_design,inspection}.rs` | 6 | `production`（按 `src/modules/prod/*` 对齐；`shelf_process.rs` 2026-10-02 自当时的 `tests/shelf/api.rs` 迁入；**`process_design.rs` 2026-10-05 新增**，★ 核心回归是「装配件子件可见」；**`inspection.rs` 2026-10-05 新增** 13 场景，★ 核心回归是「扫子件 → 返回整棵装配件树」；**2026-10-08** `worker_pool.rs` → `queue.rs`、`worker_pool_auto_allocate.rs` → `queue_auto_allocate.rs`、`batch.rs` → `queue_dispatch.rs`，并新增 `queue_board.rs`（队列板聚合 9 场景））|
 | `tests/outsource/{main,company,quote,quotable,send_receive,shipment,pool}.rs` | 3 | `outsource` |
 | `tests/user_repo/{main,basic,role,password}.rs` | 1 → 3 sub-file | `user_repo` |
-| 单文件保留：_e2e_api / applicant_api / auto_complete_api / cnc_program_api / cos_opendal_api / cos_real_smoke / customer_api / dashboard_ws_api / files_sts_tmp_keys / idempotency_api / print_forward / wecom_login | 12 | （各自原 binary 名）|
-| **合计** | — | **21 binary**（9 子目录 + 12 单文件；**2026-10-13** 新增 `tests/mail_digest/` 后由 20 → 21；⚠️ `cargo metadata --no-deps` 实测是 22，多出的 `wx` binary 是本表一直漏登记的，见本节开头的出入登记）|
+| `tests/files/{main,part_file,upload,cnc,sts}.rs` | 2 → 1 binary | `files`（**2026-10-13 新建**：由 2 个原单文件 binary `tests/cnc_program_api.rs`（→ `cnc.rs`）/ `tests/files_sts_tmp_keys.rs`（→ `sts.rs`）合并而来；⚠️ 另有 2 个 sub-file 自别的 binary 迁入 —— `tests/part/file.rs` → `part_file.rs`（它从来不是独立 binary，在 `part` 里只是 sub-file）与 `tests/assembly/files.rs` 的 2 条文件上传用例 → `upload.rs`（**2026-10-13 PR1b**：端点 `POST /assemblies/{id}/files` 下线后改测 `PartFileService::upload_file_for_owner(owner_kind=ASSEMBLY)`），两者均不计入本列的 binary 数；★ 核心回归是 `part_file.rs` 的硬切 404 守卫 —— PR1a 3 条（`old_part_files_prefix_returns_404` 等，含旧前缀整段 / 数字段 / 旧 CNC 前缀）+ **PR1b 4 条**（`old_part_upload_drawing_returns_404` / `old_part_upload_3d_model_returns_404` / `old_part_files_confirm_returns_404` / `old_assembly_files_returns_404`），共 7 条）|
+| `tests/wx/{main,part_list,production}.rs` | 1 → 1 binary | `wx`（**2026-10-13 补记**：2026-10-11「BFF 按页面切子模块」时建的 binary，此前本表漏登记；本次一并补上并按 `cargo metadata --no-deps` 复核计数）|
+| 单文件保留：_e2e_api / applicant_api / auto_complete_api / cos_opendal_api / cos_real_smoke / customer_api / dashboard_ws_api / idempotency_api / print_forward / wecom_login | 10 | （各自原 binary 名；⚠️ 原清单里的 `cnc_program_api` / `files_sts_tmp_keys` 已于 2026-10-13 并入上表 `files` binary）|
+| **合计** | — | **21 binary**（11 子目录 + 10 单文件；逐目录 `ls` + `cargo metadata --no-deps` 实测，2026-10-13 复核；⚠️ `tests/com/delivery_note/` 只有 `mod.rs` 没有 `main.rs`，按本仓「cargo 不识别 `tests/<dir>/mod.rs`」的约定不构成 binary，不计入子目录数）|
 
 **关键约定**：
 - cargo 1.98.1 **不识别** `tests/<dir>/mod.rs`，只识别 `tests/<dir>/main.rs`（binary 名 = `<dir>`）。新 domain 一律用 `main.rs`。

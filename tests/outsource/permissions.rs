@@ -28,8 +28,8 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 
 use hsh_erp_test_support::{
-    OutsourceFixture, PartFixture, json_request, load_outsource_fixture, login_token, pool_snowflake,
-    send, test_app, test_pool, test_state,
+    OutsourceFixture, PartFixture, json_request, load_outsource_fixture, login_token,
+    pool_snowflake, send, test_app, test_pool, test_state,
 };
 
 /// fresh DB + outsource fixture + app（不登录）。
@@ -92,8 +92,12 @@ async fn company_read_tightened_for_cnc() {
     let (pool, app, _fx) = bootstrap().await;
     insert_cnc_user(&pool, "fx_os_cnc1").await;
     let cnc = login_token(&app, "fx_os_cnc1", "changeme").await;
-    let inspector = login_token(&app, PartFixture::INSPECTOR_USERNAME, OutsourceFixture::PASSWORD)
-        .await;
+    let inspector = login_token(
+        &app,
+        PartFixture::INSPECTOR_USERNAME,
+        OutsourceFixture::PASSWORD,
+    )
+    .await;
 
     let (s, env) = get(&app, "/outsource-companies", &cnc).await;
     assert_forbidden(s, &env, "CNC 公司列表");
@@ -116,8 +120,12 @@ async fn quote_read_forbidden_for_shelf_account() {
         OutsourceFixture::PASSWORD,
     )
     .await;
-    let inspector = login_token(&app, PartFixture::INSPECTOR_USERNAME, OutsourceFixture::PASSWORD)
-        .await;
+    let inspector = login_token(
+        &app,
+        PartFixture::INSPECTOR_USERNAME,
+        OutsourceFixture::PASSWORD,
+    )
+    .await;
 
     let (s, env) = get(&app, "/outsource-quotes", &sa).await;
     assert_forbidden(s, &env, "SA 报价列表");
@@ -137,14 +145,13 @@ async fn quote_read_forbidden_for_shelf_account() {
 #[tokio::test]
 async fn quote_edit_forbidden_for_inspector() {
     let (_pool, app, fx) = bootstrap().await;
-    let inspector = login_token(&app, PartFixture::INSPECTOR_USERNAME, OutsourceFixture::PASSWORD)
-        .await;
-    let clerk = login_token(
+    let inspector = login_token(
         &app,
-        &fx.clerk_username,
+        PartFixture::INSPECTOR_USERNAME,
         OutsourceFixture::PASSWORD,
     )
     .await;
+    let clerk = login_token(&app, &fx.clerk_username, OutsourceFixture::PASSWORD).await;
 
     let (s, env) = get(&app, "/outsource-quotes/quotable-parts", &inspector).await;
     assert_forbidden(s, &env, "Inspector 可报价零件");

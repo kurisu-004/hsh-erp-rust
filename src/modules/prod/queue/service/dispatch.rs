@@ -725,10 +725,9 @@ mod tests {
     /// dispatch 的守卫用例仍能命中 40300（它本就不在 `queue.dispatch` 矩阵里）。
     fn make_current(user_id: i64, role: Role) -> CurrentUser {
         let permissions = match role {
-            Role::Manager | Role::Clerk => vec![
-                "queue.dispatch".to_string(),
-                "queue.view".to_string(),
-            ],
+            Role::Manager | Role::Clerk => {
+                vec!["queue.dispatch".to_string(), "queue.view".to_string()]
+            }
             Role::Inspector => vec!["queue.view".to_string()],
             _ => Vec::new(),
         };

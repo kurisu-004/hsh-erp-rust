@@ -6,9 +6,12 @@
 //!
 //! ## 范围（本文件）
 //! - `create_part` / `list_parts` / `get_part` / `get_part_by_serial` /
-//!   `get_part_batches_by_serial` / `update_part` / `soft_delete_part` /
-//!   `upload_part_file` / `upload_drawing` / `upload_3d_model`
+//!   `get_part_batches_by_serial` / `update_part` / `soft_delete_part`
 //! - `batch_create_parts` —— 薄包装，转 `service/batch.rs::batch_create_parts_legacy`
+//!
+//! 2026-10-13 PR1b：`upload_part_file` / `upload_drawing` / `upload_3d_model`
+//! **自本文件删除**（三条端点并入 `POST /api/v2/files/objects`）。⇒ 本文件自此
+//! **零** `t_part_file` 写入，也不再 import `part_file` 的 model / policy / repo。
 //!
 //! ## helpers（pub(super)，供 batch.rs 复用）
 //! - `map_create_error` —— sqlx 错误码 → 业务错误码
@@ -24,7 +27,6 @@
 //! `CustomerRepo` / `ProcessChainRepo` / `PartBatchRepo` 等同时持有）。
 
 use sqlx::PgConnection;
-use std::sync::Arc;
 
 use chrono::NaiveDate;
 
@@ -37,9 +39,6 @@ use crate::modules::part::repo::{NewPartCreate, PartListFilters, PartUpdate};
 use crate::modules::part::vo::{
     PartBatchScanOut, PartDetailOut, PartListItem, PartListOut, PartScanContextOut, PartScanInfoOut,
 };
-use crate::modules::part_file::model::TPartFile;
-use crate::modules::part_file::policy; // 2026-09-11 新增：kind → 扩展名 / content_type 白名单
-use crate::modules::part_file::repo::{NewPartFile, PartFileRepo, hash_bytes};
 use crate::modules::prod::batch::repo::{NewInitialBatch, PartBatchRepo};
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
 use crate::shared::customer::expand_customer_id;
@@ -47,7 +46,6 @@ use crate::shared::error::{AppError, code};
 // 2026-10-12：`t_part_event` 的写侧自 part 域的事件 INSERT 上提到
 // `shared::part_event`（该表由 7 个模块写、无域归属）。
 use crate::shared::part_event::{NewPartEvent, insert};
-use crate::state::AppState;
 
 use super::PartService;
 use super::list_enrichment::{
@@ -653,179 +651,6 @@ impl PartService {
                 }
             }
         }
-    }
-
-    /// 通用 part 文件上传（2026-09-11 重构）：
-    /// DRAWING / 3D_MODEL 等 kind 共用同一段上传 + 落库逻辑。
-    /// 调用方（`upload_drawing` / `upload_3d_model`）只负责决定 kind 和 file_type。
-    #[allow(clippy::too_many_arguments)]
-    pub async fn upload_part_file<R: PartRepoTrait>(
-        mut repo: R,
-        snowflake: &SnowflakeIdGenerator,
-        state: &Arc<AppState>,
-        part_id: i64,
-        bytes: &[u8],
-        original_filename: &str,
-        content_type: &str,
-        kind: &str,
-        file_type: &str,
-        current: &CurrentUser,
-    ) -> Result<TPartFile, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk])?;
-        if bytes.is_empty() {
-            // 空字节不是「过大」而是「无效输入」：用 VALIDATION_ERROR (40001)
-            // 而不是 BIZ_PART_FILE_TOO_LARGE (21103)
-            return Err(AppError::validation(format!("{file_type} 字节为空")));
-        }
-        // 2026-09-11 修改：改用 CosConfig.max_file_size 配置（默认 300MB），
-        // 不再写死 50MB。`.env` 改 COS_MAX_FILE_SIZE 即生效。
-        let max = state.config.cos.max_file_size;
-        if bytes.len() > max {
-            return Err(AppError::biz(
-                code::BIZ_PART_FILE_TOO_LARGE,
-                format!("{file_type} > {max} bytes（{}MB）", max / 1024 / 1024),
-            ));
-        }
-        // 2026-09-11 新增：kind → 扩展名 / content_type 白名单校验
-        let ext = policy::ext_of(original_filename)
-            .ok_or_else(|| AppError::biz(code::BIZ_PART_FILE_BAD_TYPE, "缺少扩展名"))?;
-        let allowed = policy::allowed_exts(kind);
-        if !allowed.contains(&ext.as_str()) {
-            return Err(AppError::biz(
-                code::BIZ_PART_FILE_BAD_TYPE,
-                format!("扩展名 {ext} 不在 kind={kind} 白名单（{allowed:?}）"),
-            ));
-        }
-        let ct_ok = policy::expected_content_types_for_ext(&ext);
-        if !ct_ok.contains(&content_type) {
-            return Err(AppError::biz(
-                code::BIZ_PART_FILE_BAD_TYPE,
-                format!("content_type {content_type} 与扩展名 {ext} 不一致"),
-            ));
-        }
-        // 上传前 part 必须存在
-        if repo.get_part_detail(part_id).await?.is_none() {
-            return Err(AppError::biz(
-                code::BIZ_PART_FILE_OWNER_NOT_FOUND,
-                format!("part {part_id} 不存在"),
-            ));
-        }
-
-        let sha = hash_bytes(bytes);
-        let new_file_id = snowflake.next_id();
-        // 2026-09-29 扁平化：CAS key 模板五段→两段
-        // `{prefix}{sha16}_{safe_filename}`，owner/kind 信息已在 t_part_file
-        // DB 行外键索引。prefix 仍走 cfg.upload_prefix 兼容 .env 旧值。
-        let real_key = crate::util::cos_key::build_cas_key(
-            &state.config.cos.upload_prefix,
-            &sha,
-            original_filename,
-        );
-        state
-            .cos
-            .put_object(&real_key, bytes.to_vec(), content_type)
-            .await
-            .map_err(|e| {
-                AppError::biz(
-                    code::BIZ_PART_FILE_UPLOAD_FAILED,
-                    format!("COS 上传失败: {e}"),
-                )
-            })?;
-        PartFileRepo::create_part_file(
-            repo.conn_mut(),
-            NewPartFile {
-                id: new_file_id,
-                part_id,
-                owner_kind: "PART",
-                kind,
-                file_type,
-                object_key: &real_key,
-                original_filename,
-                file_size: bytes.len() as i64,
-                content_type,
-                upload_status: "READY",
-                content_sha256: Some(&sha),
-                created_by: current.id,
-            },
-        )
-        .await
-        .map_err(|e| {
-            if let sqlx::Error::Database(db) = &e
-                && db.code().as_deref() == Some("23505")
-            {
-                return AppError::biz(code::BIZ_PART_FILE_DUPLICATE, "相同文件已存在");
-            }
-            AppError::from(e)
-        })?;
-        let pf = PartFileRepo::get_by_part_kind(repo.conn_mut(), part_id, kind)
-            .await?
-            .ok_or_else(|| AppError::internal("刚 INSERT 的 file 查不到"))?;
-        Ok(pf)
-    }
-
-    /// 上传 part 图纸 PDF（multipart 处理上传到 COS + INSERT t_part_file）。
-    /// 2026-09-11 修改：改为对 `upload_part_file` 的薄包装。
-    #[allow(clippy::too_many_arguments)]
-    pub async fn upload_drawing<R: PartRepoTrait>(
-        repo: R,
-        snowflake: &SnowflakeIdGenerator,
-        state: &Arc<AppState>,
-        part_id: i64,
-        bytes: &[u8],
-        original_filename: &str,
-        content_type: &str,
-        current: &CurrentUser,
-    ) -> Result<TPartFile, AppError> {
-        Self::upload_part_file(
-            repo,
-            snowflake,
-            state,
-            part_id,
-            bytes,
-            original_filename,
-            content_type,
-            "DRAWING",
-            "PDF",
-            current,
-        )
-        .await
-    }
-
-    /// 上传 part 3D 模型（STEP / STP / IGES / IGS / STL / OBJ / 3MF）。
-    /// 2026-09-11 新增：与 Python `POST /api/v1/parts/{id}/3d-models` 对齐。
-    /// file_type 由扩展名推导（`policy::file_type_for_ext`）。
-    #[allow(clippy::too_many_arguments)]
-    pub async fn upload_3d_model<R: PartRepoTrait>(
-        repo: R,
-        snowflake: &SnowflakeIdGenerator,
-        state: &Arc<AppState>,
-        part_id: i64,
-        bytes: &[u8],
-        original_filename: &str,
-        content_type: &str,
-        current: &CurrentUser,
-    ) -> Result<TPartFile, AppError> {
-        let ext = policy::ext_of(original_filename)
-            .ok_or_else(|| AppError::biz(code::BIZ_PART_FILE_BAD_TYPE, "缺少扩展名"))?;
-        let file_type = policy::file_type_for_ext(&ext).ok_or_else(|| {
-            AppError::biz(
-                code::BIZ_PART_FILE_BAD_TYPE,
-                format!("未知 3D 模型扩展名: {ext}"),
-            )
-        })?;
-        Self::upload_part_file(
-            repo,
-            snowflake,
-            state,
-            part_id,
-            bytes,
-            original_filename,
-            content_type,
-            "3D_MODEL",
-            file_type,
-            current,
-        )
-        .await
     }
 }
 

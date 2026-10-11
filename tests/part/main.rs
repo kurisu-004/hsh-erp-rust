@@ -6,6 +6,7 @@
 //! - lifecycle.rs          ← 原 part_lifecycle_api.rs
 //! - batch.rs              ← 原 part_batch_api.rs
 //! - file.rs               ← 原 part_file_api.rs
+//!   （**2026-10-13 已迁出** → `tests/files/part_file.rs`，随 part_file 域收编进 files 域）
 //! - list_enrichment.rs    ← 原 part_list_enrichment_api.rs
 //! - repair.rs             ← 原 part_repair_api.rs
 //! - to_ship.rs            ← 原 part_api_to_ship.rs
@@ -34,7 +35,6 @@
 mod batch;
 mod create_serial_price;
 mod crud;
-mod file;
 mod inspection_batches;
 mod lifecycle;
 mod list_enrichment;

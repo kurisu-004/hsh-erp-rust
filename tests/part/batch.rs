@@ -653,7 +653,7 @@ async fn batch_create_with_bindings_object_key_test() {
     // 直接查 DB 找 part_file 行：按 owner_id + kind 找出刚生成的 part_file
     let new_part_id = out.created[0].part.id;
     let mut tx = pool.begin().await.unwrap();
-    let rows = hsh_erp_rust::modules::part_file::repo::PartFileRepo::list_by_owner(
+    let rows = hsh_erp_rust::modules::files::part_file::repo::PartFileRepo::list_by_owner(
         &mut *tx,
         "PART",
         new_part_id,
@@ -691,7 +691,8 @@ async fn split_and_cancel_permission_matrix() {
     let insp = login_token(&app, &fx.inspector_username, PartFixture::PASSWORD).await;
     let clerk = login_token(&app, &fx.clerk_username, PartFixture::PASSWORD).await;
 
-    let (_pid, bid) = insert_part_with_batch(&pool, "P-RBAC", fx.customer_l2_id, "PENDING", 10).await;
+    let (_pid, bid) =
+        insert_part_with_batch(&pool, "P-RBAC", fx.customer_l2_id, "PENDING", 10).await;
     let version = batch_version(&pool, bid).await;
 
     // ---- Inspector：split / cancel 均 40300 ----

@@ -3442,8 +3442,7 @@ async fn move_allows_clerk_after_allocation_widening() {
     let prod_shelf = insert_shelf(&pool, "PROD-CLK2", "PROD-CLK2", "PRODUCTION").await;
     link_shelf_to_process(&pool, prod_shelf, proc).await;
     let worker = insert_worker(&pool, "BC-CLK2", "工CLK2", Some(wt)).await;
-    let (_p, pool_batch) =
-        insert_pool_part(&pool, customer, "P-CLK2", prod_shelf, proc, 1).await;
+    let (_p, pool_batch) = insert_pool_part(&pool, customer, "P-CLK2", prod_shelf, proc, 1).await;
 
     let (app, token) = login_clerk_with_username(&pool, "clerk_move").await;
     let (s, env) = send(

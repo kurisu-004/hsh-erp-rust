@@ -17,13 +17,15 @@ pub mod _e2e;
 // Manager 单角色）。域内不含任何新派生算法，只复用 part / assembly 域的 rollup 函数。
 pub mod admin;
 pub mod assembly;
-pub mod cnc_program;
 // 2026-09-19 新增 com 模块聚合：customer + applicant 平移至 `com::customer` / `com::applicant`，
 // URL 迁移到 `/api/v2/com/*`（见本文件 `v2_router` 与 `com/mod.rs`）。
 pub mod com;
 pub mod dashboard;
 // 2026-09-28 新增 files 域：薄壳鉴权转发端点（`POST /api/v2/files/sts-tmp-keys` → python `/api/v1/files/sts-tmp-keys`）。
 // 修复 python STS 端口裸开鉴权漏洞：rust 端强制 JWT + Role 鉴权后再转发。
+// 2026-10-13 升格为**文件资源容器域**：原独立 `part_file` 域与 `cnc_program` 域收编进来，
+// 顶层 `pub mod part_file;` / `pub mod cnc_program;` 两条声明随之删除，
+// 下方 `/part-files` 与 `/cnc-programs` 两个 nest 也一并删除（**旧路径 404，无 alias**）。
 pub mod files;
 // 2026-09-19 IAM 域合并（PR-1）：合并 `auth` + `user` 为单一 `iam` 业务域；
 // handler 内 17 端点（session 5 + users 12）+ 1 个 router 工厂函数 `router()`。
@@ -42,7 +44,8 @@ pub mod part;
 // 的 repo / model / shared::batch::status / 全部批次用例与批次路由（逐条见
 // `prod/batch/mod.rs` 的路由表）。
 // 这里不再 `pub mod part_batch;`，所有引用走 `crate::modules::prod::batch::*`。
-pub mod part_file;
+// 2026-10-13：原独立 `pub mod part_file;` 已删除 —— 该域收编进 files 域，
+// 源码现为 `crate::modules::files::part_file::*`，URL 为 `/api/v2/files/objects/*`。
 // 2026-09-19 新增 prod 模块聚合：worker + work_type + process + process_chain +
 // queue 平移至 `prod::*`，URL 硬切换到 `/api/v2/prod/*`（无 alias，前端锁步）。
 // part / assembly 是核心实体未移入；报工端点保留在 part 域。
@@ -117,13 +120,21 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // `/api/v2` 前缀）并存；前者给前端走「HTTP 首取 + WS 事件 invalidate」
         // 模式，后者保留供 WS-only 老客户端握手 + snapshot。
         .nest("/dashboard", dashboard::http_router())
-        // 2026-09-28 新增：files 域 BFF（薄壳鉴权转发 STS 端点到 python）。
+        // 2026-09-28 新增：files 域（当时是薄壳鉴权转发 STS 端点到 python）。
         // 端点：`POST /api/v2/files/sts-tmp-keys`（详见 `modules/files/mod.rs`）。
+        // 2026-10-13：files 域升格为文件资源容器域，**这一行是 files 域唯一的顶层挂载**，
+        // 域内两个嵌套子模块的路由由 `files::router()` 内部 nest 声明：
+        //   `/files/sts-tmp-keys`  → STS 凭证转发（本 nest 自身）
+        //   `/files/objects/*`      → `files::part_file`      （t_part_file 的对象语义）
+        //   `/files/cnc/*`          → `files::part_file::cnc` = CNC 配对
+        // 硬切无 alias：旧顶层前缀 `/api/v2/part-files/*`（12 条里 4 条改名 + 8 条删除）
+        // 与 `/api/v2/cnc-programs/*`（1 条改名 + 4 条删除）一律 404。
         .nest("/files", files::router())
         .nest("/parts", part::router())
         .nest("/assemblies", assembly::router())
-        .nest("/cnc-programs", cnc_program::router())
-        .nest("/part-files", part_file::router())
+        // 2026-10-13 删除：`.nest("/part-files", part_file::router())` 与
+        //   `.nest("/cnc-programs", cnc_program::router())`
+        //   —— 两域收编进 files 域，旧前缀 404 无 alias（端点清单见 modules/files/mod.rs）。
         // 2026-09-28 删除：/api/v2/upload-sessions nest（域整体下线）
         .nest("/outsource-companies", outsource::company_router())
         .nest("/outsource-quotes", outsource::quote_router())

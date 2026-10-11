@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE public.t_file_preview\n            SET state = 'PENDING', ci_job_id = NULL, page_count = 0,\n                error_message = NULL, next_poll_at = now(), updated_at = now(), updated_by = $2\n            WHERE id = $1 AND state = 'FAILED' AND deleted_at IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "24d3fdade48dbce7a638bfb1cca781de6846186f3941afd5fc5e0c016495caef"
+}

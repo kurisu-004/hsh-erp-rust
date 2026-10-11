@@ -745,9 +745,16 @@ async fn auto_allocate_allows_clerk_after_allocation_widening() {
         ),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "Clerk auto-allocate 应 200（放宽后）: {env}");
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "Clerk auto-allocate 应 200（放宽后）: {env}"
+    );
     let filled = env["data"]["filled"].as_array().expect("filled array");
     assert_eq!(filled.len(), 1);
     assert_eq!(filled[0]["worker_id"], worker.to_string());
-    assert_eq!(filled[0]["filled_count"], 2, "Clerk 应能补到 auto 上限: {env}");
+    assert_eq!(
+        filled[0]["filled_count"], 2,
+        "Clerk 应能补到 auto 上限: {env}"
+    );
 }

@@ -222,16 +222,31 @@ pub struct CosConfig {
     /// 整体作为 virtual-host 第一段。
     pub endpoint: String,
     pub scheme: String,
-    /// COS 桶内上传前缀（保留兼容 .env 旧值）。
+    /// COS 桶内上传前缀（env `COS_UPLOAD_PREFIX`，代码缺省 `obj/`）。
     ///
     /// 2026-09-29 扁平化：CAS key 模板已从五段简化为两段
-    /// `{prefix}{sha16}_{safe_filename}`，新模板的 prefix 仅在新 key 写入路径
-    /// (`util::cos_key::build_cas_key`) 使用一次。后续会切到 bin 迁移历史 DB
-    /// 行的 object_key 后彻底删除（迁移 bin 见 §cos_key_migrate.rs）。
+    /// `{prefix}{sha16}_{safe_filename}` —— prefix 只在新 key 的写入路径
+    /// (`util::cos_key::build_cas_key`) 与读端点的 legacy fallback
+    /// (`PartFileService::resolve_effective_key`) 各用一次。
     ///
-    /// 当前阶段：保留 `upload_prefix` 字段以兼容 .env / tests 的 `uploads` 或
-    /// `uploads/` 旧值不报错，标记 `dead_code` 允许编译器跳过 unused 警告。
-    #[allow(dead_code)]
+    /// 2026-10-13：字段**恢复为活字段**（去掉 `#[allow(dead_code)]`）。此前它是死字段
+    /// 的原因是 `upload_file_for_owner` 把 prefix 硬编码成 `""`（新对象落桶根），
+    /// 而 part 域那条上传路径在读配置 —— 两套并存导致同一张表的对象一半在 `drawings/`
+    /// 一半在桶根。本轮把那处硬编码改成读本字段，两个写入点就此统一。
+    ///
+    /// ⚠️ **改本字段不需要数据迁移**：`t_part_file.object_key` 存的是**完整 key**，
+    /// 读端点先 `head_object(db_object_key)` 优先命中 ⇒ 历史对象原地不动，
+    /// 只是新上传改落新前缀。别为此跑 `src/bin/cos_key_migrate.rs`（那是 2026-09-29
+    /// 五段→两段的迁移，与前缀无关）。
+    ///
+    /// ### ⚠️ 2026-10-13 review 第 1 轮 MAJOR-2：容器部署下前缀**仍未**统一
+    ///
+    /// 代码侧（`config.rs` 缺省 / `.env.example` / 代码回退三处）已是 `obj/`，但
+    /// **`docker-compose{,-local,-staging}.yml` 的 `${COS_UPLOAD_PREFIX:-drawings/}`
+    /// 共 6 处仍在根仓**（backend-rust 仓外，本 PR 结构上无法触及）⇒
+    /// **容器部署下前缀仍落 `drawings/`**，代码回退值 `obj/` 只在**不经 compose** 的
+    /// `cargo run` 场景生效。根仓那 6 处待单独提交改掉，本仓不要在文档里声称
+    /// 「前缀已统一」——那会让后人以为闭环已合上。
     pub upload_prefix: String,
     pub presign_expire_seconds: u32,
     pub max_file_size: usize,
@@ -240,6 +255,30 @@ pub struct CosConfig {
     ///
     /// 可通过 `COS_TMP_PREFIX` env 覆盖，缺省 `tmp/`。
     pub tmp_prefix: String,
+    /// COS 桶内 **CI 预览图** 前缀（env `COS_PREVIEW_PREFIX`，代码缺省 `previews`）。
+    ///
+    /// 2026-10-13 PR2 新增。只被 `files::part_file::preview` 的 URL 拼接读一次
+    /// （`PreviewService::preview_urls`），是**读端**配置 —— rust 侧不往这个前缀写
+    /// 任何东西，JPG 由 python 侧的 CI 任务产出。
+    ///
+    /// ⚠️ **该前缀必须是 public-read**，否则返回给前端的是「永久不过期的公开读
+    /// 直链」这个安全取舍就落不了地（取取舍的理由与补偿见
+    /// `src/modules/files/part_file/preview/mod.rs` 的模块 doc）。
+    ///
+    /// ⚠️ **绝不能在这里拼文件名**：路径成分只有 `<preview_prefix>/<preview_seed>/p{n}.jpg`，
+    /// 其中 `preview_seed` 是纯哈希。`t_part_file.object_key` 的 `{sha16}_{原文件名}`
+    /// 里那半截文件名（图号）**可枚举**，public-read 前缀下拼进去等于公开图号清单。
+    pub preview_prefix: String,
+    /// CI 预览图的对外站点根（env `COS_PREVIEW_BASE_URL`）。
+    ///
+    /// 2026-10-13 PR2 新增。**缺省回退到 COS 源站域名**
+    /// `"{scheme}://{bucket}.cos.{region}.myqcloud.com"`（照本结构体已有的
+    /// `scheme` / `bucket` / `region` 三字段拼），所以不配也能跑 —— 配它只是为了
+    /// 允许前面挂 CDN 或换加速域名。
+    ///
+    /// ⚠️ 回退值**不读** `endpoint` 字段：那个字段是 OpenDAL 的 S3 endpoint
+    /// （可能带私有化路径），与浏览器直链的站点根不是一回事。
+    pub preview_base_url: String,
 }
 
 /// 雪花 ID 配置（位布局对齐 myERP Python `snowflake-id` 包）：
@@ -677,22 +716,40 @@ impl AppConfig {
                 } else {
                     (String::new(), String::new())
                 };
+                // 2026-10-13 PR2：预览站点根的**代码回退值**。先算出来再进结构体
+                // 字面量，让 `preview_base_url` 永远是可直接拼 URL 的站点根
+                // （不含尾斜杠），下游 `PreviewService::preview_urls` 无需再判空。
+                let region = env_or("COS_REGION", "ap-shanghai");
+                let bucket = env_required("COS_BUCKET")?;
+                let scheme = env_or("COS_SCHEME", "https");
+                let preview_base_url = env_or_non_empty(
+                    "COS_PREVIEW_BASE_URL",
+                    // ⚠️ 刻意**不**用 `COS_ENDPOINT`：那是 OpenDAL 的 S3 endpoint
+                    // （可能带私有化路径），浏览器直链的站点根与之不是一回事。
+                    &format!("{scheme}://{bucket}.cos.{region}.myqcloud.com"),
+                );
                 CosConfig {
                     backend,
                     enabled: cos_enabled,
-                    region: env_or("COS_REGION", "ap-shanghai"),
-                    bucket: env_required("COS_BUCKET")?,
+                    region,
+                    bucket,
                     secret_id,
                     secret_key,
                     app_id: env_or("COS_APP_ID", ""),
                     endpoint: env_or("COS_ENDPOINT", ""),
-                    scheme: env_or("COS_SCHEME", "https"),
-                    upload_prefix: env_or("COS_UPLOAD_PREFIX", "uploads"),
+                    scheme,
+                    // 2026-10-13：缺省值与 `.env.example` / compose 的
+                    // `COS_UPLOAD_PREFIX` 同步为 `obj/`（此前是 `uploads`，与
+                    // `.env` 的 `drawings/` 又不同 —— 前缀三套并存正是本轮要收敛的）。
+                    upload_prefix: env_or("COS_UPLOAD_PREFIX", "obj/"),
                     presign_expire_seconds: env_parse("COS_PRESIGN_EXPIRE", 3600)?,
                     max_file_size: env_parse("COS_MAX_FILE_SIZE", 300 * 1024 * 1024)?,
                     // 2026-09-20 迁移：删 `sts_duration_seconds` 字段（spike 已记
-                    // 「未来清理」）；STS 链路与 COS 对象存储解耦。
+                    // 「将来清理」）；STS 链路与 COS 对象存储解耦。
                     tmp_prefix: env_or("COS_TMP_PREFIX", "tmp/"),
+                    // 2026-10-13 PR2：`files::part_file::preview` 的 URL 拼接两件套
+                    preview_prefix: env_or("COS_PREVIEW_PREFIX", "previews"),
+                    preview_base_url,
                 }
             },
 
@@ -873,6 +930,33 @@ pub fn build_redis_url() -> String {
 
 fn env_or(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// 2026-10-13 review 第 1 轮 MAJOR-2 新增：与 [`env_or`] 同款，但**空值也回落缺省**。
+///
+/// ## 为什么需要它（`env_or` 的坑）
+///
+/// `env::var` 对「变量**存在但为空**」返回 `Ok("")`，**不触发** `unwrap_or_else`
+/// 的缺省分支。而部署方把某行**留在文件里、只清空值**（`COS_PREVIEW_BASE_URL=`）
+/// 是极常见的做法 —— 那正是 `.env.example` 模板里「可选项留空 = 用缺省」这一惯例
+/// 诱导出来的。
+///
+/// 于是 `preview_base_url = ""` ⇒ `preview_urls` 产出
+/// `/previews/<seed>/p1.jpg` —— **协议相对 URL，指向前端自己的源站**，不是 COS。
+/// 生产表现是「预览全是裂图」且**日志里看不出任何异常**（一切都成功，只是 URL 指错
+/// 了地方）。任何照抄 `.env.example` 起服务的部署都会中招。
+///
+/// ## ⚠️ 返回值也要 `trim`（2026-10-13 review 第 2 轮 N-9）
+///
+/// 判空用 `trim()`、返回用原值是**不一致**的：`COS_PREVIEW_BASE_URL=https://cdn.example.com `
+///（行尾一个空格，`.env` 手改 / 从文档复制粘贴时极常见）会原样带进 URL ⇒
+/// 每个预览 URL 末尾多一个空格 ⇒ 前端 `<img src>` 加载失败。
+/// ⇒ **判空与返回用同一种口径**。
+fn env_or_non_empty(key: &str, default: &str) -> String {
+    match env::var(key) {
+        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => default.to_string(),
+    }
 }
 
 /// 2026-10-01 新增：解析 WS 存活检测的两个环境变量

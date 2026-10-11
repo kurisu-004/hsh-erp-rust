@@ -685,7 +685,10 @@ async fn process_chain_read_allows_shelf_account() {
     )
     .await;
     assert_eq!(s, StatusCode::NOT_FOUND, "SA 应放行（无链 ⇒ 404）: {env}");
-    assert_eq!(env["code"], 20701, "应为 BIZ_PROCESS_CHAIN_NOT_FOUND: {env}");
+    assert_eq!(
+        env["code"], 20701,
+        "应为 BIZ_PROCESS_CHAIN_NOT_FOUND: {env}"
+    );
 }
 
 /// 撤权负向：软删 CLERK 的 `production.view` 授权行 → 重登（新 session 装载新
@@ -702,11 +705,7 @@ async fn process_chain_read_forbidden_after_grant_revoked() {
 
     // 前提：CLERK 有 production.view（矩阵）⇒ 放行（无链 ⇒ 404 / 20701）。
     let clerk = login_token(&app, &fx.clerk_username, ProcessChainFixture::PASSWORD).await;
-    let (s, env) = send(
-        app.clone(),
-        json_request("GET", &uri, None, Some(&clerk)),
-    )
-    .await;
+    let (s, env) = send(app.clone(), json_request("GET", &uri, None, Some(&clerk))).await;
     assert_eq!(s, StatusCode::NOT_FOUND, "撤权前 CLERK 应放行: {env}");
     assert_eq!(env["code"], 20701);
 

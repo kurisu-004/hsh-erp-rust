@@ -58,6 +58,9 @@ fn make_cos_config(backend: CosBackend, enabled: bool) -> CosConfig {
         presign_expire_seconds: 3600,
         max_file_size: 300 * 1024 * 1024,
         tmp_prefix: "tmp/".to_string(),
+        // 2026-10-13 PR2：CI 预览图 URL 拼接两件套（本 binary 不打预览端点，取字面量即可）
+        preview_prefix: "previews".to_string(),
+        preview_base_url: "https://test-bucket.cos.ap-shanghai.myqcloud.com".to_string(),
         bucket: "test-bucket-1234567890".to_string(),
     }
 }

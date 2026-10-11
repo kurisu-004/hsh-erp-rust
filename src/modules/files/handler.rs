@@ -1,14 +1,35 @@
-//! files 域 HTTP handler
+//! files 域 HTTP handler（路由表 + STS 转发端点）
 //!
-//! 2026-09-28 新增：`POST /api/v2/files/sts-tmp-keys` —— 强制 JWT 鉴权 +
-//! Role 检查 + 透明转发到 python `/api/v1/files/sts-tmp-keys`。
+//! ## 路由表（2026-10-13 起本文件是 files 域的**唯一**路由声明处）
+//!
+//! ```text
+//! /sts-tmp-keys   → forward_sts_tmp_keys      （2026-09-28 起，逐字未变）
+//! /objects/*      → part_file::router()       （嵌套子模块 part_file）
+//! /cnc/*          → part_file::cnc::router()  （嵌套子模块 part_file::cnc）
+//! ```
+//!
+//! 完整路径（叠加 `modules::v2_router()` 的 `.nest("/files", …)`）：
+//! `/api/v2/files/sts-tmp-keys` / `/api/v2/files/objects/*` / `/api/v2/files/cnc/*`。
+//!
+//! ⚠️ **为什么 nest 段写 `/objects` 而不是模块名 `part_file`**：URL 对外语义是
+//! 「文件对象」而非「零件文件」—— `t_part_file` 的 owner 本来就是多态的
+//! （`owner_kind ∈ {PART, ASSEMBLY}`），装配件文件也走这里。模块归 `part_file`
+//! （它 own 这张表）、URL 说对象，两者有意不同。
+//!
+//! ⚠️ **matchit 注册顺序**：1 段静态 `/sts-tmp-keys` vs 2~3 段的两个 nest，
+//! 段数不同天然无冲突，**不需要**「静态段先于 `Path<i64>` catch-all」的处理。
+//!
+//! ## 端点 `POST /api/v2/files/sts-tmp-keys`
+//!
+//! 2026-09-28 新增：强制 JWT 鉴权 + Role 检查 + 透明转发到 python
+//! `/api/v1/files/sts-tmp-keys`。
 //!
 //! 2026-09-29 追加：rust 端在转发前注入 `X-Forwarded-User-Id: <CurrentUser.id>`
 //! 头（clone 原 HeaderMap 后再插入，不污染原 extractor 形参）。python 端 STS
-//! service 信任此 header 取得真实 user_id（替代此前「依赖 rust JWT 二
-//! 次验签」的反向泄露风险）。
+//! service 信任此 header 取得真实 user_id（替代此前「依赖 rust JWT 二次验签」的
+//! 反向泄露风险）。
 //!
-//! 详见 [`mod.rs`](mod.rs) 模块 doc 与 plan `/Users/ren/.claude/plans/sts-session-uploader-sts-sts-sequential-globe.md`。
+//! 详见 [`mod.rs`](mod.rs) 模块 doc。
 //!
 //! ## 事务边界
 //! 纯转发，无 DB 操作 —— `handler` 不开事务（与「非持久化写」端点同形）。
@@ -29,14 +50,44 @@
 use std::sync::Arc;
 
 use axum::Json;
+use axum::Router;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
+use axum::routing::post;
 use serde_json::Value;
 
 use crate::auth::rbac::{CurrentUser, Role};
+use crate::modules::files::part_file;
 use crate::shared::error::AppError;
 use crate::state::AppState;
+
+/// files 域路由工厂。
+///
+/// 权威路由清单是 [`ROUTES`]（容器自带的那 1 条）；两个 `.nest(...)` 的路由清单
+/// 分别归 [`crate::modules::files::part_file::handler::ROUTES`] 与
+/// [`crate::modules::files::part_file::cnc::handler::ROUTES`]。
+pub fn router() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/sts-tmp-keys", post(forward_sts_tmp_keys))
+        .nest("/objects", part_file::router())
+        .nest("/cnc", part_file::cnc::router())
+}
+
+/// 本文件 `router()` 注册的全部 `METHOD /path`（相对 `/api/v2/files`）。
+///
+/// 2026-10-13 review 第 2 轮 N-3 补：此前本域 9 条端点里**只有 8 条**有 `ROUTES`
+/// —— 容器自带的 `POST /sts-tmp-keys` 没有登记表，而 `mod.rs` 的端点表却把本文件
+/// 的 `ROUTES` 说成「计数真源」。缺的这一条会让「加一条容器级端点」完全无感。
+///
+/// ⚠️ **只含本文件自己 `.route(...)` 的**；两个 `.nest(...)` 的路由清单归各自的
+/// 子模块（见 `mod.rs` 的登记表说明）—— 在这里再记一遍就是重复计数。
+///
+/// ⚠️ 只被同文件的 `mod tests` 消费 —— `ROUTES` 是**测试期登记表**，不是运行期读的
+/// 配置。而 `mod handler` 本身私有 ⇒ 非测试构建里本常量不可达，`dead_code` 会误报。
+/// 故只在 `not(test)` 下放行（同域另两张表挂在 `pub mod` 下，天然可达，无需此豁免）。
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const ROUTES: &[&str] = &["POST /sts-tmp-keys"];
 
 /// `POST /api/v2/files/sts-tmp-keys` —— 鉴权 + 转发
 ///
@@ -75,4 +126,34 @@ pub async fn forward_sts_tmp_keys(
         .forward_sts_tmp_keys(body, fwd_headers)
         .await?;
     Ok((resp.status, resp.headers, resp.body).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ROUTES;
+    use crate::modules::files::route_guard::routes_in_router_source;
+
+    /// `ROUTES` 必须与 `router()` 源码**逐条**一致（解析规则见 `route_guard`）。
+    #[test]
+    fn routes_declared_in_router() {
+        let actual = routes_in_router_source(include_str!("handler.rs"), "router");
+        assert_eq!(
+            actual.len(),
+            ROUTES.len(),
+            "`router()` 注册了 {} 条路由，ROUTES 只列了 {} 条（新增端点忘了登记？）\n\
+             router(): {:?}\nROUTES: {:?}",
+            actual.len(),
+            ROUTES.len(),
+            actual,
+            ROUTES,
+        );
+        for (got, want) in actual.iter().zip(ROUTES.iter()) {
+            assert_eq!(
+                got,
+                want,
+                "`router()` 与 ROUTES 的第 {} 条不一致",
+                ROUTES.len()
+            );
+        }
+    }
 }

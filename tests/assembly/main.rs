@@ -6,7 +6,6 @@
 //!
 //! ## 拆分映射
 //! - api.rs         ← 原 assembly_api.rs
-//! - files.rs       ← 原 assembly_files_api.rs
 //! - status_sync.rs ← 原 assembly_status_sync.rs（依赖 tests/part_api_helpers.rs，
 //!   通过 `#[path = "../part_api_helpers.rs"]` 跨 subdir 引用，
 //!   part 域拆分由 Phase C 处理，本 Phase 不动 part 侧）
@@ -14,7 +13,14 @@
 //! ## 2026-09-25 api-drift-fix 新增 3 sub-file
 //! - children.rs    ← D-07 POST /assemblies/{id}/children
 //! - by_part.rs     ← D-08 GET  /parts/{id}/assembly
-//! - files_list.rs  ← D-09 GET  /assemblies/{id}/files
+//!
+//! ## 2026-10-13 PR1b：两条文件 sub-file 的去向
+//! - `files.rs` → **更名 `lifecycle.rs`**（内容只剩 start / soft_delete / 三态备注 /
+//!   子件 current_batch_id；原文件里的 2 条文件上传用例迁往 `tests/files/upload.rs`）
+//! - `files_list.rs`（D-09 `GET /assemblies/{id}/files` 的 4 条用例）→ **整文件删除**
+//!   （端点 2026-10-13 随 part/assembly 文件端点收编一并下线，等价读端点是
+//!   `GET /files/objects?owner_kind=ASSEMBLY&owner_id=…`，其覆盖在
+//!   `tests/files/part_file.rs`）
 //!
 //! ## 2026-10-05 新增 1 sub-file
 //! - create_serial_price.rs ← POST /assemblies 建单期序列号派发 + 子件金额
@@ -30,7 +36,6 @@ mod api;
 mod by_part;
 mod children;
 mod create_serial_price;
-mod files;
-mod files_list;
 mod force_complete;
+mod lifecycle;
 mod status_sync;

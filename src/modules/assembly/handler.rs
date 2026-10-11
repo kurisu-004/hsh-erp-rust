@@ -10,9 +10,19 @@
 //! - `POST /{assembly_id}/soft-delete`     —— Manager 软删（OCC）
 //! - `POST /{assembly_id}/cancel`          —— Manager/Clerk 取消
 //! - `POST /{assembly_id}/start`           —— PENDING → IN_PROCESS 状态机守卫
-//! - `POST /{assembly_id}/files`           —— multipart PDF 上传到 COS
 //! - `POST /{assembly_id}/children`        —— 2026-09-25 新增 D-07：追加单个子件（事务）
-//! - `GET  /{assembly_id}/files`           —— 2026-09-25 新增 D-09：列出已上传 PDF
+//!
+//! ### 2026-10-13 PR1b：两条 `/files` 端点下线（移除记录，防后人重建）
+//!
+//! | 旧 URL | 方法 | 处置 |
+//! |---|---|---|
+//! | `/api/v2/assemblies/{assembly_id}/files` | `POST` | 删 → 上传并入 `POST /api/v2/files/objects`（四合一，`owner_kind=ASSEMBLY` / `kind=ASSEMBLY_MASTER`） |
+//! | `/api/v2/assemblies/{assembly_id}/files` | `GET` | 删 → 等价于 `GET /api/v2/files/objects?owner_kind=ASSEMBLY&owner_id={id}`（已核实 0 调用方） |
+//!
+//! 两条旧路径**均无 alias**（整段 `{assembly_id}/files` 从 router 上删除）。
+//! ⚠️ `GET /assemblies/{id}` 详情里的 `files[]`（`AssemblyDetail.files`，类型仍是
+//! `AssemblyFileRef`）**不受影响** —— 它走 `service/crud.rs` 的
+//! `list_part_files_by_owner`，与被删的那条 list 端点是两条路径。
 //!
 //! ## 约定（2026-09-22 Group D-3 重构对齐 iam 范本）
 //! - 事务边界在 handler：`state.pool.begin()` → service（trait 注入式签名
@@ -50,7 +60,6 @@ use crate::modules::assembly::vo::{
     AssemblyCreateResult, AssemblyDetail, AssemblyListOut, AssemblyOut,
 };
 use crate::modules::part::vo::PartListItem;
-use crate::modules::part_file::vo::PartFileListOut;
 use crate::shared::error::{AppError, code};
 use crate::shared::response::R;
 use crate::state::AppState;
@@ -241,70 +250,6 @@ pub async fn start_assembly(
     Ok(Json(R::ok(out)))
 }
 
-/// `POST /api/v2/assemblies/{assembly_id}/files` → 201 Created
-///
-/// 2026-09-14 Phase 3（deferred #1）：multipart PDF 上传到 COS。
-/// body: 多个 `file` 二进制字段（PDF）。
-pub async fn upload_assembly_files(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(assembly_id): Path<i64>,
-    mut multipart: Multipart,
-) -> Result<
-    (
-        StatusCode,
-        Json<R<Vec<crate::modules::assembly::vo::AssemblyFileRef>>>,
-    ),
-    AppError,
-> {
-    let mut files: Vec<(Vec<u8>, String, String)> = Vec::new();
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| AppError::validation(format!("multipart 解析失败: {e}")))?
-    {
-        match field.name().unwrap_or("") {
-            "file" => {
-                let filename = field
-                    .file_name()
-                    .ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "file 缺少文件名"))?
-                    .to_string();
-                let content_type = field
-                    .content_type()
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "application/pdf".to_string());
-                let bytes = field
-                    .bytes()
-                    .await
-                    .map_err(|e| AppError::validation(format!("file 字段读取失败: {e}")))?
-                    .to_vec();
-                files.push((bytes, filename, content_type));
-            }
-            _ => {
-                let _ = field.bytes().await;
-            }
-        }
-    }
-    if files.is_empty() {
-        return Err(AppError::biz(
-            code::BIZ_INVALID_VALUE,
-            "至少需要一个 file 字段",
-        ));
-    }
-    let mut tx = state.pool.begin().await?;
-    let out = AssemblyService::upload_assembly_files(
-        &mut tx,
-        &state.snowflake,
-        state.cos.clone(),
-        assembly_id,
-        files,
-        &current,
-    )
-    .await?;
-    tx.commit().await?;
-    Ok((StatusCode::CREATED, Json(R::ok(out))))
-}
-
 /// `POST /api/v2/assemblies/{assembly_id}/children` → 200 OK
 ///
 /// 2026-09-25 新增（D-07 api-drift-fix）：在已存在装配体下追加单个 part 子件。
@@ -335,28 +280,6 @@ pub async fn add_assembly_child(
         kind: "ASSEMBLY_UPDATED".into(),
         payload: json!({ "assembly_id": assembly_id.to_string() }),
     });
-    Ok(Json(R::ok(out)))
-}
-
-/// `GET /api/v2/assemblies/{assembly_id}/files` → 200 OK
-///
-/// 2026-09-25 新增（D-09 api-drift-fix）：列出装配体已上传 PDF（kind=ASSEMBLY_MASTER）。
-/// 与现有 `POST /{assembly_id}/files` 配套。
-///
-/// 行为：
-/// - 权限：Manager / Clerk / Inspector / CncProgrammer（4 角色全开放，与
-///   `GET /part-files/{id}/url` 一致）
-/// - 读端点：不开事务（`pool.acquire()` 直接拿连接）
-/// - 复用 `part_file` 域 `list_by_owner('ASSEMBLY', asm.id)` 走 `t_part_file`
-/// - 响应：`PartFileListOut { items, total }`（无 limit/offset——list_by_owner 不分页，
-///   与单 owner 视图对齐）
-pub async fn list_assembly_files(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(assembly_id): Path<i64>,
-) -> Result<Json<R<PartFileListOut>>, AppError> {
-    let mut conn = state.pool.acquire().await?;
-    let out = AssemblyService::list_assembly_files(&mut conn, assembly_id, &current).await?;
     Ok(Json(R::ok(out)))
 }
 
@@ -420,12 +343,5 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{assembly_id}/soft-delete", post(soft_delete_assembly))
         .route("/{assembly_id}/cancel", post(cancel_assembly))
         .route("/{assembly_id}/start", post(start_assembly))
-        // 静态段 `/files` 在 `/children` 之前注册（与既有 POST /files 不冲突——
-        // POST 与 GET 共享 `/files`，按 method 路由；children 是新增 POST，二者
-        // method 维度不同，注册顺序无 catch-all 歧义）。
-        .route(
-            "/{assembly_id}/files",
-            post(upload_assembly_files).get(list_assembly_files),
-        )
         .route("/{assembly_id}/children", post(add_assembly_child))
 }

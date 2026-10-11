@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO public.t_file_preview\n                (id, preview_seed, src_object_key, state, next_poll_at,\n                 created_at, created_by, updated_at, updated_by)\n            VALUES ($1, $2, $3, 'PENDING', $4, now(), $5, now(), $5)\n            ON CONFLICT (preview_seed) WHERE deleted_at IS NULL DO NOTHING\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Bpchar",
+        "Varchar",
+        "Timestamp",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "52d69078f0c8801496c8256de3880fec9232f66cb40c670eba741c951eeb687b"
+}

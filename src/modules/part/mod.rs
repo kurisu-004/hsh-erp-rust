@@ -55,10 +55,28 @@ use std::sync::Arc;
 use crate::state::AppState;
 
 // 2026-09-29 修复：移除 2026-09-15 followup-cleanup A8 的兼容 nest。
-// part 维度文件路由（cad-files / cnc-programs / setup-sheets / cnc-pair / files）
-// 仅通过 part_file 域 canonical 第二入口
-// `/api/v2/part-files/parts/{part_id}/<file>...` 对外暴露（见
-// `backend-rust/src/modules/part_file/handler.rs::router()`）。
+//
+// 2026-10-13：上面那条「part 维度文件路由（cad-files / cnc-programs / setup-sheets /
+// cnc-pair / files）仅通过 part_file 域 canonical 第二入口
+// `/api/v2/part-files/parts/{part_id}/<file>...` 对外暴露」的说明**已整体作废** ——
+// 那条第二入口随 part_file 域收编进 files 域**整段下线**（连同
+// `part_nested_router()` 一并删除；旧 URL **无 alias**，`/part-files/*` 一律 404）。
+// ⚠️ 判定「某条 part 端点算不算 part_file 域的东西」时按**写不写 `t_part_file`** 判，
+// 不是按「挂在哪个域」判 —— 这条口径**继续有效**，只是本域的命中项在 PR1b 之后
+// 变成了**零条独立文件端点**（判定口径留给后续重组用，别连口径一起删掉）：
+// - 与 part_file **无关**：`print-drawing` / `print-drawing-batch`（纯 BFF 转发到 python
+//   出 PDF）、`batch-with-pdfs`（PDF 只喂 `lopdf` 数页数、不入库不上 COS）。
+// - 与 part_file **相关**（PR1b 前）：`upload-drawing` / `upload-3d-model`（虽挂在 part
+//   域却写 `t_part_file`）、`files/confirm`（STS 直传回执）。二者已分别并入
+//   `POST /api/v2/files/objects` 与硬切到 `POST /api/v2/files/objects/confirm`。
+// - 仍留在本域的**条件性**文件写入：`POST /parts/batch` 的 bindings 分支
+//   （`service/batch.rs::prepare_binding_head_copy`）—— 它命中上面的口径
+//   （确实写 `t_part_file`），但端点本体是「批量建零件」，文件只是可选入参，
+//   故按「一条端点的目标域按前端消费方判定」的约定留在 part 域。
+// 下线的 7 条端点逐条清单见 `src/modules/files/part_file/handler.rs` 的模块 doc
+// 「2026-10-13 同批下线的 7 条端点（移除记录，防后人重建）」一节；PR1b 的 3 条
+// （upload-drawing / upload-3d-model / files/confirm）见同一文件的
+// 「2026-10-13 PR1b：写路径搬进本子模块（上传四合一）」一节。
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -96,8 +114,6 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{part_id}", get(handler::get_part_detail))
         .route("/{part_id}/update", post(handler::update_part))
         .route("/{part_id}/soft-delete", post(handler::soft_delete_part))
-        .route("/{part_id}/upload-drawing", post(handler::upload_drawing))
-        .route("/{part_id}/upload-3d-model", post(handler::upload_3d_model)) // 2026-09-11 新增：3D 模型上传
         // 2026-10-03 新增：单件零件图纸打印（图纸正面 + 条码背面的双面 PDF）。
         // 纯 BFF 转发到 python `GET /api/v1/parts/{id}/print`（v2/v1 路径不同名）。
         .route(
@@ -113,11 +129,24 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{part_id}/batches", get(handler::list_part_batches))
         // ---- 2026-09-25 D-08 api-drift-fix：按 part 反查所属装配体 ----
         .route("/{part_id}/assembly", get(handler::get_assembly_by_part))
-        // ---- 2026-09-29 修复：移除 2026-09-15 followup-cleanup A8 的兼容 nest。
-        //      part 维度文件路由（cad-files / cnc-programs / setup-sheets / cnc-pair / files）
-        //      仅通过 part_file 域 canonical 第二入口
-        //      `/api/v2/part-files/parts/{part_id}/<file>...` 对外暴露（per
-        //      backend-rust/src/modules/part_file/handler.rs::router() 注释）。
-        // ---- 2026-09-16 M2-B 新增：直传 COS 链路 confirm 端点（POST /parts/{id}/files/confirm）----
-        .route("/{part_id}/files/confirm", post(handler::confirm_part_file))
+    // ---- 2026-10-13：part 维度的全部文件端点下线（三批，见上方模块级注记）----
+    //   ① PR1a：cad-files / cnc-programs / setup-sheets / cnc-pair / files 共 **7** 条
+    //      （2026-10-13 review 第 1 轮 NIT-9 订正：原文写 8 是把同批复活的
+    //      `POST /part-files/` 数了进去）；
+    //   ② PR1b：`upload-drawing` / `upload-3d-model` 并入
+    //      `POST /api/v2/files/objects`（四合一）；
+    //   ③ PR1b：`files/confirm` 硬切到 `POST /api/v2/files/objects/confirm`。
+    //   三批**均无 alias，旧路径 404**；移除记录见
+    //   `src/modules/files/part_file/handler.rs` 的模块 doc。
+    // ⚠️ ② 的**响应形状与状态码也变了**（2026-10-13 review 第 1 轮 MINOR-5 登记，
+    // 此前 part 侧这处变更三处 doc 都查不到）：HTTP 200 → **201**；
+    // 出参 `R<TPartFile>` → `R<PartFileOut>`；owner 键 `part_id` → `owner_id`
+    // （并新增 `owner_kind` 回显）；丢 `updated_at` / `updated_by` / `deleted_at`。
+    // 逐字段对照见 `files/part_file/mod.rs` 的「零件侧上传的响应形状与状态码变更」一节。
+    // ⚠️ 刻意保留在本域的：**`POST /parts/batch` 的 bindings 分支**
+    // （service/batch.rs::prepare_binding_head_copy）—— 端点本体是「批量建零件」，
+    // 文件只是可选入参，不是一条独立的文件端点。
+    // ⚠️ 该分支仍把 size 上限写死成 300MB（同 `bind_uploaded_file` 的老写法，
+    // 2026-10-13 review 第 1 轮已在 files 域那侧改成读配置，本侧未动）；
+    // 登记见 `files/part_file/mod.rs` 的「已知偏差登记」第 5 条。
 }

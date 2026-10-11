@@ -1241,10 +1241,7 @@ async fn permission_matrix_matches_legacy_roles() {
                 "outsource.move",
             ],
         ),
-        (
-            "CNC_PROGRAMMER",
-            &["part.drawing.print", "production.view"],
-        ),
+        ("CNC_PROGRAMMER", &["part.drawing.print", "production.view"]),
         ("SHELF_ACCOUNT", &["production.view"]),
     ];
 

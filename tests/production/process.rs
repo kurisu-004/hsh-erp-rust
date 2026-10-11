@@ -643,11 +643,7 @@ async fn list_processes_allows_shelf_account() {
     )
     .await;
 
-    let (s, env) = send(
-        app,
-        json_request("GET", "/prod/processes", None, Some(&sa)),
-    )
-    .await;
+    let (s, env) = send(app, json_request("GET", "/prod/processes", None, Some(&sa))).await;
     assert_eq!(s, StatusCode::OK, "SHELF_ACCOUNT 应 200: {env}");
     assert!(
         env["data"]["items"].as_array().is_some(),

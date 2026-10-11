@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Multipart, Path, Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use serde_json::json;
 
@@ -31,8 +31,7 @@ use crate::modules::part::vo::{
     BatchUpdateOrderInfoOut, LocationTreeOut, MatchByExcelItemResult, PartBatchListItemOut,
     PartDetailOut, PartEventOut, PartListOut, PartScanContextOut,
 };
-use crate::modules::part_file::model::TPartFile;
-use crate::shared::error::{AppError, code};
+use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
 
@@ -44,7 +43,11 @@ const LIST_PART_ROLES: &[Role] = &[
     Role::CncProgrammer,
 ];
 
-/// CRUD（create / batch-create / update / upload-drawing / upload-3d-model）允许角色。
+/// CRUD（create / update）允许角色。
+///
+/// ⚠️ 2026-10-13 PR1b：原注释里的 `upload-drawing` / `upload-3d-model` 两条端点
+/// 已迁往 `files::part_file`（`POST /api/v2/files/objects`），本常量自此只服务
+/// `create_part` / `update_part` 两处。
 const CRUD_PART_ROLES: &[Role] = &[Role::Manager, Role::Clerk];
 
 /// `DELETE` / 单件 `SOFT-DELETE` 软删后 WS 广播事件。
@@ -151,8 +154,9 @@ pub async fn get_assembly_by_part(
 
 /// `POST /api/v2/parts` → 201 Created
 ///
-/// 单件创建工单。响应只含 `PartDetailOut`（无 `PartCreateResult`，upload
-/// drawing 由独立端点 `/upload-drawing` 处理）。
+/// 单件创建工单。响应只含 `PartDetailOut`（无 `PartCreateResult`；图纸上传由独立
+/// 端点 `POST /api/v2/files/objects` 处理 —— 2026-10-13 PR1b 前是本域的
+/// `/upload-drawing`）。
 pub async fn create_part(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -197,125 +201,6 @@ pub async fn soft_delete_part(
     tx.commit().await?;
     ws_broadcast_soft_deleted(&state, part_id);
     Ok(Json(R::ok_empty()))
-}
-
-/// `POST /api/v2/parts/{part_id}/upload-drawing`
-///
-/// Multipart 严格校验（Finding F）：
-/// - 必须恰好含一个 `file` 字段；缺字段 / 多 `file` / 未知字段名一律 40001
-/// - 不为 `file` 默认 MIME —— service 层做严格 `application/pdf` 守卫，
-///   客户端忘记设头会得到 21102 `BIZ_PART_FILE_BAD_TYPE`
-///
-/// 权限（Finding B）：先 `require_any_role` 再读 multipart，避免非授权请求
-/// 触发 50 MB 内存分配。
-pub async fn upload_drawing(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(part_id): Path<i64>,
-    mut multipart: Multipart,
-) -> Result<Json<R<TPartFile>>, AppError> {
-    // Finding B：权限守卫先于 multipart 解析 —— 拒绝未授权请求的内存分配。
-    current.require_any_role(CRUD_PART_ROLES)?;
-    let (data, fname, ct) = read_single_file_field(&mut multipart).await?;
-    let ct =
-        ct.ok_or_else(|| AppError::biz(code::BIZ_PART_FILE_BAD_TYPE, "file 缺少 content_type"))?;
-    let mut tx = state.pool.begin().await?;
-    let pf = PartService::upload_drawing(
-        &mut *tx,
-        &state.snowflake,
-        &state,
-        part_id,
-        &data,
-        &fname,
-        &ct,
-        &current,
-    )
-    .await?;
-    tx.commit().await?;
-    Ok(Json(R::ok(pf)))
-}
-
-/// `POST /api/v2/parts/{part_id}/upload-3d-model`
-///
-/// 上传 part 3D 模型（STEP/STP/IGES/IGS/STL/OBJ/3MF），对齐 Python 后端
-/// `POST /api/v1/parts/{part_id}/3d-models`（2026-09-11 新增）。
-///
-/// Multipart 字段：
-/// - `file`：3D 模型字节（≤ 50 MB）；扩展名 + content_type 由 service 层
-///   `policy::allowed_exts("3D_MODEL")` / `expected_content_types_for_ext` 校验
-///
-/// 权限：`Manager` / `Clerk`（同 upload-drawing）
-///
-/// 错误码：
-/// - 21102 `BIZ_PART_FILE_BAD_TYPE` — 扩展名不在白名单 / content_type 与扩展名不一致
-/// - 21103 `BIZ_PART_FILE_TOO_LARGE` — 空字节 / > 50 MB
-/// - 21104 `BIZ_PART_FILE_UPLOAD_FAILED` — COS SDK 抛错
-/// - 21105 `BIZ_PART_FILE_OWNER_NOT_FOUND` — part 不存在
-/// - 21108 `BIZ_PART_FILE_DUPLICATE` — 同 part + kind + sha256 撞唯一索引
-pub async fn upload_3d_model(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(part_id): Path<i64>,
-    mut multipart: Multipart,
-) -> Result<Json<R<TPartFile>>, AppError> {
-    // 权限守卫先于 multipart 解析（同 upload_drawing）
-    current.require_any_role(CRUD_PART_ROLES)?;
-    let (data, fname, ct) = read_single_file_field(&mut multipart).await?;
-    let ct =
-        ct.ok_or_else(|| AppError::biz(code::BIZ_PART_FILE_BAD_TYPE, "file 缺少 content_type"))?;
-    let mut tx = state.pool.begin().await?;
-    let pf = PartService::upload_3d_model(
-        &mut *tx,
-        &state.snowflake,
-        &state,
-        part_id,
-        &data,
-        &fname,
-        &ct,
-        &current,
-    )
-    .await?;
-    tx.commit().await?;
-    Ok(Json(R::ok(pf)))
-}
-
-/// 共享 helper：从 multipart 流里读恰好一个 `file` 字段（拒绝多 / 缺 / 未知字段）。
-///
-/// `upload_drawing` / `upload_3d_model` 共用同一段 multipart 严格校验：
-/// - 必须恰好含一个 `file` 字段；缺字段 / 多 `file` / 未知字段名一律 40001。
-async fn read_single_file_field(
-    multipart: &mut Multipart,
-) -> Result<(Vec<u8>, String, Option<String>), AppError> {
-    let mut bytes: Option<(Vec<u8>, String, Option<String>)> = None;
-    let mut file_seen = false;
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| AppError::validation(format!("multipart 解析失败: {e}")))?
-    {
-        let name = field.name().unwrap_or("").to_string();
-        if name == "file" {
-            if file_seen {
-                return Err(AppError::validation(
-                    "multipart 包含多个 'file' 字段（仅允许 1 个）",
-                ));
-            }
-            file_seen = true;
-            let fname = field.file_name().unwrap_or("upload.bin").to_string();
-            let ct = field.content_type().map(|m| m.to_string());
-            let data = field
-                .bytes()
-                .await
-                .map_err(|e| AppError::validation(format!("file 读取失败: {e}")))?
-                .to_vec();
-            bytes = Some((data, fname, ct));
-        } else {
-            return Err(AppError::validation(format!(
-                "multipart 未知字段: '{name}'（仅接受 'file'）"
-            )));
-        }
-    }
-    bytes.ok_or_else(|| AppError::validation("multipart 缺少 'file' 字段"))
 }
 
 /// `GET /api/v2/parts/{part_id}/events`

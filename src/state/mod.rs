@@ -9,8 +9,10 @@
 //!
 //! 2026-09-22 Group C 重构：`cnc_program_service` / `part_file_service` 装线。
 //! 两个 service 字段仅 `Arc<SnowflakeIdGenerator>` + `Arc<dyn CosClient>`，事务由
-//! handler 借 `&mut *tx` / `&mut *conn` 喂给 trait（`CncProgramRepoTrait` /
-//! `PartFileRepoTrait`，均直接 `impl for &mut PgConnection`）。
+//! handler 借 `&mut *tx` / `&mut *conn` 喂给 trait。
+//! 2026-10-13：`CncProgramRepoTrait` 已随 `cnc/repo/` 整目录删除（`cnc` 改用父模块的
+//! `PartFileRepoTrait`），故现在**两个 service 共用同一个 `PartFileRepoTrait`**
+//! （直接 `impl for &mut PgConnection`）。
 
 use std::sync::Arc;
 
@@ -25,15 +27,16 @@ use crate::infra::py_backend::PyBackendClient;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::infra::ws_hub::WsHub;
 use crate::middleware::idempotency::IdempotencyStore;
-use crate::modules::cnc_program::service::CncProgramService;
 use crate::modules::com::applicant::service::ApplicantService;
 use crate::modules::com::customer::service::CustomerService;
 use crate::modules::com::delivery_note::service::{DeliveryGroupService, DeliveryNoteService};
 use crate::modules::dashboard::service::DashboardService;
+use crate::modules::files::part_file::cnc::service::CncProgramService;
+use crate::modules::files::part_file::preview::service::PreviewService;
+use crate::modules::files::part_file::service::PartFileService;
 use crate::modules::iam::rbac::service::RbacService;
 use crate::modules::iam::service::{AccountService, SessionService};
 use crate::modules::outsource::service::OutsourceService;
-use crate::modules::part_file::service::PartFileService;
 use crate::modules::prod::process::service::ProcessService;
 use crate::modules::prod::process_chain::service::crud::ProcessChainService;
 use crate::modules::prod::queue::service::QueueService;
@@ -85,14 +88,23 @@ pub struct AppState {
     pub outsource_service: Arc<OutsourceService>,
     /// 2026-09-22 Group C 新增：part_file service。字段 `Arc<SnowflakeIdGenerator>` +
     /// `Arc<dyn CosClient>`；handler 借 `&mut *tx` 喂给 `PartFileRepoTrait`。
-    /// 6 个 handler 端点（upload/list/get_url/get_content/soft_delete）走 handler 管 tx
+    /// 4 个 handler 端点（list / get_url / get_content / soft_delete）走 handler 管 tx
     /// 范式；`bind_uploaded_file` 是事务范式特例（part 域 caller 不开 tx，由 service 自管）。
+    /// 2026-10-13：所属域收编进 files 域（源码 `modules::files::part_file`，URL
+    /// `/api/v2/files/objects/*`），字段名**保持不变** —— 移除会波及
+    /// `src/main.rs` + `test-support/src/state.rs` 两处 `AppState::new` 位置参数。
     pub part_file_service: Arc<PartFileService>,
+    /// 2026-10-13 PR2 新增：`files::part_file::preview` service（CI 预览惰性状态机）。
+    /// 字段仅 `snowflake`（发 `t_file_preview.id`）。
+    /// ⚠️ **单独一个 service 而非塞进 `PartFileService`**：预览的自有表是
+    /// `t_file_preview`（不是 `t_part_file`），状态机与文件 CRUD 无共享状态；
+    /// 合并只会让 `PartFileService` 的字段与职责继续膨胀。
+    pub preview_service: Arc<PreviewService>,
     /// 2026-09-22 Group C 新增：cnc_program service。字段 `Arc<SnowflakeIdGenerator>` +
-    /// `Arc<dyn CosClient>`；handler 借 `&mut *tx` 喂给 `CncProgramRepoTrait`。
-    /// 5 个 handler 端点（upload_cnc_pair / list_pairs_for_part / 3 个 alias）走 handler 管 tx 范式。
-    /// 3 个 alias 端点（download-url / content / delete）由 handler 直接转发到
-    /// `state.part_file_service.method(&mut *tx, ...)`，不抽 trait 到 part_file。
+    /// `Arc<dyn CosClient>`；handler 借 `&mut *tx` 喂给 `PartFileRepoTrait`。
+    /// 2026-10-13：所属域收编进 files 域（源码 `modules::files::part_file::cnc`，URL
+    /// `/api/v2/files/cnc/pairs`），只保留 `upload_cnc_pair` 一个方法（配对列表端点与
+    /// 3 条 alias 端点随零调用方清理下线）。字段名**保持不变**，理由同上。
     pub cnc_program_service: Arc<CncProgramService>,
     /// 2026-09-22 D-2-simple 新增：prod/worker service（仅 CRUD —— `verify-badge`
     /// 已于 2026-10-10 随 handler 迁往 `prod::scan`，worker 侧零调用方）。
@@ -188,6 +200,8 @@ impl AppState {
         let outsource_service = Arc::new(OutsourceService::new(snowflake.clone()));
         // 2026-09-22 Group C 装线：part_file + cnc_program service；字段含 snowflake + cos。
         let part_file_service = Arc::new(PartFileService::new(snowflake.clone(), cos.clone()));
+        // 2026-10-13 PR2：CI 预览 service 装线；字段仅 snowflake。
+        let preview_service = Arc::new(PreviewService::new(snowflake.clone()));
         let cnc_program_service = Arc::new(CncProgramService::new(snowflake.clone(), cos.clone()));
         // 2026-09-22 D-2-simple prod/worker service 装线：仅需 snowflake。
         let worker_service = Arc::new(WorkerService::new(snowflake.clone()));
@@ -232,6 +246,7 @@ impl AppState {
             process_chain_service,
             outsource_service,
             part_file_service,
+            preview_service,
             cnc_program_service,
             worker_service,
             work_type_service,

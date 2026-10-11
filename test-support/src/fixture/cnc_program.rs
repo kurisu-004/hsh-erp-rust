@@ -1,14 +1,14 @@
 //! 集成测试 fixture（PR13 Phase I 引入，2026-09-24）：cnc_program 域预制 fixture
 //!
-//! `tests/cnc_program_api.rs`（404 行）单文件使用。覆盖 CncProgramService
-//! upload_cnc_pair / list_pairs_for_part + PartFileService alias 端点
-//! （download-url / content / delete）。
+//! 2026-10-13 起由 `tests/files/cnc.rs` 使用（原 `tests/cnc_program_api.rs`
+//! 已随 cnc_program 域收编进 files 域而改名并并入 `files` binary）。
+//! 覆盖 `CncProgramService::upload_cnc_pair`（`POST /api/v2/files/cnc/pairs`）。
 //!
 //! ## 字段按域需求聚合
 //! - `t_customer` ×2 —— L1（fx_cnc_l1，prefix='C'）+ L2（fx_cnc_l2，parent=L1）
 //! - `t_part` ×1 —— fx_cnc_part（PENDING 状态，upload_cnc_pair 测试用）
 //!
-//! 不预置 `t_user`：cnc_program_api 是 service 层单测，用
+//! 不预置 `t_user`：该文件是 service 层单测，用
 //! `test_current_user(vec![Role::Manager])` 构造 CurrentUser（不依赖 DB user 行）。
 
 use sqlx::PgPool;

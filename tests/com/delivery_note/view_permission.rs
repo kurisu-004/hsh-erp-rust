@@ -85,10 +85,18 @@ async fn note_reads_permission_matrix() {
     insert_user_with_role(&pool, "fx_dn_view_cnc", "CNC_PROGRAMMER").await;
     let manager = login_token(&app, &fx.part_manager_username, DeliveryFixture::PASSWORD).await;
     let clerk = login_token(&app, PartFixture::CLERK_USERNAME, DeliveryFixture::PASSWORD).await;
-    let inspector =
-        login_token(&app, PartFixture::INSPECTOR_USERNAME, DeliveryFixture::PASSWORD).await;
-    let shelf =
-        login_token(&app, PartFixture::SHELF_ACCOUNT_USERNAME, DeliveryFixture::PASSWORD).await;
+    let inspector = login_token(
+        &app,
+        PartFixture::INSPECTOR_USERNAME,
+        DeliveryFixture::PASSWORD,
+    )
+    .await;
+    let shelf = login_token(
+        &app,
+        PartFixture::SHELF_ACCOUNT_USERNAME,
+        DeliveryFixture::PASSWORD,
+    )
+    .await;
     let cnc = login_token(&app, "fx_dn_view_cnc", "changeme").await;
 
     // 不存在但格式合法的 note id（固定值，落在 fixture 常量段之外）。
@@ -126,7 +134,11 @@ async fn note_reads_permission_matrix() {
         assert_eq!(env["code"], 40300, "{label} detail 应 40300: {env}");
 
         let (s, env) = get(&app, "/com/delivery/note/batch-detail?ids=1", token).await;
-        assert_eq!(s, StatusCode::FORBIDDEN, "{label} batch-detail 应 403: {env}");
+        assert_eq!(
+            s,
+            StatusCode::FORBIDDEN,
+            "{label} batch-detail 应 403: {env}"
+        );
         assert_eq!(env["code"], 40300, "{label} batch-detail 应 40300: {env}");
     }
 }
@@ -149,7 +161,12 @@ async fn note_reads_reject_before_argument_validation() {
     assert_eq!(env["code"], 40300, "应先 40300 而非 20104: {env}");
 
     // 对照：MANAGER 传坏 ids ⇒ 20104（证明参数校验本身可达、不是被权限短路掩盖）。
-    let manager = login_token(&app, PartFixture::MANAGER_USERNAME, DeliveryFixture::PASSWORD).await;
+    let manager = login_token(
+        &app,
+        PartFixture::MANAGER_USERNAME,
+        DeliveryFixture::PASSWORD,
+    )
+    .await;
     let (s, env) = get(&app, "/com/delivery/note/batch-detail?ids=abc", &manager).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "MANAGER 坏 ids 应 400: {env}");
     assert_eq!(env["code"], 20104, "应为 20104: {env}");
