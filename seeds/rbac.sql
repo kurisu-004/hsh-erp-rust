@@ -74,7 +74,9 @@ ON CONFLICT (code) WHERE deleted_at IS NULL DO NOTHING;
 -- 点分形态 `<域>.<操作>`。三个权限点的角色矩阵（第 3 节）逐格照抄迁移前的
 -- 端点守卫 / 前端放行集合，不新增也不收紧：
 --   * `part.drawing.print`  ← part::handler::print 原 require_any_role
---     （MANAGER / CLERK / INSPECTOR / CNC_PROGRAMMER；CNC 岗要看图纸编程序）
+--     （MANAGER / CLERK / INSPECTOR / CNC_PROGRAMMER；CNC 岗要看图纸编程序）；
+--     2026-10-14 同点接管 part_file::service::get_file_with_url（图纸下载直链，
+--     原白名单逐格相同；cnc-programs/{id}/download-url alias 随之一并走点）
 --   * `queue.dispatch`      ← prod::queue::service::dispatch::dispatch_batch 原
 --     require_any_role（MANAGER / CLERK；读端点 list_pending / auto-dispatch
 --     预览**保持角色守卫不动**，不迁权限点）
@@ -86,7 +88,7 @@ INSERT INTO t_permission (
     id, code, name, domain, description, is_active,
     version, created_at, created_by, updated_at, updated_by
 ) VALUES
-    (9300000000000001, 'part.drawing.print',  '零件图纸打印', 'part',          '零件图纸（单件 / 批量）打印转发端点',             true, 0, now(), 0, now(), 0),
+    (9300000000000001, 'part.drawing.print',  '零件图纸打印', 'part',          '零件图纸打印转发端点 + 图纸下载直链（part-files/{id}/url）', true, 0, now(), 0, now(), 0),
     (9300000000000002, 'queue.dispatch',      '生产队列下发', 'queue',         '待下发批次的批量下发写路径',                     true, 0, now(), 0, now(), 0),
     (9300000000000003, 'delivery_note.print', '送货单打印',   'delivery_note', '前端本地生成送货单打印件（后端无打印端点，仅登记）', true, 0, now(), 0, now(), 0)
 ON CONFLICT (code) WHERE deleted_at IS NULL DO NOTHING;
@@ -105,7 +107,7 @@ INSERT INTO t_role_permission (
 )
 SELECT v.id, v.role_code, v.permission_code, 0, now(), 0, now(), 0
 FROM (VALUES
-    -- part.drawing.print：照 print.rs 原 require_any_role 的角色集合
+    -- part.drawing.print：照 print.rs / get_file_with_url 原 require_any_role 的角色集合（两处逐格相同）
     (9400000000000001::bigint, 'MANAGER',        'part.drawing.print'),
     (9400000000000002::bigint, 'CLERK',          'part.drawing.print'),
     (9400000000000003::bigint, 'INSPECTOR',      'part.drawing.print'),

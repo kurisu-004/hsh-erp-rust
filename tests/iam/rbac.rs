@@ -1125,7 +1125,9 @@ async fn custom_role_grant_does_not_trigger_scope_validation() {
 ///
 /// 迁移前集合的来源（照代码，不猜）：
 /// - `part.drawing.print`   ← `part::handler::print` 原 `require_any_role`
-///   （MANAGER / CLERK / INSPECTOR / CNC_PROGRAMMER）
+///   （MANAGER / CLERK / INSPECTOR / CNC_PROGRAMMER）；同点另接
+///   `part_file::service::get_file_with_url`（`GET /part-files/{id}/url` 及
+///   cnc alias，原白名单逐格相同）
 /// - `queue.dispatch`       ← `dispatch_batch` 原 `require_any_role`（MANAGER / CLERK）
 /// - `delivery_note.print`  ← 前端 `canPrint`（MANAGER / CLERK / INSPECTOR；后端打印
 ///   端点已下线，本点只登记矩阵）
@@ -1136,9 +1138,12 @@ async fn custom_role_grant_does_not_trigger_scope_validation() {
 /// 2. 判定层：按角色构造 `CurrentUser`（非 ADMIN 的 permissions 取自 DB），逐点跑
 ///    `require_permission`，放行结果恰好等于矩阵 —— ADMIN 刻意给**空** permissions
 ///    也必须全放行（元角色通配在代码里，不靠数据）；
-/// 3. 端点层（不在本用例内重复）：`part.drawing.print` 由 `tests/print_forward.rs`
-///    的角色闸门用例覆盖，`queue.dispatch` 由 `tests/production/queue_dispatch.rs`
-///    的 Inspector 403 用例覆盖。
+/// 3. 端点层（不在本用例内重复）：`part.drawing.print` 的打印端由
+///    `tests/print_forward.rs` 的角色闸门用例覆盖、`/url` 端由
+///    `tests/part/file.rs` 的 `get_url_requires_permission_point` /
+///    `rbac_shelf_account_get_file_url_still_forbidden` 覆盖，
+///    `queue.dispatch` 由 `tests/production/queue_dispatch.rs` 的 Inspector 403
+///    用例覆盖。
 #[tokio::test]
 async fn permission_matrix_matches_legacy_roles() {
     use hsh_erp_rust::auth::rbac::{CurrentUser, Role, parse_role_string};

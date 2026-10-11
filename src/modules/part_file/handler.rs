@@ -185,11 +185,12 @@ pub async fn list_part_files(
 
 /// `GET /api/v2/part-files/{file_id}/url` → 200 OK
 ///
-/// 权限：`PartFileService::get_file_with_url` 的 4 角色（Manager / Clerk / Inspector /
-/// CncProgrammer）—— **刻意不含 `ShelfAccount`**。本端点回的是 COS 预签直链
+/// 权限：`PartFileService::get_file_with_url` 的权限点 `part.drawing.print`
+/// （2026-10-14 由 4 角色白名单迁移；默认矩阵 = MANAGER / CLERK / INSPECTOR /
+/// CNC_PROGRAMMER，**`ShelfAccount` 默认不授**）。本端点回的是 COS 预签直链
 /// （`url_expires_in_seconds = 3600`），拿到即可脱离本后端直接访问、直链可外传；
 /// 工控机账号的图纸预览走 `get_part_file_content`（后端代理、逐次过 RBAC）即可。
-/// 详见 `part_file/mod.rs` 模块 doc 的角色矩阵。
+/// 详见 `part_file/mod.rs` 模块 doc 的端点守卫矩阵。
 pub async fn get_part_file_url(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -216,10 +217,11 @@ pub async fn get_part_file_url(
 /// 权限：`PartFileService::get_file_content` 的 5 角色（Manager / Clerk / Inspector /
 /// CncProgrammer / **ShelfAccount**，2026-10-10 新增 ShelfAccount 供报工台工控机预览图纸）。
 ///
-/// ⚠️ 与 `get_part_file_url` **角色集合相同但风险面不同**，`/url` 刻意不含 ShelfAccount：
-/// 本端点是**后端代理**（每次都过 RBAC）；`/url` 回的是 **COS 预签直链（1 小时有效）**，
-/// 拿到即可脱离本后端直接访问、直链可外传 ⇒ 工控机账号不需要它（预览走 content 就够），
-/// 不因「同一个 owner 的两个读端点」而一并放开。
+/// ⚠️ 与 `get_part_file_url` **同为按 id 取文件的读端点，但守卫与风险面不同**：
+/// 本端点是**后端代理**（每次都过 RBAC）、对 `ShelfAccount` 放行；`/url` 的守卫是
+/// 权限点 `part.drawing.print`（默认矩阵不含 ShelfAccount），回的是 **COS 预签直链
+/// （1 小时有效）**，拿到即可脱离本后端直接访问、直链可外传 ⇒ 工控机账号不需要它
+/// （预览走 content 就够），不因「同一个 owner 的两个读端点」而一并放开。
 ///
 /// 2026-09-29 扁平化：service 内部走 legacy→新模板 fallback（见
 /// `resolve_effective_key`），handler 仅透传 `cfg.upload_prefix`。

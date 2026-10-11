@@ -431,11 +431,15 @@ ADMIN 用户由元角色通配天然放行（见 §9.3）。
 
 | 权限点 | domain | 守卫的端点 | 授权矩阵（`t_role_permission`） |
 |---|---|---|---|
-| `part.drawing.print` | `part` | `GET /parts/{id}/print-drawing`、`POST /parts/print-drawing-batch` | MANAGER / CLERK / INSPECTOR / CNC_PROGRAMMER |
+| `part.drawing.print` | `part` | `GET /parts/{id}/print-drawing`、`POST /parts/print-drawing-batch`、`GET /part-files/{id}/url`（+ 同 service 的 alias `GET /cnc-programs/{id}/download-url`） | MANAGER / CLERK / INSPECTOR / CNC_PROGRAMMER |
 | `queue.dispatch` | `queue` | `POST /prod/queue/dispatch`（写路径；读端点仍角色守卫） | MANAGER / CLERK |
 | `delivery_note.print` | `delivery_note` | **无**（前端-only） | MANAGER / CLERK / INSPECTOR |
 
 - 三个权限点对 `SHELF_ACCOUNT` **全部不授**；矩阵逐格等于迁移前的角色守卫集合。
+- `part.drawing.print` 守的三条后端端点共用一张矩阵：两条打印端点是纯转发
+  （`part::handler::print`），`GET /part-files/{id}/url` 是图纸下载直链
+  （2026-10-14 由同集合的 4 角色白名单迁移；`GET /cnc-programs/{id}/download-url`
+  是同一 service 方法的 alias，随之一并走权限点）。改矩阵即同时改三处的放行集合。
 - **`delivery_note.print` 是前端-only**：后端送货单打印端点已于 2026-10-08 下线
   （打印改前端 hucre 本地生成），后端无守卫可迁、也不新增端点/死代码；矩阵照前端
   `frontend/src/utils/deliveryNotePermissions.ts::canPrint` 的放行集合登记，供前端
