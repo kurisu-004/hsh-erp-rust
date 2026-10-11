@@ -199,10 +199,16 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 
 > 端点求和 = 1 + 7 + 1 = **9**，与 `src/modules/files/mod.rs` 模块 doc 的端点表恒等。计数口径同 iam 表。
 >
+> ★ **权威路由清单是三张 `ROUTES` 常量**（2026-10-13 review 第 2 轮 N-3 / N-10 补齐）：`files::handler::ROUTES`（1 条 `sts-tmp-keys`）/ `part_file::handler::ROUTES`（7）/ `part_file::cnc::handler::ROUTES`（1）。三者由**同一个**比对器 `src/modules/files/route_guard.rs::routes_in_router_source` 逐条核对各自的 `router()` 源码（单测 `routes_declared_in_router`）—— 加 / 删端点忘同步 `ROUTES` 会当场红。⚠️ 各 `.nest(...)` 的路由清单归**子模块**自己的 `ROUTES`，不在父级重复计数。
+>
 > **2026-10-13 PR2 新增 `files::part_file::preview`**（`GET /objects/{id}/preview`，1 条）：COS CI 逐页光栅化预览。三条必须知道的事实：
 > ① **惰性轮询、零后台任务、零新增 cron** —— 状态推进完全由前端下一次调用驱动（`PENDING & 到期 → describe`），代价是「没人调就没人推进」；
-> ② **内容寻址 + 独立表** —— `t_file_preview` 按 `preview_seed`（内容哈希）去重而非按 `t_part_file` 行去重，因为 CI **按页计费**，同一份 PDF 的 N 份拷贝只该跑 1 次 job；`uk_t_file_preview_seed` 同时是**并发不重复提交**的唯一机制（应用层「先查再插」有 TOCTOU）；
+> ② **内容寻址 + 独立表** —— `t_file_preview` 按 `preview_seed`（内容哈希）去重而非按 `t_part_file` 行去重，因为 CI **按页计费**，同一份 PDF 的 N 份拷贝只该跑 1 次 job。⚠️ **并发不重复提交是「两道闸」不是一道**（2026-10-13 review 第 1 轮 MAJOR-1 订正）：`uk_t_file_preview_seed` 唯一索引只闸**首次登记**；「行已存在 + 无真 job id」的**重试**与**自愈**两条路径靠 `PreviewRepo::claim_submit` 的**条件 UPDATE 认领**（占位 token `__claiming__:<snowflake>` + 30s 租约），只有 `rows == 1` 的调用才允许 POST `/doc_jobs`。⚠️ 「先查再插 / 先查再打」在这两条路径上是 TOCTOU，会重复计费；
 > ③ ⚠️ **安全取舍反转**：本端点**放开 `SHELF_ACCOUNT`** 且返回**永久 public-read 直链**，比 `/url` 的 1 小时预签窗口**更宽** —— 这是用户拍板的选项 A，取舍全文 / 风险补偿见 `src/modules/files/part_file/preview/mod.rs` 的「安全取舍反转」一节。**不要**「顺手把 `/preview` 与 `/url` 的角色集合对齐」。
+>
+> ⚠️ **`POST /objects/{id}/delete` 不回收预览**（2026-10-13 review 第 1 轮 m-7 登记）：该端点只软删 `t_part_file` + 异步删 COS **源对象**，`previews/<seed>/` 下的 JPG 与 `t_file_preview` 行**都不动** ⇒ 图纸「删除」后完整视觉副本仍 public-read 永久可读，且该表只增不减、无 TTL / GC / 级联。
+>
+> ⚠️ **两套时钟的纪律**（2026-10-13 review 第 2 轮 N-7 登记）：`next_poll_at` **进谓词**（`claim_submit` 的租约判据）⇒ **必须 bind** `infra::clock::now_naive()`，**不得**写 SQL `now()`（DB 会话时区与应用时钟是两个时钟，容器里可能 UTC，差 8h ⇒ 过期认领永远接管不了）；`updated_at` 是**纯审计**列、不进任何谓词 ⇒ 沿用全仓既有的 `now()`，**不要**「顺手统一」。同款纪律见 `CLAUDE.md`「状态派生契约」与 mail_digest 一节的 `CURRENT_DATE` 提醒。
 >
 > ⚠️ **`preview_seed char(64)` 有空白填充陷阱**：PG 的 `bpchar` 会把 32 位种子右侧填空格到 64，读出来带 32 个尾随空格。`WHERE preview_seed = $1` 不受影响（bpchar 比较忽略尾随空格），但**拼进 URL 就是 404**。故 `PreviewRepo::find_by_seed` 是本表唯一的读出口并在此统一 `trim_end()` —— 新增读路径必须走它，不要自己写 SQL 读该列。
 >

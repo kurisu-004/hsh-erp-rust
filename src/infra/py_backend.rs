@@ -150,6 +150,20 @@ pub trait PyBackendClient: Send + Sync {
     ///
     /// 成功时响应体是 python 信封，`data.job_id` 为 CI job 标识；
     /// 网络层失败（超时 / 连接拒 / 读 body 失败）→ 502 + 21118。
+    ///
+    /// ## ⚠️↩️ 本方法的超时**必须小于** CI 预览的认领租约（跨文件反向指针）
+    ///
+    /// 调用方 `files::part_file::preview::service::CLAIM_LEASE_SECONDS` = **30s**，
+    /// 超时由 `PythonBackendConfig::timeout_ms`（缺省 10s）控制。
+    ///
+    /// **为什么这条约束存在**：预览提交前会先在库里写一枚**认领 token** 挡住并发
+    /// （见 `PreviewRepo::claim_submit`），提交往返期间这枚 token 占着 `ci_job_id`。
+    /// 若**超时 ≥ 租约**，认领会在请求还在飞的时候过期 ⇒ 被别的请求接管并**再提交
+    /// 一个** ⇒ 两个 CI job（按页计费 = 双份钱）。
+    ///
+    /// ⚠️ **改这个超时前，先去看 `CLAIM_LEASE_SECONDS`**（那边有对称的一条）。
+    /// 这是 2026-10-13 review 第 2 轮 N-5 点 3 补的反向指针：此前约束只写在
+    /// 租约那侧、守卫是**单向**的，读本文件的人看不到还有一处要配。
     async fn forward_ci_submit(
         &self,
         body: Value,

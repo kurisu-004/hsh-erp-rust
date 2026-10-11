@@ -62,13 +62,32 @@ use crate::modules::files::part_file;
 use crate::shared::error::AppError;
 use crate::state::AppState;
 
-/// files 域路由表。
+/// files 域路由工厂。
+///
+/// 权威路由清单是 [`ROUTES`]（容器自带的那 1 条）；两个 `.nest(...)` 的路由清单
+/// 分别归 [`crate::modules::files::part_file::handler::ROUTES`] 与
+/// [`crate::modules::files::part_file::cnc::handler::ROUTES`]。
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/sts-tmp-keys", post(forward_sts_tmp_keys))
         .nest("/objects", part_file::router())
         .nest("/cnc", part_file::cnc::router())
 }
+
+/// 本文件 `router()` 注册的全部 `METHOD /path`（相对 `/api/v2/files`）。
+///
+/// 2026-10-13 review 第 2 轮 N-3 补：此前本域 9 条端点里**只有 8 条**有 `ROUTES`
+/// —— 容器自带的 `POST /sts-tmp-keys` 没有登记表，而 `mod.rs` 的端点表却把本文件
+/// 的 `ROUTES` 说成「计数真源」。缺的这一条会让「加一条容器级端点」完全无感。
+///
+/// ⚠️ **只含本文件自己 `.route(...)` 的**；两个 `.nest(...)` 的路由清单归各自的
+/// 子模块（见 `mod.rs` 的登记表说明）—— 在这里再记一遍就是重复计数。
+///
+/// ⚠️ 只被同文件的 `mod tests` 消费 —— `ROUTES` 是**测试期登记表**，不是运行期读的
+/// 配置。而 `mod handler` 本身私有 ⇒ 非测试构建里本常量不可达，`dead_code` 会误报。
+/// 故只在 `not(test)` 下放行（同域另两张表挂在 `pub mod` 下，天然可达，无需此豁免）。
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const ROUTES: &[&str] = &["POST /sts-tmp-keys"];
 
 /// `POST /api/v2/files/sts-tmp-keys` —— 鉴权 + 转发
 ///
@@ -107,4 +126,34 @@ pub async fn forward_sts_tmp_keys(
         .forward_sts_tmp_keys(body, fwd_headers)
         .await?;
     Ok((resp.status, resp.headers, resp.body).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ROUTES;
+    use crate::modules::files::route_guard::routes_in_router_source;
+
+    /// `ROUTES` 必须与 `router()` 源码**逐条**一致（解析规则见 `route_guard`）。
+    #[test]
+    fn routes_declared_in_router() {
+        let actual = routes_in_router_source(include_str!("handler.rs"), "router");
+        assert_eq!(
+            actual.len(),
+            ROUTES.len(),
+            "`router()` 注册了 {} 条路由，ROUTES 只列了 {} 条（新增端点忘了登记？）\n\
+             router(): {:?}\nROUTES: {:?}",
+            actual.len(),
+            ROUTES.len(),
+            actual,
+            ROUTES,
+        );
+        for (got, want) in actual.iter().zip(ROUTES.iter()) {
+            assert_eq!(
+                got,
+                want,
+                "`router()` 与 ROUTES 的第 {} 条不一致",
+                ROUTES.len()
+            );
+        }
+    }
 }

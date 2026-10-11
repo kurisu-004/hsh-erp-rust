@@ -45,6 +45,16 @@ pub const CLAIM_TOKEN_PREFIX: &str = "__claiming__:";
 ///
 /// ⚠️ 改这个值前先确认 `PyBackendClient::forward_ci_submit` 的超时
 /// （`PythonBackendConfig::timeout_ms`，缺省 10s）仍 < 本值。
+///
+/// ↩️ **反向指针（2026-10-13 review 第 2 轮 N-5）**：本约束在
+/// `crate::infra::py_backend::PyBackendClient::forward_ci_submit` 的 doc 上有
+/// 对称的一条。**任何一侧改动都必须同时看另一侧** —— 之前守卫是**单向**的
+/// （只在这里写），读 `py_backend.rs` 的人看不到「这个超时还有个租约要配」。
+///
+/// ⚠️ 即便两者配错，**后果已被 [`PreviewRepo::mark_submitted`] 的
+/// `ci_job_id = $5` 谓词封住**：最坏是「多跑一个 job」，而**不是**「静默覆盖
+/// 别人的 job id」。本常量是**第一道**闸（少花钱），那条谓词是**第二道**闸
+/// （不产生错数据）。
 pub const CLAIM_LEASE_SECONDS: i64 = 30;
 
 /// 轮询节流：首次登记后 / 提交后到下一次允许轮询的间隔（秒）。
@@ -275,8 +285,18 @@ impl PreviewService {
             let next_poll = now + Self::backoff();
             match Self::submit(py_backend, preview_prefix, &seed, &file.object_key, current).await {
                 Ok(job_id) => {
-                    PreviewRepo::mark_submitted(&mut *conn, row.id, &job_id, next_poll, current.id)
-                        .await?;
+                    // ⚠️ `claim_token` 必须一并传入：`mark_submitted` 的谓词靠它
+                    //    校验「我才是认领者」（review 第 2 轮 N-5）。传错 / 传空会让
+                    //    写入永远得 0 行 ⇒ job id 落不了库 ⇒ 预览永远卡在 PENDING。
+                    PreviewRepo::mark_submitted(
+                        &mut *conn,
+                        row.id,
+                        &job_id,
+                        next_poll,
+                        &claim_token,
+                        current.id,
+                    )
+                    .await?;
                     // ⚠️ **两处都要更新**：`pending_out` 读的是内存里这一行的
                     // `next_poll_at`，只改 `ci_job_id` 会让它仍停在「登记时的
                     // `now()`」⇒ 算出 `retry_after_ms = 0`，前端立刻重调，
@@ -300,12 +320,31 @@ impl PreviewService {
                     // python 侧不存在的值，会误导任何将来直接读这一列的排障代码。
                     // 用独立方法而非改 `touch_poll`：`touch_poll` 还有一个调用点
                     // （3e 的 Running 分支）**必须保留真 job id**，两处语义相反。
-                    PreviewRepo::release_claim(&mut *conn, row.id, &claim_token, current.id)
+                    let released =
+                        PreviewRepo::release_claim(&mut *conn, row.id, &claim_token, current.id)
+                            .await?;
+                    // ⚠️⚠️ **只在真的归还成功（1 行）时才推节流戳**
+                    //（2026-10-13 review 第 2 轮 N-5 的 R2）：`release_claim` 得 0 行
+                    // = 认领**已被接管** / 行已不是 PENDING。此时若仍无条件
+                    // `touch_poll(now + 2s)`，就会把**接管者刚写的租约戳**
+                    // （now + 30s）**缩短**成 now + 2s ⇒ 第三个请求 2s 后即可合法
+                    // 接管 ⇒「租约不可抢」这条闸被一个善意的退避动作从下面捅穿。
+                    if released == 1 {
+                        // 节流：至少等一个 backoff 再重试，避免前端对着一个必然失败的
+                        // 上游连打（错误原样抛给调用方 → 21118 / HTTP 502）。
+                        PreviewRepo::touch_poll(
+                            &mut *conn,
+                            row.id,
+                            now + Self::backoff(),
+                            current.id,
+                        )
                         .await?;
-                    // 节流：至少等一个 backoff 再重试，避免前端对着一个必然失败的
-                    // 上游连打（错误原样抛给调用方 → 21118 / HTTP 502）。
-                    PreviewRepo::touch_poll(&mut *conn, row.id, now + Self::backoff(), current.id)
-                        .await?;
+                    } else {
+                        warn!(
+                            seed = %seed,
+                            "归还认领得 0 行（已被接管或行已非 PENDING），不推节流戳以免缩短接管者的租约"
+                        );
+                    }
                     return Err(e);
                 }
             }

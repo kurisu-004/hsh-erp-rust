@@ -147,21 +147,34 @@ pub const ROUTES: &[&str] = &["POST /pairs"];
 #[cfg(test)]
 mod tests {
     use super::ROUTES;
+    use crate::modules::files::route_guard::routes_in_router_source;
 
-    /// `ROUTES` 与 `router()` 源码逐条一致（详见 `part_file::handler::tests` 的
-    /// 同名测试 —— 解析规则与实现共用一套说明）。
+    /// `ROUTES` 与 `router()` 源码逐条一致。
+    ///
+    /// ⚠️ 2026-10-13 review 第 2 轮 N-4：本条此前是**硬编码 `contains(...)` +
+    /// `len() == 1`** ⇒ **加第二条 cnc 路由不会红**，等于没有守卫。改为与另两个
+    /// router 共用同一解析器（`crate::modules::files::route_guard`），从「恒 1 条」
+    /// 的断言升级成逐条比对。
     #[test]
     fn routes_declared_in_router() {
-        let src = include_str!("handler.rs");
-        let body = src
-            .split_once("pub fn router()")
-            .expect("本文件必须有 pub fn router()")
-            .1;
-        let body = &body[..body.find("\n}\n").expect("router() 必须有收尾大括号")];
-        assert!(
-            body.contains(r#".route("/pairs", post(upload_cnc_pair))"#),
-            "`router()` 必须仍注册 `/pairs`；新增/删除端点时同步改 ROUTES"
+        let actual = routes_in_router_source(include_str!("handler.rs"), "router");
+        assert_eq!(
+            actual.len(),
+            ROUTES.len(),
+            "`router()` 注册了 {} 条路由，ROUTES 只列了 {} 条（新增端点忘了登记？）\n\
+             router(): {:?}\nROUTES: {:?}",
+            actual.len(),
+            ROUTES.len(),
+            actual,
+            ROUTES,
         );
-        assert_eq!(ROUTES.len(), 1, "本子模块当前恒 1 条端点");
+        for (got, want) in actual.iter().zip(ROUTES.iter()) {
+            assert_eq!(
+                got,
+                want,
+                "`router()` 与 ROUTES 的第 {} 条不一致",
+                ROUTES.len()
+            );
+        }
     }
 }

@@ -288,9 +288,11 @@
 //!
 //! ## 模块内文件
 //!
-//! - `repo.rs` —— `t_file_preview` 的全部读写（**8 个静态方法**，**用 `query!`
-//!   宏**，理由见该文件模块 doc）。2026-10-13 review 第 1 轮补 `claim_submit`
-//!   （条件 UPDATE 认领）与 `release_claim`（提交失败归还认领）⇒ 6 → 8
+//! - `repo.rs` —— `t_file_preview` 的全部读写（**静态方法**，**用 `query!`
+//!   宏**，理由见该文件模块 doc）。⚠️ **方法个数不要在这里手写数字** —— 真源是
+//!   [`repo::ALL_METHODS`]（`repo.rs` 的 `tests::all_methods_matches_impl` 逐条
+//!   比对 `impl PreviewRepo`）。2026-10-13 review 第 2 轮 N-1：这个数字连错两轮
+//!   （6 → 8 → 实际 9），正是因为它是纯手工的散文、没有编译期抓手
 //! - `model.rs` —— `TFilePreview` 行结构
 //! - `service.rs` —— 状态机 + seed 推导 + URL 拼接 + python 转发
 //! - `dto.rs` —— `PreviewOut` 出参

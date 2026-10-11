@@ -760,9 +760,16 @@ fn env_or(key: &str, default: &str) -> String {
 /// `/previews/<seed>/p1.jpg` —— **协议相对 URL，指向前端自己的源站**，不是 COS。
 /// 生产表现是「预览全是裂图」且**日志里看不出任何异常**（一切都成功，只是 URL 指错
 /// 了地方）。任何照抄 `.env.example` 起服务的部署都会中招。
+///
+/// ## ⚠️ 返回值也要 `trim`（2026-10-13 review 第 2 轮 N-9）
+///
+/// 判空用 `trim()`、返回用原值是**不一致**的：`COS_PREVIEW_BASE_URL=https://cdn.example.com `
+///（行尾一个空格，`.env` 手改 / 从文档复制粘贴时极常见）会原样带进 URL ⇒
+/// 每个预览 URL 末尾多一个空格 ⇒ 前端 `<img src>` 加载失败。
+/// ⇒ **判空与返回用同一种口径**。
 fn env_or_non_empty(key: &str, default: &str) -> String {
     match env::var(key) {
-        Ok(v) if !v.trim().is_empty() => v,
+        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
         _ => default.to_string(),
     }
 }

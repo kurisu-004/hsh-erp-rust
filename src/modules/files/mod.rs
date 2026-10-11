@@ -37,10 +37,12 @@
 //! 各端点的逐字段契约、角色矩阵理由、移除记录见 `part_file/mod.rs` 与
 //! `part_file/cnc/mod.rs` 的模块 doc。
 //!
-//! ⚠️ **本表的计数真源是各 `router()` 的 `ROUTES` 常量**（2026-10-13 review 第 1
-//! 轮 NIT 新增）：`part_file::handler::ROUTES`（7 条，`mod tests` 逐条比对
-//! `router()` 源码）、`part_file::cnc::handler::ROUTES`（1 条）。加端点忘改本表
-//! **不会红**（本表是人读的），但忘了改 `ROUTES` 会当场红。
+//! ⚠️ **本表三条路径的计数真源是三个 `ROUTES` 常量**（2026-10-13 review 第 2 轮
+//! N-3 补齐最后一个缺口）：`handler::ROUTES`（1 条 sts-tmp-keys）、
+//! `part_file::handler::ROUTES`（7 条）、`part_file::cnc::handler::ROUTES`（1 条）。
+//! 三张表都用**同一个**比对器（`route_guard::routes_in_router_source`）逐条核对
+//! 各自的 `router()` 源码。⚠️ 加端点忘改本表**不会红**（本表是人读的），但忘了改
+//! 对应的 `ROUTES` 会当场红。
 //!
 //! ## ⚠️ 硬切记录（2026-10-13）
 //!
@@ -112,6 +114,14 @@
 mod handler;
 
 pub mod part_file;
+
+/// 「`router()` 源码 ↔ `ROUTES` 常量」比对器的共用实现（**仅 `#[cfg(test)]`**，
+/// 不进 lib 产物 ⇒ 只有 `src/` 内的单元测试能用）。
+///
+/// 三个 router 工厂（`handler` / `part_file::handler` / `part_file::cnc::handler`）
+/// 的 `mod tests` 都调它，见该文件模块 doc。
+#[cfg(test)]
+mod route_guard;
 
 use std::sync::Arc;
 

@@ -3,32 +3,40 @@
 //! 被测端点：`GET /api/v2/files/objects/{file_id}/preview`
 //! （COS CI 图纸预览，惰性轮询、零后台任务）。
 //!
-//! ## 覆盖场景（**20 条编号** + 6 条不编号护栏，2026-10-13 review 第 1 轮复核）
+//! ## 覆盖场景：**29 个测试函数**（2026-10-13 review 第 2 轮 N-2 逐函数点过）
 //!
-//! | # | 用例 | 断言要点 |
-//! |---|---|---|
-//! | 1 | `preview_seed_uses_content_sha256_prefix` | 有 sha 时取**前 32 位 hex** |
-//! | 2 | `preview_seed_falls_back_to_object_key_hash` | sha 为 NULL 时退回 `sha256(object_key)` 前 32 位 |
-//! | 3 | `ready_cache_hit_never_calls_python` | READY 命中 → **mock 零调用** |
-//! | 4 | `cache_miss_submits_once_and_returns_pending` | 未命中 → 提交 1 次 → PENDING |
-//! | 5 | `pending_not_due_returns_pending_without_python` | 未到期 → 直接 PENDING（**不打 python**） |
-//! | 6 | `pending_due_describe_success_marks_ready` | 到期 + Success → READY + `pages.len() == total_page_count` + URL 逐条正确 |
-//! | 7 | `describe_failed_returns_21117` | Failed → 21117 / HTTP 502 |
-//! | 8 | `submit_forward_failure_returns_21118` | 提交失败 → 21118 / HTTP 502（且**归还认领**，`ci_job_id` 回 NULL） |
-//! | 9 | `non_pdf_and_non_drawing_kind_return_21116` | 3D_MODEL / 非 PDF → 21116 / HTTP 400 |
-//! | 10 | `concurrent_misses_submit_only_one_job` | 并发两次 **首次登记** → 只提交 1 个 job（唯一索引闸门） |
-//! | 11 | `failed_state_restarts_on_next_call` | FAILED → 下次调用自愈重启为 PENDING |
-//! | 12 | `shelf_account_can_get_preview` | SHELF_ACCOUNT 能拿到 preview（锁选项 A 的角色矩阵） |
-//! | 13 | `describe_not_exist_returns_21117_and_row_failed` | python 合成态 `NotExist` ⇒ 21117 + 行落 FAILED，**且本次调用零 submit** |
-//! | 14 | `describe_not_exist_lowercase_also_recognized` | `notexist` 小写变体同判（大小写不敏感） |
-//! | 15 | `describe_cancel_returns_21117` | CI 官方 `Cancel` ⇒ 21117 + 行落 FAILED |
-//! | 16 | `describe_pause_returns_21117` | CI 官方 `Pause` ⇒ 21117 + 行落 FAILED |
-//! | 17 | `describe_success_with_zero_pages_stays_pending` | **回归护栏**：`Success` 但 0 页仍当 Running（不落 READY） |
-//! | 18 | `describe_prefers_state_key_over_status` + `describe_reads_status_key_as_well` | 状态字段名 `state`（python 真源，**优先**）/ `status`（兜底）两支都认 |
-//! | 19 | `concurrent_due_retries_submit_only_one_job` | **路径 A**：行已存在 + 到期 + 无 job id ⇒ 并发**只提交 1 个**（条件 UPDATE 认领闸门） |
-//! | 20 | `failed_heal_losing_racer_does_not_submit_again` | **路径 B**：自愈输家（`reset_to_pending` 得 0 行）**不再提交** |
+//! 拆开是 **21 个编号函数**（下表 20 个编号条目，其中 #18 一条覆盖 2 个函数）
+//! + **8 条不编号护栏**。
 //!
-//! 另有 **6 条护栏**（不编号）：
+//! ⚠️ 本节的三个数字此前**互相打架且都与实际不符**（写了「20 + 6」/「6 条但列了
+//! 8 条」/「20 + 4」）。三个数字都是纯手工维护的散文 ⇒ 逐函数点数核对，并按
+//! 「编号条目 / 实际函数」两栏分开写，避免再出现「一个条目两个函数」的歧义。
+//!
+//! | # | 用例（⚠️ 一条可含多个函数） | 函数数 | 断言要点 |
+//! |---|---|---:|---|
+//! | 1 | `preview_seed_uses_content_sha256_prefix` | 1 | 有 sha 时取**前 32 位 hex** |
+//! | 2 | `preview_seed_falls_back_to_object_key_hash` | 1 | sha 为 NULL 时退回 `sha256(object_key)` 前 32 位 |
+//! | 3 | `ready_cache_hit_never_calls_python` | 1 | READY 命中 → **mock 零调用** |
+//! | 4 | `cache_miss_submits_once_and_returns_pending` | 1 | 未命中 → 提交 1 次 → PENDING |
+//! | 5 | `pending_not_due_returns_pending_without_python` | 1 | 未到期 → 直接 PENDING（**不打 python**） |
+//! | 6 | `pending_due_describe_success_marks_ready` | 1 | 到期 + Success → READY + `pages.len() == total_page_count` + URL 逐条正确 |
+//! | 7 | `describe_failed_returns_21117` | 1 | Failed → 21117 / HTTP 502 |
+//! | 8 | `submit_forward_failure_returns_21118` | 1 | 提交失败 → 21118 / HTTP 502（且**归还认领**，`ci_job_id` 回 NULL） |
+//! | 9 | `non_pdf_and_non_drawing_kind_return_21116` | 1 | 3D_MODEL / 非 PDF → 21116 / HTTP 400 |
+//! | 10 | `concurrent_misses_submit_only_one_job` | 1 | 并发两次 **首次登记** → 只提交 1 个 job（唯一索引闸门） |
+//! | 11 | `failed_state_restarts_on_next_call` | 1 | FAILED → 下次调用自愈重启为 PENDING |
+//! | 12 | `shelf_account_can_get_preview` | 1 | SHELF_ACCOUNT 能拿到 preview（锁选项 A 的角色矩阵） |
+//! | 13 | `describe_not_exist_returns_21117_and_row_failed` | 1 | python 合成态 `NotExist` ⇒ 21117 + 行落 FAILED，**且本次调用零 submit** |
+//! | 14 | `describe_not_exist_lowercase_also_recognized` | 1 | `notexist` 小写变体同判（大小写不敏感） |
+//! | 15 | `describe_cancel_returns_21117` | 1 | CI 官方 `Cancel` ⇒ 21117 + 行落 FAILED |
+//! | 16 | `describe_pause_returns_21117` | 1 | CI 官方 `Pause` ⇒ 21117 + 行落 FAILED |
+//! | 17 | `describe_success_with_zero_pages_stays_pending` | 1 | **回归护栏**：`Success` 但 0 页仍当 Running（不落 READY） |
+//! | 18 | `describe_prefers_state_key_over_status` + `describe_reads_status_key_as_well` | **2** | 状态字段名 `state`（python 真源，**优先**）/ `status`（兜底）两支都认 |
+//! | 19 | `concurrent_due_retries_submit_only_one_job` | 1 | **路径 A**：行已存在 + 到期 + 无 job id ⇒ 并发**只提交 1 个**（条件 UPDATE 认领闸门） |
+//! | 20 | `failed_heal_losing_racer_does_not_submit_again` | 1 | **路径 B**：自愈输家（`reset_to_pending` 得 0 行）**不再提交** |
+//! | | **编号小计** | **21** | |
+//!
+//! 另有 **8 条护栏**（不编号）：
 //! - `preview_route_is_not_swallowed_by_sibling_catch_alls` —— **matchit 冲突的实测**
 //!   （见下节）
 //! - `preview_urls_shape_is_stable` —— `preview_urls` 纯函数断言
@@ -39,9 +47,11 @@
 //! - `preview_object_prefix_tolerates_trailing_slash` —— `dst_prefix` / `pages` 中段
 //!   同源 + 尾斜杠容忍
 //! - `claim_submit_predicate_admits_exactly_one_concurrent_claimer` —— 认领谓词的
-//!   **确定性**并发断言（service 层的 `join!` 版本验不了，见该用例 doc）
+//!   **确定性**并发断言（service 层的 `join!` 版本验不了，见下节）
 //! - `concurrent_takeover_of_expired_claim_submits_once` —— 过期认领的并发接管只提一次
 //! - `live_claim_blocks_all_python_calls_until_lease_expiry` —— 租约期内零 python 调用
+//!
+//! **合计 21 + 8 = 29 个测试函数。**
 //!
 //! ## matchit 冲突的验证方式（本文件最重要的一条护栏）
 //!
@@ -1464,21 +1474,26 @@ async fn claim_submit_predicate_admits_exactly_one_concurrent_claimer() {
         .await
         .unwrap();
     let row_id = shared_test_snowflake().next_id();
-    // 过期认领（= 认领者崩溃的形态）：token 在、租约戳在过去
+    // 过期认领（= 认领者崩溃的形态）：token 在、租约戳在过去。
+    // ⚠️ 租约戳用**应用时钟** bind（2026-10-13 review 第 2 轮 N-8）—— 被测谓词
+    //    比较的正是 bind 来的应用时钟（`claim_submit` 的 `$6`），fixture 若用 SQL
+    //    的 `now() - interval` 就是拿**另一个时钟**造数据，测试在与生产不同源的值上
+    //    验证。方向上碰巧安全（存进去的只会更旧），但那正是「碰巧」，不是纪律。
+    let now = now_naive();
+    let expired = now - chrono::Duration::minutes(1);
     sqlx::query(
         "INSERT INTO t_file_preview \
            (id, preview_seed, src_object_key, ci_job_id, state, page_count, next_poll_at, \
             created_at, created_by, updated_at, updated_by) \
-         VALUES ($1, $2, 'k.pdf', '__claiming__:crashed', 'PENDING', 0, \
-                 now() - interval '1 minute', now(), 1, now(), 1)",
+         VALUES ($1, $2, 'k.pdf', '__claiming__:crashed', 'PENDING', 0, $3, now(), 1, now(), 1)",
     )
     .bind(row_id)
     .bind(seed)
+    .bind(expired)
     .execute(&pool)
     .await
     .unwrap();
 
-    let now = now_naive();
     let lease = now + chrono::Duration::seconds(30);
     let (a, b) = tokio::join!(
         PreviewRepo::claim_submit(&pool, row_id, "__claiming__:A", lease, now, 1),
