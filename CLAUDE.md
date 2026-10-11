@@ -78,13 +78,13 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 
 - `migrations/20260925000000_001_baseline.sql` —— 全量 schema 基线（合并原 001-029）
 - `migrations/archive/` —— 原 29 个 migration 文件归档，仅历史参考，**不参与** sqlx::migrate! 扫描
-- `seeds/menu.sql` —— 菜单树声明式种子（t_menu + t_role_menu），幂等可反复跑
-- `seeds/rbac.sql` —— RBAC 基线种子（6 个内置角色 + 权限点 + 系统角色授权矩阵），幂等可反复跑；与 `seeds/menu.sql` 关注点分离（「看得见的入口」vs「能做什么操作」）
+- `seeds/menu.sql` —— 菜单目录声明式种子（t_menu），幂等可反复跑
+- `seeds/rbac.sql` —— RBAC 基线种子（6 个内置角色 + 权限点 + 系统角色授权基线：t_role_permission / t_role_menu），幂等可反复跑；与 `seeds/menu.sql` 关注点分离（菜单目录 vs 角色 / 权限点 / 授权基线；角色→菜单授权由 RBAC 面板持续管理，seed 只补首次基线）
 - `seeds/README.md` —— seed 编写规范
 
 **新 schema 变更走追加新 migration**（append-only，永不修改已有文件）。
 **菜单变更 = 改 `seeds/menu.sql` + 重启 app**（启动钩子自动跑，无需新 migration）。
-**角色 / 权限点基线变更 = 改 `seeds/rbac.sql` + 重启 app**（同上，`run_seeds` 按 menu → rbac → [admin] 顺序无条件加载）。
+**角色 / 权限点 / 授权基线变更 = 改 `seeds/rbac.sql` + 重启 app**（同上，`run_seeds` 按 menu → rbac → [admin] 顺序无条件加载；`t_role_menu` 基线只补「从未有过的组合」，面板的增 / 删重启后保留）。
 
 ### 初始管理员账号（2026-09-26 新增）
 
@@ -101,7 +101,7 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 3. **stage 投影** —— 漂移表先进 `restore_stage`（用 dump 自己的 DDL 原样建表），再 `INSERT INTO public.<t> (交集列) SELECT ... FROM restore_stage.<t>`，逐张对账行数。
 4. **schema 快照 diff** —— 灌数据前后各存一份 `information_schema`，diff 非空即失败（永久堵死「列被复活」这类回归）。
 5. **`_sqlx_migrations` / `alembic_version` 从 TOC 排除** —— dump 里带的是 Python 端 15 条旧迁移记录，灌进去会让 sqlx 报 `VersionMissing`，之后 `cargo run` 起不来。
-6. `t_menu` / `t_role_menu` 默认跳过（`seeds/menu.sql` 是权威源），最后幂等补灌。
+6. `t_menu` / `t_role_menu` 默认跳过（菜单目录归 `seeds/menu.sql`，角色→菜单授权基线归 `seeds/rbac.sql`），最后按序幂等补灌。
 
 **改 schema 契约时先改脚本顶部的两张表**（不在其中 → 脚本硬失败，不会静默丢数据）：
 
@@ -608,9 +608,9 @@ integration test binary 已重组为 **21 binary**（9 多文件 domain 子目�
 
 ### 测试数据两条硬约定（2026-10-10 新增）
 
-**1）共享 template DB 已灌 `seeds/menu.sql`** —— `scripts/test_nextest.sh` 建 template 库时会 apply 它（与生产启动钩子 `src/infra/seed.rs` 同一份 SQL），因此每个测试用例 clone 出来的库**都带着**那份 seed 给 `MANAGER` / `CLERK` / `INSPECTOR` / `CNC_PROGRAMMER` / `SHELF_ACCOUNT` 五个真实角色授予的若干菜单。**角色数 5 是结构事实、不随 seed 内容变；菜单条数随 `seeds/menu.sql` 改动而变，故此处不写数字**（要确切条数就查库，别把它抄进注释或文档 —— 那正是会立刻过期的陈旧数字）。
+**1）共享 template DB 已灌 `seeds/menu.sql` + `seeds/rbac.sql`** —— `scripts/test_nextest.sh` 建 template 库时会按序 apply 它们（与生产启动钩子 `src/infra/seed.rs` 同一份 SQL），因此每个测试用例 clone 出来的库**都带着**那份授权基线给 `MANAGER` / `CLERK` / `INSPECTOR` / `CNC_PROGRAMMER` / `SHELF_ACCOUNT` 五个真实角色授予的若干菜单。**角色数 5 是结构事实、不随 seed 内容变；菜单条数随 `seeds/menu.sql` 的目录与 `seeds/rbac.sql` 的基线改动而变，故此处不写数字**（要确切条数就查库，别把它抄进注释或文档 —— 那正是会立刻过期的陈旧数字）。
 
-⇒ **任何断言 `t_menu` / `t_role_menu` 条数或内容的测试，必须用 `seeds/menu.sql` 永不授予的合成角色串**（`t_role_menu.role` 是 `varchar(20)`、无 DB ENUM、无 `t_role` 表，任意 ≤20 字符字符串都合法），不能用 `MANAGER` 等真实角色反查 —— 否则会把共享 seed 的菜单一起数进来。范本见 `tests/user_repo/role.rs` 的 `SYNTHETIC_MENU_ROLE` / `SYNTHETIC_MENU_ROLE_B`，同文件 `menu_seed_never_grants_synthetic_menu_roles` 自锁「seed 文本不得出现这两个串」（护的是「合成角色」这个前提本身，一旦被破坏就在 seed 文本上当场红，而不是稀释掉某条断言）。
+⇒ **任何断言 `t_menu` / `t_role_menu` 条数或内容的测试，必须用 `seeds/menu.sql` / `seeds/rbac.sql` 永不授予的合成角色串**（`t_role_menu.role` 是 `varchar(20)`、无 DB ENUM、无 `t_role` 表，任意 ≤20 字符字符串都合法），不能用 `MANAGER` 等真实角色反查 —— 否则会把共享 seed 的菜单一起数进来。范本见 `tests/user_repo/role.rs` 的 `SYNTHETIC_MENU_ROLE` / `SYNTHETIC_MENU_ROLE_B`，同文件 `menu_seed_never_grants_synthetic_menu_roles` 自锁「两份 seed 文本不得出现这两个串」（护的是「合成角色」这个前提本身，一旦被破坏就在 seed 文本上当场红，而不是稀释掉某条断言）。
 
 **2）插入行用 `now_naive()` 时，查询窗口不得硬编码绝对日期** —— 否则每月 1 号再次变红（`2026-09` 写的测试在 `2026-10-01` 起查不到行）。两条合规写法：照 `tests/statistics/event_driven.rs` 的 `insert_delivered_event(…, at_date)` 把插入时间戳一起钉死，或让查询窗口由 `now_naive()` 推导。
 
@@ -713,7 +713,7 @@ integration test binary 已重组为 **21 binary**（9 多文件 domain 子目�
 
 reviewer 在 iam 域重构期间实跑复现出的另外 6 条基线红（与 iam 无关），根因已逐条核实并处置完毕。两条根因各自都**不是** fixture 污染，也都被收进了「测试数据两条硬约定」一节的机制约束：
 
-| 3 条 `user_repo role::list_active_for_roles_*` | 根因：共享 template DB 已灌 `seeds/menu.sql`，真实角色带着共享 seed 授予的那批菜单；测试用 `MANAGER` / `CLERK` 反查并断言**精确条数**，把 seed 菜单数了进去。处置：改用合成角色 `SYNTHETIC_MENU_ROLE`（断言逐字未削弱），另加 `menu_seed_never_grants_synthetic_menu_roles` 自锁「seed 文本不得出现该串」。 |
+| 3 条 `user_repo role::list_active_for_roles_*` | 根因：共享 template DB 已灌 `seeds/menu.sql` + `seeds/rbac.sql`，真实角色带着共享 seed 授予的那批菜单；测试用 `MANAGER` / `CLERK` 反查并断言**精确条数**，把 seed 菜单数了进去。处置：改用合成角色 `SYNTHETIC_MENU_ROLE`（断言逐字未削弱），另加 `menu_seed_never_grants_synthetic_menu_roles` 自锁「两份 seed 文本不得出现该串」。 |
 | 3 条 `statistics api::{overview,workers_stats,worker_detail}_happy_path` | 根因：**时间炸弹** —— 插入行用 `now_naive()`，查询窗口却硬编码 `2026-09-01..2026-09-30`，`2026-09` 写、`2026-09` 跑是绿的，`2026-10-01` 起窗口里查不到行。处置：**删除**（用户决定接受该覆盖清零，不修复）。 |
 
 ### 覆盖空洞登记：`StatisticsService` 的三个方法无 happy-path 测试（2026-10-10）
