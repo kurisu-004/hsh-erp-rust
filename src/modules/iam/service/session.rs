@@ -2,7 +2,7 @@
 //!
 //! - login：username 归一化、bcrypt 校验、角色/shelf 范围解析、签发双 token、`last_login_at` 戳更新
 //! - refresh：decode refresh → 校验版本 → 轮转 `refresh_token_version` → 重签双 token
-//! - me：从 DB 重读当前用户 + 角色 + shelf 范围 + 菜单，返回最新视图
+//! - me：从 DB 重读当前用户 + 角色 + shelf 范围 + 权限码 + 菜单，返回最新视图
 //! - change_password：自助改密复用 `AccountService::change_own_password`
 //!
 //! ## 实施约定（2026-09-21 事务分层重构）
@@ -346,7 +346,8 @@ impl SessionService {
             .create_session(&pair.refresh_jti, u.id, TokenKind::Refresh, ttl, &profile)
             .await?;
 
-        let user_out = build_current_user_out(&u, &role_codes, &shelf_ids, menus);
+        let user_out =
+            build_current_user_out(&u, &role_codes, &shelf_ids, &profile.permissions, menus);
 
         Ok(LoginResponse {
             token: pair.access_token,
@@ -581,7 +582,8 @@ impl SessionService {
             .create_session(&pair.refresh_jti, u.id, TokenKind::Refresh, ttl, &profile)
             .await?;
 
-        let user_out = build_current_user_out(&u, &role_codes, &shelf_ids, menus);
+        let user_out =
+            build_current_user_out(&u, &role_codes, &shelf_ids, &profile.permissions, menus);
 
         Ok(LoginResponse {
             token: pair.access_token,
@@ -594,7 +596,7 @@ impl SessionService {
     // me（读端点）
     // =======================================================================
 
-    /// `/iam/me`：从 DB 重读当前用户 + 角色 + shelf 范围 + 菜单。
+    /// `/iam/me`：从 DB 重读当前用户 + 角色 + shelf 范围 + 权限码 + 菜单。
     /// 读端点，handler `pool.acquire()` 不开事务，service 借到的 `repo` 用完即 drop。
     pub async fn me<R: IamRepoTrait>(
         &self,
@@ -610,12 +612,15 @@ impl SessionService {
             return Err(AppError::biz(code::UNAUTHORIZED, "用户不存在或已停用"));
         }
 
-        // 2. 重查角色 + shelf 范围 + 菜单（不走 JWT 里的 stale 数据）
+        // 2. 重查角色 + shelf 范围 + 权限码 + 菜单（不走 JWT 里的 stale 数据）
         let role_rows = repo.list_user_roles_by_user_id(u.id).await?;
         // 枚举 `roles` 在 me 里用不到（出参的 roles 用原始串）；仍要跑解析，
         // 因为它同时算出 role_codes 与 shelf scope
         let (_roles, role_codes, shelf_ids, _wildcard) =
             resolve_roles_and_scope(&mut repo, &role_rows).await?;
+        // 权限码：按**原始** role code 联查（含自定义角色 —— 它们在 t_role 里
+        // 也可能有授权行，枚举认不出不代表没有权限）
+        let permissions = repo.list_permission_codes_by_roles(&role_codes).await?;
         // 菜单：按**原始** role code 取（含自定义角色 —— 它们在 `t_role_menu` 里
         // 的授权行是角色面板的可写对象；用枚举 `roles` 会把这些菜单全部丢掉）
         let menus = self
@@ -623,7 +628,13 @@ impl SessionService {
             .menus_for_roles(&mut repo, &role_codes)
             .await?;
 
-        Ok(build_current_user_out(&u, &role_codes, &shelf_ids, menus))
+        Ok(build_current_user_out(
+            &u,
+            &role_codes,
+            &shelf_ids,
+            &permissions,
+            menus,
+        ))
     }
 
     // =======================================================================
@@ -740,6 +751,7 @@ fn build_current_user_out(
     u: &User,
     role_codes: &[String],
     shelf_ids: &[i64],
+    permissions: &[String],
     menus: Vec<MenuNodeOut>,
 ) -> CurrentUserOut {
     CurrentUserOut {
@@ -749,6 +761,8 @@ fn build_current_user_out(
         is_active: u.is_active,
         // 原始大写码（含自定义角色）—— `Role` 枚举只用于授权判定，不用于出参
         roles: role_codes.to_vec(),
+        // 与写进 Redis session 缓存的是同一份（ADMIN 恒空 vec）
+        permissions: permissions.to_vec(),
         shelf_ids: shelf_ids.iter().map(|v| v.to_string()).collect(),
         menus,
     }

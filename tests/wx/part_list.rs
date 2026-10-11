@@ -1327,10 +1327,16 @@ async fn wx_login_response_only_exposes_six_fields() {
     assert_eq!(
         ukeys,
         vec!["full_name", "id", "roles", "username"],
-        "user 只该有 4 个键（is_active / shelf_ids / menus 是 Web 端专用，必须缺席）: {env}"
+        "user 只该有 4 个键（is_active / shelf_ids / menus / permissions 是 Web 端专用，必须缺席）: {env}"
     );
 
-    for banned in ["expires_in", "is_active", "shelf_ids", "menus"] {
+    for banned in [
+        "expires_in",
+        "is_active",
+        "shelf_ids",
+        "menus",
+        "permissions",
+    ] {
         assert!(
             !user.contains_key(banned),
             "user 不该含 {banned}（小程序零消费 + 多余负载）: {env}"

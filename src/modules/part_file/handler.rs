@@ -493,7 +493,7 @@ pub async fn upload_cnc_pair(
 /// `GET /api/v2/part-files/parts/{part_id}/files` —— 列出 part 全部文件（kind 可选过滤）。
 ///
 /// 权限：**handler 级** 4 角色（M / C / I / CNC）—— 比 service 的 `list_files` 更严一档。
-/// ⚠️ 这与 service 白名单的有意分歧见 `part_file/mod.rs` 模块 doc 的角色矩阵一节：
+/// ⚠️ 这与 service 白名单的有意分歧见 `part_file/mod.rs` 模块 doc 的端点守卫矩阵一节：
 /// 放开给工控机账号的是 `GET /part-files` 与 `/part-files/{id}/content` 两条，零件维度
 /// 的三条嵌套列表端点不在放开范围内。
 ///
@@ -530,7 +530,7 @@ pub async fn list_part_files_for_part(
 ///
 /// 权限：**handler 级** 4 角色（M / C / I / CNC）。`list_files` 的 service 白名单已含
 /// `ShelfAccount`（供报工台预览图纸），本端点自己再收一道 —— 零件维度的嵌套列表端点
-/// 不在放开范围内，理由见 `part_file/mod.rs` 模块 doc 的角色矩阵一节。
+/// 不在放开范围内，理由见 `part_file/mod.rs` 模块 doc 的端点守卫矩阵一节。
 ///
 /// 2026-09-29 修复：兼容 nest 移除，统一走 canonical 第二入口。
 pub async fn list_part_cnc_programs(
@@ -563,7 +563,7 @@ pub async fn list_part_cnc_programs(
 /// `GET /api/v2/part-files/parts/{part_id}/setup-sheets` —— 列出 part 下 SETUP_SHEET 文件。
 ///
 /// 权限：**handler 级** 4 角色（M / C / I / CNC），与同 nest 的 `/cnc-programs` 逐字相同
-/// （理由同上，见 `part_file/mod.rs` 模块 doc 的角色矩阵一节）。
+/// （理由同上，见 `part_file/mod.rs` 模块 doc 的端点守卫矩阵一节）。
 ///
 /// 2026-09-29 修复：兼容 nest 移除，统一走 canonical 第二入口。
 pub async fn list_part_setup_sheets(

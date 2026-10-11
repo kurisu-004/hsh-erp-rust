@@ -5,9 +5,9 @@
 //! 上的第一个落地。
 //!
 //! ## 为什么砍掉 `LoginResponse` 的 4 个字段
-//! 旧实现直接返回 `iam::vo::LoginResponse`，即
+//! iam 的 `LoginResponse` 是
 //! `{token, refresh_token, user{id, username, full_name, is_active, roles,
-//! shelf_ids, menus}}`。小程序侧真源 `wx-app/miniprogram/services/auth.ts` 的
+//! permissions, shelf_ids, menus}}`。小程序侧真源 `wx-app/miniprogram/services/auth.ts` 的
 //! `applyLoginResponse` 只读 **6 个**字段：
 //!
 //! | 字段 | 小程序是否读 | 处置 |
@@ -17,9 +17,10 @@
 //! | `user.is_active` | ❌ 停用账号在登录那一刻就被 `login_by_user_id` 40101 拒了，登录成功后该字段恒为 `true` | **删** |
 //! | `user.shelf_ids` | ❌ 货架范围是 Web 端权限模型（`SHELF_ACCOUNT` 账号 scope），小程序不做货架作业 | **删** |
 //! | `user.menus` | ❌ 小程序导航写死在页面路由里，不吃菜单树 | **删** |
+//! | `user.permissions` | ❌ 权限点是 Web 端 `hasPermission` 的输入，小程序无权限闸门 | **删** |
 //!
-//! 三个删掉的字段恰好是「Web 端权限模型的三件套」，对小程序既无消费方又是**多余负载**
-//! （`menus` 是整棵菜单树）。
+//! 删掉的 4 个字段对小程序既无消费方又是**多余负载**：`is_active` 恒 `true`、
+//! `shelf_ids` 属 Web 端货架范围、`menus` 是整棵菜单树、`permissions` 是权限点全集。
 //!
 //! ⚠️ 字段名保持 `snake_case`（`refresh_token` / `full_name` / `roles`），**不**做
 //! camelCase 改写 —— 前端 `applyLoginResponse` 逐字读这几个键，改名即打断登录态。

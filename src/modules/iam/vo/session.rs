@@ -4,7 +4,7 @@ use serde::Serialize;
 
 use super::menu::MenuNodeOut;
 
-/// `/iam/me` 出参：当前用户 + 扁平角色名 + 可访问货架 + 菜单树
+/// `/iam/me` 出参：当前用户 + 扁平角色名 + 权限点 code 全集 + 可访问货架 + 菜单树
 #[derive(Debug, Clone, Serialize)]
 pub struct CurrentUserOut {
     #[serde(serialize_with = "crate::shared::types::serialize_i64")]
@@ -13,6 +13,10 @@ pub struct CurrentUserOut {
     pub full_name: String,
     pub is_active: bool,
     pub roles: Vec<String>,
+    /// 权限点 code 全集（2026-10-14 新增，与 `roles` / `menus` 并列的账号能力视图；
+    /// 前端 `hasPermission` 的输入）。ADMIN 恒空 vec —— 通配在
+    /// `require_permission` 代码里，不靠数据。
+    pub permissions: Vec<String>,
     pub shelf_ids: Vec<String>,
     pub menus: Vec<MenuNodeOut>,
 }

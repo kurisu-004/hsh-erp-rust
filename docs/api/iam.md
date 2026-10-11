@@ -134,6 +134,7 @@
 | `id` | string | `t_user.id` | i64 → string |
 | `username` / `full_name` / `is_active` | string / string / boolean | `t_user` | 与 `UserOut` 同源 |
 | `roles` | string[] | `t_user_role.role` | 大写；未知值 warn 后**跳过**（宁可不识别也不 panic） |
+| `permissions` | string[] | `t_role_permission` 按用户全部角色 code 联查 | 权限点 code 全集（前端 `hasPermission` 的输入）；ADMIN 恒 `[]`（通配在代码里） |
 | `shelf_ids` | string[] | SHELF_ACCOUNT 行的 `scope_id` | 只保留**货架 active 且 zone ∈ 白名单**的；i64 → string |
 | `menus` | `MenuNodeOut[]` | `t_menu` JOIN `t_role_menu` | 已组树（见 §2.6） |
 
@@ -445,7 +446,8 @@ ADMIN 用户由元角色通配天然放行（见 §9.3）。
   `frontend/src/utils/deliveryNotePermissions.ts::canPrint` 的放行集合登记，供前端
   按钮显隐使用。
 - 权限装载：登录 / `/iam/refresh` 时按用户**全部角色 code**（含自定义）联查
-  `t_role_permission`，写进 Redis session 缓存；改授权靠踢持有者下线生效（§9.4）。
+  `t_role_permission`，写进 Redis session 缓存；`/iam/me` 按同一规则从 DB 重查并直接出参
+  （不改写缓存）；改授权靠踢持有者下线生效（§9.4）。
 
 ### 9.3 ADMIN 是元角色
 
@@ -513,7 +515,7 @@ ADMIN 用户由元角色通配天然放行（见 §9.3）。
 | 40400 | `NOT_FOUND` | 404 | 角色 id 不存在（含软删） |
 | 20605 | `BIZ_USER_ROLE_NOT_FOUND` | 404 | 撤销的角色行不存在或不属于该用户 |
 | 40901 | `VERSION_CONFLICT` | 409 | 角色 / grants 的 OCC 冲突（共用 `t_role.version`） |
-| 40001 | `VALIDATION_ERROR` | 422 | 入参形态错（code 超长 / 非大写、未知或已停用的菜单码 / 权限码、非 SHELF 角色带 scope……；重复码走 40000） |
+| 40001 | `VALIDATION_ERROR` | 422 | 入参形态错（code 归一为大写后长度或字符集不合规、未知或已停用的菜单码 / 权限码、非 SHELF 角色带 scope……；重复码走 40000） |
 
 已知偏差：登录要求用户至少有一个**启用中且枚举可识别**的角色（`login` /
 `refresh` 对「枚举角色为空」的用户返 `20606 BIZ_USER_NO_ROLE`；停用角色在解析时

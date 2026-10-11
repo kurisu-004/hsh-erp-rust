@@ -388,9 +388,10 @@ async fn me_happy_returns_current_user_out() {
     mock_repo
         .expect_list_active_menus_by_roles()
         .returning(|_| Ok(vec![]));
+    // 2026-10-14：me 也装载 permissions（非空值钉住「查出即出参」）
     mock_repo
         .expect_list_permission_codes_by_roles()
-        .returning(|_| Ok(vec![]));
+        .returning(|_| Ok(vec!["part.drawing.print".to_string()]));
     let mock_session = MockSessionStore::new();
     let svc = make_session_service(mock_session);
     let current = crate::auth::rbac::CurrentUser {
@@ -409,6 +410,11 @@ async fn me_happy_returns_current_user_out() {
     assert_eq!(out.id, 42);
     assert_eq!(out.username, "alice");
     assert_eq!(out.roles, vec!["MANAGER"]);
+    assert_eq!(
+        out.permissions,
+        vec!["part.drawing.print".to_string()],
+        "me 必须回 DB 重查的 permissions（不读 CurrentUser 里的 stale 副本）"
+    );
 }
 
 // ===========================================================================
@@ -683,7 +689,7 @@ async fn complete_refresh_happy_writes_sessions() {
         user: u.clone(),
         roles: vec![Role::Manager],
         role_codes: vec!["MANAGER".to_string()],
-        permissions: vec![],
+        permissions: vec!["part.drawing.print".to_string()],
         shelf_ids: vec![],
         shelf_wildcard: false,
         menus,
@@ -711,6 +717,12 @@ async fn complete_refresh_happy_writes_sessions() {
     assert_eq!(out.user.id, 42);
     assert!(!out.token.is_empty());
     assert!(!out.refresh_token.is_empty());
+    // 2026-10-14：refresh 出参同样带 permissions（与登录同形）
+    assert_eq!(
+        out.user.permissions,
+        vec!["part.drawing.print".to_string()],
+        "complete_refresh 必须把 pending.permissions 透进出参"
+    );
 }
 
 #[tokio::test]
