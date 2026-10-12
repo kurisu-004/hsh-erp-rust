@@ -326,7 +326,7 @@
 //!   （6 → 8 → 实际 9），正是因为它是纯手工的散文、没有编译期抓手
 //! - `model.rs` —— `TFilePreview` 行结构
 //! - `service.rs` —— 状态机 + seed 推导 + URL 拼接 + python 转发
-//! - `dto.rs` —— `PreviewOut` 出参
+//! - `dto.rs` —— `PreviewOut` 出参 + `PreviewQuery` / `PreviewSize`（`size` 档位解析）
 
 pub mod dto;
 pub mod model;

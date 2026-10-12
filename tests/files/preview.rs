@@ -5,13 +5,12 @@
 //!
 //! ## 覆盖场景：**33 个测试函数**（2026-10-12 新增 3 条后逐函数点数）
 //!
-//! 拆开是 **24 个编号函数**（下表 22 个编号条目，其中 #18 一条覆盖 2 个函数）
-//! + **9 条不编号护栏**。
+//! 拆开是 **24 个编号函数**（下表 23 个编号条目，含 8b；其中 #18 一条覆盖 2 个
+//! 函数）+ **9 条不编号护栏**。
 //!
-//! ⚠️ 本节的数字是纯手工维护的散文，历轮多次互相打架（写了「20 + 6」/「6 条但列了
-//! 8 条」/「20 + 4」，以及 21+8=29 与「编号小计 22」并存）⇒ **改本文件时必须
-//! 逐函数点数核对**，按「编号条目 / 实际函数」两栏分开写，避免「一个条目两个函数」
-//! 的歧义。2026-10-12（`size` 档位 + 配方版本）后的真值：**33**。
+//! ⚠️ 本节的数字是纯手工维护的散文 ⇒ **改本文件时必须逐函数点数核对**，按
+//! 「编号条目 / 实际函数」两栏分开写，避免「一个条目两个函数」的歧义。
+//! 2026-10-12（`size` 档位 + 配方版本）后的真值：**33**。
 //!
 //! | # | 用例（⚠️ 一条可含多个函数） | 函数数 | 断言要点 |
 //! |---|---|---:|---|
@@ -45,7 +44,8 @@
 //!   （见下节）
 //! - `preview_urls_shape_is_stable` —— `preview_urls` 纯函数断言
 //! - `preview_urls_appends_image_params_when_present` —— `image_params` 追加规则
-//!   （`?` / 已有 `?` 用 `&` / 空白不追加；2026-10-12 新增）
+//!   （`?` / 已有 `?` 时用 `&` 仅为防第二个 `?` 的**畸形防御** / 空白不追加；
+//!   2026-10-12 新增）
 //! - `parse_ci_status_word_table_is_exhaustive` —— **跨仓 CI 终态词表的表驱动断言**
 //!   （review 第 1 轮新增；含 `NotExist` / `Pause` / `Cancel` 与大小写别名）
 //! - `submit_request_body_matches_python_schema` —— **跨仓请求体契约**
@@ -2071,9 +2071,11 @@ fn preview_urls_shape_is_stable() {
 /// `preview_urls` 的 `image_params` 追加规则（2026-10-12 新增 `size` 档位的落点）。
 ///
 /// 三个方向各一条：非空追加（`?`）、base 已含 `?` 时用 `&`、空白参数不追加。
-/// ⚠️ 「base 含 `?`」是**低成本防御**：正常形态下 `COS_PREVIEW_BASE_URL` 不带
-/// query（`env_or_non_empty` 不做语法校验），但拼出 `...jpg?eo-img.resize=...`
-/// 之前先确认一次连接符，比事后排查「URL 里两个 `?`」便宜。
+/// ⚠️ 「base 含 `?`」是**畸形防御**、不是支持形态：正常形态下
+/// `COS_PREVIEW_BASE_URL` 是不带 query 的站点根（`env_or_non_empty` 只判非空、
+/// 不做语法校验）；这一支只保证「base 被配错时 URL 里不出现第二个 `?`」，
+/// 带 query 的 base 本身并不好使 —— 对象路径会落进 base 的 query，请求打到的是
+/// 站点根而非图片。
 #[test]
 fn preview_urls_appends_image_params_when_present() {
     // ① 非空参数 ⇒ 每条 URL 追加 `?{params}`
@@ -2092,7 +2094,8 @@ fn preview_urls_appends_image_params_when_present() {
         ]
     );
 
-    // ② base 已含 `?`（带 query 的站点根）⇒ 用 `&` 连接，不得出现第二个 `?`
+    // ② base 已含 `?`（配置错误的畸形输入）⇒ 仅防「两个 ?」，用 `&` 连接；
+    //    这不代表带 query 的 base 可用（对象路径落进 query，请求打到站点根）
     let urls = PreviewService::preview_urls(
         "https://cdn.example.com/?v=2",
         "previews",
@@ -2103,7 +2106,7 @@ fn preview_urls_appends_image_params_when_present() {
     assert_eq!(
         urls,
         vec!["https://cdn.example.com/?v=2/previews/abc/p1.jpg&eo-img.resize=w/480".to_string()],
-        "base 含 ? 必须用 & 连接"
+        "畸形防御：base 含 ? 时用 & 连接，不得拼出第二个 ?"
     );
     assert_eq!(
         urls[0].matches('?').count(),
