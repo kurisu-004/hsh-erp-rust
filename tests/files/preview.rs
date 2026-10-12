@@ -1667,8 +1667,9 @@ async fn claim_submit_predicate_admits_exactly_one_concurrent_claimer() {
 ///
 /// pydantic v2 默认 `extra="ignore"` ⇒ 本仓多发的 `preview_prefix` / `preview_seed`
 /// 被**静默丢弃**，而必填的 `dst_prefix` 缺失 ⇒ FastAPI **422** ⇒ `parse_envelope`
-/// 立刻 21118/502。行永远停在 `PENDING / ci_job_id IS NULL`，2s 后重试、再失败 ——
-/// **既烧不出图，也不报成「CI 失败」**（压根没到 CI）。
+/// 立刻 21118/502。行永远停在 `PENDING / ci_job_id IS NULL`，一个节流间隔（缺省 2s，
+/// 可经 env `PREVIEW_POLL_BACKOFF_SECONDS` 配 1..=5）后重试、再失败 ——
+/// **既烧不出图，也不报成「CI 失败」**（因为压根没到 CI）。
 ///
 /// 断言方式刻意是 **`withf` + 键集合等值**，而不是「断言某个键存在」：后者挡不住
 /// 「多发一个键」这个方向，而多发键正是本轮的实际故障。

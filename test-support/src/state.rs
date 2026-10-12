@@ -247,9 +247,6 @@ pub async fn test_state_with_hs256_fallback_off(pool: PgPool) -> Arc<AppState> {
             allow_hs256_fallback: false,
             ..old_cfg.jwt.clone()
         },
-        // 2026-10-13 新增字段：与 `test_state_with_redis` 的缺省同值显式写出，
-        // 让本 fixture「只改 jwt 段」这句话在字段层面可核对。
-        preview_poll_backoff_seconds: 2,
         ..old_cfg
     });
     state_inner.config = new_cfg;
@@ -610,9 +607,6 @@ pub async fn test_state_with_wecom(
             enabled: !corp_id.is_empty(),
             ..WeComConfig::default()
         },
-        // 2026-10-13 新增字段：与 `test_state_with_redis` 的缺省同值显式写出
-        // （本 fixture 只改 wecom 段）。
-        preview_poll_backoff_seconds: 2,
         ..old_cfg
     });
     state_inner.config = new_cfg;

@@ -1041,7 +1041,8 @@ pub const PREVIEW_POLL_BACKOFF_MAX_SECONDS: i64 = 5;
 /// 零 IO，拆开后单测直接喂字面量即可确定性地覆盖边界。
 ///
 /// ⚠️ `env_parse` 对「变量存在但为空串」会解析失败（启动报错）—— 这是有意的、
-/// 与其它数值变量同款；compose 已给缺省 2，`.env` / `.env.example` 里**不可留空**。
+/// 与其它数值变量同款；本变量由根仓 compose 透传并给缺省 2（同批编排改动，根仓
+/// 单列提交），不经 compose 裸跑时由代码缺省 2 兜底。`.env` / `.env.example` 里**不可留空**。
 fn preview_poll_backoff_config() -> Result<i64> {
     let v = env_parse(
         "PREVIEW_POLL_BACKOFF_SECONDS",
