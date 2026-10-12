@@ -79,6 +79,11 @@ pub const POLL_BACKOFF_MAX_SECONDS: i64 = 5;
 ///
 /// CI 失败原因可能被截断到 500 字符 —— 只回显给前端、不含栈，超长不影响排查
 /// （日志侧另有 `tracing::warn!` 打全量）。
+///
+/// ⚠️ **2026-10-14 起它也是「上游信封消息」的上限**，不只服务 `error_message` 列：
+/// [`PreviewService::upstream_detail`] 摘 python 响应体的 `message`（或 body 片段）
+/// 时复用同一个常量与同一个截断函数 —— **一个 500 字预算、两条使用路径**，避免
+/// 出现「DB 侧截 500、日志侧不截」这种同源信息两个量纲的漂移。
 pub const ERROR_MESSAGE_MAX_CHARS: usize = 500;
 
 /// `preview_seed` 的十六进制长度（32 位 = sha256 的前 16 字节 = 128 bit）。
@@ -556,8 +561,14 @@ impl PreviewService {
         )
     }
 
-    /// `error_message` 截断到列宽（按 **字符**边界，不是字节 —— 避免把多字节字符
+    /// 截断到 [`ERROR_MESSAGE_MAX_CHARS`]（按 **字符**边界，不是字节 —— 避免把多字节字符
     /// 切成非法 UTF-8 而让 PG 拒写）。
+    ///
+    /// ⚠️ 两个调用点、两种载荷：① CI 终态失败的中文原因短语（落
+    /// `t_file_preview.error_message`，列宽 varchar(500)）；② 上游响应的 `message`
+    /// 或 body 片段（落 21118 的 `AppError.message`，见 [`Self::upstream_detail`]）。
+    /// ② 之所以也要截：python 侧只保证自己的 body 可读、不保证长度，而本条 message
+    /// 会**进 HTTP 响应信封**（`AppError::biz` ⇒ `into_response`），不能让它无界。
     fn truncate_error(msg: Option<&str>) -> String {
         let raw = msg.unwrap_or("CI 未给出失败原因");
         if raw.chars().count() <= ERROR_MESSAGE_MAX_CHARS {
@@ -730,11 +741,65 @@ impl PreviewService {
         CiStatus::Running
     }
 
+    /// 从上游非 2xx 响应体里摘出可读原因，拼成 `": msg"` 或 `" body=…"` 后缀。
+    ///
+    /// ## ⚠️ 为什么需要它（2026-10-14 修的一个真实排障黑洞）
+    ///
+    /// python 侧把 CI 的真因放在**响应体的 `message` 字段**里（`core/ci.py` 的
+    /// `_describe_ci_error` 会把 `code=… msg=… status=…` 全部拼进去）。而本模块
+    /// 此前在非 2xx 分支**只写状态码、把 body 整个丢弃**，python 侧自己也不打日志
+    /// ⇒ **两端同时丢弃** ⇒ 排障现场只剩一行
+    /// `CI 预览任务提交失败 … error=[21118] CI submit 返回 HTTP 502`，
+    /// 502 是「python 打 CI 失败」的统称，它**不区分**「桶未开通文档预览」/
+    /// 「源对象不存在」/「网络不通」/「CI 参数被拒」四种完全不同的根因。
+    /// 同一个函数的 `code != 0` 分支**带** `msg`、非 2xx 分支不带，本身也是不对称。
+    ///
+    /// ## 形态（与 python `_describe_ci_error` 同款取舍）
+    ///
+    /// | body | 后缀 |
+    /// |---|---|
+    /// | JSON 且 `message` 是非空串 | `": {message}"` |
+    /// | 非 JSON / 无该键 / 空串，但 body 非空 | `" body={片段}"`（压平空白后截断） |
+    /// | 空 body | `""` —— 与本函数改动前**逐字一致** |
+    ///
+    /// ⚠️ **第三行是刻意的不变式**：body 为空时不能凭空造一句话，那只会让日志
+    /// 变长而不变好排查。有信息才加后缀。
+    ///
+    /// ⚠️ 片段要**压平空白**：body 可能是一整个 HTML 错误页（网关 502），逐字塞进
+    /// 单行日志会把整页糊进去；压平后仍超长的由 [`Self::truncate_error`] 截断。
+    fn upstream_detail(body: &axum::body::Bytes) -> String {
+        // 刻意写成一条链而不是嵌套 `if let`：既避开 `clippy::collapsible_if`，
+        // 也让「唯一的失败理由是 message 缺失/为空」这件事在一行里说完。
+        let envelope_msg = serde_json::from_slice::<Value>(body).ok().and_then(|v| {
+            v.get("message")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(str::to_string)
+        });
+        if let Some(m) = envelope_msg {
+            return format!(": {}", Self::truncate_error(Some(&m)));
+        }
+        let flat: String = String::from_utf8_lossy(body)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if flat.is_empty() {
+            return String::new();
+        }
+        format!(" body={}", Self::truncate_error(Some(&flat)))
+    }
+
     /// 解 python 信封 `{code, message, data}` 并取出 `data`。
     ///
     /// 非 2xx 或 `code != 0` ⇒ 21118（打 python / CI 失败）。⚠️ **不看 python 的
     /// 业务码是什么**：那套码属于送货单 / 打印语义，与预览无关，统一映射成 21118
     /// 才不会让前端拿到一个它不认识的码。
+    ///
+    /// ⚠️ **两条错误分支都要带出上游原因**（2026-10-14 修）：非 2xx 走
+    /// [`Self::upstream_detail`] 摘 body 的 `message`，`code != 0` 直接带 `msg`
+    /// —— 而 python 的 CI 失败是**抛 `BizError(http_status=502)`**，走的正是前者。
+    /// 只修后者等于没修（这是本函数曾经的状态）。
     fn parse_envelope(
         body: &axum::body::Bytes,
         status: &axum::http::StatusCode,
@@ -743,7 +808,11 @@ impl PreviewService {
         if !status.is_success() {
             return Err(AppError::biz(
                 code::BIZ_PART_FILE_PREVIEW_FORWARD_FAILED,
-                format!("CI {what} 返回 HTTP {}", status.as_u16()),
+                format!(
+                    "CI {what} 返回 HTTP {}{}",
+                    status.as_u16(),
+                    Self::upstream_detail(body),
+                ),
             ));
         }
         let v: Value = serde_json::from_slice(body).map_err(|e| {
@@ -835,4 +904,152 @@ struct CiDescribe {
     status: CiStatus,
     page_count: i32,
     message: Option<String>,
+}
+
+/// `parse_envelope` / `upstream_detail` 的单测。
+///
+/// ⚠️ **这组用例的存在理由是一个真实故障**（2026-10-14）：CI 预览提交持续 502，
+/// 而 rust 侧日志只有 `error=[21118] CI submit 返回 HTTP 502` —— 非 2xx 分支把
+/// body 整个丢弃，python 又不打日志，两端同时把真因扔了。故第一条用例钉的就是
+/// 「python 把 CI 真因放在 body 的 `message` 里时，它必须出现在我们的错误消息里」。
+///
+/// ⚠️ 全部**不碰 DB、不发 HTTP**（纯函数），故可在无库/无网环境跑：
+/// `SQLX_OFFLINE=true cargo test --lib preview`。
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Bytes;
+    use axum::http::StatusCode;
+
+    /// python 的统一信封（`R.fail` 的形状：`{code, message, data}`）。
+    fn envelope(code: i64, message: &str) -> Bytes {
+        Bytes::from(
+            serde_json::to_vec(&json!({"code": code, "message": message, "data": null})).unwrap(),
+        )
+    }
+
+    // ---------------------------------------------------------------
+    // upstream_detail：body 的四种形态
+    // ---------------------------------------------------------------
+
+    /// ★ 本次故障的回归本体：python 把 CI 真因放进 `message`，我们必须摘出来。
+    #[test]
+    fn upstream_detail_prefers_envelope_message() {
+        let body = envelope(
+            20404,
+            "CI 提交转码任务失败: code=AccessDenied msg=CI is not enabled for this bucket status=403",
+        );
+        let d = PreviewService::upstream_detail(&body);
+        assert!(
+            d.starts_with(": "),
+            "拿到结构化 message 时后缀必须是 `: msg`，实际 {d:?}"
+        );
+        assert!(d.contains("AccessDenied"), "CI 错误码必须可见：{d}");
+        assert!(d.contains("status=403"), "CI HTTP 状态必须可见：{d}");
+    }
+
+    /// body 不是 JSON（网关 502 的 HTML 页）⇒ 退回片段，且**必须压平空白**：
+    /// 逐字塞进单行日志会把整页糊进去。
+    #[test]
+    fn upstream_detail_falls_back_to_flattened_body_snippet() {
+        let body = Bytes::from_static(b"<html>\n  <body>\n    502 Bad Gateway\n  </body>\n</html>");
+        let d = PreviewService::upstream_detail(&body);
+        assert!(d.starts_with(" body="), "非 JSON 应走片段：{d:?}");
+        assert!(d.contains("502 Bad Gateway"), "片段要含关键信息：{d}");
+        assert!(
+            !d.contains('\n'),
+            "片段必须压平空白，否则单行日志被整页撑开：{d:?}"
+        );
+    }
+
+    /// JSON 但 `message` 为空串 / 缺该键 ⇒ 仍退回片段（不能返回「无信息」的裸 502）。
+    #[test]
+    fn upstream_detail_falls_back_when_message_blank_or_absent() {
+        for body in [
+            envelope(20404, ""),
+            envelope(20404, "   "),
+            Bytes::from_static(br#"{"code":20404}"#),
+        ] {
+            let d = PreviewService::upstream_detail(&body);
+            assert!(
+                !d.is_empty(),
+                "body 里还有 code 等信息，不该返回空后缀：{body:?}"
+            );
+            assert!(d.contains("20404"), "片段至少要带出信封的 code：{d}");
+        }
+    }
+
+    /// ⚠️ **不变式**：空 body ⇒ 后缀为空串，消息与本函数改动前**逐字一致**。
+    /// 不能凭空造一句话 —— 那只会让日志变长而不变好排查。
+    #[test]
+    fn upstream_detail_empty_body_is_no_suffix() {
+        assert_eq!(PreviewService::upstream_detail(&Bytes::new()), "");
+        assert_eq!(
+            PreviewService::upstream_detail(&Bytes::from_static(b"   \n ")),
+            ""
+        );
+    }
+
+    /// 截断走**字符**边界（不是字节）：超长中文不能被切成非法 UTF-8
+    /// （它会进响应信封，也进日志）。
+    #[test]
+    fn upstream_detail_truncates_multibyte_on_char_boundary() {
+        let long = "错".repeat(ERROR_MESSAGE_MAX_CHARS + 200);
+        let d = PreviewService::upstream_detail(&envelope(20404, &long));
+        let payload = d.strip_prefix(": ").expect("应走 message 分支");
+        assert_eq!(
+            payload.chars().count(),
+            ERROR_MESSAGE_MAX_CHARS,
+            "截断后应恰好等于预算（{} + \"...\"）",
+            ERROR_MESSAGE_MAX_CHARS
+        );
+        assert!(payload.ends_with("..."), "截断标记：{payload}");
+        assert!(
+            !payload.contains('\u{FFFD}'),
+            "不得出现替换字符（说明按字节切了多字节字符）"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // parse_envelope：两条错误分支都不得再丢上游信息
+    // ---------------------------------------------------------------
+
+    /// 非 2xx（python 的 CI 失败就是 `BizError(http_status=502)`）⇒ 21118 + 真因。
+    #[test]
+    fn parse_envelope_non_2xx_keeps_upstream_reason() {
+        let err = PreviewService::parse_envelope(
+            &envelope(20404, "CI 提交转码任务失败: code=NoSuchKey status=404"),
+            &StatusCode::BAD_GATEWAY,
+            "submit",
+        )
+        .expect_err("非 2xx 必须报错");
+        assert_eq!(err.code(), code::BIZ_PART_FILE_PREVIEW_FORWARD_FAILED);
+        assert_eq!(err.http_status(), StatusCode::BAD_GATEWAY);
+        let s = err.to_string();
+        assert!(s.contains("HTTP 502"), "状态码仍在：{s}");
+        assert!(s.contains("NoSuchKey"), "★ 上游真因必须出现在错误里：{s}");
+    }
+
+    /// ⚠️ 钉住另一条分支的现行为（它本来就带 `msg`）：修非 2xx 时**不能**把它改坏。
+    #[test]
+    fn parse_envelope_business_code_branch_still_carries_message() {
+        let err = PreviewService::parse_envelope(
+            &envelope(20404, "CI 返回业务错误原因"),
+            &StatusCode::OK,
+            "describe",
+        )
+        .expect_err("code != 0 必须报错");
+        assert_eq!(err.code(), code::BIZ_PART_FILE_PREVIEW_FORWARD_FAILED);
+        let s = err.to_string();
+        assert!(s.contains("20404"), "{s}");
+        assert!(s.contains("CI 返回业务错误原因"), "{s}");
+    }
+
+    /// 2xx + `code == 0` ⇒ 照旧只取 `data`（守住本次改动没碰成功路径）。
+    #[test]
+    fn parse_envelope_success_returns_data() {
+        let v = PreviewService::parse_envelope(&envelope(0, "ok"), &StatusCode::OK, "submit")
+            .expect("2xx + code 0 必须成功");
+        assert!(v.is_null(), "data 为 null 时原样返回 null：{v}");
+    }
 }

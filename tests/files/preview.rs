@@ -21,7 +21,8 @@
 //! | 5 | `pending_not_due_returns_pending_without_python` | 1 | 未到期 → 直接 PENDING（**不打 python**） |
 //! | 6 | `pending_due_describe_success_marks_ready` | 1 | 到期 + Success → READY + `pages.len() == total_page_count` + URL 逐条正确 |
 //! | 7 | `describe_failed_returns_21117` | 1 | Failed → 21117 / HTTP 502 |
-//! | 8 | `submit_forward_failure_returns_21118` | 1 | 提交失败 → 21118 / HTTP 502（且**归还认领**，`ci_job_id` 回 NULL） |
+//! | 8 | `submit_forward_failure_returns_21118` | 1 | 提交失败（**传输层 Err**）→ 21118 / HTTP 502（且**归还认领**，`ci_job_id` 回 NULL） |
+//! | 8b | `submit_upstream_502_propagates_ci_reason` | 1 | 上游返 **HTTP 502 + 信封真因** → 21118，且**错误消息含 `code=/status=`**（此前被整个丢弃，2026-10-14 回归） |
 //! | 9 | `non_pdf_and_non_drawing_kind_return_21116` | 1 | 3D_MODEL / 非 PDF → 21116 / HTTP 400 |
 //! | 10 | `concurrent_misses_submit_only_one_job` | 1 | 并发两次 **首次登记** → 只提交 1 个 job（唯一索引闸门） |
 //! | 11 | `failed_state_restarts_on_next_call` | 1 | FAILED → 下次调用自愈重启为 PENDING |
@@ -34,7 +35,7 @@
 //! | 18 | `describe_prefers_state_key_over_status` + `describe_reads_status_key_as_well` | **2** | 状态字段名 `state`（python 真源，**优先**）/ `status`（兜底）两支都认 |
 //! | 19 | `concurrent_due_retries_submit_only_one_job` | 1 | **路径 A**：行已存在 + 到期 + 无 job id ⇒ 并发**只提交 1 个**（条件 UPDATE 认领闸门） |
 //! | 20 | `failed_heal_losing_racer_does_not_submit_again` | 1 | **路径 B**：自愈输家（`reset_to_pending` 得 0 行）**不再提交** |
-//! | | **编号小计** | **21** | |
+//! | | **编号小计** | **22** | |
 //!
 //! 另有 **8 条护栏**（不编号）：
 //! - `preview_route_is_not_swallowed_by_sibling_catch_alls` —— **matchit 冲突的实测**
@@ -181,6 +182,23 @@ fn ci_ok(data: Value) -> PyBackendResponse {
     headers.insert("content-type", "application/json".parse().unwrap());
     PyBackendResponse {
         status: StatusCode::OK,
+        headers,
+        body: Bytes::from(serde_json::to_vec(&body).unwrap()),
+    }
+}
+
+/// 造 python 侧的 **CI 失败**响应：`status` 非 2xx + 信封里带真因。
+///
+/// ⚠️ 形状必须与真实一致：python 的 `core/ci.py` 把 CI 失败抛成
+/// `BizError(code=20404, http_status=502)`，而 `biz_error_handler` 会把它装进
+/// **HTTP 502 + `{code, message, data}`** 信封返回 —— 也就是说**真因在响应体里、
+/// 状态码只是 502**。这不是随手编的形态，是场景 8b 要钉的那条链路。
+fn ci_failed(status: StatusCode, code: i64, message: &str) -> PyBackendResponse {
+    let body = json!({"code": code, "message": message, "data": null});
+    let mut headers = HeaderMap::new();
+    headers.insert("content-type", "application/json".parse().unwrap());
+    PyBackendResponse {
+        status,
         headers,
         body: Bytes::from(serde_json::to_vec(&body).unwrap()),
     }
@@ -593,6 +611,77 @@ async fn submit_forward_failure_returns_21118() {
         state_s, "PENDING",
         "「提交失败」不是 CI 终态，行必须保持 PENDING 以便自愈"
     );
+    assert_eq!(job_id, None, "未拿到 job id");
+}
+
+// ===========================================================================
+//  8b：上游 502 时，**真因必须出现在错误消息里**（2026-10-14 回归）
+// ===========================================================================
+
+/// 场景 8b：python 返回 **HTTP 502 + 信封里带 CI 真因** ⇒ 21118，且**错误消息
+/// 必须含真因**。
+///
+/// ## 这条钉的是一个真实故障
+///
+/// 现象：预览恒 502，日志只有一行
+/// `CI 预览任务提交失败 … error=[21118] CI submit 返回 HTTP 502` —— 一个光秃秃的
+/// 状态码。根因是**两端同时丢弃信息**：python 的 `biz_error_handler` 不打日志，
+/// 而 rust `parse_envelope` 的非 2xx 分支此前**只写状态码、把 body 整个丢掉**。
+/// 而真因（`code=… msg=… status=…`）恰恰就在 body 的 `message` 字段里。
+///
+/// ⚠️ **与场景 8 的区别不是「失败 vs 不失败」，而是「有没有 body」**：
+/// 场景 8 mock 的是**传输层 `Err`**（压根没 HTTP 响应），本条 mock 的是
+/// **真实形状的 HTTP 502 响应** —— 只有后者能证明「上游说了什么，我们看得见」。
+///
+/// ⚠️ 断言打在 `err.to_string()` 而不是 HTTP 响应体上：消息进响应信封这一步由
+/// `shared::error::tests::biz_with_status_renders_in_response` 覆盖（那里断言了
+/// message 出现在 `into_response()` 的 body 里），此处只管「消息里有真因」。
+#[tokio::test]
+async fn submit_upstream_502_propagates_ci_reason() {
+    let pool = test_pool().await;
+    let file_id = insert_part_file(&pool, "DRAWING", "PDF", "fwd.pdf", Some(&"f".repeat(64))).await;
+    let file = fetch_row(&pool, file_id).await;
+    let seed = PreviewService::preview_seed(&file);
+
+    let mut mock = MockPyBackendClient::new();
+    mock.expect_forward_ci_submit()
+        .times(1)
+        .returning(|_b, _h| {
+            // 逐字复刻 python `core/ci.py::_describe_ci_error` 的产出格式
+            Ok(ci_failed(
+                StatusCode::BAD_GATEWAY,
+                20404,
+                "CI 提交转码任务失败: code=AccessDenied msg=CI is not enabled for this bucket status=403",
+            ))
+        });
+    mock.expect_forward_ci_describe().never();
+
+    let mut state = test_state(pool.clone()).await;
+    let _app = app_with_mock(&mut state, mock);
+
+    let err = PreviewService::new(shared_test_snowflake().clone())
+        .get_preview(
+            &pool,
+            &state.py_backend,
+            PREVIEW_PREFIX,
+            PREVIEW_BASE_URL,
+            &file,
+            &test_user(vec![Role::Manager]),
+        )
+        .await
+        .expect_err("上游 502 必须报错");
+    assert_eq!(err.code(), 21118, "对外码不因本次修复而变");
+    assert_eq!(err.http_status(), StatusCode::BAD_GATEWAY);
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("AccessDenied") && msg.contains("status=403"),
+        "★ 上游 CI 真因必须出现在错误消息里（此前被整个丢弃，只剩 HTTP 502）：{msg}"
+    );
+
+    // 守场景 8 的不变式：提交失败不是 CI 终态，行仍 PENDING / 无 job id / 认领已归还。
+    let (state_s, job_id, _) = read_state(&pool, &seed).await.unwrap();
+    assert_eq!(state_s, "PENDING", "行必须保持 PENDING 以便自愈");
     assert_eq!(job_id, None, "未拿到 job id");
 }
 
