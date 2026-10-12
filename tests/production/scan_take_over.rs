@@ -4,11 +4,14 @@
 //! - happy path：holder worker → worker + 工序 / step 成对推进（**派生**与
 //!   **显式指定**两条分支）、`version + 1`、`status` 仍 `IN_PROCESS`、数量不变；
 //! - 判据顺序与错误码全矩阵（`20201` / `20202` / `20206` → `20109` / `20101` →
-//!   `40901` → `20103` ×2 → `20104` ×2 → `40001` / `20702` → `20904` / `20204`
-//!   → `40300`）；
+//!   `40901` → `20103` ×2 → `20104` ×2 → `40001` → `20904` / `20204` → `40300`）；
 //! - 失败路径**零写入**（holder / version 不变）；
 //! - `t_part_event` 的 `TRANSFERRED` 事件逐字段（含两种 note 形态）；
-//! - **关键回归** `is_repairing` 保持 true（防误用无条件清标记的漏斗）。
+//! - **关键回归** `is_repairing` 保持 true（防误用无条件清标记的漏斗）；
+//! - 2026-10-16 新语义（目标工序改由工种映射推导）：
+//!   **单候选自动推导成功** / **多候选缺省 `40001`** / **零候选 `20104`** /
+//!   **显式传链外工序成功且 step 落 NULL**（最后这条是
+//!   `take_over_explicit_process_not_in_chain_returns_20702` 的反转）。
 //!
 //! ## fixture 复用
 //! 全部从 `super::queue` 借（`bootstrap_as_manager` / `insert_work_type` /
@@ -217,22 +220,29 @@ async fn take_over_derives_next_process_when_pointer_consistent() {
 //  判据顺序 / 错误码矩阵
 // ===========================================================================
 
-/// 推导不出下一道（指针漂移 + 无链）且未传 `next_process_id` → `40001`（零写入）；
+/// 链不可推导 + **工种有多道候选**且未传 `next_process_id` → `40001`（零写入）；
 /// 补上显式 `next_process_id` 后成功，且**无链时 step 可为 NULL**。
+///
+/// ⚠️ 2026-10-16 调整 fixture：工种映射由 1 道改为 **2 道**。新语义下「链推不出且
+/// 工种只有一道」会由服务端自动推导（成功），本用例要钉的是「**多候选必填**」那条
+/// 分支 —— 改 fixture 而不是回退新语义。两条工序：`proc`（本用例显式传的那道）与
+/// `proc_extra`（只用来把候选数抬到 2，它不在链上、也不参与本用例的断言）。
 #[tokio::test]
 async fn take_over_requires_next_process_id_when_not_consistent() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     // 手写工单形态：part 无链（`with_chain=false`）。
     let customer = insert_customer_l2(&pool, "TO-NOCHAIN").await;
     let proc = seed_process(&pool, "TO-NOCHAIN-P", "无链工序").await;
+    let proc_extra = seed_process(&pool, "TO-NOCHAIN-PX", "候选工序2").await;
     let wt = insert_work_type(&pool, "TO-NOCHAIN-WT", "工种", Some(5)).await;
     link_work_type_to_process(&pool, wt, proc).await;
+    link_work_type_to_process(&pool, wt, proc_extra).await;
     let wt_holder = insert_work_type(&pool, "TO-NOCHAIN-WH", "持有人工种", Some(5)).await;
     let holder = insert_worker(&pool, "TO-NOCHAIN-H", "持有人", Some(wt_holder)).await;
     let _taker = insert_worker(&pool, "TO-NOCHAIN-T", "接管人", Some(wt)).await;
     let (_part, batch, _step) =
         insert_worker_held_part(&pool, customer, "SN-TO-NOCHAIN", holder, proc, 2, false).await;
-    // 指针漂移（NULL）⇒ 非顺应 ⇒ 必须显式指定。
+    // 指针漂移（NULL）⇒ 非顺应 ⇒ 工种候选决定目标工序。
     clear_step_pointer(&pool, batch).await;
 
     let (s, env) = take_over(
@@ -274,14 +284,37 @@ async fn take_over_requires_next_process_id_when_not_consistent() {
     assert_eq!(version, 1);
 }
 
-/// 显式指定的工序**不在链内** → `20702`（即使它也不在工种映射里 —— 钉住
-/// 「链内定位先于工种校验」的判据顺序）。
+/// 显式指定的工序**在该工单的链之外**（但在接管人工种的活跃映射里）→ **成功**，
+/// 且 `current_process_step_id` 落 `NULL`（2026-10-16 新语义）。
+///
+/// ⚠️ 本用例在 2026-10-16 **反转**：此前它钉的是「显式传链外工序 ⇒ `20702`」，而
+/// 产品决策是「跨工序接管是独立路径，不因越链而拒」—— 非同工序内接管时链可能整体
+/// 不适用（无链 / 链已软删 / 链外工序），`current_process_step_id` 是可空列，链上
+/// 没有落点就落 NULL。写侧 `service/transfer.rs` 第 6 步的分支 B / C 因此不再调
+/// `optional_step_id`（那函数越链就抛 `20702`），改用
+/// `resolve_step_id_by_process`（返 `Option` 不抛）。
+///
+/// 所选工序必须在 `t_work_type_process` 里（否则先吃 `20104`，钉不到本用例的语义）
+/// 且不在该 part 的 `t_process_chain_step` 里（链只有 proc1 / proc2）。
 #[tokio::test]
-async fn take_over_explicit_process_not_in_chain_returns_20702() {
+async fn take_over_explicit_process_outside_chain_lands_null_step() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
-    let (part, batch, holder, _taker, _proc2, _step2) =
-        setup_derivable(&pool, "TO-NOTIN", true).await;
+    let customer = insert_customer_l2(&pool, "TO-NOTIN").await;
+    let proc1 = seed_process(&pool, "TO-NOTIN-P1", "链内工序1").await;
+    let proc2 = seed_process(&pool, "TO-NOTIN-P2", "链内工序2").await;
     let proc3 = seed_process(&pool, "TO-NOTIN-P3", "链外工序").await;
+    let wt = insert_work_type(&pool, "TO-NOTIN-WT", "接管工种", Some(5)).await;
+    // 工种映射 proc2（链内）+ proc3（链外）—— 两个候选，确保走到的是「显式分支」
+    // 而不是「单候选自动推导」。
+    link_work_type_to_process(&pool, wt, proc2).await;
+    link_work_type_to_process(&pool, wt, proc3).await;
+    let wt_holder = insert_work_type(&pool, "TO-NOTIN-WH", "持有人工种", Some(5)).await;
+    let holder = insert_worker(&pool, "TO-NOTIN-H", "持有人", Some(wt_holder)).await;
+    let taker = insert_worker(&pool, "TO-NOTIN-T", "接管人", Some(wt)).await;
+    let (part, batch, _step1) =
+        insert_worker_held_part(&pool, customer, "SN-TO-NOTIN", holder, proc1, 3, true).await;
+    let chain = part_chain_id(&pool, part).await.expect("part 应有链");
+    append_chain_step(&pool, chain, proc2, 20).await;
     clear_step_pointer(&pool, batch).await;
     assert!(
         super::queue::part_chain_id(&pool, part).await.is_some(),
@@ -299,15 +332,141 @@ async fn take_over_explicit_process_not_in_chain_returns_20702() {
         }),
     )
     .await;
-    // 20702 在 `status_from_code` 里归「资源缺失」组 ⇒ HTTP 404（与 40001 的 422 一样，
-    // 是集中映射的结果，不要按「业务错一律 400」改写）。
-    assert_eq!(s, StatusCode::NOT_FOUND, "链外工序应 404: {env}");
+    assert_eq!(s, StatusCode::OK, "链外但属工种映射的工序应放行: {env}");
+    assert_eq!(env["data"]["next_process_id"], proc3.to_string());
     assert_eq!(
-        env["code"], 20702,
-        "BIZ_PROCESS_CHAIN_STEP_NOT_FOUND（且必须优先于 20104）: {env}"
+        env["data"]["next_process_step_id"],
+        Value::Null,
+        "工序不在链内 ⇒ step 落 NULL（不是 20702）: {env}"
     );
-    let (_st, _loc, h, _p, _step, version, _q, _r) = read_batch(&pool, batch).await;
-    assert_eq!(h, Some(holder), "20702 必须零写入");
+
+    let (_st, _loc, h, process, step, version, _q, _r) = read_batch(&pool, batch).await;
+    assert_eq!(h, Some(taker), "holder 必须换成接管人");
+    assert_eq!(process, Some(proc3), "目标工序必须落库");
+    assert_eq!(step, None, "链外工序没有链上落点");
+    assert_eq!(version, 1, "OCC 应 +1");
+}
+
+/// 2026-10-16 新语义：链不可推导（无链）+ 工种**只映射一道**工序 ⇒ **不传**
+/// `next_process_id` 也成功（服务端自动推导），落库工序 = 那一道、step 为 NULL。
+#[tokio::test]
+async fn take_over_auto_derives_single_work_type_process() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "TO-AUTO1").await;
+    let proc = seed_process(&pool, "TO-AUTO1-P", "唯一工序").await;
+    let wt = insert_work_type(&pool, "TO-AUTO1-WT", "单工序工种", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let wt_holder = insert_work_type(&pool, "TO-AUTO1-WH", "持有人工种", Some(5)).await;
+    let holder = insert_worker(&pool, "TO-AUTO1-H", "持有人", Some(wt_holder)).await;
+    let taker = insert_worker(&pool, "TO-AUTO1-T", "接管人", Some(wt)).await;
+    let (_part, batch, _step) =
+        insert_worker_held_part(&pool, customer, "SN-TO-AUTO1", holder, proc, 2, false).await;
+    clear_step_pointer(&pool, batch).await;
+
+    let (s, env) = take_over(
+        &app,
+        &token,
+        json!({
+            "batch_id": batch.to_string(),
+            "badge_code": "TO-AUTO1-T",
+            "version": 0,
+        }),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "工种只有一道候选时不必让前端挑工序: {env}"
+    );
+    assert_eq!(env["data"]["next_process_id"], proc.to_string());
+    assert_eq!(env["data"]["next_process_step_id"], Value::Null);
+    assert_eq!(env["data"]["to_worker_id"], taker.to_string());
+
+    let (_st, _loc, h, process, step, version, _q, _r) = read_batch(&pool, batch).await;
+    assert_eq!(h, Some(taker));
+    assert_eq!(process, Some(proc), "自动推导的工序必须落库");
+    assert_eq!(step, None, "无链 ⇒ step 可空");
+    assert_eq!(version, 1);
+}
+
+/// 2026-10-16 新语义：链不可推导 + 工种映射 **2 道**工序 + 未传 `next_process_id`
+/// ⇒ `40001`（HTTP 422，零写入），文案说明「有 N 道工序」。
+#[tokio::test]
+async fn take_over_requires_explicit_when_multiple_candidates() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "TO-MULTI").await;
+    let proc1 = seed_process(&pool, "TO-MULTI-P1", "候选1").await;
+    let proc2 = seed_process(&pool, "TO-MULTI-P2", "候选2").await;
+    let wt = insert_work_type(&pool, "TO-MULTI-WT", "多工序工种", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc1).await;
+    link_work_type_to_process(&pool, wt, proc2).await;
+    let wt_holder = insert_work_type(&pool, "TO-MULTI-WH", "持有人工种", Some(5)).await;
+    let holder = insert_worker(&pool, "TO-MULTI-H", "持有人", Some(wt_holder)).await;
+    let taker = insert_worker(&pool, "TO-MULTI-T", "接管人", Some(wt)).await;
+    let (_part, batch, _step) =
+        insert_worker_held_part(&pool, customer, "SN-TO-MULTI", holder, proc1, 2, false).await;
+    clear_step_pointer(&pool, batch).await;
+
+    let (s, env) = take_over(
+        &app,
+        &token,
+        json!({
+            "batch_id": batch.to_string(),
+            "badge_code": "TO-MULTI-T",
+            "version": 0,
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "多候选必填: {env}");
+    assert_eq!(env["code"], 40001, "VALIDATION_ERROR: {env}");
+    let msg = env["message"].as_str().unwrap_or_default().to_string();
+    assert!(
+        msg.contains('2') && msg.contains("next_process_id"),
+        "文案应说明「有 2 道工序」并指明字段: {env}"
+    );
+    let (_st, _loc, h, process, step, version, _q, _r) = read_batch(&pool, batch).await;
+    assert_eq!(h, Some(holder), "40001 必须零写入");
+    assert_ne!(h, Some(taker));
+    assert_eq!(process, Some(proc1));
+    assert_eq!(step, None);
+    assert_eq!(version, 0, "40001 不得改 version");
+}
+
+/// 2026-10-16 新语义：链不可推导 + 工种**一条工序都没映射** ⇒ `20104`
+/// （HTTP 400，零写入），文案点名工号。
+#[tokio::test]
+async fn take_over_empty_work_type_mapping_returns_20104() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "TO-EMPTY").await;
+    let proc = seed_process(&pool, "TO-EMPTY-P", "工序").await;
+    // 接管人的工种**不 link** 任何工序 ⇒ 候选集为空。
+    let wt = insert_work_type(&pool, "TO-EMPTY-WT", "空工种", Some(5)).await;
+    let wt_holder = insert_work_type(&pool, "TO-EMPTY-WH", "持有人工种", Some(5)).await;
+    let holder = insert_worker(&pool, "TO-EMPTY-H", "持有人", Some(wt_holder)).await;
+    let taker = insert_worker(&pool, "TO-EMPTY-T", "接管人", Some(wt)).await;
+    let (_part, batch, _step) =
+        insert_worker_held_part(&pool, customer, "SN-TO-EMPTY", holder, proc, 2, false).await;
+    clear_step_pointer(&pool, batch).await;
+
+    let (s, env) = take_over(
+        &app,
+        &token,
+        json!({
+            "batch_id": batch.to_string(),
+            "badge_code": "TO-EMPTY-T",
+            "version": 0,
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "零候选应 400: {env}");
+    assert_eq!(env["code"], 20104, "BIZ_INVALID_VALUE: {env}");
+    let msg = env["message"].as_str().unwrap_or_default().to_string();
+    assert!(
+        msg.contains(&taker.to_string()) && msg.contains("未映射任何工序"),
+        "文案应点名工号并说明「工种未映射任何工序」: {env}"
+    );
+    let (_st, _loc, h, _process, _step, version, _q, _r) = read_batch(&pool, batch).await;
+    assert_eq!(h, Some(holder), "20104 必须零写入");
     assert_eq!(version, 0);
 }
 
