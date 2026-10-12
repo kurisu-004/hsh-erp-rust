@@ -9,8 +9,10 @@
 //! - `listing.rs` —— `ScanListItem` / `ScanListOut` / `HeldListOut` / `ScanChainState`
 //!   （两条只读聚合端点的分页行；`HeldListOut` 是 `/held` 专用的「+ 容量两字段」信封）
 //! - `locate.rs` —— `LocateOut` / `LocatePartBrief` / `LocateBatchItem` /
-//!   `LocateAction` / `LocateDisabledReason`（2026-10-15 新增的诊断端点
-//!   `GET /scan/locate`；`chain_state` 复用 `listing.rs` 的 `ScanChainState`）
+//!   `LocateProcessBriefOut` / `LocateAction` / `LocateDisabledReason`（2026-10-15
+//!   新增的诊断端点 `GET /scan/locate`；`chain_state` 复用 `listing.rs` 的
+//!   `ScanChainState`；`LocateProcessBriefOut` 是 2026-10-16 起 `LocateOut` 新增的
+//!   **工人维度**目标工序 picker 行）
 //! - `transition.rs` —— `WorkerScanCoreOut` / `WorkerScanOut` / `WorkerScanSplitInfo`
 //!   （放回 / 送检）
 //! - `take_over.rs` —— `TakeOverOut`（2026-10-15 新增的第 7 条端点
@@ -32,7 +34,10 @@ pub mod transition;
 pub mod worker;
 
 pub use listing::{HeldListOut, ScanChainState, ScanListItem, ScanListOut};
-pub use locate::{LocateAction, LocateBatchItem, LocateDisabledReason, LocateOut, LocatePartBrief};
+pub use locate::{
+    LocateAction, LocateBatchItem, LocateDisabledReason, LocateOut, LocatePartBrief,
+    LocateProcessBriefOut,
+};
 pub use outsource_receive::OutsourceReceiveOut;
 pub use take_over::TakeOverOut;
 pub use transition::{WorkerScanCoreOut, WorkerScanOut, WorkerScanSplitInfo};

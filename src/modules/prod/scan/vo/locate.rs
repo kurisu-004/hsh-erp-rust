@@ -27,15 +27,23 @@
 //!
 //! ## 序列化约定
 //!
-//! 雪花 id（`LocatePartBrief.id` / `LocateBatchItem.batch_id` / `next_process_id`）
+//! 雪花 id（`LocatePartBrief.id` / `LocateBatchItem.batch_id` / `next_process_id` /
+//! `LocateProcessBriefOut.process_id`）
 //! 一律 `serialize_i64` / `serialize_i64_opt` → JSON **string**（19 位 id 在 JS
 //! `Number` 下会丢精度）；`batch_no` / `quantity` / `version` 是裸数字；
 //! `chain_state` 复用 [`ScanChainState`]（`"NONE"` / `"NEXT"` / `"TAIL"` 三个大写
 //! 字面量）；`action` / `disabled_reason` 为 `null` 或大写蛇形字面量（枚举
 //! `rename_all = "SCREAMING_SNAKE_CASE"`，逐字清单见两个枚举的 doc）。
 //!
+//! ## 目标工序 picker：2026-10-16 新增 `worker_processes`
+//!
+//! `LocateOut` 多一个**顶层** `worker_processes`（不在批次行里）—— 它是「这个工人
+//! 能做哪几道工序」的**工人维度**事实，与 batch 维度无关，且同一响应内所有批次行
+//! 共用同一份。写端点「接管 / 外协收回」的「单候选自动推导 / 多候选必填」用的
+//! 是同一份工种映射，读侧只是把它显式发给前端当 picker 的选项集。
+//!
 //! ⚠️ **键集是网络契约**：`scan_list_item_keys_are_pinned` 的同款单测
-//! （`locate_keys_are_pinned`）钉死本模块三个结构的键集合与雪花 string 形态 ——
+//! （`locate_keys_are_pinned`）钉死本模块四个结构的键集合与雪花 string 形态 ——
 //! 加 / 删字段必须先改它，并同步前端 schema。
 
 use chrono::{NaiveDate, NaiveDateTime};
@@ -101,6 +109,11 @@ pub enum LocateDisabledReason {
     WorkTypeNotSet,
     /// 链首（PENDING）/ 推导出的下一道（TAKE_OVER / 外协收回）不命中该工种的
     /// `t_work_type_process` 活跃映射。
+    ///
+    /// ⚠️ **2026-10-16 起有两种成因**（前端文案可共用，但排障时别混）：① 链推得出
+    /// 目标工序、而它不在工种映射里；② 链推不出目标工序（无链 / 指针漂移 / 链尾 /
+    /// 链内歧义），而该工种**一条工序都没映射**（对位写侧 `20104`）。后者是
+    /// 「这个人根本没有可执行的工序」，与「这道工序不归他管」是两回事。
     ProcessNotInWorkType,
     /// 有链但链内没有未软删 step ⇒ 写侧没有可落的链首（对位写侧 `20702`）。
     ProcessChainStepNotFound,
@@ -112,7 +125,7 @@ pub enum LocateDisabledReason {
     Unknown,
 }
 
-/// `GET /api/v2/prod/scan/locate` 的 data（`part` + 全部批次）。
+/// `GET /api/v2/prod/scan/locate` 的 data（`part` + 全部批次 + 工种候选工序）。
 #[derive(Debug, Clone, Serialize)]
 pub struct LocateOut {
     /// 命中的工单（只读序列号，**不回退 `t_assembly`**，见 `docs/api/scan.md` §8）。
@@ -120,6 +133,37 @@ pub struct LocateOut {
     /// 该 part **全部未软删批次**（含终态），按 `batch_no ASC, pb.id ASC` 排序。
     /// 顺序即「件数递增 + 拆批兜底」，与前端展示顺序一致，不必二次排序。
     pub batches: Vec<LocateBatchItem>,
+    /// 该工人工种可执行的工序（`t_work_type_process` 活跃映射 ∩ 未软删
+    /// `t_process`），按 `sort_order ASC, id ASC`。未传 `worker_id` / 工人无工种 /
+    /// 工种未映射任何工序 ⇒ 空数组。
+    ///
+    /// **2026-10-16 新增**：前端把「接管 / 外协收回」的目标工序 picker 收窄到这个
+    /// 集合（不再展示全部工序），且**单候选时直接提交、不弹框**（写端点会自行推导）。
+    /// ⚠️ **本列表比写侧判据窄**（2026-10-16 review 第 1 轮 MINOR-1）：**闸门**
+    /// （`locate` 的 `disabled_reason` 判定）用的是**宽**集合（全部活跃映射，含工序
+    /// 已软删的，与写侧 `WorkTypeRepo::list_process_ids` 逐字同源），本**出参**只留
+    /// 工序未软删的行（软删工序没有可展示的名字）。故「闸门放行 + 本数组为空」是
+    /// 刻意且正常的形态（工种只映射了已软删工序）。
+    /// ⚠️ **出参长度不能反推写侧会不会自动推导**（2026-10-16 review 第 2 轮
+    /// MINOR-1）：「出参 1 条 / 写侧宽集 ≥ 2 条」同样可达，此时写侧仍返 `40001`
+    /// ⇒ 前端**须**保留该错误分支。**须**在 0 候选时给 warning 而非静默失败
+    /// ——这是**需求**不是现状断言（review 第 2 轮 NIT-2：`LocateDialog.vue` 不在本仓，
+    /// 现状待联调核对）。三态全表见 `docs/api/scan.md` §7.2 第 15 条。
+    pub worker_processes: Vec<LocateProcessBriefOut>,
+}
+
+/// 目标工序 picker 的一行（`LocateOut.worker_processes` 的元素，4 字段）。
+#[derive(Debug, Clone, Serialize)]
+pub struct LocateProcessBriefOut {
+    /// `t_process.id`（`serialize_i64` → JSON string；写端点的
+    /// `next_process_id` 入参吃同一种字符串形态）。
+    #[serde(serialize_with = "serialize_i64")]
+    pub process_id: i64,
+    pub code: String,
+    pub name: String,
+    /// `t_process.category`：`"INHOUSE"` / `"OUTSOURCE"`（与前端 `ProcessCategory`
+    /// 对齐）。
+    pub category: String,
 }
 
 /// 诊断结果的工单侧最小投影（7 字段）。
@@ -242,8 +286,9 @@ mod tests {
         }
     }
 
-    /// `LocatePartBrief` / `LocateBatchItem` / `LocateOut` 的键集合逐字钉死，
-    /// 并锁住雪花 id 的 string 形态（19 位 id 在 JS `Number` 下会丢精度）。
+    /// `LocatePartBrief` / `LocateBatchItem` / `LocateOut` / `LocateProcessBriefOut`
+    /// 的键集合逐字钉死，并锁住雪花 id 的 string 形态（19 位 id 在 JS `Number`
+    /// 下会丢精度）。
     #[test]
     fn locate_keys_are_pinned() {
         let part = serde_json::to_value(sample_part()).expect("serialize LocatePartBrief");
@@ -310,6 +355,12 @@ mod tests {
         let out = serde_json::to_value(LocateOut {
             part: sample_part(),
             batches: vec![sample_item()],
+            worker_processes: vec![LocateProcessBriefOut {
+                process_id: 5,
+                code: "P".into(),
+                name: "n".into(),
+                category: "INHOUSE".into(),
+            }],
         })
         .expect("serialize LocateOut");
         let mut out_keys: Vec<&str> = out
@@ -319,7 +370,28 @@ mod tests {
             .map(String::as_str)
             .collect();
         out_keys.sort_unstable();
-        assert_eq!(out_keys, ["batches", "part"]);
+        assert_eq!(out_keys, ["batches", "part", "worker_processes"]);
+
+        let brief = serde_json::to_value(LocateProcessBriefOut {
+            process_id: 5,
+            code: "P".into(),
+            name: "n".into(),
+            category: "INHOUSE".into(),
+        })
+        .expect("serialize LocateProcessBriefOut");
+        let mut brief_keys: Vec<&str> = brief
+            .as_object()
+            .expect("LocateProcessBriefOut 序列化成对象")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        brief_keys.sort_unstable();
+        assert_eq!(
+            brief_keys,
+            ["category", "code", "name", "process_id"],
+            "LocateProcessBriefOut 的字段集变了：加 / 删字段要同步前端 schema 与本文档"
+        );
+        assert_eq!(brief["process_id"], serde_json::json!("5"));
     }
 
     /// `action` 的 4 个 wire 字面量逐字钉死（前端按字符串分支）。

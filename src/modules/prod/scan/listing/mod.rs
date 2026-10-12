@@ -21,12 +21,26 @@
 //! ## SQL 条数（与工人数 / 批次数无关）
 //! - `pickable`：**2 条**（取行 / COUNT）
 //! - `held`：**3 条**（取行 / COUNT / 工种上限）
-//! - `locate`：**≤ 4 条**（工单命中 / 工人 + 工种上限 / 持有数 / 批次取行；
-//!   未传 `worker_id` 时只有 2 条。持有数复用 `/held` 的 `count_held` 同一条 SQL）
+//! - `locate`：**≤ 5 条**（工单命中 / 工人 + 工种上限 / **工种候选工序**（2026-10-16
+//!   新增）/ 持有数 / 批次取行；未传 `worker_id` 时只有 2 条。持有数复用 `/held` 的
+//!   `count_held` 同一条 SQL）
 //!
 //! 三条端点都不按行数重复查（`pickable` 一次 SQL 把「工种→工序映射 → 架 → 批次」
 //! 全链 JOIN 完；`held` / `locate` 一次 SQL 把链位置派生挂在 `LEFT JOIN LATERAL`
 //! 上，`locate` 另把 PENDING 链首 / 工种工序映射 / 外协在途 shipment 一并 JOIN 完）。
+//!
+//! 2026-10-16：`locate` 的第 3 条（`fetch_worker_processes`，出参
+//! `worker_processes`）与 `held` 的第 3 条属**同一类**「工人维度量」—— 它是独立
+//! 结果集（每个工种工序一行），并进批次取行就得让每条批次行都重复投影一遍，或把
+//! 它聚成一个字符串列再在 SQL 层拆开；两者都是把一个恒定大小的常量摊到「批次数」
+//! 这个变量上。它同时是写端点「单候选自动推导 / 多候选必填 / 零候选拒」三态的
+//! 同一份事实，故**不允许**为了省一条 SQL 而改用别的候选集。
+//!
+//! ⚠️ 2026-10-16 review 第 1 轮 MINOR-1：那条 SQL 内部**一条结果集分两路消费** ——
+//! `t_process` 的软删闸门留在 `LEFT JOIN ... ON` 里，闸门判据（`process_ids`）吃
+//! **全部**映射行（与写侧 `WorkTypeRepo::list_process_ids` 逐字同源），出参
+//! （`worker_processes`）只留工序未软删的行。改之前闸门用的是窄集合，会在
+//! 「工种只映射了已软删工序」时产生**假阻挡**（读侧藏按钮、写侧却会成功）。
 //!
 //! 2026-10-14：`held` 的第 3 条是 `fetch_max_held_batches`（`t_worker LEFT JOIN
 //! t_work_type` 取 `max_held_batches`，供 `HeldListOut` 的容量展示）。它是

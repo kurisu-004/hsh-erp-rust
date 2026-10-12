@@ -39,9 +39,9 @@ pub struct TakeOverOut {
     /// 接管后批次落到哪道工序（链上推导或前端显式指定，判据见 service doc）。
     #[serde(serialize_with = "serialize_i64")]
     pub next_process_id: i64,
-    /// 目标工序在链内的 step id；**无链时可空**（`serialize_i64_opt` →
-    /// JSON string|null）。有链时由 `optional_step_id` 解析（链内定位不到 → `20702`，
-    /// 不会走到这里）。
+    /// 目标工序在链内的 step id；**可空**（`serialize_i64_opt` → JSON
+    /// string|null）。空有两种成因：**无链**，或 **2026-10-16 起**「目标工序不在
+    /// 该工单的链内」（跨工序接管本就允许，链上无落点故落 NULL）。
     #[serde(serialize_with = "serialize_i64_opt")]
     pub next_process_step_id: Option<i64>,
     /// 接管**后**的 `t_part_batch.version`（= 客户端传值 + 1，本仓约定

@@ -234,8 +234,13 @@ pub struct TakeOverRequest {
     pub badge_code: String,
     /// 批次 OCC 锚（客户端传值；与 `t_part_batch.version` 不一致 → `40901`）。
     pub version: i32,
-    /// 接管后要推进到的工序；**仅链位置推导不出下一道时必填**（缺失 → `40001`，
-    /// 有链但链内定位不到 → `20702`）。JSON 字符串形态（与 worker-scan 同款）。
+    /// 接管后要推进到的工序。**三态**（2026-10-16 新语义，缺省不必再传）：
+    /// ① 链位置可推导 ⇒ 后端按链推导，**忽略**本字段；
+    /// ② 链推不出且传了本字段 ⇒ 显式指定（**允许工序不在该工单链内**，此时
+    /// `current_process_step_id` 落 NULL）；
+    /// ③ 链推不出且缺省 ⇒ 按工种候选推导：恰好 1 条自动用它、>1 条 `40001`、
+    /// 0 条 `20104`。
+    /// JSON 字符串形态（与 worker-scan 同款）。
     #[serde(default)]
     pub next_process_id: Option<String>,
     /// `t_part_event.note` 的附加备注。缺省时事件备注自动写
@@ -258,9 +263,9 @@ pub struct TakeOverRequest {
 /// - `next_process_id` 保持 `Option<String>` 不改 wire（与 `WorkerScanRequest` /
 ///   `TakeOverRequest` 逐字同款），service 内 `str::parse`，非法值 → `40001`。
 ///   **语义与 `TakeOverRequest` 不同**：这里它是可选的**显式覆盖**（传了就用，
-///   覆盖链推导）；缺省时才按链推导 —— 而**无链零件缺省必拒 `40001`**
-///   （「无链零件收回必须手填」），有链但推不出按 `resolve_receive_next_process`
-///   的两段 `20706` 文案拒。前端在 `locate` 的 `chain_state != "NEXT"` 时应弹手填。
+///   覆盖链推导）；缺省时先按链推导（`resolve_receive_next_process`），链推不出
+///   才退回**工种候选**（2026-10-16 新语义：恰好 1 条自动推导、>1 条要求手填、
+///   0 条 `20104`）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct OutsourceReceiveRequest {
     /// 批次锚（雪花 id 的 JSON 字符串）。
@@ -271,8 +276,8 @@ pub struct OutsourceReceiveRequest {
     pub badge_code: String,
     /// 批次 OCC 锚（客户端传值；与 `t_part_batch.version` 不一致 → `40901`）。
     pub version: i32,
-    /// 收回后要落到的工序（**可显式覆盖链推导**；缺省 = 按链推导，
-    /// 无链 ⇒ `40001`「无链零件收回必须手填 next_process_id」）。
+    /// 收回后要落到的工序（**可显式覆盖链推导**；缺省时先按链推导，链推不出再按
+    /// 工种候选自动推导 —— 恰好 1 条时不传也能成）。
     /// JSON 字符串形态（与同域其它工序 id 入参同款）。
     #[serde(default)]
     pub next_process_id: Option<String>,

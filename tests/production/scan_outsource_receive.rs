@@ -6,6 +6,12 @@
 //!   （两段 OCC 写各 +1，写后读回）；数量不变；
 //! - 下一道解析两条分支：缺省按链推导（`NEXT_PROCESS_LATERAL_SQL` 的
 //!   `sort_order = 当前 + 1` 口径）与显式 `next_process_id` 覆盖链推导；
+//! - 2026-10-16 新语义（目标工序改由工种映射推导）：链不可推导时**单候选自动推导**
+//!   / **零候选 `20104`**；两条既有用例（无链 `40001`、有链推不出 `20706`）的
+//!   fixture 相应改成「工种映射 2 道」，钉的是**多候选**分支而非回退旧语义；
+//! - 2026-10-16 review 第 1 轮 BLOCKER-1：stage① 传 `StepResolve::Lenient` ⇒
+//!   「有链 + 链外工序」落 `NULL` step 而**不是** `20702`，两条形态各有回归
+//!   （显式链外 / 链推不出 + 工种单候选链外）；
 //! - 判据顺序与错误码全矩阵（`20201` / `20202` / `20206` → `20109` / `20101` →
 //!   `40901` → `20103` / `20122` → `40001` / `20104` → `20904` / `20204` → `40300`）；
 //! - **关键回归**：容量触顶（`20204`）时**零写入**（批次仍 `OUTSOURCE` /
@@ -266,6 +272,45 @@ fn body(st: &ReceiveSetup, version: i32, next: Option<i64>) -> Value {
     v
 }
 
+/// 造一个「工种存在但**一条工序都没映射**」的可收回形态（2026-10-16 零候选用例）。
+///
+/// 与 [`setup_receive`] 的差别只有一处：扫码工的工种不 `link_work_type_to_process`
+/// —— 于是写侧判据 5 的候选集为空，缺省 `next_process_id` 必落 `20104`。
+/// 批次形态与 `setup_receive(.., true, true)` 完全一致（无链 / 工种未映射 ⇒ 候选空）。
+async fn setup_receive_without_process_mapping(pool: &PgPool, serial: &str) -> ReceiveSetup {
+    let customer = insert_customer_l2(pool, &format!("{serial}-C")).await;
+    let current = seed_process(pool, &format!("{serial}-PC"), "当前工序").await;
+    let next = seed_process(pool, &format!("{serial}-PN"), "下一道工序").await;
+    let wt = insert_work_type(pool, &format!("{serial}-WT"), "空工种", Some(5)).await;
+    // ⚠️ 刻意**不** link 任何工序
+    let worker = insert_worker(pool, &format!("{serial}-W"), "扫码工", Some(wt)).await;
+    let shelf = insert_shelf(pool, &format!("{serial}-SH"), "生产架", "PRODUCTION").await;
+    link_shelf_to_process(pool, shelf, next).await;
+    let company = insert_outsource_company(pool, &format!("{serial}-公司")).await;
+    let (part, batch, _step_current) =
+        insert_worker_held_part(pool, customer, serial, worker, current, 3, true).await;
+    force_batch_state(
+        pool,
+        batch,
+        "OUTSOURCE",
+        Some("OUTSOURCE_COMPANY"),
+        Some(company),
+    )
+    .await;
+    ReceiveSetup {
+        part_id: part,
+        batch_id: batch,
+        worker_id: worker,
+        badge_code: format!("{serial}-W"),
+        company_id: company,
+        work_type_id: wt,
+        shelf_id: shelf,
+        next_process_id: next,
+        current_process_id: current,
+        next_step_id: None,
+    }
+}
+
 // ===========================================================================
 //  happy path（显式 / 推导）
 // ===========================================================================
@@ -372,11 +417,18 @@ async fn outsource_receive_explicit_next_overrides_chain() {
 //  下一道解析的失败路径
 // ===========================================================================
 
-/// 无链 + 缺省 `next_process_id` → `40001`（HTTP 422，零写入）。
+/// 无链 + 缺省 `next_process_id` + 工种**多道**候选 → `40001`（HTTP 422，零写入）。
+///
+/// ⚠️ 2026-10-16 调整 fixture：工种映射由 1 道改为 **2 道**。新语义下「无链 + 工种
+/// 只有一道」会由服务端自动推导（成功），本用例要钉的是「多候选必填」那条分支 ——
+/// 改 fixture 而不是回退新语义。
 #[tokio::test]
 async fn outsource_receive_requires_next_process_when_no_chain_40001() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let st = setup_receive(&pool, "OR-NOCHAIN", false, true).await;
+    // 第二个候选（只把候选数抬到 2；无链 ⇒ 它在链外也无所谓）
+    let extra = seed_process(&pool, "OR-NOCHAIN-PX", "候选工序2").await;
+    link_work_type_to_process(&pool, st.work_type_id, extra).await;
 
     let (s, env) = receive(&app, &token, body(&st, 0, None)).await;
     assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "应 422: {env}");
@@ -385,11 +437,64 @@ async fn outsource_receive_requires_next_process_when_no_chain_40001() {
         env["message"]
             .as_str()
             .unwrap_or_default()
-            .contains("手填 next_process_id"),
-        "文案应提示手填: {env}"
+            .contains("next_process_id"),
+        "文案应指明要在 next_process_id 里显式指定: {env}"
     );
     let (status, location, holder, _p, _step, version, _q) = read_batch(&pool, st.batch_id).await;
     assert_eq!(status, "OUTSOURCE", "40001 必须零写入");
+    assert_eq!(location.as_deref(), Some("OUTSOURCE_COMPANY"));
+    assert_eq!(holder, Some(st.company_id));
+    assert_eq!(version, 0);
+    assert_eq!(count_part_events(&pool, st.part_id).await, 0);
+}
+
+/// 2026-10-16 新语义：无链 + 缺省 `next_process_id` + 工种**只映射一道** ⇒ 服务端
+/// 自动推导，收回成功（工序 = 那一道）。
+#[tokio::test]
+async fn outsource_receive_auto_derives_single_work_type_process() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    // setup_receive(..., with_chain=false, map_next=true) ⇒ 工种只映射「下一道」一道
+    let st = setup_receive(&pool, "OR-AUTO1", false, true).await;
+
+    let (s, env) = receive(&app, &token, body(&st, 0, None)).await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "无链 + 工种单候选时不必让前端挑工序: {env}"
+    );
+    assert_eq!(
+        env["data"]["next_process_id"],
+        st.next_process_id.to_string(),
+        "自动推导的工序必须是工种那唯一候选: {env}"
+    );
+    let (status, location, holder, process, _step, version, quantity) =
+        read_batch(&pool, st.batch_id).await;
+    assert_eq!(status, "IN_PROCESS");
+    assert_eq!(location.as_deref(), Some("WORKER"));
+    assert_eq!(holder, Some(st.worker_id));
+    assert_eq!(process, Some(st.next_process_id));
+    assert_eq!(version, 2, "两段写各 +1");
+    assert_eq!(quantity, 3);
+}
+
+/// 2026-10-16 新语义：工种**一条工序都没映射** + 缺省 `next_process_id` ⇒ `20104`
+/// （HTTP 400，零写入），文案点名工号。
+#[tokio::test]
+async fn outsource_receive_empty_work_type_mapping_returns_20104() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    // 工种存在但**不 link** 任何工序
+    let st = setup_receive_without_process_mapping(&pool, "OR-EMPTY").await;
+
+    let (s, env) = receive(&app, &token, body(&st, 0, None)).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "零候选应 400: {env}");
+    assert_eq!(env["code"], 20104, "BIZ_INVALID_VALUE: {env}");
+    let msg = env["message"].as_str().unwrap_or_default().to_string();
+    assert!(
+        msg.contains(&st.worker_id.to_string()) && msg.contains("未映射任何工序"),
+        "文案应点名工号并说明「工种未映射任何工序」: {env}"
+    );
+    let (status, location, holder, _p, _step, version, _q) = read_batch(&pool, st.batch_id).await;
+    assert_eq!(status, "OUTSOURCE", "20104 必须零写入");
     assert_eq!(location.as_deref(), Some("OUTSOURCE_COMPANY"));
     assert_eq!(holder, Some(st.company_id));
     assert_eq!(version, 0);
@@ -412,16 +517,22 @@ async fn outsource_receive_manual_next_not_in_work_type_returns_20104() {
     assert_eq!(count_part_events(&pool, st.part_id).await, 0);
 }
 
-/// 有链但**当前工序 / 指针均被清空** + 缺省 `next_process_id` → `20706`
-/// （HTTP 409，零写入）。
+/// 有链但**当前工序 / 指针均被清空** + 缺省 `next_process_id` + 工种**多道**候选
+/// → `20706`（HTTP 409，零写入）。
 ///
 /// 出池清工序不变式下外协批次两列均为 NULL；此时锚链仍在（part 绑着链），写侧
 /// `NEXT_PROCESS_LATERAL_SQL` 推不出下一道 ⇒ `20706`（两段文案的「有链推不出」段）。
 /// 与 §8 残余失败组合第 4 条对位：显式回传 `next_process_id` 可绕过本形态。
+///
+/// ⚠️ 2026-10-16 调整 fixture：工种映射由 1 道改为 **2 道** —— 单候选时写侧会
+/// 退回工种候选自动推导（成功），多候选才保留链推导自己的 `20706` 文案。
 #[tokio::test]
 async fn outsource_receive_chain_without_position_returns_20706() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let st = setup_receive(&pool, "OR-NOPOS", true, true).await;
+    // 第二个候选（只把候选数抬到 2）
+    let extra = seed_process(&pool, "OR-NOPOS-PX", "候选工序2").await;
+    link_work_type_to_process(&pool, st.work_type_id, extra).await;
     sqlx::query(
         "UPDATE t_part_batch SET current_process_id = NULL, current_process_step_id = NULL \
          WHERE id = $1",
@@ -503,6 +614,106 @@ async fn outsource_receive_no_shelf_for_next_process_returns_20508() {
         0,
         "20508 必须零 part 事件"
     );
+}
+
+// ===========================================================================
+//  链外工序 / `StepResolve::Lenient`（2026-10-16 review 第 1 轮 BLOCKER-1）
+// ===========================================================================
+
+/// **BLOCKER-1 回归**：工单**有链** + 显式 `next_process_id` 指向**链外**工序 ⇒
+/// 收回**成功**，`current_process_step_id` 落 `NULL`（不再 `20702`）。
+///
+/// 改前 stage① 内核走 `optional_step_id`，「有链但链内定位不到」即抛 `20702` ——
+/// 而本端点 2026-10-16 的新语义（工种候选**不与链求交**）恰恰会主动生产这个输入。
+/// 断言三件事：HTTP 200、工序落显式值、step 为 `None`。
+#[tokio::test]
+async fn outsource_receive_explicit_process_outside_chain_succeeds_with_null_step() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let st = setup_receive(&pool, "OR-OUTCHAIN", true, true).await;
+    // 链外工序：工种与货架都映射它，但**不 append 到工单的链上**
+    let outside = seed_process(&pool, "OR-OUTCHAIN-PX", "链外工序").await;
+    link_work_type_to_process(&pool, st.work_type_id, outside).await;
+    link_shelf_to_process(&pool, st.shelf_id, outside).await;
+    // 前置：工单确实有链，且该工序确实不在链内
+    assert!(part_chain_id(&pool, st.part_id).await.is_some(), "前置：工单有链");
+
+    let (s, env) = receive(&app, &token, body(&st, 0, Some(outside))).await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "有链 + 链外工序必须成功（step 落 NULL，不是 20702）: {env}"
+    );
+    assert_eq!(env["data"]["next_process_id"], outside.to_string());
+
+    let (status, location, holder, process, step, version, quantity) =
+        read_batch(&pool, st.batch_id).await;
+    assert_eq!(status, "IN_PROCESS");
+    assert_eq!(location.as_deref(), Some("WORKER"));
+    assert_eq!(holder, Some(st.worker_id));
+    assert_eq!(process, Some(outside), "工序必须落显式指定的链外工序");
+    assert_eq!(
+        step, None,
+        "链内定位不到 ⇒ step 落 NULL（Lenient），不是保持旧值、也不是报错"
+    );
+    assert_eq!(version, 2);
+    assert_eq!(quantity, 3);
+}
+
+/// **BLOCKER-1 回归（决策 3 形态）**：工单**有链**但**链推不出**（当前工序 / step
+/// 指针被清空）+ 工种**单候选**且该候选**不在链内** ⇒ 缺省 `next_process_id`
+/// 自动推导成功、step 落 `NULL`。
+///
+/// 这一形态不是边角：`resolve_receive_next_process` 内部是 `sort_order = 当前 + 1`
+/// 口径，**稀疏链上必然推不出** ⇒ 正好落进「退回工种候选」那条分支；而决策 2 又要求
+/// 候选**不与链求交** ⇒ 「part 有链 + 单候选链外」这个组合是新语义主动生产出来的。
+/// 改前它会被 stage① 的 `optional_step_id` 原样打回 `20702`。
+#[tokio::test]
+async fn outsource_receive_chain_derivation_fails_single_candidate_outside_chain_succeeds() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let st = setup_receive(&pool, "OR-CHAINFAIL", true, true).await;
+    // 链外唯一候选：先软删 setup 里「下一道」那条映射，再只映射它
+    let solo = seed_process(&pool, "OR-CHAINFAIL-PX", "链外唯一候选").await;
+    sqlx::query(
+        "UPDATE t_work_type_process SET deleted_at = now() \
+         WHERE work_type_id = $1 AND process_id <> $2",
+    )
+    .bind(st.work_type_id)
+    .bind(solo)
+    .execute(&pool)
+    .await
+    .expect("soft drop other work type mappings");
+    link_work_type_to_process(&pool, st.work_type_id, solo).await;
+    link_shelf_to_process(&pool, st.shelf_id, solo).await;
+    // 出池清工序不变式：当前工序与 step 指针都清空 ⇒ 链推不出下一道
+    sqlx::query(
+        "UPDATE t_part_batch SET current_process_id = NULL, current_process_step_id = NULL \
+         WHERE id = $1",
+    )
+    .bind(st.batch_id)
+    .execute(&pool)
+    .await
+    .expect("clear process columns");
+    assert!(
+        part_chain_id(&pool, st.part_id).await.is_some(),
+        "前置：工单仍绑着链（否则落无链分支，测的不是本形态）"
+    );
+
+    let (s, env) = receive(&app, &token, body(&st, 0, None)).await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "有链 + 链推不出 + 工种单候选（链外）⇒ 自动推导成功: {env}"
+    );
+    assert_eq!(env["data"]["next_process_id"], solo.to_string());
+
+    let (status, location, holder, process, step, version, _q) =
+        read_batch(&pool, st.batch_id).await;
+    assert_eq!(status, "IN_PROCESS");
+    assert_eq!(location.as_deref(), Some("WORKER"));
+    assert_eq!(holder, Some(st.worker_id));
+    assert_eq!(process, Some(solo), "工序必须落工种那唯一候选");
+    assert_eq!(step, None, "链外候选 ⇒ step 落 NULL");
+    assert_eq!(version, 2);
 }
 
 // ===========================================================================

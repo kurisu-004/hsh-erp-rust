@@ -321,6 +321,8 @@ impl OutsourceMoveService {
                     &batch,
                     &part,
                     next_process,
+                    // 本端点的目标工序必须能在链内定位（既有契约），定位不到拒 20702。
+                    StepResolve::Strict,
                     req.note.as_deref(),
                     current,
                 )
@@ -363,6 +365,46 @@ impl OutsourceMoveService {
     }
 }
 
+/// 回收臂的 step 解析策略（2026-10-16 新增，review 第 1 轮 BLOCKER-1）。
+///
+/// ## 为什么要有这个参数
+///
+/// 「有链但链内定位不到目标工序」要不要拒，**取决于这条回收路径上目标工序是从哪
+/// 来的**，而这个事实只有 caller 知道：
+///
+/// - [`StepResolve::Strict`] —— `POST /api/v2/outsource-queue/move` 的回收臂。
+///   它的 `next_process_id` 由 `resolve_receive_next_process`（「显式或链推导」）
+///   解析，既有契约是「目标工序必须在链内」⇒ 定位不到就拒 `20702`
+///   `BIZ_PROCESS_CHAIN_STEP_NOT_FOUND`（`shared::batch::guards::optional_step_id`
+///   的逐字语义，本端点**一行行为不变**）。
+/// - [`StepResolve::Lenient`] —— `POST /api/v2/prod/scan/outsource-receive`。
+///   2026-10-16 新语义下目标工序可由**工种映射**推导，且候选集**刻意不与工序链
+///   求交**（「part 有链但链推不出」时链已不适用）；于是「part 有链 + 目标工序在
+///   链外」是这个端点**自己主动生产出来的合法输入**（显式传链外工序、以及
+///   有链但推不出 + 工种单候选两条路径都会落到这个形态）。若 stage① 继续走
+///   `optional_step_id`，新代码会把自己制造出来的输入原样打回 `20702` —— 那不是
+///   守卫，是自相矛盾。
+///
+/// ## 为什么 `optional_step_id` 的全局语义不动
+///
+/// 它是全仓多处在用的共享闸门（发送臂、批次流转等），把「定位不到 ⇒ 拒」改成
+/// 「定位不到 ⇒ 落 NULL」会一次性放宽所有调用方。策略只挂在**这一个内核函数**
+/// 的入参上，别去改 `shared::batch::guards::optional_step_id`。
+///
+/// ## `Lenient` 落 `NULL` 为什么不丢数据
+///
+/// 外协批次按「出池清工序」不变式，`current_process_step_id` 恒为 `NULL`；
+/// `mark_batch_with_status_and_meta` 的 `new_process_step_id = None` 映射为
+/// `clear_process_step_id = true`，对**已经是 `NULL`** 的列是 no-op。也就是说这条
+/// 分支不改任何既有值，只是**不再**为一个「该列本来就该是空」的形态抛错。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StepResolve {
+    /// 链内定位不到目标工序 ⇒ `20702`（`optional_step_id` 的逐字语义）。
+    Strict,
+    /// 链内定位不到目标工序 ⇒ `current_process_step_id` 落 `NULL`，不报错。
+    Lenient,
+}
+
 /// 回收臂的内核：外协公司 → 生产架（`to.kind = PRODUCTION_SHELF`）的全部写入。
 ///
 /// 2026-10-15 自 [`OutsourceMoveService::move_batch`] 的回收臂**逐行搬移**（行为逐字
@@ -385,6 +427,11 @@ impl OutsourceMoveService {
 /// → `close_open_outsource_shipment`（含 quote `RECEIVED` 事件）→ part 事件
 /// `RECEIVED_FROM_OUTSOURCE`。
 ///
+/// ## `step_mode`（2026-10-16 新增，review 第 1 轮 BLOCKER-1）
+/// 「有链但链内定位不到目标工序」是拒（[`StepResolve::Strict`]）还是落 `NULL`
+/// （[`StepResolve::Lenient`]），**由 caller 显式声明**。理由见该枚举的 doc：
+/// 两条 caller 的目标工序来源不同，对「工序不在链内」的容忍度也不同。
+///
 /// 返回**选中的生产架 id**（= 批次落点，caller 的 `new_holder_id`）。
 pub(crate) async fn receive_from_outsource_inner(
     conn: &mut PgConnection,
@@ -392,6 +439,7 @@ pub(crate) async fn receive_from_outsource_inner(
     batch: &TPartBatch,
     part: &TPartInspected,
     next_process: i64,
+    step_mode: StepResolve,
     note: Option<&str>,
     current: &CurrentUser,
 ) -> Result<i64, AppError> {
@@ -420,7 +468,17 @@ pub(crate) async fn receive_from_outsource_inner(
     })?
     .id;
     let chain_id = optional_process_chain(conn, batch.part_id).await?;
-    let step_id = optional_step_id(conn, chain_id, next_process).await?;
+    let step_id = match step_mode {
+        StepResolve::Strict => optional_step_id(conn, chain_id, next_process).await?,
+        StepResolve::Lenient => match chain_id {
+            Some(c) => {
+                crate::modules::prod::process_chain::repo::ProcessChainRepo::
+                    resolve_step_id_by_process(&mut *conn, c, next_process)
+                    .await?
+            }
+            None => None,
+        },
+    };
     mark_batch_with_status_and_meta(
         conn,
         batch.id,

@@ -455,14 +455,23 @@ impl ScanListingRepo {
     // =====================================================================
     //  locate —— GET /api/v2/prod/scan/locate（2026-10-15 新增）
     //
-    //  固定 4 条 SQL 以内（与 part 的批次数 / 工人数无关）：
-    //    1. fetch_locate_part   —— 按 serial_no 命中工单（未命中 ⇒ service 返 20101）
-    //    2. fetch_locate_worker —— 工人 active / work_type / 工种容量上限（仅传了
+    //  固定 5 条 SQL 以内（与 part 的批次数 / 工人数无关）：
+    //    1. fetch_locate_part    —— 按 serial_no 命中工单（未命中 ⇒ service 返 20101）
+    //    2. fetch_locate_worker  —— 工人 active / work_type / 工种容量上限（仅传了
     //       `worker_id` 时执行）
-    //    3. count_held          —— 「该工人当前持有」的容量计数（**复用 `/held` 的
+    //    3. fetch_worker_processes—— 该工人工种可执行的工序（2026-10-16 新增，仅传了
+    //       `worker_id` **且**工人绑了工种时执行；出参 `worker_processes` +
+    //       写端点单候选自动推导的判据）
+    //    4. count_held           —— 「该工人当前持有」的容量计数（**复用 `/held` 的
     //       同一条 SQL**，谓词 = 写侧 `ensure_worker_has_capacity` 的同一判据）
-    //    4. fetch_locate_batches—— 取行（一条 SQL 把位置 / 链位置 / 工种映射 /
+    //    5. fetch_locate_batches —— 取行（一条 SQL 把位置 / 链位置 / 工种映射 /
     //       外协在途全链 JOIN 完，不按行数重复查）
+    //
+    //  ⚠️ 第 3 条**无法**并进第 5 条：它是「工人维度」的**独立结果集**（每个工种
+    //  工序一行），而第 5 条的每行都锚在批次上 —— 要合就得让每条批次行都带一遍这
+    //  一列（要么重复投影、要么数组聚成一个字符串列再在 SQL 层拆），两者都是把
+    //  一个恒定大小的常量摊到「批次数」这个变量上。它与 `fetch_max_held_batches`
+    // 属同一类「工人维度量」，理由见 `listing/mod.rs` 的模块 doc。
     // =====================================================================
 
     /// `GET /scan/locate` 的工单命中（`serial_no` 唯一化 + 软删闸门）。
@@ -525,6 +534,71 @@ impl ScanListingRepo {
         )
         .bind(worker_id)
         .fetch_optional(conn)
+        .await
+    }
+
+    /// `GET /scan/locate` 出参 `worker_processes` 的取行：**该工人工种可执行的
+    /// 工序**（2026-10-16 新增；`t_process` 的 JOIN 于 2026-10-16 review 第 1 轮
+    /// MINOR-1 由 `JOIN` 改为 `LEFT JOIN`）。
+    ///
+    /// ## 它的两个消费方
+    ///
+    /// 1. **读侧**：前端把「接管 / 外协收回」的目标工序 picker **收窄到这个集合**，
+    ///    不再让工人从全部工序里挑（`LocateProcessBriefOut` 含 `name` / `category`，
+    ///    卡片才渲染得出来）；
+    /// 2. **写侧判据**：`LocateWorkerCtx.process_ids` 的 id 投影，是两个写端点
+    ///    「单候选自动推导 / 多候选必填 / 零候选拒」三态的**同一份事实**。
+    ///
+    /// ⚠️ **必须裸写这条 SQL，不许 import `prod::work_type` 的 repo**：本目录受
+    /// 域隔离护栏扫（读他域的**表**是允许的既定 pattern，import 他域的**符号**才
+    /// 违规），理由与 `fetch_locate_worker` / `fetch_max_held_batches` 同款。
+    ///
+    /// ## ⚠️ 一条 SQL 同时产出**宽窄两个集合**（2026-10-16 review MINOR-1）
+    ///
+    /// `JOIN t_process` ⇒ `LEFT JOIN t_process ON p.id = wtp.process_id AND
+    /// p.deleted_at IS NULL`，**软删闸门留在 ON 子句里**（写进 WHERE 会把整行滤掉、
+    /// 等价于原来的 INNER JOIN）。一条结果集由 service 分成两路消费：
+    ///
+    /// - **闸门（`LocateWorkerCtx.process_ids`）取全部行的 `process_id`** ——
+    ///   与写侧 `WorkTypeRepo::list_process_ids`（只筛 `wtp.deleted_at IS NULL`、
+    ///   **不 JOIN `t_process`**）**逐字同源**。这是本轮改动的全部要点：改之前读侧
+    ///   候选集 ⊂ 写侧候选集，工种只映射了已软删工序时读侧判 0 条 ⇒ 闸门落
+    ///   `PROCESS_NOT_IN_WORK_TYPE` 藏掉按钮，而写侧 `list_process_ids` 返 1 条 ⇒
+    ///   **单候选自动推导会成功** —— 一个「写侧会成功、读侧说做不了」的**假阻挡**，
+    ///   正是本仓明令禁止（`listing/service.rs` 里 2026-10-15 S3 那次订正就是为消灭它）。
+    /// - **出参（`LocateOut.worker_processes`）只留「工序未软删」的行** ——
+    ///   即 `name` / `code` / `category` 有值的那些。软删工序在业务上已作废、
+    ///   **没有可展示的名字**，picker 里不该出现死卡片。
+    ///
+    /// 于是「闸门放行 + `worker_processes` 为空数组」是**刻意且正常**的形态（工种只
+    /// 映射了已软删工序）：写侧此时会成功，读侧不再假装不能做。⚠️ **「前端须在 0
+    /// 候选时给 warning 而非静默失败」是需求、不是现状断言**（2026-10-16 review 第 2
+    /// 轮 NIT-2 收口）：本仓没有 `frontend/` 子模块，`LocateDialog.vue` 的现状待联调
+    /// 核对，且绝不随本仓任何提交刷新 —— 不要把它写成「前端已有」的既成事实。
+    /// 前端配套清单（含 0 候选 warning 与三态 `40001` 兜底）见 `docs/api/scan.md`
+    /// §7.2 第 15 条。**不要**为了让两者看起来一致而把闸门改回窄集合。
+    ///
+    /// ⚠️ **`process_id` 取 `wtp.process_id` 而不是 `p.id`**（2026-10-16 review
+    /// MINOR-1 返工）：LEFT JOIN 未命中（工序已软删）时 `p.id` 是 SQL NULL，按
+    /// `i64` 解码会报 `ColumnDecode` ⇒ 整页 500。映射行的 `wtp.process_id` 恒非空，
+    /// 且它才是闸门要的那个 id（写侧 `list_process_ids` 读的也正是这一列）。
+    ///
+    /// 排序 `wtp.sort_order ASC, wtp.id ASC`：`sort_order` 是工种↔工序映射的
+    /// 配置顺序（同 `work-types/{id}/processes` 的整组替换语义），`id` 兜同序的
+    /// 平局（`sort_order` 无唯一约束）。排序只为让前端 picker 稳定，不影响任何判定。
+    pub(crate) async fn fetch_worker_processes(
+        conn: &mut PgConnection,
+        work_type_id: i64,
+    ) -> Result<Vec<LocateProcessRow>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT wtp.process_id AS process_id, p.code, p.name, p.category \
+             FROM t_work_type_process wtp \
+             LEFT JOIN t_process p ON p.id = wtp.process_id AND p.deleted_at IS NULL \
+             WHERE wtp.work_type_id = $1 AND wtp.deleted_at IS NULL \
+             ORDER BY wtp.sort_order ASC, wtp.id ASC",
+        )
+        .bind(work_type_id)
+        .fetch_all(conn)
         .await
     }
 
@@ -695,6 +769,25 @@ pub struct LocateWorkerRow {
     pub(crate) is_active: bool,
     pub(crate) work_type_id: Option<i64>,
     pub(crate) max_held_batches: Option<i32>,
+}
+
+/// `GET /scan/locate` 的工种映射行（`fetch_worker_processes` 的一条结果）。
+///
+/// 字段名即 SQL 别名（`FromRow` 按列名匹配）。与 [`LocateWorkerRow`] 同款：行投影
+/// 与网络契约 VO **刻意不合并**（投影层还要顺带给 `LocateWorkerCtx.process_ids`
+/// 递 id 投影，且它比出参**宽** —— 见 `fetch_worker_processes` 的 doc），转换在
+/// service 层做。
+#[derive(Debug, sqlx::FromRow)]
+pub struct LocateProcessRow {
+    /// `t_work_type_process.process_id`（**取自映射行**，不是 `t_process.id` ——
+    /// LEFT JOIN 未命中时后者为 NULL，但这一列恒有值）。出参走 `serialize_i64`。
+    pub(crate) process_id: i64,
+    /// `t_process.code`；`None` = 该工序已软删（LEFT JOIN 未命中）。
+    pub(crate) code: Option<String>,
+    /// `t_process.name`；`None` = 该工序已软删。
+    pub(crate) name: Option<String>,
+    /// `t_process.category`：`"INHOUSE"` / `"OUTSOURCE"`；`None` = 该工序已软删。
+    pub(crate) category: Option<String>,
 }
 
 /// `GET /scan/locate` 的批次行：**action 判定所需的全部原始事实**。

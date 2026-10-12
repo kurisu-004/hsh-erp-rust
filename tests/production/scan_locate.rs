@@ -6,6 +6,12 @@
 //! - 「无 `worker_id` ⇒ action / disabled_reason 均 null」的纯位置事实形态
 //!   （含终态批次）；
 //! - action 决策表（与写侧守卫同源的 16 个形态，逐条见各用例 doc）；
+//! - `worker_processes`（2026-10-16 新增出参）：工种有映射时按 `sort_order` 返回、
+//!   无映射 / 未传 `worker_id` 时是空数组；
+//! - 2026-10-16 review 第 1 轮：闸门候选集用**宽**集合（与写侧 `list_process_ids`
+//!   逐字同源、含已软删工序）、出参用窄集合（`locate_take_over_with_only_soft_deleted_process_mapping_still_returns_action`）；
+//!   `outsource_gate` 的零候选闸门单独覆盖（`locate_outsource_empty_work_type_candidate_returns_none_with_reason`，
+//!   两个 gate 是两个独立函数）；
 //! - 字段契约（逐键 + 雪花 string + `chain_state` 三字面量）。
 //!
 //! ## fixture 复用
@@ -222,6 +228,21 @@ async fn login_user_with_role(
     login_token(app, username, ProductionFixture::PASSWORD).await
 }
 
+/// 把既有映射的 `sort_order` 改成指定值（`link_work_type_to_process` 恒写 0，
+/// 排序用例需要非零值来验证「返回序 ≠ 插入序」）。
+async fn set_mapping_sort_order(pool: &PgPool, work_type_id: i64, process_id: i64, sort_order: i32) {
+    sqlx::query(
+        "UPDATE t_work_type_process SET sort_order = $3 \
+         WHERE work_type_id = $1 AND process_id = $2",
+    )
+    .bind(work_type_id)
+    .bind(process_id)
+    .bind(sort_order)
+    .execute(pool)
+    .await
+    .expect("update t_work_type_process.sort_order");
+}
+
 // ===========================================================================
 //  HTTP helper
 // ===========================================================================
@@ -419,6 +440,123 @@ async fn locate_returns_all_batches_including_terminal_with_null_action_when_no_
             "未传 worker_id 时 disabled_reason 恒 null"
         );
     }
+}
+
+// ===========================================================================
+//  worker_processes：目标工序 picker（2026-10-16 新增）
+// ===========================================================================
+
+/// `worker_processes` 返回该工种映射的**全部**工序，逐键 + 雪花 string + 排序。
+///
+/// 排序判据是 `t_work_type_process.sort_order ASC, wtp.id ASC`；本用例把第二条映射
+/// 的 `sort_order` 调成 0、第一条调成 10，从而让「插入顺序」与「返回顺序」相反 ——
+/// 这样断言的是排序真被应用，而不是碰巧与插入序一致。
+#[tokio::test]
+async fn locate_worker_processes_lists_work_type_mapping_in_sort_order() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "LOCATE-WP").await;
+    let proc_a = seed_process(&pool, "LOC-WP-A", "工序甲").await;
+    let proc_b = seed_process(&pool, "LOC-WP-B", "工序乙").await;
+    let wt = insert_work_type(&pool, "WT-WP", "工种", Some(5)).await;
+    // 先插 A(sort=10) 再插 B(sort=0) ⇒ 返回序应是 [B, A]
+    link_work_type_to_process(&pool, wt, proc_a).await;
+    link_work_type_to_process(&pool, wt, proc_b).await;
+    set_mapping_sort_order(&pool, wt, proc_a, 10).await;
+    set_mapping_sort_order(&pool, wt, proc_b, 0).await;
+    let worker = insert_worker(&pool, "BC-WP", "工", Some(wt)).await;
+    let (part, batch, _step) =
+        insert_worker_held_part(&pool, customer, "SN-WP", worker, proc_a, 1, true).await;
+
+    let (s, env) = locate(&app, &token, "SN-WP", Some(worker)).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let wp = env["data"]["worker_processes"]
+        .as_array()
+        .expect("worker_processes 是数组");
+    assert_eq!(wp.len(), 2, "两条映射都要出现: {env}");
+    assert_eq!(wp[0]["process_id"], proc_b.to_string(), "sort_order=0 在前");
+    assert_eq!(wp[0]["code"], "LOC-WP-B");
+    assert_eq!(wp[0]["name"], "工序乙");
+    assert_eq!(wp[0]["category"], "INHOUSE");
+    assert_eq!(wp[1]["process_id"], proc_a.to_string());
+    assert_eq!(wp[1]["code"], "LOC-WP-A");
+    for row in wp {
+        assert!(
+            row["process_id"].is_string(),
+            "process_id 必须是 JSON string（雪花精度）: {env}"
+        );
+        let mut keys: Vec<&str> = row
+            .as_object()
+            .expect("候选工序行是对象")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["category", "code", "name", "process_id"],
+            "LocateProcessBriefOut 字段集变了（同步前端 schema）: {env}"
+        );
+    }
+    // 该响应同时带着诊断行 —— 两块信息在同一次调用里。
+    assert_eq!(
+        first_batch(&env)["batch_id"],
+        batch.to_string(),
+        "worker_processes 与 batches 同在一次响应: {env}"
+    );
+    let _ = part;
+}
+
+/// 工种未映射任何工序 ⇒ `worker_processes` 是**空数组**（不是 null、不是省略键），
+/// 且「非链推导形态」下的批次落 `NONE + PROCESS_NOT_IN_WORK_TYPE`（对位写侧 2026-10-16
+/// 新增分支 C 的 `20104` —— 零候选时写侧必拒，读侧必须先藏掉按钮）。
+#[tokio::test]
+async fn locate_worker_processes_empty_when_work_type_has_no_mapping() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "LOCATE-WP0").await;
+    let proc = seed_process(&pool, "LOC-WP0", "工序").await;
+    // 工种存在但**不 link** 任何工序
+    let wt = insert_work_type(&pool, "WT-WP0", "空工种", Some(5)).await;
+    let holder = insert_worker(&pool, "BC-WP0-H", "持有人", Some(wt)).await;
+    let taker = insert_worker(&pool, "BC-WP0-T", "接管人", Some(wt)).await;
+    let (_part, batch, _step) =
+        insert_worker_held_part(&pool, customer, "SN-WP0", holder, proc, 1, true).await;
+    // 指针漂移 ⇒ 非链推导形态（会走「工种候选」那条判据）
+    sqlx::query("UPDATE t_part_batch SET current_process_step_id = NULL WHERE id = $1")
+        .bind(batch)
+        .execute(&pool)
+        .await
+        .expect("clear step pointer");
+
+    let (s, env) = locate(&app, &token, "SN-WP0", Some(taker)).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(
+        env["data"]["worker_processes"],
+        json!([]),
+        "零候选必须是空数组（前端 picker 无选项）: {env}"
+    );
+    let b = first_batch(&env);
+    assert_eq!(b["action"], Value::Null, "零候选时不得给可点按钮: {env}");
+    assert_eq!(b["disabled_reason"], "PROCESS_NOT_IN_WORK_TYPE");
+}
+
+/// 未传 `worker_id` ⇒ `worker_processes` 是空数组（无工人 = 无工种 = 无候选）。
+#[tokio::test]
+async fn locate_worker_processes_empty_without_worker_id() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "LOCATE-WPN").await;
+    let proc = seed_process(&pool, "LOC-WPN", "工序").await;
+    let wt = insert_work_type(&pool, "WT-WPN", "工种", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let worker = insert_worker(&pool, "BC-WPN", "工", Some(wt)).await;
+    insert_worker_held_part(&pool, customer, "SN-WPN", worker, proc, 1, true).await;
+
+    let (s, env) = locate(&app, &token, "SN-WPN", None).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(
+        env["data"]["worker_processes"],
+        json!([]),
+        "未传 worker_id 时不查工种映射，恒空数组: {env}"
+    );
 }
 
 // ===========================================================================
@@ -994,6 +1132,110 @@ async fn locate_outsource_manual_next_capacity_gate_still_applies() {
     assert_eq!(b["disabled_reason"], "WORKER_HOLD_LIMIT_EXCEEDED");
 }
 
+/// 2026-10-16 review 第 1 轮 MINOR-1 回归：工种映射**只含一条已软删工序**时，
+/// 读侧仍给 `TAKE_OVER`（闸门候选集与写侧 `WorkTypeRepo::list_process_ids` 逐字
+/// 同源，含已软删工序），但出参 `worker_processes` 是**空数组**（软删工序没有可
+/// 展示的名字）。
+///
+/// ⚠️ 改前 `fetch_worker_processes` 用的是 `JOIN t_process`，该行被软删闸门滤掉
+/// ⇒ 闸门判 0 候选 ⇒ 落 `PROCESS_NOT_IN_WORK_TYPE` 藏掉按钮，而写侧此时
+/// `list_process_ids` 返 1 条 ⇒ **单候选自动推导会成功** —— 一个「写侧会成功、
+/// 读侧说做不了」的**假阻挡**（本仓明令禁止，`listing/service.rs` 2026-10-15 S3
+/// 那次订正就是为消灭它）。
+#[tokio::test]
+async fn locate_take_over_with_only_soft_deleted_process_mapping_still_returns_action() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "LOCATE-WPDEL").await;
+    let proc = seed_process(&pool, "LOC-WPDEL", "已软删工序").await;
+    let wt = insert_work_type(&pool, "WT-WPDEL", "工种", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    // 工序作废，但工种↔工序映射仍在（`wtp.deleted_at IS NULL`）—— 写侧看得到它。
+    sqlx::query("UPDATE t_process SET deleted_at = now() WHERE id = $1")
+        .bind(proc)
+        .execute(&pool)
+        .await
+        .expect("soft delete t_process");
+    let holder = insert_worker(&pool, "BC-WPDEL-H", "持有人", Some(wt)).await;
+    let taker = insert_worker(&pool, "BC-WPDEL-T", "接管人", Some(wt)).await;
+    // ⚠️ `with_chain=false` **不等于「无链」**：fixture 仍建链 + step，并把批次的
+    // `current_process_step_id` 指过去；只把 part 的 `process_chain_id` 留空 ⇒ 读侧
+    // 锚链表达式是 `COALESCE(p.process_chain_id, cur.chain_id)`，会回退捞到那条
+    // **未绑链** ⇒ 落 `chain_state == "TAIL"`（**不是 `NONE`**）。本用例要的只是
+    // 「非链推导形态」（`take_over_gate` 改判「工种有没有候选」），TAIL / NONE 两种
+    // 非链推导形态走**同一分支**，故断言结果不受影响。
+    // ⚠️ 想要真正的 `NONE` 形态（指针为 NULL）请照
+    // `locate_outsource_empty_work_type_candidate_returns_none_with_reason` 的显式
+    // 清列写法（那条同时清了 `current_process_id` 与 `current_process_step_id` 并
+    // 断言 `chain_state == "NONE"`），别照注释字面理解 `with_chain=false` 的语义。
+    let (_part, batch, _step) =
+        insert_worker_held_part(&pool, customer, "SN-WPDEL", holder, proc, 1, false).await;
+
+    let (s, env) = locate(&app, &token, "SN-WPDEL", Some(taker)).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let b = first_batch(&env);
+    assert_eq!(b["batch_id"], batch.to_string(), "前置：本用例针对该批次: {env}");
+    assert_eq!(
+        b["action"], "TAKE_OVER",
+        "写侧单候选自动推导会成功，读侧不得藏按钮（假阻挡）: {env}"
+    );
+    assert_eq!(b["disabled_reason"], Value::Null);
+    assert_eq!(
+        env["data"]["worker_processes"],
+        json!([]),
+        "出参是窄集合：软删工序没有可展示的名字，不进 picker: {env}"
+    );
+}
+
+/// 2026-10-16 review 第 1 轮 MINOR-4 补齐：`outsource_gate` 的「工种零候选 ⇒
+/// `PROCESS_NOT_IN_WORK_TYPE`」**读侧**用例（此前只测了 `TAKE_OVER` 一侧；两个
+/// gate 是两个独立函数，只测一个等于放过另一个）。
+///
+/// 对位写侧：`POST /scan/outsource-receive` 判据 5 的「0 条 ⇒ `20104` 工人 X 的
+/// 工种未映射任何工序」。无链形态（`chain_state=NONE`）走「改判工种候选」那条。
+#[tokio::test]
+async fn locate_outsource_empty_work_type_candidate_returns_none_with_reason() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "LOCATE-OS-EMPTY").await;
+    let proc = seed_process(&pool, "LOC-OS-EMPTY", "工序").await;
+    // 工种存在但**不 link** 任何工序 ⇒ 写侧判据 5 的候选集为空
+    let wt = insert_work_type(&pool, "WT-OS-EMPTY", "空工种", Some(5)).await;
+    let worker = insert_worker(&pool, "BC-OS-EMPTY", "工", Some(wt)).await;
+    let company = insert_outsource_company(&pool, "外协公司-己").await;
+    let (_part, batch, _step) =
+        insert_worker_held_part(&pool, customer, "SN-OS-EMPTY", worker, proc, 1, false).await;
+    force_batch_state(
+        &pool,
+        batch,
+        "OUTSOURCE",
+        Some("OUTSOURCE_COMPANY"),
+        Some(company),
+    )
+    .await;
+    // 出池清工序不变式：外协批次的当前工序与 step 指针都清空 ⇒ 链推导整体不进
+    // （⚠️ 否则 `insert_worker_held_part` 造的「未绑链 step」会被锚链回退
+    // `COALESCE(p.process_chain_id, cur.chain_id)` 捞回来，落 `TAIL` 而非 `NONE`）。
+    sqlx::query(
+        "UPDATE t_part_batch SET current_process_id = NULL, current_process_step_id = NULL \
+         WHERE id = $1",
+    )
+    .bind(batch)
+    .execute(&pool)
+    .await
+    .expect("clear process columns");
+
+    let (s, env) = locate(&app, &token, "SN-OS-EMPTY", Some(worker)).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let b = first_batch(&env);
+    assert_eq!(b["chain_state"], "NONE", "前置：无链形态: {env}");
+    assert_eq!(
+        b["action"],
+        Value::Null,
+        "零候选时写侧必拒 20104，读侧不得给可点按钮: {env}"
+    );
+    assert_eq!(b["disabled_reason"], "PROCESS_NOT_IN_WORK_TYPE");
+    assert_eq!(env["data"]["worker_processes"], json!([]));
+}
+
 /// 品检中批次 → `NONE + INSPECTION`（指引找品检）。
 #[tokio::test]
 async fn locate_inspection_batch_returns_none_inspection_reason() {
@@ -1171,6 +1413,20 @@ async fn locate_field_contract_pins_every_key() {
             "version",
         ],
         "LocateBatchItem 字段集变了（同步前端 schema）: {env}"
+    );
+
+    // ---- 顶层键集合（2026-10-16 起 3 键：多了 `worker_processes`）----
+    let mut out_keys: Vec<&str> = env["data"]
+        .as_object()
+        .expect("data 是对象")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    out_keys.sort_unstable();
+    assert_eq!(
+        out_keys,
+        ["batches", "part", "worker_processes"],
+        "LocateOut 顶层键集变了（同步前端 schema）: {env}"
     );
 
     // ---- chain_state 三字面量全部可达 ----

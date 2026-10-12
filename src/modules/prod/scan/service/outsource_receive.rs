@@ -13,11 +13,29 @@
 //! | 2 | 批次存在、part 存在 | `20109` / `20101` |
 //! | 3 | 客户端 `version` 与批次 OCC 比对 | `40901` |
 //! | 4 | `status='OUTSOURCE'`；`location='OUTSOURCE_COMPANY'` 且有持有人 | `20103` / `20122` |
-//! | 5 | 下一道解析：显式 `next_process_id` 覆盖链推导；缺省时**无链 ⇒ `40001`**，有链 ⇒ `resolve_receive_next_process` 推导（推不出按其两段 `20706` 文案） | `40001` / `20706` |
-//! | 6 | 下一道 ∈ 扫码工种的活跃工序映射（`WorkTypeRepo::list_process_ids`） | `20104` |
+//! | 5 | 目标工序解析（三态，见下） | `40001` / 零候选 `20104` / `20706` |
+//! | 6 | 目标工序 ∈ 扫码工种的活跃工序映射（`WorkTypeRepo::list_process_ids`） | `20104` |
 //! | 7 | 容量预检 `QueueService::ensure_worker_has_capacity` | `20904` / `20204` |
 //! | 8 | stage①：`receive_from_outsource_inner`（落 `IN_PROCESS + PRODUCTION_SHELF` + 关 shipment + `RECEIVED_FROM_OUTSOURCE`） | `20508` |
 //! | 9 | stage②：`ScanService::pick_up`（同事务把批次交到工人手上 + `PICKED_UP`） | 复检容量 `20904` / `20204`、OCC `40901` |
+//!
+//! ## 第 5 步的三个分支（**2026-10-16 新语义**：目标工序改由工种映射推导）
+//!
+//! 与 `transfer.rs` 第 6 步同一套业务口径（工人不该在全部工序里挑，该做什么由他的
+//! 工种说了算），但**优先级次序刻意不同**：
+//!
+//! 1. **显式 `next_process_id`** ⇒ 直接用它（**覆盖链推导**，既有语义逐字不变）；
+//! 2. **链推导** ⇒ 缺省时仍先按 outsource 域的 `resolve_receive_next_process`
+//!    推导（有链且能推出时工种候选**不参与**）——「有链且能推导」这条老路子的行为
+//!    与 2026-10-15 逐字相同（回归 `outsource_receive_derives_next_process_from_chain`）；
+//! 3. **链推导不可用**（无链 / 链已软删 / 指针漂移 / 链内歧义 / 链尾）⇒ 退回工种候选
+//!    `t_work_type_process` 活跃映射（**不与工序链求交**）：恰好 1 条 ⇒ 自动推导
+//!    （**不要求前端传**）；>1 条 ⇒ 有链的返 `20706`（保留「请手填」指引）、无链的
+//!    返 `40001`；0 条 ⇒ `20104`「工人 X 的工种未映射任何工序，无法收回」。
+//!
+//! 与 `transfer.rs` 的次序差异有实据：本端点的链推导口径是 outsource 域的
+//! `NEXT_PROCESS_LATERAL_SQL`（`sort_order = 当前 + 1`），在稀疏链上与读侧不等价
+//! （分叉登记见 `docs/api/scan.md` §8），故**链能推时优先信链**、推不出才用工种兜底。
 //!
 //! ## 为什么 stage① 复用 outsource 域的 `receive_from_outsource_inner`
 //!
@@ -41,9 +59,25 @@
 //! stage① 与 stage② 同一事务，stage② 失败（容量预检后极罕见）整体回滚
 //! ⇒「要么全成、要么全无」。
 //!
-//! ⚠️ 写入侧**没有**「下一道 ∈ 工种」的第二道闸门（stage① / `pick_up` 都不校验
+//! ⚠️ 写入侧**没有**「目标工序 ∈ 工种」的第二道闸门（stage① / `pick_up` 都不校验
 //! 工序归属），判据 6 是本端点唯一的工种资格闸门 —— 与 `take-over` / `queue/move`
 //! 同款纪律（写侧集中守一次，不让读侧与写侧各判一套）。
+//!
+//! ## step 指针：`Lenient`（2026-10-16，review 第 1 轮 BLOCKER-1）
+//!
+//! stage① 传 [`StepResolve::Lenient`]：**有链但链内定位不到目标工序 ⇒ step 落
+//! `NULL`，不再 `20702`**。这不是宽容而是本端点新语义的**必然推论** —— 第 5 步的
+//! 工种候选集刻意不与工序链求交，而「part 有链 + 链推不出（指针漂移 / 链内歧义 /
+//! 链尾 / 稀疏链）」正是候选集唯一会被激活的形态之一；该形态下自动推导出来的工序
+//! **必然可能不在链内**（决策 2 的求交禁令的直接后果）。若 stage① 沿用
+//! `/outsource-queue/move` 回收臂的 `optional_step_id`，就会出现「新代码制造输入、
+//! 新代码原样打回」的自相矛盾。
+//!
+//! ⚠️ `/outsource-queue/move` 的回收臂传 [`StepResolve::Strict`]，那条端点的行为
+//! **一行未变**；`shared::batch::guards::optional_step_id` 的全局语义也**没动**。
+//! 落 `NULL` 不丢数据：外协批次按「出池清工序」不变式该列恒 `NULL`，而
+//! `mark_batch_with_status_and_meta` 的 `None` → `clear_process_step_id = true`
+//! 对已是 `NULL` 的列是 no-op（详见 `StepResolve` 的 doc）。
 
 use sqlx::PgConnection;
 
@@ -52,7 +86,7 @@ use crate::infra::snowflake::SnowflakeIdGenerator;
 // 2026-10-15：回收臂内核与「下一道」推导自 outsource 域复用（`pub(crate)`）。
 // `prod::scan` 是转发型域（整域不适用域隔离护栏），跨域 import 是既定 pattern。
 use crate::modules::outsource::service::move_svc::{
-    receive_from_outsource_inner, resolve_receive_next_process,
+    StepResolve, receive_from_outsource_inner, resolve_receive_next_process,
 };
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::prod::queue::service::QueueService;
@@ -152,31 +186,68 @@ impl ScanService {
                 ),
             )
         })?;
-        // ── 5. 下一道解析 ───────────────────────────────────────────────────────
-        // 显式值**覆盖链推导**（与 `resolve_receive_next_process` 的 `given` 分支
-        // 同义，语义逐字一致）；缺省时才按链走 outsource 域的同一份推导。
-        let next_process = match req.next_process_id.as_deref() {
-            Some(raw) => raw
-                .parse::<i64>()
-                .map_err(|_| AppError::validation("next_process_id 非法"))?,
-            None => {
-                // 无链零件手写工单是常态：收回必须知道落哪道工序，而链推导对无链
-                // 无解 ⇒ `40001` 明确要求手填（有链时才复用 `20706` 的两段文案）。
-                if optional_process_chain(&mut *conn, batch.part_id)
-                    .await?
-                    .is_none()
-                {
-                    return Err(AppError::validation("无链零件收回必须手填 next_process_id"));
-                }
-                resolve_receive_next_process(&mut *conn, batch.id, None).await?
-            }
-        };
-        // ── 6. 下一道 ∈ 扫码工种的活跃工序映射（本端点唯一的工种资格闸门）──────
+        // ── 5. 目标工序解析（三态：显式 / 链推导 / 工种单候选自动推导）────────
+        // 工种候选**先查出来**（2026-10-16）：分支 3 的自动推导与判据 6 的工种闸门
+        // 共用同一份，与 `transfer` 逐字同源。
         let process_ids = crate::modules::prod::work_type::repo::WorkTypeRepo::list_process_ids(
             &mut *conn,
             work_type_id,
         )
         .await?;
+        // 显式值**覆盖链推导**（与 `resolve_receive_next_process` 的 `given` 分支
+        // 同义，语义逐字一致）；缺省时按「链推导 → 工种候选」两级回落。
+        let next_process = match req.next_process_id.as_deref() {
+            Some(raw) => raw
+                .parse::<i64>()
+                .map_err(|_| AppError::validation("next_process_id 非法"))?,
+            None => {
+                // 分支 1：链推导**逐字保留既有路径**（含 `20706` 的两段文案）——
+                // 有链且能推导出下一道时，工种候选不参与。
+                let chain_err =
+                    if optional_process_chain(&mut *conn, batch.part_id).await?.is_some() {
+                        match resolve_receive_next_process(&mut *conn, batch.id, None).await {
+                            Ok(pid) => Some(Ok(pid)),
+                            Err(err) => Some(Err(err)),
+                        }
+                    } else {
+                        None
+                    };
+                match chain_err {
+                    Some(Ok(pid)) => pid,
+                    // 分支 2/3：链推不出（无链 / 指针漂移 / 链内歧义 / 链尾）⇒ 退回
+                    // 工种候选（**不与工序链求交** —— 这种形态下默认工序链已不适用）。
+                    other => match process_ids.as_slice() {
+                        // 恰好一道 ⇒ 自动推导，**不要求前端传**
+                        [only] => *only,
+                        // 一条都没有 ⇒ 该工种不可作业
+                        [] => {
+                            return Err(AppError::biz(
+                                code::BIZ_INVALID_VALUE,
+                                format!(
+                                    "worker {} 的工种未映射任何工序，无法收回",
+                                    worker.id
+                                ),
+                            ));
+                        }
+                        many => {
+                            return Err(match other {
+                                // 有链但推不出 + 多候选 ⇒ 保留链推导自己的 `20706`
+                                // 文案（「请手填」），那正是前端该看到的指引。
+                                Some(Err(err)) => err,
+                                // 无链 + 多候选 ⇒ `40001`
+                                _ => AppError::validation(format!(
+                                    "worker {} 的工种有 {} 道工序，无法从工序链推导收回后的工序，\
+                                     必须在 next_process_id 里显式指定",
+                                    worker.id,
+                                    many.len()
+                                )),
+                            });
+                        }
+                    },
+                }
+            }
+        };
+        // ── 6. 目标工序 ∈ 扫码工种的活跃工序映射（本端点唯一的工种资格闸门）──────
         if !process_ids.contains(&next_process) {
             return Err(AppError::biz(
                 code::BIZ_INVALID_VALUE,
@@ -197,6 +268,12 @@ impl ScanService {
             &batch,
             &part,
             next_process,
+            // 2026-10-16（review 第 1 轮 BLOCKER-1）：本端点的目标工序可由工种
+            // 映射推导、且候选集刻意不与工序链求交 ⇒「有链 + 链外工序」是本端点
+            // 自己生产出来的合法输入，必须传 `Lenient`（落 `NULL` step），否则
+            // stage① 会被 `optional_step_id` 打回 `20702`。`/outsource-queue/move`
+            // 的回收臂传 `Strict`，那条端点行为逐字不变。
+            StepResolve::Lenient,
             None,
             current,
         )
