@@ -76,10 +76,13 @@
 //!
 //! ### 退避常数
 //!
-//! [`service::POLL_BACKOFF_SECONDS`] = **2s**、上限
-//! [`service::POLL_BACKOFF_MAX_SECONDS`] = **5s**。当前是**固定 2s**、无递增
-//! （本表没有「已轮询次数」列，加递增要改 schema，而 CI 通常几秒内收敛）；
-//! 上限常量是给「将来加递增退避」预留的接缝。
+//! 缺省 [`crate::infra::config::PREVIEW_POLL_BACKOFF_DEFAULT_SECONDS`] = **2s**，
+//! 可经 env `PREVIEW_POLL_BACKOFF_SECONDS` 调到 `1..=5`（上界
+//! [`crate::infra::config::PREVIEW_POLL_BACKOFF_MAX_SECONDS`] = 5s；区间外启动
+//! 直接报错，见 `validate_preview_poll_backoff`）。2026-10-13 起可配：生产设 1
+//! 让首次等待更快（CI 转图通常很短），缺省 2 与改动前行为逐字一致。当前仍是
+//! **固定间隔、无递增**（本表没有「已轮询次数」列，加递增要改 schema，而 CI 通常
+//! 几秒内收敛）；上限常量是给「将来加递增退避」预留的接缝。
 //!
 //! ⚠️ `retry_after_ms` 在**所有**返 PENDING 的分支上都必须传「距**现在**还差多久」
 //! （即 `next_poll_at - now`），不能传 `next_poll_at - next_poll_at` —— 后者恒为
@@ -285,13 +288,13 @@
 //! | 1 | 渲染配方换代（CI 镜像升级 / DPI / 质量调整）后，旧 `READY` 行与 CDN 缓存会继续供旧图 | **已修（2026-10-12）**：渲染配方版本入 seed（[`service::PREVIEW_RECIPE_VERSION`]）—— 改配方必须递增该常量，种子随之换代 ⇒ 新目录 / 新行 / 新 URL |
 //! | 2 | **python 侧端点尚未实现**：本模块打的是 `POST/GET /api/v1/files/ci-preview-jobs`，截至 2026-10-13 `backend-python/` 无该实现。未部署 python 端时走 `NoopPyBackend` 返 21118（HTTP 502），**不会静默成功** | **跨仓待办**（python 侧实现前，本端点在生产恒 502） |
 //! | 3 | `preview_seed` 在 `content_sha256 IS NULL` 的历史行上**退回按 `object_key` 哈希**，非内容寻址 ⇒ 同一份内容挂不同文件名会重复跑 CI | **未修**（要回填历史行哈希得重读 COS 对象，属独立立项） |
-//! | 4 | `next_poll_at` 的退避**固定 2s、无递增**，长文档（大 PDF 几百页）渲染超过 ~10s 时前端会持续轮询到收敛 | **未修**（本表无「轮询次数」列；上限常数 `POLL_BACKOFF_MAX_SECONDS=5s` 已预留接缝） |
+//! | 4 | `next_poll_at` 的退避**固定间隔（缺省 2s，可经 env `PREVIEW_POLL_BACKOFF_SECONDS` 调 1..=5）、无递增**，长文档（大 PDF 几百页）渲染超过 ~10s 时前端会持续轮询到收敛 | **未修**（本表无「轮询次数」列；上限常数 `PREVIEW_POLL_BACKOFF_MAX_SECONDS=5s` 已预留接缝） |
 //! | 5 | 预览图 public-read **无过期、无撤销**（除改 COS ACL）；且无法按零件关闭 | **有意保留 + 已登记**（用户拍板选项 A；见「安全取舍反转」一节） |
 //! | 6 | **CI 终局失败的落点是 `FAILED` + 21117，不静默重提 job**（`NotExist` / `Cancel` / `Pause` 三者同判）。代价：`Pause` 若在 CI 侧存在「自动恢复」的场景会被**过早判死**（多跑一个 job 而非永远失败） | **有意 + 已论证**（见「CI 终局失败的落点」一节，含「为什么不会变成无限提交 job」的论证） |
 //! | 7 | **跨仓词表缺口（2026-10-13 review 第 1 轮已修 rust 侧）**：`NotExist` 是 python **合成**的词（CI 官方六态里没有），python 侧**只负责产出、不抛 404、不加 `exists` 位**；**识别与落点全部由 rust 负责**（`parse_ci_status`）。此前 rust 只认 `Success`/`Failed`，其余全落「进行中」⇒ `NotExist` / `Cancel` / `Pause` 会**无限轮询** | **已修（rust 侧）**；**python 侧需同步 doc**（把 `NotExist` 从「CI 官方状态」改述为「本仓合成」，位置清单见本节末） |
 //! | 8 | **状态字段名跨仓两种写法**：`forward_ci_describe` 的响应模型字段是 **`state`**（python `CiPreviewJobStatus.state`，模块 docstring 的线上样例也是它），`status` 键在 python 侧**根本不存在**。本仓**两个键都读、`state` 优先**（读错 ⇒ 空串 ⇒ 落 `Running` 兜底 ⇒ 无限轮询）。⚠️ 2026-10-13 review 第 1 轮 MINOR-1 订正：此前实现是 `status` 优先、**顺序反了** | **已在本仓兜住**；两侧收敛到同一键名后可删掉 `status` 那一支 |
 //! | 9 | **提交请求体的跨仓字段名错配（2026-10-13 review 第 1 轮 BLOCKER，已修）**：本仓发 `{src_object_key, preview_prefix, preview_seed}`，python 的 `CiPreviewJobRequest` 只有 `{src_object_key, dst_prefix}` 且 `dst_prefix` **必填** ⇒ pydantic 静默丢掉两个多余键 + FastAPI **422** ⇒ **每一次 submit 都失败**，行永远停在 `PENDING / ci_job_id IS NULL` | **已修**（body 改为 `dst_prefix` + 抽出与 `preview_urls` 同源的 `preview_object_prefix` 真源；跨仓契约由 `tests/files/preview.rs::submit_request_body_matches_python_schema` 钉死） |
-//! | 10 | **`Success` 但 `total_page_count == 0` ⇒ 永远 PENDING 且每 2s 真打一次 python**（护栏的代价）：CI 若**永久**不返回页数（如 python 侧 `DocProcessResult` 结构变更导致该字段恒缺），行会**永不停**地以固定 2s 打 python（无递增退避，见 #4）⇒ **一次打不开的预览 = 一个永不停歇的 python 探针**。⚠️ **跨仓义务（前端）**：收到 **21117 / 21118** 时**必须停止自动重试**并回落 `GET /objects/{id}/content`（原始 PDF），**不得**按 `retry_after_ms` 无限重调 —— 每一次重试在「提交失败后自愈」这条路径上都是**一次新的 CI job**（按页计费） | **未修（有意）**：改成「N 次后判 FAILED」要改 schema（加轮询计数字段）。**该义务落在前端**，本仓已在 `PreviewOut` 的 `retry_after_ms` 语义与本表登记 |
+//! | 10 | **`Success` 但 `total_page_count == 0` ⇒ 永远 PENDING 且以固定节流间隔（缺省 2s，可配 1..=5）真打一次 python**（护栏的代价）：CI 若**永久**不返回页数（如 python 侧 `DocProcessResult` 结构变更导致该字段恒缺），行会**永不停**地以固定节流间隔打 python（无递增退避，见 #4）⇒ **一次打不开的预览 = 一个永不停歇的 python 探针**。⚠️ **跨仓义务（前端）**：收到 **21117 / 21118** 时**必须停止自动重试**并回落 `GET /objects/{id}/content`（原始 PDF），**不得**按 `retry_after_ms` 无限重调 —— 每一次重试在「提交失败后自愈」这条路径上都是**一次新的 CI job**（按页计费） | **未修（有意）**：改成「N 次后判 FAILED」要改 schema（加轮询计数字段）。**该义务落在前端**，本仓已在 `PreviewOut` 的 `retry_after_ms` 语义与本表登记 |
 //! | 11 | **`?size=a&size=b` 重复键 ⇒ 纯文本 400**（不进 `R<T>` 信封、无业务码）：`Query<PreviewQuery>` 的提取器层判定（serde_urlencoded 对单值字段遇重复键报错），非本 handler 可控。**单值非法**（`?size=bogus`）不受影响，走 40001 / 422 信封 | **已知残余（平台级行为，不修）**：实现 `RawQuery` 手解仅为兜一个病态输入，收益不抵多一层解析；前端按单值拼参即可 |
 //!
 //! ### 需要 `backend-python` 同步的位置（本 PR 无法触及，python 在另一 worktree）

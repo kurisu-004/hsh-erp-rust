@@ -3,14 +3,14 @@
 //! 被测端点：`GET /api/v2/files/objects/{file_id}/preview`
 //! （COS CI 图纸预览，惰性轮询、零后台任务）。
 //!
-//! ## 覆盖场景：**33 个测试函数**（2026-10-12 新增 3 条后逐函数点数）
+//! ## 覆盖场景：**34 个测试函数**（2026-10-13 新增 1 条后逐函数点数）
 //!
-//! 拆开是 **24 个编号函数**（下表 23 个编号条目，含 8b；其中 #18 一条覆盖 2 个
+//! 拆开是 **25 个编号函数**（下表 24 个编号条目，含 8b；其中 #18 一条覆盖 2 个
 //! 函数）+ **9 条不编号护栏**。
 //!
 //! ⚠️ 本节的数字是纯手工维护的散文 ⇒ **改本文件时必须逐函数点数核对**，按
 //! 「编号条目 / 实际函数」两栏分开写，避免「一个条目两个函数」的歧义。
-//! 2026-10-12（`size` 档位 + 配方版本）后的真值：**33**。
+//! 2026-10-13（轮询节流可配新增 #23）后的真值：**34**。
 //!
 //! | # | 用例（⚠️ 一条可含多个函数） | 函数数 | 断言要点 |
 //! |---|---|---:|---|
@@ -37,7 +37,8 @@
 //! | 20 | `failed_heal_losing_racer_does_not_submit_again` | 1 | **路径 B**：自愈输家（`reset_to_pending` 得 0 行）**不再提交** |
 //! | 21 | `size_query_selects_image_params_tier` | 1 | **2026-10-12 `size` 档位**：缺省/空/空白 ⇒ view 参数；thumb ⇒ thumb；full ⇒ **无 query**（READY 零 IO） |
 //! | 22 | `invalid_size_returns_422_without_side_effects` | 1 | 非法 `size` ⇒ 422 + 信封 40001，**零副作用**（不打 python、不建 `t_file_preview` 行 —— 解析先于 DB） |
-//! | | **编号小计** | **24** | |
+//! | 23 | `preview_poll_backoff_one_second_yields_retry_after_1000ms` | 1 | **2026-10-13 轮询节流可配**：`PreviewService::new(..., 1)`（模拟 env 配 1）⇒ 首响应 PENDING 的 `retry_after_ms` 精确 **1000**（未接通实现会返缺省 2000） |
+//! | | **编号小计** | **25** | |
 //!
 //! 另有 **9 条护栏**（不编号）：
 //! - `preview_route_is_not_swallowed_by_sibling_catch_alls` —— **matchit 冲突的实测**
@@ -57,7 +58,7 @@
 //! - `concurrent_takeover_of_expired_claim_submits_once` —— 过期认领的并发接管只提一次
 //! - `live_claim_blocks_all_python_calls_until_lease_expiry` —— 租约期内零 python 调用
 //!
-//! **合计 24 + 9 = 33 个测试函数。**
+//! **合计 25 + 9 = 34 个测试函数。**
 //!
 //! ## matchit 冲突的验证方式（本文件最重要的一条护栏）
 //!
@@ -375,7 +376,7 @@ async fn ready_cache_hit_never_calls_python() {
 
 /// 通过 service 直调预览（本文件多数用例走这条，省掉 JWT / Redis 开销）。
 async fn call_preview(pool: &PgPool, state: &Arc<AppState>, file: &TPartFile) -> PreviewOut {
-    PreviewService::new(shared_test_snowflake().clone())
+    PreviewService::new(shared_test_snowflake().clone(), 2)
         .get_preview(
             pool,
             &state.py_backend,
@@ -562,7 +563,7 @@ async fn describe_failed_returns_21117() {
     let _ = call_preview(&pool, &state, &file).await;
     force_poll_due(&pool, &seed).await;
 
-    let err = PreviewService::new(shared_test_snowflake().clone())
+    let err = PreviewService::new(shared_test_snowflake().clone(), 2)
         .get_preview(
             &pool,
             &state.py_backend,
@@ -611,7 +612,7 @@ async fn submit_forward_failure_returns_21118() {
     let mut state = test_state(pool.clone()).await;
     let _app = app_with_mock(&mut state, mock);
 
-    let err = PreviewService::new(shared_test_snowflake().clone())
+    let err = PreviewService::new(shared_test_snowflake().clone(), 2)
         .get_preview(
             &pool,
             &state.py_backend,
@@ -679,7 +680,7 @@ async fn submit_upstream_502_propagates_ci_reason() {
     let mut state = test_state(pool.clone()).await;
     let _app = app_with_mock(&mut state, mock);
 
-    let err = PreviewService::new(shared_test_snowflake().clone())
+    let err = PreviewService::new(shared_test_snowflake().clone(), 2)
         .get_preview(
             &pool,
             &state.py_backend,
@@ -732,7 +733,7 @@ async fn non_pdf_and_non_drawing_kind_return_21116() {
         ("非 PDF", not_pdf),
     ] {
         let file = fetch_row(&pool, id).await;
-        let err = PreviewService::new(shared_test_snowflake().clone())
+        let err = PreviewService::new(shared_test_snowflake().clone(), 2)
             .get_preview(
                 &pool,
                 &state.py_backend,
@@ -779,7 +780,7 @@ async fn concurrent_misses_submit_only_one_job() {
 
     let mut state = test_state(pool.clone()).await;
     let _app = app_with_mock(&mut state, mock);
-    let svc = PreviewService::new(shared_test_snowflake().clone());
+    let svc = PreviewService::new(shared_test_snowflake().clone(), 2);
     let user = test_user(vec![Role::Manager]);
 
     let (a, b) = tokio::join!(
@@ -906,7 +907,7 @@ async fn shelf_account_can_get_preview() {
     .await
     .unwrap();
 
-    let out = PreviewService::new(shared_test_snowflake().clone())
+    let out = PreviewService::new(shared_test_snowflake().clone(), 2)
         .get_preview(
             &pool,
             &state.py_backend,
@@ -954,7 +955,7 @@ async fn describe_once(
 
     let mut state = test_state(pool.clone()).await;
     let _app = app_with_mock(&mut state, mock);
-    let svc = PreviewService::new(shared_test_snowflake().clone());
+    let svc = PreviewService::new(shared_test_snowflake().clone(), 2);
     let user = test_user(vec![Role::Manager]);
 
     // 第 1 次：新 seed ⇒ 登记 + 提交 ⇒ PENDING
@@ -1292,7 +1293,7 @@ async fn concurrent_due_retries_submit_only_one_job() {
 
     let mut state = test_state(pool.clone()).await;
     let _app = app_with_mock(&mut state, mock);
-    let svc = PreviewService::new(shared_test_snowflake().clone());
+    let svc = PreviewService::new(shared_test_snowflake().clone(), 2);
     let user = test_user(vec![Role::Manager]);
 
     let (a, b) = tokio::join!(
@@ -1366,7 +1367,7 @@ async fn failed_heal_losing_racer_does_not_submit_again() {
     // 赢家：自愈 + 提交一个新 job
     // ⚠️ `app_with_mock` 要 `Arc::get_mut`，state 的强计数必须是 1 —— 所以**每次
     // 都从 `test_state` 现造一份**，不能 clone 上一份（`test_app` 也会多存一份）。
-    let svc = PreviewService::new(shared_test_snowflake().clone());
+    let svc = PreviewService::new(shared_test_snowflake().clone(), 2);
     let user = test_user(vec![Role::Manager]);
 
     let mut mock_win = MockPyBackendClient::new();
@@ -1488,7 +1489,7 @@ async fn concurrent_takeover_of_expired_claim_submits_once() {
 
     let mut state = test_state(pool.clone()).await;
     let _app = app_with_mock(&mut state, mock);
-    let svc = PreviewService::new(shared_test_snowflake().clone());
+    let svc = PreviewService::new(shared_test_snowflake().clone(), 2);
     let user = test_user(vec![Role::Manager]);
 
     let (a, b) = tokio::join!(
@@ -2035,6 +2036,69 @@ async fn invalid_size_returns_422_without_side_effects() {
                 .unwrap();
         assert_eq!(cnt, 0, "size={bad:?} 非法值不得产生 t_file_preview 行");
     }
+}
+
+// ===========================================================================
+//  23（2026-10-13 新增）：轮询节流可配 —— 配 1s 时首响应 retry_after_ms
+// ===========================================================================
+
+/// 场景 23：`PreviewService::new(..., 1)`（模拟 env `PREVIEW_POLL_BACKOFF_SECONDS=1`）
+/// 时，首次请求「登记 + 提交」后返回的 PENDING `retry_after_ms` 必须是 **1000**
+/// （而不是缺省 2s 的 2000）。
+///
+/// 本条钉的是「节流间隔**真的**从构造参数读出、不是写死 2s」：未接通的实现会返回
+/// 2000 而当场红。
+///
+/// ⚠️ 用 `assert_eq!(1000)` 而不是 `(0, 1000]` 区间断言，是因为该值在这里**确定性**
+/// 可算：走的是「提交成功后 `pending_out` 按 `next_poll_at - now` 算」的正常分支，
+/// `next_poll = now + Duration::seconds(1)` 与传入的 `now` 是**同一个内存快照**
+/// （`now` 在 `get_preview` 开头取一次，mock 提交不消耗时钟），chrono 的微秒精度下
+/// 差值恒为 1_000_000µs ⇒ 1000ms。区间断言反而会掩盖「实现读错字段」的错误。
+#[tokio::test]
+async fn preview_poll_backoff_one_second_yields_retry_after_1000ms() {
+    let pool = test_pool().await;
+    let file_id = insert_part_file(
+        &pool,
+        "DRAWING",
+        "PDF",
+        "backoff-1s.pdf",
+        Some(&"d".repeat(64)),
+    )
+    .await;
+    let file = fetch_row(&pool, file_id).await;
+
+    let mut mock = MockPyBackendClient::new();
+    mock.expect_forward_ci_submit()
+        .times(1)
+        .returning(|_body, _headers| Ok(ci_ok(json!({"job_id": "job-backoff-1"}))));
+    mock.expect_forward_ci_describe().never();
+
+    let mut state = test_state(pool.clone()).await;
+    let _app = app_with_mock(&mut state, mock);
+
+    // ⚠️ 与文件里其余调用点（`call_preview` 走缺省 2）不同：本条显式传 1。
+    let out = PreviewService::new(shared_test_snowflake().clone(), 1)
+        .get_preview(
+            &pool,
+            &state.py_backend,
+            PREVIEW_PREFIX,
+            PREVIEW_BASE_URL,
+            "",
+            &file,
+            &test_user(vec![Role::Manager]),
+        )
+        .await
+        .expect("预览调用应成功");
+
+    assert_eq!(out.state, "PENDING");
+    assert!(
+        out.retry_after_ms > 0,
+        "PENDING 必须给前端节流值（配 1 时也为正）"
+    );
+    assert_eq!(
+        out.retry_after_ms, 1000,
+        "配 1s ⇒ 首次提交后的 retry_after_ms 应精确为 1000ms（对缺省 2s 的 2000）"
+    );
 }
 
 // ===========================================================================

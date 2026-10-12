@@ -259,6 +259,9 @@ pub fn test_app_config() -> Arc<AppConfig> {
         ws_pong_timeout_seconds: 60,
         // 2026-10-02 新增：周期性 re-auth 周期（与生产缺省一致）。
         ws_reauth_every_n_heartbeats: 10,
+        // 2026-10-13 新增：CI 预览轮询节流（秒）。session service 单测不读，
+        // 取生产缺省 2 占位。
+        preview_poll_backoff_seconds: 2,
         request_timeout_seconds: 30,
         // 2026-10-03 新增：打印路径长档（session service 单测不读，取生产缺省值）。
         print_request_timeout_seconds: 660,

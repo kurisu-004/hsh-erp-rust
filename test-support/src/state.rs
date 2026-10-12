@@ -149,6 +149,9 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
         // 即每 2s 验一次 session，让「re-auth 失败 → 4001」这条安全核心路径
         // 在 CI 上可被 E2E 覆盖（缺省 10 需要 >10s，见 review 第 1 轮 Minor 7）。
         ws_reauth_every_n_heartbeats: 2,
+        // 2026-10-13 新增：CI 预览轮询节流（秒）。测试取生产缺省 2；「配 1」的分支
+        // 由 `tests/files/preview.rs` 用 `PreviewService::new(..., 1)` 直接覆盖。
+        preview_poll_backoff_seconds: 2,
         // 2026-09-20 新增：HTTP nest 请求超时；30s 默认足够测试用例（<1s）。
         request_timeout_seconds: 30,
         // 2026-10-03 新增：打印路径长档（`middleware::timeout` 按 `is_print_path`
@@ -244,6 +247,9 @@ pub async fn test_state_with_hs256_fallback_off(pool: PgPool) -> Arc<AppState> {
             allow_hs256_fallback: false,
             ..old_cfg.jwt.clone()
         },
+        // 2026-10-13 新增字段：与 `test_state_with_redis` 的缺省同值显式写出，
+        // 让本 fixture「只改 jwt 段」这句话在字段层面可核对。
+        preview_poll_backoff_seconds: 2,
         ..old_cfg
     });
     state_inner.config = new_cfg;
@@ -346,6 +352,7 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
         // 即每 2s 验一次 session，让「re-auth 失败 → 4001」这条安全核心路径
         // 在 CI 上可被 E2E 覆盖（缺省 10 需要 >10s，见 review 第 1 轮 Minor 7）。
         ws_reauth_every_n_heartbeats: 2,
+        preview_poll_backoff_seconds: 2,
         // 2026-09-20 新增：HTTP nest 请求超时。
         request_timeout_seconds: 30,
         // 2026-10-03 新增：打印路径长档（`middleware::timeout` 按 `is_print_path`
@@ -509,6 +516,7 @@ pub async fn test_state_with_cos(
         // 即每 2s 验一次 session，让「re-auth 失败 → 4001」这条安全核心路径
         // 在 CI 上可被 E2E 覆盖（缺省 10 需要 >10s，见 review 第 1 轮 Minor 7）。
         ws_reauth_every_n_heartbeats: 2,
+        preview_poll_backoff_seconds: 2,
         // 2026-09-20 新增：HTTP nest 请求超时。
         request_timeout_seconds: 30,
         // 2026-10-03 新增：打印路径长档（`middleware::timeout` 按 `is_print_path`
@@ -602,6 +610,9 @@ pub async fn test_state_with_wecom(
             enabled: !corp_id.is_empty(),
             ..WeComConfig::default()
         },
+        // 2026-10-13 新增字段：与 `test_state_with_redis` 的缺省同值显式写出
+        // （本 fixture 只改 wecom 段）。
+        preview_poll_backoff_seconds: 2,
         ..old_cfg
     });
     state_inner.config = new_cfg;

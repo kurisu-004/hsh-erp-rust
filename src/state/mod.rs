@@ -200,8 +200,12 @@ impl AppState {
         let outsource_service = Arc::new(OutsourceService::new(snowflake.clone()));
         // 2026-09-22 Group C 装线：part_file + cnc_program service；字段含 snowflake + cos。
         let part_file_service = Arc::new(PartFileService::new(snowflake.clone(), cos.clone()));
-        // 2026-10-13 PR2：CI 预览 service 装线；字段仅 snowflake。
-        let preview_service = Arc::new(PreviewService::new(snowflake.clone()));
+        // 2026-10-13 PR2：CI 预览 service 装线；字段含 snowflake + 轮询节流间隔
+        // （后者来自 env `PREVIEW_POLL_BACKOFF_SECONDS`，缺省 2、启动期已校验 1..=5）。
+        let preview_service = Arc::new(PreviewService::new(
+            snowflake.clone(),
+            config.preview_poll_backoff_seconds,
+        ));
         let cnc_program_service = Arc::new(CncProgramService::new(snowflake.clone(), cos.clone()));
         // 2026-09-22 D-2-simple prod/worker service 装线：仅需 snowflake。
         let worker_service = Arc::new(WorkerService::new(snowflake.clone()));

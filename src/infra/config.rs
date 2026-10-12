@@ -62,6 +62,19 @@ pub struct AppConfig {
     /// 环境变量 `WS_REAUTH_EVERY_N_HEARTBEATS`，缺省 `10`（生产 30s × 10 ≈ 5min）。
     /// 启动期强制校验 `>= 1`（0 ⇒ re-auth 静默永不触发，见 `ws_reauth_config`）。
     pub ws_reauth_every_n_heartbeats: u32,
+    /// 2026-10-13 新增：CI 预览轮询节流间隔（秒）。
+    ///
+    /// 环境变量 `PREVIEW_POLL_BACKOFF_SECONDS`，缺省 2
+    /// （[`PREVIEW_POLL_BACKOFF_DEFAULT_SECONDS`]），合法区间 `1..=5`
+    /// （上界 [`PREVIEW_POLL_BACKOFF_MAX_SECONDS`]），启动期由
+    /// `validate_preview_poll_backoff` 严格校验（fail-fast）。
+    ///
+    /// 语义：`preview::service` 在「首次登记 / 提交 CI job 后」把 `next_poll_at`
+    /// 推到的间隔秒数 —— 到期前的请求直接返 PENDING（零外部 IO），到期后才
+    /// describe 打 python。生产设 1 可让首次等待更快：前端 `usePreviewPolling`
+    /// 的第 1 次等待 = `clamp(后端建议值, 1s, 8s)`，后端配 1 ⇒ 前端第一次等 1s；
+    /// 前端的 1.6× 递增退避与本字段无关（不随它变）。
+    pub preview_poll_backoff_seconds: i64,
     /// 2026-09-20 新增：HTTP `/api/v2/*` nest 请求超时（秒）。仅挂在 nest 内层
     /// （不影响 WS 长连接，也不影响根 Router 的 CORS/Body limit）。环境变量
     /// `REQUEST_TIMEOUT_SECONDS`，缺省 `30`。
@@ -816,6 +829,10 @@ impl AppConfig {
             ws_pong_timeout_seconds,
             // 2026-10-02 新增：周期性 re-auth 的心跳周期（可注入，便于 CI 覆盖 4001 路径）。
             ws_reauth_every_n_heartbeats,
+            // 2026-10-13 新增：CI 预览轮询节流间隔（`preview::service` 的
+            // `next_poll_at` 推后量 + 前端建议重试间隔的缺省值）。缺省 2s 与
+            // 既有行为逐字一致；生产可设 1 让首次等待更快（前端 clamp(.., 1s, 8s)）。
+            preview_poll_backoff_seconds: preview_poll_backoff_config()?,
             // 2026-09-20 新增：HTTP nest 请求超时；与 WS 隔离（挂在内层）。
             request_timeout_seconds: env_parse("REQUEST_TIMEOUT_SECONDS", 30u64)?,
             // 2026-10-03 新增：打印路径专用 HTTP 超时档（`middleware::timeout` 按
@@ -988,6 +1005,69 @@ fn env_or_non_empty(key: &str, default: &str) -> String {
         Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
         _ => default.to_string(),
     }
+}
+
+/// 2026-10-13 新增：CI 预览轮询节流的**缺省**间隔（秒）。
+///
+/// 语义：`preview::service` 首次登记后 / 提交 CI job 后把 `next_poll_at` 推到的
+/// 间隔。取 **2s** 的理由（原 service 侧常量的 doc 迁入此处的取舍记录）：
+/// CI 光栅化一页 PDF 的典型耗时是几百毫秒到数秒，2s 足以让「点了预览立刻再看」
+/// 的用户在第二次请求就拿到结果；同时又不至于把 python 打成高频探针
+/// （前端轮询间隔通常 ≥1s）。
+///
+/// 可经 env `PREVIEW_POLL_BACKOFF_SECONDS` 覆盖（合法区间
+/// `1..=PREVIEW_POLL_BACKOFF_MAX_SECONDS`）；缺省 2 与改动前行为逐字一致，
+/// 生产想更快可设 1。
+pub const PREVIEW_POLL_BACKOFF_DEFAULT_SECONDS: i64 = 2;
+
+/// 2026-10-13 新增：预览轮询节流的**校验上限**（秒）。
+///
+/// 两处消费：① 启动期 `validate_preview_poll_backoff` 的合法区间上界；
+/// ② `preview::service` 侧对已落库值的**防御性 clamp**（启动校验才是真闸）。
+///
+/// ⚠️ 当前实现只写「登记 / 提交后推一个固定间隔」（**无递增退避**）：
+/// `t_file_preview` 没有「已轮询次数」列，加递增要改 schema，而 CI 通常几秒内
+/// 收敛。这个上限常量是给「将来真要加递增退避」预留的接缝 —— 那时退避序列写成
+/// `min(缺省值 × 2^n, 本上限)`。
+///
+/// 之所以现在就把它钉成一个常量而不是等需要时再加：让它**先在代码里存在**，
+/// 将来加递增退避的人能一眼看到上限在哪，而不必自己拍一个（拍高了会拖慢收敛）。
+pub const PREVIEW_POLL_BACKOFF_MAX_SECONDS: i64 = 5;
+
+/// 2026-10-13 新增：解析并校验 `PREVIEW_POLL_BACKOFF_SECONDS`（缺省 2）。
+///
+/// 拆成「读 env」+「纯校验」两层的理由与 `ws_liveness_config` 同款：
+/// `env_parse` 读**进程级全局 env**，同进程并行单测互相覆盖会 flaky；校验本身
+/// 零 IO，拆开后单测直接喂字面量即可确定性地覆盖边界。
+///
+/// ⚠️ `env_parse` 对「变量存在但为空串」会解析失败（启动报错）—— 这是有意的、
+/// 与其它数值变量同款；compose 已给缺省 2，`.env` / `.env.example` 里**不可留空**。
+fn preview_poll_backoff_config() -> Result<i64> {
+    let v = env_parse(
+        "PREVIEW_POLL_BACKOFF_SECONDS",
+        PREVIEW_POLL_BACKOFF_DEFAULT_SECONDS,
+    )?;
+    validate_preview_poll_backoff(v)
+}
+
+/// 预览轮询节流校验（**纯函数、零 IO**，便于单测直接喂字面量）。
+///
+/// 合法区间 `1..=PREVIEW_POLL_BACKOFF_MAX_SECONDS`，区间外 fail-fast
+/// （宁可不启动，也不要带病上线）：
+/// - `<= 0` 是**忙轮询**：`next_poll_at` 被推到当前或过去 ⇒ 前端拿到的
+///   `retry_after_ms` 恒 0 ⇒ 每个请求都真打一次 python / CI；
+/// - `> 上限` 无意义且有害：前端 `usePreviewPolling` 的单次等待 8s 封顶会把
+///   建议值截断，配大了不会「等更久」，只会让两端语义分叉。
+fn validate_preview_poll_backoff(v: i64) -> Result<i64> {
+    if !(1..=PREVIEW_POLL_BACKOFF_MAX_SECONDS).contains(&v) {
+        return Err(anyhow!(
+            "环境变量 PREVIEW_POLL_BACKOFF_SECONDS 必须在 \
+             1..={PREVIEW_POLL_BACKOFF_MAX_SECONDS}（秒）之间，实际 {v}：\
+             0 / 负数 = 忙轮询（retry_after_ms 恒 0，每个请求都真打 python）；\
+             超上限前端 8s 封顶会截断建议值。缺省 2，生产想更快可设 1"
+        ));
+    }
+    Ok(v)
 }
 
 /// 2026-10-01 新增：解析 WS 存活检测的两个环境变量
@@ -1228,6 +1308,38 @@ mod tests {
             validate_ws_liveness(20, 0).is_err(),
             "pong=0 必须 bail（一连接上就判死）"
         );
+    }
+
+    // =======================================================================
+    // 2026-10-13 新增：预览轮询节流校验（`validate_preview_poll_backoff`）。
+    //
+    // 表驱动直接喂字面量（不设 env）：`env_parse` 读进程级全局 env，
+    // 同进程并行单测会互相覆盖，与上面 `validate_ws_liveness` 同款理由。
+    // =======================================================================
+
+    /// 表驱动：`1 / 2 / 5` 放行且**原值返回**；`-1 / 0 / 6 / 100` 一律 bail。
+    ///
+    /// 两侧的钉子分别是「生产要配的 1」「缺省 2」「区间上界 5」与
+    /// 「忙轮询（0 / 负数）」「超上限（前端 8s 封顶会截断）」，缺任一条都会让
+    /// 区间的一端失去回归保护。
+    #[test]
+    fn validate_preview_poll_backoff_rejects_out_of_range() {
+        for v in [1, 2, 5] {
+            assert_eq!(
+                validate_preview_poll_backoff(v).expect("1..=5 应放行"),
+                v,
+                "合法值必须原样返回（缺省 2 / 生产 1 / 上界 5 都在这段里）"
+            );
+        }
+        for v in [-1, 0, 6, 100] {
+            let err = validate_preview_poll_backoff(v)
+                .expect_err("区间外必须 bail（0 / 负数 = 忙轮询；超上限前端 8s 封顶会截断建议值）");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("PREVIEW_POLL_BACKOFF_SECONDS") && msg.contains(&v.to_string()),
+                "报错必须带 env 名与实际值，便于运维定位：{msg}"
+            );
+        }
     }
 
     // =======================================================================

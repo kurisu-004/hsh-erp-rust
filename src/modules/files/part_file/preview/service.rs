@@ -13,6 +13,9 @@ use tracing::warn;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock::now_naive;
+// 2026-10-13 新增：轮询节流上限（`PreviewService::backoff*` 的防御性 clamp）。
+// 缺省 / env 名 / 启动校验见 `infra::config::preview_poll_backoff_config`。
+use crate::infra::config::PREVIEW_POLL_BACKOFF_MAX_SECONDS;
 use crate::infra::py_backend::PyBackendClient;
 use crate::modules::files::part_file::model::TPartFile;
 use crate::modules::files::part_file::preview::dto::PreviewOut;
@@ -35,10 +38,13 @@ pub const CLAIM_TOKEN_PREFIX: &str = "__claiming__:";
 /// 认领**租约**时长（秒）：认领成功后 `next_poll_at` 被推到 `now + 本值`，
 /// 在此之前**别的请求抢不走这枚 token**。
 ///
-/// ⚠️ **必须显著大于 [`POLL_BACKOFF_SECONDS`]（2s）**：认领之后紧接着是一次
-/// `POST /doc_jobs` 的**同步往返**，python 侧要落队列、要调 CI，耗时可能好几秒。
-/// 若租约只有 2s，第二个请求会在第一次还在飞的时候把认领抢走 ⇒ 两个都提交 ⇒
-/// **重复计费**（本方法存在的全部意义就是防这个）。
+/// ⚠️ **必须显著大于轮询节流间隔**（[`crate::infra::config::PREVIEW_POLL_BACKOFF_DEFAULT_SECONDS`]
+/// 缺省 2s、可经 env `PREVIEW_POLL_BACKOFF_SECONDS` 配 1..=5，2026-10-13 起可配）：
+/// 认领之后紧接着是一次 `POST /doc_jobs` 的**同步往返**，python 侧要落队列、要调
+/// CI，耗时可能好几秒。若租约只有节流间隔那么短 —— 即便配到区间上限 5s ——
+/// 第二个请求会在第一次还在飞的时候把认领抢走 ⇒ 两个都提交 ⇒ **重复计费**
+/// （本方法存在的全部意义就是防这个）。30s 对 1..=5s 区间仍有 ≥6× 余量，
+/// 「显著大于」这条约束在可配区间下依然成立。
 ///
 /// 取 **30s** 的取舍：够覆盖一次 CI 提交往返；又不至于让「认领者进程崩溃」之后
 /// 这份预览长时间无人接管（租约一过，下一次调用的 3d 分支就能重提）。
@@ -56,24 +62,6 @@ pub const CLAIM_TOKEN_PREFIX: &str = "__claiming__:";
 /// 别人的 job id」。本常量是**第一道**闸（少花钱），那条谓词是**第二道**闸
 /// （不产生错数据）。
 pub const CLAIM_LEASE_SECONDS: i64 = 30;
-
-/// 轮询节流：首次登记后 / 提交后到下一次允许轮询的间隔（秒）。
-///
-/// 取 **2s** 的理由：CI 光栅化一页 PDF 的典型耗时是几百毫秒到数秒，2s 足以让
-/// 「点了预览立刻再看」的用户在第二次请求就拿到结果；同时又不至于把 python 打成
-/// 高频探针（前端轮询间隔通常 ≥1s）。
-pub const POLL_BACKOFF_SECONDS: i64 = 2;
-
-/// 轮询退避上限（秒）。
-///
-/// ⚠️ 当前实现只写 [`POLL_BACKOFF_SECONDS`]（**无递增退避**）：本表没有「已轮询
-/// 次数」列，加递增要改 schema，而 CI 通常几秒内收敛，固定 2s 已经够。
-/// 这个上限常量是给「将来真要加递增退避」预留的接缝 —— 那时退避序列写成
-/// `min(POLL_BACKOFF_SECONDS * 2^n, POLL_BACKOFF_MAX_SECONDS)`。
-///
-/// 之所以现在就把它钉成一个常量而不是等需要时再加：让它**先在代码里存在**，
-/// 将来加递增退避的人能一眼看到上限在哪，而不必自己拍一个（拍高了会拖慢收敛）。
-pub const POLL_BACKOFF_MAX_SECONDS: i64 = 5;
 
 /// `error_message` 列宽上限（varchar(500)）。
 ///
@@ -118,16 +106,30 @@ pub const PREVIEW_SEED_HEX_LEN: usize = 32;
 /// - 版本只作为哈希输入：**不进 URL、不出现在任何输出**（种子仍是 32 位 hex）。
 pub const PREVIEW_RECIPE_VERSION: &str = "r2-dpi300q90";
 
-/// 预览任务的全部业务逻辑。字段仅 `snowflake`（发 `t_file_preview.id` 用）。
+/// 预览任务的全部业务逻辑。字段：`snowflake`（发 `t_file_preview.id` 用）+
+/// 轮询节流间隔。
 ///
 /// ⚠️ **本域零后台任务、零新增 cron**：状态推进完全由端点调用驱动。
 pub struct PreviewService {
     snowflake: Arc<crate::infra::snowflake::SnowflakeIdGenerator>,
+    /// 轮询节流间隔（秒），来自 `AppConfig::preview_poll_backoff_seconds`
+    /// （env `PREVIEW_POLL_BACKOFF_SECONDS`，缺省 2、启动期已校验 1..=5）。
+    ///
+    /// ⚠️ `backoff*()` 里还会**再 clamp 一次**，那是防御性的：启动校验才是真闸，
+    /// 但本值一旦绕过 `from_env`（测试直构 / 将来别的装配路径）配成 0 或负数，
+    /// `next_poll_at` 会被推到当前或过去 ⇒ `retry_after_ms` 恒 0 ⇒ 忙轮询。
+    poll_backoff_seconds: i64,
 }
 
 impl PreviewService {
-    pub fn new(snowflake: Arc<crate::infra::snowflake::SnowflakeIdGenerator>) -> Self {
-        Self { snowflake }
+    pub fn new(
+        snowflake: Arc<crate::infra::snowflake::SnowflakeIdGenerator>,
+        poll_backoff_seconds: i64,
+    ) -> Self {
+        Self {
+            snowflake,
+            poll_backoff_seconds,
+        }
     }
 
     /// `GET /api/v2/files/objects/{file_id}/preview` 的全部逻辑。
@@ -208,7 +210,8 @@ impl PreviewService {
                     &file.object_key,
                     // ⚠️ **置 `now()` 而不是「现在 + 退避」**：本次调用就是登记者，
                     // 它必须**紧接着**就提交 job（否则首次调用只会登记不提交，前端
-                    // 要等两秒后的第二次调用才看见 job 被提交）。
+                    // 要等一个节流间隔后的第二次调用才看见 job 被提交；间隔缺省 2s、
+                    // 可经 env `PREVIEW_POLL_BACKOFF_SECONDS` 配 1..=5）。
                     // `now()` 同时也让「登记成功但进程在提交前挂了」能被下一次调用
                     // 的 3d 分支补上（自愈）。
                     now,
@@ -230,7 +233,7 @@ impl PreviewService {
         let Some(row) = row.as_mut() else {
             // 并发分支：命中别人刚登记的 PENDING 且尚未提交，本调用不做任何推进。
             // 返 PENDING 让前端按 retry_after_ms 稍后再来（那时轮询条件已到期）。
-            return Ok(PreviewOut::pending(Self::backoff_ms()));
+            return Ok(PreviewOut::pending(self.backoff_ms()));
         };
 
         // 3a. READY → **立即返回，零 IO**。
@@ -264,7 +267,7 @@ impl PreviewService {
                 let Some(fresh) = PreviewRepo::find_by_seed(&mut *conn, &seed).await? else {
                     // 行被软删了（本仓 preview 侧零 DELETE，理论上不会发生）：
                     // 退化成「不推进」，让前端下轮再来。
-                    return Ok(Self::pending_out(row, &now));
+                    return Ok(self.pending_out(row, &now));
                 };
                 *row = fresh;
                 // 重新过 3a：可能已被别人推到 READY，那就该零 IO 直接返。
@@ -278,7 +281,7 @@ impl PreviewService {
                 }
                 // 仍是 FAILED（别人又把它打失败了）⇒ 本调用不参与自愈，返 PENDING。
                 if row.state == state::FAILED {
-                    return Ok(Self::pending_out(row, &now));
+                    return Ok(self.pending_out(row, &now));
                 }
                 // 否则是 PENDING ⇒ 继续走下面的 3c / 3d（3d 有条件认领，不会重复提交）
             } else {
@@ -291,7 +294,7 @@ impl PreviewService {
 
         // 3c. PENDING & 未到期 → 节流返回（不打 python）
         if !Self::poll_due(row, &now) {
-            return Ok(Self::pending_out(row, &now));
+            return Ok(self.pending_out(row, &now));
         }
 
         // 3d. 尚无真 job id → **条件认领**后补提交
@@ -328,9 +331,9 @@ impl PreviewService {
             if !claimed {
                 // 认领失败 = 别人正在提交（租约未过）/ 行已不是 PENDING
                 // ⇒ **绝不自己打 python**。返 PENDING 让前端按 retry_after_ms 再来。
-                return Ok(Self::pending_out(row, &now));
+                return Ok(self.pending_out(row, &now));
             }
-            let next_poll = now + Self::backoff();
+            let next_poll = now + self.backoff();
             match Self::submit(py_backend, preview_prefix, &seed, &file.object_key, current).await {
                 Ok(job_id) => {
                     // ⚠️ `claim_token` 必须一并传入：`mark_submitted` 的谓词靠它
@@ -352,7 +355,7 @@ impl PreviewService {
                     // 才是「距现在还有多久」的正确语义。
                     row.ci_job_id = Some(job_id);
                     row.next_poll_at = Some(next_poll);
-                    return Ok(Self::pending_out(row, &now));
+                    return Ok(self.pending_out(row, &now));
                 }
                 Err(e) => {
                     // 提交失败**不**把行打成 FAILED —— 那是 CI 的终态语义，
@@ -374,16 +377,17 @@ impl PreviewService {
                     // ⚠️⚠️ **只在真的归还成功（1 行）时才推节流戳**
                     //（2026-10-13 review 第 2 轮 N-5 的 R2）：`release_claim` 得 0 行
                     // = 认领**已被接管** / 行已不是 PENDING。此时若仍无条件
-                    // `touch_poll(now + 2s)`，就会把**接管者刚写的租约戳**
-                    // （now + 30s）**缩短**成 now + 2s ⇒ 第三个请求 2s 后即可合法
-                    // 接管 ⇒「租约不可抢」这条闸被一个善意的退避动作从下面捅穿。
+                    // `touch_poll(now + 节流间隔)`，就会把**接管者刚写的租约戳**
+                    // （now + 30s）**缩短**成 now + 节流间隔（缺省 2s，可配 1..=5）
+                    // ⇒ 第三个请求一个节流间隔后即可合法接管 ⇒「租约不可抢」这条闸
+                    // 被一个善意的退避动作从下面捅穿。
                     if released == 1 {
                         // 节流：至少等一个 backoff 再重试，避免前端对着一个必然失败的
                         // 上游连打（错误原样抛给调用方 → 21118 / HTTP 502）。
                         PreviewRepo::touch_poll(
                             &mut *conn,
                             row.id,
-                            now + Self::backoff(),
+                            now + self.backoff(),
                             current.id,
                         )
                         .await?;
@@ -453,7 +457,7 @@ impl PreviewService {
             }
             CiStatus::Running => {
                 // 退避推进节流戳，返 PENDING（前端按 retry_after_ms 再来）
-                let next_poll = now + Self::backoff();
+                let next_poll = now + self.backoff();
                 PreviewRepo::touch_poll(&mut *conn, row.id, next_poll, current.id).await?;
                 row.next_poll_at = Some(next_poll);
                 // ⚠️ **传 `&now` 而不是 `&next_poll`**（2026-10-13 review 第 1 轮修）：
@@ -462,7 +466,7 @@ impl PreviewService {
                 // 拿 `retry_after_ms = 0` 立刻重调，退避形同虚设（变成**忙轮询**，
                 // 每个请求都真打一次 python）。这正是「无限轮询」在**合法 Running
                 // 路径**上的同款症状：越是非法终局被识别出来，这条路径越要真的节流。
-                Ok(Self::pending_out(row, &now))
+                Ok(self.pending_out(row, &now))
             }
         }
     }
@@ -616,13 +620,25 @@ impl PreviewService {
     }
 
     /// 节流间隔（[`chrono::Duration`]）。
-    fn backoff() -> chrono::Duration {
-        chrono::Duration::seconds(POLL_BACKOFF_SECONDS.min(POLL_BACKOFF_MAX_SECONDS))
+    ///
+    /// ⚠️ `clamp(1, PREVIEW_POLL_BACKOFF_MAX_SECONDS)` 是**防御性**的（2026-10-13
+    /// 轮询节流可配）：启动校验（`preview_poll_backoff_config`）才是真闸，这里只
+    /// 兜住绕过 `from_env` 的装配路径 —— 允许 0 会让 `next_poll_at` 推到当前 /
+    /// 过去，退避形同虚设（见字段 doc）。
+    fn backoff(&self) -> chrono::Duration {
+        chrono::Duration::seconds(
+            self.poll_backoff_seconds
+                .clamp(1, PREVIEW_POLL_BACKOFF_MAX_SECONDS),
+        )
     }
 
-    /// 返给前端的建议重试间隔（毫秒）。
-    fn backoff_ms() -> u64 {
-        (POLL_BACKOFF_SECONDS.min(POLL_BACKOFF_MAX_SECONDS) * 1000) as u64
+    /// 返给前端的建议重试间隔（毫秒）。clamp 口径与 [`Self::backoff`] 相同
+    /// （同一个区间常量，两处不得漂移）。
+    fn backoff_ms(&self) -> u64 {
+        (self
+            .poll_backoff_seconds
+            .clamp(1, PREVIEW_POLL_BACKOFF_MAX_SECONDS)
+            * 1000) as u64
     }
 
     /// 轮询是否到期：`next_poll_at` 为 NULL 视为**到期**。
@@ -641,11 +657,14 @@ impl PreviewService {
     }
 
     /// PENDING 出参：`retry_after_ms` = 距离 `next_poll_at` 的毫秒数（>=0）。
-    fn pending_out(row: &TFilePreview, now: &NaiveDateTime) -> PreviewOut {
+    ///
+    /// ⚠️ 2026-10-13 轮询节流可配后由关联函数改 `&self`：`next_poll_at` 为 NULL 的
+    /// 兜底分支要用 `self.backoff_ms()`（与 `backoff()` 同源）。
+    fn pending_out(&self, row: &TFilePreview, now: &NaiveDateTime) -> PreviewOut {
         let retry_after_ms = row
             .next_poll_at
             .map(|at| (at - *now).num_milliseconds().max(0) as u64)
-            .unwrap_or_else(Self::backoff_ms);
+            .unwrap_or_else(|| self.backoff_ms());
         PreviewOut::pending(retry_after_ms)
     }
 
@@ -705,7 +724,8 @@ impl PreviewService {
     /// 不存在**。pydantic v2 默认 `extra="ignore"` 会**静默丢掉**它们，而必填的
     /// `dst_prefix` 缺失 ⇒ FastAPI 直接返 **422** ⇒ 本函数 `parse_envelope` 立刻
     /// 21118/502。症状极具迷惑性：行永远停在 `PENDING / ci_job_id IS NULL`，
-    /// 2s 后再试、再失败 —— **既烧不出图，也不报成「CI 失败」**（因为压根没到 CI）。
+    /// 一个节流间隔（缺省 2s，可经 env `PREVIEW_POLL_BACKOFF_SECONDS` 配 1..=5）后
+    /// 再试、再失败 —— **既烧不出图，也不报成「CI 失败」**（因为压根没到 CI）。
     ///
     /// ⚠️ 之所以此前 19 条集成测试全绿：所有 submit mock 都写成
     /// `.returning(|_b, _h| …)`，**body 参数整个被丢弃、零断言**。跨仓请求体契约
@@ -811,7 +831,7 @@ impl PreviewService {
     ///
     /// ## 兜底为什么留 `Running`（而不是猜失败）
     ///
-    /// 未知词时继续等是 fail-safe 的：最坏是多轮询几次（节流 2s/次），而猜成终局
+    /// 未知词时继续等是 fail-safe 的：最坏是多轮询几次（节流缺省 2s/次），而猜成终局
     /// 失败会让**正常预览直接报 502**。⚠️ 代价是这条兜底**不会自动识别跨仓新增
     /// 的词** —— python 侧改 `state` 取值时必须同步本函数（词表真源见
     /// [`super::mod`] 的「跨仓 CI 终态词表」一节）。
@@ -831,8 +851,8 @@ impl PreviewService {
             return CiStatus::Failed;
         }
         // ↓ 以下三支是 2026-10-13 review 第 1 轮补的跨仓契约缺口：
-        //   此前它们全落进下面的 `_ => Running` 兜底 ⇒ 每轮 `touch_poll` 再等 2s，
-        //   **永远返回 PENDING** ⇒ 前端无限轮询直到自己超限。
+        //   此前它们全落进下面的 `_ => Running` 兜底 ⇒ 每轮 `touch_poll` 再等一个
+        //   节流间隔（缺省 2s），**永远返回 PENDING** ⇒ 前端无限轮询直到自己超限。
         if s.eq_ignore_ascii_case("cancel")
             || s.eq_ignore_ascii_case("canceled")
             || s.eq_ignore_ascii_case("cancelled")
