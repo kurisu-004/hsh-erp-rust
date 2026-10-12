@@ -279,6 +279,26 @@ pub struct CosConfig {
     /// ⚠️ 回退值**不读** `endpoint` 字段：那个字段是 OpenDAL 的 S3 endpoint
     /// （可能带私有化路径），与浏览器直链的站点根不是一回事。
     pub preview_base_url: String,
+    /// 预览图 `view` 档的 EdgeOne 图片即时处理 URL 参数
+    /// （env `COS_PREVIEW_IMAGE_VIEW_PARAMS`，缺省 `eo-img.resize=l/2560`）。
+    ///
+    /// 2026-10-12 新增。这是**部署级固定 query**：由
+    /// `GET /objects/{id}/preview?size=view|thumb|full` 的 `size` 档位选中后，
+    /// 拼在每个 `pages[]` 直链的 query 尾部（`?` / `&` 由 service 按 URL 现状选）。
+    ///
+    /// ⚠️ **本值不做语法校验**：内容来自部署配置（EdgeOne 规则），rust 侧只当
+    /// 不透明字符串拼接；写错的症状是「图片 404 / 镜像不按预期缩放」，不是启动失败。
+    ///
+    /// ⚠️ **`full` 档恒无参数**（不读本字段，也不读 thumb 字段）—— 原始全尺寸
+    /// 走无 query 的直链。⚠️ **只允许单轴**（如 `w/480` 或 `l/2560`）：写成
+    /// `w/480&h/480` 会让非等比图**失真**，图片即时处理不替调用方保比例。
+    pub preview_image_view_params: String,
+    /// 预览图 `thumb` 档的 EdgeOne 图片即时处理 URL 参数
+    /// （env `COS_PREVIEW_IMAGE_THUMB_PARAMS`，缺省 `eo-img.resize=w/480`）。
+    ///
+    /// 与 [`Self::preview_image_view_params`] 同款契约（不校验语法 / 只允许单轴 /
+    /// `full` 档不读）。列表页缩略图用本档，单张查看默认走 `view` 档。
+    pub preview_image_thumb_params: String,
 }
 
 /// 雪花 ID 配置（位布局对齐 myERP Python `snowflake-id` 包）：
@@ -728,6 +748,14 @@ impl AppConfig {
                     // （可能带私有化路径），浏览器直链的站点根与之不是一回事。
                     &format!("{scheme}://{bucket}.cos.{region}.myqcloud.com"),
                 );
+                // 2026-10-12 新增：预览图 `size` 档位的 EdgeOne 图片即时处理参数。
+                // 用 `env_or_non_empty`（空值回落缺省）：`COS_PREVIEW_IMAGE_VIEW_PARAMS=`
+                // 这种「变量在、值为空」的写法在 `.env` 里极常见，语义应是「用缺省」
+                // 而不是「把空串拼进 URL」（与 `preview_base_url` 同款理由）。
+                let preview_image_view_params =
+                    env_or_non_empty("COS_PREVIEW_IMAGE_VIEW_PARAMS", "eo-img.resize=l/2560");
+                let preview_image_thumb_params =
+                    env_or_non_empty("COS_PREVIEW_IMAGE_THUMB_PARAMS", "eo-img.resize=w/480");
                 CosConfig {
                     backend,
                     enabled: cos_enabled,
@@ -750,6 +778,9 @@ impl AppConfig {
                     // 2026-10-13 PR2：`files::part_file::preview` 的 URL 拼接两件套
                     preview_prefix: env_or("COS_PREVIEW_PREFIX", "previews"),
                     preview_base_url,
+                    // 2026-10-12 新增：`size` 档位的图片即时处理参数（见字段 doc）
+                    preview_image_view_params,
+                    preview_image_thumb_params,
                 }
             },
 

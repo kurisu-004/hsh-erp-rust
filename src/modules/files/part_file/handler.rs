@@ -116,7 +116,7 @@ use crate::auth::rbac::CurrentUser;
 use crate::modules::files::part_file::dto::{
     ConfirmFileIn, DeletePartFileRequest, PartFileListQuery, UploadFileData,
 };
-use crate::modules::files::part_file::preview::dto::PreviewOut;
+use crate::modules::files::part_file::preview::dto::{PreviewOut, PreviewQuery, PreviewSize};
 use crate::modules::files::part_file::service::PartFileService;
 use crate::modules::files::part_file::vo::{PartFileListOut, PartFileOut, PartFileWithUrlOut};
 use crate::shared::error::{AppError, code};
@@ -449,6 +449,17 @@ pub async fn soft_delete_part_file(
 /// 2026-10-13 PR2 新增。**唯一端点**是本子模块 `preview` 子模块的入口，
 /// 其状态机 / seed 推导 / 安全取舍见 `part_file::preview` 的模块 doc。
 ///
+/// ## 入参（2026-10-12 新增 `size`）
+///
+/// `?size=view|thumb|full`（可选，缺省 `view`）：选择 `pages[]` 尾部拼哪一档
+/// 图片即时处理参数（值来自 `CosConfig` 的 `preview_image_*_params`；`full` 档
+/// 恒无参数）。**大小写敏感**，非法值 ⇒ 40001 / HTTP 422。
+///
+/// ⚠️ 解析顺序：`size` 必须先于**任何 DB 读 / CI 副作用**（非法值不应读到文件行、
+/// 更不应登记 `t_file_preview`）。⚠️ `size` 在 `PreviewQuery` 里是 `Option<String>`
+/// 而不是枚举 —— 枚举放提取器层会让非法值走 `QueryRejection` 纯文本 400，
+/// 破坏「错误走 `R<T>` 信封」的契约。
+///
 /// ## 事务边界
 ///
 /// **handler 不开事务**（与本文件 `confirm_file_object` 同款「service 自管」的
@@ -459,6 +470,7 @@ pub async fn soft_delete_part_file(
 ///
 /// | 码 | HTTP | 条件 |
 /// |---|---|---|
+/// | 40001 | 422 | `size` 非法（非 `view` / `thumb` / `full`） |
 /// | 40300 | 403 | 角色不在 M / C / I / CNC / **SHELF** 内 |
 /// | 21101 | 404 | `file_id` 不存在（或已软删） |
 /// | 21116 | 400 | 该文件不可预览（kind 非图纸类 / `file_type ≠ PDF`） |
@@ -493,7 +505,16 @@ pub async fn get_part_file_preview(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Path(file_id): Path<i64>,
+    Query(q): Query<PreviewQuery>,
 ) -> Result<Json<R<PreviewOut>>, AppError> {
+    // ⚠️ `size` 解析必须在读文件行 / 任何 DB / CI 副作用**之前**（非法输入零代价
+    // 拒绝；也让「非法值不产生 t_file_preview 行」成为结构性事实而不是巧合）。
+    let size = PreviewSize::parse(q.size.as_deref())?;
+    let image_params = size.image_params(
+        &state.config.cos.preview_image_view_params,
+        &state.config.cos.preview_image_thumb_params,
+    );
+
     let file = {
         let mut tx = state.pool.begin().await?;
         let file = state
@@ -510,6 +531,7 @@ pub async fn get_part_file_preview(
             &state.py_backend,
             &state.config.cos.preview_prefix,
             &state.config.cos.preview_base_url,
+            image_params,
             &file,
             &current,
         )

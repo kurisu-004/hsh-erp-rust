@@ -198,7 +198,7 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 | 子模块 | 端点数 | URL 前缀 | 表 | 说明 |
 |---|---:|---|---|---|
 | （容器自带） | 1 | `/api/v2/files/sts-tmp-keys` | 无（薄壳鉴权转发到 python） | 2026-09-28 新增，逐字未动 |
-| `files::part_file` | 7 | `/api/v2/files/objects` | `t_part_file`（自有） | `POST /objects`（**上传四合一**）/ `GET /objects`（列表）/ `POST /objects/confirm`（STS 直传回执）/ `GET /objects/{id}/url` / `GET /objects/{id}/content` / `POST /objects/{id}/delete` / `GET /objects/{id}/preview`（**2026-10-13 PR2**：COS CI 预览，惰性轮询零后台任务） |
+| `files::part_file` | 7 | `/api/v2/files/objects` | `t_part_file`（自有） | `POST /objects`（**上传四合一**）/ `GET /objects`（列表）/ `POST /objects/confirm`（STS 直传回执）/ `GET /objects/{id}/url` / `GET /objects/{id}/content` / `POST /objects/{id}/delete` / `GET /objects/{id}/preview`（**2026-10-13 PR2**：COS CI 预览，惰性轮询零后台任务；**2026-10-12** 增可选 `?size=view\|thumb\|full` 投放档位，缺省 view、非法值 40001/422） |
 | `files::part_file::cnc` | 1 | `/api/v2/files/cnc` | 复用 `t_part_file`（无 repo 层） | `POST /cnc/pairs`：G_CODE + 工艺卡配对写入 |
 
 > 端点求和 = 1 + 7 + 1 = **9**，与 `src/modules/files/mod.rs` 模块 doc 的端点表恒等。计数口径同 iam 表。
@@ -208,7 +208,8 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 > **2026-10-13 PR2 新增 `files::part_file::preview`**（`GET /objects/{id}/preview`，1 条）：COS CI 逐页光栅化预览。三条必须知道的事实：
 > ① **惰性轮询、零后台任务、零新增 cron** —— 状态推进完全由前端下一次调用驱动（`PENDING & 到期 → describe`），代价是「没人调就没人推进」；
 > ② **内容寻址 + 独立表** —— `t_file_preview` 按 `preview_seed`（内容哈希）去重而非按 `t_part_file` 行去重，因为 CI **按页计费**，同一份 PDF 的 N 份拷贝只该跑 1 次 job。⚠️ **并发不重复提交是「两道闸」不是一道**（2026-10-13 review 第 1 轮 MAJOR-1 订正）：`uk_t_file_preview_seed` 唯一索引只闸**首次登记**；「行已存在 + 无真 job id」的**重试**与**自愈**两条路径靠 `PreviewRepo::claim_submit` 的**条件 UPDATE 认领**（占位 token `__claiming__:<snowflake>` + 30s 租约），只有 `rows == 1` 的调用才允许 POST `/doc_jobs`。⚠️ 「先查再插 / 先查再打」在这两条路径上是 TOCTOU，会重复计费；
-> ③ ⚠️ **安全取舍反转**：本端点**放开 `SHELF_ACCOUNT`** 且返回**永久 public-read 直链**，比 `/url` 的 1 小时预签窗口**更宽** —— 这是用户拍板的选项 A，取舍全文 / 风险补偿见 `src/modules/files/part_file/preview/mod.rs` 的「安全取舍反转」一节。**不要**「顺手把 `/preview` 与 `/url` 的角色集合对齐」。
+> ③ ⚠️ **安全取舍反转**：本端点**放开 `SHELF_ACCOUNT`** 且返回**永久 public-read 直链**，比 `/url` 的 1 小时预签窗口**更宽** —— 这是用户拍板的选项 A，取舍全文 / 风险补偿见 `src/modules/files/part_file/preview/mod.rs` 的「安全取舍反转」一节。**不要**「顺手把 `/preview` 与 `/url` 的角色集合对齐」；
+> ④ **2026-10-12 增 `?size=` 投放档位 + 配方版本入 seed**：`?size=view\|thumb\|full`（缺省 `view`，大小写敏感）按档位给 `pages[]` 尾部拼 `CosConfig` 的 `preview_image_view_params` / `preview_image_thumb_params`（EdgeOne 图片即时处理参数，**只允许单轴**；`full` 档恒无参数），非法值 ⇒ 40001 / HTTP 422 且解析先于任何 DB / CI 副作用；`preview_seed` 改为「`content:{sha}` / `key:{sha256(object_key)}` 材料 + `PREVIEW_RECIPE_VERSION`」整体哈希取前 32 位 —— **改渲染配方必须递增该常量**，否则旧 READY 行与 CDN 缓存不换代（已知偏差 #1 因此标为已修）。⚠️ 重复键 `?size=a&size=b` 仍是提取器层纯文本 400（平台级残余，偏差 #11）。
 >
 > ⚠️ **`POST /objects/{id}/delete` 不回收预览**（2026-10-13 review 第 1 轮 m-7 登记）：该端点只软删 `t_part_file` + 异步删 COS **源对象**，`previews/<seed>/` 下的 JPG 与 `t_file_preview` 行**都不动** ⇒ 图纸「删除」后完整视觉副本仍 public-read 永久可读，且该表只增不减、无 TTL / GC / 级联。
 >

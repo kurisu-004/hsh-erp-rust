@@ -110,6 +110,10 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
             // 让 `tests/files/preview.rs` 能逐条断言拼出来的 URL。
             preview_prefix: "previews".into(),
             preview_base_url: "https://test-bucket.cos.ap-shanghai.myqcloud.com".into(),
+            // 2026-10-12 新增：`size` 档位的图片即时处理参数，取与生产代码缺省
+            // 相同的字面量（测试据此断言 pages[] 尾部参数）。
+            preview_image_view_params: "eo-img.resize=l/2560".into(),
+            preview_image_thumb_params: "eo-img.resize=w/480".into(),
         },
         snowflake: SnowflakeConfig {
             epoch_ms: 1_577_836_800_000,
@@ -303,6 +307,10 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
             // 让 `tests/files/preview.rs` 能逐条断言拼出来的 URL。
             preview_prefix: "previews".into(),
             preview_base_url: "https://test-bucket.cos.ap-shanghai.myqcloud.com".into(),
+            // 2026-10-12 新增：`size` 档位的图片即时处理参数，取与生产代码缺省
+            // 相同的字面量（测试据此断言 pages[] 尾部参数）。
+            preview_image_view_params: "eo-img.resize=l/2560".into(),
+            preview_image_thumb_params: "eo-img.resize=w/480".into(),
         },
         snowflake: SnowflakeConfig {
             epoch_ms: 1_577_836_800_000,
@@ -463,6 +471,10 @@ pub async fn test_state_with_cos(
             // 让 `tests/files/preview.rs` 能逐条断言拼出来的 URL。
             preview_prefix: "previews".into(),
             preview_base_url: "https://test-bucket.cos.ap-shanghai.myqcloud.com".into(),
+            // 2026-10-12 新增：`size` 档位的图片即时处理参数，取与生产代码缺省
+            // 相同的字面量（测试据此断言 pages[] 尾部参数）。
+            preview_image_view_params: "eo-img.resize=l/2560".into(),
+            preview_image_thumb_params: "eo-img.resize=w/480".into(),
         },
         snowflake: SnowflakeConfig {
             epoch_ms: 1_577_836_800_000,

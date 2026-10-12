@@ -3,19 +3,20 @@
 //! 被测端点：`GET /api/v2/files/objects/{file_id}/preview`
 //! （COS CI 图纸预览，惰性轮询、零后台任务）。
 //!
-//! ## 覆盖场景：**29 个测试函数**（2026-10-13 review 第 2 轮 N-2 逐函数点过）
+//! ## 覆盖场景：**33 个测试函数**（2026-10-12 新增 3 条后逐函数点数）
 //!
-//! 拆开是 **21 个编号函数**（下表 20 个编号条目，其中 #18 一条覆盖 2 个函数）
-//! + **8 条不编号护栏**。
+//! 拆开是 **24 个编号函数**（下表 22 个编号条目，其中 #18 一条覆盖 2 个函数）
+//! + **9 条不编号护栏**。
 //!
-//! ⚠️ 本节的三个数字此前**互相打架且都与实际不符**（写了「20 + 6」/「6 条但列了
-//! 8 条」/「20 + 4」）。三个数字都是纯手工维护的散文 ⇒ 逐函数点数核对，并按
-//! 「编号条目 / 实际函数」两栏分开写，避免再出现「一个条目两个函数」的歧义。
+//! ⚠️ 本节的数字是纯手工维护的散文，历轮多次互相打架（写了「20 + 6」/「6 条但列了
+//! 8 条」/「20 + 4」，以及 21+8=29 与「编号小计 22」并存）⇒ **改本文件时必须
+//! 逐函数点数核对**，按「编号条目 / 实际函数」两栏分开写，避免「一个条目两个函数」
+//! 的歧义。2026-10-12（`size` 档位 + 配方版本）后的真值：**33**。
 //!
 //! | # | 用例（⚠️ 一条可含多个函数） | 函数数 | 断言要点 |
 //! |---|---|---:|---|
-//! | 1 | `preview_seed_uses_content_sha256_prefix` | 1 | 有 sha 时取**前 32 位 hex** |
-//! | 2 | `preview_seed_falls_back_to_object_key_hash` | 1 | sha 为 NULL 时退回 `sha256(object_key)` 前 32 位 |
+//! | 1 | `preview_seed_hashes_content_sha_with_recipe_version` | 1 | 有 sha 时材料 `content:{sha}` + 配方版本整体哈希，取**前 32 位 hex**（期望独立算出） |
+//! | 2 | `preview_seed_falls_back_to_object_key_hash` | 1 | sha 为 NULL 时退回 `sha256(object_key)`，同样掺配方版本后取前 32 位 |
 //! | 3 | `ready_cache_hit_never_calls_python` | 1 | READY 命中 → **mock 零调用** |
 //! | 4 | `cache_miss_submits_once_and_returns_pending` | 1 | 未命中 → 提交 1 次 → PENDING |
 //! | 5 | `pending_not_due_returns_pending_without_python` | 1 | 未到期 → 直接 PENDING（**不打 python**） |
@@ -35,12 +36,16 @@
 //! | 18 | `describe_prefers_state_key_over_status` + `describe_reads_status_key_as_well` | **2** | 状态字段名 `state`（python 真源，**优先**）/ `status`（兜底）两支都认 |
 //! | 19 | `concurrent_due_retries_submit_only_one_job` | 1 | **路径 A**：行已存在 + 到期 + 无 job id ⇒ 并发**只提交 1 个**（条件 UPDATE 认领闸门） |
 //! | 20 | `failed_heal_losing_racer_does_not_submit_again` | 1 | **路径 B**：自愈输家（`reset_to_pending` 得 0 行）**不再提交** |
-//! | | **编号小计** | **22** | |
+//! | 21 | `size_query_selects_image_params_tier` | 1 | **2026-10-12 `size` 档位**：缺省/空/空白 ⇒ view 参数；thumb ⇒ thumb；full ⇒ **无 query**（READY 零 IO） |
+//! | 22 | `invalid_size_returns_422_without_side_effects` | 1 | 非法 `size` ⇒ 422 + 信封 40001，**零副作用**（不打 python、不建 `t_file_preview` 行 —— 解析先于 DB） |
+//! | | **编号小计** | **24** | |
 //!
-//! 另有 **8 条护栏**（不编号）：
+//! 另有 **9 条护栏**（不编号）：
 //! - `preview_route_is_not_swallowed_by_sibling_catch_alls` —— **matchit 冲突的实测**
 //!   （见下节）
 //! - `preview_urls_shape_is_stable` —— `preview_urls` 纯函数断言
+//! - `preview_urls_appends_image_params_when_present` —— `image_params` 追加规则
+//!   （`?` / 已有 `?` 用 `&` / 空白不追加；2026-10-12 新增）
 //! - `parse_ci_status_word_table_is_exhaustive` —— **跨仓 CI 终态词表的表驱动断言**
 //!   （review 第 1 轮新增；含 `NotExist` / `Pause` / `Cancel` 与大小写别名）
 //! - `submit_request_body_matches_python_schema` —— **跨仓请求体契约**
@@ -52,7 +57,7 @@
 //! - `concurrent_takeover_of_expired_claim_submits_once` —— 过期认领的并发接管只提一次
 //! - `live_claim_blocks_all_python_calls_until_lease_expiry` —— 租约期内零 python 调用
 //!
-//! **合计 21 + 8 = 29 个测试函数。**
+//! **合计 24 + 9 = 33 个测试函数。**
 //!
 //! ## matchit 冲突的验证方式（本文件最重要的一条护栏）
 //!
@@ -110,8 +115,8 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 
 use hsh_erp_test_support::{
-    PartFixture, load_part_fixture, login_token, send, shared_test_snowflake, test_app, test_pool,
-    test_state,
+    PartFixture, json_request, load_part_fixture, login_token, send, shared_test_snowflake,
+    test_app, test_pool, test_state,
 };
 
 /// test-support `test_state` 里的 `cos.preview_base_url`（见 `test-support/src/state.rs`）。
@@ -248,16 +253,19 @@ fn app_with_mock(state: &mut Arc<AppState>, mock: MockPyBackendClient) -> axum::
 //  1 + 2：seed 推导的两条路径
 // ===========================================================================
 
-/// 场景 1：有 `content_sha256` ⇒ 取**前 32 位 hex**。
+/// 场景 1：有 `content_sha256` ⇒ 材料 `content:{sha}` 带配方版本整体哈希，取前 32 位 hex。
+///
+/// ⚠️ 期望值用 `printf 'content:<sha>|recipe:r2-dpi300q90' | shasum -a 256` **独立算出**
+/// 后写死（不用同函数自证）—— 这样改公式（如配方版本递增却忘同步测试）会当场红。
 #[tokio::test]
-async fn preview_seed_uses_content_sha256_prefix() {
+async fn preview_seed_hashes_content_sha_with_recipe_version() {
     let pool = test_pool().await;
     let sha = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
     let id = insert_part_file(&pool, "DRAWING", "PDF", "A00123_rev2.pdf", Some(sha)).await;
     let file = fetch_row(&pool, id).await;
     assert_eq!(
         PreviewService::preview_seed(&file),
-        "abcdef0123456789abcdef0123456789"
+        "27c4168ae76526e8c76a78512cf02f17"
     );
     assert_eq!(
         PreviewService::preview_seed(&file).len(),
@@ -266,13 +274,17 @@ async fn preview_seed_uses_content_sha256_prefix() {
     );
 }
 
-/// 场景 2：`content_sha256 IS NULL`（历史行）⇒ 退回 `sha256(object_key)` 前 32 位。
+/// 场景 2：`content_sha256 IS NULL`（历史行）⇒ 退回 `sha256(object_key)`，同样带
+/// 域前缀 + 配方版本整体哈希，取前 32 位。
 #[tokio::test]
 async fn preview_seed_falls_back_to_object_key_hash() {
     let pool = test_pool().await;
     let id = insert_part_file(&pool, "DRAWING", "PDF", "B99999.pdf", None).await;
     let file = fetch_row(&pool, id).await;
     let seed = PreviewService::preview_seed(&file);
+    // ⚠️ 独立算出：inner = `printf '0123456789abcdef_B99999.pdf' | shasum -a 256`；
+    //    种子 = `printf 'key:<inner>|recipe:r2-dpi300q90' | shasum -a 256` 前 32 位。
+    assert_eq!(seed, "10c7d6929ae4621eb195d776965e9e1d");
     assert_eq!(seed.len(), 32, "退回分支同样必须产出 32 位 hex");
     assert!(
         seed.chars().all(|c| c.is_ascii_hexdigit()),
@@ -287,6 +299,11 @@ async fn preview_seed_falls_back_to_object_key_hash() {
     // 另一份同内容、不同文件名的行 ⇒ 种子不同（该分支非内容寻址，见已知偏差 #3）
     let id2 = insert_part_file(&pool, "DRAWING", "PDF", "C88888.pdf", None).await;
     let file2 = fetch_row(&pool, id2).await;
+    assert_eq!(
+        PreviewService::preview_seed(&file2),
+        "90565b0dd68e9ed099a787861f019bc3",
+        "同款独立算出的期望（inner = sha256('0123456789abcdef_C88888.pdf')）"
+    );
     assert_ne!(
         PreviewService::preview_seed(&file2),
         seed,
@@ -364,6 +381,7 @@ async fn call_preview(pool: &PgPool, state: &Arc<AppState>, file: &TPartFile) ->
             &state.py_backend,
             PREVIEW_PREFIX,
             PREVIEW_BASE_URL,
+            "",
             file,
             &test_user(vec![Role::Manager]),
         )
@@ -550,6 +568,7 @@ async fn describe_failed_returns_21117() {
             &state.py_backend,
             PREVIEW_PREFIX,
             PREVIEW_BASE_URL,
+            "",
             &file,
             &test_user(vec![Role::Manager]),
         )
@@ -598,6 +617,7 @@ async fn submit_forward_failure_returns_21118() {
             &state.py_backend,
             PREVIEW_PREFIX,
             PREVIEW_BASE_URL,
+            "",
             &file,
             &test_user(vec![Role::Manager]),
         )
@@ -665,6 +685,7 @@ async fn submit_upstream_502_propagates_ci_reason() {
             &state.py_backend,
             PREVIEW_PREFIX,
             PREVIEW_BASE_URL,
+            "",
             &file,
             &test_user(vec![Role::Manager]),
         )
@@ -717,6 +738,7 @@ async fn non_pdf_and_non_drawing_kind_return_21116() {
                 &state.py_backend,
                 PREVIEW_PREFIX,
                 PREVIEW_BASE_URL,
+                "",
                 &file,
                 &test_user(vec![Role::Manager]),
             )
@@ -766,6 +788,7 @@ async fn concurrent_misses_submit_only_one_job() {
             &state.py_backend,
             PREVIEW_PREFIX,
             PREVIEW_BASE_URL,
+            "",
             &file,
             &user
         ),
@@ -774,6 +797,7 @@ async fn concurrent_misses_submit_only_one_job() {
             &state.py_backend,
             PREVIEW_PREFIX,
             PREVIEW_BASE_URL,
+            "",
             &file,
             &user
         ),
@@ -888,6 +912,7 @@ async fn shelf_account_can_get_preview() {
             &state.py_backend,
             PREVIEW_PREFIX,
             PREVIEW_BASE_URL,
+            "",
             &file,
             &test_user(vec![Role::ShelfAccount]),
         )
@@ -938,6 +963,7 @@ async fn describe_once(
         &state.py_backend,
         PREVIEW_PREFIX,
         PREVIEW_BASE_URL,
+        "",
         file,
         &user,
     )
@@ -952,6 +978,7 @@ async fn describe_once(
         &state.py_backend,
         PREVIEW_PREFIX,
         PREVIEW_BASE_URL,
+        "",
         file,
         &user,
     )
@@ -1274,6 +1301,7 @@ async fn concurrent_due_retries_submit_only_one_job() {
             &state.py_backend,
             PREVIEW_PREFIX,
             PREVIEW_BASE_URL,
+            "",
             &file,
             &user
         ),
@@ -1282,6 +1310,7 @@ async fn concurrent_due_retries_submit_only_one_job() {
             &state.py_backend,
             PREVIEW_PREFIX,
             PREVIEW_BASE_URL,
+            "",
             &file,
             &user
         ),
@@ -1356,6 +1385,7 @@ async fn failed_heal_losing_racer_does_not_submit_again() {
             &state_win.py_backend,
             PREVIEW_PREFIX,
             PREVIEW_BASE_URL,
+            "",
             &file,
             &user,
         )
@@ -1390,6 +1420,7 @@ async fn failed_heal_losing_racer_does_not_submit_again() {
             &state_lose.py_backend,
             PREVIEW_PREFIX,
             PREVIEW_BASE_URL,
+            "",
             &file,
             &user,
         )
@@ -1466,6 +1497,7 @@ async fn concurrent_takeover_of_expired_claim_submits_once() {
             &state.py_backend,
             PREVIEW_PREFIX,
             PREVIEW_BASE_URL,
+            "",
             &file,
             &user
         ),
@@ -1474,6 +1506,7 @@ async fn concurrent_takeover_of_expired_claim_submits_once() {
             &state.py_backend,
             PREVIEW_PREFIX,
             PREVIEW_BASE_URL,
+            "",
             &file,
             &user
         ),
@@ -1713,7 +1746,7 @@ fn preview_object_prefix_tolerates_trailing_slash() {
     }
 
     // ⚠️ `preview_urls` 的中段必须**逐字**等于 submit 的 `dst_prefix`
-    let urls = PreviewService::preview_urls("https://cdn.example.com", "previews/", "abc", 2);
+    let urls = PreviewService::preview_urls("https://cdn.example.com", "previews/", "abc", 2, "");
     let dst_prefix = PreviewService::preview_object_prefix("previews/", "abc");
     assert!(
         urls[0].contains(&dst_prefix),
@@ -1824,13 +1857,196 @@ async fn raw_get(
 }
 
 // ===========================================================================
+//  护栏 D（2026-10-12）：`?size=` 档位（view / thumb / full）
+// ===========================================================================
+
+/// HTTP 契约：`?size=` 缺省 / 空 / 空白 ⇒ `view` 档参数；`thumb` ⇒ thumb 参数；
+/// `full` ⇒ **无 query**。
+///
+/// ⚠️ 预置 `READY` 行让本条零 python 调用（mock 两个方法都 `.never()`）——
+/// 只验 `pages[]` 尾部参数的选择，状态机行为由编号场景覆盖。
+///
+/// ⚠️ 参数期望值取 `test-support` 的两项配置字面量（与生产代码缺省同款）：
+/// `eo-img.resize=l/2560` / `eo-img.resize=w/480`。
+#[tokio::test]
+async fn size_query_selects_image_params_tier() {
+    let pool = test_pool().await;
+    let fx = load_part_fixture(&pool).await;
+    let file_id =
+        insert_part_file(&pool, "DRAWING", "PDF", "size.pdf", Some(&"e1".repeat(32))).await;
+    let file = fetch_row(&pool, file_id).await;
+    let seed = PreviewService::preview_seed(&file);
+
+    // 预置 READY（2 页）⇒ 各档位都该零 IO 直接返 pages
+    sqlx::query(
+        "INSERT INTO t_file_preview \
+           (id, preview_seed, src_object_key, ci_job_id, state, page_count, \
+            created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, $3, 'job-size', 'READY', 2, now(), 1, now(), 1)",
+    )
+    .bind(shared_test_snowflake().next_id())
+    .bind(&seed)
+    .bind(&file.object_key)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mut mock = MockPyBackendClient::new();
+    mock.expect_forward_ci_submit().never();
+    mock.expect_forward_ci_describe().never();
+    let mut state = test_state(pool.clone()).await;
+    let app = app_with_mock(&mut state, mock);
+    let token = login_token(&app, &fx.manager_username, PartFixture::PASSWORD).await;
+
+    const VIEW_PARAMS: &str = "eo-img.resize=l/2560";
+    const THUMB_PARAMS: &str = "eo-img.resize=w/480";
+
+    // ① 缺省 / `size=`（空） / `size=空白` ⇒ 都是 view 档
+    for query in ["", "?size=", "?size=%20%20", "?size=view"] {
+        let (st, body) = send(
+            app.clone(),
+            json_request(
+                "GET",
+                &format!("/files/objects/{file_id}/preview{query}"),
+                None,
+                Some(&token),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "query={query:?} 应 200");
+        assert_eq!(body["data"]["state"], "READY", "query={query:?}");
+        let pages = body["data"]["pages"].as_array().expect("pages 应为数组");
+        assert_eq!(pages.len(), 2, "query={query:?}");
+        for (i, page) in pages.iter().enumerate() {
+            assert_eq!(
+                page.as_str().unwrap(),
+                format!(
+                    "{PREVIEW_BASE_URL}/{PREVIEW_PREFIX}/{seed}/p{}.jpg?{VIEW_PARAMS}",
+                    i + 1
+                ),
+                "query={query:?} 应走 view 档（缺省档）"
+            );
+        }
+    }
+
+    // ② `thumb` ⇒ thumb 参数
+    let (st, body) = send(
+        app.clone(),
+        json_request(
+            "GET",
+            &format!("/files/objects/{file_id}/preview?size=thumb"),
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        body["data"]["pages"][0],
+        format!("{PREVIEW_BASE_URL}/{PREVIEW_PREFIX}/{seed}/p1.jpg?{THUMB_PARAMS}"),
+        "thumb 档必须换用 thumb 参数"
+    );
+
+    // ③ `full` ⇒ **无 query**（原始全尺寸直链）
+    let (st, body) = send(
+        app.clone(),
+        json_request(
+            "GET",
+            &format!("/files/objects/{file_id}/preview?size=full"),
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let full_url = body["data"]["pages"][0].as_str().unwrap();
+    assert_eq!(
+        full_url,
+        format!("{PREVIEW_BASE_URL}/{PREVIEW_PREFIX}/{seed}/p1.jpg"),
+        "full 档必须是不带任何 query 的裸直链"
+    );
+    assert!(
+        !full_url.contains('?')
+            && !full_url.contains(VIEW_PARAMS)
+            && !full_url.contains(THUMB_PARAMS),
+        "full 档不得漏配任何一档参数：{full_url}"
+    );
+}
+
+/// HTTP 契约：非法 `size`（`bogus` / 大写 `VIEW`）⇒ **422 + 信封 40001**，
+/// 且**零副作用**（不打 python、不为该 seed 新建 `t_file_preview` 行）。
+///
+/// ⚠️ 这两条是本仓「错误一律走 `R<T>` 信封」契约的牙齿：若把 `size` 声明成枚举
+/// 放提取器层，非法值会走 `QueryRejection` ⇒ **纯文本 400**，`send` 在 JSON 解析处
+/// 就 panic，前端拿不到业务码。解析放在 handler（`PreviewSize::parse`）才能保住信封。
+///
+/// ⚠️ 「不建行」断言的是**顺序纪律**（解析先于任何 DB 读 / 副作用），不是巧合：
+/// 文件行存在、mock 就绪，唯独 `size` 非法 —— 走错顺序就会先登记再报错。
+#[tokio::test]
+async fn invalid_size_returns_422_without_side_effects() {
+    let pool = test_pool().await;
+    let fx = load_part_fixture(&pool).await;
+    let file_id = insert_part_file(
+        &pool,
+        "DRAWING",
+        "PDF",
+        "bad-size.pdf",
+        Some(&"e2".repeat(32)),
+    )
+    .await;
+    let file = fetch_row(&pool, file_id).await;
+    let seed = PreviewService::preview_seed(&file);
+
+    // 文件可预览、python 可用 —— 唯一的失败源就是 size 本身
+    let mut mock = MockPyBackendClient::new();
+    mock.expect_forward_ci_submit().never();
+    mock.expect_forward_ci_describe().never();
+    let mut state = test_state(pool.clone()).await;
+    let app = app_with_mock(&mut state, mock);
+    let token = login_token(&app, &fx.manager_username, PartFixture::PASSWORD).await;
+
+    for bad in ["bogus", "VIEW", "Thumb", "v"] {
+        let (st, body) = send(
+            app.clone(),
+            json_request(
+                "GET",
+                &format!("/files/objects/{file_id}/preview?size={bad}"),
+                None,
+                Some(&token),
+            ),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "size={bad:?} 应走校验错误（不是提取器层纯文本 400）"
+        );
+        assert_eq!(
+            body["code"], 40001,
+            "size={bad:?} 必须是信封 code 40001，实际 body={body}"
+        );
+
+        // 零副作用：该 seed 一行都不该被登记
+        let (cnt,): (i64,) =
+            sqlx::query_as("SELECT count(*) FROM t_file_preview WHERE preview_seed = $1")
+                .bind(&seed)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(cnt, 0, "size={bad:?} 非法值不得产生 t_file_preview 行");
+    }
+}
+
+// ===========================================================================
 //  护栏 B：preview_urls 纯函数
 // ===========================================================================
 
-/// `preview_urls` 的形状：页码 **1-based**、站点根的尾斜杠被吃掉、`n<=0` 返空。
+/// `preview_urls` 的形状：页码 **1-based**、站点根的尾斜杠被吃掉、`n<=0` 返空，
+/// 空 `image_params` 时输出与追加功能引入前**逐字一致**。
 #[test]
 fn preview_urls_shape_is_stable() {
-    let urls = PreviewService::preview_urls("https://cdn.example.com/", "previews", "abc123", 3);
+    let urls =
+        PreviewService::preview_urls("https://cdn.example.com/", "previews", "abc123", 3, "");
     assert_eq!(
         urls,
         vec![
@@ -1841,13 +2057,66 @@ fn preview_urls_shape_is_stable() {
         "页码必须 1-based、站点根尾斜杠不能造成 //"
     );
     assert!(
-        PreviewService::preview_urls("https://cdn.example.com", "previews", "abc123", 0).is_empty(),
+        PreviewService::preview_urls("https://cdn.example.com", "previews", "abc123", 0, "")
+            .is_empty(),
         "0 页不得产出占位 URL"
     );
     assert!(
-        PreviewService::preview_urls("https://cdn.example.com", "previews", "abc123", -1)
+        PreviewService::preview_urls("https://cdn.example.com", "previews", "abc123", -1, "")
             .is_empty(),
         "负页数不得产出 URL"
+    );
+}
+
+/// `preview_urls` 的 `image_params` 追加规则（2026-10-12 新增 `size` 档位的落点）。
+///
+/// 三个方向各一条：非空追加（`?`）、base 已含 `?` 时用 `&`、空白参数不追加。
+/// ⚠️ 「base 含 `?`」是**低成本防御**：正常形态下 `COS_PREVIEW_BASE_URL` 不带
+/// query（`env_or_non_empty` 不做语法校验），但拼出 `...jpg?eo-img.resize=...`
+/// 之前先确认一次连接符，比事后排查「URL 里两个 `?`」便宜。
+#[test]
+fn preview_urls_appends_image_params_when_present() {
+    // ① 非空参数 ⇒ 每条 URL 追加 `?{params}`
+    let urls = PreviewService::preview_urls(
+        "https://cdn.example.com",
+        "previews",
+        "abc",
+        2,
+        "eo-img.resize=l/2560",
+    );
+    assert_eq!(
+        urls,
+        vec![
+            "https://cdn.example.com/previews/abc/p1.jpg?eo-img.resize=l/2560".to_string(),
+            "https://cdn.example.com/previews/abc/p2.jpg?eo-img.resize=l/2560".to_string(),
+        ]
+    );
+
+    // ② base 已含 `?`（带 query 的站点根）⇒ 用 `&` 连接，不得出现第二个 `?`
+    let urls = PreviewService::preview_urls(
+        "https://cdn.example.com/?v=2",
+        "previews",
+        "abc",
+        1,
+        "eo-img.resize=w/480",
+    );
+    assert_eq!(
+        urls,
+        vec!["https://cdn.example.com/?v=2/previews/abc/p1.jpg&eo-img.resize=w/480".to_string()],
+        "base 含 ? 必须用 & 连接"
+    );
+    assert_eq!(
+        urls[0].matches('?').count(),
+        1,
+        "URL 里不得出现第二个 ?（第二个 ? 会被当作 query 正文）"
+    );
+
+    // ③ 纯空白参数 ⇒ 与空串同义（trim 后为空，不追加）
+    let urls = PreviewService::preview_urls("https://cdn.example.com", "previews", "abc", 1, "   ");
+    assert_eq!(
+        urls,
+        vec!["https://cdn.example.com/previews/abc/p1.jpg".to_string()],
+        "空白参数必须被 trim 成「不追加」"
     );
 }
 

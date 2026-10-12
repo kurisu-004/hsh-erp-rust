@@ -1,6 +1,79 @@
-//! `files::part_file::preview` 的出参 VO。
+//! `files::part_file::preview` 的出参 VO 与入参 query。
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+use crate::shared::error::AppError;
+
+/// `GET /api/v2/files/objects/{file_id}/preview` 的 query 参数。
+///
+/// ## ⚠️ `size` 刻意是 `Option<String>` 而不是枚举
+///
+/// 枚举放在**提取器**这一层会让 `?size=bogus` 走 `QueryRejection` ⇒ axum 返
+/// **纯文本 400**（不进 `R<T>` 信封）。前端契约（`PreviewOut` 的 doc）是
+/// 「一切错误走信封 + 业务码」，故解析放在 handler 里手动做（[`PreviewSize::parse`]），
+/// 让非法值走 `AppError::validation` ⇒ 422 + 40001 信封。
+///
+/// ⚠️ **已知残余**：`?size=a&size=b` 这类**重复键**仍会在提取器层失败
+/// （serde_urlencoded 对单值字段遇重复键报错）⇒ 纯文本 400。这是平台级行为，
+/// 不实现 `RawQuery` 兜（多写一层仅为一个病态输入），已登记在
+/// `preview/mod.rs` 的已知偏差节。
+#[derive(Debug, Deserialize)]
+pub struct PreviewQuery {
+    /// 投放档位（`view` / `thumb` / `full`，缺省 `view`）。大小写敏感。
+    pub size: Option<String>,
+}
+
+/// 预览图投放档位（2026-10-12 新增）。
+///
+/// 由 query `?size=` 选择，决定 `pages[]` 尾部拼哪一档图片即时处理参数
+/// （参数值来自 `CosConfig` 的两个 `preview_image_*_params` 字段）：
+///
+/// | 档位 | 语义 | URL 参数 |
+/// |---|---|---|
+/// | `View` | 单张查看（缺省） | `preview_image_view_params` |
+/// | `Thumb` | 列表缩略图 | `preview_image_thumb_params` |
+/// | `Full` | 原始全尺寸 | **恒无**（不读配置） |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewSize {
+    /// 单张查看（缺省档）。
+    View,
+    /// 列表缩略图。
+    Thumb,
+    /// 原始全尺寸（URL 不带任何 query）。
+    Full,
+}
+
+impl PreviewSize {
+    /// 解析 query 里的 `size` 原始值。
+    ///
+    /// 规则：先 `trim`；`None` / 空串 ⇒ [`Self::View`]；`"view"` / `"thumb"` /
+    /// `"full"` **精确小写**匹配；其余 ⇒ 40001（HTTP 422）——
+    /// **大小写敏感**是刻意的：`"VIEW"` 落进「非法」而不是被静默接受，
+    /// 避免前端两种拼法并存后没人知道哪个是真契约。
+    pub fn parse(raw: Option<&str>) -> Result<Self, AppError> {
+        match raw.map(str::trim) {
+            None | Some("") => Ok(Self::View),
+            Some("view") => Ok(Self::View),
+            Some("thumb") => Ok(Self::Thumb),
+            Some("full") => Ok(Self::Full),
+            Some(other) => Err(AppError::validation(format!(
+                "size 非法（可选：view / thumb / full）：{other:?}"
+            ))),
+        }
+    }
+
+    /// 本档位对应的图片处理参数。
+    ///
+    /// `Full` 恒返 `""`（**不读两个入参**）—— 原始全尺寸直链不带 query 是本档的
+    /// 定义，不是「配置为空」的巧合。
+    pub fn image_params<'a>(self, view: &'a str, thumb: &'a str) -> &'a str {
+        match self {
+            Self::View => view,
+            Self::Thumb => thumb,
+            Self::Full => "",
+        }
+    }
+}
 
 /// `GET /api/v2/files/objects/{file_id}/preview` 的出参。
 ///
@@ -81,5 +154,59 @@ impl PreviewOut {
             retry_after_ms: 0,
             error: None,
         }
+    }
+}
+
+/// 2026-10-12 新增：`size` 档位解析的纯函数单测（零 IO，`cargo test --lib preview` 可跑）。
+#[cfg(test)]
+mod tests {
+    use super::PreviewSize;
+
+    /// 三档命中 + 大小写敏感 + 非法值报 40001。
+    #[test]
+    fn parse_accepts_exactly_three_lowercase_tiers() {
+        assert_eq!(PreviewSize::parse(Some("view")).unwrap(), PreviewSize::View);
+        assert_eq!(
+            PreviewSize::parse(Some("thumb")).unwrap(),
+            PreviewSize::Thumb
+        );
+        assert_eq!(PreviewSize::parse(Some("full")).unwrap(), PreviewSize::Full);
+
+        // ⚠️ 精确小写：大写是非法值（不是「宽容接受」）—— 见 parse 的 doc。
+        for bad in ["VIEW", "Thumb", "bogus", "v"] {
+            let err = PreviewSize::parse(Some(bad)).expect_err("非法档位必须报错");
+            assert_eq!(err.code(), 40001, "{bad:?} 应走校验错误码");
+            assert_eq!(
+                err.http_status(),
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "{bad:?} 应为 HTTP 422"
+            );
+        }
+    }
+
+    /// `None` / 空串 / 纯空白 ⇒ 缺省 `View`（`trim` 后再判空）。
+    #[test]
+    fn parse_defaults_to_view_on_missing_or_blank() {
+        assert_eq!(PreviewSize::parse(None).unwrap(), PreviewSize::View);
+        assert_eq!(PreviewSize::parse(Some("")).unwrap(), PreviewSize::View);
+        assert_eq!(PreviewSize::parse(Some("   ")).unwrap(), PreviewSize::View);
+        assert_eq!(
+            PreviewSize::parse(Some(" view ")).unwrap(),
+            PreviewSize::View
+        );
+    }
+
+    /// `Full` 档恒无参数（不读两个入参），`View` / `Thumb` 各取自己那一份。
+    #[test]
+    fn image_params_maps_tier_to_configured_param() {
+        let view = "eo-img.resize=l/2560";
+        let thumb = "eo-img.resize=w/480";
+        assert_eq!(PreviewSize::View.image_params(view, thumb), view);
+        assert_eq!(PreviewSize::Thumb.image_params(view, thumb), thumb);
+        assert_eq!(
+            PreviewSize::Full.image_params(view, thumb),
+            "",
+            "full 档不得带上任何参数（即使两项配置都非空）"
+        );
     }
 }

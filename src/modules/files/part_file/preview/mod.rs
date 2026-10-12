@@ -7,7 +7,7 @@
 //!
 //! | 方法 | URL | 角色 | 入参 | 出参 |
 //! |---|---|---|---|---|
-//! | `GET` | `/api/v2/files/objects/{file_id}/preview` | M / C / I / CNC / **SHELF** | 无（仅 path 段 `file_id`） | `R<PreviewOut>` |
+//! | `GET` | `/api/v2/files/objects/{file_id}/preview` | M / C / I / CNC / **SHELF** | path 段 `file_id` + 可选 query `?size=view\|thumb\|full`（缺省 `view`，大小写敏感，非法值 40001/422） | `R<PreviewOut>` |
 //!
 //! ## 这条端点解决什么
 //!
@@ -109,10 +109,18 @@
 //! {preview_base_url}/{preview_prefix}/{preview_seed}/p{n}.jpg
 //! ```
 //!
-//! `preview_seed` 由 [`service::PreviewService::preview_seed`] 推导：
+//! `preview_seed` 由 [`service::PreviewService::preview_seed`] 推导（2026-10-12
+//! 起**配方版本入 seed**）：
 //!
-//! - `content_sha256` 有值 ⇒ 取**前 32 位 hex**（sha256 前 16 字节 = 128 bit）；
-//! - 为 NULL（历史行）⇒ 退回 `sha256(object_key)` 的**前 32 位 hex**。
+//! ```text
+//! 材料 = content_sha256 非空 ? "content:{sha256}" : "key:{sha256(object_key)}"
+//! 种子 = hex(sha256("{材料}|recipe:{PREVIEW_RECIPE_VERSION}"))[..32]
+//! ```
+//!
+//! - `content_sha256` 有值 ⇒ 材料 `content:{sha}`（先 `trim` 再判空）；
+//! - 为 NULL（历史行）⇒ 材料 `key:{sha256(object_key)}`；
+//! - 两条来源都**显式带域前缀**，再统一掺 [`service::PREVIEW_RECIPE_VERSION`]
+//!   整体哈希、取**前 32 位 hex**（改渲染配方 ⇒ 种子换代，理由见该常量 doc）。
 //!
 //! 退回分支取的是**摘要**，原始 `object_key`（含文件名）本身不进路径。
 //! ⚠️ 退回分支因此**不是内容寻址**（同一份内容挂不同文件名会算出不同种子 ⇒
@@ -160,13 +168,35 @@
 //!
 //! ## CDN / 直链契约（固定 URL，无签名）
 //!
-//! `pages[]` 里是**固定 URL**（无 query、无签名、无过期参数）。含义与后果：
+//! `pages[]` 里是**固定 URL**（无签名、无过期参数、无按请求变化的部分）。含义与后果：
 //!
 //! - 前端可以把它直接塞进 `<img src>`、`<link rel="preload">`、Service Worker
 //!   缓存 —— 因为它不变，缓存命中率天然高；
-//! - ⚠️ 也因此，**内容一旦变更 URL 不变**。缓解：seed 是内容哈希，内容变了
-//!   就是另一个 seed ⇒ 另一个目录。唯一残留风险是「同内容重渲」（CI 版本升级导致
-//!   同一 PDF 渲出不同图）URL 不变 —— 记在下方「已知偏差」第 1 条。
+//! - ⚠️ 2026-10-12 起 URL **可带部署级固定 query**（`?size=` 档位选中的
+//!   `eo-img.resize=…` 图片即时处理参数，值来自 `CosConfig` 的
+//!   `preview_image_view_params` / `preview_image_thumb_params`）。它由**部署
+//!   配置**决定，**同一部署下对同一份文件稳定**（不随请求 / 用户 / 时间变），
+//!   故「固定 URL」的缓存语义不变；换部署配置会换 URL（缓存自然失效）；
+//! - ⚠️ 也因此，**内容一旦变更 URL 不变**。缓解：seed 是内容哈希（且掺
+//!   [`service::PREVIEW_RECIPE_VERSION`]，配方换代即换 seed），内容或配方变了
+//!   就是另一个目录，旧目录自然退场 —— 记在下方「已知偏差」第 1 条。
+//!
+//! ## `size` 投放档位（2026-10-12 新增）
+//!
+//! `?size=view|thumb|full`（缺省 `view`，大小写敏感）选择 `pages[]` 尾部拼哪一档
+//! 图片即时处理参数（值来自 `CosConfig` 的两个 `preview_image_*_params`）：
+//!
+//! | 档位 | 语义 | URL 参数 |
+//! |---|---|---|
+//! | `view` | 单张查看（缺省） | `preview_image_view_params` |
+//! | `thumb` | 列表缩略图 | `preview_image_thumb_params` |
+//! | `full` | 原始全尺寸 | **恒无**（不读配置） |
+//!
+//! 解析在 handler（[`dto::PreviewSize::parse`]）而**不是**提取器层：`size` 若在
+//! `PreviewQuery` 里声明成枚举，非法值会走 `QueryRejection` ⇒ 纯文本 400，
+//! 破坏「错误走 `R<T>` 信封」契约。非法值 ⇒ `40001` / HTTP 422，且解析**先于
+//! 任何 DB 读 / CI 副作用**（不产生 `t_file_preview` 行）。⚠️ 重复键
+//! （`?size=a&size=b`）仍是提取器层纯文本 400，属平台级残余，见已知偏差 #11。
 //!
 //! ## 跨仓 CI 终态词表（2026-10-13 review 第 1 轮建立）
 //!
@@ -252,7 +282,7 @@
 //!
 //! | # | 偏差 | 状态 |
 //! |---|---|---|
-//! | 1 | 预览图 URL **不带内容版本**：同 seed 重渲（CI 镜像升级等）URL 不变，浏览器缓存会让用户看到旧图，除非手动清缓存 | **未修**（要修得给 URL 加一档「渲染版本号」，需要 python CI 侧一并产出，属跨仓改动） |
+//! | 1 | 渲染配方换代（CI 镜像升级 / DPI / 质量调整）后，旧 `READY` 行与 CDN 缓存会继续供旧图 | **已修（2026-10-12）**：渲染配方版本入 seed（[`service::PREVIEW_RECIPE_VERSION`]）—— 改配方必须递增该常量，种子随之换代 ⇒ 新目录 / 新行 / 新 URL |
 //! | 2 | **python 侧端点尚未实现**：本模块打的是 `POST/GET /api/v1/files/ci-preview-jobs`，截至 2026-10-13 `backend-python/` 无该实现。未部署 python 端时走 `NoopPyBackend` 返 21118（HTTP 502），**不会静默成功** | **跨仓待办**（python 侧实现前，本端点在生产恒 502） |
 //! | 3 | `preview_seed` 在 `content_sha256 IS NULL` 的历史行上**退回按 `object_key` 哈希**，非内容寻址 ⇒ 同一份内容挂不同文件名会重复跑 CI | **未修**（要回填历史行哈希得重读 COS 对象，属独立立项） |
 //! | 4 | `next_poll_at` 的退避**固定 2s、无递增**，长文档（大 PDF 几百页）渲染超过 ~10s 时前端会持续轮询到收敛 | **未修**（本表无「轮询次数」列；上限常数 `POLL_BACKOFF_MAX_SECONDS=5s` 已预留接缝） |
@@ -262,6 +292,7 @@
 //! | 8 | **状态字段名跨仓两种写法**：`forward_ci_describe` 的响应模型字段是 **`state`**（python `CiPreviewJobStatus.state`，模块 docstring 的线上样例也是它），`status` 键在 python 侧**根本不存在**。本仓**两个键都读、`state` 优先**（读错 ⇒ 空串 ⇒ 落 `Running` 兜底 ⇒ 无限轮询）。⚠️ 2026-10-13 review 第 1 轮 MINOR-1 订正：此前实现是 `status` 优先、**顺序反了** | **已在本仓兜住**；两侧收敛到同一键名后可删掉 `status` 那一支 |
 //! | 9 | **提交请求体的跨仓字段名错配（2026-10-13 review 第 1 轮 BLOCKER，已修）**：本仓发 `{src_object_key, preview_prefix, preview_seed}`，python 的 `CiPreviewJobRequest` 只有 `{src_object_key, dst_prefix}` 且 `dst_prefix` **必填** ⇒ pydantic 静默丢掉两个多余键 + FastAPI **422** ⇒ **每一次 submit 都失败**，行永远停在 `PENDING / ci_job_id IS NULL` | **已修**（body 改为 `dst_prefix` + 抽出与 `preview_urls` 同源的 `preview_object_prefix` 真源；跨仓契约由 `tests/files/preview.rs::submit_request_body_matches_python_schema` 钉死） |
 //! | 10 | **`Success` 但 `total_page_count == 0` ⇒ 永远 PENDING 且每 2s 真打一次 python**（护栏的代价）：CI 若**永久**不返回页数（如 python 侧 `DocProcessResult` 结构变更导致该字段恒缺），行会**永不停**地以固定 2s 打 python（无递增退避，见 #4）⇒ **一次打不开的预览 = 一个永不停歇的 python 探针**。⚠️ **跨仓义务（前端）**：收到 **21117 / 21118** 时**必须停止自动重试**并回落 `GET /objects/{id}/content`（原始 PDF），**不得**按 `retry_after_ms` 无限重调 —— 每一次重试在「提交失败后自愈」这条路径上都是**一次新的 CI job**（按页计费） | **未修（有意）**：改成「N 次后判 FAILED」要改 schema（加轮询计数字段）。**该义务落在前端**，本仓已在 `PreviewOut` 的 `retry_after_ms` 语义与本表登记 |
+//! | 11 | **`?size=a&size=b` 重复键 ⇒ 纯文本 400**（不进 `R<T>` 信封、无业务码）：`Query<PreviewQuery>` 的提取器层判定（serde_urlencoded 对单值字段遇重复键报错），非本 handler 可控。**单值非法**（`?size=bogus`）不受影响，走 40001 / 422 信封 | **已知残余（平台级行为，不修）**：实现 `RawQuery` 手解仅为兜一个病态输入，收益不抵多一层解析；前端按单值拼参即可 |
 //!
 //! ### 需要 `backend-python` 同步的位置（本 PR 无法触及，python 在另一 worktree）
 //!

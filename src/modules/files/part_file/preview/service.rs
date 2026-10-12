@@ -86,11 +86,33 @@ pub const POLL_BACKOFF_MAX_SECONDS: i64 = 5;
 /// 出现「DB 侧截 500、日志侧不截」这种同源信息两个量纲的漂移。
 pub const ERROR_MESSAGE_MAX_CHARS: usize = 500;
 
-/// `preview_seed` 的十六进制长度（32 位 = sha256 的前 16 字节 = 128 bit）。
+/// `preview_seed` 的十六进制长度（32 位 = sha256 前 16 字节 = 128 bit）。
 ///
 /// 128 bit 对「同一份 PDF 被不同人反复上传」这个规模的碰撞概率已经可以忽略
 /// （生日界约 2^64 份才有一半概率碰撞）。
+///
+/// ⚠️ 种子**不是**「材料哈希的前 32 位直取」——材料先带域前缀（`content:` /
+/// `key:`）与配方版本（[`PREVIEW_RECIPE_VERSION`]）再整体哈希一次，见
+/// [`PreviewService::preview_seed`] 的 doc。
 pub const PREVIEW_SEED_HEX_LEN: usize = 32;
+
+/// 渲染配方版本标签，参与 [`PreviewService::preview_seed`] 的哈希输入。
+///
+/// ## 为什么需要它
+///
+/// 种子是**内容寻址**的：同一份 PDF 渲出的图永远落在同一个目录，`READY` 行与
+/// CDN / 浏览器缓存都以它为锚。代价是「同一份内容、换了渲染配方」（CI 镜像升级、
+/// DPI / 质量调整）时**没有任何一代机制** —— 旧 `READY` 行会继续返旧图，
+/// 浏览器也命中旧缓存。把配方版本掺进种子即可：改配方 ⇒ 种子变 ⇒ 新目录、
+/// 新行、新 URL，旧的一代自然退场。
+///
+/// ## 纪律
+///
+/// - 当前值与 python CI 配方（ImageDpi=300 / Quality=90）配套；
+/// - ⚠️ **每次改渲染配方必须递增本常量**（否则旧 READY 行与 CDN 缓存不会换代，
+///   用户看到的仍是按旧配方渲的图）；
+/// - 版本只作为哈希输入：**不进 URL、不出现在任何输出**（种子仍是 32 位 hex）。
+pub const PREVIEW_RECIPE_VERSION: &str = "r2-dpi300q90";
 
 /// 预览任务的全部业务逻辑。字段仅 `snowflake`（发 `t_file_preview.id` 用）。
 ///
@@ -136,12 +158,19 @@ impl PreviewService {
     /// `GET /objects/{id}/content` 逐字相同。⚠️ 放开 `ShelfAccount` 是**对既有
     /// 取舍的有意反转**，理由与风险补偿见 [`super::mod`] 的「安全取舍反转」一节 ——
     /// 改这一行前务必先读那段。
+    ///
+    /// ## `image_params`（2026-10-12 新增）
+    ///
+    /// 由 handler 按 `?size=` 档位选好的图片即时处理参数，只影响 READY 的
+    /// `pages[]` 尾部 query，**不进任何落库 / 送 python 的数据**（`preview_seed`、
+    /// `dst_prefix` 都与它无关）。
     pub async fn get_preview(
         &self,
         pool: &PgPool,
         py_backend: &Arc<dyn PyBackendClient>,
         preview_prefix: &str,
         preview_base_url: &str,
+        image_params: &str,
         file: &TPartFile,
         current: &CurrentUser,
     ) -> Result<PreviewOut, AppError> {
@@ -206,7 +235,12 @@ impl PreviewService {
         //     若把 READY 交给下面的 PENDING 流程，一个本该零 IO 的请求会去打一次
         //     python describe —— 既慢、又可能把并发窗口里的状态写乱。
         if row.state == state::READY {
-            return Ok(Self::ready_out(row, preview_base_url, preview_prefix));
+            return Ok(Self::ready_out(
+                row,
+                preview_base_url,
+                preview_prefix,
+                image_params,
+            ));
         }
 
         // 3b. FAILED → 自愈重置为 PENDING 后重走下面的推进流程。
@@ -231,7 +265,12 @@ impl PreviewService {
                 *row = fresh;
                 // 重新过 3a：可能已被别人推到 READY，那就该零 IO 直接返。
                 if row.state == state::READY {
-                    return Ok(Self::ready_out(row, preview_base_url, preview_prefix));
+                    return Ok(Self::ready_out(
+                        row,
+                        preview_base_url,
+                        preview_prefix,
+                        image_params,
+                    ));
                 }
                 // 仍是 FAILED（别人又把它打失败了）⇒ 本调用不参与自愈，返 PENDING。
                 if row.state == state::FAILED {
@@ -376,7 +415,12 @@ impl PreviewService {
                 row.page_count = describe.page_count;
                 row.error_message = None;
                 row.next_poll_at = None;
-                Ok(Self::ready_out(row, preview_base_url, preview_prefix))
+                Ok(Self::ready_out(
+                    row,
+                    preview_base_url,
+                    preview_prefix,
+                    image_params,
+                ))
             }
             CiStatus::Failed | CiStatus::Canceled | CiStatus::Paused | CiStatus::NotExist => {
                 // ⚠️ **四个变体逐个列出、刻意不写 `_`**：编译器会在本函数新增
@@ -444,24 +488,47 @@ impl PreviewService {
         Ok(())
     }
 
-    /// 内容寻址种子：`content_sha256` 前 32 位 hex；为 NULL（历史行）时退回
-    /// `sha256(object_key)` 前 32 位 hex。
+    /// 内容寻址种子：材料带域前缀 + 配方版本，整体再哈希，取前
+    /// [`PREVIEW_SEED_HEX_LEN`] 位 hex。
     ///
-    /// ⚠️⚠️ **两条路径的产物都必须是纯哈希，绝不带文件名**。`object_key` 的形状是
-    /// `{sha16}_{原文件名}`，文件名是图号（如 `A00123_rev2.pdf`）、**可枚举**；
-    /// 而预览目录是 public-read 的，把图号拼进路径等于公开图号清单。退回分支只
-    /// 取 `sha256(object_key)` 的**摘要**，原始 object_key（含文件名）不进路径。
+    /// ## 公式（2026-10-12 改，配方版本入 seed）
+    ///
+    /// ```text
+    /// 材料 = content_sha256 非空 ? "content:{sha256}" : "key:{sha256(object_key)}"
+    /// 种子 = hex(sha256("{材料}|recipe:{PREVIEW_RECIPE_VERSION}"))[..32]
+    /// ```
+    ///
+    /// 两条来源都**显式带域前缀**（`content:` / `key:`）—— 不加前缀时，
+    /// 「sha 恰好等于某个 object_key 的摘要」这种（理论上可构造的）输入会让两条
+    /// 来源坍缩到同一材料，而它们语义不同、不该共享目录。`|recipe:` 段是
+    /// [`PREVIEW_RECIPE_VERSION`] 的接入口（改配方 ⇒ 换代，理由见该常量 doc）。
+    /// 先 `trim` 再判空：`content_sha256` 是历史列，可能有空白脏值。
+    ///
+    /// ## ⚠️ 两条路径的产物都必须是纯哈希，绝不带文件名
+    ///
+    /// `object_key` 的形状是 `{sha16}_{原文件名}`，文件名是图号（如
+    /// `A00123_rev2.pdf`）、**可枚举**；而预览目录是 public-read 的，把图号拼进
+    /// 路径等于公开图号清单。退回分支只取 `sha256(object_key)` 的**摘要**，原始
+    /// object_key（含文件名）不进路径；两条来源又都被外层哈希一遍，不可反推。
     ///
     /// ⚠️ 退回分支**不是**内容寻址（同一份内容挂不同文件名会算出不同种子 ⇒ 重复
     /// 跑 CI）。这是可接受的：它只对 `content_sha256 IS NULL` 的历史行走，而
     /// 新上传路径（`upload_file_for_owner` / `bind_uploaded_file`）必写 sha256。
     /// 真要根治得回填历史行的 sha256（要重读 COS 对象算哈希），属独立立项。
     pub fn preview_seed(file: &TPartFile) -> String {
-        let source = match file.content_sha256.as_deref() {
-            Some(sha) if !sha.is_empty() => sha.to_string(),
-            _ => crate::modules::files::part_file::repo::hash_bytes(file.object_key.as_bytes()),
+        // ⚠️ 材料与配方标签之间用 `|` 分隔：两段都是定长 / 无 `|` 的十六进制或
+        // 固定串，拼接不产生歧义。
+        let material = match file.content_sha256.as_deref().map(str::trim) {
+            Some(sha) if !sha.is_empty() => format!("content:{sha}"),
+            _ => format!(
+                "key:{}",
+                crate::modules::files::part_file::repo::hash_bytes(file.object_key.as_bytes())
+            ),
         };
-        source.chars().take(PREVIEW_SEED_HEX_LEN).collect()
+        let hashed = crate::modules::files::part_file::repo::hash_bytes(
+            format!("{material}|recipe:{PREVIEW_RECIPE_VERSION}").as_bytes(),
+        );
+        hashed.chars().take(PREVIEW_SEED_HEX_LEN).collect()
     }
 
     /// 预览对象在 COS 里的**相对前缀**（不含站点根、不含页文件名）：
@@ -495,7 +562,8 @@ impl PreviewService {
         format!("{}/{}", prefix.trim_matches('/'), seed)
     }
 
-    /// 预览图 URL 列表：`{base}/{prefix}/{seed}/p{n}.jpg`，`n ∈ [1, page_count]`。
+    /// 预览图 URL 列表：`{base}/{prefix}/{seed}/p{n}.jpg`，`n ∈ [1, page_count]`；
+    /// `image_params` 非空时给每条 URL 追加 query（2026-10-12 新增）。
     ///
     /// ⚠️ **页码从 1 起**：CI 产出的对象名是 `p1.jpg` / `p2.jpg` / …（人类可读的
     /// 1-based），不是 `p0.jpg`。这个约定必须与 python 侧 CI 配置一致。
@@ -504,12 +572,37 @@ impl PreviewService {
     /// 同一真源）而不是就地拼 `prefix` —— 否则「写了哪个前缀」与「读哪个前缀」
     /// 会各自演化，`previews/` 那种尾斜杠配置就会一边 `//` 一边 `/`。
     ///
+    /// ## `image_params` 的追加规则（`size` 档位的落点）
+    ///
+    /// - 先 `trim`：空 / 纯空白 ⇒ **与追加功能引入前逐字一致**的裸 URL；
+    /// - 非空 ⇒ 追加 `?{params}`；URL 已含 `?` 时用 `&` 连接（低成本防御，
+    ///   正常形态下 `preview_base_url` 不带 query，这一支不会命中）。
+    ///
+    /// ⚠️ `image_params` 由调用方按 `PreviewSize` 档位选好（`Full` 档传空串），
+    /// 本函数**不认识档位**、只认识「拼不拼」。
+    ///
     /// `page_count <= 0` 返回空 vec（不该发生：`mark_ready` 只在 CI 报正页数时调，
     /// 而 service 在 `Success` 分支上把 0 页当 Running 处理，见 [`CiStatus`] 解析）。
-    pub fn preview_urls(base_url: &str, prefix: &str, seed: &str, page_count: i64) -> Vec<String> {
+    pub fn preview_urls(
+        base_url: &str,
+        prefix: &str,
+        seed: &str,
+        page_count: i64,
+        image_params: &str,
+    ) -> Vec<String> {
         let mid = Self::preview_object_prefix(prefix, seed);
+        let params = image_params.trim();
         (1..=page_count.max(0))
-            .map(|n| format!("{}/{}/p{}.jpg", base_url.trim_end_matches('/'), mid, n))
+            .map(|n| {
+                let url = format!("{}/{}/p{}.jpg", base_url.trim_end_matches('/'), mid, n);
+                if params.is_empty() {
+                    url
+                } else if url.contains('?') {
+                    format!("{url}&{params}")
+                } else {
+                    format!("{url}?{params}")
+                }
+            })
             .collect()
     }
 
@@ -548,7 +641,15 @@ impl PreviewService {
     }
 
     /// READY 出参：`pages` 长度恒等于 `page_count`（同一处循环产出，不可能不等长）。
-    fn ready_out(row: &TFilePreview, preview_base_url: &str, preview_prefix: &str) -> PreviewOut {
+    ///
+    /// `image_params` 是 `size` 档位选好的图片处理参数，原样透传给
+    /// [`Self::preview_urls`]（空串 = `full` 档 / 未配置）。
+    fn ready_out(
+        row: &TFilePreview,
+        preview_base_url: &str,
+        preview_prefix: &str,
+        image_params: &str,
+    ) -> PreviewOut {
         let page_count = row.page_count.max(0) as i64;
         PreviewOut::ready(
             page_count,
@@ -557,6 +658,7 @@ impl PreviewService {
                 preview_prefix,
                 &row.preview_seed,
                 page_count,
+                image_params,
             ),
         )
     }

@@ -14,7 +14,7 @@
 //! | `GET` | `/api/v2/files/objects/{id}/url` | M / C / I / CNC | `part_file` |
 //! | `GET` | `/api/v2/files/objects/{id}/content` | M / C / I / CNC / **SHELF** | `part_file` |
 //! | `POST` | `/api/v2/files/objects/{id}/delete` | 按 kind 派生 | `part_file` |
-//! | `GET` | `/api/v2/files/objects/{id}/preview` | M / C / I / CNC / **SHELF** | `part_file::preview`（**2026-10-13 PR2 新增**，COS CI 预览） |
+//! | `GET` | `/api/v2/files/objects/{id}/preview` | M / C / I / CNC / **SHELF** | `part_file::preview`（**2026-10-13 PR2 新增**，COS CI 预览；**2026-10-12** 支持可选 query `?size=view\|thumb\|full`） |
 //! | `POST` | `/api/v2/files/cnc/pairs` | M / CNC | `part_file::cnc` |
 //!
 //! ⚠️ **`/preview` 与 `/url` 的角色集合看似矛盾，实为有意**：`/url` 回的是 COS 预签

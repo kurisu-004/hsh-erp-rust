@@ -16,11 +16,12 @@
 //! - sts.rs         ← 2026-10-13 自 `tests/files_sts_tmp_keys.rs` 迁入。
 //!   `POST /api/v2/files/sts-tmp-keys` 的 BFF 转发用例（URL 未变）。
 //! - preview.rs     ← **2026-10-13 PR2 新建**：COS CI 图纸预览
-//!   `GET /api/v2/files/objects/{id}/preview`（惰性轮询、零后台任务）。⚠️ **29 个
-//!   测试函数**（2026-10-13 review 第 2 轮 N-2 逐函数点数核对）= 21 个编号函数
-//!   （20 个编号条目，其中 #18 覆盖 2 个）+ 8 条不编号护栏 —— 含 matchit 冲突实测、
-//!   `preview_urls` 纯函数、跨仓 CI 终态词表表驱动、**跨仓请求体契约**、认领谓词的
-//!   确定性并发断言。
+//!   `GET /api/v2/files/objects/{id}/preview`（惰性轮询、零后台任务）。⚠️ **33 个
+//!   测试函数**（2026-10-12 新增 `?size=` 档位 2 条 + `image_params` 追加 1 条后
+//!   逐函数点数）= 24 个编号函数（22 个编号条目，其中 #18 覆盖 2 个）+ 9 条不编号
+//!   护栏 —— 含 matchit 冲突实测、`preview_urls` 纯函数、跨仓 CI 终态词表表驱动、
+//!   **跨仓请求体契约**、认领谓词的确定性并发断言、**`size=view/thumb/full` 档位与
+//!   非法值 422 零副作用**。
 //!
 //! ⚠️ `sts.rs` 自建了一个最小 Router（`.nest("/files", files::router())` + iam nest），
 //! 2026-10-13 起它会顺带挂上本域新的对象 / CNC 路由，但该文件一条都不打 —— 保留原样。

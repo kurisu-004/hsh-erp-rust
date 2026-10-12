@@ -61,6 +61,9 @@ fn make_cos_config(backend: CosBackend, enabled: bool) -> CosConfig {
         // 2026-10-13 PR2：CI 预览图 URL 拼接两件套（本 binary 不打预览端点，取字面量即可）
         preview_prefix: "previews".to_string(),
         preview_base_url: "https://test-bucket.cos.ap-shanghai.myqcloud.com".to_string(),
+        // 2026-10-12 新增：`size` 档位的图片即时处理参数（同上，本 binary 不消费）
+        preview_image_view_params: "eo-img.resize=l/2560".to_string(),
+        preview_image_thumb_params: "eo-img.resize=w/480".to_string(),
         bucket: "test-bucket-1234567890".to_string(),
     }
 }

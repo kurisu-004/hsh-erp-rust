@@ -230,6 +230,9 @@ pub fn test_app_config() -> Arc<AppConfig> {
             // 2026-10-13 PR2：CI 预览图 URL 拼接两件套（iam 单测不涉及，取字面量即可）
             preview_prefix: String::new(),
             preview_base_url: String::new(),
+            // 2026-10-12 新增：`size` 档位的图片即时处理参数（同上，零值占位）
+            preview_image_view_params: String::new(),
+            preview_image_thumb_params: String::new(),
         },
         snowflake: crate::infra::config::SnowflakeConfig {
             instance: 1,
