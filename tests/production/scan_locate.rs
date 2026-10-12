@@ -1157,7 +1157,16 @@ async fn locate_take_over_with_only_soft_deleted_process_mapping_still_returns_a
         .expect("soft delete t_process");
     let holder = insert_worker(&pool, "BC-WPDEL-H", "持有人", Some(wt)).await;
     let taker = insert_worker(&pool, "BC-WPDEL-T", "接管人", Some(wt)).await;
-    // 无链 ⇒ 非链推导形态（`take_over_gate` 改判「工种有没有候选」）
+    // ⚠️ `with_chain=false` **不等于「无链」**：fixture 仍建链 + step，并把批次的
+    // `current_process_step_id` 指过去；只把 part 的 `process_chain_id` 留空 ⇒ 读侧
+    // 锚链表达式是 `COALESCE(p.process_chain_id, cur.chain_id)`，会回退捞到那条
+    // **未绑链** ⇒ 落 `chain_state == "TAIL"`（**不是 `NONE`**）。本用例要的只是
+    // 「非链推导形态」（`take_over_gate` 改判「工种有没有候选」），TAIL / NONE 两种
+    // 非链推导形态走**同一分支**，故断言结果不受影响。
+    // ⚠️ 想要真正的 `NONE` 形态（指针为 NULL）请照
+    // `locate_outsource_empty_work_type_candidate_returns_none_with_reason` 的显式
+    // 清列写法（那条同时清了 `current_process_id` 与 `current_process_step_id` 并
+    // 断言 `chain_state == "NONE"`），别照注释字面理解 `with_chain=false` 的语义。
     let (_part, batch, _step) =
         insert_worker_held_part(&pool, customer, "SN-WPDEL", holder, proc, 1, false).await;
 

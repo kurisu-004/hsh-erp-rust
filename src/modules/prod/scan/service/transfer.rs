@@ -41,6 +41,14 @@
 //!   「链内能定位到就取，定位不到落 `NULL`」—— **2026-10-16 起不再报 `20702`**：
 //!   非同工序内接管时链可能整体不适用（无链 / 链已软删 / 链外工序），而
 //!   `current_process_step_id` 是可空列，跨工序接管不必有链上落点。
+//!   ⚠️ 代价登记（2026-10-16 review 第 2 轮 MINOR-2）：在**有链 + 指针原本非 NULL**
+//!   的批次上，这会让 `transfer_to_worker` 把 step 指针**真的清成 NULL**（该 SQL 是
+//!   直写、不学 `mark_batch_returned` 的 `COALESCE` 条件写），由此产生的**新数据形态**
+//!   及两条下游后果（① 后续 `worker-scan` 因 `is_pointer_consistent == false` 走非顺应
+//!   分支、要求显式传 `next_process_id`；② 候选池按 `current_process_id` 过滤、不经
+//!   step JOIN，故不受影响）逐条见 `docs/api/scan.md` §8「`take-over` 造出
+//!   `current_process_step_id` 由非 NULL 被清成 NULL 的新数据形态」。**本分支不
+//!   「顺手」把 `20702` 加回去** —— 那是产品决策 6 明确要拆掉的东西。
 //! - **分支 C · 缺省且链不可推导**：候选集 = 该工种 `t_work_type_process` 活跃映射
 //!   （**不与工序链求交** —— 这种形态下默认工序链已不适用，再求交会把候选清空）。
 //!   恰好 1 条 ⇒ 自动用它（同分支 B 的 step 解析）；>1 条 ⇒ `40001`（前端按
@@ -217,6 +225,9 @@ impl ScanService {
             };
             // step 解析：**链内定位得到就取，定位不到落 NULL**（2026-10-16 起不再
             // 报 `20702` —— 跨工序接管本就允许工序不在链内，该列允许 NULL）。
+            // ⚠️ 这里的 `None` 会经 `transfer_to_worker` **真的清掉**批次的 step 指针
+            //（该 SQL 直写该列、不做 COALESCE 保持原值）⇒ 新形态 + 两条下游后果见
+            // 本文件模块 doc 的分支 B 与 `docs/api/scan.md` §8 对应登记。
             // `optional_process_chain` 只读 `t_part.process_chain_id`、**不判链行
             // 软删**，故 `chain_id` 可能是已软删链的 id；`resolve_step_id_by_process`
             // 同样只查 step 不 JOIN 链行，这个既有分叉**不在本轮处理**（登记见

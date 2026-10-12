@@ -599,7 +599,17 @@ p.deleted_at IS NULL`，过滤 `wtp.work_type_id = $工种` 且 `wtp.deleted_at 
 读侧说做不了」的**假阻挡**。
 
 ⇒ 「`action` 给了按钮但 `worker_processes` 是 `[]`」是**刻意且正常**的形态（工种只
-映射了已软删工序）；前端已有 0 候选兜底提示（`LocateDialog.vue` 的 warning）。
+映射了已软删工序）；前端**须**在 0 候选时给「该工种未映射工序」warning 而非静默
+失败（`LocateDialog.vue` 的现状待联调核对，见 §7.2 第 15 条）。
+
+⚠️ **出参长度 ≤ 写侧候选数：前端不可由出参长度反推写侧会不会自动推导**
+（2026-10-16 review 第 2 轮 MINOR-1）。出参是窄集合、写侧候选是宽集合，故恒有
+`worker_processes.length ≤ |list_process_ids|`：**两处不等**，而且不等的方向不止一种
+——「出参 0 条 / 宽集 ≥ 1」已登记（只映射了已软删工序），「**出参 1 条 / 宽集 ≥ 2**」
+同样可达（工种既有活跃工序映射、又有指向已软删工序的活跃映射）⇒ 此时写侧落
+`many` 分支返 `40001`，而前端按「出参恰好 1 条 ⇒ 单候选自动推导」实现就会踩。
+⇒ **前端不得把 `worker_processes.length` 当作「写侧会不会自动推导」的判据**，
+必须保留 `40001` 错误分支。三态与对应失败码逐条见 §7.2 第 15 条。
 
 ⚠️ 它与 `batches` 一样是**逐次请求现查**的（`GET /scan/locate` 无缓存层）：工种↔工序
 映射是配置数据，前端 picker 打开时拿到的就是当前生效的那一份。
@@ -1317,16 +1327,28 @@ repo 都不 import（连 `PartRepoTrait` 都不借 —— 那是一个 part 域�
       「该做什么由工人的工种说了算」。⚠️ **闸门与出参用宽窄两个集合**
       （2026-10-16 review 第 1 轮 MINOR-1）：写端点的「单候选自动推导 / 多候选必填 /
       零候选拒」判据用**全部**活跃映射（含工序已软删的），本出参只含工序未软删的
-      行 ⇒ **`length === 0` 不等于「写侧会拒」**（只映射了已软删工序时写侧仍会成功，
-      出参为空）。空数组的四种成因：未传 `worker_id` / 工人无工种 / 工种未映射任何
-      工序 / 工种只映射了已软删工序。前端一律走既有兜底（`LocateDialog.vue` 给
-      「该工种未映射工序」warning 而不静默失败）。
+      行 ⇒ **出参长度不能反推写侧会不会自动推导**（恒有 `出参 ≤ 写侧候选数`，不等方向
+      见下一条的三态表）。空数组的四种成因：未传 `worker_id` / 工人无工种 / 工种未映射
+      任何工序 / 工种只映射了已软删工序。前端**须**在 0 候选时给「该工种未映射工序」
+      warning 而不静默失败（`LocateDialog.vue` 的现状待联调核对，见下方三态表 ①/①′）。
     - **`worker_processes.length === 1` ⇒ 直接提交、不弹框**：`POST /scan/take-over`
       与 `POST /scan/outsource-receive` 在「链推不出 + 候选恰好 1 条」时都不要求
-      `next_process_id`（省略该键即可，别发 `null`）。⚠️ 该结论只对**出参非空且恰好
-      1 条**成立；出参为空时「写侧单候选自动推导」仍可能发生（上面的宽集合），
-      这时前端无法预知结果 —— **仍需保留错误分支**（`20104` / `40001`）。
-      前端「选一道工序」的弹框只在 `length > 1` 时才需要。
+      `next_process_id`（省略该键即可，别发 `null`）。前端「选一道工序」的弹框只在
+      `length > 1` 时才需要。
+      ⚠️⚠️ **该优化的前提是「写侧宽集恰好 1 条」，不是「出参恰好 1 条」** —— 两者是
+      不同集合（上一条的宽窄分叉）。下列**三态**才是完整的例外清单，前端必须按表处理，
+      尤其第 ③ 态：**`40001` 错误分支任何情况下都不能省**。
+
+      | 态 | 出参 `worker_processes` | 写侧宽集（`list_process_ids`） | 缺省提交的写侧结果 | 前端动作 |
+      |---|---|---|---|---|
+      | ① | `length === 0`（四种成因，见上） | 宽集 = 0 | `20104`「工种未映射任何工序」 | 给 warning 文案（指路找管理员配工种）；**保留 `20104` 分支** |
+      | ①′ | `length === 0`（只映射了已软删工序） | 宽集 = 1 | 单候选 ⇒ **成功**（写侧自动推导） | 直接提交；**`20104` 仍可能出现**（管理员把宽集改成 0 后再提交） |
+      | ② | `length >= 2` | 宽集 ≥ 2（**恒成立**：出参 ⊆ 宽集） | `many` 分支 ⇒ `40001`（HTTP 422） | 弹「选一道工序」框、必填 `next_process_id`（本态是**唯一**「出参长度即可判定必填」的情形） |
+      | ③ | **`length === 1`** | 宽集 ≥ 2（工种既有活跃工序映射、又有指向**已软删**工序的活跃映射） | `many` 分支 ⇒ **`40001`（HTTP 422）** | ⚠️ **「出参 1 条 ⇒ 免填」在此态下不成立**。必须保留 `40001` 分支（失败后回退到「选一道工序」弹框，或提示重扫 `locate` 刷新候选） |
+
+      ⇒ **实操口径**：前端可以「出参 1 条时不弹框」作为体验优化，但**提交失败必须能接住
+      `40001`** 并给出「这道工序得您选」的文案（见下方「新的失败码形态」）。把
+      `worker_processes.length` 当成写侧判据的实现，在第 ③ 态必然踩空。
     - ⚠️ **`chain_state == "NEXT"`（take-over）/ 有链可推导（outsource-receive）时仍要
       照旧回传 `next_process_id`**：那两条路径的**链推导优先于工种候选**，前端省略了
       后端会用链上的下一道（可能与工人想选的候选不同）。两条端点的判定入口不同
@@ -1362,9 +1384,16 @@ repo 都不 import（连 `PartRepoTrait` 都不借 —— 那是一个 part 域�
 
 ⇒ **`20702` 在这两个端点上已不再是「越链」**：`take-over` 只剩一种成因（链推导返回
 `NEXT` 却拿不到下一道 id，派生 SQL 内部不自洽），`outsource-receive` **完全不产生**
-`20702`（其判据 5 的失败码只剩 `40001` / `20104` / `20706`）。落 `NULL` 不丢数据 ——
-外协批次按「出池清工序」不变式该列恒为 `NULL`，`mark_batch_with_status_and_meta` 的
-`None → clear_process_step_id = true` 对已是 `NULL` 的列是 no-op。
+`20702`（其判据 5 的失败码只剩 `40001` / `20104` / `20706`）。
+
+⚠️ **「落 `NULL` 不丢数据」这句论证只对 `outsource-receive` 成立**（2026-10-16 review
+第 2 轮 MINOR-2 收窄）：外协批次按「出池清工序」不变式该列恒为 `NULL`，
+`mark_batch_with_status_and_meta` 的 `None → clear_process_step_id = true` 对已是
+`NULL` 的列确是 no-op。`take-over` **不在**那条不变式的适用范围内 —— 它的
+`transfer_to_worker` 是**直写** `current_process_step_id`（刻意不学
+`mark_batch_returned` 的 `COALESCE` 条件写，见 `prod/batch/repo/sql.rs` 的
+`TRANSFER_TO_WORKER_SQL`），于是「NULL」在那边是**真的清掉了指针** ⇒ 新形态与后果
+单列一条登记：见下条。
 
 **已消解的读侧不可预判**（原 2026-10-16 登记的「`worker_processes` 收窄后仍可能吃到
 `20702`」）：该形态由 `Lenient` 消除 —— picker 给出的每一项，写侧现在都认；反之写侧
@@ -1376,6 +1405,39 @@ repo 都不 import（连 `PartRepoTrait` 都不借 —— 那是一个 part 域�
 第 2 / 3 条的那一半）。新语义下链推不出时**候选集来自工种映射**、越链也放行，
 该分叉随之消失；读侧新增的空候选闸门（`PROCESS_NOT_IN_WORK_TYPE`）是对位的新闸门，
 不是同一条旧组合。
+
+---
+
+**`take-over` 造出「`current_process_step_id` 由非 NULL 被清成 NULL」的新数据形态
+（2026-10-16，review 第 2 轮 MINOR-2 补登记；属上一条产品决策的**显式取舍，本轮不改**）**
+
+**形态**：*part 有链*，接管时链推不出（`!pointer_consistent` 或 `chain_state != "NEXT"`），
+且目标工序 ∉ 该链 ⇒ 走 `transfer.rs` 的**分支 B / C**，step 解析
+`resolve_step_id_by_process` 在链内定位不到 ⇒ 出参 `next_process_step_id = null`，且
+`transfer_to_worker` **直写**该列 ⇒ 批次的 step 指针从**非 NULL**（原指针）被**清成
+NULL**。2026-10-16 之前该形态不可达（`optional_step_id` 越链即抛 `20702`），是本轮
+「放宽 `20702`」才让它合法的 ⇒ **这是本 diff 新引入的数据形态，不是存量脏数据**。
+
+两条已核实的下游后果（都**不会炸**，但**行为变了**，前端 / 排障须知）：
+
+1. **后续放回落 `worker-scan` 的非顺应分支 ⇒ 必须显式传 `next_process_id`**（与**无链
+   工单**同款）：`ChainPosition::is_pointer_consistent` 要求
+   `(located, pointer)` 双非 NULL 且相等，指针成 NULL 后恒返 `false`
+   （`src/shared/batch/chain.rs`）⇒ `POST /scan/worker-scan` 的 `RETURNED` 分支拿不到
+   「链上下一道」，落**非顺应**分支，缺 `next_process_id` 即 `40001`。这是既有契约
+   （链信息不可信时不替工人断定下一道），不是新缺陷，但**接管过的批次之后会走这条**。
+2. **不影响候选池**：`prod/queue` 的候选池按 `pb.current_process_id` 普通过滤
+   （`take_one_from_pool` 用 `= ANY($3)`、`list_candidates_by_process_all_shelves` 用
+   `= $1`）——⚠️ 历史上那条 `INNER JOIN t_process_chain_step s ON s.id =
+   pb.current_process_step_id`（以及 `list_candidates_by_process_all_shelves` 的 `s2`
+   变体）**已于 2026-09-30 因「下发后不入池」bug 修复时删除**，现任何形态都**不经 step
+   指针 JOIN** ⇒ 不存在「step 指针为 NULL 让批次对候选池隐身」的回归。
+   `prod/queue/board` 侧那两处 step 关联走 **LEFT JOIN**（`cs` 未命中照常出列），
+   同样不筛行。
+
+⇒ 登记在此只为：后续排障遇到「接管后批次 step 指针为空、放回要求显式指定下一道工序」
+时，知道这是**预期形态**（产品决策 6 的取舍）而非数据损坏。**不要**为了「消灭这个形态」
+把 `20702` 加回去 —— 那正是产品决策要拆掉的东西。
 
 ---
 

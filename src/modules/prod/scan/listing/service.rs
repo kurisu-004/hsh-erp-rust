@@ -417,6 +417,12 @@ fn pending_gate(row: &LocateBatchRow, ctx: &LocateWorkerCtx) -> Option<LocateDis
 ///
 /// ⚠️ 上面那条 `NEXT && 指针一致 && 下一道 ∉ 工种` 闸门**不受本轮影响** —— 跨工序
 /// 接管是「链不适用」的那条独立路径，不是「候选为空」。
+///
+/// ⚠️ **`ctx.process_ids` 是宽集，与 `LocateOut.worker_processes`（窄出参）不是同一
+/// 个集合**（2026-10-16 review 第 2 轮 MINOR-1）：本函数「宽集非空 ⇒ 放行」与写侧
+/// 「宽集恰好 1 条才自动推导」之间没有一一对应 —— 「出参 1 条 / 宽集 ≥ 2」时前端按
+/// 出参实现会漏填 `next_process_id`、写侧仍返 `40001`。三态全表见 `docs/api/scan.md`
+/// §7.2 第 15 条。**不要**为了让闸门与出参长度看起来一致而把本处改用窄集。
 fn take_over_gate(row: &LocateBatchRow, ctx: &LocateWorkerCtx) -> Option<LocateDisabledReason> {
     let chain_derivable =
         chain_state_of(row) == ScanChainState::Next && row.pointer_consistent.unwrap_or(false);
@@ -444,6 +450,10 @@ fn take_over_gate(row: &LocateBatchRow, ctx: &LocateWorkerCtx) -> Option<LocateD
 /// ⚠️ **2026-10-16**：本函数比 `take_over_gate` 少一个 `pointer_consistent` 条件 ——
 /// 外协批次按「出池清工序」不变式两个指针列都是 NULL，链可推导与否只由
 /// `chain_state` 表达（与既有判据同源，本次未改）。
+///
+/// ⚠️ **与 `take_over_gate` 同一个宽窄分叉**：`ctx.process_ids` 含工序已软删的映射行，
+/// 而前端 picker 的选项集 `worker_processes` 只含未软删的 ⇒ 「出参 1 条 / 宽集 ≥ 2」
+/// 时写侧仍落 `many` 返 `40001`。见上条与 `docs/api/scan.md` §7.2 第 15 条三态表。
 fn outsource_gate(row: &LocateBatchRow, ctx: &LocateWorkerCtx) -> Option<LocateDisabledReason> {
     if row.has_chain && chain_state_of(row) == ScanChainState::Next {
         if !row.next_process_in_work_type {
