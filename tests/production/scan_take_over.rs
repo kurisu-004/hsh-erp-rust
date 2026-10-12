@@ -10,8 +10,8 @@
 //! - **关键回归** `is_repairing` 保持 true（防误用无条件清标记的漏斗）；
 //! - 2026-10-16 新语义（目标工序改由工种映射推导）：
 //!   **单候选自动推导成功** / **多候选缺省 `40001`** / **零候选 `20104`** /
-//!   **显式传链外工序成功且 step 落 NULL**（最后这条是
-//!   `take_over_explicit_process_not_in_chain_returns_20702` 的反转）。
+//!   **显式传链外工序成功且 step 落 `NULL`**（`20702` 在本端点只剩分支 A
+//!   「派生 SQL 返回 `NEXT` 却拿不到下一道」一种成因）。
 //!
 //! ## fixture 复用
 //! 全部从 `super::queue` 借（`bootstrap_as_manager` / `insert_work_type` /

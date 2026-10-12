@@ -538,7 +538,8 @@ impl ScanListingRepo {
     }
 
     /// `GET /scan/locate` 出参 `worker_processes` 的取行：**该工人工种可执行的
-    /// 工序**（2026-10-16 新增）。
+    /// 工序**（2026-10-16 新增；`t_process` 的 JOIN 于 2026-10-16 review 第 1 轮
+    /// MINOR-1 由 `JOIN` 改为 `LEFT JOIN`）。
     ///
     /// ## 它的两个消费方
     ///
@@ -552,14 +553,32 @@ impl ScanListingRepo {
     /// 域隔离护栏扫（读他域的**表**是允许的既定 pattern，import 他域的**符号**才
     /// 违规），理由与 `fetch_locate_worker` / `fetch_max_held_batches` 同款。
     ///
-    /// ## ⚠️ `p.deleted_at IS NULL` 比写侧**更严**，且刻意不对齐
+    /// ## ⚠️ 一条 SQL 同时产出**宽窄两个集合**（2026-10-16 review MINOR-1）
     ///
-    /// 写侧的候选集判据是 `WorkTypeRepo::list_process_ids`（只筛
-    /// `wtp.deleted_at IS NULL`，**不 JOIN `t_process`**）；本条多带一个
-    /// `p.deleted_at IS NULL`。方向是**安全**的（读侧 ⊆ 写侧 ⇒ 读侧永不给出写侧会
-    /// 拒的值，picker 里不会出现「选了必被 20104」的行），而且软删工序**没有可展示的
-    /// 名字**（`code` / `name` 仍在库里但业务上已作废）。**不要**为「与写侧逐字同源」
-    /// 把这个闸门删掉 —— 删掉不会让任何现有测试变红，只会让 picker 多出一列死卡片。
+    /// `JOIN t_process` ⇒ `LEFT JOIN t_process ON p.id = wtp.process_id AND
+    /// p.deleted_at IS NULL`，**软删闸门留在 ON 子句里**（写进 WHERE 会把整行滤掉、
+    /// 等价于原来的 INNER JOIN）。一条结果集由 service 分成两路消费：
+    ///
+    /// - **闸门（`LocateWorkerCtx.process_ids`）取全部行的 `process_id`** ——
+    ///   与写侧 `WorkTypeRepo::list_process_ids`（只筛 `wtp.deleted_at IS NULL`、
+    ///   **不 JOIN `t_process`**）**逐字同源**。这是本轮改动的全部要点：改之前读侧
+    ///   候选集 ⊂ 写侧候选集，工种只映射了已软删工序时读侧判 0 条 ⇒ 闸门落
+    ///   `PROCESS_NOT_IN_WORK_TYPE` 藏掉按钮，而写侧 `list_process_ids` 返 1 条 ⇒
+    ///   **单候选自动推导会成功** —— 一个「写侧会成功、读侧说做不了」的**假阻挡**，
+    ///   正是本仓明令禁止（`listing/service.rs` 里 2026-10-15 S3 那次订正就是为消灭它）。
+    /// - **出参（`LocateOut.worker_processes`）只留「工序未软删」的行** ——
+    ///   即 `name` / `code` / `category` 有值的那些。软删工序在业务上已作废、
+    ///   **没有可展示的名字**，picker 里不该出现死卡片。
+    ///
+    /// 于是「闸门放行 + `worker_processes` 为空数组」是**刻意且正常**的形态（工种只
+    /// 映射了已软删工序）：写侧此时会成功，读侧不再假装不能做；前端已有 0 候选兜底
+    /// 提示（`LocateDialog.vue` 给「该工种未映射工序」warning 而非静默失败）。
+    /// **不要**为了让两者看起来一致而把闸门改回窄集合。
+    ///
+    /// ⚠️ **`process_id` 取 `wtp.process_id` 而不是 `p.id`**（2026-10-16 review
+    /// MINOR-1 返工）：LEFT JOIN 未命中（工序已软删）时 `p.id` 是 SQL NULL，按
+    /// `i64` 解码会报 `ColumnDecode` ⇒ 整页 500。映射行的 `wtp.process_id` 恒非空，
+    /// 且它才是闸门要的那个 id（写侧 `list_process_ids` 读的也正是这一列）。
     ///
     /// 排序 `wtp.sort_order ASC, wtp.id ASC`：`sort_order` 是工种↔工序映射的
     /// 配置顺序（同 `work-types/{id}/processes` 的整组替换语义），`id` 兜同序的
@@ -567,11 +586,11 @@ impl ScanListingRepo {
     pub(crate) async fn fetch_worker_processes(
         conn: &mut PgConnection,
         work_type_id: i64,
-    ) -> Result<Vec<LocateProcessBrief>, sqlx::Error> {
+    ) -> Result<Vec<LocateProcessRow>, sqlx::Error> {
         sqlx::query_as(
-            "SELECT p.id AS process_id, p.code, p.name, p.category \
+            "SELECT wtp.process_id AS process_id, p.code, p.name, p.category \
              FROM t_work_type_process wtp \
-             JOIN t_process p ON p.id = wtp.process_id AND p.deleted_at IS NULL \
+             LEFT JOIN t_process p ON p.id = wtp.process_id AND p.deleted_at IS NULL \
              WHERE wtp.work_type_id = $1 AND wtp.deleted_at IS NULL \
              ORDER BY wtp.sort_order ASC, wtp.id ASC",
         )
@@ -749,19 +768,23 @@ pub struct LocateWorkerRow {
     pub(crate) max_held_batches: Option<i32>,
 }
 
-/// `GET /scan/locate` 的工种可执行工序行（`fetch_worker_processes` 的一条结果）。
+/// `GET /scan/locate` 的工种映射行（`fetch_worker_processes` 的一条结果）。
 ///
 /// 字段名即 SQL 别名（`FromRow` 按列名匹配）。与 [`LocateWorkerRow`] 同款：行投影
 /// 与网络契约 VO **刻意不合并**（投影层还要顺带给 `LocateWorkerCtx.process_ids`
-/// 递 id 投影），转换在 service 层做。
+/// 递 id 投影，且它比出参**宽** —— 见 `fetch_worker_processes` 的 doc），转换在
+/// service 层做。
 #[derive(Debug, sqlx::FromRow)]
-pub struct LocateProcessBrief {
-    /// `t_process.id`（出参走 `serialize_i64` → JSON string）。
+pub struct LocateProcessRow {
+    /// `t_work_type_process.process_id`（**取自映射行**，不是 `t_process.id` ——
+    /// LEFT JOIN 未命中时后者为 NULL，但这一列恒有值）。出参走 `serialize_i64`。
     pub(crate) process_id: i64,
-    pub(crate) code: String,
-    pub(crate) name: String,
-    /// `t_process.category`：`"INHOUSE"` / `"OUTSOURCE"`。
-    pub(crate) category: String,
+    /// `t_process.code`；`None` = 该工序已软删（LEFT JOIN 未命中）。
+    pub(crate) code: Option<String>,
+    /// `t_process.name`；`None` = 该工序已软删。
+    pub(crate) name: Option<String>,
+    /// `t_process.category`：`"INHOUSE"` / `"OUTSOURCE"`；`None` = 该工序已软删。
+    pub(crate) category: Option<String>,
 }
 
 /// `GET /scan/locate` 的批次行：**action 判定所需的全部原始事实**。

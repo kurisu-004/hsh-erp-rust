@@ -139,8 +139,11 @@ pub struct LocateOut {
     ///
     /// **2026-10-16 新增**：前端把「接管 / 外协收回」的目标工序 picker 收窄到这个
     /// 集合（不再展示全部工序），且**单候选时直接提交、不弹框**（写端点会自行推导）。
-    /// ⚠️ 与写侧的候选集**不逐字同源**：本列表多带 `p.deleted_at IS NULL` 闸门
-    /// （理由见 `listing/repo.rs::fetch_worker_processes` 的 doc），方向是读侧 ⊆ 写侧。
+    /// ⚠️ **本列表比写侧判据窄**（2026-10-16 review 第 1 轮 MINOR-1）：**闸门**
+    /// （`locate` 的 `disabled_reason` 判定）用的是**宽**集合（全部活跃映射，含工序
+    /// 已软删的，与写侧 `WorkTypeRepo::list_process_ids` 逐字同源），本**出参**只留
+    /// 工序未软删的行（软删工序没有可展示的名字）。故「闸门放行 + 本数组为空」是
+    /// 刻意且正常的形态（工种只映射了已软删工序），前端有 0 候选兜底提示。
     pub worker_processes: Vec<LocateProcessBriefOut>,
 }
 

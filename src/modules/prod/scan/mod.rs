@@ -64,7 +64,13 @@
 //! - 读侧 `GET /scan/locate` 出参新增**顶层** `worker_processes`（工种可执行工序，
 //!   供前端把 picker 收窄到这个集合；单候选时直接提交、不弹框）；两个闸门函数各加一条
 //!   「**非链推导形态下**工种零候选 ⇒ `PROCESS_NOT_IN_WORK_TYPE`」—— 复用既有
-//!   字面量，**不扩 wire 枚举**。
+//!   字面量，**不扩 wire 枚举**。闸门用的候选集与写侧 `WorkTypeRepo::list_process_ids`
+//!   **逐字同源**（2026-10-16 review 第 1 轮 MINOR-1 订正：含工序已软删的映射行），
+//!   `worker_processes` 出参则只留工序未软删的行 —— 「闸门放行 + 出参为空」是刻意形态。
+//! - `outsource-receive` 的 stage① 传 `StepResolve::Lenient`（2026-10-16 review 第 1
+//!   轮 BLOCKER-1 订正）：**有链 + 链外工序落 `NULL` step、不再 `20702`**，否则本
+//!   端点「工种候选不与链求交」的新语义造出的输入会被自己拒收。`/outsource-queue/move`
+//!   的回收臂传 `Strict`，那条端点一行未变。
 //! - 错误码分段不变：复用 `20104` / `40001` / `20702`，无新增段。
 //!
 //! ## 模块结构

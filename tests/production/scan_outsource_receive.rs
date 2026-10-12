@@ -9,6 +9,9 @@
 //! - 2026-10-16 新语义（目标工序改由工种映射推导）：链不可推导时**单候选自动推导**
 //!   / **零候选 `20104`**；两条既有用例（无链 `40001`、有链推不出 `20706`）的
 //!   fixture 相应改成「工种映射 2 道」，钉的是**多候选**分支而非回退旧语义；
+//! - 2026-10-16 review 第 1 轮 BLOCKER-1：stage① 传 `StepResolve::Lenient` ⇒
+//!   「有链 + 链外工序」落 `NULL` step 而**不是** `20702`，两条形态各有回归
+//!   （显式链外 / 链推不出 + 工种单候选链外）；
 //! - 判据顺序与错误码全矩阵（`20201` / `20202` / `20206` → `20109` / `20101` →
 //!   `40901` → `20103` / `20122` → `40001` / `20104` → `20904` / `20204` → `40300`）；
 //! - **关键回归**：容量触顶（`20204`）时**零写入**（批次仍 `OUTSOURCE` /
@@ -611,6 +614,106 @@ async fn outsource_receive_no_shelf_for_next_process_returns_20508() {
         0,
         "20508 必须零 part 事件"
     );
+}
+
+// ===========================================================================
+//  链外工序 / `StepResolve::Lenient`（2026-10-16 review 第 1 轮 BLOCKER-1）
+// ===========================================================================
+
+/// **BLOCKER-1 回归**：工单**有链** + 显式 `next_process_id` 指向**链外**工序 ⇒
+/// 收回**成功**，`current_process_step_id` 落 `NULL`（不再 `20702`）。
+///
+/// 改前 stage① 内核走 `optional_step_id`，「有链但链内定位不到」即抛 `20702` ——
+/// 而本端点 2026-10-16 的新语义（工种候选**不与链求交**）恰恰会主动生产这个输入。
+/// 断言三件事：HTTP 200、工序落显式值、step 为 `None`。
+#[tokio::test]
+async fn outsource_receive_explicit_process_outside_chain_succeeds_with_null_step() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let st = setup_receive(&pool, "OR-OUTCHAIN", true, true).await;
+    // 链外工序：工种与货架都映射它，但**不 append 到工单的链上**
+    let outside = seed_process(&pool, "OR-OUTCHAIN-PX", "链外工序").await;
+    link_work_type_to_process(&pool, st.work_type_id, outside).await;
+    link_shelf_to_process(&pool, st.shelf_id, outside).await;
+    // 前置：工单确实有链，且该工序确实不在链内
+    assert!(part_chain_id(&pool, st.part_id).await.is_some(), "前置：工单有链");
+
+    let (s, env) = receive(&app, &token, body(&st, 0, Some(outside))).await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "有链 + 链外工序必须成功（step 落 NULL，不是 20702）: {env}"
+    );
+    assert_eq!(env["data"]["next_process_id"], outside.to_string());
+
+    let (status, location, holder, process, step, version, quantity) =
+        read_batch(&pool, st.batch_id).await;
+    assert_eq!(status, "IN_PROCESS");
+    assert_eq!(location.as_deref(), Some("WORKER"));
+    assert_eq!(holder, Some(st.worker_id));
+    assert_eq!(process, Some(outside), "工序必须落显式指定的链外工序");
+    assert_eq!(
+        step, None,
+        "链内定位不到 ⇒ step 落 NULL（Lenient），不是保持旧值、也不是报错"
+    );
+    assert_eq!(version, 2);
+    assert_eq!(quantity, 3);
+}
+
+/// **BLOCKER-1 回归（决策 3 形态）**：工单**有链**但**链推不出**（当前工序 / step
+/// 指针被清空）+ 工种**单候选**且该候选**不在链内** ⇒ 缺省 `next_process_id`
+/// 自动推导成功、step 落 `NULL`。
+///
+/// 这一形态不是边角：`resolve_receive_next_process` 内部是 `sort_order = 当前 + 1`
+/// 口径，**稀疏链上必然推不出** ⇒ 正好落进「退回工种候选」那条分支；而决策 2 又要求
+/// 候选**不与链求交** ⇒ 「part 有链 + 单候选链外」这个组合是新语义主动生产出来的。
+/// 改前它会被 stage① 的 `optional_step_id` 原样打回 `20702`。
+#[tokio::test]
+async fn outsource_receive_chain_derivation_fails_single_candidate_outside_chain_succeeds() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let st = setup_receive(&pool, "OR-CHAINFAIL", true, true).await;
+    // 链外唯一候选：先软删 setup 里「下一道」那条映射，再只映射它
+    let solo = seed_process(&pool, "OR-CHAINFAIL-PX", "链外唯一候选").await;
+    sqlx::query(
+        "UPDATE t_work_type_process SET deleted_at = now() \
+         WHERE work_type_id = $1 AND process_id <> $2",
+    )
+    .bind(st.work_type_id)
+    .bind(solo)
+    .execute(&pool)
+    .await
+    .expect("soft drop other work type mappings");
+    link_work_type_to_process(&pool, st.work_type_id, solo).await;
+    link_shelf_to_process(&pool, st.shelf_id, solo).await;
+    // 出池清工序不变式：当前工序与 step 指针都清空 ⇒ 链推不出下一道
+    sqlx::query(
+        "UPDATE t_part_batch SET current_process_id = NULL, current_process_step_id = NULL \
+         WHERE id = $1",
+    )
+    .bind(st.batch_id)
+    .execute(&pool)
+    .await
+    .expect("clear process columns");
+    assert!(
+        part_chain_id(&pool, st.part_id).await.is_some(),
+        "前置：工单仍绑着链（否则落无链分支，测的不是本形态）"
+    );
+
+    let (s, env) = receive(&app, &token, body(&st, 0, None)).await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "有链 + 链推不出 + 工种单候选（链外）⇒ 自动推导成功: {env}"
+    );
+    assert_eq!(env["data"]["next_process_id"], solo.to_string());
+
+    let (status, location, holder, process, step, version, _q) =
+        read_batch(&pool, st.batch_id).await;
+    assert_eq!(status, "IN_PROCESS");
+    assert_eq!(location.as_deref(), Some("WORKER"));
+    assert_eq!(holder, Some(st.worker_id));
+    assert_eq!(process, Some(solo), "工序必须落工种那唯一候选");
+    assert_eq!(step, None, "链外候选 ⇒ step 落 NULL");
+    assert_eq!(version, 2);
 }
 
 // ===========================================================================

@@ -63,9 +63,21 @@
 //! 工序归属），判据 6 是本端点唯一的工种资格闸门 —— 与 `take-over` / `queue/move`
 //! 同款纪律（写侧集中守一次，不让读侧与写侧各判一套）。
 //!
-//! ⚠️ 本端点**不自己解析 step 指针**：`stage①` 内部按 outsource 域的既有逻辑落
-//! `current_process_step_id`，跨工序形态（目标工序不在链内）的落位语义属 outsource
-//! 域，不在本轮改动范围。
+//! ## step 指针：`Lenient`（2026-10-16，review 第 1 轮 BLOCKER-1）
+//!
+//! stage① 传 [`StepResolve::Lenient`]：**有链但链内定位不到目标工序 ⇒ step 落
+//! `NULL`，不再 `20702`**。这不是宽容而是本端点新语义的**必然推论** —— 第 5 步的
+//! 工种候选集刻意不与工序链求交，而「part 有链 + 链推不出（指针漂移 / 链内歧义 /
+//! 链尾 / 稀疏链）」正是候选集唯一会被激活的形态之一；该形态下自动推导出来的工序
+//! **必然可能不在链内**（决策 2 的求交禁令的直接后果）。若 stage① 沿用
+//! `/outsource-queue/move` 回收臂的 `optional_step_id`，就会出现「新代码制造输入、
+//! 新代码原样打回」的自相矛盾。
+//!
+//! ⚠️ `/outsource-queue/move` 的回收臂传 [`StepResolve::Strict`]，那条端点的行为
+//! **一行未变**；`shared::batch::guards::optional_step_id` 的全局语义也**没动**。
+//! 落 `NULL` 不丢数据：外协批次按「出池清工序」不变式该列恒 `NULL`，而
+//! `mark_batch_with_status_and_meta` 的 `None` → `clear_process_step_id = true`
+//! 对已是 `NULL` 的列是 no-op（详见 `StepResolve` 的 doc）。
 
 use sqlx::PgConnection;
 
@@ -74,7 +86,7 @@ use crate::infra::snowflake::SnowflakeIdGenerator;
 // 2026-10-15：回收臂内核与「下一道」推导自 outsource 域复用（`pub(crate)`）。
 // `prod::scan` 是转发型域（整域不适用域隔离护栏），跨域 import 是既定 pattern。
 use crate::modules::outsource::service::move_svc::{
-    receive_from_outsource_inner, resolve_receive_next_process,
+    StepResolve, receive_from_outsource_inner, resolve_receive_next_process,
 };
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::prod::queue::service::QueueService;
@@ -256,6 +268,12 @@ impl ScanService {
             &batch,
             &part,
             next_process,
+            // 2026-10-16（review 第 1 轮 BLOCKER-1）：本端点的目标工序可由工种
+            // 映射推导、且候选集刻意不与工序链求交 ⇒「有链 + 链外工序」是本端点
+            // 自己生产出来的合法输入，必须传 `Lenient`（落 `NULL` step），否则
+            // stage① 会被 `optional_step_id` 打回 `20702`。`/outsource-queue/move`
+            // 的回收臂传 `Strict`，那条端点行为逐字不变。
+            StepResolve::Lenient,
             None,
             current,
         )

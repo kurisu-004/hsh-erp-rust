@@ -26,7 +26,10 @@ use crate::state::AppState;
 ///   `serial_no` → axum `QueryRejection` → **HTTP 400 纯文本，不进 `R<T>` 信封**）
 /// - 未命中工单 → `20101`（HTTP 404，不生回退 `t_assembly`）；`worker_id` 无效 →
 ///   `20201`（404）/ `20202`（400）
-/// - 出参 `LocateOut { part, batches }`，逐字段契约见 `docs/api/scan.md`
+/// - 出参 `LocateOut { part, batches, worker_processes }`：`worker_processes` 是
+///   **顶层**字段（2026-10-16 新增，前端目标工序 picker 的选项集；工序已软删的行
+///   不在其中，详见 `listing/repo.rs::fetch_worker_processes`），逐字段契约见
+///   `docs/api/scan.md`
 pub async fn locate(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,

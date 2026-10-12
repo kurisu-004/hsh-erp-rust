@@ -36,6 +36,12 @@
 //! 这个变量上。它同时是写端点「单候选自动推导 / 多候选必填 / 零候选拒」三态的
 //! 同一份事实，故**不允许**为了省一条 SQL 而改用别的候选集。
 //!
+//! ⚠️ 2026-10-16 review 第 1 轮 MINOR-1：那条 SQL 内部**一条结果集分两路消费** ——
+//! `t_process` 的软删闸门留在 `LEFT JOIN ... ON` 里，闸门判据（`process_ids`）吃
+//! **全部**映射行（与写侧 `WorkTypeRepo::list_process_ids` 逐字同源），出参
+//! （`worker_processes`）只留工序未软删的行。改之前闸门用的是窄集合，会在
+//! 「工种只映射了已软删工序」时产生**假阻挡**（读侧藏按钮、写侧却会成功）。
+//!
 //! 2026-10-14：`held` 的第 3 条是 `fetch_max_held_batches`（`t_worker LEFT JOIN
 //! t_work_type` 取 `max_held_batches`，供 `HeldListOut` 的容量展示）。它是
 //! 「工人维度」的量，与取行 / COUNT 的「批次维度」量互不覆盖、无法合并 —— 合并

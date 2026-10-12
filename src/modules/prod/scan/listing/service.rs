@@ -10,7 +10,7 @@ use sqlx::PgConnection;
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::modules::prod::scan::dto::{HeldQuery, LocateQuery, PickableQuery};
 use crate::modules::prod::scan::listing::repo::{
-    LocateBatchRow, LocateProcessBrief, ScanListingRepo,
+    LocateBatchRow, ScanListingRepo,
 };
 use crate::modules::prod::scan::vo::{
     HeldListOut, LocateAction, LocateBatchItem, LocateDisabledReason, LocateOut,
@@ -207,16 +207,33 @@ impl ScanListingService {
                         format!("worker {worker_id} 已停用"),
                     ));
                 }
-                // 工种候选工序（2026-10-16 新增）：**工人未绑工种时不查**，给空 vec
-                // —— 那些形态下 `decide_action` 已在 `WORK_TYPE_NOT_SET` 短路，
-                // 空候选不会被误读成「工种未映射任何工序」。
-                let processes = match row.work_type_id {
+                // 工种候选工序（2026-10-16 新增；LEFT JOIN 分宽窄两路见下方注释）：
+                // **工人未绑工种时不查**，给空 vec —— 那些形态下 `decide_action` 已在
+                // `WORK_TYPE_NOT_SET` 短路，空候选不会被误读成「工种未映射任何工序」。
+                let rows = match row.work_type_id {
                     Some(work_type_id) => {
                         ScanListingRepo::fetch_worker_processes(conn, work_type_id).await?
                     }
                     None => Vec::new(),
                 };
-                let process_ids = processes.iter().map(|p| p.process_id).collect();
+                // 一条结果集 → **宽窄两个集合**（2026-10-16 review MINOR-1）：
+                // 闸门吃全部行的 id（与写侧 `WorkTypeRepo::list_process_ids` 逐字
+                // 同源），出参只留工序未软删的行（软删工序没有可展示的名字）。
+                let mut process_ids = Vec::with_capacity(rows.len());
+                let mut worker_processes = Vec::with_capacity(rows.len());
+                for row in rows {
+                    process_ids.push(row.process_id);
+                    if let (Some(code), Some(name), Some(category)) =
+                        (row.code, row.name, row.category)
+                    {
+                        worker_processes.push(LocateProcessBriefOut {
+                            process_id: row.process_id,
+                            code,
+                            name,
+                            category,
+                        });
+                    }
+                }
                 // 容量计数：**复用 `/held` 的同一条 `count_held`**，判据与写侧
                 // `QueueService::ensure_worker_has_capacity` 的 held 完全一致
                 // （`IN_PROCESS + WORKER + 未软删`）。
@@ -227,7 +244,7 @@ impl ScanListingService {
                     max_held_batches: row.max_held_batches,
                     held,
                     process_ids,
-                    worker_processes: processes,
+                    worker_processes,
                 })
             }
         };
@@ -244,10 +261,7 @@ impl ScanListingService {
             batches,
             worker_processes: worker_ctx
                 .map(|ctx| ctx.worker_processes)
-                .unwrap_or_default()
-                .into_iter()
-                .map(into_process_brief)
-                .collect(),
+                .unwrap_or_default(),
         })
     }
 }
@@ -263,12 +277,19 @@ struct LocateWorkerCtx {
     max_held_batches: Option<i32>,
     /// 该工人当前持有批次数（与写侧容量守卫同一谓词）。
     held: i64,
-    /// 该工人工种可执行的工序 id（`worker_processes` 的 id 投影）。
+    /// 该工人工种可执行的工序 id（**全部** `t_work_type_process` 活跃映射行，含工序
+    /// 已软删的），与写侧 `WorkTypeRepo::list_process_ids` **逐字同源**。
     /// 空 = 工种未映射任何工序（`decide_action` 里落 `PROCESS_NOT_IN_WORK_TYPE`）。
+    ///
+    /// ⚠️ 2026-10-16 review MINOR-1：改之前这里是**窄**集合（`JOIN t_process` 把已软删
+    /// 工序滤掉），于是「工种只映射了已软删工序」时读侧判 0 条 ⇒ 闸门落
+    /// `PROCESS_NOT_IN_WORK_TYPE`（按钮被藏），而写侧 `list_process_ids` 返 1 条 ⇒
+    /// 单候选自动推导**会成功** —— 假阻挡。现在两者同源。
     process_ids: Vec<i64>,
-    /// 同一批取行结果（带 `code` / `name` / `category`），出参
-    /// `LocateOut.worker_processes` 的直接来源。
-    worker_processes: Vec<LocateProcessBrief>,
+    /// 出参 `LocateOut.worker_processes` 的直接来源：**窄**集合（工序未软删的行）。
+    /// 与 `process_ids` 是同一条 SQL 的两路分拆，刻意不等长，见
+    /// `listing/repo.rs::fetch_worker_processes` 的 doc。
+    worker_processes: Vec<LocateProcessBriefOut>,
 }
 
 /// 状态 / 位置组合 → 候选动作（不含任何闸门）。
@@ -473,20 +494,6 @@ fn decide_action(
                 None => (Some(action), None),
             }
         }
-    }
-}
-
-/// 投影行 → 出参行（穷尽 struct 字面量：加字段时这里编译失败）。
-///
-/// repo 层的行投影与 VO 层**刻意不合并**：行投影还要给 `LocateWorkerCtx.process_ids`
-/// 递 id 投影（判据用），而 VO 是网络契约（雪花走 `serialize_i64`）。同
-/// `LocatePartRow::into_part_brief` 的写法。
-fn into_process_brief(row: LocateProcessBrief) -> LocateProcessBriefOut {
-    LocateProcessBriefOut {
-        process_id: row.process_id,
-        code: row.code,
-        name: row.name,
-        category: row.category,
     }
 }
 

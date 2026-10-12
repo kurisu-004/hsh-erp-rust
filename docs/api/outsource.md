@@ -490,6 +490,8 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 
 ⚠️ **2026-10-15：回收臂内核抽离（不改守卫）**。`OUTSOURCE_COMPANY → PRODUCTION_SHELF` 的写入段抽成 `service/move.rs::receive_from_outsource_inner`（`pub(crate)`，逐行搬移、判据与文案零改动），供 `prod::scan` 的 `POST /scan/outsource-receive` 复用；`resolve_receive_next_process` 同步改 `pub(crate)`。**守卫 1–6 仍全部留在 `move_batch` 内**（守卫在第一行，位置未动；2026-10-15 起首行守卫为权限点 `outsource.move`，矩阵 = 原 M+C+I），本节的守卫顺序 / 错误码逐条不变。
 
+⚠️ **2026-10-16 review 第 1 轮：内核加 `step_mode` 入参，本端点行为仍逐字不变**。`receive_from_outsource_inner` 新增一个显式的 step 解析策略参数 `StepResolve`（`Strict` / `Lenient`）—— 判「有链但链内定位不到目标工序」是拒（`optional_step_id` ⇒ `20702`）还是落 `NULL`。**本端点的回收臂传 `Strict`**，故守卫 8 的失败码集合与判据 8 的行内容**一行未变**；`prod::scan` 那个端点传 `Lenient`（它的目标工序可来自工种映射、**不与工序链求交**，链外工序是合法输入）。`shared::batch::guards::optional_step_id` 的全局语义**没有**被改（策略只挂在该内核的入参上）。见 [`scan.md`](scan.md) §2.9 / §8。
+
 ### 5.2 出池不变式（回收直送品检方向已下线）
 
 该方向的 `OUTSOURCE → INSPECTION` 是**出池**（`current_process_id` 与
