@@ -16,27 +16,39 @@
 //! | 3 | 客户端 `version` 与批次 OCC 比对 | `40901` |
 //! | 4 | `status='IN_PROCESS'` 且 `location='WORKER'` 且**有持有人** | `20103` |
 //! | 5 | 持有人不是我自己 | `20104`「批次已在你手上，无需接管」 |
-//! | 6 | 链位置解析出下一道（`pointer_consistent && NEXT` 免填，否则 `next_process_id` 必填） | 缺 `40001` / 链内定位不到 `20702` |
-//! | 7 | 下一道 ∈ 我的工种工序映射（`WorkTypeRepo::list_process_ids`） | `20104` |
+//! | 6 | 目标工序解析（**三态**，见下） | 缺 `40001` / 零候选 `20104` / 链推导内部不自洽 `20702` |
+//! | 7 | 目标工序 ∈ 我的工种工序映射（`WorkTypeRepo::list_process_ids`） | `20104` |
 //! | 8 | 容量守卫 `QueueService::ensure_worker_has_capacity` | `20904` / `20204` |
 //! | 9 | 原子 UPDATE（`PartBatchRepo::transfer_to_worker`） | 0 行 `40901` |
 //!
 //! 与 S1 `locate` 的 `TAKE_OVER` 判定**刻意同源**（写侧会成功的绝不显示 `NONE`、
 //! 写侧会拒绝的绝不显示可点按钮）：第 6 / 7 两步与 `locate` 的
-//! `take_over_gate` 对位（推导得出时校验「下一道 ∈ 工种」，推导不出时放行到
-//! 手填流由写侧兜底）。第 4 步的「有持有人」与 `classify_batch` 的
-//! 「holder 为 NULL 不给 TAKE_OVER」也是同一条订正。
+//! `take_over_gate` 对位（链推导得出时校验「下一道 ∈ 工种」；链推不出时改查工种候选
+//! 集，空 ⇒ `20104`、非空 ⇒ 放行到「单候选自动推导 / 多候选手填」）。第 4 步的
+//! 「有持有人」与 `classify_batch` 的「holder 为 NULL 不给 TAKE_OVER」也是同一条订正。
 //!
-//! ## 第 6 步的两条分支（与 worker-scan RETURNED 逐条同源）
+//! ## 第 6 步的三个分支（**2026-10-16 新语义**：目标工序改由工种映射推导）
 //!
-//! - **`pointer_consistent && chain_state == "NEXT"`**：链上下一道已定位到，
-//!   `next_process_id` 可省略；`position.next_process_id` 为 `None` 说明派生 SQL
-//!   内部不自洽，按 worker-scan 同款拒 `20702`。
-//! - **其余形态**（无链 / 链已软删 / 指针漂移 / 链内歧义 / 链尾 TAIL）：
-//!   `req.next_process_id` 必填（缺 `40001`）；显式值经
-//!   `optional_process_chain` + `optional_step_id` 解析 ——
-//!   **无链 ⇒ step 可空**（该列允许 NULL）；**有链但链内没有这道工序 ⇒ `20702`**。
-//!   链尾（TAIL）同样只能指定**链内**工序：越链的显式值一律 `20702`。
+//! 业务口径：报工台接管是「实物已经在我手上」的现场恢复动作，工人**不该**被要求
+//! 在全部工序里挑一道 —— 该做什么由他的**工种**说了算。只有当一道工序都不映射时
+//! 才无从选择（`20104`）。
+//!
+//! - **分支 A · 同工序内接管**：`pointer_consistent && chain_state == "NEXT"` ⇒
+//!   用 `position.next_process_id`，**不要求前端传** `next_process_id`，且**不破坏
+//!   工序链进度**（step 指针随链推导成对推进）；`next_process_id` 为 `None` 说明派生
+//!   SQL 内部不自洽，按 worker-scan 同款拒 `20702`。
+//! - **分支 B · 前端显式指定**：`req.next_process_id` 有值即解析它。step 解析改为
+//!   「链内能定位到就取，定位不到落 `NULL`」—— **2026-10-16 起不再报 `20702`**：
+//!   非同工序内接管时链可能整体不适用（无链 / 链已软删 / 链外工序），而
+//!   `current_process_step_id` 是可空列，跨工序接管不必有链上落点。
+//! - **分支 C · 缺省且链不可推导**：候选集 = 该工种 `t_work_type_process` 活跃映射
+//!   （**不与工序链求交** —— 这种形态下默认工序链已不适用，再求交会把候选清空）。
+//!   恰好 1 条 ⇒ 自动用它（同分支 B 的 step 解析）；>1 条 ⇒ `40001`（前端按
+//!   `locate` 的 `worker_processes` picker 收窄后重选）；0 条 ⇒ `20104`「工人 X 的
+//!   工种未映射任何工序，无法接管」。
+//!
+//! 分支 A 优先级最高：**链能推导时不看工种候选**，显式值也不覆盖它（同工序内接管
+//! 不该由前端改目标）。
 //!
 //! ## 写入（第 9 步）为什么不是 `mark_batch_with_status_and_meta`
 //!
@@ -149,14 +161,22 @@ impl ScanService {
                 "批次已在你手上，无需接管",
             ));
         }
-        // ── 6. 链位置解析（照 worker-scan RETURNED 分支）─────────────────
+        // ── 6. 目标工序解析（三态：链推导 / 显式 / 工种单候选自动推导）────────
         let position =
             crate::shared::batch::chain::resolve_chain_position(repo.conn_mut(), part.id, &batch)
                 .await?;
+        // 工种候选**先查出来**（2026-10-16）：第 6 步的自动推导与第 7 步的工种闸门
+        // 共用同一份，两个写端点（接管 / 外协收回）也是同一份事实。
+        let process_ids = crate::modules::prod::work_type::repo::WorkTypeRepo::list_process_ids(
+            repo.conn_mut(),
+            work_type_id,
+        )
+        .await?;
         let (next_pid, step_id_opt): (i64, Option<i64>) = if position.is_pointer_consistent(&batch)
             && position.chain_state.as_deref() == Some("NEXT")
         {
-            // 顺应工序：链上下一道已定位到，可免填。
+            // 分支 A · 同工序内接管：链上下一道已定位到，可免填。**逐字保留既有语义**
+            // （含「派生 SQL 内部不自洽 ⇒ 20702」）。
             let pid = position.next_process_id.ok_or_else(|| {
                 AppError::biz(
                     code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND,
@@ -165,30 +185,55 @@ impl ScanService {
             })?;
             (pid, position.next_step_id)
         } else {
-            // 非顺应（无链 / 链已软删 / 指针漂移 / 链内歧义 / 链尾）：必须显式指定
-            // 接管后的工序。链尾同样只能指定链内工序（越链 ⇒ 20702，见
-            // `optional_step_id` 的 doc）。
-            let raw = req.next_process_id.as_deref().ok_or_else(|| {
-                AppError::validation(
-                    "非顺应工序（无链 / 链已软删 / 指针漂移 / 当前工序不在链内 / 当前已是链尾），\
-                     必须在 next_process_id 里显式指定接管后的工序",
-                )
-            })?;
-            let pid = raw
-                .parse()
-                .map_err(|_| AppError::validation("next_process_id 非法"))?;
-            let chain_id =
-                crate::shared::batch::optional_process_chain(repo.conn_mut(), part.id).await?;
-            let step =
-                crate::shared::batch::optional_step_id(repo.conn_mut(), chain_id, pid).await?;
+            // 分支 B / C · 链推不出（无链 / 链已软删 / 指针漂移 / 链内歧义 / 链尾）：
+            let pid = match req.next_process_id.as_deref() {
+                // B：前端显式指定（越链也接受 —— 跨工序接管是独立路径，见模块 doc）
+                Some(raw) => raw
+                    .parse()
+                    .map_err(|_| AppError::validation("next_process_id 非法"))?,
+                // C：缺省 → 按工种候选推导（2026-10-16 新语义）
+                None => match process_ids.as_slice() {
+                    // C-1：恰好一道 ⇒ 自动推导，**不要求前端传**
+                    [only] => *only,
+                    // C-0：一条都没有 ⇒ 该工种不可作业
+                    [] => {
+                        return Err(AppError::biz(
+                            code::BIZ_INVALID_VALUE,
+                            format!(
+                                "worker {} 的工种未映射任何工序，无法接管",
+                                worker.id
+                            ),
+                        ));
+                    }
+                    many => {
+                        return Err(AppError::validation(format!(
+                            "worker {} 的工种有 {} 道工序，无法从工序链推导接管后的工序，\
+                             必须在 next_process_id 里显式指定",
+                            worker.id,
+                            many.len()
+                        )));
+                    }
+                },
+            };
+            // step 解析：**链内定位得到就取，定位不到落 NULL**（2026-10-16 起不再
+            // 报 `20702` —— 跨工序接管本就允许工序不在链内，该列允许 NULL）。
+            // `optional_process_chain` 只读 `t_part.process_chain_id`、**不判链行
+            // 软删**，故 `chain_id` 可能是已软删链的 id；`resolve_step_id_by_process`
+            // 同样只查 step 不 JOIN 链行，这个既有分叉**不在本轮处理**（登记见
+            // `shared::batch::guards::optional_process_chain` 的 doc）。
+            let step = match crate::shared::batch::optional_process_chain(repo.conn_mut(), part.id)
+                .await?
+            {
+                Some(chain_id) => {
+                    crate::modules::prod::process_chain::repo::ProcessChainRepo::
+                        resolve_step_id_by_process(repo.conn_mut(), chain_id, pid)
+                        .await?
+                }
+                None => None,
+            };
             (pid, step)
         };
-        // ── 7. 下一道 ∈ 我的工种工序映射（与 queue/move POOL→WORKER 同源）────
-        let process_ids = crate::modules::prod::work_type::repo::WorkTypeRepo::list_process_ids(
-            repo.conn_mut(),
-            work_type_id,
-        )
-        .await?;
+        // ── 7. 目标工序 ∈ 我的工种工序映射（与 queue/move POOL→WORKER 同源）────
         if !process_ids.contains(&next_pid) {
             return Err(AppError::biz(
                 code::BIZ_INVALID_VALUE,

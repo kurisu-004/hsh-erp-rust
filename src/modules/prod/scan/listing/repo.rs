@@ -455,14 +455,23 @@ impl ScanListingRepo {
     // =====================================================================
     //  locate —— GET /api/v2/prod/scan/locate（2026-10-15 新增）
     //
-    //  固定 4 条 SQL 以内（与 part 的批次数 / 工人数无关）：
-    //    1. fetch_locate_part   —— 按 serial_no 命中工单（未命中 ⇒ service 返 20101）
-    //    2. fetch_locate_worker —— 工人 active / work_type / 工种容量上限（仅传了
+    //  固定 5 条 SQL 以内（与 part 的批次数 / 工人数无关）：
+    //    1. fetch_locate_part    —— 按 serial_no 命中工单（未命中 ⇒ service 返 20101）
+    //    2. fetch_locate_worker  —— 工人 active / work_type / 工种容量上限（仅传了
     //       `worker_id` 时执行）
-    //    3. count_held          —— 「该工人当前持有」的容量计数（**复用 `/held` 的
+    //    3. fetch_worker_processes—— 该工人工种可执行的工序（2026-10-16 新增，仅传了
+    //       `worker_id` **且**工人绑了工种时执行；出参 `worker_processes` +
+    //       写端点单候选自动推导的判据）
+    //    4. count_held           —— 「该工人当前持有」的容量计数（**复用 `/held` 的
     //       同一条 SQL**，谓词 = 写侧 `ensure_worker_has_capacity` 的同一判据）
-    //    4. fetch_locate_batches—— 取行（一条 SQL 把位置 / 链位置 / 工种映射 /
+    //    5. fetch_locate_batches —— 取行（一条 SQL 把位置 / 链位置 / 工种映射 /
     //       外协在途全链 JOIN 完，不按行数重复查）
+    //
+    //  ⚠️ 第 3 条**无法**并进第 5 条：它是「工人维度」的**独立结果集**（每个工种
+    //  工序一行），而第 5 条的每行都锚在批次上 —— 要合就得让每条批次行都带一遍这
+    //  一列（要么重复投影、要么数组聚成一个字符串列再在 SQL 层拆），两者都是把
+    //  一个恒定大小的常量摊到「批次数」这个变量上。它与 `fetch_max_held_batches`
+    // 属同一类「工人维度量」，理由见 `listing/mod.rs` 的模块 doc。
     // =====================================================================
 
     /// `GET /scan/locate` 的工单命中（`serial_no` 唯一化 + 软删闸门）。
@@ -525,6 +534,49 @@ impl ScanListingRepo {
         )
         .bind(worker_id)
         .fetch_optional(conn)
+        .await
+    }
+
+    /// `GET /scan/locate` 出参 `worker_processes` 的取行：**该工人工种可执行的
+    /// 工序**（2026-10-16 新增）。
+    ///
+    /// ## 它的两个消费方
+    ///
+    /// 1. **读侧**：前端把「接管 / 外协收回」的目标工序 picker **收窄到这个集合**，
+    ///    不再让工人从全部工序里挑（`LocateProcessBriefOut` 含 `name` / `category`，
+    ///    卡片才渲染得出来）；
+    /// 2. **写侧判据**：`LocateWorkerCtx.process_ids` 的 id 投影，是两个写端点
+    ///    「单候选自动推导 / 多候选必填 / 零候选拒」三态的**同一份事实**。
+    ///
+    /// ⚠️ **必须裸写这条 SQL，不许 import `prod::work_type` 的 repo**：本目录受
+    /// 域隔离护栏扫（读他域的**表**是允许的既定 pattern，import 他域的**符号**才
+    /// 违规），理由与 `fetch_locate_worker` / `fetch_max_held_batches` 同款。
+    ///
+    /// ## ⚠️ `p.deleted_at IS NULL` 比写侧**更严**，且刻意不对齐
+    ///
+    /// 写侧的候选集判据是 `WorkTypeRepo::list_process_ids`（只筛
+    /// `wtp.deleted_at IS NULL`，**不 JOIN `t_process`**）；本条多带一个
+    /// `p.deleted_at IS NULL`。方向是**安全**的（读侧 ⊆ 写侧 ⇒ 读侧永不给出写侧会
+    /// 拒的值，picker 里不会出现「选了必被 20104」的行），而且软删工序**没有可展示的
+    /// 名字**（`code` / `name` 仍在库里但业务上已作废）。**不要**为「与写侧逐字同源」
+    /// 把这个闸门删掉 —— 删掉不会让任何现有测试变红，只会让 picker 多出一列死卡片。
+    ///
+    /// 排序 `wtp.sort_order ASC, wtp.id ASC`：`sort_order` 是工种↔工序映射的
+    /// 配置顺序（同 `work-types/{id}/processes` 的整组替换语义），`id` 兜同序的
+    /// 平局（`sort_order` 无唯一约束）。排序只为让前端 picker 稳定，不影响任何判定。
+    pub(crate) async fn fetch_worker_processes(
+        conn: &mut PgConnection,
+        work_type_id: i64,
+    ) -> Result<Vec<LocateProcessBrief>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT p.id AS process_id, p.code, p.name, p.category \
+             FROM t_work_type_process wtp \
+             JOIN t_process p ON p.id = wtp.process_id AND p.deleted_at IS NULL \
+             WHERE wtp.work_type_id = $1 AND wtp.deleted_at IS NULL \
+             ORDER BY wtp.sort_order ASC, wtp.id ASC",
+        )
+        .bind(work_type_id)
+        .fetch_all(conn)
         .await
     }
 
@@ -695,6 +747,21 @@ pub struct LocateWorkerRow {
     pub(crate) is_active: bool,
     pub(crate) work_type_id: Option<i64>,
     pub(crate) max_held_batches: Option<i32>,
+}
+
+/// `GET /scan/locate` 的工种可执行工序行（`fetch_worker_processes` 的一条结果）。
+///
+/// 字段名即 SQL 别名（`FromRow` 按列名匹配）。与 [`LocateWorkerRow`] 同款：行投影
+/// 与网络契约 VO **刻意不合并**（投影层还要顺带给 `LocateWorkerCtx.process_ids`
+/// 递 id 投影），转换在 service 层做。
+#[derive(Debug, sqlx::FromRow)]
+pub struct LocateProcessBrief {
+    /// `t_process.id`（出参走 `serialize_i64` → JSON string）。
+    pub(crate) process_id: i64,
+    pub(crate) code: String,
+    pub(crate) name: String,
+    /// `t_process.category`：`"INHOUSE"` / `"OUTSOURCE"`。
+    pub(crate) category: String,
 }
 
 /// `GET /scan/locate` 的批次行：**action 判定所需的全部原始事实**。

@@ -9,10 +9,12 @@ use sqlx::PgConnection;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::modules::prod::scan::dto::{HeldQuery, LocateQuery, PickableQuery};
-use crate::modules::prod::scan::listing::repo::{LocateBatchRow, ScanListingRepo};
+use crate::modules::prod::scan::listing::repo::{
+    LocateBatchRow, LocateProcessBrief, ScanListingRepo,
+};
 use crate::modules::prod::scan::vo::{
-    HeldListOut, LocateAction, LocateBatchItem, LocateDisabledReason, LocateOut, ScanChainState,
-    ScanListOut,
+    HeldListOut, LocateAction, LocateBatchItem, LocateDisabledReason, LocateOut,
+    LocateProcessBriefOut, ScanChainState, ScanListOut,
 };
 use crate::shared::error::{AppError, code};
 
@@ -149,9 +151,16 @@ impl ScanListingService {
     ///   诊断出一个「点了就会失败」的按钮；
     /// - 未传 `worker_id` → `action` / `disabled_reason` 均为 `null`（纯位置事实）。
     ///
-    /// ## SQL 条数（≤ 4，与批次数无关）
-    /// part 1 + worker/工种上限 1（仅传了 worker_id）+ held 计数 1（复用 `/held`
-    /// 的 `count_held`）+ 批次取行 1。登记在 `docs/api/scan.md` §5。
+    /// ## SQL 条数（≤ 5，与批次数无关）
+    /// part 1 + worker/工种上限 1（仅传了 worker_id）+ 工种候选工序 1（同上，且绑了
+    /// 工种时）+ held 计数 1（复用 `/held` 的 `count_held`）+ 批次取行 1。登记在
+    /// `docs/api/scan.md` §5。
+    ///
+    /// ## `worker_processes`（2026-10-16 新增）
+    /// 出参顶层多一个「该工人工种可执行的工序」列表，前端据此把接管 / 外协收回的
+    /// 目标工序 picker 收窄到这个集合（**不再展示全部工序**），且单候选时直接提交、
+    /// 不弹框（写端点会自行推导）。它是**工人维度**的量，与批次行无关，故所有批次
+    /// 行共用同一份、放在 `LocateOut` 顶层而非批次行里。
     ///
     /// ## action 判定（决策表见 `docs/api/scan.md`，判定函数见下方自由函数）
     /// 判定顺序与写侧「先资格后容量」同序：**状态类原因 → 工种未绑定 → 工序 ∉
@@ -198,6 +207,16 @@ impl ScanListingService {
                         format!("worker {worker_id} 已停用"),
                     ));
                 }
+                // 工种候选工序（2026-10-16 新增）：**工人未绑工种时不查**，给空 vec
+                // —— 那些形态下 `decide_action` 已在 `WORK_TYPE_NOT_SET` 短路，
+                // 空候选不会被误读成「工种未映射任何工序」。
+                let processes = match row.work_type_id {
+                    Some(work_type_id) => {
+                        ScanListingRepo::fetch_worker_processes(conn, work_type_id).await?
+                    }
+                    None => Vec::new(),
+                };
+                let process_ids = processes.iter().map(|p| p.process_id).collect();
                 // 容量计数：**复用 `/held` 的同一条 `count_held`**，判据与写侧
                 // `QueueService::ensure_worker_has_capacity` 的 held 完全一致
                 // （`IN_PROCESS + WORKER + 未软删`）。
@@ -207,6 +226,8 @@ impl ScanListingService {
                     work_type_id: row.work_type_id,
                     max_held_batches: row.max_held_batches,
                     held,
+                    process_ids,
+                    worker_processes: processes,
                 })
             }
         };
@@ -221,11 +242,18 @@ impl ScanListingService {
         Ok(LocateOut {
             part: part.into_part_brief(),
             batches,
+            worker_processes: worker_ctx
+                .map(|ctx| ctx.worker_processes)
+                .unwrap_or_default()
+                .into_iter()
+                .map(into_process_brief)
+                .collect(),
         })
     }
 }
 
-/// `locate` 的工人上下文（一次 `fetch_locate_worker` + 一次 `count_held` 的产物）。
+/// `locate` 的工人上下文（一次 `fetch_locate_worker` + 一次 `count_held` +
+/// 一次 `fetch_worker_processes` 的产物）。
 struct LocateWorkerCtx {
     /// 用于判 `IN_PROCESS + WORKER` 批次是不是「我持有的」。
     worker_id: i64,
@@ -235,6 +263,12 @@ struct LocateWorkerCtx {
     max_held_batches: Option<i32>,
     /// 该工人当前持有批次数（与写侧容量守卫同一谓词）。
     held: i64,
+    /// 该工人工种可执行的工序 id（`worker_processes` 的 id 投影）。
+    /// 空 = 工种未映射任何工序（`decide_action` 里落 `PROCESS_NOT_IN_WORK_TYPE`）。
+    process_ids: Vec<i64>,
+    /// 同一批取行结果（带 `code` / `name` / `category`），出参
+    /// `LocateOut.worker_processes` 的直接来源。
+    worker_processes: Vec<LocateProcessBrief>,
 }
 
 /// 状态 / 位置组合 → 候选动作（不含任何闸门）。
@@ -345,15 +379,31 @@ fn pending_gate(row: &LocateBatchRow, ctx: &LocateWorkerCtx) -> Option<LocateDis
     capacity_gate(ctx)
 }
 
-/// `TAKE_OVER` 的闸门：仅当**推导得出下一道**（`chain_state == NEXT` 且指针与
-/// 当前工序一致）才校验「下一道 ∈ 我工种映射」（对位写侧 S2 派生分支的 `20104`）；
-/// 推导不出（无链 / 指针漂移 / 链内歧义）**仍给 `TAKE_OVER`** —— 前端弹手填下一道，
-/// 残余失败组合登记在 `docs/api/scan.md` §8。最后过容量。
+/// `TAKE_OVER` 的闸门：**链能推出下一道**（`chain_state == NEXT` 且指针与当前工序
+/// 一致）时校验「下一道 ∈ 我工种映射」（对位写侧 S2 派生分支的 `20104`）；
+/// **链推不出**（无链 / 链已软删 / 指针漂移 / 链内歧义 / 链尾）时改判**工种是否有
+/// 候选**（空 ⇒ `PROCESS_NOT_IN_WORK_TYPE`，对位写侧 2026-10-16 新增分支 C 的
+/// `20104`；非空 ⇒ 仍给 `TAKE_OVER`，单候选由写侧自动推导、多候选前端弹手填）。
+/// 最后过容量。
+///
+/// ## 为什么空候选闸门只挂在「非链推导形态」上（2026-10-16）
+///
+/// 链可推导时目标工序由链决定，工种有没有映射**根本不影响这次能不能接管** ——
+/// 链推导出的下一道不在工种里，对位的 `20104` 由上面那条闸门给出（那是「链说该做
+/// X，但 X 不在你工种里」，与「你压根没有可做的工序」是两回事，前端文案也不同）。
+/// 链推不出时才轮到这个工种的候选集合，候选为空 ⇒ 写侧必拒 `20104`，读侧必须先
+/// 藏掉按钮（否则又是一个「点了必失败」的按钮）。
+///
+/// ⚠️ 上面那条 `NEXT && 指针一致 && 下一道 ∉ 工种` 闸门**不受本轮影响** —— 跨工序
+/// 接管是「链不适用」的那条独立路径，不是「候选为空」。
 fn take_over_gate(row: &LocateBatchRow, ctx: &LocateWorkerCtx) -> Option<LocateDisabledReason> {
-    if chain_state_of(row) == ScanChainState::Next
-        && row.pointer_consistent.unwrap_or(false)
-        && !row.next_process_in_work_type
-    {
+    let chain_derivable =
+        chain_state_of(row) == ScanChainState::Next && row.pointer_consistent.unwrap_or(false);
+    if chain_derivable {
+        if !row.next_process_in_work_type {
+            return Some(LocateDisabledReason::ProcessNotInWorkType);
+        }
+    } else if ctx.process_ids.is_empty() {
         return Some(LocateDisabledReason::ProcessNotInWorkType);
     }
     capacity_gate(ctx)
@@ -361,21 +411,24 @@ fn take_over_gate(row: &LocateBatchRow, ctx: &LocateWorkerCtx) -> Option<LocateD
 
 /// 外协收回的闸门：**有链且 `NEXT`** ⇒ 校验「下一道 ∈ 我工种映射」（对位 S3 写侧
 /// `POST /scan/outsource-receive` 的 `20104`）；**其余形态（无链 / 有链但推不出
-/// `NEXT`）一律放行** —— 写侧对这两种形态走「前端手填 `next_process_id`」的流
-/// （无链时写侧缺省必拒 `40001`、有链推不出按其 `20706` 文案拒），前端弹手填即可。
+/// `NEXT`）**改判「工种有没有候选」—— 空 ⇒ `PROCESS_NOT_IN_WORK_TYPE`（对位写侧
+/// 2026-10-16 新增的单候选推导前置闸门 `20104`），非空 ⇒ 放行（单候选由写侧自动
+/// 推导，多候选前端弹手填）。最后过容量。
 ///
 /// ⚠️ **2026-10-15 S3 订正（假阻挡）**：此前「有链但推不出 NEXT」返回
 /// `PROCESS_CHAIN_REQUIRED`（`NONE`），但写侧 `receive_from_outsource_inner` 的
 /// `next_process_id` 显式分支**原样放行**、其 `20706` 文案本身就写「请手填」——
 /// 即会点成功的操作被读侧藏掉了按钮。该 reason 变体已随之删除。
 ///
-/// `next_process_in_work_type` 投影的谓词是「**链内推导出的下一道** ∈ 工种映射」，
-/// 只在 `NEXT` 形态下被消费。最后过容量。
+/// ⚠️ **2026-10-16**：本函数比 `take_over_gate` 少一个 `pointer_consistent` 条件 ——
+/// 外协批次按「出池清工序」不变式两个指针列都是 NULL，链可推导与否只由
+/// `chain_state` 表达（与既有判据同源，本次未改）。
 fn outsource_gate(row: &LocateBatchRow, ctx: &LocateWorkerCtx) -> Option<LocateDisabledReason> {
-    if row.has_chain
-        && chain_state_of(row) == ScanChainState::Next
-        && !row.next_process_in_work_type
-    {
+    if row.has_chain && chain_state_of(row) == ScanChainState::Next {
+        if !row.next_process_in_work_type {
+            return Some(LocateDisabledReason::ProcessNotInWorkType);
+        }
+    } else if ctx.process_ids.is_empty() {
         return Some(LocateDisabledReason::ProcessNotInWorkType);
     }
     capacity_gate(ctx)
@@ -420,6 +473,20 @@ fn decide_action(
                 None => (Some(action), None),
             }
         }
+    }
+}
+
+/// 投影行 → 出参行（穷尽 struct 字面量：加字段时这里编译失败）。
+///
+/// repo 层的行投影与 VO 层**刻意不合并**：行投影还要给 `LocateWorkerCtx.process_ids`
+/// 递 id 投影（判据用），而 VO 是网络契约（雪花走 `serialize_i64`）。同
+/// `LocatePartRow::into_part_brief` 的写法。
+fn into_process_brief(row: LocateProcessBrief) -> LocateProcessBriefOut {
+    LocateProcessBriefOut {
+        process_id: row.process_id,
+        code: row.code,
+        name: row.name,
+        category: row.category,
     }
 }
 
