@@ -12,11 +12,42 @@
 
 ## 0. 变更摘要
 
-### 0.0 2026-10-15：扫码找件 · 自助恢复三件套（总述）+ 外协确认收回（S3）
+### 0.0 2026-10-16：接管 / 外协收回的目标工序改由「工种映射」推导
+
+报工台的「扫码接管」（端点 7）与「外协确认收回」（端点 8）原本要求工人在**全部工序**
+里挑目标工序：链推不出下一道时 `next_process_id` 必填（`40001`），而显式值又必须落在
+该工单的工序链内（越链 `20702`）。产品决策改为「该做什么由工人的**工种**说了算」，
+本节是这次变更的**跨端总述**（逐字段见 §2.7 / §2.8 / §2.9，决策表见 §3.6）。
+
+- **`GET /scan/locate` 出参新增 `worker_processes`**（§2.7）：该工人工种可执行的工序
+  （`t_work_type_process` 活跃映射 ∩ 未软删 `t_process`，按 `sort_order ASC, id ASC`）。
+  它在响应**顶层**而非批次行里 —— 是「工人维度」事实，同一响应内所有批次共用同一份。
+  未传 `worker_id` / 工人无工种 / 工种未映射 ⇒ 空数组。⚠️ 该列表比写侧候选集**多带**
+  `p.deleted_at IS NULL`（方向是读侧 ⊆ 写侧，理由见 `listing/repo.rs::fetch_worker_processes`）。
+- **`POST /scan/take-over` 的 `next_process_id` 变成三态**（§2.8）：
+  ① 链可推导 ⇒ 用链（**优先级最高**，显式值也不覆盖；不破坏工序链进度）；
+  ② 链推不出且传了 ⇒ 显式指定，**允许工序不在链内**（此时
+  `current_process_step_id` 落 `NULL`）；
+  ③ 链推不出且缺省 ⇒ 按工种候选：恰好 1 条自动推导（**不必再传**）、>1 条 `40001`、
+  0 条 `20104`。
+- **`POST /scan/outsource-receive` 的次序刻意不同**（§2.9）：显式值覆盖链推导的老语义
+  逐字不变；缺省时**先按链推导**，推不出才退回工种候选 —— 理由是该端点的链推导口径是
+  outsource 域的 `sort_order = 当前 + 1`，稀疏链上与读侧不等价（分叉登记见 §8）。
+- **候选集合 = 工种映射，且不与工序链求交**：非链推导形态下默认「这张工单的工序链已
+  不适用」，再求交会把候选清空成零（零候选 = 不可作业）。
+- **`20702` 的触发条件变了**（§8 登记）：在这两个端点上它**不再**表示「显式工序不在
+  链内」，只可能是「链推导返回 `NEXT` 却拿不到下一道 id」的 SQL 内部不自洽。
+- **错误码分段不变**：复用 `20104` / `40001` / `20702`，无新增段。
+- **`disabled_reason` 字面量集合仍 9 个**：空候选读侧复用既有的
+  `PROCESS_NOT_IN_WORK_TYPE`（不扩 wire 枚举）；两种成因的区别见 §3.6。
+- **前端配套**：picker 收窄到 `worker_processes`、**单候选直接提交不弹框**，逐条见
+  §7.2 第 15 条。
+
+### 0.1 2026-10-15：扫码找件 · 自助恢复三件套（总述）+ 外协确认收回（S3）
 
 「扫码找件 · 自助恢复」三件套于本日**全部落地**，`prod::scan` 由 5 端点增至
-**8 端点**（§1）：S1 = `GET /scan/locate` 只读诊断（§0.2）；S2 = `POST /scan/take-over`
-扫码接管 + `pick-up` PENDING 链首落位（§0.1）；S3 = `POST /scan/outsource-receive`
+**8 端点**（§1）：S1 = `GET /scan/locate` 只读诊断（§0.3）；S2 = `POST /scan/take-over`
+扫码接管 + `pick-up` PENDING 链首落位（§0.2）；S3 = `POST /scan/outsource-receive`
 外协确认收回（本节）。三件套共同回答「工人扫到一件不在自己名下的件，怎么自助把它
 恢复成可继续作业的状态」：`locate` 的 `action` / `disabled_reason` 是对应写端点守卫
 在**同一份判据**上的只读投影（会成功的绝不显示 `NONE`、会拒绝的绝不显示可点按钮），
@@ -49,7 +80,7 @@ S2 = `POST /scan/take-over` 扫码接管，均已落地）。场景：件实际�
   操作被藏掉按钮。现改为**放行**（给 `RECEIVE_FROM_OUTSOURCE`），该 reason 变体删除
   （`disabled_reason` **10 → 9** 个字面量，见 §2.7 / §3.6）。
 
-### 0.1 2026-10-15：扫码接管 `POST /scan/take-over` + pick-up PENDING 链首落位（S2）
+### 0.2 2026-10-15：扫码接管 `POST /scan/take-over` + pick-up PENDING 链首落位（S2）
 
 「扫码找件 · 自助恢复」的第二件（S1 = `GET /scan/locate` 只读诊断）。本轮两半：
 
@@ -77,12 +108,12 @@ S2 = `POST /scan/take-over` 扫码接管，均已落地）。场景：件实际�
 **链行软删闸门**（与 `first_step_in_chain` 对齐）；② `location='WORKER'` 但
 **holder 为 NULL** 的脏形态不再给 `TAKE_OVER`（写侧同形态拒 `20103`；落 `UNKNOWN`）。
 
-### 0.2 2026-10-15：新增第 6 条端点 `GET /scan/locate`（扫码找件 · 诊断）
+### 0.3 2026-10-15：新增第 6 条端点 `GET /scan/locate`（扫码找件 · 诊断）
 
 工人扫图纸序列号 → 返回该 part **全部未软删批次**（**含终态**）的位置事实；传了
 `worker_id` 时再对每批给出「**这个工人**、**这一批**现在能做什么」的 `action` /
 不能做的 `disabled_reason`。这是「扫码找件 · 自助恢复」三件套的**第一件（S1，纯只读
-诊断）**；**S2（接手 take-over，见 §0.1）与 S3（外协收回，见 §0.0）均已落地**
+诊断）**；**S2（接手 take-over，见 §0.2）与 S3（外协收回，见 §0.1）均已落地**
 —— 本端点预留的 `TAKE_OVER` / `RECEIVE_FROM_OUTSOURCE` 两个 action 现在**都有**
 真实写端点。
 
@@ -93,7 +124,7 @@ S2 = `POST /scan/take-over` 扫码接管，均已落地）。场景：件实际�
 - 端点专节：§1 第 6 行 / §2.7 逐字段 / §3.6 action 决策表与写侧守卫对照 / §5 SQL
   条数 / §7 表依赖 / §8 三条偏差登记。
 
-### 0.3 2026-10-14：`/held` 容量可见 + pick-up 容量守卫
+### 0.4 2026-10-14：`/held` 容量可见 + pick-up 容量守卫
 
 **三处前端契约变更**：
 
@@ -124,7 +155,7 @@ S2 = `POST /scan/take-over` 扫码接管，均已落地）。场景：件实际�
 逐条见 [`queue.md`](queue.md) §8.4 与 [`batch.md`](batch.md)）：读侧判据对齐 +
 终态批次清 `location` / `current_holder_id`。
 
-### 0.4 2026-10-11：worker-scan 支持部分数量
+### 0.5 2026-10-11：worker-scan 支持部分数量
 
 `WorkerScanRequest` 新增 `quantity`（**JSON 字符串**），让放回 / 送检都能指定
 「这次只处理这么多件」。逐字段与三种落法见 §2.4，拆批落点见 §2.4.1。
@@ -138,11 +169,11 @@ S2 = `POST /scan/take-over` 扫码接管，均已落地）。场景：件实际�
 - **响应** `scan.batch_id` 改为返回「**本次实际被处理的那一批**」（拆批场景 = 新
   批次）；JSON 形状仍是那 6 个键。
 
-### 0.5 2026-10-10：报工台立域
+### 0.6 2026-10-10：报工台立域
 
 把**报工台（工人扫码台）的 5 个端点**从原先散落在三个域的状态收拢进 `prod::scan`
 一个域，URL 全部挂 `/api/v2/prod/scan/*`，**硬切、无 alias**（本节记的是立域当时，
-2026-10-15 三件套落地后本域共 **8 条**，见 §0.0）。
+2026-10-15 三件套落地后本域共 **8 条**，见 §0.1）。
 
 1. **立域**：`prod::scan`（URL `/api/v2/prod/scan/*`，5 端点）。判定依据是**前端
    消费方** —— 5 条端点的唯一消费方是 `views/production/scan/` 三页（取件 / 放回 /
@@ -173,7 +204,7 @@ S2 = `POST /scan/take-over` 扫码接管，均已落地）。场景：件实际�
 | 3 | GET | `/api/v2/prod/scan/held?worker_id=&limit=&offset=` | `GET /api/v2/parts/by-worker/{worker_id}` | Manager + Clerk + Inspector + ShelfAccount | `worker_id` **必填**（字符串）、`limit?`、`offset?` | `HeldListOut` |
 | 4 | POST | `/api/v2/prod/scan/worker-scan` | `POST /api/v2/prod/batches/worker-scan` | Manager + ShelfAccount | `WorkerScanRequest`（6 字段，`quantity?` 为 **JSON 字符串**） | `WorkerScanOut` |
 | 5 | POST | `/api/v2/prod/scan/batches/{batch_id}/pick-up` | `POST /api/v2/prod/batches/{batch_id}/pick-up` | Manager + Clerk + ShelfAccount | path `batch_id` + `PickUpRequest` | `R<PartOut>` |
-| 6 | GET | `/api/v2/prod/scan/locate?serial_no=&worker_id=` | —（**2026-10-15 纯新增，无旧路径**） | Manager + Clerk + Inspector + ShelfAccount | `serial_no` **必填**（字符串）、`worker_id?`（字符串；缺省 ⇒ 不算 action） | `LocateOut`（`part` + `batches[]`） |
+| 6 | GET | `/api/v2/prod/scan/locate?serial_no=&worker_id=` | —（**2026-10-15 纯新增，无旧路径**） | Manager + Clerk + Inspector + ShelfAccount | `serial_no` **必填**（字符串）、`worker_id?`（字符串；缺省 ⇒ 不算 action） | `LocateOut`（`part` + `batches[]` + `worker_processes[]`） |
 | 7 | POST | `/api/v2/prod/scan/take-over` | —（**2026-10-15 纯新增，无旧路径**） | Manager + ShelfAccount | `TakeOverRequest`（5 字段，`batch_id` / `next_process_id?` 为 **JSON 字符串**；`version` 必填 number） | `TakeOverOut`（7 键） |
 | 8 | POST | `/api/v2/prod/scan/outsource-receive` | —（**2026-10-15 纯新增 S3，无旧路径**） | Manager + ShelfAccount | `OutsourceReceiveRequest`（4 字段，`batch_id` 为 **JSON 字符串**、`next_process_id?` 为字符串；`version` 必填 number） | `OutsourceReceiveOut`（6 键） |
 
@@ -517,7 +548,7 @@ JSON **形状**逐字不变（键集一字未动）；`scan.batch_id` 的**取�
 - 与 `locate` 的 PENDING 闸门**逐谓词对齐**（`has_usable_chain_head` /
   `chain_head_in_work_type` 两个投影），见 §3.6 与 §8。
 
-### 2.7 `LocateOut` / `LocatePartBrief` / `LocateBatchItem`（端点 6，2026-10-15 新增）
+### 2.7 `LocateOut` / `LocatePartBrief` / `LocateBatchItem` / `LocateProcessBriefOut`（端点 6，2026-10-15 新增；`LocateProcessBriefOut` 2026-10-16 新增）
 
 #### 入参（`LocateQuery`）
 
@@ -540,6 +571,27 @@ JSON **形状**逐字不变（键集一字未动）；`scan.batch_id` 的**取�
 |---|---|---|
 | `part` | `LocatePartBrief` | 命中的工单 |
 | `batches` | `LocateBatchItem[]` | 该 part **全部未软删批次**（**含终态**），`ORDER BY batch_no ASC, pb.id ASC`。**不分页、无上限**（同一工单批次数有限，找件场景要一次看全） |
+| `worker_processes` | `LocateProcessBriefOut[]` | **2026-10-16 新增**：该工人工种可执行的工序（目标工序 picker 的选项集）。**工人维度**事实，与批次无关，故所有批次共用同一份。空 ⇒ `[]`（不传 `worker_id` / 工人无工种 / 工种未映射任何工序） |
+
+#### `LocateProcessBriefOut`（4 字段，**2026-10-16 新增**）
+
+| 字段 | 类型 | 来源 |
+|---|---|---|
+| `process_id` | **string**（雪花） | `t_process.id`；写端点 `next_process_id` 入参吃同一种字符串形态 |
+| `code` | string | `t_process.code` |
+| `name` | string | `t_process.name` |
+| `category` | `"INHOUSE"` \| `"OUTSOURCE"` | `t_process.category`（与前端 `ProcessCategory` 对齐） |
+
+取行 = `t_work_type_process JOIN t_process`，过滤 `wtp.work_type_id = $工种` 且
+**两侧都 `deleted_at IS NULL`**，排序 `wtp.sort_order ASC, wtp.id ASC`。
+
+⚠️ **与写侧候选集不逐字同源**：写侧判据是 `WorkTypeRepo::list_process_ids`（**不** JOIN
+`t_process`、不过滤工序软删），本列表多一道 `p.deleted_at IS NULL`。方向安全（读侧 ⊆
+写侧 ⇒ 前端 picker 不会给出「选了必被 `20104`」的行），且软删工序没有可展示的名字。
+**别为「与写侧同源」把它删掉** —— 删掉不会让任何测试变红，只会让 picker 多出死卡片。
+
+⚠️ 它与 `batches` 一样是**逐次请求现查**的（`GET /scan/locate` 无缓存层）：工种↔工序
+映射是配置数据，前端 picker 打开时拿到的就是当前生效的那一份。
 
 #### `LocatePartBrief`（7 字段）
 
@@ -583,8 +635,9 @@ JSON **形状**逐字不变（键集一字未动）；`scan.batch_id` 的**取�
 ⚠️ **`"PROCESS_CHAIN_REQUIRED"` 已于 2026-10-15 S3 删除**（10 → 9）：外协收回写端点
 支持手填 `next_process_id`，把「有链但推不出下一道」判成不可点是假阻挡（见 §3.6）。
 
-⚠️ **键集护栏**：`vo/locate.rs` 的单测 `locate_keys_are_pinned` 逐键钉死本模块三个
-结构，两个枚举的字面量另有 `locate_action_literals_are_pinned` /
+⚠️ **键集护栏**：`vo/locate.rs` 的单测 `locate_keys_are_pinned` 逐键钉死本模块**四个**
+结构（`LocatePartBrief` / `LocateBatchItem` / `LocateOut` / `LocateProcessBriefOut`），
+两个枚举的字面量另有 `locate_action_literals_are_pinned` /
 `locate_disabled_reason_literals_are_pinned` 钉住 —— 加 / 删字段或改字面量必须先改
 它们，并同步前端 schema。
 
@@ -597,7 +650,7 @@ JSON **形状**逐字不变（键集一字未动）；`scan.batch_id` 的**取�
 | `batch_id` | string | **是** | 批次锚（雪花 id 字符串）。**只接受字符串**（`deserialize_i64`）；发数字 → 422 纯文本 |
 | `badge_code` | string | **是** | **接管人**（扫码人）工牌码；旧持有人由批次行 `current_holder_id` 决定，**后端不需要、也不接受**客户端指定 |
 | `version` | number | **是** | 批次 OCC 锚（与 `t_part_batch.version` 不一致 → `40901`）；**缺失 → 422 纯文本**（本仓 OCC 规约） |
-| `next_process_id` | string | 条件 | 接管后要推进到的工序。**仅「链位置推导不出下一道」时必填**（判据见下）；解析失败 → `40001`。JSON 字符串形态（与 `worker-scan` 同款） |
+| `next_process_id` | string | **否**（2026-10-16 起） | 接管后要推进到的工序，**三态**：① 链可推导 ⇒ 后端用链，**本字段被忽略**；② 链推不出且传了 ⇒ 显式指定（**允许工序不在该工单链内**，此时 `current_process_step_id` 落 `null`）；③ 链推不出且缺省 ⇒ 按工种候选自动推导（恰好 1 条时不传即可）。解析失败 → `40001`。JSON 字符串形态（与 `worker-scan` 同款） |
 | `note` | string | 否 | `t_part_event.note` 的附加备注；缺省自动文案见下 |
 
 #### 出参（`TakeOverOut`，7 键，键名即网络契约）
@@ -609,7 +662,7 @@ JSON **形状**逐字不变（键集一字未动）；`scan.batch_id` 的**取�
 | `from_worker_id` | **string**（雪花） | **旧**持有人（批次行接管前的 `current_holder_id`，**恒非空** —— holder 为 NULL 的行拒 `20103`） |
 | `to_worker_id` | **string**（雪花） | **新**持有人（扫牌反查出的接管人） |
 | `next_process_id` | **string**（雪花） | 接管后落到的工序 |
-| `next_process_step_id` | **string \| null** | 目标工序在链内的 step；**无链时 `null`**（不是 `"0"` 兜底） |
+| `next_process_step_id` | **string \| null** | 目标工序在链内的 step；`null` 有两种成因：**无链**，或 **2026-10-16 起**「目标工序不在该工单链内」（跨工序接管本就允许，链上无落点）。不是 `"0"` 兜底 |
 | `version` | number | 接管**后**的批次锚（客户端传值 + 1），前端继续拿它做下一次动作的 OCC |
 
 #### 判据顺序（**顺序即错误码优先级契约**，实现 = `service/transfer.rs`）
@@ -621,7 +674,7 @@ JSON **形状**逐字不变（键集一字未动）；`scan.batch_id` 的**取�
 | 3 | 客户端 `version` 与批次 OCC 比对 | `40901` | 409 |
 | 4 | `status='IN_PROCESS'` 且 `location='WORKER'` 且**有持有人** | `20103` | 400 |
 | 5 | 持有人不是扫码人自己 | `20104`（「批次已在你手上，无需接管」） | 400 |
-| 6 | 链位置解析：`pointer_consistent && chain_state=='NEXT'` ⇒ 免填；否则 `next_process_id` 必填、且经 `optional_step_id` 链内解析 | 缺 `40001`（**HTTP 422**）/ 链内定位不到 `20702`（**HTTP 404**） | 422 / 404 |
+| 6 | 目标工序解析（三态，见下） | 缺 `40001`（**HTTP 422**）/ 零候选 `20104`（400）/ 链推导内部不自洽 `20702`（**HTTP 404**） | 422 / 400 / 404 |
 | 7 | 目标工序 ∈ 接管人工种的活跃工序映射（`WorkTypeRepo::list_process_ids`） | `20104` | 400 |
 | 8 | 容量守卫（`ensure_worker_has_capacity`，只按 `max_held_batches` 判） | `20904` / `20204` | 400 / 409 |
 | 9 | 原子 UPDATE（`transfer_to_worker`）0 行 | `40901` | 409 |
@@ -630,14 +683,21 @@ JSON **形状**逐字不变（键集一字未动）；`scan.batch_id` 的**取�
 持有人的行是数据异常（任何写路径都不会产出）；「接管」的前提是挂在**别人**手上，
 无对象可接管 ⇒ 与 `locate` 的 `UNKNOWN` 口径对齐（S1 决策表也同步订正）。
 
-**第 6 步的两条分支**（与 `worker-scan` RETURNED 逐条同源）：
+**第 6 步的三个分支**（**2026-10-16 起**；分支 A 与 worker-scan RETURNED 仍逐条同源）：
 
-- **顺应且 `NEXT`**：后端按链推导下一道（`resolve_chain_position`），响应回传推导值；
-  派生 SQL 内部不自洽（NEXT 但无下一道）按 worker-scan 同款拒 `20702`。
-- **其余**（无链 / 链已软删 / 指针漂移 / 链内工序重复 / **链尾 TAIL**）：必须显式指定，
-  且**有链时只能是链内工序**（越链 → `20702`；无链 ⇒ step 可为 `null`）。
-  ⚠️ TAIL 接管只能指定链内工序 —— 「链尾做完了」在报工台的语义是放回 / 送检，
-  不是接管到链外。
+| 分支 | 条件 | 目标工序 | step 解析 |
+|---|---|---|---|
+| **A · 同工序内接管** | `pointer_consistent && chain_state=='NEXT'` | `position.next_process_id`（**不要求前端传**，显式值也**不覆盖**它；不破坏工序链进度） | `position.next_step_id`；为 `None` ⇒ `20702`（派生 SQL 内部不自洽） |
+| **B · 前端显式指定** | 链推不出 + 传了 `next_process_id` | 该值。**允许工序不在该工单链内** | 链内定位得到就取；定位不到（或无链）⇒ `null`（**不再 `20702`**） |
+| **C · 工种候选自动推导** | 链推不出 + 缺省 | 候选 = 该工种 `t_work_type_process` 活跃映射（**不与工序链求交**）：恰好 1 条 ⇒ 用它；>1 条 ⇒ `40001`；0 条 ⇒ `20104` | 同分支 B |
+
+- 候选为空的文案：`"worker {id} 的工种未映射任何工序，无法接管"`；
+  多候选的文案：`"worker {id} 的工种有 {N} 道工序，无法从工序链推导接管后的工序，必须在 next_process_id 里显式指定"`。
+- ⚠️ **`20702` 在本端点的含义变了**（登记见 §8）：不再表示「越链」，只剩分支 A 的
+  「派生 SQL 返回 NEXT 却拿不到下一道 id」一种成因。
+- ⚠️ 链尾（TAIL）接管走分支 B / C：工序由**工种映射**决定，可以是链内工序也可以是
+  链外工序（链外 ⇒ step 落 `null`）。「链尾做完了」在报工台的语义是放回 / 送检，
+  但接管本身不禁止跨工序。
 
 #### 写入行为（与 `worker-scan` 的差别）
 
@@ -668,7 +728,7 @@ JSON **形状**逐字不变（键集一字未动）；`scan.batch_id` 的**取�
 | `batch_id` | string | **是** | 批次锚（雪花 id 字符串）。**只接受字符串**（`deserialize_i64`）；发数字 → 422 纯文本 |
 | `badge_code` | string | **是** | 收回人（扫码人）工牌码；反查不到 `20201` / 停用 `20202` / 无工种 `20206`。**收回后立刻交到这位工人手上** |
 | `version` | number | **是** | 批次 OCC 锚（与 `t_part_batch.version` 不一致 → `40901`）；**缺失 → 422 纯文本**（本仓 OCC 规约） |
-| `next_process_id` | string | 否 | 收回后要落到的工序。**传了直接覆盖链推导**；缺省 = 按链推导，**无链 ⇒ `40001`**（「无链零件收回必须手填」）。解析失败 → `40001`。JSON 字符串形态（与同域同款） |
+| `next_process_id` | string | 否 | 收回后要落到的工序，**三态**：① 传了 ⇒ 直接用它（**覆盖链推导**，既有语义逐字不变）；② 缺省且**链能推导** ⇒ 按链推导（`resolve_receive_next_process`）；③ 缺省且**链推不出** ⇒ 按工种候选：恰好 1 条自动推导（不传也能成）、>1 条 `40001`（无链）/ `20706`（有链推不出，保留链推导自己的「请手填」文案）、0 条 `20104`。解析失败 → `40001`。JSON 字符串形态（与同域同款） |
 
 **没有 `note` / `quantity`**：收回是整批动作；事件备注由下游事件本身承担。
 
@@ -694,7 +754,7 @@ JSON **形状**逐字不变（键集一字未动）；`scan.batch_id` 的**取�
 | 2 | 批次存在、part 存在 | `20109` / `20101` | 404 / 404 |
 | 3 | 客户端 `version` 与批次 OCC 比对 | `40901` | 409 |
 | 4 | `status='OUTSOURCE'`；`location='OUTSOURCE_COMPANY'` 且有持有人（公司） | `20103` / `20122` | 400 / **409** |
-| 5 | 下一道解析：显式 `next_process_id` 覆盖链推导；缺省时**无链 ⇒ `40001`**；有链 ⇒ `resolve_receive_next_process` 推导 | `40001`（**422**）/ 推不出按其 `20706`（**409**） | 422 / 409 |
+| 5 | 目标工序解析（三态，见下） | `40001`（**422**，无链 + 多候选）/ 零候选 `20104`（400）/ 链推不出 + 多候选按 `20706`（**409**） | 422 / 400 / 409 |
 | 6 | 下一道 ∈ 收回人工种的活跃工序映射（`WorkTypeRepo::list_process_ids`） | `20104` | 400 |
 | 7 | **容量预检** `QueueService::ensure_worker_has_capacity`（排在 stage① 之前） | `20904` / `20204` | 400 / **409** |
 | 8 | stage① 收回落架：`receive_from_outsource_inner`（选架 / `IN_PROCESS + PRODUCTION_SHELF` / 关 shipment / `RECEIVED_FROM_OUTSOURCE`） | `20508`（该工序无可用生产架）/ `20702`（有链但工序不在链内） | 404 / 404 |
@@ -708,6 +768,16 @@ JSON **形状**逐字不变（键集一字未动）；`scan.batch_id` 的**取�
 却没有公司持有人的行是数据异常（任何写路径都会写公司 id），出参 `company_id` 与收回
 语义都以它为前提 ⇒ 按「位置对不上」同类拒 `20122`。**读侧已对齐（2026-10-15 收尾）**：
 `locate` 对同形态落 `NONE + UNKNOWN`（§3.6 / §8）。
+
+**第 5 步的三态与 `take-over` 的次序差异**（**2026-10-16 起**）：本端点**先信链**、
+推不出才用工种候选；`take-over` 则是链可推导时同样先信链 —— 两者唯一的差别是
+**显式值**：`take-over` 的分支 A 不接受显式值覆盖链推导，而本端点显式值**始终**覆盖
+（本端点 2026-10-15 的既有语义，逐字未变）。链推导口径本身也不同：本端点走 outsource
+域的 `NEXT_PROCESS_LATERAL_SQL`（`sort_order = 当前 + 1`），稀疏链上与读侧不等价
+（分叉登记见 §8），所以「能推导时优先信链」在本端点更该保住。
+
+⚠️ 本端点**不自己解析 step 指针**：`current_process_step_id` 由 stage① 内部按 outsource
+域的既有逻辑落位，跨工序形态的落位语义属 outsource 域，不在本轮改动范围。
 
 **stage① / stage② 之间的 `version` 衔接**：stage① 写完后**读回真实新 version**
 （不手算 +1）再喂给 stage② 的 OCC；stage② 成功后再读回最终 version 作出参 ——
@@ -817,8 +887,8 @@ step 指针与「当前工序在链内的位置」是两个独立事实，而 wo
 | `PENDING` | `PICK_UP` | ① **part 有链**（`t_part.process_chain_id IS NOT NULL`）时：链行已软删 / 链内**无未软删 step** ⇒ `PROCESS_CHAIN_STEP_NOT_FOUND`（与写侧 `first_step_in_chain` 逐谓词对齐，2026-10-15 S2-B 订正）；链首（`ORDER BY sort_order ASC, id ASC LIMIT 1`）∉ 我工种活跃映射 ⇒ `PROCESS_NOT_IN_WORK_TYPE`。② 容量：工种未配 max ⇒ `WORK_TYPE_MAX_HELD_NOT_SET`；held ≥ max ⇒ `WORKER_HOLD_LIMIT_EXCEEDED` |
 | `IN_PROCESS` + `location='PRODUCTION_SHELF'` | `PICK_UP` | **只查容量** —— 写侧 pick-up 的 IN_PROCESS 分支不校验工序归属，读侧也不许校验（防「假阻挡」） |
 | `IN_PROCESS` + `location='WORKER'` + holder==我 | `MINE` | 无 |
-| `IN_PROCESS` + `location='WORKER'` + holder≠我（**且非空**） | `TAKE_OVER` | ① 当 `chain_state=='NEXT'` **且** `pointer_consistent`（写侧 `is_pointer_consistent` 的纯 SQL 表达）时：推导出的下一道 ∉ 我工种映射 ⇒ `PROCESS_NOT_IN_WORK_TYPE`；推导不出（无链 / 指针漂移 / 链内歧义 / 链尾）⇒ **仍给 `TAKE_OVER`**（前端弹手填，残余失败组合见 §8）。② 容量 |
-| `OUTSOURCE` + `location='OUTSOURCE_COMPANY'` + 持有人**非空** | `RECEIVE_FROM_OUTSOURCE` | ① **仅当有链且 `chain_state=='NEXT'`** 时校验下一道 ∉ 我工种映射 ⇒ `PROCESS_NOT_IN_WORK_TYPE`；**其余（无链 / 有链但推不出 `NEXT`）一律放行** —— 写侧（S3）对这两种形态走「前端手填 `next_process_id`」的流，前端在 `chain_state != "NEXT"` 时弹手填（2026-10-15 S3 订正：此前给 `PROCESS_CHAIN_REQUIRED` 是**假阻挡**，见 §8）。② 容量 |
+| `IN_PROCESS` + `location='WORKER'` + holder≠我（**且非空**） | `TAKE_OVER` | ① 当 `chain_state=='NEXT'` **且** `pointer_consistent`（写侧 `is_pointer_consistent` 的纯 SQL 表达）时：推导出的下一道 ∉ 我工种映射 ⇒ `PROCESS_NOT_IN_WORK_TYPE`；**链推不出**（无链 / 指针漂移 / 链内歧义 / 链尾）⇒ **工种零候选**（2026-10-16 新增）时同样 `PROCESS_NOT_IN_WORK_TYPE`，否则**仍给 `TAKE_OVER`**（单候选写侧自动推导、多候选前端弹手填）。② 容量 |
+| `OUTSOURCE` + `location='OUTSOURCE_COMPANY'` + 持有人**非空** | `RECEIVE_FROM_OUTSOURCE` | ① **仅当有链且 `chain_state=='NEXT'`** 时校验下一道 ∉ 我工种映射 ⇒ `PROCESS_NOT_IN_WORK_TYPE`；**其余形态（无链 / 有链但推不出 `NEXT`）** 改判「工种有没有候选」—— **零候选 ⇒ `PROCESS_NOT_IN_WORK_TYPE`**（2026-10-16 新增，对位写侧 `20104`）；非空 ⇒ 放行（单候选写侧自动推导、多候选前端弹手填）。② 容量 |
 | `PROGRAMMING` | `NONE` | `PROGRAMMING`（指引找 CNC 编程） |
 | `INSPECTION` | `NONE` | `INSPECTION`（指引找品检） |
 | `READY_TO_SHIP` / `DELIVERED` / `COMPLETED` / `CANCELLED` | `NONE` | `TERMINAL` |
@@ -835,8 +905,8 @@ step 指针与「当前工序在链内的位置」是两个独立事实，而 wo
 | `PICK_UP` 的 `PROCESS_CHAIN_STEP_NOT_FOUND` | `POST /scan/batches/{id}/pick-up`（PENDING 链首落位，S2-B） | `20702`（链行软删 / 链内无活跃 step） |
 | `PICK_UP` 的 `PROCESS_NOT_IN_WORK_TYPE` | 同上 | `20104`（链首 ∉ 工种映射） |
 | `MINE` | 无写端点，前端引导到放回 / 送检流 | — |
-| `TAKE_OVER` | `POST /scan/take-over`（S2-A，**已落地**） | `20702` / `20104` / `20103` / 容量两条；推导不出下一道时前端**必须弹手填**（`40001` / `20702` 兜底） |
-| `RECEIVE_FROM_OUTSOURCE` | `POST /scan/outsource-receive`（S3，**已落地**） | `20103` / `20122` / `20109` / `20101` / `40901` / `40001`（无链缺省）/ `20706`（有链推不出）/ `20104`（手填 ∉ 工种）/ 容量两条（`20904`/`20204`，零写入）；推导不出下一道时前端**必须弹手填**；读侧**不预判** `20508`（收回时该工序无可用生产架，写入才知，见 §8） |
+| `TAKE_OVER` | `POST /scan/take-over`（S2-A，**已落地**） | `20702`（**仅**「链推导 NEXT 却拿不到下一道」，见 §8）/ `20104` / `20103` / `40001`（多候选必填）/ 容量两条；**单候选时前端不传 `next_process_id` 也能成**（2026-10-16） |
+| `RECEIVE_FROM_OUTSOURCE` | `POST /scan/outsource-receive`（S3，**已落地**） | `20103` / `20122` / `20109` / `20101` / `40901` / `40001`（无链 + 多候选）/ `20706`（有链推不出 + 多候选）/ `20104`（手填 ∉ 工种 / 零候选）/ 容量两条（`20904`/`20204`，零写入）；**单候选时前端不传 `next_process_id` 也能成**（2026-10-16）；读侧**不预判** `20508`（收回时该工序无可用生产架，写入才知，见 §8） |
 | 容量两条 reason | 任意取件路径 | 与 `QueueService::ensure_worker_has_capacity` **同一判据**（`20904` 先于 `20204`） |
 
 ⚠️ **容量判据逐字同谓词**：held = `t_part_batch WHERE status='IN_PROCESS' AND
@@ -844,9 +914,9 @@ location='WORKER' AND current_holder_id=$w AND deleted_at IS NULL`（**复用 `/
 `count_held` 同一条 SQL**）；max = 工人 `work_type_id` 对应的 `t_work_type.
 max_held_batches`（`NULL` = 未配置，不是「不限」）。
 
-⚠️ **读侧零跨域 import**：工人 / 工种 / 外协的查询全部内联在 `listing/repo.rs` 的
-SQL 里（不 import `prod::worker` / `prod::queue` / `outsource` 任何符号），
-由域隔离护栏守住（§7.1）。
+⚠️ **读侧零跨域 import**：工人 / 工种 / 外协 / **工种↔工序映射**的查询全部内联在
+`listing/repo.rs` 的 SQL 里（不 import `prod::worker` / `prod::queue` / `prod::work_type`
+任何符号），由域隔离护栏守住（§7.1）。
 
 ## 4. 与 WS 的关系
 
@@ -960,12 +1030,12 @@ SQL 里（不 import `prod::worker` / `prod::queue` / `outsource` 任何符号�
 |---|---|---|
 | `GET /scan/pickable` | **2** | 取行 + COUNT |
 | `GET /scan/held` | **3** | 取行 + COUNT + 工种上限（**2026-10-14 由 2 增至 3**） |
-| `GET /scan/locate` | **≤ 4**（未传 `worker_id` 时 2） | 工单命中 + 工人/工种上限 + 持有数（**复用 `/held` 的 `count_held` 同一条 SQL**）+ 批次取行。**2026-10-15 新增** |
+| `GET /scan/locate` | **≤ 5**（未传 `worker_id` 时 2） | 工单命中 + 工人/工种上限 + **工种候选工序（2026-10-16 新增）** + 持有数（**复用 `/held` 的 `count_held` 同一条 SQL**）+ 批次取行。**2026-10-15 新增** |
 | `POST /scan/verify-badge` | 1 | 按 `badge_code` 反查 |
 | `POST /scan/worker-scan` | 多次 | 状态翻转 + 事件日志 + 选架 + 同事务 refill + 派生。RETURNED 臂**无条件**先跑 1 条链位置解析（整批路径也跑）；`0 < q < batch.quantity` 的部分数量路径**再加** 5 条：拆批 3 条（`max(batch_no)` / `INSERT ... SELECT` / 扣量 `UPDATE`）+ `SPLIT` 事件 1 条 + 新批次回读 1 条 |
 | `POST /scan/batches/{id}/pick-up` | 多次 | **容量守卫 2 条**（工种 + 持有数）+ **PENDING 链首解析 1–3 条**（仅 PENDING 起点，2026-10-15 S2-B：`optional_process_chain` 恒 1 条；有链再 +2 —— `first_step_in_chain` + `list_process_ids`）+ 拆批（可选）+ 状态翻转 + 事件日志 |
-| `POST /scan/take-over` | 多次（前置校验 7–9 条） | 工牌 1 + 批次 1 + part 1 + 链位置解析 1 + 链内 step **0–2**（仅非顺应分支：`optional_process_chain` + `optional_step_id`，无链时后者不查库）+ 工种工序 1 + 容量 2；写 1（`transfer_to_worker`）+ 派生 + 事件 1。**2026-10-15 S2 新增** |
-| `POST /scan/outsource-receive` | 多次（两段写 + 写后读回） | 前置：工牌 1 + 批次 1 + part 1 + **无链判定 1**（缺省 `next_process_id` 时 `optional_process_chain`；显式则不查）+ 有链推导 1（缺省且无链已拒，不会到）+ 工种工序 1 + 容量 2；stage①（与 `/outsource-queue/move` 回收臂**同内核**）：选架 1 + 链 step 0–2 + 批次写 1 + shipment 读 1 + shipment 写 + quote 事件 0–1 + part 事件 1；**读回 version 1**；stage② `pick_up` 全量（批次 1 + part 1 + 容量 2 + 写 1 + 事件 1 + part 回读 1）；**终读 version 1**。**2026-10-15 S3 新增** |
+| `POST /scan/take-over` | 多次（前置校验 8–10 条） | 工牌 1 + 批次 1 + part 1 + **工种工序 1（2026-10-16 起上移到链位置解析之前，两个分支共用）** + 链位置解析 1 + 链内 step **0–2**（仅分支 B / C：`optional_process_chain` + `resolve_step_id_by_process`，无链时后者不查库；分支 A 不查）+ 容量 2；写 1（`transfer_to_worker`）+ 派生 + 事件 1。**2026-10-15 S2 新增** |
+| `POST /scan/outsource-receive` | 多次（两段写 + 写后读回） | 前置：工牌 1 + 批次 1 + part 1 + **工种工序 1（2026-10-16 起上移，先于链推导）** + **无链判定 1**（缺省 `next_process_id` 时 `optional_process_chain`；显式则不查）+ 有链推导 1（缺省且有链时；推不出即退回工种候选，不再直接拒）+ 容量 2；stage①（与 `/outsource-queue/move` 回收臂**同内核**）：选架 1 + 链 step 0–2 + 批次写 1 + shipment 读 1 + shipment 写 + quote 事件 0–1 + part 事件 1；**读回 version 1**；stage② `pick_up` 全量（批次 1 + part 1 + 容量 2 + 写 1 + 事件 1 + part 回读 1）；**终读 version 1**。**2026-10-15 S3 新增** |
 
 三条只读端点都**不按行数重复查**：`pickable` 一次 SQL 把「工种→工序映射 → 架 →
 批次」全链 JOIN 完；`held` / `locate` 一次 SQL 把链位置派生挂在 `LEFT JOIN LATERAL`
@@ -986,6 +1056,13 @@ SQL 两次查询）—— 再查一次不仅多一条 SQL，还会让两个字�
 repo**：本域 `listing/` 子模块受域隔离护栏
 `listing_aggregation_depends_on_no_other_domain` 扫，任何他域 import 都会让它变红。
 读他域的**表**是允许的既定 pattern，import 他域的**符号**才违规。
+
+⚠️ **`locate` 的工种候选工序同样是独立的一条（2026-10-16）**，理由与上一条同类但更硬：
+它是**独立结果集**（每个工种工序一行），而批次取行的每行都锚在批次上 —— 要合就得让每条
+批次行都重复投影一遍，或聚成一个字符串列再在 SQL 层拆开；两者都是把一个恒定大小的常量
+摊到「批次数」这个变量上。它同时是两个写端点「单候选自动推导 / 多候选必填 / 零候选拒」
+三态的同一份事实，**更不能**为了省一条 SQL 而改用别的候选集（那会让读侧 picker 与写侧
+判据各自漂移）。
 
 ⚠️ **`pick-up` 的容量守卫 2 条**（`work_type_get_by_id` + `count_held_by_worker`）
 与 `move` 共用 `QueueService::ensure_worker_has_capacity`。守卫失败时事务回滚，
@@ -1036,7 +1113,7 @@ repo**：本域 `listing/` 子模块受域隔离护栏
 |---|---|
 | 批次行 / 批次锚 / OCC | `t_part_batch` |
 | 工单展示字段 | `t_part` |
-| 工种↔工序映射（`pickable` 过滤；`take-over` / `outsource-receive` 的「下一道 ∈ 工种」校验；pick-up PENDING 链首校验） | `t_work_type_process` |
+| 工种↔工序映射（`pickable` 过滤；`take-over` / `outsource-receive` 的「目标工序 ∈ 工种」校验**与单候选自动推导**；pick-up PENDING 链首校验；2026-10-16 起 `locate` 的 `worker_processes`） | `t_work_type_process` |
 | 货架（zone / active / 软删 / scope） | `t_shelf` |
 | 工序名（链派生后取名） | `t_process` |
 | 工艺链与 step 定位（含 `t_part_process_chain` 链行软删闸门） | `t_part_process_chain` / `t_process_chain_step` / `t_part.process_chain_id` |
@@ -1128,7 +1205,7 @@ repo 都不 import（连 `PartRepoTrait` 都不借 —— 那是一个 part 域�
      是业务信封 `20111`（**HTTP 400**，`{ code, message, data: null }`）；
      发数字则是 axum `JsonRejection` 的 **HTTP 422 纯文本**，**不进信封**
      ⇒ 前者走既有 `code != 0` 的错误提示路径，后者得单独处理（否则只会拿到一句裸 422）。
-10. **2026-10-14 的三条契约（摘要见 §0.3，逐字段见对应小节）**：
+10. **2026-10-14 的三条契约（摘要见 §0.4，逐字段见对应小节）**：
     - `GET /scan/held` 换成 `HeldListOut`，新增 `current_held` / `max_held_batches`
       两个**裸 number**（§2.3.1）—— 取件页要显示「已拿 N / 上限 M」并据此禁用取件按钮；
     - `POST /scan/batches/{id}/pick-up` 新增 `20204`（容量触顶，HTTP 409）/ `20904`
@@ -1149,13 +1226,13 @@ repo 都不 import（连 `PartRepoTrait` 都不借 —— 那是一个 part 域�
       `AUTO_LIMIT_REACHED` 应提示「自动补料已到上限，可手动领取」；
     - ⚠️ `WORKER_POOL_EMPTY` 的广播条件**不变**（仍只认 `POOL_EMPTY`，见 §4.2）；
     - pick-up 的容量守卫**不受自动上限影响**（仍只按 `max_held_batches` 判，§2.6.1）。
-12. **2026-10-15 S2：扫码接管前端接入 + PENDING 领取行为变更**（§0.1 / §2.8 / §2.6.2）：
+12. **2026-10-15 S2：扫码接管前端接入 + PENDING 领取行为变更**（§0.2 / §2.8 / §2.6.2）：
     - **新端点** `POST /api/v2/prod/scan/take-over`（Manager / ShelfAccount）：
-      `locate` 给出 `TAKE_OVER` 的批次用「诊断行的 `batch_id` + `version`」直接发起；
-      推导不出下一道时**必须弹手填工序**（缺 → `40001`，链外 → `20702`）。成功后可
-      拿响应的 `version` 继续做 OCC 锚。错误码矩阵见 §2.8 —— 注意 `40001` → HTTP
-      **422**、`20702` → HTTP **404**（本仓集中映射的结果，别按「业务错一律 400」
-      处理）。
+      `locate` 给出 `TAKE_OVER` 的批次用「诊断行的 `batch_id` + `version`」直接发起。
+      ⚠️ 工序参数的形态**已被 2026-10-16 改写**（原「推导不出下一道时必须弹手填、
+      链外 → `20702`」不再成立）—— 现行三态与 picker 收窄见**第 15 条**，此处只留
+      错误码映射：`40001` → HTTP **422**、`20702` → HTTP **404**（本仓集中映射的
+      结果，别按「业务错一律 400」处理）。成功后可拿响应的 `version` 继续做 OCC 锚。
     - **新 WS 事件** `PART_TRANSFERRED`（payload 四键全字符串，§4）：消费方按新事件名
       接入刷新（dashboard / 队列看板的「工人持有」格子）；它**只有四个键**，别指望带
       全量快照。
@@ -1163,27 +1240,26 @@ repo 都不 import（连 `PartRepoTrait` 都不借 —— 那是一个 part 域�
       （HTTP 400）（§2.6.2），且领取后的批次工序两列 = 链首（不再是 NULL）；
       `PICKED_UP` / `SPLIT` 事件的 `process_id` 同理（无链仍 `null`）。取件页的失败
       文案要给这两个码留位置。
-13. **2026-10-15 S3：外协确认收回前端接入 + `locate` 假阻挡订正**（§0.0 / §2.9 / §3.6）：
+13. **2026-10-15 S3：外协确认收回前端接入 + `locate` 假阻挡订正**（§0.1 / §2.9 / §3.6）：
     - **新端点** `POST /api/v2/prod/scan/outsource-receive`（Manager / ShelfAccount）：
       `locate` 给出 `RECEIVE_FROM_OUTSOURCE` 的批次用「诊断行的 `batch_id` +
-      `version`」直接发起；工序参数两条形态（2026-10-15 review 订正）：
-      `chain_state != "NEXT"`（含无链）时**必须弹手填工序**（缺省且无链 →
-      `40001`）；`chain_state == "NEXT"` 时也**必须把 locate 行返回的
-      `next_process_id` 原样回传**（不得省略）—— 写侧缺省推导的
-      `NEXT_PROCESS_LATERAL_SQL` 口径是 `sort_order = 当前 + 1`，与读侧
-      `sort_order > 当前 LIMIT 1` **在稀疏链上不等价**，仅当写侧可推导时才可省略
-      （两类形态与根因见 §8 残余失败组合第 4 条）。成功后可拿响应的 `version`
-      继续做 OCC 锚。
+      `version`」直接发起。⚠️ 工序参数的两条形态**已被 2026-10-16 改写**：`chain_state
+      != "NEXT"`（含无链）时不再「必须弹手填」—— 单候选时**不传**即可（链推导不可用
+      时退回工种候选）；且**有链可推导时仍建议把 locate 行的 `next_process_id` 原样
+      回传**（不得省略）—— 写侧缺省推导的 `NEXT_PROCESS_LATERAL_SQL` 口径是
+      `sort_order = 当前 + 1`，与读侧 `sort_order > 当前 LIMIT 1` **在稀疏链上不等价**
+      （两类形态与根因见 §8 残余失败组合第 4 条）。现行三态与 picker 收窄见**第 15 条**。
+      成功后可拿响应的 `version` 继续做 OCC 锚。
       错误码矩阵见 §2.9 —— 注意 `40001` → HTTP **422**、`20702` / `20508` / `20122`
       都是 **404 / 409**（本仓集中映射的结果，别按「业务错一律 400」处理）。
     - **`disabled_reason` 字面量集合 10 → 9**：`"PROCESS_CHAIN_REQUIRED"` 已删除 ——
       前端的 `switch` / 映射表必须删掉该分支（后端不再产生它）。
     - **`locate` 行为变更**：外协批次「有链但推不出 `NEXT`」现在给
-      `RECEIVE_FROM_OUTSOURCE`（此前 `NONE`）—— 按钮渲染逻辑会看到更多可点行，
-      但点击后可能要吃 `40001` / `20706`，按 §2.9 弹手填。
+      `RECEIVE_FROM_OUTSOURCE`（此前 `NONE`；**工种零候选**除外，见第 15 条）——
+      按钮渲染逻辑会看到更多可点行。
     - **WS**：`PART_PICKED_UP` 多了一个产出点（本端点），payload 与 `pick-up` 逐字
       同形 —— 已有该事件的处理函数**零改动**即生效（§4）。
-14. **2026-10-15 S1：扫码找件诊断前端接入**（§0.2 / §2.7 / §3.6）：
+14. **2026-10-15 S1：扫码找件诊断前端接入**（§0.3 / §2.7 / §3.6）：
     - **新端点** `GET /api/v2/prod/scan/locate?serial_no=&worker_id=`（Manager /
       Clerk / Inspector / ShelfAccount）。`serial_no` **必填**（trim 后为空按未命中
       `20101`）；`worker_id` **可选**、只吃 JSON 字符串（发数字 → 400 纯文本，与
@@ -1195,8 +1271,75 @@ repo 都不 import（连 `PartRepoTrait` 都不借 —— 那是一个 part 域�
       第 12 条的链首行为变更）、`TAKE_OVER` 走第 12 条 `POST /scan/take-over`、
       `RECEIVE_FROM_OUTSOURCE` 走第 13 条 `POST /scan/outsource-receive`。
     - **无 WS**：只读诊断不发事件（§4 不登记它），列表新鲜度靠前端自身的 query 策略。
+15. **2026-10-16：目标工序 picker 收窄 + 单候选不弹框**（§0.0 / §2.7 / §2.8 / §2.9 /
+    §3.6）：
+    - **`locate` 出参新增顶层 `worker_processes`**（`{ process_id, code, name, category }[]`，
+      `process_id` 是 **JSON 字符串**）。Zod schema 那边是**新增一个可选键**，
+      `locate` 的行 schema（`part` / `batches`）逐字不变；空数组（未传 `worker_id` /
+      工人无工种 / 工种未映射）也要能过校验。
+    - **picker 的选项集改成这个列表**，不要再拉全部工序让工人自己挑 —— 业务口径是
+      「该做什么由工人的工种说了算」。⚠️ 该列表比写侧候选集**多一道工序软删闸门**
+      （读侧 ⊆ 写侧），所以 picker 里出现的每一项写侧都认。
+    - **`worker_processes.length === 1` ⇒ 直接提交、不弹框**：`POST /scan/take-over`
+      与 `POST /scan/outsource-receive` 在「链推不出 + 候选恰好 1 条」时都不要求
+      `next_process_id`（省略该键即可，别发 `null`）。前端「选一道工序」的弹框只在
+      `length > 1` 时才需要。
+    - ⚠️ **`chain_state == "NEXT"`（take-over）/ 有链可推导（outsource-receive）时仍要
+      照旧回传 `next_process_id`**：那两条路径的**链推导优先于工种候选**，前端省略了
+      后端会用链上的下一道（可能与工人想选的候选不同）。两条端点的判定入口不同
+      （take-over 另要求 `pointer_consistent`），判据见 §2.8 / §2.9 的三态表。
+    - **新的失败码形态**：`40001`（多候选缺省，HTTP **422**）/ `20104`（工种零候选，
+      HTTP 400，文案点名工号）。前端要分别给「这道工序得您选」与「您这个工种还没配
+      任何工序，请找管理员」的文案，别都落进通用提示。
+    - ⚠️ **`20702` 在这两个端点上不再是「越链」**：前端若仍按老语义把它当「工序不在
+      链内」来提示文案，说服力会变弱（它的真实含义见 §8）。`next_process_step_id` /
+      step 列落 `null` 现在是**正常返回**（跨工序接管），前端不要把它当异常态渲染。
+    - **读侧按钮口径变化**：`disabled_reason == "PROCESS_NOT_IN_WORK_TYPE"` 现在有
+      **两种成因**（推导出的下一道不属该工种 / 该工种零候选），共用同一字面量但
+      文案可以不同（枚举**未扩**，见 §2.7）。
 
 ## 8. 已知偏差登记
+
+---
+
+**`20702` 在 `take-over` / `outsource-receive` 上被「放宽」（2026-10-16，产品决策）**
+
+2026-10-16 前，这两个端点的 `20702 BIZ_PROCESS_CHAIN_STEP_NOT_FOUND` 也承担
+「显式传入的工序不在该工单的工序链内」这一形态（`optional_step_id` 越链即抛）。
+产品决策是「跨工序接管是独立路径，不因越链而拒」，故：
+
+- `take-over`：step 解析改用 `resolve_step_id_by_process`（返 `Option` 不抛），
+  链内定位不到 ⇒ `current_process_step_id` 落 `NULL`；
+- `outsource-receive`：本端点**从不**自己解析 step —— `current_process_step_id` 由
+  stage① 内核 `receive_from_outsource_inner` 按 outsource 域的既有逻辑落位，它仍调
+  `optional_step_id` ⇒ **「工单有链但目标工序不在链内」在本端点仍会 `20702`**
+  （该内核属 outsource 域，**本轮未动**，属独立改动）。
+
+⚠️ **由此产生的一处读侧不可预判**（2026-10-16 登记）：`outsource-receive` 的候选集是
+工种映射（**不与链求交**），而 stage① 对「有链 + 链外工序」必拒 ⇒ 前端把 picker 收窄到
+`worker_processes` 后仍可能在该端点吃到 `20702`（take-over 侧已消解）。这不是回归 ——
+2026-10-16 前前端手填同样会撞它；真正的根因是 outsource 域的回收内核仍以「工序必须在
+链内」为前提。处置建议：后续把 outsource 收回内核的 step 解析也放宽为「定位不到落
+NULL」（与 `take-over` 对齐），本轮**不动**（跨域行为变更需单独评审）。
+
+⇒ **`20702` 在 `take-over` 上只剩一种成因**：链推导返回 `NEXT` 却拿不到下一道 id
+（派生 SQL 内部不自洽）。`optional_step_id` 这个函数**仍被其它路径使用**
+（`shared::batch::guards` 内），不要因为本域不再调它就删。
+
+**已消解的旧残余失败组合**：`locate` 对 `TAKE_OVER` / `RECEIVE_FROM_OUTSOURCE` 曾经
+「链推不出也一律放行、让前端弹手填」，写侧却会在越链时拒 `20702`（§8「残余失败组合」
+第 2 / 3 条的那一半）。新语义下链推不出时**候选集来自工种映射**、越链也放行，
+该分叉随之消失；读侧新增的空候选闸门（`PROCESS_NOT_IN_WORK_TYPE`）是对位的新闸门，
+不是同一条旧组合。
+
+---
+
+**`PROCESS_NOT_IN_WORK_TYPE` 一个字面量两种成因（2026-10-16）**
+
+读侧复用既有字面量（**不扩 wire 枚举**）：① 链推得出的目标工序不在该工种映射里；
+② 链推不出、而该工种**一条工序都没映射**。前端可以按「是否 `worker_processes` 为空」
+区分文案（`[]` 即 ②）。⚠️ 但 `[]` 也可能是「未传 `worker_id`」—— 那种形态下
+`action` / `disabled_reason` 都是 `null`，不会产生 ②，别据此判。
 
 ---
 
@@ -1324,34 +1467,40 @@ LEFT JOIN 一次），该写法**假定** holder id 在三表 PK 空间里互不
    ⚠️ 残余的**reason 优先级分歧**：PENDING 同时踩「链问题 + 容量问题」时，`locate`
    先报链类 reason、写侧按既有优先级先报容量类错误（`20904` / `20204`）—— 两侧都拒，
    只是提示不同；不要试图把写侧改成「链先于容量」（那会改变既有错误码优先级）。
-2. **TAKE_OVER 的「推导不出」分支**（无链 / 指针漂移 / 链尾 / 链内歧义）：读侧仍给
-   `TAKE_OVER`（前端弹手填下一道），手填值经写侧 `optional_step_id` 校验 ——
-   **有链但链内没有该工序 ⇒ 写侧 `20702`**，无链 ⇒ 放行（step 可为 `null`）。
-   即「链尾 + 手填链内工序」是唯一「可点但可能被拒」的接管形态。
-3. **外协收回的手填流（S3，2026-10-15 已落地）**：读侧对「无链 / 有链但推不出
-   `NEXT`」放行（前端弹手填），手填值经写侧判据 —— **手填 ∉ 工种映射 ⇒ `20104`**
-   （读侧对这两种形态**无法预判**：链状态既不是 `NEXT`，也就没有「推导出的下一道」
-   可拿去对工种映射）；**有链且手填工序不在链内 ⇒ `20702`**。另有读侧完全不预判的
-   **`20508`**（收回时该工序无可用生产架 —— 选架只在写入时发生）。三者都在写侧有
+2. ~~**TAKE_OVER 的「推导不出」分支手填越链 ⇒ `20702`**~~
+   **已消解（2026-10-16）**：链推不出时目标工序改由**工种映射**推导（越链也放行、
+   step 落 `NULL`），该分叉不复存在。读侧仍给 `TAKE_OVER`，但它挡住的只剩
+   **工种零候选**（⇒ `PROCESS_NOT_IN_WORK_TYPE`，对位写侧 `20104`）。
+3. **外协收回的手填流（S3，2026-10-15 已落地；2026-10-16 部分改写）**：读侧对
+   「无链 / 有链但推不出 `NEXT`」放行（**工种零候选除外**，2026-10-16 起落
+   `PROCESS_NOT_IN_WORK_TYPE`），前端按 `worker_processes` 收窄 picker；手填值经写侧
+   判据 —— **手填 ∉ 工种映射 ⇒ `20104`**（读侧对这两种形态**无法预判**：链状态既不是
+   `NEXT`，也就没有「推导出的下一道」可拿去对工种映射）。另有读侧完全不预判的
+   **`20508`**（收回时该工序无可用生产架 —— 选架只在写入时发生）。两者都在写侧有
    显式错误码且失败**零写入**，前端必须保留错误分支（逐条登记见下文）。
-4. **外协收回的「读侧给 `NEXT`、写侧缺省推不出」（S3，2026-10-15 review 补登记）**：
+   ⚠️ 「有链且手填工序不在链内」在本端点仍可能落到 stage① 内部的 `20702`
+   （该内核属 outsource 域，2026-10-16 未动，登记见本节第一条）。
+4. **外协收回的「读侧给 `NEXT`、写侧缺省推不出」（S3，2026-10-15 review 补登记；
+   2026-10-16 改写为「退回工种候选」）**：
    `locate` 的 `chain_state` / `next_process_id` 取自
    `shared::batch::chain::CHAIN_POSITION_LATERAL_SQL`（下一道按
    `sort_order > 当前 ORDER BY ASC LIMIT 1`），而 `POST /scan/outsource-receive`
    缺省 `next_process_id` 时走 outsource 域的 `NEXT_PROCESS_LATERAL_SQL`
    （`sort_order = 当前 + 1`）+ `optional_process_chain`（只读
-   `t_part.process_chain_id`）—— 以下两类形态读侧可推、写侧缺省必推不出：
+   `t_part.process_chain_id`）—— 以下两类形态读侧可推、写侧链推导必推不出：
    - **(a) 稀疏链**（如 `[10, 20]`、批次在 10）：读侧 `>` 推得出 ⇒
      `chain_state == "NEXT"` 且 `next_process_id` 有值；写侧 `= 当前 + 1` 无行 ⇒
-     缺省返 **`20706`**。前端按 §7.2 第 13 条把 locate 行的 `next_process_id`
-     显式回传即可绕过。根因在 outsource 域 `src/modules/outsource/repo/sql.rs`
-     的 `NEXT_PROCESS_LATERAL_SQL`（同样影响 `/outsource-queue/move` 的回收推导
-     与看板 `chain_resolvable`），**属 outsource 域独立改动，本功能不动**。
+     链推导失败。**2026-10-16 起**：工种**单候选**时直接退回该候选（成功，无需前端
+     干预）；**多候选**时仍返 **`20706`**（保留「请手填」指引），前端按 §7.2 第 13 条
+     把 locate 行的 `next_process_id` 显式回传同样可绕过。根因在 outsource 域
+     `src/modules/outsource/repo/sql.rs` 的 `NEXT_PROCESS_LATERAL_SQL`（同样影响
+     `/outsource-queue/move` 的回收推导与看板 `chain_resolvable`），
+     **属 outsource 域独立改动，本功能不动**。
    - **(b) part 无链但批次 step 指针存活**（两处锚链表达式都是
      `COALESCE(p.process_chain_id, cur.chain_id)` 的回退形态，legacy 恢复数据可达）：
      读侧锚到指针所属活跃链、可给 `NEXT`；写侧缺省预检 `optional_process_chain`
-     只看 part 列 ⇒ `None` ⇒ 缺省必拒 **`40001`**。显式回传 locate 行的
-     `next_process_id` 同样绕过（写侧显式值不做链归属校验，step 落 NULL）；
+     只看 part 列 ⇒ `None` ⇒ 链推导路径整体不进，改走工种候选（单候选成功 / 多候选
+     `40001`；显式回传 locate 行的 `next_process_id` 同样可行）；
      **无写路径可产出该形态**，登记为已知偏差。
 
 `locate` 是**诊断**不是**预演**：它按当前读到的数据回答「大概率能做什么」，

@@ -34,7 +34,7 @@
 //!
 //! | 端点 | 说明 |
 //! |---|---|
-//! | `GET /scan/locate?serial_no=&worker_id=` | S1：只读诊断（位置事实 + 针对该工人的 `action` / `disabled_reason`） |
+//! | `GET /scan/locate?serial_no=&worker_id=` | S1：只读诊断（位置事实 + 针对该工人的 `action` / `disabled_reason` + **工种可执行工序 `worker_processes`**，2026-10-16 新增） |
 //! | `POST /scan/take-over` | S2：扫码接管（holder worker → worker + 工序顺推的原子写） |
 //! | `POST /scan/outsource-receive` | S3：外协确认收回（收回落自动选架 + 立刻交到扫码工人，同一事务） |
 //!
@@ -44,6 +44,28 @@
 //! ⚠️ S3 修正了 S1 的一处**假阻挡**：`locate` 此前对有链但推不出 `NEXT` 的外协
 //! 批次给 `NONE`，而写侧支持手填 `next_process_id` ⇒ 该硬阻挡与
 //! `LocateDisabledReason::ProcessChainRequired` 变体已一并删除。
+//!
+//! ## 2026-10-16：接管 / 外协收回的目标工序改由「工人的工种映射」推导
+//!
+//! 业务口径：报工台这两个端点是「实物已经在本人手上」的现场恢复动作，工人**不该**
+//! 被要求在全部工序里挑一道 —— 该做什么由他的**工种**说了算。
+//!
+//! - `next_process_id` 由「链推不出就必填」变成**三态**（逐条见
+//!   `service/transfer.rs` 与 `service/outsource_receive.rs` 的模块 doc）：
+//!   链可推导 ⇒ 用链（**优先级最高**，显式值也不覆盖，不破坏工序链进度）；
+//!   链推不出 + 显式 ⇒ 允许**工序不在该工单链内**
+//!   （`current_process_step_id` 落 `NULL`，`20702` 不再表示「越链」）；
+//!   链推不出 + 缺省 ⇒ 工种候选恰好 1 条自动推导 / >1 条 `40001` / 0 条 `20104`。
+//!   候选集 = `t_work_type_process` 活跃映射，**不与工序链求交**
+//!   （非链推导形态下默认「这张工单的链已不适用」）。
+//! - `outsource-receive` 的次序**刻意不同**：显式值覆盖链推导的 2026-10-15 语义
+//!   逐字不变，缺省时先信链、推不出才退回工种候选（该端点的链推导口径是 outsource
+//!   域的 `sort_order = 当前 + 1`，稀疏链上与读侧不等价，分叉登记见 `docs/api/scan.md` §8）。
+//! - 读侧 `GET /scan/locate` 出参新增**顶层** `worker_processes`（工种可执行工序，
+//!   供前端把 picker 收窄到这个集合；单候选时直接提交、不弹框）；两个闸门函数各加一条
+//!   「**非链推导形态下**工种零候选 ⇒ `PROCESS_NOT_IN_WORK_TYPE`」—— 复用既有
+//!   字面量，**不扩 wire 枚举**。
+//! - 错误码分段不变：复用 `20104` / `40001` / `20702`，无新增段。
 //!
 //! ## 模块结构
 //! - `dto.rs` —— 8 条端点的全部入参（`VerifyBadgeRequest` / `PickableQuery` /
