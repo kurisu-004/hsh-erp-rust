@@ -115,9 +115,14 @@ pub struct DigestRow {
     pub order_no: Option<String>,
     /// `LEFT JOIN t_customer` 得到的客户名。
     ///
-    /// ⚠️ **刻意不加 `AND c.deleted_at IS NULL`**：客户软删时该列退化为 `null`，
-    /// 但**不该**因此把工单从邮件里剔除掉（工单本身是有效的，只是不知道发给谁家）。
-    /// 与 dashboard `list_orders_*` 的客户名处理同款决策。
+    /// ⚠️ **刻意不加 `AND c.deleted_at IS NULL`**：`ON` 里只有 `cust.id = p.customer_id`
+    /// ⇒ **软删客户的名字照常带出**。闸门放 `ON` 里本来也只会清空名字、**不会**剔除工单行，
+    /// 所以「不该把工单从邮件里剔除」不是这里的取舍理由；取舍是「客户名以 `id` 为准、
+    /// 不受软删影响」（与 dashboard `list_orders_*` 同款 —— 那边是
+    /// `SELECT id, name FROM t_customer WHERE id = ANY(...)`，同样无软删闸门）。
+    /// 本列为 `NULL` 的**唯一**成因是客户行不存在（`customer_id` 悬空，指向一个已不存在的
+    /// `t_customer.id`）。四条语句（[`list_overdue`] / [`list_upcoming`] 各两个
+    /// `UNION ALL` 分支）口径一致。
     pub customer_name: Option<String>,
     /// SQL 里写死的来源字面量：`'PART'` / `'ASSEMBLY'`。
     pub row_type: String,

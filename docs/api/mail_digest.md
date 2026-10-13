@@ -122,7 +122,7 @@
 | `name` | 名称 | 同名列 | — |
 | `batch_no` | 批次 | `t_part_batch.batch_no`，渲染成 `　第 N 批`（**2026-10-16 新增**） | ✅ |
 | `quantity` | 数量 | `t_part.quantity` / `t_assembly.quantity`；**装配件行单位是「套」**，渲染成 `12 套`。批次子行渲批次自身件数、**不带「套」后缀** | — |
-| `customer_name` | 客户 | `LEFT JOIN t_customer.name`（软删客户退化为空串，**不**剔除该工单） | — |
+| `customer_name` | 客户 | `LEFT JOIN t_customer.name`，`ON` 里**刻意不加**软删闸门 ⇒ **软删客户名字照常带出**；只有客户行不存在（`customer_id` 悬空）才为空（取舍见 §8.1） | — |
 | `status` | 状态 | 工单行 = `t_part/t_assembly.status` 查表（§5）；批次子行 = `t_part_batch.status` 查表，`is_repairing = true` 时恒「返修中」 | — |
 | `location` | 位置 | 批次所在的 `t_part_batch.location` + 多态 holder 名（`t_shelf.code` / `t_worker.name` / `t_outsource_company.name`），文案见 §4.5。解析不出时 `—`（**2026-10-16 新增**） | ✅ |
 | `system_delivery_date` | 系统交期 | `date`，格式 `YYYY-MM-DD` | — |
@@ -131,10 +131,29 @@
 | `is_urgent` | 是否紧急 | 渲染为「是」/「否」 | — |
 | `order_no` | 订单号 | `varchar(30)`，可空 | — |
 
-**缺省 10 列** = 前 10 个（不含 `row_type` / `is_urgent` / `order_no`）。⚠️ 这条缺省集
-是**三份副本**，改一处必须同步另两处：`dto.rs::VisibleColumn::DEFAULT_SET`、迁移
-`migrations/20261016000001_001_mail_digest_default_columns.sql` 的列 DEFAULT 字面量、
-以及 `tests/mail_digest/config.rs` 的缺省断言。
+**缺省集** = `ALL` 中**除 `row_type` / `is_urgent` / `order_no` 之外的全部**。⚠️ 刻意
+**按名**描述而非「`ALL` 的前 N 个」：`DEFAULT_SET` 是显式列表、不依赖枚举顺序，往 `ALL`
+中段插一个新变体只会让「前 N 个」那句措辞变陈旧、不会改变缺省集本身。个数另有机器钉住
+（`tests/mail_digest/preview.rs` 的 `Some(10)`、`template.rs` 的 `ALL.len() == 13`），
+措辞不钉数字。
+
+⚠️ 这条缺省集是**四份副本**（2026-10-16 复核更正：原先写「三份」且第三份指错了对象），
+改一处必须同步其余三处：
+
+| # | 副本 | 同步方式 |
+|---|---|---|
+| ① | `dto.rs::VisibleColumn::DEFAULT_SET`（Rust 常量） | **真源** |
+| ② | 迁移 `migrations/20261016000001_001_mail_digest_default_columns.sql` 的列 DEFAULT 字面量 | 测试逐字对拍 ① |
+| ③ | `tests/mail_digest/main.rs::DEFAULT_COLUMNS`（fixture 的裸列表，不带 PG 数组花括号） | 测试逐字对拍 ① |
+| ④ | `tests/mail_digest/config.rs` 的缺省断言（`GET /config` 缺省响应的 `visible_columns`） | 自身断言对拍运行时缺省 |
+
+⇒ ②③ 由 `default_column_set_stays_in_sync_across_its_three_copies` 覆盖（它把 ② 从迁移
+文件里解析出来与 ①③ 当场比对；测试名里的「三条」指的就是这三份，**不含 ④**）；④ 不参与
+那次对拍，只由自己那条 `assert_eq!` 守「缺省响应 == ①」。**四条链最终都锚在 ①**。
+
+⚠️ **按「文件」数是 4 份、按「字面量出现次数」数是 5 处**：② 那一份在同一条迁移里出现
+**两次**（`SET DEFAULT` 一处 + 回填存量行的 `UPDATE` 一处）—— 将来若有人去改那条迁移
+（它 append-only、本不该被改），改一处等于只改了一半。
 
 ⚠️ **勾掉 `batch_no` / `location` 整列就没有了**：列白名单是**逐列**的，管理员勾掉
 `location` 时批次的位置信息在正文里没有任何出口。这是列白名单的固有行为，不是缺陷。
@@ -555,7 +574,7 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
 | 工单与系统交期 | `t_part` | 只读聚合（跨域） |
 | 装配件与系统交期 | `t_assembly` | 只读聚合（跨域） |
 | 已交量守卫 + **批次子行** | `t_part_batch` | 只读聚合（跨域）。⚠️ 2026-10-16 起**不再只是 `NOT EXISTS` 的存在性检查**，而是批次行的主表（`batch_no` / `quantity` / `status` / `is_repairing` / `location` / `current_holder_id` 六列） |
-| 客户名 | `t_customer` | `LEFT JOIN`，**刻意不加** `AND c.deleted_at IS NULL`（客户软删时该列退化为空串，但**不该**因此把工单从邮件里剔除） |
+| 客户名 | `t_customer` | `LEFT JOIN`，**刻意不加** `AND c.deleted_at IS NULL` ⇒ **软删客户的名字照常带出**。取舍是「客户名以 `id` 为准、不受软删影响」（闸门放 `ON` 里本来也只会清空名字、不会剔除工单行，所以「不该剔除工单」**不是**这里的理由）；本列为空只因**客户行不存在**（`customer_id` 悬空）。与 dashboard 域同款 |
 | **货架 `code`** | `t_shelf` | **2026-10-16 新增**。`LEFT JOIN` + `deleted_at IS NULL` 在 `ON` 里；两种货架档取的是 **`code` 不是 `name`** |
 | **工人 `name`** | `t_worker` | **2026-10-16 新增**。同上（`location = 'WORKER'` 时参与匹配） |
 | **外协公司 `name`** | `t_outsource_company` | **2026-10-16 新增**。同上（`location = 'OUTSOURCE_COMPANY'` 时参与匹配） |

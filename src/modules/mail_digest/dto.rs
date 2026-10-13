@@ -231,8 +231,14 @@ impl VisibleColumn {
         VisibleColumn::OrderNo,
     ];
 
-    /// 缺省配置使用的 10 列（= `ALL` 的**前 10 个**，末三位
-    /// `row_type` / `is_urgent` / `order_no` 不在缺省集里）。
+    /// 缺省配置使用的列（= `ALL` 中**除 `row_type` / `is_urgent` / `order_no` 之外的
+    /// 全部**）。
+    ///
+    /// ⚠️ **刻意按名描述、不写「`ALL` 的前 N 个」**：`DEFAULT_SET` 是显式列表、不依赖枚举
+    /// 顺序，往 `ALL` 中段插一个新变体只会让那种措辞变陈旧、不会改变缺省集本身。个数另有
+    /// 机器钉住（`tests/mail_digest/preview.rs` 的 `Some(10)`、`template.rs` 的
+    /// `ALL.len() == 13`），完整四份副本清单与各自同步方式见
+    /// `docs/api/mail_digest.md` §2.3。
     ///
     /// ⚠️ **改这一处必须新开一条迁移**同时改列 DEFAULT 与**回填存量行**
     /// （2026-10-16 已按此办理，迁移见
