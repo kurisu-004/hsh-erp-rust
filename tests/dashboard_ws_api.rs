@@ -35,13 +35,17 @@
 //!    17. ws_e2e_access_token_expiry_sends_4001_with_access_token_expired
 //!                                                  — access JWT 过期（session 仍活）→
 //!                                                    4001（reason `access token expired`）
+//!    18. ws_e2e_scan_banner_carries_six_display_fields_on_pick_up
+//!                                                  — `SCAN_BANNER` 业务事件 banner：
+//!                                                    6 个展示字段齐全 + 两个可空字段
+//!                                                    的 JSON `null` 形态（2026-10-13）
 //!
 //!   HTTP 端点：
-//!    18. http_snapshot_unauthenticated_returns_401
-//!    19. http_snapshot_happy_path_returns_full_shape
-//!    20-23. `GET /dashboard/upcoming-delivery`：缺省 days=14 / days=7 / basis 切换 /
+//!    19. http_snapshot_unauthenticated_returns_401
+//!    20. http_snapshot_happy_path_returns_full_shape
+//!    21-24. `GET /dashboard/upcoming-delivery`：缺省 days=14 / days=7 / basis 切换 /
 //!         basis 非法值 → 400 + today 字段
-//!    24-26. `GET /dashboard/delivery-orders`：date / statuses 的 40001 契约 + 正常返回
+//!    25-27. `GET /dashboard/delivery-orders`：date / statuses 的 40001 契约 + 正常返回
 //!
 //! （`statuses` 的限长闸门 `STATUSES_MAX_ITEMS` / `STATUSES_MAX_RAW_LEN` 由 lib 单测
 //!   `handler::tests::statuses_filter_*` 覆盖，不进本 binary。）
@@ -1282,6 +1286,299 @@ async fn ws_e2e_server_shutdown_sends_1012() {
         reason, "server restart",
         "1012 Close 帧的 reason 应为 server restart"
     );
+}
+
+// ===========================================================================
+// 2026-10-13 新增：`SCAN_BANNER`（业务事件 banner）真 socket E2E
+// ===========================================================================
+//
+// 覆盖：
+//   1. ws_e2e_scan_banner_carries_six_display_fields_on_pick_up
+//      — 走 `POST /prod/scan/batches/{id}/pick-up`：6 个展示字段齐全，且
+//        `system_delivery_date` 的 JSON 形状是 `"YYYY-MM-DD"` 字符串
+//   2. （同一用例的第二次领取）`serial_no` / `system_delivery_date` 均为 NULL 时
+//      两键都在位且值是 JSON `null`（不是缺键、不是空串），`drawing_no` 仍有值
+//
+// 为什么要真 socket：banner 是**纯展示**事件，它不改变任何看板数据的有效性，
+// 消费方只把它渲染成一行文案。所以本用例守的不是「数据有没有刷新」，而是
+// 「payload 的键集合与 JSON 形状」—— 前端的 Zod schema 是照这份 JSON 写的。
+//
+// ⚠️ 帧结构：pick-up 一次会连发两条业务事件（`PART_PICKED_UP` → `SCAN_BANNER`），
+// 故收集帧时按 `event_type` 过滤而不是按到达顺序取第 N 条。
+
+/// 插一个工种（`t_work_type`），返回其 id。`max_held_batches` 必给 —— pick-up 的
+/// 容量守卫读它，NULL 时端点返 20904 `BIZ_WORK_TYPE_MAX_HELD_NOT_SET`。
+async fn insert_banner_work_type(pool: &PgPool, code: &str, max_held_batches: i32) -> i64 {
+    let id = shared_test_snowflake().next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_work_type (id, code, name, sort_order, max_held_batches, version, \
+         created_at, updated_at) VALUES ($1, $2, $2, 0, $3, 0, $4, $4)",
+    )
+    .bind(id)
+    .bind(code)
+    .bind(max_held_batches)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_work_type");
+    id
+}
+
+/// 插一个 active 且已绑工种的工人，返回其 id。`name` 直接进 banner 文案，
+/// 故调用方给可辨识的名字。
+async fn insert_banner_worker(
+    pool: &PgPool,
+    badge_code: &str,
+    name: &str,
+    work_type_id: i64,
+) -> i64 {
+    let id = shared_test_snowflake().next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_worker (id, badge_code, name, is_active, work_type_id, version, \
+         created_at, updated_at) VALUES ($1, $2, $3, true, $4, 0, $5, $5)",
+    )
+    .bind(id)
+    .bind(badge_code)
+    .bind(name)
+    .bind(work_type_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_worker");
+    id
+}
+
+/// 插一条 `status='PENDING'` 的批次，返回其 id。
+///
+/// PENDING 起点是 pick-up 两个起点里依赖最少的那个：`location` 可为 NULL、无需
+/// 生产架，`shelf_id` 不传即完全不校验（见 `PickUpRequest::shelf_id` 的 doc）。
+async fn insert_pending_batch(pool: &PgPool, part_id: i64, quantity: i32) -> i64 {
+    let id = shared_test_snowflake().next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, version, \
+         created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, 1, $3, 'PENDING', 0, $4, NULL, $4, NULL)",
+    )
+    .bind(id)
+    .bind(part_id)
+    .bind(quantity)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert pending t_part_batch");
+    id
+}
+
+/// 插一条带 `serial_no` / `system_delivery_date` 的工单，返回其 id。
+///
+/// 与本文件既有的 `insert_part` 只差这两列 —— banner 的两个可空字段正是它们，
+/// 既有 helper 不填，无法覆盖「有值」与「NULL」两条路径。
+async fn insert_banner_part(
+    pool: &PgPool,
+    customer_id: i64,
+    serial_no: Option<&str>,
+    drawing_no: &str,
+    system_delivery_date: Option<NaiveDate>,
+) -> i64 {
+    let id = shared_test_snowflake().next_id();
+    let planned = system_delivery_date.unwrap_or_else(|| now_naive().date());
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_part (id, serial_no, name, drawing_no, applicant_name, customer_id, \
+         request_date, planned_delivery_date, system_delivery_date, status, version, \
+         created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, 'p-banner', $3, 'tester', $4, $5, $5, $6, 'PENDING', 0, $7, NULL, $7, NULL)",
+    )
+    .bind(id)
+    .bind(serial_no)
+    .bind(drawing_no)
+    .bind(customer_id)
+    .bind(planned)
+    .bind(system_delivery_date)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert banner t_part");
+    id
+}
+
+/// 轮询读到 `event_type == kind` 的那条业务事件帧，返回其 `data`。
+///
+/// 跳过 snapshot 首帧 / Ping / Pong / 其它 kind 的事件帧。报错文案带上已收到的
+/// `event_type` 列表，避免「服务端压根没发」与「发了但 payload 不对」看起来一样。
+async fn wait_for_banner(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    wait: Duration,
+) -> serde_json::Value {
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut seen: Vec<String> = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        let Ok(Some(frame)) = tokio::time::timeout_at(deadline, ws.next()).await else {
+            break;
+        };
+        let Ok(frame) = frame else {
+            break;
+        };
+        let WsMessage::Text(t) = frame else {
+            continue;
+        };
+        let v: serde_json::Value = match serde_json::from_str(&t) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if v["type"] != "event" {
+            continue;
+        }
+        let kind = v["event_type"].as_str().unwrap_or("?").to_string();
+        seen.push(kind.clone());
+        if kind == "SCAN_BANNER" {
+            return v["data"].clone();
+        }
+    }
+    panic!("{wait:?} 内没读到 SCAN_BANNER 帧；期间收到的 event_type = {seen:?}");
+}
+
+#[tokio::test]
+async fn ws_e2e_scan_banner_carries_six_display_fields_on_pick_up() {
+    let (base, state) = spawn_ws_server().await;
+    let token = mint_test_token(&state, DashboardWsFixture::WS_USER_ID).await;
+    let url = format!("{base}/dashboard?token={token}");
+
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("WS upgrade must succeed for valid token");
+    // 收首帧 snapshot（顺带确保 handler 已进主循环、订阅已建立）
+    let _ = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("snapshot 超时")
+        .expect("ws stream closed")
+        .expect("ws frame err");
+
+    let pool = state.pool.clone();
+    // `t_customer.serial_prefix` 是 `varchar(1)` 且根客户有唯一索引 ⇒ 前缀固定单字符
+    let cust_id = insert_customer(&pool, "banner_cust", "B").await;
+    let work_type_id = insert_banner_work_type(&pool, "BN-WT", 5).await;
+    let worker_id = insert_banner_worker(&pool, "BN-001", "张三", work_type_id).await;
+
+    let app = test_app(state.clone());
+    // ── 第 1 次领取：serial_no 与系统交期都有值 ──────────────────────────
+    let part_id = insert_banner_part(
+        &pool,
+        cust_id,
+        Some("F1234"),
+        "DWG-BN-1",
+        Some(NaiveDate::from_ymd_opt(2026, 10, 27).unwrap()),
+    )
+    .await;
+    let batch_id = insert_pending_batch(&pool, part_id, 20).await;
+    let (status, envelope) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/prod/scan/batches/{batch_id}/pick-up"),
+            Some(serde_json::json!({ "worker_id": worker_id.to_string(), "version": 0 })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::OK,
+        "领取应成功；envelope={envelope}"
+    );
+
+    let data = wait_for_banner(&mut ws, Duration::from_secs(10)).await;
+    let keys: Vec<&String> = data.as_object().unwrap().keys().collect();
+    assert_eq!(
+        keys.len(),
+        6,
+        "banner payload 应恰好 6 个键（前端 Zod 按此写严格 schema）；实际 = {keys:?}"
+    );
+    for k in [
+        "action",
+        "worker_name",
+        "serial_no",
+        "drawing_no",
+        "quantity",
+        "system_delivery_date",
+    ] {
+        assert!(
+            data.get(k).is_some(),
+            "banner payload 缺键 `{k}`；实际 = {data}"
+        );
+    }
+    assert_eq!(data["action"], "PICKED_UP", "领取动作字面量应为 PICKED_UP");
+    assert_eq!(
+        data["worker_name"], "张三",
+        "worker_name 应取 t_worker.name"
+    );
+    assert_eq!(
+        data["serial_no"], "F1234",
+        "serial_no 应取 t_part.serial_no"
+    );
+    assert_eq!(
+        data["drawing_no"], "DWG-BN-1",
+        "drawing_no 应取 t_part.drawing_no"
+    );
+    assert_eq!(data["quantity"], 20, "整批领取的数量 = 批次数量");
+    assert_eq!(
+        data["system_delivery_date"], "2026-10-27",
+        "系统交期的 JSON 形状应为 \"YYYY-MM-DD\" 字符串（前端照此写 schema）"
+    );
+
+    // ── 第 2 次领取：serial_no 与系统交期都为 NULL ───────────────────────
+    // 钉住「两键都在位、值是 JSON null」—— 缺键与空串都会让前端渲染出 1970 之类的怪值。
+    let part_id2 = insert_banner_part(&pool, cust_id, None, "DWG-BN-2", None).await;
+    let batch_id2 = insert_pending_batch(&pool, part_id2, 5).await;
+    let (status, envelope) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/scan/batches/{batch_id2}/pick-up"),
+            Some(serde_json::json!({ "worker_id": worker_id.to_string(), "version": 0 })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::OK,
+        "领取应成功；envelope={envelope}"
+    );
+
+    let data2 = wait_for_banner(&mut ws, Duration::from_secs(10)).await;
+    assert_eq!(
+        data2["serial_no"],
+        serde_json::Value::Null,
+        "无序列号时 serial_no 应为 JSON null"
+    );
+    assert!(
+        data2.as_object().unwrap().contains_key("serial_no"),
+        "serial_no 键必须在位（值 null），不能整个省略"
+    );
+    assert_eq!(
+        data2["system_delivery_date"],
+        serde_json::Value::Null,
+        "无系统交期时 system_delivery_date 应为 JSON null"
+    );
+    assert!(
+        data2
+            .as_object()
+            .unwrap()
+            .contains_key("system_delivery_date"),
+        "system_delivery_date 键必须在位（值 null），不能整个省略"
+    );
+    assert_eq!(
+        data2["drawing_no"], "DWG-BN-2",
+        "serial_no 为 null 时 drawing_no 必须有值（前端兜底显示位）"
+    );
+
+    let _ = ws.close(None).await;
 }
 
 // ===========================================================================

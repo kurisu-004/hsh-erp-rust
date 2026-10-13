@@ -976,6 +976,8 @@ max_held_batches`（`NULL` = 未配置，不是「不限」）。
 | `POST /scan/take-over` | `PART_TRANSFERRED` | **无条件**（2026-10-15 S2 新事件，见下） |
 | `POST /scan/take-over` | `ASSEMBLY_UPDATED` | 父装配件真变了（`sync_from_batch_change` 返回 `Changed`） |
 | `POST /scan/outsource-receive` | `PART_PICKED_UP` | **无条件**（2026-10-15 S3；payload 与 `pick-up` 逐字同形，见下） |
+| `POST /scan/worker-scan` | `SCAN_BANNER` | **无条件**（2026-10-13；`action` = `"RETURNED"` / `"INSPECTED"`，按响应的 `scan_out.event_type` 派生，见下） |
+| `POST /scan/batches/{id}/pick-up` | `SCAN_BANNER` | **无条件**（2026-10-13；`action` = `"PICKED_UP"`，见下） |
 
 - **事件名一字不改** —— dashboard 与队列页都在监听，改名会静默断链。
 - **`PART_TRANSFERRED`（2026-10-15 S2 新增，本域第 7 条端点 `POST /scan/take-over` 的唯一产出点）**：
@@ -996,6 +998,23 @@ max_held_batches`（`NULL` = 未配置，不是「不限」）。
   （伪造 `shipment_id` / `to_kind` 会破坏 outsource 域消费方契约）。「收回」对看板的
   效果与「批次被工人领走」等价（`IN_PROCESS + WORKER`），故走 `PART_PICKED_UP`
   这条既有通路。
+- ⚠️ **`SCAN_BANNER` 是本域唯一带展示字段的事件（2026-10-13 新增），payload
+  形状与 `PART_PICKED_UP` 无关** —— 它是 `ScanBannerItem` 的全量序列化（6 个键：
+  `action` / `worker_name` / `serial_no` / `drawing_no` / `quantity` /
+  `system_delivery_date`），逐字段表见
+  [`dashboard.md` §7](dashboard.md#7-与-ws-的关系)。两者不共享任何键名，别把
+  `PART_PICKED_UP` 的四键习惯套过来。本域其它事件的「只带 id」原则（见上
+  `PART_TRANSFERRED` 那条）对 banner **刻意不适用**：banner 的消费方只把这一帧
+  渲染成一行文案，不刷新任何数据，因此**它不进前端失效白名单**。
+  - 产出点只有 `worker-scan` 与 `pick-up` 两条路径；⚠️ `POST /scan/outsource-receive`
+    **刻意不发** banner（外协收回不接入 banner 口径），它照旧发 `PART_PICKED_UP`。
+  - `worker-scan` 的 `action` 按**响应**的 `scan_out.event_type` 派生（不是请求的
+    `event_type`），与 §4.1 那条纪律同源：`WORKER_SCAN_RETURNED → "RETURNED"` /
+    `WORKER_SCAN_INSPECTED → "INSPECTED"`。
+  - `quantity` 取 `scan_out.operated_quantity` / `outcome.picked_quantity`（都是
+    **本次实际处理量**，整批 / 部分数量都对）。⚠️ 该 VO 字段是
+    `#[serde(skip)]` 的内部管道字段 —— 它加在 `WorkerScanCoreOut` 上**不进 HTTP
+    响应体、也不进 `WORKER_SCAN_*` 的 payload**，只供 handler 组 banner。
 - 本域两条拆批写路径（worker-scan 部分放回 / 部分送检、pick-up 部分领取）共用
   `PART_BATCH_SPLIT`，payload 字段名**逐字同形**：
   `{ part_id, new_batch_id, source_batch_id, quantity }`（雪花 id 为 JSON string，
@@ -1673,3 +1692,18 @@ LEFT JOIN 一次），该写法**假定** holder id 在三表 PK 空间里互不
 `PART_BATCH_SPLIT` / `PART_TRANSFERRED`（上面两条）同一处境：事件名 / payload 键名被
 改错不会让任何测试变红。⚠️ 这条广播的 payload 与 `pick-up` 那条**逐字同形**
 （同一事件名 + 同一组 4 个键），改任一处时必须**两处同时改**。
+
+---
+
+**`SCAN_BANNER` 广播的覆盖形态（2026-10-13）**
+
+与上面三条**不同**：本域的 `SCAN_BANNER` 有**端到端断言**，守的是
+`tests/dashboard_ws_api.rs::ws_e2e_scan_banner_carries_six_display_fields_on_pick_up`
+—— 起真 WS 服务 + 真 tungstenite socket → 调 `POST /scan/batches/{id}/pick-up` →
+读到 `event_type == "SCAN_BANNER"` 帧，逐字段断言 6 个键齐全、日期形状是
+`"YYYY-MM-DD"`、两个可空字段在无值时是 JSON `null`。另有
+`prod::scan::vo::transition` 的 lib 单测守序列化形状与 `operated_quantity` 不进 JSON。
+
+⚠️ **覆盖面只到 `pick-up` 这条产出点**：`worker-scan` 那条（`action` 按响应
+`scan_out.event_type` 分派生 `RETURNED` / `INSPECTED`）目前**无端到端断言**，
+改它时必须手动联调。

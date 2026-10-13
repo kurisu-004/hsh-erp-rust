@@ -13,6 +13,12 @@
 //! commit 之后（对齐 Python 延迟广播模式）。事件名逐字不变 —— dashboard 与队列
 //! 页都在监听，改名会静默断链。唯一新增的是 `PART_BATCH_SPLIT`：2026-10-11
 //! worker-scan 支持部分数量后与 pick-up 共用它，payload 字段名逐字同形。
+//!
+//! **2026-10-13 新增 `SCAN_BANNER`**：业务事件 banner 的专属展示事件，由本文件
+//! 两个端点（`worker-scan` / `pick-up`）在 commit 之后产出，构造见
+//! [`banner::broadcast_scan_banner`]。⚠️ **外协收回端点
+//! （`POST /scan/outsource-receive`）刻意不产它** —— 它发的是
+//! `PART_PICKED_UP`。该事件**不进**前端失效白名单（纯展示、消费方只渲染文案）。
 
 use std::sync::Arc;
 
@@ -28,6 +34,7 @@ use crate::modules::prod::queue::service::QueueService;
 // 共用同一个停机原因常量（见本文件 `worker_scan` 处的「改一同步二」注释）。
 use crate::modules::prod::queue::vo::worker as queue_vo;
 use crate::modules::prod::scan::dto::{PickUpRequest, WorkerScanRequest};
+use crate::modules::prod::scan::handler::banner::broadcast_scan_banner;
 use crate::modules::prod::scan::service::ScanService;
 use crate::modules::prod::scan::vo::WorkerScanOut;
 use crate::shared::error::AppError;
@@ -163,6 +170,44 @@ pub async fn worker_scan(
             }),
         );
     }
+    // 2026-10-13：`SCAN_BANNER`（业务事件 banner 的专属展示事件），action 按
+    // **响应**的 `scan_out.event_type` 派生 —— 沿用本文件既有的那条纪律
+    // （`WorkerScanCoreOut::event_type` 的字段 doc 与上面 `worker_scan` 的
+    // 「按响应而非请求广播」注释都写明了）：链尾自动送检会让「请求 `RETURNED` /
+    // 响应 `WORKER_SCAN_INSPECTED`」成立，按请求派生就会把自动送检说成「放回」。
+    // 数量取 `scan_out.operated_quantity`（本次实际处理量，整批 / 拆批都对）。
+    match scan_out.event_type.as_str() {
+        "WORKER_SCAN_RETURNED" => {
+            broadcast_scan_banner(
+                &state,
+                "RETURNED",
+                scan_out.worker_id,
+                scan_out.part_id,
+                scan_out.operated_quantity,
+            )
+            .await;
+        }
+        "WORKER_SCAN_INSPECTED" => {
+            broadcast_scan_banner(
+                &state,
+                "INSPECTED",
+                scan_out.worker_id,
+                scan_out.part_id,
+                scan_out.operated_quantity,
+            )
+            .await;
+        }
+        other => {
+            // 不可达：`scan_out.event_type` 只由上面两个臂赋值（见
+            // `service/worker_scan.rs::worker_scan_event`）。留这条臂是为了新增
+            // 事件类型时**当场可见**，而不是静默少发一条 banner。
+            tracing::warn!(
+                event_type = other,
+                part_id = scan_out.part_id,
+                "SCAN_BANNER：未知 event_type，跳过本次 banner 广播"
+            );
+        }
+    }
     state.ws_hub.broadcast(WsEvent::DashboardEvent {
         kind: scan_out.event_type.clone(),
         payload: serde_json::to_value(&scan_out).unwrap_or_default(),
@@ -254,5 +299,16 @@ pub async fn pick_up(
             "quantity": outcome.picked_quantity,
         }),
     );
+    // 2026-10-13：`SCAN_BANNER`（业务事件 banner 的展示事件）。
+    // ⚠️ **外协收回（`outsource-receive`）刻意不发本事件** —— 它已经发了
+    // `PART_PICKED_UP`，banner 侧只接工人的三个动作（领取 / 放回 / 送检）。
+    broadcast_scan_banner(
+        &state,
+        "PICKED_UP",
+        worker_id,
+        outcome.part.id,
+        outcome.picked_quantity,
+    )
+    .await;
     Ok(Json(R::ok(outcome.part)))
 }
