@@ -484,7 +484,13 @@ JSON **形状**逐字不变（键集一字未动）；`scan.batch_id` 的**取�
 「部分数量有没有拆批」，供 handler 在 commit 之后补发 `PART_BATCH_SPLIT`；
 `operated_quantity`（**2026-10-13 新增**）承载本次实际处理量，**只供 handler 在 commit
 之后组 `SCAN_BANNER`**（banner 的 `quantity`，见 §4），别处零消费。⚠️ **四个都不出现在
-JSON 里** —— 「`scan` 段恒为那 6 个键」是本端点既有契约，加内部管道字段不需要改它。
+JSON 里** —— 「`WorkerScanCoreOut` 恒为那 5 个 JSON 键（`worker_id` / `part_id` /
+`batch_id` / `event_type` / `synced_assembly_id`）、`WorkerScanOut` 的 `scan` + `refill`
+两段逐字段合计 6 个」是本端点既有契约，加内部管道字段不需要改它。
+⚠️ **两个口径别混**：6 说的是整份响应（`scan` 段 5 个 + `refill` 段 1 个），
+**`scan` 段自身是 5 个 JSON 键**（lib 单测
+`prod::scan::vo::transition::tests::worker_scan_core_out_keeps_existing_json_keys`
+逐字断言这 5 个键）。
 
 ### 2.6 `PickUpRequest`（端点 5）
 
@@ -1023,6 +1029,14 @@ max_held_batches`（`NULL` = 未配置，不是「不限」）。
   - ⚠️ **帧到达序无语义、消费方不许依赖**：两个产出点都把 banner 排在本次请求的
     **最后一条广播**，但那只是一致性而非契约 —— banner 不触发任何 invalidate，
     数据刷新仍由同一次请求的主事件负责。
+  - ⚠️ **`worker-scan` 的主事件帧序在 2026-10-13 一并调整过（计划外改动，此处
+    登记）**：`WORKER_SCAN_RETURNED` / `WORKER_SCAN_INSPECTED` 原先排在 refill
+    两条帧（`WORKER_POOL_REFILL_DONE` / `WORKER_POOL_EMPTY`）**之前**，加 banner
+    时被一并挪到了**之后**（`PART_BATCH_SPLIT` / `ASSEMBLY_UPDATED` 位置未动）。
+    影响面已核实为零：**帧到达序无语义**，前端把 `WORKER_SCAN_*` 与 `WORKER_POOL_*`
+    收进**同一个** 500ms / maxWait 1500ms 防抖闭包（`useDashboardInvalidation.ts`），
+    顺序不改变失效结果；消费方也没有按事件名分先后处理的逻辑。消费方**不要**依赖
+    「主事件先到 / refill 先到」这一顺序。
   - `quantity` 取 `scan_out.operated_quantity` / `outcome.picked_quantity`（都是
     **本次实际处理量**，整批 / 部分数量都对）。⚠️ 该 VO 字段是
     `#[serde(skip)]` 的内部管道字段 —— 它加在 `WorkerScanCoreOut` 上**不进 HTTP

@@ -92,6 +92,15 @@ fn ws_broadcast_assembly_updated(state: &AppState, assembly_id: i64) {
 ///     "POOL_EMPTY"`，即真的池空。工人已拿满时**不广播**，见下）。
 ///   - `SCAN_BANNER`（**排在这几条之后**，即本请求的最后一条；到达序无语义）
 ///
+/// ⚠️ **`worker_scan` 的帧序在 2026-10-13 调整过（计划外改动，此处登记）**：
+/// `WORKER_SCAN_RETURNED` / `WORKER_SCAN_INSPECTED` 这条**主事件帧**原先排在
+/// refill 两条帧（`WORKER_POOL_REFILL_DONE` / `WORKER_POOL_EMPTY`）**之前**，
+/// 2026-10-13 加 banner 时被一并挪到了**之后**（`PART_BATCH_SPLIT` /
+/// `ASSEMBLY_UPDATED` 仍在 refill 之前，位置未动）。⚠️ **帧的到达序无语义、
+/// 消费方不许依赖**：前端把 `WORKER_SCAN_*` 与 `WORKER_POOL_*` 收进**同一个**
+/// 500ms / maxWait 1500ms 防抖闭包，顺序不改变失效结果；本仓也没有断言旧序的测试。
+/// 登记在此，是为了让后人知道现在这个顺序**不是**「主事件在前」的设计保证。
+///
 /// ⚠️ **`refill.stopped_reason` 的取值三选一（2026-10-15 起）**：
 /// `"POOL_EMPTY"` / `"WORKER_FULL"` / **`"AUTO_LIMIT_REACHED"`**（工种自动
 /// 上限 `auto_allocate_limit` 触顶、工人仍低于 `max_held_batches` 时走手动
@@ -186,7 +195,7 @@ pub async fn worker_scan(
                 "worker_id": scan_out.worker_id.to_string(),
                 "shelf_id": serde_json::Value::Null,
                 "pool_empty": true,
-                // 2026-10-10：`shelf_id` 键删除（refill 已无架锚，worker-scan 也不收它）。
+                // 2026-10-10：`shelf_id` 键删除（refill 已无架锚，worker-scan 也不再收它）。
                 // WS payload 与 HTTP 响应的 `refill.shelf_id` 同步为 `null`。
                 // 2026-10-14：补 `stopped_reason` 键（字符串）—— 让消费方能确认这条事件
                 // 确实来自「池空」而不是「工人已拿满」。走这条分支时该字段恒为
