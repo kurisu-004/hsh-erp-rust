@@ -86,8 +86,9 @@ pub struct ScanAssemblyOut {
     /// 「第 2 层到叶子」的 `" / "` 路径（**不含**根；本节点即根时 = 根自己的名字）。
     ///
     /// 2026-10-17 新增，数据源 `shared::customer::paths_of`（旧形只有
-    /// `customer_name` 一段，深树上拼不出完整路径）。客户已软删 / 链成环时取不到
-    /// ⇒ **空串**（必填字段，与全仓 `customer_path` 口径一致）。
+    /// `customer_name` 一段，深树上拼不出完整路径）。**终点行不存在 / 已软删**时取不到
+    /// ⇒ **空串**（必填字段，与全仓 `customer_path` 口径一致）；成环 / 超深度时 map 里
+    /// 仍有该项，给出的是**截断路径**。
     pub customer_path: String,
 }
 
@@ -202,7 +203,8 @@ pub struct InspectionQueueItemOut {
     /// `root_name` 派生，与 part / assembly / outsource 各域同口径。
     pub l1_customer_name: Option<String>,
     /// 「第 2 层到叶子」的 `" / "` 路径（**不含**根）。2026-10-17 新增，
-    /// 缺失（客户软删 / 链成环）时落**空串**而非 `null`（必填字段）。
+    /// 缺失（**终点行不存在 / 已软删**）时落**空串**而非 `null`（必填字段）。
+    /// ⚠️ 成环 / 超深度时 `paths_of` **仍产出**该项（**截断路径**），不是空串。
     pub customer_path: String,
 }
 

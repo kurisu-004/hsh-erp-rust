@@ -41,8 +41,9 @@ pub struct AssemblyOut {
     /// 2026-10-17 新增。上一轮只加在 [`AssemblyListItem`] 上，理由是
     /// 「`render_assembly_out` 拿不到连接 ⇒ 加过去只能恒空串」—— 该理由只对**装配
     /// 函数**成立，六个调用点（详情 / 建单回读 / 更新 / 取消 / start / force-complete）
-    /// 都持有 repo。本轮由 `service::assembly_out_with_path` 统一补，查不到（客户已软删
-    /// / `parent_id` 链成环）时落**空串**（必填字段，与全仓 `customer_path` 一致）。
+    /// 都持有 repo。本轮由 `service::assembly_out_with_path` 统一补，查不到（**终点行不存在 /
+    /// 已软删**）时落**空串**（必填字段，与全仓 `customer_path` 一致）。⚠️ 「查不到」**不等于**
+    /// 「链成环」：成环 / 超深度时 `paths_of` 仍有该项，只是给出截断路径。
     ///
     /// ⚠️ **键名在列表端点不变**：`AssemblyListItem` 用 `#[serde(flatten)]` 平铺本
     /// 结构，旧的「列表项自带一个 `customer_path`」已删（否则 serde 会输出**两个同名

@@ -112,8 +112,10 @@ impl PartDetailOut {
     /// （2026-10-17 新增）：旧签名收 `customer_name` / `l1_customer_name` 两个独立
     /// 形参，是「各调用点自己去查一遍客户」的根源（4 个调用点各写一遍两层假设）。
     /// 改由调用方交出 [`crate::shared::customer::paths_of`] 的产物后，本函数是全仓
-    /// 唯一的「客户 id → 三个名字」转换点。`None` = 客户行解析不出（已软删 / 成环），
-    /// 三个字段同时退成 `None` / 空串。
+    /// 唯一的「客户 id → 三个名字」转换点。`None` = **终点行不存在 / 已软删**（`paths_of`
+    /// 的锚点带 `deleted_at IS NULL`），三个字段同时退成 `None` / 空串。
+    /// ⚠️ `None` **不**表示「链成环」：成环 / 超 `MAX_CUSTOMER_DEPTH` 时 map 里**仍有**
+    /// 该项，只是 `path` 是**截断路径**、`root_name` 是断链处那个祖先。
     pub fn from_with_customer_extra(
         part: TPart,
         current_batch_id: Option<i64>,

@@ -700,8 +700,8 @@ pub(super) fn map_create_error(e: sqlx::Error) -> AppError {
 ///
 /// 口径：`(customer_name, l1_customer_name, customer_path)`，
 /// `l1_customer_name` 恒为**根**名（不是直接父），`customer_path` 是「第 2 层到
-/// 叶子用 ` / ` 拼接、不含根」。map 里没有该 id（客户已软删 / 链成环）⇒ 前两个
-/// `None`、第三个空串。
+/// 叶子用 ` / ` 拼接、不含根」。map 里没有该 id（**终点行不存在 / 已软删**）⇒ 前两个
+/// `None`、第三个空串；⚠️ 成环 / 超深度时 map 里**仍有**该项（`path` 为**截断路径**）。
 pub(crate) fn customer_names_of(
     paths: &std::collections::HashMap<i64, crate::shared::customer::CustomerPath>,
     customer_id: i64,

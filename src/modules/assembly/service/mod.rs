@@ -101,7 +101,10 @@ pub(crate) fn render_assembly_out(asm: TAssembly, customer_path: String) -> Asse
 /// `render_assembly_out` 拿不到连接」—— 那是**装配函数**拿不到，不是**调用点**
 /// 拿不到：六个调用点全部持有 repo（`AssemblyRepoTrait::customer_paths_by_ids`
 /// 委托 `shared::customer::paths_of`）。故本轮补齐，**不再有「恒空串」分支**：
-/// 客户已软删 / `parent_id` 链成环时 `paths_of` 返空 map ⇒ 落**空串**（必填字段口径）。
+/// 客户**终点行不存在 / 已软删**时 `paths_of` 返空 map ⇒ 落**空串**（必填字段口径）。
+/// ⚠️ 注意这**不是**「链成环 ⇒ 空串」：`paths_of` 的锚点带 `deleted_at IS NULL`，
+/// 而 `GROUP BY target_id` 对每个未软删终点行恒出一组，故成环 / 超 `MAX_CUSTOMER_DEPTH`
+/// 时 map 里**仍有**该项，只是 `path` 是**截断路径**（`root_name` 是断链处那个祖先）。
 ///
 /// `force_complete_inner` 收的是 `&mut PgConnection` 而不是泛型 `R`，但
 /// `AssemblyRepoTrait` 直接实现于 `&mut PgConnection`，故传 `&mut *conn` 即可。

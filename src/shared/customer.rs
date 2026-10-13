@@ -271,8 +271,10 @@ pub async fn paths_of(
 /// 「还有 2 层」更可操作。
 ///
 /// ⚠️ **不分「客户不存在」**：本函数只判 `has_children`，而 `has_children` 对不存在的
-/// 客户也返 `false`（等于「无子节点」）。调用方必须**各自先做存在性闸门**（part /
-/// assembly / outsource 三处都是），否则会把「客户没录进来」伪装成「挂到了合法叶子」。
+/// 客户也返 `false`（等于「无子节点」）⇒ 走到这一步直接 `Ok` 早退。调用方必须**各自
+/// 先做存在性闸门**（part / assembly / outsource 三处都是），否则会把「客户没录进来」
+/// 伪装成「挂到了合法叶子」。反之，只要 `has_children` 返 `true`，后面的
+/// [`subtree_ids`] 会顺带把存在性闸住（锚点行不存在 / 已软删 → `20102`）。
 ///
 /// 2026-10-17 由 part / assembly / outsource 三份域内副本收敛到本函数：三份的判据、
 /// 错误码、消息结构本已逐字相同，只是各写一遍，改口径必然漏改一处。
@@ -289,10 +291,17 @@ pub async fn require_leaf_customer(
         .len()
         .saturating_sub(1);
     let paths = paths_of(&mut *conn, &[customer_id]).await?;
-    // 兜底分支可达但罕见：`paths_of` 的锚点只收**未软删**行，而本函数只判
-    // `has_children`（不判本行自身的 `deleted_at`）⇒ 脏数据（节点自己已软删、下面还挂
-    // 着活子节点）会让 map 里没有该 id。此时回落成「customer {id}」而不是空串：空串
-    // 拼进 message 读起来像漏了值。
+    // ⚠️ 下面的 `unwrap_or_else` **当前恒不可达**，是防御分支而**不是**「罕见分支」：
+    // 上一步的 `subtree_ids` 锚点是 `WHERE id = $1 AND deleted_at IS NULL`，锚点查不到
+    // 行就当场返 `20102`；`paths_of` 的锚点则是**同一谓词**
+    // （`c.id = ANY($1) AND c.deleted_at IS NULL`）⇒ 凡是能走到这一行的，
+    // `paths` 必含 `customer_id`。（本函数**只**判 `has_children`，所以「客户不存在」
+    // 这个洞在 `has_children` 那一步就早退了，进不到这里。）
+    //
+    // **为什么不改成 `.expect()`**：这条不变式是「两条 SQL 的锚点谓词恰好一致」这个
+    // **数据层事实**，改任一条都不会编译报错。把它做成 panic，等于让一次查询口径调整
+    // 变成线上 500；保留回落分支 ⇒ 口径若将来真被改紧，最坏只是错误消息里少一段路径，
+    // 仍可读（回落成「customer {id}」而不是空串：空串拼进 message 读起来像漏了值）。
     let label = paths
         .get(&customer_id)
         .map(|p| p.path.clone())

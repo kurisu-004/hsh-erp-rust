@@ -253,7 +253,9 @@ router 工厂始终是 **4 个**（`company_router` / `quote_router` / `shipment
 | `held_count` | number | **服务层内存分组行数**（`== held_batches.len()`，见 §4.1） |
 | `held_batches[]` | array | SQL 3（**无公司谓词**，见下） |
 
-`items[]` 元素（`OutsourceQueueCandidate`，26 字段）：取自 `SENDABLE_PROJECTION_FULL` 的全投影，字段与后端 SQL 列一一对应 —— `version`（`pb.version`，**OCC 锚**）、`send_mode`、`batch_id` / `part_id`（string）、`batch_no`、`quantity`（`pb.quantity`，行 = 批次故与旧 VO 的 `batch_quantity` 同值）、`part_serial_no` / `part_drawing_no` / `part_name`、`planned_delivery_date` / `system_delivery_date`（`to_char(…,'YYYY-MM-DD')`，**字符串不是日期对象**）、`is_urgent`、`customer_name` / `parent_customer_name`、`applicant_name`、`note`、`shelf_code`（string \| null）、`shelf_id`（string，**2026-10-10 起只是展示字段**、写端点不再消费，见 §8.4 与 §0b）、`outsource_company_id` / `outsource_company_name`、`quote_id`、`company_options: OutsourceCompanyOption[]`（`id` string + `name`）、`price`（Decimal 字符串）、`can_send`（**服务层算** `send_mode == "APPROVAL" || !company_options.is_empty()`）、`has_cnc_program`（`EXISTS (t_part_file kind='G_CODE')`）、`has_process_chain`（判据见 §8.4）。
+`items[]` 元素（`OutsourceQueueCandidate`，**27 字段**）：取自 `SENDABLE_PROJECTION_FULL` 的全投影，字段与后端 SQL 列一一对应 —— `version`（`pb.version`，**OCC 锚**）、`send_mode`、`batch_id` / `part_id`（string）、`batch_no`、`quantity`（`pb.quantity`，行 = 批次故与旧 VO 的 `batch_quantity` 同值）、`part_serial_no` / `part_drawing_no` / `part_name`、`planned_delivery_date` / `system_delivery_date`（`to_char(…,'YYYY-MM-DD')`，**字符串不是日期对象**）、`is_urgent`、`customer_name` / `parent_customer_name`、**`customer_path`（string，必填，2026-10-17 新增）**、`applicant_name`、`note`、`shelf_code`（string \| null）、`shelf_id`（string，**2026-10-10 起只是展示字段**、写端点不再消费，见 §8.4 与 §0b）、`outsource_company_id` / `outsource_company_name`、`quote_id`、`company_options: OutsourceCompanyOption[]`（`id` string + `name`）、`price`（Decimal 字符串）、`can_send`（**服务层算** `send_mode == "APPROVAL" || !company_options.is_empty()`）、`has_cnc_program`（`EXISTS (t_part_file kind='G_CODE')`）、`has_process_chain`（判据见 §8.4）。
+
+⚠️ **候选卡的 `customer_path` 是 2026-10-17 新增的必填 `string`**：此前**刻意没有**这一列（前端拿「根名 + 自身名」两段自己拼），客户树放开任意深度后那条口径不成立 —— 最多只能拼出最后两段。同批在 `OutsourceQueueHeldBatch` 上补了同一列（同口径、同必填）。
 
 ⚠️ `has_process_chain` **只加在候选卡上，同屏的在途卡 `OutsourceQueueHeldBatch` 没有这一列** —— 外协收发阶段的批次在厂外，不存在「按工序链顺推到下一道」的语义，故在途卡恒按无链渲染（不画绿框）。这是**有意的不对称**，见 §8.4。
 
@@ -268,7 +270,7 @@ router 工厂始终是 **4 个**（`company_router` / `quote_router` / `shipment
 | `is_urgent` | boolean | `t_part` |
 | `customer_name` | string \| null | `CustomerPath::own_name`（**本节点**单段名） |
 | `parent_customer_name` | string \| null | `CustomerPath::root_name`（**根**名 —— 2026-10-17 起不再是「上跳一层」的直接父） |
-| `customer_path` | string（**必填**） | `CustomerPath::path`（第 2 层到叶子、不含根）—— **2026-10-17 新增**：候选卡此前刻意没有这一列（前端拿两个名字自己拼），任意深度树上拼不出来 |
+| `customer_path` | string（**必填**） | `CustomerPath::path`（第 2 层到叶子、不含根）—— **2026-10-17 新增**（与候选卡同批补上，理由见上） |
 | `applicant_name` | string \| null | `LEFT JOIN LATERAL t_applicant` |
 | `location` | string | `pb.location`，恒为 `"OUTSOURCE_COMPANY"`（在途谓词保证） |
 | `note` | string \| null | `t_part.note` |
@@ -647,7 +649,8 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
    —— 老客户端继续回传会被 serde 静默忽略。
 6. **候选卡的 `shelf_id` 为空串的行走不通**：那是 `PENDING` 且未上架的批次（本来就在生产架之外），要先 `place-on-shelf`。
 7. **新增 2 个看板 composable** + **删 3 个旧 composable**（`/outsource-pool/counts` 计数、`/outsource-pool/state` 每公司一次、`/outsource-pool/{process_id}` 详情）。
-8. **zod schema 同步**：新增 `outsourceQueueSnapshotSchema` / `outsourceQueueProcessDetailSchema` / `outsourceQueueCandidateSchema` / `outsourceQueueCompanySchema` / `outsourceQueueHeldBatchSchema` / `outsourceMoveResultSchema`。**注意 zod 默认 strip 模式**会让漏声明的字段静默丢失，数组元素必须全字段声明（**候选卡 26 字段**，含 `has_process_chain`；**在途卡刻意无 `has_process_chain`**，勿给它补声明）。
+8. **zod schema 同步**：新增 `outsourceQueueSnapshotSchema` / `outsourceQueueProcessDetailSchema` / `outsourceQueueCandidateSchema` / `outsourceQueueCompanySchema` / `outsourceQueueHeldBatchSchema` / `outsourceMoveResultSchema`。**注意 zod 默认 strip 模式**会让漏声明的字段静默丢失，数组元素必须全字段声明（**候选卡 27 字段**，含 `has_process_chain`；**在途卡刻意无 `has_process_chain`**，勿给它补声明）。
+   - ⚠️ **2026-10-17 本特性要求前端补声明**：候选卡与在途卡的 `customer_path`（两处都是**必填 `string`**）需要前端在 `outsourceQueueCandidateSchema` / `outsourceQueueHeldBatchSchema` 里补上 `customer_path: z.string()` 才能用上（**同批交付**）。⚠️ 这两处是 **strip 模式（非 `.strict()`）**：漏声明**不抛 `unrecognized_keys`、不白屏**，而是被 Zod **静默剥离** ⇒ 适配层拿不到路径，**看板客户列永久降级成两段拼接、零报错**，在三层以上的树上永远拼不对（`.strict()` 域漏声明是当场白屏，strip 域漏声明只在深层树上才看得见 —— 这是最容易漏的一类）。
 9. **日期字段类型不一致**（勿写同一个 schema 复用）：候选卡 / `quotable` 的日期是 `YYYY-MM-DD` **字符串**（`to_char`）；`held_batches` 的是 ISO 日期串（native date）。
 10. **`receive_next_process_id` 是字符串 `"0"`** 而非数字 0、亦非 `null`；配合 `chain_resolvable` 判定要不要弹手填对话框。
 11. **`snapshot.processes[]` 的 tab 集合必须 join 全量 OUTSOURCE 工序列表**（见 §4.3）。

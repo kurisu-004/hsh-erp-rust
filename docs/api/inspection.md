@@ -180,13 +180,13 @@ ScanTreeOut
 | 11 | `customer_id` | string | `p.customer_id` | 雪花 ID 字符串化；客户表头筛选的入参回显（caller 选中任意层级的客户都用它，后端展开成纯子树） |
 | 12 | `customer_name` | string \| null | `c.name` | 叶子客户名（本节点单段名） |
 | 13 | `l1_customer_name` | string \| null | `shared::customer::paths_of` 的 `root_name`（见 §3.5） | **根**（L1 集团）名 |
-| 14 | `customer_path` | string | `shared::customer::paths_of` 的 `path` | **2026-10-17 新增，必填**：第 2 层到叶子用 `" / "` 拼接（**不含**根）；取不到（客户软删 / 链成环）落**空串** |
+| 14 | `customer_path` | string | `shared::customer::paths_of` 的 `path` | **2026-10-17 新增，必填**：第 2 层到叶子用 `" / "` 拼接（**不含**根）；落**空串**只发生在「终点行不存在 / 已软删」，成环 / 超深度时给的是**截断路径**（见 `customers.md` §2.2） |
 
 字段集严格对齐前端 7 个数据列（序列号 / 图号 / 名称 / 批次 / 数量 / 系统交期 / 客户）+ 操作列所需的锚点（`batch_id` / `version` / `part_id` / `is_urgent` / `customer_id`）。
 
 ⚠️ **本 VO 与返修 VO 不共用**：`GET /api/v2/prod/batches/repair` / `/repairing` 继续用 `prod::batch::vo::InspectionBatchListItemOut`。共用会让那边的字段在待品检页成为无用负载。两端点的行对象**不可互相 cast**。
 
-⚠️ **2026-10-17 新增第 14 个键 `customer_path`**：前端 `inspectionQueueItemSchema` 是 `.strict()`（键集恰好 13 个），多一个键即抛 `unrecognized_keys` ⇒ **整个待品检页白屏**。前端必须同步在该 schema 里声明 `customer_path: z.string()`（**必填、非 nullable** —— 后端恒给字符串，取不到时是空串）。扫码树（§2.3 / §2.4）那两个节点的 `customer_path` 同样新增。
+⚠️ **2026-10-17 新增第 14 个键 `customer_path`**：前端 `inspectionQueueItemSchema` 是 `.strict()`，多一个后端键即抛 `unrecognized_keys` ⇒ **整个待品检页白屏**。本特性要求前端在该 schema 里补声明 `customer_path` 才能用上（**2026-10-17 同批交付**）—— 前端落地为 `z.string().nullable()`，比后端的「必填 `string`、取不到时是空串」**更宽松**，两者**兼容**、不算断裂（`frontend` 的守门纪律是「前端更宽松可接受，前端更严会假阴性」）。队列读与扫码树两侧的模式差异与失败形态见 §8.2。
 
 ### 3.4 队列口径：WHERE 五段拼装
 
@@ -212,7 +212,7 @@ JOIN 只有 2 张：`t_part_batch` JOIN `t_part` JOIN `t_customer`（2026-10-17 
 - `l1_customer_name` = `shared::customer::paths_of` 的 `root_name`（**根**名）；
 - `customer_path` = 同一函数的 `path`（第 2 层到叶子的 `" / "` 拼接，不含根）。
 
-⚠️ 旧口径是 `c.parent_id IS NOT NULL → pc.name.or(c.name)`，**只上跳一层**，三层以上的树上拿到的是中间层名；返修侧则是 `c_l1.name` 裸值（不回落 `c.name`）。两处都已随本轮改成 `paths_of`，**分叉消失**：客户已软删 / 链成环时 `paths_of` 不产出该项 ⇒ `l1_customer_name = null`、`customer_path = ""`。
+⚠️ 旧口径是 `c.parent_id IS NOT NULL → pc.name.or(c.name)`，**只上跳一层**，三层以上的树上拿到的是中间层名；返修侧则是 `c_l1.name` 裸值（不回落 `c.name`）。两处都已随本轮改成 `paths_of`，**分叉消失**：真正落 `l1_customer_name = null` / `customer_path = ""` 的**只有**「终点行不存在 / 已软删」这一种（`paths_of` 的锚点带 `deleted_at IS NULL`）；成环 / 超深度时 map 里**仍有**该项，给出的是**截断路径**与「断链处那个祖先」的名字（不是根），详见 `customers.md` §2.2。
 
 ## 4. 口径表
 
@@ -347,13 +347,20 @@ JOIN 只有 2 张：`t_part_batch` JOIN `t_part` JOIN `t_customer`（2026-10-17 
 | 落点（`frontend` 仓） | 路径 | 备注 |
 |---|---|---|
 | queryKey 工厂 | `src/composables/queries/keys.ts` 的 `qk.inspectionQueueList(params)` / `qk.inspectionPrefix` | 前缀失效用 `inspectionPrefix` |
-| Zod 守门 schema | `src/views/inspection/composables/inspectionSchema.ts` | `inspectionQueueListItemSchema`（**13 个 key + `.strict()`**，多一个键即抛 `unrecognized_keys`）+ `inspectionQueueListResultSchema`（计数 `z.string()`）+ 扫码树 schema |
+| Zod 守门 schema | `src/views/inspection/composables/inspectionSchema.ts` | `inspectionQueueListItemSchema`（**14 键 + `.strict()`**，多一个键即抛 `unrecognized_keys`；含 2026-10-17 新增的 `customer_path`）+ `inspectionQueueListResultSchema`（计数 `z.string()`）+ 扫码树 schema（**strip 模式**，见下） |
 | query hook | `src/views/inspection/composables/useInspectionQueueQuery.ts` | hook 无自有状态，入参 `MaybeRefOrGetter`（params + `enabled` + `autoRefresh`） |
 | 页面级 store | `src/views/inspection/composables/useInspectionListStore.ts` | 分页 / 筛选 / 弹窗态 + 写 mutation + `invalidateInspectionQuery()` |
 | 列定义 | `src/views/inspection/inspectionColumnDefs.ts` | 表头 7 列 |
 | api 层 | `src/api/inspection.ts` | 队列读 `listInspectionBatches` 与扫码端点**同模块** |
 
-⚠️ 队列读行 schema 用 `.strict()`（13 键锁死），扫码树 schema 用普通 strip 模式 `z.object` —— 两侧宽容度不同，加字段时注意各自的行为差异。
+⚠️ 队列读行 schema 用 `.strict()`（14 键锁死），扫码树 schema 用普通 strip 模式 `z.object` —— **两侧宽容度不同，漏声明同一字段的失败形态也相反**：
+
+| 落点 | 模式 | 漏声明 `customer_path` 的失败形态 |
+|---|---|---|
+| 队列读 `inspectionQueueListItemSchema` | `.strict()` | 后端多一个键即抛 `unrecognized_keys` ⇒ **待品检页白屏**（响亮、当场发现） |
+| 扫码树 `ScanAssemblyOut`（§2.3）/ `ScanPartOut`（§2.4）两个节点的 schema | strip 模式 `z.object` | 后端多一个键被 Zod **静默剥离** ⇒ **不抛、不白屏、零报错**，但扫码弹窗的适配层拿不到路径、客户列**永久降级成单段名**，任意深度树上再也拼不出完整路径 |
+
+⇒ **本特性要求前端在扫码树那两个节点的 schema 里补声明 `customer_path: z.string()` 才能用上**（**2026-10-17 同批交付**）。strip 模式这一侧比 `.strict()` 那一侧**更容易漏**：它在两层树上与「补了声明」的表现完全一样，只有客户树真被加深到第三层才看得出路径不对。
 
 ### 8.3 写端点（**全部在 `prod::batch` 域**，不在本域文档里）
 

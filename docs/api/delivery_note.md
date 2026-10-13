@@ -184,7 +184,7 @@ BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY`、`21420 BIZ_DELIVERY_NOTE_LOCKED_PART`
 | `delivery_note_no` | string | `t_delivery_note.delivery_note_no`（`DN-YYYYMMDD-NNNN`） |
 | `customer_id` | string | `t_delivery_note.customer_id`（**恒为 L1 根** id，见 §0.1） |
 | `customer_name` | string \| null | `shared::customer::paths_of` → `t_customer.name`（取不到 null） |
-| `customer_path` | string | 第 2 层到叶子的 `" / "` 拼接（**不含**根）。⚠️ **2026-10-17 由 `string \| null` 收紧为必填 `string`**：取不到（客户软删 / 链成环）落**空串**，不再是 `null`。送货单恒挂在根上，故本字段恒等于根自己的名字 |
+| `customer_path` | string | 第 2 层到叶子的 `" / "` 拼接（**不含**根）。⚠️ **2026-10-17 由 `string \| null` 收紧为必填 `string`**：落**空串**的情形**只**是「终点行不存在 / 已软删」（消费侧 `paths.get()` 落空的兜底）；成环 / 超深度时 map 里仍有该项、给出的是**截断路径**（见 `customers.md` §2.2）。送货单恒挂在根上，故本字段恒等于根自己的名字 |
 | `status` | string | `t_delivery_note.status`（4 态，见 §5） |
 | `submitted_at` | string \| null | `t_delivery_note.submitted_at` |
 | `picked_up_at` | string \| null | `t_delivery_note.picked_up_at` |
@@ -220,7 +220,7 @@ BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY`、`21420 BIZ_DELIVERY_NOTE_LOCKED_PART`
 | `note` | string \| null | `t_part.note` |
 | `customer_name` | string \| null | 零件所属客户名（自身单段名） |
 | `parent_customer_name` | string \| null | **根**（L1 集团）名 —— 2026-10-17 起不再是「直接父」（旧形是零件客户的直接父，深树上会退化成中间层） |
-| `customer_path` | string | 第 2 层到叶子的 `" / "` 拼接（**不含**根）。⚠️ **2026-10-17 由 `string \| null` 收紧为必填 `string`** + 由「两段手工拼接」改为 `shared::customer::paths_of`（旧形 `format!("{父名} / {自身名}")` 在三层以上的树上必然只给两段）；取不到落**空串** |
+| `customer_path` | string | 第 2 层到叶子的 `" / "` 拼接（**不含**根）。⚠️ **2026-10-17 由 `string \| null` 收紧为必填 `string`** + 由「两段手工拼接」改为 `shared::customer::paths_of`（旧形 `format!("{父名} / {自身名}")` 在三层以上的树上必然只给两段）；落**空串**只发生在「终点行不存在 / 已软删」，成环 / 超深度时给的是**截断路径**（见 `customers.md` §2.2） |
 | `customer_id` | string ★ | `t_part.customer_id`（**叶子客户 id**，必填非空）。打印分组按它查 `t_delivery_group_member` 定位分组；**不得改用 `customer_name` 匹配**（`t_customer.name` 只有非唯一 btree 索引，同名客户会被并进同一张 sheet） |
 | `assembly_id` | string \| null | `t_part.assembly_id`（散件 null） |
 | `assembly_serial_no` | string \| null | `AssemblyRepo::list_by_ids(include_deleted=false)` |

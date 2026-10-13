@@ -662,7 +662,7 @@ commit 之后发一次汇总。前端若订阅了它，会成**死订阅**（永
 
 ## `docs/api/` 目录约定（2026-10-07 确立）
 
-**现状**：`docs/api/` 有 **14 份**文件（与本文件顶部「📌 前端对接」一节同口径；2026-10-11 review 第 1 轮订正过「9 份 / 11 份」两处自相矛盾与漏登 `wx.md`，2026-10-12 新建 `statistics.md` 后为 12，2026-10-13 新建 `mail_digest.md` 后为 13，**2026-10-16 新建 `mail.md` 后为 14**），每份 = **一个域的整域契约**：
+**现状**：`docs/api/` 有 **15 份**文件（与本文件顶部「📌 前端对接」一节同口径；2026-10-11 review 第 1 轮订正过「9 份 / 11 份」两处自相矛盾与漏登 `wx.md`，2026-10-12 新建 `statistics.md` 后为 12，2026-10-13 新建 `mail_digest.md` 后为 13，2026-10-16 新建 `mail.md` 后为 14，**2026-10-17 新建 `customers.md` 后为 15**），每份 = **一个域的整域契约**：
 
 | 文件 | 覆盖域 |
 |---|---|
@@ -674,6 +674,7 @@ commit 之后发一次汇总。前端若订阅了它，会成**死订阅**（永
 | [`docs/api/scan.md`](docs/api/scan.md) | `prod::scan`（报工台：扫工牌 + 扫码找件诊断 / 接管 / 外协收回 + 取件 / 放回列表 + 放回送检 + 手动领取） |
 | [`docs/api/outsource.md`](docs/api/outsource.md) | `outsource`（外协公司 / 报价 / 发货 + 外协看板与三合一写端点；公司 7 条 / 报价 7 条 / 发货 2 条 / 看板 3 条） |
 | [`docs/api/delivery_note.md`](docs/api/delivery_note.md) | `com::delivery_note`（送货单 + 送货分组 + 司机候选，2026-10-08 平移 com + 入单收敛为扫码单一入口） |
+| [`docs/api/customers.md`](docs/api/customers.md) | `com::customer`（**2026-10-17 新建**；客户树由固定两层放开为**任意深度**：`customer_path` 口径 / 业务单据只挂叶子 / 筛选纯子树 / 不传 `limit` 即全量；⚠️ 出参 `customer_path` 是**必填 `String`**，全仓共用 `shared::customer::paths_of` 一个真源） |
 | [`docs/api/shelves.md`](docs/api/shelves.md) | `iam::shelf`（**iam 域下的嵌套子模块**：货架 CRUD + 负载与自动选架，5 端点；2026-10-10 自独立 shelf 域迁入 iam，URL 硬切 `/api/v2/iam/shelves/*`） |
 | [`docs/api/iam.md`](docs/api/iam.md) | `iam`（认证 + 账号 + 企业微信绑定 + 货架子模块 + **RBAC 角色权限面板**，**30 端点**；session 5 + users 12 + shelves 5 + rbac 8，4 条破坏性变更与 OCC 锚点；ADMIN 元角色通配 / 停用即降权） |
 | [`docs/api/wx.md`](docs/api/wx.md) | `wx` 微信小程序 BFF（**2026-10-11 新建**；**按小程序页面切子模块**：`login/` + `part_list/` + `production/`；5 端点；URL 硬切无 alias 5 条、VO camelCase 逐字对齐前端卡片模型、`deliveredQty` 真值、尾斜杠 404 实测钉死、`counts` / `list` 口径对齐、★ 2026-10-12 `part_list` 日期 + 7 类 tab 双维筛选） |

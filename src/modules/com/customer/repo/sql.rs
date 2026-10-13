@@ -85,8 +85,13 @@ impl CustomerRepo {
         .await
     }
 
-    /// 取 `parent_id = $1` 的全部 L2 子客户（用于 L1 分组列表计算组外 L2）。
-    /// 空 parent_id 时返回空 Vec，由 caller 自行短路。
+    /// 取 `parent_id = $1` 的**直接子节点**（客户树是任意深度，这里是「往下一层」，
+    /// **不**等于「叶子」）。根节点（`parent_id IS NULL`）没有直接子节点时返回空 Vec，
+    /// 由 caller 自行短路。
+    ///
+    /// ⚠️ 2026-10-17 起本方法**零调用方**（原「L1 分组列表算组外 L2」那个消费方已改走
+    /// `shared::customer::subtree_ids`）。保留是因为它是 `CustomerRepoTrait` 的既有接口，
+    /// 将来接「只展开一层」的需求时不必重造。
     pub async fn list_children<'e, E: PgExecutor<'e>>(
         executor: E,
         parent_id: i64,
@@ -110,7 +115,7 @@ impl CustomerRepo {
         .await
     }
 
-    /// 取全部一级客户（`parent_id IS NULL`），可选包含已软删。
+    /// 取全部**根**客户（`parent_id IS NULL`），可选包含已软删。
     pub async fn list_roots<'e, E: PgExecutor<'e>>(
         executor: E,
         include_deleted: bool,

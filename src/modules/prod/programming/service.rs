@@ -138,7 +138,8 @@ fn row_to_item(r: ProgrammingRow, paths: &HashMap<i64, CustomerPath>) -> Program
             .unwrap_or_else(|| "1970-01-01".to_string()),
         system_delivery_date: r.system_delivery_date,
         customer_name: r.customer_name,
-        // 根名与路径都取 `paths`（取不到 = 客户已软删 / 链成环 ⇒ None / 空串）。
+        // 根名与路径都取 `paths`（取不到 = **终点行不存在 / 已软删** ⇒ None / 空串；
+        // 成环 / 超深度时 `paths_of` 仍有该项、给的是**截断路径**）。
         parent_customer_name: cp.map(|p| p.root_name.clone()),
         customer_path: cp.map(|p| p.path.clone()).unwrap_or_default(),
         has_cnc_program: r.has_cnc_program,

@@ -45,13 +45,14 @@ pub struct ProgrammingItemOut {
     ///
     /// 旧形由 SQL 自连 `t_customer pc ON pc.id = c.parent_id` 取到，**只上跳一层**，
     /// 深树上拿到的是中间层名。现由 `shared::customer::paths_of` 的 `root_name` 派生。
-    /// 客户已软删 / 链成环时为 `None`。
+    /// **终点行不存在 / 已软删**时为 `None`；⚠️ 成环 / 超深度时 `paths_of` **仍有**
+    /// 该项（名字是断链处那个祖先，不是根）。
     pub parent_customer_name: Option<String>,
     /// 「第 2 层到叶子」的 `" / "` 路径（**不含**根；本节点即根时 = 根自己的名字）。
     ///
-    /// 2026-10-17 新增，数据源同上（`paths_of.path`）。取不到时落**空串**而非
-    /// `null` —— 与全仓 `customer_path` 的必填口径一致，前端不必为「没有路径」
-    /// 单开一个第三态分支。
+    /// 2026-10-17 新增，数据源同上（`paths_of.path`）。**终点行不存在 / 已软删**时落
+    /// **空串**而非 `null` —— 与全仓 `customer_path` 的必填口径一致，前端不必为
+    /// 「没有路径」单开一个第三态分支。⚠️ 成环 / 超深度时给的是**截断路径**，非空串。
     pub customer_path: String,
     /// 是否已上传 G_CODE（真相源 `EXISTS t_part_file kind='G_CODE' AND
     /// deleted_at IS NULL`，与 queue 候选池同源）。
