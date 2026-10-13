@@ -6,12 +6,24 @@
 > 迁移 `migrations/20261013000000_001_mail_digest.sql`、菜单 `seeds/menu.sql`（`mail_group`
 > → `mail_digest`，仅 MANAGER，路径 `/mail/digest`）。
 >
-> ⚠️ **本域的 SMTP 凭据只走 env，不进 DB**（`MAIL_SMTP_USERNAME` / `MAIL_SMTP_PASSWORD`
-> / 发件人地址，见 `infra/config.rs::MailConfig`）。`t_mail_digest_config` 只存收件人 /
-> 内容口径 / 调度。密码一旦落库就跟着备份走，且任何有只读库权限的人都能捞走。
+> ⚠️ **SMTP 凭据走 `scheduled_task` 域的加密邮箱表**（**2026-10-16 整段替换**）。
+> 授权码 AES-256-GCM 加密进 `t_mail_account.encrypted_secret`（主密钥 env
+> `MAIL_ACCOUNT_SECRET`），本域只存「**选哪个邮箱**」（`t_mail_digest_config.sender_account_id`）
+> + 收件人 / 内容口径 / 调度。整域契约见 [`docs/api/mail.md`](mail.md)。
 >
-> ⚠️ **未配置 SMTP 时后端照常启动**：定时任务打一行 info 后直接返回、不注册任何 job，
-> 手动触发返 `21701`。与 `WECOM_*` 同一降级范式（未配置不 fail-fast）。
+>   - **不是明文**（备份 + 任何只读库权限的人都能拿到），也**不是散列** —— bcrypt 取不回
+>     明文，而 SMTP 发信必须把授权码交给 lettre ⇒ 只能是**可逆**的对称加密。
+>   - `MAIL_SMTP_HOST` / `_PORT` / `_TLS_MODE` / `_USERNAME` / `_PASSWORD` /
+>     `MAIL_FROM_ADDRESS` / `_NAME` / `MAIL_DIGEST_ENABLED` **已全部删除、运行时不读**：
+>     代码里没有任何 env 兜底路径，也没有启动自检 / 一次性引导导入。host / port / TLS 模式
+>     由**预设**决定（网易 163 / QQ，均 465 隐式 TLS，见 `docs/api/mail.md` §3）。
+>   - **域外依赖 = 1 个模块**：`scheduled_task`（读 `t_mail_account` 一行 +
+>     `infra::crypto::open` 解密）。方向是 **mail_digest → scheduled_task**（内容域依赖
+>     通道域），反向不存在。
+>
+> ⚠️ **未选定可用发信邮箱时后端照常启动**：定时任务打一行 info 后**不注册 job**（判据见
+> `docs/api/mail.md` §4.5），手动触发返 `21701`。降级语义与被删除前的 env 方案逐条对齐，
+> 只是判据从 env 换成了 DB。
 
 ## 1. 端点表
 
@@ -22,7 +34,7 @@
 |---|---|---|---|
 | `GET` | `/api/v2/mail-digest/config` | Manager | 读配置**单例**；表里无行时返回全部默认值 + `version=0` + `id="0"`（**不是 404**） |
 | `POST` | `/api/v2/mail-digest/config` | Manager | **全量覆写**；body **必含** `version`（OCC）；成功后热重载 cron（失败不回滚配置） |
-| `GET` | `/api/v2/mail-digest/meta` | Manager | 表单的**全部**选项源：频率枚举 / 列白名单 / 取值范围 / 缺省值 / SMTP 公开信息 |
+| `GET` | `/api/v2/mail-digest/meta` | Manager | **内容与调度**侧的表单选项源：频率枚举 / 列白名单 / 取值范围 / 缺省值（⚠️ **2026-10-16 起不再含 `smtp` 段**） |
 | `POST` | `/api/v2/mail-digest/preview` | Manager | 按「当前配置 + 临时覆盖」渲染 HTML；**不发送、不落流水** |
 | `POST` | `/api/v2/mail-digest/send` | Manager | 手动触发：渲染 + 真发 + 落流水（**成败都落**） |
 | `GET` | `/api/v2/mail-digest/logs` | Manager | 发送历史分页（`sent_at DESC, id DESC`；`limit∈[1,200]` + `offset≥0`） |
@@ -33,6 +45,10 @@
   `router()` 源码，加了 `.route()` 忘登记就在单测里当场红）。
 - 挂载点：`src/modules/mod.rs::v2_router()` 的 `.nest("/mail-digest", …)`（顶层 nest，
   kebab-case 单段，与 `/part-files` / `/cnc-programs` / `/outsource-queue` 同款）。
+  ⚠️ **2026-10-16**：同一次提交里新增了同族的 `.nest("/mail", scheduled_task::router())`
+  （邮箱通道域，路径 `/mail`）。两者无冲突：matchit 按段数 + 静态段优先匹配，
+  `/mail/meta`（2 段）不会落到 `/mail-digest`（1 段静态段）上。菜单也同批从
+  `mail_group → mail_digest`（`/mail/digest`）改成 `scheduled_task → mail`（`/mail`）。
 - ⚠️ **6 条路由全是静态段**（无 `Path` 参数）⇒ 不存在「静态段必须先于 catch-all」的
   matchit 排序约束。后人加 `/{id}` 时要重新审视这一点。
 
@@ -46,7 +62,7 @@
 |---|---|---|---|
 | `id` | string | `t_mail_digest_config.id`（雪花）；**表空时恒 `"0"`** | 否 |
 | `version` | number | OCC 版本；表空时恒 `0`（= 首次初始化提交值）；每次 `POST /config` 自增 1 | 否 |
-| `enabled` | bool | **定时任务第二道闸**（第一道是 env 的 `MAIL_DIGEST_ENABLED`）。`false` 时不注册 cron job，但 `POST /send` 手动触发**仍可用** | 否 |
+| `enabled` | bool | 定时任务闸（**2026-10-16 起是唯一的一道 DB 闸**，原先的另一道是 env 的 `MAIL_DIGEST_ENABLED`，已删）。`false` 时不注册 cron job，但 `POST /send` 手动触发**仍可用** | 否 |
 | `frequency` | string | `DAILY` / `WEEKLY` / `MONTHLY` / `MANUAL_ONLY`（无 DB ENUM，Rust 枚举校验；解析失败 → `21704`） | 否 |
 | `send_hour` | number | `0..23`；**非** `MANUAL_ONLY` 时必填且校验。⚠️ `MANUAL_ONLY` 之下**不清空也不校验**（见 §8.3「实现与注释不符」第 4 条） | 是 |
 | `send_minute` | number | `0..59`；同上 | 是 |
@@ -59,7 +75,8 @@
 | `upcoming_days` | number | 未来节窗口天数，**clamp 到 `1..60`**（不是拒绝），缺省 `14` | 否 |
 | `visible_columns` | string[] | 正文表格列白名单，**封闭枚举**（§2.3）；未知项 → `21704`（**不静默丢弃**）；空数组在渲染层退回缺省 8 列 | 否 |
 | `subject_template` | string | 主题模板；`null` = 用缺省主题。`{date}` / `{days}` 两个占位符，未知 `{xxx}` 原样保留 | 是 |
-| `smtp_configured` | bool | env 侧是否具备发信能力（`MailConfig::is_enabled()`）。前端据此灰掉「立即发送」 | 否 |
+| `sender_account_id` | string | 发信邮箱（`t_mail_account.id`，雪花 **JSON string**）；`null` = 未选。`POST /config` 传不存在的/已软删的 id ⇒ `21706` | 是 |
+| `smtp_configured` | bool | **2026-10-16 语义改写**：原先是「env 侧是否具备发信能力」（`MailConfig::is_enabled()`，env 已删），现为「`sender_account_id` 是否指向一个**存在且未软删**的邮箱」。前端据此灰掉「立即发送」。⚠️ **不**试解密（见 `docs/api/mail.md` §8.3 第 7 条） | 否 |
 | `created_at` | string | `YYYY-MM-DD HH:MM:SS`（Asia/Shanghai naive）；**表空时是空串**（不是会跳动的假时间） | 否（可为空串） |
 | `updated_at` | string | 同上 | 否（可为空串） |
 
@@ -79,6 +96,7 @@
 | `upcoming_days` | number | 否（缺省 `14`） | clamp `1..60` |
 | `visible_columns` | string[] | **必填** | §2.3 |
 | `subject_template` | string | 否 | ≤200 **字**（`.chars().count()`，不是字节数）+ 拒 CR/LF |
+| `sender_account_id` | string | 否（缺省 / `null` = 未选） | **JSON string**（雪花防精度截断；`deserialize_i64_opt` 只收字符串或 `null`，**发数字会 422**）。指向不存在**或已软删**的邮箱 ⇒ `21706` + 404。⚠️ `POST /config` 是**全量覆写**，不带这个键 = 把它清成 `null` |
 
 **响应回填的是提交后的新 `version`**（读回最新行），前端据此做下一次提交 ——
 不要拿「提交前」的 version 复用，否则立刻撞一次假的 OCC 冲突。
@@ -163,15 +181,27 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
 就不必在流水里重复。回归用例
 `tests/mail_digest/send.rs::scheduled_prepare_failure_still_writes_failed_log`。
 
-### 2.6 `GET /meta` 出参
+### 2.6 `GET /meta` 出参（⚠️ 2026-10-16 删掉 `smtp` 段）
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `frequencies[]` | `{value, label, needs_time, needs_weekday, needs_day_of_month}` | 4 个预设；三个 `needs_*` 驱动表单的显示/隐藏（`MANUAL_ONLY.needs_time = false`） |
 | `columns[]` | `{key, label}` | §2.3 白名单（顺序 = 展示顺序 = 缺省顺序） |
-| `defaults` | `ConfigDefaultsOut` | 缺省配置（**不含** `id` / `version` / 时间戳 / `smtp_configured`） |
+| `defaults` | `ConfigDefaultsOut` | 缺省配置（**不含** `id` / `version` / 时间戳 / `smtp_configured`；**含** `sender_account_id`，缺省恒 `null`） |
 | `upcoming_days_range` | `{min: 1, max: 60}` | 前端数值控件边界 |
-| `smtp` | `{configured, host, port, tls_mode, from_address, from_name}` | ⚠️ **绝不含 username / password**（本段原样进前端页面）。含 `tls_mode` 是因为「收不到信」时第一件事就是看 TLS 模式配对没配对 |
+
+**已删除的 `smtp` 段**原先带的是 env 侧 SMTP 公开信息，而那些值在「邮箱改为页面内配置」
+之后**逐条换了归属**：
+
+| 原 `smtp.*` | 新的去处 |
+|---|---|
+| `configured` | `ConfigOut.smtp_configured`（`GET /config`，纯 DB 判定） |
+| `host` / `port` / `tls_mode` | `GET /api/v2/mail/meta` 的 `presets[]`（`scheduled_task` 域，见 `docs/api/mail.md` §3） |
+| `from_address` | `GET /api/v2/mail/accounts` 的 `account` |
+| `from_name` | `GET /api/v2/mail/accounts` 的 `name` |
+
+⚠️ 保留一个「已经没有任何生产方」的字段只会让前端照着它读一个恒空的对象。前端改造时
+按上表逐条改，**不要**保留对 `smtp` 段的引用。
 
 ## 3. 频率枚举与 cron 映射
 
@@ -306,34 +336,42 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
 
 | 用途 | 表 | 本域关系 |
 |---|---|---|
-| 配置单例（读 + 写） | `t_mail_digest_config` | **owned**（`T*` 全列投影在 `model.rs`） |
+| 配置单例（读 + 写） | `t_mail_digest_config` | **owned**（`T*` 全列投影在 `model.rs`；**2026-10-16 新增 `sender_account_id` 一列**，无物理外键） |
+| 发信通道（读一行 + 解密） | `t_mail_account` | **只读**（跨域，`scheduled_task` 域 owned；`service::resolve_sender`） |
 | 发送流水（只增） | `t_mail_digest_log` | **owned**（刻意无 `deleted_at` / `version`） |
 | 工单与系统交期 | `t_part` | 只读聚合（跨域） |
 | 装配件与系统交期 | `t_assembly` | 只读聚合（跨域） |
 | 已交量守卫 | `t_part_batch` | 只读聚合（跨域） |
 | 客户名 | `t_customer` | `LEFT JOIN`，**刻意不加** `AND c.deleted_at IS NULL`（客户软删时该列退化为空串，但**不该**因此把工单从邮件里剔除） |
 
-- **域外依赖 = 0 个模块**：统计 SQL 完全在本域内写全，**不 import** 他域的 service / repo。
-  唯一的「引用他域符号」是**共用常量** `DELIVERY_STATUSES` —— 它是 CLAUDE.md 要求
-  「四处共用」的那一份，硬要绕开反而会逼出一份副本常量，那才是真正的漂移源。
-- **域隔离护栏（`assert_no_foreign_domain`）：不适用**。该护栏扫的是
-  `crate::modules::<别的域>` 形式的路径引用，而本域引用 dashboard 的是**常量**
-  （不是 service / repo）且正是设计意图。
-- env 侧：`MAIL_DIGEST_ENABLED` / `MAIL_SMTP_HOST` / `_PORT` / `_USERNAME` / `_PASSWORD` /
-  `_TLS_MODE` / `MAIL_FROM_ADDRESS` / `MAIL_FROM_NAME`（见 `.env.example`）。
+- **域外依赖 = 1 个模块**（2026-10-16 由 0 变 1）：`scheduled_task`（邮箱通道域）。
+  本域 import 了它的 `dto::MailAccountPreset` 与 `repo::get_account`，**只读**那一张表。
+  方向是 **mail_digest → scheduled_task**（内容域依赖通道域）；反向不存在（通道域对
+  内容域零代码引用，其「是否被引用」检查是自己写的 SQL，见 `docs/api/mail.md` §8.1）。
+- **域隔离护栏（`assert_no_foreign_domain`）：不适用**（2026-10-16 复核过）。两类依赖
+  都不是「图省事 import 别人的 service」：① 统计 SQL 完全在本域内写全、只读聚合别域的表
+  （既定 pattern）；② 通道域是**通道域**、本域是**内容域**，「发信要拿通道的凭据」是这个
+  切分的必然结果，且正确做法（自己写 SQL 查那一行、自己解密）本域已经做到了。
+  ⚠️ 反向的护栏装在 `scheduled_task` 域。
+- ⚠️ **env 侧的 SMTP 凭据已彻底废弃**（2026-10-16）：`MAIL_DIGEST_ENABLED` / `MAIL_SMTP_*`
+  / `MAIL_FROM_*` **已从 `infra/config.rs` 删除、运行时不读**，`.env.example` 里也一并删除。
+  现在 env 侧只剩**一个**与本域相关的键：`MAIL_ACCOUNT_SECRET`（授权码加密主密钥，
+  由 `scheduled_task` 域与 `infra::crypto` 消费，本域只在解密时用到它）。
 
 ### 8.2 前端配套改动清单
 
 | 落点（`frontend` 仓） | 说明 |
 |---|---|
-| 路由 / 视图 | 新增 `/mail/digest` 页（菜单已在 `seeds/menu.sql` 登记：`mail_group` → `mail_digest`，`sort_order=10`） |
+| 路由 / 视图 | ⚠️ **2026-10-16 改**：路径 `/mail/digest` → **`/mail`**（菜单已在 `seeds/menu.sql` 改成 `scheduled_task`「定时任务」→ `mail`「邮件」，`sort_order=10`）。页面上方用 **tab** 区分邮件类型，**当前只有「交期汇总」一种** |
 | api 层 | 6 个函数：`fetchConfig` / `saveConfig` / `fetchMeta` / `previewMail` / `sendMail` / `fetchLogs` |
 | 权限 | 菜单仅授予 `MANAGER`；页面路由守卫按同一角色判定 |
 | 预览 | `/preview` 的 `html` 是完整 HTML 文档，**直接插 iframe**（`srcdoc` + `sandbox`）而**不要** `v-html` 塞进主文档 —— 后端已做转义，但 iframe 少一层依赖主文档上下文的暴露面 |
 | 枚举 | **不要在前端另存一份频率 / 列名映射**：一律取 `GET /meta` 的 `frequencies[]` / `columns[]`（`label` 是后端给的中文表头） |
-| 「立即发送」按钮 | 按 `smtp_configured === false` 灰掉并提示去配 `MAIL_SMTP_*`（运维看不到后端 env） |
-| 错误处理 | `21701`（503）「后端未配 SMTP」与 `21702`（502）「SMTP 挂了」**排查方向相反**，UI 文案必须区分，不要都显示成「发送失败」 |
-| 雪花 ID | `ConfigOut.id` / `SendResultOut.log_id` 是 **JSON string**，不要按 `number` 声明 |
+| **发信邮箱下拉** | ⚠️ **2026-10-16 新增**：选项源取 `GET /api/v2/mail/accounts`（`scheduled_task` 域）；提交时 `sender_account_id` 按 **JSON string** 发（发数字会 422）。⚠️ `POST /config` 是**全量覆写**，不带这个键 = 清成 `null`（= 定时任务不再注册 job） |
+| 「立即发送」按钮 | 按 `smtp_configured === false` 灰掉并提示「**未选择发信邮箱**」（⚠️ 不再是「去配 `MAIL_SMTP_*`」—— 那套 env 已删） |
+| `GET /meta` 的 `smtp` 段 | ⚠️ **已删除**（2026-10-16），逐条去处见 §2.6 的对照表。**不要**保留对它的引用 |
+| 错误处理 | `21701`（503）「发信通道不可用」与 `21702`（502）「SMTP 挂了」**排查方向相反**，UI 文案必须区分，不要都显示成「发送失败」；`21706`（邮箱不存在/已删，保存配置时出现） |
+| 雪花 ID | `ConfigOut.id` / `ConfigOut.sender_account_id` / `SendResultOut.log_id` 是 **JSON string**，不要按 `number` 声明 |
 
 ### 8.3 已知偏差登记
 
@@ -348,7 +386,7 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
 | 「依赖库版本相关的实测结论」 | 1–4 |
 | 「本域设计上的已知取舍」 | 1–8 |
 | 「实现与注释不符」 | 1–5（改实现前先改文档或先改测试；第 5 条已修） |
-| 「覆盖空洞」 | 1–2 |
+| 「覆盖空洞」 | 1–3（⚠️ 2026-10-16 新增第 3 条：SMTP 层失败造法换过一次） |
 | 「与任务书的差异」 | 1–2 |
 
 ⚠️ 组数与条目数在 2026-10-13 review 第 2 轮又动过两次，都是**上一轮自己引入的自相矛盾**：
@@ -386,7 +424,8 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
    「加个 DB 唯一索引当半个防重」——那会让第二个副本发信失败被记成流水里的 `FAILED`，
    污染审计。
 3. **`/send` 无频控**：它会对**真实收件人**发信。当前唯一的护栏是
-   `MANAGER` 角色 + `enabled` 闸 + `MAIL_DIGEST_ENABLED` 总闸。
+   `MANAGER` 角色 + `t_mail_digest_config.enabled` 闸 + 「已选定可用发信邮箱」。
+   （⚠️ 2026-10-16：原写作「+ `MAIL_DIGEST_ENABLED` env 总闸」，那套 env 已删。）
 4. **`mailer::send` 返回裸 `String` 而不是 `AppError`**：同一段失败文本有两个去处
    （`t_mail_digest_log.error_message` 与 HTTP `message`）。若在这里就包成
    `AppError`，落库拿到的是 `Display`（带 `[21702] ` 前缀）⇒ 流水里会存下
@@ -458,6 +497,16 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
     transport，登记为后续增强。
 2. **`21705 BIZ_MAIL_CONFIG_NOT_FOUND` 是保留位，当前无生产方**：`GET /config` 在表空时
    返回默认值 + `version=0`，不返本码；`status_from_code` 已把它映射到 404 以备将来使用。
+3. ⚠️ **「SMTP 层失败」的集成测试造法在 2026-10-16 换过一次**（登记，不修）：host / port
+   由**编译期预设表**固定（网易 163 / QQ 均 465），原先「把 SMTP 指向 `127.0.0.1:1`」
+   这种**确定性连不通**的造法**不再可复现** —— 而真去连 `smtp.163.com:465` 会在有外网
+   的机器上「连得上但认证失败」、在无外网的机器上「DNS 失败」，两端都失败但**耗时不可控**
+   （防火墙丢包时会等到 TCP SYN 超时）。现改用**零网络 IO** 的确定性失败：邮箱的
+   自定义名里含 `<` / `>` ⇒ `mailer::send` 构造 `From` 头时 `Mailbox` 解析必然失败。
+   `deliver` 里「`mailer::send` 返回 `Err` → 记 FAILED 流水 → 返 `21702`」的两段代码
+   **逐字未变**，故守的不变量不变。完整登记见 `docs/api/mail.md` §8.3 第 8 条。
+   ⚠️ 用例名 `send_to_unreachable_smtp_returns_21702_and_records_failed_log` **沿用旧名**
+   （doc 里已写清新造法），改名会让「这条用例在 git 历史里改过什么」更难追。
 
 **与任务书的差异：**
 
