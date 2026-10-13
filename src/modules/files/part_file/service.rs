@@ -898,6 +898,13 @@ impl PartFileService {
 /// review 第 1 轮 MAJOR-2 关掉的那条「有角色闸门、**无 kind 闸门**」的绕行面，
 /// 以 `pub` 形态留在原地（生产侧零调用方，只剩两个测试在调）⇒ 本轮**整条删除**。
 /// 现在「按 id 取字节」在本域只有两条合法入口，都**先判 kind 再取字节**。
+///
+/// ⚠️ 「有角色闸门」这半句**不产生任何拒绝**（2026-10-16 review 第 3 轮 NIT-4 订正）：
+/// 它要的白名单是 Manager / Clerk / Inspector / CncProgrammer / ShelfAccount 共 5 个
+/// 角色，而 `require_any_role` 对 `Role::Admin` 元角色短路（`has_role(Admin)` 恒真，
+/// 见 `src/auth/rbac.rs`）⇒ **全部 6 个角色都放行**。所以删除那个方法的**真正理由**
+/// 只有「**无 kind 闸门**」那半句（那半句完全成立）：它按 id 取字节、不过滤
+/// `DELIVERY_TEMPLATE`，正是第 1 轮 MAJOR-2 关掉的那条越权读链。
 pub struct PartFileContent {
     pub bytes: Vec<u8>,
     pub content_type: Option<String>,

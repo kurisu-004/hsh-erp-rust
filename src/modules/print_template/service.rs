@@ -447,11 +447,24 @@ mod query_guard {
     //! - 这种**跨函数的间接 N+1** 由 `list_templates_joins_customer_names_in_memory`
     //!   兜：它显式禁止列表端点调单条取名的 `customer_name(`、并要求出现
     //!   `customer_names(` + `let ids: Vec<i64>` + `names.get(` 三步。
+    //!   ⚠️ **这个兜底只覆盖 `list_templates` 一个函数**（2026-10-16 review 第 3 轮
+    //!   MINOR-3 补）—— 那条断言取的是 `fn_body("list_templates")`。在**别的**函数里
+    //!   逐行查名它一条都拦不住：将来在本文件新增第 6 个端点（哪怕只是导出）并在
+    //!   其中写 `for row in rows { customer_name(conn, row.part_id).await? }`，
+    //!   第 1 条（循环体内无 `sqlx::query`，那条在别的 helper 里）过、第 2 条（总查询
+    //!   点数仍是 3）过、第 3 条（只查 `list_templates`）也过 ⇒ **三条全绿**。
+    //!   ⇒ 其它函数里的逐行查名，只能靠「新增 helper 时同步扩断言」这条人工纪律守。
     //! - 若日后新增**第四个**会发查询的 helper 并在别处逐行调用它，这三条都拦不住
     //!   ⇒ 新增 helper 时请顺手扩 `list_templates_joins_customer_names_in_memory`。
     //!
-    //! ⚠️ 两条断言（循环内查询数、三条 helper 各一条）都经过**变异验证**（手改成
-    //! N+1 后当场红），不是恒真绿。
+    //! ⚠️ **变异验证的覆盖面（2026-10-16 review 第 3 轮 MINOR-3 订正）**：原文写
+    //! 「两条断言（循环内查询数、三条 helper 各一条）都经过变异验证」，其中对**第 1 条
+    //! （循环内查询数）不成立** —— `code()` 扫的那段源码里**零个** `for` / `while` /
+    //! `loop`（实测：护栏 banner 之前 429 行，剥掉注释后零个迭代语句），`loop_bodies()`
+    //! 返回空、自检 `!bodies.is_empty() || !code().contains("\n    for ")` 因 `bodies`
+    //! 为空而**恒真** ⇒ 第 1 条**当前不承载任何判定**（一旦有人在本文件写出循环即生效）。
+    //! 真正经过**变异验证**（手改成 N+1 后当场红）的只有**第 2 条**（三条 helper 各
+    //! 恰好一条查询）与**第 3 条**（列表端点必须走批量那条）。
 
     /// 护栏模块自身的 banner 行（**只在这一行出现**，下面的 `const` 声明刻意不含
     /// `//  ` 前缀），用于把本模块从源码统计里切掉 —— 断言里含 `"sqlx::query"`

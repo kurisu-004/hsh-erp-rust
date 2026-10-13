@@ -147,9 +147,15 @@
 //! ⑥ 通用列表端点 `exclude_kind` 掉 `DELIVERY_TEMPLATE`；
 //! ⑦ 软删分派表加 `DELIVERY_TEMPLATE => [Manager]`；
 //! ⑧ `upload_file_for_owner` 的 CUSTOMER 臂（④ 的其中一半）；
-//! ⑨ 取字节的**唯一** service 入口 `get_file_content_of_checked_row`（⚠️ 不判 kind，
-//!    判据归调用方；review 第 2 轮 MINOR-A 把那个「有角色闸门、无 kind 闸门」的
-//!    `get_file_content` **整条删除**了，见下）。
+//! ⑨ 取字节的**带闸门** service 入口 `get_file_content_of_checked_row`（⚠️ 不判 kind，
+//!    判据归调用方；review 第 2 轮 MINOR-A 把那个「有（当前不拦任何人的）角色闸门、
+//!    无 kind 闸门」的 `get_file_content` **整条删除**了，见下）。
+//!    ⚠️ **本域取字节的服务层入口其实有两条**（2026-10-16 review 第 3 轮 NIT-5 订正：
+//!    原文写「唯一」不成立）：`get_file_content_of_checked_row`（带角色闸门，即 ⑨）与
+//!    `get_file_content_for_row`（**零判定**：不判权限、不判 kind，`print_template`
+//!    域端点 4 在 Rust 侧自己判完 kind 再调它）。`get_file_content_for_row` 是最底层的
+//!    取字节原语、不属于本域为 `DELIVERY_TEMPLATE` 新增的能力，故不进这份清单；
+//!    但别把「唯一」当成本域只有一条取字节路径 —— 它有两条。
 //! 逐条理由见下面的收紧表与已知偏差登记表。
 //!
 //! ### ⚠️ **六处**刻意收紧（新增第三种 owner 带来的；2026-10-16 review 第 1 轮补齐、

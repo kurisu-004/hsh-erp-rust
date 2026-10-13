@@ -144,7 +144,7 @@ fallback 产出，`route_layer` 只作用于已匹配路由 ⇒ 404 连鉴权层
 | 端点 | 怎么填 | 语句数 |
 |---|---|---|
 | 1 `POST /` | `service::l1_customer_name` —— **L1 强制点那条查询顺带把 `name` 取回来**（谓词本来就带 `parent_id IS NULL`）⇒ 零额外往返。⚠️ 「是不是 L1」与「叫什么」压在同一个 `Option` 上，安全前提是 **`t_customer.name` 是 NOT NULL**（baseline 迁移）—— 若日后改成可空，这道门会把「无名 L1 客户」误拒成 20104 | 与改前逐字相同 |
-| 2 `GET /` | `service::customer_names` —— **一条 `WHERE id = ANY($1)`** 一次取回全部客户名，在内存里 join（`HashMap` 查表） | +1（见 §8.3 第 13 条） |
+| 2 `GET /` | `service::customer_names` —— **一条 `WHERE id = ANY($1)`** 一次取回全部客户名，在内存里 join（`HashMap` 查表） | +1（见 §8.3 第 16 条） |
 | 3 `GET /resolve` | `service::customer_name` —— 与 §2.2 那个顶层字段**同一条查询、同一个值**，一个 `clone()` 后分别填两处 | 与改前逐字相同 |
 
 ⚠️ **`customer_name`（行内）与 §2.2 的 `customer_name`（resolve 顶层）是两个字段、
