@@ -28,6 +28,12 @@
 //! `/{part_id}/...` catch-all 之前注册，否则 axum 会把静态段解析成 part_id。
 //! 组装见 `super::router()`（src/modules/part/mod.rs）。
 
+use axum::Router;
+use axum::routing::post;
+use std::sync::Arc;
+
+use crate::state::AppState;
+
 pub mod batch;
 pub mod crud;
 pub mod lifecycle;
@@ -74,3 +80,17 @@ pub use lifecycle::{cancel, force_complete};
 // 路径落进只注册 GET 的 `/{part_id}`，matchit 先判方法）、GET → **400 纯文本**
 // （方法对上后才轮到 `Path<i64>`）。移除记录见 `batch.rs` 的模块 doc。
 pub use batch::batch_create_parts;
+
+/// part 域**生产链路逃生端点**子路由（不含公共前缀；由 `mod.rs::force_complete_router()`
+/// 转发、`prod::router()` 桥接到 `/prod/parts`）。
+///
+/// 2026-10-13 新增，当前只含 1 条：
+/// - `POST /{part_id}/force-complete` —— MANAGER 单角色强推该 part 全部非 CANCELLED
+///   批次为 `COMPLETED`（绕状态机、不走 OCC）。
+///
+/// 与 [`super::router`] 是两个独立工厂：后者给零件域本体的其余端点（顶层
+/// `/api/v2/parts`），本工厂只含强制完成这一条（`/api/v2/prod/parts`）。前缀并存是
+/// **刻意**的端点级归属裁决，理由见 `super::force_complete_router` 的 doc。
+pub fn force_complete_router() -> Router<Arc<AppState>> {
+    Router::new().route("/{part_id}/force-complete", post(lifecycle::force_complete))
+}

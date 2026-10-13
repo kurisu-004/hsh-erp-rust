@@ -9,9 +9,13 @@
 //!
 //! 2026-10-02 批次路由迁出后，本域只留「多批次动作 + 非批次动作」：
 //! `/{part_id}/cancel`（BATCH-N：翻转该 part 全部活跃批次）、
-//! `/{part_id}/force-complete`（全部非 CANCELLED 批次）、
 //! `/{part_id}/soft-delete`、`GET /{part_id}/batches`（part 的批次集合读）、
 //! 全部 CRUD / 文件 / Excel 工具 / 各类 list 端点。
+//!
+//! ⚠️ **2026-10-13：`/{part_id}/force-complete` 已迁出本域**，硬切到
+//! `POST /api/v2/prod/parts/{part_id}/force-complete`（见本文件 [`force_complete_router`]，
+//! 与装配件侧的 `/prod/assemblies/{id}/force-complete` 对称）；`cancel` 因判据不同**留下**。
+//! 移除记录与旧路径实测形态见本文件末尾的「2026-10-13 force-complete 硬切到 /prod 前缀」一节。
 //!
 //! 以**单个批次**为操作对象的 22 条端点（`to-*` / `deliver` / `complete` /
 //! `pick-up` / `split-batch` / `cancel-batch` / `worker-scan` / 3 条批次集合读 …）
@@ -37,6 +41,47 @@
 //! 而非 404 —— 本域 `/{part_id}`（`Path<i64>`）catch-all 兜住任何未注册的 1 段
 //! 静态路径，再由 `Path` extractor 拒绝非数字段；该成因与「不改跨域路由语义」的
 //! 取舍，本节即全仓最完整的一处说明（外协域侧另有同义登记）。
+//!
+//! ## 2026-10-13 force-complete 硬切到 /prod 前缀（移除记录，防后人重建）
+//!
+//! **硬切下线、**无 alias**：旧 `POST /api/v2/parts/{part_id}/force-complete`
+//! → 新 `POST /api/v2/prod/parts/{part_id}/force-complete`
+//! （挂载点 `prod::router()` 末尾的 `.nest("/parts", part::force_complete_router())`，
+//! 工厂转发见本文件 [`force_complete_router`]）。
+//!
+//! **为什么搬**（判据：谁是主写入对象 + OCC 锚在哪张表）：该端点的唯一实质写入是
+//! `force_complete_all_batches_for_part` —— 把该 part 的**全部非 CANCELLED 批次**强推
+//! `COMPLETED`，`t_part.status` 只是同事务内由 `shared::batch::status` 派生出来的缓存、
+//! 不是主写入对象 ⇒ 与「批次 / 队列动作」同属生产执行语义，与装配件侧那条
+//! `POST /api/v2/prod/assemblies/{id}/force-complete`（2026-10-11，理由原文见
+//! `src/modules/prod/mod.rs` 的模块 doc）**逐条同构**，故对称处理。
+//!
+//! **为什么 `cancel` 不跟着搬**：判据不同。`POST /parts/{part_id}/cancel` 的主写入是
+//! `mark_part_cancelled`（写 `t_part.status`，OCC 锚在 `part.version`），级联取消批次
+//! 只是副作用 ⇒ 留在 part 域的 `/parts/{id}/cancel`，本轮**一行未动**。判据不要
+//! 简写成「凡是碰批次的都归 prod」—— 看的是**主写入对象**。
+//!
+//! **旧路径实测响应形态 = 干净 404、空 body**（钉在
+//! `tests/part/lifecycle.rs::force_complete_old_part_path_is_gone`，实测钉死、不是推理）：
+//! `force-complete` 段的第 2 段是**字面量**，本域全部 2 段路由的第 2 段也都是字面量
+//! （`update` / `cancel` / `events` / …），而 `Path<i64>` catch-all `/{part_id}` 只有
+//! **1 段**、够不着它 ⇒ matchit 无命中、`Path` extractor 根本没机会出手。
+//! ⚠️ 同域的「1 段」一侧形态**不同**，别记混：`POST /parts/batch-with-pdfs`（1 段静态）
+//! POST → **405**、GET → **400 纯文本**。段数是分水岭，但**方法**会改写形态。
+//!
+//! **契约逐字未变**：body `ForceCompleteRequest { note: Option<String> }`
+//! （**无 `version`** —— 本端点属 OCC 豁免清单，见 CLAUDE.md「OCC」第 8 条的逃生口一档）；
+//! 响应 `R<PartOut>`；错误码全在 `201xx`（`20101` 不存在 / `20119` 不可操作状态 /
+//! `20123` `BIZ_PART_ALREADY_COMPLETED` 幂等拒）；角色守卫仍是 MANAGER **单角色**
+//! （handler 首行 + service 入口各一道）；WS 仍是 commit 后 `PART_FORCE_COMPLETED`。
+//!
+//! **前端配套**：只需改 api 层**一处 URL 常量** ——
+//! `frontend/src/api/parts/crud.ts` 的 `forceCompletePart()` 里那行
+//! `` api.post(`/parts/${id}/force-complete`, …) `` 改成 `/prod/parts/${id}/…`；
+//! 请求体（`ForceCompletePayload { note }`）/ 响应解析（`PartOutDto`）/ 错误码处理全部不动。
+//! ⚠️ 前端仓另有一份**逐条 URL 守卫** `frontend/src/api/parts/__tests__/routes.spec.ts`，
+//! 它对 force-complete **只有注释提及、没有断言** ⇒ 本次不需要改它；但它顶部「判据」
+//! 一节把 force-complete 列为「留在 part 域」，建议顺手同步（纯注释，不影响测试）。
 
 pub mod dto_crud;
 pub mod handler;
@@ -129,8 +174,10 @@ pub fn router() -> Router<Arc<AppState>> {
         )
         // BATCH-N：翻转该 part 全部活跃批次 → part CANCELLED（留 part 域）
         .route("/{part_id}/cancel", post(handler::cancel))
-        // BATCH-N：全部非 CANCELLED 批次强推 COMPLETED（留 part 域）
-        .route("/{part_id}/force-complete", post(handler::force_complete)) // 2026-09-30 新增：MANAGER 单角色强推工单 + 所有活跃批次为 COMPLETED（绕状态机）
+        // ⚠️ 2026-10-13：`/{part_id}/force-complete` **自本 router 摘除**，硬切到
+        // `POST /api/v2/prod/parts/{part_id}/force-complete`（`/prod` 前缀下，与装配件侧
+        // 的 `/prod/assemblies/{id}/force-complete` 对称）。理由、移除记录与实测响应
+        // 形态见本文件模块 doc 的「2026-10-13 force-complete 硬切到 /prod 前缀」一节。
         .route("/{part_id}/events", get(handler::list_part_events))
         // part 的批次集合读（留 part 域：操作对象是「该 part 的批次集合」）
         .route("/{part_id}/batches", get(handler::list_part_batches))
@@ -156,4 +203,19 @@ pub fn router() -> Router<Arc<AppState>> {
     // ⚠️ 该分支仍把 size 上限写死成 300MB（同 `bind_uploaded_file` 的老写法，
     // 2026-10-13 review 第 1 轮已在 files 域那侧改成读配置，本侧未动）；
     // 登记见 `files/part_file/mod.rs` 的「已知偏差登记」第 5 条。
+}
+
+/// part 域的**生产链路逃生端点**子路由（不含公共前缀；由 `prod::router()` 桥接到
+/// `/prod/parts`）。
+///
+/// 2026-10-13 新增，当前只含 1 条（自本域 [`router`] 摘出、硬切过来）：
+/// - `POST /{part_id}/force-complete` —— MANAGER 单角色强推该 part 全部非
+///   CANCELLED 批次为 `COMPLETED`（绕状态机、不走 OCC）。
+///
+/// **本域因此有 2 处挂载**：上面的 [`router`]（`modules::v2_router()` 的顶层
+/// `/api/v2/parts` nest，域本体端点一行未动）+ 本工厂（`prod::router()` 里的
+/// `/api/v2/prod/parts` nest）。归属判据与「为什么 `cancel` 不跟着搬」见本文件模块
+/// doc 的「2026-10-13 force-complete 硬切到 /prod 前缀」一节。
+pub fn force_complete_router() -> Router<Arc<AppState>> {
+    handler::force_complete_router()
 }

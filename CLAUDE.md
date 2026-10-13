@@ -176,6 +176,8 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 >
 > ⚠️ **2026-10-11 新增第 3 处**不计入本表的 nest：`POST /api/v2/prod/assemblies/{assembly_id}/force-complete`（`assembly::force_complete_router()`，1 条）。装配件**域本体**仍是核心实体、不进 prod（其 8 条 CRUD / 状态机端点仍在 `/api/v2/assemblies/*`，`modules::v2_router()` 顶层 nest，一行未动）；只有这条生产链路收口的逃生端点归 `/prod` 前缀，理由见 `src/modules/prod/mod.rs` 的模块 doc 与 `src/modules/assembly/mod.rs::force_complete_router`。**本处是首处挂在 `/api/v2/prod` 下的非 prod 子模块 nest**（另两处挂 `/api/v2` 顶层，见上一段）。因它不属于上表任一 prod 子模块，**不计入求和**。
 >
+> ⚠️ **2026-10-13 新增第 4 处**同样不计入本表的 nest：`POST /api/v2/prod/parts/{part_id}/force-complete`（`part::force_complete_router()`，1 条）。零件侧与上面装配件侧**逐条同构**（唯一实质写入是批次的强推、`t_part.status` 只是派生缓存），故对称处理；**硬切无 alias**，旧 `POST /api/v2/parts/{part_id}/force-complete` 实测是**干净 404 空 body**（`force-complete` 是第 2 段字面量、够不着 1 段的 `/{part_id}` catch-all；别与同域 1 段静态的 400/405 记混）。⚠️ **`POST /parts/{part_id}/cancel` 判据不同、刻意留在 part 域**（主写入是 `t_part.status`、OCC 锚 `part.version`，级联取消批次只是副作用）—— 判据是「主写入对象 + OCC 锚点」，不是「碰没碰批次」。⇒ **part 域有两处挂载**（`/api/v2/parts/*` 顶层 nest + 本处 `/api/v2/prod/parts/*`）。移除记录见 `src/modules/part/mod.rs` 的模块 doc。
+>
 > 求和演变：2026-10-08 `prod::worker_pool` 6 条 → `prod::queue` 9 条、`prod::batch` 27 条 → 23 条（两域间净移动 4 条，prod 域求和 62 → 61），同日在 `com` 聚合新增 `com::delivery_note` 子模块 17 条 ⇒ 61 + 17 = 78；2026-10-09 外协三端点合并为 `POST /api/v2/outsource-queue/move`（`outsource` 域）⇒ `prod::batch` 23 → 20（prod 域求和 61 → **58**），同日拆批 1 条提升为顶层共用端点（不计入本表）⇒ `prod::batch` 20 → 19（prod 域求和 **57**）⇒ 全表 **57 + 17 = 74**；2026-10-10 报工台 5 端点收拢进新建的 `prod::scan`：`prod::worker` 7 → 6、`prod::batch` 19 → 17、`part` 域两条 list 端点（不计入本表，part 无独立表）迁入 ⇒ `prod::scan` 5 条，prod 域求和 **57** → **59**（−1 worker、−2 batch、+5 scan，净 +2）⇒ 全表 **59 + 17 = 76**；2026-10-15 报工台扫码找件自助恢复三件套（locate / take-over / outsource-receive）⇒ `prod::scan` 5 → **8**（+3），prod 域求和 **59** → **62** ⇒ 全表 **62 + 17 = 79**；12 行求和 76 → **79**。⚠️ **2026-10-15 订正两处历史算术**：2026-10-10 段的 prod 域求和应为 **59**（旧文误记 55，净变化也非 −3）⇒ 全表 76；本段 prod 域求和应为 **62**。订正后「12 行直加」与「prod 域自己的子模块 + com 域」恒等（均为 **79**）。
 
 ### `src/modules/iam/*` 子模块清单（iam 域 = 认证 / 账号 / 角色 / 货架实体）
@@ -245,7 +247,7 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
   - **元测试**：`shared::domain_guard::tests::*`（6 条，含「本域标识符非法必须 panic」与 raw string 字符串状态两组）。任一写法漏报、误报或探测器瞎了都会红。
 - `DELIVERY_STATUSES`（6 态，`repo/delivery.rs`）是「未交付」的**唯一**判据，逾期计数 / 面板 / 抽屉 / 柱状图 top+middle 四处共用；柱状图 bottom 层额外含 `DELIVERED`。**它与前端 `LAYERS[].statuses` 是人工同步关系，无编译期保障**，改一侧必须改另一侧。
 - ⚠️ **行单位**（2026-10-10）：逾期 = **工单级**；交期面板三桶 = **工单级**（装配件行**替换**其子件行，行内新增 `row_type` 标 PART / ASSEMBLY，装配件的 `quantity` 与 `delivered_quantity` 单位是**套**）；柱状图 / 抽屉 = **件级**（子件各算 1）。
-- ⚠️ **装配件整套交付不变式**（2026-10-10）：逾期 KPI 与面板 `upcoming` / `overdue` 两桶用**同一个** `NOT EXISTS(已交批次)` 谓词（逐字相同 ⇒ `overdue.total == overdue_count` 严格对数）；装配件的 `delivered_sets` 只是 `delivered_quantity` 这个**展示值**的算法、**不参与桶归属**，但在该不变式下与 `NOT EXISTS` 同解（推导见 `docs/api/dashboard.md` §4.4）——不要把其中任何一条当成漏判「修」掉。无装配件套数校验的写路径共 **4 条**（`POST /prod/batches/{batch_id}/deliver`、`POST /prod/batches/scan/deliver`、`POST /parts/{part_id}/force-complete`、`POST /prod/assemblies/{assembly_id}/force-complete`；后两条强推的是 `COMPLETED` 而守卫把 `COMPLETED` 也算已交），排查 SQL 见 §4.4。
+- ⚠️ **装配件整套交付不变式**（2026-10-10）：逾期 KPI 与面板 `upcoming` / `overdue` 两桶用**同一个** `NOT EXISTS(已交批次)` 谓词（逐字相同 ⇒ `overdue.total == overdue_count` 严格对数）；装配件的 `delivered_sets` 只是 `delivered_quantity` 这个**展示值**的算法、**不参与桶归属**，但在该不变式下与 `NOT EXISTS` 同解（推导见 `docs/api/dashboard.md` §4.4）——不要把其中任何一条当成漏判「修」掉。无装配件套数校验的写路径共 **4 条**（`POST /prod/batches/{batch_id}/deliver`、`POST /prod/batches/scan/deliver`、`POST /prod/parts/{part_id}/force-complete`、`POST /prod/assemblies/{assembly_id}/force-complete`；后两条强推的是 `COMPLETED` 而守卫把 `COMPLETED` 也算已交），排查 SQL 见 §4.4。
 - ⚠️ 与 `statistics::repo::sql::count_overdue_undelivered` **有意分叉**（planned 口径 + DELIVERED 事件兜底，服务生产统计页）——不要动它。⚠️ 那是**另一份 SQL**；dashboard 自己这份是 system 口径 + 已交量守卫，两者分叉点只在「交期列 + 事件兜底」两处。
 - 完整契约（含每字段 SQL 来源、移除记录、WS 事件集、前端配套改动清单、已知偏差登记）见 [`docs/api/dashboard.md`](docs/api/dashboard.md)。
 
@@ -593,7 +595,7 @@ commit 之后发一次汇总。前端若订阅了它，会成**死订阅**（永
    - **禁止「读-再-比」式的隐式 OCC**。service 内 `get_batch_by_id` 拿到的 `version` 只能用来做**兜底对账**（0 行时区分归因），不能**替代**客户端传值。理由：看板数据是 30s 缓存的快照，隐式 OCC 下「用户看到 5 件 → 实际移动 3 件」（期间他人改动）会**静默成功**。
    - **`40901 VERSION_CONFLICT` 只表达 OCC**，不得用于业务唯一键冲突（如 worker 的 `badge_code` create 撞车 —— 已知违规，见 `prod/worker/service.rs` 的 `create_worker`）。业务唯一键冲突须有专用码。
    - **豁免清单（刻意无锁，改动时勿「补齐」）**：
-     - 逃生口：`parts/{id}/force-complete`（dto 注释明写「依赖 SQL 行锁串行化」）、`assemblies/{id}/cancel`（service 注释明写「设计上无 OCC，单向状态翻转」）
+     - 逃生口：`prod/parts/{id}/force-complete`（dto 注释明写「依赖 SQL 行锁串行化」）、`assemblies/{id}/cancel`（service 注释明写「设计上无 OCC，单向状态翻转」）
      - 幂等：`iam/users/{id}/reset-password`（⚠️ 另一条 `admin/recompute-rollup`
        已于 2026-10-13 随 admin 域删除，见本文件「派生层对账逃生口的移除记录」）
      - junction 整组替换：`work-types/{id}/processes`、`shelf-processes/{shelf_id}` —— 锚在父表 `version`，不是映射行

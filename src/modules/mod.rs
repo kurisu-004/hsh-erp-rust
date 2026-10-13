@@ -124,6 +124,13 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // 硬切无 alias：旧顶层前缀 `/api/v2/part-files/*`（12 条里 4 条改名 + 8 条删除）
         // 与 `/api/v2/cnc-programs/*`（1 条改名 + 4 条删除）一律 404。
         .nest("/files", files::router())
+        // 2026-10-13：part 域的强制完成逃生端点**硬切到 `/api/v2/prod/parts/*`**
+        // （`prod::router()` 内的 nest，见 `part::force_complete_router`）—— 与装配件侧
+        // 的 `/api/v2/prod/assemblies/*` 对称。⇒ **part 域有两处挂载**：本行的
+        // `/api/v2/parts/*`（域本体端点一行未动）+ `prod::router()` 里的
+        // `/api/v2/prod/parts/*`（1 条）。⚠️ `POST /parts/{id}/cancel` 判据不同
+        // （主写入是 `t_part.status`、OCC 锚在 `part.version`），**刻意留在本 nest**。
+        // 移除记录见 `src/modules/part/mod.rs` 的模块 doc。
         .nest("/parts", part::router())
         .nest("/assemblies", assembly::router())
         // 2026-10-13 删除：`.nest("/part-files", part_file::router())` 与

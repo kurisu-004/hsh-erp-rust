@@ -2,7 +2,14 @@
 //!
 //! 本文件只服务 part 维度的 2 条写端点：
 //! - `POST /api/v2/parts/{part_id}/cancel`
-//! - `POST /api/v2/parts/{part_id}/force-complete`
+//! - `POST /api/v2/prod/parts/{part_id}/force-complete`
+//!
+//! ⚠️ **2026-10-13 硬切**：第二条自 `POST /api/v2/parts/{part_id}/force-complete`
+//! 迁到 `/prod` 前缀（与装配件侧的 `/prod/assemblies/{id}/force-complete` 对称；
+//! **无 alias**，旧路径实测干净 404 空 body）。**handler 函数本文件未搬** —— 它与
+//! `cancel` 同文件、共用本文件的 `ws_broadcast` helper，路由归属与源码位置是两件事。
+//! 本文件的子路由工厂 `force_complete_router()` 定义在 `handler/mod.rs`（路由表在
+//! handler，`part::mod.rs` 只放纯转发，遵「路由声明规约」）。
 //!
 //! 以**单个批次**为操作对象的端点不在 part 域：deliver / complete /
 //! place-on-shelf / recall-to-pending / split-batch / cancel-batch /
@@ -81,7 +88,8 @@ pub async fn cancel(
     Ok(Json(R::ok(out)))
 }
 
-/// `POST /api/v2/parts/{part_id}/force-complete`（2026-09-30 新增）
+/// `POST /api/v2/prod/parts/{part_id}/force-complete`（2026-09-30 新增，2026-10-13
+/// 自 `/api/v2/parts/*` 硬切过来）
 ///
 /// MANAGER **单角色** 强推工单 + 该工单下所有活跃批次为 COMPLETED（绕状态机）。
 /// 事件日志 `FORCE_COMPLETED` 区别常规 COMPLETED；commit 后广播

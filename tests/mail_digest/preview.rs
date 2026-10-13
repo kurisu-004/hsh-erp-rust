@@ -280,7 +280,7 @@ async fn preview_renders_assembly_once_and_hides_its_children() {
 
 /// ★ 只要交过一部分就不再出现在邮件里 —— 且**必须包含 `COMPLETED`**。
 ///
-/// force-complete 端点（`POST /parts/{id}/force-complete` 与
+/// force-complete 端点（`POST /prod/parts/{id}/force-complete` 与
 /// `POST /prod/assemblies/{id}/force-complete`）把批次强推成 `COMPLETED`，
 /// 守卫若只判 `DELIVERED`，已完工的工单会继续出现在「逾期未交」邮件里。
 /// 装配件侧同样要判（子件批次 `COMPLETED` ⇒ 装配件行消失）。

@@ -9,6 +9,10 @@
 //!
 //! part 域的 `cancel` / `force-complete` 留在 `part::service::lifecycle` —— 它们的
 //! 操作对象是 part（一个 part 的全部活跃批次），不是单个批次。
+//! ⚠️ 2026-10-13 起这条只对 `cancel` 成立了：`force-complete` 的**路由**已硬切到
+//! `POST /api/v2/prod/parts/{part_id}/force-complete`（与本域装配件侧那条对称），
+//! 但其 **service 实现仍在 `part::service::lifecycle`** —— 路由归属与源码归属是两件事，
+//! 且下面「收敛目标」第 2 条（service 层也搬进 prod）**仍未做**。
 
 use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;

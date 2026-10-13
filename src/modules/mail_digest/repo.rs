@@ -33,7 +33,7 @@
 //!    不重复计入），装配件单独查 `t_assembly` 且其行**替换**子件行。与 dashboard
 //!    交期面板三桶同一行单位（柱状图 / 抽屉是件级，本域**不**跟它）。
 //! 2. **`NOT EXISTS` 必须同时判 `b.deleted_at IS NULL` 且状态集含 `'COMPLETED'`**：
-//!    force-complete 端点（`POST /parts/{id}/force-complete` 与
+//!    force-complete 端点（`POST /prod/parts/{id}/force-complete` 与
 //!    `POST /prod/assemblies/{id}/force-complete`）把批次强推 `COMPLETED`，
 //!    守卫漏掉 `COMPLETED` 会让已完工的工单继续出现在「逾期未交」邮件里。
 //! 3. **窗口下界来自形参 `today`，SQL 里绝不写 `CURRENT_DATE`**：DB 会话时区

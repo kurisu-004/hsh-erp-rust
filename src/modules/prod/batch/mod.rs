@@ -8,8 +8,11 @@
 //! `router()` 源码逐条一致；下方路由表是给读的人看的手写摘要）。
 //!
 //! part 域自此只保留「多批次动作 + part 级动作」：`/{part_id}/cancel`（BATCH-N）、
-//! `/{part_id}/force-complete`（BATCH-N）、`/{part_id}/soft-delete`、
-//! `GET /{part_id}/batches` 与全部 CRUD / 文件 / Excel 工具 / 各类 list 端点。
+//! `/{part_id}/soft-delete`、`GET /{part_id}/batches` 与全部 CRUD / 文件 /
+//! Excel 工具 / 各类 list 端点。⚠️ **`/{part_id}/force-complete` 已于 2026-10-13
+//! 硬切出 part 域** → `POST /api/v2/prod/parts/{part_id}/force-complete`
+//! （**无 alias**，旧路径干净 404 空 body；`cancel` 判据不同、刻意留下）。
+//! 移除记录见 `src/modules/part/mod.rs` 的模块 doc。
 //!
 //! 依赖方向：prod → part 单向（本模块引用 `PartOut` / `PartRepoTrait` 等 part 域
 //! 实体，状态机自 2026-10-13 起在 `shared::batch::status_machine`）；但 `prod::batch::service` 的批次方法经

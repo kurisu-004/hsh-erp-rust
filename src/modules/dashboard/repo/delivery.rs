@@ -112,7 +112,7 @@ pub const DELIVERY_DETAIL_LIMIT: i64 = 200;
 /// - `POST /api/v2/prod/batches/scan/deliver` —— `prod::batch::service::scan::scan_deliver_part`
 ///   同样只查 `part.status == READY_TO_SHIP` 就 `mark_batch_delivered`（司机扫码发货），
 ///   可单独交一个子件；
-/// - `POST /api/v2/parts/{part_id}/force-complete` —— `force_complete_all_batches_for_part`
+/// - `POST /api/v2/prod/parts/{part_id}/force-complete` —— `force_complete_all_batches_for_part`
 ///   把该 part 全部非 CANCELLED 批次强推 `COMPLETED`，而本守卫的 `status IN
 ///   ('DELIVERED','COMPLETED')` 把 `COMPLETED` 也算已交，可单独交一个子件；
 /// - `POST /api/v2/prod/assemblies/{assembly_id}/force-complete` —— 同一机制但作用对象是

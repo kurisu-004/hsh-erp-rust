@@ -221,7 +221,7 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
 
 1. **工单级行单位**：`t_part` 侧必须带 `AND p.assembly_id IS NULL`。
 2. **`NOT EXISTS` 必须同时判 `b.deleted_at IS NULL` 且状态集含 `'COMPLETED'`**：
-   force-complete 端点（`POST /parts/{id}/force-complete` 与
+   force-complete 端点（`POST /prod/parts/{id}/force-complete` 与
    `POST /prod/assemblies/{id}/force-complete`）把批次强推 `COMPLETED`，守卫漏掉它
    会让**已完工**的工单继续出现在「逾期未交」邮件里。
 3. **窗口下界来自形参 `today`，SQL 里绝不写 `CURRENT_DATE`**：DB 会话时区（测试容器

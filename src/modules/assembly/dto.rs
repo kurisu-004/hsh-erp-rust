@@ -22,7 +22,7 @@ use serde::Deserializer;
 /// `POST /api/v2/prod/assemblies/{assembly_id}/force-complete` 的请求体。
 ///
 /// 2026-10-11 新增。MANAGER **单角色**守卫（不下放 Clerk 等其它角色 —— 与零件级
-/// `POST /api/v2/parts/{part_id}/force-complete` 同款，逃生通道明确不委派）。
+/// `POST /api/v2/prod/parts/{part_id}/force-complete` 同款，逃生通道明确不委派）。
 ///
 /// 语义：完全绕状态机，把装配件 + 全部子件 + 全部**非 CANCELLED** 批次强推
 /// `COMPLETED`。用于「实际早已送货、但没在系统录入」的工单收口；判据是 dashboard

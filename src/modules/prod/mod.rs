@@ -74,8 +74,7 @@
 //! `auto-dispatch`）与召回已剥离到 `prod::queue`（2026-10-08）。
 //!
 //! part 域只留「多批次动作 + 非批次动作」：`POST /parts/{part_id}/cancel`（翻转该
-//! part 全部活跃批次）、`POST /parts/{part_id}/force-complete`（全部非 CANCELLED
-//! 批次）、`POST /parts/{part_id}/soft-delete`、`GET /parts/{part_id}/batches`，
+//! part 全部活跃批次）、`POST /parts/{part_id}/soft-delete`、`GET /parts/{part_id}/batches`，
 //! 以及全部 CRUD / 文件 / Excel 工具 / 各类 list 端点。
 //!
 //! assembly **域本体**仍是核心实体、其 10 条 CRUD / 状态机端点不进 prod（决策不变，
@@ -86,6 +85,20 @@
 //! `/api/v2/prod/assemblies/*`（见本文件 `router()` 末尾的 nest）。这只是端点级
 //! 的归属裁决，不构成「assembly 进 prod」的域归属变更。
 //!
+//! ★ **2026-10-13 零件侧对称处理**：`POST /parts/{part_id}/force-complete` 同样硬切到
+//! `POST /api/v2/prod/parts/{part_id}/force-complete`（`/parts` nest，见 `router()` 末尾）。
+//! 分水岭判据是「**谁是主写入对象 + OCC 锚在哪张表**」：
+//! - `force-complete` 的唯一实质写入是 `force_complete_all_batches_for_part`
+//!   （该 part 全部非 CANCELLED 批次强推 `COMPLETED`），`t_part.status` 只是同事务内
+//!   派生出来的缓存 ⇒ 归 prod，与装配件侧逐条同构；
+//! - `POST /parts/{part_id}/cancel` 的主写入是 `mark_part_cancelled`
+//!   （写 `t_part.status`，OCC 锚在 `part.version`），级联取消批次只是副作用
+//!   ⇒ **刻意留在 part 域，不跟着搬**。
+//!
+//! 两条旧 URL **均无 alias**；请求 / 响应 / 错误码 / OCC 契约逐字不变（force-complete
+//! 属 OCC 豁免清单，无 `version`）。移除记录与旧路径实测响应形态见
+//! `src/modules/part/mod.rs` 的模块 doc（不在本文件 —— part 域才是那段的归属方）。
+//!
 //! URL 硬切换（无 alias）：前端配套 PR 锁步迁移。端点全貌以本文件末尾的
 //! `router()` 聚合为准。
 
@@ -94,6 +107,7 @@ use std::sync::Arc;
 use axum::Router;
 
 use crate::modules::assembly;
+use crate::modules::part;
 use crate::state::AppState;
 
 pub mod batch;
@@ -136,6 +150,11 @@ pub fn router() -> Router<Arc<AppState>> {
         // 见 [`assembly::force_complete_router`] 的 doc —— 装配件域**本体**仍是核心
         // 实体、不进 prod（决策不变），只有这条生产链路收口的端点归 `/prod` 前缀。
         .nest("/assemblies", assembly::force_complete_router())
+        // 2026-10-13 新增：零件级强制完成逃生端点（1 端点，自 part 域硬切过来，与上面
+        // 装配件那条对称）。见 [`part::force_complete_router`] 的 doc —— 零件域**本体**
+        // 同样不进 prod，只有这条收口端点归 `/prod` 前缀；`cancel` 因主写入对象不同
+        // **刻意留在 part 域**。
+        .nest("/parts", part::force_complete_router())
 }
 
 /// 全模块共用的批次拆分工厂（挂载点 `/api/v2/batches`，见 `modules::v2_router`）。

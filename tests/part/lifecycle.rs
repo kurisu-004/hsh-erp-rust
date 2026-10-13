@@ -1389,3 +1389,87 @@ async fn deliver_and_complete_forbidden_for_inspector() {
         assert_eq!(env["code"], 40300, "{uri} 应 40300: {env}");
     }
 }
+
+
+// ===========================================================================
+//  force-complete 硬切到 /prod 前缀（2026-10-13）
+// ===========================================================================
+
+/// 零件级强制完成端点自 `POST /api/v2/parts/{part_id}/force-complete` **硬切**到
+/// `POST /api/v2/prod/parts/{part_id}/force-complete`（与装配件侧的
+/// `/prod/assemblies/{id}/force-complete` 对称）。本用例是新路径的主路径回归 ——
+/// 硬切前该端点**零 HTTP 集成测试**（`rg -in 'force' tests/part/` 当时为空），故这里
+/// 同时把契约钉住：
+/// - body `ForceCompleteRequest { note: Option<String> }`，**无 `version`**（OCC 豁免）；
+/// - 响应 `R<PartOut>`，`data.id` 与 `data.status == "COMPLETED"`；
+/// - 副作用：该 part 全部非 CANCELLED 批次强推 `COMPLETED`，`t_part` 派生随之更新。
+#[tokio::test]
+async fn force_complete_new_prod_path_pushes_part_and_batches_to_completed() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let (pid, bid) = insert_part_with_batch(
+        &pool,
+        "强制完成-新路径",
+        fx.customer_l1_id,
+        "IN_PROCESS",
+        3,
+    )
+    .await;
+
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/parts/{pid}/force-complete"),
+            Some(json!({ "note": "早已送货，补录" })),
+            Some(&token),
+        ),
+    )
+    .await;
+
+    assert_eq!(s, StatusCode::OK, "新路径 force-complete 应成功: {env}");
+    assert_eq!(env["code"], 0, "应成功: {env}");
+    assert_eq!(env["data"]["id"].as_str(), Some(pid.to_string().as_str()), "{env}");
+    assert_eq!(env["data"]["status"], "COMPLETED", "{env}");
+
+    // 批次侧：唯一实质写入落在这里
+    let bstatus: String =
+        sqlx::query_scalar("SELECT status FROM t_part_batch WHERE id = $1")
+            .bind(bid)
+            .fetch_one(&pool)
+            .await
+            .expect("read batch status");
+    assert_eq!(bstatus, "COMPLETED", "批次应被强推 COMPLETED");
+    assert_eq!(part_status(&pool, pid).await, "COMPLETED", "part 派生应同步");
+}
+
+/// **硬切守卫**：旧路径 `POST /api/v2/parts/{part_id}/force-complete` 已无 alias。
+///
+/// ⚠️ 旧路径的响应形态是**实测钉死**的、不是照抄推理：`force-complete` 是
+/// `/{part_id}/force-complete` —— 第 2 段是**字面量**，而本域全部 2 段路由的第 2 段
+/// 也全是字面量（`update` / `cancel` / `events` / …），`Path<i64>` catch-all
+/// `/{part_id}` 只有 **1 段**、够不着它 ⇒ matchit 无命中 ⇒ **干净 404**。
+/// ⚠️ 别把它与同域两条「400 / 405」形态记混：`POST /parts/batch-with-pdfs`（1 段静态）
+/// 会落进 `/{part_id}` 被 `Path<i64>` 拒成 400，POST 则是 405 —— 那是「1 段」的一侧。
+///
+/// 用 `send_raw` 而非 `send`：404 的 body 是空 / 纯文本，`send` 会在解析 JSON 处 panic。
+#[tokio::test]
+async fn force_complete_old_part_path_is_gone() {
+    let (_pool, app, token, fx) = bootstrap_as_manager().await;
+    let (s, raw) = send_raw(
+        app,
+        json_request(
+            "POST",
+            &format!("/parts/{}/force-complete", fx.customer_l1_id),
+            Some(json!({ "note": "旧路径应已下线" })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::NOT_FOUND,
+        "旧路径 POST /api/v2/parts/{{part_id}}/force-complete 必须 404（硬切无 alias，\
+         别把 400/405 当成「路由还在」）: {raw}"
+    );
+}
+

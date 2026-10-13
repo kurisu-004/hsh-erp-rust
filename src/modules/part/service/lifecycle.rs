@@ -147,7 +147,9 @@ impl PartService {
         Ok(PartOut::from(fresh))
     }
 
-    /// 强推工单 + 所有活跃批次为 COMPLETED（force-complete 端点，2026-09-30 新增）。
+    /// 强推工单 + 所有活跃批次为 COMPLETED（force-complete 端点，2026-09-30 新增；
+    /// 2026-10-13 端点硬切到 `POST /api/v2/prod/parts/{part_id}/force-complete`，
+    /// 本方法与请求 / 响应 / 错误码契约**逐字未变**）。
     ///
     /// **MANAGER 单角色守卫**（明确不下放 Clerk 等其它角色 —— 强改逃生通道）；
     /// **完全绕状态机**：非 CANCELLED / 非 COMPLETED 状态均可被强推到 COMPLETED。

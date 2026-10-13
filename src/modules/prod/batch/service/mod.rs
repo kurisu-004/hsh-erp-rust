@@ -51,9 +51,11 @@
 //!
 //! 收敛目标（分两步，本轮只做标注，未动代码）：
 //! 1. prod service 改直调 `PartBatchRepo` / `shared::batch::status`，不再借 part 域 trait；
-//! 2. part 域的 `POST /api/v2/parts/{part_id}/cancel` 与 `/force-complete`
-//!    改走 `prod::batch::service` / `shared::batch::status` —— **前提是先把这 2 条端点重路由
-//!    到 prod 域**，否则 part 域无法在不自建反向依赖的前提下完成多批次动作。
+//! 2. part 域的 `POST /api/v2/parts/{part_id}/cancel` 与
+//!    `POST /api/v2/prod/parts/{part_id}/force-complete`（2026-10-13 已完成**路由**这半步，
+//!    见 `src/modules/part/mod.rs` 的移除记录）改走 `prod::batch::service` /
+//!    `shared::batch::status` —— **`service` 这半步仍未做**（两个方法今天仍在
+//!    `part::service::lifecycle`）。
 //!
 //! ## 事务 / 权限守卫
 //! 事务边界在 handler；权限守卫在 handler 与 service 双层（handler 做权限分发，

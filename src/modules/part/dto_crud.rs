@@ -283,7 +283,8 @@ pub struct CancelRequest {
     #[serde(default)]
     pub note: Option<String>,
 }
-/// `POST /parts/{id}/force-complete` 入参（2026-09-30 新增）。
+/// `POST /prod/parts/{id}/force-complete` 入参（2026-09-30 新增，2026-10-13 自
+/// `/api/v2/parts/*` 硬切到 `/api/v2/prod/parts/*`、**无 alias**）。
 ///
 /// MANAGER 单角色守卫；完全绕状态机把 part + 所有活跃批次强推到 COMPLETED。
 /// 仅可填 `note`（会拼 `[FORCE]` 前缀写入事件日志追溯），不收 `batch_id` /
