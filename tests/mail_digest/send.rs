@@ -25,8 +25,7 @@ use serde_json::{Value, json};
 use hsh_erp_test_support::{json_request, send};
 
 use crate::{
-    Ctx, assert_biz_code, bootstrap, bootstrap_with_mail, config_body, insert_part,
-    unreachable_smtp,
+    Ctx, assert_biz_code, bootstrap, bootstrap_with_sender_account, config_body, insert_part,
 };
 
 /// `POST /send` → `(status, 信封)`。
@@ -66,11 +65,13 @@ fn ok_body() -> Value {
 //  1. 未配置 SMTP → 21701（503），且不落流水
 // ===========================================================================
 
-/// env 侧未配 SMTP（`MailConfig::is_enabled() == false`）⇒ `21701` + **HTTP 503**。
+/// 未选发信邮箱（`sender_account_id` 为 NULL / 指向已删邮箱 / 授权码解不开）
+/// ⇒ `21701` + **HTTP 503**。
 ///
 /// ⚠️ 语义是「服务未就绪」而不是「调用方填错了」—— 与 `BIZ_WX_NOT_CONFIGURED`
 /// (40109 → 503) 同款；**不得**兜底成 400，否则运维会以为是自己的参数问题。
 /// 且这条路径**在渲染之前**就返回 ⇒ 不得产生任何流水行。
+/// （2026-10-16 起判据从 env 换成 DB，见 `main.rs::bootstrap` 的 doc。）
 #[tokio::test]
 async fn send_without_smtp_config_returns_21701_and_writes_no_log() {
     let ctx = bootstrap().await;
@@ -93,7 +94,7 @@ async fn send_without_smtp_config_returns_21701_and_writes_no_log() {
     assert_eq!(
         crate::count_logs(&ctx.pool).await,
         0,
-        "未配置 SMTP 是**前置**拒绝，不得落流水：{env}"
+        "未选定发信邮箱是**前置**拒绝，不得落流水：{env}"
     );
 }
 
@@ -101,15 +102,23 @@ async fn send_without_smtp_config_returns_21701_and_writes_no_log() {
 //  2. SMTP 连不通 → 21702（502）+ 一行 FAILED 流水
 // ===========================================================================
 
-/// ★ 指向 `127.0.0.1:1`（必连不通）⇒ `21702` + HTTP 502，
+/// ★ `mailer::send` 在 SMTP 层失败（零网络 IO：`From` 头解析失败，见
+/// `main.rs::TEST_ACCOUNT_NAME`）⇒ `21702` + HTTP 502，
 /// **并且必须留下一行 `status='FAILED'` + `error_message` 的流水**。
 ///
 /// 这是本域最重要的一条不变量：**落流水在发送之后、且不分成败**。
 /// 只记成功会让「定时任务每天都在失败」完全不可观测 —— 而这恰是定时任务最常见的
-/// 故障形态（凭据过期 / 收件人被拒 / TLS 模式错配）。
+/// 故障形态（授权码过期 / 收件人被拒 / TLS 模式错配）。
+///
+/// ⚠️ **造法在本轮改过（2026-10-16）**：原实现把 SMTP 指向 `127.0.0.1:1`
+/// （端口 1 无监听 ⇒ connect 立刻 refused）。host/port 现在由**编译期预设表**固定
+/// （网易 163 / QQ 都是 465 隐式 TLS），env 那套已整轮删除 ⇒ 那种「指定一个连不通
+/// 的主机」的造法**不再可复现**。改用 `From` 头解析失败：`mailer::send` 的
+/// `build_transport` 之后、`transport.send` 之前就 `Err`，网络 IO 为零，
+/// 后续的「记 FAILED 流水 → 返 `21702`」两段代码**逐字未变**。
 #[tokio::test]
 async fn send_to_unreachable_smtp_returns_21702_and_records_failed_log() {
-    let ctx = bootstrap_with_mail(unreachable_smtp()).await;
+    let ctx = bootstrap_with_sender_account().await;
     insert_part(
         &ctx.pool,
         ctx.customer_id,
@@ -126,9 +135,12 @@ async fn send_to_unreachable_smtp_returns_21702_and_records_failed_log() {
 
     let (status, env) = send_mail(&ctx, ok_body()).await;
     assert_biz_code(status, &env, 21702, StatusCode::BAD_GATEWAY);
-    // 错误文本里应带 SMTP 主机 + 端口（排障第一眼要看的两样）
+    // 错误文本里应带失败原因（排障第一眼要看的那一样）
     let msg = env["message"].as_str().unwrap_or_default();
-    assert!(msg.contains("127.0.0.1"), "错误信息应含 SMTP 主机：{env}");
+    assert!(
+        msg.contains("发件人地址无法解析"),
+        "错误信息应含失败原因：{env}"
+    );
     assert!(msg.contains("log_id="), "应给出流水 id 作为排障指针：{env}");
 
     // 流水：1 行 FAILED + error_message 非空 + 计数与渲染一致
@@ -156,10 +168,10 @@ async fn send_to_unreachable_smtp_returns_21702_and_records_failed_log() {
     );
 }
 
-/// 连不通时**不得**出现 `SUCCESS` 流水行（否则「失败被记成成功」不可排查）。
+/// 发信失败时**不得**出现 `SUCCESS` 流水行（否则「失败被记成成功」不可排查）。
 #[tokio::test]
-async fn send_never_reports_success_when_smtp_unreachable() {
-    let ctx = bootstrap_with_mail(unreachable_smtp()).await;
+async fn send_never_reports_success_when_sending_fails() {
+    let ctx = bootstrap_with_sender_account().await;
     for _ in 0..2 {
         let (status, _) = send_mail(&ctx, ok_body()).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
@@ -181,7 +193,7 @@ async fn send_never_reports_success_when_smtp_unreachable() {
 /// （那不是一次「发送尝试」，落进去会污染「今天发过几封」这个数）。
 #[tokio::test]
 async fn send_with_header_injection_recipient_returns_21703_and_writes_no_log() {
-    let ctx = bootstrap_with_mail(unreachable_smtp()).await;
+    let ctx = bootstrap_with_sender_account().await;
     let (status, env) = send_mail(
         &ctx,
         json!({ "recipients": ["ops@example.com\r\nBcc: victim@x.com"] }),
@@ -198,7 +210,7 @@ async fn send_with_header_injection_recipient_returns_21703_and_writes_no_log() 
 /// 配置组合非法（如两节都关）⇒ `21704`，同样不落流水。
 #[tokio::test]
 async fn send_with_invalid_config_combination_returns_21704_and_writes_no_log() {
-    let ctx = bootstrap_with_mail(unreachable_smtp()).await;
+    let ctx = bootstrap_with_sender_account().await;
     let (status, env) = send_mail(
         &ctx,
         json!({ "include_overdue": false, "include_upcoming": false }),
@@ -215,7 +227,7 @@ async fn send_with_invalid_config_combination_returns_21704_and_writes_no_log() 
 /// CLERK 调 `/send` ⇒ 403（端点全 MANAGER 独占；越权者**发不出信**）。
 #[tokio::test]
 async fn clerk_cannot_send_mail_returns_403() {
-    let ctx = bootstrap_with_mail(unreachable_smtp()).await;
+    let ctx = bootstrap_with_sender_account().await;
     let (status, env) = send(
         ctx.app.clone(),
         json_request(
@@ -239,8 +251,8 @@ async fn clerk_cannot_send_mail_returns_403() {
 // ===========================================================================
 
 /// `POST /config` 成功后 handler 调 `task::mail_digest::reschedule`。
-/// 本用例钉的是「热重载**永不**把保存接口搞挂」：env 侧 SMTP 未配置时
-/// 热重载直接短路返回，保存接口照常 200。
+/// 本用例钉的是「热重载**永不**把保存接口搞挂」：未选发信邮箱时热重载走
+/// 「摘旧 job、不挂新 job」的分支，保存接口照常 200。
 #[tokio::test]
 async fn save_config_survives_scheduler_reschedule() {
     let ctx = bootstrap().await;
@@ -277,7 +289,7 @@ async fn save_config_survives_scheduler_reschedule() {
 /// 走 API 是改不出脏值的（写侧会拒），这正是「真实脏数据」的样子。
 #[tokio::test]
 async fn scheduled_prepare_failure_still_writes_failed_log() {
-    let ctx = bootstrap_with_mail(unreachable_smtp()).await;
+    let ctx = bootstrap_with_sender_account().await;
 
     // 先存一份合法配置，再绕过写侧把 frequency 改成非法值（写侧永远不会产生这种行）
     let (status, env) = send(
@@ -334,7 +346,7 @@ async fn scheduled_prepare_failure_still_writes_failed_log() {
 /// 看得见错误码，流水是唯一的痕迹。
 #[tokio::test]
 async fn scheduled_empty_recipients_still_writes_failed_log() {
-    let ctx = bootstrap_with_mail(unreachable_smtp()).await;
+    let ctx = bootstrap_with_sender_account().await;
 
     let (status, env) = send(
         ctx.app.clone(),

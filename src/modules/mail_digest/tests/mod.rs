@@ -139,6 +139,10 @@ fn req() -> SaveConfigRequest {
             "remaining_days".into(),
         ],
         subject_template: None,
+        // 2026-10-16：发信邮箱。`None` = 未选邮箱（合法，见
+        // `service::validate_sender_account`），所以域内这批**纯校验**用例可以
+        // 照常跑 —— 存在性校验是独立的一条 async 规则（要查库）。
+        sender_account_id: None,
     }
 }
 

@@ -6,19 +6,27 @@
 //! 每条语句自身原子。开事务反而会让「INSERT 流水失败 → 整笔回滚 → 发送结果
 //! 也丢了」这种场景无法发生。
 //!
+//! ## 域外依赖：**1 个模块**（`scheduled_task`）
+//!
+//! 2026-10-16 起发信通道不再来自 env，而是查 `t_mail_account`（由
+//! `scheduled_task` 域 owned）。本域读那一张表（[`resolve_sender`]）与
+//! [`sender_is_available`]。方向是 **mail_digest → scheduled_task**（内容域
+//! 依赖通道域），反向不存在 —— 通道域完全不知道自己会被谁用。
+//!
 //! ## 发送流程（`render_and_send`）的顺序是刻意的
 //!
 //! ```text
-//! 取配置 → 按节开关查统计（关掉的节不查） → 渲染 → 调 lettre → 无论成败落流水
+//! 取配置 → 解析发信通道 → 按节开关查统计（关掉的节不查） → 渲染 → 调 lettre
+//!        → 无论成败落流水
 //! ```
 //!
 //! ⚠️ **落流水在发送之后、且不分成败**：只记成功会让「定时任务每天都在失败」
-//! 这件事完全不可观测 —— 而这恰恰是定时任务最常见的故障形态（凭据过期、
-//! 收件人被拒、TLS 模式错配）。
+//! 这件事完全不可观测 —— 而这恰恰是定时任务最常见的故障形态（授权码过期、
+//! 收件人被拒、主密钥被换过）。
 //!
 //! ## 日志纪律
-//! - **绝不**打印 SMTP password（它只在 [`crate::infra::config::MailConfig`] 的
-//!   手写 `Debug` 里以 `***` 出现）。
+//! - **绝不**打印 SMTP 授权码：它只在 [`ResolvedSender`] 的手写 `Debug` 里以
+//!   `***` 出现。
 //! - 收件人**只打数量 + 掩码**（`a***@x.com`）：地址本身是个人信息，进日志就等于
 //!   把一份客户名册散进了日志文件。
 
@@ -29,7 +37,9 @@ use sqlx::PgConnection;
 
 use crate::auth::rbac::CurrentUser;
 use crate::infra::clock::now_naive;
-use crate::infra::config::MailConfig;
+use crate::infra::crypto;
+use crate::modules::mail_digest::mailer::ResolvedSender;
+use crate::modules::scheduled_task::{dto::MailAccountPreset, repo as mail_account_repo};
 use crate::shared::error::{AppError, code};
 use crate::state::AppState;
 
@@ -43,6 +53,96 @@ use super::repo::{self, NewDigestLog};
 use super::template::{self, RenderInput};
 
 // ============================================================================
+// 发信通道解析（2026-10-16 新增；替代原先的 `MailConfig::is_enabled()`）
+// ============================================================================
+
+/// `t_mail_digest_config.sender_account_id` 指向的邮箱是否**存在且未软删**。
+///
+/// 只判「行在不在」，**不**判授权码能否解密 —— 它是给配置页按钮灰态用的纯 DB
+/// 查询，而解密失败的原因（多半是运维换了 `MAIL_ACCOUNT_SECRET`）对页面上的
+/// 「能不能发」没有帮助，对管理员也不可行动。解密失败那一类只在真发信时以
+/// `21701` 暴露（见 [`resolve_sender`]）。
+pub async fn sender_is_available(conn: &mut PgConnection, account_id: Option<i64>) -> bool {
+    match account_id {
+        None => false,
+        Some(id) => matches!(mail_account_repo::get_account(conn, id).await, Ok(Some(_))),
+    }
+}
+
+/// 把 `sender_account_id` 解析成一条可发信的 [`ResolvedSender`]。
+///
+/// ## 四类失败**统一**映射到 `21701 BIZ_MAIL_NOT_CONFIGURED`（HTTP 503）
+///
+/// | 失败 | 判据 |
+/// |---|---|
+/// | 未选邮箱 | `sender_account_id IS NULL` |
+/// | 指向不存在 / 已软删的邮箱 | `get_account` 返回 `None` |
+/// | 库里 `preset` 是未知字面量 | `MailAccountPreset::parse` 失败 |
+/// | 授权码解不开（base64 坏 / tag 校验失败 / **主密钥被换过**） | `crypto::open` 失败 |
+///
+/// ⚠️ 四者**共用一个码**是刻意的：调用方（HTTP handler / cron job）对这四类的
+/// 可行动动作**完全相同** —— 都是「去把发信邮箱配好」。分码只会让前端多出四个
+/// 分支去渲染同一句提示。真正的差异只写进 `message` 文本与本域的
+/// `tracing::error!`。
+///
+/// ⚠️ **刻意不新开 `SECRET_DECRYPT_FAILED` 码**（任务书与本文件一致）：解密失败最常见
+/// 的成因是「运维把 `MAIL_ACCOUNT_SECRET` 换了」，而那是一个**运维侧**问题，
+/// 不是「某个配置项没填」。所以本函数额外打一行 `tracing::error!` 点名它 ——
+/// 运维看日志能立刻定位，调用方看到的仍是一个可行动的 503。
+pub async fn resolve_sender(
+    conn: &mut PgConnection,
+    account_id: Option<i64>,
+) -> Result<ResolvedSender, AppError> {
+    let Some(id) = account_id else {
+        return Err(no_sender_err(
+            "未选择发信邮箱：请在「定时任务 → 邮件 → 邮箱」里添加邮箱，并在「交期汇总」配置中选定一个",
+        ));
+    };
+    let row = mail_account_repo::get_account(conn, id)
+        .await?
+        .ok_or_else(|| {
+            no_sender_err(&format!(
+                "发信邮箱（id={id}）不存在或已被删除：请在「交期汇总」配置中重新选择一个"
+            ))
+        })?;
+    let preset = MailAccountPreset::parse(&row.preset).map_err(|e| {
+        tracing::error!(error = %e, account_id = id, "mail_digest: 邮箱的 SMTP 预设在库里不可识别");
+        no_sender_err(&format!(
+            "发信邮箱「{}」的 SMTP 预设（{}）不可识别，请重新保存该邮箱",
+            row.name, row.preset
+        ))
+    })?;
+    let password = crypto::open(&row.encrypted_secret).map_err(|e| {
+        tracing::error!(
+            error = %e,
+            account_id = id,
+            "mail_digest: 邮箱授权码解密失败 —— 疑似 env MAIL_ACCOUNT_SECRET 已被更换（换密钥会让全部存量授权码永久解不开）"
+        );
+        no_sender_err(&format!(
+            "发信邮箱「{}」的授权码无法解密：疑似 MAIL_ACCOUNT_SECRET 已被更换，请用新密钥重新保存该邮箱的授权码",
+            row.name
+        ))
+    })?;
+
+    Ok(ResolvedSender {
+        host: preset.host().to_string(),
+        port: preset.port(),
+        tls_mode: preset.tls_mode(),
+        username: row.account.clone(),
+        password,
+        // 发件人地址缺省回退到登录账号（163/QQ 的登录账号本身就是可发信地址）。
+        from_address: row.account.clone(),
+        // 发件人显示名 = 管理员给这个邮箱起的自定义名。
+        from_name: row.name.clone(),
+    })
+}
+
+/// 「发不出信」的统一文案（21701）。
+fn no_sender_err(detail: &str) -> AppError {
+    AppError::biz(code::BIZ_MAIL_NOT_CONFIGURED, detail.to_string())
+}
+
+// ============================================================================
 // 读
 // ============================================================================
 
@@ -51,10 +151,15 @@ use super::template::{self, RenderInput};
 /// 表里无行时返回**全部默认值 + `version=0` + `id="0"`**（而不是 404）：配置页必须
 /// 能在「还没配过」的状态下正常打开并提交首次配置，返 404 会让前端多写一套
 /// 「404 ⇒ 空表单」的分支。
-pub async fn get_config(conn: &mut PgConnection, mail: &MailConfig) -> Result<ConfigOut, AppError> {
+///
+/// `smtp_configured` 是**本轮唯一**需要额外查一次库的地方：判「已选邮箱是否还存在」。
+pub async fn get_config(conn: &mut PgConnection) -> Result<ConfigOut, AppError> {
     match repo::get_config(conn).await? {
-        Some(row) => Ok(ConfigOut::from_row(&row, mail)),
-        None => Ok(ConfigOut::default_out(mail)),
+        Some(row) => {
+            let smtp_configured = sender_is_available(conn, row.sender_account_id).await;
+            Ok(ConfigOut::from_row(&row, smtp_configured))
+        }
+        None => Ok(ConfigOut::default_out(false)),
     }
 }
 
@@ -83,15 +188,16 @@ pub async fn list_logs(conn: &mut PgConnection, q: &LogListQuery) -> Result<LogL
 /// 1. 首次初始化（表里无行、`version=0`）→ INSERT；
 /// 2. 其余 → `UPDATE … WHERE id AND version` 的标准 OCC。
 ///
-/// `mail` 只用于回填 `smtp_configured`（让前端一次拿到「配置行」+「SMTP 是否就绪」），
-/// 不参与 OCC。
+/// **2026-10-16 新增**：先跑 [`validate_sender_account`] 做 `sender_account_id` 的
+/// 存在性校验 —— 指向不存在**或已软删**的邮箱 ⇒ `21706 BIZ_MAIL_ACCOUNT_NOT_FOUND`，
+/// 而不是留到发信时才发现（那时现场只剩一句 503，且配置页上看着一切正常）。
 pub async fn save_config(
     conn: &mut PgConnection,
     req: &SaveConfigRequest,
     current: &CurrentUser,
     snowflake: &crate::infra::snowflake::SnowflakeIdGenerator,
-    mail: &MailConfig,
 ) -> Result<ConfigOut, AppError> {
+    validate_sender_account(conn, req.sender_account_id).await?;
     let normalized = validate_save_request(req)?;
     let now = now_naive();
 
@@ -119,11 +225,12 @@ pub async fn save_config(
     // 读回最新行（含自增后的 version）返回，避免前端拿一个「提交前的 version」
     // 做下一次提交 → 立刻撞一次假的 OCC 冲突。
     let fresh = repo::get_config(conn).await?.ok_or_else(version_conflict)?;
-    Ok(ConfigOut::from_row(&fresh, mail))
+    let smtp_configured = sender_is_available(conn, fresh.sender_account_id).await;
+    Ok(ConfigOut::from_row(&fresh, smtp_configured))
 }
 
 impl ConfigOut {
-    fn from_row(row: &TMailDigestConfig, mail: &MailConfig) -> Self {
+    fn from_row(row: &TMailDigestConfig, smtp_configured: bool) -> Self {
         Self {
             id: row.id,
             version: row.version,
@@ -140,14 +247,15 @@ impl ConfigOut {
             upcoming_days: row.upcoming_days,
             visible_columns: row.visible_columns.clone(),
             subject_template: row.subject_template.clone(),
-            smtp_configured: mail.is_enabled(),
+            sender_account_id: row.sender_account_id,
+            smtp_configured,
             created_at: format_ts(row.created_at),
             updated_at: format_ts(row.updated_at),
         }
     }
 
     /// 表里无行时的「零值配置」：`id="0"` + `version=0` + 缺省内容。
-    fn default_out(mail: &MailConfig) -> Self {
+    fn default_out(smtp_configured: bool) -> Self {
         let d = NormalizedConfig::default();
         Self {
             id: 0,
@@ -169,7 +277,8 @@ impl ConfigOut {
                 .map(|c| c.as_str().to_string())
                 .collect(),
             subject_template: d.subject_template.clone(),
-            smtp_configured: mail.is_enabled(),
+            sender_account_id: d.sender_account_id,
+            smtp_configured,
             // 时间戳在「尚未创建」时没有意义，给一个固定的占位串而不是 `now()`：
             // 前端拿它做「更新时间」展示的话，固定的占位比会跳动的假时间更好判断。
             created_at: String::new(),
@@ -246,6 +355,11 @@ pub(crate) fn now_ts() -> NaiveDateTime {
 /// 5. `visible_columns` 逐项解析（未知项 ⇒ 21704，**不静默丢弃**）；
 /// 6. 两节都关 ⇒ 21704（那样渲出来的是一封纯「无符合条件的工单」的邮件，
 ///    每天发一次纯属骚扰）。
+///
+/// ⚠️ **本函数刻意保持「纯函数、零 DB IO」**：`sender_account_id` 的存在性校验
+/// 被拆到 [`validate_sender_account`]（async、查一次库）。拆开而不是塞进来，
+/// 是为了让本函数仍可被 lib 单测直接调用（域内既有校验矩阵用例全是这么写的），
+/// 也为了让「哪条规则要查库」这件事在函数签名上就是看得见的。
 pub fn validate_save_request(req: &SaveConfigRequest) -> Result<NormalizedConfig, AppError> {
     let frequency: Frequency = req.frequency.parse()?;
 
@@ -287,7 +401,35 @@ pub fn validate_save_request(req: &SaveConfigRequest) -> Result<NormalizedConfig
             .clamp(UPCOMING_DAYS_MIN, UPCOMING_DAYS_MAX),
         visible_columns: parse_visible_columns(&req.visible_columns)?,
         subject_template: validate_subject_template(req.subject_template.as_deref())?,
+        sender_account_id: req.sender_account_id,
     })
+}
+
+/// 2026-10-16 新增：`sender_account_id` 的存在性校验（**唯一**要查库的校验规则）。
+///
+/// `NULL` 是**合法值**（未选邮箱 —— 新装的库在管理员第一次打开配置页之前就是它）；
+/// 指向不存在**或已软删**的邮箱 ⇒ `21706 BIZ_MAIL_ACCOUNT_NOT_FOUND`。
+///
+/// 为什么要在这里查而不在发信时才发现：配置页若接受一个失效的邮箱 id，页面上
+/// 看着一切正常（甚至 `smtp_configured` 也可能在删之前是 `true`），直到定时任务
+/// 真发信才以 `21701` 暴露 —— 那时现场只剩一句 503，没人知道是配置早就坏了。
+pub async fn validate_sender_account(
+    conn: &mut PgConnection,
+    account_id: Option<i64>,
+) -> Result<(), AppError> {
+    let Some(account_id) = account_id else {
+        return Ok(());
+    };
+    if sender_is_available(conn, Some(account_id)).await {
+        return Ok(());
+    }
+    Err(AppError::biz(
+        code::BIZ_MAIL_ACCOUNT_NOT_FOUND,
+        format!(
+            "发信邮箱（id={account_id}）不存在或已被删除：请先在「定时任务 → 邮件 → 邮箱」\
+             里添加，或改选另一个邮箱"
+        ),
+    ))
 }
 
 /// 时段校验：`MANUAL_ONLY` 不需要时刻；其余频率必须给全 `hour` + `minute`。
@@ -490,6 +632,10 @@ pub async fn effective_config(
             None => base.visible_columns,
         },
         subject_template: overrides.subject_template.clone().or(base.subject_template),
+        // 2026-10-16：`PreviewRequest` **刻意不含** `sender_account_id`（见该 DTO 的
+        // doc：/preview 不发信；/send 也不该靠「预览覆盖」顺带换发件人），故这里恒
+        // 沿用当前配置选定的邮箱。
+        sender_account_id: base.sender_account_id,
     };
     // 合并结果走同一套校验（把 NormalizedConfig 还原成「请求体」形态复用校验逻辑）
     validate_normalized(&merged)
@@ -520,6 +666,7 @@ fn normalize_row(row: &TMailDigestConfig) -> Result<NormalizedConfig, AppError> 
         upcoming_days: row.upcoming_days,
         visible_columns: parse_visible_columns(&row.visible_columns)?,
         subject_template: row.subject_template.clone(),
+        sender_account_id: row.sender_account_id,
     })
 }
 
@@ -595,12 +742,16 @@ pub async fn send_manual(
 ///
 /// ## ⚠️ 「准备阶段」的失败**也**落流水（2026-10-13 review 第 1 轮 M8）
 ///
-/// 本函数分两段：**准备**（取连接 → 读配置并规范化 → 判收件人非空）与**投递**
-/// （渲染 → 调 lettre → 落流水）。原实现里准备段失败直接 `return`，`deliver` 根本没
+/// 本函数分两段：**准备**（取连接 → 读配置并规范化 → 判收件人非空 → 判发信通道可用）
+/// 与**投递**（渲染 → 调 lettre → 落流水）。原实现里准备段失败直接 `return`，`deliver` 根本没
 /// 被调用 ⇒ `t_mail_digest_log` 里查不到任何东西，于是「定时任务每天都在失败」这件事
 /// **只剩一行 `tracing::warn!`**——而容器日志恰恰是最容易被轮转掉、最难按时间线回看
 /// 的那一份。可观测性的价值几乎全在流水表上（它是只增的、带 `config_version` 与收件人
 /// 快照的审计表），所以准备段的失败也补一行 `status='FAILED'`。
+///
+/// ⚠️ **2026-10-16 新增一种准备阶段失败**：发信通道不可用（未选邮箱 / 指向已删邮箱 /
+/// 授权码解不开）。它取代了原先的「env 未配 SMTP」那一类，与后者在流水里的落法逐条
+/// 相同（`subject` 空串、两个 count 0、`html_bytes` 0）。
 ///
 /// 唯一落不了的失败是 `pool.acquire()` 本身——没有连接就没有地方写。见
 /// [`log_prepare_failure`] 的 doc。
@@ -628,6 +779,13 @@ pub async fn send_scheduled(state: &Arc<AppState>) {
         let e = empty_recipients_err();
         log_prepare_failure(state, &mut conn, Some(&cfg), &e).await;
         tracing::warn!(error = %e, "mail_digest: 定时汇总邮件准备失败（收件人为空），流水已落库");
+        return;
+    }
+
+    // 发信通道不可用同上（2026-10-16 取代原先的 env 闸）。
+    if let Err(e) = resolve_sender(&mut conn, cfg.sender_account_id).await {
+        log_prepare_failure(state, &mut conn, Some(&cfg), &e).await;
+        tracing::warn!(error = %e, "mail_digest: 定时汇总邮件准备失败（发信通道不可用），流水已落库");
         return;
     }
 
@@ -739,7 +897,7 @@ async fn fetch_rows(
 fn empty_recipients_err() -> AppError {
     AppError::biz(
         code::BIZ_MAIL_CONFIG_INVALID,
-        "收件人为空：请先在「交期汇总邮件」配置里填写至少一个收件人",
+        "收件人为空：请先在「定时任务 → 邮件 → 交期汇总」配置里填写至少一个收件人",
     )
 }
 
@@ -754,14 +912,10 @@ async fn deliver(
     cfg: &NormalizedConfig,
     source: TriggerSource,
 ) -> Result<SendResultOut, AppError> {
-    let mail = &state.config.mail;
-    if !mail.is_enabled() {
-        return Err(AppError::biz(
-            code::BIZ_MAIL_NOT_CONFIGURED,
-            "后端未配置 SMTP：请设置环境变量 MAIL_DIGEST_ENABLED=true 以及 \
-             MAIL_SMTP_USERNAME / MAIL_SMTP_PASSWORD（发件人地址缺省取登录名）后重启",
-        ));
-    }
+    // 发信通道解析（2026-10-16 取代原先的 `MailConfig::is_enabled()` 闸）。
+    // ⚠️ 放在收件人检查**之前**：通道不可用是更根本的故障，先报它，
+    // 免得管理员在「没配邮箱」的现场被「收件人为空」带偏方向。
+    let sender = resolve_sender(conn, cfg.sender_account_id).await?;
     if cfg.recipients.is_empty() {
         return Err(empty_recipients_err());
     }
@@ -776,7 +930,7 @@ async fn deliver(
     });
     let html_bytes = rendered.html.len() as i32;
 
-    let send_result = super::mailer::send(mail, cfg, &rendered.subject, &rendered.html).await;
+    let send_result = super::mailer::send(&sender, cfg, &rendered.subject, &rendered.html).await;
 
     let status = match &send_result {
         Ok(()) => SendStatus::Success,

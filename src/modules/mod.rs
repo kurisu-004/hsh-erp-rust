@@ -32,10 +32,15 @@ pub mod files;
 pub mod iam;
 // 2026-10-13 新增 mail_digest 域：交期到期汇总邮件的配置 + 预览 + 手动触发
 // （6 端点，全部 Manager 独占）+ 后台定时任务（`task::mail_digest`）。
-// SMTP 凭据只走 env（`MAIL_SMTP_*`），本域只管收件人 / 内容口径 / 调度配置（存 DB）。
+// ⚠️ 2026-10-16 改造：SMTP 凭据**不再走 env**（`MAIL_SMTP_*` 已整轮删除），
+// 改由 `scheduled_task` 域的邮箱表提供；本域只管收件人 / 内容口径 / 调度配置。
 pub mod mail_digest;
 pub mod outsource;
 pub mod part;
+// 2026-10-16 新增 scheduled_task 域：「定时任务」菜单下的**邮件通道**（邮箱实体 +
+// SMTP 预设元数据），6 端点全部 Manager 独占，URL 挂 `/api/v2/mail`。
+// 与 mail_digest 域的切分线见该域 `mod.rs` 的模块 doc（通道 vs 内容与调度）。
+pub mod scheduled_task;
 // 2026-10-02 域归属定案：原 `part_batch` 域（1866 行 helper，无独立 URL）整体
 // 归入 prod 域的 `prod::batch` 子模块（src/modules/prod/batch/），承载 `t_part_batch`
 // 的 repo / model / shared::batch::status / 全部批次用例与批次路由（逐条见
@@ -152,6 +157,13 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // 前缀 `/mail-digest`：本仓顶层 nest 惯例是 kebab-case 单段（`/part-files` /
         // `/cnc-programs` / `/outsource-queue`），域名 `mail_digest` 直接连字符化。
         .nest("/mail-digest", mail_digest::router())
+        // 2026-10-16 新增：scheduled_task 域（邮件通道：邮箱 CRUD + SMTP 预设表）。
+        // 6 端点全部 Manager 独占，角色守卫写在各 handler 第一行
+        // （`require_role(Role::Manager)`），此处不挂 role layer。
+        // 前缀 `/mail`：**刻意不是** kebab-case —— 菜单结构改版（一级「定时任务」
+        // / 二级「邮件」）时与前端路由、菜单 seed 的 `path='/mail'` 对齐成同一个词。
+        // 完整契约见 `docs/api/mail.md`。
+        .nest("/mail", scheduled_task::router())
         // 2026-09-28 新增：微信小程序 BFF 域（聚合端点 + 复用 IAM 鉴权）
         // 2026-10-11 重构：按小程序页面切子模块（`/login` + `/part-list`），
         //   URL 跟页面名走，旧 `/wx/iam/*` / `/wx/parts*` / `/wx/dashboard*`

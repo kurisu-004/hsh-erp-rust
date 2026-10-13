@@ -331,11 +331,15 @@ WHERE m.code IN (
     'roles_list',
     'outsource_list', 'outsource_companies_list', 'outsource_quotes_list', 'outsource_send_receive_list',
     'floor_group', 'settings_root',
-    -- 2026-10-13 新增：交期汇总邮件。**仅 MANAGER** —— 4.2 CLERK / 4.3 INSPECTOR /
-    -- 4.4 CNC_PROGRAMMER / 4.5 SHELF_ACCOUNT 四段**都不加**这两个 code。理由与
-    -- 2026-10-05 收紧 process_work_type / part_process_chain 同款：邮件定时任务
-    -- 会**对真实收件人发信**，属配置型 + 有外发副作用的操作，只归管理员。
-    'mail_group', 'mail_digest'
+    -- 2026-10-16 换 code：'mail_group' / 'mail_digest' → 'scheduled_task' / 'mail'
+    -- （菜单结构改版：一级「定时任务」/ 二级「邮件」，页内用 tab 区分邮件类型）。
+    -- 授权范围**逐条不变**，只是 code 换名。
+    --
+    -- **仅 MANAGER** —— 4.2 CLERK / 4.3 INSPECTOR / 4.4 CNC_PROGRAMMER /
+    -- 4.5 SHELF_ACCOUNT 四段**都不加**这两个 code。理由与 2026-10-05 收紧
+    -- process_work_type / part_process_chain 同款：邮箱配置**对真实收件人发信**，
+    -- 属配置型 + 有外发副作用的操作，只归管理员。
+    'scheduled_task', 'mail'
 )
 AND m.deleted_at IS NULL
   AND NOT EXISTS (
@@ -450,7 +454,11 @@ DELETE FROM t_role_menu rm
 USING t_menu m
 WHERE rm.menu_id = m.id
   AND m.code IN ('settings_root', 'work_types_list', 'processes_list', 'work_type_processes_list',
-                 'delivery_dispatch')
+                 'delivery_dispatch',
+                 -- 2026-10-16：旧的一级/二级邮件菜单 code（menu.sql §3.6 已软删）。
+                 -- 换 code 之后旧 code 不再被 §4 声明，其存量授权行若不清，会永远
+                 -- 占着 t_role_menu（指向一条已软删的菜单，对前端不可见也无法再被勾选）。
+                 'mail_group', 'mail_digest')
   AND m.deleted_at IS NOT NULL;
 
 COMMIT;

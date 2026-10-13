@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, version, enabled, frequency, send_hour, send_minute, weekday,\n               day_of_month, recipients, cc_recipients, include_overdue,\n               include_upcoming, upcoming_days, visible_columns, subject_template,\n               created_at, created_by, updated_at, updated_by, deleted_at\n        FROM t_mail_digest_config\n        WHERE deleted_at IS NULL\n        ORDER BY id ASC\n        LIMIT 1\n        ",
+  "query": "\n        SELECT id, version, enabled, frequency, send_hour, send_minute, weekday,\n               day_of_month, recipients, cc_recipients, include_overdue,\n               include_upcoming, upcoming_days, visible_columns, subject_template,\n               sender_account_id, created_at, created_by, updated_at, updated_by, deleted_at\n        FROM t_mail_digest_config\n        WHERE deleted_at IS NULL\n        ORDER BY id ASC\n        LIMIT 1\n        ",
   "describe": {
     "columns": [
       {
@@ -170,6 +170,17 @@
       },
       {
         "ordinal": 15,
+        "name": "sender_account_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_mail_digest_config",
+            "name": "sender_account_id"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
         "name": "created_at",
         "type_info": "Timestamp",
         "origin": {
@@ -180,7 +191,7 @@
         }
       },
       {
-        "ordinal": 16,
+        "ordinal": 17,
         "name": "created_by",
         "type_info": "Int8",
         "origin": {
@@ -191,7 +202,7 @@
         }
       },
       {
-        "ordinal": 17,
+        "ordinal": 18,
         "name": "updated_at",
         "type_info": "Timestamp",
         "origin": {
@@ -202,7 +213,7 @@
         }
       },
       {
-        "ordinal": 18,
+        "ordinal": 19,
         "name": "updated_by",
         "type_info": "Int8",
         "origin": {
@@ -213,7 +224,7 @@
         }
       },
       {
-        "ordinal": 19,
+        "ordinal": 20,
         "name": "deleted_at",
         "type_info": "Timestamp",
         "origin": {
@@ -243,6 +254,7 @@
       false,
       false,
       true,
+      true,
       false,
       true,
       false,
@@ -250,5 +262,5 @@
       true
     ]
   },
-  "hash": "659c191fb9e4e50bf4564c716620715745a793c091c066be0e2bd788d7d884b0"
+  "hash": "ccd554913c6a7b82f19f669c4cc6a1d50f234be403b326e0fdf7fa070633495d"
 }

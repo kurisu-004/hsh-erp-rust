@@ -65,10 +65,18 @@ WHERE deleted_at IS NOT NULL
     -- 2026-09-29 新增：复活待编程（pending_programming）和待品检（inspection_pending）子项，
     -- 它们从顶级/order_group 移到 production_group 下；软删态要复活才能命中 ON CONFLICT。
     'pending_programming',
-    -- 2026-10-13 新增：交期汇总邮件（mail_group 顶级 + mail_digest 子菜单）。
-    -- 放进复活清单的理由同上：软删态下不会被 uk_t_menu_code 的 partial 索引命中，
-    -- ON CONFLICT 失效后会直接 INSERT 撞 PK。
-    'mail_group', 'mail_digest'
+    -- 2026-10-16 换 code：'mail_group' / 'mail_digest' → 'scheduled_task' / 'mail'
+    -- （一级「定时任务」/ 二级「邮件」，见下面 §1 / §2 两段）。
+    --
+    -- ⚠️ **两个旧 code 必须从复活清单里移除**，否则本节会把它们复活，而 §3.6 又要
+    -- 把它们软删 —— 两段互相抵消，seed 反复跑会在「活/删」之间来回跳。更重要的是：
+    -- `ON CONFLICT (code) WHERE deleted_at IS NULL` 的冲突目标是 **code**，改 code 后
+    -- 旧行**不参与冲突判定** ⇒ 新行是 INSERT 而非 UPDATE，`id` 必须换新值（见 §1 / §2
+    -- 的两条 ⚠️）。旧行只由 §3.6 单向软删，不需要复活。
+    --
+    -- 2026-10-13 复活它们时的理由（软删态下不被 partial 索引命中、ON CONFLICT 失效
+    -- 会撞 PK）对本轮的新 code **不适用**：新 code 从来没有过软删行。
+    'scheduled_task', 'mail'
   );
 
 -- ============================================================================
@@ -90,11 +98,16 @@ INSERT INTO t_menu (
     (9000000000000009, NULL, 'auth_group',           '权限管理',   NULL,                  'Key',            30, true, 0, now(), 0, now(), 0),
     (9000000000000010, NULL, 'outsource_list',       '外协管理',   NULL,                  'Promotion',      35, true, 0, now(), 0, now(), 0),
     (9000000000000011, NULL, 'floor_group',          '车间',       NULL,                  'Tools',          40, true, 0, now(), 0, now(), 0),
-    -- 2026-10-13 新增：交期汇总邮件的一级菜单。sort_order=45 —— 刻意插在
-    -- floor_group(40) 与 settings_root(50) 之间：一级菜单从左到右按 sort_order
-    -- 排，「车间」是生产执行侧入口、「设置」是系统配置侧入口，邮件定时任务属于
-    -- 两者之间的「运维自动化」，放 45 会正好卡在两组之间，两边都不挤。
-    (9000000000000013, NULL, 'mail_group',           '定时任务/邮件', NULL,                'Clock',          45, true, 0, now(), 0, now(), 0),
+    -- 2026-10-16 新增：「定时任务」一级菜单（sort_order=45，位置与理由沿用 2026-10-13
+    -- 那版 `mail_group`：一级菜单从左到右按 sort_order 排，「车间」是生产执行侧入口、
+    -- 「设置」是系统配置侧入口，定时任务属于两者之间的「运维自动化」，45 正好卡在中间）。
+    --
+    -- ⚠️ **用新 id `9000000000000014`，不复用旧行的 `...013`**：`ON CONFLICT (code)
+    -- WHERE deleted_at IS NULL` 的冲突目标是 **code**；本行 code 由 `mail_group` 改成
+    -- `scheduled_task`，旧行（id=...013，code=`mail_group`）**不参与**冲突判定 ⇒ 本行
+    -- 走的是 INSERT。若复用 id=...013，会撞 `t_menu_pkey` 让整条 seed 回滚；
+    -- 若不软删旧行，还会留下一条同 title 的孤儿行。
+    (9000000000000014, NULL, 'scheduled_task',       '定时任务',     NULL,                'Clock',          45, true, 0, now(), 0, now(), 0),
     (9000000000000012, NULL, 'settings_root',        '设置',       NULL,                  'Setting',        50, true, 0, now(), 0, now(), 0)
 ON CONFLICT (code) WHERE deleted_at IS NULL DO UPDATE SET
     parent_id  = EXCLUDED.parent_id,
@@ -156,9 +169,13 @@ INSERT INTO t_menu (
     -- 原 id（9000000000000105）保留；sort_order 从 50 改为 30（在 worker_queue 之后）。
     (9000000000000105, (SELECT id FROM t_menu WHERE code = 'production_group'  AND deleted_at IS NULL), 'inspection_pending',        '待品检',        '/inspection/pending',          'CircleCheck',  30, true, 0, now(), 0, now(), 0),
 
-    -- 2026-10-13 新增：mail_group 下。交期汇总邮件（域 mail_digest，6 端点
-    -- 全部 MANAGER 独占）。path 与前端视图名一致（/mail/digest）。
-    (9000000000000901, (SELECT id FROM t_menu WHERE code = 'mail_group'       AND deleted_at IS NULL), 'mail_digest',               '交期汇总邮件',  '/mail/digest',                 'Message',     10, true, 0, now(), 0, now(), 0),
+    -- 2026-10-16 新增：scheduled_task 下。**邮件**（页面上方用 tab 区分邮件类型，
+    -- 当前只有「交期汇总」一种；邮箱账号与授权码在页内配置）。
+    --
+    -- ⚠️ **新 id `9000000000000902`**：与 §1 那条同理 —— code 由 `mail_digest` 改成
+    -- `mail`，旧行（id=...901）不参与 `ON CONFLICT (code)` 判定，复用 id 会撞 pkey。
+    -- path 与前端路由一致（`/mail`）。
+    (9000000000000902, (SELECT id FROM t_menu WHERE code = 'scheduled_task'   AND deleted_at IS NULL), 'mail',                      '邮件',          '/mail',                        'Message',     10, true, 0, now(), 0, now(), 0),
 
     -- template_management 下（023）
     (9000000000000701, (SELECT id FROM t_menu WHERE code = 'template_management' AND deleted_at IS NULL), 'print_templates_designer','模板编辑',     '/print-templates',             'Document',     10, true, 0, now(), 0, now(), 0)
@@ -223,5 +240,21 @@ SET deleted_at = now(),
     updated_at = now(),
     version    = version + 1
 WHERE code = 'delivery_dispatch' AND deleted_at IS NULL;
+
+-- 3.6 旧的「定时任务/邮件」两个菜单 code 整条下线（2026-10-16）：一级 code
+--     `mail_group` → `scheduled_task`、二级 code `mail_digest` → `mail`。
+--     走的仍是「seed 声明新 code + 显式软删旧 code」这条路（与 3.5 同款）而不是硬删：
+--     `t_menu.code` 的唯一索引是 uk_t_menu_code WHERE deleted_at IS NULL，硬删会与
+--     本文件 §0 的复活机制、以及 seeds/rbac.sql §5 的授权清理（按 m.deleted_at IS NOT
+--     NULL 回收残留）三方打架。
+--     配套：§0 复活清单已**移除**这两个旧 code（复活它们再软删是两段互相抵消）；
+--     授权基线（rbac.sql §4.1）不再声明它们，存量授权残留由 rbac.sql §5 清理。
+--     ⚠️ 旧的 `path='/mail/digest'` 一并失效：前端路由同批改到 `/mail`。
+UPDATE t_menu
+SET deleted_at = now(),
+    is_active  = false,
+    updated_at = now(),
+    version    = version + 1
+WHERE code IN ('mail_group', 'mail_digest') AND deleted_at IS NULL;
 
 COMMIT;

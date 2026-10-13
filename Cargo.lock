@@ -1356,6 +1356,7 @@ dependencies = [
  "redis",
  "regex",
  "reqwest",
+ "ring",
  "rsa",
  "rust_decimal",
  "serde",

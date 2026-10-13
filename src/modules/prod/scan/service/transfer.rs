@@ -208,10 +208,7 @@ impl ScanService {
                     [] => {
                         return Err(AppError::biz(
                             code::BIZ_INVALID_VALUE,
-                            format!(
-                                "worker {} 的工种未映射任何工序，无法接管",
-                                worker.id
-                            ),
+                            format!("worker {} 的工种未映射任何工序，无法接管", worker.id),
                         ));
                     }
                     many => {

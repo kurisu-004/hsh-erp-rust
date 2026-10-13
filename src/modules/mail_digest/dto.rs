@@ -348,6 +348,20 @@ pub struct SaveConfigRequest {
     pub visible_columns: Vec<String>,
     #[serde(default)]
     pub subject_template: Option<String>,
+    /// 2026-10-16 新增：发信邮箱（`t_mail_account.id`）。
+    ///
+    /// - **JSON string**（与出参 `ConfigOut.sender_account_id` 对称，雪花 ID 防
+    ///   JS 精度截断）：`deserialize_i64_opt` 只收字符串或 `null`。
+    /// - **`null` / 缺省 = 不选邮箱**：新装的库在管理员第一次打开配置页之前就是
+    ///   这个状态。此时定时任务**不注册 cron**、`POST /send` 返 `21701`
+    ///   （与旧 env 方案「没配 SMTP 就跳过」的降级语义逐条对齐，判据换成 DB）。
+    /// - 指向不存在**或已软删**的邮箱 ⇒ `21706 BIZ_MAIL_ACCOUNT_NOT_FOUND`
+    ///   （写侧校验，不等到发信时才发现）。
+    #[serde(
+        default,
+        deserialize_with = "crate::shared::types::deserialize_i64_opt"
+    )]
+    pub sender_account_id: Option<i64>,
 }
 
 fn default_true() -> bool {
@@ -363,6 +377,10 @@ fn default_upcoming_days() -> i32 {
 /// - **不含 `version`**：这两个端点**不改配置**，只是拿「当前配置 + 临时覆盖」
 ///   渲一封信出来试排版 / 真发一封，OCC 对它们没有意义（覆盖值不落库）。
 /// - 全部字段 `#[serde(default)]`：空体 `{}` = 完全用当前配置，语义最自然。
+/// - ⚠️ **刻意不含 `sender_account_id`**（2026-10-16）：`/preview` 不发信，
+///   发信通道与它无关；`/send` 确实发信，但「用哪个邮箱发」是一条**配置**决策，
+///   不该被「预览一次」这种临时覆盖顺带改掉（否则 /send 的覆盖就成了绕过配置
+///   页直接换发件人的后门）。要换邮箱请走 `POST /config`。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct PreviewRequest {
     #[serde(default)]
@@ -429,6 +447,10 @@ pub struct NormalizedConfig {
     pub upcoming_days: i32,
     pub visible_columns: Vec<VisibleColumn>,
     pub subject_template: Option<String>,
+    /// 2026-10-16 新增：发信邮箱 id（`t_mail_account.id`）；`None` = 未选。
+    ///
+    /// ⚠️ **不参与渲染**（`template::render` 完全不读它），只参与**发信**。
+    pub sender_account_id: Option<i64>,
 }
 
 impl Default for NormalizedConfig {
@@ -461,6 +483,10 @@ impl Default for NormalizedConfig {
             upcoming_days: UPCOMING_DAYS_DEFAULT,
             visible_columns: VisibleColumn::DEFAULT_SET.to_vec(),
             subject_template: None,
+            // 2026-10-16：缺省**不选邮箱**。缺省「选一个自动命中的默认邮箱」会
+            // 让「管理员还没配过邮箱」这件事在配置页上看不出来（页面显示正常、
+            // 只有真发信时才炸）。显式选一次反而是更早暴露问题的形态。
+            sender_account_id: None,
         }
     }
 }
@@ -486,8 +512,19 @@ pub struct ConfigOut {
     pub upcoming_days: i32,
     pub visible_columns: Vec<String>,
     pub subject_template: Option<String>,
-    /// env 侧是否已具备发信能力（`MailConfig::is_enabled()`）。
-    /// 前端据此灰掉「立即发送」并提示去配 `MAIL_SMTP_*`。
+    /// 2026-10-16 新增：发信邮箱 id（**JSON string** 或 `null`）。
+    #[serde(serialize_with = "crate::shared::types::serialize_i64_opt")]
+    pub sender_account_id: Option<i64>,
+    /// 是否**已选定且可用**的发信通道（`sender_account_id` 指向一个未软删邮箱）。
+    ///
+    /// ⚠️ **2026-10-16 语义改写**：原先是「env 侧是否具备发信能力」
+    /// （`MailConfig::is_enabled()`），而 env 那套已整轮删除。现在它是**纯 DB 判定**
+    /// （一次 `get_account` 查询），前端「立即发送」按钮的灰态仍读这一位。
+    ///
+    /// ⚠️ 它**不**校验授权码能否解密（那要真解一次密），所以「主密钥被换过导致
+    /// 存量密文全解不开」这一种故障在这里仍显示为 `true` —— 那一类只在真发信时
+    /// 才以 `21701` 暴露。把它算进来的代价是每次读配置页都要做一次解密，
+    /// 而解密失败的原因对管理员是不可行动的。
     pub smtp_configured: bool,
     /// naive timestamp（Asia/Shanghai），格式 `YYYY-MM-DD HH:MM:SS`。
     pub created_at: String,
@@ -511,6 +548,9 @@ pub struct ConfigDefaultsOut {
     pub upcoming_days: i32,
     pub visible_columns: Vec<String>,
     pub subject_template: Option<String>,
+    /// 2026-10-16 新增：缺省**恒为 `null`**（未选邮箱）。序列化同上，JSON string。
+    #[serde(serialize_with = "crate::shared::types::serialize_i64_opt")]
+    pub sender_account_id: Option<i64>,
 }
 
 impl From<&NormalizedConfig> for ConfigDefaultsOut {
@@ -533,6 +573,7 @@ impl From<&NormalizedConfig> for ConfigDefaultsOut {
                 .map(|c| c.as_str().to_string())
                 .collect(),
             subject_template: c.subject_template.clone(),
+            sender_account_id: c.sender_account_id,
         }
     }
 }
@@ -561,28 +602,26 @@ pub struct RangeOut {
     pub max: i32,
 }
 
-/// `GET /meta` 的 SMTP 公开信息。
+/// `GET /meta` 响应体（前端表单的**内容与调度**选项源都在这一个端点里）。
 ///
-/// ⚠️ **绝不含 username / password**：本段会原样进前端页面。发件地址与主机名
-/// 是排障必需的（收不到信时第一件事就是看发件人），凭据不是。
-#[derive(Debug, Clone, Serialize)]
-pub struct SmtpPublicOut {
-    pub configured: bool,
-    pub host: String,
-    pub port: u16,
-    pub tls_mode: String,
-    pub from_address: String,
-    pub from_name: String,
-}
-
-/// `GET /meta` 响应体（前端表单的**全部**选项源都在这一个端点里）。
+/// ⚠️ **2026-10-16 删掉 `smtp` 段**。原先它带的是 env 侧 SMTP 公开信息
+/// （`configured` / `host` / `port` / `tls_mode` / `from_address` / `from_name`），
+/// 而那些值在「邮箱改为页面内配置」之后**逐条换了归属**：
+///
+/// | 原 `smtp.*` | 新的去处 |
+/// |---|---|
+/// | `configured` | `ConfigOut.smtp_configured`（`GET /config`，纯 DB 判定） |
+/// | `host` / `port` / `tls_mode` | `GET /api/v2/mail/meta` 的 `presets[]` |
+/// | `from_address` | `GET /api/v2/mail/accounts` 的 `account` |
+/// | `from_name` | `GET /api/v2/mail/accounts` 的 `name` |
+///
+/// 保留一个「已经没有任何生产方」的字段只会让前端照着它读一个恒空的对象。
 #[derive(Debug, Clone, Serialize)]
 pub struct MetaOut {
     pub frequencies: Vec<FrequencyOption>,
     pub columns: Vec<ColumnOption>,
     pub defaults: ConfigDefaultsOut,
     pub upcoming_days_range: RangeOut,
-    pub smtp: SmtpPublicOut,
 }
 
 /// `POST /preview` 响应体：**不发送、不落 log**。
