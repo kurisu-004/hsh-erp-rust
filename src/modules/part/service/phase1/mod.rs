@@ -17,7 +17,8 @@
 //! - `work_type.rs` 工种维度只读（list_by_work_type；2026-10-10 起另两条随报工台
 //!   迁往 `crate::modules::prod::scan::listing`）
 //!
-//! 状态机扩展见 `part/statemachine.rs`（2026-09-29 缩至 19 个合法迁移）。
+//! 状态机见 `shared/batch/status_machine.rs`（2026-09-29 缩至 21 个合法迁移；
+//! 2026-10-13 自 `part/statemachine.rs` 上提，该文件随之删除）。
 //! 错误码全部沿用 `shared/error.rs::code` 已声明常量（201xx / 205xx）。
 
 // 2026-10-13 死代码清理（计划项「删 deprecated allow」**实跑后未采纳**）：本模块级

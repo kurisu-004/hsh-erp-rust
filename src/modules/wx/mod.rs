@@ -15,7 +15,7 @@
 //! - 每个页面 = **1 个「首屏聚合端点」**（角标 + 第 1 页数据）+ **1 个「上拉增量端点」**
 //!   （只返增量，不重算角标）
 //! - **VO 不复用任何他域结构**（消灭了跨域复用的 `iam::vo::CurrentUserOut` /
-//!   `iam::vo::LoginResponse` / `part::statemachine::PartStatus`）
+//!   `iam::vo::LoginResponse` / `shared::batch::status_machine::PartStatus`）
 //! - **URL 跟页面名走**（`/login` / `/part-list` / `/production`），不再把别域的
 //!   路径前缀（`/iam`）嫁接过来
 //!

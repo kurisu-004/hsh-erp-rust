@@ -52,12 +52,12 @@ use crate::modules::outsource::repo::sql::NEXT_PROCESS_LATERAL_SQL;
 use crate::modules::outsource::vo::OutsourceMoveResult;
 use crate::modules::part::model::TPartInspected;
 use crate::modules::part::repo::PartRepoTrait;
-use crate::modules::part::statemachine::PartStatus;
 use crate::shared::batch::TPartBatch;
 use crate::shared::batch::guards::{
     ensure_transition, mark_batch_with_status_and_meta, optional_process_chain, optional_step_id,
     validate_batch_version,
 };
+use crate::shared::batch::status_machine::PartStatus;
 use crate::shared::error::{AppError, code};
 // 2026-10-12：`t_part_event` 的写侧自 part 域的事件 INSERT 上提到
 // `shared::part_event`（该表由 7 个模块写、无域归属）。

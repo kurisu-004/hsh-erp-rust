@@ -362,7 +362,7 @@ status = 'IN_PROCESS' AND location = 'PRODUCTION_SHELF'
 pb.status IN ('PENDING', 'PROGRAMMING') AND pb.deleted_at IS NULL AND p.deleted_at IS NULL
 ```
 
-`PROGRAMMING` 是**已废弃**状态（`part::statemachine` 的入口端点已下线，只留出口），但存量行需要在待下发页被消化，故与 `PENDING` **同链路、同待遇**。白名单分布在 6 处，必须同步：
+`PROGRAMMING` 是**已废弃**状态（`shared::batch::status_machine` 的入口端点已下线，只留出口），但存量行需要在待下发页被消化，故与 `PENDING` **同链路、同待遇**。白名单分布在 6 处，必须同步：
 
 | 用途 | SQL 位置 |
 |---|---|
@@ -603,7 +603,7 @@ CTE 删除而过期（cap 改由 service 传入），由 migration `202610150000
 
 queue 域**整体不适用**域隔离护栏：它继承 worker_pool 的「经本域 trait 转发其它域单表查询」pattern（`repo/mod.rs::QueueRepoTrait`，**13 个跨域 helper**，2026-10-15 实测：`worker` 2 / `work_type` 3 / `process` 1 / `process_chain` 1 / `part_batch` 2 / `part` 3 / `part_event` 1），这是逐域剥离期间的既定 pattern（与 assembly / `iam::shelf` / process_chain 同形）。
 
-⚠️ **`shelf_process` 不在 trait 转发明录里（2026-10-15 订正）**：queue 侧 `t_shelf_process` 只在 `repo/dispatch.rs::preview_auto_dispatch` 保留 inline LATERAL SQL（复合查询性能决策，见该处注释）；下发选架自 2026-10-10 起走 `shared::shelf::select::pick_least_loaded`（shared 设施层、无域归属），原先直连的 `prod::shelf_process::repo::ShelfProcessRepo::find_first_shelf_for_process` 已无调用方（现状登记见 §8.4）。trait 转发之外另有一层直连面（既有事实，登记备查、不是漏改）：`service/dispatch.rs` 直调 `part::repo::PartRepo` 与 `prod::process_chain::repo::ProcessChainRepo`，`service/queue.rs` 直调 `part::service::PartService`，`service/recall.rs` 泛型收 `R: PartRepoTrait`（并读 `part::statemachine::PartStatus`）。
+⚠️ **`shelf_process` 不在 trait 转发明录里（2026-10-15 订正）**：queue 侧 `t_shelf_process` 只在 `repo/dispatch.rs::preview_auto_dispatch` 保留 inline LATERAL SQL（复合查询性能决策，见该处注释）；下发选架自 2026-10-10 起走 `shared::shelf::select::pick_least_loaded`（shared 设施层、无域归属），原先直连的 `prod::shelf_process::repo::ShelfProcessRepo::find_first_shelf_for_process` 已无调用方（现状登记见 §8.4）。trait 转发之外另有一层直连面（既有事实，登记备查、不是漏改）：`service/dispatch.rs` 直调 `part::repo::PartRepo` 与 `prod::process_chain::repo::ProcessChainRepo`，`service/queue.rs` 直调 `part::service::PartService`，`service/recall.rs` 泛型收 `R: PartRepoTrait`（并读 `shared::batch::status_machine::PartStatus`）。
 
 **新增的 board 聚合 SQL 零跨域依赖** —— `board/` 子模块单独由 `cargo test --lib` 的 `modules::prod::queue::board::tests::board_aggregation_depends_on_no_other_domain` 守住（扫 `src/modules/prod/queue/board/**/*.rs`，代码区里任何 `crate::modules::<他域>` 路径即失败，含同父兄弟域 `prod::batch`）。护栏为什么只扫 `board/`：聚合 SQL 读的 9 张表完全可以在本域 SQL 内聚合，写端点的转发 pattern 则是既有事实，圈出来单独守比整域不守要强。
 

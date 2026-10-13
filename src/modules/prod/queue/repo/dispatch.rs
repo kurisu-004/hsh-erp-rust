@@ -35,7 +35,7 @@ impl QueueDispatchRepo {
     ///
     /// 2026-10-06：状态闸门由 `pb.status = 'PENDING'` 放宽为
     /// `pb.status IN ('PENDING', 'PROGRAMMING')`。`PROGRAMMING` 是**已废弃**状态
-    /// （`part::statemachine` 中 `PENDING → PROGRAMMING` 的入口端点已下线，只保留
+    /// （`shared::batch::status_machine` 中 `PENDING → PROGRAMMING` 的入口端点已下线，只保留
     /// 4 条出口），但存量行仍需在「待下发」页被消化掉，故与 `PENDING` **同链路、
     /// 同待遇**：同样出现在本列表、同样能被 `dispatch_batch` / `auto_dispatch`
     /// 下发。白名单与 `count_pending_batches` / `preview_auto_dispatch` /

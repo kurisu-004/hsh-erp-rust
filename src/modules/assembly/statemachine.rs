@@ -16,12 +16,13 @@
 //!
 //! ## rollup 函数（part/assembly/batch 重构方案 §4.2 PR-B2）
 //!
-//! `part_status_progress` 提升到 `part::statemachine`（共享函数），本文件
-//! 通过 `use crate::modules::part::statemachine::part_status_progress;` 引用。
+//! `part_status_progress` 提升为共享函数（2026-10-13 起在
+//! `shared::batch::status_machine`，原先在 `part::statemachine`），本文件
+//! 通过 `use crate::shared::batch::status_machine::part_status_progress;` 引用。
 
 use serde::{Deserialize, Serialize};
 
-use crate::modules::part::statemachine::part_status_progress;
+use crate::shared::batch::status_machine::part_status_progress;
 
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

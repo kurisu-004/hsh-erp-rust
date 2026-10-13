@@ -66,7 +66,7 @@
 //!
 //! - ⚠️ **必填**：缺 `?tab=` 是 serde 缺字段 ⇒ axum 提取器层 **HTTP 400 纯文本**
 //!   （**不走 `R<T>`**，旧端点同款行为，本轮不改）；传了但非法才走 40001 / 422。
-//! - ⚠️ **刻意不用** `part::statemachine::PartStatus` 做校验 —— 那正是本次要消灭的
+//! - ⚠️ **刻意不用** `shared::batch::status_machine::PartStatus` 做校验 —— 那正是本次要消灭的
 //!   跨域复用。
 //!
 //! ## ⚠️ `counts` 的键保持 snake_case（`in_progress` / `done`）

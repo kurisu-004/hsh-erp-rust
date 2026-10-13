@@ -27,7 +27,7 @@ pub enum BatchStatusDto {
     /// 的兜底分别是 `unwrap_or(Pending)`（`scan::helpers`，会把返修批次误标
     /// 成 PENDING）和 `Err(BIZ_DELIVERY_NOTE_INVALID_VALUE)`（`lifecycle.rs`，
     /// 会让整张送货单候选查询 400）—— 都是比「显示一个过时标签」严重得多的
-    /// 故障。保留它与 `statemachine::PartStatus::from_str` 的
+    /// 故障。保留它与 `shared::batch::status_machine::PartStatus::from_str` 的
     /// `"REPAIRING" => IN_PROCESS` 兼容分支是同款取舍：宁可容忍脏数据，也不让
     /// 读路径崩。
     ///

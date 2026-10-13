@@ -33,7 +33,7 @@ pub struct ProductionQuery {
     /// [`super::service`]（私有），白名单外的值一律 `AppError::validation`
     /// （40001 / HTTP 422）。
     ///
-    /// 刻意**不**复用 `part::statemachine::PartStatus` 做校验 —— 那正是本次
+    /// 刻意**不**复用 `shared::batch::status_machine::PartStatus` 做校验 —— 那正是本次
     /// 重构要消灭的跨域复用。
     pub tab: String,
     /// 统计月份 `YYYY-MM`；缺省 = 当前月（`chrono::Local::now() %Y-%m`）。

@@ -14,10 +14,10 @@ use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::assembly::service::SyncOutcome;
 use crate::modules::part::model::TPartInspected;
 use crate::modules::part::repo::PartRepoTrait;
-use crate::modules::part::statemachine::PartStatus;
 use crate::modules::part::vo::PartOut;
 use crate::modules::prod::batch::vo::ToXxxOut;
 use crate::shared::batch::TPartBatch;
+use crate::shared::batch::status_machine::PartStatus;
 use crate::shared::error::{AppError, code};
 // 2026-10-12：`t_part_event` 的写侧自 part 域的事件 INSERT 上提到
 // `shared::part_event`（该表由 7 个模块写、无域归属）。

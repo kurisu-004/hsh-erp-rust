@@ -486,7 +486,7 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 | 8 | 回收生产：下一道工序推导；然后**自动选目标架**（候选集自带 `zone='PRODUCTION'` / 启用 / 未软删 / 「映射了该工序」四个谓词） | `20706` / `20508` |
 | 9 | （2026-10-10 删除：回收直送品检方向整条下线。替代路径 = 先收进生产架，再走 `POST /api/v2/prod/batches/{batch_id}/to-inspection`，品检架同样由服务端自动选） | — |
 
-`ensure_transition` 依赖 `PartStatus::can_transition_to`（`part::statemachine` 的内存迁移表）。发送方向用到的两条边是 `PENDING → OUTSOURCE` 与 `IN_PROCESS → OUTSOURCE`；⚠️ `IN_PROCESS → OUTSOURCE` 这条边**曾经缺失**，导致「可发送一览的行（几乎全是 `IN_PROCESS` 源）发一单就被 `20103` 拒」，端到端实测下外协发送 100% 不可用。状态机补边后守卫 6b 才真正承担 location 不变式 —— 别因为「守卫 6 已经能拒」就把它删掉。
+`ensure_transition` 依赖 `PartStatus::can_transition_to`（`shared::batch::status_machine` 的内存迁移表）。发送方向用到的两条边是 `PENDING → OUTSOURCE` 与 `IN_PROCESS → OUTSOURCE`；⚠️ `IN_PROCESS → OUTSOURCE` 这条边**曾经缺失**，导致「可发送一览的行（几乎全是 `IN_PROCESS` 源）发一单就被 `20103` 拒」，端到端实测下外协发送 100% 不可用。状态机补边后守卫 6b 才真正承担 location 不变式 —— 别因为「守卫 6 已经能拒」就把它删掉。
 
 ⚠️ **2026-10-15：回收臂内核抽离（不改守卫）**。`OUTSOURCE_COMPANY → PRODUCTION_SHELF` 的写入段抽成 `service/move.rs::receive_from_outsource_inner`（`pub(crate)`，逐行搬移、判据与文案零改动），供 `prod::scan` 的 `POST /scan/outsource-receive` 复用；`resolve_receive_next_process` 同步改 `pub(crate)`。**守卫 1–6 仍全部留在 `move_batch` 内**（守卫在第一行，位置未动；2026-10-15 起首行守卫为权限点 `outsource.move`，矩阵 = 原 M+C+I），本节的守卫顺序 / 错误码逐条不变。
 

@@ -16,7 +16,7 @@
 //!
 //! ## 2026-10-06：源状态白名单纳入已废弃的 `PROGRAMMING`
 //! 三个方法的状态闸门统一为 `IN ('PENDING', 'PROGRAMMING')`。`PROGRAMMING` 的入口
-//! 端点已下线（见 `part::statemachine`），但存量行需要在「待下发」页被消化，故与
+//! 端点已下线（见 `shared::batch::status_machine`），但存量行需要在「待下发」页被消化，故与
 //! `PENDING` 同链路：同样可列出、同样可批量下发、同样可自动下发。白名单分布在
 //! `QueueDispatchRepo::list_pending_batches` / `count_pending_batches` /
 //! `preview_auto_dispatch` / `update_batch_dispatched` 与本文件 `dispatch_single`，

@@ -43,7 +43,10 @@ pub mod handler;
 pub mod model;
 pub mod repo;
 pub mod service;
-pub mod statemachine;
+// 2026-10-13：本域的 `statemachine` 子模块**整文件删除** —— 它的全部内容
+// （`PartStatus` 枚举 + `can_transition_to` / `part_status_progress` /
+// `compute_part_target` 及其单测）都是批次与工单**共用**的状态机纯函数，已上提到
+// `crate::shared::batch::status_machine`。该文件原本不含任何 part 私有的状态判定。
 pub mod vo;
 
 use axum::{

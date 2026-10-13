@@ -3075,7 +3075,7 @@ async fn cancelling_one_held_batch_releases_capacity_for_the_next() {
 /// - 批次 A：`IN_PROCESS` + `location='WORKER'` + `current_holder_id=<工人>`（在加工）
 /// - 批次 B：`INSPECTION` + `location='INSPECTION_SHELF'`
 /// - part 派生状态 = min-progress = `INSPECTION`（`INSPECTION` 的 progress 4 >
-///   `IN_PROCESS` 的 2，见 `part::statemachine::part_status_progress`）⇒ **可取消**
+///   `IN_PROCESS` 的 2，见 `shared::batch::status_machine::part_status_progress`）⇒ **可取消**
 ///
 /// part 级取消级联把 A、B 一起打成 `CANCELLED`。若 D2 没做，A 会仍以
 /// `location='WORKER'` 挂在该工人名下 ⇒ 额度不释放，正是本次要修的 bug。

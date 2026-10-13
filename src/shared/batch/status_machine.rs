@@ -1,41 +1,48 @@
-//! part 状态机
+//! 批次 / 工单共用的**状态机纯函数**（2026-10-13 自 `part::statemachine` 上提）
 //!
-//! 对应 Python myERP/statemachines/part_state_machine.py。
-//! 实施约定：手写 enum + match 迁移表（`can_transition_to`），状态机不写 DB；
-//! 事件日志由 service 在事务内统一插入。
+//! ## 为什么上提
+//!
+//! 原先这半段住在 `src/modules/part/statemachine.rs`，但它并不是 part 域私有的：
+//! `PartStatus` 这个枚举被**同一个类型**同时用来读 `t_part.status` 与
+//! `t_part_batch.status`（两张表的 `status` 词汇集逐字相同），而
+//! `shared::batch::guards::ensure_transition(from: PartStatus, to: PartStatus)`
+//! 的守卫文案写的是「工单已 CANCELLED」、入参却是批次状态。留在 part 域的直接
+//! 后果就是 `shared::batch` 反向 import `modules::part` —— 违反 CLAUDE.md
+//! 「依赖方向是 域 → shared」的约定，是本仓唯一一处方向违规。
+//!
+//! 上提到 shared 后：`part` / `prod::batch` / `prod::scan` / `prod::queue` /
+//! `outsource` / `assembly` / `com::delivery_note` 与 `shared::batch` 内部的
+//! `guards` / `status` 全部是**同一层依赖 shared**，方向恢复一致。
+//!
+//! ## 搬走的就是全部（原文件无 part 私有内容）
+//!
+//! 搬来的符号：`PartStatus` 枚举 + `from_str` /
+//! `as_str` / `can_transition_to` / [`part_status_progress`] /
+//! [`BatchForRollup`] / [`PartRollupTarget`] / [`compute_part_target`]，连同
+//! 它们的全部单测。⚠️ 原计划以为「part 域特有的一部分会留在 `part::statemachine`」，
+//! 逐条核对后该文件**没有任何 part 私有内容**（返修守卫在
+//! `prod::batch::service::repair` 与 `shared::batch::status`），故
+//! `src/modules/part/statemachine.rs` 随之**整文件删除**。
+//!
+//! ⚠️ **wx 域的「刻意不共享」是已知待办、本轮未动**：`src/modules/wx/` 有 4 处
+//! 注释明写「刻意不用 `PartStatus` 做校验 —— 那正是要消灭的跨域复用」，
+//! `com::delivery_note::vo::BatchStatusDto` 也自持一份带 `Repairing` 变体的
+//! 投影。它们不构成 `shared → modules` 方向违规（是 `modules → modules` 的
+//! 各持一份），故本轮**只解决方向违规**、不改这些域的行为与注释。后续要把它们
+//! 也收敛到本模块，是独立一轮。
+//!
+//! ## 状态词汇与 DB 列的对应
 //!
 //! 状态词汇与 `migrations/20260811100005_005_create_part_tables.sql` 中
 //! `t_part.status` 列语义保持一致（PENDING 默认；INSPECTION 为待检，
-//! READY_TO_SHIP 为待出 / 待装车）。
-//!
-//! ## 2026-09-29 废弃 PROGRAMMING 进入路径
-//!
-//! `PartStatus::PROGRAMMING` 仍保留枚举值（历史数据兼容），但 `can_transition_to`
-//! 删除了 `PENDING → PROGRAMMING` 与 `IN_PROCESS → PROGRAMMING` 两条入口。
-//! 编程员现在通过 `release-from-programming` 唯一出路把已有 PROGRAMMING 批次
-//! 消化到生产流；待编程一览改为基于 `t_process.is_cnc` 列的过滤（新进入路径
-//! 是「直接在 PROCESS_CHAIN 步骤排 CNC step + 上架」）。
-//!
-//! 保留 4 条出口供历史数据消化：
-//! - `PROGRAMMING → PENDING`（recall-to-pending，2026-09-13）
-//! - `PROGRAMMING → IN_PROCESS`（release-from-programming，2026-09-13）
-//! - `PROGRAMMING → INSPECTION`（to-inspection，PR-CRUD）
-//! - `PROGRAMMING → CANCELLED`（cancel，PR-CRUD）
-//!
-//! `part_status_progress` 与 `compute_part_target` 用于 batch → part 状态回
-//! 流的 rollup 计算（与 assembly 域 `compute_assembly_target` 同构）。原
-//! `part_status_progress` 私有定义在 `assembly/statemachine.rs`，提升为共享
-//! 函数：assembly 端 `compute_assembly_target` 通过本模块导入。
-//!
-//! 2026-09-29 废弃：PROGRAMMING 状态的进入路径 `PENDING → PROGRAMMING` 与
-//! `IN_PROCESS → PROGRAMMING` 已从 `can_transition_to` 删除。保留 4 条出口：
-//! `PROGRAMMING → PENDING` / `PROGRAMMING → IN_PROCESS` / `PROGRAMMING → INSPECTION` /
-//! `PROGRAMMING → CANCELLED`。枚举值与 `as_str()` / `FromStr` 映射仍保留以
-//! 兼容历史数据。
+//! READY_TO_SHIP 为待出 / 待装车）。同一套值也是 `t_part_batch.status` 的取值集。
 
 use serde::{Deserialize, Serialize};
 
-/// `t_part.status` 取值（与 migration 005 字段语义对齐）。
+/// `t_part.status` / `t_part_batch.status` 取值（与 migration 005 字段语义对齐）。
+///
+/// ⚠️ 一型两列：`t_part.status` 与 `t_part_batch.status` **共用**本枚举
+/// （两张表的取值集逐字相同，rollup 就是靠这一点把批次状态原样写进 part 派生列）。
 ///
 /// to-XXX 流（to_inspection / to_ship / to_process）按状态机白名单放行；
 /// 其它合法迁移留到后续 PR 补齐。当前 `can_transition_to` 严格按白名单放行。
@@ -208,6 +215,157 @@ impl PartStatus {
                 | (OUTSOURCE, CANCELLED) // cancel 路径
         )
     }
+}
+
+// ===== rollup 共享函数（part/assembly/batch 重构方案 §4.2 PR-B2） =====
+
+/// batch.status → progress rank（镜像 Python `ROLLUP_PROGRESS`）。
+///
+/// 序值：
+/// - PENDING     = 0
+/// - PROGRAMMING = 1
+/// - IN_PROCESS  = 2（2026-10-01：原 `IN_PROCESS | REPAIRING` 合并为单值，
+///   返修由 `t_part_batch.is_repairing` 标记承载、状态本身留在 IN_PROCESS）
+/// - OUTSOURCE   = 3（外包是 IN_PROCESS 的延伸，独立 rank）
+/// - INSPECTION  = 4
+/// - READY_TO_SHIP = 5
+/// - DELIVERED   = 6
+///
+/// 未知值 → 2（IN_PROCESS 等价，防御兜底）。
+///
+/// 提升为 pub：从 assembly 域 `compute_assembly_target` 复用，避免两个域各
+/// 维护一份 progress 表导致漂移。
+pub fn part_status_progress(s: &str) -> u8 {
+    match s {
+        "PENDING" => 0,
+        "PROGRAMMING" => 1,
+        "IN_PROCESS" => 2,
+        "OUTSOURCE" => 3,
+        "INSPECTION" => 4,
+        "READY_TO_SHIP" => 5,
+        "DELIVERED" => 6,
+        _ => 2,
+    }
+}
+
+/// `compute_part_target` 的输入投影（仅 rollup 所需列；避免引入完整 `TPartBatch`）。
+///
+/// 2026-09-16 PR-2 瘦身（migration 027）：`location` / `current_holder_id` /
+/// `placed_at` 列已从 t_part 删除，rollup 投影同步收窄。`next_process_id` 仍
+/// 保留作 part 派生列读缓存（service 层按 `next_process_id` 决策下一步）。
+///
+/// 2026-09-16 PR-3 批次 step 化（migration 028）：
+/// - 删 `placed_at`（t_part_batch 列已删）
+/// - `next_process_id` → `current_process_step_id`（t_part_batch 新列，逻辑 FK → step.id）
+///
+/// 2026-09-30 改直读 `current_process_id`（migration 004，逻辑 FK → t_process.id）：
+/// 字段由 `current_process_step_id` 改名。原先 rollup 派生只拿 step_id，再由
+/// service 层**额外发一次 SELECT** 去 `t_process_chain_step` 翻 `process_id`；
+/// 且「最慢批次」（min progress）只按 status 挑、不看工序，若它 step_id 为 NULL
+/// （无工序链工单的常态）就会把整个工单的 `t_part.next_process_id` 抹成 NULL，
+/// 而该列是删工序的保护条件之一（`prod/process` 的 `count_referencing` 5 个
+/// 子查询之一）。新列 `current_process_id` 是批次工序池归属的**权威依据**，
+/// 直读它即可，无需 step 中转。
+#[derive(Debug, Clone, Default)]
+pub struct BatchForRollup {
+    pub status: String,
+    pub location: Option<String>,
+    pub current_holder_id: Option<i64>,
+    /// 逻辑 FK → `t_process.id`；2026-09-30 改直读新列（migration 004）。
+    pub current_process_id: Option<i64>,
+}
+
+/// `compute_part_target` 的输出：目标 status + 派生列（从最慢批次物化）。
+///
+/// 2026-09-16 PR-2 瘦身：只物化 `status` + `next_process_id`（t_part 保留的两
+/// 列 rollup 缓存）。`location` / `current_holder_id` / `placed_at` 真相源在
+/// `t_part_batch`，由 `sync_from_batch_change` 的 caller 在需要时另查。
+///
+/// 2026-09-16 PR-3 批次 step 化：`next_process_id` 字段保留作为派生缓存值，
+/// 但派生源改为 `BatchForRollup.current_process_step_id`（service 层
+/// `sync_from_batch_change` JOIN `t_process_chain_step` 取 `process_id` 写入）。
+/// 本函数只搬运 step_id → next_process_id（语义对齐：step 进程维度 1:1，
+/// rollup 派生保留同一 process_id）。
+///
+/// 2026-09-30 改直读 `current_process_id`（migration 004）：字段名同步改为
+/// `current_process_id`，且**这次名实相符**——承载的确实是 `t_process.id`
+/// （原 `next_process_id` 名下装的是 step_id，误导性命名）。DB 列名与对外
+/// DTO 字段名 `t_part.next_process_id` 不动，仅内部 struct 改名。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartRollupTarget {
+    pub status: String,
+    /// 2026-09-30：由「实装 step_id 的 next_process_id」改为真正的 process_id。
+    pub current_process_id: Option<i64>,
+}
+
+/// batch 集 → part rollup target（part/assembly/batch 重构方案 §4.2 步骤 1–6）。
+///
+/// 规则（与 assembly 端 `compute_assembly_target` 同构，但 part 与 batch 状态
+/// 词汇相同，直接取 status 字符串）：
+///
+/// 1. 空集 → `None`（防御；caller 走 NoChange）
+/// 2. 全部 CANCELLED → `status='CANCELLED'`
+/// 3. 非 CANCELLED 全部 COMPLETED → `status='COMPLETED'`
+/// 4. 否则取「最慢批次」（min progress over non-terminal, non-cancelled）的
+///    `status` + `current_process_id`（`t_part.next_process_id` 派生缓存）；
+///    progress 表见 `part_status_progress`
+///
+/// 2026-09-16 PR-2 瘦身：返回值只剩 `status` + `next_process_id`；其它派
+/// 生列（`location` / `current_holder_id` / `placed_at`）真相源在
+/// `t_part_batch`，由 `sync_from_batch_change` 的 caller 在需要时另查。
+///
+/// 2026-09-30 改直读 `current_process_id`（migration 004）：本函数保持纯函数
+/// 性质（不引入 SQL、不查 `t_process_chain_step`）。caller
+/// `sync_from_batch_change` 直接把 `current_process_id` 写进
+/// `t_part.next_process_id`，省掉原先「step_id → 一次 SELECT → process_id」的
+/// 转译往返。
+pub fn compute_part_target(batches: &[BatchForRollup]) -> Option<PartRollupTarget> {
+    if batches.is_empty() {
+        return None;
+    }
+    let non_cancelled: Vec<&BatchForRollup> =
+        batches.iter().filter(|b| b.status != "CANCELLED").collect();
+    if non_cancelled.is_empty() {
+        let r = &batches[0];
+        return Some(PartRollupTarget {
+            status: "CANCELLED".to_string(),
+            current_process_id: r.current_process_id,
+        });
+    }
+    let non_terminal: Vec<&BatchForRollup> = non_cancelled
+        .iter()
+        .copied()
+        .filter(|b| b.status != "COMPLETED")
+        .collect();
+    if non_terminal.is_empty() {
+        let r = non_cancelled[0];
+        return Some(PartRollupTarget {
+            status: "COMPLETED".to_string(),
+            current_process_id: r.current_process_id,
+        });
+    }
+    // 取 min-progress 批次
+    let min = non_terminal
+        .iter()
+        .min_by_key(|b| part_status_progress(&b.status))
+        .copied()
+        .unwrap(); // safety: non_terminal 至少有一条
+    Some(PartRollupTarget {
+        // 2026-10-01：归一化存量 'REPAIRING' → 'IN_PROCESS'。REPAIRING 已从
+        // PartStatus 降级为 `t_part_batch.is_repairing` 标记列（migration
+        // 005/006），本函数的返回值会被原样写进 `t_part.status`；若不在此
+        // 归一化，未跑 migration 006 的环境会把 'REPAIRING' 重新写回派生列，
+        // 让「枚举已无该值」的读侧只能靠 `from_str` 兼容分支兜底。
+        status: normalize_legacy_repairing(&min.status).to_string(),
+        current_process_id: min.current_process_id,
+    })
+}
+
+/// 2026-10-01 新增：rollup 输出归一化（`'REPAIRING'` → `'IN_PROCESS'`）。
+///
+/// 纯字符串映射，不改 progress 档位（两者同档 2，见 `part_status_progress`）。
+fn normalize_legacy_repairing(s: &str) -> &str {
+    if s == "REPAIRING" { "IN_PROCESS" } else { s }
 }
 
 #[cfg(test)]
@@ -459,157 +617,7 @@ mod tests {
     }
 }
 
-// ===== rollup 共享函数（part/assembly/batch 重构方案 §4.2 PR-B2） =====
-
-/// batch.status → progress rank（镜像 Python `ROLLUP_PROGRESS`）。
-///
-/// 序值：
-/// - PENDING     = 0
-/// - PROGRAMMING = 1
-/// - IN_PROCESS  = 2（2026-10-01：原 `IN_PROCESS | REPAIRING` 合并为单值，
-///   返修由 `t_part_batch.is_repairing` 标记承载、状态本身留在 IN_PROCESS）
-/// - OUTSOURCE   = 3（外包是 IN_PROCESS 的延伸，独立 rank）
-/// - INSPECTION  = 4
-/// - READY_TO_SHIP = 5
-/// - DELIVERED   = 6
-///
-/// 未知值 → 2（IN_PROCESS 等价，防御兜底）。
-///
-/// 提升为 pub：从 assembly 域 `compute_assembly_target` 复用，避免两个域各
-/// 维护一份 progress 表导致漂移。
-pub fn part_status_progress(s: &str) -> u8 {
-    match s {
-        "PENDING" => 0,
-        "PROGRAMMING" => 1,
-        "IN_PROCESS" => 2,
-        "OUTSOURCE" => 3,
-        "INSPECTION" => 4,
-        "READY_TO_SHIP" => 5,
-        "DELIVERED" => 6,
-        _ => 2,
-    }
-}
-
-/// `compute_part_target` 的输入投影（仅 rollup 所需列；避免引入完整 `TPartBatch`）。
-///
-/// 2026-09-16 PR-2 瘦身（migration 027）：`location` / `current_holder_id` /
-/// `placed_at` 列已从 t_part 删除，rollup 投影同步收窄。`next_process_id` 仍
-/// 保留作 part 派生列读缓存（service 层按 `next_process_id` 决策下一步）。
-///
-/// 2026-09-16 PR-3 批次 step 化（migration 028）：
-/// - 删 `placed_at`（t_part_batch 列已删）
-/// - `next_process_id` → `current_process_step_id`（t_part_batch 新列，逻辑 FK → step.id）
-///
-/// 2026-09-30 改直读 `current_process_id`（migration 004，逻辑 FK → t_process.id）：
-/// 字段由 `current_process_step_id` 改名。原先 rollup 派生只拿 step_id，再由
-/// service 层**额外发一次 SELECT** 去 `t_process_chain_step` 翻 `process_id`；
-/// 且「最慢批次」（min progress）只按 status 挑、不看工序，若它 step_id 为 NULL
-/// （无工序链工单的常态）就会把整个工单的 `t_part.next_process_id` 抹成 NULL，
-/// 而该列是删工序的保护条件之一（`prod/process` 的 `count_referencing` 5 个
-/// 子查询之一）。新列 `current_process_id` 是批次工序池归属的**权威依据**，
-/// 直读它即可，无需 step 中转。
-#[derive(Debug, Clone, Default)]
-pub struct BatchForRollup {
-    pub status: String,
-    pub location: Option<String>,
-    pub current_holder_id: Option<i64>,
-    /// 逻辑 FK → `t_process.id`；2026-09-30 改直读新列（migration 004）。
-    pub current_process_id: Option<i64>,
-}
-
-/// `compute_part_target` 的输出：目标 status + 派生列（从最慢批次物化）。
-///
-/// 2026-09-16 PR-2 瘦身：只物化 `status` + `next_process_id`（t_part 保留的两
-/// 列 rollup 缓存）。`location` / `current_holder_id` / `placed_at` 真相源在
-/// `t_part_batch`，由 `sync_from_batch_change` 的 caller 在需要时另查。
-///
-/// 2026-09-16 PR-3 批次 step 化：`next_process_id` 字段保留作为派生缓存值，
-/// 但派生源改为 `BatchForRollup.current_process_step_id`（service 层
-/// `sync_from_batch_change` JOIN `t_process_chain_step` 取 `process_id` 写入）。
-/// 本函数只搬运 step_id → next_process_id（语义对齐：step 进程维度 1:1，
-/// rollup 派生保留同一 process_id）。
-///
-/// 2026-09-30 改直读 `current_process_id`（migration 004）：字段名同步改为
-/// `current_process_id`，且**这次名实相符**——承载的确实是 `t_process.id`
-/// （原 `next_process_id` 名下装的是 step_id，误导性命名）。DB 列名与对外
-/// DTO 字段名 `t_part.next_process_id` 不动，仅内部 struct 改名。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PartRollupTarget {
-    pub status: String,
-    /// 2026-09-30：由「实装 step_id 的 next_process_id」改为真正的 process_id。
-    pub current_process_id: Option<i64>,
-}
-
-/// batch 集 → part rollup target（part/assembly/batch 重构方案 §4.2 步骤 1–6）。
-///
-/// 规则（与 assembly 端 `compute_assembly_target` 同构，但 part 与 batch 状态
-/// 词汇相同，直接取 status 字符串）：
-///
-/// 1. 空集 → `None`（防御；caller 走 NoChange）
-/// 2. 全部 CANCELLED → `status='CANCELLED'`
-/// 3. 非 CANCELLED 全部 COMPLETED → `status='COMPLETED'`
-/// 4. 否则取「最慢批次」（min progress over non-terminal, non-cancelled）的
-///    `status` + `current_process_id`（`t_part.next_process_id` 派生缓存）；
-///    progress 表见 `part_status_progress`
-///
-/// 2026-09-16 PR-2 瘦身：返回值只剩 `status` + `next_process_id`；其它派
-/// 生列（`location` / `current_holder_id` / `placed_at`）真相源在
-/// `t_part_batch`，由 `sync_from_batch_change` 的 caller 在需要时另查。
-///
-/// 2026-09-30 改直读 `current_process_id`（migration 004）：本函数保持纯函数
-/// 性质（不引入 SQL、不查 `t_process_chain_step`）。caller
-/// `sync_from_batch_change` 直接把 `current_process_id` 写进
-/// `t_part.next_process_id`，省掉原先「step_id → 一次 SELECT → process_id」的
-/// 转译往返。
-pub fn compute_part_target(batches: &[BatchForRollup]) -> Option<PartRollupTarget> {
-    if batches.is_empty() {
-        return None;
-    }
-    let non_cancelled: Vec<&BatchForRollup> =
-        batches.iter().filter(|b| b.status != "CANCELLED").collect();
-    if non_cancelled.is_empty() {
-        let r = &batches[0];
-        return Some(PartRollupTarget {
-            status: "CANCELLED".to_string(),
-            current_process_id: r.current_process_id,
-        });
-    }
-    let non_terminal: Vec<&BatchForRollup> = non_cancelled
-        .iter()
-        .copied()
-        .filter(|b| b.status != "COMPLETED")
-        .collect();
-    if non_terminal.is_empty() {
-        let r = non_cancelled[0];
-        return Some(PartRollupTarget {
-            status: "COMPLETED".to_string(),
-            current_process_id: r.current_process_id,
-        });
-    }
-    // 取 min-progress 批次
-    let min = non_terminal
-        .iter()
-        .min_by_key(|b| part_status_progress(&b.status))
-        .copied()
-        .unwrap(); // safety: non_terminal 至少有一条
-    Some(PartRollupTarget {
-        // 2026-10-01：归一化存量 'REPAIRING' → 'IN_PROCESS'。REPAIRING 已从
-        // PartStatus 降级为 `t_part_batch.is_repairing` 标记列（migration
-        // 005/006），本函数的返回值会被原样写进 `t_part.status`；若不在此
-        // 归一化，未跑 migration 006 的环境会把 'REPAIRING' 重新写回派生列，
-        // 让「枚举已无该值」的读侧只能靠 `from_str` 兼容分支兜底。
-        status: normalize_legacy_repairing(&min.status).to_string(),
-        current_process_id: min.current_process_id,
-    })
-}
-
-/// 2026-10-01 新增：rollup 输出归一化（`'REPAIRING'` → `'IN_PROCESS'`）。
-///
-/// 纯字符串映射，不改 progress 档位（两者同档 2，见 `part_status_progress`）。
-fn normalize_legacy_repairing(s: &str) -> &str {
-    if s == "REPAIRING" { "IN_PROCESS" } else { s }
-}
-
+/// rollup 共享函数的单测（2026-10-13 随函数一并从 `part::statemachine` 搬来）。
 #[cfg(test)]
 mod rollup_tests {
     use super::*;

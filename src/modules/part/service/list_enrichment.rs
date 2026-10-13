@@ -26,6 +26,11 @@ use sqlx::PgConnection;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::prod::batch::repo::PartBatchRepo;
 use crate::shared::batch::TPartBatch;
+// 2026-10-13：原先本文件另存一份 `part_status_progress_inline`（与状态机
+// 8 个 match 臂逐字同形），已删改为直调 `shared::batch::status_machine` 的那一份。
+// 理由：原注释「避免在 service 层引一圈 statemachine 依赖」已失效 —— 同域的
+// `service/lifecycle.rs` 早就在 import `PartStatus`（同一子模块树内）。
+use crate::shared::batch::status_machine::part_status_progress;
 use crate::shared::error::AppError;
 
 /// 列表页「位置 / 持有人」派生（按 min-progress 活跃批次，跨 t_shelf /
@@ -88,10 +93,10 @@ pub(crate) async fn enrich_part_list_with_location_and_holder<R: PartRepoTrait>(
         } else {
             bs.iter().collect()
         };
-        // min progress（与 statemachine::part_status_progress 对齐）。
+        // min progress（口径见 `shared::batch::status_machine::part_status_progress`）。
         if let Some(min) = candidates
             .iter()
-            .min_by_key(|b| part_status_progress_inline(&b.status))
+            .min_by_key(|b| part_status_progress(&b.status))
             .copied()
         {
             target_per_part.insert(part_id, min);
@@ -294,29 +299,4 @@ pub(crate) async fn fetch_delivered_sets(
         out.insert(asm_id, sets);
     }
     Ok(out)
-}
-
-/// 与 `crate::modules::part::statemachine::part_status_progress` 同逻辑的
-/// 内联副本（避免在 service 层引一圈 statemachine 依赖）。PR-2 增列同步。
-///
-/// 2026-10-01：删掉 `"IN_PROCESS" | "REPAIRING" => 2` 的合并臂，改回单值
-/// `"IN_PROCESS" => 2`。REPAIRING 降级为 `t_part_batch.is_repairing` 标记列
-/// 后，`t_part.status` 里不会再出现该字面量（migration 006 已把存量洗白，
-/// shared::batch::status 也永不写它）。
-///
-/// ⚠️ 存量兼容：migration 006 未 apply 的环境里仍可能读到 `'REPAIRING'`，此时
-/// 落到 `_ => 2` 兜底臂 —— 恰好与原 REPAIRING 档位（2）相同，故本函数对
-/// 两种数据形态**返回值一致**（与 `statemachine::part_status_progress` 的
-/// 同款兜底同构）。
-fn part_status_progress_inline(s: &str) -> u8 {
-    match s {
-        "PENDING" => 0,
-        "PROGRAMMING" => 1,
-        "IN_PROCESS" => 2,
-        "OUTSOURCE" => 3,
-        "INSPECTION" => 4,
-        "READY_TO_SHIP" => 5,
-        "DELIVERED" => 6,
-        _ => 2,
-    }
 }

@@ -51,8 +51,8 @@
 use sqlx::PgConnection;
 
 use crate::modules::iam::shelf::repo::ShelfRepo;
-use crate::modules::part::statemachine::PartStatus;
 use crate::shared::batch::status::{StatusChange, apply_batch_status_change};
+use crate::shared::batch::status_machine::PartStatus;
 use crate::shared::error::{AppError, code};
 
 #[derive(sqlx::FromRow)]
@@ -534,7 +534,7 @@ pub async fn optional_step_id(
 mod tests {
     use super::*;
     use crate::infra::clock::now_naive;
-    use crate::modules::part::statemachine::PartStatus;
+    use crate::shared::batch::status_machine::PartStatus;
     // 2026-10-09：本模块测试 ID 一律从
     // `crate::shared::test_snowflake::shared_test_snowflake()`（**lib 单测进程内唯一**
     // 的 generator 对象）取号，不再就地 `SnowflakeIdGenerator::new`（为什么不用

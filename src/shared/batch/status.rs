@@ -85,8 +85,8 @@ use sqlx::PgConnection;
 use crate::modules::assembly::repo::AssemblyRepo;
 use crate::modules::assembly::service::{AssemblyService, SyncOutcome};
 use crate::modules::part::repo::sql::PartRepo;
-use crate::modules::part::statemachine::{BatchForRollup, compute_part_target};
 use crate::shared::batch::read::list_active_batches_by_part_id;
+use crate::shared::batch::status_machine::{BatchForRollup, compute_part_target};
 use crate::shared::error::{AppError, code};
 // 2026-10-12：`t_part_event` 的写侧自 part 域的事件 INSERT 上提到
 // `shared::part_event`（该表由 7 个模块写、无域归属；本文件因此少了对

@@ -34,7 +34,7 @@
 //! 形参一律 `<R: PartRepoTrait>(mut repo: R, ...)`：handler 开 tx 并 commit，
 //! 生产 `R = &mut PgConnection`；跨域 repo 与 inline sqlx 走 `repo.conn_mut()`。
 //! 用例读写 part 行（`get_part_inspected` / `insert_part_event`）与派生
-//! （`part::statemachine`）都经 part 域 trait。
+//! （`shared::batch::status_machine::compute_part_target`）都经 part 域 trait。
 //!
 //! ## 依赖方向：过渡期，**尚未单向**
 //! 本模块的批次方法以 `<R: PartRepoTrait>` 形参接收 part 域 trait，批次写入经它

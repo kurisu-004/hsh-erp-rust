@@ -11,10 +11,18 @@
 //! | [`model`] | `TPartBatch` 全列行结构 | 仅 chrono |
 //! | [`read`] | `get_batch_by_id` / `list_active_batches_by_part_id` | `model` + sqlx |
 //! | [`status`] | `apply_batch_status_change` / `apply_bulk_batch_status_change_for_part` + 派生链 | assembly / part / 本表（见下） |
-//! | [`guards`] | 9 个 `pub fn`：状态机守卫 / OCC / 货架校验 / status 薄包装 | part / iam / `status` |
+//! | [`guards`] | 9 个 `pub fn`：状态机守卫 / OCC / 货架校验 / status 薄包装 | `status_machine` / iam / `status` |
+//! | [`status_machine`] | `PartStatus` 枚举 + `can_transition_to` + rollup 纯函数（`part_status_progress` / `compute_part_target` / `BatchForRollup` / `PartRollupTarget`）—— **2026-10-13 自 `part::statemachine` 上提**，零外部依赖 | 无（纯函数） |
 //! | [`chain`] | `CHAIN_POSITION_LATERAL_SQL` + `HAS_PROCESS_CHAIN_EXPR` + `resolve_chain_position`（批次在工序链上的位置派生，读写共用） | `model` + 本表 SQL 内聚合（见下） |
 //!
 //! ## 边界登记：shared/batch 依赖 4 个域，是本仓依赖面最宽的 shared 模块
+//!
+//! > ⚠️ **反向依赖（`shared → modules`）已在 2026-10-13 消除**：本表 4 行全是
+//! > 「shared 经**域 repo** 读写别域的表」，方向仍是 `shared → modules`，但那是
+//! > **既有的、已登记的**例外（派生链的实现本身）。本轮消除的是另一类问题：
+//! > `shared/batch/{status,guards}.rs` 直接 `use crate::modules::part::statemachine::…`
+//! > 这类「shared 借用某个域的纯逻辑」—— `PartStatus` / `compute_part_target` 已上提
+//! > 到本模块的 [`status_machine`]，part 域的 `statemachine.rs` 随之整文件删除。
 //!
 //! | 域 | 经 shared 的哪个文件 | 读 / 写 | 入口 |
 //! |---|---|---|---|
@@ -72,6 +80,7 @@ pub mod guards;
 pub mod model;
 pub mod read;
 pub mod status;
+pub mod status_machine;
 
 pub use guards::{
     InspectionRepairRow, ensure_transition, mark_batch_status_only,
@@ -85,3 +94,8 @@ pub use status::{
     PartDerivation, RollupOutcome, StatusChange, apply_batch_status_change,
     apply_bulk_batch_status_change_for_part, rollup_part_derived,
 };
+// ⚠️ 2026-10-13：`status_machine`（自 `part::statemachine` 上提的 PartStatus /
+// rollup 纯函数）**刻意不做平铺 `pub use`** —— 域侧一律走显式路径
+// `shared::batch::status_machine::X`。理由：这三类符号（状态枚举、rollup 输入
+// 投影、rollup 纯函数）在全仓到处用，平铺到 `shared::batch::*` 面上会与
+// `guards` / `status` 的导出混在一起、看不出它们的归属子模块。

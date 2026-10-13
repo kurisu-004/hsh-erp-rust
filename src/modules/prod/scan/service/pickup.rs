@@ -21,11 +21,11 @@
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::part::repo::PartRepoTrait;
-use crate::modules::part::statemachine::PartStatus;
 use crate::modules::part::vo::PartOut;
 use crate::modules::prod::batch::repo::PartBatchRepo;
 use crate::modules::prod::queue::service::QueueService;
 use crate::modules::prod::scan::dto::PickUpRequest;
+use crate::shared::batch::status_machine::PartStatus;
 use crate::shared::error::{AppError, code};
 // 2026-10-12：`t_part_event` 的写侧自 part 域的事件 INSERT 上提到
 // `shared::part_event`（该表由 7 个模块写、无域归属）；本文件的 2 处构造点同时
