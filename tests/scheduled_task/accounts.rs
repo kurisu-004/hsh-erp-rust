@@ -485,6 +485,15 @@ async fn set_default_requires_version() {
 /// `service::set_default_account` 的 doc 与 `docs/api/mail.md` §4.3）。故断言的是
 /// **允许的结果集合**：两个都成功（串行执行时本该如此）**或** 一个成功、另一个
 /// `40901`；**任何 5xx 都是回归**（那一支原来会变成「数据库错误」500）。
+///
+/// ⚠️ **只断言下界（至少一个赢家），不锁死「恰好一个赢家」**：本测试跑在
+/// `#[tokio::test]`（current_thread 单任务）+ `tokio::join!` 协作调度上，两次请求
+/// **完全可以串行跑完** —— A 的整笔事务在 B 发出 `clear_default` 之前提交时，B 会
+/// 照常降 A、升 B（`version` 没人碰过）⇒ 两个都是 200。⚠️ 早先这里断言的是
+/// `ok_count == 1`，那是把「文档承诺的允许集合」写成了「某个具体交错顺序」⇒ 调度
+/// 一变就间歇红，且现场分不清是回归还是抖动。「两次都 40901」仍由下面的下界断言
+/// 拦住（那说明降级与升格双双没生效）；「恰好一个默认」这个终态不变式由最后那段
+/// 查询断言守住 —— **那才是本用例真正要守的东西**。
 #[tokio::test]
 async fn concurrent_set_default_on_two_accounts_never_returns_500() {
     let ctx = bootstrap().await;
@@ -506,9 +515,9 @@ async fn concurrent_set_default_on_two_accounts_never_returns_500() {
             other => panic!("{who}：只允许 200 或 40901（绝不能是 5xx），实际 {other}：{env}"),
         }
     }
-    assert_eq!(
-        ok_count, 1,
-        "两次并发置默认只可能有一个赢家（40901 分支之外的兜底）"
+    assert!(
+        ok_count >= 1,
+        "至少要有一个赢家：两次都 40901 说明『先降后升』两条 UPDATE 都没生效"
     );
 
     // 终态：唯一索引兜底 ⇒ 至多一个默认，且确实有一个

@@ -78,7 +78,10 @@ pub async fn create_account(
         conn,
         &NewAccount {
             id,
-            name,
+            // ⚠️ clone 一次：`name` 还要留给下面两个 `name_duplicate` 分支的报错文案。
+            // 报错用**校验并 trim 后**的这个值（不是 `req.name` 原文），与 `update_account`
+            // 同款 —— 两条端点的 `21707` 文案口径必须一致。
+            name: name.clone(),
             preset: preset.as_str().to_string(),
             account,
             encrypted_secret: encrypted,
@@ -89,8 +92,8 @@ pub async fn create_account(
     .await
     {
         Ok(true) => {}
-        Ok(false) => return Err(name_duplicate(&req.name)),
-        Err(e) if is_unique_violation(&e) => return Err(name_duplicate(&req.name)),
+        Ok(false) => return Err(name_duplicate(&name)),
+        Err(e) if is_unique_violation(&e) => return Err(name_duplicate(&name)),
         Err(e) => return Err(e.into()),
     }
 

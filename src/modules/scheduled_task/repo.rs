@@ -63,7 +63,11 @@ pub async fn get_account(
 /// ⚠️ **为什么用结构体而不是 7 个平铺形参**：本函数的形参有 7 个（加 `conn` 共 8 个），
 /// 逐个传下去要靠调用点的位置记忆「哪个是 `operator`、哪个是 `now`」—— 而它们在
 /// SQL 的 VALUES 里是**互换不出错**的一对。结构体让这件事在类型上不可互换。
-#[derive(Debug, Clone)]
+///
+/// ⚠️ **刻意不 derive `Debug`，手写一个屏蔽 `encrypted_secret`**（与
+/// [`crate::modules::scheduled_task::model::TMailAccount`] 同一手法）：derive 版会让任何
+/// 一处 `{new:?}` 把密文原文写进日志，而密文是 base64、可解码。
+#[derive(Clone)]
 pub struct NewAccount {
     pub id: i64,
     pub name: String,
@@ -75,6 +79,24 @@ pub struct NewAccount {
     pub encrypted_secret: String,
     pub operator: i64,
     pub now: NaiveDateTime,
+}
+
+/// 手写 `Debug`：屏蔽 `encrypted_secret`（2026-10-16）。
+///
+/// ⚠️ 字段顺序与声明顺序一致，便于和 derive 版对照阅读。
+impl std::fmt::Debug for NewAccount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewAccount")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("preset", &self.preset)
+            .field("account", &self.account)
+            // ⚠️ 永远输出 `***`
+            .field("encrypted_secret", &"***")
+            .field("operator", &self.operator)
+            .field("now", &self.now)
+            .finish()
+    }
 }
 
 /// 插入邮箱（`version = 0`）。
@@ -156,7 +178,10 @@ pub async fn update_account(
 
 /// 全量覆写的目标值（见 [`update_account`] 的「为什么不覆写 `encrypted_secret` 之外
 /// 的两列」与 [`NewAccount`] 的形参打包理由）。
-#[derive(Debug, Clone)]
+///
+/// ⚠️ **同样手写 `Debug` 屏蔽 `encrypted_secret`**（与 [`NewAccount`] 同款理由：本域的
+/// 凭据一律走手写 `Debug`，不靠「调用方记得别打印」这条约定）。
+#[derive(Clone)]
 pub struct AccountPatch {
     pub name: String,
     pub preset: String,
@@ -165,6 +190,21 @@ pub struct AccountPatch {
     pub encrypted_secret: String,
     pub operator: i64,
     pub now: NaiveDateTime,
+}
+
+/// 手写 `Debug`：屏蔽 `encrypted_secret`（2026-10-16）。
+impl std::fmt::Debug for AccountPatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccountPatch")
+            .field("name", &self.name)
+            .field("preset", &self.preset)
+            .field("account", &self.account)
+            // ⚠️ 永远输出 `***`
+            .field("encrypted_secret", &"***")
+            .field("operator", &self.operator)
+            .field("now", &self.now)
+            .finish()
+    }
 }
 
 /// 软删（`deleted_at` + `version + 1`），带 OCC。

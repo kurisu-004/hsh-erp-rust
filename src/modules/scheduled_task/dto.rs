@@ -121,7 +121,14 @@ pub const SECRET_MAX_CHARS: usize = 200;
 ///
 /// ⚠️ **无 `version`**：这是新建，没有「别人先改过」这回事（CLAUDE.md §8 的 OCC
 /// 只适用于已存在的行）。
-#[derive(Debug, Clone, Deserialize)]
+///
+/// ⚠️ **刻意不 derive `Debug`**：`secret` 是**明文**授权码（比 repo 两个结构体手上的密文
+/// 更危险 —— 密文还要 base64 解一道），而本仓对含凭据的类型一律走「不实现 `Debug`」或
+/// 「手写屏蔽版」（`infra::config::MailAccountSecret` / `WeComConfig`、
+/// `mail_digest::mailer::ResolvedSender`、`repo::NewAccount` / `AccountPatch`、
+/// `model::TMailAccount` 同一手法）—— 不靠「调用方记得别打印」这条约定。
+/// 守卫：`tests::create_and_update_request_must_not_expose_plaintext_secret`.
+#[derive(Clone, Deserialize)]
 pub struct CreateAccountRequest {
     /// 自定义名称（同时是发件人显示名）。≤50 字（与列 `varchar(50)` 对齐）。
     pub name: String,
@@ -137,14 +144,20 @@ pub struct CreateAccountRequest {
 ///
 /// ⚠️ `version` **必填、无 `#[serde(default)]`**（CLAUDE.md §8 硬约定）：
 /// 缺失时 axum `Json` 提取器直接返 **HTTP 422 纯文本**，不是业务信封。
-#[derive(Debug, Clone, Deserialize)]
+///
+/// ⚠️ **同样刻意不 derive `Debug`**：`secret` 是**明文**授权码，与
+/// [`CreateAccountRequest`] 同一理由（不靠「调用方记得别打印」这条约定）。
+/// 守卫：`tests::create_and_update_request_must_not_expose_plaintext_secret`.
+#[derive(Clone, Deserialize)]
 pub struct UpdateAccountRequest {
     /// 乐观锁锚点。0 行命中 → `40901 VERSION_CONFLICT`。
     pub version: i32,
     pub name: String,
     pub preset: String,
     pub account: String,
-    /// 授权码。**缺省或空串 ⇒ 沿用旧密文**（不覆写、不报错）。
+    /// 授权码。**缺省或 trim 后为空 ⇒ 沿用旧密文**（不覆写、不报错；判定在 trim
+    /// 之后做，故 `"   "` 也算「没填」，与新建路径「纯空白直接 21704」刻意不同 ——
+    /// 理由见 `docs/api/mail.md` §2.4）。
     ///
     /// 之所以不是「必填」：管理员改个名称时前端拿不到授权码明文（服务端从不回显），
     /// 强制必填等于逼前端每次都把「不知道的东西」原样传回来。空串是前端唯一能

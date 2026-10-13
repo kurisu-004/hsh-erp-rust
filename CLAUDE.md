@@ -15,7 +15,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 > - [`docs/api/iam.md`](docs/api/iam.md) —— `iam` 认证 + 账号 + 货架子模块 + RBAC 角色权限面板域（**30 端点** = session 5 + users 12 + shelves 5 + rbac 8；4 条破坏性变更（`DELETE wx-bind` → `POST .../unbind`、`GET wx-bind` 返 `Option`、bind 删 `corp_id`、4 端点 body 必填 `version`）、`t_wx_identity` 的双向一对一与 TOCTOU 偏差、`uk_t_user_role_user_role_scope` **非 partial**；**2026-10-14 RBAC**：8 条 MANAGER-only 端点（角色 CRUD / grants 整包 / 权限点 / 全量菜单树）、ADMIN 元角色通配且拒写授权、停用即降权 + 变更踢持有者）
 > - [`docs/api/wx.md`](docs/api/wx.md) —— `wx` 微信小程序 BFF 域（**2026-10-11 新建**；按小程序页面切子模块：`login/` + `part_list/`；URL 硬切无 alias 5 条（`/wx/iam/wx-login` → `/wx/login/wecom`、`/wx/parts/*` → `/wx/part-list/*`、`/wx/dashboard/home` 删除）、VO 逐字对齐前端卡片模型改 camelCase、`deliveredQty` 真值、尾斜杠 404 实测钉死、★ 2026-10-12 `part_list` 接上日期 + 7 类 tab 双维筛选（`?date=` 打 `system_delivery_date`、`all` 不再是「不过滤」））
 > - [`docs/api/statistics.md`](docs/api/statistics.md) —— `statistics` 生产统计域（**2026-10-12 新建**；3 个 MANAGER-only 只读端点、有效工时口径表、链外工序计 0、`LEFT JOIN LATERAL … LIMIT 1` 的去重理由与「数据覆盖受工序链配置率限制」的登记）
-> - [`docs/api/mail_digest.md`](docs/api/mail_digest.md) —— `mail_digest` 交期汇总邮件域（**2026-10-13 新建**；6 个 MANAGER-only 端点、`DELIVERY_STATUSES` 与 dashboard 共用、行单位工单级 / 刻意 `LIMIT 30` 分叉、频率→**6 段带秒** cron 与 WEEKLY 减 1、217xx 错误码、失败也落流水、**五处**「实现与注释不符」的偏差登记（其中第 5 条已修）；**2026-10-16**：`MAIL_SMTP_*` / `MAIL_FROM_*` / `MAIL_DIGEST_ENABLED` 整轮删除，凭据改由 `scheduled_task` 域的邮箱表提供，配置加 `sender_account_id`、`GET /meta` 删掉 `smtp` 段）
+> - [`docs/api/mail_digest.md`](docs/api/mail_digest.md) —— `mail_digest` 交期汇总邮件域（**2026-10-13 新建**；6 个 MANAGER-only 端点、`DELIVERY_STATUSES` 与 dashboard 共用、行单位工单级 / 刻意 `LIMIT 30` 分叉、频率→**6 段带秒** cron 与 WEEKLY 减 1、217xx 错误码、失败也落流水、**六处**「实现与注释不符」的偏差登记（其中第 5 条已修）；**2026-10-16**：`MAIL_SMTP_*` / `MAIL_FROM_*` / `MAIL_DIGEST_ENABLED` 整轮删除，凭据改由 `scheduled_task` 域的邮箱表提供，配置加 `sender_account_id`、`GET /meta` 删掉 `smtp` 段）
 > - [`docs/api/mail.md`](docs/api/mail.md) —— `scheduled_task` 域「邮件通道」（**2026-10-16 新建**；6 个 MANAGER-only 端点、邮箱 CRUD + SMTP 预设表、**AES-256-GCM 加密入库 + 掩码不回显**、被引用禁删 21708、**21706..21708** 新错误码、密钥轮换未实现的缺口登记）
 >
 > **其它域的契约在代码注释里**（各域 `mod.rs` / `repo.rs` / `vo` / `dto` 的模块 doc 与逐字段 doc），本仓的目录约定见本文件「`docs/api/` 目录约定」一节。⚠️ **引用不存在的文档路径是禁止的** —— 后端代码变更（新增 / 修改 / 删除端点，或修改 DTO 字段 / 错误码）必须同步更新对应域的 `docs/api/` 文件（若该域有）与代码注释。
@@ -441,7 +441,7 @@ VO**：零件时间线用 `part::service::phase1::events` 的 `EventListRow`，s
 - ⚠️ **`set-default` 是本域唯一开事务的写路径**（「先降旧、再升新」两条 UPDATE 必须原子，否则两个并发请求会让库里**一个默认都没有**）；删 / 改 / 置默认**三条写端点都吃 OCC**（表带 `version` 列 ⇒ 按 CLAUDE.md §8 body 必填）。
 - ⚠️ **「被引用禁删」有 TOCTOU 窗口**（查引用与软删不在同一事务）⇒ 产出「配置指向已软删行」，发信时以 `21701` 暴露。**有意不修**：为一个配置型实体引入跨表约束不划算，故障面是「发不出信 + 一条明确错误」。
 - **域隔离护栏：适用**（`assert_no_foreign_domain` 扫 `src/modules/scheduled_task/**`，`scheduled_task_domain_depends_on_no_other_domain` 在 CI 里钉住）。⚠️ 本域**唯一**的跨域表引用是「查 `t_mail_digest_config` 有几份配置指向本邮箱」那一条 COUNT，**SQL 写在本域**（既定 pattern，同 `dashboard`/`statistics`/`admin`），**不 import** 他域任何符号。**反向**（mail_digest import 本域）见上一节。
-- 完整契约（逐字段 / 预设枚举 / 加密口径 / 前端配套 / **已知偏差 9 条**）见 [`docs/api/mail.md`](docs/api/mail.md)。
+- 完整契约（逐字段 / 预设枚举 / 加密口径 / 前端配套 / **已知偏差 11 条（§8.3 第 1–11 条）**）见 [`docs/api/mail.md`](docs/api/mail.md)。
 
 ### 状态派生契约（2026-10-01）
 

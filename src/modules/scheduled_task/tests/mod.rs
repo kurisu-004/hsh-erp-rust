@@ -4,6 +4,7 @@
 //! - SMTP 预设表（`dto::MailAccountPreset`）：解析 / 取值域 / host/port/tls_mode 映射
 //! - 写侧校验矩阵（`service` 的 `validate_*`）：21704 的每条规则
 //! - 出参的**密文屏蔽**：`MailAccountOut::from_row` 逐字段挑选这件事本身就是断言对象
+//! - 凭据类型的 `Debug` 纪律：表行 / 写侧载体手写屏蔽版，两个入参 DTO 一律没有 `Debug`
 //! - 域隔离护栏（`scheduled_task_domain_depends_on_no_other_domain`）
 //!
 //! ## ⚠️ 遵守「测试数据两条硬约定」第 2 条
@@ -15,6 +16,7 @@
 
 use super::dto::{MailAccountOut, MailAccountPreset};
 use crate::modules::scheduled_task::model::TMailAccount;
+use crate::modules::scheduled_task::repo::{AccountPatch, NewAccount};
 
 // ============================================================================
 // SMTP 预设
@@ -71,10 +73,6 @@ fn every_preset_is_implicit_tls_on_465() {
         );
     }
 }
-
-// ============================================================================
-// 写侧校验
-// ============================================================================
 
 // ============================================================================
 // 写侧校验矩阵（21704 的每条规则）
@@ -218,6 +216,108 @@ fn account_row_debug_masks_ciphertext() {
     // 排障需要的非敏感字段仍可见（否则这条 Debug 等于没用）
     assert!(dbg.contains("ops@163.com"), "account 应可见：{dbg}");
     assert!(dbg.contains("汇森告警邮箱"), "name 应可见：{dbg}");
+}
+
+/// ★ **两个写侧的凭据载体 `Debug` 必须屏蔽密文**（`repo::NewAccount` / `AccountPatch`）。
+///
+/// 与 [`account_row_debug_masks_ciphertext`] 同款守卫，只是这一批手上的密文是
+/// **写进去**的那一份（那条钉的是读出来的那份）：service 封好密文后交给 repo，
+/// 这两个结构体就是明文密文的最后两个落脚点。
+#[test]
+fn write_param_debug_masks_ciphertext() {
+    let ts = crate::infra::clock::now_naive();
+    let secret = "Y2Fubm90LWJlLWV2aWxvZA==".to_string();
+
+    let new = NewAccount {
+        id: 9_000_000_000_000_000_002,
+        name: "汇森告警邮箱".into(),
+        preset: "NET_EASE_163".into(),
+        account: "ops@163.com".into(),
+        encrypted_secret: secret.clone(),
+        operator: 1,
+        now: ts,
+    };
+    let new_dbg = format!("{new:?}");
+    assert!(
+        !new_dbg.contains(&secret),
+        "NewAccount Debug 泄漏了密文：{new_dbg}"
+    );
+    assert!(
+        new_dbg.contains("encrypted_secret: \"***\""),
+        "密文应固定显示为 ***：{new_dbg}"
+    );
+    // 排障需要的非敏感字段仍可见
+    assert!(new_dbg.contains("ops@163.com"), "account 应可见：{new_dbg}");
+    assert!(new_dbg.contains("汇森告警邮箱"), "name 应可见：{new_dbg}");
+
+    let patch = AccountPatch {
+        name: "汇森告警邮箱".into(),
+        preset: "TENCENT_QQ".into(),
+        account: "ops@qq.com".into(),
+        encrypted_secret: secret.clone(),
+        operator: 2,
+        now: ts,
+    };
+    let patch_dbg = format!("{patch:?}");
+    assert!(
+        !patch_dbg.contains(&secret),
+        "AccountPatch Debug 泄漏了密文：{patch_dbg}"
+    );
+    assert!(
+        patch_dbg.contains("encrypted_secret: \"***\""),
+        "密文应固定显示为 ***：{patch_dbg}"
+    );
+    assert!(
+        patch_dbg.contains("ops@qq.com"),
+        "account 应可见：{patch_dbg}"
+    );
+}
+
+/// ★ **两个入参 DTO 不得有 `Debug`**（`secret` 是**明文**授权码，比密文更危险）。
+///
+/// ⚠️ 这两个类型**刻意一个 `Debug` 都不实现**（不是手写屏蔽版 —— 明文没有可保留的
+/// 「非敏感部分」可展示），故这里守的不是「屏蔽得对不对」而是「有没有」。
+///
+/// ⚠️ **为什么钉在源码属性上而不是编译期探针**：stable 上没有「断言某类型未实现某
+/// trait」的手段（特化未稳定），而 `` `compile_fail` doctest `` 这条路走不通 ——
+/// nextest **不跑** doctest，闸门形同虚设。故直接读 `dto.rs` 断言 derive 列表里没有
+/// `Debug`，钉的正是「有人顺手把 `Debug` 加回 derive」这个真实失败模式。
+/// ⚠️ 末尾那组**反向自检**是这道闸的保险：若将来文件结构变了导致上面的匹配恒真，
+/// 「`DeleteAccountRequest` 等无凭据 DTO 仍应 derive `Debug`」会先红。
+#[test]
+fn create_and_update_request_must_not_expose_plaintext_secret() {
+    let src = include_str!("../dto.rs");
+
+    for ty in ["CreateAccountRequest", "UpdateAccountRequest"] {
+        let derive = derive_line_above(src, ty);
+        assert!(
+            !derive.contains("Debug"),
+            "{ty} 不得有 Debug（`secret` 是明文授权码）：{derive}"
+        );
+    }
+    for ty in ["DeleteAccountRequest", "SetDefaultAccountRequest"] {
+        let derive = derive_line_above(src, ty);
+        assert!(
+            derive.contains("Debug"),
+            "{ty} 不含凭据、应保留 Debug（这条是上面扫描的反向自检）：{derive}"
+        );
+    }
+}
+
+/// 取 `pub struct <ty> {` 紧上方那条 `#[derive(...)]`（跳过它自己的 doc 注释）。
+fn derive_line_above(src: &str, ty: &str) -> String {
+    let lines: Vec<&str> = src.lines().collect();
+    let idx = lines
+        .iter()
+        .position(|l| l.contains(&format!("pub struct {ty} {{")))
+        .unwrap_or_else(|| panic!("dto.rs 里找不到 {ty}"));
+    lines[..idx]
+        .iter()
+        .rev()
+        .find(|l| l.trim_start().starts_with("#[derive"))
+        .unwrap_or_else(|| panic!("{ty} 上方没有 derive 行"))
+        .trim()
+        .to_string()
 }
 
 /// 库里存了未知 preset（手工改库 / 加了预设没同步）时**降级而不丢行**：
