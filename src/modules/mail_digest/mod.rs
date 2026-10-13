@@ -55,12 +55,18 @@
 //!
 //! ## 口径分叉登记（与 dashboard 域）
 //!
-//! 「未交付」的判据与 dashboard **共用同一份常量**
-//! [`crate::modules::dashboard::repo::DELIVERY_STATUSES`]，行单位同为**工单级**
-//! （`t_part` 侧带 `assembly_id IS NULL`，装配件行替换其子件行），已交量守卫同为
-//! `status IN ('DELIVERED','COMPLETED')`。这三处与 dashboard 逐字同源，是既定契约。
+//! 「未交付」的**判据**与 dashboard 逐字同源，行单位同为**工单级**（`t_part` 侧带
+//! `assembly_id IS NULL`，装配件行替换其子件行），已交量守卫同为
+//! `status IN ('DELIVERED','COMPLETED')`。这三处是既定契约。
 //!
-//! **刻意不同的只有「取哪些行」**：dashboard 每桶 `LIMIT 30`（大屏一屏放不下），
+//! ⚠️ **2026-10-16 拆掉常量共用**：原先「未交付」白名单是
+//! `use crate::modules::dashboard::repo::DELIVERY_STATUSES` 直接引 dashboard 那份
+//! （「一处改、两处生效」）。本轮按用户要求「在邮件通知的域重写 SQL，不要复用其它域的」
+//! **改成本域自有常量 [`repo::DELIVERY_STATUSES`]**（6 态字面量相同），本域统计 SQL
+//! 从此零他域符号依赖。代价是白名单取值变成**人工同步**关系，登记在
+//! `docs/api/mail_digest.md` §5。
+//!
+//! **刻意不同的仍只有「取哪些行」**：dashboard 每桶 `LIMIT 30`（大屏一屏放不下），
 //! 邮件必须给全量 —— 漏一条交期就是漏一个客户；且本域未来节有 `[today, today+N)`
 //! 的时间窗口（用户要的就是「未来 14 天」）。理由详见 [`repo`] 模块 doc 的对照表。
 //!
@@ -84,8 +90,8 @@
 //! 扫 `src/modules/scheduled_task/**`）：通道域对内容域**零**代码引用，那条
 //! 「被引用禁删」的检查是它自己写的 SQL 查 `t_mail_digest_config`。
 //!
-//! 唯一的「引用他域符号」还有共用常量 [`DELIVERY_STATUSES`] —— 它是一个
-//! `&'static [&str; 6]`，正是 CLAUDE.md 要求「四处共用」的那一份。
+//! ⚠️ 「统计用的 `DELIVERY_STATUSES`」**已于 2026-10-16 改成本域自有常量**
+//! （见上一节「拆掉常量共用」），不再构成跨域引用。
 
 pub mod dto;
 pub mod handler;

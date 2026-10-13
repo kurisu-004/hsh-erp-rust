@@ -870,22 +870,70 @@ async fn log_prepare_failure(
     }
 }
 
-/// 按节开关取两批行（关掉的节**不查**，省一次 SQL）。
+/// 按节开关取两批行（关掉的节**不查**，省一次 SQL），再**一次**把它们的批次装进去。
+///
+/// ## 不变量：**定长 2 条语句，与工单数 / 批次数无关**（2026-10-16）
+///
+/// 1 条（或 0 条，看节开关）+ [`repo::list_batches`] 1 条。批次不是逐工单循环查的
+/// —— 那样的写法功能完全正确、集成测试也照样全绿（每条用例只造 2~3 个工单），
+/// 但邮件一次可能带几百个工单，语句数会跟着线性涨。
+/// ⇒ **循环体内只允许做内存操作**（收集 id、按 `(row_type, id)` 分组），
+/// **绝不调 `repo::`**。这条由 `tests/mail_digest/n_plus_one_guard.rs` 的源码护栏
+/// 钉住（改本函数时它会当场红）。
+///
+/// ⚠️ 逾期节与未来节的窗口谓词互斥（`< today` / `>= today`），同一个工单不会
+/// 在两节里各出现一次；即便将来谓词改动，分组是「按 key 取 vec 后整体搬过去」，
+/// 重复也不会互相覆盖。
 async fn fetch_rows(
     conn: &mut PgConnection,
     cfg: &NormalizedConfig,
     today: chrono::NaiveDate,
 ) -> Result<(Vec<repo::DigestRow>, Vec<repo::DigestRow>), AppError> {
-    let overdue = if cfg.include_overdue {
+    let mut overdue = if cfg.include_overdue {
         repo::list_overdue(conn, today).await?
     } else {
         Vec::new()
     };
-    let upcoming = if cfg.include_upcoming {
+    let mut upcoming = if cfg.include_upcoming {
         repo::list_upcoming(conn, today, cfg.upcoming_days).await?
     } else {
         Vec::new()
     };
+
+    // ── 收集两侧工单 id（纯内存循环，不发 SQL）──
+    let mut part_ids: Vec<i64> = Vec::new();
+    let mut assembly_ids: Vec<i64> = Vec::new();
+    for row in overdue.iter().chain(upcoming.iter()) {
+        if row.is_assembly() {
+            assembly_ids.push(row.id);
+        } else {
+            part_ids.push(row.id);
+        }
+    }
+
+    // ── 一次拉回全部批次；无工单时不发这条语句 ──
+    // 「两节都关」在配置层已被 21704 拒掉，但纯函数调用仍可能走到这里 ⇒ 不发
+    // 无意义的空数组查询。
+    let mut by_owner: std::collections::HashMap<(String, i64), Vec<repo::DigestBatchRow>> =
+        std::collections::HashMap::new();
+    if !part_ids.is_empty() || !assembly_ids.is_empty() {
+        let batches = repo::list_batches(conn, &part_ids, &assembly_ids).await?;
+        for b in batches {
+            by_owner
+                .entry((b.owner_type.clone(), b.owner_id))
+                .or_default()
+                .push(b);
+        }
+    }
+
+    // ⚠️ **不二次排序**：`list_batches` 的 SQL 已按 `(owner_type, owner_id, batch_no)`
+    // 排好，分组时按到达顺序 push 即保持顺序（与主查询「渲染层不二次排序」同一约定）。
+    for row in overdue.iter_mut().chain(upcoming.iter_mut()) {
+        if let Some(batches) = by_owner.remove(&(row.row_type.clone(), row.id)) {
+            row.batches = batches;
+        }
+    }
+
     Ok((overdue, upcoming))
 }
 

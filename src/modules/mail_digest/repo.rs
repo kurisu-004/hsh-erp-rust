@@ -10,9 +10,9 @@
 //!
 //! 两条 SQL 的「未交付」谓词与 dashboard 域
 //! `repo/delivery.rs::SQL_COUNT_OVERDUE` / `SQL_ORDERS_*` **逐字同源**（状态白名单
-//! 绑 [`DELIVERY_STATUSES`]、行单位工单级、装配件行替换子件行、已交量守卫
-//! `status IN ('DELIVERED','COMPLETED')`）。但**行集合的取法**不一样，这是需求
-//! 决定的、不是漂移：
+//! 取值相同、但**常量是本域自己那份** [`DELIVERY_STATUSES`]，见它的 doc；行单位工单级、
+//! 装配件行替换子件行、已交量守卫 `status IN ('DELIVERED','COMPLETED')`）。
+//! 但**行集合的取法**不一样，这是需求决定的、不是漂移：
 //!
 //! | | dashboard | mail_digest（本文件） |
 //! |---|---|---|
@@ -40,38 +40,57 @@
 //!    （测试容器 UTC）与 `infra::clock::now_naive()` 的 Asia/Shanghai 是**两个时钟**，
 //!    Shanghai 00:00–08:00 期间 `CURRENT_DATE == today - 1`，于是「今天到期」的
 //!    工单会落进逾期节、未来节则整体偏移一天。
+//!
+//! 4. **统计取数恒定 2 条语句**（2026-10-16）：两条主查询（逾期 / 未来）各一条，加
+//!    [`list_batches`] 一条。**与工单数、批次数无关** —— 批次是一次性按 id 集合
+//!    `= ANY($N)` 拉回 Rust 侧分组，循环里只做内存操作。护栏见
+//!    `tests/mail_digest/n_plus_one_guard.rs`。
 
 use chrono::{NaiveDate, NaiveDateTime};
 use sqlx::{PgConnection, Row};
 
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::dashboard::repo::DELIVERY_STATUSES;
 use crate::modules::mail_digest::model::{TMailDigestConfig, TMailDigestLog};
 
-/// `DELIVERY_STATUSES` 的 `Vec<String>` 形态（`LazyLock` 只算一次）。
+/// 「未交付」状态白名单（6 态）。取集合用于两条主查询的 `status = ANY($2::varchar[])`。
 ///
-/// ⚠️ 为什么需要这一层：`dashboard::repo::DeliveryRepo` 走**运行时**
-/// `sqlx::query(..).bind(DELIVERY_STATUSES)`，`&[&str; 6]` 能直接绑 `varchar[]`；
-/// 而本域走 `sqlx::query_as!` **宏**，宏要求参数类型是具体可绑的 Rust 类型，
-/// 对 `$2::varchar[]` 推出的类型是 `&[String]`。于是常量（`&[&str; 6]`）得先转一次。
+/// ⚠️ **刻意复制而**不** import dashboard 域那份**（2026-10-16，用户明确要求
+/// 「在邮件通知的域重写 SQL，不要复用其它域的」）：本域的统计 SQL 从此**不依赖**
+/// 任何他域符号，取值变化时要人工同步 `dashboard::repo::delivery::DELIVERY_STATUSES`
+/// 与前端 `UpcomingDeliveryChart.vue` 的 `LAYERS[].statuses`。同步义务与症状见
+/// `docs/api/mail_digest.md` §5。
+pub const DELIVERY_STATUSES: [&str; 6] = [
+    "PENDING",
+    "PROGRAMMING",
+    "IN_PROCESS",
+    "OUTSOURCE",
+    "INSPECTION",
+    "READY_TO_SHIP",
+];
+
+/// [`DELIVERY_STATUSES`] 的 `Vec<String>` 形态（`LazyLock` 只算一次）。
+///
+/// ⚠️ 为什么需要这一层：本域走 `sqlx::query_as!` **宏**，宏要求参数类型是具体可绑的
+/// Rust 类型，对 `$2::varchar[]` 推出的类型是 `&[String]`（`&[&str; 6]` 绑不上去）；
+/// 而 dashboard 的同类查询走**运行时** `sqlx::query(..).bind(..)`，可以直接绑
+/// `&[&str; 6]`。于是常量得先转一次。
 ///
 /// 每次调用都新建 `Vec` 会给「每天发一封信」平白加 6 次分配；`LazyLock` 把它压到一次。
-/// ⚠️ 取值仍直接来自 dashboard 那个常量（不复制字面量）—— 一处改、两处生效，
-/// 这正是 CLAUDE.md 要求四处共用同一个 `DELIVERY_STATUSES` 的意义。
 fn delivery_statuses_vec() -> &'static [String] {
     static VEC: std::sync::LazyLock<Vec<String>> =
         std::sync::LazyLock::new(|| DELIVERY_STATUSES.iter().map(|s| s.to_string()).collect());
     &VEC
 }
 
-/// 邮件正文的一行（`t_part` 一行 UNION ALL `t_assembly` 一行）。
+/// 邮件正文的一行（`t_part` 一行 UNION ALL `t_assembly` 一行）+ 它下面的全部批次子行。
 ///
 /// ⚠️ **刻意不起 `T*` 名**：`T*` 在本仓是「域 owned 表的全列投影」的约定
-/// （见 `model.rs` 顶部 doc），而本结构是**跨两张非 owned 表的读侧自定义列集**
+/// （见 `model.rs` 顶部 doc），而本结构是**跨多张非 owned 表的读侧视图行**
 /// （`t_assembly` 没有 `assembly_id`、`t_part` 没有子件概念，两侧列名与类型
-/// 不同，装配件那一支额外靠 `row_type` 字面量区分）。起 `T*` 名会让「这是本域
-/// owned 表」的错误印象盖过「这是拼出来的视图行」。
-#[derive(Debug, Clone, sqlx::FromRow)]
+/// 不同，装配件那一支额外靠 `row_type` 字面量区分；`batches` 更完全不属于任何一张
+/// 表的投影）。起 `T*` 名会让「这是本域 owned 表」的错误印象盖过「这是拼出来的
+/// 视图行」。
+#[derive(Debug, Clone)]
 pub struct DigestRow {
     /// `t_part.id` 或 `t_assembly.id`。雪花全局唯一，但**跨表**不保证不撞
     /// —— 本域从不把它当主键用，只在调试时人工定位。
@@ -100,6 +119,14 @@ pub struct DigestRow {
     pub customer_name: Option<String>,
     /// SQL 里写死的来源字面量：`'PART'` / `'ASSEMBLY'`。
     pub row_type: String,
+    /// 该工单名下的**全部**批次（2026-10-16），按 `batch_no ASC`。
+    ///
+    /// 由 [`list_batches`] 一次拉回后按 `(row_type, id)` 在 Rust 侧分组装进来
+    /// （见 `service::fetch_rows`）⇒ 工单数、批次数都不会让语句数变多。
+    /// ⚠️ **含终态批次**（`DELIVERED` / `COMPLETED` / `CANCELLED`）：用户要的是
+    /// 「对应的**所有**批次」，终态批次同样占一行，只是位置列为空（见
+    /// [`DigestBatchRow::holder_name`]）。无批次时是空数组（渲染层不渲子行）。
+    pub batches: Vec<DigestBatchRow>,
 }
 
 impl DigestRow {
@@ -107,6 +134,86 @@ impl DigestRow {
     pub fn is_assembly(&self) -> bool {
         self.row_type == "ASSEMBLY"
     }
+}
+
+/// 主查询的**纯 SQL 投影**（[`DigestRow`] 的原料）。
+///
+/// ⚠️ 为什么与 [`DigestRow`] 分成两个结构：`sqlx::query_as!` 生成的是
+/// **struct literal**（`DigestRow { id: …, … }`），SELECT 里没有的字段**编译不过**。
+/// 而 `batches` 不是任何一列的投影（它由第二条语句在 Rust 侧装配）⇒ 只能拆开：
+/// 宏落在本结构上，`list_overdue` / `list_upcoming` 再逐字段搬进 [`DigestRow`]。
+#[derive(Debug, Clone)]
+struct DigestOrderRow {
+    id: i64,
+    serial_no: Option<String>,
+    drawing_no: String,
+    name: String,
+    quantity: i32,
+    status: String,
+    system_delivery_date: Option<NaiveDate>,
+    is_urgent: bool,
+    order_no: Option<String>,
+    customer_name: Option<String>,
+    row_type: String,
+}
+
+impl From<DigestOrderRow> for DigestRow {
+    /// 批次留空 —— 装配在 `service::fetch_rows` 里统一做（那里才知道两节的全部
+    /// 工单 id），不在单条查询里做。
+    fn from(r: DigestOrderRow) -> Self {
+        Self {
+            id: r.id,
+            serial_no: r.serial_no,
+            drawing_no: r.drawing_no,
+            name: r.name,
+            quantity: r.quantity,
+            status: r.status,
+            system_delivery_date: r.system_delivery_date,
+            is_urgent: r.is_urgent,
+            order_no: r.order_no,
+            customer_name: r.customer_name,
+            row_type: r.row_type,
+            batches: Vec::new(),
+        }
+    }
+}
+
+/// 邮件正文里一个批次的**子行**（2026-10-16）。
+///
+/// ⚠️ 同样**刻意不起 `T*` 名**：它是 `t_part_batch` 单表列 + 三个 holder 表解析出
+/// 的展示名拼出来的读侧视图行，不是域 owned 表的全列投影。
+#[derive(Debug, Clone)]
+pub struct DigestBatchRow {
+    /// `t_part_batch.id`。
+    pub id: i64,
+    /// `integer`，工单内批次序号（1 起）；渲染成「第 N 批」。
+    pub batch_no: i32,
+    /// `integer`，本批次数量。**不带**「套」后缀 —— 批次恒是件数，「套」是装配件
+    /// 工单行的口径。
+    pub quantity: i32,
+    /// `PartStatus` 的 9 个字面量之一；渲染前经 `dto::batch_status_label` 转中文。
+    pub status: String,
+    /// `is_repairing = true` ⇒ 状态列显示「返修中」（该布尔列是 2026-10-01 从
+    /// `REPAIRING` 状态码降级来的）。
+    pub is_repairing: bool,
+    /// `OFFICE` / `PRODUCTION_SHELF` / `WORKER` / `INSPECTION_SHELF` /
+    /// `OUTSOURCE_COMPANY`，可为 NULL。
+    pub location: Option<String>,
+    /// 按 `location` 分桶解析出的展示名：货架 `code` / 工人 `name` /
+    /// 外协公司 `name`；解析不出（`OFFICE`、`location IS NULL`、holder 行已软删）
+    /// 时为 `None`。
+    ///
+    /// ⚠️ **终态批次这里恒为 `None`**：迁移
+    /// `20261013000002_001_clear_terminal_batch_location.sql` 把 `DELIVERED` /
+    /// `COMPLETED` / `CANCELLED` 三态的 `location` 与 `current_holder_id` 一起清了
+    /// （出厂时工件已经不在任何货架 / 工人 / 外协厂手里）。这不是取数漏了，是数据
+    /// 本来就没有；渲染层渲成 `—`。登记见 `docs/api/mail_digest.md` §8.3。
+    pub holder_name: Option<String>,
+    /// 与工单行的 `row_type` 同源（`'PART'` / `'ASSEMBLY'`），由
+    /// [`list_batches`] 的 SQL 原样带回，供 Rust 侧按 `(owner_type, owner_id)` 分组。
+    pub owner_type: String,
+    /// 所属工单 id（`t_part.id` 或 `t_assembly.id`）。
+    pub owner_id: i64,
 }
 
 /// 已逾期且一件没交过的工单（工单级）。
@@ -124,7 +231,7 @@ pub async fn list_overdue(
     today: NaiveDate,
 ) -> Result<Vec<DigestRow>, sqlx::Error> {
     sqlx::query_as!(
-        DigestRow,
+        DigestOrderRow,
         r#"
         SELECT
             u.id                AS "id!",
@@ -174,6 +281,7 @@ pub async fn list_overdue(
     )
     .fetch_all(&mut *conn)
     .await
+    .map(|rows| rows.into_iter().map(DigestRow::from).collect())
 }
 
 /// 未来 `days` 天内交期到期且一件没交过的工单（工单级）。
@@ -189,7 +297,7 @@ pub async fn list_upcoming(
     days: i32,
 ) -> Result<Vec<DigestRow>, sqlx::Error> {
     sqlx::query_as!(
-        DigestRow,
+        DigestOrderRow,
         r#"
         SELECT
             u.id                AS "id!",
@@ -239,6 +347,112 @@ pub async fn list_upcoming(
         today,
         delivery_statuses_vec(),
         days,
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .map(|rows| rows.into_iter().map(DigestRow::from).collect())
+}
+
+/// 一次拉回给定工单的**全部**批次（含终态），holder 名在**同一条 SQL**里解析完。
+///
+/// 参数：
+/// - `part_ids`：散件工单 id 集合（主查询 `row_type='PART'` 的那些）；
+/// - `assembly_ids`：装配件工单 id 集合（主查询 `row_type='ASSEMBLY'` 的那些）。
+///
+/// ## 为什么是「一条语句、零 N+1」
+///
+/// 逐工单循环查批次是**功能完全正确**的改法（行数守恒、少批量时更快），但邮件
+/// 可能一次带几百个工单 ⇒ 语句数随工单数线性上涨，而这条语句的**总行数**本来就与
+/// 工单数成正比（每工单至少 1 个批次）。故改成「按 id 集合 `= ANY` 一次拉回、
+/// Rust 侧按 `(owner_type, owner_id)` 分组」，语句数**恒为 1**。
+/// `service::fetch_rows` 是唯一调用方，其「循环里不得调 `repo::`」由
+/// `tests/mail_digest/n_plus_one_guard.rs` 的源码护栏钉住。
+///
+/// ## 设计要点
+///
+/// - **两个 id 集合分开绑**（`$1::bigint[]` / `$2::bigint[]`）：装配件的批次**挂在子件
+///   上**（`t_part_batch.part_id → t_part.id`，子件 `t_part.assembly_id` 指向装配件），
+///   那一支因此必须经 `t_part c JOIN t_assembly a` 两跳，口径与主查询的已交量守卫
+///   **逐字一致**（含 `c.deleted_at IS NULL`）。
+/// - **空数组是常态，不是边界情况**：`= ANY('{}')` 恒 false，一侧为空时该侧 UNION
+///   分支贡献 0 行、另一半照常工作。仓内绝大多数工单不是装配件。
+/// - **三张 holder 表全是 `LEFT JOIN` + `location` 分桶谓词**（不匹配就退化成
+///   `holder_name = NULL`，而**不会**丢掉批次行）；`location` 只有 5 个取值、DB
+///   侧无枚举约束，将来多一个取值时的表现是「位置列显示 `—`」，不是「批次消失」。
+/// - **holder 三表都带 `deleted_at IS NULL`**（在 `ON` 条件里，不是 `WHERE`）：
+///   软删的货架 / 工人 / 外协厂不该出现在邮件里；而加了它之后 `LEFT JOIN` 仍保留行，
+///   只是名字解析不出来。
+/// - **`ORDER BY` 在 SQL 里排**（渲染层不二次排序，与主查询同一约定）。
+pub async fn list_batches(
+    conn: &mut PgConnection,
+    part_ids: &[i64],
+    assembly_ids: &[i64],
+) -> Result<Vec<DigestBatchRow>, sqlx::Error> {
+    sqlx::query_as!(
+        DigestBatchRow,
+        r#"
+        SELECT
+            u.owner_type       AS "owner_type!",
+            u.owner_id         AS "owner_id!",
+            u.id               AS "id!",
+            u.batch_no         AS "batch_no!",
+            u.quantity         AS "quantity!",
+            u.status           AS "status!",
+            u.is_repairing     AS "is_repairing!",
+            u.location         AS "location?",
+            u.holder_name      AS "holder_name?"
+        FROM (
+            SELECT 'PART'::text AS owner_type,
+                   p.id AS owner_id,
+                   b.id, b.batch_no, b.quantity, b.status, b.is_repairing, b.location,
+                   CASE b.location
+                       WHEN 'WORKER'            THEN w.name
+                       WHEN 'PRODUCTION_SHELF'  THEN s.code
+                       WHEN 'INSPECTION_SHELF'  THEN s.code
+                       WHEN 'OUTSOURCE_COMPANY' THEN oc.name
+                   END AS holder_name
+            FROM t_part_batch b
+            JOIN t_part p ON p.id = b.part_id AND p.deleted_at IS NULL
+            LEFT JOIN t_worker w
+                   ON b.location = 'WORKER' AND w.id = b.current_holder_id
+                  AND w.deleted_at IS NULL
+            LEFT JOIN t_shelf s
+                   ON b.location IN ('PRODUCTION_SHELF', 'INSPECTION_SHELF')
+                  AND s.id = b.current_holder_id
+                  AND s.deleted_at IS NULL
+            LEFT JOIN t_outsource_company oc
+                   ON b.location = 'OUTSOURCE_COMPANY' AND oc.id = b.current_holder_id
+                  AND oc.deleted_at IS NULL
+            WHERE b.deleted_at IS NULL AND p.id = ANY($1::bigint[])
+            UNION ALL
+            SELECT 'ASSEMBLY'::text AS owner_type,
+                   a.id AS owner_id,
+                   b.id, b.batch_no, b.quantity, b.status, b.is_repairing, b.location,
+                   CASE b.location
+                       WHEN 'WORKER'            THEN w.name
+                       WHEN 'PRODUCTION_SHELF'  THEN s.code
+                       WHEN 'INSPECTION_SHELF'  THEN s.code
+                       WHEN 'OUTSOURCE_COMPANY' THEN oc.name
+                   END AS holder_name
+            FROM t_part_batch b
+            JOIN t_part c     ON c.id = b.part_id AND c.deleted_at IS NULL
+            JOIN t_assembly a ON a.id = c.assembly_id AND a.deleted_at IS NULL
+            LEFT JOIN t_worker w
+                   ON b.location = 'WORKER' AND w.id = b.current_holder_id
+                  AND w.deleted_at IS NULL
+            LEFT JOIN t_shelf s
+                   ON b.location IN ('PRODUCTION_SHELF', 'INSPECTION_SHELF')
+                  AND s.id = b.current_holder_id
+                  AND s.deleted_at IS NULL
+            LEFT JOIN t_outsource_company oc
+                   ON b.location = 'OUTSOURCE_COMPANY' AND oc.id = b.current_holder_id
+                  AND oc.deleted_at IS NULL
+            WHERE b.deleted_at IS NULL AND a.id = ANY($2::bigint[])
+        ) u
+        ORDER BY u.owner_type ASC, u.owner_id ASC, u.batch_no ASC
+        "#,
+        part_ids,
+        assembly_ids,
     )
     .fetch_all(&mut *conn)
     .await

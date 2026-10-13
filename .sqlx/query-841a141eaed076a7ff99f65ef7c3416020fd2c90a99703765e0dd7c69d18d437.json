@@ -1,0 +1,80 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            u.owner_type       AS \"owner_type!\",\n            u.owner_id         AS \"owner_id!\",\n            u.id               AS \"id!\",\n            u.batch_no         AS \"batch_no!\",\n            u.quantity         AS \"quantity!\",\n            u.status           AS \"status!\",\n            u.is_repairing     AS \"is_repairing!\",\n            u.location         AS \"location?\",\n            u.holder_name      AS \"holder_name?\"\n        FROM (\n            SELECT 'PART'::text AS owner_type,\n                   p.id AS owner_id,\n                   b.id, b.batch_no, b.quantity, b.status, b.is_repairing, b.location,\n                   CASE b.location\n                       WHEN 'WORKER'            THEN w.name\n                       WHEN 'PRODUCTION_SHELF'  THEN s.code\n                       WHEN 'INSPECTION_SHELF'  THEN s.code\n                       WHEN 'OUTSOURCE_COMPANY' THEN oc.name\n                   END AS holder_name\n            FROM t_part_batch b\n            JOIN t_part p ON p.id = b.part_id AND p.deleted_at IS NULL\n            LEFT JOIN t_worker w\n                   ON b.location = 'WORKER' AND w.id = b.current_holder_id\n                  AND w.deleted_at IS NULL\n            LEFT JOIN t_shelf s\n                   ON b.location IN ('PRODUCTION_SHELF', 'INSPECTION_SHELF')\n                  AND s.id = b.current_holder_id\n                  AND s.deleted_at IS NULL\n            LEFT JOIN t_outsource_company oc\n                   ON b.location = 'OUTSOURCE_COMPANY' AND oc.id = b.current_holder_id\n                  AND oc.deleted_at IS NULL\n            WHERE b.deleted_at IS NULL AND p.id = ANY($1::bigint[])\n            UNION ALL\n            SELECT 'ASSEMBLY'::text AS owner_type,\n                   a.id AS owner_id,\n                   b.id, b.batch_no, b.quantity, b.status, b.is_repairing, b.location,\n                   CASE b.location\n                       WHEN 'WORKER'            THEN w.name\n                       WHEN 'PRODUCTION_SHELF'  THEN s.code\n                       WHEN 'INSPECTION_SHELF'  THEN s.code\n                       WHEN 'OUTSOURCE_COMPANY' THEN oc.name\n                   END AS holder_name\n            FROM t_part_batch b\n            JOIN t_part c     ON c.id = b.part_id AND c.deleted_at IS NULL\n            JOIN t_assembly a ON a.id = c.assembly_id AND a.deleted_at IS NULL\n            LEFT JOIN t_worker w\n                   ON b.location = 'WORKER' AND w.id = b.current_holder_id\n                  AND w.deleted_at IS NULL\n            LEFT JOIN t_shelf s\n                   ON b.location IN ('PRODUCTION_SHELF', 'INSPECTION_SHELF')\n                  AND s.id = b.current_holder_id\n                  AND s.deleted_at IS NULL\n            LEFT JOIN t_outsource_company oc\n                   ON b.location = 'OUTSOURCE_COMPANY' AND oc.id = b.current_holder_id\n                  AND oc.deleted_at IS NULL\n            WHERE b.deleted_at IS NULL AND a.id = ANY($2::bigint[])\n        ) u\n        ORDER BY u.owner_type ASC, u.owner_id ASC, u.batch_no ASC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "owner_type!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "owner_id!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "id!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "batch_no!",
+        "type_info": "Int4",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 4,
+        "name": "quantity!",
+        "type_info": "Int4",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 5,
+        "name": "status!",
+        "type_info": "Varchar",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 6,
+        "name": "is_repairing!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 7,
+        "name": "location?",
+        "type_info": "Varchar",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 8,
+        "name": "holder_name?",
+        "type_info": "Varchar",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8Array",
+        "Int8Array"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "841a141eaed076a7ff99f65ef7c3416020fd2c90a99703765e0dd7c69d18d437"
+}
