@@ -69,7 +69,7 @@ pub fn banner_action(event_type: &str) -> Option<&'static str> {
 /// 它 **≥** 真正订阅广播的连接数 ⇒ 只可能「查了但广播被丢」，不可能「有人订阅却早退」。
 ///
 /// ## 补查走 `state.pool` 而不是复用事务
-/// 三个产出点的 `tx.commit()` 都**早于**本调用，事务已耗尽，`&mut *tx` 借不出可
+/// 两个产出点的 `tx.commit()` 都**早于**本调用，事务已耗尽，`&mut *tx` 借不出可
 /// 用的连接。因此这里自行 `pool.acquire()`。
 ///
 /// ## 两条查询都取 `include_deleted = true`（防御性取值）
