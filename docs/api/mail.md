@@ -128,17 +128,18 @@
 回显），强制必填等于逼前端每次把「不知道的东西」原样传回来。空串是前端唯一能表达
 「我没改它」的方式。
 
-⚠️ **⚠️ 非空 `secret` 与新建走同款校验**（`service::validate_secret`）：控制字符
+⚠️ **非空 `secret` 与新建走同款校验**（`service::validate_secret`）：控制字符
 （CR/LF 等，会进 SMTP `AUTH` 命令行）与 `SECRET_MAX_CHARS = 200` 两道闸在**改档**路径上
 同样生效。回归：`accounts::update_secret_with_control_chars_returns_21704_and_keeps_ciphertext` /
 `accounts::update_secret_over_200_chars_returns_21704`。
 
 ⚠️ **换 `account` 时必须同时换 `secret`**：两个字段是**独立**填的，服务端不校验二者
-匹配。改了登录账号却沿用旧授权码 ⇒ SMTP 以 535 拒绝认证（**零网络 IO 之外的失败**，
-只会体现为流水里一行 `FAILED`）。这是「`secret` 可沿用」这条便利的固有代价：**改档页
-面上必须提示「换账号请一并重填授权码」**。
+匹配。改了登录账号却沿用旧授权码 ⇒ SMTP 以 535 拒绝认证，而**这个失败要等到真发信那一刻
+才暴露**（配置页一切正常、`smtp_configured` 仍是 true，只在流水里留下一行 `FAILED`）。
+这是「`secret` 可沿用」这条便利的固有代价：**改档页面上必须提示「换账号请一并重填
+授权码」**。
 
-⚠️ **⚠️ `name` 撞同名未软删行 ⇒ `21707` + 409**（同 §2.3）：本端点是**全量覆写**，
+⚠️ **`name` 撞同名未软删行 ⇒ `21707` + 409**（同 §2.3）：本端点是**全量覆写**，
 `name` 每次都参与写入 ⇒ 撞 `uk_t_mail_account_name_alive` 与新建撞车是同一件事。service
 层捕 `is_unique_violation`（SQLSTATE 23505）转本码，**不是** 500、也不是 `40901`。
 回归：`accounts::update_name_to_a_live_duplicate_returns_21707_and_keeps_row_intact`。
@@ -398,7 +399,7 @@ t_mail_digest_config.enabled == true
 | **改档时的授权码** | 换 `account` 必须一并重填 `secret`（§2.4 的 535 提醒）；不改则**不发 `secret` 或发空串** |
 
 ⚠️ **部署顺序：后端先上（或与前端同批）**。本轮 `ConfigOut` **新增了 `sender_account_id`
-字段**（`mail_digest` 域，见 `docs/api/mail_digest.md` §2.2），而前端
+字段**（`mail_digest` 域，见 `docs/api/mail_digest.md` §2.1），而前端
 `mailDigestConfigSchema`（`views/mail/digest/mailDigestSchema.ts`）是 **`.strict()`**
 ⇒ **旧前端拿到新出参会整包 `parse` 抛 ZodError ⇒ 配置页白屏**（不是某个字段
 `undefined`、也不是静默少一列 —— strict 是全包拒）。本域 6 个端点是全新端点，旧前端
