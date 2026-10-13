@@ -370,24 +370,41 @@ pub mod code {
     // 映射，撞码比撞段更隐蔽。故取**全新段 217xx**，与 CLAUDE.md §3
     // 「新增域错误码先入对应段、每域一段」的约定一致。
     //
-    // 21701 = 未配置 SMTP（`MailConfig::is_enabled()` 为 false：总闸关，或
-    //   `MAIL_SMTP_USERNAME` / `MAIL_SMTP_PASSWORD` / 发件人地址任一为空）。
-    //   语义上更接近「服务未就绪」→ 映射 HTTP 503（与 `BIZ_WX_NOT_CONFIGURED`
-    //   40109 → 503 同款），不是「调用方无权」。
+    // 21701 = 未配置 SMTP。⚠️ **2026-10-16 语义已改**：`MAIL_SMTP_*` env 整轮删除，
+    //   判据从「`MailConfig::is_enabled()`」换成「`t_mail_digest_config.sender_account_id`
+    //   为 NULL / 指向已软删邮箱 / 授权码解密失败」。语义仍是「服务未就绪」→ 503
+    //   （与 `BIZ_WX_NOT_CONFIGURED` 40109 同款），不是「调用方无权」。
     // 21702 = lettre SMTP 层报错（连接 / 认证 / 拒收 / 握手）。⚠️ 触达本码时
     //   `t_mail_digest_log` **已经落了一行** `status='FAILED'` + error_message，
     //   信息不会因为返错而丢失。
     // 21703 = 邮箱地址格式非法，或含 CR / LF（SMTP header 注入面，见
-    //   `mail_digest::service::validate_email`）。
+    //   `mail_digest::service::validate_email`）。⚠️ 只用于**收件人**；
+    //   发信登录账号的同类校验走 21704（语义不同，混用会让前端文案串台）。
     // 21704 = 配置组合非法：WEEKLY 缺 weekday、MONTHLY 缺 day_of_month、
-    //   未知 visible_columns 列名、两节都关闭、`upcoming_days` 越界等。
+    //   未知 visible_columns 列名、两节都关闭、`upcoming_days` 越界、
+    //   以及 scheduled_task 域的邮箱名称 / 预设 / 登录账号 / 授权码校验失败。
     // 21705 = 配置行不存在**且不可自动初始化**的语义保留位（当前
     //   `GET /config` 在表空时返回默认值 + `version=0`，不返本码）。
+    //
+    // 2026-10-16 新增 scheduled_task 域（邮箱实体）三条：
+    // ⚠️ **复用 217xx 段而不是新开一段**：它们与 mail_digest 共用同一段前缀，
+    //   两域是同一条业务链（通道 → 内容），前端按 `code >= 21701 && code <= 21708`
+    //   归类也没必要 —— 前端本来就是按**具体码**分支的。段位已在 `docs/api/mail.md`
+    //   与 `docs/api/mail_digest.md` 两处登记。
+    // 21706 = 邮箱不存在**或已软删**（HTTP 404）。⚠️ 指向已软删邮箱与指向不存在的
+    //   id 得到同一个码：调用方（发信路径）无法也不需要区分，两者都是「发不出信」。
+    // 21707 = 邮箱名称重复（HTTP 409，**不是** 40901 —— 40901 只表达 OCC，
+    //   业务唯一键冲突须有专用码，见 CLAUDE.md §8）。
+    // 21708 = 邮箱被 `t_mail_digest_config.sender_account_id` 引用，禁止删除
+    //   （HTTP 409）。同上一条：这是「状态冲突」而非「入参非法」。
     pub const BIZ_MAIL_NOT_CONFIGURED: i32 = 21701;
     pub const BIZ_MAIL_SEND_FAILED: i32 = 21702;
     pub const BIZ_MAIL_RECIPIENT_INVALID: i32 = 21703;
     pub const BIZ_MAIL_CONFIG_INVALID: i32 = 21704;
     pub const BIZ_MAIL_CONFIG_NOT_FOUND: i32 = 21705;
+    pub const BIZ_MAIL_ACCOUNT_NOT_FOUND: i32 = 21706;
+    pub const BIZ_MAIL_ACCOUNT_NAME_DUPLICATE: i32 = 21707;
+    pub const BIZ_MAIL_ACCOUNT_IN_USE: i32 = 21708;
 
     // 系统错误
     pub const INTERNAL: i32 = 50000;
@@ -572,7 +589,10 @@ fn status_from_code(c: i32) -> StatusCode {
             || c == code::BIZ_PROCESS_CHAIN_NOT_FOUND
             || c == code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND
             || c == code::BIZ_BATCH_NOT_FOUND
-            || c == code::BIZ_MAIL_CONFIG_NOT_FOUND =>
+            || c == code::BIZ_MAIL_CONFIG_NOT_FOUND
+            // 2026-10-16 新增（scheduled_task 域）：邮箱不存在**或已软删**。
+            // 与 `BIZ_MAIL_CONFIG_NOT_FOUND` 同为「引用一个已经不在的实体」。
+            || c == code::BIZ_MAIL_ACCOUNT_NOT_FOUND =>
         {
             StatusCode::NOT_FOUND
         }
@@ -637,7 +657,12 @@ fn status_from_code(c: i32) -> StatusCode {
             // 2026-10-11 新增：装配件级 force-complete 端点两条幂等拒绝 → 409
             // （与零件级 20123 / 20115 语义对称）。
             || c == code::BIZ_ASSEMBLY_ALREADY_COMPLETED
-            || c == code::BIZ_ASSEMBLY_ALREADY_CANCELLED =>
+            || c == code::BIZ_ASSEMBLY_ALREADY_CANCELLED
+            // 2026-10-16 新增（scheduled_task 域）：邮箱重名（21707，**不是**
+            // 40901 —— 40901 只表达 OCC）与「邮箱被交期汇总配置引用、禁止删除」
+            // （21708）。两者都是状态冲突而非入参非法。
+            || c == code::BIZ_MAIL_ACCOUNT_NAME_DUPLICATE
+            || c == code::BIZ_MAIL_ACCOUNT_IN_USE =>
         {
             StatusCode::CONFLICT
         }
@@ -1134,6 +1159,16 @@ mod tests {
         ),
         (code::BIZ_MAIL_CONFIG_INVALID, "BIZ_MAIL_CONFIG_INVALID"),
         (code::BIZ_MAIL_CONFIG_NOT_FOUND, "BIZ_MAIL_CONFIG_NOT_FOUND"),
+        // 21706..21708 scheduled_task 域（2026-10-16 新增：邮箱实体）
+        (
+            code::BIZ_MAIL_ACCOUNT_NOT_FOUND,
+            "BIZ_MAIL_ACCOUNT_NOT_FOUND",
+        ),
+        (
+            code::BIZ_MAIL_ACCOUNT_NAME_DUPLICATE,
+            "BIZ_MAIL_ACCOUNT_NAME_DUPLICATE",
+        ),
+        (code::BIZ_MAIL_ACCOUNT_IN_USE, "BIZ_MAIL_ACCOUNT_IN_USE"),
         // 207xx 工艺链（worker-pool auto-allocate 阶段新增）
         (
             code::BIZ_PROCESS_CHAIN_NOT_FOUND,
@@ -1370,12 +1405,15 @@ mod tests {
 
         // 2026-09-28 删除：216xx 相关会话域断言（域下线，码段**未复用**）。
 
-        // 217xx（mail_digest，2026-10-13 新增）
+        // 217xx（mail_digest，2026-10-13 新增；后 3 条 scheduled_task，2026-10-16 新增）
         assert_eq!(code::BIZ_MAIL_NOT_CONFIGURED, 21701);
         assert_eq!(code::BIZ_MAIL_SEND_FAILED, 21702);
         assert_eq!(code::BIZ_MAIL_RECIPIENT_INVALID, 21703);
         assert_eq!(code::BIZ_MAIL_CONFIG_INVALID, 21704);
         assert_eq!(code::BIZ_MAIL_CONFIG_NOT_FOUND, 21705);
+        assert_eq!(code::BIZ_MAIL_ACCOUNT_NOT_FOUND, 21706);
+        assert_eq!(code::BIZ_MAIL_ACCOUNT_NAME_DUPLICATE, 21707);
+        assert_eq!(code::BIZ_MAIL_ACCOUNT_IN_USE, 21708);
     }
 
     /// 数据驱动的 HTTP 表覆盖测试：每个 (code, expected_http, name) 一行。
@@ -1461,6 +1499,23 @@ mod tests {
             code::BIZ_MAIL_CONFIG_NOT_FOUND,
             StatusCode::NOT_FOUND,
             "BIZ_MAIL_CONFIG_NOT_FOUND",
+        ),
+        // 2026-10-16 新增（scheduled_task 域）：邮箱不存在 → 404；重名 / 被引用
+        // 禁删 → 409（⚠️ 重名**不是** 40901，那一码只表达 OCC）。
+        (
+            code::BIZ_MAIL_ACCOUNT_NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            "BIZ_MAIL_ACCOUNT_NOT_FOUND",
+        ),
+        (
+            code::BIZ_MAIL_ACCOUNT_NAME_DUPLICATE,
+            StatusCode::CONFLICT,
+            "BIZ_MAIL_ACCOUNT_NAME_DUPLICATE",
+        ),
+        (
+            code::BIZ_MAIL_ACCOUNT_IN_USE,
+            StatusCode::CONFLICT,
+            "BIZ_MAIL_ACCOUNT_IN_USE",
         ),
         (code::FORBIDDEN, StatusCode::FORBIDDEN, "FORBIDDEN"),
         (
