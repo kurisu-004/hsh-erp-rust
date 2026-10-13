@@ -80,16 +80,19 @@ async fn config_empty_table_returns_defaults_with_zero_version() {
     assert_eq!(d["updated_at"], "");
     // SMTP 未配置时 smtp_configured=false（前端据此灰掉「立即发送」）
     assert_eq!(d["smtp_configured"], false);
-    // 缺省列白名单 = 8 列（row_type / is_urgent / order_no 不在缺省集里）
+    // 缺省列白名单 = 10 列（row_type / is_urgent / order_no 不在缺省集里；
+    // 2026-10-16 起新增 batch_no / location 两个批次级列）
     assert_eq!(
         d["visible_columns"],
         json!([
             "serial_no",
             "drawing_no",
             "name",
+            "batch_no",
             "quantity",
             "customer_name",
             "status",
+            "location",
             "system_delivery_date",
             "remaining_days"
         ])

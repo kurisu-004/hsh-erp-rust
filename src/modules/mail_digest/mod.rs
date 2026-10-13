@@ -55,22 +55,32 @@
 //!
 //! ## 口径分叉登记（与 dashboard 域）
 //!
-//! 「未交付」的判据与 dashboard **共用同一份常量**
-//! [`crate::modules::dashboard::repo::DELIVERY_STATUSES`]，行单位同为**工单级**
-//! （`t_part` 侧带 `assembly_id IS NULL`，装配件行替换其子件行），已交量守卫同为
-//! `status IN ('DELIVERED','COMPLETED')`。这三处与 dashboard 逐字同源，是既定契约。
+//! 「未交付」的**判据**与 dashboard 逐字同源，行单位同为**工单级**（`t_part` 侧带
+//! `assembly_id IS NULL`，装配件行替换其子件行），已交量守卫同为
+//! `status IN ('DELIVERED','COMPLETED')`。这三处是既定契约。
 //!
-//! **刻意不同的只有「取哪些行」**：dashboard 每桶 `LIMIT 30`（大屏一屏放不下），
-//! 邮件必须给全量 —— 漏一条交期就是漏一个客户；且本域未来节有 `[today, today+N)`
-//! 的时间窗口（用户要的就是「未来 14 天」）。理由详见 [`repo`] 模块 doc 的对照表。
+//! ⚠️ **2026-10-16 拆掉常量共用**：原先「未交付」白名单是
+//! `use crate::modules::dashboard::repo::DELIVERY_STATUSES` 直接引 dashboard 那份
+//! （「一处改、两处生效」）。本轮按用户要求「在邮件通知的域重写 SQL，不要复用其它域的」
+//! **改成本域自有常量 [`repo::DELIVERY_STATUSES`]**（6 态字面量相同），本域统计 SQL
+//! 从此零他域符号依赖。代价是白名单取值变成**人工同步**关系，登记在
+//! `docs/api/mail_digest.md` §5。
+//!
+//! **刻意不同的逐项对照见 `docs/api/mail_digest.md` §4.2**（六项，⚠️ 不止「取哪些行」：
+//! 还有**取哪些列**、客户名的取法、两侧窗口边界、行单位 —— 2026-10-16 复核更正，本句
+//! 原先写成「仍只有『取哪些行』」，与 §4.2 那张表对不上）。其中影响最大的两条：`LIMIT 30`
+//! vs 无 LIMIT（大屏一屏放不下 vs 邮件必须给全量 —— 漏一条交期就是漏一个客户），以及未来节
+//! 的 `[today, today+N)` 上界（用户要的就是「未来 14 天」）。
 //!
 //! ## 域隔离护栏：**不适用**（2026-10-16 复核过）
 //!
 //! 本域有两类对别域的依赖，**没有一类**适合 `assert_no_foreign_domain`：
 //!
-//! 1. **只读聚合别域的表**（`t_part` / `t_assembly` / `t_part_batch` / `t_customer`，
-//!    四张）：那是本仓既定 pattern（同 `dashboard` / `statistics` / `admin`），
-//!    统计 SQL 完全在本域内写全（[`repo`]），不 import 他域的 service / repo。
+//! 1. **只读聚合别域的表**（`t_part` / `t_assembly` / `t_part_batch` / `t_customer`
+//!    四张，另加批次位置解析用的 `t_shelf` / `t_worker` / `t_outsource_company`）：
+//!    那是本仓既定 pattern（同 `dashboard` / `statistics` / `admin`），统计 SQL 完全在
+//!    本域内写全（[`repo`]），不 import 他域的 service / repo。⚠️ **张数刻意不写死**
+//!    （加表即过期），完整清单以 `docs/api/mail_digest.md` §8.1 的表格为准。
 //! 2. **读 `scheduled_task` 域的 `t_mail_account`**（2026-10-16 新增）：这条**确实**
 //!    是 `use crate::modules::scheduled_task::{dto, repo}` 形式的跨域引用 ——
 //!    护栏若装上会当场红。
@@ -84,8 +94,8 @@
 //! 扫 `src/modules/scheduled_task/**`）：通道域对内容域**零**代码引用，那条
 //! 「被引用禁删」的检查是它自己写的 SQL 查 `t_mail_digest_config`。
 //!
-//! 唯一的「引用他域符号」还有共用常量 [`DELIVERY_STATUSES`] —— 它是一个
-//! `&'static [&str; 6]`，正是 CLAUDE.md 要求「四处共用」的那一份。
+//! ⚠️ 「统计用的 `DELIVERY_STATUSES`」**已于 2026-10-16 改成本域自有常量**
+//! （见上一节「拆掉常量共用」），不再构成跨域引用。
 
 pub mod dto;
 pub mod handler;
