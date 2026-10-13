@@ -1223,8 +1223,13 @@ async fn recall_to_pending_rejects_non_production_location() {
 // 用例随之删除；同族的另两条端点那份断言在
 // `tests/production/scan_listing.rs` 里仍绿着。
 //
-// 本节保留它们用到的 4 个造数 helper（`insert_part_biz` / `insert_worker` /
-// `insert_pickable_batch` / `insert_worker_held_batch`）：`recall` 那条用例仍在用。
+// 本节保留它们用到的 3 个造数 helper（`insert_part_biz` / `insert_worker` /
+// `insert_worker_held_batch`）：`recall` 那条用例仍在用。同族原先还有第 4 个
+// `insert_pickable_batch`，随本轮删除（2026-10-13 review 第 2 轮 NIT：它已成死代码 ——
+// 本文件零调用点；`tests/part/main.rs` 的 crate 级 `#![allow(dead_code, …)]` 让 clippy
+// 不报，故一直没人发现。同名的 `insert_pickable_batch` 在
+// `tests/production/scan_listing.rs` 里是**另一个文件自己的本地 helper**，仍在用，
+// 不要一起删）。
 //
 // ## ⚠️ 旧路径的响应形态：**干净 404**
 //
@@ -1287,27 +1292,6 @@ async fn insert_worker(pool: &PgPool, work_type_id: i64, code: &str) -> i64 {
     .await
     .expect("insert t_worker");
     worker_id
-}
-
-/// 造一条「可领取」批次：PRODUCTION_SHELF + holder=生产架 + current_process_id=工序。
-/// 前两条 list 端点要求批次满足这三条 + part 未软删 + 工种↔工序映射活跃。
-async fn insert_pickable_batch(pool: &PgPool, part_id: i64, shelf_id: i64, process_id: i64) -> i64 {
-    use hsh_erp_test_support::pool_snowflake;
-    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
-    let batch_id = snowflake.next_id();
-    sqlx::query(
-        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
-         current_holder_id, current_process_id, version, created_at, updated_at) \
-         VALUES ($1, $2, 1, 3, 'IN_PROCESS', 'PRODUCTION_SHELF', $3, $4, 0, now(), now())",
-    )
-    .bind(batch_id)
-    .bind(part_id)
-    .bind(shelf_id)
-    .bind(process_id)
-    .execute(pool)
-    .await
-    .expect("insert t_part_batch (PRODUCTION_SHELF)");
-    batch_id
 }
 
 /// 造一条「工人持有中」批次：IN_PROCESS + location='WORKER' + holder=worker。
@@ -1471,5 +1455,62 @@ async fn force_complete_old_part_path_is_gone() {
         "旧路径 POST /api/v2/parts/{{part_id}}/force-complete 必须 404（硬切无 alias，\
          别把 400/405 当成「路由还在」）: {raw}"
     );
+}
+
+/// **RBAC 回归**：CLERK → 403。零件侧 force-complete 是 MANAGER **单角色**的逃生通道
+/// （不下放 Clerk），与装配件侧 `tests/assembly/force_complete.rs` 同款契约。
+///
+/// 补的是**哪一层的缺口**：service 层的守卫早有 lib 单测
+/// （`modules::part::service::lifecycle::tests::force_complete_rejects_clerk`，
+/// 直调 service、断言 `code::FORBIDDEN`），但 **handler 层的同名检查没有任何测试**
+/// —— handler 是走 HTTP 的集成测试才能覆盖的那一层，而集成侧此前只有主路径 happy
+/// path 与旧路径 404 守卫。于是「删掉 handler 里那道
+/// `current.require_role(Role::Manager)?`」这个动作**全仓零测试会红**
+/// （service 单测绕开 handler 直调 service），逃生通道被静默放开一层。
+/// 本用例把那一层钉住。
+///
+/// 断言两件事：① HTTP 403 + 信封 `code == 40300`（`FORBIDDEN`）；② 守卫拒绝后
+/// part 与其批次**状态一字未改**（`IN_PROCESS`），即拒绝发生在任何写之前。
+#[tokio::test]
+async fn force_complete_rejects_clerk_role() {
+    let (pool, app, token, fx) = bootstrap_as_clerk().await;
+    let (pid, bid) = insert_part_with_batch(
+        &pool,
+        "强制完成-角色守卫",
+        fx.customer_l1_id,
+        "IN_PROCESS",
+        2,
+    )
+    .await;
+
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/parts/{pid}/force-complete"),
+            Some(json!({ "note": "Clerk 不该能强推" })),
+            Some(&token),
+        ),
+    )
+    .await;
+
+    assert_eq!(s, StatusCode::FORBIDDEN, "CLERK 应 403: {env}");
+    assert_eq!(
+        env["code"], 40300,
+        "CLERK 应报 FORBIDDEN（MANAGER 单角色，不委派 Clerk）: {env}"
+    );
+
+    // 拒绝路径不得改动任何状态（守卫在 handler 首行，先于 tx 开与 service）
+    assert_eq!(
+        part_status(&pool, pid).await,
+        "IN_PROCESS",
+        "守卫拒绝后 part 状态不应被强推"
+    );
+    let bstatus: String = sqlx::query_scalar("SELECT status FROM t_part_batch WHERE id = $1")
+        .bind(bid)
+        .fetch_one(&pool)
+        .await
+        .expect("read batch status");
+    assert_eq!(bstatus, "IN_PROCESS", "守卫拒绝后批次状态不应被强推");
 }
 

@@ -47,8 +47,8 @@ pub mod part;
 // queue 平移至 `prod::*`，URL 硬切换到 `/api/v2/prod/*`（无 alias，前端锁步）。
 // part / assembly 是核心实体未移入；报工端点保留在 part 域。
 // 2026-10-11 补记：assembly 的「域本体不进 prod」决策不变（下方
-// `.nest("/assemblies", assembly::router())` 承载其 10 条 CRUD / 状态机端点，路径与
-// 形状一行未动）；**唯一例外**是装配件级强制完成逃生端点
+// `.nest("/assemblies", assembly::router())` 承载其 8 条 CRUD / 状态机端点 ——
+// 2026-10-13 订正，原写 10 条；该 nest 的路径与挂载位置不变）；**唯一例外**是装配件级强制完成逃生端点
 // `POST /api/v2/prod/assemblies/{assembly_id}/force-complete` 挂在 `prod::router()`
 // 下 —— 它操作的是「子件 + 批次的生产执行状态」，与批次 / 队列动作同属生产链路。
 // 这是端点级归属裁决，不是域归属变更，两处注释不要读成互相矛盾。

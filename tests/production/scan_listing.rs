@@ -8,8 +8,10 @@
 //!
 //! 2026-10-10 自 `tests/part/pickable_by_work_type.rs` 迁来（URL 全部硬切，无 alias），
 //! 同时吸收 `tests/part/lifecycle.rs` 里「工种 / 工人维度三条 list 端点的 part 侧真实
-//! 字段投影」一节里属于这两条端点的两例。留在 part 域的 `GET /parts/by-work-type/{id}`
-//! 仍由 `tests/part/lifecycle.rs` 覆盖。
+//! 字段投影」一节里属于这两条端点的两例。同族的
+//! `GET /parts/by-work-type/{id}` 已于 2026-10-13 随零消费方清理**整条下线**
+//! （无 alias；404 守卫在 `tests/part/lifecycle.rs`），故本文件是这族端点
+//! 唯一的 HTTP 覆盖。
 //!
 //! ## 过滤条件（全套都满足，行才进列表）
 //! **pickable**：批次 `status='IN_PROCESS'` + `location='PRODUCTION_SHELF'` +
@@ -260,8 +262,10 @@ async fn pickable_returns_batch_id_and_version_matching_db() {
 // 本轮（独立 commit）一次清完 `part/service/phase1/work_type.rs` 的全部 3 处：
 //   · 报工台 pickable 列表（`GET /prod/scan/pickable?work_type_id=`）
 //   · 报工台 held 列表（`GET /prod/scan/held?worker_id=`）        ← 本节用例 2
-// 同族的 `list_by_work_type`（`GET /parts/by-work-type/{id}`）留在 part 域，用例在
-// `tests/part/lifecycle.rs`。
+// 同族的 `list_by_work_type`（`GET /parts/by-work-type/{id}`）已于 2026-10-13 随零消费方
+// 清理**整条下线**（连同 `service/phase1/work_type.rs` 与 `dto_crud::ByWorkTypeQuery`；
+// 无 alias，404 守卫在 `tests/part/lifecycle.rs`）—— 本节这三条 `use` 是那一轮之前
+// 逐字搬过来的历史记录，**当时代码面**成立；现状见 §6 的移除记录。
 
 /// 插一个 active 且已绑 work_type 的工人（`by-work-type` 走 `t_worker` JOIN，
 /// 报工台 held 列表以 worker_id 为过滤锚点）。

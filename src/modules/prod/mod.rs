@@ -77,8 +77,9 @@
 //! part 全部活跃批次）、`POST /parts/{part_id}/soft-delete`、`GET /parts/{part_id}/batches`，
 //! 以及全部 CRUD / 文件 / Excel 工具 / 各类 list 端点。
 //!
-//! assembly **域本体**仍是核心实体、其 10 条 CRUD / 状态机端点不进 prod（决策不变，
-//! URL 仍在 `/api/v2/assemblies/*`，由 `modules::v2_router` 的顶层 nest 承载）。
+//! assembly **域本体**仍是核心实体、其 8 条 CRUD / 状态机端点不进 prod（决策不变，
+//! URL 仍在 `/api/v2/assemblies/*`，由 `modules::v2_router` 的顶层 nest 承载；计数
+//! 8 的口径见 `src/modules/assembly/mod.rs` 的「路由归属」一节，2026-10-13 订正）。
 //! **唯一的例外**是 2026-10-11 新增的强制完成逃生端点
 //! `POST /api/v2/prod/assemblies/{assembly_id}/force-complete`：它的操作对象是
 //! 「子件 + 批次的生产执行状态」，与批次 / 队列动作同属生产链路语义，故挂

@@ -1134,7 +1134,10 @@ repo**：本域 `listing/` 子模块受域隔离护栏
 
 - `ScanWorkerBrief` 相对 `WorkerOut` 删 7 个字段（§2.1）。
 - `ScanListItem` 相对 `PartListItem` 删 23 个字段（§2.2）。
-- `PickableQuery` 删 `shelf_id`；`ByWorkTypeQuery`（留在 part 域）同步删。
+- `PickableQuery` 删 `shelf_id`。同族的 `ByWorkTypeQuery` 当年的去向是「留在 part 域
+  同步删」—— ⚠️ **该 DTO 已于 2026-10-13 随 `GET /parts/by-work-type/{id}` 整条端点
+  删除**（零消费方，`service/phase1/work_type.rs` 与 `dto_crud::ByWorkTypeQuery`
+  一并删掉），故本行只是当年迁移方案的史实，不是现状。
 
 ### 6.3 文件 / 类型归属
 
@@ -1145,7 +1148,7 @@ repo**：本域 `listing/` 子模块受域隔离护栏
 | `WorkerScanEvent` | `prod::queue::dto` | `prod::scan::dto` |
 | `WorkerScanRequest` / `PickUpRequest` | `prod::batch::dto` | `prod::scan::dto` |
 | `VerifyBadgeRequest` | `prod::worker::dto` | `prod::scan::dto` |
-| `ByWorkTypeQuery` / `ByWorkerQuery` | `part::dto_crud` | `prod::scan::dto::PickableQuery` / `HeldQuery` |
+| `ByWorkTypeQuery` / `ByWorkerQuery` | `part::dto_crud` | `prod::scan::dto::PickableQuery` / `HeldQuery`（⚠️ `ByWorkTypeQuery` 已于 2026-10-13 随 `GET /parts/by-work-type/{id}` 端点一并删除，见 §6.2 的同款批注） |
 | `PickUpOutcome` / `PickUpSplitInfo` | `prod::batch::service::pickup` | `prod::scan::service::pickup` |
 
 `part::vo::ChainState` **保留**（`PartListItem` 仍在用），并从本域 re-export 去掉 ——

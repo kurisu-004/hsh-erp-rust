@@ -49,7 +49,8 @@ pub fn router() -> Router<Arc<AppState>> {
 ///   全部非 CANCELLED 批次为 `COMPLETED`（绕状态机）。
 ///
 /// 为什么单开一个工厂而不并进上面的 [`router`]：装配件域**本体**是核心实体，路由仍
-/// 挂在 `/api/v2/assemblies/*`（`modules::v2_router` 的顶层 nest，10 条一行未动）；
+/// 挂在 `/api/v2/assemblies/*`（`modules::v2_router` 的顶层 nest，8 条 —— 计数口径见
+/// 本文件模块 doc 的「路由归属」一节）；单开本工厂**不改动**域本体的任何一条路由；
 /// 只有这条生产链路收口的逃生端点挂在 `/api/v2/prod/assemblies/*` 下 —— 与批次 /
 /// 队列动作同属「生产执行」语义。两个前缀并存是**刻意**的分歧，不是遗漏。
 pub fn force_complete_router() -> Router<Arc<AppState>> {

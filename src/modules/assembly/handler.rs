@@ -290,7 +290,7 @@ pub async fn add_assembly_child(
 ///
 /// 路径挂在 `/api/v2/prod/assemblies/*`（**不是** `/api/v2/assemblies/*`）：它是生产
 /// 链路收口的逃生端点，与 `prod` 下其余批次 / 队列动作同属「生产执行」语义；装配件域
-/// 本体的 10 条 CRUD / 状态机端点仍在 `modules::v2_router` 的顶层 nest，一行未动。
+/// 本体的 8 条 CRUD / 状态机端点仍在 `modules::v2_router` 的顶层 nest。
 /// 详见 `modules::prod::router()` 的挂载注释。
 ///
 /// 行为：
@@ -325,7 +325,7 @@ pub async fn force_complete_assembly(
 /// 装配件域**生产链路逃生端点**子路由（不含公共前缀；由 `mod.rs::force_complete_router()`
 /// 转发、`prod::router()` 桥接到 `/prod/assemblies`）。
 ///
-/// 与 [`router`] 是两个独立工厂：前者给装配件域本体的 10 条（顶层 `/api/v2/assemblies`），
+/// 与 [`router`] 是两个独立工厂：前者给装配件域本体的 8 条（顶层 `/api/v2/assemblies`），
 /// 后者只含强制完成这一条（`/api/v2/prod/assemblies`）。前缀并存是刻意的端点级归属裁决。
 pub fn force_complete_router() -> Router<Arc<AppState>> {
     Router::new().route(
