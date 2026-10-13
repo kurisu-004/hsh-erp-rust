@@ -13,8 +13,6 @@ use sqlx::PgPool;
 use hsh_erp_rust::auth::rbac::{CurrentUser, Role};
 use hsh_erp_rust::modules::assembly::dto::{AssemblyChildAddRequest, AssemblyCreateRequest};
 use hsh_erp_rust::modules::assembly::service::AssemblyService;
-use hsh_erp_rust::modules::part::dto_crud::PartCreateRequest;
-use hsh_erp_rust::modules::part::service::PartService;
 use hsh_erp_rust::shared::error::AppError;
 
 use hsh_erp_test_support::{
@@ -426,11 +424,4 @@ async fn add_child_inherits_planned_delivery_date_when_omitted() {
         child.planned_delivery_date, planned,
         "子件 planned_delivery_date 缺省 → 继承父件"
     );
-}
-
-// 强制 PartService / PartCreateRequest 不被 unused warning（保留为扩展预留）
-#[allow(dead_code)]
-fn _phantom_part_service_usage() {
-    let _ = PartService::create_part::<&mut sqlx::PgConnection>;
-    let _: fn() -> Option<PartCreateRequest> = || None;
 }

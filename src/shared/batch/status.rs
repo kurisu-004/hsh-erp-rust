@@ -73,7 +73,7 @@
 //!
 //! # 为什么收 `&mut PgConnection` 而不是泛型 `impl PgExecutor<'_>`
 //!
-//! step 3 必须调 `AssemblyService::sync_from_part_change`（D-6 架构约定：
+//! step 3 必须调 `AssemblyService::sync_from_part_change_by_id`（D-6 架构约定：
 //! service 不持连接，跨域调用经 `repo.conn_mut()` 拿连接；该 wrapper 的实体
 //! 实现 [`sync_assembly_status`] 已于 2026-10-13 一并搬进本文件，见下），step 4/5 的
 //! 序列号释放要读写 `t_part` / `t_assembly` / `t_part_event` 三张表。
@@ -902,7 +902,8 @@ pub(crate) async fn release_part_serial_no(
 // `R = &mut PgConnection`、单测路径的 `R = MockAssemblyRepoTrait` 都靠它收，
 // 这正是「可 mock」这条收益的来源。
 
-/// 实际聚合 + 翻转的核心；`sync_from_part_change_inner` / `sync_from_part_changes` 共用。
+/// 实际聚合 + 翻转的核心；生产侧唯一调用方是
+/// `assembly::service::sync_from_part::sync_from_part_change_by_id`。
 ///
 /// 2026-09-22 D-3 决策：保持自由函数（不挂在 `impl AssemblyService`），避免
 /// 跨 impl 块调用路径复杂化；签名与 `assembly::service::crud::fetch_current_batch_ids` 同形。

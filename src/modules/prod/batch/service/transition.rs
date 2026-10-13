@@ -248,7 +248,7 @@ impl BatchService {
                 }
             }
         }
-        // 父装配件同步已由各 to_ship_core 在 savepoint 内调用 sync_from_part_change 完成。
+        // 父装配件同步已由各 to_ship_core 在 savepoint 内调用 sync_from_part_change_by_id 完成。
         Ok(BatchToXxxOut { submitted, failed })
     }
 
@@ -413,7 +413,7 @@ impl BatchService {
                 }
             }
         }
-        // 父装配件同步已由各 to_inspection_core 在 savepoint 内调用 sync_from_part_change 完成。
+        // 父装配件同步已由各 to_inspection_core 在 savepoint 内调用 sync_from_part_change_by_id 完成。
         Ok(BatchToXxxOut { submitted, failed })
     }
 }

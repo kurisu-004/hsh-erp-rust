@@ -250,9 +250,3 @@ async fn by_part_part_no_parent() {
         detail_opt
     );
 }
-
-// 强制 PartService / PartCreateRequest 不被 unused warning（保留为扩展预留）
-#[allow(dead_code)]
-fn _phantom_part_service_usage() {
-    let _: fn() -> Option<PartCreateRequest> = || None;
-}

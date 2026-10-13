@@ -14,7 +14,7 @@
 //! ## 子模块拆分（2026-09-22，原 service.rs 1088 行超 1000 行上限）
 //! - `crud.rs` —— 列表 / 详情 / 创建 / 更新 / 软删 / 取消（6 端点）
 //! - `lifecycle.rs` —— start（状态机 PENDING → IN_PROCESS）/ files 上传
-//! - `sync_from_part.rs` —— 被 part 反向触发的回调（`sync_from_part_change[es]` /
+//! - `sync_from_part.rs` —— 被 part 反向触发的回调（`sync_from_part_change_by_id` /
 //!   `sync_assembly_status`）
 //!
 //! ## 跨域调用（2026-09-22 D-3 决策）
@@ -22,7 +22,7 @@
 //! `AssemblyRepoTrait` 跨域 helper 收口——service 不直接调 `PartRepo::xxx` /
 //! `PartFileRepo::xxx` ZST 静态方法。
 //!
-//! 反向：part → assembly 由 `AssemblyService::sync_from_part_change`（mod.rs 内
+//! 反向：part → assembly 由 `AssemblyService::sync_from_part_change_by_id`（mod.rs 内
 //! ZST 静态入口）暴露，供 `shared::batch::status` 的 ZST 调用点使用。
 //!
 //! ## 兼容旧测试的 ZST 静态 wrapper（2026-09-22 D-3 决策）
@@ -197,36 +197,21 @@ impl AssemblyService {
         crud::add_assembly_child_dispatch(conn, snowflake, assembly_id, req, current).await
     }
 
-    /// 兼容旧 ZST 静态调用：单 part → assembly sync 钩子。
-    ///
-    /// `shared::batch::status` 走 ZST 静态调用。详见 [`sync_from_part::sync_from_part_change`]。
-    pub async fn sync_from_part_change(
-        conn: &mut sqlx::PgConnection,
-        part_id: i64,
-        current: &CurrentUser,
-    ) -> Result<SyncOutcome, AppError> {
-        sync_from_part::sync_from_part_change(&Self {}, conn, part_id, current).await
-    }
-
     /// 2026-10-01 新增：只收 `updated_by` 的单 part → assembly sync 钩子。
     ///
-    /// 唯一调用方是 `shared::batch::status`（batch → part → assembly 单一写
+    /// **唯一**调用方是 `shared::batch::status`（batch → part → assembly 单一写
     /// 入口）—— 该链路上只有 `updated_by`，没有登录用户上下文。
+    ///
+    /// 2026-10-13：原先还有一个收 `&CurrentUser` 的 `sync_from_part_change` 与一个
+    /// 批量变体 `sync_from_part_changes`，生产零调用（派生链自 2026-10-01 起就只走
+    /// 本方法），唯一真实调用方是集成测试，已随死代码清理一并删除。理由与影响见
+    /// [`sync_from_part`] 的模块 doc「2026-10-13 死代码清理」一节。
     pub async fn sync_from_part_change_by_id(
         conn: &mut sqlx::PgConnection,
         part_id: i64,
         updated_by: i64,
     ) -> Result<SyncOutcome, AppError> {
         sync_from_part::sync_from_part_change_by_id(&Self {}, conn, part_id, updated_by).await
-    }
-
-    /// 兼容旧 ZST 静态调用：批量 part → assembly sync 钩子。
-    pub async fn sync_from_part_changes(
-        conn: &mut sqlx::PgConnection,
-        part_ids: &[i64],
-        current: &CurrentUser,
-    ) -> Result<Vec<SyncOutcome>, AppError> {
-        sync_from_part::sync_from_part_changes_dispatch(conn, part_ids, current).await
     }
 
     /// 2026-10-11 新增：装配件级强制完成

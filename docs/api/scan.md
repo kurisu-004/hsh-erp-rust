@@ -1151,6 +1151,10 @@ repo**：本域 `listing/` 子模块受域隔离护栏
 `part::vo::ChainState` **保留**（`PartListItem` 仍在用），并从本域 re-export 去掉 ——
 让 `part` 反向依赖 `prod::scan` 换来的只是省几行字，代价是一条本不该存在的跨域依赖。
 
+⚠️ **2026-10-13 瘦身**：该类型只剩 `None` 一个变体（`Next` / `Tail` 与它们的
+`from_db_text` 映射随 part 域最后的填充路径一起删除），但**wire 字段保留**、仍发
+`"NONE"`。本域 `ScanChainState` 的三值分流**完全不受影响**（它是独立类型，独立真源）。
+
 ## 7. 表依赖
 
 | 用途 | 表 |

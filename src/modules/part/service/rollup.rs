@@ -8,7 +8,7 @@
 //! 3. target == 当前 → NoChange（不写库、不触发 assembly sync）
 //! 4. 内部 UPDATE `t_part`（派生写不走 OCC 冲突，仍 `version += 1` + 写
 //!    `updated_by` / `updated_at`）
-//! 5. 若 part.status 实际变化 → 调 `AssemblyService::sync_from_part_change`
+//! 5. 若 part.status 实际变化 → 调 `AssemblyService::sync_from_part_change_by_id`
 //!    闭合 batch → part → assembly 链路；返回 `SyncOutcome::Changed(part_id)`
 //!    由 handler 决定 WS 广播。
 //!

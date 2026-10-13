@@ -160,7 +160,7 @@ impl BatchService {
         // 7. batch → part → assembly rollup：**已在第 5 步的 shared::batch::status 内完成**
         //    （min-progress 规则：多条 INSPECTION 批次时 part 维持 INSPECTION，
         //    单条时升 READY_TO_SHIP；part.status 真变了才级联
-        //    `AssemblyService::sync_from_part_change`）。
+        //    `AssemblyService::sync_from_part_change_by_id`）。
         //    2026-10-01：此处**不再**补调 `PartService::sync_from_batch_change`
         //    —— 那会跑第二次派生、必然 `NoChange`，把 `synced_assembly_id`
         //    恒吞成 null（连带 WS 的 `ASSEMBLY_UPDATED` 永不发）。

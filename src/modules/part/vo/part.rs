@@ -8,7 +8,7 @@
 
 use chrono::{NaiveDate, NaiveDateTime};
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::modules::part::model::{TPart, TPartInspected};
 use crate::shared::types::{serialize_i64, serialize_i64_opt};
@@ -120,45 +120,24 @@ impl PartDetailOut {
 /// —— 让 `part` 反向依赖 `prod::scan` 换来的只是省几行字，代价是一条本不该
 /// 存在的跨域依赖。
 ///
-/// 序列化形态是大写字符串（`rename_all = "UPPERCASE"` ⇒ `"NONE"` / `"NEXT"` /
-/// `"TAIL"`），与本仓「无 DB ENUM、Rust enum 校验」的约定一致。
+/// 2026-10-13：`Next` / `Tail` 两个变体随它们的**唯一填充方**
+/// （`part::service::phase1::work_type` 的 `into_list_item`，Phase F 随
+/// `GET /parts/by-work-type/{id}` 端点整条下线）一并删除。**wire 字段本身保留**，
+/// 出参仍发 `"NONE"` —— 删字段是破坏性变更，须等前端 `types/parts.ts` 一起收。
+/// ⚠️ 前端真正的 `NEXT` / `TAIL` 三态分流吃的是 `ScanListItem`（报工台的
+/// `ScanChainState`），**不受本枚举瘦身影响**。
 ///
-/// 三值**互斥**而不是两个 bool：两个 bool 会出现「可免填 + 是链尾」这类自相矛盾的
-/// 组合，前端必须自己排优先级，而排错的后果是静默把工件投到错误工序。
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// ⚠️ **前端注释自相矛盾（2026-10-13 登记，未修）**：前端
+/// `src/types/parts.ts` 的 `chain_state` 字段上方有一句「不含 NEXT/TAIL」的注释，
+/// 而紧邻的字段声明仍然声明着三者 —— 两侧说的是同一件事、结论相反。属前端仓范围，
+/// 本轮只在 commit message 里点名，请前端 PR 一并收。
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum ChainState {
     /// 无链 / 链已软删 / 锚链解析失败 / **当前工序不在链内（位置指针漂移）**
     /// ⇒ 前端弹工序选择框，让用户手填下一道工序。
     #[default]
     None,
-    /// 当前工序在链内且**有下一道** ⇒ 前端免填，确认后直接放回。
-    Next,
-    /// 当前工序是链内**最后一道** ⇒ 前端提示「加工完成后请送检」。
-    Tail,
-}
-
-impl ChainState {
-    /// DB 文本（取行 SQL 里 `COALESCE(nx.chain_state, 'NONE')` 的结果）→ 枚举。
-    ///
-    /// 未知取值降级成 [`ChainState::None`] 并 `warn!`。判错的代价不对称：
-    /// `NEXT` / `TAIL` 会让写侧**免填**下一道工序（投错工序静默发生），
-    /// `NONE` 只是多一次人工选择，故一律往保守方向降。
-    ///
-    /// 2026-10-10 起本函数在 part 域**没有调用方**（唯一那条取行 SQL 已迁走），
-    /// 保留它是为了让 wire 字面量与降级口径在本 VO 上仍有一个可测的锚点 —— 与
-    /// 报工台那份 `ScanChainState::from_db_text` 逐条同形、同样的单测。
-    pub fn from_db_text(raw: &str) -> Self {
-        match raw {
-            "NEXT" => Self::Next,
-            "TAIL" => Self::Tail,
-            "NONE" => Self::None,
-            other => {
-                tracing::warn!("chain_state 出现未知取值 {other:?}，降级为 NONE");
-                Self::None
-            }
-        }
-    }
 }
 
 /// `GET /parts` 列表行：`TPart` 显式列字段 + 客户冗余字段 + 派生位置 / 持有人。
@@ -601,33 +580,17 @@ pub struct PartBatchListItemOut {
 
 #[cfg(test)]
 mod tests {
-    //! `ChainState` 的 DB 文本 → 枚举映射守卫（含序列化字面量）。
+    //! `ChainState` 的 wire 字面量守卫。
     //!
-    //! 这条映射的唯一调用点是取行 SQL 里 `COALESCE(nx.chain_state, 'NONE')` 的
-    //! 结果，而 SQL 的 `CASE` 只能产出 `NONE` / `NEXT` / `TAIL` 三个字面量。
-    //! 一旦两边字面量漂移（改了 SQL 分支名却没改 `from_db_text`），未知取值会
-    //! 静默降级成 `NONE` —— 症状是「放回页突然让工人手填工序」，离根因很远。
-    //! 故把映射与序列化形态一并锁在单测里。
+    //! ⚠️ 2026-10-13 原先这里还有 4 条用例（`from_db_text_maps_all_three_values` /
+    //! `from_db_text_unknown_falls_back_to_none` / `deserializes_from_uppercase_strings` /
+    //! `from_db_text_matches_scan_chain_state_on_every_input`），它们守的是
+    //! `Next` / `Tail` 两个变体与 `from_db_text` 映射 —— 随那两个变体一并删除。
+    //! 「本 VO 与 `ScanChainState` 两份 `from_db_text` 是否会漂移」这个担忧随之
+    //! **消失**：本 VO 侧已没有 `from_db_text`，只剩报工台那份真源。
+    //!
+    //! 剩下这两条守的是**仍在 wire 上的 `None`**：默认值与序列化名。
     use super::*;
-
-    #[test]
-    fn from_db_text_maps_all_three_values() {
-        assert_eq!(ChainState::from_db_text("NEXT"), ChainState::Next);
-        assert_eq!(ChainState::from_db_text("TAIL"), ChainState::Tail);
-        assert_eq!(ChainState::from_db_text("NONE"), ChainState::None);
-    }
-
-    #[test]
-    fn from_db_text_unknown_falls_back_to_none() {
-        // 未知取值必须降级成 `NONE`（保守方向：多一次人工选择，而不是免填投错工序）
-        for raw in ["WAT", "", "next", "Next", "TAIL "] {
-            assert_eq!(
-                ChainState::from_db_text(raw),
-                ChainState::None,
-                "未知取值 {raw:?} 必须降级为 NONE"
-            );
-        }
-    }
 
     #[test]
     fn default_is_none() {
@@ -637,67 +600,8 @@ mod tests {
 
     #[test]
     fn serializes_as_uppercase_strings() {
-        // 出参契约的 wire 字面量：前端按 `"NEXT"` / `"TAIL"` / `"NONE"` 判三态
-        for (state, want) in [
-            (ChainState::None, "\"NONE\""),
-            (ChainState::Next, "\"NEXT\""),
-            (ChainState::Tail, "\"TAIL\""),
-        ] {
-            let json = serde_json::to_string(&state).expect("serialize ChainState");
-            assert_eq!(json, want);
-        }
-    }
-
-    #[test]
-    fn deserializes_from_uppercase_strings() {
-        assert_eq!(
-            serde_json::from_str::<ChainState>("\"NEXT\"").expect("deserialize"),
-            ChainState::Next
-        );
-        // 小写字面量必须拒收（`rename_all = "UPPERCASE"` 的大小写是契约的一部分）
-        assert!(serde_json::from_str::<ChainState>("\"next\"").is_err());
-    }
-
-    /// ⚠️ 本测试**故意**跨域引用 `prod::scan`（2026-10-10 新增）。理由：报工台
-    /// 迁域时把 `ChainState` 的填充路径整条搬到了 `ScanChainState`，本 VO 那份
-    /// 变成零调用方的孤儿副本 —— 两份 `from_db_text` 是同一段映射抄了两遍，**没有
-    /// 任何测试锁住它们一致**。任一边改了字面量而另一边没改，只会在报工台放回页
-    /// 上表现为「突然让工人手填工序」，离根因极远，所以用对拍把漂移钉死在编译期。
-    ///
-    /// 域隔离不违规：`shared::domain_guard::assert_no_foreign_domain` 只扫
-    /// `src/modules/prod/scan/listing/`，而这条引用写在 part 域的文件里、且只在
-    /// `#[cfg(test)]` 内 —— 产物代码零跨域依赖。
-    ///
-    /// ## 覆盖不到什么（2026-10-10 review 第 2 轮登记）
-    /// 本用例只锁「**同样 10 个输入**下两侧的 wire 字面量一致」，是**取样对拍**而非
-    /// **形状对拍**。以下三类漂移它一个都抓不到，且都不会让本用例变红：
-    ///
-    /// - 给一侧**新增枚举变体**（输入表里没有新变体的字面量，两侧对它都走
-    ///   `from_db_text` 的兜底分支）—— ⚠️ 这条**当前无任何守卫**，相邻的
-    ///   `serializes_as_uppercase_strings` 只逐字断言既有 3 个变体，不枚举全集；
-    /// - 改 `#[serde(rename)]` / `rename_all` / `alias`；
-    /// - 改 `Deserialize` 的接受集（`alias` / 自定义 `Deserialize`）。
-    ///
-    /// 后两条另有守卫：`ChainState` / `ScanChainState` 各自
-    /// `serializes_as_uppercase_strings`（钉大小写）+ `deserializes_from_uppercase_strings`
-    /// （钉小写必须**拒收** ⇒ 加 `alias` 立刻红）。要连「新增变体」也覆盖得比对两侧的
-    /// 变体集合相等，代价与收益不成比例，故**明确不补**：本用例的职责就是兜住
-    /// 「同一段映射被抄成两份」这一类漂移。
-    #[test]
-    fn from_db_text_matches_scan_chain_state_on_every_input() {
-        use crate::modules::prod::scan::vo::ScanChainState;
-
-        // 三个合法字面量 + 若干未知取值（含大小写 / 空白 / 空串的近似形）。
-        // 比的是**序列化后的 wire 字面量**而非枚举本身：两份是不同类型，
-        // `assert_eq!` 不了，而漂移真正伤人的正是 wire 字面量。
-        for raw in [
-            "NEXT", "TAIL", "NONE", "WAT", "", "next", "Next", "TAIL ", " NONE", "none",
-        ] {
-            let mine = serde_json::to_string(&ChainState::from_db_text(raw))
-                .expect("serialize ChainState");
-            let theirs = serde_json::to_string(&ScanChainState::from_db_text(raw))
-                .expect("serialize ScanChainState");
-            assert_eq!(mine, theirs, "from_db_text 对输入 {raw:?} 的两侧产出漂移了");
-        }
+        // 出参契约的 wire 字面量：本 VO 只发 `"NONE"`（前端按此判「需手填工序」）
+        let json = serde_json::to_string(&ChainState::None).expect("serialize ChainState");
+        assert_eq!(json, "\"NONE\"");
     }
 }

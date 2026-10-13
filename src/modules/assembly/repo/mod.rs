@@ -321,18 +321,11 @@ pub trait AssemblyRepoTrait: Send {
     ) -> Result<Option<TPart>, sqlx::Error>;
 
     /// 反查 part 的 assembly_id（None = part 不存在；Some(None) = part 无父；Some(Some) = 有父）。
-    /// 用于 `sync_from_part_change_inner` 短路判断。
+    /// 用于 `sync_from_part_change_by_id_inner` 短路判断。
     async fn fetch_part_assembly_id(
         &mut self,
         part_id: i64,
     ) -> Result<Option<Option<i64>>, sqlx::Error>;
-
-    /// 批量反查 part 的 assembly_id（去重 + 仅返回 IS NOT NULL）。
-    /// 用于 `sync_from_part_changes` 一次性拿到全部需 sync 的父装配件。
-    async fn fetch_distinct_assembly_ids_by_part_ids<'a>(
-        &mut self,
-        part_ids: &'a [i64],
-    ) -> Result<Vec<i64>, sqlx::Error>;
 
     /// 序列号派发（`crate::shared::serial::acquire` 的 trait 包装）。
     /// service 不直接调 serial::acquire（后者要 `&mut PgConnection`），故经 trait 收口。
@@ -760,24 +753,6 @@ impl AssemblyRepoTrait for &mut PgConnection {
                 .fetch_optional(&mut **self)
                 .await?;
         Ok(row.map(|(a,)| a))
-    }
-
-    async fn fetch_distinct_assembly_ids_by_part_ids<'b>(
-        &mut self,
-        part_ids: &'b [i64],
-    ) -> Result<Vec<i64>, sqlx::Error> {
-        if part_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let rows: Vec<(Option<i64>,)> = sqlx::query_as(
-            "SELECT DISTINCT assembly_id FROM t_part \
-             WHERE id = ANY($1) AND assembly_id IS NOT NULL \
-               AND deleted_at IS NULL",
-        )
-        .bind(part_ids)
-        .fetch_all(&mut **self)
-        .await?;
-        Ok(rows.into_iter().filter_map(|(a,)| a).collect())
     }
 
     async fn acquire_serial(

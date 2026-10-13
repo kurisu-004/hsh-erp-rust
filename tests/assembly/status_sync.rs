@@ -6,8 +6,8 @@
 //!   2. `mixed_children_assembly_rolls_up_to_min_progress`
 //!      —— 一子 COMPLETED + 一子 INSPECTION → 父 = **INSPECTION**（min progress = 4）
 //!   3. `all_children_cancelled_flips_assembly_to_cancelled`
-//!      —— 2 件子全部 CANCELLED → 父 = CANCELLED（cancel 端点不触发 sync，所以用
-//!      `AssemblyService::sync_from_part_change` 直接驱动 sync 来覆盖该路径）
+//!      —— 2 件子全部 CANCELLED → 父 = CANCELLED（cancel 端点不触发 sync，所以直调
+//!      `AssemblyService::sync_from_part_change_by_id` 驱动 sync 来覆盖该路径）
 //!   4. `terminal_assembly_is_not_modified_by_child_change`
 //!      —— 父已是终态（COMPLETED / CANCELLED）→ 子变更不触发 version 自增
 //!   5. `batch_to_inspection_emits_per_assembly_update`
@@ -425,12 +425,16 @@ async fn mixed_children_assembly_rolls_up_to_min_progress() {
 /// 测试策略：
 ///   - 直接用 SQL UPDATE 把两件子推到 CANCELLED（绕开 `/parts/{id}/cancel` 端点的
 ///     role 守卫——cancel 需要 Manager/Clerk，本测试不引入额外 user fixture）。
-///   - 再用 service 直调 `AssemblyService::sync_from_part_change` 驱动 rollup，
+///   - 再用 service 直调 `AssemblyService::sync_from_part_change_by_id` 驱动 rollup，
 ///     验证算法对 ALL_CANCELLED → CANCELLED 的契约。
 ///
-/// 备注：`/parts/{id}/cancel` 端点**不**触发 `sync_from_part_change`（sync 仅挂在
+/// 备注：`/parts/{id}/cancel` 端点**不**触发父装配件 sync（sync 仅挂在
 /// to-inspection / to-ship / to-process / worker-scan 4 个流上）。这是有意的设计
 /// 决策（cancel 不属于「业务流转」范畴），与本测试的算法正确性正交。
+///
+/// 2026-10-13：本用例原先调的是收 `&CurrentUser` 的 `sync_from_part_change`，随那
+/// 条死链一并删除后改调生产真实使用的 `sync_from_part_change_by_id` —— 守的算法
+/// （ALL_CANCELLED → CANCELLED）完全不变，且不再是「为一个测试而存在的符号」。
 #[tokio::test]
 async fn all_children_cancelled_flips_assembly_to_cancelled() {
     let pool = test_pool().await;
@@ -458,12 +462,12 @@ async fn all_children_cancelled_flips_assembly_to_cancelled() {
     assert_eq!(asm_status_before, "PENDING");
     assert_eq!(asm_version_before, 0, "无 sync → version 应保持 0");
 
-    // service 直调 sync_from_part_change 驱动 rollup
+    // service 直调 sync_from_part_change_by_id 驱动 rollup
     let current = test_current_user();
     let mut tx = pool.begin().await.expect("begin tx");
-    let synced = AssemblyService::sync_from_part_change(&mut tx, p1, &current)
+    let synced = AssemblyService::sync_from_part_change_by_id(&mut tx, p1, current.id)
         .await
-        .expect("sync_from_part_change 应 OK");
+        .expect("sync_from_part_change_by_id 应 OK");
     tx.commit().await.expect("commit tx");
     assert_eq!(
         synced,
@@ -564,8 +568,13 @@ async fn terminal_assembly_is_not_modified_by_child_change() {
 /// 「target ≠ current ⇒ Changed、target == current ⇒ NoChange」这条判据没变。
 ///
 /// handler 侧：`let mut seen = HashSet::new(); for item in submitted { if Some(aid) && seen.insert(aid) { broadcast } }`
-/// → asm-A / asm-B 各广播一次。本测试**不**验 WS 通道（WS 需独立订阅路径）；
-/// handler 侧的 dedup 逻辑通过 service 直调 `sync_from_part_changes` 覆盖（见下）。
+/// → asm-A / asm-B 各广播一次。本测试**不**验 WS 通道（WS 需独立订阅路径）。
+///
+/// 2026-10-13：本用例原先尾部还直调一次 service 的批量变体 `sync_from_part_changes`
+/// 来「再驱动一轮 ⇒ 全部 NoChange」，随那条死链一并删除。该尾块本质是**伪造**一个
+/// handler dedup 场景来给一个只为测试存在的符号找调用方，并不能证明生产 handler 的
+/// dedup 正确；而它想守的「target == current ⇒ NoChange」已由上面前两个用例
+/// （item 1 = null）与 `shared::batch::status` 的 mock 单测覆盖。
 #[tokio::test]
 async fn batch_to_inspection_emits_per_assembly_update() {
     let (pool, app, token, _fx) = bootstrap_as_inspector().await;
@@ -639,22 +648,4 @@ async fn batch_to_inspection_emits_per_assembly_update() {
     let (st_b, _v_b) = get_assembly_status_version(&pool, asm_b).await;
     assert_eq!(st_a, "INSPECTION");
     assert_eq!(st_b, "INSPECTION");
-
-    // handler 侧 dedup 证据：用 service `sync_from_part_changes` 模拟再次批量驱动；
-    // 应返回 `Vec<SyncOutcome>`，且全部 = NoChange（target 已 == current）。
-    let current = test_current_user();
-    let mut tx = pool.clone().begin().await.expect("begin tx");
-    let outcomes = AssemblyService::sync_from_part_changes(&mut tx, &[pa1, pa2, pb1], &current)
-        .await
-        .expect("sync_from_part_changes 应 OK");
-    tx.commit().await.expect("commit tx");
-    assert_eq!(
-        outcomes.len(),
-        2,
-        "distinct assembly_ids 去重后 = 2（asm-A + asm-B）"
-    );
-    assert!(
-        outcomes.iter().all(|o| matches!(o, SyncOutcome::NoChange)),
-        "再次 sync 时 target 已 = current → 全部 NoChange；got={outcomes:?}"
-    );
 }
