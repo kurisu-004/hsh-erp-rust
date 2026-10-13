@@ -1,6 +1,6 @@
 //! 2026-10-04 新增：本单口径的装配件「可出货套数」（纯内存计算，无 SQL）
 //!
-//! 口径与 `part::service::list_enrichment::fetch_delivered_sets`（**全局已送套数**）
+//! 口径与 `shared::analytics::delivered::fetch_delivered_sets`（**全局已送套数**）
 //! 同源，差别只有一处：分子换成「**本单**批次量」（本单要回答的是「这一单能出几套」，
 //! 不是「这个装配件历史上共出几套」）。分子另按 `READY_TO_SHIP` 过滤，理由见下方
 //! 「与全局已送口径的有意分叉」一节。
@@ -35,7 +35,7 @@
 //!    无批次的子件以 `COALESCE(SUM,0)=0` 参与 `min`（其注释原话：「未交任何批次的
 //!    子件若贡献 NULL 会被 MIN 忽略，那样『子件 A 交一半、子件 B 一件没交』会误判
 //!    成 A 能撑的套数」）；
-//! 3. 本仓同公式的 SQL 版 `part::service::list_enrichment::fetch_delivered_sets`
+//! 3. 本仓同公式的 SQL 版 `shared::analytics::delivered::fetch_delivered_sets`
 //!    以「各子件」为驱动单元，与本式一致。
 //!
 //! 故入参必须有「该装配件的全部子件」`children_by_asm`，它由调用方从
@@ -64,7 +64,7 @@
 //!
 //! ## 与全局已送口径的有意分叉：分子只计本单 `READY_TO_SHIP` 批次
 //!
-//! `part::service::list_enrichment::fetch_delivered_sets`（**全局已送套数**）的分子
+//! `shared::analytics::delivered::fetch_delivered_sets`（**全局已送套数**）的分子
 //! 带 `b.status IN ('DELIVERED','COMPLETED')` 过滤；本单版的分子只计
 //! `status == 'READY_TO_SHIP'` 的批次。两者是两套**刻意不同**的口径，不是同一口径
 //! 的两种实现。

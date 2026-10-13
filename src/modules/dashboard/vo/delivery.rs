@@ -40,7 +40,7 @@ pub struct SystemDeliveryOrder {
     pub customer_name: Option<String>,
     pub is_urgent: bool,
     /// 件级：已交**件数**（`t_part` 侧 `SUM(t_part_batch.quantity)`）；
-    /// 装配件级：已交**套数**（min 公式，见 `repo/delivery.rs::fetch_delivered_sets`）。
+    /// 装配件级：已交**套数**（min 公式，见 `shared::analytics::delivered::fetch_delivered_sets`）。
     /// 一行的语义随 `row_type` 变，前端展示单位必须跟着换。
     pub delivered_quantity: i32,
     /// 行来源：`"PART"`（`t_part`，`assembly_id IS NULL`）| `"ASSEMBLY"`（`t_assembly`）。

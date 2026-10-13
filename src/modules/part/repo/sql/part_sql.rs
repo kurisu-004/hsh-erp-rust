@@ -338,7 +338,7 @@ impl PartRepo {
     ///
     /// 用**非宏** `sqlx::query_as`（`TPart` 已 `derive(FromRow)`）：非宏不进
     /// `.sqlx/` 离线缓存，改本文件不需要重跑 `scripts/sqlx_prepare.sh`。
-    /// 范本 `part::service::list_enrichment::fetch_delivered_sets`。
+    /// 范本 `shared::analytics::delivered::fetch_delivered_sets`。
     pub async fn list_children_by_assemblies<'e, E: PgExecutor<'e>>(
         executor: E,
         assembly_ids: &[i64],

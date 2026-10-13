@@ -2159,7 +2159,7 @@ async fn overdue_bucket_matches_overdue_count_on_undelivered_subset() {
 }
 
 // ---------------------------------------------------------------------------
-// 装配件行 `delivered_quantity` 按**套数**（`repo/delivery.rs::fetch_delivered_sets` 的
+// 装配件行 `delivered_quantity` 按**套数**（`shared::analytics::delivered::fetch_delivered_sets` 的
 // min 公式，与 `com::union_list` 侧逐字同源）
 // ---------------------------------------------------------------------------
 

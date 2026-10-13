@@ -47,6 +47,10 @@ use crate::modules::dashboard::vo::{
     DeliveryBucket, DeliveryOrderDetail, DeliveryOrderDetailOut, SystemDeliveryOrder,
     SystemDeliveryOrders,
 };
+// 2026-10-13：两条「已交数量 / 已交套数」聚合改调 shared 的唯一实现，本域副本已删。
+// `shared::analytics` 不属于任何业务域 ⇒ 本域的 `assert_no_foreign_domain` 护栏
+// （只认「域根段 + 他域路径」前缀失配）仍然零跨域依赖，强度不降。
+use crate::shared::analytics::delivered::{fetch_delivered_quantities, fetch_delivered_sets};
 
 /// 影响「未交付」判定的状态白名单（2026-10-07）。
 ///
@@ -362,8 +366,8 @@ impl DeliveryRepo {
             .filter(|r| r.row_type == ROW_TYPE_ASSEMBLY)
             .map(|r| r.id)
             .collect::<Vec<i64>>();
-        let delivered_parts = Self::fetch_delivered_quantities(conn, &part_ids).await?;
-        let delivered_assemblies = Self::fetch_delivered_sets(conn, &asm_ids).await?;
+        let delivered_parts = fetch_delivered_quantities(conn, &part_ids).await?;
+        let delivered_assemblies = fetch_delivered_sets(conn, &asm_ids).await?;
 
         // 装配件的 `customer_id` 与散件同为 `t_customer.id`（雪花全局唯一）⇒ 同一张表
         // 同一次批量查即可，不必分两侧。`dedup_positive` 内部已剔除非正 id。
@@ -468,112 +472,16 @@ impl DeliveryRepo {
     // 私有批量查表（三处都用「一条 SQL 批量」而非逐行查，防 N+1）
     // =====================================================================
 
-    /// 已送数量聚合（SQL 形态与 `part::service::list_enrichment::fetch_delivered_quantities`
-    /// 一致：`::int` cast 不可省——PG 的 `SUM(int4)` 返 int8，直接绑 i32 会类型不匹配）。
-    async fn fetch_delivered_quantities(
-        conn: &mut PgConnection,
-        part_ids: &[i64],
-    ) -> Result<HashMap<i64, i32>, sqlx::Error> {
-        let mut out: HashMap<i64, i32> = HashMap::new();
-        if part_ids.is_empty() {
-            return Ok(out);
-        }
-        let rows = sqlx::query(
-            "SELECT part_id, COALESCE(SUM(quantity), 0)::int AS delivered_qty \
-             FROM t_part_batch \
-             WHERE part_id = ANY($1::bigint[]) AND deleted_at IS NULL \
-               AND status IN ('DELIVERED', 'COMPLETED') \
-             GROUP BY part_id",
-        )
-        .bind(part_ids)
-        .fetch_all(&mut *conn)
-        .await?;
-        for r in rows {
-            out.insert(r.get::<i64, _>("part_id"), r.get::<i32, _>("delivered_qty"));
-        }
-        Ok(out)
-    }
-
-    /// 装配件侧的「已交量」= **已交套数**（不是件数），口径是
-    /// `LEAST(COALESCE(MIN(子件已送件数 × a.quantity / NULLIF(c.quantity, 0)), 0), a.quantity)`。
-    ///
-    /// **与 `part::service::list_enrichment::fetch_delivered_sets` 逐字同源**（同一公式、
-    /// 同一组边界处理）。之所以必须复刻而不能直接调用：本域受
-    /// `modules::dashboard::tests::dashboard_domain_depends_on_no_other_domain` 约束
-    /// （`cargo test --lib` 强制扫 `src/modules/dashboard/**/*.rs`），禁止 import 他域
-    /// 的任何实现。只读跨域聚合是本仓既定 pattern（同 `statistics` / `admin`），
-    /// 于是这条 SQL 在 dashboard 域有自己的副本 —— **改动时两处必须同步**。
-    ///
-    /// 边界处理（逐条照抄自原实现的注释，因为每一条去掉都会静默算错）：
-    /// - `COALESCE(SUM(...), 0)` 不可省：未交任何批次的子件若贡献 NULL 会被 `MIN` 忽略，
-    ///   那样「子件 A 交一半、子件 B 一件没交」会误判成 A 能撑的套数；
-    /// - `NULLIF(子件总量, 0)`：总量为 0 的子件让该项为 NULL 从而被 `MIN` 忽略
-    ///   （不参与），既不整除零出错也不拖累 min；
-    /// - `LEAST(COALESCE(MIN(...), 0), a.quantity)`：收口到工单总套数，同时兜住子件超交
-    ///   （否则 UI 会出现「20 / 10 套」）。**`COALESCE` 必须在 `LEAST` 里面**：PG 的
-    ///   `LEAST` 会忽略 NULL 实参（与 `MIN` 聚合同语义），写成
-    ///   `COALESCE(LEAST(MIN(...), a.quantity), 0)` 会在「子件总量全为 0、`MIN` 为 NULL」
-    ///   时返回 `a.quantity`（整套全交），与口径正好相反；
-    /// - `LEAST` 顺带消除 int8→int4 收窄溢出（`子件已送 × 装配件套数` 是 int8 乘积，
-    ///   `1e6 × 1e6 = 1e12` 超 int4 会让整页 500）；收口后上界是 `a.quantity`（int4），
-    ///   `::int` 不再可能溢出。PART 侧的 `fetch_delivered_quantities` 保持纯 `::int`
-    ///   不加钳制：那边只是 `SUM(quantity)` 不放大，无真实溢出路径。
-    ///
-    /// **无子件的装配件不产生结果行**（SQL 以子件表为驱动表），调用方必须
-    /// `.copied().unwrap_or(0)` 兜底 —— 那会让无子件装配件的 `delivered_quantity = 0`，
-    /// 落进 `upcoming` / `overdue` 桶，与现状 `count_overdue` 计它的行为一致，保持不变。
-    ///
-    /// ### 为什么它与 `SQL_COUNT_OVERDUE` 的 `NOT EXISTS` 同解
-    /// 装配件**只能整套交付、不允许单独交子件**（业务不变式）。总套数 N、交 k 套 ⇒ 每个
-    /// 子件 c 交 `k × c.quantity / N` 件 ⇒ `per_set(c) = (子件已交 × N) / NULLIF(c.quantity, 0) = k`
-    /// ⇒ `delivered_sets = MIN over c (k) = LEAST(k, N) = k`
-    /// ⇒ `delivered_sets == 0 ⟺ k == 0 ⟺ 无任何子件被交付 ⟺ NOT EXISTS(子件有已交批次)`。
-    ///
-    /// 本函数**不参与桶归属**：三桶的归属判据是 SQL 里的 `NOT EXISTS` / `EXISTS`
-    /// （KPI 与 `upcoming` / `overdue` 两桶逐字相同），本函数只负责填 `delivered_quantity`
-    /// 这个展示值。不变式被破坏时错位的是展示值（行落 `partial` 却显示 0 套），不是
-    /// KPI ↔ 面板的行集合；完整推导 + 四条破坏路径 + 存量违规排查 SQL 见
-    /// `SQL_COUNT_OVERDUE` 的 doc 与 `docs/api/dashboard.md` §4.4。
-    ///
-    /// SQL 条数：1 条，与桶行数无关（防 N+1 往返）；扫描量是 O(本页装配件的子件总数)。
-    async fn fetch_delivered_sets(
-        conn: &mut PgConnection,
-        asm_ids: &[i64],
-    ) -> Result<HashMap<i64, i32>, sqlx::Error> {
-        let mut out: HashMap<i64, i32> = HashMap::new();
-        if asm_ids.is_empty() {
-            return Ok(out);
-        }
-        // 以 `t_part`（子件）为驱动表，走 `(assembly_id, ...)` 前缀索引，因此整段仍只 1 条
-        // SQL。不写死索引名：`ix_t_part_assembly_id_status` 与 `ix_t_part_assembly_id` 同
-        // 前缀，planner 可能选后者，钉死名字必过期。
-        // `GROUP BY c.assembly_id, a.quantity`：套数是表达式的一部分，必须进 GROUP BY。
-        // ⚠️ `c.id` / `c.quantity` **未**进 GROUP BY 却被 SELECT 表达式引用，靠的是
-        // 「相关标量子查询的外层引用不受 grouping 检查」这一 PG 行为 —— 标准 SQL 应拒绝。
-        // **把相关子查询改写成 LEFT JOIN 或改用窗口函数会立刻报**
-        // `column "c.id" must appear in the GROUP BY clause`，改写前务必先跑
-        // `tests/dashboard_ws_api.rs` 与 `tests/com/union_list.rs` 的 `delivered_quantity_*` 用例。
-        let rows: Vec<(i64, i32)> = sqlx::query_as(
-            "SELECT c.assembly_id, \
-                    LEAST(COALESCE(MIN( \
-                        (COALESCE((SELECT SUM(b.quantity) FROM t_part_batch b \
-                                   WHERE b.part_id = c.id AND b.deleted_at IS NULL \
-                                     AND b.status IN ('DELIVERED', 'COMPLETED')), 0) \
-                             * a.quantity) / NULLIF(c.quantity, 0) \
-                    ), 0), a.quantity)::int AS delivered_sets \
-             FROM t_part c \
-             JOIN t_assembly a ON a.id = c.assembly_id AND a.deleted_at IS NULL \
-             WHERE c.assembly_id = ANY($1) AND c.deleted_at IS NULL \
-             GROUP BY c.assembly_id, a.quantity",
-        )
-        .bind(asm_ids)
-        .fetch_all(&mut *conn)
-        .await?;
-        for (asm_id, sets) in rows {
-            out.insert(asm_id, sets);
-        }
-        Ok(out)
-    }
+    // ⚠️ 2026-10-13：`fetch_delivered_quantities` / `fetch_delivered_sets` 的副本
+    // 已删除，改调 `shared::analytics::delivered` 里的同一份实现。
+    //
+    // 原注释（保留作决策留档）：本域此前**必须**复刻这两条聚合，因为
+    // `modules::dashboard::tests::dashboard_domain_depends_on_no_other_domain`
+    // （`cargo test --lib` 强制扫 `src/modules/dashboard/**/*.rs`）禁止 import 他域的
+    // 任何实现，只读跨域聚合虽是本仓既定 pattern、SQL 却只能在本域写全。
+    // 落到 `shared/` 后该前提消失 —— `assert_no_foreign_domain` 判的是
+    // 「域根段 + 他域路径」前缀失配，`shared::analytics` 不属于任何域、合法可引。
+    // **护栏强度未降**（该单测仍绿），副本消失则口径不会再静默漂移。
 
     /// 客户 id → name（单级，足够填 `SystemDeliveryOrder.customer_name`）。
     async fn fetch_customer_names(

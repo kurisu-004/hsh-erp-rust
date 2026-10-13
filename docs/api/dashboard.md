@@ -256,10 +256,16 @@ ORDER BY c.assembly_id;
 
 **装配件行的 `delivered_quantity` = 已交套数**（不是件数），公式
 `LEAST(COALESCE(MIN((子件已送件数 × a.quantity) / NULLIF(c.quantity, 0)), 0), a.quantity)`
-与 `part::service::list_enrichment::fetch_delivered_sets` **逐字同源**，且在 dashboard 域
-**复刻**了一份 —— 域隔离护栏（`cargo test --lib` 的
-`modules::dashboard::tests::dashboard_domain_depends_on_no_other_domain`）禁止 import 他域
-实现，只读跨域聚合是本仓既定 pattern。**改动时两处必须同步。**
+与零件列表侧的同名聚合**逐字同源**。
+
+⚠️ **2026-10-13 变更**：此前 dashboard 域**复刻**了一份这份 SQL，理由是域隔离护栏
+（`cargo test --lib` 的 `modules::dashboard::tests::dashboard_domain_depends_on_no_other_domain`）
+禁止 import 他域实现，而只读跨域聚合是本仓既定 pattern、SQL 只能在本域写全。
+现在两条聚合已提取到 `shared::analytics::delivered`（`fetch_delivered_sets` /
+`fetch_delivered_quantities`），**副本消失、护栏强度未降** ——
+`assert_no_foreign_domain` 判的是「域根段 + 他域路径」前缀失配，
+`shared::analytics` 不属于任何业务域、合法可引，该单测仍绿。**改口径只需改 shared
+一处。**
 
 `COALESCE` 必须在 `LEAST` **里面**：PG 的 `LEAST` 忽略 NULL 实参，写成
 `COALESCE(LEAST(MIN(...), a.quantity), 0)` 会在「子件总量全为 0、`MIN` 为 NULL」时返回

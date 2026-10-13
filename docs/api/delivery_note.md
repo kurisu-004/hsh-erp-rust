@@ -546,7 +546,8 @@ entry_max_sets(a) = LEAST( MIN( per_set(c) for c ∈ a 的**全部**未软删子
 
 ### 4.4 与全局 `fetch_delivered_sets` 的有意分叉
 
-`part::service::list_enrichment::fetch_delivered_sets`（**全局已送套数**）的分子带
+`shared::analytics::delivered::fetch_delivered_sets`（**全局已送套数**，2026-10-13
+自 `part::service::list_enrichment` 提取）的分子带
 `b.status IN ('DELIVERED','COMPLETED')` 过滤；本域两套口径都**只计 `READY_TO_SHIP`**：
 
 | | `fetch_delivered_sets` | 本域 `shippable_sets` |
