@@ -320,10 +320,12 @@ async fn recipient_with_crlf_returns_21703() {
 /// 本用例把**实际**行为两侧都钉死，让这条偏差在测试层可见而不是只存在于文档里。
 #[tokio::test]
 async fn config_accepts_empty_recipients_but_send_rejects_it() {
-    // ⚠️ 必须用「已配置 SMTP」的上下文：`deliver` 里**先**判 SMTP 就绪（21701）
-    // 再判收件人非空（21704），SMTP 没配时根本走不到第二条。
-    let ctx = crate::bootstrap_with_mail(crate::unreachable_smtp()).await;
-    let mut body = config_body(0);
+    // ⚠️ 必须用「已选定发信邮箱」的上下文：`deliver` 里**先**解析发信通道
+    // （失败 ⇒ 21701）再判收件人非空（21704），通道不可用时根本走不到第二条。
+    // 且保存的配置体**必须带上** sender_account_id —— `POST /config` 是全量覆写，
+    // 不带就把已选的邮箱清成 NULL 了。
+    let ctx = crate::bootstrap_with_sender_account().await;
+    let mut body = crate::config_body_with_sender(0, ctx.sender_account_id.unwrap());
     body["recipients"] = json!([]);
 
     let (status, env) = save_config(&ctx, body).await;

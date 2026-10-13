@@ -230,7 +230,12 @@ async fn login_user_with_role(
 
 /// 把既有映射的 `sort_order` 改成指定值（`link_work_type_to_process` 恒写 0，
 /// 排序用例需要非零值来验证「返回序 ≠ 插入序」）。
-async fn set_mapping_sort_order(pool: &PgPool, work_type_id: i64, process_id: i64, sort_order: i32) {
+async fn set_mapping_sort_order(
+    pool: &PgPool,
+    work_type_id: i64,
+    process_id: i64,
+    sort_order: i32,
+) {
     sqlx::query(
         "UPDATE t_work_type_process SET sort_order = $3 \
          WHERE work_type_id = $1 AND process_id = $2",
@@ -1173,7 +1178,11 @@ async fn locate_take_over_with_only_soft_deleted_process_mapping_still_returns_a
     let (s, env) = locate(&app, &token, "SN-WPDEL", Some(taker)).await;
     assert_eq!(s, StatusCode::OK, "{env}");
     let b = first_batch(&env);
-    assert_eq!(b["batch_id"], batch.to_string(), "前置：本用例针对该批次: {env}");
+    assert_eq!(
+        b["batch_id"],
+        batch.to_string(),
+        "前置：本用例针对该批次: {env}"
+    );
     assert_eq!(
         b["action"], "TAKE_OVER",
         "写侧单候选自动推导会成功，读侧不得藏按钮（假阻挡）: {env}"

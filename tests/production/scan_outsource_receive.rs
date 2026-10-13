@@ -635,7 +635,10 @@ async fn outsource_receive_explicit_process_outside_chain_succeeds_with_null_ste
     link_work_type_to_process(&pool, st.work_type_id, outside).await;
     link_shelf_to_process(&pool, st.shelf_id, outside).await;
     // 前置：工单确实有链，且该工序确实不在链内
-    assert!(part_chain_id(&pool, st.part_id).await.is_some(), "前置：工单有链");
+    assert!(
+        part_chain_id(&pool, st.part_id).await.is_some(),
+        "前置：工单有链"
+    );
 
     let (s, env) = receive(&app, &token, body(&st, 0, Some(outside))).await;
     assert_eq!(

@@ -17,7 +17,10 @@ use serde_json::{Value, json};
 
 use hsh_erp_test_support::{json_request, send};
 
-use crate::{Ctx, bootstrap_with_mail, config_body, insert_log_row, unreachable_smtp};
+use crate::{
+    Ctx, bootstrap, bootstrap_with_sender_account, config_body, config_body_with_sender,
+    insert_log_row,
+};
 
 /// `GET /logs?query` → `(status, 信封)`。
 async fn get_logs(ctx: &Ctx, query: &str) -> (StatusCode, Value) {
@@ -56,7 +59,7 @@ async fn save_config(ctx: &Ctx, body: Value) -> (StatusCode, Value) {
 /// 排序是 `sent_at DESC, id DESC`（同刻按 id 兜底，保证分页顺序确定）。
 #[tokio::test]
 async fn logs_paginates_with_limit_and_offset_and_reports_total() {
-    let ctx = bootstrap_with_mail(unreachable_smtp()).await;
+    let ctx = bootstrap().await;
     let base = hsh_erp_rust::infra::clock::now_naive();
     // 三个不同发送时刻：old < mid < new
     insert_log_row(&ctx.pool, 1, "MANUAL", "old@example.com", base).await;
@@ -117,7 +120,7 @@ async fn logs_paginates_with_limit_and_offset_and_reports_total() {
 /// 越界分页参数被 clamp：`limit∈[1,200]`、`offset>=0`。
 #[tokio::test]
 async fn logs_clamps_out_of_range_pagination_params() {
-    let ctx = bootstrap_with_mail(unreachable_smtp()).await;
+    let ctx = bootstrap().await;
 
     let (_, env) = get_logs(&ctx, "?limit=99999").await;
     assert_eq!(env["data"]["limit"], 200, "超上限 clamp 到 200：{env}");
@@ -145,9 +148,13 @@ async fn logs_clamps_out_of_range_pagination_params() {
 /// 这样才验到「快照来自配置」而不是「DB 列恰好没被更新」。
 #[tokio::test]
 async fn log_snapshots_recipients_at_send_time() {
-    let ctx = bootstrap_with_mail(unreachable_smtp()).await;
+    // ⚠️ 必须用「已选定发信邮箱」的上下文：`/send` 要进到 `deliver` 才落流水，
+    // 而 `deliver` 的第一道闸就是解析发信通道（失败 ⇒ 21701，不落流水）。
+    // 配置体也要带上 sender_account_id —— `POST /config` 是全量覆写。
+    let ctx = bootstrap_with_sender_account().await;
+    let sender = ctx.sender_account_id.unwrap();
 
-    let mut cfg = config_body(0);
+    let mut cfg = config_body_with_sender(0, sender);
     cfg["recipients"] = json!(["old@example.com"]);
     let (status, saved) = save_config(&ctx, cfg).await;
     assert_eq!(status, StatusCode::OK, "{saved}");
@@ -167,7 +174,7 @@ async fn log_snapshots_recipients_at_send_time() {
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{env}");
 
     // 改配置收件人（按刚读回的版本提交）
-    let mut cfg2 = config_body(v);
+    let mut cfg2 = config_body_with_sender(v, sender);
     cfg2["recipients"] = json!(["new@example.com"]);
     let (status, env2) = save_config(&ctx, cfg2).await;
     assert_eq!(status, StatusCode::OK, "{env2}");
@@ -202,14 +209,20 @@ async fn log_snapshots_recipients_at_send_time() {
 /// ★ 流水里的 `config_version` = **发送当时**的配置版本，改配置后不追认。
 #[tokio::test]
 async fn log_records_config_version_at_send_time() {
-    let ctx = bootstrap_with_mail(unreachable_smtp()).await;
+    let ctx = bootstrap_with_sender_account().await;
+    let sender = ctx.sender_account_id.unwrap();
 
-    // v0：首次初始化（INSERT，version=0）
-    let (_, env) = save_config(&ctx, config_body(0)).await;
-    assert_eq!(env["data"]["version"], 0, "{env}");
+    // ⚠️ `bootstrap_with_sender_account` 已经直插了一行配置（version=0）以便 `/send`
+    // 进得到 `deliver`，所以这里第一次 `POST /config` 是**覆写**（version 0 → 1）
+    // 而不是首次 INSERT。用「读回的实际版本」而不是写死数字，是为了让本用例断言的
+    // 仍是它真正要守的东西：**流水记的是发送当时的版本**。
+    let (status, env) = save_config(&ctx, config_body_with_sender(0, sender)).await;
+    assert_eq!(status, StatusCode::OK, "{env}");
+    let version_at_send = env["data"]["version"].as_i64().expect("version 是数字");
+    assert_eq!(version_at_send, 1, "{env}");
 
-    // 发一次 → 流水应记 version=0
-    let (status, _) = send(
+    // 发一次 → 流水应记的就是 version_at_send
+    let (status, env) = send(
         ctx.app.clone(),
         json_request(
             "POST",
@@ -219,16 +232,17 @@ async fn log_records_config_version_at_send_time() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{env}");
 
-    // v1：再存一次（version 0 → 1）
-    let (_, env2) = save_config(&ctx, config_body(0)).await;
-    assert_eq!(env2["data"]["version"], 1, "{env2}");
+    // 再存一次（version 1 → 2），制造「发送之后配置又变了」
+    let (status, env2) = save_config(&ctx, config_body_with_sender(1, sender)).await;
+    assert_eq!(status, StatusCode::OK, "{env2}");
+    assert_eq!(env2["data"]["version"], 2, "{env2}");
 
     let (_, env3) = get_logs(&ctx, "").await;
     assert_eq!(env3["data"]["total"], 1, "{env3}");
     assert_eq!(
-        env3["data"]["items"][0]["config_version"], 0,
+        env3["data"]["items"][0]["config_version"], version_at_send,
         "流水记的是发送当时的版本，不追认后续改动：{env3}"
     );
 }
@@ -240,7 +254,7 @@ async fn log_records_config_version_at_send_time() {
 /// CLERK 读流水 ⇒ 403。
 #[tokio::test]
 async fn clerk_cannot_read_logs_returns_403() {
-    let ctx = bootstrap_with_mail(unreachable_smtp()).await;
+    let ctx = bootstrap().await;
     let (status, env) = send(
         ctx.app.clone(),
         json_request("GET", "/mail-digest/logs", None, Some(&ctx.clerk_token)),

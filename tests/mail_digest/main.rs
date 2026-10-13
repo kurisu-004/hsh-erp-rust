@@ -39,7 +39,8 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 
 use hsh_erp_rust::infra::clock::now_naive;
-use hsh_erp_rust::infra::config::{AppConfig, MailConfig};
+use hsh_erp_rust::infra::config::MAIL_ACCOUNT_SECRET_ENV;
+use hsh_erp_rust::infra::crypto;
 use hsh_erp_test_support::{
     PartFixture, load_part_fixture, login_token, shared_test_snowflake, test_app, test_pool,
     test_state,
@@ -63,27 +64,42 @@ pub(crate) struct Ctx {
     pub manager_token: String,
     pub clerk_token: String,
     pub customer_id: i64,
+    /// `bootstrap_with_sender_account()` 建出来的发信邮箱 id；`bootstrap()` 为 `None`。
+    ///
+    /// 供需要把 `sender_account_id` 填进 `POST /config` 请求体的用例使用。
+    pub sender_account_id: Option<i64>,
 }
 
-/// 默认（SMTP **未**配置）上下文：绝大多数用例用它。
-pub(crate) async fn bootstrap() -> Ctx {
-    bootstrap_with_mail(MailConfig::default()).await
-}
-
-/// 指定 SMTP 配置的上下文。
+/// 默认（**未选**发信邮箱）上下文：绝大多数用例用它。
 ///
-/// ⚠️ `MailConfig` 走 env、不进 DB，集成测试**没有** env 通道，只能在
-/// `AppState.config` 这一层替换（手法同 `test_state_with_wecom`：
-/// `Arc::get_mut` 拿唯一 state Arc → 整体替换 `config` Arc）。
-pub(crate) async fn bootstrap_with_mail(mail: MailConfig) -> Ctx {
+/// 等价于旧 env 方案里的「SMTP 未配置」形态 ⇒ `/send` 返 `21701` + HTTP 503。
+pub(crate) async fn bootstrap() -> Ctx {
+    bootstrap_inner(None).await
+}
+
+/// 「已选定可用发信邮箱」的上下文（2026-10-16 起取代 `bootstrap_with_mail`）。
+///
+/// 建两行：
+/// 1. `t_mail_account` 一行（授权码用 [`crypto::seal_with`] + [`TEST_MAIL_SECRET`]
+///    加密，与 [`ensure_mail_secret_env`] 设进 env 的那把是同一把）；
+/// 2. `t_mail_digest_config` 一行，`sender_account_id` 指向上面那行
+///    —— 这样 `/send` 与 cron 的准备阶段都能进到 `deliver`。
+///
+/// ⚠️ **邮箱名带 `<` / `>` 是刻意的**（`TEST_ACCOUNT_NAME`）：它让
+/// `mailer::send` 构造 `From` 头时 `Mailbox` 解析**必然失败**，从而在**零网络 IO**
+/// 的前提下触发「SMTP 层失败 ⇒ `21702` + 一行 FAILED 流水」这条不变量。
+/// 旧实现靠 env 指 `127.0.0.1:1` 达到同样效果，而 host/port 现在由**编译期预设表**
+/// 固定（网易 163 / QQ 都是 465），env 已整轮删除 ⇒ 那条确定性造法不可复现。
+/// 两条失败路径在 `deliver` 里共用**完全相同**的一段代码
+/// （`mailer::send` 返回 `Err` → 记 FAILED 流水 → 返 `21702`），
+/// 详见 `docs/api/mail_digest.md` §8.3「覆盖空洞」。
+pub(crate) async fn bootstrap_with_sender_account() -> Ctx {
+    ensure_mail_secret_env();
     let pool = test_pool().await;
     let fx = load_part_fixture(&pool).await;
-    let mut state = test_state(pool.clone()).await;
-    {
-        let inner = Arc::get_mut(&mut state).expect("state Arc 必须 unique");
-        let old_cfg = (*inner.config).clone();
-        inner.config = Arc::new(AppConfig { mail, ..old_cfg });
-    }
+    let state = test_state(pool.clone()).await;
+    let account_id = insert_mail_account(&pool, TEST_ACCOUNT_NAME, "sender@163.com").await;
+    insert_digest_config(&pool, account_id).await;
     let app = test_app(state.clone());
     let manager_token = login_token(&app, &fx.manager_username, PartFixture::PASSWORD).await;
     let clerk_token = login_token(&app, &fx.clerk_username, PartFixture::PASSWORD).await;
@@ -95,7 +111,104 @@ pub(crate) async fn bootstrap_with_mail(mail: MailConfig) -> Ctx {
         manager_token,
         clerk_token,
         customer_id,
+        sender_account_id: Some(account_id),
     }
+}
+
+async fn bootstrap_inner(sender_account_id: Option<i64>) -> Ctx {
+    let pool = test_pool().await;
+    let fx = load_part_fixture(&pool).await;
+    let state = test_state(pool.clone()).await;
+    let app = test_app(state.clone());
+    let manager_token = login_token(&app, &fx.manager_username, PartFixture::PASSWORD).await;
+    let clerk_token = login_token(&app, &fx.clerk_username, PartFixture::PASSWORD).await;
+    let customer_id = insert_customer(&pool, "汇总邮件测试客户").await;
+    Ctx {
+        pool,
+        app,
+        state,
+        manager_token,
+        clerk_token,
+        customer_id,
+        sender_account_id,
+    }
+}
+
+// ===========================================================================
+//  发信邮箱 fixture（2026-10-16 取代 env 版 `unreachable_smtp`）
+// ===========================================================================
+
+/// 测试用主密钥（与 `MailAccountSecret::default()` 的 `[0x5A; 32]` 同值）。
+pub(crate) const TEST_MAIL_SECRET: [u8; 32] = [0x5Au8; 32];
+
+/// ⚠️ **含 `<` / `>`**：让 lettre 的 `Mailbox` 解析必然失败 ⇒ 零网络 IO 的
+/// 「SMTP 层失败」。见 [`bootstrap_with_sender_account`] 的 doc。
+pub(crate) const TEST_ACCOUNT_NAME: &str = "测试<发件人>";
+
+/// 把测试主密钥写进进程 env（`crypto::seal` / `open` 每次重读 env）。
+///
+/// ⚠️ `std::env::set_var` 在 edition 2024 是 unsafe，且**不能**与同进程的并发
+/// 读写竞争 ⇒ 用 `OnceLock::get_or_init` 串成「第一个调用者写、其余调用者等它写完」
+/// （本 binary 里所有用到密文的路径都先过本函数）。仓内同款手法见
+/// `tests/cos_opendal_api.rs` 的 `ENV_LOCK`。
+pub(crate) fn ensure_mail_secret_env() {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        let hex: String = TEST_MAIL_SECRET
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        // SAFETY: 本 binary 内所有需要该 env 的代码路径都先过本函数（由
+        // `OnceLock` 串行），不存在与其它线程的 env 读写并发。
+        unsafe { std::env::set_var(MAIL_ACCOUNT_SECRET_ENV, hex) };
+    });
+}
+
+/// 插一行 `t_mail_account`（授权码已加密）。
+pub(crate) async fn insert_mail_account(pool: &PgPool, name: &str, account: &str) -> i64 {
+    let id = shared_test_snowflake().next_id();
+    let now = now_naive();
+    let secret =
+        crypto::seal_with(&TEST_MAIL_SECRET, "dummy-secret").expect("用测试主密钥加密必成功");
+    sqlx::query(
+        "INSERT INTO t_mail_account (id, version, name, preset, account, encrypted_secret, \
+         is_default, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, 0, $2, 'NET_EASE_163', $3, $4, true, $5, 0, $5, 0)",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(account)
+    .bind(secret)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_mail_account");
+    id
+}
+
+/// 插一行 `t_mail_digest_config`，`sender_account_id` 指向给定邮箱。
+///
+/// 直插 SQL 而不走 `POST /config`：这批用例要的是「上下文里有可用通道」这个**前置**，
+/// 而走 API 还得先算 `version`、再逐个填必填字段，会让每个用例多三行样板。
+/// 值本身仍按 DTO 的缺省写（`DAILY` / 两节都开 / 8 列），与 `config_body()` 一致。
+pub(crate) async fn insert_digest_config(pool: &PgPool, sender_account_id: i64) {
+    let id = shared_test_snowflake().next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_mail_digest_config (id, version, enabled, frequency, send_hour, \
+         send_minute, recipients, cc_recipients, include_overdue, include_upcoming, \
+         upcoming_days, visible_columns, sender_account_id, created_at, created_by, \
+         updated_at, updated_by) \
+         VALUES ($1, 0, true, 'DAILY', 8, 0, '{}', '{}', true, true, 14, \
+         '{serial_no,drawing_no,name,quantity,customer_name,status,system_delivery_date,remaining_days}', \
+         $2, $3, 0, $3, 0)",
+    )
+    .bind(id)
+    .bind(sender_account_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_mail_digest_config");
 }
 
 // ===========================================================================
@@ -289,18 +402,14 @@ pub(crate) fn config_body(version: i32) -> Value {
     })
 }
 
-/// 指向 `127.0.0.1:1` 的「必然连不通」SMTP 配置（端口 1 无监听 ⇒ connect 立刻 refused）。
-pub(crate) fn unreachable_smtp() -> MailConfig {
-    MailConfig {
-        host: "127.0.0.1".to_string(),
-        port: 1,
-        username: "sender@example.com".to_string(),
-        password: "dummy-password".to_string(),
-        from_address: "sender@example.com".to_string(),
-        from_name: "测试发件人".to_string(),
-        tls_mode: hsh_erp_rust::infra::config::MailTlsModeKind::None,
-        digest_enabled: true,
-    }
+/// 一份**带发信邮箱**的 `POST /config` 请求体。
+///
+/// `sender_account_id` 是 **JSON string**（与出参对称；`deserialize_i64_opt` 只收
+/// 字符串或 `null`，收数字会 422）。
+pub(crate) fn config_body_with_sender(version: i32, sender_account_id: i64) -> Value {
+    let mut body = config_body(version);
+    body["sender_account_id"] = json!(sender_account_id.to_string());
+    body
 }
 
 /// 断言信封里的业务码。

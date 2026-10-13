@@ -1,0 +1,158 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, version, name, preset, account, encrypted_secret, is_default,\n               created_at, created_by, updated_at, updated_by, deleted_at\n        FROM t_mail_account\n        WHERE deleted_at IS NULL\n        ORDER BY is_default DESC, id ASC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_mail_account",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_mail_account",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "name",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_mail_account",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "preset",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_mail_account",
+            "name": "preset"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "account",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_mail_account",
+            "name": "account"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "encrypted_secret",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "t_mail_account",
+            "name": "encrypted_secret"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "is_default",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "t_mail_account",
+            "name": "is_default"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_mail_account",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "created_by",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_mail_account",
+            "name": "created_by"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "updated_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_mail_account",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "updated_by",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_mail_account",
+            "name": "updated_by"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "deleted_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_mail_account",
+            "name": "deleted_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "95beb8fca4bae3f23ac5714e8414ba7f5534b1df065235dbd650d484289ede66"
+}
