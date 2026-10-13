@@ -202,6 +202,11 @@ impl ScanService {
         // 供 match 之后的出参使用 —— 响应 `scan.batch_id` 取 `out_batch.id`。
         let out_batch: TPartBatch;
         let out_split: Option<WorkerScanSplitInfo>;
+        // 2026-10-13：同上，「本次实际被处理的数量」原先只是各臂的局部变量
+        // `operated_qty`、从未进过出参，而整批路径（本臂不拆批 ⇒ `split` 为
+        // `None`）连拆批信息都没有 ⇒ 数量在 handler 侧彻底丢失。同 `out_batch`
+        // 一样的晚初始化模式，由两个臂各自赋值。
+        let out_qty: i32;
         match req.event_type {
             WorkerScanEvent::RETURNED => {
                 // 解析批次在链上的位置，决定「下一道工序」是自动推导还是前端显式指定。
@@ -289,6 +294,9 @@ impl ScanService {
                         work_type_id,
                         badge_code: worker.badge_code.clone(),
                         split,
+                        // 2026-10-13：链尾自动送检与显式送检走的是同一个
+                        // `sent_to_inspection`，数量口径逐字相同（= 本次实际送出的量）。
+                        operated_quantity: operated_qty,
                     });
                 }
                 let (next_pid, step_id_opt): (i64, Option<i64>) = if position
@@ -440,6 +448,7 @@ impl ScanService {
                 .await?;
                 out_batch = operated;
                 out_split = split;
+                out_qty = operated_qty;
                 event_type_str = "WORKER_SCAN_RETURNED";
             }
             WorkerScanEvent::INSPECTED => {
@@ -467,6 +476,7 @@ impl ScanService {
                 .await?;
                 out_batch = operated;
                 out_split = split;
+                out_qty = operated_qty;
                 event_type_str = "WORKER_SCAN_INSPECTED";
             }
         }
@@ -479,6 +489,9 @@ impl ScanService {
             work_type_id,
             badge_code: worker.badge_code.clone(),
             split: out_split,
+            // 2026-10-13：两个臂都在「本次实际处理」的那一批上算出了数量，
+            // 这里只做搬运（不进 JSON，见 `WorkerScanCoreOut` 的字段 doc）。
+            operated_quantity: out_qty,
         })
     }
 }

@@ -324,15 +324,29 @@ ORDER BY c.assembly_id;
 - **`WsEvent::DashboardSnapshot` 已删**（零生产方）。`WsEvent` 现在只有 `DashboardEvent { kind, payload }` 一个变体。
 - **`kind` 事件集**（后端全量 `ws_hub.broadcast` 生产方）：
 
-  `ASSEMBLY_CANCELLED` / `ASSEMBLY_CREATED` / `ASSEMBLY_DELETED` / `ASSEMBLY_FORCE_COMPLETED` / `ASSEMBLY_UPDATED` / `BATCH_TO_INSPECTION` / `BATCH_TO_SHIP` / `PART_BATCH_WITH_PDFS_CREATED` / `PART_COMPLETED` / `PART_DELIVERED` / `PART_FORCE_COMPLETED` / `PART_SOFT_DELETED` / `PART_TO_INSPECTION` / `PART_TO_PROCESS` / `PART_TO_SHIP` / `PART_TRANSFERRED` / ~~`ROLLUP_RECOMPUTED`~~ / `WORKER_POOL_AUTO_ALLOCATE_DONE` / `WORKER_POOL_EMPTY` / `WORKER_POOL_MOVE_DONE` / `WORKER_POOL_REFILL_DONE` / `DELIVERY_NOTE_CREATED` / `DELIVERY_NOTE_PARTS_ADDED` / `DELIVERY_NOTE_SUBMITTED` / `DELIVERY_NOTE_PICKED_UP` / `DELIVERY_NOTE_SCAN_ADD` / `DELIVERY_NOTE_BATCHES_ATTACHED` / `DELIVERY_NOTE_DRIVER_SET`
+  `ASSEMBLY_CANCELLED` / `ASSEMBLY_CREATED` / `ASSEMBLY_DELETED` / `ASSEMBLY_FORCE_COMPLETED` / `ASSEMBLY_UPDATED` / `BATCH_TO_INSPECTION` / `BATCH_TO_SHIP` / ~~`PART_BATCH_WITH_PDFS_CREATED`~~ / `PART_COMPLETED` / `PART_DELIVERED` / `PART_FORCE_COMPLETED` / `PART_SOFT_DELETED` / `PART_TO_INSPECTION` / `PART_TO_PROCESS` / `PART_TO_SHIP` / `PART_TRANSFERRED` / ~~`ROLLUP_RECOMPUTED`~~ / `SCAN_BANNER` / `WORKER_POOL_AUTO_ALLOCATE_DONE` / `WORKER_POOL_EMPTY` / `WORKER_POOL_MOVE_DONE` / `WORKER_POOL_REFILL_DONE` / `DELIVERY_NOTE_CREATED` / `DELIVERY_NOTE_PARTS_ADDED` / `DELIVERY_NOTE_SUBMITTED` / `DELIVERY_NOTE_PICKED_UP` / `DELIVERY_NOTE_SCAN_ADD` / `DELIVERY_NOTE_BATCHES_ATTACHED` / `DELIVERY_NOTE_DRIVER_SET`
 
   前端 `AFFECTS_DASHBOARD` 白名单与之人工对应（关系是**子集**：并非每个 kind 都影响大屏）。
 
-  ⚠️ **`ROLLUP_RECOMPUTED` 已无生产方（2026-10-13）**：唯一的发送方是
-  `POST /api/v2/admin/recompute-rollup`，该端点随 admin 域整域删除。字面量**故意
-  保留**在上面的全集里（前端 `AFFECTS_DASHBOARD` 白名单按这个全集对齐，删字面量
-  会让两侧对不上）。⚠️ 它现在是个**死订阅**：永不触发、也不报错。前端若仍在
-  `AFFECTS_DASHBOARD` 里列它，本轮按产品决定**不处理**，只登记事实。
+  ⚠️ **两个 kind 已无生产方（2026-10-13，均为死订阅）**，字面量**故意保留**在
+  上面的全集里并划删除线（前端 `AFFECTS_DASHBOARD` 白名单按这个全集对齐，删字面量
+  会让两侧对不上）：
+
+  | 划除的 kind | 唯一曾存在的发送方 | 下线原因 |
+  |---|---|---|
+  | ~~`ROLLUP_RECOMPUTED`~~ | `POST /api/v2/admin/recompute-rollup` | 端点随 **admin 域整域删除**（`src/modules/admin/` 已不存在） |
+  | ~~`PART_BATCH_WITH_PDFS_CREATED`~~ | `POST /api/v2/parts/batch-with-pdfs` | 端点随**零消费方清理整条删除**（multipart PDF 同款；见 `CLAUDE.md` files 域「刻意留在别的域的两处文件写入」的 2026-10-13 批注与 `src/modules/part/handler/batch.rs` 的移除记录） |
+
+  两者现在都是**死订阅**：永不触发、也不报错。前端若仍在 `AFFECTS_DASHBOARD` 里列
+  它们，按产品决定**不处理**，只登记事实。
+  ⚠️ 划除口径（本文件 2026-10-13 起）：**判定依据是「`grep 'kind: "<字面量>"' src/`
+  的生产方计数为 0」**，不是「本分支碰过它」。划除只动本行与本表，**不改
+  `WsEvent` 定义、不改任何发送点**。
+  ⚠️ 本仓更早的同类先例（2026-10-08、`DELIVERY_NOTE_CREATED` /
+  `DELIVERY_NOTE_PARTS_ADDED` / `DELIVERY_NOTE_BATCHES_ATTACHED`）只写「已无生产方…
+  仍留在本清单里作为历史全集」而**不划线**；两种写法并存，本表统一用带删除线的这
+  种，因为「可读出『全集里的哪几个已死』」比「要读下一段才知道」更有用。前端对齐时
+  **以全集（含划掉的）为基准**，两种写法不影响对齐结果。
 
   2026-10-15 补充（`prod::scan` 的 `POST /scan/take-over` 扫码接管）：
   - **新增** `PART_TRANSFERRED`（payload `{ part_id, batch_id, from_worker_id,
@@ -342,6 +356,35 @@ ORDER BY c.assembly_id;
     `WORKER_SCAN_INSPECTED` / `PART_PICKED_UP` / `PART_BATCH_SPLIT` 等 kind（含
     `pick-up` / `worker-scan` / 外协收回各产出点）一直不在本清单内。**另行处理**，
     本次只补 `PART_TRANSFERRED`、不追补其余欠账。
+
+  2026-10-13 补充（业务事件 banner，`prod::scan` 的 `POST /scan/worker-scan` 与
+  `POST /scan/batches/{batch_id}/pick-up` 两个产出点）：
+  - **新增** `SCAN_BANNER`，payload 是 `ScanBannerItem` 的**全量序列化**，
+    恰好 6 个键：
+
+    | 键 | 类型 | 取值 |
+    |---|---|---|
+    | `action` | string | `"PICKED_UP"` / `"RETURNED"` / `"INSPECTED"` 三选一 |
+    | `worker_name` | string | `t_worker.name` |
+    | `serial_no` | string \| **null** | `t_part.serial_no`（可空：手工工单没有序列号，终态工单被 migration 置 NULL） |
+    | `drawing_no` | string | `t_part.drawing_no` —— **`serial_no` 为 null 时的兜底显示位，必填** |
+    | `quantity` | number | 本次动作涉及的数量（裸 number） |
+    | `system_delivery_date` | string \| **null** | `t_part.system_delivery_date`，格式恒为 `YYYY-MM-DD`（无交期时是 `null`，不是空串、不是缺键） |
+
+  - ⚠️ **本 kind 不进前端失效白名单**：它是**纯展示**事件（渲染一行
+    `张三领取 F1234 x 20 (10-27)` 文案），不改变任何看板数据的有效性。消费方
+    **不要**拿它去 invalidate 任何 query。（前端仍须把它加进
+    `DashboardEventType` 联合类型，只是不进 `AFFECTS_DASHBOARD`。）
+  - ⚠️ **只有工人三个动作**产出本事件；外协收回（`POST /scan/outsource-receive`）
+    刻意不产，它发的是 `PART_PICKED_UP`。
+  - `action` 按 `worker-scan` **响应**的 `scan_out.event_type` 派生（链尾自动送检
+    会让「请求 `RETURNED` / 响应 `WORKER_SCAN_INSPECTED`」成立；`pick-up` 侧是常量
+    `"PICKED_UP"`）。逐端点对照见 [`scan.md` §4](scan.md#4-与-ws-的关系)。
+  - 唯一构造点是 `prod::scan::handler::banner::broadcast_scan_banner`（**不新增 SQL
+    宏查询**，复用 part / worker 两个域的既有 `get_by_id`）。⚠️ 它在 commit 之后
+    执行、补查走 `state.pool`（事务已耗尽），**零 WS 订阅者时整条早退**（不取连接、
+    不查库 —— 早退口径保守，不会让已订阅的连接丢帧），且**查询失败一律静默跳过 +
+    warn** —— 一条纯展示事件不该把一笔已 commit 成功的业务请求变成 500。
 
   2026-10-11 补充（装配件级强制完成端点
   `POST /api/v2/prod/assemblies/{assembly_id}/force-complete`）：

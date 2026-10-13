@@ -9,6 +9,8 @@
 //!   **2026-10-15 新增 S3**）
 //! - `transition.rs` —— 放回 / 送检（`POST /scan/worker-scan`）+ 手动 pick-up
 //!   （`POST /scan/batches/{batch_id}/pick-up`）
+//! - `banner.rs` —— `SCAN_BANNER`（业务事件 banner）事件的唯一构造点，
+//!   **2026-10-13 新增**；由上面两个端点在 commit 之后调用
 //!
 //! ## 事务边界
 //! 写端点统一在 handler：`state.pool.begin()` → 传 `&mut tx` 给 service → 显式
@@ -30,6 +32,7 @@ use axum::routing::{get, post};
 use crate::state::AppState;
 
 pub mod badge;
+pub mod banner;
 pub mod listing;
 pub mod locate;
 pub mod outsource_receive;
