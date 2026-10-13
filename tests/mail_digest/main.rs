@@ -3,11 +3,14 @@
 //! 本 binary 与 `src/modules/mail_digest/` 同批落地，覆盖 6 个端点的
 //! HTTP 契约 + 统计 SQL 口径 + 发送流水语义。
 //!
-//! ## 拆分映射（4 个 sub-file）
+//! ## 拆分映射（6 个 sub-file）
 //! - `config.rs`  —— 端点 1/2：读单例 + 全量覆写（OCC / 422 / 409）+ 校验矩阵
+//! - `batches.rs` —— 2026-10-16 新增：工单行下的批次子行 + 位置列 + 空数组入参
 //! - `preview.rs` —— 端点 3：渲染（工单级行单位 / 已交量守卫 / 节开关 / 列白名单 / XSS）
 //! - `send.rs`    —— 端点 4：`/send` 的三条失败路径 + 「失败也落流水」不变量
 //! - `logs.rs`    —— 端点 6：分页 + 收件人快照 + `config_version` 快照
+//! - `n_plus_one_guard.rs` —— **源码级**护栏：`service::fetch_rows` 的循环体内禁
+//!   `repo::` 调用（需求 4「禁止出现 N+1」的回归防线；手段与局限见该文件头注释）
 //!
 //! ## ⚠️ 覆盖空洞（2026-10-13 登记）
 //! **`/send` 的成功路径（`status='SUCCESS'` 的流水行）无集成测试**：测试环境没有
@@ -26,8 +29,10 @@
 
 #![allow(dead_code, clippy::await_holding_lock, unused_imports)]
 
+mod batches;
 mod config;
 mod logs;
+mod n_plus_one_guard;
 mod preview;
 mod send;
 
@@ -190,7 +195,9 @@ pub(crate) async fn insert_mail_account(pool: &PgPool, name: &str, account: &str
 ///
 /// 直插 SQL 而不走 `POST /config`：这批用例要的是「上下文里有可用通道」这个**前置**，
 /// 而走 API 还得先算 `version`、再逐个填必填字段，会让每个用例多三行样板。
-/// 值本身仍按 DTO 的缺省写（`DAILY` / 两节都开 / 8 列），与 `config_body()` 一致。
+/// 值本身仍按 DTO 的缺省写（`DAILY` / 两节都开 / 10 列），与 `config_body()` 一致。
+/// ⚠️ 这份字面量与 `VisibleColumn::DEFAULT_SET` + 迁移里的列 DEFAULT 是**三条副本**，
+/// 改缺省列时三处必须一起改。
 pub(crate) async fn insert_digest_config(pool: &PgPool, sender_account_id: i64) {
     let id = shared_test_snowflake().next_id();
     let now = now_naive();
@@ -200,7 +207,7 @@ pub(crate) async fn insert_digest_config(pool: &PgPool, sender_account_id: i64) 
          upcoming_days, visible_columns, sender_account_id, created_at, created_by, \
          updated_at, updated_by) \
          VALUES ($1, 0, true, 'DAILY', 8, 0, '{}', '{}', true, true, 14, \
-         '{serial_no,drawing_no,name,quantity,customer_name,status,system_delivery_date,remaining_days}', \
+         '{serial_no,drawing_no,name,batch_no,quantity,customer_name,status,location,system_delivery_date,remaining_days}', \
          $2, $3, 0, $3, 0)",
     )
     .bind(id)
@@ -326,19 +333,99 @@ pub(crate) async fn insert_assembly(
 
 /// 造一个批次（`status` 决定「已交量守卫」是否命中：`DELIVERED` / `COMPLETED`）。
 pub(crate) async fn insert_batch(pool: &PgPool, part_id: i64, status: &str) -> i64 {
+    insert_batch_full(pool, part_id, 1, 1, status, None, None, false).await
+}
+
+/// 造一个批次的**完整形态**（位置 / 多态持有人 / 返修标记都可指定）。
+///
+/// `location` 取 `t_part_batch.location` 的 5 个字面量之一（`OFFICE` /
+/// `PRODUCTION_SHELF` / `WORKER` / `INSPECTION_SHELF` / `OUTSOURCE_COMPANY`），
+/// `holder_id` 是**多态** holder（货架 / 工人 / 外协厂的 id，取决于 `location`）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn insert_batch_full(
+    pool: &PgPool,
+    part_id: i64,
+    batch_no: i32,
+    quantity: i32,
+    status: &str,
+    location: Option<&str>,
+    holder_id: Option<i64>,
+    is_repairing: bool,
+) -> i64 {
     let id = shared_test_snowflake().next_id();
     let now = now_naive();
     sqlx::query(
-        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, version, \
-         created_at, updated_at) VALUES ($1, $2, 1, 1, $3, 0, $4, $4)",
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
+         current_holder_id, is_repairing, version, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, $9, $9)",
     )
     .bind(id)
     .bind(part_id)
+    .bind(batch_no)
+    .bind(quantity)
     .bind(status)
+    .bind(location)
+    .bind(holder_id)
+    .bind(is_repairing)
     .bind(now)
     .execute(pool)
     .await
     .expect("insert t_part_batch");
+    id
+}
+
+/// 造一个工人（`t_worker.name` = 邮件「位置」列在 `WORKER` 档的取值）。
+pub(crate) async fn insert_worker(pool: &PgPool, name: &str) -> i64 {
+    let id = shared_test_snowflake().next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_worker (id, badge_code, name, is_active, version, created_at, updated_at) \
+         VALUES ($1, $2, $3, true, 0, $4, $4)",
+    )
+    .bind(id)
+    .bind(format!("W-{id}"))
+    .bind(name)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_worker");
+    id
+}
+
+/// 造一个货架（邮件「位置」列在两种货架档取的是 **`code`** 不是 `name`）。
+pub(crate) async fn insert_shelf(pool: &PgPool, code: &str) -> i64 {
+    let id = shared_test_snowflake().next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_shelf (id, code, name, zone, is_active, version, display_order, \
+         created_at, updated_at) VALUES ($1, $2, $3, 'PRODUCTION', true, 0, 0, $4, $4)",
+    )
+    .bind(id)
+    .bind(code)
+    // `name` 与 `code` 同源不同形：正因为「位置」列取的是 `code`，这里必须让两者
+    // **不可混淆**（取到 `name` 的用例会红），故 `name` 加一个 `货架` 前缀。
+    .bind(format!("货架{code}"))
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_shelf");
+    id
+}
+
+/// 造一个外协公司（邮件「位置」列在 `OUTSOURCE_COMPANY` 档的取值）。
+pub(crate) async fn insert_outsource_company(pool: &PgPool, name: &str) -> i64 {
+    let id = shared_test_snowflake().next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_outsource_company (id, name, is_active, version, created_at, updated_at) \
+         VALUES ($1, $2, true, 0, $3, $3)",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_outsource_company");
     id
 }
 

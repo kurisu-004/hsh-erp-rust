@@ -14,8 +14,10 @@
 //! 插入时间戳一起钉死 —— 否则下个月 1 号会再次变红。
 //!
 //! ## 为什么不装 `assert_no_foreign_domain`
-//! 见 [`super`] 的模块 doc 末节：本域**共用** dashboard 的 `DELIVERY_STATUSES`
-//! 常量是既定契约（CLAUDE.md 明确要求四处共用），不是「跨域依赖违规」。
+//! 见 [`super`] 的模块 doc 末节：第 1 类依赖是只读聚合别域的表、统计 SQL 在本域
+//! 写全（既定 pattern），第 2 类是「内容域向通道域取发信凭据」的必然引用，两类都不适合
+//! 用「不 import 别域 service / repo」来守。统计用的 `DELIVERY_STATUSES` 自
+//! **2026-10-16** 起已是本域自有常量，不构成跨域引用。
 
 use super::dto::{
     Frequency, SaveConfigRequest, TriggerSource, VisibleColumn, parse_visible_columns,
@@ -67,7 +69,7 @@ fn frequency_meta_flags_match_the_product_decisions() {
 
 #[test]
 fn visible_column_whitelist_is_closed_and_labels_unique() {
-    // 白名单 11 项，标签互不重复（否则邮件表头会有两列同名，读信人分不清）
+    // 白名单 13 项，标签互不重复（否则邮件表头会有两列同名，读信人分不清）
     let mut labels: Vec<&str> = VisibleColumn::ALL.iter().map(|c| c.label()).collect();
     labels.sort_unstable();
     let before = labels.len();
@@ -78,7 +80,7 @@ fn visible_column_whitelist_is_closed_and_labels_unique() {
     }
     assert_eq!(VisibleColumn::parse("customer_name_xxx"), None);
 
-    // 缺省 8 列必须是全量白名单的子集
+    // 缺省 10 列必须是全量白名单的子集
     for c in VisibleColumn::DEFAULT_SET {
         assert!(
             VisibleColumn::ALL.contains(c),

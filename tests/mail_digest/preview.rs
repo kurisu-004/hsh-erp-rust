@@ -605,7 +605,10 @@ async fn preview_rejects_unknown_column_with_21704() {
     assert_eq!(env["code"], 21704, "未知列必须暴露，不能静默丢弃：{env}");
 }
 
-/// 空列白名单 ⇒ **退回缺省 8 列**（否则会渲出一张只有表头的空表）。
+/// 空列白名单 ⇒ **退回缺省 10 列**（否则会渲出一张只有表头的空表）。
+///
+/// ⚠️ 数字与 `VisibleColumn::DEFAULT_SET.len()` 是同一条信息的两份副本，改缺省列时
+/// 两处必须一起改（2026-10-16 加 `batch_no` / `location` 时两处都漏过）。
 #[tokio::test]
 async fn preview_empty_column_list_falls_back_to_default_set() {
     let ctx = crate::bootstrap().await;
@@ -627,8 +630,8 @@ async fn preview_empty_column_list_falls_back_to_default_set() {
     assert_eq!(status, StatusCode::OK, "{env}");
     assert_eq!(
         env["data"]["columns"].as_array().map(|a| a.len()),
-        Some(8),
-        "空列白名单应退回缺省 8 列：{env}"
+        Some(10),
+        "空列白名单应退回缺省 10 列：{env}"
     );
     assert!(env["data"]["html"].as_str().unwrap().contains("序列号"));
 }
