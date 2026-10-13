@@ -32,7 +32,7 @@ use sqlx::PgPool;
 
 use hsh_erp_test_support::fixture::PartFixture;
 use hsh_erp_test_support::{
-    json_request, load_part_fixture, login_token, send, test_app, test_pool, test_state,
+    json_request, load_part_fixture, login_token, send, send_raw, test_app, test_pool, test_state,
 };
 
 // ===========================================================================
@@ -1207,32 +1207,35 @@ async fn recall_to_pending_rejects_non_production_location() {
 }
 
 // ===========================================================================
-//  2026-10-04：工种维度 list 端点的 part 侧真实字段投影
+//  2026-10-13：`GET /parts/by-work-type/{id}` 下线（硬切 404 守卫）
 // ===========================================================================
 //
-// 三个同族端点（`GET /parts/by-work-type/{id}` 与已迁往 `prod::scan` 的
-// `GET /prod/scan/pickable?work_type_id=` / `GET /prod/scan/held?worker_id=`）
-// 此前共享一个根因：取行 SQL 只投影
-// `p.id` / `p.serial_no` / `p.drawing_no` 三列，剩下的 `PartListItem` 字段靠**手抄
-// 20 个占位值**的 `TPart { ... }` 字面量填。于是 `name` 填成图号副本（前端卡片第 1
-// 行与第 2 行重复）、`is_urgent` 恒 `false`（加急 tag 永不渲染）、
-// `system_delivery_date` 恒 `null`（交期 chip 永不渲染）、
-// `planned_delivery_date` 恒 `1970-01-01`。
+// ## 移除记录
 //
-// 而 `pickable` 列表的 `ORDER BY p.is_urgent DESC, p.planned_delivery_date ASC`
-// 排的是 **DB 真实列** ⇒ 列表已经按加急排好了，工件上却看不出任何标记。
+// 端点**零消费方**（前端 `src/types/parts.ts` 里只有一句类型注释、无任何 api
+// 函数；工种维度的三个页面数据源全是报工台那两条端点
+// `GET /api/v2/prod/scan/pickable` / `GET /api/v2/prod/scan/held`）⇒ 随端点
+// 一起删除的还有 `service/phase1/work_type.rs` 整个文件与
+// `dto_crud::ByWorkTypeQuery`。**无 alias**。
 //
-// 2026-10-04 起三处改为投影 `p.name` / `p.is_urgent` / `p.system_delivery_date` /
-// `p.planned_delivery_date` 真实值并共用 `WorkTypeListRow` 投影 struct。本节把
-// 「真实值」与「响应不含 `next_process_id`」两条不变量锁在这个端点上；
-// 另两条端点的同类断言随其迁往 `tests/production/scan_listing.rs`。
+// 原先本节锁着 3 条 part 侧真实字段投影的用例（`name` 不得填成图号副本、
+// `is_urgent` 不得恒 false、`system_delivery_date` 不得恒 null）—— 端点没了，
+// 用例随之删除；同族的另两条端点那份断言在
+// `tests/production/scan_listing.rs` 里仍绿着。
 //
-// ## 断言手法
-// `insert_part_biz` 造 part 时让 `name` **不等于** `drawing_no`：改造前 `name`
-// 就是图号副本，两者相等时任何 `assert_eq!(name, ...)` 都测不出漂移。
-// 另外 `is_urgent` / `planned_delivery_date` 刻意取**非默认值**（`false` / 当天），
-// 否则「投影到真值」与「仍填占位」不可区分。
-
+// 本节保留它们用到的 4 个造数 helper（`insert_part_biz` / `insert_worker` /
+// `insert_pickable_batch` / `insert_worker_held_batch`）：`recall` 那条用例仍在用。
+//
+// ## ⚠️ 旧路径的响应形态：**干净 404**
+//
+// 本仓「段数是分水岭」那条规则的 2 段一侧：`by-work-type/{id}` 是**两段**，
+// 而 `Path<i64>` catch-all 是 1 段的 `/{part_id}`，本 router 全部 2 段路由的
+// 第二段都是**字面量**（`update` / `soft-delete` / `cancel` / `events` / …），
+// 没有 `/{part_id}/{param}` 这种形态 ⇒ 路由删除后没有任何注册路径能匹配它。
+// 反之 1 段静态路径才会落进 `/{part_id}` 被 `Path<i64>` 拒成 **400 纯文本** ——
+// 同批删除的 `POST /api/v2/parts/batch-with-pdfs` 正是那一种
+// （由 `tests/part/create_serial_price.rs` 里新增的守卫用例钉死）。
+//
 /// 插一个 part，显式带上本次要断言的 4 个 part 侧业务列，返回 part id。
 async fn insert_part_biz(
     pool: &PgPool,
@@ -1325,211 +1328,41 @@ async fn insert_worker_held_batch(pool: &PgPool, part_id: i64, worker_id: i64) -
     .expect("insert t_part_batch (WORKER-held)");
     batch_id
 }
-
-/// 打一次 list 端点并按 part id 取目标行（找不到即 panic 并打印整份信封）。
-async fn list_item(app: &axum::Router, token: &str, uri: &str, part_id: i64) -> Value {
-    let (s, env) = send(
-        app.clone(),
-        json_request("GET", uri, None::<Value>, Some(token)),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "GET {uri}: {env}");
-    assert_eq!(env["code"], 0, "GET {uri}: {env}");
-    let want = part_id.to_string();
-    env["data"]["items"]
-        .as_array()
-        .expect("data.items")
-        .iter()
-        .find(|it| it["id"].as_str() == Some(want.as_str()))
-        .unwrap_or_else(|| panic!("part {part_id} 不在 {uri} 的结果里: {env}"))
-        .clone()
-}
-
-/// 断言一个 item 的 4 个 part 侧业务列都是 DB 真值。
-///
-/// 同时锁死 `next_process_id` **不出现在响应里**（`PartListItem` 根本没有该字段，
-/// 序列化后不应有这个键）—— 这条不变量在 2026-10-04 之前是靠「`TPart` 字面量里
-/// 写 `next_process_id: None` + `From<TPart>` 不复制它」两处巧合隐式达成的，
-/// 重构后改由类型系统保证，本断言是它的线缆级守卫。
-fn assert_real_part_fields(
-    item: &Value,
-    want_name: &str,
-    want_urgent: bool,
-    want_planned: &str,
-    want_system: Option<&str>,
-) {
-    assert_eq!(
-        item["name"], want_name,
-        "name 必须是 t_part.name 真实值（改造前是 drawing_no 的副本）: {item}"
-    );
-    assert_eq!(
-        item["is_urgent"], want_urgent,
-        "is_urgent 必须是 t_part.is_urgent 真实值（改造前恒 false）: {item}"
-    );
-    assert_eq!(
-        item["planned_delivery_date"], want_planned,
-        "planned_delivery_date 必须是真实值（改造前恒 1970-01-01）: {item}"
-    );
-    match want_system {
-        Some(s) => assert_eq!(
-            item["system_delivery_date"], s,
-            "system_delivery_date 必须是 t_part 的真实值: {item}"
-        ),
-        None => assert!(
-            item["system_delivery_date"].is_null(),
-            "system_delivery_date 为 NULL 的 part 必须序列化成 null: {item}"
-        ),
+// 钉这条形态是为了防「400 / 404 当成旧路由还在」：与
+// `tests/files/part_file.rs` 的 7 条硬切 404 守卫同款作用。
+#[tokio::test]
+async fn by_work_type_endpoint_is_gone_and_old_paths_are_no_longer_routed() {
+    let (_pool, app, token, fx) = bootstrap_as_manager().await;
+    // ⚠️ 用 `send_raw` 而非 `send`：旧形态是**纯文本** 4xx（提取器层 rejection），
+    // 走 `send` 会在「parse JSON」处 panic —— 那本身就是个佐证，但拿不到状态码。
+    for uri in [
+        format!("/parts/by-work-type/{}", fx.work_type_id),
+        "/parts/by-work-type/123".to_string(),
+        // ⚠️ 这条是**两种形态的分界点**：`by-work-type` 单独一段时它确实是 1 段
+        // 静态路径 ⇒ 会落进 `/{part_id}` 的 `Path<i64>` catch-all ⇒ 400 纯文本。
+        "/parts/by-work-type".to_string(),
+    ] {
+        let (s, raw) = send_raw(
+            app.clone(),
+            json_request("GET", &uri, None::<Value>, Some(&token)),
+        )
+        .await;
+        if uri == "/parts/by-work-type" {
+            assert_eq!(
+                s,
+                StatusCode::BAD_REQUEST,
+                "1 段静态路径落进 Path<i64> catch-all ⇒ 400 纯文本: {raw}"
+            );
+        } else {
+            assert_eq!(
+                s,
+                StatusCode::NOT_FOUND,
+                "2 段路径够不着 1 段 catch-all ⇒ 干净 404（别把 400/404 当成「路由还在」）: {raw}"
+            );
+        }
     }
-    assert!(
-        item.get("next_process_id").is_none(),
-        "列表响应恒不含 next_process_id（PartListItem 无该字段）: {item}"
-    );
 }
 
-/// `GET /parts/by-work-type/{id}`：part 侧 4 列投影真实值。
-#[tokio::test]
-async fn by_work_type_projects_real_part_business_fields() {
-    let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let part_id = insert_part_biz(
-        &pool,
-        fx.customer_l1_id,
-        "急件工单名",
-        "D-BIZ-WT",
-        true,
-        chrono::NaiveDate::from_ymd_opt(2026, 12, 31).unwrap(),
-        Some(chrono::NaiveDate::from_ymd_opt(2026, 11, 30).unwrap()),
-    )
-    .await;
-    let worker_id = insert_worker(&pool, fx.work_type_id, "WT-BIZ").await;
-    insert_worker_held_batch(&pool, part_id, worker_id).await;
-
-    let item = list_item(
-        &app,
-        &token,
-        &format!("/parts/by-work-type/{}", fx.work_type_id),
-        part_id,
-    )
-    .await;
-    assert_real_part_fields(&item, "急件工单名", true, "2026-12-31", Some("2026-11-30"));
-    assert_ne!(
-        item["name"], item["drawing_no"],
-        "前提自证：name 与 drawing_no 必须不同（相等时测不出「name 填成图号」的漂移）: {item}"
-    );
-    // 本端点的行不是「批次锚点」语义（口径见 vo/part.rs 字段 doc），仍是 null。
-    assert!(
-        item["batch_id"].is_null() && item["batch_version"].is_null(),
-        "by-work-type 不填批次锚点: {item}"
-    );
-}
-
-/// 非加急 + 有 system_delivery_date 的组合：`is_urgent` 不得被反向填成 true。
-///
-/// 上一节三例全走 `is_urgent = true`，只锁住「true 能穿透」；本例锁住另一半：false
-/// 是**真值**（与「未投影而恒 false」不可区分，但至少保证没有恒 true 的镜像 bug）。
-#[tokio::test]
-async fn by_work_type_keeps_non_urgent_and_real_system_delivery_date() {
-    let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let part_id = insert_part_biz(
-        &pool,
-        fx.customer_l1_id,
-        "不急工单",
-        "D-BIZ-CALM",
-        false,
-        chrono::NaiveDate::from_ymd_opt(2027, 3, 1).unwrap(),
-        Some(chrono::NaiveDate::from_ymd_opt(2027, 2, 1).unwrap()),
-    )
-    .await;
-    let worker_id = insert_worker(&pool, fx.work_type_id, "WT-CALM").await;
-    insert_worker_held_batch(&pool, part_id, worker_id).await;
-
-    let item = list_item(
-        &app,
-        &token,
-        &format!("/parts/by-work-type/{}", fx.work_type_id),
-        part_id,
-    )
-    .await;
-    assert_real_part_fields(&item, "不急工单", false, "2027-03-01", Some("2027-02-01"));
-}
-
-/// `serial_no IS NULL` 的手工工单不得让本端点整页 500。
-///
-/// `t_part.serial_no` 是 nullable（手工工单无序列号；baseline 里是
-/// `serial_no character varying(15)`，无 NOT NULL）。取行 SQL 一旦把它按 `String`
-/// 解码，遇到任一行 `serial_no IS NULL` 就 `unexpected null; try decoding as an
-/// Option` ⇒ 整页 500。手工工单是常态，这是必经路径而非边角。
-///
-/// 用例刻意造一个 `serial_no IS NULL` 的行**并**给同页另一个行补上序列号，证明
-/// 「null 行不会被整页炸掉、且与有值行共存」而不是「整页恰好只有 null 行所以
-/// 看不出来」。
-#[tokio::test]
-async fn by_work_type_tolerates_null_serial_no() {
-    let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let worker_id = insert_worker(&pool, fx.work_type_id, "WT-SERIAL-NULL").await;
-
-    // `insert_part_biz` 不写 serial_no ⇒ DB 里是 NULL（手工工单形态）
-    let manual_part = insert_part_biz(
-        &pool,
-        fx.customer_l1_id,
-        "无序列号件",
-        "D-SERIAL-NULL",
-        false,
-        chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
-        None,
-    )
-    .await;
-    insert_worker_held_batch(&pool, manual_part, worker_id).await;
-
-    let numbered_part = insert_part_biz(
-        &pool,
-        fx.customer_l1_id,
-        "有序列号件",
-        "D-SERIAL-OK",
-        false,
-        chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
-        None,
-    )
-    .await;
-    sqlx::query("UPDATE t_part SET serial_no = $2 WHERE id = $1")
-        .bind(numbered_part)
-        .bind("WT-OK-001")
-        .execute(&pool)
-        .await
-        .expect("give the second part a serial_no");
-    insert_worker_held_batch(&pool, numbered_part, worker_id).await;
-
-    let uri = format!("/parts/by-work-type/{}", fx.work_type_id);
-    let (s, env) = send(
-        app.clone(),
-        json_request("GET", &uri, None::<Value>, Some(&token)),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "serial_no=NULL 不应 500: {env}");
-    assert_eq!(env["code"], 0, "GET {uri}: {env}");
-
-    let manual = env["data"]["items"]
-        .as_array()
-        .expect("data.items")
-        .iter()
-        .find(|it| it["id"].as_str() == Some(manual_part.to_string().as_str()))
-        .expect("无序列号那行应在结果里")
-        .clone();
-    assert!(
-        manual["serial_no"].is_null(),
-        "手工工单的 serial_no 应序列化成 null 而非整页炸掉: {env}"
-    );
-    let numbered = env["data"]["items"]
-        .as_array()
-        .expect("data.items")
-        .iter()
-        .find(|it| it["id"].as_str() == Some(numbered_part.to_string().as_str()))
-        .expect("有序列号那行应与 null 行共存")
-        .clone();
-    assert_eq!(
-        numbered["serial_no"], "WT-OK-001",
-        "同页有序列号的行不受影响: {env}"
-    );
-}
 
 // ===========================================================================
 //  权限点闸门（2026-10-15 新增）

@@ -12,13 +12,31 @@
 //! 4. `batch_create_rejects_when_l1_serial_prefix_missing` —— L1 未配 prefix
 //!    → 20308 整单拒，且 t_part 行数不变；
 //! 5. `batch_create_serials_are_unique_and_increasing` —— 同批 / 跨批都不重号且递增；
-//! 6. `batch_with_pdfs_keeps_master_and_child_serial_pattern` —— 遗留端点回归：
-//!    有 PDF 仍派 master 号 + `{master}-{NN}` 子件号；
-//! 7. `batch_with_pdfs_without_pdf_leaves_serial_null` —— 无 PDF 时仍不派号；
-//! 8. `batch_create_with_bindings_dispatches_serial_and_keeps_prices` —— 带
+//! 6. `batch_create_with_bindings_dispatches_serial_and_keeps_prices` —— 带
 //!    `drawing_file` 的另一个 service 入口（`has_bindings` 分流）同样派号 + 透传金额；
-//! 9. `batch_create_rejects_when_l1_parent_soft_deleted` —— L1 父行已软删 → 20102；
-//! 10. `batch_create_rejects_when_serial_prefix_not_uppercase` —— prefix 非 A-Z → 20104。
+//! 7. `batch_create_rejects_when_l1_parent_soft_deleted` —— L1 父行已软删 → 20102；
+//! 8. `batch_create_rejects_when_serial_prefix_not_uppercase` —— prefix 非 A-Z → 20104；
+//! 9. `batch_with_pdfs_endpoint_is_gone_and_old_path_is_rejected` —— 硬切守卫（见下）。
+//!
+//! ## 2026-10-13：`POST /parts/batch-with-pdfs` 下线，本文件少 2 条用例
+//!
+//! 该端点**零消费方**（前端 `src/api/parts/batch.ts` 里那处是**主动弃用注释**、
+//! 6 个 `export async用 function` 无一打它），随端点一起删掉的还有
+//! `dto_crud::BatchWithPdfsRequest` 与 `service::PartService::batch_with_pdfs`。
+//! 原用例 6 / 7（`batch_with_pdfs_keeps_master_and_child_serial_pattern` /
+//! `batch_with_pdfs_without_pdf_leaves_serial_null`）守的是「master 号 +
+//! `{master}-{NN}` 子件号」这条**端点专属**约定，随端点一起消失；派发器本身
+//! （`serial_prefix_for_customer` + `shared::serial::acquire`）由用例 1 / 3 / 5 / 6
+//! 继续守，未受影响。
+//!
+//! ⚠️ **旧路径形态与 `by-work-type` 不同，且 POST / GET 之间也不同**（实测钉死，
+//! 见下方守卫用例）：
+//! - `POST /parts/batch-with-pdfs` → **405**（1 段静态路径落进 `/{part_id}`，
+//!   而那条**只注册了 GET** ⇒ matchit 先判方法，直接 `Method Not Allowed`）；
+//! - `GET /parts/batch-with-pdfs` → **400 纯文本**（方法对上了，才轮到
+//!   `Path<i64>` 解不出整数）；
+//! - `GET /parts/by-work-type/{id}` → **干净 404**（2 段路径够不着 1 段 catch-all，
+//!   本 router 全部 2 段路由的第二段都是字面量）。
 //!
 //! 基建沿用 `crud.rs` / `batch.rs` 的写法（`test_pool` + `load_part_fixture` +
 //! `send` / `json_request` / `login_token`），不新建 helper 体系。
@@ -514,12 +532,28 @@ async fn batch_create_serials_are_unique_and_increasing() {
 }
 
 // ===========================================================================
-//  6-7. POST /parts/batch-with-pdfs 回归（遗留端点，行为不得变）
+//  9. POST /parts/batch-with-pdfs 硬切守卫（端点已下线）
 // ===========================================================================
 
+/// 钉住「旧路径不再被路由到」这一形态 —— **POST 与 GET 的形态不同**。
+///
+/// `POST /api/v2/parts/batch-with-pdfs` 是 **1 段**静态路径；路由删除后它落进
+/// `/{part_id}` 那条 catch-all，而**那条只注册了 GET** ⇒ matchit 先判路径再判
+/// 方法，方法不中直接 **`HTTP 405`**，压根轮不到 `Path<i64>` 提取器。
+/// 同一路径改用 **GET** 请求时方法对上了，才轮到 `Path<i64>` 去解 `"batch-with-pdfs"`
+/// ⇒ **`HTTP 400` 纯文本**。
+///
+/// ⚠️ 同仓已有同款先例：`prod::worker` 的 `POST /verify-badge` 迁往 `prod::scan`
+/// 之后，旧路径 `/prod/workers/verify-badge` 就是 405（落进只注册 GET 的 `/{id}`），
+/// 见本仓 `CLAUDE.md` 的 `prod::worker` 那一行。
+/// ⇒ **「1 段静态路径落进 catch-all」有两种落点，取决于 catch-all 注册了哪些方法**，
+/// 别把它们混成一条规则。
+///
+/// ⚠️ 用 `send_raw`：`send` 会去 parse JSON，而 405 / 400 这类提取器层 rejection
+/// 的响应体是**空串**（实测 `raw=""`），走 `send` 会直接 panic 在解析处。
 #[tokio::test]
-async fn batch_with_pdfs_keeps_master_and_child_serial_pattern() {
-    let (pool, app, token, fx) = bootstrap_as_manager().await;
+async fn batch_with_pdfs_endpoint_is_gone_and_old_paths_are_no_longer_routed() {
+    let (_pool, app, token, fx) = bootstrap_as_manager().await;
     let today = today().to_string();
     let json_field = json!({
         "customer_id": fx.customer_l2_id.to_string(),
@@ -529,68 +563,26 @@ async fn batch_with_pdfs_keeps_master_and_child_serial_pattern() {
         "is_urgent": false,
     })
     .to_string();
-    // 3 页 PDF → master + 2 子件
-    let (s, env) = send(
-        app,
-        batch_with_pdfs_request(&json_field, &[make_fixture_pdf(3)], &token),
+    for (label, pdfs) in [("带 PDF", vec![make_fixture_pdf(3)]), ("无 PDF", vec![])] {
+        let (s, raw) = send_raw(app.clone(), batch_with_pdfs_request(&json_field, &pdfs, &token))
+            .await;
+        assert_eq!(
+            s,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{label}：旧 POST 端点已下线，落进只注册 GET 的 /{{part_id}} ⇒ 405（别当成「路由还在」）: raw={raw}"
+        );
+    }
+    // GET 同一路径：方法对上了 ⇒ 轮到 `Path<i64>` 解不出整数 ⇒ 400 纯文本。
+    let (s, raw) = send_raw(
+        app.clone(),
+        json_request("GET", "/parts/batch-with-pdfs", None::<Value>, Some(&token)),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "batch-with-pdfs: {env}");
-    let master = assert_dispatched_serial(env["data"]["serial_no"].as_str(), "P1000", "master");
-    let master_id = env["data"]["id"].as_str().expect("master id").to_string();
-
-    let child_serials: Vec<Option<String>> = sqlx::query_scalar(
-        "SELECT serial_no FROM t_part \
-         WHERE drawing_no LIKE 'ASM-%-01' OR drawing_no LIKE 'ASM-%-02' \
-         ORDER BY drawing_no",
-    )
-    .fetch_all(&pool)
-    .await
-    .expect("查子件 serial_no");
     assert_eq!(
-        child_serials,
-        vec![Some(format!("{master}-01")), Some(format!("{master}-02"))],
-        "子件序列号应派生自 master 号（{master}），且由 INSERT 期写入"
+        s,
+        StatusCode::BAD_REQUEST,
+        "GET 同一路径应落进 Path<i64> 提取器返 400 纯文本: raw={raw}"
     );
-    let master_db: Option<String> =
-        sqlx::query_scalar("SELECT serial_no FROM t_part WHERE id = $1::bigint")
-            .bind(&master_id)
-            .fetch_one(&pool)
-            .await
-            .expect("查 master serial_no");
-    assert_eq!(master_db.as_deref(), Some(master.as_str()));
-}
-
-#[tokio::test]
-async fn batch_with_pdfs_without_pdf_leaves_serial_null() {
-    let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let today = today().to_string();
-    let json_field = json!({
-        "customer_id": fx.customer_l2_id.to_string(),
-        "applicant_name": "丁",
-        "request_date": today,
-        "planned_delivery_date": today,
-        "is_urgent": false,
-    })
-    .to_string();
-    let (s, env) = send(app, batch_with_pdfs_request(&json_field, &[], &token)).await;
-    assert_eq!(s, StatusCode::OK, "batch-with-pdfs（无 PDF）: {env}");
-    assert!(
-        env["data"]["serial_no"].is_null(),
-        "PDF 页数为 0 时不应派发序列号: {env}"
-    );
-    let master_id = env["data"]["id"].as_str().expect("master id").to_string();
-    let master_db: Option<String> =
-        sqlx::query_scalar("SELECT serial_no FROM t_part WHERE id = $1::bigint")
-            .bind(&master_id)
-            .fetch_one(&pool)
-            .await
-            .expect("查 master serial_no");
-    assert!(
-        master_db.is_none(),
-        "DB 里 master.serial_no 应为 NULL: {master_db:?}"
-    );
-    assert_eq!(count_parts(&pool).await, 1, "无 PDF 时只建 master 一件");
 }
 
 // ===========================================================================

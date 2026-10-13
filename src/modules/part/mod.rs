@@ -101,18 +101,22 @@ pub fn router() -> Router<Arc<AppState>> {
             "/batch-update-order-info",
             post(handler::batch_update_order_info),
         )
-        .route("/batch-with-pdfs", post(handler::batch_with_pdfs))
         // 2026-10-03 新增：批量零件图纸打印（纯 BFF 转发到 python 执行 PDF 光栅化 +
         // pikepdf 合并）。★静态段必须在 /{part_id}/... catch-all 之前注册。
         .route(
             "/print-drawing-batch",
             post(handler::print::print_drawing_batch),
         )
-        // ---- Phase 2 (2026-09-13) 静态段（by-work-type）----
-        .route(
-            "/by-work-type/{work_type_id}",
-            get(handler::list_by_work_type),
-        )
+        // ⚠️ 2026-10-13：`/batch-with-pdfs`（1 段静态）与 `/by-work-type/{id}`
+        // （2 段）两条零消费方端点整条下线，逐条移除记录见 `handler/batch.rs` 与
+        // `handler/lifecycle.rs` 的模块 doc。⚠️ **两条的旧路径响应形态不同，且
+        // `batch-with-pdfs` 的 POST / GET 也不同**（实测钉死，见各自的守卫用例）：
+        // - `GET /parts/by-work-type/{id}` → **干净 404**（2 段够不着 1 段 catch-all；
+        //   本 router 全部 2 段路由的第二段都是字面量，没有 `/{part_id}/{param}`）。
+        // - `POST /parts/batch-with-pdfs` → **405**（落进下面的 `/{part_id}`，而那条
+        //   **只注册 GET** ⇒ matchit 先判方法，`Path<i64>` 压根没被调用）。
+        // - `GET /parts/batch-with-pdfs` → **400 纯文本**（方法对上后才轮到
+        //   `Path<i64>` 解不出整数）。
         // ---- 单件 {part_id} ----
         .route("/{part_id}", get(handler::get_part_detail))
         .route("/{part_id}/update", post(handler::update_part))

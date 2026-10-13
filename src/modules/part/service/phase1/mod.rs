@@ -10,28 +10,25 @@
 //! `PartListItem`，与前端外协域字段需求不匹配。取代者迁往 outsource 域。
 //!
 //! - `events.rs` 1.6 事件历史 + 位置树 + 1.8 批量创建增强（list_events /
-//!   location_tree / batch_with_pdfs / batch_update_order_info）
+//!   location_tree / batch_update_order_info；⚠️ `batch_with_pdfs` 已于 2026-10-13
+//!   随端点删除）
 //! - `excel_match.rs` 采购订单 Excel 匹配（2026-10-06 新增，从 `events.rs` 迁出；
 //!   含分档决策纯函数 `resolve_match_tier` + 匹配索引 `ExcelMatchIndex`）
 //! - `lifecycle_helpers.rs` 批次列表（list_batches）
-//! - `work_type.rs` 工种维度只读（list_by_work_type；2026-10-10 起另两条随报工台
-//!   迁往 `crate::modules::prod::scan::listing`）
+//!
+//! ⚠️ 原 `work_type.rs`（工种维度只读）已于 2026-10-13 **整文件删除**：最后一条
+//! `list_by_work_type` 零消费方（另两条 2026-10-10 随报工台迁往
+//! `crate::modules::prod::scan::listing`）—— 本模块已无工种维度读端点。
 //!
 //! 状态机见 `shared/batch/status_machine.rs`（2026-09-29 缩至 21 个合法迁移；
 //! 2026-10-13 自 `part/statemachine.rs` 上提，该文件随之删除）。
 //! 错误码全部沿用 `shared/error.rs::code` 已声明常量（201xx / 205xx）。
 
-// 2026-10-13 死代码清理（计划项「删 deprecated allow」**实跑后未采纳**）：本模块级
-// `#![allow(...)]` 的 `deprecated` 一项当前掩盖着 3 处真实弃用告警 ——
-// `work_type.rs` 的 `PLACEHOLDER_TS`（`NaiveDateTime::from_timestamp_opt`）与
-// `excel_match.rs` 的 2 处 `NaiveDateTime::UNIX_EPOCH`。删掉即新增 3 条 warning，
-// 故保留。要收窄请就地逐处 `#[allow(deprecated)]` 精确标注（属独立改动）。
-#![allow(deprecated, clippy::too_many_arguments, clippy::type_complexity)]
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 pub mod events;
 pub mod excel_match;
 pub mod lifecycle_helpers;
-pub mod work_type;
 
 /// 外协公司精简投影（outsource 域 Phase 2 stub 期间绕过 OutsourceCompanyRepo）。
 struct OutsourceLite {

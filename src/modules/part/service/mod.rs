@@ -13,12 +13,16 @@
 //!   prepare_binding_head_copy + PreparedBinding），2026-09-16 M2-B + M2-C 重构
 //! - `lifecycle.rs`：part 级多批次终态（cancel / force_complete）
 //! - `phase1/events.rs`：事件历史 / 位置树 / 批量创建增强（list_events /
-//!   location_tree / batch_with_pdfs / batch_update_order_info）
+//!   location_tree / batch_update_order_info；⚠️ `batch_with_pdfs` 已于 2026-10-13
+//!   随端点删除）
 //! - `phase1/excel_match.rs`：采购订单 Excel 匹配（2026-10-06 新增，从
 //!   `events.rs` 迁出；含分档决策纯函数 `resolve_match_tier`）
 //! - `phase1/lifecycle_helpers.rs`：批次列表（list_batches）
-//! - `phase1/work_type.rs`：工种维度只读端点（list_by_work_type /
-//!   list_by_work_type）
+//!
+//! ⚠️ 原 `phase1/work_type.rs`（工种维度只读端点 `list_by_work_type`）已于
+//! 2026-10-13 随端点**整文件删除**（零消费方，移除记录见
+//! `crate::modules::part::handler::lifecycle` 的模块 doc）—— 本模块已无工种维度
+//! 读端点。
 //! - `rollup.rs`：rollup 工具（sync_from_batch_change）
 //! - `list_enrichment.rs`：list_parts 派生层「位置 / 持有人」跨三表解析
 //!   helper（2026-09-22 review 第 2 轮从 crud.rs 抽出，原 1054 行超限）

@@ -327,8 +327,10 @@ impl PartBatchRepo {
     /// | `part::service::batch::batch_create_parts_with_bindings` | `POST /parts/batch` 的 `has_bindings=true` 那一支（handler 按 `items[].drawing_file/model3d_file` 是否非空分流） | 整单 Err（错误类型 `(AppError, Vec<String>)`，handler 拿 `cleanup_tmp_keys` 兜底删 COS 对象） |
     /// | `part::service::batch::batch_create_parts_legacy` | `POST /parts/batch` 的 `has_bindings=false` 那一支 | 整单 500 |
     ///
-    /// （`POST /parts/batch-with-pdfs` 不在此列 —— 它是 `batch_with_pdfs`，建完
-    /// master/子件后直接返详情，回填 `current_batch_id` 的位置恒传 `None`。）
+    /// （⚠️ 原先还有一行「`POST /parts/batch-with-pdfs` 不在此列 —— 它是
+    /// `batch_with_pdfs`，建完 master/子件后直接返详情，回填 `current_batch_id`
+    /// 的位置恒传 `None`」—— 该端点已于 2026-10-13 随零消费方清理整条删除，
+    /// 故这条例外说明随之消失。）
     ///
     /// ⚠️ 四处**全是 `?` 上抛 ⇒ 整单失败**，没有一处是「该行进 `failed[]`、
     /// 其余行照写」：那两个批量端点的 `failed[]` 只收 `create_part` /

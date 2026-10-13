@@ -4,10 +4,11 @@
 //! - `crud.rs` —— 单件 CRUD：list / detail / create / update / soft-delete / by-serial /
 //!   列表 / 事件 / 位置树 / match-by-excel / batch-update-order-info
 //!   （2026-10-13 PR1b：`upload-drawing` / `upload-3d-model` 两条已迁出本文件）
-//! - `lifecycle.rs` —— part 级终态（cancel / force-complete）+ 各种 list 列表
-//!   （by-work-type / by-worker）
-//! - `batch.rs` —— 批量创建（batch / batch-with-bindings / batch-with-pdfs）
-//!   （2026-10-13 PR1b：`confirm_part_file` 已迁至 `files::part_file::handler`）
+//! - `lifecycle.rs` —— part 级终态（cancel / force-complete）
+//!   （2026-10-13：`list_by_work_type` 零消费方，随端点整条删除）
+//! - `batch.rs` —— 批量创建（batch / batch-with-bindings）
+//!   （2026-10-13：`batch_with_pdfs` 零消费方，随端点整条删除；PR1b：
+//!   `confirm_part_file` 已迁至 `files::part_file::handler`）
 //! - `print.rs` —— 打印转发（print-drawing / print-drawing-batch，纯 BFF：鉴权 + 转发到 python）
 //!
 //! 2026-10-02：原 `inspection.rs` 整体迁至 `crate::modules::prod::batch::handler`
@@ -59,9 +60,17 @@ pub use crud::{
 // recall-to-pending / release-from-programming / outsource 三端点 / complete-repair /
 // repair-dispatch / split-batch / cancel-batch / pick-up（见 prod::batch::handler::lifecycle）。
 // 2026-10-10 报工台端点迁出：pickable-by-work-type / by-worker（见 prod::scan::handler）。
-pub use lifecycle::{cancel, force_complete, list_by_work_type};
+// 2026-10-13 零消费方端点下线：`list_by_work_type`（`GET /api/v2/parts/by-work-type/{id}`）
+// —— 前端只有一句类型注释、无任何 api 函数；旧路径**干净 404**（2 段路径够不着 1 段
+// catch-all）。移除记录见 `lifecycle.rs` 的模块 doc。
+pub use lifecycle::{cancel, force_complete};
 
 // ----- batch.rs -----
 // 2026-10-13 PR1b：`confirm_part_file` 自本域删除（硬切到
 // `POST /api/v2/files/objects/confirm`，**无 alias，旧路径 404**）。
-pub use batch::{batch_create_parts, batch_with_pdfs};
+// 2026-10-13 零消费方端点下线：`batch_with_pdfs`（`POST /api/v2/parts/batch-with-pdfs`）
+// —— 前端 `api/parts/batch.ts` 里那处是**主动弃用注释**、6 个 `export async function`
+// 无一打它。⚠️ 旧路径形态**既不是 404 也不是单纯 400**：POST → **405**（1 段静态
+// 路径落进只注册 GET 的 `/{part_id}`，matchit 先判方法）、GET → **400 纯文本**
+// （方法对上后才轮到 `Path<i64>`）。移除记录见 `batch.rs` 的模块 doc。
+pub use batch::batch_create_parts;

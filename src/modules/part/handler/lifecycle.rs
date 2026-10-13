@@ -1,9 +1,8 @@
 //! part 域 lifecycle / 状态机扩展 handler
 //!
-//! 本文件只服务 part 维度的 2 条写端点 + 1 条批次行 list 端点：
+//! 本文件只服务 part 维度的 2 条写端点：
 //! - `POST /api/v2/parts/{part_id}/cancel`
 //! - `POST /api/v2/parts/{part_id}/force-complete`
-//! - `GET /api/v2/parts/by-work-type/{work_type_id}`
 //!
 //! 以**单个批次**为操作对象的端点不在 part 域：deliver / complete /
 //! place-on-shelf / recall-to-pending / split-batch / cancel-batch /
@@ -18,24 +17,36 @@
 //! - cancel：`require_any_role([Manager, Clerk])` —— 撤销属仓库动作，放开 Clerk
 //! - force-complete：`require_role(Manager)` —— 逃生通道（绕状态机强推），明确
 //!   不下放 Clerk
-//! - list 端点：handler 层不设闸门，角色闸门在 service 层
-//!   （`require_any_role([Manager, Clerk, Inspector, ShelfAccount])`）
 //!
-//! 2026-10-10：报工台的 `pickable-by-work-type` / `by-worker` 两条 list 端点连同
-//! 它们的 handler 迁往 `crate::modules::prod::scan`（新路径
-//! `GET /api/v2/prod/scan/pickable` 与 `GET /api/v2/prod/scan/held`，**无 alias**）。
+//! ## 移除记录（2026-10-13：零消费方端点整条下线）
+//!
+//! - `GET /api/v2/parts/by-work-type/{work_type_id}`（连同它的
+//!   `service/phase1/work_type.rs` 整个文件与 `dto_crud::ByWorkTypeQuery`）
+//!   —— **零消费方**：前端 `src/types/parts.ts` 里只有一句类型注释、**没有任何
+//!   api 函数**，而工种维度的三个页面数据源全是报工台那两条端点
+//!   （`GET /api/v2/prod/scan/pickable` / `held`）。
+//!   ⚠️ **旧路径是干净 404、不是 400**（本域「段数是分水岭」那条规则的 2 段一侧）：
+//!   `by-work-type/{id}` 是**两段**，而 `Path<i64>` catch-all 是 1 段的
+//!   `/{part_id}`，本 router 全部 2 段路由的第二段都是**字面量**（`update` /
+//!   `cancel` / `events` / …），没有 `/{part_id}/{param}` 这种形态 ⇒ 删路由后
+//!   没有任何注册路径能匹配它。⚠️ 相反，1 段静态路径才会落进 `/{part_id}` 被
+//!   `Path<i64>` 拒成 **400 纯文本** —— 同批删除的
+//!   `POST /api/v2/parts/batch-with-pdfs` 正是那一种，两条形态别记混。
+//! - 2026-10-10 早已迁往 `prod::scan` 的 `pickable-by-work-type` / `by-worker`
+//!   （新路径 `GET /api/v2/prod/scan/pickable` 与 `held`，**无 alias**）—— 本轮
+//!   一并在此登记，便于后人查本域 list 族的去向。
 
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use serde_json::json;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::ws_hub::WsEvent;
-use crate::modules::part::dto_crud::{ByWorkTypeQuery, CancelRequest, ForceCompleteRequest};
+use crate::modules::part::dto_crud::{CancelRequest, ForceCompleteRequest};
 use crate::modules::part::service::PartService;
-use crate::modules::part::vo::{PartListOut, PartOut};
+use crate::modules::part::vo::PartOut;
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
@@ -91,19 +102,5 @@ pub async fn force_complete(
         "PART_FORCE_COMPLETED",
         json!({ "part_id": part_id.to_string() }),
     );
-    Ok(Json(R::ok(out)))
-}
-
-/// `GET /api/v2/parts/by-work-type/{work_type_id}`
-///
-/// 2026-09-22 PR5：只读 list 端点改 `pool.acquire()`。
-pub async fn list_by_work_type(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(work_type_id): Path<i64>,
-    Query(query): Query<ByWorkTypeQuery>,
-) -> Result<Json<R<PartListOut>>, AppError> {
-    let mut conn = state.pool.acquire().await?;
-    let out = PartService::list_by_work_type(&mut *conn, work_type_id, &query, &current).await?;
     Ok(Json(R::ok(out)))
 }

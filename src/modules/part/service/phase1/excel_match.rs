@@ -495,6 +495,14 @@ mod tests {
     // ===== 行构造 helper =====
 
     /// 造一行 `TPart`（只填匹配链路读到的列，其余给中性值）。
+    ///
+    /// ⚠️ 2026-10-13：下面两处 `chrono::NaiveDateTime::UNIX_EPOCH` 是 chrono 0.4.45
+    /// 已弃用的 API（推荐 `DateTime::UNIX_EPOCH`）。此前它们被
+    /// `phase1/mod.rs` 的**文件级** `#![allow(deprecated)]` 一并压住 —— 那条 allow
+    /// 原本掩盖 3 处告警，`work_type.rs` 那一处随端点删除后只剩这两处，故按「就地
+    /// 逐点标注」收窄：文件级 allow 已删，改在两行上各自挂 `#[allow(deprecated)]`。
+    /// **不要**把文件级 allow 加回来（那会重新掩盖本模块未来的真实弃用）。
+    #[allow(deprecated)]
     fn sample_part(id: i64, drawing_no: &str, name: &str, assembly_id: Option<i64>) -> TPart {
         TPart {
             id,
@@ -516,8 +524,13 @@ mod tests {
             unit_price: rust_decimal::Decimal::ZERO,
             total_price: rust_decimal::Decimal::ZERO,
             version: 3,
+            // 2026-10-13：逐点 `#[allow(deprecated)]`（见本函数的 doc）——
+            // 这两行是 chrono 0.4.45 已弃用的常量，属**测试造数**、换成
+            // `DateTime::UNIX_EPOCH` 只会让中性值随 chrono 版本漂移。
+            #[allow(deprecated)]
             created_at: chrono::NaiveDateTime::UNIX_EPOCH,
             created_by: Some(1),
+            #[allow(deprecated)]
             updated_at: chrono::NaiveDateTime::UNIX_EPOCH,
             updated_by: Some(1),
             deleted_at: None,

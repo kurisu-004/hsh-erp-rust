@@ -293,43 +293,20 @@ pub struct ForceCompleteRequest {
     #[serde(default)]
     pub note: Option<String>,
 }
-/// `GET /parts/by-work-type/{work_type_id}` 入参（query）。
-///
-/// 2026-10-10：`shelf_id` 字段**删除**。它此前只被报工台的 `pickable` 端点消费，
-/// 而那条端点已迁往 `GET /api/v2/prod/scan/pickable`（新 DTO `prod::scan::dto::PickableQuery`
-/// 同样不带 `shelf_id`，货架范围改由服务端按账号 scope 收窄）。本端点列的是
-/// **工人手上**的件而非架上的候选池，shelf 过滤对它没有语义。
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct ByWorkTypeQuery {
-    #[serde(default)]
-    pub limit: Option<i64>,
-    #[serde(default)]
-    pub offset: Option<i64>,
-}
+// ⚠️ 2026-10-13 随端点删除的两个入参 DTO（防后人重建时又照抄回来）：
+// - `ByWorkTypeQuery` —— `GET /api/v2/parts/by-work-type/{work_type_id}` 的
+//   `limit` / `offset`。该端点**零消费方**（前端只有一句类型注释、无 api 函数；
+//   工种维度的三个页面数据源全是报工台那两条端点）。⚠️ 它曾**刻意不带
+//   `shelf_id`**（本端点列的是「工人手上的件」而非架上的候选池）—— 这条语义随端点
+//   一起消失，不要试图在报工台那两个端点上复活它；报工台的 `shelf_id` 语义见
+//   `prod::scan::dto::PickableQuery`。
+// - `BatchWithPdfsRequest` —— `POST /parts/batch-with-pdfs` 的 multipart `json`
+//   字段。它曾**刻意不收** `unit_price` / `total_price`（金额补齐只做在
+//   `POST /parts` / `POST /parts/batch` 两个真实建单端点上），序列号由 service 按
+//   L1 客户 `serial_prefix` 派发（master 1 个 + 子件 `{master}-{NN}`）—— 派发器
+//   **仍在**（另两个建单端点共用），只是这条调用路径没了。
 
 // ===== 文件 / Excel 工具 =====
-
-/// `POST /parts/batch-with-pdfs` multipart 入参：JSON + PDFs。
-///
-/// 2026-10-05：本 DTO **不收** `unit_price` / `total_price`（该端点无前端调用方，
-/// 金额字段的补齐只做在 `POST /parts` / `POST /parts/batch` 两个真实建单端点上）。
-/// 序列号仍由 service 按 L1 客户 `serial_prefix` 派发（master 1 个 +
-/// 子件 `{master}-{NN}`），与另两个端点同一套派发器。
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct BatchWithPdfsRequest {
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub customer_id: i64,
-    #[serde(default)]
-    pub applicant_name: Option<String>,
-    #[serde(default)]
-    pub request_date: Option<chrono::NaiveDate>,
-    #[serde(default)]
-    pub planned_delivery_date: Option<chrono::NaiveDate>,
-    #[serde(default)]
-    pub is_urgent: Option<bool>,
-    #[serde(default)]
-    pub note: Option<String>,
-}
 
 /// `POST /parts/match-by-excel-items` 入参：采购订单 Excel 明细行 → 候选零件。
 ///

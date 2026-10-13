@@ -97,8 +97,10 @@
 //!
 //! - `POST /api/v2/parts/batch` 的 **bindings 分支**（part 域）：端点本体是
 //!   「批量建零件」，文件只是可选入参，不是一条独立的文件端点。
-//! - `POST /api/v2/parts/batch-with-pdfs` / `POST /api/v2/assemblies` 的
-//!   **multipart PDF**：只喂 `lopdf` 数页数，**不入库不上 COS**。
+//! - `POST /api/v2/assemblies` 的 **multipart PDF**：只喂 `lopdf` 数页数，
+//!   **不入库不上 COS**。（⚠️ 另一处原为 `POST /api/v2/parts/batch-with-pdfs`
+//!   的 multipart PDF **已于 2026-10-13 随该端点整条删除** —— 零消费方，见
+//!   `crate::modules::part::handler::batch` 的模块 doc。）
 //!
 //! 2026-09-28 之前的历史（保留供溯源）：本域最初只是 1 条薄壳鉴权转发端点 ——
 //! `POST /api/v2/files/sts-tmp-keys`。背景是上轮「移除 STS session 设施」完成后，

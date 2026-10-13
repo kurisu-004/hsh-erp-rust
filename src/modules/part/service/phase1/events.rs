@@ -4,25 +4,23 @@
 //! 含以下端点：
 //! - `list_events`（GET /parts/{id}/events）
 //! - `location_tree`（GET /parts/location-tree）
-//! - `batch_with_pdfs`（POST /parts/batch-with-pdfs）
 //! - `batch_update_order_info`（POST /parts/batch-update-order-info）
+//!
+//! ⚠️ 2026-10-13：`batch_with_pdfs`（POST /parts/batch-with-pdfs）随端点整条删除
+//! （零消费方，移除记录见 `crate::modules::part::handler::batch` 的模块 doc）。
 //!
 //! 2026-10-06：`match_by_excel_items`（POST /parts/match-by-excel-items）连同它的
 //! 分档决策纯函数迁到同目录的 `excel_match.rs`（本文件原 548 行里它是唯一一段
 //! 「一次请求 → 一份候选表」的批处理逻辑，与事件/位置树无共同点）。
 
 use crate::auth::rbac::{CurrentUser, Role};
-use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::com::customer::repo::CustomerRepo;
 use crate::modules::iam::shelf::repo::ShelfRepo;
-use crate::modules::part::dto_crud::{BatchUpdateOrderInfoRequest, BatchWithPdfsRequest};
-use crate::modules::part::repo::NewPartCreate;
+use crate::modules::part::dto_crud::BatchUpdateOrderInfoRequest;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::vo::{
     BatchUpdateOrderInfoFailure, BatchUpdateOrderInfoOut, LocationTreeNodeOut, LocationTreeOut,
     PartEventOut,
 };
-use crate::modules::prod::batch::repo::PartBatchRepo;
 use crate::modules::prod::worker::repo::WorkerRepo;
 use crate::shared::error::{AppError, code};
 
@@ -328,158 +326,13 @@ impl PartService {
         }
         Ok(LocationTreeOut { items })
     }
-
-    /// `POST /parts/batch-with-pdfs`：multipart JSON + PDFs。
-    ///
-    /// 2026-10-05：序列号改由 `create_part` INSERT 期写入（此前是 INSERT 后一句
-    /// `UPDATE t_part SET serial_no = $1`），派发器与另两个建单端点共用
-    /// `PartRepoTrait::serial_prefix_for_customer` + `shared::serial::acquire`。
-    /// 行为不变：有 PDF 才派 master 号、子件号仍是 `{master}-{NN}`、PDF 页数为 0
-    /// 时 master 与（无）子件都不派号。`BatchWithPdfsRequest` 无前端调用方。
-    ///
-    /// 2026-10-05 错误码变化：`serial_prefix_for_customer` 改用 `fetch_optional`，
-    /// 此前同一段是两条 `fetch_one`（先折 L1、再取 prefix）。所以「L2 自身未软删、
-    /// L1 父行已软删」从空结果集 `RowNotFound` → `AppError::Database`（**500**）
-    /// 变为 `20102 BIZ_CUSTOMER_NOT_FOUND`（**404**）。该查询只在 PDF 页数 > 0
-    /// 时执行。
-    pub async fn batch_with_pdfs<R: PartRepoTrait>(
-        mut repo: R,
-        snowflake: &SnowflakeIdGenerator,
-        req: &BatchWithPdfsRequest,
-        pdf_files: &[Vec<u8>],
-        current: &CurrentUser,
-    ) -> Result<crate::modules::part::vo::PartDetailOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk])?;
-        if req.customer_id == 0 {
-            return Err(AppError::biz(
-                code::BIZ_CUSTOMER_NOT_FOUND,
-                "customer_id 必填",
-            ));
-        }
-        let _customer = CustomerRepo::get_by_id(repo.conn_mut(), req.customer_id, false)
-            .await?
-            .ok_or_else(|| AppError::biz(code::BIZ_CUSTOMER_NOT_FOUND, "customer 不存在"))?;
-        // 解析 PDF 总页数
-        let mut page_count: i32 = 0;
-        if !pdf_files.is_empty() {
-            for pdf in pdf_files {
-                let doc = lopdf::Document::load_mem(pdf).map_err(|e| {
-                    AppError::biz(code::BIZ_ASSEMBLY_PDF_INVALID, format!("PDF 解析失败: {e}"))
-                })?;
-                page_count += doc.get_pages().len() as i32;
-            }
-        }
-        // 子件数量上限 99（page2..N 共 99 个）
-        let child_count = std::cmp::max(0, page_count - 1);
-        if child_count > 99 {
-            return Err(AppError::biz(
-                code::BIZ_ASSEMBLY_TOO_MANY_CHILDREN,
-                format!("batch-with-pdfs 子件最多 99 个，当前 PDF 页数={page_count}"),
-            ));
-        }
-
-        let today = chrono::Local::now().date_naive();
-        let new_id = snowflake.next_id();
-        let name = format!("装配件-{}", today.format("%Y%m%d"));
-        let drawing_no = format!("ASM-{}", today.format("%Y%m%d"));
-
-        // 若有 PDF → 派 master serial（从 L1 客户 serial_prefix 拿）
-        let master_serial: Option<String> = if page_count > 0 {
-            let ch = repo.serial_prefix_for_customer(req.customer_id).await?;
-            Some(crate::shared::serial::acquire(repo.conn_mut(), ch).await?)
-        } else {
-            None
-        };
-
-        let new = NewPartCreate {
-            id: new_id,
-            name: &name,
-            drawing_no: &drawing_no,
-            applicant_name: req.applicant_name.as_deref().unwrap_or(""),
-            quantity: 1,
-            request_date: req.request_date.unwrap_or(today),
-            planned_delivery_date: req.planned_delivery_date.unwrap_or(today),
-            is_urgent: req.is_urgent.unwrap_or(false),
-            customer_id: req.customer_id,
-            assembly_id: None,
-            order_no: None,
-            system_delivery_date: None,
-            note: req.note.as_deref(),
-            created_by: current.id,
-            serial_no: master_serial.as_deref(),
-            unit_price: None,
-            total_price: None,
-        };
-        repo.create_part(new).await?;
-        // 初始批次
-        let initial_batch_id = snowflake.next_id();
-        PartBatchRepo::create_initial_batch(
-            repo.conn_mut(),
-            crate::modules::prod::batch::repo::NewInitialBatch {
-                id: initial_batch_id,
-                part_id: new_id,
-                quantity: 1,
-                location: None,
-                created_by: Some(current.id),
-            },
-        )
-        .await?;
-
-        // 自动派发子件（page2..N）
-        if child_count > 0 {
-            let master_serial = master_serial
-                .as_deref()
-                .expect("master_serial present when child_count > 0");
-            for i in 1..=child_count {
-                let child_id = snowflake.next_id();
-                let child_serial = format!("{}-{:02}", master_serial, i);
-                let child = NewPartCreate {
-                    id: child_id,
-                    name: &format!("{name}-{:02}", i),
-                    drawing_no: &format!("{drawing_no}-{:02}", i),
-                    applicant_name: req.applicant_name.as_deref().unwrap_or(""),
-                    quantity: 1,
-                    request_date: req.request_date.unwrap_or(today),
-                    planned_delivery_date: req.planned_delivery_date.unwrap_or(today),
-                    is_urgent: req.is_urgent.unwrap_or(false),
-                    customer_id: req.customer_id,
-                    assembly_id: None,
-                    order_no: None,
-                    system_delivery_date: None,
-                    note: req.note.as_deref(),
-                    created_by: current.id,
-                    // 子件号从 master 号派生，不再向 t_serial_counter 派发
-                    serial_no: Some(&child_serial),
-                    unit_price: None,
-                    total_price: None,
-                };
-                repo.create_part(child).await?;
-                // 初始批次
-                PartBatchRepo::create_initial_batch(
-                    repo.conn_mut(),
-                    crate::modules::prod::batch::repo::NewInitialBatch {
-                        id: snowflake.next_id(),
-                        part_id: child_id,
-                        quantity: 1,
-                        location: None,
-                        created_by: Some(current.id),
-                    },
-                )
-                .await?;
-            }
-        }
-
-        // 重读 master
-        let part: crate::modules::part::model::TPart = repo
-            .get_by_id(new_id, false)
-            .await?
-            .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "create 后查不到"))?;
-        Ok(
-            crate::modules::part::vo::PartDetailOut::from_with_customer_extra(
-                part, None, None, None,
-            ),
-        )
-    }
+    // ⚠️ 2026-10-13：`PartService::batch_with_pdfs` 随 `POST /api/v2/parts/batch-with-pdfs`
+    // 端点整条删除（**零消费方**：前端 `api/parts/batch.ts` 里那处是**主动弃用注释**，
+    // 6 个 `export async function` 无一打它）。该端点的入参没有 `items` 数组、
+    // 服务端自己造一个 `装配件-{今天}` 并按 PDF 页数拆子件，承载不了「逐行录入」
+    // —— 前端早已改走 `batchCreateParts` + 后置上传（`POST /api/v2/files/objects`）。
+    // 派发器本身（`PartRepoTrait::serial_prefix_for_customer` + `shared::serial::acquire`）
+    // 与另两个建单端点共用、未受影响；只是本端点这条调用路径没了。
 
     /// `POST /parts/batch-update-order-info`：批量回填 order_no / system_delivery_date / note。
     ///

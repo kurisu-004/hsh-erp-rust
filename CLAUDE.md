@@ -226,7 +226,7 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 >
 > ⚠️ **files 域的两条写路径别再弄丢**（review 第 1 轮 MAJOR-1 回归）：`POST /files/objects` 与 `POST /files/objects/confirm` 都从配置读 `COS_MAX_FILE_SIZE`（`.env.example` = 100MB），0 字节 → 40001、超限 → 21103；两条路径**同时**校验 `owner_kind` × `kind` 配对（`PART` 只收 DRAWING / 3D_MODEL，`ASSEMBLY` 只收 ASSEMBLY_MASTER，否则 20104）。已知例外：`POST /parts/batch` 的 bindings 分支仍写死 300MB（part 域、本 PR 未触碰，登记在 `files/part_file/mod.rs` 的「已知偏差登记」第 5 条）。
 >
-> ⚠️ **刻意留在别的域的两处文件写入**：`POST /api/v2/parts/batch` 的 **bindings 分支**（端点本体是「批量建零件」，文件只是可选入参）；`POST /api/v2/parts/batch-with-pdfs` / `POST /api/v2/assemblies` 的 **multipart PDF**（只喂 `lopdf` 数页数，不入库不上 COS）。
+> ⚠️ **刻意留在别的域的两处文件写入**：`POST /api/v2/parts/batch` 的 **bindings 分支**（端点本体是「批量建零件」，文件只是可选入参）；`POST /api/v2/assemblies` 的 **multipart PDF**（只喂 `lopdf` 数页数，不入库不上 COS）。⚠️ **2026-10-13**：原先并列的 `POST /api/v2/parts/batch-with-pdfs`（multipart PDF 同款）随该端点零消费方清理**整条删除**。
 >
 > ⚠️ `files` 域**不在** `docs/api/` 的整域覆盖清单里（该目录只覆盖部分域，判据见本文件「`docs/api/` 目录约定」一节），契约真源是各级模块 doc；「已知偏差登记」节落在 `src/modules/files/part_file/mod.rs` 的模块 doc 末尾。
 

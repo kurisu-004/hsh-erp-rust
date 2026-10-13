@@ -21,16 +21,19 @@
 //! - rollup_derived.rs     ← **2026-10-13 新增**：`shared::batch::status::rollup_part_derived`
 //!   直调（非 HTTP）的漂移修正 + 幂等 + 序列号归档 + 级联父装配件
 //! - create_serial_price.rs ← 2026-10-05 新增：建单期序列号派发（`POST /parts` /
-//!   `POST /parts/batch` / `POST /parts/batch-with-pdfs`）+ `unit_price` /
-//!   `total_price` 入参落库
+//!   `POST /parts/batch`）+ `unit_price` / `total_price` 入参落库
+//!   （⚠️ **2026-10-13**：`POST /parts/batch-with-pdfs` 零消费方、整条下线，原先在
+//!   本文件里的 2 条「遗留端点回归」用例换成了 1 条硬切守卫）
 //! - purchase_order_import.rs ← 2026-10-06 新增：采购订单 Excel 导入两端点
 //!   （`POST /parts/match-by-excel-items` 分档匹配 + `POST /parts/batch-update-order-info`
 //!   三态回填 / skip）；此前这两条端点零覆盖
 //!
 //! 2026-10-10：报工台两条 list 端点（`GET /parts/pickable-by-work-type/{id}` /
 //! `GET /parts/by-worker/{id}`）随端点迁往 `prod::scan`，其测试文件随之迁往
-//! `tests/production/scan_listing.rs`。留在本 binary 的 `lifecycle.rs` 覆盖
-//! `GET /parts/by-work-type/{id}`（本域唯一剩下的工种维度 list 端点）。
+//! `tests/production/scan_listing.rs`。⚠️ **2026-10-13**：本域最后一条工种维度 list
+//! 端点 `GET /parts/by-work-type/{id}` 也因零消费方整条下线，`lifecycle.rs` 里原
+//! 那 3 条投影用例随之删除、换成 1 条硬切守卫（`by_work_type_endpoint_is_gone_and_
+//! old_paths_are_no_longer_routed`）—— 本 binary 已**无工种维度 list 端点**覆盖。
 
 #![allow(dead_code, clippy::await_holding_lock, unused_imports)]
 

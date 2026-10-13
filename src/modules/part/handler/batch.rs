@@ -4,8 +4,28 @@
 //! - `POST /api/v2/parts/batch` —— 批量创建（共享 `customer_id`）；per-item 失败
 //!   不中断整体；支持 `drawing_file` / `model3d_file` 单 item 文件绑定（场景 A 直传
 //!   COS 链路，2026-09-16 M2-B 新增）。
-//! - `POST /api/v2/parts/batch-with-pdfs` (multipart) —— 多 PDF 自动派生子件
-//!   （page1 = master + page2..N = children），2026-09-14 Phase 3 完整化。
+//!
+//! ## 移除记录（2026-10-13：零消费方端点整条下线）
+//!
+//! - `POST /api/v2/parts/batch-with-pdfs` (multipart) —— **零消费方**：前端
+//!   `src/api/parts/batch.ts` 里那处引用是**主动弃用注释**（原文：「入参没有
+//!   `items` 数组、服务端自己造一个 `装配件-{今天}` 并按页数拆子件，**承载不了
+//!   Tab 2 的逐行录入**。逐行建单一律走 `batchCreateParts` + 后置上传」），同文件
+//!   6 个 `export async function` **无一**打它；`backend-python` 侧只有
+//!   `.env.example` 的一行注释。随端点删除：`dto_crud::BatchWithPdfsRequest` 与
+//!   `service::PartService::batch_with_pdfs`。
+//!   ⚠️ **旧路径的响应形态：POST → `HTTP 405`，GET → `HTTP 400` 纯文本，两者都不是
+//!   404**（实测钉死，守卫用例见 `tests/part/create_serial_price.rs` 的
+//!   `batch_with_pdfs_endpoint_is_gone_and_old_paths_are_no_longer_routed`）：
+//!   `batch-with-pdfs` 是 **1 段**静态路径，路由删除后落进 `/{part_id}` 那条
+//!   catch-all —— 而**那条只注册了 GET** ⇒ matchit 先判路径再判方法，POST 直接
+//!   `Method Not Allowed`；同一路径改用 GET 时方法对上了，才轮到 `Path<i64>` 去解
+//!   `"batch-with-pdfs"` ⇒ `Invalid URL: ...` 400 纯文本（**没有业务信封**）。
+//!   ⚠️ 同仓同款先例：`prod::worker` 的 `POST /verify-badge` 迁往 `prod::scan`
+//!   之后，旧路径 `/prod/workers/verify-badge` 也是 405。⇒ **「1 段静态路径落进
+//!   catch-all」有两种落点，取决于 catch-all 注册了哪些方法**，别当成一条规则。
+//! - 连带失效的 WS 事件 `PART_BATCH_WITH_PDFS_CREATED` **自此无人发送**
+//!   （与 `ROLLUP_RECOMPUTED` 同款死订阅，按产品决定本轮只登记、不动事件定义）。
 //!
 //! 2026-10-13 PR1b：`POST /api/v2/parts/{part_id}/files/confirm` **自本文件删除**，
 //! 硬切为 `POST /api/v2/files/objects/confirm`（**无 alias，旧路径 404**），
@@ -29,14 +49,12 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Multipart, State};
-use serde_json::json;
+use axum::extract::State;
 
 use crate::auth::rbac::CurrentUser;
-use crate::infra::ws_hub::WsEvent;
-use crate::modules::part::dto_crud::{BatchWithPdfsRequest, PartBatchCreateRequest};
+use crate::modules::part::dto_crud::PartBatchCreateRequest;
 use crate::modules::part::service::PartService;
-use crate::modules::part::vo::{PartBatchCreateOut, PartDetailOut};
+use crate::modules::part::vo::PartBatchCreateOut;
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
@@ -145,59 +163,4 @@ pub async fn batch_create_parts(
         Ok((out, _keys)) => Ok(Json(R::ok(out))),
         Err((e, _keys)) => Err(e),
     }
-}
-
-/// `POST /api/v2/parts/batch-with-pdfs` (multipart)
-///
-/// page1 = master part + page2..N = auto-created children parts；
-/// page_count == 1 仅创建 master；page_count == 0 仅创建 master 无 serial。
-pub async fn batch_with_pdfs(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    mut multipart: Multipart,
-) -> Result<Json<R<PartDetailOut>>, AppError> {
-    let mut json_body: Option<BatchWithPdfsRequest> = None;
-    let mut pdf_files: Vec<Vec<u8>> = Vec::new();
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| AppError::validation(format!("multipart 解析失败: {e}")))?
-    {
-        let name = field.name().unwrap_or("").to_string();
-        match name.as_str() {
-            "json" => {
-                let text = field
-                    .text()
-                    .await
-                    .map_err(|e| AppError::validation(format!("json 字段读取失败: {e}")))?;
-                json_body =
-                    Some(serde_json::from_str(&text).map_err(|e| {
-                        AppError::validation(format!("json 字段 JSON 解析失败: {e}"))
-                    })?);
-            }
-            "pdf" | "file" => {
-                let data = field
-                    .bytes()
-                    .await
-                    .map_err(|e| AppError::validation(format!("pdf 字段读取失败: {e}")))?
-                    .to_vec();
-                pdf_files.push(data);
-            }
-            _ => {
-                return Err(AppError::validation(format!(
-                    "multipart 未知字段: '{name}'（仅接受 'json' / 'pdf' / 'file'）"
-                )));
-            }
-        }
-    }
-    let req = json_body.ok_or_else(|| AppError::validation("multipart 缺少 'json' 字段"))?;
-    let mut tx = state.pool.begin().await?;
-    let out = PartService::batch_with_pdfs(&mut *tx, &state.snowflake, &req, &pdf_files, &current)
-        .await?;
-    tx.commit().await?;
-    state.ws_hub.broadcast(WsEvent::DashboardEvent {
-        kind: "PART_BATCH_WITH_PDFS_CREATED".into(),
-        payload: json!({ "part_id": out.part.id.to_string() }),
-    });
-    Ok(Json(R::ok(out)))
 }

@@ -1467,9 +1467,19 @@ NULL**。2026-10-16 之前该形态不可达（`optional_step_id` 越链即抛 `
 `chain_next_process_id` / `chain_next_process_name` / `chain_current_process_name` /
 `has_process_chain` 在**本 VO 内已无填充点**（唯一填它们的端点已迁往本域）。
 
-**字段保留**，理由：`PartListItem` 在 wire 上还有 **3 个域的 4 个端点**在用 ——
-`part`（`GET /parts` + `GET /parts/by-work-type/{id}` 两条 list）、`assembly`
-（`POST /assemblies/{id}/children` 的单条响应）、`com::union_list`（`GET /com/union-list`），
+⚠️ **2026-10-13：简化窗口已打开** —— 这 7 个字段在本域外的**最后一个 part 侧消费方**
+（`GET /api/v2/parts/by-work-type/{id}` 的 `into_list_item` 穷尽字面量，是 part 侧
+唯一还在给它们填「恒占位」的地方）随该端点整条下线。现在这 7 个字段在
+**所有** `PartListItem` 出参里恒为 `null` / `null` / `"NONE"` / `"0"` / `null` /
+`null` / `false`。⚠️ **本轮不删字段**（仍在 wire 上、前端类型仍声明着，删字段是破坏性
+变更），但删字段的最后一个阻挡已经没有了 —— 待前端 `types/parts.ts` 一起收即可。
+⚠️ 本域的 `ScanListItem` 有自己的 `chain_state` 三值，**完全不受影响**。
+
+**字段保留**，理由：`PartListItem` 在 wire 上还有 **3 个域的 3 个端点**在用 ——
+`part`（`GET /parts`，⚠️ **2026-10-13** `GET /parts/by-work-type/{id}` 零消费方、
+已整条下线，见下文「`list_by_work_type` 留在 part 域」一节改写后的登记）、
+`assembly`（`POST /assemblies/{id}/children` 的单条响应）、`com::union_list`
+（`GET /com/union-list`），
 它们的响应形状不能变，删字段是**破坏性 wire 变更**。⚠️ `outsource` 与 `wx` **不在此列**：
 两者只在注释里拿 `PartListItem` 做字段对照，各有自己的 VO（`QuotablePartListOut` /
 `OutsourceSentPartListOut` 等、`wx::vo` 的窄投影），从不返回它 —— 算域数时别把
@@ -1487,14 +1497,19 @@ doc 写明「恒 null / NONE / "0" / false」。它们在那些 part 级行上�
 
 ---
 
-**`list_by_work_type`（`GET /parts/by-work-type/{id}`）留在 part 域**
+**`list_by_work_type`（`GET /parts/by-work-type/{id}`）—— ⚠️ 2026-10-13 整条下线**
 
-它是 part 域 list 族里唯一的「按工种列工人持有件」读端点，**零前端消费方**但有集成
-测试覆盖其 part 侧投影，故未随报工台那两条 list 端点一起迁走。它的取行投影已从共用
-struct 拆成独立的 `WorkTypeByWorkTypeRow`（只含它自己 SELECT 的 8 列），不再与报工台
-的行投影共享代码。
-`?shelf_id=` 入参同步删除（该端点列的是**工人手上**的件而非架上的候选池，shelf
-过滤对它没有语义）。
+它曾在 2026-10-10 留在 part 域（理由：part 域 list 族里唯一的「按工种列工人持有件」
+读端点，**零前端消费方**但有集成测试覆盖其 part 侧投影）。**2026-10-13 复核后删除**：
+前端 `src/types/parts.ts` 里只有一句类型注释、**没有任何 api 函数**，而工种维度的
+三个页面数据源全是本域那两条端点 —— 「零消费方」这一条在 4 个月里没有变化，删掉它
+不需要任何迁移期。随之删除：`service/phase1/work_type.rs` 整个文件
+（含取行投影 `WorkTypeByWorkTypeRow`）与 `dto_crud::ByWorkTypeQuery`。
+**硬切、无 alias**；旧路径 `GET /parts/by-work-type/{id}` 返**干净 404**
+（2 段路径够不着 1 段的 `/{part_id}` catch-all，本 router 全部 2 段路由的第二段
+都是字面量）。⚠️ `GET /parts/by-work-type`（少一个 path 段）则是 **400 纯文本**
+—— 那才是 1 段静态路径落进 `Path<i64>` 的形态。守卫用例：
+`tests/part/lifecycle.rs::by_work_type_endpoint_is_gone_and_old_paths_are_no_longer_routed`。
 
 ---
 
