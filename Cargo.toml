@@ -170,6 +170,24 @@ tokio-cron-scheduler = "0.15"
 #   版本与 tokio-cron-scheduler 的 `chrono-tz = "0.10"` 对齐（cargo 会 unify 成一份）。
 chrono-tz = "0.10"
 
+# 2026-10-16 新增：`scheduled_task` 域邮箱授权码的**可逆**加密（AES-256-GCM），
+#   见 `src/infra/crypto.rs`。
+#
+# ⚠️ **零新 crate**：`ring 0.17.14` 早已在 `Cargo.lock` 里，是 rustls 0.23 的传递依赖
+#   （`rustls` → `ring`，lock 中已存在同版本条目）。这里只是**把传递依赖提为直接依赖**，
+#   版本与 lock 中既有条目完全一致 ⇒ 不下载、不编译第二份、不升级任何已有依赖。
+#   刻意**不用** `aes-gcm`（它不在 lock 里，会引入一个新 crate + 新依赖树），
+#   也**不用** `bcrypt` / `auth::password` 那套（那是单向散列，取不回明文，
+#   而 SMTP 发信必须能还原出授权码）。
+#   默认 feature 含 `alloc`，`ring::aead` 的 `AES_256_GCM` in-place 形态即由它提供。
+ring = "0.17"
+
+# 2026-10-16：`src/infra/crypto.rs` 的密文信封是 `base64(nonce ‖ ct ‖ tag)`，与加密同批
+#   需要在主依赖里可用（此前只声明在 `[dev-dependencies]`，lib 侧拿不到）。
+#   `base64 0.22` 本就已在本仓依赖树里（opendal / jsonwebtoken 的传递依赖，lock 有条目），
+#   且 `[dependencies]` 对 dev 目标同样生效 ⇒ 只是把同一行移到主依赖段，不是新增 crate。
+base64 = "0.22"
+
 # 2026-09-29 CAS key 扁平化迁移 bin：从 src/bin/cos_key_migrate.rs 暴露
 # `cargo run --bin cos-key-migrate -- --dry-run` / `--apply` 入口。
 [[bin]]
@@ -250,6 +268,5 @@ rsa = { version = "0.9", features = ["pem"] }
 
 # 2026-09-23 重构：tests/auth_middleware.rs 的 `protected_endpoint_with_alg_none_returns_40100`
 # 负向用例手工拼 alg=none 的 JWT（header / payload base64url），避免引 `jsonwebtoken`
-# 库（其 0.10 起已禁 alg=none 的 encode，构造不出来）。base64 已是传递依赖
-# （opendal / reqwest 等），但显式声明避免 union features 漂移。
-base64 = "0.22"
+# 库（其 0.10 起已禁 alg=none 的 encode，构造不出来）。base64 已在 2026-10-16 上移到
+# `[dependencies]`（`src/infra/crypto.rs` 的密文信封要用），dev 目标同样能取到，无需在此重复声明。
