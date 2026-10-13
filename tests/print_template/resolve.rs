@@ -1,35 +1,47 @@
 //! 端点 3 / 4：`GET /print-templates/resolve` 与 `GET /{id}/content`
 //!
-//! 覆盖 15 组场景（★ = 核心回归）：
+//! 覆盖 19 组场景（★ = 核心回归）：
 //! 1. ★ `resolve_hit_returns_template_and_customer_name`
-//! 2. ★ `resolve_miss_returns_21109_with_http_422` —— **HTTP 状态码是 422**
+//! 2. ★ `customer_name_is_present_on_upload_list_and_resolve` ——
+//!    **行 VO 的 `customer_name`**（前端 `.strict()` schema 的必填项，
+//!    2026-10-16 review 第 2 轮 C-1：缺它 ⇒ 上传 / 列表 / 自动选用三条路径全废）
+//! 3. ★ `customer_name_is_null_after_customer_soft_deleted` —— `null` 而不是报错
+//! 4. ★ `resolve_miss_returns_21109_with_http_422` —— **HTTP 状态码是 422**
 //!    （2026-10-16 新选，python 转发时代是 400）
-//! 3. ★ `resolve_after_soft_delete_returns_21109`
-//! 4. ★ `resolve_is_available_to_inspector` —— **不是 MANAGER-only**
-//! 5. ★ `resolve_denied_for_shelf_account` —— 权限点矩阵不含 SHELF_ACCOUNT
-//! 6. ★ `content_bytes_are_byte_identical_to_upload` + Content-Type 是 xlsx MIME
-//! 7. ★ `content_of_non_template_file_returns_21101` —— 传一个图纸 id
-//! 8. ★ `clerk_cannot_bypass_via_generic_upload_endpoint` —— CLERK 打
-//!    `POST /files/objects`（通用上传原语）也造不出模板行
-//! 9. ★ `manager_bypass_control_group_really_reaches_the_generic_endpoint` ——
-//!    上一条的**对照组**（换个角色同一 body 就成功 ⇒ 被拒的确实是角色闸门）
-//! 10. ★ `clerk_cannot_bypass_via_generic_confirm_endpoint` —— **第二条写入口**
+//! 5. ★ `resolve_after_soft_delete_returns_21109`
+//! 6. `resolve_without_customer_id_returns_20104`
+//! 7. ★ `resolve_is_available_to_inspector` —— **不是 MANAGER-only**
+//! 8. ★ `resolve_denied_for_shelf_account` —— 权限点矩阵不含 SHELF_ACCOUNT
+//! 9. ★ `content_bytes_are_byte_identical_to_upload` + Content-Type 是 xlsx MIME
+//! 10. ★ `content_of_non_template_file_returns_21101` —— 传一个图纸 id
+//! 11. ★ `clerk_cannot_bypass_via_generic_upload_endpoint` —— CLERK 打
+//!     `POST /files/objects`（通用上传原语）也造不出模板行
+//! 12. ★ `manager_bypass_control_group_really_reaches_the_generic_endpoint` ——
+//!     上一条的**对照组**（换个角色同一 body 就成功 ⇒ 被拒的确实是角色闸门）
+//! 13. ★ `manager_cannot_bind_template_to_l2_customer_via_generic_endpoint` ——
+//!     **同一个通用端点也不许绑二级客户**（review 第 2 轮 MAJOR-A：L1 判据下沉进
+//!     `customer_owner_exists` ⇒ 21105 + 零副作用）
+//! 14. ★ `clerk_cannot_bypass_via_generic_confirm_endpoint` —— **第二条写入口**
 //!     （`POST /files/objects/confirm`）同样被收口
-//! 11. ★ `manager_cannot_write_template_via_confirm_endpoint` —— confirm 端点
+//! 15. ★ `manager_cannot_write_template_via_confirm_endpoint` —— confirm 端点
 //!     **不接受** CUSTOMER（20104）
-//! 12. ★ `clerk_cannot_get_delivery_template_presigned_url` —— 通用 `/url` 端点
+//! 16. ★ `clerk_cannot_get_delivery_template_presigned_url` —— 通用 `/url` 端点
 //!     的 kind 白名单
-//! 13. ★ `shelf_account_list_never_sees_delivery_template_rows` —— 通用列表端点
+//! 17. ★ `shelf_account_list_never_sees_delivery_template_rows` —— 通用列表端点
 //!     永不返回模板行
-//! 14. ★ `shelf_account_cannot_get_delivery_template_bytes` —— 通用 `/content`
+//! 18. ★ `shelf_account_cannot_get_delivery_template_bytes` —— 通用 `/content`
 //!     端点的 kind 白名单
-//! 15. ★ `old_paths_return_404` —— `/api/v2/com/delivery/template/*` 与
+//! 19. ★ `old_paths_return_404` —— `/api/v2/com/delivery/template/*` 与
 //!     `/api/v2/print-template/*`（少个 s）
-//! 16. `resolve_and_static_paths_are_not_swallowed` —— matchit 实测：静态段没被吞
+//! 20. `resolve_and_static_paths_are_not_swallowed` —— matchit 实测：静态段没被吞
+//!
+//! ⚠️ 出参形状（`customer_name`）相关的两条刻意放在**本文件**而不是 `upload.rs` /
+//! `delete.rs`：它们横跨三个端点，而 resolve 那个是「顶层 + 行内**两个**字段」，
+//! 放一起才看得见「刻意重复」这件事。
 
 use axum::http::StatusCode;
 use hsh_erp_test_support::{json_request, send, send_raw};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::{
     Ctx, assert_biz_code, bootstrap, fetch_content, minimal_xlsx_bytes, resolve,
@@ -71,6 +83,93 @@ async fn resolve_hit_returns_template_and_customer_name() {
     assert_eq!(
         env["data"]["customer_name"], "模板测试甲公司",
         "customer_name 靠本域的一条 t_customer 只读聚合：{env}"
+    );
+}
+
+// ===========================================================================
+//  1b. 出参形状：行 VO 的 `customer_name`（2026-10-16 review 第 2 轮 C-1）
+// ===========================================================================
+
+/// ★ **上传 / 列表 / resolve 三个端点的行 VO 都带 `customer_name`** 且命中时等于
+/// 那个一级客户的名。
+///
+/// ⚠️ **这是硬阻断级回归**（review 第 2 轮 C-1）：前端 `printTemplateSchema` 是
+/// `.strict()` 且 `customer_name` **必填** —— 缺这一个键时
+/// - 上传即便后端返 **201** 也恒抛 ZodError（前端看不到成功）；
+/// - 列表每行都抛 ⇒ 页面恒空、「客户」列恒显「（已删除的客户）」；
+/// - 「自动选用模板」那条链路同样拿不到数据。
+/// 也就是**对着真后端本域 100% 不可用**，而当时三条端点的用例全绿。
+///
+/// ⚠️ 三个端点走**三条不同的填充路径**（端点 1 顺带 L1 强制点那条查询、
+/// 端点 2 批量 `id = ANY($1)` 后内存 join、端点 3 与顶层同源），所以三处都要断。
+#[tokio::test]
+async fn customer_name_is_present_on_upload_list_and_resolve() {
+    let ctx = bootstrap().await;
+
+    // ① 端点 1（上传）
+    let bytes = minimal_xlsx_bytes("customer name shape");
+    let (st, env) = upload(&ctx, ctx.l1_id, "带客户名.xlsx", &bytes, &ctx.manager_token).await;
+    assert_eq!(st, StatusCode::CREATED, "{env}");
+    assert_eq!(
+        env["data"]["customer_name"], "模板测试甲公司",
+        "上传出参的行 VO 必须带客户名：{env}"
+    );
+
+    // ② 端点 2（列表）
+    let (st, env) = crate::list(&ctx, "", &ctx.manager_token).await;
+    assert_eq!(st, StatusCode::OK, "{env}");
+    assert_eq!(env["data"]["items"].as_array().unwrap().len(), 1, "{env}");
+    assert_eq!(
+        env["data"]["items"][0]["customer_name"], "模板测试甲公司",
+        "列表每行都必须带客户名：{env}"
+    );
+
+    // ③ 端点 3（resolve）：行内那个 + 顶层那个（刻意重复，两个都得在）
+    let (st, env) = resolve(&ctx, ctx.l1_id, &ctx.manager_token).await;
+    assert_eq!(st, StatusCode::OK, "{env}");
+    assert_eq!(
+        env["data"]["template"]["customer_name"], "模板测试甲公司",
+        "resolve 的行 VO 也必须带客户名：{env}"
+    );
+    assert_eq!(
+        env["data"]["customer_name"], "模板测试甲公司",
+        "resolve 顶层那个保留不动：{env}"
+    );
+}
+
+/// ★ 客户被软删后，`customer_name` 在两个端点都是 **`null`** 而不是报错、也不是
+/// `（已删除的客户）` 之外的任何编造值。
+///
+/// ⚠️ 语义与模板行**解耦**：软删闸门只管 `t_part_file`，模板行还在 ⇒ 模板管理页
+/// 与打印对话框都仍要展示模板，只是名字取不到（`docs/api/print_template.md`
+/// §8.3 第 6 条）。
+#[tokio::test]
+async fn customer_name_is_null_after_customer_soft_deleted() {
+    let ctx = bootstrap().await;
+    seed_template(&ctx, ctx.l1_id).await;
+
+    // 直插 fixture 的客户被别的域软删（本域只读 `t_customer`，不写）
+    sqlx::query("UPDATE t_customer SET deleted_at = now() WHERE id = $1")
+        .bind(ctx.l1_id)
+        .execute(&ctx.pool)
+        .await
+        .expect("soft delete customer");
+
+    let (st, env) = resolve(&ctx, ctx.l1_id, &ctx.manager_token).await;
+    assert_eq!(st, StatusCode::OK, "客户软删不应让模板打不开：{env}");
+    assert_eq!(env["data"]["customer_name"], Value::Null, "{env}");
+    assert_eq!(
+        env["data"]["template"]["customer_name"],
+        Value::Null,
+        "行 VO 那个同样退化成 null（两个字段刻意同源）：{env}"
+    );
+
+    let (st, env) = crate::list(&ctx, "", &ctx.manager_token).await;
+    assert_eq!(st, StatusCode::OK, "{env}");
+    assert_eq!(
+        env["data"]["items"][0]["customer_name"],
+        Value::Null,
+        "列表同理：{env}"
     );
 }
 
@@ -347,6 +446,70 @@ async fn manager_bypass_control_group_really_reaches_the_generic_endpoint() {
             .len(),
         1,
         "对照组必须真的落库 —— 否则上面那条 403 用例是恒真绿"
+    );
+}
+
+/// ★ **Manager 也绑不了二级客户**：`POST /files/objects` 带 `owner_id=<L2>` ⇒
+/// **21105**（HTTP 404），且零副作用（库里无行 + 桶里无对象）。
+///
+/// ⚠️ 这是 **2026-10-16 review 第 2 轮 MAJOR-A**：上一轮给 confirm 加「拒 CUSTOMER」
+/// 的理由逐字是「该端点没有『只绑一级客户』的强制点，放行等于给 Manager 一条绕过
+/// L1-only 的路」—— 而**同一句理由逐字适用于 `POST /files/objects`**。上一轮刻意
+/// 留着它开、并用上面那条对照组（真 L1 ⇒ 201）钉住「这条路对 Manager 是通的」，
+/// 于是第 1 轮 MAJOR-1 里「含二级客户的模板可绕」这后半句只在两条入口之一上闭合。
+/// 现 L1 判据下沉进共用原语 `PartFileRepo::customer_owner_exists`
+/// （谓词加 `AND parent_id IS NULL`），错误码沿用同族 21105。
+///
+/// 绑定这条时**注意与上一条对照着读**：owner 只换了「L1 → L2」，
+/// 角色、路径、body 形状逐字相同 ⇒ 两条合起来才是完整的判据网（角色过了、L1
+/// 这道没过）。
+#[tokio::test]
+async fn manager_cannot_bind_template_to_l2_customer_via_generic_endpoint() {
+    use crate::{multipart_request_to, send_multipart};
+    let ctx = bootstrap().await;
+    let bytes = minimal_xlsx_bytes("bind to l2");
+
+    let data = format!(
+        r#"{{"owner_kind":"CUSTOMER","owner_id":"{}","kind":"DELIVERY_TEMPLATE"}}"#,
+        ctx.l2_id
+    );
+    let (status, env) = send_multipart(
+        &ctx,
+        multipart_request_to(
+            "/files/objects",
+            Some(&data),
+            Some((
+                "file",
+                "绑二级.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                &bytes,
+            )),
+            Some(&ctx.manager_token),
+        ),
+    )
+    .await;
+
+    // 21105 = BIZ_PART_FILE_OWNER_NOT_FOUND，`status_from_code` 映射成 404
+    assert_biz_code(status, &env, 21105, StatusCode::NOT_FOUND);
+
+    // 零副作用 ①：L2 名下没有模板行（否则就是 review 第 2 轮修的那个孤儿配置行）
+    assert!(
+        rows_for_owner_kind(&ctx.pool, ctx.l2_id, "DELIVERY_TEMPLATE")
+            .await
+            .is_empty(),
+        "绑二级被拒 ⇒ L2 名下不得有任何行：{env}"
+    );
+    // 零副作用 ②：桶里也没有对象 —— owner 存在性复核排在 `cos.put_object` **之前**
+    assert!(
+        ctx.cos.get_responses.lock().unwrap().is_empty(),
+        "被拒的请求不得已往 COS 写过字节"
+    );
+    // 零副作用 ③：其父 L1 名下也没有被动过（本次请求不该软删任何东西）
+    assert!(
+        rows_for_owner_kind(&ctx.pool, ctx.l1_id, "DELIVERY_TEMPLATE")
+            .await
+            .is_empty(),
+        "绑 L2 的请求不该碰到父 L1 的行：{env}"
     );
 }
 

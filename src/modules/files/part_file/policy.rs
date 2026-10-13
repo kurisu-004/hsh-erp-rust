@@ -132,15 +132,47 @@ pub const CONFIRM_ROLES: &[Role] = &[Role::Manager, Role::Clerk];
 /// [`write_roles_for`]）。
 pub const CUSTOMER_WRITE_ROLES: &[Role] = &[Role::Manager];
 
+/// `t_part_file` 的**哪一条**写入口（2026-10-16 review 第 2 轮 MINOR-B）。
+///
+/// ## 为什么不能直接传 `&[Role]` 当「默认集合」
+///
+/// [`write_roles_for`] 的原签名是 `write_roles_for(owner_kind, default_roles)`——
+/// 「默认集合」是个**位置参数**。那意味着：把 `bind_uploaded_file` 里的
+/// `CONFIRM_ROLES` 抄成 `UPLOAD_ROLES`（同文件、同类型、clippy 不报、lib 单测
+/// 仍全绿）就会**静默把 confirm 的 CNC 面放开** —— 恰好是上一轮 commit message
+/// 里声明「刻意不做」的那件事。lib 单测 `write_roles_for_narrows_customer_only`
+/// 钉的是**函数本身**的行为，**钉不到调用点传了哪个常量**。
+///
+/// ⇒ 改成入口枚举后，**调用方不再传集合、只传「我是哪条入口」**，常量由函数内部
+/// 选：传错常量这件事在类型层面就不存在了。代价是新增一条写入口时要在这里加一个
+/// 变体（那本来就该是一件显眼的事 —— 新入口必须显式决定它的角色面）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteEntry {
+    /// `POST /files/objects`（multipart 上传）—— 默认集合 [`UPLOAD_ROLES`]。
+    Upload,
+    /// `POST /files/objects/confirm`（STS 直传回执）—— 默认集合 [`CONFIRM_ROLES`]。
+    Confirm,
+}
+
+impl WriteEntry {
+    /// 本入口对**非 CUSTOMER** owner 的角色集合。
+    fn default_roles(self) -> &'static [Role] {
+        match self {
+            WriteEntry::Upload => UPLOAD_ROLES,
+            WriteEntry::Confirm => CONFIRM_ROLES,
+        }
+    }
+}
+
 /// 把「这条写入口对非 CUSTOMER owner 的角色集合」按 `owner_kind` 收窄。
 ///
-/// ## 为什么是「带默认集合的分派函数」而不是一张固定的表
+/// ## 为什么是「按入口分派」而不是一张固定的表
 ///
 /// `t_part_file` 有**两条**写入口，而它们对 `PART` / `ASSEMBLY` 的历史角色集合
 /// **本来就不同**（[`UPLOAD_ROLES`] = M+C+CNC 的并集；[`CONFIRM_ROLES`] = M+C）。
 /// 抽成一张固定表会顺手把 confirm 放宽成含 CNC —— 那是一次**权限面放开**，
 /// 与本轮要修的越权方向相反。所以本函数只承载**真正需要跨入口共享**的那一段
-/// （`CUSTOMER` ⇒ 仅 Manager），其余 owner_kind 逐字返回调用方自己的既有集合。
+/// （`CUSTOMER` ⇒ 仅 Manager），其余 owner_kind 逐字返回**该入口自己的**既有集合。
 ///
 /// ## 调用方（两处，缺一不可）
 /// - `service::upload_file_for_owner`（`POST /files/objects` 的角色闸门）
@@ -150,12 +182,16 @@ pub const CUSTOMER_WRITE_ROLES: &[Role] = &[Role::Manager];
 /// 只在 `upload_file_for_owner` 里加了 CUSTOMER 分支，**漏了 confirm 那条**，
 /// 于是 CLERK 打 `POST /files/objects/confirm` 仍能造出（并替换掉）任意客户的
 /// 打印模板行。共用本函数就是防「下次新增 owner_kind 又只改一条入口」。
-pub fn write_roles_for<'a>(owner_kind: &str, default_roles: &'a [Role]) -> &'a [Role] {
+///
+/// ⚠️ 2026-10-16 review 第 2 轮 MINOR-B：形参由 `default_roles: &[Role]`
+/// 改成 [`WriteEntry`]，**调用点不再传常量**（原形态下「传错常量」是静默的权限面
+/// 放开，见 `WriteEntry` 的 doc）。
+pub fn write_roles_for(owner_kind: &str, entry: WriteEntry) -> &'static [Role] {
     match owner_kind {
         "CUSTOMER" => CUSTOMER_WRITE_ROLES,
-        // 未知 owner_kind 由调用方后续的配对守卫报 20104，这里逐字沿用其默认集合
-        // （与本轮之前 `upload_file_for_owner` 的 `_ =>` 臂行为一致）。
-        _ => default_roles,
+        // 未知 owner_kind 由调用方后续的配对守卫报 20104，这里逐字沿用该**入口**
+        // 自己的默认集合（与本轮之前 `upload_file_for_owner` 的 `_ =>` 臂行为一致）。
+        _ => entry.default_roles(),
     }
 }
 
@@ -379,25 +415,35 @@ mod tests {
     ///
     /// 钉的是三件事：① CUSTOMER 恒收窄成仅 Manager；② 两条入口各自的默认集合
     /// 逐字不变（`UPLOAD_ROLES` 含 CNC、`CONFIRM_ROLES` 不含）；③ 未知 owner_kind
-    /// 走默认集合（随后由配对守卫报 20104，与本轮之前行为一致）。
+    /// 走**该入口**自己的默认集合（随后由配对守卫报 20104，与本轮之前行为一致）。
+    ///
+    /// ⚠️ 2026-10-16 review 第 2 轮 MINOR-B：形参已从 `&[Role]` 换成
+    /// [`WriteEntry`]，所以这个用例**传不出一份错误的集合** —— 它验证的是
+    /// 「入口 → 集合」那张映射，而调用点传错常量这件事已由类型消除。
     #[test]
     fn write_roles_for_narrows_customer_only() {
         // CUSTOMER ⇒ 仅 Manager（两条入口都是）
         assert_eq!(
-            write_roles_for("CUSTOMER", UPLOAD_ROLES),
+            write_roles_for("CUSTOMER", WriteEntry::Upload),
             CUSTOMER_WRITE_ROLES
         );
         assert_eq!(
-            write_roles_for("CUSTOMER", CONFIRM_ROLES),
+            write_roles_for("CUSTOMER", WriteEntry::Confirm),
             CUSTOMER_WRITE_ROLES
         );
         assert!(!CUSTOMER_WRITE_ROLES.contains(&Role::Clerk));
         assert!(!CUSTOMER_WRITE_ROLES.contains(&Role::CncProgrammer));
 
-        // PART / ASSEMBLY / 未知 owner_kind ⇒ 逐字返回调用方自己的集合
-        assert_eq!(write_roles_for("PART", UPLOAD_ROLES), UPLOAD_ROLES);
-        assert_eq!(write_roles_for("ASSEMBLY", CONFIRM_ROLES), CONFIRM_ROLES);
-        assert_eq!(write_roles_for("WHATEVER", UPLOAD_ROLES), UPLOAD_ROLES);
+        // PART / ASSEMBLY / 未知 owner_kind ⇒ 逐字返回**该入口**自己的集合
+        assert_eq!(write_roles_for("PART", WriteEntry::Upload), UPLOAD_ROLES);
+        assert_eq!(
+            write_roles_for("ASSEMBLY", WriteEntry::Confirm),
+            CONFIRM_ROLES
+        );
+        assert_eq!(
+            write_roles_for("WHATEVER", WriteEntry::Upload),
+            UPLOAD_ROLES
+        );
 
         // ⚠️ 两条入口的默认集合**刻意不同**：confirm 历史上没给过 CNC，
         // 抽成一张固定表会顺带放开它 —— 这条断言防「顺手合并」。

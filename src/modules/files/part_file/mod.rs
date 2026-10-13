@@ -135,23 +135,30 @@
 //! `part_id` 列装的是**一级客户的 `t_customer.id`**，「该 L1 名下存在一行未软删的
 //! `DELIVERY_TEMPLATE`」本身就是绑定关系。承载域是新建的 `print_template` 域
 //! （`src/modules/print_template/`，URL `/api/v2/print-templates`，5 端点），
-//! 完整契约见 `docs/api/print_template.md`。本域只出**八处**能力：
+//! 完整契约见 `docs/api/print_template.md`。本域只出**九处**能力：
 //! ① `kind` 白名单 / 扩展名 / file_type / content_type 四张表加了 `DELIVERY_TEMPLATE`；
-//! ② `owner_kind='CUSTOMER'` 的存在性闸门（`repo::customer_owner_exists`）；
+//! ② `owner_kind='CUSTOMER'` 的闸门（`repo::customer_owner_exists`，⚠️ **含
+//!    `parent_id IS NULL`** —— 只绑一级客户，2026-10-16 review 第 2 轮 MAJOR-A 补）；
 //! ③ `owner_kind × kind` 配对表加 `CUSTOMER => DELIVERY_TEMPLATE`；
-//! ④ 两条**写**入口的角色分派共用 `policy::write_roles_for`，且 confirm 直接拒
+//! ④ 两条**写**入口的角色分派共用 `policy::write_roles_for`（形参是
+//!    `WriteEntry` 入口枚举，**不是**可传错的常量集合），且 confirm 直接拒
 //!    `owner_kind='CUSTOMER'`；
 //! ⑤ 两条**取字节**端点（`content` / `url`）共用 `policy::is_file_content_kind`；
 //! ⑥ 通用列表端点 `exclude_kind` 掉 `DELIVERY_TEMPLATE`；
 //! ⑦ 软删分派表加 `DELIVERY_TEMPLATE => [Manager]`；
-//! ⑧ `upload_file_for_owner` 的 CUSTOMER 臂（④ 的其中一半）。
+//! ⑧ `upload_file_for_owner` 的 CUSTOMER 臂（④ 的其中一半）；
+//! ⑨ 取字节的**唯一** service 入口 `get_file_content_of_checked_row`（⚠️ 不判 kind，
+//!    判据归调用方；review 第 2 轮 MINOR-A 把那个「有角色闸门、无 kind 闸门」的
+//!    `get_file_content` **整条删除**了，见下）。
 //! 逐条理由见下面的收紧表与已知偏差登记表。
 //!
-//! ### ⚠️ **五处**刻意收紧（新增第三种 owner 带来的；2026-10-16 review 第 1 轮补齐）
+//! ### ⚠️ **六处**刻意收紧（新增第三种 owner 带来的；2026-10-16 review 第 1 轮补齐、
+//! 第 2 轮再加一处 L1 判据）
 //!
 //! | 收紧点 | 位置 | 为什么 |
 //! |---|---|---|
 //! | 上传端点的角色面按 `owner_kind` 分派 | `policy::write_roles_for` + `service::upload_file_for_owner` | `CUSTOMER` 只放 **Manager**。⚠️ `owner_kind` / `kind` 都由 client 在 multipart `data` 里给，只在 `print_template` 域的 handler 上守 MANAGER 的话，CLERK 直接打 `POST /files/objects` 就能绕过模板管理页乱换别人的打印模板。`PART` / `ASSEMBLY` 的集合**逐字不变** |
+//! | **两条写入口都收 CUSTOMER 的「只绑一级客户」** | `repo::customer_owner_exists` 的 `AND parent_id IS NULL`（review 第 2 轮 MAJOR-A 补） | ⚠️ 第 1 轮给 confirm 加「直接拒 CUSTOMER」的理由逐字是「该端点没有 L1 强制点，放行等于给 Manager 一条绕过 L1-only 的路」—— **同一句理由逐字适用于 `POST /files/objects`**，而首版在那边只收了角色、没收 L1 ⇒ Manager 能造出绑在二级客户上的孤儿模板行（详见已知偏差第 15 条的三条后果）。修法不是「再拒一次 CUSTOMER」（那会让 `POST /files/objects` 彻底不能写 CUSTOMER、破坏 `print_template` 域的复用路径），而是**把 L1 判据下沉进两道闸门共用的原语** |
 //! | **confirm 端点（第二条写入口）同样分派 + 直接拒 CUSTOMER** | `policy::write_roles_for` + `service::bind_uploaded_file` | ⚠️ **2026-10-16 review 第 1 轮 MAJOR-1 补的漏**：首版只给 `upload_file_for_owner` 加了 CUSTOMER 分支，而 confirm 的角色闸门恒是 `M + C`、与 `owner_kind` 无关 ⇒ CLERK 打 `POST /files/objects/confirm` 能造出并替换掉任意客户的模板行。现两条入口**共用同一张分派表**（`policy::write_roles_for`，防「下次新增 owner_kind 又只改一条」），且 confirm 额外**拒 `owner_kind='CUSTOMER'`**（20104）—— 它没有本域那条「只绑一级客户」的强制点，放行就等于给 Manager 一条绕过 L1-only 的路，而它零个合法 CUSTOMER 调用方 |
 //! | 软删分派表加 `DELIVERY_TEMPLATE => [Manager]` | `service::soft_delete_file` | 不加就是「写得进、删不掉」，与 2026-10-13 review 第 1 轮 MINOR-6 修的 `ASSEMBLY_MASTER` 同款坑 |
 //! | **两条取字节端点共用** kind 白名单 | `policy::is_file_content_kind`（`content` + `/url` 都调） | `content` 端点**放 `SHELF_ACCOUNT`**（工控机预览图纸）且原先不校验 kind ⇒ 工控机账号能按 id 取到**任意客户的送货单打印模板**字节。⚠️ **2026-10-16 review 第 1 轮 MAJOR-2 补的漏**：首版只给 `content` 加了白名单，而 `/url` 的守卫是权限点 `part.drawing.print`（默认矩阵 M / C / I / CNC）、回的是**1 小时 COS 预签直链** ⇒ CLERK / INSPECTOR / CNC 完全绕得过去。守卫取白名单而非「排除 DELIVERY_TEMPLATE」，新增 kind 时忘了加 = 拒绝（fail-safe） |
@@ -229,8 +236,8 @@
 //! `get_file_with_url` 回的是 **COS 预签直链**（`presigned_get_url`，
 //! `url_expires_in_seconds = 3600`）：链接一旦到手就能**脱离本后端**直接 GET，
 //! 也能整条外发给任何人 ⇒ 它等价于「把这 1 小时的 COS 读权限发出去」，而 RBAC
-//! 在签发之后就不再参与。`get_file_content` 不同：字节流由本后端代理，每次访问都
-//! 重新过一次 RBAC。工控机预览需要的是「看得到图纸字节」，content 已足够 ⇒ 放开
+//! 在签发之后就不再参与。`GET /objects/{id}/content` 不同：字节流由本后端代理，
+//! 每次访问都重新过一次 RBAC。工控机预览需要的是「看得到图纸字节」，content 已足够 ⇒ 放开
 //! content 即达成目标，`/url` 无需、也不应一并放开。
 //!
 //! ### ⚠️⚠️ 为什么 `/preview` **反而**放开 SHELF（对上一节的**有意反转**，2026-10-13 PR2）
@@ -291,7 +298,8 @@
 //! | 12 | **通用列表端点曾会列出模板行**（review 第 1 轮 MAJOR-3）：`PartFileListQuery.kind` 缺省时无 kind 谓词，端点角色集合含 `SHELF_ACCOUNT` ⇒ 工控机账号可列出全部客户的模板元数据（越权读链的「发现」环节）。⚠️ 该事实**本轮之前**也成立，只是那时表里还没有第三种 owner | **已闭合**（`service::list_files` 无条件传 `exclude_kind = Some("DELIVERY_TEMPLATE")`，rows 与 total 两条 SQL 同步；集成测试 `shelf_account_list_never_sees_delivery_template_rows`） |
 //! | 13 | **`GET /files/objects/{id}/url` 曾无 kind 守卫**（review 第 1 轮 MAJOR-2）：守卫是权限点 `part.drawing.print`（默认矩阵 M/C/I/CNC）、回 1 小时 COS 预签直链 ⇒ CLERK / INSPECTOR / CNC 拿任意客户模板的字节，与 `content` 侧那道守卫形同虚设 | **已闭合**（`policy::is_file_content_kind` 上提，两条取字节端点共用；集成测试 `clerk_cannot_get_delivery_template_presigned_url` 带**对照组**—— 同一 token 打图纸行仍 200，证明判的是 kind） |
 //! | 14 | **`files` 域的 kind 白名单与 `print_template` 域的 kind 校验是**两份**、错误码不同**：本域「白名单外的 kind」⇒ **21102**（HTTP 400，端点不服务这种类型）；模板域「不是 `DELIVERY_TEMPLATE`」⇒ **21101**（HTTP 404，这行在别的端点眼里不存在） | **有意保留 + 已登记**。两者面向的前端动作不同：21102 让前端提示「换个入口」，21101 让它刷新列表。别为了「统一」把任一侧改成另一侧的码 |
-//! | 15 | **模板相关的 5 处收口全在本域，但 `print_template` 域「只绑一级客户」的业务不变式不在**（`customer_is_l1` 只在那个域）⇒ 本域的 `assert_owner_exists` CUSTOMER 臂**只判存在**、不判 `parent_id IS NULL` | **有意保留 + 已登记**（files 域刻意不知道「客户分两级」这个别的域的业务概念）。缓解：唯一能经 `owner_kind='CUSTOMER'` 写行的入口是两条写路径，都已收口到仅 Manager，且 confirm 直接拒 CUSTOMER（见第 11 条）⇒ 剩下的可达调用方只有 `print_template` 域自己，而它先跑 L1 强制点 |
+//! | 15 | **`POST /files/objects` 曾能把模板绑到**二级客户**上**（review 第 2 轮 MAJOR-A）：`assert_owner_exists` 的 CUSTOMER 臂只判存在、不判 `parent_id IS NULL`，而该端点的 `owner_kind` / `owner_id` 全由 client 给 ⇒ Manager 能造出一行绑在 L2 上的模板行。后果三条：① 破坏「只绑一级客户」不变式；② `uk_t_part_file_single` 是 `(part_id, kind)`、L1 行与 L2 行互不冲突 ⇒「一个 L1 至多一份活跃模板」被绕过，且给 L1 重传时 `soft_delete_active_by_part_kind(l1_id)` 清不掉 L2 那行；③ 该行 `resolve` 永远读不到 ⇒ **永不消费、永不清理**的孤儿配置行 | **已闭合**（L1 判据下沉进 `repo::customer_owner_exists`，谓词加 `AND parent_id IS NULL`，错误码沿用 21105。集成测试 `manager_cannot_bind_template_to_l2_customer_via_generic_endpoint` 从外部钉住，并断言**零副作用**：库里无行 + 桶里无对象 + 父 L1 未被碰） |
+//! | 16 | **L1-only 的判据有**两道**、错误码不同**：本域兜底（`customer_owner_exists` → **21105** / HTTP 404）与 `print_template::service::l1_customer_name`（该域自己的前置强制点 → **20104** / HTTP 400） | **有意保留 + 已登记**。本域那道排在 `upload_file_for_owner` 内部、早于 COS PUT，管的是「有人绕过那个域的 handler 直调共用上传原语」；那域那道在 service 入口、零外部 IO，是 5 条端点的正常路径。**两道缺任一条都不成立** —— 别因为「files 域不该知道客户分两级」删掉本域那道（本域判的是 `parent_id IS NULL` 这个**列取值**，与它判 `t_part.assembly_id IS NULL` 同形） |
 pub mod cnc;
 pub mod dto;
 pub mod handler;

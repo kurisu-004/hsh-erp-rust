@@ -141,6 +141,13 @@ use crate::state::AppState;
 /// 旧 `upload-drawing` / `upload-3d-model` 是 M+C（`CRUD_PART_ROLES`）、旧
 /// `assemblies/{id}/files` 是 M+C、旧 multipart 端点是 M+C+CNC，故白名单含 CNC。
 ///
+/// ⚠️ **`owner_kind='CUSTOMER'`（送货单打印模板）是两条额外闸门，不在「3 角色」里**
+/// （2026-10-16 review 第 1 / 2 轮）：角色收窄成**仅 Manager**
+/// （`policy::write_roles_for`）+ `owner_id` 必须是**一级客户**
+/// （`parent_id IS NULL`，review 第 2 轮 MAJOR-A 把该谓词下沉进
+/// `repo::customer_owner_exists`）。两条闸门都排在读 multipart 之后的
+/// service 入口、且**早于任何 COS / DB 副作用** ⇒ 未授权 / 不合格的请求零副作用。
+///
 /// ⚠️ **权限面到底放大了什么**（2026-10-13 review 第 1 轮存疑点 4 订正，别再笼统
 /// 写成「CNC 现在也能传图纸 / 3D 模型」——那句话不准确）：
 /// - **DRAWING / 3D_MODEL：没有放大**。CNC 在 PR1b 之前就已经能传这两类（旧
@@ -164,7 +171,7 @@ use crate::state::AppState;
 /// |---|---|---|
 /// | 40300 | 角色不在 M / C / CNC 内 | handler（读 multipart 前）+ service 双层 |
 /// | 20104 | `data` / `file` / filename 缺失、`data` JSON 解析失败、`owner_id` 非数字、`owner_kind` × `kind` 组合非法 | handler（前三项）+ service（末项） |
-/// | 21105 | owner 不存在（`owner_kind ∈ {PART, ASSEMBLY}` 但 id 查不到） | service `assert_owner_exists` |
+/// | 21105 | owner 不存在：`owner_kind ∈ {PART, ASSEMBLY}` 时 id 查不到；`owner_kind='CUSTOMER'` 时 id 查不到 / 已软删 / **不是一级客户**（`parent_id IS NULL`，2026-10-16 review 第 2 轮 MAJOR-A 补的谓词） | service `assert_owner_exists` |
 /// | 40001 | **0 字节文件** | service（2026-10-13 review 第 1 轮 MAJOR-1 补回，被删的 `upload_part_file` 有这道） |
 /// | 21103 | **超过 `config.cos.max_file_size`**（`COS_MAX_FILE_SIZE`，`.env.example` = 100MB） | service（同上补回；HTTP 400 —— `status_from_code` 对 2xxxx 的兜底） |
 /// | 21102 | 无扩展名 / 扩展名不在 `policy::allowed_exts(kind)` / content_type 与扩展名不匹配 | service |
@@ -370,7 +377,7 @@ pub async fn get_part_file_url(
 /// `GET /api/v2/files/objects/{file_id}/content` —— 后端代理文件二进制流。
 ///
 /// 拉 `t_part_file.object_key` + COS `get_object`，透传 `content_type` 头。
-/// 权限：`PartFileService::get_file_content` 的 5 角色（Manager / Clerk / Inspector /
+/// 权限：`PartFileService::get_file_content_of_checked_row` 的 5 角色（Manager / Clerk / Inspector /
 /// CncProgrammer / **ShelfAccount**，2026-10-10 新增 ShelfAccount 供报工台工控机预览图纸）。
 ///
 /// ⚠️ 与 `get_part_file_url` **角色集合相同但风险面不同**，`/url` 刻意不含 ShelfAccount：

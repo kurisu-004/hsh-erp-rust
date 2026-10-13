@@ -58,11 +58,18 @@
 //! 数与顺序是**按客户**的：L2 与其父 L1 往往是同一套抬头，绑到 L2 会立刻出现
 //! 「同一个客户名下两个 L2 模板打架」。
 //!
-//! ⚠️ **L1-only 是本域的强制点，错误码 20104**（绑二级 / 客户不存在 / 已软删
-//! 三种情形都返它，因为写侧**刻意不区分**这三者 —— 前端拿到的都是「你选的这个
-//! 客户 id 不能绑模板」，回显原 id 让它自己选，而不是让前端去猜是「不存在」还是
-//! 「不是一级」）。存在性本身另由 `PartFileService::assert_owner_exists` 的
-//! `CUSTOMER` 臂复核（21105），正常流程里永远先被 20104 拦下，那道是**兜底**。
+//! ⚠️ **L1-only 有**两道**强制点、错误码不同**：
+//! - 本域这一侧是 `service::l1_customer_name`（前置、零外部 IO）⇒ **20104**，
+//!   把「不存在 / 已软删 / 不是一级」三种情形**刻意不区分**（前端拿到的都是
+//!   「你选的这个客户 id 不能绑模板」，回显原 id 让它自己选，而不是让前端去猜是
+//!   「不存在」还是「不是一级」）；
+//! - `files` 域那侧是 `PartFileRepoTrait::customer_owner_exists` ⇒ **21105**
+//!   （HTTP 404），**2026-10-16 review 第 2 轮 MAJOR-A 把 `parent_id IS NULL`
+//!   下沉进了它**：管的是「有人绕过本域 handler、直调共用上传原语
+//!   `upload_file_for_owner`」那条路径（如 `POST /files/objects`，其
+//!   `owner_kind` / `owner_id` 全由 client 给）。
+//!
+//! ⇒ **两道都要留**，缺任一条都不成立。正常路径永远先被本域这一侧拦下。
 //!
 //! ## 守卫：两条读端点**绝不能** MANAGER-only
 //!
@@ -81,12 +88,15 @@
 //! `get_file_content_for_row` / `soft_delete_file` / `list_with_filters`），
 //! 这是设计（复用 `t_part_file`，见上表）而不是越界。
 //! 硬装这道护栏只会逼出「把 files 域的写法复制一份到本域」这种更糟的结果。
-//! 本域对 `t_customer` 的两处读（`parent_id IS NULL` 强制点、`resolve` 的客户名）
-//! SQL 写在本域 service 里，属既定的「只读跨域聚合」pattern（`dashboard` /
-//! `statistics` / `prod::inspection` 同款），**不 import** `com::customer` 任何符号。
+//! 本域对 `t_customer` 的三处读（`parent_id IS NULL` 强制点**顺带取名**、`resolve`
+//! 的客户名、列表的批量客户名）SQL 都写在本域 service 里，属既定的「只读跨域
+//! 聚合」pattern（`dashboard` / `statistics` / `prod::inspection` 同款），
+//! **不 import** `com::customer` 任何符号。⚠️ 列表那处**必须**是一条
+//! `id = ANY($1)`（不许逐行查）：见 `service.rs` 模块 doc 的「取数恒 ≤ 3 条语句」
+//! 一节与文件末尾的 `mod query_guard` 源码级护栏。
 //!
-//! ⚠️ **端点 4 取字节走的是 files 域最底层的 `get_file_content_for_row`**
-//! （**不判权限、不判 kind、不查库**）而不是 `get_file_content`：权限点
+//! ⚠️ 端点 4 取字节走的是 files 域最底层的 `get_file_content_for_row`
+//! （**不判权限、不判 kind、不查库**）而不是 `get_file_content_of_checked_row`：权限点
 //! `delivery_note.print` 由本域 handler 判（本域刻意不套 files 域那张 5 角色表
 //! —— 一个只持该权限点、不在表内的账号不该被二次拒绝），kind 校验在本域 service
 //! 里比 `row.kind`（错误码 **21101**，files 域的白名单侧是 **21102**，刻意不同）。
@@ -98,8 +108,8 @@
 //! - `t_part_file` 的读写走 `files::part_file` 的既有 `PartFileRepoTrait`
 //!   （`get_by_part_kind` / `soft_delete_active_by_part_kind` / `get_by_id` /
 //!   `soft_delete_file` / `list_with_filters` 都是既有方法，逐字复用）；
-//! - `t_customer` 的两处只读查询直接写在 `service.rs`（运行时 `sqlx::query_scalar`，
-//!   **不进 `query!` 宏**、不需要 `.sqlx/` 缓存）。
+//! - `t_customer` 的三处只读查询直接写在 `service.rs`（运行时 `sqlx::query_scalar` /
+//!   `sqlx::query_as`，**不进 `query!` 宏**、不需要 `.sqlx/` 缓存）。
 //!
 //! 范本：`files::part_file::cnc` 子模块（「复用 `t_part_file`、无 repo 层」）。
 //!
