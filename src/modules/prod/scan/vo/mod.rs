@@ -14,7 +14,8 @@
 //!   `ScanChainState`；`LocateProcessBriefOut` 是 2026-10-16 起 `LocateOut` 新增的
 //!   **工人维度**目标工序 picker 行）
 //! - `transition.rs` —— `WorkerScanCoreOut` / `WorkerScanOut` / `WorkerScanSplitInfo`
-//!   （放回 / 送检）
+//!   （放回 / 送检）+ `ScanBannerItem`（2026-10-13 新增的 `SCAN_BANNER` 事件 payload，
+//!   业务事件 banner 的专属展示 VO）
 //! - `take_over.rs` —— `TakeOverOut`（2026-10-15 新增的第 7 条端点
 //!   `POST /scan/take-over` 扫码接管；`synced_assembly_id` 是内部管道字段，不进 JSON）
 //! - `outsource_receive.rs` —— `OutsourceReceiveOut`（2026-10-15 新增的第 8 条端点
@@ -40,5 +41,5 @@ pub use locate::{
 };
 pub use outsource_receive::OutsourceReceiveOut;
 pub use take_over::TakeOverOut;
-pub use transition::{WorkerScanCoreOut, WorkerScanOut, WorkerScanSplitInfo};
+pub use transition::{ScanBannerItem, WorkerScanCoreOut, WorkerScanOut, WorkerScanSplitInfo};
 pub use worker::ScanWorkerBrief;

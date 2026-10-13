@@ -104,6 +104,9 @@
 //! `PART_PICKED_UP`（部分领取时另发 `PART_BATCH_SPLIT`）；2026-10-15 三件套起
 //! `take-over` 广播 `PART_TRANSFERRED`、`outsource-receive` 广播 `PART_PICKED_UP`
 //! （与 `pick-up` 那条逐字同形 —— 同一事件名 + 同一组 4 个键，改一处必须两处同时改）。
+//! **2026-10-13 起** `worker-scan` 与 `pick-up` 另各发一条 `SCAN_BANNER`
+//! （业务事件 banner 的**纯展示**事件，payload 带展示字段、**不进前端失效白名单**；
+//! 唯一构造点 `handler/banner.rs`，⚠️ `outsource-receive` 刻意不发）。
 //! **事件名一字不改** —— dashboard 与队列页在监听，改名会静默断链。
 //!
 //! ## 部分数量（2026-10-11 新增）

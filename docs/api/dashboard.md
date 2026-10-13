@@ -318,7 +318,7 @@ ORDER BY c.assembly_id;
 - **`WsEvent::DashboardSnapshot` 已删**（零生产方）。`WsEvent` 现在只有 `DashboardEvent { kind, payload }` 一个变体。
 - **`kind` 事件集**（后端全量 `ws_hub.broadcast` 生产方）：
 
-  `ASSEMBLY_CANCELLED` / `ASSEMBLY_CREATED` / `ASSEMBLY_DELETED` / `ASSEMBLY_FORCE_COMPLETED` / `ASSEMBLY_UPDATED` / `BATCH_TO_INSPECTION` / `BATCH_TO_SHIP` / `PART_BATCH_WITH_PDFS_CREATED` / `PART_COMPLETED` / `PART_DELIVERED` / `PART_FORCE_COMPLETED` / `PART_SOFT_DELETED` / `PART_TO_INSPECTION` / `PART_TO_PROCESS` / `PART_TO_SHIP` / `PART_TRANSFERRED` / `ROLLUP_RECOMPUTED` / `WORKER_POOL_AUTO_ALLOCATE_DONE` / `WORKER_POOL_EMPTY` / `WORKER_POOL_MOVE_DONE` / `WORKER_POOL_REFILL_DONE` / `DELIVERY_NOTE_CREATED` / `DELIVERY_NOTE_PARTS_ADDED` / `DELIVERY_NOTE_SUBMITTED` / `DELIVERY_NOTE_PICKED_UP` / `DELIVERY_NOTE_SCAN_ADD` / `DELIVERY_NOTE_BATCHES_ATTACHED` / `DELIVERY_NOTE_DRIVER_SET`
+  `ASSEMBLY_CANCELLED` / `ASSEMBLY_CREATED` / `ASSEMBLY_DELETED` / `ASSEMBLY_FORCE_COMPLETED` / `ASSEMBLY_UPDATED` / `BATCH_TO_INSPECTION` / `BATCH_TO_SHIP` / `PART_BATCH_WITH_PDFS_CREATED` / `PART_COMPLETED` / `PART_DELIVERED` / `PART_FORCE_COMPLETED` / `PART_SOFT_DELETED` / `PART_TO_INSPECTION` / `PART_TO_PROCESS` / `PART_TO_SHIP` / `PART_TRANSFERRED` / `ROLLUP_RECOMPUTED` / `SCAN_BANNER` / `WORKER_POOL_AUTO_ALLOCATE_DONE` / `WORKER_POOL_EMPTY` / `WORKER_POOL_MOVE_DONE` / `WORKER_POOL_REFILL_DONE` / `DELIVERY_NOTE_CREATED` / `DELIVERY_NOTE_PARTS_ADDED` / `DELIVERY_NOTE_SUBMITTED` / `DELIVERY_NOTE_PICKED_UP` / `DELIVERY_NOTE_SCAN_ADD` / `DELIVERY_NOTE_BATCHES_ATTACHED` / `DELIVERY_NOTE_DRIVER_SET`
 
   前端 `AFFECTS_DASHBOARD` 白名单与之人工对应（关系是**子集**：并非每个 kind 都影响大屏）。
 
@@ -330,6 +330,35 @@ ORDER BY c.assembly_id;
     `WORKER_SCAN_INSPECTED` / `PART_PICKED_UP` / `PART_BATCH_SPLIT` 等 kind（含
     `pick-up` / `worker-scan` / 外协收回各产出点）一直不在本清单内。**另行处理**，
     本次只补 `PART_TRANSFERRED`、不追补其余欠账。
+
+  2026-10-13 补充（业务事件 banner，`prod::scan` 的 `POST /scan/worker-scan` 与
+  `POST /scan/batches/{batch_id}/pick-up` 两个产出点）：
+  - **新增** `SCAN_BANNER`，payload 是 `ScanBannerItem` 的**全量序列化**，
+    恰好 6 个键：
+
+    | 键 | 类型 | 取值 |
+    |---|---|---|
+    | `action` | string | `"PICKED_UP"` / `"RETURNED"` / `"INSPECTED"` 三选一 |
+    | `worker_name` | string | `t_worker.name` |
+    | `serial_no` | string \| **null** | `t_part.serial_no`（可空：手工工单没有序列号，终态工单被 migration 置 NULL） |
+    | `drawing_no` | string | `t_part.drawing_no` —— **`serial_no` 为 null 时的兜底显示位，必填** |
+    | `quantity` | number | 本次动作涉及的数量（裸 number） |
+    | `system_delivery_date` | string \| **null** | `t_part.system_delivery_date`，格式恒为 `YYYY-MM-DD`（无交期时是 `null`，不是空串、不是缺键） |
+
+  - ⚠️ **本 kind 不进前端失效白名单**：它是**纯展示**事件（渲染一行
+    `张三领取 F1234 x 20 (10-27)` 文案），不改变任何看板数据的有效性。消费方
+    **不要**拿它去 invalidate 任何 query。（前端仍须把它加进
+    `DashboardEventType` 联合类型，只是不进 `AFFECTS_DASHBOARD`。）
+  - ⚠️ **只有工人三个动作**产出本事件；外协收回（`POST /scan/outsource-receive`）
+    刻意不产，它发的是 `PART_PICKED_UP`。
+  - `action` 按 `worker-scan` **响应**的 `scan_out.event_type` 派生（链尾自动送检
+    会让「请求 `RETURNED` / 响应 `WORKER_SCAN_INSPECTED`」成立；`pick-up` 侧是常量
+    `"PICKED_UP"`）。逐端点对照见 [`scan.md` §4](scan.md#4-与-ws-的关系)。
+  - 唯一构造点是 `prod::scan::handler::banner::broadcast_scan_banner`（**不新增 SQL
+    宏查询**，复用 part / worker 两个域的既有 `get_by_id`）。⚠️ 它在 commit 之后
+    执行、补查走 `state.pool`（事务已耗尽），**零 WS 订阅者时整条早退**（不取连接、
+    不查库 —— 早退口径保守，不会让已订阅的连接丢帧），且**查询失败一律静默跳过 +
+    warn** —— 一条纯展示事件不该把一笔已 commit 成功的业务请求变成 500。
 
   2026-10-11 补充（装配件级强制完成端点
   `POST /api/v2/prod/assemblies/{assembly_id}/force-complete`）：
