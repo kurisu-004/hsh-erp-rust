@@ -25,6 +25,14 @@
 > ⚠️ **未选定可用发信邮箱时后端照常启动**：定时任务打一行 info 后**不注册 job**（判据见
 > `docs/api/mail.md` §4.5），手动触发返 `21701`。降级语义与被删除前的 env 方案逐条对齐，
 > 只是判据从 env 换成了 DB。
+>
+> ⚠️ **2026-10-16 第二轮：批次子行 + 位置列 + 状态中文 + 本域自有 SQL**。用户需求（原文）
+> 「①状态列发送时要 alias 为中文；②工单下方要紧跟着对应的所有批次；③增加一列位置，
+> 显示每个批次所在的位置；④在邮件通知的域重写 SQL，不要复用其它域的，禁止出现 N+1 问题；
+> ⑥表格列要对齐，支持打印」（⑤ COS 预览链接 / 批量 CI 本轮不做）。落在 §2.3（白名单
+> 11 → 13 项）、§2.4（批次子行逐字段）、§4.4（工单-批次行结构）、§4.5（位置口径）、
+> §4.6（列对齐与打印）、§4.7（定长 2 条语句）、§5（状态中文与三副本同步）、§6（拆掉
+> dashboard `DELIVERY_STATUSES` 共用）、§8.1（现读 7 张表）、§8.2（前端**零改动**）。
 
 ## 1. 端点表
 
@@ -74,7 +82,7 @@
 | `include_overdue` | bool | 是否**渲染**「已逾期」节；关掉时正文里**完全不出现**该节（2026-10-13 M5）。与 `include_upcoming` **不能同时 false**（→ `21704`） | 否 |
 | `include_upcoming` | bool | 是否**渲染**「未来 N 天」节；关掉时**完全不出现**该节（2026-10-13 M5） | 否 |
 | `upcoming_days` | number | 未来节窗口天数，**clamp 到 `1..60`**（不是拒绝），缺省 `14` | 否 |
-| `visible_columns` | string[] | 正文表格列白名单，**封闭枚举**（§2.3）；未知项 → `21704`（**不静默丢弃**）；空数组在渲染层退回缺省 8 列 | 否 |
+| `visible_columns` | string[] | 正文表格列白名单，**封闭枚举**（§2.3）；未知项 → `21704`（**不静默丢弃**）；空数组在渲染层退回缺省 10 列 | 否 |
 | `subject_template` | string | 主题模板；`null` = 用缺省主题。`{date}` / `{days}` 两个占位符，未知 `{xxx}` 原样保留 | 是 |
 | `sender_account_id` | string | 发信邮箱（`t_mail_account.id`，雪花 **JSON string**）；`null` = 未选。`POST /config` 传不存在的/已软删的 id ⇒ `21706` | 是 |
 | `smtp_configured` | bool | **2026-10-16 语义改写**：原先是「env 侧是否具备发信能力」（`MailConfig::is_enabled()`，env 已删），现为「`sender_account_id` 是否指向一个**存在且未软删**的邮箱」。前端据此灰掉「立即发送」。⚠️ **不**试解密（见 `docs/api/mail.md` §8.3 第 7 条） | 否 |
@@ -102,25 +110,63 @@
 **响应回填的是提交后的新 `version`**（读回最新行），前端据此做下一次提交 ——
 不要拿「提交前」的 version 复用，否则立刻撞一次假的 OCC 冲突。
 
-### 2.3 列白名单（`visible_columns`，封闭枚举）
+### 2.3 列白名单（`visible_columns`，封闭枚举，**13 项**）
 
-| key | 中文表头 | 来源列 |
+⚠️ **顺序 = 展示顺序 = 缺省顺序**（`GET /meta` 的 `columns[]` 按此顺序下发，前端逐
+`meta.columns[].key` 渲勾选框即可，不要在前端另存一份列名映射）。
+
+| key | 中文表头 | 来源列 | 只在批次子行有值 |
+|---|---|---|---|
+| `serial_no` | 序列号 | `t_part.serial_no` / `t_assembly.serial_no`（可空 ⇒ 空串） | — |
+| `drawing_no` | 图号 | 同名列 | — |
+| `name` | 名称 | 同名列 | — |
+| `batch_no` | 批次 | `t_part_batch.batch_no`，渲染成 `　第 N 批`（**2026-10-16 新增**） | ✅ |
+| `quantity` | 数量 | `t_part.quantity` / `t_assembly.quantity`；**装配件行单位是「套」**，渲染成 `12 套`。批次子行渲批次自身件数、**不带「套」后缀** | — |
+| `customer_name` | 客户 | `LEFT JOIN t_customer.name`（软删客户退化为空串，**不**剔除该工单） | — |
+| `status` | 状态 | 工单行 = `t_part/t_assembly.status` 查表（§5）；批次子行 = `t_part_batch.status` 查表，`is_repairing = true` 时恒「返修中」 | — |
+| `location` | 位置 | 批次所在的 `t_part_batch.location` + 多态 holder 名（`t_shelf.code` / `t_worker.name` / `t_outsource_company.name`），文案见 §4.5。解析不出时 `—`（**2026-10-16 新增**） | ✅ |
+| `system_delivery_date` | 系统交期 | `date`，格式 `YYYY-MM-DD` | — |
+| `remaining_days` | 剩余天数 | `(交期 − today)` 天数；今天到期 = `0`，逾期为负 | — |
+| `row_type` | 工单类型 | 渲染为「装配件」/「零件」 | — |
+| `is_urgent` | 是否紧急 | 渲染为「是」/「否」 | — |
+| `order_no` | 订单号 | `varchar(30)`，可空 | — |
+
+**缺省 10 列** = 前 10 个（不含 `row_type` / `is_urgent` / `order_no`）。⚠️ 这条缺省集
+是**三份副本**，改一处必须同步另两处：`dto.rs::VisibleColumn::DEFAULT_SET`、迁移
+`migrations/20261016000001_001_mail_digest_default_columns.sql` 的列 DEFAULT 字面量、
+以及 `tests/mail_digest/config.rs` 的缺省断言。
+
+⚠️ **勾掉 `batch_no` / `location` 整列就没有了**：列白名单是**逐列**的，管理员勾掉
+`location` 时批次的位置信息在正文里没有任何出口。这是列白名单的固有行为，不是缺陷。
+
+### 2.4 批次子行（`DigestBatchRow`，2026-10-16 新增）
+
+正文里的行有两种：**工单行**（`DigestRow`，§2.3 上半张表）与**紧跟其下**的**批次子行**
+（本节）。行单位仍是**工单级** —— 子行不计入 `overdue_count` / `upcoming_count`，也不
+改变任何统计口径。
+
+| 字段 | 类型 | 取值 / 来源 |
 |---|---|---|
-| `serial_no` | 序列号 | `t_part.serial_no` / `t_assembly.serial_no`（可空 ⇒ 空串） |
-| `drawing_no` | 图号 | 同名列 |
-| `name` | 名称 | 同名列 |
-| `quantity` | 数量 | `t_part.quantity` / `t_assembly.quantity`；**装配件行单位是「套」**，渲染成 `12 套` |
-| `customer_name` | 客户 | `LEFT JOIN t_customer.name`（软删客户退化为空串，**不**剔除该工单） |
-| `status` | 状态 | 6 态白名单之一（装配件侧只可能命中其中 4 态，见 §5） |
-| `system_delivery_date` | 系统交期 | `date`，格式 `YYYY-MM-DD` |
-| `remaining_days` | 剩余天数 | `(交期 − today)` 天数；今天到期 = `0`，逾期为负 |
-| `row_type` | 工单类型 | 渲染为「装配件」/「零件」 |
-| `is_urgent` | 是否紧急 | 渲染为「是」/「否」 |
-| `order_no` | 订单号 | `varchar(30)`，可空 |
+| `batch_no` | number | `t_part_batch.batch_no`（工单内序号，1 起） |
+| `quantity` | number | `t_part_batch.quantity`（**件数**，不带「套」） |
+| `status` | string | `t_part_batch.status`（`PartStatus` 字面量）⇒ 渲染时查表转中文；`is_repairing = true` ⇒ 恒「返修中」 |
+| `is_repairing` | bool | `t_part_batch.is_repairing`（`REPAIRING` 状态码于 2026-10-01 删除后由该布尔承载） |
+| `location` | string \| null | `t_part_batch.location`，**裸 varchar 无枚举约束**；5 个取值 = `OFFICE` / `PRODUCTION_SHELF` / `WORKER` / `INSPECTION_SHELF` / `OUTSOURCE_COMPANY` |
+| `holder_name` | string \| null | 按 `location` 分桶解析：两种货架档取 `t_shelf.code`（**不是 `name`**）、`WORKER` 取 `t_worker.name`、`OUTSOURCE_COMPANY` 取 `t_outsource_company.name` |
+| `owner_type` / `owner_id` | string / string | `PART` + `t_part.id` 或 `ASSEMBLY` + `t_assembly.id`；Rust 侧按这个二元组把批次装回工单行 |
 
-**缺省 8 列** = 前 8 个（不含 `row_type` / `is_urgent` / `order_no`）。
+⚠️ **`is_repairing` 在工单行上不存在**：`t_part` / `t_assembly` 上没有这一列 ⇒ 一行
+返修中的件，**工单行显示「生产中」而它下面的批次子行显示「返修中」**。这是表结构事实，
+不是漏实现。
 
-### 2.4 `POST /preview` 与 `POST /send` 入参（`PreviewRequest`）
+⚠️ **装配件的批次挂在子件上**：`t_part_batch.part_id → t_part.id`，子件的
+`t_part.assembly_id` 指向装配件 ⇒ 子件本身不单独成行，它的批次归到装配件行下面。
+
+⚠️ **本结构不出现在任何 HTTP 出参里**：`/preview` 与 `/send` 返的仍是 §2.5 的
+`{ subject, html, overdue_count, upcoming_count, columns }`，批次信息**只存在于
+`html` 字符串内部**。前端不需要（也不能）按结构消费它。
+
+### 2.5 `POST /preview` 与 `POST /send` 入参（`PreviewRequest`）
 
 **不含 `version`**（这两个端点不改配置，OCC 对它们没有意义），且**全部字段可选** ——
 空体 `{}` = 完全用当前配置。字段与 §2.2 同名同型（`Option<T>` 语义：`null` = 沿用当前值）。
@@ -131,9 +177,9 @@
 | 端点 | 出参 | 说明 |
 |---|---|---|
 | `/preview` | `{ subject, html, overdue_count, upcoming_count, columns }` | `html` 是**完整 HTML 文档**（前端直接塞进 iframe / `v-html` 预览）；`columns` 是**实际参与渲染**的列 |
-| `/send` | `SendResultOut` | 见 §2.5 |
+| `/send` | `SendResultOut` | 见 §2.6 |
 
-### 2.5 `SendResultOut`（`POST /send` 出参 = 流水行视图）
+### 2.6 `SendResultOut`（`POST /send` 出参 = 流水行视图）
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -154,7 +200,7 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
 它只说明「这次没统计逾期」。同一份 0 与 `html_bytes` 的口径差异是两回事（后者是渲染
 结果，前者是查询开关）。⇒ 流水表的两个 count **保持 0 是刻意的**，改它就得让 service
 为关掉的节也去查一次库（把「省一次 SQL」这个设计意图反掉）。**正文里则连这个 0 都不
-出现**：概览行只列**已启用**的两节（§4.4）——两个出口给同一件事两种口径，正是 M5 与
+出现**：概览行只列**已启用**的两节（§4.8）——两个出口给同一件事两种口径，正是 M5 与
 本条要消除的那类误读。回归：`template.rs::tests::overview_line_lists_only_enabled_sections`
 + `preview.rs::preview_section_toggles_hide_each_section`。
 
@@ -182,12 +228,12 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
 就不必在流水里重复。回归用例
 `tests/mail_digest/send.rs::scheduled_prepare_failure_still_writes_failed_log`。
 
-### 2.6 `GET /meta` 出参（⚠️ 2026-10-16 删掉 `smtp` 段）
+### 2.7 `GET /meta` 出参（⚠️ 2026-10-16 删掉 `smtp` 段）
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `frequencies[]` | `{value, label, needs_time, needs_weekday, needs_day_of_month}` | 4 个预设；三个 `needs_*` 驱动表单的显示/隐藏（`MANUAL_ONLY.needs_time = false`） |
-| `columns[]` | `{key, label}` | §2.3 白名单（顺序 = 展示顺序 = 缺省顺序） |
+| `columns[]` | `{key, label}` | §2.3 白名单，**13 项**（⚠️ 2026-10-16 由 11 项加 `batch_no` / `location`；顺序 = 展示顺序 = 缺省顺序） |
 | `defaults` | `ConfigDefaultsOut` | 缺省配置（**不含** `id` / `version` / 时间戳 / `smtp_configured`；**含** `sender_account_id`，缺省恒 `null`） |
 | `upcoming_days_range` | `{min: 1, max: 60}` | 前端数值控件边界 |
 
@@ -225,11 +271,11 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
 
 ## 4. 口径表
 
-### 4.1 与 dashboard 域**共用**的部分（逐字同源，不要改）
+### 4.1 与 dashboard 域**共用**的口径（谓词逐字同源，不要改）
 
 | 判据 | 说明 |
 |---|---|
-| `DELIVERY_STATUSES` | 6 态白名单（`PENDING` / `PROGRAMMING` / `IN_PROCESS` / `OUTSOURCE` / `INSPECTION` / `READY_TO_SHIP`），**共用同一常量** `dashboard::repo::delivery::DELIVERY_STATUSES` |
+| 「未交付」6 态集合 | `PENDING` / `PROGRAMMING` / `IN_PROCESS` / `OUTSOURCE` / `INSPECTION` / `READY_TO_SHIP`。⚠️ **2026-10-16 起是本域自有常量** `repo::DELIVERY_STATUSES`（原先 `use` dashboard 那份），见 §5 |
 | **行单位 = 工单级** | `t_part` 侧带 `AND p.assembly_id IS NULL`（子件不重复计入），装配件单独查 `t_assembly` 且其行**替换**子件行 |
 | **已交量守卫** | `NOT EXISTS (… FROM t_part_batch b WHERE b.part_id = … AND b.deleted_at IS NULL AND b.status IN ('DELIVERED','COMPLETED'))` |
 | 软删闸门 | `p/a.deleted_at IS NULL` |
@@ -247,8 +293,10 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
 
 ⇒ 故**不复用** `DeliveryRepo::list_orders_*`：复用就得先解掉它的 `LIMIT 30`
 （等于改坏大屏）或在外面再分页（等于让 SQL 口径与 Rust 侧重叠，两边都要维护）。
+⚠️ 2026-10-16 需求进一步要求「**在邮件通知的域重写 SQL，不要复用其它域的**」⇒ 连
+`DELIVERY_STATUSES` 常量也不再 import，统计 SQL 现在对本域外**零符号依赖**。
 
-### 4.3 三条硬约束（改 SQL 前逐条读）
+### 4.3 四条硬约束（改 SQL 前逐条读）
 
 1. **工单级行单位**：`t_part` 侧必须带 `AND p.assembly_id IS NULL`。
 2. **`NOT EXISTS` 必须同时判 `b.deleted_at IS NULL` 且状态集含 `'COMPLETED'`**：
@@ -259,15 +307,119 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
    UTC）与 `infra::clock::now_naive()` 的 Asia/Shanghai 是**两个时钟**，Shanghai
    00:00–08:00 期间 `CURRENT_DATE == today - 1`，于是「今天到期」的工单会落进逾期节、
    未来节整体偏移一天。
+4. **统计取数恒定 2 条语句**（2026-10-16）：见 §4.7。
 
-### 4.4 渲染口径
+### 4.4 工单行 / 批次行的结构（2026-10-16 新增）
+
+需求原文：「工单下方要紧跟着对应的**所有批次**」「增加一列位置，显示**每个批次**所在的
+位置」⇒ 正文里一个工单下面挂若干**批次子行**，逐行展示。
+
+- **子行紧跟工单行**，不是集中排在表尾：渲染时对每个工单行先打它自己、再打它的批次
+  （`template::push_row_with_batches`）。若按工单渲完再统一渲批次，读者无从对应。
+- **子行只填 4 列**：`批次` / `数量` / `状态` / `位置`。其余（序列号 / 图号 / 名称 /
+  客户 / 交期 / 剩余天数 / 工单类型 / 是否紧急 / 订单号）**留空** —— 那些是工单级属性，
+  填在子行上会让人以为这批件的交期与工单不同。
+- **一个批次都没有的工单不渲子行**（子行是「这个工单名下有批次」的证据，空子行是噪声）。
+- **行单位仍是工单级**：子行不计入 `overdue_count` / `upcoming_count`，也不参与任何
+  统计（节的「N 条」是工单数）。
+- **批次过滤**：**读全部批次、不按状态过滤**（含 `DELIVERED` / `COMPLETED` /
+  `CANCELLED` 终态批次）—— 用户要的是「所有批次」。⚠️ 与**工单行**的已交量守卫方向相反：
+  守卫判「一件没交过」才让工单出现，但一旦出现，它名下**已交的那几批**也要列出来
+  （否则读者看到的批次集合与工单行「一件没交过」互相矛盾）。
+- **批次序**：`ORDER BY owner_type, owner_id, batch_no`，Rust 侧分组时按到达顺序
+  push，渲染层**不**二次排序（与工单行同一约定）。
+
+### 4.5 位置列的口径（2026-10-16 新增）
+
+`location` 是**裸 `varchar`（无 DB 枚举、无 Rust 枚举类型）**，5 个取值；holder 是
+**多态**的（批次表上**没有** `worker_id` / `outsource_company_id` / `shelf_id` 列，
+只有 `current_holder_id` + `location` 两个字段）。
+
+| `location` | holder 取自 | 渲染文案 |
+|---|---|---|
+| `PRODUCTION_SHELF` | `t_shelf.code` | `货架 {code}` |
+| `INSPECTION_SHELF` | `t_shelf.code` | `品检 {code}` |
+| `WORKER` | `t_worker.name` | `{姓名}`（**不加前缀**，与其余三档不同，是前端既有口径） |
+| `OUTSOURCE_COMPANY` | `t_outsource_company.name` | `外协 {公司名}` |
+| `OFFICE` / `NULL` / 未知值 / holder 行已软删 | — | `—` |
+
+- **三张 holder 表全部 `LEFT JOIN` + `deleted_at IS NULL` 放在 `ON` 条件里**（不是
+  `WHERE`）：软删的货架 / 工人 / 外协厂**不该出现在邮件里**，而加了软删闸门之后
+  `LEFT JOIN` 仍保留批次行、只是名字解析不出来（位置退化成 `—`）。写进 `WHERE` 会
+  把整批批次行滤掉 —— 那比「位置空着」严重得多。
+- ⚠️ **货架取 `code` 不是 `name`**（`t_shelf` 两列都在，既有口径用 `code`）。
+- ⚠️ **终态批次的位置恒为 `—`**：迁移 `20261013000002_001_clear_terminal_batch_location.sql`
+  把 `DELIVERED` / `COMPLETED` / `CANCELLED` 三态的 `location` 与 `current_holder_id`
+  一起清了（出厂时工件已不在任何货架 / 工人 / 外协厂手里）。这不是取数漏了，是数据本来
+  就没有。
+- ⚠️ **`location` 没有枚举约束** ⇒ 将来多一个取值时的表现是「位置列显示 `—`」，不是
+  「批次消失」（`CASE` 无匹配分支 ⇒ `NULL`）。
+
+### 4.6 列对齐与打印（2026-10-16 新增，需求「表格列要对齐，支持打印」）
+
+- **列对齐**：每张子表带 `<colgroup>`，逐 `<col width="N%" style="width:N%">`，
+  外加 `table-layout:fixed`。宽度由 `VisibleColumn::width_weight` 的**权重**按
+  「本次实际渲染的列集合」归一化后取整，**最后一列吸收余数** ⇒ **合计恒 100%**。
+  ⚠️ 直接用权重原值会凑不出 100%（只勾 4 列时合计 41%）⇒ 表格整体塌掉、`fixed` 布局
+  退回自适应，等于白做。
+- **`<colgroup>` 每张子表各一份**：分组渲染会开多张子表，`<colgroup>` 是表内元素、
+  不跨表共享。
+- **不写 `@media print`**：邮件客户端（企业邮 / QQ 邮箱）会把 `<style>` 块**整块剥掉**，
+  写进去等于什么都没写 ⇒ 全部样式**内联**。
+- **底色在打印路径里会丢**：`background-color` 遇到部分打印路径 / Outlook 桌面版会被
+  丢弃，故所有有底色的单元格额外内联 `print-color-adjust:exact;
+  -webkit-print-color-adjust:exact`（两个前缀都写：旧 WebKit 只认 `-webkit-`）。
+- **批次子行的区分不只靠颜色**：淡灰底（`bgcolor` 属性 + `background-color` 两处都写）
+  之外，还有**「第 N 批」文案**与**首格全角空格缩进** —— 打印时底色整片丢掉，子行与
+  工单行仍分得开。
+- **不用 `float` / `position`**：两者在邮件与打印路径里都会产生不可预期的漂移。
+- 组标题行的 `colspan` 取**真实列数**（13 列全开时是 `colspan="13"`，不是 `"*"`）。
+- `bgcolor` 的**加急行**（`#fdf6ec`）与**批次子行**（`#f7f8fa`）是两套底色，语义不同。
+
+### 4.7 定长 2 条语句（2026-10-16 新增，需求「禁止出现 N+1 问题」）
+
+一封信的取数语句数**恒定**，与工单数 / 批次数**无关**：
+
+| # | 语句 | 形态 |
+|---|---|---|
+| 1 | `repo::list_overdue` | 字面量宏 `query_as!`，按 `system_delivery_date < today` 取工单 |
+| 2 | `repo::list_upcoming` | 字面量宏 `query_as!`，按 `[today, today+N)` 取工单 |
+| 3 | `repo::list_batches` | 字面量宏 `query_as!`，`part_ids` / `assembly_ids` 两个数组 `= ANY($1::bigint[])` / `= ANY($2::bigint[])`，一次拉回**全部**批次 |
+
+- 序号 1 / 2 由**节开关互斥**（两节不能同时关，`21704`）⇒ 任一封信恒有且只有 1 条主
+  查询；序号 3 在**两侧 id 都为空**时不发。⇒ **恒定 2 条**。
+- **批次查询是「一条语句、两个 UNION ALL 分支」**：PART 支 `t_part_batch ⋈ t_part`，
+  ASSEMBLY 支 `t_part_batch ⋈ t_part c ⋈ t_assembly a`（装配件的批次挂在**子件**上，
+  该支必须两跳）。**holder 三向解析在同一条 SQL 里完成** —— 三张 holder 表都是
+  `LEFT JOIN`，`ON` 条件里用 `location` 分桶（`b.location = 'WORKER'` 等）限定谁参与匹配，
+  `CASE b.location` 取对应那一列的 `name/code`。⇒ 位置文案不需要第二次查询、不需要在
+  Rust 侧再解多态 holder。
+- **两侧 id 数组可以有一个是空数组**：`= ANY('{}')` 恒 false，那一支贡献 0 行、另一半
+  照常工作。**这是常态不是边界情况**（绝大多数工单不是装配件；「两节都关」则两侧都空）。
+- **Rust 侧只做内存分组**：`service::fetch_rows` 先查主行 → 收集两组 id → 跑**一次**
+  批次查询 → 按 `(owner_type, owner_id)` 分组装进 `DigestRow::batches`。
+  ⚠️ **循环体内不得调 `repo::`** —— 这条由 `tests/mail_digest/n_plus_one_guard.rs` 的
+  源码级护栏钉住（扫 `fetch_rows` 的 `for` / `while` / `loop` 体，命中 `repo::` /
+  `sqlx::query` 即红，并另有一条钉住顶层恰好 3 个 `repo::` 调用点）。逐工单循环查批次
+  是**功能完全正确**的写法（集成测试照样全绿），只有语句数会随工单数线性涨，所以只能靠
+  源码护栏守。
+- **不因为「先查后过滤」而省语句**：工单行的已交量守卫在 SQL 里做（`NOT EXISTS`），
+  不是查回来再过滤 —— 否则会多一轮往返。
+
+### 4.8 渲染口径
 
 - **主题**：缺省 `交期汇总 YYYY-MM-DD（未来N天）`；`subject_template` 支持
   `{date}` / `{days}`，未知 `{xxx}` 原样保留。主题里的 CR/LF 在写侧就拒（`21704`）。
 - **正文**：全**行内样式**、无 `<style>` 块 / 无外链 / 无图片（企业邮与 QQ 邮箱默认拦
   远程内容），表格布局（不吃 flex/grid），关键底色 `bgcolor` 与 `background-color` 两处都写。
-- **XSS**：图号 / 名称 / 客户名 / 订单号 / 序列号**每一个插值点**都过 `html_escape`
-  （`& < > " '` 五个字符，`&` 必须**第一个**替换，否则 `&lt;` 会被二次转义成 `&amp;lt;`）。
+- **XSS**：图号 / 名称 / 客户名 / 订单号 / 序列号 / 批次号 / 工人姓名 / 外协公司名
+  **每一个插值点**都过 `html_escape`（`& < > " '` 五个字符，`&` 必须**第一个**替换，
+  否则 `&lt;` 会被二次转义成 `&amp;lt;`）。
+- ⚠️ **状态列输出中文，不输出英文原字面量**（2026-10-16 新增，需求「状态列发送时要
+  alias 为中文」）：工单行查 `t_part` / `t_assembly.status`，批次子行查
+  `t_part_batch.status`。文案表见 §5。**未知值原样回显**（不静默变空串 —— 静默空串会让
+  「这批件状态坏了」在邮件里完全看不出来）。回归：
+  `template.rs::tests::status_column_is_chinese_and_unknown_falls_back_to_literal`。
 - ⚠️ **节开关真的作用于正文（2026-10-13 review 第 1 轮 M5 修复）**：`include_overdue=false`
   时正文里**完全不出现**「已逾期」那一节（标题行 + 空态文案一并消失），未来节同理。
   修复前 `render()` 无条件渲染两节、关掉的节因为没查库而拿到空切片，于是信里照样出现
@@ -290,37 +442,85 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
   （无数据时连表头都不渲染）。两节都关在配置层已被 `21704` 拒掉，渲染层对纯函数调用仍
   有一句「本邮件未启用任何内容节」的兜底。
 - **按 `system_delivery_date` 分组**：组标题带「已逾期 N 天」/「今天到期」/「明天到期」
-  /「剩余 N 天」。SQL 已按 `(交期 ASC, id ASC)` 排好，渲染层**不**二次排序（避免口径分叉）。
-  组标题的 `colspan` 取**真实列数**（2026-10-13 m1 修复：原为字面量 `"*"`，而 HTML 的
-  `colspan="*"` 非法、客户端一律回落到 1，标题行于是只盖住第一列）。
+   /「剩余 N 天」。SQL 已按 `(交期 ASC, id ASC)` 排好，渲染层**不**二次排序（避免口径分叉）。
+   组标题的 `colspan` 取**真实列数**（2026-10-13 m1 修复：原为字面量 `"*"`，而 HTML 的
+   `colspan="*"` 非法、客户端一律回落到 1，标题行于是只盖住第一列）。**白名单全开时是
+   `colspan="13"`**。
+- **批次子行的渲染**：结构见 §4.4、位置文案见 §4.5、列宽与打印见 §4.6。回归：
+  `template.rs::tests::batch_sub_rows_follow_their_own_order_row` /
+  `batch_sub_row_fills_only_four_columns` / `print_attributes_present_and_no_style_block` /
+  `colgroup_widths_sum_to_one_hundred` / `colspan_matches_column_count_with_all_columns`。
 
 ## 5. 状态域约定（无编译期保障）
 
-- 后端常量：`dashboard::repo::delivery::DELIVERY_STATUSES`（6 态）。
+### 5.1 「未交付」6 态（筛选谓词用）
+
+- 后端常量：⚠️ **2026-10-16 起是本域自有常量** `mail_digest::repo::DELIVERY_STATUSES`
+  （原先 `use dashboard::repo::delivery::DELIVERY_STATUSES`）。6 态字面量与 dashboard
+  逐字相同，但**不再共用同一份符号** —— 用户要求「在邮件通知的域重写 SQL，不要复用其它域的」。
 - 前端对应：大屏柱状图 `UpcomingDeliveryChart.vue` 的 `LAYERS[].statuses` ——
   `top`（4 态）+ `middle`（2 态）合起来正是这 6 态，`bottom`（`DELIVERED`）额外多一个。
-- 两者是**人工同步**关系，Rust 常量与 TS 字面量之间没有任何编译期约束，漂了不会编译失败，
-  只会让「逾期数」与「柱状图层数」互相矛盾（现象是数字对不上、极难定位）。改任一侧必须同步另一侧。
-- ⚠️ **本域不引入第二份状态常量**：`repo.rs` 里把 `DELIVERY_STATUSES` 转成
-  `Vec<String>` 是为了让 `query_as!` 宏能绑 `varchar[]`（宏要求具体可绑类型），
-  取值仍来自 dashboard 那份常量，**一处改、两处生效**。
+- 三者是**人工同步**关系（Rust ↔ Rust ↔ TS），没有任何编译期约束，漂了不会编译失败，
+  只会让「逾期数」与「柱状图层数」互相矛盾（现象是数字对不上、极难定位）。改任一处必须
+  同步另两处。
+- `repo.rs` 里把 `DELIVERY_STATUSES` 转成 `Vec<String>`（`LazyLock`）是因为 `query_as!`
+  **宏**要求参数是具体可绑类型，`&[&str; 6]` 绑不上 `$N::varchar[]`；dashboard 的同类
+  查询走运行时 `sqlx::query(..).bind(..)`，可以直绑。
 - `t_assembly` 侧只可能命中其中 4 态（`AssemblyStatus` 无 `PROGRAMMING` / `OUTSOURCE`）
   —— 这是有意的：白名单按 part 状态域取全集，装配件侧对不上的两个自然不参与，
   **不需要**第二份常量。
 
+### 5.2 状态**中文标签**（2026-10-16 新增，需求「状态列发送时要 alias 为中文」）
+
+正文状态列输出中文，来源是 `mail_digest::dto::part_status_label` / `batch_status_label`：
+
+| 原值 | 中文 |
+|---|---|
+| `PENDING` | 待生产 |
+| `PROGRAMMING` | 编程中 |
+| `IN_PROCESS` | 生产中 |
+| `INSPECTION` | 待品检 |
+| `READY_TO_SHIP` | 待送货 |
+| `DELIVERED` | 已送货 |
+| `REPAIRING` | 返修中 |
+| `OUTSOURCE` | 外协中 |
+| `COMPLETED` | 已完成 |
+| `CANCELLED` | 已取消 |
+
+- ⚠️ **未知值原样回显**（不静默变空串 / 不变 `未知`）：fail-loud 是这里刻意选的形态。
+- ⚠️ **`REPAIRING` 已在 2026-10-01 从状态枚举删除**，语义由 `t_part_batch.is_repairing`
+  布尔承载；`shared::batch::status_machine` 仍留一个过渡兼容分支能解析该字面量，故
+  标签表保留这一行（存量行仍可能读出这个值）。批次子行则**优先看布尔**
+  （`is_repairing = true` ⇒ 「返修中」）；工单行只能查表（`t_part` 上没有该列）⇒
+  一行返修中的件，工单行显示「生产中」而它的子行显示「返修中」。
+- ⚠️ **文案是「订单管理语义」**（与零件一览页一致），**不是统计页那套**
+  （前端 `src/constants/partStatus.ts::STATUS_LABEL`，那是另一组文案）。
+- ⚠️ **三副本人工同步**：后端 `dto::part_status_label`、前端
+  `src/types/parts.ts::ORDER_STATUS_LABEL`、前端 `src/constants/partStatus.ts::STATUS_LABEL`。
+  前两份**要求逐字一致**（同一批件在不同页面显示两种中文状态是最难查的一类问题）；
+  第三份是统计语义、**刻意不同**，不要拿它当本表的依据。Rust ↔ TS 之间没有任何编译期
+  约束。
+
 ## 6. 移除记录
 
-**本域 2026-10-13 新立，到目前为止没有任何移除项**（无端点下线、无字段删除、无 VO 裁剪）。
+**无端点下线、无字段删除、无 VO 裁剪**（本域 2026-10-13 新立）。⚠️ 但有一条**代码级**
+的共用被移除，必须登记（它不是 HTTP 契约、不影响任何客户端）：
+
+| 移除项 | 说明 |
+|---|---|
+| ⚠️ **与 dashboard 共用 `DELIVERY_STATUSES` 常量**（2026-10-16） | `repo.rs` 原先 `use crate::modules::dashboard::repo::DELIVERY_STATUSES`（「一处改、两处生效」）。按用户要求「**在邮件通知的域重写 SQL，不要复用其它域的**」，改为**本域自有常量** `mail_digest::repo::DELIVERY_STATUSES`，6 态字面量与 dashboard 逐字相同。**后果**：那 6 态从「编译期共用一个符号」退化为**三处人工同步**（本域常量 / dashboard 常量 / 前端 `LAYERS[].statuses`），见 §5.1。⚠️ 改判据不改 wire —— 本域的 HTTP 出参、入参、错误码**一个字都没变** |
 
 已知的「刻意**没有**做的事」，记录在此以防后人来「补齐」：
 
 | 没做的事 | 原因 |
 |---|---|
 | `PUT` / `PATCH` / `DELETE` 端点 | 全仓零这三种 HTTP 方法 |
-| SMTP 凭据入库 | 跟着备份走 + 任何只读库权限的人都能捞走 |
+| SMTP 凭据入库 | 跟着备份走 + 任何有只读库权限的人都能捞走 |
 | 流水表软删 / `version` 列 | 只增的审计流水；软删会让「定时任务是不是在偷偷重发」永远查不清 |
 | 分角色（不止 Manager） | 端点会对**真实收件人发信**，属配置型 + 有外发副作用的操作，只归管理员 |
 | `send` 的幂等键 / 频控 | 见 §8.3「本域设计上的已知取舍」第 3 条 |
+| 批次信息进 HTTP 出参 | 批次只存在于 `html` 字符串内部（§2.4），不给前端造第二个消费入口 |
+| COS 预览链接 / 批量 CI | 需求原文第 5 条，**本轮不做** |
 
 ## 7. 与 WS 的关系
 
@@ -333,7 +533,7 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
 
 ## 8. 表依赖与前端配套
 
-### 8.1 读 / 写的表
+### 8.1 读 / 写的表（**现读 7 张**，2026-10-16 批次与位置列新增 3 张）
 
 | 用途 | 表 | 本域关系 |
 |---|---|---|
@@ -342,8 +542,16 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
 | 发送流水（只增） | `t_mail_digest_log` | **owned**（刻意无 `deleted_at` / `version`） |
 | 工单与系统交期 | `t_part` | 只读聚合（跨域） |
 | 装配件与系统交期 | `t_assembly` | 只读聚合（跨域） |
-| 已交量守卫 | `t_part_batch` | 只读聚合（跨域） |
+| 已交量守卫 + **批次子行** | `t_part_batch` | 只读聚合（跨域）。⚠️ 2026-10-16 起**不再只是 `NOT EXISTS` 的存在性检查**，而是批次行的主表（`batch_no` / `quantity` / `status` / `is_repairing` / `location` / `current_holder_id` 六列） |
 | 客户名 | `t_customer` | `LEFT JOIN`，**刻意不加** `AND c.deleted_at IS NULL`（客户软删时该列退化为空串，但**不该**因此把工单从邮件里剔除） |
+| **货架 `code`** | `t_shelf` | **2026-10-16 新增**。`LEFT JOIN` + `deleted_at IS NULL` 在 `ON` 里；两种货架档取的是 **`code` 不是 `name`** |
+| **工人 `name`** | `t_worker` | **2026-10-16 新增**。同上（`location = 'WORKER'` 时参与匹配） |
+| **外协公司 `name`** | `t_outsource_company` | **2026-10-16 新增**。同上（`location = 'OUTSOURCE_COMPANY'` 时参与匹配） |
+
+⚠️ **计数副本：现读 7 张别域表 + 2 张自有表 = 9 张。** 三张新表**不是新依赖**，它们只
+在 `repo::list_batches` 一条 SQL 里以 `LEFT JOIN` 出现（§4.7），且全部是**展示用附表**
+（同 `prod::inspection` 的既有取舍：给不给软删闸门由「该不该出现在邮件里」决定，本域对
+三张都判软删 —— 软删的货架 / 工人 / 外协厂**不该**出现在邮件里）。
 
 - **域外依赖 = 1 个模块**（2026-10-16 由 0 变 1）：`scheduled_task`（邮箱通道域）。
   本域 import 了它的 `dto::MailAccountPreset` 与 `repo::get_account`，**只读**那一张表。
@@ -368,9 +576,10 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
 | 权限 | 菜单仅授予 `MANAGER`；页面路由守卫按同一角色判定 |
 | 预览 | `/preview` 的 `html` 是完整 HTML 文档，**直接插 iframe**（`srcdoc` + `sandbox`）而**不要** `v-html` 塞进主文档 —— 后端已做转义，但 iframe 少一层依赖主文档上下文的暴露面 |
 | 枚举 | **不要在前端另存一份频率 / 列名映射**：一律取 `GET /meta` 的 `frequencies[]` / `columns[]`（`label` 是后端给的中文表头） |
+| ⚠️ **`columns[]` 多了两个 key，前端不需要改代码**（2026-10-16） | 本轮给列白名单加了 `batch_no`（表头「批次」）与 `location`（表头「位置」），`GET /meta` 的 `columns[]` 从 11 项变 **13 项**。**前端零改动**：`visible_columns` 的 schema 是 `z.array(z.string())`（不是枚举），`MailContentSection` 逐 `meta.columns[].key` 渲勾选框 ⇒ 新 key 自动出现、自动可勾、勾上就生效。⚠️ 别在前端补一份列名常量表（那是 §8.2「枚举」那条明令禁止的），也别把 key 数量写死成 11 |
 | **发信邮箱下拉** | ⚠️ **2026-10-16 新增**：选项源取 `GET /api/v2/mail/accounts`（`scheduled_task` 域）；提交时 `sender_account_id` 按 **JSON string** 发（发数字会 422）。⚠️ `POST /config` 是**全量覆写**，不带这个键 = 清成 `null`（= 定时任务不再注册 job） |
 | 「立即发送」按钮 | 按 `smtp_configured === false` 灰掉并提示「**未选择发信邮箱**」（⚠️ 不再是「去配 `MAIL_SMTP_*`」—— 那套 env 已删） |
-| `GET /meta` 的 `smtp` 段 | ⚠️ **已删除**（2026-10-16），逐条去处见 §2.6 的对照表。**不要**保留对它的引用 |
+| `GET /meta` 的 `smtp` 段 | ⚠️ **已删除**（2026-10-16），逐条去处见 §2.7 的对照表。**不要**保留对它的引用 |
 | 错误处理 | `21701`（503）「发信通道不可用」与 `21702`（502）「SMTP 挂了」**排查方向相反**，UI 文案必须区分，不要都显示成「发送失败」；`21706`（邮箱不存在/已删，保存配置时出现） |
 | 雪花 ID | `ConfigOut.id` / `ConfigOut.sender_account_id` / `SendResultOut.log_id` 是 **JSON string**，不要按 `number` 声明 |
 
@@ -385,10 +594,10 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
 | 组名 | 覆盖 |
 |---|---|
 | 「依赖库版本相关的实测结论」 | 1–4 |
-| 「本域设计上的已知取舍」 | 1–8 |
+| 「本域设计上的已知取舍」 | 1–11（⚠️ 2026-10-16 新增第 9–11 条：迁移回填 / N+1 护栏局限 / 勾掉整列就没了） |
 | 「实现与注释不符」 | 1–6（改实现前先改文档或先改测试；第 5 条已修） |
 | 「覆盖空洞」 | 1–3（⚠️ 2026-10-16 新增第 3 条：SMTP 层失败造法换过一次） |
-| 「与任务书的差异」 | 1–2 |
+| 「与任务书的差异」 | 1–4（⚠️ 2026-10-16 新增第 3–4 条：需求第 5 条不做 / 多一列 `batch_no`） |
 
 ⚠️ 组数与条目数在 2026-10-13 review 第 2 轮又动过两次，都是**上一轮自己引入的自相矛盾**：
 先给「实现与注释不符」加了第 5 条却没同步表里的 `1–4` 与紧邻标题的「四处」（M5-#5），
@@ -455,6 +664,31 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
    「调度器里恒 ≤ 1 个 job」；第 2 条管**多副本**「N 个进程各发各的」，仍需分布式锁 /
    领导者选举。用这条冒充多副本防重（或反过来拿第 2 条当「进程内可以不互斥」的
    理由）都会漏掉真实故障。回归：`task::mail_digest::tests::concurrent_swap_leaves_exactly_one_job`。
+9. ⚠️ **迁移会静默改掉管理员已存的列勾选**（2026-10-16，刻意决定）：迁移
+   `20261016000001_001_mail_digest_default_columns.sql` 除了改列 DEFAULT，还
+   **无条件回填**存量未软删行的 `visible_columns`（旧的 8 列 → 新的 10 列）。
+   **必要性**：列白名单一旦被管理员存过就与列 DEFAULT 无关 —— 只改 DEFAULT 的话，
+   已经保存过配置的环境永远看不到 `batch_no` / `location` 两列，而用户明确要求正文里
+   能看到批次与位置。
+   **代价**：管理员手工去掉过某列的勾选会被**重新加回**；该列现在**可以**再手工勾掉
+   （`POST /config` 全量覆写）。影响面仅限升级那一次。⚠️ 别把回填删掉「让配置更尊重
+   用户」—— 那会让本轮需求在已存配置的环境里静默失效。
+10. ⚠️ **「无 N+1」是源码级护栏，不是运行时计数**（2026-10-16）：
+    `tests/mail_digest/n_plus_one_guard.rs` 扫 `service::fetch_rows` 的源码，断言
+    `for` / `while` / `loop` 体内不出现 `repo::` / `sqlx::query`，并另钉一条「顶层恰好
+    3 个 `repo::` 调用点」。
+    **为什么不装 sqlx `QueryLogger` 计数**：`tracing::subscriber::with_default` 只在当前
+    线程生效、集成测试同进程并行跑多个 case；改全局 subscriber 又会把别的 case 算进来
+    （多线程下还会静默少计，「条数相等」退化成 `0 == 0` 的假绿）。
+    **已知局限**（明写出来，别当它是完备证明）：① 对源码形态敏感 —— 把循环写进宏、
+    或把 `repo::` 调用包进另一个函数再在循环里调它，都能绕过（仓内不存在这种写法）；
+    ② 只扫 `fetch_rows` 一个函数体（写路径 `update_config` 等不在范围内 —— 它们是**写**
+    不是读放大）；③ 判定的是**调用点**而不是语句条数，「恒定 2 条」还依赖「两条主查询
+    由节开关互斥」+「无工单时不发批次查询」这两条事实（`fetch_rows` 的 doc 已登记）。
+11. **勾掉 `batch_no` / `location` 整列就没有了**（2026-10-16）：列白名单是**逐列**的，
+    管理员勾掉 `location` 时批次的位置信息在正文里没有任何出口。⚠️ 这是列白名单的固有
+    行为、不是缺陷 —— 不要为此在渲染层加「无视白名单的强制列」（那会让「可勾选」这个
+    承诺失效）。回归：`template.rs::tests::dropping_batch_column_removes_batch_number_only`。
 
 **实现与注释/直觉不符的六处（测试已把实际行为钉死，改实现前先改文档或先改测试）：**
 **（2026-10-13 review 第 1 轮扩到五条：新增第 5 条是 M5「节开关不作用于正文」，
@@ -484,7 +718,7 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
     关掉的节不查库、拿到空切片，于是正文里出现「已逾期（系统交期早于今日）（0 条）/
     本节无符合条件的工单」。§2.1 当时把它描述成「是否**渲染**节」、需求原文是
     「内容可选 ① 节开关」，而这一半没兑现。**现状**：渲染层按 `cfg.include_*` 决定渲不
-    渲染，关掉的节整段不出现（§4.4）。登记在此是为了防回归
+    渲染，关掉的节整段不出现（§4.8）。登记在此是为了防回归
     ——`preview.rs::preview_section_toggles_hide_each_section` 与 `template.rs` 的两条
     `closed_*_section_is_not_rendered_at_all` 单测各钉一半。
 6. ⚠️ **迁移 `migrations/20261013000000_001_mail_digest.sql` 里 `enabled` 列的注释已过期**
@@ -535,8 +769,16 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
    说「本来就没这些」。
 2. ⚠️ **`GET /meta` 的 `smtp` 段已于 2026-10-16 整体删除**，本条**不再是「字段数差异」**：
    任务书里的那 4 个字段、以及实现侧多出的 `tls_mode` 与 `from_name`，连同整段一起去掉了
-   —— 逐条换到了别处，对照表见 §2.6。⚠️ **别把本条读成「`smtp` 段还在、只是字段数与
+   —— 逐条换到了别处，对照表见 §2.7。⚠️ **别把本条读成「`smtp` 段还在、只是字段数与
    任务书不同」**：那是本条登记**之前**的状态，保留在此只为防一件事 —— 有人拿任务书当
    验收标准，跑过去在 `/meta` 上找一个已经删掉的段、然后以为实现「漏做了一部分」。
-   判定一律以 §2.6 为准；前端改造时**不要**保留对 `smtp` 段的引用
-   （那段的内容里**从来**不含 username / password）。
+   判定一律以 §2.7 为准；前端改造时**不要**保留对 `smtp` 段的引用
+   （那段的内容里**从来**不含 username / password）。3. ⚠️ **需求第 5 条（COS 预览链接 / 批量 CI）本轮不做**（2026-10-16）：任务书列了
+   「…」的第 5 条，本轮**实现范围不含它** —— 邮件正文没有图纸预览链接、也没有触发批量
+   CI 的动作。⚠️ 拿任务书逐条验收会在这一条判错；剩余条目（状态中文 / 批次子行 / 位置列 /
+   本域重写 SQL / 禁 N+1 / 列对齐与打印）都已落地，索引见 §2.3、§4.4–§4.7。
+4. ⚠️ **多出一列 `batch_no`（表头「批次」），任务书没要求**（2026-10-16）：用户原话只说
+   「工单下方要紧跟着对应的所有批次」「增加一列位置」。批次子行若没有批次号，一行只有
+   「数量 / 状态 / 位置」，读者分不清它是第几批 ⇒ 补了这一列。⚠️ 它与 `location` 一样
+   **只对批次子行有值、工单行留空**，且**同样可勾可去勾**（§8.3「本域设计上的已知取舍」
+   第 11 条）—— 不想看的可以勾掉。
