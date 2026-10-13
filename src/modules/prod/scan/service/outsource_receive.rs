@@ -203,15 +203,17 @@ impl ScanService {
             None => {
                 // 分支 1：链推导**逐字保留既有路径**（含 `20706` 的两段文案）——
                 // 有链且能推导出下一道时，工种候选不参与。
-                let chain_err =
-                    if optional_process_chain(&mut *conn, batch.part_id).await?.is_some() {
-                        match resolve_receive_next_process(&mut *conn, batch.id, None).await {
-                            Ok(pid) => Some(Ok(pid)),
-                            Err(err) => Some(Err(err)),
-                        }
-                    } else {
-                        None
-                    };
+                let chain_err = if optional_process_chain(&mut *conn, batch.part_id)
+                    .await?
+                    .is_some()
+                {
+                    match resolve_receive_next_process(&mut *conn, batch.id, None).await {
+                        Ok(pid) => Some(Ok(pid)),
+                        Err(err) => Some(Err(err)),
+                    }
+                } else {
+                    None
+                };
                 match chain_err {
                     Some(Ok(pid)) => pid,
                     // 分支 2/3：链推不出（无链 / 指针漂移 / 链内歧义 / 链尾）⇒ 退回
@@ -223,10 +225,7 @@ impl ScanService {
                         [] => {
                             return Err(AppError::biz(
                                 code::BIZ_INVALID_VALUE,
-                                format!(
-                                    "worker {} 的工种未映射任何工序，无法收回",
-                                    worker.id
-                                ),
+                                format!("worker {} 的工种未映射任何工序，无法收回", worker.id),
                             ));
                         }
                         many => {

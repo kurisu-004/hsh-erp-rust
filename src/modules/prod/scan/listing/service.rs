@@ -9,9 +9,7 @@ use sqlx::PgConnection;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::modules::prod::scan::dto::{HeldQuery, LocateQuery, PickableQuery};
-use crate::modules::prod::scan::listing::repo::{
-    LocateBatchRow, ScanListingRepo,
-};
+use crate::modules::prod::scan::listing::repo::{LocateBatchRow, ScanListingRepo};
 use crate::modules::prod::scan::vo::{
     HeldListOut, LocateAction, LocateBatchItem, LocateDisabledReason, LocateOut,
     LocateProcessBriefOut, ScanChainState, ScanListOut,
