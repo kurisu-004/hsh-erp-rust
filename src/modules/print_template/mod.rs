@@ -22,8 +22,12 @@
 //! ## URL 与硬切记录
 //!
 //! 本域**全新**，**无任何旧路径、无 alias**。`/api/v2/print-templates` 与前端菜单
-//! `seeds/menu.sql` 里 `template_management` / `print_templates_designer` 两项的
-//! `path='/print-templates'` **逐字一致**（刻意不写成 kebab-case 的别名词）。
+//! 的**子项** `print_templates_designer`（`template_management` →「模板管理」下的
+//! 「模板编辑」）的 `path='/print-templates'` **逐字一致**（刻意不写成 kebab-case 的
+//! 别名词）。
+//! ⚠️ 2026-10-16 review 第 1 轮 MINOR-4 订正：一级菜单 `template_management`
+//! 自己的 `path` 是 **NULL**（目录项、不指向页面，见 `seeds/menu.sql` §1）——
+//! 本域对应的**只是**那个子菜单项，别把 path 记在目录项名下。
 //!
 //! 两条**曾经出现过、但从未落到 Rust 侧**的相近前缀，本仓同样不存在，
 //! 一律**干净 404**（集成测试 `tests/print_template/resolve.rs` 有钉死用例）：
@@ -73,12 +77,19 @@
 //! ## 本域**刻意不装** `assert_no_foreign_domain` 域隔离护栏
 //!
 //! 与 `prod::scan` / `wx` 同款「**转发型**域」：本域的字节读写**全部**经
-//! `files::part_file`（`upload_file_for_owner` / `get_file_row` / `get_file_content`
-//! / `soft_delete_file`），这是设计（复用 `t_part_file`，见上表）而不是越界。
+//! `files::part_file`（`upload_file_for_owner` / `get_file_row` /
+//! `get_file_content_for_row` / `soft_delete_file` / `list_with_filters`），
+//! 这是设计（复用 `t_part_file`，见上表）而不是越界。
 //! 硬装这道护栏只会逼出「把 files 域的写法复制一份到本域」这种更糟的结果。
 //! 本域对 `t_customer` 的两处读（`parent_id IS NULL` 强制点、`resolve` 的客户名）
 //! SQL 写在本域 service 里，属既定的「只读跨域聚合」pattern（`dashboard` /
 //! `statistics` / `prod::inspection` 同款），**不 import** `com::customer` 任何符号。
+//!
+//! ⚠️ **端点 4 取字节走的是 files 域最底层的 `get_file_content_for_row`**
+//! （**不判权限、不判 kind、不查库**）而不是 `get_file_content`：权限点
+//! `delivery_note.print` 由本域 handler 判（本域刻意不套 files 域那张 5 角色表
+//! —— 一个只持该权限点、不在表内的账号不该被二次拒绝），kind 校验在本域 service
+//! 里比 `row.kind`（错误码 **21101**，files 域的白名单侧是 **21102**，刻意不同）。
 //!
 //! ## 结构（**转发式**，见 CLAUDE.md「路由声明规约」第 9 条）
 //!

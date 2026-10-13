@@ -1,6 +1,6 @@
 //! 端点 3 / 4：`GET /print-templates/resolve` 与 `GET /{id}/content`
 //!
-//! 覆盖 10 组场景（★ = 核心回归）：
+//! 覆盖 15 组场景（★ = 核心回归）：
 //! 1. ★ `resolve_hit_returns_template_and_customer_name`
 //! 2. ★ `resolve_miss_returns_21109_with_http_422` —— **HTTP 状态码是 422**
 //!    （2026-10-16 新选，python 转发时代是 400）
@@ -11,12 +11,25 @@
 //! 7. ★ `content_of_non_template_file_returns_21101` —— 传一个图纸 id
 //! 8. ★ `clerk_cannot_bypass_via_generic_upload_endpoint` —— CLERK 打
 //!    `POST /files/objects`（通用上传原语）也造不出模板行
-//! 9. ★ `old_paths_return_404` —— `/api/v2/com/delivery/template/*` 与
-//!    `/api/v2/print-template/*`（少个 s）
-//! 10. `resolve_without_static_path_swallowing` —— matchit 实测：静态段没被吞
+//! 9. ★ `manager_bypass_control_group_really_reaches_the_generic_endpoint` ——
+//!    上一条的**对照组**（换个角色同一 body 就成功 ⇒ 被拒的确实是角色闸门）
+//! 10. ★ `clerk_cannot_bypass_via_generic_confirm_endpoint` —— **第二条写入口**
+//!     （`POST /files/objects/confirm`）同样被收口
+//! 11. ★ `manager_cannot_write_template_via_confirm_endpoint` —— confirm 端点
+//!     **不接受** CUSTOMER（20104）
+//! 12. ★ `clerk_cannot_get_delivery_template_presigned_url` —— 通用 `/url` 端点
+//!     的 kind 白名单
+//! 13. ★ `shelf_account_list_never_sees_delivery_template_rows` —— 通用列表端点
+//!     永不返回模板行
+//! 14. ★ `shelf_account_cannot_get_delivery_template_bytes` —— 通用 `/content`
+//!     端点的 kind 白名单
+//! 15. ★ `old_paths_return_404` —— `/api/v2/com/delivery/template/*` 与
+//!     `/api/v2/print-template/*`（少个 s）
+//! 16. `resolve_and_static_paths_are_not_swallowed` —— matchit 实测：静态段没被吞
 
 use axum::http::StatusCode;
 use hsh_erp_test_support::{json_request, send, send_raw};
+use serde_json::json;
 
 use crate::{
     Ctx, assert_biz_code, bootstrap, fetch_content, minimal_xlsx_bytes, resolve,
@@ -222,11 +235,12 @@ async fn content_bytes_are_byte_identical_to_upload() {
 /// ★ 传一个**图纸 id**（`kind='DRAWING'`）给 `/{id}/content` ⇒ `21101`（404）。
 ///
 /// kind 校验在 `print_template::service::get_template_content` 里，且**在取字节
-/// 之前** —— 非法 kind 零 COS IO。
+/// 之前** —— 非法 kind 零 COS IO（反例行的 `object_key` 是假的，真去拉就会炸）。
 #[tokio::test]
 async fn content_of_non_template_file_returns_21101() {
     let ctx = bootstrap().await;
-    // 借 `POST /files/objects` 造一行 DRAWING（owner_kind=PART，绑本域无关的 part）
+    // 直插一行 DRAWING（owner 是本域无关的散件 part），见 `insert_drawing_row`
+    // 的 doc：刻意不走 API，避免这条守卫用例多三行 multipart 样板。
     let part_id = crate::insert_part_for_drawing(&ctx).await;
     let drawing_id = crate::insert_drawing_row(&ctx, part_id).await;
 
@@ -235,20 +249,26 @@ async fn content_of_non_template_file_returns_21101() {
 }
 
 // ===========================================================================
-//  8. 通用上传入口的绕行面
+//  8. 通用上传原语的绕行面（两条写入口）
 // ===========================================================================
 
 /// ★ CLERK 经 `POST /api/v2/files/objects`（**files 域的通用上传原语**）
-/// 也造不出 `DELIVERY_TEMPLATE` 行 ⇒ 403，且该 L1 名下**没有**模板行。
+/// 也造不出 `DELIVERY_TEMPLATE` 行 ⇒ **403**，且该 L1 名下**没有**模板行。
 ///
 /// ⚠️ 这是本域最容易被绕开的一处：`POST /print-templates` 有 MANAGER 守卫，
 /// 但 `POST /files/objects` 的 `owner_kind` / `kind` 都由 client 在 multipart
 /// `data` 里给。只在域内 handler 守 MANAGER 是不够的 ——
 /// 所以 `PartFileService::upload_file_for_owner` 里有那道按 `owner_kind`
-/// 分派角色的闸门（2026-10-16 新增）。本用例从**外部**钉住它。
+/// 分派角色的闸门（`policy::write_roles_for`）。本用例从**外部**钉住它。
+///
+/// ⚠️⚠️ **本用例必须显式打 `/files/objects`（`multipart_request_to`）**：
+/// 2026-10-16 首版误用了 uri 写死成 `/print-templates` 的 `multipart_request`，
+/// 于是 403 来自**本域自己的** handler 守卫、`data` 里的 `owner_kind` / `kind`
+/// 压根没被解析 ⇒ 断言恒真、什么也没钉到（review 第 1 轮 MAJOR-4）。
+/// 现在打的是真的通用上传端点，且 `data` 的形状就是它的 `UploadFileData`。
 #[tokio::test]
 async fn clerk_cannot_bypass_via_generic_upload_endpoint() {
-    use crate::{multipart_request, send_multipart};
+    use crate::{multipart_request_to, send_multipart};
     let ctx = bootstrap().await;
     let bytes = minimal_xlsx_bytes("bypass attempt");
 
@@ -258,7 +278,8 @@ async fn clerk_cannot_bypass_via_generic_upload_endpoint() {
     );
     let (status, env) = send_multipart(
         &ctx,
-        multipart_request(
+        multipart_request_to(
+            "/files/objects",
             Some(&data),
             Some((
                 "file",
@@ -271,13 +292,300 @@ async fn clerk_cannot_bypass_via_generic_upload_endpoint() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::FORBIDDEN, "CLERK 绕行必须 403：{env}");
+    assert_biz_code(status, &env, 40300, StatusCode::FORBIDDEN);
     assert!(
         rows_for_owner_kind(&ctx.pool, ctx.l1_id, "DELIVERY_TEMPLATE")
             .await
             .is_empty(),
-        "绕行失败不得留下任何行"
+        "绕行失败不得留下任何行：{env}"
     );
+}
+
+/// ★ **正向对照**：同一个 multipart、换成 **Manager** 打同一个 `/files/objects`
+/// ⇒ 会**真的写进去**（201）。
+///
+/// ⚠️ 这条是上一条的**对照组**，缺了它上一条就没有意义：403 可能来自任何一层
+/// （本域 handler、`owner_kind` × `kind` 配对、扩展名、content_type……），
+/// 只有「同样的 body 换个角色就成功」才能证明被拒的**唯一**原因是角色闸门，
+/// 且证明请求**真的打到了 `POST /files/objects`**（打错 URL 的话这条会红）。
+#[tokio::test]
+async fn manager_bypass_control_group_really_reaches_the_generic_endpoint() {
+    use crate::{multipart_request_to, send_multipart};
+    let ctx = bootstrap().await;
+    let bytes = minimal_xlsx_bytes("bypass control");
+
+    let data = format!(
+        r#"{{"owner_kind":"CUSTOMER","owner_id":"{}","kind":"DELIVERY_TEMPLATE"}}"#,
+        ctx.other_l1_id
+    );
+    let (status, env) = send_multipart(
+        &ctx,
+        multipart_request_to(
+            "/files/objects",
+            Some(&data),
+            Some((
+                "file",
+                "对照.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                &bytes,
+            )),
+            Some(&ctx.manager_token),
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "Manager 打通用端点应成功：{env}"
+    );
+    assert_eq!(env["data"]["kind"], "DELIVERY_TEMPLATE");
+    assert_eq!(env["data"]["owner_kind"], "CUSTOMER");
+    assert_eq!(
+        rows_for_owner_kind(&ctx.pool, ctx.other_l1_id, "DELIVERY_TEMPLATE")
+            .await
+            .len(),
+        1,
+        "对照组必须真的落库 —— 否则上面那条 403 用例是恒真绿"
+    );
+}
+
+/// ★ CLERK 经 `POST /api/v2/files/objects/confirm`（**第二条**写入口，STS 直传回执）
+/// 同样造不出模板行 ⇒ 403，且零副作用。
+///
+/// ⚠️ 这是 2026-10-16 首版**真正漏掉**的那条路径（review 第 1 轮 MAJOR-1）：
+/// 本轮给 `owner_kind_allows_kind` 加了 `CUSTOMER => DELIVERY_TEMPLATE`，而
+/// `bind_uploaded_file` 的角色闸门恒是 `M + C`、**与 `owner_kind` 无关** ⇒
+/// CLERK 打 confirm 能造出并**替换掉**任意未软删客户名下的模板行。
+/// 现已与 `upload_file_for_owner` 共用 `policy::write_roles_for`。
+///
+/// 断言的形态刻意挑在**任何外部 IO 之前**：body 里的 `tmp_key` 是假的
+/// （`head_object` 必失败），所以「真的走到了 head 那一步」会换成 21114；
+/// 拿到 403 就证明闸门排在它前面。
+#[tokio::test]
+async fn clerk_cannot_bypass_via_generic_confirm_endpoint() {
+    use hsh_erp_test_support::{json_request, send};
+
+    let ctx = bootstrap().await;
+    let body = json!({
+        "owner_kind": "CUSTOMER",
+        "owner_id": ctx.l1_id.to_string(),
+        "kind": "DELIVERY_TEMPLATE",
+        "tmp_key": "tmp/never-uploaded.xlsx",
+        "content_sha256": "a".repeat(64),
+        "original_filename": "confirm绕行.xlsx",
+        "file_size": "1024",
+        "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    });
+    let (status, env) = send(
+        ctx.app.clone(),
+        json_request(
+            "POST",
+            "/files/objects/confirm",
+            Some(body),
+            Some(&ctx.clerk_token),
+        ),
+    )
+    .await;
+
+    assert_biz_code(status, &env, 40300, StatusCode::FORBIDDEN);
+    assert!(
+        rows_for_owner_kind(&ctx.pool, ctx.l1_id, "DELIVERY_TEMPLATE")
+            .await
+            .is_empty(),
+        "confirm 绕行失败不得留下任何行：{env}"
+    );
+}
+
+/// ★ **Manager** 打 confirm 写 `CUSTOMER` 也被拒 ⇒ **20104**（不是 201 Created）。
+///
+/// ⚠️ 这条钉的是 MAJOR-1 的**第二个缺口**：角色闸门只保证「到得了这里」，而
+/// confirm 端点**没有**本域那两条业务不变式（「只绑一级客户」在
+/// `print_template::service::customer_is_l1`，「替换语义」在上传流程里）⇒
+/// Manager 经它能造出一行绑在**二级客户** id 上的模板行，绕过 L1-only 规则。
+/// 本域零个合法 CUSTOMER confirm 调用方，故直接拒（错误码 20104：不是权限问题，
+/// 是「这个 owner 类型本端点不服务」）。
+#[tokio::test]
+async fn manager_cannot_write_template_via_confirm_endpoint() {
+    use hsh_erp_test_support::{json_request, send};
+
+    let ctx = bootstrap().await;
+    let body = json!({
+        "owner_kind": "CUSTOMER",
+        "owner_id": ctx.l1_id.to_string(),
+        "kind": "DELIVERY_TEMPLATE",
+        "tmp_key": "tmp/never-uploaded.xlsx",
+        "content_sha256": "b".repeat(64),
+        "original_filename": "manager确认.xlsx",
+        "file_size": "1024",
+        "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    });
+    let (status, env) = send(
+        ctx.app.clone(),
+        json_request(
+            "POST",
+            "/files/objects/confirm",
+            Some(body),
+            Some(&ctx.manager_token),
+        ),
+    )
+    .await;
+
+    assert_biz_code(status, &env, 20104, StatusCode::BAD_REQUEST);
+    assert!(
+        rows_for_owner_kind(&ctx.pool, ctx.l1_id, "DELIVERY_TEMPLATE")
+            .await
+            .is_empty(),
+        "被拒后不得留下任何行：{env}"
+    );
+}
+
+// ===========================================================================
+//  8b. 通用读端点的越权面（2026-10-16 review 第 1 轮 MAJOR-2 / MAJOR-3）
+// ===========================================================================
+
+/// ★ CLERK 打 `GET /api/v2/files/objects/{模板 id}/url` ⇒ **21102**（不是预签直链）。
+///
+/// ⚠️ `url` 与 `content` 是同一个「按 id 拿字节」动作，守卫分别是权限点
+/// `part.drawing.print`（默认矩阵含 CLERK / INSPECTOR / CNC）与本域 5 角色。
+/// 2026-10-16 首版只给 `content` 加了 kind 白名单 ⇒ CLERK / INSPECTOR / CNC
+/// 能拿到任意客户送货单打印模板的 **1 小时 COS 预签直链**（拿到即可脱离本后端
+/// 直接下载），完全绕过 content 侧那道守卫。现两条共用
+/// `policy::is_file_content_kind`。
+#[tokio::test]
+async fn clerk_cannot_get_delivery_template_presigned_url() {
+    use hsh_erp_test_support::{json_request, send};
+
+    let ctx = bootstrap().await;
+    let id = seed_template(&ctx, ctx.l1_id).await;
+
+    // 对照组：同一个 token 打**图纸**行的同一条端点 ⇒ 200（证明守卫判的是 kind
+    // 而不是「所有 file_id 都 21102」）。DRAWING 行由直插 helper 造。
+    let part_id = crate::insert_part_for_drawing(&ctx).await;
+    let drawing_id = crate::insert_drawing_row(&ctx, part_id).await;
+
+    let (status, env) = send(
+        ctx.app.clone(),
+        json_request(
+            "GET",
+            &format!("/files/objects/{id}/url"),
+            None,
+            Some(&ctx.clerk_token),
+        ),
+    )
+    .await;
+    assert_biz_code(status, &env, 21102, StatusCode::BAD_REQUEST);
+
+    let (status, env) = send(
+        ctx.app.clone(),
+        json_request(
+            "GET",
+            &format!("/files/objects/{drawing_id}/url"),
+            None,
+            Some(&ctx.clerk_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "图纸行同端点仍应放行：{env}");
+    assert!(
+        env["data"]["download_url"].as_str().is_some(),
+        "对照组应拿到预签直链：{env}"
+    );
+}
+
+/// ★ SHELF_ACCOUNT 打 `GET /api/v2/files/objects`（通用列表）**列不出**模板元数据。
+///
+/// ⚠️ 出参含 `owner_id`(= 一级客户 id) / `object_key` / `original_filename` /
+/// `content_sha256` —— 那正是「按 id 取字节」越权链的**发现**环节。2026-10-16 首版
+/// 不传 `kind` 就没 kind 谓词 ⇒ 工控机账号能列出全部客户的模板行（review 第 1 轮
+/// MAJOR-3）。现 `PartFileService::list_files` **无条件**排除 `DELIVERY_TEMPLATE`。
+#[tokio::test]
+async fn shelf_account_list_never_sees_delivery_template_rows() {
+    use hsh_erp_test_support::{json_request, send};
+
+    let ctx = bootstrap().await;
+    let id = seed_template(&ctx, ctx.l1_id).await;
+    seed_template(&ctx, ctx.other_l1_id).await;
+
+    // 缺省（不带 kind）⇒ 0 条
+    let (status, env) = send(
+        ctx.app.clone(),
+        json_request("GET", "/files/objects", None, Some(&ctx.shelf_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{env}");
+    assert_eq!(env["data"]["total"], 0, "模板行不得进通用列表：{env}");
+
+    // ⚠️ 显式 `?kind=DELIVERY_TEMPLATE` **也**是 0 条（只在缺省时排除的话，
+    // 攻击者补一个 kind 参数就绕回来了 —— `kind` 是自由文本、不做枚举校验）。
+    let (status, env) = send(
+        ctx.app.clone(),
+        json_request(
+            "GET",
+            "/files/objects?kind=DELIVERY_TEMPLATE",
+            None,
+            Some(&ctx.shelf_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{env}");
+    assert_eq!(env["data"]["total"], 0, "显式指定 kind 也不得放行：{env}");
+
+    // 对照组：SHELF_ACCOUNT 仍能列**图纸**行（不能把这条端点整体关死）
+    let part_id = crate::insert_part_for_drawing(&ctx).await;
+    let drawing_id = crate::insert_drawing_row(&ctx, part_id).await;
+    let (status, env) = send(
+        ctx.app.clone(),
+        json_request(
+            "GET",
+            &format!("/files/objects?owner_id={part_id}"),
+            None,
+            Some(&ctx.shelf_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{env}");
+    let ids: Vec<&str> = env["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|it| it["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![drawing_id.to_string()], "只应出图纸行：{env}");
+    assert!(ids.iter().all(|s| *s != id.to_string()));
+}
+
+/// ★ `SHELF_ACCOUNT` 打 `GET /api/v2/files/objects/{模板 id}/content` ⇒ **21102**。
+///
+/// 这是 2026-10-16 首版就有的那道守卫（工控机账号不能读客户的送货单抬头），
+/// 本轮把它与 `/url` 并成同一张 `policy::is_file_content_kind` 白名单后重新钉一遍，
+/// 防止「提 predicate 时把 content 侧漏掉」。
+#[tokio::test]
+async fn shelf_account_cannot_get_delivery_template_bytes() {
+    let ctx = bootstrap().await;
+    let id = seed_template(&ctx, ctx.l1_id).await;
+
+    let (status, _, _) = fetch_content(&ctx, id, &ctx.shelf_token).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "content 端点本就 403（角色）"
+    );
+
+    // 换成「有 content 权限的角色」打同一条路 ⇒ 角色过了、被 kind 白名单拦下。
+    // 用 CLERK（本域 5 角色之一）走 files 域的 content 端点（不是本域的）。
+    use hsh_erp_test_support::{json_request, send};
+    let (status, env) = send(
+        ctx.app.clone(),
+        json_request(
+            "GET",
+            &format!("/files/objects/{id}/content"),
+            None,
+            Some(&ctx.clerk_token),
+        ),
+    )
+    .await;
+    assert_biz_code(status, &env, 21102, StatusCode::BAD_REQUEST);
 }
 
 // ===========================================================================

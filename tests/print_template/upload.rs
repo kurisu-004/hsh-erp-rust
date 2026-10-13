@@ -91,7 +91,7 @@ async fn upload_happy_path_writes_delivery_template_row() {
 
     // 字节确实落进了 COS（内容寻址 ⇒ 重传幂等）
     assert_eq!(
-        ctx.cos.get(object_key).as_deref(),
+        ctx.cos.stored_bytes(object_key).as_deref(),
         Some(bytes.as_slice()),
         "上传的字节应落在 object_key 指向的对象上"
     );

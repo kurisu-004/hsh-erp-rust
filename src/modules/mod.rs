@@ -179,9 +179,13 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // （`GET /resolve`、`GET /{id}/content`）用**权限点 `delivery_note.print`**
         // （默认矩阵 M / C / I）—— 打印对话框是 CLERK / INSPECTOR 在用，
         // 绝不能 MANAGER-only。守卫写在各 handler 第一行，此处不挂 role layer。
-        // 前缀 `/print-templates`：与前端菜单 `template_management` /
-        // `print_templates_designer` 的 `path='/print-templates'` **逐字一致**
-        // （故刻意不是别的词形）。顶层 nest、单段、kebab-case。
+        // 前缀 `/print-templates`：与前端菜单的**子项**
+        // `print_templates_designer`（`template_management` 下的「模板编辑」）的
+        // `path='/print-templates'` **逐字一致**（故刻意不是别的词形）。
+        // ⚠️ 一级菜单 `template_management`（「模板管理」）自己的 `path` 是 **NULL**
+        //（它是目录项、不指向页面）—— 2026-10-16 review 第 1 轮 MINOR-4 订正：
+        // 原注释把 path 记在 `template_management` 名下，与 `seeds/menu.sql`
+        // 实际不符。顶层 nest、单段、kebab-case。
         // 权威路由清单：`print_template::handler::ROUTES`（5 条，lib 单测比对）。
         // 完整契约见 `docs/api/print_template.md`。
         .nest("/print-templates", print_template::router())

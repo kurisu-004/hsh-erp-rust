@@ -295,7 +295,6 @@ pub async fn get_template_content(
         state.cos.clone(),
         &state.config.cos.upload_prefix,
         template_id,
-        &current,
     )
     .await?;
     drop(conn);

@@ -48,6 +48,14 @@
 --   走的是「软删旧行 + 重新 PUT + INSERT 新行」，CAS 命中的省流优化在
 --   替换语义下取不到 —— 代价是一次幂等的 COS PUT（key 是内容寻址的），
 --   登记在 `docs/api/print_template.md` §8.3 第 3 条。
+-- ⚠️ **索引重建不加 `CONCURRENTLY`**（2026-10-16 review 第 1 轮 NIT-2 登记）：
+--   `CREATE INDEX CONCURRENTLY` **不能在事务块里执行**，而 sqlx 的每条迁移默认包在
+--   一个事务内 ⇒ 要用它就得在本迁移顶部声明 no-transaction，并接受「失败时可能留下
+--   INVALID 索引、需手工 DROP 重建」的额外恢复路径。代价对比：`t_part_file` 是
+--   **小表**（每个 owner 至多几条文件行），重建与加约束的锁窗口是毫秒级；拿
+--   「迁移可能失败到一半」换一个本可忽略的锁窗口不划算。
+--   ⚠️ 若将来 `t_part_file` 长到百万行级，**必须**改走 no-transaction +
+--   `CREATE INDEX CONCURRENTLY`，并同步改写本段说明。
 -- ============================================================================
 
 ALTER TABLE public.t_part_file DROP CONSTRAINT ck_t_part_file_kind;

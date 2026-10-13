@@ -19,36 +19,38 @@
 //!   （同全仓其它 HTTP 契约测试同款前提）。跨 worktree 用
 //!   `TEST_REDIS_URL=redis://localhost:<port>/0` 覆盖。
 //!
-//! ## ⚠️ 本 binary 自带一个 `MemoryCos`（**不是** fixture，是测试替身）
+//! ## COS 替身：`test-support` 的 `MockCos`（2026-10-16 review 第 1 轮 MINOR-6 改）
 //!
-//! `test-support` 的 `NoopCos.get_object` 恒返**空字节**、`MockCos.put_object`
-//! **不保存**字节 —— 两者都无法支撑「`GET /{id}/content` 返回的字节与上传的
-//! 字节逐字节相等」这条 ★ 核心回归。故本文件底部实现一个最小的内存 COS：
-//! `Mutex<HashMap<String, Vec<u8>>>`，`head_object` 报真实 size（让
-//! `PartFileService::resolve_effective_key` 的第一跳命中）、`get_object` 返真实
-//! 字节。其余方法走最小可用行为。
+//! 本 binary 早先自带一个 `MemoryCos`（`Mutex<HashMap>`），理由是
+//! `NoopCos.get_object` 恒返空字节、而当时的 `MockCos.put_object` **不保存**
+//! 字节 —— 两者都钉不到「`GET /{id}/content` 返回的字节与上传的字节逐字节相等」
+//! 这条 ★ 核心回归。那是**重复造轮子**（仓内第 3 个 COS 替身），现已把能力上提到
+//! `MockCos`（`put` 真存字节 + `head_object` 报真实 size、`delete` 真删字节），
+//! 本 binary 直接复用它。
+//!
+//! ⚠️ **替身掩盖的两条路径仍然零覆盖**（登记在
+//! `docs/api/print_template.md` §8.3）：① 真实 COS 的**错误分类**（替身对缺失
+//! key 返 `BIZ_PART_FILE_UPLOAD_FAILED`，真 COS 是 `NoSuchKey`）；② **etag 语义**
+//! （替身是拼出来的字符串）；③「CAS 命中跳过 COS PUT」那条省流路径本 binary 也
+//! 完全没跑（替换语义下取不到，见该文档 §8.3 第 4 条）。
 
-#![allow(dead_code, clippy::await_holding_lock, unused_imports)]
+#![allow(dead_code)]
 
 mod delete;
 mod resolve;
 mod upload;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, Response, StatusCode, header};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 
 use hsh_erp_rust::infra::clock::now_naive;
-use hsh_erp_rust::infra::cos::{CosClient, ObjectMeta};
-use hsh_erp_rust::shared::error::{AppError, code};
 use hsh_erp_test_support::{
-    PartFixture, load_part_fixture, login_token, shared_test_snowflake, test_app, test_pool,
-    test_state_with_cos,
+    MockCos, PartFixture, load_part_fixture, login_token, shared_test_snowflake, test_app,
+    test_pool, test_state_with_cos,
 };
 
 // ===========================================================================
@@ -63,8 +65,8 @@ use hsh_erp_test_support::{
 pub(crate) struct Ctx {
     pub pool: PgPool,
     pub app: axum::Router,
-    /// 内存 COS 替身（断言「删除后 spawn 确实删了对象」用）。
-    pub cos: Arc<MemoryCos>,
+    /// 内存 COS 替身（断言「删除后 spawn 确实删了对象」用 `stored_bytes`）。
+    pub cos: Arc<MockCos>,
     pub manager_token: String,
     pub clerk_token: String,
     pub inspector_token: String,
@@ -80,7 +82,7 @@ pub(crate) struct Ctx {
 pub(crate) async fn bootstrap() -> Ctx {
     let pool = test_pool().await;
     let fx = load_part_fixture(&pool).await;
-    let cos = Arc::new(MemoryCos::new());
+    let cos = Arc::new(MockCos::new());
     let state = test_state_with_cos(pool.clone(), cos.clone()).await;
     let app = test_app(state);
 
@@ -186,25 +188,38 @@ pub(crate) fn multipart_body(
 }
 
 /// 构造一个 multipart 请求（`data` + `file`），带 Bearer。
+///
+/// ⚠️ **uri 固定是 `/print-templates`**（本域端点 1）。要打别的 multipart 端点
+/// （典型是 `POST /files/objects` 那个**通用上传原语**，见 review 第 1 轮 MAJOR-4）
+/// 必须显式调 [`multipart_request_to`] —— 2026-10-16 首版这条 helper 把 uri 写死、
+/// 又被「CLERK 绕行」用例复用，于是那条用例其实打的是 `/print-templates`（被本域
+/// 自己的 `require_role(Manager)` 挡下），**恒真绿**、什么也没钉到。
 pub(crate) fn multipart_request(
     data: Option<&str>,
     file: Option<(&str, &str, &str, &[u8])>,
     bearer: Option<&str>,
 ) -> Request<Body> {
+    multipart_request_to("/print-templates", data, file, bearer)
+}
+
+/// 同 [`multipart_request`]，但**显式给 uri**。
+pub(crate) fn multipart_request_to(
+    uri: &str,
+    data: Option<&str>,
+    file: Option<(&str, &str, &str, &[u8])>,
+    bearer: Option<&str>,
+) -> Request<Body> {
     let body = multipart_body(data, file);
-    let mut builder = Request::builder()
-        .method("POST")
-        .uri("/print-templates")
-        .header(
-            header::CONTENT_TYPE,
-            format!("multipart/form-data; boundary={MP_BOUNDARY}"),
-        );
+    let mut builder = Request::builder().method("POST").uri(uri).header(
+        header::CONTENT_TYPE,
+        format!("multipart/form-data; boundary={MP_BOUNDARY}"),
+    );
     if let Some(t) = bearer {
         builder = builder.header(header::AUTHORIZATION, format!("Bearer {t}"));
     }
     builder
         .body(Body::from(body))
-        .expect("multipart_request: build request")
+        .expect("multipart_request_to: build request")
 }
 
 // ===========================================================================
@@ -247,17 +262,6 @@ pub(crate) async fn send_multipart(ctx: &Ctx, req: Request<Body>) -> (StatusCode
     let env: Value = serde_json::from_slice(&raw)
         .unwrap_or_else(|e| panic!("parse JSON: {e}; raw = {}", String::from_utf8_lossy(&raw)));
     (status, env)
-}
-
-/// 打一个 multipart 请求并拿**原始文本** body（用于 422 纯文本断言）。
-pub(crate) async fn send_multipart_raw(ctx: &Ctx, req: Request<Body>) -> (StatusCode, String) {
-    use tower::ServiceExt;
-    let resp: Response<Body> = ctx.app.clone().oneshot(req).await.expect("oneshot");
-    let status = resp.status();
-    let raw = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .expect("read body");
-    (status, String::from_utf8_lossy(&raw).into_owned())
 }
 
 /// `GET /print-templates/{id}/content` → `(status, headers, 字节)`。
@@ -476,107 +480,4 @@ pub(crate) async fn insert_drawing_row(ctx: &Ctx, part_id: i64) -> i64 {
     .await
     .expect("insert t_part_file DRAWING");
     id
-}
-
-// ===========================================================================
-//  MemoryCos：最小内存 COS 替身
-// ===========================================================================
-
-/// 最小内存 COS（`Mutex<HashMap<key, bytes>>`）。
-///
-/// 为什么不用 `test-support` 的两个：
-/// - `NoopCos.get_object` 恒返**空字节** ⇒ 钉不到「返回字节 == 上传字节」；
-/// - `MockCos.put_object` **不保存**字节、`get_object` 只查预注册的
-///   `get_responses` ⇒ 走真实上传路径后必然拿不到内容。
-///
-/// `head_object` 报**真实** size：这是关键 —— `PartFileService::
-/// resolve_effective_key` 第一跳就 `head_object(db_key)`，命中即直接用 db_key，
-/// 后面 `get_object` 也能命中同一个 key。size 报 0 会让路径退化到 legacy 解析分支。
-pub(crate) struct MemoryCos {
-    objects: std::sync::Mutex<HashMap<String, Vec<u8>>>,
-}
-
-impl MemoryCos {
-    pub(crate) fn new() -> Self {
-        Self {
-            objects: std::sync::Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// 取某个 key 当前的字节（断言「上传确实落了对象」用）。
-    pub(crate) fn get(&self, key: &str) -> Option<Vec<u8>> {
-        self.objects.lock().unwrap().get(key).cloned()
-    }
-}
-
-#[async_trait]
-impl CosClient for MemoryCos {
-    async fn put_object(
-        &self,
-        key: &str,
-        body: Vec<u8>,
-        _content_type: &str,
-    ) -> Result<(), AppError> {
-        self.objects.lock().unwrap().insert(key.to_string(), body);
-        Ok(())
-    }
-
-    async fn get_object(&self, key: &str) -> Result<Vec<u8>, AppError> {
-        self.objects
-            .lock()
-            .unwrap()
-            .get(key)
-            .cloned()
-            .ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_PART_FILE_UPLOAD_FAILED,
-                    format!("MemoryCos get_object NoSuch key={key}"),
-                )
-            })
-    }
-
-    async fn presigned_get_url(
-        &self,
-        key: &str,
-        _expires_seconds: u32,
-    ) -> Result<String, AppError> {
-        Ok(format!("memory://{key}"))
-    }
-
-    async fn delete_object(&self, key: &str) -> Result<(), AppError> {
-        // 幂等：NoSuchKey 也视为成功（与真实 COS 一致，也与 files 域 handler
-        // 的「spawn best-effort 清理」语义一致）
-        self.objects.lock().unwrap().remove(key);
-        Ok(())
-    }
-
-    async fn head_object(&self, key: &str) -> Result<ObjectMeta, AppError> {
-        let objs = self.objects.lock().unwrap();
-        match objs.get(key) {
-            Some(bytes) => Ok(ObjectMeta {
-                size: bytes.len() as i64,
-                etag: format!("mem-{}", &key[key.len().saturating_sub(8)..]),
-            }),
-            None => Err(AppError::biz(
-                code::BIZ_PART_FILE_UPLOAD_FAILED,
-                format!("MemoryCos head_object NoSuch key={key}"),
-            )),
-        }
-    }
-
-    async fn copy_object(&self, src_key: &str, dst_key: &str) -> Result<(), AppError> {
-        let objs = self.objects.lock().unwrap();
-        let src = objs.get(src_key).cloned().ok_or_else(|| {
-            AppError::biz(
-                code::BIZ_PART_FILE_UPLOAD_FAILED,
-                format!("MemoryCos copy_object NoSuch src={src_key}"),
-            )
-        })?;
-        drop(objs);
-        self.objects
-            .lock()
-            .unwrap()
-            .insert(dst_key.to_string(), src);
-        Ok(())
-    }
 }

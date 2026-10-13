@@ -121,11 +121,18 @@ pub trait PartFileRepoTrait: Send {
         kind: &'a str,
         sha: &'a str,
     ) -> Result<Option<TPartFile>, sqlx::Error>;
+    /// `exclude_kind` 是 2026-10-16 review 第 1 轮 MAJOR-3 新增的形参：把某个 kind
+    /// 从结果里**排除**（与 `kind` 的「只取某个 kind」正交，两者同时生效）。
+    /// ⚠️ 它的存在理由是 `kind` 形参**不能**表达这件事：调用方若只想「排除模板
+    /// 行」就必须自己知道别的 kind 全集，而新增 kind 时那个全集必然过期。
+    /// 本域通用列表端点传 `Some("DELIVERY_TEMPLATE")`；`print_template` 域自己
+    /// 列举模板时传 `None`（它要的正是这一种 kind）。
     async fn list_with_filters<'a>(
         &mut self,
         owner_kind: &'a str,
         owner_id: Option<i64>,
         kind: Option<&'a str>,
+        exclude_kind: Option<&'a str>,
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<TPartFile>, i64), sqlx::Error>;
@@ -245,11 +252,20 @@ impl PartFileRepoTrait for &mut PgConnection {
         owner_kind: &'b str,
         owner_id: Option<i64>,
         kind: Option<&'b str>,
+        exclude_kind: Option<&'b str>,
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<TPartFile>, i64), sqlx::Error> {
-        PartFileRepo::list_with_filters(&mut **self, owner_kind, owner_id, kind, limit, offset)
-            .await
+        PartFileRepo::list_with_filters(
+            &mut **self,
+            owner_kind,
+            owner_id,
+            kind,
+            exclude_kind,
+            limit,
+            offset,
+        )
+        .await
     }
 
     async fn list_by_owner<'b>(

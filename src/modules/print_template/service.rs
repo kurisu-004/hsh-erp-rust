@@ -239,6 +239,10 @@ pub async fn resolve_template(
 /// list_with_filters` 的 `owner_kind` 形参**不进 SQL**（表上没有 owner 列，
 /// 见 `files/part_file/mod.rs` 已知偏差第 9 条），所以 `kind` 谓词是本端点
 /// **唯一**的隔离依据 —— 漏传会把零件图纸 / 装配件整图一并列出来。
+/// ⚠️ **必须传 `exclude_kind = None`**：该形参是 files 域通用列表端点那道守卫的
+/// 入口（`PartFileService::list_files` 传 `Some("DELIVERY_TEMPLATE")`，2026-10-16
+/// review 第 1 轮 MAJOR-3）—— 本端点要的**正是**这一种 kind，排除它就把自己
+/// 清空了。两条路径互相独立，**不要**「顺手把两边统一成同一张表」。
 pub async fn list_templates(
     conn: &mut PgConnection,
     customer_id: Option<i64>,
@@ -252,6 +256,7 @@ pub async fn list_templates(
             OWNER_KIND,
             customer_id,
             Some(TEMPLATE_KIND),
+            None,
             limit,
             offset,
         )
@@ -268,17 +273,23 @@ pub async fn list_templates(
 
 /// 取模板字节（后端代理）。
 ///
-/// ⚠️ **kind 校验在这里**（不在 `files` 域的 `/objects/{id}/content`）—— 那条
-/// 路由虽然也在 2026-10-16 加了 kind 白名单，但它**放 `SHELF_ACCOUNT`**
-/// （工控机预览图纸）且是 files 域自己的权限面；本端点用权限点
-/// `delivery_note.print`（M / C / I），是**打印**语义。两者的角色集合刻意不同。
+/// ⚠️ kind 校验在这里（不在 `files` 域的 `/objects/{id}/content`）—— 那条
+/// 路由的 kind 白名单（`policy::is_file_content_kind`）**刻意不含**本 kind，
+/// 且它的角色集合含 `SHELF_ACCOUNT`（工控机预览图纸）、是 files 域自己的权限面；
+/// 本端点用权限点 `delivery_note.print`（M / C / I），是**打印**语义。两者的
+/// 角色集合与错误码（那边 21102、这边 21101）都刻意不同。
+///
+/// ⚠️ 2026-10-16 review 第 1 轮 MINOR-5：行只取**一次**（判 kind 与取字节共用同一行），
+/// 原先这里 `get_file_row` 一次、`get_file_content` 内部又 `get_by_id` 一次。
+/// 取字节走 files 域最底层的 `get_file_content_for_row`（**不判权限、不判 kind**）
+/// —— 权限点由本域 handler 判、CNC_PROGRAMMER 这类「不在 files 域 5 角色表里但持
+/// `delivery_note.print`」的账号不该被二次拒绝。
 pub async fn get_template_content(
     part_file_service: &PartFileService,
     conn: &mut PgConnection,
     cos: std::sync::Arc<dyn crate::infra::cos::CosClient>,
     cfg_upload_prefix: &str,
     template_id: i64,
-    current: &CurrentUser,
 ) -> Result<PartFileContent, AppError> {
     let row = part_file_service
         .get_file_row(&mut *conn, template_id)
@@ -293,7 +304,7 @@ pub async fn get_template_content(
         ));
     }
     part_file_service
-        .get_file_content(&mut *conn, cos, cfg_upload_prefix, template_id, current)
+        .get_file_content_for_row(cos.as_ref(), cfg_upload_prefix, &row)
         .await
 }
 

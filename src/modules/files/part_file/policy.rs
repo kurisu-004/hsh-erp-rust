@@ -1,4 +1,5 @@
-//! part_file kind → 扩展名 / file_type / 期望 content_type 映射
+//! part_file 的**全部**策略表：kind → 扩展名 / file_type / 期望 content_type、
+//! `owner_kind` × `kind` 配对、写路径的角色分派、取字节端点的 kind 白名单。
 //!
 //! 对齐 Python 后端 `core/_file_kind_policy.py`（2026-09-11 新增）。
 //!
@@ -9,8 +10,18 @@
 //!   3. `content_type` 在 `expected_content_types_for_ext(&ext)` 白名单内 → 否则拒绝
 //! - file_type 由 `file_type_for_ext(&ext)` 推导（`step`/`stp` → `"STEP"` 等），
 //!   避免调用方在 service 里再写一遍映射。
+//!
+//! ## 为什么**读侧**的判定也在这里（2026-10-16 review 第 1 轮 MAJOR-2 补）
+//!
+//! `is_file_content_kind` 原先住在 `handler.rs`，于是「哪些 kind 的字节能从通用
+//! 取字节端点出去」这条**读侧策略**被写在 HTTP 层：service 反过来要用它就得
+//! import handler（反向依赖）。两条取字节的 service 方法
+//! （`get_file_with_url` / `get_file_content_for_row`）都判它 ⇒ 它是**策略**、
+//! 不是某个端点的实现细节，故上提到本文件。
 
 use std::path::Path;
+
+use crate::auth::rbac::Role;
 
 /// kind → 允许的扩展名（小写，不含点）。
 ///
@@ -90,6 +101,100 @@ pub fn owner_kind_allows_kind(owner_kind: &str, kind: &str) -> bool {
         // 这里直接 false（不区分错误码，两道守卫都拒即可）。
         _ => false,
     }
+}
+
+// ===========================================================================
+//  写路径的角色分派（2026-10-16 review 第 1 轮 MAJOR-1 抽出）
+// ===========================================================================
+
+/// `POST /api/v2/files/objects`（multipart 上传）对**非 CUSTOMER** owner 的角色集合。
+///
+/// 取 4 条旧上传端点的**并集**（`upload-drawing` / `upload-3d-model` 是 M+C，
+/// `POST /assemblies/{id}/files` 是 M+C，旧 `POST /part-files/` 是 M+C+CNC），
+/// 逐字不变 —— 见 `part_file/mod.rs` 的「唯一一处权限面放大」一节。
+///
+/// ⚠️ **CUSTOMER owner 不走这份集合**（走 [`write_roles_for`] 的收窄分支）。
+pub const UPLOAD_ROLES: &[Role] = &[Role::Manager, Role::Clerk, Role::CncProgrammer];
+
+/// `POST /api/v2/files/objects/confirm`（STS 直传回执）对**非 CUSTOMER** owner 的角色集合。
+///
+/// 逐字沿用自 part 域搬来的旧 `POST /parts/{id}/files/confirm`（M+C）。
+/// ⚠️ **刻意不与 [`UPLOAD_ROLES`] 合并**：confirm 是「客户端先把对象直传进 tmp 区、
+/// 再回执绑定」的第二段式链路，它历史上就没给过 CncProgrammer；合并成一个表会顺带
+/// 放开 confirm 的 CNC 面 —— 那不是本轮要修的东西（见 `part_file/mod.rs` 的
+/// 「权限面只做收口、不做放开」纪律）。
+pub const CONFIRM_ROLES: &[Role] = &[Role::Manager, Role::Clerk];
+
+/// `CUSTOMER` owner（= 送货单打印模板）的写角色集合：**仅 Manager**。
+///
+/// 这是「CLERK 不能偷偷绑 / 换别人客户的打印模板」的**唯一**收口点，且
+/// **两条写入口共用**（`upload_file_for_owner` 与 `bind_uploaded_file` 都经
+/// [`write_roles_for`]）。
+pub const CUSTOMER_WRITE_ROLES: &[Role] = &[Role::Manager];
+
+/// 把「这条写入口对非 CUSTOMER owner 的角色集合」按 `owner_kind` 收窄。
+///
+/// ## 为什么是「带默认集合的分派函数」而不是一张固定的表
+///
+/// `t_part_file` 有**两条**写入口，而它们对 `PART` / `ASSEMBLY` 的历史角色集合
+/// **本来就不同**（[`UPLOAD_ROLES`] = M+C+CNC 的并集；[`CONFIRM_ROLES`] = M+C）。
+/// 抽成一张固定表会顺手把 confirm 放宽成含 CNC —— 那是一次**权限面放开**，
+/// 与本轮要修的越权方向相反。所以本函数只承载**真正需要跨入口共享**的那一段
+/// （`CUSTOMER` ⇒ 仅 Manager），其余 owner_kind 逐字返回调用方自己的既有集合。
+///
+/// ## 调用方（两处，缺一不可）
+/// - `service::upload_file_for_owner`（`POST /files/objects` 的角色闸门）
+/// - `service::bind_uploaded_file`（`POST /files/objects/confirm` 的角色闸门）
+///
+/// ⚠️ 2026-10-16 review 第 1 轮 MAJOR-1：本轮新增 `owner_kind='CUSTOMER'` 时
+/// 只在 `upload_file_for_owner` 里加了 CUSTOMER 分支，**漏了 confirm 那条**，
+/// 于是 CLERK 打 `POST /files/objects/confirm` 仍能造出（并替换掉）任意客户的
+/// 打印模板行。共用本函数就是防「下次新增 owner_kind 又只改一条入口」。
+pub fn write_roles_for<'a>(owner_kind: &str, default_roles: &'a [Role]) -> &'a [Role] {
+    match owner_kind {
+        "CUSTOMER" => CUSTOMER_WRITE_ROLES,
+        // 未知 owner_kind 由调用方后续的配对守卫报 20104，这里逐字沿用其默认集合
+        // （与本轮之前 `upload_file_for_owner` 的 `_ =>` 臂行为一致）。
+        _ => default_roles,
+    }
+}
+
+/// `GET /objects/{id}/content` 与 `GET /objects/{id}/url` 的 **kind 白名单**
+/// （2026-10-16 新增于 handler，2026-10-16 review 第 1 轮 MAJOR-2 提到本文件）。
+///
+/// ## 为什么要这道守卫
+///
+/// 两条端点都是「按 id 拿字节」，守卫分别是 5 角色白名单（content，含
+/// `SHELF_ACCOUNT` 工控机预览图纸）与权限点 `part.drawing.print`（url，默认矩阵
+/// M / C / I / CNC）。两者原先都**不校验 kind** —— 任何能过 RBAC 的账号都能拿
+/// 任意 `file_id` 取到字节。
+/// 在 `t_part_file` 只装图纸 / 3D 模型 / CNC 程序时这不构成问题；但 2026-10-16 起
+/// 同一张表多了一种**不是「给人看的文件」**的行：`kind='DELIVERY_TEMPLATE'`
+/// （客户的送货单打印模板，见 `print_template` 域）。CLERK / INSPECTOR /
+/// SHELF_ACCOUNT / CNC 若能按 id 取到它的字节，就等于能读任意客户的送货单抬头 /
+/// 地址 / 行模板 —— 一条**跨了货架 / 角色范围**的越权读。
+/// ⚠️ `/url` 回的还是 **1 小时有效的 COS 预签直链**（拿到即可脱离本后端直接访问、
+/// 可外传）⇒ 它比 content 更不能漏这道守卫。
+///
+/// ## 为什么取「白名单」而不是「黑名单排除 DELIVERY_TEMPLATE」
+///
+/// 白名单只会在**新增 kind 时要求显式决策**（忘了加 ⇒ 拒绝，fail-safe）；
+/// 黑名单则会在新增 kind 时**默认放行**（忘了加 ⇒ 泄漏，fail-open）。
+///
+/// ## 报错码刻意是 21102 而不是 21101
+///
+/// `21101 BIZ_PART_FILE_NOT_FOUND` 的语义是「**这行不存在**」，而本行**存在**
+/// —— 错在「这个端点不提供这种 kind 的字节」，与扩展名 / content_type 不匹配同族
+/// （`BIZ_PART_FILE_BAD_TYPE` 一直覆盖「请求指向的东西不是这个端点服务的类型」）。
+/// ⚠️ 别把它改成 21101：前端拿到 404 会去刷新列表，拿到 21102 才会提示「换个入口」。
+/// 客户送货单打印模板要取字节请打 `print_template` 域的
+/// `GET /print-templates/{id}/content`（那是**打印**语义、权限点
+/// `delivery_note.print`，刻意与本端点的角色集合不同）。
+pub fn is_file_content_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "DRAWING" | "3D_MODEL" | "G_CODE" | "SETUP_SHEET" | "ASSEMBLY_MASTER" | "CAD_2D"
+    )
 }
 
 /// 扩展名（大写） → `t_part_file.file_type` 字符串（如 `"PDF"` / `"STEP"`）。
@@ -268,6 +373,57 @@ mod tests {
         // 未列出的 owner_kind 继续 fail-safe（新增 CUSTOMER 不得放宽默认臂）
         assert!(!owner_kind_allows_kind("CUSTOMERS", "DELIVERY_TEMPLATE"));
         assert!(!owner_kind_allows_kind("SHELF", "DELIVERY_TEMPLATE"));
+    }
+
+    /// 2026-10-16 review 第 1 轮 MAJOR-1：两条写入口的角色分派**共用**本函数。
+    ///
+    /// 钉的是三件事：① CUSTOMER 恒收窄成仅 Manager；② 两条入口各自的默认集合
+    /// 逐字不变（`UPLOAD_ROLES` 含 CNC、`CONFIRM_ROLES` 不含）；③ 未知 owner_kind
+    /// 走默认集合（随后由配对守卫报 20104，与本轮之前行为一致）。
+    #[test]
+    fn write_roles_for_narrows_customer_only() {
+        // CUSTOMER ⇒ 仅 Manager（两条入口都是）
+        assert_eq!(
+            write_roles_for("CUSTOMER", UPLOAD_ROLES),
+            CUSTOMER_WRITE_ROLES
+        );
+        assert_eq!(
+            write_roles_for("CUSTOMER", CONFIRM_ROLES),
+            CUSTOMER_WRITE_ROLES
+        );
+        assert!(!CUSTOMER_WRITE_ROLES.contains(&Role::Clerk));
+        assert!(!CUSTOMER_WRITE_ROLES.contains(&Role::CncProgrammer));
+
+        // PART / ASSEMBLY / 未知 owner_kind ⇒ 逐字返回调用方自己的集合
+        assert_eq!(write_roles_for("PART", UPLOAD_ROLES), UPLOAD_ROLES);
+        assert_eq!(write_roles_for("ASSEMBLY", CONFIRM_ROLES), CONFIRM_ROLES);
+        assert_eq!(write_roles_for("WHATEVER", UPLOAD_ROLES), UPLOAD_ROLES);
+
+        // ⚠️ 两条入口的默认集合**刻意不同**：confirm 历史上没给过 CNC，
+        // 抽成一张固定表会顺带放开它 —— 这条断言防「顺手合并」。
+        assert!(UPLOAD_ROLES.contains(&Role::CncProgrammer));
+        assert!(!CONFIRM_ROLES.contains(&Role::CncProgrammer));
+    }
+
+    /// 2026-10-16 review 第 1 轮 MAJOR-2：`/objects/{id}/url` 与
+    /// `GET /objects/{id}/content` 共用同一张 kind 白名单，客户送货单打印模板
+    /// **不在**其中。
+    #[test]
+    fn is_file_content_kind_excludes_delivery_template_and_unknowns() {
+        for k in [
+            "DRAWING",
+            "3D_MODEL",
+            "G_CODE",
+            "SETUP_SHEET",
+            "ASSEMBLY_MASTER",
+            "CAD_2D",
+        ] {
+            assert!(is_file_content_kind(k), "{k} 应放行");
+        }
+        assert!(!is_file_content_kind("DELIVERY_TEMPLATE"));
+        // 白名单方向：未知 kind 默认拒（fail-safe），不是拒掉单个新 kind 就算完
+        assert!(!is_file_content_kind("SOMETHING_NEW"));
+        assert!(!is_file_content_kind(""));
     }
 
     #[test]

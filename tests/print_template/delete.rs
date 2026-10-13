@@ -5,8 +5,8 @@
 //!    **HTTP 422 纯文本**（不是 `R<T>` 信封；CLAUDE.md §8 铁律）
 //! 2. ★ `delete_with_stale_version_returns_40901`
 //! 3. ★ `delete_then_resolve_returns_21109`
-//! 4. ★ `delete_is_idempotent_guard_second_call_also_40901` —— 第二次删用新 version
-//!    也拿不到 404（软删闸门让 `get_by_id(include_deleted=false)` 直接落 409）
+//! 4. ★ `delete_twice_returns_21101_not_409` —— 第二次删用已自增后的正确 version
+//!    也拿不到 409：软删闸门让 `get_by_id(include_deleted=false)` 直接落 21101 / 404
 //! 5. ★ `delete_spawns_cos_cleanup_after_commit`
 //! 6. `clerk_cannot_delete_returns_403`
 //! 7. ★ `list_supports_pagination_and_customer_filter`
@@ -16,8 +16,7 @@ use axum::http::StatusCode;
 use hsh_erp_test_support::{json_request, send_raw};
 
 use crate::{
-    Ctx, assert_biz_code, bootstrap, delete, list, minimal_xlsx_bytes, rows_for_owner_kind,
-    send_multipart_raw, upload,
+    Ctx, assert_biz_code, bootstrap, delete, list, minimal_xlsx_bytes, rows_for_owner_kind, upload,
 };
 
 /// 造一份「上传成功」的模板，返回 `(id, bytes)`。
@@ -140,7 +139,7 @@ async fn delete_soft_deletes_and_bumps_version() {
 //  4. 重复删除
 // ===========================================================================
 
-/// ★ 重复删除（第二次带**已自增后**的正确 version）仍 ⇒ `40901`，**不是** 21101。
+/// ★ 重复删除（第二次带**已自增后**的正确 version）仍 ⇒ `21101` / 404，**不是** 40901。
 ///
 /// `PartFileService::soft_delete_file` 先 `get_by_id(id, false)`（软删闸门），
 /// 第二次就查不到了 ⇒ 走 `21101 BIZ_PART_FILE_NOT_FOUND`（HTTP 404）。
@@ -188,7 +187,7 @@ async fn delete_spawns_cos_cleanup_after_commit() {
     let rows = rows_for_owner_kind(&ctx.pool, ctx.l1_id, "DELIVERY_TEMPLATE").await;
     let object_key = rows[0].3.clone();
     assert_eq!(
-        ctx.cos.get(&object_key).as_deref(),
+        ctx.cos.stored_bytes(&object_key).as_deref(),
         Some(bytes.as_slice()),
         "删除前对象应在"
     );
@@ -204,7 +203,7 @@ async fn delete_spawns_cos_cleanup_after_commit() {
 
     let mut gone = false;
     for _ in 0..40 {
-        if ctx.cos.get(&object_key).is_none() {
+        if ctx.cos.stored_bytes(&object_key).is_none() {
             gone = true;
             break;
         }
@@ -356,7 +355,6 @@ async fn delete_nonexistent_id_returns_21101() {
     )
     .await;
     assert_biz_code(status, &env, 21101, StatusCode::NOT_FOUND);
-    let _ = send_multipart_raw; // 抑制未用 import（multipart 断言在 upload.rs）
 }
 
 /// 取一个新雪花 id（直插 fixture 用）。

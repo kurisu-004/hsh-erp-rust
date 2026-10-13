@@ -85,6 +85,15 @@ pub struct PartFileService {
     cos: Arc<dyn CosClient>,
 }
 
+/// 本域通用列表端点（`GET /files/objects`）**永不返回**的 kind。
+///
+/// 2026-10-16 review 第 1 轮 MAJOR-3：送货单打印模板行的元数据（含一级客户 id）
+/// 只应经 `print_template` 域的端点暴露，而那个端点集是 Manager-only（列表）
+/// 或权限点 `delivery_note.print`（resolve / content）。⚠️ 这里的守卫是**无条件**
+/// 的 —— 即便调用方显式传 `?kind=DELIVERY_TEMPLATE` 也不返回（理由见
+/// `list_files` 的 doc）。
+const TEMPLATE_KIND_EXCLUDED_FROM_LIST: &str = "DELIVERY_TEMPLATE";
+
 impl PartFileService {
     /// 构造：雪花 ID 生成器 + COS 客户端（2026-09-22 重构：cos 从 handler 形参
     /// 收归到 service 字段，service 自管 cos 不变量；handler 仍按需
@@ -149,33 +158,26 @@ impl PartFileService {
         bytes: Vec<u8>,
         current: &CurrentUser,
     ) -> Result<PartFileOut, AppError> {
-        // 角色闸门（2026-10-16 新增 CUSTOMER 分支）。
+        // 角色闸门（2026-10-16 新增 CUSTOMER 分支，review 第 1 轮 MAJOR-1
+        // 抽到 `policy::write_roles_for` 与 confirm 共用）。
         //
-        // PART / ASSEMBLY 保持原集合**逐字不变**（M / C / CNC —— 三条旧上传端点的并集，
-        // 见本文件模块 doc 的「唯一一处权限面放大」一节）；CUSTOMER（送货单打印模板）
-        // **只放 MANAGER**。
+        // PART / ASSEMBLY 保持原集合**逐字不变**（M / C / CNC —— 三条旧上传端点的
+        // 并集，见本文件模块 doc 的「唯一一处权限面放大」一节）；CUSTOMER
+        // （送货单打印模板）**只放 MANAGER**。
         //
-        // ⚠️ **这道分派是「CLERK 不能偷偷绑模板」的唯一闸门**：`owner_kind` 与 `kind`
-        // 都由 client 在 multipart `data` 里给，而 `print_template` 域的
-        // `POST /print-templates` 有自己的 MANAGER-only handler 守卫 —— 但那只守
-        // **那一个端点**。CLERK 若能直接打 `POST /files/objects` 并在 `data` 里写
+        // ⚠️ **这道分派是「CLERK 不能偷偷绑模板」的收口点之一，且必须与
+        // `bind_uploaded_file`（`POST /files/objects/confirm`）共用同一张表**：
+        // `owner_kind` 与 `kind` 都由 client 在 multipart `data`（confirm 则是 body）
+        // 里给，而 `print_template` 域的 `POST /print-templates` 有自己的
+        // MANAGER-only handler 守卫 —— 但那只守**那一个端点**。CLERK 若能直接打
+        // `POST /files/objects` 或 `POST /files/objects/confirm` 并写
         // `{"owner_kind":"CUSTOMER","kind":"DELIVERY_TEMPLATE"}`，就能绕过模板管理页
         // 给自己日常对接的客户乱换打印模板（改的是别人出货单上的抬头、地址、抬头行
         // 数与顺序）。所以「谁能写 DELIVERY_TEMPLATE」必须在**共用上传原语**里判，
-        // 不能只在新域的 handler 上判。
-        match owner_kind {
-            "PART" | "ASSEMBLY" => {
-                current.require_any_role(&[Role::Manager, Role::Clerk, Role::CncProgrammer])?;
-            }
-            "CUSTOMER" => {
-                current.require_any_role(&[Role::Manager])?;
-            }
-            // 未知 owner_kind 不在此放行：交给下面 step 0 的配对守卫报 20104，
-            // 与既有行为一致（`require_any_role(&[...])` 逐条原样跑即可）。
-            _ => {
-                current.require_any_role(&[Role::Manager, Role::Clerk, Role::CncProgrammer])?;
-            }
-        }
+        // 且两条写入口都要经过它 —— 2026-10-16 首版只在本方法加了 CUSTOMER 分支、
+        // 漏了 confirm 那条，review 第 1 轮 MAJOR-1 已闭合（共用函数见
+        // `policy::write_roles_for`）。
+        current.require_any_role(policy::write_roles_for(owner_kind, policy::UPLOAD_ROLES))?;
 
         // 0. owner_kind × kind 配对（2026-10-13 review 第 1 轮 MINOR-3）：四合一
         //    之前这层配对由「各端点自己的 path 段 + 硬编码 kind」在结构上保证，
@@ -307,6 +309,18 @@ impl PartFileService {
     /// 报工台（`/scan/*`，路由守卫就是 `SHELF_ACCOUNT`）的图纸预览要拉这份列表。
     /// ⚠️ **只读端点**：上传 `upload_file_for_owner` 与软删 `soft_delete_file` 的角色
     /// 白名单**不含** `ShelfAccount`，两者是写路径、不在本次放开范围。
+    ///
+    /// ⚠️ **2026-10-16 review 第 1 轮 MAJOR-3：本端点永不返回 `DELIVERY_TEMPLATE`
+    /// 行**（`?kind=DELIVERY_TEMPLATE` 也一样返空，不是「缺省时才排除」）。
+    /// 理由：出参含 `owner_id`(= 一级客户 id) / `object_key` / `original_filename` /
+    /// `content_sha256`，而本端点的角色集合**含 `SHELF_ACCOUNT`**（工控机）——
+    /// 不加这道过滤，工控机账号不传 `kind` 就能列出全部客户的打印模板元数据并拿到
+    /// 模板 id，那正是「按 id 取字节」越权链的「发现」环节。
+    /// ⚠️ **不传 `kind` 也排除**：只在缺省时排除的话，攻击者补一个
+    /// `?kind=DELIVERY_TEMPLATE` 就绕回来了（`kind` 是自由文本，不做枚举校验）。
+    /// 模板行要列举只能打 `print_template` 域的 `GET /print-templates`
+    /// （**Manager-only**，管理面），单客户定向取打 `GET /print-templates/resolve`
+    /// （权限点 `delivery_note.print`）—— 两者的权限面都比本端点窄或语义不同。
     pub async fn list_files<R: PartFileRepoTrait>(
         &self,
         mut repo: R,
@@ -336,7 +350,14 @@ impl PartFileService {
         let kind_opt = query.kind.as_deref();
 
         let (rows, total) = repo
-            .list_with_filters(owner_kind, owner_id_opt, kind_opt, limit, offset)
+            .list_with_filters(
+                owner_kind,
+                owner_id_opt,
+                kind_opt,
+                Some(TEMPLATE_KIND_EXCLUDED_FROM_LIST),
+                limit,
+                offset,
+            )
             .await?;
         let items = rows
             .into_iter()
@@ -384,9 +405,17 @@ impl PartFileService {
     ///
     /// 2026-09-29 扁平化：DB 历史行 object_key 仍是五段（legacy），但 COS 桶内
     /// 真实对象可能按新模板存储（同一文件内容 sha16 一致 → 新模板 key 一致）。
-    /// 读端点 fallback：先尝试 `head_object(db_key)`，若 NoSuch 且 db_key 可被
+    /// 读端点 fallback：先尝试 `head_object(db_object_key)`，若 NoSuch 且 db_key 可被
     /// `parse_legacy_key` 解析，则按新模板重写 key 再 head 一次；若新模板 key
     /// 存在则用其生成 presigned URL（保证浏览器拿到的 URL 在桶内有效）。
+    ///
+    /// ⚠️ **2026-10-16 review 第 1 轮 MAJOR-2：kind 白名单（`policy::
+    /// is_file_content_kind`）**。本方法与 `GET /objects/{id}/content` 是同一个
+    /// 「按 id 拿字节」动作，而先前只有后者判 kind ⇒ CLERK / INSPECTOR /
+    /// CNC_PROGRAMMER（权限点 `part.drawing.print` 的默认矩阵）能拿到**任意客户**
+    /// 送货单打印模板的 1 小时直链，字节直接可下载、完全绕过 content 侧那道守卫。
+    /// 报错码 21102（与 content 侧同款，理由见 `policy::is_file_content_kind` 的 doc）。
+    /// 判定排在 `head_object` **之前** ⇒ 非法 kind 零外部 IO。
     #[allow(clippy::too_many_arguments)]
     pub async fn get_file_with_url<R: PartFileRepoTrait>(
         &self,
@@ -403,6 +432,15 @@ impl PartFileService {
                 format!("part_file {file_id} 不存在"),
             )
         })?;
+        if !policy::is_file_content_kind(&row.kind) {
+            return Err(AppError::biz(
+                code::BIZ_PART_FILE_BAD_TYPE,
+                format!(
+                    "kind={:?} 不走本端点取预签直链（仅 DRAWING / 3D_MODEL / G_CODE / SETUP_SHEET / ASSEMBLY_MASTER / CAD_2D）",
+                    row.kind
+                ),
+            ));
+        }
         let effective_key =
             Self::resolve_effective_key(cos.as_ref(), cfg_upload_prefix, &row.object_key).await?;
         let url = cos.presigned_get_url(&effective_key, 3600).await?;
@@ -578,7 +616,10 @@ impl PartFileService {
     /// 调用方：`POST /api/v2/files/objects/confirm` 的 handler。
     ///
     /// 流程：
-    /// 0. 角色守卫（M+C）
+    /// 0. 角色守卫（**按 `owner_kind` 派生**：`policy::write_roles_for`；非 CUSTOMER
+    ///    是 M+C、逐字沿用旧端点；`CUSTOMER` ⇒ 仅 Manager）
+    ///    ＋ **拒 `owner_kind = "CUSTOMER"`**（20104，2026-10-16 review 第 1 轮
+    ///    MAJOR-1 补：模板只经 `print_template` 域写入，见下面步骤 1a 的注释）
     /// 1. owner 存在性校验（`owner_kind ∈ {PART, ASSEMBLY}`；2026-10-13 PR1b 新增，
     ///    旧形态 owner 在 path 段恒 PART、无需校验）
     ///    ＋ `owner_kind` × `kind` 配对校验（2026-10-13 review 第 1 轮 MINOR-3）
@@ -627,8 +668,42 @@ impl PartFileService {
         content_type: &str,
         current: &CurrentUser,
     ) -> Result<(PartFileOut, String), AppError> {
-        // 1. 权限（按 kind 派生：DRAWING / 3D_MODEL → M+C；与 multipart 端点一致）
-        current.require_any_role(&[Role::Manager, Role::Clerk])?;
+        // 1. 权限（按 owner_kind 派生，与 multipart 上传端点**共用同一张分派表**）
+        //
+        // ⚠️ 2026-10-16 review 第 1 轮 MAJOR-1：本方法原先恒是 `M + C`、与
+        // `owner_kind` 无关，于是本轮给 `owner_kind_allows_kind` 加
+        // `CUSTOMER => DELIVERY_TEMPLATE` 之后，CLERK 打本端点就能造出（并替换掉）
+        // **任意未软删客户**名下的打印模板行 —— `assert_owner_exists` 的 CUSTOMER 臂
+        // 只判存在、不判 `parent_id IS NULL`，第 7 步的
+        // `soft_delete_active_by_part_kind` 还会把该客户现有模板软删掉。
+        // 修法是两条写入口共用 `policy::write_roles_for`，本方法不再自带一套。
+        // ⚠️ 非 CUSTOMER 的默认集合**仍是 M + C**（`policy::CONFIRM_ROLES`）——
+        // 刻意不与上传端点的 M+C+CNC 合并，那会顺带放开本端点的 CNC 面。
+        current.require_any_role(policy::write_roles_for(owner_kind, policy::CONFIRM_ROLES))?;
+
+        // 1a. ⚠️ 本端点**不接受 `owner_kind = "CUSTOMER"`**（2026-10-16 review 第 1 轮
+        //     MAJOR-1 闭合的第二个缺口）。角色闸门只保证「只有 Manager 能到这里」，
+        //     但本端点**没有** `print_template` 域的那条业务不变式：
+        //     - 「只绑一级客户（`parent_id IS NULL`）」的强制点在
+        //       `print_template::service::customer_is_l1`，本方法没有、也不该有
+        //       （files 域刻意不知道「客户分两级」这个别的域的业务概念）；
+        //     - 「同 L1 至多一份活跃模板 + 先软删后写入」的替换语义也在那个域里。
+        //     ⇒ Manager 经本端点能造出一行绑在**二级客户** id 上的模板行，而
+        //     `resolve` 并不校验 L1 ⇒ 绕过本域的 L1-only 规则。
+        //     代价只是业务规则不一致（不是权限提升：能到这里的人本来就是 Manager），
+        //     但本端点**零个合法 CUSTOMER 调用方**（STS 直传是前端上传大图纸的路径，
+        //     模板走 `print_template` 域的一次性 multipart 上传），所以直接拒。
+        //     ⚠️ 错误码 20104 而不是 403：角色已经是 Manager 了，这里判的是
+        //     「这个 owner 类型本端点不服务」。
+        if owner_kind == "CUSTOMER" {
+            return Err(AppError::biz(
+                code::BIZ_INVALID_VALUE,
+                format!(
+                    "owner_kind={owner_kind:?} 不走本端点：送货单打印模板只经 print_template 域的 \
+                     POST /print-templates 写入（只有那里有「只绑一级客户」与「替换」两条不变式）"
+                ),
+            ));
+        }
         // 1b. owner 存在性（2026-10-13 PR1b 新增：owner 改由 body 携带，见 dto::ConfirmFileIn）
         {
             let mut conn = pool.acquire().await?;
@@ -809,12 +884,66 @@ impl PartFileService {
                 format!("part_file {file_id} 不存在"),
             )
         })?;
+        self.get_file_content_for_row(cos.as_ref(), cfg_upload_prefix, &row)
+            .await
+    }
+
+    /// [`Self::get_file_content`] 的「**已取到行**」形态：角色闸门 + 取字节，
+    /// **零 DB 查询**（2026-10-16 review 第 1 轮 MINOR-5 新增，与 MAJOR-2 合并成一处）。
+    ///
+    /// ## 为什么不直接内联进 `get_file_content`
+    ///
+    /// kind 白名单要在**取字节之前**判（否则非法 kind 已经拉了 COS、「零外部 IO」
+    /// 的性质丢失 —— 集成测试用「假 object_key」的反例行钉这一条），而判据在**行上**
+    /// （`row.kind`）⇒ 调用方必须先把行取出来。2026-10-16 首版因此在 handler 里
+    /// 「`get_file_row` 判 kind → `get_file_content` 又 `get_by_id` 一次」⇒
+    /// **同一行同一谓词查了两遍**（`print_template::service::get_template_content` 同款），
+    /// 两次读之间还有一行被软删的窗口。
+    ///
+    /// 现在把「取字节」这段单独拆成 [`Self::get_file_content_for_row`]（**不判
+    /// 权限、不查库**，判据全归调用方）：本方法补上本域的角色闸门后转调它。
+    pub async fn get_file_content_of_checked_row(
+        &self,
+        cos: &dyn CosClient,
+        cfg_upload_prefix: &str,
+        row: &TPartFile,
+        current: &CurrentUser,
+    ) -> Result<PartFileContent, AppError> {
+        current.require_any_role(&[
+            Role::Manager,
+            Role::Clerk,
+            Role::Inspector,
+            Role::CncProgrammer,
+            Role::ShelfAccount,
+        ])?;
+        self.get_file_content_for_row(cos, cfg_upload_prefix, row)
+            .await
+    }
+
+    /// 「按**已取到的行**取字节」—— 本域取字节的**最底层**原语
+    /// （2026-10-16 review 第 1 轮 MINOR-5 新增）。
+    ///
+    /// ⚠️ 本方法**刻意不判权限、不判 kind、不查库**：判据全部由调用方给
+    /// —— 两条调用方要的东西不同，混进本方法会逼出一串布尔开关：
+    /// - `files::part_file::handler::get_part_file_content`：角色 = 本域 5 角色
+    ///   （经 `get_file_content_of_checked_row`）、kind = `policy::is_file_content_kind`
+    ///   白名单（不通过 ⇒ **21102**）；
+    /// - `print_template::service::get_template_content`：角色 = 权限点
+    ///   `delivery_note.print`（M / C / I，**不在**本域 5 角色那张表里 ——
+    ///   一个只持该权限点的账号不该被本域的角色白名单二次拒绝）、kind = 「必须是
+    ///   `DELIVERY_TEMPLATE`」（不通过 ⇒ **21101**，前端据此刷新列表）。
+    pub async fn get_file_content_for_row(
+        &self,
+        cos: &dyn CosClient,
+        cfg_upload_prefix: &str,
+        row: &TPartFile,
+    ) -> Result<PartFileContent, AppError> {
         let effective_key =
-            Self::resolve_effective_key(cos.as_ref(), cfg_upload_prefix, &row.object_key).await?;
+            Self::resolve_effective_key(cos, cfg_upload_prefix, &row.object_key).await?;
         let bytes = cos.get_object(&effective_key).await?;
         Ok(PartFileContent {
             bytes,
-            content_type: Some(row.content_type),
+            content_type: Some(row.content_type.clone()),
         })
     }
 
