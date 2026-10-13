@@ -184,32 +184,11 @@ fn render_list_item(
     }
 }
 
-/// `TAssembly` → `AssemblyOut`（详情 / 更新 / 取消返回）。
-///
-/// 2026-09-16 PR-2 瘦身：删 `actual_delivery_date` 字段。
-fn render_assembly_out(asm: TAssembly) -> AssemblyOut {
-    AssemblyOut {
-        id: asm.id,
-        drawing_no: asm.drawing_no,
-        name: asm.name,
-        applicant_name: asm.applicant_name,
-        customer_id: asm.customer_id,
-        request_date: asm.request_date,
-        planned_delivery_date: asm.planned_delivery_date,
-        is_urgent: asm.is_urgent,
-        status: asm.status,
-        version: asm.version,
-        serial_no: asm.serial_no,
-        quantity: asm.quantity,
-        unit_price: asm.unit_price,
-        total_price: asm.total_price,
-        order_no: asm.order_no,
-        system_delivery_date: asm.system_delivery_date,
-        note: asm.note,
-        created_at: asm.created_at,
-        updated_at: asm.updated_at,
-    }
-}
+// 2026-10-13：`render_assembly_out` 原先在本文件与 `lifecycle.rs` 各存一份 20 字段
+// 逐字同形的副本（2022-09-22 D-3 的理由「避免跨子模块 pub(crate) 暴露」在 Rust 里
+// 不成立 —— 同 crate 内 `pub(crate)` 即可）。两份副本已合并到
+// `super::render_assembly_out`（`service/mod.rs`），改字段只改一处。
+use super::render_assembly_out;
 
 impl AssemblyService {
     // =======================================================================

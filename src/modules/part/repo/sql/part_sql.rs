@@ -5,7 +5,7 @@
 //! **改了 `query!` 宏里的 SQL 文本就必须重跑 `./scripts/sqlx_prepare.sh`**
 //! 并把 `.sqlx/query-*.json` 一起提交（CI / Docker 靠离线元数据构建）。
 //!
-//! ## 承载方法（24 个）
+//! ## 承载方法（23 个）
 //!
 //! ### 只读查询（6）
 //! - `get_by_id` / `list_by_ids` / `get_by_serial` / `list_children`
@@ -25,9 +25,11 @@
 //! - `list_by_assembly_id` / `insert_child_for_assembly`
 //! - `cascade_sync_from_assembly` / `scale_children_quantity`
 //!
-//! ### rollup（3）
+//! ### rollup（2）
 //! - `get_part_rollup_state` / `update_part_rollup`
-//! - `clear_part_serial_no_when_completed`
+//! - 2026-10-13：`clear_part_serial_no_when_completed` 随死代码清理删除 —— 零调用方，
+//!   终态序列号释放（含 `SERIAL_RELEASED` 归档事件）已由
+//!   `shared::batch::status::release_part_serial_no` 独占承接（rollup step 4）。
 //!
 //! ### 跨表 helper（1）
 //! - `serial_prefix_for_customer` —— 派发序列号用的 L1 客户 `serial_prefix`；
@@ -1237,33 +1239,6 @@ impl PartRepo {
             next_process_id,
             updated_by,
         )
-        .execute(executor)
-        .await?;
-        Ok(r.rows_affected())
-    }
-
-    /// 2026-09-11 part/assembly/batch 重构方案 §4.3 (PR-B3) complete 辅助：
-    /// part 进入 COMPLETED 时清空 `serial_no`（序列号已转交送货单）。
-    ///
-    /// 条件：`status='COMPLETED'`（rollup 已把 part 推到终态）。0 行不影响事务。
-    /// **不走 OCC**（衍生写）。
-    pub async fn clear_part_serial_no_when_completed<'e, E: PgExecutor<'e>>(
-        executor: E,
-        part_id: i64,
-        updated_by: i64,
-    ) -> Result<u64, sqlx::Error> {
-        let r = sqlx::query(
-            r#"
-            UPDATE t_part
-            SET serial_no  = NULL,
-                version    = version + 1,
-                updated_at = now(),
-                updated_by = $2
-            WHERE id = $1 AND status = 'COMPLETED' AND deleted_at IS NULL
-            "#,
-        )
-        .bind(part_id)
-        .bind(updated_by)
         .execute(executor)
         .await?;
         Ok(r.rows_affected())

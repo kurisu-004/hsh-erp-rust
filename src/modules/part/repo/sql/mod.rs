@@ -3,7 +3,7 @@
 //! ## 结构（2026-09-22 PR2 重构）
 //!
 //! 原 `sql.rs`（1771 行，超 conventions.md §2 1000 行硬上限）按"主表归属"
-//! 拆分为 4 子文件：
+//! 拆分为多子文件；2026-10-13 死代码清理后**只剩 `part_sql.rs` 一个子文件**：
 //!
 //! - `part_sql.rs` —— `t_part` 表 SQL（get_by_id / list_by_ids /
 //!   get_by_serial / list_children / list_children_by_assemblies /
@@ -12,10 +12,9 @@
 //!   count_with_filters / list_by_assembly_id / insert_child_for_assembly /
 //!   cascade_sync_from_assembly / scale_children_quantity /
 //!   get_part_rollup_state / update_part_rollup /
-//!   clear_part_serial_no_when_completed / serial_prefix_for_customer /
+//!   serial_prefix_for_customer /
 //!   list_match_parts_by_keys / list_match_assemblies_by_keys /
 //!   list_assembly_names_by_ids / update_order_info）
-//! - `helper_sql.rs` —— 杂项 helper（`scale_qty` 缩放公式纯函数 + 单测）
 //!
 //! 2026-10-02：`batch_sql.rs`（`t_part_batch` 表 19 个流转写点）已随
 //! `t_part_batch` 归属迁至 `crate::modules::prod::batch::repo::sql`（impl 目标由
@@ -43,11 +42,9 @@
 /// 静态方法调用——本任务**不能**破坏 `part::repo::PartRepo` 作为 ZST 的对外身份。
 pub struct PartRepo;
 
-pub mod helper_sql;
 pub mod part_sql;
 
 // 重导出保留原路径兼容（part/repo/mod.rs 已 `pub use sql::{...}`，继续穿透）。
-pub use helper_sql::scale_qty;
 pub use part_sql::{
     AssemblyMatchRow, ChildInheritFields, NewPartCreate, PartListFilters, PartUpdate,
 };

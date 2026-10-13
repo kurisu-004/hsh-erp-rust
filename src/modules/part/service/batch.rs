@@ -145,13 +145,12 @@ impl PartService {
         let preallocated_part_ids: Vec<i64> =
             (0..req.items.len()).map(|_| snowflake.next_id()).collect();
 
-        // 收集所有 (item_index, binding_kind, FileBindingIn, future_owner_id) jobs
+        // 收集所有 (item_index, binding_kind, FileBindingIn) jobs
         #[derive(Clone)]
         struct Job {
             item_index: usize,
             kind: &'static str,
             binding: FileBindingIn,
-            future_owner_id: i64,
         }
         let mut jobs: Vec<Job> = Vec::new();
         for (idx, item) in req.items.iter().enumerate() {
@@ -160,7 +159,6 @@ impl PartService {
                     item_index: idx,
                     kind: "DRAWING",
                     binding: b.clone(),
-                    future_owner_id: preallocated_part_ids[idx],
                 });
             }
             if let Some(b) = &item.model3d_file {
@@ -168,7 +166,6 @@ impl PartService {
                     item_index: idx,
                     kind: "3D_MODEL",
                     binding: b.clone(),
-                    future_owner_id: preallocated_part_ids[idx],
                 });
             }
         }
@@ -200,7 +197,6 @@ impl PartService {
                         cos,
                         &cfg_upload_prefix,
                         &cfg_tmp_prefix,
-                        job.future_owner_id,
                         job.kind,
                         &job.binding,
                     )
@@ -588,9 +584,6 @@ pub(super) async fn prepare_binding_head_copy(
     cos: Arc<dyn CosClient>,
     cfg_upload_prefix: &str,
     cfg_tmp_prefix: &str,
-    #[allow(unused_variables)]
-    // 2026-09-29 扁平化：CAS key 已不带 owner_id，参数保留以匹配 caller 签名
-    future_owner_id: i64,
     kind: &str,
     binding: &FileBindingIn,
 ) -> Result<PreparedBinding, AppError> {

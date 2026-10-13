@@ -20,6 +20,11 @@
 //! 状态机扩展见 `part/statemachine.rs`（2026-09-29 缩至 19 个合法迁移）。
 //! 错误码全部沿用 `shared/error.rs::code` 已声明常量（201xx / 205xx）。
 
+// 2026-10-13 死代码清理（计划项「删 deprecated allow」**实跑后未采纳**）：本模块级
+// `#![allow(...)]` 的 `deprecated` 一项当前掩盖着 3 处真实弃用告警 ——
+// `work_type.rs` 的 `PLACEHOLDER_TS`（`NaiveDateTime::from_timestamp_opt`）与
+// `excel_match.rs` 的 2 处 `NaiveDateTime::UNIX_EPOCH`。删掉即新增 3 条 warning，
+// 故保留。要收窄请就地逐处 `#[allow(deprecated)]` 精确标注（属独立改动）。
 #![allow(deprecated, clippy::too_many_arguments, clippy::type_complexity)]
 
 pub mod events;
@@ -40,7 +45,6 @@ struct OutsourceLite {
 // compile-time DB access via .sqlx cache).
 
 #[derive(sqlx::FromRow)]
-#[allow(dead_code)] // current_process_step_id: 通过 service 层需要，但本 struct 仅 DTO 转换使用
 struct BatchListRow {
     id: i64,
     /// 2026-09-30 新增（来自 b.part_id，对齐 PartBatchListItemOut 新字段）

@@ -9,14 +9,18 @@
 //!
 //! 2026-09-22 Group D-3 重构（对齐 iam 事务分层范式）：
 //! - 原 `repo.rs` 拆为 `repo/{mod, sql}.rs`：sql.rs 是 SQL 真源（11 个静态方法 + ZST
-//!   `AssemblyRepo`，零 diff），mod.rs 新增胖 trait `AssemblyRepoTrait`（11 方法）并
-//!   直接 `impl for &mut PgConnection`（与 iam 2026-09-22 删 `PgIamRepo` 同步）。
+//!   `AssemblyRepo`，零 diff），mod.rs 新增胖 trait `AssemblyRepoTrait`（31 方法）
+//!   并直接 `impl for &mut PgConnection`（与 iam 2026-09-22 删 `PgIamRepo` 同步）。
 //! - 原 `service.rs`（1088 行超 1000 行上限）拆为 `service/{mod, crud, lifecycle,
 //!   sync_from_part}.rs` 4 子模块。
 //!
 //! ## 路由归属
-//! - 域本体 10 条（CRUD / 状态机 / 文件 / 子件）挂 `/api/v2/assemblies/*`
+//! - 域本体 8 条（CRUD / 状态机 / 子件）挂 `/api/v2/assemblies/*`
 //!   （`modules::v2_router` 的顶层 nest，见本文件 [`router`]）。
+//!   ⚠️ 计数口径：`handler.rs::router()` 的 7 条 `.route` 里 `/` 的 GET+POST 记 2 条，
+//!   合计 8。2026-10-13 订正：原文档写「10 条」是 PR1b 删掉
+//!   `GET /assemblies/{id}/files`（1 条）与 `POST /assemblies/{id}/files`（1 条）
+//!   之前的旧数，与 `router()` 源码对不上。
 //! - 2026-10-11 新增 1 条生产链路逃生端点
 //!   `POST /api/v2/prod/assemblies/{assembly_id}/force-complete` 挂 `/api/v2/prod/*`
 //!   下（见 [`force_complete_router`]，由 `prod::router()` nest）。前缀并存是刻意的：

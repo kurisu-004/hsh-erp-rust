@@ -673,9 +673,9 @@ impl PartBatchRepo {
     /// 注：本函数需在同一事务内连发三条 SQL（max + insert + update），而
     /// `impl PgExecutor<'_>` 不能 move 多次，因此显式收 `&mut PgConnection`。
     ///
-    /// 2026-09-17 PR-4 卫生项 B2 合并：把 `split_batch`（part_batch/repo.rs）
-    /// 与 `split_batch_for_partial_pass`（part/repo/batch.rs）80% 重叠的逻辑
-    /// 抽到这里；两个公开 fn 改为薄包装。
+    /// 2026-09-17 PR-4 卫生项 B2 合并：把 `split_batch`（本文件同域）与
+    /// `split_batch_for_partial_pass`（`PartRepoTrait` 上的一行委托）80% 重叠的
+    /// 逻辑抽到这里；两个公开 fn 改为薄包装。
     ///
     /// 2026-09-16 PR-3 批次 step 化（migration 028）：删 `next_process_id` /
     /// `placed_at` 列写入；`current_process_step_id` 走 SELECT 继承源批次。

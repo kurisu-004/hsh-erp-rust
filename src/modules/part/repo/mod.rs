@@ -1,11 +1,11 @@
 //! part 域 repo 层（SQL 真源 + 胖 trait + PG 实现）
 //!
 //! ## 结构（2026-09-22 D-6 重构对齐 iam / shelf / customer / part_batch / queue 范本）
-//! - `sql/`（原 `sql.rs`，已按表拆 `part_sql.rs` / `helper_sql.rs` + `mod.rs`）：
+//! - `sql/`（原 `sql.rs`，现只剩 `part_sql.rs` + `mod.rs`）：
 //!   `t_part` 表 SQL 全文，
-//!   24 个 pub 固有静态方法
+//!   23 个 pub 固有静态方法
 //!   + sqlx `query!` 宏。ZST struct `PartRepo` 收 `impl PgExecutor<'_>` 形参。
-//! - `mod.rs`（本文件）：对外暴露胖 trait `PartRepoTrait`（43 方法合并单 trait，
+//! - `mod.rs`（本文件）：对外暴露胖 trait `PartRepoTrait`（42 方法合并单 trait，
 //!   口径见下文「方法计数口径」），并直接 `impl PartRepoTrait for &mut PgConnection`
 //!   ——handler/service 借 `&mut *tx` / `&mut *conn` 即可，零中间壳。
 //!
@@ -13,15 +13,21 @@
 //! `crate::shared::part_event`（该表由 7 个模块写、无域归属），本文件随之删掉
 //! `insert_part_event` 的 trait 声明与 impl、`sql/event_sql.rs` 与 2 个 re-export。
 //!
+//! 2026-10-13 死代码清理：删 `sql/helper_sql.rs`（唯一代码项 `scale_qty` 零生产调用，
+//! 生产缩放走 `part_sql::scale_children_quantity`）、`repo/batch.rs` / `repo/event.rs`
+//! 两个零代码项空壳（`t_part_batch` / `t_part_event` 的 SQL 已各自上提，见上），
+//! 以及零调用的 `clear_part_serial_no_when_completed`（终态序列号释放已被
+//! `shared::batch::status::release_part_serial_no` 承接，见 rollup step 4）。
+//!
 //! ## 方法计数口径
 //! 「trait 方法数」= `pub trait PartRepoTrait` 花括号内声明的 `fn` 签名条数；
 //! `conn_mut` 这类工具方法计入，`#[allow(...)]` / doc 注释不计；`#[async_trait]`
-//! 展开出的生命周期形参不算独立方法。43 = `conn_mut` 1 + t_part 18 +
+//! 展开出的生命周期形参不算独立方法。42 = `conn_mut` 1 + t_part 17 +
 //! t_part_batch 17 + 跨域 helper 2 +
 //! 采购订单 Excel 匹配 + 订单信息回填 5：
 //!
 //! - `conn_mut` 1 —— 工具方法，暴露 `&mut PgConnection`
-//! - t_part 18 —— 查询 5 + CRUD 6 + assembly 子件 4 + rollup 3（一行委托 `sql::PartRepo`）
+//! - t_part 17 —— 查询 5 + CRUD 6 + assembly 子件 4 + rollup 2（一行委托 `sql::PartRepo`）
 //! - t_part_batch 17 —— 查询 6 + mark_* 品检 4 + lifecycle 6 + split 1（一行委托
 //!   `prod::batch::repo::PartBatchRepo` / `shared::batch::status`）
 //! - 跨域 helper 2 —— `part_batch_has_active_on_delivery_note`（委托 `PartBatchRepo`）
@@ -33,7 +39,7 @@
 //!   `update_order_info`。上 trait 的**唯一动机是可 mock**：旧实现走
 //!   `conn_mut()` 内联 sqlx，匹配分档只能靠集成测试守护。
 //!
-//! ⚠️ trait 方法数 **不等于** `sql/` 静态方法数（24）：`t_part_batch` 段（17）与跨域 helper
+//! ⚠️ trait 方法数 **不等于** `sql/` 静态方法数（23）：`t_part_batch` 段（17）与跨域 helper
 //! 中的一项转发到 `prod::batch` 域的 ZST 静态方法，`conn_mut` 则无对应 SQL 方法。
 //! 2026-10-06 起 `sql::PartRepo` 的**全部**静态方法都已上 trait（此前
 //! `list_children_by_assemblies` 是唯一漏项，由匹配链路补上）。
@@ -47,8 +53,8 @@
 //! 故 trait 改名 `PartRepoTrait`（与 shelf / customer / part_batch 范本同形）：
 //!
 //! - `part::repo::PartRepo` —— ZST struct（在 `sql/mod.rs` 内，通过 `pub use sql::PartRepo;`
-//!   重新导出至本模块），保留 24 个静态方法签名不变（cross-module 调用方零修改）。
-//! - `part::repo::PartRepoTrait` —— 本文件的胖 trait（43 方法合并单 trait），part 域
+//!   重新导出至本模块），保留 23 个静态方法签名不变（cross-module 调用方零修改）。
+//! - `part::repo::PartRepoTrait` —— 本文件的胖 trait（42 方法合并单 trait），part 域
 //!   内部 service 用 `<R: PartRepoTrait>` 收。
 //!
 //! ## 为什么是胖 trait 而非按表拆 3 trait
@@ -123,8 +129,6 @@ use crate::modules::prod::batch::repo::PartBatchRepo;
 use crate::shared::batch::status as batch_status;
 use crate::shared::error::AppError;
 
-pub mod batch;
-pub mod event;
 pub mod part;
 pub mod sql;
 // 2026-10-01 review 第 1 轮 M8：`shared::batch::status` 已从 `repo/` 移到
@@ -142,10 +146,9 @@ pub mod sql;
 pub use crate::modules::part::model::{TPart, TPartInspected, TPartRollupState};
 pub use sql::{
     AssemblyMatchRow, ChildInheritFields, NewPartCreate, PartListFilters, PartRepo, PartUpdate,
-    scale_qty,
 };
 
-/// part 域数据访问 trait（43 方法 = `conn_mut` 1 + t_part 18 + t_part_batch 17 +
+/// part 域数据访问 trait（42 方法 = `conn_mut` 1 + t_part 17 + t_part_batch 17 +
 /// 跨域 helper 2 + 采购订单 Excel 匹配 5；
 /// 计数口径见模块头「方法计数口径」小节）。
 ///
@@ -260,7 +263,7 @@ pub trait PartRepoTrait: Send {
         updated_by: i64,
     ) -> Result<u64, sqlx::Error>;
 
-    // ── t_part rollup（3）──
+    // ── t_part rollup（2）──
     async fn get_part_rollup_state(
         &mut self,
         part_id: i64,
@@ -270,11 +273,6 @@ pub trait PartRepoTrait: Send {
         part_id: i64,
         status: &'a str,
         next_process_id: Option<i64>,
-        updated_by: i64,
-    ) -> Result<u64, sqlx::Error>;
-    async fn clear_part_serial_no_when_completed(
-        &mut self,
-        part_id: i64,
         updated_by: i64,
     ) -> Result<u64, sqlx::Error>;
 
@@ -659,7 +657,7 @@ impl PartRepoTrait for &mut PgConnection {
             .await
     }
 
-    // ── t_part rollup（3）──
+    // ── t_part rollup（2）──
     async fn get_part_rollup_state(
         &mut self,
         part_id: i64,
@@ -676,14 +674,6 @@ impl PartRepoTrait for &mut PgConnection {
     ) -> Result<u64, sqlx::Error> {
         PartRepo::update_part_rollup(&mut **self, part_id, status, next_process_id, updated_by)
             .await
-    }
-
-    async fn clear_part_serial_no_when_completed(
-        &mut self,
-        part_id: i64,
-        updated_by: i64,
-    ) -> Result<u64, sqlx::Error> {
-        PartRepo::clear_part_serial_no_when_completed(&mut **self, part_id, updated_by).await
     }
 
     // ── t_part_batch 查询（6）──

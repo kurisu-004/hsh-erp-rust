@@ -30,13 +30,14 @@ use std::collections::HashMap;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::assembly::model::TAssembly;
 use crate::modules::assembly::repo::AssemblyRepoTrait;
 use crate::modules::assembly::statemachine::AssemblyStatus;
 use crate::modules::assembly::vo::AssemblyOut;
 use crate::shared::error::{AppError, code};
 
-use super::AssemblyService;
+// 2026-10-13：本文件原先另存一份 `render_assembly_out`（与 `crud.rs` 逐字同形），
+// 已收敛到 `super::render_assembly_out`（`service/mod.rs`）单点承载。
+use super::{AssemblyService, render_assembly_out};
 
 // =============================================================================
 // 兼容旧测试的 ZST 静态 wrapper 实现（2026-09-22 D-3 决策）
@@ -321,35 +322,5 @@ impl AssemblyService {
                 AppError::biz(code::BIZ_ASSEMBLY_NOT_FOUND, "force-complete 后查不到")
             })?;
         Ok((render_assembly_out(fresh), changed))
-    }
-}
-
-// ---------- internal helpers ----------
-
-/// `TAssembly` → `AssemblyOut`（start / cancel / 等端点返回）。
-///
-/// 与 `crud.rs::render_assembly_out` 同形；2026-09-22 D-3 决策：保留两份（不抽 pub fn）
-/// 以避免跨子模块 `pub(crate)` 暴露——本子模块只服务 lifecycle 端点。
-fn render_assembly_out(asm: TAssembly) -> AssemblyOut {
-    AssemblyOut {
-        id: asm.id,
-        drawing_no: asm.drawing_no,
-        name: asm.name,
-        applicant_name: asm.applicant_name,
-        customer_id: asm.customer_id,
-        request_date: asm.request_date,
-        planned_delivery_date: asm.planned_delivery_date,
-        is_urgent: asm.is_urgent,
-        status: asm.status,
-        version: asm.version,
-        serial_no: asm.serial_no,
-        quantity: asm.quantity,
-        unit_price: asm.unit_price,
-        total_price: asm.total_price,
-        order_no: asm.order_no,
-        system_delivery_date: asm.system_delivery_date,
-        note: asm.note,
-        created_at: asm.created_at,
-        updated_at: asm.updated_at,
     }
 }

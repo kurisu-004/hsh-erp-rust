@@ -47,11 +47,45 @@ use crate::modules::assembly::dto::{
     AssemblyChildAddRequest, AssemblyCreateRequest, AssemblyListQuery, AssemblyUpdateRequest,
     ForceCompleteRequest,
 };
+use crate::modules::assembly::model::TAssembly;
 use crate::modules::assembly::vo::{
     AssemblyCreateResult, AssemblyDetail, AssemblyListOut, AssemblyOut,
 };
 use crate::modules::part::vo::PartListItem;
 use crate::shared::error::AppError;
+
+/// `TAssembly` → `AssemblyOut`（详情 / 更新 / 取消 / start / force-complete 返回）。
+///
+/// 2026-10-13：原先 `crud.rs` 与 `lifecycle.rs` 各存一份 20 字段逐字同形的副本，
+/// 2022-09-22 D-3 给的理由是「保留两份以避免跨子模块 `pub(crate)` 暴露」—— 该理由
+/// 在 Rust 里不成立（同 crate 内 `pub(crate)` 即可，且本函数本就只在同 crate 内被两个
+/// 子模块调用）。两份副本改由本函数单点承载：VO 加/删字段只改一处，不会出现
+/// 「crud 返新字段、lifecycle 返旧字段」这种静默分叉。
+///
+/// 2026-09-16 PR-2 瘦身：删 `actual_delivery_date` 字段。
+pub(crate) fn render_assembly_out(asm: TAssembly) -> AssemblyOut {
+    AssemblyOut {
+        id: asm.id,
+        drawing_no: asm.drawing_no,
+        name: asm.name,
+        applicant_name: asm.applicant_name,
+        customer_id: asm.customer_id,
+        request_date: asm.request_date,
+        planned_delivery_date: asm.planned_delivery_date,
+        is_urgent: asm.is_urgent,
+        status: asm.status,
+        version: asm.version,
+        serial_no: asm.serial_no,
+        quantity: asm.quantity,
+        unit_price: asm.unit_price,
+        total_price: asm.total_price,
+        order_no: asm.order_no,
+        system_delivery_date: asm.system_delivery_date,
+        note: asm.note,
+        created_at: asm.created_at,
+        updated_at: asm.updated_at,
+    }
+}
 
 /// Sync hook result（service::sync_from_part 回调返回；handler 据此发 ASSEMBLY_UPDATED）。
 ///
