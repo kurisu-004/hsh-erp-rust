@@ -117,6 +117,73 @@ impl Serialize for Frequency {
 }
 
 // ============================================================================
+// 状态中文（2026-10-16 新增）
+// ============================================================================
+
+/// 订单状态的中文标签（邮件正文「状态」列用）。
+///
+/// ⚠️ **三副本人工同步**（Rust / TS 之间没有任何编译期约束）：后端两份 —— 本文件
+/// 与前端 `src/types/parts.ts::ORDER_STATUS_LABEL`（逐字一致）；前端另有一份
+/// `src/constants/partStatus.ts::STATUS_LABEL` 那是**统计**语义（另一套文案），
+/// **不要**与本表混用。三副本任一处漂了都不会编译失败，只会让同一批件在不同页面
+/// 显示两种中文状态。登记见 `docs/api/mail_digest.md` §5 与 §8.3。
+///
+/// ⚠️ `REPAIRING` 已于 2026-10-01 从状态枚举删除（降级为 `t_part_batch.is_repairing`
+/// 布尔列），但 `shared::batch::status_machine` 仍保留一个过渡兼容分支能解析该字面量，
+/// 故本表**保留**这一行（存量行仍可能读出这个值）。
+pub fn part_status_label(status: &str) -> &str {
+    match status {
+        "PENDING" => "待生产",
+        "PROGRAMMING" => "编程中",
+        "IN_PROCESS" => "生产中",
+        "INSPECTION" => "待品检",
+        "READY_TO_SHIP" => "待送货",
+        "DELIVERED" => "已送货",
+        "REPAIRING" => "返修中",
+        "OUTSOURCE" => "外协中",
+        "COMPLETED" => "已完成",
+        "CANCELLED" => "已取消",
+        // 未知值**原样回显**，不静默变空串：静默空串会让「这批件状态坏了」这件事
+        // 在邮件里完全看不出来（收件人只会以为没填状态）。
+        other => other,
+    }
+}
+
+/// 批次行的状态标签。
+///
+/// ⚠️ **与工单行不对称**：`t_part_batch.is_repairing` 这个布尔列只存在于批次表，
+/// `t_part` / `t_assembly` 上没有对应列 ⇒ 批次行能显示「返修中」，工单行**不能**
+/// （只能查 `status` 表）。这是两个表结构的事实差异，不是漏实现。
+/// 也就是说：一行返修中的件，工单行显示「生产中」而它下面的批次子行显示「返修中」。
+pub fn batch_status_label(status: &str, is_repairing: bool) -> &str {
+    if is_repairing {
+        "返修中"
+    } else {
+        part_status_label(status)
+    }
+}
+
+/// 批次位置的展示文案，**逐字对齐前端**
+/// `src/views/parts/list/partsListColumnDefs.ts` 的位置列渲染：
+/// `货架 {code}` / `品检 {code}` / `{工人姓名}` / `外协 {公司名}` / 解析不出时 `—`。
+///
+/// ⚠️ `WORKER` **不加前缀**（工人姓名本身自解释），与其余三档不同，这是前端的既有
+/// 口径、不是遗漏。
+pub fn batch_location_label(location: Option<&str>, holder_name: Option<&str>) -> String {
+    let Some(holder) = holder_name else {
+        return "—".to_string();
+    };
+    match location {
+        Some("PRODUCTION_SHELF") => format!("货架 {holder}"),
+        Some("INSPECTION_SHELF") => format!("品检 {holder}"),
+        Some("WORKER") => holder.to_string(),
+        Some("OUTSOURCE_COMPANY") => format!("外协 {holder}"),
+        // `OFFICE` / 未知 location / holder 已被软删（名字解析不出来）⇒ 同样给 `—`
+        _ => "—".to_string(),
+    }
+}
+
+// ============================================================================
 // 列白名单枚举
 // ============================================================================
 
@@ -132,9 +199,13 @@ pub enum VisibleColumn {
     SerialNo,
     DrawingNo,
     Name,
+    /// 批次号（**批次子行**才有值，工单行留空）。2026-10-16 新增。
+    BatchNo,
     Quantity,
     CustomerName,
     Status,
+    /// 批次所在位置（**批次子行**才有值，工单行留空）。2026-10-16 新增。
+    Location,
     SystemDeliveryDate,
     RemainingDays,
     RowType,
@@ -148,9 +219,11 @@ impl VisibleColumn {
         VisibleColumn::SerialNo,
         VisibleColumn::DrawingNo,
         VisibleColumn::Name,
+        VisibleColumn::BatchNo,
         VisibleColumn::Quantity,
         VisibleColumn::CustomerName,
         VisibleColumn::Status,
+        VisibleColumn::Location,
         VisibleColumn::SystemDeliveryDate,
         VisibleColumn::RemainingDays,
         VisibleColumn::RowType,
@@ -158,17 +231,24 @@ impl VisibleColumn {
         VisibleColumn::OrderNo,
     ];
 
-    /// 缺省配置使用的 8 列（`t_mail_digest_config.visible_columns` 的列默认值）。
+    /// 缺省配置使用的 10 列（= `ALL` 的**前 10 个**，末三位
+    /// `row_type` / `is_urgent` / `order_no` 不在缺省集里）。
     ///
-    /// ⚠️ **改这一处必须同步 migration 里的列 DEFAULT 字面量** —— migration 是
-    /// append-only、不会被改写，已经建过表的环境不会跟着变。
+    /// ⚠️ **改这一处必须新开一条迁移**同时改列 DEFAULT 与**回填存量行**
+    /// （2026-10-16 已按此办理，迁移见
+    /// `migrations/20261016000001_001_mail_digest_default_columns.sql`）：迁移是
+    /// append-only、不会被改写，已经建过表的环境不会跟着变 —— 只改 Rust 常量的话，
+    /// 新库与老库的缺省列会静默分叉。回填会**改掉管理员已存的勾选**（刻意决定，
+    /// 理由与后果见 `docs/api/mail_digest.md` §8.3）。
     pub const DEFAULT_SET: &'static [VisibleColumn] = &[
         VisibleColumn::SerialNo,
         VisibleColumn::DrawingNo,
         VisibleColumn::Name,
+        VisibleColumn::BatchNo,
         VisibleColumn::Quantity,
         VisibleColumn::CustomerName,
         VisibleColumn::Status,
+        VisibleColumn::Location,
         VisibleColumn::SystemDeliveryDate,
         VisibleColumn::RemainingDays,
     ];
@@ -179,9 +259,11 @@ impl VisibleColumn {
             Self::SerialNo => "serial_no",
             Self::DrawingNo => "drawing_no",
             Self::Name => "name",
+            Self::BatchNo => "batch_no",
             Self::Quantity => "quantity",
             Self::CustomerName => "customer_name",
             Self::Status => "status",
+            Self::Location => "location",
             Self::SystemDeliveryDate => "system_delivery_date",
             Self::RemainingDays => "remaining_days",
             Self::RowType => "row_type",
@@ -196,14 +278,40 @@ impl VisibleColumn {
             Self::SerialNo => "序列号",
             Self::DrawingNo => "图号",
             Self::Name => "名称",
+            Self::BatchNo => "批次",
             Self::Quantity => "数量",
             Self::CustomerName => "客户",
             Self::Status => "状态",
+            Self::Location => "位置",
             Self::SystemDeliveryDate => "系统交期",
             Self::RemainingDays => "剩余天数",
             Self::RowType => "工单类型",
             Self::IsUrgent => "是否紧急",
             Self::OrderNo => "订单号",
+        }
+    }
+
+    /// 该列的**列宽权重**（2026-10-16 新增，需求「表格列要对齐」）。
+    ///
+    /// ⚠️ 是**权重**不是百分比：实际百分比由 [`crate::modules::mail_digest::template`]
+    /// 按「当次实际渲染的列集合」归一化后取整，最后一列吸收余数保证合计恒 100。
+    /// 语义分配的理由（窄列 = 定长码 / 计数；宽列 = 自由文本）见 template.rs 的
+    /// 「列宽表」注释。
+    pub fn width_weight(self) -> u32 {
+        match self {
+            Self::SerialNo => 7,
+            Self::DrawingNo => 10,
+            Self::Name => 14,
+            Self::BatchNo => 5,
+            Self::Quantity => 5,
+            Self::CustomerName => 10,
+            Self::Status => 6,
+            Self::Location => 11,
+            Self::SystemDeliveryDate => 9,
+            Self::RemainingDays => 6,
+            Self::RowType => 6,
+            Self::IsUrgent => 5,
+            Self::OrderNo => 6,
         }
     }
 
