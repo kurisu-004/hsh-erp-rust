@@ -15,9 +15,12 @@
 //!
 //! ## 打印友好（2026-10-16 需求「表格列要对齐，支持打印」）
 //!
-//! - **列对齐**：每张子表带 `<colgroup>`，每个 `<col>` 写**显式宽度百分比**，
-//!   表格加 `table-layout:fixed`。没有它时 13 列全由浏览器按内容自适应 ⇒
-//!   「名称」长一点就把后面几列挤歪，读信人横向扫行对不上。
+//! - **列对齐**：**每个日期组一张自带表头的子表**，`<colgroup>` / 组标题 / 表头
+//!   `<th>` / 数据行全在**同一张表**里；每个 `<col>` 写**显式宽度百分比**，表格加
+//!   `table-layout:fixed`。⚠️ `<colgroup>` 只对它**所在那张表**的列宽生效 —— 表头若留在
+//!   外层表里，表头单元格由另一套布局算法定宽，「横向扫行对得上」在表头这一行就不成立。
+//!   没有 `fixed` + 显式宽度时 13 列全由浏览器按内容自适应 ⇒「名称」长一点就把后面几列
+//!   挤歪。
 //! - **不写 `@media print`**：约束 1 已经说明 `<style>` 块会被整块剥掉，
 //!   写进去等于什么都没写 ⇒ 全部内联。
 //! - **底色在打印路径里会丢**：`background-color` 遇到部分打印路径 /
@@ -235,6 +238,9 @@ const fn table_open() -> &'static str {
 
 /// `<colgroup>`：按**本次实际渲染的列**逐列给显式宽度百分比。
 ///
+/// ⚠️ **每张子表各写一份**（分组渲染会开多张子表）：`<colgroup>` 是表内元素、不跨表
+/// 共享，只在第一张表写的话，后面的组退回自适应布局（列还是歪的）。
+///
 /// ⚠️ 宽度是**归一化后的整数百分比**，不是 [`VisibleColumn::width_weight`] 的原值 ——
 /// 白名单是任意子集，直接用原值会凑不出 100%（例如只勾 4 列时合计 41%）⇒ 表格整体
 /// 宽度塌掉、fixed 布局按内容回退成自适应，等于白做。故：先求当次列集合的权重和，
@@ -264,7 +270,36 @@ fn colgroup(columns: &[VisibleColumn]) -> String {
     out
 }
 
+/// 子表的收尾：内层 `<table>` + 外层那格的 `</td></tr>`（见 [`open_group`]）。
+const SUB_TABLE_TAIL: &str = "</table></td></tr>";
+
 /// 渲染一节（逾期节或未来节）。空集合输出「本节无符合条件的工单」。
+///
+/// ## 骨架：**外层表 → 每个日期组一行 → 那一格里的子表**
+///
+/// ```text
+/// 外层 table
+///   <tr><td>节标题（X 条）</td></tr>
+///   <tr><td colspan="N">        ← 每组一行，N = 本次渲染列数
+///     <table … table-layout:fixed>
+///       <colgroup>…</colgroup>  ← 列宽只对本表生效
+///       <tr><td colspan="N">2026-10-15（剩余 2 天）</td></tr>
+///       <tr><th>…</th>…</tr>   ← 表头与 <colgroup> 同表 ⇒ 列宽对齐
+///       <tr>工单行</tr> <tr>批次子行…</tr> …
+///     </table>
+///   </td></tr>
+///   …下一个日期组…
+/// ```
+///
+/// ⚠️ **表头必须与 `<colgroup>` 在同一张表里**：`<colgroup>` 是表内元素、只对本表的列宽
+/// 生效，表头留在外层表时由另一套布局算法定宽 ⇒ 横向扫行在表头这一行对不上（需求⑥要的
+/// 「列对齐」就没了）。所以表头**每组一张**（组多时重复出现，但每组都与本组的列宽同源）。
+/// 回归：`tests::header_row_shares_table_with_colgroup`。
+///
+/// ⚠️ 外层包裹**成对**：一张内层表必须整体落在外层表的一个 `<td colspan="N">` 里
+/// （[`open_group`] 开 / [`SUB_TABLE_TAIL`] 关）。内层表若是外层表的直接子节点，
+/// 浏览器会把外层表提前闭合，后续行的归属由解析器的隐式纠正决定 —— 邮件里表现为
+/// 某一组整体串到节标题外面。
 fn render_section(
     title: &str,
     rows: &[DigestRow],
@@ -290,8 +325,69 @@ fn render_section(
         return out;
     }
 
-    // 表头
-    out.push_str("<tr>");
+    // 按 system_delivery_date 分组，组内画一条分隔标题行。
+    // SQL 已按 (交期 ASC, id ASC) 排好，故线性扫描即可，**不排序**（避免渲染层
+    // 与 SQL 各排一次而口径分叉）。
+    //
+    // `Option<Option<NaiveDate>>` 的外层是「**已经开过组**」的标志位：交期为空的行归到
+    // 「无交期」组，若外层也用 `Option<NaiveDate>`，开头的无交期行会被当成「与当前组同组」
+    // 而渲染到组外。
+    let mut opened = false;
+    let mut current: Option<Option<NaiveDate>> = None;
+    for row in rows {
+        let key = row.system_delivery_date;
+        if current != Some(key) {
+            if opened {
+                out.push_str(SUB_TABLE_TAIL);
+            }
+            open_group(&mut out, columns, key, is_overdue, today);
+            current = Some(key);
+            opened = true;
+        }
+        push_row_with_batches(&mut out, row, columns, today);
+    }
+    if opened {
+        out.push_str(SUB_TABLE_TAIL);
+    }
+    out
+}
+
+/// 开一个日期组：外层一行一格 + 内层一张自带 `<colgroup>` / 组标题 / 表头的子表。
+///
+/// 收尾由 [`SUB_TABLE_TAIL`] 负责（`</table></td></tr>`，恰好与这里开的三个标签配平）。
+/// 交期为空（`None`）时组标题取「无交期」、不显示剩余天数。
+fn open_group(
+    out: &mut String,
+    columns: &[VisibleColumn],
+    date: Option<NaiveDate>,
+    is_overdue: bool,
+    today: NaiveDate,
+) {
+    out.push_str(&format!(
+        "<tr><td colspan=\"{}\" style=\"padding-left:0;\">",
+        columns.len()
+    ));
+    out.push_str(table_open());
+    out.push_str(&colgroup(columns));
+    let label = date
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| NO_DATE_LABEL.to_string());
+    out.push_str(&group_header(
+        &label,
+        is_overdue,
+        today,
+        date,
+        columns.len(),
+    ));
+    out.push_str(&header_row(columns));
+}
+
+/// 表头行（一个 `<tr>` + 每列一个 `<th>`）。
+///
+/// ⚠️ 它必须紧跟在同表的 `<colgroup>` 之后渲染 —— 见 [`render_section`] 的骨架图与
+/// 「表头必须与 `<colgroup>` 同表」那条。
+fn header_row(columns: &[VisibleColumn]) -> String {
+    let mut out = String::from("<tr>");
     for col in columns {
         out.push_str(&format!(
             "<th style=\"{TH_STYLE}\">{}</th>",
@@ -299,61 +395,7 @@ fn render_section(
         ));
     }
     out.push_str("</tr>");
-
-    // 按 system_delivery_date 分组，组内画一条分隔标题行。
-    // SQL 已按 (交期 ASC, id ASC) 排好，故线性扫描即可，**不排序**（避免渲染层
-    // 与 SQL 各排一次而口径分叉）。
-    let mut current: Option<NaiveDate> = None;
-    for row in rows {
-        let Some(date) = row.system_delivery_date else {
-            // 理论上被 SQL 的窗口谓词排除了（`IS NOT NULL`），但真出现时不能 panic：
-            // 归到「无交期」组里照常渲染，只是不显示剩余天数。
-            if current.is_some() {
-                out.push_str("</table></td></tr><tr><td colspan=\"");
-                out.push_str(&columns.len().to_string());
-                out.push_str("\" style=\"padding-left:0;\">");
-                out.push_str(&group_header(
-                    "无交期",
-                    is_overdue,
-                    today,
-                    None,
-                    columns.len(),
-                ));
-                open_sub_table(&mut out, columns);
-                current = None;
-            }
-            push_row_with_batches(&mut out, row, columns, today);
-            continue;
-        };
-        if current != Some(date) {
-            if current.is_some() {
-                out.push_str("</table></td></tr><tr><td colspan=\"");
-                out.push_str(&columns.len().to_string());
-                out.push_str("\" style=\"padding-left:0;\">");
-            }
-            out.push_str(&group_header(
-                &date.format("%Y-%m-%d").to_string(),
-                is_overdue,
-                today,
-                Some(date),
-                columns.len(),
-            ));
-            open_sub_table(&mut out, columns);
-            current = Some(date);
-        }
-        push_row_with_batches(&mut out, row, columns, today);
-    }
-    out.push_str("</table></td></tr>");
     out
-}
-
-/// 开一张子表：`<table …>` 开标签 + **本次实际列集合**的 `<colgroup>`。
-///
-/// ⚠️ `<colgroup>` 必须**每张子表各一份**：分组渲染会开多张子表，`<colgroup>` 是
-/// 表内元素、不跨表共享。只在第一张表写的话，后面的组会退回自适应布局（列还是歪的）。
-fn open_sub_table(out: &mut String, columns: &[VisibleColumn]) {
-    out.push_str(table_open());
-    out.push_str(&colgroup(columns));
 }
 
 /// 一个工单行 + **紧跟其下**的该工单的批次子行（2026-10-16 需求 2）。
@@ -557,6 +599,10 @@ const COLOR_URGENT_BG: &str = "#fdf6ec";
 
 /// 批次子行的淡灰底（`<tr bgcolor>` 属性）。
 const COLOR_BATCH_BG: &str = "#f7f8fa";
+
+/// `system_delivery_date` 为空的行归入的组标题（SQL 的窗口谓词已排除该形态，这里是
+/// 渲染层的兜底：真出现时照常渲染，只是不显示剩余天数）。
+const NO_DATE_LABEL: &str = "无交期";
 
 /// 表头单元格样式（`bg` 两处都写：Outlook 只认 `bgcolor` 属性）。
 ///
@@ -961,7 +1007,7 @@ mod tests {
         assert!(!out.html.contains("SN-001"), "未选中的列不应出现数据");
     }
 
-    /// 空列白名单退回缺省 8 列（否则会渲出一张只有表头的空表）。
+    /// 空列白名单退回缺省 10 列（否则会渲出一张只有表头的空表）。
     #[test]
     fn empty_column_set_falls_back_to_default() {
         let cfg = NormalizedConfig {
@@ -1237,6 +1283,58 @@ mod tests {
             );
             assert!(out.html.contains("<colgroup>"), "缺 <colgroup>");
         }
+    }
+
+    /// ⚠️ **表头 `<th>` 与 `<colgroup>` 必须落在同一张 `<table …>` 里**（需求⑥「列对齐」
+    /// 的真断言）。
+    ///
+    /// `<colgroup>` 是表内元素、只对它**所在那张表**的列宽生效。表头若留在外层表里，
+    /// 表头单元格由另一套布局算法定宽 ⇒ 数据列齐了、表头不齐，横向扫行照样对不上。
+    /// 只断言「有 N 个 `<col>` 且百分比合计 100」的那条**对表头一无所知**，表头错位时
+    /// 它照样全绿。
+    #[test]
+    fn header_row_shares_table_with_colgroup() {
+        let cfg = NormalizedConfig::default();
+        let rows = vec![
+            with_batches(
+                row("DWG-1", Some("2026-10-15"), false),
+                vec![batch(1, "IN_PROCESS")],
+            ),
+            row("DWG-2", Some("2026-10-15"), false), // 同组
+            row("DWG-3", Some("2026-10-16"), false), // 第二组 ⇒ 第二张子表
+        ];
+        let html = &render(&input(&cfg, &[], &rows)).html;
+        let colgroups: Vec<usize> = html.match_indices("<colgroup>").map(|(i, _)| i).collect();
+        // 表头**行**（`<tr>` 紧跟 `<th>`），不是一个 `<th>`
+        let ths: Vec<usize> = html.match_indices("<tr><th ").map(|(i, _)| i).collect();
+        assert_eq!(
+            colgroups.len(),
+            2,
+            "两个日期组 ⇒ 两张子表各一份 <colgroup>：\n{html}"
+        );
+        assert_eq!(
+            ths.len(),
+            colgroups.len(),
+            "**每张子表都要有自己的一行表头**（表头不在子表内就等于没有表头）：\n{html}"
+        );
+        // 「同一个 `<table …>` 开标签」= 两个标记之前最近的 `<table` 是同一处下标
+        let table_open_before = |pos: usize| {
+            html[..pos]
+                .rfind("<table")
+                .unwrap_or_else(|| panic!("{pos} 之前没有 <table 开标签：\n{html}"))
+        };
+        for (cg, th) in colgroups.iter().zip(ths.iter()) {
+            assert_eq!(
+                table_open_before(*cg),
+                table_open_before(*th),
+                "表头 <th> 与 <colgroup> 不在同一张表 ⇒ 列对齐在表头行不成立：\n{html}"
+            );
+        }
+        // 组标题也在同一张子表内：组标题行紧随本表 `<colgroup>` 之后
+        assert!(
+            html.contains("</colgroup><tr><td colspan=\"10\" style=\""),
+            "组标题应紧随本表 <colgroup>：\n{html}"
+        );
     }
 
     /// 打印友好：底色保底属性在位、且**没有** `<style>` 块（客户端会整块剥掉）。

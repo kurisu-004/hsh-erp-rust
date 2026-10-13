@@ -130,8 +130,7 @@ async fn preview_renders_all_batches_of_every_order_row() {
     for marker in ["第1批", "第2批", "第3批"] {
         assert!(html.contains(marker), "缺批次子行 {marker}：\n{html}");
     }
-    // 位置全为空 ⇒ 4 个批次子行都是 `—`（共 5 个 `—`：无批次工单不产生子行，
-    // 故恰为 4 个批次行 + 0）
+    // 位置全为空 ⇒ 4 个批次子行都是 `—`（无批次工单不产生子行）
     assert_eq!(
         html.matches(">—<").count(),
         4,
@@ -516,4 +515,79 @@ async fn preview_repairing_batch_renders_repairing_label() {
         html.contains("返修中"),
         "is_repairing 未渲成「返修中」：\n{html}"
     );
+}
+
+// ===========================================================================
+//  7. 「已交 + 未交混合」：工单行守卫与批次过滤方向相反
+// ===========================================================================
+
+/// ★ 已交量守卫与批次子行是**方向相反**的两条口径，取数侧钉住（docs §4.4 的配套回归）。
+///
+/// 工单行的守卫是 `NOT EXISTS（任一批次 status IN ('DELIVERED','COMPLETED')）` ⇒
+/// **一件交过，整个工单行就不出现**，哪怕它还有没交的批次（那几批自然也不出现）；
+/// 反过来，工单行一旦出现，它名下**全部**批次都列出来 —— `list_batches` 不按状态过滤，
+/// 于是 `CANCELLED` 这类**非交割终态**批次照列。
+///
+/// 两条都写成一个「已交 + 未交混合」的用例：只钉其中一条时，另一条被改坏不会红。
+#[tokio::test]
+async fn mixed_delivered_and_open_batches_follow_the_opposite_two_rules() {
+    let ctx = crate::bootstrap().await;
+    let t = today();
+    let soon = t + chrono::Duration::days(2);
+
+    // ① 一件交过 ⇒ 整行消失（它名下没交的那批也不出现）
+    let mixed = insert_part(
+        &ctx.pool,
+        ctx.customer_id,
+        "DWG-MIXED",
+        "混交件",
+        "IN_PROCESS",
+        Some(soon),
+        None,
+        10,
+        None,
+        None,
+    )
+    .await;
+    insert_batch_full(&ctx.pool, mixed, 1, 6, "DELIVERED", None, None, false).await;
+    insert_batch_full(&ctx.pool, mixed, 2, 4, "IN_PROCESS", None, None, false).await;
+
+    // ② 只有非交割终态（CANCELLED）⇒ 行出现，且**两批都列出来**
+    let cancelled = insert_part(
+        &ctx.pool,
+        ctx.customer_id,
+        "DWG-CANCELLED",
+        "含取消批件",
+        "IN_PROCESS",
+        Some(soon),
+        None,
+        8,
+        None,
+        None,
+    )
+    .await;
+    insert_batch_full(&ctx.pool, cancelled, 1, 5, "CANCELLED", None, None, false).await;
+    insert_batch_full(&ctx.pool, cancelled, 2, 3, "IN_PROCESS", None, None, false).await;
+
+    let (status, env) = preview(
+        &ctx,
+        // 加 `drawing_no` 才看得见是哪个工单行（`batch_only_body()` 只有批次四列）
+        json!({ "visible_columns": ["drawing_no", "batch_no", "quantity", "status"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{env}");
+    assert_eq!(
+        env["data"]["upcoming_count"], 1,
+        "只有「含取消批件」那一个工单：{env}"
+    );
+    let html = env["data"]["html"].as_str().expect("html 是字符串");
+    assert!(
+        !html.contains("DWG-MIXED"),
+        "交过一件 ⇒ 整个工单行不出现（连没交的那批也不列）：\n{html}"
+    );
+    assert!(html.contains("DWG-CANCELLED"), "缺工单行：\n{html}");
+    // 两个批次都在（CANCELLED 不按状态过滤）
+    for marker in ["第1批", "第2批", "已取消", "生产中"] {
+        assert!(html.contains(marker), "缺 {marker}：\n{html}");
+    }
 }

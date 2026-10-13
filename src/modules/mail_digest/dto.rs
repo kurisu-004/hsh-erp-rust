@@ -122,11 +122,11 @@ impl Serialize for Frequency {
 
 /// 订单状态的中文标签（邮件正文「状态」列用）。
 ///
-/// ⚠️ **三副本人工同步**（Rust / TS 之间没有任何编译期约束）：后端两份 —— 本文件
-/// 与前端 `src/types/parts.ts::ORDER_STATUS_LABEL`（逐字一致）；前端另有一份
-/// `src/constants/partStatus.ts::STATUS_LABEL` 那是**统计**语义（另一套文案），
-/// **不要**与本表混用。三副本任一处漂了都不会编译失败，只会让同一批件在不同页面
-/// 显示两种中文状态。登记见 `docs/api/mail_digest.md` §5 与 §8.3。
+/// ⚠️ **人工同步关系分两类**（Rust / TS 之间没有任何编译期约束）：① **两份必须逐字
+/// 一致** —— 本文件与前端 `src/types/parts.ts::ORDER_STATUS_LABEL`；② **一份刻意不同**
+/// —— 前端 `src/constants/partStatus.ts::STATUS_LABEL` 是**统计**语义（另一套文案），
+/// **不要**把它当依据、也不要与本表混用。任一处漂了都不会编译失败，只会让同一批件在
+/// 不同页面显示两种中文状态。登记见 `docs/api/mail_digest.md` §5 与 §8.3。
 ///
 /// ⚠️ `REPAIRING` 已于 2026-10-01 从状态枚举删除（降级为 `t_part_batch.is_repairing`
 /// 布尔列），但 `shared::batch::status_machine` 仍保留一个过渡兼容分支能解析该字面量，

@@ -191,31 +191,100 @@ pub(crate) async fn insert_mail_account(pool: &PgPool, name: &str, account: &str
     id
 }
 
+/// 缺省列白名单（10 列）的**裸**列表（逗号分隔，**不带** PG 数组的花括号）——
+/// `insert_digest_config` 写库时套上 `'{' … '}'`。
+///
+/// ⚠️ 这份字面量与 `VisibleColumn::DEFAULT_SET` + 迁移里的列 DEFAULT 是**三条副本**，
+/// 改缺省列时三处必须一起改（`default_column_set_stays_in_sync_across_its_three_copies`
+/// 会自动比对，漏一处即红）。
+pub(crate) const DEFAULT_COLUMNS: &str = "serial_no,drawing_no,name,batch_no,quantity,\
+customer_name,status,location,system_delivery_date,remaining_days";
+
 /// 插一行 `t_mail_digest_config`，`sender_account_id` 指向给定邮箱。
 ///
 /// 直插 SQL 而不走 `POST /config`：这批用例要的是「上下文里有可用通道」这个**前置**，
 /// 而走 API 还得先算 `version`、再逐个填必填字段，会让每个用例多三行样板。
-/// 值本身仍按 DTO 的缺省写（`DAILY` / 两节都开 / 10 列），与 `config_body()` 一致。
-/// ⚠️ 这份字面量与 `VisibleColumn::DEFAULT_SET` + 迁移里的列 DEFAULT 是**三条副本**，
-/// 改缺省列时三处必须一起改。
+/// 值本身仍按 DTO 的缺省写（`DAILY` / 两节都开 / 缺省 10 列，见 [`DEFAULT_COLUMNS`]）。
+/// ⚠️ 别拿它与 `config_body()` 对齐：后者是**请求体 fixture**、刻意只勾 8 列（省得断言被
+/// 新增的两列干扰），不是缺省集。
 pub(crate) async fn insert_digest_config(pool: &PgPool, sender_account_id: i64) {
     let id = shared_test_snowflake().next_id();
     let now = now_naive();
-    sqlx::query(
+    // ⚠️ `AssertSqlSafe` 的注入面为 0：`format!` 只填 [`DEFAULT_COLUMNS`] 这一个
+    // 编译期常量（其余取值全部走 bind），口径同 `shared::batch::chain::resolve_chain_position`。
+    let sql = sqlx::AssertSqlSafe(format!(
         "INSERT INTO t_mail_digest_config (id, version, enabled, frequency, send_hour, \
          send_minute, recipients, cc_recipients, include_overdue, include_upcoming, \
          upcoming_days, visible_columns, sender_account_id, created_at, created_by, \
          updated_at, updated_by) \
-         VALUES ($1, 0, true, 'DAILY', 8, 0, '{}', '{}', true, true, 14, \
-         '{serial_no,drawing_no,name,batch_no,quantity,customer_name,status,location,system_delivery_date,remaining_days}', \
-         $2, $3, 0, $3, 0)",
+         VALUES ($1, 0, true, 'DAILY', 8, 0, '{{}}', '{{}}', true, true, 14, \
+         '{{{cols}}}', $2, $3, 0, $3, 0)",
+        cols = DEFAULT_COLUMNS,
+    ));
+    sqlx::query(sql)
+        .bind(id)
+        .bind(sender_account_id)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert t_mail_digest_config");
+}
+
+/// ★ 缺省列白名单的**三条副本**必须逐字一致：
+/// ① `VisibleColumn::DEFAULT_SET`（Rust 常量）② 迁移里的列 DEFAULT ③ [`DEFAULT_COLUMNS`]（fixture）。
+///
+/// 三者散在一个 `.rs` 常量、一个 append-only `.sql`、一个测试 fixture 里，没有任何编译期
+/// 约束 —— 改缺省列只改其中一处时，新库与老库的缺省列会静默分叉，而**没有一条测试会红**。
+/// 故本条把 ② 从迁移文件里解析出来当场比对（改列时**必须新开迁移**，见 `dto.rs` 的
+/// `DEFAULT_SET` doc）。
+#[test]
+fn default_column_set_stays_in_sync_across_its_three_copies() {
+    use hsh_erp_rust::modules::mail_digest::dto::VisibleColumn;
+
+    let rust_set: Vec<&str> = VisibleColumn::DEFAULT_SET
+        .iter()
+        .map(|c| c.as_str())
+        .collect();
+
+    let migration = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("migrations/20261016000001_001_mail_digest_default_columns.sql"),
     )
-    .bind(id)
-    .bind(sender_account_id)
-    .bind(now)
-    .execute(pool)
-    .await
-    .expect("insert t_mail_digest_config");
+    .expect("读缺省列迁移（改缺省列时请新开一条迁移，不要改这一条）");
+
+    // `ALTER COLUMN … SET DEFAULT '{…}'` 那一行里的字面量（回填那句是同一份，取首个即可）。
+    // ⚠️ 锚点取**整句**而不是 `"SET DEFAULT"`：文件头的幂等说明里也出现了这个短语。
+    let from_migration = migration
+        .split("ALTER COLUMN visible_columns SET DEFAULT")
+        .nth(1)
+        .and_then(split_columns_literal)
+        .unwrap_or_else(|| {
+            panic!("迁移里找不到 `ALTER COLUMN visible_columns SET DEFAULT '{{…}}'` 的列字面量")
+        });
+    let fixture_literal = format!("{{{DEFAULT_COLUMNS}}}");
+    let from_fixture = split_columns_literal(&fixture_literal).expect("fixture 列字面量");
+
+    assert_eq!(
+        from_migration, rust_set,
+        "迁移里的列 DEFAULT 与 `VisibleColumn::DEFAULT_SET` 不一致 —— 缺省列改了但迁移没跟上"
+    );
+    assert_eq!(
+        from_fixture, rust_set,
+        "测试 fixture 的缺省列与 `VisibleColumn::DEFAULT_SET` 不一致 —— 用例会按另一套列断言"
+    );
+}
+
+/// 从 `'{a,b,c}'` 形态的 PG 数组字面量里取出元素（容忍字面量前后的换行 / 缩进）。
+fn split_columns_literal(s: &str) -> Option<Vec<&str>> {
+    let start = s.find('{')?;
+    let end = s[start..].find('}')? + start;
+    Some(
+        s[start + 1..end]
+            .split(',')
+            .map(str::trim)
+            .filter(|x| !x.is_empty())
+            .collect(),
+    )
 }
 
 // ===========================================================================
