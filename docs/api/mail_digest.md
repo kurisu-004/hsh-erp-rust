@@ -3,8 +3,9 @@
 > **2026-10-13 新建域**。把「已逾期 + 未来 N 天系统交期到期」的**工单级**汇总成一封
 > HTML 表格邮件，按配置的频率与时刻定时发出，也支持手动触发与预览。
 > 代码位置：`src/modules/mail_digest/`（六件套）、后台调度 `src/task/mail_digest.rs`、
-> 迁移 `migrations/20261013000000_001_mail_digest.sql`、菜单 `seeds/menu.sql`（`mail_group`
-> → `mail_digest`，仅 MANAGER，路径 `/mail/digest`）。
+> 迁移 `migrations/20261013000000_001_mail_digest.sql`、菜单 `seeds/menu.sql`
+> （`scheduled_task` → `mail`，仅 MANAGER，路径 `/mail`；⚠️ **2026-10-16 由
+> `mail_group` → `mail_digest`（原路径 `/mail/digest`）改名**，旧行软删）。
 >
 > ⚠️ **SMTP 凭据走 `scheduled_task` 域的加密邮箱表**（**2026-10-16 整段替换**）。
 > 授权码 AES-256-GCM 加密进 `t_mail_account.encrypted_secret`（主密钥 env

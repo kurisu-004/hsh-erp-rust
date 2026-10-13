@@ -403,7 +403,7 @@ VO**：零件时间线用 `part::service::phase1::events` 的 `EventListRow`，s
 | `GET /api/v2/mail-digest/logs` | **Manager 独占** | 发送历史分页（`sent_at DESC, id DESC`；`limit` clamp `[1,200]`、缺省 20；`offset` clamp `>=0`；`total` 不受 `limit` 截断） |
 
 - **只用 GET / POST**（全仓零 PUT/PATCH/DELETE）；挂 `/api/v2/mail-digest`，登记在 `src/modules/mod.rs::v2_router()` 的 `.nest("/mail-digest", …)`（顶层 nest、kebab-case 单段）。**权威路由清单是 `handler::ROUTES`**（lib 单测逐条比对 `router()` 源码）。⚠️ 6 条路由**全是静态段**（无 `Path` 参数）⇒ 不受「静态段先于 catch-all」的 matchit 约束。
-- **角色守卫下沉在 handler 第一行**（6 个 handler 逐字 `require_role(Role::Manager)`；菜单亦仅授予 `MANAGER`，`seeds/menu.sql` 的 `mail_group` → `mail_digest`，路径 `/mail/digest`）。**错误码开 `217xx` 段**：`21701` 发信通道不可用（**503**，与 `40109` 同款）/ `21702` 发信失败（**502**，SMTP 是外部依赖）/ `21703` **收件人**邮箱非法（含 CR/LF 注入）/ `21704` 配置组合非法 / `21705` 配置不存在（**保留位，当前无生产方**）/ `21706..21708` **scheduled_task 域**的邮箱三条（见下节）。
+- **角色守卫下沉在 handler 第一行**（6 个 handler 逐字 `require_role(Role::Manager)`；菜单亦仅授予 `MANAGER`，`seeds/menu.sql` 的 `scheduled_task` → `mail`，路径 `/mail`）。**错误码开 `217xx` 段**：`21701` 发信通道不可用（**503**，与 `40109` 同款）/ `21702` 发信失败（**502**，SMTP 是外部依赖）/ `21703` **收件人**邮箱非法（含 CR/LF 注入）/ `21704` 配置组合非法 / `21705` 配置不存在（**保留位，当前无生产方**）/ `21706..21708` **scheduled_task 域**的邮箱三条（见下节）。
 - ⚠️ **2026-10-16：菜单结构改版** —— 一级「定时任务」/ 二级「邮件」，code 由
   `mail_group` → `mail_digest` 改成 `scheduled_task` → `mail`，路径 `/mail/digest` → `/mail`
   （前端同批改）。旧 code 的**菜单行软删、授权残留由 `rbac.sql` §5 清理**；新行**必须换新 id**
@@ -636,7 +636,7 @@ t_assembly.status               ← 派生缓存
 | [`docs/api/iam.md`](docs/api/iam.md) | `iam`（认证 + 账号 + 企业微信绑定 + 货架子模块 + **RBAC 角色权限面板**，**30 端点**；session 5 + users 12 + shelves 5 + rbac 8，4 条破坏性变更与 OCC 锚点；ADMIN 元角色通配 / 停用即降权） |
 | [`docs/api/wx.md`](docs/api/wx.md) | `wx` 微信小程序 BFF（**2026-10-11 新建**；**按小程序页面切子模块**：`login/` + `part_list/` + `production/`；5 端点；URL 硬切无 alias 5 条、VO camelCase 逐字对齐前端卡片模型、`deliveredQty` 真值、尾斜杠 404 实测钉死、`counts` / `list` 口径对齐、★ 2026-10-12 `part_list` 日期 + 7 类 tab 双维筛选） |
 | [`docs/api/statistics.md`](docs/api/statistics.md) | `statistics` 生产统计（**2026-10-12 新建**；3 个 MANAGER-only 只读端点、有效工时口径表与数据覆盖登记、跳序取件域清空的移除记录） |
-| [`docs/api/mail_digest.md`](docs/api/mail_digest.md) | `mail_digest` 交期汇总邮件（**2026-10-13 新建**；6 个 MANAGER-only 端点 + 定时任务；6 段带秒 cron 与 WEEKLY 减 1；217xx 错误码；失败也落流水；与 dashboard 的口径分叉与**五处**偏差登记（第 5 条已修）；**2026-10-16** env 凭据整轮删除、配置加 `sender_account_id`、`GET /meta` 删 `smtp` 段） |
+| [`docs/api/mail_digest.md`](docs/api/mail_digest.md) | `mail_digest` 交期汇总邮件（**2026-10-13 新建**；6 个 MANAGER-only 端点 + 定时任务；6 段带秒 cron 与 WEEKLY 减 1；217xx 错误码；失败也落流水；与 dashboard 的口径分叉与**六处**「实现与注释不符」偏差登记（第 5 条已修）；**2026-10-16** env 凭据整轮删除、配置加 `sender_account_id`、`GET /meta` 删 `smtp` 段） |
 | [`docs/api/mail.md`](docs/api/mail.md) | `scheduled_task` 邮件通道（**2026-10-16 新建**；6 个 MANAGER-only 端点；AES-256-GCM 加密入库 + 掩码不回显；SMTP 预设两家均 465/WRAPPED；被引用禁删；21706..21708；密钥轮换未实现的缺口） |
 
 **约定**：
