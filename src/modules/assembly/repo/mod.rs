@@ -286,12 +286,24 @@ pub trait AssemblyRepoTrait: Send {
         customer_id: i64,
     ) -> Result<char, crate::shared::error::AppError>;
 
-    /// 是否存在**直接**子节点（未软删）。建单「只能挂叶子」闸门用；委托
+    /// 是否存在**直接**子节点（未软删）。委托
     /// [`crate::shared::customer::has_children`]。
     ///
     /// ⚠️ 它分不出「叶子」与「客户不存在」（两种情况都返 `false`），故调用方必须
     /// 另配一个存在性判据（本域是 `fetch_customer_parent_id` 返回 `None`）。
     async fn has_children(&mut self, customer_id: i64) -> Result<bool, sqlx::Error>;
+
+    /// 业务单据只能挂**叶子**客户的闸门（2026-10-17 新增；建单与改客户端点共用）。
+    ///
+    /// 有未软删子节点 → `20104 BIZ_INVALID_VALUE`，消息带客户路径与下级节点数。
+    /// 收在 repo 层是因为 service 方法泛型 `R: AssemblyRepoTrait`（拿不到
+    /// `&mut PgConnection`）。2026-10-17 起方法体委托
+    /// [`crate::shared::customer::require_leaf_customer`]（原先是本域 service 里
+    /// 两段各抄一遍的内联实现）。
+    ///
+    /// ⚠️ 同样**不分「客户不存在」**：调用方仍须各自先跑
+    /// `fetch_customer_parent_id` 的存在性闸门。
+    async fn require_leaf_customer(&mut self, customer_id: i64) -> Result<(), AppError>;
 
     /// 客户三列（`root_name` / `own_name` / `path`）批量查（防 N+1，空 ids 短路）。
     ///
@@ -692,6 +704,10 @@ impl AssemblyRepoTrait for &mut PgConnection {
 
     async fn has_children(&mut self, customer_id: i64) -> Result<bool, sqlx::Error> {
         crate::shared::customer::has_children(&mut **self, customer_id).await
+    }
+
+    async fn require_leaf_customer(&mut self, customer_id: i64) -> Result<(), AppError> {
+        crate::shared::customer::require_leaf_customer(&mut **self, customer_id, "装配件").await
     }
 
     async fn customer_paths_by_ids(

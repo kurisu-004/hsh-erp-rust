@@ -132,14 +132,13 @@
 //! 行顶到最前。`pb.id ASC` 是兜底键（排序列可重复，无兜底键时翻页会漏行 / 重复行），
 //! 覆盖用例：`tests/part/inspection_batches.rs::inspection_batches_pagination_tiebreak_by_batch_id_is_stable`。
 //!
-//! ### `l1_customer_name` 的派生口径（两处并存，勿统一）
-//! 本查询的口径：`c.parent_id IS NOT NULL` → `pc.name.or(c.name)`（pc 的 LEFT JOIN
-//! 不带 `deleted_at` 过滤，父行在即取父名，父行悬空才回落 `c.name`）；否则
-//! （自身即 L1）→ `c.name`。
-//! ⚠️ 与 `prod::batch::service::repair::list_batches_matching` 的同名派生**口径不同**
-//! （那条不回落 `c.name`：客户自身即 L1、或父客户被软删时为 null）。两条 SQL 的分叉
-//! 是有意的，但**只有本处写了登记** —— 返修侧当前没有对应注释，改这一处前先去看
-//! `repair.rs` 的 SQL 是否仍是分叉。
+//! ### `l1_customer_name` / `customer_path` 的派生口径（2026-10-17 起两域一致）
+//! 本查询**不再**在 SQL 里自连 `t_customer` 派生「L1 名」（旧口径是
+//! `c.parent_id IS NOT NULL → pc.name.or(c.name)`，**只上跳一层**）；改为投影
+//! `p.customer_id`，service 层一次 [`crate::shared::customer::paths_of`] 补出
+//! `l1_customer_name`（= **根**名）与 `customer_path`（第 2 层到叶子的路径）。
+//! ⇒ 本域与 `prod::batch::service::repair::list_batches_matching`（返修列表）**不再
+//! 分叉**，两域共用 `shared::customer` 的同一口径。
 
 use chrono::NaiveDate;
 use sqlx::{PgConnection, PgExecutor, Postgres, QueryBuilder};
@@ -174,6 +173,7 @@ impl InspectionScanRepo {
                 p.system_delivery_date AS "system_delivery_date?",
                 p.version AS "version!",
                 p.assembly_id AS "assembly_id?",
+                p.customer_id AS "customer_id!",
                 c.name AS "customer_name?"
             FROM t_part p
             LEFT JOIN t_customer c ON c.id = p.customer_id AND c.deleted_at IS NULL
@@ -208,6 +208,7 @@ impl InspectionScanRepo {
                 a.quantity AS "quantity!",
                 a.is_urgent AS "is_urgent!",
                 a.system_delivery_date AS "system_delivery_date?",
+                a.customer_id AS "customer_id!",
                 c.name AS "customer_name?"
             FROM t_assembly a
             LEFT JOIN t_customer c ON c.id = a.customer_id AND c.deleted_at IS NULL
@@ -242,6 +243,7 @@ impl InspectionScanRepo {
                 a.quantity AS "quantity!",
                 a.is_urgent AS "is_urgent!",
                 a.system_delivery_date AS "system_delivery_date?",
+                a.customer_id AS "customer_id!",
                 c.name AS "customer_name?"
             FROM t_assembly a
             LEFT JOIN t_customer c ON c.id = a.customer_id AND c.deleted_at IS NULL
@@ -278,6 +280,7 @@ impl InspectionScanRepo {
                 p.system_delivery_date AS "system_delivery_date?",
                 p.version AS "version!",
                 p.assembly_id AS "assembly_id?",
+                p.customer_id AS "customer_id!",
                 c.name AS "customer_name?"
             FROM t_part p
             LEFT JOIN t_customer c ON c.id = p.customer_id AND c.deleted_at IS NULL
@@ -375,11 +378,16 @@ pub struct InspectionQueueFilters<'a> {
     pub offset: i64,
 }
 
-/// `GET /api/v2/prod/inspection/queue` 窄投影 SELECT（13 个输出列 + 派生 L1 名的 2 列原料）。
+/// `GET /api/v2/prod/inspection/queue` 窄投影 SELECT（13 个输出列）。
 ///
-/// 只 JOIN 3 张表：`t_part`（工单）/ `t_customer`（客户）/ `t_customer` 自连（L1）。
+/// 只 JOIN 2 张表：`t_part`（工单）/ `t_customer`（客户）。
 /// **不** JOIN `t_shelf` / `t_worker` / `t_outsource_company` / `t_process_chain_step`
 /// / `t_process` / `t_delivery_note` —— 待品检页不渲染 holder / 工序 / 送货单。
+///
+/// 2026-10-17：**去掉了「`t_customer` 自连父行」这第三个 JOIN**。它只为派生
+/// `l1_customer_name`，而 `pc.id = c.parent_id` 是**只上跳一层**的写法，客户树放开
+/// 任意深度后拿到的是中间层名。根名与「第 2 层到叶子」路径改由 service 层一次
+/// `shared::customer::paths_of` 产出（同一口径的字段见 `vo::InspectionQueueItemOut`）。
 ///
 /// 列别名直接取语义名（`pb.id AS batch_id` …），行结构侧 `FromRow` 同名承接。
 const INSPECTION_QUEUE_SELECT: &str = "SELECT \
@@ -394,20 +402,16 @@ const INSPECTION_QUEUE_SELECT: &str = "SELECT \
      p.system_delivery_date AS system_delivery_date, \
      p.is_urgent AS is_urgent, \
      p.customer_id AS customer_id, \
-     c.name AS customer_name, \
-     c.parent_id AS customer_parent_id, \
-     pc.name AS parent_customer_name \
+     c.name AS customer_name \
      FROM t_part_batch pb \
      JOIN t_part p ON p.id = pb.part_id \
-     JOIN t_customer c ON c.id = p.customer_id \
-     LEFT JOIN t_customer pc ON pc.id = c.parent_id";
+     JOIN t_customer c ON c.id = p.customer_id";
 
 /// COUNT 版本的 FROM 子句（与 [`INSPECTION_QUEUE_SELECT`] 同 JOIN，`SELECT COUNT(*)`）。
 const INSPECTION_QUEUE_COUNT_FROM: &str = "SELECT COUNT(*)::bigint AS n \
      FROM t_part_batch pb \
      JOIN t_part p ON p.id = pb.part_id \
-     JOIN t_customer c ON c.id = p.customer_id \
-     LEFT JOIN t_customer pc ON pc.id = c.parent_id";
+     JOIN t_customer c ON c.id = p.customer_id";
 
 /// list / count 共用的 WHERE 拼装器 —— 判据只此一份，天然杜绝「count 与 items
 /// 各说各话」的分页 bug。
@@ -453,11 +457,11 @@ fn push_inspection_queue_where(qb: &mut QueryBuilder<Postgres>, f: &InspectionQu
 }
 
 /// [`list_inspection_queue`](InspectionQueueRepo::list_inspection_queue) 的
-/// `FromRow` 行结构（13 输出列 + `l1_customer_name` 的 2 列原料）。
+/// `FromRow` 行结构（13 输出列）。
 ///
 /// 手动 `#[derive(FromRow)]` 而非 `query_as!` —— SQL 由 `QueryBuilder` 动态拼装。
-/// 多出的 `customer_parent_id` / `parent_customer_name` 是 `l1_customer_name` 的派生
-/// 原料，不进 VO。
+/// 2026-10-17：原先多出的 `customer_parent_id` / `parent_customer_name` 两列原料
+/// （`l1_customer_name` 的派生用）随「客户自连」一并删除。
 #[derive(sqlx::FromRow)]
 struct InspectionQueueRawRow {
     batch_id: i64,
@@ -472,8 +476,6 @@ struct InspectionQueueRawRow {
     is_urgent: bool,
     customer_id: i64,
     customer_name: Option<String>,
-    customer_parent_id: Option<i64>,
-    parent_customer_name: Option<String>,
 }
 
 /// 待品检队列读的 SQL 真源（ZST，与 [`InspectionScanRepo`] 同形、无状态）。
@@ -506,34 +508,19 @@ impl InspectionQueueRepo {
 
         Ok(rows
             .into_iter()
-            .map(|r| {
-                // l1_customer_name 派生：c.parent_id IS NOT NULL → pc.name.or(c.name)
-                // （pc 的 LEFT JOIN 不带 deleted_at 过滤，父行在即取父名，父行悬空才
-                // 回落 c.name）；否则（自身即 L1）→ c.name。与
-                // `prod::batch::service::repair::list_batches_matching` 的同名派生
-                // **口径不同**（那条不回落 c.name），勿统一；返修侧无对应登记。
-                let l1_customer_name = if r.customer_parent_id.is_some() {
-                    r.parent_customer_name
-                        .clone()
-                        .or_else(|| r.customer_name.clone())
-                } else {
-                    r.customer_name.clone()
-                };
-                InspectionQueueRow {
-                    batch_id: r.batch_id,
-                    part_id: r.part_id,
-                    batch_no: r.batch_no,
-                    quantity: r.quantity,
-                    version: r.version,
-                    serial_no: r.serial_no,
-                    drawing_no: r.drawing_no,
-                    name: r.name,
-                    system_delivery_date: r.system_delivery_date,
-                    is_urgent: r.is_urgent,
-                    customer_id: r.customer_id,
-                    customer_name: r.customer_name,
-                    l1_customer_name,
-                }
+            .map(|r| InspectionQueueRow {
+                batch_id: r.batch_id,
+                part_id: r.part_id,
+                batch_no: r.batch_no,
+                quantity: r.quantity,
+                version: r.version,
+                serial_no: r.serial_no,
+                drawing_no: r.drawing_no,
+                name: r.name,
+                system_delivery_date: r.system_delivery_date,
+                is_urgent: r.is_urgent,
+                customer_id: r.customer_id,
+                customer_name: r.customer_name,
             })
             .collect())
     }

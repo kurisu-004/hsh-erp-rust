@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-> 📌 **前端对接**：后端 API 参考见 [`docs/api/`](docs/api/)。**2026-10-16 现状**：`docs/api/` 有 14 份文件，每份是一个域的**整域契约**（端点表 / 逐字段 / 口径表 / 错误码 / 移除记录 / WS 关系 / 表依赖与前端配套 / 已知偏差登记），范本是 [`dashboard.md`](docs/api/dashboard.md) 的八节骨架：
+> 📌 **前端对接**：后端 API 参考见 [`docs/api/`](docs/api/)。**2026-10-17 现状**：`docs/api/` 有 15 份文件（新增 [`docs/api/customers.md`](docs/api/customers.md) —— 客户树**任意深度**的整域契约：`customer_path` 口径 / 「业务单据只挂叶子」/ 筛选纯子树 / 不传 `limit` 即全量），每份是一个域的**整域契约**（端点表 / 逐字段 / 口径表 / 错误码 / 移除记录 / WS 关系 / 表依赖与前端配套 / 已知偏差登记），范本是 [`dashboard.md`](docs/api/dashboard.md) 的八节骨架：
 > - [`docs/api/dashboard.md`](docs/api/dashboard.md) —— 大屏聚合域（3 个只读 HTTP 端点 + WS 首帧 / 增量；`DELIVERY_STATUSES` 四处共用、行单位、装配件整套交付不变式、`ts` 格式、前端配套清单）
 > - [`docs/api/programming.md`](docs/api/programming.md) —— `prod::programming` 待编程一览（part 状态闸门 + 三规则并集、part 级去重、批次锚点、排序白名单大小写不对称）
 > - [`docs/api/inspection.md`](docs/api/inspection.md) —— `prod::inspection` 待品检（队列列表 + 扫码三层树、`l1_customer_name` 与返修侧有意分叉、域隔离漏报盲区）

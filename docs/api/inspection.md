@@ -42,7 +42,7 @@ ScanTreeOut
 | `assembly` | object \| null | 仅 `hit_kind == "ASSEMBLY"` 或扫中的零件是某个装配件的子件时有值；独立件树为 `null` |
 | `children` | array | 装配件树 = 该装配件的**全部**子件（不止被扫中的那个）；独立件树 = `[被扫中的那个 part]` |
 
-### 2.3 `ScanAssemblyOut` 逐字段（9）
+### 2.3 `ScanAssemblyOut` 逐字段（10）
 
 | 字段 | 类型 | SQL 来源 |
 |---|---|---|
@@ -55,8 +55,9 @@ ScanTreeOut
 | `is_urgent` | boolean | `a.is_urgent` |
 | `system_delivery_date` | string \| null | `a.system_delivery_date` |
 | `customer_name` | string \| null | `LEFT JOIN t_customer c ON c.id = a.customer_id AND c.deleted_at IS NULL`（**带**软删闸门，客户被软删时退化为 `null`，不影响节点返回） |
+| `customer_path` | string | **2026-10-17 新增，必填**：第 2 层到叶子的 `" / "` 拼接（**不含**根），来自 service 层对整棵树**一次** `shared::customer::paths_of`；取不到落**空串** |
 
-### 2.4 `ScanPartOut` 逐字段（11）
+### 2.4 `ScanPartOut` 逐字段（12）
 
 | 字段 | 类型 | SQL 来源 |
 |---|---|---|
@@ -69,6 +70,7 @@ ScanTreeOut
 | `is_urgent` | boolean | `p.is_urgent` |
 | `system_delivery_date` | string \| null | `p.system_delivery_date` |
 | `customer_name` | string \| null | 同上（带 `c.deleted_at IS NULL`） |
+| `customer_path` | string | **2026-10-17 新增，必填**：与 `ScanAssemblyOut::customer_path` 同一次 `paths_of` 产出，取不到落**空串** |
 | `version` | number | `p.version` ⚠️ **仅展示**，任何批次写动作的 OCC 锚是 `ScanBatchOut::version` |
 | `children[]` | array | `ScanBatchOut` |
 
@@ -175,40 +177,42 @@ ScanTreeOut
 | 8 | `name` | string | `p.name` | 名称列 |
 | 9 | `system_delivery_date` | string \| null | `p.system_delivery_date` | 系统交期列，可空 → JSON `null` |
 | 10 | `is_urgent` | boolean | `p.is_urgent` | 加急红底 |
-| 11 | `customer_id` | string | `p.customer_id` | 雪花 ID 字符串化；客户表头筛选的入参回显（caller 选中 L1 / L2 都用它） |
-| 12 | `customer_name` | string \| null | `c.name` | **L2** 叶子客户名 |
-| 13 | `l1_customer_name` | string \| null | 派生（见 §3.5） | **L1** 一级集团名 |
+| 11 | `customer_id` | string | `p.customer_id` | 雪花 ID 字符串化；客户表头筛选的入参回显（caller 选中任意层级的客户都用它，后端展开成纯子树） |
+| 12 | `customer_name` | string \| null | `c.name` | 叶子客户名（本节点单段名） |
+| 13 | `l1_customer_name` | string \| null | `shared::customer::paths_of` 的 `root_name`（见 §3.5） | **根**（L1 集团）名 |
+| 14 | `customer_path` | string | `shared::customer::paths_of` 的 `path` | **2026-10-17 新增，必填**：第 2 层到叶子用 `" / "` 拼接（**不含**根）；取不到（客户软删 / 链成环）落**空串** |
 
 字段集严格对齐前端 7 个数据列（序列号 / 图号 / 名称 / 批次 / 数量 / 系统交期 / 客户）+ 操作列所需的锚点（`batch_id` / `version` / `part_id` / `is_urgent` / `customer_id`）。
 
-⚠️ **本 VO 与返修 VO 不共用**：`GET /api/v2/prod/batches/repair` / `/repairing` 继续用 `prod::batch::vo::InspectionBatchListItemOut`（28 字段）。共用会让那 15 个字段在待品检页成为无用负载。两端点的行对象**不可互相 cast**。
+⚠️ **本 VO 与返修 VO 不共用**：`GET /api/v2/prod/batches/repair` / `/repairing` 继续用 `prod::batch::vo::InspectionBatchListItemOut`。共用会让那边的字段在待品检页成为无用负载。两端点的行对象**不可互相 cast**。
+
+⚠️ **2026-10-17 新增第 14 个键 `customer_path`**：前端 `inspectionQueueItemSchema` 是 `.strict()`（键集恰好 13 个），多一个键即抛 `unrecognized_keys` ⇒ **整个待品检页白屏**。前端必须同步在该 schema 里声明 `customer_path: z.string()`（**必填、非 nullable** —— 后端恒给字符串，取不到时是空串）。扫码树（§2.3 / §2.4）那两个节点的 `customer_path` 同样新增。
 
 ### 3.4 队列口径：WHERE 五段拼装
 
 `repo.rs` 私有 `push_inspection_queue_where` —— list 与 count **共用**，天然杜绝「count 与 items 各说各话」的分页 bug。逐段：
 
 1. **状态 + 双软删闸门**：`pb.status = 'INSPECTION' AND pb.deleted_at IS NULL AND p.deleted_at IS NULL`（固定，不接受入参）
-2. **客户**：`cardinality($ids::bigint[]) = 0 OR p.customer_id = ANY($ids)` —— 空数组命中全部；非空时限定到展开后的 L1+L2 ids（同一数组绑两次）
+2. **客户**：`cardinality($ids::bigint[]) = 0 OR p.customer_id = ANY($ids)` —— 空数组命中全部；非空时限定到展开后的「该节点 + 全部后代」ids（同一数组绑两次）
 3. **表头 3 个文本列各一个独立 ILIKE**：`$n::text IS NULL OR <col> ILIKE $n`（短路 ⇒ 缺省不过滤）
 4. **系统交期区间**：两个可空边界各自 `$n::date IS NULL OR …`，缺界不参与过滤
 5. （仅 list）`ORDER BY {order_col} {order_dir} NULLS LAST, pb.id ASC LIMIT / OFFSET`
 
-JOIN 只有 3 张：`t_part_batch` JOIN `t_part` JOIN `t_customer`（L2）+ `t_customer` 自连（L1）。⚠️ **不** JOIN `t_shelf` / `t_worker` / `t_outsource_company` / `t_process` / `t_process_chain_step` / `t_delivery_note` —— 待品检页不渲染那些列。
+JOIN 只有 2 张：`t_part_batch` JOIN `t_part` JOIN `t_customer`（2026-10-17 起**去掉了 `t_customer` 自连**：它只为取「上跳一层」的父名，深树上必错；根名与路径改由 service 层一次 `paths_of` 产出）。⚠️ **不** JOIN `t_shelf` / `t_worker` / `t_outsource_company` / `t_process` / `t_process_chain_step` / `t_delivery_note` —— 待品检页不渲染那些列。
 
 ⚠️ 排序**必须**带 `NULLS LAST`：`p.system_delivery_date` 可空，而 PG 默认 ASC → `NULLS LAST` / DESC → `NULLS FIRST`，不显式指定时按交期倒序会把未填交期的行顶到最前。`pb.id ASC` 是兜底键（排序列可重复，无兜底键时翻页会漏行 / 重复行），覆盖用例 `tests/part/inspection_batches.rs::inspection_batches_pagination_tiebreak_by_batch_id_is_stable`。
 
 ⚠️ `customer_id` 的子树展开走 `crate::shared::customer::subtree_ids`（2026-10-17 客户层级放开为任意深度后由 `expand_customer_id` 改名并改为纯子树口径）：任意层级客户 → 自身 + 其**全部后代** ids，**不含**兄弟节点。该函数在 `shared`（公共设施，**不是**域），故本域引用它**不**违反零跨域依赖。
 
-### 3.5 ⚠️ `l1_customer_name` 的派生口径（两处并存，勿统一）
+### 3.5 `l1_customer_name` / `customer_path` 的派生口径（两域已统一）
 
-本端点（`repo.rs`）的口径：
+2026-10-17 起**本域与返修域不再分叉**：
 
-- `c.parent_id IS NOT NULL` → `pc.name.or(c.name)`：pc 的 LEFT JOIN **不带** `deleted_at` 过滤，父行在即取父名，父行悬空才回落 `c.name`
-- 否则（自身即 L1）→ `c.name`
+- SQL 只投影 `p.customer_id`（自连 `t_customer` 取父名的那个 JOIN 已删）；
+- `l1_customer_name` = `shared::customer::paths_of` 的 `root_name`（**根**名）；
+- `customer_path` = 同一函数的 `path`（第 2 层到叶子的 `" / "` 拼接，不含根）。
 
-⚠️ **与 `prod::batch::service::repair::list_batches_matching` 的同名派生口径不同**：返修侧那条 SQL 里 `l1_customer_name` 就是 `c_l1.name` 裸值 —— **不回落** `c.name`（客户自身即 L1、或父客户被软删时为 `null`），且它的 JOIN **带** `c_l1.deleted_at IS NULL`。两条 SQL 的分叉是**有意的**（队列侧要「L1 名恒尽量非空」的展示体验，返修侧要「客户被软删就不该假装它还有父集团」的严格性），但 ⚠️ **目前只有本域侧写了登记**（`repo.rs` 模块 doc），返修侧**没有对应注释**。
-
-⇒ 这条不对称本身是已登记的债：改本域这一处前先去看 `src/modules/prod/batch/service/repair.rs` 的 SQL 是否仍是分叉；要统一就得两侧一起改，并给返修侧补上登记。
+⚠️ 旧口径是 `c.parent_id IS NOT NULL → pc.name.or(c.name)`，**只上跳一层**，三层以上的树上拿到的是中间层名；返修侧则是 `c_l1.name` 裸值（不回落 `c.name`）。两处都已随本轮改成 `paths_of`，**分叉消失**：客户已软删 / 链成环时 `paths_of` 不产出该项 ⇒ `l1_customer_name = null`、`customer_path = ""`。
 
 ## 4. 口径表
 
@@ -327,7 +331,7 @@ JOIN 只有 3 张：`t_part_batch` JOIN `t_part` JOIN `t_customer`（L2）+ `t_c
 
 ### 8.1 读的表
 
-端点 1（队列读）：`t_part_batch` / `t_part` / `t_customer`（L2 + 自连 L1）。
+端点 1（队列读）：`t_part_batch` / `t_part` / `t_customer`（自连取父名的 JOIN 已于 2026-10-17 删除）。
 
 端点 2（扫码读）：`t_part` / `t_assembly` / `t_part_batch` / `t_customer`，另 `LEFT JOIN` `t_process` / `t_shelf` / `t_worker` / `t_outsource_company` 五表。
 

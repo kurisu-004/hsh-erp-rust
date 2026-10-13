@@ -46,7 +46,7 @@ use crate::modules::prod::inspection::vo::{
     InspectionQueueItemOut, InspectionQueueListOut, ScanAssemblyOut, ScanBatchOut, ScanPartOut,
     ScanTreeOut,
 };
-use crate::shared::customer::subtree_ids;
+use crate::shared::customer::{CustomerPath, paths_of, subtree_ids};
 use crate::shared::error::{AppError, code};
 
 /// `hit_kind` 出参的取值白名单。
@@ -151,6 +151,16 @@ impl InspectionScanService {
             }
         };
 
+        // 客户路径层（2026-10-17）：整棵树的客户 id 去重后**一次** `paths_of`
+        // （装配件节点 + 全部零件节点），给每个节点补 `customer_path`。
+        let mut customer_ids: Vec<i64> = hit.parts.iter().map(|p| p.customer_id).collect();
+        if let Some(a) = hit.assembly.as_ref() {
+            customer_ids.push(a.customer_id);
+        }
+        customer_ids.sort_unstable();
+        customer_ids.dedup();
+        let paths: HashMap<i64, CustomerPath> = paths_of(&mut *conn, &customer_ids).await?;
+
         // 批次层：一条 SQL 覆盖整棵树（无 N+1），空零件列表时 repo 直接返空。
         let part_ids: Vec<i64> = hit.parts.iter().map(|p| p.id).collect();
         let batch_rows =
@@ -174,14 +184,14 @@ impl InspectionScanService {
             .into_iter()
             .map(|p| {
                 let batches = batches_by_part.remove(&p.id).unwrap_or_default();
-                part_to_out(p, batches)
+                part_to_out(p, batches, &paths)
             })
             .collect();
 
         Ok(ScanTreeOut {
             hit_kind: hit.kind.as_str().to_string(),
             scanned_serial_no: serial_no.to_string(),
-            assembly: hit.assembly.map(assembly_to_out),
+            assembly: hit.assembly.map(|a| assembly_to_out(a, &paths)),
             children,
         })
     }
@@ -199,8 +209,8 @@ fn not_found(serial_no: &str) -> AppError {
     )
 }
 
-/// 装配件行 → VO（逐字段直传，无兜底）。
-fn assembly_to_out(r: ScanAssemblyRow) -> ScanAssemblyOut {
+/// 装配件行 → VO（逐字段直传；客户路径取 `paths`，取不到落空串）。
+fn assembly_to_out(r: ScanAssemblyRow, paths: &HashMap<i64, CustomerPath>) -> ScanAssemblyOut {
     ScanAssemblyOut {
         id: r.id,
         serial_no: r.serial_no,
@@ -211,11 +221,19 @@ fn assembly_to_out(r: ScanAssemblyRow) -> ScanAssemblyOut {
         is_urgent: r.is_urgent,
         system_delivery_date: r.system_delivery_date,
         customer_name: r.customer_name,
+        customer_path: paths
+            .get(&r.customer_id)
+            .map(|p| p.path.clone())
+            .unwrap_or_default(),
     }
 }
 
-/// 零件行 → VO（挂上该零件的批次列表）。
-fn part_to_out(r: ScanPartRow, children: Vec<ScanBatchOut>) -> ScanPartOut {
+/// 零件行 → VO（挂上该零件的批次列表 + 客户路径）。
+fn part_to_out(
+    r: ScanPartRow,
+    children: Vec<ScanBatchOut>,
+    paths: &HashMap<i64, CustomerPath>,
+) -> ScanPartOut {
     ScanPartOut {
         id: r.id,
         serial_no: r.serial_no,
@@ -226,6 +244,10 @@ fn part_to_out(r: ScanPartRow, children: Vec<ScanBatchOut>) -> ScanPartOut {
         is_urgent: r.is_urgent,
         system_delivery_date: r.system_delivery_date,
         customer_name: r.customer_name,
+        customer_path: paths
+            .get(&r.customer_id)
+            .map(|p| p.path.clone())
+            .unwrap_or_default(),
         // 零件级 version 仅展示：批次写操作的 OCC 锚是 ScanBatchOut::version
         version: r.version,
         children,
@@ -361,8 +383,19 @@ impl InspectionQueueService {
         let rows = InspectionQueueRepo::list_inspection_queue(&mut *conn, &filters).await?;
         let total = InspectionQueueRepo::count_inspection_queue(&mut *conn, &filters).await?;
 
+        // 客户三列（自身名 / **根**名 / 第 2 层到叶子的路径）由一次 `paths_of`
+        // 产出（2026-10-17）：本页至多 200 行、去重后通常几十个客户 id，一次往返
+        // 即可；旧形是 SQL 内自连 `t_customer` 取**直接父**名，深树上必错。
+        let mut customer_ids: Vec<i64> = rows.iter().map(|r| r.customer_id).collect();
+        customer_ids.sort_unstable();
+        customer_ids.dedup();
+        let paths = paths_of(&mut *conn, &customer_ids).await?;
+
         Ok(InspectionQueueListOut {
-            items: rows.into_iter().map(InspectionQueueItemOut::from).collect(),
+            items: rows
+                .into_iter()
+                .map(|r| InspectionQueueItemOut::from_row(r, &paths))
+                .collect(),
             total,
             limit,
             offset,

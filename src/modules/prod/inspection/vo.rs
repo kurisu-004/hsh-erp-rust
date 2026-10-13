@@ -34,10 +34,13 @@
 //! 域的形态留在 `vo.rs`；真正需要「按职责拆文件 + 精确 re-export」的是会自己长出
 //! 逻辑的 VO 子目录（`prod::dashboard` / `prod::programming`）。
 
+use std::collections::HashMap;
+
 use chrono::NaiveDate;
 use serde::Serialize;
 
 use crate::modules::prod::inspection::model::InspectionQueueRow;
+use crate::shared::customer::CustomerPath;
 use crate::shared::types::serialize_i64;
 
 /// `GET /api/v2/prod/inspection/scan/{serial_no}` 顶层响应（扫码树）。
@@ -78,8 +81,14 @@ pub struct ScanAssemblyOut {
     pub quantity: i32,
     pub is_urgent: bool,
     pub system_delivery_date: Option<NaiveDate>,
-    /// L2 叶子客户名（`LEFT JOIN t_customer`，取不到为 `null`）。
+    /// 叶子客户名（`LEFT JOIN t_customer`，取不到为 `null`）。
     pub customer_name: Option<String>,
+    /// 「第 2 层到叶子」的 `" / "` 路径（**不含**根；本节点即根时 = 根自己的名字）。
+    ///
+    /// 2026-10-17 新增，数据源 `shared::customer::paths_of`（旧形只有
+    /// `customer_name` 一段，深树上拼不出完整路径）。客户已软删 / 链成环时取不到
+    /// ⇒ **空串**（必填字段，与全仓 `customer_path` 口径一致）。
+    pub customer_path: String,
 }
 
 /// 零件节点（其 `children` 是该零件的全部批次）。
@@ -96,6 +105,9 @@ pub struct ScanPartOut {
     pub is_urgent: bool,
     pub system_delivery_date: Option<NaiveDate>,
     pub customer_name: Option<String>,
+    /// 「第 2 层到叶子」的 `" / "` 路径（**不含**根）。口径同
+    /// [`ScanAssemblyOut::customer_path`]（同一次 `paths_of` 调用产出整棵树）。
+    pub customer_path: String,
     /// `t_part.version` —— **仅展示**。
     ///
     /// ⚠️ 与 [`ScanBatchOut::version`] 严格区分：任何批次写动作
@@ -183,11 +195,26 @@ pub struct InspectionQueueItemOut {
     #[serde(serialize_with = "serialize_i64")]
     pub customer_id: i64,
     pub customer_name: Option<String>,
+    /// **根**（L1 集团）客户名。
+    ///
+    /// 2026-10-17 语义变更：旧形是「`c.parent_id IS NOT NULL` → 父行名，否则自身名」
+    /// —— **只上跳一层**，深树上会拿到中间层名。现由 `shared::customer::paths_of` 的
+    /// `root_name` 派生，与 part / assembly / outsource 各域同口径。
     pub l1_customer_name: Option<String>,
+    /// 「第 2 层到叶子」的 `" / "` 路径（**不含**根）。2026-10-17 新增，
+    /// 缺失（客户软删 / 链成环）时落**空串**而非 `null`（必填字段）。
+    pub customer_path: String,
 }
 
-impl From<InspectionQueueRow> for InspectionQueueItemOut {
-    fn from(r: InspectionQueueRow) -> Self {
+/// 行 → 出参：13 个逐字段直传 + 客户两列由 `paths` 补。
+///
+/// 2026-10-17：原先是 `impl From<InspectionQueueRow>`（repo 层就把 L1 名派生好了）。
+/// 「一次往返批量取名」只能在 service 层做（那里才有 `&mut PgConnection`），故改成
+/// 带 `&HashMap<i64, CustomerPath>` 的显式构造，`From` 随之删除 —— 留着它只会让人
+/// 在没有 paths map 的地方少拿一列。
+impl InspectionQueueItemOut {
+    pub(super) fn from_row(r: InspectionQueueRow, paths: &HashMap<i64, CustomerPath>) -> Self {
+        let cp = paths.get(&r.customer_id);
         Self {
             batch_id: r.batch_id,
             batch_no: r.batch_no,
@@ -201,7 +228,8 @@ impl From<InspectionQueueRow> for InspectionQueueItemOut {
             is_urgent: r.is_urgent,
             customer_id: r.customer_id,
             customer_name: r.customer_name,
-            l1_customer_name: r.l1_customer_name,
+            l1_customer_name: cp.map(|p| p.root_name.clone()),
+            customer_path: cp.map(|p| p.path.clone()).unwrap_or_default(),
         }
     }
 }

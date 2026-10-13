@@ -153,41 +153,15 @@ pub(crate) async fn add_assembly_child_dispatch(
 /// （旧形是「自身 name + 上跳一层取父名」，两层假设硬编码）。`parent_customer_name`
 /// 的语义因此从「直接父」变成「**根**」（与 `l1_customer_name` 一致）。
 fn render_list_item(asm: TAssembly, names: &HashMap<i64, CustomerPath>) -> AssemblyListItem {
-    let (customer_name, parent_customer_name, customer_path) = names
-        .get(&asm.customer_id)
-        .map(|p| {
-            (
-                Some(p.own_name.clone()),
-                Some(p.root_name.clone()),
-                p.path.clone(),
-            )
-        })
-        .unwrap_or((None, None, String::new()));
+    let cp = names.get(&asm.customer_id);
+    let (customer_name, parent_customer_name) = cp
+        .map(|p| (Some(p.own_name.clone()), Some(p.root_name.clone())))
+        .unwrap_or((None, None));
+    // 列表是一次批量取名，故 `customer_path` 直接从同一个 map 取（不再逐行查）。
     AssemblyListItem {
-        assembly: AssemblyOut {
-            id: asm.id,
-            drawing_no: asm.drawing_no,
-            name: asm.name,
-            applicant_name: asm.applicant_name,
-            customer_id: asm.customer_id,
-            request_date: asm.request_date,
-            planned_delivery_date: asm.planned_delivery_date,
-            is_urgent: asm.is_urgent,
-            status: asm.status,
-            version: asm.version,
-            serial_no: asm.serial_no,
-            quantity: asm.quantity,
-            unit_price: asm.unit_price,
-            total_price: asm.total_price,
-            order_no: asm.order_no,
-            system_delivery_date: asm.system_delivery_date,
-            note: asm.note,
-            created_at: asm.created_at,
-            updated_at: asm.updated_at,
-        },
+        assembly: render_assembly_out(asm, cp.map(|p| p.path.clone()).unwrap_or_default()),
         customer_name,
         parent_customer_name,
-        customer_path,
     }
 }
 
@@ -195,7 +169,7 @@ fn render_list_item(asm: TAssembly, names: &HashMap<i64, CustomerPath>) -> Assem
 // 逐字同形**的副本（2026-09-22 D-3 的理由「避免跨子模块 pub(crate) 暴露」在 Rust 里
 // 不成立 —— 同 crate 内 `pub(crate)` 即可）。两份副本已合并到
 // `super::render_assembly_out`（`service/mod.rs`），改字段只改一处。
-use super::render_assembly_out;
+use super::{assembly_out_with_path, render_assembly_out};
 
 impl AssemblyService {
     // =======================================================================
@@ -368,7 +342,7 @@ impl AssemblyService {
             .collect();
 
         Ok(AssemblyDetail {
-            assembly: render_assembly_out(asm),
+            assembly: assembly_out_with_path(repo, asm).await?,
             children,
             files,
         })
@@ -407,7 +381,9 @@ impl AssemblyService {
         // 那是**两层树**下「叶子」的等价写法。客户树放开任意深度后它既拦不住中间层
         // 节点（一个 L3 中间层照样 `parent_id IS NOT NULL`，却还有下级），又误拒了
         // 单层树上的合法叶子（`parent_id IS NULL` 的孤立根）。判据统一改成
-        // `has_children == false`。
+        // 「叶子 = `has_children == false`」，实现收敛到
+        // `AssemblyRepoTrait::require_leaf_customer`（2026-10-17：原先是本文件
+        // 建单 / 改单两段各抄一份的内联代码，现委托 `shared::customer`）。
         let customer_id: i64 = req.customer_id.parse().map_err(|_| {
             AppError::biz(
                 code::BIZ_INVALID_VALUE,
@@ -444,6 +420,7 @@ impl AssemblyService {
                 ),
             ));
         }
+        repo.require_leaf_customer(customer_id).await?;
 
         // 2. 子件上限
         if req.children.len() > 99 {
@@ -586,7 +563,7 @@ impl AssemblyService {
             .map_err(AppError::from)?
             .ok_or_else(|| AppError::biz(code::BIZ_ASSEMBLY_NOT_FOUND, "刚创建却查不到"))?;
         Ok(AssemblyCreateResult {
-            assembly: render_assembly_out(asm_t),
+            assembly: assembly_out_with_path(repo, asm_t).await?,
             created_children: created_children_out,
         })
     }
@@ -644,16 +621,7 @@ impl AssemblyService {
                         format!("customer {cid} 不存在"),
                     )
                 })?;
-            if repo.has_children(cid).await.map_err(AppError::from)? {
-                let descendants = repo.subtree_ids(cid).await?.len().saturating_sub(1);
-                return Err(AppError::biz(
-                    code::BIZ_INVALID_VALUE,
-                    format!(
-                        "装配件只能挂在叶子客户上：customer {cid} 下还有 {descendants} 个子节点，\
-                         请改挂到它的下级客户"
-                    ),
-                ));
-            }
+            repo.require_leaf_customer(cid).await?;
             Some(cid)
         } else {
             None
@@ -740,7 +708,7 @@ impl AssemblyService {
                 .map_err(AppError::from)?;
         }
 
-        Ok(render_assembly_out(asm))
+        assembly_out_with_path(repo, asm).await
     }
 
     // =======================================================================
@@ -831,7 +799,7 @@ impl AssemblyService {
             .await
             .map_err(AppError::from)?
             .ok_or_else(|| AppError::biz(code::BIZ_ASSEMBLY_NOT_FOUND, "assembly 不存在"))?;
-        Ok(render_assembly_out(asm))
+        assembly_out_with_path(repo, asm).await
     }
 
     // =======================================================================

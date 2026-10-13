@@ -137,10 +137,27 @@ pub struct InspectionBatchListItemOut {
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 
-    // ===== 客户解析（JOIN t_customer + 自连 L1）=====
+    // ===== 客户解析（JOIN t_customer；根名 / 路径由 service 层 paths_of 补）=====
     #[serde(serialize_with = "serialize_i64")]
     pub customer_id: i64,
+    /// ⚠️ **2026-10-17 起承载 `customer_path`，不再是单段客户名**：值是
+    /// 「第 2 层到叶子」用 `" / "` 拼接的路径（**不含**根）。
+    ///
+    /// 字段名**刻意不改**：前端 `repairBatchListItemSchema` 是 `.strict()`（键集
+    /// 恰好三个客户键），新增一个 `customer_path` 键会抛 `unrecognized_keys` ⇒
+    /// 整个返修页白屏；而**改已有键的值**不触发 strict。消费侧（`RepairReceive.vue`
+    /// 的「客户」列）按 `l1 + " / " + customer_name` 组合展示，故
+    /// - 两层树：`"华强" + " / " + "终端BG"` = `"华强 / 终端BG"`，与旧值逐字相同；
+    /// - 四层树：`"华强" + " / " + "终端BG / 手机部 / 影像组"` = 全路径。
+    ///
+    /// 客户已软删 / `parent_id` 链成环时 `paths_of` 取不到 ⇒ 落**空串**（此时前端
+    /// 两段都空，渲染「—」）。
     pub customer_name: Option<String>,
+    /// **根**（L1 集团）客户名 —— 2026-10-17 起不再是「直接父」。
+    ///
+    /// 旧形由 SQL 自连 `t_customer c_l1 ON c_l1.id = c.parent_id` 取到，**只上跳
+    /// 一层**：深树上拿到的是中间层名。现由 `shared::customer::paths_of` 的
+    /// `root_name` 派生，与 part / assembly / outsource / inspection 各域同口径。
     pub l1_customer_name: Option<String>,
 }
 

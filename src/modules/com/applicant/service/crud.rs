@@ -4,8 +4,17 @@
 //!
 //! ## 业务规则（与 Python 一致）
 //! - 角色：Manager + Clerk 可读写（service 层二次守卫）
-//! - customer_id 必须指向 L1（一级集团 parent_id IS NULL）—— 不允许挂到 L2
+//! - customer_id 必须指向 L1（一级集团 parent_id IS NULL）—— 不允许挂到下级
 //! - 同一 L1 下姓名唯一（DB partial unique 兜底）
+//!
+//! ## 「必须挂 L1 根」**不随客户层级加深而改变**（2026-10-17 复核确认）
+//! 客户树从固定两层放开为任意深度后，全仓多数域的「挂叶子 / 取根名」口径都跟着变了，
+//! 本域**刻意不动**：申请人属于**集团**不属于分厂 —— 它是给人用的建单主体
+//! （`t_part.applicant_name` 落在零件行上），按集团登记才不会每个车间重复维护一批人。
+//! 判据仍是 `parent_id IS NULL`（`l1_customer_exists`，它同时排除软删行），
+//! 在任意深度的树上语义不变：只有根才算「一级集团」。
+//! ⚠️ 反过来说：给 L1 根加下级**不影响**既有申请人的有效性（判据只看本节点自己是不是
+//! 根，不看它有没有子节点）—— 与 part / assembly 那些「只能挂叶子」的域正好相反。
 //! - 软删时被 t_part.applicant_name 引用 → 拒软删（21004）
 //!
 //! 2026-09-22 重构：原 `service.rs::lookup_customer_names` 的 inline t_customer SQL
@@ -60,10 +69,14 @@ fn duplicate_name() -> AppError {
         "同一客户下已存在同名申请人",
     )
 }
+/// 客户不是根（`parent_id IS NOT NULL`）或不存在 / 已软删。
+///
+/// 2026-10-17：文案补一句「不随层级加深而改变」，让现场看到 20311 时知道这不是
+/// 「客户树变深了导致的误判」—— 申请人按集团登记，挂在任何下级都会被拒。
 fn bad_customer() -> AppError {
     AppError::biz(
         code::BIZ_APPLICANT_BAD_CUSTOMER,
-        "customer_id 必须指向一级客户（L1）",
+        "customer_id 必须指向一级客户（L1 集团根）：申请人按集团登记，不挂分厂 / 车间",
     )
 }
 fn in_use() -> AppError {

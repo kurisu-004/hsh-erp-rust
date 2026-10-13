@@ -64,8 +64,9 @@
 | `is_urgent` | boolean | `p.is_urgent` | |
 | `planned_delivery_date` | string | `p.planned_delivery_date` | `String` 而非 `NaiveDate`；DB `NOT NULL` 已保证非空，NULL 走 `"1970-01-01"` 防御性兜底 |
 | `system_delivery_date` | string \| null | `p.system_delivery_date` | `NaiveDate` 原生序列化；该列可空 → JSON `null` |
-| `customer_name` | string \| null | `c.name`（`LEFT JOIN t_customer c ON c.id = p.customer_id`） | **L2 叶子客户名** |
-| `parent_customer_name` | string \| null | `pc.name`（`LEFT JOIN t_customer pc ON pc.id = c.parent_id`） | **L1 一级集团名**；L2 未挂 parent 时为 `null` |
+| `customer_name` | string \| null | `c.name`（`LEFT JOIN t_customer c ON c.id = p.customer_id`） | 叶子客户名（本节点单段名） |
+| `parent_customer_name` | string \| null | `shared::customer::paths_of` 的 `root_name`（service 层一次批量取） | **根**（L1 集团）名 —— **2026-10-17 起不再是「直接父」**（旧形是 SQL 自连 `pc ON pc.id = c.parent_id`，只上跳一层，深树上错）；取不到为 `null` |
+| `customer_path` | string | `shared::customer::paths_of` 的 `path` | **2026-10-17 新增，必填**：第 2 层到叶子用 `" / "` 拼接（**不含**根）；取不到落**空串** |
 | `has_cnc_program` | boolean | `EXISTS (SELECT 1 FROM t_part_file pf WHERE pf.part_id = p.id AND pf.kind = 'G_CODE' AND pf.deleted_at IS NULL)` | `repo.rs::G_CODE_EXISTS` 单一常量，同时供 SELECT 投影与 WHERE 三态过滤复用 |
 | `batch_id` | string \| null | `LEFT JOIN LATERAL` 取 `pb.id`（`status='PROGRAMMING' AND deleted_at IS NULL`，`ORDER BY pb.id DESC LIMIT 1`） | 批次锚点，见 §2.2；雪花 ID 字符串化（`serialize_i64_opt`） |
 | `batch_version` | number \| null | 同上 LATERAL 的 `pb.version` | 与 `batch_id` **同生共死**；`t_part_batch.version`（批次 OCC），与上面的 part 级 `version` 严格区分 |
@@ -88,8 +89,7 @@
 
 ```sql
 FROM t_part p
-LEFT JOIN t_customer c  ON c.id = p.customer_id          -- L2 叶子客户
-LEFT JOIN t_customer pc ON pc.id = c.parent_id           -- L1 一级集团
+LEFT JOIN t_customer c  ON c.id = p.customer_id          -- 叶子客户（只取 name，见 §2.1）
 LEFT JOIN LATERAL ( ... ) pb_prog ON true                -- 批次锚点（§2.2，list 专用）
 WHERE p.deleted_at IS NULL
   AND p.status IN ('PENDING','IN_PROCESS','PROGRAMMING')  -- ⓿ 状态闸门，在三规则括号之外
@@ -235,7 +235,7 @@ service 规范化后由 `repo.rs::escape_like` 把用户 keyword 里的 `\ / % /
 | CNC 判定走 `current_holder_id → t_shelf_process` **间接链路** | 规则3 走 `t_part_batch.current_process_id` **权威列**（§3.2）。间接链路在 `t_process.is_cnc` 未正确维护 / 批次未上架时取不到工序 |
 | 无 `serial_no` **精确**筛选（只能靠 keyword 模糊命中） | `serial_no` 是独立参数，`p.serial_no = $n` 精确匹配（§1.1） |
 | 无 `escape_like`（`%` / `_` 被当通配符放大） | 转义成字面量（§3.4） |
-| 无 L1 / L2 客户名 | `customer_name`（L2）+ `parent_customer_name`（L1）（§2.1） |
+| 无客户三列 | `customer_name`（自身名）+ `parent_customer_name`（**根**名）+ `customer_path`（§2.1） |
 | list 与 count **两份手抄 SQL**（其中 `has_cnc_program` 的 EXISTS 子查询重复手抄 3 处）→ `total` 与 `items` 可能对不上 | 共用 `push_where` + `FROM_SQL`，判据只写一份（§3.1） |
 | 无 part 状态闸门 | 状态闸门在最外层约束全部三规则（§3.3） |
 
@@ -302,11 +302,11 @@ service 规范化后由 `repo.rs::escape_like` 把用户 keyword 里的 `\ / % /
 
 ### 8.1 读的 6 张表
 
-`t_part` / `t_part_batch` / `t_customer`（L2 + 自连 L1，同一张表 JOIN 两次）/ `t_process` / `t_process_chain_step` / `t_part_file`。
+`t_part` / `t_part_batch` / `t_customer`（**只 JOIN 一次**：2026-10-17 删掉了「自连取父名」那个 JOIN，根名与路径改由 service 层一次 `shared::customer::paths_of` 产出）/ `t_process` / `t_process_chain_step` / `t_part_file`。
 
 软删闸门（5 处，`repo.rs` 内逐条写死）：`p` / `pb` / `pr` / `s` / `t_part_file pf`。
 
-⚠️ **客户侧故意不过滤 `deleted_at`**（`FROM_SQL` 的两条 `LEFT JOIN t_customer` 都没有软删条件），这是**有意的**分叉：历史工单需要显示其原客户名 —— 软删客户后工单仍在册，名字不能变空。若将来要改这一口径，须同步评估历史列表页的展示回归。
+⚠️ **客户侧故意不过滤 `deleted_at`**（`FROM_SQL` 的 `LEFT JOIN t_customer` 没有软删条件），这是**有意的**分叉：历史工单需要显示其原客户名 —— 软删客户后工单仍在册，名字不能变空。若将来要改这一口径，须同步评估历史列表页的展示回归。
 
 本域**零跨域依赖**：`shared::domain_guard` 的单测 `src/modules/prod/programming/mod.rs` 里的 `programming_domain_depends_on_no_other_domain` 把这条边界变成 CI 强制（扫 `src/modules/prod/programming/**/*.rs`，代码区里出现任何 `crate::modules::<他域>` 路径即 panic；`prod::batch` 这类**兄弟域**同样算跨域）。
 
@@ -315,13 +315,17 @@ service 规范化后由 `repo.rs::escape_like` 把用户 keyword 里的 `\ / % /
 | 落点（`frontend` 仓） | 路径 | 备注 |
 |---|---|---|
 | queryKey 工厂 | `src/composables/queries/keys.ts` 的 `qk.programmingList(params)` / `qk.programmingPrefix` | 全仓唯一 queryKey 来源，禁止在调用点拼字面量数组 |
-| Zod 守门 schema | `src/views/cnc/composables/pendingProgrammingSchema.ts` | `pendingProgrammingItemSchema`（15 字段逐个显式声明）+ `pendingProgrammingListResultSchema` |
+| Zod 守门 schema | `src/views/cnc/composables/pendingProgrammingSchema.ts` | `pendingProgrammingItemSchema`（**16** 字段逐个显式声明；2026-10-17 新增 `customer_path`）+ `pendingProgrammingListResultSchema` |
 | query hook | `src/views/cnc/composables/usePendingProgrammingQuery.ts` | hook 无自有状态，入参 `MaybeRefOrGetter`（params + `enabled` + `autoRefresh`） |
 | 页面级 store | `src/views/cnc/composables/usePendingProgrammingStore.ts` | 分页 / 筛选 / 对话框态 + mutation + `invalidateProgrammingQuery(qc)` |
 | 列定义 | `src/views/cnc/pendingProgrammingColumnDefs.ts` | 批次锚点改名义务在 `RELEASE_*` 常量注释上双向登记 |
 | api 层 | `src/api/programming.ts` | URL `/prod/programming/pending` |
 
-⚠️ **客户字段名与 part 域不同名**：本域是 `parent_customer_name`(L1) / `customer_name`(L2)，part 域 `PartListItem` 是 `l1_customer_name` / `customer_name`。两边的行对象**不能互相 cast**，否则列渲染读不到键、静默显示「—」。
+⚠️ **客户字段名与 part 域不同名**：本域是 `parent_customer_name`（= **根**名）/ `customer_name`（自身名）/ `customer_path`，part 域 `PartListItem` 是 `l1_customer_name` / `customer_name` / `customer_path`。两边的行对象**不能互相 cast**，否则列渲染读不到键、静默显示「—」。
+
+⚠️ **`customer_path` 是 2026-10-17 新增的第 16 个字段**：本域的 Zod schema 是 strip 模式（非 `.strict()`），前端未声明它时会被静默丢弃（不报错、不显示）。前端需在 `pendingProgrammingItemSchema` 里补 `customer_path: z.string()` 才能用上。
+
+⚠️ 另有一处**只上跳一层**的旧写法在本仓长期存在且本轮已消除：`LEFT JOIN t_customer pc ON pc.id = c.parent_id`（取「L1 集团名」）。客户树放开任意深度后它拿到的是**中间层**名，本域与 `prod::inspection` 队列均已改为 `paths_of`。
 
 ⚠️ **Zod schema 是 strip 模式的 `z.object`（非 `.strict()`）**：后端改字段名不会让 Zod 报错，只会被静默丢弃。所以批次锚点两个字段的改名是**双向登记**义务，不是单侧约定。
 

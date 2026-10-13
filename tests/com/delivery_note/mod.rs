@@ -22,6 +22,8 @@
 //!   同源）
 //! - view_permission.rs ← 2026-10-15 新增（`delivery_note.view` 三条读闸门矩阵：
 //!   list 收紧去 CNC + 详情 / batch-detail 补闸）
+//! - customer_depth.rs ← **2026-10-17 新增**（客户树任意深度 × 本域：分组成员放宽为
+//!   任意后代、入单叶子闸门、`l1_of` 上溯到根、`customer_path` = 第 2 层到叶子拼接）
 //!
 //! ## 2026-10-08 删除
 //! - `attach_batches.rs` ← 原 tests/delivery/attach_batches.rs（`POST /{id}/attach-batches`
@@ -31,6 +33,7 @@
 
 mod applicant_fallback;
 mod batch_allocation;
+mod customer_depth;
 mod driver;
 mod drivers;
 mod entry_gate;

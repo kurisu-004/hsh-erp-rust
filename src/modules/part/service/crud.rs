@@ -718,37 +718,13 @@ pub(crate) fn customer_names_of(
 
 /// 业务单据只能挂**叶子**客户（2026-10-17 新增，与客户树无限层级化同批）。
 ///
-/// 客户树从固定两层放开为任意深度后，「挂一个 L2」不再是「一定是最深一层」——
-/// 中间层节点同样有子节点，若不拦，建出来的工单/装配件挂在一个还有下级的客户上，
-/// 筛选口径（选中节点 = 自身 + 子树）与展示口径都会失真。
-///
-/// 报 `20104 BIZ_INVALID_VALUE`（不是 `20124`，那一条是**客户软删**闸门专用），
-/// 消息带上客户 id / 名字与下级节点数，便于现场直接定位到要改的树节点。
-///
-/// ⚠️ 「有几层下级」按**下级节点总数**（子树大小 - 1）给出而不是层数：树深需要逐层
-/// 遍历，而节点数一次 `subtree_ids` 就有，且对用户来说「你下面还有 3 个子节点」比
-/// 「还有 2 层」更可操作。
+/// 2026-10-17 收敛：本函数原来在本文件另有一份实现，现整体委托
+/// [`crate::shared::customer::require_leaf_customer`]（part / assembly / outsource
+/// 三域共用一份，判据、错误码与消息结构逐字相同）。本函数保留只是为了让
+/// `crate::service::batch` 的导入路径与语义（「工单」口径）留在本域。
 pub(super) async fn require_leaf_customer(
     conn: &mut PgConnection,
     customer_id: i64,
 ) -> Result<(), AppError> {
-    if !crate::shared::customer::has_children(&mut *conn, customer_id).await? {
-        return Ok(());
-    }
-    let descendants = crate::shared::customer::subtree_ids(&mut *conn, customer_id)
-        .await?
-        .len()
-        .saturating_sub(1);
-    let names = crate::shared::customer::paths_of(&mut *conn, &[customer_id]).await?;
-    let label = names
-        .get(&customer_id)
-        .map(|p| p.path.clone())
-        .unwrap_or_else(|| format!("customer {customer_id}"));
-    Err(AppError::biz(
-        code::BIZ_INVALID_VALUE,
-        format!(
-            "工单只能挂在叶子客户上：{label}（id={customer_id}）下还有 {descendants} 个子节点，\
-             请改挂到它的下级客户"
-        ),
-    ))
+    crate::shared::customer::require_leaf_customer(conn, customer_id, "工单").await
 }

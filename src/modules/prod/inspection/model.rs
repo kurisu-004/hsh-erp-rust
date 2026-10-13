@@ -31,7 +31,7 @@
 use chrono::NaiveDate;
 use sqlx::FromRow;
 
-/// `t_part` 窄投影行（11 列）+ `LEFT JOIN t_customer` 的客户名。
+/// `t_part` 窄投影行（11 列 + 客户 id）+ `LEFT JOIN t_customer` 的客户名。
 ///
 /// 命中查询与装配件子件列表查询**共用同一组列**（SQL 字面量各写一份，`query_as!`
 /// 宏要求字面量、不能插常量，见 [`super::repo`] 模块 doc）。
@@ -54,9 +54,13 @@ pub struct ScanPartRow {
     pub version: i32,
     /// 所属装配件 id；`None` = 独立零件。非 `None` 时本端点返回整棵装配件树。
     pub assembly_id: Option<i64>,
+    /// 零件所属客户 id —— service 层一次 `shared::customer::paths_of` 的入参，
+    /// 用来给节点补 `customer_path`（2026-10-17 新增；旧形只有 `customer_name`，
+    /// 深树上无法还原完整路径）。
+    pub customer_id: i64,
 }
 
-/// `t_assembly` 窄投影行（9 列）+ `LEFT JOIN t_customer` 的客户名。
+/// `t_assembly` 窄投影行（9 列 + 客户 id）+ `LEFT JOIN t_customer` 的客户名。
 ///
 /// 装配件节点**本身没有批次**（`t_assembly` 在 `t_part_batch` 里没有行），所以
 /// 本结构不含 `version` —— 本端点不提供任何以装配件为锚的写操作。
@@ -73,6 +77,8 @@ pub struct ScanAssemblyRow {
     pub is_urgent: bool,
     pub system_delivery_date: Option<NaiveDate>,
     pub customer_name: Option<String>,
+    /// 装配件所属客户 id（`paths_of` 的入参，同 [`ScanPartRow::customer_id`]）。
+    pub customer_id: i64,
 }
 
 /// `t_part_batch` 窄投影行（10 列 + 1 列分组键）。
@@ -115,7 +121,12 @@ pub struct ScanBatchRow {
 /// 2026-10-07 自 `prod::batch::model` 迁入（域迁移，字段与投影逐字不变）。
 /// 待品检页只渲染 7 个数据列（序列号 / 图号 / 名称 / 批次 / 数量 / 系统交期 /
 /// 客户），故只投 13 列 —— 不投 holder / 工序 / 送货单。
-/// `l1_customer_name` 的派生在 repo 层完成（原料列 `c.parent_id` / `pc.name`）。
+///
+/// 2026-10-17：`l1_customer_name` 字段与它依赖的「`t_customer` 自连父行」一并**从
+/// repo 层删除**，改由 service 层一次 `shared::customer::paths_of` 补
+/// `l1_customer_name`（= **根**名）与 `customer_path`。旧口径是
+/// `c.parent_id IS NOT NULL → pc.name.or(c.name)`：**只上跳一层**，在三层以上的树上
+/// 拿到的是中间层名而不是集团名。
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct InspectionQueueRow {
     pub batch_id: i64,
@@ -130,8 +141,8 @@ pub struct InspectionQueueRow {
     /// 系统交期（页面已不显示计划交期，日期筛选改筛本列）。
     pub system_delivery_date: Option<NaiveDate>,
     pub is_urgent: bool,
+    /// 零件所属客户 id：service 层 `paths_of` 的入参（与出参
+    /// `InspectionQueueItemOut::customer_id` 同值）。
     pub customer_id: i64,
     pub customer_name: Option<String>,
-    /// L1 集团名（由 `c.parent_id` 是否为空派生，口径见 [`super::repo`]）。
-    pub l1_customer_name: Option<String>,
 }

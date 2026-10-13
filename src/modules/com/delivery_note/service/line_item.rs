@@ -9,7 +9,8 @@
 //! 的装配逻辑逐字相同**。口径（含申请人回落、装配件父行字段、可出货套数挂载点）
 //! 必须只有一份实现，否则改一处忘一处 ⇒ 同一张单在两条路径上给不同的行项。
 //!
-//! 调用方各自负责的**只有取数**：客户 map（leaf / parent）、装配件 map、套数 map。
+//! 调用方各自负责的**只有取数**：客户路径 map（`shared::customer::paths_of` 的产物）、
+//! 装配件 map、套数 map。
 //!
 //! ## 入参为什么不收连接
 //!
@@ -19,42 +20,45 @@
 use std::collections::HashMap;
 
 use crate::modules::assembly::model::TAssembly;
-use crate::modules::com::customer::model::TCustomer;
 use crate::modules::part::model::TPart;
 use crate::shared::batch::TPartBatch;
+use crate::shared::customer::CustomerPath;
 
 use super::super::vo::{DeliveryNoteLineItem, delivery_seq_i32};
 
 /// 行 = 批次。`b` 定身份与量 / 状态，`p` 定工单投影，`*_map` 定跨表补齐的字段。
 ///
-/// 三张 map 的键口径（调用方保证，本函数不再回查）：
-/// - `leaf_map`：`t_part.customer_id` → L2 叶子客户；
-/// - `parent_map`：L2 的 `parent_id` → L1 客户；
-/// - `assembly_map`：`t_part.assembly_id` → 装配件（`include_deleted=false`，
-///   软删 / 不存在时该键缺失 ⇒ 整行按散件行退化）。
+/// `paths_map` 的键口径（调用方保证，本函数不再回查）：
+/// - `t_part.customer_id` → [`CustomerPath`]（`shared::customer::paths_of` 的
+///   产物，一次往返拿齐整页的 `root_name` / `own_name` / `customer_path`）。
+///
+/// 2026-10-17：三个客户字段全部由该 map 派生。此前本函数收的是两张
+/// `TCustomer` map（零件自身客户 + 其**直接父**），并在内存里拼 `"父 / 子"`
+/// ——那是**两层树**的形状：客户树放开任意深度后，「直接父」既可能是中间层
+/// （拼出来的路径只有两段、丢掉上层的根），也可能不存在（零件挂根上）。
+/// `paths_of` 一次往返给出「第 2 层到叶子」的完整路径与根名，两个问题一起消失。
+///
+/// `assembly_map` 的键口径：
+/// - `t_part.assembly_id` → 装配件（`include_deleted=false`，软删 / 不存在时该键
+///   缺失 ⇒ 整行按散件行退化）。
 ///
 /// `sets_map` 是「装配件 id → 本单可出货套数」（`shippable_sets::note_shippable_sets`
 /// 的产物），只有子件行会命中。
 pub(super) fn build_line_item(
     b: &TPartBatch,
     p: &TPart,
-    leaf_map: &HashMap<i64, TCustomer>,
-    parent_map: &HashMap<i64, TCustomer>,
+    paths_map: &HashMap<i64, CustomerPath>,
     assembly_map: &HashMap<i64, TAssembly>,
     sets_map: &HashMap<i64, i32>,
 ) -> DeliveryNoteLineItem {
-    let leaf = leaf_map.get(&p.customer_id);
-    let parent = leaf
-        .and_then(|l| l.parent_id)
-        .and_then(|pid| parent_map.get(&pid));
-    let leaf_name = leaf.map(|c| c.name.clone());
-    // L1 自指（顶层客户没有 parent）时回落 L2 名，保证 `parent_customer_name`
-    // 恒有值；`customer_path` 下面那条 `p != l` 再把「自指」折回单段。
-    let parent_name = parent.map(|c| c.name.clone()).or_else(|| leaf_name.clone());
-    let path = match (&parent_name, &leaf_name) {
-        (Some(p), Some(l)) if p != l => Some(format!("{p} / {l}")),
-        _ => leaf_name.clone(),
-    };
+    // map 里没有该 id = 客户已软删 / parent_id 链解析不出根。两种情况都取不到
+    // 名字与路径：前两列落 `None`、路径落**空串**（必填字段，语义见
+    // `vo::DeliveryNoteLineItem::customer_path`）。
+    let cp = paths_map.get(&p.customer_id);
+    let leaf_name = cp.map(|c| c.own_name.clone());
+    // 2026-10-17：`parent_customer_name` 的语义是**根**（集团）名，不再是直接父名。
+    let root_name = cp.map(|c| c.root_name.clone());
+    let path = cp.map(|c| c.path.clone()).unwrap_or_default();
 
     let asm = p.assembly_id.and_then(|id| assembly_map.get(&id));
 
@@ -82,9 +86,9 @@ pub(super) fn build_line_item(
         order_no: p.order_no.clone(),
         note: p.note.clone(),
         customer_name: leaf_name,
-        parent_customer_name: parent_name,
+        parent_customer_name: root_name,
         customer_path: path,
-        // 与 `leaf_map` 的查表 key 同值，不额外查库
+        // 与 `paths_map` 的查表 key 同值，不额外查库
         customer_id: p.customer_id,
         assembly_id: asm.map(|a| a.id),
         assembly_serial_no: asm.and_then(|a| a.serial_no.clone()),

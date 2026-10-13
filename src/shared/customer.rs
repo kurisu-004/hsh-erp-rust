@@ -4,11 +4,13 @@
 //! 端点都要把 Query 里的单个 `customer_id` 展开成一组 ids 才能进 SQL 的
 //! `= ANY($n)`，口径必须**全仓一份**，否则同一页面的不同入口会给出不同的行集。
 //!
-//! 四个公开函数，**互不派生**（各自可独立调用，调用方按需要取）：
+//! 五个公开函数，**互不派生**（各自可独立调用，调用方按需要取）：
 //! - [`subtree_ids`]：向下展开成「自身 + 全部后代」的纯子树（筛选用）
 //! - [`root_id_of`]：向上走到根（`parent_id IS NULL`），派发序列号 / 派生根属性用
 //! - [`has_children`]：有没有未软删的直接子节点（软删闸门用）
 //! - [`paths_of`]：一次往返批量产出 `(root_name, own_name, customer_path)`（出参用）
+//! - [`require_leaf_customer`]：业务单据「只能挂叶子」的闸门（2026-10-17 新增，
+//!   前一轮各域各写一份，现收敛到本函数）
 //!
 //! 全部只读 `t_customer`，不带任何权限 / 分页口径，故可放在 shared 而非某个域的
 //! service：调用方各自用自己的连接句柄传入，本模块自身不开事务（**事务边界在
@@ -235,6 +237,56 @@ pub async fn paths_of(
         );
     }
     Ok(out)
+}
+
+/// 业务单据只能挂**叶子**客户的闸门（2026-10-17 新增）。
+///
+/// 客户树从固定两层放开为任意深度后，「挂一个 L2」不再蕴含「一定是最深一层」——
+/// 中间层节点同样有子节点；若不拦，建出来的工单 / 装配件 / 外协报价挂在一个还有
+/// 下级的客户上，筛选口径（选中节点 = 自身 + 子树）与展示口径都会失真。
+///
+/// 有未软删子节点 → `20104 BIZ_INVALID_VALUE`（**不是** `20124`，那一条是**客户软删**
+/// 闸门专用），消息带上客户 id / 路径与下级节点数，便于现场直接定位到要改的树节点。
+///
+/// `subject` 是**域内业务名**（如「工单」「装配件」「外协报价」），只进 message —— 本函数
+/// 不区分单据类型，判据对所有业务单据是同一条，错误文案不该由闸门自己决定。
+///
+/// ⚠️ 「有几层下级」按**下级节点总数**（子树大小 - 1）给出而不是层数：树深需要逐层
+/// 遍历，而节点数一次 [`subtree_ids`] 就有，且对用户来说「你下面还有 3 个子节点」比
+/// 「还有 2 层」更可操作。
+///
+/// ⚠️ **不分「客户不存在」**：本函数只判 `has_children`，而 `has_children` 对不存在的
+/// 客户也返 `false`（等于「无子节点」）。调用方必须**各自先做存在性闸门**（part /
+/// assembly / outsource 三处都是），否则会把「客户没录进来」伪装成「挂到了合法叶子」。
+///
+/// 2026-10-17 由 part / assembly / outsource 三份域内副本收敛到本函数：三份的判据、
+/// 错误码、消息结构本已逐字相同，只是各写一遍，改口径必然漏改一处。
+pub async fn require_leaf_customer(
+    conn: &mut PgConnection,
+    customer_id: i64,
+    subject: &str,
+) -> Result<(), AppError> {
+    if !has_children(&mut *conn, customer_id).await? {
+        return Ok(());
+    }
+    let descendants = subtree_ids(&mut *conn, customer_id)
+        .await?
+        .len()
+        .saturating_sub(1);
+    let paths = paths_of(&mut *conn, &[customer_id]).await?;
+    // 解析不出根（成环 / 链尾断在已软删父行）时 map 里没有该 id —— 回落成
+    // 「customer {id}」而不是空串：空串拼进 message 读起来像漏了值。
+    let label = paths
+        .get(&customer_id)
+        .map(|p| p.path.clone())
+        .unwrap_or_else(|| format!("customer {customer_id}"));
+    Err(AppError::biz(
+        code::BIZ_INVALID_VALUE,
+        format!(
+            "{subject}只能挂在叶子客户上：{label}（id={customer_id}）下还有 {descendants} 个\
+             子节点，请改挂到它的下级客户"
+        ),
+    ))
 }
 
 /// 按产品口径拼 `customer_path`：`chain` 是**根在前**的名字数组。

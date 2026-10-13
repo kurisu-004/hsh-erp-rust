@@ -670,3 +670,210 @@ async fn outsource_quote_list_filter_expands_to_pure_subtree() {
     assert_eq!(s, StatusCode::OK, "{env}");
     assert_eq!(env["data"]["total"], 1, "{env}");
 }
+
+// ===========================================================================
+//  4. Gate E（2026-10-17）：前两轮漏掉的三个域的 `customer_path`
+// ===========================================================================
+
+/// `prod::inspection` 待品检队列：行项三列（自身名 / **根**名 / 第 2 层到叶子的路径）。
+///
+/// 改因：Gate C 只给 part / assembly / outsource / queue / dashboard 补了
+/// `customer_path`，inspection 队列的 `l1_customer_name` 仍是 SQL 自连 `c.parent_id`
+/// 取到的**一层父名** —— 四层树上它会是「手机部」而不是根「华强」。新口径由
+/// `shared::customer::paths_of` 一次批量产出（service 层），SQL 侧的自连已删。
+#[tokio::test]
+async fn inspection_queue_customer_columns_on_four_level_tree() {
+    let pool = test_pool().await;
+    let fx = load_part_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+    let token = login_token(&app, &fx.inspector_username, PartFixture::PASSWORD).await;
+    let (_l1, _l2, _l3, l4, _sib) = insert_tree(&pool).await;
+
+    // 直接插一条 INSPECTION 批次（待品检队列只筛 `status='INSPECTION'`）
+    let part_id = insert_part(&pool, l4, "QUEUE").await;
+    let batch_id = next_test_id();
+    let now = hsh_erp_rust::infra::clock::now_naive();
+    sqlx::query(
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, version, \
+         created_at, updated_at) VALUES ($1, $2, 1, 3, 'INSPECTION', 0, $3, $3)",
+    )
+    .bind(batch_id)
+    .bind(part_id)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert INSPECTION batch");
+
+    let (s, env) = send(
+        app,
+        json_request("GET", "/prod/inspection/queue?limit=50", None, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let part_id_s = part_id.to_string();
+    let mine = env["data"]["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        // `part_id` 在 wire 上是 JSON string；先备好 `&str` 再比，避免每次比较都
+        // 新建一个 `String`（clippy::cmp_owned）
+        .find(|it| it["part_id"].as_str() == Some(part_id_s.as_str()))
+        .expect("刚插的行");
+    assert_eq!(mine["customer_name"], "影像组", "{mine}");
+    assert_eq!(
+        mine["l1_customer_name"], "华强",
+        "根名（旧的「一层父名」口径在四层树上会给「手机部」）: {mine}"
+    );
+    assert_eq!(
+        mine["customer_path"], "终端BG / 手机部 / 影像组",
+        "第 2 层到叶子、不含根: {mine}"
+    );
+}
+
+/// `prod::inspection` 扫码树：装配件节点与零件节点的 `customer_path`。
+#[tokio::test]
+async fn inspection_scan_tree_customer_path_on_four_level_tree() {
+    let pool = test_pool().await;
+    let fx = load_part_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+    let token = login_token(&app, &fx.inspector_username, PartFixture::PASSWORD).await;
+    let (_l1, _l2, _l3, l4, _sib) = insert_tree(&pool).await;
+    // 本文件的 `insert_part` 不写 serial_no，扫码端点按 serial_no 命中 ⇒ 这里直插。
+    // ⚠️ `t_part.serial_no` 是 `varchar(15)`，故用短码而不是把雪花 id 拼进去。
+    let part_id = next_test_id();
+    let serial_no = format!("PS{}", &part_id.to_string()[15..]);
+    let now = hsh_erp_rust::infra::clock::now_naive();
+    let day = now.date();
+    sqlx::query(
+        "INSERT INTO t_part (id, serial_no, name, drawing_no, applicant_name, quantity, \
+         request_date, planned_delivery_date, customer_id, status, version, created_at, updated_at) \
+         VALUES ($1, $2, 'PART-SCAN-TREE', 'DWG-SCAN', '张三', 1, $3, $3, $4, 'PENDING', 0, $5, $5)",
+    )
+    .bind(part_id)
+    .bind(serial_no.clone())
+    .bind(day)
+    .bind(l4)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert t_part with serial_no");
+
+    let (s, env) = send(
+        app,
+        json_request(
+            "GET",
+            &format!("/prod/inspection/scan/{serial_no}"),
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(env["data"]["hit_kind"], "PART", "{env}");
+    assert_eq!(
+        env["data"]["children"][0]["customer_path"], "终端BG / 手机部 / 影像组",
+        "{env}"
+    );
+    assert_eq!(
+        env["data"]["children"][0]["customer_name"], "影像组",
+        "{env}"
+    );
+}
+
+/// `prod::programming` 待编程一览：`parent_customer_name` = 根名 + 新增 `customer_path`。
+#[tokio::test]
+async fn programming_pending_customer_columns_on_four_level_tree() {
+    let pool = test_pool().await;
+    let fx = load_part_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+    let token = login_token(&app, &fx.clerk_username, PartFixture::PASSWORD).await;
+    let (_l1, _l2, _l3, l4, _sib) = insert_tree(&pool).await;
+    // 待编程一览的状态闸门是 `PENDING/IN_PROCESS/PROGRAMMING` 且命中三规则之一；
+    // 最省的一条是直接置 PROGRAMMING（规则 1）。
+    let part_id = next_test_id();
+    let now = hsh_erp_rust::infra::clock::now_naive();
+    let day = now.date();
+    sqlx::query(
+        "INSERT INTO t_part (id, name, drawing_no, applicant_name, quantity, \
+         request_date, planned_delivery_date, customer_id, status, version, created_at, updated_at) \
+         VALUES ($1, 'PART-PROG', 'DWG-PROG', '张三', 1, $2, $2, $3, 'PROGRAMMING', 0, $4, $4)",
+    )
+    .bind(part_id)
+    .bind(day)
+    .bind(l4)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert t_part PROGRAMMING");
+
+    let (s, env) = send(
+        app,
+        json_request(
+            "GET",
+            "/prod/programming/pending?limit=50",
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let part_id_s = part_id.to_string();
+    let mine = env["data"]["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        // 同上：`id` 是 JSON string，先备 `&str`
+        .find(|it| it["id"].as_str() == Some(part_id_s.as_str()))
+        .expect("刚插的行");
+    assert_eq!(mine["customer_name"], "影像组", "{mine}");
+    assert_eq!(
+        mine["parent_customer_name"], "华强",
+        "根名（旧口径是 SQL 自连取到的一层父名 = 手机部）: {mine}"
+    );
+    assert_eq!(mine["customer_path"], "终端BG / 手机部 / 影像组", "{mine}");
+}
+
+/// `assembly` 详情 / 建单回读也带上 `customer_path`（Gate C 只加到了列表 VO）。
+///
+/// 改因：上一轮的回执说明是「`render_assembly_out` 拿不到连接，加过去只能恒空串」。
+/// 本轮新增 `assembly_out_with_path`（六个调用点都持有 repo），故该缺口关闭。
+/// ⚠️ wire 形状对列表**不变**：`customer_path` 从 `AssemblyListItem` 移到
+/// `AssemblyOut`（flatten 平铺），同一个键、同一个值。
+#[tokio::test]
+async fn assembly_out_carries_customer_path_on_four_level_tree() {
+    let pool = test_pool().await;
+    let _fx = load_part_fixture(&pool).await;
+    let (_l1, _l2, _l3, l4, _sib) = insert_tree(&pool).await;
+    seed_serial_counter(&pool).await;
+
+    let current = manager_user();
+    let mut tx = pool.begin().await.expect("begin");
+    let created = AssemblyService::create_assembly(
+        &mut tx,
+        shared_test_snowflake().as_ref(),
+        &create_assembly_req(l4, "GATE-E"),
+        vec![],
+        &current,
+    )
+    .await
+    .expect("叶子客户建装配件应成功");
+    let asm_id: i64 = created.assembly.id;
+    // 建单回读（`AssemblyCreateResult.assembly`）已带路径
+    let created_json = serde_json::to_value(&created.assembly).expect("serialize");
+    assert_eq!(
+        created_json["customer_path"], "终端BG / 手机部 / 影像组",
+        "建单回读出参必须带 customer_path: {created_json}"
+    );
+    tx.commit().await.expect("commit");
+
+    // 详情（`AssemblyDetail` 把 head 平铺到顶层）
+    let mut conn = pool.acquire().await.expect("acquire");
+    let detail = AssemblyService::get_assembly(&mut conn, asm_id, &current)
+        .await
+        .expect("get assembly");
+    let detail_json = serde_json::to_value(&detail).expect("serialize");
+    assert_eq!(
+        detail_json["customer_path"], "终端BG / 手机部 / 影像组",
+        "详情出参必须带 customer_path: {detail_json}"
+    );
+}

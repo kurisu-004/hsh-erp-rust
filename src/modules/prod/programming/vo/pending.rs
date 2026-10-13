@@ -39,10 +39,20 @@ pub struct ProgrammingItemOut {
     pub planned_delivery_date: String,
     /// 系统交期（`NaiveDate` 原生序列化；NULL → JSON `null`）。
     pub system_delivery_date: Option<NaiveDate>,
-    /// L2 叶子客户名
+    /// 叶子客户名（本节点单段名）
     pub customer_name: Option<String>,
-    /// L1 一级集团名；L2 未挂 parent 时为 None
+    /// **根**（L1 集团）客户名 —— 2026-10-17 起不再是「直接父」。
+    ///
+    /// 旧形由 SQL 自连 `t_customer pc ON pc.id = c.parent_id` 取到，**只上跳一层**，
+    /// 深树上拿到的是中间层名。现由 `shared::customer::paths_of` 的 `root_name` 派生。
+    /// 客户已软删 / 链成环时为 `None`。
     pub parent_customer_name: Option<String>,
+    /// 「第 2 层到叶子」的 `" / "` 路径（**不含**根；本节点即根时 = 根自己的名字）。
+    ///
+    /// 2026-10-17 新增，数据源同上（`paths_of.path`）。取不到时落**空串**而非
+    /// `null` —— 与全仓 `customer_path` 的必填口径一致，前端不必为「没有路径」
+    /// 单开一个第三态分支。
+    pub customer_path: String,
     /// 是否已上传 G_CODE（真相源 `EXISTS t_part_file kind='G_CODE' AND
     /// deleted_at IS NULL`，与 queue 候选池同源）。
     pub has_cnc_program: bool,

@@ -49,7 +49,7 @@ use sqlx::PgConnection;
 
 // 2026-10-17：客户三列取名统一走 `shared::customer::paths_of`（全仓唯一实现）。
 use crate::shared::customer::CustomerPath;
-use crate::shared::error::{AppError, code};
+use crate::shared::error::AppError;
 
 pub mod sql;
 
@@ -568,6 +568,10 @@ pub trait OutsourceRepoTrait: Send {
     /// 收在 repo 层是因为 service 方法是泛型 `R: OutsourceRepoTrait`（拿不到
     /// `&mut PgConnection`），而闸门本身要连查 `has_children` + `subtree_ids` +
     /// `paths_of` 三条 SQL —— 放 service 就得给 trait 再加三个方法。
+    ///
+    /// 2026-10-17：方法体改为委托 `shared::customer::require_leaf_customer`
+    /// （本域那份实现与 part / assembly 逐字同构，已收敛）。`subject` 取域内
+    /// 业务名，让错误文案仍指向「外协报价」而不是通用的「单据」。
     async fn require_leaf_customer(&mut self, customer_id: i64) -> Result<(), AppError>;
     /// `t_process` 按 id 查 name。供 shipment_out 单条拼装。
     async fn process_get_name(&mut self, process_id: i64) -> Result<Option<String>, sqlx::Error>;
@@ -1128,25 +1132,12 @@ impl OutsourceRepoTrait for &mut PgConnection {
     }
 
     async fn require_leaf_customer(&mut self, customer_id: i64) -> Result<(), AppError> {
-        if !crate::shared::customer::has_children(&mut **self, customer_id).await? {
-            return Ok(());
-        }
-        let descendants = crate::shared::customer::subtree_ids(&mut **self, customer_id)
-            .await?
-            .len()
-            .saturating_sub(1);
-        let paths = crate::shared::customer::paths_of(&mut **self, &[customer_id]).await?;
-        let label = paths
-            .get(&customer_id)
-            .map(|p| p.path.clone())
-            .unwrap_or_default();
-        Err(AppError::biz(
-            code::BIZ_INVALID_VALUE,
-            format!(
-                "外协报价只能挂在叶子客户上的零件：{label}（id={customer_id}）下还有 \
-                 {descendants} 个子节点，请改挂到它的下级客户"
-            ),
-        ))
+        crate::shared::customer::require_leaf_customer(
+            &mut **self,
+            customer_id,
+            "外协报价只能挂在叶子客户上的零件",
+        )
+        .await
     }
 
     async fn process_get_name(&mut self, process_id: i64) -> Result<Option<String>, sqlx::Error> {

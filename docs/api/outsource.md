@@ -446,6 +446,9 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 - 判据收在 `OutsourceRepoTrait::require_leaf_customer`（service 方法是泛型
   `R: OutsourceRepoTrait`，拿不到 `&mut PgConnection`；闸门本身要连查
   `has_children` + `subtree_ids` + `paths_of` 三条 SQL，故整体收在 trait 一层）。
+  ⚠️ 2026-10-17 起该方法体只是 `shared::customer::require_leaf_customer` 的委托 ——
+  **闸门判据全仓只有一份**（part / assembly / outsource / delivery_note 四处共用），
+  各域只传一个 `subject` 文案（"外协报价…" / "工单" / "装配件" / "送货入单"）。
 - 闸门排在 `quote_create` **之前** ⇒ 拒绝时不留 DRAFT 报价行。
 
 ### 4.7 写端点的 OCC 锚（必填 `version`）

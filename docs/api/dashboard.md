@@ -69,7 +69,7 @@
 | `quantity` | number | `t_part.quantity`（**件数**）/ `t_assembly.quantity`（**套数**）—— 随 `row_type` 变 |
 | `status` | string | 两侧共用同一份 6 态白名单；`t_assembly` 侧天然只落 4 态（见 §4.2） |
 | `system_delivery_date` | string \| null | `YYYY-MM-DD`；`partial` 桶内可为 null |
-| `customer_name` | string \| null | 二级客户名。两侧 `customer_id` 同指 `t_customer.id`，**一次**批量查 |
+| `customer_name` | string \| null | 客户名（本节点单段名）。两侧 `customer_id` 同指 `t_customer.id`，**一次**批量查（客户树任意深度：这里取的是**自身名**，完整路径见 §3.2 的抽屉三列） |
 | `is_urgent` | boolean | 两侧同名列 |
 | `delivered_quantity` | number | 件级：已交**件数**；装配件级：已交**套数**（min 公式，见 §4.4） |
 | `row_type` | string | `"PART"` \| `"ASSEMBLY"`。前端据此切换「件 / 套」单位与下钻目标 |

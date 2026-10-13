@@ -13,6 +13,8 @@
 //! 读端点不开事务（handler `pool.acquire()` 借 `&mut PgConnection`），与
 //! `prod::batch` 的 pending 端点一致。
 
+use std::collections::HashMap;
+
 use sqlx::PgConnection;
 
 use crate::auth::rbac::{CurrentUser, Role};
@@ -20,6 +22,7 @@ use crate::modules::prod::programming::repo::{
     ProgrammingFilters, ProgrammingRepo, ProgrammingRow,
 };
 use crate::modules::prod::programming::vo::{ProgrammingItemOut, ProgrammingListOut};
+use crate::shared::customer::{CustomerPath, paths_of};
 use crate::shared::error::AppError;
 
 use super::dto::ProgrammingListQuery;
@@ -92,7 +95,14 @@ impl ProgrammingService {
 
         let rows = ProgrammingRepo::list(&mut *conn, &f).await?;
         let total = ProgrammingRepo::count(&mut *conn, &f).await?;
-        let items = rows.into_iter().map(row_to_item).collect();
+        // 客户三列（自身名 / **根**名 / 第 2 层到叶子的路径）由一次 `paths_of` 产出
+        // （2026-10-17）：旧形是 SQL 自连 `t_customer` 取**直接父**名，深树上必错，
+        // 且本页最多 500 行逐行查就是 N+1。
+        let mut customer_ids: Vec<i64> = rows.iter().map(|r| r.customer_id).collect();
+        customer_ids.sort_unstable();
+        customer_ids.dedup();
+        let paths = paths_of(&mut *conn, &customer_ids).await?;
+        let items = rows.into_iter().map(|r| row_to_item(r, &paths)).collect();
 
         Ok(ProgrammingListOut {
             items,
@@ -109,8 +119,10 @@ fn normalize(raw: Option<String>) -> Option<String> {
     raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
-/// row → vo 投影（日期走 `String`，NULL 兜底 `"1970-01-01"`）。
-fn row_to_item(r: ProgrammingRow) -> ProgrammingItemOut {
+/// row → vo 投影（日期走 `String`，NULL 兜底 `"1970-01-01"`；客户根名与路径由
+/// `paths` 补，取不到时 `parent_customer_name = None` / `customer_path = ""`）。
+fn row_to_item(r: ProgrammingRow, paths: &HashMap<i64, CustomerPath>) -> ProgrammingItemOut {
+    let cp = paths.get(&r.customer_id);
     ProgrammingItemOut {
         id: r.id,
         version: r.version,
@@ -126,7 +138,9 @@ fn row_to_item(r: ProgrammingRow) -> ProgrammingItemOut {
             .unwrap_or_else(|| "1970-01-01".to_string()),
         system_delivery_date: r.system_delivery_date,
         customer_name: r.customer_name,
-        parent_customer_name: r.parent_customer_name,
+        // 根名与路径都取 `paths`（取不到 = 客户已软删 / 链成环 ⇒ None / 空串）。
+        parent_customer_name: cp.map(|p| p.root_name.clone()),
+        customer_path: cp.map(|p| p.path.clone()).unwrap_or_default(),
         has_cnc_program: r.has_cnc_program,
         // 2026-10-03 新增：PROGRAMMING 活跃批次锚点（无该状态批次 → 两个都是 None，
         // 前端据此禁用「下发」按钮）。与上面的 part 级 `version` 严格区分。
