@@ -27,6 +27,10 @@ pub struct QueueDispatchRepo;
 impl QueueDispatchRepo {
     /// 待下发批次列表（JOIN 4 表）。
     ///
+    /// 2026-10-17：`LEFT JOIN t_customer pc`（父名）与 `pc.name` 投影删除，改投影
+    /// `p.customer_id`，由 service 层批量补 `parent_customer_name` / `customer_path`
+    /// （口径见 `shared::customer::paths_of`）。
+    ///
     /// 投影比 batch 域通用读（`prod::batch::repo::PartBatchRepo::list_batches_with_part_in_customers`）
     /// 宽：额外
     /// LEFT JOIN `t_part.process_chain_id` 与 `pb.current_process_step_id`（批次
@@ -74,16 +78,14 @@ impl QueueDispatchRepo {
                 p.is_urgent        AS "p_is_urgent!",
                 p.note             AS "p_note?",
                 p.process_chain_id AS "p_process_chain_id?",
+                p.customer_id      AS "customer_id!",
                 c.name             AS "c_name?",
-                pc.name            AS "pc_name?",
                 a.name             AS "a_name?"
             FROM t_part_batch pb
             JOIN t_part p
               ON p.id = pb.part_id
             LEFT JOIN t_customer c
               ON c.id = p.customer_id
-            LEFT JOIN t_customer pc
-              ON pc.id = c.parent_id
             LEFT JOIN t_applicant a
               ON a.name = p.applicant_name AND a.deleted_at IS NULL
             WHERE pb.status IN ('PENDING', 'PROGRAMMING')
@@ -348,10 +350,12 @@ pub struct PendingBatchRow {
     pub p_is_urgent: bool,
     pub p_note: Option<String>,
     pub p_process_chain_id: Option<i64>,
-    // —— t_customer L2 ——
+    // —— t_customer ——
+    /// `p.customer_id`（2026-10-17 新增）：`parent_customer_name`（= **根**名）与
+    /// `customer_path` 由 service 层用一次 `shared::customer::paths_of` 批量补齐，
+    /// SQL 不再自连 `t_customer` 取「上跳一层」的父名（深树下那是中间层名）。
+    pub customer_id: i64,
     pub c_name: Option<String>,
-    // —— t_customer L1 ——
-    pub pc_name: Option<String>,
     // —— t_applicant ——
     pub a_name: Option<String>,
 }

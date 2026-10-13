@@ -31,8 +31,8 @@ use crate::modules::outsource::vo::{
 use crate::shared::error::{AppError, code};
 
 use super::{
-    DEFAULT_LIMIT, LIST_MAX_LIMIT, OutsourceService, format_price, join_customer_path,
-    keyword_pattern, not_found_shipment, parse_optional_snowflake, parse_price, version_conflict,
+    DEFAULT_LIMIT, LIST_MAX_LIMIT, OutsourceService, format_price, keyword_pattern,
+    not_found_shipment, parse_optional_snowflake, parse_price, version_conflict,
 };
 
 /// shipment_out：单条拼装（part / 客户 / process / company 批查 + 批次号补全）。
@@ -43,10 +43,19 @@ async fn shipment_out<R: OutsourceRepoTrait>(
     // 单条拼装：part / 客户 / process / company 四个批查
     let part = repo.part_drawing_name(s.part_id).await?;
     // 2026-10-03 起 customer_path 真算（此前硬编码 None，对账行编辑每次回读都把
-    // 客户列抹掉）。口径与 list 侧 `OutsourceSentPartRow` 的两条 LEFT JOIN 逐条
-    // 一致（客户自身 `deleted_at IS NULL` 才给名），故同一条历史 shipment 经写
-    // 端点回读与经 list 读到的 customer_path 恒相同。
-    let (l2_name, l1_name) = repo.part_customer_names(s.part_id).await?;
+    // 客户列抹掉）；2026-10-17 改读 `shared::customer::paths_of` 的 `CustomerPath::path`
+    // （此前是 SQL 侧「L2 名 + 上跳一层的父名」两段拼接，深树上两段都不是全路径）。
+    // 口径与 list 侧同源 ⇒ 同一条历史 shipment 经写端点回读与经 list 读到的
+    // customer_path 恒相同。
+    let cust_id = repo.part_customer_id(s.part_id).await?;
+    let cust_paths = match cust_id {
+        Some(cid) => repo.customer_paths_by_ids(&[cid]).await?,
+        None => Default::default(),
+    };
+    let cust_path = cust_id
+        .and_then(|cid| cust_paths.get(&cid))
+        .map(|p| p.path.clone())
+        .unwrap_or_default();
     let company = repo.company_map_name(&[s.outsource_company_id]).await?;
     let company = company.into_iter().next().map(|(_, name)| name);
     let process = repo.process_get_name(s.process_id).await?;
@@ -76,7 +85,7 @@ async fn shipment_out<R: OutsourceRepoTrait>(
         part_name: part.map(|p| p.1),
         outsource_company_name: company,
         process_name: process,
-        customer_path: join_customer_path(l1_name.as_deref(), l2_name.as_deref()),
+        customer_path: cust_path,
     })
 }
 
@@ -219,6 +228,15 @@ impl OutsourceService {
             .await?;
         let total = repo.shipment_count_for_company(company_id, &filter).await?;
 
+        // 2026-10-17：SQL 侧只 SELECT `customer_id`，`customer_path` 一次批量产出
+        // （`p` 是 LEFT JOIN ⇒ `customer_id` 可空，缺失按空串处理）。
+        let cust_ids: Vec<i64> = rows.iter().filter_map(|r| r.customer_id).collect();
+        let cust_paths = repo.customer_paths_by_ids(&cust_ids).await?;
+        let path_of = |cid: Option<i64>| {
+            cid.and_then(|c| cust_paths.get(&c))
+                .map(|p| p.path.clone())
+                .unwrap_or_default()
+        };
         // `unit_price` 解析失败用 `?` 传播（`create_quote` 同款），不降级成
         // `Decimal::ZERO` —— 对账页上的「假 0.00 金额」是最坏的失败模式
         // （`total_price` 静默变 0，用户看不出是数据坏了）。该列 DB 侧是
@@ -232,10 +250,7 @@ impl OutsourceService {
                 version: r.version,
                 part_drawing_no: r.drawing_no,
                 part_name: r.name,
-                customer_path: join_customer_path(
-                    r.parent_customer_name.as_deref(),
-                    r.customer_name.as_deref(),
-                ),
+                customer_path: path_of(r.customer_id),
                 batch_no: r.batch_no,
                 process_id: r.process_id,
                 process_name: r.process_name,
@@ -293,6 +308,9 @@ impl OutsourceService {
             .await?;
         let total = repo.shipment_count_in_flight(pat.as_deref()).await?;
 
+        // 2026-10-17：同上，`customer_path` 由 `paths_of` 批量产出。
+        let cust_ids: Vec<i64> = rows.iter().map(|r| r.customer_id).collect();
+        let cust_paths = repo.customer_paths_by_ids(&cust_ids).await?;
         let items = rows
             .into_iter()
             .map(|r| OutsourceInFlightItem {
@@ -305,10 +323,10 @@ impl OutsourceService {
                 drawing_no: r.drawing_no,
                 name: r.name,
                 is_urgent: r.is_urgent,
-                customer_path: join_customer_path(
-                    r.parent_customer_name.as_deref(),
-                    r.customer_name.as_deref(),
-                ),
+                customer_path: cust_paths
+                    .get(&r.customer_id)
+                    .map(|p| p.path.clone())
+                    .unwrap_or_default(),
                 next_process_id: Some(r.process_id),
                 next_process_name: r.process_name,
                 outsource_company_id: r.outsource_company_id,

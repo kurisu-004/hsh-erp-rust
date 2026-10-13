@@ -152,7 +152,7 @@ router 工厂始终是 **4 个**（`company_router` / `quote_router` / `shipment
 | `shipment_id` | string | `t_outsource_shipment.id`（**主键字段名是 `shipment_id`，不是 `id`** —— 前端行编辑端点入参按此名取） |
 | `version` | number | `s.version`（**shipment 行 OCC**，reconcile-update 必传） |
 | `part_drawing_no` / `part_name` / `is_urgent` | string \| null / boolean | `LEFT JOIN t_part p` |
-| `customer_path` | string \| null | `service::join_customer_path`（L2 `c.name` + L1 `cp.name`，有 L1 拼 `L1 / L2`） |
+| `customer_path` | string（**必填**） | `shared::customer::paths_of` 的 `CustomerPath::path`（`p.customer_id` 批量取回后按行取） |
 | `batch_no` | number \| null | `LEFT JOIN t_part_batch pb`（shipment 未绑批次的历史行为 null） |
 | `process_id` / `process_name` | string / string \| null | `s.process_id` / `LEFT JOIN t_process pr` |
 | `quantity` | number | `s.quantity`（**发出时的全量**，不是批次当前余量） |
@@ -176,7 +176,7 @@ router 工厂始终是 **4 个**（`company_router` / `quote_router` / `shipment
 | `created_at` / `updated_at` | string | 同名列 |
 | `part_serial_no` / `part_drawing_no` / `part_name` / `is_urgent` | string \| null / boolean | `t_part`（service 补全） |
 | `outsource_company_name` / `process_code` / `process_name` | string \| null | `t_outsource_company` / `t_process`（service 补全） |
-| `customer_path` | string \| null | service 拼 L1 / L2 |
+| `customer_path` | string（**必填**） | `shared::customer::paths_of` 的 `CustomerPath::path` |
 | `part_unit_price` | string \| null | `t_part.unit_price::text`（供与报价对比） |
 
 `is_direct` **不在出参里**（内部列，谓词用途见 §4.4）。
@@ -190,7 +190,9 @@ router 工厂始终是 **4 个**（`company_router` / `quote_router` / `shipment
 | `is_urgent` | boolean | `t_part` |
 | `unit_price` | string | `t_part.unit_price::text`（Decimal 字符串，**下单单价**供与报价对比） |
 | `customer_id` | string | `t_part.customer_id` |
-| `customer_name` / `l1_customer_name` / `customer_path` | string \| null | `t_customer` L2 / L1 / service 拼 |
+| `customer_name` | string \| null | `CustomerPath::own_name`（**本节点**单段名） |
+| `l1_customer_name` | string \| null | `CustomerPath::root_name`（**根**名；本节点即根时 = 自身名） |
+| `customer_path` | string（**必填**） | `CustomerPath::path`（第 2 层到叶子、不含根） |
 
 行粒度 = **一行一个零件**（该零件存在 `PENDING` 批次）。刻意不复用 `PartListItem`：后者刻意不声明任何派生工序字段，本 VO 要带单价 / 加急 / 客户路径供 picker 直接渲染。
 
@@ -202,7 +204,7 @@ router 工厂始终是 **4 个**（`company_router` / `quote_router` / `shipment
 | `batch_no` / `quantity` | number | `pb.batch_no` / **`pb.quantity`（当前剩余待收量，不是 shipment.quantity**） |
 | `serial_no` / `drawing_no` / `name` | string \| null | `t_part` |
 | `is_urgent` | boolean | `t_part` |
-| `customer_path` | string \| null | service 拼 L1 / L2 |
+| `customer_path` | string（**必填**） | `shared::customer::paths_of` 的 `CustomerPath::path` |
 | `next_process_id` | string \| null | `s.process_id`（外协加工的工序，`serialize_i64_opt`） |
 | `next_process_name` | string \| null | `LEFT JOIN t_process pr` |
 | `outsource_company_id` / `outsource_company_name` | string / string \| null | `s.outsource_company_id` / `LEFT JOIN t_outsource_company` |
@@ -264,7 +266,10 @@ router 工厂始终是 **4 个**（`company_router` / `quote_router` / `shipment
 | `serial_no` / `drawing_no` / `name` | string \| null / string | `t_part` |
 | `system_delivery_date` / `planned_delivery_date` | string \| null | `t_part`（**native date，非 `to_char` 字符串** —— 与候选卡不同） |
 | `is_urgent` | boolean | `t_part` |
-| `customer_name` / `parent_customer_name` / `applicant_name` | string \| null | `t_customer` L2 / L1 / `LEFT JOIN LATERAL t_applicant` |
+| `customer_name` | string \| null | `CustomerPath::own_name`（**本节点**单段名） |
+| `parent_customer_name` | string \| null | `CustomerPath::root_name`（**根**名 —— 2026-10-17 起不再是「上跳一层」的直接父） |
+| `customer_path` | string（**必填**） | `CustomerPath::path`（第 2 层到叶子、不含根）—— **2026-10-17 新增**：候选卡此前刻意没有这一列（前端拿两个名字自己拼），任意深度树上拼不出来 |
+| `applicant_name` | string \| null | `LEFT JOIN LATERAL t_applicant` |
 | `location` | string | `pb.location`，恒为 `"OUTSOURCE_COMPANY"`（在途谓词保证） |
 | `note` | string \| null | `t_part.note` |
 | `version` | number | `pb.version`（**移动写端点的 OCC 锚**） |
@@ -417,13 +422,31 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 
 ### 4.6 `customer_id` 的客户子树展开（报价列表）
 
-`GET /outsource-quotes/` 的 `customer_id` 在 service 层展开成 part_id 集合（自身 ∪ **直接**子客户），落成 SQL 的一个 WHERE 段（`part_id = ANY($4)`）。
+`GET /outsource-quotes/` 的 `customer_id` 在 repo 层展开成 part_id 集合，落成 SQL 的一个 WHERE 段（`part_id = ANY($4)`）。
 
-展开只下潜**一层** —— 依据是生产库实测（零件全挂 L2、L3 数量 0），而该结构 API 层不强制（`create_customer` 不校验 `parent_id` 是否指向根客户）。出现 L3 后本字段需改成递归 CTE，且漏报**是静默的**（`total` 偏小、不报错）。
+**2026-10-17（客户树无限层级化）**：谓词改为
+`shared::customer::subtree_ids(customer_id)` 展开成「自身 + 任意深度的全部后代」的**纯子树**
+（递归 CTE，`UNION` 去重防环），**不再只下潜一层**、**不含兄弟节点**。客户不存在（含软删）
+报 `20102 BIZ_CUSTOMER_NOT_FOUND`（而不是返回空集）。漏报仍是静默的（`total` 偏小、不报错），
+故零命中早返回分支必须保留。
 
 ⚠️ 这是报价一览里**唯一**还需要「展开成中间 id 集合」的维度（客户子树无法写成对 `t_outsource_quote` 单表 + `t_part` LEFT JOIN 的谓词），也因此它是**唯一**需要「客户子树零命中 → service 早返回空列表」守卫的维度 —— 空数组会让 `cardinality($4) = 0` 成立、整个客户条件被短路掉，不兜住就会「选了一个零件都没有的客户」返回**全量**报价。零件侧维度（`drawing_no` / `name` / `is_urgent`）不需要对应守卫：谓词形如 `($N::text IS NULL OR col …)`，NULL 时短路、给值时正常求值，零命中天然就是零行。
 
 ⚠️ **`GET /outsource-companies/{id}/sent-parts` 的 `customer_id` 语义不同** —— 那边**只判等值**（`p.customer_id = $4`），不做子树展开。理由：对账页筛的是「零件本身的归属客户」（这家外协厂供过哪个客户的货），与 batch / 工序域的 `customer_id` 谓词同形；而报价一览筛的是「客户视角的报价归属」，前端给的常是 L1 客户，故需展开。两者不要混用同一个 DTO 字段名当同义。
+
+### 4.6b 报价只能挂在**叶子客户**的零件上（2026-10-17 新增）
+
+`POST /outsource-quotes` 的零件必须挂在一个**没有未软删子节点**的客户上，否则
+`20104 BIZ_INVALID_VALUE`，消息点名该客户的 `customer_path` 与它下面的子节点数。
+
+- 与 `POST /api/v2/parts`、`POST /api/v2/parts/batch`、`POST /api/v2/assemblies`
+  是**同一条**口径（三个建单入口 + 装配件的改客户端点）。
+- 旧的「必须是 L2 叶子」（= `parent_id IS NOT NULL`）是**两层树**下的等价写法，
+  任意深度树上既拦不住中间层、也误拒单层树上的合法叶子 ⇒ 已作废。
+- 判据收在 `OutsourceRepoTrait::require_leaf_customer`（service 方法是泛型
+  `R: OutsourceRepoTrait`，拿不到 `&mut PgConnection`；闸门本身要连查
+  `has_children` + `subtree_ids` + `paths_of` 三条 SQL，故整体收在 trait 一层）。
+- 闸门排在 `quote_create` **之前** ⇒ 拒绝时不留 DRAFT 报价行。
 
 ### 4.7 写端点的 OCC 锚（必填 `version`）
 
@@ -586,7 +609,7 @@ REJECTED ──▶ （软删；或重新建一条 DRAFT）
 | 外协公司与工序能力映射 | `t_outsource_company` / `t_outsource_company_process` |
 | 报价 | `t_outsource_quote` |
 | 发货记录（开口 / 已收 / 单价） | `t_outsource_shipment` |
-| 客户两级名 | `t_customer`（L2 + `parent_id` L1） |
+| 客户三列（`customer_name` / `parent_customer_name` / `customer_path`） | `shared::customer::paths_of`（一次批量，板级 service 装配） |
 | 申请人 | `t_applicant`（`LEFT JOIN LATERAL`） |
 | 货架（候选卡的 `shelf_code` / 回收目标） | `t_shelf` |
 | 工序链（下一道工序推导） | `t_process_chain_step` / `t_part.process_chain_id` |

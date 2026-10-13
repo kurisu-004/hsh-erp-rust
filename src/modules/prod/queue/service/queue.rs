@@ -1381,7 +1381,8 @@ mod tests {
         id
     }
 
-    /// 写一个 L2 customer（parent_id NULL 表示 L1 叶子）。
+    /// 写一个**根 / 叶子** customer（`parent_id` NULL ⇒ 本身就是根）。
+    /// 2026-10-17 起本 fixture 不再叫 L2：客户树放开任意深度后「L2」不再是固定层数。
     async fn insert_customer(pool: &sqlx::PgPool, name: &str) -> i64 {
         let id = shared_test_snowflake().next_id();
         let now = now_naive();

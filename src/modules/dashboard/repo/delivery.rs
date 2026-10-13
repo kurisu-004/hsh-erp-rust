@@ -51,6 +51,10 @@ use crate::modules::dashboard::vo::{
 // `shared::analytics` 不属于任何业务域 ⇒ 本域的 `assert_no_foreign_domain` 护栏
 // （只认「域根段 + 他域路径」前缀失配）仍然零跨域依赖，强度不降。
 use crate::shared::analytics::delivered::{fetch_delivered_quantities, fetch_delivered_sets};
+// 2026-10-17：客户三列（name / L1 / path）取名收敛到 `shared::customer::paths_of`
+// （跨域隔离护栏只认「域根段 + 他域路径」前缀失配，`shared::` 不属于任何业务域）。
+use crate::shared::customer::{CustomerPath, paths_of};
+use crate::shared::error::AppError;
 
 /// 影响「未交付」判定的状态白名单（2026-10-07）。
 ///
@@ -405,7 +409,7 @@ impl DeliveryRepo {
         statuses: &[&str],
         basis: DeliveryBasis,
         limit: i64,
-    ) -> Result<DeliveryOrderDetailOut, sqlx::Error> {
+    ) -> Result<DeliveryOrderDetailOut, AppError> {
         let (rows_sql, count_sql) = match basis {
             DeliveryBasis::Planned => (SQL_DETAILS_PLANNED, SQL_DETAILS_COUNT_PLANNED),
             DeliveryBasis::System => (SQL_DETAILS_SYSTEM, SQL_DETAILS_COUNT_SYSTEM),
@@ -428,20 +432,22 @@ impl DeliveryRepo {
             .iter()
             .map(|r| r.get::<i64, _>("customer_id"))
             .collect();
-        let (cust_names, l1_names) = Self::fetch_customer_two_level(conn, &cust_ids).await?;
+        let cust_paths = Self::fetch_customer_paths(conn, &cust_ids).await?;
 
         let items: Vec<DeliveryOrderDetail> = rows
             .into_iter()
             .map(|r| {
                 let id: i64 = r.get("id");
                 let customer_id: i64 = r.get("customer_id");
+                let cp = cust_paths.get(&customer_id);
                 DeliveryOrderDetail {
                     id: id.to_string(),
                     serial_no: r.try_get::<Option<String>, _>("serial_no").ok().flatten(),
                     drawing_no: r.try_get::<String, _>("drawing_no").unwrap_or_default(),
                     name: r.try_get::<String, _>("name").unwrap_or_default(),
-                    l1_customer_name: l1_names.get(&customer_id).cloned(),
-                    customer_name: cust_names.get(&customer_id).cloned(),
+                    l1_customer_name: cp.map(|p| p.root_name.clone()),
+                    customer_name: cp.map(|p| p.own_name.clone()),
+                    customer_path: cp.map(|p| p.path.clone()).unwrap_or_default(),
                     status: r.get::<String, _>("status"),
                     planned_delivery_date: r
                         .get::<NaiveDate, _>("planned_delivery_date")
@@ -501,56 +507,21 @@ impl DeliveryRepo {
             .collect())
     }
 
-    /// 客户两级批量查（叶子名 + L1 名），抽屉行需要 `l1_customer_name`。
-    async fn fetch_customer_two_level(
+    /// 客户三列批量查（`customer_name` / `l1_customer_name` / `customer_path`）。
+    ///
+    /// 2026-10-17 起委托 [`crate::shared::customer::paths_of`]（全仓唯一的客户树取名
+    /// 设施），本域不再自写「查自身 name + 上跳一层取父 name」的两级 SQL。旧实现的
+    /// 两处缺陷随之消失：① `parent_id` 只上跳一层，三级以上的树上 `l1_customer_name`
+    /// 拿到的是中间层名；② 两级查询遇到「无父」要另开一条分支兜底，而根名按定义
+    /// 就是自身。
+    async fn fetch_customer_paths(
         conn: &mut PgConnection,
         cust_ids: &[i64],
-    ) -> Result<(HashMap<i64, String>, HashMap<i64, String>), sqlx::Error> {
+    ) -> Result<HashMap<i64, CustomerPath>, AppError> {
         let Some(ids) = dedup_positive(cust_ids) else {
-            return Ok((HashMap::new(), HashMap::new()));
+            return Ok(HashMap::new());
         };
-        let rows =
-            sqlx::query("SELECT id, name, parent_id FROM t_customer WHERE id = ANY($1::bigint[])")
-                .bind(&ids)
-                .fetch_all(&mut *conn)
-                .await?;
-        let mut names: HashMap<i64, String> = HashMap::new();
-        let mut parent_of: HashMap<i64, Option<i64>> = HashMap::new();
-        let mut parent_ids: Vec<i64> = Vec::new();
-        for r in rows {
-            let id: i64 = r.get("id");
-            names.insert(id, r.get::<String, _>("name"));
-            let parent: Option<i64> = r.try_get("parent_id").ok().flatten();
-            if let Some(pid) = parent {
-                parent_ids.push(pid);
-            }
-            parent_of.insert(id, parent);
-        }
-        let Some(pids) = dedup_positive(&parent_ids) else {
-            // 无 L1：两列都退化成叶子客户名，保持「L1 恒有值」的前端契约
-            let l1 = names.clone();
-            return Ok((names, l1));
-        };
-        let parent_rows =
-            sqlx::query("SELECT id, name FROM t_customer WHERE id = ANY($1::bigint[])")
-                .bind(pids)
-                .fetch_all(&mut *conn)
-                .await?;
-        let parent_names: HashMap<i64, String> = parent_rows
-            .into_iter()
-            .map(|r| (r.get::<i64, _>("id"), r.get::<String, _>("name")))
-            .collect();
-        let l1_names: HashMap<i64, String> = parent_of
-            .iter()
-            .map(|(id, parent)| {
-                let l1 = parent
-                    .and_then(|pid| parent_names.get(&pid).cloned())
-                    .or_else(|| names.get(id).cloned())
-                    .unwrap_or_default();
-                (*id, l1)
-            })
-            .collect();
-        Ok((names, l1_names))
+        paths_of(conn, &ids).await
     }
 }
 

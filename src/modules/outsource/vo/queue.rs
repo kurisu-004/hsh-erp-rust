@@ -21,7 +21,7 @@
 //! | 删 | `status_label` | 恒为 `"sendable"`，与 `can_send` 重复 |
 //! | 删 | `source_status` | 候选谓词已保证只有 `PENDING` / `IN_PROCESS`+`PRODUCTION_SHELF` 两态，**两态都可发**，不能用于任何判定 |
 //! | 删 | `batch_quantity` | 与 `quantity` 同值重复（行 = 批次） |
-//! | 拆 | `customer_path` → `customer_name` + `parent_customer_name` | 前端自己拼 L1 / L2；SQL 层本来就已 SELECT 了这两列，是旧 VO 层用 `service::join_customer_path` 合并掉的 |
+//! | 拆 | `customer_path` → `customer_name` + `parent_customer_name` | ~~前端自己拼 L1 / L2~~ —— **2026-10-17 恢复 `customer_path`**：客户树放开任意深度后前端拼不出第 3 层及以下；两个名字列保留但改由 `shared::customer::paths_of` 产出（`parent_customer_name` 语义从「直接父」变成「根」） |
 //! | 加 | `system_delivery_date` | 卡片 body 第 3 行的**唯一日期**；缺了前端卡片恒显「—」 |
 //! | 加 | `has_cnc_program` | 卡片角标；与 `prod::queue` 候选卡的 EXISTS 逐字同款 |
 //! | 加 | `applicant_name` | 卡片申请人名；必须走 `LEFT JOIN LATERAL`（理由见 `board/repo.rs` 的在途 SQL 注释与 `repo/sql.rs::SENDABLE_INNER_X_SQL`） |
@@ -173,10 +173,17 @@ pub struct OutsourceQueueCandidate {
     /// `t_part.system_delivery_date`（`YYYY-MM-DD`）—— 卡片 body 第 3 行的唯一日期。
     pub system_delivery_date: Option<String>,
     pub is_urgent: bool,
-    /// L2 叶子客户名（`t_customer`，`p.customer_id`）。
+    /// 本节点单段客户名（`shared::customer::paths_of` 的 `own_name`）
     pub customer_name: Option<String>,
-    /// L1 一级集团名（`t_customer`，`c.parent_id`）。
+    /// **根**（L1 集团）客户名 —— 2026-10-17 起由 `paths_of` 的 `root_name` 给出，
+    /// 不再是「上跳一层」的直接父
     pub parent_customer_name: Option<String>,
+    /// 2026-10-17 新增（必填）：第 2 层到叶子的 `" / "` 路径（不含根）。
+    ///
+    /// 候选卡此前**刻意没有**这一列（前端拿两个名字自己拼 L1 / L2），客户树放开
+    /// 任意深度后那条口径不成立 —— 前端最多只能拼出最后两段。客户行缺失 / 已软删
+    /// 时为空串。
+    pub customer_path: String,
     /// `t_applicant.name`（非 FK 字符串匹配；`LEFT JOIN LATERAL` 防同名扇行）。
     pub applicant_name: Option<String>,
     /// `t_part.note`（DB 无 batch 级 remark 字段）。
@@ -232,10 +239,12 @@ pub struct OutsourceQueueHeldBatch {
     pub system_delivery_date: Option<chrono::NaiveDate>,
     pub planned_delivery_date: Option<chrono::NaiveDate>,
     pub is_urgent: bool,
-    /// L2 叶子客户名。
+    /// 本节点单段客户名（`shared::customer::paths_of` 的 `own_name`）
     pub customer_name: Option<String>,
-    /// L1 一级集团名。
+    /// **根**（L1 集团）客户名（2026-10-17 起 = `root_name`）
     pub parent_customer_name: Option<String>,
+    /// 2026-10-17 新增（必填）：第 2 层到叶子的 `" / "` 路径（不含根）
+    pub customer_path: String,
     pub applicant_name: Option<String>,
     /// 恒为 `"OUTSOURCE_COMPANY"`（在途谓词保证）。
     pub location: String,
@@ -358,6 +367,7 @@ mod tests {
             is_urgent: false,
             customer_name: None,
             parent_customer_name: None,
+            customer_path: String::new(),
             applicant_name: None,
             location: "OUTSOURCE_COMPANY".into(),
             note: None,

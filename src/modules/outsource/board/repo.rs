@@ -144,11 +144,13 @@ const SQL_COMPANIES_BY_PROCESS: &str = "SELECT c.id AS company_id, c.name \
 /// `ap.name = p.applicant_name` 由 WHERE 保证恒等 ⇒ **取哪一行取值都一样**，
 /// `ORDER BY ap.id ASC` 的作用只是给这条 LATERAL 一个确定的行（配合 `LIMIT 1`），零
 /// 语义内容；不要把它当成「挑了某个申请人」。
+/// 2026-10-17：`LEFT JOIN t_customer c2` / `c1` 两条自连接**删除**，改为投影
+/// `p.customer_id`，客户三列由 service 层用 `shared::customer::paths_of` 批量补齐。
 const SQL_HELD_BY_PROCESS: &str = "SELECT pb.id AS batch_id, pb.current_holder_id AS company_id, \
      pb.part_id, pb.batch_no, pb.quantity, \
      p.serial_no, p.drawing_no, p.name, \
      p.system_delivery_date, p.planned_delivery_date, p.is_urgent, \
-     c2.name AS customer_name, c1.name AS parent_customer_name, \
+     p.customer_id AS customer_id, \
      a.name AS applicant_name, \
      pb.location AS batch_location, p.note, \
      pb.version AS batch_version, \
@@ -161,8 +163,6 @@ const SQL_HELD_BY_PROCESS: &str = "SELECT pb.id AS batch_id, pb.current_holder_i
      nx.next_process_name AS receive_next_process_name \
      FROM t_part_batch pb \
      JOIN t_part p ON p.id = pb.part_id AND p.deleted_at IS NULL \
-     LEFT JOIN t_customer c2 ON c2.id = p.customer_id AND c2.deleted_at IS NULL \
-     LEFT JOIN t_customer c1 ON c1.id = c2.parent_id AND c1.deleted_at IS NULL \
      LEFT JOIN LATERAL ( \
        SELECT ap.name \
        FROM t_applicant ap \
@@ -197,7 +197,7 @@ const SQL_CANDIDATES_BY_PROCESS: &str = "SELECT d.batch_version, d.batch_id, d.b
      d.batch_quantity, d.shelf_id, \
      d.part_id, d.part_serial_no, d.part_drawing_no, d.part_name, \
      d.planned_delivery_date, d.system_delivery_date, d.is_urgent, \
-     d.customer_name, d.parent_customer_name, d.applicant_name, d.note, \
+     d.customer_id, d.applicant_name, d.note, \
      d.shelf_code, d.requires_approval, d.quote_id, d.price, \
      d.outsource_company_id, d.outsource_company_name, \
      d.has_cnc_program, d.has_process_chain, d.company_options \
@@ -259,8 +259,11 @@ pub struct HeldBatchRow {
     pub system_delivery_date: Option<chrono::NaiveDate>,
     pub planned_delivery_date: Option<chrono::NaiveDate>,
     pub is_urgent: bool,
-    pub customer_name: Option<String>,
-    pub parent_customer_name: Option<String>,
+    /// 2026-10-17：两个客户名列删除，改投影 `customer_id`；`customer_name` /
+    /// `parent_customer_name`（= **根**名）/ `customer_path` 三列由 service 层用
+    /// 一次 `shared::customer::paths_of` 批量产出（SQL 里的 `c1` 自连接只上跳一层，
+    /// 深树上拿到的是中间层名）。
+    pub customer_id: i64,
     pub applicant_name: Option<String>,
     /// `t_part_batch.location`，恒为 `"OUTSOURCE_COMPANY"`。
     pub batch_location: String,
@@ -291,8 +294,9 @@ pub struct CandidateRow {
     pub planned_delivery_date: Option<String>,
     pub system_delivery_date: Option<String>,
     pub is_urgent: bool,
-    pub customer_name: Option<String>,
-    pub parent_customer_name: Option<String>,
+    /// 同 [`HeldBatchRow::customer_id`]（service 层批量补客户三列；本列原本就在
+    /// `repo/sql.rs::SENDABLE_PROJECTION_FULL` 里，只是外层没 SELECT 出来）
+    pub customer_id: i64,
     pub applicant_name: Option<String>,
     pub note: Option<String>,
     pub shelf_code: Option<String>,

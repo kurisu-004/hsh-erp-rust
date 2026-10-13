@@ -39,16 +39,27 @@ pub struct AssemblyOut {
 }
 
 /// 列表项：`#[serde(flatten)]` 把 `assembly` 字段的所有 key 平铺到顶层，
-/// 再追加 `customer_name` / `parent_customer_name`。前端拿到的 JSON 形状与单条
-/// `AssemblyOut` 几乎一致（仅多两个 customer 名字段）。
+/// 再追加 `customer_name` / `parent_customer_name` / `customer_path`。前端拿到的
+/// JSON 形状与单条 `AssemblyOut` 几乎一致（仅多三个 customer 字段）。
+///
+/// **2026-10-17 新增 `customer_path`**（第 2 层到叶子的 `" / "` 路径，不含根），
+/// 数据源与前两列同源（`shared::customer::paths_of`）。`customer_path` 挂在
+/// **本 VO 而非 `AssemblyOut`**：`AssemblyOut` 另有两类消费方（详情 / 写端点回读
+/// `render_assembly_out`）拿不到连接、也就拿不到客户行，加过去只能恒空串，而空串的
+/// 面包屑比没有这个字段更难排查。`AssemblyListItem` 是**唯一**自带客户系列字段的
+/// 出参，故也是该字段唯一正确的落点。
 ///
 /// 2026-09-22 PR4：迁移到 vo/，仅 Serialize。
 #[derive(Debug, Clone, Serialize)]
 pub struct AssemblyListItem {
     #[serde(flatten)]
     pub assembly: AssemblyOut,
+    /// 本节点单段客户名
     pub customer_name: Option<String>,
+    /// **根**（L1 集团）客户名 —— 2026-10-17 起不再是「直接父」
     pub parent_customer_name: Option<String>,
+    /// 第 2 层到叶子的 `" / "` 路径（不含根；本节点即根时 = 根自己的名字）
+    pub customer_path: String,
 }
 
 /// 列表出参（items + total + limit + offset）。字段顺序对齐 Python

@@ -84,8 +84,19 @@ impl From<TPart> for PartOut {
 pub struct PartDetailOut {
     #[serde(flatten)]
     pub part: TPart,
+    /// 本节点单段客户名（`t_customer.name`）
     pub customer_name: Option<String>,
+    /// 根（L1 集团）客户名 —— **任意深度树上都是根**，不是「直接父」
     pub l1_customer_name: Option<String>,
+    /// **2026-10-17 新增，必填**：第 2 层到叶子用 `" / "` 拼接的路径
+    /// （**不含**根；本节点即根时 = 根自己的名字）。数据源是
+    /// [`crate::shared::customer::paths_of`] 的 `CustomerPath::path`。
+    ///
+    /// 客户行缺失 / 已软删（脏数据）⇒ 空串而非 `null`：前端的展示口径是「把这一列
+    /// 直接显示出来」，`null` 会让所有 `!customer_path` 的渲染分支退化成「—
+    /// （客户未知）」，而真实发生率极低（`t_part.customer_id` NOT NULL 且建单时已
+    /// 校验客户存在）。
+    pub customer_path: String,
     #[serde(serialize_with = "serialize_i64_opt")]
     pub current_batch_id: Option<i64>,
 }
@@ -96,16 +107,23 @@ impl PartDetailOut {
     /// `current_batch_id` 由 service 层调用
     /// [`crate::modules::part::repo::PartRepo::find_current_inspection_batch_id`]
     /// 取值；`None` 表示当前不在 INSPECTION。
+    ///
+    /// 三个客户名字段由 `customer_path: Option<&CustomerPath>` **一次派生**
+    /// （2026-10-17 新增）：旧签名收 `customer_name` / `l1_customer_name` 两个独立
+    /// 形参，是「各调用点自己去查一遍客户」的根源（4 个调用点各写一遍两层假设）。
+    /// 改由调用方交出 [`crate::shared::customer::paths_of`] 的产物后，本函数是全仓
+    /// 唯一的「客户 id → 三个名字」转换点。`None` = 客户行解析不出（已软删 / 成环），
+    /// 三个字段同时退成 `None` / 空串。
     pub fn from_with_customer_extra(
         part: TPart,
         current_batch_id: Option<i64>,
-        customer_name: Option<String>,
-        l1_customer_name: Option<String>,
+        customer_path: Option<&crate::shared::customer::CustomerPath>,
     ) -> Self {
         Self {
             part,
-            customer_name,
-            l1_customer_name,
+            customer_name: customer_path.map(|p| p.own_name.clone()),
+            l1_customer_name: customer_path.map(|p| p.root_name.clone()),
+            customer_path: customer_path.map(|p| p.path.clone()).unwrap_or_default(),
             current_batch_id,
         }
     }
@@ -201,7 +219,11 @@ pub struct PartListItem {
     #[serde(serialize_with = "serialize_i64_opt")]
     pub process_chain_id: Option<i64>,
     pub customer_name: Option<String>,
+    /// 根（L1 集团）客户名（任意深度树上恒为根，语义见 `PartDetailOut::l1_customer_name`）
     pub l1_customer_name: Option<String>,
+    /// **2026-10-17 新增，必填**：第 2 层到叶子的 `" / "` 路径（不含根）。
+    /// 与 `PartDetailOut::customer_path` 同源同口径（`shared::customer::paths_of`）。
+    pub customer_path: String,
     /// 派生位置（见字段级 doc 注释）。
     #[serde(default)]
     pub location: Option<String>,
@@ -356,8 +378,11 @@ impl From<TPart> for PartListItem {
             process_chain_id: p.process_chain_id,
             customer_name: None,    // 由 service 注入
             l1_customer_name: None, // 由 service 注入
-            location: None,         // 由 service 注入
-            holder_name: None,      // 由 service 注入
+            // 2026-10-17 新增：与上面两个字段同一个来源（`shared::customer::paths_of`
+            // 的 `CustomerPath`）。`From<TPart>` 是 part 级投影、拿不到客户行 ⇒ 恒空串。
+            customer_path: String::new(),
+            location: None,    // 由 service 注入
+            holder_name: None, // 由 service 注入
             // 2026-09-28 新增：TPart 派生默认就是 PART 行
             row_type: Some("PART".to_string()),
             has_children: false,

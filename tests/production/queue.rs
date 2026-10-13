@@ -1800,12 +1800,20 @@ async fn board_process_detail_happy() {
         "items[1] 应 is_urgent=false: {env}"
     );
     assert_eq!(items[1]["serial_no"], "N-001");
-    // customer_path 已删（前端自行拼 L1 / L2），客户两级名仍在
+    // 2026-10-17（客户树无限层级化）：客户三列全部来自 `shared::customer::paths_of`。
+    // 本用例的树是 **3 层**（part fixture 的 L1「FX 客户 L1」→ 本用例的 L1-NAME
+    // → L2-NAME），所以：
+    // - `customer_name` = 本节点单段名；
+    // - `parent_customer_name` = **根**名（不是「上跳一层」的直接父 L1-NAME）；
+    // - `customer_path` = 第 2 层到叶子、**不含根** ⇒ "L1-NAME / L2-NAME"。
     assert_eq!(items[0]["customer_name"], "L2-NAME", "{env}");
-    assert_eq!(items[0]["parent_customer_name"], "L1-NAME", "{env}");
-    assert!(
-        items[0].get("customer_path").is_none(),
-        "customer_path 应已删除: {env}"
+    assert_eq!(
+        items[0]["parent_customer_name"], "FX 客户 L1",
+        "parent_customer_name = 根名（3 层树上与直接父不同）: {env}"
+    );
+    assert_eq!(
+        items[0]["customer_path"], "L1-NAME / L2-NAME",
+        "customer_path 不含根节点: {env}"
     );
     // shelf 元数据存在（POOL→WORKER move 的 from.shelf_id 数据源）
     assert_eq!(items[0]["shelf_id"], prod_shelf.to_string());

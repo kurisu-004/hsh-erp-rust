@@ -70,6 +70,7 @@ use crate::modules::part::model::TPart;
 use crate::modules::part::repo::PartRepo;
 use crate::modules::part::repo::part::{ChildInheritFields, NewPartCreate};
 use crate::modules::prod::batch::repo::{NewInitialBatch, PartBatchRepo};
+use crate::shared::error::AppError;
 
 pub mod sql;
 
@@ -80,10 +81,14 @@ pub use sql::{AssemblyListFilters, AssemblyRepo, AssemblyUpdate, NewAssembly};
 
 /// assembly 域数据访问 trait（20 方法 = t_assembly CRUD 9 + sync helper 2 + 跨域 helper 9）。
 ///
-/// 2026-09-25 补 3 端点（api-drift-fix）：新增 4 个跨域 helper
-///（`create_simple_child_part` / `create_initial_part_batch` /
-/// `lookup_customer_names` / `get_part_by_id`）。
+/// 2026-09-25 补 3 端点（api-drift-fix）：新增跨域 helper
+///（`create_simple_child_part` / `create_initial_part_batch` / `get_part_by_id`）。
 /// `fetch_customer_names_map` 在第 1 轮 review 被标记为死代码，已删除（2026-09-25）。
+///
+/// 2026-10-17（客户树无限层级化）三条客户相关方法的形态变更：
+/// - `lookup_customer_names` / `fetch_customer_names_by_ids` **删除**，取名统一走
+///   `customer_paths_by_ids`（委托 `shared::customer::paths_of`）；
+/// - `expand_customer_l2_ids` → `subtree_ids`，委托 `shared::customer::subtree_ids`。
 ///
 /// 单 trait 而非每实体一个：`&mut PgConnection` 同一作用域只能借给一个 repo 实例，
 /// 拆分会让 service 无法同时持有两个 repo（2026-09-22 重构定案；与 iam / shelf 同形）。
@@ -266,8 +271,13 @@ pub trait AssemblyRepoTrait: Send {
         customer_id: i64,
     ) -> Result<Option<Option<i64>>, sqlx::Error>;
 
-    /// L1 → L2 子节点 + 自身展开（recursive CTE）；若入参是 L2 直接返回 `[customer_id]`。
-    async fn expand_customer_l2_ids(&mut self, customer_id: i64) -> Result<Vec<i64>, sqlx::Error>;
+    /// 客户筛选展开：`[customer_id]` + 其任意深度的全部后代（**纯子树**）。
+    ///
+    /// 2026-10-17 起委托 [`crate::shared::customer::subtree_ids`]（全仓唯一的客户树
+    /// 遍历设施），本域不再自写递归 CTE。语义变更：旧的 `expand_customer_l2_ids`
+    /// 对「非根节点」只返回**自身**（两层时代的假设：非 L1 必然是叶子），在三级以上
+    /// 的树上会把选中的节点的下级整批漏掉。
+    async fn subtree_ids(&mut self, customer_id: i64) -> Result<Vec<i64>, AppError>;
 
     /// 建单派序列号用的 L1 客户 `serial_prefix` 首字符。委托
     /// `shared::serial::prefix_for_customer`（与 part 域同一实现，全仓只一份）。
@@ -276,11 +286,22 @@ pub trait AssemblyRepoTrait: Send {
         customer_id: i64,
     ) -> Result<char, crate::shared::error::AppError>;
 
-    /// customer name + parent_id 批量查（防 N+1，`ids` 为空返回空 HashMap）。
-    async fn fetch_customer_names_by_ids<'a>(
+    /// 是否存在**直接**子节点（未软删）。建单「只能挂叶子」闸门用；委托
+    /// [`crate::shared::customer::has_children`]。
+    ///
+    /// ⚠️ 它分不出「叶子」与「客户不存在」（两种情况都返 `false`），故调用方必须
+    /// 另配一个存在性判据（本域是 `fetch_customer_parent_id` 返回 `None`）。
+    async fn has_children(&mut self, customer_id: i64) -> Result<bool, sqlx::Error>;
+
+    /// 客户三列（`root_name` / `own_name` / `path`）批量查（防 N+1，空 ids 短路）。
+    ///
+    /// 2026-10-17 新增，取代 `fetch_customer_names_by_ids`（后者只取 `name` +
+    /// `parent_id`，父名要调用方自己再上跳一层查一次，三层树上必错）。委托
+    /// [`crate::shared::customer::paths_of`]。
+    async fn customer_paths_by_ids(
         &mut self,
-        ids: &'a [i64],
-    ) -> Result<std::collections::HashMap<i64, (String, Option<i64>)>, sqlx::Error>;
+        ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, crate::shared::customer::CustomerPath>, AppError>;
 
     /// 子件挂送货单预检（PR-2 后改 JOIN t_part_batch 查）。
     async fn has_active_shipment_for_assembly(
@@ -304,13 +325,6 @@ pub trait AssemblyRepoTrait: Send {
         &mut self,
         nf: NewInitialBatch<'a>,
     ) -> Result<i64, sqlx::Error>;
-
-    /// 取客户名 + L1 名（用于 `PartListItem` 冗余字段）；返回 `(name, l1_name)`。
-    /// 客户不存在 → `(None, None)`；自身是 L1 → l1_name == name。
-    async fn lookup_customer_names(
-        &mut self,
-        customer_id: i64,
-    ) -> Result<(Option<String>, Option<String>), sqlx::Error>;
 
     /// 读回单条 part（按 id，include_deleted 旗标）—— 给 add_assembly_child
     /// service 在 INSERT 后做 read-back 用（与 PartService::create_part 同形）。
@@ -665,30 +679,8 @@ impl AssemblyRepoTrait for &mut PgConnection {
         Ok(row.map(|(p,)| p))
     }
 
-    async fn expand_customer_l2_ids(&mut self, customer_id: i64) -> Result<Vec<i64>, sqlx::Error> {
-        // 先看自身是不是 L1（parent_id IS NULL） → 是：收集自身 + 所有 L2 子节点；否：仅自身
-        let row: Option<(Option<i64>,)> =
-            sqlx::query_as("SELECT parent_id FROM t_customer WHERE id = $1 AND deleted_at IS NULL")
-                .bind(customer_id)
-                .fetch_optional(&mut **self)
-                .await?;
-        match row {
-            Some((None,)) => {
-                // L1：递归取所有 L2（用 recursive CTE 一次拿齐）
-                let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
-                    "WITH RECURSIVE subtree AS (SELECT id FROM t_customer WHERE id = ",
-                );
-                qb.push_bind(customer_id);
-                qb.push(
-                    " AND deleted_at IS NULL UNION ALL SELECT c.id FROM t_customer c \
-                     INNER JOIN subtree s ON c.parent_id = s.id WHERE c.deleted_at IS NULL) \
-                     SELECT id FROM subtree",
-                );
-                let ids: Vec<(i64,)> = qb.build_query_as().fetch_all(&mut **self).await?;
-                Ok(ids.into_iter().map(|(i,)| i).collect())
-            }
-            _ => Ok(vec![customer_id]),
-        }
+    async fn subtree_ids(&mut self, customer_id: i64) -> Result<Vec<i64>, AppError> {
+        crate::shared::customer::subtree_ids(&mut **self, customer_id).await
     }
 
     async fn serial_prefix_for_customer(
@@ -698,29 +690,16 @@ impl AssemblyRepoTrait for &mut PgConnection {
         crate::shared::serial::prefix_for_customer(&mut **self, customer_id).await
     }
 
-    async fn fetch_customer_names_by_ids<'b>(
+    async fn has_children(&mut self, customer_id: i64) -> Result<bool, sqlx::Error> {
+        crate::shared::customer::has_children(&mut **self, customer_id).await
+    }
+
+    async fn customer_paths_by_ids(
         &mut self,
-        ids: &'b [i64],
-    ) -> Result<std::collections::HashMap<i64, (String, Option<i64>)>, sqlx::Error> {
-        let mut out: std::collections::HashMap<i64, (String, Option<i64>)> =
-            std::collections::HashMap::new();
-        if ids.is_empty() {
-            return Ok(out);
-        }
-        let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
-            "SELECT id, name, parent_id FROM t_customer WHERE deleted_at IS NULL AND id IN (",
-        );
-        let mut sep = qb.separated(", ");
-        for id in ids {
-            sep.push_bind(*id);
-        }
-        qb.push(")");
-        let rows: Vec<(i64, String, Option<i64>)> =
-            qb.build_query_as().fetch_all(&mut **self).await?;
-        for (i, n, p) in rows {
-            out.insert(i, (n, p));
-        }
-        Ok(out)
+        ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, crate::shared::customer::CustomerPath>, AppError>
+    {
+        crate::shared::customer::paths_of(&mut **self, ids).await
     }
 
     async fn has_active_shipment_for_assembly(
@@ -776,34 +755,6 @@ impl AssemblyRepoTrait for &mut PgConnection {
         nf: NewInitialBatch<'b>,
     ) -> Result<i64, sqlx::Error> {
         PartBatchRepo::create_initial_batch(&mut **self, nf).await
-    }
-
-    async fn lookup_customer_names(
-        &mut self,
-        customer_id: i64,
-    ) -> Result<(Option<String>, Option<String>), sqlx::Error> {
-        let row: Option<(String, Option<i64>)> = sqlx::query_as(
-            "SELECT name, parent_id FROM t_customer WHERE id = $1 AND deleted_at IS NULL",
-        )
-        .bind(customer_id)
-        .fetch_optional(&mut **self)
-        .await?;
-        let (name, parent_id) = match row {
-            Some(r) => r,
-            None => return Ok((None, None)),
-        };
-        let l1_name = match parent_id {
-            Some(pid) => {
-                sqlx::query_scalar::<_, String>(
-                    "SELECT name FROM t_customer WHERE id = $1 AND deleted_at IS NULL",
-                )
-                .bind(pid)
-                .fetch_optional(&mut **self)
-                .await?
-            }
-            None => Some(name.clone()),
-        };
-        Ok((Some(name), l1_name))
     }
 
     async fn get_part_by_id(

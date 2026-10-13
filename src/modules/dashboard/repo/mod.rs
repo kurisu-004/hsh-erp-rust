@@ -54,7 +54,7 @@ pub trait DashboardRepoTrait: Send {
         statuses: &[&str],
         basis: DeliveryBasis,
         limit: i64,
-    ) -> Result<DeliveryOrderDetailOut, sqlx::Error>;
+    ) -> Result<DeliveryOrderDetailOut, crate::shared::error::AppError>;
 }
 
 #[async_trait]
@@ -97,7 +97,7 @@ impl DashboardRepoTrait for &mut PgConnection {
         statuses: &[&str],
         basis: DeliveryBasis,
         limit: i64,
-    ) -> Result<DeliveryOrderDetailOut, sqlx::Error> {
+    ) -> Result<DeliveryOrderDetailOut, crate::shared::error::AppError> {
         DeliveryRepo::list_delivery_order_details(&mut **self, date, statuses, basis, limit).await
     }
 }

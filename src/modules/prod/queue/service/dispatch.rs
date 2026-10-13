@@ -49,12 +49,16 @@
 //! `shared::shelf::select::pick_least_loaded`（`current_load / capacity` 升序）。
 //! 那个旧实现由此**失去唯一调用方**（保留不删，登记见 `docs/api/queue.md` §8.4）。
 
+use std::collections::HashMap;
+
 use sqlx::PgConnection;
 
 use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::part::repo::PartRepo;
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
+// 2026-10-17：待下发行的客户三列批量取回（SQL 侧已删「上跳一层」的自连接）。
+use crate::shared::customer::{CustomerPath, paths_of};
 use crate::shared::error::{AppError, code};
 // 2026-10-12：`t_part_event` 的写侧自 part 域的事件 INSERT 上提到
 // `shared::part_event`（该表由 7 个模块写、无域归属）。
@@ -87,7 +91,14 @@ impl QueueService {
 
         let rows = QueueDispatchRepo::list_pending_batches(&mut *conn, limit, offset).await?;
         let total = QueueDispatchRepo::count_pending_batches(&mut *conn).await?;
-        let items = rows.into_iter().map(row_to_item).collect();
+        // 2026-10-17：客户三列（`customer_name` / `parent_customer_name`=根 /
+        // `customer_path`）一次批量取回，SQL 侧已删掉「上跳一层」的自连接。
+        let cust_ids: Vec<i64> = rows.iter().map(|r| r.customer_id).collect();
+        let cust_paths = paths_of(&mut *conn, &cust_ids).await?;
+        let items = rows
+            .into_iter()
+            .map(|r| row_to_item(r, &cust_paths))
+            .collect();
         Ok(PendingBatchListOut {
             items,
             total,
@@ -451,7 +462,8 @@ impl QueueService {
 ///（2026-10-10 review 第 2 轮订正：做 `Option → i64` 的是这句，不是 sqlx 的类型
 /// 推断）。`0` 即"未设 step"语义；与 dispatch 写入值（无链 `null` / 有链链首 step）
 /// 的差异由前端按 status 区分。
-fn row_to_item(r: PendingBatchRow) -> PendingBatchItem {
+fn row_to_item(r: PendingBatchRow, paths: &HashMap<i64, CustomerPath>) -> PendingBatchItem {
+    let cp = paths.get(&r.customer_id);
     PendingBatchItem {
         batch_id: r.pb_id,
         part_id: r.pb_part_id,
@@ -463,7 +475,8 @@ fn row_to_item(r: PendingBatchRow) -> PendingBatchItem {
         planned_delivery_date: r.p_planned_delivery_date.to_string(),
         system_delivery_date: r.p_system_delivery_date,
         customer_name: r.c_name,
-        parent_customer_name: r.pc_name,
+        parent_customer_name: cp.map(|p| p.root_name.clone()),
+        customer_path: cp.map(|p| p.path.clone()).unwrap_or_default(),
         applicant_name: r.a_name,
         is_urgent: r.p_is_urgent,
         note: r.p_note,
@@ -544,7 +557,8 @@ mod tests {
         user_id
     }
 
-    /// 写一个 L2 customer（parent_id 留 NULL 表示它本身就是 L1）。
+    /// 写一个**根 / 叶子** customer（`parent_id` 留 NULL ⇒ 它本身就是根）。
+    /// 2026-10-17 起本 fixture 不再叫 L2：客户树放开任意深度后「L2」不再是固定层数。
     async fn insert_customer_l2(pool: &sqlx::PgPool, name: &str) -> i64 {
         let id = shared_test_snowflake().next_id();
         let now = now_naive();
@@ -557,7 +571,7 @@ mod tests {
         .bind(now)
         .execute(pool)
         .await
-        .expect("insert t_customer L2");
+        .expect("insert t_customer");
         id
     }
 

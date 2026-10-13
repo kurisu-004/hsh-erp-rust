@@ -103,9 +103,16 @@
 | `items[]` | array | 最多 **200** 行（`DELIVERY_DETAIL_LIMIT`） |
 | `ts` | string | 服务端时间戳（格式见 §7） |
 
-行字段（`DeliveryOrderDetail`）：`id`（字符串）/ `serial_no` / `drawing_no` / `name` / `l1_customer_name` / `customer_name` / `status` / `planned_delivery_date` / `system_delivery_date`。
+行字段（`DeliveryOrderDetail`）：`id`（字符串）/ `serial_no` / `drawing_no` / `name` / `l1_customer_name` / `customer_name` / `customer_path`（**2026-10-17 新增，必填 string**）/ `status` / `planned_delivery_date` / `system_delivery_date`。
 
-**两列交期恒同时返回**（`planned_delivery_date` 是 NOT NULL 列），前端倒计列按自己的 basis 选列渲染。客户名两级批量查（`l1_customer_name` 取 `t_customer.parent_id` 对应客户名；叶子无 parent 时 L1 退化为叶子名，保证该列非空）。
+**两列交期恒同时返回**（`planned_delivery_date` 是 NOT NULL 列），前端倒计列按自己的 basis 选列渲染。
+
+客户三列（`customer_name` / `l1_customer_name` / `customer_path`）由
+`shared::customer::paths_of` **一次批量**产出（2026-10-17 客户树放开任意深度后取代
+原先「查自身 name + 上跳一层取 parent name」的两级 SQL）：
+- `customer_name` = 本节点单段名；
+- `l1_customer_name` = **根**（L1 集团）名 —— 任意深度树上恒为根，本节点即根时 = 自身名；
+- `customer_path` = 第 2 层到叶子用 `" / "` 拼接、**不含根**，客户行缺失 / 已软删时为空串。
 
 ## 4. 口径表
 

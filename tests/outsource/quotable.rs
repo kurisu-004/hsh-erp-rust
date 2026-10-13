@@ -143,9 +143,11 @@ async fn quotable_happy_path_returns_part_fields() {
     let row = &env["data"]["items"][0];
     assert_eq!(row["id"], pid.to_string(), "{env}");
     assert_eq!(row["unit_price"], "33.00", "{env}");
-    // 客户路径：本例 customer 是根 L1（无 parent）→ 只给自身名
+    // 客户三列：本例 customer 是**根**（无 parent）
+    // 2026-10-17：`l1_customer_name` 恒为**根**名 ⇒ 根自己时 = 自身名（旧的
+    // 「上跳一层」实现返回 null）；`customer_path` 不含根 ⇒ 根自己时 = 自身名。
     assert_eq!(row["customer_path"], "QtCo", "{env}");
-    assert_eq!(row["l1_customer_name"], serde_json::Value::Null, "{env}");
+    assert_eq!(row["l1_customer_name"], "QtCo", "{env}");
     // 2026-10-03：行粒度收成「一零件一行」，货架 / 工序四字段已从契约里删除
     for gone in [
         "shelf_id",

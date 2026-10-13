@@ -6,7 +6,8 @@
 //!
 //! ## 字段取舍：按前端实际消费收敛（逐字段 grep 证据见 `docs/api/queue.md` §5）
 //!
-//! - 删 `customer_path` —— 前端用 `customer_name` + `parent_customer_name` 自行拼；
+//! - ~~删 `customer_path`~~ —— 2026-10-17 **恢复**：客户树放开任意深度后前端无法
+//!   自拼（它只能拿到最后两段名），`customer_path` 由后端按统一口径给出；
 //! - 删 `location` 原始 enum —— 候选池项恒为 `PRODUCTION_SHELF`、持有项恒为
 //!   `WORKER`，前端用 `shelf_code` 表达位置；
 //! - 删 `QueueHeldBatch.shelf_code` —— 持有态 `current_holder_id` 是 worker，
@@ -121,8 +122,13 @@ pub struct QueueHeldBatch {
     /// 而非安全保证。与 [`QueuePoolItem::has_process_chain`] 同源（同一个常量），
     /// 两列必须同时改。
     pub has_process_chain: bool,
+    /// 本节点单段客户名（SQL 里 `t_customer` 自身那一次 join）
     pub customer_name: Option<String>,
+    /// **根**（L1 集团）客户名 —— 2026-10-17 起由 `shared::customer::paths_of` 补齐，
+    /// 不再是「上跳一层」的直接父
     pub parent_customer_name: Option<String>,
+    /// 2026-10-17 新增（必填）：第 2 层到叶子的 `" / "` 路径（不含根）
+    pub customer_path: String,
     pub applicant_name: Option<String>,
     /// 恒为 `"WORKER"`（写入闸门保证；保留是因为卡片要显示「在工人手上」）
     pub location: String,
@@ -132,8 +138,9 @@ pub struct QueueHeldBatch {
 
 /// 候选池里的一批（`status='IN_PROCESS' AND location='PRODUCTION_SHELF'`）。
 ///
-/// **不含 `customer_path` 与 `location`**：前者前端自己拼 L1 / L2；后者恒为
-/// `"PRODUCTION_SHELF"`，前端用 `shelf_code` 表达位置。
+/// 2026-10-17 起**含 `customer_path`**（客户树无限层级化后「前端自己拼 L1 / L2」
+/// 这条口径不再成立 —— 树上可以有任意多层，前端拼不出第 2 层以外的段）。
+/// **不含 `location`**：它恒为 `"PRODUCTION_SHELF"`，前端用 `shelf_code` 表达位置。
 #[derive(Debug, Clone, Serialize)]
 pub struct QueuePoolItem {
     pub batch_id: String,
@@ -144,8 +151,12 @@ pub struct QueuePoolItem {
     pub name: String,
     pub drawing_no: String,
     pub system_delivery_date: Option<chrono::NaiveDate>,
+    /// 本节点单段客户名（SQL 里 `t_customer` 自身那一次 join）
     pub customer_name: Option<String>,
+    /// **根**客户名（2026-10-17 起由 `shared::customer::paths_of` 补齐）
     pub parent_customer_name: Option<String>,
+    /// 2026-10-17 新增（必填）：第 2 层到叶子的 `" / "` 路径（不含根）
+    pub customer_path: String,
     pub applicant_name: Option<String>,
     /// 当前货架 id（`t_part_batch.current_holder_id`）—— POOL → WORKER 移动的
     /// `from.shelf_id` 数据源，**不能**用用户当前激活货架凑（候选池跨货架）。

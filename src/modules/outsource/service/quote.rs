@@ -49,8 +49,8 @@ use crate::shared::error::{AppError, code};
 
 use super::{
     DEFAULT_LIMIT, LIST_MAX_LIMIT, MAX_LIMIT, OutsourceService, current_id_to_snowflake,
-    format_price, join_customer_path, keyword_pattern, not_found_company, not_found_quote,
-    parse_price, parse_snowflake_id, version_conflict,
+    format_price, keyword_pattern, not_found_company, not_found_quote, parse_price,
+    parse_snowflake_id, version_conflict,
 };
 
 /// quote_out_many：批量拼装 `OutsourceQuoteOut`（part/company/process 名称补全）。
@@ -65,23 +65,18 @@ async fn quote_out_many<R: OutsourceRepoTrait>(
     let company_ids: Vec<i64> = quotes.iter().map(|q| q.outsource_company_id).collect();
     let process_ids: Vec<i64> = quotes.iter().map(|q| q.process_id).collect();
 
-    let part_map: HashMap<
-        i64,
-        (
-            Option<String>,
-            String,
-            String,
-            bool,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ),
-    > = {
+    let part_map: HashMap<i64, (Option<String>, String, String, bool, Option<String>, i64)> = {
         let rows = repo.part_map_for_quote(&part_ids).await?;
         rows.into_iter()
-            .map(|r| (r.0, (r.1, r.2, r.3, r.4, r.5, r.6, r.7)))
+            .map(|r| (r.0, (r.1, r.2, r.3, r.4, r.5, r.6)))
             .collect()
     };
+    // 2026-10-17：报价行的 `customer_path` 直接读 `shared::customer::paths_of` 的
+    // `CustomerPath::path`（此前是 service 层把「L1 名 / L2 名」两段拼出来的，
+    // 深树上那两段既不是根也不是整条路径）。按 part 的 customer_id 一次批量取回。
+    let cust_paths = repo
+        .customer_paths_by_ids(&part_map.values().map(|p| p.5).collect::<Vec<_>>())
+        .await?;
     let company_map: HashMap<i64, String> = {
         let rows = repo.company_map_name(&company_ids).await?;
         rows.into_iter().collect()
@@ -93,10 +88,10 @@ async fn quote_out_many<R: OutsourceRepoTrait>(
 
     let mut out = Vec::with_capacity(quotes.len());
     for q in quotes {
-        let (serial, drawing, name, urgent, unit_price, cust_l2, cust_l1) = part_map
+        let (serial, drawing, name, urgent, unit_price, cust_id) = part_map
             .get(&q.part_id)
             .cloned()
-            .unwrap_or_else(|| (None, String::new(), String::new(), false, None, None, None));
+            .unwrap_or_else(|| (None, String::new(), String::new(), false, None, 0));
         let company_name = company_map.get(&q.outsource_company_id).cloned();
         let (proc_code, proc_name) = process_map
             .get(&q.process_id)
@@ -122,8 +117,11 @@ async fn quote_out_many<R: OutsourceRepoTrait>(
             outsource_company_name: company_name,
             process_code: Some(proc_code),
             process_name: Some(proc_name),
-            // 2026-10-03 新增：此前硬编码 `None` → 前端报价一览「客户」列恒 `—`
-            customer_path: join_customer_path(cust_l1.as_deref(), cust_l2.as_deref()),
+            // 2026-10-03 新增（原为两段拼接，2026-10-17 改读 `paths_of` 的 path）
+            customer_path: cust_paths
+                .get(&cust_id)
+                .map(|p| p.path.clone())
+                .unwrap_or_default(),
             part_unit_price: unit_price,
             is_urgent: urgent,
         });
@@ -292,22 +290,26 @@ impl OutsourceService {
         let rows = repo.quotable_list(pat.as_deref(), limit, offset).await?;
         let total = repo.quotable_count(pat.as_deref()).await?;
 
+        // 2026-10-17：SQL 侧只 SELECT `customer_id`，三个客户名一次批量产出
+        // （`l1_customer_name` = **根**名；`customer_path` = 第 2 层到叶子的路径）
+        let cust_ids: Vec<i64> = rows.iter().map(|r| r.customer_id).collect();
+        let cust_paths = repo.customer_paths_by_ids(&cust_ids).await?;
         let items = rows
             .into_iter()
-            .map(|r| QuotablePartOut {
-                id: r.id,
-                serial_no: r.serial_no,
-                drawing_no: r.drawing_no,
-                name: r.name,
-                is_urgent: r.is_urgent,
-                unit_price: r.unit_price,
-                customer_id: r.customer_id,
-                customer_name: r.customer_name.clone(),
-                l1_customer_name: r.parent_customer_name.clone(),
-                customer_path: join_customer_path(
-                    r.parent_customer_name.as_deref(),
-                    r.customer_name.as_deref(),
-                ),
+            .map(|r| {
+                let cp = cust_paths.get(&r.customer_id);
+                QuotablePartOut {
+                    id: r.id,
+                    serial_no: r.serial_no,
+                    drawing_no: r.drawing_no,
+                    name: r.name,
+                    is_urgent: r.is_urgent,
+                    unit_price: r.unit_price,
+                    customer_id: r.customer_id,
+                    customer_name: cp.map(|p| p.own_name.clone()),
+                    l1_customer_name: cp.map(|p| p.root_name.clone()),
+                    customer_path: cp.map(|p| p.path.clone()).unwrap_or_default(),
+                }
             })
             .collect();
 
@@ -340,6 +342,13 @@ impl OutsourceService {
                 code::BIZ_PART_NOT_FOUND,
                 format!("part {part_id} 不存在"),
             ));
+        }
+        // 2026-10-17 新增：报价只能挂在「叶子客户」的零件上（与 POST /parts、
+        // POST /assemblies 同一口径）。part 存在性已在上一步校验过，故 customer_id
+        // 必然有值（`t_part.customer_id` NOT NULL）。
+        let part_customer = repo.part_customer_id(part_id).await?;
+        if let Some(cid) = part_customer {
+            repo.require_leaf_customer(cid).await?;
         }
         // 公司存在 + active
         let _company = repo

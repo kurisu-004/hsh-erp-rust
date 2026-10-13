@@ -37,10 +37,14 @@ pub struct PendingBatchItem {
     /// 系统交期（`NaiveDate` 原生序列化；NULL → JSON `null`）。
     pub system_delivery_date: Option<NaiveDate>,
     // —— 客户 / 申请人 ——
-    /// L2 客户名（叶子）
+    /// 本节点单段客户名（`t_customer` 自身那一次 join）
     pub customer_name: Option<String>,
-    /// L1 客户名（一级集团），L2.parent_id 为空时为 None
+    /// **根**（L1 集团）客户名 —— 2026-10-17 起由 `shared::customer::paths_of` 补齐，
+    /// 不再是「上跳一层」的直接父（深树上那是中间层名）
     pub parent_customer_name: Option<String>,
+    /// 2026-10-17 新增（必填）：第 2 层到叶子的 `" / "` 路径（不含根；本节点即根时
+    /// = 根自己的名字）。客户行缺失 / 已软删时为空串。
+    pub customer_path: String,
     /// 申请人字符串（来自 `t_part.applicant_name` LEFT JOIN `t_applicant.name`，
     /// applicant 软删 / 不存在时为 None）。
     pub applicant_name: Option<String>,

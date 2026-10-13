@@ -38,7 +38,7 @@ use crate::shared::error::{AppError, code};
 
 use super::{BATCH_CREATE_PARTS_MAX_ITEMS, PartService};
 
-use super::crud::{lookup_customer_names, map_create_error};
+use super::crud::{map_create_error, require_leaf_customer};
 
 /// 2026-09-16 M2-B 新增：单 item 文件绑定预处理的输出。
 ///
@@ -132,6 +132,16 @@ impl PartService {
             }
             Err(e) => return Err((AppError::from(e), Vec::new())),
         }
+        // 2026-10-17 新增：整批只能挂叶子客户（与 `POST /parts` 的单件闸门同一条）。
+        // 排在 head/copy 之前 ⇒ 挂了非叶子客户一个 COS 对象都不会落地。
+        require_leaf_customer(repo.conn_mut(), req.customer_id)
+            .await
+            .map_err(|e| (e, Vec::new()))?;
+        // 2026-10-17：本批所有 part 的客户三个名字只取一次（逐 item 查 = N+1，
+        // 而本批 customer_id 恒定，等价于单次 `paths_of`）。
+        let cust_paths = crate::shared::customer::paths_of(repo.conn_mut(), &[req.customer_id])
+            .await
+            .map_err(|e| (e, Vec::new()))?;
 
         // 2026-10-05：序列号 prefix 只取一次，且取在第一遍 head/copy **之前** ——
         // L1 客户没配 prefix（20308）要 fail-fast 整批拒，此时一个 COS 对象都
@@ -370,10 +380,6 @@ impl PartService {
                             // DB 结果无关）。
                             match repo.get_part_detail(new_id).await {
                                 Ok(Some(p)) => {
-                                    let (cn, l1cn) =
-                                        lookup_customer_names(repo.conn_mut(), p.customer_id)
-                                            .await
-                                            .map_err(|e| (e, cleanup_tmp_keys.clone()))?;
                                     let current_batch_id =
                                         repo.find_current_inspection_batch_id(p.id).await.map_err(
                                             |e| (AppError::from(e), cleanup_tmp_keys.clone()),
@@ -381,8 +387,7 @@ impl PartService {
                                     created.push(PartDetailOut::from_with_customer_extra(
                                         p,
                                         current_batch_id,
-                                        cn,
-                                        l1cn,
+                                        cust_paths.get(&req.customer_id),
                                     ));
                                 }
                                 _ => {
@@ -463,6 +468,10 @@ impl PartService {
             })?;
         // 与 with_bindings 同口径：prefix 缺失（20308）在写任何行之前整批拒
         let serial_prefix = repo.serial_prefix_for_customer(req.customer_id).await?;
+        // 2026-10-17：叶子客户闸门 + 本批客户三列只取一次（逐 item 查 = N+1）。
+        require_leaf_customer(repo.conn_mut(), req.customer_id).await?;
+        let cust_paths =
+            crate::shared::customer::paths_of(repo.conn_mut(), &[req.customer_id]).await?;
         let mut created = Vec::new();
         let mut failed = Vec::new();
         for (idx, item) in req.items.iter().enumerate() {
@@ -524,15 +533,12 @@ impl PartService {
                         .await?;
                     match repo.get_part_detail(new_id).await {
                         Ok(Some(p)) => {
-                            let (cn, l1cn) =
-                                lookup_customer_names(repo.conn_mut(), p.customer_id).await?;
                             let current_batch_id =
                                 repo.find_current_inspection_batch_id(p.id).await?;
                             created.push(PartDetailOut::from_with_customer_extra(
                                 p,
                                 current_batch_id,
-                                cn,
-                                l1cn,
+                                cust_paths.get(&req.customer_id),
                             ));
                         }
                         _ => {

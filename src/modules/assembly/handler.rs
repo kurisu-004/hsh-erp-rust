@@ -107,7 +107,7 @@ pub async fn get_assembly(
 ///   两个字段名等价，都收；PDF 在本端点**不入库**。
 ///
 /// 行为：
-/// - 业务流转：service `create_assembly`（L2 customer 校验 + 子件上限 +
+/// - 业务流转：service `create_assembly`（叶子 customer 校验 + 子件上限 +
 ///   PDF 页数 == children.len()+1 + serial 派发 + children INSERT）。
 /// - WS 广播：commit 后 `ASSEMBLY_CREATED`。
 /// - 响应：`AssemblyCreateResult { assembly, created_children }`。
@@ -167,7 +167,7 @@ pub async fn create_assembly(
 
 /// POST /api/v2/assemblies/{assembly_id}/update
 ///
-/// 字段可选 UPDATE（含 customer_id 三态校验 + L2 校验）；OCC 通过 `req.version` 守。
+/// 字段可选 UPDATE（含 customer_id 三态校验 + 叶子校验）；OCC 通过 `req.version` 守。
 ///
 /// 行为：
 /// - 权限：Manager / Clerk（service 内守卫）
