@@ -64,7 +64,7 @@ use crate::modules::part::service::list_enrichment::{
     enrich_part_list_with_location_and_holder, fetch_delivered_quantities, fetch_delivered_sets,
 };
 use crate::modules::part::vo::{ChainState, PartListItem};
-use crate::shared::customer::expand_customer_id;
+use crate::shared::customer::subtree_ids;
 use crate::shared::error::AppError;
 
 use super::super::dto::{RowType, UnionListQuery};
@@ -75,7 +75,7 @@ use super::super::vo::PartListOut;
 ///
 /// 行为：
 /// 1. normalize `row_type`（`None` / `"ALL"` / `""` → `All`；`"PART"` / `"PART_FLAT"` / `"ASSEMBLY"` 合法；其它 → 40001）。
-/// 2. 解析共享筛选条件（`expand_customer_id` + 字符串切分）。
+/// 2. 解析共享筛选条件（`subtree_ids` + 字符串切分）。
 /// 3. 按 `RowType` dispatch：
 ///    - `Part` → `PartRepo::list_with_filters` + `count_with_filters`（`part_only=true`）
 ///    - `PartFlat` → 同上但 `part_only=false`（2026-10-05 新增，含装配件子件）
@@ -543,7 +543,7 @@ async fn parse_filters(
     .to_string();
 
     let customer_ids: Vec<i64> = if let Some(cid) = query.customer_id {
-        expand_customer_id(conn, cid).await?
+        subtree_ids(conn, cid).await?
     } else {
         Vec::new()
     };

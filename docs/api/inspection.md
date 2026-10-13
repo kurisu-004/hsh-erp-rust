@@ -197,7 +197,7 @@ JOIN 只有 3 张：`t_part_batch` JOIN `t_part` JOIN `t_customer`（L2）+ `t_c
 
 ⚠️ 排序**必须**带 `NULLS LAST`：`p.system_delivery_date` 可空，而 PG 默认 ASC → `NULLS LAST` / DESC → `NULLS FIRST`，不显式指定时按交期倒序会把未填交期的行顶到最前。`pb.id ASC` 是兜底键（排序列可重复，无兜底键时翻页会漏行 / 重复行），覆盖用例 `tests/part/inspection_batches.rs::inspection_batches_pagination_tiebreak_by_batch_id_is_stable`。
 
-⚠️ `customer_id` 的 L1/L2 展开走 `crate::shared::customer::expand_customer_id`：L1 客户 → 自身 + 全部 L2 子节点 ids；L2 客户 → 自身 + 同 L1 下所有兄弟 L2 ids。该函数在 `shared`（公共设施，**不是**域），故本域引用它**不**违反零跨域依赖。
+⚠️ `customer_id` 的子树展开走 `crate::shared::customer::subtree_ids`（2026-10-17 客户层级放开为任意深度后由 `expand_customer_id` 改名并改为纯子树口径）：任意层级客户 → 自身 + 其**全部后代** ids，**不含**兄弟节点。该函数在 `shared`（公共设施，**不是**域），故本域引用它**不**违反零跨域依赖。
 
 ### 3.5 ⚠️ `l1_customer_name` 的派生口径（两处并存，勿统一）
 
@@ -265,7 +265,7 @@ JOIN 只有 3 张：`t_part_batch` JOIN `t_part` JOIN `t_customer`（L2）+ `t_c
 | `40102` `TOKEN_EXPIRED` | 401 | 两者 | JWT `ExpiredSignature` | `src/auth/middleware.rs` |
 | `40105` `SESSION_REVOKED` | 401 | 两者 | Redis session 查不到 / jti 命中吊销黑名单 | `src/auth/middleware.rs` |
 | `20101` `BIZ_PART_NOT_FOUND` | 404 | 扫码 | 序列号在 `t_part` 与 `t_assembly` 皆未命中；trim 后为空串同样按未命中 | `service.rs::not_found`（复用 part 域同码，不另开槽位） |
-| `20102` `BIZ_CUSTOMER_NOT_FOUND` | 404 | 队列 | `customer_id` 指向不存在或已软删的客户 | `shared::customer::expand_customer_id` |
+| `20102` `BIZ_CUSTOMER_NOT_FOUND` | 404 | 队列 | `customer_id` 指向不存在或已软删的客户 | `shared::customer::subtree_ids` |
 | `40001` `VALIDATION_ERROR` | 422 | 队列 | 3 个表头筛选值含 `%` / `_` / `\` | `service.rs::to_ilike_pat` → `AppError::validation` |
 | `20118` `BIZ_PART_REPAIR_NOT_TRIGGERED` | 400 | **本域不产生**，登记备查：`ScanBatchOut::is_repairing` 为 `true` 的批次若被调 `POST /prod/batches/{batch_id}/to-process` 会撞这个码（语义是「返修流转前置条件不满足」，文案提示改用 `complete-repair`）。前端据此用 `is_repairing` 提前禁用「指定工序」按钮 | `prod::batch` 的 `transition_core` |
 | **HTTP 400 纯文本**（无 `R` 信封） | 400 | 队列 | `customer_id` / `limit` / `offset` 非数字字面量；`system_delivery_date_from` / `_to` 格式非法 | axum `Query` 提取器反序列化失败，**不经 `AppError`** |
@@ -374,7 +374,7 @@ JOIN 只有 3 张：`t_part_batch` JOIN `t_part` JOIN `t_customer`（L2）+ `t_c
 
 本域**零跨域依赖**：`src/shared/domain_guard` 把「本域不 import 其它域的 service / repo」从口头约定变成 CI 强制。单测 `src/modules/prod/inspection/mod.rs` 的 `inspection_domain_depends_on_no_other_domain` 传本域路径 `prod::inspection` + 源码目录，扫全部 `.rs`，代码区里出现任何他域路径即 panic。⚠️ 嵌套域走**前缀匹配**而非「首段相同即本域」—— 否则同父兄弟域 `prod::batch` 会被一起放行，护栏等于没装。
 
-本域对 `crate::shared::customer::expand_customer_id` 的引用**不**违规：`shared` 是公共设施不是域。
+本域对 `crate::shared::customer::subtree_ids` 的引用**不**违规：`shared` 是公共设施不是域。
 
 ### 9.1 ⚠️ 已知漏报盲区（诚实登记，来源：`src/shared/domain_guard` 的「已知漏报盲区」节）
 

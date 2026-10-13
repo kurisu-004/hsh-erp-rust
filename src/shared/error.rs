@@ -143,6 +143,17 @@ pub mod code {
     // HTTP 409 由 status_from_code 表驱动映射。语义与 `BIZ_PART_ALREADY_CANCELLED=20115`
     // 对称（CAN/COMPLETED 互为幂等拒绝码）。
     pub const BIZ_PART_ALREADY_COMPLETED: i32 = 20123;
+    // 2026-10-17 新增：客户层级从固定两层放开为**任意深度**后出现的软删闸门码。
+    // 触发场景：`POST /api/v2/com/customers/{id}/soft-delete` 删一个有未软删子节点的
+    // 客户。旧两层实现**不**查子节点（「L1 仍有 L2」不报错，子节点由前端显式 cascade），
+    // 任意深度下那套隐式约定已经不成立（子节点可能挂在第 5 层，且单据挂叶子，
+    // 级联删除会连带软删已被单据引用的节点）⇒ 改为服务端显式拒绝。
+    // 与 `BIZ_CUSTOMER_IN_USE`(20113) 的分工：那一条判「**业务单据**引用」（part /
+    // assembly），本条判「**客户树**引用」（子节点），两者独立、任一命中即拒软删。
+    // 槽位选择：20124 顺延 201xx 段最后一个（20123 是 parts 段的 force-complete）。
+    // HTTP 400（与 `BIZ_INVALID_VALUE` 一致）：请求本身合法，是「按这个客户现在的
+    // 状态不能删」——调用方改请求也改不动，只能改数据，故不是 409。
+    pub const BIZ_CUSTOMER_HAS_CHILDREN: i32 = 20124;
 
     // 202xx 工人
     pub const BIZ_WORKER_NOT_FOUND: i32 = 20201;
@@ -612,6 +623,14 @@ fn status_from_code(c: i32) -> StatusCode {
             StatusCode::BAD_REQUEST
         }
 
+        // ---- 2xxxx 业务码：400（入参 / 当前状态不允许）----
+        // 2026-10-17 新增：客户有未软删子节点 → 拒软删（400）。刻意**不**并进下面
+        // 那条 409 段（`BIZ_CUSTOMER_IN_USE`）：409 的语义是「换个值 / 重试也许能过」，
+        // 而这里改请求改不动（客户就是有子节点），只能先把子节点处理掉。
+        // 下面 `(20000..30000) => BAD_REQUEST` 的兜底本来就是 400，这里显式登记是
+        // 为了让「它落在 400 段」成为有断言的契约，而不是兜底的副产物。
+        c if c == code::BIZ_CUSTOMER_HAS_CHILDREN => StatusCode::BAD_REQUEST,
+
         // ---- 2xxxx 业务码：409 (状态冲突 / 重复 / 占用 / 锁) ----
         // 2026-09-30 新增：prod/pool/move 的 from/holder 不一致也归到 409 段，
         // 与 worker→worker/worker→pool 的版本冲突并列。前端按 code 区分
@@ -845,6 +864,8 @@ mod tests {
             code::BIZ_PART_ALREADY_COMPLETED,
             "BIZ_PART_ALREADY_COMPLETED",
         ),
+        // 2026-10-17 新增：客户有未软删子节点 → 拒软删（400）
+        (code::BIZ_CUSTOMER_HAS_CHILDREN, "BIZ_CUSTOMER_HAS_CHILDREN"),
         // 202xx
         (code::BIZ_WORKER_NOT_FOUND, "BIZ_WORKER_NOT_FOUND"),
         (code::BIZ_WORKER_INACTIVE, "BIZ_WORKER_INACTIVE"),
@@ -1262,6 +1283,8 @@ mod tests {
         assert_eq!(code::BIZ_BATCH_LOCATION_MISMATCH, 20122);
         // 2026-09-30 新增：force-complete 端点已 COMPLETED 幂等拒绝 → 409
         assert_eq!(code::BIZ_PART_ALREADY_COMPLETED, 20123);
+        // 2026-10-17 新增：客户层级任意深度 → 子节点闸门码
+        assert_eq!(code::BIZ_CUSTOMER_HAS_CHILDREN, 20124);
 
         // 202xx
         assert_eq!(code::BIZ_WORKER_NOT_FOUND, 20201);
@@ -1756,6 +1779,11 @@ mod tests {
             code::BIZ_CUSTOMER_IN_USE,
             StatusCode::CONFLICT,
             "BIZ_CUSTOMER_IN_USE",
+        ),
+        (
+            code::BIZ_CUSTOMER_HAS_CHILDREN,
+            StatusCode::BAD_REQUEST,
+            "BIZ_CUSTOMER_HAS_CHILDREN",
         ),
         (
             code::BIZ_WORKER_IN_USE,

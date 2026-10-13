@@ -117,9 +117,9 @@
 //! - **表头筛选**：图号 / 名称 / 序列号各一个独立 ILIKE（`%…%`）。service 层
 //!   trim + 空串→None，并**拒绝** `%` / `_` / `\`（40001 —— 防 `%…%` 被 PG 当通配符
 //!   放大成全表扫描；注入面由 repo 的 `push_bind` 参数化保证，与该校验无关）。
-//! - **`customer_id`**：单值 → `crate::shared::customer::expand_customer_id`
-//!   展开为 L1 + 全部 L2 ids 进 `= ANY($n)`。该函数在 `shared`（公共设施，不是域），
-//!   故本域引用它**不**违反零跨域依赖。
+//! - **`customer_id`**：单值 → `crate::shared::customer::subtree_ids`
+//!   展开为「该节点 + 全部后代」ids（纯子树，任意深度）进 `= ANY($n)`。该函数在
+//!   `shared`（公共设施，不是域），故本域引用它**不**违反零跨域依赖。
 //! - **分页**：`limit ∈ [1, 200]`（默认 200）、`offset ≥ 0`（默认 0）；`total`
 //!   与 `items` 共用同一个 WHERE 拼装器，恒等于**过滤后**的条数。
 //! - **排序**：白名单映射在 service 层完成（表头 7 列；缺省 / 非法 `sort_by` 退化为
@@ -204,7 +204,7 @@ mod tests {
             &Path::new(env!("CARGO_MANIFEST_DIR")).join("src/modules/prod/inspection"),
             "需要别的域的数据时，正确做法是像 statistics / admin 那样在本域 SQL 里只读聚合\
              （本域要读的 t_part / t_part_batch / t_assembly / t_customer 等表，SQL 真源见 \
-             repo.rs；客户 L1 展开用 crate::shared::customer::expand_customer_id，shared 是\
+             repo.rs；客户子树展开用 crate::shared::customer::subtree_ids，shared 是\
              公共设施不是域），而不是 import 别人的 service / repo。",
         );
     }

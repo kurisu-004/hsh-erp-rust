@@ -214,7 +214,8 @@ pub struct PartUpdateRequest {
 
 /// `GET /parts` 查询参数（2026-09-29 简化：移除 `row_type` / `include_assemblies`）。
 ///
-/// `customer_id`：单值；service 层用 `expand_customer_id` 展开为 L1+L2 ids。
+/// `customer_id`：单值；service 层用 `subtree_ids` 展开为「该节点 + 全部后代」
+/// （纯子树，任意深度；2026-10-17 起不再含兄弟节点）。
 /// `status` / `statuses`：单值 / 多值互不冲突；service 层二选一传入。
 /// `locations` / `holder_ids`：逗号分隔。`locations` 是 `t_part_batch.location`
 /// 字符串白名单（OFFICE / PRODUCTION_SHELF / WORKER / INSPECTION_SHELF /

@@ -3,14 +3,26 @@
 //! 列表 / 详情 / 创建 / 更新 / 软删 —— 共 5 个端点。
 //!
 //! ## 业务约束（service 层 enforce）
-//! - L1：`parent_id IS NULL`，`serial_prefix` 必须为单个大写字母
-//! - L2：`parent_id` 非 NULL（指向 L1），`serial_prefix` 必须 NULL
+//! - 根（`parent_id IS NULL`）：`serial_prefix` 必须为单个大写字母
+//! - 非根（`parent_id` 非 NULL，指向任意层级的父节点）：`serial_prefix` 必须 NULL
 //!
-//! ## soft-delete "in use" 检查
-//! 与 Python `service/customer.py:soft_delete_customer` 对齐：先查 `t_part.customer_id` 与
-//! `t_assembly.customer_id` 的非软删引用计数，>0 即拒软删，抛 `20113 BIZ_CUSTOMER_IN_USE`。
-//! **不**检查 `t_customer.parent_id`（子 L2），所以「L1 仍有 L2 子节点」**不会**触发此码——
-//! L1 子节点的语义由前端在删除前显式 cascade 处理，与 Python 行为一致。
+//! 2026-10-17：客户层级由固定两层（L1 集团 + L2 叶子）放开为**任意深度**。上面两条
+//! 判据本身**深度无关**（判的是「有没有 parent_id」），真正随深度变的是下面两处：
+//! - `parent_id` 必须指向**已存在且未软删**的父客户（否则造出断链，根与路径都解析不出）
+//! - 软删的「有子节点」闸门（见下）
+//!
+//! ## soft-delete 的两道闸门（2026-10-17 改写）
+//! 顺序：**先子节点、再单据引用**，任一命中即拒。
+//! 1. 子节点闸门（**新增**）：有任意深度的未软删子节点 ⇒ `20124 BIZ_CUSTOMER_HAS_CHILDREN`。
+//!    消息里带下级节点数（= 子树大小 - 1）。
+//!    ⚠️ 旧的两层实现**不**查 `t_customer.parent_id`，「L1 仍有 L2」**不会**触发任何码——
+//!    子节点由前端在删除前显式 cascade。任意深度下那套隐式约定已经不成立：子节点可能挂在
+//!    第 5 层、前端拿不到（列表按 50 条截断的历史问题也会让它看不见子节点），且单据挂叶子，
+//!    级联删除会连带软删已被 part / assembly 引用的节点 ⇒ 改为服务端显式拒绝。
+//! 2. 单据引用闸门（不变）：`t_part.customer_id` 与 `t_assembly.customer_id` 的非软删
+//!    引用计数，>0 即拒软删，抛 `20113 BIZ_CUSTOMER_IN_USE`。对齐 Python
+//!    `service/customer.py:soft_delete_customer`。跨域 inline SQL 已下沉到
+//!    `CustomerRepoTrait::count_parts_using_customer` / `count_assemblies_using_customer`。
 //!
 //! 2026-09-22 重构：跨域 inline SQL（`t_part` / `t_assembly` 引用计数）从本文件下沉到
 //! `CustomerRepo::count_parts_using_customer` / `count_assemblies_using_customer`——
@@ -36,7 +48,11 @@ use crate::modules::com::customer::repo::CustomerRepoTrait;
 use crate::modules::com::customer::vo::{CustomerListOut, CustomerOut};
 use crate::shared::error::{AppError, code};
 
-const DEFAULT_LIMIT: i64 = 50;
+/// 2026-10-17：**不传 `limit` ⇒ 不分页、返回全量**（旧的 `DEFAULT_LIMIT = 50`
+/// 已删除）。客户列表的语义是「整棵树」而不是「一页行」：前端 `listCustomers()` 不传
+/// limit，把整份列表当全集用（拼树 / 反查祖先 / 做 label）。旧口径下节点一多就
+/// **静默截断**——筛选器里凭空少一批客户且零报错，比报错更难查。
+/// 显式传了 `limit` 才走分页，并夹到 `MAX_LIMIT`。
 const MAX_LIMIT: i64 = 500;
 
 fn customer_not_found() -> AppError {
@@ -106,8 +122,14 @@ impl CustomerService {
             Role::Inspector,
         ])?;
 
-        let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-        let offset = query.offset.unwrap_or(0).max(0);
+        // 2026-10-17：`None` = 不分页（全量，见 MAX_LIMIT 上方口径）；`Some` 才夹到
+        // `[1, MAX_LIMIT]`。`offset` 只在分页模式下生效：没有页就没有「第几页」。
+        let limit = query.limit.map(|l| l.clamp(1, MAX_LIMIT));
+        let offset = if limit.is_some() {
+            query.offset.unwrap_or(0).max(0)
+        } else {
+            0
+        };
         let name_like = query
             .name_like
             .as_deref()
@@ -140,6 +162,9 @@ impl CustomerService {
         let parent_map: std::collections::HashMap<i64, String> =
             parents.into_iter().map(|p| (p.id, p.name)).collect();
 
+        // 全量模式下 `limit` 回填**实际行数**、offset 恒 0：前端 `CustomerListResult`
+        // 有这两个字段，缺了会与 Python 旧响应对不上（那个年代恒定 50/0）。
+        let out_limit = limit.unwrap_or(items.len() as i64);
         let out_items = items
             .into_iter()
             .map(|c| {
@@ -151,7 +176,7 @@ impl CustomerService {
         Ok(CustomerListOut {
             items: out_items,
             total,
-            limit,
+            limit: out_limit,
             offset,
         })
     }
@@ -207,13 +232,27 @@ impl CustomerService {
             _ => None,
         };
 
-        // L1 必须带 serial_prefix，L2 必须不带
+        // 2026-10-17 新增：层级放开为任意深度后，父节点可以是**任意层级**的客户，
+        // 但必须真实存在且未软删 —— 否则造出一条断链，之后 `root_id_of`（派序列号取根
+        // 的 serial_prefix）与 `customer_path` 都解析不出根，而现场看到的是「建客户
+        // 成功、之后派号报 20308 / 路径少一段」，排查方向完全错位。DB 侧对 parent_id
+        // **无**约束（无自 FK），这道校验只能在此处做。
+        if let Some(pid) = parent_id
+            && repo.get_by_id(pid, false).await?.is_none()
+        {
+            return Err(AppError::biz(
+                code::BIZ_CUSTOMER_NOT_FOUND,
+                format!("父客户 {pid} 不存在或已软删"),
+            ));
+        }
+
+        // 根必须带 serial_prefix，非根必须不带（判据是「有没有 parent_id」，与层级深度无关）
         let prefix_upper: Option<String> = match (&req.serial_prefix, parent_id.is_some()) {
             (Some(s), false) if !s.is_empty() => Some(check_serial_prefix(s)?),
             (Some(_), true) => {
                 return Err(AppError::biz(
                     code::BIZ_INVALID_VALUE,
-                    "二级客户不得提供 serial_prefix",
+                    "非一级客户不得提供 serial_prefix",
                 ));
             }
             (None, false) => {
@@ -278,16 +317,16 @@ impl CustomerService {
                 } else {
                     return Err(AppError::biz(
                         code::BIZ_INVALID_VALUE,
-                        "二级客户无需清空 serial_prefix",
+                        "非一级客户无需清空 serial_prefix",
                     ));
                 }
             }
             Some(Some(s)) => {
-                // serial_prefix 只在 L1 可改（L2 的 prefix 由 L1 派生）
+                // serial_prefix 只在一级客户可改（序列号前缀是根的属性，由根派生）
                 if current.parent_id.is_some() {
                     return Err(AppError::biz(
                         code::BIZ_INVALID_VALUE,
-                        "二级客户不得修改 serial_prefix",
+                        "非一级客户不得修改 serial_prefix",
                     ));
                 }
                 let upper = check_serial_prefix(s)?;
@@ -296,12 +335,14 @@ impl CustomerService {
             }
         };
 
-        // parent_id：暂不在 update 阶段支持（与 Python `exclude_unset` 行为对齐：
-        // Python 也只允许改 name / serial_prefix；移级是单独操作）。
+        // 2026-10-17：**刻意**不支持修改 `parent_id`（客户层级不可移动）——
+        // 这是产品决定而非「暂未实现」。移动节点会让挂在整棵子树上的
+        // l1_customer_name / customer_path 全部漂移，而已派发的序列号前缀又是**按建单
+        // 时**的根取的，事后移级无法回溯修正；要做也只能是「删除后在目标父节点下重建」。
         if req.parent_id.is_some() {
             return Err(AppError::biz(
                 code::BIZ_INVALID_VALUE,
-                "本接口不支持修改 parent_id，请走 soft-delete + 重建",
+                "不支持修改 parent_id（客户层级不可移动）；请删除后在目标父节点下重建",
             ));
         }
 
@@ -324,10 +365,13 @@ impl CustomerService {
     }
 
     /// 软删：置 `deleted_at = now()` + `version + 1`。
-    /// 软删前查 `t_part.customer_id` 与 `t_assembly.customer_id` 非软删引用计数，
-    /// 大于 0 即拒（20113 BIZ_CUSTOMER_IN_USE）。引用计数 SQL 已下沉到
-    /// `CustomerRepoTrait::count_parts_using_customer` 与
-    /// `CustomerRepoTrait::count_assemblies_using_customer`。
+    ///
+    /// 两道闸门（2026-10-17，详见模块 doc）：
+    /// 1. 有未软删子节点 ⇒ `20124 BIZ_CUSTOMER_HAS_CHILDREN`（消息带下级节点数）
+    /// 2. `t_part.customer_id` / `t_assembly.customer_id` 非软删引用计数 > 0 ⇒
+    ///    `20113 BIZ_CUSTOMER_IN_USE`。引用计数 SQL 已下沉到
+    ///    `CustomerRepoTrait::count_parts_using_customer` 与
+    ///    `CustomerRepoTrait::count_assemblies_using_customer`。
     pub async fn soft_delete_customer<R: CustomerRepoTrait>(
         &self,
         mut repo: R,
@@ -340,6 +384,18 @@ impl CustomerService {
             .get_by_id(id, false)
             .await?
             .ok_or_else(customer_not_found)?;
+
+        // 2026-10-17 新增第一道闸门：有子节点即拒（任意深度，见模块 doc）。
+        // 放在单据引用检查**之前**：子节点是更「浅」的原因，先报它才不会让用户
+        // 先删掉一堆零件才发现真正的原因是「这客户下面还有下级」。
+        // `subtree_ids` 只用来取消息里的数量（子树大小 - 1 = 下级节点数）。
+        if repo.has_children(id).await? {
+            let child_count = repo.subtree_ids(id).await?.len().saturating_sub(1);
+            return Err(AppError::biz(
+                code::BIZ_CUSTOMER_HAS_CHILDREN,
+                format!("客户仍有 {child_count} 个下级节点，无法软删（请先处理全部下级节点）"),
+            ));
+        }
 
         // 与 Python `service/customer.py:soft_delete_customer` 对齐：检查 part + assembly 引用
         let part_count = repo.count_parts_using_customer(id).await?;

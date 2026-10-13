@@ -29,25 +29,34 @@ const SERIAL_FORMAT_WIDTH: usize = 4;
 /// 单次派发最多绕一圈（= 号池宽度）；再绕说明整池占满，抛 `20105`。
 const SERIAL_PREFIX_MAX_ATTEMPTS: i64 = SERIAL_POOL_SIZE;
 
-/// 2026-10-05 新增：取「L1 客户」的 `serial_prefix` 首字符，供建单派发序列号。
+/// 2026-10-05 新增：取「根客户（L1）」的 `serial_prefix` 首字符，供建单派发序列号。
 ///
-/// 序列号前缀是 L1 客户的属性（L2 客户的 `serial_prefix` 恒为 NULL，由
-/// customer 域 service 双校验保证），所以入参可以是 L1 也可以是 L2：内层子查询
-/// 用 `COALESCE(parent_id, id)` 把 L2 折回它的 L1，外层再取那一行的 prefix。
-/// 一条 SQL 走完，不在 Rust 侧分叉。
+/// 序列号前缀是**根节点**的属性（任意非根客户的 `serial_prefix` 恒为 NULL，由
+/// customer 域 service 校验保证），所以入参可以是任意层级的客户：向上递归 CTE
+/// 沿 `parent_id` 走到 `parent_id IS NULL` 的根，取那一行的 prefix。一条 SQL
+/// 走完，不在 Rust 侧分叉。
 ///
-/// `COALESCE` **只折一层**：本函数假定客户树恒为两层（建 L2 时必须有 L1 父行、
-/// 不得再挂子节点，都由 customer 域 service 保证，DB 侧**无**约束）。
-/// 若真出现 L2 的 `parent_id` 指向另一个 L2（第三层），内层折回的是那个中间 L2
-/// 而它的 `serial_prefix` 恒为 NULL ⇒ 本函数报 `20308`（语义上应是层级非法，
-/// 但该形态进不来，不另设错误码）。
+/// 2026-10-17 改：客户层级从固定两层放开为**任意深度**，原来的
+/// `WHERE id = (SELECT COALESCE(parent_id, id) …)` **只折一层** —— 三级客户的
+/// `parent_id` 指向二级，而二级的 `serial_prefix` 恒为 NULL ⇒ 派号必然报
+/// `20308`。现改为向上递归走到根。
+///
+/// ⚠️ 这里的向上递归**内联**而没有调 [`crate::shared::customer::root_id_of`]：
+/// 本函数收泛型 `E: PgExecutor`，而 sqlx 0.9 的 `Executor` **只对 `&Pool` /
+/// `&mut PgConnection` / `&PgListener` 实现**（没有 `&mut E` 的 blanket impl），
+/// 泛型 executor 只能被消费一次，做不成「先查根 id、再查 prefix」两条语句。
+/// 防环两道闸（`seen` 路径数组 + `MAX_CUSTOMER_DEPTH` 深度上限）与
+/// `shared::customer::root_id_of` 逐字同款，**改一处必须同步改另一处**。
 ///
 /// 三种失败（都不该被 DB CHECK 之外的脏数据放过，故逐个显式判）：
-/// - 目标客户或其 L1 父行不存在 / 已软删 → `20102 BIZ_CUSTOMER_NOT_FOUND`
-/// - prefix 为 NULL（L1 客户未配前缀）→ `20308 BIZ_CUSTOMER_NO_SERIAL_PREFIX`
+/// - 目标客户或其根行不存在 / 已软删（链里没有未软删的 `parent_id IS NULL` 行）
+///   → `20102 BIZ_CUSTOMER_NOT_FOUND`
+/// - prefix 为 NULL（根客户未配前缀）→ `20308 BIZ_CUSTOMER_NO_SERIAL_PREFIX`
 /// - prefix 为空串 / 非 ASCII 大写开头 → `20104 BIZ_INVALID_VALUE`
 ///   （`ck_t_customer_serial_prefix_uppercase` 已用 `^[A-Z]$` 挡住该形态，
 ///   这两条分支是对脏数据的兜底，正常写入路径进不来）
+/// - 客户树成环 / 链尾断在已软删或不存在的父行 ⇒ 同样取不到根行，按第一条报
+///   `20102`（脏数据不进正常写入路径，不另设码）
 ///
 /// 2026-10-05 起本函数是**派号链路上 A-Z 校验的唯一一处**：`acquire` 收 `char`
 /// 且不重复校验，脏 prefix 必须在这里被挡住（DB CHECK
@@ -60,15 +69,26 @@ pub async fn prefix_for_customer<'e, E: PgExecutor<'e>>(
     executor: E,
     customer_id: i64,
 ) -> Result<char, AppError> {
-    // 外层 Option = 查无此行（客户或其 L1 父行不存在 / 已软删）；
-    // 内层 Option = 行在但 `serial_prefix IS NULL`（L1 未配前缀）。
+    // 外层 Option = 取不到未软删的根行（客户或其根不存在 / 已软删 / 树成环断链）；
+    // 内层 Option = 根行在但 `serial_prefix IS NULL`（根客户未配前缀）。
     let row: Option<Option<String>> = sqlx::query_scalar(
-        "SELECT serial_prefix FROM t_customer \
-         WHERE id = (SELECT COALESCE(parent_id, id) FROM t_customer \
-                     WHERE id = $1 AND deleted_at IS NULL) \
-           AND deleted_at IS NULL",
+        // CTE 投影 `deleted_at` 与 `serial_prefix`：外层要判「根行未软删」并取它的
+        // prefix，不投影这两列 PG 会报 `column "…" does not exist`。
+        "WITH RECURSIVE up AS ( \
+           SELECT id, parent_id, deleted_at, serial_prefix, 0 AS depth, \
+                  ARRAY[id] AS seen FROM t_customer \
+           WHERE id = $1 AND deleted_at IS NULL \
+         UNION ALL \
+           SELECT p.id, p.parent_id, p.deleted_at, p.serial_prefix, u.depth + 1, u.seen || p.id \
+           FROM up u \
+           INNER JOIN t_customer p ON p.id = u.parent_id \
+           WHERE NOT (p.id = ANY(u.seen)) AND u.depth < $2) \
+         SELECT serial_prefix FROM up \
+         WHERE parent_id IS NULL AND deleted_at IS NULL \
+         ORDER BY depth ASC LIMIT 1",
     )
     .bind(customer_id)
+    .bind(crate::shared::customer::MAX_CUSTOMER_DEPTH)
     .fetch_optional(executor)
     .await?;
     let prefix = row.ok_or_else(|| {
@@ -80,7 +100,7 @@ pub async fn prefix_for_customer<'e, E: PgExecutor<'e>>(
     let prefix = prefix.ok_or_else(|| {
         AppError::biz(
             code::BIZ_CUSTOMER_NO_SERIAL_PREFIX,
-            format!("customer {customer_id} 的 L1 父客户未配置 serial_prefix"),
+            format!("customer {customer_id} 的根客户未配置 serial_prefix"),
         )
     })?;
     let ch = prefix.chars().next().ok_or_else(|| {

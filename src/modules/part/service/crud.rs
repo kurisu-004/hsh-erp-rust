@@ -41,7 +41,7 @@ use crate::modules::part::vo::{
 };
 use crate::modules::prod::batch::repo::{NewInitialBatch, PartBatchRepo};
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
-use crate::shared::customer::expand_customer_id;
+use crate::shared::customer::subtree_ids;
 use crate::shared::error::{AppError, code};
 // 2026-10-12：`t_part_event` 的写侧自 part 域的事件 INSERT 上提到
 // `shared::part_event`（该表由 7 个模块写、无域归属）。
@@ -366,7 +366,7 @@ impl PartService {
         .to_string();
 
         let customer_ids: Vec<i64> = if let Some(cid) = query.customer_id {
-            expand_customer_id(repo.conn_mut(), cid).await?
+            subtree_ids(repo.conn_mut(), cid).await?
         } else {
             Vec::new()
         };

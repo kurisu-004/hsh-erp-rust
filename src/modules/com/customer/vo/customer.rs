@@ -21,9 +21,11 @@ pub struct CustomerOut {
     pub updated_at: NaiveDateTime,
 }
 
-/// 客户列表出参（不分页：phase 1 仅返回全部；后续加 limit/offset 后再补）。
+/// 客户列表出参。
 ///
 /// 字段顺序对齐 Python `schema/customer.py::CustomerListOut`。
+/// `limit` / `offset`：2026-10-17 起**请求不传 `limit` 即不分页、返回全量**，此时
+/// `limit` 回填实际行数、`offset` 恒 0；显式传了 `limit` 才分页并原样回显。
 #[derive(Debug, Clone, Serialize)]
 pub struct CustomerListOut {
     pub items: Vec<CustomerOut>,

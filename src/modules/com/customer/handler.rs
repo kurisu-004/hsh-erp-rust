@@ -43,6 +43,9 @@ use crate::shared::response::R;
 use crate::state::AppState;
 
 /// GET /api/v2/com/customers —— 读端点，acquire 不开事务
+///
+/// 分页口径（2026-10-17）：query 不带 `limit` ⇒ **不分页、返回全量**（service 层
+/// 决定，repo 不下 `LIMIT` 子句）；带 `limit` 才分页并夹到 `[1, 500]`。
 pub async fn list_customers(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,

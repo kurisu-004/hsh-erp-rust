@@ -7,8 +7,11 @@
 //! - model/customer.py
 //! - schema/customer.py
 //!
-//! 域内含 L1（一级集团，parent_id IS NULL，带 serial_prefix 单大写字母）与
-//! L2（叶子客户，parent_id 非 NULL）两层结构。CRUD 端点挂在 `/api/v2/com/customers`。
+//! 域内是**任意深度**的客户树（2026-10-17 由固定两层放开，对齐部门架构：
+//! 集团 / 分厂 / 车间 / 班组…）：根节点（`parent_id IS NULL`，带 `serial_prefix`
+//! 单大写字母）+ 任意层级的非根节点（`parent_id` 非 NULL）。
+//! 跨域的客户树遍历设施在 `shared::customer`（子树展开 / 上溯根 / 路径批量取）。
+//! CRUD 端点挂在 `/api/v2/com/customers`。
 //!
 //! 2026-09-22 重构对齐 iam 范本：`repo.rs` → `repo/{mod, sql}.rs`（胖 trait
 //! `CustomerRepo` + `impl for &mut PgConnection`），`service.rs` →

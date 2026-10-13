@@ -354,7 +354,8 @@ impl InspectionScanRepo {
 /// `resolve_order_dir` 兜底）。
 #[derive(Debug, Clone)]
 pub struct InspectionQueueFilters<'a> {
-    /// 已 `expand_customer_id` 展开的 L1+L2 ids；空切片 → 不按客户过滤。
+    /// 已 `subtree_ids` 展开的「该节点 + 全部后代」ids（纯子树，任意深度）；
+    /// 空切片 → 不按客户过滤。
     pub customer_ids: &'a [i64],
     /// 图号 ILIKE pattern（service 已拼 `%...%` 并拒通配符）；`None` → 不过滤。
     pub drawing_no_pat: Option<&'a str>,

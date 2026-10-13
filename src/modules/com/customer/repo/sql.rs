@@ -132,7 +132,7 @@ impl CustomerRepo {
         .await
     }
 
-    /// 取全部客户（L1+L2），可选包含已软删，按 L1 优先 + id 升序。
+    /// 取全部客户（任意层级），可选包含已软删，按 id 升序。
     pub async fn list_all<'e, E: PgExecutor<'e>>(
         executor: E,
         include_deleted: bool,
@@ -145,7 +145,7 @@ impl CustomerRepo {
                    serial_prefix
             FROM t_customer
             WHERE ($1::bool OR deleted_at IS NULL)
-            ORDER BY parent_id NULLS FIRST, id ASC
+            ORDER BY id ASC
             "#,
             include_deleted,
         )
@@ -155,13 +155,20 @@ impl CustomerRepo {
 
     /// 过滤+分页：用 `QueryBuilder` 动态拼 name_like / parent_id / is_root 三态过滤。
     /// 一次往返即可拿全表行，避免 N+1。
+    ///
+    /// 2026-10-17：`limit` 改成 `Option<i64>` —— `None` 表示**不分页、返回全量**
+    /// （不下 `LIMIT` 子句），`Some` 才走 `clamp` 后的分页。理由：客户列表是
+    /// 「整棵树」而不是「一页行」的语义，前端 `listCustomers()` 不传 limit 并把整份
+    /// 列表当全集用（拼树、反查祖先、做 label）；旧口径下不传 limit 落
+    /// `DEFAULT_LIMIT = 50`，节点一多就**静默截断**（筛选器里凭空少一批客户、零报错）。
+    /// `offset` 只在 `limit = Some` 时生效（全量模式下「没有页就没有第几页」）。
     #[allow(clippy::too_many_arguments)]
     pub async fn list_with_filters<'e, E: PgExecutor<'e>>(
         executor: E,
         name_like: Option<&str>,
         parent_id: Option<i64>,
         is_root: Option<bool>,
-        limit: i64,
+        limit: Option<i64>,
         offset: i64,
     ) -> Result<Vec<TCustomer>, sqlx::Error> {
         let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
@@ -187,10 +194,17 @@ impl CustomerRepo {
                 qb.push(" AND name ILIKE ").push_bind(pat);
             }
         }
-        qb.push(" ORDER BY parent_id NULLS FIRST, id ASC LIMIT ")
-            .push_bind(limit)
-            .push(" OFFSET ")
-            .push_bind(offset);
+        // 2026-10-17：排序从 `parent_id NULLS FIRST, id ASC` 改成纯 `id ASC`。
+        // 旧键只在**两层**树上恰好给出「同一父的兄弟连续」；任意深度下它既不保证
+        // 兄弟连续、也不表达任何产品语义（前端拼树只依赖 `parent_id`，不依赖顺序），
+        // 留着一个「看起来像分组、实际不是」的键最容易让人误读结果集。
+        qb.push(" ORDER BY id ASC");
+        if let Some(l) = limit {
+            qb.push(" LIMIT ").push_bind(l);
+            if offset > 0 {
+                qb.push(" OFFSET ").push_bind(offset);
+            }
+        }
 
         qb.build_query_as::<TCustomer>().fetch_all(executor).await
     }

@@ -46,7 +46,7 @@ use crate::modules::prod::inspection::vo::{
     InspectionQueueItemOut, InspectionQueueListOut, ScanAssemblyOut, ScanBatchOut, ScanPartOut,
     ScanTreeOut,
 };
-use crate::shared::customer::expand_customer_id;
+use crate::shared::customer::subtree_ids;
 use crate::shared::error::{AppError, code};
 
 /// `hit_kind` 出参的取值白名单。
@@ -331,10 +331,11 @@ impl InspectionQueueService {
         let limit = query.limit.unwrap_or(DEFAULT_QUEUE_LIMIT).clamp(1, 200);
         let offset = query.offset.unwrap_or(0).max(0);
 
-        // customer_id 展开：单值 → [L1, 所有 L2]；None → 空切片（不过滤）
+        // customer_id 展开：单值 → [该节点 + 全部后代]（纯子树，任意深度）；
+        // None → 空切片（不过滤）
         let customer_ids_owned: Vec<i64>;
         let customer_ids: &[i64] = if let Some(cid) = query.customer_id {
-            customer_ids_owned = expand_customer_id(&mut *conn, cid).await?;
+            customer_ids_owned = subtree_ids(&mut *conn, cid).await?;
             &customer_ids_owned
         } else {
             &[]
