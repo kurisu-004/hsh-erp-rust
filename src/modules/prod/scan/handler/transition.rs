@@ -16,8 +16,9 @@
 //!
 //! **2026-10-13 新增 `SCAN_BANNER`**：业务事件 banner 的专属展示事件，由本文件
 //! 两个端点（`worker-scan` / `pick-up`）在 commit 之后产出，构造见
-//! [`banner::broadcast_scan_banner`]。⚠️ **外协收回端点
-//! （`POST /scan/outsource-receive`）刻意不产它** —— 它发的是
+//! [`banner::broadcast_scan_banner`]，`action` 派生见 [`banner::banner_action`]。
+//! 两端点都把它排在**本次请求的最后一条广播**（到达序无语义，消费方不许依赖）。
+//! ⚠️ **外协收回端点（`POST /scan/outsource-receive`）刻意不产它** —— 它发的是
 //! `PART_PICKED_UP`。该事件**不进**前端失效白名单（纯展示、消费方只渲染文案）。
 
 use std::sync::Arc;
@@ -34,7 +35,7 @@ use crate::modules::prod::queue::service::QueueService;
 // 共用同一个停机原因常量（见本文件 `worker_scan` 处的「改一同步二」注释）。
 use crate::modules::prod::queue::vo::worker as queue_vo;
 use crate::modules::prod::scan::dto::{PickUpRequest, WorkerScanRequest};
-use crate::modules::prod::scan::handler::banner::broadcast_scan_banner;
+use crate::modules::prod::scan::handler::banner::{self, broadcast_scan_banner};
 use crate::modules::prod::scan::service::ScanService;
 use crate::modules::prod::scan::vo::WorkerScanOut;
 use crate::shared::error::AppError;
@@ -89,6 +90,7 @@ fn ws_broadcast_assembly_updated(state: &AppState, assembly_id: i64) {
 ///   - `WORKER_POOL_REFILL_DONE`（refill 抢到一批）或
 ///   - `WORKER_POOL_EMPTY`（**2026-10-14 起收窄**：`stopped_reason ==
 ///     "POOL_EMPTY"`，即真的池空。工人已拿满时**不广播**，见下）。
+///   - `SCAN_BANNER`（**排在这几条之后**，即本请求的最后一条；到达序无语义）
 ///
 /// ⚠️ **`refill.stopped_reason` 的取值三选一（2026-10-15 起）**：
 /// `"POOL_EMPTY"` / `"WORKER_FULL"` / **`"AUTO_LIMIT_REACHED"`**（工种自动
@@ -170,48 +172,8 @@ pub async fn worker_scan(
             }),
         );
     }
-    // 2026-10-13：`SCAN_BANNER`（业务事件 banner 的专属展示事件），action 按
-    // **响应**的 `scan_out.event_type` 派生 —— 沿用本文件既有的那条纪律
-    // （`WorkerScanCoreOut::event_type` 的字段 doc 与上面 `worker_scan` 的
-    // 「按响应而非请求广播」注释都写明了）：链尾自动送检会让「请求 `RETURNED` /
-    // 响应 `WORKER_SCAN_INSPECTED`」成立，按请求派生就会把自动送检说成「放回」。
-    // 数量取 `scan_out.operated_quantity`（本次实际处理量，整批 / 拆批都对）。
-    match scan_out.event_type.as_str() {
-        "WORKER_SCAN_RETURNED" => {
-            broadcast_scan_banner(
-                &state,
-                "RETURNED",
-                scan_out.worker_id,
-                scan_out.part_id,
-                scan_out.operated_quantity,
-            )
-            .await;
-        }
-        "WORKER_SCAN_INSPECTED" => {
-            broadcast_scan_banner(
-                &state,
-                "INSPECTED",
-                scan_out.worker_id,
-                scan_out.part_id,
-                scan_out.operated_quantity,
-            )
-            .await;
-        }
-        other => {
-            // 不可达：`scan_out.event_type` 只由上面两个臂赋值（见
-            // `service/worker_scan.rs::worker_scan_event`）。留这条臂是为了新增
-            // 事件类型时**当场可见**，而不是静默少发一条 banner。
-            tracing::warn!(
-                event_type = other,
-                part_id = scan_out.part_id,
-                "SCAN_BANNER：未知 event_type，跳过本次 banner 广播"
-            );
-        }
-    }
-    state.ws_hub.broadcast(WsEvent::DashboardEvent {
-        kind: scan_out.event_type.clone(),
-        payload: serde_json::to_value(&scan_out).unwrap_or_default(),
-    });
+    // 2026-10-13：`SCAN_BANNER`（业务事件 banner 的专属展示事件）排在本次请求的
+    // **最后一条广播**（见下方调用点，与 `pick_up` 同款）。
     if !refill_out.taken.is_empty() {
         state.ws_hub.broadcast(WsEvent::DashboardEvent {
             kind: "WORKER_POOL_REFILL_DONE".into(),
@@ -224,7 +186,7 @@ pub async fn worker_scan(
                 "worker_id": scan_out.worker_id.to_string(),
                 "shelf_id": serde_json::Value::Null,
                 "pool_empty": true,
-                // 2026-10-10：`shelf_id` 键删除（refill 已无架锚，worker-scan 也不再收它）。
+                // 2026-10-10：`shelf_id` 键删除（refill 已无架锚，worker-scan 也不收它）。
                 // WS payload 与 HTTP 响应的 `refill.shelf_id` 同步为 `null`。
                 // 2026-10-14：补 `stopped_reason` 键（字符串）—— 让消费方能确认这条事件
                 // 确实来自「池空」而不是「工人已拿满」。走这条分支时该字段恒为
@@ -241,6 +203,43 @@ pub async fn worker_scan(
                 "stopped_reason": refill_out.stopped_reason,
             }),
         });
+    }
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: scan_out.event_type.clone(),
+        payload: serde_json::to_value(&scan_out).unwrap_or_default(),
+    });
+    // 2026-10-13：`SCAN_BANNER`（业务事件 banner 的专属展示事件）。
+    //
+    // ⚠️ **排在本次请求的最后一条广播**，与 `pick_up` 那条产出点同款。banner 不
+    // 触发任何 invalidate，故帧的到达序**无语义**、消费方不许依赖 —— 统一放最后只为
+    // 两个产出点写法一致，别让后人当成「主事件之前/之后必有 banner」之类的保证。
+    //
+    // action 按**响应**的 `scan_out.event_type` 派生 —— 沿用本文件既有的那条纪律
+    // （`WorkerScanCoreOut::event_type` 的字段 doc 与上面 `worker_scan` 的
+    // 「按响应而非请求广播」注释都写明了）：链尾自动送检会让「请求 `RETURNED` /
+    // 响应 `WORKER_SCAN_INSPECTED`」成立，按请求派生就会把自动送检说成「放回」。
+    // 映射本身抽在 [`banner::banner_action`]（那边有单测钉住两条字面量），调用点的
+    // 形参写作 `scan_out.event_type` 是为了让「吃的是响应」在源码上一眼可见。
+    // 数量取 `scan_out.operated_quantity`（本次实际处理量，整批 / 拆批都对）。
+    match banner::banner_action(scan_out.event_type.as_str()) {
+        Some(action) => {
+            broadcast_scan_banner(
+                &state,
+                action,
+                scan_out.worker_id,
+                scan_out.part_id,
+                scan_out.operated_quantity,
+            )
+            .await;
+        }
+        // 不可达：`scan_out.event_type` 只由上面两个臂赋值（见
+        // `service/worker_scan.rs::worker_scan_event`）。留这条臂是为了新增
+        // 事件类型时**当场可见**，而不是静默少发一条 banner。
+        None => tracing::warn!(
+            event_type = scan_out.event_type,
+            part_id = scan_out.part_id,
+            "SCAN_BANNER：未知 event_type，跳过本次 banner 广播"
+        ),
     }
     Ok(Json(R::ok(WorkerScanOut {
         scan: scan_out,
@@ -299,7 +298,10 @@ pub async fn pick_up(
             "quantity": outcome.picked_quantity,
         }),
     );
-    // 2026-10-13：`SCAN_BANNER`（业务事件 banner 的展示事件）。
+    // 2026-10-13：`SCAN_BANNER`（业务事件 banner 的展示事件）。⚠️ 本端点的
+    // `action` 是**常量** `"PICKED_UP"`（不经 `banner::banner_action` —— 那个映射只
+    // 吃 `worker-scan` 响应的 `WORKER_SCAN_*` 字面量）。本调用点是本请求的**最后一条
+    // 广播**；到达序无语义（banner 不触发 invalidate），与 worker-scan 侧同款。
     // ⚠️ **外协收回（`outsource-receive`）刻意不发本事件** —— 它已经发了
     // `PART_PICKED_UP`，banner 侧只接工人的三个动作（领取 / 放回 / 送检）。
     broadcast_scan_banner(

@@ -1305,6 +1305,8 @@ async fn ws_e2e_server_shutdown_sends_1012() {
 //
 // ⚠️ 帧结构：pick-up 一次会连发两条业务事件（`PART_PICKED_UP` → `SCAN_BANNER`），
 // 故收集帧时按 `event_type` 过滤而不是按到达顺序取第 N 条。
+// ⚠️ 本用例要求 **socket 先连上再调端点**（banner 的构造在零订阅者时会早退，见下面
+// `conn_count()` 断言处的注释）。
 
 /// 插一个工种（`t_work_type`），返回其 id。`max_held_batches` 必给 —— pick-up 的
 /// 容量守卫读它，NULL 时端点返 20904 `BIZ_WORK_TYPE_MAX_HELD_NOT_SET`。
@@ -1460,6 +1462,17 @@ async fn ws_e2e_scan_banner_carries_six_display_fields_on_pick_up() {
         .expect("ws frame err");
 
     let pool = state.pool.clone();
+    // ⚠️ **本用例依赖「socket 已连上」**（2026-10-13）：`broadcast_scan_banner`
+    // 首行按 `ws_hub.conn_count() == 0` 早退（无人订阅就不取连接、不查库），所以调
+    // 端点之前连接**必须已进连接表**。`register_conn` 发生在 `handle_socket` 入口、
+    // 严格早于上面那帧 snapshot（收到它即证明已登记），故这个顺序是安全的；把它显式
+    // 断言出来，是为了「先调端点后连 socket」的重排不会静默把本用例变成
+    // 「等 10s 读不到 banner」的假红。
+    assert_eq!(
+        state.ws_hub.conn_count(),
+        1,
+        "调端点前 WS 连接必须已登记，否则 banner 会被零订阅者早退吞掉"
+    );
     // `t_customer.serial_prefix` 是 `varchar(1)` 且根客户有唯一索引 ⇒ 前缀固定单字符
     let cust_id = insert_customer(&pool, "banner_cust", "B").await;
     let work_type_id = insert_banner_work_type(&pool, "BN-WT", 5).await;

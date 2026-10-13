@@ -478,11 +478,13 @@ JSON **形状**逐字不变（键集一字未动）；`scan.batch_id` 的**取�
 | `scan.synced_assembly_id` | string \| null | 父装配件真变了才有值（handler 据此发 `ASSEMBLY_UPDATED`） |
 | `refill` | `RefillResult` | 同事务 refill（`QueueService::refill_for_worker_with_work_type`）。**2026-10-14 起 5 字段** = `worker_id` / `shelf_id`（worker-scan 路径恒 `null`，refill 无架锚）/ `taken[]` / `pool_empty` / **`stopped_reason`**（可选键：refill 一批也没抢到时出现，取 `"POOL_EMPTY"` / `"WORKER_FULL"` / **`"AUTO_LIMIT_REACHED"`**（2026-10-15 新增），抢到东西时**整个键不出现**）。⭐ **2026-10-15：refill 的目标口径改为「补到工种自动上限 `auto_allocate_limit`（未配置兜底 `max_held_batches`）」**（逐条见 [`queue.md`](queue.md) §4.8）。逐字段与判据见 [`queue.md`](queue.md) §3.2；真源 `prod/queue/vo/worker.rs::RefillResult` |
 
-`work_type_id` / `badge_code` / `split` 是**内部管道字段**（`#[serde(skip)]`）：前两个
-把 `worker_scan_event` 已 fetch 过的 worker 信息透传给同事务的
-`QueueService::refill_for_worker_with_work_type`，避免重复查询；`split` 承载
-「部分数量有没有拆批」，供 handler 在 commit 之后补发 `PART_BATCH_SPLIT`。三者都不
-出现在 JSON 里。
+`work_type_id` / `badge_code` / `split` / **`operated_quantity`** 是**内部管道字段**
+（`#[serde(skip)]`）：前两个把 `worker_scan_event` 已 fetch 过的 worker 信息透传给
+同事务的 `QueueService::refill_for_worker_with_work_type`，避免重复查询；`split` 承载
+「部分数量有没有拆批」，供 handler 在 commit 之后补发 `PART_BATCH_SPLIT`；
+`operated_quantity`（**2026-10-13 新增**）承载本次实际处理量，**只供 handler 在 commit
+之后组 `SCAN_BANNER`**（banner 的 `quantity`，见 §4），别处零消费。⚠️ **四个都不出现在
+JSON 里** —— 「`scan` 段恒为那 6 个键」是本端点既有契约，加内部管道字段不需要改它。
 
 ### 2.6 `PickUpRequest`（端点 5）
 
@@ -976,8 +978,8 @@ max_held_batches`（`NULL` = 未配置，不是「不限」）。
 | `POST /scan/take-over` | `PART_TRANSFERRED` | **无条件**（2026-10-15 S2 新事件，见下） |
 | `POST /scan/take-over` | `ASSEMBLY_UPDATED` | 父装配件真变了（`sync_from_batch_change` 返回 `Changed`） |
 | `POST /scan/outsource-receive` | `PART_PICKED_UP` | **无条件**（2026-10-15 S3；payload 与 `pick-up` 逐字同形，见下） |
-| `POST /scan/worker-scan` | `SCAN_BANNER` | **无条件**（2026-10-13；`action` = `"RETURNED"` / `"INSPECTED"`，按响应的 `scan_out.event_type` 派生，见下） |
-| `POST /scan/batches/{id}/pick-up` | `SCAN_BANNER` | **无条件**（2026-10-13；`action` = `"PICKED_UP"`，见下） |
+| `POST /scan/worker-scan` | `SCAN_BANNER` | 响应 `event_type` 是 `WORKER_SCAN_*`（2026-10-13；`action` = `"RETURNED"` / `"INSPECTED"`，按响应的 `scan_out.event_type` 派生，见下）。⚠️ **零 WS 订阅者时整条早退**（见下） |
+| `POST /scan/batches/{id}/pick-up` | `SCAN_BANNER` | 无条件（2026-10-13；`action` = `"PICKED_UP"`）。⚠️ **零 WS 订阅者时整条早退**（见下） |
 
 - **事件名一字不改** —— dashboard 与队列页都在监听，改名会静默断链。
 - **`PART_TRANSFERRED`（2026-10-15 S2 新增，本域第 7 条端点 `POST /scan/take-over` 的唯一产出点）**：
@@ -1010,7 +1012,17 @@ max_held_batches`（`NULL` = 未配置，不是「不限」）。
     **刻意不发** banner（外协收回不接入 banner 口径），它照旧发 `PART_PICKED_UP`。
   - `worker-scan` 的 `action` 按**响应**的 `scan_out.event_type` 派生（不是请求的
     `event_type`），与 §4.1 那条纪律同源：`WORKER_SCAN_RETURNED → "RETURNED"` /
-    `WORKER_SCAN_INSPECTED → "INSPECTED"`。
+    `WORKER_SCAN_INSPECTED → "INSPECTED"`。映射抽在
+    `prod::scan::handler::banner::banner_action`（**有 lib 单测钉住两条字面量**），
+    `pick-up` 侧的 `"PICKED_UP"` 是常量、不经该映射。
+  - ⚠️ **零 WS 订阅者时整条早退**（`broadcast_scan_banner` 首行 `conn_count() == 0`）：
+    不取连接、不查库。语义等价（广播给零订阅者本就丢弃），且早退**保守** ——
+    `conn_count()` 记的是已认证握手的连接表（早于 `subscribe()`），它 ≥ 真正订阅的
+    连接数 ⇒ 只可能「查了但广播被丢」，不会「有人订阅却丢帧」。对前端的含义：
+    **「没人连 WS 时不会有 banner」不是 bug**。
+  - ⚠️ **帧到达序无语义、消费方不许依赖**：两个产出点都把 banner 排在本次请求的
+    **最后一条广播**，但那只是一致性而非契约 —— banner 不触发任何 invalidate，
+    数据刷新仍由同一次请求的主事件负责。
   - `quantity` 取 `scan_out.operated_quantity` / `outcome.picked_quantity`（都是
     **本次实际处理量**，整批 / 部分数量都对）。⚠️ 该 VO 字段是
     `#[serde(skip)]` 的内部管道字段 —— 它加在 `WorkerScanCoreOut` 上**不进 HTTP
@@ -1095,8 +1107,8 @@ max_held_batches`（`NULL` = 未配置，不是「不限」）。
 | `GET /scan/held` | **3** | 取行 + COUNT + 工种上限（**2026-10-14 由 2 增至 3**） |
 | `GET /scan/locate` | **≤ 5**（未传 `worker_id` 时 2） | 工单命中 + 工人/工种上限 + **工种候选工序（2026-10-16 新增）** + 持有数（**复用 `/held` 的 `count_held` 同一条 SQL**）+ 批次取行。**2026-10-15 新增** |
 | `POST /scan/verify-badge` | 1 | 按 `badge_code` 反查 |
-| `POST /scan/worker-scan` | 多次 | 状态翻转 + 事件日志 + 选架 + 同事务 refill + 派生。RETURNED 臂**无条件**先跑 1 条链位置解析（整批路径也跑）；`0 < q < batch.quantity` 的部分数量路径**再加** 5 条：拆批 3 条（`max(batch_no)` / `INSERT ... SELECT` / 扣量 `UPDATE`）+ `SPLIT` 事件 1 条 + 新批次回读 1 条 |
-| `POST /scan/batches/{id}/pick-up` | 多次 | **容量守卫 2 条**（工种 + 持有数）+ **PENDING 链首解析 1–3 条**（仅 PENDING 起点，2026-10-15 S2-B：`optional_process_chain` 恒 1 条；有链再 +2 —— `first_step_in_chain` + `list_process_ids`）+ 拆批（可选）+ 状态翻转 + 事件日志 |
+| `POST /scan/worker-scan` | 多次 | 状态翻转 + 事件日志 + 选架 + 同事务 refill + 派生。RETURNED 臂**无条件**先跑 1 条链位置解析（整批路径也跑）；`0 < q < batch.quantity` 的部分数量路径**再加** 5 条：拆批 3 条（`max(batch_no)` / `INSERT ... SELECT` / 扣量 `UPDATE`）+ `SPLIT` 事件 1 条 + 新批次回读 1 条。**commit 后另补查 2 条**（part `get_by_id` + worker `get_by_id`，供 `SCAN_BANNER`；2026-10-13 新增，⚠️ **无 WS 订阅者时零条** —— `broadcast_scan_banner` 首行按 `conn_count() == 0` 早退） |
+| `POST /scan/batches/{id}/pick-up` | 多次 | **容量守卫 2 条**（工种 + 持有数）+ **PENDING 链首解析 1–3 条**（仅 PENDING 起点，2026-10-15 S2-B：`optional_process_chain` 恒 1 条；有链再 +2 —— `first_step_in_chain` + `list_process_ids`）+ 拆批（可选）+ 状态翻转 + 事件日志。**commit 后另补查 2 条**（同 `worker-scan`：part + worker `get_by_id`，供 `SCAN_BANNER`；⚠️ 无 WS 订阅者时零条） |
 | `POST /scan/take-over` | 多次（前置校验 8–10 条） | 工牌 1 + 批次 1 + part 1 + 链位置解析 1 + **工种工序 1（2026-10-16 起排在链位置解析之后，两个分支共用）** + 链内 step **0–2**（仅分支 B / C：`optional_process_chain` + `resolve_step_id_by_process`，无链时后者不查库；分支 A 不查）+ 容量 2；写 1（`transfer_to_worker`）+ 派生 + 事件 1。**2026-10-15 S2 新增**。⚠️ 次序是**逐条 SQL 记账表**，改动 `service/transfer.rs` 第 6 步的查询次序时必须同步本行（2026-10-16 review 第 1 轮 MINOR-3 订正：原文误写「工种工序上移到链位置解析之前」） |
 | `POST /scan/outsource-receive` | 多次（两段写 + 写后读回） | 前置：工牌 1 + 批次 1 + part 1 + **工种工序 1（2026-10-16 起上移，先于链推导）** + **无链判定 1**（缺省 `next_process_id` 时 `optional_process_chain`；显式则不查）+ 有链推导 1（缺省且有链时；推不出即退回工种候选，不再直接拒）+ 容量 2；stage①（与 `/outsource-queue/move` 回收臂**同内核**）：选架 1 + 链 step 0–2 + 批次写 1 + shipment 读 1 + shipment 写 + quote 事件 0–1 + part 事件 1；**读回 version 1**；stage② `pick_up` 全量（批次 1 + part 1 + 容量 2 + 写 1 + 事件 1 + part 回读 1）；**终读 version 1**。**2026-10-15 S3 新增** |
 
@@ -1384,6 +1396,25 @@ repo 都不 import（连 `PartRepoTrait` 都不借 —— 那是一个 part 域�
     - **读侧按钮口径变化**：`disabled_reason == "PROCESS_NOT_IN_WORK_TYPE"` 现在有
       **两种成因**（推导出的下一道不属该工种 / 该工种零候选），共用同一字面量但
       文案可以不同（枚举**未扩**，见 §2.7）。
+16. **2026-10-13：新 WS 事件 `SCAN_BANNER`（业务事件 banner）**（§4 /
+    [`dashboard.md` §7](dashboard.md#7-与-ws-的关系)）：
+    - **新增事件名 `SCAN_BANNER`**，产出点是本域两条端点 `POST /scan/worker-scan` 与
+      `POST /scan/batches/{batch_id}/pick-up`（外协收回**刻意不产**，见 §4）。payload
+      是 `ScanBannerItem` 的**全量序列化**，恰好 6 个键
+      （`action` / `worker_name` / `serial_no` / `drawing_no` / `quantity` /
+      `system_delivery_date`）—— ⚠️ **不与本域其它事件的「只带 id」同形**，别把
+      `PART_PICKED_UP` 的四键习惯套过来。前端 Zod schema 按「恰好 6 键 + 两个可空键
+      必须是 JSON `null`（不是缺键、不是空串）」写。
+    - **`action` 三选一**：`"PICKED_UP"` / `"RETURNED"` / `"INSPECTED"`；拼成
+      `张三领取 F1234 x 20 (10-27)` 一行文案（`serial_no` 为 `null` 时回退
+      `drawing_no`，`system_delivery_date` 为 `null` 时不显示交期）。
+    - ⚠️ **它必须进前端 `DashboardEventType` 联合类型**（否则 `switch` 分支被 TS 标为
+      永不可达、或该帧在收包处就被丢掉），但**只渲染文案、绝不许拿它 invalidate
+      任何 query** —— 它是纯展示事件，不改变任何看板数据的有效性，**不在**前端
+      `AFFECTS_DASHBOARD` 失效白名单里。既有数据刷新仍由同一次请求的
+      `WORKER_SCAN_*` / `PART_PICKED_UP` / `PART_BATCH_SPLIT` 负责。
+    - ⚠️ **帧到达序无语义**：两个产出点都把它排在本次请求的**最后一条广播**，但这是
+      一致性而非契约（banner 不触发 invalidate），消费方不许依赖它与主事件的先后。
 
 ## 8. 已知偏差登记
 
@@ -1705,5 +1736,8 @@ LEFT JOIN 一次），该写法**假定** holder id 在三表 PK 空间里互不
 `prod::scan::vo::transition` 的 lib 单测守序列化形状与 `operated_quantity` 不进 JSON。
 
 ⚠️ **覆盖面只到 `pick-up` 这条产出点**：`worker-scan` 那条（`action` 按响应
-`scan_out.event_type` 分派生 `RETURNED` / `INSPECTED`）目前**无端到端断言**，
-改它时必须手动联调。
+`scan_out.event_type` 派生 `RETURNED` / `INSPECTED`）目前**无端到端断言**。
+其中「两条 `event_type` → `action` 字面量映射」已由
+`prod::scan::handler::banner::tests`（`banner_action_maps_worker_scan_response_event_types` /
+`banner_action_rejects_non_worker_scan_event_types`）钉住 —— 改动那两条映射会**当场变红**；
+但「整条 worker-scan 路径真的发了 banner 且 payload 六键齐全」仍只能手动联调。

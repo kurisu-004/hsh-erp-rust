@@ -9,6 +9,10 @@
 //! 2026-10-11：worker-scan 支持部分数量后，`scan.batch_id` 的取值从「工人手上那批」
 //! 变成「**本次实际被处理的那一批**」（拆批场景 = 拆出来的新批次），并新增一个
 //! **不进 JSON** 的内部管道字段 `split`（与 `work_type_id` / `badge_code` 同类）。
+//!
+//! 2026-10-13：再新增第 4 个内部管道字段 `operated_quantity`（本次实际处理量，
+//! 供 handler 在 commit 之后组 `SCAN_BANNER`），同样是 `#[serde(skip)]`。⇒ **内部
+//! 管道字段共 4 个**：`work_type_id` / `badge_code` / `split` / `operated_quantity`。
 //! JSON 形状本身仍是那 6 个键。
 
 use serde::Serialize;
@@ -22,10 +26,16 @@ use crate::shared::types::{serialize_i64, serialize_i64_opt};
 /// `WorkerScanCoreOut` 是 service 层直接产出的最小投影（与 queue 域的
 /// `RefillResult` 解耦，便于 service 层单测）。
 ///
-/// `work_type_id` 与 `badge_code` 是**内部管道字段**：handler 用它把
-/// `worker_scan_event` 已经 fetch 过的 worker 信息透传给同事务的
-/// `QueueService::refill_for_worker_with_work_type`，避免重复
-/// `WorkerRepo::get_by_id` 查询。不暴露到 JSON 响应里。
+/// 本 struct 共 **4 个内部管道字段**，全部 `#[serde(skip)]`、全部不进 JSON：
+/// - `work_type_id` / `badge_code`：handler 用它把 `worker_scan_event` 已经 fetch 过的
+///   worker 信息透传给同事务的 `QueueService::refill_for_worker_with_work_type`，
+///   避免重复 `WorkerRepo::get_by_id` 查询（refill 写 `TAKEN_FROM_POOL` 事件日志还要
+///   `badge_code`）；
+/// - `split`：部分数量自动拆批信息，供 handler 在 commit 之后补发 `PART_BATCH_SPLIT`；
+/// - `operated_quantity`（2026-10-13 新增）：本次实际处理量，**只供** handler 在
+///   commit 之后组 `SCAN_BANNER`，别处零消费。
+///
+/// 逐字段登记（含「哪一个不进 JSON」）见 `docs/api/scan.md` §2.5。
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkerScanCoreOut {
     #[serde(serialize_with = "serialize_i64")]
@@ -51,7 +61,7 @@ pub struct WorkerScanCoreOut {
     #[serde(skip)]
     pub badge_code: String,
     /// 内部：部分数量自动拆批信息（整批路径为 `None`），供 handler 在 commit
-    /// 之后补发 `PART_BATCH_SPLIT`。**不进 JSON** —— 与本 struct 的另两个内部管道
+    /// 之后补发 `PART_BATCH_SPLIT`。**不进 JSON** —— 与本 struct 的另三个内部管道
     /// 字段同类，「响应体形状不变」是本端点的既有契约。
     #[serde(skip)]
     pub split: Option<WorkerScanSplitInfo>,
@@ -87,7 +97,7 @@ pub struct ScanBannerItem {
     /// `"INSPECTED"`（送检）。由产出点传入，见
     /// [`crate::modules::prod::scan::handler::banner`]。
     pub action: String,
-    /// `t_worker.name`（`Zhang San` 这样的显示名，不是 `badge_code`）。
+    /// `t_worker.name`（`张三` 这样的显示名，不是 `badge_code`）。
     pub worker_name: String,
     /// `t_part.serial_no`，**可空** —— 终态工单被 migration
     /// `20261001000200_007_serial_release.sql` 置 NULL，且手工工单本就没有序列号。
