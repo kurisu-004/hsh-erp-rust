@@ -87,21 +87,13 @@ pub(crate) fn render_assembly_out(asm: TAssembly) -> AssemblyOut {
     }
 }
 
-/// Sync hook result（service::sync_from_part 回调返回；handler 据此发 ASSEMBLY_UPDATED）。
-///
-/// ## 变体
-/// - `NoChange` —— 父装配件已为终态 / 无子件 / 目标 == 当前 → 不写库；handler 不广播。
-/// - `Changed(assembly_id)` —— 实际更新了 t_assembly.status；handler 发 ASSEMBLY_UPDATED。
-///
-/// 设计意图：把"是否需要广播"的判断推给 handler，service 只表达"是否实际写库"。
-/// 2026-09-22 D-3 与 `SyncOutcome` 命名统一（part/service/rollup.rs 也有同名 enum）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SyncOutcome {
-    /// 父装配件已为终态 / 无子件 / 目标 == 当前 → 不写库
-    NoChange,
-    /// 实际更新了 t_assembly.status；handler 据此发 ASSEMBLY_UPDATED
-    Changed(i64),
-}
+/// 2026-10-13：`SyncOutcome` 的**定义**已上提到
+/// `crate::shared::batch::status`（本模块的 [`RollupOutcome`] 与整条派生链都在
+/// shared 那一层，而 `SyncOutcome` 表达的是「派生有没有真写库」，是派生链自身的
+/// 返回类型）。此处保留 `pub use` 重导出，使
+/// `crate::modules::assembly::service::SyncOutcome` 这条老路径继续可解析
+/// （`admin::service` 与 `tests/assembly/status_sync.rs` 走的就是它）。
+pub use crate::shared::batch::status::SyncOutcome;
 
 /// assembly 域业务门面。handler 经 `state.pool.begin()` 开 tx 后透传 `&mut tx`。
 ///

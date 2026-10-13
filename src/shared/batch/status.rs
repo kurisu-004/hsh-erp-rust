@@ -74,7 +74,8 @@
 //! # 为什么收 `&mut PgConnection` 而不是泛型 `impl PgExecutor<'_>`
 //!
 //! step 3 必须调 `AssemblyService::sync_from_part_change`（D-6 架构约定：
-//! service 不持连接，跨域调用经 `repo.conn_mut()` 拿连接），step 4/5 的
+//! service 不持连接，跨域调用经 `repo.conn_mut()` 拿连接；该 wrapper 的实体
+//! 实现 [`sync_assembly_status`] 已于 2026-10-13 一并搬进本文件，见下），step 4/5 的
 //! 序列号释放要读写 `t_part` / `t_assembly` / `t_part_event` 三张表。
 //! 这些都无法表达在 `impl PgExecutor` 上（它不保证能再借出可变的
 //! `PgConnection`），故主入口收具体连接。13 个包装函数本来就全是连接入参，
@@ -82,8 +83,9 @@
 
 use sqlx::PgConnection;
 
-use crate::modules::assembly::repo::AssemblyRepo;
-use crate::modules::assembly::service::{AssemblyService, SyncOutcome};
+use crate::modules::assembly::repo::{AssemblyRepo, AssemblyRepoTrait};
+use crate::modules::assembly::service::AssemblyService;
+use crate::modules::assembly::statemachine::{AssemblyStatus, compute_assembly_target};
 use crate::modules::part::repo::sql::PartRepo;
 use crate::shared::batch::read::list_active_batches_by_part_id;
 use crate::shared::batch::status_machine::{BatchForRollup, compute_part_target};
@@ -92,6 +94,32 @@ use crate::shared::error::{AppError, code};
 // `shared::part_event`（该表由 7 个模块写、无域归属；本文件因此少了对
 // `part::repo::sql::PartRepo` 的一次依赖）。
 use crate::shared::part_event::{NewPartEvent, insert};
+
+/// Sync hook result（part → assembly 反向派生回调返回；handler 据此发
+/// ASSEMBLY_UPDATED）。
+///
+/// 2026-10-13 自 `assembly::service` 上提到 shared（本文件已有
+/// [`RollupOutcome`] 内嵌它，是自然归位）。上提理由：派生链
+/// `t_part_batch → t_part → t_assembly` 的**两端**都在 shared 这一层，
+/// 而 `SyncOutcome` 表达的是「这次派生有没有真写库」——它描述的是派生链本身，
+/// 不是 assembly 域的对外契约。留在 assembly 域会让 `shared::batch::status`
+/// 反向 import `modules::assembly::service`（方向违规）。
+/// `assembly::service` 保留 `pub use` 重导出，老路径
+/// `crate::modules::assembly::service::SyncOutcome` 继续可解析。
+///
+/// ## 变体
+/// - `NoChange` —— 父装配件已为终态 / 无子件 / 目标 == 当前 → 不写库；handler 不广播。
+/// - `Changed(assembly_id)` —— 实际更新了 t_assembly.status；handler 发 ASSEMBLY_UPDATED。
+///
+/// 设计意图：把"是否需要广播"的判断推给 handler，service 只表达"是否实际写库"。
+/// 2026-09-22 D-3 与 `SyncOutcome` 命名统一（part/service/rollup.rs 也有同名 enum）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncOutcome {
+    /// 父装配件已为终态 / 无子件 / 目标 == 当前 → 不写库
+    NoChange,
+    /// 实际更新了 t_assembly.status；handler 据此发 ASSEMBLY_UPDATED
+    Changed(i64),
+}
 
 /// 一次批次状态变更的完整意图（本模块的唯一入参形状）。
 ///
@@ -857,6 +885,107 @@ pub(crate) async fn release_part_serial_no(
     .execute(&mut *conn)
     .await?;
     Ok(())
+}
+
+// ---------- step 3 的实体：父装配件聚合 + 翻转 ----------
+//
+// 2026-10-13 自 `assembly::service::sync_from_part::sync_assembly_status` 搬来
+// （函数体逐字保留，含下面那段「派生层不得否决主操作」的降级规则 —— **这是
+// 2026-10-01 review 第 1 轮的关键修正，搬移中丢掉就是回归**）。
+//
+// 为什么搬：它是派生链 `t_part_batch → t_part → t_assembly` 的**最后一跳**
+// 实体实现，与本文件的 `rollup_part_derived` / `rollup_assembly_derived` 是同一条
+// 链的相邻两段。留在 assembly 域的后果是本文件要反向 import
+// `modules::assembly::service` 才能调它 —— 又一处 `shared → modules` 方向违规。
+//
+// 形参 `<R: AssemblyRepoTrait>` 保持不变（**刻意不做泛型化**）：生产路径的
+// `R = &mut PgConnection`、单测路径的 `R = MockAssemblyRepoTrait` 都靠它收，
+// 这正是「可 mock」这条收益的来源。
+
+/// 实际聚合 + 翻转的核心；`sync_from_part_change_inner` / `sync_from_part_changes` 共用。
+///
+/// 2026-09-22 D-3 决策：保持自由函数（不挂在 `impl AssemblyService`），避免
+/// 跨 impl 块调用路径复杂化；签名与 `assembly::service::crud::fetch_current_batch_ids` 同形。
+///
+/// 2026-10-01：第三个形参由 `current: &CurrentUser` 收窄为 `updated_by: i64`
+/// —— 本函数只把它写进 `t_assembly.updated_by`，用不上 username / roles。
+pub(crate) async fn sync_assembly_status<R: AssemblyRepoTrait>(
+    repo: &mut R,
+    assembly_id: i64,
+    updated_by: i64,
+) -> Result<SyncOutcome, AppError> {
+    // 父存在性 + 终态短路
+    let asm = repo
+        .get_by_id(assembly_id, false)
+        .await
+        .map_err(AppError::from)?
+        .ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_ASSEMBLY_NOT_FOUND,
+                format!("assembly {assembly_id} 不存在"),
+            )
+        })?;
+    let current_status = AssemblyStatus::from_str(&asm.status).ok_or_else(|| {
+        AppError::biz(
+            code::BIZ_INVALID_VALUE,
+            format!("未知 assembly status: {}", asm.status),
+        )
+    })?;
+    if matches!(
+        current_status,
+        AssemblyStatus::COMPLETED | AssemblyStatus::CANCELLED
+    ) {
+        return Ok(SyncOutcome::NoChange);
+    }
+
+    // 聚合子件
+    let children_statuses = repo
+        .aggregate_children_status(assembly_id)
+        .await
+        .map_err(AppError::from)?;
+    let Some(target) = compute_assembly_target(children_statuses.iter().map(|s| s.as_str())) else {
+        return Ok(SyncOutcome::NoChange);
+    };
+
+    // target == current → NoChange
+    if target == current_status {
+        return Ok(SyncOutcome::NoChange);
+    }
+
+    // OCC 翻转
+    let affected = repo
+        .update_status_if_not_terminal(assembly_id, asm.version, target.as_str(), updated_by)
+        .await
+        .map_err(AppError::from)?;
+
+    // ==========================================================================
+    // 2026-10-01 派生层冲突降级（本函数最关键的一处行为修正）
+    // ==========================================================================
+    // 改造前：`affected == 0` 直接 `Err(VERSION_CONFLICT)`。该错误会沿
+    // `PartService::sync_from_batch_change` 一路上抛到 handler，把**整个事务**
+    // 回滚 —— 包括用户真正请求的那次批次状态变更。于是出现一个语义上完全
+    // 倒挂的故障：用户点了「送检 / 完成」，却被一个**派生缓存**（父装配件
+    // 的 `t_assembly.status`）的并发写否决，主操作什么都没发生，还收到一个
+    // 指向完全无关实体的 409。
+    //
+    // 判据：**派生层不允许否决主操作**。`t_assembly.status` 是缓存，缓存写失败
+    // 最多导致它短暂偏旧（下次任意 part 状态变化时由 `sync_assembly_status`
+    // 自动追平），代价远小于「用户的主操作被回滚」。故此处降级为
+    // `Ok(SyncOutcome::NoChange)` + `tracing::warn!`（留下可观测痕迹），
+    // 绝不返回 Err。
+    //
+    // 同理，`t_part.status`（`shared::batch::status` step 2）本来就是**不走 OCC 的派生写**，
+    // 冲突由行锁串行化而非报错 —— 两层派生的冲突策略现在是一致的。
+    if affected == 0 {
+        tracing::warn!(
+            assembly_id,
+            version = asm.version,
+            target = target.as_str(),
+            "assembly 派生写降级：version 已变化或已终态，跳过本次派生（不回滚主操作）"
+        );
+        return Ok(SyncOutcome::NoChange);
+    }
+    Ok(SyncOutcome::Changed(assembly_id))
 }
 
 /// 父装配件（`t_assembly`）终态序列号释放：**直接清，不归档**（理由见上）。

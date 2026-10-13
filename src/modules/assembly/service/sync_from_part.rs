@@ -3,15 +3,21 @@
 //! 当 part 状态变化时（worker_scan / pick-up / to-* / complete / 返修闭环 / 报工），
 //! `PartService::sync_from_batch_change` 在同一事务内调用
 //! `AssemblyService::sync_from_part_change(conn, part_id, current)` 闭合
-//! batch → part → assembly 链路。本文件承载该反向钩子的 3 个方法。
+//! batch → part → assembly 链路。本文件承载该反向钩子的 3 个 `_inner` 方法与
+//! 4 个 ZST 静态 wrapper；聚合 + 翻转的**实体实现**在
+//! `crate::shared::batch::status::sync_assembly_status`（2026-10-13 自本文件搬走）。
 //!
-//! ## 核心流程（per-assembly）
-//! 1. 反查 `part.assembly_id`（None → NoChange）
-//! 2. 父已是 COMPLETED/CANCELLED → NoChange（Python 短路 L92）
-//! 3. 拉子件 status → `compute_assembly_target` → Some(target)
-//! 4. 取父当前 version + status；target == 当前 → NoChange
-//! 5. `update_status_if_not_terminal`；0 行 → VERSION_CONFLICT（事务回滚）
-//! 6. 返回 `Changed(assembly_id)` —— handler 据此发 ASSEMBLY_UPDATED
+//! ## 核心流程（per-assembly，实体实现在 `shared::batch::status`）
+//! 1. 反查 `part.assembly_id`（None → NoChange）—— **本文件**的 `_inner` 做
+//! 2. 父已是 COMPLETED/CANCELLED → NoChange（Python 短路 L92）—— shared
+//! 3. 拉子件 status → `compute_assembly_target` → Some(target) —— shared
+//! 4. 取父当前 version + status；target == 当前 → NoChange —— shared
+//! 5. `update_status_if_not_terminal`；0 行 → **降级为 `NoChange` + `tracing::warn!`**
+//!    （**派生层不得否决主操作**，2026-10-01 review 第 1 轮）—— shared
+//! 6. 返回 `Changed(assembly_id)` —— handler 据此发 ASSEMBLY_UPDATED —— shared
+//!
+//! ⚠️ 第 5 步在 2026-10-01 之前是 `Err(VERSION_CONFLICT)`（事务回滚）。那会把用户
+//! 真正请求的批次状态变更一起回滚、还返回一个指向无关实体的 409。现在只 warn。
 //!
 //! ## 事务边界（2026-09-22 重构对齐 iam 范本）
 //! 事务移交 caller（part/service/rollup.rs 在自己的事务里调本方法）。service 不知事务——
@@ -25,8 +31,8 @@
 
 use crate::auth::rbac::CurrentUser;
 use crate::modules::assembly::repo::AssemblyRepoTrait;
-use crate::modules::assembly::statemachine::{AssemblyStatus, compute_assembly_target};
-use crate::shared::error::{AppError, code};
+use crate::shared::batch::status::sync_assembly_status;
+use crate::shared::error::AppError;
 
 use super::{AssemblyService, SyncOutcome};
 
@@ -103,91 +109,17 @@ impl AssemblyService {
     }
 }
 
-/// 实际聚合 + 翻转的核心；`sync_from_part_change_inner` / `sync_from_part_changes` 共用。
-///
-/// 2026-09-22 D-3 决策：保持 module-private 自由函数（不挂在 `impl AssemblyService`），避免
-/// 跨 impl 块调用路径复杂化；签名与 `crud.rs::fetch_current_batch_ids` 同形。
-///
-/// 2026-10-01：第三个形参由 `current: &CurrentUser` 收窄为 `updated_by: i64`
-/// —— 本函数只把它写进 `t_assembly.updated_by`，用不上 username / roles。
-async fn sync_assembly_status<R: AssemblyRepoTrait>(
-    repo: &mut R,
-    assembly_id: i64,
-    updated_by: i64,
-) -> Result<SyncOutcome, AppError> {
-    // 父存在性 + 终态短路
-    let asm = repo
-        .get_by_id(assembly_id, false)
-        .await
-        .map_err(AppError::from)?
-        .ok_or_else(|| {
-            AppError::biz(
-                code::BIZ_ASSEMBLY_NOT_FOUND,
-                format!("assembly {assembly_id} 不存在"),
-            )
-        })?;
-    let current_status = AssemblyStatus::from_str(&asm.status).ok_or_else(|| {
-        AppError::biz(
-            code::BIZ_INVALID_VALUE,
-            format!("未知 assembly status: {}", asm.status),
-        )
-    })?;
-    if matches!(
-        current_status,
-        AssemblyStatus::COMPLETED | AssemblyStatus::CANCELLED
-    ) {
-        return Ok(SyncOutcome::NoChange);
-    }
-
-    // 聚合子件
-    let children_statuses = repo
-        .aggregate_children_status(assembly_id)
-        .await
-        .map_err(AppError::from)?;
-    let Some(target) = compute_assembly_target(children_statuses.iter().map(|s| s.as_str())) else {
-        return Ok(SyncOutcome::NoChange);
-    };
-
-    // target == current → NoChange
-    if target == current_status {
-        return Ok(SyncOutcome::NoChange);
-    }
-
-    // OCC 翻转
-    let affected = repo
-        .update_status_if_not_terminal(assembly_id, asm.version, target.as_str(), updated_by)
-        .await
-        .map_err(AppError::from)?;
-
-    // ==========================================================================
-    // 2026-10-01 派生层冲突降级（本函数最关键的一处行为修正）
-    // ==========================================================================
-    // 改造前：`affected == 0` 直接 `Err(VERSION_CONFLICT)`。该错误会沿
-    // `PartService::sync_from_batch_change` 一路上抛到 handler，把**整个事务**
-    // 回滚 —— 包括用户真正请求的那次批次状态变更。于是出现一个语义上完全
-    // 倒挂的故障：用户点了「送检 / 完成」，却被一个**派生缓存**（父装配件
-    // 的 `t_assembly.status`）的并发写否决，主操作什么都没发生，还收到一个
-    // 指向完全无关实体的 409。
-    //
-    // 判据：**派生层不允许否决主操作**。`t_assembly.status` 是缓存，缓存写失败
-    // 最多导致它短暂偏旧（下次任意 part 状态变化时由 `sync_assembly_status`
-    // 自动追平），代价远小于「用户的主操作被回滚」。故此处降级为
-    // `Ok(SyncOutcome::NoChange)` + `tracing::warn!`（留下可观测痕迹），
-    // 绝不返回 Err。
-    //
-    // 同理，`t_part.status`（`shared::batch::status` step 2）本来就是**不走 OCC 的派生写**，
-    // 冲突由行锁串行化而非报错 —— 两层派生的冲突策略现在是一致的。
-    if affected == 0 {
-        tracing::warn!(
-            assembly_id,
-            version = asm.version,
-            target = target.as_str(),
-            "assembly 派生写降级：version 已变化或已终态，跳过本次派生（不回滚主操作）"
-        );
-        return Ok(SyncOutcome::NoChange);
-    }
-    Ok(SyncOutcome::Changed(assembly_id))
-}
+// ⚠️ 2026-10-13：聚合 + 翻转的**实体实现**已搬到
+// `crate::shared::batch::status::sync_assembly_status`（派生链最后一跳，与
+// `rollup_part_derived` / `rollup_assembly_derived` 同属一条链、放在同一层）。
+// 本文件保留 4 个 wrapper（`sync_from_part_change` / `sync_from_part_changes` /
+// `sync_from_part_change_by_id` / `recompute_assembly_status_by_id`）与其 3 个
+// `_inner` 方法，它们只做「反查 assembly_id → 调 shared 那份」。
+//
+// 保留 wrapper 而不是让 shared 反过来调这里的原因：本文件的入口签名收
+// `&CurrentUser`，而 `shared::batch::status` 的派生链手上只有 `updated_by`
+// （一个 i64）—— 在 shared 里伪造 `CurrentUser` 迟早会被下游的
+// `username` / `roles` 依赖带出真实 bug。
 
 // ---------- ZST 静态入口的兼容 wrapper ----------
 //
@@ -236,7 +168,8 @@ pub(crate) async fn sync_from_part_changes_dispatch(
 
 /// 2026-10-01 新增：按 `assembly_id` 直接重算一次聚合状态（admin 对账逃生口用）。
 ///
-/// 暴露本模块私有 [`sync_assembly_status`] 的唯一理由是
+/// 暴露（自 2026-10-13 起在 `shared::batch::status` 的）[`sync_assembly_status`]
+/// 的唯一理由是
 /// `POST /api/v2/admin/recompute-rollup` 需要「**从装配件出发**」跑一次聚合 ——
 /// 正常业务流永远是从 part 出发的（`sync_from_part_change*`），而对账场景要修的
 /// 恰恰是「part 侧派生已正确、但父装配件没跟上」这种反向漂移。

@@ -27,7 +27,8 @@
 //! | 域 | 经 shared 的哪个文件 | 读 / 写 | 入口 |
 //! |---|---|---|---|
 //! | `part` | `status` | **写** | `PartRepo::update_part_rollup`（`part` 派生列回填） |
-//! | `assembly` | `status` | **写** | `AssemblyService::sync_assembly_status`（父件派生级联） |
+//! | `assembly` | `status` | **写** | [`status::sync_assembly_status`]（父件聚合 + 翻转，**2026-10-13 自 `assembly::service` 搬进本文件**）；另经 `AssemblyService::sync_from_part_change_by_id` 这个 wrapper 入口 |
+//! | `assembly`（状态机纯函数） | `status` | 读 | `AssemblyStatus` / `compute_assembly_target`（同上搬移带入；二者是内存函数、零 DB） |
 //! | `iam` | `guards` | 读 | `ShelfRepo::get_by_id`（`validate_shelf_zone` 的存在 / 停用 / zone 三谓词在 Rust 层逐条判） |
 //! | `prod::process_chain` | `guards` | 读 | `ProcessChainRepo::resolve_step_id_by_process`（`optional_step_id`） |
 //!

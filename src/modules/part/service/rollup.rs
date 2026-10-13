@@ -61,9 +61,9 @@
 use sqlx::PgConnection;
 
 use crate::auth::rbac::CurrentUser;
-use crate::modules::assembly::service::SyncOutcome;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::shared::batch::status as batch_status;
+use crate::shared::batch::status::SyncOutcome;
 use crate::shared::error::AppError;
 
 use super::PartService;
