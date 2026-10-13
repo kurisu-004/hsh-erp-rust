@@ -8,14 +8,32 @@
 //!
 //! ```text
 //! run(state, token)
-//!   ├─ MailConfig::is_enabled() == false → info! + 直接 return（不注册任何 job）
 //!   ├─ JobScheduler::new()（0.15 已改成 async）+ spawn(scheduler.start())
-//!   ├─ reschedule_inner()：读配置 → schedule::to_cron() → 注册 / 替换 job
+//!   ├─ reschedule_inner()：读配置 → **解析发信通道** → schedule::to_cron() → 注册 job
 //!   └─ spawn(watcher)：await token.cancelled() → scheduler.shutdown()
 //! ```
 //!
 //! `POST /api/v2/mail-digest/config` 成功后由 handler 调 [`reschedule`]，
 //! **改完立刻生效、不必重启进程**。
+//!
+//! ## ⚠️ 判据从 env 换成 DB（2026-10-16）
+//!
+//! 原先 `run()` 的第一道闸是 `MailConfig::is_enabled()`，取值来自 env
+//! （`MAIL_DIGEST_ENABLED` + `MAIL_SMTP_USERNAME` / `_PASSWORD` / 发件人地址）。
+//! 那套 env 已随「邮箱改为页面内配置」整轮删除（凭据改由 `scheduled_task` 域的
+//! `t_mail_account` 提供），判据因此改成 [`service::sender_is_available`]：
+//! `t_mail_digest_config.enabled` 为 true **且** `sender_account_id` 指向一个
+//! 未软删邮箱。
+//!
+//! 它**不再**是 `run()` 的前置 return，而是搬进了 [`reschedule_inner`] 的
+//! `make_new` 闭包里（与 `enabled=false` / `MANUAL_ONLY` 同款）。两者的差别：
+//! `run()` 早退会跳过 `ensure_scheduler()` + watcher 注册，而走 `make_new` 的
+//! `None` 分支走的是 [`swap_job`] 的「**先摘旧 job**、再决定要不要挂新的」——
+//! 后者才是正确的形态：管理员配好邮箱之后**不必重启进程**就能让定时任务生效。
+//!
+//! ⚠️ 判据只到「邮箱行在不在」为止，**不**解密授权码：解密失败要等到真发信时才
+//! 暴露（`21701` + 流水里一行 `FAILED`）。理由与 `ConfigOut.smtp_configured`
+//! 同款 —— 解密失败的原因对「要不要注册 job」这个决定没有帮助。
 //!
 //! ## 时区：cron 走进程本地时区，所以「不显式指定」是真实的线上事故
 //!
@@ -174,20 +192,14 @@ struct NewJob {
 static SCHEDULER: OnceLock<MailDigestScheduler> = OnceLock::new();
 
 /// 后台任务入口（`src/main.rs` 里 `tokio::spawn`）。
+///
+/// ⚠️ **2026-10-16：这里不再有「未配置 SMTP 就早退」的前置闸**（env 那套已删除）。
+/// 调度器**总是**建起来，是否注册 job 由 [`reschedule_inner`] 读库后的判据决定
+/// （模块 doc 的「判据从 env 换成 DB」一节）。这样管理员配好邮箱 / 打开
+/// `enabled` 之后**不必重启进程**就能让定时任务生效 —— 而早退形态做不到这一点
+/// （它连 watcher 都不注册）。
 pub async fn run(state: Arc<AppState>, token: CancellationToken) {
-    // 第一道闸在 env（总闸 + 三项凭据），第二道在 DB（`t_mail_digest_config.enabled`）。
-    if !state.config.mail.is_enabled() {
-        info!(
-            "mail_digest: SMTP 未配置（MAIL_DIGEST_ENABLED / MAIL_SMTP_USERNAME / MAIL_SMTP_PASSWORD / 发件人地址），定时任务跳过"
-        );
-        return;
-    }
-    info!(
-        host = %state.config.mail.host,
-        port = state.config.mail.port,
-        tls_mode = %state.config.mail.tls_mode,
-        "mail_digest: 交期汇总邮件定时任务已启动"
-    );
+    info!("mail_digest: 交期汇总邮件定时任务已启动（是否注册 job 由配置决定）");
 
     let s = match ensure_scheduler().await {
         Ok(s) => s,
@@ -253,24 +265,21 @@ fn scheduler_cell() -> &'static tokio::sync::OnceCell<JobScheduler> {
 ///
 /// **幂等**：
 /// - 调度器不存在 ⇒ 懒创建（覆盖「先改配置、后启动任务」的顺序）；
-/// - `MANUAL_ONLY` 或 `enabled = false` ⇒ **移除**已注册的 job（并把 `job_id` 清空）；
+/// - `enabled = false` / `MANUAL_ONLY` / **无可用发信通道** ⇒ **移除**已注册的
+///   job（并把 `job_id` 清空）；
 /// - 其它 ⇒ 先移除旧 job 再注册新的（不泄漏）。
 ///
 /// ⚠️ 调用方是 HTTP handler，必须**永不 panic、永不把错误抛给调用方**：
 /// `JobScheduler::remove/add` 都是 async 且内部有锁，失败只记 warn —— 配置已经
 /// 落库，不该因为「调度没换上」而让保存接口返 500。
+///
+/// ⚠️ **2026-10-16 删掉了原先的 env-disabled 分支**（`if !state.config.mail
+/// .is_enabled() { remove_job(..); return }`）：env 那套已删除，而「配置改成不满足
+/// 条件」这个场景现在由 [`reschedule_inner`] 的 `make_new → None` 覆盖，且走的是
+/// **同一把闸** [`swap_job`]（原先那个分支若与并发的 `reschedule_inner` 各摘各的，
+/// 会出现「删了一个 job、另一个 reschedule 又挂上一个」而槽里记的却是刚被删掉的
+/// 那个 ⇒ 同样泄漏，review 第 2 轮 M1 的同源问题）。
 pub async fn reschedule(state: &Arc<AppState>) {
-    if !state.config.mail.is_enabled() {
-        // env 侧被关掉 ⇒ 把已注册的 job 也摘掉（可能有旧配置留下的 job）。
-        // ⚠️ 与 [`reschedule_inner`] 走**同一个闸**（`job_id` 锁）：本分支与并发
-        // 的另一次 `reschedule_inner` 若各摘各的，会出现「删了一个 job、另一个
-        // reschedule 又挂上一个」而槽里记的却是刚被删掉的那个 ⇒ 同样泄漏
-        // （review 第 2 轮 M1 的同源问题）。
-        if let Ok(s) = ensure_scheduler().await {
-            remove_job(&s.scheduler, &s.job_id).await;
-        }
-        return;
-    }
     let Ok(s) = ensure_scheduler().await else {
         return;
     };
@@ -296,8 +305,6 @@ async fn reschedule_inner(state: &Arc<AppState>, s: &'static MailDigestScheduler
                 return None;
             }
         };
-        drop(conn);
-
         if !cfg.enabled {
             info!("mail_digest: 配置未启用（enabled=false），不注册定时 job");
             return None;
@@ -306,6 +313,17 @@ async fn reschedule_inner(state: &Arc<AppState>, s: &'static MailDigestScheduler
             info!("mail_digest: 频率为 MANUAL_ONLY（仅手动），不注册定时 job");
             return None;
         }
+        // 2026-10-16 新增：第二道 DB 闸（取代原先的 env 闸）。
+        // ⚠️ 只判「邮箱行在不在」（`sender_is_available`），不真解密 —— 解密失败
+        // 要到发信那一刻才暴露，而那一次同样会落一行 FAILED 流水，可观测性不缺。
+        //
+        // ⚠️ **必须在 `drop(conn)` 之前**：那个 drop 会把 `PoolConnection` 移走，
+        // 之后再借 `&mut conn` 是 E0382。
+        if !service::sender_is_available(&mut conn, cfg.sender_account_id).await {
+            info!("mail_digest: 未选定可用的发信邮箱（sender_account_id 为空或已失效），不注册定时 job");
+            return None;
+        }
+        drop(conn);
 
         let cron = match schedule::to_cron(&NormalizedScheduleInput {
             frequency: cfg.frequency,
@@ -406,6 +424,18 @@ async fn swap_job<R: JobRegistry>(
 /// 摘掉已注册的 job（幂等：没注册过就是空操作）。
 ///
 /// 与 [`swap_job`] 取**同一把闸** ⇒ 不会与并发的 `reschedule_inner` 交错。
+///
+/// ⚠️ **2026-10-16 起是测试专用**（`#[cfg(test)]`）：原先生产路径有两处调它 ——
+/// `reschedule` 的 env-disabled 分支（env 已整轮删除，该分支随之删除）与
+/// `run()` 的早退。现在「配置不满足条件」一律由 [`swap_job`] 的
+/// 「**先摘旧 → 再决定挂不挂**」覆盖，而那条路径**内联**了同一段摘除逻辑，
+/// 于是本函数在生产侧**零调用方**。
+///
+/// **不删它的理由**：回归用例 `remove_job_and_swap_share_the_same_gate`
+/// （review 第 2 轮 M1 配套）守的是「槽与调度器恒一致」这个**并发不变式**，
+/// 它需要一条「只摘不挂」的独立入口才能构造出 interleaving。留着一个
+/// `#[cfg(test)]` 的辅助函数比删掉一条并发回归便宜。
+#[cfg(test)]
 async fn remove_job<R: JobRegistry>(reg: &R, job_id: &tokio::sync::Mutex<Option<uuid::Uuid>>) {
     let mut slot = job_id.lock().await;
     let Some(id) = slot.take() else {

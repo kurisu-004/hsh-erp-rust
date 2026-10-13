@@ -2,6 +2,7 @@
 //!
 //! 对应 Python myERP/core/ 下除 security/permission 之外的 infra 模块：
 //! - `config`：应用配置（dotenvy + env 读取）
+//! - `crypto`：AES-256-GCM 对称加解密（2026-10-16 新增，邮箱授权码加密入库用）
 //! - `db`：sqlx PgPool 构建
 //! - `seed`：seeds/ 目录声明式种子加载（2026-09-25 sqlx 接管新增）
 //! - `cos`：腾讯云 COS 抽象（trait + NoopCos 占位）
@@ -20,6 +21,7 @@ pub mod clock;
 pub mod config;
 pub mod cos;
 pub mod cos_opendal; // 2026-09-20 spike：OpenDAL S3 backend 替代 cos-rust-sdk 可行性验证
+pub mod crypto; // 2026-10-16 新增：邮箱授权码加密（AES-256-GCM）
 pub mod db;
 // 2026-09-28 新增：rust → python 后端转发 HTTP 客户端抽象（薄壳鉴权转发到 python STS 端点）。
 pub mod py_backend;

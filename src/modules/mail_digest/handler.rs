@@ -3,7 +3,9 @@
 //! 端点（挂在 `/api/v2/mail-digest`，由 [`router`] 桥接；**全部 Manager 独占**）：
 //! - `GET  /config` —— 读单例配置（表空 ⇒ 全部默认值 + `version=0` + `id="0"`）
 //! - `POST /config` —— 全量覆写（body **必含** `version`）+ 触发调度热重载
-//! - `GET  /meta`   —— 表单选项源（频率 / 列白名单 / 取值范围 / SMTP 公开信息）
+//! - `GET  /meta`   —— 内容与调度侧的表单选项源（频率 / 列白名单 / 取值范围）；
+//!   ⚠️ 2026-10-16 起**不再**含 `smtp` 段（发信通道改由 `scheduled_task` 域的
+//!   `/api/v2/mail/meta` + `/api/v2/mail/accounts` 提供）
 //! - `POST /preview`—— 按「当前配置 + 临时覆盖」渲染 HTML（**不发送、不落流水**）
 //! - `POST /send`   —— 手动触发（渲染 + 真发 + 落流水）
 //! - `GET  /logs`   —— 发送历史分页（`limit∈[1,200]` + `offset`）
@@ -28,7 +30,7 @@ use axum::{
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::modules::mail_digest::dto::{
     ColumnOption, ConfigOut, FrequencyOption, LogListOut, MetaOut, PreviewOut, PreviewRequest,
-    SaveConfigRequest, SendResultOut, SmtpPublicOut,
+    RangeOut, SaveConfigRequest, SendResultOut,
 };
 use crate::modules::mail_digest::service;
 use crate::shared::error::AppError;
@@ -59,7 +61,7 @@ pub async fn get_config(
 ) -> Result<Json<R<ConfigOut>>, AppError> {
     current.require_role(Role::Manager)?;
     let mut conn = state.pool.acquire().await?;
-    let out = service::get_config(&mut conn, &state.config.mail).await?;
+    let out = service::get_config(&mut conn).await?;
     Ok(Json(R::ok(out)))
 }
 
@@ -78,14 +80,7 @@ pub async fn save_config(
 ) -> Result<Json<R<ConfigOut>>, AppError> {
     current.require_role(Role::Manager)?;
     let mut conn = state.pool.acquire().await?;
-    let out = service::save_config(
-        &mut conn,
-        &req,
-        &current,
-        &state.snowflake,
-        &state.config.mail,
-    )
-    .await?;
+    let out = service::save_config(&mut conn, &req, &current, &state.snowflake).await?;
     drop(conn);
     crate::task::mail_digest::reschedule(&state).await;
     Ok(Json(R::ok(out)))
@@ -93,17 +88,15 @@ pub async fn save_config(
 
 /// `GET /api/v2/mail-digest/meta`
 ///
-/// Manager 独占。**表单的全部选项源都在这一个端点**（频率 / 列白名单 / 取值范围 /
-/// SMTP 公开信息 / 缺省值），前端不需要在任何地方硬编码一份枚举映射。
+/// Manager 独占。**内容与调度侧的表单选项源都在这一个端点**（频率 / 列白名单 /
+/// 取值范围 / 缺省值），前端不需要在任何地方硬编码一份枚举映射。
 ///
-/// ⚠️ `smtp` 段**绝不含 username / password**（本段原样进前端页面）；
-/// 含 `tls_mode` 是因为「收不到信」时第一件事就是看 TLS 模式配对没配对。
-pub async fn meta(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-) -> Result<Json<R<MetaOut>>, AppError> {
+/// ⚠️ **2026-10-16 删掉 `smtp` 段**：那些值（host / port / tls_mode / 发件地址 /
+/// 发件人名）已经逐条换了归属 —— 见 `dto::MetaOut` 的「原 `smtp.*` → 新的去处」
+/// 对照表。现在发信通道信息在 `GET /api/v2/mail/meta`（预设表）与
+/// `GET /api/v2/mail/accounts`（邮箱列表）两个端点里。
+pub async fn meta(current: CurrentUser) -> Result<Json<R<MetaOut>>, AppError> {
     current.require_role(Role::Manager)?;
-    let mail = &state.config.mail;
     let out = MetaOut {
         frequencies: crate::modules::mail_digest::dto::Frequency::ALL
             .iter()
@@ -123,17 +116,9 @@ pub async fn meta(
             })
             .collect(),
         defaults: service::config_defaults(),
-        upcoming_days_range: crate::modules::mail_digest::dto::RangeOut {
+        upcoming_days_range: RangeOut {
             min: crate::modules::mail_digest::dto::UPCOMING_DAYS_MIN,
             max: crate::modules::mail_digest::dto::UPCOMING_DAYS_MAX,
-        },
-        smtp: SmtpPublicOut {
-            configured: mail.is_enabled(),
-            host: mail.host.clone(),
-            port: mail.port,
-            tls_mode: mail.tls_mode.to_string(),
-            from_address: mail.from_address.clone(),
-            from_name: mail.from_name.clone(),
         },
     };
     Ok(Json(R::ok(out)))

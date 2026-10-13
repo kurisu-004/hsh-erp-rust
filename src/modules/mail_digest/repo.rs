@@ -261,7 +261,7 @@ pub async fn get_config(conn: &mut PgConnection) -> Result<Option<TMailDigestCon
         SELECT id, version, enabled, frequency, send_hour, send_minute, weekday,
                day_of_month, recipients, cc_recipients, include_overdue,
                include_upcoming, upcoming_days, visible_columns, subject_template,
-               created_at, created_by, updated_at, updated_by, deleted_at
+               sender_account_id, created_at, created_by, updated_at, updated_by, deleted_at
         FROM t_mail_digest_config
         WHERE deleted_at IS NULL
         ORDER BY id ASC
@@ -294,8 +294,8 @@ pub async fn insert_config(
             id, version, enabled, frequency, send_hour, send_minute, weekday,
             day_of_month, recipients, cc_recipients, include_overdue,
             include_upcoming, upcoming_days, visible_columns, subject_template,
-            created_at, created_by, updated_at, updated_by
-        ) VALUES ($1, 0, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $15, $16)
+            sender_account_id, created_at, created_by, updated_at, updated_by
+        ) VALUES ($1, 0, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $16, $17)
         "#,
     )
     .bind(id)
@@ -312,6 +312,7 @@ pub async fn insert_config(
     .bind(cfg.upcoming_days)
     .bind(cfg.visible_columns.iter().map(|c| c.as_str()).collect::<Vec<&str>>())
     .bind(cfg.subject_template.as_deref())
+    .bind(cfg.sender_account_id)
     .bind(now)
     .bind(operator)
     .execute(&mut *conn)
@@ -361,9 +362,10 @@ pub async fn update_config(
             upcoming_days    = $13,
             visible_columns  = $14,
             subject_template = $15,
+            sender_account_id = $16,
             version          = version + 1,
-            updated_at       = $16,
-            updated_by       = $17
+            updated_at       = $17,
+            updated_by       = $18
         WHERE id = $1 AND version = $2 AND deleted_at IS NULL
         "#,
     )
@@ -387,6 +389,7 @@ pub async fn update_config(
             .collect::<Vec<&str>>(),
     )
     .bind(cfg.subject_template.as_deref())
+    .bind(cfg.sender_account_id)
     .bind(now)
     .bind(operator)
     .execute(&mut *conn)

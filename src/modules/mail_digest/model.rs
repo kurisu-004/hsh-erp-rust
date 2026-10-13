@@ -41,6 +41,12 @@ pub struct TMailDigestConfig {
     pub upcoming_days: i32,
     pub visible_columns: Vec<String>,
     pub subject_template: Option<String>,
+    /// 2026-10-16 新增：发信邮箱（`t_mail_account.id`）；`None` = 未选邮箱。
+    ///
+    /// ⚠️ **无物理外键**（CLAUDE.md「DB 约定」）。指向已软删邮箱是可能发生的
+    /// （`scheduled_task` 域会拦删除，但那一次「查引用 → 删」之间有极窄窗口），
+    /// 读侧按 `None` 处理并以 `21701` 暴露。
+    pub sender_account_id: Option<i64>,
     pub created_at: NaiveDateTime,
     pub created_by: Option<i64>,
     pub updated_at: NaiveDateTime,

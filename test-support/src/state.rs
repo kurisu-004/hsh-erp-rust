@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 
 use hsh_erp_rust::auth::session::{RedisSessionStore, SessionStore};
 use hsh_erp_rust::infra::config::{
-    AppConfig, AutoCompleteConfig, CosBackend, CosConfig, JwtConfig, MailConfig,
+    AppConfig, AutoCompleteConfig, CosBackend, CosConfig, JwtConfig, MailAccountSecret,
     PythonBackendConfig, RedisConfig as AppRedisConfig, SnowflakeConfig, WeComConfig,
 };
 use hsh_erp_rust::infra::cos::{CosClient, NoopCos, ObjectMeta};
@@ -168,9 +168,10 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
         python_backend: PythonBackendConfig::default(),
         // 2026-09-29 新增：企业微信登录配置默认未配置（enabled=false）。
         wecom: WeComConfig::default(),
-        // 2026-10-13 新增：SMTP 默认未配置（is_enabled()=false）——
-        // 测试进程不该真去连企业邮 SMTP。
-        mail: MailConfig::default(),
+        // 2026-10-16：邮箱授权码的加密主密钥。测试用 `Default` 的占位密钥
+        // （`[0x5A; 32]`）——它只是让 `crypto::seal` 在集成测试里能跑通，
+        // 绝不指向任何真数据；生产路径由 `AppConfig::from_env` 强制 env 存在且合法。
+        mail_account_secret: MailAccountSecret::default(),
     });
     // 2026-10-09：AppState 复用全进程共享 generator（`shared_test_snowflake()`），与
     // fixture helper 发出的 ID 同流。此前每个 `test_state*` 各建一个 generator、且
@@ -364,9 +365,10 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
         python_backend: PythonBackendConfig::default(),
         // 2026-09-29 新增：企业微信登录配置默认未配置（enabled=false）。
         wecom: WeComConfig::default(),
-        // 2026-10-13 新增：SMTP 默认未配置（is_enabled()=false）——
-        // 测试进程不该真去连企业邮 SMTP。
-        mail: MailConfig::default(),
+        // 2026-10-16：邮箱授权码的加密主密钥。测试用 `Default` 的占位密钥
+        // （`[0x5A; 32]`）——它只是让 `crypto::seal` 在集成测试里能跑通，
+        // 绝不指向任何真数据；生产路径由 `AppConfig::from_env` 强制 env 存在且合法。
+        mail_account_secret: MailAccountSecret::default(),
     });
     // 2026-10-09：AppState 复用全进程共享 generator（`shared_test_snowflake()`），与
     // fixture helper 发出的 ID 同流。此前每个 `test_state*` 各建一个 generator、且
@@ -528,9 +530,10 @@ pub async fn test_state_with_cos(
         python_backend: PythonBackendConfig::default(),
         // 2026-09-29 新增：企业微信登录配置默认未配置（enabled=false）。
         wecom: WeComConfig::default(),
-        // 2026-10-13 新增：SMTP 默认未配置（is_enabled()=false）——
-        // 测试进程不该真去连企业邮 SMTP。
-        mail: MailConfig::default(),
+        // 2026-10-16：邮箱授权码的加密主密钥。测试用 `Default` 的占位密钥
+        // （`[0x5A; 32]`）——它只是让 `crypto::seal` 在集成测试里能跑通，
+        // 绝不指向任何真数据；生产路径由 `AppConfig::from_env` 强制 env 存在且合法。
+        mail_account_secret: MailAccountSecret::default(),
     });
     // 2026-10-09：AppState 复用全进程共享 generator（`shared_test_snowflake()`），与
     // fixture helper 发出的 ID 同流。此前每个 `test_state*` 各建一个 generator、且
