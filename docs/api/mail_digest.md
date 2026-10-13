@@ -32,7 +32,7 @@
 > ⑥表格列要对齐，支持打印」（⑤ COS 预览链接 / 批量 CI 本轮不做）。落在 §2.3（白名单
 > 11 → 13 项）、§2.4（批次子行逐字段）、§4.4（工单-批次行结构）、§4.5（位置口径）、
 > §4.6（列对齐与打印）、§4.7（取数恒 ≤ 3 条语句）、§5（状态中文与三副本同步）、§6（拆掉
-> dashboard `DELIVERY_STATUSES` 共用）、§8.1（现读 7 张表）、§8.2（前端**零改动**）。
+> dashboard `DELIVERY_STATUSES` 共用）、§8.1（读 / 写的表清单）、§8.2（前端**零改动**）。
 
 ## 1. 端点表
 
@@ -285,7 +285,7 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
 | | dashboard | mail_digest |
 |---|---|---|
 | 每桶行数上限 | `LIMIT 30`（`DELIVERY_BUCKET_LIMIT`，大屏一屏放不下） | **无 LIMIT**（邮件必须给全量 —— 漏一条交期就是漏一个客户） |
-| 取哪些列 | 9 列（无 `drawing_no` / `order_no`） | 10 列（邮件要图号 / 订单号） |
+| 取哪些列 | 原样 `p.customer_id`（客户名另有批量聚合） | `customer_id` 换成同一条 SQL 里 `LEFT JOIN` 来的 `customer_name`，**另多取** `drawing_no` / `order_no`（邮件要图号 / 订单号） |
 | 未来节窗口 | `>= today`，**无上界** | **`[today, today+N)` 半开区间**，`N = upcoming_days` clamp `1..60` |
 | 逾期节窗口 | （KPI 另算） | `system_delivery_date < today` —— **含今天之前、不含今天**（今天的交期属未来节的「今日」组） |
 | 客户名 | 单独批量聚合（防 N+1） | 本 SQL 里 `LEFT JOIN` 一次带出 |
@@ -367,6 +367,11 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
   退回自适应，等于白做。
 - **`<colgroup>` 每张子表各一份**：分组渲染会开多张子表，`<colgroup>` 是表内元素、
   不跨表共享。
+- ⚠️ **表头每组一张、且与 `<colgroup>` 在同一张 `<table>` 里**（2026-10-16）：`<colgroup>`
+  只对它**所在那张表**的列宽生效；表头若留在外层表里，那行 `<th>` 就由另一套布局算法定宽 ⇒
+  「横向扫行对得上」在表头这一行不成立，需求⑥要的列对齐只剩数据行那几行。所以表头
+  **每组重复一次是故意**的、**不是**冗余，别看到重复就「优化」回节级一行。回归：
+  `template.rs::tests::header_row_shares_table_with_colgroup`。
 - **不写 `@media print`**：邮件客户端（企业邮 / QQ 邮箱）会把 `<style>` 块**整块剥掉**，
   写进去等于什么都没写 ⇒ 全部样式**内联**。
 - **底色在打印路径里会丢**：`background-color` 遇到部分打印路径 / Outlook 桌面版会被
@@ -455,7 +460,8 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
 - **批次子行的渲染**：结构见 §4.4、位置文案见 §4.5、列宽与打印见 §4.6。回归：
   `template.rs::tests::batch_sub_rows_follow_their_own_order_row` /
   `batch_sub_row_fills_only_four_columns` / `print_attributes_present_and_no_style_block` /
-  `colgroup_widths_sum_to_one_hundred` / `colspan_matches_column_count_with_all_columns`。
+  `colgroup_widths_sum_to_one_hundred` / `colspan_matches_column_count_with_all_columns` /
+  `header_row_shares_table_with_colgroup`。
 
 ## 5. 状态域约定（无编译期保障）
 
@@ -539,7 +545,7 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
 
 ## 8. 表依赖与前端配套
 
-### 8.1 读 / 写的表（**现读 7 张**，2026-10-16 批次与位置列新增 3 张）
+### 8.1 读 / 写的表（**清单即下表**；2026-10-16 批次与位置列新增 3 张 holder 表）
 
 | 用途 | 表 | 本域关系 |
 |---|---|---|
@@ -554,8 +560,11 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
 | **工人 `name`** | `t_worker` | **2026-10-16 新增**。同上（`location = 'WORKER'` 时参与匹配） |
 | **外协公司 `name`** | `t_outsource_company` | **2026-10-16 新增**。同上（`location = 'OUTSOURCE_COMPANY'` 时参与匹配） |
 
-⚠️ **计数副本：现读 7 张别域表 + 2 张自有表 = 9 张。** 三张新表**不是新依赖**，它们只
-在 `repo::list_batches` 一条 SQL 里以 `LEFT JOIN` 出现（§4.7），且全部是**展示用附表**
+⚠️ **张数以本节表格为准，不在正文写死**：别域表 = 统计用的 `t_part` / `t_assembly` /
+`t_part_batch` / `t_customer` 四张，加位置解析用的三张 holder 表（`t_shelf` /
+`t_worker` / `t_outsource_company`），再加通道域那一行 `t_mail_account`；自有表两张。
+三张 holder 表**不是新依赖**，它们只在 `repo::list_batches` 一条 SQL 里以 `LEFT JOIN` 出现
+（§4.7），且全部是**展示用附表**
 （同 `prod::inspection` 的既有取舍：给不给软删闸门由「该不该出现在邮件里」决定，本域对
 三张都判软删 —— 软删的货架 / 工人 / 外协厂**不该**出现在邮件里）。
 

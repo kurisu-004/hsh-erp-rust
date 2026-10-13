@@ -7,7 +7,9 @@
 //!
 //! ## 反例：统计查询的行**不是** `T*`
 //! 邮件正文的每一行是「`t_part` 一行 UNION ALL `t_assembly` 一行」的**读侧自定义列集**
-//! （10 列，两张表的列名与类型都不同、装配件额外标 `row_type`），本域不拥有
+//! （相对 dashboard 侧那份**多取 `drawing_no` / `order_no`**，并把 `customer_id` 换成
+//! `LEFT JOIN` 来的 `customer_name`；两张表的列名与类型都不同、装配件额外标
+//! `row_type`），本域不拥有
 //! `t_part` / `t_assembly`，故那种行结构叫 [`DigestRow`]、**刻意不起 `T*` 名**，
 //! 定义在 `repo.rs`（与 `prod::inspection::model` 的窄投影范式一致）。
 //! 起 `T*` 名会让「哪一列是端点要的」这件事被「这是本域 owned 表的全列」这个

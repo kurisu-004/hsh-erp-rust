@@ -6,14 +6,21 @@
 //!    —— 多工单多批次**全部**出现在 HTML 里，且**紧跟**各自的工单行
 //! 2. `preview_attaches_child_batches_to_assembly_row`
 //!    —— 装配件的批次挂在**子件**上，必须归到装配件行下面（主查询口径与批次查询逐字一致）
-//! 3. `preview_renders_each_holder_location_in_chinese`
-//!    —— 四种 `location` 各渲染对应中文（货架 code / 品检 code / 工人名 / 外协厂名）
+//! 3. `preview_renders_each_holder_location_in_chinese` +
+//!    `preview_soft_deleted_holder_degrades_to_dash`
+//!    —— 四种 `location` 各渲染对应中文（货架 code / 品检 code / 工人名 / 外协厂名）；
+//!    holder 行已软删时**批次行不丢**、位置降级成 `—`（软删闸门在 `ON` 里而非 `WHERE`）
 //! 4. `list_batches_accepts_empty_id_arrays`
 //!    —— 两个 id 集合任一为空（乃至都为空）都不炸，且另一侧照常返回
 //! 5. `preview_unknown_column_still_rejected_and_known_ones_render`
 //!    —— 白名单仍是封闭枚举：新增的两列可勾、未知列仍 `21704`
-//! 6. `preview_chinese_status_and_batch_location_are_escaped`
-//!    —— 批次侧的 holder 名（用户输入）同样过 HTML 转义
+//! 6. `preview_chinese_status_and_batch_location_are_escaped` +
+//!    `preview_repairing_batch_renders_repairing_label`
+//!    —— 批次侧的 holder 名（用户输入）同样过 HTML 转义；`is_repairing = true` 的批次
+//!    状态渲成「返修中」，而工单行**没有**这条信息（`t_part` 上没这列）
+//! 7. `mixed_delivered_and_open_batches_follow_the_opposite_two_rules`
+//!    —— 工单行守卫（任一批次已交 ⇒ 整行不出现）与批次过滤（不按状态，`CANCELLED` 照列）
+//!    **方向相反**，两条钉在同一个用例里
 //!
 //! ## 本文件**不**守的东西
 //!

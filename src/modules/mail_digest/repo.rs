@@ -17,7 +17,7 @@
 //! | | dashboard | mail_digest（本文件） |
 //! |---|---|---|
 //! | 每桶上限 | `LIMIT 30`（`DELIVERY_BUCKET_LIMIT`） | **无 LIMIT** |
-//! | 取哪些列 | 9 列（无 `drawing_no` / `order_no`） | 10 列（邮件要图号 / 订单号） |
+//! | 取哪些列 | 原样 `p.customer_id`（客户名另有批量聚合） | `customer_id` 换成同一条 SQL 里 `LEFT JOIN` 来的 `customer_name`，**另多取** `drawing_no` / `order_no`（邮件要图号 / 订单号） |
 //! | 未来节窗口 | `>= today` 无上界（`upcoming` 桶） | `[today, today+N)`，N clamp 1..60 |
 //! | 客户名 | 单独批量聚合（防 N+1） | 本 SQL 里 `LEFT JOIN` 一次带出 |
 //!
@@ -125,9 +125,16 @@ pub struct DigestRow {
     ///
     /// 由 [`list_batches`] 一次拉回后按 `(row_type, id)` 在 Rust 侧分组装进来
     /// （见 `service::fetch_rows`）⇒ 工单数、批次数都不会让语句数变多。
-    /// ⚠️ **含终态批次**（`DELIVERED` / `COMPLETED` / `CANCELLED`）：用户要的是
-    /// 「对应的**所有**批次」，终态批次同样占一行，只是位置列为空（见
-    /// [`DigestBatchRow::holder_name`]）。无批次时是空数组（渲染层不渲子行）。
+    /// ⚠️ **不过滤状态**（用户要的是「对应的**所有**批次」），但这与**工单行**的
+    /// 已交量守卫方向相反：守卫是 `NOT EXISTS（任一批次 `status IN
+    /// ('DELIVERED','COMPLETED')`）` ⇒ **一件交过，整个工单行就不出现**
+    /// ⇒ 工单行一旦出现，它名下**不可能**有 `DELIVERED` / `COMPLETED` 批次，
+    /// 「不过滤状态」实际只对 `CANCELLED` 这类**非交割终态**批次有意义（照列）。
+    /// ⚠️ 终态批次的位置列恒渲成 `—` 是**另一条**事实（迁移出厂即清
+    /// `location` / `current_holder_id`，见 [`DigestBatchRow::holder_name`]），
+    /// 不要与上一条混成一句。
+    /// 无批次时是空数组（渲染层不渲子行）。回归：
+    /// `tests/mail_digest/batches.rs::mixed_delivered_and_open_batches_follow_the_opposite_two_rules`。
     pub batches: Vec<DigestBatchRow>,
 }
 
@@ -355,7 +362,11 @@ pub async fn list_upcoming(
     .map(|rows| rows.into_iter().map(DigestRow::from).collect())
 }
 
-/// 一次拉回给定工单的**全部**批次（含终态），holder 名在**同一条 SQL**里解析完。
+/// 一次拉回给定工单的**全部**批次（不按状态过滤），holder 名在**同一条 SQL**里解析完。
+///
+/// ⚠️ 入参 id 全部来自已带已交量守卫的主查询 ⇒ 名下**不可能**有 `DELIVERED` /
+/// `COMPLETED` 批次，「不按状态过滤」实际只对 `CANCELLED` 这类**非交割终态**有意义；
+/// 本函数自己**不加**状态谓词（守卫属于主查询，见 [`DigestRow::batches`]）。
 ///
 /// 参数：
 /// - `part_ids`：散件工单 id 集合（主查询 `row_type='PART'` 的那些）；

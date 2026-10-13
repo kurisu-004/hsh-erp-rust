@@ -74,9 +74,11 @@
 //!
 //! 本域有两类对别域的依赖，**没有一类**适合 `assert_no_foreign_domain`：
 //!
-//! 1. **只读聚合别域的表**（`t_part` / `t_assembly` / `t_part_batch` / `t_customer`，
-//!    四张）：那是本仓既定 pattern（同 `dashboard` / `statistics` / `admin`），
-//!    统计 SQL 完全在本域内写全（[`repo`]），不 import 他域的 service / repo。
+//! 1. **只读聚合别域的表**（`t_part` / `t_assembly` / `t_part_batch` / `t_customer`
+//!    四张，另加批次位置解析用的 `t_shelf` / `t_worker` / `t_outsource_company`）：
+//!    那是本仓既定 pattern（同 `dashboard` / `statistics` / `admin`），统计 SQL 完全在
+//!    本域内写全（[`repo`]），不 import 他域的 service / repo。⚠️ **张数刻意不写死**
+//!    （加表即过期），完整清单以 `docs/api/mail_digest.md` §8.1 的表格为准。
 //! 2. **读 `scheduled_task` 域的 `t_mail_account`**（2026-10-16 新增）：这条**确实**
 //!    是 `use crate::modules::scheduled_task::{dto, repo}` 形式的跨域引用 ——
 //!    护栏若装上会当场红。
