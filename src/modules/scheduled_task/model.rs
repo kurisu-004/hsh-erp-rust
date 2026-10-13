@@ -17,7 +17,12 @@
 use chrono::NaiveDateTime;
 
 /// `t_mail_account` 全列投影（邮箱实体；软删 + OCC）。
-#[derive(Debug, Clone, sqlx::FromRow)]
+///
+/// ⚠️ **刻意不 derive `Debug`，手写一个屏蔽 `encrypted_secret`**：derive 版会让任何一处
+/// `{row:?}` / `dbg!(&row)` 把密文原文写进日志，而本仓对含凭据的类型一律走手写
+/// `Debug`（`infra::config::MailAccountSecret` / `WeComConfig`、`mail_digest::mailer
+/// ::ResolvedSender` 同一手法）—— 不靠「调用方记得别打印」这条约定。
+#[derive(Clone, sqlx::FromRow)]
 pub struct TMailAccount {
     pub id: i64,
     pub version: i32,
@@ -43,4 +48,28 @@ pub struct TMailAccount {
     pub updated_at: NaiveDateTime,
     pub updated_by: Option<i64>,
     pub deleted_at: Option<NaiveDateTime>,
+}
+
+/// 手写 `Debug`：屏蔽 `encrypted_secret`（2026-10-16，与 `MailAccountSecret` 同款）。
+///
+/// ⚠️ `encrypted_secret` 的值是 `base64(nonce‖ct‖tag)`，它**可被 base64 解码** ⇒ 打进
+/// 日志等于泄漏授权码。字段顺序与声明顺序一致，便于和 derive 版对照阅读。
+impl std::fmt::Debug for TMailAccount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TMailAccount")
+            .field("id", &self.id)
+            .field("version", &self.version)
+            .field("name", &self.name)
+            .field("preset", &self.preset)
+            .field("account", &self.account)
+            // ⚠️ 永远输出 `***`
+            .field("encrypted_secret", &"***")
+            .field("is_default", &self.is_default)
+            .field("created_at", &self.created_at)
+            .field("created_by", &self.created_by)
+            .field("updated_at", &self.updated_at)
+            .field("updated_by", &self.updated_by)
+            .field("deleted_at", &self.deleted_at)
+            .finish()
+    }
 }

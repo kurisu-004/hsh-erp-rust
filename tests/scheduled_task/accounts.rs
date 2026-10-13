@@ -8,7 +8,8 @@ use serde_json::{Value, json};
 
 use crate::{
     Ctx, assert_biz_code, bootstrap, create_account, create_body, get_as_manager, id_of,
-    open_with_test_key, post_as_clerk, post_as_manager, post_raw, stored_secret, unique_name,
+    open_with_test_key, post_as_clerk, post_as_manager, post_raw, stored_name_and_version,
+    stored_secret, unique_name,
 };
 
 // ===========================================================================
@@ -263,6 +264,111 @@ async fn update_with_new_secret_reencrypts() {
     assert_eq!(open_with_test_key(&sealed_after), "zzzzzz9999999999");
 }
 
+/// ★ 改名撞上另一个**存活**邮箱的名字 ⇒ `21707` + 409，**不是** 500，也不是 40901。
+///
+/// 这条钉的是「写侧的 `is_unique_violation` 映射**在 update 路径也在**」：漏了它，
+/// sqlx 的 `Database(23505)` 会一路冒到 `AppError::Database` ⇒ 前端只看到一句
+/// 「数据库错误」，连「重名了」这个可执行结论都拿不到（`docs/api/mail.md` §2.4 承诺
+/// 的是 21707）。回归 `service.rs::update_account` 里那个 `Err(e) if
+/// is_unique_violation(&e)` 分支。
+#[tokio::test]
+async fn update_name_to_a_live_duplicate_returns_21707_and_keeps_row_intact() {
+    let ctx = bootstrap().await;
+    let taken = unique_name("已被占");
+    create_account(&ctx, &taken).await;
+    let mine = create_account(&ctx, &unique_name("要改名")).await;
+    let sealed_before = stored_secret(&ctx.pool, id_of(&mine)).await;
+    let (name_before, ver_before) = stored_name_and_version(&ctx.pool, id_of(&mine)).await;
+
+    let (status, env) = post_as_manager(
+        &ctx,
+        &format!("/mail/accounts/{}", id_of(&mine)),
+        json!({
+            "version": mine["version"],
+            "name": taken,          // ← 撞 uk_t_mail_account_name_alive
+            "preset": "NET_EASE_163",
+            "account": "ops@163.com",
+        }),
+    )
+    .await;
+    assert_biz_code(status, &env, 21707, StatusCode::CONFLICT);
+
+    // 失败的那次写**一个字都不能改**：名字、版本、密文都原样
+    let (name_after, ver_after) = stored_name_and_version(&ctx.pool, id_of(&mine)).await;
+    assert_eq!(name_before, name_after, "被拒的改名不该落到库里");
+    assert_eq!(ver_before, ver_after, "被拒的写不该推进 version");
+    assert_eq!(
+        stored_secret(&ctx.pool, id_of(&mine)).await,
+        sealed_before,
+        "被拒的写不该重写密文"
+    );
+}
+
+/// ⚠️ 非空 `secret` 里的**控制字符** ⇒ `21704`，且密文逐字未变。
+///
+/// 改档是绕过「建档时那道闸」的旁路：CR/LF 会进 SMTP `AUTH` 命令行（凭据注入面），
+/// 而 `validate_secret` 的 doc 就是这么写的。只有 create 校验 = 留了个后门。
+#[tokio::test]
+async fn update_secret_with_control_chars_returns_21704_and_keeps_ciphertext() {
+    let ctx = bootstrap().await;
+    let created = create_account(&ctx, &unique_name("控制字符")).await;
+    let sealed_before = stored_secret(&ctx.pool, id_of(&created)).await;
+    let (_, ver_before) = stored_name_and_version(&ctx.pool, id_of(&created)).await;
+
+    let (status, env) = post_as_manager(
+        &ctx,
+        &format!("/mail/accounts/{}", id_of(&created)),
+        json!({
+            "version": created["version"],
+            "name": created["name"],
+            "preset": "NET_EASE_163",
+            "account": "ops@163.com",
+            "secret": "abcdef\r\nX-Evil: 1",   // ← 控制字符
+        }),
+    )
+    .await;
+    assert_biz_code(status, &env, 21704, StatusCode::BAD_REQUEST);
+
+    let sealed_after = stored_secret(&ctx.pool, id_of(&created)).await;
+    assert_eq!(sealed_before, sealed_after, "被拒的授权码不得落库");
+    assert_eq!(open_with_test_key(&sealed_after), "abcdef1234567890");
+    assert_eq!(
+        stored_name_and_version(&ctx.pool, id_of(&created)).await.1,
+        ver_before,
+        "被拒的写不该推进 version"
+    );
+}
+
+/// ⚠️ 非空 `secret` 超长（201 字 > `SECRET_MAX_CHARS` = 200）⇒ `21704`。
+///
+/// 这一条与控制字符是**同一个缺口的两端**：`SECRET_MAX_CHARS` 此前只在 create 生效，
+/// 于是「建一个短码、再改成超长码」能把任意长度的串塞进 `encrypted_secret` 列。
+#[tokio::test]
+async fn update_secret_over_200_chars_returns_21704() {
+    let ctx = bootstrap().await;
+    let created = create_account(&ctx, &unique_name("超长授权码")).await;
+    let sealed_before = stored_secret(&ctx.pool, id_of(&created)).await;
+
+    let (status, env) = post_as_manager(
+        &ctx,
+        &format!("/mail/accounts/{}", id_of(&created)),
+        json!({
+            "version": created["version"],
+            "name": created["name"],
+            "preset": "NET_EASE_163",
+            "account": "ops@163.com",
+            "secret": "x".repeat(201),
+        }),
+    )
+    .await;
+    assert_biz_code(status, &env, 21704, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        stored_secret(&ctx.pool, id_of(&created)).await,
+        sealed_before,
+        "被拒的超长授权码不得落库"
+    );
+}
+
 /// OCC：body **缺** `version` ⇒ HTTP **422 纯文本**（axum `Json` 提取器，
 /// 不是业务信封 —— 前端拿不到 `code` 字段）。
 #[tokio::test]
@@ -370,6 +476,50 @@ async fn set_default_requires_version() {
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{raw}");
     assert!(!raw.contains("\"code\""), "422 是纯文本：{raw}");
+}
+
+/// ⚠️ **两个管理员并发对不同邮箱点置默认 ⇒ 绝不返 500**。
+///
+/// 两个事务各自看不见对方未提交的结果，后到者的 `promote_to_default` 会撞
+/// `uk_t_mail_account_one_default`（23505）—— 事务消不掉这个窗口（见
+/// `service::set_default_account` 的 doc 与 `docs/api/mail.md` §4.3）。故断言的是
+/// **允许的结果集合**：两个都成功（串行执行时本该如此）**或** 一个成功、另一个
+/// `40901`；**任何 5xx 都是回归**（那一支原来会变成「数据库错误」500）。
+#[tokio::test]
+async fn concurrent_set_default_on_two_accounts_never_returns_500() {
+    let ctx = bootstrap().await;
+    let a = create_account(&ctx, &unique_name("并发甲")).await;
+    let b = create_account(&ctx, &unique_name("并发乙")).await;
+
+    let path_a = format!("/mail/accounts/{}/set-default", id_of(&a));
+    let path_b = format!("/mail/accounts/{}/set-default", id_of(&b));
+    let (ra, rb) = tokio::join!(
+        post_as_manager(&ctx, &path_a, json!({ "version": a["version"] })),
+        post_as_manager(&ctx, &path_b, json!({ "version": b["version"] })),
+    );
+
+    let mut ok_count = 0;
+    for (who, (status, env)) in [("甲", ra), ("乙", rb)] {
+        match status {
+            StatusCode::OK => ok_count += 1,
+            StatusCode::CONFLICT => assert_biz_code(status, &env, 40901, StatusCode::CONFLICT),
+            other => panic!("{who}：只允许 200 或 40901（绝不能是 5xx），实际 {other}：{env}"),
+        }
+    }
+    assert_eq!(
+        ok_count, 1,
+        "两次并发置默认只可能有一个赢家（40901 分支之外的兜底）"
+    );
+
+    // 终态：唯一索引兜底 ⇒ 至多一个默认，且确实有一个
+    let (status, env) = get_as_manager(&ctx, "/mail/accounts").await;
+    assert_eq!(status, StatusCode::OK, "{env}");
+    let items = env["data"]["items"].as_array().expect("items 是数组");
+    let defaults = items
+        .iter()
+        .filter(|i| i["is_default"] == json!(true))
+        .count();
+    assert_eq!(defaults, 1, "并发之后仍须有且仅有一个默认邮箱：{env}");
 }
 
 // ===========================================================================

@@ -170,7 +170,9 @@ const TARGET_CODES: [&str; 3] = ["process_work_type", "part_process_chain", "wor
 /// （menu.sql §3.1 的 `settings_root`、§3.5 的 `delivery_dispatch`）后的全量 live 授权
 /// code 快照，**31 项**（2026-10-13 新增 `mail_group` + `mail_digest`：交期汇总邮件
 /// 的顶级分组与子菜单，域 `mail_digest` 的 6 端点全部 MANAGER 独占，只归管理员；
-/// 2026-10-14 新增 `roles_list`：RBAC 角色面板，8 端点同样 MANAGER 独占）。
+/// 2026-10-14 新增 `roles_list`：RBAC 角色面板，8 端点同样 MANAGER 独占；
+/// 2026-10-16 菜单结构改版：`mail_group` / `mail_digest` **换 code** 为
+/// `scheduled_task` / `mail`，**项数与授权范围逐条不变**、只是改名）。
 const MANAGER_EXPECTED: &[&str] = &[
     "applicants_list",
     "assemblies_list",
@@ -181,8 +183,7 @@ const MANAGER_EXPECTED: &[&str] = &[
     "floor_group",
     "home",
     "inspection_pending",
-    "mail_digest",
-    "mail_group",
+    "mail",
     "order_group",
     "outsource_companies_list",
     "outsource_list",
@@ -198,6 +199,7 @@ const MANAGER_EXPECTED: &[&str] = &[
     "production_stats",
     "repair_receive",
     "roles_list",
+    "scheduled_task",
     "shelves_list",
     "template_management",
     "users_list",
@@ -247,7 +249,8 @@ const CNC_PROGRAMMER_EXPECTED: &[&str] = &["home", "parts_list", "pending_progra
 const SHELF_ACCOUNT_EXPECTED: &[&str] = &["floor_group", "home", "scan_badge"];
 
 /// 5 份快照 = 31 + 16 + 8 + 3 + 3 = **61 条 live 授权**（31 = 28 + 2026-10-13 新增
-/// 的 `mail_group` / `mail_digest` + 2026-10-14 新增的 `roles_list`）。
+/// 的邮件两个 code + 2026-10-14 新增的 `roles_list`；邮件那两个 code 2026-10-16 换了名，
+/// 仍是两项）。
 const EXPECTED_SNAPSHOT: [(&str, &[&str]); 5] = [
     ("MANAGER", MANAGER_EXPECTED),
     ("CLERK", CLERK_EXPECTED),

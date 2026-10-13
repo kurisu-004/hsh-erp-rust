@@ -198,6 +198,28 @@ fn account_out_serializes_id_as_string() {
     );
 }
 
+/// ★ **表行模型的 `Debug` 必须屏蔽密文**（与 `MailAccountSecret` / `ResolvedSender` 同款）。
+///
+/// 这是「不靠约定靠类型」的回归闸：只要有人把 `impl Debug` 删掉改回
+/// `#[derive(Debug)]`，本测试立刻红；而那之后任何一处 `{row:?}` 都会把授权码密文写进
+/// 日志（密文是 base64，可解码）。
+#[test]
+fn account_row_debug_masks_ciphertext() {
+    let row = sample_row();
+    let dbg = format!("{row:?}");
+    assert!(
+        !dbg.contains(&row.encrypted_secret),
+        "表行 Debug 泄漏了密文：{dbg}"
+    );
+    assert!(
+        dbg.contains("encrypted_secret: \"***\""),
+        "密文应固定显示为 ***：{dbg}"
+    );
+    // 排障需要的非敏感字段仍可见（否则这条 Debug 等于没用）
+    assert!(dbg.contains("ops@163.com"), "account 应可见：{dbg}");
+    assert!(dbg.contains("汇森告警邮箱"), "name 应可见：{dbg}");
+}
+
 /// 库里存了未知 preset（手工改库 / 加了预设没同步）时**降级而不丢行**：
 /// 列表页整体 500 会让人以为「邮箱全没了」。
 #[test]

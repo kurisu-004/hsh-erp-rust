@@ -3,9 +3,12 @@
 //! ## 事务边界（CLAUDE.md §1）
 //! 常规读写在 handler：`pool.acquire()` → service 借 `&mut *conn` → drop conn。
 //! **唯一开显式事务的写路径是 [`set_default_account`]**：它必须「先降旧默认、
-//! 再升新默认」两条 UPDATE 严格有序，中间不能让别的请求插进来（否则会出现两个
-//! 默认、或第二个 UPDATE 撞唯一索引）。其余写端点各只做单行 INSERT / UPDATE，
-//! 语句自身原子，开事务反而会让「唯一索引冲突」变成「整笔回滚」而丢掉诊断信息。
+//! 再升新默认」两条 UPDATE 严格有序，且第二步失败时第一步要一起回滚（否则库里
+//! 会一个默认都没有）。⚠️ 事务**消不掉**「两次并发置默认到不同邮箱」那一支 ——
+//! 见 [`set_default_account`] 的 doc 与 `docs/api/mail.md` §4.3。其余写端点各只做
+//! 单行 INSERT / UPDATE，语句自身原子，开事务反而会让「唯一索引冲突」变成「整笔
+//! 回滚」而丢掉诊断信息（那一支改在 service 层捕 `is_unique_violation` 转成
+//! `21707`，见 [`create_account`] / [`update_account`]）。
 
 use sqlx::{Acquire, PgConnection};
 
@@ -102,6 +105,15 @@ pub async fn create_account(
 /// **授权码的「沿用」语义**：body 的 `secret` 缺省**或** trim 后为空 ⇒
 /// 取回旧行原样写回（`None`）。这条规则在**本层**翻译，repo 层因此完全不感知
 /// 「空 = 沿用」（见 `repo::update_account` 的 doc）。
+///
+/// ⚠️ **非空 `secret` 走与新建同款的 `validate_secret`**（控制字符 / ≤200 字），**不是**
+/// 直接封：改档是绕过「建档时那道闸」的旁路，只在 create 校验等于留了个后门（控制字符会
+/// 进 SMTP `AUTH` 命令行）。
+///
+/// ⚠️ **改名撞同名未软删行 ⇒ `21707`**（与 create 同款，见本函数内 `is_unique_violation`
+/// 分支）：本端点是**全量覆写**，`name` 每次都参与写入 ⇒ 撞 `uk_t_mail_account_name_alive`
+/// 与新建撞车是同一件事，若放行成 `AppError::Database` 就是「一句数据库错误、不带失败原因」
+/// 的 500（`docs/api/mail.md` §2.4 承诺的是 21707）。
 pub async fn update_account(
     conn: &mut PgConnection,
     id: i64,
@@ -117,17 +129,20 @@ pub async fn update_account(
     let account = validate_account(&req.account)?;
 
     let encrypted = match req.secret.as_deref().map(str::trim) {
-        Some(s) if !s.is_empty() => crypto::seal(s)?,
+        // ⚠️ 非空 ⇒ **全量过 `validate_secret`**（控制字符 / ≤200 字），与 create 同款。
+        Some(s) if !s.is_empty() => crypto::seal(&validate_secret(s)?)?,
         _ => row.encrypted_secret.clone(),
     };
 
     let now = now_naive();
-    let ok = repo::update_account(
+    let ok = match repo::update_account(
         conn,
         id,
         req.version,
         &AccountPatch {
-            name,
+            // ⚠️ 这里 clone 一次：`name` 还要留给下面 `is_unique_violation` 分支的报错文案
+            // （用**校验并 trim 后**的那个值，而不是 `req.name` 原文）。
+            name: name.clone(),
             preset: preset.as_str().to_string(),
             account,
             encrypted_secret: encrypted,
@@ -135,7 +150,13 @@ pub async fn update_account(
             now,
         },
     )
-    .await?;
+    .await
+    {
+        Ok(ok) => ok,
+        // 改名撞 `uk_t_mail_account_name_alive` ⇒ 业务唯一键冲突，**不是** OCC。
+        Err(e) if is_unique_violation(&e) => return Err(name_duplicate(&name)),
+        Err(e) => return Err(e.into()),
+    };
     if !ok {
         return Err(version_conflict());
     }
@@ -184,13 +205,24 @@ pub async fn delete_account(
 
 /// `POST /accounts/{id}/set-default`：置默认（**本域唯一开事务的写路径**）。
 ///
-/// ## 为什么必须开事务
+/// ## 事务解决的是「失败不留半截状态」
 ///
-/// `uk_t_mail_account_one_default` 保证「至多一个未软删行为 `is_default`」，
-/// 于是「先升新的、再降旧的」必然在第二条 UPDATE 上撞 23505 ⇒ 必须**先降后升**。
-/// 而这两条语句之间若被别的请求插入（另一个管理员同时点了另一个邮箱的
-/// set-default），就会出现「两个都降了、一个都没升」的结果 —— 库里**一个默认都
-/// 没有**。开事务把两条 UPDATE 变成一个原子单元即解决。
+/// `uk_t_mail_account_one_default` 保证「至多一个未软删行为 `is_default`」，于是「先升
+/// 新的、再降旧的」必然在第二条 UPDATE 上撞 23505 ⇒ 必须**先降后升**。而两条语句若各自
+/// 自动提交，则**「降已生效 + 升没生效」就是库的终态** —— 中途失败最常见的一支是升格那
+/// 步自己失败（body 的 `version` 对不上 ⇒ 40901），后果是**一个默认邮箱都没有**。
+/// 同一事务里任何一步失败都整笔回滚 ⇒ 要么原默认还在、要么新默认已升上。
+///
+/// ## 事务**解决不了**的是「两个管理员同时对不同邮箱点置默认」
+///
+/// 各自的事务都看不见对方未提交的结果：两边都「先降（降的不是对方要升的那行）、
+/// 再升」，于是后到者的 [`repo::promote_to_default`] 撞 23505。这一支在 service 层
+/// 捕下来转 `40901`（**不是** 500）：本次提交基于一份已过期的「谁是默认」快照，
+/// 处置是刷新后重试 —— 与 CLAUDE.md 对 `mail_digest` 配置单例并发首次初始化的
+/// 同款处理（23505 → OCC 冲突）。
+///
+/// ⚠️ **不要**为了让这个窗口消失而去动那个 partial 唯一索引：它是「至多一个默认」的
+/// **唯一**保障，去掉它会让「库里两个默认」变成可能，而那个状态没有任何代码能收敛回来。
 ///
 /// ## 为什么先降的是「全部」而不是「当前那一个」
 ///
@@ -213,7 +245,12 @@ pub async fn set_default_account(
     let mut tx = conn.begin().await?;
     repo::clear_default(&mut tx).await?;
     let now = now_naive();
-    let ok = repo::promote_to_default(&mut tx, id, req.version, current.id, now).await?;
+    let ok = match repo::promote_to_default(&mut tx, id, req.version, current.id, now).await {
+        Ok(ok) => ok,
+        // 并发的另一次 set-default 已升了别的邮箱 ⇒ 本次快照过期。
+        Err(e) if is_unique_violation(&e) => return Err(default_conflict()),
+        Err(e) => return Err(e.into()),
+    };
     if !ok {
         return Err(version_conflict());
     }
@@ -330,6 +367,20 @@ fn version_conflict() -> AppError {
     AppError::biz(
         code::VERSION_CONFLICT,
         "邮箱已被其他人修改（或删除），请刷新后重试",
+    )
+}
+
+/// `set-default` 与**并发的另一次 set-default** 撞「至多一个默认」时的文案。
+///
+/// ⚠️ **用 `40901` 而不是复用 `version_conflict()` 的文案、也不是新开业务码**：本次提交
+/// 是基于一份已过期的「谁是默认」快照（判据照 CLAUDE.md 对 `mail_digest` 配置单例并发
+/// 首次初始化的同款处理：23505 → OCC 冲突）。复用 `version_conflict()` 会把「别人改了
+/// **这个**邮箱」与「别人改了**全局的默认**」混成一句话，管理员照提示去刷新单个邮箱的
+/// 编辑框会看不出任何变化。
+fn default_conflict() -> AppError {
+    AppError::biz(
+        code::VERSION_CONFLICT,
+        "另一个管理员刚刚改动了默认邮箱，请刷新列表后重试",
     )
 }
 

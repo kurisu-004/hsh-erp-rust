@@ -120,23 +120,56 @@
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `version` | number | **必填** | OCC 锚点。**缺失 → HTTP 422 纯文本**（axum `Json` 提取器，不是业务信封） |
+| `version` | number | **必填** | OCC 锚点。**缺失 → HTTP 422 纯文本**，见下「⚠️ 422 不是信封」 |
 | `name` / `preset` / `account` | string | **必填** | 同 §2.3 |
-| `secret` | string | 否 | **缺省或空串 ⇒ 沿用旧密文**（不覆写、不报错） |
+| `secret` | string | 否 | **缺省或空串 ⇒ 沿用旧密文**（不覆写、不报错）；**非空 ⇒ 全量走 §2.3 的 `secret` 校验矩阵**（控制字符 / ≤200 字，失败 `21704`） |
 
 ⚠️ **`secret` 不是必填是有意的**：管理员改个名称时前端拿不到授权码明文（服务端从不
 回显），强制必填等于逼前端每次把「不知道的东西」原样传回来。空串是前端唯一能表达
 「我没改它」的方式。
+
+⚠️ **⚠️ 非空 `secret` 与新建走同款校验**（`service::validate_secret`）：控制字符
+（CR/LF 等，会进 SMTP `AUTH` 命令行）与 `SECRET_MAX_CHARS = 200` 两道闸在**改档**路径上
+同样生效。回归：`accounts::update_secret_with_control_chars_returns_21704_and_keeps_ciphertext` /
+`accounts::update_secret_over_200_chars_returns_21704`。
+
+⚠️ **换 `account` 时必须同时换 `secret`**：两个字段是**独立**填的，服务端不校验二者
+匹配。改了登录账号却沿用旧授权码 ⇒ SMTP 以 535 拒绝认证（**零网络 IO 之外的失败**，
+只会体现为流水里一行 `FAILED`）。这是「`secret` 可沿用」这条便利的固有代价：**改档页
+面上必须提示「换账号请一并重填授权码」**。
+
+⚠️ **⚠️ `name` 撞同名未软删行 ⇒ `21707` + 409**（同 §2.3）：本端点是**全量覆写**，
+`name` 每次都参与写入 ⇒ 撞 `uk_t_mail_account_name_alive` 与新建撞车是同一件事。service
+层捕 `is_unique_violation`（SQLSTATE 23505）转本码，**不是** 500、也不是 `40901`。
+回归：`accounts::update_name_to_a_live_duplicate_returns_21707_and_keeps_row_intact`。
 
 ⚠️ **全量覆写**：`name` / `preset` / `account` 三项都必须给全，**没有**「只改一项」的
 三态语义。`is_default` 与 `encrypted_secret`（未给时）**不在**本端点的可写集合里。
 
 **响应回填的是提交后的新 `version`**（读回最新行），前端据此做下一次提交。
 
+**⚠️ 缺 `version` 是「HTTP 422 纯文本」，不是业务信封**：`/accounts/{id}`、
+`/accounts/{id}/delete`、`/accounts/{id}/set-default` 三条**都必收 `version`**（本表带
+`version` 列 ⇒ 照 CLAUDE.md §8，**软删也不例外**）。缺字段时 axum 在 `Json` 提取器层就拒
+了，而**本仓没有 `JsonRejection` 的自定义处理器**（全仓零处定制 `handle_error` / `JsonDataError`）
+⇒ 走 axum 默认路径：
+
+| | 值 |
+|---|---|
+| HTTP | **422 Unprocessable Entity** |
+| 响应体 | **纯文本**（含缺失字段名，如 ``Failed to deserialize the JSON body into the target type: missing field `version` ``） |
+| `code` 字段 | **没有** —— 不是 `R<T>` 信封，前端 `resp.data.code` 恒 `undefined` |
+
+⇒ **前端必须按 HTTP 状态码处理这一类失败，不能指望读 `code`**（尤其 `delete`：它有
+`21708`「被引用禁删」这个业务码，**别把 422 也当成「删不掉」的一种**）。回归：
+`accounts::update_without_version_returns_422_plain_text` /
+`accounts::set_default_requires_version`（都断言了 `!raw.contains("\"code\"")`）。
+
 ### 2.5 `POST /accounts/{id}/delete` 与 `POST /accounts/{id}/set-default` 入参
 
 两者都只有 `{"version": <number>}` 一个字段，**必填**、无 `#[serde(default)]`
-⇒ 缺失同样是 **HTTP 422 纯文本**。
+⇒ 缺失同样是 **HTTP 422 纯文本**（形态见 §2.4 末的「缺 `version`」小节：不是业务信封、
+没有 `code` 字段）。
 
 ⚠️ **软删也吃 OCC**：本表带 `version` 列，按 CLAUDE.md §8「所有对带 `version` 列的表的
 写端点，body 必须显式收客户端 `version` 且必填」，软删也不例外。这正是「读-再-比式
@@ -225,10 +258,22 @@
 | 同名邮箱（未软删）唯一 | `uk_t_mail_account_name_alive ON t_mail_account ((name)) WHERE deleted_at IS NULL` |
 | 软删后可同名再建 | 两个索引都以 `deleted_at IS NULL` 为前提（回归用例 `delete::name_can_be_reused_after_soft_delete`） |
 
-⚠️ **`set-default` 必须在同一事务内「先降后升」**：先升新的、再降旧的会在第二条 UPDATE
-上撞 23505（唯一索引只允许一个 `is_default = true`）。两条语句之间若被并发的另一次
-`set-default` 插进来，会出现「两个都降了、一个都没升」—— 库里**一个默认都没有**。开事务
-即解决。回归：`accounts::set_default_demotes_the_previous_default`。
+⚠️ **`set-default` 的两条 UPDATE 必须在同一事务内「先降后升」**，事务的作用是
+**失败时不留半截状态**：先升新的、再降旧的会在第二条 UPDATE 上撞 23505（唯一索引只允许
+一个 `is_default = true`），所以顺序必须反过来；而更常见的中途失败是**升格那一步自己失败**
+（body 的 `version` 与库里对不上 ⇒ `40901`）。两条语句若各自分别自动提交，「降已生效 +
+升没生效」就是库的终态 ⇒ **一个默认邮箱都没有**（§8.3 第 5 条已登记这个状态是合法的）。
+放进同一事务后任何一步失败都整笔回滚 ⇒ 要么原默认还在、要么新默认已升上。回归：
+`accounts::set_default_demotes_the_previous_default`。
+
+⚠️ **⚠️ 开事务消不掉的是「两个管理员同时对不同邮箱点置默认」**：两个事务各自看不见对方
+未提交的结果（各自要降的那行不是对方要升的），于是后到者的 `promote_to_default` 撞
+`uk_t_mail_account_one_default`（23505）。这一支在 service 层捕 23505 转 `40901`
+（**不是** 500：处置是刷新列表后重试，判据照 CLAUDE.md 对 `mail_digest` 配置单例并发
+首次初始化的同款处理），详见 §8.3 第 11 条。⚠️ **不要**为了让这个窗口消失而去动那个
+partial 唯一索引 —— 它是「至多一个默认」的**唯一**保障。回归：
+`accounts::concurrent_set_default_on_two_accounts_never_returns_500`（断言「允许的
+结果集合」而非某个具体交错顺序，故并发与否都不会 flaky）。
 
 ⚠️ **删掉默认邮箱不会把默认自动转给别的邮箱**（库里变成「零个默认」）：把默认自动转给
 某个「别的邮箱」需要一条选择规则（最近建的？第一个？），而任何一条规则都会让「我以为 A
@@ -349,6 +394,15 @@ t_mail_digest_config.enabled == true
 | 删除的提示 | 被引用时后端返 `21708` + 409，message 里带引用份数与该去哪儿改 —— 前端**原样展示**即可 |
 | 雪花 ID | `MailAccountOut.id` / `ConfigOut.sender_account_id` 是 **JSON string**，不要按 `number` 声明 |
 | 错误处理 | `21701`（503）「发信通道不可用」与 `21702`（502）「SMTP 挂了」**排查方向相反**，UI 文案必须区分；`21706` / `21707` / `21708` 分别是「邮箱不存在」「重名」「被引用禁删」 |
+| **改名撞重名** | `21707` 与新建同款（§2.4）⇒ 表单上「名称已存在」的提示**两条端点共用同一句**，不要按端点写两套文案 |
+| **改档时的授权码** | 换 `account` 必须一并重填 `secret`（§2.4 的 535 提醒）；不改则**不发 `secret` 或发空串** |
+
+⚠️ **部署顺序：后端先上（或与前端同批）**。本轮 `ConfigOut` **新增了 `sender_account_id`
+字段**（`mail_digest` 域，见 `docs/api/mail_digest.md` §2.2），而前端
+`mailDigestConfigSchema`（`views/mail/digest/mailDigestSchema.ts`）是 **`.strict()`**
+⇒ **旧前端拿到新出参会整包 `parse` 抛 ZodError ⇒ 配置页白屏**（不是某个字段
+`undefined`、也不是静默少一列 —— strict 是全包拒）。本域 6 个端点是全新端点，旧前端
+没有调用点、不调即可，**唯一的硬阻断就是那个新键**。
 
 ### 8.3 已知偏差登记
 
@@ -390,3 +444,26 @@ env，而集成测试进程**不走** `AppConfig::from_env`（`test-support` 直
 故 `tests/scheduled_task/main.rs::ensure_mail_secret_env` 与
 `tests/mail_digest/main.rs::ensure_mail_secret_env` 各自用
 `OnceLock` + `unsafe { std::env::set_var }` 串行写一次（Rust 2024 的 `set_var` 是 unsafe）。
+
+**10. ⚠️ 部署前置：三步，一步都不能跳（升级存量部署时尤其）**：① **先写
+`MAIL_ACCOUNT_SECRET`**（`openssl rand -hex 32`，写进**进程 env**，不是只在 `.env` 里
+放着）—— 缺失或长度不对 ⇒ `AppConfig::from_env` **启动直接 bail**（§4.1 末条），
+**任何没改 env 的存量部署升级后起不来**；② 再建至少一个邮箱（`t_mail_account` 表空 ⇒
+交期汇总的「发信邮箱」下拉是空的、`sender_account_id` 恒 `NULL`）；③ 再回交期汇总页
+选定发信邮箱、打开 `enabled`、配好收件人与时刻。
+
+⚠️ **②③ 之前定时任务静默不注册**：调度器**总会**建起来
+（`task::mail_digest::run` 已经没有「未配置 SMTP 就早退」的前置闸），而
+`reschedule_inner` 的判据（§4.5）不满足 ⇒ 只摘不挂，**全程只有两行 `info!`**、不报错、
+不落流水。现场看到的是「每天该发的汇总邮件没来，日志里什么都好着」。⚠️ 旧 env
+`MAIL_SMTP_*` 那套本轮**整轮删除、不做迁移、不留兜底**（§6）⇒ 升级后必须由管理员
+在页面上重填一遍，**「升级前先备份 env 里的 SMTP 密码」这条例行习惯在这里没有用**。
+
+**11. ⚠️ `set-default` 的并发唯一索引冲突转 `40901` 而不是 500**（2026-10-16）：两个
+管理员同时对**不同**邮箱点置默认时，后到者的 `promote_to_default`
+撞 `uk_t_mail_account_one_default`（23505）。这一支**事务消不掉**（两条语句在各自事务里
+看不见对方未提交的结果，§4.3），所以在 service 层捕 23505 并转 `40901` —— 语义是「本次
+提交基于一份已过期的『谁是默认』快照，处置是刷新后重试」，判据照 CLAUDE.md 对
+`mail_digest` 配置单例并发首次初始化的同款处理。⚠️ **不要**改那个 partial 唯一索引
+（它是「至多一个默认」的唯一保障）。回归：
+`accounts::concurrent_set_default_on_two_accounts_never_returns_500`。

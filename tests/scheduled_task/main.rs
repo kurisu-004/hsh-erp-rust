@@ -182,6 +182,24 @@ pub(crate) async fn stored_secret(pool: &PgPool, id: i64) -> String {
     .expect("读 t_mail_account.encrypted_secret")
 }
 
+/// 库里该邮箱的 `name` 与 `version`（用于断言「被拒的那次写**没有动过那一行**」）。
+///
+/// ⚠️ 读的是**未软删**行（`deleted_at IS NULL`）：行若被软删掉，`fetch_one` 直接 panic，
+/// 那本身也是一条断言（「写侧校验失败不该软删任何东西」）。
+pub(crate) async fn stored_name_and_version(pool: &PgPool, id: i64) -> (String, i32) {
+    let row = sqlx::query(
+        "SELECT name, version FROM t_mail_account WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("读 t_mail_account.name / version");
+    (
+        sqlx::Row::get(&row, "name"),
+        sqlx::Row::get(&row, "version"),
+    )
+}
+
 /// 用给定密钥解密某个邮箱的密文（验证「入库的确实是本密钥下的 AES-GCM 密文」）。
 pub(crate) fn open_with_test_key(sealed: &str) -> String {
     crypto::open_with(&TEST_MAIL_SECRET, sealed).expect("用测试主密钥必须能解开")

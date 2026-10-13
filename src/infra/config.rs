@@ -549,7 +549,14 @@ impl MailAccountSecret {
         Ok(Self { key })
     }
 
-    /// 只在 `Default` 构造路径用（测试 / 非 `from_env` 的装配路径）。
+    /// 读 env `MAIL_ACCOUNT_SECRET` 并解析 —— **生产唯一入口**（`AppConfig::from_env` 只在
+    /// 这一处拿主密钥，缺失或格式不对即 `Err` ⇒ **进程启动 bail**）。
+    ///
+    /// ⚠️ **不是**「只在 `Default` 构造路径用」：`Default`（`[0x5A; 32]`）才是那个只供测试
+    /// / 非 `from_env` 装配路径用的，它与本函数恰好互为反面（见 [`Default`] impl 的 doc）。
+    /// 另注 `crypto::seal` / `open` 每次调用也**重读同一 env**（同一个 [`parse`] 函数）
+    /// ⇒ 「启动通过」与「运行期可解密」不可能分叉；只有集成测试是例外（它不走
+    /// `from_env`，自己在进程里写 env）。
     pub fn from_env_value() -> Result<Self> {
         let raw = std::env::var(MAIL_ACCOUNT_SECRET_ENV)
             .with_context(|| format!("环境变量 {MAIL_ACCOUNT_SECRET_ENV} 未设置"))?;
