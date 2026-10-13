@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-> 📌 **前端对接**：后端 API 参考见 [`docs/api/`](docs/api/)。**2026-10-16 现状**：`docs/api/` 有 14 份文件，每份是一个域的**整域契约**（端点表 / 逐字段 / 口径表 / 错误码 / 移除记录 / WS 关系 / 表依赖与前端配套 / 已知偏差登记），范本是 [`dashboard.md`](docs/api/dashboard.md) 的八节骨架：
+> 📌 **前端对接**：后端 API 参考见 [`docs/api/`](docs/api/)。**2026-10-16 现状**：`docs/api/` 有 15 份文件，每份是一个域的**整域契约**（端点表 / 逐字段 / 口径表 / 错误码 / 移除记录 / WS 关系 / 表依赖与前端配套 / 已知偏差登记），范本是 [`dashboard.md`](docs/api/dashboard.md) 的八节骨架：
 > - [`docs/api/dashboard.md`](docs/api/dashboard.md) —— 大屏聚合域（3 个只读 HTTP 端点 + WS 首帧 / 增量；`DELIVERY_STATUSES` 四处共用、行单位、装配件整套交付不变式、`ts` 格式、前端配套清单）
 > - [`docs/api/programming.md`](docs/api/programming.md) —— `prod::programming` 待编程一览（part 状态闸门 + 三规则并集、part 级去重、批次锚点、排序白名单大小写不对称）
 > - [`docs/api/inspection.md`](docs/api/inspection.md) —— `prod::inspection` 待品检（队列列表 + 扫码三层树、`l1_customer_name` 与返修侧有意分叉、域隔离漏报盲区）
@@ -17,6 +17,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 > - [`docs/api/statistics.md`](docs/api/statistics.md) —— `statistics` 生产统计域（**2026-10-12 新建**；3 个 MANAGER-only 只读端点、有效工时口径表、链外工序计 0、`LEFT JOIN LATERAL … LIMIT 1` 的去重理由与「数据覆盖受工序链配置率限制」的登记）
 > - [`docs/api/mail_digest.md`](docs/api/mail_digest.md) —— `mail_digest` 交期汇总邮件域（**2026-10-13 新建**；6 个 MANAGER-only 端点、`DELIVERY_STATUSES` 与 dashboard 共用、行单位工单级 / 刻意 `LIMIT 30` 分叉、频率→**6 段带秒** cron 与 WEEKLY 减 1、217xx 错误码、失败也落流水、**六处**「实现与注释不符」的偏差登记（其中第 5 条已修）；**2026-10-16**：`MAIL_SMTP_*` / `MAIL_FROM_*` / `MAIL_DIGEST_ENABLED` 整轮删除，凭据改由 `scheduled_task` 域的邮箱表提供，配置加 `sender_account_id`、`GET /meta` 删掉 `smtp` 段）
 > - [`docs/api/mail.md`](docs/api/mail.md) —— `scheduled_task` 域「邮件通道」（**2026-10-16 新建**；6 个 MANAGER-only 端点、邮箱 CRUD + SMTP 预设表、**AES-256-GCM 加密入库 + 掩码不回显**、被引用禁删 21708、**21706..21708** 新错误码、密钥轮换未实现的缺口登记）
+> - [`docs/api/print_template.md`](docs/api/print_template.md) —— `print_template` 送货单打印模板（**2026-10-16 新建**；5 端点；★ **不建模板表**，复用 `files` 域的 `t_part_file`（`kind='DELIVERY_TEMPLATE'`、`part_id` 承载 L1 客户 id）⇒「存在性 = 绑定关系」；只绑一级客户；`21109` 未配置 ⇒ **HTTP 422**（本次新选，python 时代无 Rust 侧先例）；读端点用权限点 `delivery_note.print`（M/C/I）、写端点 MANAGER-only；**不恢复任何打印渲染端点**，渲染一直在前端 hucre）
 >
 > **其它域的契约在代码注释里**（各域 `mod.rs` / `repo.rs` / `vo` / `dto` 的模块 doc 与逐字段 doc），本仓的目录约定见本文件「`docs/api/` 目录约定」一节。⚠️ **引用不存在的文档路径是禁止的** —— 后端代码变更（新增 / 修改 / 删除端点，或修改 DTO 字段 / 错误码）必须同步更新对应域的 `docs/api/` 文件（若该域有）与代码注释。
 
@@ -203,8 +204,9 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 | （容器自带） | 1 | `/api/v2/files/sts-tmp-keys` | 无（薄壳鉴权转发到 python） | 2026-09-28 新增，逐字未动 |
 | `files::part_file` | 7 | `/api/v2/files/objects` | `t_part_file`（自有） | `POST /objects`（**上传四合一**）/ `GET /objects`（列表）/ `POST /objects/confirm`（STS 直传回执）/ `GET /objects/{id}/url` / `GET /objects/{id}/content` / `POST /objects/{id}/delete` / `GET /objects/{id}/preview`（**2026-10-13 PR2**：COS CI 预览，惰性轮询零后台任务；**2026-10-12** 增可选 `?size=view\|thumb\|full` 投放档位，缺省 view、非法值 40001/422） |
 | `files::part_file::cnc` | 1 | `/api/v2/files/cnc` | 复用 `t_part_file`（无 repo 层） | `POST /cnc/pairs`：G_CODE + 工艺卡配对写入 |
+| （**无独立子模块**） | 0 | — | 复用 `t_part_file` | ★ **2026-10-16：`t_part_file.kind` 新增第 7 个值 `DELIVERY_TEMPLATE`**（xlsx，`file_type='XLSX'`），`part_id` 列承载**第三种 owner：一级客户的 `t_customer.id`**。承载域是新建的 `print_template` 域（见 `docs/api/print_template.md`），本域只出 6 处能力：4 张 policy 表（`allowed_exts` / `file_type_for_ext` / `expected_content_types_for_ext` / `owner_kind_allows_kind`）+ `repo::customer_owner_exists`（`owner_kind='CUSTOMER'` 的存在性闸门）+ 三处**收紧**（上传角色按 `owner_kind` 分派 `CUSTOMER`⇒仅 Manager、软删分派加 `DELIVERY_TEMPLATE`、`GET /objects/{id}/content` 加 kind 白名单拒掉它）。⚠️ **迁移 `20261016000100_001_add_delivery_template_kind.sql`**：`ck_t_part_file_kind` 与 `uk_t_part_file_single` 都要 `DROP` 再 `ADD`（PG 的 CHECK 约束不支持增量追加，而 partial unique index 的 kind 白名单就写在谓词里）。⚠️ **`part_id` 一列现承载三种 owner**、共用雪花 ID 空间且**无映射表** ⇒ 新增读路径**必须**带 `kind` 谓词 |
 
-> 端点求和 = 1 + 7 + 1 = **9**，与 `src/modules/files/mod.rs` 模块 doc 的端点表恒等。计数口径同 iam 表。
+> 端点求和 = 1 + 7 + 1 = **9**（⚠️ 2026-10-16 加的 `DELIVERY_TEMPLATE` 一行**端点数为 0** —— 它不是 files 域的子模块、也不是 files 域的端点，而是**另一张表上的第三种 owner**，承载端点在 `print_template` 域，见 `docs/api/print_template.md`；本求和不变），与 `src/modules/files/mod.rs` 模块 doc 的端点表恒等。计数口径同 iam 表。
 >
 > ★ **权威路由清单是三张 `ROUTES` 常量**（2026-10-13 review 第 2 轮 N-3 / N-10 补齐）：`files::handler::ROUTES`（1 条 `sts-tmp-keys`）/ `part_file::handler::ROUTES`（7）/ `part_file::cnc::handler::ROUTES`（1）。三者由**同一个**比对器 `src/modules/files/route_guard.rs::routes_in_router_source` 逐条核对各自的 `router()` 源码（单测 `routes_declared_in_router`）—— 加 / 删端点忘同步 `ROUTES` 会当场红。⚠️ 各 `.nest(...)` 的路由清单归**子模块**自己的 `ROUTES`，不在父级重复计数。
 >
@@ -659,10 +661,11 @@ commit 之后发一次汇总。前端若订阅了它，会成**死订阅**（永
    - **顶层 nest 集中登记在 `src/modules/mod.rs::v2_router()`**，一个前缀一行 + 注释说明归属域与硬切日期。跨域共用的端点也在这里登记，并在**拥有它的域**的 `mod.rs` doc 里注明「本域有 N 处挂载」。
      - **2026-10-13 新增**：`.nest("/mail-digest", mail_digest::router())`（`mail_digest` 域，6 端点，**顶层 nest、kebab-case 单段**，与 `/part-files` / `/cnc-programs` / `/outsource-queue` 同款；无硬切记录，本域新立）。本域 6 条路由**全是静态段**（无 `Path` 参数）⇒ 不受上面那条 matchit 排序约束。
      - **2026-10-16 新增**：`.nest("/mail", scheduled_task::router())`（`scheduled_task` 域，6 端点，**顶层 nest、单段、刻意不是 kebab-case** —— 菜单结构改版时与前端路由、菜单 seed 的 `path='/mail'` 对齐成同一个词）。⚠️ 与 `/mail-digest` **无冲突**：matchit 按段数 + 静态段优先匹配，`/mail/meta`（2 段）不会落到 `/mail-digest`（1 段静态段）上。本域最长段数 3、`Path<i64>` 只在第 2 段、**无 2 段静态路径** ⇒ 也不受上面那条排序约束。
+     - **2026-10-16 新增**：`.nest("/print-templates", print_template::router())`（`print_template` 域，5 端点，**顶层 nest、单段、kebab-case**，与菜单 seed 的 `template_management` / `print_templates_designer` 的 `path='/print-templates'` 逐字一致）。⚠️ `/resolve`（1 段静态）**不受** matchit 排序约束 —— 本域**没有** 1 段的 `Path<i64>` catch-all（无 `/{template_id}` 端点）；`/{template_id}/content` 与 `/{template_id}/delete` 两条**位置平行**（第 1 段捕获、第 2 段静态），彼此不争。守卫分两档：写端点 3 条 `require_role(Manager)`、读端点 2 条用**权限点 `delivery_note.print`**（打印对话框是 CLERK / INSPECTOR 在用，**绝不能** MANAGER-only）。完整契约见 `docs/api/print_template.md`。
 
 ## `docs/api/` 目录约定（2026-10-07 确立）
 
-**现状**：`docs/api/` 有 **14 份**文件（与本文件顶部「📌 前端对接」一节同口径；2026-10-11 review 第 1 轮订正过「9 份 / 11 份」两处自相矛盾与漏登 `wx.md`，2026-10-12 新建 `statistics.md` 后为 12，2026-10-13 新建 `mail_digest.md` 后为 13，**2026-10-16 新建 `mail.md` 后为 14**），每份 = **一个域的整域契约**：
+**现状**：`docs/api/` 有 **15 份**文件（与本文件顶部「📌 前端对接」一节同口径；2026-10-11 review 第 1 轮订正过「9 份 / 11 份」两处自相矛盾与漏登 `wx.md`，2026-10-12 新建 `statistics.md` 后为 12，2026-10-13 新建 `mail_digest.md` 后为 13，2026-10-16 新建 `mail.md` 后为 14、**同批新建 `print_template.md` 后为 15**），每份 = **一个域的整域契约**：
 
 | 文件 | 覆盖域 |
 |---|---|
@@ -680,6 +683,7 @@ commit 之后发一次汇总。前端若订阅了它，会成**死订阅**（永
 | [`docs/api/statistics.md`](docs/api/statistics.md) | `statistics` 生产统计（**2026-10-12 新建**；3 个 MANAGER-only 只读端点、有效工时口径表与数据覆盖登记、跳序取件域清空的移除记录） |
 | [`docs/api/mail_digest.md`](docs/api/mail_digest.md) | `mail_digest` 交期汇总邮件（**2026-10-13 新建**；6 个 MANAGER-only 端点 + 定时任务；6 段带秒 cron 与 WEEKLY 减 1；217xx 错误码；失败也落流水；与 dashboard 的口径分叉与**六处**「实现与注释不符」偏差登记（第 5 条已修）；**2026-10-16** env 凭据整轮删除、配置加 `sender_account_id`、`GET /meta` 删 `smtp` 段） |
 | [`docs/api/mail.md`](docs/api/mail.md) | `scheduled_task` 邮件通道（**2026-10-16 新建**；6 个 MANAGER-only 端点；AES-256-GCM 加密入库 + 掩码不回显；SMTP 预设两家均 465/WRAPPED；被引用禁删；21706..21708；密钥轮换未实现的缺口） |
+| [`docs/api/print_template.md`](docs/api/print_template.md) | `print_template` 送货单打印模板（**2026-10-16 新建**；5 端点 = `POST /` 上传替换 / `GET /` 列表 / `GET /resolve` / `GET /{id}/content` / `POST /{id}/delete`；**不建模板表**、复用 `t_part_file`；只绑一级客户；`21109` ⇒ HTTP 422） |
 
 **约定**：
 
@@ -691,7 +695,7 @@ commit 之后发一次汇总。前端若订阅了它，会成**死订阅**（永
 
 ## 集成测试目录结构（2026-09-23 PR13 重构后）
 
-integration test binary 已重组为 **22 binary**（12 多文件 domain 子目录化 + 10 single-file 保留；**2026-10-10** 原 `shelf` binary 并入 `iam` binary；**2026-10-13** 原 `cnc_program_api` 与 `files_sts_tmp_keys` 两个单文件 binary 并成新 `files` 目录域 binary，同日新增 `mail_digest`；**2026-10-16** 新增 `scheduled_task`）—— 数字以 `cargo metadata --no-deps` 列出的 test target 为准逐个复核过（**2026-10-13** 复核、**2026-10-16** 增量）：
+integration test binary 已重组为 **23 binary**（13 多文件 domain 子目录化 + 10 single-file 保留；**2026-10-10** 原 `shelf` binary 并入 `iam` binary；**2026-10-13** 原 `cnc_program_api` 与 `files_sts_tmp_keys` 两个单文件 binary 并成新 `files` 目录域 binary，同日新增 `mail_digest`；**2026-10-16** 新增 `scheduled_task` 与 `print_template`）—— 数字以 `cargo metadata --no-deps` 列出的 test target 为准逐个复核过（**2026-10-13** 复核、**2026-10-16** 增量；⚠️ 2026-10-16 新增 `print_template` 后由 `cargo metadata` 实测复核为 **23**）：
 
 | 新结构 | 拆前 binary 数 | 拆后 binary 名（nextest filter） |
 |---|---:|---|
@@ -708,7 +712,8 @@ integration test binary 已重组为 **22 binary**（12 多文件 domain 子目�
 | `tests/files/{main,part_file,upload,cnc,sts}.rs` | 2 → 1 binary | `files`（**2026-10-13 新建**：由 2 个原单文件 binary `tests/cnc_program_api.rs`（→ `cnc.rs`）/ `tests/files_sts_tmp_keys.rs`（→ `sts.rs`）合并而来；⚠️ 另有 2 个 sub-file 自别的 binary 迁入 —— `tests/part/file.rs` → `part_file.rs`（它从来不是独立 binary，在 `part` 里只是 sub-file）与 `tests/assembly/files.rs` 的 2 条文件上传用例 → `upload.rs`（**2026-10-13 PR1b**：端点 `POST /assemblies/{id}/files` 下线后改测 `PartFileService::upload_file_for_owner(owner_kind=ASSEMBLY)`），两者均不计入本列的 binary 数；★ 核心回归是 `part_file.rs` 的硬切 404 守卫 —— PR1a 3 条（`old_part_files_prefix_returns_404` 等，含旧前缀整段 / 数字段 / 旧 CNC 前缀）+ **PR1b 4 条**（`old_part_upload_drawing_returns_404` / `old_part_upload_3d_model_returns_404` / `old_part_files_confirm_returns_404` / `old_assembly_files_returns_404`），共 7 条）|
 | `tests/wx/{main,part_list,production}.rs` | 1 → 1 binary | `wx`（**2026-10-13 补记**：2026-10-11「BFF 按页面切子模块」时建的 binary，此前本表漏登记；本次一并补上并按 `cargo metadata --no-deps` 复核计数）|
 | 单文件保留：_e2e_api / applicant_api / auto_complete_api / cos_opendal_api / cos_real_smoke / customer_api / dashboard_ws_api / idempotency_api / print_forward / wecom_login | 10 | （各自原 binary 名；⚠️ 原清单里的 `cnc_program_api` / `files_sts_tmp_keys` 已于 2026-10-13 并入上表 `files` binary）|
-| **合计** | — | **22 binary**（12 子目录 + 10 单文件；逐目录 `ls` + `cargo metadata --no-deps` 实测，2026-10-13 复核、2026-10-16 增量；⚠️ `tests/com/delivery_note/` 只有 `mod.rs` 没有 `main.rs`，按本仓「cargo 不识别 `tests/<dir>/mod.rs`」的约定不构成 binary，不计入子目录数）|
+| `tests/print_template/{main,upload,resolve,delete}.rs` | — | `print_template`（**2026-10-16 新建**，与新域同批；3 个 sub-file 按端点切分：`upload.rs` 上传 / 替换语义 / 四道轻校验 / CLERK 403，`resolve.rs` `21109` + HTTP **422** / 内容字节逐字节相等 / 权限点守卫 / 旧路径 404，`delete.rs` OCC（缺 `version` ⇒ 422 纯文本、陈旧 ⇒ 40901）+ 列表分页与 kind 隔离。**36 条用例**。★ 核心回归是「`t_part_file` 行四列逐项对上」「同 L1 二次上传 = 替换」「绑二级客户 ⇒ 20104」「`.xlsx` 但非 ZIP ⇒ 21102」「CLERK 经 `POST /files/objects` 通用入口绕行也造不出模板行」；⚠️ 本 binary 自带一个 `MemoryCos`（`Mutex<HashMap>`）—— test-support 的 `NoopCos.get_object` 恒返空字节、`MockCos.put_object` 不保存字节，两者都钉不到「content 返回字节 == 上传字节」；⚠️ 需要 Redis）|
+| **合计** | — | **23 binary**（13 子目录 + 10 单文件；逐目录 `ls` + `cargo metadata --no-deps` 实测，2026-10-13 复核、2026-10-16 增量；⚠️ `tests/com/delivery_note/` 只有 `mod.rs` 没有 `main.rs`，按本仓「cargo 不识别 `tests/<dir>/mod.rs`」的约定不构成 binary，不计入子目录数）|
 
 **关键约定**：
 - cargo 1.98.1 **不识别** `tests/<dir>/mod.rs`，只识别 `tests/<dir>/main.rs`（binary 名 = `<dir>`）。新 domain 一律用 `main.rs`。

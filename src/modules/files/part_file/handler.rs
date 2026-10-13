@@ -361,6 +361,36 @@ pub async fn get_part_file_url(
     Ok(Json(R::ok(out)))
 }
 
+/// `GET /objects/{id}/content` 的 **kind 白名单**（2026-10-16 新增）。
+///
+/// ## 为什么要这道守卫
+///
+/// 该端点的角色集合含 `SHELF_ACCOUNT`（工控机预览图纸），且原先**不校验 kind** ——
+/// 任何能过 RBAC 的账号都能拿任意 `file_id` 取到字节。
+/// 在 `t_part_file` 只装图纸 / 3D 模型 / CNC 程序时这不构成问题；但 2026-10-16 起
+/// 同一张表多了一种**不是「给人看的文件」**的行：`kind='DELIVERY_TEMPLATE'`
+/// （客户的送货单打印模板，见 `print_template` 域）。SHELF_ACCOUNT 若能按 id 取到
+/// 它的字节，就等于工控机账号能读任意客户的送货单抬头 / 地址 / 行模板 —— 一条
+/// **跨了 SHELF 货架范围**的越权读。
+///
+/// ## 为什么取「白名单」而不是「黑名单排除 DELIVERY_TEMPLATE」
+///
+/// 白名单只会在**新增 kind 时要求显式决策**（忘了加 ⇒ 拒绝，fail-safe）；
+/// 黑名单则会在新增 kind 时**默认放行**（忘了加 ⇒ 泄漏，fail-open）。
+///
+/// ## 报错码刻意是 21102 而不是 21101
+///
+/// `21101 BIZ_PART_FILE_NOT_FOUND` 的语义是「**这行不存在**」，而本行**存在**
+/// —— 错在「这个端点不提供这种 kind 的字节」，与扩展名 / content_type 不匹配同族
+/// （`BIZ_PART_FILE_BAD_TYPE` 一直覆盖「请求指向的东西不是这个端点服务的类型」）。
+/// ⚠️ 别把它改成 21101：前端拿到 404 会去刷新列表，拿到 21102 才会提示「换个入口」。
+pub(crate) fn is_file_content_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "DRAWING" | "3D_MODEL" | "G_CODE" | "SETUP_SHEET" | "ASSEMBLY_MASTER" | "CAD_2D"
+    )
+}
+
 /// `GET /api/v2/files/objects/{file_id}/content` —— 后端代理文件二进制流。
 ///
 /// 拉 `t_part_file.object_key` + COS `get_object`，透传 `content_type` 头。
@@ -372,6 +402,12 @@ pub async fn get_part_file_url(
 /// 拿到即可脱离本后端直接访问、直链可外传 ⇒ 工控机账号不需要它（预览走 content 就够），
 /// 不因「同一个 owner 的两个读端点」而一并放开。
 ///
+/// ⚠️ **2026-10-16 起加 kind 白名单**，判据与 fail-safe 方向见
+/// [`is_file_content_kind`]。判 kind 排在取字节**之前** ⇒ 非法 kind 零外部 IO
+/// （不拉 COS）。客户送货单打印模板要取字节请打 `print_template` 域的
+/// `GET /print-templates/{id}/content`（那是**打印**语义、权限点
+/// `delivery_note.print`，刻意与本端点的 5 角色集合不同）。
+///
 /// 2026-09-29 扁平化：service 内部走 legacy→新模板 fallback（见
 /// `resolve_effective_key`），handler 仅透传 `cfg.upload_prefix`。
 pub async fn get_part_file_content(
@@ -380,6 +416,20 @@ pub async fn get_part_file_content(
     Path(file_id): Path<i64>,
 ) -> Result<Response, AppError> {
     let mut tx = state.pool.begin().await?;
+    // ⚠️ 先取行判 kind 再取字节：非法 kind 零外部 IO（不拉 COS）。
+    let row = state
+        .part_file_service
+        .get_file_row(&mut *tx, file_id)
+        .await?;
+    if !is_file_content_kind(&row.kind) {
+        return Err(AppError::biz(
+            code::BIZ_PART_FILE_BAD_TYPE,
+            format!(
+                "kind={:?} 不走本端点取字节（仅 DRAWING / 3D_MODEL / G_CODE / SETUP_SHEET / ASSEMBLY_MASTER / CAD_2D）",
+                row.kind
+            ),
+        ));
+    }
     let out = state
         .part_file_service
         .get_file_content(
@@ -581,7 +631,7 @@ pub fn router() -> Router<Arc<AppState>> {
 
 #[cfg(test)]
 mod tests {
-    use super::ROUTES;
+    use super::{ROUTES, is_file_content_kind};
     use crate::modules::files::route_guard::routes_in_router_source;
 
     /// `ROUTES` 必须与 `router()` 源码**逐条**一致（不多、不少、同序）。
@@ -612,5 +662,25 @@ mod tests {
                 ROUTES.len()
             );
         }
+    }
+
+    /// 2026-10-16：`GET /objects/{id}/content` 的 kind 白名单 —— 客户送货单打印模板
+    /// **不在**其中（该端点放 SHELF_ACCOUNT，模板字节不能走这条路被工控机账号读到）。
+    #[test]
+    fn content_kind_allowlist_excludes_delivery_template() {
+        for k in [
+            "DRAWING",
+            "3D_MODEL",
+            "G_CODE",
+            "SETUP_SHEET",
+            "ASSEMBLY_MASTER",
+            "CAD_2D",
+        ] {
+            assert!(is_file_content_kind(k), "{k} 应放行");
+        }
+        assert!(!is_file_content_kind("DELIVERY_TEMPLATE"));
+        // 白名单方向：未知 kind 默认拒（fail-safe），不是拒掉单个新 kind 就算完
+        assert!(!is_file_content_kind("SOMETHING_NEW"));
+        assert!(!is_file_content_kind(""));
     }
 }

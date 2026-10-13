@@ -17,10 +17,15 @@
    find-or-create + DP 分配 + 拆批 + 挂单），删 7 条端点；新增只读扫码三层树
    `GET /scan/{serial_no}`；新增 DP 批次分配算法。
 4. **打印链路全删**（前端改 hucre 本地生成 xlsx）+ 新增 `POST /{id}/driver` 与 `GET /drivers`
-   + `/pickup` 入参瘦身并重跑司机校验。⚠️ 2026-10-14 起 RBAC 里登记了 **前端-only** 权限点
-   `delivery_note.print`（后端打印端点已删、无守卫可迁；授权矩阵照前端
+   + `/pickup` 入参瘦身并重跑司机校验。⚠️ 2026-10-14 起 RBAC 里登记了权限点
+   `delivery_note.print`（授权矩阵照前端
    `frontend/src/utils/deliveryNotePermissions.ts::canPrint` 的放行集合：
    MANAGER / CLERK / INSPECTOR），前端按钮显隐以该权限点为准。
+   ⚠️ **2026-10-16 该权限点不再是「前端-only」**：新建的 `print_template` 域用它守两条
+   后端读端点（`GET /print-templates/resolve` + `GET /print-templates/{id}/content`），
+   **授权矩阵逐字未变**。但**本域仍然零打印端点** —— 模板存 / 绑 / 取字节在
+   `print_template` 域（`docs/api/print_template.md`），渲染一直在前端 hucre；
+   `POST /{id}/print` / `print-labels` **逐字不恢复**。
 5. **VO 字段裁剪 29 个** + `RemoveParts` → `RemoveBatches` 改名 + `SubmitDeliveryOut` 塌缩为
    `R<String>`。
 6. **菜单 `delivery_dispatch` 下线**（`seeds/menu.sql`，非 migration —— seed 每次启动重放）：
@@ -615,6 +620,14 @@ DRAFT ──submit──▶ SUBMITTED ──pickup──▶ PICKED_UP ──▶ 
 | `GET /api/v2/delivery-notes/*` → `/api/v2/com/delivery/note/*` | 域平移，**硬切无 alias** |
 | `GET /api/v2/delivery-groups/*` → `/api/v2/com/delivery/group/*` | 同上 |
 
+⚠️ **2026-10-16 补记：打印模板的绑定不在本域，而在新建的 `print_template` 域**
+（`/api/v2/print-templates/*`，5 端点，契约见
+[`print_template.md`](print_template.md)）。**本域仍然零打印端点** ——
+上表那两条（`POST /{id}/print` / `print-labels`）于 2026-10-08 下线后**逐字不恢复**；
+新域只管「模板文件的存 / 绑一级客户 / 取字节」，**渲染仍在前端 hucre 本地生成**。
+两条相近前缀 `/api/v2/com/delivery/template/*` 与 `/api/v2/print-template/*`（少个 `s`）
+自始至终**都是干净 404**（前者从未存在，后者刻意不设 alias）。
+
 ### 6.2 字段（29 条删除）
 
 **恒定值（4）**：`DeliveryNoteLineItem.is_urgent`（两处装配都硬编码 `false`）、
@@ -696,6 +709,10 @@ schema 与页面都在用」。
 | `t_worker` | 指定司机（`driver_worker_name`、`GET /drivers`） |
 | `t_work_type` | 工种（`送货司机` 判据） |
 | `t_shelf` · `t_process` · `t_outsource_company` | 扫码树批次层的 **3 张 `LEFT JOIN` 展示用附表**（holder 名 / 工序名）；**刻意不加软删闸门**，与 `prod::batch::repo` 既有写法一致 |
+
+⚠️ **打印模板不在本域的表依赖里**：模板字节与「绑一级客户」这条绑定关系落在
+`t_part_file`（`kind='DELIVERY_TEMPLATE'`）+ `t_customer`，读写全在 `print_template` 域
+（见 [`print_template.md`](print_template.md) §8.1）。本域**一条模板 SQL 都没有**。
 
 `t_delivery_note.delivery_group_id` / `leaf_customer_id` 两列**逻辑废弃**（范围判定下线，
 新单一律写 NULL）。保留列本身不动，避免 DDL 抖动与既有 baseline 约束

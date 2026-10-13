@@ -90,10 +90,16 @@ ON CONFLICT (code) WHERE deleted_at IS NULL DO NOTHING;
 --   * `queue.dispatch`      ← prod::queue::service::dispatch::dispatch_batch 原
 --     require_any_role（MANAGER / CLERK）；auto-dispatch 预览 2026-10-15 回改并入
 --     同点（见 docs/api/queue.md §1）；list_pending 归第二批 `queue.view`
---   * `delivery_note.print` ← **前端-only** 权限点：后端打印端点已于 2026-10-08
---     下线（打印改前端本地 hucre 生成），后端零守卫可迁；矩阵照现有前端
+--   * `delivery_note.print` ← 2026-10-16 起**真的守后端两条读端点**：
+--     `print_template` 域的 `GET /print-templates/resolve` 与
+--     `GET /print-templates/{id}/content`（打印对话框取模板 + 取 xlsx 字节）。
+--     打印**渲染**仍是前端本地 hucre 生成，后端仍无渲染端点（2026-10-08 那轮
+--     下线的 `POST /{id}/print` / `print-labels` 逐字不恢复）。
+--     ⚠️ 授权矩阵**逐字不变**（仍照前端
 --     `frontend/src/utils/deliveryNotePermissions.ts::canPrint` 的放行集合
---     （MANAGER / CLERK / INSPECTOR）登记，供前端 hasPermission 使用。
+--     MANAGER / CLERK / INSPECTOR）—— 打送货单是 CLERK / INSPECTOR 的日常动作，
+--     本次只把「前端-only 的登记点」升级成「后端端点的守卫点」，
+--     不借机放宽或收紧矩阵。
 --
 -- 2026-10-15 第二批 17 点（用户定稿矩阵，与第 3 节逐格对应）：
 --   * `production.view`           ← work_type / process / shelf_process 三个域的
@@ -142,7 +148,7 @@ INSERT INTO t_permission (
 ) VALUES
     (9300000000000001, 'part.drawing.print',  '零件图纸打印', 'part',          '零件图纸打印转发端点 + 图纸下载直链（part-files/{id}/url）', true, 0, now(), 0, now(), 0),
     (9300000000000002, 'queue.dispatch',      '生产队列下发', 'queue',         '待下发批次的批量下发写路径',                     true, 0, now(), 0, now(), 0),
-    (9300000000000003, 'delivery_note.print', '送货单打印',   'delivery_note', '前端本地生成送货单打印件（后端无打印端点，仅登记）', true, 0, now(), 0, now(), 0),
+    (9300000000000003, 'delivery_note.print', '送货单打印',   'delivery_note', '打印对话框：取该一级客户绑定的送货单打印模板（GET /print-templates/resolve）与其 xlsx 字节（GET /print-templates/{id}/content）。渲染仍在前端本地生成，本域无打印渲染端点', true, 0, now(), 0, now(), 0),
     -- ---- 2026-10-15 第二批 17 点 ----
     (9300000000000004, 'production.view',           '生产基础数据查看', 'production',    '工序 / 工种 / 货架工序映射 / 工艺链的只读端点（用户定稿：SA 并入是有意并集）', true, 0, now(), 0, now(), 0),
     (9300000000000005, 'production.config',         '生产基础数据配置', 'production',    '工种↔工序、货架↔工序映射的整组替换写路径', true, 0, now(), 0, now(), 0),
@@ -191,7 +197,8 @@ FROM (VALUES
     -- queue.dispatch：照 dispatch_batch 原 require_any_role 的角色集合
     (9400000000000005::bigint, 'MANAGER',        'queue.dispatch'),
     (9400000000000006::bigint, 'CLERK',          'queue.dispatch'),
-    -- delivery_note.print：前端-only，矩阵照前端 canPrint 放行集合
+    -- delivery_note.print：2026-10-16 起是后端 `print_template` 域两条读端点的守卫点，
+    -- 矩阵照前端 canPrint 放行集合（逐字未变）
     (9400000000000007::bigint, 'MANAGER',        'delivery_note.print'),
     (9400000000000008::bigint, 'CLERK',          'delivery_note.print'),
     (9400000000000009::bigint, 'INSPECTOR',      'delivery_note.print'),

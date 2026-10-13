@@ -120,10 +120,48 @@
 //! |---|---|
 //! | `PART` | `DRAWING` / `3D_MODEL` |
 //! | `ASSEMBLY` | `ASSEMBLY_MASTER` |
+//! | `CUSTOMER` | `DELIVERY_TEMPLATE`（**2026-10-16 新增**，见下一节） |
 //!
 //! fail-safe 方向：不在表内一律拒。将来给 `allowed_exts` 加新 kind（CAD_2D /
 //! G_CODE / SETUP_SHEET 走 CNC 配对端点）时**不会**自动放行 —— 必须先在这里显式
 //! 声明它挂哪种 owner。
+//!
+//! ## 2026-10-16 新增第三种 owner `CUSTOMER`（送货单打印模板）
+//!
+//! 需求：「增加模板上传的功能，模板支持 xlsx 格式，当前用于打印送货单……且可以
+//! 绑定一级客户。送货单打印时自动选择已绑定的模板」。
+//!
+//! **模板字节不新建表**，复用本表的 `t_part_file`：`kind='DELIVERY_TEMPLATE'`，
+//! `part_id` 列装的是**一级客户的 `t_customer.id`**，「该 L1 名下存在一行未软删的
+//! `DELIVERY_TEMPLATE`」本身就是绑定关系。承载域是新建的 `print_template` 域
+//! （`src/modules/print_template/`，URL `/api/v2/print-templates`，5 端点），
+//! 完整契约见 `docs/api/print_template.md`。本域只出三处能力：
+//! ① `kind` 白名单 / 扩展名 / file_type / content_type 四张表加了 `DELIVERY_TEMPLATE`；
+//! ② `owner_kind='CUSTOMER'` 的存在性闸门（`repo::customer_owner_exists`）；
+//! ③ `GET /objects/{id}/content` 加 kind 白名单（见下）。
+//!
+//! ### ⚠️ 三处**刻意收紧**（新增第三种 owner 带来的）
+//!
+//! | 收紧点 | 位置 | 为什么 |
+//! |---|---|---|
+//! | 上传端点的角色面按 `owner_kind` 分派 | `service::upload_file_for_owner` | `CUSTOMER` 只放 **Manager**。⚠️ 这是「CLERK 不能偷偷绑模板」的**唯一**闸门 —— `owner_kind` / `kind` 都由 client 在 multipart `data` 里给，只在 `print_template` 域的 handler 上守 MANAGER 的话，CLERK 直接打 `POST /files/objects` 就能绕过模板管理页乱换别人的打印模板。`PART` / `ASSEMBLY` 的集合**逐字不变** |
+//! | 软删分派表加 `DELIVERY_TEMPLATE => [Manager]` | `service::soft_delete_file` | 不加就是「写得进、删不掉」，与 2026-10-13 review 第 1 轮 MINOR-6 修的 `ASSEMBLY_MASTER` 同款坑 |
+//! | `GET /objects/{id}/content` 加 kind 白名单 | `handler::get_part_file_content` | 该端点**放 `SHELF_ACCOUNT`**（工控机预览图纸）且原先不校验 kind ⇒ 工控机账号能按 id 取到**任意客户的送货单打印模板**字节。守卫取白名单而非「排除 DELIVERY_TEMPLATE」，新增 kind 时忘了加 = 拒绝（fail-safe） |
+//!
+//! ### ⚠️ `CUSTOMER` 是**单向**的
+//!
+//! `PART` / `ASSEMBLY` 两臂刻意**不加** `DELIVERY_TEMPLATE` —— 否则能造出「零件挂
+//! 送货单打印模板」这种**无人读**（`print_template` 域只按
+//! `(customer_id, DELIVERY_TEMPLATE)` 查）的垃圾行。
+//!
+//! ### ⚠️ 扩展名 / file_type / content_type 三处的新增值
+//!
+//! `DELIVERY_TEMPLATE => &["xlsx"]`（**不收 `.xls`**：BIFF 二进制格式，前端
+//! SheetJS / hucre 侧读它要走另一条兼容路径，需求原文就是 xlsx）；
+//! `"xlsx" => "XLSX"`；content_type **只收**精确的
+//! `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`，
+//! **刻意不给 `application/octet-stream` 兜底**（同 pdf 那支的纪律）——
+//! 收下它等于放行「改名成 `.xlsx` 的任意文件」。
 //!
 //! ## 角色矩阵（7 条存活端点；2026-10-10 新增 `Role::ShelfAccount` 的两条只读端点，
 //! 2026-10-13 PR2 新增预览端点）
@@ -135,13 +173,13 @@
 //!
 //! | 端点 | 角色集合 | 备注 |
 //! |---|---|---|
-//! | `POST /files/objects`（上传） | M / C / CNC | 四合一；白名单取 4 条旧上传端点的**并集** |
+//! | `POST /files/objects`（上传） | `PART`/`ASSEMBLY`：M / C / CNC；**`CUSTOMER`：仅 M** | 四合一；白名单取 4 条旧上传端点的**并集**。⚠️ 2026-10-16 起按 `owner_kind` 分派（模板只放 Manager，理由见「2026-10-16 新增第三种 owner」一节） |
 //! | `POST /files/objects/confirm` | M / C | 逐字沿用旧 `POST /parts/{id}/files/confirm` |
 //! | `GET /files/objects`（列表） | M / C / I / CNC / **SHELF** | 2026-10-10 放开 SHELF |
-//! | `GET /files/objects/{id}/content` | M / C / I / CNC / **SHELF** | 2026-10-10 放开 SHELF |
+//! | `GET /files/objects/{id}/content` | M / C / I / CNC / **SHELF** | 2026-10-10 放开 SHELF；⚠️ 2026-10-16 起**加 kind 白名单**（拒 `DELIVERY_TEMPLATE` 等非文件类 kind） |
 //! | `GET /files/objects/{id}/url` | 权限点 `part.drawing.print`（默认矩阵 M / C / I / CNC） | **默认矩阵刻意不含 SHELF**，见下 |
 //! | `GET /files/objects/{id}/preview` | M / C / I / CNC / **SHELF** | 2026-10-13 PR2 新增；⚠️ **含 SHELF 是对上一行的有意反转**，见下 |
-//! | `POST /files/objects/{id}/delete` | 按 kind 派生（图纸类 + `ASSEMBLY_MASTER` M / C，G_CODE M / CNC） | `ASSEMBLY_MASTER` 是 2026-10-13 review 第 1 轮 MINOR-6 补进分派的 |
+//! | `POST /files/objects/{id}/delete` | 按 kind 派生（图纸类 + `ASSEMBLY_MASTER` M / C，G_CODE M / CNC，`DELIVERY_TEMPLATE` **仅 Manager**） | `ASSEMBLY_MASTER` 是 2026-10-13 review 第 1 轮 MINOR-6 补进分派的；`DELIVERY_TEMPLATE` 是 2026-10-16 新增（否则「写得进、删不掉」） |
 //!
 //! ### ⚠️ 上传四合一的**唯一一处权限面放大**（2026-10-13 review 第 1 轮存疑点 4 订正）
 //!
@@ -238,6 +276,8 @@
 //! | 6 | **`POST /files/objects/confirm` 的 size 上限由硬编码 300MB 改为读 `COS_MAX_FILE_SIZE`**（`.env.example` = 100MB ⇒ 按样例配置部署时**上限下降**）。副作用：`validate::check_file_size` 排在 step 2，**早于** step 3 的 `cos.head_object` 与 step 6 的 best-effort `delete_object` spawn ⇒ 100–300MB 区间的 STS 直传会在 confirm 被 21103 拒、**tmp 对象留在桶里**，只能等 COS lifecycle 回收 | **有意保留 + 已登记**（与 `POST /files/objects` 同读一份配置是本轮 MAJOR-1 的目的；review 第 2 轮 MINOR-C 补登记。⚠️ 降级/上限调整时注意这条副作用，且它与第 5 条**互不相干**：第 5 条是 part 域另一条写路径，既不读配置也不做 owner_kind 配对） |
 //! | 7 | **`GET /files/objects` 的 `owner_kind` 过滤是空操作，且响应里的 `owner_kind` 从请求参数回显**（`service::render_out(&row, owner_kind)` 取形参、不取行上任何列 —— schema 压根没有 owner 类型列） | **有意保留 + 已登记**（读侧不构成隔离，见 `repo/sql.rs::list_with_filters` / `list_by_owner` 顶部注释；review 第 2 轮 MINOR-C 补登记。⚠️ **本条最易误导后人**：**写侧本轮新加了 `owner_kind` × `kind` 强制配对**（20104）而**读侧全无对应隔离** ⇒ 拿 `owner_kind=PART` 去查装配件 owner id 仍会返回 ASSEMBLY_MASTER 行，不要据响应里的 `owner_kind` 认定这些行真属该类型） |
 //! | 8 | **`GET /files/objects/{id}/preview` 返回永久 public-read 直链并放开 `SHELF_ACCOUNT`**：比 `/url` 的 1 小时预签窗口更宽、且**无过期、无撤销**（除改 `previews/` 的 COS ACL），也无法按零件关闭 | **有意保留 + 已登记**（用户拍板选项 A；取舍全文与补偿表见 `preview/mod.rs` 的「安全取舍反转」一节。⚠️ 它与第 6 行「`owner_kind` 过滤是空操作」同源：读侧仍无 owner 级范围判定） |
+//! | 9 | **`t_part_file` 表上没有 `owner_kind` 列 —— owner 语义只活在 API 层**：写侧由 `policy::owner_kind_allows_kind` 强制配对；读侧 `list_with_filters` / `list_by_owner` 的 `owner_kind` 形参**完全不进 SQL**；`render_out` 的 `owner_kind` 字段是**从请求参数回显**、不是从行上读出来的 | **有意保留 + 已登记**（与第 7 条同源。⚠️ 2026-10-16 加第三种 owner `CUSTOMER`（`DELIVERY_TEMPLATE`）后代价更明确：库里无法区分「零件 123 的图纸」与「客户 123 的打印模板」，二者共用 `part_id` 一个列空间。`print_template` 域因此**从不在通用列表端点上读这批行** —— 它只有自己那 5 条端点，每条都按 `(part_id, kind='DELIVERY_TEMPLATE')` 精确取，不依赖 `owner_kind` 过滤） |
+//! | 10 | **`part_id` 一列现已承载**三种 owner：① `t_part.id`（DRAWING / 3D_MODEL / G_CODE / SETUP_SHEET / CAD_2D）、② `t_assembly.id`（ASSEMBLY_MASTER）、③ **`t_customer.id`（DELIVERY_TEMPLATE，2026-10-16）**。三者共用同一个雪花 ID 空间、**无映射表** | **有意保留 + 已登记**（用户拍板「不新建模板表」；新表要多一套软删 / 审计 / OCC 列，而模板字节本来就得走 COS + `t_part_file` 的 CAS key 与配额逻辑）。代价：`SELECT * FROM t_part_file WHERE part_id = $1` 这种**不带 kind** 的查询在语义上是跨三类 owner 的 —— 新增读路径**必须**带 `kind` 谓词，不得依赖 `part_id` 单列的隐含语义） |
 pub mod cnc;
 pub mod dto;
 pub mod handler;

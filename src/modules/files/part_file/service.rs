@@ -149,7 +149,33 @@ impl PartFileService {
         bytes: Vec<u8>,
         current: &CurrentUser,
     ) -> Result<PartFileOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk, Role::CncProgrammer])?;
+        // 角色闸门（2026-10-16 新增 CUSTOMER 分支）。
+        //
+        // PART / ASSEMBLY 保持原集合**逐字不变**（M / C / CNC —— 三条旧上传端点的并集，
+        // 见本文件模块 doc 的「唯一一处权限面放大」一节）；CUSTOMER（送货单打印模板）
+        // **只放 MANAGER**。
+        //
+        // ⚠️ **这道分派是「CLERK 不能偷偷绑模板」的唯一闸门**：`owner_kind` 与 `kind`
+        // 都由 client 在 multipart `data` 里给，而 `print_template` 域的
+        // `POST /print-templates` 有自己的 MANAGER-only handler 守卫 —— 但那只守
+        // **那一个端点**。CLERK 若能直接打 `POST /files/objects` 并在 `data` 里写
+        // `{"owner_kind":"CUSTOMER","kind":"DELIVERY_TEMPLATE"}`，就能绕过模板管理页
+        // 给自己日常对接的客户乱换打印模板（改的是别人出货单上的抬头、地址、抬头行
+        // 数与顺序）。所以「谁能写 DELIVERY_TEMPLATE」必须在**共用上传原语**里判，
+        // 不能只在新域的 handler 上判。
+        match owner_kind {
+            "PART" | "ASSEMBLY" => {
+                current.require_any_role(&[Role::Manager, Role::Clerk, Role::CncProgrammer])?;
+            }
+            "CUSTOMER" => {
+                current.require_any_role(&[Role::Manager])?;
+            }
+            // 未知 owner_kind 不在此放行：交给下面 step 0 的配对守卫报 20104，
+            // 与既有行为一致（`require_any_role(&[...])` 逐条原样跑即可）。
+            _ => {
+                current.require_any_role(&[Role::Manager, Role::Clerk, Role::CncProgrammer])?;
+            }
+        }
 
         // 0. owner_kind × kind 配对（2026-10-13 review 第 1 轮 MINOR-3）：四合一
         //    之前这层配对由「各端点自己的 path 段 + 硬编码 kind」在结构上保证，
@@ -451,6 +477,12 @@ impl PartFileService {
     }
 
     /// 校验 owner 存在性（polymorphic，走 trait helper）。
+    ///
+    /// 2026-10-16 新增 `"CUSTOMER"` 臂（送货单打印模板挂在**一级客户**上）。
+    /// ⚠️ 本方法**只判「存在且未软删」**，不判「是不是一级客户」——
+    /// `parent_id IS NULL` 是 `print_template` 域自己的强制点（绑二级 → 20104），
+    /// 刻意不放这里：files 域不该知道「客户分两级」这个别的域的业务概念。
+    /// 错误码沿用 `BIZ_PART_FILE_OWNER_NOT_FOUND`（21105），与另两种 owner 同款。
     async fn assert_owner_exists<R: PartFileRepoTrait>(
         repo: &mut R,
         owner_kind: &str,
@@ -473,10 +505,18 @@ impl PartFileService {
                     ));
                 }
             }
+            "CUSTOMER" => {
+                if !repo.customer_owner_exists(owner_id).await? {
+                    return Err(AppError::biz(
+                        code::BIZ_PART_FILE_OWNER_NOT_FOUND,
+                        format!("customer {owner_id} 不存在"),
+                    ));
+                }
+            }
             other => {
                 return Err(AppError::biz(
                     code::BIZ_INVALID_VALUE,
-                    format!("owner_kind {other:?} 不支持（仅 PART / ASSEMBLY）"),
+                    format!("owner_kind {other:?} 不支持（仅 PART / ASSEMBLY / CUSTOMER）"),
                 ));
             }
         }
@@ -827,11 +867,22 @@ impl PartFileService {
             "G_CODE" => {
                 current.require_any_role(&[Role::Manager, Role::CncProgrammer])?;
             }
+            // 2026-10-16 新增：送货单打印模板**只放 MANAGER**。
+            // ⚠️ 不加这一支就是「写得进、删不掉」——`owner_kind_allows_kind`
+            // 放行了 `CUSTOMER + DELIVERY_TEMPLATE`，所以 CLERK 能通过
+            // `POST /files/objects` 造出这种行，而本分派表若缺它，别的角色一律
+            // 撞 `other => 不可软删` 分支 ⇒ 模板永久删不掉（`print_template` 域的
+            // `POST /print-templates/{id}/delete` 也走本方法，它自己已是
+            // MANAGER-only，与这一支同面）。与 ASSEMBLY_MASTER 那次
+            // （2026-10-13 review 第 1 轮 MINOR-6）同款闭包。
+            "DELIVERY_TEMPLATE" => {
+                current.require_any_role(&[Role::Manager])?;
+            }
             other => {
                 return Err(AppError::biz(
                     code::BIZ_PART_FILE_BAD_TYPE,
                     format!(
-                        "kind={other:?} 不可软删（仅 DRAWING / 3D_MODEL / CAD_2D / SETUP_SHEET / ASSEMBLY_MASTER / G_CODE）"
+                        "kind={other:?} 不可软删（仅 DRAWING / 3D_MODEL / CAD_2D / SETUP_SHEET / ASSEMBLY_MASTER / G_CODE / DELIVERY_TEMPLATE）"
                     ),
                 ));
             }

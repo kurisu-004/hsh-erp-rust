@@ -28,12 +28,23 @@ use std::path::Path;
 /// 它们只经 CNC 配对端点（`POST /files/cnc/pairs`，走 `cnc/service.rs` 的专用
 /// 分支）写入，不经过本函数，故不受影响。
 ///
+/// 2026-10-16 **新增 `DELIVERY_TEMPLATE`**：送货单打印模板复用 `t_part_file`
+/// 承载（不新建模板表），扩展名**只收 `xlsx`**。
+/// ⚠️ 「只收 xlsx」是**刻意不给 `.xls`**：`.xls` 是 BIFF 二进制格式，前端
+/// hucre / SheetJS 侧读它要走另一条兼容路径，而需求原文就是「模板支持 xlsx
+/// 格式」。旧 `.xls` 模板请先另存为 `.xlsx` 再上传。
+/// 连带效果：`dto::validate::check_kind` 复用同一张白名单，所以
+/// `POST /files/objects/confirm`（STS 两段式）也顺带接受该 kind —— 但
+/// `print_template` 域**只用一次性 multipart 上传**，没有走 confirm 的调用方，
+/// 见 `docs/api/print_template.md` §8.3 第 3 条。
+///
 /// 2026-09-11 新增
 pub fn allowed_exts(kind: &str) -> &'static [&'static str] {
     match kind {
         "DRAWING" => &["pdf"],
         "3D_MODEL" => &["step", "stp", "iges", "igs", "stl", "obj", "3mf"],
         "ASSEMBLY_MASTER" => &["pdf"],
+        "DELIVERY_TEMPLATE" => &["xlsx"],
         _ => &[],
     }
 }
@@ -59,22 +70,35 @@ pub fn allowed_exts(kind: &str) -> &'static [&'static str] {
 /// 本表**不会**自动放行它 —— 那是有意的：新 kind 必须先在这里显式声明它挂哪种
 /// owner，避免又出现「能写不能删」的行。
 ///
+/// 2026-10-16 **新增第三种 owner `CUSTOMER`**（只收 `DELIVERY_TEMPLATE`）：
+/// 送货单打印模板挂在**一级客户**上（`print_template` 域）。
+/// ⚠️ `CUSTOMER` 是**单向**的：`PART` / `ASSEMBLY` 两臂刻意**不加**
+/// `DELIVERY_TEMPLATE` —— 否则 `POST /files/objects`（owner_kind 与 kind 都由
+/// client 在 multipart `data` 里给）会造出「零件挂送货单打印模板」这种
+/// 语义上不存在的行，且这类行**无人读**（`print_template` 域只按
+/// `(customer_id, DELIVERY_TEMPLATE)` 查），是纯垃圾数据。
+/// 未列出的 owner_kind 一律返 `false`（fail-safe），该行为**不变**。
+///
 /// 2026-10-13 新增
 pub fn owner_kind_allows_kind(owner_kind: &str, kind: &str) -> bool {
     match owner_kind {
         "PART" => matches!(kind, "DRAWING" | "3D_MODEL"),
         "ASSEMBLY" => matches!(kind, "ASSEMBLY_MASTER"),
+        // 2026-10-16 新增：一级客户只挂送货单打印模板（xlsx）。
+        "CUSTOMER" => matches!(kind, "DELIVERY_TEMPLATE"),
         // 未知 owner_kind 由 `PartFileService::assert_owner_exists` 报 20104，
         // 这里直接 false（不区分错误码，两道守卫都拒即可）。
         _ => false,
     }
 }
 
-/// 扩展名（小写，不含点） → file_type 字符串（如 `"PDF"` / `"STEP"`）。
+/// 扩展名（大写） → `t_part_file.file_type` 字符串（如 `"PDF"` / `"STEP"`）。
 ///
 /// **大小写不敏感**：传入 `"STL"` / `"stl"` 等价。
 /// 返回 `Option`：扩展名无对应 file_type（不在白名单）时 `None`，
 /// service 层用其判定是否接受。
+///
+/// 2026-10-16 新增 `"xlsx" => "XLSX"`（`DELIVERY_TEMPLATE` 的唯一格式）。
 ///
 /// 2026-09-11 新增
 pub fn file_type_for_ext(ext: &str) -> Option<&'static str> {
@@ -85,17 +109,30 @@ pub fn file_type_for_ext(ext: &str) -> Option<&'static str> {
         "stl" => Some("STL"),
         "obj" => Some("OBJ"),
         "3mf" => Some("3MF"),
+        "xlsx" => Some("XLSX"),
         _ => None,
     }
 }
 
-/// 扩展名 → 浏览器可能上传的 content_type 白名单（含 `application/octet-stream` 兜底）。
+/// 扩展名 → 浏览器可能上传的 content_type 白名单。
 ///
 /// **大小写不敏感**（与 `file_type_for_ext` 一致）。
 ///
 /// service 层据此校验客户端声明的 `content_type` 是否与扩展名一致；
 /// 返回 `&[]` 表示该扩展名不接受任何 content_type（实际不会到这，因为
 /// `file_type_for_ext` 已先把不在白名单的扩展名挡掉）。
+///
+/// ⚠️ **白名单里给不给 `application/octet-stream` 是逐扩展名的取舍，不是默认值**：
+/// 本文件对 **pdf 从来不给**它 —— 浏览器对 PDF 一律发 `application/pdf`，
+/// 收 octet-stream 等于「不校验 MIME」。`step` / `stl` / `obj` / `3mf` 那几支
+/// 则**故意**收了（部分浏览器 / 拖拽上传对未知类型一律发 octet-stream，收了才
+/// 是可用性而不是放水）。
+/// 2026-10-16 **新增 `xlsx` 分支，只收精确值**：
+/// OOXML 的 MIME 是标准化的，主流浏览器 / Element Plus 的 `:accept` 都发
+/// `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`，
+/// **刻意不给 octet-stream 兜底** —— 收下 octet-stream 等于让任何文件改个名
+/// 成 `.xlsx` 就能过 content_type 这道闸，而模板是要被前端 SheetJS / hucre
+/// 直接解析的，伪装进来只会在渲染阶段炸。
 ///
 /// 2026-09-11 新增
 pub fn expected_content_types_for_ext(ext: &str) -> &'static [&'static str] {
@@ -118,6 +155,8 @@ pub fn expected_content_types_for_ext(ext: &str) -> &'static [&'static str] {
             "model/3mf",
             "application/octet-stream",
         ],
+        // ⚠️ 只收精确值，**不给** `application/octet-stream` 兜底（同 pdf 一节的理由）。
+        "xlsx" => &["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"],
         _ => &[],
     }
 }
@@ -172,6 +211,14 @@ mod tests {
         assert_eq!(allowed_exts("UNKNOWN"), &[] as &[&str]);
     }
 
+    /// 2026-10-16：`DELIVERY_TEMPLATE` **只收 xlsx**（刻意不收 `.xls`）。
+    #[test]
+    fn allowed_exts_delivery_template_only_xlsx() {
+        assert_eq!(allowed_exts("DELIVERY_TEMPLATE"), &["xlsx"]);
+        assert!(!allowed_exts("DELIVERY_TEMPLATE").contains(&"pdf"));
+        assert!(!allowed_exts("DELIVERY_TEMPLATE").contains(&"xls"));
+    }
+
     #[test]
     fn owner_kind_allows_kind_normal_pairs() {
         // PART owner 只能挂零件自己的两类文件
@@ -202,6 +249,27 @@ mod tests {
         assert!(!owner_kind_allows_kind("PART_FILE", "DRAWING"));
     }
 
+    /// 2026-10-16：`CUSTOMER` 只挂 `DELIVERY_TEMPLATE`，且**反向一律拒**。
+    ///
+    /// 反向那三条（PART / ASSEMBLY 挂 DELIVERY_TEMPLATE）是本条守卫存在的全部
+    /// 理由：`POST /files/objects` 的 owner_kind 与 kind 都由 client 给，
+    /// 不挡就会有「零件挂送货单打印模板」这种无人读、删不掉的垃圾行。
+    #[test]
+    fn owner_kind_allows_kind_customer_is_delivery_template_only() {
+        assert!(owner_kind_allows_kind("CUSTOMER", "DELIVERY_TEMPLATE"));
+        for k in ["DRAWING", "3D_MODEL", "ASSEMBLY_MASTER"] {
+            assert!(
+                !owner_kind_allows_kind("CUSTOMER", k),
+                "CUSTOMER 不该收 {k}"
+            );
+        }
+        assert!(!owner_kind_allows_kind("PART", "DELIVERY_TEMPLATE"));
+        assert!(!owner_kind_allows_kind("ASSEMBLY", "DELIVERY_TEMPLATE"));
+        // 未列出的 owner_kind 继续 fail-safe（新增 CUSTOMER 不得放宽默认臂）
+        assert!(!owner_kind_allows_kind("CUSTOMERS", "DELIVERY_TEMPLATE"));
+        assert!(!owner_kind_allows_kind("SHELF", "DELIVERY_TEMPLATE"));
+    }
+
     #[test]
     fn file_type_for_ext_maps_step_stp_to_step() {
         assert_eq!(file_type_for_ext("step"), Some("STEP"));
@@ -209,6 +277,9 @@ mod tests {
         assert_eq!(file_type_for_ext("pdf"), Some("PDF"));
         assert_eq!(file_type_for_ext("STL"), Some("STL"));
         assert_eq!(file_type_for_ext("3mf"), Some("3MF"));
+        // 2026-10-16：xlsx → XLSX（送货单打印模板）
+        assert_eq!(file_type_for_ext("xlsx"), Some("XLSX"));
+        assert_eq!(file_type_for_ext("XLSX"), Some("XLSX"));
     }
 
     #[test]
@@ -227,6 +298,20 @@ mod tests {
         let cts = expected_content_types_for_ext("step");
         assert!(cts.contains(&"application/step"));
         assert!(cts.contains(&"application/octet-stream"));
+    }
+
+    /// 2026-10-16：`xlsx` **只收精确 OOXML MIME**，不给 octet-stream 兜底。
+    #[test]
+    fn expected_content_types_xlsx_is_exact_only() {
+        let cts = expected_content_types_for_ext("xlsx");
+        assert_eq!(
+            cts,
+            &["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"]
+        );
+        assert!(
+            !cts.contains(&"application/octet-stream"),
+            "xlsx 刻意不给 octet-stream 兜底：收下它等于放行「改名成 .xlsx 的任意文件」"
+        );
     }
 
     #[test]
