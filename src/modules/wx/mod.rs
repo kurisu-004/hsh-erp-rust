@@ -15,7 +15,10 @@
 //! - 每个页面 = **1 个「首屏聚合端点」**（角标 + 第 1 页数据）+ **1 个「上拉增量端点」**
 //!   （只返增量，不重算角标）
 //! - **VO 不复用任何他域结构**（消灭了跨域复用的 `iam::vo::CurrentUserOut` /
-//!   `iam::vo::LoginResponse` / `shared::batch::status_machine::PartStatus`）
+//!   `iam::vo::LoginResponse`）。`shared::batch::status_machine::PartStatus` 同样
+//!   不用，但那是**页面语义 vs 状态机语义**之别、**不是跨域复用** —— 该枚举
+//!   2026-10-13 起已不属于任何域，待办条目见 `shared::batch::status_machine`
+//!   模块 doc 的 wx 一节
 //! - **URL 跟页面名走**（`/login` / `/part-list` / `/production`），不再把别域的
 //!   路径前缀（`/iam`）嫁接过来
 //!

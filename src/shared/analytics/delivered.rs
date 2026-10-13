@@ -23,7 +23,7 @@
 //! ## 口径约定（两条 SQL 与它们的边界处理，改口径必须改这一处）
 //!
 //! 两条都是**已交**（`t_part_batch.status IN ('DELIVERED','COMPLETED')`）口径。
-//! ⚠️ 与 [`crate::modules::com::delivery_note::service::shippable_sets`] 的
+//! ⚠️ 与 `crate::modules::com::delivery_note::service` 的私有 `shippable_sets`
 //! 「本单可出货套数」**刻意不同**：那份是纯内存实现、分子只计本单 `READY_TO_SHIP`
 //! 批次、问的是「这一单能出几套」而非「这个装配件历史上共出几套」。三者不是同一口径的
 //! 两种实现，不要合并。

@@ -31,7 +31,9 @@
 
 wx BFF 重构 **B2 + B3 两步**已完成（重构收官）。原先 `/api/v2/wx/*` 是 **10 个平铺
 文件、零 service 层**，且**跨域复用** `iam::vo::CurrentUserOut` /
-`iam::vo::LoginResponse` / `shared::batch::status_machine::PartStatus`。重构后：
+`iam::vo::LoginResponse`（另**未复用** `shared::batch::status_machine::PartStatus` ——
+白名单是页面语义不是状态机语义，**2026-10-13 起该枚举已不属于任何域**，不再是
+「跨域」问题）。重构后：
 
 1. **按页面切子模块**：`login/`（登录页）+ `part_list/`（零件一览页，B2）+
    `production/`（生产页，B3）。B3 之后 `wx/mod.rs` 下只剩这 3 个子目录 +
@@ -129,7 +131,8 @@ wx BFF 重构 **B2 + B3 两步**已完成（重构收官）。原先 `/api/v2/wx
 | `size` | number | 否 | 缺省 10，`clamp(1, 50)` |
 
 `tab` 白名单在 `production::service::tab_to_db_statuses`（私有），**刻意不用**
-`shared::batch::status_machine::PartStatus` 做校验 —— 那正是本次要消灭的跨域复用。
+`shared::batch::status_machine::PartStatus` 做校验 —— 白名单是**页面语义**
+（前端 tab 值 → SQL 状态集），不是状态机迁移语义。
 
 `resolve_period`（旧 `wx::resolve_period`，`pub(crate)`）于 2026-10-11 随 B3 搬进
 `production::service` 并**降级为私有函数**（连同它的 3 个单测）。B3 之后 wx 域只剩
@@ -441,7 +444,9 @@ camelCase。它们是**前端的 tab 名**（前端 `mock/production.ts` 声明�
   **在拼进 SQL 之前**就被拒（映射表是编译期常量，参数仍走 bind ⇒ 注入面为 0）。
 - 白名单在 `part_list::service::status_to_db_statuses`（返回
   `PartFilter { statuses, ignore_date }`），**刻意不用**
-  `shared::batch::status_machine::PartStatus` 做校验 —— 那正是要消灭的跨域复用。
+  `shared::batch::status_machine::PartStatus` 做校验 —— 白名单是**页面语义**
+  （前端 tab 值 → SQL 状态集，且产品已排除 `PROGRAMMING` / `COMPLETED` /
+  `CANCELLED`），不是状态机迁移语义。
 - `REPAIRING` **不在表里**（2026-10-01 起降级为 `t_part_batch.is_repairing` 标记列，
   DB 不再产生该 status；返修中的工单 status 就是 `IN_PROCESS`，自动计入
   `in_production`）。**别加回 `REPAIRING` 分支**。

@@ -43,7 +43,9 @@ impl AssemblyService {
     /// 3. 拉子件 status → `compute_assembly_target` → Some(target)
     /// 4. 取父当前 version + status；target == 当前 → NoChange
     /// 5. `update_status_if_not_terminal`；0 行 → **降级为 `NoChange`**（不抛错、
-    ///    不回滚，2026-10-01，见下方「派生层冲突降级」段）
+    ///    不回滚，2026-10-01，见 `shared::batch::status::sync_assembly_status`
+    ///    函数体内的「2026-10-01 派生层冲突降级」段 —— 该段已于 2026-10-13
+    ///    随函数实体搬到 shared，本文件不再持有）
     /// 6. 返回 `Changed(assembly_id)`
     ///
     /// 2026-09-22 D-3 决策：方法签名为 `(&self, repo: R, part_id, current)`；

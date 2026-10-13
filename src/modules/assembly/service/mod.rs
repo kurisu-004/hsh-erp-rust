@@ -56,8 +56,9 @@ use crate::shared::error::AppError;
 
 /// `TAssembly` → `AssemblyOut`（详情 / 更新 / 取消 / start / force-complete 返回）。
 ///
-/// 2026-10-13：原先 `crud.rs` 与 `lifecycle.rs` 各存一份 20 字段逐字同形的副本，
-/// 2022-09-22 D-3 给的理由是「保留两份以避免跨子模块 `pub(crate)` 暴露」—— 该理由
+/// 2026-10-13：原先 `crud.rs` 与 `lifecycle.rs` 各存一份**全字段逐字同形**的
+/// `AssemblyOut` 副本，2026-09-22 D-3 给的理由是「保留两份以避免跨子模块
+/// `pub(crate)` 暴露」—— 该理由
 /// 在 Rust 里不成立（同 crate 内 `pub(crate)` 即可，且本函数本就只在同 crate 内被两个
 /// 子模块调用）。两份副本改由本函数单点承载：VO 加/删字段只改一处，不会出现
 /// 「crud 返新字段、lifecycle 返旧字段」这种静默分叉。
@@ -88,11 +89,12 @@ pub(crate) fn render_assembly_out(asm: TAssembly) -> AssemblyOut {
 }
 
 /// 2026-10-13：`SyncOutcome` 的**定义**已上提到
-/// `crate::shared::batch::status`（本模块的 [`RollupOutcome`] 与整条派生链都在
+/// `crate::shared::batch::status`（本模块的 `RollupOutcome` 与整条派生链都在
 /// shared 那一层，而 `SyncOutcome` 表达的是「派生有没有真写库」，是派生链自身的
 /// 返回类型）。此处保留 `pub use` 重导出，使
 /// `crate::modules::assembly::service::SyncOutcome` 这条老路径继续可解析
-/// （`admin::service` 与 `tests/assembly/status_sync.rs` 走的就是它）。
+/// （现存的调用点是 `admin::service` / `prod::scan::service::transfer` /
+/// `tests/assembly/status_sync.rs`）。
 pub use crate::shared::batch::status::SyncOutcome;
 
 /// assembly 域业务门面。handler 经 `state.pool.begin()` 开 tx 后透传 `&mut tx`。

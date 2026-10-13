@@ -66,8 +66,9 @@
 //!
 //! - ⚠️ **必填**：缺 `?tab=` 是 serde 缺字段 ⇒ axum 提取器层 **HTTP 400 纯文本**
 //!   （**不走 `R<T>`**，旧端点同款行为，本轮不改）；传了但非法才走 40001 / 422。
-//! - ⚠️ **刻意不用** `shared::batch::status_machine::PartStatus` 做校验 —— 那正是本次要消灭的
-//!   跨域复用。
+//! - ⚠️ **刻意不用** `shared::batch::status_machine::PartStatus` 做校验 —— 白名单是
+//!   **页面语义**（前端 tab 值 → SQL 状态集），不是状态机迁移语义；且 `done` 桶
+//!   含 `COMPLETED` 而状态机词汇表对此另有语义，两者本就不该共用一张表。
 //!
 //! ## ⚠️ `counts` 的键保持 snake_case（`in_progress` / `done`）
 //! 它是**前端 tab 名**（前端 `mock/production.ts` 声明为

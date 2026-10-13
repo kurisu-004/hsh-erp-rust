@@ -1025,7 +1025,8 @@ impl PartBatchRepo {
     /// 本函数是「part 被 rollup 进 COMPLETED → 归档并释放 `serial_no`」这条
     /// 新链路的**最常见触发点**：part 只有在所有非取消批次都 COMPLETED 时才会
     /// 派生到 COMPLETED，故多批次工单完成最后一条时自动释放，无需 service 层
-    /// 再记得调 `clear_part_serial_no_when_completed`。
+    /// 再记得调 `clear_part_serial_no_when_completed`（该函数已随 2026-10-13
+    /// 死代码清理删除 —— 零调用方，释放逻辑收进 `shared::batch::status`）。
     ///
     /// `event_id`（2026-10-01 review 第 1 轮 M4）：本函数是**能让 part 新进
     /// COMPLETED** 的写点之一，故必须由 caller 传一个真实雪花 id 供终态序列号

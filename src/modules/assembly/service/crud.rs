@@ -184,8 +184,8 @@ fn render_list_item(
     }
 }
 
-// 2026-10-13：`render_assembly_out` 原先在本文件与 `lifecycle.rs` 各存一份 20 字段
-// 逐字同形的副本（2022-09-22 D-3 的理由「避免跨子模块 pub(crate) 暴露」在 Rust 里
+// 2026-10-13：`render_assembly_out` 原先在本文件与 `lifecycle.rs` 各存一份**全字段
+// 逐字同形**的副本（2026-09-22 D-3 的理由「避免跨子模块 pub(crate) 暴露」在 Rust 里
 // 不成立 —— 同 crate 内 `pub(crate)` 即可）。两份副本已合并到
 // `super::render_assembly_out`（`service/mod.rs`），改字段只改一处。
 use super::render_assembly_out;

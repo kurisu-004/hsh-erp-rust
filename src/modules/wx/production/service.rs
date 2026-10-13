@@ -9,8 +9,9 @@
 //! | `in_progress` | `['IN_PROCESS']` | `status='IN_PROCESS'`（+ `updated_at` 落当月） |
 //! | `done` | `['DELIVERED','COMPLETED']`（**两个**） | `status IN (...)` + 当月存在 `DELIVERED` 事件 |
 //!
-//! ⚠️ **不**复用 `shared::batch::status_machine::PartStatus` 做校验 —— 那正是本次重构要消灭的
-//! 跨域复用（`wx::mod.rs` 的模块 doc 有登记）。
+//! ⚠️ **不**复用 `shared::batch::status_machine::PartStatus` 做校验 —— 白名单是
+//! **页面语义**（前端 tab 值 → SQL 状态集），不是状态机迁移语义
+//! （`wx::mod.rs` 的模块 doc 有登记）。
 //!
 //! ## ★ `resolve_period` 从 `wx/mod.rs` 搬来（2026-10-11）
 //! 旧位置是 `wx::resolve_period`（`pub(crate)`，被 `batches.rs` + `worker.rs`

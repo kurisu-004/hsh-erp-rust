@@ -12,15 +12,20 @@
 //! ## 4 条硬边界
 //! 1. 不挂 URL：`src/shared/analytics/mod.rs` **不**出现在 `src/modules/mod.rs`
 //! 2. 没有五段式：不创建 handler/、service/、repo/、dto/、vo/ 任一段
-//! 3. **SQL 只在本库内自持**：本库**不**是任何一张表的 repo、也不调任何域的 repo；
-//!    `daily_buckets` / `worker_contribution` 是纯函数（SQL 在 statistics/repo.rs），
-//!    `delivered` 的两条 SQL 因原先要跨两个域复用而直接落在这里（它们是**共享口径**
-//!    而非某域表结构的私有查询，见 `delivered.rs` 的模块 doc）
+//! 3. **零 SQL 真源**：所有 SQL 仍在 statistics/repo.rs。本库**不**是任何一张表的
+//!    repo、也**不调任何域的 repo**。**唯一例外**是 `delivered` 的两条 SQL（2026-10-13
+//!    新增）：它们原先要跨 part / dashboard 两个域复用，故直接落在这里（属**共享口径**
+//!    而非某域表结构的私有查询，见 `delivered.rs` 的模块 doc）。
+//!    ⚠️ 本库仍 import 既有他域**类型**（`statistics::repo::WorkerPickupRow`、
+//!    `statistics::vo::DayCount`）—— 那是 row / vo 的形状，不是 SQL 真源、也不是
+//!    调他的 repo；这类依赖是既有事实，见下一节。
 //! 4. 零鉴权：analytics 函数不调 `current.require_role()`
 //!
 //! ## 边界收敛
-//! 本库的函数**各有若干消费方**（`statistics` 2 个、`delivered` 是 part 与 dashboard
-//! 两域共用）。`cargo test --lib` 的 dashboard 域隔离护栏
+//! 本库的函数**各有若干消费方**（`statistics` 2 个；`delivered` 共 **3 个消费方**：
+//! `part::service::crud` / `dashboard::repo::delivery` / `com::union_list::service::crud`
+//! —— 后者经 `part::service::list_enrichment` 的 `pub(crate)` 重导出取用）。
+//! `cargo test --lib` 的 dashboard 域隔离护栏
 //! （`modules::dashboard::tests::dashboard_domain_depends_on_no_other_domain`）
 //! 挡的是「引其它**业务域**」这一类依赖——它只扫 `src/modules/dashboard/**/*.rs`
 //! 里的「域根段 + 他域路径」前缀失配，**不拦** `shared::analytics`。

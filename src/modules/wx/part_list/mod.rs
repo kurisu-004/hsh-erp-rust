@@ -53,7 +53,9 @@
 //!
 //! 白名单外的值（如 DB 原值 `PENDING`、旧 tab 值 `pendingInspection`、注入串）
 //! → `AppError::validation`（40001 / HTTP 422），且**在拼进 SQL 之前**被拒。
-//! ⚠️ **刻意不用** `shared::batch::status_machine::PartStatus` 做校验 —— 那正是要消灭的跨域复用。
+//! ⚠️ **刻意不用** `shared::batch::status_machine::PartStatus` 做校验 —— 白名单是
+//! **页面语义**（前端 tab 值 → SQL 状态集），不是状态机迁移语义；且产品已明确
+//! 排除 `PROGRAMMING` / `COMPLETED` / `CANCELLED`，与 `PartStatus` 的迁移表无关。
 //!
 //! ### 2026-10-12 修掉 / 变更的语义
 //! 1. **`all` / 缺省不再是「不过滤」**：旧实现落到 `Option::None`（SQL 里

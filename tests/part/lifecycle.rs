@@ -627,7 +627,8 @@ async fn part_status(pool: &PgPool, part_id: i64) -> String {
 /// 覆盖本次修的核心缺陷（`clear_part_serial_no_when_completed` 的 WHERE 是
 /// **part 级** `status='COMPLETED'`，而 `complete` 一次只翻**一条**批次，
 /// 于是该 UPDATE 命中 0 行并被 `let _ =` 静默吞掉 → 序列号被
-/// `uk_t_part_serial_no` 永久占住）：
+/// `uk_t_part_serial_no` 永久占住）。⚠️ 该函数已随 2026-10-13 死代码清理删除
+/// （零调用方，释放逻辑收进 `shared::batch::status`），此处留作历史成因说明：
 ///
 /// 1. 完成第 1 条批次 → part 仍 DELIVERED（min-progress 还是有别的批次）→
 ///    **序列号必须仍在**（货还在厂里，唯一索引继续占用是**正确**行为）；
@@ -727,7 +728,8 @@ async fn multi_batch_complete_releases_serial_only_when_part_terminates() {
 /// 覆盖改造前的**永久泄漏**路径：`PartService::cancel_batch`
 /// （`POST /prod/batches/{batch_id}/cancel`）只翻批次、调 rollup，
 /// 从不调 `clear_part_serial_no_when_completed`（那个函数的 WHERE 只认
-/// `status='COMPLETED'`）。于是 part 已 CANCELLED、`serial_no` 却还挂着，
+/// `status='COMPLETED'`；该函数已随 2026-10-13 死代码清理删除）。于是 part 已
+/// CANCELLED、`serial_no` 却还挂着，
 /// 被 `uk_t_part_serial_no` 永久占住，同序列号再也无法被新工单复用，
 /// 且**没有任何报错或告警**。
 #[tokio::test]

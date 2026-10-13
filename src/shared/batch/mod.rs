@@ -17,17 +17,19 @@
 //!
 //! ## 边界登记：shared/batch 依赖 4 个域，是本仓依赖面最宽的 shared 模块
 //!
-//! > ⚠️ **反向依赖（`shared → modules`）已在 2026-10-13 消除**：本表 4 行全是
-//! > 「shared 经**域 repo** 读写别域的表」，方向仍是 `shared → modules`，但那是
-//! > **既有的、已登记的**例外（派生链的实现本身）。本轮消除的是另一类问题：
-//! > `shared/batch/{status,guards}.rs` 直接 `use crate::modules::part::statemachine::…`
-//! > 这类「shared 借用某个域的纯逻辑」—— `PartStatus` / `compute_part_target` 已上提
-//! > 到本模块的 [`status_machine`]，part 域的 `statemachine.rs` 随之整文件删除。
+//! > ⚠️ **本轮消除的是「shared 借用某域的**纯逻辑**」这一类**，不是全部方向：
+//! > `PartStatus` / `compute_part_target` 已上提到本模块的 [`status_machine`]，
+//! > part 域的 `statemachine.rs` 随之整文件删除 ⇒ `shared/batch` 内
+//! > `part::statemachine` 的 import 净变化 = **消除 3 条 `use`**
+//! > （`status.rs` 1 条带 2 个符号 + `guards.rs` 2 条同符号：主模块与 test mod
+//! > 各 1）/ **新增 1 条**（读 `assembly::statemachine`，见下表新增的第 3 行）。
+//! > 而**经域 repo 读写别域的表**（本表 4 行）方向仍是 `shared → modules` —— 那是
+//! > **既有的、已登记**的例外（派生链的实现本身），本轮未动、也不在消除目标内。
 //!
 //! | 域 | 经 shared 的哪个文件 | 读 / 写 | 入口 |
 //! |---|---|---|---|
 //! | `part` | `status` | **写** | `PartRepo::update_part_rollup`（`part` 派生列回填） |
-//! | `assembly` | `status` | **写** | [`status::sync_assembly_status`]（父件聚合 + 翻转，**2026-10-13 自 `assembly::service` 搬进本文件**）；另经 `AssemblyService::sync_from_part_change_by_id` 这个 wrapper 入口 |
+//! | `assembly` | `status` | **写** | `status::sync_assembly_status`（父件聚合 + 翻转，**2026-10-13 自 `assembly::service` 搬进本文件**）；另经 `AssemblyService::sync_from_part_change_by_id` 这个 wrapper 入口 |
 //! | `assembly`（状态机纯函数） | `status` | 读 | `AssemblyStatus` / `compute_assembly_target`（同上搬移带入；二者是内存函数、零 DB） |
 //! | `iam` | `guards` | 读 | `ShelfRepo::get_by_id`（`validate_shelf_zone` 的存在 / 停用 / zone 三谓词在 Rust 层逐条判） |
 //! | `prod::process_chain` | `guards` | 读 | `ProcessChainRepo::resolve_step_id_by_process`（`optional_step_id`） |

@@ -7,8 +7,10 @@
 //!
 //! 1. 「位置 / 持有人」（2026-09-16 PR-2 瘦身后新增，见下）：按 min-progress
 //!    活跃批次跨 `t_shelf` / `t_worker` / `t_outsource_company` 解析。
-//! 2. 「已送数量」（2026-10-03 新增）：PART 行取已交批次 `quantity` 之和，
-//!    ASSEMBLY 行取可凑齐的套数（min 公式）。
+//! 2. 「已送数量 / 已送套数」（2026-10-03 新增）：PART 行取已交批次 `quantity`
+//!    之和，ASSEMBLY 行取可凑齐的套数（min 公式）。⚠️ **2026-10-13 起这两条的定义
+//!    已搬到 `shared::analytics::delivered`**（原先 dashboard 域另有一份逐字副本，
+//!    见文件末尾的 `pub(crate) use` 重导出），本文件不再持有其定义。
 //!
 //! 2026-09-16 PR-2 瘦身（migration 027）：t_part 删 `location` /
 //! `current_holder_id`（已删列），列表页需要的「位置 / 持有人」展示由

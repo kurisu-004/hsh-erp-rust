@@ -159,7 +159,9 @@ impl PartService {
     /// 2026-10-01：该 bulk 写点已改走 `shared::batch::status` 的批量模式，故
     /// `compute_part_target` 派生 `part.status='COMPLETED'`、级联 assembly
     /// 同步、终态序列号归档 / 释放**全部在同一事务内自动完成**，
-    /// 本方法不再手工调 `sync_from_batch_change` / `clear_part_serial_no_when_completed`。
+    /// 本方法不再手工调 `sync_from_batch_change` / `clear_part_serial_no_when_completed`
+    /// （后者已随 2026-10-13 死代码清理删除 —— 零调用方，释放逻辑已收进
+    /// `shared::batch::status` 的终态序列号段）。
     ///
     /// 事件日志 `event_type='FORCE_COMPLETED'`（区别常规 COMPLETED），note 加
     /// `[FORCE]` 前缀以便审计追溯；WS 广播 `PART_FORCE_COMPLETED`。
@@ -201,7 +203,8 @@ impl PartService {
         //    part → assembly 派生（part 自动派生到 COMPLETED）与终态序列号
         //    归档 / 释放**都已在同一事务内完成**。原第 6/7 步
         //    （`sync_from_batch_change` + `clear_part_serial_no_when_completed`，
-        //    两者都被 `let _ =` 静默吞掉）整体删除。
+        //    两者都被 `let _ =` 静默吞掉）整体删除。⚠️ 这两个符号现在**都不存在**
+        //    （`clear_part_serial_no_when_completed` 随 2026-10-13 死代码清理删除）。
         let _n = repo
             .force_complete_all_batches_for_part(part_id, current.id, Some(snowflake.next_id()))
             .await?;

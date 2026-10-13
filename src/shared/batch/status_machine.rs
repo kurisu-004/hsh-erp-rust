@@ -11,8 +11,9 @@
 //! 「依赖方向是 域 → shared」的约定，是本仓唯一一处方向违规。
 //!
 //! 上提到 shared 后：`part` / `prod::batch` / `prod::scan` / `prod::queue` /
-//! `outsource` / `assembly` / `com::delivery_note` 与 `shared::batch` 内部的
-//! `guards` / `status` 全部是**同一层依赖 shared**，方向恢复一致。
+//! `outsource` / `assembly` 与 `shared::batch` 内部的 `guards` / `status` 全部是
+//! **同一层依赖 shared**，方向恢复一致。（`com::delivery_note` **不在**这份名单里 ——
+//! 实测该域对本模块**零 import**，只有 `vo/batch_status.rs` 的注释提到本模块。）
 //!
 //! ## 搬走的就是全部（原文件无 part 私有内容）
 //!
@@ -24,12 +25,22 @@
 //! `prod::batch::service::repair` 与 `shared::batch::status`），故
 //! `src/modules/part/statemachine.rs` 随之**整文件删除**。
 //!
-//! ⚠️ **wx 域的「刻意不共享」是已知待办、本轮未动**：`src/modules/wx/` 有 4 处
-//! 注释明写「刻意不用 `PartStatus` 做校验 —— 那正是要消灭的跨域复用」，
-//! `com::delivery_note::vo::BatchStatusDto` 也自持一份带 `Repairing` 变体的
-//! 投影。它们不构成 `shared → modules` 方向违规（是 `modules → modules` 的
-//! 各持一份），故本轮**只解决方向违规**、不改这些域的行为与注释。后续要把它们
-//! 也收敛到本模块，是独立一轮。
+//! ⚠️ **wx 域的「刻意不共享」是已知待办、本轮只动注释口径**：搬移后
+//! `PartStatus` 已**不属于任何域**，故「那正是要消灭的跨域复用」这个理由随之失效
+//! —— 不改的话，后人会以为 shared 也在 wx 的禁用清单里。2026-10-13 review 第 1 轮
+//! 已把 wx 侧 5 处代码注释 + 本文件下方 `docs/api/wx.md` 两处（连同 §0.2 摘要）的
+//! 口径**同批校准**为「白名单是**页面语义**（前端 tab 值 → SQL 状态集），不是状态机
+//! 迁移语义」，行为与白名单一字未动。`src/modules/wx/part_list/mod.rs` /
+//! `wx/production/{mod,service,dto}.rs` / `wx/mod.rs` 与 `docs/api/wx.md` 保持一致。
+//! `com::delivery_note::vo::BatchStatusDto` 另自持一份带 `Repairing` 变体的投影，
+//! 它同样**未复用**本枚举、也不构成 `shared → modules` 方向违规（是
+//! `modules → modules` 的各持一份）。把这些投影也收敛到本模块，是独立一轮。
+//!
+//! ## ⚠️ 一条历史指针的失效登记
+//!
+//! append-only migration `migrations/20261001000100_006_repairing_to_in_process.sql`
+//! 的注释指向旧路径 `src/modules/part/statemachine.rs`（**该文件不得修改**，
+//! append-only）：该路径已随本次上提失效，`PartStatus` 现在住在这里。
 //!
 //! ## 状态词汇与 DB 列的对应
 //!

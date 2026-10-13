@@ -131,7 +131,7 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 | `service.rs` | 业务逻辑，签名收 `&mut PgConnection` | `service/<mod>_service.py` |
 | `repo.rs` | sqlx 查询，签名收 `impl PgExecutor<'_>` | `repository/<mod>_repository.py` |
 | `model.rs` / `dto.rs` | 表行模型+域枚举 / 请求响应 DTO | `model/` / `schema/` |
-| `statemachine.rs` | 仅 part / assembly / outsource / process_chain 四域（`delivery_note` 于 2026-10-08 随事件子系统下线移除） | `statemachines/` |
+| `statemachine.rs` | 仅 assembly / outsource / process_chain 三域（`delivery_note` 于 2026-10-08 随事件子系统下线移除；`part` 那份于 2026-10-13 整文件上提到 `shared::batch::status_machine`、不再是域内文件） | `statemachines/` |
 
 **part 是跨域枢纽**（`com::delivery_note`、assembly、outsource、part_file、statistics、shelf 均依赖它），实施顺序见 architecture.md 第 7 节。
 
@@ -174,7 +174,7 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 >
 > ⚠️ **两处顶层 nest 不计入本表**：`POST /api/v2/batches/split`（`prod::split_router()`）与 `/api/v2/outsource-queue/*`（`outsource::queue_router()`）—— 二者挂 `/api/v2` 顶层而非本表的 `/api/v2/prod/*`，见「路由声明规约」第 9 条的顶层 nest 登记。
 >
-> ⚠️ **2026-10-11 新增第 3 处**不计入本表的 nest：`POST /api/v2/prod/assemblies/{assembly_id}/force-complete`（`assembly::force_complete_router()`，1 条）。装配件**域本体**仍是核心实体、不进 prod（其 10 条 CRUD / 状态机端点仍在 `/api/v2/assemblies/*`，`modules::v2_router()` 顶层 nest，一行未动）；只有这条生产链路收口的逃生端点归 `/prod` 前缀，理由见 `src/modules/prod/mod.rs` 的模块 doc 与 `src/modules/assembly/mod.rs::force_complete_router`。**本处是首处挂在 `/api/v2/prod` 下的非 prod 子模块 nest**（另两处挂 `/api/v2` 顶层，见上一段）。因它不属于上表任一 prod 子模块，**不计入求和**。
+> ⚠️ **2026-10-11 新增第 3 处**不计入本表的 nest：`POST /api/v2/prod/assemblies/{assembly_id}/force-complete`（`assembly::force_complete_router()`，1 条）。装配件**域本体**仍是核心实体、不进 prod（其 8 条 CRUD / 状态机端点仍在 `/api/v2/assemblies/*`，`modules::v2_router()` 顶层 nest，一行未动）；只有这条生产链路收口的逃生端点归 `/prod` 前缀，理由见 `src/modules/prod/mod.rs` 的模块 doc 与 `src/modules/assembly/mod.rs::force_complete_router`。**本处是首处挂在 `/api/v2/prod` 下的非 prod 子模块 nest**（另两处挂 `/api/v2` 顶层，见上一段）。因它不属于上表任一 prod 子模块，**不计入求和**。
 >
 > 求和演变：2026-10-08 `prod::worker_pool` 6 条 → `prod::queue` 9 条、`prod::batch` 27 条 → 23 条（两域间净移动 4 条，prod 域求和 62 → 61），同日在 `com` 聚合新增 `com::delivery_note` 子模块 17 条 ⇒ 61 + 17 = 78；2026-10-09 外协三端点合并为 `POST /api/v2/outsource-queue/move`（`outsource` 域）⇒ `prod::batch` 23 → 20（prod 域求和 61 → **58**），同日拆批 1 条提升为顶层共用端点（不计入本表）⇒ `prod::batch` 20 → 19（prod 域求和 **57**）⇒ 全表 **57 + 17 = 74**；2026-10-10 报工台 5 端点收拢进新建的 `prod::scan`：`prod::worker` 7 → 6、`prod::batch` 19 → 17、`part` 域两条 list 端点（不计入本表，part 无独立表）迁入 ⇒ `prod::scan` 5 条，prod 域求和 **57** → **59**（−1 worker、−2 batch、+5 scan，净 +2）⇒ 全表 **59 + 17 = 76**；2026-10-15 报工台扫码找件自助恢复三件套（locate / take-over / outsource-receive）⇒ `prod::scan` 5 → **8**（+3），prod 域求和 **59** → **62** ⇒ 全表 **62 + 17 = 79**；12 行求和 76 → **79**。⚠️ **2026-10-15 订正两处历史算术**：2026-10-10 段的 prod 域求和应为 **59**（旧文误记 55，净变化也非 −3）⇒ 全表 76；本段 prod 域求和应为 **62**。订正后「12 行直加」与「prod 域自己的子模块 + com 域」恒等（均为 **79**）。
 
