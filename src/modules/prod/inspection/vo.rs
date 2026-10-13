@@ -5,8 +5,9 @@
 //!
 //! 2026-10-07 新增：待品检队列读出参（`InspectionQueueItemOut` /
 //! `InspectionQueueListOut`）自 `prod::batch::vo` 迁入，**字段集与序列化形态逐字
-//! 未变**（前端 Zod schema 依赖 `items[*]` 恰好 13 个 key、`total` / `limit` /
-//! `offset` 是 JSON string 这三点）。
+//! 未变**（前端 Zod schema 依赖 `items[*]` 当时恰好 13 个 key、`total` / `limit` /
+//! `offset` 是 JSON string 这三点；⚠️ 2026-10-17 起 `items[*]` 是 **14** 个 key，
+//! 新增 `customer_path`）。
 //!
 //! i64 一律走 `serialize_i64` → JSON string（雪花 ID > 2^53，JS `Number` 会丢
 //! 精度，参见 `shared::types` 模块 doc）。
@@ -192,7 +193,7 @@ pub struct InspectionQueueItemOut {
     pub system_delivery_date: Option<NaiveDate>,
     /// 加急红底。
     pub is_urgent: bool,
-    /// 客户表头筛选的入参回显（caller 选中 L1 / L2 都用它）。
+    /// 客户表头筛选的入参回显（caller 选中任意层级的客户都用它）。
     #[serde(serialize_with = "serialize_i64")]
     pub customer_id: i64,
     pub customer_name: Option<String>,
@@ -208,7 +209,8 @@ pub struct InspectionQueueItemOut {
     pub customer_path: String,
 }
 
-/// 行 → 出参：13 个逐字段直传 + 客户两列由 `paths` 补。
+/// 行 → 出参：12 个逐字段直传 + 客户两列（`l1_customer_name` / `customer_path`）
+/// 由 `paths` 补 —— 共 14 字段。
 ///
 /// 2026-10-17：原先是 `impl From<InspectionQueueRow>`（repo 层就把 L1 名派生好了）。
 /// 「一次往返批量取名」只能在 service 层做（那里才有 `&mut PgConnection`），故改成

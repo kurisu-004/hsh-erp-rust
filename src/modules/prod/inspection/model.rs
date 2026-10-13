@@ -19,8 +19,9 @@
 //!   `t_part_batch` 行），故不需要 `version`（OCC 锚在批次上）
 //! - [`ScanBatchRow`] 只读 10 列 + `part_id` 供 service 内存分组（见
 //!   `t_part_batch` **无序列号列**这一事实）
-//! - [`InspectionQueueRow`] 读 13 列（3-JOIN 窄投影），字段与
-//!   `vo::InspectionQueueItemOut` 逐字同形；SQL 侧列别名直接取语义名
+//! - [`InspectionQueueRow`] 读 12 列（2-JOIN 窄投影），字段与
+//!   `vo::InspectionQueueItemOut` 同形（少 `l1_customer_name` / `customer_path`
+//!   两列，它们由 service 层的 `paths_of` 补）；SQL 侧列别名直接取语义名
 //!   （`pb.id AS batch_id` 等），repo 层 1:1 搬运，service 只做形状转换
 //!
 //! 四个行结构里三个 `#[derive(sqlx::FromRow)]` —— `query_as!(Struct, …)` 宏需要它
@@ -47,7 +48,7 @@ pub struct ScanPartRow {
     pub quantity: i32,
     pub is_urgent: bool,
     pub system_delivery_date: Option<NaiveDate>,
-    /// L2 叶子客户名；`LEFT JOIN` 命中不到（客户软删 / 悬空 id）时为 `None`。
+    /// 所属客户名（本节点单段名）；`LEFT JOIN` 命中不到（客户软删 / 悬空 id）时为 `None`。
     pub customer_name: Option<String>,
     /// `t_part.version` —— **仅展示**，不参与任何批次写操作的 OCC（见
     /// [`ScanBatchRow::version`]）。
@@ -120,7 +121,8 @@ pub struct ScanBatchRow {
 ///
 /// 2026-10-07 自 `prod::batch::model` 迁入（域迁移，字段与投影逐字不变）。
 /// 待品检页只渲染 7 个数据列（序列号 / 图号 / 名称 / 批次 / 数量 / 系统交期 /
-/// 客户），故只投 13 列 —— 不投 holder / 工序 / 送货单。
+/// 客户），故只投 12 列 —— 不投 holder / 工序 / 送货单；也不投 `l1_customer_name` /
+/// `customer_path`（2026-10-17 起那两列由 service 层的 `paths_of` 补，见下）。
 ///
 /// 2026-10-17：`l1_customer_name` 字段与它依赖的「`t_customer` 自连父行」一并**从
 /// repo 层删除**，改由 service 层一次 `shared::customer::paths_of` 补

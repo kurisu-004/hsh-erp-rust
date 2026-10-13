@@ -323,7 +323,7 @@ service 规范化后由 `repo.rs::escape_like` 把用户 keyword 里的 `\ / % /
 
 ⚠️ **客户字段名与 part 域不同名**：本域是 `parent_customer_name`（= **根**名）/ `customer_name`（自身名）/ `customer_path`，part 域 `PartListItem` 是 `l1_customer_name` / `customer_name` / `customer_path`。两边的行对象**不能互相 cast**，否则列渲染读不到键、静默显示「—」。
 
-⚠️ **`customer_path` 是 2026-10-17 新增的第 16 个字段**：本域的 Zod schema 是 strip 模式（非 `.strict()`），前端未声明它时会被静默丢弃（不报错、不显示）。前端需在 `pendingProgrammingItemSchema` 里补 `customer_path: z.string()` 才能用上。
+⚠️ **`customer_path` 是 2026-10-17 新增的第 16 个字段**：本域的 Zod schema 是 strip 模式（非 `.strict()`），前端未声明它时会被静默丢弃（不报错、不显示）。前端需在 `pendingProgrammingItemSchema` 里补 `customer_path` 声明才能用上 —— **实际落地为 `z.string().nullable()`**（键必填、值可空），比后端的「必填 `string`、取不到时是空串」**更宽松**，两者**兼容**（`frontend` 的守门纪律：前端更宽松可接受，前端更严会假阴性）。
 
 ⚠️ 另有一处**只上跳一层**的旧写法在本仓长期存在且本轮已消除：`LEFT JOIN t_customer pc ON pc.id = c.parent_id`（取「L1 集团名」）。客户树放开任意深度后它拿到的是**中间层**名，本域与 `prod::inspection` 队列均已改为 `paths_of`。
 

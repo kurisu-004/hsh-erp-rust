@@ -59,7 +59,7 @@
 - ⚠️ `parent_customer_name` / `l1_customer_name` 是**根**名，**不是**「直接父」名。旧形（SQL 自连 `t_customer pc ON pc.id = c.parent_id` 取一层父名）在三层以上的树上会退化成中间层名。
 - ⚠️ 本域自己的 `parent_name`（§4）是**另一回事**：它是 `CustomerOut` 上「本节点的直接父名」，只用于前端画树的一层缩进，**不要**拿它当集团名。
 - ⚠️ **「取不到」的确切口径**（全仓逐字同款，见 `src/shared/customer.rs` 的 `paths_of` 文档）：map 里没有该 id **只意味着「终点行不存在 / 已软删」** —— 锚点带 `deleted_at IS NULL`，而 `GROUP BY target_id` 对每个未软删终点行**恒产出一组**。**成环 / 超过 `MAX_CUSTOMER_DEPTH` 时 map 里仍有该项**，此时 `path` 是**截断路径**、`root_name` 退化成断链处那个祖先（不是根）；这两种形态只出现在脏数据里（`create` 要求父行存在且未软删、`update` 拒改 `parent_id`）。
-- ⇒ 消费侧落**空串**（不是 `null`）的情形**只有**「终点行已软删 / 不存在」这一种，即 `paths.get(&id)` 落空后 `unwrap_or_default()` 的兜底。
+- ⇒ 消费侧落**空串**（不是 `null`）的情形**只有**「终点行不存在 / 已软删」这一种，即 `paths.get(&id)` 落空后的兜底。⚠️ **兜底形态分两种，不要当成一条**：多数消费方是 `unwrap_or_default()` → **空串**（`inspection` / `programming` / `queue` / `outsource` / `assembly` / `dashboard` 等）；**`com::customer` 自身刻意不同** —— `service/crud.rs::path_of` 用 `unwrap_or_else(|| c.name.clone())` 退到**本节点的单段名**，理由是该字段是前端必填键，落空串会让客户筛选器渲染成一截空标签，比「只有一段名」更难排查。读某一域的落空形态要看那一域的兜底写法。
 
 ### 2.3 各域对客户树的特殊约定
 

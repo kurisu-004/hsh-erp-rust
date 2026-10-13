@@ -619,7 +619,7 @@ queue 域**整体不适用**域隔离护栏：它继承 worker_pool 的「经本
 4. **新增 2 个端点的 composable**：`GET /snapshot`（序列板 + 待下发 tab 徽标）、`GET /processes/{id}`（单工序板）。原 `useWorkerPoolByProcessQuery` + `useWorkerStateByWorkerQuery`（每 worker 一次）应合并为**一次**请求；`useWorkerPoolCountsQuery` 迁到 snapshot。
 5. **删 3 个 composable**：`useWorkerStateByWorkerQuery`（`/state`）、`useWorkerPoolCountsQuery`（`/counts`）、`useWorkerPoolByProcessQuery` 的旧形态（`/pool/{id}`）—— 后者改指 `/processes/{id}`。
 6. **zod schema 同步**：`workerBriefSchema` 删 `work_type_id`（4 → 3 字段）；删 `workTypeMaxHeldSchema` 与 `poolBatchItemSchema` 的 `customer_path` / `location`；新增 `queueBoardSnapshotSchema` / `queueProcessBoardDetailSchema` / `queueHeldBatchSchema` / `queuePoolItemSchema`。
-   - **2026-10-17 订正**：`customer_path` 又回来了（见 §2.5 的说明与上表的必填声明），且 `parent_customer_name` 的语义从「直接父」变成「**根**」。本特性要求前端在 `queuePoolItemSchema` / `queueHeldBatchSchema` / `pendingBatchItemSchema` 三处补上声明 `customer_path: z.string()` 才能用上（**2026-10-17 同批交付**）。
+   - **2026-10-17 订正**：`customer_path` 又回来了（见 §2.5 的说明与上表的必填声明），且 `parent_customer_name` 的语义从「直接父」变成「**根**」。本特性要求前端在 `queuePoolItemSchema` / `queueHeldBatchSchema` / `queuePendingBatchSchema`（三者同在 `src/views/production/queue/composables/productionQueueSchema.ts`）三处补上声明 `customer_path: z.string()` 才能用上（**2026-10-17 同批交付**）。
    - ⚠️ **这三处是 strip 模式（非 `.strict()`），漏声明的失败形态与 `.strict()` 域相反**：Zod 会**静默剥离**未声明的键 ⇒ **不抛 `unrecognized_keys`、不白屏、零报错**，而是候选卡 / 持有卡 / 待下发池的适配层**永久拿不到路径**，客户列降级成「单段名 + 根名」两段拼接，在三层以上的树上永远拼不对。`.strict()` 域漏声明会当场 parse 抛、页面直接空白；strip 域漏声明只在**深层树**上表现为「路径看着不对」，是最容易漏的一类。
    - **注意 zod 默认 strip 模式**会让漏声明的字段静默丢失，数组元素必须全字段声明。
 7. **i64 字符串化**：所有雪花 id 仍是 JSON string，本仓不因本次改动变更该约定。

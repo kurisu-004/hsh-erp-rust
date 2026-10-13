@@ -163,7 +163,7 @@ ScanTreeOut
 
 ⚠️ **与 `prod::programming` 的分页计数方向相反**（那边是裸 i64 ⇒ number）。两个前端 schema 千万别互相照抄：前端 `inspectionQueueListResultSchema` 声明 `z.string()`，`pendingProgrammingListResultSchema` 声明 `z.number()`。
 
-### 3.3 `InspectionQueueItemOut` 逐字段（13 个）
+### 3.3 `InspectionQueueItemOut` 逐字段（14 个）
 
 | # | 字段 | 类型 | SQL 来源 | 口径 |
 |---|---|---|---|---|
@@ -186,7 +186,7 @@ ScanTreeOut
 
 ⚠️ **本 VO 与返修 VO 不共用**：`GET /api/v2/prod/batches/repair` / `/repairing` 继续用 `prod::batch::vo::InspectionBatchListItemOut`。共用会让那边的字段在待品检页成为无用负载。两端点的行对象**不可互相 cast**。
 
-⚠️ **2026-10-17 新增第 14 个键 `customer_path`**：前端 `inspectionQueueItemSchema` 是 `.strict()`，多一个后端键即抛 `unrecognized_keys` ⇒ **整个待品检页白屏**。本特性要求前端在该 schema 里补声明 `customer_path` 才能用上（**2026-10-17 同批交付**）—— 前端落地为 `z.string().nullable()`，比后端的「必填 `string`、取不到时是空串」**更宽松**，两者**兼容**、不算断裂（`frontend` 的守门纪律是「前端更宽松可接受，前端更严会假阴性」）。队列读与扫码树两侧的模式差异与失败形态见 §8.2。
+⚠️ **2026-10-17 新增第 14 个键 `customer_path`**：前端 `inspectionQueueListItemSchema` 是 `.strict()`，多一个后端键即抛 `unrecognized_keys` ⇒ **整个待品检页白屏**。本特性要求前端在该 schema 里补声明 `customer_path` 才能用上（**2026-10-17 同批交付**）—— 前端落地为 `z.string().nullable()`，比后端的「必填 `string`、取不到时是空串」**更宽松**，两者**兼容**、不算断裂（`frontend` 的守门纪律是「前端更宽松可接受，前端更严会假阴性」）。队列读与扫码树两侧的模式差异与失败形态见 §8.2。
 
 ### 3.4 队列口径：WHERE 五段拼装
 
@@ -287,10 +287,10 @@ JOIN 只有 2 张：`t_part_batch` JOIN `t_part` JOIN `t_customer`（2026-10-17 
 |---|---|---|
 | 路径 | `GET /api/v2/prod/batches/inspection` | `GET /api/v2/prod/inspection/queue` |
 | 状态 | **已下线，无 alias（旧路径 404）** | 现行 |
-| 出参 | `InspectionQueueListOut` | `InspectionQueueListOut` **逐字未变**（字段名、`items[*]` 恰好 13 个 key、计数为 JSON **string** 而非 number） |
+| 出参 | `InspectionQueueListOut` | `InspectionQueueListOut` **在本次迁入时逐字未变**（字段名、`items[*]` 13 个 key、计数为 JSON **string** 而非 number）；⚠️ **2026-10-17 起 `items[*]` 是 14 个 key**（新增 `customer_path`，见 §3.3） |
 | 入参 | `InspectionQueueQuery` | `InspectionQueueQuery` **逐字未变**（9 个 query 参数） |
 
-因为出参逐字未变，**前端 Zod schema 无需改动**。迁入范围：SQL 落到 `repo.rs` 的 `InspectionQueueRepo`（与 `InspectionScanRepo` 并列的第二个 ZST）+ 私有 `push_inspection_queue_where` + 常量 `INSPECTION_QUEUE_SELECT` / `INSPECTION_QUEUE_COUNT_FROM`；行结构 `InspectionQueueRow` 落到 `model.rs`；VO 落到 `vo.rs`；DTO `InspectionQueueQuery` 落到 `dto.rs`；service `InspectionQueueService` 落到 `service.rs`（与 `InspectionScanService` 共用 `inspection.view` 权限点）；handler `queue` 落到 `handler.rs`。
+因为**迁入那一刻**出参逐字未变，前端 Zod schema 当时无需改动（⚠️ 2026-10-17 新增 `customer_path` 后前端**需要**补声明，见 §3.3）。迁入范围：SQL 落到 `repo.rs` 的 `InspectionQueueRepo`（与 `InspectionScanRepo` 并列的第二个 ZST）+ 私有 `push_inspection_queue_where` + 常量 `INSPECTION_QUEUE_SELECT` / `INSPECTION_QUEUE_COUNT_FROM`；行结构 `InspectionQueueRow` 落到 `model.rs`；VO 落到 `vo.rs`；DTO `InspectionQueueQuery` 落到 `dto.rs`；service `InspectionQueueService` 落到 `service.rs`（与 `InspectionScanService` 共用 `inspection.view` 权限点）；handler `queue` 落到 `handler.rs`。
 
 ⇒ 迁后本域**零跨域依赖**，这是本次迁移的主要收益。
 
@@ -340,7 +340,7 @@ JOIN 只有 2 张：`t_part_batch` JOIN `t_part` JOIN `t_customer`（2026-10-17 
 | 端点 | 软删闸门 | 说明 |
 |---|---|---|
 | 端点 2 | `t_part` / `t_assembly` / `t_part_batch` **三处必过滤**；`t_customer` 带闸门（客户名退化为 `null`，不影响节点返回）；`t_process` / `t_shelf` / `t_worker` / `t_outsource_company` **刻意不加** | 软删闸门在这里是**语义**闸门不是保守过滤：扫到软删行等于扫到一个业务上已不存在的码，前端弹「未找到」比弹一棵含已删数据的树更安全 |
-| 端点 1 | `pb.deleted_at IS NULL` + `p.deleted_at IS NULL`；**两条 `t_customer` JOIN 都不过滤 `deleted_at`** | 与端点 2 的 `t_customer` 闸门**方向相反**，同域内两个端点口径不同，改任一处的客户 JOIN 前先确认不会破坏另一处 |
+| 端点 1 | `pb.deleted_at IS NULL` + `p.deleted_at IS NULL`；**那一条 `t_customer` JOIN 不过滤 `deleted_at`** | 与端点 2 的 `t_customer` 闸门**方向相反**，同域内两个端点口径不同，改任一处的客户 JOIN 前先确认不会破坏另一处 |
 
 ### 8.2 前端配套改动清单
 

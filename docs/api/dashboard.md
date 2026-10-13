@@ -70,7 +70,7 @@
 | `status` | string | 两侧共用同一份 6 态白名单；`t_assembly` 侧天然只落 4 态（见 §4.2） |
 | `system_delivery_date` | string \| null | `YYYY-MM-DD`；`partial` 桶内可为 null |
 | `customer_name` | string \| null | 客户名（本节点单段名）。两侧 `customer_id` 同指 `t_customer.id`，**一次**批量查（客户树任意深度：这里取的是**自身名**） |
-| `customer_path` | string | **2026-10-17 新增（必填键、非 nullable）**：第 2 层到叶子的 `" / "` 拼接（**不含**根），与 §3.2 抽屉行的 `customer_path` 同一份 `shared::customer::paths_of` map；客户行取不到时落**空串**。⚠️ 前端 `dashboardSnapshotSchema` 的 `systemDeliveryOrderSchema` 声明成必填键 ⇒ **部署顺序：后端必须先上**，否则 `dashboardSnapshotSchema.parse` 抛 ⇒ **整个大屏空白** |
+| `customer_path` | string | **2026-10-17 新增（必填键、非 nullable）**：第 2 层到叶子的 `" / "` 拼接（**不含**根），与 §3.2 抽屉行的 `customer_path` 同一份 `shared::customer::paths_of` map；客户行取不到时落**空串**。⚠️ 前端 `dashboardSnapshotSchema` 的 `systemDeliveryOrderSchema` 声明成**必填键 + 值可空**（`z.string().nullable()`，与 `deliveryOrderDetailSchema` 同款）—— 比后端**更宽松**、两者兼容（前端更严会假阴性）⇒ **部署顺序：后端必须先上**，否则缺键时 `dashboardSnapshotSchema.parse` 抛 ⇒ **整个大屏空白** |
 | `is_urgent` | boolean | 两侧同名列 |
 | `delivered_quantity` | number | 件级：已交**件数**；装配件级：已交**套数**（min 公式，见 §4.4） |
 | `row_type` | string | `"PART"` \| `"ASSEMBLY"`。前端据此切换「件 / 套」单位与下钻目标 |

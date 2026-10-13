@@ -336,7 +336,8 @@ impl InspectionQueueService {
     /// 数据列 + 操作列锚点。
     ///
     /// 流程：权限守卫（`inspection.view`）→ limit/offset 规范化 → `customer_id` 展开为
-    /// L1+L2 ids → 3 个表头文本筛选 trim + 拒通配符 + 拼 `%…%` → 排序白名单映射 →
+    /// 子树 ids（该节点 + 全部后代，任意深度）→ 3 个表头文本筛选 trim + 拒通配符 +
+    /// 拼 `%…%` → 排序白名单映射 →
     /// `list_inspection_queue` + `count_inspection_queue` 两条 SQL（同 WHERE 拼装器）。
     ///
     /// 排序非法值**不报错**：非法 `sort_by` 退化为系统交期、非法 `sort_dir` 退化为

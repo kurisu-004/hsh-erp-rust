@@ -344,7 +344,7 @@ pub mod code {
     pub const BIZ_DELIVERY_NOTE_PARTS_LOCKED: i32 = 21412; // SUBMITTED/PICKED_UP 后禁止 add_parts / remove_batches
     pub const BIZ_DELIVERY_GROUP_NOT_FOUND: i32 = 21413; // 找不到指定的送货分组 / 已软删
     pub const BIZ_DELIVERY_GROUP_DUPLICATE_NAME: i32 = 21414; // 同 L1 下分组重名
-    pub const BIZ_DELIVERY_GROUP_MEMBER_CONFLICT: i32 = 21415; // L2 已属于其他活跃分组
+    pub const BIZ_DELIVERY_GROUP_MEMBER_CONFLICT: i32 = 21415; // 该客户已属于其他活跃分组（任意深度的后代）
     pub const BIZ_DELIVERY_NOTE_SCOPE_MISMATCH: i32 = 21416; // 零件分类与送货单范围不符（add_parts 校验）
     pub const BIZ_DELIVERY_SCAN_UNKNOWN_CODE: i32 = 21417; // 扫码的 serial_no 无法识别
     pub const BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY: i32 = 21418; // 装配件整套拒绝：含不可入单子件（message 附明细）

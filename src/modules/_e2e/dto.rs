@@ -17,7 +17,7 @@ pub struct ResetResp {
     pub cleared: i64,
 }
 
-/// L1 / L2 客户 seed 入参。L1 必带 serial_prefix；L2 必带 parent_id。
+/// 根 / 非根客户 seed 入参。根必带 serial_prefix；非根必带 parent_id。
 #[derive(Debug, Deserialize)]
 pub struct SeedCustomerReq {
     pub name: String,

@@ -32,8 +32,8 @@ pub struct DeliveryGroup {
 }
 
 /// `t_delivery_group_member` 行
-/// `customer_id` 必须是 L2（`t_customer.parent_id = group.customer_id`），
-/// service 层负责校验。
+/// `customer_id` 必须是该根客户的**任意后代**（任意深度，`shared::customer::subtree_ids`
+/// 口径）；**根自身不算后代**。service 层负责校验。
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct DeliveryGroupMember {
     pub id: i64,

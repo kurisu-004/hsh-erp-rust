@@ -117,7 +117,8 @@
 //!
 //! 1. 状态 + 双软删闸门：`pb.status = 'INSPECTION' AND pb.deleted_at IS NULL
 //!    AND p.deleted_at IS NULL`（本端点不接 statuses 参数）
-//! 2. 客户：空数组 → 命中全部；非空 → `p.customer_id = ANY(展开后的 L1+L2 ids)`
+//! 2. 客户：空数组 → 命中全部；非空 → `p.customer_id = ANY(展开后的子树 ids)`
+//!    （`shared::customer::subtree_ids` = 该节点 + 全部后代，任意深度）
 //! 3. 表头 3 个文本列各一个独立 ILIKE（`$n::text IS NULL` 短路 → 不过滤）
 //! 4. 系统交期区间（两个可空边界，缺界不参与过滤）
 //! 5. list 额外的 `ORDER BY {order_col} {order_dir} NULLS LAST, pb.id ASC LIMIT /
@@ -378,7 +379,7 @@ pub struct InspectionQueueFilters<'a> {
     pub offset: i64,
 }
 
-/// `GET /api/v2/prod/inspection/queue` 窄投影 SELECT（13 个输出列）。
+/// `GET /api/v2/prod/inspection/queue` 窄投影 SELECT（12 个输出列）。
 ///
 /// 只 JOIN 2 张表：`t_part`（工单）/ `t_customer`（客户）。
 /// **不** JOIN `t_shelf` / `t_worker` / `t_outsource_company` / `t_process_chain_step`
@@ -457,7 +458,7 @@ fn push_inspection_queue_where(qb: &mut QueryBuilder<Postgres>, f: &InspectionQu
 }
 
 /// [`list_inspection_queue`](InspectionQueueRepo::list_inspection_queue) 的
-/// `FromRow` 行结构（13 输出列）。
+/// `FromRow` 行结构（12 输出列）。
 ///
 /// 手动 `#[derive(FromRow)]` 而非 `query_as!` —— SQL 由 `QueryBuilder` 动态拼装。
 /// 2026-10-17：原先多出的 `customer_parent_id` / `parent_customer_name` 两列原料
@@ -486,7 +487,7 @@ pub struct InspectionQueueRepo;
 
 impl InspectionQueueRepo {
     /// `GET /api/v2/prod/inspection/queue` 列表
-    /// （3-JOIN 窄投影 + 表头筛选 + 服务端排序）。
+    /// （2-JOIN 窄投影 + 表头筛选 + 服务端排序）。
     ///
     /// 排序：`{order_col} {order_dir} NULLS LAST, pb.id ASC`
     /// （`NULLS LAST` 与 `pb.id ASC` 的理由见本文件模块 doc 的「队列读」小节）。
