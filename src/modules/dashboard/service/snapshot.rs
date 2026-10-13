@@ -18,6 +18,7 @@
 use crate::infra::clock::now_naive;
 use crate::modules::dashboard::repo::{BatchLite, DashboardRepoTrait, PartLite};
 use crate::modules::dashboard::vo::{DashboardSnapshot, WorkerHeldBatch};
+use crate::shared::error::AppError;
 
 /// 大屏 snapshot 装配 service
 ///
@@ -44,10 +45,14 @@ impl DashboardService {
     /// （`GET /api/v2/dashboard/upcoming-delivery`），不再内嵌在本快照里。
     ///
     /// service 内零 SQL——所有 SQL 在 `repo/sql.rs` / `repo/delivery.rs`。
+    ///
+    /// 返回 `AppError`（2026-10-17，原为 `sqlx::Error`）：交期三桶的客户三列改由
+    /// `shared::customer::paths_of` 产出（`customer_path` 是前端必填键），错误类型随
+    /// 它上行。两个调用方（HTTP 首取 / WS 首帧）本来就返回 `AppError`，`?` 直通。
     pub async fn build_snapshot<R: DashboardRepoTrait>(
         &self,
         mut repo: R,
-    ) -> Result<DashboardSnapshot, sqlx::Error> {
+    ) -> Result<DashboardSnapshot, AppError> {
         // 「今天」只取一次，同一个值喂给逾期 / 面板三桶：逾期与 `overdue` 桶的窗口边界
         // 必须一致，否则同一条工单可能同时落进逾期数与逾期面板（或两侧都漏）。
         // ⚠️ 三桶里 `partial` 刻意**不吃** `today`（无时间窗口），故它不受这条约束。

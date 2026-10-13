@@ -49,7 +49,7 @@
   继承申请人这条设计**大量未落地**（开发库实测 490 条子件中 360 条 `t_part.applicant_name`
   为空串，而 90 个 `t_assembly.applicant_name` 无一为空），直接读子件列会让这些行渲染成
   「—」。**只做读侧回落、不回填存量**（理由见 §2.3.2）。字段本身恒定存在、前端三处渲染点
-  已在读 ⇒ **前端零改动**（§8.3 前端配套表第 19 条）。同时把单张详情与批量详情两处
+  已在读 ⇒ **前端零改动**（§8.3 前端配套表第 21 条）。同时把单张详情与批量详情两处
   逐字重复的行项装配收进 `service/line_item.rs::build_line_item` 一个实现，口径只维护一处。
 - **2026-10-10 行项默认序改为「加入本单的次序」（§2.3.1）**：单据详情与批量详情的
   `line_items[]` 排序键从 `t_part_batch.id` 切成 `delivery_seq ASC NULLS LAST, id ASC`
@@ -754,9 +754,9 @@ schema 与页面都在用」。
 | 17 | `line_items[].customer_id` | ★ `DeliveryNoteLineItem` **新增** `customer_id: string`（叶子客户 id，必填非空）。打印分组键从 `customer_name` 切成 `customer_id`：`t_customer.name` 只有**非唯一** btree 索引，同名客户会被并进同一张 sheet，而打印产物是客户签字的收货凭证。Zod schema 里加必填 `customer_id: z.string()` |
 | 18 | `customer_path` 的类型收紧 | ★ 2026-10-17：`DeliveryNoteOut.customer_path` 与 `DeliveryNoteLineItem.customer_path` 由 `string \| null` 改为**必填 `string`**（取不到落空串）。前端现有 schema 声明的是 `z.string().nullable()`，**收得下 `""`，无需改动** |
 | 19 | `line_items[].customer_path` 的值口径 | ★ 2026-10-17：由「`{直接父名} / {自身名}`」两段拼接改为「第 2 层到叶子的 `" / "` 拼接（不含根）」；`line_items[].parent_customer_name` 由「直接父名」改为「**根**名」。两层树上两者逐字相同，深树上才看得出差别 |
-| 18 | `line_items[].delivery_seq` | ★ `DeliveryNoteLineItem` **新增** `delivery_seq: number \| null`（**加入本单的次序**，口径见 §2.3.1）。数组顺序已由后端按它排好，前端**零改动即得「按扫码先后」的展示**；Zod schema 里加 `delivery_seq: z.number().nullable()`，供页面按需展示序号列 |
-| 19 | `applicant_name` 回落 | **零改动**（2026-10-10，§2.3.2）。字段名 / 类型 / 可空性都没动，只是「装配件子件自身为空时改用父装配件的值」。前端三处渲染点（详情列表列定义、标签 xlsx 工作簿、送货单打印模板）本就在读它 ⇒ 部署后立即见效，**不需要改 schema、不需要改列定义、不需要改模板** |
-| 20 | 三条读的权限点（2026-10-15） | `GET /`（列表）、`GET /{id}`（详情）、`GET /batch-detail` 统一走权限点 `delivery_note.view`（矩阵 Mgr+Clerk+Insp）。⚠️ 列表自原 `Mgr+Clerk+Insp+CncProg` **收紧去 `CncProgrammer`**（用户定稿）—— 对 CNC 账号列表入口应改按 `hasPermission('delivery_note.view')` 显隐；详情与 batch-detail 原零守卫、本轮补闸。存量会话部署窗口见 `iam.md` §9.2 注记 |
+| 20 | `line_items[].delivery_seq` | ★ `DeliveryNoteLineItem` **新增** `delivery_seq: number \| null`（**加入本单的次序**，口径见 §2.3.1）。数组顺序已由后端按它排好，前端**零改动即得「按扫码先后」的展示**；Zod schema 里加 `delivery_seq: z.number().nullable()`，供页面按需展示序号列 |
+| 21 | `applicant_name` 回落 | **零改动**（2026-10-10，§2.3.2）。字段名 / 类型 / 可空性都没动，只是「装配件子件自身为空时改用父装配件的值」。前端三处渲染点（详情列表列定义、标签 xlsx 工作簿、送货单打印模板）本就在读它 ⇒ 部署后立即见效，**不需要改 schema、不需要改列定义、不需要改模板** |
+| 22 | 三条读的权限点（2026-10-15） | `GET /`（列表）、`GET /{id}`（详情）、`GET /batch-detail` 统一走权限点 `delivery_note.view`（矩阵 Mgr+Clerk+Insp）。⚠️ 列表自原 `Mgr+Clerk+Insp+CncProg` **收紧去 `CncProgrammer`**（用户定稿）—— 对 CNC 账号列表入口应改按 `hasPermission('delivery_note.view')` 显隐；详情与 batch-detail 原零守卫、本轮补闸。存量会话部署窗口见 `iam.md` §9.2 注记 |
 
 ### 8.4 已知偏差登记
 

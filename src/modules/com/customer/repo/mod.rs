@@ -57,9 +57,12 @@
 //! repo trait 方法 → `sqlx::Error`（与 sql.rs 签名 1:1，`create` 检
 //! SQLSTATE 23505 → 20104 BIZ_INVALID_VALUE 已在 service 层做）。
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use sqlx::PgConnection;
 
+use crate::shared::customer::CustomerPath;
 use crate::shared::error::AppError;
 
 pub mod sql;
@@ -163,6 +166,21 @@ pub trait CustomerRepoTrait: Send {
     /// `20102 BIZ_CUSTOMER_NOT_FOUND`（客户已不存在），那是业务码，摊平成
     /// `sqlx::Error` 会退化成 500。
     async fn subtree_ids(&mut self, customer_id: i64) -> Result<Vec<i64>, AppError>;
+
+    // ── 客户树取名（2026-10-17 新增；`CustomerOut.customer_path` 的数据来源）──
+    /// 一次往返批量产出 `id → (root_name, own_name, customer_path)`。委托
+    /// `crate::shared::customer::paths_of`（全仓唯一的客户树取名设施）。
+    ///
+    /// 本域只需要 `path` 一列（另两列由各业务域自己的 VO 承载），但**不自写**一份
+    /// 「自身 name + 上跳各层拼路径」的 SQL：客户树遍历口径必须全仓一份，否则同一个
+    /// 客户的路径在零件一览与客户管理页会给出不同答案。
+    ///
+    /// 返回 `AppError`（同 `subtree_ids`）：shared 那份可能抛业务码，摊平成
+    /// `sqlx::Error` 会退化成 500。
+    async fn customer_paths_by_ids(
+        &mut self,
+        ids: &[i64],
+    ) -> Result<HashMap<i64, CustomerPath>, AppError>;
 }
 
 /// 把 `CustomerRepo` 直接对 `&mut PgConnection` 实现——handler/service 借 `&mut *tx` 或
@@ -295,5 +313,12 @@ impl CustomerRepoTrait for &mut PgConnection {
 
     async fn subtree_ids(&mut self, customer_id: i64) -> Result<Vec<i64>, AppError> {
         crate::shared::customer::subtree_ids(&mut **self, customer_id).await
+    }
+
+    async fn customer_paths_by_ids(
+        &mut self,
+        ids: &[i64],
+    ) -> Result<HashMap<i64, CustomerPath>, AppError> {
+        crate::shared::customer::paths_of(&mut **self, ids).await
     }
 }

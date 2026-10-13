@@ -329,12 +329,12 @@ impl DeliveryRepo {
     /// 1. `SQL_ORDERS_UPCOMING` / 2. `SQL_ORDERS_OVERDUE` / 3. `SQL_ORDERS_PARTIAL`
     /// 4. `fetch_delivered_quantities`（三桶里 `row_type == 'PART'` 的全部 id）
     /// 5. `fetch_delivered_sets`（三桶里 `row_type == 'ASSEMBLY'` 的全部 id）
-    /// 6. `fetch_customer_names`（三桶全部 `customer_id` 合并去重）
+    /// 6. `fetch_customer_paths`（三桶全部 `customer_id` 合并去重）
     pub async fn list_system_delivery_orders(
         conn: &mut PgConnection,
         today: NaiveDate,
         limit: usize,
-    ) -> Result<SystemDeliveryOrders, sqlx::Error> {
+    ) -> Result<SystemDeliveryOrders, AppError> {
         // `usize` 不是 sqlx 的可绑类型，三条主查询的 LIMIT 一律以 `i64` 绑定。
         let upcoming = sqlx::query(SQL_ORDERS_UPCOMING)
             .bind(today)
@@ -378,26 +378,26 @@ impl DeliveryRepo {
         let cust_ids = raw_all(&[&raw_upcoming, &raw_overdue, &raw_partial])
             .map(|r| r.customer_id)
             .collect::<Vec<i64>>();
-        let cust_names = Self::fetch_customer_names(conn, &cust_ids).await?;
+        let cust_paths = Self::fetch_customer_paths(conn, &cust_ids).await?;
 
         Ok(SystemDeliveryOrders {
             upcoming: build_bucket(
                 raw_upcoming,
                 &delivered_parts,
                 &delivered_assemblies,
-                &cust_names,
+                &cust_paths,
             ),
             overdue: build_bucket(
                 raw_overdue,
                 &delivered_parts,
                 &delivered_assemblies,
-                &cust_names,
+                &cust_paths,
             ),
             partial: build_bucket(
                 raw_partial,
                 &delivered_parts,
                 &delivered_assemblies,
-                &cust_names,
+                &cust_paths,
             ),
         })
     }
@@ -489,31 +489,14 @@ impl DeliveryRepo {
     // 「域根段 + 他域路径」前缀失配，`shared::analytics` 不属于任何域、合法可引。
     // **护栏强度未降**（该单测仍绿），副本消失则口径不会再静默漂移。
 
-    /// 客户 id → name（单级，足够填 `SystemDeliveryOrder.customer_name`）。
-    async fn fetch_customer_names(
-        conn: &mut PgConnection,
-        cust_ids: &[i64],
-    ) -> Result<HashMap<i64, String>, sqlx::Error> {
-        let Some(ids) = dedup_positive(cust_ids) else {
-            return Ok(HashMap::new());
-        };
-        let rows = sqlx::query("SELECT id, name FROM t_customer WHERE id = ANY($1::bigint[])")
-            .bind(ids)
-            .fetch_all(&mut *conn)
-            .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| (r.get::<i64, _>("id"), r.get::<String, _>("name")))
-            .collect())
-    }
-
     /// 客户三列批量查（`customer_name` / `l1_customer_name` / `customer_path`）。
     ///
     /// 2026-10-17 起委托 [`crate::shared::customer::paths_of`]（全仓唯一的客户树取名
     /// 设施），本域不再自写「查自身 name + 上跳一层取父 name」的两级 SQL。旧实现的
     /// 两处缺陷随之消失：① `parent_id` 只上跳一层，三级以上的树上 `l1_customer_name`
     /// 拿到的是中间层名；② 两级查询遇到「无父」要另开一条分支兜底，而根名按定义
-    /// 就是自身。
+    /// 就是自身。交期面板三桶（`SystemDeliveryOrder`）的 `customer_name` 同源取自
+    /// `own_name`（与旧的单级查表逐字相同），并因此多带了 `customer_path`。
     async fn fetch_customer_paths(
         conn: &mut PgConnection,
         cust_ids: &[i64],
@@ -590,11 +573,15 @@ fn raw_all<'a>(buckets: &'a [&'a RawBucket]) -> impl Iterator<Item = &'a RawOrde
 /// 已交量按 `row_type` 取不同来源：PART 侧是**件数**，ASSEMBLY 侧是**套数**。
 /// 两个 map 都以 id 为键，`unwrap_or(0)` 兜住「无子件的装配件」（`fetch_delivered_sets`
 /// 不为它产生结果行，见该函数 doc）。
+///
+/// 客户三列取自同一份 `paths_of` map（2026-10-17）：`customer_name` = 本节点单段名
+/// （与旧的单级查表逐字相同），`customer_path` = 第 2 层到叶子的 `" / "` 拼接、不含根。
+/// 取不到时 `customer_name` 落 `null`、`customer_path` 落空串（必填键口径）。
 fn build_bucket(
     raw: RawBucket,
     delivered_parts: &HashMap<i64, i32>,
     delivered_assemblies: &HashMap<i64, i32>,
-    cust_names: &HashMap<i64, String>,
+    cust_paths: &HashMap<i64, CustomerPath>,
 ) -> DeliveryBucket {
     let items = raw
         .rows
@@ -614,7 +601,11 @@ fn build_bucket(
                 system_delivery_date: r
                     .system_delivery_date
                     .map(|d| d.format("%Y-%m-%d").to_string()),
-                customer_name: cust_names.get(&r.customer_id).cloned(),
+                customer_name: cust_paths.get(&r.customer_id).map(|p| p.own_name.clone()),
+                customer_path: cust_paths
+                    .get(&r.customer_id)
+                    .map(|p| p.path.clone())
+                    .unwrap_or_default(),
                 is_urgent: r.is_urgent,
                 delivered_quantity,
                 row_type: r.row_type,

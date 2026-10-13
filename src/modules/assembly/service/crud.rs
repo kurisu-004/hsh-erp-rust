@@ -381,9 +381,9 @@ impl AssemblyService {
         // 那是**两层树**下「叶子」的等价写法。客户树放开任意深度后它既拦不住中间层
         // 节点（一个 L3 中间层照样 `parent_id IS NOT NULL`，却还有下级），又误拒了
         // 单层树上的合法叶子（`parent_id IS NULL` 的孤立根）。判据统一改成
-        // 「叶子 = `has_children == false`」，实现收敛到
-        // `AssemblyRepoTrait::require_leaf_customer`（2026-10-17：原先是本文件
-        // 建单 / 改单两段各抄一份的内联代码，现委托 `shared::customer`）。
+        // 「叶子 = `has_children == false`」，实现**只保留**一条：
+        // `AssemblyRepoTrait::require_leaf_customer`（委托 `shared::customer`，
+        // 本文件零内联副本 —— 与改单路径 `update_assembly` 同一行）。
         let customer_id: i64 = req.customer_id.parse().map_err(|_| {
             AppError::biz(
                 code::BIZ_INVALID_VALUE,
@@ -401,25 +401,6 @@ impl AssemblyService {
                     format!("customer {customer_id} 不存在"),
                 )
             })?;
-        if repo
-            .has_children(customer_id)
-            .await
-            .map_err(AppError::from)?
-        {
-            let descendants = repo.subtree_ids(customer_id).await?.len().saturating_sub(1);
-            let paths = repo.customer_paths_by_ids(&[customer_id]).await?;
-            let label = paths
-                .get(&customer_id)
-                .map(|p| p.path.clone())
-                .unwrap_or_default();
-            return Err(AppError::biz(
-                code::BIZ_INVALID_VALUE,
-                format!(
-                    "装配件只能挂在叶子客户上：{label}（id={customer_id}）下还有 \
-                     {descendants} 个子节点，请改挂到它的下级客户"
-                ),
-            ));
-        }
         repo.require_leaf_customer(customer_id).await?;
 
         // 2. 子件上限

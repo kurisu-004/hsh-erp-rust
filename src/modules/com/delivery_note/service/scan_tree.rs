@@ -324,7 +324,7 @@ fn batch_to_out(r: ScanBatchRow, is_scanned: bool) -> DeliveryScanBatchOut {
 /// 取该 L1 名下现有的 DRAFT（无则 `null`；**绝不建单**）。
 ///
 /// L1 的推导口径与 `POST /scan` 完全一致：装配件树用 `t_assembly.customer_id`
-/// 上推一级，独立件树用 `t_part.customer_id` 上推一级（`parent_id.unwrap_or(id)`）。
+/// 上溯到**根**，独立件树用 `t_part.customer_id` 上溯到根（`l1_of` → `root_id_of`）。
 async fn resolve_draft<R: DeliveryNoteRepoTrait>(
     repo: &mut R,
     hit: &HitTree,

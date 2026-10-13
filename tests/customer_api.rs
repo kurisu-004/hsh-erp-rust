@@ -16,6 +16,9 @@
 //!    （环只能用裸 SQL 造，API 路径造不出来）。
 //! 8. `paths_of` 的出参口径（`customer_path` 不含根名、根自身 path = 自己）。
 //! 9. 列表不传 `limit` ⇒ 返回全量（>50 条）；显式传 `limit` 仍分页。
+//! 10. `CustomerOut.customer_path` 必填且逐层正确（两层 / 四层 / 根三档），列表与
+//!     详情 / 建单 / 改单四条返回路径一致 —— 前端 `customerSchema` 声明成
+//!     `z.string()`，缺这个键会让全站客户筛选器集体空白。
 //!
 //! ## 并行
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
@@ -656,4 +659,154 @@ async fn list_customers_without_limit_returns_all_rows() {
         61,
         "total 是过滤后的全量条数，不受 limit 影响"
     );
+}
+
+/// 2026-10-17（review 第 1 轮 BLOCKER-2）：`CustomerOut.customer_path` 必填且逐层正确。
+///
+/// 前端 `composables/queries/schemas.ts::customerSchema` 把 `customer_path` 声明成
+/// `z.string()`（必填非空），`useCustomersQuery` 的 queryFn 走
+/// `customerListResultSchema.parse` ⇒ 后端少这个键就是**每一次**响应都过不了守门，
+/// `data === undefined`，客户一览页 + 全站所有客户筛选器集体空白且零红色报错。
+/// 本用例把三档口径与四条返回路径一起钉死：
+/// - 两层（第 2 层）⇒ `customer_path` = 本节点单段名（根被去掉）；
+/// - 四层（叶子）⇒ 第 2 层到叶子的 `" / "` 拼接（**不含**根）；
+/// - 根 ⇒ 根自己的名字（**不会**是空串）。
+///
+/// 返回路径：POST（201 建单回读）/ GET 详情 / GET 列表 / POST update —— 四条都必须
+/// 带同一个 `customer_path`，否则前端按路径建的树节点会对不上。
+#[tokio::test]
+async fn customer_out_carries_customer_path_on_every_return_path() {
+    let (pool, token) = bootstrap_as_manager().await;
+
+    // 华强(L1) → 终端BG(L2) → 手机部(L3) → 影像组(L4)
+    let l1 = create_customer_id(&pool, &token, "华强", None, Some("H")).await;
+    let l2 = create_customer_id(&pool, &token, "终端BG", Some(&l1), None).await;
+    let l3 = create_customer_id(&pool, &token, "手机部", Some(&l2), None).await;
+    let l4 = create_customer_id(&pool, &token, "影像组", Some(&l3), None).await;
+
+    assert_eq!(
+        customer_path_of(&pool, &token, &l1).await,
+        "华强",
+        "根 ⇒ 自己的名字（不是空串）"
+    );
+    assert_eq!(
+        customer_path_of(&pool, &token, &l2).await,
+        "终端BG",
+        "第 2 层 ⇒ 去掉根后只剩自己"
+    );
+    assert_eq!(
+        customer_path_of(&pool, &token, &l3).await,
+        "终端BG / 手机部",
+        "第 3 层"
+    );
+    assert_eq!(
+        customer_path_of(&pool, &token, &l4).await,
+        "终端BG / 手机部 / 影像组",
+        "四层叶子 ⇒ 第 2 层到叶子的拼接、不含根"
+    );
+
+    // 建单（201）回读与列表（GET /）两条路径必须逐字一致
+    let (_, env_created) = send(
+        fresh_app(&pool).await,
+        json_request(
+            "POST",
+            "/com/customers",
+            Some(serde_json::json!({
+                "name": "影像组-改名",
+                "parent_id": l3.clone(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        env_created["data"]["customer_path"], "终端BG / 手机部 / 影像组-改名",
+        "201 建单回读必须带 customer_path: {env_created}"
+    );
+
+    let (s, env_list) = send(
+        fresh_app(&pool).await,
+        json_request("GET", "/com/customers", None, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, axum::http::StatusCode::OK, "{env_list}");
+    let items = env_list["data"]["items"].as_array().expect("items");
+    let leaf = items
+        .iter()
+        .find(|it| it["id"] == serde_json::json!(l4))
+        .expect("列表里应有第 4 层那个叶子");
+    assert_eq!(
+        leaf["customer_path"], "终端BG / 手机部 / 影像组",
+        "列表 enrichment 口径必须与详情逐字一致: {leaf}"
+    );
+    // 列表里每一行都必须带这个键（批量 paths_of 一次取齐，不允许某行漏）
+    for it in items {
+        assert!(
+            it["customer_path"].is_string(),
+            "列表每一行都必须带 customer_path: {it}"
+        );
+    }
+}
+
+/// `GET /com/customers/{id}` 的 `customer_path`（2026-10-17 helper）。
+///
+/// 断言的是**键本身**：`.as_str()` 在键缺失 / 为 `null` 时都返 `None`，两者都触发
+/// panic —— 前端 `customerSchema` 声明的是 `z.string()`，`null` 与缺键同样过不了守门。
+async fn customer_path_of(pool: &PgPool, token: &str, id: &str) -> String {
+    let (s, env) = send(
+        fresh_app(pool).await,
+        json_request("GET", &format!("/com/customers/{id}"), None, Some(token)),
+    )
+    .await;
+    assert_eq!(s, axum::http::StatusCode::OK, "get {id}: {env}");
+    env["data"]["customer_path"]
+        .as_str()
+        .unwrap_or_else(|| panic!("customer_path 必须是必填 string: {env}"))
+        .to_string()
+}
+
+/// 2026-10-17（review 第 1 轮 MAJOR-6）：**软删祖先可穿过**，三处向上递归同口径。
+///
+/// 口径统一前 `paths_of` 的递归步带 `p.deleted_at IS NULL`，而 `root_id_of` /
+/// `shared::serial::prefix_for_customer` 不带 ⇒ 同一个客户「取根」能取到、
+/// 「取路径」却被截断。本用例钉住统一后的行为：中途祖先已软删时
+/// `paths_of` 仍能上溯到根，给出与 `root_id_of` **同一个**根。
+///
+/// ⚠️ 触发形态只能用裸 SQL 造：`soft_delete` 的子节点闸门（20124）会拒掉「有活子节点
+/// 的祖先」，而 `create` 要求父行未软删 ⇒ 正常 API 路径进不来这个状态。
+#[tokio::test]
+async fn paths_of_traverses_soft_deleted_ancestors_like_root_id_of() {
+    let (pool, token) = bootstrap_as_manager().await;
+
+    let l1 = create_customer_id(&pool, &token, "华强", None, Some("H")).await;
+    let l2 = create_customer_id(&pool, &token, "终端BG", Some(&l1), None).await;
+    let l3 = create_customer_id(&pool, &token, "手机部", Some(&l2), None).await;
+    let l1_i = l1.parse::<i64>().unwrap();
+    let l2_i = l2.parse::<i64>().unwrap();
+    let l3_i = l3.parse::<i64>().unwrap();
+
+    // 裸 SQL 软删中间层（第 2 层）：绕开 20124 子节点闸门，造出「活节点挂在已软删祖先下」。
+    sqlx::query("UPDATE t_customer SET deleted_at = now() WHERE id = $1")
+        .bind(l2_i)
+        .execute(&pool)
+        .await
+        .expect("软删中间层（裸 SQL 绕开 20124）");
+
+    let mut conn = pool.acquire().await.expect("acquire conn");
+    let map = hsh_erp_rust::shared::customer::paths_of(&mut conn, &[l3_i])
+        .await
+        .expect("paths_of");
+    let got = map.get(&l3_i).expect("软删祖先不该让该行退出 map");
+    assert_eq!(
+        got.root_name, "华强",
+        "软删祖先可穿过 ⇒ root_name 必须与 root_id_of 同解"
+    );
+    assert_eq!(got.own_name, "手机部");
+    assert_eq!(got.path, "终端BG / 手机部");
+
+    // 与 `root_id_of` 对账：两处必须给出同一个根。
+    let root = hsh_erp_rust::shared::customer::root_id_of(&mut conn, l3_i)
+        .await
+        .expect("root_id_of 同样可穿过软删祖先");
+    assert_eq!(root, l1_i, "paths_of 与 root_id_of 必须同解一个根");
 }

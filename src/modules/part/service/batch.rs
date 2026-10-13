@@ -466,10 +466,13 @@ impl PartService {
                     format!("customer {} 不存在", req.customer_id),
                 )
             })?;
-        // 与 with_bindings 同口径：prefix 缺失（20308）在写任何行之前整批拒
-        let serial_prefix = repo.serial_prefix_for_customer(req.customer_id).await?;
-        // 2026-10-17：叶子客户闸门 + 本批客户三列只取一次（逐 item 查 = N+1）。
+        // 与 `batch_create_parts_with_bindings` / `create_part` **同口径**（2026-10-17
+        // 对齐）：闸门一律是「存在性 → 叶子 → 派号 → 取名」。叶子闸门排在派号之前，
+        // 挂了非叶子客户不会白烧一个序列号（号池 4 位一轮回绕，白烧的号会挤掉真正要用的）。
         require_leaf_customer(repo.conn_mut(), req.customer_id).await?;
+        // 2026-10-05：prefix 缺失（20308）在写任何行之前整批拒
+        let serial_prefix = repo.serial_prefix_for_customer(req.customer_id).await?;
+        // 2026-10-17：本批客户三列只取一次（逐 item 查 = N+1，而本批 customer_id 恒定）。
         let cust_paths =
             crate::shared::customer::paths_of(repo.conn_mut(), &[req.customer_id]).await?;
         let mut created = Vec::new();

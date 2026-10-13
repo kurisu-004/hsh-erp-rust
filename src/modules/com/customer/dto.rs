@@ -35,7 +35,7 @@ pub struct CustomerCreateRequest {
 ///
 /// `parent_id` / `serial_prefix` 用 `Option<Option<String>>` 三态编码：
 /// - 字段缺省 ⇒ `None` ⇒ 不修改
-/// - `Some(null)` ⇒ 显式清空（仅 `serial_prefix`，一级客户才能传）
+/// - `Some(null)` ⇒ 显式清空（仅 `serial_prefix`，**根**客户才能传）
 /// - `Some(value)` ⇒ 改值
 ///
 /// ⚠️ `parent_id` **一律不支持修改**（字段保留在 DTO 里只为让显式传值能拿到一条

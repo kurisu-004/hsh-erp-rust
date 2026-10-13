@@ -42,10 +42,14 @@ pub trait DashboardRepoTrait: Send {
     async fn snapshot_overdue(&mut self, today: NaiveDate) -> Result<i64, sqlx::Error>;
 
     /// 交期面板三桶 `upcoming` / `overdue` / `partial`（桶归属与已交判据都在 SQL 侧）。
+    ///
+    /// 返 `AppError` 而非 `sqlx::Error`（2026-10-17）：三桶的客户三列改由
+    /// `shared::customer::paths_of` 产出（`customer_path` 是前端必填键），而那份
+    /// helper 的错误类型就是 `AppError`。
     async fn snapshot_system_delivery_orders(
         &mut self,
         today: NaiveDate,
-    ) -> Result<SystemDeliveryOrders, sqlx::Error>;
+    ) -> Result<SystemDeliveryOrders, crate::shared::error::AppError>;
 
     /// 柱状图下钻抽屉：单日 + 状态过滤的工单明细。
     async fn list_delivery_order_details(
@@ -87,7 +91,7 @@ impl DashboardRepoTrait for &mut PgConnection {
     async fn snapshot_system_delivery_orders(
         &mut self,
         today: NaiveDate,
-    ) -> Result<SystemDeliveryOrders, sqlx::Error> {
+    ) -> Result<SystemDeliveryOrders, crate::shared::error::AppError> {
         DeliveryRepo::list_system_delivery_orders(&mut **self, today, DELIVERY_BUCKET_LIMIT).await
     }
 

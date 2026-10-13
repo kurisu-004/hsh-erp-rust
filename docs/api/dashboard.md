@@ -59,7 +59,7 @@
 | `items[]` | array | 最多 **30** 行（`DELIVERY_BUCKET_LIMIT`） |
 | `total` | number | **匹配总数，不受 `items` 截断影响**（SQL 侧 `COUNT(*) OVER ()`）。裸 JSON number，与 `overdue_count` 一致。零命中时为 `0`（无行 ⇒ 窗口函数无从求值） |
 
-行字段（`SystemDeliveryOrder`，10 个）：
+行字段（`SystemDeliveryOrder`，11 个）：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -69,14 +69,15 @@
 | `quantity` | number | `t_part.quantity`（**件数**）/ `t_assembly.quantity`（**套数**）—— 随 `row_type` 变 |
 | `status` | string | 两侧共用同一份 6 态白名单；`t_assembly` 侧天然只落 4 态（见 §4.2） |
 | `system_delivery_date` | string \| null | `YYYY-MM-DD`；`partial` 桶内可为 null |
-| `customer_name` | string \| null | 客户名（本节点单段名）。两侧 `customer_id` 同指 `t_customer.id`，**一次**批量查（客户树任意深度：这里取的是**自身名**，完整路径见 §3.2 的抽屉三列） |
+| `customer_name` | string \| null | 客户名（本节点单段名）。两侧 `customer_id` 同指 `t_customer.id`，**一次**批量查（客户树任意深度：这里取的是**自身名**） |
+| `customer_path` | string | **2026-10-17 新增（必填键、非 nullable）**：第 2 层到叶子的 `" / "` 拼接（**不含**根），与 §3.2 抽屉行的 `customer_path` 同一份 `shared::customer::paths_of` map；客户行取不到时落**空串**。⚠️ 前端 `dashboardSnapshotSchema` 的 `systemDeliveryOrderSchema` 声明成必填键 ⇒ **部署顺序：后端必须先上**，否则 `dashboardSnapshotSchema.parse` 抛 ⇒ **整个大屏空白** |
 | `is_urgent` | boolean | 两侧同名列 |
 | `delivered_quantity` | number | 件级：已交**件数**；装配件级：已交**套数**（min 公式，见 §4.4） |
 | `row_type` | string | `"PART"` \| `"ASSEMBLY"`。前端据此切换「件 / 套」单位与下钻目标 |
 
 判据（是否已交）**全部在 SQL 里**（`repo/delivery.rs` 的三个 `SQL_ORDERS_*` 常量），
 不拉全量回 Rust 分桶 —— 否则「前 30 条」会变成「先截断再分桶」的错误口径。
-三桶各 1 条主查询 + 3 次批量聚合（散件已交件数 / 装配件已交套数 / 客户名），
+三桶各 1 条主查询 + 3 次批量聚合（散件已交件数 / 装配件已交套数 / 客户三列），
 **SQL 条数上界 6 条且与命中行数无关**（聚合入参集为空时各跳过 1 条）。
 
 ## 3. 交期分桶与抽屉

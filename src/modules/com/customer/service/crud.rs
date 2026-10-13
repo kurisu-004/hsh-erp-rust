@@ -38,6 +38,7 @@
 //! `CustomerService` 是 unit struct（无字段依赖，iam 范本 §6）；方法签名
 //! `<R: CustomerRepoTrait>(&self, mut repo: R, ...)`，生产 `R = &mut PgConnection`。
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::auth::rbac::{CurrentUser, Role};
@@ -46,6 +47,7 @@ use crate::modules::com::customer::dto::*;
 use crate::modules::com::customer::model::TCustomer;
 use crate::modules::com::customer::repo::CustomerRepoTrait;
 use crate::modules::com::customer::vo::{CustomerListOut, CustomerOut};
+use crate::shared::customer::CustomerPath;
 use crate::shared::error::{AppError, code};
 
 /// 2026-10-17：**不传 `limit` ⇒ 不分页、返回全量**（旧的 `DEFAULT_LIMIT = 50`
@@ -64,17 +66,39 @@ fn version_conflict() -> AppError {
 }
 
 /// 把 service 的 `(parent_id: i64, name: String)` 拼成 `CustomerOut`。
-fn to_customer_out(c: TCustomer, parent_name: Option<String>) -> CustomerOut {
+///
+/// `customer_path` 由 service 层用 `shared::customer::paths_of` 的批量 map 补
+/// （2026-10-17 新增，前端 `customerSchema` 声明成必填键，见 `vo::CustomerOut` 的
+/// 部署顺序注记）。
+fn to_customer_out(
+    c: TCustomer,
+    parent_name: Option<String>,
+    customer_path: String,
+) -> CustomerOut {
     CustomerOut {
         id: c.id,
         name: c.name,
         parent_id: c.parent_id.map(|v| v.to_string()),
         parent_name,
+        customer_path,
         serial_prefix: c.serial_prefix,
         version: c.version,
         created_at: c.created_at,
         updated_at: c.updated_at,
     }
+}
+
+/// 从 `paths_of` 的批量 map 里取一行的 `customer_path`。
+///
+/// ⚠️ 取不到时**退化成本节点单段名而不是空串**：本域所有调用点读的 `c` 都是刚查出来
+/// 的未软删行，`paths_of` 的锚点只收未软删行 ⇒ 正常路径必有值；退化分支只兜脏数据
+/// （客户行已软删 / `parent_id` 断链）。而 `customer_path` 是前端必填键，落空串会让
+/// 客户筛选器渲染成一截空标签，比「只有一段名」更难排查。
+fn path_of(paths: &HashMap<i64, CustomerPath>, c: &TCustomer) -> String {
+    paths
+        .get(&c.id)
+        .map(|p| p.path.clone())
+        .unwrap_or_else(|| c.name.clone())
 }
 
 /// 校验 `serial_prefix`：必须为单个 ASCII 大写字母；空 / 多字符 / 小写都拒。
@@ -162,6 +186,11 @@ impl CustomerService {
         let parent_map: std::collections::HashMap<i64, String> =
             parents.into_iter().map(|p| (p.id, p.name)).collect();
 
+        // 2026-10-17 新增：`customer_path`（第 2 层到叶子、不含根）同样防 N+1 批量取 ——
+        // 一次 `paths_of` 覆盖全部 item，逐行上溯会让 61 个客户的列表变 61 次递归 CTE。
+        let ids: Vec<i64> = items.iter().map(|c| c.id).collect();
+        let path_map = repo.customer_paths_by_ids(&ids).await?;
+
         // 全量模式下 `limit` 回填**实际行数**、offset 恒 0：前端 `CustomerListResult`
         // 有这两个字段，缺了会与 Python 旧响应对不上（那个年代恒定 50/0）。
         let out_limit = limit.unwrap_or(items.len() as i64);
@@ -169,7 +198,8 @@ impl CustomerService {
             .into_iter()
             .map(|c| {
                 let parent_name = c.parent_id.and_then(|pid| parent_map.get(&pid).cloned());
-                to_customer_out(c, parent_name)
+                let customer_path = path_of(&path_map, &c);
+                to_customer_out(c, parent_name, customer_path)
             })
             .collect();
 
@@ -204,7 +234,10 @@ impl CustomerService {
             None => None,
         };
 
-        Ok(to_customer_out(c, parent_name))
+        let path_map = repo.customer_paths_by_ids(&[id]).await?;
+        let customer_path = path_of(&path_map, &c);
+
+        Ok(to_customer_out(c, parent_name, customer_path))
     }
 
     // =======================================================================
@@ -247,18 +280,20 @@ impl CustomerService {
         }
 
         // 根必须带 serial_prefix，非根必须不带（判据是「有没有 parent_id」，与层级深度无关）
+        // 2026-10-17：文案统一用「根 / 非根」（`docs/api/customers.md` §2 的口径词），
+        // 不再用两层时代的「一级 / 非一级」—— 深树上「第 2 层」不是「一级」，混用会误导。
         let prefix_upper: Option<String> = match (&req.serial_prefix, parent_id.is_some()) {
             (Some(s), false) if !s.is_empty() => Some(check_serial_prefix(s)?),
             (Some(_), true) => {
                 return Err(AppError::biz(
                     code::BIZ_INVALID_VALUE,
-                    "非一级客户不得提供 serial_prefix",
+                    "非根客户（parent_id 非空）不得提供 serial_prefix",
                 ));
             }
             (None, false) => {
                 return Err(AppError::biz(
                     code::BIZ_INVALID_VALUE,
-                    "一级客户必须提供 serial_prefix",
+                    "根客户（parent_id 为空）必须提供 serial_prefix",
                 ));
             }
             _ => None,
@@ -276,7 +311,12 @@ impl CustomerService {
                 },
             )?;
 
-        Ok(to_customer_out(c, None))
+        // 2026-10-17 新增：201 响应同样是 `CustomerOut`，`customer_path` 是前端必填键 ⇒
+        // 建完立刻取一次（单行查询，不是 N+1：整个 create 只多这一趟）。
+        let path_map = repo.customer_paths_by_ids(&[c.id]).await?;
+        let customer_path = path_of(&path_map, &c);
+
+        Ok(to_customer_out(c, None, customer_path))
     }
 
     pub async fn update_customer<R: CustomerRepoTrait>(
@@ -311,22 +351,22 @@ impl CustomerService {
         let prefix_update: Option<Option<&str>> = match &req.serial_prefix {
             None => None,
             Some(None) => {
-                // 显式清空：仅 L1 允许
+                // 显式清空：仅根允许
                 if current.parent_id.is_none() {
                     Some(None)
                 } else {
                     return Err(AppError::biz(
                         code::BIZ_INVALID_VALUE,
-                        "非一级客户无需清空 serial_prefix",
+                        "非根客户（parent_id 非空）无需清空 serial_prefix",
                     ));
                 }
             }
             Some(Some(s)) => {
-                // serial_prefix 只在一级客户可改（序列号前缀是根的属性，由根派生）
+                // serial_prefix 只在根客户可改（序列号前缀是根的属性，由根派生）
                 if current.parent_id.is_some() {
                     return Err(AppError::biz(
                         code::BIZ_INVALID_VALUE,
-                        "非一级客户不得修改 serial_prefix",
+                        "非根客户（parent_id 非空）不得修改 serial_prefix",
                     ));
                 }
                 let upper = check_serial_prefix(s)?;

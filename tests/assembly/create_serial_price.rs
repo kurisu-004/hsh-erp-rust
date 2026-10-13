@@ -19,8 +19,11 @@
 //!    行数不变；
 //! 7. `create_rejects_when_serial_prefix_not_registered` —— prefix 未在
 //!    `t_serial_counter` 注册 → 20108，行数不变；
-//! 8. `create_rejects_when_customer_not_l2_leaf` —— customer 传 L1 → 20302，
-//!    行数不变。
+//! 8. `create_rejects_when_customer_is_not_leaf` —— customer 挂到**有子节点**的客户
+//!    ⇒ **20104** `BIZ_INVALID_VALUE`，行数不变。⚠️ 旧注释写的
+//!    `create_rejects_when_customer_not_l2_leaf → 20302` 两处都已过期：客户树放开
+//!    任意深度后「L2 叶子」不再是等价写法，闸门统一成 `has_children == false`
+//!    （`shared::customer::require_leaf_customer`），错误码随之改为 20104。
 //!
 //! 全程走 HTTP（`POST /assemblies` 是 multipart 端点，service 直调验证不了字段名
 //! 解析），基建沿用 `tests/part/create_serial_price.rs` 的写法：`test_pool` +

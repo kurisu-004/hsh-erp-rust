@@ -7,7 +7,12 @@
 use chrono::NaiveDateTime;
 use serde::Serialize;
 
-/// 客户详情出参。`parent_name` 由 service 层补全（连表查父客户的 name）。
+/// 客户详情出参。`parent_name` / `customer_path` 由 service 层补全。
+///
+/// ⚠️ 两个「名字」字段语义不同，不要互相 cast：
+/// - `parent_name` = **直接父**（上跳一层）的名字，只用于前端画树的一层缩进；
+/// - `customer_path` = **第 2 层到叶子**的 `" / "` 拼接（**不含**根），与其它域
+///   出参上的 `customer_path` / `l1_customer_name` 同源（`shared::customer::paths_of`）。
 #[derive(Debug, Clone, Serialize)]
 pub struct CustomerOut {
     #[serde(serialize_with = "crate::shared::types::serialize_i64")]
@@ -15,6 +20,15 @@ pub struct CustomerOut {
     pub name: String,
     pub parent_id: Option<String>,
     pub parent_name: Option<String>,
+    /// 2026-10-17 新增（必填键、非 nullable）：第 2 层到叶子的 `" / "` 拼接路径，
+    /// **不含**根；本节点即根时 = 根自己的名字。
+    ///
+    /// ⚠️ **部署顺序：后端必须先上** —— 前端 `customerSchema` 把它声明成
+    /// `z.string()`（必填非空），缺这个键 ⇒ `useCustomersQuery` 的守门 `parse` 抛
+    /// ⇒ `data === undefined` ⇒ 客户一览页 + **全站所有客户筛选器**（零件 / 装配件 /
+    /// 外协 / 送货单 / 报工台）集体空白且零红色报错。取不到时落**本节点单段名**（不是
+    /// 空串），保证这个必填键永远有可读值。
+    pub customer_path: String,
     pub serial_prefix: Option<String>,
     pub version: i32,
     pub created_at: NaiveDateTime,

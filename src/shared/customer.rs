@@ -110,9 +110,15 @@ pub async fn subtree_ids(conn: &mut PgConnection, cid: i64) -> Result<Vec<i64>, 
 ///
 /// 两种失败：
 /// - 客户不存在 / 已软删（`chain` 为空）→ `20102 BIZ_CUSTOMER_NOT_FOUND`
-/// - 客户在但**解析不出根**（成环 / 链尾断在已软删或不存在的父行 / 超过深度上限）
-///   → `20104 BIZ_INVALID_VALUE`。刻意**不**复用 20102：那不是「客户没录进来」，
+/// - 客户在但**解析不出根**（成环 / 链尾断在**不存在**的父行 / 根行已软删 / 超过
+///   深度上限）→ `20104 BIZ_INVALID_VALUE`。刻意**不**复用 20102：那不是「客户没录进来」，
 ///   而是库里的树已经坏了，报 20102 会把排查方向指到「用户没建客户」。
+///
+/// ## 软删祖先：**可以穿过**（2026-10-17 与 [`paths_of`] / `shared::serial::
+/// prefix_for_customer` 统一口径）
+/// 递归步**不**带 `p.deleted_at IS NULL` —— 中途祖先即使已软删也照样穿过，只有
+/// **根行**必须未软删（外层的 `AND deleted_at IS NULL` 判据）。三处向上递归必须同口径：
+/// 同一个客户若在「取根」和「取路径」上给出不同答案，派号与展示就会互相矛盾。
 pub async fn root_id_of(conn: &mut PgConnection, cid: i64) -> Result<i64, AppError> {
     // CTE 里必须带出 `deleted_at`：外层要在 CTE 结果上判「根行未软删」，
     // CTE 不投影这一列的话 PG 直接报 `column "deleted_at" does not exist`。
@@ -152,7 +158,7 @@ pub async fn root_id_of(conn: &mut PgConnection, cid: i64) -> Result<i64, AppErr
         AppError::biz(
             code::BIZ_INVALID_VALUE,
             format!(
-                "customer {cid} 的 parent_id 链解析不出根（成环 / 父行缺失或已软删 / \
+                "customer {cid} 的 parent_id 链解析不出根（成环 / 父行不存在或根行已软删 / \
                  超过最大深度 {MAX_CUSTOMER_DEPTH}），客户树数据异常"
             ),
         )
@@ -190,9 +196,18 @@ pub async fn has_children(conn: &mut PgConnection, cid: i64) -> Result<bool, sql
 /// 递归 CTE 逐行携带 `target_id`（沿链不变），故同一批 id 的链在一条查询里并行
 /// 上溯、最后按 `target_id` 分组，互不串味。防环两道闸同 [`root_id_of`]。
 ///
-/// 解析不出根的节点（成环 / 链尾断在已软删父行 / 超深度）**不进 map**：它的
-/// `array_agg` 只收集到断链处，拼出来的路径是残缺的。调用方按「map 里没有 = 该客户
-/// 拿不到路径」容忍处理，不要当成致命错误。
+/// ## 软删祖先：**可以穿过**（2026-10-17 统一口径）
+/// 递归步**不**带 `p.deleted_at IS NULL`，与 [`root_id_of`] / `shared::serial::
+/// prefix_for_customer`] 两处向上递归逐字一致：**只有终点行（被查询的那个 id 本身）
+/// 必须未软删**。此前本函数独一份「软删祖先即断链」的判据，会让同一个客户在
+/// 「取路径」与「取根 / 取序列号前缀」上给出互相矛盾的答案（前者截断、后者穿过）。
+///
+/// ## 解析不出根时 map 里**仍有**该 id，但 `root_name` 会退化
+/// `GROUP BY target_id` 对每个未软删的终点行都产出一组，故「map 里没有」只意味着
+/// 「终点行不存在 / 已软删」，**不**意味着「树断了」。成环 / 超过
+/// [`MAX_CUSTOMER_DEPTH`] 时链条在防环闸门处停下，`chain.first()` 拿到的是**断链处
+/// 那个祖先**（不是根），`path` 是对应的截断路径。正常写入路径进不来这两种形态
+/// （`create` 要求父行存在且未软删、`update` 拒改 `parent_id`），它们只出现在脏数据里。
 ///
 /// 空 `ids` 短路返回空 map（省一次无谓往返）。
 pub async fn paths_of(
@@ -214,7 +229,7 @@ pub async fn paths_of(
          UNION ALL \
          SELECT u.target_id, p.id, p.parent_id, p.name, u.depth + 1, u.seen || p.id \
          FROM up u INNER JOIN t_customer p ON p.id = u.parent_id \
-         WHERE p.deleted_at IS NULL AND NOT (p.id = ANY(u.seen)) AND u.depth < ",
+         WHERE NOT (p.id = ANY(u.seen)) AND u.depth < ",
     );
     qb.push_bind(MAX_CUSTOMER_DEPTH);
     // depth 越大越靠近根，故 DESC 序 = 根在前、自身在后。
@@ -274,8 +289,10 @@ pub async fn require_leaf_customer(
         .len()
         .saturating_sub(1);
     let paths = paths_of(&mut *conn, &[customer_id]).await?;
-    // 解析不出根（成环 / 链尾断在已软删父行）时 map 里没有该 id —— 回落成
-    // 「customer {id}」而不是空串：空串拼进 message 读起来像漏了值。
+    // 兜底分支可达但罕见：`paths_of` 的锚点只收**未软删**行，而本函数只判
+    // `has_children`（不判本行自身的 `deleted_at`）⇒ 脏数据（节点自己已软删、下面还挂
+    // 着活子节点）会让 map 里没有该 id。此时回落成「customer {id}」而不是空串：空串
+    // 拼进 message 读起来像漏了值。
     let label = paths
         .get(&customer_id)
         .map(|p| p.path.clone())

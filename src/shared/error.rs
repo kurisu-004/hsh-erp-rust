@@ -165,7 +165,12 @@ pub mod code {
 
     // 203xx 装配体
     pub const BIZ_ASSEMBLY_NOT_FOUND: i32 = 20301;
-    pub const BIZ_ASSEMBLY_BAD_CUSTOMER: i32 = 20302; // 客户节点不允许（一级集团 / 不存在）
+    // ⚠️ 2026-10-17 起**零调用方**，按仓内先例（`20118`）保留常量登记备查：
+    // 客户树放开任意深度后，「装配件只能挂在叶子客户」改由
+    // `shared::customer::require_leaf_customer` 统一判定，错误码改为
+    // `20104 BIZ_INVALID_VALUE`（旧的 20302 语义「一级集团 / 不存在」在深树上已不成立
+    // —— 建根不再是错误，只有「还有子节点」才是）。
+    pub const BIZ_ASSEMBLY_BAD_CUSTOMER: i32 = 20302;
     pub const BIZ_ASSEMBLY_TOO_MANY_CHILDREN: i32 = 20303; // 子件 > 99，序列号 {serial}-{i:02d} 派生失败
     pub const BIZ_ASSEMBLY_PDF_INVALID: i32 = 20305; // multipart PDF 页数与 children.len()+1 不匹配 / lopdf 解析失败
     pub const BIZ_ASSEMBLY_CHILD_PRICE_LOCKED: i32 = 20306; // 父装配体已设总价时禁止子件改价（预留）
