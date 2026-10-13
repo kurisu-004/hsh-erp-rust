@@ -259,11 +259,16 @@ pub struct RollupOutcome {
     ///
     /// 之前这条路径只留一条
     /// `tracing::warn!`：对调用方而言「part 已终态、派生被跳过」与「数据本来就
-    /// 一致」都是 `NoChange`，**完全无法区分** —— admin 对账端点会因此对
+    /// 一致」都是 `NoChange`，**完全无法区分** —— 当时的 admin 对账端点会因此对
     /// 「终态但错的 part」报出一份「已覆盖全表、0 变化」的假干净报告；而
-    /// 终态守卫对「用 `part_ids` 定点排查」这条路径同样生效，所以定点排查
+    /// 终态守卫对任何定点排查路径同样生效，所以定点排查
     /// 物理上不可能把那类行修好。本字段把「被拦 + 拦前
     /// 状态 + 派生值」上抛，让调用方能显式计数与逐条上报。
+    ///
+    /// ⚠️ **2026-10-13**：admin 域整域删除后，本字段**在生产链路上已无消费方**
+    /// （唯一的消费者是那个对账端点）。字段本身**必须保留**且派生逻辑**必须继续
+    /// 填它** —— 「被守卫拦下」与「数据本来就一致」在返回值上同形这件事没有消失，
+    /// 将来任何新增的排查 / 修数入口都只能靠它区分。
     pub terminal_skip: Option<TerminalSkip>,
 }
 
@@ -483,7 +488,9 @@ pub async fn rollup_part_derived(
         // 2026-10-01 review 第 2 轮 MAJOR-1：终态守卫命中**必须上抛**诊断信息。
         // 降级语义不变（`NoChange`，派生层不否决主操作），但此前只留一条
         // `tracing::warn!`，调用方无法把它与「数据本来就一致」区分开 ——
-        // admin 对账端点因此会对「终态但错的 part」报出假干净报告。
+        // 当时的 admin 对账端点因此会对「终态但错的 part」报出假干净报告。
+        // ⚠️ 2026-10-13 该端点随域删除，但**这一段逻辑照旧**：它守的是返回值语义
+        //   的可区分性，不是那个端点。
         let terminal_skip = if is_terminal(&cur.status) {
             tracing::warn!(
                 part_id,
@@ -1694,5 +1701,220 @@ mod write_guard_tests {
         // 大小写 / 换行 / 别名 / 限定名都要能命中
         let tricky = "let q = \"update   t_part_batch\\n  set pb.status= $1 where id=$2\";";
         assert_eq!(status_write_lines(tricky), vec![1]);
+    }
+}
+
+// =============================================================================
+// `sync_assembly_status` 的 mock 单测（2026-10-13 新增）
+// =============================================================================
+//
+// ## 为什么放在这里、而不是集成测试
+//
+// `sync_assembly_status` 是派生链**最后一跳**的实体实现（batch → part → assembly
+// 三层里的第 3 层），它的三条不可变量全部是「控制流」性质，与 SQL 无关：
+// 1. 终态短路：父件已 COMPLETED / CANCELLED → 连子件状态都不查；
+// 2. 派生层不得否决主操作：OCC UPDATE 命中 0 行 → **降级为 NoChange**，绝不 Err；
+// 3. ALL_CANCELLED → CANCELLED（`compute_assembly_target` 的唯一「非 min-progress」
+//    分支，其余全是 min-progress 映射）。
+//
+// 这三条用 mock 打桩就能钉死，且**零 DB**；真库那侧由
+// `tests/assembly/status_sync.rs` 的 4 条端到端用例守。本模块在 2026-10-13 删掉
+// admin 域（`POST /api/v2/admin/recompute-rollup`）时失去了唯一一组直接覆盖本函数的
+// 集成用例（`tests/part/rollup_recompute.rs` 的用例 2 / 3），故补本模块保住回归网。
+//
+// ## mockall strict mode
+//
+// 被调用的方法必须 `.expect_*()`；没被调用的方法**不必** expect —— 这正是「终态
+// 短路」那条用例能表达「短路发生在查子件之前」的机制（不给
+// `aggregate_children_status` 挂 expect，它被调到就会当场 panic）。
+//
+// 范本：`src/modules/part/service/phase1/excel_match.rs` 的 `#[cfg(test)]` 模块。
+
+#[cfg(test)]
+mod sync_assembly_status_tests {
+    use mockall::predicate::*;
+
+    use super::*;
+    use crate::modules::assembly::model::TAssembly;
+    use crate::modules::assembly::repo::MockAssemblyRepoTrait;
+
+    /// 造一行 `TAssembly`：只填本函数读到的两列（`status` / `version`），
+    /// 其余给中性值 —— 与 `shippable_sets.rs` 的同名 helper 同款。
+    fn asm(status: &str, version: i32) -> TAssembly {
+        let d = chrono::NaiveDate::from_ymd_opt(2026, 10, 13).unwrap();
+        TAssembly {
+            id: ASM_ID,
+            drawing_no: "A-MOCK".to_string(),
+            name: "装配件-mock".to_string(),
+            applicant_name: None,
+            customer_id: 1,
+            request_date: d,
+            planned_delivery_date: d,
+            is_urgent: false,
+            status: status.to_string(),
+            version,
+            created_at: crate::infra::clock::now_naive(),
+            created_by: None,
+            updated_at: crate::infra::clock::now_naive(),
+            updated_by: None,
+            deleted_at: None,
+            serial_no: None,
+            quantity: 1,
+            unit_price: None,
+            total_price: None,
+            order_no: None,
+            system_delivery_date: None,
+            note: None,
+        }
+    }
+
+    const ASM_ID: i64 = 9_000_000_000_000_900_001;
+    const UPDATED_BY: i64 = 9_000_000_000_000_900_002;
+
+    /// 不变式 ③：`ALL_CANCELLED → CANCELLED`。
+    ///
+    /// 这是 `compute_assembly_target` 里唯一**不走 min-progress** 的分支：所有子件
+    /// 取消时进度是「空集」的语义，必须判成 CANCELLED 而不是 PENDING。
+    /// （本函数之外，`tests/assembly/status_sync.rs`
+    /// 的 `all_children_cancelled_flips_assembly_to_cancelled` 在真库上守同一条。）
+    #[tokio::test]
+    async fn all_children_cancelled_flips_to_cancelled() {
+        let mut repo = MockAssemblyRepoTrait::new();
+        repo.expect_get_by_id()
+            .with(eq(ASM_ID), eq(false))
+            .returning(|_, _| Ok(Some(asm("PENDING", 0))));
+        repo.expect_aggregate_children_status()
+            .with(eq(ASM_ID))
+            .returning(|_| Ok(vec!["CANCELLED".to_string(), "CANCELLED".to_string()]));
+        repo.expect_update_status_if_not_terminal()
+            .with(eq(ASM_ID), eq(0), eq("CANCELLED"), eq(UPDATED_BY))
+            .returning(|_, _, _, _| Ok(1));
+
+        let out = sync_assembly_status(&mut repo, ASM_ID, UPDATED_BY)
+            .await
+            .expect("sync 应 OK");
+        assert_eq!(out, SyncOutcome::Changed(ASM_ID));
+    }
+
+    /// 终态短路：父件已 COMPLETED / CANCELLED → **连子件状态都不查**。
+    ///
+    /// mockall strict mode 下不给 `aggregate_children_status` / `update_status_if_not_terminal`
+    /// 挂 expect：被调到就 panic，正是「短路发生在拉子件之前」的可执行证据。
+    #[tokio::test]
+    async fn terminal_parent_short_circuits_before_reading_children() {
+        for terminal in ["COMPLETED", "CANCELLED"] {
+            let mut repo = MockAssemblyRepoTrait::new();
+            repo.expect_get_by_id()
+                .with(eq(ASM_ID), eq(false))
+                .returning(move |_, _| Ok(Some(asm(terminal, 7))));
+            // 故意不 expect 其它两个方法：短路成立时它们一次都不会被调。
+
+            let out = sync_assembly_status(&mut repo, ASM_ID, UPDATED_BY)
+                .await
+                .unwrap_or_else(|e| panic!("terminal={terminal} 不该报错：{e}"));
+            assert_eq!(
+                out,
+                SyncOutcome::NoChange,
+                "terminal={terminal}：父已终态 → 派生不得改写它"
+            );
+        }
+    }
+
+    /// 不变式 ②：**派生层不得否决主操作**（2026-10-01 review 第 1 轮 B1 的核心修正）。
+    ///
+    /// `update_status_if_not_terminal` 返回 0 行（并发把 version 改了 / 期间进了终态）
+    /// 时，本函数必须**降级为 NoChange 并返回 Ok** —— 改造前这里返
+    /// `Err(VERSION_CONFLICT)`，那个 Err 会沿派生链上抛、把**用户真正请求的那次
+    /// 批次状态变更**一起回滚，还会返回一个指向无关实体（父装配件）的 409。
+    #[tokio::test]
+    async fn occ_conflict_degrades_to_nochange_instead_of_erroring() {
+        let mut repo = MockAssemblyRepoTrait::new();
+        repo.expect_get_by_id()
+            .with(eq(ASM_ID), eq(false))
+            .returning(|_, _| Ok(Some(asm("IN_PROCESS", 3))));
+        repo.expect_aggregate_children_status()
+            .with(eq(ASM_ID))
+            .returning(|_| Ok(vec!["INSPECTION".to_string()]));
+        repo.expect_update_status_if_not_terminal()
+            .with(eq(ASM_ID), eq(3), eq("INSPECTION"), eq(UPDATED_BY))
+            .returning(|_, _, _, _| Ok(0));
+
+        let out = sync_assembly_status(&mut repo, ASM_ID, UPDATED_BY)
+            .await
+            .expect("OCC 冲突必须降级为 Ok，绝不能 Err");
+        assert_eq!(out, SyncOutcome::NoChange);
+    }
+
+    /// target == current → NoChange，**不写库**。
+    #[tokio::test]
+    async fn target_equal_current_is_nochange_without_write() {
+        let mut repo = MockAssemblyRepoTrait::new();
+        repo.expect_get_by_id()
+            .with(eq(ASM_ID), eq(false))
+            .returning(|_, _| Ok(Some(asm("INSPECTION", 2))));
+        repo.expect_aggregate_children_status()
+            .with(eq(ASM_ID))
+            .returning(|_| Ok(vec!["COMPLETED".to_string(), "INSPECTION".to_string()]));
+        // 不 expect update：min-progress = min(6, 4) = 4 ⇒ INSPECTION == current。
+
+        let out = sync_assembly_status(&mut repo, ASM_ID, UPDATED_BY)
+            .await
+            .expect("sync 应 OK");
+        assert_eq!(out, SyncOutcome::NoChange);
+    }
+
+    /// min-progress 落点：子件 `[INSPECTION, INSPECTION]` → 父 `INSPECTION`。
+    ///
+    /// 顺带钉住「OCC 用的是读到的那个 version、`updated_by` 原样透传」这两条
+    /// 事实 —— 它们错了不会编译失败，只会静默把派生写打偏。
+    #[tokio::test]
+    async fn min_progress_target_is_written_with_read_version_and_actor() {
+        let mut repo = MockAssemblyRepoTrait::new();
+        repo.expect_get_by_id()
+            .with(eq(ASM_ID), eq(false))
+            .returning(|_, _| Ok(Some(asm("PENDING", 5))));
+        repo.expect_aggregate_children_status()
+            .with(eq(ASM_ID))
+            .returning(|_| Ok(vec!["INSPECTION".to_string(), "INSPECTION".to_string()]));
+        // 断言 version=5 原样传给 OCC；下面的 with() 写死这两个值即守卫。
+        repo.expect_update_status_if_not_terminal()
+            .with(eq(ASM_ID), eq(5), eq("INSPECTION"), eq(UPDATED_BY))
+            .returning(|_, _, _, _| Ok(1));
+
+        let out = sync_assembly_status(&mut repo, ASM_ID, UPDATED_BY)
+            .await
+            .expect("sync 应 OK");
+        assert_eq!(out, SyncOutcome::Changed(ASM_ID));
+    }
+
+    /// 父装配件不存在 → `BIZ_ASSEMBLY_NOT_FOUND`（不是静默 NoChange）。
+    ///
+    /// 反向漂移的典型形态就是「子件还指向一个已被删的父件」，静默 NoChange 会让
+    /// 对账 / 业务流都以为「已经一致」。
+    #[tokio::test]
+    async fn missing_parent_is_a_business_error() {
+        let mut repo = MockAssemblyRepoTrait::new();
+        repo.expect_get_by_id()
+            .with(eq(ASM_ID), eq(false))
+            .returning(|_, _| Ok(None));
+
+        let err = sync_assembly_status(&mut repo, ASM_ID, UPDATED_BY)
+            .await
+            .expect_err("父不存在必须 Err");
+        assert_eq!(err.code(), code::BIZ_ASSEMBLY_NOT_FOUND, "err={err:?}");
+    }
+
+    /// 库里的 `status` 出现未知字面量 → `BIZ_INVALID_VALUE`，不得静默按 None 处理。
+    #[tokio::test]
+    async fn unknown_parent_status_is_rejected() {
+        let mut repo = MockAssemblyRepoTrait::new();
+        repo.expect_get_by_id()
+            .with(eq(ASM_ID), eq(false))
+            .returning(|_, _| Ok(Some(asm("NOT_A_STATUS", 0))));
+
+        let err = sync_assembly_status(&mut repo, ASM_ID, UPDATED_BY)
+            .await
+            .expect_err("未知状态必须 Err");
+        assert_eq!(err.code(), code::BIZ_INVALID_VALUE, "err={err:?}");
     }
 }

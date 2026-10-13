@@ -239,7 +239,7 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 | `GET /api/v2/dashboard/delivery-orders` | 登录即可 | 柱状图下钻抽屉：`date` + `statuses` 必填（逗号分隔），`basis` 缺省 system，`total` 不受 200 条截断影响 |
 | `GET /ws/dashboard` | JWT + session | 握手首帧 snapshot + `WsEvent::DashboardEvent` 增量 + text 心跳 |
 
-- **域外依赖 = 0**（只读 5 表 `t_part` / `t_part_batch` / `t_assembly` / `t_customer` / `t_worker`，只读跨域聚合是本仓既定 pattern，同 `statistics` / `admin`）。
+- **域外依赖 = 0**（只读 5 表 `t_part` / `t_part_batch` / `t_assembly` / `t_customer` / `t_worker`，只读跨域聚合是本仓既定 pattern，同 `statistics`；⚠️ 原举例的 `admin` 域已于 2026-10-13 整域删除）。
   - **护栏设施**：`src/shared/domain_guard.rs`（`#[cfg(test)]` 项、不进 lib 产物，故**只有 `src/` 内单元测试能用**，`tests/` 集成测试拿不到、要靠它得先改调用方式）的 `assert_no_foreign_domain(本域路径, 本域源码目录, 域专属指引)` —— 在剥掉注释的代码区里找「域根段 + 他域路径」前缀失配；不连网不连库，单测可在无 DB 环境跑。已登记的漏报盲区与精度边界见该文件顶部 doc。
   - **已接入共 7 处 = 整域 5 + 非整域切片 3**（2026-10-11 review 第 1 轮由 6 = 4 + 2 订正：wx BFF 重构新增 `wx::production` 整域接入 + `wx::part_list` 切片接入。与 `src/shared/domain_guard.rs` 顶部 doc 同一套口径）：整域接入的 5 处是 `modules::dashboard::tests::dashboard_domain_depends_on_no_other_domain`（扫 `src/modules/dashboard/**/*.rs`）、`modules::iam::tests::iam_domain_depends_on_no_other_domain`（扫 `src/modules/iam/**/*.rs`，含嵌套子模块 `iam::shelf`；⚠️ iam 是「**纯自有表域**」—— `t_user` / `t_user_role` / `t_menu` / `t_wx_identity` / `t_shelf` 全部归它，不需要 dashboard / statistics 那种「在本域 SQL 里跨域只读聚合」的取舍，故这条护栏只有「不许 import 别人的 service / repo」一重含义）、`modules::prod::programming::tests::programming_domain_depends_on_no_other_domain`、`modules::prod::inspection::tests::inspection_domain_depends_on_no_other_domain`（后两者分别扫 `src/modules/prod/programming/**/*.rs` 与 `src/modules/prod/inspection/**/*.rs`，本域路径为嵌套域 `prod::xxx`，**同父兄弟域 `prod::batch` 同样算跨域**）、`modules::wx::production::tests::production_domain_depends_on_no_other_domain`（扫 `src/modules/wx/production/**/*.rs`；本域读 `t_user` / `t_worker` / `t_work_type` 但按既定 pattern 在本域 SQL 里只读聚合，不 import `iam::service::account`）；**非整域切片接入**的 3 处是 `modules::prod::queue::board::tests::board_aggregation_depends_on_no_other_domain`（只扫 `src/modules/prod/queue/board/**/*.rs` —— queue 域整体**不适用**该护栏，它的写端点按既定 pattern 经本域 trait 转发其它域单表查询）、`modules::prod::scan::listing::tests::listing_aggregation_depends_on_no_other_domain`（只扫 `src/modules/prod/scan/listing/**/*.rs` —— `prod::scan` 是**转发型**域，`worker_scan` 必然 import `part` / `assembly` / `prod::queue` / `prod::worker` 四处域，但它的 3 条只读聚合端点（pickable / held / locate）完全可以零跨域；圈出可守的部分比整域不守要强）与 `modules::wx::part_list::tests::part_list_domain_depends_on_no_other_domain`（只扫 `src/modules/wx/part_list/**/*.rs` —— `wx` 域整体**不适用**该护栏，其 `login` 子模块必然 import `iam::service::account`，但 `part_list` 这块只读聚合完全可以零跨域）。新增只读跨域聚合域时照此加一行调用即可。
   - **元测试**：`shared::domain_guard::tests::*`（6 条，含「本域标识符非法必须 panic」与 raw string 字符串状态两组）。任一写法漏报、误报或探测器瞎了都会红。
@@ -474,7 +474,10 @@ t_assembly.status               ← 派生缓存
   - bulk 入口传 `PartDerivation::KeepPartTerminalAsIs`：显式「跳过 part 写、继续派生
     父装配件」，否则跳过 part 写的同时父件也会与子件长期不一致。
   - 回归测试：`tests/part/lifecycle.rs::cancel_part_is_not_overwritten_by_rollup_completed`。
-  - 已知代价：**已终态**的 part 不再被 rollup / admin 对账改写（那需要一次人工决策）。
+  - 已知代价：**已终态**的 part 不再被 rollup 改写（那需要一次人工决策）——
+    ⚠️ 2026-10-13 起**没有**任何自动对账端点能改它了（原 `admin/recompute-rollup`
+    的 `parts_skipped_terminal` 显式上报能力随域一起消失）。此类行只能靠
+    force-complete / cancel 或业务流修。
 - **`StatusChange` 的三态约定**：`Option` 的 `None` 一律是「保持原值」，「清 NULL」
   由同名 `clear_location` / `clear_holder_id` / `clear_process_id` /
   `clear_process_step_id` 显式表达。出池（召回 / 送检 / 外协收回 / 返修出池）
@@ -516,19 +519,55 @@ t_assembly.status               ← 派生缓存
   `SnowflakeIdGenerator` 透传）：`GET /parts/{id}/events` 是 `ORDER BY id DESC`，
   拿 `part_id` 之类的建单期 id 顶替会把归档事件排到时间线最底部，且二次进终态时
   pkey 冲突 → 事务 500。
-- **兜底对账**：`POST /api/v2/admin/recompute-rollup`（Manager）复用上述 rollup
-  函数重跑并回报 before→after，**幂等**；新增派生算法时**不要**在对账端点重写一遍。
-  全量对账靠**分表游标**续扫（2026-10-01 review 第 2 轮 MAJOR-2：`t_part` 与
-  `t_assembly` 的 id 来自同一个雪花流、按时间序交错，共用一个游标会永久跳过
-  `(assembly_max, part_max]` 那段装配件）——把响应里非 null 的
-  `next_part_after_id` / `next_assembly_after_id` 回传为请求的 `part_after_id` /
-  `assembly_after_id`，直到 `truncated=false`。
-  ⚠️ 报告里 `parts_skipped_terminal > 0` 表示「该 part 已终态、派生被守卫跳过」，
-  **不是**「数据已一致」；这类行只能靠 force-complete / cancel 或业务流修
-  （见 `src/modules/admin/handler.rs` 的 `recompute_rollup` 端点 doc）。
+- ⚠️ **兜底对账端点已于 2026-10-13 下线**（admin 域整域删除，见「派生层对账逃生口
+  的移除记录」一节）。**算法本体一行未动**：派生仍由 `rollup_part_derived` /
+  `sync_assembly_status` 在业务流里跑，新增派生算法时**不要**在任何别处重写一遍。
+  现在唯一的调用方是业务写入口（`apply_batch_status_change` /
+  `apply_bulk_batch_status_change_for_part`），没有第二个「手动重算」的口子。
 - 词汇：batch/part 8 态 + `is_repairing` 标记（`REPAIRING` 已于 2026-10-01 降级为
   boolean 列，DB 不再产生该 status）；assembly 7 态（无 `OUTSOURCE`，子件
   `OUTSOURCE` ⇒ 父 `IN_PROCESS`）。完整状态派生契约见本文件上方「状态派生契约（2026-10-01）」一节与 `src/shared/batch/status.rs`。
+
+### 派生层对账逃生口的移除记录（2026-10-13：admin 域整域删除）
+
+**硬切下线、**无 alias**：旧 `POST /api/v2/admin/recompute-rollup`（Manager）
+整段 `/api/v2/admin/*` 前缀随域删除 ⇒ 旧路径是**干净 404**（整段 nest 都没了，
+不是落进某个 `Path<i64>` catch-all 的 400 纯文本 —— 后者才对应「同段数里
+静态段被 catch-all 吞掉」的形态，见「路由声明规约」的 matchit 约束）。
+
+随端点一起消失的是三项**曾经是这个端点独有**的能力，登记在此以免后人重建时
+重复踩同一个坑：
+
+1. **分表游标续扫**：全量对账靠 `part_after_id` / `assembly_after_id` **两个独立
+   游标**推进并逐轮回传 `next_part_after_id` / `next_assembly_after_id`。教训：
+   `t_part` 与 `t_assembly` 的 id 出自**同一个雪花流**、按时间序交错，共用一个游标
+   会**永久跳过** `(assembly_max, part_max]` 那段装配件、却仍报
+   `truncated=false`（「已覆盖全表」是假的）。
+2. **终态跳过显式计数**：终态守卫拦下的行库里一个字节都没改，若报告不把它单独
+   计数（`parts_skipped_terminal` + `skipped_terminal[{id,current,derived}]`），
+   就与「数据已一致」在报告里**同形** —— 兜底工具给出假干净报告是最坏的失败模式。
+   ⚠️ 该诊断能力**在算法层仍然存在**（`RollupOutcome::terminal_skip` 上抛），
+   消失的只是「把它呈报给人」的那一层；新增派生算法时**必须**继续填它。
+3. **`limit` 上限**：防止单次请求把整表锁在一个长事务里。
+
+⚠️ **WS 事件 `ROLLUP_RECOMPUTED` 自此无人发送**：它只在真有变化时、且在全部块
+commit 之后发一次汇总。前端若订阅了它，会成**死订阅**（永不触发、也不报错）。
+按用户指示本轮**不处理 WS 事件**，只在此点出。
+
+### ⚠️ 但派生算法一行未动（不要连算法一起删）
+
+保留：`shared::batch::status` 的 `rollup_part_derived` / `sync_assembly_status` /
+`compute_part_target` / `compute_assembly_target`；`seeds/admin.sql`
+（那是 ADMIN **账号 / 元角色**的初始种子，与 admin **域**毫无关系，不许碰）；
+`t_part` / `t_assembly` 上的派生缓存列与全部业务写入口。
+
+**回归网**（admin 域删除**之前**先补上的）：
+- `src/shared/batch/status.rs` 的 `#[cfg(test)] mod sync_assembly_status_tests` ——
+  7 条 mock 单测，守父装配件聚合的终态短路 / OCC 冲突降级 /
+  `ALL_CANCELLED → CANCELLED`（零 DB）；
+- `tests/part/rollup_derived.rs` —— 8 条直调 `rollup_part_derived` 的集成测试
+  （**不走 HTTP**），守漂移修正 + 幂等 + 序列号归档释放 + 级联父装配件
+  + 终态守卫上抛 `TerminalSkip`。
 
 ## 必须遵守的架构约定
 
@@ -555,7 +594,8 @@ t_assembly.status               ← 派生缓存
    - **`40901 VERSION_CONFLICT` 只表达 OCC**，不得用于业务唯一键冲突（如 worker 的 `badge_code` create 撞车 —— 已知违规，见 `prod/worker/service.rs` 的 `create_worker`）。业务唯一键冲突须有专用码。
    - **豁免清单（刻意无锁，改动时勿「补齐」）**：
      - 逃生口：`parts/{id}/force-complete`（dto 注释明写「依赖 SQL 行锁串行化」）、`assemblies/{id}/cancel`（service 注释明写「设计上无 OCC，单向状态翻转」）
-     - 幂等：`admin/recompute-rollup`、`iam/users/{id}/reset-password`
+     - 幂等：`iam/users/{id}/reset-password`（⚠️ 另一条 `admin/recompute-rollup`
+       已于 2026-10-13 随 admin 域删除，见本文件「派生层对账逃生口的移除记录」）
      - junction 整组替换：`work-types/{id}/processes`、`shelf-processes/{shelf_id}` —— 锚在父表 `version`，不是映射行
      - 服务端驱动：`queue/refill`、`queue/auto-allocate` —— `SKIP LOCKED` 是正解，客户端对「取哪几批」没有意见
      - BFF 转发 / `_e2e`
@@ -580,7 +620,7 @@ t_assembly.status               ← 派生缓存
    }
    ```
 
-   - **仓内多数域用转发式**（`outsource` / `files` / `assembly` / `statistics` / `iam`），少数用 `mod.rs` 内联（`part` / `com` / `prod::queue` / `admin`）。转发式是多数形态，新域与重构域一律按转发式。（2026-10-10 订正：原清单里的 `shelf` 已不是一级域 —— 货架子模块于同日迁入 iam，仍是转发式。**2026-10-13 订正**：`part_file` / `cnc_program` 也已不是一级域 —— 两者于同日收编成 `files` 容器域及其嵌套子模块，URL 硬切到 `/files/objects/*` 与 `/files/cnc/*`，`files` 本身是转发式；⚠️ **同批再订正 `delivery_note`** —— 它自 **2026-10-08** 起是 `com::delivery_note`（原清单里写它时它还是一级域），容器 `com` 走 `mod.rs` 内联（`com/mod.rs::router()` 直接 `.nest(…)`），故已从转发式清单移到内联侧。）
+   - **仓内多数域用转发式**（`outsource` / `files` / `assembly` / `statistics` / `iam`），少数用 `mod.rs` 内联（`part` / `com` / `prod::queue`；⚠️ 2026-10-13：`admin` 域整域删除）。转发式是多数形态，新域与重构域一律按转发式。（2026-10-10 订正：原清单里的 `shelf` 已不是一级域 —— 货架子模块于同日迁入 iam，仍是转发式。**2026-10-13 订正**：`part_file` / `cnc_program` 也已不是一级域 —— 两者于同日收编成 `files` 容器域及其嵌套子模块，URL 硬切到 `/files/objects/*` 与 `/files/cnc/*`，`files` 本身是转发式；⚠️ **同批再订正 `delivery_note`** —— 它自 **2026-10-08** 起是 `com::delivery_note`（原清单里写它时它还是一级域），容器 `com` 走 `mod.rs` 内联（`com/mod.rs::router()` 直接 `.nest(…)`），故已从转发式清单移到内联侧。）
    - **一个前缀一个 router 工厂**。多个独立顶层前缀时用多个 `xxx_router()`（`outsource` 有 4 个），而不是一个工厂返回合并 router —— 合并后 matchit 的注册顺序约束会跨前缀纠缠，排查困难。
    - **`handler.rs` > 600 行或工厂数 > 4 时拆 `handler/<子域>.rs`**，`handler.rs` 退化为聚合器。`prod/queue/handler/`、`prod/batch/handler/` 是范本。
    - **`mod.rs` 的模块 doc 逐条列出端点表与硬切记录**；域改名/URL 硬切必须写「旧路径 404，无 alias」。
@@ -623,7 +663,7 @@ integration test binary 已重组为 **21 binary**（11 多文件 domain 子目�
 | 新结构 | 拆前 binary 数 | 拆后 binary 名（nextest filter） |
 |---|---:|---|
 | `tests/com/{main,union_list,delivery_note_in_use}.rs` | 5 | `com`（送货单域 2026-10-08 平移进 com 容器时目录随之更名 `delivery` → `com`；`group` / `attach_batches` / `scan` 三个 sub-file 已随端点收敛删除）|
-| `tests/part/{main,create_serial_price,batch,crud,inspection_batches,lifecycle,list_enrichment,purchase_order_import,repair,rollup_recompute,serial,to_inspection,to_process,to_ship}.rs` | 12 | `part`（sub-file 穷举，**14 个文件**，2026-10-13 逐 `ls` 核对；`main.rs` 为 binary 入口。★ `purchase_order_import.rs` 2026-10-06 新增：采购订单 Excel 导入两端点 —— `match-by-excel-items` 分档匹配 + `batch-update-order-info` 三态回填 / skip。⚠️ **两个 sub-file 已迁出、枚举里不再有**：`file.rs` → `tests/files/part_file.rs`（**2026-10-13**，随 part_file 域收编进 files 域，与 `tests/part/main.rs` 的拆分映射同批记）；`pickable_by_work_type.rs` → `tests/production/scan_listing.rs`（**2026-10-10**，报工台两条 list 端点迁往 `prod::scan` 时带走））|
+| `tests/part/{main,create_serial_price,batch,crud,inspection_batches,lifecycle,list_enrichment,purchase_order_import,repair,rollup_derived,serial,to_inspection,to_process,to_ship}.rs` | 12 | `part`（sub-file 穷举，**14 个文件**，2026-10-13 逐 `ls` 核对 + 本次 `rollup_recompute.rs` 换成 `rollup_derived.rs` 后**仍是 14**；`main.rs` 为 binary 入口。★ `purchase_order_import.rs` 2026-10-06 新增：采购订单 Excel 导入两端点 —— `match-by-excel-items` 分档匹配 + `batch-update-order-info` 三态回填 / skip。★ `rollup_derived.rs` **2026-10-13 新增**（随 admin 域删除而来）：直调 `shared::batch::status::rollup_part_derived` 的 8 条**非 HTTP** 集成测试，守派生修正 + 幂等 + 序列号归档释放 + 级联父装配件 + 终态守卫上抛 `TerminalSkip`；它**取代**（而非补充）原 `rollup_recompute.rs`（8 条 HTTP 用例，走已下线的 `POST /api/v2/admin/recompute-rollup`）。⚠️ **两个 sub-file 已迁出、枚举里不再有**：`file.rs` → `tests/files/part_file.rs`（**2026-10-13**，随 part_file 域收编进 files 域，与 `tests/part/main.rs` 的拆分映射同批记）；`pickable_by_work_type.rs` → `tests/production/scan_listing.rs`（**2026-10-10**，报工台两条 list 端点迁往 `prod::scan` 时带走））|
 | `tests/assembly/{main,api,lifecycle,by_part,children,create_serial_price,force_complete,status_sync}.rs` | 3 | `assembly`（**2026-10-11** 新增 `force_complete.rs`：装配件级强制完成端点 `POST /prod/assemblies/{id}/force-complete`，含「子件非取消批次为 0 条」的边角回归；⚠️ **2026-10-13 PR1b 两个 sub-file 已不在枚举里**：`files.rs` → **更名 `lifecycle.rs`**（其中 2 条文件上传用例迁往 `tests/files/upload.rs`，剩下 4 条生命周期用例留在本 binary —— 是更名不是搬家）；`files_list.rs`（D-09 `GET /assemblies/{id}/files` 的 4 条用例）→ **整文件删除**，端点已下线）|
 | `tests/iam/{main,api,middleware,bootstrap_admin_seed,menu_seed,wx_bind,shelf,shelf_deactivate}.rs` | 2 | `iam`（**2026-10-09**：原 `redis-flush` 串行组已整体删除 —— Redis 隔离改由 key 前缀承担、触发该组的 `clean_redis`（FLUSHDB）已零调用方随函数删除、两个 binary 的并行度已恢复；删除理由留档在 `.config/nextest.toml` 的注释里。**2026-10-10**：`tests/shelf/` 整体并入本 binary，用例改名 `shelf.rs`（← `api.rs`，`api.rs` 同名冲突）/ `shelf_deactivate.rs`（← `deactivate.rs`），与货架子模块迁入 iam 域同批）|
 | `tests/statistics/{main,api,event_driven}.rs` | 2 | `statistics` |

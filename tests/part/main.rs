@@ -15,6 +15,11 @@
 //! - inspection_batches.rs ← 原 part_api_inspection_batches.rs
 //! - serial.rs            ← 原 serial_api.rs
 //! - rollup_recompute.rs   ← 2026-10-01 新增：admin 对账端点（POST /admin/recompute-rollup）定点修正 + 幂等断言
+//!   （**2026-10-13 已随 admin 域下线删除**；它守的派生算法部分由
+//!   `rollup_derived.rs` 以直调 `rollup_part_derived` 的形式接管，父装配件那一跳
+//!   由 `src/shared/batch/status.rs` 的 `sync_assembly_status_tests` mock 单测接管）
+//! - rollup_derived.rs     ← **2026-10-13 新增**：`shared::batch::status::rollup_part_derived`
+//!   直调（非 HTTP）的漂移修正 + 幂等 + 序列号归档 + 级联父装配件
 //! - create_serial_price.rs ← 2026-10-05 新增：建单期序列号派发（`POST /parts` /
 //!   `POST /parts/batch` / `POST /parts/batch-with-pdfs`）+ `unit_price` /
 //!   `total_price` 入参落库
@@ -41,7 +46,7 @@ mod list_enrichment;
 // 2026-10-06 新增：采购订单 Excel 导入（match-by-excel-items + batch-update-order-info）
 mod purchase_order_import;
 mod repair;
-mod rollup_recompute;
+mod rollup_derived;
 mod serial;
 mod to_inspection;
 mod to_process;

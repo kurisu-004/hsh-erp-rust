@@ -68,14 +68,18 @@ impl AssemblyService {
 // ⚠️ 2026-10-13：聚合 + 翻转的**实体实现**已搬到
 // `crate::shared::batch::status::sync_assembly_status`（派生链最后一跳，与
 // `rollup_part_derived` / `rollup_assembly_derived` 同属一条链、放在同一层）。
-// 本文件保留 2 个 wrapper（`sync_from_part_change_by_id` /
-// `recompute_assembly_status_by_id`，后者同批随 admin 域删除）与它的 1 个 `_inner`
+// 本文件保留 1 个 wrapper（`sync_from_part_change_by_id`）与它的 1 个 `_inner`
 // 方法，它们只做「反查 assembly_id → 调 shared 那份」。
 //
 // 保留 wrapper 而不是让 shared 反过来调这里的原因：本文件历史的入口签名收
 // `&CurrentUser`，而 `shared::batch::status` 的派生链手上只有 `updated_by`
 // （一个 i64）—— 在 shared 里伪造 `CurrentUser` 迟早会被下游的
 // `username` / `roles` 依赖带出真实 bug。
+//
+// 2026-10-13 随 admin 域下线一并删除的还有 `recompute_assembly_status_by_id`
+// ——「从装配件出发反查一次聚合」的逃生入口，它的唯一调用方就是
+// `POST /api/v2/admin/recompute-rollup`。算法本体（`sync_assembly_status`）
+// **完全不动**、仍由 `sync_from_part_change_by_id` 走；消失的只是那个反向入口。
 
 // ---------- ZST 静态入口的兼容 wrapper ----------
 //
@@ -95,25 +99,4 @@ pub async fn sync_from_part_change_by_id(
     self_svc
         .sync_from_part_change_by_id_inner::<&mut sqlx::PgConnection>(conn, part_id, updated_by)
         .await
-}
-
-/// 2026-10-01 新增：按 `assembly_id` 直接重算一次聚合状态（admin 对账逃生口用）。
-///
-/// 暴露（自 2026-10-13 起在 `shared::batch::status` 的）[`sync_assembly_status`]
-/// 的唯一理由是
-/// `POST /api/v2/admin/recompute-rollup` 需要「**从装配件出发**」跑一次聚合 ——
-/// 正常业务流永远是从 part 出发的（`sync_from_part_change*`），而对账场景要修的
-/// 恰恰是「part 侧派生已正确、但父装配件没跟上」这种反向漂移。
-///
-/// 仍然走同一段聚合实现（`compute_assembly_target` + OCC + 终态守卫），因此
-/// 对账端点与业务流**不可能**算出两个结果。
-pub async fn recompute_assembly_status_by_id(
-    conn: &mut sqlx::PgConnection,
-    assembly_id: i64,
-    updated_by: i64,
-) -> Result<SyncOutcome, AppError> {
-    // `sync_assembly_status` 收 `&mut R`（trait 注入式），生产路径的 R 是
-    // `&mut PgConnection`；这里借用一次以凑出那个 `&mut R` 借位。
-    let mut repo: &mut sqlx::PgConnection = conn;
-    sync_assembly_status::<&mut sqlx::PgConnection>(&mut repo, assembly_id, updated_by).await
 }

@@ -1,8 +1,9 @@
 //! 域隔离护栏：把「本域不 import 其它域的 service / repo」从口头约定变成 CI 强制
 //!
 //! 2026-10-07 新增。只读跨域聚合域在本仓是既定 pattern（dashboard / statistics /
-//! admin 都不 import 别域的 service / repo，而是各自在本域 SQL 里聚合），但口头
-//! 约定挡不住回退，故用单测在源码层兜住。
+//! mail_digest 都不 import 别域的 service / repo，而是各自在本域 SQL 里聚合），但
+//! 口头约定挡不住回退，故用单测在源码层兜住。
+//! （⚠️ 2026-10-13：原举例里的 `admin` 域已整域删除，换成 `mail_digest`。）
 //!
 //! 已接入共 **7 处**，分两类：
 //! - **整域接入 5 处**：`dashboard`（扫 `src/modules/dashboard`）、`iam`（扫
@@ -114,7 +115,7 @@
 //! assert_no_foreign_domain(
 //!     "dashboard",
 //!     &Path::new(env!("CARGO_MANIFEST_DIR")).join("src/modules/dashboard"),
-//!     "需要别的域的数据时，正确做法是像 statistics / admin 那样在本域 SQL 里只读聚合。",
+//!     "需要别的域的数据时，正确做法是像 statistics / mail_digest 那样在本域 SQL 里只读聚合。",
 //! );
 //! ```
 //!

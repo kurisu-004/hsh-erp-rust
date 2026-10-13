@@ -273,7 +273,7 @@ t_assembly.status               ← 派生缓存
 - **写 `t_part_batch.status` 只能走 `shared::batch::status::apply_batch_status_change`**。它一函数内完成「写批次（OCC + SQL 层源状态白名单）→ 回填 part 派生列 → 级联 assembly → 终态序列号归档 / 释放」，caller 没有「要不要顺手调 sync」这个选项。
 - **CI 强制**：`cargo test --lib` 的 `shared::batch::status::write_guard_tests::no_outside_file_writes_batch_status` 扫全 `src/**/*.rs`，除 `src/shared/batch/status.rs` 外任何文件写 `UPDATE t_part_batch SET status …` 即失败。该测试的允许路径是一处字面量常量，**写入口再搬家时必须同步改它**。
 - **派生层不得覆盖主操作**：`t_part` 已由主操作写成终态时，min-progress 不许写回去（SQL 层 `AND status NOT IN ('COMPLETED','CANCELLED')` 兜底）。
-- 兜底对账端点 `POST /api/v2/admin/recompute-rollup`（Manager）复用同一套 rollup 函数，**幂等**。
+- ⚠️ **兜底对账端点 `POST /api/v2/admin/recompute-rollup` 已于 2026-10-13 随 admin 域整域删除**（硬切、无 alias、旧路径干净 404）。**派生算法本身一行未动**，仍只由业务写入口驱动。⚠️ 随之消失的是「把 `RollupOutcome::terminal_skip` 呈报给人看」的那一层 —— 算法仍会填它，新增派生算法时**必须**继续填，否则调用方无法把「被守卫拦下」与「数据本来就一致」区分开；手工修数请走 force-complete / cancel 或业务流。
 
 ### 6.1 写入不变式：终态批次不在任何位置、也不在任何人手上（2026-10-14 新增）
 

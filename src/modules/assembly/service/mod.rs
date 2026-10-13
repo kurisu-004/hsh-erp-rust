@@ -93,8 +93,8 @@ pub(crate) fn render_assembly_out(asm: TAssembly) -> AssemblyOut {
 /// shared 那一层，而 `SyncOutcome` 表达的是「派生有没有真写库」，是派生链自身的
 /// 返回类型）。此处保留 `pub use` 重导出，使
 /// `crate::modules::assembly::service::SyncOutcome` 这条老路径继续可解析
-/// （现存的调用点是 `admin::service` / `prod::scan::service::transfer` /
-/// `tests/assembly/status_sync.rs`）。
+/// （⚠️ 2026-10-13：admin 域删除后，`admin::service` 那条调用点已消失；现存调用点是
+/// `prod::scan::service::transfer` 与集成测试）。
 pub use crate::shared::batch::status::SyncOutcome;
 
 /// assembly 域业务门面。handler 经 `state.pool.begin()` 开 tx 后透传 `&mut tx`。
