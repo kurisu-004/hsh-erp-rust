@@ -4,10 +4,13 @@
 //! - `sql.rs`：原 `repo.rs` 全文搬迁，6 个 pub 固有静态方法 + 运行时 `sqlx::query_as` /
 //!   `sqlx::query` / `sqlx::query_scalar`（**不**用 `query!` 宏，本域 SQL 改动频繁），
 //!   **内容零 diff**（part_file 本无 `.sqlx/query-*.json` 缓存故无哈希影响）。
-//! - `mod.rs`（本文件）：对外暴露胖 trait `PartFileRepoTrait`（12 方法合并单 trait；
-//!   含 sql.rs 6 方法 trait 化 + 跨域 owner 校验 2 + 软删 2 + cnc 配对互写
+//! - `mod.rs`（本文件）：对外暴露胖 trait `PartFileRepoTrait`（**13** 方法合并单
+//!   trait；含 sql.rs 6 方法 trait 化 + 跨域 owner 校验 **3** + 软删 2 + cnc 配对互写
 //!   paired_file_id 2），并直接 `impl PartFileRepoTrait for &mut PgConnection` ——
 //!   handler/service 借 `&mut *tx` / `&mut *conn` 即可，零中间壳。
+//!   ⚠️ 2026-10-16 新增第 13 个方法 `customer_owner_exists`（`owner_kind='CUSTOMER'`
+//!   的闸门，送货单打印模板挂在**一级客户**上），它是本域**唯一**一处读
+//!   `t_customer` 的地方 —— 属既定的「只读跨域聚合」pattern，详见该方法的 doc。
 //!
 //! ## 为什么 trait 命名为 `PartFileRepoTrait`（带 `Trait` 后缀）
 //! 域外调用方 `assembly` / `part` 共 6 处直接调 `PartFileRepo::xxx(&mut *conn, ...)`
@@ -16,7 +19,7 @@
 //! - `part_file::repo::PartFileRepo` —— ZST struct（在 `sql.rs` 内，通过
 //!   `pub use sql::PartFileRepo;` 重新导出至本模块），保留 6 个 pub 静态方法签名不变
 //!   （上述跨域调用方零修改）。
-//! - `part_file::repo::PartFileRepoTrait` —— 本文件新加的胖 trait（12 方法），part_file 域
+//! - `part_file::repo::PartFileRepoTrait` —— 本文件新加的胖 trait（13 方法），part_file 域
 //!   内部 service 用 `<R: PartFileRepoTrait>` 收。
 //!
 //! ⚠️ 2026-10-13 收编进 files 域时订正：原写的跨域调用方清单里含 `cnc_program`
@@ -36,8 +39,13 @@
 //! 无需任何 `PgPartFileRepo<'a>` 转发壳（与 iam 2026-09-22 删 `PgIamRepo` 同步）。
 //!
 //! ## 跨域 helper（4 个新方法，从 service.rs 迁来）
-//! - `part_owner_exists` / `assembly_owner_exists` —— 替代原 service `assert_owner_exists`
-//!   内的 inline SQL `SELECT id FROM t_part/t_assembly WHERE id=$1 AND deleted_at IS NULL`
+//! - `part_owner_exists` / `assembly_owner_exists` / `customer_owner_exists` —— 替代原
+//!   service `assert_owner_exists` 内的 inline SQL
+//!   `SELECT id FROM t_part/t_assembly WHERE id=$1 AND deleted_at IS NULL`
+//!   （`customer_owner_exists` 是 2026-10-16 随 `DELIVERY_TEMPLATE` 一并加的第三种
+//!   owner，写法是 `SELECT EXISTS(...)`；⚠️ **2026-10-16 review 第 2 轮 MAJOR-A 给它
+//!   补上了 `AND parent_id IS NULL`** —— 首版只判存在，于是 `POST /files/objects`
+//!   能把模板绑到二级客户上）
 //! - `soft_delete_file` —— 替代原 service `soft_delete_file` 内的 inline SQL
 //!   `UPDATE t_part_file SET deleted_at = now(), version = version + 1, ... WHERE id=$1
 //!   AND version=$3 AND deleted_at IS NULL`
@@ -85,7 +93,8 @@ pub fn hash_bytes(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// part_file 域数据访问 trait（12 方法 = sql.rs 6 + 跨域 owner 校验 2 + 软删 2 + cnc_pair 2）。
+/// part_file 域数据访问 trait（**13** 方法 = sql.rs 6 + 跨域 owner 校验 3 + 软删 2
+/// + cnc_pair 2；⚠️ 2026-10-16 新增 `customer_owner_exists`）。
 ///
 /// 单 trait 而非每表一个：`&mut PgConnection` 同一作用域只能借给一个 repo 实例，
 /// 拆分会让 service 无法同时持有两个 repo（2026-09-22 重构定案；与 iam 同形）。
@@ -114,11 +123,18 @@ pub trait PartFileRepoTrait: Send {
         kind: &'a str,
         sha: &'a str,
     ) -> Result<Option<TPartFile>, sqlx::Error>;
+    /// `exclude_kind` 是 2026-10-16 review 第 1 轮 MAJOR-3 新增的形参：把某个 kind
+    /// 从结果里**排除**（与 `kind` 的「只取某个 kind」正交，两者同时生效）。
+    /// ⚠️ 它的存在理由是 `kind` 形参**不能**表达这件事：调用方若只想「排除模板
+    /// 行」就必须自己知道别的 kind 全集，而新增 kind 时那个全集必然过期。
+    /// 本域通用列表端点传 `Some("DELIVERY_TEMPLATE")`；`print_template` 域自己
+    /// 列举模板时传 `None`（它要的正是这一种 kind）。
     async fn list_with_filters<'a>(
         &mut self,
         owner_kind: &'a str,
         owner_id: Option<i64>,
         kind: Option<&'a str>,
+        exclude_kind: Option<&'a str>,
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<TPartFile>, i64), sqlx::Error>;
@@ -128,11 +144,43 @@ pub trait PartFileRepoTrait: Send {
         owner_id: i64,
     ) -> Result<Vec<TPartFile>, sqlx::Error>;
 
-    // ── 跨域 owner 校验（2）── 从原 service `assert_owner_exists` 迁来
+    // ── 跨域 owner 校验（3）── 从原 service `assert_owner_exists` 迁来
     /// `SELECT id FROM t_part WHERE id = $1 AND deleted_at IS NULL`。
     async fn part_owner_exists(&mut self, part_id: i64) -> Result<bool, sqlx::Error>;
     /// `SELECT id FROM t_assembly WHERE id = $1 AND deleted_at IS NULL`。
     async fn assembly_owner_exists(&mut self, assembly_id: i64) -> Result<bool, sqlx::Error>;
+    /// `SELECT EXISTS(SELECT 1 FROM t_customer WHERE id = $1 AND deleted_at IS NULL
+    /// AND parent_id IS NULL)` —— 2026-10-16 新增，`owner_kind='CUSTOMER'` 的
+    /// 闸门（送货单打印模板挂在一级客户上，由 `print_template` 域写入）。
+    ///
+    /// ## ⚠️ 2026-10-16 review 第 2 轮 MAJOR-A：**L1 判据下沉到本方法**
+    ///
+    /// 首版（review 第 1 轮）这里**只判「存在且未软删」**，把 `parent_id IS NULL`
+    /// 当成 `print_template` 域的独有强制点。那是个错的切分：`POST /files/objects`
+    /// 的 `owner_kind` / `owner_id` 都由 client 在 multipart `data` 里给，
+    /// `upload_file_for_owner` **不判 L1** ⇒ Manager 打
+    /// `{"owner_kind":"CUSTOMER","owner_id":"<二级客户>"}` 会 201 + 落一行绑在
+    /// 二级客户上的模板行。后果三条：
+    /// ① 违反「只绑一级客户」这条用户拍板的不变式；
+    /// ② `uk_t_part_file_single` 是 `(part_id, kind)`，L1 行与 L2 行互不冲突 ⇒
+    ///    「一个 L1 至多一份活跃模板」在 (L1, L2) 这一对上被绕过，且给 L1 重新上传时
+    ///    `soft_delete_active_by_part_kind(l1_id)` 清不掉 L2 那行；
+    /// ③ 该行 `resolve` 永远读不到（`delivery_note.customer_id` 是 L1）⇒ 变成
+    ///    **永不消费也永不被清理**的孤儿配置行。
+    ///
+    /// ⇒ `parent_id IS NULL` 现在是**两道闸门共有**的判据：本方法（files 域，
+    /// 兜底、错误码 21105）与 `print_template::service::l1_customer_name`
+    /// （本域自己的前置强制点、错误码 20104、零外部 IO）。前者管「任何绕过本域
+    /// handler 直调共用上传原语的路径」，后者管「本域 5 条端点的正常路径」，
+    /// **缺任一条都不成立**。
+    ///
+    /// ⚠️ **本文件读 `t_customer` 是 `files` 域唯一一处跨域表引用**，属本仓既定
+    /// 的「只读跨域聚合」pattern（同 `dashboard` / `statistics` / `prod::inspection`）：
+    /// SQL 写在本域文件里、**不 import** 任何他域 service / repo 符号。
+    /// ⚠️ 本域**不知道也不需要知道**「客户分两级」这个别的域的业务细节 ——
+    /// 它只知道 `t_customer.parent_id IS NULL` 是一列的取值判据，与本域判
+    /// `t_part.assembly_id IS NULL`（散件）同形。
+    async fn customer_owner_exists(&mut self, customer_id: i64) -> Result<bool, sqlx::Error>;
 
     // ── 软删 helper（2）── 从原 service `soft_delete_file` / `bind_uploaded_file` 迁来
     /// 单条软删（带版本号 OCC）：原 `soft_delete_file` 的 UPDATE 语句。
@@ -225,11 +273,20 @@ impl PartFileRepoTrait for &mut PgConnection {
         owner_kind: &'b str,
         owner_id: Option<i64>,
         kind: Option<&'b str>,
+        exclude_kind: Option<&'b str>,
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<TPartFile>, i64), sqlx::Error> {
-        PartFileRepo::list_with_filters(&mut **self, owner_kind, owner_id, kind, limit, offset)
-            .await
+        PartFileRepo::list_with_filters(
+            &mut **self,
+            owner_kind,
+            owner_id,
+            kind,
+            exclude_kind,
+            limit,
+            offset,
+        )
+        .await
     }
 
     async fn list_by_owner<'b>(
@@ -257,6 +314,30 @@ impl PartFileRepoTrait for &mut PgConnection {
                 .fetch_optional(&mut **self)
                 .await?;
         Ok(exists.is_some())
+    }
+
+    /// 2026-10-16 新增：`owner_kind='CUSTOMER'` 的闸门（存在 **且是一级**）。
+    ///
+    /// 写成 `SELECT EXISTS(...)` 而不是照抄上面两条的 `SELECT id … fetch_optional` ——
+    /// EXISTS 返回**恒有一行**（true / false），省掉 `Option` 的存在性判断，
+    /// 也让「这个 owner 至少被查过一次」在语句层就是显然的。
+    ///
+    /// ⚠️ 谓词里的 `parent_id IS NULL` 是 **2026-10-16 review 第 2 轮 MAJOR-A 补的**
+    /// （首版只判「存在且未软删」，于是 `POST /files/objects` 能给二级客户落模板行；
+    /// 理由与两条闸门的关系见 trait 上那条方法的 doc）。
+    ///
+    /// ⚠️ 运行时 `query_scalar`（**不用 `query!` 宏**）：与本文件其余 helper 一致，
+    /// 见 `repo/sql.rs` 模块 doc 的「约定」一节（本域运行时 SQL 改动频繁，
+    /// 不强依赖 `.sqlx/` 离线缓存），故本条**不需要**重跑 `sqlx_prepare.sh`。
+    async fn customer_owner_exists(&mut self, customer_id: i64) -> Result<bool, sqlx::Error> {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM t_customer \
+             WHERE id = $1 AND deleted_at IS NULL AND parent_id IS NULL)",
+        )
+        .bind(customer_id)
+        .fetch_one(&mut **self)
+        .await?;
+        Ok(exists)
     }
 
     // ── 软删 helper（2）── inline SQL（迁自原 service）

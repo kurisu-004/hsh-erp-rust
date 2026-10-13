@@ -120,10 +120,16 @@ pub mod part_file;
 /// 「`router()` 源码 ↔ `ROUTES` 常量」比对器的共用实现（**仅 `#[cfg(test)]`**，
 /// 不进 lib 产物 ⇒ 只有 `src/` 内的单元测试能用）。
 ///
-/// 三个 router 工厂（`handler` / `part_file::handler` / `part_file::cnc::handler`）
-/// 的 `mod tests` 都调它，见该文件模块 doc。
+/// 四个 router 工厂（`handler` / `part_file::handler` / `part_file::cnc::handler`
+/// / **域外的 `print_template::handler`**）的 `mod tests` 都调它，见该文件模块 doc。
+///
+/// ⚠️ 2026-10-16：`mod` 改 `pub(crate) mod` —— `print_template` 域（**不属于
+/// `files`**）的路由清单比对器也复用这一份实现。函数本身早已是 `pub(crate)`，
+/// 但外层模块是私有的 ⇒ 跨模块够不着。**刻意不复制第二份解析器**：两份同名同款
+/// 的「从源码抠路由表」逻辑必然漂移，而漂移的表现是「守卫静默失效」
+/// （写成 `contains("GET /resolve")` 硬断言那种，加了第 6 条端点不会红）。
 #[cfg(test)]
-mod route_guard;
+pub(crate) mod route_guard;
 
 use std::sync::Arc;
 

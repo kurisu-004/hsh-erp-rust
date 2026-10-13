@@ -253,16 +253,24 @@ pub mod code {
     pub const BIZ_APPLICANT_IN_USE: i32 = 21004; // 被 part.applicant_name 引用 → 拒软删
 
     // 211xx 零件文件（t_part_file，统一 5 类；另含 4 个送货单打印模板码 21109 / 21111 /
-    // 21112 / 21113 —— 由 python 端判定并产出、rust 原样透传，rust 侧注册仅为识别 / 回显）
+    // 21112 / 21113 —— ⚠️ 21109 自 2026-10-16 起改由 **Rust 侧自产**，其余三个仍是
+    // python 端产出、rust 原样透传，rust 侧注册仅为识别 / 回显）
     pub const BIZ_PART_FILE_NOT_FOUND: i32 = 21101;
     pub const BIZ_PART_FILE_BAD_TYPE: i32 = 21102; // 扩展名与 kind 不匹配
     pub const BIZ_PART_FILE_TOO_LARGE: i32 = 21103; // 文件大小 ≤0 或 > cos_max_file_size_bytes
     pub const BIZ_PART_FILE_UPLOAD_FAILED: i32 = 21104; // COS SDK 抛错
-    pub const BIZ_PART_FILE_OWNER_NOT_FOUND: i32 = 21105; // polymorphic owner (part/assembly) 不存在
+    pub const BIZ_PART_FILE_OWNER_NOT_FOUND: i32 = 21105; // polymorphic owner (part/assembly/customer) 不存在
     pub const BIZ_PART_FILE_DUPLICATE: i32 = 21108; // 同 part+kind+content_sha256 撞唯一索引（并发兜底）
-    // 2026-10-03：打印端点改纯转发后本码无 rust 生产点 —— 由 python 端判定并产出、rust 原样透传，
-    // rust 侧无任何送货单模板配置。保留常量供 rust 识别 / 回显 python 产出的码。
-    pub const BIZ_DELIVERY_TEMPLATE_NOT_CONFIGURED: i32 = 21109; // python 侧：客户 prefix 未配出 xlsx 模板
+    // 2026-10-16：**改由 Rust 侧自产** —— `GET /api/v2/print-templates/resolve`
+    // 查不到该一级客户名下未软删的 `kind='DELIVERY_TEMPLATE'` 行时抛出（HTTP **422**，
+    // 见 `status_from_code`）。
+    // ⚠️ 该码在 wire 上**未变**（仍是 21109，仍在 python 时代的错误码表里），变的只是
+    // 「谁产出它」：从前端转发透传（2026-10-03 打印链路改纯转发后 Rust 侧零生产点）
+    // 变成 `print_template` 域的正常业务分支。**HTTP 状态码是本次新选的 422**
+    // （python 时代无 Rust 侧先例可循，取「请求本身合法、但这个客户的配置不满足
+    // 前提」这层语义，与 `VALIDATION_ERROR` 同档），登记在
+    // `docs/api/print_template.md` §8.3。
+    pub const BIZ_DELIVERY_TEMPLATE_NOT_CONFIGURED: i32 = 21109; // 该一级客户未绑定送货单打印模板
     // 2026-10-03：打印端点改纯转发后本码无 rust 生产点 —— 由 python 端判定并产出、rust 原样透传，
     // rust 侧无零件状态校验。保留常量供 rust 识别 / 回显 python 产出的码。
     pub const BIZ_DELIVERY_PART_STATUS_INVALID: i32 = 21111; // python 侧：所选零件状态非 READY_TO_SHIP
@@ -597,6 +605,16 @@ fn status_from_code(c: i32) -> StatusCode {
         {
             StatusCode::NOT_FOUND
         }
+
+        // 2026-10-16 新增（`print_template` 域）：`GET /print-templates/resolve`
+        // 查不到该一级客户名下未软删的 `kind='DELIVERY_TEMPLATE'` 行。
+        // ⚠️ **必须是 422、且必须显式登记**：本码原先在 HTTP_TABLE_CASES 里显式
+        // 映射成 400（python 转发时代的形态），下面 `(20000..30000) => BAD_REQUEST`
+        // 的兜底也会把它变成 400。取 422 的理由：请求本身完全合法（客户 id 存在、
+        // 是一级客户、没有越权），**不满足的是「这个客户的配置」**，与
+        // `VALIDATION_ERROR`（40001 = 422）同档 —— 前端据此走「提示去模板管理页
+        // 绑定 / 或让用户手动上传兜底」，而不是「你请求参数错了」。
+        c if c == code::BIZ_DELIVERY_TEMPLATE_NOT_CONFIGURED => StatusCode::UNPROCESSABLE_ENTITY,
 
         // 2026-10-13 新增（mail_digest 域）：
         // - 21701 未配置 SMTP → 503「服务未就绪」，与 `BIZ_WX_NOT_CONFIGURED`
@@ -1894,9 +1912,12 @@ mod tests {
             StatusCode::BAD_REQUEST,
             "BIZ_INVALID_VALUE",
         ),
+        // 2026-10-16：`print_template` 域自产 21109 ⇒ 显式登记 422
+        // （原先是 400，python 转发时代的形态；显式登记是为了压住下面
+        //  `(20000..30000) => BAD_REQUEST` 的兜底，见 `status_from_code` 的注记）。
         (
             code::BIZ_DELIVERY_TEMPLATE_NOT_CONFIGURED,
-            StatusCode::BAD_REQUEST,
+            StatusCode::UNPROCESSABLE_ENTITY,
             "BIZ_DELIVERY_TEMPLATE_NOT_CONFIGURED",
         ),
         (

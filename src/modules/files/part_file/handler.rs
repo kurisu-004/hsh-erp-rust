@@ -116,6 +116,7 @@ use crate::auth::rbac::CurrentUser;
 use crate::modules::files::part_file::dto::{
     ConfirmFileIn, DeletePartFileRequest, PartFileListQuery, UploadFileData,
 };
+use crate::modules::files::part_file::policy;
 use crate::modules::files::part_file::preview::dto::{PreviewOut, PreviewQuery, PreviewSize};
 use crate::modules::files::part_file::service::PartFileService;
 use crate::modules::files::part_file::vo::{PartFileListOut, PartFileOut, PartFileWithUrlOut};
@@ -140,6 +141,13 @@ use crate::state::AppState;
 /// 旧 `upload-drawing` / `upload-3d-model` 是 M+C（`CRUD_PART_ROLES`）、旧
 /// `assemblies/{id}/files` 是 M+C、旧 multipart 端点是 M+C+CNC，故白名单含 CNC。
 ///
+/// ⚠️ **`owner_kind='CUSTOMER'`（送货单打印模板）是两条额外闸门，不在「3 角色」里**
+/// （2026-10-16 review 第 1 / 2 轮）：角色收窄成**仅 Manager**
+/// （`policy::write_roles_for`）+ `owner_id` 必须是**一级客户**
+/// （`parent_id IS NULL`，review 第 2 轮 MAJOR-A 把该谓词下沉进
+/// `repo::customer_owner_exists`）。两条闸门都排在读 multipart 之后的
+/// service 入口、且**早于任何 COS / DB 副作用** ⇒ 未授权 / 不合格的请求零副作用。
+///
 /// ⚠️ **权限面到底放大了什么**（2026-10-13 review 第 1 轮存疑点 4 订正，别再笼统
 /// 写成「CNC 现在也能传图纸 / 3D 模型」——那句话不准确）：
 /// - **DRAWING / 3D_MODEL：没有放大**。CNC 在 PR1b 之前就已经能传这两类（旧
@@ -163,7 +171,7 @@ use crate::state::AppState;
 /// |---|---|---|
 /// | 40300 | 角色不在 M / C / CNC 内 | handler（读 multipart 前）+ service 双层 |
 /// | 20104 | `data` / `file` / filename 缺失、`data` JSON 解析失败、`owner_id` 非数字、`owner_kind` × `kind` 组合非法 | handler（前三项）+ service（末项） |
-/// | 21105 | owner 不存在（`owner_kind ∈ {PART, ASSEMBLY}` 但 id 查不到） | service `assert_owner_exists` |
+/// | 21105 | owner 不存在：`owner_kind ∈ {PART, ASSEMBLY}` 时 id 查不到；`owner_kind='CUSTOMER'` 时 id 查不到 / 已软删 / **不是一级客户**（`parent_id IS NULL`，2026-10-16 review 第 2 轮 MAJOR-A 补的谓词） | service `assert_owner_exists` |
 /// | 40001 | **0 字节文件** | service（2026-10-13 review 第 1 轮 MAJOR-1 补回，被删的 `upload_part_file` 有这道） |
 /// | 21103 | **超过 `config.cos.max_file_size`**（`COS_MAX_FILE_SIZE`，`.env.example` = 100MB） | service（同上补回；HTTP 400 —— `status_from_code` 对 2xxxx 的兜底） |
 /// | 21102 | 无扩展名 / 扩展名不在 `policy::allowed_exts(kind)` / content_type 与扩展名不匹配 | service |
@@ -267,7 +275,12 @@ pub async fn upload_part_file(
 /// spawn 异步 `delete_object(tmp_key)` 兜底清理（与 `soft_delete_part_file` 同款
 /// 「commit 在前、spawn 在后」纪律）。
 ///
-/// 权限：service 内 M+C（`bind_uploaded_file` 的 `require_any_role`），与旧端点逐字一致。
+/// 权限：service 内 `bind_uploaded_file` 的 `require_any_role` —— **按 `owner_kind`
+/// 派生**（非 CUSTOMER 仍是 M+C、与旧端点逐字一致；`CUSTOMER` ⇒ 仅 Manager，
+/// 且随后直接 20104 拒收）。⚠️ 2026-10-16 review 第 1 轮 MAJOR-1：本端点原先恒
+/// 是 M+C、与 `owner_kind` 无关，于是新增的 CUSTOMER owner 能让 CLERK 经它造出 /
+/// 替换任意客户的送货单打印模板行。理由见 `service::bind_uploaded_file` 的步骤
+/// 0 / 1a 注释。
 pub async fn confirm_file_object(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -364,13 +377,25 @@ pub async fn get_part_file_url(
 /// `GET /api/v2/files/objects/{file_id}/content` —— 后端代理文件二进制流。
 ///
 /// 拉 `t_part_file.object_key` + COS `get_object`，透传 `content_type` 头。
-/// 权限：`PartFileService::get_file_content` 的 5 角色（Manager / Clerk / Inspector /
+/// 权限：`PartFileService::get_file_content_of_checked_row` 的 5 角色（Manager / Clerk / Inspector /
 /// CncProgrammer / **ShelfAccount**，2026-10-10 新增 ShelfAccount 供报工台工控机预览图纸）。
 ///
 /// ⚠️ 与 `get_part_file_url` **角色集合相同但风险面不同**，`/url` 刻意不含 ShelfAccount：
 /// 本端点是**后端代理**（每次都过 RBAC）；`/url` 回的是 **COS 预签直链（1 小时有效）**，
 /// 拿到即可脱离本后端直接访问、直链可外传 ⇒ 工控机账号不需要它（预览走 content 就够），
 /// 不因「同一个 owner 的两个读端点」而一并放开。
+///
+/// ⚠️ **2026-10-16 起两条取字节端点共用同一张 kind 白名单**
+/// （[`policy::is_file_content_kind`]，判据与 fail-safe 方向见那里的 doc；
+/// 2026-10-16 review 第 1 轮 MAJOR-2 把 `/url` 也纳入了同一张表 ——
+/// 原先只守 content，CLERK / INSPECTOR / CNC 拿预签直链完全绕得过去）。
+/// 判 kind 排在取字节**之前** ⇒ 非法 kind 零外部 IO（不拉 COS）。客户送货单打印模板
+/// 要取字节请打 `print_template` 域的 `GET /print-templates/{id}/content`（那是**打印**
+/// 语义、权限点 `delivery_note.print`，刻意与本端点的 5 角色集合不同）。
+///
+/// ⚠️ 2026-10-16 review 第 1 轮 MINOR-5：kind 判定与取字节**共用同一行**（行由本
+/// handler 取一次，判过之后交给 `get_file_content_for_row`）—— 原先这里是
+/// 「handler 取一次行判 kind → service 又 `get_by_id` 一次」，同一行同一谓词查两遍。
 ///
 /// 2026-09-29 扁平化：service 内部走 legacy→新模板 fallback（见
 /// `resolve_effective_key`），handler 仅透传 `cfg.upload_prefix`。
@@ -380,13 +405,28 @@ pub async fn get_part_file_content(
     Path(file_id): Path<i64>,
 ) -> Result<Response, AppError> {
     let mut tx = state.pool.begin().await?;
+    // ⚠️ 先取行判 kind 再取字节：非法 kind 零外部 IO（不拉 COS）。
+    let row = state
+        .part_file_service
+        .get_file_row(&mut *tx, file_id)
+        .await?;
+    if !policy::is_file_content_kind(&row.kind) {
+        return Err(AppError::biz(
+            code::BIZ_PART_FILE_BAD_TYPE,
+            format!(
+                "kind={:?} 不走本端点取字节（仅 DRAWING / 3D_MODEL / G_CODE / SETUP_SHEET / ASSEMBLY_MASTER / CAD_2D）",
+                row.kind
+            ),
+        ));
+    }
+    // 角色闸门仍在 service（`get_file_content_of_checked_row`）—— 本 handler 不重复
+    // 那张 5 角色表，保持「一个端点一层闸门、且那层闸门在 service」的域内约定。
     let out = state
         .part_file_service
-        .get_file_content(
-            &mut *tx,
-            state.cos.clone(),
+        .get_file_content_of_checked_row(
+            state.cos.as_ref(),
             &state.config.cos.upload_prefix,
-            file_id,
+            &row,
             &current,
         )
         .await?;
@@ -613,4 +653,21 @@ mod tests {
             );
         }
     }
+
+    // ⚠️ **kind 白名单没有 lib 单测钉在这里**，因为它现在**不在 handler 里**：
+    // 2026-10-16 review 第 1 轮 MAJOR-2 把它上提到 `policy::is_file_content_kind`
+    // （service 的 `get_file_with_url` 也要判它，不能让 service 反向依赖 handler），
+    // 两处判定点分别是：
+    // - 本文件 `get_part_file_content`（判完把行交给 `get_file_content_of_checked_row`）
+    // - `service::get_file_with_url`（判完才 `head_object` + `presigned_get_url`）
+    //
+    // 语义（白名单含哪些 kind、不含 DELIVERY_TEMPLATE）由
+    // `policy::tests::is_file_content_kind_excludes_delivery_template_and_unknowns` 钉；
+    // **接线**（两条端点真的都拒）由集成测试从 HTTP 外部钉：
+    // `tests/print_template/resolve.rs::clerk_cannot_get_delivery_template_presigned_url`
+    // （含对照组：同一 token 打图纸行仍 200）与
+    // `::shelf_account_cannot_get_delivery_template_bytes`。
+    // ⚠️ 别写「数源码里出现几次 `policy::is_file_content_kind`」这种自证式单测 ——
+    // 断言字符串自己就会出现在同一文件里，count 恒 ≥ 1 ⇒ 恒真绿（review 第 1 轮
+    // MAJOR-4 同一类陷阱，本轮实际踩过一次后已改掉）。
 }

@@ -5,7 +5,7 @@
 //!   简化为两段 `{prefix}{sha16}_{safe_filename}`：owner/kind 信息已在 `t_part_file`
 //!   DB 行（外键索引），key 本身只需 prefix + 内容指纹 + 安全 filename。
 //! - `legacy_key` 反向解析 + `LegacyKey` 结构体：读端点（`get_part_file_url` /
-//!   `get_file_content`）在 DB 持有的 object_key（仍是历史五段）找不对象时，
+//!   `get_file_content_for_row`）在 DB 持有的 object_key（仍是历史五段）找不对象时，
 //!   先尝试按 sha16 推新 key，找不到再试 DB 原值；新数据写入则一律走新模板。
 //! - 上传路径（`upload_file_for_owner` / `upload_part_file`）一律走新模板，
 //!   `upload_prefix` 配置字段降级为 dead_code（保留兼容 .env 旧值不报错）。

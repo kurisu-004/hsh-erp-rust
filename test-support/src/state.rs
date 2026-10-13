@@ -657,6 +657,15 @@ pub fn test_ws_app(state: Arc<AppState>) -> axum::Router {
 //
 // 当前实现覆盖的 6 个方法：put_object / get_object / presigned_get_url /
 // delete_object / head_object / copy_object。
+//
+// 2026-10-16（review 第 1 轮 MINOR-6）：`put_object` 由 no-op 改成**真的存字节**
+// （连带写 head_responses），`delete_object` 连带**移除**字节，`copy_object`
+// 在缺省成功时把 src 的字节复制到 dst，并新增读侧 helper `stored_bytes`。
+// 动机：`print_template` binary 原来自造了**第三个**内存 COS 替身（`MemoryCos`），
+// 只因为本 Mock 的 `put` 不保存字节、钉不到「返回字节 == 上传字节」—— 那是重复
+// 造轮子，能力上提到这里后该替身已删除。
+// ⚠️ 替身固有偏差（**不是**回归）：缺 key 一律返 `BIZ_PART_FILE_UPLOAD_FAILED`
+// （真 COS 是 `NoSuchKey`）、etag 是拼出来的、对象存储错误分类不分层。
 // ===========================================================================
 
 /// 测试用 MockCos：按 key 查找 `head_object` / `copy_object` 的响应，其余方法走默认行为。
@@ -739,17 +748,52 @@ impl MockCos {
             .filter(|k| k.as_str() == key)
             .count()
     }
+
+    /// 当前桶里某 key 的字节（`put_object` 写入、`delete_object` 移除）。
+    ///
+    /// 2026-10-16 新增：`put_object` 改成**真的存字节**之后，测试才有办法断言
+    /// 「上传确实落了对象」与「删除后对象确实没了」（原先 `put` 是 no-op，只能靠
+    /// `delete_calls` 间接判断）。
+    pub fn stored_bytes(&self, key: &str) -> Option<Vec<u8>> {
+        self.get_responses.lock().unwrap().get(key).cloned()
+    }
 }
 
 #[async_trait::async_trait]
 impl CosClient for MockCos {
+    /// 2026-10-16：**真的把字节存下来**（原先是 no-op「测试不走真实上传」）。
+    ///
+    /// 为什么改：`NoopCos.get_object` 恒返空字节、`MockCos` 又不保存 ⇒ 集成测试
+    /// 钉不到「`GET /{id}/content` 返回的字节与上传的字节逐字节相等」这条 ★ 核心
+    /// 回归。`print_template` binary 因此自造了**第三个**内存 COS 替身
+    /// （`tests/print_template/main.rs` 的 `MemoryCos`），那是重复造轮子 ——
+    /// 能力上提到这里之后那个替身已删除。
+    ///
+    /// 同时写进 `head_responses`（size 取真实字节数）：`PartFileService::
+    /// resolve_effective_key` 的第一跳就是 `head_object(db_key)`，命中即直接用
+    /// db_key ⇒ 不写 head 会让读路径退化到 legacy 重写分支。
+    ///
+    /// ⚠️ **已知与真实 COS 的偏差**（替身固有限制，登记在
+    /// `docs/api/print_template.md` §8.3）：缺 key 的错误分类（替身一律
+    /// `BIZ_PART_FILE_UPLOAD_FAILED`，真 COS 是 `NoSuchKey`）、etag 语义。
     async fn put_object(
         &self,
-        _key: &str,
-        _body: Vec<u8>,
+        key: &str,
+        body: Vec<u8>,
         _content_type: &str,
     ) -> Result<(), AppError> {
-        // Mock 不模拟服务端写入（测试不走真实上传）
+        let size = body.len() as i64;
+        self.head_responses.lock().unwrap().insert(
+            key.to_string(),
+            ObjectMeta {
+                size,
+                etag: format!("mock-etag-{}", &key[..key.len().min(8)]),
+            },
+        );
+        self.get_responses
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), body);
         Ok(())
     }
 
@@ -775,8 +819,13 @@ impl CosClient for MockCos {
         Ok(format!("local://mock/{key}"))
     }
 
+    /// 2026-10-16：删掉时也把桶里的字节**移除**（原先只记 `delete_calls`）。
+    /// 语义与真实 COS 一致（NoSuchKey 视为成功 ⇒ 恒 Ok），且让「删除后对象没了」
+    /// 可被 `stored_bytes` 断言。
     async fn delete_object(&self, key: &str) -> Result<(), AppError> {
         self.delete_calls.lock().unwrap().push(key.to_string());
+        self.get_responses.lock().unwrap().remove(key);
+        self.head_responses.lock().unwrap().remove(key);
         // 模拟幂等：删除总成功（NoSuchKey 也视为成功）
         Ok(())
     }
@@ -798,6 +847,9 @@ impl CosClient for MockCos {
             })
     }
 
+    /// 2026-10-16：copy 成功时把 src 的字节复制到 dst（`put_object` 开始真存之后
+    /// 「STS 直传 → confirm → 读回」这条链在替身上也是通的）。`copy_results` 里
+    /// 显式登记的 `Err` 仍然优先返回错误。
     async fn copy_object(&self, src_key: &str, dst_key: &str) -> Result<(), AppError> {
         self.copy_calls
             .lock()
@@ -812,7 +864,23 @@ impl CosClient for MockCos {
         {
             Some(Ok(())) => Ok(()),
             Some(Err(msg)) => Err(AppError::biz(code::BIZ_PART_FILE_UPLOAD_FAILED, msg)),
-            None => Ok(()), // 缺省成功
+            None => {
+                if let Some(bytes) = self.get_responses.lock().unwrap().get(src_key).cloned() {
+                    let size = bytes.len() as i64;
+                    self.head_responses.lock().unwrap().insert(
+                        dst_key.to_string(),
+                        ObjectMeta {
+                            size,
+                            etag: format!("mock-etag-{}", &dst_key[..dst_key.len().min(8)]),
+                        },
+                    );
+                    self.get_responses
+                        .lock()
+                        .unwrap()
+                        .insert(dst_key.to_string(), bytes);
+                }
+                Ok(()) // 缺省成功
+            }
         }
     }
 }

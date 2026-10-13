@@ -636,15 +636,14 @@ async fn content_happy_path() {
     tx.commit().await.unwrap();
 
     // content 端点 — NoopCos.get_object 返空字节，但应正常返回
+    // ⚠️ 2026-10-16 review 第 2 轮 MINOR-A：原先这里调 `get_file_content`（那个
+    // 「有角色闸门、无 kind 闸门」的 pub 方法已随本轮整条删除），现走生产同款形态
+    // —— handler 取一次行判完 kind，再交给 `get_file_content_of_checked_row`。
+    let svc = PartFileService::new(shared_test_snowflake().clone(), cos.clone());
     let mut tx = pool.begin().await.unwrap();
-    let content = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
-        .get_file_content(
-            &mut *tx,
-            cos.clone(),
-            UPLOAD_UPLOAD_PREFIX,
-            out.id,
-            &current,
-        )
+    let row = svc.get_file_row(&mut *tx, out.id).await.unwrap();
+    let content = svc
+        .get_file_content_of_checked_row(cos.as_ref(), UPLOAD_UPLOAD_PREFIX, &row, &current)
         .await
         .expect("content ok");
     drop(tx);
@@ -1167,15 +1166,12 @@ async fn rbac_shelf_account_can_get_file_content() {
     tx.commit().await.unwrap();
 
     let shelf_account = test_current_user_with_roles(vec![Role::ShelfAccount]);
+    // ⚠️ 2026-10-16 review 第 2 轮 MINOR-A：同上，取行与取字节走生产同款的两步。
+    let svc = PartFileService::new(shared_test_snowflake().clone(), cos.clone());
     let mut tx = pool.begin().await.unwrap();
-    let content = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
-        .get_file_content(
-            &mut *tx,
-            cos.clone(),
-            UPLOAD_UPLOAD_PREFIX,
-            uploaded.id,
-            &shelf_account,
-        )
+    let row = svc.get_file_row(&mut *tx, uploaded.id).await.unwrap();
+    let content = svc
+        .get_file_content_of_checked_row(cos.as_ref(), UPLOAD_UPLOAD_PREFIX, &row, &shelf_account)
         .await
         .expect("SHELF_ACCOUNT 应能读内容（2026-10-10 放开）");
     drop(tx);

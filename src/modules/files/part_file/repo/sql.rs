@@ -163,16 +163,21 @@ impl PartFileRepo {
         .await
     }
 
-    /// 列表（owner_kind + 可选 owner_id + 可选 kind + limit + offset）。
+    /// 列表（owner_kind + 可选 owner_id + 可选 kind + 可选 exclude_kind + limit + offset）。
     /// 返回 (rows, total)。
     ///
     /// 注：`part_id` 列在 schema 里是 polymorphic（part 或 assembly）；
     /// 这里以 `part_id` 当 owner_id，配合 `owner_kind` 字符串区分语义。
+    ///
+    /// ⚠️ `exclude_kind`（2026-10-16 review 第 1 轮 MAJOR-3 新增）：把某个 kind 从
+    /// 结果里排除，**与 `kind` 正交**、两者同时生效，且**同时**加进 rows 与 total
+    /// 两个查询 —— 只加 rows 会让 `total` 仍把被排除的行算进去（前端分页页数对不上）。
     pub async fn list_with_filters(
         conn: &mut sqlx::PgConnection,
         _owner_kind: &str,
         owner_id: Option<i64>,
         kind: Option<&str>,
+        exclude_kind: Option<&str>,
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<TPartFile>, i64), sqlx::Error> {
@@ -189,11 +194,13 @@ impl PartFileRepo {
              WHERE deleted_at IS NULL \
                AND ($1::bigint IS NULL OR part_id = $1) \
                AND ($2::text IS NULL OR kind = $2) \
+               AND ($3::text IS NULL OR kind <> $3) \
              ORDER BY created_at DESC \
-             LIMIT $3 OFFSET $4",
+             LIMIT $4 OFFSET $5",
         )
         .bind(owner_id)
         .bind(kind)
+        .bind(exclude_kind)
         .bind(limit)
         .bind(offset)
         .fetch_all(&mut *conn)
@@ -202,10 +209,12 @@ impl PartFileRepo {
             "SELECT COUNT(*) FROM t_part_file \
              WHERE deleted_at IS NULL \
                AND ($1::bigint IS NULL OR part_id = $1) \
-               AND ($2::text IS NULL OR kind = $2)",
+               AND ($2::text IS NULL OR kind = $2) \
+               AND ($3::text IS NULL OR kind <> $3)",
         )
         .bind(owner_id)
         .bind(kind)
+        .bind(exclude_kind)
         .fetch_one(&mut *conn)
         .await?;
         Ok((rows, total))
