@@ -1,4 +1,4 @@
-//! `/api/v2/mail` 的 `GET /meta`、`GET /accounts`、`POST /accounts`、
+//! `/api/v2/cron/mail` 的 `GET /meta`、`GET /accounts`、`POST /accounts`、
 //! `POST /accounts/{id}`、`POST /accounts/{id}/set-default` 契约。
 //!
 //! ★ 核心回归：**授权码加密入库 + 出参里一个字都不回显**（掩码也不回显）。
@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 
 use crate::{
-    Ctx, assert_biz_code, bootstrap, create_account, create_body, get_as_manager, id_of,
+    Ctx, assert_biz_code, bootstrap, create_account, create_body, get_as_manager, get_raw, id_of,
     open_with_test_key, post_as_clerk, post_as_manager, post_raw, stored_name_and_version,
     stored_secret, unique_name,
 };
@@ -24,7 +24,7 @@ use crate::{
 #[tokio::test]
 async fn meta_lists_both_presets_with_smoke_parameters() {
     let ctx = bootstrap().await;
-    let (status, env) = get_as_manager(&ctx, "/mail/meta").await;
+    let (status, env) = get_as_manager(&ctx, "/cron/mail/meta").await;
     assert_eq!(status, StatusCode::OK, "{env}");
 
     let presets = env["data"]["presets"].as_array().expect("presets 是数组");
@@ -51,7 +51,7 @@ async fn meta_rejects_non_manager() {
     let ctx = bootstrap().await;
     let (status, env) = hsh_erp_test_support::send(
         ctx.app.clone(),
-        hsh_erp_test_support::json_request("GET", "/mail/meta", None, Some(&ctx.clerk_token)),
+        hsh_erp_test_support::json_request("GET", "/cron/mail/meta", None, Some(&ctx.clerk_token)),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{env}");
@@ -112,14 +112,14 @@ async fn list_accounts_hides_secret_and_orders_default_first() {
     // 置 b 为默认
     let (status, env) = post_as_manager(
         &ctx,
-        &format!("/mail/accounts/{}/set-default", id_of(&b)),
+        &format!("/cron/mail/accounts/{}/set-default", id_of(&b)),
         json!({ "version": b["version"] }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{env}");
     assert_eq!(env["data"]["is_default"], true, "{env}");
 
-    let (status, env) = get_as_manager(&ctx, "/mail/accounts").await;
+    let (status, env) = get_as_manager(&ctx, "/cron/mail/accounts").await;
     assert_eq!(status, StatusCode::OK, "{env}");
     let items = env["data"]["items"].as_array().expect("items 是数组");
     assert_eq!(items.len(), 2, "{env}");
@@ -139,7 +139,7 @@ async fn duplicate_name_returns_21707() {
     let name = unique_name("重名");
     create_account(&ctx, &name).await;
 
-    let (status, env) = post_as_manager(&ctx, "/mail/accounts", create_body(&name)).await;
+    let (status, env) = post_as_manager(&ctx, "/cron/mail/accounts", create_body(&name)).await;
     assert_biz_code(status, &env, 21707, StatusCode::CONFLICT);
 }
 
@@ -149,7 +149,7 @@ async fn unknown_preset_returns_21704_with_legal_values() {
     let ctx = bootstrap().await;
     let mut body = create_body(&unique_name("坏预设"));
     body["preset"] = json!("OUTLOOK");
-    let (status, env) = post_as_manager(&ctx, "/mail/accounts", body).await;
+    let (status, env) = post_as_manager(&ctx, "/cron/mail/accounts", body).await;
     assert_biz_code(status, &env, 21704, StatusCode::BAD_REQUEST);
     let msg = env["message"].as_str().unwrap_or_default();
     assert!(
@@ -164,7 +164,7 @@ async fn empty_secret_returns_21704() {
     let ctx = bootstrap().await;
     let mut body = create_body(&unique_name("空授权码"));
     body["secret"] = json!("   ");
-    let (status, env) = post_as_manager(&ctx, "/mail/accounts", body).await;
+    let (status, env) = post_as_manager(&ctx, "/cron/mail/accounts", body).await;
     assert_biz_code(status, &env, 21704, StatusCode::BAD_REQUEST);
 }
 
@@ -172,8 +172,12 @@ async fn empty_secret_returns_21704() {
 #[tokio::test]
 async fn create_rejects_non_manager() {
     let ctx = bootstrap().await;
-    let (status, env) =
-        post_as_clerk(&ctx, "/mail/accounts", create_body(&unique_name("越权"))).await;
+    let (status, env) = post_as_clerk(
+        &ctx,
+        "/cron/mail/accounts",
+        create_body(&unique_name("越权")),
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{env}");
 }
 
@@ -191,7 +195,7 @@ async fn update_without_secret_keeps_old_ciphertext() {
 
     let (status, env) = post_as_manager(
         &ctx,
-        &format!("/mail/accounts/{}", id_of(&created)),
+        &format!("/cron/mail/accounts/{}", id_of(&created)),
         json!({
             "version": created["version"],
             "name": format!("{name}-改名"),
@@ -224,7 +228,7 @@ async fn update_with_blank_secret_keeps_old_ciphertext() {
 
     let (status, env) = post_as_manager(
         &ctx,
-        &format!("/mail/accounts/{}", id_of(&created)),
+        &format!("/cron/mail/accounts/{}", id_of(&created)),
         json!({
             "version": created["version"],
             "name": "改名-2",
@@ -248,7 +252,7 @@ async fn update_with_new_secret_reencrypts() {
 
     let (status, env) = post_as_manager(
         &ctx,
-        &format!("/mail/accounts/{}", id_of(&created)),
+        &format!("/cron/mail/accounts/{}", id_of(&created)),
         json!({
             "version": created["version"],
             "name": "改名-3",
@@ -282,7 +286,7 @@ async fn update_name_to_a_live_duplicate_returns_21707_and_keeps_row_intact() {
 
     let (status, env) = post_as_manager(
         &ctx,
-        &format!("/mail/accounts/{}", id_of(&mine)),
+        &format!("/cron/mail/accounts/{}", id_of(&mine)),
         json!({
             "version": mine["version"],
             "name": taken,          // ← 撞 uk_t_mail_account_name_alive
@@ -317,7 +321,7 @@ async fn update_secret_with_control_chars_returns_21704_and_keeps_ciphertext() {
 
     let (status, env) = post_as_manager(
         &ctx,
-        &format!("/mail/accounts/{}", id_of(&created)),
+        &format!("/cron/mail/accounts/{}", id_of(&created)),
         json!({
             "version": created["version"],
             "name": created["name"],
@@ -351,7 +355,7 @@ async fn update_secret_over_200_chars_returns_21704() {
 
     let (status, env) = post_as_manager(
         &ctx,
-        &format!("/mail/accounts/{}", id_of(&created)),
+        &format!("/cron/mail/accounts/{}", id_of(&created)),
         json!({
             "version": created["version"],
             "name": created["name"],
@@ -379,7 +383,7 @@ async fn update_without_version_returns_422_plain_text() {
     let (status, raw) = post_raw(
         &ctx,
         "POST",
-        &format!("/mail/accounts/{}", id_of(&created)),
+        &format!("/cron/mail/accounts/{}", id_of(&created)),
         json!({ "name": "x", "preset": "NET_EASE_163", "account": "a@163.com" }),
     )
     .await;
@@ -402,7 +406,7 @@ async fn update_with_stale_version_returns_40901() {
 
     let (status, env) = post_as_manager(
         &ctx,
-        &format!("/mail/accounts/{}", id_of(&created)),
+        &format!("/cron/mail/accounts/{}", id_of(&created)),
         json!({
             "version": created["version"].as_i64().unwrap() + 99,
             "name": "改名-4",
@@ -420,7 +424,7 @@ async fn update_missing_account_returns_21706() {
     let ctx = bootstrap().await;
     let (status, env) = post_as_manager(
         &ctx,
-        "/mail/accounts/999999999999999",
+        "/cron/mail/accounts/999999999999999",
         json!({
             "version": 0, "name": "x",
             "preset": "NET_EASE_163", "account": "a@163.com"
@@ -444,14 +448,14 @@ async fn set_default_demotes_the_previous_default() {
     for acct in [&a, &b] {
         let (status, env) = post_as_manager(
             &ctx,
-            &format!("/mail/accounts/{}/set-default", id_of(acct)),
+            &format!("/cron/mail/accounts/{}/set-default", id_of(acct)),
             json!({ "version": acct["version"] }),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{env}");
     }
 
-    let (_, env) = get_as_manager(&ctx, "/mail/accounts").await;
+    let (_, env) = get_as_manager(&ctx, "/cron/mail/accounts").await;
     let items = env["data"]["items"].as_array().expect("items 是数组");
     let defaults: Vec<&Value> = items
         .iter()
@@ -470,7 +474,7 @@ async fn set_default_requires_version() {
     let (status, raw) = post_raw(
         &ctx,
         "POST",
-        &format!("/mail/accounts/{}/set-default", id_of(&created)),
+        &format!("/cron/mail/accounts/{}/set-default", id_of(&created)),
         json!({}),
     )
     .await;
@@ -500,8 +504,8 @@ async fn concurrent_set_default_on_two_accounts_never_returns_500() {
     let a = create_account(&ctx, &unique_name("并发甲")).await;
     let b = create_account(&ctx, &unique_name("并发乙")).await;
 
-    let path_a = format!("/mail/accounts/{}/set-default", id_of(&a));
-    let path_b = format!("/mail/accounts/{}/set-default", id_of(&b));
+    let path_a = format!("/cron/mail/accounts/{}/set-default", id_of(&a));
+    let path_b = format!("/cron/mail/accounts/{}/set-default", id_of(&b));
     let (ra, rb) = tokio::join!(
         post_as_manager(&ctx, &path_a, json!({ "version": a["version"] })),
         post_as_manager(&ctx, &path_b, json!({ "version": b["version"] })),
@@ -521,7 +525,7 @@ async fn concurrent_set_default_on_two_accounts_never_returns_500() {
     );
 
     // 终态：唯一索引兜底 ⇒ 至多一个默认，且确实有一个
-    let (status, env) = get_as_manager(&ctx, "/mail/accounts").await;
+    let (status, env) = get_as_manager(&ctx, "/cron/mail/accounts").await;
     assert_eq!(status, StatusCode::OK, "{env}");
     let items = env["data"]["items"].as_array().expect("items 是数组");
     let defaults = items
@@ -546,11 +550,12 @@ async fn put_and_delete_verbs_are_not_routed() {
     let id = id_of(&created);
 
     for verb in ["PUT", "PATCH", "DELETE"] {
-        let (status, raw) = post_raw(&ctx, verb, &format!("/mail/accounts/{id}"), json!({})).await;
+        let (status, raw) =
+            post_raw(&ctx, verb, &format!("/cron/mail/accounts/{id}"), json!({})).await;
         assert_eq!(
             status,
             StatusCode::METHOD_NOT_ALLOWED,
-            "{verb} /mail/accounts/{{id}} 不该被路由（登记在 docs/api/mail.md §6）：{raw}"
+            "{verb} /cron/mail/accounts/{{id}} 不该被路由（登记在 docs/api/mail.md §6）：{raw}"
         );
     }
 }
@@ -561,3 +566,60 @@ fn _ctx_type_check(_c: &Ctx) {}
 
 #[allow(dead_code)]
 fn _unused_value(_v: &Value) {}
+
+// ===========================================================================
+//  硬切守卫（2026-10-18 新增）
+// ===========================================================================
+
+/// 2026-10-18 硬切：`/api/v2/mail/*` → `/api/v2/cron/mail/*`，**旧路径 404、无 alias**。
+///
+/// 本用例是那条硬切的回归护栏 —— service 直调结构上测不到「路由没挂上去」，
+/// 只有实跑 HTTP 才测得到。
+///
+/// ⚠️ 先钉正向对照（新前缀 200）：否则「整个域都坏了」也会让本用例绿。
+/// ⚠️ 用 `get_raw`（`send_raw`）：axum 对未匹配路由返 **404 + 空 body**，
+/// `get_as_manager` 会在 JSON 解析处 panic —— 那是 helper 前提被打破，不是被测行为。
+#[tokio::test]
+async fn old_mail_prefix_returns_404() {
+    let ctx = bootstrap().await;
+    let created = create_account(&ctx, &unique_name("硬切守卫")).await;
+    let id = id_of(&created);
+
+    // 正向对照：新前缀对同一个邮箱必须 200。
+    let (new_status, new_raw) = get_raw(&ctx, "/cron/mail/accounts").await;
+    assert_eq!(new_status, StatusCode::OK, "新前缀必须 200：{new_raw}");
+
+    // 旧前缀：一律 404。逐条端点都打一遍（6 条 + 两类写动词），
+    // 避免只钉 `accounts` 时「`/meta` 忘了搬」这类半搬家漏网 —— 那正是本仓
+    // 历次硬切最常见的漏法（`verify-badge` 式的「路径还在但 method 变了」）。
+    for path in ["/mail/meta", "/mail/accounts", "/mail/logs"] {
+        let (status, raw) = get_raw(&ctx, path).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "旧前缀 GET {path} 必须 404，实际 {raw}"
+        );
+    }
+
+    // 写端点：`POST /accounts` 与 `POST /accounts/{id}/delete` 各打一次，
+    // 确认不是「读没挂、写还在」。
+    for (method, path, body) in [
+        (
+            "POST",
+            "/mail/accounts".to_string(),
+            create_body(&unique_name("旧前缀")),
+        ),
+        (
+            "POST",
+            format!("/mail/accounts/{id}/delete"),
+            json!({"version": created["version"].as_i64().unwrap_or(0)}),
+        ),
+    ] {
+        let (status, raw) = post_raw(&ctx, method, &path, body).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "旧前缀 {method} {path} 必须 404，实际 {raw}"
+        );
+    }
+}

@@ -48,7 +48,7 @@ async fn preview(ctx: &Ctx, body: Value) -> (StatusCode, Value) {
         ctx.app.clone(),
         json_request(
             "POST",
-            "/mail-digest/preview",
+            "/cron/mail-digest/preview",
             Some(body),
             Some(&ctx.manager_token),
         ),

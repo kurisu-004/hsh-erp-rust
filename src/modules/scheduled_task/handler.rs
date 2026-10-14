@@ -1,6 +1,6 @@
 //! scheduled_task 域 HTTP handler：6 个端点 + 路由表
 //!
-//! 端点（挂在 `/api/v2/mail`，由 [`router`] 桥接；**全部 Manager 独占**）：
+//! 端点（挂在 `/api/v2/cron/mail`，由 [`router`] 桥接；**全部 Manager 独占**）：
 //! - `GET  /meta`                  —— SMTP 预设表（纯函数，不查库）
 //! - `GET  /accounts`              —— 邮箱列表（**绝不返回密文**）
 //! - `POST /accounts`              —— 新建（授权码加密入库；不设默认）
@@ -45,7 +45,7 @@ use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
 
-/// 本域 router 注册的全部路由（`METHOD /path`，相对 `/api/v2/mail`）。
+/// 本域 router 注册的全部路由（`METHOD /path`，相对 `/api/v2/cron/mail`）。
 ///
 /// 与 [`router`] 的源码由 `mod tests::routes_declared_in_router` 逐条比对
 /// （范式同 `mail_digest::handler::ROUTES` / `prod::batch::handler::ROUTES`）
@@ -59,7 +59,7 @@ pub const ROUTES: &[&str] = &[
     "POST /accounts/{id}/set-default",
 ];
 
-/// `GET /api/v2/mail/meta`
+/// `GET /api/v2/cron/mail/meta`
 ///
 /// Manager 独占。**纯函数、不开事务、不查库**：预设表是编译期常量，
 /// 前端据此渲染「服务商」下拉，不需要在前端另存一份 host/port 映射。
@@ -68,7 +68,7 @@ pub async fn meta(current: CurrentUser) -> Result<Json<R<MailMetaOut>>, AppError
     Ok(Json(R::ok(service::meta())))
 }
 
-/// `GET /api/v2/mail/accounts`
+/// `GET /api/v2/cron/mail/accounts`
 ///
 /// Manager 独占。列表**不含** `encrypted_secret`，也没有掩码字段
 /// （见 `dto::MailAccountOut` 的 doc）。
@@ -82,7 +82,7 @@ pub async fn list_accounts(
     Ok(Json(R::ok(out)))
 }
 
-/// `POST /api/v2/mail/accounts`
+/// `POST /api/v2/cron/mail/accounts`
 ///
 /// Manager 独占。新建邮箱。⚠️ **不设默认** —— 置默认是
 /// `POST /accounts/{id}/set-default` 那条独立端点的事。
@@ -97,7 +97,7 @@ pub async fn create_account(
     Ok(Json(R::ok(out)))
 }
 
-/// `POST /api/v2/mail/accounts/{id}`
+/// `POST /api/v2/cron/mail/accounts/{id}`
 ///
 /// Manager 独占。**全量覆写** + 标准 OCC（`version` 必填，缺失 → axum `Json`
 /// 提取器返 **HTTP 422 纯文本**，不是业务信封）。
@@ -116,7 +116,7 @@ pub async fn update_account(
     Ok(Json(R::ok(out)))
 }
 
-/// `POST /api/v2/mail/accounts/{id}/delete`
+/// `POST /api/v2/cron/mail/accounts/{id}/delete`
 ///
 /// Manager 独占。软删。被 `t_mail_digest_config.sender_account_id` 引用 ⇒
 /// `21708 BIZ_MAIL_ACCOUNT_IN_USE`（HTTP 409）。
@@ -135,7 +135,7 @@ pub async fn delete_account(
     Ok(Json(R::ok(())))
 }
 
-/// `POST /api/v2/mail/accounts/{id}/set-default`
+/// `POST /api/v2/cron/mail/accounts/{id}/set-default`
 ///
 /// Manager 独占。置默认邮箱。⚠️ 同上，body 必含 `version`（目标行的）。
 ///
@@ -153,7 +153,7 @@ pub async fn set_default_account(
     Ok(Json(R::ok(out)))
 }
 
-/// `/api/v2/mail/*` 路由表。
+/// `/api/v2/cron/mail/*` 路由表。
 ///
 /// ⚠️ **matchit 注册顺序无约束**：本域最长段数 3（`/accounts/{id}/delete`），
 /// 最短 1（`/meta` / `/accounts`），**不存在同段数下的「静态段 vs catch-all」

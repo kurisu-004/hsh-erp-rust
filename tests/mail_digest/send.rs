@@ -34,7 +34,7 @@ async fn send_mail(ctx: &Ctx, body: Value) -> (StatusCode, Value) {
         ctx.app.clone(),
         json_request(
             "POST",
-            "/mail-digest/send",
+            "/cron/mail-digest/send",
             Some(body),
             Some(&ctx.manager_token),
         ),
@@ -48,7 +48,7 @@ async fn get_logs(ctx: &Ctx, query: &str) -> (StatusCode, Value) {
         ctx.app.clone(),
         json_request(
             "GET",
-            &format!("/mail-digest/logs{query}"),
+            &format!("/cron/mail-digest/logs{query}"),
             None,
             Some(&ctx.manager_token),
         ),
@@ -232,7 +232,7 @@ async fn clerk_cannot_send_mail_returns_403() {
         ctx.app.clone(),
         json_request(
             "POST",
-            "/mail-digest/send",
+            "/cron/mail-digest/send",
             Some(ok_body()),
             Some(&ctx.clerk_token),
         ),
@@ -260,7 +260,7 @@ async fn save_config_survives_scheduler_reschedule() {
         ctx.app.clone(),
         json_request(
             "POST",
-            "/mail-digest/config",
+            "/cron/mail-digest/config",
             Some(config_body(0)),
             Some(&ctx.manager_token),
         ),
@@ -296,7 +296,7 @@ async fn scheduled_prepare_failure_still_writes_failed_log() {
         ctx.app.clone(),
         json_request(
             "POST",
-            "/mail-digest/config",
+            "/cron/mail-digest/config",
             Some(config_body(0)),
             Some(&ctx.manager_token),
         ),
@@ -352,7 +352,7 @@ async fn scheduled_empty_recipients_still_writes_failed_log() {
         ctx.app.clone(),
         json_request(
             "POST",
-            "/mail-digest/config",
+            "/cron/mail-digest/config",
             Some(config_body(0)),
             Some(&ctx.manager_token),
         ),

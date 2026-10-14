@@ -343,10 +343,15 @@ WHERE m.code IN (
     -- 授权范围**逐条不变**，只是 code 换名。
     --
     -- **仅 MANAGER** —— 4.2 CLERK / 4.3 INSPECTOR / 4.4 CNC_PROGRAMMER /
-    -- 4.5 SHELF_ACCOUNT 四段**都不加**这两个 code。理由与 2026-10-05 收紧
-    -- process_work_type / part_process_chain 同款：邮箱配置**对真实收件人发信**，
-    -- 属配置型 + 有外发副作用的操作，只归管理员。
-    'scheduled_task', 'mail'
+    -- 4.5 SHELF_ACCOUNT 四段**都不加**这三个 code。理由与 2026-10-05 收紧
+    -- process_work_type / part_process_chain 同款：邮箱 / webhook 配置
+    -- **对真实收件人、真实企业微信群发消息**，属配置型 + 有外发副作用的操作，
+    -- 只归管理员。
+    --
+    -- 2026-10-18 新增 'wecom'：scheduled_task 下第三个子项（群机器人 webhook
+    -- 通道 + 每日总结推送），沿用同一判据 —— **同样只归 MANAGER**，那四段
+    -- 一行不加。
+    'scheduled_task', 'mail', 'wecom'
 )
 AND m.deleted_at IS NULL
   AND NOT EXISTS (

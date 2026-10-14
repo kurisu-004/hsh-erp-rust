@@ -28,7 +28,7 @@ async fn get_logs(ctx: &Ctx, query: &str) -> (StatusCode, Value) {
         ctx.app.clone(),
         json_request(
             "GET",
-            &format!("/mail-digest/logs{query}"),
+            &format!("/cron/mail-digest/logs{query}"),
             None,
             Some(&ctx.manager_token),
         ),
@@ -42,7 +42,7 @@ async fn save_config(ctx: &Ctx, body: Value) -> (StatusCode, Value) {
         ctx.app.clone(),
         json_request(
             "POST",
-            "/mail-digest/config",
+            "/cron/mail-digest/config",
             Some(body),
             Some(&ctx.manager_token),
         ),
@@ -165,7 +165,7 @@ async fn log_snapshots_recipients_at_send_time() {
         ctx.app.clone(),
         json_request(
             "POST",
-            "/mail-digest/send",
+            "/cron/mail-digest/send",
             Some(json!({})),
             Some(&ctx.manager_token),
         ),
@@ -192,7 +192,12 @@ async fn log_snapshots_recipients_at_send_time() {
     // 配置侧确实已经改了（否则本用例等于什么都没验）
     let (_, env4) = send(
         ctx.app.clone(),
-        json_request("GET", "/mail-digest/config", None, Some(&ctx.manager_token)),
+        json_request(
+            "GET",
+            "/cron/mail-digest/config",
+            None,
+            Some(&ctx.manager_token),
+        ),
     )
     .await;
     assert_eq!(
@@ -226,7 +231,7 @@ async fn log_records_config_version_at_send_time() {
         ctx.app.clone(),
         json_request(
             "POST",
-            "/mail-digest/send",
+            "/cron/mail-digest/send",
             Some(json!({})),
             Some(&ctx.manager_token),
         ),
@@ -257,7 +262,12 @@ async fn clerk_cannot_read_logs_returns_403() {
     let ctx = bootstrap().await;
     let (status, env) = send(
         ctx.app.clone(),
-        json_request("GET", "/mail-digest/logs", None, Some(&ctx.clerk_token)),
+        json_request(
+            "GET",
+            "/cron/mail-digest/logs",
+            None,
+            Some(&ctx.clerk_token),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{env}");

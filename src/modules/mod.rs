@@ -34,6 +34,8 @@ pub mod iam;
 // （6 端点，全部 Manager 独占）+ 后台定时任务（`task::mail_digest`）。
 // ⚠️ 2026-10-16 改造：SMTP 凭据**不再走 env**（`MAIL_SMTP_*` 已整轮删除），
 // 改由 `scheduled_task` 域的邮箱表提供；本域只管收件人 / 内容口径 / 调度配置。
+// ⚠️ 2026-10-18 URL 硬切：`/api/v2/mail-digest/*` → `/api/v2/cron/mail-digest/*`
+// （归入「定时任务」域组前缀 `/cron`；**旧路径 404，无 alias**）。
 pub mod mail_digest;
 pub mod outsource;
 pub mod part;
@@ -46,8 +48,10 @@ pub mod part;
 // 完整契约见 `docs/api/print_template.md`。
 pub mod print_template;
 // 2026-10-16 新增 scheduled_task 域：「定时任务」菜单下的**邮件通道**（邮箱实体 +
-// SMTP 预设元数据），6 端点全部 Manager 独占，URL 挂 `/api/v2/mail`。
+// SMTP 预设元数据），6 端点全部 Manager 独占，URL 挂 `/api/v2/cron/mail`。
 // 与 mail_digest 域的切分线见该域 `mod.rs` 的模块 doc（通道 vs 内容与调度）。
+// ⚠️ 2026-10-18 URL 硬切：`/api/v2/mail/*` → `/api/v2/cron/mail/*`
+// （归入「定时任务」域组前缀 `/cron`；**旧路径 404，无 alias**）。
 pub mod scheduled_task;
 // 2026-10-02 域归属定案：原 `part_batch` 域（1866 行 helper，无独立 URL）整体
 // 归入 prod 域的 `prod::batch` 子模块（src/modules/prod/batch/），承载 `t_part_batch`
@@ -160,18 +164,47 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // 「候选 + 公司列 + 内联在途批次」的整块看板与它的移动写端点。
         .nest("/outsource-queue", outsource::queue_router())
         .nest("/statistics", statistics::router())
-        // 2026-10-13 新增：mail_digest 域（交期汇总邮件）。6 端点全部 Manager 独占，
-        // 角色守卫写在各 handler 第一行（`require_role(Role::Manager)`），此处不挂 role layer。
-        // 前缀 `/mail-digest`：本仓顶层 nest 惯例是 kebab-case 单段（`/part-files` /
-        // `/cnc-programs` / `/outsource-queue`），域名 `mail_digest` 直接连字符化。
-        .nest("/mail-digest", mail_digest::router())
-        // 2026-10-16 新增：scheduled_task 域（邮件通道：邮箱 CRUD + SMTP 预设表）。
+        // ⚠️ 2026-10-18 URL 硬切：`/api/v2/mail-digest/*` → `/api/v2/cron/mail-digest/*`
+        // （**旧路径 404，无 alias**）。`/cron` 是「定时任务」域组的统一父前缀，
+        // 其下四个子域：`mail`（通道）/ `mail-digest`（内容）/ `wecom`（通道）/ `wecom-daily`（内容）。
         // 6 端点全部 Manager 独占，角色守卫写在各 handler 第一行
         // （`require_role(Role::Manager)`），此处不挂 role layer。
-        // 前缀 `/mail`：**刻意不是** kebab-case —— 菜单结构改版（一级「定时任务」
+        // 前缀仍刻意是 kebab-case 单段词（`mail-digest`），只多了一个 `/cron` 父段。
+        // 完整契约见 `docs/api/mail_digest.md`。
+        .nest("/cron/mail-digest", mail_digest::router())
+        // ⚠️ 2026-10-18 URL 硬切：`/api/v2/mail/*` → `/api/v2/cron/mail/*`
+        // （**旧路径 404，无 alias**）。6 端点全部 Manager 独占，角色守卫写在各 handler
+        // 第一行（`require_role(Role::Manager)`），此处不挂 role layer。
+        // 第 2 段 `/mail` **刻意不是** kebab-case —— 菜单结构改版（一级「定时任务」
         // / 二级「邮件」）时与前端路由、菜单 seed 的 `path='/mail'` 对齐成同一个词。
         // 完整契约见 `docs/api/mail.md`。
-        .nest("/mail", scheduled_task::router())
+        .nest("/cron/mail", scheduled_task::router())
+        // ── `/cron` 前缀族的 matchit 注册顺序核对（2026-10-18 新增，必读）──
+        //
+        // CLAUDE.md §9 有一条硬约束：「同段数时静态段必须先于 `Path<i64>` catch-all，
+        // 否则静态路径被吞成 **400**（不是 404）」。`/cron` 前缀族下现有两个子域
+        // **不触发**它，逐条理由如下（后续新域挂进 `/cron` 前请照此核对）：
+        //
+        // 1. **每个子域各自一个 `.nest()`，没有合并 router**。这里刻意没写成
+        //    `.nest("/cron", Router::new().merge(a).merge(b))` —— 合并后所有子域的
+        //    路由进同一张 matchit 表，注册顺序约束会跨前缀纠缠，排查困难
+        //    （CLAUDE.md §9「一个前缀一个 router 工厂」）。两个子域各自独立 nest ⇒
+        //    各自独立成表，`/cron/mail*` 与将来的 `/cron/wecom*` 匹配互不参与。
+        // 2. **两条 nest 的第 2 段都是静态段，且互不为对方的前缀**
+        //    （`mail` / `mail-digest` / 将来的 `wecom` / `wecom-daily` 逐字互异）⇒
+        //    axum 在 nest 阶段就能分流，不存在「一个静态段是另一个静态段前缀」的重叠。
+        // 3. **`mail` 与 `mail-digest` 段数相同也不冲突**：第 2 段先静态判别，
+        //    `/cron/mail/accounts`（3 段，第 2 段恰好等于 `mail`）与
+        //    `/cron/mail-digest/config`（3 段，第 2 段恰好等于 `mail-digest`）
+        //    在第 2 段就分道，不进入第 3 段的比较。
+        // 4. **两个子域的路由表内部本就无 catch-all 竞争**：`mail` 6 条最长 3 段、
+        //    `Path<i64>` 只在第 2 段、无 2 段静态路径；`mail-digest` 6 条**全是静态段**。
+        //    将来的 `wecom` 侧若引入 `Path<i64>`（如 `/webhooks/{id}` 3 段 vs
+        //    `/webhooks/{id}/delete` 4 段）也因**段数不同**而天然无冲突，且那张表
+        //    与 `mail` 侧完全隔离（第 1 条）。
+        //
+        // 守卫：旧前缀 404 的集成用例见 `tests/scheduled_task/accounts.rs`
+        // 与 `tests/mail_digest/config.rs`（2026-10-18 新增）。
         // 2026-10-16 新增：print_template 域（送货单打印模板：xlsx 上传 / 绑一级客户 /
         // 打印时取模板字节）。5 端点。
         // 守卫分两档：写端点 3 条（`POST /` 上传替换、`GET /` 列表、

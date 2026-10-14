@@ -4,10 +4,38 @@
 > 定时任务，二级菜单：邮件。页面上方使用 tab 区分不同的邮件类型，当前只有一种：交期汇总。
 > 邮箱账号和授权码可以在页面中配置」。
 >
+> ## ⚠️ 2026-10-18 URL 硬切：前缀进了 `/cron` 域组
+>
+> | 旧路径 | 新路径 |
+> |---|---|
+> | `/api/v2/mail/*` | **`/api/v2/cron/mail/*`** |
+>
+> **旧路径 404，无 alias**（合仓内 `scan` / `files` / `print_template` / `wx` 一贯做法）。
+> 需求出处（用户原话）：「api挂载到 /cron/wecom_daily 下，邮件的API也移动到 /cron 下」。
+>
+> `/cron` 是**定时任务域组**的统一 API 前缀，其下四个子域：
+>
+> | 子域 | 职责 | 模块 | URL |
+> |---|---|---|---|
+> | `mail` | **通道**（本文件） | `src/modules/scheduled_task/` | `/api/v2/cron/mail/*` |
+> | `mail-digest` | **内容** | `src/modules/mail_digest/` | `/api/v2/cron/mail-digest/*` |
+> | `wecom` | **通道**（企业微信群机器人） | `src/modules/wecom/` | `/api/v2/cron/wecom/*` |
+> | `wecom-daily` | **内容**（每日总结推送） | `src/modules/wecom_daily/` | `/api/v2/cron/wecom-daily/*` |
+>
+> ⚠️ **`wecom` / `wecom-daily` 两行在本轮只是登记**（2026-10-18 建表 + 开错误码段，
+> 模块代码随下一批落地）；本文件描述的 6 条端点表逐字有效。
+>
+> ⚠️ **菜单 path 不跟着 API 前缀变**：菜单 seed 的 `path='/mail'` 与前端路由
+> `path: 'mail'` **保持不变**，变的只是后端 URL。
+>
+> 守卫：`tests/scheduled_task/accounts.rs::old_mail_prefix_returns_404`
+> （实跑旧前缀断言 404；同用例先钉新前缀 200 作正向对照）。
+>
 > 代码位置：`src/modules/scheduled_task/`（六件套）、加密基建 `src/infra/crypto.rs`、
 > 主密钥解析 `src/infra/config.rs::MailAccountSecret`、
 > 迁移 `migrations/20261016000000_001_scheduled_task.sql`、
-> 菜单 `seeds/menu.sql`（`scheduled_task` 定时任务 → `mail` 邮件，仅 MANAGER，路径 `/mail`）。
+> 菜单 `seeds/menu.sql`（`scheduled_task` 定时任务 → `mail` 邮件 → `wecom` 企业微信，
+> 均仅 MANAGER，路径 `/mail` 与 `/wecom`）。
 >
 > ## 域范围：只管**通道**，不管内容与调度
 >
@@ -38,16 +66,16 @@
 ## 1. 端点表
 
 **全部 6 条都是 Manager 独占**（角色守卫写在各 handler 第一行，逐字
-`current.require_role(Role::Manager)?`）。前缀 `/api/v2/mail`。
+`current.require_role(Role::Manager)?`）。前缀 `/api/v2/cron/mail`。
 
 | 方法 | 路径 | 权限 | 一句话 |
 |---|---|---|---|
-| `GET` | `/api/v2/mail/meta` | Manager | SMTP 预设表（**纯函数、不查库**）：`{presets:[{value,label,host,port,tls_mode}]}` |
-| `GET` | `/api/v2/mail/accounts` | Manager | 邮箱列表（默认邮箱排最前）；**绝不返回** `encrypted_secret` |
-| `POST` | `/api/v2/mail/accounts` | Manager | 新建（`name` / `preset` / `account` / `secret`）；**不设默认** |
-| `POST` | `/api/v2/mail/accounts/{id}` | Manager | **全量覆写**；body **必含 `version`**（OCC）；`secret` 空串或缺省 ⇒ **沿用旧密文** |
-| `POST` | `/api/v2/mail/accounts/{id}/delete` | Manager | 软删；被交期汇总配置引用 ⇒ `21708`；body **必含 `version`** |
-| `POST` | `/api/v2/mail/accounts/{id}/set-default` | Manager | 置默认；body **必含 `version`**（目标行的） |
+| `GET` | `/api/v2/cron/mail/meta` | Manager | SMTP 预设表（**纯函数、不查库**）：`{presets:[{value,label,host,port,tls_mode}]}` |
+| `GET` | `/api/v2/cron/mail/accounts` | Manager | 邮箱列表（默认邮箱排最前）；**绝不返回** `encrypted_secret` |
+| `POST` | `/api/v2/cron/mail/accounts` | Manager | 新建（`name` / `preset` / `account` / `secret`）；**不设默认** |
+| `POST` | `/api/v2/cron/mail/accounts/{id}` | Manager | **全量覆写**；body **必含 `version`**（OCC）；`secret` 空串或缺省 ⇒ **沿用旧密文** |
+| `POST` | `/api/v2/cron/mail/accounts/{id}/delete` | Manager | 软删；被交期汇总配置引用 ⇒ `21708`；body **必含 `version`** |
+| `POST` | `/api/v2/cron/mail/accounts/{id}/set-default` | Manager | 置默认；body **必含 `version`**（目标行的） |
 
 - **只用 GET / POST**：本仓 HTTP 方法**零** PUT/PATCH/DELETE（`mail_digest` 域
   2026-10-13 实测核实：全仓 `.put(` / `.patch(` / `.delete(` 的命中只有 opendal /
@@ -57,13 +85,20 @@
   `DELETE /accounts/{id}` 时会当场红」。
 - **权威路由清单**：`src/modules/scheduled_task/handler.rs::ROUTES`（lib 单测逐条比对
   `router()` 源码，加了 `.route()` 忘登记就在单测里当场红）。
-- 挂载点：`src/modules/mod.rs::v2_router()` 的 `.nest("/mail", …)`（顶层 nest、
-  **单段、刻意不是 kebab-case** —— 与菜单 seed 的 `path='/mail'`、前端路由同一个词）。
-  ⚠️ 与既有的 `/mail-digest` **同前缀族**但无冲突：matchit 按段数与静态段优先匹配，
-  `/mail/meta`（2 段）不会落到 `/mail-digest`（1 段静态段）上。
-- ⚠️ **matchit 注册顺序无约束**：本域最长段数 3（`/accounts/{id}/delete`），最短 1
-  （`/meta` / `/accounts`）；`Path<i64>` 只出现在第 2 段，而**没有任何 2 段的静态路径**
-  ⇒ 不存在「静态段被 catch-all 吞成 400」的风险。
+- 挂载点：`src/modules/mod.rs::v2_router()` 的 `.nest("/cron/mail", …)`
+  （**`/cron` 父前缀下的两段**，2026-10-18 硬切；第 2 段 `/mail` **刻意不是
+  kebab-case** —— 与菜单 seed 的 `path='/mail'`、前端路由同一个词）。
+  ⚠️ 与同族的 `/cron/mail-digest` **同段数但无冲突**：matchit 在**第 2 段**先静态
+  判别（`mail` vs `mail-digest` 互不为对方的前缀），`/cron/mail/accounts` 与
+  `/cron/mail-digest/config` 在第 2 段就分道。
+  ⚠️ **matchit 注册顺序核对**（`/cron` 前缀族的四条理由，逐条见 `src/modules/mod.rs`
+  `v2_router()` 内 `/cron` 段的注释）：① 每个子域**各自一个 `.nest()`**、没有合并
+  router ⇒ 两张 matchit 表互不参与；② 第 2 段互不为前缀；③ 段数相同也在第 2 段分道；
+  ④ 本域与 `mail-digest` 的路由表内部本就无 catch-all 竞争（`mail-digest` 6 条
+  **全是静态段**）。
+- ⚠️ **matchit 注册顺序无约束**（域内）：本域最长段数 3（`/accounts/{id}/delete`），
+  最短 1（`/meta` / `/accounts`）；`Path<i64>` 只出现在第 2 段，而**没有任何 2 段的
+  静态路径** ⇒ 不存在「静态段被 catch-all 吞成 400」的风险。
 
 ## 2. `MailAccount` 逐字段
 
@@ -324,7 +359,7 @@ t_mail_digest_config.enabled == true
 
 - 后端常量：`scheduled_task::dto::MailAccountPreset::ALL`（2 项）+ 每个变体的
   `as_str()` / `host()` / `port()` / `tls_mode()`。
-- 前端对应：邮箱编辑表单的「服务商」下拉，选项源**取 `GET /api/v2/mail/meta` 的
+- 前端对应：邮箱编辑表单的「服务商」下拉，选项源**取 `GET /api/v2/cron/mail/meta` 的
   `presets[]`**（`label` 是后端给的中文文案，`host` 用于展示「选这家会连到哪台服务器」）。
 - 两者是**人工同步**关系，Rust 字面量与 TS 侧之间没有编译期约束，漂了不会编译失败。
   ⚠️ 抄一份到前端是最容易犯的错：加一家服务商时 host/port/tls_mode 三处都会变，
@@ -402,9 +437,9 @@ t_mail_digest_config.enabled == true
 | 邮箱配置 UI | 「自定义名称 + 服务商预设下拉 + 登录账号 + 授权码」四个字段；**没有**主机 / 端口输入框 |
 | api 层 | 6 个函数：`fetchMailMeta` / `fetchMailAccounts` / `createMailAccount` / `updateMailAccount` / `deleteMailAccount` / `setDefaultMailAccount` |
 | 权限 | 菜单仅授予 `MANAGER`；页面路由守卫按同一角色判定（6 个端点全部 `require_role(Role::Manager)`） |
-| **枚举** | **不要在前端硬编码预设 / host / port** —— 一律取 `GET /api/v2/mail/meta` 的 `presets[]`（§5） |
+| **枚举** | **不要在前端硬编码预设 / host / port** —— 一律取 `GET /api/v2/cron/mail/meta` 的 `presets[]`（§5） |
 | **授权码输入框** | 每次提交都是**全量**的：修改时若不重新填授权码，**不要**发 `secret` 或发空串（两者都表示「沿用旧密文」） |
-| **`sender_account_id`** | 交期汇总配置页的发信邮箱下拉，选项源是 `GET /api/v2/mail/accounts`；提交时按 **JSON string**（与出参对称，`deserialize_i64_opt` 只收字符串或 `null`） |
+| **`sender_account_id`** | 交期汇总配置页的发信邮箱下拉，选项源是 `GET /api/v2/cron/mail/accounts`；提交时按 **JSON string**（与出参对称，`deserialize_i64_opt` 只收字符串或 `null`） |
 | 授权码字段的交互 | **建完之后前端拿不到明文**（出参不回显）⇒ 编辑表单必须显示为「已配置（不修改则留空）」这类占位提示，**不要**试图回填 |
 | 删除的提示 | 被引用时后端返 `21708` + 409，message 里带引用份数与该去哪儿改 —— 前端**原样展示**即可 |
 | 雪花 ID | `MailAccountOut.id` / `ConfigOut.sender_account_id` 是 **JSON string**，不要按 `number` 声明 |

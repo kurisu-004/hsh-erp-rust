@@ -2,6 +2,34 @@
 
 > **2026-10-13 新建域**。把「已逾期 + 未来 N 天系统交期到期」的**工单级**汇总成一封
 > HTML 表格邮件，按配置的频率与时刻定时发出，也支持手动触发与预览。
+>
+> ## ⚠️ 2026-10-18 URL 硬切：前缀进了 `/cron` 域组
+>
+> | 旧路径 | 新路径 |
+> |---|---|
+> | `/api/v2/mail-digest/*` | **`/api/v2/cron/mail-digest/*`** |
+>
+> **旧路径 404，无 alias**（合仓内 `scan` / `files` / `print_template` / `wx` 一贯做法）。
+> 需求出处（用户原话）：「api挂载到 /cron/wecom_daily 下，邮件的API也移动到 /cron 下」。
+>
+> `/cron` 是**定时任务域组**的统一 API 前缀，其下四个子域：
+>
+> | 子域 | 职责 | 模块 | URL |
+> |---|---|---|---|
+> | `mail` | **通道**（邮箱 + SMTP 预设） | `src/modules/scheduled_task/` | `/api/v2/cron/mail/*` |
+> | `mail-digest` | **内容**（本文件） | `src/modules/mail_digest/` | `/api/v2/cron/mail-digest/*` |
+> | `wecom` | **通道**（企业微信群机器人） | `src/modules/wecom/` | `/api/v2/cron/wecom/*` |
+> | `wecom-daily` | **内容**（每日总结推送） | `src/modules/wecom_daily/` | `/api/v2/cron/wecom-daily/*` |
+>
+> ⚠️ **`wecom` / `wecom-daily` 两行在本轮只是登记**（2026-10-18 建表 + 开错误码段，
+> 模块代码随下一批落地）；本文件描述的 6 条端点表逐字有效。
+>
+> ⚠️ **菜单 path 不跟着 API 前缀变**：菜单 seed 的 `path='/mail'`（本域与 `mail` 域
+> 共用同一个二级菜单）与前端路由 `path: 'mail'` **保持不变**，变的只是后端 URL。
+>
+> 守卫：`tests/mail_digest/config.rs::old_mail_digest_prefix_returns_404`
+> （实跑旧前缀断言 404；同用例先钉新前缀 200 作正向对照）。
+>
 > 代码位置：`src/modules/mail_digest/`（六件套）、后台调度 `src/task/mail_digest.rs`、
 > 迁移 `migrations/20261013000000_001_mail_digest.sql`、菜单 `seeds/menu.sql`
 > （`scheduled_task` → `mail`，仅 MANAGER，路径 `/mail`；⚠️ **2026-10-16 由
@@ -37,27 +65,32 @@
 ## 1. 端点表
 
 **全部 6 条都是 Manager 独占**（角色守卫写在各 handler 第一行，逐字
-`current.require_role(Role::Manager)?`）。前缀 `/api/v2/mail-digest`。
+`current.require_role(Role::Manager)?`）。前缀 `/api/v2/cron/mail-digest`。
 
 | 方法 | 路径 | 权限 | 一句话 |
 |---|---|---|---|
-| `GET` | `/api/v2/mail-digest/config` | Manager | 读配置**单例**；表里无行时返回全部默认值 + `version=0` + `id="0"`（**不是 404**） |
-| `POST` | `/api/v2/mail-digest/config` | Manager | **全量覆写**；body **必含** `version`（OCC）；成功后热重载 cron（失败不回滚配置） |
-| `GET` | `/api/v2/mail-digest/meta` | Manager | **内容与调度**侧的表单选项源：频率枚举 / 列白名单 / 取值范围 / 缺省值（⚠️ **2026-10-16 起不再含 `smtp` 段**） |
-| `POST` | `/api/v2/mail-digest/preview` | Manager | 按「当前配置 + 临时覆盖」渲染 HTML；**不发送、不落流水** |
-| `POST` | `/api/v2/mail-digest/send` | Manager | 手动触发：渲染 + 真发 + 落流水（**成败都落**） |
-| `GET` | `/api/v2/mail-digest/logs` | Manager | 发送历史分页（`sent_at DESC, id DESC`；`limit∈[1,200]` + `offset≥0`） |
+| `GET` | `/api/v2/cron/mail-digest/config` | Manager | 读配置**单例**；表里无行时返回全部默认值 + `version=0` + `id="0"`（**不是 404**） |
+| `POST` | `/api/v2/cron/mail-digest/config` | Manager | **全量覆写**；body **必含** `version`（OCC）；成功后热重载 cron（失败不回滚配置） |
+| `GET` | `/api/v2/cron/mail-digest/meta` | Manager | **内容与调度**侧的表单选项源：频率枚举 / 列白名单 / 取值范围 / 缺省值（⚠️ **2026-10-16 起不再含 `smtp` 段**） |
+| `POST` | `/api/v2/cron/mail-digest/preview` | Manager | 按「当前配置 + 临时覆盖」渲染 HTML；**不发送、不落流水** |
+| `POST` | `/api/v2/cron/mail-digest/send` | Manager | 手动触发：渲染 + 真发 + 落流水（**成败都落**） |
+| `GET` | `/api/v2/cron/mail-digest/logs` | Manager | 发送历史分页（`sent_at DESC, id DESC`；`limit∈[1,200]` + `offset≥0`） |
 
 - **只用 GET / POST**：本仓 HTTP 方法**零** PUT/PATCH/DELETE，故配置写入走
   `POST /config`（全量覆写）而非 `PUT /config/{id}`。
 - **权威路由清单**：`src/modules/mail_digest/handler.rs::ROUTES`（lib 单测逐条比对
   `router()` 源码，加了 `.route()` 忘登记就在单测里当场红）。
-- 挂载点：`src/modules/mod.rs::v2_router()` 的 `.nest("/mail-digest", …)`（顶层 nest，
-  kebab-case 单段，与 `/part-files` / `/cnc-programs` / `/outsource-queue` 同款）。
-  ⚠️ **2026-10-16**：同一次提交里新增了同族的 `.nest("/mail", scheduled_task::router())`
-  （邮箱通道域，路径 `/mail`）。两者无冲突：matchit 按段数 + 静态段优先匹配，
-  `/mail/meta`（2 段）不会落到 `/mail-digest`（1 段静态段）上。菜单也同批从
-  `mail_group → mail_digest`（`/mail/digest`）改成 `scheduled_task → mail`（`/mail`）。
+- 挂载点：`src/modules/mod.rs::v2_router()` 的 `.nest("/cron/mail-digest", …)`
+  （**`/cron` 父前缀下的两段**，2026-10-18 硬切；第 2 段仍 kebab-case 单段词
+  `mail-digest`，域名 `mail_digest` 直接连字符化）。
+  ⚠️ 与同族的 `.nest("/cron/mail", scheduled_task::router())`（邮箱通道域）**同段数但
+  无冲突**：matchit 在**第 2 段**先静态判别（`mail-digest` 与 `mail` 互不为对方的前缀），
+  `/cron/mail-digest/config` 与 `/cron/mail/meta` 在第 2 段就分道，不进入第 3 段比较。
+  ⚠️ **matchit 注册顺序核对**（`/cron` 前缀族的四条理由，逐条见 `src/modules/mod.rs`
+  `v2_router()` 内 `/cron` 段的注释）：① 每个子域**各自一个 `.nest()`**、没有合并
+  router ⇒ 两张 matchit 表互不参与；② 第 2 段互不为前缀；③ 段数相同也在第 2 段分道；
+  ④ 本域 6 条**全是静态段**（见下一条）。
+  菜单也同批从 `mail_group → mail_digest`（`/mail/digest`）改成 `scheduled_task → mail`（`/mail`）。
 - ⚠️ **6 条路由全是静态段**（无 `Path` 参数）⇒ 不存在「静态段必须先于 catch-all」的
   matchit 排序约束。后人加 `/{id}` 时要重新审视这一点。
 
@@ -262,9 +295,9 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
 | 原 `smtp.*` | 新的去处 |
 |---|---|
 | `configured` | `ConfigOut.smtp_configured`（`GET /config`，纯 DB 判定） |
-| `host` / `port` / `tls_mode` | `GET /api/v2/mail/meta` 的 `presets[]`（`scheduled_task` 域，见 `docs/api/mail.md` §3） |
-| `from_address` | `GET /api/v2/mail/accounts` 的 `account` |
-| `from_name` | `GET /api/v2/mail/accounts` 的 `name` |
+| `host` / `port` / `tls_mode` | `GET /api/v2/cron/mail/meta` 的 `presets[]`（`scheduled_task` 域，见 `docs/api/mail.md` §3） |
+| `from_address` | `GET /api/v2/cron/mail/accounts` 的 `account` |
+| `from_name` | `GET /api/v2/cron/mail/accounts` 的 `name` |
 
 ⚠️ 保留一个「已经没有任何生产方」的字段只会让前端照着它读一个恒空的对象。前端改造时
 按上表逐条改，**不要**保留对 `smtp` 段的引用。
@@ -611,7 +644,7 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
 | 预览 | `/preview` 的 `html` 是完整 HTML 文档，**直接插 iframe**（`srcdoc` + `sandbox`）而**不要** `v-html` 塞进主文档 —— 后端已做转义，但 iframe 少一层依赖主文档上下文的暴露面 |
 | 枚举 | **不要在前端另存一份频率 / 列名映射**：一律取 `GET /meta` 的 `frequencies[]` / `columns[]`（`label` 是后端给的中文表头） |
 | ⚠️ **`columns[]` 多了两个 key，前端不需要改代码**（2026-10-16） | 本轮给列白名单加了 `batch_no`（表头「批次」）与 `location`（表头「位置」），`GET /meta` 的 `columns[]` 从 11 项变 **13 项**。**前端零改动**：`visible_columns` 的 schema 是 `z.array(z.string())`（不是枚举），`MailContentSection` 逐 `meta.columns[].key` 渲勾选框 ⇒ 新 key 自动出现、自动可勾、勾上就生效。⚠️ 别在前端补一份列名常量表（那是 §8.2「枚举」那条明令禁止的），也别把 key 数量写死成 11 |
-| **发信邮箱下拉** | ⚠️ **2026-10-16 新增**：选项源取 `GET /api/v2/mail/accounts`（`scheduled_task` 域）；提交时 `sender_account_id` 按 **JSON string** 发（发数字会 422）。⚠️ `POST /config` 是**全量覆写**，不带这个键 = 清成 `null`（= 定时任务不再注册 job） |
+| **发信邮箱下拉** | ⚠️ **2026-10-16 新增**：选项源取 `GET /api/v2/cron/mail/accounts`（`scheduled_task` 域）；提交时 `sender_account_id` 按 **JSON string** 发（发数字会 422）。⚠️ `POST /config` 是**全量覆写**，不带这个键 = 清成 `null`（= 定时任务不再注册 job） |
 | 「立即发送」按钮 | 按 `smtp_configured === false` 灰掉并提示「**未选择发信邮箱**」（⚠️ 不再是「去配 `MAIL_SMTP_*`」—— 那套 env 已删） |
 | `GET /meta` 的 `smtp` 段 | ⚠️ **已删除**（2026-10-16），逐条去处见 §2.7 的对照表。**不要**保留对它的引用 |
 | 错误处理 | `21701`（503）「发信通道不可用」与 `21702`（502）「SMTP 挂了」**排查方向相反**，UI 文案必须区分，不要都显示成「发送失败」；`21706`（邮箱不存在/已删，保存配置时出现） |
