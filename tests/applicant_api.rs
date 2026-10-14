@@ -1,12 +1,18 @@
-//! applicant 域 6 端点集成测试（Task 5 / plan §11）
+//! applicant 域集成测试（**6 端点 / 10 用例**；2026-10-17 补 4 条 get-or-create）
 //!
 //! 覆盖：
 //!   1. list_applicants_empty                          — 空 DB GET /com/applicants → items=[]
 //!   2. create_get_update_soft_delete_applicant_happy_path — 全生命周期 + version 递增 + 软删后 404
 //!   3. create_with_l2_customer_returns_21003          — L1 校验
-//!   4. duplicate_name_under_same_customer_returns_21002 — 同客户下重名
+//!   4. duplicate_name_under_same_customer_returns_21002 — 同客户下重名（**语义不变**，
+//!      `POST /com/applicants` 撞车仍报 21002；幂等只走新的 `/get-or-create`）
 //!   5. update_with_stale_version_returns_409          — 乐观锁（并发事务让 UPDATE 撞 0 行）
 //!   6. soft_delete_in_use_returns_21004               — 被 t_part.applicant_name 引用 → 拒软删
+//!   7. get_or_create_twice_returns_the_same_row       — 幂等核心：两次 200 / 同 id / version 与
+//!      created_at 不变 / 库里只有一行
+//!   8. get_or_create_is_not_swallowed_by_id_catch_all — 路由顺序守卫（被 `/{id}` 吞会是 405）
+//!   9. get_or_create_with_l2_customer_returns_21003  — 幂等**不豁免** L1 校验
+//!  10. get_or_create_with_blank_name_returns_20104    — 空 name 走同条 20104 校验路径
 //!
 //! ## 并行 / 认证
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
@@ -542,4 +548,160 @@ async fn soft_delete_in_use_returns_21004() {
     .await
     .expect("count applicant");
     assert_eq!(still_there, 1, "in-use 时 applicant 应未被软删");
+}
+
+// ===========================================================================
+//  2026-10-17：`POST /com/applicants/get-or-create`（幂等写路径）
+//
+//  背景（已实证，不要重新调查）：新增订单页提交时会对未登记的申请人自动
+//  `POST /com/applicants`；前端缓存 auto-create 结果后**从不回写**、列表加载失败时
+//  `rootCustomerId` 也不清 ⇒ 必然重复 POST ⇒ create 返 21002/409，而前端循环体没有
+//  try/catch ⇒ **整批订单全废**。本组用例守住幂等端点的四条边界。
+// ===========================================================================
+
+/// 7. 同一 `(name, L1)` 连打两次 `/get-or-create` → 两次都 200，且返回**同一行**：
+///    `id` / `version` / `created_at` 全部不变（库房里也只有一行）。
+///
+/// 这是本端点的**核心契约**：第二次绝不是 21002、也绝不是新建一行。
+#[tokio::test]
+async fn get_or_create_twice_returns_the_same_row() {
+    let (pool, token, fx) = bootstrap_as_manager().await;
+    let body = serde_json::json!({
+        "name": "幂等申请人",
+        "customer_id": fx.l1_customer_id.to_string(),
+    });
+
+    let (s1, env1) = send(
+        fresh_app(&pool).await,
+        json_request(
+            "POST",
+            "/com/applicants/get-or-create",
+            Some(body.clone()),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s1,
+        axum::http::StatusCode::OK,
+        "第一次 get-or-create 应 200（刻意不是 201）: {env1}"
+    );
+    assert_eq!(env1["code"], 0, "{env1}");
+    let id1 = env1["data"]["id"].as_str().unwrap().to_string();
+    assert_eq!(env1["data"]["version"], 0, "新建行 version 应 0: {env1}");
+    let created_at1 = env1["data"]["created_at"].clone();
+    assert_eq!(env1["data"]["name"], "幂等申请人");
+    assert_eq!(env1["data"]["customer_name"], "FX Applicant L1");
+
+    let (s2, env2) = send(
+        fresh_app(&pool).await,
+        json_request(
+            "POST",
+            "/com/applicants/get-or-create",
+            Some(body),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s2,
+        axum::http::StatusCode::OK,
+        "第二次 get-or-create 仍应是 200（幂等，不是 21002）: {env2}"
+    );
+    assert_eq!(env2["code"], 0, "{env2}");
+    assert_eq!(env2["data"]["id"], id1, "必须是同一行: {env2}");
+    assert_eq!(
+        env2["data"]["version"], env1["data"]["version"],
+        "命中既有行不该动 version: {env2}"
+    );
+    assert_eq!(
+        env2["data"]["created_at"], created_at1,
+        "命中既有行不该改 created_at: {env2}"
+    );
+
+    // 库房里确实只有一行（没有偷偷插入第二行）
+    let rows: i64 = sqlx::query_scalar!(
+        r#"SELECT COUNT(*) AS "n!" FROM t_applicant
+           WHERE name = '幂等申请人' AND customer_id = $1 AND deleted_at IS NULL"#,
+        fx.l1_customer_id,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count applicants");
+    assert_eq!(rows, 1, "同一 (name, L1) 只能有一行: {env2}");
+}
+
+/// 8. **路由顺序守卫**：`/get-or-create` 必须真正命中本端点。
+///
+/// 若把 `.route("/get-or-create", …)` 写在 `.route("/{id}", get(get_applicant))`
+/// **之后**，matchit 会让静态段被 `Path<i64>` catch-all 吞掉 —— 而 `/{id}` 只注册了
+/// GET，于是打 POST 得到 **405**（不是 404）。这里显式断言 200，把那条硬约束钉死。
+#[tokio::test]
+async fn get_or_create_is_not_swallowed_by_id_catch_all() {
+    let (pool, token, fx) = bootstrap_as_manager().await;
+    let (s, env) = send(
+        fresh_app(&pool).await,
+        json_request(
+            "POST",
+            "/com/applicants/get-or-create",
+            Some(serde_json::json!({
+                "name": "路由守卫",
+                "customer_id": fx.l1_customer_id.to_string(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        axum::http::StatusCode::OK,
+        "405/400 说明静态段被 /{{id}} 吞了（matchit 硬约束）: {env}"
+    );
+    assert_eq!(env["code"], 0, "{env}");
+    assert!(env["data"]["id"].is_string(), "应返回 ApplicantOut: {env}");
+}
+
+/// 9. L1 校验与 create 同款：`customer_id` 指向 L2 → 400 / 21003。
+///
+/// ⚠️ 幂等**不豁免**业务校验：绑在下级客户的申请人在 create 里被拒，在
+/// get-or-create 里同样被拒（申请人按集团登记）。
+#[tokio::test]
+async fn get_or_create_with_l2_customer_returns_21003() {
+    let (pool, token, fx) = bootstrap_as_manager().await;
+    let (s, env) = send(
+        fresh_app(&pool).await,
+        json_request(
+            "POST",
+            "/com/applicants/get-or-create",
+            Some(serde_json::json!({
+                "name": "L2 申请人",
+                "customer_id": fx.l2_customer_id.to_string(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, axum::http::StatusCode::BAD_REQUEST, "L2 应 400: {env}");
+    assert_eq!(env["code"], 21003, "BIZ_APPLICANT_BAD_CUSTOMER: {env}");
+}
+
+/// 10. 空 name（空白串）→ 400 / 20104 BIZ_INVALID_VALUE，与 create 同条校验路径。
+#[tokio::test]
+async fn get_or_create_with_blank_name_returns_20104() {
+    let (pool, token, fx) = bootstrap_as_manager().await;
+    let (s, env) = send(
+        fresh_app(&pool).await,
+        json_request(
+            "POST",
+            "/com/applicants/get-or-create",
+            Some(serde_json::json!({
+                "name": "   ",
+                "customer_id": fx.l1_customer_id.to_string(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, axum::http::StatusCode::BAD_REQUEST, "空名应 400: {env}");
+    assert_eq!(env["code"], 20104, "BIZ_INVALID_VALUE: {env}");
 }

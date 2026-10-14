@@ -784,6 +784,24 @@ impl IntoResponse for AppError {
     }
 }
 
+/// PG **唯一约束冲突**（SQLSTATE `23505`）判定 —— 全仓**单一真源**。
+///
+/// 2026-10-17 提升：本仓此前有**两份逐字相同**的私有副本
+/// （`scheduled_task::service::is_unique_violation` 与
+/// `mail_digest::service::is_unique_violation`），新增 `com::applicant` 时会是第三份
+/// —— 判据（`db.code() == "23505"`）是 DB 层面的事实、复制三份只会漂移，故上提到
+/// `shared`。三处调用方各自保留**自己的错误码映射**（`21707` / `40901` / `21002` …），
+/// 本函数只回答「是不是唯一键冲突」。
+///
+/// ⚠️ 它只判**唯一约束**，不含 `23503`（外键）/ `23502`（唯一）/ `23514`（CHECK）；
+/// 调用方若想把多种 DB 错误分类，**不要**往这里堆，逐条在自己的 service 里判。
+pub fn is_unique_violation(e: &sqlx::Error) -> bool {
+    matches!(
+        e,
+        sqlx::Error::Database(db) if db.code().as_deref() == Some("23505")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

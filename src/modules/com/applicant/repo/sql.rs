@@ -14,6 +14,8 @@
 //! - 校验：`l1_customer_exists` / `count_parts_using_applicant_name`
 //! - 过滤+分页+计数：`list_with_filters` / `count_with_filters`（QueryBuilder 防 N+1）
 //! - 写：`create` / `update` / `soft_delete`
+//! - **幂等写**：`get_or_create`（2026-10-17 新增，见该函数 doc；`POST
+//!   /com/applicants/get-or-create` 的唯一写入口）
 //!
 //! 2026-09-22 重构：从 `repo.rs` 平移到 `repo/sql.rs`，本文件 SQL 与方法签名零 diff；
 //! `.sqlx/query-*.json` 哈希不变；`customer_name`（跨域读 t_customer.name 单值）保留
@@ -210,6 +212,49 @@ impl ApplicantRepo {
         .execute(executor)
         .await?;
         Ok(())
+    }
+
+    /// **2026-10-17 新增**：「插入或取出」—— 幂等 get-or-create 的唯一写入口。
+    ///
+    /// `INSERT … ON CONFLICT (name, customer_id) WHERE deleted_at IS NULL DO NOTHING
+    /// RETURNING <列集>`：
+    /// - 冲突目标是**索引推断**，不是 `ON CONFLICT ON CONSTRAINT`
+    ///   （`uq_t_applicant_name_customer_active` 是 partial 索引、不是约束，PG 不支持
+    ///   `ON CONSTRAINT` 形式）。PG 靠谓词 `(name, customer_id) WHERE deleted_at IS
+    ///   NULL` 反查唯一索引，故**该谓词必须与索引定义逐字同序**。
+    /// - 返回 **1 行** ⇒ 插入成功（新行）；返回 **0 行** ⇒ 已有未软删的同名同行，
+    ///   调用方（service）据此回退到 `find_by_name_and_customer` 取既有行。
+    /// - **无 TOCTOU**：并发下 `DO NOTHING` 会等胜者提交后再返回 0 行，因此回退的
+    ///   SELECT 必然读到那一行 —— 这正是本仓「先查再插」在这条路径上不可用的原因。
+    ///
+    /// ⚠️ 与 [`create`](Self::create) 的区别是**语义**而非实现：`create` 撞重名会抛
+    /// `23505`（由 service 转 `21002`），本方法撞重名**不报错**，直接交出既有行。
+    /// `RETURNING` 列集与 `get_by_id` / `find_by_name_and_customer` 逐字一致（同一份
+    /// `TApplicant` 投影）。
+    pub async fn get_or_create<'e, E: PgExecutor<'e>>(
+        executor: E,
+        snowflake_id: i64,
+        name: &str,
+        customer_id: i64,
+        created_by: Option<i64>,
+    ) -> Result<Option<TApplicant>, sqlx::Error> {
+        sqlx::query_as!(
+            TApplicant,
+            r#"
+            INSERT INTO t_applicant
+                 (id, name, customer_id, version, created_at, created_by, updated_at, updated_by)
+            VALUES ($1, $2, $3, 0, now(), $4, now(), $4)
+            ON CONFLICT (name, customer_id) WHERE deleted_at IS NULL DO NOTHING
+            RETURNING id, name, customer_id, version,
+                      created_at, created_by, updated_at, updated_by, deleted_at
+            "#,
+            snowflake_id,
+            name,
+            customer_id,
+            created_by,
+        )
+        .fetch_optional(executor)
+        .await
     }
 
     /// 部分更新（OCC）：带乐观锁。

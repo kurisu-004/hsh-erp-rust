@@ -3,10 +3,13 @@
 //! ## 结构（2026-09-22 重构对齐 iam 范本）
 //! - `sql.rs`：原 `repo.rs` 全文搬迁，9 个 pub 固有静态方法 + sqlx `query!` 宏，
 //!   **内容零 diff**（`.sqlx/query-*.json` 哈希不变）。
-//! - `mod.rs`（本文件）：对外暴露胖 trait `ApplicantRepo`（9 方法合并单 trait；
-//!   t_applicant 7 + t_customer 跨域 helper 1 `customer_name` + 跨域校验 1
+//! - `mod.rs`（本文件）：对外暴露胖 trait `ApplicantRepo`（10 方法合并单 trait；
+//!   t_applicant 8 + t_customer 跨域 helper 1 `customer_name` + 跨域校验 1
 //!   `l1_customer_exists`），并直接 `impl ApplicantRepo for &mut PgConnection`
 //!   ——handler/service 借 `&mut *tx` / `&mut *conn` 即可，零中间壳。
+//!
+//! **2026-10-17**：新增第 10 个方法 `get_or_create`（幂等「插入或取出」，
+//! 服务 `POST /com/applicants/get-or-create`）⇒ 上面的「9」全部改为「10」。
 //!
 //! ## 为什么 trait 命名为 `ApplicantRepoTrait`（带 `Trait` 后缀）
 //! 与 shelf / customer 同形：跨模块静态调用方（本任务范围内未发现，保留扩展点）
@@ -15,8 +18,9 @@
 //! 申请人 trait 也加 `Trait` 后缀，避免后续 part 域引入 applicant 静态调用时再破。
 //!
 //! - `com::applicant::repo::ApplicantRepo` —— ZST struct（在 `sql.rs` 内，通过
-//!   `pub use sql::ApplicantRepo;` 重新导出至本模块），保留 9 个 pub 静态方法签名不变。
-//! - `com::applicant::repo::ApplicantRepoTrait` —— 本文件新加的胖 trait（9 方法），
+//!   `pub use sql::ApplicantRepo;` 重新导出至本模块），保留 9 个既有 pub 静态方法签名
+//!   不变 + 新增 `get_or_create`（既有 9 个**逐字未改**）。
+//! - `com::applicant::repo::ApplicantRepoTrait` —— 本文件新加的胖 trait（10 方法），
 //!   applicant 域内部 service 用 `<R: ApplicantRepoTrait>` 收。
 //!
 //! ## 跨域 trait 形参（`CustomerRepo`）
@@ -39,8 +43,14 @@
 //! ——按 conventions.md §4.1 含 IO 不强求 100%。
 //!
 //! ## 错误类型
-//! repo trait 方法 → `sqlx::Error`（与 sql.rs 签名 1:1，`create` 检
-//! SQLSTATE 23505 → 21002 BIZ_APPLICANT_DUPLICATE_NAME 由 service 层做）。
+//! repo trait 方法 → `sqlx::Error`（与 sql.rs 签名 1:1）。
+//!
+//! ⚠️ **2026-10-17 补上一个缺口**：本段原文写「`create` 检 SQLSTATE 23505 → 21002
+//! BIZ_APPLICANT_DUPLICATE_NAME 由 service 层做」，但 service 侧当时是**裸 `?`**，
+//! 文档陈述与实现不符 —— 并发重名只会漏成 `50001 数据库错误`（实测前端遇到的
+//! `21002` 来自 service 的前置 `find_by_name_and_customer` 判重，不是 DB 兜底）。
+//! 现在 `service::create_applicant` 真按 `shared::error::is_unique_violation` 分流到
+//! `21002`，与本段陈述一致。
 
 use async_trait::async_trait;
 use sqlx::PgConnection;
@@ -52,7 +62,7 @@ pub mod sql;
 pub use super::model::TApplicant;
 pub use sql::ApplicantRepo;
 
-/// applicant 域数据访问 trait（9 方法 = t_applicant 7 + t_customer 跨域 2）。
+/// applicant 域数据访问 trait（10 方法 = t_applicant 8 + t_customer 跨域 2）。
 ///
 /// 单 trait 而非每表一个：`&mut PgConnection` 同一作用域只能借给一个 repo 实例，
 /// 拆分会让 service 无法同时持有两个 repo（2026-09-22 重构定案；与 iam 同形）。
@@ -62,7 +72,7 @@ pub use sql::ApplicantRepo;
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait ApplicantRepoTrait: Send {
-    // ── t_applicant（7）──
+    // ── t_applicant（8）──
     async fn get_by_id(
         &mut self,
         id: i64,
@@ -93,6 +103,21 @@ pub trait ApplicantRepoTrait: Send {
         customer_id: i64,
         created_by: Option<i64>,
     ) -> Result<(), sqlx::Error>;
+    /// **幂等写**（2026-10-17 新增）：插入成功返新行、撞重名返既有行（`None`）。
+    ///
+    /// ⚠️ 与 [`create`](ApplicantRepoTrait::create) 的区别是**语义**、不是实现：
+    /// `create` 遇同一 L1 下同名 → 抛 SQLSTATE 23505（service 转 `21002`）；
+    /// 本方法遇同名**不报错**，交出既有行让调用方继续 —— 这是新增订单页
+    /// 「自动登记申请人」循环不会因第二次 POST 而整批报废的前提。
+    /// 返回 `None` 时**必须**紧接一次 `find_by_name_and_customer` 取该行，
+    /// 不得凭空造行（并发下 `DO NOTHING` 会等胜者提交，故该 SELECT 必然命中）。
+    async fn get_or_create<'a>(
+        &mut self,
+        snowflake_id: i64,
+        name: &'a str,
+        customer_id: i64,
+        created_by: Option<i64>,
+    ) -> Result<Option<TApplicant>, sqlx::Error>;
     async fn update<'a>(
         &mut self,
         id: i64,
@@ -132,7 +157,7 @@ pub trait ApplicantRepoTrait: Send {
 /// 故喂给 `sql::ApplicantRepo::yyy` 须写 `&mut **self`（reborrow，避免 move 引用本身）。
 #[async_trait]
 impl ApplicantRepoTrait for &mut PgConnection {
-    // ── t_applicant（7）── 一行委托 sql::ApplicantRepo ─────────────
+    // ── t_applicant（8）── 一行委托 sql::ApplicantRepo ─────────────
     async fn get_by_id(
         &mut self,
         id: i64,
@@ -177,6 +202,16 @@ impl ApplicantRepoTrait for &mut PgConnection {
         created_by: Option<i64>,
     ) -> Result<(), sqlx::Error> {
         ApplicantRepo::create(&mut **self, snowflake_id, name, customer_id, created_by).await
+    }
+
+    async fn get_or_create<'b>(
+        &mut self,
+        snowflake_id: i64,
+        name: &'b str,
+        customer_id: i64,
+        created_by: Option<i64>,
+    ) -> Result<Option<TApplicant>, sqlx::Error> {
+        ApplicantRepo::get_or_create(&mut **self, snowflake_id, name, customer_id, created_by).await
     }
 
     async fn update<'b>(

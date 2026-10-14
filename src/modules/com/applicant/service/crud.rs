@@ -1,11 +1,13 @@
 //! applicant 域 CRUD service
 //!
-//! 列表 / 详情 / 创建 / 更新 / 软删 —— 共 5 个端点。
+//! 列表 / 详情 / 创建 / 更新 / 软删 + **幂等 get-or-create** —— 共 6 个端点
+//! （2026-10-17 新增 `get_or_create_applicant`，见该方法 doc）。
 //!
 //! ## 业务规则（与 Python 一致）
 //! - 角色：Manager + Clerk 可读写（service 层二次守卫）
 //! - customer_id 必须指向 L1（一级集团 parent_id IS NULL）—— 不允许挂到下级
-//! - 同一 L1 下姓名唯一（DB partial unique 兜底）
+//! - 同一 L1 下姓名唯一（DB partial unique 兜底；`create` 撞车返 `21002`，
+//!   `/get-or-create` 撞车返既有行 —— 两条路径的差别见两个方法各自的 doc）
 //!
 //! ## 「必须挂 L1 根」**不随客户层级加深而改变**（2026-10-17 复核确认）
 //! 客户树从固定两层放开为任意深度后，全仓多数域的「挂叶子 / 取根名」口径都跟着变了，
@@ -37,8 +39,8 @@
 //! picker 同样不抽 trait 直接收 conn 静态调用）。
 //!
 //! `ApplicantService` 是带字段 struct（仅 `snowflake`：iam 范本 §6）；get/create/
-//! update/soft_delete 4 端点方法签名 `<R: ApplicantRepoTrait>(&self, mut repo: R, ...)`，
-//! 生产 `R = &mut PgConnection`。
+//! get-or-create/update/soft_delete 5 端点方法签名 `<R: ApplicantRepoTrait>(&self, mut
+//! repo: R, ...)`，生产 `R = &mut PgConnection`。
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -229,14 +231,84 @@ impl ApplicantService {
         }
 
         let new_id = self.snowflake.next_id();
-        repo.create(new_id, name, customer_id, Some(current.id))
-            .await?;
+        // ⚠️ 2026-10-17：DB 唯一约束兜底（并发重名 / 前置判重与 INSERT 之间的 TOCTOU）
+        // 走 SQLSTATE 23505 → `21002`。此前这里是裸 `?`，即 `repo/mod.rs` 模块 doc
+        // 声称「23505 → 21002 由 service 层做」而实现漏了，并发重名会漏成
+        // `50001 数据库错误`；判据用全仓单一真源 `shared::error::is_unique_violation`。
+        // ⚠️ **非 23505 的错误照原样上抛**（不要用「只有 23505 才处理」的 if-let
+        // 把 else 分支漏成静默吞错）。
+        match repo
+            .create(new_id, name, customer_id, Some(current.id))
+            .await
+        {
+            Ok(()) => {}
+            Err(e) if crate::shared::error::is_unique_violation(&e) => {
+                return Err(duplicate_name());
+            }
+            Err(e) => return Err(e.into()),
+        }
 
         // 重读一次拿 server-side defaults（version / created_at / updated_at）
         let row = repo
             .get_by_id(new_id, false)
             .await?
             .ok_or_else(applicant_not_found)?;
+        let customer_name = repo.customer_name(row.customer_id).await?;
+        Ok(to_applicant_out(row, customer_name))
+    }
+
+    /// **2026-10-17 新增**：`POST /com/applicants/get-or-create` 的 service。
+    ///
+    /// 幂等「插入或取出」：同一 `(name, L1)` 无论调用多少次都成功，且**永远返回
+    /// 同一行**（同 `id` / `version` / `created_at`）。
+    ///
+    /// ## 为什么需要它（背景已实证，不要重新调查）
+    /// 新增订单页提交时会对未登记的申请人自动 `POST /com/applicants`；前端缓存
+    /// auto-create 结果后**从不回写**，列表加载失败时 `rootCustomerId` 也不清 ⇒
+    /// 必然重复 POST ⇒ `create` 返 `21002`/409，而前端循环体没有 try/catch ⇒
+    /// **整批订单全废**。Python 时代的 `bulk-get-or-create` 从未移植到 Rust
+    /// （见 `handler.rs` 顶部 doc 的缺口登记）。
+    ///
+    /// ## 与 `create_applicant` 的差别只有「重名怎么办」
+    /// 校验（`name.trim()` 非空 → `20104`、`l1_customer_exists` → `21003`）、角色
+    /// （`require_any_role([Manager, Clerk])`，与 create 逐字一致）全部复用；
+    /// 重名在 create 是错误码 21002，在本方法是**返回既有行**。
+    ///
+    /// ## 无 TOCTOU
+    /// 落库走 `ON CONFLICT … DO NOTHING RETURNING`（见
+    /// `ApplicantRepoTrait::get_or_create` doc）：返回 0 行时并发胜者**已提交**，
+    /// 随后的 `find_by_name_and_customer` 必然读到那一行。
+    pub async fn get_or_create_applicant<R: ApplicantRepoTrait>(
+        &self,
+        mut repo: R,
+        req: &ApplicantCreateRequest,
+        current: &CurrentUser,
+    ) -> Result<ApplicantOut, AppError> {
+        require_role(current)?;
+
+        let name = req.name.trim();
+        if name.is_empty() {
+            return Err(AppError::biz(code::BIZ_INVALID_VALUE, "申请人姓名不能为空"));
+        }
+        let customer_id = req.customer_id.parse::<i64>().map_err(|_| bad_customer())?;
+
+        // L1 校验：与 create 同款 —— 申请人按集团登记，挂在任何下级都拒（21003）。
+        if !repo.l1_customer_exists(customer_id).await? {
+            return Err(bad_customer());
+        }
+
+        let new_id = self.snowflake.next_id();
+        let row = match repo
+            .get_or_create(new_id, name, customer_id, Some(current.id))
+            .await?
+        {
+            Some(row) => row,
+            // 已有未软删的同名同行 ⇒ 取既有行（DO NOTHING 之后必然读得到）。
+            None => repo
+                .find_by_name_and_customer(name, customer_id, false)
+                .await?
+                .ok_or_else(applicant_not_found)?,
+        };
         let customer_name = repo.customer_name(row.customer_id).await?;
         Ok(to_applicant_out(row, customer_name))
     }

@@ -326,12 +326,13 @@ fn version_conflict() -> AppError {
     )
 }
 
-/// PG 唯一约束冲突（SQLSTATE 23505）。
+/// PG 唯一约束冲突（SQLSTATE 23505）—— **委托全仓单一真源**。
+///
+/// 2026-10-17：本函数原先是逐字私有副本（与 `scheduled_task::service` 同一份判据两份
+/// 代码），随 `com::applicant` 引入第三份而一并上提到 `shared::error`。
+/// ⚠️ **本域的错误码映射逐字不动**：配置单例首次初始化的 23505 仍转成 `40901`。
 fn is_unique_violation(e: &sqlx::Error) -> bool {
-    matches!(
-        e,
-        sqlx::Error::Database(db) if db.code().as_deref() == Some("23505")
-    )
+    crate::shared::error::is_unique_violation(e)
 }
 
 /// naive timestamp 的展示格式（与全仓 `created_at` 出参一致）。
