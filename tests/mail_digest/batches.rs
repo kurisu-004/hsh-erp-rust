@@ -3,7 +3,11 @@
 //! 覆盖 `/preview` 渲出的正文中「工单行 + 其下紧跟的批次子行」这条新结构：
 //!
 //! 1. `preview_renders_all_batches_of_every_order_row`
-//!    —— 多工单多批次**全部**出现在 HTML 里，且**紧跟**各自的工单行
+//!    —— 多工单多批次**全部**出现在 HTML 里；节行数仍是工单级；无批次工单不产生子行；
+//!    且**散件工单的批次子行序列号格恒空**（fixture 派了序列号才有这条信号，
+//!    否则把 PART 支改回 `p.serial_no` 也照样全绿）。「子行紧跟工单行」由
+//!    `template.rs::tests::batch_sub_rows_follow_their_own_order_row` 守（那是纯渲染层
+//!    的事、要按**位置**断言，集成测试按子串断言反而脆）
 //! 2. `preview_attaches_child_batches_to_assembly_row`
 //!    —— 装配件的批次挂在**子件**上，必须归到装配件行下面（主查询口径与批次查询逐字一致）
 //! 3. `preview_renders_each_holder_location_in_chinese` +
@@ -60,19 +64,33 @@ async fn preview(ctx: &Ctx, body: Value) -> (StatusCode, Value) {
 
 /// 只看批次侧几列的 preview（省得断言被 10 个缺省列的其它内容干扰）。
 ///
-/// ⚠️ 2026-10-16 起含 `serial_no` —— 装配件子行的序列号格就是靠这一列断言的。
+/// ⚠️ 2026-10-16 起含 `serial_no` —— 它是**子行序列号格**所在的那一列（装配件支填子件
+/// 序列号、散件支恒空，见 `repo::DigestBatchRow::part_serial_no`），且因为它排在第一位，
+/// [`batch_sub_row_serials`] 才敢直接取子行的首个 `<td>`。⚠️ 列集一旦调整、首位不再
+/// 是 `serial_no`，那个 helper 必须跟着改。
 fn batch_only_body() -> Value {
     json!({
         "visible_columns": ["serial_no", "batch_no", "quantity", "status", "location"]
     })
 }
 
-/// 取出正文里**全部批次子行**的首个 `<td>`（列序 = `serial_no` 在第一位时的序列号格）。
+/// 批次子行的**批次格**是否恰好等于 `　{n}`（整格等值）。
+///
+/// ⚠️ **不要写 `html.contains("　1")`**（2026-10-16）：批次格去掉「第…批」前缀之后，
+/// `　1` 是 `　10` / `　11` 的**子串** ⇒ 批次数 ≥ 10 的场景下「批次列出现 / 消失」那类
+/// 断言假绿（旧 marker `第1批` 没有这个歧义 —— 前缀里那个「第」帮它挡掉了）。`>　1<`
+/// 带上两侧界 ⇒ `>　10<` 里不含 `>　1<`。
+fn has_batch_cell(html: &str, no: i32) -> bool {
+    html.contains(&format!(">\u{3000}{no}<"))
+}
+
+/// 取出正文里**全部批次子行**的首个 `<td>`（`batch_only_body()` 的列序把 `serial_no`
+/// 放在第一位 ⇒ 那就是子行的序列号格）。
 ///
 /// ⚠️ 按 `<tr bgcolor="#f7f8fa">` 定位而不是按某个批次号：同一装配件下多个子件的批次
-/// **各自**从 `batch_no = 1` 起 ⇒ 定位不到是哪一行，返回**顺序也不确定**
-/// （SQL 只按 `(owner_type, owner_id, batch_no)` 排，子件之间无先后口径）⇒ 断言一律
-/// 按集合做。
+/// **各自**从 `batch_no = 1` 起 ⇒ 按批次号定位根本定位不到是哪一行。返回**顺序不承载
+/// 语义**（SQL 的 `ORDER BY … batch_no, id` 只保证结果可复现，子件之间没有先后口径）
+/// ⇒ 断言一律按集合做。
 fn batch_sub_row_serials(html: &str) -> Vec<String> {
     html.split("<tr bgcolor=\"#f7f8fa\">")
         .skip(1)
@@ -91,15 +109,19 @@ fn batch_sub_row_serials(html: &str) -> Vec<String> {
 }
 
 // ===========================================================================
-//  1. 多工单多批次全部出现，且紧跟各自工单行
+//  1. 多工单多批次全部出现 + 散件子行序列号格恒空
 // ===========================================================================
 
-/// ★ 需求 2：工单下方**紧跟**对应的所有批次。
+/// ★ 需求 2：工单下方紧跟对应的所有批次。
 ///
-/// 断言四件事：① 每个工单的每个批次都在（一个不落）；② 子行**紧跟**本工单而不是
-/// 集中排在表尾（渲染层若按 id 分组后集中渲染，顺序就会变成「所有工单、所有批次」）；
-/// ③ 节行数仍是**工单级**（子行不计入 `upcoming_count`）；④ 一个批次都没有的工单
-/// 不产生子行。
+/// 本用例断言五件事：① 每个工单的每个批次都在（一个不落）；② 节行数仍是**工单级**
+/// （子行不计入 `upcoming_count`）；③ 一个批次都没有的工单不产生子行；④ **散件工单的
+/// 批次子行序列号格恒空**；⑤ 该格恒空这件事本身是「有判别力」的（fixture 派了序列号）。
+/// ⚠️ **「子行紧跟工单行」不由本用例守** —— 那是纯渲染层的渲染顺序，
+/// `template.rs::tests::batch_sub_rows_follow_their_own_order_row` 按位置断言它。
+/// ④ 之所以能有信号：fixture 刻意给 `DWG-A` / `DWG-B` 都派了序列号（`SN-A` / `SN-B`）
+/// ——序列号是 NULL 时，把 PART 支改回 `p.serial_no` 也照样渲出空格子、断言零信号；
+/// 派了序列号才能真正区分「刻意留空」与「取不到值」。
 #[tokio::test]
 async fn preview_renders_all_batches_of_every_order_row() {
     let ctx = crate::bootstrap().await;
@@ -115,7 +137,7 @@ async fn preview_renders_all_batches_of_every_order_row() {
         Some(soon),
         None,
         10,
-        None,
+        Some("SN-A"),
         None,
     )
     .await;
@@ -132,7 +154,7 @@ async fn preview_renders_all_batches_of_every_order_row() {
         Some(soon),
         None,
         6,
-        None,
+        Some("SN-B"),
         None,
     )
     .await;
@@ -162,14 +184,33 @@ async fn preview_renders_all_batches_of_every_order_row() {
     let html = env["data"]["html"].as_str().expect("html 是字符串");
 
     // 批次格只写纯数字 + 一个全角缩进（2026-10-16）
-    for marker in ["\u{3000}1", "\u{3000}2", "\u{3000}3"] {
-        assert!(html.contains(marker), "缺批次子行 {marker}：\n{html}");
+    for no in [1, 2, 3] {
+        assert!(has_batch_cell(html, no), "缺批次子行 第{no}批：\n{html}");
     }
     // 位置全为空 ⇒ 4 个批次子行都是 `—`（无批次工单不产生子行）
     assert_eq!(
         html.matches(">—<").count(),
         4,
         "4 个无位置批次 ⇒ 4 处 `—`：\n{html}"
+    );
+
+    // ④ 散件工单的批次子行**序列号格恒空**（序列号已写在工单行上，子行不重复）。
+    let serials = batch_sub_row_serials(html);
+    assert_eq!(
+        serials.len(),
+        4,
+        "4 个批次子行一个不少（别让上面的空格子断言空转）：\n{html}"
+    );
+    for s in &serials {
+        assert!(
+            s.is_empty(),
+            "散件工单的批次子行序列号格必须留空（PART 支恒 None），实际渲染成「{s}」：\n{html}"
+        );
+    }
+    // ⑤ 反向钉住「取到了值」这件事本身成立：序列号确实派了、工单行上确实看得见
+    assert!(
+        html.contains("SN-A") && html.contains("SN-B"),
+        "工单行的序列号必须在（否则本用例的负向断言没有对照）：\n{html}"
     );
 }
 
@@ -218,10 +259,10 @@ async fn preview_attaches_child_batches_to_assembly_row() {
     assert_eq!(env["data"]["upcoming_count"], 1, "装配件只出一行：{env}");
     let html = env["data"]["html"].as_str().expect("html 是字符串");
     assert!(
-        html.contains("\u{3000}1"),
+        has_batch_cell(html, 1),
         "子件的批次没挂到装配件行下：\n{html}"
     );
-    assert!(html.contains("\u{3000}2"), "子件的第二个批次丢了：\n{html}");
+    assert!(has_batch_cell(html, 2), "子件的第二个批次丢了：\n{html}");
     assert!(
         !html.contains("CHILD-9"),
         "子件不得单独成行（工单级行单位）：\n{html}"
@@ -233,8 +274,9 @@ async fn preview_attaches_child_batches_to_assembly_row() {
 /// 一个装配件行下面挂着多个子件的批次，只看批次号分不清「这一批是哪个子件的」——
 /// 用户原话：「对于装配件要写出每个子零件的序列号，否则不知道哪个批次是哪个子零件的」。
 ///
-/// ⚠️ **返回顺序不可断言**：两个子件的批次**各自**从 `batch_no = 1` 起，而 SQL 只按
-/// `(owner_type, owner_id, batch_no)` 排、子件之间没有先后口径 ⇒ 断言按集合做。
+/// ⚠️ **返回顺序不承载语义**：两个子件的批次**各自**从 `batch_no = 1` 起，SQL 只能靠
+/// 末尾的 `id ASC` 让结果可复现，子件之间没有先后口径 ⇒ 断言按集合做（别断言「哪个子件
+/// 在前」）。
 #[tokio::test]
 async fn preview_shows_each_assembly_childs_serial_no_on_its_batch_row() {
     let ctx = crate::bootstrap().await;
@@ -402,7 +444,7 @@ async fn preview_soft_deleted_holder_degrades_to_dash() {
         "软删工人不该出现在邮件里：\n{html}"
     );
     assert!(
-        html.contains("\u{3000}1"),
+        has_batch_cell(html, 1),
         "批次行本身不能因 holder 软删而丢：\n{html}"
     );
 }
@@ -517,7 +559,7 @@ async fn preview_unknown_column_still_rejected_and_known_ones_render() {
     let (status, env) = preview(&ctx, json!({ "visible_columns": ["drawing_no"] })).await;
     assert_eq!(status, StatusCode::OK, "{env}");
     let html = env["data"]["html"].as_str().expect("html 是字符串");
-    assert!(!html.contains("\u{3000}1"), "批次列被勾掉后不应出现批次号");
+    assert!(!has_batch_cell(html, 1), "批次列被勾掉后不应出现批次号");
     assert!(!html.contains(">位置<"), "位置列被勾掉后不应出现表头");
 
     // ② 勾上 batch_no + location ⇒ 出现
@@ -528,10 +570,7 @@ async fn preview_unknown_column_still_rejected_and_known_ones_render() {
     .await;
     assert_eq!(status, StatusCode::OK, "{env}");
     let html = env["data"]["html"].as_str().expect("html 是字符串");
-    assert!(
-        html.contains("\u{3000}1") && html.contains(">位置<"),
-        "{html}"
-    );
+    assert!(has_batch_cell(html, 1) && html.contains(">位置<"), "{html}");
 
     // ③ 未知列仍 21704（不静默丢弃）
     let (status, env) = preview(
@@ -672,7 +711,8 @@ async fn mixed_delivered_and_open_batches_follow_the_opposite_two_rules() {
 
     let (status, env) = preview(
         &ctx,
-        // 加 `drawing_no` 才看得见是哪个工单行（`batch_only_body()` 只有批次四列）
+        // 加 `drawing_no` 才看得见是哪个工单行（`batch_only_body()` 只有批次侧几列：
+        // 序列号 / 批次 / 数量 / 状态 / 位置，没有图号）
         json!({ "visible_columns": ["drawing_no", "batch_no", "quantity", "status"] }),
     )
     .await;
@@ -688,7 +728,10 @@ async fn mixed_delivered_and_open_batches_follow_the_opposite_two_rules() {
     );
     assert!(html.contains("DWG-CANCELLED"), "缺工单行：\n{html}");
     // 两个批次都在（CANCELLED 不按状态过滤）
-    for marker in ["\u{3000}1", "\u{3000}2", "已取消", "生产中"] {
-        assert!(html.contains(marker), "缺 {marker}：\n{html}");
+    for no in [1, 2] {
+        assert!(has_batch_cell(html, no), "缺 第{no}批：\n{html}");
+    }
+    for want in ["已取消", "生产中"] {
+        assert!(html.contains(want), "缺 {want}：\n{html}");
     }
 }

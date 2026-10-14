@@ -175,7 +175,7 @@
 
 | 字段 | 类型 | 取值 / 来源 |
 |---|---|---|
-| `batch_no` | number | `t_part_batch.batch_no`（工单内序号，1 起）；渲染成**纯数字** + 全角空格缩进 |
+| `batch_no` | number | `t_part_batch.batch_no`（**该子件（`t_part`）内**序号，1 起 —— ⚠️ 一个装配件下多个子件**各自**从 1 起、跨子件**会撞号**，见 §4.4）；渲染成**纯数字** + 全角空格缩进 |
 | `part_serial_no` | string \| null | 批次所属**子件**的 `t_part.serial_no`，填在子行的「序列号」列上。⚠️ **两支取法不同**：`ASSEMBLY` 支取子件行 `c.serial_no`（可空）；`PART` 支恒 `None` —— 那一支的批次就是工单自己那个零件，序列号已写在工单行上，子行重复写是冗余（见 §4.4） |
 | `quantity` | number | `t_part_batch.quantity`（**件数**，不带「套」） |
 | `status` | string | `t_part_batch.status`（`PartStatus` 字面量）⇒ 渲染时查表转中文；`is_repairing = true` ⇒ 恒「返修中」 |
@@ -360,8 +360,16 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
   add_assembly_child_inner` 的 doc）⇒ 那一类子件的序列号格是空的，这是表结构事实、
   不是取数漏了。回归：`template.rs::tests::assembly_child_without_serial_no_leaves_cell_blank`
   与 `tests/mail_digest/batches.rs::preview_shows_each_assembly_childs_serial_no_on_its_batch_row`。
-- **批次格只写纯数字**（`1` / `2` / `3`，2026-10-16 起去掉「第…批」前缀），列首另加**一个
+- **批次格只写纯数字**（`1` / `2` / `3`，2026-10-16 起去掉「第…批」前缀），该格另加**一个
   全角空格**缩进 —— 与淡底一起承担「这是一行子行」的信号（打印丢色时缩进仍在）。
+  ⚠️ 带缩进的是**批次格**、不是子行的**首格**：`DEFAULT_SET` 的列序是
+  `serial_no, drawing_no, name, batch_no, …` ⇒ 批次格是**第 4 格**；而子行首格在勾了序列号
+  列时装配件子件序列号（散件恒空），离「这是一行子行」的视觉信号最远。
+  ⚠️ **去掉前缀之后，测试里不能再用 `html.contains("　1")` 判批次格在不在**：
+  `　1` 是 `　10` / `　11` 的**子串** ⇒ 批次数 ≥ 10 的场景下这类断言假绿（既有
+  `第1批` 没有这个歧义 —— 前缀里那个「第」帮它挡掉了）。断言一律用整格形态 `>　1<`
+  （`template.rs` 的 `has_batch_cell` / `lacks_batch_cell` 与
+  `tests/mail_digest/batches.rs` 的 `has_batch_cell` 三个 helper 同款）。
 - **一个批次都没有的工单不渲子行**（子行是「这个工单名下有批次」的证据，空子行是噪声）。
 - **行单位仍是工单级**：子行不计入 `overdue_count` / `upcoming_count`，也不参与任何
   统计（节的「N 条」是工单数）。
@@ -372,8 +380,17 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
   实际只对 `CANCELLED` 这类**非交割终态**批次有意义（照列）。
   ⚠️ **别把本条读成「已交的那几批也会跟在工单行下面列出来」—— 那个状态不可达**。
   回归：`tests/mail_digest/batches.rs::mixed_delivered_and_open_batches_follow_the_opposite_two_rules`。
-- **批次序**：`ORDER BY owner_type, owner_id, batch_no`，Rust 侧分组时按到达顺序
+- **批次序**：`ORDER BY owner_type, owner_id, batch_no, id`，Rust 侧分组时按到达顺序
   push，渲染层**不**二次排序（与工单行同一约定）。
+  ⚠️ **`batch_no` 是每个 `part_id` 各自从 1 起，不是「装配件内」的序号、也不是「这封信
+  里」的序号**（2026-10-16 登记）：唯一键是 `uq_t_part_batch_part_no (part_id, batch_no)`
+  （`part_id` = **子件**）、装配件建档时逐个子件各建一条 `batch_no = 1`
+  （`assembly::repo::create_initial_part_batch`）、拆批走
+  `SELECT COALESCE(MAX(batch_no),0)+1 … WHERE part_id = $1`（`prod::batch::repo::queries`）
+  ⇒ **一个装配件下 N 个子件各 1 批时，N 行都渲成 `　1`**。**子件之间没有先后口径**，
+  别把子行读成「同一个装配件的第 1/2/3 批」。末尾的 `id ASC` 只是让结果**可复现**
+  （同一份数据每次渲染同序），**不**构成子件间的语义顺序 —— 认哪个子件靠**序列号格**
+  （上一条），不靠行的先后。
 
 ### 4.5 位置列的口径（2026-10-16 新增）
 
@@ -421,7 +438,7 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
   丢弃，故所有有底色的单元格额外内联 `print-color-adjust:exact;
   -webkit-print-color-adjust:exact`（两个前缀都写：旧 WebKit 只认 `-webkit-`）。
 - **批次子行的区分不只靠颜色**：淡灰底（`bgcolor` 属性 + `background-color` 两处都写）
-  之外，还有**首格的全角空格缩进**（批次格只写纯数字）—— 打印时底色整片丢掉，子行与
+  之外，还有**批次格的全角空格缩进**（批次格只写纯数字）—— 打印时底色整片丢掉，子行与
   工单行仍分得开。
 - **不用 `float` / `position`**：两者在邮件与打印路径里都会产生不可预期的漂移。
 - 组标题行的 `colspan` 取**真实列数**（13 列全开时是 `colspan="13"`，不是 `"*"`）。
@@ -764,7 +781,12 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
     表结构事实。**刻意不回退到图号**：图号是「图号」列的内容，在序列号列重复它会让
     这一列的语义漂成「零件标识」。同时**散件工单的批次子行序列号格恒空**（那一列已在
     工单行上），也是刻意形态而非缺省遗漏。回归：
-    `template.rs::tests::assembly_child_without_serial_no_leaves_cell_blank`。
+    `template.rs::tests::assembly_child_without_serial_no_leaves_cell_blank` +
+    `tests/mail_digest/batches.rs::preview_renders_all_batches_of_every_order_row`
+    （⚠️ **散件那条必须在集成层守**：两条 lib 用例直接构造 `DigestBatchRow`、fixture
+    把 `part_serial_no` 硬编码成 `None`，与 SQL 无关；而集成用例里若 fixture 的序列号
+    本来就是 NULL，把 PART 支改回 `p.serial_no` 也照样渲出空格子、断言零信号 ⇒
+    fixture 必须派了序列号才有判别力）。
 
 **实现与注释/直觉不符的六处（测试已把实际行为钉死，改实现前先改文档或先改测试）：**
 **（2026-10-13 review 第 1 轮扩到五条：新增第 5 条是 M5「节开关不作用于正文」，

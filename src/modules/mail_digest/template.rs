@@ -490,10 +490,15 @@ fn data_row(row: &DigestRow, columns: &[VisibleColumn], today: NaiveDate) -> Str
 ///
 /// ## 视觉区分不只靠颜色
 ///
-/// 淡底 + `bgcolor` 属性（Outlook 只认属性）+ **首格缩进**（全角空格）。批次列只写
+/// 淡底 + `bgcolor` 属性（Outlook 只认属性）+ **批次格的全角空格缩进**。批次列只写
 /// **纯数字**（`1` / `2` / `3`，不加「第…批」前缀）—— 缩进与淡底一起承担「这是一行
 /// 子行」的信号：打印时底色可能整片丢掉，而全角空格在任何字体下都保留，子行与工单行
 /// 仍然分得开。
+///
+/// ⚠️ 带缩进的是**批次格**、不是子行的**首格**：`DEFAULT_SET` 的列序是
+/// `serial_no, drawing_no, name, batch_no, …`，批次格是**第 4 格**；而子行首格在勾了
+/// 序列号列时装配件子件序列号（散件恒空），离「这是一行子行」的视觉信号最远 ⇒
+/// **认子行靠的是批次格的缩进 + 淡底，不是首格**。
 fn batch_row(batch: &DigestBatchRow, columns: &[VisibleColumn]) -> String {
     let mut out = format!("<tr bgcolor=\"{COLOR_BATCH_BG}\">");
     for col in columns {
@@ -703,11 +708,32 @@ mod tests {
         r
     }
 
+    /// 批次子行的**批次格**是否恰好等于 `　{n}`（整格等值）。
+    ///
+    /// ⚠️ **不要写 `html.contains("\u{3000}1")`**（2026-10-16）：去掉「第…批」前缀之后
+    /// `　1` 是 `　10` / `　11` 的**子串** ⇒ 一个有 10 批的工单能让「批次列出现/消失」
+    /// 那类断言假绿（批次 10 一条就足以让 `contains("\u{3000}1")` 与
+    /// `!contains("\u{3000}1")` 同时给出错误答案）。`>\u{3000}1<` 带上两侧界 ⇒
+    /// `>　10<` 里不含 `>　1<`，恢复旧 marker `第1批` 不具备的前缀安全性。
+    fn has_batch_cell(html: &str, no: i32) -> bool {
+        html.contains(&format!(">\u{3000}{no}<"))
+    }
+
+    /// 子行上**不含**批次号 `no` 的整格（`has_batch_cell` 的否定形态，供「列被勾掉后不应
+    /// 出现批次号」这类断言用 —— 同样带界，避免 `　10` 顶掉 `　1` 的断言）。
+    fn lacks_batch_cell(html: &str, no: i32) -> bool {
+        !has_batch_cell(html, no)
+    }
+
     /// 取出某个 `<tr …>…</tr>` 块里各 `<td>` 的**纯文本**。
     ///
     /// 用于「子行只填 5 列、其余留空」这类结构性断言。单元格形如
     /// `<td style="…">TEXT</td>`，而样式串里没有 `>`（只有 `:` 与 `;`）⇒ 第一个
     /// `>` 之后到 `</td>` 之间就是文本。
+    ///
+    /// ⚠️ 形参 `marker` 是**子串**匹配（`html.find`），传批次号时**必须**用
+    /// [`has_batch_cell`] 那种带界的形态先确认该格真的存在，否则 `　1` 会先命中
+    /// `　10`、返回的是另一行的格子。
     fn row_cells(html: &str, marker: &str) -> Vec<String> {
         let start = html
             .find(marker)
@@ -1108,11 +1134,12 @@ mod tests {
                 .unwrap_or_else(|| panic!("正文里找不到 {needle}：\n{}", out.html))
         };
         // A 工单行 → A 的两个批次 → B 工单行 → B 的批次
-        // （批次格只写纯数字 + 全角缩进，故标记用 `\u{3000}1`）
+        // （批次格只写纯数字 + 全角缩进；标记带 `>` / `<` 两侧界，`　1` 才不会被
+        //  `　10` 顶掉 —— 见 `has_batch_cell` 的 doc）
         let (a, b1, b2, b) = (
             pos("DWG-A"),
-            pos("\u{3000}1"),
-            pos("\u{3000}2"),
+            pos(">\u{3000}1<"),
+            pos(">\u{3000}2<"),
             pos("DWG-B"),
         );
         assert!(
@@ -1139,7 +1166,7 @@ mod tests {
             vec![b],
         )];
         let out = render(&input(&cfg, &[], &rows));
-        let cells = row_cells(&out.html, "\u{3000}3");
+        let cells = row_cells(&out.html, ">\u{3000}3<");
         assert_eq!(
             cells.len(),
             cfg.visible_columns.len(),
@@ -1177,7 +1204,7 @@ mod tests {
             ],
         )];
         let out = render(&input(&cfg, &[], &rows));
-        let cells = row_cells(&out.html, "\u{3000}2");
+        let cells = row_cells(&out.html, ">\u{3000}2<");
         assert_eq!(cells, vec!["ASM-1-02", "\u{3000}2"], "{cells:?}");
     }
 
@@ -1201,8 +1228,8 @@ mod tests {
             vec![child_batch(1, None)],
         )];
         let out = render(&input(&cfg, &[], &rows));
-        // 工单行的图号 / 序列号有值，子行两格都空（`\u{3000}1` 定位子行）
-        let cells = row_cells(&out.html, "\u{3000}1");
+        // 工单行的图号 / 序列号有值，子行两格都空（`>\u{3000}1<` 定位子行）
+        let cells = row_cells(&out.html, ">\u{3000}1<");
         // 列序 = [序列号, 图号, 批次]：子行前两格都空（`CHILD-9` 只出现在工单行）
         assert_eq!(
             cells,
@@ -1217,8 +1244,8 @@ mod tests {
         let cfg = NormalizedConfig::default();
         let rows = vec![row("DWG-A", Some("2026-10-15"), false)];
         let out = render(&input(&cfg, &[], &rows));
-        assert!(!out.html.contains("\u{3000}1"));
-        assert!(!out.html.contains("\u{3000}0"));
+        assert!(lacks_batch_cell(&out.html, 1), "无子行时不得出现批次格");
+        assert!(lacks_batch_cell(&out.html, 0));
         // 行数与子行无关：仍是 1 行
         assert_eq!(out.upcoming_count, 1);
     }
@@ -1316,7 +1343,7 @@ mod tests {
             vec![batch(1, "COMPLETED")],
         )];
         let out = render(&input(&cfg, &[], &rows));
-        let cells = row_cells(&out.html, "\u{3000}1");
+        let cells = row_cells(&out.html, ">\u{3000}1<");
         assert!(cells.iter().any(|c| c == "—"), "{cells:?}");
         assert!(cells.iter().any(|c| c == "已完成"), "{cells:?}");
     }
@@ -1440,17 +1467,14 @@ mod tests {
             out.html.contains("bgcolor=\"#f7f8fa\""),
             "批次子行缺 bgcolor"
         );
-        // 子行不只靠颜色区分：首格缩进是第二重信号（批次格只写纯数字）
-        assert!(out.html.contains("\u{3000}1"), "批次单元格缺全角缩进");
+        // 子行不只靠颜色区分：批次格的全角缩进是第二重信号（批次格只写纯数字）
+        assert!(
+            has_batch_cell(&out.html, 1),
+            "批次格应是「全角缩进 + 纯数字」"
+        );
         assert!(
             !out.html.contains("第1批"),
             "批次格只写纯数字，不带「第…批」前缀"
-        );
-        assert!(
-            row_cells(&out.html, "\u{3000}1")
-                .iter()
-                .any(|c| c == "\u{3000}1"),
-            "批次格应是「全角缩进 + 纯数字」"
         );
     }
 
@@ -1470,7 +1494,7 @@ mod tests {
         assert!(out.html.contains("colspan=\"13\""), "{}", out.html);
         assert!(!out.html.contains("colspan=\"*\""));
         // 子行与工单行同为 13 列（fixed 布局下列宽必须齐）
-        assert_eq!(row_cells(&out.html, "\u{3000}1").len(), 13);
+        assert_eq!(row_cells(&out.html, ">\u{3000}1<").len(), 13);
     }
 
     /// 勾掉「批次」列后子行的批次号消失（列白名单逐列生效），其余列不受影响。
@@ -1493,7 +1517,7 @@ mod tests {
         )];
         let out = render(&input(&cfg, &[], &rows));
         assert!(
-            !out.html.contains("\u{3000}1"),
+            lacks_batch_cell(&out.html, 1),
             "批次列被勾掉后不应出现批次号"
         );
         assert!(out.html.contains("李四"), "位置列仍在：{}", out.html);

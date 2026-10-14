@@ -932,8 +932,12 @@ async fn fetch_rows(
         }
     }
 
-    // ⚠️ **不二次排序**：`list_batches` 的 SQL 已按 `(owner_type, owner_id, batch_no)`
-    // 排好，分组时按到达顺序 push 即保持顺序（与主查询「渲染层不二次排序」同一约定）。
+    // ⚠️ **不二次排序**：`list_batches` 的 SQL 已按
+    // `(owner_type, owner_id, batch_no, id)` 排好，分组时按到达顺序 push 即保持顺序
+    // （与主查询「渲染层不二次排序」同一约定）。⚠️ **`batch_no` 不是装配件内的序号** ——
+    // 它是**每个子件各自从 1 起**（见 `repo::DigestBatchRow::batch_no`）⇒ 一个装配件下
+    // 多个子件的批次同为 `batch_no = 1`，末尾的 `id ASC` 只让结果**可复现**，子件之间
+    // 没有先后语义。渲染层靠**子行的序列号格**认子件，不靠行的先后。
     //
     // `get(..).cloned()` 而不是 `remove(..)`：后者消费条目，同一个 key 第二次出现时
     // 拿不到批次（理由见本函数的 doc）。
