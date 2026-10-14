@@ -13,7 +13,6 @@
 > | `wecom` | **通道**（本文件） | `src/modules/wecom/` | `/api/v2/cron/wecom/*` |
 > | `wecom-daily` | **内容**（每日总结） | `src/modules/wecom_daily/` | `/api/v2/cron/wecom-daily/*` |
 >
-> ⚠️ **`wecom-daily` 那一行在本轮只是登记**（下一批落地）。
 > ⚠️ **菜单 path 不跟着 API 前缀变**：菜单 seed 的 `path='/wecom'` 与前端路由保持不变，
 > 变的只是后端 URL。
 >
@@ -277,7 +276,7 @@ SUCCESS、页面上「每日总结照常到达」，而群里什么都没有。
 | 每个消息推送 ≤ 20 条/分钟 | 官方限频 | 内容域：`t_wecom_daily_config.max_chunks`（范围 `1..=20`）**就是这条限频的上界** |
 | `markdown` 内容 ≤ 4096 字节（UTF-8） | 官方上限 | **内容域负责分片**（`sender` 不截断、不分片） |
 | `text` 内容 ≤ 2048 字节 | 官方上限 | 同上（探针文案固定一句话，远低于上限） |
-| 单次请求超时 5s | `sender::HTTP_TIMEOUT_MS` | ⚠️ **本轮是模块常量**（任务书禁止新增 env）；将来接 `WECOM_HTTP_TIMEOUT_MS` |
+| 单次请求超时 5s | `sender::HTTP_TIMEOUT_MS` | ⚠️ **刻意是模块常量、不走 `infra::config` 的 env**：已有的 `WECOM_HTTP_TIMEOUT_MS`（`infra::config::WeComConfig::http_timeout_ms`）是**小程序登录**那条链路的超时，同名不同物、互不共享 —— 挂到本域会让人以为改一个 env 能同时调两条链路 |
 
 ⚠️ **超限的表现是企业微信返 `errcode != 0`（`Failed`），不会静默截断** ⇒ 内容域必须在
 流水里看到它，而不是发出一条被腰斩的消息。

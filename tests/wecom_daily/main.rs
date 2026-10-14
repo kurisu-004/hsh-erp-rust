@@ -3,13 +3,16 @@
 //! 覆盖 `/api/v2/cron/wecom-daily` 的 5 个端点（6 条路由）的 HTTP 契约 + 统计 SQL
 //! 口径 + 分片与流水语义。
 //!
-//! ## 拆分映射（5 个 sub-file）
+//! ## 拆分映射（6 个 sub-file）
 //! - `config.rs`  —— 端点 1/2：读单例 + 全量覆写（422 / 40901 / 21804 / 21806）
 //! - `preview.rs` —— 端点 3：窗口半开含今天、节开关、分片、**绝不落流水**
 //! - `send.rs`    —— 端点 4：`/send` 的失败路径 + 「失败也落流水」不变量
 //! - `logs.rs`    —— 端点 5：分页 + 快照列
 //! - `n_plus_one_guard.rs` —— **源码级**护栏：`service::fetch_rows` 的循环体内禁
 //!   `repo::` 调用 + 顶层恰好 6 个调用点
+//! - `timeout_guard.rs` —— **跨域**纯函数护栏：`/send` 必须命中
+//!   `middleware::timeout::is_long_timeout_path` 长档（否则超时会把已推送的分片变成
+//!   「零流水」），`/preview` 必须不命中
 //!
 //! ## ⚠️ 覆盖空洞（2026-10-18 登记）
 //! **`/send` 的成功路径（`status='SUCCESS'` 的流水行）无集成测试**：测试环境没有
@@ -36,6 +39,7 @@ mod logs;
 mod n_plus_one_guard;
 mod preview;
 mod send;
+mod timeout_guard;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

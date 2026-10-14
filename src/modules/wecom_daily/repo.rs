@@ -552,12 +552,18 @@ pub async fn update_config(
 
 /// 落一行推送流水（**成败都落**，见 `t_wecom_daily_log` 的表注释）。
 ///
+/// ⚠️ `config_version` 是**形参**而不是 [`NewDailyLog`] 的字段：它是「落库这一刻」的
+/// 快照，必须由调用方**现读**（[`get_config`] → `.version`，表空 ⇒ `0`）。本仓 repo 的
+/// 约定是「一函数一条 SQL」，所以「读版本 + INSERT」由 service 层的
+/// `service::insert_log` 在**同一条连接**上合并成一次借还 —— 投递期间因此不必持有连接。
+///
 /// ⚠️ `error_message` 由调用方**截断到 500 字符**再传（列是 `varchar(500)`）：企业
 /// 微信的失败原因可能带整段 errmsg，很容易超长；让 PG 报错会把「推送失败」这件事
 /// 本身变成「落库也失败」，反而丢掉诊断信息。
 pub async fn insert_log(
     conn: &mut PgConnection,
     snowflake: &SnowflakeIdGenerator,
+    config_version: i32,
     log: &NewDailyLog,
 ) -> Result<TWeComDailyLogRow, sqlx::Error> {
     let id = snowflake.next_id();
@@ -578,7 +584,7 @@ pub async fn insert_log(
                   sent_at, created_at
         "#,
         id,
-        log.config_version,
+        config_version,
         log.trigger_source,
         log.webhook_name,
         log.webhook_masked,
@@ -633,10 +639,14 @@ pub async fn list_logs(
     Ok((items, total))
 }
 
-/// 写一行推送流水的入参（`id` / `created_at` 由 [`insert_log`] 生成）。
+/// 写一行推送流水的入参（`id` / `created_at` 由 [`insert_log`] 生成，`config_version`
+/// 是它的独立形参）。
+///
+/// ⚠️ **`config_version` 不在入参里**（是 [`insert_log`] 的独立形参）：它是「落库这一刻」
+/// 的版本快照，恒由调用方现读（见 `service::insert_log` —— 两个调用点都在那儿现读，
+/// 没有第三条路可以写进一个与库不符的值）。
 #[derive(Debug, Clone)]
 pub struct NewDailyLog {
-    pub config_version: i32,
     /// `SCHEDULED` / `MANUAL`。
     pub trigger_source: &'static str,
     /// webhook 名称快照。

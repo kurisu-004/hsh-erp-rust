@@ -67,10 +67,15 @@
 //!
 //! ## 超时
 //!
-//! [`HTTP_TIMEOUT_MS`] 是**本轮给的模块常量**：任务书明令本轮**不新增 env**、不改
-//! `src/infra/config.rs`。⚠️ 将来接线时把它换成 env `WECOM_HTTP_TIMEOUT_MS`（与
-//! `infra::config::WeComConfig::http_timeout_ms` 同名不同物 —— 那是小程序登录那条链路
-//! 的超时，两者互不共享）。
+//! [`HTTP_TIMEOUT_MS`] 是**模块常量**（5s），本域**刻意不走 `infra::config` 的 env**：
+//! `infra::config::WeComConfig::http_timeout_ms`（env `WECOM_HTTP_TIMEOUT_MS`）是**小程序
+//! 登录**那条链路的超时，**同名不同物**、两者互不共享 —— 把它们并成一个 env 会让人以为
+//! 改一个值能同时调两条毫不相干的链路。要接线时新增一个**本域专属**的 env，别复用那个名字。
+//!
+//! ⚠️ 改这个常量的连带影响：内容域 `wecom_daily` 的 `POST /cron/wecom-daily/send` 在
+//! **同一个请求内**串着做「取数 + 最多 `max_chunks`（上界 20）次顺序 HTTP」，本常数是它
+//! 最坏耗时的估算基（20 × 5s = 100s）；该路径已在
+//! `middleware::timeout::is_long_timeout_path` 的长档白名单里（660s），余量充足。
 
 use std::sync::OnceLock;
 use std::time::Duration;

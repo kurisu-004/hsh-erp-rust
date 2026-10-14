@@ -21,8 +21,9 @@
 > | `wecom` | **通道**（企业微信群机器人） | `src/modules/wecom/` | `/api/v2/cron/wecom/*` |
 > | `wecom-daily` | **内容**（每日总结推送） | `src/modules/wecom_daily/` | `/api/v2/cron/wecom-daily/*` |
 >
-> ⚠️ **`wecom` / `wecom-daily` 两行在本轮只是登记**（2026-10-18 建表 + 开错误码段，
-> 模块代码随下一批落地）；本文件描述的 6 条端点表逐字有效。
+> ⚠️ **`wecom` / `wecom-daily` 两域已落地**（2026-10-18 同批：建表 + 开 `218xx` 错误码段
+> + 模块代码），契约分别见 [`wecom.md`](wecom.md) / [`wecom-daily.md`](wecom-daily.md)；
+> 本文件描述的 6 条端点表逐字有效。
 >
 > ⚠️ **菜单 path 不跟着 API 前缀变**：菜单 seed 的 `path='/mail'`（本域与 `mail` 域
 > 共用同一个二级菜单）与前端路由 `path: 'mail'` **保持不变**，变的只是后端 URL。

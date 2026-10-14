@@ -1,10 +1,27 @@
 //! wecom_daily 域 service 层：校验 / OCC / 取数编排 / 发送编排
 //!
 //! ## 事务边界（CLAUDE.md §1）
-//! 全部在 handler：`pool.acquire()` → service 借 `&mut *conn` → drop conn。
 //! 本域**不开显式事务**：一次请求要么只读、要么只做单行 UPDATE/INSERT，每条语句
 //! 自身原子。开事务反而会让「INSERT 流水失败 → 整笔回滚 → 发送结果也丢了」这种
 //! 场景无法发生。
+//!
+//! ## ⚠️ 连接纪律：**投递期间绝不持有连接**（2026-10-19）
+//!
+//! 读 / 配置端点的连接照旧在 handler 借（`pool.acquire()` → 借 `&mut *conn` → 用完
+//! 还），但**推送路径（`send_manual` / `send_scheduled` → `deliver`）自己借、且每段
+//! 用完即还**，全段只在三个点借连接：
+//!
+//! ```text
+//! 借 1/3 → resolve_target（查 + 解密）→ 还
+//! 借 2/3 → fetch_rows（恒 ≤ 6 条 SQL）→ 还
+//! ────── 逐片顺序发送（≈ max_chunks × 5s 的**纯网络等待**，零 DB IO）──────
+//! 借 3/3 → cfg_version 快照 + insert_log（合并成**一次**借还）→ 还
+//! ```
+//!
+//! 为什么：**投递期间握着一条 `PoolConnection` 等 ≈100s 的网络**，`/send` 又**无频控**
+//! ⇒ 几个管理员同时点就把连接池占满，**读端点跟着排队**（一条只查配置单例的
+//! `GET /config` 排在后面拿不到连接，现场看是「整个域卡住」）。`/preview` 不受
+//! 影响（只渲染不投递）。
 //!
 //! ## 域外依赖：**1 个模块**（`wecom`，通道域）
 //!
@@ -627,13 +644,18 @@ pub async fn preview(
 }
 
 /// `POST /send`：手动触发（渲染 + 真发 + 落流水）。
+///
+/// ⚠️ 合并配置的连接**用完即还**（作用域块），`deliver` 内部自己按「借 3 次」的
+/// 纪律借连接 —— 全程没有任何一段持有连接跨越网络等待（见模块 doc「连接纪律」）。
 pub async fn send_manual(
     state: &Arc<AppState>,
     req: &PreviewRequest,
 ) -> Result<SendResultOut, AppError> {
-    let mut conn = state.pool.acquire().await?;
-    let cfg = effective_config(&mut conn, req).await?;
-    deliver(state, &mut conn, &cfg, TriggerSource::Manual).await
+    let cfg = {
+        let mut conn = state.pool.acquire().await?;
+        effective_config(&mut conn, req).await?
+    };
+    deliver(state, &cfg, TriggerSource::Manual).await
 }
 
 /// cron 定时触发（`task::wecom_daily` 调用）。
@@ -651,31 +673,49 @@ pub async fn send_manual(
 ///
 /// 唯一落不了的失败是 `pool.acquire()` 本身 —— 没有连接就没有地方写。见
 /// [`log_prepare_failure`]。
+///
+/// ⚠️ **每个准备段各自借一次连接、用完即还**（块作用域）；失败分支里的
+/// [`log_prepare_failure`] 也**自己借**一条 —— 必须先还再借，否则池被本任务自己占满时
+/// 落流水会二次 `acquire` 失败（读端点随即排队）。
 pub async fn send_scheduled(state: &Arc<AppState>) {
-    let mut conn = match state.pool.acquire().await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(error = %e, "wecom_daily: 定时日报取连接失败（无连接可落流水）");
-            return;
-        }
+    // ── 准备段 1/2：读配置并规范化 ──
+    let normalized = {
+        let mut conn = match state.pool.acquire().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "wecom_daily: 定时日报取连接失败（无连接可落流水）");
+                return;
+            }
+        };
+        current_normalized(&mut conn).await
     };
-
-    let cfg = match current_normalized(&mut conn).await {
+    let cfg = match normalized {
         Ok(c) => c,
         Err(e) => {
-            log_prepare_failure(state, &mut conn, None, &e).await;
+            log_prepare_failure(state, &e).await;
             tracing::warn!(error = %e, "wecom_daily: 定时日报准备失败（读配置/解析），流水已落库");
             return;
         }
     };
 
-    if let Err(e) = wecom_service::resolve_target(&mut conn, cfg.webhook_id).await {
-        log_prepare_failure(state, &mut conn, Some(&cfg), &e).await;
+    // ── 准备段 2/2：通道是否可用（与推送路径同一条 `resolve_target`，故判据一致）──
+    let target_check = {
+        let mut conn = match state.pool.acquire().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "wecom_daily: 定时日报取连接失败（无连接可落流水）");
+                return;
+            }
+        };
+        wecom_service::resolve_target(&mut conn, cfg.webhook_id).await
+    };
+    if let Err(e) = target_check {
+        log_prepare_failure(state, &e).await;
         tracing::warn!(error = %e, "wecom_daily: 定时日报准备失败（推送通道不可用），流水已落库");
         return;
     }
 
-    match deliver(state, &mut conn, &cfg, TriggerSource::Scheduled).await {
+    match deliver(state, &cfg, TriggerSource::Scheduled).await {
         Ok(out) => {
             tracing::info!(
                 log_id = out.log_id,
@@ -691,33 +731,39 @@ pub async fn send_scheduled(state: &Arc<AppState>) {
 
 /// 「准备阶段」失败的流水：**没有**渲染产物（压根没分片）。
 ///
-/// `cfg` 传 `None` 表示连配置都没解析出来（脏 `frequency` / `worker_metric`）——
-/// 此时尽力从**原始行**捞版本号，捞不到就记 0：流水表的这几列是**快照**（配置改了
-/// 之后仍要看「当时用的是哪版配置」），拿不到时留空比编一个更诚实。
+/// ⚠️ **入参刻意只有 `err`**（2026-10-19 删掉了原先的 `cfg: Option<&NormalizedConfig>`）：
+/// 那份配置只被调用方拿去做 warn 文案区分（`config_version` 其实是本函数自己从**原始行**
+/// 现捞的，压根不用它），落库的形态两种失败**完全一样**（内容全 0 + 通道名/掩码空串）⇒
+/// 形参是纯噪音，留着只会让人以为「落库形态依赖 cfg」。两种失败的区分由**调用方的
+/// `warn!` 文案**承担（「读配置/解析」vs「推送通道不可用」）。
+///
+/// `config_version` 尽力从**原始行**捞（表空 / 读取失败 ⇒ 记 0）：流水表的这几列是
+/// **快照**（配置改了之后仍要看「当时用的是哪版配置」），拿不到时留 0 比编一个更诚实。
+///
+/// ⚠️ **自己借连接**（不接 `&mut PgConnection`）：调用方已经把连接还回池里了，
+/// 带着形参会逼它在「准备失败 → 要落流水」这条路径上继续占着一条连接。
 ///
 /// ⚠️ 本函数**永不**向上返回错误：它存在的意义是「失败也要留下痕迹」，若它自己失败
-/// 就静默 `warn!`（调用方随后仍会 `warn!` 原始原因，两条日志互补）。
-async fn log_prepare_failure(
-    state: &Arc<AppState>,
-    conn: &mut PgConnection,
-    cfg: Option<&NormalizedConfig>,
-    err: &AppError,
-) {
-    // `cfg` 只用来区分「配置都读不出来」与「读出来了但通道不可用」两种准备阶段失败 ——
-    // 两者落库的形态一样（内容全 0），差异只在这一行 warn 文案上。
-    let _ = cfg;
-    let config_version = cfg_version_of(conn).await.unwrap_or(0);
-    let inserted = repo::insert_log(
-        conn,
-        &state.snowflake,
-        &NewDailyLog {
-            config_version,
+/// （**包括 `acquire` 本身失败**）就静默 `warn!`（调用方随后仍会 `warn!` 原始原因，两条
+/// 日志互补）。
+async fn log_prepare_failure(state: &Arc<AppState>, err: &AppError) {
+    let mut conn = match state.pool.acquire().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "wecom_daily: 准备阶段失败流水取连接失败（无连接可落流水）");
+            return;
+        }
+    };
+    let now = now_ts();
+    let inserted = insert_log(
+        state,
+        &mut conn,
+        NewDailyLog {
             trigger_source: TriggerSource::Scheduled.as_str(),
             // 通道都没解析出来 ⇒ 名称与掩码只能是空串（列是 NOT NULL）。留空而不是
             // 编一个：那两列是「发到哪个群」的快照，编出来的比没有更会误导排障。
             webhook_name: String::new(),
             webhook_masked: String::new(),
-            report_date: now_ts().date(),
             markdown_bytes: 0,
             chunk_count: 0,
             chunk_sent: 0,
@@ -730,9 +776,11 @@ async fn log_prepare_failure(
             worker_row_total: 0,
             status: SendStatus::Failed.as_str(),
             error_message: Some(truncate_chars(&err.to_string(), 500)),
-            // ⚠️ `report_date` 由 `sent_at.date()` 派生 ⇒ 「统计日恒等于发送时刻的
-            // 日期」这条前端依赖的不变量在流水侧也成立。
-            sent_at: now_ts(),
+            // ⚠️ `report_date` 与 `sent_at` **取自同一次 `now_ts()`**：两次独立取时钟
+            // 会跨零点产出 `report_date != sent_at.date()` 的行，直接违反 `repo.rs`
+            // 写死的那条不变量（前端「不建统计日列」的前提）。
+            report_date: now.date(),
+            sent_at: now,
         },
     )
     .await;
@@ -803,6 +851,24 @@ async fn fetch_rows(
     Ok(rows)
 }
 
+/// 落一行流水（**版本号快照与 INSERT 合并在同一次借还里**，见模块 doc「连接纪律」）。
+///
+/// `config_version` 在此**现读**（`repo::get_config` → `.version`，表空 ⇒ `0`）：
+/// 它是「落库这一刻」的快照，配置在推送途中被别人改过时流水要记**新**值。本函数是
+/// **唯一**给 `repo::insert_log` 传版本号的入口 ⇒ 不存在「调用方塞了个陈旧版本」的路径。
+///
+/// ⚠️ 返回 [`AppError`]（而不是 `sqlx::Error`）：`deliver` 与 `log_prepare_failure` 都是
+/// `Result<_, AppError>`，且落流水失败必须**原样**冒泡（`deliver` 里这行就是「推送失败后
+/// 唯一的诊断信息载体」，静默吞掉等于把 `21802` 换成一个没人看的结果）。
+async fn insert_log(
+    state: &Arc<AppState>,
+    conn: &mut PgConnection,
+    log: NewDailyLog,
+) -> Result<TWeComDailyLogRow, AppError> {
+    let config_version = cfg_version_of(conn).await?;
+    Ok(repo::insert_log(conn, &state.snowflake, config_version, &log).await?)
+}
+
 /// 读当前配置行版本（流水快照用；表空时记 `0`）。
 async fn cfg_version_of(conn: &mut PgConnection) -> Result<i32, AppError> {
     Ok(repo::get_config(conn)
@@ -834,19 +900,33 @@ pub fn status_for(chunk_count: i32, chunk_sent: i32) -> SendStatus {
 ///
 /// 企业微信**没有批量接口**（一次只能推一条），而群里必须先出现 `1/N` 再出现 `2/N`
 /// ⇒ 顺序发。**不重发**已成功的片：重发会在群里出现重复内容，比缺一半更糟。
+///
+/// ## ⚠️ **连接纪律**：只在三处借、用完即还
+///
+/// 本函数**不再接收 `&mut PgConnection`**（2026-10-19）：投递期间握着连接等 ≈100s 的
+/// 网络会把连接池占满、读端点跟着排队（`/send` 无频控 ⇒ 几个管理员同时点就成立）。
+/// 连接纪律见模块 doc，落在下面三段块作用域里：
+/// ① 解析通道 ② 取数 ③ 落流水 —— **③ 之后的逐片发送全程零 DB IO、零连接**。
 async fn deliver(
     state: &Arc<AppState>,
-    conn: &mut PgConnection,
     cfg: &NormalizedConfig,
     source: TriggerSource,
 ) -> Result<SendResultOut, AppError> {
     // 通道解析排在节开关检查**之前**（更基础的失败先报，见模块 doc）。
-    let target = wecom_service::resolve_target(conn, cfg.webhook_id).await?;
+    // 借还 1/3：`ResolvedTarget` 的四个字段全是 `String`/`i64`，还连接之后照样能读。
+    let target = {
+        let mut conn = state.pool.acquire().await?;
+        wecom_service::resolve_target(&mut conn, cfg.webhook_id).await?
+    };
     validate_sections(cfg)?;
 
     let now = now_ts();
     let today = now.date();
-    let rows = fetch_rows(conn, cfg, today).await?;
+    // 借还 2/3：恒 ≤ 6 条 SQL（关掉的节一条都不发，见 `fetch_rows`）。
+    let rows = {
+        let mut conn = state.pool.acquire().await?;
+        fetch_rows(&mut conn, cfg, today).await?
+    };
     let rendered = template::render(&RenderInput {
         cfg,
         rows: &rows,
@@ -857,6 +937,7 @@ async fn deliver(
     let chunks = rendered.chunks;
     let markdown_bytes = chunks.iter().map(|c| c.len() as i32).sum::<i32>();
 
+    // ── 纯网络等待段（≈ max_chunks × 5s）：**不持有任何连接** ──
     let mut chunk_sent = 0i32;
     let mut failure: Option<(usize, String)> = None;
     for (idx, chunk) in chunks.iter().enumerate() {
@@ -874,12 +955,12 @@ async fn deliver(
         .as_ref()
         .map(|(i, msg)| truncate_chars(&format!("第 {i}/{} 条失败：{msg}", chunks.len()), 500));
 
-    let config_version = cfg_version_of(conn).await?;
-    let log = repo::insert_log(
-        conn,
-        &state.snowflake,
-        &NewDailyLog {
-            config_version,
+    // 借还 3/3：版本号快照 + INSERT（`insert_log` 内部合并成一次借还）。
+    let mut conn = state.pool.acquire().await?;
+    let log = insert_log(
+        state,
+        &mut conn,
+        NewDailyLog {
             trigger_source: source.as_str(),
             webhook_name: target.name.clone(),
             webhook_masked: target.masked.clone(),
@@ -896,10 +977,14 @@ async fn deliver(
             worker_row_total: rendered.worker_row_total,
             status: status.as_str(),
             error_message,
+            // ⚠️ `report_date` 与 `sent_at` 取自**同一次** `now_ts()` 调用（`today`
+            // 就是 `now.date()`）⇒ 「统计日恒等于发送时刻的日期」这条前端依赖的
+            // 不变量成立，见 `repo::NewDailyLog::sent_at`。
             sent_at: now,
         },
     )
     .await?;
+    drop(conn);
 
     // 只打名称与掩码，明文 URL 一个字都不进日志（见模块 doc「日志纪律」）。
     tracing::info!(
@@ -925,11 +1010,18 @@ async fn deliver(
 
 /// 按**字符**截断（不是字节）—— 字节截断可能把一个多字节汉字劈成非法 UTF-8，
 /// 那是 PG 层的编码错误，比超长更难查。
+///
+/// ⚠️ **`max` 是含省略号的**总长上限：`take(max)` 之后再 `push('…')` 会产出
+/// `max + 1` 个字符，而两个调用点的 `max` 都是列宽 `varchar(500)` ⇒ 那会撞 PG
+/// `22001`（value too long），把本该报 `21802` / 其它码的失败换成一条
+/// `50001 DATABASE` 并**丢掉整行流水**（正是 `repo.rs` 那条「`error_message`
+/// 必须截到列宽内」的警告形态）。所以先给省略号**留一位**：
+/// `take(max - 1)` + `push('…')` = 恰好 `max` 字。
 fn truncate_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
-    let mut out: String = s.chars().take(max).collect();
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
     out.push('…');
     out
 }
@@ -1231,8 +1323,42 @@ mod tests {
         assert_eq!(truncate_chars("abc", 5), "abc");
         let long = "汉".repeat(600);
         let t = truncate_chars(&long, 500);
-        assert!(t.chars().count() <= 501, "截断后不应超 500 字 + 省略号");
+        assert!(
+            t.chars().count() <= 500,
+            "截断后总长不得超过 max（含省略号）"
+        );
         assert!(t.ends_with('…'));
         assert!(std::str::from_utf8(t.as_bytes()).is_ok());
+    }
+
+    /// ★ 守卫：`truncate_chars` 的**输出长度恒 ≤ `max`**（含省略号）—— 这一条钉的是
+    /// `error_message` 的列宽 `varchar(500)`。
+    ///
+    /// ⚠️ **变异验证**：`take(max)` + `push('…')`（2026-10-19 修掉的那个形态）产出
+    /// **501** 字 ⇒ PG `22001` ⇒ `repo::insert_log` 失败会把本该报的 `21802` 换成一条
+    /// `50001 DATABASE`，**并且整行审计流水丢失**（正是 `repo.rs` 那条「`error_message`
+    /// 必须截到列宽内」的警告形态）。把实现改回 `take(max)` 本用例立刻红。
+    #[test]
+    fn truncate_chars_never_exceeds_max_including_the_ellipsis() {
+        for max in [1usize, 2, 10, 499, 500] {
+            for len in [0usize, max - 1, max, max + 1, 600] {
+                let src = "汉".repeat(len);
+                let out = truncate_chars(&src, max);
+                assert!(
+                    out.chars().count() <= max,
+                    "len={len} max={max} 时输出 {} 字，超了上限：{out:?}",
+                    out.chars().count()
+                );
+                // 超长时必须有省略号，且总长**正好**等于 max（给省略号留了一位）。
+                if len > max {
+                    assert_eq!(out.chars().count(), max, "len={len} max={max}");
+                    assert!(out.ends_with('…'), "len={len} max={max}：{out:?}");
+                }
+            }
+        }
+        // **真实调用点**的上限（`error_message` 列宽 `varchar(500)`）逐字钉住。
+        let msg = format!("第 {}/{} 条失败：{}", 20, 20, "错因".repeat(400));
+        let out = truncate_chars(&msg, 500);
+        assert_eq!(out.chars().count(), 500, "必须恰好占满列宽而不是溢出 501");
     }
 }

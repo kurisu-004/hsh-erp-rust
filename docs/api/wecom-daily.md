@@ -472,11 +472,17 @@ upcoming_days`，clamp 1..60）。**窗口是半开的，「N 日内交期」含
 ### 8.3 已知偏差登记
 
 1. **迁移的 `worker_metric` 列注释写的是 `QUANTITY / HOURS`，本域实现的是
-   `QUANTITY / BATCH`**。迁移是 append-only、**不得改写**，而取值域的真源是 Rust 侧
-   `dto::WorkerMetric`（无 DB ENUM，未知值在**写侧**就被 `21804` 拒）⇒ 代码侧逐字生效，
-   **迁移注释那一行是过时的**。为什么不是 `HOURS`：本域的口径里**没有工时**（有效工时
-   要经工序链上配的 `estimated_minutes`，跨域且跨工序链配置率，而日报要的是一个当场可算、
-   与第一节可对账的量）。
+   `QUANTITY / BATCH`**。取值域的真源是 Rust 侧 `dto::WorkerMetric`（无 DB ENUM，未知值
+   在**写侧**就被 `21804` 拒）⇒ 代码侧逐字生效，**迁移注释那一行是过时的**。
+   为什么不是 `HOURS`：本域的口径里**没有工时**（有效工时要经工序链上配的
+   `estimated_minutes`，跨域且跨工序链配置率，而日报要的是一个当场可算、与第一节可对账
+   的量）。
+   ⚠️ **为什么不去改那一行注释**（不是「规矩不许改」这种形式主义理由）：迁移是
+   append-only，**改一个字都会让已 apply 过该迁移的库 checksum 失配** ⇒
+   `sqlx migrate run` 直接失败、**进程起不来**。代价（一次不可逆的启动失败）与收益
+   （一行过时注释）完全不成比例，所以偏差如实登记在**四处**（本条 / `dto.rs` 文件头 +
+   `model.rs` 字段 doc / `CLAUDE.md`），而**真源只有一处**：`dto::WorkerMetric` +
+   写侧 `21804` 拒未知值。
 2. **前端 `DEFAULT_WECOM_DAILY_*` 兜底常量与后端 `GET /meta` 的 label 措辞不同**
    （「按件数」vs「送件数」、「每周（指定星期几）」vs「每周」）。真源是 meta，前端那份
    只在 meta 在飞时用 ⇒ 不是契约冲突，但**看到两者不一致不要以为哪个错了**。
@@ -511,6 +517,13 @@ upcoming_days`，clamp 1..60）。**窗口是半开的，「N 日内交期」含
    替代覆盖：`/preview` 覆盖渲染与分片（含多片、字节预算、页码后缀）、「指向不可达 key」
    路径覆盖落流水与部分失败、`wecom::sender::classify` 的 lib 单测覆盖 errcode 解析。
    要补它需要一个**真实群机器人地址**作为测试夹具。
-10. **`docs/api/wecom.md` 里「`wecom-daily` 那一行在本轮只是登记（下一批落地）」这句已
-    过期**（本域已落地）。该文件属于**通道域**的文档、不在本轮授权修改范围内，故原样
-    留着 —— 读到那句话时请以本文件为准。
+10. **⚠️ 请求超时优先于落流水**：`timeout_middleware` 是 `tokio::time::timeout` ——
+    到点把 handler 的 future **整个 drop 掉**，所以「请求级超时」永远**优先于**
+    「落流水」。`POST /cron/wecom-daily/send` 最坏 ≈ 100s（`max_chunks` 上界 20 ×
+    单片 5s），为此本域已把 `/send` 放进
+    `middleware::timeout::is_long_timeout_path` 的**长档白名单**（660s，与批量打印共用
+    一档）⇒ **正常路径下「失败也落流水」成立**。⚠️ 但**已知残留缺口**：整链超出该档时
+    （数据库本身不可用、上游网关比 660s 更早切断连接），那一行流水**仍然写不出来**，
+    `GET /logs` 里查不到痕迹。这不是「已完全解决」，是「把触发概率压到可忽略」的处置；
+    要彻底消除它得改成分片投递与流水落库**解耦**（后台任务补写流水），那是独立重构。
+    护栏：`tests/wecom_daily/timeout_guard.rs` + `middleware::timeout` 的 lib 单测。

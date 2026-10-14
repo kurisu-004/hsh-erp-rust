@@ -188,7 +188,6 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // 前缀仍刻意是 kebab-case 单段词（`mail-digest`），只多了一个 `/cron` 父段。
         // 完整契约见 `docs/api/mail_digest.md`。
         .nest("/cron/mail-digest", mail_digest::router())
-        // 2026-10-19 新增：serial 域（终态工单序列号一键释放）。1 端点
         // ⚠️ 2026-10-18 URL 硬切：`/api/v2/mail/*` → `/api/v2/cron/mail/*`
         // （**旧路径 404，无 alias**）。6 端点全部 Manager 独占，角色守卫写在各 handler
         // 第一行（`require_role(Role::Manager)`），此处不挂 role layer。

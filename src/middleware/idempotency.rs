@@ -284,7 +284,7 @@ pub async fn idempotency_middleware(
         return next.run(req).await;
     }
 
-    // 1.6) 2026-10-03 新增：打印路径闸门 —— 打印响应**直接 pass-through，不缓存**。
+    // 1.6) 2026-10-03 新增：**长耗时路径**闸门 —— 打印响应**直接 pass-through，不缓存**。
     // 防御目标：本中间件会把下游响应**整份 body 缓冲进内存并写进 Redis 24h**。
     // 前端打印请求（送货单 print / print-labels、零件 print-drawing /
     // print-drawing-batch）正常不带 Idempotency-Key，所以线上无感；但只要有人
@@ -294,7 +294,14 @@ pub async fn idempotency_middleware(
     // 同一份 key 命中另一台机器的渲染结果反而可能是过期的。
     // 本闸门与 route_layer 顺序（auth 在外层 = 先跑）同样构成双保险：即便
     // 顺序错位也不缓存打印响应。
-    if crate::middleware::timeout::is_print_path(req.uri().path()) {
+    //
+    // ⚠️ 2026-10-19：闸门与 `timeout` 的长档白名单**同源**（同一个
+    // `is_long_timeout_path`），白名单从「2 条打印路径」扩到「3 条」之后，本闸门
+    // 也一并覆盖 `POST /cron/wecom-daily/send`。这与「长耗时路径的响应体不该被整份
+    // 缓冲进缓存」的口径一致，代价是该端点**不再享有幂等缓存**（带同一
+    // `Idempotency-Key` 的重试会真发一次）。该端点本就没有任何客户端带 key，且它
+    // 自身的「失败也不重发已成功的片」在**单次调用内部**生效，与本层无关。
+    if crate::middleware::timeout::is_long_timeout_path(req.uri().path()) {
         return next.run(req).await;
     }
 
@@ -492,20 +499,22 @@ where
 mod tests {
     use super::*;
 
-    /// 2026-10-03 新增：打印路径跳过闸门与**已注册路由**逐字对齐。
+    /// 2026-10-19 更新：长耗时路径跳过闸门与**已注册路由**逐字对齐。
     ///
     /// 这条测试钉的是「改了一边忘了另一边」这个失效模式：若有人把
-    /// `print-drawing` 改名而没同步 [`crate::middleware::timeout::is_print_path`]，
+    /// `print-drawing` 改名而没同步 [`crate::middleware::timeout::is_long_timeout_path`]，
     /// 后果是双向的 —— 该端点既拿不到长档超时（批量打印被 30s 砍断），
     /// 打印响应又会重新落进 Redis 缓存。两者都不可接受。
     ///
-    /// 断言方向：中间件只对 `is_print_path` 判定为真的路径跳过缓存，所以这里
-    /// 反过来断言「全部已注册打印路由的两种路径形态（带 /api/v2 前缀的生产形态
+    /// 断言方向：中间件只对 `is_long_timeout_path` 判定为真的路径跳过缓存，所以这里
+    /// 反过来断言「全部已注册长耗时路由的两种路径形态（带 /api/v2 前缀的生产形态
     /// + 测试直挂 v2_router 的裸路径形态）都必须命中该判定」。
     ///
-    /// 2026-10-08：送货单的两条打印路由随打印链路下线从 `is_print_path` 移除，
-    /// 本表同步收窄到 parts 的 2 条（与 `middleware::timeout::is_print_path`
+    /// 2026-10-08：送货单的两条打印路由随打印链路下线从 `is_long_timeout_path` 移除，
+    /// 本表同步收窄到 parts 的 2 条（与 `middleware::timeout::is_long_timeout_path`
     /// 的判定表严格同源 —— 本测试守的就是「跳过缓存的闸门不被悄悄关掉」）。
+    /// 2026-10-19：企业微信日报的 `POST /cron/wecom-daily/send` 进长档白名单，
+    /// 本表同步加上（闸门与超时档位**必须同源**，否则两边对同一条路由的判断会分叉）。
     #[test]
     fn print_gate_covers_every_registered_print_route() {
         for p in [
@@ -513,10 +522,12 @@ mod tests {
             "/api/v2/parts/print-drawing-batch",
             "/parts/1234567890/print-drawing",
             "/parts/print-drawing-batch",
+            "/api/v2/cron/wecom-daily/send",
+            "/cron/wecom-daily/send",
         ] {
             assert!(
-                crate::middleware::timeout::is_print_path(p),
-                "打印路径应命中跳过闸门（否则多 MB 的 PDF/XLSX 会被整份塞进 Redis）：{p}"
+                crate::middleware::timeout::is_long_timeout_path(p),
+                "长耗时路径应命中跳过闸门（否则多 MB 的 PDF/XLSX 会被整份塞进 Redis）：{p}"
             );
         }
     }
@@ -529,13 +540,15 @@ mod tests {
             "/api/v2/parts",
             "/api/v2/parts/1234567890/update",
             "/api/v2/com/delivery/note/1234567890/submit",
-            // 名字相近但不是打印的路径：既不命中 is_print_path，也不该被跳过缓存
+            // 名字相近但不是打印的路径：既不命中 is_long_timeout_path，也不该被跳过缓存
             "/api/v2/com/delivery/note/1234567890/print-preview",
             "/api/v2/parts/1234567890/print-drawing-batch",
+            // 同域但只渲染、不投递 ⇒ 不在长档白名单 ⇒ 幂等缓存对它照常生效
+            "/api/v2/cron/wecom-daily/preview",
         ] {
             assert!(
-                !crate::middleware::timeout::is_print_path(p),
-                "非打印路径不该命中跳过闸门（否则幂等能力被静默关掉）：{p}"
+                !crate::middleware::timeout::is_long_timeout_path(p),
+                "非长耗时路径不该命中跳过闸门（否则幂等能力被静默关掉）：{p}"
             );
         }
     }

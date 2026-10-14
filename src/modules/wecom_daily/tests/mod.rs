@@ -18,7 +18,7 @@
 //! **这个切分的必然结果**（与 `mail_digest → scheduled_task` 同款），不是「图省事
 //! import 了别人的 service」。本域的统计 SQL 完全写在本域内、**零他域符号引用**。
 
-use super::dto::{Frequency, TriggerSource, WorkerMetric};
+use super::dto::{Frequency, SendStatus, TriggerSource, WorkerMetric};
 
 /// 四个频率字面量与「哪些频率要哪些配套字段」三组判据。
 #[test]
@@ -94,7 +94,11 @@ fn trigger_source_and_send_status_parse() {
         "SCHEDULED".parse::<TriggerSource>().unwrap(),
         TriggerSource::Scheduled
     );
-    assert_eq!("AUTO".parse::<TriggerSource>().unwrap_err().code(), 21802);
+    // ⚠️ 脏值回 `code::INTERNAL`（50000，系统层）**而不是 21802「投递失败」**：这两个是
+    // 读侧枚举（从库里反解一行流水），解析失败 = 库里有脏值，与这一次投递无关。理由见
+    // `dto.rs` 的「触发来源 / 发送结果」段。
+    assert_eq!("AUTO".parse::<TriggerSource>().unwrap_err().code(), 50000);
+    assert_eq!("DONE".parse::<SendStatus>().unwrap_err().code(), 50000);
 }
 
 /// 缺省配置：`webhook_id` 恒 `None`（**没有**回落到 `is_default` 的分支）、

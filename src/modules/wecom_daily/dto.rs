@@ -232,6 +232,21 @@ impl Serialize for WorkerMetric {
 // ============================================================================
 // 触发来源 / 发送结果
 // ============================================================================
+//
+// ## ⚠️ 这两个枚举的 `FromStr` 失败**回 `code::INTERNAL`（50000），不是 `21802`**
+//
+// 这两个是**读侧**枚举（从 `t_wecom_daily_log` 的一行反解），解析失败意味着**库里那行有
+// 脏值** —— 那是数据完整性问题（别的进程 / 手改 SQL / 一次没配好的迁移），与「这一次的
+// 推送失不成功」毫无关系。返回 `BIZ_WECOM_SEND_FAILED`（21802 / HTTP 502「投递失败」）
+// 会把**数据层故障伪装成投递故障**：监控按 21802 告警 ⇒ 值班的人去查企业微信通道，而真因
+// 在库里。分层上它属于 `5xxxx` 系统层（`code::INTERNAL`）。
+//
+// ⚠️ **现状无生产方**：[`SendResultOut::from_row`] 用 `unwrap_or` 兜底（脏值退化成
+// `MANUAL` / `FAILED` 展示，不冒泡），所以这一处**不改变任何 wire 行为** —— 是纯粹的
+// 分层纠正，留着是为了「万一将来有人改成严格模式」，那时它报出来的码才是对的。
+//
+// ⚠️ 与**写侧**的分界：用户提交非法 `frequency` / `worker_metric` 仍是 `21804`
+// （那是**用户输入**校验），本节两个枚举是**库内数据**的反解。
 
 /// 触发来源（`t_wecom_daily_log.trigger_source`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -259,7 +274,7 @@ impl std::str::FromStr for TriggerSource {
             "SCHEDULED" => Ok(Self::Scheduled),
             "MANUAL" => Ok(Self::Manual),
             other => Err(AppError::biz(
-                code::BIZ_WECOM_SEND_FAILED,
+                code::INTERNAL,
                 format!("触发来源取值非法：{other}；合法值只有 SCHEDULED / MANUAL"),
             )),
         }
@@ -296,7 +311,7 @@ impl std::str::FromStr for SendStatus {
             "SUCCESS" => Ok(Self::Success),
             "FAILED" => Ok(Self::Failed),
             other => Err(AppError::biz(
-                code::BIZ_WECOM_SEND_FAILED,
+                code::INTERNAL,
                 format!("发送状态取值非法：{other}；合法值只有 SUCCESS / FAILED"),
             )),
         }
@@ -735,3 +750,54 @@ pub const SECTION_WORKERS: &str = "workers";
 // `vo.rs` 只会让读代码的人多一次「该 import 哪个路径」的判断（照
 // `mail_digest::dto` 与 `wecom::dto` 的同款取舍）。
 // ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ★ 守卫：读侧两个枚举的**脏值解析失败回 `code::INTERNAL`（系统层），不是 `21802`**
+    /// （投递失败）。
+    ///
+    /// 这两个枚举只用于**从库里反解一行流水** ⇒ 解析失败 = 库里有脏值 = 数据完整性问题。
+    /// 报成 `21802`（HTTP 502「投递失败」）会让监控按投递故障告警，而真因在库。
+    /// ⚠️ **变异验证**：把两处 `code::INTERNAL` 改回 `code::BIZ_WECOM_SEND_FAILED`
+    /// 本用例立刻红。
+    #[test]
+    fn read_side_enum_parse_failures_are_internal_not_send_failed() {
+        let e = "自动".parse::<TriggerSource>().expect_err("脏值必须被拒");
+        assert_eq!(e.code(), code::INTERNAL, "不该报成投递失败：{e}");
+        assert_ne!(e.code(), code::BIZ_WECOM_SEND_FAILED);
+        assert!(e.to_string().contains("SCHEDULED / MANUAL"));
+
+        let e = "PARTIAL".parse::<SendStatus>().expect_err("脏值必须被拒");
+        assert_eq!(e.code(), code::INTERNAL, "不该报成投递失败：{e}");
+        assert_ne!(e.code(), code::BIZ_WECOM_SEND_FAILED);
+        assert!(e.to_string().contains("SUCCESS / FAILED"));
+
+        // 合法值逐条仍能解析（别把分层纠正改成「一律拒」）。
+        assert_eq!(
+            "SCHEDULED".parse::<TriggerSource>().unwrap(),
+            TriggerSource::Scheduled
+        );
+        assert_eq!(
+            "MANUAL".parse::<TriggerSource>().unwrap(),
+            TriggerSource::Manual
+        );
+        assert_eq!(
+            "SUCCESS".parse::<SendStatus>().unwrap(),
+            SendStatus::Success
+        );
+        assert_eq!("FAILED".parse::<SendStatus>().unwrap(), SendStatus::Failed);
+    }
+
+    /// 对照组：**写侧**枚举（用户输入）仍回 `21804`，别被上面那条带偏。
+    #[test]
+    fn write_side_enum_parse_failures_stay_21804() {
+        let e = "HOURS"
+            .parse::<WorkerMetric>()
+            .expect_err("非法指标必须被拒");
+        assert_eq!(e.code(), code::BIZ_WECOM_CONFIG_INVALID);
+        let e = "HOURLY".parse::<Frequency>().expect_err("非法频率必须被拒");
+        assert_eq!(e.code(), code::BIZ_WECOM_CONFIG_INVALID);
+    }
+}
