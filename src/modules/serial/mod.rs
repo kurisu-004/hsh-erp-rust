@@ -37,6 +37,23 @@
 //! 与 `docs/api/batch.md` 里「写 `t_part_batch.status` 只能走 `apply_batch_status_change`」
 //! 是同一条纪律。
 //!
+//! ## 域隔离护栏：**不适用**（2026-10-19 复核过）
+//!
+//! 本域对别域的**唯一**代码引用是 `service.rs` 里一行
+//! `use crate::modules::assembly::repo::AssemblyRepo;`（装配件侧清列原语）——
+//! 护栏（`shared::domain_guard::assert_no_foreign_domain`）若整域装上会当场红。
+//!
+//! 为什么不装：那一行**就是本域的立域前提**，与上一节「一行写 SQL 都不写」同源 ——
+//! 清 `t_assembly.serial_no` 必须走 `AssemblyRepo::clear_serial_no_if_terminal`，
+//! 自写 UPDATE 会立刻分叉出「归档丢失 / `version` 不递增 / 守卫口径漂移」三处。
+//! 护栏的规则（「不 import 别域的 service / repo」）在这里恰好把**正确**的写法也拦了，
+//! 与 `prod::scan`（转发型域）、`mail_digest`（内容域 → 通道域）同款豁免，两处都在
+//! 各自 `mod.rs` 与 `docs/api/*.md` 复核登记。
+//!
+//! ⚠️ 零件侧那个原语 `shared::batch::status::release_part_serial_no` **不构成**跨域
+//! 引用：`crate::shared` 是非域公共设施，该护栏按设计就不挡它（同 `crate::infra` /
+//! `crate::auth` / `crate::state`）。
+//!
 //! ## 结构（**转发式**，见 CLAUDE.md「路由声明规约」第 9 条）
 //!
 //! `mod.rs` 只放 `pub fn router()`，路由表在 `handler::router()`。

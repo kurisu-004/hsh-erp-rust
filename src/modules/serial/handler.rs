@@ -40,8 +40,9 @@
 //! ## ⚠️ 本事件**驱动** dashboard（不是「零驱动作用」）
 //!
 //! dashboard 的出参多处带 `serial_no`（`WorkerHeldBatch` / `SystemDeliveryOrder` /
-//! `DeliveryOrderDetail`），释放后这些切片上的序列号即陈旧 ⇒ 前端必须靠事件失效重取。
-//! 真正会被本端点改到内容的是 `in_process` 切片：那条 SQL 只卡批次状态
+//! `DeliveryOrderDetail`），其中**只有 `in_process` 会被本端点改到内容**（理由见下段）——
+//! 前端应按整前缀保守失效重取，而不是只盯那一条切片。
+//! `in_process` 那条 SQL 只卡批次状态
 //! `IN_PROCESS`、**不卡 `t_part.status`**，所以「工单已终态、批次仍压在工人手上」的
 //! 残留行本就带序列号进大屏，而它正是本端点的释放对象。交期面板与下钻抽屉也 SELECT
 //! `serial_no`，但谓词卡的是 6 个**非终态**，本端点动不到；`upcoming-delivery` 分桶

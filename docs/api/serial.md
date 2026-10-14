@@ -230,6 +230,13 @@ dry_run 分支两条 SELECT 不带 `FOR UPDATE`、不持任何锁 ⇒ **不受�
 开事务的理由：整批候选的清列 + 子件归档事件必须**全成功或全回滚**。半途失败留下
 「一部分清了、一部分没清」，比一行没清更难排查。
 
+⚠️ **`dry_run` 的 4 条 SELECT 不在同一个快照内**（不开事务 ⇒ autocommit ⇒ 每条语句各取
+一个 READ COMMITTED 快照）：并发释放发生时，先跑的 `COUNT(*)` 与后跑的两条 list SELECT
+**可能看到不同的数据集**，于是预览的 `released_total` 与 `affected` 的行数可能短暂对不上。
+这是 §4.1 那条「计数与明细解耦」之外的**第二个解耦来源**，且是良性的 —— 预览只给人看，
+`truncated` 也会按当时的计数正确置位，apply 分支不受影响。**强一致只有 apply 分支有**
+（候选在事务内、经 `FOR UPDATE` 锁内取，见 §4.3）。
+
 ⚠️ **零行不广播**（2026-10-19 review 第 2 轮 MINOR-3）：幂等重复点击 / 无残留时会
 commit 一个什么都没写的事务，此时推一条 `assembly_count=0, part_count=0` 的事件
 **毫无信息量**，却会让**所有**大屏客户端各防抖一次、三张报表各重取一遍 ⇒ 纯浪费。
@@ -301,6 +308,16 @@ commit 一个什么都没写的事务，此时推一条 `assembly_count=0, part_
 
 附带写 `t_part_event` 一行（经既有原语）。**本域不新增任何表 / 列 / 索引 / migration。**
 
+- **域隔离护栏（`assert_no_foreign_domain`）：不适用**（2026-10-19 复核过）。本域对别域的
+  **唯一**代码引用是 `service.rs` 的一行 `use crate::modules::assembly::repo::AssemblyRepo;`
+  —— 而那一行正是「一行写 SQL 都不写」（§4.2）的兑现：装配件侧清列必须走既有原语
+  `clear_serial_no_if_terminal`，自写 UPDATE 会分叉出「归档丢失 / `version` 不递增 /
+  守卫口径漂移」三处。护栏的规则（「不 import 别域的 service / repo」）在这里恰好把
+  **正确**的写法也拦了。同款豁免先例：`prod::scan`（转发型域）/ `mail_digest`
+  （内容域 → 通道域），两处均在各自 `mod.rs` 与 `docs/api/*.md` 复核登记。
+  ⚠️ 零件侧的 `shared::batch::status::release_part_serial_no` **不算**跨域引用
+  （`crate::shared` 是非域公共设施，该护栏按设计不挡它）。
+
 ### 8.2 唯一性来源（本域存在的理由）与**两表谓词不对称**
 
 | 索引 | 谓词（**现行**，非 baseline） |
@@ -348,8 +365,9 @@ commit 一个什么都没写的事务，此时推一条 `assembly_count=0, part_
    **每行 3 次往返** —— `SELECT serial_no`（`release_part_serial_no` 的「先读原值」）
    + `INSERT t_part_event`（归档）+ `UPDATE t_part`（清列 + `version+1`），
    全部在**同一个事务**里、**无分批无上限**；装配件侧每行 1 次 `UPDATE`。合计往返数
-   随候选集线性增长：`3 × part_candidates + assembly_candidates + 4`（2 条 count 走
-   dry_run 那支、apply 支是 2 条候选 SELECT）。
+   随候选集线性增长：apply 支是
+   `3 × part_candidates + assembly_candidates + 2`（2 条候选 SELECT），
+   dry_run 支才是 `+ 4`（2 条 count + 2 条 list）。
    ⇒ 1 万行零件残留 ⇒ 单事务约 **3 万次**往返，在一个慢连接上是分钟级持锁（与第 3 条
    叠加）。当前形态下用户看到的是「请求转圈很久后 200 / 或锁超时 50001」。
    **TODO（未做，登记在此防遗忘）**：等「单次实跑行数上限」被产品给出一个具体阈值

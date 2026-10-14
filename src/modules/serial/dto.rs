@@ -89,8 +89,13 @@ pub struct ReleaseTerminalOut {
 ///
 /// **为什么不影响正确性**：`released_total` / `assembly_count` / `part_count`
 /// 三个计数**取自真实候选集合，不经过本上限**，只有 `affected` 明细被截断，并由
-/// `truncated` 标志显式告知。`dry_run` 与 apply **共用同一个上限**（预览看到的行数
-/// 与实跑会动的行数口径一致，不会出现「预览 200 条、实跑 3000 条」的错配）。
+/// `truncated` 标志显式告知。⚠️ **只有 `affected` 受本上限约束，写入不受**：
+/// `dry_run` 与 apply 共用的是**候选判据口径**（同一谓词常量、apply 侧还是同一个
+/// 锁内候选集），**不是**明细条数上限 —— apply 的候选 SELECT 刻意传 `limit = None`
+/// （`service.rs` apply 分支），5000 行残留会实打实清 5000 行。给写入套上限会变成
+/// 「报 200、实清 5000」的错配，比不限流严重得多。
+/// 集成测试 `truncated_flag_and_limit` 钉的就是这个形态：种 201 行 ⇒
+/// `affected.len() == 200` 而 `released_total == 201`。
 pub const RELEASE_DETAIL_LIMIT: usize = 200;
 
 /// `ReleasedSerialItem.kind` 的两个字面量（**唯一真源**，别在别处重写字符串）。
