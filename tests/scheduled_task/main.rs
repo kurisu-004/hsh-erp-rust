@@ -1,12 +1,13 @@
 //! scheduled_task 域集成测试（2026-10-16 新建，与新域同批）
 //!
-//! 覆盖 `/api/v2/mail` 的 6 个端点的 HTTP 契约 + 三条硬约束：
+//! 覆盖 `/api/v2/cron/mail` 的 6 个端点的 HTTP 契约 + 三条硬约束：
 //! - **密文不回显**（列表与新建/修改的出参里都没有 `secret` 任何形式的影子）；
 //! - **OCC**（缺 `version` → 422 纯文本；版本不对 → 40901）；
 //! - **被引用禁删**（`t_mail_digest_config.sender_account_id` 指向它 → 21708）。
 //!
 //! ## 拆分映射（2 个 sub-file）
 //! - `accounts.rs` —— 端点 1/2/3/4/6：预设表、列表、CRUD、默认邮箱的唯一性
+//!   + **硬切守卫 `old_mail_prefix_returns_404`**（2026-10-18 新增）
 //! - `delete.rs`   —— 端点 5：软删 + 被引用禁删 + 软删后同名可再建
 //!
 //! ## ⚠️ 测试主密钥必须写进进程 env（`tests/scheduled_task/main.rs::ensure_mail_secret_env`）
@@ -157,7 +158,7 @@ pub(crate) fn create_body(name: &str) -> Value {
 
 /// 建一个邮箱并返回它的 JSON 出参。
 pub(crate) async fn create_account(ctx: &Ctx, name: &str) -> Value {
-    let (status, env) = post_as_manager(ctx, "/mail/accounts", create_body(name)).await;
+    let (status, env) = post_as_manager(ctx, "/cron/mail/accounts", create_body(name)).await;
     assert_eq!(status, StatusCode::OK, "建邮箱应成功：{env}");
     env["data"].clone()
 }
@@ -237,6 +238,19 @@ pub(crate) async fn post_raw(
     hsh_erp_test_support::send_raw(
         ctx.app.clone(),
         hsh_erp_test_support::json_request(method, path, Some(body), Some(&ctx.manager_token)),
+    )
+    .await
+}
+
+/// `GET {path}`（MANAGER），返回**原始文本**（不走 JSON 解析）。
+///
+/// 用于断言 axum 层「未匹配路由」的 **404 + 空 body**（2026-10-18 硬切守卫用）：
+/// 那类响应不是 `R<T>` 信封，`get_as_manager` 会在 JSON 解析处 panic —— 那是
+/// helper 的前提被打破，不是被测行为。
+pub(crate) async fn get_raw(ctx: &Ctx, path: &str) -> (StatusCode, String) {
+    hsh_erp_test_support::send_raw(
+        ctx.app.clone(),
+        hsh_erp_test_support::json_request("GET", path, None, Some(&ctx.manager_token)),
     )
     .await
 }

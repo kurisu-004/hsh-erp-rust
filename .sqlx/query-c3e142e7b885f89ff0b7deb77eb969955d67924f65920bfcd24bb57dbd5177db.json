@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            COUNT(*)::bigint AS \"note_count!\",\n            COALESCE(SUM(pc.part_count), 0)::bigint AS \"part_count!\"\n        FROM t_delivery_note n\n        LEFT JOIN LATERAL (\n            SELECT COUNT(*)::bigint AS part_count\n            FROM t_part_batch b\n            WHERE b.delivery_note_id = n.id AND b.deleted_at IS NULL\n        ) pc ON TRUE\n        WHERE n.deleted_at IS NULL\n          AND n.picked_up_at >= $1::date::timestamp\n          AND n.picked_up_at < ($1::date + INTERVAL '1 day')::timestamp\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "note_count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "part_count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Date"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "c3e142e7b885f89ff0b7deb77eb969955d67924f65920bfcd24bb57dbd5177db"
+}

@@ -13,7 +13,7 @@
 //!   └─ spawn(watcher)：await token.cancelled() → scheduler.shutdown()
 //! ```
 //!
-//! `POST /api/v2/mail-digest/config` 成功后由 handler 调 [`reschedule`]，
+//! `POST /api/v2/cron/mail-digest/config` 成功后由 handler 调 [`reschedule`]，
 //! **改完立刻生效、不必重启进程**。
 //!
 //! ## ⚠️ 判据从 env 换成 DB（2026-10-16）

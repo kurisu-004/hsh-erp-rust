@@ -16,7 +16,8 @@
 //!   204xx 图纸文件、205xx 货架、206xx 账号、208xx 工序、209xx 工种、210xx 申请人、
 //!   211xx 零件文件、212xx 外协公司、213xx 外协报价、214xx 送货单、215xx 外协发货、
 //!   217xx 交期汇总邮件（2026-10-13 新增；216xx 上传会话域 2026-09-28 下线后**未复用**，
-//!   理由见 `code` 模块内 217xx 段的注释）。
+//!   理由见 `code` 模块内 217xx 段的注释）、218xx 企业微信推送（2026-10-18 新增；
+//!   `wecom` 通道域 + `wecom_daily` 内容域）。
 //!
 //!   错误码段位归属（2026-09-19 prod 聚合后）：
 //!   - `prod::worker` / `prod::queue` → `202xx` 工人段（共享；queue 的 `WORKER_POOL_EMPTY`/`NO_WORK_TYPE` 等复用 `20205`/`20206`）
@@ -431,6 +432,56 @@ pub mod code {
     pub const BIZ_MAIL_ACCOUNT_NAME_DUPLICATE: i32 = 21707;
     pub const BIZ_MAIL_ACCOUNT_IN_USE: i32 = 21708;
 
+    // 218xx 企业微信推送（wecom 通道域 + wecom_daily 内容域，2026-10-18 新增）
+    //
+    // ⚠️ **为什么不是 216xx**：`216xx`（上传会话域）已于 2026-09-28 随域下线**释放**，
+    // 但复用一个「已用过又被回收」的段位有风险 —— 老客户端 / 旧日志里可能还残留
+    // 216xx 的映射，撞码比撞段更隐蔽（217xx 当初就是为此放弃了 216xx，见上面那段
+    // 注释）。故与 217xx 同款取**全新段 218xx**，照 CLAUDE.md §3「新增域错误码先入
+    // 对应段、每域一段」的约定。
+    //
+    // ⚠️ **为什么 21802 一条码要同时覆盖两种失败形态**：企业微信群机器人 webhook
+    // 的失败**几乎从不体现为非 2xx HTTP** —— 网络挂掉 / DNS 解析不了 / 被代理拦了
+    // 才是 HTTP 层失败；而「业务失败」是 **HTTP 200 + `{"errcode":93000,
+    // "errmsg":"..."}`**（如 key 失效、机器人被移出群、频率超限），这是它的常态。
+    // 只判 HTTP 状态码的话，第二个形态会被读成「发送成功」，日志与流水全绿而群里
+    // 一条消息都没有 —— **静默成功**，比任何显式报错都难查。故投递失败一律 21802，
+    // `error_message` 里带上 `errcode` 供排障。
+    //
+    // 21801 = 推送通道不可用：`t_wecom_daily_config.webhook_id IS NULL` / 指向
+    //   已软删或不存在行 / 密文解不开。语义是「服务未就绪」→ **503**，
+    //   逐字对位 `BIZ_MAIL_NOT_CONFIGURED`(21701) 与 `BIZ_WX_NOT_CONFIGURED`(40109)：
+    //   调用方没做错任何事，是运维没配通道。
+    // 21802 = 投递失败：HTTP 层失败**或**响应体 `errcode != 0` → **502**
+    //   （企业微信是外部依赖，本服务的入参校验全过了，失败发生在下游）。
+    // 21803 = webhook URL 非法：非
+    //   `https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=…` / 缺 `key` /
+    //   含 CR-LF（注入面）/ 超长 → **400**。
+    // 21804 = 配置组合非法：频率与时刻字段不匹配（WEEKLY 缺 weekday…）/
+    //   四节全关 / `upcoming_days`、`worker_top_n`、`max_chunks` 越界 /
+    //   未知 `worker_metric` / 渲染后分片数超 `max_chunks` → **400**。
+    //   ⚠️ 最后一条刻意**不**静默截断：截断会让人以为「全发出去了」，
+    //   而群里其实少了一截消息。
+    // 21805 = 配置行不存在**且不可自动初始化**的语义保留位（当前
+    //   `GET /config` 在表空时返回默认值 + `version=0`，不返本码；`POST /config`
+    //   走的是「并发首插撞 23505 → 转 40901」那条路）。逐字对位
+    //   `BIZ_MAIL_CONFIG_NOT_FOUND`(21705) → **400**。
+    // 21806 = webhook 不存在**或已软删** → **404**。⚠️ 与 21801 的分工：
+    //   21801 是「没配通道 → 服务不可用」（运维视角），21806 是「点了这个 id 但
+    //   它不在」（调用方视角，典型是拿着已删 id 来改配置）。
+    // 21807 = webhook 名称重复 → **409**（⚠️ **不是** 40901 —— 40901 只表达 OCC，
+    //   业务唯一键冲突须有专用码，见 CLAUDE.md §8；逐字对位 21707）。
+    // 21808 = webhook 被 `t_wecom_daily_config.webhook_id` 引用，禁止删除
+    //   → **409**（同上一条：状态冲突而非入参非法；逐字对位 21708）。
+    pub const BIZ_WECOM_NOT_CONFIGURED: i32 = 21801;
+    pub const BIZ_WECOM_SEND_FAILED: i32 = 21802;
+    pub const BIZ_WECOM_WEBHOOK_URL_INVALID: i32 = 21803;
+    pub const BIZ_WECOM_CONFIG_INVALID: i32 = 21804;
+    pub const BIZ_WECOM_CONFIG_NOT_FOUND: i32 = 21805;
+    pub const BIZ_WECOM_WEBHOOK_NOT_FOUND: i32 = 21806;
+    pub const BIZ_WECOM_WEBHOOK_NAME_DUPLICATE: i32 = 21807;
+    pub const BIZ_WECOM_WEBHOOK_IN_USE: i32 = 21808;
+
     // 系统错误
     pub const INTERNAL: i32 = 50000;
     pub const DATABASE: i32 = 50001;
@@ -617,7 +668,11 @@ fn status_from_code(c: i32) -> StatusCode {
             || c == code::BIZ_MAIL_CONFIG_NOT_FOUND
             // 2026-10-16 新增（scheduled_task 域）：邮箱不存在**或已软删**。
             // 与 `BIZ_MAIL_CONFIG_NOT_FOUND` 同为「引用一个已经不在的实体」。
-            || c == code::BIZ_MAIL_ACCOUNT_NOT_FOUND =>
+            || c == code::BIZ_MAIL_ACCOUNT_NOT_FOUND
+            // 2026-10-18 新增（wecom 通道域 21806）：webhook 不存在**或已软删**。
+            // 与 21801 的分工：21801 是「没配通道 → 服务不可用」，这里是「点了
+            // 这个 id 但它不在」⇒ 调用方该换 id。
+            || c == code::BIZ_WECOM_WEBHOOK_NOT_FOUND =>
         {
             StatusCode::NOT_FOUND
         }
@@ -643,6 +698,25 @@ fn status_from_code(c: i32) -> StatusCode {
         c if c == code::BIZ_MAIL_NOT_CONFIGURED => StatusCode::SERVICE_UNAVAILABLE,
         c if c == code::BIZ_MAIL_SEND_FAILED => StatusCode::BAD_GATEWAY,
         c if c == code::BIZ_MAIL_RECIPIENT_INVALID || c == code::BIZ_MAIL_CONFIG_INVALID => {
+            StatusCode::BAD_REQUEST
+        }
+
+        // 2026-10-18 新增（wecom / wecom_daily 两域，21801..21808）：
+        // - 21801 未配置推送通道 → 503「服务未就绪」，逐字对位 21701 与 40109。
+        // - 21802 投递失败 → 502（企业微信是外部依赖，它挂了；⚠️ 该码同时覆盖
+        //   「HTTP 层失败」与「HTTP 200 但 body 里 `errcode != 0`」两种形态 ——
+        //   后者是 webhook 的常态，见常量声明处的注释）。
+        // - 21803 URL 非法 / 21804 配置组合非法 → 400（纯入参问题，含 CR/LF 注入）。
+        // - 21805 配置行不存在（保留位，当前无生产方）→ 400。
+        // ⚠️ **8 个码全部必须显式登记**：下面 `(20000..30000) => BAD_REQUEST` 的兜底
+        // 会把漏掉的码悄悄变成 400 —— 尤其 21801 的 503 与 21802 的 502 会退化成
+        // 「你填错了」，与实际排查方向完全相反。
+        c if c == code::BIZ_WECOM_NOT_CONFIGURED => StatusCode::SERVICE_UNAVAILABLE,
+        c if c == code::BIZ_WECOM_SEND_FAILED => StatusCode::BAD_GATEWAY,
+        c if c == code::BIZ_WECOM_WEBHOOK_URL_INVALID
+            || c == code::BIZ_WECOM_CONFIG_INVALID
+            || c == code::BIZ_WECOM_CONFIG_NOT_FOUND =>
+        {
             StatusCode::BAD_REQUEST
         }
 
@@ -705,7 +779,11 @@ fn status_from_code(c: i32) -> StatusCode {
             // 40901 —— 40901 只表达 OCC）与「邮箱被交期汇总配置引用、禁止删除」
             // （21708）。两者都是状态冲突而非入参非法。
             || c == code::BIZ_MAIL_ACCOUNT_NAME_DUPLICATE
-            || c == code::BIZ_MAIL_ACCOUNT_IN_USE =>
+            || c == code::BIZ_MAIL_ACCOUNT_IN_USE
+            // 2026-10-18 新增（wecom 通道域）：webhook 重名（21807，**不是** 40901）
+            // 与「webhook 被每日总结配置引用、禁止删除」（21808）。逐字对位 21707/21708。
+            || c == code::BIZ_WECOM_WEBHOOK_NAME_DUPLICATE
+            || c == code::BIZ_WECOM_WEBHOOK_IN_USE =>
         {
             StatusCode::CONFLICT
         }
@@ -1239,6 +1317,27 @@ mod tests {
             "BIZ_MAIL_ACCOUNT_NAME_DUPLICATE",
         ),
         (code::BIZ_MAIL_ACCOUNT_IN_USE, "BIZ_MAIL_ACCOUNT_IN_USE"),
+        // 218xx 企业微信推送（2026-10-18 新增：wecom 通道域 + wecom_daily 内容域）
+        (code::BIZ_WECOM_NOT_CONFIGURED, "BIZ_WECOM_NOT_CONFIGURED"),
+        (code::BIZ_WECOM_SEND_FAILED, "BIZ_WECOM_SEND_FAILED"),
+        (
+            code::BIZ_WECOM_WEBHOOK_URL_INVALID,
+            "BIZ_WECOM_WEBHOOK_URL_INVALID",
+        ),
+        (code::BIZ_WECOM_CONFIG_INVALID, "BIZ_WECOM_CONFIG_INVALID"),
+        (
+            code::BIZ_WECOM_CONFIG_NOT_FOUND,
+            "BIZ_WECOM_CONFIG_NOT_FOUND",
+        ),
+        (
+            code::BIZ_WECOM_WEBHOOK_NOT_FOUND,
+            "BIZ_WECOM_WEBHOOK_NOT_FOUND",
+        ),
+        (
+            code::BIZ_WECOM_WEBHOOK_NAME_DUPLICATE,
+            "BIZ_WECOM_WEBHOOK_NAME_DUPLICATE",
+        ),
+        (code::BIZ_WECOM_WEBHOOK_IN_USE, "BIZ_WECOM_WEBHOOK_IN_USE"),
         // 207xx 工艺链（worker-pool auto-allocate 阶段新增）
         (
             code::BIZ_PROCESS_CHAIN_NOT_FOUND,
@@ -1486,6 +1585,18 @@ mod tests {
         assert_eq!(code::BIZ_MAIL_ACCOUNT_NOT_FOUND, 21706);
         assert_eq!(code::BIZ_MAIL_ACCOUNT_NAME_DUPLICATE, 21707);
         assert_eq!(code::BIZ_MAIL_ACCOUNT_IN_USE, 21708);
+
+        // 218xx（wecom 通道域 + wecom_daily 内容域，2026-10-18 新增）
+        assert_eq!(code::BIZ_WECOM_NOT_CONFIGURED, 21801);
+        assert_eq!(code::BIZ_WECOM_SEND_FAILED, 21802);
+        assert_eq!(code::BIZ_WECOM_WEBHOOK_URL_INVALID, 21803);
+        assert_eq!(code::BIZ_WECOM_CONFIG_INVALID, 21804);
+        assert_eq!(code::BIZ_WECOM_CONFIG_NOT_FOUND, 21805);
+        assert_eq!(code::BIZ_WECOM_WEBHOOK_NOT_FOUND, 21806);
+        assert_eq!(code::BIZ_WECOM_WEBHOOK_NAME_DUPLICATE, 21807);
+        assert_eq!(code::BIZ_WECOM_WEBHOOK_IN_USE, 21808);
+        // ⚠️ 21809 是 218xx 段的下一个空位：当前无生产方，**不预分配**
+        // （与 217xx 段「21709 是下一个空位、不要用」同款纪律）。
     }
 
     /// 数据驱动的 HTTP 表覆盖测试：每个 (code, expected_http, name) 一行。
@@ -1588,6 +1699,53 @@ mod tests {
             code::BIZ_MAIL_ACCOUNT_IN_USE,
             StatusCode::CONFLICT,
             "BIZ_MAIL_ACCOUNT_IN_USE",
+        ),
+        // 2026-10-18 新增（wecom / wecom_daily 两域 218xx）：未配置通道 → 503
+        // （逐字对位 21701 / 40109）；投递失败 → 502（⚠️ 同时覆盖「HTTP 层失败」
+        // 与「HTTP 200 但 body 里 errcode != 0」，后者是 webhook 的常态）；
+        // URL / 配置组合非法 → 400；webhook 不存在 → 404；重名 / 被引用禁删 → 409。
+        (
+            code::BIZ_WECOM_NOT_CONFIGURED,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "BIZ_WECOM_NOT_CONFIGURED",
+        ),
+        (
+            code::BIZ_WECOM_SEND_FAILED,
+            StatusCode::BAD_GATEWAY,
+            "BIZ_WECOM_SEND_FAILED",
+        ),
+        (
+            code::BIZ_WECOM_WEBHOOK_URL_INVALID,
+            StatusCode::BAD_REQUEST,
+            "BIZ_WECOM_WEBHOOK_URL_INVALID",
+        ),
+        (
+            code::BIZ_WECOM_CONFIG_INVALID,
+            StatusCode::BAD_REQUEST,
+            "BIZ_WECOM_CONFIG_INVALID",
+        ),
+        // ⚠️ 21805 当前**无生产方**（保留位）：读端点在表空时返默认值 + version=0，
+        // 首插并发走 40901。这条断言的作用是把「它将来真被用上时的 HTTP 语义」
+        // 提前钉住，避免有人随手填成 503。
+        (
+            code::BIZ_WECOM_CONFIG_NOT_FOUND,
+            StatusCode::BAD_REQUEST,
+            "BIZ_WECOM_CONFIG_NOT_FOUND",
+        ),
+        (
+            code::BIZ_WECOM_WEBHOOK_NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            "BIZ_WECOM_WEBHOOK_NOT_FOUND",
+        ),
+        (
+            code::BIZ_WECOM_WEBHOOK_NAME_DUPLICATE,
+            StatusCode::CONFLICT,
+            "BIZ_WECOM_WEBHOOK_NAME_DUPLICATE",
+        ),
+        (
+            code::BIZ_WECOM_WEBHOOK_IN_USE,
+            StatusCode::CONFLICT,
+            "BIZ_WECOM_WEBHOOK_IN_USE",
         ),
         (code::FORBIDDEN, StatusCode::FORBIDDEN, "FORBIDDEN"),
         (

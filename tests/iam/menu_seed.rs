@@ -168,11 +168,14 @@ const TARGET_CODES: [&str; 3] = ["process_work_type", "part_process_chain", "wor
 
 /// `seeds/rbac.sql` §4.1 段 MANAGER 白名单去掉两条已 soft-delete 的菜单
 /// （menu.sql §3.1 的 `settings_root`、§3.5 的 `delivery_dispatch`）后的全量 live 授权
-/// code 快照，**31 项**（2026-10-13 新增 `mail_group` + `mail_digest`：交期汇总邮件
+/// code 快照，**32 项**（2026-10-13 新增 `mail_group` + `mail_digest`：交期汇总邮件
 /// 的顶级分组与子菜单，域 `mail_digest` 的 6 端点全部 MANAGER 独占，只归管理员；
 /// 2026-10-14 新增 `roles_list`：RBAC 角色面板，8 端点同样 MANAGER 独占；
 /// 2026-10-16 菜单结构改版：`mail_group` / `mail_digest` **换 code** 为
-/// `scheduled_task` / `mail`，**项数与授权范围逐条不变**、只是改名）。
+/// `scheduled_task` / `mail`，**项数与授权范围逐条不变**、只是改名；
+/// 2026-10-18 新增 `wecom`：`scheduled_task` 下第三个子项「企业微信」，沿用
+/// 「对外发消息 / 配置型操作只归管理员」同款判据，CLERK / INSPECTOR /
+/// CNC_PROGRAMMER / SHELF_ACCOUNT 四段**一行不加**）。
 const MANAGER_EXPECTED: &[&str] = &[
     "applicants_list",
     "assemblies_list",
@@ -203,6 +206,7 @@ const MANAGER_EXPECTED: &[&str] = &[
     "shelves_list",
     "template_management",
     "users_list",
+    "wecom",
     "worker_queue",
     "workers_list",
 ];
@@ -248,9 +252,9 @@ const CNC_PROGRAMMER_EXPECTED: &[&str] = &["home", "parts_list", "pending_progra
 /// §4.5 段 SHELF_ACCOUNT 白名单，**3 项**。
 const SHELF_ACCOUNT_EXPECTED: &[&str] = &["floor_group", "home", "scan_badge"];
 
-/// 5 份快照 = 31 + 16 + 8 + 3 + 3 = **61 条 live 授权**（31 = 28 + 2026-10-13 新增
-/// 的邮件两个 code + 2026-10-14 新增的 `roles_list`；邮件那两个 code 2026-10-16 换了名，
-/// 仍是两项）。
+/// 5 份快照 = 32 + 16 + 8 + 3 + 3 = **62 条 live 授权**（32 = 28 + 2026-10-13 新增
+/// 的邮件两个 code + 2026-10-14 新增的 `roles_list` + 2026-10-18 新增的 `wecom`；
+/// 邮件那两个 code 2026-10-16 换了名，仍是两项）。
 const EXPECTED_SNAPSHOT: [(&str, &[&str]); 5] = [
     ("MANAGER", MANAGER_EXPECTED),
     ("CLERK", CLERK_EXPECTED),

@@ -117,7 +117,7 @@ impl MailAccountPreset {
 /// 163 / QQ 的授权码都是 16 位字母数字，200 已是极大裕度。
 pub const SECRET_MAX_CHARS: usize = 200;
 
-/// `POST /api/v2/mail/accounts` 请求体。
+/// `POST /api/v2/cron/mail/accounts` 请求体。
 ///
 /// ⚠️ **无 `version`**：这是新建，没有「别人先改过」这回事（CLAUDE.md §8 的 OCC
 /// 只适用于已存在的行）。
@@ -140,7 +140,7 @@ pub struct CreateAccountRequest {
     pub secret: String,
 }
 
-/// `POST /api/v2/mail/accounts/{id}` 请求体：**全量覆写**。
+/// `POST /api/v2/cron/mail/accounts/{id}` 请求体：**全量覆写**。
 ///
 /// ⚠️ `version` **必填、无 `#[serde(default)]`**（CLAUDE.md §8 硬约定）：
 /// 缺失时 axum `Json` 提取器直接返 **HTTP 422 纯文本**，不是业务信封。
@@ -166,7 +166,7 @@ pub struct UpdateAccountRequest {
     pub secret: Option<String>,
 }
 
-/// `POST /api/v2/mail/accounts/{id}/delete` 请求体。
+/// `POST /api/v2/cron/mail/accounts/{id}/delete` 请求体。
 ///
 /// ⚠️ **只有 `version`**：本表带 `version` 列，故按 CLAUDE.md §8「所有对带
 /// `version` 列的表的写端点，body 必须显式收客户端 `version` 且必填」，
@@ -177,7 +177,7 @@ pub struct DeleteAccountRequest {
     pub version: i32,
 }
 
-/// `POST /api/v2/mail/accounts/{id}/set-default` 请求体。
+/// `POST /api/v2/cron/mail/accounts/{id}/set-default` 请求体。
 ///
 /// 与 [`DeleteAccountRequest`] 同款：目标行的 `version` 必填。
 #[derive(Debug, Clone, Deserialize)]
@@ -203,13 +203,13 @@ pub struct PresetOption {
     pub tls_mode: String,
 }
 
-/// `GET /api/v2/mail/meta` 响应体。
+/// `GET /api/v2/cron/mail/meta` 响应体。
 #[derive(Debug, Clone, Serialize)]
 pub struct MailMetaOut {
     pub presets: Vec<PresetOption>,
 }
 
-/// `GET /api/v2/mail/accounts` 的一个邮箱。
+/// `GET /api/v2/cron/mail/accounts` 的一个邮箱。
 ///
 /// ⚠️ **没有 `encrypted_secret`、没有掩码字段、没有 `secret_configured`**：
 /// 建邮箱时授权码必填 ⇒ 「是否配了授权码」恒为 true，是个死字段；而死字段会让人
@@ -265,7 +265,7 @@ impl MailAccountOut {
     }
 }
 
-/// `GET /api/v2/mail/accounts` 响应体。
+/// `GET /api/v2/cron/mail/accounts` 响应体。
 #[derive(Debug, Clone, Serialize)]
 pub struct MailAccountListOut {
     pub items: Vec<MailAccountOut>,

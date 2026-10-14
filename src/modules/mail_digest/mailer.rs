@@ -226,7 +226,7 @@ mod tests {
     ///
     /// ⚠️ 2026-10-16 起 `MailTlsModeKind::parse`（env 字符串解析）已随
     /// `MAIL_SMTP_TLS_MODE` 整轮删除，所以这条用例守的是 `Display` 而不是
-    /// `parse`：字面量仍会经 `GET /api/v2/mail/meta` 的 `tls_mode` 字段出参。
+    /// `parse`：字面量仍会经 `GET /api/v2/cron/mail/meta` 的 `tls_mode` 字段出参。
     #[test]
     fn tls_mode_literals_are_pinned() {
         assert_eq!(MailTlsModeKind::Wrapped.to_string(), "WRAPPED");

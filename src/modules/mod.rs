@@ -34,6 +34,8 @@ pub mod iam;
 // （6 端点，全部 Manager 独占）+ 后台定时任务（`task::mail_digest`）。
 // ⚠️ 2026-10-16 改造：SMTP 凭据**不再走 env**（`MAIL_SMTP_*` 已整轮删除），
 // 改由 `scheduled_task` 域的邮箱表提供；本域只管收件人 / 内容口径 / 调度配置。
+// ⚠️ 2026-10-18 URL 硬切：`/api/v2/mail-digest/*` → `/api/v2/cron/mail-digest/*`
+// （归入「定时任务」域组前缀 `/cron`；**旧路径 404，无 alias**）。
 pub mod mail_digest;
 pub mod outsource;
 pub mod part;
@@ -46,8 +48,10 @@ pub mod part;
 // 完整契约见 `docs/api/print_template.md`。
 pub mod print_template;
 // 2026-10-16 新增 scheduled_task 域：「定时任务」菜单下的**邮件通道**（邮箱实体 +
-// SMTP 预设元数据），6 端点全部 Manager 独占，URL 挂 `/api/v2/mail`。
+// SMTP 预设元数据），6 端点全部 Manager 独占，URL 挂 `/api/v2/cron/mail`。
 // 与 mail_digest 域的切分线见该域 `mod.rs` 的模块 doc（通道 vs 内容与调度）。
+// ⚠️ 2026-10-18 URL 硬切：`/api/v2/mail/*` → `/api/v2/cron/mail/*`
+// （归入「定时任务」域组前缀 `/cron`；**旧路径 404，无 alias**）。
 pub mod scheduled_task;
 // 2026-10-02 域归属定案：原 `part_batch` 域（1866 行 helper，无独立 URL）整体
 // 归入 prod 域的 `prod::batch` 子模块（src/modules/prod/batch/），承载 `t_part_batch`
@@ -74,6 +78,22 @@ pub mod prod;
 // 本域**一行写 SQL 都不写**，清列全部复用两个既有原语（详见 `serial/mod.rs`）。
 pub mod serial;
 pub mod statistics;
+// 2026-10-18 新增 wecom 域：「定时任务」菜单下的**企业微信推送通道**（群机器人 webhook
+// 实体 + 地址加密 + 掩码 + 探针发送），6 端点全部 Manager 独占，URL 挂 `/api/v2/cron/wecom`。
+// ⚠️ **全新域，无任何旧路径、无 alias**。
+// ⚠️ **与 `modules::wx::wecom_client` 同名不同物**（小程序登录客户端，需 corpid/corpsecret；
+// 本域是群机器人 webhook，**裸 HTTP POST、不需任何凭据**）—— 两域零交集，别混用。
+// 与 wecom_daily（内容域）的切分线见该域 `mod.rs` 的模块 doc（通道 vs 内容与调度）。
+// 完整契约见 `docs/api/wecom.md`。
+pub mod wecom;
+// 2026-10-18 新增 wecom_daily 域：「定时任务」菜单下的**企业微信每日总结推送**（内容域：
+// 4 节报表 + 分片渲染 + 推送配置单例 + 流水），5 个端点 / 6 条路由全部 Manager 独占，
+// URL 挂 `/api/v2/cron/wecom-daily`。
+// ⚠️ **全新域，无任何旧路径、无 alias**。
+// 取数 SQL 在本域内写全、**零他域符号引用**（统计口径常量 `repo::DELIVERY_STATUSES`
+// 是本域自有的一份，与 mail_digest / dashboard 两处人工同步）。
+// 完整契约见 `docs/api/wecom-daily.md`。
+pub mod wecom_daily;
 // 2026-09-28 删除：相关上传会话域（Redis 共享 STS 凭证会话机制）。
 // 前端改为单 uploader 触发时单 HTTP 调用 python `sts-tmp-keys` 数组入参直签，
 // 不再走 rust 转发。
@@ -177,18 +197,72 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // 「候选 + 公司列 + 内联在途批次」的整块看板与它的移动写端点。
         .nest("/outsource-queue", outsource::queue_router())
         .nest("/statistics", statistics::router())
-        // 2026-10-13 新增：mail_digest 域（交期汇总邮件）。6 端点全部 Manager 独占，
-        // 角色守卫写在各 handler 第一行（`require_role(Role::Manager)`），此处不挂 role layer。
-        // 前缀 `/mail-digest`：本仓顶层 nest 惯例是 kebab-case 单段（`/part-files` /
-        // `/cnc-programs` / `/outsource-queue`），域名 `mail_digest` 直接连字符化。
-        .nest("/mail-digest", mail_digest::router())
-        // 2026-10-16 新增：scheduled_task 域（邮件通道：邮箱 CRUD + SMTP 预设表）。
+        // ⚠️ 2026-10-18 URL 硬切：`/api/v2/mail-digest/*` → `/api/v2/cron/mail-digest/*`
+        // （**旧路径 404，无 alias**）。`/cron` 是「定时任务」域组的统一父前缀，
+        // 其下四个子域：`mail`（通道）/ `mail-digest`（内容）/ `wecom`（通道）/ `wecom-daily`（内容）。
         // 6 端点全部 Manager 独占，角色守卫写在各 handler 第一行
         // （`require_role(Role::Manager)`），此处不挂 role layer。
-        // 前缀 `/mail`：**刻意不是** kebab-case —— 菜单结构改版（一级「定时任务」
+        // 前缀仍刻意是 kebab-case 单段词（`mail-digest`），只多了一个 `/cron` 父段。
+        // 完整契约见 `docs/api/mail_digest.md`。
+        .nest("/cron/mail-digest", mail_digest::router())
+        // ⚠️ 2026-10-18 URL 硬切：`/api/v2/mail/*` → `/api/v2/cron/mail/*`
+        // （**旧路径 404，无 alias**）。6 端点全部 Manager 独占，角色守卫写在各 handler
+        // 第一行（`require_role(Role::Manager)`），此处不挂 role layer。
+        // 第 2 段 `/mail` **刻意不是** kebab-case —— 菜单结构改版（一级「定时任务」
         // / 二级「邮件」）时与前端路由、菜单 seed 的 `path='/mail'` 对齐成同一个词。
         // 完整契约见 `docs/api/mail.md`。
-        .nest("/mail", scheduled_task::router())
+        .nest("/cron/mail", scheduled_task::router())
+        // 2026-10-18 新增 wecom 域（企业微信**通道**：群机器人 webhook 实体 + 地址加密 +
+        // 掩码 + 探针发送），6 端点全部 Manager 独占，角色守卫写在各 handler 第一行
+        // （`require_role(Role::Manager)`），此处不挂 role layer。
+        // 第 2 段 `/wecom` 刻意是**单段词**（不是 kebab-case 的 `wecom-webhooks`）——
+        // 与菜单 seed 的 `path='/wecom'`、前端路由同一个词。
+        // ⚠️ **全新域，无旧路径、无 alias**。完整契约见 `docs/api/wecom.md`。
+        .nest("/cron/wecom", wecom::router())
+        // 2026-10-18 新增 wecom_daily 域（企业微信**内容**域：每日总结 4 节报表 + 分片
+        // 渲染 + 推送配置单例 + 流水），5 个端点 / 6 条路由全部 Manager 独占，角色守卫
+        // 写在各 handler 第一行（`require_role(Role::Manager)`），此处不挂 role layer。
+        // ⚠️ **独立 `.nest()`**，刻意**不**合并进 `.nest("/cron", Router::new().merge(..))`
+        // —— 理由见下面那段 matchit 核对第 1 条。⚠️ 第 2 段 `wecom-daily` 刻意是
+        // **kebab-case**（与 `mail-digest` 同款），而通道域那一条是单段词 `wecom`
+        // （与菜单 seed 的 `path='/wecom'` 对齐）—— 两者逐字互异、互不为前缀。
+        // 完整契约见 `docs/api/wecom-daily.md`。
+        .nest("/cron/wecom-daily", wecom_daily::router())
+        // ── `/cron` 前缀族的 matchit 注册顺序核对（2026-10-18 新增，必读）──
+        //
+        // CLAUDE.md §9 有一条硬约束：「同段数时静态段必须先于 `Path<i64>` catch-all，
+        // 否则静态路径被吞成 **400**（不是 404）」。`/cron` 前缀族下现有三个子域
+        // **不触发**它，逐条理由如下（后续新域挂进 `/cron` 前请照此核对）：
+        //
+        // 1. **每个子域各自一个 `.nest()`，没有合并 router**。这里刻意没写成
+        //    `.nest("/cron", Router::new().merge(a).merge(b))` —— 合并后所有子域的
+        //    路由进同一张 matchit 表，注册顺序约束会跨前缀纠缠，排查困难
+        //    （CLAUDE.md §9「一个前缀一个 router 工厂」）。各子域各自独立 nest ⇒
+        //    各自独立成表，`/cron/mail*`、`/cron/wecom*`、`/cron/wecom-daily*` 的匹配
+        //    互不参与（**2026-10-18 起 `/cron` 下共 4 个子域，全部各自独立 nest**）。
+        // 2. **四条 nest 的第 2 段互不为对方的前缀**
+        //    （`mail` / `mail-digest` / `wecom` / `wecom-daily` 逐字互异）⇒
+        //    axum 在 nest 阶段就能分流，不存在「一个静态段是另一个静态段前缀」的重叠。
+        // 3. **`mail` 与 `mail-digest` / `wecom` 段数相同也不冲突**：第 2 段先静态判别，
+        //    `/cron/mail/accounts`（3 段，第 2 段恰好等于 `mail`）与
+        //    `/cron/mail-digest/config`（3 段，第 2 段恰好等于 `mail-digest`）
+        //    与 `/cron/wecom/webhooks`（3 段，第 2 段恰好等于 `wecom`）
+        //    与 `/cron/wecom-daily/config`（3 段，第 2 段恰好等于 `wecom-daily`）
+        //    在第 2 段就分道，不进入第 3 段的比较。
+        //    ⚠️ **`wecom` 与 `wecom-daily` 这一对最值得盯**：`wecom` 是 `wecom-daily`
+        //    的**字符串前缀**，但 matchit 是**逐段**比较而不是字符串前缀比较 ⇒ 第 2 段
+        //    就是完整的一格（`wecom` vs `wecom-daily`），不存在「短段吃掉长段」的窗口。
+        // 4. **四个子域的路由表内部本就无 catch-all 竞争**：`mail` 6 条最长 3 段、
+        //    `Path<i64>` 只在第 2 段、无 2 段静态路径；`mail-digest` 与
+        //    `wecom-daily` 各 6 条**全是静态段**；`wecom` 6 条最长 3 段
+        //    （`/webhooks/{id}/delete`）、`Path<i64>` 只在 `/webhooks/{id}`（2 段）
+        //    而**没有任何 2 段静态路径** ⇒ 四张表都安全，且彼此完全隔离（第 1 条）。
+        //
+        // 守卫：旧前缀 404 的集成用例见 `tests/scheduled_task/accounts.rs`
+        // 与 `tests/mail_digest/config.rs`（2026-10-18 新增）。`/cron/wecom*` 与
+        // `/cron/wecom-daily*` 是**全新前缀**（无旧路径）故无 404 用例；它们各自的
+        // 路由表由 `wecom::handler::tests` / `wecom_daily::handler::tests` 的
+        // 「ROUTES 与 router() 源码逐条比对」守住。
         // 2026-10-16 新增：print_template 域（送货单打印模板：xlsx 上传 / 绑一级客户 /
         // 打印时取模板字节）。5 端点。
         // 守卫分两档：写端点 3 条（`POST /` 上传替换、`GET /` 列表、

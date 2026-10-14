@@ -16,7 +16,7 @@
 //! 加第二个邮件类型（订单变更通知、月度报表）时，前者不动、后者各自加自己的
 //! 内容配置表；而邮箱、预设、授权码加密这一整套只需要建一次。
 //!
-//! ## 端点表（挂在 `/api/v2/mail`，**全部 Manager 独占**）
+//! ## 端点表（挂在 `/api/v2/cron/mail`，**全部 Manager 独占**）
 //!
 //! | 方法 | 路径 | 说明 |
 //! |---|---|---|
@@ -28,7 +28,19 @@
 //! | `POST` | `/accounts/{id}/set-default` | 置默认；同事务内**先降旧、再升新** |
 //!
 //! 权威路由清单是 [`handler::ROUTES`]（`handler::tests` 断言它与 [`router`] 源码
-//! 逐条一致）。挂载点登记在 [`crate::modules::v2_router`] 的 `.nest("/mail", …)`。
+//! 逐条一致）。挂载点登记在 [`crate::modules::v2_router`] 的
+//! `.nest("/cron/mail", …)`。
+//!
+//! ## 硬切记录（2026-10-18）
+//!
+//! - `/api/v2/mail/*` → **`/api/v2/cron/mail/*`**（**旧路径 404，无 alias**）。
+//!   归入「定时任务」域组前缀 `/cron`（其下四个子域：`mail` 通道 / `mail-digest` 内容
+//!   / `wecom` 通道 / `wecom-daily` 内容），与菜单 seed 的 `path='/mail'` 仍是同一个词 ——
+//!   **菜单 path 不跟着 API 前缀变**，变的只是 URL。
+//! - 前缀由「顶层 nest、单段」变为「`/cron` 父前缀下的两段」；域内路由表本身
+//!   （[`handler::ROUTES`]）**一行未动**，变的只是 nest 路径。
+//! - 守卫：`tests/scheduled_task/accounts.rs::old_mail_prefix_returns_404`
+//!   （实跑旧前缀，断言 404；同文件先钉新前缀 200 作正向对照）。
 //!
 //! **只用 GET / POST**：本仓 HTTP 路由**零** PUT/PATCH/DELETE，故「改」走
 //! `POST /accounts/{id}`、「删」走 `POST /accounts/{id}/delete`（与既有
@@ -68,7 +80,7 @@
 //!
 //! 将来若本域需要 import `mail_digest`（例如让「删除邮箱」顺便清空引用），
 //! 护栏会当场红 —— 那时的正确做法是**反过来**：把「引用检查」留在本域 SQL 里，
-//! 或把清理动作交给 mail_digest 自己（`POST /mail-digest/config` 存 NULL）。
+//! 或把清理动作交给 mail_digest 自己（`POST /api/v2/cron/mail-digest/config` 存 NULL）。
 
 pub mod dto;
 pub mod handler;
@@ -85,11 +97,12 @@ use axum::Router;
 
 use crate::state::AppState;
 
-/// `/api/v2/mail/*` 端点（6 条，全部 Manager 独占）。
+/// `/api/v2/cron/mail/*` 端点（6 条，全部 Manager 独占）。
 ///
-/// 挂载点登记在 [`crate::modules::v2_router`] 的 `.nest("/mail", …)`（顶层 nest、
-/// 单段，**不是** kebab-case —— 菜单结构改版时与前端约定成 `/mail` 一词，
-/// `docs/api/mail.md` §1 与 `seeds/menu.sql` 同款登记）。
+/// 挂载点登记在 [`crate::modules::v2_router`] 的 `.nest("/cron/mail", …)`
+/// （`/cron` 父前缀下的两段，**不是**顶层单段 —— 2026-10-18 硬切，见模块 doc 的
+/// 「硬切记录」；第 2 段 `mail` 刻意不是 kebab-case，菜单结构改版时与前端约定成
+/// `/mail` 一词，`docs/api/mail.md` §1 与 `seeds/menu.sql` 同款登记）。
 pub fn router() -> Router<Arc<AppState>> {
     handler::router()
 }

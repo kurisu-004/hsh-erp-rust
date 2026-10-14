@@ -4,18 +4,28 @@
 //! 系统交期到期的工单的汇总邮件的定时任务」，并配一个管理界面可指定
 //! 收件人 / 发送内容 / 触发时间与频率。
 //!
-//! ## 端点表（挂在 `/api/v2/mail-digest`，**全部 Manager 独占**）
+//! ## 端点表（挂在 `/api/v2/cron/mail-digest`，**全部 Manager 独占**）
 //!
 //! | 方法 | 路径 | 说明 |
 //! |---|---|---|
 //! | `GET`  | `/config`  | 读单例配置；表里无行时返回全部默认值 + `version=0` + `id="0"` |
 //! | `POST` | `/config`  | 全量覆写；**body 必含 `version`**（OCC）；成功后热重载 cron |
-//! | `GET`  | `/meta`    | 内容与调度侧的表单选项源：频率枚举 / 列白名单 / 取值范围（**2026-10-16 起不再含 `smtp` 段** —— 发信通道改由 `scheduled_task` 域的 `GET /api/v2/mail/meta` + `GET /api/v2/mail/accounts` 提供，见 `dto::MetaOut`） |
+//! | `GET`  | `/meta`    | 内容与调度侧的表单选项源：频率枚举 / 列白名单 / 取值范围（**2026-10-16 起不再含 `smtp` 段** —— 发信通道改由 `scheduled_task` 域的 `GET /api/v2/cron/mail/meta` + `GET /api/v2/cron/mail/accounts` 提供，见 `dto::MetaOut`） |
 //! | `POST` | `/preview` | 按「当前配置 + 临时覆盖」渲染 HTML；**不发送、不落流水** |
 //! | `POST` | `/send`    | 手动触发：渲染 + 真发 + 落流水（成败都落） |
 //! | `GET`  | `/logs`    | 发送历史分页（`limit∈[1,200]` + `offset`） |
 //!
 //! 权威路由清单是 [`handler::ROUTES`]（`handler::tests` 断言它与 [`router`] 源码逐条一致）。
+//!
+//! ## 硬切记录（2026-10-18）
+//!
+//! - `/api/v2/mail-digest/*` → **`/api/v2/cron/mail-digest/*`**（**旧路径 404，无 alias**）。
+//!   归入「定时任务」域组前缀 `/cron`（其下四个子域：`mail` 通道 / `mail-digest` 内容
+//!   / `wecom` 通道 / `wecom-daily` 内容）。
+//! - 前缀由「顶层 nest、单段」变为「`/cron` 父前缀下的两段」；域内路由表本身
+//!   （[`handler::ROUTES`]）**一行未动**，变的只是 nest 路径。
+//! - 守卫：`tests/mail_digest/config.rs::old_mail_digest_prefix_returns_404`
+//!   （实跑旧前缀，断言 404；同用例先钉新前缀 200 作正向对照）。
 //!
 //! ## 硬约束记录
 //! - **只用 GET / POST**：本仓 HTTP 路由**零** PUT/PATCH/DELETE（全仓 `.put(` /
@@ -115,9 +125,11 @@ use axum::Router;
 
 use crate::state::AppState;
 
-/// `/api/v2/mail-digest/*` 端点（6 条，全部 Manager 独占）。
+/// `/api/v2/cron/mail-digest/*` 端点（6 条，全部 Manager 独占）。
 ///
-/// 挂载点登记在 [`crate::modules::v2_router`] 的 `.nest("/mail-digest", …)`。
+/// 挂载点登记在 [`crate::modules::v2_router`] 的 `.nest("/cron/mail-digest", …)`
+/// （`/cron` 父前缀下的两段，**不是**顶层单段 —— 2026-10-18 硬切，见模块 doc 的
+/// 「硬切记录」）。
 /// （2026-10-13 review 第 2 轮 #11：原先写成 [`crate::modules::mod::v2_router`]，
 /// `mod` 是关键字，rustdoc 解析不了；仓内其它域一律写不带 `mod` 的形式，见 `wx/mod.rs`。）
 pub fn router() -> Router<Arc<AppState>> {

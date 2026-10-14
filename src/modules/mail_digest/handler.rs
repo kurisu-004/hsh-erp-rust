@@ -1,11 +1,11 @@
 //! mail_digest 域 HTTP handler：6 个端点 + 路由表
 //!
-//! 端点（挂在 `/api/v2/mail-digest`，由 [`router`] 桥接；**全部 Manager 独占**）：
+//! 端点（挂在 `/api/v2/cron/mail-digest`，由 [`router`] 桥接；**全部 Manager 独占**）：
 //! - `GET  /config` —— 读单例配置（表空 ⇒ 全部默认值 + `version=0` + `id="0"`）
 //! - `POST /config` —— 全量覆写（body **必含** `version`）+ 触发调度热重载
 //! - `GET  /meta`   —— 内容与调度侧的表单选项源（频率 / 列白名单 / 取值范围）；
 //!   ⚠️ 2026-10-16 起**不再**含 `smtp` 段（发信通道改由 `scheduled_task` 域的
-//!   `/api/v2/mail/meta` + `/api/v2/mail/accounts` 提供）
+//!   `/api/v2/cron/mail/meta` + `/api/v2/cron/mail/accounts` 提供）
 //! - `POST /preview`—— 按「当前配置 + 临时覆盖」渲染 HTML（**不发送、不落流水**）
 //! - `POST /send`   —— 手动触发（渲染 + 真发 + 落流水）
 //! - `GET  /logs`   —— 发送历史分页（`limit∈[1,200]` + `offset`）
@@ -37,7 +37,7 @@ use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
 
-/// 本域 router 注册的全部路由（`METHOD /path`，相对 `/api/v2/mail-digest`）。
+/// 本域 router 注册的全部路由（`METHOD /path`，相对 `/api/v2/cron/mail-digest`）。
 ///
 /// 与 [`router`] 的源码由 `mod tests::routes_declared_in_router` 逐条比对
 /// （范式同 `prod::batch::handler::ROUTES`）—— 加了 `.route()` 忘了登记就在
@@ -51,7 +51,7 @@ pub const ROUTES: &[&str] = &[
     "GET /logs",
 ];
 
-/// `GET /api/v2/mail-digest/config`
+/// `GET /api/v2/cron/mail-digest/config`
 ///
 /// Manager 独占。表里无行时返回 `id="0"` / `version=0` + 全部默认值，
 /// 前端据此渲染空表单并以 `version=0` 提交首次配置。
@@ -65,7 +65,7 @@ pub async fn get_config(
     Ok(Json(R::ok(out)))
 }
 
-/// `POST /api/v2/mail-digest/config`
+/// `POST /api/v2/cron/mail-digest/config`
 ///
 /// Manager 独占。**全量覆写** + 标准 OCC（`version` 必填，缺失 → axum `Json`
 /// 提取器返 **HTTP 422 纯文本**，不是业务信封）。
@@ -86,15 +86,15 @@ pub async fn save_config(
     Ok(Json(R::ok(out)))
 }
 
-/// `GET /api/v2/mail-digest/meta`
+/// `GET /api/v2/cron/mail-digest/meta`
 ///
 /// Manager 独占。**内容与调度侧的表单选项源都在这一个端点**（频率 / 列白名单 /
 /// 取值范围 / 缺省值），前端不需要在任何地方硬编码一份枚举映射。
 ///
 /// ⚠️ **2026-10-16 删掉 `smtp` 段**：那些值（host / port / tls_mode / 发件地址 /
 /// 发件人名）已经逐条换了归属 —— 见 `dto::MetaOut` 的「原 `smtp.*` → 新的去处」
-/// 对照表。现在发信通道信息在 `GET /api/v2/mail/meta`（预设表）与
-/// `GET /api/v2/mail/accounts`（邮箱列表）两个端点里。
+/// 对照表。现在发信通道信息在 `GET /api/v2/cron/mail/meta`（预设表）与
+/// `GET /api/v2/cron/mail/accounts`（邮箱列表）两个端点里。
 pub async fn meta(current: CurrentUser) -> Result<Json<R<MetaOut>>, AppError> {
     current.require_role(Role::Manager)?;
     let out = MetaOut {
@@ -124,7 +124,7 @@ pub async fn meta(current: CurrentUser) -> Result<Json<R<MetaOut>>, AppError> {
     Ok(Json(R::ok(out)))
 }
 
-/// `POST /api/v2/mail-digest/preview`
+/// `POST /api/v2/cron/mail-digest/preview`
 ///
 /// Manager 独占。按「当前配置 + 临时覆盖」渲染 HTML，**不发送、不落流水**。
 /// 用途：前端配置页的「预览邮件效果」。空体 `{}` = 完全用当前配置。
@@ -139,7 +139,7 @@ pub async fn preview(
     Ok(Json(R::ok(out)))
 }
 
-/// `POST /api/v2/mail-digest/send`
+/// `POST /api/v2/cron/mail-digest/send`
 ///
 /// Manager 独占。手动触发：渲染 + 真发 + 落流水（**成败都落**）。
 ///
@@ -155,7 +155,7 @@ pub async fn send(
     Ok(Json(R::ok(out)))
 }
 
-/// `GET /api/v2/mail-digest/logs`
+/// `GET /api/v2/cron/mail-digest/logs`
 ///
 /// Manager 独占。发送历史（`sent_at DESC`），`limit` clamp 到 `[1,200]`、
 /// `offset` clamp 到 `>=0`。`total` 不受 `limit` 截断影响。
@@ -170,7 +170,7 @@ pub async fn logs(
     Ok(Json(R::ok(out)))
 }
 
-/// `/api/v2/mail-digest/*` 路由表。
+/// `/api/v2/cron/mail-digest/*` 路由表。
 ///
 /// ⚠️ **matchit 注册顺序**：本域 6 条路由**全部是静态段**（无 `Path` 参数），
 /// 故不存在「静态段必须先于 catch-all」的排序约束 —— 这一点在 `mod.rs` 的

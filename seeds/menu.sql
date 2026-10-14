@@ -76,7 +76,12 @@ WHERE deleted_at IS NOT NULL
     --
     -- 2026-10-13 复活它们时的理由（软删态下不被 partial 索引命中、ON CONFLICT 失效
     -- 会撞 PK）对本轮的新 code **不适用**：新 code 从来没有过软删行。
-    'scheduled_task', 'mail'
+    'scheduled_task', 'mail',
+    -- 2026-10-18 新增：scheduled_task 下第三个子项「企业微信」（`wecom`），
+    -- 与 §2 那条 INSERT 配对登记。此刻该 code 还没有任何行（含软删行）⇒
+    -- 本节的 UPDATE 对它是 no-op；列在这里是为了让「本 seed 声明过的 code」
+    -- 清单完整 —— 将来若有人下线再复活这个菜单，它已被覆盖。
+    'wecom'
   );
 
 -- ============================================================================
@@ -176,6 +181,24 @@ INSERT INTO t_menu (
     -- `mail`，旧行（id=...901）不参与 `ON CONFLICT (code)` 判定，复用 id 会撞 pkey。
     -- path 与前端路由一致（`/mail`）。
     (9000000000000902, (SELECT id FROM t_menu WHERE code = 'scheduled_task'   AND deleted_at IS NULL), 'mail',                      '邮件',          '/mail',                        'Message',     10, true, 0, now(), 0, now(), 0),
+    -- 2026-10-18 新增：scheduled_task 下。**企业微信**（群机器人 webhook 通道 +
+    -- 每日总结推送内容；页面上方同样用 tab 区分推送类型）。
+    --
+    -- ⚠️ **id 必须是 `9000000000000903`**：`...902` 已被「邮件」占、上面 §1 那段
+    -- 里 `...013` 是**已软删**的旧 `mail_group` 行（物理占用，绝不可复用 ——
+    -- id 是唯一能把「软删」与「新增」区分开的标识），`...001..014` 顶级段也已占满。
+    -- `...903` 是 `9000…090x` 这一段里 `scheduled_task` 下的唯一空闲位。
+    --
+    -- ⚠️ `path='/wecom'` 必须与前端 router 的 `path: 'wecom'` **逐字一致**：
+    -- 不一致时前端路由守卫会把用户踢走（现象是「点菜单闪一下又回到别的页」）。
+    -- ⚠️ **菜单 path 不跟着 API 前缀变**：后端 API 已硬切到 `/api/v2/cron/wecom*`
+    -- （2026-10-18），菜单 path 仍是 `/wecom` —— 两者是不同层的东西。
+    --
+    -- icon `ChatDotRound`：`@element-plus/icons-vue@2.3.1` 确实导出该图标；
+    -- 前端 `src/layouts/components/menuIcons.ts` 的 `ICON_MAP` 同步补一条
+    -- （与后端 seed 锁步，前端那一半不在本仓库）。
+    -- 授权：仅 MANAGER，见 `seeds/rbac.sql` §4.1。
+    (9000000000000903, (SELECT id FROM t_menu WHERE code = 'scheduled_task'   AND deleted_at IS NULL), 'wecom',                     '企业微信',      '/wecom',                       'ChatDotRound', 20, true, 0, now(), 0, now(), 0),
 
     -- template_management 下（023）
     (9000000000000701, (SELECT id FROM t_menu WHERE code = 'template_management' AND deleted_at IS NULL), 'print_templates_designer','模板编辑',     '/print-templates',             'Document',     10, true, 0, now(), 0, now(), 0)

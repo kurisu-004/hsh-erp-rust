@@ -4,7 +4,7 @@
 //! `GET /parts/{part_id}/print-drawing`（单件图纸 + 条码背面 PDF）与
 //! `POST /parts/print-drawing-batch`（多件合并 PDF）。PDF 光栅化 / pikepdf 合并 /
 //! ReportLab 条码全在 python 侧执行，rust 只提供「必须带 JWT 才能打印」这道闸门
-//! 与一条撑得住分钟级耗时的通道（`middleware::timeout::is_print_path` 长档）。
+//! 与一条撑得住分钟级耗时的通道（`middleware::timeout::is_long_timeout_path` 长档）。
 //!
 //! ## handler 语义
 //! 1. `authenticate_middleware` 已强制 JWT 校验（未带 token → 40100）；

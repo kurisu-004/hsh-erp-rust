@@ -1,4 +1,4 @@
-//! `POST /api/v2/mail/accounts/{id}/delete`（软删 + 被引用禁删）契约。
+//! `POST /api/v2/cron/mail/accounts/{id}/delete`（软删 + 被引用禁删）契约。
 //!
 //! ★ 核心回归：**被 mail_digest 配置引用的邮箱禁止删除**（21708 + 409）——
 //! 否则删完之后交期汇总配置的 `sender_account_id` 会指向一条死行，页面看着正常、
@@ -21,14 +21,14 @@ async fn delete_soft_deletes_and_hides_from_list() {
 
     let (status, env) = post_as_manager(
         &ctx,
-        &format!("/mail/accounts/{id}/delete"),
+        &format!("/cron/mail/accounts/{id}/delete"),
         json!({ "version": created["version"] }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{env}");
     assert_eq!(env["code"], 0, "{env}");
 
-    let (_, env) = get_as_manager(&ctx, "/mail/accounts").await;
+    let (_, env) = get_as_manager(&ctx, "/cron/mail/accounts").await;
     let items = env["data"]["items"].as_array().expect("items 是数组");
     assert!(
         !items.iter().any(|i| i["id"] == json!(id.to_string())),
@@ -54,7 +54,7 @@ async fn delete_referenced_account_returns_21708() {
 
     let (status, env) = post_as_manager(
         &ctx,
-        &format!("/mail/accounts/{id}/delete"),
+        &format!("/cron/mail/accounts/{id}/delete"),
         json!({ "version": created["version"] }),
     )
     .await;
@@ -63,7 +63,7 @@ async fn delete_referenced_account_returns_21708() {
     // 行必须还在（拒删，不是「删了再说」）
     let sealed = stored_secret(&ctx.pool, id).await;
     assert!(!sealed.is_empty(), "被引用的邮箱不得被软删");
-    let (_, env) = get_as_manager(&ctx, "/mail/accounts").await;
+    let (_, env) = get_as_manager(&ctx, "/cron/mail/accounts").await;
     assert!(
         env["data"]["items"]
             .as_array()
@@ -90,7 +90,7 @@ async fn delete_allowed_when_only_soft_deleted_config_references_it() {
 
     let (status, env) = post_as_manager(
         &ctx,
-        &format!("/mail/accounts/{id}/delete"),
+        &format!("/cron/mail/accounts/{id}/delete"),
         json!({ "version": created["version"] }),
     )
     .await;
@@ -106,7 +106,7 @@ async fn delete_without_version_returns_422_plain_text() {
     let (status, raw) = post_raw(
         &ctx,
         "POST",
-        &format!("/mail/accounts/{}/delete", id_of(&created)),
+        &format!("/cron/mail/accounts/{}/delete", id_of(&created)),
         json!({}),
     )
     .await;
@@ -121,7 +121,7 @@ async fn delete_missing_account_returns_21706() {
     let ctx = bootstrap().await;
     let (status, env) = post_as_manager(
         &ctx,
-        "/mail/accounts/999999999999999/delete",
+        "/cron/mail/accounts/999999999999999/delete",
         json!({ "version": 0 }),
     )
     .await;
@@ -138,7 +138,7 @@ async fn name_can_be_reused_after_soft_delete() {
 
     let (status, env) = post_as_manager(
         &ctx,
-        &format!("/mail/accounts/{id}/delete"),
+        &format!("/cron/mail/accounts/{id}/delete"),
         json!({ "version": created["version"] }),
     )
     .await;
@@ -160,7 +160,7 @@ async fn deleting_the_default_leaves_no_default() {
 
     let (status, env) = post_as_manager(
         &ctx,
-        &format!("/mail/accounts/{}/set-default", id_of(&a)),
+        &format!("/cron/mail/accounts/{}/set-default", id_of(&a)),
         json!({ "version": a["version"] }),
     )
     .await;
@@ -168,13 +168,13 @@ async fn deleting_the_default_leaves_no_default() {
 
     let (status, env) = post_as_manager(
         &ctx,
-        &format!("/mail/accounts/{}/delete", id_of(&a)),
+        &format!("/cron/mail/accounts/{}/delete", id_of(&a)),
         json!({ "version": env["data"]["version"] }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{env}");
 
-    let (_, env) = get_as_manager(&ctx, "/mail/accounts").await;
+    let (_, env) = get_as_manager(&ctx, "/cron/mail/accounts").await;
     let defaults = env["data"]["items"]
         .as_array()
         .expect("items 是数组")

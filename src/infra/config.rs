@@ -79,9 +79,11 @@ pub struct AppConfig {
     /// （不影响 WS 长连接，也不影响根 Router 的 CORS/Body limit）。环境变量
     /// `REQUEST_TIMEOUT_SECONDS`，缺省 `30`。
     pub request_timeout_seconds: u64,
-    /// 2026-10-03 新增：打印路径 HTTP 请求超时（秒），缺省 `660`。与上面的通用档
-    /// 分档并存——`middleware::timeout` 按 [`crate::middleware::timeout::is_print_path`]
-    /// 判定：打印路径走本档，其余路径仍走 `request_timeout_seconds`（30s 不变）。
+    /// 2026-10-03 新增：**长耗时路径** HTTP 请求超时（秒），缺省 `660`。与上面的通用档
+    /// 分档并存——`middleware::timeout` 按 [`crate::middleware::timeout::is_long_timeout_path`]
+    /// 判定：白名单路径走本档，其余路径仍走 `request_timeout_seconds`（30s 不变）。
+    /// 白名单 = 2 条批量打印路由 + `POST /cron/wecom-daily/send`（2026-10-19 加；
+    /// 共用本档而非新开一档，理由见 `middleware::timeout` 的模块 doc）。
     ///
     /// ## 为什么缺省 660 而不是 600（多出的 60s 是有意的边际）
     /// 批量图纸打印（20 件/批）由 Python 端执行，Python 侧超时是 600s
@@ -857,8 +859,8 @@ impl AppConfig {
             preview_poll_backoff_seconds: preview_poll_backoff_config()?,
             // 2026-09-20 新增：HTTP nest 请求超时；与 WS 隔离（挂在内层）。
             request_timeout_seconds: env_parse("REQUEST_TIMEOUT_SECONDS", 30u64)?,
-            // 2026-10-03 新增：打印路径专用 HTTP 超时档（`middleware::timeout` 按
-            // `is_print_path` 分档）。缺省 660s = Python 打印档 600s + 60s 边际，
+            // 2026-10-03 新增：长耗时路径专用 HTTP 超时档（`middleware::timeout` 按
+            // `is_long_timeout_path` 分档）。缺省 660s = Python 打印档 600s + 60s 边际，
             // 理由见 `AppConfig::print_request_timeout_seconds` 的 doc。
             // 用 `env_parse(.., 缺省)` 而非 `env_required`：本仓约定是「未配置则降级」
             // （与 `python_backend` / `wecom` 的 enabled 闸同一范式），不是「未配置则拒启」。

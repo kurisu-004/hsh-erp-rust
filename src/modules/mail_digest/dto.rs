@@ -356,7 +356,7 @@ pub fn parse_visible_columns(raw: &[String]) -> Result<Vec<VisibleColumn>, AppEr
 pub enum TriggerSource {
     /// cron 定时任务（`task::mail_digest` 的 job）。
     Scheduled,
-    /// 人工点「立即发送」（`POST /api/v2/mail-digest/send`）。
+    /// 人工点「立即发送」（`POST /api/v2/cron/mail-digest/send`）。
     Manual,
 }
 
@@ -431,7 +431,7 @@ impl Serialize for SendStatus {
 // 请求体
 // ============================================================================
 
-/// `POST /api/v2/mail-digest/config` 请求体：**全量覆写**。
+/// `POST /api/v2/cron/mail-digest/config` 请求体：**全量覆写**。
 ///
 /// ⚠️ `version` **必填、无 `#[serde(default)]`**（CLAUDE.md §8 硬约定）：
 /// 缺失时 axum `Json` 提取器直接返 **HTTP 422 纯文本**，不是业务信封。
@@ -727,9 +727,9 @@ pub struct RangeOut {
 /// | 原 `smtp.*` | 新的去处 |
 /// |---|---|
 /// | `configured` | `ConfigOut.smtp_configured`（`GET /config`，纯 DB 判定） |
-/// | `host` / `port` / `tls_mode` | `GET /api/v2/mail/meta` 的 `presets[]` |
-/// | `from_address` | `GET /api/v2/mail/accounts` 的 `account` |
-/// | `from_name` | `GET /api/v2/mail/accounts` 的 `name` |
+/// | `host` / `port` / `tls_mode` | `GET /api/v2/cron/mail/meta` 的 `presets[]` |
+/// | `from_address` | `GET /api/v2/cron/mail/accounts` 的 `account` |
+/// | `from_name` | `GET /api/v2/cron/mail/accounts` 的 `name` |
 ///
 /// 保留一个「已经没有任何生产方」的字段只会让前端照着它读一个恒空的对象。
 #[derive(Debug, Clone, Serialize)]

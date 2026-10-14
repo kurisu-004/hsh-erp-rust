@@ -1,0 +1,257 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, config_version, trigger_source, webhook_name, webhook_masked,\n               report_date, markdown_bytes, chunk_count, chunk_sent,\n               overview_batch_count, overview_quantity, note_count, note_part_count,\n               overdue_count, upcoming_count, worker_row_total, status, error_message,\n               sent_at, created_at\n        FROM t_wecom_daily_log\n        ORDER BY sent_at DESC, id DESC\n        LIMIT $1 OFFSET $2\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_wecom_daily_log",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "config_version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_wecom_daily_log",
+            "name": "config_version"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "trigger_source",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_wecom_daily_log",
+            "name": "trigger_source"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "webhook_name",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_wecom_daily_log",
+            "name": "webhook_name"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "webhook_masked",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_wecom_daily_log",
+            "name": "webhook_masked"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "report_date",
+        "type_info": "Date",
+        "origin": {
+          "Table": {
+            "table": "t_wecom_daily_log",
+            "name": "report_date"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "markdown_bytes",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_wecom_daily_log",
+            "name": "markdown_bytes"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "chunk_count",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "t_wecom_daily_log",
+            "name": "chunk_count"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "chunk_sent",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "t_wecom_daily_log",
+            "name": "chunk_sent"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "overview_batch_count",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_wecom_daily_log",
+            "name": "overview_batch_count"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "overview_quantity",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_wecom_daily_log",
+            "name": "overview_quantity"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "note_count",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_wecom_daily_log",
+            "name": "note_count"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "note_part_count",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_wecom_daily_log",
+            "name": "note_part_count"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "overdue_count",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_wecom_daily_log",
+            "name": "overdue_count"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "upcoming_count",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_wecom_daily_log",
+            "name": "upcoming_count"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "worker_row_total",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_wecom_daily_log",
+            "name": "worker_row_total"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "status",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_wecom_daily_log",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "error_message",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_wecom_daily_log",
+            "name": "error_message"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
+        "name": "sent_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_wecom_daily_log",
+            "name": "sent_at"
+          }
+        }
+      },
+      {
+        "ordinal": 19,
+        "name": "created_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_wecom_daily_log",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "45516ad0ee54c698aeb56469bd368bc1de6d9e874e06021988e0853abe4bf8e7"
+}

@@ -16,7 +16,9 @@
 //! 9. `upcoming_days_999_is_clamped_to_60` —— 越界值被 clamp，不是拒绝。
 //! 10. `unknown_visible_column_returns_21704`（不静默丢弃）。
 //! 11. `save_twice_bumps_version_by_one`
-//! 12. `clerk_cannot_read_config_returns_403`（6 端点全 MANAGER 独占）
+//! 13. `clerk_cannot_read_config_returns_403`（6 端点全 MANAGER 独占）
+//! 14. `old_mail_digest_prefix_returns_404` —— 硬切守卫（2026-10-18 新增）：
+//!     `/api/v2/mail-digest/*` → `/api/v2/cron/mail-digest/*`（旧路径 404、无 alias）
 
 use axum::http::StatusCode;
 use serde_json::json;
@@ -34,7 +36,7 @@ pub(crate) async fn save_config(
         ctx.app.clone(),
         json_request(
             "POST",
-            "/mail-digest/config",
+            "/cron/mail-digest/config",
             Some(body),
             Some(&ctx.manager_token),
         ),
@@ -46,7 +48,12 @@ pub(crate) async fn save_config(
 pub(crate) async fn get_config(ctx: &Ctx) -> (StatusCode, serde_json::Value) {
     send(
         ctx.app.clone(),
-        json_request("GET", "/mail-digest/config", None, Some(&ctx.manager_token)),
+        json_request(
+            "GET",
+            "/cron/mail-digest/config",
+            None,
+            Some(&ctx.manager_token),
+        ),
     )
     .await
 }
@@ -119,7 +126,7 @@ async fn config_save_without_version_field_returns_422_plain_text() {
         ctx.app.clone(),
         json_request(
             "POST",
-            "/mail-digest/config",
+            "/cron/mail-digest/config",
             Some(body),
             Some(&ctx.manager_token),
         ),
@@ -340,7 +347,7 @@ async fn config_accepts_empty_recipients_but_send_rejects_it() {
         ctx.app.clone(),
         json_request(
             "POST",
-            "/mail-digest/send",
+            "/cron/mail-digest/send",
             Some(json!({})),
             Some(&ctx.manager_token),
         ),
@@ -436,7 +443,12 @@ async fn clerk_cannot_read_config_returns_403() {
     let ctx = bootstrap().await;
     let (status, env) = send(
         ctx.app.clone(),
-        json_request("GET", "/mail-digest/config", None, Some(&ctx.clerk_token)),
+        json_request(
+            "GET",
+            "/cron/mail-digest/config",
+            None,
+            Some(&ctx.clerk_token),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{env}");
@@ -446,7 +458,7 @@ async fn clerk_cannot_read_config_returns_403() {
         ctx.app.clone(),
         json_request(
             "POST",
-            "/mail-digest/config",
+            "/cron/mail-digest/config",
             Some(config_body(0)),
             Some(&ctx.clerk_token),
         ),
@@ -489,7 +501,7 @@ async fn date_window_is_relative_to_runtime_today() {
         ctx.app.clone(),
         json_request(
             "POST",
-            "/mail-digest/preview",
+            "/cron/mail-digest/preview",
             Some(json!({})),
             Some(&ctx.manager_token),
         ),
@@ -505,4 +517,72 @@ async fn date_window_is_relative_to_runtime_today() {
 /// `now_naive().date()` 的本地别名（避免在断言里混用两套时间来源）。
 fn now_naive_date() -> chrono::NaiveDate {
     hsh_erp_rust::infra::clock::now_naive().date()
+}
+
+// ===========================================================================
+//  13. 硬切守卫：旧前缀 `/api/v2/mail-digest/*` 实跑 404（2026-10-18 新增）
+// ===========================================================================
+
+/// 2026-10-18 硬切：`/api/v2/mail-digest/*` → `/api/v2/cron/mail-digest/*`，
+/// **旧路径 404、无 alias**。本用例是那条硬切的回归护栏 —— service 直调
+/// 结构上测不到「路由没挂上去」，只有实跑 HTTP 才测得到。
+///
+/// ⚠️ 先钉正向对照（新前缀 200）：否则「整个域都坏了」也会让本用例绿。
+/// ⚠️ 用 `send_raw`：axum 对未匹配路由返 **404 + 空 body**，`send` 会在
+/// JSON 解析处 panic（那不是被测行为，是 helper 的前提）。
+#[tokio::test]
+async fn old_mail_digest_prefix_returns_404() {
+    let ctx = bootstrap().await;
+
+    // 正向对照：新前缀 200。
+    let (new_status, _) = send_raw(
+        ctx.app.clone(),
+        json_request(
+            "GET",
+            "/cron/mail-digest/config",
+            None,
+            Some(&ctx.manager_token),
+        ),
+    )
+    .await;
+    assert_eq!(new_status, StatusCode::OK, "新前缀必须 200");
+
+    // 旧前缀：一律 404。逐条端点都打一遍（6 条），避免只钉 `config` 时
+    // 「其余 5 条忘了搬」漏网 —— 那正是本仓历次硬切最常见的漏法。
+    for path in [
+        "/mail-digest/config",
+        "/mail-digest/meta",
+        "/mail-digest/logs",
+        "/mail-digest/preview",
+        "/mail-digest/send",
+    ] {
+        let (status, raw) = send_raw(
+            ctx.app.clone(),
+            json_request("GET", path, None, Some(&ctx.manager_token)),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "旧前缀 {path} 必须 404，实际 {raw}"
+        );
+    }
+
+    // 写端点同样 404（`/send` 用 GET 打一遍只是探路由；POST 那条另打一次，
+    // 确认不是「GET 没挂、POST 还在」这种半搬家）。
+    let (status, raw) = send_raw(
+        ctx.app.clone(),
+        json_request(
+            "POST",
+            "/mail-digest/config",
+            Some(json!({})),
+            Some(&ctx.manager_token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "旧前缀 POST /mail-digest/config 必须 404，实际 {raw}"
+    );
 }

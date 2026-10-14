@@ -170,12 +170,25 @@ async fn main() -> anyhow::Result<()> {
         task::mail_digest::run(mail_state, mail_token).await;
     });
 
+    // 2026-10-18 新增：企业微信每日总结推送定时任务。与上面两个任务一样挂**同一枚**
+    // `shutdown` 令牌（优雅退出一并生效）。未启用 / 未选通道时它自己打一行 info 后
+    // 不注册任何 job —— 后端照常启动，手动触发仍可用。
+    let wecom_state = state.clone();
+    let wecom_token = shutdown.clone();
+    tokio::spawn(async move {
+        task::wecom_daily::run(wecom_state, wecom_token).await;
+    });
+
     // 10. 路由组装
     let max_body = state.config.max_request_body_size;
     // 2026-10-03 新增：请求级超时改为按路径分档（替换 `tower_http::timeout::TimeoutLayer`）。
-    // 打印路径（送货单 print / print-labels、零件 print-drawing / print-drawing-batch）
-    // 走长档 `print_request_timeout_seconds`（缺省 660s）——批量图纸打印由 python 端
-    // 执行，合法耗时数分钟，原先统一 30s 会把批量打印必然打断成 408；
+    // 长耗时路径（**2 条**批量打印 + `POST /cron/wecom-daily/send`）走长档
+    // `print_request_timeout_seconds`（缺省 660s）：批量图纸打印由 python 端执行，合法耗时
+    // 数分钟；企业微信日报是「同一个请求内串着 N 次顺序 HTTP」，最坏 ≈ 100s。原先统一 30s 会
+    // 把它们必然打断成 408（超时是把 handler 的 future 整个 drop 掉 ⇒ 已发生的对外副作用
+    // 连同本该落库的痕迹一起消失）。白名单与逐条理由见
+    // `middleware::timeout::is_long_timeout_path` 的 doc；⚠️ 2026-10-08 送货单的两条打印
+    // 路径已随打印链路下线移除，不再命中长档。
     // 其余路径仍走 `request_timeout_seconds`（缺省 30s，行为不变）。
     let api_v2 = modules::v2_router(state.clone())
         // 2026-10-03 新增：谓词 = tower-http 默认谓词 `and` 排除已压缩格式

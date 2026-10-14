@@ -14,8 +14,9 @@
 //! - 端到端（真实 `HttpPyBackend` + 本地 mock python 服务端）：2 条 v2→v1 URL
 //!   拼装逐字正确、鉴权头不进转发、`X-Forwarded-User-Id` 进转发、响应头清洗
 //!   （`content-length` 按实际 body 重算 / hop-by-hop + `content-encoding` 剥除）；
-//! - `is_print_path` 与本工程实际注册的 2 条打印路由**逐字一致**（不一致 = 批量
-//!   打印拿不到长档超时 / 打印响应落进 Redis 缓存）；
+//! - `is_long_timeout_path` 与本工程实际注册的 2 条打印路由**逐字一致**（不一致 = 批量
+//!   打印拿不到长档超时 / 打印响应落进 Redis 缓存）。⚠️ 该判定是**长耗时路径白名单**
+//!   （2026-10-19 起含 `POST /cron/wecom-daily/send`），本文件只守打印那两条；
 //! - 幂等中间件的打印路径跳过闸门。
 //!
 //! ## 测试栈
@@ -412,20 +413,23 @@ async fn print_forward_failure_returns_20407() {
 }
 
 // ===========================================================================
-// 8. is_print_path 与实际注册的 2 条路由逐字一致
+// 8. is_long_timeout_path 与实际注册的 2 条打印路由逐字一致
 // ===========================================================================
 
 /// 判定的输出（长档超时 + 幂等跳过缓存）必须落在**实际注册**的 2 条路由上。
-/// 一旦路由改名而 `is_print_path` 没跟着改：批量打印会退回 30s 被砍断
+/// 一旦路由改名而 `is_long_timeout_path` 没跟着改：批量打印会退回 30s 被砍断
 /// （功能不可用），同时多 MB 的 PDF 又会落进 Redis 缓存。
 #[test]
 fn print_path_gate_matches_registered_routes_verbatim() {
-    use hsh_erp_rust::middleware::timeout::is_print_path;
+    use hsh_erp_rust::middleware::timeout::is_long_timeout_path;
 
     for uri in [PART_DRAWING_URI, PART_DRAWING_BATCH_URI] {
-        assert!(is_print_path(uri), "已注册的打印路由必须命中长档：{uri}");
         assert!(
-            is_print_path(&format!("/api/v2{uri}")),
+            is_long_timeout_path(uri),
+            "已注册的打印路由必须命中长档：{uri}"
+        );
+        assert!(
+            is_long_timeout_path(&format!("/api/v2{uri}")),
             "生产形态（/api/v2 前缀）也必须命中：/api/v2{uri}"
         );
     }
@@ -434,7 +438,7 @@ fn print_path_gate_matches_registered_routes_verbatim() {
 /// 反向：相近但不是打印的路径不能命中（否则普通端点静默继承 660s 长档）。
 #[test]
 fn print_path_gate_rejects_lookalikes() {
-    use hsh_erp_rust::middleware::timeout::is_print_path;
+    use hsh_erp_rust::middleware::timeout::is_long_timeout_path;
 
     for uri in [
         "/parts/1234567890/print",
@@ -443,7 +447,7 @@ fn print_path_gate_rejects_lookalikes() {
         "/parts/batch",
         "/parts/1234567890",
     ] {
-        assert!(!is_print_path(uri), "非打印路径不该命中长档：{uri}");
+        assert!(!is_long_timeout_path(uri), "非打印路径不该命中长档：{uri}");
     }
 }
 
