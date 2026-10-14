@@ -683,7 +683,7 @@ pub async fn send_scheduled(state: &Arc<AppState>) {
         let mut conn = match state.pool.acquire().await {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(error = %e, "wecom_daily: 定时日报取连接失败（无连接可落流水）");
+                tracing::warn!(error = %e, "wecom_daily: 定时日报读配置段取连接失败（无连接可落流水）");
                 return;
             }
         };
@@ -703,7 +703,7 @@ pub async fn send_scheduled(state: &Arc<AppState>) {
         let mut conn = match state.pool.acquire().await {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(error = %e, "wecom_daily: 定时日报取连接失败（无连接可落流水）");
+                tracing::warn!(error = %e, "wecom_daily: 定时日报通道探测段取连接失败（无连接可落流水）");
                 return;
             }
         };
@@ -737,8 +737,16 @@ pub async fn send_scheduled(state: &Arc<AppState>) {
 /// 形参是纯噪音，留着只会让人以为「落库形态依赖 cfg」。两种失败的区分由**调用方的
 /// `warn!` 文案**承担（「读配置/解析」vs「推送通道不可用」）。
 ///
-/// `config_version` 尽力从**原始行**捞（表空 / 读取失败 ⇒ 记 0）：流水表的这几列是
+/// `config_version` 尽力从**原始行**捞（表空 / **读取失败** ⇒ 记 0）：流水表的这几列是
 /// **快照**（配置改了之后仍要看「当时用的是哪版配置」），拿不到时留 0 比编一个更诚实。
+///
+/// ⚠️ **刻意不走共用的 [`insert_log`]，自己读版本号再直调 [`repo::insert_log`]**：
+/// 共用那条对版本号快照是**严格**的（读失败 ⇒ 整行不落），而本函数存在的意义恰恰是
+/// 「失败也要留下痕迹」⇒ 这里的读失败必须降级成 `0`、INSERT 照发。两条路径对**同一个**
+/// 失败取相反策略，理由各自不同（`deliver` 那条见 [`insert_log`] 的 doc），所以不给共用
+/// helper 加「模式」形参：那样只会在严格那条调用点多一个开关，而严格性恰恰是不能由调用点
+/// 随手决定的东西。⚠️ 仍然是**同一条借来的连接**上「读版本号 + INSERT」，不额外借还。
+/// 源码级护栏见 `tests` 里 `log_prepare_failure_keeps_its_best_effort_version_snapshot`。
 ///
 /// ⚠️ **自己借连接**（不接 `&mut PgConnection`）：调用方已经把连接还回池里了，
 /// 带着形参会逼它在「准备失败 → 要落流水」这条路径上继续占着一条连接。
@@ -755,37 +763,34 @@ async fn log_prepare_failure(state: &Arc<AppState>, err: &AppError) {
         }
     };
     let now = now_ts();
-    let inserted = insert_log(
-        state,
-        &mut conn,
-        NewDailyLog {
-            trigger_source: TriggerSource::Scheduled.as_str(),
-            // 通道都没解析出来 ⇒ 名称与掩码只能是空串（列是 NOT NULL）。留空而不是
-            // 编一个：那两列是「发到哪个群」的快照，编出来的比没有更会误导排障。
-            webhook_name: String::new(),
-            webhook_masked: String::new(),
-            markdown_bytes: 0,
-            chunk_count: 0,
-            chunk_sent: 0,
-            overview_batch_count: 0,
-            overview_quantity: 0,
-            note_count: 0,
-            note_part_count: 0,
-            overdue_count: 0,
-            upcoming_count: 0,
-            worker_row_total: 0,
-            status: SendStatus::Failed.as_str(),
-            error_message: Some(truncate_chars(&err.to_string(), 500)),
-            // ⚠️ `report_date` 与 `sent_at` **取自同一次 `now_ts()`**：两次独立取时钟
-            // 会跨零点产出 `report_date != sent_at.date()` 的行，直接违反 `repo.rs`
-            // 写死的那条不变量（前端「不建统计日列」的前提）。
-            report_date: now.date(),
-            sent_at: now,
-        },
-    )
-    .await;
+    let log = NewDailyLog {
+        trigger_source: TriggerSource::Scheduled.as_str(),
+        // 通道都没解析出来 ⇒ 名称与掩码只能是空串（列是 NOT NULL）。留空而不是
+        // 编一个：那两列是「发到哪个群」的快照，编出来的比没有更会误导排障。
+        webhook_name: String::new(),
+        webhook_masked: String::new(),
+        markdown_bytes: 0,
+        chunk_count: 0,
+        chunk_sent: 0,
+        overview_batch_count: 0,
+        overview_quantity: 0,
+        note_count: 0,
+        note_part_count: 0,
+        overdue_count: 0,
+        upcoming_count: 0,
+        worker_row_total: 0,
+        status: SendStatus::Failed.as_str(),
+        error_message: Some(truncate_chars(&err.to_string(), 500)),
+        // ⚠️ `report_date` 与 `sent_at` **取自同一次 `now_ts()`**：两次独立取时钟
+        // 会跨零点产出 `report_date != sent_at.date()` 的行，直接违反 `repo.rs`
+        // 写死的那条不变量（前端「不建统计日列」的前提）。
+        report_date: now.date(),
+        sent_at: now,
+    };
+    let config_version = cfg_version_best_effort(cfg_version_of(&mut conn).await);
+    let inserted = repo::insert_log(&mut conn, &state.snowflake, config_version, &log).await;
     match inserted {
-        Ok(log) => tracing::info!(log_id = log.id, "wecom_daily: 准备阶段失败流水已落库"),
+        Ok(row) => tracing::info!(log_id = row.id, "wecom_daily: 准备阶段失败流水已落库"),
         Err(e) => tracing::warn!(error = %e, "wecom_daily: 准备阶段失败流水落库失败"),
     }
 }
@@ -854,12 +859,14 @@ async fn fetch_rows(
 /// 落一行流水（**版本号快照与 INSERT 合并在同一次借还里**，见模块 doc「连接纪律」）。
 ///
 /// `config_version` 在此**现读**（`repo::get_config` → `.version`，表空 ⇒ `0`）：
-/// 它是「落库这一刻」的快照，配置在推送途中被别人改过时流水要记**新**值。本函数是
-/// **唯一**给 `repo::insert_log` 传版本号的入口 ⇒ 不存在「调用方塞了个陈旧版本」的路径。
+/// 它是「落库这一刻」的快照，配置在推送途中被别人改过时流水要记**新**值。本函数**只**
+/// 服务 [`deliver`] 一条路径 ⇒ 不存在「调用方塞了个陈旧版本」的路径。
 ///
-/// ⚠️ 返回 [`AppError`]（而不是 `sqlx::Error`）：`deliver` 与 `log_prepare_failure` 都是
-/// `Result<_, AppError>`，且落流水失败必须**原样**冒泡（`deliver` 里这行就是「推送失败后
-/// 唯一的诊断信息载体」，静默吞掉等于把 `21802` 换成一个没人看的结果）。
+/// ⚠️ **版本号读失败在此原样冒泡**（不降级）：`deliver` 里这行就是「推送失败后唯一的
+/// 诊断信息载体」，静默吞掉等于把 `21802` 换成一个没人看的结果。
+/// ⚠️ 另一条落流水路径（准备阶段失败）**刻意不走本函数**、自己读且降级成 `0` —— 那边
+/// 的存在意义是「失败也要留下痕迹」，对同一个失败取相反策略；理由与写法见
+/// [`log_prepare_failure`]。
 async fn insert_log(
     state: &Arc<AppState>,
     conn: &mut PgConnection,
@@ -869,12 +876,23 @@ async fn insert_log(
     Ok(repo::insert_log(conn, &state.snowflake, config_version, &log).await?)
 }
 
-/// 读当前配置行版本（流水快照用；表空时记 `0`）。
+/// 读当前配置行版本（流水快照用；表空时记 `0`）。**读失败也返回 `Err`** —— 由调用方决定
+/// 拿它怎么办（[`deliver`] 原样冒泡 / [`log_prepare_failure`] 降级，见两处 doc）。
 async fn cfg_version_of(conn: &mut PgConnection) -> Result<i32, AppError> {
     Ok(repo::get_config(conn)
         .await?
         .map(|r| r.version)
         .unwrap_or(0))
+}
+
+/// 版本号快照的**尽力**读法：读失败降级 `0`（纯函数，吃读出来的 `Result`，不碰连接）。
+///
+/// ⚠️ **只有 [`log_prepare_failure`] 走它**（`deliver` 走 [`insert_log`] 的严格版）。
+/// 降级口径与「表空」同形（都记 `0`）：`config_version` 是审计快照列，宁可少一个版本号，
+/// 也不能因为读不到版本号就把**整行**痕迹丢掉 —— 那正是这条路径存在的理由被抽掉时
+/// 会出现的那种静默（只多一行会被轮转掉的 `warn!`，`t_wecom_daily_log` 里一行都没有）。
+fn cfg_version_best_effort(read: Result<i32, AppError>) -> i32 {
+    read.unwrap_or(0)
 }
 
 /// 状态映射的**纯函数**（`chunk_sent < chunk_count ⟺ FAILED` 是前端可依赖的不变量）。
@@ -1017,11 +1035,21 @@ async fn deliver(
 /// `50001 DATABASE` 并**丢掉整行流水**（正是 `repo.rs` 那条「`error_message`
 /// 必须截到列宽内」的警告形态）。所以先给省略号**留一位**：
 /// `take(max - 1)` + `push('…')` = 恰好 `max` 字。
+///
+/// ⚠️ **`max == 0` 早退成空串**（不是 1 个省略号）：`max.saturating_sub(1)` 在 `max = 0`
+/// 时得 0，再 `push('…')` 仍是 1 字 > `max` ⇒ 「输出恒 ≤ `max`」这条不变式会被破坏。
+/// 选**运行期早退**而不是 `debug_assert!`：这条不变式是本函数 doc 的**对外承诺**
+/// （PG 列宽是硬边界），release 构建里也必须成立；而形如 `varchar(0)` 的列在仓内
+/// 不存在，但形参允许 0 ⇒ 早退是「不承诺的事就当场说清」，比让它在测试之外悄悄违反
+/// 承诺好。当前两个调用点都硬编码 `500`，这一档**不可达**，是给将来第三个调用点留的。
 fn truncate_chars(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
     if s.chars().count() <= max {
         return s.to_string();
     }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    let mut out: String = s.chars().take(max - 1).collect();
     out.push('…');
     out
 }
@@ -1360,5 +1388,143 @@ mod tests {
         let msg = format!("第 {}/{} 条失败：{}", 20, 20, "错因".repeat(400));
         let out = truncate_chars(&msg, 500);
         assert_eq!(out.chars().count(), 500, "必须恰好占满列宽而不是溢出 501");
+
+        // ⚠️ `max == 0` 单独判（上面的循环用 `max - 1` 造入参，0 会下溢）：一个字符都
+        // 放不下 ⇒ 空串。`max.saturating_sub(1)` + `push('…')` 那个形态在这里产出
+        // **1 个省略号** > `max`，违反本函数 doc 的「输出恒 ≤ max」。
+        for len in [0usize, 1, 600] {
+            let src = "汉".repeat(len);
+            assert_eq!(
+                truncate_chars(&src, 0),
+                "",
+                "len={len} max=0：应为空串而不是 1 个省略号"
+            );
+        }
+    }
+
+    // ==========================================================================
+    // 「准备阶段失败」的版本号快照：尽力读 + 绝不改走严格的 `insert_log`
+    // ==========================================================================
+
+    /// 把源码里的**注释**空格化（保留换行，便于 `panic!` 里报行号）。
+    ///
+    /// ⚠️ 只处理 `//` 与 `/* */`，**不**处理字符串字面量 —— 本文件现状零「字面量里含
+    /// `//` 或 `/*`」的写法（护栏只扫 [`FN_LOG_PREPARE_FAILURE`] 一个函数体，且下面两条
+    /// 断言匹配的是标识符/调用名，不是一般文本）。将来若在那个函数体里加了带 `//` 的
+    /// 字面量，本护栏会误判 ⇒ 属**源码形态敏感**的已知局限，与 `tests/wecom_daily/
+    /// n_plus_one_guard.rs` 同款口径（那里已把盲区清单逐条登记）。
+    fn blank_comments(src: &str) -> String {
+        let b = src.as_bytes();
+        let mut out = b.to_vec();
+        let mut i = 0usize;
+        while i < b.len() {
+            if b[i] == b'/' && b.get(i + 1) == Some(&b'/') {
+                while i < b.len() && b[i] != b'\n' {
+                    out[i] = b' ';
+                    i += 1;
+                }
+                continue;
+            }
+            if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                let mut depth = 1usize;
+                while i < b.len() {
+                    if b[i..].starts_with(b"/*") {
+                        depth += 1;
+                        out[i] = b' ';
+                        out[i + 1] = b' ';
+                        i += 2;
+                        continue;
+                    }
+                    if b[i..].starts_with(b"*/") {
+                        depth -= 1;
+                        out[i] = b' ';
+                        out[i + 1] = b' ';
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                        continue;
+                    }
+                    if b[i] != b'\n' {
+                        out[i] = b' ';
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            i += 1;
+        }
+        String::from_utf8(out).expect("注释空格化不改变字节的可解码性")
+    }
+
+    /// 被扫描的函数（准备阶段失败落流水，**不走**严格 `insert_log` 的那条）。
+    const FN_LOG_PREPARE_FAILURE: &str = "log_prepare_failure";
+
+    /// ★ 守卫：`log_prepare_failure` **不走**严格版 `insert_log`，版本号走尽力读。
+    ///
+    /// 2026-10-19 review 第 2 轮登记的**上一轮 fixer 自己引入的回归**：那次把
+    /// `log_prepare_failure` 里的 `cfg_version_of(conn).await.unwrap_or(0)` 挪进了共用
+    /// helper `insert_log`（那里是 `?`）⇒ 版本号读失败会让**整条**落流水提前返回、
+    /// `t_wecom_daily_log` 零行 —— 而「失败也要留下痕迹」这条路径上兜底**只有**这一份。
+    /// 复现形态（集成测试造不出来，见本用例的「覆盖形态」说明）：准备阶段失败 →
+    /// `log_prepare_failure` → `repo::get_config` 读失败 → `Err`。
+    ///
+    /// ## 覆盖形态与不足（**明写出来，免得日后有人当它是完备证明**）
+    ///
+    /// 这条护栏是**源码级**的（`include_str!("service.rs")`），与
+    /// `tests/wecom_daily/n_plus_one_guard.rs`、本域 `handler.rs` 的路由表护栏同款取舍。
+    /// 它守的是**接线形态**（走哪个 helper），守不了运行时：集成测试侧无法让
+    /// `repo::get_config` 在一条健康的测试库连接上失败（`REVOKE` / 断网都会让整条用例的
+    /// 基建一起挂），所以「读失败仍落库」这个**行为**由 [`cfg_version_best_effort`]
+    /// 的纯函数单测守，两条合起来才是「降级口径 + 接线」全覆盖。
+    /// ⚠️ 已知局限：注释里的同名字符串会骗过匹配（`blank_comments` 已把注释空格化，
+    /// 但**没有**处理字符串字面量）；函数被改名 / 抽出到别的文件时本用例会 panic 而非
+    /// 静默通过（panic 同样算红）。
+    #[test]
+    fn log_prepare_failure_keeps_its_best_effort_version_snapshot() {
+        let src = blank_comments(include_str!("service.rs"));
+        let (_, rest) = src
+            .split_once(&format!("async fn {FN_LOG_PREPARE_FAILURE}"))
+            .unwrap_or_else(|| panic!("源码里找不到 `async fn {FN_LOG_PREPARE_FAILURE}`"));
+        let end = rest
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("`{FN_LOG_PREPARE_FAILURE}` 必须有收尾大括号"));
+        let body = &rest[..end];
+
+        assert!(
+            body.contains("cfg_version_best_effort("),
+            "`{FN_LOG_PREPARE_FAILURE}` 的函数体必须经 `cfg_version_best_effort` 取版本号 \
+             （尽力读：失败降级 0，INSERT 照发）"
+        );
+        // 严格 helper 只服务 `deliver`：本函数体内**任何**独立的 `insert_log` 标识符都
+        // 必须带 `repo::` 限定（`repo::insert_log` 是直调 repo，不是共用 helper）。
+        let mut from = 0usize;
+        while let Some(rel) = body[from..].find("insert_log") {
+            let at = from + rel;
+            assert!(
+                body[..at].ends_with("::"),
+                "`{FN_LOG_PREPARE_FAILURE}` 不得调用严格的 `insert_log` helper \
+                 （第 {} 行：`{}`）：那里版本号读失败会让整条落流水提前返回、\
+                 `t_wecom_daily_log` 零行；本函数要走 `repo::insert_log` + \
+                 `cfg_version_best_effort`",
+                1 + body[..at].matches('\n').count(),
+                body[at..].split(['\n', ',']).next().unwrap_or("")
+            );
+            from = at + "insert_log".len();
+        }
+    }
+
+    /// 尽力版的降级口径：读失败 ⇒ `0`，读到 ⇒ 原值。
+    ///
+    /// ⚠️ 与上一条**成对存在**：那条守「谁在用这个降级」（接线），本条守「降级成什么」
+    /// （口径）。缺上一条 ⇒ 把调用改回严格 helper 时本条仍全绿；缺本条 ⇒ 降级写成别的
+    /// 值（比如 `1`）时上一条仍全绿。
+    #[test]
+    fn cfg_version_best_effort_degrades_read_failures_to_zero() {
+        assert_eq!(cfg_version_best_effort(Ok(7)), 7, "读得到就原样用");
+        // 表空那档在 `cfg_version_of` 里就已经是 `Ok(0)`，落到本函数仍是 0。
+        assert_eq!(cfg_version_best_effort(Ok(0)), 0);
+        let boom = AppError::Database(sqlx::Error::PoolTimedOut);
+        assert_eq!(cfg_version_best_effort(Err(boom)), 0, "读失败必须降级成 0");
     }
 }
