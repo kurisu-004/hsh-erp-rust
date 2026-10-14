@@ -21,6 +21,8 @@
 //! 7. `mixed_delivered_and_open_batches_follow_the_opposite_two_rules`
 //!    —— 工单行守卫（任一批次已交 ⇒ 整行不出现）与批次过滤（不按状态，`CANCELLED` 照列）
 //!    **方向相反**，两条钉在同一个用例里
+//! 8. `preview_shows_each_assembly_childs_serial_no_on_its_batch_row`
+//!    —— 装配件的批次子行**序列号格填子件序列号**（2026-10-16）；子件图号不得顶上来
 //!
 //! ## 本文件**不**守的东西
 //!
@@ -56,11 +58,36 @@ async fn preview(ctx: &Ctx, body: Value) -> (StatusCode, Value) {
     .await
 }
 
-/// 只看批次四列的 preview（省得断言被 10 个缺省列的其它内容干扰）。
+/// 只看批次侧几列的 preview（省得断言被 10 个缺省列的其它内容干扰）。
+///
+/// ⚠️ 2026-10-16 起含 `serial_no` —— 装配件子行的序列号格就是靠这一列断言的。
 fn batch_only_body() -> Value {
     json!({
-        "visible_columns": ["batch_no", "quantity", "status", "location"]
+        "visible_columns": ["serial_no", "batch_no", "quantity", "status", "location"]
     })
+}
+
+/// 取出正文里**全部批次子行**的首个 `<td>`（列序 = `serial_no` 在第一位时的序列号格）。
+///
+/// ⚠️ 按 `<tr bgcolor="#f7f8fa">` 定位而不是按某个批次号：同一装配件下多个子件的批次
+/// **各自**从 `batch_no = 1` 起 ⇒ 定位不到是哪一行，返回**顺序也不确定**
+/// （SQL 只按 `(owner_type, owner_id, batch_no)` 排，子件之间无先后口径）⇒ 断言一律
+/// 按集合做。
+fn batch_sub_row_serials(html: &str) -> Vec<String> {
+    html.split("<tr bgcolor=\"#f7f8fa\">")
+        .skip(1)
+        .filter_map(|row| {
+            let first_td = row.split("<td").nth(1)?;
+            let after_gt = &first_td[first_td.find('>')? + 1..];
+            Some(
+                after_gt
+                    .split("</td>")
+                    .next()
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        })
+        .collect()
 }
 
 // ===========================================================================
@@ -134,7 +161,8 @@ async fn preview_renders_all_batches_of_every_order_row() {
     );
     let html = env["data"]["html"].as_str().expect("html 是字符串");
 
-    for marker in ["第1批", "第2批", "第3批"] {
+    // 批次格只写纯数字 + 一个全角缩进（2026-10-16）
+    for marker in ["\u{3000}1", "\u{3000}2", "\u{3000}3"] {
         assert!(html.contains(marker), "缺批次子行 {marker}：\n{html}");
     }
     // 位置全为空 ⇒ 4 个批次子行都是 `—`（无批次工单不产生子行）
@@ -190,13 +218,76 @@ async fn preview_attaches_child_batches_to_assembly_row() {
     assert_eq!(env["data"]["upcoming_count"], 1, "装配件只出一行：{env}");
     let html = env["data"]["html"].as_str().expect("html 是字符串");
     assert!(
-        html.contains("第1批"),
+        html.contains("\u{3000}1"),
         "子件的批次没挂到装配件行下：\n{html}"
     );
-    assert!(html.contains("第2批"), "子件的第二个批次丢了：\n{html}");
+    assert!(html.contains("\u{3000}2"), "子件的第二个批次丢了：\n{html}");
     assert!(
         !html.contains("CHILD-9"),
         "子件不得单独成行（工单级行单位）：\n{html}"
+    );
+}
+
+/// ★ 装配件的批次子行**序列号格填子件序列号**（2026-10-16）。
+///
+/// 一个装配件行下面挂着多个子件的批次，只看批次号分不清「这一批是哪个子件的」——
+/// 用户原话：「对于装配件要写出每个子零件的序列号，否则不知道哪个批次是哪个子零件的」。
+///
+/// ⚠️ **返回顺序不可断言**：两个子件的批次**各自**从 `batch_no = 1` 起，而 SQL 只按
+/// `(owner_type, owner_id, batch_no)` 排、子件之间没有先后口径 ⇒ 断言按集合做。
+#[tokio::test]
+async fn preview_shows_each_assembly_childs_serial_no_on_its_batch_row() {
+    let ctx = crate::bootstrap().await;
+    let t = today();
+    let soon = t + chrono::Duration::days(2);
+    let asm_id = insert_assembly(
+        &ctx.pool,
+        ctx.customer_id,
+        "ASM-C1",
+        "多子件装配件",
+        "IN_PROCESS",
+        Some(soon),
+        4,
+    )
+    .await;
+
+    let mut serials = Vec::new();
+    for (drawing, serial) in [("CHILD-C1", "C1-001"), ("CHILD-C2", "C2-002")] {
+        let child = insert_part(
+            &ctx.pool,
+            ctx.customer_id,
+            drawing,
+            "子件",
+            "IN_PROCESS",
+            Some(soon),
+            Some(asm_id),
+            2,
+            Some(serial),
+            None,
+        )
+        .await;
+        insert_batch_full(&ctx.pool, child, 1, 2, "IN_PROCESS", None, None, false).await;
+        serials.push(serial.to_string());
+    }
+
+    let (status, env) = preview(&ctx, batch_only_body()).await;
+    assert_eq!(status, StatusCode::OK, "{env}");
+    assert_eq!(env["data"]["upcoming_count"], 1, "装配件只出一行：{env}");
+    let html = env["data"]["html"].as_str().expect("html 是字符串");
+
+    let mut got = batch_sub_row_serials(html);
+    got.sort();
+    let mut want = serials.clone();
+    want.sort();
+    assert_eq!(
+        got, want,
+        "每个批次子行的序列号格 = 各自的子件序列号：\n{html}"
+    );
+
+    // 子件的图号**不得**出现在子行序列号格上（不回退到图号）；子件也不单独成行
+    assert!(
+        !html.contains("CHILD-C1") && !html.contains("CHILD-C2"),
+        "子件图号不得漏进子行（只填子件序列号，且子件不单独成行）：\n{html}"
     );
 }
 
@@ -311,7 +402,7 @@ async fn preview_soft_deleted_holder_degrades_to_dash() {
         "软删工人不该出现在邮件里：\n{html}"
     );
     assert!(
-        html.contains("第1批"),
+        html.contains("\u{3000}1"),
         "批次行本身不能因 holder 软删而丢：\n{html}"
     );
 }
@@ -426,7 +517,7 @@ async fn preview_unknown_column_still_rejected_and_known_ones_render() {
     let (status, env) = preview(&ctx, json!({ "visible_columns": ["drawing_no"] })).await;
     assert_eq!(status, StatusCode::OK, "{env}");
     let html = env["data"]["html"].as_str().expect("html 是字符串");
-    assert!(!html.contains("第1批"), "批次列被勾掉后不应出现批次号");
+    assert!(!html.contains("\u{3000}1"), "批次列被勾掉后不应出现批次号");
     assert!(!html.contains(">位置<"), "位置列被勾掉后不应出现表头");
 
     // ② 勾上 batch_no + location ⇒ 出现
@@ -437,7 +528,10 @@ async fn preview_unknown_column_still_rejected_and_known_ones_render() {
     .await;
     assert_eq!(status, StatusCode::OK, "{env}");
     let html = env["data"]["html"].as_str().expect("html 是字符串");
-    assert!(html.contains("第1批") && html.contains(">位置<"), "{html}");
+    assert!(
+        html.contains("\u{3000}1") && html.contains(">位置<"),
+        "{html}"
+    );
 
     // ③ 未知列仍 21704（不静默丢弃）
     let (status, env) = preview(
@@ -594,7 +688,7 @@ async fn mixed_delivered_and_open_batches_follow_the_opposite_two_rules() {
     );
     assert!(html.contains("DWG-CANCELLED"), "缺工单行：\n{html}");
     // 两个批次都在（CANCELLED 不按状态过滤）
-    for marker in ["第1批", "第2批", "已取消", "生产中"] {
+    for marker in ["\u{3000}1", "\u{3000}2", "已取消", "生产中"] {
         assert!(html.contains(marker), "缺 {marker}：\n{html}");
     }
 }

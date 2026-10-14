@@ -200,8 +200,22 @@ impl From<DigestOrderRow> for DigestRow {
 pub struct DigestBatchRow {
     /// `t_part_batch.id`。
     pub id: i64,
-    /// `integer`，工单内批次序号（1 起）；渲染成「第 N 批」。
+    /// `integer`，工单内批次序号（1 起）；渲染成**纯数字**（列首格另加一个全角空格
+    /// 缩进，见 `template::batch_row`）。
     pub batch_no: i32,
+    /// 批次所属**子件**的序列号（`t_part.serial_no`，即 `t_part_batch.part_id` 指向的
+    /// 那一行）；填在子行的「序列号」列上。
+    ///
+    /// ⚠️ **散件工单的批次恒为 `None`** —— 那一支的 `t_part_batch.part_id` 指向的就是
+    /// 工单行自己那个零件，序列号已经写在工单行上，子行再写一遍是纯冗余（每行都重复
+    /// 一个已经在上一格出现过的值）。这是刻意选择，不是漏取。
+    ///
+    /// ⚠️ **装配件追加的子件 `serial_no` 恒为 NULL**（补件语义不重新打开序列号派发
+    /// 通道，出处是 `assembly::service::crud::add_assembly_child_inner` 的 doc）⇒ 那一类
+    /// 子件的批次子行序列号格**留空**，**不回退到图号**：图号是「图号」列的内容，
+    /// 在序列号列重复它会让这一列的语义漂成「零件标识」。回归：
+    /// `template.rs::tests::assembly_child_without_serial_no_leaves_cell_blank`。
+    pub part_serial_no: Option<String>,
     /// `integer`，本批次数量。**不带**「套」后缀 —— 批次恒是件数，「套」是装配件
     /// 工单行的口径。
     pub quantity: i32,
@@ -401,6 +415,9 @@ pub async fn list_upcoming(
 ///   软删的货架 / 工人 / 外协厂不该出现在邮件里；而加了它之后 `LEFT JOIN` 仍保留行，
 ///   只是名字解析不出来。
 /// - **`ORDER BY` 在 SQL 里排**（渲染层不二次排序，与主查询同一约定）。
+/// - **`part_serial_no` 两支取法不同（2026-10-16）**：装配件支取子件的 `c.serial_no`
+///   （可空），散件支写 `NULL::varchar` —— 那一支的批次就是工单自己的零件，序列号已在
+///   工单行上，子行重复写是冗余。逐字段理由见 [`DigestBatchRow::part_serial_no`]。
 pub async fn list_batches(
     conn: &mut PgConnection,
     part_ids: &[i64],
@@ -418,7 +435,8 @@ pub async fn list_batches(
             u.status           AS "status!",
             u.is_repairing     AS "is_repairing!",
             u.location         AS "location?",
-            u.holder_name      AS "holder_name?"
+            u.holder_name      AS "holder_name?",
+            u.part_serial_no   AS "part_serial_no?"
         FROM (
             SELECT 'PART'::text AS owner_type,
                    p.id AS owner_id,
@@ -428,7 +446,11 @@ pub async fn list_batches(
                        WHEN 'PRODUCTION_SHELF'  THEN s.code
                        WHEN 'INSPECTION_SHELF'  THEN s.code
                        WHEN 'OUTSOURCE_COMPANY' THEN oc.name
-                   END AS holder_name
+                   END AS holder_name,
+                   -- 2026-10-16：散件支恒 NULL（子行不重复工单行的序列号，见
+                   -- DigestBatchRow::part_serial_no）。显式写 NULL 而不是不选该列，
+                   -- 是因为 UNION ALL 两支的列必须逐列对齐、类型也要一致。
+                   NULL::varchar AS part_serial_no
             FROM t_part_batch b
             JOIN t_part p ON p.id = b.part_id AND p.deleted_at IS NULL
             LEFT JOIN t_worker w
@@ -451,7 +473,8 @@ pub async fn list_batches(
                        WHEN 'PRODUCTION_SHELF'  THEN s.code
                        WHEN 'INSPECTION_SHELF'  THEN s.code
                        WHEN 'OUTSOURCE_COMPANY' THEN oc.name
-                   END AS holder_name
+                   END AS holder_name,
+                   c.serial_no AS part_serial_no
             FROM t_part_batch b
             JOIN t_part c     ON c.id = b.part_id AND c.deleted_at IS NULL
             JOIN t_assembly a ON a.id = c.assembly_id AND a.deleted_at IS NULL
