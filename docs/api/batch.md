@@ -183,7 +183,7 @@ MINOR-4 收紧）。服务端算
 |---|---|---|---|---|
 | `IN_PROCESS` + `PRODUCTION_SHELF` | 任意（含 `true`） | `INSPECTED` | **均 `None`** | `note` 入参；缺省时自动生成「送检：来自〈来源〉→ 品检架 〈架 code〉」 |
 | `IN_PROCESS` + `WORKER` | `false` | — 20103，**不写事件** | — | — |
-| `IN_PROCESS` + `WORKER` | **`true`** | **`FORCED_SENT_TO_INSPECTION`** | **均 `None`** | **前置 `[FORCE] `**，其余同上 |
+| `IN_PROCESS` + `WORKER` | **`true`** | **`FORCED_SENT_TO_INSPECTION`** | **均 `None`** | **前置 `[FORCE] `**；缺省时自动生成的是「送检：强制取自工人 → 品检架 〈架 code〉」，**不是**第一行那句「来自〈来源〉」—— `from` 只是状态、不含位置，而强制路径这批货的真实位置是**工人手上**，沿用「来自生产架」会在时间线上留下一条自相矛盾的人读文本（review 第 2 轮 NIT-D）。caller 自带 `note` 时用自带那条，只加前缀 |
 | `PENDING` / `PROGRAMMING` | `true` | `INSPECTED` | **均 `None`** | **不带** `[FORCE]` 前缀（`forced = false`） |
 | 被闸门拒的其余组合（状态不在 `{PENDING, PROGRAMMING, IN_PROCESS}` / `IN_PROCESS` + 非生产架 / 空 `location`） | 任意 | — 20103，**不写事件** | — | — |
 

@@ -636,6 +636,17 @@ async fn to_inspection_force_writes_forced_event_with_null_worker() {
         note.contains("FX-SH-INSP"),
         "自动生成的 note 仍须含货架 code: {note}"
     );
+    // 2026-10-17 review 第 2 轮 NIT-D：强制路径的自动 note **单独措辞**。
+    // `from` 只含状态不含位置，而这批货的真实位置是「工人手上」—— 沿用普通路径那句
+    // 「来自生产架」会在时间线上留下一条自相矛盾的人读文本（生产架上没有这批货）。
+    assert!(
+        note.contains("强制取自工人"),
+        "强制送检的自动 note 必须说清来源是工人: {note}"
+    );
+    assert!(
+        !note.contains("来自生产架"),
+        "强制送检时这批货不在生产架上，note 不得写「来自生产架」: {note}"
+    );
 }
 
 /// `force` **不绕过** OCC：version 陈旧仍 40901。

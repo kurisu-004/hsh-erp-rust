@@ -405,8 +405,10 @@ impl BatchService {
     /// 1. `t_part.status` & `t_part_batch.status` → `INSPECTION`，同步 `location =
     ///    'INSPECTION_SHELF'` / `current_holder_id = target_shelf.id`。
     /// 2. 写 `INSPECTED` 事件日志（闸门**真被绕过**时改写
-    ///    `FORCED_SENT_TO_INSPECTION` + note 加 `[FORCE] ` 前缀；判据见下面
-    ///    `# force` 一节，⚠️ 不是「客户端传了 `force=true`」）。
+    ///    `FORCED_SENT_TO_INSPECTION` + note 加 `[FORCE] ` 前缀，且自动生成的 note
+    ///    **单独措辞**为「送检：强制取自工人 → 品检架 …」而非「来自生产架」——
+    ///    见下面第 9 步的注释；判据见 `# force` 一节，
+    ///    ⚠️ 不是「客户端传了 `force=true`」）。
     ///
     /// 部分通过拆批：`quantity < target.quantity` 时调
     /// `split_batch_for_partial_pass`：operated 部分（拆出的新批次，quantity =
@@ -607,11 +609,21 @@ impl BatchService {
         // 9. 写事件日志（2026-10-17：`force` 走**另一个** event_type）
         let event_id = snowflake.next_id();
         // note 用货架 **code**（人类可读），不是 id：这条 note 直接显示在工单时间线上。
-        let note_text = match from {
-            PartStatus::PENDING => format!("送检：来自待下发 → 品检架 {target_shelf_code}"),
-            PartStatus::PROGRAMMING => format!("送检：来自编程中 → 品检架 {target_shelf_code}"),
-            PartStatus::IN_PROCESS => format!("送检：来自生产架 → 品检架 {target_shelf_code}"),
-            _ => format!("送检 → 品检架 {target_shelf_code}"),
+        // ⚠️ 2026-10-17 review 第 2 轮 NIT-D：`forced` 那支**单独**措辞。`from` 只是
+        // 状态机状态、不含位置，而「IN_PROCESS + WORKER」的真实位置是**工人手上** ——
+        // 若沿用下面那行「来自生产架」，时间线就会出现 `[FORCE] 送检：来自生产架 → …`
+        // 这条自相矛盾的人读文本（生产架上根本没有这批货）。`forced` 时 `from` 恒为
+        // `IN_PROCESS`（其它两种状态压根进不了闸门），故这里可以安全地**不**按 `from`
+        // 分支，只按「它一定是从工人手上强制取来的」写。
+        let note_text = if forced {
+            format!("送检：强制取自工人 → 品检架 {target_shelf_code}")
+        } else {
+            match from {
+                PartStatus::PENDING => format!("送检：来自待下发 → 品检架 {target_shelf_code}"),
+                PartStatus::PROGRAMMING => format!("送检：来自编程中 → 品检架 {target_shelf_code}"),
+                PartStatus::IN_PROCESS => format!("送检：来自生产架 → 品检架 {target_shelf_code}"),
+                _ => format!("送检 → 品检架 {target_shelf_code}"),
+            }
         };
         // ⚠️ 前缀加在**最终 note**（caller 自带 note 时也照加），不是只加在自动生成
         // 的 `note_text` 上 —— 否则调用方一旦传了 note，强制痕迹就整个消失，时间线

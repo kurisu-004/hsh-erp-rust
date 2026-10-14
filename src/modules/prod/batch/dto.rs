@@ -77,9 +77,9 @@ pub struct ToShipRequest {
 ///   `service/transition_core::to_inspection_core` 闸门那一支）：
 ///   「工人持有件请先归还或送检（force=true 可强制送检）」。括号里的后半句**就是
 ///   本开关的对外引导**，前端可原样展示给用户。
-/// - **历史文案**（2026-10-17 加 `force` **之前**那一支返的）：
-///   「工人持有件请先归还或送检」。**已无任何代码路径产出它**，此处保留只为标明
-///   「这一支是从哪条闸门放宽来的」——不要拿它当现状去写文档或断言。
+/// - **历史文案**（加 `force` 之前那一支返的）就是上面那条的**前缀子串**（无括号
+///   里的后半句），**已无任何代码路径产出它**；此处提一句只为标明「这一支是从哪条
+///   闸门放宽来的」，要引用 wire 文案请引上面那条。
 ///
 /// 待品检页扫码到压在工人手上的批次时可直接强制送检。⚠️ **另外两支不放宽**：
 /// `Some(other)`（非生产架，如
@@ -87,7 +87,13 @@ pub struct ToShipRequest {
 /// 数据完整性违规）仍各返 20103，需求未要求放宽。
 ///
 /// 副作用（全部刻意）：
-/// - 事件写 `FORCED_SENT_TO_INSPECTION`（不是 `INSPECTED`），note 前缀 `[FORCE]`；
+/// - 事件写 `FORCED_SENT_TO_INSPECTION`（不是 `INSPECTED`），note 前缀 `[FORCE]`
+///   —— ⚠️ **两者都按 `forced` 判据、不是无条件**：
+///   `forced = force && from == IN_PROCESS && location == 'WORKER'`。故
+///   `PENDING` / `PROGRAMMING` 批次带 `force=true` 写的是 `INSPECTED`、note
+///   **不带** `[FORCE]`（那两种状态根本没进闸门、没绕过任何东西）。完整真源见
+///   `service/transition_core::to_inspection_core` 的 doc 与
+///   `docs/api/batch.md` §2.1b.2；
 /// - 该事件 `worker_id` / `process_id` 恒 `None` ⇒ **不计入**该工人的报工统计
 ///   （有效工时口径只认 `RETURNED_TO_SHELF` / `SENT_TO_INSPECTION`，见
 ///   `docs/api/statistics.md`）；

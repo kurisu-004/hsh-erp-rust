@@ -4,8 +4,10 @@
 //! URL 一并迁移到 `/api/v2/com/*`。order 域后续再讨论，本任务不涉及。
 //!
 //! 路由风格保持不变：customer 5 条标准 CRUD 端点，applicant **6** 条（5 条标准
-//! CRUD + `POST /get-or-create`，2026-10-17 新增的幂等写路径；权威清单见各自
-//! 子模块的 `handler::ROUTES`）。
+//! CRUD + `POST /get-or-create`，2026-10-17 新增的幂等写路径）。⚠️ 这两个子模块
+//! **没有** `handler::ROUTES` 常量、也没有路由守卫单测（`grep -rn ROUTES
+//! src/modules/com/` 只命中 `delivery_note` 与本文件）—— 端点清单直接看各自
+//! `handler::router()` 里的 `.route()` 调用，加 / 删端点**不会**被任何单测拦下。
 //!
 //! 2026-09-29 新增 `union_list` 子模块：跨 `t_part` + `t_assembly` 合并视图端点
 //! `GET /api/v2/com/union-list`，承担原 part 域 `row_type` 矩阵（ALL / PART /
