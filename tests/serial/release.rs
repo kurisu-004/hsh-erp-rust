@@ -145,11 +145,11 @@ async fn dry_run_returns_counts_without_writing() {
     // 明细：3 条，装配件在前
     let affected = data["affected"].as_array().expect("affected 是数组");
     assert_eq!(affected.len(), 3, "明细应有 3 行：{data}");
-    assert_eq!(affected[0]["kind"], "assembly", "明细装配件在前：{data}");
+    assert_eq!(affected[0]["kind"], "ASSEMBLY", "明细装配件在前：{data}");
     assert_eq!(affected[0]["serial_no"], "ASM-COMPL-001");
     assert_eq!(affected[0]["status"], "COMPLETED");
-    assert_eq!(affected[1]["kind"], "part", "明细子件在后：{data}");
-    assert_eq!(affected[2]["kind"], "part");
+    assert_eq!(affected[1]["kind"], "PART", "明细子件在后：{data}");
+    assert_eq!(affected[2]["kind"], "PART");
     // 雪花 id 序列化成字符串（不能是 JSON 数字）
     assert!(
         affected[0]["id"].is_string(),

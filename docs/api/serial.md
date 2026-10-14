@@ -42,11 +42,34 @@
 | 码 | HTTP | 条件 |
 |---|---|---|
 | `40300` `FORBIDDEN` | 403 | 角色不是 MANAGER（ADMIN 元角色由 `require_role` 内部短路放行）。守卫**先于**任何全表扫 |
-| `40001` `VALIDATION_ERROR` | 422 | body 不是合法 JSON / `dry_run` 不是布尔 |
 | `50001` | 500 | DB 错误（唯一可能的实际形态：`SELECT … FOR UPDATE` 与并发 DDL 冲突） |
 
 本端点**不产生任何业务码**（`20xxx` / `21xxx`）：它没有「找不到」形态（不存在即 0 行，
 幂等返回 200），也没有「校验失败」形态（候选判据写死在服务端）。
+
+#### ⚠️ **没有 `40001`**：body 解析失败是**纯文本**，不是信封
+
+handler 用 `axum::Json` 提取器入参，**反序列化失败发生在进 handler 之前**，走 axum 的
+`JsonRejection` ⇒ **不进 `AppError`、不进 `R<T>` 信封，响应体里没有 `code` 字段**
+（本仓**零处**定制 `JsonRejection` 处理器 / `handle_error`，走 axum 默认路径 —— 与
+`docs/api/mail.md` §2.4 末的「⚠️ 缺 `version` 是 422 纯文本，不是业务信封」、
+`docs/api/batch.md` 的「`Path<i64>` 抽不出数字 → 400 纯文本」同款，
+**平台级行为、非本域特例**）。
+
+⇒ **前端必须按 HTTP 状态码分支，不能假设响应必有 `code`**（按 `err.response.data.code`
+分类的处理器在这条路径上会读到 `undefined`，落到「未知错误」）：
+
+| 条件 | HTTP | 响应体 | `code` 字段 |
+|---|---|---|---|
+| body **不是合法 JSON**（语法错，如截断的 `{`） | **400 Bad Request** | **纯文本**（如 ``Failed to parse the request body as JSON: ...``） | **没有** |
+| **`dry_run` 不是布尔**（类型错，如发字符串 `"true"`） | **422 Unprocessable Entity** | **纯文本**（``Failed to deserialize the JSON body into the target type: ...``） | **没有** |
+
+两个状态码的差别来自 `JsonRejection` 的两个变体：语法错 → `JsonSyntaxError`（400）、
+数据错 → `JsonDataError`（422）。**前端不要把 422 当成「入参不合法」的业务码分支处理** ——
+本端点没有任何业务码意义上的「入参不合法」，422 只可能来自提取器层。
+
+（第三种同族形态：请求缺 `Content-Type: application/json` → `MissingJsonContentType`
+→ **415**，同样纯文本。axios 发对象 body 时会自动带上该头，正常接入碰不到。）
 
 ### 1.2 守卫顺序（逐条 early-fail，顺序固定）
 
@@ -70,7 +93,7 @@
 
 | 字段 | 类型 | 语义 |
 |---|---|---|
-| `kind` | `"assembly"` \| `"part"` | 行所属表 |
+| `kind` | `"ASSEMBLY"` \| `"PART"` | 行所属表。⚠️ **判别位是大写**，与全仓惯例一致（union 列表 `row_type` / 送货单扫码树 `hit_kind` / `PartStatus` 序列化都是大写）；前端 schema 按 `z.enum(['ASSEMBLY', 'PART'])` 逐字对接，大小写对不上时 `affected` 每一行都过不了守门 |
 | `id` | **string** | 雪花 id。⚠️ **必须序列化成字符串** —— 超出 JS `Number.MAX_SAFE_INTEGER`，前端一律按字符串处理（同 `assembly` 域 `force_complete` 响应的 `assembly_id`） |
 | `serial_no` | string | 被释放掉的原序列号。恒非空（候选判据带 `serial_no IS NOT NULL`） |
 | `drawing_no` | string | 图纸号。⚠️ **恒非空**：`t_assembly.drawing_no` 与 `t_part.drawing_no` 在 baseline 里都是 `NOT NULL`（两表皆然，无后续 migration 放开该约束）⇒ 出参**不是** `Option` |
@@ -207,10 +230,22 @@ AND status IN ('COMPLETED', 'CANCELLED')
 ```
 
 - **一条汇总事件，不是逐行 N 条** —— 整表扫下逐行就是几千条噪音帧。
-- **不进 `AFFECTS_DASHBOARD` 白名单**（`views/dashboard/composables/useDashboardInvalidation.ts`
-  的前端白名单）：序列号列**不进** dashboard 三张报表（`snapshot` / `upcoming` /
-  `delivery_orders`）的任何一个切片 ⇒ 这条事件对大屏**零驱动作用**。
-  ⚠️ 前端若将来要消费它，需要显式加白名单；**别默认「WS 发了前端就会刷新」**。
+- **本事件驱动 dashboard**：dashboard 的出参**多处带 `serial_no`**
+  （`WorkerHeldBatch.serial_no` / `SystemDeliveryOrder.serial_no` /
+  `DeliveryOrderDetail.serial_no`，对应 SQL 也都 SELECT 了该列），释放之后这些切片上的
+  序列号就是陈旧的 ⇒ 必须靠事件失效重取。
+  - **前端已接线**：它已把 `TERMINAL_SERIALS_RELEASED` 加进 `AFFECTS_DASHBOARD`
+    （前端仓 commit `7cdd7de0`）⇒ 收到本事件即失效 dashboard 那几个 query。
+  - ⚠️ **后端不得据此假设前端会自行接线**：加白名单是前端侧的改动、后端无感知，
+    「WS 发了」不等于「前端会刷」。反向也要留意：**前端已接线这件事对后端不是契约**，
+    后端侧的义务止于「广播的字段足够前端判因」，别把「前端已加白名单」写成后端的可依赖前提。
+  - **口径提醒：真正会被本端点改到内容的只有 `in_process` 切片**
+    （`WorkerHeldBatch`）。那条 SQL 只卡 `t_part_batch.status = 'IN_PROCESS'`、
+    **不卡 `t_part.status`** ⇒ 「工单状态已是终态、批次仍压在工人手上」这类残留行本来就会
+    带序列号进大屏，而它正是本端点的释放对象。交期面板与下钻抽屉虽然也 SELECT
+    `serial_no`，但谓词卡的是 `DELIVERY_STATUSES` 那 6 个**非终态**，本端点动不到它们；
+    `upcoming-delivery` 分桶只出计数、根本不含 `serial_no`。前端整前缀失效是**保守但正确**
+    的选择，后端不要据此把本事件的影响面写窄。
 - 广播在 **commit 之后**（commit 失败却已广播 = 大屏看到一次从未发生的清理）。
 - `dry_run` **不广播**。
 
@@ -272,7 +307,9 @@ AND status IN ('COMPLETED', 'CANCELLED')
 
 ### 8.4 前端配套改动清单
 
-**后端本轮已完成，前端尚未接入**（截至 2026-10-19）。前端需要：
+**后端本轮已完成；前端已有对应实现，但落在前端仓一条尚未合入的分支上**
+（前端仓 commit `7cdd7de0`，截至 2026-10-19）。下面这份清单是「前端要做什么」的契约说明，
+合并进度以那侧分支为准 —— 后端**不假设**它已上线（§7 末同理）。前端需要：
 
 1. 一个 MANAGER-only 的「释放终态序列号」入口（按钮）—— ⚠️ 后端守卫是
    `require_role(Manager)`，前端入口可见性按同口径判。

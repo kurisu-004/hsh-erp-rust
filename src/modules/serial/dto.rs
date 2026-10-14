@@ -38,7 +38,7 @@ pub struct ReleaseTerminalRequest {
 /// `repo::TerminalSerialRow` 里流转，出参前 `.to_string()`。
 #[derive(Debug, Clone, Serialize)]
 pub struct ReleasedSerialItem {
-    /// 行所属表：`"assembly"`（装配件）/ `"part"`（零件 / 子件）。
+    /// 行所属表：`"ASSEMBLY"`（装配件）/ `"PART"`（零件 / 子件）。
     pub kind: &'static str,
     /// 雪花 id，**序列化成字符串**（见本 struct 的 doc）。
     pub id: String,
@@ -94,6 +94,19 @@ pub struct ReleaseTerminalOut {
 pub const RELEASE_DETAIL_LIMIT: usize = 200;
 
 /// `ReleasedSerialItem.kind` 的两个字面量（**唯一真源**，别在别处重写字符串）。
-pub const KIND_ASSEMBLY: &str = "assembly";
-/// `ReleasedSerialItem.kind` 的两个字面量（**唯一真源**，别在别处重写字符串）。
-pub const KIND_PART: &str = "part";
+///
+/// ⚠️ **必须是大写**，这是**全仓判别位的统一惯例**，不是本域的偏好：
+/// - `com::union_list::repo::sql` 投影 `'PART'::text AS row_type` /
+///   `'ASSEMBLY'::text AS row_type`（union 列表的 `row_type` 判别位）；
+/// - `com::delivery_note::vo::scan_tree` 的 `hit_kind: "ASSEMBLY" | "PART"`；
+/// - `prod::inspection::service` 扫码命中的 `hit_kind = "PART"` / `"ASSEMBLY"`；
+/// - `shared::batch::status_machine` 的 `PartStatus` 一律 `#[serde(rename = "大写")]`。
+///
+/// 本域初版曾取小写（`"assembly"` / `"part"`）、与上述惯例分叉，已订正。判别位两侧
+/// （后端常量 / 前端 schema）大小写必须逐字相同 —— 消费侧普遍对判别位写 `.strict()`
+/// 守门 schema，大小写对不上时**每一行明细都过不了 Zod**、整个响应被拒（不是降级，
+/// 是功能不存在），且这类失败发生在契约层、不产生任何红色报错。
+pub const KIND_ASSEMBLY: &str = "ASSEMBLY";
+/// `ReleasedSerialItem.kind` 的两个字面量（**唯一真源**，别在别处重写字符串）；
+/// 大写惯例的依据见 [`KIND_ASSEMBLY`] 的 doc。
+pub const KIND_PART: &str = "PART";

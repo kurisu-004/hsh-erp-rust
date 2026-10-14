@@ -21,9 +21,23 @@
 //! ## ⚠️ WS 广播：**commit 之后、一条汇总事件**
 //!
 //! 实跑成功后广播**一条** `TERMINAL_SERIALS_RELEASED`，payload 只带两个计数。
-//! **不逐行广播**：整表扫的形态下逐行就是几千条噪音帧，把 dashboard 的增量通道淹掉，
-//! 而这些事件对大屏的三个报表（`dashboard` 域）**没有任何驱动作用** —— 序列号列不进
-//! 那三张表的任何一个切片。dry_run **不广播**（零写入 ⇒ 零事件）。
+//! **不逐行广播**：整表扫的形态下逐行就是几千条噪音帧，把 dashboard 的增量通道淹掉。
+//! dry_run **不广播**（零写入 ⇒ 零事件）。
+//!
+//! ## ⚠️ 本事件**驱动** dashboard（不是「零驱动作用」）
+//!
+//! dashboard 的出参多处带 `serial_no`（`WorkerHeldBatch` / `SystemDeliveryOrder` /
+//! `DeliveryOrderDetail`），释放后这些切片上的序列号即陈旧 ⇒ 前端必须靠事件失效重取。
+//! 真正会被本端点改到内容的是 `in_process` 切片：那条 SQL 只卡批次状态
+//! `IN_PROCESS`、**不卡 `t_part.status`**，所以「工单已终态、批次仍压在工人手上」的
+//! 残留行本就带序列号进大屏，而它正是本端点的释放对象。交期面板与下钻抽屉也 SELECT
+//! `serial_no`，但谓词卡的是 6 个**非终态**，本端点动不到；`upcoming-delivery` 分桶
+//! 只出计数、不含 `serial_no`。
+//!
+//! 前端已把 `TERMINAL_SERIALS_RELEASED` 加进 `AFFECTS_DASHBOARD`（前端仓 commit
+//! `7cdd7de0`）。⚠️ 那份白名单是**前端**的资产、后端无感知：**不得把「前端已接线」
+//! 当成后端可依赖的前提**，后端侧的义务止于「广播字段足够前端判因」；反过来也别因为
+//! 「前端已接线」就把本域文档写成「后端不需要关心 dashboard 刷新」。
 //!
 //! ## ⚠️ matchit 注册顺序：**无冲突**
 //!
