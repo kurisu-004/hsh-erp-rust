@@ -3,7 +3,9 @@
 //! 2026-09-19 新增 com 模块聚合：把 customer + applicant 两个域代码组织上归位到 com 下，
 //! URL 一并迁移到 `/api/v2/com/*`。order 域后续再讨论，本任务不涉及。
 //!
-//! 路由风格保持不变：customer/applicant 各自定义 5 个标准 CRUD 端点。
+//! 路由风格保持不变：customer 5 条标准 CRUD 端点，applicant **6** 条（5 条标准
+//! CRUD + `POST /get-or-create`，2026-10-17 新增的幂等写路径；权威清单见各自
+//! 子模块的 `handler::ROUTES`）。
 //!
 //! 2026-09-29 新增 `union_list` 子模块：跨 `t_part` + `t_assembly` 合并视图端点
 //! `GET /api/v2/com/union-list`，承担原 part 域 `row_type` 矩阵（ALL / PART /

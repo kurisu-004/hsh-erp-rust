@@ -15,7 +15,10 @@ use crate::shared::batch::status_machine::PartStatus;
 use crate::shared::error::{AppError, code};
 // 2026-10-12：`t_part_event` 的写侧自 part 域的事件 INSERT 上提到
 // `shared::part_event`（该表由 7 个模块写、无域归属）。
-use crate::shared::part_event::{NewPartEvent, insert};
+// 2026-10-17：`INSPECTED` 字面量改用具名常量（该列无 CHECK / 无 DB ENUM /
+// 读侧无 Rust enum，裸字面量打错字没有任何拦截）。原 doc 说「两处写点都已收敛」而
+// 本文件当时仍是裸字面量 —— 常量的存在意义就在这两处逐字一致。
+use crate::shared::part_event::{EVENT_INSPECTED, NewPartEvent, insert};
 
 use super::BatchService;
 use crate::shared::batch::guards::{
@@ -150,7 +153,7 @@ impl BatchService {
             NewPartEvent {
                 id: snowflake.next_id(),
                 part_id,
-                event_type: "INSPECTED",
+                event_type: EVENT_INSPECTED,
                 from_status: Some(from.as_str()),
                 to_status: Some("INSPECTION"),
                 batch_id: Some(batch.id),

@@ -5,7 +5,8 @@
 //!   - to-inspection：IN_PROCESS+WORKER / IN_PROCESS+非 PRODUCTION_SHELF holder 拒绝
 //!   - to-inspection：★ `force=true` 强制送检（2026-10-17）—— 工人手上批次放行 /
 //!     事件写 `FORCED_SENT_TO_INSPECTION` + `worker_id IS NULL` / OCC 仍生效 /
-//!     非生产架与空 location 两支**不放宽** / 部分数量下余量仍留在工人手上
+//!     非生产架与空 location 两支**不放宽** / 部分数量下余量仍留在工人手上 /
+//!     **闸门没被绕过时（PENDING + force=true）不写 FORCED_*、note 不带 `[FORCE]`**
 //!   - to-inspection：target shelf zone≠INSPECTION / is_active=false 拒绝
 //!   - batch-to-inspection：items 空 / 超 200 / 3 件混合 / CLERK 越权
 //!   - to-inspection partial-split：PENDING 批次 qty=10 → quantity=3，拆批
@@ -500,7 +501,8 @@ async fn to_inspection_in_process_non_production_shelf_rejected() {
 //  但事件记为**强制送检**，**不计**该工人的报工统计。
 //
 //  ⚠️ `force` **只**放宽 `location='WORKER'` 一支；另两支（非生产架 / 空 location）
-//     与 OCC 都不动。下面 6 条用例把这条边界逐面钉死。
+//     与 OCC 都不动。下面 7 条用例把这条边界逐面钉死（含「闸门没被绕过时事件仍
+//     是 INSPECTED」这一面 —— 判据是闸门而不是请求 flag）。
 // ===========================================================================
 
 /// ★ 强制送检 happy path：`IN_PROCESS + WORKER + force=true` ⇒ 200，批次落品检架。
@@ -873,6 +875,76 @@ async fn to_inspection_force_prefixes_caller_supplied_note() {
     assert_eq!(
         note, "[FORCE] 工人离场，运营代送检",
         "caller 自带 note 时也必须保留 [FORCE] 前缀: {note}"
+    );
+}
+
+/// ★ `force=true` 打**非工人持有**批次 ⇒ 事件仍是 `INSPECTED`、note **不带**
+/// `[FORCE]`（2026-10-17 review 第 1 轮 MINOR-4 收紧）。
+///
+/// 组合校验（工人持有 / 非生产架 / 空 location 那三支）**只在 `from == IN_PROCESS`
+/// 时执行** ⇒ PENDING / PROGRAMMING 批次带 `force=true` 时**根本没绕过任何闸门**。
+/// 若事件类型与 note 前缀按请求 flag 判定，前端一旦图省事「总是带 force」，
+/// `FORCED_SENT_TO_INSPECTION` 与 `[FORCE]` 就会在整条时间线上退化成噪声，
+/// 与「运营代工人做的一次越权送检」这层语义（statistics 侧据此不计该工人工时、
+/// 前端据此渲染特殊文案）直接冲突。
+///
+/// 因此本用例与 `to_inspection_force_writes_forced_event_with_null_worker` 成对：
+/// 那条钉 `IN_PROCESS + WORKER + force=true` ⇒ `FORCED_*` + `[FORCE]`；本条钉
+/// `PENDING + force=true` ⇒ 普通 `INSPECTED` + 无前缀。
+#[tokio::test]
+async fn to_inspection_force_on_pending_batch_is_not_a_forced_event() {
+    let (pool, app, token, fx) = bootstrap_as_inspector().await;
+    let (part_id, batch_id) = insert_part_with_batch(
+        &pool,
+        "P0-F-PEND",
+        fx.customer_l2_id,
+        Some("P000-F-PEND"),
+        "PENDING",
+        5,
+    )
+    .await;
+    let v = batch_version(&pool, batch_id).await;
+
+    let (status, body) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/batches/{batch_id}/to-inspection"),
+            Some(json!({ "version": v, "force": true })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "PENDING 送检本来就放行: {body}");
+    assert_eq!(body["data"]["part"]["status"], "INSPECTION", "{body}");
+
+    let mut types: Vec<String> =
+        sqlx::query_scalar("SELECT event_type FROM t_part_event WHERE part_id = $1")
+            .bind(part_id)
+            .fetch_all(&pool)
+            .await
+            .expect("读工单事件");
+    types.sort();
+    assert_eq!(
+        types,
+        vec!["INSPECTED".to_string()],
+        "PENDING 批次带 force=true 时**没绕过任何闸门** ⇒ 不该写 FORCED_*: {body}"
+    );
+
+    let note: Option<String> =
+        sqlx::query_scalar("SELECT note FROM t_part_event WHERE part_id = $1")
+            .bind(part_id)
+            .fetch_one(&pool)
+            .await
+            .expect("读送检事件 note");
+    let note = note.expect("送检事件应带 note");
+    assert!(
+        !note.starts_with("[FORCE]"),
+        "PENDING + force=true 没有闸门被绕过 ⇒ note 不该带 [FORCE] 前缀: {note}"
+    );
+    assert!(
+        note.contains("FX-SH-INSP"),
+        "普通送检的自动 note 仍须含货架 code: {note}"
     );
 }
 

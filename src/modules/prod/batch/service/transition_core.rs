@@ -404,8 +404,9 @@ impl BatchService {
     /// 流转：
     /// 1. `t_part.status` & `t_part_batch.status` → `INSPECTION`，同步 `location =
     ///    'INSPECTION_SHELF'` / `current_holder_id = target_shelf.id`。
-    /// 2. 写 `INSPECTED` 事件日志（`force=true` 时改写
-    ///    `FORCED_SENT_TO_INSPECTION` + note 加「【强制送检】」前缀）。
+    /// 2. 写 `INSPECTED` 事件日志（闸门**真被绕过**时改写
+    ///    `FORCED_SENT_TO_INSPECTION` + note 加 `[FORCE] ` 前缀；判据见下面
+    ///    `# force` 一节，⚠️ 不是「客户端传了 `force=true`」）。
     ///
     /// 部分通过拆批：`quantity < target.quantity` 时调
     /// `split_batch_for_partial_pass`：operated 部分（拆出的新批次，quantity =
@@ -443,6 +444,17 @@ impl BatchService {
     ///
     /// ⚠️ **`force` 不绕过 OCC**：`_assert_batch_version` 在放宽闸门**之前**执行，
     /// 陈旧 `version` 仍返 40901。
+    ///
+    /// ⚠️ **事件与 note 前缀按「闸门真被绕过」判定，不按请求 flag**（2026-10-17
+    /// review 第 1 轮 MINOR-4 收紧）：实现侧算
+    /// `forced = force && from == IN_PROCESS && target.location == Some("WORKER")`，
+    /// `FORCED_SENT_TO_INSPECTION` 与 `[FORCE] ` 前缀都按 `forced` 走。
+    /// 组合校验（上面 step 4）**只在 `from == IN_PROCESS` 时执行**，故 PENDING /
+    /// PROGRAMMING 批次即便带 `force=true` 也**没绕过任何闸门** —— 那种请求记成
+    /// 「强制送检」纯属噪声，会让该事件类型在前端「总是带 force」时彻底失去
+    /// 「运营代工人做的越权送检」这层含义（该语义另见本常量 doc 与
+    /// `docs/api/batch.md` §2.1b.2、`docs/api/statistics.md`）。回归：
+    /// `tests/part/to_inspection.rs::to_inspection_force_on_pending_batch_is_not_a_forced_event`。
     ///
     /// 2026-09-16 PR-2 瘦身（migration 027）：t_part 删 `current_holder_id` 列；
     /// IN_PROCESS 组合校验的「工人持有件 / 非生产架件拒绝」改读**目标批次**的
@@ -530,6 +542,17 @@ impl BatchService {
         // ⚠️ 2026-10-17：`force=true` **只**把 `Some("WORKER")` 那一支从「拒」改成
         // 「放行」，另外两支（`Some(other)` 非生产架 / `None` 空 location）刻意不动
         // —— 理由与回归测试见本函数 doc 的 `# force` 一节。
+        //
+        // ⚠️ `forced`（闸门**真被绕过**）与入参 `force`（客户端传了 flag）**刻意不是
+        // 同一个判据**：PENDING / PROGRAMMING 批次根本不进这段组合校验（那段只在
+        // `from == IN_PROCESS` 执行），此时客户端即使带 `force=true` 也**没有绕过
+        // 任何闸门**。若拿请求 flag 去标事件，`FORCED_SENT_TO_INSPECTION` 与
+        // `[FORCE]` note 就会在「前端图省事总是带 force」时退化成噪声，与本模块 /
+        // `docs/api/statistics.md` / `docs/api/batch.md` 三处写的「运营代工人做的
+        // 一次越权送检」语义直接冲突。回归：
+        // `tests/part/to_inspection.rs::to_inspection_force_on_pending_batch_is_not_a_forced_event`。
+        let forced =
+            force && from == PartStatus::IN_PROCESS && target.location.as_deref() == Some("WORKER");
         if from == PartStatus::IN_PROCESS {
             match target.location.as_deref() {
                 Some("PRODUCTION_SHELF") => { /* 放行 */ }
@@ -594,8 +617,9 @@ impl BatchService {
         // 的 `note_text` 上 —— 否则调用方一旦传了 note，强制痕迹就整个消失，时间线
         // 分不出这次是不是强制送检。措辞对齐 `part::service::lifecycle::force_complete`
         // 的 `[FORCE]` 口径（同一批事件日志的两种「运营越权代做」标记）。
+        // ⚠️ 判据是上面的 `forced`（闸门真被绕过），**不是**入参 `force`。
         let note_owned = note.map(str::to_string).unwrap_or(note_text);
-        let note_final = if force {
+        let note_final = if forced {
             format!("[FORCE] {note_owned}")
         } else {
             note_owned
@@ -605,7 +629,7 @@ impl BatchService {
             NewPartEvent {
                 id: event_id,
                 part_id,
-                event_type: if force {
+                event_type: if forced {
                     EVENT_FORCED_SENT_TO_INSPECTION
                 } else {
                     EVENT_INSPECTED

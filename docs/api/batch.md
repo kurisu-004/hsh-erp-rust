@@ -135,7 +135,7 @@ BIZ_INVALID_TRANSITION`）：
 | `location` | `force` 缺省（=false） | `force=true` | 报错文案（`force=false` 时） |
 |---|---|---|---|
 | `PRODUCTION_SHELF` | ✅ 放行 | ✅ 放行 | — |
-| `WORKER` | ❌ **20103** | ✅ **放行**（强制送检） | 「工人持有件请先归还或送检」 |
+| `WORKER` | ❌ **20103** | ✅ **放行**（强制送检） | 「工人持有件请先归还或送检（force=true 可强制送检）」 |
 | 其它值（`INSPECTION_SHELF` / `OFFICE` / `OUTSOURCE_COMPANY` …） | ❌ **20103** | ❌ **20103**（**不放宽**） | 「不在生产架上，无法送检（batch.location=…）」 |
 | `NULL` | ❌ **20103** | ❌ **20103**（**不放宽**） | 「batch.location 为空，无法送检」 |
 
@@ -169,10 +169,26 @@ BIZ_INVALID_TRANSITION`）：
 
 #### 2.1b.2 本端点写的 `t_part_event` 事件类型
 
-| `force` | `event_type` | `worker_id` / `process_id` | `note` |
-|---|---|---|---|
-| 缺省 / `false` | `INSPECTED` | **均 `None`** | `note` 入参；缺省时自动生成「送检：来自〈来源〉→ 品检架 〈架 code〉」 |
-| `true` | **`FORCED_SENT_TO_INSPECTION`** | **均 `None`** | **前置 `[FORCE] `**，其余同上 |
+⚠️ **判据是「闸门真被绕过」，不是「客户端传了 `force`」**（2026-10-17 review 第 1 轮
+MINOR-4 收紧）。服务端算
+`forced = force && from == IN_PROCESS && t_part_batch.location == 'WORKER'`，
+事件类型与 note 前缀都按 `forced` 走。**为什么**：§2.1b.1 那三支组合校验
+**只在 `from == IN_PROCESS` 时执行** ⇒ `PENDING` / `PROGRAMMING` 批次即便带
+`force=true`，也**没有绕过任何闸门**。若按请求 flag 判定，前端一旦图省事「总是带
+`force`」，`FORCED_SENT_TO_INSPECTION` 与 `[FORCE]` 就会在整条时间线上退化成噪声，
+与「运营代工人做的一次越权送检」这层语义（statistics 侧据此不计该工人工时）
+直接冲突。回归 `to_inspection_force_on_pending_batch_is_not_a_forced_event`。
+
+| `from` + `location` | 请求 `force` | `event_type` | `worker_id` / `process_id` | `note` |
+|---|---|---|---|---|
+| `IN_PROCESS` + `PRODUCTION_SHELF` | 任意（含 `true`） | `INSPECTED` | **均 `None`** | `note` 入参；缺省时自动生成「送检：来自〈来源〉→ 品检架 〈架 code〉」 |
+| `IN_PROCESS` + `WORKER` | `false` | — 20103，**不写事件** | — | — |
+| `IN_PROCESS` + `WORKER` | **`true`** | **`FORCED_SENT_TO_INSPECTION`** | **均 `None`** | **前置 `[FORCE] `**，其余同上 |
+| `PENDING` / `PROGRAMMING` | `true` | `INSPECTED` | **均 `None`** | **不带** `[FORCE]` 前缀（`forced = false`） |
+| 被闸门拒的其余组合（状态不在 `{PENDING, PROGRAMMING, IN_PROCESS}` / `IN_PROCESS` + 非生产架 / 空 `location`） | 任意 | — 20103，**不写事件** | — | — |
+
+⚠️ **第三条是全表唯一会写 `FORCED_SENT_TO_INSPECTION` 的组合** —— 即「工人手上那批货
+被运营代为送检」。其余能放行的组合一律 `INSPECTED`，**哪怕客户端带了 `force=true`**。
 
 ⚠️ **两条的 `worker_id` 都是 `None`** —— 发起者是品检员账号（`created_by`）而非工人，
 两者共用雪花 ID 空间但无映射表（见 `src/shared/part_event/mod.rs` 的模块 doc）。

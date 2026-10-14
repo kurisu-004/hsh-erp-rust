@@ -84,6 +84,17 @@ fn ws_broadcast(state: &AppState, kind: &str, payload: serde_json::Value) {
 ///   类型调，挡下来比猜它想发什么更安全）。
 ///
 /// ⇒ 本端点对「不带 body 的取消」与「带 body 的取消」一视同仁，**零契约破坏**。
+///
+/// ⚠️ **已知取舍（review 第 1 轮 NIT-4 登记，刻意不修）**：`Option<Json<T>>` 的
+/// `OptionalFromRequest` 在**请求完全没有任何 `Content-Type` 头**时一律 `Ok(None)`
+/// —— 它**不看 body 里有没有字节**。所以一个「发了 `{"reason":"x"}` 却漏带
+/// `Content-Type`」的客户端会被**静默取消**：`reason` / `note` 整个丢掉，而调用方
+/// 拿到的是 200 + 成功信封，看不出「我的备注没进去」。
+///
+/// 刻意不改成「先取 `Bytes` 再自行判空」：那会把「有没有 Content-Type」与「body 有
+/// 没有内容」两个**独立**信号耦合进本仓的业务信封体系（要么自己造 415 纯文本、
+/// 要么在信封里报 4xxxx 校验码），而本仓其它端点都不这么做；且前端已实测不发 body。
+/// 要堵这个口的前提是先有客户端真的漏带头 —— 那时该修的是那个客户端。
 pub async fn cancel(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,

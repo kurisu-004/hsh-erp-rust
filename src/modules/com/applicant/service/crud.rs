@@ -237,6 +237,14 @@ impl ApplicantService {
         // `50001 数据库错误`；判据用全仓单一真源 `shared::error::is_unique_violation`。
         // ⚠️ **非 23505 的错误照原样上抛**（不要用「只有 23505 才处理」的 if-let
         // 把 else 分支漏成静默吞错）。
+        //
+        // ⚠️ **已知取舍（review 第 1 轮 NIT-3 登记，不修）**：`23505` 只告诉我们「某条
+        // 唯一约束被撞」，**分不清是哪一条**。本处把**任何** 23505 都报成 `21002`
+        // 「同一客户下已存在同名申请人」，而理论上**雪花 id 撞 `t_applicant_pkey`**
+        // 同样是 23505 —— 那种情况会被误标成「重名」。**刻意不修**：概率极低
+        // （同毫秒同 instance 的 seq 回绕才会撞），且 `21002` 对调用方的处置
+        // （改名字 / 走 `get-or-create`）远优于 `50001`「数据库错误」让人去查日志。
+        // 真要分清得解析 `db.constraint()` 并逐索引映射，收益不抵复杂度。
         match repo
             .create(new_id, name, customer_id, Some(current.id))
             .await

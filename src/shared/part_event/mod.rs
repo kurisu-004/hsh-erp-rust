@@ -14,7 +14,7 @@
 //! | `part` | `CANCELLED`（取消工单）/ `FORCE_COMPLETED`（零件级强推）/ `SOFT_DELETED` |
 //! | `prod::batch` | `INSPECTED` / `FORCED_SENT_TO_INSPECTION`（★ 2026-10-17 新增）/ `BATCH_PASSED` / `INSPECTION_FAILED`（`scan_inspect` 的 PASS/FAIL 结果对）/ `STATUS_CHANGED`（to-ship）/ `DELIVERED` / `COMPLETED`（lifecycle）/ `REPAIR_STARTED` / `REPAIR_COMPLETED` / `SPLIT`（手工 `POST /batches/split`）/ `BATCH_CANCELLED`（批量取消）/ `PLACED_ON_SHELF`（`place-on-shelf`）/ `CNC_RELEASED` |
 //! | `prod::scan` | `PICKED_UP` / `SPLIT`（取件与 worker-scan 的部分数量拆批）/ `RETURNED_TO_SHELF` / `SENT_TO_INSPECTION`（`worker_scan`）/ `TRANSFERRED`（扫码接管，2026-10-15） |
-//! | `prod::queue` | `TAKEN_FROM_POOL`（2 处）/ `MOVED`（3 处）/ `RECALLED`（召回）/ `PLACED_ON_SHELF`（下发后落架）—— 四者都经 `repo::part_insert_part_event` 这个**转发器**写入，块内只有字段简写 |
+//! | `prod::queue` | `TAKEN_FROM_POOL`（2 处）/ `MOVED`（3 处）—— 这 5 处经 `repo::part_insert_part_event` 这个**转发器**写入，块内只有字段简写、字面量在实参；`RECALLED`（`service/recall.rs`，**裸字面量** `NewPartEvent` 构造）/ `PLACED_ON_SHELF`（`service/dispatch.rs`，**裸字面量** `NewPartEvent` 构造）
 //! | `outsource` | `SENT_TO_OUTSOURCE` / `RECEIVED_FROM_OUTSOURCE`（经 `write_part_event` **转发器**，字面量在调用点） |
 //! | `assembly` | `FORCE_COMPLETED`（装配件级强推其子件） |
 //! | `shared::batch` | `SERIAL_RELEASED`（终态序列号归档） |
@@ -25,6 +25,11 @@
 //! （它们是 `service/lifecycle.rs` 的两个独立写点）。上表已按**当前代码**逐构造点
 //! 复核重建（`NewPartEvent {` 的全部字面量构造点 + 2 个转发器的调用点；
 //! ⚠️ **刻意不写处数** —— 那类计数必然过期，`sql.rs` 的模块 doc 已经因此过期过一次）。
+//! ⚠️ **2026-10-17 review 第 1 轮再订正**：`prod::queue` 行此前把四个事件一律说成
+//! 「都经转发器写入」，实测转发器只有 **5 个**调用点（`TAKEN_FROM_POOL` ×2 /
+//! `MOVED` ×3，全在 `service/queue.rs`），`RECALLED` / `PLACED_ON_SHELF` 是**直接**
+//! 的 `NewPartEvent` 字面量构造。该行已按形态拆开 —— **本表里「谁写」与「怎么写」
+//! 是两列事实，混写一处就会把转发器的覆盖面说大**。
 //! ⚠️ **事件类型的全集以 [`ALL_EVENT_TYPES`] 为准**，本表只答「哪个模块写哪些」
 //! —— 两份的改一同步二义务见 [`ALL_EVENT_TYPES`] 的 doc。
 //!
@@ -290,6 +295,15 @@ mod event_type_guard_tests {
     //!    编译错误、改值被**规则 2** 抓到。
     //! 4. **`use … as …` 重命名的常量**：源码里不出现常量名，查不到。
     //! 5. **未闭合块注释**（rustc 已先拦下的畸形输入）会让文件剩余内容被当注释跳过。
+    //! 6. **值位置是「非 `EVENT_*` 前缀的表达式 / 标识符」**：`event_type: self.kind`
+    //!    / `event_type: some_var` / `event_type: format!(…)` 一律**跳过、不判**
+    //!    （2026-10-17 review 第 1 轮 NIT-1 收窄：此前它们会被当成常量名去 `consts`
+    //!    查、查不到就当值判违规，报出 `event_type = "self"` / `"format"` 这种**读者
+    //!    完全看不懂的违规** —— 误报的护栏比没有护栏更糟，人会去加白名单，加着加着
+    //!    就真漏了）。⇒ 本护栏只对「裸字面量」与「`EVENT_*` 具名常量」负责；
+    //!    任何**计算出来的** `event_type` 都需要人工登记。
+    //!    连带代价：写了个**不带 `EVENT_` 前缀**的常量（命名约定之外）会漏报，规则 2
+    //!    按同一前缀收常量、同样查不到它。
     //!
     //! ## ⚠️ 刻意**不做**的事
     //!
@@ -629,8 +643,24 @@ mod event_type_guard_tests {
                         let value = match read_str_literal(out, kind, s) {
                             Some((v, _)) => Some(v),
                             // 标识符（具名常量）交给第二轮解析；字段简写 / 表达式跳过
+                            //
+                            // ⚠️ 2026-10-17 review 第 1 轮 NIT-1 收窄：**只**接受
+                            // `EVENT_*` 前缀的名字。此前这里是「任何非关键字标识符都当
+                            // 常量名去 `consts` 查、查不到就当值判违规」，于是
+                            // `event_type: self.kind` / `event_type: some_var` /
+                            // `event_type: format!(…)` 三种形态都会被报成
+                            // `event_type = "self"` / `"format"` 这种**看不懂的违规**
+                            // （误报比没有护栏更糟：人会去加白名单，加着加着就真漏了）。
+                            // 收窄后失败信息里出现的每一条都是**真的字面量或真的常量**。
+                            // 代价 = 「有人写了个不带 `EVENT_` 前缀的事件类型常量」会
+                            // 漏报（规则 2 同样按前缀收，查不到它）—— 那是命名约定之外
+                            // 的写法；要改约定**两处前缀一起改**，别只改一处。登记见
+                            // 本子模块 doc 的盲区 6。
                             None => read_ident(out, kind, s)
-                                .filter(|(name, _)| !VALUE_KEYWORDS.contains(&name.as_str()))
+                                .filter(|(name, _)| {
+                                    name.starts_with(NEEDLE_CONST_PREFIX)
+                                        && !VALUE_KEYWORDS.contains(&name.as_str())
+                                })
                                 .map(|(name, _)| name),
                         };
                         if let Some(v) = value {
@@ -965,6 +995,23 @@ mod event_type_guard_tests {
             "表达式形态不在采集范围（且不应被误判成常量名）"
         );
 
+        // 7c) ⚠️ 2026-10-17 review 第 1 轮 NIT-1：`event_type:` 后跟**非
+        //     `EVENT_*` 前缀**的标识符 / 宏调用时一律跳过。修之前它们会被报成
+        //     `event_type = "self"` / `"format"` 这种读者看不懂的违规（误报比没有
+        //     护栏更糟）。见模块 doc 盲区 6。
+        for expr_form in [
+            "fn f() {\n    let _e = NewPartEvent {\n        event_type: self.kind,\n    };\n}\n",
+            "fn f() {\n    let _e = NewPartEvent {\n        event_type: some_var,\n    };\n}\n",
+            "fn f() {\n    let _e = NewPartEvent {\n        event_type: format!(\"X_{}\", 1),\n    };\n}\n",
+            "fn f() {\n    let _e = NewPartEvent {\n        event_type: kind.clone(),\n    };\n}\n",
+        ] {
+            assert!(
+                literals_of(expr_form).is_empty(),
+                "非 EVENT_* 前缀的标识符 / 表达式不该被判（否则报出看不懂的违规）: \
+                 {expr_form}"
+            );
+        }
+
         // 8) 只 `use` 结构体（不带字面量）不判
         let only_use = "use crate::shared::part_event::NewPartEvent;\n";
         assert!(literals_of(only_use).is_empty());
@@ -1001,6 +1048,14 @@ mod event_type_guard_tests {
                 .to_string(),
             "     Dockerfile 的构建上下文只有 backend-rust 仓，跨仓路径会直接打断构建。"
                 .to_string(),
+            String::new(),
+            "本条报错里的每一条都是**真的字面量或真的 `EVENT_*` 常量** —— 本护栏判定".to_string(),
+            "范围只到这两档（`event_type: some_var` / `format!(…)` 等表达式形态一律跳过，"
+                .to_string(),
+            "不会出现在这里）。**如果你刚写的 `event_type` 没被抓到**，它八成是表达式形态："
+                .to_string(),
+            "拼错字同样不会被拦，请人工对照 `ALL_EVENT_TYPES`。漏报形态清单见本子模块".to_string(),
+            "模块 doc 的「已知漏报盲区」一节。".to_string(),
         ];
         lines.join("\n")
     }
