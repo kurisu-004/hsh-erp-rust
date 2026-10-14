@@ -66,7 +66,15 @@ use crate::shared::error::{AppError, code};
 ///
 /// ⚠️ 改这一个字面量 = 存量密文全部解不开（同换主密钥）。带 `v1` 后缀就是为了让
 /// 「将来要换」这件事在版本号上是可见的、而不是看起来像一次无害的重构。
+///
+/// ⚠️ **本常量只服务 `t_mail_account.encrypted_secret`**。别的列（`t_wecom_webhook
+/// .encrypted_url`）走 [`seal_with_aad`] / [`open_with_aad`] 显式传自己的 AAD，
+/// **不要**为了「少一个参数」把它改成读某个全局 —— 一次 AAD 串线会让那一整类密文
+/// 永久解不开，且没有任何报错能指出是哪边串的。
 const AAD: &[u8] = b"t_mail_account.secret.v1";
+
+/// 报错文案里的「凭据名」前缀（`t_mail_account` 那条路用它）。
+const SUBJECT_MAIL_SECRET: &str = "邮箱授权码";
 
 /// GCM nonce 字节数（GCM 标准 nonce 长度 96 bit）。
 const NONCE_LEN: usize = 12;
@@ -96,12 +104,44 @@ pub fn open(sealed: &str) -> Result<String, AppError> {
     open_with(&master_key()?, sealed)
 }
 
+/// [`seal`] 的 **AAD 显式版**（2026-10-18 新增，供 `wecom` 通道域用）。
+///
+/// ## 为什么要这一对，而不是给本模块加第二个全局 AAD 常量
+///
+/// AEAD 把 AAD 纳入认证 ⇒ **不同 AAD 的两类密文互不串扰**：拿 `t_wecom_webhook` 的密文
+/// 去冒充 SMTP 授权码（或反过来）会直接 `open` 失败，而不是「悄悄解出别的东西」。
+/// 主密钥仍是同一把 env `MAIL_ACCOUNT_SECRET`（**不新增 env**），变的只是这一层用途标签。
+///
+/// 生产调用点只有一个：`modules::wecom::service`（AAD 取
+/// `modules::wecom::dto::WEBHOOK_URL_AAD` = `t_wecom_webhook.url.v1`）。
+///
+/// ⚠️ 失败时返回的错误码仍是 `21701 BIZ_MAIL_NOT_CONFIGURED`（文案主体为「webhook 地址」）：
+/// 成因分类完全相同（主密钥缺失/格式错、base64 损坏、tag 失配、AAD 或主密钥不匹配），
+/// **刻意不开新码** —— 调用方 `wecom::service::resolve_target` 会把它转成 `21801`
+/// （那是推送域自己的「通道不可用」语义，见该函数 doc）。
+pub fn seal_with_aad(plaintext: &str, aad: &[u8]) -> Result<String, AppError> {
+    seal_impl(&master_key()?, plaintext, aad)
+}
+
+/// [`open`] 的 **AAD 显式版**（见 [`seal_with_aad`] 的存在理由）。
+pub fn open_with_aad(sealed: &str, aad: &[u8]) -> Result<String, AppError> {
+    open_with_key_aad(&master_key()?, sealed, aad, SUBJECT_WEBHOOK_URL)
+}
+
+/// 报错文案里的「凭据名」前缀 —— `t_wecom_webhook.encrypted_url` 那条路用它。
+const SUBJECT_WEBHOOK_URL: &str = "webhook 地址";
+
 /// [`seal`] 的密钥显式版（[`seal_with`] 的密钥注入版）。
 ///
 /// **生产不直接调**（走 `seal` 从 env 取钥）；存在意义是让单测能注入两把不同的
 /// 密钥验证「错密钥必须拒绝」，以及绕开 env 依赖。两条路径共用同一段加解密实现，
 /// 不存在「测试走的是另一条分支」的问题。
 pub fn seal_with(key: &[u8; 32], plaintext: &str) -> Result<String, AppError> {
+    seal_impl(key, plaintext, AAD)
+}
+
+/// 加密的唯一实现体（AAD 与密钥都由调用方给）。
+fn seal_impl(key: &[u8; 32], plaintext: &str, aad: &[u8]) -> Result<String, AppError> {
     let unbound = UnboundKey::new(&AES_256_GCM, key).map_err(crypto_err)?;
     let sealing = LessSafeKey::new(unbound);
 
@@ -115,7 +155,7 @@ pub fn seal_with(key: &[u8; 32], plaintext: &str) -> Result<String, AppError> {
     let nonce = Nonce::assume_unique_for_key(nonce_bytes);
     let mut buf = plaintext.as_bytes().to_vec();
     sealing
-        .seal_in_place_append_tag(nonce, Aad::from(AAD), &mut buf)
+        .seal_in_place_append_tag(nonce, Aad::from(aad), &mut buf)
         .map_err(|_| internal_err("AES-256-GCM 加密失败"))?;
 
     let mut envelope = Vec::with_capacity(NONCE_LEN + buf.len());
@@ -126,18 +166,34 @@ pub fn seal_with(key: &[u8; 32], plaintext: &str) -> Result<String, AppError> {
 
 /// [`open`] 的密钥显式版（见 [`seal_with`] 的存在理由）。
 pub fn open_with(key: &[u8; 32], sealed: &str) -> Result<String, AppError> {
+    open_with_key_aad(key, sealed, AAD, SUBJECT_MAIL_SECRET)
+}
+
+/// 解密的唯一实现体。`subject` 只进报错文案，**不参与**密码学计算。
+pub fn open_with_key_aad(
+    key: &[u8; 32],
+    sealed: &str,
+    aad: &[u8],
+    subject: &str,
+) -> Result<String, AppError> {
     let unbound = UnboundKey::new(&AES_256_GCM, key).map_err(crypto_err)?;
     let opening = LessSafeKey::new(unbound);
 
-    let raw = BASE64
-        .decode(sealed.as_bytes())
-        .map_err(|_| decrypt_err("密文不是合法 base64（列值被手工改过或不是本模块写入的）"))?;
+    let raw = BASE64.decode(sealed.as_bytes()).map_err(|_| {
+        decrypt_err(
+            subject,
+            "密文不是合法 base64（列值被手工改过或不是本模块写入的）",
+        )
+    })?;
     // 最短也要 nonce(12) + tag(16)；比这更短的一定是被截断的密文。
     if raw.len() < NONCE_LEN + TAG_LEN {
-        return Err(decrypt_err(&format!(
-            "密文长度不足（{} 字节，至少需要 nonce {NONCE_LEN} + tag {TAG_LEN}）",
-            raw.len()
-        )));
+        return Err(decrypt_err(
+            subject,
+            &format!(
+                "密文长度不足（{} 字节，至少需要 nonce {NONCE_LEN} + tag {TAG_LEN}）",
+                raw.len()
+            ),
+        ));
     }
 
     let (nonce_bytes, rest) = raw.split_at(NONCE_LEN);
@@ -149,9 +205,10 @@ pub fn open_with(key: &[u8; 32], sealed: &str) -> Result<String, AppError> {
     // 绝不能接着去读 `rest`。ring 的文档明确要求调用方不区分 Ok/Err 之外的状态。
     let mut buf = rest.to_vec();
     let plain = opening
-        .open_in_place(nonce, Aad::from(AAD), &mut buf)
+        .open_in_place(nonce, Aad::from(aad), &mut buf)
         .map_err(|_| {
             decrypt_err(
+                subject,
                 "AES-256-GCM 认证失败（密文/tag 被篡改、AAD 不匹配，或 MAIL_ACCOUNT_SECRET 已被更换）",
             )
         })?;
@@ -176,10 +233,10 @@ fn crypto_err(_: Unspecified) -> AppError {
     internal_err("AES-256-GCM 密钥长度非法（必须是 32 字节）")
 }
 
-fn decrypt_err(msg: &str) -> AppError {
+fn decrypt_err(subject: &str, msg: &str) -> AppError {
     AppError::biz(
         code::BIZ_MAIL_NOT_CONFIGURED,
-        format!("邮箱授权码解密失败：{msg}"),
+        format!("{subject}解密失败：{msg}"),
     )
 }
 
@@ -299,6 +356,34 @@ mod tests {
                 .open_in_place(Nonce::assume_unique_for_key(nonce_arr), bad_aad, &mut buf)
                 .is_err(),
             "换掉 AAD 必须解不开（否则密文能被搬到别的字段复用）"
+        );
+    }
+
+    /// 两类凭据**共用一把主密钥、不同 AAD** ⇒ 互相解不开（2026-10-18）。
+    ///
+    /// 守的是「`seal_with_aad` / `open_with_aad` 的 AAD 真的进了认证计算」这件事：
+    /// 若哪天有人图省事把 AAD 改成忽略参数，webhook 的密文就能被当成 SMTP 授权码取回
+    /// （反之亦然），而两边都跑得好好的、零报错。
+    #[test]
+    fn different_aad_cannot_open_the_other_tables_ciphertext() {
+        const WECOM_AAD: &[u8] = b"t_wecom_webhook.url.v1";
+
+        let webhook_sealed = seal_impl(&KEY_A, "693a-uuid-key", WECOM_AAD).unwrap();
+        // 用 mail 的 AAD 解不开
+        assert!(
+            open_with(&KEY_A, &webhook_sealed).is_err(),
+            "webhook 的密文不得被当成 SMTP 授权码解出"
+        );
+        // 用 webhook 自己的 AAD 能解开
+        assert_eq!(
+            open_with_key_aad(&KEY_A, &webhook_sealed, WECOM_AAD, SUBJECT_WEBHOOK_URL).unwrap(),
+            "693a-uuid-key"
+        );
+        // 反向：mail 的密文也解不开
+        let mail_sealed = seal_with(&KEY_A, "smtp-secret").unwrap();
+        assert!(
+            open_with_key_aad(&KEY_A, &mail_sealed, WECOM_AAD, SUBJECT_WEBHOOK_URL).is_err(),
+            "SMTP 授权码的密文不得被当成 webhook 地址解出"
         );
     }
 

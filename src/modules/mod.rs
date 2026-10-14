@@ -71,6 +71,14 @@ pub mod scheduled_task;
 // 这是端点级归属裁决，不是域归属变更，两处注释不要读成互相矛盾。
 pub mod prod;
 pub mod statistics;
+// 2026-10-18 新增 wecom 域：「定时任务」菜单下的**企业微信推送通道**（群机器人 webhook
+// 实体 + 地址加密 + 掩码 + 探针发送），6 端点全部 Manager 独占，URL 挂 `/api/v2/cron/wecom`。
+// ⚠️ **全新域，无任何旧路径、无 alias**。
+// ⚠️ **与 `modules::wx::wecom_client` 同名不同物**（小程序登录客户端，需 corpid/corpsecret；
+// 本域是群机器人 webhook，**裸 HTTP POST、不需任何凭据**）—— 两域零交集，别混用。
+// 与 wecom_daily（内容域）的切分线见该域 `mod.rs` 的模块 doc（通道 vs 内容与调度）。
+// 完整契约见 `docs/api/wecom.md`。
+pub mod wecom;
 // 2026-09-28 删除：相关上传会话域（Redis 共享 STS 凭证会话机制）。
 // 前端改为单 uploader 触发时单 HTTP 调用 python `sts-tmp-keys` 数组入参直签，
 // 不再走 rust 转发。
@@ -179,29 +187,38 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // / 二级「邮件」）时与前端路由、菜单 seed 的 `path='/mail'` 对齐成同一个词。
         // 完整契约见 `docs/api/mail.md`。
         .nest("/cron/mail", scheduled_task::router())
+        // 2026-10-18 新增 wecom 域（企业微信**通道**：群机器人 webhook 实体 + 地址加密 +
+        // 掩码 + 探针发送），6 端点全部 Manager 独占，角色守卫写在各 handler 第一行
+        // （`require_role(Role::Manager)`），此处不挂 role layer。
+        // 第 2 段 `/wecom` 刻意是**单段词**（不是 kebab-case 的 `wecom-webhooks`）——
+        // 与菜单 seed 的 `path='/wecom'`、前端路由同一个词。
+        // ⚠️ **全新域，无旧路径、无 alias**。完整契约见 `docs/api/wecom.md`。
+        .nest("/cron/wecom", wecom::router())
         // ── `/cron` 前缀族的 matchit 注册顺序核对（2026-10-18 新增，必读）──
         //
         // CLAUDE.md §9 有一条硬约束：「同段数时静态段必须先于 `Path<i64>` catch-all，
-        // 否则静态路径被吞成 **400**（不是 404）」。`/cron` 前缀族下现有两个子域
+        // 否则静态路径被吞成 **400**（不是 404）」。`/cron` 前缀族下现有三个子域
         // **不触发**它，逐条理由如下（后续新域挂进 `/cron` 前请照此核对）：
         //
         // 1. **每个子域各自一个 `.nest()`，没有合并 router**。这里刻意没写成
         //    `.nest("/cron", Router::new().merge(a).merge(b))` —— 合并后所有子域的
         //    路由进同一张 matchit 表，注册顺序约束会跨前缀纠缠，排查困难
-        //    （CLAUDE.md §9「一个前缀一个 router 工厂」）。两个子域各自独立 nest ⇒
-        //    各自独立成表，`/cron/mail*` 与将来的 `/cron/wecom*` 匹配互不参与。
-        // 2. **两条 nest 的第 2 段都是静态段，且互不为对方的前缀**
-        //    （`mail` / `mail-digest` / 将来的 `wecom` / `wecom-daily` 逐字互异）⇒
+        //    （CLAUDE.md §9「一个前缀一个 router 工厂」）。各子域各自独立 nest ⇒
+        //    各自独立成表，`/cron/mail*`、`/cron/wecom*`、`/cron/wecom-daily*` 的匹配
+        //    互不参与。
+        // 2. **三条 nest 的第 2 段互不为对方的前缀**
+        //    （`mail` / `mail-digest` / `wecom` / 将来的 `wecom-daily` 逐字互异）⇒
         //    axum 在 nest 阶段就能分流，不存在「一个静态段是另一个静态段前缀」的重叠。
-        // 3. **`mail` 与 `mail-digest` 段数相同也不冲突**：第 2 段先静态判别，
+        // 3. **`mail` 与 `mail-digest` / `wecom` 段数相同也不冲突**：第 2 段先静态判别，
         //    `/cron/mail/accounts`（3 段，第 2 段恰好等于 `mail`）与
         //    `/cron/mail-digest/config`（3 段，第 2 段恰好等于 `mail-digest`）
+        //    与 `/cron/wecom/webhooks`（3 段，第 2 段恰好等于 `wecom`）
         //    在第 2 段就分道，不进入第 3 段的比较。
-        // 4. **两个子域的路由表内部本就无 catch-all 竞争**：`mail` 6 条最长 3 段、
-        //    `Path<i64>` 只在第 2 段、无 2 段静态路径；`mail-digest` 6 条**全是静态段**。
-        //    将来的 `wecom` 侧若引入 `Path<i64>`（如 `/webhooks/{id}` 3 段 vs
-        //    `/webhooks/{id}/delete` 4 段）也因**段数不同**而天然无冲突，且那张表
-        //    与 `mail` 侧完全隔离（第 1 条）。
+        // 4. **三个子域的路由表内部本就无 catch-all 竞争**：`mail` 6 条最长 3 段、
+        //    `Path<i64>` 只在第 2 段、无 2 段静态路径；`mail-digest` 6 条**全是静态段**；
+        //    `wecom` 6 条最长 3 段（`/webhooks/{id}/delete`）、`Path<i64>` 只在
+        //    `/webhooks/{id}`（2 段）而**没有任何 2 段静态路径** ⇒ 三张表都安全，且
+        //    彼此完全隔离（第 1 条）。
         //
         // 守卫：旧前缀 404 的集成用例见 `tests/scheduled_task/accounts.rs`
         // 与 `tests/mail_digest/config.rs`（2026-10-18 新增）。
