@@ -12,10 +12,13 @@ use serde::Serialize;
 /// 建单判定键收敛为 `(customer_id, DRAFT)` 单键 ⇒ 「这张单属于哪个分组 / 哪个单厂」
 /// 不再是单据属性，展示口径统一退化为「L1 客户名 + `customer_path`」。
 ///
-/// **零读 6 个**（后端真在发但前端从不读）：`parent_customer_name`（前端统一读
-/// `customer_path`）/ `submitted_by` / `picked_up_by`（只有 id 没有姓名，页面无从
-/// 展示）/ `driver_worker_id`（用 `driver_worker_name` 判空即可）/ `updated_at`
-/// （只有 `created_at` 有展示位）。
+/// **零读 6 个**（后端真在发但前端从不读）：`submitted_by` /
+/// `picked_up_by`（只有 id 没有姓名，页面无从展示）/ `driver_worker_id`
+/// （用 `driver_worker_name` 判空即可）/ `updated_at`（只有 `created_at` 有展示位）。
+///
+/// 2026-10-17 订正一处：`parent_customer_name` 在**本 VO 上从来就不存在**（它只挂在
+/// `DeliveryNoteLineItem` 上，且那一列的语义本轮已由「直接父」改成「根」）—— 旧注释
+/// 把它列进「零读」是笔误，会让下一个人以为删掉行项上的那一列是安全的。
 ///
 /// **`created_at` 保留**：一带的单据列表 / 详情都显示创建时间。
 ///
@@ -30,9 +33,17 @@ pub struct DeliveryNoteOut {
     #[serde(serialize_with = "crate::shared::types::serialize_i64")]
     pub customer_id: i64,
     pub customer_name: Option<String>,
-    /// 「L1 / L2」完整路径（L1 自指时只给 L1 名）。前端统一读这个字段展示客户，
-    /// 不再单独读 `parent_customer_name`（2026-10-08 已删）。
-    pub customer_path: Option<String>,
+    /// 「第 2 层到叶子」的 `" / "` 路径，**不含** L1（送货单恒挂在 L1 根上，故本字段
+    /// 恒等于根自己的名字）。
+    ///
+    /// 2026-10-17 由 `Option<String>` **收紧为必填 `String`**：**终点行不存在 / 已软删**
+    /// 时旧实现给 `None`，而那条分支在前端只能渲染成「—」，与「客户没录进来」长得
+    /// 一模一样。空串同样是「没有」，但它在类型上就是「必填且可能为空」，消费侧不必
+    /// 为一个永远不会出现的第三态写分支。字段集与键名逐字未变（前端 schema 仍是
+    /// `z.string().nullable()`，收得下 `""`）。
+    ///
+    /// 前端统一读这个字段展示客户，不再单独读 `parent_customer_name`（2026-10-08）。
+    pub customer_path: String,
     pub status: String,
     pub submitted_at: Option<NaiveDateTime>,
     pub picked_up_at: Option<NaiveDateTime>,
@@ -94,10 +105,20 @@ pub struct DeliveryNoteLineItem {
     pub order_no: Option<String>,
     pub note: Option<String>,
     pub customer_name: Option<String>,
+    /// **根**（L1 集团）客户名 —— 2026-10-17 起不再是「直接父」。
+    ///
+    /// 旧形是「零件客户的 `parent_id` 指向的那一行」，两层树下恰好是根；客户树放开
+    /// 任意深度后它会退化成**中间层**名（L4 零件拿到它的 L3 父）。改由
+    /// `shared::customer::paths_of` 的 `root_name` 派生，与全仓其它出参同源。
     pub parent_customer_name: Option<String>,
-    pub customer_path: Option<String>,
-    /// L2 叶子客户 id（`t_part.customer_id`）—— 打印分组时按它查
-    /// `t_delivery_group_member` 定位分组。
+    /// 「第 2 层到叶子」的 `" / "` 路径（**不含**根；零件挂根上时 = 根自己的名字）。
+    ///
+    /// 2026-10-17 收紧为必填 `String`（口径与 [`DeliveryNoteOut::customer_path`】
+    /// 同，理由见该字段 doc）：旧实现是 `Option<String>` + 两段手工拼接
+    /// （`format!("{父名} / {自身名}")`），深树上必然只给两段。
+    pub customer_path: String,
+    /// 零件所属客户 id（`t_part.customer_id`，业务单据恒挂在**叶子**客户上）——
+    /// 打印分组时按它查 `t_delivery_group_member` 定位分组。
     ///
     /// 2026-10-08 新增。⚠️ 分组键**必须是 id 而不是 `customer_name`**：
     /// `t_customer.name` 只有**非唯一** btree 索引，同名 L2 会被并进同一张 sheet，

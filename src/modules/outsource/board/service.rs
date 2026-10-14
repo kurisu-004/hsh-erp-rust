@@ -26,6 +26,7 @@ use crate::modules::outsource::vo::{
     OutsourceQueueCandidate, OutsourceQueueCompany, OutsourceQueueHeldBatch, OutsourceQueueProcess,
     OutsourceQueueProcessDetail, OutsourceQueueProcessMeta, OutsourceQueueSnapshot,
 };
+use crate::shared::customer::{CustomerPath, paths_of};
 use crate::shared::error::AppError;
 
 use super::repo::{CandidateRow, CompanyRow, HeldBatchRow, OutsourceQueueRepo, ProcessMetaRow};
@@ -105,11 +106,24 @@ impl OutsourceQueueService {
         current.require_permission("outsource.view")?;
         let data = OutsourceQueueRepo::process_detail(&mut *conn, process_id).await?;
 
-        // 在途批次按公司分组（一次查询结果的服务端分组，不是第二次查询）
-        let companies = to_companies(data.companies, data.held);
+        // 2026-10-17：候选卡 + 在途卡的全部 customer_id **合并成一次**
+        // `paths_of`（repo 侧已删掉两条只上跳一层的 `t_customer` 自连接）。
+        let cust_ids: Vec<i64> = data
+            .held
+            .iter()
+            .map(|r| r.customer_id)
+            .chain(data.items.iter().map(|r| r.customer_id))
+            .collect();
+        let cust_paths = paths_of(&mut *conn, &cust_ids).await?;
 
-        let items: Vec<OutsourceQueueCandidate> =
-            data.items.into_iter().map(to_candidate).collect();
+        // 在途批次按公司分组（一次查询结果的服务端分组，不是第二次查询）
+        let companies = to_companies(data.companies, data.held, &cust_paths);
+
+        let items: Vec<OutsourceQueueCandidate> = data
+            .items
+            .into_iter()
+            .map(|r| to_candidate(r, &cust_paths))
+            .collect();
         let total = items.len() as i64;
 
         Ok(OutsourceQueueProcessDetail {
@@ -160,7 +174,7 @@ fn to_process(
     }
 }
 
-fn to_candidate(r: CandidateRow) -> OutsourceQueueCandidate {
+fn to_candidate(r: CandidateRow, paths: &HashMap<i64, CustomerPath>) -> OutsourceQueueCandidate {
     let company_options = decode_company_options(r.company_options);
     let send_mode = send_mode_of(r.requires_approval, r.quote_id.is_some());
     OutsourceQueueCandidate {
@@ -176,8 +190,12 @@ fn to_candidate(r: CandidateRow) -> OutsourceQueueCandidate {
         planned_delivery_date: r.planned_delivery_date,
         system_delivery_date: r.system_delivery_date,
         is_urgent: r.is_urgent,
-        customer_name: r.customer_name,
-        parent_customer_name: r.parent_customer_name,
+        customer_name: paths.get(&r.customer_id).map(|p| p.own_name.clone()),
+        parent_customer_name: paths.get(&r.customer_id).map(|p| p.root_name.clone()),
+        customer_path: paths
+            .get(&r.customer_id)
+            .map(|p| p.path.clone())
+            .unwrap_or_default(),
         applicant_name: r.applicant_name,
         note: r.note,
         shelf_code: r.shelf_code,
@@ -196,7 +214,7 @@ fn to_candidate(r: CandidateRow) -> OutsourceQueueCandidate {
     }
 }
 
-fn to_held_batch(r: HeldBatchRow) -> OutsourceQueueHeldBatch {
+fn to_held_batch(r: HeldBatchRow, paths: &HashMap<i64, CustomerPath>) -> OutsourceQueueHeldBatch {
     OutsourceQueueHeldBatch {
         batch_id: r.batch_id.to_string(),
         part_id: r.part_id.to_string(),
@@ -208,8 +226,12 @@ fn to_held_batch(r: HeldBatchRow) -> OutsourceQueueHeldBatch {
         system_delivery_date: r.system_delivery_date,
         planned_delivery_date: r.planned_delivery_date,
         is_urgent: r.is_urgent,
-        customer_name: r.customer_name,
-        parent_customer_name: r.parent_customer_name,
+        customer_name: paths.get(&r.customer_id).map(|p| p.own_name.clone()),
+        parent_customer_name: paths.get(&r.customer_id).map(|p| p.root_name.clone()),
+        customer_path: paths
+            .get(&r.customer_id)
+            .map(|p| p.path.clone())
+            .unwrap_or_default(),
         applicant_name: r.applicant_name,
         location: r.batch_location,
         note: r.note,
@@ -232,6 +254,7 @@ fn to_held_batch(r: HeldBatchRow) -> OutsourceQueueHeldBatch {
 pub(super) fn to_companies(
     companies: Vec<CompanyRow>,
     held: Vec<HeldBatchRow>,
+    cust_paths: &HashMap<i64, CustomerPath>,
 ) -> Vec<OutsourceQueueCompany> {
     // 在途批次按公司分组：**不依赖 SQL 的 ORDER BY 保证同一公司的行连续** —— 那条
     // ORDER BY 排的是 `pb.current_holder_id ASC, pb.id ASC`，与分组键同序只是巧合，
@@ -242,7 +265,7 @@ pub(super) fn to_companies(
         held_by_company
             .entry(row.company_id)
             .or_default()
-            .push(to_held_batch(row));
+            .push(to_held_batch(row, cust_paths));
     }
     companies
         .into_iter()

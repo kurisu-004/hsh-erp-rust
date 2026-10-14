@@ -107,9 +107,13 @@ const SCAN_TREE_SQL_CALL_SITES: &[(&str, usize)] = &[
 ];
 
 /// `resolve_draft` + `l1_of` 里两个跨域 / 跨 repo 调用点的出现次数。
+///
+/// 2026-10-17：`l1_of` 的实现由 `CustomerRepo::get_by_id`（`parent_id.unwrap_or(id)`，
+/// **只上跳一层**）改成委托 `shared::customer::root_id_of`（向上递归走到根），
+/// 登记表同步换名。**条数不变**（各 1 条 SQL），变的只是那一问的语义深度。
 const RESOLVE_DRAFT_SQL_CALL_SITES: &[(&str, usize)] = &[
     ("note_find_open_draft_by_l1", 1),
-    ("CustomerRepo::get_by_id", 1),
+    ("shared::customer::root_id_of", 1),
 ];
 
 // ===========================================================================

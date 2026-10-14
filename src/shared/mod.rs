@@ -14,7 +14,7 @@ pub mod analytics;
 // 的实现本身天然跨域、无域可归属；留在 prod::batch 只会让 part / assembly 反向
 // 依赖 prod::batch，与逐域剥离方向相反。详见 `shared/batch/mod.rs` 顶部注释。
 pub mod batch;
-pub mod customer; // 2026-10-07：客户 L1/L2 id 展开（part / com::union_list / prod::batch 三域共用）
+pub mod customer; // 2026-10-17：客户树（任意深度）遍历与 id 展开 —— subtree_ids / root_id_of / paths_of / require_leaf_customer 等，各域共用
 // 2026-10-07 新增 domain_guard：跨域只读聚合域（dashboard / prod::programming …）的
 // 域隔离护栏，把「本域不 import 其它域的 service / repo」从口头约定变成 CI 强制。
 // 只在单测里用（调用方全在各域 `#[cfg(test)] mod tests`），故不进生产 API 面。

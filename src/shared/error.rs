@@ -143,6 +143,17 @@ pub mod code {
     // HTTP 409 由 status_from_code 表驱动映射。语义与 `BIZ_PART_ALREADY_CANCELLED=20115`
     // 对称（CAN/COMPLETED 互为幂等拒绝码）。
     pub const BIZ_PART_ALREADY_COMPLETED: i32 = 20123;
+    // 2026-10-17 新增：客户层级从固定两层放开为**任意深度**后出现的软删闸门码。
+    // 触发场景：`POST /api/v2/com/customers/{id}/soft-delete` 删一个有未软删子节点的
+    // 客户。旧两层实现**不**查子节点（「L1 仍有 L2」不报错，子节点由前端显式 cascade），
+    // 任意深度下那套隐式约定已经不成立（子节点可能挂在第 5 层，且单据挂叶子，
+    // 级联删除会连带软删已被单据引用的节点）⇒ 改为服务端显式拒绝。
+    // 与 `BIZ_CUSTOMER_IN_USE`(20113) 的分工：那一条判「**业务单据**引用」（part /
+    // assembly），本条判「**客户树**引用」（子节点），两者独立、任一命中即拒软删。
+    // 槽位选择：20124 顺延 201xx 段最后一个（20123 是 parts 段的 force-complete）。
+    // HTTP 400（与 `BIZ_INVALID_VALUE` 一致）：请求本身合法，是「按这个客户现在的
+    // 状态不能删」——调用方改请求也改不动，只能改数据，故不是 409。
+    pub const BIZ_CUSTOMER_HAS_CHILDREN: i32 = 20124;
 
     // 202xx 工人
     pub const BIZ_WORKER_NOT_FOUND: i32 = 20201;
@@ -154,7 +165,12 @@ pub mod code {
 
     // 203xx 装配体
     pub const BIZ_ASSEMBLY_NOT_FOUND: i32 = 20301;
-    pub const BIZ_ASSEMBLY_BAD_CUSTOMER: i32 = 20302; // 客户节点不允许（一级集团 / 不存在）
+    // ⚠️ 2026-10-17 起**零调用方**，按仓内先例（`20118`）保留常量登记备查：
+    // 客户树放开任意深度后，「装配件只能挂在叶子客户」改由
+    // `shared::customer::require_leaf_customer` 统一判定，错误码改为
+    // `20104 BIZ_INVALID_VALUE`（旧的 20302 语义「一级集团 / 不存在」在深树上已不成立
+    // —— 建根不再是错误，只有「还有子节点」才是）。
+    pub const BIZ_ASSEMBLY_BAD_CUSTOMER: i32 = 20302;
     pub const BIZ_ASSEMBLY_TOO_MANY_CHILDREN: i32 = 20303; // 子件 > 99，序列号 {serial}-{i:02d} 派生失败
     pub const BIZ_ASSEMBLY_PDF_INVALID: i32 = 20305; // multipart PDF 页数与 children.len()+1 不匹配 / lopdf 解析失败
     pub const BIZ_ASSEMBLY_CHILD_PRICE_LOCKED: i32 = 20306; // 父装配体已设总价时禁止子件改价（预留）
@@ -336,7 +352,7 @@ pub mod code {
     pub const BIZ_DELIVERY_NOTE_PARTS_LOCKED: i32 = 21412; // SUBMITTED/PICKED_UP 后禁止 add_parts / remove_batches
     pub const BIZ_DELIVERY_GROUP_NOT_FOUND: i32 = 21413; // 找不到指定的送货分组 / 已软删
     pub const BIZ_DELIVERY_GROUP_DUPLICATE_NAME: i32 = 21414; // 同 L1 下分组重名
-    pub const BIZ_DELIVERY_GROUP_MEMBER_CONFLICT: i32 = 21415; // L2 已属于其他活跃分组
+    pub const BIZ_DELIVERY_GROUP_MEMBER_CONFLICT: i32 = 21415; // 该客户已属于其他活跃分组（任意深度的后代）
     pub const BIZ_DELIVERY_NOTE_SCOPE_MISMATCH: i32 = 21416; // 零件分类与送货单范围不符（add_parts 校验）
     pub const BIZ_DELIVERY_SCAN_UNKNOWN_CODE: i32 = 21417; // 扫码的 serial_no 无法识别
     pub const BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY: i32 = 21418; // 装配件整套拒绝：含不可入单子件（message 附明细）
@@ -630,6 +646,14 @@ fn status_from_code(c: i32) -> StatusCode {
             StatusCode::BAD_REQUEST
         }
 
+        // ---- 2xxxx 业务码：400（入参 / 当前状态不允许）----
+        // 2026-10-17 新增：客户有未软删子节点 → 拒软删（400）。刻意**不**并进下面
+        // 那条 409 段（`BIZ_CUSTOMER_IN_USE`）：409 的语义是「换个值 / 重试也许能过」，
+        // 而这里改请求改不动（客户就是有子节点），只能先把子节点处理掉。
+        // 下面 `(20000..30000) => BAD_REQUEST` 的兜底本来就是 400，这里显式登记是
+        // 为了让「它落在 400 段」成为有断言的契约，而不是兜底的副产物。
+        c if c == code::BIZ_CUSTOMER_HAS_CHILDREN => StatusCode::BAD_REQUEST,
+
         // ---- 2xxxx 业务码：409 (状态冲突 / 重复 / 占用 / 锁) ----
         // 2026-09-30 新增：prod/pool/move 的 from/holder 不一致也归到 409 段，
         // 与 worker→worker/worker→pool 的版本冲突并列。前端按 code 区分
@@ -863,6 +887,8 @@ mod tests {
             code::BIZ_PART_ALREADY_COMPLETED,
             "BIZ_PART_ALREADY_COMPLETED",
         ),
+        // 2026-10-17 新增：客户有未软删子节点 → 拒软删（400）
+        (code::BIZ_CUSTOMER_HAS_CHILDREN, "BIZ_CUSTOMER_HAS_CHILDREN"),
         // 202xx
         (code::BIZ_WORKER_NOT_FOUND, "BIZ_WORKER_NOT_FOUND"),
         (code::BIZ_WORKER_INACTIVE, "BIZ_WORKER_INACTIVE"),
@@ -1280,6 +1306,8 @@ mod tests {
         assert_eq!(code::BIZ_BATCH_LOCATION_MISMATCH, 20122);
         // 2026-09-30 新增：force-complete 端点已 COMPLETED 幂等拒绝 → 409
         assert_eq!(code::BIZ_PART_ALREADY_COMPLETED, 20123);
+        // 2026-10-17 新增：客户层级任意深度 → 子节点闸门码
+        assert_eq!(code::BIZ_CUSTOMER_HAS_CHILDREN, 20124);
 
         // 202xx
         assert_eq!(code::BIZ_WORKER_NOT_FOUND, 20201);
@@ -1774,6 +1802,11 @@ mod tests {
             code::BIZ_CUSTOMER_IN_USE,
             StatusCode::CONFLICT,
             "BIZ_CUSTOMER_IN_USE",
+        ),
+        (
+            code::BIZ_CUSTOMER_HAS_CHILDREN,
+            StatusCode::BAD_REQUEST,
+            "BIZ_CUSTOMER_HAS_CHILDREN",
         ),
         (
             code::BIZ_WORKER_IN_USE,

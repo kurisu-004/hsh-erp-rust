@@ -40,9 +40,16 @@ pub struct QuotablePartOut {
     pub unit_price: String,
     #[serde(serialize_with = "serialize_i64")]
     pub customer_id: i64,
+    /// 本节点单段客户名
     pub customer_name: Option<String>,
-    /// L1（`t_customer.parent_id`）名称。
+    /// **根**（L1 集团）客户名 —— 2026-10-17 起由 `shared::customer::paths_of` 补齐，
+    /// 不再是「上跳一层」的直接父
     pub l1_customer_name: Option<String>,
-    /// 客户路径：有 L1 拼 `L1 / L2`，否则仅 L2 名，缺客户为 `null`。
-    pub customer_path: Option<String>,
+    /// 客户路径（第 2 层到叶子用 `" / "` 拼接，**不含**根；本节点即根时 = 根自己的名字）。
+    ///
+    /// 2026-10-17 由 `Option<String>` 改为**必填** `String`，且数据源由「service 层把
+    /// L1 名 / L2 名两段拼起来」改成 [`crate::shared::customer::paths_of`] 的
+    /// `CustomerPath::path`：客户树放开任意深度后两段拼接既不是全路径、也不是产品口径。
+    /// 客户行缺失 / 已软删时为空串（前端按「空 = 无客户信息」展示）。
+    pub customer_path: String,
 }

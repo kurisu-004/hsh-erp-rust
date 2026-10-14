@@ -122,6 +122,27 @@ async fn insert_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
     id
 }
 
+/// 插一条**非根**客户（`parent_id` 指向给定父节点），返回其 id（2026-10-17）。
+///
+/// 非根客户的 `serial_prefix` 必须为 NULL（DB CHECK + service 双校验），故本 helper
+/// 不收 prefix 形参。用来在 dashboard 用例里搭 3~4 层客户树，验证
+/// `customer_path` 取的是「第 2 层到叶子」而不是「直接父 / 自身」。
+async fn insert_child_customer(pool: &PgPool, name: &str, parent_id: i64) -> i64 {
+    let id = shared_test_snowflake().next_id();
+    sqlx::query(
+        "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
+         created_at, updated_at) VALUES ($1, $2, $3, NULL, 0, $4, $4)",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(parent_id)
+    .bind(now_naive())
+    .execute(pool)
+    .await
+    .expect("insert t_customer (child)");
+    id
+}
+
 /// 插一条工单（`t_part`），返回其 id。
 ///
 /// `system_delivery_date` 传 `None` 即 NULL；`planned_delivery_date` 是 NOT NULL 列，
@@ -1751,7 +1772,7 @@ async fn http_snapshot_delivery_orders_json_shape_is_stable() {
         "零命中时 total 退化为 0 而非 null"
     );
 
-    // 行的 10 个键逐个钉死
+    // 行的 11 个键逐个钉死
     let mut keys: Vec<&str> = orders["upcoming"]["items"][0]
         .as_object()
         .expect("行应是对象")
@@ -1763,6 +1784,7 @@ async fn http_snapshot_delivery_orders_json_shape_is_stable() {
         keys,
         [
             "customer_name",
+            "customer_path",
             "delivered_quantity",
             "id",
             "is_urgent",
@@ -1785,6 +1807,11 @@ async fn http_snapshot_delivery_orders_json_shape_is_stable() {
     assert_eq!(part_row["quantity"], 10);
     assert_eq!(part_row["delivered_quantity"], 0);
     assert_eq!(part_row["customer_name"], "shape_cust");
+    // 2026-10-17（review 第 1 轮 BLOCKER-4）：`customer_path` 是**必填键** ——
+    // 前端 `systemDeliveryOrderSchema` 声明成 `z.string().nullable()`，缺它 ⇒
+    // `dashboardSnapshotSchema.parse` 抛 ⇒ **整个大屏空白**（大屏 / HMI 常驻页）。
+    // 本 fixture 的客户是孤立根 ⇒ path = 根自己的名字（**不是**空串）。
+    assert_eq!(part_row["customer_path"], "shape_cust");
 
     let asm_row = orders["upcoming"]["items"]
         .as_array()
@@ -1798,6 +1825,58 @@ async fn http_snapshot_delivery_orders_json_shape_is_stable() {
     let pa_row = &orders["partial"]["items"][0];
     assert_eq!(pa_row["id"], pa.to_string());
     assert_eq!(pa_row["delivered_quantity"], 4);
+}
+
+/// 2026-10-17（review 第 1 轮 BLOCKER-4）：交期三桶的行带 `customer_path`，
+/// 深树上取「第 2 层到叶子、不含根」。
+///
+/// 改因：本轮只给 `DeliveryOrderDetail`（下钻抽屉）补了 `customer_path`，
+/// `SystemDeliveryOrder`（三桶行）漏了 —— 而前端
+/// `views/dashboard/composables/dashboardSnapshotSchema.ts` 的
+/// `systemDeliveryOrderSchema` 把它声明成**必填键**（`z.string().nullable()`），
+/// 缺它 ⇒ `dashboardSnapshotSchema.parse` 抛 ⇒ **整个大屏空白**。
+///
+/// 树形：华强(L1) → 终端BG(L2) → 手机部(L3) → 影像组(L4 叶子)，工单挂叶子。
+#[tokio::test]
+async fn http_snapshot_delivery_orders_customer_path_on_four_level_tree() {
+    let pool = setup().await;
+    let state = test_state(pool.clone()).await;
+    let token = mint_test_token(&state, DashboardWsFixture::WS_USER_ID).await;
+    let app = test_app(state.clone());
+
+    // 华强(根) → 终端BG → 手机部 → 影像组
+    let l1 = insert_customer(&pool, "华强", "J").await;
+    let l2 = insert_child_customer(&pool, "终端BG", l1).await;
+    let l3 = insert_child_customer(&pool, "手机部", l2).await;
+    let l4 = insert_child_customer(&pool, "影像组", l3).await;
+
+    let today = now_naive().date();
+    let sdd = today + chrono::Duration::days(2);
+    let part_id = insert_part_with_quantity(&pool, l4, "IN_PROCESS", Some(sdd), sdd, 10).await;
+
+    let (status, envelope) = send(
+        app,
+        json_request("GET", "/dashboard/snapshot", None, Some(&token)),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "envelope={envelope}");
+    let row = envelope["data"]["system_delivery_orders"]["upcoming"]["items"]
+        .as_array()
+        .expect("upcoming.items")
+        .iter()
+        .find(|o| o["id"] == part_id.to_string())
+        .expect("刚插的工单行")
+        .clone();
+
+    assert_eq!(row["customer_name"], "影像组", "自身名：{row}");
+    assert_eq!(
+        row["customer_path"], "终端BG / 手机部 / 影像组",
+        "第 2 层到叶子、**不含**根「华强」: {row}"
+    );
+    assert!(
+        row["customer_path"].is_string(),
+        "customer_path 必须是必填 string（前端 z.string().nullable()）: {row}"
+    );
 }
 
 // ===========================================================================

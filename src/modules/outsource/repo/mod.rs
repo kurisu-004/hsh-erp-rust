@@ -47,6 +47,10 @@ use chrono::NaiveDateTime;
 use rust_decimal::Decimal;
 use sqlx::PgConnection;
 
+// 2026-10-17：客户三列取名统一走 `shared::customer::paths_of`（全仓唯一实现）。
+use crate::shared::customer::CustomerPath;
+use crate::shared::error::AppError;
+
 pub mod sql;
 
 // 重导出 sql.rs 中的 ZST struct / NewXxx insert 与 model 表行类型，让上层继续用
@@ -82,10 +86,10 @@ pub struct OutsourceSentPartRow {
     pub drawing_no: Option<String>,
     pub name: Option<String>,
     pub is_urgent: bool,
-    /// L2 客户名（`t_customer`，即 part 直属客户）。
-    pub customer_name: Option<String>,
-    /// L1 客户名（`t_customer.parent_id`）。
-    pub parent_customer_name: Option<String>,
+    /// `p.customer_id`（2026-10-17：两个客户名列删掉，改由 service 层用
+    /// `shared::customer::paths_of` 批量产出 `customer_path`）。`LEFT JOIN t_part p`
+    /// ⇒ part 已软删 / 不存在时为 `None`。
+    pub customer_id: Option<i64>,
     pub process_id: i64,
     pub process_name: Option<String>,
     pub batch_no: Option<i32>,
@@ -141,8 +145,8 @@ pub struct OutsourceInFlightRow {
     pub drawing_no: Option<String>,
     pub name: Option<String>,
     pub is_urgent: bool,
-    pub customer_name: Option<String>,
-    pub parent_customer_name: Option<String>,
+    /// `p.customer_id`（2026-10-17：客户名两列删掉，改由 service 层批量补 `customer_path`）
+    pub customer_id: i64,
     pub process_id: i64,
     pub process_name: Option<String>,
     pub outsource_company_id: i64,
@@ -162,9 +166,9 @@ pub struct OutsourceQuotableRow {
     pub name: String,
     pub is_urgent: bool,
     pub unit_price: String,
+    /// 2026-10-17：两个客户名列删掉（改由 service 层用 `shared::customer::paths_of`
+    /// 一次批量产出 `customer_name` / `l1_customer_name` / `customer_path` 三列）
     pub customer_id: i64,
-    pub customer_name: Option<String>,
-    pub parent_customer_name: Option<String>,
 }
 
 /// outsource 域数据访问胖 trait。
@@ -440,6 +444,11 @@ pub trait OutsourceRepoTrait: Send {
     async fn part_exists(&mut self, part_id: i64) -> Result<bool, sqlx::Error>;
     /// `t_part` 按客户子树取零件 id。供 list_quotes 的 `customer_id` 过滤展开。
     ///
+    /// 2026-10-17：客户子树改由 [`crate::shared::customer::subtree_ids`] 展开
+    /// （「自身 + 任意深度的全部后代」），本域不再自写「自身 ∪ 直接子」的两层谓词。
+    /// **行为变更**：旧谓词对二级客户是「自身 ∪ 兄弟」（两层时代的包袱），新口径
+    /// 下选中某节点 = 该节点 + 它的子树，兄弟不在其中。
+    ///
     /// 谓词形状与已下线的 `GET /outsource-sendable` 的 `customer_id` 谓词**逐字同形**
     /// （`customer_id = $1 OR customer_id IN (直接子客户)`；该端点 2026-10-09 下线时其
     /// 谓词常量一并删除，两处形状靠本注释保持同步，**无编译期保障**）：实测
@@ -465,7 +474,7 @@ pub trait OutsourceRepoTrait: Send {
     /// 本查询**没有 `ORDER BY`** ⇒ 一旦真的触顶，返回的是**任意 10000 条**（非确定性子集、
     /// 同一请求两次可能不同），`total` 偏小且零命中守卫不触发 ⇒ 静默少报。已知取舍，本轮
     /// 不改成 count+warn、不加 `ORDER BY`（属计划外改动）。
-    async fn part_ids_by_customer(&mut self, customer_id: i64) -> Result<Vec<i64>, sqlx::Error>;
+    async fn part_ids_by_customer(&mut self, customer_id: i64) -> Result<Vec<i64>, AppError>;
     /// `t_process` 按 id 查 category。供 create_quote 校验 OUTSOURCE 类别。
     async fn process_get_category(
         &mut self,
@@ -504,12 +513,13 @@ pub trait OutsourceRepoTrait: Send {
         process_ids: &'a [i64],
     ) -> Result<Vec<(i64, String)>, sqlx::Error>;
     /// `t_part` 按 ids 查
-    /// `(id, serial_no, drawing_no, name, is_urgent, unit_price::text, customer_name, l1_customer_name)`。
+    /// `(id, serial_no, drawing_no, name, is_urgent, unit_price::text, customer_id)`。
     /// 供 quote_out_many 拼装 part 显示字段。
     ///
-    /// 2026-10-03 扩 2 列：L2 / L1 客户名（`t_customer` ⋈ 自引用），供 service 拼
-    /// `customer_path`（此前 `OutsourceQuoteOut.customer_path` 恒 `None` → 前端报价
-    /// 一览「客户」列全 `—`）。
+    /// 2026-10-17：原先带的 `customer_name` / `l1_customer_name` 两列（SQL 里是
+    /// `t_customer` ⋈ 自引用取「上跳一层」的父名）**删除**，只留 `customer_id` ——
+    /// 三个客户名（`customer_name` / `l1_customer_name` = **根** / `customer_path`）
+    /// 统一由 [`Self::customer_paths_by_ids`] 一次批量产出。
     #[allow(clippy::type_complexity)]
     async fn part_map_for_quote<'a>(
         &mut self,
@@ -522,8 +532,7 @@ pub trait OutsourceRepoTrait: Send {
             String,
             bool,
             Option<String>,
-            Option<String>,
-            Option<String>,
+            i64,
         )>,
         sqlx::Error,
     >;
@@ -537,14 +546,33 @@ pub trait OutsourceRepoTrait: Send {
         &mut self,
         part_id: i64,
     ) -> Result<Option<(String, String)>, sqlx::Error>;
-    /// `t_part` 按 id 查 `(L2 客户名, L1 客户名)`，供 `shipment_out` 真算
-    /// `customer_path`。两条 JOIN 与 list 侧 `OutsourceSentPartRow` 的
-    /// `t_customer` / `t_customer.parent_id` 逐条一致（各自 `deleted_at IS NULL`
-    /// 才给名，part 软删不影响取名 —— list 侧是 `LEFT JOIN t_part`）。
-    async fn part_customer_names(
+    /// 客户三列（`own_name` / `root_name` / `path`）批量查。委托
+    /// [`crate::shared::customer::paths_of`]，空 ids 短路。
+    ///
+    /// 2026-10-17 新增，取代 `part_customer_names`（只返回两个名字、要 service 自己
+    /// 拼两段且拼的是「上跳一层」的父名，深树上必错）与三处 SQL 内嵌的两级 JOIN。
+    async fn customer_paths_by_ids(
         &mut self,
-        part_id: i64,
-    ) -> Result<(Option<String>, Option<String>), sqlx::Error>;
+        ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, CustomerPath>, AppError>;
+    /// `t_part.customer_id`（按 id 单查；part 不存在 / 已软删 → `None`）。
+    ///
+    /// 2026-10-17 新增：`create_quote` 的「只能挂叶子客户」闸门要在 INSERT 之前知道
+    /// 该 part 挂在哪个客户上，而 quote 行自身不持 `customer_id`。
+    async fn part_customer_id(&mut self, part_id: i64) -> Result<Option<i64>, sqlx::Error>;
+
+    /// 业务单据只能挂**叶子**客户的闸门（2026-10-17 新增，与 `POST /parts` /
+    /// `POST /assemblies` 同一口径）。
+    ///
+    /// 有未软删子节点 → `20104 BIZ_INVALID_VALUE`，消息带客户路径与下级节点数。
+    /// 收在 repo 层是因为 service 方法是泛型 `R: OutsourceRepoTrait`（拿不到
+    /// `&mut PgConnection`），而闸门本身要连查 `has_children` + `subtree_ids` +
+    /// `paths_of` 三条 SQL —— 放 service 就得给 trait 再加三个方法。
+    ///
+    /// 2026-10-17：方法体改为委托 `shared::customer::require_leaf_customer`
+    /// （本域那份实现与 part / assembly 逐字同构，已收敛）。`subject` 取域内
+    /// 业务名，让错误文案仍指向「外协报价」而不是通用的「单据」。
+    async fn require_leaf_customer(&mut self, customer_id: i64) -> Result<(), AppError>;
     /// `t_process` 按 id 查 name。供 shipment_out 单条拼装。
     async fn process_get_name(&mut self, process_id: i64) -> Result<Option<String>, sqlx::Error>;
     /// `t_part_batch` 按 id 查 batch_no。供 shipment_out 单条拼装。
@@ -977,15 +1005,13 @@ impl OutsourceRepoTrait for &mut PgConnection {
     // `LIMIT 10000` 的依据与已知取舍（含「无 ORDER BY ⇒ 触顶时静默返回非确定性子集」
     // 这个已知取舍）写在 trait 处同名方法的 doc 上，避免两份拷贝各自漂移。
     // 此处只放字面量，不重复论证。
-    async fn part_ids_by_customer(&mut self, customer_id: i64) -> Result<Vec<i64>, sqlx::Error> {
+    async fn part_ids_by_customer(&mut self, customer_id: i64) -> Result<Vec<i64>, AppError> {
+        // 2026-10-17：子树展开统一走 `shared::customer::subtree_ids`（自身 + 全部后代）。
+        let ids = crate::shared::customer::subtree_ids(&mut **self, customer_id).await?;
         let rows: Vec<(i64,)> = sqlx::query_as(
-            "SELECT id FROM t_part WHERE deleted_at IS NULL \
-             AND (customer_id = $1 \
-                  OR customer_id IN (SELECT c2.id FROM t_customer c2 \
-                                     WHERE c2.parent_id = $1 AND c2.deleted_at IS NULL)) \
-             LIMIT 10000",
+            "SELECT id FROM t_part WHERE deleted_at IS NULL AND customer_id = ANY($1) LIMIT 10000",
         )
-        .bind(customer_id)
+        .bind(&ids)
         .fetch_all(&mut **self)
         .await?;
         Ok(rows.into_iter().map(|r| r.0).collect())
@@ -1053,17 +1079,14 @@ impl OutsourceRepoTrait for &mut PgConnection {
             String,
             bool,
             Option<String>,
-            Option<String>,
-            Option<String>,
+            i64,
         )>,
         sqlx::Error,
     > {
         sqlx::query_as(
             "SELECT p.id, p.serial_no, p.drawing_no, p.name, p.is_urgent, p.unit_price::text, \
-                    c.name, cp.name \
+                    p.customer_id \
              FROM t_part p \
-             LEFT JOIN t_customer c ON c.id = p.customer_id AND c.deleted_at IS NULL \
-             LEFT JOIN t_customer cp ON cp.id = c.parent_id AND cp.deleted_at IS NULL \
              WHERE p.id = ANY($1) AND p.deleted_at IS NULL",
         )
         .bind(part_ids)
@@ -1094,23 +1117,27 @@ impl OutsourceRepoTrait for &mut PgConnection {
             .await
     }
 
-    async fn part_customer_names(
+    async fn customer_paths_by_ids(
         &mut self,
-        part_id: i64,
-    ) -> Result<(Option<String>, Option<String>), sqlx::Error> {
-        // LEFT JOIN 出 L2 / L1 两个可空名（都可能是 NULL：未挂客户 / 客户已软删）；
-        // part 行不存在时 fetch_optional 返 None，塌成 (None, None)。
-        let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT c.name, cp.name \
-             FROM t_part p \
-             LEFT JOIN t_customer c ON c.id = p.customer_id AND c.deleted_at IS NULL \
-             LEFT JOIN t_customer cp ON cp.id = c.parent_id AND cp.deleted_at IS NULL \
-             WHERE p.id = $1",
+        ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, CustomerPath>, AppError> {
+        crate::shared::customer::paths_of(&mut **self, ids).await
+    }
+
+    async fn part_customer_id(&mut self, part_id: i64) -> Result<Option<i64>, sqlx::Error> {
+        sqlx::query_scalar("SELECT customer_id FROM t_part WHERE id = $1 AND deleted_at IS NULL")
+            .bind(part_id)
+            .fetch_optional(&mut **self)
+            .await
+    }
+
+    async fn require_leaf_customer(&mut self, customer_id: i64) -> Result<(), AppError> {
+        crate::shared::customer::require_leaf_customer(
+            &mut **self,
+            customer_id,
+            "外协报价只能挂在叶子客户上的零件",
         )
-        .bind(part_id)
-        .fetch_optional(&mut **self)
-        .await?;
-        Ok(row.unwrap_or((None, None)))
+        .await
     }
 
     async fn process_get_name(&mut self, process_id: i64) -> Result<Option<String>, sqlx::Error> {

@@ -508,7 +508,7 @@ impl BatchService {
         // **两条独立 SQL**，M3 当年只回退了 inspection 端点那条；本条当时漏网，
         // 本次补齐。
         let rows: Vec<InspectionRepairRow> = sqlx::query_as::<_, InspectionRepairRow>(
-            "SELECT b.id AS batch_id, b.part_id, b.batch_no, b.quantity, b.status, b.is_repairing,              b.location, b.version, b.current_process_step_id, b.parent_batch_id,              b.current_holder_id, COALESCE(s.name, w.name, oc.name) AS holder_name,              s2.process_id AS next_process_id, p2.name AS next_process_name,              b.delivery_note_id, dn.delivery_note_no,              p.serial_no, p.drawing_no, p.name, p.order_no, p.planned_delivery_date,              p.is_urgent, p.version AS part_version, p.created_at, p.updated_at,              p.customer_id, c.name AS customer_name, c_l1.name AS l1_customer_name              FROM t_part_batch b JOIN t_part p ON p.id = b.part_id              LEFT JOIN t_customer c ON c.id = p.customer_id              LEFT JOIN t_customer c_l1 ON c_l1.id = c.parent_id AND c_l1.deleted_at IS NULL              LEFT JOIN t_shelf s ON s.id = b.current_holder_id              LEFT JOIN t_worker w ON w.id = b.current_holder_id              LEFT JOIN t_outsource_company oc ON oc.id = b.current_holder_id              LEFT JOIN t_process_chain_step s2 ON s2.id = b.current_process_step_id              LEFT JOIN t_process p2 ON p2.id = s2.process_id              LEFT JOIN t_delivery_note dn ON dn.id = b.delivery_note_id              WHERE b.deleted_at IS NULL AND p.deleted_at IS NULL              AND (CASE WHEN $9::bool THEN b.is_repairing = true ELSE b.status = ANY($1) END)              AND (NOT $9::bool OR b.status NOT IN ('COMPLETED', 'CANCELLED'))              AND ($2 = '' OR p.drawing_no ILIKE '%' || $2 || '%' OR p.name ILIKE '%' || $2 || '%')              AND ($3::bigint IS NULL OR p.customer_id = $3)              AND ($4::text IS NULL OR p.serial_no ILIKE '%' || $4 || '%')              AND ($5::date IS NULL OR p.planned_delivery_date >= $5)              AND ($6::date IS NULL OR p.planned_delivery_date <= $6)              ORDER BY b.id DESC LIMIT $7 OFFSET $8",
+            "SELECT b.id AS batch_id, b.part_id, b.batch_no, b.quantity, b.status, b.is_repairing,              b.location, b.version, b.current_process_step_id, b.parent_batch_id,              b.current_holder_id, COALESCE(s.name, w.name, oc.name) AS holder_name,              s2.process_id AS next_process_id, p2.name AS next_process_name,              b.delivery_note_id, dn.delivery_note_no,              p.serial_no, p.drawing_no, p.name, p.order_no, p.planned_delivery_date,              p.is_urgent, p.version AS part_version, p.created_at, p.updated_at,              p.customer_id, c.name AS customer_name              FROM t_part_batch b JOIN t_part p ON p.id = b.part_id              LEFT JOIN t_customer c ON c.id = p.customer_id              LEFT JOIN t_shelf s ON s.id = b.current_holder_id              LEFT JOIN t_worker w ON w.id = b.current_holder_id              LEFT JOIN t_outsource_company oc ON oc.id = b.current_holder_id              LEFT JOIN t_process_chain_step s2 ON s2.id = b.current_process_step_id              LEFT JOIN t_process p2 ON p2.id = s2.process_id              LEFT JOIN t_delivery_note dn ON dn.id = b.delivery_note_id              WHERE b.deleted_at IS NULL AND p.deleted_at IS NULL              AND (CASE WHEN $9::bool THEN b.is_repairing = true ELSE b.status = ANY($1) END)              AND (NOT $9::bool OR b.status NOT IN ('COMPLETED', 'CANCELLED'))              AND ($2 = '' OR p.drawing_no ILIKE '%' || $2 || '%' OR p.name ILIKE '%' || $2 || '%')              AND ($3::bigint IS NULL OR p.customer_id = $3)              AND ($4::text IS NULL OR p.serial_no ILIKE '%' || $4 || '%')              AND ($5::date IS NULL OR p.planned_delivery_date >= $5)              AND ($6::date IS NULL OR p.planned_delivery_date <= $6)              ORDER BY b.id DESC LIMIT $7 OFFSET $8",
         )
         .bind(statuses)
         .bind(keyword)
@@ -522,43 +522,58 @@ impl BatchService {
         .bind(by_repairing_flag)
         .fetch_all(&mut *conn)
         .await?;
+        // 客户两列由一次 `paths_of` 补（2026-10-17）：
+        // - `customer_name` 出参承载 **`customer_path`**（第 2 层到叶子的拼接，
+        //   不含根）—— 前端「客户」列按 `一级 / 二级` 组合展示，两层树下与旧值逐字
+        //   相同（path = 二级名），深树下自动变成 `根 / 中间 / 叶子`；
+        // - `l1_customer_name` 是**根**名（旧形是 SQL 自连 `c.parent_id` 的一层父名）。
+        let mut customer_ids: Vec<i64> = rows.iter().map(|r| r.customer_id).collect();
+        customer_ids.sort_unstable();
+        customer_ids.dedup();
+        let paths = crate::shared::customer::paths_of(&mut *conn, &customer_ids).await?;
         let items: Vec<InspectionBatchListItemOut> = rows
             .into_iter()
-            .map(|r| InspectionBatchListItemOut {
-                batch_id: r.batch_id,
-                batch_no: r.batch_no,
-                quantity: r.quantity,
-                status: r.status,
-                // 2026-10-01 review 第 1 轮 M5：REPAIRING 已降级为标记列，
-                // `status` 恒为 IN_PROCESS，「返修中」只能由本字段表达
-                is_repairing: r.is_repairing,
-                location: r.location,
-                version: r.version,
-                current_process_step_id: r.current_process_step_id,
-                parent_batch_id: r.parent_batch_id,
-                current_holder_id: r.current_holder_id,
-                holder_name: r.holder_name,
-                // 2026-09-30（review 第 3 轮 M3 补漏）：派生自 `s2.process_id`
-                // （LEFT JOIN t_process_chain_step），**刻意不直读
-                // `b.current_process_id`** —— 理由见上方 SQL 注释。字段名保留以
-                // 兼容 `InspectionBatchListItemOut` DTO 与前端。
-                next_process_id: r.next_process_id,
-                next_process_name: r.next_process_name,
-                delivery_note_id: r.delivery_note_id,
-                delivery_note_no: r.delivery_note_no,
-                part_id: r.part_id,
-                serial_no: r.serial_no,
-                drawing_no: r.drawing_no,
-                name: r.name,
-                order_no: r.order_no,
-                planned_delivery_date: r.planned_delivery_date,
-                is_urgent: r.is_urgent,
-                part_version: r.part_version,
-                created_at: r.created_at,
-                updated_at: r.updated_at,
-                customer_id: r.customer_id,
-                customer_name: r.customer_name,
-                l1_customer_name: r.l1_customer_name,
+            .map(|r| {
+                let cp = paths.get(&r.customer_id);
+                InspectionBatchListItemOut {
+                    batch_id: r.batch_id,
+                    batch_no: r.batch_no,
+                    quantity: r.quantity,
+                    status: r.status,
+                    // 2026-10-01 review 第 1 轮 M5：REPAIRING 已降级为标记列，
+                    // `status` 恒为 IN_PROCESS，「返修中」只能由本字段表达
+                    is_repairing: r.is_repairing,
+                    location: r.location,
+                    version: r.version,
+                    current_process_step_id: r.current_process_step_id,
+                    parent_batch_id: r.parent_batch_id,
+                    current_holder_id: r.current_holder_id,
+                    holder_name: r.holder_name,
+                    // 2026-09-30（review 第 3 轮 M3 补漏）：派生自 `s2.process_id`
+                    // （LEFT JOIN t_process_chain_step），**刻意不直读
+                    // `b.current_process_id`** —— 理由见上方 SQL 注释。字段名保留以
+                    // 兼容 `InspectionBatchListItemOut` DTO 与前端。
+                    next_process_id: r.next_process_id,
+                    next_process_name: r.next_process_name,
+                    delivery_note_id: r.delivery_note_id,
+                    delivery_note_no: r.delivery_note_no,
+                    part_id: r.part_id,
+                    serial_no: r.serial_no,
+                    drawing_no: r.drawing_no,
+                    name: r.name,
+                    order_no: r.order_no,
+                    planned_delivery_date: r.planned_delivery_date,
+                    is_urgent: r.is_urgent,
+                    part_version: r.part_version,
+                    created_at: r.created_at,
+                    updated_at: r.updated_at,
+                    customer_id: r.customer_id,
+                    customer_name: Some(
+                        cp.map(|p| p.path.clone())
+                            .unwrap_or_else(|| r.customer_name.clone().unwrap_or_default()),
+                    ),
+                    l1_customer_name: cp.map(|p| p.root_name.clone()),
+                }
             })
             .collect();
         // 计数（轻量重发一次同条件但不带分页）

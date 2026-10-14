@@ -37,7 +37,7 @@ use crate::shared::error::{AppError, code};
 
 // 2026-10-13：本文件原先另存一份 `render_assembly_out`（与 `crud.rs` 逐字同形），
 // 已收敛到 `super::render_assembly_out`（`service/mod.rs`）单点承载。
-use super::{AssemblyService, render_assembly_out};
+use super::{AssemblyService, assembly_out_with_path};
 
 // =============================================================================
 // 兼容旧测试的 ZST 静态 wrapper 实现（2026-09-22 D-3 决策）
@@ -110,7 +110,7 @@ impl AssemblyService {
             .await
             .map_err(AppError::from)?
             .ok_or_else(|| AppError::biz(code::BIZ_ASSEMBLY_NOT_FOUND, "start 后查不到"))?;
-        Ok(render_assembly_out(fresh))
+        assembly_out_with_path(repo, fresh).await
     }
 
     // =======================================================================
@@ -321,6 +321,6 @@ impl AssemblyService {
             .ok_or_else(|| {
                 AppError::biz(code::BIZ_ASSEMBLY_NOT_FOUND, "force-complete 后查不到")
             })?;
-        Ok((render_assembly_out(fresh), changed))
+        Ok((assembly_out_with_path(&mut *conn, fresh).await?, changed))
     }
 }

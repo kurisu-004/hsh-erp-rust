@@ -120,7 +120,8 @@
 | `is_urgent` | boolean | `t_part.is_urgent` |
 | `has_cnc_program` | boolean | `EXISTS (t_part_file kind='G_CODE' AND part_id=pb.part_id AND deleted_at IS NULL)` |
 | `has_process_chain` | boolean | `shared::batch::chain::HAS_PROCESS_CHAIN_EXPR`（判据与理由见下） |
-| `customer_name` | string \| null | `t_customer`（`p.customer_id`，L2 叶子） |
+| `customer_name` | string \| null | `t_customer`（`p.customer_id`，**本节点**单段名） |
+| `customer_path` | string（**必填**） | `shared::customer::paths_of` 的 `CustomerPath::path`（第 2 层到叶子、**不含根**；客户行缺失时为空串）—— **2026-10-17 新增** |
 | `parent_customer_name` | string \| null | `t_customer`（`c2.parent_id`，L1 集团） |
 | `applicant_name` | string \| null | `t_applicant.name`（`a.name = p.applicant_name`，非 FK） |
 | `location` | string | `t_part_batch.location`，恒为 `"WORKER"`（写入闸门保证） |
@@ -138,7 +139,9 @@
 | `serial_no` | string \| null | `t_part.serial_no` |
 | `name` / `drawing_no` | string | `t_part.name` / `.drawing_no` |
 | `system_delivery_date` | string \| null | `t_part.system_delivery_date` |
-| `customer_name` / `parent_customer_name` | string \| null | `t_customer` L2 / L1 |
+| `customer_name` | string \| null | `t_customer`（`p.customer_id`，本节点单段名） |
+| `parent_customer_name` | string \| null | `CustomerPath::root_name`（**根**名 —— 2026-10-17 起不再是「上跳一层」的直接父） |
+| `customer_path` | string（**必填**） | `CustomerPath::path`（第 2 层到叶子、不含根）—— **2026-10-17 恢复** |
 | `applicant_name` | string \| null | `t_applicant.name`，回退到 `t_part.applicant_name` |
 | `shelf_id` | string | `t_part_batch.current_holder_id` |
 | `shelf_code` / `shelf_name` | string | `t_shelf.code` / `.name`（INNER JOIN，未命中则该批不进候选池） |
@@ -150,7 +153,8 @@
 
 `shelf_id` 是 `POST /queue/move` 的 `from.shelf_id` **唯一数据源**：`from.kind = "POOL"` 时它必须与批次真实所在货架一致（service 比对 `batch.current_holder_id`）。候选池跨货架，不能用用户当前激活货架凑（激活货架对 MANAGER / CLERK / INSPECTOR 恒为空）。
 
-⚠️ **不含 `customer_path` 与 `location`**：前者前端自己拼 L1 / L2；后者恒为 `"PRODUCTION_SHELF"`，前端用 `shelf_code` 表达位置。见 §6。
+⚠️ **不含 `location`**：它恒为 `"PRODUCTION_SHELF"`，前端用 `shelf_code` 表达位置。见 §6。
+`customer_path` **2026-10-17 恢复**（见上表）：客户树放开任意深度后前端只拿得到最后两段名，拼不出第 2 层以外的路径。
 
 ### 2.6 `has_process_chain` 判据（4 处卡片共用一个常量）
 
@@ -524,7 +528,7 @@ CTE 删除而过期（cap 改由 service 传入），由 migration `202610150000
 | `ProcessPoolDetail.work_types[]`（`WorkTypeMaxHeld` 数组） | `WorkerPoolTab.vue` 只从 `workers[]` 取 `worker_id` / `name` / `work_type_code`；`max_held` 改由端点 2 直接挂到每个 worker 上 |
 | `WorkerBrief.work_type_id` | 同上，`WorkerPoolTab.vue` 从不读 |
 | `QueueHeldBatch.shelf_code` | 持有态 `current_holder_id = worker_id`，`t_shelf` JOIN 恒不命中 → 恒 `null`；前端零消费 |
-| `QueuePoolItem.customer_path` | 前端用 `customer_name` + `parent_customer_name` 自行拼 |
+| ~~`QueuePoolItem.customer_path`~~ | **2026-10-17 恢复**：前端只拿得到最后两段名，任意深度树上拼不出完整路径 |
 | `QueuePoolItem.location`（原始 enum） | 恒为 `"PRODUCTION_SHELF"`；前端用 `shelf_code` 表达位置 |
 | `RecallOut` 的 `part`（原 `PartOut` 全量投影） | 召回的语义锚点是**批次**，返工单投影让前端为拿 `part_id` 解析上百字段对象，且批次自己的 `version` 根本不在里面 |
 
@@ -592,7 +596,7 @@ CTE 删除而过期（cap 改由 service 传入），由 migration `202610150000
 | 工单展示字段 | `t_part` |
 | 工序元数据 | `t_process` |
 | 工人与工种 | `t_worker` / `t_work_type` / `t_work_type_process` |
-| 客户两级名 | `t_customer`（L2 + `parent_id` L1） |
+| 客户三列（`customer_name` / `parent_customer_name` / `customer_path`） | `shared::customer::paths_of`（一次批量，板级 service 装配；SQL 侧只留 `t_customer` 自身那一次 join + `p.customer_id`） |
 | 申请人 | `t_applicant` |
 | 货架 | `t_shelf` |
 | CNC 程序存在性 | `t_part_file`（`EXISTS` 子查询） |
@@ -614,7 +618,10 @@ queue 域**整体不适用**域隔离护栏：它继承 worker_pool 的「经本
 3. **`POST /queue/recall` 出参变更**：`data` 由 `PartOut` 换成 `RecallOut`（3 字段）。读 `out.id` 拿 part_id 的改成 `out.part_id`；OCC 版本号改读 `out.version`（原 `PartOut` 里根本没有批次的 `version`）。
 4. **新增 2 个端点的 composable**：`GET /snapshot`（序列板 + 待下发 tab 徽标）、`GET /processes/{id}`（单工序板）。原 `useWorkerPoolByProcessQuery` + `useWorkerStateByWorkerQuery`（每 worker 一次）应合并为**一次**请求；`useWorkerPoolCountsQuery` 迁到 snapshot。
 5. **删 3 个 composable**：`useWorkerStateByWorkerQuery`（`/state`）、`useWorkerPoolCountsQuery`（`/counts`）、`useWorkerPoolByProcessQuery` 的旧形态（`/pool/{id}`）—— 后者改指 `/processes/{id}`。
-6. **zod schema 同步**：`workerBriefSchema` 删 `work_type_id`（4 → 3 字段）；删 `workTypeMaxHeldSchema` 与 `poolBatchItemSchema` 的 `customer_path` / `location`；新增 `queueBoardSnapshotSchema` / `queueProcessBoardDetailSchema` / `queueHeldBatchSchema` / `queuePoolItemSchema`。**注意 zod 默认 strip 模式**会让漏声明的字段静默丢失，数组元素必须全字段声明。
+6. **zod schema 同步**：`workerBriefSchema` 删 `work_type_id`（4 → 3 字段）；删 `workTypeMaxHeldSchema` 与 `poolBatchItemSchema` 的 `customer_path` / `location`；新增 `queueBoardSnapshotSchema` / `queueProcessBoardDetailSchema` / `queueHeldBatchSchema` / `queuePoolItemSchema`。
+   - **2026-10-17 订正**：`customer_path` 又回来了（见 §2.5 的说明与上表的必填声明），且 `parent_customer_name` 的语义从「直接父」变成「**根**」。本特性要求前端在 `queuePoolItemSchema` / `queueHeldBatchSchema` / `queuePendingBatchSchema`（三者同在 `src/views/production/queue/composables/productionQueueSchema.ts`）三处补上声明 `customer_path: z.string()` 才能用上（**2026-10-17 同批交付**）。
+   - ⚠️ **这三处是 strip 模式（非 `.strict()`），漏声明的失败形态与 `.strict()` 域相反**：Zod 会**静默剥离**未声明的键 ⇒ **不抛 `unrecognized_keys`、不白屏、零报错**，而是候选卡 / 持有卡 / 待下发池的适配层**永久拿不到路径**，客户列降级成「单段名 + 根名」两段拼接，在三层以上的树上永远拼不对。`.strict()` 域漏声明会当场 parse 抛、页面直接空白；strip 域漏声明只在**深层树**上表现为「路径看着不对」，是最容易漏的一类。
+   - **注意 zod 默认 strip 模式**会让漏声明的字段静默丢失，数组元素必须全字段声明。
 7. **i64 字符串化**：所有雪花 id 仍是 JSON string，本仓不因本次改动变更该约定。
 8. **`max_held` 取值位置变更**：原从 `work_types[].max_held_batches` 按工种查，改从 `workers[].max_held` 按工人直接读。`max_held_batches` 未设置时后端返 0（不是 null）—— 展示「未设置上限」占位的逻辑需自行按 0 判断。
 9. **代码里残留的 `WORKER_POOL_*` WS 事件名不变**（`kind` 是 WS 协议的一部分，改它要同步 dashboard 域的白名单与前端 `AFFECTS_DASHBOARD`）。本域改的只是 URL 与类型名。

@@ -19,8 +19,11 @@
 //!    行数不变；
 //! 7. `create_rejects_when_serial_prefix_not_registered` —— prefix 未在
 //!    `t_serial_counter` 注册 → 20108，行数不变；
-//! 8. `create_rejects_when_customer_not_l2_leaf` —— customer 传 L1 → 20302，
-//!    行数不变。
+//! 8. `create_rejects_when_customer_is_not_leaf` —— customer 挂到**有子节点**的客户
+//!    ⇒ **20104** `BIZ_INVALID_VALUE`，行数不变。⚠️ 旧注释写的
+//!    `create_rejects_when_customer_not_l2_leaf → 20302` 两处都已过期：客户树放开
+//!    任意深度后「L2 叶子」不再是等价写法，闸门统一成 `has_children == false`
+//!    （`shared::customer::require_leaf_customer`），错误码随之改为 20104。
 //!
 //! 全程走 HTTP（`POST /assemblies` 是 multipart 端点，service 直调验证不了字段名
 //! 解析），基建沿用 `tests/part/create_serial_price.rs` 的写法：`test_pool` +
@@ -609,27 +612,44 @@ async fn create_rejects_when_serial_prefix_not_registered() {
     assert_eq!(count_parts(&pool).await, 0, "t_part 行数必须不变");
 }
 
-/// 8. `customer_id` 传 L1（集团节点）→ 20302，整单拒且不落行。
+/// 8. `customer_id` 传**非叶子**客户（根节点下面还有子节点）→ 20104，整单拒且不落行。
 ///
-/// L1 自己有 `serial_prefix='P'` 且计数器可用，所以这个用例证明 20302 来自
-/// 「必须是 L2 叶子」这道校验，而不是被后面的派发逻辑误伤。
+/// 该 L1 自己有 `serial_prefix='P'` 且计数器可用，所以这个用例证明 20104 来自
+/// 「只能挂叶子客户」这道校验，而不是被后面的派发逻辑误伤。
+///
+/// 2026-10-17（客户树无限层级化）：判据由「必须是 L2」（= `parent_id IS NOT NULL`，
+/// 两层树下的叶子等价写法）改成「**无未软删子节点**」。本用例的 fixture L1
+/// （`fx.customer_l1_id`）下面挂着 L2 ⇒ 正是新判据要拒的形态。错误码同步由
+/// `20302 BIZ_ASSEMBLY_BAD_CUSTOMER` 改成 `20104 BIZ_INVALID_VALUE`
+/// （与 `POST /parts` / 外协报价的叶子闸门同一条口径）。
 #[tokio::test]
-async fn create_rejects_when_customer_not_l2_leaf() {
+async fn create_rejects_when_customer_is_not_leaf() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
     let body = create_body(fx.customer_l1_id, &[("子件-1", Some("D-Z-1"), None)]);
 
     let (s, env) = send(app, create_assembly_request(&body, None, None, &token)).await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "customer 传 L1 应 20302: {env}");
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "customer 传非叶子应 20104: {env}"
+    );
     assert_eq!(
         env["code"],
-        code::BIZ_ASSEMBLY_BAD_CUSTOMER,
-        "错误码应为 20302 BIZ_ASSEMBLY_BAD_CUSTOMER: {env}"
+        code::BIZ_INVALID_VALUE,
+        "错误码应为 20104 BIZ_INVALID_VALUE: {env}"
+    );
+    assert!(
+        env["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("子节点"),
+        "消息应给出下级节点数: {env}"
     );
     assert_eq!(count_assemblies(&pool).await, 0, "t_assembly 行数必须不变");
     assert_eq!(count_parts(&pool).await, 0, "t_part 行数必须不变");
     assert_eq!(
         counter_of(&pool, "P").await,
         0,
-        "20302 排在派发前 ⇒ 计数器不应被推进"
+        "20104 排在派发前 ⇒ 计数器不应被推进"
     );
 }

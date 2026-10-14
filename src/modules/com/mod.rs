@@ -21,7 +21,7 @@
 //!
 //! 送货单的多个前缀收敛成**一个** nest：`/delivery` 下再分 `note`（送货单本体）
 //! 与 `group`（送货分组）。分组表 `t_delivery_group` / `t_delivery_group_member`
-//! 仍在使用（按 L2 归属分单展示），故 `/group` 段保留。整域契约见
+//! 仍在使用（按同一根下的客户归属分单展示），故 `/group` 段保留。整域契约见
 //! `docs/api/delivery_note.md`。
 
 use std::sync::Arc;

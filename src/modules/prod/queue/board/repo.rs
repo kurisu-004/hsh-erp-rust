@@ -110,6 +110,12 @@ const SQL_WORKERS_BY_PROCESS: &str = "SELECT w.id AS worker_id, \
 
 /// `board_process_detail` SQL 3：**一次**取齐该工序全部工人的持有批次。
 ///
+/// 2026-10-17：`LEFT JOIN t_customer c1`（取「上跳一层」的父名）**删除**，改为投影
+/// `p.customer_id`，由 service 层用 `shared::customer::paths_of` 批量补
+/// `parent_customer_name`（= **根**名）与 `customer_path`。理由见
+/// `board/service.rs::build_process_detail`：热路径上少一个 join，且客户路径口径
+/// 全仓只有 `paths_of` 一份。
+///
 /// ⚠️ 这是消灭 N+1 的关键：`current_holder_id = ANY($1::bigint[])`（不是
 /// `= $1`），10 个工人与 2 个工人发的是**同一条 SQL**，只是数组长度不同。
 /// 闸门与 `take_one_from_pool` 的持有态判定一致：`status='IN_PROCESS' AND
@@ -128,8 +134,8 @@ const SQL_HELD_BATCHES_BY_WORKERS: &str = "SELECT pb.id AS batch_id, \
      p.planned_delivery_date AS planned_delivery_date, \
      p.is_urgent AS is_urgent, \
      p.note AS note, \
+     p.customer_id AS customer_id, \
      c2.name AS customer_name, \
-     c1.name AS parent_customer_name, \
      a.name AS applicant_name, \
      EXISTS (SELECT 1 FROM t_part_file pf \
              WHERE pf.part_id = pb.part_id \
@@ -139,7 +145,6 @@ const SQL_HELD_BATCHES_BY_WORKERS: &str = "SELECT pb.id AS batch_id, \
      FROM t_part_batch pb \
      JOIN t_part p ON p.id = pb.part_id AND p.deleted_at IS NULL \
      LEFT JOIN t_customer c2 ON c2.id = p.customer_id AND c2.deleted_at IS NULL \
-     LEFT JOIN t_customer c1 ON c1.id = c2.parent_id AND c1.deleted_at IS NULL \
      LEFT JOIN t_applicant a ON a.name = p.applicant_name AND a.deleted_at IS NULL \
      LEFT JOIN t_process_chain_step cs \
        ON cs.id = pb.current_process_step_id AND cs.deleted_at IS NULL \
@@ -150,6 +155,8 @@ const SQL_HELD_BATCHES_BY_WORKERS: &str = "SELECT pb.id AS batch_id, \
      ORDER BY pb.current_holder_id ASC, pb.id ASC";
 
 /// `board_process_detail` SQL 4：该工序候选池（跨所有生产货架）。
+///
+/// 2026-10-17 同 SQL 3：`c1` join 删除、改投影 `p.customer_id`。
 ///
 /// `has_process_chain` 由 `shared::batch::chain::HAS_PROCESS_CHAIN_EXPR` 提供，
 /// 判据与理由（含「必须 `IS NOT NULL AND =` 而不是 `IS NOT DISTINCT FROM`」）见
@@ -178,8 +185,8 @@ const SQL_POOL_ITEMS_BY_PROCESS: &str = "SELECT pb.id AS batch_id, \
      p.is_urgent AS is_urgent, \
      p.note AS note, \
      p.applicant_name AS applicant_name, \
+     p.customer_id AS customer_id, \
      c2.name AS customer_name, \
-     c1.name AS parent_customer_name, \
      a.name AS applicant_name_resolved, \
      s.id AS shelf_id, \
      s.code AS shelf_code, \
@@ -192,7 +199,6 @@ const SQL_POOL_ITEMS_BY_PROCESS: &str = "SELECT pb.id AS batch_id, \
      FROM t_part_batch pb \
      JOIN t_part p ON p.id = pb.part_id AND p.deleted_at IS NULL \
      LEFT JOIN t_customer c2 ON c2.id = p.customer_id AND c2.deleted_at IS NULL \
-     LEFT JOIN t_customer c1 ON c1.id = c2.parent_id AND c1.deleted_at IS NULL \
      LEFT JOIN t_applicant a ON a.name = p.applicant_name AND a.deleted_at IS NULL \
      JOIN t_shelf s ON s.id = pb.current_holder_id AND s.deleted_at IS NULL \
      LEFT JOIN t_process_chain_step cs \
@@ -250,8 +256,10 @@ pub struct HeldBatchRow {
     pub planned_delivery_date: Option<chrono::NaiveDate>,
     pub is_urgent: bool,
     pub note: Option<String>,
+    /// `t_part.customer_id`：2026-10-17 起 `parent_customer_name` / `customer_path`
+    /// 由 service 层用一次 `shared::customer::paths_of` 批量补齐（见该方法的 doc）。
+    pub customer_id: i64,
     pub customer_name: Option<String>,
-    pub parent_customer_name: Option<String>,
     pub applicant_name: Option<String>,
     pub has_cnc_program: bool,
     /// 工单已绑工序链且批次当前工序能在链内定位（判据见
@@ -272,8 +280,9 @@ pub struct PoolItemRow {
     pub system_delivery_date: Option<chrono::NaiveDate>,
     pub is_urgent: bool,
     pub note: Option<String>,
+    /// 同 [`HeldBatchRow::customer_id`]（service 层批量补客户三列）。
+    pub customer_id: i64,
     pub customer_name: Option<String>,
-    pub parent_customer_name: Option<String>,
     pub applicant_name: Option<String>,
     pub shelf_id: i64,
     pub shelf_code: String,
@@ -483,8 +492,8 @@ fn row_to_held_batch(r: sqlx::postgres::PgRow) -> HeldBatchRow {
         planned_delivery_date: r.get("planned_delivery_date"),
         is_urgent: r.get("is_urgent"),
         note: r.get("note"),
+        customer_id: r.get("customer_id"),
         customer_name: r.get("customer_name"),
-        parent_customer_name: r.get("parent_customer_name"),
         applicant_name: r.get("applicant_name"),
         has_cnc_program: r.get("has_cnc_program"),
         has_process_chain: r.get("has_process_chain"),
@@ -504,8 +513,8 @@ fn row_to_pool_item(r: sqlx::postgres::PgRow) -> PoolItemRow {
         system_delivery_date: r.get("system_delivery_date"),
         is_urgent: r.get("is_urgent"),
         note: r.get("note"),
+        customer_id: r.get("customer_id"),
         customer_name: r.get("customer_name"),
-        parent_customer_name: r.get("parent_customer_name"),
         // `t_part.applicant_name` 是字符串列、`t_applicant` 是名字表：前端卡片要
         // 显示申请人**已录制的名字**，故优先取 JOIN 结果，回退到 part 上的
         // 原始字符串（申请人未录入时后者仍可用）。

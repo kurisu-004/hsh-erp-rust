@@ -856,8 +856,7 @@ impl OutsourceShipmentRepo {
     ) -> Result<Vec<OutsourceSentPartRow>, sqlx::Error> {
         sqlx::query_as::<_, OutsourceSentPartRow>(
             "SELECT s.id, s.version, \
-                    p.drawing_no, p.name, p.is_urgent, \
-                    c.name AS customer_name, cp.name AS parent_customer_name, \
+                    p.drawing_no, p.name, p.is_urgent, p.customer_id, \
                     s.process_id, pr.name AS process_name, \
                     pb.batch_no, \
                     s.quantity, s.unit_price::text, s.sent_at, s.received_at, \
@@ -866,8 +865,6 @@ impl OutsourceShipmentRepo {
              LEFT JOIN t_part p ON p.id = s.part_id \
              LEFT JOIN t_process pr ON pr.id = s.process_id \
              LEFT JOIN t_part_batch pb ON pb.id = s.batch_id \
-             LEFT JOIN t_customer c ON c.id = p.customer_id AND c.deleted_at IS NULL \
-             LEFT JOIN t_customer cp ON cp.id = c.parent_id AND cp.deleted_at IS NULL \
              WHERE s.deleted_at IS NULL AND s.status IN ('OUTSOURCING', 'RECEIVED') \
                AND s.outsource_company_id = $1 \
                AND ($2::text IS NULL OR p.drawing_no ILIKE $2) \
@@ -920,8 +917,7 @@ impl OutsourceShipmentRepo {
     ) -> Result<Vec<OutsourceInFlightRow>, sqlx::Error> {
         sqlx::query_as::<_, OutsourceInFlightRow>(
             "SELECT p.id, pb.id AS batch_id, pb.batch_no, pb.quantity, pb.version, \
-                    p.serial_no, p.drawing_no, p.name, p.is_urgent, \
-                    c.name AS customer_name, cp.name AS parent_customer_name, \
+                    p.serial_no, p.drawing_no, p.name, p.is_urgent, p.customer_id, \
                     s.process_id, pr.name AS process_name, \
                     s.outsource_company_id, oc.name AS outsource_company_name, s.sent_at \
              FROM t_outsource_shipment s \
@@ -929,8 +925,6 @@ impl OutsourceShipmentRepo {
              JOIN t_part p ON p.id = s.part_id AND p.deleted_at IS NULL \
              LEFT JOIN t_outsource_company oc ON oc.id = s.outsource_company_id AND oc.deleted_at IS NULL \
              LEFT JOIN t_process pr ON pr.id = s.process_id AND pr.deleted_at IS NULL \
-             LEFT JOIN t_customer c ON c.id = p.customer_id AND c.deleted_at IS NULL \
-             LEFT JOIN t_customer cp ON cp.id = c.parent_id AND cp.deleted_at IS NULL \
              WHERE s.deleted_at IS NULL AND s.status = 'OUTSOURCING' \
                AND ($1::text IS NULL OR p.drawing_no ILIKE $1 OR p.name ILIKE $1) \
              ORDER BY s.sent_at DESC, pb.id DESC \
@@ -998,17 +992,15 @@ impl OutsourceQuotableRepo {
     ) -> Result<Vec<OutsourceQuotableRow>, sqlx::Error> {
         sqlx::query_as::<_, OutsourceQuotableRow>(
             "SELECT q.id, q.serial_no, q.drawing_no, q.name, q.is_urgent, q.unit_price, \
-                    q.customer_id, q.customer_name, q.parent_customer_name \
+                    q.customer_id \
              FROM ( \
                SELECT DISTINCT ON (p.id) \
                   p.id, p.serial_no, p.drawing_no, p.name, p.is_urgent, p.unit_price::text AS unit_price, \
-                  p.customer_id, c.name AS customer_name, cp.name AS parent_customer_name, \
+                  p.customer_id, \
                   p.is_urgent AS order_is_urgent, p.planned_delivery_date AS order_planned_date \
                FROM t_part p \
                JOIN t_part_batch pb ON pb.part_id = p.id AND pb.deleted_at IS NULL \
                  AND pb.status = 'PENDING' \
-               LEFT JOIN t_customer c ON c.id = p.customer_id AND c.deleted_at IS NULL \
-               LEFT JOIN t_customer cp ON cp.id = c.parent_id AND cp.deleted_at IS NULL \
                WHERE p.deleted_at IS NULL \
                  AND ($1::text IS NULL OR p.drawing_no ILIKE $1 OR p.name ILIKE $1) \
                ORDER BY p.id, pb.batch_no ASC \
@@ -1169,8 +1161,6 @@ const SENDABLE_INNER_X_SQL: &str = "SELECT {projection} \
                AND q.deleted_at IS NULL AND pr.requires_approval \
              LEFT JOIN t_outsource_company oc ON oc.id = q.outsource_company_id \
                AND oc.deleted_at IS NULL \
-             LEFT JOIN t_customer c ON c.id = p.customer_id AND c.deleted_at IS NULL \
-             LEFT JOIN t_customer cp ON cp.id = c.parent_id AND cp.deleted_at IS NULL \
              LEFT JOIN LATERAL ( \
                SELECT ap.name \
                FROM t_applicant ap \
@@ -1220,7 +1210,6 @@ pub(crate) const SENDABLE_PROJECTION_FULL: &str = "pb.version AS batch_version, 
      to_char(p.planned_delivery_date, 'YYYY-MM-DD') AS planned_delivery_date, \
      to_char(p.system_delivery_date, 'YYYY-MM-DD') AS system_delivery_date, \
      p.is_urgent, p.customer_id, \
-     c.name AS customer_name, cp.name AS parent_customer_name, \
      ap1.name AS applicant_name, \
      EXISTS (SELECT 1 FROM t_part_file pf \
              WHERE pf.part_id = pb.part_id \
@@ -1248,7 +1237,7 @@ pub(crate) const SENDABLE_DEDUP_PROJECTION_FULL: &str = "x.batch_version, x.batc
      x.batch_quantity, x.source_status, x.shelf_id, \
      x.part_id, x.part_serial_no, x.part_drawing_no, x.part_name, x.note, \
      x.planned_delivery_date, x.system_delivery_date, x.is_urgent, \
-     x.customer_name, x.parent_customer_name, x.customer_id, \
+     x.customer_id, \
       x.applicant_name, x.has_cnc_program, x.has_process_chain, \
      x.shelf_code, x.current_process_id, x.current_process_name, x.requires_approval, \
      x.quote_id, x.price, x.outsource_company_id, x.outsource_company_name, \

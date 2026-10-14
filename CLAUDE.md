@@ -2,10 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-> 📌 **前端对接**：后端 API 参考见 [`docs/api/`](docs/api/)。**2026-10-16 现状**：`docs/api/` 有 15 份文件，每份是一个域的**整域契约**（端点表 / 逐字段 / 口径表 / 错误码 / 移除记录 / WS 关系 / 表依赖与前端配套 / 已知偏差登记），范本是 [`dashboard.md`](docs/api/dashboard.md) 的八节骨架：
+> 📌 **前端对接**：后端 API 参考见 [`docs/api/`](docs/api/)。**2026-10-17 现状**：`docs/api/` 有 16 份文件（新增 [`docs/api/customers.md`](docs/api/customers.md) —— 客户树**任意深度**的整域契约：`customer_path` 口径 / 「业务单据只挂叶子」/ 筛选纯子树 / 不传 `limit` 即全量），每份是一个域的**整域契约**（端点表 / 逐字段 / 口径表 / 错误码 / 移除记录 / WS 关系 / 表依赖与前端配套 / 已知偏差登记），范本是 [`dashboard.md`](docs/api/dashboard.md) 的八节骨架：
 > - [`docs/api/dashboard.md`](docs/api/dashboard.md) —— 大屏聚合域（3 个只读 HTTP 端点 + WS 首帧 / 增量；`DELIVERY_STATUSES` 四处共用、行单位、装配件整套交付不变式、`ts` 格式、前端配套清单）
 > - [`docs/api/programming.md`](docs/api/programming.md) —— `prod::programming` 待编程一览（part 状态闸门 + 三规则并集、part 级去重、批次锚点、排序白名单大小写不对称）
-> - [`docs/api/inspection.md`](docs/api/inspection.md) —— `prod::inspection` 待品检（队列列表 + 扫码三层树、`l1_customer_name` 与返修侧有意分叉、域隔离漏报盲区）
+> - [`docs/api/inspection.md`](docs/api/inspection.md) —— `prod::inspection` 待品检（队列列表 + 扫码三层树、`l1_customer_name` 与返修侧**已统一**为「根」名（2026-10-17 起两域同源 `shared::customer::paths_of`）、域隔离漏报盲区）
 > - [`docs/api/queue.md`](docs/api/queue.md) —— `prod::queue` 生产队列（9 端点；候选池判据的两列一致 / 货架 JOIN 不一致、`pending_count` 口径、`batch_id` 必须是 JSON 字符串）
 > - [`docs/api/scan.md`](docs/api/scan.md) —— `prod::scan` 报工台（**2026-10-10 新建**，5 端点硬切自 `prod::worker` / `part` / `prod::batch`；`ScanListItem` 39 → 17 字段收敛、`ScanWorkerBrief` 12 → 4 字段收敛、旧路径 4×404 + 1×405 的实跑形态、`pickable_shelf_scope` 与 `shelf_scope_for` 的刻意分歧、`listing/` 子模块的域隔离护栏；**2026-10-11 worker-scan 加部分数量**：`quantity` 为 JSON 字符串，缺省 = 整批、`0 < q < batch.quantity` 自动拆批、余量**留在工人手上**（与 pick-up 的「余量留架上」相反），响应 `scan.batch_id` 返回被处理的那一批；**2026-10-15 增至 8 端点**：`GET /locate` 扫码找件诊断 + `POST /take-over` 扫码接管 + `POST /outsource-receive` 外协确认收回（自助恢复三件套）+ `pick-up` PENDING 分支补链首落位；★ **2026-10-16 接管 / 外协收回的目标工序改由「工人的工种映射」推导**：`next_process_id` 变三态（缺省 + 单候选自动 / 缺省 + 多候选必填 `40001` / 显式 + 越链落 `NULL` step），`20702` 不再表示「越链」（`outsource-receive` 自 review 第 1 轮起**完全不产生**该码：stage① 传 `StepResolve::Lenient`），读侧 `locate` 出参新增顶层 `worker_processes` 供前端收窄 picker；⚠️ 闸门候选集与写侧逐字同源、**出参**才是窄集合）
 > - [`docs/api/batch.md`](docs/api/batch.md) —— `prod::batch` 批次流转（**剥离中间态**，域内 17 条 + 域外 `/batches/split` 1 条；剥离登记表 / `ROUTES` 权威源 / 状态派生契约 / 外协三端点已迁往 `outsource::queue` / 报工台 2 条已迁往 `prod::scan`）
@@ -670,7 +670,7 @@ commit 之后发一次汇总。前端若订阅了它，会成**死订阅**（永
 
 ## `docs/api/` 目录约定（2026-10-07 确立）
 
-**现状**：`docs/api/` 有 **15 份**文件（与本文件顶部「📌 前端对接」一节同口径；2026-10-11 review 第 1 轮订正过「9 份 / 11 份」两处自相矛盾与漏登 `wx.md`，2026-10-12 新建 `statistics.md` 后为 12，2026-10-13 新建 `mail_digest.md` 后为 13，2026-10-16 新建 `mail.md` 后为 14、**同批新建 `print_template.md` 后为 15**），每份 = **一个域的整域契约**：
+**现状**：`docs/api/` 有 **16 份**文件（与本文件顶部「📌 前端对接」一节同口径；2026-10-11 review 第 1 轮订正过「9 份 / 11 份」两处自相矛盾与漏登 `wx.md`，2026-10-12 新建 `statistics.md` 后为 12，2026-10-13 新建 `mail_digest.md` 后为 13，2026-10-16 新建 `mail.md` 后为 14、**同批新建 `print_template.md` 后为 15**，2026-10-17 **新建 `customers.md` 后为 16**），每份 = **一个域的整域契约**：
 
 | 文件 | 覆盖域 |
 |---|---|
@@ -682,6 +682,7 @@ commit 之后发一次汇总。前端若订阅了它，会成**死订阅**（永
 | [`docs/api/scan.md`](docs/api/scan.md) | `prod::scan`（报工台：扫工牌 + 扫码找件诊断 / 接管 / 外协收回 + 取件 / 放回列表 + 放回送检 + 手动领取） |
 | [`docs/api/outsource.md`](docs/api/outsource.md) | `outsource`（外协公司 / 报价 / 发货 + 外协看板与三合一写端点；公司 7 条 / 报价 7 条 / 发货 2 条 / 看板 3 条） |
 | [`docs/api/delivery_note.md`](docs/api/delivery_note.md) | `com::delivery_note`（送货单 + 送货分组 + 司机候选，2026-10-08 平移 com + 入单收敛为扫码单一入口） |
+| [`docs/api/customers.md`](docs/api/customers.md) | `com::customer`（**2026-10-17 新建**；客户树由固定两层放开为**任意深度**：`customer_path` 口径 / 业务单据只挂叶子 / 筛选纯子树 / 不传 `limit` 即全量；⚠️ 出参 `customer_path` 是**必填 `String`**，全仓共用 `shared::customer::paths_of` 一个真源） |
 | [`docs/api/shelves.md`](docs/api/shelves.md) | `iam::shelf`（**iam 域下的嵌套子模块**：货架 CRUD + 负载与自动选架，5 端点；2026-10-10 自独立 shelf 域迁入 iam，URL 硬切 `/api/v2/iam/shelves/*`） |
 | [`docs/api/iam.md`](docs/api/iam.md) | `iam`（认证 + 账号 + 企业微信绑定 + 货架子模块 + **RBAC 角色权限面板**，**30 端点**；session 5 + users 12 + shelves 5 + rbac 8，4 条破坏性变更与 OCC 锚点；ADMIN 元角色通配 / 停用即降权） |
 | [`docs/api/wx.md`](docs/api/wx.md) | `wx` 微信小程序 BFF（**2026-10-11 新建**；**按小程序页面切子模块**：`login/` + `part_list/` + `production/`；5 端点；URL 硬切无 alias 5 条、VO camelCase 逐字对齐前端卡片模型、`deliveredQty` 真值、尾斜杠 404 实测钉死、`counts` / `list` 口径对齐、★ 2026-10-12 `part_list` 日期 + 7 类 tab 双维筛选） |

@@ -3,8 +3,15 @@
 //! ## 2026-09-22 D-5 + review 第 1 轮修正（service by-value trait）
 //! 所有方法签名改为 `<R: DeliveryNoteRepoTrait>(&self, mut repo: R, ...)`（iam 严格
 //! 范本）。snowflake 改为 `&self.snowflake`。跨域 ZST（`CustomerRepo::xxx`）走
-//! `&mut *repo.conn_mut()`；私有 helper（`validate_l2_members` / `l1_children_lookup`）
-//! 收 `&mut PgConnection`，caller 喂 `&mut *repo.conn_mut()`。
+//! `&mut *repo.conn_mut()`；私有 helper（`validate_group_members` /
+//! `member_name_lookup`）收 `&mut PgConnection`，caller 喂 `&mut *repo.conn_mut()`。
+//!
+//! ## 2026-10-17 客户树任意深度后的三处口径变更
+//! 1. 分组键**仍是 L1 根**（`customer_id` 必须 `parent_id IS NULL`）—— 这条语义
+//!    不随客户层级加深而改变（送货单的判定键 / 编号前缀键都是根）。
+//! 2. **成员**从「L1 的直接子」放宽为「L1 的任意后代」（`validate_group_members`）。
+//! 3. 本文件的成员显示名与 `ungrouped_customers` 候选集从 `list_children`
+//!    （**直接**子）改成 `shared::customer::subtree_ids` + `paths_of`（任意深度）。
 
 use std::collections::HashSet;
 
@@ -12,6 +19,7 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock::now_naive;
 use crate::modules::com::customer::repo::CustomerRepo;
 use crate::modules::com::delivery_note::repo::DeliveryNoteRepoTrait;
+use crate::shared::customer::{paths_of, subtree_ids};
 use crate::shared::error::{AppError, code};
 
 use super::super::model::{DeliveryGroup, DeliveryGroupMember};
@@ -19,7 +27,8 @@ use super::super::vo::{
     DeliveryGroupListOut, DeliveryGroupMemberOut, DeliveryGroupOut, UngroupedCustomerOut,
 };
 use super::inner::{
-    group_not_found, l1_children_lookup, validate_group_name, validate_l2_members, version_conflict,
+    group_not_found, member_name_lookup, validate_group_members, validate_group_name,
+    version_conflict,
 };
 
 use super::DeliveryGroupService;
@@ -61,19 +70,25 @@ impl DeliveryGroupService {
         let members = repo
             .group_list_members_by_group_ids(&group_ids, false)
             .await?;
-        let l2_children = CustomerRepo::list_children(&mut *repo.conn_mut(), l1_id, false).await?;
+        // 2026-10-17：成员显示名的候选集由「L1 的**直接**子」（`list_children`）改成
+        // 「L1 的**全部后代**」（`subtree_ids`）—— 分组成员可以是任意深度的后代，
+        // 直接子列表在三层以上的树上根本匹配不上，会把成员显示成「(已删除)」。
+        // 名字取 `paths_of` 的 `own_name`（本节点单段名），一次往返拿齐。
+        let mut descendant_ids = subtree_ids(&mut *repo.conn_mut(), l1_id).await?;
+        // 剔除 L1 自身（`subtree_ids` 含自身）：分组键就是它，列成「未分组候选」或
+        // 成员都没有业务含义。
+        descendant_ids.retain(|id| *id != l1_id);
+        let paths = paths_of(&mut *repo.conn_mut(), &descendant_ids).await?;
+        let own_name_of =
+            |cid: i64| -> Option<String> { paths.get(&cid).map(|p| p.own_name.clone()) };
 
         let mut groups_out = Vec::with_capacity(groups.len());
-        let mut membered_l2_ids: HashSet<i64> = HashSet::new();
+        let mut membered_ids: HashSet<i64> = HashSet::new();
         for g in &groups {
             let mut mems = Vec::new();
             for m in members.iter().filter(|m| m.group_id == g.id) {
-                membered_l2_ids.insert(m.customer_id);
-                let name = l2_children
-                    .iter()
-                    .find(|c| c.id == m.customer_id)
-                    .map(|c| c.name.clone())
-                    .unwrap_or_else(|| "(已删除)".to_string());
+                membered_ids.insert(m.customer_id);
+                let name = own_name_of(m.customer_id).unwrap_or_else(|| "(已删除)".to_string());
                 mems.push(DeliveryGroupMemberOut {
                     customer_id: m.customer_id,
                     customer_name: name,
@@ -82,13 +97,13 @@ impl DeliveryGroupService {
             groups_out.push(Self::assemble_group_out(g, mems));
         }
 
-        let ungrouped_customers: Vec<UngroupedCustomerOut> = l2_children
+        // 未分组候选 = 该根的**全部后代**里还没进任何分组的那些。
+        // 2026-10-17：旧形取的是「直接子」，两层树下恰好等于全部叶子；深树上若仍取
+        // 直接子，L3/L4 客户会从候选里消失，用户没法把它们排进分组。
+        let ungrouped_customers: Vec<UngroupedCustomerOut> = descendant_ids
             .into_iter()
-            .filter(|c| !membered_l2_ids.contains(&c.id))
-            .map(|c| UngroupedCustomerOut {
-                id: c.id,
-                name: c.name,
-            })
+            .filter(|cid| !membered_ids.contains(cid))
+            .filter_map(|cid| own_name_of(cid).map(|name| UngroupedCustomerOut { id: cid, name }))
             .collect();
 
         Ok(DeliveryGroupListOut {
@@ -132,7 +147,7 @@ impl DeliveryGroupService {
         }
 
         let validated_members =
-            validate_l2_members(&mut *repo.conn_mut(), &l1.id, &req.member_customer_ids).await?;
+            validate_group_members(&mut *repo.conn_mut(), &l1.id, &req.member_customer_ids).await?;
 
         let now = now_naive();
         let group = DeliveryGroup {
@@ -163,7 +178,7 @@ impl DeliveryGroupService {
         let mut member_outs: Vec<DeliveryGroupMemberOut> =
             Vec::with_capacity(validated_members.len());
         for cid in &validated_members {
-            let name = l1_children_lookup(&mut *repo.conn_mut(), *cid)
+            let name = member_name_lookup(&mut *repo.conn_mut(), *cid)
                 .await
                 .unwrap_or_else(|_| "(已删除)".into());
             member_outs.push(DeliveryGroupMemberOut {
@@ -219,7 +234,7 @@ impl DeliveryGroupService {
         let mut replace_members = false;
         if let Some(ref new_ids) = req.member_customer_ids {
             let validated =
-                validate_l2_members(&mut *repo.conn_mut(), &group.customer_id, new_ids).await?;
+                validate_group_members(&mut *repo.conn_mut(), &group.customer_id, new_ids).await?;
             new_member_ids = validated;
             replace_members = true;
         }
@@ -263,7 +278,7 @@ impl DeliveryGroupService {
             .await?;
         let mut members: Vec<DeliveryGroupMemberOut> = Vec::with_capacity(raw_members.len());
         for m in raw_members.into_iter().filter(|m| m.group_id == group_id) {
-            let name = l1_children_lookup(&mut *repo.conn_mut(), m.customer_id)
+            let name = member_name_lookup(&mut *repo.conn_mut(), m.customer_id)
                 .await
                 .unwrap_or_else(|_| "(已删除)".into());
             members.push(DeliveryGroupMemberOut {

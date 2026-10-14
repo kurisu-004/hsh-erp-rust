@@ -18,8 +18,6 @@ use std::collections::HashMap;
 use sqlx::PgConnection;
 
 use crate::auth::rbac::{CurrentUser, Role};
-use crate::modules::com::customer::model::TCustomer;
-use crate::modules::com::customer::repo::CustomerRepo;
 use crate::modules::com::delivery_note::repo::DeliveryNoteRepoTrait;
 use crate::modules::com::delivery_note::repo::scan_tree::{
     DeliveryScanRepo, ScanAssemblyRow, ScanBatchRow, ScanPartRow,
@@ -326,7 +324,7 @@ fn batch_to_out(r: ScanBatchRow, is_scanned: bool) -> DeliveryScanBatchOut {
 /// 取该 L1 名下现有的 DRAFT（无则 `null`；**绝不建单**）。
 ///
 /// L1 的推导口径与 `POST /scan` 完全一致：装配件树用 `t_assembly.customer_id`
-/// 上推一级，独立件树用 `t_part.customer_id` 上推一级（`parent_id.unwrap_or(id)`）。
+/// 上溯到**根**，独立件树用 `t_part.customer_id` 上溯到根（`l1_of` → `root_id_of`）。
 async fn resolve_draft<R: DeliveryNoteRepoTrait>(
     repo: &mut R,
     hit: &HitTree,
@@ -350,15 +348,20 @@ async fn resolve_draft<R: DeliveryNoteRepoTrait>(
     }))
 }
 
-/// 客户 id → 其 L1 id（自身即 L1 时返回自身）。客户不存在时报 20103。
+/// 客户 id → 其**根**（L1 集团）id。客户不存在 / 解析不出根时报 20102 / 20104。
+///
+/// 2026-10-17 语义变更：原实现是 `c.parent_id.unwrap_or(c.id)`，即**只上跳一层**——
+/// 两层树下等价于「走到根」，客户树放开任意深度后，挂在 L3/L4 的零件会拿到**中间层**
+/// 当根：同一集团下的两个分厂会被拆成两张送货单（L1 判定键错），编号前缀也派错。
+/// 现委托 [`crate::shared::customer::root_id_of`]（向上递归走到 `parent_id IS NULL`，
+/// 带 `seen` 数组 + 深度上限双防环）。
+///
+/// **仍是 1 条 SQL**（`root_id_of` 内部一条递归 CTE），与旧的 `get_by_id` 同量级；
+/// 调用方共 3 处（`resolve_draft` / `scan_entry` 建单 / `scan_entry` 的 21407 闸门），
+/// 逐处一次往返、不在循环内，不是 N+1。
+///
+/// 函数名保留 `l1_of`：`sql_count_guard::RESOLVE_DRAFT_SQL_CALL_SITES` 按函数名取体，
+/// 且「L1」在本域仍是「根」的现行叫法（送货单判定键 / 编号前缀键都挂在根上）。
 pub(crate) async fn l1_of(customer_id: i64, conn: &mut PgConnection) -> Result<i64, AppError> {
-    let c: TCustomer = CustomerRepo::get_by_id(conn, customer_id, false)
-        .await?
-        .ok_or_else(|| {
-            AppError::biz(
-                code::BIZ_CUSTOMER_NOT_FOUND,
-                format!("customer {customer_id} not found"),
-            )
-        })?;
-    Ok(c.parent_id.unwrap_or(c.id))
+    crate::shared::customer::root_id_of(conn, customer_id).await
 }

@@ -684,7 +684,13 @@ async fn test_get_delivery_note_line_items_fields_are_populated() {
 
     // 1. 建 L1 客户（detail 端点的 customer_id 必须是 L1，service 校验）
     let l1 = insert_l1(&pool, "详情字段客户", "D").await;
-    let _l2 = insert_l2(&pool, "二厂", l1).await;
+    // ⚠️ 2026-10-17 改因（客户树任意深度 Gate E）：零件挂到 **L2**（叶子），不再是 L1。
+    // 旧形「part 直接挂 L1、旁边放一个没人用的 L2」在旧口径下能过（两层树的 L1 常常
+    // 也被当叶子用），但本轮新增的「入单客户必须是**叶子**」闸门会把它拒掉（20104：
+    // L1 下面有子节点）。断言本身（6 个字段透传）与客户层级无关，故只改 fixture 形状，
+    // **断言一字未动**。送货单仍由服务端从零件客户上溯到根（L1）建单，故本用例其余
+    // 流程不变。
+    let l2 = insert_l2(&pool, "二厂", l1).await;
 
     // 2. 直插 part（**6 字段全填**）：用 `sqlx::query()` 而非 `query!` 宏，
     //    避免为这条纯测试 INSERT 往 `.sqlx/` 离线缓存里塞新条目。
@@ -705,7 +711,7 @@ async fn test_get_delivery_note_line_items_fields_are_populated() {
     )
     .bind(part_id)
     .bind(Some("D-002-SN"))
-    .bind(l1)
+    .bind(l2)
     .bind(chrono::NaiveDate::from_ymd_opt(2026, 9, 1).unwrap())
     .bind(chrono::NaiveDate::from_ymd_opt(2026, 9, 15).unwrap())
     .bind(chrono::NaiveDate::from_ymd_opt(2026, 9, 20).unwrap())

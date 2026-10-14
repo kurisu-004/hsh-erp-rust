@@ -18,7 +18,8 @@
 //!   t_assembly 无 batch 派生字段（locations / holder_ids 忽略）。
 //! - **enrichment 分桶**：PART / PART_FLAT 行 `location` / `holder_name`；
 //!   ASSEMBLY 行 `child_count` / `has_children`；所有行 `customer_name` /
-//!   `l1_customer_name`。
+//!   `l1_customer_name` / `customer_path`（2026-10-17：三列同源，一次
+//!   `shared::customer::paths_of` 批量取回）。
 //!
 //! ## 与 part::service::crud 边界
 //! - ALL / ASSEMBLY 两种 `row_type` 的分支逻辑在本域：过滤解析走 `parse_filters`
@@ -54,6 +55,7 @@
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use sqlx::PgConnection;
+use std::collections::HashMap;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::modules::assembly::model::TAssembly;
@@ -64,7 +66,7 @@ use crate::modules::part::service::list_enrichment::{
     enrich_part_list_with_location_and_holder, fetch_delivered_quantities, fetch_delivered_sets,
 };
 use crate::modules::part::vo::{ChainState, PartListItem};
-use crate::shared::customer::expand_customer_id;
+use crate::shared::customer::{CustomerPath, paths_of, subtree_ids};
 use crate::shared::error::AppError;
 
 use super::super::dto::{RowType, UnionListQuery};
@@ -75,7 +77,7 @@ use super::super::vo::PartListOut;
 ///
 /// 行为：
 /// 1. normalize `row_type`（`None` / `"ALL"` / `""` → `All`；`"PART"` / `"PART_FLAT"` / `"ASSEMBLY"` 合法；其它 → 40001）。
-/// 2. 解析共享筛选条件（`expand_customer_id` + 字符串切分）。
+/// 2. 解析共享筛选条件（`subtree_ids` + 字符串切分）。
 /// 3. 按 `RowType` dispatch：
 ///    - `Part` → `PartRepo::list_with_filters` + `count_with_filters`（`part_only=true`）
 ///    - `PartFlat` → 同上但 `part_only=false`（2026-10-05 新增，含装配件子件）
@@ -185,14 +187,19 @@ impl UnionListService {
         let batch_enrichment =
             enrich_part_list_with_location_and_holder(&mut conn, &part_ids).await?;
         let delivered_quantities = fetch_delivered_quantities(&mut *conn, &part_ids).await?;
+        // 2026-10-17：客户三列一次批量取回（旧的逐行 `lookup_customer_names` 是 N+1
+        // 且只上跳一层取「L1 名」，三层以上树上拿到的是中间层）。
+        let cust_ids: Vec<i64> = rows.iter().map(|p| p.customer_id).collect();
+        let cust_paths = paths_of(&mut *conn, &cust_ids).await?;
 
         let mut items = Vec::with_capacity(rows.len());
         for p in rows {
-            let (cn, l1cn) = lookup_customer_names(&mut *conn, p.customer_id).await?;
+            let (cn, l1cn, path) = customer_names_of(&cust_paths, p.customer_id);
             let (loc, holder) = batch_enrichment.get(&p.id).cloned().unwrap_or((None, None));
             let mut item: PartListItem = p.into();
             item.customer_name = cn;
             item.l1_customer_name = l1cn;
+            item.customer_path = path;
             item.location = loc;
             item.holder_name = holder;
             // 2026-10-03 新增：已送数量（零批次 → 0，键恒存在）。
@@ -256,14 +263,18 @@ impl UnionListService {
         let child_counts = fetch_child_counts(&mut *conn, &asm_ids).await?;
         // 2026-10-03 新增：已送套数（子件 min 公式）。
         let delivered_sets = fetch_delivered_sets(&mut *conn, &asm_ids).await?;
+        // 2026-10-17：同上，装配行的客户三列一次批量取回。
+        let cust_ids: Vec<i64> = asm_rows.iter().map(|a| a.customer_id).collect();
+        let cust_paths = paths_of(&mut *conn, &cust_ids).await?;
 
         let mut items = Vec::with_capacity(asm_rows.len());
         for a in asm_rows {
-            let (cn, l1cn) = lookup_customer_names(&mut *conn, a.customer_id).await?;
+            let (cn, l1cn, path) = customer_names_of(&cust_paths, a.customer_id);
             let cc = child_counts.get(&a.id).copied().unwrap_or(0);
             let mut item: PartListItem = project_assembly_to_part_list_item(a);
             item.customer_name = cn;
             item.l1_customer_name = l1cn;
+            item.customer_path = path;
             item.child_count = Some(cc);
             item.has_children = cc > 0;
             // 2026-10-03 新增：已送套数（无子件 → 0）。
@@ -426,13 +437,17 @@ impl UnionListService {
         // ASSEMBLY 段取可凑齐的套数（两个 row_type 分支都要写，否则对应行会静默留 None）。
         let delivered_quantities = fetch_delivered_quantities(&mut *conn, &part_ids).await?;
         let delivered_sets = fetch_delivered_sets(&mut *conn, &asm_ids).await?;
+        // 2026-10-17：同上，两种 row_type 混在一批里，故按整批行的 customer_id 取。
+        let cust_ids: Vec<i64> = rows.iter().map(|r| r.customer_id).collect();
+        let cust_paths = paths_of(&mut *conn, &cust_ids).await?;
 
         let mut items = Vec::with_capacity(rows.len());
         for r in rows {
-            let (cn, l1cn) = lookup_customer_names(&mut *conn, r.customer_id).await?;
+            let (cn, l1cn, path) = customer_names_of(&cust_paths, r.customer_id);
             let mut item = union_row_to_part_list_item(r);
             item.customer_name = cn;
             item.l1_customer_name = l1cn;
+            item.customer_path = path;
             if item.row_type.as_deref() == Some("PART") {
                 let (loc, holder) = batch_enrichment
                     .get(&item.id)
@@ -543,7 +558,7 @@ async fn parse_filters(
     .to_string();
 
     let customer_ids: Vec<i64> = if let Some(cid) = query.customer_id {
-        expand_customer_id(conn, cid).await?
+        subtree_ids(conn, cid).await?
     } else {
         Vec::new()
     };
@@ -662,33 +677,23 @@ fn parse_optional_ilike_pattern(raw: Option<&str>) -> Option<String> {
     }
 }
 
-/// 取客户名 + L1 名（`part::service::crud::lookup_customer_names` 同形私有版本）。
-async fn lookup_customer_names(
-    conn: &mut PgConnection,
+/// 从 `paths_of` 的批量 map 里取一行的三个客户名（2026-10-17 新增）。
+///
+/// 与 `part::service::crud::customer_names_of` 逐字同形（两域各存一份是因为
+/// `shared::customer` 本轮不开放改动，而共享一个 3 行 helper 换来的是一条跨域依赖；
+/// 两份各带一句互指注释，改口径时两处一起改）。
+fn customer_names_of(
+    paths: &HashMap<i64, CustomerPath>,
     customer_id: i64,
-) -> Result<(Option<String>, Option<String>), AppError> {
-    let row: Option<(String, Option<i64>)> = sqlx::query_as(
-        "SELECT name, parent_id FROM t_customer WHERE id = $1 AND deleted_at IS NULL",
-    )
-    .bind(customer_id)
-    .fetch_optional(&mut *conn)
-    .await?;
-    let (name, parent_id) = match row {
-        Some(r) => r,
-        None => return Ok((None, None)),
-    };
-    let l1_name = match parent_id {
-        Some(pid) => {
-            sqlx::query_scalar::<_, String>(
-                "SELECT name FROM t_customer WHERE id = $1 AND deleted_at IS NULL",
-            )
-            .bind(pid)
-            .fetch_optional(&mut *conn)
-            .await?
-        }
-        None => Some(name.clone()),
-    };
-    Ok((Some(name), l1_name))
+) -> (Option<String>, Option<String>, String) {
+    match paths.get(&customer_id) {
+        Some(p) => (
+            Some(p.own_name.clone()),
+            Some(p.root_name.clone()),
+            p.path.clone(),
+        ),
+        None => (None, None, String::new()),
+    }
 }
 
 /// 一次性 GROUP BY 拿一组 assembly_id 的子件计数（从 `part::service::crud` 下沉）。
@@ -754,6 +759,9 @@ fn project_assembly_to_part_list_item(a: TAssembly) -> PartListItem {
         process_chain_id: None, // t_assembly 不持 process_chain_id
         customer_name: None,
         l1_customer_name: None,
+        // 2026-10-17：客户三列由 caller（list_assembly / list_all 的 ASSEMBLY 分支）
+        // 从 `shared::customer::paths_of` 的批量 map 注入。
+        customer_path: String::new(),
         location: None,
         holder_name: None,
         row_type: Some("ASSEMBLY".to_string()),
@@ -818,6 +826,8 @@ fn union_row_to_part_list_item(r: UnionListRow) -> PartListItem {
         process_chain_id: r.process_chain_id,
         customer_name: None,
         l1_customer_name: None,
+        // 2026-10-17：同上，由 caller 从 `shared::customer::paths_of` 的批量 map 注入。
+        customer_path: String::new(),
         location: None,
         holder_name: None,
         row_type,

@@ -19,6 +19,7 @@ use sqlx::PgConnection;
 
 use crate::auth::rbac::CurrentUser;
 use crate::infra::clock::now_shanghai_iso;
+use crate::shared::customer::CustomerPath;
 use crate::shared::error::AppError;
 
 use super::repo::{HeldBatchRow, PoolItemRow, ProcessMetaRow, QueueBoardRepo, WorkerRow};
@@ -93,13 +94,25 @@ impl QueueBoardService {
         current.require_permission("queue.view")?;
         let data = QueueBoardRepo::board_process_detail(&mut *conn, process_id).await?;
 
+        // 2026-10-17：持有批次 + 候选池的全部 customer_id **合并成一次**
+        // `paths_of`（同一请求内两条 SQL 的客户列同源，两次调用只是把同一条查询跑两遍）。
+        // repo 侧已删掉 `t_customer c1` 自连接（它只上跳一层，深树下拿到的是中间层名），
+        // 改由这里补 `parent_customer_name`（= 根名）与新增的 `customer_path`。
+        let cust_ids: Vec<i64> = data
+            .held
+            .iter()
+            .map(|r| r.customer_id)
+            .chain(data.items.iter().map(|r| r.customer_id))
+            .collect();
+        let cust_paths = crate::shared::customer::paths_of(&mut *conn, &cust_ids).await?;
+
         // 持有批次按 worker 分组（一次 ANY 查询结果的服务端分组，不是第二次查询）
         let mut held_by_worker: HashMap<i64, Vec<QueueHeldBatch>> = HashMap::new();
         for row in data.held {
             held_by_worker
                 .entry(row.holder_id)
                 .or_default()
-                .push(to_held_batch(row));
+                .push(to_held_batch(row, &cust_paths));
         }
 
         let workers: Vec<QueueWorkerBrief> = data
@@ -111,7 +124,11 @@ impl QueueBoardService {
             })
             .collect();
 
-        let items: Vec<QueuePoolItem> = data.items.into_iter().map(to_pool_item).collect();
+        let items: Vec<QueuePoolItem> = data
+            .items
+            .into_iter()
+            .map(|r| to_pool_item(r, &cust_paths))
+            .collect();
         let total = items.len() as i64;
 
         Ok(QueueProcessBoardDetail {
@@ -129,7 +146,7 @@ impl QueueBoardService {
     }
 }
 
-fn to_held_batch(r: HeldBatchRow) -> QueueHeldBatch {
+fn to_held_batch(r: HeldBatchRow, paths: &HashMap<i64, CustomerPath>) -> QueueHeldBatch {
     QueueHeldBatch {
         batch_id: r.batch_id.to_string(),
         part_id: r.part_id.to_string(),
@@ -144,7 +161,11 @@ fn to_held_batch(r: HeldBatchRow) -> QueueHeldBatch {
         has_cnc_program: r.has_cnc_program,
         has_process_chain: r.has_process_chain,
         customer_name: r.customer_name,
-        parent_customer_name: r.parent_customer_name,
+        parent_customer_name: paths.get(&r.customer_id).map(|p| p.root_name.clone()),
+        customer_path: paths
+            .get(&r.customer_id)
+            .map(|p| p.path.clone())
+            .unwrap_or_default(),
         applicant_name: r.applicant_name,
         location: r.location,
         note: r.note,
@@ -171,7 +192,7 @@ fn to_worker_brief(w: WorkerRow, held_batches: Vec<QueueHeldBatch>) -> QueueWork
     }
 }
 
-fn to_pool_item(r: PoolItemRow) -> QueuePoolItem {
+fn to_pool_item(r: PoolItemRow, paths: &HashMap<i64, CustomerPath>) -> QueuePoolItem {
     QueuePoolItem {
         batch_id: r.batch_id.to_string(),
         part_id: r.part_id.to_string(),
@@ -182,7 +203,11 @@ fn to_pool_item(r: PoolItemRow) -> QueuePoolItem {
         drawing_no: r.drawing_no,
         system_delivery_date: r.system_delivery_date,
         customer_name: r.customer_name,
-        parent_customer_name: r.parent_customer_name,
+        parent_customer_name: paths.get(&r.customer_id).map(|p| p.root_name.clone()),
+        customer_path: paths
+            .get(&r.customer_id)
+            .map(|p| p.path.clone())
+            .unwrap_or_default(),
         applicant_name: r.applicant_name,
         shelf_id: r.shelf_id.to_string(),
         shelf_code: r.shelf_code,

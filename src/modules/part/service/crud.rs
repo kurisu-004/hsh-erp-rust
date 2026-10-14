@@ -15,10 +15,12 @@
 //!
 //! ## helpers（pub(super)，供 batch.rs 复用）
 //! - `map_create_error` —— sqlx 错误码 → 业务错误码
-//! - `lookup_customer_names` —— 取客户名 + L1 名
+//! - `require_leaf_customer` —— 业务单据只能挂叶子客户的闸门（2026-10-17 新增）
+//! - `customer_names_of` —— 从 `paths_of` 的批量 map 里取一行的三个客户名
 //!
-//! 客户 id 展开（L1+L2）见 [`crate::shared::customer`]：`part` /
-//! `com::union_list` / `prod::batch` 三域共用那一份实现。
+//! 客户 id 展开（自身 + 全部后代）与 `customer_name` / `l1_customer_name` /
+//! `customer_path` 三列的取名，全部收敛到 [`crate::shared::customer`]（不再有
+//! 「查自身名 + 上跳一层取父名」的域内副本）。
 //!
 //! 2026-09-22 D-6 重构：方法签名 `<R: PartRepoTrait>`（by-value；trait 已直接
 //! `impl for &mut PgConnection`）。生产 `R = &mut PgConnection`，handler/service
@@ -41,7 +43,7 @@ use crate::modules::part::vo::{
 };
 use crate::modules::prod::batch::repo::{NewInitialBatch, PartBatchRepo};
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
-use crate::shared::customer::expand_customer_id;
+use crate::shared::customer::subtree_ids;
 use crate::shared::error::{AppError, code};
 // 2026-10-12：`t_part_event` 的写侧自 part 域的事件 INSERT 上提到
 // `shared::part_event`（该表由 7 个模块写、无域归属）。
@@ -102,6 +104,10 @@ impl PartService {
                 )
             })?;
         let new_id = snowflake.next_id();
+        // 2026-10-17 新增：业务单据只能挂叶子客户（客户树放开任意深度后，「L2」不再是
+        // 「最深一层」）。与上面的存在性校验同处、排在派发序列号之前 ⇒ 挂了非叶子客户
+        // 不会白烧一个号。
+        require_leaf_customer(repo.conn_mut(), req.customer_id).await?;
         // 2026-10-05：序列号派发下沉到 create_part（唯一收口点）。此前
         // `POST /parts` 与 `POST /parts/batch` 都从不派发，只有
         // `POST /parts/batch-with-pdfs` 在 INSERT 后补 UPDATE 一列。前缀缺失
@@ -152,13 +158,13 @@ impl PartService {
             .get_part_detail(new_id)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "新建 part 查不到"))?;
-        let (cn, l1cn) = lookup_customer_names(repo.conn_mut(), part.customer_id).await?;
+        let cust_id = part.customer_id;
+        let cust_paths = crate::shared::customer::paths_of(repo.conn_mut(), &[cust_id]).await?;
         let current_batch_id = repo.find_current_inspection_batch_id(part.id).await?;
         Ok(PartDetailOut::from_with_customer_extra(
             part,
             current_batch_id,
-            cn,
-            l1cn,
+            cust_paths.get(&cust_id),
         ))
     }
 
@@ -302,16 +308,20 @@ impl PartService {
         // enrichment —— 它的返回形态是「min-progress 目标批次的 location/holder」，
         // 既不暴露批次明细、返回类型也放不下 quantity 之和）。
         let delivered_quantities = fetch_delivered_quantities(repo.conn_mut(), &part_ids).await?;
+        // 2026-10-17：客户三列（name / L1 / path）一次批量取回，逐行查 = N+1。
+        let cust_ids: Vec<i64> = rows.iter().map(|p| p.customer_id).collect();
+        let cust_paths = crate::shared::customer::paths_of(repo.conn_mut(), &cust_ids).await?;
 
         let mut items = Vec::with_capacity(rows.len());
         for p in rows {
-            let (cn, l1cn) = lookup_customer_names(repo.conn_mut(), p.customer_id).await?;
+            let (cn, l1cn, path) = customer_names_of(&cust_paths, p.customer_id);
             let (loc, holder) = batch_enrichment.get(&p.id).cloned().unwrap_or((None, None));
             // 2026-09-27 review 第 1 修复：`From<TPart>` 派生基础字段；4 个派生字段
             // 由 service 注入（保持旧行为）。
             let mut item: PartListItem = p.into();
             item.customer_name = cn;
             item.l1_customer_name = l1cn;
+            item.customer_path = path;
             item.location = loc;
             item.holder_name = holder;
             // 2026-10-03 新增：已送数量（零批次 → 0，键恒存在）。
@@ -366,7 +376,7 @@ impl PartService {
         .to_string();
 
         let customer_ids: Vec<i64> = if let Some(cid) = query.customer_id {
-            expand_customer_id(repo.conn_mut(), cid).await?
+            subtree_ids(repo.conn_mut(), cid).await?
         } else {
             Vec::new()
         };
@@ -429,13 +439,13 @@ impl PartService {
                 format!("part {part_id} 不存在或已删除"),
             )
         })?;
-        let (cn, l1cn) = lookup_customer_names(repo.conn_mut(), part.customer_id).await?;
+        let cust_id = part.customer_id;
+        let cust_paths = crate::shared::customer::paths_of(repo.conn_mut(), &[cust_id]).await?;
         let current_batch_id = repo.find_current_inspection_batch_id(part.id).await?;
         Ok(PartDetailOut::from_with_customer_extra(
             part,
             current_batch_id,
-            cn,
-            l1cn,
+            cust_paths.get(&cust_id),
         ))
     }
 
@@ -682,32 +692,39 @@ pub(super) fn map_create_error(e: sqlx::Error) -> AppError {
 
 /// 取客户名 + L1 名（用于 `PartDetailOut` / `PartListItem` 冗余字段）。
 ///
-/// 返回 `(Some(name), Some(l1_name))`：当自身为 L1 时 l1_name 与 name 同；
-/// 当 customer 不存在 → `(None, None)`（service 层可容忍）。
-pub(crate) async fn lookup_customer_names(
+/// 2026-10-17 删除：旧的 `lookup_customer_names(conn, customer_id)` 在每个调用点
+/// 逐行查「自身 name + 上跳一层取父 name」，**两层假设硬编码**（三级树上拿到的是
+/// 中间层名）且**逐行调用 = N+1**。现由调用方一次性
+/// [`crate::shared::customer::paths_of`] 批量取回，再经
+/// [`customer_names_of`] 按行取三个名字。
+///
+/// 口径：`(customer_name, l1_customer_name, customer_path)`，
+/// `l1_customer_name` 恒为**根**名（不是直接父），`customer_path` 是「第 2 层到
+/// 叶子用 ` / ` 拼接、不含根」。map 里没有该 id（**终点行不存在 / 已软删**）⇒ 前两个
+/// `None`、第三个空串；⚠️ 成环 / 超深度时 map 里**仍有**该项（`path` 为**截断路径**）。
+pub(crate) fn customer_names_of(
+    paths: &std::collections::HashMap<i64, crate::shared::customer::CustomerPath>,
+    customer_id: i64,
+) -> (Option<String>, Option<String>, String) {
+    match paths.get(&customer_id) {
+        Some(p) => (
+            Some(p.own_name.clone()),
+            Some(p.root_name.clone()),
+            p.path.clone(),
+        ),
+        None => (None, None, String::new()),
+    }
+}
+
+/// 业务单据只能挂**叶子**客户（2026-10-17 新增，与客户树无限层级化同批）。
+///
+/// 2026-10-17 收敛：本函数原来在本文件另有一份实现，现整体委托
+/// [`crate::shared::customer::require_leaf_customer`]（part / assembly / outsource
+/// 三域共用一份，判据、错误码与消息结构逐字相同）。本函数保留只是为了让
+/// `crate::service::batch` 的导入路径与语义（「工单」口径）留在本域。
+pub(super) async fn require_leaf_customer(
     conn: &mut PgConnection,
     customer_id: i64,
-) -> Result<(Option<String>, Option<String>), AppError> {
-    let row: Option<(String, Option<i64>)> = sqlx::query_as(
-        "SELECT name, parent_id FROM t_customer WHERE id = $1 AND deleted_at IS NULL",
-    )
-    .bind(customer_id)
-    .fetch_optional(&mut *conn)
-    .await?;
-    let (name, parent_id) = match row {
-        Some(r) => r,
-        None => return Ok((None, None)),
-    };
-    let l1_name = match parent_id {
-        Some(pid) => {
-            sqlx::query_scalar::<_, String>(
-                "SELECT name FROM t_customer WHERE id = $1 AND deleted_at IS NULL",
-            )
-            .bind(pid)
-            .fetch_optional(&mut *conn)
-            .await?
-        }
-        None => Some(name.clone()),
-    };
-    Ok((Some(name), l1_name))
+) -> Result<(), AppError> {
+    crate::shared::customer::require_leaf_customer(conn, customer_id, "工单").await
 }

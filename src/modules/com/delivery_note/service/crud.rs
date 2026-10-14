@@ -16,7 +16,6 @@ use std::collections::HashMap;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock::now_naive;
-use crate::modules::com::customer::repo::CustomerRepo;
 use crate::modules::com::delivery_note::repo::DeliveryNoteRepoTrait;
 use crate::modules::part::model::TPart;
 use crate::modules::part::repo::PartRepo;
@@ -94,10 +93,14 @@ impl DeliveryNoteService {
     /// 批查 N 个送货单详情（PR3 batch-detail 专用）。固定 6 次 Postgres 往返：
     /// 1) `DeliveryNoteRepo::list_by_ids` 头
     /// 2) `PartBatchRepo::list_with_part_by_delivery_note_ids` 批次+工单
-    /// 3) `CustomerRepo::list_by_ids` (leaf) L2
-    /// 4) `CustomerRepo::list_by_ids` (parent) L1
-    /// 5) `AssemblyRepo::list_by_ids` 装配件
-    /// 6) `build_note_outs(&heads)` head → DeliveryNoteOut（内部已批 driver / group）
+    /// 3) `shared::customer::paths_of`（本单全部零件的客户三列，任意深度）
+    /// 4) `AssemblyRepo::list_by_ids` 装配件
+    /// 5) `PartRepo::list_children_by_assemblies` 装配件子件（算可出货套数用）
+    /// 6) `build_note_outs(&heads)` head → DeliveryNoteOut（内部已批 driver）
+    ///
+    /// 2026-10-17：客户三列由**两条** `CustomerRepo::list_by_ids`（零件自身客户 +
+    /// 其直接父）合并成**一条** `paths_of` —— 旧形是两层树的形状（直接父 + 自身名
+    /// 拼两段），深树上必丢中间层；往返条数净减 1。
     ///
     /// 输出按入参 `ids` 顺序排列；缺失 id 静默跳过；入参应已 dedupe（caller 责任）。
     #[allow(clippy::too_many_lines)]
@@ -108,7 +111,6 @@ impl DeliveryNoteService {
     ) -> Result<Vec<DeliveryNoteDetailOut>, AppError> {
         use crate::modules::assembly::model::TAssembly;
         use crate::modules::assembly::repo::AssemblyRepo;
-        use crate::modules::com::customer::model::TCustomer;
         use std::collections::HashSet;
 
         use super::super::vo::DeliveryNoteLineItem;
@@ -126,28 +128,9 @@ impl DeliveryNoteService {
             PartBatchRepo::list_with_part_by_delivery_note_ids(&mut *repo.conn_mut(), &head_ids)
                 .await?;
 
-        let leaf_ids: HashSet<i64> = rows.iter().map(|(_b, p)| p.customer_id).collect();
-        let leaf_list = CustomerRepo::list_by_ids(
-            &mut *repo.conn_mut(),
-            &leaf_ids.iter().copied().collect::<Vec<_>>(),
-            false,
-        )
-        .await?;
-        let leaf_map: HashMap<i64, TCustomer> = leaf_list.into_iter().map(|c| (c.id, c)).collect();
-
-        let parent_ids: HashSet<i64> = leaf_map.values().filter_map(|c| c.parent_id).collect();
-        let parent_list = if parent_ids.is_empty() {
-            Vec::new()
-        } else {
-            CustomerRepo::list_by_ids(
-                &mut *repo.conn_mut(),
-                &parent_ids.iter().copied().collect::<Vec<_>>(),
-                false,
-            )
-            .await?
-        };
-        let parent_map: HashMap<i64, TCustomer> =
-            parent_list.into_iter().map(|c| (c.id, c)).collect();
+        let part_customer_ids: Vec<i64> = rows.iter().map(|(_b, p)| p.customer_id).collect();
+        let paths_map =
+            crate::shared::customer::paths_of(&mut *repo.conn_mut(), &part_customer_ids).await?;
 
         let asm_ids: Vec<i64> = rows
             .iter()
@@ -223,14 +206,7 @@ impl DeliveryNoteService {
             // 口径（申请人回落 / 装配件父行字段）只维护一份。
             let mut items: Vec<DeliveryNoteLineItem> = Vec::with_capacity(items_rows.len());
             for (b, p) in &items_rows {
-                items.push(build_line_item(
-                    b,
-                    p,
-                    &leaf_map,
-                    &parent_map,
-                    &assembly_map,
-                    &sets_map,
-                ));
+                items.push(build_line_item(b, p, &paths_map, &assembly_map, &sets_map));
             }
             out.push(DeliveryNoteDetailOut {
                 head: head.clone(),

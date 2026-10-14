@@ -32,7 +32,13 @@ pub struct OutsourceQuoteOut {
     pub outsource_company_name: Option<String>,
     pub process_code: Option<String>,
     pub process_name: Option<String>,
-    pub customer_path: Option<String>,
+    /// 客户路径（第 2 层到叶子用 `" / "` 拼接，**不含**根；本节点即根时 = 根自己的名字）。
+    ///
+    /// 2026-10-17 由 `Option<String>` 改为**必填** `String`，且数据源由「service 层把
+    /// L1 名 / L2 名两段拼起来」改成 [`crate::shared::customer::paths_of`] 的
+    /// `CustomerPath::path`：客户树放开任意深度后两段拼接既不是全路径、也不是产品口径。
+    /// 客户行缺失 / 已软删时为空串（前端按「空 = 无客户信息」展示）。
+    pub customer_path: String,
     pub part_unit_price: Option<String>,
     pub is_urgent: bool,
 }

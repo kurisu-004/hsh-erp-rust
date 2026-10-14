@@ -465,8 +465,16 @@ mod held_count_guard_tests {
     //! 本条直接对生产路径上的纯函数
     //! [`to_companies`](super::service::to_companies) 断言恒等式（不是在测试里重写一遍
     //! 装配逻辑 —— 那样只会验证测试自己）。
+    use std::collections::HashMap;
+
+    use crate::shared::customer::CustomerPath;
+
     use super::repo::{CompanyRow, HeldBatchRow};
     use super::service::to_companies;
+
+    fn empty_paths() -> HashMap<i64, CustomerPath> {
+        HashMap::new()
+    }
 
     fn company(company_id: i64, name: &str) -> CompanyRow {
         CompanyRow {
@@ -488,8 +496,9 @@ mod held_count_guard_tests {
             system_delivery_date: None,
             planned_delivery_date: None,
             is_urgent: false,
-            customer_name: None,
-            parent_customer_name: None,
+            // 2026-10-17：客户三列改由 service 层按 `customer_id` 从
+            // `paths_of` 的 map 取，本用例不关心客户名 ⇒ 空 map。
+            customer_id: 9_000_000_000_000_000_009,
             applicant_name: None,
             batch_location: "OUTSOURCE_COMPANY".into(),
             note: None,
@@ -517,6 +526,7 @@ mod held_count_guard_tests {
                 held(300, 4),
                 held(200, 5),
             ],
+            &empty_paths(),
         );
         assert_eq!(companies.len(), 3);
         for c in &companies {
@@ -544,7 +554,7 @@ mod held_count_guard_tests {
     /// （空公司列是前端要的拖拽目标）。
     #[test]
     fn empty_company_column_survives_with_zero_held() {
-        let companies = to_companies(vec![company(100, "A")], Vec::new());
+        let companies = to_companies(vec![company(100, "A")], Vec::new(), &empty_paths());
         assert_eq!(companies.len(), 1);
         assert_eq!(companies[0].held_count, 0);
         assert!(companies[0].held_batches.is_empty());
@@ -554,7 +564,7 @@ mod held_count_guard_tests {
     /// 它不会凭空造出一列公司列。
     #[test]
     fn held_for_unlisted_company_is_dropped() {
-        let companies = to_companies(vec![company(100, "A")], vec![held(999, 7)]);
+        let companies = to_companies(vec![company(100, "A")], vec![held(999, 7)], &empty_paths());
         assert_eq!(companies.len(), 1);
         assert_eq!(companies[0].held_count, 0);
         assert!(companies[0].held_batches.is_empty());

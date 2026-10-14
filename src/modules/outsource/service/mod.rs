@@ -46,6 +46,12 @@
 //! - `submit_quote` / `soft_delete_quote` / `soft_delete_company` 改为收**调用方传的**
 //!   `version`，不再用 service 自己刚读到的值自守乐观锁；
 //! - 新增共享 helper `parse_optional_snowflake`（可选雪花 ID query 形参 → `Option<i64>`）。
+//!
+//! 2026-10-17（客户树无限层级化）：共享 helper `join_customer_path(l1, l2)` **删除**。
+//! 它的口径是「两段拼接」，在任意深度的客户树上既拼不出完整路径、也不是产品口径
+//! （产品口径 = 第 2 层到叶子用 `" / "` 拼、**不含根**）。本域全部 VO 的
+//! `customer_path` 改读 [`crate::shared::customer::paths_of`] 的
+//! `CustomerPath::path`，由 service 层一次批量取回。
 
 #![allow(
     clippy::collapsible_if,
@@ -79,22 +85,6 @@ const MAX_LIMIT: i64 = 500;
 /// 2026-10-03 新增：4 个新 list 端点统一用 `clamp(1, 200)`（对齐 part 域旧
 /// `list_outsource_in_flight` / `list_outsource_sendable` 的分页上限）。
 const LIST_MAX_LIMIT: i64 = 200;
-
-/// 拼客户路径：有 L1 给 `L1 / L2`，无 L1 时只给 L2 名，两侧都缺返回 `None`。
-///
-/// 「无 L1」含两种成因：`parent_id IS NULL`，或 L1 客户自身 `deleted_at IS NOT NULL`
-/// （取名的 LEFT JOIN 带软删过滤）。**不含自指** —— `t_customer` 有
-/// `ck_t_customer_no_self_parent` CHECK，`parent_id = id` 不可能。
-///
-/// 2026-10-03 起 outsource 域全部 VO 的 `customer_path` 都走本函数。范式抄
-/// `prod::queue::repo::sql.rs`（`CandidateRow → PoolBatchItem`）。
-pub(crate) fn join_customer_path(l1: Option<&str>, l2: Option<&str>) -> Option<String> {
-    match (l1, l2) {
-        (Some(p), Some(l)) => Some(format!("{p} / {l}")),
-        (_, Some(l)) => Some(l.to_string()),
-        _ => None,
-    }
-}
 
 /// 把 keyword 归一化成 `ILIKE` 通配串；trim 后为空视为无过滤。
 pub(crate) fn keyword_pattern(keyword: Option<&str>) -> Option<String> {

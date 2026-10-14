@@ -71,7 +71,7 @@ pub async fn scan(
 /// 待品检队列列表（权限点 `inspection.view`，M,I）。只读端点：`pool.acquire()` 不开事务。
 ///
 /// 2026-10-07 自 `GET /api/v2/prod/batches/inspection` 迁入本域：出参切到
-/// `InspectionQueueListOut`（13 字段），查询参数是 `InspectionQueueQuery`
+/// `InspectionQueueListOut`（14 字段），查询参数是 `InspectionQueueQuery`
 /// （表头 7 列各一个筛选 + 服务端排序），与 `/repair` / `/repairing` 的宽 VO 彻底
 /// 分家。旧路径**无 alias、已下线**（见模块 doc 的「破坏性路由变更」一节）。
 pub async fn queue(

@@ -340,81 +340,14 @@ impl QueueRepo {
         }))
     }
 
-    /// 列出某工序在所有生产货架上的候选批次（status=IN_PROCESS + location=PRODUCTION_SHELF
-    /// + current_process_id=process_id）。
-    ///
-    /// 跨 4 表 JOIN：t_part_batch + t_part + t_customer L2 + t_customer L1 (LEFT JOIN)
-    /// + t_shelf；service 在同事务内调用，repo 不 commit。
-    ///
-    /// 排序与 `take_one_from_pool` 对齐：admin 视图与工人抢一批用同一优先级，
-    /// 业务上语义一致（先看交期，再看加急，最后看 id 稳定）。
-    ///
-    /// 不分页：admin 视角全量，前端按 shelf_id 客户端筛选。
-    ///
-    /// 2026-09-30 修复「下发后不入池」bug：`GET /prod/pool/{process_id}` 原本
-    /// INNER JOIN `t_process_chain_step s2 ON s2.id = pb.current_process_step_id`
-    /// 并按 `s2.process_id = $1` 过滤。dispatch 写 `step=NULL` → 批次隐身。
-    /// 现改为 `pb.current_process_id = $1` 普通过滤，删掉 JOIN（顺带省一次
-    /// 工人当前持有批次的「JOIN t_part + 客户/申请人/货架」完整 DTO（worker-pool state 端点用）。
-    ///
-    /// 2026-09-14 follow-up-ux 新增 → follow-up-round2 升级为 17 字段 `HeldBatchItem`：
-    /// 解决上轮 `heldToCard` 字段降级（part_name/customer_name/applicant_name/
-    /// location/shelf_code 等核心展示字段为空）。`WorkerPoolState` 一次性返回
-    /// worker 当前持有的全部 batch，含全部展示字段，避免前端按 worker 轮询 K 次
-    /// 单 batch 详情接口的 N+1。
-    ///
-    /// 2026-09-14 review 第 1 轮下沉：本函数原本位于 `part_batch/repo.rs`，
-    /// 但它只被 queue 域消费（service 的 `compute_state` 调用一次），
-    /// 把 queue 专用查询放到 part_batch 域违反了「owner 同域」原则，
-    /// 同时导致 part_batch/repo.rs 行数越过 conventions.md 1000 行上限。
-    /// 下沉到本域 repo，与 `take_one_from_pool` / `take_specific_from_pool` 同级。
-    ///
-    /// 2026-09-29 review 第 1 轮补漏：SELECT 增 `EXISTS (t_part_file kind='G_CODE')`
-    /// 子查询透传 `has_cnc_program` → `HeldBatchItem.has_cnc_program`。
-    /// 与 `take_one_from_pool` / `list_candidates_by_process_all_shelves` 同源 EXISTS，
-    /// 保证 worker-pool state / 候选池视图 / 自动分配优先级三处口径一致。
-    ///
-    /// JOIN 拓扑（与 `list_candidates_by_process_all_shelves` 的 5 表 JOIN 同形；
-    /// t_applicant 用 `name = p.applicant_name` 因 t_part 无 applicant_id FK 字段）：
-    /// - `t_part_batch pb`            主表
-    /// - `t_part p`                   INNER JOIN（pb.part_id）
-    /// - `t_customer c2`              LEFT JOIN（p.customer_id）—— L2 叶子客户
-    /// - `t_customer c1`              LEFT JOIN（c2.parent_id）—— L1 一级集团
-    /// - `t_applicant a`              LEFT JOIN（a.name = p.applicant_name）—— 申请人
-    /// - `t_shelf s`                  LEFT JOIN（s.id = pb.current_holder_id）
-    ///   WORKER 持有时 current_holder_id = worker_id 非 shelf_id，故 shelf_code
-    ///   通常为 None
-    ///
-    /// 排序：按 `t_part_batch.id ASC`（前端按 batch_id 稳定展示）。
-    ///
-    /// 索引命中：`ix_t_part_batch_holder_location` 覆盖 `(current_holder_id,
-    /// location)` 谓词；JOIN t_part 走主键 `t_part.id`；JOIN t_customer / t_applicant
-    /// 走各自的 `id` / `name` 索引；EXISTS 子查询走 `ix_t_part_file_part_kind`
-    /// 全工序候选批次聚合计数（2026-09-30 新增）。
-    ///
-    /// 单 SQL `GROUP BY current_process_id`：跨所有生产货架聚合 `t_part_batch` 中
-    /// `status='IN_PROCESS' AND location='PRODUCTION_SHELF' AND deleted_at IS NULL`
-    /// 的批次数（按工序维度统计）。
-    ///
-    /// 业务口径与 `list_candidates_by_process_all_shelves`（per-process 候选池详情）
-    /// 完全一致：两者都限定 `status + location + deleted_at` 三态，唯一区别是本方法
-    /// 只 GROUP BY 计次，不返回批次明细。
-    ///
-    /// 返回 `Vec<(i64, i64)>` 形态 `(process_id, count)`：service 层二次调
-    /// `ProcessRepo::list_by_ids` 取 process_code / process_name 元数据后组装
-    /// `QueueCountsOut`。repo 不做 process 元数据 JOIN 是有意为之——
-    /// 与「本币 count GROUP BY」SQL 隔离，service 层负责 DTO 拼装，与
-    /// `pool_by_process` service 路径同形态（先 GROUP BY 再二次查元数据）。
-    ///
-    /// 索引命中：`ix_t_part_batch_current_process_id`（current_process_id 部分
-    /// 索引）+ `ix_t_part_batch_location`（`location`）+ `pb.deleted_at` 过滤。
-    /// 本端点为 dashboard 快照型轻量查询（前端 WorkerQueueBoard tab 标题徽标），
-    /// 无分页。
-    ///
-    /// 2026-09-30 修复「下发后不入池」bug：原本
-    /// `JOIN t_process_chain_step s ON s.id = pb.current_process_step_id` +
-    /// `GROUP BY s.process_id`，dispatch 写 `step=NULL` → 计数恒为 0。现改为
-    /// worker ↔ worker 移动：把 batch 从源 worker 切到目标 worker（OCC，2026-09-30 新增）。
+    /// 2026-10-08 之前，本位置还挂着一大段 doc —— 描述
+    /// `list_candidates_by_process_all_shelves` / `group_count_by_process_all_shelves`
+    /// 两个**已删**只读方法（含「跨 4 表 JOIN：`t_customer c2` / `t_customer c1`
+    /// LEFT JOIN 取 L1」等 JOIN 拓扑描述）。这两个方法已下线：① 2026-10-08 起职责
+    /// 归 `prod::queue::board` 的聚合 SQL（见本文件模块 doc）；② 客户两列不再由
+    /// SQL 自连取，改由 `shared::customer::paths_of` 批量补（口径见
+    /// `docs/api/customers.md` §2.2）。保留这段只会让读代码的人去找一段不存在的
+    /// JOIN，故整段删除。
     ///
     /// `POST /api/v2/prod/pool/move` 当 from.kind=WORKER 且 to.kind=WORKER 时调此 SQL。
     /// - **不写 `current_process_step_id`**：move worker→worker 不推进工序链

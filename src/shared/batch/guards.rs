@@ -85,7 +85,11 @@ pub struct InspectionRepairRow {
     pub updated_at: chrono::NaiveDateTime,
     pub customer_id: i64,
     pub customer_name: Option<String>,
-    pub l1_customer_name: Option<String>,
+    // 行结构**不含** `l1_customer_name`：2026-10-17 起它由 service 层一次
+    // `shared::customer::paths_of` 的 `root_name` 派生（旧形是 SQL 自连
+    // `c.parent_id` 取到的一层父名，深树上错），随该自连一并从 SQL 侧删除。
+    // 同理 `customer_name` 在**出参**侧承载的是 `customer_path`（见
+    // `prod::batch::vo::InspectionBatchListItemOut::customer_name` 的 doc）。
 }
 
 /// 状态机迁移守卫 + 错误码映射（在 phase1.rs 内复用）：

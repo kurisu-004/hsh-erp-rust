@@ -43,8 +43,23 @@
 //! | 批次 status ≠ `READY_TO_SHIP`（含 `INSPECTION`） | **本次分配实际需要的量**（见下节） | 21405 |
 //! | 批次已挂在别的 `DRAFT`/`SUBMITTED`/`PICKED_UP`/`ARCHIVED` 单上 | **本次分配实际需要的量**（见下节） | 21406 |
 //! | 零件的 L1 客户 ≠ 单据 L1 客户 | 请求级 | 21407 |
+//! | 扫进来的零件 / 装配件挂在**非叶子**客户上 | 请求级 | 20104（见下） |
 //! | DP 不可行（凑不出 / 差额 > 0 且无可拆批次） | 请求级 | 21405 / 21406（见下节） |
 //! | `sets` > `entry_max_sets` | 请求级 | 21405 |
+//!
+//! ### 「只能挂叶子」闸门在本域落在**入单客户**而不是单据的 `customer_id`
+//!
+//! 2026-10-17。送货单的 `customer_id` **恒为 L1 根**（`scan_find_or_create_draft`
+//! 的判定键、部分唯一索引 `uk_t_delivery_note_l1_open_draft`、编号前缀键都挂在根
+//! 上），它不是「可挂叶子的那个客户」—— 对根跑叶子闸门会让任何有下级的客户都开不出
+//! 送货单。因此本域能落到同一条判据上的位置是**入单的那个客户**：扫进来的零件 /
+//! 装配件必须挂在叶子客户上（与 `POST /parts` / `POST /assemblies` /
+//! `POST /outsource-quotes` 同一判据，共享
+//! `shared::customer::require_leaf_customer`）。
+//!
+//! 它真正拦住的形态是「零件挂在一个**后来被加了子节点**的客户上」：建单时它是叶子，
+//! 客户树加深后它成了中间层，而零件不会跟着搬家。拦下来比默默入单更安全 —— 中间层
+//! 客户名不是收货单位，送货凭证上的客户会错。
 //!
 //! ### 状态闸门的作用域：判「本次要的量」，不是「该零件的全部活跃批次」
 //!
@@ -649,6 +664,7 @@ impl DeliveryNoteService {
                             )
                         })?;
                     check_l1(&mut *conn, &part, note_customer_id).await?;
+                    require_leaf_entry_customer(&mut *conn, part.customer_id).await?;
                     *out.entry(part.id).or_insert(0) += quantity;
                 }
                 NodeKind::Assembly => {
@@ -678,6 +694,7 @@ impl DeliveryNoteService {
                             format!("装配件 {} 没有活跃子件，无法按套入单", asm.id),
                         ));
                     }
+                    require_leaf_entry_customer(&mut *conn, asm.customer_id).await?;
                     // 可组套数：把该装配件全部子件的「可入单」批次喂进与扫码树
                     // `entry_max_sets` 同一个公式 ⇒ 前端看到的上限与这里的上限同源。
                     let cap = entry_max_sets(&mut *conn, &asm, &children).await?;
@@ -726,10 +743,23 @@ struct SplitCall {
     qty: i32,
 }
 
-/// L1 一致性闸门：零件所属客户的 L1 必须等于单据 L1（21407）。
+/// 闸门「入单客户必须是叶子」的薄封装（2026-10-17 新增）。
 ///
-/// 「零件的 L1」与「单据的 L1」是两个独立查询的结果（零件表存的是 L2 客户），所以
-/// 这里现查一次 `t_customer` 而不是信任入参。
+/// 判据本体在 [`crate::shared::customer::require_leaf_customer`]（part / assembly /
+/// outsource / delivery_note 四域共用一份），本函数只把 `subject` 定成本域措辞
+/// —— 同一句话在这里要说「零件 / 装配件」，而不是 part 域的「工单」。
+///
+/// 与 21407（`check_l1`）相邻但**不是同一条闸门**：21407 判「是不是同一个 L1」，
+/// 本条判「那个客户自己是不是叶子」。同一请求里两个零件分属同一集团的不同分厂时，
+/// 21407 放行、仍可能被本条拦下（其中一个分厂是中间层）。
+async fn require_leaf_entry_customer(
+    conn: &mut sqlx::PgConnection,
+    customer_id: i64,
+) -> Result<(), AppError> {
+    crate::shared::customer::require_leaf_customer(conn, customer_id, "送货入单").await
+}
+
+/// L1 一致性闸门：零件所属客户的 L1 必须等于单据 L1（21407）。
 async fn check_l1(
     conn: &mut sqlx::PgConnection,
     part: &TPart,

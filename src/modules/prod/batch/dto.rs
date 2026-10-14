@@ -135,7 +135,7 @@ pub struct BatchToShipRequest {
 /// **仅这 2 条端点**：待品检队列读（`GET /api/v2/prod/inspection/queue`）的查询
 /// 参数在 `prod::inspection` 域自己的 dto 模块里，与本结构无关。
 ///
-/// `customer_id` 单值；service 层复用 `expand_customer_id` 展开为 L1+L2 ids
+/// `customer_id` 单值；service 层复用 `subtree_ids` 展开为「该节点 + 全部后代」ids
 /// （与 `list_parts` 同逻辑）。`keyword` / `serial_no` ILIKE 匹配。
 /// `planned_delivery_date_*` 作用于 `t_part.planned_delivery_date`。
 #[derive(Debug, Clone, Default, Deserialize)]

@@ -12,9 +12,11 @@
 //!
 //! 2026-10-07 队列读迁入：⚠️ **破坏性路由变更** —— 队列读的原路径
 //! `GET /api/v2/prod/batches/inspection` **已下线且无 alias**（404），新路径是
-//! `GET /api/v2/prod/inspection/queue`。**出参 JSON 逐字不变**（字段名、
-//! `items[*]` 恰好 13 个 key、计数 `total` / `limit` / `offset` 是 JSON **string**
-//! 而非 number），前端 Zod schema 无需改动；**入参 query string 亦逐字不变**
+//! `GET /api/v2/prod/inspection/queue`。**出参 JSON 在迁入那一刻逐字不变**（字段名、
+//! `items[*]` 当时恰好 13 个 key、计数 `total` / `limit` / `offset` 是 JSON **string**
+//! 而非 number），当时前端 Zod schema 无需改动；⚠️ **2026-10-17 起 `items[*]` 是 14 个
+//! key**（新增 `customer_path`），前端**需要**补声明（见「队列端点」一节与
+//! `docs/api/inspection.md`）；**入参 query string 始终逐字不变**
 //! （`drawing_no` / `name` / `serial_no` / `customer_id` / `system_delivery_date_from|to`
 //! / `sort_by` / `sort_dir` / `limit` / `offset`）。前端配套改动在**前端仓**
 //! （`~/Code/hsh-erp/frontend`）由独立任务负责，共 3 类落点：
@@ -110,25 +112,27 @@
 //!
 //! - **判据写死** `pb.status = 'INSPECTION'` + `pb` / `p` 双软删闸门；本端点
 //!   **不接** `statuses` 参数（要按其它状态筛请走 `/repair` / `/repairing`）。
-//! - **3-JOIN 窄投影**：`t_part` + `t_customer`（L2）+ `t_customer` 自连（L1）。
-//!   不 JOIN holder 三表 / 工序 / 送货单 —— 待品检页不渲染那些列。
-//! - **13 字段**：表头 7 个数据列 + 3 个写端点锚点（`batch_id` / `version` /
-//!   `part_id`）+ `customer_id` / `is_urgent` + 两个客户名。
+//! - **2-JOIN 窄投影**：`t_part` + `t_customer`（只取**自身单段名**）。不 JOIN
+//!   holder 三表 / 工序 / 送货单 —— 待品检页不渲染那些列。2026-10-17 起**不再**
+//!   自连 `t_customer` 取父名（那条 JOIN 只上跳一层、深树上必错）。
+//! - **14 字段**（2026-10-17 起）：表头 7 个数据列 + 3 个写端点锚点（`batch_id` /
+//!   `version` / `part_id`）+ `customer_id` / `is_urgent` + 两个客户名 + 新增的
+//!   `customer_path`。
 //! - **表头筛选**：图号 / 名称 / 序列号各一个独立 ILIKE（`%…%`）。service 层
 //!   trim + 空串→None，并**拒绝** `%` / `_` / `\`（40001 —— 防 `%…%` 被 PG 当通配符
 //!   放大成全表扫描；注入面由 repo 的 `push_bind` 参数化保证，与该校验无关）。
-//! - **`customer_id`**：单值 → `crate::shared::customer::expand_customer_id`
-//!   展开为 L1 + 全部 L2 ids 进 `= ANY($n)`。该函数在 `shared`（公共设施，不是域），
-//!   故本域引用它**不**违反零跨域依赖。
+//! - **`customer_id`**：单值 → `crate::shared::customer::subtree_ids`
+//!   展开为「该节点 + 全部后代」ids（纯子树，任意深度）进 `= ANY($n)`。该函数在
+//!   `shared`（公共设施，不是域），故本域引用它**不**违反零跨域依赖。
 //! - **分页**：`limit ∈ [1, 200]`（默认 200）、`offset ≥ 0`（默认 0）；`total`
 //!   与 `items` 共用同一个 WHERE 拼装器，恒等于**过滤后**的条数。
 //! - **排序**：白名单映射在 service 层完成（表头 7 列；缺省 / 非法 `sort_by` 退化为
 //!   系统交期，方向只认 `DESC`、其余退化为 `ASC`），非法值**不报错**。SQL 侧
 //!   `ORDER BY {col} {dir} NULLS LAST, pb.id ASC`（`pb.id` 是翻页稳定性的兜底键）。
 //!
-//! ⚠️ `l1_customer_name` 的派生口径**与返修列表不同**（`c.parent_id IS NOT NULL`
-//! → `pc.name.or(c.name)`，否则 `c.name`；返修那条不回落 `c.name`）—— 两条 SQL 的
-//! 分叉是有意的，但**只有本域侧写了登记**（见 `repo.rs`），返修侧当前没有对应注释。
+//! `l1_customer_name` / `customer_path` 由 service 层一次
+//! [`crate::shared::customer::paths_of`] 派生（SQL **不**自连 `t_customer` 取父名）；
+//! 与返修列表**同口径、已不再分叉**，逐字段登记见 `repo.rs` 与 `vo.rs`。
 //!
 //! ## 模块结构（平级单文件，与 `prod::process_design` / `prod::programming` 平行）
 //! 本域**两个端点共一层文件**（不是「一端点一目录」）：端点之间的耦合只有「共用
@@ -204,7 +208,7 @@ mod tests {
             &Path::new(env!("CARGO_MANIFEST_DIR")).join("src/modules/prod/inspection"),
             "需要别的域的数据时，正确做法是像 statistics / admin 那样在本域 SQL 里只读聚合\
              （本域要读的 t_part / t_part_batch / t_assembly / t_customer 等表，SQL 真源见 \
-             repo.rs；客户 L1 展开用 crate::shared::customer::expand_customer_id，shared 是\
+             repo.rs；客户子树展开用 crate::shared::customer::subtree_ids，shared 是\
              公共设施不是域），而不是 import 别人的 service / repo。",
         );
     }

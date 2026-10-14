@@ -42,7 +42,7 @@ ScanTreeOut
 | `assembly` | object \| null | 仅 `hit_kind == "ASSEMBLY"` 或扫中的零件是某个装配件的子件时有值；独立件树为 `null` |
 | `children` | array | 装配件树 = 该装配件的**全部**子件（不止被扫中的那个）；独立件树 = `[被扫中的那个 part]` |
 
-### 2.3 `ScanAssemblyOut` 逐字段（9）
+### 2.3 `ScanAssemblyOut` 逐字段（10）
 
 | 字段 | 类型 | SQL 来源 |
 |---|---|---|
@@ -55,8 +55,9 @@ ScanTreeOut
 | `is_urgent` | boolean | `a.is_urgent` |
 | `system_delivery_date` | string \| null | `a.system_delivery_date` |
 | `customer_name` | string \| null | `LEFT JOIN t_customer c ON c.id = a.customer_id AND c.deleted_at IS NULL`（**带**软删闸门，客户被软删时退化为 `null`，不影响节点返回） |
+| `customer_path` | string | **2026-10-17 新增，必填**：第 2 层到叶子的 `" / "` 拼接（**不含**根），来自 service 层对整棵树**一次** `shared::customer::paths_of`；取不到落**空串** |
 
-### 2.4 `ScanPartOut` 逐字段（11）
+### 2.4 `ScanPartOut` 逐字段（12）
 
 | 字段 | 类型 | SQL 来源 |
 |---|---|---|
@@ -69,6 +70,7 @@ ScanTreeOut
 | `is_urgent` | boolean | `p.is_urgent` |
 | `system_delivery_date` | string \| null | `p.system_delivery_date` |
 | `customer_name` | string \| null | 同上（带 `c.deleted_at IS NULL`） |
+| `customer_path` | string | **2026-10-17 新增，必填**：与 `ScanAssemblyOut::customer_path` 同一次 `paths_of` 产出，取不到落**空串** |
 | `version` | number | `p.version` ⚠️ **仅展示**，任何批次写动作的 OCC 锚是 `ScanBatchOut::version` |
 | `children[]` | array | `ScanBatchOut` |
 
@@ -161,7 +163,7 @@ ScanTreeOut
 
 ⚠️ **与 `prod::programming` 的分页计数方向相反**（那边是裸 i64 ⇒ number）。两个前端 schema 千万别互相照抄：前端 `inspectionQueueListResultSchema` 声明 `z.string()`，`pendingProgrammingListResultSchema` 声明 `z.number()`。
 
-### 3.3 `InspectionQueueItemOut` 逐字段（13 个）
+### 3.3 `InspectionQueueItemOut` 逐字段（14 个）
 
 | # | 字段 | 类型 | SQL 来源 | 口径 |
 |---|---|---|---|---|
@@ -175,40 +177,42 @@ ScanTreeOut
 | 8 | `name` | string | `p.name` | 名称列 |
 | 9 | `system_delivery_date` | string \| null | `p.system_delivery_date` | 系统交期列，可空 → JSON `null` |
 | 10 | `is_urgent` | boolean | `p.is_urgent` | 加急红底 |
-| 11 | `customer_id` | string | `p.customer_id` | 雪花 ID 字符串化；客户表头筛选的入参回显（caller 选中 L1 / L2 都用它） |
-| 12 | `customer_name` | string \| null | `c.name` | **L2** 叶子客户名 |
-| 13 | `l1_customer_name` | string \| null | 派生（见 §3.5） | **L1** 一级集团名 |
+| 11 | `customer_id` | string | `p.customer_id` | 雪花 ID 字符串化；客户表头筛选的入参回显（caller 选中任意层级的客户都用它，后端展开成纯子树） |
+| 12 | `customer_name` | string \| null | `c.name` | 叶子客户名（本节点单段名） |
+| 13 | `l1_customer_name` | string \| null | `shared::customer::paths_of` 的 `root_name`（见 §3.5） | **根**（L1 集团）名 |
+| 14 | `customer_path` | string | `shared::customer::paths_of` 的 `path` | **2026-10-17 新增，必填**：第 2 层到叶子用 `" / "` 拼接（**不含**根）；落**空串**只发生在「终点行不存在 / 已软删」，成环 / 超深度时给的是**截断路径**（见 `customers.md` §2.2） |
 
 字段集严格对齐前端 7 个数据列（序列号 / 图号 / 名称 / 批次 / 数量 / 系统交期 / 客户）+ 操作列所需的锚点（`batch_id` / `version` / `part_id` / `is_urgent` / `customer_id`）。
 
-⚠️ **本 VO 与返修 VO 不共用**：`GET /api/v2/prod/batches/repair` / `/repairing` 继续用 `prod::batch::vo::InspectionBatchListItemOut`（28 字段）。共用会让那 15 个字段在待品检页成为无用负载。两端点的行对象**不可互相 cast**。
+⚠️ **本 VO 与返修 VO 不共用**：`GET /api/v2/prod/batches/repair` / `/repairing` 继续用 `prod::batch::vo::InspectionBatchListItemOut`。共用会让那边的字段在待品检页成为无用负载。两端点的行对象**不可互相 cast**。
+
+⚠️ **2026-10-17 新增第 14 个键 `customer_path`**：前端 `inspectionQueueListItemSchema` 是 `.strict()`，多一个后端键即抛 `unrecognized_keys` ⇒ **整个待品检页白屏**。本特性要求前端在该 schema 里补声明 `customer_path` 才能用上（**2026-10-17 同批交付**）—— 前端落地为 `z.string().nullable()`，比后端的「必填 `string`、取不到时是空串」**更宽松**，两者**兼容**、不算断裂（`frontend` 的守门纪律是「前端更宽松可接受，前端更严会假阴性」）。队列读与扫码树两侧的模式差异与失败形态见 §8.2。
 
 ### 3.4 队列口径：WHERE 五段拼装
 
 `repo.rs` 私有 `push_inspection_queue_where` —— list 与 count **共用**，天然杜绝「count 与 items 各说各话」的分页 bug。逐段：
 
 1. **状态 + 双软删闸门**：`pb.status = 'INSPECTION' AND pb.deleted_at IS NULL AND p.deleted_at IS NULL`（固定，不接受入参）
-2. **客户**：`cardinality($ids::bigint[]) = 0 OR p.customer_id = ANY($ids)` —— 空数组命中全部；非空时限定到展开后的 L1+L2 ids（同一数组绑两次）
+2. **客户**：`cardinality($ids::bigint[]) = 0 OR p.customer_id = ANY($ids)` —— 空数组命中全部；非空时限定到展开后的「该节点 + 全部后代」ids（同一数组绑两次）
 3. **表头 3 个文本列各一个独立 ILIKE**：`$n::text IS NULL OR <col> ILIKE $n`（短路 ⇒ 缺省不过滤）
 4. **系统交期区间**：两个可空边界各自 `$n::date IS NULL OR …`，缺界不参与过滤
 5. （仅 list）`ORDER BY {order_col} {order_dir} NULLS LAST, pb.id ASC LIMIT / OFFSET`
 
-JOIN 只有 3 张：`t_part_batch` JOIN `t_part` JOIN `t_customer`（L2）+ `t_customer` 自连（L1）。⚠️ **不** JOIN `t_shelf` / `t_worker` / `t_outsource_company` / `t_process` / `t_process_chain_step` / `t_delivery_note` —— 待品检页不渲染那些列。
+JOIN 只有 2 张：`t_part_batch` JOIN `t_part` JOIN `t_customer`（2026-10-17 起**去掉了 `t_customer` 自连**：它只为取「上跳一层」的父名，深树上必错；根名与路径改由 service 层一次 `paths_of` 产出）。⚠️ **不** JOIN `t_shelf` / `t_worker` / `t_outsource_company` / `t_process` / `t_process_chain_step` / `t_delivery_note` —— 待品检页不渲染那些列。
 
 ⚠️ 排序**必须**带 `NULLS LAST`：`p.system_delivery_date` 可空，而 PG 默认 ASC → `NULLS LAST` / DESC → `NULLS FIRST`，不显式指定时按交期倒序会把未填交期的行顶到最前。`pb.id ASC` 是兜底键（排序列可重复，无兜底键时翻页会漏行 / 重复行），覆盖用例 `tests/part/inspection_batches.rs::inspection_batches_pagination_tiebreak_by_batch_id_is_stable`。
 
-⚠️ `customer_id` 的 L1/L2 展开走 `crate::shared::customer::expand_customer_id`：L1 客户 → 自身 + 全部 L2 子节点 ids；L2 客户 → 自身 + 同 L1 下所有兄弟 L2 ids。该函数在 `shared`（公共设施，**不是**域），故本域引用它**不**违反零跨域依赖。
+⚠️ `customer_id` 的子树展开走 `crate::shared::customer::subtree_ids`（2026-10-17 客户层级放开为任意深度后由 `expand_customer_id` 改名并改为纯子树口径）：任意层级客户 → 自身 + 其**全部后代** ids，**不含**兄弟节点。该函数在 `shared`（公共设施，**不是**域），故本域引用它**不**违反零跨域依赖。
 
-### 3.5 ⚠️ `l1_customer_name` 的派生口径（两处并存，勿统一）
+### 3.5 `l1_customer_name` / `customer_path` 的派生口径（两域已统一）
 
-本端点（`repo.rs`）的口径：
+2026-10-17 起**本域与返修域不再分叉**：
 
-- `c.parent_id IS NOT NULL` → `pc.name.or(c.name)`：pc 的 LEFT JOIN **不带** `deleted_at` 过滤，父行在即取父名，父行悬空才回落 `c.name`
-- 否则（自身即 L1）→ `c.name`
+- SQL 只投影 `p.customer_id`（自连 `t_customer` 取父名的那个 JOIN 已删）；
+- `l1_customer_name` = `shared::customer::paths_of` 的 `root_name`（**根**名）；
+- `customer_path` = 同一函数的 `path`（第 2 层到叶子的 `" / "` 拼接，不含根）。
 
-⚠️ **与 `prod::batch::service::repair::list_batches_matching` 的同名派生口径不同**：返修侧那条 SQL 里 `l1_customer_name` 就是 `c_l1.name` 裸值 —— **不回落** `c.name`（客户自身即 L1、或父客户被软删时为 `null`），且它的 JOIN **带** `c_l1.deleted_at IS NULL`。两条 SQL 的分叉是**有意的**（队列侧要「L1 名恒尽量非空」的展示体验，返修侧要「客户被软删就不该假装它还有父集团」的严格性），但 ⚠️ **目前只有本域侧写了登记**（`repo.rs` 模块 doc），返修侧**没有对应注释**。
-
-⇒ 这条不对称本身是已登记的债：改本域这一处前先去看 `src/modules/prod/batch/service/repair.rs` 的 SQL 是否仍是分叉；要统一就得两侧一起改，并给返修侧补上登记。
+⚠️ 旧口径是 `c.parent_id IS NOT NULL → pc.name.or(c.name)`，**只上跳一层**，三层以上的树上拿到的是中间层名；返修侧则是 `c_l1.name` 裸值（不回落 `c.name`）。两处都已随本轮改成 `paths_of`，**分叉消失**：真正落 `l1_customer_name = null` / `customer_path = ""` 的**只有**「终点行不存在 / 已软删」这一种（`paths_of` 的锚点带 `deleted_at IS NULL`）；成环 / 超深度时 map 里**仍有**该项，给出的是**截断路径**与「断链处那个祖先」的名字（不是根），详见 `customers.md` §2.2。
 
 ## 4. 口径表
 
@@ -265,7 +269,7 @@ JOIN 只有 3 张：`t_part_batch` JOIN `t_part` JOIN `t_customer`（L2）+ `t_c
 | `40102` `TOKEN_EXPIRED` | 401 | 两者 | JWT `ExpiredSignature` | `src/auth/middleware.rs` |
 | `40105` `SESSION_REVOKED` | 401 | 两者 | Redis session 查不到 / jti 命中吊销黑名单 | `src/auth/middleware.rs` |
 | `20101` `BIZ_PART_NOT_FOUND` | 404 | 扫码 | 序列号在 `t_part` 与 `t_assembly` 皆未命中；trim 后为空串同样按未命中 | `service.rs::not_found`（复用 part 域同码，不另开槽位） |
-| `20102` `BIZ_CUSTOMER_NOT_FOUND` | 404 | 队列 | `customer_id` 指向不存在或已软删的客户 | `shared::customer::expand_customer_id` |
+| `20102` `BIZ_CUSTOMER_NOT_FOUND` | 404 | 队列 | `customer_id` 指向不存在或已软删的客户 | `shared::customer::subtree_ids` |
 | `40001` `VALIDATION_ERROR` | 422 | 队列 | 3 个表头筛选值含 `%` / `_` / `\` | `service.rs::to_ilike_pat` → `AppError::validation` |
 | `20118` `BIZ_PART_REPAIR_NOT_TRIGGERED` | 400 | **本域不产生**，登记备查：`ScanBatchOut::is_repairing` 为 `true` 的批次若被调 `POST /prod/batches/{batch_id}/to-process` 会撞这个码（语义是「返修流转前置条件不满足」，文案提示改用 `complete-repair`）。前端据此用 `is_repairing` 提前禁用「指定工序」按钮 | `prod::batch` 的 `transition_core` |
 | **HTTP 400 纯文本**（无 `R` 信封） | 400 | 队列 | `customer_id` / `limit` / `offset` 非数字字面量；`system_delivery_date_from` / `_to` 格式非法 | axum `Query` 提取器反序列化失败，**不经 `AppError`** |
@@ -283,10 +287,10 @@ JOIN 只有 3 张：`t_part_batch` JOIN `t_part` JOIN `t_customer`（L2）+ `t_c
 |---|---|---|
 | 路径 | `GET /api/v2/prod/batches/inspection` | `GET /api/v2/prod/inspection/queue` |
 | 状态 | **已下线，无 alias（旧路径 404）** | 现行 |
-| 出参 | `InspectionQueueListOut` | `InspectionQueueListOut` **逐字未变**（字段名、`items[*]` 恰好 13 个 key、计数为 JSON **string** 而非 number） |
+| 出参 | `InspectionQueueListOut` | `InspectionQueueListOut` **在本次迁入时逐字未变**（字段名、`items[*]` 13 个 key、计数为 JSON **string** 而非 number）；⚠️ **2026-10-17 起 `items[*]` 是 14 个 key**（新增 `customer_path`，见 §3.3） |
 | 入参 | `InspectionQueueQuery` | `InspectionQueueQuery` **逐字未变**（9 个 query 参数） |
 
-因为出参逐字未变，**前端 Zod schema 无需改动**。迁入范围：SQL 落到 `repo.rs` 的 `InspectionQueueRepo`（与 `InspectionScanRepo` 并列的第二个 ZST）+ 私有 `push_inspection_queue_where` + 常量 `INSPECTION_QUEUE_SELECT` / `INSPECTION_QUEUE_COUNT_FROM`；行结构 `InspectionQueueRow` 落到 `model.rs`；VO 落到 `vo.rs`；DTO `InspectionQueueQuery` 落到 `dto.rs`；service `InspectionQueueService` 落到 `service.rs`（与 `InspectionScanService` 共用 `inspection.view` 权限点）；handler `queue` 落到 `handler.rs`。
+因为**迁入那一刻**出参逐字未变，前端 Zod schema 当时无需改动（⚠️ 2026-10-17 新增 `customer_path` 后前端**需要**补声明，见 §3.3）。迁入范围：SQL 落到 `repo.rs` 的 `InspectionQueueRepo`（与 `InspectionScanRepo` 并列的第二个 ZST）+ 私有 `push_inspection_queue_where` + 常量 `INSPECTION_QUEUE_SELECT` / `INSPECTION_QUEUE_COUNT_FROM`；行结构 `InspectionQueueRow` 落到 `model.rs`；VO 落到 `vo.rs`；DTO `InspectionQueueQuery` 落到 `dto.rs`；service `InspectionQueueService` 落到 `service.rs`（与 `InspectionScanService` 共用 `inspection.view` 权限点）；handler `queue` 落到 `handler.rs`。
 
 ⇒ 迁后本域**零跨域依赖**，这是本次迁移的主要收益。
 
@@ -327,7 +331,7 @@ JOIN 只有 3 张：`t_part_batch` JOIN `t_part` JOIN `t_customer`（L2）+ `t_c
 
 ### 8.1 读的表
 
-端点 1（队列读）：`t_part_batch` / `t_part` / `t_customer`（L2 + 自连 L1）。
+端点 1（队列读）：`t_part_batch` / `t_part` / `t_customer`（自连取父名的 JOIN 已于 2026-10-17 删除）。
 
 端点 2（扫码读）：`t_part` / `t_assembly` / `t_part_batch` / `t_customer`，另 `LEFT JOIN` `t_process` / `t_shelf` / `t_worker` / `t_outsource_company` 五表。
 
@@ -336,20 +340,27 @@ JOIN 只有 3 张：`t_part_batch` JOIN `t_part` JOIN `t_customer`（L2）+ `t_c
 | 端点 | 软删闸门 | 说明 |
 |---|---|---|
 | 端点 2 | `t_part` / `t_assembly` / `t_part_batch` **三处必过滤**；`t_customer` 带闸门（客户名退化为 `null`，不影响节点返回）；`t_process` / `t_shelf` / `t_worker` / `t_outsource_company` **刻意不加** | 软删闸门在这里是**语义**闸门不是保守过滤：扫到软删行等于扫到一个业务上已不存在的码，前端弹「未找到」比弹一棵含已删数据的树更安全 |
-| 端点 1 | `pb.deleted_at IS NULL` + `p.deleted_at IS NULL`；**两条 `t_customer` JOIN 都不过滤 `deleted_at`** | 与端点 2 的 `t_customer` 闸门**方向相反**，同域内两个端点口径不同，改任一处的客户 JOIN 前先确认不会破坏另一处 |
+| 端点 1 | `pb.deleted_at IS NULL` + `p.deleted_at IS NULL`；**那一条 `t_customer` JOIN 不过滤 `deleted_at`** | 与端点 2 的 `t_customer` 闸门**方向相反**，同域内两个端点口径不同，改任一处的客户 JOIN 前先确认不会破坏另一处 |
 
 ### 8.2 前端配套改动清单
 
 | 落点（`frontend` 仓） | 路径 | 备注 |
 |---|---|---|
 | queryKey 工厂 | `src/composables/queries/keys.ts` 的 `qk.inspectionQueueList(params)` / `qk.inspectionPrefix` | 前缀失效用 `inspectionPrefix` |
-| Zod 守门 schema | `src/views/inspection/composables/inspectionSchema.ts` | `inspectionQueueListItemSchema`（**13 个 key + `.strict()`**，多一个键即抛 `unrecognized_keys`）+ `inspectionQueueListResultSchema`（计数 `z.string()`）+ 扫码树 schema |
+| Zod 守门 schema | `src/views/inspection/composables/inspectionSchema.ts` | `inspectionQueueListItemSchema`（**14 键 + `.strict()`**，多一个键即抛 `unrecognized_keys`；含 2026-10-17 新增的 `customer_path`）+ `inspectionQueueListResultSchema`（计数 `z.string()`）+ 扫码树 schema（**strip 模式**，见下） |
 | query hook | `src/views/inspection/composables/useInspectionQueueQuery.ts` | hook 无自有状态，入参 `MaybeRefOrGetter`（params + `enabled` + `autoRefresh`） |
 | 页面级 store | `src/views/inspection/composables/useInspectionListStore.ts` | 分页 / 筛选 / 弹窗态 + 写 mutation + `invalidateInspectionQuery()` |
 | 列定义 | `src/views/inspection/inspectionColumnDefs.ts` | 表头 7 列 |
 | api 层 | `src/api/inspection.ts` | 队列读 `listInspectionBatches` 与扫码端点**同模块** |
 
-⚠️ 队列读行 schema 用 `.strict()`（13 键锁死），扫码树 schema 用普通 strip 模式 `z.object` —— 两侧宽容度不同，加字段时注意各自的行为差异。
+⚠️ 队列读行 schema 用 `.strict()`（14 键锁死），扫码树 schema 用普通 strip 模式 `z.object` —— **两侧宽容度不同，漏声明同一字段的失败形态也相反**：
+
+| 落点 | 模式 | 漏声明 `customer_path` 的失败形态 |
+|---|---|---|
+| 队列读 `inspectionQueueListItemSchema` | `.strict()` | 后端多一个键即抛 `unrecognized_keys` ⇒ **待品检页白屏**（响亮、当场发现） |
+| 扫码树 `ScanAssemblyOut`（§2.3）/ `ScanPartOut`（§2.4）两个节点的 schema | strip 模式 `z.object` | 后端多一个键被 Zod **静默剥离** ⇒ **不抛、不白屏、零报错**，但扫码弹窗的适配层拿不到路径、客户列**永久降级成单段名**，任意深度树上再也拼不出完整路径 |
+
+⇒ **本特性要求前端在扫码树那两个节点的 schema 里补声明 `customer_path: z.string()` 才能用上**（**2026-10-17 同批交付**）。strip 模式这一侧比 `.strict()` 那一侧**更容易漏**：它在两层树上与「补了声明」的表现完全一样，只有客户树真被加深到第三层才看得出路径不对。
 
 ### 8.3 写端点（**全部在 `prod::batch` 域**，不在本域文档里）
 
@@ -364,7 +375,7 @@ JOIN 只有 3 张：`t_part_batch` JOIN `t_part` JOIN `t_customer`（L2）+ `t_c
 
 ### 8.4 已知偏差登记
 
-1. **`l1_customer_name` 与返修侧口径分叉，且只有本侧有登记**（§3.5）。产品决议（2026-10-07）：**不处理**（两条分叉各自的服务目的不同），但已把「返修侧缺登记」登记为债 —— 改任一侧前必须核对另一侧。
+1. ~~**`l1_customer_name` 与返修侧口径分叉，且只有本侧有登记**~~ —— **2026-10-17 已消解**：客户树放开任意深度后两域改用同一个 `shared::customer::paths_of`（§3.5），分叉不存在了，本条从「偏差登记」转为「已关闭的债」。登记保留是为了让后来者知道这里曾经分叉过、以及现在两域为什么会逐字一致。
 2. **同域内 `t_customer` 软删口径不一致**（端点 2 带闸门、端点 1 不过滤，见 §8.1）。这是迁域时「SQL 与派生口径逐字未改」的必然结果：队列读的 JOIN 是从 `prod::batch` 原样搬过来的。产品决议（2026-10-07）：**不处理**，端点 1 的「不过滤」与 `prod::programming` 一致（历史工单要显示原客户名）。
 3. **`current_holder_display` 的 holder 三表 COALESCE 多态歧义**（§2.5，本形态全仓第 6 处）。产品决议（2026-10-07）：**不处理**（需先确认「清脏数据」还是「改判别式」，且修必须 6 处同批）。
 4. **读端点不开事务 ⇒ 装配件分支的 2~4 条语句不保证同一快照**（READ COMMITTED 下每条语句各看一个快照）。理论上的可撕裂场景：4 条语句之间被扫中的子件被软删 ⇒ `children` 里没有自己刚扫的码、全树 `is_scanned = false`，**无任何错误提示**。发生概率极低，且全仓读端点都是这个形态（读端点不开事务是本仓约定），故不改；真要消除只能给读端点开 REPEATABLE READ 快照事务，属跨域惯例改动。
@@ -374,7 +385,7 @@ JOIN 只有 3 张：`t_part_batch` JOIN `t_part` JOIN `t_customer`（L2）+ `t_c
 
 本域**零跨域依赖**：`src/shared/domain_guard` 把「本域不 import 其它域的 service / repo」从口头约定变成 CI 强制。单测 `src/modules/prod/inspection/mod.rs` 的 `inspection_domain_depends_on_no_other_domain` 传本域路径 `prod::inspection` + 源码目录，扫全部 `.rs`，代码区里出现任何他域路径即 panic。⚠️ 嵌套域走**前缀匹配**而非「首段相同即本域」—— 否则同父兄弟域 `prod::batch` 会被一起放行，护栏等于没装。
 
-本域对 `crate::shared::customer::expand_customer_id` 的引用**不**违规：`shared` 是公共设施不是域。
+本域对 `crate::shared::customer::subtree_ids` 的引用**不**违规：`shared` 是公共设施不是域。
 
 ### 9.1 ⚠️ 已知漏报盲区（诚实登记，来源：`src/shared/domain_guard` 的「已知漏报盲区」节）
 

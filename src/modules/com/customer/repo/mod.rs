@@ -5,8 +5,9 @@
 //!   **内容零 diff**（`.sqlx/query-*.json` 哈希不变；新加的 `lookup_names` /
 //!   `count_parts_using_customer` / `count_assemblies_using_customer` 三个方法
 //!   承载原本散落在 `service.rs` 的 inline 跨域 SQL，SQL 字符串完全不变）。
-//! - `mod.rs`（本文件）：对外暴露胖 trait `CustomerRepo`（11 方法合并单 trait；
-//!   t_customer 8 + 跨域 helper 3），并直接 `impl CustomerRepo for &mut PgConnection`
+//! - `mod.rs`（本文件）：对外暴露胖 trait `CustomerRepo`（13 方法合并单 trait；
+//!   t_customer 8 + 跨域 helper 3 + 客户树 helper 2），并直接
+//!   `impl CustomerRepo for &mut PgConnection`
 //!   ——handler/service 借 `&mut *tx` / `&mut *conn` 即可，零中间壳。
 //!
 //! ## 为什么是胖 trait 而不是按表拆 2 trait
@@ -26,13 +27,19 @@
 //!   不变（cross-module 调用方零修改；2026-09-22 重构唯一例外：`lookup_names` /
 //!   `count_parts_using_customer` / `count_assemblies_using_customer` 是新增 helper，
 //!   无外部调用方）。
-//! - `com::customer::repo::CustomerRepoTrait` —— 本文件新加的胖 trait（11 方法），
+//! - `com::customer::repo::CustomerRepoTrait` —— 本文件新加的胖 trait（13 方法），
 //!   customer 域内部 service 用 `<R: CustomerRepoTrait>` 收。
 //!
 //! ## 跨域 helper（`lookup_names` / `count_parts_using_customer` /
 //! ## `count_assemblies_using_customer`）
 //! 原本散落在 `applicant/service.rs` 与 `customer/service.rs` 的 inline SQL，
 //! 抽 trait 时统一收敛到 `CustomerRepo`：service 拿 trait 即可，零 inline SQL。
+//!
+//! ## 客户树 helper（`has_children` / `subtree_ids`，2026-10-17 新增）
+//! 客户层级放开为任意深度后，软删闸门需要「有没有子节点 / 下级有几个」。
+//! 这两条**不在本域另写 SQL**，而是经 trait 一行委托 `crate::shared::customer`
+//! （客户树遍历口径全仓一份，见该文件模块 doc）；与 part / com::union_list /
+//! prod::inspection 三个筛选调用方走的是同一份实现。
 //!
 //! ## 为什么 trait 可以直接对 `&mut PgConnection` 实现
 //! `Transaction<'_, Postgres>` 与 `PoolConnection<Postgres>` 都
@@ -50,8 +57,13 @@
 //! repo trait 方法 → `sqlx::Error`（与 sql.rs 签名 1:1，`create` 检
 //! SQLSTATE 23505 → 20104 BIZ_INVALID_VALUE 已在 service 层做）。
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use sqlx::PgConnection;
+
+use crate::shared::customer::CustomerPath;
+use crate::shared::error::AppError;
 
 pub mod sql;
 
@@ -94,7 +106,7 @@ pub trait CustomerRepoTrait: Send {
         name_like: Option<&'a str>,
         parent_id: Option<i64>,
         is_root: Option<bool>,
-        limit: i64,
+        limit: Option<i64>,
         offset: i64,
     ) -> Result<Vec<TCustomer>, sqlx::Error>;
     async fn count_with_filters<'a>(
@@ -140,6 +152,35 @@ pub trait CustomerRepoTrait: Send {
         &mut self,
         customer_id: i64,
     ) -> Result<i64, sqlx::Error>;
+
+    // ── 客户树 helper（2026-10-17 新增；委托 shared，SQL 真源全仓一份）──
+    /// 是否有未软删的**直接**子节点？任意层级客户软删前的第一道闸门。
+    ///
+    /// 委托 `crate::shared::customer::has_children`（不在本域另写一份 SQL：客户树
+    /// 遍历的口径必须全仓一份，否则同一棵树的软删闸门与筛选展开会给出不同答案）。
+    async fn has_children(&mut self, customer_id: i64) -> Result<bool, sqlx::Error>;
+    /// 自身 + 全部后代 ids（纯子树，任意深度）。错误消息里的「下级节点数」取
+    /// `len() - 1`。委托 `crate::shared::customer::subtree_ids`。
+    ///
+    /// 返回 `AppError`（而非本 trait 其余方法的 `sqlx::Error`）：shared 那份会抛
+    /// `20102 BIZ_CUSTOMER_NOT_FOUND`（客户已不存在），那是业务码，摊平成
+    /// `sqlx::Error` 会退化成 500。
+    async fn subtree_ids(&mut self, customer_id: i64) -> Result<Vec<i64>, AppError>;
+
+    // ── 客户树取名（2026-10-17 新增；`CustomerOut.customer_path` 的数据来源）──
+    /// 一次往返批量产出 `id → (root_name, own_name, customer_path)`。委托
+    /// `crate::shared::customer::paths_of`（全仓唯一的客户树取名设施）。
+    ///
+    /// 本域只需要 `path` 一列（另两列由各业务域自己的 VO 承载），但**不自写**一份
+    /// 「自身 name + 上跳各层拼路径」的 SQL：客户树遍历口径必须全仓一份，否则同一个
+    /// 客户的路径在零件一览与客户管理页会给出不同答案。
+    ///
+    /// 返回 `AppError`（同 `subtree_ids`）：shared 那份可能抛业务码，摊平成
+    /// `sqlx::Error` 会退化成 500。
+    async fn customer_paths_by_ids(
+        &mut self,
+        ids: &[i64],
+    ) -> Result<HashMap<i64, CustomerPath>, AppError>;
 }
 
 /// 把 `CustomerRepo` 直接对 `&mut PgConnection` 实现——handler/service 借 `&mut *tx` 或
@@ -189,7 +230,7 @@ impl CustomerRepoTrait for &mut PgConnection {
         name_like: Option<&'b str>,
         parent_id: Option<i64>,
         is_root: Option<bool>,
-        limit: i64,
+        limit: Option<i64>,
         offset: i64,
     ) -> Result<Vec<TCustomer>, sqlx::Error> {
         CustomerRepo::list_with_filters(&mut **self, name_like, parent_id, is_root, limit, offset)
@@ -263,5 +304,21 @@ impl CustomerRepoTrait for &mut PgConnection {
         customer_id: i64,
     ) -> Result<i64, sqlx::Error> {
         CustomerRepo::count_assemblies_using_customer(&mut **self, customer_id).await
+    }
+
+    // ── 客户树 helper（2026-10-17 新增）── 一行委托 shared ─────────────
+    async fn has_children(&mut self, customer_id: i64) -> Result<bool, sqlx::Error> {
+        crate::shared::customer::has_children(&mut **self, customer_id).await
+    }
+
+    async fn subtree_ids(&mut self, customer_id: i64) -> Result<Vec<i64>, AppError> {
+        crate::shared::customer::subtree_ids(&mut **self, customer_id).await
+    }
+
+    async fn customer_paths_by_ids(
+        &mut self,
+        ids: &[i64],
+    ) -> Result<HashMap<i64, CustomerPath>, AppError> {
+        crate::shared::customer::paths_of(&mut **self, ids).await
     }
 }

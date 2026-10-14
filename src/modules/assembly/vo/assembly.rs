@@ -36,18 +36,38 @@ pub struct AssemblyOut {
     pub note: Option<String>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
+    /// 「第 2 层到叶子」的 `" / "` 路径（**不含**根；本节点即根时 = 根自己的名字）。
+    ///
+    /// 2026-10-17 新增。上一轮只加在 [`AssemblyListItem`] 上，理由是
+    /// 「`render_assembly_out` 拿不到连接 ⇒ 加过去只能恒空串」—— 该理由只对**装配
+    /// 函数**成立，六个调用点（详情 / 建单回读 / 更新 / 取消 / start / force-complete）
+    /// 都持有 repo。本轮由 `service::assembly_out_with_path` 统一补，查不到（**终点行不存在 /
+    /// 已软删**）时落**空串**（必填字段，与全仓 `customer_path` 一致）。⚠️ 「查不到」**不等于**
+    /// 「链成环」：成环 / 超深度时 `paths_of` 仍有该项，只是给出截断路径。
+    ///
+    /// ⚠️ **键名在列表端点不变**：`AssemblyListItem` 用 `#[serde(flatten)]` 平铺本
+    /// 结构，旧的「列表项自带一个 `customer_path`」已删（否则 serde 会输出**两个同名
+    /// JSON 键**），平铺后的 wire 形状与旧版逐字相同。
+    pub customer_path: String,
 }
 
 /// 列表项：`#[serde(flatten)]` 把 `assembly` 字段的所有 key 平铺到顶层，
 /// 再追加 `customer_name` / `parent_customer_name`。前端拿到的 JSON 形状与单条
-/// `AssemblyOut` 几乎一致（仅多两个 customer 名字段）。
+/// `AssemblyOut` 几乎一致（仅多两个 customer 字段）。
+///
+/// 2026-10-17：`customer_path` **从本 VO 移到 `AssemblyOut`**。`flatten` 会把被平铺
+/// 结构的所有键原样输出，本 VO 再自带一个同名的 `customer_path` 就会在 JSON 里出现
+/// **两个同名键**（取哪个取决于解析器）。移到 `AssemblyOut` 后 wire 形状逐字不变
+/// （同一个键、同一个 `String`、同一个值），却顺带让详情 / 写端点回读也带上路径。
 ///
 /// 2026-09-22 PR4：迁移到 vo/，仅 Serialize。
 #[derive(Debug, Clone, Serialize)]
 pub struct AssemblyListItem {
     #[serde(flatten)]
     pub assembly: AssemblyOut,
+    /// 本节点单段客户名
     pub customer_name: Option<String>,
+    /// **根**（L1 集团）客户名 —— 2026-10-17 起不再是「直接父」
     pub parent_customer_name: Option<String>,
 }
 

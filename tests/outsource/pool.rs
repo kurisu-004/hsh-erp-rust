@@ -1045,7 +1045,10 @@ async fn detail_lists_all_mapped_companies_with_inlined_held_batches() {
     assert_eq!(row["version"], 7, "{env}");
     assert_eq!(row["shelf_code"], "PDS", "{env}");
     assert_eq!(row["customer_name"], "PcDet", "{env}");
-    assert!(row["parent_customer_name"].is_null(), "{env}");
+    // 2026-10-17：本节点**自己就是根**（无 parent）⇒ `parent_customer_name` = 自身名
+    // （旧的「上跳一层」实现返回 null）。根名按定义就是自己。
+    assert_eq!(row["parent_customer_name"], "PcDet", "{env}");
+    assert_eq!(row["customer_path"], "PcDet", "{env}");
 }
 
 #[tokio::test]
@@ -1648,17 +1651,15 @@ async fn detail_candidate_carries_new_card_fields() {
         "shelf_id 是移动写端点 from.shelf_id 的数据源，必须等于批次真实所在货架: {env}"
     );
 
-    // 拆开的客户两字段（不再是合并后的 customer_path）
+    // 客户三字段（2026-10-17）：两个名字列 + 恢复的 customer_path 同源
+    // （`shared::customer::paths_of`）。`parent_customer_name` 恒为**根**名。
     assert_eq!(row["customer_name"], "L2 Leaf", "{env}");
     assert_eq!(row["parent_customer_name"], "L1 Group", "{env}");
+    // 客户树放开任意深度后前端拼不出第 2 层以外的段 ⇒ customer_path 恢复（必填）
+    assert_eq!(row["customer_path"], "L2 Leaf", "{env}");
 
     // 3 个已删字段
-    for gone in [
-        "status_label",
-        "source_status",
-        "batch_quantity",
-        "customer_path",
-    ] {
+    for gone in ["status_label", "source_status", "batch_quantity"] {
         assert!(
             row.get(gone).is_none(),
             "{gone} 已从候选 VO 删除，不得再出现: {env}"
@@ -1755,10 +1756,10 @@ async fn detail_held_batches_carry_shipment_fields() {
         "sent_at 必须有值: {r1}"
     );
     assert_eq!(r1["customer_name"], "PcSt", "{env}");
-    assert!(
-        r1["parent_customer_name"].is_null(),
-        "无 L1 时为 null: {env}"
-    );
+    // 2026-10-17：本节点自己就是根 ⇒ `parent_customer_name` = 自身名、`customer_path`
+    // = 自身名（旧的「上跳一层」实现两个都给 null）
+    assert_eq!(r1["parent_customer_name"], "PcSt", "{env}");
+    assert_eq!(r1["customer_path"], "PcSt", "{env}");
     // 在途卡新增的角标
     assert_eq!(r1["has_cnc_program"], true, "{env}");
 

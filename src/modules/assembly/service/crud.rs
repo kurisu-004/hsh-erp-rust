@@ -3,11 +3,14 @@
 //! 列表 / 详情 / 创建 / 更新 / 软删 / 取消 —— 共 6 个端点。
 //!
 //! ## 业务约束（service 层 enforce）
-//! - 列表：`customer_id` 支持 L1 展开（recursive CTE，由 trait 提供）
-//! - 创建：`customer_id` 必须是 L2 叶子；子件 ≤ 99；**若提供** PDF 则页数 ==
-//!   children.len()+1；序列号从 L1 customer.serial_prefix 派发（与是否提供 PDF
+//! - 列表：`customer_id` 展开成「自身 + 全部后代」的纯子树（2026-10-17 起委托
+//!   `shared::customer::subtree_ids`，任意深度）
+//! - 创建：`customer_id` 必须是**叶子**客户（2026-10-17 起判据是「无子节点」，
+//!   旧口径「必须是 L2」= `parent_id IS NOT NULL` 是两层树下的等价写法）；
+//!   子件 ≤ 99；**若提供** PDF 则页数 ==
+//!   children.len()+1；序列号从根 customer.serial_prefix 派发（与是否提供 PDF
 //!   无关）
-//! - 更新：customer_id 三态（None/Some(None)/Some(Some(v))）+ L2 校验；OCC；§3.2
+//! - 更新：customer_id 三态（None/Some(None)/Some(Some(v))）+ 叶子校验；OCC；§3.2
 //!   级联覆盖父件到所有未软删子件（8 个共享信息字段）；§3.3 套数缩放
 //! - 软删：Manager only；OCC；终态守；预检子件挂送货单（PR-2 后 JOIN t_part_batch 查）
 //! - 取消：Manager/Clerk；repo 按 `status NOT IN ('COMPLETED','CANCELLED')` 守卫，
@@ -44,6 +47,7 @@ use crate::modules::assembly::vo::{
 use crate::modules::part::repo::part::{ChildInheritFields, NewPartCreate};
 use crate::modules::part::vo::PartListItem;
 use crate::modules::prod::batch::repo::NewInitialBatch;
+use crate::shared::customer::CustomerPath;
 use crate::shared::error::{AppError, code};
 
 use super::AssemblyService;
@@ -140,45 +144,22 @@ pub(crate) async fn add_assembly_child_dispatch(
 
 // ---------- helpers ----------
 
-/// `TAssembly` → `AssemblyListItem`（含 customer_name / parent_customer_name 两次 join）。
+/// `TAssembly` → `AssemblyListItem`（含 customer_name / parent_customer_name / customer_path）。
 ///
 /// 2026-09-16 PR-2 瘦身：t_assembly 删 `actual_delivery_date` 列，AssemblyOut
 /// 同步删该字段。
-fn render_list_item(
-    asm: TAssembly,
-    names: &HashMap<i64, (String, Option<i64>)>,
-) -> AssemblyListItem {
-    let (customer_name, parent_customer_name) = names
-        .get(&asm.customer_id)
-        .map(|(n, p)| {
-            (
-                Some(n.clone()),
-                p.and_then(|pid| names.get(&pid).map(|(pn, _)| pn.clone())),
-            )
-        })
+///
+/// 2026-10-17：三个客户列全部来自 `shared::customer::paths_of` 的批量 map
+/// （旧形是「自身 name + 上跳一层取父名」，两层假设硬编码）。`parent_customer_name`
+/// 的语义因此从「直接父」变成「**根**」（与 `l1_customer_name` 一致）。
+fn render_list_item(asm: TAssembly, names: &HashMap<i64, CustomerPath>) -> AssemblyListItem {
+    let cp = names.get(&asm.customer_id);
+    let (customer_name, parent_customer_name) = cp
+        .map(|p| (Some(p.own_name.clone()), Some(p.root_name.clone())))
         .unwrap_or((None, None));
+    // 列表是一次批量取名，故 `customer_path` 直接从同一个 map 取（不再逐行查）。
     AssemblyListItem {
-        assembly: AssemblyOut {
-            id: asm.id,
-            drawing_no: asm.drawing_no,
-            name: asm.name,
-            applicant_name: asm.applicant_name,
-            customer_id: asm.customer_id,
-            request_date: asm.request_date,
-            planned_delivery_date: asm.planned_delivery_date,
-            is_urgent: asm.is_urgent,
-            status: asm.status,
-            version: asm.version,
-            serial_no: asm.serial_no,
-            quantity: asm.quantity,
-            unit_price: asm.unit_price,
-            total_price: asm.total_price,
-            order_no: asm.order_no,
-            system_delivery_date: asm.system_delivery_date,
-            note: asm.note,
-            created_at: asm.created_at,
-            updated_at: asm.updated_at,
-        },
+        assembly: render_assembly_out(asm, cp.map(|p| p.path.clone()).unwrap_or_default()),
         customer_name,
         parent_customer_name,
     }
@@ -188,7 +169,7 @@ fn render_list_item(
 // 逐字同形**的副本（2026-09-22 D-3 的理由「避免跨子模块 pub(crate) 暴露」在 Rust 里
 // 不成立 —— 同 crate 内 `pub(crate)` 即可）。两份副本已合并到
 // `super::render_assembly_out`（`service/mod.rs`），改字段只改一处。
-use super::render_assembly_out;
+use super::{assembly_out_with_path, render_assembly_out};
 
 impl AssemblyService {
     // =======================================================================
@@ -216,9 +197,9 @@ impl AssemblyService {
                     format!("customer_id 非法: {cid_str}"),
                 )
             })?;
-            repo.expand_customer_l2_ids(cid)
-                .await
-                .map_err(AppError::from)?
+            // 2026-10-17：客户筛选展开统一走「自身 + 全部后代」的纯子树
+            // （旧 `expand_customer_l2_ids` 对非根节点只返回自身，深树下漏下级）。
+            repo.subtree_ids(cid).await?
         } else {
             Vec::new()
         };
@@ -261,17 +242,14 @@ impl AssemblyService {
             .await
             .map_err(AppError::from)?;
 
-        // 批量拉 customer name（O(1) 查询）；先 BTreeSet 去重再 collect 保持稳定顺序
+        // 批量拉客户三列（O(1) 查询）；先 BTreeSet 去重再 collect 保持稳定顺序
         let unique_ids: Vec<i64> = rows
             .iter()
             .map(|r| r.customer_id)
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        let names = repo
-            .fetch_customer_names_by_ids(&unique_ids)
-            .await
-            .map_err(AppError::from)?;
+        let names = repo.customer_paths_by_ids(&unique_ids).await?;
 
         let items = rows
             .into_iter()
@@ -364,7 +342,7 @@ impl AssemblyService {
             .collect();
 
         Ok(AssemblyDetail {
-            assembly: render_assembly_out(asm),
+            assembly: assembly_out_with_path(repo, asm).await?,
             children,
             files,
         })
@@ -397,24 +375,33 @@ impl AssemblyService {
     ) -> Result<AssemblyCreateResult, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
 
-        // 1. customer_id 必须为 L2 叶子（parent_id NOT NULL）
+        // 1. customer_id 必须是**叶子**客户（无子节点）
+        //
+        // 2026-10-17 语义变更：旧校验是「必须是 L2 叶子」= `parent_id IS NOT NULL`，
+        // 那是**两层树**下「叶子」的等价写法。客户树放开任意深度后它既拦不住中间层
+        // 节点（一个 L3 中间层照样 `parent_id IS NOT NULL`，却还有下级），又误拒了
+        // 单层树上的合法叶子（`parent_id IS NULL` 的孤立根）。判据统一改成
+        // 「叶子 = `has_children == false`」，实现**只保留**一条：
+        // `AssemblyRepoTrait::require_leaf_customer`（委托 `shared::customer`，
+        // 本文件零内联副本 —— 与改单路径 `update_assembly` 同一行）。
         let customer_id: i64 = req.customer_id.parse().map_err(|_| {
             AppError::biz(
                 code::BIZ_INVALID_VALUE,
                 format!("customer_id 非法: {}", req.customer_id),
             )
         })?;
-        let parent_id = repo
-            .fetch_customer_parent_id(customer_id)
+        // 存在性闸门保留 `fetch_customer_parent_id`（`None` = 行不存在 / 已软删）：
+        // `has_children` 分不出「叶子」与「客户不存在」，两种情况都返 false。
+        repo.fetch_customer_parent_id(customer_id)
             .await
             .map_err(AppError::from)?
-            .ok_or_else(|| AppError::biz(code::BIZ_CUSTOMER_NOT_FOUND, "customer 不存在"))?;
-        if parent_id.is_none() {
-            return Err(AppError::biz(
-                code::BIZ_ASSEMBLY_BAD_CUSTOMER,
-                "customer_id 必须是 L2 叶子节点",
-            ));
-        }
+            .ok_or_else(|| {
+                AppError::biz(
+                    code::BIZ_CUSTOMER_NOT_FOUND,
+                    format!("customer {customer_id} 不存在"),
+                )
+            })?;
+        repo.require_leaf_customer(customer_id).await?;
 
         // 2. 子件上限
         if req.children.len() > 99 {
@@ -557,7 +544,7 @@ impl AssemblyService {
             .map_err(AppError::from)?
             .ok_or_else(|| AppError::biz(code::BIZ_ASSEMBLY_NOT_FOUND, "刚创建却查不到"))?;
         Ok(AssemblyCreateResult {
-            assembly: render_assembly_out(asm_t),
+            assembly: assembly_out_with_path(repo, asm_t).await?,
             created_children: created_children_out,
         })
     }
@@ -594,7 +581,7 @@ impl AssemblyService {
     ) -> Result<AssemblyOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
 
-        // customer_id 三态解析（None 缺省 = 不更新；Some(Some(cid_str)) = 覆盖 + L2 校验）
+        // customer_id 三态解析（None 缺省 = 不更新；Some(Some(cid_str)) = 覆盖 + 叶子校验）
         let customer_id_i64 = if let Some(Some(cid_str)) = req.customer_id.as_ref() {
             let cid: i64 = cid_str.parse().map_err(|_| {
                 AppError::biz(
@@ -602,15 +589,20 @@ impl AssemblyService {
                     format!("customer_id 非法: {cid_str}"),
                 )
             })?;
-            // 校验 L2 叶子（parent_id NOT NULL）
-            let parent = repo
-                .fetch_customer_parent_id(cid)
+            // 2026-10-17：闸门由「必须是 L2」（= `parent_id IS NOT NULL`，两层树下的
+            // 叶子等价写法）改成「必须是叶子」（`has_children == false`）。
+            // **改客户也要守叶子**：本端点是唯一能把装配件挪到非叶子客户上的入口，
+            // 与 `create_assembly_inner` 的建单闸门同一条（否则建单守得住、改单守不住）。
+            repo.fetch_customer_parent_id(cid)
                 .await
                 .map_err(AppError::from)?
-                .ok_or_else(|| AppError::biz(code::BIZ_CUSTOMER_NOT_FOUND, "customer 不存在"))?;
-            let _parent_id = parent.ok_or_else(|| {
-                AppError::biz(code::BIZ_ASSEMBLY_BAD_CUSTOMER, "customer_id 必须是 L2")
-            })?;
+                .ok_or_else(|| {
+                    AppError::biz(
+                        code::BIZ_CUSTOMER_NOT_FOUND,
+                        format!("customer {cid} 不存在"),
+                    )
+                })?;
+            repo.require_leaf_customer(cid).await?;
             Some(cid)
         } else {
             None
@@ -697,7 +689,7 @@ impl AssemblyService {
                 .map_err(AppError::from)?;
         }
 
-        Ok(render_assembly_out(asm))
+        assembly_out_with_path(repo, asm).await
     }
 
     // =======================================================================
@@ -788,7 +780,7 @@ impl AssemblyService {
             .await
             .map_err(AppError::from)?
             .ok_or_else(|| AppError::biz(code::BIZ_ASSEMBLY_NOT_FOUND, "assembly 不存在"))?;
-        Ok(render_assembly_out(asm))
+        assembly_out_with_path(repo, asm).await
     }
 
     // =======================================================================
@@ -886,18 +878,19 @@ impl AssemblyService {
             .map_err(AppError::from)?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "新建 part 查不到"))?;
 
-        // 7. customer_name + l1_customer_name 冗余
-        let (cn, l1cn) = repo
-            .lookup_customer_names(asm.customer_id)
-            .await
-            .map_err(AppError::from)?;
+        // 7. customer_name / l1_customer_name / customer_path 冗余（2026-10-17：
+        // 统一取自 `shared::customer::paths_of`，`l1` 恒为根）
+        let paths = repo.customer_paths_by_ids(&[asm.customer_id]).await?;
+        let cp = paths.get(&asm.customer_id);
 
         // 2026-09-27 review 第 1 轮修复：PartListItem 改显式列字段（不再 flatten
         // TPart），用 `From<TPart>` 派生基础字段；customer_name /
-        // l1_customer_name / location / holder_name 4 派生字段由 caller 注入。
+        // l1_customer_name / customer_path / location / holder_name 5 派生字段由
+        // caller 注入。
         let mut item: PartListItem = part_t.into();
-        item.customer_name = cn;
-        item.l1_customer_name = l1cn;
+        item.customer_name = cp.map(|p| p.own_name.clone());
+        item.l1_customer_name = cp.map(|p| p.root_name.clone());
+        item.customer_path = cp.map(|p| p.path.clone()).unwrap_or_default();
         // location / holder_name 默认 None（装配子件新建，无活跃批次）
         Ok(item)
     }

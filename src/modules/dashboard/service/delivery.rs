@@ -16,6 +16,7 @@ use crate::infra::clock::now_naive;
 use crate::modules::dashboard::dto::DeliveryBasis;
 use crate::modules::dashboard::repo::{DELIVERY_DETAIL_LIMIT, DashboardRepoTrait};
 use crate::modules::dashboard::vo::{DeliveryOrderDetailOut, UpcomingDeliveryBuckets};
+use crate::shared::error::AppError;
 
 /// 未来交付分桶默认天数（对齐前端 dashboard 视图横轴默认宽度）
 pub const DASHBOARD_DEFAULT_DAYS: i64 = 14;
@@ -59,7 +60,7 @@ impl super::DashboardService {
         date: NaiveDate,
         statuses: Vec<String>,
         basis: Option<DeliveryBasis>,
-    ) -> Result<DeliveryOrderDetailOut, sqlx::Error> {
+    ) -> Result<DeliveryOrderDetailOut, AppError> {
         let basis = basis.unwrap_or_default();
         let status_refs: Vec<&str> = statuses.iter().map(String::as_str).collect();
         repo.list_delivery_order_details(date, &status_refs, basis, DELIVERY_DETAIL_LIMIT)

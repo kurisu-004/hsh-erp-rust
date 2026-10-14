@@ -7,8 +7,7 @@
 //! ## 过滤谓词（三规则并集 + part 状态闸门，part 级去重）
 //! ```sql
 //! FROM t_part p
-//! LEFT JOIN t_customer c  ON c.id = p.customer_id          -- L2 叶子客户
-//! LEFT JOIN t_customer pc ON pc.id = c.parent_id           -- L1 一级集团
+//! LEFT JOIN t_customer c  ON c.id = p.customer_id          -- 叶子客户
 //! WHERE p.deleted_at IS NULL
 //!   AND p.status IN ('PENDING','IN_PROCESS','PROGRAMMING')  -- 三规则共用的状态闸门
 //!   AND (
@@ -92,18 +91,22 @@ use sqlx::{FromRow, PgConnection, Postgres, QueryBuilder};
 /// `prod::programming` ZST 静态方法容器。
 pub struct ProgrammingRepo;
 
-/// list / count 共用的 FROM 子句（客户 L1 / L2 两级 LEFT JOIN）。
+/// list / count 共用的 FROM 子句（客户一 LEFT JOIN）。
 ///
-/// 单独抽成常量而非各写一遍：`c.id = p.customer_id` / `pc.id = c.parent_id` 均走
-/// 主键 JOIN，不产生行放大，count 复用它同样安全。
+/// 单独抽成常量而非各写一遍：`c.id = p.customer_id` 走主键 JOIN，不产生行放大，
+/// count 复用它同样安全。
 ///
 /// ⚠️ 客户侧**故意不过滤 `deleted_at`**（2026-10-01 review 第 1 轮 F 项确认）：
 /// 与本文件其余 5 处严格软删过滤（`p` / `pb` / `pr` / `s` / `t_part_file`）的
 /// 差异是**有意的** —— 历史工单需要显示其原客户名（软删客户后工单仍在册，名字不能
 /// 变空）。若将来要改这一口径，须同步评估历史列表页的展示回归。
+///
+/// 2026-10-17：**删掉了第二个 `LEFT JOIN t_customer pc ON pc.id = c.parent_id`**
+/// （自连取「L1 一级集团名」）。`parent_id` 是**只上跳一层**的写法，客户树放开任意
+/// 深度后它拿到的是**中间层**名；根名与「第 2 层到叶子的路径」改由 service 层一次
+/// `shared::customer::paths_of` 产出（少一个 JOIN，count 也跟着少一次连接）。
 const FROM_SQL: &str = " FROM t_part p \
-     LEFT JOIN t_customer c  ON c.id = p.customer_id \
-     LEFT JOIN t_customer pc ON pc.id = c.parent_id";
+     LEFT JOIN t_customer c  ON c.id = p.customer_id";
 
 /// 「该 part 是否已上传 G_CODE」的单条 EXISTS 表达式（`has_cnc_program` 真相源）。
 ///
@@ -190,7 +193,7 @@ pub struct ProgrammingFilters<'a> {
 }
 
 impl ProgrammingRepo {
-    /// 待编程列表（part 级去重 + 客户 L1/L2 JOIN）。
+    /// 待编程列表（part 级去重 + 客户 JOIN；客户路径由 service 层 `paths_of` 补）。
     ///
     /// 返回 `Vec<ProgrammingRow>` —— service 内转换为 `vo::ProgrammingItemOut`。
     pub async fn list(
@@ -200,7 +203,7 @@ impl ProgrammingRepo {
         let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(format!(
             "SELECT p.id, p.version, p.serial_no, p.name, p.drawing_no, p.quantity, \
                     p.status, p.is_urgent, p.planned_delivery_date, p.system_delivery_date, \
-                    c.name AS customer_name, pc.name AS parent_customer_name, \
+                    c.name AS customer_name, p.customer_id AS customer_id, \
                     {G_CODE_EXISTS} AS has_cnc_program, \
                     pb_prog.batch_id AS batch_id, pb_prog.batch_version AS batch_version \
              {FROM_SQL}{PROGRAMMING_BATCH_JOIN}"
@@ -310,7 +313,12 @@ pub struct ProgrammingRow {
     pub planned_delivery_date: Option<NaiveDate>,
     pub system_delivery_date: Option<NaiveDate>,
     pub customer_name: Option<String>,
-    pub parent_customer_name: Option<String>,
+    /// `t_part.customer_id`：service 层 `paths_of` 的入参（补 `parent_customer_name`
+    /// 与 `customer_path`）。2026-10-17 新增，随「客户自连」删除一并补上。
+    pub customer_id: i64,
+    /// ⚠️ 行结构**不含** `parent_customer_name` / `customer_path`：两者都由 service 层
+    /// 的 `paths_of` 派生（`FromRow` 的字段必须在结果集里有同名列，故随客户自连
+    /// 一并从 SQL 侧删除）。
     pub has_cnc_program: bool,
     /// 2026-10-03 新增：PROGRAMMING 活跃批次 id（[`PROGRAMMING_BATCH_JOIN`] 投影，
     /// alias 必须同名）；无该状态批次 → `None`。

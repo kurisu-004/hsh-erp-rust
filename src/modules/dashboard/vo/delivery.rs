@@ -36,8 +36,17 @@ pub struct SystemDeliveryOrder {
     /// 侧天然只落 4 态）
     pub status: String,
     pub system_delivery_date: Option<String>,
-    /// 二级客户名
+    /// 本节点单段客户名
     pub customer_name: Option<String>,
+    /// 2026-10-17 新增（必填键、非 nullable）：第 2 层到叶子的 `" / "` 拼接路径，
+    /// **不含**根；客户行缺失（已软删 / 断链）时为空串。
+    ///
+    /// ⚠️ **部署顺序：后端必须先上** —— 前端
+    /// `views/dashboard/composables/dashboardSnapshotSchema.ts` 的
+    /// `systemDeliveryOrderSchema` 把它声明成必填键（`z.string().nullable()`），
+    /// 缺这个键 ⇒ `dashboardSnapshotSchema.parse` 抛 ⇒ **整个大屏空白**
+    /// （大屏 / HMI 屏常驻页面）。
+    pub customer_path: String,
     pub is_urgent: bool,
     /// 件级：已交**件数**（`t_part` 侧 `SUM(t_part_batch.quantity)`）；
     /// 装配件级：已交**套数**（min 公式，见 `shared::analytics::delivered::fetch_delivered_sets`）。
@@ -76,8 +85,13 @@ pub struct DeliveryOrderDetail {
     pub serial_no: Option<String>,
     pub drawing_no: String,
     pub name: String,
+    /// **根**（L1 集团）客户名 —— 任意深度树上恒为根，不是直接父
     pub l1_customer_name: Option<String>,
+    /// 本节点单段客户名
     pub customer_name: Option<String>,
+    /// 2026-10-17 新增（必填）：第 2 层到叶子的 `" / "` 路径（不含根）。
+    /// 与上面两个字段同源（`shared::customer::paths_of`）；客户行缺失时为空串。
+    pub customer_path: String,
     pub status: String,
     /// NOT NULL 列
     pub planned_delivery_date: String,

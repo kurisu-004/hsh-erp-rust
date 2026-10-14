@@ -633,12 +633,22 @@ async fn inspection_batches_filters_by_header_columns() {
     assert_eq!(body["code"], 40001, "应报 VALIDATION_ERROR: body={body}");
 }
 
-/// **VO 收口守门（2026-10-03）**：`items[*]` 的 key 集合必须**恰好** 13 个。
+/// **VO 收口守门（2026-10-03 建立；2026-10-17 由 13 改 14）**：`items[*]` 的 key
+/// 集合必须**恰好** 14 个。
 ///
-/// 前端待品检页按这 13 个字段建 Zod schema，VO 多投一个字段就是无用负载，
+/// 前端待品检页按这组字段建 Zod schema，VO 多投一个字段就是无用负载，
 /// 少投一个则前端渲染缺列 —— 故做「集合相等」断言（而非逐字段存在性）。
+///
+/// ⚠️ **2026-10-17 改因（客户树任意深度 Gate E）**：客户层级由固定两层放开为任意深度后，
+/// 「只看 `customer_name` + `l1_customer_name`」不足以还原客户的完整归属（旧口径的
+/// `l1_customer_name` 是 SQL 自连 `c.parent_id` 取到的**一层父名**，深树上就是中间层名），
+/// 故 VO 新增第 14 个键 `customer_path`（必填 `string`：第 2 层到叶子的 `" / "` 拼接、
+/// 不含根；取不到落空串）。
+/// ⇒ 旧断言「恰好 13 个」作废，新契约是 14 个；**白名单按名字新增，不删任何既有键**。
+/// ⚠️ 前端 `inspectionQueueItemSchema` 是 `.strict()`：这次新增会打到它的键集对账，
+/// 前端必须同步声明该键，否则待品检页整页抛 `unrecognized_keys`。
 #[tokio::test]
-async fn inspection_batches_item_keys_exactly_thirteen() {
+async fn inspection_batches_item_keys_exactly_fourteen() {
     let (pool, app, token, fx) = bootstrap_as_inspector().await;
     // 一条有系统交期 + 一条无（NULL 投影 case）
     let (_p1, b1) = insert_insp_batch_with_spec(
@@ -697,16 +707,17 @@ async fn inspection_batches_item_keys_exactly_thirteen() {
         "customer_id",
         "customer_name",
         "l1_customer_name",
+        "customer_path",
     ];
     expected.sort_unstable();
-    assert_eq!(expected.len(), 13, "白名单本身应是 13 个");
+    assert_eq!(expected.len(), 14, "白名单本身应是 14 个");
     for item in items {
         let obj = item.as_object().expect("item 应为 object");
         let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(
             keys, expected,
-            "item key 集合应恰好 13 个（多一个 / 少一个都失败）: body={body}"
+            "item key 集合应恰好 14 个（多一个 / 少一个都失败）: body={body}"
         );
     }
 

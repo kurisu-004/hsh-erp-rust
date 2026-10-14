@@ -33,17 +33,28 @@
    `seeds/rbac.sql` §5 回收 `t_role_menu` 残留，§4 授权基线不再声明该菜单。该菜单的目标页
    依赖的恰好是本轮删掉的 `GET /pickup-pending` / `POST /{id}/pickup-scan` ⇒ 前端必须
    同步删页（§8.3 第 16 行）。
-7. **`DeliveryNoteLineItem` 新增 `customer_id`**（L2 叶子 id，必填非空）：打印分组键由
-   `customer_name` 切到 id —— `t_customer.name` 非唯一，同名 L2 会被并进同一张 sheet。
+7. **`DeliveryNoteLineItem` 新增 `customer_id`**（叶子客户 id，必填非空）：打印分组键由
+   `customer_name` 切到 id —— `t_customer.name` 非唯一，同名客户会被并进同一张 sheet。
 
 ### 0.1 变更记录
+
+- **2026-10-17 客户树任意深度（本域第 7 轮改动）**：客户层级由固定两层放开为任意深度后，
+  本域改了 5 处 —— ① 分组成员由「L1 的直接子」放宽为「**任意后代**」，`ungrouped_customers`
+  同步改为「全部后代里未入组的」；② 扫码入口的 `l1_of` 由 `parent_id.unwrap_or(id)`
+  （**只上跳一层**）改为 `shared::customer::root_id_of`（向上递归走到根），同一集团下的不同
+  分厂不再被拆成两张送货单；③ `DeliveryNoteOut` / `DeliveryNoteLineItem` 的 `customer_path`
+  改为必填 `string` + 由两段手工拼接改为 `shared::customer::paths_of`（第 2 层到叶子、
+  不含根）；④ `line_items[].parent_customer_name` 改为「**根**」名；⑤ 扫码入单新增
+  「扫进来的零件 / 装配件必须挂**叶子**客户」闸门（20104）。
+  **不变**的：送货单的 `customer_id` 恒为 L1 根、送货分组的分组键恒为 L1 根
+  （判定键 / 编号前缀键 / 部分唯一索引都挂在根上）—— 见 §2.1 与 §8.3。
 
 - **2026-10-10 `applicant_name` 加装配件回落（§2.3.2）**：行项「申请人」改为
   **子件为空时回落所属装配件的 `t_assembly.applicant_name`**。存量数据里装配件向下
   继承申请人这条设计**大量未落地**（开发库实测 490 条子件中 360 条 `t_part.applicant_name`
   为空串，而 90 个 `t_assembly.applicant_name` 无一为空），直接读子件列会让这些行渲染成
   「—」。**只做读侧回落、不回填存量**（理由见 §2.3.2）。字段本身恒定存在、前端三处渲染点
-  已在读 ⇒ **前端零改动**（§8.3 前端配套表第 19 条）。同时把单张详情与批量详情两处
+  已在读 ⇒ **前端零改动**（§8.3 前端配套表第 21 条）。同时把单张详情与批量详情两处
   逐字重复的行项装配收进 `service/line_item.rs::build_line_item` 一个实现，口径只维护一处。
 - **2026-10-10 行项默认序改为「加入本单的次序」（§2.3.1）**：单据详情与批量详情的
   `line_items[]` 排序键从 `t_part_batch.id` 切成 `delivery_seq ASC NULLS LAST, id ASC`
@@ -93,12 +104,12 @@
 
 | # | 方法 | 路径 | 权限 | 入参 | 响应 `data` |
 |---|---|---|---|---|---|
-| 13 | GET | `/` | Mgr+Clerk+Insp+CncProg | `customer_id`（L1） | `DeliveryGroupListOut` |
+| 13 | GET | `/` | Mgr+Clerk+Insp+CncProg | `customer_id`（**L1 根**，必须 `parent_id IS NULL`） | `DeliveryGroupListOut` |
 | 14 | POST | `/` | Mgr+Clerk+**Insp** ★ | `CreateDeliveryGroupRequest` | `DeliveryGroupOut` |
 | 15 | POST | `/{id}/update` | Mgr+Clerk+**Insp** ★ | `UpdateDeliveryGroupRequest` | `DeliveryGroupOut` |
 | 16 | POST | `/{id}/soft-delete` | Mgr+Clerk+**Insp** ★ | `DeliveryGroupIdRequest` | `null` |
 
-★ 2026-10-08 加 `Inspector`：品检员在扫码入单页要能按 L2 归属分单，此前被卡在这一步。
+★ 2026-10-08 加 `Inspector`：品检员在扫码入单页要能按客户归属分单，此前被卡在这一步。
 
 ### 1.3 `/api/v2/com/delivery/drivers`（1 个）
 
@@ -140,12 +151,13 @@
 | 21404 | `BIZ_DELIVERY_NOTE_NOT_SUBMITTED` | `recall` / `pickup` 单据非 SUBMITTED | 400 |
 | **21405** | `BIZ_DELIVERY_NOTE_PART_NOT_READY` | ★ 入单唯一允许的批次状态是 `READY_TO_SHIP`：批次状态不符**且**该零件可入单量凑不出本次要的量（作用域见 §4.1）/ DP 不可行 / `sets > entry_max_sets`；`submit` 单上有非 `READY_TO_SHIP` 批次；`pickup` 单上有非 `READY_TO_SHIP` 批次 | 400 |
 | 21406 | `BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED` | 批次已被**其它**送货单占着（`reason` 两种字面量：「活跃单，货还在这张单上」/「已领取/已归档单，货已随该单送出，不可再次入单」）**且该零件可入单量凑不出本次要的量**（作用域与 `reason` 映射见 §4.1）；汇总处与 21405 二选一：失败 part 里有占用明细 ⇒ 21406，否则 21405 | 409 |
-| **21407** | `BIZ_DELIVERY_NOTE_PARTS_MULTIPLE_CUSTOMERS` | 零件的 L1 客户 ≠ 单据 L1 客户（同一请求混入别的 L1 的零件） | 400 |
+| **21407** | `BIZ_DELIVERY_NOTE_PARTS_MULTIPLE_CUSTOMERS` | 零件所属客户的**根** ≠ 单据的根（同一请求混入别的集团的零件） | 400 |
+| **20104** | `BIZ_INVALID_VALUE` | 扫进来的零件 / 装配件挂在**非叶子**客户上（业务单据只能挂叶子，2026-10-17 新增） | 400 |
 | 21409 | `BIZ_DELIVERY_NOTE_DRIVER_INVALID` | `validate_driver` 5 条任一不过；`pickup` 单据未指定司机 | 400 |
 | 21411 | `BIZ_DELIVERY_NOTE_INVALID_VALUE` | 空单提交 / 空单领取 | 400 |
 | 21413 | `BIZ_DELIVERY_GROUP_NOT_FOUND` | `/group` 端点分组不存在 / 已软删 | 404 |
 | 21414 | `BIZ_DELIVERY_GROUP_DUPLICATE_NAME` | 同 L1 下分组重名 | 409 |
-| 21415 | `BIZ_DELIVERY_GROUP_MEMBER_CONFLICT` | L2 已属于其它活跃分组 | 409 |
+| 21415 | `BIZ_DELIVERY_GROUP_MEMBER_CONFLICT` | 该客户已属于其它活跃分组 | 409 |
 | 21417 | `BIZ_DELIVERY_SCAN_UNKNOWN_CODE` | `POST /scan` 的 `serial_no` 两表皆未命中 | 404 |
 | 21419 | `BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT` | `recall` 时该 L1 已有另一张 DRAFT | 409 |
 | 21421 | `BIZ_DELIVERY_BATCH_STATE_INVALID` | `submit` 时单上批次被旁路改成 `READY_TO_SHIP` 之外的状态 | 400 |
@@ -175,9 +187,9 @@ BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY`、`21420 BIZ_DELIVERY_NOTE_LOCKED_PART`
 | `id` | string | `t_delivery_note.id` |
 | `version` | number | `t_delivery_note.version`（**OCC 锚**，前端回传） |
 | `delivery_note_no` | string | `t_delivery_note.delivery_note_no`（`DN-YYYYMMDD-NNNN`） |
-| `customer_id` | string | `t_delivery_note.customer_id`（**L1** id） |
-| `customer_name` | string \| null | `CustomerRepo::list_by_ids` → `t_customer.name`（取不到 null） |
-| `customer_path` | string \| null | `build_note_outs` 内存派生：`"{L1} / {L2}"`，L1 自指时只给 L1 名 |
+| `customer_id` | string | `t_delivery_note.customer_id`（**恒为 L1 根** id，见 §0.1） |
+| `customer_name` | string \| null | `shared::customer::paths_of` → `t_customer.name`（取不到 null） |
+| `customer_path` | string | 第 2 层到叶子的 `" / "` 拼接（**不含**根）。⚠️ **2026-10-17 由 `string \| null` 收紧为必填 `string`**：落**空串**的情形**只**是「终点行不存在 / 已软删」（消费侧 `paths.get()` 落空的兜底）；成环 / 超深度时 map 里仍有该项、给出的是**截断路径**（见 `customers.md` §2.2）。送货单恒挂在根上，故本字段恒等于根自己的名字 |
 | `status` | string | `t_delivery_note.status`（4 态，见 §5） |
 | `submitted_at` | string \| null | `t_delivery_note.submitted_at` |
 | `picked_up_at` | string \| null | `t_delivery_note.picked_up_at` |
@@ -211,10 +223,10 @@ BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY`、`21420 BIZ_DELIVERY_NOTE_LOCKED_PART`
 | `system_delivery_date` | string \| null | `t_part.system_delivery_date` |
 | `order_no` | string \| null | `t_part.order_no` |
 | `note` | string \| null | `t_part.note` |
-| `customer_name` | string \| null | 零件所属 L2 客户名 |
-| `parent_customer_name` | string \| null | L2 客户的父客户名（取不到回落 L2 名） |
-| `customer_path` | string \| null | `"{L1} / {L2}"`，L1 自指时只给 L2 名 |
-| `customer_id` | string ★ | `t_part.customer_id`（**L2 叶子 id**，必填非空）。打印分组按它查 `t_delivery_group_member` 定位分组；**不得改用 `customer_name` 匹配**（`t_customer.name` 只有非唯一 btree 索引，同名 L2 会被并进同一张 sheet） |
+| `customer_name` | string \| null | 零件所属客户名（自身单段名） |
+| `parent_customer_name` | string \| null | **根**（L1 集团）名 —— 2026-10-17 起不再是「直接父」（旧形是零件客户的直接父，深树上会退化成中间层） |
+| `customer_path` | string | 第 2 层到叶子的 `" / "` 拼接（**不含**根）。⚠️ **2026-10-17 由 `string \| null` 收紧为必填 `string`** + 由「两段手工拼接」改为 `shared::customer::paths_of`（旧形 `format!("{父名} / {自身名}")` 在三层以上的树上必然只给两段）；落**空串**只发生在「终点行不存在 / 已软删」，成环 / 超深度时给的是**截断路径**（见 `customers.md` §2.2） |
+| `customer_id` | string ★ | `t_part.customer_id`（**叶子客户 id**，必填非空）。打印分组按它查 `t_delivery_group_member` 定位分组；**不得改用 `customer_name` 匹配**（`t_customer.name` 只有非唯一 btree 索引，同名客户会被并进同一张 sheet） |
 | `assembly_id` | string \| null | `t_part.assembly_id`（散件 null） |
 | `assembly_serial_no` | string \| null | `AssemblyRepo::list_by_ids(include_deleted=false)` |
 | `assembly_drawing_no` | string \| null | 同上 |
@@ -298,7 +310,13 @@ DeliveryNoteDetailOut[] }`（按入参 `ids` 顺序，缺失 id 静默跳过）�
 | `version` | number | `t_delivery_group.version`（OCC 锚） |
 
 列表出参 `{ groups: DeliveryGroupOut[], ungrouped_customers: { id, name }[] }`
-（`ungrouped_customers` = 该 L1 名下**未入任何活跃分组**的 L2 客户）。
+（`ungrouped_customers` = 该 L1 根名下**未入任何活跃分组**的客户）。
+
+⚠️ **2026-10-17 语义变更（分组成员 / 候选集）**：旧口径是「成员必须是 L1 的**直接子**」（`customer.parent_id == l1_id`）与「`ungrouped_customers` = L1 的直接子里未入组的」，那是**两层树**下的等价写法。客户树放开任意深度后：
+- 成员必须是该根的**任意后代**（`shared::customer::subtree_ids` 判包含，一次往返、不 N+1）；
+- `ungrouped_customers` = 该根的**全部后代**里未入组的（不再只列直接子）；
+- ⚠️ 成员**可以**是中间层（分组只是「同一集团下的客户按送货批次分单」，不是「挂载点」）；真正能进单的客户由零件侧的叶子闸门保证。
+- 「L1 必须是根」这条**不变**（分组键就是根）。
 
 ### 2.6 `DeliveryDriverOption`（3 字段）/ `DeliveryDriverListOut`
 
@@ -316,7 +334,7 @@ DeliveryNoteDetailOut[] }`（按入参 `ids` 顺序，缺失 id 静默跳过）�
 DeliveryScanTreeOut
 ├─ hit_kind: string                       "ASSEMBLY" | "PART"
 ├─ scanned_serial_no: string              trim 后的回显
-├─ draft: DeliveryScanDraftOut | null     ★ 该 L1 现有的 DRAFT（无则 null，本端点绝不建单）
+├─ draft: DeliveryScanDraftOut | null     ★ 该**根**现有的 DRAFT（无则 null，本端点绝不建单）
 ├─ assembly: DeliveryScanAssemblyOut | null
 └─ children: Vec<DeliveryScanPartOut>     装配件树 = 全部子件；独立件树 = [该件]
    └─ children: Vec<DeliveryScanBatchOut>
@@ -344,7 +362,7 @@ DeliveryScanTreeOut
 | `is_urgent` | bool | `t_assembly.is_urgent` |
 | `system_delivery_date` | string \| null | `t_assembly.system_delivery_date` |
 | `customer_name` | string \| null | `LEFT JOIN t_customer`（软删客户 → null） |
-| `customer_id` | string ★ | `t_assembly.customer_id`（L2） |
+| `customer_id` | string ★ | `t_assembly.customer_id`（业务单据恒挂**叶子**客户） |
 | `entry_max_sets` | number ★ | §4.2 公式，分子 = 子件的**可入单**批次 |
 | `per_set_parts` | array ★ | `[{ part_id: string, per_set_quantity: number }]`，装配序沿用 `list_parts_by_assembly` 的源序 `serial_no ASC NULLS LAST, id ASC` |
 
@@ -365,7 +383,7 @@ DeliveryScanTreeOut
 | `system_delivery_date` | string \| null | `t_part.system_delivery_date` |
 | `customer_name` | string \| null | `LEFT JOIN t_customer` |
 | `version` | number | `t_part.version` —— **仅展示**（写动作的 OCC 锚是批次 version） |
-| `customer_id` | string ★ | `t_part.customer_id`（L2） |
+| `customer_id` | string ★ | `t_part.customer_id`（业务单据恒挂**叶子**客户） |
 | `entry_max_quantity` | number ★ | §4.1「可入单件数」 |
 | `children` | array | `DeliveryScanBatchOut[]`，`batch_no ASC, id ASC` |
 
@@ -570,7 +588,7 @@ entry_max_sets(a) = LEAST( MIN( per_set(c) for c ∈ a 的**全部**未软删子
 
 - 「同一天」只是描述**默认行为**（新建时 `delivery_date` 默认 `today.date()`），**不是筛选
   条件** —— 日期是可编辑字段，用户改到明天后继续扫码应该加到同一张单。
-- 一个 L1 同时只允许一张 DRAFT ⇒ `recall` 时若已有另一张 DRAFT，返回 `21419`（`recall` 的
+- 一个**根**（L1）同时只允许一张 DRAFT ⇒ `recall` 时若已有另一张 DRAFT，返回 `21419`（`recall` 的
   `UPDATE` 会撞唯一索引，故前置用业务码拒，给出可读原因）。
 - `recall` 的冲突判据不需要「排除自己」：被 recall 的单当前是 `SUBMITTED`，不可能被这条查询
   命中。
@@ -705,7 +723,7 @@ schema 与页面都在用」。
 | `t_part` | 零件 / 装配件子件（扫码树、入单、详情行项） |
 | `t_assembly` | 装配件（扫码树节点、套装数分子） |
 | `t_part_batch` | 批次（入单分配、拆批、挂单、扫码树批次层）；`delivery_seq` 列承载行项默认序（§2.3.1），本域是它的**全部写点**（挂单赋值 / 摘单与单据软删置 NULL） |
-| `t_customer` | L1 / L2 客户（`customer_path`、`L1_id` 推导、成员名） |
+| `t_customer` | 客户树（`customer_path` / 根名派生、分组成员与候选集、扫码入口由零件客户**上溯到根**）—— 2026-10-17 起全部走 `shared::customer::{paths_of, subtree_ids, root_id_of}` |
 | `t_worker` | 指定司机（`driver_worker_name`、`GET /drivers`） |
 | `t_work_type` | 工种（`送货司机` 判据） |
 | `t_shelf` · `t_process` · `t_outsource_company` | 扫码树批次层的 **3 张 `LEFT JOIN` 展示用附表**（holder 名 / 工序名）；**刻意不加软删闸门**，与 `prod::batch::repo` 既有写法一致 |
@@ -750,10 +768,12 @@ schema 与页面都在用」。
 | 14 | 分组权限 | `/group` 的 3 个写端点现在也接受 Inspector 角色（前端 `canEditGroup` 的角色白名单要加 Inspector） |
 | 15 | VO 字段裁剪 | 从 Zod schema 里删 §6.2 的 29 个字段（多余字段若非 `.strict()` 会静默通过，删 schema 才是真删） |
 | 16 | **删 `delivery_dispatch` 菜单页** | ⛔ 后端已下线该菜单（`seeds/menu.sql` §3.5 软删菜单 + `seeds/rbac.sql` §5 清理其授权残留），而前端 `src/views/delivery-dispatch/DispatchNoteList.vue` 仍在。**该页依赖的恰好是本轮删掉的两条端点**（`GET /pickup-pending` / `POST /{id}/pickup-scan`）⇒ 不删就是「菜单能点、页面能开、每个请求都 404」的活条目。后端无 alias，这是前端必须同步删的一页 |
-| 17 | `line_items[].customer_id` | ★ `DeliveryNoteLineItem` **新增** `customer_id: string`（L2 叶子 id，必填非空）。打印分组键从 `customer_name` 切成 `customer_id`：`t_customer.name` 只有**非唯一** btree 索引，同名 L2 会被并进同一张 sheet，而打印产物是客户签字的收货凭证。Zod schema 里加必填 `customer_id: z.string()` |
-| 18 | `line_items[].delivery_seq` | ★ `DeliveryNoteLineItem` **新增** `delivery_seq: number \| null`（**加入本单的次序**，口径见 §2.3.1）。数组顺序已由后端按它排好，前端**零改动即得「按扫码先后」的展示**；Zod schema 里加 `delivery_seq: z.number().nullable()`，供页面按需展示序号列 |
-| 19 | `applicant_name` 回落 | **零改动**（2026-10-10，§2.3.2）。字段名 / 类型 / 可空性都没动，只是「装配件子件自身为空时改用父装配件的值」。前端三处渲染点（详情列表列定义、标签 xlsx 工作簿、送货单打印模板）本就在读它 ⇒ 部署后立即见效，**不需要改 schema、不需要改列定义、不需要改模板** |
-| 20 | 三条读的权限点（2026-10-15） | `GET /`（列表）、`GET /{id}`（详情）、`GET /batch-detail` 统一走权限点 `delivery_note.view`（矩阵 Mgr+Clerk+Insp）。⚠️ 列表自原 `Mgr+Clerk+Insp+CncProg` **收紧去 `CncProgrammer`**（用户定稿）—— 对 CNC 账号列表入口应改按 `hasPermission('delivery_note.view')` 显隐；详情与 batch-detail 原零守卫、本轮补闸。存量会话部署窗口见 `iam.md` §9.2 注记 |
+| 17 | `line_items[].customer_id` | ★ `DeliveryNoteLineItem` **新增** `customer_id: string`（叶子客户 id，必填非空）。打印分组键从 `customer_name` 切成 `customer_id`：`t_customer.name` 只有**非唯一** btree 索引，同名客户会被并进同一张 sheet，而打印产物是客户签字的收货凭证。Zod schema 里加必填 `customer_id: z.string()` |
+| 18 | `customer_path` 的类型收紧 | ★ 2026-10-17：`DeliveryNoteOut.customer_path` 与 `DeliveryNoteLineItem.customer_path` 由 `string \| null` 改为**必填 `string`**（取不到落空串）。前端现有 schema 声明的是 `z.string().nullable()`，**收得下 `""`，无需改动** |
+| 19 | `line_items[].customer_path` 的值口径 | ★ 2026-10-17：由「`{直接父名} / {自身名}`」两段拼接改为「第 2 层到叶子的 `" / "` 拼接（不含根）」；`line_items[].parent_customer_name` 由「直接父名」改为「**根**名」。两层树上两者逐字相同，深树上才看得出差别 |
+| 20 | `line_items[].delivery_seq` | ★ `DeliveryNoteLineItem` **新增** `delivery_seq: number \| null`（**加入本单的次序**，口径见 §2.3.1）。数组顺序已由后端按它排好，前端**零改动即得「按扫码先后」的展示**；Zod schema 里加 `delivery_seq: z.number().nullable()`，供页面按需展示序号列 |
+| 21 | `applicant_name` 回落 | **零改动**（2026-10-10，§2.3.2）。字段名 / 类型 / 可空性都没动，只是「装配件子件自身为空时改用父装配件的值」。前端三处渲染点（详情列表列定义、标签 xlsx 工作簿、送货单打印模板）本就在读它 ⇒ 部署后立即见效，**不需要改 schema、不需要改列定义、不需要改模板** |
+| 22 | 三条读的权限点（2026-10-15） | `GET /`（列表）、`GET /{id}`（详情）、`GET /batch-detail` 统一走权限点 `delivery_note.view`（矩阵 Mgr+Clerk+Insp）。⚠️ 列表自原 `Mgr+Clerk+Insp+CncProg` **收紧去 `CncProgrammer`**（用户定稿）—— 对 CNC 账号列表入口应改按 `hasPermission('delivery_note.view')` 显隐；详情与 batch-detail 原零守卫、本轮补闸。存量会话部署窗口见 `iam.md` §9.2 注记 |
 
 ### 8.4 已知偏差登记
 
