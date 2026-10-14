@@ -196,6 +196,8 @@ pub fn batch_location_label(location: Option<&str>, holder_name: Option<&str>) -
 /// （写侧 `service::validate_save_request` 与读侧 `service::normalize_row` 都走它）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VisibleColumn {
+    /// 序列号。工单行取工单自己的；**批次子行取子件的**（装配件支）或留空
+    /// （散件支，见 `repo::DigestBatchRow::part_serial_no`）。2026-10-16 起子行也填这一列。
     SerialNo,
     DrawingNo,
     Name,

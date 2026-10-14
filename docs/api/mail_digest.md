@@ -33,6 +33,15 @@
 > 11 → 13 项）、§2.4（批次子行逐字段）、§4.4（工单-批次行结构）、§4.5（位置口径）、
 > §4.6（列对齐与打印）、§4.7（取数恒 ≤ 3 条语句）、§5（状态中文与三副本同步）、§6（拆掉
 > dashboard `DELIVERY_STATUSES` 共用）、§8.1（读 / 写的表清单）、§8.2（前端**零改动**）。
+>
+> ⚠️ **2026-10-16 第三轮：批次格只写纯数字 + 子行序列号填子件序列号**。用户需求（原文）
+> 「批次栏只写 1、2、3 这样的数字。对于装配件要写出每个子零件的序列号，否则不知道哪个批次
+> 是哪个子零件的」。**不新增列** —— 子件标识填在现有「序列号」列的子行上，子行由「只填
+> 4 列」变「只填 5 列」。落在 §2.3（`batch_no` / `serial_no` 两行的来源列）、§2.4
+> （新增 `part_serial_no`）、§4.4（子行填列与子件序列号口径）、§4.6（打印区分信号
+> 由「文案 + 缩进」缩成「缩进」）、§4.8（回归用例清单）、§8.1（`t_part` 多一处读点）、
+> §8.3「本域设计上的已知取舍」第 12 条。⚠️ **子件 `serial_no` 为空就留空、绝不回退
+> 到图号**；装配件**追加**的子件 `serial_no` 恒 NULL ⇒ 那类子件的格子必然是空的。
 
 ## 1. 端点表
 
@@ -117,10 +126,10 @@
 
 | key | 中文表头 | 来源列 | 只在批次子行有值 |
 |---|---|---|---|
-| `serial_no` | 序列号 | `t_part.serial_no` / `t_assembly.serial_no`（可空 ⇒ 空串） | — |
+| `serial_no` | 序列号 | `t_part.serial_no` / `t_assembly.serial_no`（可空 ⇒ 空串）。⚠️ **批次子行也填这一列**（装配件支取**子件**的序列号、散件支恒空，见 §2.4）⇒ 本列不是「只对工单行有值」 | — |
 | `drawing_no` | 图号 | 同名列 | — |
 | `name` | 名称 | 同名列 | — |
-| `batch_no` | 批次 | `t_part_batch.batch_no`，渲染成 `　第 N 批`（**2026-10-16 新增**） | ✅ |
+| `batch_no` | 批次 | `t_part_batch.batch_no`，**按子件各自从 1 起**（见 §4.4 末条），渲染成**纯数字** + 一个全角空格缩进（**2026-10-16 新增**；同轮起去掉「第…批」前缀） | ✅ |
 | `quantity` | 数量 | `t_part.quantity` / `t_assembly.quantity`；**装配件行单位是「套」**，渲染成 `12 套`。批次子行渲批次自身件数、**不带「套」后缀** | — |
 | `customer_name` | 客户 | `LEFT JOIN t_customer.name`，`ON` 里**刻意不加**软删闸门 ⇒ **软删客户名字照常带出**；只有客户行不存在（`customer_id` 悬空）才为空（取舍见 §8.1） | — |
 | `status` | 状态 | 工单行 = `t_part/t_assembly.status` 查表（§5）；批次子行 = `t_part_batch.status` 查表，`is_repairing = true` 时恒「返修中」 | — |
@@ -166,7 +175,8 @@
 
 | 字段 | 类型 | 取值 / 来源 |
 |---|---|---|
-| `batch_no` | number | `t_part_batch.batch_no`（工单内序号，1 起） |
+| `batch_no` | number | `t_part_batch.batch_no`（**该子件（`t_part`）内**序号，1 起 —— ⚠️ 一个装配件下多个子件**各自**从 1 起、跨子件**会撞号**，见 §4.4）；渲染成**纯数字** + 全角空格缩进 |
+| `part_serial_no` | string \| null | 批次所属**子件**的 `t_part.serial_no`，填在子行的「序列号」列上。⚠️ **两支取法不同**：`ASSEMBLY` 支取子件行 `c.serial_no`（可空）；`PART` 支恒 `None` —— 那一支的批次就是工单自己那个零件，序列号已写在工单行上，子行重复写是冗余（见 §4.4） |
 | `quantity` | number | `t_part_batch.quantity`（**件数**，不带「套」） |
 | `status` | string | `t_part_batch.status`（`PartStatus` 字面量）⇒ 渲染时查表转中文；`is_repairing = true` ⇒ 恒「返修中」 |
 | `is_repairing` | bool | `t_part_batch.is_repairing`（`REPAIRING` 状态码于 2026-10-01 删除后由该布尔承载） |
@@ -180,6 +190,8 @@
 
 ⚠️ **装配件的批次挂在子件上**：`t_part_batch.part_id → t_part.id`，子件的
 `t_part.assembly_id` 指向装配件 ⇒ 子件本身不单独成行，它的批次归到装配件行下面。
+⚠️ 由此子行的序列号格必须写**子件**的序列号（`part_serial_no`）而不是装配件的 ——
+一个装配件行下面挂着多个子件的批次，只看批次号分不清「这一批是哪个子件的」。
 
 ⚠️ **本结构不出现在任何 HTTP 出参里**：`/preview` 与 `/send` 返的仍是 §2.5 的
 `{ subject, html, overdue_count, upcoming_count, columns }`，批次信息**只存在于
@@ -335,9 +347,29 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
 
 - **子行紧跟工单行**，不是集中排在表尾：渲染时对每个工单行先打它自己、再打它的批次
   （`template::push_row_with_batches`）。若按工单渲完再统一渲批次，读者无从对应。
-- **子行只填 4 列**：`批次` / `数量` / `状态` / `位置`。其余（序列号 / 图号 / 名称 /
+- **子行只填 5 列**：`序列号` / `批次` / `数量` / `状态` / `位置`。其余（图号 / 名称 /
   客户 / 交期 / 剩余天数 / 工单类型 / 是否紧急 / 订单号）**留空** —— 那些是工单级属性，
   填在子行上会让人以为这批件的交期与工单不同。
+- ⚠️ **序列号列在子行上是「这一批属于哪个子件」**（2026-10-16，用户原话：「对于装配件要
+  写出每个子零件的序列号，否则不知道哪个批次是哪个子零件的」）：装配件支取子件的
+  `t_part.serial_no`；**散件工单的批次恒空** —— 那一支的批次就是工单自己那个零件，
+  序列号已经写在工单行上，子行再写一遍是纯冗余。
+  ⚠️ **子件序列号缺失就留空、绝不回退到图号**：图号是「图号」列的内容，在序列号列
+  重复它会让这一列的语义漂成「零件标识」。**装配件追加的子件 `serial_no` 恒 NULL**
+  （补件语义不重新打开序列号派发通道，出处是 `assembly::service::crud::
+  add_assembly_child_inner` 的 doc）⇒ 那一类子件的序列号格是空的，这是表结构事实、
+  不是取数漏了。回归：`template.rs::tests::assembly_child_without_serial_no_leaves_cell_blank`
+  与 `tests/mail_digest/batches.rs::preview_shows_each_assembly_childs_serial_no_on_its_batch_row`。
+- **批次格只写纯数字**（`1` / `2` / `3`，2026-10-16 起去掉「第…批」前缀），该格另加**一个
+  全角空格**缩进 —— 与淡底一起承担「这是一行子行」的信号（打印丢色时缩进仍在）。
+  ⚠️ 带缩进的是**批次格**、不是子行的**首格**：`DEFAULT_SET` 的列序是
+  `serial_no, drawing_no, name, batch_no, …` ⇒ 批次格是**第 4 格**；而子行首格在勾了序列号
+  列时装配件子件序列号（散件恒空），离「这是一行子行」的视觉信号最远。
+  ⚠️ **去掉前缀之后，测试里不能再用 `html.contains("　1")` 判批次格在不在**：
+  `　1` 是 `　10` / `　11` 的**子串** ⇒ 批次数 ≥ 10 的场景下这类断言假绿（既有
+  `第1批` 没有这个歧义 —— 前缀里那个「第」帮它挡掉了）。断言一律用整格形态 `>　1<`
+  （`template.rs` 的 `has_batch_cell` / `lacks_batch_cell` 与
+  `tests/mail_digest/batches.rs` 的 `has_batch_cell` 三个 helper 同款）。
 - **一个批次都没有的工单不渲子行**（子行是「这个工单名下有批次」的证据，空子行是噪声）。
 - **行单位仍是工单级**：子行不计入 `overdue_count` / `upcoming_count`，也不参与任何
   统计（节的「N 条」是工单数）。
@@ -348,8 +380,17 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
   实际只对 `CANCELLED` 这类**非交割终态**批次有意义（照列）。
   ⚠️ **别把本条读成「已交的那几批也会跟在工单行下面列出来」—— 那个状态不可达**。
   回归：`tests/mail_digest/batches.rs::mixed_delivered_and_open_batches_follow_the_opposite_two_rules`。
-- **批次序**：`ORDER BY owner_type, owner_id, batch_no`，Rust 侧分组时按到达顺序
+- **批次序**：`ORDER BY owner_type, owner_id, batch_no, id`，Rust 侧分组时按到达顺序
   push，渲染层**不**二次排序（与工单行同一约定）。
+  ⚠️ **`batch_no` 是每个 `part_id` 各自从 1 起，不是「装配件内」的序号、也不是「这封信
+  里」的序号**（2026-10-16 登记）：唯一键是 `uq_t_part_batch_part_no (part_id, batch_no)`
+  （`part_id` = **子件**）、装配件建档时逐个子件各建一条 `batch_no = 1`
+  （`assembly::repo::create_initial_part_batch`）、拆批走
+  `SELECT COALESCE(MAX(batch_no),0)+1 … WHERE part_id = $1`（`prod::batch::repo::queries`）
+  ⇒ **一个装配件下 N 个子件各 1 批时，N 行都渲成 `　1`**。**子件之间没有先后口径**，
+  别把子行读成「同一个装配件的第 1/2/3 批」。末尾的 `id ASC` 只是让结果**可复现**
+  （同一份数据每次渲染同序），**不**构成子件间的语义顺序 —— 认哪个子件靠**序列号格**
+  （上一条），不靠行的先后。
 
 ### 4.5 位置列的口径（2026-10-16 新增）
 
@@ -397,7 +438,7 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
   丢弃，故所有有底色的单元格额外内联 `print-color-adjust:exact;
   -webkit-print-color-adjust:exact`（两个前缀都写：旧 WebKit 只认 `-webkit-`）。
 - **批次子行的区分不只靠颜色**：淡灰底（`bgcolor` 属性 + `background-color` 两处都写）
-  之外，还有**「第 N 批」文案**与**首格全角空格缩进** —— 打印时底色整片丢掉，子行与
+  之外，还有**批次格的全角空格缩进**（批次格只写纯数字）—— 打印时底色整片丢掉，子行与
   工单行仍分得开。
 - **不用 `float` / `position`**：两者在邮件与打印路径里都会产生不可预期的漂移。
 - 组标题行的 `colspan` 取**真实列数**（13 列全开时是 `colspan="13"`，不是 `"*"`）。
@@ -478,9 +519,13 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
    `colspan="13"`**。
 - **批次子行的渲染**：结构见 §4.4、位置文案见 §4.5、列宽与打印见 §4.6。回归：
   `template.rs::tests::batch_sub_rows_follow_their_own_order_row` /
-  `batch_sub_row_fills_only_four_columns` / `print_attributes_present_and_no_style_block` /
+  `batch_sub_row_fills_only_five_columns` /
+  `assembly_child_batch_renders_its_serial_no` /
+  `assembly_child_without_serial_no_leaves_cell_blank` /
+  `print_attributes_present_and_no_style_block` /
   `colgroup_widths_sum_to_one_hundred` / `colspan_matches_column_count_with_all_columns` /
-  `header_row_shares_table_with_colgroup`。
+  `header_row_shares_table_with_colgroup`；端到端那条在
+  `tests/mail_digest/batches.rs::preview_shows_each_assembly_childs_serial_no_on_its_batch_row`。
 
 ## 5. 状态域约定（无编译期保障）
 
@@ -571,7 +616,7 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
 | 配置单例（读 + 写） | `t_mail_digest_config` | **owned**（`T*` 全列投影在 `model.rs`；**2026-10-16 新增 `sender_account_id` 一列**，无物理外键） |
 | 发信通道（读一行 + 解密） | `t_mail_account` | **只读**（跨域，`scheduled_task` 域 owned；`service::resolve_sender`） |
 | 发送流水（只增） | `t_mail_digest_log` | **owned**（刻意无 `deleted_at` / `version`） |
-| 工单与系统交期 | `t_part` | 只读聚合（跨域） |
+| 工单与系统交期 | `t_part` | 只读聚合（跨域）。⚠️ **2026-10-16 起多一处读点**：`repo::list_batches` 的装配件支经它取子件的 `serial_no`（批次子行的序列号格，§4.4）；散件支不读该列（恒 `NULL`） |
 | 装配件与系统交期 | `t_assembly` | 只读聚合（跨域） |
 | 已交量守卫 + **批次子行** | `t_part_batch` | 只读聚合（跨域）。⚠️ 2026-10-16 起**不再只是 `NOT EXISTS` 的存在性检查**，而是批次行的主表（`batch_no` / `quantity` / `status` / `is_repairing` / `location` / `current_holder_id` 六列） |
 | 客户名 | `t_customer` | `LEFT JOIN`，**刻意不加** `AND c.deleted_at IS NULL` ⇒ **软删客户的名字照常带出**。取舍是「客户名以 `id` 为准、不受软删影响」（闸门放 `ON` 里本来也只会清空名字、不会剔除工单行，所以「不该剔除工单」**不是**这里的理由）；本列为空只因**客户行不存在**（`customer_id` 悬空）。与 dashboard 域同款 |
@@ -628,8 +673,8 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
 | 组名 | 覆盖 |
 |---|---|
 | 「依赖库版本相关的实测结论」 | 1–4 |
-| 「本域设计上的已知取舍」 | 1–11（⚠️ 2026-10-16 新增第 9–11 条：迁移回填 / N+1 护栏局限 / 勾掉整列就没了） |
-| 「实现与注释不符」 | 1–6（改实现前先改文档或先改测试；第 5 条已修） |
+| 「本域设计上的已知取舍」 | 1–12（⚠️ 2026-10-16 新增第 9–11 条：迁移回填 / N+1 护栏局限 / 勾掉整列就没了；第 12 条：追加子件 `serial_no` 恒 NULL） |
+| 「实现与注释不符」 | 1–7（改实现前先改文档或先改测试；第 5 条已修；⚠️ 2026-10-16 新增第 7 条：迁移 `batch_no` 列注释已过期） |
 | 「覆盖空洞」 | 1–3（⚠️ 2026-10-16 新增第 3 条：SMTP 层失败造法换过一次） |
 | 「与任务书的差异」 | 1–4（⚠️ 2026-10-16 新增第 3–4 条：需求第 5 条不做 / 多一列 `batch_no`） |
 
@@ -729,11 +774,26 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
     管理员勾掉 `location` 时批次的位置信息在正文里没有任何出口。⚠️ 这是列白名单的固有
     行为、不是缺陷 —— 不要为此在渲染层加「无视白名单的强制列」（那会让「可勾选」这个
     承诺失效）。回归：`template.rs::tests::dropping_batch_column_removes_batch_number_only`。
+12. ⚠️ **装配件追加的子件 `serial_no` 恒 NULL ⇒ 那类子件的批次子行序列号格为空**
+    （2026-10-16）：批次子行的序列号列（§4.4）取子件的 `t_part.serial_no`，而**补件**
+    语义不重新打开序列号派发通道（新子件 `serial_no = NULL`，出处是
+    `assembly::service::crud::add_assembly_child_inner` 的 doc）⇒ 这不是取数漏了，是
+    表结构事实。**刻意不回退到图号**：图号是「图号」列的内容，在序列号列重复它会让
+    这一列的语义漂成「零件标识」。同时**散件工单的批次子行序列号格恒空**（那一列已在
+    工单行上），也是刻意形态而非缺省遗漏。回归：
+    `template.rs::tests::assembly_child_without_serial_no_leaves_cell_blank` +
+    `tests/mail_digest/batches.rs::preview_renders_all_batches_of_every_order_row`
+    （⚠️ **散件那条必须在集成层守**：两条 lib 用例直接构造 `DigestBatchRow`、fixture
+    把 `part_serial_no` 硬编码成 `None`，与 SQL 无关；而集成用例里若 fixture 的序列号
+    本来就是 NULL，把 PART 支改回 `p.serial_no` 也照样渲出空格子、断言零信号 ⇒
+    fixture 必须派了序列号才有判别力）。
 
-**实现与注释/直觉不符的六处（测试已把实际行为钉死，改实现前先改文档或先改测试）：**
+**实现与注释/直觉不符的七处（测试已把实际行为钉死，改实现前先改文档或先改测试）：**
 **（2026-10-13 review 第 1 轮扩到五条：新增第 5 条是 M5「节开关不作用于正文」，
 该项已在该轮修掉，保留在登记里是为了说明「这条曾经是偏差」以及防回归；
-2026-10-16 增到六条：新增第 6 条是迁移里的 `enabled` 列注释已过期。）**
+2026-10-16 增到七处：新增第 6、7 条都是迁移里的过期列注释 —— 第 6 条 `enabled`
+（「两道闸」里的 env 那道已整轮删除）、第 7 条 `t_part_batch.batch_no`（编号域是零件、
+不是装配件）。）**
 
 1. ⚠️ **`POST /config` 接受空 `recipients`**：`service::validate_save_request` 的模块 doc
     与 `NormalizedConfig::default` 的注释都写着「空数组会被 `POST /config` 的校验（21704）
@@ -769,6 +829,13 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
     分叉，而差异不会自动收敛），故只在文档里登记：**别按列注释推演「有两道闸、关掉 env
     那道就能停发」** —— 没有 env 那道闸，停发只能靠 `enabled = false` 或
     `frequency = MANUAL_ONLY`。
+7. ⚠️ **迁移 `migrations/20260925000000_001_baseline.sql` 里 `t_part_batch.batch_no` 的
+    列注释「工单内批次序号（1 起）」与实际作用域不符**（2026-10-16）：该列的编号域是
+    **零件**，唯一键 `uq_t_part_batch_part_no (part_id, batch_no)` 里的 `part_id` 是
+    **子件** ⇒ 该注释**对散件工单等价、对装配件不等价**：一个装配件的 N 个子件各从 1 起，
+    N 行都渲成 `1`（§4.4 末条）。⚠️ **迁移 append-only，不得改**（同第 6 条），故只在
+    文档里登记：**别按列注释把批次子行的批次号读成「同一个装配件内的第几批」** ——
+    子件之间没有先后口径，认哪个子件靠**序列号格**（§4.4）。
 
 **覆盖空洞：**
 

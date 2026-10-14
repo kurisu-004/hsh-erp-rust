@@ -126,7 +126,11 @@ pub struct DigestRow {
     pub customer_name: Option<String>,
     /// SQL 里写死的来源字面量：`'PART'` / `'ASSEMBLY'`。
     pub row_type: String,
-    /// 该工单名下的**全部**批次（2026-10-16），按 `batch_no ASC`。
+    /// 该工单名下的**全部**批次（2026-10-16），按 `batch_no ASC, id ASC`。
+    ///
+    /// ⚠️ **「该工单名下」对装配件是「它全部子件名下」**：批次挂在**子件**
+    /// （`t_part_batch.part_id → t_part.id`）上，而 [`DigestBatchRow::batch_no`] 是
+    /// **每个 `part_id` 各自从 1 起** ⇒ 一个装配件下多个子件各有一条 `1`，跨子件会撞号。
     ///
     /// 由 [`list_batches`] 一次拉回后按 `(row_type, id)` 在 Rust 侧分组装进来
     /// （见 `service::fetch_rows`）⇒ 工单数、批次数都不会让语句数变多。
@@ -200,8 +204,29 @@ impl From<DigestOrderRow> for DigestRow {
 pub struct DigestBatchRow {
     /// `t_part_batch.id`。
     pub id: i64,
-    /// `integer`，工单内批次序号（1 起）；渲染成「第 N 批」。
+    /// `integer`，**该子件（`t_part`）内**的批次序号（1 起）；渲染成**纯数字**（批次格
+    /// 另加一个全角空格缩进，见 `template::batch_row`）。
+    ///
+    /// ⚠️ **不是「装配件内」的序号、更不是「这封信里」的序号**：唯一键是
+    /// `uq_t_part_batch_part_no (part_id, batch_no)`、拆批走
+    /// `SELECT COALESCE(MAX(batch_no),0)+1 … WHERE part_id = $1`
+    /// （`prod::batch::repo::queries`）⇒ **每个 `part_id` 各自从 1 重新数**。一个装配件下
+    /// N 个子件各 1 批 ⇒ **N 行都渲成 `　1`**。子件之间没有先后口径，**子件间的先后顺序
+    /// 不是本域的契约**（`ORDER BY` 已补 `id` 兜底，但那只是让结果可复现，不构成语义）。
     pub batch_no: i32,
+    /// 批次所属**子件**的序列号（`t_part.serial_no`，即 `t_part_batch.part_id` 指向的
+    /// 那一行）；填在子行的「序列号」列上。
+    ///
+    /// ⚠️ **散件工单的批次恒为 `None`** —— 那一支的 `t_part_batch.part_id` 指向的就是
+    /// 工单行自己那个零件，序列号已经写在工单行上，子行再写一遍是纯冗余（每行都重复
+    /// 一个已经在上一格出现过的值）。这是刻意选择，不是漏取。
+    ///
+    /// ⚠️ **装配件追加的子件 `serial_no` 恒为 NULL**（补件语义不重新打开序列号派发
+    /// 通道，出处是 `assembly::service::crud::add_assembly_child_inner` 的 doc）⇒ 那一类
+    /// 子件的批次子行序列号格**留空**，**不回退到图号**：图号是「图号」列的内容，
+    /// 在序列号列重复它会让这一列的语义漂成「零件标识」。回归：
+    /// `template.rs::tests::assembly_child_without_serial_no_leaves_cell_blank`。
+    pub part_serial_no: Option<String>,
     /// `integer`，本批次数量。**不带**「套」后缀 —— 批次恒是件数，「套」是装配件
     /// 工单行的口径。
     pub quantity: i32,
@@ -400,7 +425,14 @@ pub async fn list_upcoming(
 /// - **holder 三表都带 `deleted_at IS NULL`**（在 `ON` 条件里，不是 `WHERE`）：
 ///   软删的货架 / 工人 / 外协厂不该出现在邮件里；而加了它之后 `LEFT JOIN` 仍保留行，
 ///   只是名字解析不出来。
-/// - **`ORDER BY` 在 SQL 里排**（渲染层不二次排序，与主查询同一约定）。
+/// - **`ORDER BY` 在 SQL 里排**（渲染层不二次排序，与主查询同一约定）。⚠️ **`batch_no`
+///   不是全局序号**（见 [`DigestBatchRow::batch_no`]）⇒ 一个装配件下多个子件的批次可以
+///   同为 `batch_no = 1`，只按 `(owner_type, owner_id, batch_no)` 排时 PG 的返回顺序
+///   **不确定**，两封连续邮件的子件行可能互换。末尾补 `u.id ASC` 兜底：它只保证**结果
+///   可复现**（同一份数据每次渲染同序），**不**让子件之间产生先后语义。
+/// - **`part_serial_no` 两支取法不同（2026-10-16）**：装配件支取子件的 `c.serial_no`
+///   （可空），散件支写 `NULL::varchar` —— 那一支的批次就是工单自己的零件，序列号已在
+///   工单行上，子行重复写是冗余。逐字段理由见 [`DigestBatchRow::part_serial_no`]。
 pub async fn list_batches(
     conn: &mut PgConnection,
     part_ids: &[i64],
@@ -418,7 +450,8 @@ pub async fn list_batches(
             u.status           AS "status!",
             u.is_repairing     AS "is_repairing!",
             u.location         AS "location?",
-            u.holder_name      AS "holder_name?"
+            u.holder_name      AS "holder_name?",
+            u.part_serial_no   AS "part_serial_no?"
         FROM (
             SELECT 'PART'::text AS owner_type,
                    p.id AS owner_id,
@@ -428,7 +461,11 @@ pub async fn list_batches(
                        WHEN 'PRODUCTION_SHELF'  THEN s.code
                        WHEN 'INSPECTION_SHELF'  THEN s.code
                        WHEN 'OUTSOURCE_COMPANY' THEN oc.name
-                   END AS holder_name
+                   END AS holder_name,
+                   -- 2026-10-16：散件支恒 NULL（子行不重复工单行的序列号，见
+                   -- DigestBatchRow::part_serial_no）。显式写 NULL 而不是不选该列，
+                   -- 是因为 UNION ALL 两支的列必须逐列对齐、类型也要一致。
+                   NULL::varchar AS part_serial_no
             FROM t_part_batch b
             JOIN t_part p ON p.id = b.part_id AND p.deleted_at IS NULL
             LEFT JOIN t_worker w
@@ -451,7 +488,8 @@ pub async fn list_batches(
                        WHEN 'PRODUCTION_SHELF'  THEN s.code
                        WHEN 'INSPECTION_SHELF'  THEN s.code
                        WHEN 'OUTSOURCE_COMPANY' THEN oc.name
-                   END AS holder_name
+                   END AS holder_name,
+                   c.serial_no AS part_serial_no
             FROM t_part_batch b
             JOIN t_part c     ON c.id = b.part_id AND c.deleted_at IS NULL
             JOIN t_assembly a ON a.id = c.assembly_id AND a.deleted_at IS NULL
@@ -467,7 +505,7 @@ pub async fn list_batches(
                   AND oc.deleted_at IS NULL
             WHERE b.deleted_at IS NULL AND a.id = ANY($2::bigint[])
         ) u
-        ORDER BY u.owner_type ASC, u.owner_id ASC, u.batch_no ASC
+        ORDER BY u.owner_type ASC, u.owner_id ASC, u.batch_no ASC, u.id ASC
         "#,
         part_ids,
         assembly_ids,
