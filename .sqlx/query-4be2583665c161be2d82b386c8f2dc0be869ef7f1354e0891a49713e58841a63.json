@@ -1,0 +1,44 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            COUNT(DISTINCT CASE\n                WHEN e.event_type IN ('RETURNED_TO_SHELF', 'SENT_TO_INSPECTION')\n                THEN e.batch_id END)::bigint AS \"batch_count!\",\n            COALESCE(SUM(CASE\n                WHEN e.event_type IN ('RETURNED_TO_SHELF', 'SENT_TO_INSPECTION')\n                THEN e.quantity END), 0)::bigint AS \"quantity!\",\n            COUNT(DISTINCT CASE\n                WHEN e.event_type = 'COMPLETED' AND e.batch_id IS NULL\n                THEN e.part_id END)::bigint AS \"completed!\",\n            COUNT(DISTINCT CASE\n                WHEN e.event_type = 'REPAIR_STARTED'\n                THEN e.part_id END)::bigint AS \"repair!\"\n        FROM t_part_event e\n        JOIN t_worker w ON w.id = e.worker_id\n        WHERE e.created_at >= $1::date::timestamp\n          AND e.created_at < ($1::date + INTERVAL '1 day')::timestamp\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "batch_count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "quantity!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "completed!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "repair!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Date"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "4be2583665c161be2d82b386c8f2dc0be869ef7f1354e0891a49713e58841a63"
+}

@@ -79,6 +79,14 @@ pub mod statistics;
 // 与 wecom_daily（内容域）的切分线见该域 `mod.rs` 的模块 doc（通道 vs 内容与调度）。
 // 完整契约见 `docs/api/wecom.md`。
 pub mod wecom;
+// 2026-10-18 新增 wecom_daily 域：「定时任务」菜单下的**企业微信每日总结推送**（内容域：
+// 4 节报表 + 分片渲染 + 推送配置单例 + 流水），5 个端点 / 6 条路由全部 Manager 独占，
+// URL 挂 `/api/v2/cron/wecom-daily`。
+// ⚠️ **全新域，无任何旧路径、无 alias**。
+// 取数 SQL 在本域内写全、**零他域符号引用**（统计口径常量 `repo::DELIVERY_STATUSES`
+// 是本域自有的一份，与 mail_digest / dashboard 两处人工同步）。
+// 完整契约见 `docs/api/wecom-daily.md`。
+pub mod wecom_daily;
 // 2026-09-28 删除：相关上传会话域（Redis 共享 STS 凭证会话机制）。
 // 前端改为单 uploader 触发时单 HTTP 调用 python `sts-tmp-keys` 数组入参直签，
 // 不再走 rust 转发。
@@ -180,6 +188,7 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // 前缀仍刻意是 kebab-case 单段词（`mail-digest`），只多了一个 `/cron` 父段。
         // 完整契约见 `docs/api/mail_digest.md`。
         .nest("/cron/mail-digest", mail_digest::router())
+        // 2026-10-19 新增：serial 域（终态工单序列号一键释放）。1 端点
         // ⚠️ 2026-10-18 URL 硬切：`/api/v2/mail/*` → `/api/v2/cron/mail/*`
         // （**旧路径 404，无 alias**）。6 端点全部 Manager 独占，角色守卫写在各 handler
         // 第一行（`require_role(Role::Manager)`），此处不挂 role layer。
@@ -194,6 +203,15 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // 与菜单 seed 的 `path='/wecom'`、前端路由同一个词。
         // ⚠️ **全新域，无旧路径、无 alias**。完整契约见 `docs/api/wecom.md`。
         .nest("/cron/wecom", wecom::router())
+        // 2026-10-18 新增 wecom_daily 域（企业微信**内容**域：每日总结 4 节报表 + 分片
+        // 渲染 + 推送配置单例 + 流水），5 个端点 / 6 条路由全部 Manager 独占，角色守卫
+        // 写在各 handler 第一行（`require_role(Role::Manager)`），此处不挂 role layer。
+        // ⚠️ **独立 `.nest()`**，刻意**不**合并进 `.nest("/cron", Router::new().merge(..))`
+        // —— 理由见下面那段 matchit 核对第 1 条。⚠️ 第 2 段 `wecom-daily` 刻意是
+        // **kebab-case**（与 `mail-digest` 同款），而通道域那一条是单段词 `wecom`
+        // （与菜单 seed 的 `path='/wecom'` 对齐）—— 两者逐字互异、互不为前缀。
+        // 完整契约见 `docs/api/wecom-daily.md`。
+        .nest("/cron/wecom-daily", wecom_daily::router())
         // ── `/cron` 前缀族的 matchit 注册顺序核对（2026-10-18 新增，必读）──
         //
         // CLAUDE.md §9 有一条硬约束：「同段数时静态段必须先于 `Path<i64>` catch-all，
@@ -205,23 +223,30 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         //    路由进同一张 matchit 表，注册顺序约束会跨前缀纠缠，排查困难
         //    （CLAUDE.md §9「一个前缀一个 router 工厂」）。各子域各自独立 nest ⇒
         //    各自独立成表，`/cron/mail*`、`/cron/wecom*`、`/cron/wecom-daily*` 的匹配
-        //    互不参与。
-        // 2. **三条 nest 的第 2 段互不为对方的前缀**
-        //    （`mail` / `mail-digest` / `wecom` / 将来的 `wecom-daily` 逐字互异）⇒
+        //    互不参与（**2026-10-18 起 `/cron` 下共 4 个子域，全部各自独立 nest**）。
+        // 2. **四条 nest 的第 2 段互不为对方的前缀**
+        //    （`mail` / `mail-digest` / `wecom` / `wecom-daily` 逐字互异）⇒
         //    axum 在 nest 阶段就能分流，不存在「一个静态段是另一个静态段前缀」的重叠。
         // 3. **`mail` 与 `mail-digest` / `wecom` 段数相同也不冲突**：第 2 段先静态判别，
         //    `/cron/mail/accounts`（3 段，第 2 段恰好等于 `mail`）与
         //    `/cron/mail-digest/config`（3 段，第 2 段恰好等于 `mail-digest`）
         //    与 `/cron/wecom/webhooks`（3 段，第 2 段恰好等于 `wecom`）
+        //    与 `/cron/wecom-daily/config`（3 段，第 2 段恰好等于 `wecom-daily`）
         //    在第 2 段就分道，不进入第 3 段的比较。
-        // 4. **三个子域的路由表内部本就无 catch-all 竞争**：`mail` 6 条最长 3 段、
-        //    `Path<i64>` 只在第 2 段、无 2 段静态路径；`mail-digest` 6 条**全是静态段**；
-        //    `wecom` 6 条最长 3 段（`/webhooks/{id}/delete`）、`Path<i64>` 只在
-        //    `/webhooks/{id}`（2 段）而**没有任何 2 段静态路径** ⇒ 三张表都安全，且
-        //    彼此完全隔离（第 1 条）。
+        //    ⚠️ **`wecom` 与 `wecom-daily` 这一对最值得盯**：`wecom` 是 `wecom-daily`
+        //    的**字符串前缀**，但 matchit 是**逐段**比较而不是字符串前缀比较 ⇒ 第 2 段
+        //    就是完整的一格（`wecom` vs `wecom-daily`），不存在「短段吃掉长段」的窗口。
+        // 4. **四个子域的路由表内部本就无 catch-all 竞争**：`mail` 6 条最长 3 段、
+        //    `Path<i64>` 只在第 2 段、无 2 段静态路径；`mail-digest` 与
+        //    `wecom-daily` 各 6 条**全是静态段**；`wecom` 6 条最长 3 段
+        //    （`/webhooks/{id}/delete`）、`Path<i64>` 只在 `/webhooks/{id}`（2 段）
+        //    而**没有任何 2 段静态路径** ⇒ 四张表都安全，且彼此完全隔离（第 1 条）。
         //
         // 守卫：旧前缀 404 的集成用例见 `tests/scheduled_task/accounts.rs`
-        // 与 `tests/mail_digest/config.rs`（2026-10-18 新增）。
+        // 与 `tests/mail_digest/config.rs`（2026-10-18 新增）。`/cron/wecom*` 与
+        // `/cron/wecom-daily*` 是**全新前缀**（无旧路径）故无 404 用例；它们各自的
+        // 路由表由 `wecom::handler::tests` / `wecom_daily::handler::tests` 的
+        // 「ROUTES 与 router() 源码逐条比对」守住。
         // 2026-10-16 新增：print_template 域（送货单打印模板：xlsx 上传 / 绑一级客户 /
         // 打印时取模板字节）。5 端点。
         // 守卫分两档：写端点 3 条（`POST /` 上传替换、`GET /` 列表、

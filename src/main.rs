@@ -170,6 +170,15 @@ async fn main() -> anyhow::Result<()> {
         task::mail_digest::run(mail_state, mail_token).await;
     });
 
+    // 2026-10-18 新增：企业微信每日总结推送定时任务。与上面两个任务一样挂**同一枚**
+    // `shutdown` 令牌（优雅退出一并生效）。未启用 / 未选通道时它自己打一行 info 后
+    // 不注册任何 job —— 后端照常启动，手动触发仍可用。
+    let wecom_state = state.clone();
+    let wecom_token = shutdown.clone();
+    tokio::spawn(async move {
+        task::wecom_daily::run(wecom_state, wecom_token).await;
+    });
+
     // 10. 路由组装
     let max_body = state.config.max_request_body_size;
     // 2026-10-03 新增：请求级超时改为按路径分档（替换 `tower_http::timeout::TimeoutLayer`）。
