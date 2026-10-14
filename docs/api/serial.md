@@ -2,7 +2,9 @@
 
 > 本文件是 `serial` 域的**唯一**契约来源。任何字段 / 端点变更必须同步本文件。
 > 代码位置：`src/modules/serial/`（`mod.rs` · `handler.rs` · `service.rs` · `repo.rs` · `dto.rs`）。
-> 权威路由清单：`handler::router()`（1 条）。
+> 权威路由清单：`handler::ROUTES`（1 条），lib 单测
+> `handler::tests::routes_declared_in_router` 逐条比对 `router()` 源码
+> （解析器复用 `files::route_guard::routes_in_router_source`，**不**另抄一份）。
 > 集成测试：`tests/serial/`（binary `serial`，5 条用例）。
 
 ## 0. 需求与范围
@@ -42,7 +44,7 @@
 | 码 | HTTP | 条件 |
 |---|---|---|
 | `40300` `FORBIDDEN` | 403 | 角色不是 MANAGER（ADMIN 元角色由 `require_role` 内部短路放行）。守卫**先于**任何全表扫 |
-| `50001` | 500 | DB 错误（唯一可能的实际形态：`SELECT … FOR UPDATE` 与并发 DDL 冲突） |
+| `50001` | 500 | DB 错误。**实际形态三类**（都不是数据损坏，是可重试的失败）：① `SELECT … FOR UPDATE` 与并发 DDL 冲突；② 行锁等待超时（候选极多 + 并发流转，§8.3 第 3 条）；③ 死锁 `40P01` —— ⚠️ 本端点与**状态机派生链**之间的 ABBA 窗口已由锁序对齐消除（§4.3 / §8.3 第 2 条），但跨域大范围 DDL / `VACUUM FULL` 等外部锁源仍可能表现为 `50001` |
 
 本端点**不产生任何业务码**（`20xxx` / `21xxx`）：它没有「找不到」形态（不存在即 0 行，
 幂等返回 200），也没有「校验失败」形态（候选判据写死在服务端）。
@@ -77,6 +79,13 @@ handler 用 `axum::Json` 提取器入参，**反序列化失败发生在进 hand
    `t_assembly` + `t_part` 两张表，不该让无权账号拿它做信息探测（有多少行泄漏着序列号）。
    判在 `service::release_terminal` 第一行（不是 handler 第一行）：service 是唯一能保证
    「候选 SELECT 之前」的位置。
+   ⚠️ **代价：apply 分支的 `pool.begin()` 发生在守卫之前**（守卫在 service 里，而事务
+   边界在 handler）⇒ 无权账号会先开一次事务、白占一个连接，再被 `40300` 拒掉。
+   `dry_run` 分支用 `pool.acquire()`（不开事务），无此问题。
+   接受这个代价是因为：把守卫提到 handler 第一行就得在两处各判一次角色、两处迟早漂移；
+   而空开事务不产生任何写入、也不落任何锁，代价只是一次短连接占用。
+   ⇒ **无权请求的资源画像**：`dry_run = true` → 1 个连接，无事务；
+   `dry_run = false` → 1 个连接 + 1 个已 `BEGIN` 但无写入的事务。
 
 ## 2. 出参 `ReleaseTerminalOut` 逐字段
 
@@ -124,9 +133,23 @@ handler 用 `axum::Json` 提取器入参，**反序列化失败发生在进 hand
 
 | 口径 | 来源 | 受 200 上限影响？ |
 |---|---|---|
-| `assembly_count` / `part_count` / `released_total` | 真实候选集合（`dry_run` 走 `COUNT(*)`，apply 走锁内候选集 `.len()` / 原语 `rows_affected`） | **否** |
-| `affected` | 同一候选集合 `take(200)` | **是**（并置 `truncated = true`） |
-| **实际写入行数** | 同计数口径，**与 `affected` 长度无关** | **否** |
+| `assembly_count` / `part_count` / `released_total` | **锁内候选集**（`dry_run` 走 `COUNT(*)`，apply 走候选集 `.len()` / 原语 `rows_affected`） | **否** |
+| `affected` | **同一个锁内候选集** `take(200)` | **是**（并置 `truncated = true`） |
+| 实际写入行数 | 同候选集口径，**与 `affected` 长度无关** | **否** |
+
+⚠️ **`affected` 是「锁内候选集」，不是「实际改动集」**（2026-10-19 review 第 2 轮
+MINOR-2 登记）。两者在本端点里**理论上会一致但不是恒等**，别把它们写成同一个概念：
+
+- apply 路径下，`assembly_count` 累加的是原语 `AssemblyRepo::clear_serial_no_if_terminal`
+  返回的 `rows_affected`，而 `part_count` 是按候选行数 `+= 1`（原语返回 `()`，没有
+  行数可读）。⇒ 若某个装配件的原语返回 0 行（代码注释自称的「防御性跳过」，
+  `t_part` 侧对应「已被别的路径清空 → 无需归档」早退），`assembly_count` 会比候选行数
+  少 1，而 **`affected` 里仍列着那一行**。
+- 之所以只算**理论**形态：候选 SELECT 带 `FOR UPDATE` 且与两个原语的守卫**逐字同源**
+  （§4.2），行锁持有期间 `status` / `serial_no` 不可能再被改 ⇒ 守卫不可能在这两步之间
+  漂移掉一行。实测路径上二者一致。
+- **`dry_run` 路径没有 `rows_affected` 这个概念**（零写入），它读到的**就是**候选集
+  ⇒ 那一支上「计数 / 明细」与「候选集」是同一个东西，不要跨分支互推。
 
 ⚠️ **写入永远不受明细上限约束**：apply 路径的候选 SELECT **不加 `LIMIT`**
 （`repo::list_*` 的 `limit` 形参传 `None`）。若把上限顺手套到写入上，就会出现
@@ -159,17 +182,30 @@ AND status IN ('COMPLETED', 'CANCELLED')
   守卫把 IN_PROCESS 行挡住了。谓词自身由 `dry_run_returns_counts_without_writing`
   的计数断言独立钉住。
 
-### 4.3 并发口径（apply 路径 `SELECT … FOR UPDATE`）
+### 4.3 并发口径（apply 路径 `SELECT … FOR UPDATE`，**锁序 part → assembly**）
 
 候选 SELECT 带 `FOR UPDATE`，把行锁**锁在事务内**，再逐行清列。理由：否则「选出候选」
 与「清列」之间，并发进来的工单流转可能把 `status` 改掉，导致计数与实动行数对不上。
+
+⚠️ **锁序是硬约束：两条候选 SELECT 的先后必须是 `t_part` 先、`t_assembly` 后**
+（`service::release_terminal` 的 apply 分支）。业务链路
+`shared::batch::status::rollup_part_derived` 的写序是「step 2–4 先改 `t_part` →
+step 3 才经 `sync_from_part_change_by_id` 级联改 `t_assembly` → step 5 再清
+`t_assembly`」，即同样是 **part → assembly**。本端点若反过来先锁 `t_assembly`，
+与一条正在跑的业务流转就是标准 **ABBA**：业务流转持 part 锁等 assembly 锁、本端点持
+assembly 锁等 part 锁 ⇒ PG 报 `40P01` 并**中止一侧** ⇒ 本端点整批回滚、返 `50001`
+（**不是数据损坏**，用户重试即可，但一次清理白跑）。
+⇒ **别把这两行调回「装配件在前」**：明细的「装配件优先」是 `detail_items` 形参顺序
+与出参契约（§2.2），与**锁的获取顺序**是两件事，改锁序不影响明细顺序。
+dry_run 分支两条 SELECT 不带 `FOR UPDATE`、不持任何锁 ⇒ **不受本约束管**。
+完整登记在 §8.3 第 2 条。
 
 ⚠️ **不用「先 `UPDATE … RETURNING` 再判」**：零件侧必须**先归档后清**
 （`release_part_serial_no` 内部要先读出 `serial_no` 才能写进归档 `note`）；
 一旦先 UPDATE 把列清了，那个原语内部那次读拿到 `NULL` ⇒ 走「已清空 → 无需归档」
 早退分支，**归档事件永久丢失**。
 
-**代价**（登记在 §8.3 第 2 条）：候选极多时长时间持锁。这是维护型端点
+**代价**（登记在 §8.3 第 3 条）：候选极多时长时间持锁。这是维护型端点
 （MANAGER 单角色、人工触发），可接受。
 
 ### 4.4 雪花 `event_id`：每个 part 各拿一个**独立** id
@@ -189,10 +225,15 @@ AND status IN ('COMPLETED', 'CANCELLED')
 | 分支 | 事务 | WS 广播 |
 |---|---|---|
 | `dry_run = true` | **不开**，`pool.acquire()` | **不广播**（零写入） |
-| `dry_run = false` | `pool.begin()` → service → `tx.commit()` | commit **之后** 一条汇总事件 |
+| `dry_run = false` | `pool.begin()` → service → `tx.commit()` | commit **之后** 一条汇总事件，**且 `released_total == 0` 时不广播** |
 
 开事务的理由：整批候选的清列 + 子件归档事件必须**全成功或全回滚**。半途失败留下
 「一部分清了、一部分没清」，比一行没清更难排查。
+
+⚠️ **零行不广播**（2026-10-19 review 第 2 轮 MINOR-3）：幂等重复点击 / 无残留时会
+commit 一个什么都没写的事务，此时推一条 `assembly_count=0, part_count=0` 的事件
+**毫无信息量**，却会让**所有**大屏客户端各防抖一次、三张报表各重取一遍 ⇒ 纯浪费。
+判据是 `out.released_total > 0`（看**计数**而不是「事务是否成功」）。
 
 ## 5. 状态域约定（无编译期保障）
 
@@ -247,7 +288,7 @@ AND status IN ('COMPLETED', 'CANCELLED')
     `upcoming-delivery` 分桶只出计数、根本不含 `serial_no`。前端整前缀失效是**保守但正确**
     的选择，后端不要据此把本事件的影响面写窄。
 - 广播在 **commit 之后**（commit 失败却已广播 = 大屏看到一次从未发生的清理）。
-- `dry_run` **不广播**。
+- `dry_run` **不广播**；**实跑但 `released_total == 0` 也不广播**（§4.5 末）。
 
 ## 8. 表依赖与前端配套
 
@@ -290,20 +331,45 @@ AND status IN ('COMPLETED', 'CANCELLED')
    破坏性操作的危险默认值。前端**必须**先 `{"dry_run": true}` 预览、用户确认后再
    `{"dry_run": false}`。本域**刻意不**改成「缺省 `true`」—— 那会让「忘了传参」
    变成静默无操作，比误清理更难察觉。
-2. **`FOR UPDATE` 在超大量候选下长时间持锁**（§4.3）。未做分批 / 超时保护。
+2. ⚠️ **锁序硬约束：`t_part` 必须先于 `t_assembly`（死锁登记）**（2026-10-19 review
+   第 2 轮 MINOR-1）。apply 路径的两条候选 `SELECT … FOR UPDATE` **必须**按
+   part → assembly 的顺序取锁。业务链路 `shared::batch::status::rollup_part_derived`
+   的写序就是 part → assembly（step 2–4 改 `t_part`，step 3 / step 5 才碰
+   `t_assembly`）；顺序相反即 **ABBA** ⇒ PG `40P01` 中止一侧 ⇒ 本端点整批回滚、
+   返 `50001`（**不是数据损坏**，重试即可）。
+   **为什么必须同序**（防后人「顺手按明细顺序调一下」的锚点）：明细「装配件优先」
+   只由 `detail_items(&assemblies, &parts)` 的**形参顺序**决定（§2.2），与取锁顺序
+   **完全无关** —— 两件事被排在一起才容易被误当成一件。
+   **已消除的是与本仓状态机派生链之间的 ABBA**；跨域大范围 DDL / `VACUUM FULL` 等
+   外部锁源仍可能表现为 `50001`（§1.1 三形态之一），未做、也不打算做超时退避。
+3. **`FOR UPDATE` 在超大量候选下长时间持锁**（§4.3）。未做分批 / 超时保护。
    维护型端点下可接受；生产残留若已达万级需评估。
-3. **软删 + 持号的行不会被清理**：候选判据带 `deleted_at IS NULL`，两个唯一索引
+4. ⚠️ **每候选行的语句数放大**（2026-10-19 review 第 2 轮 MINOR-10 登记）：零件侧
+   **每行 3 次往返** —— `SELECT serial_no`（`release_part_serial_no` 的「先读原值」）
+   + `INSERT t_part_event`（归档）+ `UPDATE t_part`（清列 + `version+1`），
+   全部在**同一个事务**里、**无分批无上限**；装配件侧每行 1 次 `UPDATE`。合计往返数
+   随候选集线性增长：`3 × part_candidates + assembly_candidates + 4`（2 条 count 走
+   dry_run 那支、apply 支是 2 条候选 SELECT）。
+   ⇒ 1 万行零件残留 ⇒ 单事务约 **3 万次**往返，在一个慢连接上是分钟级持锁（与第 3 条
+   叠加）。当前形态下用户看到的是「请求转圈很久后 200 / 或锁超时 50001」。
+   **TODO（未做，登记在此防遗忘）**：等「单次实跑行数上限」被产品给出一个具体阈值
+   （例如 2000 / 5000 行）时，把 apply 路径改成**分批提交 + 汇总计数**
+   （`released_total` 跨批累加、`affected` 仍只取第一批）；在那之前不做任何分批，
+   避免在没有阈值的情况下自行发明「静默只清一部分」的形态（与 §4.1 的写入口径冲突）。
+5. **软删 + 持号的行不会被清理**：候选判据带 `deleted_at IS NULL`，两个唯一索引
    也都带 `deleted_at IS NULL` ⇒ 这类行**既不占号、也不会被本端点清**。
    两者一致，**没有隐患**，但也意味着「软删行残留序列号」是本端点**够不到**的死角
    （要清它必须单开一个「含软删行」的维护变体，**本轮不做**）。
-4. **零件 `CANCELLED` 行的清理不解除任何占号**（§8.2）：`uk_t_part_serial_no` 带
+6. **零件 `CANCELLED` 行的清理不解除任何占号**（§8.2）：`uk_t_part_serial_no` 带
    `status <> 'CANCELLED'`，这类行本就不占唯一键。清它只是让列不留废值 + 写归档事件。
    本端点**照清**（用户明确要求两表都清），但别把它算进「救回来的号」里。
-5. **明细封顶 200 且装配件优先**（§2.2）：装配件残留极多时子件会被挤出明细，
+7. **明细封顶 200 且装配件优先**（§2.2）：装配件残留极多时子件会被挤出明细，
    需靠 `part_count` 才知道子件也清了多少。
-6. **装配件侧无归档事件**：`t_assembly` 没有事件表，且 `note` 是用户可编辑业务字段
+8. **装配件侧无归档事件**：`t_assembly` 没有事件表，且 `note` 是用户可编辑业务字段
    （写系统动作会污染用户数据）⇒ 装配件的清号**没有审计行**，只有 `version` 递增。
    这是既有原语的设计沿用，本域**刻意不**为此新建事件表。
+9. **`affected` 取自候选集而非实际改动集**（§4.1）：与第 4 条那类放大同理，这是
+   「口径统一」的有意取舍（对外报什么数必须与候选判据严格同源，否则明细会漏行）。
 
 ### 8.4 前端配套改动清单
 

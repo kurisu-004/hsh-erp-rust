@@ -46,12 +46,18 @@
 //! | `dto.rs` | 入参 / 出参 + `RELEASE_DETAIL_LIMIT`（明细上限）与 `kind` 字面量常量 |
 //! | `repo.rs` | 2 条 `COUNT` + 2 条候选 SELECT（`FOR UPDATE` 由形参控制），**唯一持有守卫谓词真源** |
 //! | `service.rs` | 释放用例（dry_run / apply 两分支）+ 计数口径 + 明细拼装 |
-//! | `handler.rs` | 1 个端点 + `router()`；事务边界、WS 广播 |
+//! | `handler.rs` | 1 个端点 + `ROUTES` + `router()`；事务边界、WS 广播 |
+//!
+//! **权威路由清单是 `handler::ROUTES`（1 条）**，lib 单测
+//! `handler::tests::routes_declared_in_router` 用
+//! `crate::modules::files::route_guard::routes_in_router_source` 逐条比对 `router()`
+//! 源码（复用该共用比对器，**不**复制一份）。
 //!
 //! ## 完整契约
 //!
-//! [`docs/api/serial.md`](../../../../docs/api/serial.md) —— 端点表 / 出参逐字段 /
-//! 计数与明细解耦口径 / 并发口径 / 移除记录 / WS 关系 / 表依赖与前端配套 / 已知偏差登记。
+//! [`docs/api/serial.md`](../../../docs/api/serial.md) —— 端点表 / 出参逐字段 /
+//! 计数与明细解耦口径 / 并发口径（含**锁序**）/ 移除记录 / WS 关系 / 表依赖与前端配套 /
+//! 已知偏差登记。
 
 use std::sync::Arc;
 

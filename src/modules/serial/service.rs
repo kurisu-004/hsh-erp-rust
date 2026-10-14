@@ -30,11 +30,20 @@
 //! 这与 `docs/api/batch.md` 里「写 `t_part_batch.status` 只能走
 //! `apply_batch_status_change`」是**同一条纪律**。
 //!
-//! ## ⚠️ 并发口径：候选 SELECT 带 `FOR UPDATE`
+//! ## ⚠️ 并发口径：候选 SELECT 带 `FOR UPDATE`，且**锁序必须是 part → assembly**
 //!
 //! apply 路径先 `SELECT … FOR UPDATE` 把候选行**锁在事务内**，再逐行调原语。理由见
 //! [`repo::list_terminal_assemblies`] 的 doc（核心：清列原语自带守卫，若不锁，
 //! 「选候选」与「清列」之间状态可能被并发流转改掉，导致计数与实动行数对不上）。
+//!
+//! **锁序（2026-10-19 review 第 2 轮 MINOR-1 新增的硬约束）**：两条候选 SELECT 的
+//! 先后**必须是 part 先、assembly 后**，与业务链路
+//! [`shared::batch::status::rollup_part_derived`] 的锁序同向（它 step 2–4 先写
+//! `t_part`，step 3 才经 `sync_from_part_change_by_id` 级联写 `t_assembly`，
+//! step 5 再清 `t_assembly`）。写序相反 ⇒ ABBA：业务流转持 part 锁等 assembly 锁、
+//! 本端点持 assembly 锁等 part 锁 ⇒ PG 报 `40P01` 并中止一侧（`50001`）。
+//! **别把这两行调回「装配件在前」** —— 明细拼接顺序（[`detail_items`] 的形参顺序）
+//! 与锁的获取顺序是两件事。
 //!
 //! ## ⚠️ 雪花 event_id：**每个 part 各拿一个独立 id**
 //!
@@ -48,7 +57,16 @@
 //!
 //! `affected` 受 `dto::RELEASE_DETAIL_LIMIT` 截断，用它当计数会让「实动 5000 行、
 //! 报 200 行」。apply 路径的计数**取自锁内候选集合**（装配件侧再叠加原语实际返回的
-//! `rows_affected`），dry_run 路径取自 `COUNT(*)` —— 两者在守卫同源 + 锁持有时恒等。
+//! `rows_affected`），dry_run 路径取自 `COUNT(*)` —— 两条路径在守卫同源 + 锁持有时
+//! 给出同一个数。
+//!
+//! ⚠️ **但「候选集」与「实际改动集」是两个概念，别写成恒等**（2026-10-19 review 第 2
+//! 轮 MINOR-2）：装配件侧 `assembly_count` 累加原语返回的 `rows_affected`（它可能返回
+//! 0，见上面「防御性跳过」），零件侧 `part_count` 直接按候选行数 `+= 1`；而 `affected`
+//! **恒取自候选集**。⇒ 极端形态下明细里可能列着一行原语实际没清的行（守卫在锁内不再
+//! 漂移，所以这在本端点里是**理论**形态而非实测形态）。dry_run 路径**根本没有**
+//! `rows_affected` 这个概念 —— 它读的就是候选集。对外口径以**候选集**为准，见
+//! `docs/api/serial.md` §4.1。
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
@@ -101,9 +119,20 @@ pub async fn release_terminal(
     // ── 实跑 ──
     // 候选**不加 LIMIT**（`None`）：明细上限只约束「回给前端看多少行」，不约束
     // 「真正清多少行」。加了 LIMIT 就变成「5000 行残留只清得掉 200 行」。
-    let assemblies = repo::list_terminal_assemblies(conn, None, true).await?;
+    //
+    // ⚠️ **两条 SELECT 的先后是锁序硬约束：part 必须先于 assembly**
+    // （2026-10-19 review 第 2 轮 MINOR-1）。业务链路 `rollup_part_derived` 是
+    // 「先改 t_part → 再级联改 t_assembly」，与本端点相反的顺序构成 ABBA ⇒ PG
+    // `40P01` 死锁（`50001` + 整批回滚）。dry_run 分支无 `FOR UPDATE`、不持锁，
+    // 故那里的读取顺序无关紧要，不受本约束管。
     let parts = repo::list_terminal_parts(conn, None, true).await?;
+    let assemblies = repo::list_terminal_assemblies(conn, None, true).await?;
 
+    // ⚠️ 下面两个**写**循环的顺序（装配件在前）与上面的锁获取顺序不一致是**有意的**
+    // 且安全：两批行锁此刻**已全部持有**，写循环只操作已加锁的行，不会再触发新的锁
+    // 等待；顺序之所以保持装配件在前，是与 `detail_items` 的形参顺序、以及明细
+    // 「装配件优先」的对外契约保持同一读法。
+    //
     // 装配件侧：逐行调既有原语。它自带三条守卫并返回 rows_affected；锁已持有时
     // 正常必为 1，0 行只是防御性跳过（不 panic、不报错 —— 强行报错会把整批回滚）。
     let mut assembly_count = 0i64;
