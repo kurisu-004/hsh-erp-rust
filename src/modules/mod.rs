@@ -66,6 +66,13 @@ pub mod scheduled_task;
 // 下 —— 它操作的是「子件 + 批次的生产执行状态」，与批次 / 队列动作同属生产链路。
 // 这是端点级归属裁决，不是域归属变更，两处注释不要读成互相矛盾。
 pub mod prod;
+// 2026-10-19 新增 serial 域：一键释放「终态工单仍占用的序列号」，
+// 1 端点，URL 挂 `/api/v2/serials`。
+// ⚠️ **独立成域的理由是端点级归属裁决**：候选集横跨 `t_assembly`（assembly 域）
+// 与 `t_part`（part 域）两张表，序列号释放不属于任何一侧 ⇒ 不塞进任一既有域。
+// 先例是 `.nest("/batches", prod::split_router())`（跨域共用端点单开顶层前缀）。
+// 本域**一行写 SQL 都不写**，清列全部复用两个既有原语（详见 `serial/mod.rs`）。
+pub mod serial;
 pub mod statistics;
 // 2026-09-28 删除：相关上传会话域（Redis 共享 STS 凭证会话机制）。
 // 前端改为单 uploader 触发时单 HTTP 调用 python `sts-tmp-keys` 数组入参直签，
@@ -146,6 +153,16 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // 移除记录见 `src/modules/part/mod.rs` 的模块 doc。
         .nest("/parts", part::router())
         .nest("/assemblies", assembly::router())
+        // 2026-10-19 新增：serial 域（终态工单序列号一键释放）。1 端点
+        // （`POST /release-terminal`，MANAGER 单角色，`dry_run` 预览 → 二次确认 → 实跑）。
+        // **归属域 = `serial`**（独立成域的理由是端点级归属裁决：候选集横跨
+        // `t_assembly` + `t_part` 两张表，不属于任何一侧；先例同本函数上方的
+        // `.nest("/batches", prod::split_router())`）。
+        // 前缀 `/serials`：顶层 nest、单段、kebab-case（同 `/mail-digest` /
+        // `/print-templates`）。本域无硬切记录（新立），⚠️ 且 1 条路由全是静态段、
+        // 无 `Path` catch-all ⇒ 不受 matchit 静态段排序约束。
+        // 完整契约见 `docs/api/serial.md`。
+        .nest("/serials", serial::router())
         // 2026-10-13 删除：`.nest("/part-files", part_file::router())` 与
         //   `.nest("/cnc-programs", cnc_program::router())`
         //   —— 两域收编进 files 域，旧前缀 404 无 alias（端点清单见 modules/files/mod.rs）。
