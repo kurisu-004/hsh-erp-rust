@@ -21,7 +21,9 @@ use crate::shared::batch::status_machine::PartStatus;
 use crate::shared::error::{AppError, code};
 // 2026-10-12：`t_part_event` 的写侧自 part 域的事件 INSERT 上提到
 // `shared::part_event`（该表由 7 个模块写、无域归属）。
-use crate::shared::part_event::{NewPartEvent, insert};
+use crate::shared::part_event::{
+    EVENT_FORCED_SENT_TO_INSPECTION, EVENT_INSPECTED, NewPartEvent, insert,
+};
 
 use super::BatchService;
 use crate::shared::batch::guards::{optional_process_chain, optional_step_id};
@@ -402,21 +404,45 @@ impl BatchService {
     /// 流转：
     /// 1. `t_part.status` & `t_part_batch.status` → `INSPECTION`，同步 `location =
     ///    'INSPECTION_SHELF'` / `current_holder_id = target_shelf.id`。
-    /// 2. 写 `INSPECTED` 事件日志。
+    /// 2. 写 `INSPECTED` 事件日志（`force=true` 时改写
+    ///    `FORCED_SENT_TO_INSPECTION` + note 加「【强制送检】」前缀）。
     ///
     /// 部分通过拆批：`quantity < target.quantity` 时调
     /// `split_batch_for_partial_pass`：operated 部分（拆出的新批次，quantity =
     /// op_qty）走状态翻转，remainder 部分留在 `{PENDING, PROGRAMMING,
     /// IN_PROCESS}` 待后续操作；返回 `new_batch_id = Some(remainder_id)`。
+    /// ⚠️ **拆批路径下 `force` 的余量归属**：新拆出的 operated 批次 `INSERT
+    /// ... SELECT` **继承**源批次的 `location` / `current_holder_id`（工人那一支就是
+    /// `location='WORKER'` + 原工人 id），随后被 `mark_batch_inspected` 翻成
+    /// `INSPECTION_SHELF` + 品检架；而**余量批次（源批次本身）原地不动**，
+    /// `location` 仍是 `'WORKER'`、`current_holder_id` 仍是原工人 —— 这是**语义正确**
+    /// 的（工人确实还拿着那部分），刻意不清。
     ///
     /// # Errors
     /// - 20101 `BIZ_PART_NOT_FOUND`
     /// - 20103 `BIZ_INVALID_TRANSITION` —— 当前状态非 `{PENDING, PROGRAMMING,
-    ///   IN_PROCESS}`；或 IN_PROCESS+WORKER；或 IN_PROCESS+非 PRODUCTION_SHELF
+    ///   IN_PROCESS}`；或 IN_PROCESS+WORKER 且 `force=false`；或 IN_PROCESS+非
+    ///   PRODUCTION_SHELF；或 IN_PROCESS+location 为空
     /// - 20109 `BIZ_PART_BATCH_NOT_FOUND`
     /// - 20111 `BIZ_PART_BATCH_INVALID_QUANTITY`
     /// - 40301 `SHELF_MISMATCH` —— 当前账号 scope 内无任何可用品检架（自动选架）
     /// - 40901 `VERSION_CONFLICT`
+    ///
+    /// # `force`（2026-10-17 新增）
+    ///
+    /// 需求：待品检页扫码后，批次若**在工人手上**原本无法送检，现在可以直接送检，
+    /// 但记为**强制送检**，**不计**该工人的报工统计。
+    ///
+    /// ⚠️ **`force` 只放宽 `location='WORKER'` 这一支**。`Some(other)`（非生产架，
+    /// 例如 `INSPECTION_SHELF` / `OFFICE` / `OUTSOURCE_COMPANY`）与 `None`（空
+    /// location，数据完整性违规）**两支保持原样拒绝**：需求没要求放宽，而它们各自
+    /// 表达的是「这批东西压根不在生产流里」与「行数据坏了」，运营的一键按钮不该
+    /// 替这两类兜底。回归见 `tests/part/to_inspection.rs` 的
+    /// `to_inspection_force_still_rejects_null_location` 与
+    /// `to_inspection_force_still_rejects_non_production_shelf_location`。
+    ///
+    /// ⚠️ **`force` 不绕过 OCC**：`_assert_batch_version` 在放宽闸门**之前**执行，
+    /// 陈旧 `version` 仍返 40901。
     ///
     /// 2026-09-16 PR-2 瘦身（migration 027）：t_part 删 `current_holder_id` 列；
     /// IN_PROCESS 组合校验的「工人持有件 / 非生产架件拒绝」改读**目标批次**的
@@ -442,6 +468,12 @@ impl BatchService {
     /// `target_shelf_code` 只进事件 note（人类可读的「送检 → 品检架 INS-01」）。它与
     /// id **必须由同一个 caller 同一次选架产出** —— note 里写雪花 id 会让工单时间线
     /// 退化成运维噪声，而分开取两处则可能拿到不同架的 id 与 code。
+    ///
+    /// ⚠️ 批量路径（`batch_to_inspection`）**恒传 `force = false`** —— `BatchOpItem`
+    /// 是 to-ship / to-process / to-inspection **共用**的结构体，给它加 `force` 会把
+    /// 一个无意义字段漏进另两条端点。代价是「批量送检下工人手上的批次仍被 20103
+    /// 拒」，这条不对称已登记在 `dto.rs::BatchOpItem` 与 `transition.rs::
+    /// batch_to_inspection` 的 doc 里。
     #[allow(clippy::too_many_arguments)]
     pub async fn to_inspection_core<R: PartRepoTrait>(
         repo: &mut R,
@@ -452,6 +484,7 @@ impl BatchService {
         expected_batch_version: i32,
         quantity: Option<i32>,
         note: Option<&str>,
+        force: bool,
         current: &CurrentUser,
     ) -> Result<ToXxxOut, AppError> {
         // 1. 品检架由 caller 选好（2026-10-10：`target_inspection_shelf_id` 入参删除）。
@@ -493,14 +526,22 @@ impl BatchService {
         // 'INSPECTION_SHELF' / 'WORKER' / 'OUTSOURCE_COMPANY' / 'OFFICE'）。
         // IN_PROCESS 状态要求 location='PRODUCTION_SHELF'；否则按目标位置
         // 分类报错（工人持有 / 非生产架持有）。
+        //
+        // ⚠️ 2026-10-17：`force=true` **只**把 `Some("WORKER")` 那一支从「拒」改成
+        // 「放行」，另外两支（`Some(other)` 非生产架 / `None` 空 location）刻意不动
+        // —— 理由与回归测试见本函数 doc 的 `# force` 一节。
         if from == PartStatus::IN_PROCESS {
             match target.location.as_deref() {
                 Some("PRODUCTION_SHELF") => { /* 放行 */ }
                 Some("WORKER") => {
-                    return Err(AppError::biz(
-                        code::BIZ_INVALID_TRANSITION,
-                        "工人持有件请先归还或送检".to_string(),
-                    ));
+                    if !force {
+                        return Err(AppError::biz(
+                            code::BIZ_INVALID_TRANSITION,
+                            "工人持有件请先归还或送检（force=true 可强制送检）".to_string(),
+                        ));
+                    }
+                    // force 放行：不改任何 holder —— 下面的 `mark_batch_inspected`
+                    // 会把 `current_holder_id` **覆盖**成品检架 id（原工人 id 不留残留）。
                 }
                 Some(other) => {
                     return Err(AppError::biz(
@@ -540,7 +581,7 @@ impl BatchService {
             SyncOutcome::Changed(aid) => Some(aid),
             SyncOutcome::NoChange => None,
         };
-        // 9. 写 INSPECTED 事件日志
+        // 9. 写事件日志（2026-10-17：`force` 走**另一个** event_type）
         let event_id = snowflake.next_id();
         // note 用货架 **code**（人类可读），不是 id：这条 note 直接显示在工单时间线上。
         let note_text = match from {
@@ -549,21 +590,40 @@ impl BatchService {
             PartStatus::IN_PROCESS => format!("送检：来自生产架 → 品检架 {target_shelf_code}"),
             _ => format!("送检 → 品检架 {target_shelf_code}"),
         };
+        // ⚠️ 前缀加在**最终 note**（caller 自带 note 时也照加），不是只加在自动生成
+        // 的 `note_text` 上 —— 否则调用方一旦传了 note，强制痕迹就整个消失，时间线
+        // 分不出这次是不是强制送检。措辞对齐 `part::service::lifecycle::force_complete`
+        // 的 `[FORCE]` 口径（同一批事件日志的两种「运营越权代做」标记）。
+        let note_owned = note.map(str::to_string).unwrap_or(note_text);
+        let note_final = if force {
+            format!("[FORCE] {note_owned}")
+        } else {
+            note_owned
+        };
         insert(
             repo.conn_mut(),
             NewPartEvent {
                 id: event_id,
                 part_id,
-                event_type: "INSPECTED",
+                event_type: if force {
+                    EVENT_FORCED_SENT_TO_INSPECTION
+                } else {
+                    EVENT_INSPECTED
+                },
                 from_status: Some(from.as_str()),
                 to_status: Some("INSPECTION"),
                 batch_id: Some(operated_id),
                 quantity: Some(target.quantity),
                 drawing_code: Some(&part.drawing_no),
                 badge_code: None,
+                // ⚠️ `worker_id` / `process_id` 在**普通送检**下就恒 `None`（发起者是
+                // 品检员账号不是工人），强制路径沿用同一口径 —— 这是「强制送检不计入
+                // 该工人报工统计」的第一道保险；第二道是 statistics 侧
+                // `effective_minutes::WHERE_SQL` 的 event_type 白名单天然排除
+                // `FORCED_SENT_TO_INSPECTION`。**不要**在这里填原工人 id。
                 worker_id: None,
                 process_id: None,
-                note: note.or(Some(&note_text)),
+                note: Some(&note_final),
                 created_by: Some(current.id),
             },
         )

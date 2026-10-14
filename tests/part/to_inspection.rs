@@ -3,6 +3,9 @@
 //! 覆盖：
 //!   - to-inspection：happy path ×3（PENDING / PROGRAMMING / IN_PROCESS+PRODUCTION_SHELF）
 //!   - to-inspection：IN_PROCESS+WORKER / IN_PROCESS+非 PRODUCTION_SHELF holder 拒绝
+//!   - to-inspection：★ `force=true` 强制送检（2026-10-17）—— 工人手上批次放行 /
+//!     事件写 `FORCED_SENT_TO_INSPECTION` + `worker_id IS NULL` / OCC 仍生效 /
+//!     非生产架与空 location 两支**不放宽** / 部分数量下余量仍留在工人手上
 //!   - to-inspection：target shelf zone≠INSPECTION / is_active=false 拒绝
 //!   - batch-to-inspection：items 空 / 超 200 / 3 件混合 / CLERK 越权
 //!   - to-inspection partial-split：PENDING 批次 qty=10 → quantity=3，拆批
@@ -152,6 +155,52 @@ async fn batch_version(pool: &PgPool, batch_id: i64) -> i32 {
         .fetch_one(pool)
         .await
         .expect("batch not found")
+}
+
+/// 插一个 `t_worker` 行（`force` 场景需要一个**真实的**持有人，而不是字面量 id）。
+///
+/// 为什么不复用既有用例里的 `fake_holder: i64 = 999_999_999`：那批用例只需要
+/// 「`location='WORKER'`」这一列去撞闸门，holder 是不是真工人无所谓；而本节要断言
+/// 「强制送检后 `current_holder_id` 被**覆盖**成品检架 id、原工人不留残留」，
+/// 拿一个不存在的 id 当原持有人会把这句断言变成同义反复（覆盖了谁？）。
+async fn insert_worker(pool: &PgPool, badge: &str, name: &str, work_type_id: i64) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+    let id = shared_test_snowflake().next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_worker (id, badge_code, name, is_active, work_type_id, version, \
+         created_at, updated_at) \
+         VALUES ($1, $2, $3, true, $4, 0, $5, $5)",
+    )
+    .bind(id)
+    .bind(badge)
+    .bind(name)
+    .bind(work_type_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_worker");
+    id
+}
+
+/// 把批次落到指定 `location` / 持有人上（`IN_PROCESS` 组合校验的三种起手形态共用）。
+async fn place_batch(pool: &PgPool, batch_id: i64, location: Option<&str>, holder: Option<i64>) {
+    sqlx::query("UPDATE t_part_batch SET location = $1, current_holder_id = $2 WHERE id = $3")
+        .bind(location)
+        .bind(holder)
+        .bind(batch_id)
+        .execute(pool)
+        .await
+        .expect("place batch");
+}
+
+/// 读批次三元组 `(status, location, current_holder_id)`。
+async fn read_placement(pool: &PgPool, batch_id: i64) -> (String, Option<String>, Option<i64>) {
+    sqlx::query_as("SELECT status, location, current_holder_id FROM t_part_batch WHERE id = $1")
+        .bind(batch_id)
+        .fetch_one(pool)
+        .await
+        .expect("read batch placement")
 }
 
 // ===========================================================================
@@ -442,6 +491,389 @@ async fn to_inspection_in_process_non_production_shelf_rejected() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
     assert_eq!(body["code"], 20103);
     assert!(body["message"].as_str().unwrap().contains("不在生产架上"));
+}
+
+// ===========================================================================
+//  强制送检（`force=true`，2026-10-17 新增）
+//
+//  需求：待品检页扫码后，批次若**压在工人手上**原本无法送检，现在可以直接送检；
+//  但事件记为**强制送检**，**不计**该工人的报工统计。
+//
+//  ⚠️ `force` **只**放宽 `location='WORKER'` 一支；另两支（非生产架 / 空 location）
+//     与 OCC 都不动。下面 6 条用例把这条边界逐面钉死。
+// ===========================================================================
+
+/// ★ 强制送检 happy path：`IN_PROCESS + WORKER + force=true` ⇒ 200，批次落品检架。
+///
+/// 断言的重点是**持有人被覆盖**：`mark_batch_inspected` 的
+/// `new_holder_id = Some(shelf_id)` + `clear_holder_id: false`（= 覆盖写而非清空）
+/// ⇒ 原工人 id 必须**不再出现在**批次行上，否则工人额度会被一件已不在手上的货
+/// 永久占住（与 `CLAUDE.md`「终态批次一律不在任何人手上」同源的卫生要求）。
+#[tokio::test]
+async fn to_inspection_force_allows_worker_held_batch() {
+    let (pool, app, token, fx) = bootstrap_as_inspector().await;
+    let worker_id = insert_worker(&pool, "FX-FORCE-1", "强制送检工人", fx.work_type_id).await;
+    let (part_id, batch_id) = insert_part_with_batch(
+        &pool,
+        "P0-FORCE",
+        fx.customer_l2_id,
+        Some("P000-FORCE"),
+        "IN_PROCESS",
+        5,
+    )
+    .await;
+    place_batch(&pool, batch_id, Some("WORKER"), Some(worker_id)).await;
+    let v = batch_version(&pool, batch_id).await;
+
+    let (status, body) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/batches/{batch_id}/to-inspection"),
+            Some(json!({
+                "version": v,
+                "force": true,
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(body["code"], 0);
+    assert_eq!(body["data"]["part"]["status"], "INSPECTION");
+    assert_eq!(body["data"]["part"]["id"], part_id.to_string());
+
+    let (b_status, location, holder) = read_placement(&pool, batch_id).await;
+    assert_eq!(b_status, "INSPECTION", "强制送检后批次状态: {body}");
+    assert_eq!(
+        location.as_deref(),
+        Some("INSPECTION_SHELF"),
+        "强制送检后批次必须落到品检架: {body}"
+    );
+    assert_eq!(
+        holder,
+        Some(fx.inspection_shelf_id),
+        "原工人 id 必须被品检架 id **覆盖**（不是叠加、也不是留残留）"
+    );
+    assert_ne!(
+        holder,
+        Some(worker_id),
+        "前提钉死：品检架 id 与原工人 id 不同，否则上一条是同义反复"
+    );
+}
+
+/// ★ 强制送检的事件：`FORCED_SENT_TO_INSPECTION` + `worker_id IS NULL`。
+///
+/// 这是「不计入该工人报工统计」的**第一道保险**（写侧就不挂工人）：第二道是
+/// statistics 侧 `effective_minutes::WHERE_SQL` 的
+/// `event_type IN ('RETURNED_TO_SHELF','SENT_TO_INSPECTION')` 白名单天然排除本值
+/// （见 `docs/api/statistics.md`）。两道保险都要断言得动 —— 只断言 event_type 不
+/// 够：白名单被谁放宽了，本用例查不出来。
+#[tokio::test]
+async fn to_inspection_force_writes_forced_event_with_null_worker() {
+    let (pool, app, token, fx) = bootstrap_as_inspector().await;
+    let worker_id = insert_worker(&pool, "FX-FORCE-2", "强制送检工人2", fx.work_type_id).await;
+    let (part_id, batch_id) = insert_part_with_batch(
+        &pool,
+        "P0-FORCE-EV",
+        fx.customer_l2_id,
+        Some("P000-FORCE-EV"),
+        "IN_PROCESS",
+        5,
+    )
+    .await;
+    place_batch(&pool, batch_id, Some("WORKER"), Some(worker_id)).await;
+    let v = batch_version(&pool, batch_id).await;
+
+    let (status, body) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/batches/{batch_id}/to-inspection"),
+            Some(json!({ "version": v, "force": true })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+
+    // 该工单下的事件集合：强制路径**只**写 FORCED_*，绝不能再落一条 INSPECTED
+    let mut types: Vec<String> =
+        sqlx::query_scalar("SELECT event_type FROM t_part_event WHERE part_id = $1")
+            .bind(part_id)
+            .fetch_all(&pool)
+            .await
+            .expect("读工单事件");
+    types.sort();
+    assert_eq!(
+        types,
+        vec!["FORCED_SENT_TO_INSPECTION".to_string()],
+        "强制送检只应写一条 FORCED_SENT_TO_INSPECTION 事件: {body}"
+    );
+
+    let (event_worker, event_process, note): (Option<i64>, Option<i64>, Option<String>) =
+        sqlx::query_as(
+            "SELECT worker_id, process_id, note FROM t_part_event \
+             WHERE part_id = $1 AND event_type = 'FORCED_SENT_TO_INSPECTION'",
+        )
+        .bind(part_id)
+        .fetch_one(&pool)
+        .await
+        .expect("读强制送检事件行");
+    assert_eq!(
+        event_worker, None,
+        "强制送检的 worker_id 必须为 NULL（**绝不**填原工人 id）—— 否则会算进他的报工统计"
+    );
+    assert_eq!(event_process, None, "process_id 同理保持 NULL");
+    let note = note.expect("强制送检事件应带 note");
+    assert!(
+        note.starts_with("[FORCE] "),
+        "note 必须带 [FORCE] 前缀（对齐 FORCE_COMPLETED 的口径）: {note}"
+    );
+    assert!(
+        note.contains("FX-SH-INSP"),
+        "自动生成的 note 仍须含货架 code: {note}"
+    );
+}
+
+/// `force` **不绕过** OCC：version 陈旧仍 40901。
+///
+/// 防止「加了个跳过所有校验的 force 分支」这种实现 —— 运营点按钮时页面上的快照同样
+/// 可能过期，放宽 OCC 会让并发下的最后一次覆盖静默成功。
+#[tokio::test]
+async fn to_inspection_force_does_not_bypass_occ() {
+    let (pool, app, token, fx) = bootstrap_as_inspector().await;
+    let worker_id = insert_worker(&pool, "FX-FORCE-3", "强制送检工人3", fx.work_type_id).await;
+    let (_part_id, batch_id) = insert_part_with_batch(
+        &pool,
+        "P0-FORCE-OCC",
+        fx.customer_l2_id,
+        Some("P000-FORCE-OCC"),
+        "IN_PROCESS",
+        5,
+    )
+    .await;
+    place_batch(&pool, batch_id, Some("WORKER"), Some(worker_id)).await;
+    let v = batch_version(&pool, batch_id).await;
+
+    let (status, body) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/batches/{batch_id}/to-inspection"),
+            Some(json!({ "version": v + 999, "force": true })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+    assert_eq!(body["code"], 40901, "force 不得绕过 OCC: {body}");
+
+    // 拒绝后批次原地不动（闸门在写之前）
+    let (b_status, location, holder) = read_placement(&pool, batch_id).await;
+    assert_eq!(b_status, "IN_PROCESS");
+    assert_eq!(location.as_deref(), Some("WORKER"));
+    assert_eq!(holder, Some(worker_id));
+}
+
+/// `force=true` **不放宽**空 `location` 那一支（数据完整性违规 ⇒ 仍 20103）。
+#[tokio::test]
+async fn to_inspection_force_still_rejects_null_location() {
+    let (pool, app, token, fx) = bootstrap_as_inspector().await;
+    let (_part_id, batch_id) = insert_part_with_batch(
+        &pool,
+        "P0-FORCE-NULL",
+        fx.customer_l2_id,
+        Some("P000-FORCE-NULL"),
+        "IN_PROCESS",
+        5,
+    )
+    .await;
+    place_batch(&pool, batch_id, None, None).await;
+    let v = batch_version(&pool, batch_id).await;
+
+    let (status, body) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/batches/{batch_id}/to-inspection"),
+            Some(json!({ "version": v, "force": true })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+    assert_eq!(body["code"], 20103);
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("batch.location 为空"),
+        "force 只放宽 WORKER 一支，空 location 的报错文案不应变: {body}"
+    );
+}
+
+/// `force=true` **不放宽**非生产架（`OFFICE`）那一支 ⇒ 仍 20103。
+///
+/// `OFFICE` 是「这批货压根不在生产流里」（已交付待发货区），与「在工人手上」语义
+/// 完全不同；需求没要求放宽它。
+#[tokio::test]
+async fn to_inspection_force_still_rejects_non_production_shelf_location() {
+    let (pool, app, token, fx) = bootstrap_as_inspector().await;
+    let (_part_id, batch_id) = insert_part_with_batch(
+        &pool,
+        "P0-FORCE-OFF",
+        fx.customer_l2_id,
+        Some("P000-FORCE-OFF"),
+        "IN_PROCESS",
+        5,
+    )
+    .await;
+    place_batch(&pool, batch_id, Some("OFFICE"), None).await;
+    let v = batch_version(&pool, batch_id).await;
+
+    let (status, body) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/batches/{batch_id}/to-inspection"),
+            Some(json!({ "version": v, "force": true })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+    assert_eq!(body["code"], 20103);
+    assert!(
+        body["message"].as_str().unwrap().contains("不在生产架上"),
+        "force 只放宽 WORKER 一支，非生产架的报错文案不应变: {body}"
+    );
+}
+
+/// ★ 强制送检 + 部分数量：operated 批次进品检架，**余量批次仍留在工人手上**。
+///
+/// 拆批走 `_split_batch_inner` 的 `INSERT ... SELECT`：新拆出的 operated 批次
+/// **继承**源批次的 `location='WORKER'` + 原工人 id，随后被 `mark_batch_inspected`
+/// 翻成 `INSPECTION_SHELF` + 品检架；而**余量批次（源批次本身）原地不动**。
+/// 这是**语义正确**的（工人确实还拿着那部分），因此刻意不清 —— 本用例把它钉死，
+/// 免得后人当「残留」去"修"。
+#[tokio::test]
+async fn to_inspection_force_partial_quantity_leaves_remainder_on_worker() {
+    let (pool, app, token, fx) = bootstrap_as_inspector().await;
+    let worker_id = insert_worker(&pool, "FX-FORCE-4", "强制送检工人4", fx.work_type_id).await;
+    let (part_id, batch_id) = insert_part_with_batch(
+        &pool,
+        "P0-FORCE-QTY",
+        fx.customer_l2_id,
+        Some("P000-FORCE-QTY"),
+        "IN_PROCESS",
+        5,
+    )
+    .await;
+    place_batch(&pool, batch_id, Some("WORKER"), Some(worker_id)).await;
+    let v = batch_version(&pool, batch_id).await;
+
+    let (status, body) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/batches/{batch_id}/to-inspection"),
+            Some(json!({ "version": v, "force": true, "quantity": 3 })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(
+        body["data"]["new_batch_id"],
+        batch_id.to_string(),
+        "remainder id 应回填为源批次 id（余量留在源批次）: {body}"
+    );
+
+    // operated（新拆出的）批次：已进品检架
+    let operated_id: i64 = sqlx::query_scalar(
+        "SELECT id FROM t_part_batch WHERE part_id = $1 AND status = 'INSPECTION' \
+         AND deleted_at IS NULL",
+    )
+    .bind(part_id)
+    .fetch_one(&pool)
+    .await
+    .expect("读 operated 批次");
+    let (op_status, op_loc, op_holder) = read_placement(&pool, operated_id).await;
+    assert_eq!(op_status, "INSPECTION");
+    assert_eq!(op_loc.as_deref(), Some("INSPECTION_SHELF"));
+    assert_eq!(op_holder, Some(fx.inspection_shelf_id));
+
+    // 余量批次（源批次）：仍在工人手上
+    let (rem_status, rem_loc, rem_holder): (String, Option<String>, Option<i64>) = sqlx::query_as(
+        "SELECT status, location, current_holder_id FROM t_part_batch WHERE id = $1",
+    )
+    .bind(batch_id)
+    .fetch_one(&pool)
+    .await
+    .expect("读余量批次");
+    assert_eq!(rem_status, "IN_PROCESS", "余量批次状态不变: {body}");
+    assert_eq!(
+        rem_loc.as_deref(),
+        Some("WORKER"),
+        "余量仍在工人手上（语义正确，刻意不清）: {body}"
+    );
+    assert_eq!(
+        rem_holder,
+        Some(worker_id),
+        "余量的持有人仍是原工人: {body}"
+    );
+    let rem_qty: i32 = sqlx::query_scalar("SELECT quantity FROM t_part_batch WHERE id = $1")
+        .bind(batch_id)
+        .fetch_one(&pool)
+        .await
+        .expect("读余量数量");
+    assert_eq!(rem_qty, 2, "余量 = 5 - 3");
+}
+
+/// `force` 的 `[FORCE]` 前缀加在**最终 note** 上，caller 自带 note 时也照加。
+///
+/// 若只在自动生成的 note 上加前缀，调用方一旦传了 note（品检页的备注框）强制痕迹
+/// 就整个消失，时间线分不出这次是不是强制送检。
+#[tokio::test]
+async fn to_inspection_force_prefixes_caller_supplied_note() {
+    let (pool, app, token, fx) = bootstrap_as_inspector().await;
+    let worker_id = insert_worker(&pool, "FX-FORCE-5", "强制送检工人5", fx.work_type_id).await;
+    let (part_id, batch_id) = insert_part_with_batch(
+        &pool,
+        "P0-FORCE-N",
+        fx.customer_l2_id,
+        Some("P000-FORCE-N"),
+        "IN_PROCESS",
+        5,
+    )
+    .await;
+    place_batch(&pool, batch_id, Some("WORKER"), Some(worker_id)).await;
+    let v = batch_version(&pool, batch_id).await;
+
+    let (status, body) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/batches/{batch_id}/to-inspection"),
+            Some(json!({ "version": v, "force": true, "note": "工人离场，运营代送检" })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+
+    let note: String = sqlx::query_scalar(
+        "SELECT note FROM t_part_event WHERE part_id = $1 AND event_type = 'FORCED_SENT_TO_INSPECTION'",
+    )
+    .bind(part_id)
+    .fetch_one(&pool)
+    .await
+    .expect("读强制送检事件 note");
+    assert_eq!(
+        note, "[FORCE] 工人离场，运营代送检",
+        "caller 自带 note 时也必须保留 [FORCE] 前缀: {note}"
+    );
 }
 
 /// 2026-10-10：`target_inspection_shelf_id` 已删除 ⇒ 「指定一个 PRODUCTION 架当

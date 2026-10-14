@@ -63,6 +63,27 @@ pub struct ToShipRequest {
 /// 老客户端多发的 `shelf_id` 会被 serde 静默忽略（本仓生产代码零
 /// `deny_unknown_fields`），故移除是**向后兼容**的；但新客户端发老版本服务端
 /// 会得 422（字段必填缺失），**部署顺序必须后端先上**。
+///
+/// ## `force`：强制送检（2026-10-17 新增）
+///
+/// 缺省 = `false`（`#[serde(default)]`）⇒ 老客户端不发该字段时**行为逐字不变**，
+/// 既是向后兼容也是「默认口径不放松」的要求。
+///
+/// 为 `true` 时，`to_inspection_core` **只**放宽 `IN_PROCESS + location='WORKER'`
+/// 这一支（原本 20103「工人持有件请先归还或送检」）—— 待品检页扫码到压在工人手上的
+/// 批次时可直接强制送检。⚠️ **另外两支不放宽**：`Some(other)`（非生产架，如
+/// `INSPECTION_SHELF` / `OFFICE` / `OUTSOURCE_COMPANY`）与 `None`（空 location，
+/// 数据完整性违规）仍各返 20103，需求未要求放宽。
+///
+/// 副作用（全部刻意）：
+/// - 事件写 `FORCED_SENT_TO_INSPECTION`（不是 `INSPECTED`），note 前缀 `[FORCE]`；
+/// - 该事件 `worker_id` / `process_id` 恒 `None` ⇒ **不计入**该工人的报工统计
+///   （有效工时口径只认 `RETURNED_TO_SHELF` / `SENT_TO_INSPECTION`，见
+///   `docs/api/statistics.md`）；
+/// - **不绕过 OCC** —— `version` 仍必填且仍逐条比对，陈旧值返 40901；
+/// - **批量端点不支持**（`POST /prod/batches/to-inspection`）：见 [`BatchOpItem`]。
+///
+/// 权限与普通送检**完全同款**（复用既有 `batch.transition` 权限点），不新增守卫。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ToInspectionRequest {
     pub version: i32,
@@ -70,6 +91,9 @@ pub struct ToInspectionRequest {
     pub note: Option<String>,
     #[serde(default)]
     pub quantity: Option<i32>,
+    /// 强制送检开关；`false` = 老行为。语义见本结构 doc 的 `## force` 一节。
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// `POST /api/v2/prod/batches/{batch_id}/to-process` 入参。
@@ -100,6 +124,18 @@ pub struct ToProcessRequest {
 /// 缺字段 → 40001 VALIDATION_ERROR；找不到批次 → 20109。
 /// `version`：**必填**；不符 → 该 item 落 `failed[] { code: 40901 }`，不中断其余
 /// item（per-item savepoint 回滚）。
+///
+/// ## ⚠️ 刻意**没有** `force` 字段（2026-10-17 登记的不对称）
+///
+/// 单件端点 `POST /prod/batches/{batch_id}/to-inspection` 的
+/// [`ToInspectionRequest`] 有 `force`（强制放行「工人手上的批次」），而本结构
+/// **共用**于 to-ship / to-process / to-inspection 三条批量端点，给它加 `force`
+/// 会把一个无意义字段漏进另外两条。故批量送检**恒传 `force = false`**：
+/// **批量路径下 `IN_PROCESS + location='WORKER'` 的批次仍落 `failed[] { code:
+/// 20103 }`**。这是刻意的不对称，不是遗漏 —— 前端实测只调单件端点（批量端点只有
+/// api 层封装 + 一条 routes.spec，零 view 调用方）。若将来批量端点真需要强制送检，
+/// 正确做法是给 `BatchToInspectionRequest` 单独一个**顶层** `force` 字段
+/// （语义覆盖全部 item），而不是塞进 `BatchOpItem`。
 #[derive(Debug, Clone, Deserialize)]
 pub struct BatchOpItem {
     pub batch_id: String,

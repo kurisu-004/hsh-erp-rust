@@ -140,6 +140,7 @@ JOIN 不过滤 `deleted_at`，软删工序仍显原名。
 | `TAKEN_FROM_POOL` | ❌ | 同上，从候选池领取是「开始」 |
 | `MOVED` | ❌ | 同上；且它有三个方向，只有 POOL→WORKER 是「开始加工」，另两个是放回与转手 |
 | `INSPECTED` | ❌ | **品检员**动作，不是工人作业（写点在 `prod::batch` 的批次扫码与状态流转两处） |
+| `FORCED_SENT_TO_INSPECTION` | ❌ | 2026-10-17 新增：品检页对「**压在工人手上**的批次」的强制送检（`POST /prod/batches/{batch_id}/to-inspection` 带 `force=true`）。它是**运营代工人做的**一次越权送检，不是工人完成了一道工序 ⇒ 与 `SENT_TO_INSPECTION`（工人**主动**送检、计入）严格区分。**两道独立保险**：① `effective_minutes::WHERE_SQL` 的 `event_type IN ('RETURNED_TO_SHELF','SENT_TO_INSPECTION')` 白名单天然排除本值；② 写侧该事件的 `worker_id` / `process_id` 恒 `None`（`JOIN t_worker w` 是 INNER + `worker_id IS NOT NULL`，见 §4.8）。⇒ **SQL 一字未改**，本行是纯登记 |
 | `DELIVERED` | ❌ | 无工序语义 |
 | 其余全部 | ❌ | 非「工人完成一道工序」语义 |
 

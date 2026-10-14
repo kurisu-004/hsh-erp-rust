@@ -367,11 +367,20 @@ JOIN 只有 2 张：`t_part_batch` JOIN `t_part` JOIN `t_customer`（2026-10-17 
 | 用途 | 端点 |
 |---|---|
 | 送检 | `POST /api/v2/prod/batches/{batch_id}/to-inspection` |
+| ★ **强制送检**（2026-10-17 新增）：批次压在**工人手上**时，品检页可直接送检 | 同上 + body `{ version, force: true }`。闸门与边界（只放宽 `location='WORKER'` 一支 / 不绕过 OCC / **批量端点不支持** / 部分数量下余量仍留在工人手上）见 [`batch.md`](batch.md) §2.1b |
 | 品检通过（部分通过） | `POST /api/v2/prod/batches/{batch_id}/to-ship` |
 | 指定工序 | `POST /api/v2/prod/batches/{batch_id}/to-process` |
 | 扫码流转 | `POST /api/v2/prod/batches/{batch_id}/scan-inspect` |
 
 本域只提供**读**上下文；所有写动作由 `prod::batch` 的 handler / service 执行并开事务、发 WS 广播。
+
+⚠️ **「强制送检」的数据前提在本域**：`ScanBatchOut` 的 `location` 与
+`current_holder_display` 两列（§2.5）是前端判定「该批次能不能走强制送检」的**唯一**
+依据 —— 前端要拿 `location == "WORKER"` 判位置、拿 `current_holder_display` 里的
+**工人名**供人工核对「是谁拿着」（避免把 A 工人的件按 B 工人处置）。本端点**纯读**、
+不代前端做决策：不派 `action`、不派生 `can_force`，状态/位置闸门一律在前端
+（与 `ScanBatchOut::status` 的 doc 同一口径）。回归
+`tests/production/inspection.rs::worker_held_batch_exposes_location_and_worker_holder_name`。
 
 ### 8.4 已知偏差登记
 
@@ -380,6 +389,7 @@ JOIN 只有 2 张：`t_part_batch` JOIN `t_part` JOIN `t_customer`（2026-10-17 
 3. **`current_holder_display` 的 holder 三表 COALESCE 多态歧义**（§2.5，本形态全仓第 6 处）。产品决议（2026-10-07）：**不处理**（需先确认「清脏数据」还是「改判别式」，且修必须 6 处同批）。
 4. **读端点不开事务 ⇒ 装配件分支的 2~4 条语句不保证同一快照**（READ COMMITTED 下每条语句各看一个快照）。理论上的可撕裂场景：4 条语句之间被扫中的子件被软删 ⇒ `children` 里没有自己刚扫的码、全树 `is_scanned = false`，**无任何错误提示**。发生概率极低，且全仓读端点都是这个形态（读端点不开事务是本仓约定），故不改；真要消除只能给读端点开 REPEATABLE READ 快照事务，属跨域惯例改动。
 5. **⚠️ `customer_id` / `limit` / `offset` 的空串容错与 `prod::programming` 相反，且无测试钉住**（§3.1 / §4.3）。本域三个字段复用 `shared::types::deserialize_i64_opt`（不 trim、不放行空串），`prod::programming` 三个字段走**该域**私有的宽松版 helper（trim + 空串按缺省）—— 后者正是当初被 `?limit=` 的 400 逼出来的（见 `src/modules/prod/programming/dto.rs` 模块 doc）。⚠️ `tests/part/inspection_batches.rs` **无空串用例** ⇒ 这条宽容度分叉在 CI 上没有任何保护，后人「顺手对齐」或「顺手收紧」都不会被测试拦住。产品决议（2026-10-07）：**不处理**（本域前端目前不发空串）；⚠️ 改任一侧的 i64 反序列化前必须先看另一侧，并补一条空串用例。
+6. **⚠️ 「强制送检」的按钮显隐判定在前端，后端不给判据**（2026-10-17 新增）。品检页要能对「压在工人手上的批次」直接送检，需自行按 `ScanBatchOut.location == "WORKER"` 决定是否渲染该按钮；后端**刻意不在扫码树里加** `can_force` / `action` 之类派生字段 —— 本域的定位是「读上下文」，任何动作闸门都由前端按批次字段决定（与 `status` 不在本域过滤、只原文透出同一口径）。⇒ **代价**：这条判据在前端改版时可能与后端闸门漂移（例如前端只判 `status=='IN_PROCESS'` 而漏判 `location`，用户点了得到 20103「工人持有件请先归还或送检」；或前端放宽到 `location='OFFICE'`，得到 20103「不在生产架上」）。后端那一侧的口径以 [`batch.md`](batch.md) §2.1b 的四行闸门表为**唯一真源**，前端若要更友好可据 `disabled_reason` 自造文案。产品决议（2026-10-17）：**接受**（后端零改动、错误码已有明确文案，前端一行判据即可）。
 
 ## 9. 域隔离
 

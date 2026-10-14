@@ -47,12 +47,17 @@
 --  （否则登录阶段就被拦掉，测不到 service 层的 40300）。
 --
 --  ## 预置零件行清单
---  PART_STANDALONE —— 独立件（assembly_id IS NULL），挂 8 个批次覆盖
---                     **全部**批次状态（扫码树不按状态过滤）
+--  PART_STANDALONE —— 独立件（assembly_id IS NULL），挂 9 个批次覆盖
+--                     **全部**批次状态（扫码树不按状态过滤）**外加一条
+--                     worker-held 批次**（2026-10-17 新增，见批次段注释）
 --  PART_CHILD_1     —— 装配件子件 #1（有 INSPECTION 批次，被扫中的就是它）
 --  PART_CHILD_2     —— 装配件子件 #2（**无批次**，验「children 仍是全部子件」）
 --  PART_CHILD_3     —— 装配件子件 #3（**无批次**，验上一条不是巧合）
 --  PART_CHILD_DELETED —— 装配件子件 #4 但 deleted_at 非空（软删闸门）
+--  WORKER_A         —— 工人档案，仅供 worker-held 批次的 holder 解析
+--                     （⚠️ 2026-10-17 新增；本行 ID 与批次段的 301+ 同段，
+--                      字面值镜像在 tests/production/inspection.rs 的
+--                      `WORKER_HELD_BATCH_ID` / `WORKER_NAME` 常量上）
 --
 --  ## OCC 锚口径（★ 前端最容易踩的一处）
 --  t_part.version 与 t_part_batch.version 是**两列**：前者是整个工单的聚合投影，
@@ -129,12 +134,26 @@ VALUES
     -- 软删子件 #4（deleted_at 非空）：扫不到、也不出现在装配件树的 children 里
     (9000000000000000283, 'SI-ASM-04', 'SI child deleted', 'D-SI-05', 'SI', now(), now() + INTERVAL '30 days', 'PENDING', false, 9000000000000000262, 5, 0, 0, 9000000000000000278, NULL, 0, now(), now(), now());
 
+-- ---- 工人（2026-10-17 新增：WORKER-held 批次的持有人） --------------------
+-- 扫码树出参 `current_holder_display` = COALESCE(s.name, w.name, oc.name)
+-- （src/modules/prod/inspection/repo.rs::list_batches_by_part_ids），故要拿到
+-- 「工人名」这一列，库里必须真有 t_worker 行 —— 只写一个不存在的 id 的话该列退化成
+-- null，无法证明品检页渲染「强制送检」按钮所需的数据后端已给全。
+-- ⚠️ t_worker 无物理外键，ID 只需与本 fixture 其余行不相交；本段取 301+（见头注释）。
+INSERT INTO t_worker (id, badge_code, name, is_active, work_type_id, version, created_at, updated_at)
+VALUES (9000000000000000301, 'SI-BADGE-1', 'SI worker A', true, NULL, 0, now(), now());
+
 -- ---- 批次行（t_part_batch） -------------------------------------------------
 -- ⚠️ 两条口径在下面被**写死**：
 --  1. INSPECTION / READY_TO_SHIP 批次的 current_process_id 恒 NULL（出池清该列的
 --     不变式 ⇒ 扫码树里它们的 process_name 恒 null，这是正确行为不是缺陷）；
 --  2. IN_PROCESS 批次带 current_process_id ⇒ process_name 取到工序名。
 -- INSPECTION 区货架 holder 走 t_shelf，location 写 'INSPECTION_SHELF'。
+-- ⚠️ 2026-10-17：新增最后一条 —— IN_PROCESS + location='WORKER' + 持有人是**工人**
+--    （此前 8 条活跃批次里没有一条 worker-held 行）。它是「强制送检」入口的数据前提：
+--    待品检页扫码后若批次压在工人手上，后端必须能在扫码树里认出
+--    「location='WORKER' + 持有人是工人名」，前端才敢渲染「强制送检」按钮
+--    （写端点是 POST /prod/batches/{batch_id}/to-inspection 带 force=true）。
 INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, current_holder_id, current_process_id, is_repairing, version, created_at, updated_at, deleted_at)
 VALUES
     -- 独立件批次 1：INSPECTION 在品检架上（★ version=3 ≠ 零件 version=1）
@@ -153,5 +172,7 @@ VALUES
     (9000000000000000296, 9000000000000000279, 7, 1, 'IN_PROCESS',     'PRODUCTION_SHELF', 9000000000000000264, 9000000000000000266, true,  2, now(), now(), NULL),
     -- 独立件批次 8：软删批次（软删闸门：不出现在扫码树里）
     (9000000000000000297, 9000000000000000279, 8, 1, 'INSPECTION',     'INSPECTION_SHELF', 9000000000000000263, NULL,                 false, 9, now(), now(), now()),
+    -- 独立件批次 9（★ 2026-10-17 新增）：IN_PROCESS + location='WORKER' + 工人持有人
+    (9000000000000000302, 9000000000000000279, 9, 1, 'IN_PROCESS',     'WORKER',            9000000000000000301, 9000000000000000265, false, 0, now(), now(), NULL),
     -- 子件 #1 的唯一批次：INSPECTION 在品检架上（version=7，与子件 version=4 又不同）
     (9000000000000000300, 9000000000000000280, 1, 5, 'INSPECTION',     'INSPECTION_SHELF', 9000000000000000263, NULL,                 false, 7, now(), now(), NULL);

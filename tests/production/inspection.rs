@@ -3,9 +3,9 @@
 //! 端点：`GET /api/v2/prod/inspection/scan/{serial_no}`
 //!      （测试内路径 `/prod/inspection/scan/{serial_no}`，不带 `/api/v2` 前缀）
 //!
-//! 覆盖 13 个场景：
+//! 覆盖 14 个场景：
 //!   1. **独立件树**：`hit_kind="PART"`、`assembly=null`、`children.len()==1`，
-//!      该件的 `children` 是它的全部批次（8 个，含终态）
+//!      该件的 `children` 是它的全部批次（8 个，含终态 + worker-held）
 //!   2. **装配件树（★ 核心回归）**：扫子件 → `assembly` 非空、`children` 是**全部
 //!      子件**（含两个没有任何批次的子件）
 //!   3. **扫装配件条码** → `hit_kind="ASSEMBLY"`、树与场景 2 逐字段同形，但
@@ -25,6 +25,10 @@
 //!  12. **`is_repairing`** 标记透传
 //!  13. **序列号含 `/`**：`%2F` 正确编码后单段匹配 + `Path` 解码命中；未编码则
 //!      路由不匹配 → 404 **空响应体**（前端 `res.json()` 会抛解析异常）
+//!  14. **worker-held 批次**（2026-10-17 新增）：扫码树透出
+//!      `location='WORKER'` + `current_holder_display` 是**工人名** ⇒ 品检页渲染
+//!      「强制送检」按钮所需的数据后端已给全（写端点在 `prod::batch` 域，带
+//!      `force=true`）
 //!
 //! ## 集成测试范本（PR13 Phase F / H）
 //! HTTP helper（`send` / `json_request` / `login_token` / `test_app` / `test_state` /
@@ -44,12 +48,15 @@ use hsh_erp_test_support::{
 /// 扫码端点路径前缀（测试 app 不带 `/api/v2` 前缀）。
 const SCAN_PREFIX: &str = "/prod/inspection/scan";
 
-/// 独立件的全部 8 个批次 id，**按 `batch_no ASC` 的返回序**。
+/// 独立件的全部**活跃**批次 id，**按 `batch_no ASC` 的返回序**。
 ///
 /// 序 = 扫独立件时 `children[0].children` 的期望序（SQL 按 `batch_no ASC, id ASC`
 /// 排，内存分组后顺序不变），第 8 位在 fixture 里是软删批次 —— 它**不该**出现，
-/// 故本常量只列前 7 个活跃批次。
-const STANDALONE_BATCH_IDS: [i64; 7] = [
+/// 故本常量只列活跃批次。
+///
+/// ⚠️ 2026-10-17：末尾新增 `WORKER_HELD_BATCH`（batch_no=9，`location='WORKER'`），
+/// 故本数组由 7 项变 8 项；软删批次（batch_no=8）仍被软删闸门挡在外面。
+const STANDALONE_BATCH_IDS: [i64; 8] = [
     InspectionFixture::BATCH_INSPECTION,
     InspectionFixture::BATCH_PENDING,
     InspectionFixture::BATCH_IN_PROCESS,
@@ -57,7 +64,21 @@ const STANDALONE_BATCH_IDS: [i64; 7] = [
     InspectionFixture::BATCH_COMPLETED,
     InspectionFixture::BATCH_CANCELLED,
     InspectionFixture::BATCH_REPAIRING,
+    WORKER_HELD_BATCH_ID,
 ];
+
+/// ★ 2026-10-17：worker-held 批次的 id（`fixtures/inspection.sql` 批次段最后一条）。
+///
+/// ⚠️ **刻意不进 `InspectionFixture` 常量表**：那要求改
+/// `test-support/src/fixture/inspection.rs`，而它不在本次改动范围内。故此处
+/// 在测试侧镜像同一批字面值，并让本文件头部的「ID 段核对」注释与 fixture SQL
+/// 保持同一句约定。改动其一必须同步另一处（SQL 里 `batch_no=9` 那一行的 id）。
+const WORKER_HELD_BATCH_ID: i64 = 9_000_000_000_000_000_302;
+
+/// worker-held 批次的持有人（`fixtures/inspection.sql` 的 `t_worker` 行 id）。
+const WORKER_A_ID: i64 = 9_000_000_000_000_000_301;
+/// worker-held 批次的持有人名（扫码树 `current_holder_display` 的断言目标）。
+const WORKER_A_NAME: &str = "SI worker A";
 
 /// 装配件树的 3 个活跃子件 id，**按 `serial_no ASC` 的返回序**（子件序列号由父件
 /// 序列号派生 `{asm}-{i:02d}`，该序即业务装配序）。
@@ -457,7 +478,63 @@ async fn soft_deleted_child_and_batch_excluded() {
     assert_eq!(
         sorted(batches.clone()),
         sorted(STANDALONE_BATCH_IDS.iter().map(|i| i.to_string()).collect()),
-        "除软删批次外应恰好剩 fixture 的 7 个活跃批次: {standalone}"
+        "除软删批次外应恰好剩 fixture 的 8 个活跃批次: {standalone}"
+    );
+}
+
+/// 场景 14（★ 2026-10-17 新增）：**worker-held 批次**在扫码树里可被认出。
+///
+/// 这是「强制送检」入口的数据前提：待品检页扫码后若批次**压在工人手上**，前端要
+/// 判定「这个批次能走强制送检（写端点 `POST /prod/batches/{batch_id}/to-inspection`
+/// 带 `force=true`）」，所需的两列是：
+///
+/// - `location == "WORKER"` —— 位置事实；
+/// - `current_holder_display` 是**工人名** —— 让人工核对「是谁拿着」，避免把
+///   A 工人的件按 B 工人处置。
+///
+/// 本端点**纯读**、不代前端做决策（无 force 相关字段、无 action 派生）—— 与
+/// `ScanBatchOut` doc 的口径一致：状态闸门由前端按批次字段决定按钮显隐。
+#[tokio::test]
+async fn worker_held_batch_exposes_location_and_worker_holder_name() {
+    let (pool, app, token, _fx) = bootstrap().await;
+
+    // 前提：fixture 那一行确实是「IN_PROCESS + WORKER + 工人持有人」
+    let (b_status, b_location, holder): (String, Option<String>, Option<i64>) = sqlx::query_as(
+        "SELECT status, location, current_holder_id FROM t_part_batch WHERE id = $1",
+    )
+    .bind(WORKER_HELD_BATCH_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("读 worker-held 批次行");
+    assert_eq!(b_status, "IN_PROCESS", "前提：状态");
+    assert_eq!(b_location.as_deref(), Some("WORKER"), "前提：位置");
+    assert_eq!(holder, Some(WORKER_A_ID), "前提：持有人是工人");
+
+    let env = scan(&app, &token, InspectionFixture::STANDALONE_SERIAL_NO).await;
+    let part = part_by_id(&env, InspectionFixture::PART_STANDALONE);
+    let b = batch_by_id(part, WORKER_HELD_BATCH_ID, &env);
+
+    assert_eq!(
+        b["location"], "WORKER",
+        "扫码树必须原样透出 WORKER（前端据此渲染「强制送检」按钮）: {env}"
+    );
+    assert_eq!(
+        b["current_holder_display"], WORKER_A_NAME,
+        "持有人必须是工人名（COALESCE(s.name, w.name, oc.name) 的第二档）: {env}"
+    );
+
+    // 正面确认另外两档没被这条新行证伪：品检架行仍拼货架名、生产架行仍拼货架名
+    assert_eq!(
+        batch_by_id(part, InspectionFixture::BATCH_IN_PROCESS, &env)["current_holder_display"],
+        // 生产架名（`fixtures/inspection.sql` 货架段字面值；该常量不在
+        // `InspectionFixture` 里，本文件既有场景 11 也用同一个字面量）
+        "SI production shelf",
+        "生产架批次仍应拼出货架名（证明上条不是因为 COALESCE 恒返回工人名）: {env}"
+    );
+    assert_eq!(
+        batch_by_id(part, InspectionFixture::BATCH_PENDING, &env)["current_holder_display"],
+        serde_json::Value::Null,
+        "无持有人的批次该列为 null（不是空串）: {env}"
     );
 }
 
@@ -535,6 +612,8 @@ async fn all_batch_statuses_are_returned_including_terminal_ones() {
         (InspectionFixture::BATCH_COMPLETED, "COMPLETED"),
         (InspectionFixture::BATCH_CANCELLED, "CANCELLED"),
         (InspectionFixture::BATCH_REPAIRING, "IN_PROCESS"),
+        // 2026-10-17 新增：worker-held 批次，状态仍是 IN_PROCESS（只换位置）
+        (WORKER_HELD_BATCH_ID, "IN_PROCESS"),
     ]
     .iter()
     .map(|(id, st)| (id.to_string(), (*st).to_string()))
@@ -784,6 +863,7 @@ async fn is_repairing_flag_is_passed_through() {
         InspectionFixture::BATCH_READY_TO_SHIP,
         InspectionFixture::BATCH_COMPLETED,
         InspectionFixture::BATCH_CANCELLED,
+        WORKER_HELD_BATCH_ID,
     ] {
         assert_eq!(
             batch_by_id(part, id, &env)["is_repairing"],

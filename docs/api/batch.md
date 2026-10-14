@@ -46,7 +46,7 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
 | 3 | GET | `/repair` | 权限点 `batch.repair`（M,C,I） |
 | 4 | GET | `/repairing` | 权限点 `batch.repair`（M,C,I） |
 | 5 | POST | `/scan/deliver` | Manager + ShelfAccount（设备流，未迁权限点） |
-| 6 | POST | `/{batch_id}/to-inspection` | 权限点 `batch.transition`（M,I） |
+| 6 | POST | `/{batch_id}/to-inspection` | 权限点 `batch.transition`（M,I；**入参多一个 `force`，见 §2.1b**） |
 | 7 | POST | `/{batch_id}/to-ship` | 权限点 `batch.transition`（M,I） |
 | 8 | POST | `/{batch_id}/to-process` | 权限点 `batch.transition`（M,I） |
 | 9 | POST | `/{batch_id}/scan-inspect` | 权限点 `batch.transition`（M,I；service 内守卫） |
@@ -119,6 +119,72 @@ batch 域（`t_part_batch` 的批次流转）正在被**逐个端点**拆走。�
 **无权**而不是「架不存在」。这是**既有约束的延续** —— 自动选架之前，操作员在 UI 上选
 品检架时同样会被 `can_access_shelf(target)` 拒（`worker-scan` 的 INSPECTED 分支就是
 这条守卫）。只是**触发时机**从「选了一个越权的架」变成「scope 内没有品检架」。
+
+### 2.1b `to-inspection` 的 `IN_PROCESS + WORKER` 闸门与 `force` 强制送检
+
+> 2026-10-17 新增。⚠️ **本节内容此前只存在于代码注释**
+> （`src/modules/prod/batch/service/transition_core.rs` 的 `to_inspection_core`），
+> `docs/api/batch.md` 里一个字都没有 —— 而它是一条**会挡掉品检页主流程**的闸门。
+> 现在它变可选了（`force`），更该写进契约。
+
+#### 2.1b.1 三支闸门（`from == IN_PROCESS` 时按 `t_part_batch.location` 分流）
+
+`IN_PROCESS` 批次**应当**停在生产架上，否则按目标位置分类报错（HTTP 400 / `20103
+BIZ_INVALID_TRANSITION`）：
+
+| `location` | `force` 缺省（=false） | `force=true` | 报错文案（`force=false` 时） |
+|---|---|---|---|
+| `PRODUCTION_SHELF` | ✅ 放行 | ✅ 放行 | — |
+| `WORKER` | ❌ **20103** | ✅ **放行**（强制送检） | 「工人持有件请先归还或送检」 |
+| 其它值（`INSPECTION_SHELF` / `OFFICE` / `OUTSOURCE_COMPANY` …） | ❌ **20103** | ❌ **20103**（**不放宽**） | 「不在生产架上，无法送检（batch.location=…）」 |
+| `NULL` | ❌ **20103** | ❌ **20103**（**不放宽**） | 「batch.location 为空，无法送检」 |
+
+⚠️ **`force` 只放宽 `WORKER` 一支**，另两支**刻意不动**：`Some(other)` 表达「这批货
+压根不在生产流里」（已交付待发区 / 已在品检架 / 在外协厂），`NULL` 表达「行数据坏了」
+（任何 `IN_PROCESS` 批次必须挂在 `PRODUCTION_SHELF` / `WORKER` / `OUTSOURCE_COMPANY`
+之一）。运营的一键按钮不该替这两类兜底。回归由
+`tests/part/to_inspection.rs::to_inspection_force_still_rejects_null_location` 与
+`to_inspection_force_still_rejects_non_production_shelf_location` 双锁。
+
+⚠️ **`force` 不绕过 OCC**：`_assert_batch_version` 在放宽闸门**之前**执行，`version`
+仍必填、仍逐条比对 ⇒ 陈旧值返 HTTP 409 / `40901 VERSION_CONFLICT`
+（回归 `to_inspection_force_does_not_bypass_occ`）。权限也**完全同款**（复用既有
+`batch.transition` 权限点，无新增守卫）。
+
+⚠️ **`force` 只在单件端点有**：`POST /to-inspection`（批量）**恒不接受** `force`。
+`BatchOpItem` 是 to-ship / to-process / to-inspection **共用**的结构体，给它加 `force`
+会把一个无意义字段漏进另两条端点。⇒ **批量路径下 `IN_PROCESS + WORKER` 的批次仍落
+`failed[] { code: 20103 }`**（刻意的不对称；前端实测只调单件端点）。若将来批量端点
+真需要，正确做法是给 `BatchToInspectionRequest` 单独一个**顶层** `force` 字段
+（语义覆盖全部 item），而不是塞进 `BatchOpItem`。回归：
+`batch_to_inspection_mixed_partial_success`（既有用例里的第 3 件仍是 20103）。
+
+⚠️ **部分数量（`quantity < batch.quantity`）下的余量归属**：拆批走
+`_split_batch_inner` 的 `INSERT ... SELECT`，新拆出的 operated 批次**继承**源批次的
+`location` / `current_holder_id`（工人那一支就是 `location='WORKER'` + 原工人 id），
+随后被 `mark_batch_inspected` 翻成 `INSPECTION_SHELF` + 品检架；而**余量批次（源批次
+本身）原地不动**，`location` 仍是 `'WORKER'`、`current_holder_id` 仍是原工人 ——
+这是**语义正确**的（工人确实还拿着那部分），**刻意不清**。回归：
+`to_inspection_force_partial_quantity_leaves_remainder_on_worker`。
+
+#### 2.1b.2 本端点写的 `t_part_event` 事件类型
+
+| `force` | `event_type` | `worker_id` / `process_id` | `note` |
+|---|---|---|---|
+| 缺省 / `false` | `INSPECTED` | **均 `None`** | `note` 入参；缺省时自动生成「送检：来自〈来源〉→ 品检架 〈架 code〉」 |
+| `true` | **`FORCED_SENT_TO_INSPECTION`** | **均 `None`** | **前置 `[FORCE] `**，其余同上 |
+
+⚠️ **两条的 `worker_id` 都是 `None`** —— 发起者是品检员账号（`created_by`）而非工人，
+两者共用雪花 ID 空间但无映射表（见 `src/shared/part_event/mod.rs` 的模块 doc）。
+⇒ 有效工时口径（[`statistics.md`](statistics.md) §4.2）**SQL 一字未改**就自然排除了
+强制送检：白名单只认 `RETURNED_TO_SHELF` / `SENT_TO_INSPECTION`。
+
+⚠️ **前缀加在最终 note 上**（caller 自带 `note` 时也照加），否则品检页的备注框一填，
+强制痕迹就在时间线上整个消失。回归 `to_inspection_force_prefixes_caller_supplied_note`。
+
+全仓 `t_part_event.event_type` 的**写侧真源**是
+`src/shared/part_event/mod.rs::ALL_EVENT_TYPES`（含本表两个值）；改一侧必须同步另一侧
+（另有源码扫描型 lib 单测 `event_type_guard_tests` 守住「新增字面量必须登记」）。
 
 ### 2.2 ~~worker-scan 的三条分流~~（2026-10-10 迁往 `prod::scan`）
 

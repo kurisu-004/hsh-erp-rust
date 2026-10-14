@@ -283,6 +283,9 @@ impl BatchService {
     }
 
     /// to_inspection 薄包装（handler 调用）。
+    ///
+    /// `req.force`（2026-10-17 新增）原样透传给 core：它是**单件端点唯一**的强制送检
+    /// 入口（批量端点恒 `false`，见 [`BatchOpItem`] 的 doc）。
     pub async fn to_inspection<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
@@ -316,6 +319,7 @@ impl BatchService {
             req.version,
             req.quantity,
             req.note.as_deref(),
+            req.force,
             current,
         )
         .await
@@ -331,6 +335,12 @@ impl BatchService {
     /// - **选品检架在循环外做一次**（2026-10-10）：原实现也在循环外做一次
     ///   `target_inspection_shelf_id` 的 zone/active 校验，口径一致。选不出 →
     ///   顶层 `40301`（**整批失败**，不让 per-item 循环开始）。
+    ///
+    /// ⚠️ **不支持强制送检**（2026-10-17）：下面每个 item 恒传 `force = false` ——
+    /// `BatchOpItem` 是 to-ship / to-process / to-inspection **共用**的，给它加 `force`
+    /// 会把无意义字段漏进另两条端点。⇒ **批量路径下 `IN_PROCESS + location='WORKER'`
+    /// 的批次仍落 `failed[] { code: 20103 }`**（刻意的不对称，理由见
+    /// [`BatchOpItem`] 的 doc）。
     pub async fn batch_to_inspection<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
@@ -391,6 +401,8 @@ impl BatchService {
                 item.version,
                 item.quantity,
                 None,
+                // 批量端点恒不强制送检（见本函数 doc 的 ⚠️ 段）
+                false,
                 current,
             )
             .await

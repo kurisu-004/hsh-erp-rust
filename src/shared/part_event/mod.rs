@@ -126,3 +126,25 @@ pub mod sql;
 
 pub use model::NewPartEvent;
 pub use sql::insert;
+
+/// `INSPECTED` 事件类型字面量（`t_part_event.event_type`，列是 `varchar(30)`）。
+///
+/// 2026-10-17 新增。此前写点把它硬写成裸字面量，且**写点分散在两处**
+/// （`prod::batch::service::scan::scan_inspect` 与
+/// `prod::batch::service::transition_core::to_inspection_core`）—— 打错字没有任何
+/// 拦截（该列无 CHECK 约束、无 DB ENUM、读侧也无 Rust enum），故提到这里做具名常量。
+/// 与 `shared::batch::status::EVENT_SERIAL_RELEASED` 同一做法，但 `part_event` 是
+/// 更合适的家（那张表没有域归属，本模块就是它的写侧设施层）。
+pub const EVENT_INSPECTED: &str = "INSPECTED";
+
+/// `FORCED_SENT_TO_INSPECTION` 事件类型字面量（`varchar(30)`，本值 26 字符）。
+///
+/// 2026-10-17 新增：待品检页对「**压在工人手上**的批次」提供强制送检入口
+/// （`POST /prod/batches/{batch_id}/to-inspection` 带 `force=true`）。该动作是
+/// **运营代工人做的一次越权送检**，不是工人自己完成的工序，因此：
+///
+/// - 事件类型与工人自主送检的 `SENT_TO_INSPECTION` 区分开（后者**计入**有效工时）；
+/// - 写侧 `worker_id` / `process_id` 一律 `None` —— 两道独立保险里的一道，
+///   另一道是 statistics 侧 `effective_minutes::WHERE_SQL` 的
+///   `event_type IN ('RETURNED_TO_SHELF','SENT_TO_INSPECTION')` 白名单天然排除本值。
+pub const EVENT_FORCED_SENT_TO_INSPECTION: &str = "FORCED_SENT_TO_INSPECTION";
