@@ -979,6 +979,158 @@ async fn cancel_part_is_not_overwritten_by_rollup_completed() {
 }
 
 // ===========================================================================
+//  2026-10-17：`POST /parts/{id}/cancel` 容忍「前端不带 body」的调用（415 修复）
+// ===========================================================================
+
+/// 造一个**可取消**的工单（返回 part id）。
+///
+/// ⚠️ 不能直接用 `insert_part_biz`：它固定插 `status='IN_PROCESS'`，而 `IN_PROCESS`
+/// **不在** cancel 的白名单里（`PartStatus::can_transition_to(CANCELLED)` 的 5 个入口是
+/// `PENDING / PROGRAMMING / INSPECTION / READY_TO_SHIP / DELIVERED`，另加 `OUTSOURCE`
+/// 与 `REPAIRING`）⇒ 那会拿到 `20103` 而不是本组用例要验的状态码。先复用它造行、
+/// 再翻成 `PENDING`，避免复制一份 INSERT。
+async fn insert_cancellable_part(pool: &PgPool, customer_id: i64, drawing_no: &str) -> i64 {
+    let part_id = insert_part_biz(
+        pool,
+        customer_id,
+        "待取消工单",
+        drawing_no,
+        false,
+        chrono::NaiveDate::from_ymd_opt(2026, 10, 20).unwrap(),
+        None,
+    )
+    .await;
+    sqlx::query("UPDATE t_part SET status = 'PENDING' WHERE id = $1")
+        .bind(part_id)
+        .execute(pool)
+        .await
+        .expect("flip t_part to PENDING（cancel 白名单入口）");
+    part_id
+}
+
+/// **回归**：请求**完全没有** body、也**没有** `Content-Type` 头 → **200**。
+///
+/// 故障形态（2026-10-17 修复前）：前端 `api.post(url)` 不带 body ⇒ axios 不发
+/// `Content-Type` ⇒ axum 的 `Json<T>` 提取器抛 `MissingJsonContentType` ⇒
+/// **HTTP 415 纯文本**（不是业务信封）。现在提取器是 `Option<Json<CancelRequest>>`。
+///
+/// ⚠️ `json_request(..., body=None, ...)`（见 `test-support/src/http.rs`）在
+/// `body = None` 时**只放 `Authorization`、不放 `Content-Type`** —— 这正是本用例要的
+/// 请求形态；下方 `cancel_without_body_constructed_by_hand_returns_200` 另用手写
+/// builder 再钉一遍。
+#[tokio::test]
+async fn cancel_without_body_and_without_content_type_returns_200() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let part_id = insert_cancellable_part(&pool, fx.customer_l2_id, "D-CANCEL-NOBODY").await;
+
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/parts/{part_id}/cancel"),
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "无 body / 无 Content-Type 不该是 415：{env}"
+    );
+    assert_eq!(env["code"], 0, "信封 code 应为 0: {env}");
+    assert_eq!(env["data"]["status"], "CANCELLED", "{env}");
+    assert_eq!(part_status(&pool, part_id).await, "CANCELLED");
+}
+
+/// **回归**：手写 builder 构造「无 body 且无 Content-Type」的 POST（不借
+/// `test-support` 的 helper），确保前者不是在替我们补头。
+#[tokio::test]
+async fn cancel_without_body_constructed_by_hand_returns_200() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let part_id =
+        insert_cancellable_part(&pool, fx.customer_l2_id, "D-CANCEL-NOBODY-HAND").await;
+
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/parts/{part_id}/cancel"))
+        .header(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}"),
+        )
+        .body(axum::body::Body::empty())
+        .expect("build request");
+    assert!(
+        req.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .is_none(),
+        "本用例的前提就是「请求头里没有 Content-Type」"
+    );
+    let (s, env) = send(app.clone(), req).await;
+    assert_eq!(s, StatusCode::OK, "手写的无 body 请求不该是 415: {env}");
+    assert_eq!(env["code"], 0, "{env}");
+    assert_eq!(env["data"]["status"], "CANCELLED", "{env}");
+}
+
+/// **零契约破坏**：`{}`（空 JSON 对象，带 `Content-Type: application/json`）→ 200。
+#[tokio::test]
+async fn cancel_with_empty_json_object_returns_200() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let part_id = insert_cancellable_part(&pool, fx.customer_l2_id, "D-CANCEL-EMPTYOBJ").await;
+
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/parts/{part_id}/cancel"),
+            Some(json!({})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "空对象应 200: {env}");
+    assert_eq!(env["code"], 0, "{env}");
+    assert_eq!(env["data"]["status"], "CANCELLED", "{env}");
+    assert_eq!(part_status(&pool, part_id).await, "CANCELLED");
+}
+
+/// **零契约破坏回归**：`{"reason":"客户作废"}` 仍生效 —— reason 被写进
+/// `t_part_event.note`（`PartService::cancel` 里 `req.reason.or(req.note)`），
+/// 所以断言事件流水里能取回该字符串。
+#[tokio::test]
+async fn cancel_with_reason_still_records_the_reason() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let part_id = insert_cancellable_part(&pool, fx.customer_l2_id, "D-CANCEL-REASON").await;
+
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/parts/{part_id}/cancel"),
+            Some(json!({ "reason": "客户作废" })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "带 reason 应 200: {env}");
+    assert_eq!(env["data"]["status"], "CANCELLED", "{env}");
+
+    let note: Option<String> = sqlx::query_scalar(
+        "SELECT note FROM t_part_event \
+         WHERE part_id = $1 AND event_type = 'CANCELLED' AND to_status = 'CANCELLED'",
+    )
+    .bind(part_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read CANCELLED event note");
+    assert_eq!(
+        note.as_deref(),
+        Some("客户作废"),
+        "reason 必须仍落进事件 note（提取器改动不得吞掉字段）"
+    );
+}
+
+// ===========================================================================
 //  2026-10-01 review 第 1 轮 M2：出池 / 召回必须真的把「位置」清空
 // ===========================================================================
 

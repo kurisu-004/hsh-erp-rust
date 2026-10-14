@@ -277,6 +277,12 @@ pub struct PartSoftDeleteRequest {
 ///
 /// cancel 保持 part 级（PR-B3 §4.3 D3）：级联取消全部活跃批次 → part 翻转
 /// CANCELLED。`reason` 优先作为事件 note。
+///
+/// ⚠️ **2026-10-17：整条 body 可缺省** —— handler 侧提取器是
+/// `Option<Json<CancelRequest>>`（不再是裸 `Json<T>`），故「请求完全没有
+/// `Content-Type` 头」（前端 `api.post(url)` 不带 body 的典型形态）**按默认值处理**，
+/// 不再被 axum 拒成 **HTTP 415 纯文本**。带 json Content-Type 时两字段仍各自
+/// `#[serde(default)]` 可缺省，语义逐字不变；带**非** json 的 Content-Type 仍 415。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct CancelRequest {
     #[serde(default)]

@@ -70,13 +70,29 @@ fn ws_broadcast(state: &AppState, kind: &str, payload: serde_json::Value) {
 /// `POST /api/v2/parts/{part_id}/cancel`
 ///
 /// 5 状态白名单 → CANCELLED；commit 后广播 `PART_CANCELLED`。
+///
+/// ## ⚠️ 2026-10-17：整条 body 可缺省（提取器改成 `Option<Json<CancelRequest>>`）
+/// 现象：前端 `api.post(url)` **不带 body** ⇒ axios 不发 `Content-Type` 头 ⇒ 裸
+/// `Json<T>` 提取器抛 `MissingJsonContentType` ⇒ **HTTP 415 纯文本**（不是业务信封），
+/// 而「取消订单」按钮在页面上就成了一条必现的报错。
+/// 现状改为 `Option<Json<CancelRequest>>`（axum 0.8 的 `OptionalFromRequest`）：
+/// - 请求**完全没有** `Content-Type` 头 ⇒ `Ok(None)` ⇒ 按 `CancelRequest::default()`
+///   处理（`reason` / `note` 双 None）；
+/// - 带正确的 json Content-Type ⇒ `Ok(Some(..))`，**字段语义逐字未变**（`reason` /
+///   `note` 仍生效，`#[serde(default)]` 仍让单字段可缺省）；
+/// - 带**非** json 的 Content-Type ⇒ 仍 **415**（刻意保留：那是有客户端在用错误媒体
+///   类型调，挡下来比猜它想发什么更安全）。
+///
+/// ⇒ 本端点对「不带 body 的取消」与「带 body 的取消」一视同仁，**零契约破坏**。
 pub async fn cancel(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Path(part_id): Path<i64>,
-    Json(req): Json<CancelRequest>,
+    body: Option<Json<CancelRequest>>,
 ) -> Result<Json<R<PartOut>>, AppError> {
     current.require_any_role(&[Role::Manager, Role::Clerk])?;
+    // 无 body / 无 Content-Type ⇒ 默认值（`CancelRequest` 已 derive(Default)）
+    let req = body.map(|Json(r)| r).unwrap_or_default();
     let mut tx = state.pool.begin().await?;
     let out = PartService::cancel(&mut *tx, &state.snowflake, part_id, req, &current).await?;
     tx.commit().await?;
