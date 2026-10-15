@@ -152,6 +152,42 @@ pub const LOGS_LIMIT_DEFAULT: i64 = 20;
 pub const SUBJECT_TEMPLATE_MAX_CHARS: usize = 200;
 
 // ============================================================================
+// 图纸预览链路的预算
+// ============================================================================
+
+/// 第三节在**推送**路径上等图纸预览就绪的预算（秒）。
+///
+/// ## 核算：必须整条推送在长档超时之内跑完
+///
+/// `/api/v2/cron/wecom-daily/send` 命中 `middleware::timeout.rs` 的**长档**（660s，
+/// 白名单第 3 条）。这条请求里串着两段串行等待：
+///
+/// ```text
+/// 480s（CI 就绪预算）+ max_chunks(6) × 5s（逐片顺序发送，单片超时 5s）= 510s < 660s
+/// ```
+///
+/// 余量 150s 留给：取数 SQL、渲染、以及超时层本身的开销。
+///
+/// ## ⚠️ 为什么是 8 分钟而不是用户最初说的 10 分钟
+///
+/// 10 分钟 = 600s，加上发送段就是 630s，距 660s 只剩 30s —— 而**分片数是配置项**
+/// （`max_chunks` 上限 20）：管理员把它调到 7 就变成 635s，调到 8 就 640s 起步，
+/// 再叠加一次慢 SQL 就可能整条请求被超时层掐掉。掐掉的后果不是「重试一次」而是
+/// **已经推进群里的前 k 片连同流水一起消失**（超时把 handler 的 future 整个 drop），
+/// `GET /logs` 里查不到任何痕迹 —— 这条不变量正是长档白名单存在的理由，不能再让它
+/// 被一个可配的分片数顶破。
+///
+/// 8 分钟给了 150s 余量，且**与分片数无关地安全**：`max_chunks` 调到上限 20 时最坏
+/// 仍是 480 + 100 = 580s < 660s。
+///
+/// ## ⚠️ 预算是**上限**，不是承诺
+///
+/// 绝大多数工单在几秒内就绪（CI 转 PDF 通常很快）；预算是「最坏情况不许超过」。
+/// 预算耗尽 ⇒ 那一行**不带链接**、其余照常挂 —— **绝不因为一张图没转出来就不发日报**
+/// （见 `files::part_file::preview::service::PreviewService::ensure_ready_for_parts`）。
+pub const DRAWING_CI_BUDGET_SECS: u64 = 8 * 60;
+
+// ============================================================================
 // 频率枚举
 // ============================================================================
 
@@ -531,6 +567,11 @@ pub struct PreviewRequest {
     pub worker_metric: Option<String>,
     #[serde(default)]
     pub worker_top_n: Option<i32>,
+    /// 第三节清单每组最多列出的工单数（`0` = 不限）。⚠️ **合并覆盖路径拒越界**
+    /// （`validate_order_list_limit`）而不 clamp —— 与 `upcoming_days` 同款理由：
+    /// 覆盖值是管理员在预览框里现填的，夹到边界会让预览结果与他的输入不符。
+    #[serde(default)]
+    pub order_list_limit: Option<i32>,
     #[serde(default)]
     pub max_chunks: Option<i16>,
     #[serde(default)]
@@ -541,6 +582,13 @@ pub struct PreviewRequest {
     pub include_orders: Option<bool>,
     #[serde(default)]
     pub include_workers: Option<bool>,
+    /// 第三节清单是否带图纸预览直链。
+    ///
+    /// ⚠️ 可覆盖的**实际意义**是「今天试一下不带链接的清单长什么样」：带链接每行多
+    /// ≈95 字节（见 [`MAX_CHUNKS_DEFAULT`] 的核算），而这一项直接决定分片数是否会撞
+    /// `max_chunks` ⇒ 管理员必须能在**不动落库配置**的前提下对比两种形态。
+    #[serde(default)]
+    pub include_drawings: Option<bool>,
     #[serde(default)]
     pub subject_template: Option<String>,
 }
@@ -780,7 +828,7 @@ pub struct WorkerBarRow {
     pub quantity: i32,
 }
 
-/// `POST /preview` 响应体（**14 个字段**）：渲染、不发送、不落 log。
+/// `POST /preview` 响应体（**13 个字段**）：渲染、不发送、不落 log。
 ///
 /// ⚠️ **没有 `markdown` 单字段**，只有 `chunks: Vec<String>` —— 同时维护两份会让
 /// 「要发几条」有两个答案，而那恰恰是管理员唯一需要预判的东西。
@@ -799,12 +847,13 @@ pub struct PreviewOut {
     pub completed_count: i32,
     /// 当前在制单数（口径 = `t_part.status = 'IN_PROCESS'`，见 `repo::OverviewEvents::wip`）。
     pub in_process_count: i32,
-    /// ⚠️ **恒为 0**：第二节改单值口径（`COUNT(DISTINCT part_id)`）后不再统计「送货单
-    /// 张数」，而该键要留着（流水表列与前端 `.strict()` schema 都按它存在）。
-    /// 它**不是**「今天没出货」—— 出货数字看 [`Self::note_part_count`]。
+    /// 第二节的那个数：本期出货的**去重工单数**（`COUNT(DISTINCT part_id)`）。
+    ///
+    /// ⚠️ **2026-10-23 起语义变更**：此前本键恒为 `0`、真正的数字在
+    /// `note_part_count` 里（那时本键指的是「送货单张数」，而第二节已不再统计它）。
+    /// 现在一个键一个含义，**历史流水行按旧语义理解**（见迁移
+    /// `20261023010000_001_wecom_daily_note_count_semantics.sql` 的列注释）。
     pub note_count: i32,
-    /// 第二节的唯一数字：本期出货的工单数。
-    pub note_part_count: i32,
     pub overdue_count: i32,
     pub upcoming_count: i32,
     pub worker_rows: Vec<WorkerBarRow>,
@@ -837,13 +886,9 @@ pub struct SendResultOut {
     pub chunk_sent: i32,
     pub overview_batch_count: i32,
     pub overview_quantity: i32,
-    /// ⚠️ **恒为 0**：第二节改单值口径后不再统计「送货单张数」，而
-    /// `t_wecom_daily_log.note_count` 是 `NOT NULL` 列 ⇒ 本域不再落一个能代表「本期
-    /// 出了几张送货单」的值。读它时**不要**当成「今天没出货」，出货数字是
-    /// `note_part_count`。列的增删留给契约变更（前端 `.strict()` schema 也按它排版）。
+    /// 第二节的那个数：本期出货的**去重工单数**（`COUNT(DISTINCT part_id)`）。
+    /// 与 [`PreviewOut::note_count`] 同源同义，两处同名字段不许出现不同口径。
     pub note_count: i32,
-    /// 第二节的唯一数字：本期出货的工单数（`COUNT(DISTINCT part_id)`）。
-    pub note_part_count: i32,
     pub overdue_count: i32,
     pub upcoming_count: i32,
     pub worker_row_total: i32,

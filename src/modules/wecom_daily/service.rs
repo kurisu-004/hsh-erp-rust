@@ -14,6 +14,7 @@
 //! ```text
 //! 借 1/3 → resolve_target（查 + 解密）→ 还
 //! 借 2/3 → fetch_rows（恒 O(1) 条 SQL）→ 还
+//! ────────── 图纸直链（**零连接**：自己短借短还，跨网络轮询 CI）──────────
 //! ────── 逐片顺序发送（≈ max_chunks × 5s 的**纯网络等待**，零 DB IO）──────
 //! 借 3/3 → cfg_version 快照 + insert_log（合并成**一次**借还）→ 还
 //! ```
@@ -21,15 +22,30 @@
 //! 为什么：**投递期间握着一条 `PoolConnection` 等 ≈100s 的网络**，`/send` 又**无频控**
 //! ⇒ 几个管理员同时点就把连接池占满，**读端点跟着排队**（一条只查配置单例的
 //! `GET /config` 排在后面拿不到连接，现场看是「整个域卡住」）。`/preview` 不受
-//! 影响（只渲染不投递）。
+//! 影响（只渲染不投递；它那条连接虽然全程借着，但图纸环节传的是
+//! `Duration::ZERO` 预算 ⇒ 零 python 往返，见 [`rows_drawing_links`]）。
 //!
-//! ## 域外依赖：**1 个模块**（`wecom`，通道域）
+//! ## 图纸直链那一环（2026-10-23 新增，`include_drawings` 打开时才走）
+//!
+//! 它是**唯一**一段「可能跑满 8 分钟」的等待（[`DRAWING_CI_BUDGET_SECS`]，等腾讯云 CI
+//! 把 PDF 渲成图）。所以它排在 `fetch_rows` 的连接**归还之后**，且由 `files` 域的入口
+//! 自己短借短还 —— 本域那三个借还点一个都没多。`cfg.include_drawings = false` 时整段
+//! 跳过、**一条 SQL 都不发**（关掉就不触发 CI、不花钱，这是那个配置项的意义）。
+//!
+//! ## 域外依赖：**2 个模块**（`wecom` 通道域 + `files` 图纸域）
 //!
 //! [`crate::modules::wecom::service::resolve_target`]（拿明文 webhook URL + 名称 +
 //! 掩码）、[`crate::modules::wecom::service::target_is_available`]（调度注册判据）、
-//! [`crate::modules::wecom::sender::send_markdown`]（唯一出网点）。方向是
-//! **内容域 → 通道域**，反向不存在。
+//! [`crate::modules::wecom::sender::send_markdown`]（唯一出网点）。
 //! ⚠️ 本域**不解密**任何东西：webhook URL 的解密在通道域内完成。
+//!
+//! 第二个是 [`crate::modules::files::part_file::preview::service::PreviewService::ensure_ready_for_parts`]
+//! （第三节的图纸直链，见 [`rows_drawing_links`]）：图纸链路要读 `t_part_file` 与
+//! `t_file_preview`、要推内容寻址种子、要跟腾讯云 CI 往返 —— 三样知识全属 `files` 域。
+//! 本域若自己去查 `t_part_file`、自己算种子，就得把 `preview_seed` 的公式（内容哈希 +
+//! 配方版本入种子）抄一份，而改配方时漏抄一处会让日报的链接指向另一个目录的图、**两端
+//! 都不报错**。方向仍是**内容域 → 能力提供方**，反向不存在（那个入口只吃 `part_id`
+//! 集合，不知道本域存在）。
 //!
 //! ## 发送流程（`deliver`）的顺序是刻意的
 //!
@@ -57,6 +73,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{NaiveDate, NaiveDateTime};
 use sqlx::PgConnection;
@@ -66,11 +83,11 @@ use crate::infra::clock::now_naive;
 use crate::modules::wecom::sender;
 use crate::modules::wecom::service as wecom_service;
 use crate::modules::wecom_daily::dto::{
-    ConfigDefaultsOut, ConfigOut, Frequency, LOGS_LIMIT_MAX, LogListOut, LogListQuery,
-    MAX_CHUNKS_MAX, MAX_CHUNKS_MIN, NormalizedConfig, ORDER_LIST_LIMIT_MAX, ORDER_LIST_LIMIT_MIN,
-    PreviewOut, PreviewRequest, SUBJECT_TEMPLATE_MAX_CHARS, SaveConfigRequest, SendResultOut,
-    SendStatus, TriggerSource, UPCOMING_DAYS_MAX, UPCOMING_DAYS_MIN, WORKER_TOP_N_MAX,
-    WORKER_TOP_N_MIN, report_window,
+    ConfigDefaultsOut, ConfigOut, DRAWING_CI_BUDGET_SECS, Frequency, LOGS_LIMIT_MAX, LogListOut,
+    LogListQuery, MAX_CHUNKS_MAX, MAX_CHUNKS_MIN, NormalizedConfig, ORDER_LIST_LIMIT_MAX,
+    ORDER_LIST_LIMIT_MIN, PreviewOut, PreviewRequest, SUBJECT_TEMPLATE_MAX_CHARS,
+    SaveConfigRequest, SendResultOut, SendStatus, TriggerSource, UPCOMING_DAYS_MAX,
+    UPCOMING_DAYS_MIN, WORKER_TOP_N_MAX, WORKER_TOP_N_MIN, report_window,
 };
 use crate::modules::wecom_daily::model::{TWeComDailyConfigRow, TWeComDailyLogRow};
 use crate::modules::wecom_daily::repo::{self, ActiveBatchRow, AssemblyChildRow, NewDailyLog};
@@ -260,7 +277,6 @@ impl SendResultOut {
             overview_batch_count: row.overview_batch_count,
             overview_quantity: row.overview_quantity,
             note_count: row.note_count,
-            note_part_count: row.note_part_count,
             overdue_count: row.overdue_count,
             upcoming_count: row.upcoming_count,
             worker_row_total: row.worker_row_total,
@@ -598,13 +614,13 @@ pub async fn effective_config(
             None => base.worker_metric,
         },
         worker_top_n: overrides.worker_top_n.unwrap_or(base.worker_top_n),
-        order_list_limit: base.order_list_limit,
+        order_list_limit: overrides.order_list_limit.unwrap_or(base.order_list_limit),
         max_chunks: overrides.max_chunks.unwrap_or(base.max_chunks),
         include_overview: overrides.include_overview.unwrap_or(base.include_overview),
         include_delivery: overrides.include_delivery.unwrap_or(base.include_delivery),
         include_orders: overrides.include_orders.unwrap_or(base.include_orders),
         include_workers: overrides.include_workers.unwrap_or(base.include_workers),
-        include_drawings: base.include_drawings,
+        include_drawings: overrides.include_drawings.unwrap_or(base.include_drawings),
         subject_template: overrides.subject_template.clone().or(base.subject_template),
     };
     validate_normalized(&merged)
@@ -643,7 +659,14 @@ fn normalize_row(row: &TWeComDailyConfigRow) -> Result<NormalizedConfig, AppErro
 }
 
 /// `POST /preview`：渲染但**不发送、不落流水**。
+///
+/// ## ⚠️ 图纸直链传 **`Duration::ZERO`** 预算
+///
+/// 这一步只取**已经 `READY`** 的预览直链、**零 python 往返**：管理端点不该因为点了
+/// 「预览日报」就提交 CI job（按页计费）、更不该让请求挂在 python 上等好几分钟。没就绪
+/// 的那几行渲成纯文字 —— 与推送路径的差别只在这里。
 pub async fn preview(
+    state: &Arc<AppState>,
     conn: &mut PgConnection,
     req: &PreviewRequest,
 ) -> Result<PreviewOut, AppError> {
@@ -653,7 +676,9 @@ pub async fn preview(
     validate_sections(&cfg)?;
     let today = now_naive().date();
     let window = report_window(&cfg, today);
-    let rows = fetch_rows(conn, &cfg, window.0, window.1).await?;
+    let mut rows = fetch_rows(conn, &cfg, window.0, window.1).await?;
+    rows.drawing_links =
+        rows_drawing_links(state, &cfg, &rows.drawing_part_ids, Duration::ZERO).await;
     let rendered = template::render(&RenderInput {
         cfg: &cfg,
         rows: &rows,
@@ -669,10 +694,7 @@ pub async fn preview(
         overview_quantity: rows.overview_quantity,
         completed_count: rows.completed_count,
         in_process_count: rows.in_process_count,
-        // ⚠️ 第二节改单值口径后不再统计「送货单张数」⇒ `note_count` 恒 0（列保留是
-        // 为了不动流水表结构与前端 `.strict()` 契约）。它不是「今天没出货」。
-        note_count: 0,
-        note_part_count: rows.note_part_count,
+        note_count: rows.note_count,
         overdue_count: rows.overdue_count,
         upcoming_count: rows.upcoming_count,
         worker_rows: rows.worker_rows.clone(),
@@ -813,7 +835,6 @@ async fn log_prepare_failure(state: &Arc<AppState>, err: &AppError) {
         overview_batch_count: 0,
         overview_quantity: 0,
         note_count: 0,
-        note_part_count: 0,
         overdue_count: 0,
         upcoming_count: 0,
         worker_row_total: 0,
@@ -852,6 +873,12 @@ async fn log_prepare_failure(state: &Arc<AppState>, err: &AppError) {
 /// ⚠️ 逐节循环查是**功能完全正确、集成测试照样全绿**的写法（每条用例只造 2~3 行），
 /// 只有数据量涨上去时语句数才悄悄线性涨 —— 而日报恰好是「一天一次、量很大」的生产形态。
 ///
+/// ## ⚠️ 图纸直链**不在本函数里**
+///
+/// 本函数只填 [`ReportRows::drawing_part_ids`]（第三节清单涉及哪些 owner id），直链由
+/// [`rows_drawing_links`] 在**调用方归还连接之后**去接 —— 那一步要跨网络轮询 CI，
+/// 放在持有本函数那条连接的位置就是拿连接池换钱（且 CI 按页计费，这笔交换极不划算）。
+///
 /// ## 窗口
 ///
 /// `(from_ts, to_ts)` = **跨天**窗口（`dto::report_window` 算，理由见那处）。
@@ -876,12 +903,16 @@ async fn fetch_rows(
 
     if cfg.include_delivery {
         let d = repo::delivery_note_summary(conn, from_ts, to_ts).await?;
-        rows.note_part_count = d.part_count as i32;
+        rows.note_count = d.part_count as i32;
     }
 
     if cfg.include_orders {
         let today = to_ts.date();
-        rows.order_groups = collect_order_groups(conn, cfg, today).await?;
+        let (groups, drawing_part_ids) = collect_order_groups(conn, cfg, today).await?;
+        rows.order_groups = groups;
+        // 第三节清单涉及的 owner id 集合：图纸链路在**本函数之外**接（见
+        // `rows_drawing_links`），因为它要跨网络轮询 CI、期间不得持有本函数的连接。
+        rows.drawing_part_ids = drawing_part_ids;
         // ⚠️ 两个计数字段取**未截断的匹配工单数**（`OrderGroup::total` 之和），与
         // 标题占位符 `{overdue_count}` 和流水快照列同源 —— 它们报的是「有几单要催」，
         // 不是「这条消息里写了几行」。清单一行的清单不在这两个字段里。
@@ -935,27 +966,20 @@ async fn fetch_rows(
 /// | 6 | [`repo::worker_names`] | 目标批次里 `WORKER` 的 holder id | **跳过** |
 /// | 7 | [`repo::outsource_names`] | 目标批次里 `OUTSOURCE_COMPANY` 的 holder id | **跳过** |
 ///
-/// ⚠️ 图纸直链那一环（[`repo::list_drawing_files`]）**本轮不接**：直链由 `files` 域的
-/// 预览入口生成，接上之后它就是第 8 条，接缝是 [`ReportRows::drawing_links`]。
+/// ## 返回值第二项 = 图纸链路的入参
 ///
-/// ## ⚠️ **位置只对 `t_part` 侧的 id 解析，装配件行恒不显示位置**
+/// `(分组清单, 参与清单的 owner id)`。⚠️ 这批 id **不是**渲染用的：`fetch_rows` 把它挂到
+/// [`ReportRows::drawing_part_ids`]，由 [`rows_drawing_links`] 在**连接已归还**之后
+/// 去接图纸预览 —— 图纸那一环要跨网络轮询 CI，不能发生在持有本函数那条连接的时候。
 ///
-/// `t_part_batch.part_id` 指向的是 **`t_part`**（批次挂在零件上），而装配件在
-/// `t_assembly` 里、`t_part.assembly_id` 指的是它的子件 ⇒ **装配件自己没有批次**。
-/// 「这套装配件现在在哪儿」这件事由**子件行逐条**回答（这正是清单要展开子件的原因），
-/// 所以第 4 条语句的入参是「散件工单 id + 全部子件 id」，不含装配件 id。
-///
-/// ## ⚠️ 为什么子件**不**再过一遍状态 / 交期 / 已交量守卫
-///
-/// 装配件那一支的 `NOT EXISTS` 已经经 `c.assembly_id = a.id` 扫过它**全部**子件的
-/// 批次（见 `repo::list_overdue` 的要点 4）⇒ **装配件能进清单，就意味着它的子件一件
-/// 都没被交过**。再加一道子件级守卫既重复，又会在守卫口径漂移时给出「装配件在、子件
-/// 不在」这种自相矛盾的清单。
+/// ⚠️ **装配件 id 也在里面**：装配件自己在 `t_part_file` 里同样有 `DRAWING` 文件
+/// （整图），而「这套装配件现在在哪儿」已经由子件行回答了（见下一节）——位置不显示
+/// ≠ 图纸不挂。
 async fn collect_order_groups(
     conn: &mut PgConnection,
     cfg: &NormalizedConfig,
     today: NaiveDate,
-) -> Result<Vec<OrderGroup>, AppError> {
+) -> Result<(Vec<OrderGroup>, Vec<i64>), AppError> {
     let overdue = repo::list_overdue(conn, today).await?;
     let upcoming = repo::list_upcoming(conn, today, cfg.upcoming_days).await?;
 
@@ -1024,14 +1048,14 @@ async fn collect_order_groups(
     let outsource =
         repo::outsource_names(conn, &outsource_ids.into_iter().collect::<Vec<_>>()).await?;
 
-    // 摊平成「(归组键, 行)」。⚠️ 图纸直链恒缺省（接缝见 `ReportRows::drawing_links`）：
-    // `drawing_links` 为空 ⇒ 每行的名称都是纯文字，其余形态一字不变。
+    // 摊平成「(归组键, 行)」。直链由 [`rows_drawing_links`] 在**归还连接之后**填进
+    // `drawing_links`，本函数只负责把解析器搭起来（`links` 先给空表）。
     let ctx = RowContext {
         targets: &targets,
         shelf: &shelf,
         worker: &worker,
         outsource: &outsource,
-        links: &rows_drawing_links(),
+        links: &HashMap::new(),
     };
     let mut flat: Vec<(OrderGroupKind, OrderRow)> = Vec::new();
     flatten_orders(
@@ -1049,21 +1073,70 @@ async fn collect_order_groups(
         &ctx,
     );
 
-    Ok(group_and_cap(
-        flat,
-        overdue.total as i32,
-        cfg.order_list_limit,
-    ))
+    let groups = group_and_cap(flat, overdue.total as i32, cfg.order_list_limit);
+
+    // 图纸链路的入参：**截断之后真的会被列出来的那些行**的 owner id（装配件 + 散件 +
+    // 子件）。⚠️ **必须在截断之后收集**：图纸链路要提交 CI job 而 CI **按页计费** ⇒
+    // 为「被 `order_list_limit` 挡掉、一个字符都不会出现在消息里」的那些行提交 CI
+    // 是纯浪费（现场逾期几千单时那是几千次提交）。这与 `include_drawings = false`
+    // 「整段跳过、不花钱」是同一条纪律的两个刻度。
+    //
+    // ⚠️ 与第 4 条语句（活跃批次）的入参**刻意不同**：那条不含装配件 id（装配件没有
+    // 批次），这条**含**（装配件自己在 `t_part_file` 里有 `DRAWING` 整图，而该列是
+    // polymorphic 的）。
+    let drawing_part_ids: Vec<i64> = groups
+        .iter()
+        .flat_map(|g| g.rows.iter())
+        .map(|r| r.owner_id)
+        .collect();
+
+    Ok((groups, drawing_part_ids))
 }
 
-/// 图纸直链映射的**接缝取值**（本轮恒空）。
+/// 图纸预览直链：第三节清单里的 `owner id` → 可点开的第 1 页直链。
 ///
-/// 抽成一个函数而不是直接写 `&HashMap::new()`：接链那一轮只改这一个函数的实现
-/// （并在其前面加上取数与填充），调用点与渲染层**一字不改**。
-fn rows_drawing_links() -> HashMap<i64, String> {
-    // ⚠️ 2026-10-23：直链由 `files` 域的预览入口生成（`t_part_file` → `t_file_preview`
-    // → 直链），那一轮接上后本函数改为「查 → 填」。在它接上之前，第三节只出文字行。
-    HashMap::new()
+/// ## ⚠️ 这一段**在连接归还之后**才跑，且它自己借短连接
+///
+/// 图纸就绪要跨网络轮询 CI（最长 [`DRAWING_CI_BUDGET_SECS`]）⇒ 期间握着一条
+/// `PoolConnection` 会把连接池占满、读端点跟着排队（连接纪律见本文件模块 doc）。
+/// 它经 [`crate::state::AppState`] 自己取 `pool` / `py_backend` / `cos` 三样，不碰调用方
+/// 那条连接。
+///
+/// ## ⚠️ `include_drawings = false` ⇒ **一条 SQL 都不发**
+///
+/// 这是那个配置项存在的意义：关掉就**不触发 CI、不花钱**（CI 按页计费）。所以这个判断
+/// 必须落在**调用 `files` 域入口之前** —— 放在它之后就是「先花完钱再决定不给链接」。
+///
+/// ## `budget` 的两个取值
+///
+/// - 推送路径（`deliver`）：[`DRAWING_CI_BUDGET_SECS`]，会提交 CI job 并等到收敛；
+/// - 预览路径（`/preview`）：`Duration::ZERO`，**零 python 往返**，只取已经 `READY`
+///   的那些 —— 管理端点不该因为点了「预览」就烧 CI 配额、也不该挂在那里等几分钟。
+///
+/// 两者都**不抛错**：拿不到的 `part_id` 就不在返回值里 ⇒ 该行名称渲成纯文字。
+async fn rows_drawing_links(
+    state: &Arc<AppState>,
+    cfg: &NormalizedConfig,
+    part_ids: &[i64],
+    budget: Duration,
+) -> HashMap<i64, String> {
+    if !cfg.include_drawings {
+        return HashMap::new();
+    }
+    state
+        .preview_service
+        .ensure_ready_for_parts(
+            &state.pool,
+            &state.py_backend,
+            &state.config.cos.preview_prefix,
+            &state.config.cos.preview_base_url,
+            // ⚠️ 用 `view` 档（`eo-img.resize=l/2560`）而不是 `thumb`：日报里的链接
+            // 是「点开看图」，不是列表缩略图；档位选错的表现是「点进去字太小看不清」。
+            &state.config.cos.preview_image_view_params,
+            part_ids,
+            budget,
+        )
+        .await
 }
 
 /// 渲染一行的**解析器**：位置（`part_id → min-progress 目标批次的 holder 名`）与图纸
@@ -1119,6 +1192,7 @@ fn flatten_orders(
         flat.push((
             kind,
             OrderRow {
+                owner_id: r.id,
                 is_child: false,
                 serial_no: r.serial_no.clone(),
                 name: r.name.clone(),
@@ -1131,6 +1205,7 @@ fn flatten_orders(
             flat.push((
                 kind,
                 OrderRow {
+                    owner_id: c.id,
                     is_child: true,
                     serial_no: c.serial_no,
                     name: c.name,
@@ -1320,6 +1395,18 @@ pub fn status_for(chunk_count: i32, chunk_sent: i32) -> SendStatus {
 /// 网络会把连接池占满、读端点跟着排队（`/send` 无频控 ⇒ 几个管理员同时点就成立）。
 /// 连接纪律见模块 doc，落在下面三段块作用域里：
 /// ① 解析通道 ② 取数 ③ 落流水 —— **③ 之后的逐片发送全程零 DB IO、零连接**。
+///
+/// ## 发送前的等待段有两段，都不持连接
+///
+/// ```text
+/// 借 2/3a → 取数（恒 O(1) 条 SQL）→ 还
+/// ─── 图纸直链：零预算以外的最长 ≤ 8 分钟等待，全程自己短借短还 ───
+/// ─── 逐片顺序发送：≈ max_chunks × 5s 的纯网络等待 ───
+/// ```
+///
+/// ⚠️ 这两段串起来仍在长档 660s 之内（`480 + 6×5 = 510`，核算见
+/// [`DRAWING_CI_BUDGET_SECS`]）—— 这不是巧合而是常量算出来的，超了就是整条请求被
+/// 超时层掐掉、已推送的分片连同流水一起消失。
 async fn deliver(
     state: &Arc<AppState>,
     cfg: &NormalizedConfig,
@@ -1337,11 +1424,22 @@ async fn deliver(
     let today = now.date();
     // 统计窗口（跨天）：两端都从**同一份配置**推出来，标题块与 SQL 共用它一个值。
     let window = report_window(cfg, today);
-    // 借还 2/3：恒 O(1) 条 SQL（关掉的节一条都不发，见 `fetch_rows`）。
-    let rows = {
+    // 借还 2/3a：恒 O(1) 条 SQL（关掉的节一条都不发，见 `fetch_rows`）。
+    let mut rows = {
         let mut conn = state.pool.acquire().await?;
         fetch_rows(&mut conn, cfg, window.0, window.1).await?
     };
+    // ── 借还 2/3b：图纸预览直链（**连接已归还**，且全程自己短借短还）──
+    // ⚠️ 这一段可能跨网络轮询 CI 最长 DRAWING_CI_BUDGET_SECS（`include_drawings`
+    // 为真且有未就绪的图纸时）。它**必须**排在上面那个块之外：握着连接等 CI 会把连接池
+    // 占满、读端点跟着排队（连接纪律见本文件模块 doc）。
+    rows.drawing_links = rows_drawing_links(
+        state,
+        cfg,
+        &rows.drawing_part_ids,
+        Duration::from_secs(DRAWING_CI_BUDGET_SECS),
+    )
+    .await;
     let rendered = template::render(&RenderInput {
         cfg,
         rows: &rows,
@@ -1386,10 +1484,7 @@ async fn deliver(
             chunk_sent: chunk_sent as i16,
             overview_batch_count: rows.overview_batch_count,
             overview_quantity: rows.overview_quantity,
-            // ⚠️ `note_count` 恒 0：第二节改单值口径后不再统计「送货单张数」，而流水
-            // 表那一列是 `NOT NULL`（理由见 `dto::SendResultOut::note_count`）。
-            note_count: 0,
-            note_part_count: rows.note_part_count,
+            note_count: rows.note_count,
             overdue_count: rows.overdue_count,
             upcoming_count: rows.upcoming_count,
             worker_row_total: rendered.worker_row_total,
@@ -2003,6 +2098,7 @@ mod tests {
     /// 造一行（测试用：默认有序列号、无位置、无链接）。
     fn mk_row(is_child: bool, serial: &str) -> OrderRow {
         OrderRow {
+            owner_id: 0,
             is_child,
             serial_no: Some(serial.to_string()),
             name: serial.to_string(),

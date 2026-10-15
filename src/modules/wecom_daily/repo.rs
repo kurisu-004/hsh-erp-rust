@@ -2,7 +2,7 @@
 //!
 //! 分两组，形态一致（静态 SQL + `sqlx::query_as!` 字面量宏 ⇒ **编译期按 `.env` 的
 //! DATABASE_URL 连开发库校验列名与类型**，产物进 `.sqlx/`）：
-//! 1. **统计查询**（第一节 / 第二节各一至两条，第三节是**清单**链路的 8 条，第四节一条
+//! 1. **统计查询**（第一节 / 第二节各一至两条，第三节是**清单**链路的 7 条，第四节一条
 //!    `GROUP BY`）；
 //! 2. **配置 / 流水 CRUD**。
 //!
@@ -55,13 +55,18 @@
 //! 不变量是「**语句数不随工单数 / 子件数 / 送货单数 / 工人数增长**」：每节都把整组
 //! 聚合压进**一条**语句（第一节 1 条、第二节 1 条、第四节 1 个 `GROUP BY`），
 //! 第三节的**清单**链路接了 7 条（逾期 / 未来两条主查询 + 装配件子件展开 + 活跃
-//! 批次 + 三个 holder 名批量解析，见 `service::collect_order_groups` 的表；图纸
-//! 文件那一条已就位、**尚未接调用**，直链由 `files` 域的预览入口生成），关掉的节
+//! 批次 + 三个 holder 名批量解析，见 `service::collect_order_groups` 的表），关掉的节
 //! 一条都不查。逐行查是**功能
 //! 完全正确**的改法（渲染逐字一致、集成测试全绿），只有数据量涨上去时语句数才悄悄
 //! 线性涨 —— 而日报恰好是「一天一次、量很大」的生产形态。⚠️ **刻意不钉死具体条数**：
 //! 这类计数必然过期，而护栏守的「循环体内不许出现取数调用」才是那条不变量的真正
 //! 来源。
+//!
+//! ⚠️ 图纸直链那一环**不在本文件**：它要读 `t_part_file` 与 `t_file_preview`、还要跨
+//! 网络轮询 CI —— 那三样知识（SQL / COS / python）全部属于 `files` 域，由它的批量
+//! 入口 `files::part_file::preview::service::PreviewService::ensure_ready_for_parts`
+//! 承担。本域只负责「第三节清单涉及哪些 owner id」这一个入参（见
+//! `service::collect_order_groups`），从而完全不碰 `t_part_file` 的表结构。
 //!
 //! ⚠️ 第三节**刻意不给清单主查询加 `LIMIT`**：`order_list_limit` 的截断在 Rust 侧
 //! 做，而组标题的「N 条」必须是**未截断的匹配总数**（`COUNT(*) OVER ()`）；SQL 侧加
@@ -688,85 +693,6 @@ struct NameRow {
     name: String,
 }
 
-// ---------------------------------------------------------------------------
-// 图纸文件（只投影 `part_id` + 文件 id + 时间戳；直链由 Part 2b 接上）
-// ---------------------------------------------------------------------------
-
-/// 清单里命中的 **PDF 图纸文件**一行。
-///
-/// ⚠️ `kind='DRAWING' AND file_type='PDF'` 是**两个**条件而不是只看 `kind`：
-/// `DRAWING` 下面同时存着 `PDF` 与 `CAD_2D` 两类（列注释：「扩展名大写（PDF / STEP /
-/// NC / …），与 kind 配套」），而 PDF 预览直链这条链路只对 PDF 成立。
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct DrawingFileRow {
-    pub part_id: i64,
-    /// `t_part_file.id` —— Part 2b 拿它去 `t_file_preview` 换预览种子。
-    pub id: i64,
-    /// 同秒上传多张图纸时靠它（与 `id` 一起）定序。
-    pub created_at: NaiveDateTime,
-}
-
-/// 一次拉回清单里全部工单的 **PDF 图纸文件**行（**不过滤到每工单一条**）。
-///
-/// ## ⚠️ 「取最新一张」在 Rust 侧做（[`latest_drawing_by_part`]），不在 SQL 里
-///
-/// `DISTINCT ON` 能少传行，但它把「同一工单有 3 张图纸时取哪张」这条业务口径藏进了
-/// 一个 `ORDER BY` 里；放在 Rust 侧它就是一条有名字、有单测的规则，而口径变了也不
-/// 会有人漏改 SQL。
-///
-/// ⚠️ 本函数当前**没有调用方**：直链由 `files` 域的预览入口生成（另一轮接上），
-/// 日报这一侧只负责「哪些工单有图纸」这件事留在结构里。在没有消费者的句子里查一次
-/// 再把结果丢掉，是纯粹的浪费 —— 所以这里**只提供函数与口径**，接链的那一轮加一行
-/// 调用即可（不涉及任何表结构或出参变更）。
-pub async fn list_drawing_files(
-    conn: &mut PgConnection,
-    part_ids: &[i64],
-) -> Result<Vec<DrawingFileRow>, sqlx::Error> {
-    if part_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    sqlx::query_as!(
-        DrawingFileRow,
-        r#"
-        SELECT part_id, id, created_at
-        FROM t_part_file
-        WHERE part_id = ANY($1) AND deleted_at IS NULL
-          AND kind = 'DRAWING' AND file_type = 'PDF'
-        ORDER BY part_id ASC, created_at ASC, id ASC
-        "#,
-        part_ids,
-    )
-    .fetch_all(&mut *conn)
-    .await
-}
-
-/// 每个工单的**最新一张** PDF 图纸（`part_id → t_part_file.id`）。
-///
-/// ⚠️ **最新 = `(created_at, id)` 的最大值**，`id` 是 tiebreaker：同一批上传（同一秒）
-/// 的两张图纸若不加它，取哪张取决于 PG 的物理行序，同一个工单两次预览会给出不同的
-/// 图纸链接。
-///
-/// 无图纸的工单**不在结果里**（`map.get(&id)` 得 `None`）⇒ 渲染成纯文字名称。
-pub fn latest_drawing_by_part(rows: &[DrawingFileRow]) -> HashMap<i64, i64> {
-    let mut out: HashMap<i64, DrawingFileRow> = HashMap::new();
-    for r in rows {
-        let keep_new = out
-            .get(&r.part_id)
-            .is_none_or(|prev| (prev.created_at, prev.id) < (r.created_at, r.id));
-        if keep_new {
-            out.insert(
-                r.part_id,
-                DrawingFileRow {
-                    part_id: r.part_id,
-                    id: r.id,
-                    created_at: r.created_at,
-                },
-            );
-        }
-    }
-    out.into_iter().map(|(k, v)| (k, v.id)).collect()
-}
-
 // ============================================================================
 // 第四节：工人本期报工（条形图的数据源）
 // ============================================================================
@@ -1018,13 +944,13 @@ pub async fn insert_log(
         INSERT INTO t_wecom_daily_log (
             id, config_version, trigger_source, webhook_name, webhook_masked,
             report_date, markdown_bytes, chunk_count, chunk_sent,
-            overview_batch_count, overview_quantity, note_count, note_part_count,
+            overview_batch_count, overview_quantity, note_count,
             overdue_count, upcoming_count, worker_row_total, status, error_message,
             sent_at, created_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $19)
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $18)
         RETURNING id, config_version, trigger_source, webhook_name, webhook_masked,
                   report_date, markdown_bytes, chunk_count, chunk_sent,
-                  overview_batch_count, overview_quantity, note_count, note_part_count,
+                  overview_batch_count, overview_quantity, note_count,
                   overdue_count, upcoming_count, worker_row_total, status, error_message,
                   sent_at, created_at
         "#,
@@ -1040,7 +966,6 @@ pub async fn insert_log(
         log.overview_batch_count,
         log.overview_quantity,
         log.note_count,
-        log.note_part_count,
         log.overdue_count,
         log.upcoming_count,
         log.worker_row_total,
@@ -1063,7 +988,7 @@ pub async fn list_logs(
         r#"
         SELECT id, config_version, trigger_source, webhook_name, webhook_masked,
                report_date, markdown_bytes, chunk_count, chunk_sent,
-               overview_batch_count, overview_quantity, note_count, note_part_count,
+               overview_batch_count, overview_quantity, note_count,
                overdue_count, upcoming_count, worker_row_total, status, error_message,
                sent_at, created_at
         FROM t_wecom_daily_log
@@ -1108,8 +1033,9 @@ pub struct NewDailyLog {
     pub chunk_sent: i16,
     pub overview_batch_count: i32,
     pub overview_quantity: i32,
+    /// 第二节那个数：本期出货的**去重工单数**（2026-10-23 起由 `note_count` 承载，
+    /// 见 [`TWeComDailyLogRow::note_count`] 的语义变更说明）。
     pub note_count: i32,
-    pub note_part_count: i32,
     pub overdue_count: i32,
     pub upcoming_count: i32,
     pub worker_row_total: i32,
@@ -1124,13 +1050,6 @@ pub struct NewDailyLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn ts(sec: u32) -> NaiveDateTime {
-        NaiveDate::from_ymd_opt(2026, 10, 15)
-            .expect("固定日期合法")
-            .and_hms_opt(9, 0, sec)
-            .expect("时分秒合法")
-    }
 
     fn batch(part_id: i64, batch_no: i32, status: &str) -> ActiveBatchRow {
         ActiveBatchRow {
@@ -1262,40 +1181,5 @@ mod tests {
             active_batch_target(&tied_reversed).map(|b| b.batch_no),
             Some(2)
         );
-    }
-
-    /// ★ 守卫：`latest_drawing_by_part` 取 `(created_at, id)` 最大的一张，且**同秒**
-    /// 上传的两张按 `id` 定序（否则同一工单两次预览给出不同链接）。
-    #[test]
-    fn latest_drawing_by_part_breaks_created_at_ties_by_id() {
-        let rows = vec![
-            DrawingFileRow {
-                part_id: 1,
-                id: 11,
-                created_at: ts(10),
-            },
-            DrawingFileRow {
-                part_id: 2,
-                id: 22,
-                created_at: ts(30),
-            },
-            // 工单 1 的第二张：更晚 ⇒ 胜出。
-            DrawingFileRow {
-                part_id: 1,
-                id: 12,
-                created_at: ts(20),
-            },
-            // 工单 2 的第二张：同一秒但 id 更大 ⇒ 也胜出（tiebreaker 生效）。
-            DrawingFileRow {
-                part_id: 2,
-                id: 23,
-                created_at: ts(30),
-            },
-        ];
-        let out = latest_drawing_by_part(&rows);
-        assert_eq!(out.get(&1).copied(), Some(12), "取更晚的那张");
-        assert_eq!(out.get(&2).copied(), Some(23), "同秒取 id 更大的");
-        assert_eq!(out.len(), 2, "两个工单各一张");
-        assert!(latest_drawing_by_part(&[]).is_empty());
     }
 }

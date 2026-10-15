@@ -145,7 +145,7 @@ pub async fn preview(
 ) -> Result<Json<R<PreviewOut>>, AppError> {
     current.require_role(Role::Manager)?;
     let mut conn = state.pool.acquire().await?;
-    let out = service::preview(&mut conn, &req).await?;
+    let out = service::preview(&state, &mut conn, &req).await?;
     Ok(Json(R::ok(out)))
 }
 

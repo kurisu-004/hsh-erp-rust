@@ -105,6 +105,14 @@ const BAR_EMPTY: char = '░';
 /// 「生产架:A-03」这种中文位置），表里没有这两列。
 #[derive(Debug, Clone)]
 pub struct OrderRow {
+    /// `t_part.id` 或 `t_assembly.id`（**渲染层不读它**）。
+    ///
+    /// ⚠️ 它存在的理由是**省钱**：图纸链路（`include_drawings`）要向 `files` 域提交 CI
+    /// job，而 CI **按页计费** ⇒ 只能为「**本次真的会被列出来的**」那些行去提交。若按
+    /// 未截断的匹配集提交，`order_list_limit` 挡掉的那些行（现场可能成百上千）会白花
+    /// 一次 CI 的钱，而它们一个字符都不会出现在消息里。
+    /// service 层据此在**截断之后**收集 id 集合（见 `service::collect_order_groups`）。
+    pub owner_id: i64,
     /// 是否**装配件的子件行**（渲染时前缀成 `>   └ `）。
     ///
     /// ⚠️ 层级靠 `└` 这个字符表达，**不靠行首空格**：`markdown` v1 会把行首连续空格
@@ -185,8 +193,8 @@ pub struct ReportRows {
     pub sent_batch_count: i32,
     /// 当前在制单数（第一节正文第二行的「在制 y 单」，口径见 `repo::OverviewEvents::wip`）。
     pub in_process_count: i32,
-    /// 第二节**唯一**的数字：本期出货的工单数（= `COUNT(DISTINCT part_id)`）。
-    pub note_part_count: i32,
+    /// 第二节**唯一**的数字：本期出货的去重工单数（= `COUNT(DISTINCT part_id)`）。
+    pub note_count: i32,
     /// 第三节逾期组的**未截断匹配工单数**（同时进标题占位符 `{overdue_count}` 与
     /// 流水快照列 `t_wecom_daily_log.overdue_count`）。
     pub overdue_count: i32,
@@ -199,12 +207,24 @@ pub struct ReportRows {
     /// 在日报里加一行「无」是往好消息上刷噪音。管理员仍然能从 `/preview` 的
     /// `sections[]` 看到这一节是开着的。
     pub order_groups: Vec<OrderGroup>,
-    /// ⚠️ 图纸预览直链的**接缝**：`t_part.id → 直链`。
+    /// 图纸预览直链：`owner id → 直链`。
+    ///
+    /// ⚠️ 键的 id 空间**是 `t_part_file.part_id` 那一列**：散件行传 `t_part.id`、
+    /// 装配件行传 `t_assembly.id`（该列 polymorphic、无物理外键）⇒ 两类行用同一个
+    /// 字段名承载，**没有**「装配件的直链挂在子件上」这种改写。
     ///
     /// 取不到的工单**不在 map 里**（`get` 得 `None`）⇒ 该行名称渲染成纯文字。
-    /// ⚠️ 本轮（只出文字行）它恒为空：直链由 `files` 域的预览入口生成，接链的那一轮
-    /// 在 `service::fetch_rows` 里填上，本字段与渲染层**一字不改**。
+    /// 四种成因同一后果（没有 PDF 图纸 / 预算耗尽 / CI 终局失败 / 打 python 失败），
+    /// 见 `files::part_file::preview::service::PreviewService::ensure_ready_for_parts`。
     pub drawing_links: HashMap<i64, String>,
+    /// 第三节清单里**本次真的会被列出的**那些行的 owner id（装配件 + 散件 + 子件），
+    /// 图纸链路的入参。
+    ///
+    /// ⚠️ **渲染层不读它**（渲染只认 `OrderRow.link`）；它是给 service 层的「取完数、
+    /// 还了连接之后再接图纸」用的中间量。必须与 [`Self::order_groups`] **同一次**
+    /// 生成、且**在 `order_list_limit` 截断之后**收集 —— 清单变了而它没跟着变，直链就会
+    /// 挂到不在清单里的行上；而 CI 按页计费 ⇒ 多提交一次就多花一次钱。
+    pub drawing_part_ids: Vec<i64>,
     /// 全量工人行（`worker_top_n` 的挡人发生在渲染层，**不是**这里）。
     pub worker_rows: Vec<WorkerBarRow>,
 }
@@ -354,9 +374,10 @@ pub fn render(input: &RenderInput) -> Result<Rendered, AppError> {
 /// 照 `mail_digest` 的既有口径：未知占位符原样保留（管理员能一眼看出自己写错了什么）
 /// 比静默吞掉好；**没有别的**内置占位符可换。
 ///
-/// ⚠️ **`{note_count}` 现在喂的是第二节的**唯一**数字**（本期出货的工单数）：第二节
+/// ⚠️ **`{note_count}` 喂的是第二节的**唯一**数字**（本期出货的去重工单数）：第二节
 /// 改口径后不再统计「送货单张数」，但**占位符名保留**——存量模板里已经写着
 /// `{note_count}`，删掉这个替换会让它在标题里变成一串没人解释的 `{note_count}`。
+/// （2026-10-23 起 `rows.note_count` 承载这个数，`note_part_count` 那一键随列下线。）
 fn render_subject(cfg: &NormalizedConfig, rows: &ReportRows, today: NaiveDate) -> String {
     let tpl = cfg
         .subject_template
@@ -366,7 +387,7 @@ fn render_subject(cfg: &NormalizedConfig, rows: &ReportRows, today: NaiveDate) -
     tpl.replace("{date}", &today.format("%Y-%m-%d").to_string())
         .replace("{batch_count}", &rows.overview_batch_count.to_string())
         .replace("{quantity}", &rows.overview_quantity.to_string())
-        .replace("{note_count}", &rows.note_part_count.to_string())
+        .replace("{note_count}", &rows.note_count.to_string())
         .replace("{overdue_count}", &rows.overdue_count.to_string())
 }
 
@@ -412,7 +433,7 @@ fn build_blocks(input: &RenderInput, subject: &str) -> Vec<Block> {
             format!(
                 "## 二、本期出货\n\
                  > 出货：<font color=\"info\">{}</font> 单",
-                rows.note_part_count,
+                rows.note_count,
             ),
         ));
     }
@@ -787,11 +808,12 @@ mod tests {
             completed_count: 37,
             sent_batch_count: 86,
             in_process_count: 92,
-            note_part_count: 214,
+            note_count: 214,
             overdue_count: 12,
             upcoming_count: 7,
             order_groups: order_groups_fixture(),
             drawing_links: HashMap::new(),
+            drawing_part_ids: Vec::new(),
             worker_rows: (0..n)
                 .map(|i| WorkerBarRow {
                     worker_name: format!("工人{i:03}"),
@@ -806,6 +828,8 @@ mod tests {
     /// 一个清单行（测试用默认值：有序列号、无位置、无链接）。
     fn order_row(serial: &str, name: &str, qty: i32) -> OrderRow {
         OrderRow {
+            // ⚠️ fixture 的 owner_id 只为让结构体编译得过，渲染层不读它（见该字段 doc）。
+            owner_id: 0,
             is_child: false,
             serial_no: Some(serial.to_string()),
             name: name.to_string(),
@@ -1312,7 +1336,7 @@ mod tests {
     #[test]
     fn markdown_special_chars_are_not_swallowed() {
         let rows = ReportRows {
-            note_part_count: 1,
+            note_count: 1,
             overdue_count: 1,
             worker_rows: vec![WorkerBarRow {
                 worker_name: "A<B>C".into(),
