@@ -260,9 +260,10 @@ is_workday = effective_day_type ∈ { WORKDAY, MAKEUP_WORKDAY }
 
 ### 5.5 `null` 与缺省的语义
 
-- **入参 `Option<T>` 的 `None` 一律是「这次不改」**（端点 6），**没有**「显式清空某个可空列」的语义 —— 要清空就传空串（`color` / `remark` / `name` 都是 varchar 而非有约束的可空列）。
+- **入参 `Option<T>` 的 `None` 一律是「这次不改」**（端点 6），**没有**「显式清空某个可空列」的语义 —— 要清空就传空串（限 `color` / `remark` 两个可空列；⚠️ **`name` 不适用**，它是必填项，传空串 / 纯空白是 `21909` 而不是「清空」，见 §5.7）。
 - **`segments` 是单列覆盖**：传了就整列替换（不做段级 merge），不传就保持原值。
-- **出参的可空列是真的可空**：`name` / `color` / `remark` 是 `string | null`，前端要能处理 `null`（不要 `x || ''` 后再判空）。
+- **出参的可空列是真的可空**：`ShiftOut` 的 `color` / `remark` 是 `string | null`，前端要能处理 `null`（不要 `x || ''` 后再判空）。⚠️ **别把 `CalendarDayOut.name`（全局日历，可空）的形态套到 `ShiftOut.name` 上** —— 后者是必填的 `string`，恒非空。
+- ⚠️ **「要清空就传空串」落库得到的是空串 `''` 而不是 `NULL`**：service 直接把入参值绑进 `UPDATE`，没有任何「空串 ⇒ 转 NULL」的转换。所以回显（GET / 列表 / 改完的响应）里 `color` / `remark` **恒为空串**，不是 `null`。⇒ **出参 `color` / `remark` 两种形态都要放行**：`null` = 从没设过 / 库里是 NULL，`''` = 被显式清空过（也是前端唯一能表达「清空」的入参）。把 `''` 当成非法值拒掉，表单里就再也清不掉这两个字段了。
 
 ### 5.6 `version` 缺失是 422 纯文本，不是业务信封
 
@@ -283,11 +284,17 @@ service 在落库前对每个 `varchar` 入参做两道检查，违规一律 `21
 
 ⚠️ **为什么空白 `code` 要拒**：它会**占住** `uk_t_hr_shift_code` 的 partial unique —— 建出一条 `code = ''` 的班次后，任何人想用空 code 都撞 `21902`，而那条空班次本身没有任何业务含义。`name` 空串则让排班表上出现一行没名字的班次。两者都是「入参非法」（`21909`）而不是「状态冲突」（`21902`）。
 
-### 5.8 「班次可写」的判据下沉进写 SQL（不是读-再-写）
+⚠️ **检查顺序在 `code_exists` 重复预检之前**：`require_text` / `check_len` 先判 ⇒ **空白 code 一律 `21909`，不会落到 `21902`**。反过来先查重，空 code 会先撞上「库里已存在的空 code」而误报成重复。端点 6 同理：新 `code` 的两道守卫都在 `code_exists(conn, new_code, Some(id))` 之前。
 
-端点 6 / 7 / 9 / 10 的写 SQL **自带班次侧判据**（`WHERE s.id = $N AND s.is_active AND s.deleted_at IS NULL`，端点 9 以 `FROM t_hr_shift s` 关联的形式出现）。service 侧那次 `get_shift` + `ensure_writable` 只是**友好报错的前置检查**，真正的判据在写语句自己的谓词里。
+### 5.8 「班次可写」不做读-再-写（判据落点逐端点不同）
 
-⚠️ 理由：读-再-写之间有 TOCTOU 窗口，并发的 `POST /shifts/{id}/deactivate` 落在窗口里时，覆盖行会写进一个已经停用的班次，而 `21906` 被整个绕过。
+service 侧那次 `get_shift` + `ensure_writable` 只是**友好报错的前置检查**，真正的判据在写语句自己的谓词里 —— 但**四条写端点的判据形态各不相同**：
+
+- **端点 7（停用）**：写 SQL 带 `AND is_active`，完整谓词是 `WHERE id = $1 AND version = $2 AND deleted_at IS NULL AND is_active`。这个动作本来就要求「当前启用」，带不带都是同一个结果，带上是显式表达。
+- **端点 9（写覆盖行）/ 端点 10（清覆盖行）**：以 `FROM … , t_hr_shift s` / `UPDATE … FROM t_hr_shift s` **关联**的形式带班次侧判据（`WHERE s.id = $N AND s.is_active AND s.deleted_at IS NULL`）。
+- **端点 6（改班次）：写 SQL 里没有 `is_active`**，只有 `WHERE id = $N AND version = $N AND deleted_at IS NULL`。它的 `21906` **不是**来自写语句的谓词，而是来自 0 行后的**回查归因**（见下方归因表）：并发停用会 `version = version + 1`，所以 `version` 判据**先**失败落 0 行，service 回查看到 `is_active = false` ⇒ 归因成 `21906`。这不构成 TOCTOU 破绽 —— 判据虽不在写语句里，但「停用一定自增 version」保证了这个写不可能在一个已停用的班次上成功。
+
+⚠️ **为什么这些写端点都不能退回「读-再-写」**：service 侧那次 `get_shift` 与写语句之间有 TOCTOU 窗口，并发的 `POST /shifts/{id}/deactivate` 落在窗口里时，覆盖行会写进一个已经停用的班次，而 `21906` 被整个绕过。
 
 ⚠️ **0 行的归因**（前端要按 code 分流，不要一律当 OCC）：
 

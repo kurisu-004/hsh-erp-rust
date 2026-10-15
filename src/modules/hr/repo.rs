@@ -32,7 +32,8 @@
 //! ## 写路径的 OCC
 //!
 //! `UPDATE … WHERE id = $1 AND version = $2 AND deleted_at IS NULL`；
-//! `rows_affected == 0` 由 service 回查归因（不存在 → `21901` / 版本陈旧 → `40901`），
+//! `rows_affected == 0` 由 service 回查归因（查不到 / 已软删 → `21901` /
+//! 在但 `is_active = false` → `21906` / 在、启用中但 `version` 陈旧 → `40901`），
 //! repo 层**只回传行数**（CLAUDE.md §8：禁止「读-再-比」式的隐式 OCC）。
 
 use chrono::{NaiveDate, NaiveDateTime};
@@ -307,8 +308,15 @@ pub struct ShiftPatch {
 
 /// 全列覆写一个班次（OCC：`WHERE id=$1 AND version=$2 AND deleted_at IS NULL`）。
 ///
-/// 返回 `rows_affected`：1 = 成功；0 = **归因由 service 决定**（行不存在 → `21901`；
-/// 存在但 `version` 陈旧 → `40901`）。repo 层刻意不替 service 做那个回查。
+/// 返回 `rows_affected`：1 = 成功；0 = **归因由 service 决定**（行不存在 / 已软删 →
+/// `21901`；在但 `is_active = false` → `21906`；在、启用中但 `version` 陈旧 → `40901`）。
+/// repo 层刻意不替 service 做那个回查。
+///
+/// ⚠️ **本条谓词里刻意没有 `is_active`**，不是漏写：`POST /shifts/{id}/deactivate`
+/// （[`deactivate_shift`]）必定 `version = version + 1`，所以「写之前被并发停用」这件事
+/// **一定**先让 `version = $2` 失配落 0 行，service 回查时看到 `is_active = false` ⇒
+/// 归因成 `21906`（而不是让这个 `UPDATE` 成功写进一个已停用的班次）。代价是 `21906`
+/// 要等回查才知，不像其它写路径那样由写语句自己挡。
 ///
 /// ⚠️ 返回 `sqlx::Error` 而非 `AppError`：改成已占用的 `code` 会撞
 /// `uk_t_hr_shift_code`（`23505`），那个要由 service 映射成 `21902` 而不是 `50001`

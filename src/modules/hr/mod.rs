@@ -85,7 +85,7 @@
 //! | 21901 | `BIZ_HR_SHIFT_NOT_FOUND` | 404 | 查 / 改 / 停用一个不存在或已软删的班次 |
 //! | 21902 | `BIZ_HR_SHIFT_CODE_DUPLICATED` | 409 | 班次 `code` 重复（**不是** 40901 OCC） |
 //! | 21903 | `BIZ_HR_SHIFT_SEGMENT_INVALID` | 400 | 段非法 / 库里那一列 jsonb 解不出来 |
-//! | 21904 | `BIZ_HR_CALENDAR_RANGE_INVALID` | 400 | `from > to` 或跨度 > 366 天 |
+//! | 21904 | `BIZ_HR_CALENDAR_RANGE_INVALID` | 400 | `from > to` / 跨度 > 366 天 / upsert 或 delete 的批量**条数** > 366 / upsert 的 `items` 为空 / 删行请求没恰好命中 `{dates}` 或 `{from,to}` 一种形态 |
 //! | 21905 | `BIZ_HR_DAY_TYPE_INVALID` | 400 | 未知 `day_type` |
 //! | 21906 | `BIZ_HR_SHIFT_INACTIVE` | 409 | 对已停用班次做写操作 |
 //! | 21907 | `BIZ_HR_CALENDAR_LEAVE_NAME_REQUIRED` | 400 | `CUSTOM_LEAVE` 未填 `name` |
