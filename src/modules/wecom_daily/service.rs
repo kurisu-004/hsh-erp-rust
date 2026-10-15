@@ -13,7 +13,7 @@
 //!
 //! ```text
 //! 借 1/3 → resolve_target（查 + 解密）→ 还
-//! 借 2/3 → fetch_rows（恒 ≤ 6 条 SQL）→ 还
+//! 借 2/3 → fetch_rows（恒 O(1) 条 SQL）→ 还
 //! ────── 逐片顺序发送（≈ max_chunks × 5s 的**纯网络等待**，零 DB IO）──────
 //! 借 3/3 → cfg_version 快照 + insert_log（合并成**一次**借还）→ 还
 //! ```
