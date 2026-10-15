@@ -6,9 +6,10 @@
 //!   （2026-10-13 PR1b：`upload-drawing` / `upload-3d-model` 两条已迁出本文件）
 //! - `lifecycle.rs` —— part 级终态（cancel / force-complete）
 //!   （2026-10-13：`list_by_work_type` 零消费方，随端点整条删除）
-//! - `batch.rs` —— 批量创建（batch / batch-with-bindings）
+//! - `batch.rs` —— 批量创建（纯建单）
 //!   （2026-10-13：`batch_with_pdfs` 零消费方，随端点整条删除；PR1b：
-//!   `confirm_part_file` 已迁至 `files::part_file::handler`）
+//!   `confirm_part_file` 已迁至 `files::part_file::handler`；**2026-10-15**：
+//!   文件 bindings 分支随统一上传链路上线删除）
 //! - `print.rs` —— 打印转发（print-drawing / print-drawing-batch，纯 BFF：鉴权 + 转发到 python）
 //!
 //! 2026-10-02：原 `inspection.rs` 整体迁至 `crate::modules::prod::batch::handler`

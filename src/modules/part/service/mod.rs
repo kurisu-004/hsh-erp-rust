@@ -9,8 +9,8 @@
 //!   lookup_customer_names；客户 id 展开走 `crate::shared::customer`）。
 //!   2026-10-13 PR1b：三条上传（upload_part_file / upload_drawing /
 //!   upload_3d_model）删除，迁往 `files::part_file`
-//! - `batch.rs`：批量创建（batch_create_parts legacy + batch_create_parts_with_bindings +
-//!   prepare_binding_head_copy + PreparedBinding），2026-09-16 M2-B + M2-C 重构
+//! - `batch.rs`：批量创建（`batch_create_parts_legacy`；2026-10-15 起 bindings 分支
+//!   随统一上传链路上线删除，文件改走 `files::part_file` 的 upload-intents + confirm）
 //! - `lifecycle.rs`：part 级多批次终态（cancel / force_complete）
 //! - `phase1/events.rs`：事件历史 / 位置树 / 批量创建增强（list_events /
 //!   location_tree / batch_update_order_info；⚠️ `batch_with_pdfs` 已于 2026-10-13

@@ -639,7 +639,9 @@ DRAFT ──submit──▶ SUBMITTED ──pickup──▶ PICKED_UP ──▶ 
 | `GET /api/v2/delivery-groups/*` → `/api/v2/com/delivery/group/*` | 同上 |
 
 ⚠️ **2026-10-16 补记：打印模板的绑定不在本域，而在新建的 `print_template` 域**
-（`/api/v2/print-templates/*`，5 端点，契约见
+（`/api/v2/print-templates/*`，**4 个端点** —— 2026-10-15 起无上传端点，模板写入改走
+`POST /api/v2/files/objects/upload-intents` + `POST /api/v2/files/objects/confirm`
+（`owner_kind=CUSTOMER` / `kind=DELIVERY_TEMPLATE`）；契约见
 [`print_template.md`](print_template.md)）。**本域仍然零打印端点** ——
 上表那两条（`POST /{id}/print` / `print-labels`）于 2026-10-08 下线后**逐字不恢复**；
 新域只管「模板文件的存 / 绑一级客户 / 取字节」，**渲染仍在前端 hucre 本地生成**。

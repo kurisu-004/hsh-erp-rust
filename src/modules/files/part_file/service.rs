@@ -544,15 +544,11 @@ impl PartFileService {
 // 2026-10-13：`list_part_files_for_owner`（原 `#[allow(dead_code)]`，本就是 0 调用方）
 // 已删除。要列某 owner 的 part_file 直接走 `PartFileRepo::list_by_owner(conn, kind, id)`。
 
-// ===== 2026-09-16 M2-B 业务层：bind_uploaded_file（STS 直传回执） ==============
+// ===== bind_uploaded_file（confirm：把已直传到正式 CAS key 的对象登记成行） =====
 //
-// 2026-09-18 注：原 `upload_intents` 业务函数已**删除**（迁移至相关 STS 会话域）。
-// 2026-09-28 备注：相关 STS 会话域整体下线；该函数不再有任何归属。
-// 2026-10-13 PR1b：调用方只剩本子模块的 confirm 端点 handler（原 part 域
-// `part/handler/batch.rs::confirm_part_file` 随端点搬来）。part 域
-// `service/batch.rs::prepare_binding_head_copy` **不**调本方法 —— 它自带一份
-// head/copy 预处理（DB 写入由 batch_create 第二遍在事务内做），只共用
-// `util::cos_key::build_cas_key` 与 `dto::validate` 两处 helper。
+// 唯一调用方是本子模块 `POST /files/objects/confirm` 的 handler。2026-10-15 起
+// 本方法**只**做「校验 → 软删旧活跃行 → INSERT（+ 可选 CNC 配对）」，不再有
+// 任何「服务端 copy / 清 tmp」动作 —— 字节是前端直传到正式 key 的。
 //
 // 2026-09-22 重构说明：本方法是「事务由 service 自管」的特例——
 // - 调用方是 confirm handler，它不开 tx（head/copy 是外部 IO，不该包在事务里）。

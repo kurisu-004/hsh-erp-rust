@@ -317,28 +317,26 @@ impl PartBatchRepo {
     /// 「两个批次都在品检」，`GET /api/v2/parts/{part_id}`（零件详情主查询）
     /// **整个打不开、HTTP 500**。
     ///
-    /// **4 个调用方与各自的故障形态**（2026-10-10 review 第 1 轮更正：原注释只
-    /// 写了 2 个，漏掉的两处都是「建单后回填详情」，故障形态与 `get_part` 不同）：
+    /// **3 个调用方与各自的故障形态**（2026-10-10 review 第 1 轮更正：原注释只
+    /// 写了 2 个，漏掉的那处是「建单后回填详情」，故障形态与 `get_part` 不同；
+    /// 2026-10-15 又删掉 bindings 那一支）：
     ///
     /// | 调用方 | 端点 | `?` 的故障形态 |
     /// |---|---|---|
     /// | `part::service::crud::create_part` | `POST /parts` | 整单 500（`?` 直接返回 ⇒ handler 的 `tx` 被 drop 回滚，工单**不**落库） |
     /// | `part::service::crud::get_part` | `GET /parts/{id}` | 整单 500 |
-    /// | `part::service::batch::batch_create_parts_with_bindings` | `POST /parts/batch` 的 `has_bindings=true` 那一支（handler 按 `items[].drawing_file/model3d_file` 是否非空分流） | 整单 Err（错误类型 `(AppError, Vec<String>)`，handler 拿 `cleanup_tmp_keys` 兜底删 COS 对象） |
-    /// | `part::service::batch::batch_create_parts_legacy` | `POST /parts/batch` 的 `has_bindings=false` 那一支 | 整单 500 |
+    /// | `part::service::batch::batch_create_parts_legacy` | `POST /parts/batch`（**2026-10-15 起这是它唯一的调用路径**：原先的 bindings 那一支随统一上传链路上线删除） | 整单 500 |
     ///
     /// （⚠️ 原先还有一行「`POST /parts/batch-with-pdfs` 不在此列 —— 它是
     /// `batch_with_pdfs`，建完 master/子件后直接返详情，回填 `current_batch_id`
     /// 的位置恒传 `None`」—— 该端点已于 2026-10-13 随零消费方清理整条删除，
     /// 故这条例外说明随之消失。）
     ///
-    /// ⚠️ 四处**全是 `?` 上抛 ⇒ 整单失败**，没有一处是「该行进 `failed[]`、
-    /// 其余行照写」：那两个批量端点的 `failed[]` 只收 `create_part` /
-    /// `create_initial_batch` / `t_part_file` **写入阶段**的错误；回填详情这步在
-    /// per-item `SAVEPOINT` 已 `RELEASE` 之后（legacy 路径更是全程无 savepoint），
-    /// 走的是「查不到就整单失败」的形态。而 `batch_create_parts_with_bindings`
-    /// 那处的 `.map_err(|e| (AppError::from(e), …))` 只是把 `sqlx::Error` 映射成
-    /// 该函数自己的 Err 元组，**不是**收集进 `failed[]`。
+    /// ⚠️ 三处**全是 `?` 上抛 ⇒ 整单失败**，没有一处是「该行进 `failed[]`、
+    /// 其余行照写」：批量端点的 `failed[]` 只收 `create_part` /
+    /// `create_initial_batch` **写入阶段**的错误；回填详情这步在 per-item
+    /// `SAVEPOINT` 已 `RELEASE` 之后（legacy 路径更是全程无 savepoint），
+    /// 走的是「查不到就整单失败」的形态。
     ///
     /// ⚠️ 由此产生的**既有**语义（不在本函数内、登记在 `part::handler::batch`
     /// 的同一段注释里）：`POST /parts/batch` 的 Err 分支照旧 `tx.commit()` 而非

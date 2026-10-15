@@ -117,10 +117,12 @@ use crate::state::AppState;
 // - 与 part_file **相关**（PR1b 前）：`upload-drawing` / `upload-3d-model`（虽挂在 part
 //   域却写 `t_part_file`）、`files/confirm`（STS 直传回执）。二者已分别并入
 //   `POST /api/v2/files/objects` 与硬切到 `POST /api/v2/files/objects/confirm`。
-// - 仍留在本域的**条件性**文件写入：`POST /parts/batch` 的 bindings 分支
-//   （`service/batch.rs::prepare_binding_head_copy`）—— 它命中上面的口径
-//   （确实写 `t_part_file`），但端点本体是「批量建零件」，文件只是可选入参，
-//   故按「一条端点的目标域按前端消费方判定」的约定留在 part 域。
+// - ★ **2026-10-15：本域已零 `t_part_file` 写入**。`POST /parts/batch` 的 bindings
+//   分支（`items[].drawing_file` / `model3d_file` + `prepare_binding_head_copy`）
+//   随统一上传链路上线整条删除，该端点回归**纯建单**；零件文件一律走
+//   `files::part_file` 的 upload-intents → 前端直传 → confirm（owner = 建单后拿到的
+//   part_id）。`assemblies` 侧的 multipart PDF 仍在本域（只喂 `lopdf` 数页数、
+//   **不入库不上 COS**）。
 // 下线的 7 条端点逐条清单见 `src/modules/files/part_file/handler.rs` 的模块 doc
 // 「2026-10-13 同批下线的 7 条端点（移除记录，防后人重建）」一节；PR1b 的 3 条
 // （upload-drawing / upload-3d-model / files/confirm）见同一文件的
@@ -197,12 +199,9 @@ pub fn router() -> Router<Arc<AppState>> {
     // 出参 `R<TPartFile>` → `R<PartFileOut>`；owner 键 `part_id` → `owner_id`
     // （并新增 `owner_kind` 回显）；丢 `updated_at` / `updated_by` / `deleted_at`。
     // 逐字段对照见 `files/part_file/mod.rs` 的「零件侧上传的响应形状与状态码变更」一节。
-    // ⚠️ 刻意保留在本域的：**`POST /parts/batch` 的 bindings 分支**
-    // （service/batch.rs::prepare_binding_head_copy）—— 端点本体是「批量建零件」，
-    // 文件只是可选入参，不是一条独立的文件端点。
-    // ⚠️ 该分支仍把 size 上限写死成 300MB（同 `bind_uploaded_file` 的老写法，
-    // 2026-10-13 review 第 1 轮已在 files 域那侧改成读配置，本侧未动）；
-    // 登记见 `files/part_file/mod.rs` 的「已知偏差登记」第 5 条。
+    // ★ **2026-10-15：`POST /parts/batch` 的 bindings 分支已删除**（与上面的
+    // 「响应形状与状态码变更」一起成为历史）—— 该端点现在**不碰** `t_part_file`，
+    // 回归纯建单；响应里的 `cleanup_tmp_keys` 字段保留但恒为空（形状兼容）。
 }
 
 /// part 域的**生产链路逃生端点**子路由（不含公共前缀；由 `prod::router()` 桥接到

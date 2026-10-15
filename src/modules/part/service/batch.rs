@@ -33,10 +33,10 @@ impl PartService {
     /// 2026-09-16 M2-C：从 crud.rs 迁移到本文件（按 docs/conventions.md §2 单文件职责拆分）。
     ///
     /// 2026-10-05：`POST /parts/batch` 不带任何 file binding 时走本路径（handler 按
-    /// `has_bindings` 分流），而前端 PDF 批量上传正是这条路径，所以序列号派发与
+    /// 本文件的实现），而前端 PDF 批量上传正是这条路径，所以序列号派发与
     /// `unit_price` / `total_price` 透传必须在这里也做一遍，否则真实建单入口仍然
     /// 拿不到序列号。prefix 只取一次、per-item 派一次号的取舍与
-    /// [`Self::batch_create_parts_with_bindings`] 同（序列号空洞可接受、
+    /// `POST /parts` 单件建单同（序列号空洞可接受、
     /// 同 prefix 建单在 `t_serial_counter` 该行的排他锁上串行到 COMMIT）。
     pub(super) async fn batch_create_parts_legacy<R: PartRepoTrait>(
         mut repo: R,
@@ -63,7 +63,7 @@ impl PartService {
                     format!("customer {} 不存在", req.customer_id),
                 )
             })?;
-        // 与 `batch_create_parts_with_bindings` / `create_part` **同口径**（2026-10-17
+        // 与 `create_part` **同口径**（2026-10-17
         // 对齐）：闸门一律是「存在性 → 叶子 → 派号 → 取名」。叶子闸门排在派号之前，
         // 挂了非叶子客户不会白烧一个序列号（号池 4 位一轮回绕，白烧的号会挤掉真正要用的）。
         require_leaf_customer(repo.conn_mut(), req.customer_id).await?;

@@ -2,7 +2,7 @@
 
 > 本文件是 `print_template` 域的**唯一**契约来源。任何字段 / 端点变更必须同步本文件。
 > 代码位置：`src/modules/print_template/`（`mod.rs` · `handler.rs` · `service.rs` · `dto.rs` · `vo.rs`）。
-> 权威路由清单：`handler::ROUTES`（5 条），lib 单测
+> 权威路由清单：`handler::ROUTES`（**4 条** —— 2026-10-15 起本域无上传端点），lib 单测
 > `handler::tests::routes_declared_in_router` 逐条比对 `router()` 源码
 > （解析器复用 `files::route_guard::routes_in_router_source`，**不**另抄一份）。
 
@@ -10,9 +10,10 @@
 
 **用户原话**：「增加模板上传的功能，模板支持 xlsx 格式，当前用于打印送货单。前端的模板管理页面增加上传模板和查看已有模板的功能。且可以绑定一级客户。送货单打印时自动选择已绑定的模板」。
 
-### 0.1 本域**做**什么（5 条端点，全在 §1）
+### 0.1 本域**做**什么（4 条端点，全在 §1）
 
-1. 管理员在「模板管理」页给某个**一级客户**上传 / 替换 / 删除一份 xlsx 打印模板；
+1. 管理员在「模板管理」页给某个**一级客户**替换 / 删除一份 xlsx 打印模板
+   （**写入**走 `files` 域的统一链路，见 §1.0）；
 2. 打印对话框按「送货单所属的一级客户」**自动解析出**该用哪份模板（端点 3）；
 3. 前端据此**取模板字节**（端点 4），再用它渲染打印件。
 
@@ -21,9 +22,9 @@
 | 不做 | 理由 |
 |---|---|
 | **不恢复任何「渲染 / 生成打印件」端点** | 打印渲染一直在**前端本地**（hucre）。`POST /com/delivery/note/{id}/print` 与 `print-labels` 于 2026-10-08 整链路下线（见 `docs/api/delivery_note.md` §6.1），本轮**逐字不恢复**。本域只管「存 + 绑 + 取字节」三件事 |
-| **不做 xlsx 内部结构校验** | 后端刻意**不引入 `zip` / `calamine` 之类 crate**（§8.3 第 3 条） |
+| **不校验 xlsx 内容**（含 ZIP magic） | 统一链路后后端**拿不到字节**（confirm 只有 `head`），物理上答不了；结构校验由前端 `assertTemplateMatches` 承担（§3.2、§8.3 第 3 条） |
 | **不绑二级客户** | 用户拍板「只绑一级客户」（§4.1） |
-| **不做「传了份新模板」的通知 / 审批流** | 需求里没有；`POST /` 是**立即替换**语义 |
+| **不做「传了份新模板」的通知 / 审批流** | 需求里没有；写入链路是**立即替换**语义 |
 
 ### 0.3 绑定关系 = 存在性（本域最核心的决策）
 
@@ -31,15 +32,41 @@
 `part_id` 列装的是**一级客户的 `t_customer.id`**。「该 L1 名下存在一行未软删的
 `DELIVERY_TEMPLATE`」**本身就是绑定关系**。取舍全文见 §8.3 第 1–2 条。
 
-## 1. 端点表（**5 个**）
+## 1. 端点表（**4 个**）
 
 | # | 方法 | 路径 | 权限 | 入参 | 响应 |
 |---|---|---|---|---|---|
-| 1 | POST | `/api/v2/print-templates` | `require_role(Manager)` | multipart：`data`（JSON 文本，**必填**）+ `file`（xlsx 字节，**必填**） | **201** + `PrintTemplateOut` |
-| 2 | GET | `/api/v2/print-templates` | `require_role(Manager)` | `customer_id?`、`limit?`（缺省 50，clamp `[1,200]`）、`offset?`（缺省 0，`max(0)`） | `PrintTemplateListOut` |
-| 3 | GET | `/api/v2/print-templates/resolve` | 权限点 `delivery_note.print` | `customer_id`（**必填**，JSON string 形态雪花 id） | `PrintTemplateResolveOut`；未绑定 ⇒ `21109` / HTTP **422** |
-| 4 | GET | `/api/v2/print-templates/{template_id}/content` | 权限点 `delivery_note.print` | 无 | **裸字节**（非 `R<T>`）+ xlsx MIME 头 |
-| 5 | POST | `/api/v2/print-templates/{template_id}/delete` | `require_role(Manager)` | JSON body **必含 `version`**（OCC） | `R<()>` |
+| 1 | GET | `/api/v2/print-templates` | `require_role(Manager)` | `customer_id?`、`limit?`（缺省 50，clamp `[1,200]`）、`offset?`（缺省 0，`max(0)`） | `PrintTemplateListOut` |
+| 2 | GET | `/api/v2/print-templates/resolve` | 权限点 `delivery_note.print` | `customer_id`（**必填**，JSON string 形态雪花 id） | `PrintTemplateResolveOut`；未绑定 ⇒ `21109` / HTTP **422** |
+| 3 | GET | `/api/v2/print-templates/{template_id}/content` | 权限点 `delivery_note.print` | 无 | **裸字节**（非 `R<T>`）+ xlsx MIME 头 |
+| 4 | POST | `/api/v2/print-templates/{template_id}/delete` | `require_role(Manager)` | JSON body **必含 `version`**（OCC） | `R<()>` |
+
+### 1.0 模板**写入**链路（2026-10-15：本域不再有上传端点）
+
+模板行的写入**全部**经 `files` 域的统一收文件链路，本域不持任何收字节的端点：
+
+```text
+① POST /api/v2/files/objects/upload-intents
+   body: { owner_kind: "CUSTOMER", owner_id: "<L1 雪花 id>",
+           items: [{ client_ref, kind: "DELIVERY_TEMPLATE",
+                     original_filename, content_type, file_size, content_sha256 }] }
+   → 每项回 { already_exists, object_key, upload_url, content_type, expires_in, existing_file? }
+② 前端 XHR PUT 字节到 upload_url（**不经 rust 进程**），头带 content_type
+③ POST /api/v2/files/objects/confirm
+   body: { owner_kind: "CUSTOMER", owner_id, kind: "DELIVERY_TEMPLATE",
+           object_key, content_sha256, original_filename, file_size, content_type, ext }
+   → R<PartFileOut>
+```
+
+- 两条写入口的角色闸门：`owner_kind='CUSTOMER'` ⇒ **仅 Manager**
+  （`policy::write_roles_for`；CLERK 打任一条都是 40300）。
+- `owner_id` 必须是**一级客户** ⇒ 否则 **21105 / HTTP 404**（§4.1）。
+- 「替换」语义（一个 L1 至多一份活跃模板）由 confirm 事务内的
+  **软删旧活跃行 + INSERT** 承接（§4.2）。
+- ⚠️ **confirm 的出参是 `R<PartFileOut>`，没有 `customer_name`** —— 那是本域给
+  `t_customer` 补的列。写完**刷新列表**（端点 1）才能拿到名字。
+- ⚠️ 上传-intents 命中 CAS 时返回 `already_exists: true` + `existing_file`，前端
+  **跳过 PUT 与 confirm**（秒传）。
 
 ### 1.1 权限分档（为什么读端点不是 MANAGER-only）
 
@@ -58,8 +85,10 @@
 
 ### 1.2 角色守卫下沉在 handler 第一行 + service 内复核
 
-仓库惯例（`statistics` / `mail_digest` / `print_template` 同款）。端点 1 的守卫
-还额外排在**读 multipart 之前** —— 避免未授权请求触发整包内存分配。
+仓库惯例（`statistics` / `mail_digest` / `print_template` 同款）。⚠️ 2026-10-15 起
+本域没有写端点，「读 multipart 之前」那条只对**读**端点不再适用（读端点是纯
+查询，没有分配成本）。写入侧的角色闸门在 `files::part_file` 的两条通用写入口里
+（`upload-intents` / `confirm`），见 §4.4。
 
 ### 1.3 事务边界
 
@@ -91,7 +120,8 @@ fallback 产出，`route_layer` 只作用于已匹配路由 ⇒ 404 连鉴权层
 
 ## 2. `PrintTemplateOut` 逐字段
 
-端点 1 / 2 / 3 复用同一形状。
+三个读端点（1 / 2 / 3）复用同一形状。⚠️ **写入侧的响应不是这个 VO** —— 它是
+`R<PartFileOut>`（见 §1.0 末）。
 
 | 字段 | 类型 | 来源 / 口径 |
 |---|---|---|
@@ -104,7 +134,7 @@ fallback 产出，`route_layer` 只作用于已匹配路由 ⇒ 404 连鉴权层
 | `file_size` | number | `t_part_file.file_size`（字节） |
 | `content_type` | string | 行上的真实列，恒为 xlsx 规范 MIME（上传闸门只收这一个精确值，§4.3） |
 | `content_sha256` | string \| null | 内容 SHA-256 hex（64 字符小写） |
-| `version` | number | **OCC 锚点**（`t_part_file.version`），端点 5 的 body 必须回传它 |
+| `version` | number | **OCC 锚点**（`t_part_file.version`），端点 4 的 body 必须回传它 |
 | `created_at` / `updated_at` | string | `t_part_file` 的两列，naive timestamp（Asia/Shanghai 写入） |
 
 ### 2.1 ⚠️ **刻意不出参**的 4 个字段及理由
@@ -119,18 +149,18 @@ fallback 产出，`route_layer` 只作用于已匹配路由 ⇒ 404 连鉴权层
 ⚠️ **本 VO 刻意不复用 `files::part_file::vo::PartFileOut`**：后者的
 `owner_kind` 字段是**从请求参数回显**的（`service::render_out(&row, owner_kind)`
 取形参、不取行上任何列 —— 那处已登记在 `files/part_file/mod.rs` 的已知偏差第 7 /
-9 条）。本域 5 条端点里只有端点 1 走那条路径，端点 3 / 4 是**按 id 取回**的，
+9 条）。本域的读端点是**按 `(part_id, kind='DELIVERY_TEMPLATE')` 取回**的，
 回显不出 `CUSTOMER`。照抄一份 VO 出来、再让 `owner_kind` 变成「要么对、要么空」
 的字段，只会把那处偏差复制到本域。
 
-### 2.2 `PrintTemplateResolveOut`（端点 3）
+### 2.2 `PrintTemplateResolveOut`（端点 2）
 
 | 字段 | 类型 | 来源 |
 |---|---|---|
 | `template` | `PrintTemplateOut` | 见 §2 |
 | `customer_name` | string \| null | **本域自己的一条 `t_customer` 只读查询**（`deleted_at IS NULL` 时取 `name`）；客户不存在 / 已软删时为 `null`，**不报错** —— 模板行本身还在（软删闸门只管 `t_part_file`），此时前端展示模板即可，不必因客户改名 / 下架而打不开打印对话框 |
 
-### 2.3 `PrintTemplateListOut`（端点 2）
+### 2.3 `PrintTemplateListOut`（端点 1）
 
 | 字段 | 类型 | 口径 |
 |---|---|---|
@@ -139,13 +169,16 @@ fallback 产出，`route_layer` 只作用于已匹配路由 ⇒ 404 连鉴权层
 
 ### 2.4 `customer_name` 的三条填充路径（⚠️ 与 N+1 无关的取舍）
 
-端点 1 / 2 / 3 走**三条不同的填充路径**（review 第 2 轮 C-1）：
+两个**读**端点走**两条不同的填充路径**：
 
 | 端点 | 怎么填 | 语句数 |
 |---|---|---|
-| 1 `POST /` | `service::l1_customer_name` —— **L1 强制点那条查询顺带把 `name` 取回来**（谓词本来就带 `parent_id IS NULL`）⇒ 零额外往返。⚠️ 「是不是 L1」与「叫什么」压在同一个 `Option` 上，安全前提是 **`t_customer.name` 是 NOT NULL**（baseline 迁移）—— 若日后改成可空，这道门会把「无名 L1 客户」误拒成 20104 | 与改前逐字相同 |
-| 2 `GET /` | `service::customer_names` —— **一条 `WHERE id = ANY($1)`** 一次取回全部客户名，在内存里 join（`HashMap` 查表） | +1（见 §8.3 第 16 条） |
-| 3 `GET /resolve` | `service::customer_name` —— 与 §2.2 那个顶层字段**同一条查询、同一个值**，一个 `clone()` 后分别填两处 | 与改前逐字相同 |
+| 1 `GET /`（列表） | `service::customer_names` —— **一条 `WHERE id = ANY($1)`** 一次取回全部客户名，在内存里 join（`HashMap` 查表） | 与返回行数无关（见 §8.3） |
+| 2 `GET /resolve` | `service::customer_name` —— 与 §2.2 那个顶层字段**同一条查询、同一个值**，一个 `clone()` 后分别填两处 | 逐字未变 |
+
+⚠️ **写入侧（`POST /files/objects/confirm`）不填 `customer_name`**：它回的是
+`R<PartFileOut>`（files 域的文件行投影，18 字段，**没有**这一列）。前端写完模板
+**刷新列表**（端点 1）才能拿到名字。
 
 ⚠️ **`customer_name`（行内）与 §2.2 的 `customer_name`（resolve 顶层）是两个字段、
 刻意重复**：前端在「模板管理列表」读行内那个、在「打印对话框」读顶层那个
@@ -161,57 +194,50 @@ fallback 产出，`route_layer` 只作用于已匹配路由 ⇒ 404 连鉴权层
 `customer_name_is_null_after_customer_soft_deleted` 钉的是**出参取值**
 （命中 / `null`），语句数由那道源码护栏钉。
 
-## 3. 端点 1 的上传契约（multipart）
+## 3. 写入契约（`files` 域统一链路）
 
-### 3.1 multipart 形态
+### 3.1 请求形态
 
-```
-Content-Type: multipart/form-data; boundary=…
+见 §1.0 的三步。**本域没有 multipart 端点了**（`POST /api/v2/print-templates`
+于 2026-10-15 下线，旧路径 POST 返回 **405** —— 路径本身还在，端点 1 的 GET
+挂在同一个 `.route("/", get(h))` 上）。
 
---…
-Content-Disposition: form-data; name="data"
-（无 filename，纯文本字段）
+### 3.2 ⚠️ 「这份 xlsx 是不是真 xlsx」**不再由后端校验**（有意弱化）
 
-{"customer_id":"<一级客户的雪花 id，JSON string 形态>"}
+原有的四道轻校验（空字节 / 扩展名 / 大小 / **ZIP magic**）随 multipart 端点
+一起下线。扩展名、大小两道**由两条通用写入口继续把**（`upload-intents` 与
+`confirm` 都判 `policy::allowed_exts("DELIVERY_TEMPLATE") == ["xlsx"]`、MIME
+精确匹配、`file_size` 上下限）；**ZIP magic 与 xlsx 内部结构这两道彻底没有
+后端了** ——
 
---…
-Content-Disposition: form-data; name="file"; filename="甲公司送货单模板.xlsx"
-Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+原因：统一链路后字节由前端直传 COS，`confirm` 只拿到 `head`（size / etag），
+**拿不到内容**。这不是取舍偏好而是**能力边界**：要答这个问题就得把整份字节
+再拉回 rust 进程，那正是本次要消除的代理上传。
 
-PK\x03\x04…（xlsx 字节）
-```
+职责移交前端：选文件时用 hucre 逐格解析（`assertTemplateMatches`），解析不过
+就不发起 upload-intents ⇒ 后端收不到「不是 xlsx 的 .xlsx」。
 
-- 循环写法逐字照抄 `files::part_file::handler::upload_part_file`（`field.name()`
-  分发 + `field.text()` / `field.bytes()`），**未识别的字段 drain 掉忽略**
-  （多塞一个隐藏字段不该让整个请求失败）。
-- ⚠️ `data` 里**只有 `customer_id` 一个键**：`owner_kind` / `kind` 由服务端钉死
-  （`dto::OWNER_KIND` / `dto::TEMPLATE_KIND`），**不接受客户端指定**。与 `files` 域
-  通用上传原语的 `UploadFileData`（三个键全由 client 给）恰好相反 —— 那边是个
-  多用途原语，这边是单一用途端点，把那两个字段暴露出去只会多出「传错组合」的
-  失败形态。
-- ⚠️ **本域前端只走这一次性 multipart，不扩展 STS 两段式**：没有
-  `POST /print-templates/confirm` 端点（§8.3 第 3 条）。
+⚠️ **代价（有意登记）**：绕过前端直接打这两条通用端点的话，一份非 xlsx 的
+`.xlsx` 能存进库，报错点后移到前端渲染时。
+⚠️ **不要**在另一个时机「顺手补回来」—— 那会造出第二个失败面；若将来真要在
+后端校验结构，必须**先**与前端 `assertTemplateMatches` 对齐判据清单。
 
-### 3.2 四道轻校验（**本域自己的**、在调 service 之前）
+### 3.3 旧端点的请求形态与四道轻校验（**已下线**）
 
-顺序即错误码优先级。全部**零事务、零 COS、零 DB**：
+⚠️ 这一节留档是为了让读旧代码 / 旧文档的人立刻知道「那套契约已经不在了」。
+**当前契约是 §1.0 + §3.2**，不要照这一节实现。
 
-| # | 判据 | 错误码 | HTTP |
-|---|---|---|---|
-| 1 | `bytes.is_empty()` | `40001 VALIDATION_ERROR` | 422 |
-| 2 | `ext_of(filename) != "xlsx"` | `21102 BIZ_PART_FILE_BAD_TYPE` | 400 |
-| 3 | `bytes.len() > config.cos.max_file_size`（`COS_MAX_FILE_SIZE`，`.env.example` = 100MB） | `21103 BIZ_PART_FILE_TOO_LARGE` | 400 |
-| 4 | 前 4 字节 ≠ `PK\x03\x04`（ZIP magic） | `21102 BIZ_PART_FILE_BAD_TYPE` | 400 |
+| # | 旧判据（`POST /api/v2/print-templates`，multipart） | 现在由谁判 |
+|---|---|---|
+| 1 | `bytes.is_empty()` → `40001` / 422 | `upload-intents` + `confirm`：`file_size > 0`（40001） |
+| 2 | 扩展名 ≠ xlsx → `21102` / 400 | `upload-intents` + `confirm`：`policy::allowed_exts`（21102） |
+| 3 | `bytes.len() > COS_MAX_FILE_SIZE` → `21103` / 400 | 同上（21103） |
+| 4 | 前 4 字节 ≠ `PK\x03\x04` → `21102` / 400 | **无人判** —— 移交前端（§3.2） |
 
-⚠️ **第 4 道只挡「改名成 `.xlsx` 的非 zip」**，不解析 zip 内部结构
-（§8.3 第 3 条）。magic bytes 就是 zip 的前 4 字节。
-
-⚠️ **第 1 道是 40001 而不是 21103**：空文件是「无效输入」不是「太大」——
-与 `files` 域那两道 size 守卫的取舍逐字一致。
-
-⚠️ **第 2 道判据是「扩展名」不是「MIME」**：MIME 由 `files` 域的
-`policy::expected_content_types_for_ext("xlsx")` 在**更晚一步**
-（`upload_file_for_owner` 内部）校验，本域先做扩展名那道是为了**早失败**。
+旧 multipart 形态：`data`（JSON 文本，`{"customer_id":"<雪花 id>"}`）+ `file`
+（xlsx 字节）。`owner_kind` / `kind` 当时由服务端钉死；**现在由前端在
+upload-intents 的 body 里显式给出**（`"CUSTOMER"` / `"DELIVERY_TEMPLATE"`），
+服务端用 `policy::owner_kind_allows_kind` 强制配对。
 
 ## 4. 口径表
 
@@ -226,13 +252,13 @@ PK\x03\x04…（xlsx 字节）
 **不要**为了「让前端知道到底是哪个原因」而拆成三个错误码：那需要前端为同一个
 用户动作再发一次请求去查。
 
-⚠️ **这条不变式有**两道**强制点、错误码不同**（2026-10-16 review 第 2 轮 MAJOR-A）：
-本域这一侧（`service::l1_customer_name`，前置、零外部 IO）⇒ **20104**；
-`files` 域那侧（`PartFileRepoTrait::customer_owner_exists`，管「绕过本域 handler
-直调共用上传原语」那条路，如 `POST /files/objects`）⇒ **21105 / HTTP 404**。
-⇒ 前端若看到 **21105**，含义是「你给的那个 id 不能当模板的 owner」，处理方式与
-20104 相同（改选客户）。**不要**在 21105 上做「重试」或「换个入口」—— 没有别的
-入口能写 CUSTOMER（confirm 直接拒）。逐条后果与回归见 §4.4 与 §8.3 第 9 / 10 条。
+⚠️ **2026-10-15：这条不变式现在只有**一道**强制点、错误码是 21105** ——
+本域的上传端点下线后（模板写入改走 §1.0 的两条通用写入口），前置的
+`service::l1_customer_name` 那个 20104 强制点随之删除；L1 判据只存在于
+`PartFileRepoTrait::customer_owner_exists`（谓词含 `parent_id IS NULL`），
+`upload-intents` 与 `confirm` **共用**它。
+⇒ 前端看到 **21105** 的含义是「你给的那个 id 不能当模板的 owner」，处理方式是
+改选客户。**不要**在 21105 上做「重试」或「换个入口」。
 
 ### 4.2 「替换」语义的实现（顺序**被唯一索引逼死**）
 
@@ -240,17 +266,22 @@ PK\x03\x04…（xlsx 字节）
 (…, 'DELIVERY_TEMPLATE')` 表达的是「**一个 L1 至多一份活跃模板**」。所以「替换」
 在 DB 层只能这样实现：
 
+这两步都在 **`POST /files/objects/confirm`**（`bind_uploaded_file`）的同一个事务里：
+
 ```
 ① soft_delete_active_by_part_kind(customer_id, by, "DELIVERY_TEMPLATE")
-② upload_file_for_owner(同一个 &mut PgConnection, …)
+② create_part_file(同一个 &mut PgConnection, …)
 ③ commit
 ```
 
 - **必须先软删**：先 INSERT 后软删 ⇒ 撞 `uk_t_part_file_single`（23505 ⇒ `21108`）。
 - **必须共用同一个 tx**：否则 ① 成功、② 失败会留下「该客户**没有**模板」的空洞，
   而用户明明只想换一份。
-- **共用 tx 的好处**：`upload_file_for_owner` 内部任何一步失败（扩展名 /
-  content_type / COS PUT / INSERT）都会把 ① 一起回滚 ⇒ 语义正确。
+- **共用 tx 的好处**：② 内部任何一步失败（扩展名 / content_type / INSERT）都会把
+  ① 一起回滚 ⇒ 语义正确。
+- ⚠️ **同内容重传不享受秒传省流**：① 刚把旧行软删，② 的 CAS 查重（`deleted_at
+  IS NULL`）必然落空 ⇒ 重新 INSERT 一行。同内容的结果是「多一行同 key 的活跃
+  行」，不是「复用旧行」。
 - **删除 = 解绑**：`POST /{id}/delete` 之后该行 `deleted_at` 非空 ⇒ `resolve` 立刻
   返 `21109`。行**仍在库里**（软删，审计留存），`version` 自增。
 
@@ -266,24 +297,25 @@ PK\x03\x04…（xlsx 字节）
 
 | `owner_kind` | 允许的 `kind` |
 |---|---|
-| `PART` | `DRAWING` / `3D_MODEL` |
+| `PART` | `DRAWING` / `3D_MODEL` / `G_CODE` / `SETUP_SHEET` |
 | `ASSEMBLY` | `ASSEMBLY_MASTER` |
-| **`CUSTOMER`** | **`DELIVERY_TEMPLATE`（仅本域）** |
+| **`CUSTOMER`** | **`DELIVERY_TEMPLATE`** |
 
 ⚠️ **`CUSTOMER` 是单向的**：`PART` / `ASSEMBLY` 两臂刻意**不加**
-`DELIVERY_TEMPLATE` —— 否则 `POST /files/objects` 能造出「零件挂送货单打印模板」
-这种**无人读**的垃圾行。
+`DELIVERY_TEMPLATE` —— 否则两条通用写入口能造出「零件挂送货单打印模板」这种
+**无人读**的垃圾行。
 
 #### 「谁能写 `DELIVERY_TEMPLATE`」必须在**共用上传原语**里收口，且**两条写入口共用一张表**
 
 `t_part_file` 有**两条**写入口，`owner_kind` / `kind` 在两条里都**由 client 给**
-（multipart `data` / confirm 的 JSON body）⇒ 只在 `print_template` 域的 handler 上
-守 MANAGER 是不够的。收口点是 `policy::write_roles_for(owner_kind, 默认集合)`：
+（upload-intents / confirm 的 JSON body）⇒ 只在 `print_template` 域的 handler 上
+守 MANAGER 是不够的（本域已无写端点，守的是 files 域那两条）。收口点是
+`policy::write_roles_for(owner_kind, 入口)`：
 
 | 写入口 | 非 CUSTOMER 的角色集合 | `CUSTOMER` |
 |---|---|---|
-| `POST /files/objects`（multipart 上传） | M / C / CNC（4 条旧上传端点的并集） | **仅 Manager，且 `owner_id` 必须是**一级客户**（§4.1）⇒ 绑 L2 / 不存在 / 已软删都返 **21105 / HTTP 404** |
-| `POST /files/objects/confirm`（STS 直传回执） | M / C（逐字沿用旧 `POST /parts/{id}/files/confirm`） | **仅 Manager，且随后直接 20104 拒收** |
+| `POST /files/objects/upload-intents`（签发预签 PUT URL） | M / C / CNC | **仅 Manager**，且 `owner_id` 必须是**一级客户**（§4.1）⇒ 绑 L2 / 不存在 / 已软删都返 **21105 / HTTP 404** |
+| `POST /files/objects/confirm`（登记 + 可选 CNC 配对） | M / C；`G_CODE` / `SETUP_SHEET` 为 M / CNC | **仅 Manager**（⚠️ 2026-10-15 起**允许**写 CUSTOMER —— 打印模板直传化走的就是它） |
 
 ⚠️ **`policy::write_roles_for` 的形参是 `WriteEntry` 入口枚举、不是可传错的常量**
 （2026-10-16 review 第 2 轮 MINOR-B）：原签名 `write_roles_for(owner_kind, default_roles)`
@@ -292,17 +324,12 @@ PK\x03\x04…（xlsx 字节）
 不报、lib 单测仍全绿）。现调用方只传「我是哪条入口」，常量由函数内部选，
 **传错常量这件事在类型层面不存在**。
 
-⚠️ **2026-10-16 首版只给第一条收了角色**（review 第 1 轮 MAJOR-1）：confirm 的角色
-闸门恒是 `M + C`、与 `owner_kind` 无关 ⇒ **CLERK 打 `POST /files/objects/confirm`
-能造出并替换掉任意客户的模板行**。现已共用同一张分派表，且 confirm **额外直接拒
-`owner_kind='CUSTOMER'`**（20104）：它没有本域那两条业务不变式（只绑一级客户 /
-替换语义），放行等于给 Manager 一条绕过 L1-only 的路，而它**零个合法 CUSTOMER
-调用方**。
+⚠️ **两条入口的角色闸门共用同一张表**，且 CUSTOMER 恒收窄为仅 Manager ——
+少任一条就等于给 CLERK 留了一条「绕开本域、直接打通用端点」的路（§4.1 的
+L1 判据同理）。
 
-⚠️ ⚠️ **2026-10-16 第 2 轮 MAJOR-A：第一条入口的 L1 判据也没收口**。上一条那两段
-理由逐字适用于 `POST /files/objects` —— 首版在那边只收了角色（仅 Manager）、
-`assert_owner_exists` 的 CUSTOMER 臂**只判存在**，于是 **Manager 能造出一行绑在
-二级客户上的模板行**（201 + 真落库）。三条后果：
+⚠️ **L1 判据必须落在两条入口共用的原语里**。曾经只判「存在且未软删」，
+于是 **Manager 能造出一行绑在二级客户上的模板行**。三条后果：
 ① 破坏「只绑一级客户」这条用户拍板的不变式；
 ② `uk_t_part_file_single` 是 `(part_id, kind)`、L1 行与 L2 行互不冲突 ⇒「一个 L1
    至多一份活跃模板」在 (L1, L2) 这一对上被绕过，且给 L1 重新上传时
@@ -310,25 +337,25 @@ PK\x03\x04…（xlsx 字节）
 ③ 该行 `resolve` 永远读不到（送货单的 `customer_id` 是 L1）⇒ 变成**永不消费、
    永不被清理**的孤儿配置行。
 
-⇒ 修法**不是**再拒一次 `CUSTOMER`（那会让 `POST /files/objects` 彻底不能写
-CUSTOMER、连本域复用 `upload_file_for_owner` 的正常路径也一起打死），而是**把 L1
-判据下沉进两道闸门共用的原语**：`PartFileRepoTrait::customer_owner_exists` 的谓词
-加 `AND parent_id IS NULL`（files 域那侧返 **21105**）。本域这一侧的 20104 强制点
-（`service::l1_customer_name`，前置、零外部 IO）**保留不动** —— 两道错误码不同、
-位置不同，**缺任一条都不成立**。
+⇒ 修法是把 L1 判据下沉进两道闸门共用的原语：
+`PartFileRepoTrait::customer_owner_exists` 的谓词含 `AND parent_id IS NULL`
+（返 **21105**）。
 
-⚠️ **两条入口的非 CUSTOMER 集合刻意不同、刻意不合并成一张固定表**：合并会顺带把
-confirm 放宽成含 CNC —— 那是**权限面放开**，与本轮要修的方向相反。
+⚠️ **两条入口的非 CUSTOMER 集合刻意不同**：upload-intents 是 M+C+CNC，confirm 是
+M+C（另有 CNC 配对两种 kind 的 M+CNC 分支）—— 合并成一张表会顺带把 confirm 的
+图纸面放开，那是**权限面放开**，与本轮方向相反。
 
 回归网（全部从 HTTP 外部打，`tests/print_template/resolve.rs`）：
-`clerk_cannot_bypass_via_generic_upload_endpoint`（真打 `/files/objects` ⇒ 403）+
-`manager_bypass_control_group_really_reaches_the_generic_endpoint`（**对照组**：同一 body
-换 Manager + 换**真 L1** ⇒ 201，证明被拒的确实是角色闸门且请求真的到了那个端点）+
-`manager_cannot_bind_template_to_l2_customer_via_generic_endpoint`（**MAJOR-A**：同一 body
-只把 `owner_id` 换成 L2 ⇒ **21105**，并断言零副作用：L2 名下无行 + 桶里无对象 +
+`clerk_cannot_bypass_via_generic_upload_intents_endpoint`（打 upload-intents ⇒ 403）+
+`manager_bypass_control_group_really_reaches_the_generic_endpoints`（**对照组**：同一
+body 换 Manager + 换**真 L1** ⇒ 走完 upload-intents + confirm 并真的落库，证明被拒
+的确实是角色闸门）+
+`manager_cannot_bind_template_to_l2_customer_via_generic_endpoint`（同一 body 只把
+`owner_id` 换成 L2 ⇒ **21105**，并断言零副作用：L2 名下无行 + 桶里无对象 +
 父 L1 未被碰）+
 `clerk_cannot_bypass_via_generic_confirm_endpoint`（confirm ⇒ 403）+
-`manager_cannot_write_template_via_confirm_endpoint`（confirm + Manager ⇒ 20104）。
+`manager_can_write_template_via_confirm_endpoint`（confirm + Manager ⇒ **200 且落库**，
+钉「模板写入只剩 confirm 这一条路」）。
 
 #### ⚠️ 通用读端点也不许漏（review 第 1 轮 MAJOR-2 / MAJOR-3）
 
@@ -403,15 +430,15 @@ confirm 放宽成含 CNC —— 那是**权限面放开**，与本轮要修的�
 
 | 不提供 | 说明 |
 |---|---|
-| `POST /confirm`（STS 两段式上传） | 本域只有一次性 multipart（§3.1）。⚠️ **连带效果**：`files` 域的 `dto::validate::check_kind` 复用 `allowed_exts`，所以 `POST /files/objects/confirm` **顺带**接受 `DELIVERY_TEMPLATE` —— 这是复用的副作用、不是设计意图，登记在 §8.3 第 3 条 |
+| 写入用的 upload-intents / confirm 端点（在本域的 `/api/v2/print-templates/*` 之外） | 模板写入走 `files` 域统一链路（§1.0）；本域**不代理**它们 |
 | WS 事件 | 见 §7 |
-| 模板历史 / 版本回滚 | `POST /` 是立即替换，旧行虽在库里（软删）但**没有**端点能把它恢复成活跃态 |
-| 按客户维度的模板**删除**（不解绑即删） | 只有 `POST /{id}/delete`（软删 = 解绑）。重新绑定 = 再 `POST /` 一次 |
+| 模板历史 / 版本回滚 | 写入是立即替换，旧行虽在库里（软删）但**没有**端点能把它恢复成活跃态 |
+| 按客户维度的模板**删除**（不解绑即删） | 只有 `POST /{id}/delete`（软删 = 解绑）。重新绑定 = 再走一遍 §1.0 |
 | xlsx 内部结构校验 / 转换（.xls→.xlsx） | §8.3 第 3 条 |
 
 ## 7. 与 WS 的关系
 
-**本域不发任何 WS 事件**（5 条端点全部无 `ws_hub.broadcast` 调用）。
+**本域不发任何 WS 事件**（4 条端点全部无 `ws_hub.broadcast` 调用）。
 
 理由与后果：
 
@@ -430,9 +457,9 @@ confirm 放宽成含 CNC —— 那是**权限面放开**，与本轮要修的�
 
 | 表 | 用途 | 写? |
 |---|---|---|
-| `t_part_file` | 模板字节索引 + 绑定关系载体（`kind='DELIVERY_TEMPLATE'`，`part_id` = L1 客户 id） | ✅ 端点 1 / 5 写（软删 + INSERT），端点 2 / 3 / 4 读 |
-| `t_customer` | ① 端点 1 的 **L1-only 强制点**（`parent_id IS NULL`，**顺带取回客户名**）；② 端点 3 的 `customer_name`；③ 端点 2 的**批量**客户名（一条 `id = ANY($1)`） | ❌ 纯读 |
-| COS 对象存储 | 模板字节（key 由 `util::cos_key::build_cas_key` 生成，内容寻址） | ✅ PUT（端点 1）/ DELETE（端点 5，commit 后异步） |
+| `t_part_file` | 模板字节索引 + 绑定关系载体（`kind='DELIVERY_TEMPLATE'`，`part_id` = L1 客户 id） | ✅ 写入经 `POST /files/objects/confirm`（软删 + INSERT）、端点 4 软删；端点 1 / 2 / 3 读 |
+| `t_customer` | ① 端点 2 的 `customer_name`；② 端点 3 的 `customer_name`；③ 端点 1 的**批量**客户名（一条 `id = ANY($1)`）。⚠️ **L1-only 判据不在本文件** —— 它在 `files::part_file` 的 `customer_owner_exists`（谓词含 `parent_id IS NULL`） | ❌ 纯读 |
+| COS 对象存储 | 模板字节（key 由 `util::cos_key::build_cas_key` 生成，内容寻址） | 写入侧 PUT（**前端直传**，不经 rust）/ 读端点 3 取字节；DELETE（端点 4，commit 后异步） |
 
 ⚠️ **`files` 域是全仓唯一持有 `t_part_file` 写入路径的域**（见 `CLAUDE.md`
 「`src/modules/files/*` 子模块清单」）。本域的写入**全部经它的
@@ -447,34 +474,38 @@ confirm 放宽成含 CNC —— 那是**权限面放开**，与本轮要修的�
 
 ### 8.2 前端配套改动清单
 
-1. **api 层新增一个常量** `/print-templates`（5 条端点，路径逐字见 §1）。
+1. **api 层新增一个常量** `/print-templates`（4 条端点，路径逐字见 §1）。
    菜单**子项** `print_templates_designer`（「模板管理」→ 目录 `template_management`
    → 子项「模板编辑」）的 `path` 已是 `/print-templates`，
    `seeds/menu.sql` **无需改动**。
    ⚠️ 一级目录 `template_management` 自己的 `path` 是 **NULL**（目录项、不指向
    页面）—— 别拿它当本域路由的依据（2026-10-16 review 第 1 轮 MINOR-4 订正）。
-2. **模板管理页**（新建或改造）：列表调端点 2（`?customer_id=` + 分页）、
-   上传调端点 1（multipart，成功看 **201** 而不是 200）、
-   删除调端点 5（**必须回传 `version`**）。
-   ⚠️ **2026-10-16 review 第 2 轮 C-1**：`PrintTemplateOut` 现在**带
-   `customer_name`**，且它是 `printTemplateSchema` 的**必填**键（`.strict()`）
-   ⇒ 后端少这个键时前端会在**解析响应时**抛 ZodError（上传 201 也一样、列表恒空），
-   不是「显示成空」。客户已软删时该字段是 `null`，前端按「（已删除的客户）」渲染即可。
-3. **打印对话框**：先调端点 3 拿模板与 `customer_name`：
+2. **模板管理页**（新建或改造）：列表调端点 1（`?customer_id=` + 分页）、
+   上传走 §1.0 的三步（upload-intents → PUT → confirm，成功看 **200**）、
+   删除调端点 4（**必须回传 `version`**）。
+   ⚠️ **`PrintTemplateOut` 带 `customer_name`**，且它是 `printTemplateSchema` 的
+   **必填**键（`.strict()`）⇒ 后端少这个键时前端会在**解析响应时**抛 ZodError
+   （列表恒空），不是「显示成空」。客户已软删时该字段是 `null`，前端按
+   「（已删除的客户）」渲染即可。
+   ⚠️ **写入侧的响应（`R<PartFileOut>`）没有 `customer_name`** ⇒ 上传成功后要
+   **刷新列表**才能显示客户名。
+   ⚠️ **ZIP magic / xlsx 结构由前端校验**（§3.2）：解析不过就别发起
+   upload-intents。
+3. **打印对话框**：先调端点 2 拿模板与 `customer_name`：
    - `21109` ⇒ 提示「该客户还没配模板」，并**保留手动上传兜底**（产品决议，
      不做成硬阻断）；
-   - 命中 ⇒ 调端点 4 取字节，用它渲染打印件。
+   - 命中 ⇒ 调端点 3 取字节，用它渲染打印件。
    ⚠️ 端点 3 的 `customer_name` **出现两次**：顶层一个、`template` 行内一个，
    **刻意重复**（同一条查询、同一个值）—— 两个都别删（§2.4）。
 4. **权限点**：端点 3 / 4 用 `delivery_note.print`（前端 `hasPermission` 的
-   输入）。端点 1 / 2 / 5 是 Manager-only，前端按钮显隐按角色判。
-5. ⚠️ **状态码别再判 200**：端点 1 成功是 **201 Created**。
+   输入）。端点 1 / 4 是 Manager-only，前端按钮显隐按角色判。
+5. ⚠️ **写入侧成功是 200**（`POST /files/objects/confirm`）。
 6. ⚠️ **雪花 id 是 string**：`customer_id` / `id` / `template_id` 出入参统一
    字符串形态，路径段拼 `encodeURIComponent` 不需要（纯数字）但**别用 `Number`
    转**。
 7. ⚠️ **端点 4 返裸字节**、不进 JSON 信封 —— `fetch` 拿到的就是 `ArrayBuffer`，
    不要 `res.json()`。
-8. ⚠️ **端点 5 的 body 缺 `version` ⇒ HTTP 422 纯文本**（不是业务信封）。
+8. ⚠️ **端点 4 的 body 缺 `version` ⇒ HTTP 422 纯文本**（不是业务信封）。
    前端不能靠 `code` 分支处理这个 422，只能当「请求体不合法」。
 
 ### 8.3 已知偏差登记
@@ -482,19 +513,19 @@ confirm 放宽成含 CNC —— 那是**权限面放开**，与本轮要修的�
 | # | 偏差 | 状态 |
 |---|---|---|
 | 1 | **不新建模板表** —— 模板的存在性与绑定关系是**同一件事**（一行未软删的 `DELIVERY_TEMPLATE`）。代价：`t_part_file` 要同时承载「文件元数据」与「配置实体绑定」两种语义 | **用户拍板 + 已登记**。收益：新表要自带 `id / version / created_* / updated_* / deleted_at` 一整套列，而字节本来就得走 COS + `t_part_file` 的 CAS key 与配额逻辑；「一个 L1 至多一份活跃模板」直接复用 `uk_t_part_file_single`。⚠️ 后人要建表，必须先推翻本条 |
-| 2 | **`t_part_file` 没有 `owner_kind` 列**，`part_id` 一列现已承载**三种 owner**：① `t_part.id`（DRAWING / 3D_MODEL / G_CODE / SETUP_SHEET / CAD_2D）、② `t_assembly.id`（ASSEMBLY_MASTER）、③ **`t_customer.id`（DELIVERY_TEMPLATE）**。三者共用同一个雪花 ID 空间、**无映射表** | **有意保留 + 已登记**（同 `files/part_file/mod.rs` 已知偏差第 9 / 10 条）。⚠️ **后果**：`WHERE part_id = $1` 这种**不带 kind** 的查询在语义上是跨三类 owner 的 —— **新增读路径必须带 `kind` 谓词**。本域 5 条端点：① 端点 1（上传后 `get_file_row` 复读）、② 端点 2（列表，**SQL kind 谓词**）、③ 端点 3（resolve，`get_by_part_kind`）**三条带 SQL kind 谓词**；端点 4 在 Rust 侧比 `row.kind`（`service::get_template_content`，非 SQL 谓词）、端点 5 靠 `soft_delete_file` 的 kind→角色分派 —— **两条按 kind 分派或校验** |
-| 3 | **后端不引 zip crate、不做 xlsx 内部结构校验**；只校验「前 4 字节是 `PK\x03\x04`」。xlsx 内部结构（有没有 `xl/workbook.xml`、命名空间、`print_area` / `print_titles` 是否被 hucre 认得）由前端已有的 `assertTemplateMatches` 把关 | **有意保留 + 已登记**。收益：零新依赖、零 CVE 面、零「后端解压用户上传的 zip」的 zip-bomb 面。代价：① 一份结构改坏的模板能**存进库**（报错点后移到前端渲染时）；② 「后端能不能解析 xlsx」这件事**不能**在集成测试里断言 —— 本域的测试用「最小 zip 头 + EOCD」字节，它**不是**能被 SheetJS 打开的工作簿；③ ⚠️ **`POST /files/objects/confirm` 顺带接受 `owner_kind="CUSTOMER"` + `kind="DELIVERY_TEMPLATE"`**（`check_kind` 复用同一张白名单）—— 副作用而非设计意图。**2026-10-16 review 第 1 轮 MAJOR-1 已把它彻底堵死**：`bind_uploaded_file` 现在 ① 角色闸门与上传入口共用 `policy::write_roles_for`（`CUSTOMER` ⇒ 仅 Manager）、② **随后直接拒 `owner_kind="CUSTOMER"` ⇒ 20104**。⇒ 现 confirm **写不出**任何模板行（既 CLERK 写不出、Manager 也写不出）。⚠️ 要在后端补结构校验，须**先**与前端 `assertTemplateMatches` 对齐判据清单，别零散加 |
-| 4 | **孤儿 COS 对象**：端点 1 的 COS PUT 发生在事务内（沿用 `files` 域现状）；事务回滚后新对象已 PUT 出去、有意**不**加补偿删除 | **有意保留 + 已登记**。缓解：对象 key 是**内容寻址**的（`{prefix}{sha16}_{safe_filename}`），同内容重传 PUT 到**同一个 key**（幂等覆盖），CAS 去重命中时压根不再 PUT ⇒ 真正的孤儿只有「传了内容 X、事务回滚、内容 X 从此没人再传」这一种。⚠️ 顺带效果：因 `soft_delete_active_by_part_kind` 先跑、而 `upload_file_for_owner` 的 CAS 去重查询 `get_by_owner_kind_sha` 带 `deleted_at IS NULL`，**「重传同一份」走的是「重新 PUT（幂等）+ INSERT 新行」**，省流优化在替换语义下取不到 |
+| 2 | **`t_part_file` 没有 `owner_kind` 列**，`part_id` 一列现已承载**三种 owner**：① `t_part.id`（DRAWING / 3D_MODEL / G_CODE / SETUP_SHEET / CAD_2D）、② `t_assembly.id`（ASSEMBLY_MASTER）、③ **`t_customer.id`（DELIVERY_TEMPLATE）**。三者共用同一个雪花 ID 空间、**无映射表** | **有意保留 + 已登记**（同 `files/part_file/mod.rs` 已知偏差第 9 / 10 条）。⚠️ **后果**：`WHERE part_id = $1` 这种**不带 kind** 的查询在语义上是跨三类 owner 的 —— **新增读路径必须带 `kind` 谓词**。本域 4 条端点：① 端点 1（列表，**SQL kind 谓词** `kind = 'DELIVERY_TEMPLATE'`）、② 端点 2（resolve，`get_by_part_kind`）**两条带 SQL kind 谓词**；端点 3 在 Rust 侧比 `row.kind`（`service::get_template_content`，非 SQL 谓词）、端点 4 靠 `soft_delete_file` 的 kind→角色分派 —— **两条按 kind 分派或校验**。写入侧的 `get_by_part_kind` 同款 SQL 谓词在 `files::part_file` 内 |
+| 3 | **后端完全不校验 xlsx 内容**（含 ZIP magic 与内部结构）：统一链路后 `confirm` 只拿到 `head`（size / etag）、**拿不到字节** ⇒ 这类问题在后端**物理上无法回答**。结构合法性由前端 `assertTemplateMatches` 把关 | **有意弱化 + 已登记**（§3.2 有完整取舍）。代价：绕过前端直打两条通用写入口时，一份非 xlsx 的 `.xlsx` 能**存进库**（报错点后移到前端渲染时）。⚠️ 集成测试 `non_zip_xlsx_is_no_longer_rejected_by_backend` 把「后端不再拒绝」**钉成事实** —— 想在后端补结构校验的人必须先读它 ⚠️ 要补就**先**与前端 `assertTemplateMatches` 对齐判据清单，别零散加 |
+| 4 | **孤儿 COS 对象**：confirm 失败时前端已经 PUT 出去的对象留在桶里，服务端**不做**补偿删除 | **有意保留 + 已登记**。对象 key 是**内容寻址**的（`{prefix}{sha16}_{safe_filename}`），同内容重传 PUT 到**同一个 key**（幂等覆盖）；真正的孤儿只有「传了内容 X、事务失败、内容 X 从此没人再传」这一种。又因 `soft_delete_active_by_part_kind` 先跑、而 confirm 的 CAS 查重（`get_by_owner_kind_sha`）带 `deleted_at IS NULL`，**「重传同一份」走的是「重新登记一行」**，省流优化在替换语义下取不到 |
 | 5 | **`21109` 的 HTTP 状态码 422 是本次新选的** | **用户拍板 + 已登记**。该码在 wire 上**未变**（仍是 21109），变的只是「谁产出它」：python 转发时代由 python 产出、rust 透传（Rust 侧零生产点），现由 `print_template` 域自产。`status_from_code` 里**显式登记**为 `UNPROCESSABLE_ENTITY`（原先显式登记的是 `BAD_REQUEST`，且 `(20000..30000) => BAD_REQUEST` 的兜底也会把它压成 400）。取 422 的理由：请求本身完全合法（客户存在、是一级客户、无越权），**不满足的是「这个客户的配置」** |
 | 6 | **`customer_name` 查不到时给 `null` 而不是报错** | **有意保留**。模板行本身还在（软删闸门只管 `t_part_file`），此时前端展示模板即可，不必因客户改名 / 下架而打不开打印对话框 |
 | 7 | **列表端点是 Manager-only**，而端点 3 / 4 对 CLERK / INSPECTOR 开放 —— 同一份数据的「读」与「列举」权限面不同 | **有意保留**。列表含**全部**客户的抬头信息（管理面）；端点 3 / 4 是单客户定向取（作业面，且必须先知道客户 id） |
-| 8 | **`POST /files/objects/confirm` 曾能造 / 替换模板行**（review 第 1 轮 MAJOR-1）：首版只给 `upload_file_for_owner` 收了口，confirm 的角色闸门恒为 `M + C` 且**不判 L1-only** ⇒ CLERK 能替别人换模板 | **已闭合**（两条写入口共用 `policy::write_roles_for`；confirm 额外拒 `owner_kind='CUSTOMER'` ⇒ 20104，**走 confirm 这条路 Manager 也写不出**。回归见 §4.4 的五条用例，含「Manager 拿同一 body 走 `/files/objects` + 真 L1 成功」的对照组。⚠️ **别把本条读成「Manager 在任何入口都写不出」**：第 2 轮 MAJOR-A 见下一条） |
-| 9 | **`POST /files/objects` 曾能把模板绑到二级客户上**（review 第 2 轮 MAJOR-A）：该端点 CUSTOMER 侧已收窄到仅 Manager，但 `assert_owner_exists` 的 CUSTOMER 臂**只判存在**、不判 `parent_id IS NULL` ⇒ Manager 走它能造出一行绑在 L2 上的模板（201 + 真落库）。三条后果：破坏「只绑一级客户」不变式 / `uk_t_part_file_single` 按 `(part_id, kind)` 判 ⇒ L1 与 L2 两行互不冲突、「一个 L1 至多一份活跃模板」被绕过且 `soft_delete_active_by_part_kind(l1_id)` 清不掉 L2 那行 / 该行 `resolve` 永远读不到 ⇒ 永不消费、永不清理的孤儿配置行 | **已闭合**（L1 判据下沉进共用原语 `PartFileRepo::customer_owner_exists`：`AND parent_id IS NULL`，错误码沿用同族 **21105 / HTTP 404**）。⚠️ 修法**刻意不是**「对 CUSTOMER 直接 20104」—— 那会把本域复用 `upload_file_for_owner` 的正常路径一起打死；两条入口的形态保持不对称（confirm 拒 CUSTOMER、`/files/objects` 收 CUSTOMER 但只收一级）。回归：`manager_cannot_bind_template_to_l2_customer_via_generic_endpoint`（断言零副作用：L2 无行 + 桶里无对象 + 父 L1 未被碰） |
-| 10 | **「L1-only」有**两道**强制点、错误码不同**：本域 `service::l1_customer_name`（前置、零外部 IO）⇒ **20104**，与 `PartFileRepo::customer_owner_exists`（files 域兜底，管「绕过本域 handler 直调共用上传原语」）⇒ **21105** | **有意保留 + 已登记**。同一份判据、两个位置两个错误码：写侧刻意不区分「不存在 / 已软删 / 不是一级」三种情形（前端只需改选），而 files 域那侧要管的是「这个 owner 能不能挂文件」。**两道都要留**，别因为「files 域不该知道客户分两级」删掉后者（本域判的是 `parent_id IS NULL` 这个**列取值**，与它判 `t_part.assembly_id IS NULL` 同形） |
+| 8 | **写入侧曾能被 CLERK 用来造 / 替换模板行**：两条写入口的角色闸门一度不共用 | **已闭合**（共用 `policy::write_roles_for` / `confirm_roles_for`，`CUSTOMER` 恒收窄为仅 Manager）。回归见 §4.4 的五条用例，含「Manager 拿同一 body 走通用链路 + 真 L1 成功落库」的对照组 |
+| 9 | **写入侧曾能把模板绑到二级客户上**：`owner_id` 由 client 给，而 owner 存在性只判「存在且未软删」⇒ Manager 能造出一行绑在 L2 上的模板。三条后果：破坏「只绑一级客户」不变式 / `uk_t_part_file_single` 按 `(part_id, kind)` 判 ⇒ L1 与 L2 两行互不冲突、「一个 L1 至多一份活跃模板」被绕过且 `soft_delete_active_by_part_kind(l1_id)` 清不掉 L2 那行 / 该行 `resolve` 永远读不到 ⇒ 永不消费、永不清理的孤儿配置行 | **已闭合**（L1 判据下沉进共用原语 `PartFileRepoTrait::customer_owner_exists`：谓词含 `parent_id IS NULL`，错误码 **21105 / HTTP 404**）。回归：`manager_cannot_bind_template_to_l2_customer_via_generic_endpoint`（断言零副作用：L2 无行 + 桶里无对象 + 父 L1 未被碰） |
+| 10 | **「L1-only」强制点只剩一道**（`PartFileRepoTrait::customer_owner_exists` ⇒ 21105）：本域上传端点下线后，`service::l1_customer_name` 那道 20104 前置检查随之删除 | **有意简化 + 已登记**（§4.1）。前端只需按 21105 改选客户。⚠️ 若本域将来恢复自己的写入端点，**要一并把 L1 前置检查加回来**，否则「同一个动作两种错误码」的前端分支会重新分叉 |
 | 11 | **通用读端点曾会泄漏模板**（review 第 1 轮 MAJOR-2 / MAJOR-3）：`GET /files/objects/{id}/url`（1 小时预签直链，权限点矩阵 M/C/I/CNC）与 `GET /files/objects`（列表，含 `SHELF_ACCOUNT`）首版都不过滤 `DELIVERY_TEMPLATE` | **已闭合**（两条取字节端点共用 `policy::is_file_content_kind` 白名单 ⇒ 21102；列表端点**无条件** `exclude_kind` ⇒ 恒空）。回归见 §4.4 末表与 `tests/print_template/resolve.rs` 的两条用例 |
 | 12 | **files 域与本域的 kind 守卫是两份、错误码不同**：files 域「白名单外的 kind」⇒ **21102 / HTTP 400**；本域「不是 `DELIVERY_TEMPLATE`」⇒ **21101 / HTTP 404** | **有意保留 + 已登记**（同 `files/part_file/mod.rs` 已知偏差第 14 条）。前端动作不同：21102 提示「换个入口」，21101 触发刷新列表。别为了统一而改任一侧 |
-| 13 | **测试替身 `MockCos` 掩盖三条路径**（review 第 1 轮 MINOR-6）：① 真实 COS 的**错误分类** —— 替身对缺失 key 一律返 `BIZ_PART_FILE_UPLOAD_FAILED`，真 COS 是 `NoSuchKey`；② **etag 语义**（替身是拼出来的字符串，无条件写 / 部分写、真 COS 的 etag 参与一致性判断）；③ **「CAS 命中跳过 COS PUT」那条省流路径本 binary 完全没跑**（替换语义下 `soft_delete_active_by_part_kind` 先跑、CAS 查询带 `deleted_at IS NULL` ⇒ 取不到，与第 4 条同源） | **有意保留 + 已登记**。2026-10-16 已把本 binary 原来自造的**第三个** COS 替身（`MemoryCos`）删掉、能力上提到 `test-support` 的 `MockCos`（`put` 真存字节 / `delete` 真删字节），三条残余偏差属替身固有限制，不是回归。⚠️ 端点 5 的 COS 清理断言改用 `MockCos::stored_bytes`（「对象确实没了」）而非只看 `delete_calls` |
-| 14 | **`GET /print-templates/{id}/content` 的 kind 校验在 Rust 侧而非 SQL 谓词**（`service::get_template_content` 比 `row.kind`）；端点 5 连 kind 都不比，只靠 `soft_delete_file` 的 kind→角色分派 | **有意保留 + 已登记**。理由：这两条路径**先取行**（端点 4 为了判「零外部 IO」、端点 5 为了拿 `object_key` 与派角色），行已在手里，比 `row.kind` 与 SQL 谓词等价，且少一次往返。别把它们「统一」成 SQL kind 谓词 |
+| 13 | **测试替身 `MockCos` 掩盖三条路径**（review 第 1 轮 MINOR-6）：① 真实 COS 的**错误分类** —— 替身对缺失 key 一律返 `BIZ_PART_FILE_UPLOAD_FAILED`，真 COS 是 `NoSuchKey`；② **etag 语义**（替身是拼出来的字符串，无条件写 / 部分写、真 COS 的 etag 参与一致性判断）；③ **「CAS 命中跳过 COS PUT」那条省流路径本 binary 完全没跑**（替换语义下 `soft_delete_active_by_part_kind` 先跑、CAS 查询带 `deleted_at IS NULL` ⇒ 取不到，与第 4 条同源） | **有意保留 + 已登记**。2026-10-16 已把本 binary 原来自造的**第三个** COS 替身（`MemoryCos`）删掉、能力上提到 `test-support` 的 `MockCos`（`put` 真存字节 / `delete` 真删字节），三条残余偏差属替身固有限制，不是回归。⚠️ 端点 4 的 COS 清理断言改用 `MockCos::stored_bytes`（「对象确实没了」）而非只看 `delete_calls` |
+| 14 | **`GET /print-templates/{id}/content` 的 kind 校验在 Rust 侧而非 SQL 谓词**（`service::get_template_content` 比 `row.kind`）；端点 4 连 kind 都不比，只靠 `soft_delete_file` 的 kind→角色分派 | **有意保留 + 已登记**。理由：这两条路径**先取行**（端点 3 为了判「零外部 IO」、端点 4 为了拿 `object_key` 与派角色），行已在手里，比 `row.kind` 与 SQL 谓词等价，且少一次往返。别把它们「统一」成 SQL kind 谓词 |
 | 15 | **行 VO 的 `customer_name` 缺了会让本域对着真前端 100% 不可用**（review 第 2 轮 C-1）：前端 `printTemplateSchema` 是 `.strict()` 且必填它，而首版 `PrintTemplateOut` 没有 ⇒ 上传即便返 **201** 也抛 ZodError、列表每行都抛（恒空）、页面「客户」列恒显「（已删除的客户）」。首版的 42 条用例全绿却钉不到它（断言只看自己写的那几个键） | **已闭合**（行 VO 补 `customer_name: Option<String>`，三条填充路径见 §2.4；新增两条集成测试钉**取值**：命中 / 客户软删后 `null`。⚠️ **列表不许逐行查名** —— 那正是 N+1；语句数与源码护栏见下一条）
 | 16 | **列表端点的取数恒 ≤ 3 条语句（rows 1 + total 1 + 客户名 1；`rows` 为空时 2），与模板条数 / 客户数无关** | **有意保留 + 登记**（review 第 2 轮 C-1 随 `customer_name` 一并引入）。客户名走**一条 `WHERE id = ANY($1)`** 一次取回后在内存里 join（`HashMap`），**绝不**在 `rows.iter()` 里逐行查 —— 逐行查的写法**功能完全正确、集成测试照样全绿**，只有语句数会线性涨，所以只能靠 `src/modules/print_template/service.rs` 末尾 `mod query_guard` 的**源码级** lib 单测钉（循环体内出现 `sqlx::query` 即红 + 三条 helper 各恰好一条查询 + 列表端点必须走批量那条）。⚠️ **该护栏的已知漏报形态**：「循环里调别的函数、那个函数里发查询」这类**跨函数的间接 N+1** `no_query_inside_any_loop` 看不见，由同一模块里的 `list_templates_joins_customer_names_in_memory` 兜（它显式禁止列表端点调单条取名的 `customer_name(`）—— 但**新增第四个会发查询的 helper** 时要顺手扩那条断言。两条断言都经变异验证（手改成 N+1 后当场红），登记在 `query_guard` 的模块 doc 里。⚠️ 逐端点的确切语句数（端点 1 = 7 等）写在 `service.rs` 模块 doc 的表里，那里也注明「会过期、要确切数字自己读，别当契约」 |
 | 17 | **`files::part_file::service::get_file_content` 已整条删除**（review 第 2 轮 MINOR-A）：它有角色闸门（5 角色）但**无 kind 闸门**，正是第 1 轮 MAJOR-2 关掉的那条绕行面，却以 `pub` 形态留在原地 —— 生产侧早已改走 `get_file_content_of_checked_row`，只剩两个测试在调 | **已闭合**（方法删除，两个测试调用方改成「`get_file_row` 取行 → `get_file_content_of_checked_row`」的生产同款两步）。⚠️ 本域不依赖它（端点 4 走最底层的 `get_file_content_for_row`），所以删除对其它域零影响。**别**因为「顺手」把它加回来 |
