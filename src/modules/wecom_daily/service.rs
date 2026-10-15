@@ -68,7 +68,8 @@ use crate::modules::wecom_daily::dto::{
     ConfigDefaultsOut, ConfigOut, Frequency, LOGS_LIMIT_MAX, LogListOut, LogListQuery,
     MAX_CHUNKS_MAX, MAX_CHUNKS_MIN, NormalizedConfig, PreviewOut, PreviewRequest,
     SUBJECT_TEMPLATE_MAX_CHARS, SaveConfigRequest, SendResultOut, SendStatus, TriggerSource,
-    UPCOMING_DAYS_MAX, UPCOMING_DAYS_MIN, WORKER_TOP_N_MAX, WORKER_TOP_N_MIN, report_window,
+    ORDER_LIST_LIMIT_MAX, ORDER_LIST_LIMIT_MIN, UPCOMING_DAYS_MAX, UPCOMING_DAYS_MIN,
+    WORKER_TOP_N_MAX, WORKER_TOP_N_MIN, report_window,
 };
 use crate::modules::wecom_daily::model::{TWeComDailyConfigRow, TWeComDailyLogRow};
 use crate::modules::wecom_daily::repo::{self, NewDailyLog};
@@ -193,11 +194,13 @@ impl ConfigOut {
             upcoming_days: row.upcoming_days,
             worker_metric: row.worker_metric.clone(),
             worker_top_n: row.worker_top_n,
+            order_list_limit: row.order_list_limit,
             max_chunks: row.max_chunks,
             include_overview: row.include_overview,
             include_delivery: row.include_delivery,
             include_orders: row.include_orders,
             include_workers: row.include_workers,
+            include_drawings: row.include_drawings,
             subject_template: row.subject_template.clone(),
             webhook_configured,
             created_at: format_ts(row.created_at),
@@ -221,11 +224,13 @@ impl ConfigOut {
             upcoming_days: d.upcoming_days,
             worker_metric: d.worker_metric.as_str().to_string(),
             worker_top_n: d.worker_top_n,
+            order_list_limit: d.order_list_limit,
             max_chunks: d.max_chunks,
             include_overview: d.include_overview,
             include_delivery: d.include_delivery,
             include_orders: d.include_orders,
             include_workers: d.include_workers,
+            include_drawings: d.include_drawings,
             subject_template: d.subject_template.clone(),
             webhook_configured,
             // 时间戳在「尚未创建」时没有意义，给空串而不是 `now()`：前端拿它做
@@ -294,8 +299,9 @@ pub(crate) fn now_ts() -> NaiveDateTime {
 ///
 /// 规范化做的事（都在这里做完，下游一律拿 [`NormalizedConfig`]）：
 /// 1. `frequency` / `worker_metric` 解析成枚举（未知 ⇒ `21804`）；
-/// 2. `upcoming_days` **clamp** 到 `[1, 60]`（照 `mail_digest`：这个数只影响窗口
-///    宽窄，越界时夹到边界比报错更符合「用户想表达的意思」；而下面三个是**拒**）；
+/// 2. `upcoming_days` / `order_list_limit` **clamp** 到各自的区间（照 `mail_digest`：
+///    这两个数只影响窗口宽窄 / 清单长度，越界时夹到边界比报错更符合「用户想表达
+///    的意思」；而下面三个是**拒**）；
 /// 3. `DAILY` / `MANUAL_ONLY` 之下**清空** `weekday` / `day_of_month`
 ///    （不留脏值：读侧会照单全收地拼 cron，留着等于埋雷）；
 ///    `WEEKLY` / `MONTHLY` 的必填字段缺失 ⇒ `21804`；
@@ -320,11 +326,15 @@ pub fn validate_save_request(req: &SaveConfigRequest) -> Result<NormalizedConfig
             .clamp(UPCOMING_DAYS_MIN, UPCOMING_DAYS_MAX),
         worker_metric: req.worker_metric.parse()?,
         worker_top_n: req.worker_top_n,
+        order_list_limit: req
+            .order_list_limit
+            .clamp(ORDER_LIST_LIMIT_MIN, ORDER_LIST_LIMIT_MAX),
         max_chunks: req.max_chunks,
         include_overview: req.include_overview,
         include_delivery: req.include_delivery,
         include_orders: req.include_orders,
         include_workers: req.include_workers,
+        include_drawings: req.include_drawings,
         subject_template: validate_subject_template(req.subject_template.as_deref())?,
     };
     let weekday = match normalized.frequency {
@@ -487,6 +497,7 @@ fn validate_normalized(cfg: &NormalizedConfig) -> Result<NormalizedConfig, AppEr
         ));
     }
     validate_worker_top_n(cfg.worker_top_n)?;
+    validate_order_list_limit(cfg.order_list_limit)?;
     validate_max_chunks(cfg.max_chunks)?;
     validate_sections(cfg)?;
     Ok(cfg.clone())
@@ -498,6 +509,23 @@ fn validate_worker_top_n(v: i32) -> Result<(), AppError> {
             code::BIZ_WECOM_CONFIG_INVALID,
             format!(
                 "「最多列出工人」必须在 {WORKER_TOP_N_MIN}..{WORKER_TOP_N_MAX} 之间（0 = 不限），收到 {v}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// 第三节清单每组行数校验（**与 `worker_top_n` 同款**：下界 `0` = 不限）。
+///
+/// ⚠️ 保存路径是 **clamp**（见 `validate_save_request`），只有**合并覆盖**路径
+/// （预览 / 发送的临时覆盖）才拒 —— 与 `upcoming_days` 的分界同理：覆盖值是用户在
+/// 预览框里现填的，夹到边界会让预览结果与他的输入不符。
+fn validate_order_list_limit(v: i32) -> Result<(), AppError> {
+    if !(ORDER_LIST_LIMIT_MIN..=ORDER_LIST_LIMIT_MAX).contains(&v) {
+        return Err(AppError::biz(
+            code::BIZ_WECOM_CONFIG_INVALID,
+            format!(
+                "「交期清单每组最多列出」必须在 {ORDER_LIST_LIMIT_MIN}..{ORDER_LIST_LIMIT_MAX} 之间（0 = 不限），收到 {v}"
             ),
         ));
     }
@@ -567,11 +595,13 @@ pub async fn effective_config(
             None => base.worker_metric,
         },
         worker_top_n: overrides.worker_top_n.unwrap_or(base.worker_top_n),
+        order_list_limit: base.order_list_limit,
         max_chunks: overrides.max_chunks.unwrap_or(base.max_chunks),
         include_overview: overrides.include_overview.unwrap_or(base.include_overview),
         include_delivery: overrides.include_delivery.unwrap_or(base.include_delivery),
         include_orders: overrides.include_orders.unwrap_or(base.include_orders),
         include_workers: overrides.include_workers.unwrap_or(base.include_workers),
+        include_drawings: base.include_drawings,
         subject_template: overrides.subject_template.clone().or(base.subject_template),
     };
     validate_normalized(&merged)
@@ -598,11 +628,13 @@ fn normalize_row(row: &TWeComDailyConfigRow) -> Result<NormalizedConfig, AppErro
         upcoming_days: row.upcoming_days,
         worker_metric: row.worker_metric.parse()?,
         worker_top_n: row.worker_top_n,
+        order_list_limit: row.order_list_limit,
         max_chunks: row.max_chunks,
         include_overview: row.include_overview,
         include_delivery: row.include_delivery,
         include_orders: row.include_orders,
         include_workers: row.include_workers,
+        include_drawings: row.include_drawings,
         subject_template: row.subject_template.clone(),
     })
 }
@@ -1093,7 +1125,8 @@ pub fn worker_quantity_total(rows: &[crate::modules::wecom_daily::dto::WorkerBar
 mod tests {
     use super::*;
     use crate::modules::wecom_daily::dto::{
-        MAX_CHUNKS_DEFAULT, UPCOMING_DAYS_DEFAULT, WORKER_TOP_N_DEFAULT, WorkerBarRow, WorkerMetric,
+        MAX_CHUNKS_DEFAULT, ORDER_LIST_LIMIT_DEFAULT, UPCOMING_DAYS_DEFAULT,
+        WORKER_TOP_N_DEFAULT, WorkerBarRow, WorkerMetric,
     };
 
     fn row(name: &str, batch: i32, quantity: i32) -> WorkerBarRow {
@@ -1222,6 +1255,67 @@ mod tests {
         );
     }
 
+    /// ★ 守卫：`order_list_limit` 与 `worker_top_n` 同款语义 —— `0` = 不限、越界即
+    /// `21804`；而**保存路径**是 clamp（夹到边界，不是报错）。
+    #[test]
+    fn order_list_limit_bounds_are_21804_and_clamped_on_save() {
+        assert!(validate_order_list_limit(0).is_ok(), "0 = 不限");
+        assert!(validate_order_list_limit(30).is_ok());
+        assert!(validate_order_list_limit(200).is_ok());
+        let e = validate_order_list_limit(-1).unwrap_err();
+        assert_eq!(e.code(), code::BIZ_WECOM_CONFIG_INVALID);
+        assert!(e.to_string().contains("0 = 不限"), "要说明 0 的语义：{e}");
+        assert_eq!(
+            validate_order_list_limit(201).unwrap_err().code(),
+            code::BIZ_WECOM_CONFIG_INVALID
+        );
+
+        // 保存路径：越界被夹到边界（照 `upcoming_days` 的分界，见函数 doc）。
+        let mk = |v: i32| SaveConfigRequest {
+            version: 0,
+            enabled: false,
+            frequency: "DAILY".into(),
+            send_hour: Some(20),
+            send_minute: Some(5),
+            weekday: None,
+            day_of_month: None,
+            webhook_id: None,
+            upcoming_days: UPCOMING_DAYS_DEFAULT,
+            worker_metric: "QUANTITY".into(),
+            worker_top_n: WORKER_TOP_N_DEFAULT,
+            order_list_limit: v,
+            max_chunks: MAX_CHUNKS_DEFAULT,
+            include_overview: true,
+            include_delivery: true,
+            include_orders: true,
+            include_workers: true,
+            include_drawings: true,
+            subject_template: None,
+        };
+        assert_eq!(validate_save_request(&mk(-5)).unwrap().order_list_limit, 0);
+        assert_eq!(
+            validate_save_request(&mk(9999)).unwrap().order_list_limit,
+            200
+        );
+    }
+
+    /// 缺省 `max_chunks` 从 3 提到 6：第三节清单形态下每行 ≈135 字节（含一条 ≈95
+    /// 字节的图纸预览直链），4 组 × 30 条 ≈ 16.4 KB ≈ 5 片 ⇒ 3 片装不下**完全按缺省
+    /// 配置**生成的一份日报。20 是企业微信官方限频，6 是「装得下缺省」与「不刷屏」
+    /// 之间的中间值。
+    #[test]
+    fn default_max_chunks_fits_the_default_order_list() {
+        assert_eq!(MAX_CHUNKS_DEFAULT, 6);
+        // 4 组 × 缺省 30 条 × 135 字节 ≈ 16.2 KB ⇒ 每片 4048 字节预算下 5 片装得下
+        assert!(
+            (4 * ORDER_LIST_LIMIT_DEFAULT * 135) as usize / (4096 - 48) < MAX_CHUNKS_DEFAULT as usize,
+            "缺省配置生成的清单必须装得进缺省片数"
+        );
+        // ⚠️ 「6 仍在 `1..=20` 之内」这一条由 `max_chunks_bounds_are_21804` 里的
+        // `validate_max_chunks(MAX_CHUNKS_DEFAULT).is_ok()` 守着（走函数，clippy 的
+        // `assertions_on_constants` 才不会把重复的常量比较判成噪声）。
+    }
+
     /// 校验矩阵：频率与配套字段不匹配 ⇒ `21804`。
     #[test]
     fn frequency_and_time_mismatch_is_21804() {
@@ -1238,11 +1332,13 @@ mod tests {
             upcoming_days: UPCOMING_DAYS_DEFAULT,
             worker_metric: "QUANTITY".into(),
             worker_top_n: WORKER_TOP_N_DEFAULT,
+            order_list_limit: ORDER_LIST_LIMIT_DEFAULT,
             max_chunks: 3,
             include_overview: true,
             include_delivery: true,
             include_orders: true,
             include_workers: true,
+            include_drawings: true,
             subject_template: None,
         })
         .unwrap_err();
@@ -1262,11 +1358,13 @@ mod tests {
                 upcoming_days: UPCOMING_DAYS_DEFAULT,
                 worker_metric: "QUANTITY".into(),
                 worker_top_n: WORKER_TOP_N_DEFAULT,
+                order_list_limit: ORDER_LIST_LIMIT_DEFAULT,
                 max_chunks: 3,
                 include_overview: true,
                 include_delivery: true,
                 include_orders: true,
                 include_workers: true,
+                include_drawings: true,
                 subject_template: None,
             })
             .is_ok(),
@@ -1341,11 +1439,13 @@ mod tests {
             upcoming_days: days,
             worker_metric: "QUANTITY".into(),
             worker_top_n: WORKER_TOP_N_DEFAULT,
+            order_list_limit: ORDER_LIST_LIMIT_DEFAULT,
             max_chunks: 3,
             include_overview: true,
             include_delivery: true,
             include_orders: true,
             include_workers: true,
+            include_drawings: true,
             subject_template: None,
         };
         assert_eq!(validate_save_request(&mk(-5)).unwrap().upcoming_days, 1);

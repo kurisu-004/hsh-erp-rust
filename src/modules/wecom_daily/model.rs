@@ -45,12 +45,16 @@ pub struct TWeComDailyConfigRow {
     pub worker_metric: String,
     /// `0` = 不限（全列）。
     pub worker_top_n: i32,
+    /// 第三节交期清单每组最多列出的工单数；`0` = 不限。
+    pub order_list_limit: i32,
     /// 分片数上限；`1..=20`（20 是企业微信官方限频）。
     pub max_chunks: i16,
     pub include_overview: bool,
     pub include_delivery: bool,
     pub include_orders: bool,
     pub include_workers: bool,
+    /// 第三节清单是否带图纸预览直链。
+    pub include_drawings: bool,
     pub subject_template: Option<String>,
     pub created_at: NaiveDateTime,
     pub created_by: Option<i64>,

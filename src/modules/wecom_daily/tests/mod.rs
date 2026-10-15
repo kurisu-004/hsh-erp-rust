@@ -121,8 +121,10 @@ fn default_config_is_the_meta_defaults_segment() {
     assert_eq!(d.upcoming_days, 3);
     assert_eq!(d.worker_metric, WorkerMetric::Quantity);
     assert_eq!(d.worker_top_n, 15);
-    assert_eq!(d.max_chunks, 3);
+    assert_eq!(d.order_list_limit, 30, "第三节清单每组 30 条（0 = 不限）");
+    assert_eq!(d.max_chunks, 6, "缺省片数按「清单装得下」重算过（见 dto 的 doc）");
     assert!(d.include_overview && d.include_delivery && d.include_orders && d.include_workers);
+    assert!(d.include_drawings, "清单默认带图纸直链");
     assert_eq!(d.subject_template, None);
 
     // `GET /meta` 的 `defaults` 段就是它的投影。
@@ -130,7 +132,9 @@ fn default_config_is_the_meta_defaults_segment() {
     assert_eq!(defaults.frequency, "DAILY");
     assert_eq!(defaults.worker_metric, "QUANTITY");
     assert_eq!(defaults.webhook_id, None);
-    assert_eq!(defaults.max_chunks, 3);
+    assert_eq!(defaults.max_chunks, 6);
+    assert_eq!(defaults.order_list_limit, 30);
+    assert!(defaults.include_drawings);
 }
 
 /// 四个节 slug 逐字固定（前端拿它们解释「我明明开了为什么没有这一节」）。

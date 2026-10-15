@@ -408,9 +408,9 @@ pub async fn get_config(
         r#"
         SELECT id, version, enabled, frequency, send_hour, send_minute, weekday,
                day_of_month, webhook_id, upcoming_days, worker_metric, worker_top_n,
-               max_chunks, include_overview, include_delivery, include_orders,
-               include_workers, subject_template, created_at, created_by, updated_at,
-               updated_by, deleted_at
+               order_list_limit, max_chunks, include_overview, include_delivery,
+               include_orders, include_workers, include_drawings, subject_template,
+               created_at, created_by, updated_at, updated_by, deleted_at
         FROM t_wecom_daily_config
         WHERE deleted_at IS NULL
         ORDER BY id ASC
@@ -438,9 +438,10 @@ pub async fn insert_config(
         INSERT INTO t_wecom_daily_config (
             id, version, enabled, frequency, send_hour, send_minute, weekday,
             day_of_month, webhook_id, upcoming_days, worker_metric, worker_top_n,
-            max_chunks, include_overview, include_delivery, include_orders,
-            include_workers, subject_template, created_at, created_by, updated_at, updated_by
-        ) VALUES ($1, 0, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $18, $19)
+            order_list_limit, max_chunks, include_overview, include_delivery, include_orders,
+            include_workers, include_drawings, subject_template, created_at, created_by,
+            updated_at, updated_by
+        ) VALUES ($1, 0, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $20, $21)
         "#,
     )
     .bind(id)
@@ -454,11 +455,13 @@ pub async fn insert_config(
     .bind(cfg.upcoming_days)
     .bind(cfg.worker_metric.as_str())
     .bind(cfg.worker_top_n)
+    .bind(cfg.order_list_limit)
     .bind(cfg.max_chunks)
     .bind(cfg.include_overview)
     .bind(cfg.include_delivery)
     .bind(cfg.include_orders)
     .bind(cfg.include_workers)
+    .bind(cfg.include_drawings)
     .bind(cfg.subject_template.as_deref())
     .bind(now)
     .bind(operator)
@@ -497,15 +500,17 @@ pub async fn update_config(
             upcoming_days    = $10,
             worker_metric    = $11,
             worker_top_n     = $12,
-            max_chunks       = $13,
-            include_overview = $14,
-            include_delivery = $15,
-            include_orders   = $16,
-            include_workers  = $17,
-            subject_template = $18,
+            order_list_limit = $13,
+            max_chunks       = $14,
+            include_overview = $15,
+            include_delivery = $16,
+            include_orders   = $17,
+            include_workers  = $18,
+            include_drawings = $19,
+            subject_template = $20,
             version          = version + 1,
-            updated_at       = $19,
-            updated_by       = $20
+            updated_at       = $21,
+            updated_by       = $22
         WHERE id = $1 AND version = $2 AND deleted_at IS NULL
         "#,
     )
@@ -521,11 +526,13 @@ pub async fn update_config(
     .bind(cfg.upcoming_days)
     .bind(cfg.worker_metric.as_str())
     .bind(cfg.worker_top_n)
+    .bind(cfg.order_list_limit)
     .bind(cfg.max_chunks)
     .bind(cfg.include_overview)
     .bind(cfg.include_delivery)
     .bind(cfg.include_orders)
     .bind(cfg.include_workers)
+    .bind(cfg.include_drawings)
     .bind(cfg.subject_template.as_deref())
     .bind(now)
     .bind(operator)

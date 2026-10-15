@@ -114,13 +114,34 @@ pub const WORKER_TOP_N_MAX: i32 = 200;
 /// 工人榜人数上限缺省值。
 pub const WORKER_TOP_N_DEFAULT: i32 = 15;
 
+/// 第三节交期清单「每组最多列出多少工单」的下限。
+///
+/// ⚠️ **下界是 `0` 而不是 1**：`0` = **不限**（与 [`WORKER_TOP_N_MIN`] 同一语义约定，
+/// 渲染层 `template::build_blocks` 里 `if cfg.worker_top_n > 0 { … } else { 全列 }`
+/// 是同款形态）。存量管理员手上可能有「清单要全量」的诉求，让它必须绕道写 999
+/// 才能表达「不限」没有意义。
+pub const ORDER_LIST_LIMIT_MIN: i32 = 0;
+/// 第三节交期清单「每组最多列出多少工单」的上限。
+///
+/// ⚠️ **200 是「让管理员在保存时就知道自己填了多大的量」的护栏**，不是分片装填的
+/// 硬边界（真撞上限时渲染层会以 `21804` 失败，绝不静默截断）。
+pub const ORDER_LIST_LIMIT_MAX: i32 = 200;
+/// 第三节交期清单「每组最多列出多少工单」的缺省值。
+pub const ORDER_LIST_LIMIT_DEFAULT: i32 = 30;
+
 /// 单次触发分片数上限的下限。
 pub const MAX_CHUNKS_MIN: i16 = 1;
 /// ⚠️ **20 是企业微信官方限频**（每个消息推送 ≤ 20 条/分钟），不是随手取的整数。
 /// `POST /config` 在写侧就拒 `> 20`（`21804`），见 [`MAX_CHUNKS_MAX`] 的 doc。
 pub const MAX_CHUNKS_MAX: i16 = 20;
 /// 分片数上限缺省值。
-pub const MAX_CHUNKS_DEFAULT: i16 = 3;
+///
+/// ⚠️ **缺省从 3 提到 6 的理由**（2026-10-23，第三节改清单后重算）：清单形态下每行
+/// ≈ **135 字节**（其中一条图纸预览直链就 ≈ 95 字节），4 组（逾期 / 今日 / 明日 /
+/// 更远）× [`ORDER_LIST_LIMIT_DEFAULT`] 30 条 ≈ **16.4 KB ≈ 5 片** —— 缺省 3 片会让
+/// 一份**完全按缺省配置**生成的日报直接 `21804`。6 片是在「装得下缺省配置」与
+/// 「不发 20 条刷屏」之间取的中间值。
+pub const MAX_CHUNKS_DEFAULT: i16 = 6;
 
 /// `GET /logs` 单页最大条数（`limit ∈ [1,200]`）。
 pub const LOGS_LIMIT_MAX: i64 = 200;
@@ -437,6 +458,9 @@ pub struct SaveConfigRequest {
     pub worker_metric: String,
     #[serde(default = "default_worker_top_n")]
     pub worker_top_n: i32,
+    /// 第三节交期清单每组最多列出的工单数；`0` = 不限（与 `worker_top_n` 同语义）。
+    #[serde(default = "default_order_list_limit")]
+    pub order_list_limit: i32,
     #[serde(default = "default_max_chunks")]
     pub max_chunks: i16,
     #[serde(default = "default_true")]
@@ -447,6 +471,9 @@ pub struct SaveConfigRequest {
     pub include_orders: bool,
     #[serde(default = "default_true")]
     pub include_workers: bool,
+    /// 第三节清单是否带图纸预览直链（缺省 `true`）。
+    #[serde(default = "default_true")]
+    pub include_drawings: bool,
     #[serde(default)]
     pub subject_template: Option<String>,
 }
@@ -465,6 +492,10 @@ fn default_worker_metric() -> String {
 
 fn default_worker_top_n() -> i32 {
     WORKER_TOP_N_DEFAULT
+}
+
+fn default_order_list_limit() -> i32 {
+    ORDER_LIST_LIMIT_DEFAULT
 }
 
 fn default_max_chunks() -> i16 {
@@ -555,11 +586,15 @@ pub struct NormalizedConfig {
     pub upcoming_days: i32,
     pub worker_metric: WorkerMetric,
     pub worker_top_n: i32,
+    /// 第三节交期清单每组最多列出的工单数；`0` = 不限。
+    pub order_list_limit: i32,
     pub max_chunks: i16,
     pub include_overview: bool,
     pub include_delivery: bool,
     pub include_orders: bool,
     pub include_workers: bool,
+    /// 第三节清单是否带图纸预览直链。
+    pub include_drawings: bool,
     pub subject_template: Option<String>,
 }
 
@@ -585,11 +620,13 @@ impl Default for NormalizedConfig {
             upcoming_days: UPCOMING_DAYS_DEFAULT,
             worker_metric: WorkerMetric::Quantity,
             worker_top_n: WORKER_TOP_N_DEFAULT,
+            order_list_limit: ORDER_LIST_LIMIT_DEFAULT,
             max_chunks: MAX_CHUNKS_DEFAULT,
             include_overview: true,
             include_delivery: true,
             include_orders: true,
             include_workers: true,
+            include_drawings: true,
             subject_template: None,
         }
     }
@@ -599,7 +636,7 @@ impl Default for NormalizedConfig {
 // 出参
 // ============================================================================
 
-/// `GET /config` / `POST /config` 响应体（**21 个字段**，前端 `.strict()` + 键数断言）。
+/// `GET /config` / `POST /config` 响应体（**23 个字段**，前端 `.strict()` + 键数断言）。
 ///
 /// `id` 是 JSON **string**（雪花 ID 防 JS 精度截断）。
 #[derive(Debug, Clone, Serialize)]
@@ -618,11 +655,15 @@ pub struct ConfigOut {
     pub upcoming_days: i32,
     pub worker_metric: String,
     pub worker_top_n: i32,
+    /// 第三节交期清单每组最多列出的工单数；`0` = 不限。
+    pub order_list_limit: i32,
     pub max_chunks: i16,
     pub include_overview: bool,
     pub include_delivery: bool,
     pub include_orders: bool,
     pub include_workers: bool,
+    /// 第三节清单是否带图纸预览直链。
+    pub include_drawings: bool,
     pub subject_template: Option<String>,
     /// `webhook_id` 指向的行**还在不在**（纯 DB 存在性检查）。
     ///
@@ -651,11 +692,15 @@ pub struct ConfigDefaultsOut {
     pub upcoming_days: i32,
     pub worker_metric: String,
     pub worker_top_n: i32,
+    /// 第三节交期清单每组最多列出的工单数；`0` = 不限。
+    pub order_list_limit: i32,
     pub max_chunks: i16,
     pub include_overview: bool,
     pub include_delivery: bool,
     pub include_orders: bool,
     pub include_workers: bool,
+    /// 第三节清单是否带图纸预览直链。
+    pub include_drawings: bool,
     pub subject_template: Option<String>,
 }
 
@@ -672,11 +717,13 @@ impl From<&NormalizedConfig> for ConfigDefaultsOut {
             upcoming_days: c.upcoming_days,
             worker_metric: c.worker_metric.as_str().to_string(),
             worker_top_n: c.worker_top_n,
+            order_list_limit: c.order_list_limit,
             max_chunks: c.max_chunks,
             include_overview: c.include_overview,
             include_delivery: c.include_delivery,
             include_orders: c.include_orders,
             include_workers: c.include_workers,
+            include_drawings: c.include_drawings,
             subject_template: c.subject_template.clone(),
         }
     }

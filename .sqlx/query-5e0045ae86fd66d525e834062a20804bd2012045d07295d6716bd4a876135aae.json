@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            COUNT(DISTINCT CASE\n                WHEN e.event_type IN ('RETURNED_TO_SHELF', 'SENT_TO_INSPECTION')\n                THEN e.batch_id END)::bigint AS \"batch_count!\",\n            COALESCE(SUM(CASE\n                WHEN e.event_type IN ('RETURNED_TO_SHELF', 'SENT_TO_INSPECTION')\n                THEN e.quantity END), 0)::bigint AS \"quantity!\",\n            COUNT(DISTINCT CASE\n                WHEN e.event_type = 'COMPLETED' AND e.batch_id IS NULL\n                THEN e.part_id END)::bigint AS \"completed!\",\n            COUNT(DISTINCT CASE\n                WHEN e.event_type = 'SENT_TO_INSPECTION'\n                THEN e.batch_id END)::bigint AS \"sent!\",\n            (SELECT COUNT(*) FROM t_part p\n              WHERE p.deleted_at IS NULL AND p.status = 'IN_PROCESS')::bigint AS \"wip!\"\n        FROM t_part_event e\n        JOIN t_worker w ON w.id = e.worker_id\n        WHERE e.created_at >= $1\n          AND e.created_at < $2\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "batch_count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "quantity!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "completed!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "sent!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 4,
+        "name": "wip!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamp",
+        "Timestamp"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "5e0045ae86fd66d525e834062a20804bd2012045d07295d6716bd4a876135aae"
+}

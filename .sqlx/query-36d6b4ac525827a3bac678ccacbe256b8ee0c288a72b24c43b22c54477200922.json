@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT COUNT(DISTINCT b.part_id)::bigint AS \"part_count!\"\n        FROM t_delivery_note n\n        JOIN t_part_batch b\n          ON b.delivery_note_id = n.id AND b.deleted_at IS NULL\n        WHERE n.deleted_at IS NULL\n          AND n.picked_up_at >= $1\n          AND n.picked_up_at < $2\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "part_count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamp",
+        "Timestamp"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "36d6b4ac525827a3bac678ccacbe256b8ee0c288a72b24c43b22c54477200922"
+}

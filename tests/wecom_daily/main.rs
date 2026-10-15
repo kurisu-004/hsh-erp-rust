@@ -565,11 +565,13 @@ pub(crate) fn config_body(version: i32, webhook_id: i64) -> Value {
         "upcoming_days": 3,
         "worker_metric": "QUANTITY",
         "worker_top_n": 15,
-        "max_chunks": 3,
+        "order_list_limit": 30,
+        "max_chunks": 6,
         "include_overview": true,
         "include_delivery": true,
         "include_orders": true,
         "include_workers": true,
+        "include_drawings": true,
         "subject_template": null
     })
 }
