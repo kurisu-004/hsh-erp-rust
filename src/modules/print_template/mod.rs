@@ -92,8 +92,7 @@
 //! `soft_delete_file` / `list_with_filters`；写入经该域的两条写入口），
 //! 这是设计（复用 `t_part_file`，见上表）而不是越界。
 //! 硬装这道护栏只会逼出「把 files 域的写法复制一份到本域」这种更糟的结果。
-//! 本域对 `t_customer` 的三处读（`parent_id IS NULL` 强制点**顺带取名**、`resolve`
-//! 的客户名、列表的批量客户名）SQL 都写在本域 service 里，属既定的「只读跨域
+//! 本域对 `t_customer` 的两处只读（`resolve` 的客户名单条、列表的客户名批量）SQL 都写在本域 service 里，属既定的「只读跨域
 //! 聚合」pattern（`dashboard` / `statistics` / `prod::inspection` 同款），
 //! **不 import** `com::customer` 任何符号。⚠️ 列表那处**必须**是一条
 //! `id = ANY($1)`（不许逐行查）：见 `service.rs` 模块 doc 的「取数恒 ≤ 3 条语句」

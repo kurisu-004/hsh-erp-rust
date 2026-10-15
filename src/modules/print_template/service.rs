@@ -8,13 +8,14 @@
 //!
 //! 本域没有自有表。`t_part_file` 的读写全部走 `files::part_file` 已有的
 //! `PartFileRepoTrait`（该 trait 已 `impl for &mut PgConnection`，可直接借位调用），
-//! `t_customer` 的三处只读查询**直接写在本文件里**（运行时 `sqlx::query_scalar` /
+//! `t_customer` 的两条只读查询**直接写在本文件里**（运行时 `sqlx::query_scalar` /
 //! `sqlx::query_as`，**不进 `query!` 宏**、不需要 `.sqlx/` 离线缓存 —— 与
 //! `files::part_file::repo` 的既有取舍一致，见该文件模块 doc 的「约定」一节；
 //! 逐条清单与「取数恒 ≤ 3 条语句」的护栏见文末两节）。
 //!
-//! 2026-10-15：上传端点下线 ⇒ `t_customer` 的只读查询由 3 条降为 **2 条**
-//! （`customer_name` / `customer_names`；L1-only 判据并入 files 域共用闸门）。
+//! `t_customer` 的只读查询只有**两条**：`customer_name`（resolve 用，单条）与
+//! `customer_names`（列表用，`id = ANY($1)` 批量）；「只绑一级客户」那条判据**不在
+//! 本域**，它在 files 域共用的 `repo::customer_owner_exists` 里（§4.1）。
 //!
 //! 范本：同域的其它「复用 `t_part_file`、无 repo 层」写法。
 //!
@@ -30,10 +31,10 @@
 //! 也就不存在「两条写入口角色口径分叉」的问题（CUSTOMER × DELIVERY_TEMPLATE
 //! 的角色闸门在 `policy::write_roles_for`，confirm 与 upload-intents 共用）。
 //!
-//! ## ⚠️ 取数恒 ≤ 3 条语句（列表端点，2026-10-16 review 第 2 轮 C-1 补）
+//! ## ⚠️ 取数恒 ≤ 3 条语句（列表端点）
 //!
 //! 端点 1（列表）是 N 行模板的端点，而 `customer_name` 是前端 `.strict()` schema
-//! 的**必填**字段（review 第 2 轮 C-1 补的出参）⇒ 天然 tempt 人写成「逐行查名」。
+//! 的**必填**字段 ⇒ 天然 tempt 人写成「逐行查名」。
 //! 本域的形态：
 //!
 //! | 端点 | 语句数 | 构成 |
@@ -64,14 +65,12 @@ use crate::modules::print_template::vo::{
 use crate::shared::error::{AppError, code};
 
 // ============================================================================
-//  t_customer 的三处只读查询（本域唯一的跨域表引用）
+//  t_customer 的两条只读查询（本域唯一的跨域表引用）
 // ============================================================================
 
-// 2026-10-15：`l1_customer_name`（本域上传端点的「只绑一级客户」强制点）随
-// 上传端点一并删除 —— 模板行的写入现在只经 `POST /files/objects/confirm`，而
-// 「是不是一级客户」这条判据已在 files 域的 `repo::customer_owner_exists`
-// （`parent_id IS NULL`）里，是 upload-intents 与 confirm **共用**的那道闸门。
-// ⚠️ 错误码随之是 **21105**（OWNER_NOT_FOUND）而不是本域原报的 20104。
+// 「只绑一级客户」这条判据**不在本域**：它在 files 域的 `repo::customer_owner_exists`
+// （谓词含 `parent_id IS NULL`）里，是 upload-intents 与 confirm **共用**的那道闸门
+// ⇒ 本域模板行写不写得上去不归它管，本文件只读 `t_customer` 取名。
 
 /// 一级客户名（查不到 / 已软删 ⇒ `None`，**不**报错）。
 ///
@@ -185,7 +184,7 @@ pub async fn resolve_template(
 /// review 第 1 轮 MAJOR-3）—— 本端点要的**正是**这一种 kind，排除它就把自己
 /// 清空了。两条路径互相独立，**不要**「顺手把两边统一成同一张表」。
 ///
-/// ## 取数恒 ≤ 3 条语句，与工单数无关（2026-10-16 review 第 2 轮 C-1）
+/// ## 取数恒 ≤ 3 条语句，与工单数无关
 ///
 /// 本函数**恒**恰好 3 条语句：`list_with_filters` 的 rows 1 条 + total 1 条
 /// ＋ [`customer_names`] 批量取客户名 1 条。⚠️ `rows` 为空时 [`customer_names`]
@@ -237,9 +236,7 @@ pub async fn list_templates(
 /// 本端点用权限点 `delivery_note.print`（M / C / I），是**打印**语义。两者的
 /// 角色集合与错误码（那边 21102、这边 21101）都刻意不同。
 ///
-/// ⚠️ 2026-10-16 review 第 1 轮 MINOR-5：行只取**一次**（判 kind 与取字节共用同一行），
-/// 原先这里 `get_file_row` 一次、files 域的 `get_file_content` 内部又 `get_by_id` 一次
-/// （那个方法已于 review 第 2 轮 MINOR-A 整条删除）。
+/// 行只取**一次**（判 kind 与取字节共用同一行）。
 /// 取字节走 files 域最底层的 `get_file_content_for_row`（**不判权限、不判 kind**）
 /// —— 权限点由本域 handler 判、CNC_PROGRAMMER 这类「不在 files 域 5 角色表里但持
 /// `delivery_note.print`」的账号不该被二次拒绝。
@@ -313,23 +310,22 @@ mod query_guard {
     //! - 这种**跨函数的间接 N+1** 由 `list_templates_joins_customer_names_in_memory`
     //!   兜：它显式禁止列表端点调单条取名的 `customer_name(`、并要求出现
     //!   `customer_names(` + `let ids: Vec<i64>` + `names.get(` 三步。
-    //!   ⚠️ **这个兜底只覆盖 `list_templates` 一个函数**（2026-10-16 review 第 3 轮
-    //!   MINOR-3 补）—— 那条断言取的是 `fn_body("list_templates")`。在**别的**函数里
-    //!   逐行查名它一条都拦不住：将来在本文件新增第 6 个端点（哪怕只是导出）并在
+    //!   ⚠️ **这个兜底只覆盖 `list_templates` 一个函数** —— 那条断言取的是
+    //!   `fn_body("list_templates")`。在**别的**函数里
+    //!   逐行查名它一条都拦不住：将来在本文件新增**另一个**发查询的端点 service 并在
     //!   其中写 `for row in rows { customer_name(conn, row.part_id).await? }`，
     //!   第 1 条（循环体内无 `sqlx::query`，那条在别的 helper 里）过、第 2 条（总查询
-    //!   点数仍是 3）过、第 3 条（只查 `list_templates`）也过 ⇒ **三条全绿**。
+    //!   点数仍是 2）过、第 3 条（只查 `list_templates`）也过 ⇒ **三条全绿**。
     //!   ⇒ 其它函数里的逐行查名，只能靠「新增 helper 时同步扩断言」这条人工纪律守。
     //! - 若日后新增**第三个**会发查询的 helper 并在别处逐行调用它，这三条都拦不住
     //!   ⇒ 新增 helper 时请顺手扩 `list_templates_joins_customer_names_in_memory`。
     //!
-    //! ⚠️ **变异验证的覆盖面（2026-10-16 review 第 3 轮 MINOR-3 订正）**：原文写
-    //! 「两条断言（循环内查询数、三条 helper 各一条）都经过变异验证」，其中对**第 1 条
-    //! （循环内查询数）不成立** —— `code()` 扫的那段源码里**零个** `for` / `while` /
+    //! ⚠️ **变异验证的覆盖面**：对**第 1 条（循环内查询数）不成立** ——
+    //! `code()` 扫的那段源码里**零个** `for` / `while` /
     //! `loop`（实测：护栏 banner 之前 429 行，剥掉注释后零个迭代语句），`loop_bodies()`
     //! 返回空、自检 `!bodies.is_empty() || !code().contains("\n    for ")` 因 `bodies`
     //! 为空而**恒真** ⇒ 第 1 条**当前不承载任何判定**（一旦有人在本文件写出循环即生效）。
-    //! 真正经过**变异验证**（手改成 N+1 后当场红）的只有**第 2 条**（三条 helper 各
+    //! 真正经过**变异验证**（手改成 N+1 后当场红）的只有**第 2 条**（两条 helper 各
     //! 恰好一条查询）与**第 3 条**（列表端点必须走批量那条）。
 
     /// 护栏模块自身的 banner 行（**只在这一行出现**，下面的 `const` 声明刻意不含
@@ -385,8 +381,8 @@ mod query_guard {
     /// 抽出某个 `async fn <name>(` 的函数体（到下一个行首 `}` 为止）。
     ///
     /// ⚠️ 匹配的是 `"fn <name>("` 而**不是** `"pub async fn <name>("` ——
-    /// 本文件里三条取名 helper 都是**私有** `async fn`（只有 `list_templates` 是
-    /// `pub`），写成 `pub` 会让三条 helper 一条都找不到（本护栏第一版踩过）。
+    /// 本文件里两条取名 helper 都是**私有** `async fn`（只有 `list_templates` 是
+    /// `pub`），写成 `pub` 会让两条 helper 一条都找不到（本护栏第一版踩过）。
     fn fn_body(name: &str) -> String {
         let src = code();
         let start = src
@@ -446,12 +442,12 @@ mod query_guard {
         }
     }
 
-    /// 三条 `t_customer` 只读查询，各一个函数、一条语句。
+    /// 两条 `t_customer` 只读查询，各一个函数、一条语句。
     ///
-    /// ⚠️ 这个数字的作用是「新增第 4 条查询时**逼你**看一眼是不是又写了一条逐行查」，
+    /// ⚠️ 这个数字的作用是「新增第 3 条查询时**逼你**看一眼是不是又写了一条逐行查」，
     /// **不是**语句数契约 —— 契约是「与行数无关」，由上一条守。
     #[test]
-    fn exactly_three_customer_queries_each_in_its_own_helper() {
+    fn exactly_two_customer_queries_each_in_its_own_helper() {
         assert_eq!(
             query_calls(code()),
             2,

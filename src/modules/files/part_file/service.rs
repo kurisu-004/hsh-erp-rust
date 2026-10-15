@@ -562,8 +562,9 @@ impl PartFileService {
 // - 本方法保持原签名（pool / snowflake / cos 全部参数化），由 service 自行
 //   `pool.begin()` 开 tx；tx 内 DB 操作仍走 trait 模式（`&mut *tx` 直接喂给
 //   `PartFileRepoTrait`）。
-// - 这是 handler 移交事务范式的**唯一例外**，余下端点（list / get_url /
-//   get_content / soft_delete）均按 handler 管 tx 范式改造。
+// - 这是 handler 移交事务范式的**唯一例外**；余下**全部**端点（
+//   upload-intents / list / get_url / get_content / soft_delete / preview）
+//   都按 handler 管 tx 范式改造。
 
 impl PartFileService {
     /// 登记一个**已由前端直传到 COS 正式 CAS key** 的对象（INSERT `t_part_file`）。

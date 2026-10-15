@@ -2,9 +2,9 @@
 //!
 //! ⚠️ **刻意不复用 `files::part_file::vo::PartFileOut`**（那是 files 域的出参，
 //! 归它所有）：`PartFileOut` 的 `owner_kind` 字段是**从请求参数回显**的
-//! （`service::render_out(&row, owner_kind)` 取形参），而本域的 4 条端点
-//! **全部**是按 `(part_id, kind='DELIVERY_TEMPLATE')` 取回或列举的 —— 回显不出
-//! `CUSTOMER`。
+//! （`service::render_out(&row, owner_kind)` 取形参），而本域 4 条端点**都不把**
+//! `owner_kind` 当请求参数回显：端点 1 / 2 按 `(part_id, kind='DELIVERY_TEMPLATE')`
+//! 取，3 / 4 是**按 id 取回**的 ⇒ 回显不出 `CUSTOMER`。
 //! 照抄一份 VO 出来、再让 `owner_kind` 变成「要么对、要么空」的字段，只会把
 //! files 域那处已登记的偏差（`files/part_file/mod.rs` 已知偏差第 7 / 9 条）复制过来。
 //! 本域的 VO 全部**从行上真实字段渲染**，`kind` 恒为 `DELIVERY_TEMPLATE`。

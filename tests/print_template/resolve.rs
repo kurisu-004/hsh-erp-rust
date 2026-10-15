@@ -1,6 +1,6 @@
 //! 端点 2 / 3：`GET /print-templates/resolve` 与 `GET /{id}/content`
 //!
-//! 覆盖 19 组场景（★ = 核心回归）：
+//! 覆盖 20 组场景（★ = 核心回归）：
 //! 1. ★ `resolve_hit_returns_template_and_customer_name`
 //! 2. ★ `customer_name_is_present_on_upload_list_and_resolve` ——
 //!    **行 VO 的 `customer_name`**（前端 `.strict()` schema 的必填项，

@@ -237,7 +237,7 @@
 //! | `GET /files/objects`（列表） | M / C / I / CNC / **SHELF** | 2026-10-10 放开 SHELF；⚠️ 2026-10-16 起**永不返回 `DELIVERY_TEMPLATE` 行**（显式传 `kind` 也是空） |
 //! | `GET /files/objects/{id}/content` | M / C / I / CNC / **SHELF** | 2026-10-10 放开 SHELF；⚠️ 2026-10-16 起**加 kind 白名单**（拒 `DELIVERY_TEMPLATE` 等非文件类 kind），与 `/url` 共用 `policy::is_file_content_kind` |
 //! | `GET /files/objects/{id}/url` | 权限点 `part.drawing.print`（默认矩阵 M / C / I / CNC） | **默认矩阵刻意不含 SHELF**，见下；⚠️ 2026-10-16 起**同样加 kind 白名单**（review 第 1 轮 MAJOR-2） |
-//! | `GET /files/objects/{id}/preview` | M / C / I / CNC / **SHELF** | 新增于 2026-10-13；⚠️ **含 SHELF 是对上一行的有意反转**，见下。⚠️ **只有 `DRAWING` / `ASSEMBLY_MASTER` 的 PDF 可预览**（`preview::assert_previewable`），`CAD_2D` / `3D_MODEL` / `G_CODE` / `SETUP_SHEET` 一律 **21116** |
+//! | `GET /files/objects/{id}/preview` | M / C / I / CNC / **SHELF** | 新增于 2026-10-13；⚠️ **含 SHELF 是对上一行的有意反转**，见下。⚠️ **只有 `DRAWING` / `ASSEMBLY_MASTER` 的 PDF 可预览**（`preview::assert_previewable`），除 `DRAWING` / `ASSEMBLY_MASTER` 的 PDF 外一律 **21116**（含 `CAD_2D` / `3D_MODEL` / `G_CODE` / `SETUP_SHEET` / `DELIVERY_TEMPLATE`） |
 //! | `POST /files/objects/{id}/delete` | 按 kind 派生（图纸类 + `ASSEMBLY_MASTER` M / C，G_CODE M / CNC，`DELIVERY_TEMPLATE` **仅 Manager**） | `ASSEMBLY_MASTER` 是 2026-10-13 review 第 1 轮 MINOR-6 补进分派的；`DELIVERY_TEMPLATE` 是 2026-10-16 新增（否则「写得进、删不掉」） |
 //!
 //! ### ⚠️ 写侧对各 kind 的接受面（当前事实）

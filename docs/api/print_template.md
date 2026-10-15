@@ -131,7 +131,7 @@ fallback 产出，`route_layer` 只作用于已匹配路由 ⇒ 404 连鉴权层
 |---|---|---|
 | `id` | **string** | `t_part_file.id`（雪花 ID 字符串化，防 JS 精度截断；`shared::types::serialize_i64`） |
 | `customer_id` | **string** | `t_part_file.part_id` —— ⚠️ **列名叫 `part_id`，装的是 `t_customer.id`**（§8.3 第 2 条） |
-| `customer_name` | string \| null | **本域自己的一条 `t_customer` 只读查询**（`deleted_at IS NULL` 时取 `name`）；查不到时为 `null`，**不报错**（§8.3 第 6 条）。⚠️ **前端 `printTemplateSchema` 是 `.strict()` 且必填它** —— 缺这个键会让上传（201 也一样）/ 列表 / 自动选用三条路径**全部**抛 ZodError（2026-10-16 review 第 2 轮 C-1 补）。三条填充路径见 §2.4 |
+| `customer_name` | string \| null | **本域自己的一条 `t_customer` 只读查询**（`deleted_at IS NULL` 时取 `name`）；查不到时为 `null`，**不报错**（§8.3 第 6 条）。⚠️ **前端 `printTemplateSchema` 是 `.strict()` 且必填它** —— 缺这个键会让「上传 / 列表 / 自动选用」三条消费路径**全部**抛 ZodError（前端 `.strict()` 直接拒整个响应，不是「显示成空」）。两条填充路径见 §2.4 |
 | `kind` | string | 行上的真实列，恒为 `"DELIVERY_TEMPLATE"` |
 | `file_type` | string | 行上的真实列，恒为 `"XLSX"`（`policy::file_type_for_ext("xlsx")`） |
 | `original_filename` | string | 上传时的原始文件名（模板管理页列表列显示它） |
@@ -171,7 +171,7 @@ fallback 产出，`route_layer` 只作用于已匹配路由 ⇒ 404 连鉴权层
 | `items` | `PrintTemplateOut[]` | `created_at DESC`（与 `files` 域 `list_with_filters` 逐字同款）；**只含未软删行** |
 | `total` | number | 独立 COUNT，**不受** `limit` / `offset` 截断影响 |
 
-### 2.4 `customer_name` 的三条填充路径（⚠️ 与 N+1 无关的取舍）
+### 2.4 `customer_name` 的两条填充路径（⚠️ 与 N+1 无关的取舍）
 
 两个**读**端点走**两条不同的填充路径**：
 
@@ -192,7 +192,7 @@ fallback 产出，`route_layer` 只作用于已匹配路由 ⇒ 404 连鉴权层
 ⚠️ **端点 1（列表）绝不逐行查名**：那正是本仓明令禁止的 N+1（功能上完全正确、测试照样
 全绿，只有语句数随行数线性涨）。守卫见 `src/modules/print_template/service.rs`
 模块 doc 的「取数恒 ≤ 3 条语句」一节与该文件末尾的 `mod query_guard`（lib 单测，
-读源码：循环体内出现 `sqlx::query` 即红 + 三条 helper 各恰好一条查询 + 列表端点
+读源码：循环体内出现 `sqlx::query` 即红 + 两条 helper 各恰好一条查询 + 列表端点
 必须走批量那条）。集成测试
 `customer_name_is_present_on_upload_list_and_resolve` /
 `customer_name_is_null_after_customer_soft_deleted` 钉的是**出参取值**
@@ -468,7 +468,7 @@ body 换 Manager + 换**真 L1** ⇒ 走完 upload-intents + confirm 并真的�
 ⚠️ **`files` 域是全仓唯一持有 `t_part_file` 写入路径的域**（见 `CLAUDE.md`
 「`src/modules/files/*` 子模块清单」）。本域的写入**全部经它的
 `PartFileService`**，不自己写 SQL 改那张表 —— 本域唯一的自有 SQL 是
-`service.rs` 里那**三条**对 `t_customer` 的只读查询（运行时 `sqlx::query_scalar` /
+`service.rs` 里那**两条**对 `t_customer` 的只读查询（运行时 `sqlx::query_scalar` /
 `sqlx::query_as`，**不进 `query!` 宏**、不需要 `.sqlx/` 离线缓存）；⚠️ **列表端点的
 取数恒 ≤ 3 条语句、与模板条数无关**（§8.3 第 16 条，含源码级护栏的位置）。
 
@@ -531,6 +531,6 @@ body 换 Manager + 换**真 L1** ⇒ 走完 upload-intents + confirm 并真的�
 | 13 | **测试替身 `MockCos` 掩盖三条路径**（review 第 1 轮 MINOR-6）：① 真实 COS 的**错误分类** —— 替身对缺失 key 一律返 `BIZ_PART_FILE_UPLOAD_FAILED`，真 COS 是 `NoSuchKey`；② **etag 语义**（替身是拼出来的字符串，无条件写 / 部分写、真 COS 的 etag 参与一致性判断）；③ **「CAS 命中跳过 COS PUT」那条省流路径本 binary 完全没跑**（替换语义下 `soft_delete_active_by_part_kind` 先跑、CAS 查询带 `deleted_at IS NULL` ⇒ 取不到，与第 4 条同源） | **有意保留 + 已登记**。2026-10-16 已把本 binary 原来自造的**第三个** COS 替身（`MemoryCos`）删掉、能力上提到 `test-support` 的 `MockCos`（`put` 真存字节 / `delete` 真删字节），三条残余偏差属替身固有限制，不是回归。⚠️ 端点 4 的 COS 清理断言改用 `MockCos::stored_bytes`（「对象确实没了」）而非只看 `delete_calls` |
 | 14 | **`GET /print-templates/{id}/content` 的 kind 校验在 Rust 侧而非 SQL 谓词**（`service::get_template_content` 比 `row.kind`）；端点 4 连 kind 都不比，只靠 `soft_delete_file` 的 kind→角色分派 | **有意保留 + 已登记**。理由：这两条路径**先取行**（端点 3 为了判「零外部 IO」、端点 4 为了拿 `object_key` 与派角色），行已在手里，比 `row.kind` 与 SQL 谓词等价，且少一次往返。别把它们「统一」成 SQL kind 谓词 |
 | 15 | **行 VO 的 `customer_name` 缺了会让本域对着真前端 100% 不可用**（review 第 2 轮 C-1）：前端 `printTemplateSchema` 是 `.strict()` 且必填它，而首版 `PrintTemplateOut` 没有 ⇒ 上传即便返 **201** 也抛 ZodError、列表每行都抛（恒空）、页面「客户」列恒显「（已删除的客户）」。首版的 42 条用例全绿却钉不到它（断言只看自己写的那几个键） | **已闭合**（行 VO 补 `customer_name: Option<String>`，三条填充路径见 §2.4；新增两条集成测试钉**取值**：命中 / 客户软删后 `null`。⚠️ **列表不许逐行查名** —— 那正是 N+1；语句数与源码护栏见下一条）
-| 16 | **列表端点的取数恒 ≤ 3 条语句（rows 1 + total 1 + 客户名 1；`rows` 为空时 2），与模板条数 / 客户数无关** | **有意保留 + 登记**（review 第 2 轮 C-1 随 `customer_name` 一并引入）。客户名走**一条 `WHERE id = ANY($1)`** 一次取回后在内存里 join（`HashMap`），**绝不**在 `rows.iter()` 里逐行查 —— 逐行查的写法**功能完全正确、集成测试照样全绿**，只有语句数会线性涨，所以只能靠 `src/modules/print_template/service.rs` 末尾 `mod query_guard` 的**源码级** lib 单测钉（循环体内出现 `sqlx::query` 即红 + 三条 helper 各恰好一条查询 + 列表端点必须走批量那条）。⚠️ **该护栏的已知漏报形态**：「循环里调别的函数、那个函数里发查询」这类**跨函数的间接 N+1** `no_query_inside_any_loop` 看不见，由同一模块里的 `list_templates_joins_customer_names_in_memory` 兜（它显式禁止列表端点调单条取名的 `customer_name(`）—— 但**新增第四个会发查询的 helper** 时要顺手扩那条断言。两条断言都经变异验证（手改成 N+1 后当场红），登记在 `query_guard` 的模块 doc 里。⚠️ 逐端点的确切语句数（端点 1 = 7 等）写在 `service.rs` 模块 doc 的表里，那里也注明「会过期、要确切数字自己读，别当契约」 |
+| 16 | **列表端点的取数恒 ≤ 3 条语句（rows 1 + total 1 + 客户名 1；`rows` 为空时 2），与模板条数 / 客户数无关** | **有意保留 + 登记**。客户名走**一条 `WHERE id = ANY($1)`** 一次取回后在内存里 join（`HashMap`），**绝不**在 `rows.iter()` 里逐行查 —— 逐行查的写法**功能完全正确、集成测试照样全绿**，只有语句数会线性涨，所以只能靠 `src/modules/print_template/service.rs` 末尾 `mod query_guard` 的**源码级** lib 单测钉（循环体内出现 `sqlx::query` 即红 + 两条 helper 各恰好一条查询 + 列表端点必须走批量那条）。⚠️ **该护栏的已知漏报形态**：「循环里调别的函数、那个函数里发查询」这类**跨函数的间接 N+1** `no_query_inside_any_loop` 看不见，由同一模块里的 `list_templates_joins_customer_names_in_memory` 兜（它显式禁止列表端点调单条取名的 `customer_name(`）—— 但**新增第三个会发查询的 helper** 时要顺手扩那条断言。两条断言都经变异验证（手改成 N+1 后当场红），登记在 `query_guard` 的模块 doc 里。⚠️ 逐端点的确切语句数（端点 1 = 3 等）写在 `service.rs` 模块 doc 的表里，那里也注明「会过期、要确切数字自己读，别当契约」 |
 | 17 | **`files::part_file::service::get_file_content` 已整条删除**（review 第 2 轮 MINOR-A）：它有角色闸门（5 角色）但**无 kind 闸门**，正是第 1 轮 MAJOR-2 关掉的那条绕行面，却以 `pub` 形态留在原地 —— 生产侧早已改走 `get_file_content_of_checked_row`，只剩两个测试在调 | **已闭合**（方法删除，两个测试调用方改成「`get_file_row` 取行 → `get_file_content_of_checked_row`」的生产同款两步）。⚠️ 本域不依赖它（端点 3 走最底层的 `get_file_content_for_row`），所以删除对其它域零影响。**别**因为「顺手」把它加回来 |
 | 18 | **`policy::write_roles_for` 的默认集合形参换成 `WriteEntry` 入口枚举**（review 第 2 轮 MINOR-B）：原签名把「这条入口的非 CUSTOMER 角色集合」当**位置参数**传 ⇒ 把 confirm 那处的 `CONFIRM_ROLES` 抄成 `UPLOAD_ROLES` 是**静默的权限面放开**（同文件、同类型、clippy 不报、lib 单测仍全绿） | **有意保留 + 登记**。调用方现在只传「我是哪条入口」（`WriteEntry::Upload` / `WriteEntry::Confirm`），常量由函数内部选 ⇒ **传错常量在类型层面不存在**。⚠️ 代价：新增一条写入口时要加一个变体（那本来就该显眼 —— 新入口必须显式决定角色面） |
