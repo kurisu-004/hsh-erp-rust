@@ -56,6 +56,13 @@ pub fn allowed_exts(kind: &str) -> &'static [&'static str] {
         "3D_MODEL" => &["step", "stp", "iges", "igs", "stl", "obj", "3mf"],
         "ASSEMBLY_MASTER" => &["pdf"],
         "DELIVERY_TEMPLATE" => &["xlsx"],
+        // 2026-10-15：G_CODE / SETUP_SHEET 两条 CNC 配对文件改走
+        // `POST /objects/upload-intents` + `POST /objects/confirm`（`pair_with_file_id`
+        // 互指），所以它们必须进这张白名单，否则 confirm 的 kind 闸门会把它们全拒。
+        // 取值逐字沿用被删的 `files::part_file::cnc::service` 里的两道判定
+        // （g_code ∈ {tap,nc,gcode,mpf,cnc}、setup_sheet 恒 pdf）。
+        "G_CODE" => &["tap", "nc", "gcode", "mpf", "cnc"],
+        "SETUP_SHEET" => &["pdf"],
         _ => &[],
     }
 }
@@ -93,13 +100,34 @@ pub fn allowed_exts(kind: &str) -> &'static [&'static str] {
 /// 2026-10-13 新增
 pub fn owner_kind_allows_kind(owner_kind: &str, kind: &str) -> bool {
     match owner_kind {
-        "PART" => matches!(kind, "DRAWING" | "3D_MODEL"),
+        // 2026-10-15：`G_CODE` / `SETUP_SHEET` 随「CNC 配对走 confirm 的
+        // `pair_with_file_id`」一并放行到 PART（此前它们只经被删的
+        // `POST /files/cnc/pairs` 写入，那条路径不走本函数）。
+        "PART" => matches!(kind, "DRAWING" | "3D_MODEL" | "G_CODE" | "SETUP_SHEET"),
         "ASSEMBLY" => matches!(kind, "ASSEMBLY_MASTER"),
         // 2026-10-16 新增：一级客户只挂送货单打印模板（xlsx）。
         "CUSTOMER" => matches!(kind, "DELIVERY_TEMPLATE"),
         // 未知 owner_kind 由 `PartFileService::assert_owner_exists` 报 20104，
         // 这里直接 false（不区分错误码，两道守卫都拒即可）。
         _ => false,
+    }
+}
+
+/// CNC 配对的两个 kind（G_CODE ↔ SETUP_SHEET 互指）。
+///
+/// 2026-10-15 新增：配对语义原在 `files::part_file::cnc` 子模块里（整块删除），
+/// 现在由 `POST /objects/confirm` 的 `pair_with_file_id` 承接，故 kind 判据、角色
+/// 分派、扩展名白名单三处都要有一个**共同的**「这两个 kind 叫什么」定义。
+pub fn is_cnc_pair_kind(kind: &str) -> bool {
+    matches!(kind, "G_CODE" | "SETUP_SHEET")
+}
+
+/// 一对（G_CODE ↔ SETUP_SHEET）互指的另一种 kind；不是配对 kind 时返回 `None`。
+pub fn cnc_pair_counterpart(kind: &str) -> Option<&'static str> {
+    match kind {
+        "G_CODE" => Some("SETUP_SHEET"),
+        "SETUP_SHEET" => Some("G_CODE"),
+        _ => None,
     }
 }
 
@@ -195,6 +223,32 @@ pub fn write_roles_for(owner_kind: &str, entry: WriteEntry) -> &'static [Role] {
     }
 }
 
+/// `POST /api/v2/files/objects/confirm` 的角色集合（**按 kind 再分一层**）。
+///
+/// 2026-10-15 新增：confirm 端点接管 CNC 配对（G_CODE / SETUP_SHEET 的上传与
+/// `pair_with_file_id` 互指）之后，它的角色集合不能只按 `owner_kind` 派 —— 那张表
+/// 给出的是 `CONFIRM_ROLES`（M+C，历史上这条端点没给过 CNC）。而 CNC 程序文件
+/// 历来由 CNC 岗位写（被删的 `POST /files/cnc/pairs` 是 M+CNC），直接套 M+C
+/// 会把写 G_CODE 的门关死；直接对所有 kind 放 CNC 又会把 DRAWING / 3D_MODEL 的
+/// confirm 面放开——那是权限面放大，与本轮方向相反。
+///
+/// ⇒ 分派规则：配对两种 kind 走 [`CNC_PAIR_ROLES`]，其余逐字走
+/// `write_roles_for(owner_kind, WriteEntry::Confirm)`（含 CUSTOMER ⇒ 仅 Manager）。
+/// 写入端点（upload-intents）同样能签 G_CODE，那里用的是 `WriteEntry::Upload`
+/// （M+C+CNC），本就含 CNC，无需再分派。
+pub fn confirm_roles_for(owner_kind: &str, kind: &str) -> &'static [Role] {
+    if is_cnc_pair_kind(kind) {
+        CNC_PAIR_ROLES
+    } else {
+        write_roles_for(owner_kind, WriteEntry::Confirm)
+    }
+}
+
+/// CNC 配对两种文件（G_CODE / SETUP_SHEET）的写入角色集合：**Manager + CNC 程序员**。
+///
+/// 逐字沿用被删的 `files::part_file::cnc` 子模块的口径（M + CNC，**不含 Clerk**）。
+pub const CNC_PAIR_ROLES: &[Role] = &[Role::Manager, Role::CncProgrammer];
+
 /// `GET /objects/{id}/content` 与 `GET /objects/{id}/url` 的 **kind 白名单**
 /// （2026-10-16 新增于 handler，2026-10-16 review 第 1 轮 MAJOR-2 提到本文件）。
 ///
@@ -251,6 +305,9 @@ pub fn file_type_for_ext(ext: &str) -> Option<&'static str> {
         "obj" => Some("OBJ"),
         "3mf" => Some("3MF"),
         "xlsx" => Some("XLSX"),
+        // 2026-10-15：G_CODE 的五种扩展名 → `file_type='G_CODE'`（与
+        // `t_part_file.kind='G_CODE'` 同名，被删的 cnc 配对实现也是这么写的）。
+        "tap" | "nc" | "gcode" | "mpf" | "cnc" => Some("G_CODE"),
         _ => None,
     }
 }
@@ -298,6 +355,18 @@ pub fn expected_content_types_for_ext(ext: &str) -> &'static [&'static str] {
         ],
         // ⚠️ 只收精确值，**不给** `application/octet-stream` 兜底（同 pdf 一节的理由）。
         "xlsx" => &["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"],
+        // 2026-10-15：G_CODE 五种扩展名。这些类型浏览器基本不认识，Element Plus
+        // 的 `:accept` / 拖拽上传**多发** `application/octet-stream`，故本组**给**
+        // 兜底（与 step / stl 那几支同款取舍）；`text/plain` 是次常见的形态
+        // （部分上传控件把纯文本类都发成它）。刻意**不给** `application/pdf` 等
+        // 具体类型 —— 那是「这文件自称是什么」的字段，不是「这类文件允许是什么」的白名单。
+        "tap" | "nc" | "gcode" | "mpf" | "cnc" => &[
+            "application/octet-stream",
+            "text/plain",
+            "text/x-nc",
+            "text/x-tap",
+            "text/x-gcode",
+        ],
         _ => &[],
     }
 }
@@ -380,14 +449,61 @@ mod tests {
     }
 
     #[test]
-    fn owner_kind_allows_kind_rejects_cnc_kinds_and_unknowns() {
-        // CAD_2D / G_CODE / SETUP_SHEET 只经 `POST /files/cnc/pairs` 写入，
-        // 两条写路径都不该收它们
-        for k in ["CAD_2D", "G_CODE", "SETUP_SHEET"] {
-            assert!(!owner_kind_allows_kind("PART", k), "PART 不该收 {k}");
-        }
+    fn owner_kind_allows_kind_allows_cnc_pair_kinds_and_rejects_the_rest() {
+        // 2026-10-15：G_CODE / SETUP_SHEET 随「CNC 配对走 confirm 的
+        // `pair_with_file_id`」放行到 PART —— 它们是配对的两种 kind。
+        assert!(owner_kind_allows_kind("PART", "G_CODE"));
+        assert!(owner_kind_allows_kind("PART", "SETUP_SHEET"));
+        // CAD_2D 不在其中：没有 kind 能配对它，也没有 kind 的扩展名白名单收它
+        assert!(!owner_kind_allows_kind("PART", "CAD_2D"));
+        // ⚠️ 配对两种 kind **不挂**到 ASSEMBLY / CUSTOMER
+        assert!(!owner_kind_allows_kind("ASSEMBLY", "G_CODE"));
+        assert!(!owner_kind_allows_kind("CUSTOMER", "G_CODE"));
         assert!(!owner_kind_allows_kind("PART", "UNKNOWN"));
         assert!(!owner_kind_allows_kind("PART_FILE", "DRAWING"));
+    }
+
+    /// 2026-10-15：`confirm_roles_for` 的 kind 分派 —— 配对两种 kind 是 M+CNC，
+    /// 其余逐字沿用 `write_roles_for(Confirm)`（M+C；CUSTOMER ⇒ 仅 Manager）。
+    #[test]
+    fn confirm_roles_for_dispatches_by_kind() {
+        assert_eq!(confirm_roles_for("PART", "G_CODE"), CNC_PAIR_ROLES);
+        assert_eq!(confirm_roles_for("PART", "SETUP_SHEET"), CNC_PAIR_ROLES);
+        assert!(CNC_PAIR_ROLES.contains(&Role::CncProgrammer));
+        assert!(!CNC_PAIR_ROLES.contains(&Role::Clerk));
+        assert_eq!(confirm_roles_for("PART", "DRAWING"), CONFIRM_ROLES);
+        assert_eq!(
+            confirm_roles_for("CUSTOMER", "DELIVERY_TEMPLATE"),
+            CUSTOMER_WRITE_ROLES
+        );
+    }
+
+    /// 2026-10-15：`cnc_pair_counterpart` 互指判据 + `is_cnc_pair_kind` 白名单方向。
+    #[test]
+    fn cnc_pair_counterpart_is_symmetric() {
+        assert!(is_cnc_pair_kind("G_CODE"));
+        assert!(is_cnc_pair_kind("SETUP_SHEET"));
+        assert!(!is_cnc_pair_kind("DRAWING"));
+        assert_eq!(cnc_pair_counterpart("G_CODE"), Some("SETUP_SHEET"));
+        assert_eq!(cnc_pair_counterpart("SETUP_SHEET"), Some("G_CODE"));
+        assert_eq!(cnc_pair_counterpart("DRAWING"), None);
+    }
+
+    /// 2026-10-15：G_CODE 的五种扩展名进白名单 + `file_type` 一律 `G_CODE`。
+    #[test]
+    fn allowed_exts_and_file_type_cover_cnc_pair_kinds() {
+        assert_eq!(
+            allowed_exts("G_CODE"),
+            &["tap", "nc", "gcode", "mpf", "cnc"]
+        );
+        assert_eq!(allowed_exts("SETUP_SHEET"), &["pdf"]);
+        for ext in ["tap", "nc", "gcode", "mpf", "cnc"] {
+            assert_eq!(file_type_for_ext(ext), Some("G_CODE"), "{ext} 的 file_type");
+            assert!(
+                expected_content_types_for_ext(ext).contains(&"application/octet-stream"),
+                "{ext} 应当收 octet-stream（浏览器对未知类型一律发它）"
+            );
+        }
     }
 
     /// 2026-10-16：`CUSTOMER` 只挂 `DELIVERY_TEMPLATE`，且**反向一律拒**。

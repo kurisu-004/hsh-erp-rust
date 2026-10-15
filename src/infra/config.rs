@@ -104,7 +104,7 @@ pub struct AppConfig {
     /// 启用后必须立刻登录 admin/changeme、改密、设回 `false`、重启；详见
     /// `src/infra/seed.rs` 模块 doc + `seeds/README.md`。
     pub bootstrap_admin_enabled: bool,
-    /// 2026-09-28 新增：rust → python 后端转发配置（薄壳鉴权转发到 python STS 端点）。
+    /// rust → python 后端转发配置（薄壳鉴权转发到 python 打印 / CI 预览端点）。
     /// 环境变量 `PYTHON_BACKEND_BASE_URL`（设了就 enabled=true）/ `PYTHON_STS_TIMEOUT_MS`。
     pub python_backend: PythonBackendConfig,
     /// 2026-09-29 新增：企业微信小程序登录配置（自建应用 `jscode2session`）。
@@ -281,13 +281,6 @@ pub struct CosConfig {
     /// 桶的 URL 挂太久。与 [`Self::presign_expire_seconds`]（读侧下载直链）分属两
     /// 条链路、各自独立配置。
     pub upload_url_expire_seconds: u32,
-    /// COS 临时对象 prefix 模板前缀（默认 `tmp/`，含尾斜杠）。
-    ///
-    /// ⚠️ **2026-10-15 起进入下线流程**：统一上传链路不再有 tmp 区，
-    /// `POST /files/objects/confirm` 的防呆改为「服务端按 sha+filename 重新派生
-    /// CAS key 比对」，`POST /parts/batch` 的 bindings 分支整条删除。随那两处改完
-    /// 本字段（与 `COS_TMP_PREFIX` env）一并删除。
-    pub tmp_prefix: String,
     /// COS 桶内 **CI 预览图** 前缀（env `COS_PREVIEW_PREFIX`，代码缺省 `previews`）。
     ///
     /// 2026-10-13 PR2 新增。只被 `files::part_file::preview` 的 URL 拼接读一次
@@ -369,20 +362,19 @@ const PRINT_REQUEST_TIMEOUT_SECONDS_DEFAULT: u64 = 660;
 /// 2026-09-28 新增：rust → python 后端转发配置（薄壳鉴权转发专用）。
 ///
 /// ## 触发场景
-/// `POST /api/v2/files/sts-tmp-keys` 强制 JWT 鉴权后，透明转发到 python 后端
-/// `POST /api/v1/files/sts-tmp-keys`（python 端**继续裸开** by design +
-/// 部署层隔离）；rust 端是新的强制鉴权点。
+/// 零件图纸打印 / CI 预览端点强制 JWT 鉴权后，透明转发到 python 后端对应端点
+/// （python 端**继续裸开** by design + 部署层隔离）；rust 端是强制鉴权点。
 ///
 /// ## env
 /// - `PYTHON_BACKEND_BASE_URL`：python 后端 base URL（如 `http://backend:8000`）；
 ///   设置即 `enabled=true`，未设置走 `NoopPyBackend`（本地 `cargo run` 不依赖 python）。
 /// - `PYTHON_STS_TIMEOUT_MS`：单次转发请求超时，缺省 `10_000`（10s）。
 /// - `PYTHON_PRINT_TIMEOUT_MS`（2026-10-03 新增）：打印转发专用超时，缺省 `600_000`
-///   （10 分钟）——打印在 Python 端执行，不能与 STS 的 10s 通道同档。
+///   （10 分钟）——打印在 Python 端执行，不能与默认的 10s 通道同档。
 ///
-/// ## 与原 `infra::python_sts::PythonStsConfig` 的区别
-/// 原 STS 配置随 `upload_session` 域下线已删除；本配置是新的「rust 鉴权后
-/// 转发到 python」场景，含义更窄、timeout 也对齐 `HttpPyBackend::timeout`。
+/// ## env 名说明
+/// 默认档的 env 名保留历史的 `PYTHON_STS_TIMEOUT_MS`（改它要同步改 3 个 compose
+/// 文件），语义已是「除打印外的所有转发共用档」。
 #[derive(Clone, Debug)]
 pub struct PythonBackendConfig {
     /// python 后端 base URL（如 `http://backend:8000`）。空字符串或未设 → 走 `NoopPyBackend`。
@@ -391,7 +383,7 @@ pub struct PythonBackendConfig {
     pub timeout_ms: u64,
     /// 2026-10-03 新增：**打印**转发专用超时（毫秒），缺省 `600_000`（10 分钟）。
     /// 打印请求由 Python 端真正执行（批量图纸打印 20 件/批，合法耗时数分钟），
-    /// 不能与 STS 那条 10s 通道共用同一档；且换算成秒后必须严格小于
+    /// 不能与默认那条 10s 通道共用同一档；且换算成秒后必须严格小于
     /// [`AppConfig::print_request_timeout_seconds`]（600s < 660s），否则先到点的是
     /// Rust，Python 的真实错误被 408 掩盖。
     /// 环境变量 `PYTHON_PRINT_TIMEOUT_MS`。
@@ -824,9 +816,6 @@ impl AppConfig {
                     max_file_size: env_parse("COS_MAX_FILE_SIZE", 300 * 1024 * 1024)?,
                     // 2026-10-15 新增：写侧预签 PUT URL 有效期（前端直传上传用）。
                     upload_url_expire_seconds: env_parse("COS_UPLOAD_URL_EXPIRE", 900u32)?,
-                    // 2026-10-15：进入下线流程（见字段 doc），随 confirm / batch
-                    // 改造一并删除。
-                    tmp_prefix: env_or("COS_TMP_PREFIX", "tmp/"),
                     // 2026-10-13 PR2：`files::part_file::preview` 的 URL 拼接两件套
                     preview_prefix: env_or("COS_PREVIEW_PREFIX", "previews"),
                     preview_base_url,
@@ -887,7 +876,7 @@ impl AppConfig {
             idempotency_ttl_seconds: env_parse("IDEMPOTENCY_TTL_SECONDS", 86_400u64)?,
             // 2026-09-26 新增：可选初始管理员账号种子开关（生产默认关闭）。
             bootstrap_admin_enabled: env_bool("BOOTSTRAP_ADMIN_ENABLED", false)?,
-            // 2026-09-28 新增：rust → python 后端转发配置（薄壳鉴权转发到 python STS）。
+            // rust → python 后端转发配置（薄壳鉴权转发到 python 打印 / CI 预览端点）。
             // env 沿用既有命名（3 个 compose 文件已带 `PYTHON_BACKEND_BASE_URL=${...:-http://backend:8000}`），
             // 不重命名。设置 `PYTHON_BACKEND_BASE_URL` 即 `enabled=true`，未设 → Noop。
             python_backend: {
@@ -896,8 +885,10 @@ impl AppConfig {
                     !base_url.trim().is_empty() && std::env::var("PYTHON_BACKEND_BASE_URL").is_ok();
                 PythonBackendConfig {
                     base_url,
+                    // env 名保留历史的 `PYTHON_STS_TIMEOUT_MS`（改它要同步改 compose）；
+                    // 它现在是「默认档」超时，CI 预览的提交 / 查询都走这一档。
                     timeout_ms: env_parse("PYTHON_STS_TIMEOUT_MS", 10_000u64)?,
-                    // 2026-10-03 新增：打印转发走独立长档（10 分钟），与 STS 的 10s 通道
+                    // 2026-10-03 新增：打印转发走独立长档（10 分钟），与默认的 10s 通道
                     // 分开；见 `PythonBackendConfig::print_timeout_ms` 的 doc。
                     print_timeout_ms: env_parse(
                         "PYTHON_PRINT_TIMEOUT_MS",
@@ -1425,7 +1416,7 @@ mod tests {
     fn python_print_timeout_default_is_ten_minutes() {
         assert_eq!(PYTHON_PRINT_TIMEOUT_MS_DEFAULT, 600_000);
         assert_eq!(PythonBackendConfig::default().print_timeout_ms, 600_000);
-        // 打印档与 STS 档是两个独立档位，别被合并成一个
+        // 打印档与默认档是两个独立档位，别被合并成一个
         assert!(PythonBackendConfig::default().timeout_ms < PYTHON_PRINT_TIMEOUT_MS_DEFAULT);
     }
 

@@ -13,9 +13,10 @@
 //! - `ws_hub`：WebSocket 广播中枢
 //! - `redis`：Redis 连接池构建（deadpool-redis 0.23，session store 用）
 //!
-//! 2026-09-28 删除 STS 转发相关模块（转发器与 sts NoopSts 占位）：
-//! 相关上传会话域已下线，前端改为单 uploader 触发时单 HTTP 调用 python `sts-tmp-keys`
-//! 数组入参直签，rust 后端不再代为转发 STS 凭证。
+//! 2026-10-15：`py_backend` 的 STS 转发方法（`forward_sts_tmp_keys`）随
+//! `POST /api/v2/files/sts-tmp-keys` 端点一并删除 —— 预签 PUT 由
+//! `POST /files/objects/upload-intents` 在本仓内直接签发（OpenDAL SigV4），
+//! 不再向 python 取临时凭证。该模块剩余的出口是零件图纸打印与 CI 预览转发。
 
 pub mod clock;
 pub mod config;

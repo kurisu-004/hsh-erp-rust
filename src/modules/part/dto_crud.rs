@@ -61,14 +61,6 @@ pub struct PartCreateRequest {
 /// `POST /parts/batch` 单 item 入参：与 `PartCreateRequest` 字段集对齐，
 /// 但 `customer_id` 提到 batch 级别（共享）。
 ///
-/// 2026-09-16 M2-B 新增可选字段：
-/// - `drawing_file`：上传图纸 PDF（kind=DRAWING）绑定
-/// - `model3d_file`：上传 3D 模型（kind=3D_MODEL）绑定
-///
-/// 两个字段都形如 [`FileBindingIn`]，由前端从 `POST /part-files/upload-intents`
-/// 拿到 `tmp_key` 后填回。`batch_create_parts` service 会先并发 head/copy 所有
-/// binding 项，**任一失败** → 整体回滚（让用户重试整批）。
-///
 /// 2026-10-05 新增 `unit_price` / `total_price`：PDF 批量上传的解析结果里有单价，
 /// 但本 item DTO 不收、`NewPartCreate` 也不带，金额在整条链上被丢弃。与
 /// [`PartCreateRequest`] 同约束：**JSON 里必须是字符串**（`"95.00"`），裸数字 95
@@ -97,37 +89,6 @@ pub struct PartBatchCreateItem {
     /// 2026-10-05 新增：总价（JSON 字符串，如 `"950.00"`；缺省 = 0）
     #[serde(default)]
     pub total_price: Option<Decimal>,
-    /// 2026-09-16 M2-B 新增：上传图纸 PDF 绑定（kind=DRAWING，file_type=PDF）
-    #[serde(default)]
-    pub drawing_file: Option<FileBindingIn>,
-    /// 2026-09-16 M2-B 新增：上传 3D 模型绑定（kind=3D_MODEL，file_type 由扩展名推导）
-    #[serde(default)]
-    pub model3d_file: Option<FileBindingIn>,
-}
-
-/// `POST /parts/batch` 单个文件绑定子结构（drawing_file / model3d_file）。
-///
-/// 由前端在拿到 `POST /part-files/upload-intents` 返回的 `tmp_key` 后填回。
-/// `content_sha256` 必须与 upload-intents 提交时一致（CAS 命中场景下
-/// upload-intents 返回 `dedup_hit=true`，前端跳过上传，把 `existing_file` 拼
-/// 回 PartFileOut，本字段为 None——即 `binding` 也为 None）。
-///
-/// 2026-09-16 M2-B 新增；2026-09-29 扁平化新增 `ext` 字段（client 声明）。
-/// CAS key 模板五段→两段后，ext 需作为 file_type 推导源随 binding 上行，
-/// 避免 service 端 `policy::ext_of` 在中文 / 多段扩展（.tar.gz）边界上与
-/// client 不一致。`ext` 缺省为空（None），由 service 走兼容回退
-/// `policy::ext_of(original_filename)`。
-#[derive(Debug, Clone, Deserialize)]
-pub struct FileBindingIn {
-    pub tmp_key: String,
-    pub content_sha256: String,
-    pub original_filename: String,
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub file_size: i64,
-    pub content_type: String,
-    /// 2026-09-29 新增：扩展名（小写、不含点）。缺省 None（service 端兼容回退）。
-    #[serde(default)]
-    pub ext: Option<String>,
 }
 
 /// `POST /parts/batch` 入参：批量创建（共享 customer_id）。

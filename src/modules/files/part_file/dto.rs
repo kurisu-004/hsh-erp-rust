@@ -41,6 +41,43 @@ pub struct UploadFileData {
     pub kind: String, // DRAWING / 3D_MODEL / ASSEMBLY_MASTER / CAD_2D / …
 }
 
+// ===== 2026-10-15 上传链路统一：upload-intents（签发预签 PUT URL） =====
+//
+// 全仓唯一的收文件链路：业务提交成功 → `POST /files/objects/upload-intents` 拿
+// 预签 PUT URL → 前端 XHR 直传 COS → `POST /files/objects/confirm` 登记。
+
+/// `POST /api/v2/files/objects/upload-intents` 入参（**批量**，1..=200 项）。
+///
+/// `owner_kind` / `owner_id` 一次声明、本组 `items` 共用 —— 前端一次选中多个文件
+/// 只发一个请求，不必逐文件往返。
+#[derive(Debug, Clone, Deserialize)]
+pub struct UploadIntentsIn {
+    /// `PART` / `ASSEMBLY` / `CUSTOMER`
+    pub owner_kind: String,
+    /// 雪花 id 的**字符串**形式（`shared::types` 的 serde helper 约定，防 JS 精度截断）。
+    pub owner_id: String,
+    pub items: Vec<UploadIntentItemIn>,
+}
+
+/// 单个待签发项：描述「这个文件是什么」，不含字节。
+///
+/// ⚠️ `content_sha256` 由**前端**算（上传前），服务端只拿它派生 CAS key —— 见
+/// `POST /files/objects/confirm` 的模块 doc 里的信任取舍（预签 PUT 用
+/// UNSIGNED-PAYLOAD，服务端无法把 sha 绑进签名）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct UploadIntentItemIn {
+    /// 前端生成的 UUID，原样回显，用来把响应项对齐回本地文件列表。
+    pub client_ref: String,
+    /// `DRAWING` / `3D_MODEL` / `ASSEMBLY_MASTER` / `DELIVERY_TEMPLATE` …
+    pub kind: String,
+    pub original_filename: String,
+    pub content_type: String,
+    #[serde(deserialize_with = "deserialize_i64")]
+    pub file_size: i64,
+    /// 64 位小写 hex
+    pub content_sha256: String,
+}
+
 // ===== 2026-09-16 M2-B 业务层：ConfirmFileIn（保留） =====
 //
 // 2026-09-18 注：原 `UploadIntentsIn` / `UploadIntentsOut` / `UploadIntentItemIn` /
@@ -60,7 +97,7 @@ pub struct UploadFileData {
 /// confirm 上行，便于 service 校验 file_type 与 ext 一致）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConfirmFileIn {
-    /// 2026-10-13 PR1b 新增：owner 类别（`PART` / `ASSEMBLY`）。
+    /// 2026-10-13 PR1b 新增：owner 类别（`PART` / `ASSEMBLY` / `CUSTOMER`）。
     ///
     /// ⚠️ 旧端点 `POST /api/v2/parts/{part_id}/files/confirm` 的 owner 是 path 段
     /// 隐含的（恒 PART），搬家到 `POST /api/v2/files/objects/confirm` 后 path 段消失，
@@ -70,7 +107,12 @@ pub struct ConfirmFileIn {
     /// 2026-10-13 PR1b 新增：owner 雪花 id 字符串（同上，替代旧 path 段的 `part_id`）。
     pub owner_id: String,
     pub kind: String,
-    pub tmp_key: String,
+    /// 2026-10-15 **硬切**：原 `tmp_key` 字段改名并改语义 ——
+    /// 值必须是 `POST /files/objects/upload-intents` 响应里回的那个**正式 CAS key**，
+    /// 服务端会用 `content_sha256` + `original_filename` 重新派生一遍并比对，
+    /// 不一致即 21114（防前端拿任意 object_key 登记）。**无兼容层**：旧字段名不再被
+    /// 接受，serde 反序列化阶段即失败。
+    pub object_key: String,
     pub content_sha256: String,
     pub original_filename: String,
     #[serde(deserialize_with = "deserialize_i64")]
@@ -81,6 +123,11 @@ pub struct ConfirmFileIn {
     /// 边界（`.tar.gz`）上与 client 不一致。
     #[serde(default)]
     pub ext: Option<String>,
+    /// 2026-10-15 新增：CNC 配对目标（另一条已登记的 `t_part_file` 行 id，字符串
+    /// 形式的雪花 id）。给了就把本行与那一行**双向**互写 `paired_file_id`
+    /// （G_CODE ↔ SETUP_SHEET）；不给则不配对。
+    #[serde(default)]
+    pub pair_with_file_id: Option<String>,
 }
 
 // ---------- 入参 ----------
@@ -322,13 +369,34 @@ mod tests {
             owner_kind: "PART".into(), // 2026-10-13 PR1b 新增字段
             owner_id: "1001".into(),   // 2026-10-13 PR1b 新增字段
             kind: "3D_MODEL".into(),
-            tmp_key: "tmp/batch/seq_step.stp".into(),
+            object_key: "obj/bbbbbbbbbbbbbbbb_model.step".into(),
             content_sha256: "b".repeat(64),
             original_filename: "model.step".into(),
             file_size: 2048,
             content_type: "application/step".into(),
-            ext: None, // 2026-09-29 新增字段（unit test 兼容回退 None）
+            ext: None,               // 2026-09-29 新增字段（unit test 兼容回退 None）
+            pair_with_file_id: None, // 2026-10-15 新增（CNC 配对，可选）
         };
         assert!(validate::check_confirm_file_in(&req, max_file_size()).is_ok());
+    }
+
+    /// 2026-10-15 硬切：旧的 `tmp_key` 字段名**不再被接受**（无兼容层），
+    /// 缺 `object_key` 直接反序列化失败（⇒ axum Json 提取器 422）。
+    #[test]
+    fn confirm_file_in_rejects_legacy_tmp_key_name() {
+        let raw = r#"{
+            "owner_kind": "PART",
+            "owner_id": "1001",
+            "kind": "3D_MODEL",
+            "tmp_key": "tmp/x.stp",
+            "content_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "original_filename": "model.step",
+            "file_size": 2048,
+            "content_type": "application/step"
+        }"#;
+        assert!(
+            serde_json::from_str::<ConfirmFileIn>(raw).is_err(),
+            "旧 `tmp_key` 字段名必须被拒（硬切，无兼容层）"
+        );
     }
 }

@@ -8,4 +8,6 @@
 
 pub mod part_file;
 
-pub use part_file::{PartFileListOut, PartFileOut, PartFileWithUrlOut};
+pub use part_file::{
+    PartFileListOut, PartFileOut, PartFileWithUrlOut, UploadIntentItemOut, UploadIntentsOut,
+};

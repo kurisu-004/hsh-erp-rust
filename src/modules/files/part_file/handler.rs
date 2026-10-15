@@ -106,7 +106,7 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Multipart, Path, Query, State},
+    extract::{Path, Query, State},
     http::{StatusCode, header},
     response::Response,
     routing::{get, post},
@@ -114,173 +114,71 @@ use axum::{
 
 use crate::auth::rbac::CurrentUser;
 use crate::modules::files::part_file::dto::{
-    ConfirmFileIn, DeletePartFileRequest, PartFileListQuery, UploadFileData,
+    ConfirmFileIn, DeletePartFileRequest, PartFileListQuery, UploadIntentsIn,
 };
 use crate::modules::files::part_file::policy;
 use crate::modules::files::part_file::preview::dto::{PreviewOut, PreviewQuery, PreviewSize};
-use crate::modules::files::part_file::service::PartFileService;
-use crate::modules::files::part_file::vo::{PartFileListOut, PartFileOut, PartFileWithUrlOut};
+use crate::modules::files::part_file::vo::{
+    PartFileListOut, PartFileOut, PartFileWithUrlOut, UploadIntentsOut,
+};
 use crate::shared::error::{AppError, code};
 use crate::shared::response::R;
 use crate::state::AppState;
 
-/// `POST /api/v2/files/objects` → 201 Created（四合一上传）
+/// `POST /api/v2/files/objects/upload-intents` → 200 OK（签发预签 PUT URL）
 ///
-/// body（multipart）：
-/// - `data`：必填文本字段，`UploadFileData` 的 JSON —— `{"owner_kind":"PART",
-///   "owner_id":"<雪花id字符串>","kind":"DRAWING"}`
-/// - `file`：必填二进制字段（PDF / STEP / STL …）
+/// 2026-10-15 新增，统一上传链路的第 ② 步：业务提交成功后拿 URL，前端 XHR PUT
+/// 直传 COS（字节不过 rust 进程），再走 `POST /objects/confirm` 登记。
 ///
-/// ⚠️ multipart 契约逐字沿用 PR1a 下线的 `POST /api/v2/part-files/`，不是新设计。
-/// 2026-10-13 PR1b 起它同时承接 part 侧两条（`upload-drawing` / `upload-3d-model`）
-/// 与 assembly 侧一条（`POST /assemblies/{id}/files`）的上传，三者只差 `data` 里
-/// 的 `owner_kind` / `owner_id` / `kind`。
+/// 权限：service 内 `grant_upload_intents` 的 `policy::write_roles_for(owner_kind,
+/// WriteEntry::Upload)` —— 与 multipart 上传**逐字同口径**（PART/ASSEMBLY 是
+/// M+C+CNC；CUSTOMER 送货单打印模板仅 Manager）。
 ///
-/// 权限：`PartFileService::upload_file_for_owner` 的 3 角色
-/// （Manager / Clerk / CncProgrammer）—— 与三条旧端点**合并后取并集**：
-/// 旧 `upload-drawing` / `upload-3d-model` 是 M+C（`CRUD_PART_ROLES`）、旧
-/// `assemblies/{id}/files` 是 M+C、旧 multipart 端点是 M+C+CNC，故白名单含 CNC。
-///
-/// ⚠️ **`owner_kind='CUSTOMER'`（送货单打印模板）是两条额外闸门，不在「3 角色」里**
-/// （2026-10-16 review 第 1 / 2 轮）：角色收窄成**仅 Manager**
-/// （`policy::write_roles_for`）+ `owner_id` 必须是**一级客户**
-/// （`parent_id IS NULL`，review 第 2 轮 MAJOR-A 把该谓词下沉进
-/// `repo::customer_owner_exists`）。两条闸门都排在读 multipart 之后的
-/// service 入口、且**早于任何 COS / DB 副作用** ⇒ 未授权 / 不合格的请求零副作用。
-///
-/// ⚠️ **权限面到底放大了什么**（2026-10-13 review 第 1 轮存疑点 4 订正，别再笼统
-/// 写成「CNC 现在也能传图纸 / 3D 模型」——那句话不准确）：
-/// - **DRAWING / 3D_MODEL：没有放大**。CNC 在 PR1b 之前就已经能传这两类（旧
-///   `POST /part-files/` 的白名单本就是 M+C+CNC，且 `policy::allowed_exts` 当时
-///   已经认这两个 kind）。变的只是**入口 URL**（原来要打 M+C 的
-///   `upload-drawing` / `upload-3d-model`，现在打合并后的同一个端点），能力没变。
-/// - **ASSEMBLY_MASTER：这是唯一真实新增的能力面**。该 kind 的扩展名白名单
-///   （`&["pdf"]`）是本轮为让装配件 PDF 走本端点而加的，加了之后 CNC 也就跟着能
-///   写装配件整图了 —— 旧 `POST /assemblies/{id}/files` 是 M+C-only。
-///
-/// ⚠️ **不收紧**：按 kind 派生角色会让「一个端点一种 kind」的白名单重新分裂，
-/// 与本轮合并的目的相反。要限制「谁能传装配件 PDF」应另开按 kind 的授权规则，
-/// 不该在这次合并里顺手做。
-///
-/// 权限守卫在读 multipart **之前**（避免未授权请求触发整包内存分配），与 part 域
-/// 旧 handler 的 Finding B 纪律一致；service 内再校验一次（双层守卫）。
-///
-/// ## 错误码（按校验顺序，先命中先返回）
-///
-/// | 码 | 条件 | 位置 |
-/// |---|---|---|
-/// | 40300 | 角色不在 M / C / CNC 内 | handler（读 multipart 前）+ service 双层 |
-/// | 20104 | `data` / `file` / filename 缺失、`data` JSON 解析失败、`owner_id` 非数字、`owner_kind` × `kind` 组合非法 | handler（前三项）+ service（末项） |
-/// | 21105 | owner 不存在：`owner_kind ∈ {PART, ASSEMBLY}` 时 id 查不到；`owner_kind='CUSTOMER'` 时 id 查不到 / 已软删 / **不是一级客户**（`parent_id IS NULL`，2026-10-16 review 第 2 轮 MAJOR-A 补的谓词） | service `assert_owner_exists` |
-/// | 40001 | **0 字节文件** | service（2026-10-13 review 第 1 轮 MAJOR-1 补回，被删的 `upload_part_file` 有这道） |
-/// | 21103 | **超过 `config.cos.max_file_size`**（`COS_MAX_FILE_SIZE`，`.env.example` = 100MB） | service（同上补回；HTTP 400 —— `status_from_code` 对 2xxxx 的兜底） |
-/// | 21102 | 无扩展名 / 扩展名不在 `policy::allowed_exts(kind)` / content_type 与扩展名不匹配 | service |
-/// | 21108 | 撞 `uk_t_part_file_single`（同 owner + kind 已有活跃行且内容不同） | service |
-///
-/// ⚠️ HTTP 状态码：成功是 **201 Created**；2xxxx 业务码一律映射成 **400**（信封内
-/// 带真实业务码），40001 是 422。空字节走 40001（422）而不是 21103（400）—— 与被删
-/// 实现的取舍一致：空文件是「无效输入」，不是「太大」。
-pub async fn upload_part_file(
+/// 事务边界：handler `pool.begin()` → service（纯读 + 一次签名）→ `tx.commit()`。
+/// 与 `confirm_file_object`（service 自管 tx）相反：本端点不碰外部 IO 的事务持有，
+/// 只是沿用本文件「handler 管 tx」的统一范式。
+pub async fn grant_upload_intents(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
-    mut multipart: Multipart,
-) -> Result<(StatusCode, Json<R<PartFileOut>>), AppError> {
-    current.require_any_role(&[
-        crate::auth::rbac::Role::Manager,
-        crate::auth::rbac::Role::Clerk,
-        crate::auth::rbac::Role::CncProgrammer,
-    ])?;
-    let mut data_json: Option<String> = None;
-    let mut file_bytes: Option<Vec<u8>> = None;
-    let mut file_name: Option<String> = None;
-    let mut file_content_type: Option<String> = None;
-
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| AppError::validation(format!("multipart 解析失败: {e}")))?
-    {
-        match field.name().unwrap_or("") {
-            "data" => {
-                data_json = Some(
-                    field
-                        .text()
-                        .await
-                        .map_err(|e| AppError::validation(format!("data 字段读取失败: {e}")))?,
-                );
-            }
-            "file" => {
-                file_name = field.file_name().map(|s| s.to_string());
-                file_content_type = field.content_type().map(|s| s.to_string());
-                let bytes = field
-                    .bytes()
-                    .await
-                    .map_err(|e| AppError::validation(format!("file 字段读取失败: {e}")))?;
-                file_bytes = Some(bytes.to_vec());
-            }
-            _ => {
-                let _ = field.bytes().await;
-            }
-        }
-    }
-
-    let data_json =
-        data_json.ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "缺少 data 字段"))?;
-    let data: UploadFileData = serde_json::from_str(&data_json)
-        .map_err(|e| AppError::biz(code::BIZ_INVALID_VALUE, format!("JSON 解析失败: {e}")))?;
-    // ⚠️ 雪花 id 一律是字符串（`shared::types` 的 serde helper 约定，防 JS 精度截断）
-    let owner_id: i64 = data.owner_id.parse().map_err(|_| {
+    Json(req): Json<UploadIntentsIn>,
+) -> Result<Json<R<UploadIntentsOut>>, AppError> {
+    let owner_id: i64 = req.owner_id.parse().map_err(|_| {
         AppError::biz(
             code::BIZ_INVALID_VALUE,
-            format!("owner_id 非法: {}", data.owner_id),
+            format!("owner_id 非法: {}", req.owner_id),
         )
     })?;
-    let bytes =
-        file_bytes.ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "缺少 file 字段"))?;
-    let filename = file_name.ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "缺少文件名"))?;
-    let content_type = file_content_type.unwrap_or_else(|| "application/octet-stream".to_string());
-
     let mut tx = state.pool.begin().await?;
     let out = state
         .part_file_service
-        .upload_file_for_owner(
+        .grant_upload_intents(
             &mut *tx,
             &state.config.cos.upload_prefix,
-            // 2026-10-13 review 第 1 轮 MAJOR-1：size 上限由配置下发（.env 的
-            // `COS_MAX_FILE_SIZE`，`.env.example` = 100MB），不再由全局 body limit
-            // （`MAX_REQUEST_BODY_SIZE`，300MB）隐式兜底。
             state.config.cos.max_file_size,
-            &data.owner_kind,
+            state.config.cos.upload_url_expire_seconds,
+            &req.owner_kind,
             owner_id,
-            &data.kind,
-            &filename,
-            &content_type,
-            bytes,
+            &req.items,
             &current,
         )
         .await?;
     tx.commit().await?;
-    Ok((StatusCode::CREATED, Json(R::ok(out))))
+    Ok(Json(R::ok(out)))
 }
 
-/// `POST /api/v2/files/objects/confirm` → 200 OK（STS 直传回执）
+/// `POST /api/v2/files/objects/confirm` → 200 OK（直传回执登记）
 ///
-/// 2026-10-13 PR1b 自 part 域 `POST /api/v2/parts/{part_id}/files/confirm` 搬来
-/// （**硬切、无 alias，旧路径 404**）。owner 由 path 段改为 body 的
-/// `owner_kind` + `owner_id`（`ConfirmFileIn`），与 `POST /files/objects` 的
-/// multipart `data` 字段对称。
+/// 统一上传链路的第 ④ 步：前端已拿 `POST /objects/upload-intents` 的 URL 把字节
+/// PUT 到 COS 正式 CAS key，本端点做「校验 → 软删旧活跃行 → INSERT」并可选地
+/// 完成 CNC 配对（`pair_with_file_id`）。**handler 不做任何后置异步清理** ——
+/// 没有 tmp 对象可清（对象从一开始就在正式 key 上）。
 ///
-/// 流程（service `bind_uploaded_file`）：head 校验 tmp 对象 + size → copy 到 CAS key
-/// → tx 内 soft_delete 旧活跃行 + INSERT → commit → **handler 在 commit 之后**
-/// spawn 异步 `delete_object(tmp_key)` 兜底清理（与 `soft_delete_part_file` 同款
-/// 「commit 在前、spawn 在后」纪律）。
+/// 权限：service 内 `bind_uploaded_file` 的 `policy::confirm_roles_for(owner_kind,
+/// kind)` —— CNC 配对两种 kind（G_CODE / SETUP_SHEET）是 M+CNC，其余逐字沿用
+/// `write_roles_for(Confirm)`（PART/ASSEMBLY 是 M+C；CUSTOMER 送货单打印模板
+/// **仅 Manager**，且本端点已不再拒 CUSTOMER —— 打印模板直传化走的就是它）。
 ///
-/// 权限：service 内 `bind_uploaded_file` 的 `require_any_role` —— **按 `owner_kind`
-/// 派生**（非 CUSTOMER 仍是 M+C、与旧端点逐字一致；`CUSTOMER` ⇒ 仅 Manager，
-/// 且随后直接 20104 拒收）。⚠️ 2026-10-16 review 第 1 轮 MAJOR-1：本端点原先恒
-/// 是 M+C、与 `owner_kind` 无关，于是新增的 CUSTOMER owner 能让 CLERK 经它造出 /
-/// 替换任意客户的送货单打印模板行。理由见 `service::bind_uploaded_file` 的步骤
-/// 0 / 1a 注释。
+/// ⚠️ 事务边界不变：service 自管 tx（`head_object` 是外部 IO，不进事务）。
 pub async fn confirm_file_object(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -292,37 +190,40 @@ pub async fn confirm_file_object(
             format!("owner_id 非法: {}", req.owner_id),
         )
     })?;
-    let (out, tmp_key) = PartFileService::bind_uploaded_file(
-        &state.pool,
-        &state.snowflake,
-        state.cos.clone(),
-        &state.config.cos.upload_prefix,
-        &state.config.cos.tmp_prefix,
-        // 2026-10-13 review 第 1 轮 MAJOR-1：原先 service 内写死 300MB，
-        // `COS_MAX_FILE_SIZE` 解析了从没被这条路径读过；改为配置下发。
-        state.config.cos.max_file_size,
-        &req.owner_kind,
-        owner_id,
-        &req.kind,
-        &req.tmp_key,
-        &req.content_sha256,
-        &req.original_filename,
-        req.file_size,
-        &req.content_type,
-        &current,
-    )
-    .await?;
-    // commit 已由 service 内 `tx.commit()` 完成；这里 spawn 异步清理 tmp
-    let cos = state.cos.clone();
-    tokio::spawn(async move {
-        if let Err(e) = cos.delete_object(&tmp_key).await {
-            tracing::warn!(
-                tmp_key = %tmp_key,
-                error = %e,
-                "confirm_file_object COS tmp 异步清理失败（已绑定到 part_file，不影响 API 返回）"
-            );
-        }
-    });
+    let pair_with_file_id: Option<i64> = req
+        .pair_with_file_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<i64>().map_err(|_| {
+                AppError::biz(
+                    code::BIZ_INVALID_VALUE,
+                    format!("pair_with_file_id 非法: {s}"),
+                )
+            })
+        })
+        .transpose()?;
+    let out = state
+        .part_file_service
+        .bind_uploaded_file(
+            &state.pool,
+            state.cos.clone(),
+            &state.config.cos.upload_prefix,
+            // 2026-10-13 review 第 1 轮 MAJOR-1：原先 service 内写死 300MB，
+            // `COS_MAX_FILE_SIZE` 解析了从没被这条路径读过；改为配置下发。
+            state.config.cos.max_file_size,
+            &req.owner_kind,
+            owner_id,
+            &req.kind,
+            &req.object_key,
+            &req.content_sha256,
+            &req.original_filename,
+            req.file_size,
+            &req.content_type,
+            pair_with_file_id,
+            &current,
+        )
+        .await?;
     Ok(Json(R::ok(out)))
 }
 
@@ -595,7 +496,7 @@ pub async fn get_part_file_preview(
 /// `.route(path, get(h).post(h))` 记 2 条。
 pub const ROUTES: &[&str] = &[
     "GET /",
-    "POST /",
+    "POST /upload-intents",
     "POST /confirm",
     "GET /{file_id}/url",
     "GET /{file_id}/content",
@@ -614,7 +515,8 @@ pub const ROUTES: &[&str] = &[
 /// 顺序无关（实测钉死见 `get_part_file_preview` 的 doc 与对应测试）。
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/", get(list_part_files).post(upload_part_file))
+        .route("/", get(list_part_files))
+        .route("/upload-intents", post(grant_upload_intents))
         .route("/confirm", post(confirm_file_object))
         .route("/{file_id}/url", get(get_part_file_url))
         .route("/{file_id}/content", get(get_part_file_content))
@@ -632,8 +534,8 @@ mod tests {
     /// 解析规则在 `crate::modules::files::route_guard`（本域三个 router 共用同一
     /// 份实现，2026-10-13 review 第 2 轮 N-4 抽出）。
     ///
-    /// ⚠️ 本表的计数口径：`"/"` 是 `get(h).post(h)`，故 `GET /` 与 `POST /`
-    /// **各记一条** ⇒ 7 条 `.route` 语句 = 7 条路由记录。
+    /// ⚠️ 本表的计数口径：`"/"` 只有 `get(h)`（2026-10-15 起 multipart 上传下线）
+    /// ⇒ **记 1 条**；本表 7 条 = 7 条 `.route` 语句。
     #[test]
     fn routes_declared_in_router() {
         let actual = routes_in_router_source(include_str!("handler.rs"), "router");

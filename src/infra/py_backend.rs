@@ -8,7 +8,6 @@
 //!
 //! | v2（rust 对外） | v1（python） | 业务错误码 |
 //! |---|---|---|
-//! | `POST /api/v2/files/sts-tmp-keys` | `POST /api/v1/files/sts-tmp-keys` | `BIZ_STS_FORWARD_FAILED` = 20406 |
 //! | `GET /api/v2/parts/{id}/print-drawing` | `GET /api/v1/parts/{id}/print` | `BIZ_PRINT_FORWARD_FAILED` = 20407 |
 //! | `POST /api/v2/parts/print-drawing-batch` | `POST /api/v1/parts/print-batch` | 同上 |
 //! | （无对外端点，由 `files::part_file::preview` 内部调用）<br>`forward_ci_submit` | `POST /api/v1/files/ci-preview-jobs` | `BIZ_PART_FILE_PREVIEW_FORWARD_FAILED` = 21118 |
@@ -44,7 +43,7 @@
 //! 合并仍在 python 侧）。
 //!
 //! ## 两档超时
-//! STS 档缺省 10s、打印档缺省 600s，相差 60 倍，client 级单一 timeout 表达不了：
+//! 默认档缺省 10s、打印档缺省 600s，相差 60 倍，client 级单一 timeout 表达不了：
 //! [`HttpPyBackend`] 存两档，打印方法用 `RequestBuilder::timeout` 逐请求覆盖
 //! client 默认值。打印档换算成秒后必须严格小于
 //! [`AppConfig::print_request_timeout_seconds`](crate::infra::config::AppConfig::print_request_timeout_seconds)，
@@ -52,7 +51,7 @@
 //!
 //! ## 错误码分家
 //! 两条链路各自独立命名（20406 / 20407）：前端与日志能直接看出是哪条链路挂了，
-//! 排查时不必先确认是 STS 还是打印。
+//! 排查时不必先确认是 CI 预览还是打印。
 //!
 //! 仿 `infra::cos.rs` 范式（trait + #[async_trait] + Send + Sync + Result<T, AppError>
 //! + Noop 占位 + mockall automock）。
@@ -88,19 +87,6 @@ use crate::shared::error::{AppError, code};
 #[automock]
 #[async_trait]
 pub trait PyBackendClient: Send + Sync {
-    /// 透传转发 STS 临时凭证签发请求到 python 后端 `POST /api/v1/files/sts-tmp-keys`。
-    ///
-    /// - `body`：前端发来的 JSON（handler 用 `Json<Value>` 提取，转发时序列化为
-    ///   字符串原样 POST 出去）。
-    /// - `headers`：原始请求 headers（鉴权头由 impl 过滤，不透传给 python）。
-    ///
-    /// 失败（网络层超时 / 连接拒 / 读 body 失败）→ 502 + `BIZ_STS_FORWARD_FAILED`。
-    async fn forward_sts_tmp_keys(
-        &self,
-        body: Value,
-        headers: HeaderMap,
-    ) -> Result<PyBackendResponse, AppError>;
-
     /// 2026-10-03 新增：单件零件图纸 PDF 转发
     /// → python `GET /api/v1/parts/{id}/print`（**与 v2 路径不同名**）。
     ///
@@ -144,7 +130,7 @@ pub trait PyBackendClient: Send + Sync {
     ///   `preview_urls` 中段**同一真源** ⇒ 写到哪里 / 从哪里取不可能分叉。
     /// - 路径里**绝不含文件名**：`preview_seed` 恒为纯哈希（见
     ///   `files::part_file::preview` 的安全条款）。
-    /// - `headers`：与 STS / 打印同款，鉴权头由 impl 过滤后注入
+    /// - `headers`：与打印转发同款，鉴权头由 impl 过滤后注入
     ///   `X-Forwarded-User-Id`（调用方 [`crate::modules::files::part_file::preview`]
     ///   的 handler 负责注入）。
     ///
@@ -204,11 +190,11 @@ pub struct PyBackendResponse {
 /// 响应经 [`filter_response_headers`] 清洗后透传。
 ///
 /// ## 两档超时
-/// - `timeout`：client 级默认值，走 STS 那条 10s 档（缺省
+/// - `timeout`：client 级默认值，走默认那档 10s 档（缺省
 ///   `PythonBackendConfig::timeout_ms` = 10s）。
 /// - `print_timeout`：打印 4 个方法逐请求覆盖用（缺省
 ///   `PythonBackendConfig::print_timeout_ms` = 600s）。批量图纸打印 20 件/批、
-///   前端并发 3 批，合法耗时数分钟，与 STS 的 10s 差 60 倍，client 级单一值
+///   前端并发 3 批，合法耗时数分钟，与默认的 10s 差 60 倍，client 级单一值
 ///   表达不了。
 ///
 /// ## 其余实现要点
@@ -252,7 +238,7 @@ impl HttpPyBackend {
     ///   `RequestBuilder::query()`——那会把 `&` / `=` 当作待转义的值再编码一次，
     ///   python 侧收到的是字面量而非参数。
     /// - `timeout`：逐请求覆盖 client 默认值（打印 4 方法传 `self.print_timeout`）。
-    /// - `err_code`：失败时用的业务错误码（STS 20406 / 打印 20407）。由调用方
+    /// - `err_code`：失败时用的业务错误码（CI 预览 21118 / 打印 20407）。由调用方
     ///   传而不是内部判路径——判定一旦散进 impl，URL 映射就不是唯一映射点了。
     #[allow(clippy::too_many_arguments)]
     async fn send(
@@ -411,25 +397,6 @@ fn filter_response_headers(src: &HeaderMap, body_len: usize) -> HeaderMap {
 
 #[async_trait]
 impl PyBackendClient for HttpPyBackend {
-    async fn forward_sts_tmp_keys(
-        &self,
-        body: Value,
-        headers: HeaderMap,
-    ) -> Result<PyBackendResponse, AppError> {
-        // v2 `POST /files/sts-tmp-keys` → v1 `POST /api/v1/files/sts-tmp-keys`
-        let url = format!("{}/api/v1/files/sts-tmp-keys", self.base_url);
-        self.send(
-            reqwest::Method::POST,
-            url,
-            Some(body),
-            None,
-            headers,
-            self.timeout,
-            code::BIZ_STS_FORWARD_FAILED,
-        )
-        .await
-    }
-
     async fn forward_part_print_pdf(
         &self,
         part_id: &str,
@@ -513,8 +480,8 @@ impl PyBackendClient for HttpPyBackend {
 /// `PYTHON_BACKEND_ENABLED=false` 时的静默占位实现（与 `NoopCos` 同形）。
 ///
 /// 与生产 `HttpPyBackend` 行为完全不一致（不会真发 HTTP 请求）；仅供
-/// 本地 `cargo run` 不依赖 python 后端时调试用。5 个方法统一返
-/// 「配置缺失」语义的业务错误（STS 20406 / 打印 20407），让 handler 走
+/// 本地 `cargo run` 不依赖 python 后端时调试用。4 个方法统一返
+/// 「配置缺失」语义的业务错误（CI 预览 21118 / 打印 20407），让 handler 走
 /// `AppError::into_response()` 自动装信封；不手拼 `R { code, message, data }`
 /// —— 与 `HttpPyBackend` 错误路径同源。
 pub struct NoopPyBackend;
@@ -527,18 +494,6 @@ impl Default for NoopPyBackend {
 
 #[async_trait]
 impl PyBackendClient for NoopPyBackend {
-    async fn forward_sts_tmp_keys(
-        &self,
-        _body: Value,
-        _headers: HeaderMap,
-    ) -> Result<PyBackendResponse, AppError> {
-        warn!("[NoopPyBackend] 跳过真实转发（PYTHON_BACKEND_ENABLED=false，本地调试）");
-        Err(AppError::biz(
-            code::BIZ_STS_FORWARD_FAILED,
-            "PYTHON_BACKEND_BASE_URL 未配置（NoopPyBackend 占位）",
-        ))
-    }
-
     async fn forward_part_print_pdf(
         &self,
         _part_id: &str,
@@ -596,7 +551,7 @@ impl PyBackendClient for NoopPyBackend {
 /// - `base_url` 为空 → 强制 Noop（fail-safe），避免 `reqwest` 收到 `http://` 空 host。
 ///
 /// 2026-10-03 新增：`print_timeout_ms` 独立接成 [`HttpPyBackend::print_timeout`]，
-/// 打印 4 个方法因此与 STS 档解耦。
+/// 打印 4 个方法因此与默认 10s 档解耦。
 pub fn build_py_backend(
     cfg: &crate::infra::config::PythonBackendConfig,
 ) -> anyhow::Result<Arc<dyn PyBackendClient>> {

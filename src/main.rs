@@ -76,9 +76,8 @@ async fn main() -> anyhow::Result<()> {
     // 6. COS 客户端（按 `COS_BACKEND` 二选一：`opendal` / `noop`）
     let cos: Arc<dyn CosClient> = build_cos_client(&config.cos).context("构造 COS 客户端失败")?;
 
-    // 6.6 python 后端转发客户端（薄壳鉴权转发到 python STS 端点）。
-    // 2026-09-28 新增：修复 python `/api/v1/files/sts-tmp-keys` 裸开漏洞——本 rust 端
-    // 是新的强制鉴权点（详见 plan `/Users/ren/.claude/plans/sts-session-uploader-sts-sts-sequential-globe.md`）。
+    // 6.6 python 后端转发客户端（薄壳鉴权转发到 python 的打印 / CI 预览端点）。
+    // 本 rust 端是强制鉴权点：鉴权通过后才把请求原样转给 python。
     // `enabled=false`（未设 `PYTHON_BACKEND_BASE_URL`）→ `NoopPyBackend` 占位；
     // `enabled=true` → `HttpPyBackend` 走真实转发。
     let py_backend: Arc<dyn PyBackendClient> =

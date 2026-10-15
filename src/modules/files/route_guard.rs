@@ -3,18 +3,17 @@
 //!
 //! ## 为什么抽到这里
 //!
-//! files 域有 **3 个** `router()` 工厂，各自都带一张人工维护的 `ROUTES` 表：
+//! 本模块被 **2 处** `router()` 工厂的 `ROUTES` 表复用：
 //!
 //! | 文件 | 前缀 | `ROUTES` 条数 |
 //! |---|---|---:|
-//! | `handler.rs` | `/api/v2/files` | 1（`sts-tmp-keys`） |
+//! | `files/handler.rs` | `/api/v2/files` | 0（只有 `.nest`，无自有端点） |
 //! | `part_file/handler.rs` | `/api/v2/files/objects` | 7 |
-//! | `part_file/cnc/handler.rs` | `/api/v2/files/cnc` | 1 |
 //!
-//! N-4 指出 `cnc` 那条此前是**硬编码 `contains(...)` + `len() == 1`** ⇒ 加第二条
-//! cnc 路由**不会红**，等于没有守卫。三处各抄一份解析器又会把「解析规则」变成
-//! 三份可漂移的散文 —— 与 `repo::ALL_METHODS` 那条教训同款。故抽成本模块一处，
-//! 三处 `mod tests` 共同调用。
+//! 另有域外一处：`print_template::handler::ROUTES`（4 条）。
+//!
+//! 各处各抄一份解析器会把「解析规则」变成多份可漂移的散文 —— 与
+//! `repo::ALL_METHODS` 那条教训同款。故抽成本模块一处，共同调用。
 //!
 //! ## 解析规则（够用即可，不引构建期依赖）
 //!

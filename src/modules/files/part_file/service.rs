@@ -2,40 +2,24 @@
 //!
 //! 对应 Python myERP/service/part_file_service.py + service/_file_kind_policy.py。
 //!
-//! ## 上传核心逻辑（`upload_file_for_owner`）
-//! 0. `owner_kind` × `kind` 配对校验（`policy::owner_kind_allows_kind`；2026-10-13
-//!    review 第 1 轮 MINOR-3 补）—— 四合一之前这层配对由各端点的 path 段结构性保证，
-//!    合并后两个字段都来自 client ⇒ 服务端重新强制
-//! 1. 取 `owner_kind`（PART / ASSEMBLY），校验存在性（21105 OWNER_NOT_FOUND）—— 走
-//!    `repo.part_owner_exists` / `repo.assembly_owner_exists`
-//!    - **空字节 / 超限守卫**（2026-10-13 review 第 1 轮 MAJOR-1 补）：0 字节 → 40001；
-//!      超 `cfg_max_file_size`（handler 传 `state.config.cos.max_file_size`）→ 21103。
-//!      这两道是被删的 `PartService::upload_part_file` 带过的，PR1b 合并时漏了
-//!    - **`owner_kind` × `kind` 配对**（MINOR-3 补，见步骤 0）
-//! 2. 校验 `kind` 在白名单内（policy::allowed_exts）
-//! 3. 校验扩展名（policy::ext_of）—— 无扩展名 / 不在白名单 → 21102 BAD_TYPE
-//! 4. 校验 content_type（policy::expected_content_types_for_ext）—— 不匹配 → 21102
-//! 5. SHA-256 算 hash → `repo.get_by_owner_kind_sha` 撞唯一索引 → 21108 DUPLICATE（CAS 去重）
-//!    注意：CAS 命中时**跳过 COS PUT**，直接复用已有 object_key（节省 COS 流量）
-//! 6. 上传 COS（infra/cos.rs::put_object）
-//! 7. `repo.create_part_file` 写 DB
-//! 8. 返回 PartFileOut
+//! ## 上传链路（2026-10-15 统一：预签 PUT 直传）
 //!
-//! ## multipart 上传契约
-//! 客户端发 multipart form-data：
-//!   - `data` JSON 字段：`{"owner_kind":"PART","owner_id":"1001","kind":"DRAWING"}`
-//!   - `file` 二进制字段：PDF / STEP / STL 等
+//! ```text
+//! ① POST /files/objects/upload-intents  → grant_upload_intents（纯读 + 一次签名）
+//! ② 前端 XHR PUT 直传 COS（字节不过本进程）
+//! ③ POST /files/objects/confirm       → bind_uploaded_file（head 校验 + INSERT）
+//! ```
 //!
-//! `content_type` 取客户端声明（multipart 头），扩展名从 `filename` 提取。
+//! ①②③ 之外本域**没有任何**收字节的入口：`POST /files/objects`（multipart 代理）
+//! 与 `POST /api/v2/files/sts-tmp-keys`（python STS 转发）均已下线。
+//!
+//! 两条写路径共用的校验原语全在 `part_file::policy` 与 `dto::validate`：
+//! `owner_kind` × `kind` 配对、扩展名白名单、content_type 白名单、写路径角色分派。
 //!
 //! ## 与 part / assembly 域的耦合
-//! 2026-10-13 PR1b 起**恒为「零」**：两条上传 / 一条 confirm 端点全部收进本子模块
-//! （`POST /api/v2/files/objects` 四合一 + `POST /api/v2/files/objects/confirm`），
-//! part 域与 assembly 域不再持有任何 `t_part_file` 的写入路径。
-//! 装配体 PDF（`kind='ASSEMBLY_MASTER'`）走同一条通道，`owner_kind='ASSEMBLY'`。
-//! ⚠️ `POST /api/v2/parts/batch` 的 bindings 分支（`service/batch.rs::
-//! prepare_binding_head_copy`）**刻意留在 part 域**：它的端点本体是「批量建零件」，
-//! 文件只是可选入参，不是一条独立的文件端点。
+//! **恒为「零」**：`t_part_file` 的写入路径只有本子模块那两条端点。
+//! 装配体 PDF（`kind='ASSEMBLY_MASTER'`）走同一条通道，`owner_kind='ASSEMBLY'`；
+//! 客户送货单打印模板（`kind='DELIVERY_TEMPLATE'`）走 `owner_kind='CUSTOMER'`。
 //!
 //! ## 2026-10-13 PR1b：COS key 前缀统一 `obj/`
 //! 上传写入的 CAS key 前缀取自 `cfg.cos.upload_prefix`（缺省 `obj/`），读端点的
@@ -43,17 +27,6 @@
 //! `t_part_file.object_key` 存的是完整 key，`resolve_effective_key` 先
 //! `head_object(db_object_key)`、命中就直接返回 ⇒ 历史上落在 `drawings/` 或桶根的
 //! 对象原地不动，本轮只是让**新上传**统一落 `obj/`。
-//!
-//! ## 2026-09-16 M2-B → 2026-09-18 STS 会话域拆分
-//! - 原 `upload_intents` 业务函数（场景 A/B 一次性签 STS + CAS 去重命中复用）
-//!   **2026-09-18 已删除**：迁移至相关 STS 会话域（共享 STS 凭证 + Redis 会话）。
-//! - `bind_uploaded_file` 保留：confirm handler + batch_create service 共享的"已上传到
-//!   tmp 区 → 绑定到 owner"逻辑；head/copy 在 tx 之外，事务内只做 soft_delete + INSERT。
-//!
-//! ## 2026-09-28 相关 STS 会话域下线
-//! 相关 STS 会话域整体下线；前端改为单 uploader 触发时单 HTTP 调用 python `sts-tmp-keys`
-//! 数组入参直签 STS 凭证。本文件保持不变（confirm 链路 + bind_uploaded_file 仍依赖
-//! t_part_file + t_part_file_tmp_object 物理表，不受 STS 链路改造影响）。
 //!
 //! ## 事务边界（2026-09-22 重构对齐 iam 范式）
 //! 事务移交 handler（与 20 个 handler 文件现状对齐）：service 仅业务逻辑，所有跨
@@ -72,13 +45,21 @@ use sqlx::PgPool;
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::cos::CosClient;
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::files::part_file::dto::{PartFileListQuery, validate};
+use crate::modules::files::part_file::dto::{PartFileListQuery, UploadIntentItemIn, validate};
 use crate::modules::files::part_file::model::TPartFile;
 use crate::modules::files::part_file::policy;
-use crate::modules::files::part_file::repo::{NewPartFile, PartFileRepoTrait, hash_bytes};
-use crate::modules::files::part_file::vo::{PartFileListOut, PartFileOut, PartFileWithUrlOut};
+use crate::modules::files::part_file::repo::{NewPartFile, PartFileRepoTrait};
+use crate::modules::files::part_file::vo::{
+    PartFileListOut, PartFileOut, PartFileWithUrlOut, UploadIntentItemOut, UploadIntentsOut,
+};
 use crate::shared::error::{AppError, code};
 use crate::util::cos_key;
+
+/// `POST /files/objects/upload-intents` 单请求最多签发多少个文件。
+///
+/// 2026-10-15：与 `part::service::BATCH_CREATE_PARTS_MAX_ITEMS`（200）取同一个量级
+/// —— 一次多选几百个文件的那是「建单」场景，不是「传文件」场景。
+pub const UPLOAD_INTENTS_MAX_ITEMS: usize = 200;
 
 pub struct PartFileService {
     snowflake: Arc<SnowflakeIdGenerator>,
@@ -102,211 +83,151 @@ impl PartFileService {
         Self { snowflake, cos }
     }
 
-    /// 单文件上传（multipart `file` 字段 + JSON `data` 字段已解析）。
+    /// `POST /api/v2/files/objects/upload-intents`：按内容 sha 派生**正式 CAS key**，
+    /// 签发预签 PUT URL（前端直传 COS）。
     ///
-    /// `original_filename` 是客户端 multipart 的 filename；`content_type` 是
-    /// 客户端声明的 MIME；`bytes` 是文件二进制。
+    /// 2026-10-15 新增。**只读**（SELECT + 一次 cos 签名，无字节、无 INSERT）——
+    /// 登记发生在随后的 `POST /files/objects/confirm`。
     ///
-    /// 返回新建的 `PartFileOut`（含 id）。
+    /// ## 校验顺序（先命中先返回，错误码即优先级）
     ///
-    /// ## 2026-10-13 PR1b：本方法是**全仓唯一的上传实现**
-    ///
-    /// 旧的 5 套并存的写法（part 域 `PartService::upload_part_file` /
-    /// `upload_drawing` / `upload_3d_model` + assembly 域
-    /// `AssemblyService::upload_assembly_files` + PR1a 下线的
-    /// `POST /api/v2/part-files/`）全部并到本方法，四者收敛为**一个** HTTP 端点
-    /// `POST /api/v2/files/objects`。详见 `handler.rs` 的端点 doc。
-    ///
-    /// ## ⚠️ 与被删的 `PartService::upload_part_file` 的去重语义差异（本轮裁决）
-    ///
-    /// | | `upload_part_file`（已删） | 本方法（保留） |
+    /// | 步 | 校验 | 码 |
     /// |---|---|---|
-    /// | 去重判据 | `PartFileRepo::get_by_part_kind(owner, kind)` —— **不看内容**，命中即复用旧行 | `get_by_owner_kind_sha(owner, kind, sha)` —— 看内容，**同内容**才复用 |
-    /// | 同 owner+kind 换内容 | 复用旧行并 `PUT` 新对象（DB 仍指旧 key）⇒ 读到的可能是旧内容 | 落新行；撞 `uk_t_part_file_single` 时由 service 映射成 21108 |
-    /// | 同内容不同文件名 | 复用旧行 | 复用旧行（同 sha），返回旧 `original_filename` |
+    /// | 1 | `items` 非空且 ≤ 200 | 40001 |
+    /// | 2 | 角色闸门（`policy::write_roles_for`，口径与 multipart 上传逐字一致） | 40300 |
+    /// | 3 | `owner_kind` × `kind` 配对（逐项） | 20104 |
+    /// | 4 | owner 存在性（CUSTOMER 仍要求一级客户） | 21105 |
+    /// | 5 | 逐项：sha 64hex / filename ≤255 / content_type 非空 | 40001 |
+    /// | 6 | 逐项：扩展名在 `policy::allowed_exts(kind)` 内 + content_type 匹配 | 21102 |
+    /// | 7 | 逐项：`0 < file_size ≤ cos.max_file_size` | 40001 / 21103 |
+    /// | 8 | 逐项：CAS 命中活跃行 ⇒ `already_exists`，**不签 URL** | — |
+    /// | 9 | 逐项：`build_cas_key` + `cos.presigned_put_url` | — |
     ///
-    /// 取舍：**以本方法为准**（它是 files 域 canonical，且 sha 去重能真正省掉一次
-    /// COS PUT）。被判据 `uk_t_part_file_single` 兜住的是「一个 owner 一个 kind 只有
-    /// 一条活跃行」，两条实现的这条不变式其实一致，差别只在**撞的是哪种情况**时报什么。
+    /// ## 为什么命中 CAS 就**不**签 URL
     ///
-    /// ## ⚠️ 2026-10-13 review 第 1 轮 MAJOR-1：文件大小与空字节两道守卫
-    ///
-    /// 本方法此前**没有**任何 size 判据（PR1b 合并时把被删的
-    /// `PartService::upload_part_file` 里的两道守卫一起丢了）。后果有三条：
-    /// - 有效上限从 `cfg.cos.max_file_size`（`.env.example` = 100MB）放宽到
-    ///   `max_request_body_size`（300MB）且改由全局 layer 兜底；
-    /// - 0 字节文件能一路过 ext / content_type 两关 → `put_object` 写 0 字节对象
-    ///   + INSERT `file_size = 0` 的行；
-    /// - `21103 BIZ_PART_FILE_TOO_LARGE` 在 multipart 上传路径上彻底不可达。
-    ///
-    /// `cfg_max_file_size` 由 handler 传 `state.config.cos.max_file_size`
-    /// （与被删实现同源）；**不要**在 service 里写死数值。守卫位置在「owner 存在性」
-    /// 之后 —— 错误码优先级即校验顺序：`40300`（角色）→ `20104`（owner_kind × kind
-    /// 配对）→ `21105`（owner 不存在）→ `40001`（空字节）→ `21103`（超限）→
-    /// `21102`（扩展名 / content_type）。
+    /// 那样前端拿到的就是一条「写这个既有 key」的授权 —— 而那个 key 已经被一条活跃
+    /// 行引用着，前端却不需要真的写它。秒传的口号是「一次 PUT 都不发」。
     #[allow(clippy::too_many_arguments)]
-    pub async fn upload_file_for_owner<R: PartFileRepoTrait>(
+    pub async fn grant_upload_intents<R: PartFileRepoTrait>(
         &self,
         mut repo: R,
         cfg_upload_prefix: &str,
         cfg_max_file_size: usize,
+        cfg_url_expire_seconds: u32,
         owner_kind: &str,
         owner_id: i64,
-        kind: &str,
-        original_filename: &str,
-        content_type: &str,
-        bytes: Vec<u8>,
+        items: &[UploadIntentItemIn],
         current: &CurrentUser,
-    ) -> Result<PartFileOut, AppError> {
-        // 角色闸门（2026-10-16 新增 CUSTOMER 分支，review 第 1 轮 MAJOR-1
-        // 抽到 `policy::write_roles_for` 与 confirm 共用）。
-        //
-        // PART / ASSEMBLY 保持原集合**逐字不变**（M / C / CNC —— 三条旧上传端点的
-        // 并集，见本文件模块 doc 的「唯一一处权限面放大」一节）；CUSTOMER
-        // （送货单打印模板）**只放 MANAGER**。
-        //
-        // ⚠️ **这道分派是「CLERK 不能偷偷绑模板」的收口点之一，且必须与
-        // `bind_uploaded_file`（`POST /files/objects/confirm`）共用同一张表**：
-        // `owner_kind` 与 `kind` 都由 client 在 multipart `data`（confirm 则是 body）
-        // 里给，而 `print_template` 域的 `POST /print-templates` 有自己的
-        // MANAGER-only handler 守卫 —— 但那只守**那一个端点**。CLERK 若能直接打
-        // `POST /files/objects` 或 `POST /files/objects/confirm` 并写
-        // `{"owner_kind":"CUSTOMER","kind":"DELIVERY_TEMPLATE"}`，就能绕过模板管理页
-        // 给自己日常对接的客户乱换打印模板（改的是别人出货单上的抬头、地址、抬头行
-        // 数与顺序）。所以「谁能写 DELIVERY_TEMPLATE」必须在**共用上传原语**里判，
-        // 且两条写入口都要经过它 —— 2026-10-16 首版只在本方法加了 CUSTOMER 分支、
-        // 漏了 confirm 那条，review 第 1 轮 MAJOR-1 已闭合（共用函数见
-        // `policy::write_roles_for`）。
-        // ⚠️ `WriteEntry::Upload` 而**不是**传 `policy::UPLOAD_ROLES`（review 第 2 轮
-        // MINOR-B）：入口由类型表达，调用点传不出「错的常量集合」——
-        // 那是静默放开 confirm 的 CNC 面那种改动的温床。
+    ) -> Result<UploadIntentsOut, AppError> {
+        // 1. 批量形状校验（与 `PartBatchCreateRequest` 同款「先形状后内容」）
+        if items.is_empty() {
+            return Err(AppError::validation("items 不能为空"));
+        }
+        if items.len() > UPLOAD_INTENTS_MAX_ITEMS {
+            return Err(AppError::validation(format!(
+                "items 数量 {} 超过上限 {UPLOAD_INTENTS_MAX_ITEMS}",
+                items.len()
+            )));
+        }
+
+        // 2. 角色闸门：与 `upload_file_for_owner`（multipart 上传）**逐字同口径**
+        //    —— PART/ASSEMBLY → M+C+CNC，CUSTOMER（送货单打印模板）→ 仅 Manager。
+        //    两条写入口必须共用 `policy::write_roles_for`，否则「谁能写
+        //    DELIVERY_TEMPLATE」的收口点会分叉（见该函数的 doc）。
         current.require_any_role(policy::write_roles_for(
             owner_kind,
             policy::WriteEntry::Upload,
         ))?;
 
-        // 0. owner_kind × kind 配对（2026-10-13 review 第 1 轮 MINOR-3）：四合一
-        //    之前这层配对由「各端点自己的 path 段 + 硬编码 kind」在结构上保证，
-        //    合并后两个字段都来自 multipart `data` ⇒ 必须由服务端重新强制。
-        //    纯内存判断，放在最前面（不花一次 DB 往返）。
-        Self::assert_owner_kind_matches_kind(owner_kind, kind)?;
+        // 3. owner_kind × kind 配对（纯内存，逐项；排在 DB 往返之前）
+        for it in items {
+            Self::assert_owner_kind_matches_kind(owner_kind, &it.kind)?;
+        }
 
-        // 1. owner 存在性校验（走 trait helper）
+        // 4. owner 存在性（一次往返；CUSTOMER 臂含 `parent_id IS NULL` 判据）
         Self::assert_owner_exists(&mut repo, owner_kind, owner_id).await?;
 
-        // 1b. 空字节 / 超限守卫（2026-10-13 review 第 1 轮 MAJOR-1 补回）。
-        //     **判定与错误码逐字等价**于被删的 `PartService::upload_part_file`
-        //     （`bytes.is_empty()` → 40001、`len() > cfg_max_file_size` → 21103），
-        //     两处有意的不同，勿当漏改：
-        //     ① 消息 token 由 `file_type` 换成 `kind`（旧 "PDF 字节为空" →
-        //        新 "DRAWING 字节为空"，信息量更高），超限措辞同理改为报实际
-        //        bytes 数 + 上限 MB（旧的 `{file_type} > {max} bytes` 连被超的
-        //        实际大小都没报）；
-        //     ② 位置后移：被删实现在角色守卫之后紧接这两道，本实现前面还排着
-        //        `owner_kind` × `kind` 配对（step 0）与 owner 存在性（step 1），
-        //        非法组合先被 20104 / 21105 拦下、不再走到 size 判定。
-        //     ⚠️ 空字节**不是**「过大」而是「无效输入」：用 VALIDATION_ERROR (40001)
-        //     而不是 BIZ_PART_FILE_TOO_LARGE (21103)。
-        if bytes.is_empty() {
-            return Err(AppError::validation(format!("{kind} 字节为空")));
-        }
-        if bytes.len() > cfg_max_file_size {
-            return Err(AppError::biz(
-                code::BIZ_PART_FILE_TOO_LARGE,
-                format!(
-                    "{kind} {} bytes 超过上限 {cfg_max_file_size}（{}MB）",
-                    bytes.len(),
-                    cfg_max_file_size / 1024 / 1024
-                ),
-            ));
-        }
-
-        // 2. kind 白名单（policy::allowed_exts 自动挡掉未知 kind）
-        let ext = policy::ext_of(original_filename).ok_or_else(|| {
-            AppError::biz(
-                code::BIZ_PART_FILE_BAD_TYPE,
-                format!("文件缺少扩展名: {original_filename:?}"),
-            )
-        })?;
-        let allowed_exts = policy::allowed_exts(kind);
-        if !allowed_exts.contains(&ext.as_str()) {
-            return Err(AppError::biz(
-                code::BIZ_PART_FILE_BAD_TYPE,
-                format!("kind={kind:?} 不接受扩展名 {ext:?}"),
-            ));
-        }
-        // 3. content_type 校验
-        let expected = policy::expected_content_types_for_ext(&ext);
-        if !expected
-            .iter()
-            .any(|c| c.eq_ignore_ascii_case(content_type))
-        {
-            return Err(AppError::biz(
-                code::BIZ_PART_FILE_BAD_TYPE,
-                format!(
-                    "kind={kind:?}, 扩展名={ext:?}: content_type {content_type:?} 不在白名单 {expected:?}"
-                ),
-            ));
-        }
-        // 4. file_type 推导
-        let file_type = policy::file_type_for_ext(&ext).ok_or_else(|| {
-            AppError::biz(
-                code::BIZ_PART_FILE_BAD_TYPE,
-                format!("扩展名 {ext:?} 无对应 file_type"),
-            )
-        })?;
-
-        // 5. SHA-256 → CAS 去重（撞唯一索引 → 21108 DUPLICATE）
-        let sha = hash_bytes(&bytes);
-        if let Some(existing) = repo.get_by_owner_kind_sha(owner_id, kind, &sha).await? {
-            // CAS 命中：跳过 COS PUT，直接复用已有记录（返回 id / object_key）
-            return Ok(Self::render_out(&existing, owner_kind));
-        }
-
-        // 6. 上传 COS（2026-09-29 扁平化：key 模板五段→两段 `{prefix}{sha16}_{safe_filename}`，
-        //    owner_kind/owner_id/KIND 信息已在 t_part_file DB 行外键索引，不再写进 key）。
-        //    2026-10-13 PR1b：prefix 由硬编码 `""` 改为读 `cfg.cos.upload_prefix`
-        //    （缺省 `obj/`）—— 上传写入与读端点的 legacy fallback 共用同一份配置。
-        let object_key = cos_key::build_cas_key(cfg_upload_prefix, &sha, original_filename);
-        self.cos
-            .put_object(&object_key, bytes.clone(), content_type)
-            .await?;
-
-        // 7. INSERT t_part_file
-        let nf = NewPartFile {
-            id: self.snowflake.next_id(),
-            part_id: owner_id,
-            owner_kind,
-            kind,
-            file_type,
-            object_key: &object_key,
-            original_filename,
-            file_size: bytes.len() as i64,
-            content_type,
-            upload_status: "READY",
-            content_sha256: Some(&sha),
-            created_by: current.id,
-        };
-        let id = repo.create_part_file(nf).await.map_err(|e| match e {
-            sqlx::Error::Database(db) => {
-                if db.code().as_deref() == Some("23505") {
-                    AppError::biz(
-                        code::BIZ_PART_FILE_DUPLICATE,
-                        format!("owner {owner_id} / {kind} / sha={} 撞唯一索引", &sha[..16]),
-                    )
-                } else {
-                    AppError::from(sqlx::Error::Database(db))
-                }
+        let mut out_items = Vec::with_capacity(items.len());
+        for it in items {
+            // 5. 逐项字段形状校验（与 confirm 共用同一批 helper，报 40001）
+            validate::check_sha256(&it.content_sha256)?;
+            validate::check_filename(&it.original_filename)?;
+            if it.content_type.trim().is_empty() {
+                return Err(AppError::validation(format!(
+                    "client_ref={} 的 content_type 不可为空",
+                    it.client_ref
+                )));
             }
-            other => AppError::from(other),
-        })?;
 
-        // 8. 读回（include_deleted=true 兜底 INSERT 可见性）
-        let row = repo
-            .get_by_id(id, true)
-            .await?
-            .ok_or_else(|| AppError::biz(code::BIZ_PART_FILE_NOT_FOUND, "刚 INSERT 却查不到"))?;
-        Ok(Self::render_out(&row, owner_kind))
+            // 6. 扩展名白名单 + content_type 匹配（21102：请求指向的类型不对）
+            let ext = policy::ext_of(&it.original_filename).ok_or_else(|| {
+                AppError::biz(
+                    code::BIZ_PART_FILE_BAD_TYPE,
+                    format!("文件缺少扩展名: {:?}", it.original_filename),
+                )
+            })?;
+            if !policy::allowed_exts(&it.kind).contains(&ext.as_str()) {
+                return Err(AppError::biz(
+                    code::BIZ_PART_FILE_BAD_TYPE,
+                    format!("kind={:?} 不接受扩展名 {ext:?}", it.kind),
+                ));
+            }
+            let expected = policy::expected_content_types_for_ext(&ext);
+            if !expected
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case(&it.content_type))
+            {
+                return Err(AppError::biz(
+                    code::BIZ_PART_FILE_BAD_TYPE,
+                    format!(
+                        "kind={:?}, 扩展名={ext:?}: content_type {:?} 不在白名单 {expected:?}",
+                        it.kind, it.content_type
+                    ),
+                ));
+            }
+
+            // 7. 大小：0 → 40001（无效输入），超限 → 21103（与 multipart 上传同码）
+            validate::check_file_size(it.file_size, cfg_max_file_size)?;
+
+            // 8. CAS 查重：命中**活跃行**即秒传，不签 URL
+            if let Some(existing) = repo
+                .get_by_owner_kind_sha(owner_id, &it.kind, &it.content_sha256)
+                .await?
+            {
+                out_items.push(UploadIntentItemOut {
+                    client_ref: it.client_ref.clone(),
+                    already_exists: true,
+                    object_key: None,
+                    upload_url: None,
+                    content_type: None,
+                    expires_in: cfg_url_expire_seconds,
+                    existing_file: Some(Self::render_out(&existing, owner_kind)),
+                });
+                continue;
+            }
+
+            // 9. 派生正式 CAS key + 签预签 PUT URL（前端拿它直传，字节不过 rust）
+            let object_key = cos_key::build_cas_key(
+                cfg_upload_prefix,
+                &it.content_sha256,
+                &it.original_filename,
+            );
+            let signed = self
+                .cos
+                .presigned_put_url(&object_key, &it.content_type, cfg_url_expire_seconds)
+                .await?;
+            out_items.push(UploadIntentItemOut {
+                client_ref: it.client_ref.clone(),
+                already_exists: false,
+                object_key: Some(object_key),
+                upload_url: Some(signed.url),
+                content_type: Some(signed.content_type),
+                expires_in: cfg_url_expire_seconds,
+                existing_file: None,
+            });
+        }
+
+        Ok(UploadIntentsOut { items: out_items })
     }
 
     /// 列表：按 owner_kind + owner_id + kind 过滤 + 分页。
@@ -644,241 +565,227 @@ impl PartFileService {
 //   `delete` 拆成两条数，实际它们是同一条端点 `POST /files/objects/{file_id}/delete`。）
 
 impl PartFileService {
-    /// 把已上传到 COS tmp 区的一个对象绑定到 owner（INSERT t_part_file）。
+    /// 登记一个**已由前端直传到 COS 正式 CAS key** 的对象（INSERT `t_part_file`）。
     ///
     /// 调用方：`POST /api/v2/files/objects/confirm` 的 handler。
     ///
-    /// 流程：
-    /// 0. 角色守卫（**按 `owner_kind` 派生**：`policy::write_roles_for`；非 CUSTOMER
-    ///    是 M+C、逐字沿用旧端点；`CUSTOMER` ⇒ 仅 Manager）
-    ///    ＋ **拒 `owner_kind = "CUSTOMER"`**（20104，2026-10-16 review 第 1 轮
-    ///    MAJOR-1 补：模板的「替换」不变式只在 `print_template` 域那条路径上，
-    ///    见下面步骤 1a 的注释）
-    /// 1. owner 存在性校验（`owner_kind ∈ {PART, ASSEMBLY}`；2026-10-13 PR1b 新增，
-    ///    旧形态 owner 在 path 段恒 PART、无需校验。⚠️ 步骤 1a 之后 CUSTOMER 已被
-    ///    拒 ⇒ 本步实际只判 PART / ASSEMBLY）
-    ///    ＋ `owner_kind` × `kind` 配对校验（2026-10-13 review 第 1 轮 MINOR-3）
-    /// 2. `tmp_key` 前缀防呆：必须以 `cfg_tmp_prefix` 开头（防客户端乱传 key 读到别人文件）
-    /// 3. `head_object` 校验对象存在 + size 与声明一致：
-    ///    - 不存在 → `BIZ_PART_FILE_TMP_OBJECT_MISSING` 21114
-    ///    - size 不一致 → `BIZ_PART_FILE_SIZE_MISMATCH` 21115
-    ///    - 超 `cfg_max_file_size`（handler 传 `state.config.cos.max_file_size`）
-    ///      → `BIZ_PART_FILE_TOO_LARGE` 21103（2026-10-13 review 第 1 轮 MAJOR-1：
-    ///      原先此处写死 300MB，改由配置下发）    /// 4. 派生 CAS key：`util::cos_key::build_cas_key(prefix, sha16, filename)`
-    /// 5. `cos.copy_object(tmp_key, cas_key)` —— 走 PermanentCos（不走 STS）
-    /// 6. copy_object 成功后**立刻 spawn** best-effort delete_object(tmp_key) 早期清理
-    /// 7. 开 tx：soft_delete 旧活跃行（`uk_t_part_file_single` 部分唯一约束） + INSERT 新行
-    /// 8. commit
-    /// 9. 返回 `(PartFileOut, tmp_key)` —— caller 拿到 tmp_key 后**已 commit**，再
-    ///    spawn 异步 delete_object(tmp_key) 兜底清理
+    /// ## 流程（每步的「为什么」见行内注释，错误码即校验顺序）
     ///
-    /// ⚠️ **`ASSEMBLY_MASTER` 的确认面**（2026-10-13 PR1b 计划外扩大）：`check_kind`
-    /// 复用 `policy::allowed_exts`，而该白名单本轮为 multipart 上传新增了
-    /// `ASSEMBLY_MASTER` ⇒ confirm 端点**顺带**开始接受这个 kind。四合一的本意
-    /// 只是让 assembly 的 PDF 能走上传端点，confirm 侧一并放开是复用的副作用，
-    /// 不是设计意图；保留（两条路径对 kind 的接受面一致，是同一张白名单的必然结果），
-    /// 但已在 `part_file/mod.rs` 与 `files/mod.rs` 的移除记录里显式登记。
+    /// 1. 角色闸门 —— `policy::confirm_roles_for(owner_kind, kind)`
+    /// 2. owner 存在性 + `owner_kind` × `kind` 配对
+    /// 3. 字段校验（kind / sha256 / filename / size / content_type）
+    /// 4. **key 防呆**：服务端按 `content_sha256` + `original_filename` **重新派生**
+    ///    CAS key，与入参 `object_key` 逐字比对，不一致即 21114
+    /// 5. `head_object`：不存在 / size=0 → 21114；size 与声明不符 → 21115
+    /// 6. CAS 查重兜底（并发双 confirm）—— 命中活跃行直接复用（配对仍要做）
+    /// 7. tx 内：软删旧活跃行 + INSERT + readback
+    /// 8. tx 内：CNC 配对（`pair_with_file_id` 给了才做）双向互写
+    /// 9. commit → `PartFileOut`
     ///
-    /// **重要**：head/copy 是外部 IO，**不**放进事务 tx 里——tx 里只做 DB（事务回滚时
-    /// IO 已发生难恢复），依赖 6 / 9 两层 spawn 双层防护。
+    /// ## ⚠️ **内容 sha256 不做服务端校验**（与 sha 绑定有关的取舍见 `mod.rs`）
     ///
-    /// 注：pool 直接传（不是 `&mut tx`）—— head/copy 用 pool 直连，确保与 tx 隔离。
-    /// 本方法自管 tx（handler 不开 tx），不依赖 handler 借连接——是事务范式的
-    /// 唯一例外（详见模块 doc-comment）。
+    /// S3 预签 PUT 走 **UNSIGNED-PAYLOAD**（SigV4 的 `x-amz-content-sha256` 固定
+    /// `UNSIGNED-PAYLOAD`），无法把 payload hash 绑进签名 ⇒ 服务端**既拿不到**字节，
+    /// 也无法重算 sha。因此 `content_sha256` 是「客户端声明」，服务端只能用两种
+    /// 方式约束它：① 用它派生 CAS key 并在步骤 4 比对（保证 key 由 sha 决定，
+    /// 不能指向任意对象）；② 同 owner + kind + 同 sha 只能有一条活跃行（步骤 6）。
+    /// size 则在**入参**（步骤 3 上限）与 **COS head**（步骤 5 实测）两处各校一次。
+    ///
+    /// 注：pool 直接传（不是 `&mut tx`）—— `head_object` 是外部 IO，不该被包在
+    /// 事务里（事务回滚时 IO 已发生、难恢复）。本方法自管 tx（handler 不开 tx），
+    /// 是事务范式的唯一例外（详见模块 doc-comment）。
     #[allow(clippy::too_many_arguments)]
     pub async fn bind_uploaded_file(
+        &self,
         pool: &PgPool,
-        snowflake: &SnowflakeIdGenerator,
         cos: Arc<dyn CosClient>,
         cfg_upload_prefix: &str,
-        cfg_tmp_prefix: &str,
         cfg_max_file_size: usize,
         owner_kind: &str,
         owner_id: i64,
         kind: &str,
-        tmp_key: &str,
+        object_key: &str,
         sha256: &str,
         original_filename: &str,
         file_size: i64,
         content_type: &str,
+        pair_with_file_id: Option<i64>,
         current: &CurrentUser,
-    ) -> Result<(PartFileOut, String), AppError> {
-        // 1. 权限（按 owner_kind 派生，与 multipart 上传端点**共用同一张分派表**）
-        //
-        // ⚠️ 2026-10-16 review 第 1 轮 MAJOR-1：本方法原先恒是 `M + C`、与
-        // `owner_kind` 无关，于是本轮给 `owner_kind_allows_kind` 加
-        // `CUSTOMER => DELIVERY_TEMPLATE` 之后，CLERK 打本端点就能造出（并替换掉）
-        // **任意未软删客户**名下的打印模板行 —— `assert_owner_exists` 的 CUSTOMER 臂
-        // 只判存在（第 1 步那句判据**当时**不判 `parent_id IS NULL`；review 第 2 轮
-        // MAJOR-A 已把该谓词下沉进去），第 7 步的
-        // `soft_delete_active_by_part_kind` 还会把该客户现有模板软删掉。
-        // 修法是两条写入口共用 `policy::write_roles_for`，本方法不再自带一套。
-        // ⚠️ 非 CUSTOMER 的默认集合**仍是 M + C**（`WriteEntry::Confirm` ⇒
-        // `policy::CONFIRM_ROLES`）—— 刻意不与上传端点的 M+C+CNC 合并，
-        // 那会顺带放开本端点的 CNC 面（review 第 2 轮 MINOR-B：入口由类型表达，
-        // 传不出错的常量）。
-        current.require_any_role(policy::write_roles_for(
-            owner_kind,
-            policy::WriteEntry::Confirm,
-        ))?;
+    ) -> Result<PartFileOut, AppError> {
+        // 1. 权限：**按 owner_kind + kind 两级分派**
+        //    （`policy::confirm_roles_for`：CNC 配对两种 kind 是 M+CNC，其余逐字
+        //    走 `write_roles_for(Confirm)`；CUSTOMER ⇒ 仅 Manager）
+        current.require_any_role(policy::confirm_roles_for(owner_kind, kind))?;
 
-        // 1a. ⚠️ 本端点**不接受 `owner_kind = "CUSTOMER"`**（2026-10-16 review 第 1 轮
-        //     MAJOR-1 闭合的第二个缺口）。角色闸门只保证「只有 Manager 能到这里」，
-        //     但本端点**没有** `print_template` 域的那条业务不变式：
-        //     - 「只绑一级客户（`parent_id IS NULL`）」的强制点在
-        //       `print_template::service::l1_customer_name`，本方法**没有**；
-        //       ⚠️ 2026-10-16 review 第 2 轮 MAJOR-A 已把该判据**也**下沉进本域
-        //       共用的 `customer_owner_exists`（本方法第 1b 步会调到它）⇒ 本端点
-        //       其实**也**守得住 L1-only 了。它仍然拒 CUSTOMER 的理由**不变**：
-        //       - 「同 L1 至多一份活跃模板 + 先软删后写入」的**替换语义**在那个域里，
-        //         本端点没有 —— 经它能造出**第二行**活跃模板吗？不能（唯一索引），
-        //         但它会走 `bind_uploaded_file` 自己的软删路径（`part_id` + `kind`），
-        //         语义与那个域的「先软删再写」不是同一套；
-        //       - 本端点**零个合法 CUSTOMER 调用方**（STS 直传是前端上传大图纸的
-        //         路径，模板走 `print_template` 域的一次性 multipart 上传）。
-        //     ⇒ 直接拒。⚠️ 错误码 20104 而不是 403：角色已经是 Manager 了，
-        //     这里判的是「这个 owner 类型本端点不服务」。
-        if owner_kind == "CUSTOMER" {
-            return Err(AppError::biz(
-                code::BIZ_INVALID_VALUE,
-                format!(
-                    "owner_kind={owner_kind:?} 不走本端点：送货单打印模板只经 print_template 域的 \
-                     POST /print-templates 写入（只有那里有「替换」这条不变式）"
-                ),
-            ));
-        }
-        // 1b. owner 存在性（2026-10-13 PR1b 新增：owner 改由 body 携带，见 dto::ConfirmFileIn）
+        // 2. owner 存在性（1 次往返；CUSTOMER 臂含 `parent_id IS NULL` 判据）
         {
             let mut conn = pool.acquire().await?;
             let mut repo: &mut sqlx::PgConnection = &mut conn;
             Self::assert_owner_exists(&mut repo, owner_kind, owner_id).await?;
         }
-        // 1c. owner_kind × kind 配对（2026-10-13 review 第 1 轮 MINOR-3）：
-        //     `check_kind` 只认 kind 白名单、不看 owner ⇒ 这里补上另一半，
-        //     否则 confirm 也能造出「part + ASSEMBLY_MASTER」这种永不可删的行。
+        // 2b. owner_kind × kind 配对（纯内存）
         Self::assert_owner_kind_matches_kind(owner_kind, kind)?;
 
-        // 2. 字段校验（kind/sha/filename/size/content_type）
-        // ⚠️ 2026-10-13 review 第 1 轮 MAJOR-1：原先这里是硬编码的
-        // `300 * 1024 * 1024`，与 `cfg_upload_prefix` 同源的 `cfg_max_file_size`
-        // 形参一起由 handler 传 `state.config.cos.max_file_size` 下来 —— 这是
-        // CLAUDE.md 已登记的「`COS_MAX_FILE_SIZE` 解析了从没被读」的同一件事。
+        // 3. 字段校验（kind 白名单 / sha256 64hex / filename ≤255 / size / content_type）
+        //    ⚠️ `cfg_max_file_size` 由 handler 传 `state.config.cos.max_file_size`，
+        //    不在 service 里写死数值。
         validate::check_kind(kind)?;
-
         validate::check_sha256(sha256)?;
         validate::check_filename(original_filename)?;
         validate::check_file_size(file_size, cfg_max_file_size)?;
         validate::check_content_type(content_type, original_filename)?;
 
-        // 3. tmp_key 前缀防呆
-        if !tmp_key.starts_with(cfg_tmp_prefix) {
+        // 3b. CNC 配对目标校验（kind 必须互补）+ 目标行存在性。
+        //     排在任何写入之前 ⇒ 配错 kind 时零副作用。
+        if let Some(pair_id) = pair_with_file_id {
+            let counterpart = policy::cnc_pair_counterpart(kind).ok_or_else(|| {
+                AppError::biz(
+                    code::BIZ_INVALID_VALUE,
+                    format!("kind={kind:?} 不是 CNC 配对文件（G_CODE / SETUP_SHEET），不接受 pair_with_file_id"),
+                )
+            })?;
+            let mut conn = pool.acquire().await?;
+            let mut repo: &mut sqlx::PgConnection = &mut conn;
+            let target = PartFileRepoTrait::get_by_id(&mut repo, pair_id, false)
+                .await?
+                .ok_or_else(|| {
+                    AppError::biz(
+                        code::BIZ_PART_FILE_NOT_FOUND,
+                        format!("pair_with_file_id={pair_id} 不存在或已软删"),
+                    )
+                })?;
+            if target.kind != counterpart {
+                return Err(AppError::biz(
+                    code::BIZ_INVALID_VALUE,
+                    format!(
+                        "pair_with_file_id={pair_id} 的 kind={:?} 与本行 kind={kind:?} 不互补（应为 {counterpart}）",
+                        target.kind
+                    ),
+                ));
+            }
+        }
+
+        // 4. **key 防呆**：服务端重新派生 CAS key 并与入参比对。
+        //    这是「前端不能拿任意 object_key 来登记」的唯一保证 —— 派生只依赖
+        //    (upload_prefix, sha256, original_filename)，三者都过了上面的字段校验。
+        let cas_key = cos_key::build_cas_key(cfg_upload_prefix, sha256, original_filename);
+        if object_key != cas_key {
             return Err(AppError::biz(
-                code::BIZ_INVALID_VALUE,
-                format!("tmp_key {tmp_key:?} 不在 cfg_tmp_prefix {cfg_tmp_prefix:?} 范围内"),
+                code::BIZ_PART_FILE_TMP_OBJECT_MISSING,
+                format!(
+                    "object_key={object_key:?} 与按 (content_sha256, original_filename) 派生的 {cas_key:?} 不一致（须用 upload-intents 响应里回的那个 key）"
+                ),
             ));
         }
 
-        // 4. head_object（IO，无 DB）
-        let meta = cos.head_object(tmp_key).await.map_err(|e| {
+        // 5. head 校验（外部 IO，在 tx 之外）
+        let meta = cos.head_object(&cas_key).await.map_err(|e| {
             AppError::biz(
                 code::BIZ_PART_FILE_TMP_OBJECT_MISSING,
-                format!("head_object 失败（tmp_key={tmp_key:?}）: {e}"),
+                format!("head_object 失败（object_key={cas_key:?}）: {e}"),
             )
         })?;
+        if meta.size == 0 {
+            return Err(AppError::biz(
+                code::BIZ_PART_FILE_TMP_OBJECT_MISSING,
+                format!("object_key={cas_key:?} 在 COS 上是 0 字节对象"),
+            ));
+        }
         if meta.size != file_size {
             return Err(AppError::biz(
                 code::BIZ_PART_FILE_SIZE_MISMATCH,
                 format!(
-                    "tmp_key={tmp_key:?} 客户端声明 size={file_size} 与服务端 head size={} 不一致",
+                    "object_key={cas_key:?} 客户端声明 size={file_size} 与服务端 head size={} 不一致",
                     meta.size
                 ),
             ));
         }
 
-        // 5. 派生 CAS key（2026-09-29 扁平化：模板五段→两段）
-        let ext = policy::ext_of(original_filename)
-            .ok_or_else(|| AppError::biz(code::BIZ_PART_FILE_BAD_TYPE, "缺少扩展名"))?;
-        let file_type = policy::file_type_for_ext(&ext).ok_or_else(|| {
-            AppError::biz(code::BIZ_PART_FILE_BAD_TYPE, format!("未知扩展名 {ext}"))
-        })?;
-        let cas_key = cos_key::build_cas_key(cfg_upload_prefix, sha256, original_filename);
+        // 6. CAS 查重兜底（并发双 confirm 撞同一 owner+kind+sha）：
+        //    正常流程已在 upload-intents 短路，这里是并发兜底。命中活跃行时
+        //    **不重复 INSERT**；若还带 `pair_with_file_id`，配对照做（步骤 8 复用
+        //    那一行 id），否则直接返回旧行。
+        let cas_hit = {
+            let mut conn = pool.acquire().await?;
+            let mut repo: &mut sqlx::PgConnection = &mut conn;
+            PartFileRepoTrait::get_by_owner_kind_sha(&mut repo, owner_id, kind, sha256).await?
+        };
+        if cas_hit.is_some() && pair_with_file_id.is_none() {
+            let existing = cas_hit.expect("已判 is_some");
+            return Ok(Self::render_out(&existing, owner_kind));
+        }
 
-        // 6. copy_object（IO，无 DB）
-        cos.copy_object(tmp_key, &cas_key).await.map_err(|e| {
-            AppError::biz(
-                code::BIZ_PART_FILE_UPLOAD_FAILED,
-                format!("copy_object 失败（tmp={tmp_key:?} → cas={cas_key:?}）: {e}"),
-            )
-        })?;
-
-        // 2026-09-16 M2-B review 第 2 轮 B2 修：copy_object 成功后**立刻** spawn
-        // best-effort delete_object(tmp_key)，不等 commit。
-        // - commit 成功路径：handler 后续也会 spawn 一次 delete（与此处重复），但
-        //   delete_object 幂等（NoSuchKey 视为成功），不会报 21104。
-        // - commit 失败路径（create_part_file 撞 23505 / tx.commit() 抛错）：此 spawn
-        //   是**唯一**清理 tmp 的机会，否则 tmp 会留作孤儿（直到下次 list_objects
-        //   lifecycle 兜底）。
-        // 两层 spawn（service 一层 + handler 一层）双层防护；任何一层失败不阻塞另一层。
-        let cos_for_early_cleanup = cos.clone();
-        let tmp_key_for_early_cleanup = tmp_key.to_string();
-        tokio::spawn(async move {
-            if let Err(e) = cos_for_early_cleanup
-                .delete_object(&tmp_key_for_early_cleanup)
-                .await
-            {
-                tracing::warn!(
-                    tmp_key = %tmp_key_for_early_cleanup,
-                    error = %e,
-                    "bind_uploaded_file copy 后早期 spawn delete 失败（best-effort，commit 后 handler 还会再 spawn）"
-                );
-            }
-        });
-
-        // 7. 开 tx：soft_delete 旧 + INSERT 新 + readback（事务范式特例：本方法自管 tx）
+        // 7./8. tx 内写入（+ 配对）
         let mut tx = pool.begin().await?;
-        // 单文件 kind（DRAWING / 3D_MODEL / ASSEMBLY_MASTER / CAD_2D）下，旧活跃行
-        // 要先 soft_delete（`uk_t_part_file_single` 部分唯一约束，谓词按
-        // `(part_id, kind)` 走 —— 2026-10-13 PR1b 起 owner 可能是 ASSEMBLY，但该列
-        // 装的就是 owner id，故这行 SQL 对两种 owner 等价）。
         let mut repo: &mut sqlx::PgConnection = &mut tx;
-        let _ = PartFileRepoTrait::soft_delete_active_by_part_kind(
-            &mut repo, owner_id, current.id, kind,
-        )
-        .await?;
-        let new_id = snowflake.next_id();
-        PartFileRepoTrait::create_part_file(
-            &mut repo,
-            NewPartFile {
-                id: new_id,
-                part_id: owner_id,
-                owner_kind,
-                kind,
-                file_type,
-                object_key: &cas_key,
-                original_filename,
-                file_size,
-                content_type,
-                upload_status: "READY",
-                content_sha256: Some(sha256),
-                created_by: current.id,
-            },
-        )
-        .await
-        .map_err(|e| {
-            if let sqlx::Error::Database(db) = &e
-                && db.code().as_deref() == Some("23505")
-            {
-                return AppError::biz(code::BIZ_PART_FILE_DUPLICATE, "相同文件已存在");
+        let new_id = match &cas_hit {
+            // CAS 命中：不软删、不 INSERT，只在原有行上做配对（同一 owner 的同一份
+            // 内容已被登记过，再写一行会撞 `uk_t_part_file_single`）。
+            Some(existing) => existing.id,
+            None => {
+                // 单文件 kind（DRAWING / 3D_MODEL / ASSEMBLY_MASTER / CAD_2D /
+                // G_CODE / SETUP_SHEET / DELIVERY_TEMPLATE）下，旧活跃行要先
+                // soft_delete（`uk_t_part_file_single` 部分唯一约束，谓词按
+                // `(part_id, kind)` 走 —— 该列装的就是 owner id，对三种 owner
+                // 等价）。这也是送货单打印模板「二次上传 = 替换」的落点。
+                let _ = PartFileRepoTrait::soft_delete_active_by_part_kind(
+                    &mut repo, owner_id, current.id, kind,
+                )
+                .await?;
+                let id = self.snowflake.next_id();
+                let ext = policy::ext_of(original_filename)
+                    .ok_or_else(|| AppError::biz(code::BIZ_PART_FILE_BAD_TYPE, "缺少扩展名"))?;
+                let file_type = policy::file_type_for_ext(&ext).ok_or_else(|| {
+                    AppError::biz(code::BIZ_PART_FILE_BAD_TYPE, format!("未知扩展名 {ext}"))
+                })?;
+                PartFileRepoTrait::create_part_file(
+                    &mut repo,
+                    NewPartFile {
+                        id,
+                        part_id: owner_id,
+                        owner_kind,
+                        kind,
+                        file_type,
+                        object_key: &cas_key,
+                        original_filename,
+                        file_size,
+                        content_type,
+                        // ⚠️ 恒 READY：字节在 confirm 之前就已经在 COS 上（head
+                        // 校验通过），本行一落库即为可用状态。
+                        upload_status: "READY",
+                        content_sha256: Some(sha256),
+                        created_by: current.id,
+                    },
+                )
+                .await
+                .map_err(|e| {
+                    if let sqlx::Error::Database(db) = &e
+                        && db.code().as_deref() == Some("23505")
+                    {
+                        return AppError::biz(
+                            code::BIZ_PART_FILE_DUPLICATE,
+                            "同 owner + kind 已有活跃行（并发 confirm）",
+                        );
+                    }
+                    AppError::from(e)
+                })?;
+                id
             }
-            AppError::from(e)
-        })?;
+        };
+
+        // 8. CNC 配对：两行互指（`set_paired_file_id(new → pair)` + `set_paired_file_id(pair → new)`）
+        if let Some(pair_id) = pair_with_file_id {
+            PartFileRepoTrait::set_paired_file_id(&mut repo, new_id, pair_id, current.id).await?;
+            PartFileRepoTrait::set_paired_file_id(&mut repo, pair_id, new_id, current.id).await?;
+        }
+
         let row = PartFileRepoTrait::get_by_id(&mut repo, new_id, true)
             .await?
             .ok_or_else(|| AppError::internal("刚 INSERT 的 part_file 查不到"))?;
         let out = Self::render_out(&row, owner_kind);
         tx.commit().await?;
 
-        Ok((out, tmp_key.to_string()))
+        Ok(out)
     }
 }
 

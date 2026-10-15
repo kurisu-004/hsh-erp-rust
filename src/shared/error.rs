@@ -200,12 +200,10 @@ pub mod code {
     // ⚠️ 保留码位的理由（2026-10-13）：上面 4 个 DRAWING_FILE 码位随 `t_drawing_file`
     // 表一起失去调用方，但仍保留 —— 它们是 COS 上传/读取错误的历史分段位，Python 端旧
     // 前端仍可能读到；code 值是对外契约，删掉会让 code 值跳变。
-    // 下方 20406 / 20407 是活跃码，不属于这一列。
-    // 2026-09-28 新增：rust → python 薄壳鉴权转发 STS 失败。
-    // 触发场景：`POST /api/v2/files/sts-tmp-keys` 鉴权通过后调
-    // `HttpPyBackend::forward_sts_tmp_keys` 失败（网络层超时 / 连接拒 / 读取 body 失败）。
-    // HTTP 502 BAD_GATEWAY；语义与 nginx upstream 失败同形（"上传相关资源失败"）。
-    // 槽位选择：204xx 图纸文件/上传段，与 `BIZ_DRAWING_UPLOAD_FAILED=20404` 同形；20406 与上1下20405 同段连续。
+    // 下方 20407（打印转发）仍是活跃码，不属于这一列。
+    // 2026-10-15：rust → python 的 STS 转发失败**码位保留**（触发场景已随
+    // `POST /api/v2/files/sts-tmp-keys` 端点下线而消失）。
+    // 保留理由与上面 4 个 DRAWING_FILE 码位同款：码值是对外契约，删掉会让码值跳变。
     pub const BIZ_STS_FORWARD_FAILED: i32 = 20406;
     // 2026-10-03 新增：rust → python 薄壳鉴权转发**打印**失败。
     // 触发场景：打印链路 4 个端点鉴权通过后转发到 Python 端执行，失败（网络层超时 /
@@ -294,14 +292,14 @@ pub mod code {
     // 2026-10-03：同上，纯 python 端产出、rust 原样透传，rust 侧无模板容量概念。
     pub const BIZ_DELIVERY_TEMPLATE_TOO_MANY_PARTS: i32 = 21112; // python 侧：所选零件超过模板容量（法 14 / 路 25）
     pub const BIZ_DELIVERY_PRINT_BAD_ORDER: i32 = 21113; // custom_order 含非法 batch id 或漏行（422）
-    // 2026-09-16 M2-A 新增：前端直传 COS 链路错误码。
-    // 槽位选择说明：
-    // - 21114/21115 复用 211xx「零件文件」语义（tmp_key = `t_part_file.tmp_key`）。
+    // 前端直传 COS 链路的错误码（2026-10-15：对象 key 语义从 tmp 改为**正式 CAS key**，
+    // 常量名保持 `…_TMP_OBJECT_MISSING` 不变 —— 码值是对外契约，名字是仓内标识）。
     // 槽位不与 21109/21110/21111/21112/21113 冲突（这些已被送货模板占用）。
-    // 2026-09-28 删除：原 BIZ_STS_ISSUE_FAILED=21116（无业务调用方，相关 STS 会话域下线后
-    // 同步释放码段；与 Python 错误码表的"STS 失败"对齐责任由 STS 签发链路实端承担）。
-    pub const BIZ_PART_FILE_TMP_OBJECT_MISSING: i32 = 21114; // tmp_key 在 COS 不存在 / size=0（前端直传未成功落地）
-    pub const BIZ_PART_FILE_SIZE_MISMATCH: i32 = 21115; // tmp_key size 与 client 声明的 size_bytes 不一致
+    // 21114 的两个触发场景：① 入参 `object_key` 与服务端按 (sha256, filename) 重新
+    // 派生出来的 CAS key 不一致（防前端拿任意 object_key 来登记）；② 该 key 在 COS
+    // 上不存在或 size=0（前端 PUT 未成功落地）。
+    pub const BIZ_PART_FILE_TMP_OBJECT_MISSING: i32 = 21114; // object_key 不合法 / 在 COS 不存在 / size=0
+    pub const BIZ_PART_FILE_SIZE_MISMATCH: i32 = 21115; // object_key 的 head size 与 client 声明的 file_size 不一致
     // 2026-10-13 PR2：`files::part_file::preview`（GET /files/objects/{id}/preview）三条。
     // 槽位 21116 是 2026-09-28 随 STS 会话域下线释放的（原 BIZ_STS_ISSUE_FAILED），本轮复用。
     pub const BIZ_PART_FILE_PREVIEW_UNSUPPORTED: i32 = 21116; // 该文件不做预览（kind 非图纸类 / file_type ≠ PDF）→ HTTP 400
@@ -1126,7 +1124,7 @@ mod tests {
             code::BIZ_DELIVERY_PRINT_BAD_ORDER,
             "BIZ_DELIVERY_PRINT_BAD_ORDER",
         ),
-        // 2026-09-16 M2-A：前端直传 COS 链路 + STS 凭证签发错误码
+        // 前端直传 COS 链路的两个错误码
         (
             code::BIZ_PART_FILE_TMP_OBJECT_MISSING,
             "BIZ_PART_FILE_TMP_OBJECT_MISSING",
@@ -1513,7 +1511,7 @@ mod tests {
         assert_eq!(code::BIZ_DELIVERY_PART_STATUS_INVALID, 21111);
         assert_eq!(code::BIZ_DELIVERY_TEMPLATE_TOO_MANY_PARTS, 21112);
         assert_eq!(code::BIZ_DELIVERY_PRINT_BAD_ORDER, 21113);
-        // 2026-09-16 M2-A：前端直传 COS + STS 错误码数值契约
+        // 前端直传 COS 错误码数值契约（常量名带 TMP 是历史名，语义见定义处注释）
         assert_eq!(code::BIZ_PART_FILE_TMP_OBJECT_MISSING, 21114);
         assert_eq!(code::BIZ_PART_FILE_SIZE_MISMATCH, 21115);
         // 2026-10-13 PR2：COS CI 预览三码（21116 是 2026-09-28 释放的 STS 槽位）

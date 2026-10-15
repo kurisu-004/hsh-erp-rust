@@ -13,50 +13,23 @@
 //! `files::part_file::repo` 的既有取舍一致，见该文件模块 doc 的「约定」一节；
 //! 逐条清单与「取数恒 ≤ 3 条语句」的护栏见文末两节）。
 //!
-//! 范本：`files::part_file::cnc` 子模块（「复用 `t_part_file`、无 repo 层」）。
+//! 2026-10-15：上传端点下线 ⇒ `t_customer` 的只读查询由 3 条降为 **2 条**
+//! （`customer_name` / `customer_names`；L1-only 判据并入 files 域共用闸门）。
 //!
-//! ## ⚠️ 上传的**顺序**是被唯一索引逼死的，不是随手写的
+//! 范本：同域的其它「复用 `t_part_file`、无 repo 层」写法。
 //!
-//! `uk_t_part_file_single (part_id, kind) WHERE deleted_at IS NULL AND kind IN
-//! (…, 'DELIVERY_TEMPLATE')` 表达的是「**一个 L1 至多一份活跃模板**」。
-//! 所以「替换」这个语义在 DB 层只能这样实现：
+//! ## ⚠️ 替换语义由 `files::part_file::service::bind_uploaded_file` 承接
 //!
-//! ```text
-//! ① soft_delete_active_by_part_kind(customer_id, by, "DELIVERY_TEMPLATE")
-//!    ② upload_file_for_owner(repo=同一个 &mut PgConnection, …)
-//!    ③ commit
-//! ```
+//! 「一个 L1 至多一份活跃模板」由 `uk_t_part_file_single (part_id, kind)
+//! WHERE deleted_at IS NULL AND kind IN (…, 'DELIVERY_TEMPLATE')` 表达，
+//! 所以「先软删旧行、再 INSERT 新行」**必须**在同一个 PG 事务里 ——
+//! `POST /files/objects/confirm` 正是这么做的（`bind_uploaded_file` 步骤 7）。
+//! 先 INSERT 后软删会撞 23505；不共用 tx 会留下「该客户没有模板」的空洞。
 //!
-//! ⚠️ **② 必须在 ① 之后、且必须与 ① 共用同一个 tx**：
-//! - 先 INSERT 后软删 ⇒ 撞 `uk_t_part_file_single`（23505）；
-//! - 不共用同一个 tx ⇒ ① 成功、② 失败时会留下「该客户**没有**模板」的空洞，
-//!   而用户明明只想换一份。
+//! ⚠️ 模板行的写入**全部**经 confirm 一条路：本域不再有任何收字节的端点，
+//! 也就不存在「两条写入口角色口径分叉」的问题（CUSTOMER × DELIVERY_TEMPLATE
+//! 的角色闸门在 `policy::write_roles_for`，confirm 与 upload-intents 共用）。
 //!
-//! 共用 tx 的代价是：`upload_file_for_owner` 内部任何一步校验失败（扩展名 /
-//! content_type / COS PUT / INSERT）都会把 ① 一起回滚 ⇒ 语义正确。
-//! **残留的孤儿 COS 对象**：tx 回滚后新对象已经 PUT 出去了。
-//! ⚠️ 有意**不**加补偿删除 —— 对象 key 是**内容寻址**的
-//! （`util::cos_key::build_cas_key` = `{prefix}{sha16}_{safe_filename}`），
-//! 同内容重传会 PUT 到**同一个 key**（幂等覆盖），CAS 去重命中时压根不再 PUT。
-//! 真正的孤儿只有「传了份内容 X、事务回滚、内容 X 从此没人再传」这一种形态，
-//! 代价是一次对象存储写入。登记在 `docs/api/print_template.md` §8.3 第 3 条。
-//!
-//! ⚠️ **代价：CAS 去重的省流优化在替换语义下取不到**。`upload_file_for_owner`
-//! 的第 5 步按 `get_by_owner_kind_sha` 命中就跳过 COS PUT，而那条查询带
-//! `deleted_at IS NULL` —— ① 刚把旧行软删了，所以「重传同一份」走的是
-//! 「重新 PUT（幂等）+ INSERT 新行」。这也是可以接受的：省下的是一次幂等写。
-//!
-//! ## ⚠️ COS PUT 发生在事务内（沿用 `files` 域现状，有意登记）
-//!
-//! `upload_file_for_owner` 的第 6 步（`cos.put_object`）在 handler 开的事务里。
-//! 这**不是**本域引入的形态（`POST /files/objects` 逐字同款），本域沿用它而
-//! **不**单独改造 —— 改造它要动 `files` 域的共用上传原语（进而影响图纸 /
-//! 3D 模型 / 装配件整图三条既有路径），代价与收益不成比例。
-//! 对本域可接受：送货单打印模板是 **xlsx**，通常 < 500KB，
-//! 而 `COS_MAX_FILE_SIZE`（`.env.example` = 100MB）才是真正的上限 ——
-//! 一份超大模板会把连接在事务里占住相应时长。登记在
-//! `docs/api/print_template.md` §8.3 第 3 条。
-
 //! ## ⚠️ 取数恒 ≤ 3 条语句（列表端点，2026-10-16 review 第 2 轮 C-1 补）
 //!
 //! 端点 2（列表）是 N 行模板的端点，而 `customer_name` 是前端 `.strict()` schema
@@ -65,15 +38,13 @@
 //!
 //! | 端点 | 语句数 | 构成 |
 //! |---|---|---|
-//! | 1 `POST /` | **7**（CAS 命中提前返时 5） | `l1_customer_name` 1（**顺带取名**）+ 软删旧行 1 + `upload_file_for_owner` 内 4（owner 存在性复核 1 / CAS 去重查 1 / INSERT 1 / 读回 1）+ 本域 `get_file_row` 复读 1 |
 //! | 2 `GET /` | **3**（`rows` 为空时 2） | `list_with_filters` 的 rows 1 + total 1 + `customer_names` 的 `id = ANY($1)` 1 |
 //! | 3 `GET /resolve` | 2 | `get_by_part_kind` 1 + `customer_name` 1 |
 //! | 4 `GET /{id}/content` | 1 | `get_file_row` 1（字节走 COS，不算 SQL） |
 //! | 5 `POST /{id}/delete` | 2 | `soft_delete_file` 内的 `get_by_id` 1 + UPDATE 1 |
 //!
-//! ⚠️ **每个数字都与「返回行数 / 模板大小 / 客户数」无关**（端点 1 那 7 条里唯一
-//! 与历史数据量有关的是「同内容重传」⇒ CAS 命中省掉 PUT 与读回，这正是端点 2 上界
-//! 那一格注释说的同一件事）。⚠️ 这些计数会随 files 域的共用原语演化而过期
+//! ⚠️ **每个数字都与「返回行数 / 模板大小 / 客户数」无关**。⚠️ 这些计数会随
+//! files 域的共用原语演化而过期
 //! —— **要确切数字就跑一次或读 `files::part_file::service` 的步骤注释**，
 //! 别把它当契约；真正不许破的是「与行数无关」这一条，由本文件末尾的
 //! `mod query_guard` 源码级护栏钉住（逐行查的写法功能完全正确、集成测试照样全绿，
@@ -96,49 +67,11 @@ use crate::shared::error::{AppError, code};
 //  t_customer 的三处只读查询（本域唯一的跨域表引用）
 // ============================================================================
 
-/// 该 id 是不是一个**未软删的一级客户**（`parent_id IS NULL`）；是的话带回它的
-/// 名称，否则 `None`。
-///
-/// ⚠️ 这是**绑定粒度「只绑一级客户」的强制点**（本域这一侧）。返回 `None` 的四种
-/// 情形（不存在 / 已软删 / 是二级客户 / …）**一律映射成同一个 `20104`**：写侧刻意
-/// 不区分它们 —— 前端拿到的是「你选的这个客户 id 不能绑模板」，而回显的 message
-/// 里带上原始 id 让它自己改选，**不要**让前端去猜是「客户不存在」还是「客户不是
-/// 一级」（那需要它再发一次请求去查）。
-///
-/// ## 为什么顺带把名称一起取回来（2026-10-16 review 第 2 轮 C-1）
-///
-/// 端点 1 的出参 `PrintTemplateOut.customer_name`（前端 `.strict()` schema 必填）
-/// 要的就是这个名称，而**这条查询本来就带 `parent_id IS NULL`** ⇒ 多取一列是零
-/// 额外往返。若另写一条只查 `name` 的查询，端点 1 就会变成 3 条语句。
-///
-/// ## 为什么**不**直接把 `PartFileRepoTrait::customer_owner_exists` 当这道闸门
-///
-/// 那道闸门排在 `upload_file_for_owner` 内部（files 域的共用上传原语），
-/// `owner_kind='CUSTOMER'` 的角色闸门之后 —— 绑二级客户时那里会返 21105，而本域
-/// 要的是 20104（见 `docs/api/print_template.md` §4.1）。两者的**判据相同**、
-/// **错误码不同**、**位置不同**（本函数在 COS PUT 之前、零外部 IO）。
-/// ⚠️ 2026-10-16 review 第 2 轮 MAJOR-A 已把 `parent_id IS NULL` 也下沉进
-/// `customer_owner_exists`（files 域那侧是**兜底**，管「有人绕过本域 handler 直调
-/// 共用上传原语」那条路）—— **两道都要留**，不要因为有了兜底就删掉本函数。
-///
-/// ⚠️ **本函数把「是不是 L1」与「叫什么」压在同一个 `Option` 上** —— 之所以安全是
-/// 因为 `t_customer.name` 是 **NOT NULL**（baseline 迁移第 238 行）⇒ `None` 只可能
-/// 是「没命中行」，不可能是「命中了但名字是空的」。**若日后有人把 `name` 改成可空，
-/// 这里会立刻变成「无名的 L1 客户被 20104 拒掉」** —— 那时必须拆成两个查询或用
-/// `SELECT EXISTS(...) , name` 双列返回。
-async fn l1_customer_name(
-    conn: &mut PgConnection,
-    customer_id: i64,
-) -> Result<Option<String>, AppError> {
-    let name: Option<String> = sqlx::query_scalar(
-        "SELECT name FROM t_customer \
-         WHERE id = $1 AND deleted_at IS NULL AND parent_id IS NULL",
-    )
-    .bind(customer_id)
-    .fetch_optional(conn)
-    .await?;
-    Ok(name)
-}
+// 2026-10-15：`l1_customer_name`（本域上传端点的「只绑一级客户」强制点）随
+// 上传端点一并删除 —— 模板行的写入现在只经 `POST /files/objects/confirm`，而
+// 「是不是一级客户」这条判据已在 files 域的 `repo::customer_owner_exists`
+// （`parent_id IS NULL`）里，是 upload-intents 与 confirm **共用**的那道闸门。
+// ⚠️ 错误码随之是 **21105**（OWNER_NOT_FOUND）而不是本域原报的 20104。
 
 /// 一级客户名（查不到 / 已软删 ⇒ `None`，**不**报错）。
 ///
@@ -182,90 +115,22 @@ async fn customer_names(
 }
 
 // ============================================================================
-//  端点 1：POST /  上传并替换
+//  端点 1：POST /  —— 2026-10-15 起**不存在**（见下方说明）
 // ============================================================================
 
-/// 上传一份 xlsx 模板并**替换**该一级客户当前绑定的模板。
-///
-/// ⚠️ **调用顺序是契约的一部分**（handler 必须在调本函数**之前**做完这四道轻校验）：
-/// ① `bytes.is_empty()` → `40001`；② 扩展名非 xlsx → `21102`；
-/// ③ `bytes.len() > cfg_max_file_size` → `21103`；④ 前 4 字节不是
-/// `PK\x03\x04` → `21102`。**这四道都在本域自己的 handler 里**（零事务、
-/// 零 COS、零 DB），理由与代价见 [`crate::modules::print_template::dto`] 末尾。
-///
-/// 本函数内部：L1-only 强制点 → 软删旧行 → 复用 `files` 域的
-/// `upload_file_for_owner` 写新行。⚠️ **顺序理由见本文件模块 doc 的
-/// 「上传的顺序是被唯一索引逼死的」一节**，不要重排。
-///
-/// 角色：`upload_file_for_owner` 内按 `owner_kind='CUSTOMER'` 分派成
-/// **仅 Manager**（2026-10-16 新增的那道闸门，见
-/// `files::part_file::service::upload_file_for_owner`），本函数开头**复核**一次
-/// —— handler 第一行已有 `require_role(Manager)`，此处是双层守卫。
-#[allow(clippy::too_many_arguments)]
-pub async fn upload_template(
-    part_file_service: &PartFileService,
-    conn: &mut PgConnection,
-    cfg_upload_prefix: &str,
-    cfg_max_file_size: usize,
-    customer_id: i64,
-    filename: &str,
-    content_type: &str,
-    bytes: Vec<u8>,
-    current: &CurrentUser,
-) -> Result<PrintTemplateOut, AppError> {
-    // ① 本域唯一的「必须是一级客户」强制点（零外部 IO）
-    //    ⚠️ 同一条查询把客户名一并带回，供出参 `customer_name` 用（C-1）：
-    //    零额外往返，详见 `l1_customer_name` 的 doc。
-    let Some(name) = l1_customer_name(conn, customer_id).await? else {
-        return Err(AppError::biz(
-            code::BIZ_INVALID_VALUE,
-            format!(
-                "customer {customer_id} 不能绑送货单打印模板：不存在 / 已软删 / 不是一级客户（只绑一级，parent_id IS NULL）"
-            ),
-        ));
-    };
-
-    // ② 角色复核（handler 已守过一次；这里是 service 层的双层守卫）
-    current.require_role(crate::auth::rbac::Role::Manager)?;
-
-    // ③ **先**软删旧活跃行（`uk_t_part_file_single` 的硬要求，理由见模块 doc）
-    //
-    //    ⚠️ `let mut repo: &mut PgConnection = conn;` 是本仓 trait 借位的既有写法
-    //    （`PartFileRepoTrait` 直接 `impl for &mut PgConnection`，方法收 `&mut self`
-    //    ⇒ 实参要写 `&mut repo`；与 `files::part_file::service::bind_uploaded_file`
-    //    第 7 步逐字同款）。
-    {
-        let mut repo: &mut PgConnection = conn;
-        let _ = crate::modules::files::part_file::repo::PartFileRepoTrait::
-            soft_delete_active_by_part_kind(&mut repo, customer_id, current.id, TEMPLATE_KIND)
-            .await?;
-    }
-
-    // ④ 复用 files 域的**全仓唯一**上传实现（CAS key / sha256 / COS PUT /
-    //    owner 存在性复核 / content_type 校验全在它里面）。
-    //    ⚠️ `repo` 传 `&mut *conn`（同一个 tx ⇒ 与 ③ 共命运，回滚一起回滚）。
-    //    ⚠️ 它回的是 `PartFileOut`（含**从形参回显**的 `owner_kind`），本域
-    //    **刻意不直接用它**：`owner_kind` 字段是 files 域的偏差登记对象
-    //    （第 7 / 9 条），而这里已经知道行 id —— 用 `get_file_row` 复读一次，
-    //    从**行上真实字段**渲染本域的 `PrintTemplateOut`。
-    let uploaded = part_file_service
-        .upload_file_for_owner(
-            &mut *conn,
-            cfg_upload_prefix,
-            cfg_max_file_size,
-            OWNER_KIND,
-            customer_id,
-            TEMPLATE_KIND,
-            filename,
-            content_type,
-            bytes,
-            current,
-        )
-        .await?;
-
-    let row = part_file_service.get_file_row(conn, uploaded.id).await?;
-    Ok(PrintTemplateOut::from_row(&row, Some(name)))
-}
+// ⚠️ **本域不再有上传端点**（2026-10-15）
+//
+// 模板上传改走全仓统一的收文件链路：
+// `POST /files/objects/upload-intents`（`owner_kind=CUSTOMER` + `kind=DELIVERY_TEMPLATE`）
+// → 前端直传 COS → `POST /files/objects/confirm` 落行。
+//
+// 替换语义（一个 L1 至多一份活跃模板）由 confirm 内部的「软删旧行 + INSERT」
+// 在同一事务里承接（`uk_t_part_file_single` 的硬要求），本域只保留
+// 列表 / resolve / 取字节 / 软删四个端点。
+//
+// ⚠️ **「xlsx 内容是不是真 xlsx」不再由后端校验**：confirm 拿不到字节（只有 head），
+// ZIP magic / 模板结构的校验职责移交前端（前端已用 hucre 逐格校验）。
+// 登记在 `docs/api/print_template.md`。
 
 // ============================================================================
 //  端点 3：GET /resolve
@@ -438,7 +303,7 @@ mod query_guard {
     //!
     //! 同款护栏在本仓有先例：`mail_digest` 的 `n_plus_one_guard.rs`（集成测试
     //! binary）与 `shared::domain_guard.rs`（lib 单测读源码）。本域选后者 ——
-    //! 本域**没有 repo 层**、三条 `t_customer` 只读查询就在本文件里，
+    //! 本域**没有 repo 层**、`t_customer` 的两条只读查询就在本文件里，
     //! `include_str!` 读自己最短。
     //!
     //! ⚠️ **精度边界（已登记，别当「完备」用）**：三条用例**各自**的漏报形态：
@@ -454,7 +319,7 @@ mod query_guard {
     //!   第 1 条（循环体内无 `sqlx::query`，那条在别的 helper 里）过、第 2 条（总查询
     //!   点数仍是 3）过、第 3 条（只查 `list_templates`）也过 ⇒ **三条全绿**。
     //!   ⇒ 其它函数里的逐行查名，只能靠「新增 helper 时同步扩断言」这条人工纪律守。
-    //! - 若日后新增**第四个**会发查询的 helper 并在别处逐行调用它，这三条都拦不住
+    //! - 若日后新增**第三个**会发查询的 helper 并在别处逐行调用它，这三条都拦不住
     //!   ⇒ 新增 helper 时请顺手扩 `list_templates_joins_customer_names_in_memory`。
     //!
     //! ⚠️ **变异验证的覆盖面（2026-10-16 review 第 3 轮 MINOR-3 订正）**：原文写
@@ -588,11 +453,11 @@ mod query_guard {
     fn exactly_three_customer_queries_each_in_its_own_helper() {
         assert_eq!(
             query_calls(code()),
-            3,
-            "service.rs 里的查询调用点变了（预期 3：`l1_customer_name` / \
-             `customer_name` / `customer_names`）。新增前请确认它不是逐行查客户名。"
+            2,
+            "service.rs 里的查询调用点变了（预期 2：`customer_name` / \
+             `customer_names`）。新增前请确认它不是逐行查客户名。"
         );
-        for helper in ["l1_customer_name", "customer_name", "customer_names"] {
+        for helper in ["customer_name", "customer_names"] {
             assert_eq!(
                 query_calls(&fn_body(helper)),
                 1,

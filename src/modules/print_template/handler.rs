@@ -73,7 +73,7 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Multipart, Path, Query, State},
+    extract::{Path, Query, State},
     http::{StatusCode, header},
     response::Response,
     routing::{get, post},
@@ -81,12 +81,11 @@ use axum::{
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::modules::print_template::dto::{
-    DeleteTemplateRequest, ListQuery, ResolveQuery, UploadTemplateData, XLSX_MIME,
-    assert_xlsx_filename, has_zip_magic,
+    DeleteTemplateRequest, ListQuery, ResolveQuery, XLSX_MIME,
 };
 use crate::modules::print_template::service;
-use crate::modules::print_template::vo::{PrintTemplateListOut, PrintTemplateOut};
-use crate::shared::error::{AppError, code};
+use crate::modules::print_template::vo::PrintTemplateListOut;
+use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
 
@@ -97,121 +96,6 @@ use crate::state::AppState;
 /// 授权矩阵**逐字不变**（仍照前端 `deliveryNotePermissions.ts::canPrint` 的
 /// MANAGER / CLERK / INSPECTOR），只改描述文字。
 const PRINT_PERMISSION: &str = "delivery_note.print";
-
-// ============================================================================
-//  端点 1：POST /
-// ============================================================================
-
-/// `POST /api/v2/print-templates` → **201 Created**
-///
-/// multipart：`data`（JSON 文本字段 `{"customer_id":"<雪花 id>"}`）+ `file`（xlsx 字节）。
-/// 语义是**替换**：该 L1 先有的模板被软删，新模板生效（`uk_t_part_file_single`
-/// 的硬要求，顺序理由见 `service.rs` 模块 doc）。
-///
-/// 权限：Manager 独占（守卫在**读 multipart 之前**，避免未授权请求触发整包内存分配；
-/// service 内再复核一次）。⚠️ 不是权限点：模板是配置，写它要有管理面。
-pub async fn upload_template(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    mut multipart: Multipart,
-) -> Result<(StatusCode, Json<R<PrintTemplateOut>>), AppError> {
-    current.require_role(Role::Manager)?;
-
-    let mut data_json: Option<String> = None;
-    let mut file_bytes: Option<Vec<u8>> = None;
-    let mut file_name: Option<String> = None;
-    let mut file_content_type: Option<String> = None;
-
-    // ⚠️ 循环写法逐字照抄 `files::part_file::handler::upload_part_file`：
-    //    按 `field.name()` 分发，未识别的字段 drain 掉忽略（不报错 ——
-    //    multipart 里多塞一个字段不该让整个请求失败）。
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| AppError::validation(format!("multipart 解析失败: {e}")))?
-    {
-        match field.name().unwrap_or("") {
-            "data" => {
-                data_json = Some(
-                    field
-                        .text()
-                        .await
-                        .map_err(|e| AppError::validation(format!("data 字段读取失败: {e}")))?,
-                );
-            }
-            "file" => {
-                file_name = field.file_name().map(|s| s.to_string());
-                file_content_type = field.content_type().map(|s| s.to_string());
-                let bytes = field
-                    .bytes()
-                    .await
-                    .map_err(|e| AppError::validation(format!("file 字段读取失败: {e}")))?;
-                file_bytes = Some(bytes.to_vec());
-            }
-            _ => {
-                let _ = field.bytes().await;
-            }
-        }
-    }
-
-    let data_json =
-        data_json.ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "缺少 data 字段"))?;
-    let data: UploadTemplateData = serde_json::from_str(&data_json)
-        .map_err(|e| AppError::biz(code::BIZ_INVALID_VALUE, format!("JSON 解析失败: {e}")))?;
-    let customer_id = data.parse_customer_id()?;
-    let bytes =
-        file_bytes.ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "缺少 file 字段"))?;
-    let filename = file_name.ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "缺少文件名"))?;
-    let content_type = file_content_type
-        .unwrap_or_else(|| crate::modules::print_template::dto::XLSX_MIME.to_string());
-
-    // ---- ⚠️ 本域自己的四道轻校验（**在调 service 之前**、零事务零 COS 零 DB）----
-    //
-    // 顺序即错误码优先级：0 字节 → 扩展名 → 大小 → ZIP magic。
-    // ⚠️ **第 4 道只挡「改名成 .xlsx 的非 zip」**：xlsx 结构合法性由前端已有的
-    // `assertTemplateMatches` 把关，后端**刻意不引入 zip crate**（理由与代价见
-    // `dto.rs` 末尾）。魔法字节就是 zip 的前 4 字节 `PK\x03\x04`。
-    if bytes.is_empty() {
-        return Err(AppError::validation("模板字节为空"));
-    }
-    assert_xlsx_filename(&filename)?;
-    if bytes.len() > state.config.cos.max_file_size {
-        return Err(AppError::biz(
-            code::BIZ_PART_FILE_TOO_LARGE,
-            format!(
-                "模板 {} bytes 超过上限 {}（{}MB）",
-                bytes.len(),
-                state.config.cos.max_file_size,
-                state.config.cos.max_file_size / 1024 / 1024
-            ),
-        ));
-    }
-    if !has_zip_magic(&bytes) {
-        return Err(AppError::biz(
-            code::BIZ_PART_FILE_BAD_TYPE,
-            format!(
-                "送货单打印模板必须是 xlsx（zip 容器），但 {} 的前 4 字节不是 PK\\x03\\x04 —— 可能只是把别的文件改名成了 .xlsx",
-                filename
-            ),
-        ));
-    }
-
-    let mut tx = state.pool.begin().await?;
-    let out = service::upload_template(
-        &state.part_file_service,
-        &mut tx,
-        &state.config.cos.upload_prefix,
-        state.config.cos.max_file_size,
-        customer_id,
-        &filename,
-        &content_type,
-        bytes,
-        &current,
-    )
-    .await?;
-    tx.commit().await?;
-    Ok((StatusCode::CREATED, Json(R::ok(out))))
-}
 
 // ============================================================================
 //  端点 2：GET /
@@ -366,11 +250,7 @@ pub async fn delete_template(
 /// 计数口径与全仓一致：一条 `.route(path, m1)` 记 1 条；一条
 /// `.route(path, get(h).post(h))` 记 2 条。
 pub const ROUTES: &[&str] = &[
-    // ⚠️ 顺序按 `routes_in_router_source` 的解析结果：`.route("/", get(h).post(h))`
-    //    记「GET 先、POST 后」。mod.rs 的端点表按**语义**排（上传在前），
-    //    两处顺序不同是刻意的 —— 这里必须跟解析器走。
     "GET /",
-    "POST /",
     "GET /resolve",
     "GET /{template_id}/content",
     "POST /{template_id}/delete",
@@ -383,7 +263,7 @@ pub const ROUTES: &[&str] = &[
 /// 静态段先于捕获段。将来若有人加 `GET /{template_id}`，这里不用改也不会炸。
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/", get(list_templates).post(upload_template))
+        .route("/", get(list_templates))
         .route("/resolve", get(resolve_template))
         .route("/{template_id}/content", get(get_template_content))
         .route("/{template_id}/delete", post(delete_template))
@@ -432,11 +312,10 @@ mod tests {
             assert!(seen.insert(*r), "ROUTES 里 `{r}` 重复了");
         }
         assert!(ROUTES.contains(&"GET /"));
-        assert!(ROUTES.contains(&"POST /"));
         assert_eq!(
             ROUTES.len(),
-            5,
-            "本域端点数是 5；改端点必须同步改这里与 mod.rs 端点表"
+            4,
+            "本域端点数是 4（2026-10-15 起无上传端点）；改端点必须同步改这里与 mod.rs 端点表"
         );
     }
 
@@ -445,27 +324,5 @@ mod tests {
     fn router_builds() {
         let r: Router<Arc<AppState>> = router();
         drop(r);
-    }
-
-    /// ZIP magic 判据本身：`PK\x03\x04` 放行、其余拒、短于 4 字节拒。
-    #[test]
-    fn zip_magic_accepts_only_pk_header() {
-        use crate::modules::print_template::dto::has_zip_magic;
-        assert!(has_zip_magic(b"PK\x03\x04rest-of-zip"));
-        assert!(!has_zip_magic(b"%PDF-1.5\n%%EOF\n"));
-        assert!(!has_zip_magic(b"PK\x03"));
-        assert!(!has_zip_magic(b""));
-    }
-
-    /// 扩展名守卫：只收 `xlsx`（大小写不敏感），其余一律 21102。
-    #[test]
-    fn filename_guard_only_accepts_xlsx() {
-        use crate::modules::print_template::dto::assert_xlsx_filename;
-        assert!(assert_xlsx_filename("模板.xlsx").is_ok());
-        assert!(assert_xlsx_filename("TEMPLATE.XLSX").is_ok());
-        for bad in ["模板.xls", "模板.pdf", "模板", "模板.xlsx.exe"] {
-            let err = assert_xlsx_filename(bad).expect_err(bad);
-            assert_eq!(err.code(), 21102, "{bad} 应得 21102");
-        }
     }
 }

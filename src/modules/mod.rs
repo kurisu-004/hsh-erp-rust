@@ -18,8 +18,6 @@ pub mod assembly;
 // URL 迁移到 `/api/v2/com/*`（见本文件 `v2_router` 与 `com/mod.rs`）。
 pub mod com;
 pub mod dashboard;
-// 2026-09-28 新增 files 域：薄壳鉴权转发端点（`POST /api/v2/files/sts-tmp-keys` → python `/api/v1/files/sts-tmp-keys`）。
-// 修复 python STS 端口裸开鉴权漏洞：rust 端强制 JWT + Role 鉴权后再转发。
 // 2026-10-13 升格为**文件资源容器域**：原独立 `part_file` 域与 `cnc_program` 域收编进来，
 // 顶层 `pub mod part_file;` / `pub mod cnc_program;` 两条声明随之删除，
 // 下方 `/part-files` 与 `/cnc-programs` 两个 nest 也一并删除（**旧路径 404，无 alias**）。
@@ -94,9 +92,6 @@ pub mod wecom;
 // 是本域自有的一份，与 mail_digest / dashboard 两处人工同步）。
 // 完整契约见 `docs/api/wecom-daily.md`。
 pub mod wecom_daily;
-// 2026-09-28 删除：相关上传会话域（Redis 共享 STS 凭证会话机制）。
-// 前端改为单 uploader 触发时单 HTTP 调用 python `sts-tmp-keys` 数组入参直签，
-// 不再走 rust 转发。
 // 2026-09-28 新增：微信小程序 BFF 域（`/api/v2/wx/*` 聚合端点）
 pub mod wx;
 
@@ -154,13 +149,11 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // `/api/v2` 前缀）并存；前者给前端走「HTTP 首取 + WS 事件 invalidate」
         // 模式，后者保留供 WS-only 老客户端握手 + snapshot。
         .nest("/dashboard", dashboard::http_router())
-        // 2026-09-28 新增：files 域（当时是薄壳鉴权转发 STS 端点到 python）。
-        // 端点：`POST /api/v2/files/sts-tmp-keys`（详见 `modules/files/mod.rs`）。
-        // 2026-10-13：files 域升格为文件资源容器域，**这一行是 files 域唯一的顶层挂载**，
-        // 域内两个嵌套子模块的路由由 `files::router()` 内部 nest 声明：
-        //   `/files/sts-tmp-keys`  → STS 凭证转发（本 nest 自身）
-        //   `/files/objects/*`      → `files::part_file`      （t_part_file 的对象语义）
-        //   `/files/cnc/*`          → `files::part_file::cnc` = CNC 配对
+        // files 域：**这一行是 files 域唯一的顶层挂载**，域内嵌套子模块的路由由
+        // `files::router()` 内部 nest 声明：
+        //   `/files/objects/*`      → `files::part_file`（t_part_file 的对象语义：
+        //                              列表 / upload-intents / confirm / url / content /
+        //                              delete / preview）
         // 硬切无 alias：旧顶层前缀 `/api/v2/part-files/*`（12 条里 4 条改名 + 8 条删除）
         // 与 `/api/v2/cnc-programs/*`（1 条改名 + 4 条删除）一律 404。
         .nest("/files", files::router())

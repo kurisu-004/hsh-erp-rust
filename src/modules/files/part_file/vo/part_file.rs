@@ -60,3 +60,41 @@ pub struct PartFileListOut {
     pub items: Vec<PartFileOut>,
     pub total: i64,
 }
+
+/// `POST /api/v2/files/objects/upload-intents` 出参（逐项对应入参，顺序一致）。
+///
+/// 2026-10-15 新增：每个 item 有两种互斥形态 ——
+///
+/// | `already_exists` | 含义 | 前端动作 |
+/// |---|---|---|
+/// | `true` | 同 owner + kind + 同 sha 已有**活跃行**（秒传） | 跳过 PUT 与 confirm，直接用 `existing_file` |
+/// | `false` | 需新传 | PUT 到 `upload_url`（头带 `content_type`），再 confirm |
+///
+/// 两种形态的字段用 `skip_serializing_if` 互斥省略：秒传项**不会**带
+/// `upload_url`（服务端没签、也不该让前端误 PUT），新传项不带 `existing_file`。
+#[derive(Debug, Clone, Serialize)]
+pub struct UploadIntentsOut {
+    pub items: Vec<UploadIntentItemOut>,
+}
+
+/// 单个签发结果（见 [`UploadIntentsOut`] 的两态表）。
+#[derive(Debug, Clone, Serialize)]
+pub struct UploadIntentItemOut {
+    /// 入参 `client_ref` 原样回显。
+    pub client_ref: String,
+    pub already_exists: bool,
+    /// 正式 CAS key（`{upload_prefix}{sha16}_{safe_filename}`）；秒传时为 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object_key: Option<String>,
+    /// 预签 PUT URL；秒传时为 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_url: Option<String>,
+    /// 前端 PUT 时必须原样带上；秒传时为 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    /// URL 剩余有效期（秒）；秒传项同样回（值为配置值，前端不用看）。
+    pub expires_in: u32,
+    /// 秒传命中的既有行（`PartFileOut` 全字段）；需新传时为 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub existing_file: Option<PartFileOut>,
+}

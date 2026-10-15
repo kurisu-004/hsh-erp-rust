@@ -51,11 +51,9 @@
 //!   AND version=$3 AND deleted_at IS NULL`
 //! - `soft_delete_active_by_part_kind` —— 替代原 service `bind_uploaded_file` 内的
 //!   inline SQL（单文件 kind 的旧活跃行 soft_delete）
-//! - `insert_setup_sheet_with_paired` / `set_paired_file_id` —— 给本域的
-//!   `files::part_file::cnc` 子模块 `CncProgramService::upload_cnc_pair` 用：原
-//!   `cnc_program::service` 内 inline `INSERT INTO t_part_file ... SETUP_SHEET
-//!   ... paired_file_id = $9` 与 `UPDATE t_part_file SET paired_file_id = $2 ...`
-//!   SQL 字符串零 diff 迁入 trait impl。
+//! - `set_paired_file_id` —— CNC 配对（G_CODE ↔ SETUP_SHEET）的 `paired_file_id`
+//!   回写：`POST /files/objects/confirm` 带 `pair_with_file_id` 时在事务内调两次
+//!   （新行 → 对面行、对面行 → 新行）。
 //!
 //! ## automock
 //! `#[cfg_attr(test, mockall::automock)]` 在 trait 上声明，生成 `MockPartFileRepoTrait`
@@ -200,27 +198,7 @@ pub trait PartFileRepoTrait: Send {
         kind: &'a str,
     ) -> Result<u64, sqlx::Error>;
 
-    // ── cnc_pair 写入 helper（2）── 从 `files::part_file::cnc::service` 迁来
-    //    （SQL 字符串零 diff）
-    /// `INSERT INTO t_part_file ... SETUP_SHEET ... paired_file_id = $9, ...`。
-    /// `CncProgramService::upload_cnc_pair` 写 SETUP_SHEET 行专用。
-    #[allow(clippy::too_many_arguments)]
-    async fn insert_setup_sheet_with_paired<'a>(
-        &mut self,
-        id: i64,
-        part_id: i64,
-        file_type: &'a str,
-        object_key: &'a str,
-        original_filename: &'a str,
-        file_size: i64,
-        content_type: &'a str,
-        content_sha256: Option<&'a str>,
-        paired_file_id: i64,
-        created_by: i64,
-    ) -> Result<(), sqlx::Error>;
-    /// `UPDATE t_part_file SET paired_file_id = $2, updated_at = now(), updated_by = $3
-    /// WHERE id = $1 AND deleted_at IS NULL` —— `CncProgramService::upload_cnc_pair`
-    /// 互写 paired_file_id 专用。
+    // ── CNC 配对 helper（1）── `POST /files/objects/confirm` 的 `pair_with_file_id`
     async fn set_paired_file_id(
         &mut self,
         g_code_id: i64,
@@ -384,46 +362,8 @@ impl PartFileRepoTrait for &mut PgConnection {
         Ok(rows_affected)
     }
 
-    // ── cnc_pair 写入 helper（2）── inline SQL（迁自 `files::part_file::cnc::service`，
-    //    零 diff）
-    #[allow(clippy::too_many_arguments)]
-    async fn insert_setup_sheet_with_paired<'b>(
-        &mut self,
-        id: i64,
-        part_id: i64,
-        file_type: &'b str,
-        object_key: &'b str,
-        original_filename: &'b str,
-        file_size: i64,
-        content_type: &'b str,
-        content_sha256: Option<&'b str>,
-        paired_file_id: i64,
-        created_by: i64,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "INSERT INTO t_part_file \
-               (id, part_id, kind, file_type, object_key, original_filename, \
-                file_size, content_type, upload_status, content_sha256, \
-                paired_file_id, \
-                created_at, created_by, updated_at, updated_by) \
-             VALUES ($1, $2, 'SETUP_SHEET', $3, $4, $5, $6, $7, 'READY', $8, \
-                     $9, now(), $10, now(), $10)",
-        )
-        .bind(id)
-        .bind(part_id)
-        .bind(file_type)
-        .bind(object_key)
-        .bind(original_filename)
-        .bind(file_size)
-        .bind(content_type)
-        .bind(content_sha256)
-        .bind(paired_file_id)
-        .bind(created_by)
-        .execute(&mut **self)
-        .await?;
-        Ok(())
-    }
-
+    // ── CNC 配对 helper（1）── inline SQL（SQL 字符串沿用 `files::part_file::cnc`
+    //    被删前的那一份，零 diff）
     async fn set_paired_file_id(
         &mut self,
         g_code_id: i64,

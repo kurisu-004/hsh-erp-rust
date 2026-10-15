@@ -21,18 +21,14 @@ pub struct PartBatchCreateFailure {
 
 /// `POST /parts/batch` 出参：`created` 与 `failed` 互斥。
 ///
-/// 2026-09-16 M2-B review 第 1 轮：`cleanup_tmp_keys` 新增字段。
-/// - 含义：本批次成功 INSERT 后、需要 commit 后异步清理的 tmp 对象 key 列表
-///   （client 已直传到 COS tmp 区，已被 service 端 head+copy 到 CAS key）。
-/// - 用途：handler 在 `tx.commit()` 之后 `tokio::spawn` 批量 `cos.delete_object(&key)`
-///   兜底，避免 commit 失败却已触发 COS 删除产生孤儿。
-/// - 前端不需要该字段（`#[serde(default)]` 兜空，前端忽略）；后端用 `out.cleanup_tmp_keys`。
-/// - legacy（无 binding）路径该列表为空，前端 / 集成测试无需关注。
+/// ⚠️ `cleanup_tmp_keys` **恒为空数组**（2026-10-15 起本端点不再绑定文件，故没有
+/// 需要后置清理的临时对象）。字段**保留**是为了不改动前端已消费的响应形状；
+/// 它不在任何生产路径上被写入，新代码不要依赖它。
 #[derive(Debug, Clone, Serialize)]
 pub struct PartBatchCreateOut {
     pub created: Vec<crate::modules::part::vo::PartDetailOut>,
     pub failed: Vec<PartBatchCreateFailure>,
-    /// commit 后由 handler spawn 异步清理的 tmp 对象 key 列表。
+    /// 恒为空（见上方 doc）；保留字段仅为响应形状兼容。
     #[serde(default)]
     pub cleanup_tmp_keys: Vec<String>,
 }

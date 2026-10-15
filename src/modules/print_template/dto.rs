@@ -1,7 +1,12 @@
-//! `print_template` 域 DTO：入参请求体 + multipart 的 `data` 字段
+//! `print_template` 域 DTO：入参请求体（query / body）
 //!
 //! 出参 VO 另放 [`super::vo`]（与 `files::part_file` / `mail_digest` 两域的取舍不同：
 //! 本域入参只有 3 个小结构、出参有 3 个，分开放可读性更好）。
+//!
+//! ⚠️ 2026-10-15：上传端点下线，本域随之不再有「multipart `data` 字段」与
+//! **ZIP magic / xlsx 扩展名**这两道后端校验 —— 后端 confirm 拿不到字节，
+//! 「这份 xlsx 是不是真 xlsx」改由前端 `assertTemplateMatches` 承担。
+//! 完整取舍见本文件末尾。
 //!
 //! ## i64 一律是 JSON string
 //!
@@ -11,61 +16,14 @@
 //! 非数字字符串走 `20104 BIZ_INVALID_VALUE`（不是 422 —— 与 `files` 域
 //! `POST /objects` 的 `owner_id` 处理逐字一致）。
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-use crate::modules::files::part_file::policy;
 use crate::shared::error::{AppError, code};
 
 /// `GET /` 列表：缺省单页条数。
 pub const LIST_LIMIT_DEFAULT: i64 = 50;
 /// `GET /` 列表：单页条数上限（与 `PartFileService::list_files` 的 clamp 同档）。
 pub const LIST_LIMIT_MAX: i64 = 200;
-
-// ============================================================================
-//  multipart `data` 字段
-// ============================================================================
-
-/// `POST /` 的 multipart 文本字段 `data` 的 JSON 体。
-///
-/// ⚠️ **只带 `customer_id` 一个键** —— `owner_kind` / `kind` 刻意**不**由客户端给：
-/// 本域只有「一级客户的送货单打印模板」这一种东西，两者由服务端钉死
-/// （`"CUSTOMER"` / `"DELIVERY_TEMPLATE"`，见 [`super::service`]）。
-/// 与 `POST /files/objects` 的 `UploadFileData` 恰好相反：那边是个通用上传原语，
-/// 这边是单一用途端点，把两个字段暴露给 client 只会多出「传错组合」的失败形态。
-///
-/// `customer_id` 必须是**一级客户**的 id（JSON string 形态的雪花 id）。
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct UploadTemplateData {
-    /// 一级客户 `t_customer.id`，JSON **string** 形态。
-    pub customer_id: String,
-}
-
-impl UploadTemplateData {
-    /// 解析 `customer_id` → `i64`（非数字 ⇒ 20104）。
-    ///
-    /// 刻意**不**用 `deserialize_i64` 那类自动转换：那类 helper 收数字 / 字符串两
-    /// 种形态，而本仓的约定是雪花 id 出入参统一 string（`shared::types`），
-    /// 这里与 `files::part_file::handler::upload_part_file` 的 `owner_id` 逐字同款。
-    pub fn parse_customer_id(&self) -> Result<i64, AppError> {
-        self.customer_id
-            .parse::<i64>()
-            .map_err(|_| {
-                AppError::biz(
-                    code::BIZ_INVALID_VALUE,
-                    format!("customer_id 非法: {:?}", self.customer_id),
-                )
-            })
-            .and_then(|id| {
-                if id <= 0 {
-                    return Err(AppError::biz(
-                        code::BIZ_INVALID_VALUE,
-                        format!("customer_id 非法（须为正雪花 id）: {id}"),
-                    ));
-                }
-                Ok(id)
-            })
-    }
-}
 
 // ============================================================================
 //  查询 / 路径 / 请求体
@@ -170,55 +128,23 @@ pub const TEMPLATE_KIND: &str = "DELIVERY_TEMPLATE";
 /// 上传闸门**只收**这个精确值，所以回包也只能是它。
 pub const XLSX_MIME: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 
-/// ZIP 容器的前 4 字节（xlsx 就是个 zip）—— `PK\x03\x04`。
-///
-/// ⚠️ **只挡「改名成 `.xlsx` 的非 zip」**，不解析 zip 结构（后端刻意**不引入
-/// zip crate**，见本文件末尾的取舍说明）。
-pub const ZIP_MAGIC: [u8; 4] = [0x50, 0x4B, 0x03, 0x04];
-
-/// 判字节是否以 ZIP magic 开头。
-///
-/// 只看**前 4 字节**，且要求字节长度 ≥ 4（0 字节由上一道 40001 挡下，这里也
-/// 独立成立，不依赖调用顺序）。
-pub fn has_zip_magic(bytes: &[u8]) -> bool {
-    bytes.len() >= ZIP_MAGIC.len() && bytes[..ZIP_MAGIC.len()] == ZIP_MAGIC
-}
-
-/// 校验扩展名必须是 `xlsx`（否则 21102 `BIZ_PART_FILE_BAD_TYPE`）。
-///
-/// 复用 `policy::ext_of`（`Path::extension`，大小写不敏感、自动取最后一段）。
-/// ⚠️ 这是**本域的第一道格式守卫**：`policy::allowed_exts(TEMPLATE_KIND)` 也会
-/// 拒非 xlsx（那是在 `upload_file_for_owner` 内部、更晚一步），本函数让拒绝
-/// 发生在**调 service 之前** —— 少一次事务往返、少一次 COS 交互。
-pub fn assert_xlsx_filename(filename: &str) -> Result<(), AppError> {
-    match policy::ext_of(filename) {
-        Some(ext) if ext == "xlsx" => Ok(()),
-        Some(ext) => Err(AppError::biz(
-            code::BIZ_PART_FILE_BAD_TYPE,
-            format!("送货单打印模板只支持 .xlsx，收到扩展名 {ext:?}（filename={filename:?}）"),
-        )),
-        None => Err(AppError::biz(
-            code::BIZ_PART_FILE_BAD_TYPE,
-            format!("送货单打印模板缺少扩展名（filename={filename:?}）"),
-        )),
-    }
-}
-
 // ============================================================================
-//  取舍说明（为什么不引入 zip crate）
+//  取舍说明：xlsx 内容校验为什么不在后端（2026-10-15）
 // ============================================================================
 //
-// **后端刻意不做 xlsx 内部结构校验**（不引入 `zip` / `calamine` 之类 crate）。
+// **后端不做任何 xlsx 内容校验** —— 连「前 4 字节是不是 `PK\x03\x04`」那道
+// 也没有了。
 //
-// 判据是**分工**：xlsx 内部结构（有没有 `xl/workbook.xml`、命名空间对不对、
-// 模板区域（`print_area` / `print_titles`）是否被 hucre 认得）**只有渲染方知道
-// 答案**，而渲染方是前端的 `assertTemplateMatches`（已在用）。后端能廉价提供的
-// 只有「这至少是个 zip 容器」这一层 —— 那正是 `has_zip_magic` 做的。
+// 原因：统一上传链路后，字节由前端直传 COS、后端 confirm 只拿到 `head`
+// （size / etag），**拿不到内容**。ZIP magic 判据与「是不是真 xlsx」这类问题在
+// 后端**物理上无法回答**（除非把整份字节再拉回来，那正是本次要消除的代理上传）。
 //
-// 代价与收益的平衡：
-// - 收益：零新依赖、零 CVE 面、零「后端解压一个用户上传的 zip」的 zip-bomb 面。
-// - 代价：一个把 `.xlsx` 内部结构改坏的模板能**存进库**（报错点后移到前端渲染时）。
+// 职责移交前端：前端在选文件时用 hucre 逐格解析（`assertTemplateMatches`），
+// 解析不过就不发起 upload-intents ⇒ 后端不会收到「不是 xlsx 的 .xlsx」。
 //
-// ⚠️ **不要**在后人「补全 xlsx 校验」时顺手把校验加到上传端点上、又在不同时机
-// 放宽 —— 那是两个失败面。若将来真要在后端加结构校验，应当**先**与前端
-// `assertTemplateMatches` 对齐判据清单，登记在 `docs/api/print_template.md` §8.3。
+// ⚠️ **这是有意弱化，代价要说清**：绕过前端直接打
+// `POST /files/objects/upload-intents` + `confirm` 的话，一份非 xlsx 的
+// `.xlsx` 能存进库，报错点后移到前端渲染时。登记在
+// `docs/api/print_template.md`。⚠️ 不要在后人「补全 xlsx 校验」时又在**另一个**
+// 时机加回来 —— 那会造出第二个失败面；若将来要后端校验结构，必须与前端
+// `assertTemplateMatches` 对齐判据清单后再定。

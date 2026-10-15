@@ -557,7 +557,7 @@ impl PreviewService {
     /// ## ⚠️ `prefix` 的 `trim_matches('/')` 是必需的，不是洁癖
     ///
     /// `config.rs` 的缺省值是 `previews`（**无**尾斜杠），而同结构体的
-    /// `upload_prefix` / `tmp_prefix` 缺省都**带**尾斜杠 —— 三者形态不一致，
+    /// `upload_prefix` 缺省**带**尾斜杠 —— 两者形态不一致，
     /// 运维照着 `COS_UPLOAD_PREFIX=obj/` 的习惯把 `COS_PREVIEW_PREFIX` 配成
     /// `previews/` 是极自然的事。不 trim 就产出 `previews//<seed>/`：
     /// COS 的 key 里 `//` 是**实打实的两个字符**，不会像 URL 那样被规范化 ⇒
