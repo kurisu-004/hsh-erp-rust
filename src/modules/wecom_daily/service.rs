@@ -66,10 +66,10 @@ use crate::modules::wecom::sender;
 use crate::modules::wecom::service as wecom_service;
 use crate::modules::wecom_daily::dto::{
     ConfigDefaultsOut, ConfigOut, Frequency, LOGS_LIMIT_MAX, LogListOut, LogListQuery,
-    MAX_CHUNKS_MAX, MAX_CHUNKS_MIN, NormalizedConfig, PreviewOut, PreviewRequest,
-    SUBJECT_TEMPLATE_MAX_CHARS, SaveConfigRequest, SendResultOut, SendStatus, TriggerSource,
-    ORDER_LIST_LIMIT_MAX, ORDER_LIST_LIMIT_MIN, UPCOMING_DAYS_MAX, UPCOMING_DAYS_MIN,
-    WORKER_TOP_N_MAX, WORKER_TOP_N_MIN, report_window,
+    MAX_CHUNKS_MAX, MAX_CHUNKS_MIN, NormalizedConfig, ORDER_LIST_LIMIT_MAX, ORDER_LIST_LIMIT_MIN,
+    PreviewOut, PreviewRequest, SUBJECT_TEMPLATE_MAX_CHARS, SaveConfigRequest, SendResultOut,
+    SendStatus, TriggerSource, UPCOMING_DAYS_MAX, UPCOMING_DAYS_MIN, WORKER_TOP_N_MAX,
+    WORKER_TOP_N_MIN, report_window,
 };
 use crate::modules::wecom_daily::model::{TWeComDailyConfigRow, TWeComDailyLogRow};
 use crate::modules::wecom_daily::repo::{self, NewDailyLog};
@@ -1125,8 +1125,8 @@ pub fn worker_quantity_total(rows: &[crate::modules::wecom_daily::dto::WorkerBar
 mod tests {
     use super::*;
     use crate::modules::wecom_daily::dto::{
-        MAX_CHUNKS_DEFAULT, ORDER_LIST_LIMIT_DEFAULT, UPCOMING_DAYS_DEFAULT,
-        WORKER_TOP_N_DEFAULT, WorkerBarRow, WorkerMetric,
+        MAX_CHUNKS_DEFAULT, ORDER_LIST_LIMIT_DEFAULT, UPCOMING_DAYS_DEFAULT, WORKER_TOP_N_DEFAULT,
+        WorkerBarRow, WorkerMetric,
     };
 
     fn row(name: &str, batch: i32, quantity: i32) -> WorkerBarRow {
@@ -1308,7 +1308,8 @@ mod tests {
         assert_eq!(MAX_CHUNKS_DEFAULT, 6);
         // 4 组 × 缺省 30 条 × 135 字节 ≈ 16.2 KB ⇒ 每片 4048 字节预算下 5 片装得下
         assert!(
-            (4 * ORDER_LIST_LIMIT_DEFAULT * 135) as usize / (4096 - 48) < MAX_CHUNKS_DEFAULT as usize,
+            (4 * ORDER_LIST_LIMIT_DEFAULT * 135) as usize / (4096 - 48)
+                < MAX_CHUNKS_DEFAULT as usize,
             "缺省配置生成的清单必须装得进缺省片数"
         );
         // ⚠️ 「6 仍在 `1..=20` 之内」这一条由 `max_chunks_bounds_are_21804` 里的

@@ -122,7 +122,10 @@ fn default_config_is_the_meta_defaults_segment() {
     assert_eq!(d.worker_metric, WorkerMetric::Quantity);
     assert_eq!(d.worker_top_n, 15);
     assert_eq!(d.order_list_limit, 30, "第三节清单每组 30 条（0 = 不限）");
-    assert_eq!(d.max_chunks, 6, "缺省片数按「清单装得下」重算过（见 dto 的 doc）");
+    assert_eq!(
+        d.max_chunks, 6,
+        "缺省片数按「清单装得下」重算过（见 dto 的 doc）"
+    );
     assert!(d.include_overview && d.include_delivery && d.include_orders && d.include_workers);
     assert!(d.include_drawings, "清单默认带图纸直链");
     assert_eq!(d.subject_template, None);
