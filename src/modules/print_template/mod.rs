@@ -77,9 +77,10 @@
 //! ## 守卫：两条读端点**绝不能** MANAGER-only
 //!
 //! 打印对话框是 **CLERK / INSPECTOR** 在用（备货、点检、装车都要打单），不是管理
-//! 员的活。故端点 3 / 4 用**权限点** `delivery_note.print`（默认矩阵恰是
-//! MANAGER / CLERK / INSPECTOR，见 `seeds/rbac.sql`），端点 1 / 2 / 5 用
-//! `require_role(Manager)`（模板是配置，改它会影响别人出货单上的抬头）。
+//! 员的活。故端点 2（resolve）/ 3（content）用**权限点** `delivery_note.print`
+//! （默认矩阵恰是 MANAGER / CLERK / INSPECTOR，见 `seeds/rbac.sql`），端点
+//! 1（列表）/ 4（软删）用 `require_role(Manager)`（模板是配置，改它会影响别人
+//! 出货单上的抬头）。
 //!
 //! ⚠️ 这**不是** RBAC 面板那套「面板是权限真源、用权限点守会自锁」的情形 ——
 //! 面板自身才需要角色兜底（`docs/api/iam.md` §9），本域不是权限真源。
@@ -98,7 +99,7 @@
 //! `id = ANY($1)`（不许逐行查）：见 `service.rs` 模块 doc 的「取数恒 ≤ 3 条语句」
 //! 一节与文件末尾的 `mod query_guard` 源码级护栏。
 //!
-//! ⚠️ 端点 4 取字节走的是 files 域最底层的 `get_file_content_for_row`
+//! ⚠️ 端点 3 取字节走的是 files 域最底层的 `get_file_content_for_row`
 //! （**不判权限、不判 kind、不查库**）而不是 `get_file_content_of_checked_row`：权限点
 //! `delivery_note.print` 由本域 handler 判（本域刻意不套 files 域那张 5 角色表
 //! —— 一个只持该权限点、不在表内的账号不该被二次拒绝），kind 校验在本域 service

@@ -1,4 +1,4 @@
-//! 端点 5 `POST /print-templates/{id}/delete`（OCC）+ 端点 2 `GET /print-templates`（列表）
+//! 端点 4 `POST /print-templates/{id}/delete`（OCC）+ 端点 1 `GET /print-templates`（列表）
 //!
 //! 覆盖 7 组场景（★ = 核心回归）：
 //! 1. ★ `delete_without_version_field_returns_422_plain_text` —— OCC 锚点缺失 ⇒

@@ -32,16 +32,16 @@
 //!
 //! ## ⚠️ 取数恒 ≤ 3 条语句（列表端点，2026-10-16 review 第 2 轮 C-1 补）
 //!
-//! 端点 2（列表）是 N 行模板的端点，而 `customer_name` 是前端 `.strict()` schema
+//! 端点 1（列表）是 N 行模板的端点，而 `customer_name` 是前端 `.strict()` schema
 //! 的**必填**字段（review 第 2 轮 C-1 补的出参）⇒ 天然 tempt 人写成「逐行查名」。
 //! 本域的形态：
 //!
 //! | 端点 | 语句数 | 构成 |
 //! |---|---|---|
-//! | 2 `GET /` | **3**（`rows` 为空时 2） | `list_with_filters` 的 rows 1 + total 1 + `customer_names` 的 `id = ANY($1)` 1 |
-//! | 3 `GET /resolve` | 2 | `get_by_part_kind` 1 + `customer_name` 1 |
-//! | 4 `GET /{id}/content` | 1 | `get_file_row` 1（字节走 COS，不算 SQL） |
-//! | 5 `POST /{id}/delete` | 2 | `soft_delete_file` 内的 `get_by_id` 1 + UPDATE 1 |
+//! | 1 `GET /` | **3**（`rows` 为空时 2） | `list_with_filters` 的 rows 1 + total 1 + `customer_names` 的 `id = ANY($1)` 1 |
+//! | 2 `GET /resolve` | 2 | `get_by_part_kind` 1 + `customer_name` 1 |
+//! | 3 `GET /{id}/content` | 1 | `get_file_row` 1（字节走 COS，不算 SQL） |
+//! | 4 `POST /{id}/delete` | 2 | `soft_delete_file` 内的 `get_by_id` 1 + UPDATE 1 |
 //!
 //! ⚠️ **每个数字都与「返回行数 / 模板大小 / 客户数」无关**。⚠️ 这些计数会随
 //! files 域的共用原语演化而过期

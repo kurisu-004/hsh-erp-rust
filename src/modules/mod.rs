@@ -38,10 +38,11 @@ pub mod mail_digest;
 pub mod outsource;
 pub mod part;
 // 2026-10-16 新增 print_template 域：送货单打印模板（xlsx）的**存 + 绑 + 取字节**，
-// 5 端点，URL 挂 `/api/v2/print-templates`。
+// **4 端点**，URL 挂 `/api/v2/print-templates`。
 // ⚠️ 模板字节**不新建表**，复用 `files` 域自有的 `t_part_file`
 // （`kind='DELIVERY_TEMPLATE'`、`part_id` 承载一级客户的 `t_customer.id`），
 // 「该 L1 名下存在一行未软删的模板」本身就是绑定关系。
+// ⚠️ **写入不在本域**：走 `files` 域两条写入口（upload-intents + confirm）。
 // 本域**不恢复任何打印端点** —— 渲染一直在前端 hucre，本域只管存取。
 // 完整契约见 `docs/api/print_template.md`。
 pub mod print_template;
@@ -256,11 +257,11 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // `/cron/wecom-daily*` 是**全新前缀**（无旧路径）故无 404 用例；它们各自的
         // 路由表由 `wecom::handler::tests` / `wecom_daily::handler::tests` 的
         // 「ROUTES 与 router() 源码逐条比对」守住。
-        // 2026-10-16 新增：print_template 域（送货单打印模板：xlsx 上传 / 绑一级客户 /
-        // 打印时取模板字节）。5 端点。
-        // 守卫分两档：写端点 3 条（`POST /` 上传替换、`GET /` 列表、
-        // `POST /{id}/delete` 软删）`require_role(Manager)`；读端点 2 条
-        // （`GET /resolve`、`GET /{id}/content`）用**权限点 `delivery_note.print`**
+        // 2026-10-16 新增：print_template 域（送货单打印模板：xlsx 绑一级客户 /
+        // 打印时取模板字节）。**4 端点**（写入不在本域，见下方「守卫分两档」）。
+        // 守卫分两档：`require_role(Manager)` 的**管理面端点 2 条**
+        //（`GET /` 列表、`POST /{id}/delete` 软删）；**权限点 `delivery_note.print`**
+        // 的读端点 2 条（`GET /resolve`、`GET /{id}/content`）
         // （默认矩阵 M / C / I）—— 打印对话框是 CLERK / INSPECTOR 在用，
         // 绝不能 MANAGER-only。守卫写在各 handler 第一行，此处不挂 role layer。
         // 前缀 `/print-templates`：与前端菜单的**子项**
@@ -270,7 +271,7 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         //（它是目录项、不指向页面）—— 2026-10-16 review 第 1 轮 MINOR-4 订正：
         // 原注释把 path 记在 `template_management` 名下，与 `seeds/menu.sql`
         // 实际不符。顶层 nest、单段、kebab-case。
-        // 权威路由清单：`print_template::handler::ROUTES`（5 条，lib 单测比对）。
+        // 权威路由清单：`print_template::handler::ROUTES`（4 条，lib 单测比对）。
         // 完整契约见 `docs/api/print_template.md`。
         .nest("/print-templates", print_template::router())
         // 2026-09-28 新增：微信小程序 BFF 域（聚合端点 + 复用 IAM 鉴权）

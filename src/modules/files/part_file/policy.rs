@@ -34,7 +34,7 @@ use crate::auth::rbac::Role;
 /// `AssemblyService::upload_assembly_files` 的判定（`ext != "pdf"` 即拒）逐字等价。
 /// 连带效果：`dto::validate::check_kind` 复用同一张白名单，confirm 一并接受该 kind。
 ///
-/// ⚠️ **覆盖的 kind 必须与 DB 的 `ck_t_part_file_kind` 逐条对齐**：全仓**每一条**
+/// ⚠️ **本表的 kind 集必须与 DB 的 `ck_t_part_file_kind` 逐条对齐**：全仓**每一条**
 /// 收文件入口都是 `upload-intents` + `confirm`，两者都判本表 ⇒ 「本表缺某个 kind」
 /// 等于「那个 kind 在**任何**入口都上传不了」。当前 7 条全收
 /// （`DRAWING` / `3D_MODEL` / `ASSEMBLY_MASTER` / `CAD_2D` / `G_CODE` /
@@ -46,6 +46,10 @@ use crate::auth::rbac::Role;
 /// 入口可上传**。DB 侧早已允许该 kind（CHECK 约束、`uk_t_part_file_single` 谓词、
 /// [`is_file_content_kind`] 白名单、软删分派 `CAD_2D => M+C`），只有这两张**写侧**
 /// 表漏了它 ⇒ 本次是**补齐写侧**，读侧与删侧一直就是通的。
+/// ⚠️ **两张写侧表必须同批改**（本表与 [`owner_kind_allows_kind`]）：任缺一张，
+/// 那个 kind 在两条写入口都传不上来。⚠️ 这条**没有测试能自动兜住**（本表是
+/// `match`、没有可枚举的键集；`tests` 里那条守卫只遍历写死的 7 个字面量）
+/// ⇒ 靠「新增 kind 时人工同步两张表 + 那条守卫的数组」这条纪律。
 ///
 /// **2026-10-15 新增 `G_CODE` / `SETUP_SHEET`**：CNC 配对的两种文件改走
 /// `POST /objects/upload-intents` + `POST /objects/confirm`（`pair_with_file_id`
@@ -505,9 +509,11 @@ mod tests {
         assert!(!owner_kind_allows_kind("PART_FILE", "DRAWING"));
     }
 
-    /// ⚠️ **两张写侧表必须逐条对齐**（2026-10-15）：`allowed_exts` 缺某个 kind
-    /// ⇒ 扩展名闸门拒它；本表缺 ⇒ owner×kind 配对闸门拒它。任缺一张，那个 kind 在
-    /// upload-intents 与 confirm 里都**上传不了**（`CAD_2D` 就这么丢过一次）。
+    /// **只覆盖下面这 7 个字面量，不覆盖「将来新增的 kind」。** `allowed_exts` 是
+    /// `match`，没有可枚举的键集，本用例只能把已知 kind 逐个写死 —— 新增第 8 个 kind
+    /// 时**它不会变红**，两张表漏同步也照样漏过（`CAD_2D` 就这么丢过一次）。
+    /// ⇒ **新增 kind 必须人工同步本用例的数组**（同时改
+    /// [`allowed_exts`] 与 [`owner_kind_allows_kind`]）。
     #[test]
     fn every_allowed_ext_kind_is_mounted_on_some_owner() {
         for kind in [

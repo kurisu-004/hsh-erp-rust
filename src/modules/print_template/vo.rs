@@ -2,8 +2,9 @@
 //!
 //! ⚠️ **刻意不复用 `files::part_file::vo::PartFileOut`**（那是 files 域的出参，
 //! 归它所有）：`PartFileOut` 的 `owner_kind` 字段是**从请求参数回显**的
-//! （`service::render_out(&row, owner_kind)` 取形参），而本域 5 条端点里只有
-//! 端点 1 走那条路径、端点 3 / 4 是**按 id 取回**的 —— 回显不出 `CUSTOMER`。
+//! （`service::render_out(&row, owner_kind)` 取形参），而本域的 4 条端点
+//! **全部**是按 `(part_id, kind='DELIVERY_TEMPLATE')` 取回或列举的 —— 回显不出
+//! `CUSTOMER`。
 //! 照抄一份 VO 出来、再让 `owner_kind` 变成「要么对、要么空」的字段，只会把
 //! files 域那处已登记的偏差（`files/part_file/mod.rs` 已知偏差第 7 / 9 条）复制过来。
 //! 本域的 VO 全部**从行上真实字段渲染**，`kind` 恒为 `DELIVERY_TEMPLATE`。
@@ -19,7 +20,8 @@ use serde::Serialize;
 use crate::modules::files::part_file::model::TPartFile;
 use crate::shared::types::serialize_i64;
 
-/// 单份送货单打印模板的出参（端点 1 / 2 / 3 复用同一形状）。
+/// 单份送货单打印模板的出参（端点 1 列表 / 端点 2 resolve 复用同一形状；
+/// 端点 3 回裸字节、端点 4 无出参，都不用它）。
 #[derive(Debug, Clone, Serialize)]
 pub struct PrintTemplateOut {
     /// `t_part_file.id`（雪花 ID，序列化为 **string**，防 JS 精度截断）。

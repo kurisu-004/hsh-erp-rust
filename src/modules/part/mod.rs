@@ -123,10 +123,10 @@ use crate::state::AppState;
 //   `files::part_file` 的 upload-intents → 前端直传 → confirm（owner = 建单后拿到的
 //   part_id）。`assemblies` 侧的 multipart PDF 仍在本域（只喂 `lopdf` 数页数、
 //   **不入库不上 COS**）。
-// 下线的 7 条端点逐条清单见 `src/modules/files/part_file/handler.rs` 的模块 doc
-// 「2026-10-13 同批下线的 7 条端点（移除记录，防后人重建）」一节；PR1b 的 3 条
-// （upload-drawing / upload-3d-model / files/confirm）见同一文件的
-// 「2026-10-13 PR1b：写路径搬进本子模块（上传四合一）」一节。
+// 逐条移除记录见 `src/modules/files/part_file/handler.rs` 的模块 doc
+// 「⚠️ 本域**没有任何收字节的端点**」一节下的两张表：「已下线的收字节入口」列的是
+// 上面的收字节 / 硬切端点，「2026-10-13 同批下线的『零件维度嵌套列表』入口」列的是
+// 那 7 条零件维度嵌套列表。
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()

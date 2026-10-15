@@ -1,8 +1,8 @@
 //! part 域单件 CRUD 业务逻辑（2026-09-16 M2-C 拆分）
 //!
-//! 本文件承载单件 CRUD + 列表 + 上传 + 历史 / 位置树等查询；批量创建相关逻辑
-//! （含直传 COS 文件绑定 `batch_create_parts_with_bindings` / legacy 路径 /
-//! `prepare_binding_head_copy`）已迁出到 `service/batch.rs`，避免单文件超 1000 行。
+//! 本文件承载单件 CRUD + 列表 + 历史 / 位置树等查询；批量创建相关逻辑（含 2026-10-15
+//! 随统一上传链路下线的「直传 COS 文件绑定」那一支）已迁出到 `service/batch.rs`，
+//! 避免单文件超 1000 行。
 //!
 //! ## 范围（本文件）
 //! - `create_part` / `list_parts` / `get_part` / `get_part_by_serial` /
@@ -174,9 +174,7 @@ impl PartService {
         req: &PartBatchCreateRequest,
         current: &CurrentUser,
     ) -> Result<crate::modules::part::vo::PartBatchCreateOut, AppError> {
-        // 2026-09-16 M2-B + M2-C：薄包装转 legacy 实现（不绑定文件）。
-        // 文件绑定走 `batch_create_parts_with_bindings`（handler 层显式选，
-        // 实现已迁出到 `service/batch.rs`）。
+        // 薄包装转 `service/batch.rs` 的实现（纯建单，不碰 `t_part_file`）。
         Self::batch_create_parts_legacy(repo, snowflake, req, current).await
     }
 

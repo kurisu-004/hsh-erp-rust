@@ -1,4 +1,4 @@
-//! 端点 3 / 4：`GET /print-templates/resolve` 与 `GET /{id}/content`
+//! 端点 2 / 3：`GET /print-templates/resolve` 与 `GET /{id}/content`
 //!
 //! 覆盖 19 组场景（★ = 核心回归）：
 //! 1. ★ `resolve_hit_returns_template_and_customer_name`
@@ -117,7 +117,7 @@ async fn customer_name_is_present_on_list_and_resolve() {
         "confirm 回 `PartFileOut`，按契约不含 customer_name：{env}"
     );
 
-    // ② 端点 2（列表）
+    // ② 端点 1（列表）
     let (st, env) = crate::list(&ctx, "", &ctx.manager_token).await;
     assert_eq!(st, StatusCode::OK, "{env}");
     assert_eq!(env["data"]["items"].as_array().unwrap().len(), 1, "{env}");
@@ -126,7 +126,7 @@ async fn customer_name_is_present_on_list_and_resolve() {
         "列表每行都必须带客户名：{env}"
     );
 
-    // ③ 端点 3（resolve）：行内那个 + 顶层那个（刻意重复，两个都得在）
+    // ③ 端点 2（resolve）：行内那个 + 顶层那个（刻意重复，两个都得在）
     let (st, env) = resolve(&ctx, ctx.l1_id, &ctx.manager_token).await;
     assert_eq!(st, StatusCode::OK, "{env}");
     assert_eq!(

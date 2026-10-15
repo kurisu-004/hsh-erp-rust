@@ -14,7 +14,7 @@
 //! 序列化成 **string**（防 JS 精度截断，见 CLAUDE.md「DB 约定」最后几条）。
 //! 入参侧同理：**雪花 id 必须以字符串形式提交**（`customer_id`），
 //! 非数字字符串走 `20104 BIZ_INVALID_VALUE`（不是 422 —— 与 `files` 域
-//! `POST /objects` 的 `owner_id` 处理逐字一致）。
+//! `POST /files/objects/confirm` 的 `owner_id` 处理逐字一致）。
 
 use serde::Deserialize;
 

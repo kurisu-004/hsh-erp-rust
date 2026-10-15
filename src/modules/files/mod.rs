@@ -45,7 +45,7 @@
 //! 正向对照（200）+ 尾斜杠对照（404）双向钉死。
 //!
 //! 各端点的逐字段契约、角色矩阵理由、移除记录见 `part_file/mod.rs` 与
-//! `part_file/cnc/mod.rs` 的模块 doc。
+//! `part_file/handler.rs` 的模块 doc。
 //!
 //! ⚠️ **本表的计数真源是两张 `ROUTES` 常量**：`part_file::handler::ROUTES`（7 条，
 //! 即本表全部端点）与 `handler::ROUTES`（0 条 —— 容器层只 nest、无自有端点）。

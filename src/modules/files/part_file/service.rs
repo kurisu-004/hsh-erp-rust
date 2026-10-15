@@ -562,10 +562,8 @@ impl PartFileService {
 // - 本方法保持原签名（pool / snowflake / cos 全部参数化），由 service 自行
 //   `pool.begin()` 开 tx；tx 内 DB 操作仍走 trait 模式（`&mut *tx` 直接喂给
 //   `PartFileRepoTrait`）。
-// - 这是 handler 移交事务范式的**唯一例外**，余下 **5** 个 part_file 端点
-//   （upload / list / get_url / get_content / soft_delete）均按 handler 管 tx 范式改造。
-//   （2026-10-13 review 第 1 轮 NIT-10 订正：原文写「6 个」并把 `soft_delete` 与
-//   `delete` 拆成两条数，实际它们是同一条端点 `POST /files/objects/{file_id}/delete`。）
+// - 这是 handler 移交事务范式的**唯一例外**，余下端点（list / get_url /
+//   get_content / soft_delete）均按 handler 管 tx 范式改造。
 
 impl PartFileService {
     /// 登记一个**已由前端直传到 COS 正式 CAS key** 的对象（INSERT `t_part_file`）。
@@ -577,9 +575,6 @@ impl PartFileService {
     /// 1. 角色闸门 —— `policy::confirm_roles_for(owner_kind, kind)`
     /// 2. owner 存在性 + `owner_kind` × `kind` 配对
     /// 3. 字段校验（kind / sha256 / filename / size / content_type / 扩展名白名单）。
-    ///    仅当 `pair_with_file_id` 给了才继续第 3b 步：目标行存在 + **kind 互补**
-    ///    + **同一个 owner**（`part_id` 相同）；任一不满足 ⇒ 20104 / 21101，
-    ///    **零副作用**。
     /// 4. **key 防呆**：服务端按 `content_sha256` + `original_filename` **重新派生**
     ///    CAS key，与入参 `object_key` 逐字比对，不一致即 21114
     /// 5. `head_object`：不存在 / size=0 → 21114；size 与声明不符 → 21115
@@ -588,8 +583,12 @@ impl PartFileService {
     /// 8. tx 内：CNC 配对（`pair_with_file_id` 给了才做）双向互写
     /// 9. commit → `PartFileOut`
     ///
-    /// ⚠️ 步骤 8 是**覆写**语义：`set_paired_file_id` 不清对面的旧指向，所以
-    /// 步骤 3b 的 owner / kind 两道校验是它唯一的正确性前提 —— 配错一次就是
+    /// 第 3 步与第 4 步之间还有一步：**仅当 `pair_with_file_id` 给了**才做的配对
+    /// 目标校验 —— 目标行存在 + **kind 互补** + **同一个 owner**（`part_id` 相同）。
+    /// 任一不满足 ⇒ 20104 / 21101，且排在任何写入之前 ⇒ **零副作用**。
+    ///
+    /// ⚠️ 步骤 8 是**覆写**语义：`set_paired_file_id` 不清对面的旧指向，所以上面那
+    /// 道配对目标校验的 owner / kind 两条是它唯一的正确性前提 —— 配错一次就是
     /// 前端 `paired_file_id` 分组串料。
     ///
     /// ## ⚠️ **内容 sha256 不做服务端校验**（与 sha 绑定有关的取舍见 `mod.rs`）

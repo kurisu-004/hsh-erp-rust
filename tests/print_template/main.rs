@@ -12,8 +12,8 @@
 //! - `upload.rs`  —— 模板写入链路（upload-intents → 直传 → confirm）/ 替换语义 /
 //!   校验矩阵 / 403 守卫。⚠️ **2026-10-15 起本域没有上传端点**：写入一律经
 //!   `POST /files/objects/upload-intents` + `POST /files/objects/confirm`
-//! - `resolve.rs` —— 端点 3 / 4：21109 未绑定 / 内容字节 / 权限点守卫 / 旧路径 404
-//! - `delete.rs`  —— 端点 5：OCC（缺 version ⇒ 422 纯文本 / 陈旧 ⇒ 40901）+ 端点 2 列表
+//! - `resolve.rs` —— 端点 2 / 3：21109 未绑定 / 内容字节 / 权限点守卫 / 旧路径 404
+//! - `delete.rs`  —— 端点 4：OCC（缺 version ⇒ 422 纯文本 / 陈旧 ⇒ 40901）+ 端点 1 列表
 //!
 //! ## 前置条件
 //! - PG：`scripts/test_nextest.sh` 自带 session 容器与 per-test fresh database。

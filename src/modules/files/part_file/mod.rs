@@ -54,6 +54,11 @@
 //! ≤ `COS_MAX_FILE_SIZE`）+ COS `head_object` 的实测 size 与入参逐字比对
 //! （不符即 **21115**）；`head` 为 0 字节同样按「对象没落地」处理（**21114**）。
 //!
+//! **③ CUSTOMER 的角色口径。** `owner_kind='CUSTOMER'`（送货单打印模板）**两条**
+//! 写入口都只放 **Manager**（`policy::write_roles_for`，共用同一张表）；
+//! 且 owner 存在性走 `repo::customer_owner_exists`（含 `parent_id IS NULL`）⇒
+//! 只绑**一级**客户，绑二级客户得 **21105**。
+//!
 //! **④ ⚠️ CAS 秒传的判据已从「服务端算的 sha」变成「客户端声明的 sha」。**
 //! 上面 ① 的第一段说的是「服务端**既拿不到字节、也无法重算 sha**」——但**秒传**
 //! 这一条路上，服务端连一次 `head` 都不做：`grant_upload_intents` 拿
@@ -78,11 +83,6 @@
 //! 命中同一个对象。这是内容寻址的正常性质（省一份存储），但也意味着「拿到一张
 //! 能写某 key 的签名 URL」与「能绑到哪个 owner」是两件事 —— owner 归属由
 //! `t_part_file` 行决定，不由 key 决定。
-//!
-//! **③ CUSTOMER 的角色口径。** `owner_kind='CUSTOMER'`（送货单打印模板）**两条**
-//! 写入口都只放 **Manager**（`policy::write_roles_for`，共用同一张表）；
-//! 且 owner 存在性走 `repo::customer_owner_exists`（含 `parent_id IS NULL`）⇒
-//! 只绑**一级**客户，绑二级客户得 **21105**。
 //!
 //! ### ⚠️ 前端配套改动清单（2026-10-15 两条写入口的 DTO 逐字段变更）
 //!
@@ -237,7 +237,7 @@
 //! | `GET /files/objects`（列表） | M / C / I / CNC / **SHELF** | 2026-10-10 放开 SHELF；⚠️ 2026-10-16 起**永不返回 `DELIVERY_TEMPLATE` 行**（显式传 `kind` 也是空） |
 //! | `GET /files/objects/{id}/content` | M / C / I / CNC / **SHELF** | 2026-10-10 放开 SHELF；⚠️ 2026-10-16 起**加 kind 白名单**（拒 `DELIVERY_TEMPLATE` 等非文件类 kind），与 `/url` 共用 `policy::is_file_content_kind` |
 //! | `GET /files/objects/{id}/url` | 权限点 `part.drawing.print`（默认矩阵 M / C / I / CNC） | **默认矩阵刻意不含 SHELF**，见下；⚠️ 2026-10-16 起**同样加 kind 白名单**（review 第 1 轮 MAJOR-2） |
-//! | `GET /files/objects/{id}/preview` | M / C / I / CNC / **SHELF** | 2026-10-13 PR2 新增；⚠️ **含 SHELF 是对上一行的有意反转**，见下 |
+//! | `GET /files/objects/{id}/preview` | M / C / I / CNC / **SHELF** | 新增于 2026-10-13；⚠️ **含 SHELF 是对上一行的有意反转**，见下。⚠️ **只有 `DRAWING` / `ASSEMBLY_MASTER` 的 PDF 可预览**（`preview::assert_previewable`），`CAD_2D` / `3D_MODEL` / `G_CODE` / `SETUP_SHEET` 一律 **21116** |
 //! | `POST /files/objects/{id}/delete` | 按 kind 派生（图纸类 + `ASSEMBLY_MASTER` M / C，G_CODE M / CNC，`DELIVERY_TEMPLATE` **仅 Manager**） | `ASSEMBLY_MASTER` 是 2026-10-13 review 第 1 轮 MINOR-6 补进分派的；`DELIVERY_TEMPLATE` 是 2026-10-16 新增（否则「写得进、删不掉」） |
 //!
 //! ### ⚠️ 写侧对各 kind 的接受面（当前事实）
@@ -248,6 +248,10 @@
 //!
 //! - `DRAWING` / `3D_MODEL` / `ASSEMBLY_MASTER` / `CAD_2D`：M+C+CNC 可写
 //!   （与图纸 / 3D 模型 / 装配件整图 / CAD 源文件的既有权限面一致）。
+//!   ⚠️ **CAD_2D 没有预览**：`preview::assert_previewable` 只放
+//!   `DRAWING` / `ASSEMBLY_MASTER` 且 `file_type` 必 PDF（DWG 本身也栅格化
+//!   不了，COS CI 只吃 PDF / 图片）⇒ 调 `GET /objects/{id}/preview` 返 **21116**。
+//!   取字节请走 `/content` 或 `/url`（`CAD_2D` 在 `is_file_content_kind` 白名单内）。
 //! - `G_CODE` / `SETUP_SHEET`：confirm 侧 M+CNC（`confirm_roles_for`）；
 //!   `upload-intents` 侧 M+C+CNC。
 //! - `DELIVERY_TEMPLATE`：**仅 Manager**（两条写入口都是）。
@@ -345,6 +349,7 @@
 //! | 14 | **`files` 域的 kind 白名单与 `print_template` 域的 kind 校验是**两份**、错误码不同**：本域「白名单外的 kind」⇒ **21102**（HTTP 400，端点不服务这种类型）；模板域「不是 `DELIVERY_TEMPLATE`」⇒ **21101**（HTTP 404，这行在别的端点眼里不存在） | **有意保留 + 已登记**。两者面向的前端动作不同：21102 让前端提示「换个入口」，21101 让它刷新列表。别为了「统一」把任一侧改成另一侧的码 |
 //! | 15 | **模板曾能被绑到**二级客户**上**：`owner_kind` / `owner_id` 全由 client 给，而 owner 存在性只判「存在且未软删」 ⇒ Manager 能造出一行绑在 L2 上的模板行。后果三条：① 破坏「只绑一级客户」不变式；② `uk_t_part_file_single` 是 `(part_id, kind)`、L1 行与 L2 行互不冲突 ⇒「一个 L1 至多一份活跃模板」被绕过；③ 该行 `resolve` 永远读不到 ⇒ 孤儿配置行 | **已闭合**（L1 判据下沉进 `repo::customer_owner_exists`，谓词含 `AND parent_id IS NULL`，错误码沿用 21105。集成测试从外部钉住，并断言**零副作用**：库里无行 + 桶里无对象 + 父 L1 未被碰） |
 //! | 16 | **「xlsx 内容是不是真 xlsx」不再由后端校验**：统一链路后 confirm 只拿到 `head`（size / etag），拿不到字节 ⇒ ZIP magic 判据在**后端物理上无法回答**。该职责移交前端（选文件时用 hucre 逐格解析） | **有意弱化 + 已登记**。代价：绕过前端直打两条通用端点时，一份非 xlsx 的 `.xlsx` 能存进库，报错点后移到前端渲染时。取舍全文见 `print_template/dto.rs` 末尾与 `docs/api/print_template.md`。⚠️ 别在另一个时机「补全」回来 —— 那会造出第二个失败面 |
+//! | 17 | **`POST /parts/batch` 的 `items[].drawing_file` / `model3d_file` 被 serde 静默丢弃**（2026-10-15）：`PartBatchCreateItem` 未开 `deny_unknown_fields` ⇒ 前端继续发这两个字段会拿到 **200 + 零副作用**，文件绑定凭空消失、**服务端没有任何信号** | **有意保留 + 已登记**（与 confirm 的 `tmp_key`→`object_key` 硬切方向**相反**：那条是缺字段即 422、fail-loud，这两条是 fail-silent。两条是独立决策，别拿其中一个的结论套另一个）。⇒ **前端必须停发这两个字段**。钉住它的集成测试在 `tests/part/crud.rs::batch_create_ignores_removed_binding_fields` |
 pub mod dto;
 pub mod handler;
 pub mod model;
