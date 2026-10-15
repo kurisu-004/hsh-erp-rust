@@ -290,11 +290,14 @@ impl PreviewService {
     ///   不发生，只把**已经 READY** 的那些直链取出来。⇒ 「预览一次日报」不会烧掉
     ///   CI 配额、也不会让 HTTP 请求挂在那儿等几分钟。
     ///
-    /// ## ⚠️ **准备段恒 2 条语句 + 推进段轮转**（为什么不按 part 逐个等）
+    /// ## ⚠️ **准备段 ≤ 2 条语句 + 推进段轮转**（为什么不按 part 逐个等）
     ///
     /// | 段 | 语句数 | 与 part 数的关系 |
     /// |---|---|---|
     /// | 准备 | `t_part_file` 按 `part_id` 批量 **1** 条 + `t_file_preview` 按 seed 批量 **1** 条 | **无关** |
+    ///
+    /// ⚠️ 准备段**刻意不写死条数**：入参是空集时一条都不发（没有 `part_id` 可查），
+    /// 而「查回来 0 个 PDF 文件」只发前一条 ⇒ 上界 2、下界 0。
     /// | 推进 | 每个未收敛者**每格**至多 1 次 python 往返 + 3~4 条状态迁移语句 | 与「未收敛数 × 轮数」成正比 |
     ///
     /// 已就绪的那些**零 IO** 返回、不进推进段。
@@ -314,11 +317,13 @@ impl PreviewService {
     /// —— 本函数最长会跑满 `budget`（分钟级），握着一条 `PoolConnection` 等 CI 会把
     /// 连接池占满、读端点跟着排队。
     ///
-    /// ⚠️ `#[allow(too_many_arguments)]` 是**刻意**的：八个形参里有五个是
-    /// **部署级配置**（`pool` / `py_backend` / `prefix` / `base_url` / `image_params`），
-    /// 它们在本仓的惯例里都由调用方从 `AppState` 直接传（`handler::get_part_file_preview`
-    /// 同款）。打成结构体只会在签名里造一层「看起来更整齐、实际每处调用都要多构造一个
-    /// 东西」的壳，而这三个 `&str` 在函数体内再拆包时还得逐个注明谁是谁。
+    /// ⚠️ `#[allow(too_many_arguments)]` 是**刻意**的，而本文件**同时**有 [`UrlParams`]
+    /// —— 两者服务的不是同一件事：`UrlParams` 是**内部传播**用的（`drive_pending` /
+    /// `advance_one` 那些「三个配置 + 四五个别的」的深层签名，逐层拆包反而更难读），
+    /// 而**公开入口**这一层**刻意不收它**：三个 `&str` 都是**部署级配置**，本仓惯例是
+    /// 调用方从 `AppState` 直传（`handler::get_part_file_preview` 同款）。让外部域为了
+    /// 调一次入口而构造一个本模块私有的配置分组，等于把本模块的分组方式强加给别人，
+    /// 还把「用 `view` 档而不是 `thumb`」这类**逐个字段**的取舍注释挤到构造器里去。
     #[allow(clippy::too_many_arguments)]
     pub async fn ensure_ready_for_parts(
         &self,
@@ -357,6 +362,13 @@ impl PreviewService {
         };
 
         // ③ 轮转推进未收敛者，直到预算耗尽 / 全部收敛 / 全部终局失败。
+        // ⚠️ **零预算（`Duration::ZERO`，只读路径如管理端 `/preview`）直接不进推进段**：
+        // 那条路径本就该「零 CI 提交」，若照常进去，每个未就绪者都会因 `now >= deadline`
+        // 被判超时、最后打出一条「预算耗尽」的 warn —— 与推送路径**真的**烧完预算的
+        // 那条 warn 混在一起，稀释了排障信号（2026-10-23）。
+        if budget.is_zero() {
+            return ready;
+        }
         self.drive_pending(
             pool,
             py_backend,
@@ -719,6 +731,15 @@ impl PreviewService {
     ///
     /// 写成本方法（而不是内联进 `advance_one`）是为了让「重置 0 行 → 读回真实状态 →
     /// 可能已是 READY / FAILED」的收尾有地方落脚，又不必把整个状态机的缩进再套一层。
+    ///
+    /// ⚠️ `#[allow(too_many_arguments)]` 的理由（2026-10-23 补）：十个形参分属三组
+    /// **不同维度**的上下文，打成结构体只会得到一个「什么都装」的对象 ——
+    /// `pool` / `py_backend` / `preview_prefix` 是**环境**（与调用方共享，不属于本轮
+    /// 推进）、`seed` + `file` 是**这一份图纸的身份**、`conn` + `row` 是**这条状态行
+    /// 的可变现场**、`actor_id` + `now` 是**审计口径**。其中 `conn` 与 `row` **必须按
+    /// 值/可变借用单独传**才能保住上面那条「`drop(conn)` 是真还连接」的性质，
+    /// 一旦塞进同一个结构体就会退化成「从 `&mut ctx` 里 drop 一个字段」，那条编译期
+    /// 保护随之失效 —— 而它正是这个方法存在的理由。
     #[allow(clippy::too_many_arguments)]
     async fn advance_pending(
         &self,
