@@ -73,7 +73,8 @@
 //! 放宽 V6 的代价不是「多一种排班形态」，而是日历写端点必须新增一条跨
 //! `days × shifts` 的区间求交检查、且与并发插入之间存在 TOCTOU 窗口。
 //!
-//! ## 错误码段：**219xx**（2026-10-19 新增）
+//! ## 错误码段：**219xx**（2026-10-19 新增；表内触发场景 2026-10-23 复核，
+//! 与 `docs/api/hr.md` §6 逐行对齐）
 //!
 //! ⚠️ **不是 216xx**：该段（上传会话域）已于 2026-09-28 随域下线**释放**，但复用
 //! 一个「已用过又被回收」的段位有风险 —— 老客户端 / 旧日志里可能还残留 216xx 的映射，
@@ -82,15 +83,20 @@
 //!
 //! | 码 | 常量 | HTTP | 触发场景 |
 //! |---|---|---|---|
-//! | 21901 | `BIZ_HR_SHIFT_NOT_FOUND` | 404 | 查 / 改 / 停用一个不存在或已软删的班次 |
-//! | 21902 | `BIZ_HR_SHIFT_CODE_DUPLICATED` | 409 | 班次 `code` 重复（**不是** 40901 OCC） |
-//! | 21903 | `BIZ_HR_SHIFT_SEGMENT_INVALID` | 400 | 段非法 / 库里那一列 jsonb 解不出来 |
+//! | 21901 | `BIZ_HR_SHIFT_NOT_FOUND` | 404 | 查 / 改 / 停用 / 写覆盖 / 清覆盖，以及**端点 8 的读**，命中一个不存在或已软删的班次；也含**写 SQL 0 行后的回查归因**（班次在写语句与回查之间被并发软删，0 行归因表见 `docs/api/hr.md` §5.8） |
+//! | 21902 | `BIZ_HR_SHIFT_CODE_DUPLICATED` | 409 | 班次 `code` 重复（**不是** 40901 OCC）；应用层预检与 DB partial unique 的并发兜底**同码** |
+//! | 21903 | `BIZ_HR_SHIFT_SEGMENT_INVALID` | 400 | 段非法（V1–V5 任一），或库里那一列 jsonb 解不出来 / 解出来过不了 V1–V6（降级成 21903 而不是 500） |
 //! | 21904 | `BIZ_HR_CALENDAR_RANGE_INVALID` | 400 | `from > to` / 跨度 > 366 天 / upsert 或 delete 的批量**条数** > 366 / upsert 的 `items` 为空 / 删行请求没恰好命中 `{dates}` 或 `{from,to}` 一种形态 |
-//! | 21905 | `BIZ_HR_DAY_TYPE_INVALID` | 400 | 未知 `day_type` |
-//! | 21906 | `BIZ_HR_SHIFT_INACTIVE` | 409 | 对已停用班次做写操作 |
-//! | 21907 | `BIZ_HR_CALENDAR_LEAVE_NAME_REQUIRED` | 400 | `CUSTOM_LEAVE` 未填 `name` |
-//! | 21908 | `BIZ_HR_SHIFT_SPAN_EXCEEDS_DAY` | 400 | **V6**：`span > 24:00` |
+//! | 21905 | `BIZ_HR_DAY_TYPE_INVALID` | 400 | 未知 `day_type`（**大小写敏感**：不 trim、不做大小写折叠） |
+//! | 21906 | `BIZ_HR_SHIFT_INACTIVE` | 409 | 对已停用班次做写操作（改 / 停用 / 写覆盖 / 清覆盖）；**重复停用**、并发停用后迟到的写都走这条（不落 40901） |
+//! | 21907 | `BIZ_HR_CALENDAR_LEAVE_NAME_REQUIRED` | 400 | `CUSTOM_LEAVE` 未填 `name`（**仅全局日历**：覆盖行表无 `name` 列，说明走 `remark`） |
+//! | 21908 | `BIZ_HR_SHIFT_SPAN_EXCEEDS_DAY` | 400 | **V6**：`span > "24:00"` |
 //! | 21909 | `BIZ_HR_FIELD_INVALID` | 400 | 必填项（`code` / `name`）trim 后为空白，或某字段超 `varchar` 列宽（判**字符数**） |
+//!
+//! ⚠️ **本表只列本域自有段 `219xx`**：写端点 0 行归因的第三种结果 `40901`（OCC）
+//! 与权限守卫的 `40300` 是**跨域共用码**，不属本段，故不在表内 —— 前端按 code
+//! 分流时它们与 `219xx` 同级看待，别因为表里没有就当不会来。三者的判据表见
+//! `docs/api/hr.md` §5.8。
 //!
 //! ## 结构（**转发式**，见 CLAUDE.md「路由声明规约」第 9 条）
 //!
