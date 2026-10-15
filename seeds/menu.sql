@@ -81,7 +81,13 @@ WHERE deleted_at IS NOT NULL
     -- 与 §2 那条 INSERT 配对登记。此刻该 code 还没有任何行（含软删行）⇒
     -- 本节的 UPDATE 对它是 no-op；列在这里是为了让「本 seed 声明过的 code」
     -- 清单完整 —— 将来若有人下线再复活这个菜单，它已被覆盖。
-    'wecom'
+    'wecom',
+    -- 2026-10-19 新增：人事管理分组（`hr_group`）与排班日历子菜单
+    -- （`hr_schedule_calendar`），与下面 §1 / §2 两段配对登记。此刻这两个 code
+    -- 还没有任何行（含软删行）⇒ 本节的 UPDATE 对它们是 no-op；列在这里是为了让
+    -- 「本 seed 声明过的 code」清单完整 —— 将来若有人下线再复活这两个菜单，
+    -- 它们已被覆盖。
+    'hr_group', 'hr_schedule_calendar'
   );
 
 -- ============================================================================
@@ -113,6 +119,20 @@ INSERT INTO t_menu (
     -- 走的是 INSERT。若复用 id=...013，会撞 `t_menu_pkey` 让整条 seed 回滚；
     -- 若不软删旧行，还会留下一条同 title 的孤儿行。
     (9000000000000014, NULL, 'scheduled_task',       '定时任务',     NULL,                'Clock',          45, true, 0, now(), 0, now(), 0),
+    -- 2026-10-19 新增：「人事管理」一级菜单，归属域 `hr`（全局日历 + 班次 + 班次
+    -- 日历覆盖的配置页，API 前缀 `/api/v2/hr/*`）。
+    --
+    -- ⚠️ **`path = NULL` 表示分组节点**：前端把它渲染成 `el-sub-menu`，不需要对应的
+    -- 前端路由（真正的页面挂在它的子菜单上）。
+    -- ⚠️ **sort_order=48 的插入位是硬约束**：一级菜单从左到右按 sort_order 排，48 卡在
+    -- 「定时任务」(45) 与「设置」(50) 之间 —— 人事排班既不是生产执行侧、也不是系统
+    -- 配置侧，排在「定时任务」后面、「设置」前面。
+    --
+    -- ⚠️ **id 必须用全新值 `9000000000000015`**：`...012` 是 settings_root、`...014` 是
+    -- scheduled_task、`...013` 是**已软删**的旧 `mail_group` 行（物理占用，绝不可复用
+    -- —— id 是唯一能把「软删」与「新增」区分开的标识）。`...015` 是 `9000…000x` 这一段里
+    -- 唯一的空闲位。
+    (9000000000000015, NULL, 'hr_group',             '人事管理',   NULL,                  'Avatar',         48, true, 0, now(), 0, now(), 0),
     (9000000000000012, NULL, 'settings_root',        '设置',       NULL,                  'Setting',        50, true, 0, now(), 0, now(), 0)
 ON CONFLICT (code) WHERE deleted_at IS NULL DO UPDATE SET
     parent_id  = EXCLUDED.parent_id,
@@ -199,6 +219,25 @@ INSERT INTO t_menu (
     -- （与后端 seed 锁步，前端那一半不在本仓库）。
     -- 授权：仅 MANAGER，见 `seeds/rbac.sql` §4.1。
     (9000000000000903, (SELECT id FROM t_menu WHERE code = 'scheduled_task'   AND deleted_at IS NULL), 'wecom',                     '企业微信',      '/wecom',                       'ChatDotRound', 20, true, 0, now(), 0, now(), 0),
+
+    -- 2026-10-19 新增：hr_group 下。**排班日历**（全局日历 + 班次 + 班次覆盖的
+    -- 配置页；`GET /hr/calendar/days` / `GET /hr/shifts` / `GET /hr/shifts/{id}/calendar`）。
+    --
+    -- ⚠️ **id 必须是 `9000000000000910`**：`...901`（已软删的旧 `mail_digest`）/ `...902`
+    -- （邮件）/ `...903`（企业微信）都已被占，`...910` 是 `9000…090x` 这一段里 hr_group
+    -- 下的唯一空闲位。
+    -- ⚠️ `path='/hr/schedule'` 必须与前端 router 的 `path: 'hr/schedule'` **逐字一致**：
+    -- 不一致时前端路由守卫第 3 条会把用户踢走（现象是「点菜单闪一下又回到别的页」，
+    -- **不是编译错误**）。
+    -- ⚠️ **菜单 path 不跟着 API 前缀变**：后端 API 是 `/api/v2/hr/*`，菜单 path 是
+    -- `/hr/schedule`（书签 URL）—— 两者是不同层的东西。
+    -- ⚠️ icon `Calendar` 与父节点的 `Avatar` 必须与前端
+    -- `src/layouts/components/menuIcons.ts` 的 `ICON_MAP` **逐字一致**；查不到的图标在
+    -- 模板里 `v-if` **静默不显示、不报错**（漏补的表现是侧栏图标消失而无人察觉）。
+    --
+    -- 授权：**MANAGER 与 CLERK 都授**（见 `seeds/rbac.sql` §4.1 / §4.2）—— 用户定稿是
+    -- 「MANAGER 写、CLERK 只读」，CLERK 持有 `hr.view` 权限点却点不进页面是自相矛盾。
+    (9000000000000910, (SELECT id FROM t_menu WHERE code = 'hr_group'        AND deleted_at IS NULL), 'hr_schedule_calendar',      '排班日历',      '/hr/schedule',                 'Calendar',     10, true, 0, now(), 0, now(), 0),
 
     -- template_management 下（023）
     (9000000000000701, (SELECT id FROM t_menu WHERE code = 'template_management' AND deleted_at IS NULL), 'print_templates_designer','模板编辑',     '/print-templates',             'Document',     10, true, 0, now(), 0, now(), 0)

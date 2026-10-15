@@ -24,6 +24,15 @@ pub mod dashboard;
 // 顶层 `pub mod part_file;` / `pub mod cnc_program;` 两条声明随之删除，
 // 下方 `/part-files` 与 `/cnc-programs` 两个 nest 也一并删除（**旧路径 404，无 alias**）。
 pub mod files;
+// 2026-10-19 新增 hr 域：人事排班（全局日历 `t_hr_calendar_day` + 班次 `t_hr_shift`
+// + 班次单日覆盖 `t_hr_shift_calendar`），10 端点，URL 挂 `/api/v2/hr`。
+// ⚠️ **本期是纯配置域**：不做班次与实际工人的绑定（那属于排班实例 / 考勤流水）。
+// 班次时段是**绝对时钟轴**（自 `cal_date 00:00` 起算、`HH ∈ 0..48` 的 `"HH:MM"`
+// 字符串），span 卡死 ≤ 24:00 ⇒ 日历写端点零重叠检查（详见 `hr/mod.rs` 的 V1–V6）。
+// ⚠️ `t_hr_shift.segments` 是本仓**第一个 jsonb 列**，本域因此走运行时 `query_as`
+// 而非 `query!` 宏（不产生 `.sqlx/` 缓存 diff）。
+// ⚠️ **全新域，无任何旧路径、无 alias**。错误码段 219xx（不复用已释放的 216xx）。
+pub mod hr;
 // 2026-09-19 IAM 域合并（PR-1）：合并 `auth` + `user` 为单一 `iam` 业务域；
 // handler 内 17 端点（session 5 + users 12）+ 1 个 router 工厂函数 `router()`。
 // auth / user 目录已删除。
@@ -186,6 +195,21 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // 无 `Path` catch-all ⇒ 不受 matchit 静态段排序约束。
         // 完整契约见 `docs/api/serial.md`。
         .nest("/serials", serial::router())
+        // 2026-10-19 新增：hr 域（人事排班：全局日历 + 班次 + 班次单日覆盖）。
+        // **归属域 = `hr`** —— 三张表 `t_hr_calendar_day` / `t_hr_shift` /
+        // `t_hr_shift_calendar` 全是本域自有，与 part / prod / com 零交集，不存在
+        // 端点级归属裁决问题（与上方 `/serials` 那条不同：那条横跨两张他域表才单开前缀）。
+        // 10 端点、读写两个权限点（`hr.view` / `hr.schedule.manage`），守卫判在
+        // service 第一行（`current.require_permission(..)`），此处不挂 role layer。
+        // 前缀 `/hr`：顶层 nest、单段裸名词。⚠️ **API 前缀与菜单 path 是两层不同的
+        // 东西**：菜单 path 是 `/hr/schedule`（见 `seeds/menu.sql`），前端路由也是
+        // `hr/schedule` —— 别把菜单侧的词当成本前缀的依据。
+        // ⚠️ 本域**无硬切记录**（新立），**无 alias**。
+        // ⚠️ matchit 无冲突：域内唯一的 `Path<i64>` catch-all 在 `/shifts/{id}`（2 段），
+        // 同段数的 `/calendar/days`（2 段全静态）第 1 段就分道，不触发「静态段被吞成
+        // 400」那条硬约束（逐条核对见 `hr/handler.rs` 模块 doc）。
+        // 权威路由清单：`hr::handler::ROUTES`（10 条，lib 单测比对）。
+        .nest("/hr", hr::router())
         // 2026-10-13 删除：`.nest("/part-files", part_file::router())` 与
         //   `.nest("/cnc-programs", cnc_program::router())`
         //   —— 两域收编进 files 域，旧前缀 404 无 alias（端点清单见 modules/files/mod.rs）。

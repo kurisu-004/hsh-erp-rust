@@ -4,6 +4,8 @@
 -- 2026-10-14 新增（iam::rbac 子模块配套）。
 -- 2026-10-15 第二批 17 个权限点（生产流转 + 外协 + 送货单 / 品检读），见第 2 节；
 -- 同批把 `t_role_menu` 角色→菜单基线自 seeds/menu.sql 迁入本文件（§4）。
+-- 2026-10-19 第三批 2 个权限点（人事排班 hr 域）+ hr_group / hr_schedule_calendar
+-- 两个菜单的 MANAGER+CLERK 菜单授权基线。
 --
 -- ## 与 seeds/menu.sql 的分工
 --   * menu.sql 管「**菜单目录**」：t_menu 菜单树（部署配置，与前端路由耦合）；
@@ -138,6 +140,14 @@ ON CONFLICT (code) WHERE deleted_at IS NULL DO NOTHING;
 --     （M,C,I，原集合相同）。
 --   * `outsource.company.manage`  ← 公司建 / 改 / 删（M,C，原集合相同）。
 --
+-- 2026-10-19 第三批 2 点（hr 域新建，与 `docs/api/hr.md` 同批）：
+--   * `hr.view`              ← `GET /hr/calendar/days` / `GET /hr/shifts` /
+--     `GET /hr/shifts/{id}/calendar` 三条只读端点。
+--   * `hr.schedule.manage`   ← 其余 7 条写端点（全局日历 upsert / 删行、班次建 /
+--     改 / 停用、班次覆盖 upsert / 清覆盖）。
+--   读写分成两个点而不是一个：`hr.view` 给所有要看到排班表的人（MANAGER 与 CLERK），
+--   `hr.schedule.manage` 只给能改配置的人（MANAGER）。
+--
 -- 明确**不迁**（保持现状，后续批次处理）：`place-on-shelf` /
 -- `release-from-programming`（废弃端点）；`scan/deliver` / `worker-scan` /
 -- `pick-up` / `verify-badge`（设备流）；RBAC 8 端点（`require_role(Manager)`
@@ -166,7 +176,10 @@ INSERT INTO t_permission (
     (9300000000000017, 'outsource.quote.edit',      '外协报价编辑',     'outsource',     '报价建 / 可报价零件 / 提交 / 删', true, 0, now(), 0, now(), 0),
     (9300000000000018, 'outsource.quote.approve',   '外协报价审批',     'outsource',     '报价 approve / reject', true, 0, now(), 0, now(), 0),
     (9300000000000019, 'outsource.move',            '外协收发货',       'outsource',     'POST /outsource-queue/move（发送 + 回收同一端点）', true, 0, now(), 0, now(), 0),
-    (9300000000000020, 'outsource.company.manage',  '外协公司管理',     'outsource',     '外协公司建 / 改 / 删', true, 0, now(), 0, now(), 0)
+    (9300000000000020, 'outsource.company.manage',  '外协公司管理',     'outsource',     '外协公司建 / 改 / 删', true, 0, now(), 0, now(), 0),
+    -- ---- 2026-10-19 人事排班 2 点（hr 域，10 端点）----
+    (9300000000000021, 'hr.view',                    '人事排班查看',     'hr',            '人事排班日历 / 班次列表 / 班次日历的只读端点（GET /hr/calendar/days / GET /hr/shifts / GET /hr/shifts/{id}/calendar）', true, 0, now(), 0, now(), 0),
+    (9300000000000022, 'hr.schedule.manage',         '人事排班配置',     'hr',            '全局日历与班次（含班次日历覆盖）的全部写路径', true, 0, now(), 0, now(), 0)
 ON CONFLICT (code) WHERE deleted_at IS NULL DO NOTHING;
 
 -- ---------------------------------------------------------------------------
@@ -259,7 +272,15 @@ FROM (VALUES
     (9400000000000047::bigint, 'INSPECTOR',      'outsource.move'),
     -- outsource.company.manage：公司建/改/删（M,C）
     (9400000000000048::bigint, 'MANAGER',        'outsource.company.manage'),
-    (9400000000000049::bigint, 'CLERK',          'outsource.company.manage')
+    (9400000000000049::bigint, 'CLERK',          'outsource.company.manage'),
+    -- ---- 2026-10-19 人事排班 2 点（hr 域）----
+    -- hr.view：排班日历 / 班次列表 / 班次日历读（M,C）
+    -- ⚠️ 用户定稿是「MANAGER 写、CLERK 只读」：CLERK 要能在排班日历页上查询班次与
+    -- 日历但改不了 —— CLERK 是工厂文员，日常对交期与送货单，排班表是他的工作台。
+    (9400000000000050::bigint, 'MANAGER',        'hr.view'),
+    (9400000000000051::bigint, 'CLERK',          'hr.view'),
+    -- hr.schedule.manage：全局日历 + 班次（含班次日历覆盖）的全部写路径（M）
+    (9400000000000052::bigint, 'MANAGER',        'hr.schedule.manage')
 ) AS v(id, role_code, permission_code)
 WHERE NOT EXISTS (
     SELECT 1 FROM t_role_permission rp
@@ -351,7 +372,14 @@ WHERE m.code IN (
     -- 2026-10-18 新增 'wecom'：scheduled_task 下第三个子项（群机器人 webhook
     -- 通道 + 每日总结推送），沿用同一判据 —— **同样只归 MANAGER**，那四段
     -- 一行不加。
-    'scheduled_task', 'mail', 'wecom'
+    --
+    -- 2026-10-19 新增 'hr_group' / 'hr_schedule_calendar'：人事排班（hr 域）。
+    -- **MANAGER 与 CLERK 都授**（4.2 CLERK 段同款加这两个 code）—— 用户定稿是
+    -- 「MANAGER 写、CLERK 只读」，而 CLERK 持有 `hr.view` 权限点（第 3 节）却
+    -- 点不进页面是自相矛盾：前端路由守卫第 3 条（menuCode 不在菜单树里就踢回
+    -- 第一个有 path 的节点）会把他挡在门外。
+    'scheduled_task', 'mail', 'wecom',
+    'hr_group', 'hr_schedule_calendar'
 )
 AND m.deleted_at IS NULL
   AND NOT EXISTS (
@@ -380,7 +408,12 @@ WHERE m.code IN (
     -- 本段只补从未有过的组合（seed 不回收、不复活）。
     'production_group', 'worker_queue',
     'outsource_list', 'outsource_companies_list', 'outsource_quotes_list', 'outsource_send_receive_list',
-    'repair_receive'
+    'repair_receive',
+    -- 2026-10-19 新增：人事排班（hr 域）。**CLERK 授的是只读身份** —— 菜单进得去
+    -- （他持有 `hr.view` 权限点，见第 3 节），但 `hr.schedule.manage` 不授（只给
+    -- MANAGER），所以页面上只能查询班次与日历，改不动。菜单可见性与端点守卫是
+    -- **两个独立维度**：菜单给到人、权限点决定他能在页面上做什么。
+    'hr_group', 'hr_schedule_calendar'
 )
 AND m.deleted_at IS NULL
   AND NOT EXISTS (
