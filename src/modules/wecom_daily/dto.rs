@@ -185,6 +185,15 @@ pub const SUBJECT_TEMPLATE_MAX_CHARS: usize = 200;
 /// 绝大多数工单在几秒内就绪（CI 转 PDF 通常很快）；预算是「最坏情况不许超过」。
 /// 预算耗尽 ⇒ 那一行**不带链接**、其余照常挂 —— **绝不因为一张图没转出来就不发日报**
 /// （见 `files::part_file::preview::service::PreviewService::ensure_ready_for_parts`）。
+///
+/// ## ⚠️ 预算约束的是**耗时**，不是**提交量**（2026-10-23）
+///
+/// CI 提交是**按页计费**的，而名义提交量可以很大：`UPCOMING_DAYS_MAX`(60) ×
+/// `ORDER_LIST_LIMIT_MAX`(200) ⇒ 截断后交给图纸链路的入参名义上可到 ~12 000 份。
+/// 真正兜住钱的是 `PreviewService::ensure_ready_for_parts` 内部的 deadline 检查 ——
+/// 预算耗尽后它不再提交新 job，未就绪的行只是不挂链接。⚠️ 所以「把入参收窄」仍然是
+/// 值得做的（少交 pointless 的 job、少花 480s 轮询），但它不是**正确性**依赖：
+/// 不收窄不会烧穿预算，只会更慢。
 pub const DRAWING_CI_BUDGET_SECS: u64 = 8 * 60;
 
 // ============================================================================
