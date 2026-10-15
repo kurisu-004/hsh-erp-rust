@@ -60,8 +60,8 @@
 > 显示每个批次所在的位置；④在邮件通知的域重写 SQL，不要复用其它域的，禁止出现 N+1 问题；
 > ⑥表格列要对齐，支持打印」（⑤ COS 预览链接 / 批量 CI 本轮不做）。落在 §2.3（白名单
 > 11 → 13 项）、§2.4（批次子行逐字段）、§4.4（工单-批次行结构）、§4.5（位置口径）、
-> §4.6（列对齐与打印）、§4.7（取数恒 ≤ 3 条语句）、§5（状态中文与三副本同步）、§6（拆掉
-> dashboard `DELIVERY_STATUSES` 共用）、§8.1（读 / 写的表清单）、§8.2（前端**零改动**）。
+> §4.6（列对齐与打印）、§4.7（取数恒 O(1)）、§5（状态中文与两处人工同步）、§6（状态
+> 白名单上提到 `shared::delivery_status`）、§8.1（读 / 写的表清单）、§8.2（前端**零改动**）。
 >
 > ⚠️ **2026-10-16 第三轮：批次格只写纯数字 + 子行序列号填子件序列号**。用户需求（原文）
 > 「批次栏只写 1、2、3 这样的数字。对于装配件要写出每个子零件的序列号，否则不知道哪个批次
@@ -340,7 +340,7 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
 
 | 判据 | 说明 |
 |---|---|
-| 「未交付」6 态集合 | `PENDING` / `PROGRAMMING` / `IN_PROCESS` / `OUTSOURCE` / `INSPECTION` / `READY_TO_SHIP`。⚠️ **2026-10-16 起是本域自有常量** `repo::DELIVERY_STATUSES`（原先 `use` dashboard 那份），见 §5 |
+| 「未交付」6 态集合 | `PENDING` / `PROGRAMMING` / `IN_PROCESS` / `OUTSOURCE` / `INSPECTION` / `READY_TO_SHIP`。取自共享常量 `shared::delivery_status::DELIVERY_STATUSES`（大屏 / 日报共用同一份），见 §5 |
 | **行单位 = 工单级** | `t_part` 侧带 `AND p.assembly_id IS NULL`（子件不重复计入），装配件单独查 `t_assembly` 且其行**替换**子件行 |
 | **已交量守卫** | `NOT EXISTS (… FROM t_part_batch b WHERE b.part_id = … AND b.deleted_at IS NULL AND b.status IN ('DELIVERED','COMPLETED'))` |
 | 软删闸门 | `p/a.deleted_at IS NULL` |
@@ -359,7 +359,8 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
 ⇒ 故**不复用** `DeliveryRepo::list_orders_*`：复用就得先解掉它的 `LIMIT 30`
 （等于改坏大屏）或在外面再分页（等于让 SQL 口径与 Rust 侧重叠，两边都要维护）。
 ⚠️ 2026-10-16 需求进一步要求「**在邮件通知的域重写 SQL，不要复用其它域的**」⇒ 连
-`DELIVERY_STATUSES` 常量也不再 import，统计 SQL 现在对本域外**零符号依赖**。
+状态白名单也不再 import 任何业务域符号（改引 `shared::delivery_status`），
+统计 SQL 现在对**其它业务域**零符号依赖。
 
 ### 4.3 四条硬约束（改 SQL 前逐条读）
 
@@ -565,17 +566,19 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
 
 ### 5.1 「未交付」6 态（筛选谓词用）
 
-- 后端常量：⚠️ **2026-10-16 起是本域自有常量** `mail_digest::repo::DELIVERY_STATUSES`
-  （原先 `use dashboard::repo::delivery::DELIVERY_STATUSES`）。6 态字面量与 dashboard
-  逐字相同，但**不再共用同一份符号** —— 用户要求「在邮件通知的域重写 SQL，不要复用其它域的」。
+- 后端常量：`shared/delivery_status.rs::DELIVERY_STATUSES`（**共享常量**）。用户要求
+  「在邮件通知的域重写 SQL，不要复用其它域的」⇒ 本域的**统计 SQL 逐字写在本域**
+  （不 import 大屏 / 日报的任何符号），但**状态字面量本身**是共用的一份：`shared::`
+  不属于任何业务域，引用它不构成跨域依赖，而「加一个状态漏改一处」会静默让两个页面的
+  「未交付」判定互相矛盾且无单测变红。
 - 前端对应：大屏柱状图 `UpcomingDeliveryChart.vue` 的 `LAYERS[].statuses` ——
   `top`（4 态）+ `middle`（2 态）合起来正是这 6 态，`bottom`（`DELIVERED`）额外多一个。
-- 三者是**人工同步**关系（Rust ↔ Rust ↔ TS），没有任何编译期约束，漂了不会编译失败，
-  只会让「逾期数」与「柱状图层数」互相矛盾（现象是数字对不上、极难定位）。改任一处必须
-  同步另两处。
-- `repo.rs` 里把 `DELIVERY_STATUSES` 转成 `Vec<String>`（`LazyLock`）是因为 `query_as!`
+- ⚠️ **人工同步点共 2 处**（后端 1 + 前端 1）：两者之间没有任何编译期约束，漂了不会编译
+  失败，只会让「逾期数」与「柱状图层数」互相矛盾（现象是数字对不上、极难定位）。
+- `repo.rs` 里把状态白名单转成 `Vec<String>`（`LazyLock`）是因为 `query_as!`
   **宏**要求参数是具体可绑类型，`&[&str; 6]` 绑不上 `$N::varchar[]`；dashboard 的同类
   查询走运行时 `sqlx::query(..).bind(..)`，可以直绑。
+- ⚠️ 日报域的清单取同文件的 `RED_TIER_STATUSES`（品检前 4 态）—— 有意分叉，不是漂移。
 - `t_assembly` 侧只可能命中其中 4 态（`AssemblyStatus` 无 `PROGRAMMING` / `OUTSOURCE`）
   —— 这是有意的：白名单按 part 状态域取全集，装配件侧对不上的两个自然不参与，
   **不需要**第二份常量。
@@ -618,7 +621,7 @@ SQL），行数因此恒 0。事后拿流水对数时**不能**把「逾期 0 �
 
 | 移除项 | 说明 |
 |---|---|
-| ⚠️ **与 dashboard 共用 `DELIVERY_STATUSES` 常量**（2026-10-16） | `repo.rs` 原先 `use crate::modules::dashboard::repo::DELIVERY_STATUSES`（「一处改、两处生效」）。按用户要求「**在邮件通知的域重写 SQL，不要复用其它域的**」，改为**本域自有常量** `mail_digest::repo::DELIVERY_STATUSES`，6 态字面量与 dashboard 逐字相同。**后果**：那 6 态从「编译期共用一个符号」退化为**三处人工同步**（本域常量 / dashboard 常量 / 前端 `LAYERS[].statuses`），见 §5.1。⚠️ 改判据不改 wire —— 本域的 HTTP 出参、入参、错误码**一个字都没变** |
+| ⚠️ **状态白名单从 dashboard 上提到 `shared::delivery_status`** | `repo.rs` 曾经直接 `use` 大屏那份 `DELIVERY_STATUSES`，后来为本域复制了一份（避免依赖别域符号），代价是「加一个状态」要改多处。**现在取自 `shared::`**（不属于任何业务域）⇒ 后端三域共用一份，**人工同步点只剩前端 `LAYERS[].statuses` 那一处**，见 §5.1。⚠️ 改判据不改 wire —— 本域的 HTTP 出参、入参、错误码**一个字都没变** |
 
 已知的「刻意**没有**做的事」，记录在此以防后人来「补齐」：
 

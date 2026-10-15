@@ -366,6 +366,186 @@ pub(crate) async fn insert_batch(pool: &PgPool, part_id: i64, status: &str) -> i
     insert_batch_full(pool, part_id, status, None).await
 }
 
+/// 造一个**带位置**的批次（第三节清单的「工人 / 生产架 / 品检架 / 外协」四项）。
+///
+/// ⚠️ `location` 与 `current_holder_id` 是**成对**的：`current_holder_id` 按 `location`
+/// 指向 `t_shelf` / `t_worker` / `t_outsource_company` 之一（逻辑外键，无 DB 约束），
+/// 单给一个会让渲染层按 `location` 去查一张**没有那行**的表 ⇒ 位置整项不显示。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn insert_batch_at(
+    pool: &PgPool,
+    part_id: i64,
+    status: &str,
+    location: Option<&str>,
+    holder_id: Option<i64>,
+) -> i64 {
+    let id = shared_test_snowflake().next_id();
+    let now = now_naive();
+    let batch_no: i32 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(batch_no), 0) + 1 FROM t_part_batch WHERE part_id = $1",
+    )
+    .bind(part_id)
+    .fetch_one(pool)
+    .await
+    .expect("取 batch_no");
+    sqlx::query(
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
+         current_holder_id, is_repairing, version, created_at, updated_at) \
+         VALUES ($1, $2, $3, 1, $4, $5, $6, false, 0, $7, $7)",
+    )
+    .bind(id)
+    .bind(part_id)
+    .bind(batch_no)
+    .bind(status)
+    .bind(location)
+    .bind(holder_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_part_batch");
+    id
+}
+
+/// 造一个**带序列号与数量**的工单（第三节清单的 `序列号` / `×数量` 两个字段）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn insert_part_serialized(
+    pool: &PgPool,
+    customer_id: i64,
+    serial_no: Option<&str>,
+    drawing_no: &str,
+    status: &str,
+    quantity: i32,
+    system_date: Option<NaiveDate>,
+) -> i64 {
+    let id = shared_test_snowflake().next_id();
+    let now = now_naive();
+    let req = today();
+    sqlx::query(
+        "INSERT INTO t_part (id, serial_no, name, drawing_no, applicant_name, quantity, \
+         unit_price, total_price, request_date, planned_delivery_date, system_delivery_date, \
+         status, is_urgent, customer_id, assembly_id, version, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, 'tester', $5, 0, 0, $6, $6, $7, $8, false, $9, NULL, 0, $10, $10)",
+    )
+    .bind(id)
+    .bind(serial_no)
+    .bind(format!("件{drawing_no}"))
+    .bind(drawing_no)
+    .bind(quantity)
+    .bind(req)
+    .bind(system_date)
+    .bind(status)
+    .bind(customer_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_part");
+    id
+}
+
+/// 造一个**装配件的子件**（`t_part.assembly_id = $2`）。
+///
+/// ⚠️ 子件自己也是一张完整工单（有自己的序列号、数量、批次），第三节把它渲染成装配件
+/// 行下面的缩进子行。
+pub(crate) async fn insert_child_part(
+    pool: &PgPool,
+    customer_id: i64,
+    assembly_id: i64,
+    serial_no: Option<&str>,
+    drawing_no: &str,
+    quantity: i32,
+) -> i64 {
+    let id = shared_test_snowflake().next_id();
+    let now = now_naive();
+    let req = today();
+    sqlx::query(
+        "INSERT INTO t_part (id, serial_no, name, drawing_no, applicant_name, quantity, \
+         unit_price, total_price, request_date, planned_delivery_date, system_delivery_date, \
+         status, is_urgent, customer_id, assembly_id, version, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, 'tester', $5, 0, 0, $6, $6, NULL, 'IN_PROCESS', false, $7, $8, 0, $9, $9)",
+    )
+    .bind(id)
+    .bind(serial_no)
+    .bind(format!("件{drawing_no}"))
+    .bind(drawing_no)
+    .bind(quantity)
+    .bind(req)
+    .bind(customer_id)
+    .bind(assembly_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert 子件 t_part");
+    id
+}
+
+/// 造一个**带序列号与数量**的装配件（第三节清单的装配件行）。
+pub(crate) async fn insert_assembly_serialized(
+    pool: &PgPool,
+    customer_id: i64,
+    serial_no: Option<&str>,
+    drawing_no: &str,
+    quantity: i32,
+    system_date: Option<NaiveDate>,
+) -> i64 {
+    let id = shared_test_snowflake().next_id();
+    let now = now_naive();
+    let req = today();
+    sqlx::query(
+        "INSERT INTO t_assembly (id, serial_no, drawing_no, name, applicant_name, quantity, \
+         unit_price, total_price, request_date, planned_delivery_date, system_delivery_date, \
+         status, is_urgent, customer_id, version, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, 'tester', $5, 0, 0, $6, $6, $7, 'IN_PROCESS', false, $8, 0, $9, $9)",
+    )
+    .bind(id)
+    .bind(serial_no)
+    .bind(drawing_no)
+    .bind(format!("装{drawing_no}"))
+    .bind(quantity)
+    .bind(req)
+    .bind(system_date)
+    .bind(customer_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_assembly");
+    id
+}
+
+/// 造一个货架（清单里渲染成 `生产架:<code>` / `品检架:<code>`）。
+pub(crate) async fn insert_shelf(pool: &PgPool, code: &str) -> i64 {
+    let id = shared_test_snowflake().next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_shelf (id, code, name, zone, is_active, version, created_at, updated_at) \
+         VALUES ($1, $2, $3, 'PRODUCTION', true, 0, $4, $4)",
+    )
+    .bind(id)
+    .bind(code)
+    .bind(format!("货架{code}"))
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_shelf");
+    id
+}
+
+/// 造一个外协公司（清单里渲染成 `外协:<name>`）。
+pub(crate) async fn insert_outsource_company(pool: &PgPool, name: &str) -> i64 {
+    let id = shared_test_snowflake().next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_outsource_company (id, name, is_active, version, created_at, updated_at) \
+         VALUES ($1, $2, true, 0, $3, $3)",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_outsource_company");
+    id
+}
+
 pub(crate) async fn insert_batch_full(
     pool: &PgPool,
     part_id: i64,
@@ -498,10 +678,10 @@ pub(crate) async fn insert_log_row(
     sqlx::query(
         "INSERT INTO t_wecom_daily_log (id, config_version, trigger_source, webhook_name, \
          webhook_masked, report_date, markdown_bytes, chunk_count, chunk_sent, \
-         overview_batch_count, overview_quantity, note_count, note_part_count, \
+         overview_batch_count, overview_quantity, note_count, \
          overdue_count, upcoming_count, worker_row_total, status, error_message, \
          sent_at, created_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, 100, $7, $8, 1, 2, 3, 4, 5, 6, $9, $10, $11, $12, $12)",
+         VALUES ($1, $2, $3, $4, $5, $6, 100, $7, $8, 1, 2, 3, 4, 5, $9, $10, $11, $12, $12)",
     )
     .bind(id)
     .bind(config_version)
@@ -555,19 +735,23 @@ pub(crate) fn config_body(version: i32, webhook_id: i64) -> Value {
         "version": version,
         "enabled": true,
         "frequency": "DAILY",
-        "send_hour": 8,
-        "send_minute": 0,
+        // ⚠️ 推送时刻**同时**是统计窗口的锚点（`dto::report_window`）⇒ 用例里造的事件
+        // 必须落在这个时刻之前的 24 小时内（这里的事件都落在当天 09:00）。
+        "send_hour": 20,
+        "send_minute": 5,
         "weekday": null,
         "day_of_month": null,
         "webhook_id": webhook_id.to_string(),
         "upcoming_days": 3,
         "worker_metric": "QUANTITY",
         "worker_top_n": 15,
-        "max_chunks": 3,
+        "order_list_limit": 30,
+        "max_chunks": 6,
         "include_overview": true,
         "include_delivery": true,
         "include_orders": true,
         "include_workers": true,
+        "include_drawings": true,
         "subject_template": null
     })
 }

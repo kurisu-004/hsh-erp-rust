@@ -184,9 +184,11 @@ async fn main() -> anyhow::Result<()> {
     // 2026-10-03 新增：请求级超时改为按路径分档（替换 `tower_http::timeout::TimeoutLayer`）。
     // 长耗时路径（**2 条**批量打印 + `POST /cron/wecom-daily/send`）走长档
     // `print_request_timeout_seconds`（缺省 660s）：批量图纸打印由 python 端执行，合法耗时
-    // 数分钟；企业微信日报是「同一个请求内串着 N 次顺序 HTTP」，最坏 ≈ 100s。原先统一 30s 会
-    // 把它们必然打断成 408（超时是把 handler 的 future 整个 drop 掉 ⇒ 已发生的对外副作用
-    // 连同本该落库的痕迹一起消失）。白名单与逐条理由见
+    // 数分钟；企业微信日报是「同一个请求内串着 N 次顺序 HTTP」，**全路径最坏 ≈510s（缺省
+    // `max_chunks=6`）/ ≈580s（上界 20）** —— 主导项是 ≤480s 的图纸就绪预算，不是发送段
+    // （逐片发送只占 `max_chunks × 5s`，核算见 `wecom_daily::dto::DRAWING_CI_BUDGET_SECS`）。
+    // 原先统一 30s 会把它们必然打断成 408（超时是把 handler 的 future 整个 drop 掉 ⇒
+    // 已发生的对外副作用连同本该落库的痕迹一起消失）。白名单与逐条理由见
     // `middleware::timeout::is_long_timeout_path` 的 doc；⚠️ 2026-10-08 送货单的两条打印
     // 路径已随打印链路下线移除，不再命中长档。
     // 其余路径仍走 `request_timeout_seconds`（缺省 30s，行为不变）。

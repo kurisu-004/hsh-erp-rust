@@ -10,7 +10,8 @@
 //!
 //! 两条 SQL 的「未交付」谓词与 dashboard 域
 //! `repo/delivery.rs::SQL_COUNT_OVERDUE` / `SQL_ORDERS_*` **逐字同源**（状态白名单
-//! 取值相同、但**常量是本域自己那份** [`DELIVERY_STATUSES`]，见它的 doc；行单位工单级、
+//! 取值来自共享的 [`crate::shared::delivery_status::DELIVERY_STATUSES`]，见它的
+//! doc；行单位工单级、
 //! 装配件行替换子件行、已交量守卫 `status IN ('DELIVERED','COMPLETED')`）。
 //! 但**行集合的取法**不一样，这是需求决定的、不是漂移：
 //!
@@ -53,36 +54,10 @@ use sqlx::{PgConnection, Row};
 
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::mail_digest::model::{TMailDigestConfig, TMailDigestLog};
-
-/// 「未交付」状态白名单（6 态）。取集合用于两条主查询的 `status = ANY($2::varchar[])`。
-///
-/// ⚠️ **刻意复制而**不** import dashboard 域那份**（2026-10-16，用户明确要求
-/// 「在邮件通知的域重写 SQL，不要复用其它域的」）：本域的统计 SQL 从此**不依赖**
-/// 任何他域符号，取值变化时要人工同步 `dashboard::repo::delivery::DELIVERY_STATUSES`
-/// 与前端 `UpcomingDeliveryChart.vue` 的 `LAYERS[].statuses`。同步义务与症状见
-/// `docs/api/mail_digest.md` §5。
-pub const DELIVERY_STATUSES: [&str; 6] = [
-    "PENDING",
-    "PROGRAMMING",
-    "IN_PROCESS",
-    "OUTSOURCE",
-    "INSPECTION",
-    "READY_TO_SHIP",
-];
-
-/// [`DELIVERY_STATUSES`] 的 `Vec<String>` 形态（`LazyLock` 只算一次）。
-///
-/// ⚠️ 为什么需要这一层：本域走 `sqlx::query_as!` **宏**，宏要求参数类型是具体可绑的
-/// Rust 类型，对 `$2::varchar[]` 推出的类型是 `&[String]`（`&[&str; 6]` 绑不上去）；
-/// 而 dashboard 的同类查询走**运行时** `sqlx::query(..).bind(..)`，可以直接绑
-/// `&[&str; 6]`。于是常量得先转一次。
-///
-/// 每次调用都新建 `Vec` 会给「每天发一封信」平白加 6 次分配；`LazyLock` 把它压到一次。
-fn delivery_statuses_vec() -> &'static [String] {
-    static VEC: std::sync::LazyLock<Vec<String>> =
-        std::sync::LazyLock::new(|| DELIVERY_STATUSES.iter().map(|s| s.to_string()).collect());
-    &VEC
-}
+// 「未交付」6 态白名单取自共享常量（2026-10-23）：本域的统计 SQL 自己写全，
+// 但状态判据**不复制** —— 副本漏改一处不会编译失败，只会让邮件与大屏的逾期数互相
+// 矛盾且无单测变红。共享模块不属于任何业务域 ⇒ 本域的域隔离判定不受影响。
+use crate::shared::delivery_status::delivery_statuses_vec;
 
 /// 邮件正文的一行（`t_part` 一行 UNION ALL `t_assembly` 一行）+ 它下面的全部批次子行。
 ///
@@ -105,7 +80,8 @@ pub struct DigestRow {
     pub name: String,
     /// 装配件的语义是**套数**、散件是**件数**（沿用 dashboard 的行单位约定）。
     pub quantity: i32,
-    /// 6 态之一（见 `DELIVERY_STATUSES`）；装配件侧只可能命中其中 4 态
+    /// 6 态之一（见 `crate::shared::delivery_status::DELIVERY_STATUSES`）；装配件侧
+    /// 只可能命中其中 4 态
     /// （`AssemblyStatus` 无 `PROGRAMMING` / `OUTSOURCE`），无需第二份常量。
     pub status: String,
     /// 系统交期（`date`）；可为 NULL，被窗口谓词自然排除。

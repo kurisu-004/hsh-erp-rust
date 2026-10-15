@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, version, enabled, frequency, send_hour, send_minute, weekday,\n               day_of_month, webhook_id, upcoming_days, worker_metric, worker_top_n,\n               max_chunks, include_overview, include_delivery, include_orders,\n               include_workers, subject_template, created_at, created_by, updated_at,\n               updated_by, deleted_at\n        FROM t_wecom_daily_config\n        WHERE deleted_at IS NULL\n        ORDER BY id ASC\n        LIMIT 1\n        ",
+  "query": "\n        SELECT id, version, enabled, frequency, send_hour, send_minute, weekday,\n               day_of_month, webhook_id, upcoming_days, worker_metric, worker_top_n,\n               order_list_limit, max_chunks, include_overview, include_delivery,\n               include_orders, include_workers, include_drawings, subject_template,\n               created_at, created_by, updated_at, updated_by, deleted_at\n        FROM t_wecom_daily_config\n        WHERE deleted_at IS NULL\n        ORDER BY id ASC\n        LIMIT 1\n        ",
   "describe": {
     "columns": [
       {
@@ -137,6 +137,17 @@
       },
       {
         "ordinal": 12,
+        "name": "order_list_limit",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_wecom_daily_config",
+            "name": "order_list_limit"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
         "name": "max_chunks",
         "type_info": "Int2",
         "origin": {
@@ -147,7 +158,7 @@
         }
       },
       {
-        "ordinal": 13,
+        "ordinal": 14,
         "name": "include_overview",
         "type_info": "Bool",
         "origin": {
@@ -158,7 +169,7 @@
         }
       },
       {
-        "ordinal": 14,
+        "ordinal": 15,
         "name": "include_delivery",
         "type_info": "Bool",
         "origin": {
@@ -169,7 +180,7 @@
         }
       },
       {
-        "ordinal": 15,
+        "ordinal": 16,
         "name": "include_orders",
         "type_info": "Bool",
         "origin": {
@@ -180,7 +191,7 @@
         }
       },
       {
-        "ordinal": 16,
+        "ordinal": 17,
         "name": "include_workers",
         "type_info": "Bool",
         "origin": {
@@ -191,7 +202,18 @@
         }
       },
       {
-        "ordinal": 17,
+        "ordinal": 18,
+        "name": "include_drawings",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "t_wecom_daily_config",
+            "name": "include_drawings"
+          }
+        }
+      },
+      {
+        "ordinal": 19,
         "name": "subject_template",
         "type_info": "Varchar",
         "origin": {
@@ -202,7 +224,7 @@
         }
       },
       {
-        "ordinal": 18,
+        "ordinal": 20,
         "name": "created_at",
         "type_info": "Timestamp",
         "origin": {
@@ -213,7 +235,7 @@
         }
       },
       {
-        "ordinal": 19,
+        "ordinal": 21,
         "name": "created_by",
         "type_info": "Int8",
         "origin": {
@@ -224,7 +246,7 @@
         }
       },
       {
-        "ordinal": 20,
+        "ordinal": 22,
         "name": "updated_at",
         "type_info": "Timestamp",
         "origin": {
@@ -235,7 +257,7 @@
         }
       },
       {
-        "ordinal": 21,
+        "ordinal": 23,
         "name": "updated_by",
         "type_info": "Int8",
         "origin": {
@@ -246,7 +268,7 @@
         }
       },
       {
-        "ordinal": 22,
+        "ordinal": 24,
         "name": "deleted_at",
         "type_info": "Timestamp",
         "origin": {
@@ -278,6 +300,8 @@
       false,
       false,
       false,
+      false,
+      false,
       true,
       false,
       true,
@@ -286,5 +310,5 @@
       true
     ]
   },
-  "hash": "c39390c722b490c2e92d77cfad5ef6c7c0061b42520816e495fedcdb7dfb5cfc"
+  "hash": "be6376242003cca72676a9d2086f041a9607f7b2d63cab5b11a347994f15a466"
 }

@@ -1,0 +1,112 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, preview_seed, src_object_key, ci_job_id, state, page_count,\n                   error_message, next_poll_at\n            FROM public.t_file_preview\n            WHERE preview_seed = ANY($1) AND deleted_at IS NULL\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_file_preview",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "preview_seed",
+        "type_info": "Bpchar",
+        "origin": {
+          "Table": {
+            "table": "t_file_preview",
+            "name": "preview_seed"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "src_object_key",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_file_preview",
+            "name": "src_object_key"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "ci_job_id",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_file_preview",
+            "name": "ci_job_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "state",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_file_preview",
+            "name": "state"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "page_count",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_file_preview",
+            "name": "page_count"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "error_message",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_file_preview",
+            "name": "error_message"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "next_poll_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_file_preview",
+            "name": "next_poll_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "BpcharArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "b7b321f8f9a40e3c2683c6024d97810ac6fc6bd869503ac5d7c6fe472532af29"
+}

@@ -9,6 +9,32 @@
 //! |---|---|---|---|---|
 //! | `GET` | `/api/v2/files/objects/{file_id}/preview` | M / C / I / CNC / **SHELF** | path 段 `file_id` + 可选 query `?size=view\|thumb\|full`（缺省 `view`，大小写敏感，非法值 40001/422） | `R<PreviewOut>` |
 //!
+//! ## ★ 第二个入口：**无 HTTP 端点**的批量确保（2026-10-23 新增）
+//!
+//! [`service::PreviewService::ensure_ready_for_parts`] 接受一批 `part_id`、返回每份
+//! 的**第 1 页**预览直链，供「一次要给出几十条图纸链接」的调用方使用（企业微信日报的
+//! 第三节清单行）。它**复用与 HTTP 端点完全相同的状态机**（[`service::PreviewService::advance_one`]，
+//! 两道并发闸 / 自愈重置 / 四种终局失败 / 0 页护栏全在这一处），差别只有两点：
+//!
+//! | | HTTP 端点 | 批量入口 |
+//! |---|---|---|
+//! | 推几格 | 一次请求推**一格** | 在**预算**内轮转推到收敛 |
+//! | `budget` 的作用 | —— | `Duration::ZERO` = **只读**（零 python 往返，只取已 `READY` 的）；非零 = 允许提交 + 轮询 |
+//! | 终局失败 | 返 `21117` / HTTP 502 | **不抛错**，那一份没有链接 |
+//!
+//! ⚠️ **不新增端点是有意的**：批量入参是 `part_id` 集合（几十到几百个），既不该开放成
+//! HTTP（等于给任意调用方一个「花我的 CI 配额」的入口 —— 预览端点的权限模型是 5 角色
+//! 通读，而 CI 是**按页计费**），也不该由调用方自己拼 `t_part_file` + `t_file_preview`
+//! （那要把种子公式与 CI 协议抄一遍）。
+//!
+//! ### ⚠️⚠️ 批量入口**没有**放松任何安全条款
+//!
+//! 它产出的是同一批直链，因此 [`preview_urls`] 的三段路径、`preview_seed` 的纯哈希
+//! 性质、public-read 的风险补偿**逐条不变**。集成测试
+//! `tests/files/preview.rs::ensure_ready_for_parts_zero_budget_is_read_only` 直接断言
+//! 「路径里没有图号 / 版本号 / `object_key`，只有 `p1.jpg`」，lib 单测
+//! `service::tests::batch_link_path_is_prefix_seed_and_first_page_only` 再钉一次。
+//!
 //! ## 这条端点解决什么
 //!
 //! 报工台（`/scan/*`）的工控机要显示 PDF 图纸。在浏览器里直接嵌 `<iframe src=PDF>`
@@ -29,6 +55,10 @@
 //!
 //! 代价是**没人调就没人推进**：一份没人再打开的预览会永远停在 `PENDING`。
 //! 这是可接受的 —— 没人看的预览不值得花钱继续渲染，且下次有人打开时会自愈。
+//!
+//! ⚠️ 批量入口（[`service::PreviewService::ensure_ready_for_parts`]）**不破坏**这条
+//! 「零后台任务」性质：它是被调用方（企业微信日报的推送）**在请求内**推进的，不是定时器。
+//! 且它同样只推进「有人要」的预览 —— 清单里没有的工单连 `t_file_preview` 行都不会有。
 //!
 //! | 分支 | 判定条件 | 动作 | 外部依赖 |
 //! |---|---|---|---|
@@ -296,6 +326,7 @@
 //! | 9 | **提交请求体的跨仓字段名错配（2026-10-13 review 第 1 轮 BLOCKER，已修）**：本仓发 `{src_object_key, preview_prefix, preview_seed}`，python 的 `CiPreviewJobRequest` 只有 `{src_object_key, dst_prefix}` 且 `dst_prefix` **必填** ⇒ pydantic 静默丢掉两个多余键 + FastAPI **422** ⇒ **每一次 submit 都失败**，行永远停在 `PENDING / ci_job_id IS NULL` | **已修**（body 改为 `dst_prefix` + 抽出与 `preview_urls` 同源的 `preview_object_prefix` 真源；跨仓契约由 `tests/files/preview.rs::submit_request_body_matches_python_schema` 钉死） |
 //! | 10 | **`Success` 但 `total_page_count == 0` ⇒ 永远 PENDING 且以固定节流间隔（缺省 2s，可配 1..=5）真打一次 python**（护栏的代价）：CI 若**永久**不返回页数（如 python 侧 `DocProcessResult` 结构变更导致该字段恒缺），行会**永不停**地以固定节流间隔打 python（无递增退避，见 #4）⇒ **一次打不开的预览 = 一个永不停歇的 python 探针**。⚠️ **跨仓义务（前端）**：收到 **21117 / 21118** 时**必须停止自动重试**并回落 `GET /objects/{id}/content`（原始 PDF），**不得**按 `retry_after_ms` 无限重调 —— 每一次重试在「提交失败后自愈」这条路径上都是**一次新的 CI job**（按页计费） | **未修（有意）**：改成「N 次后判 FAILED」要改 schema（加轮询计数字段）。**该义务落在前端**，本仓已在 `PreviewOut` 的 `retry_after_ms` 语义与本表登记 |
 //! | 11 | **`?size=a&size=b` 重复键 ⇒ 纯文本 400**（不进 `R<T>` 信封、无业务码）：`Query<PreviewQuery>` 的提取器层判定（serde_urlencoded 对单值字段遇重复键报错），非本 handler 可控。**单值非法**（`?size=bogus`）不受影响，走 40001 / 422 信封 | **已知残余（平台级行为，不修）**：实现 `RawQuery` 手解仅为兜一个病态输入，收益不抵多一层解析；前端按单值拼参即可 |
+//! | 12 | **批量入口对「非 DRAWING / 非 PDF」的文件不产生任何副作用**：它按 `part_id` 取「PDF 图纸」时就把那些行过滤掉了，因而这些文件既不会拿到直链、也不会被登记进 `t_file_preview` | **有意**：CI 的 PDF 光栅化管线对它们无意义（与 `assert_previewable` 同款判据），而批量入口**没有** HTTP 响应可以回 21116 —— 缺键与「不可预览」在日报里是同一个渲染后果（名称渲成纯文字） |
 //!
 //! ### 需要 `backend-python` 同步的位置（本 PR 无法触及，python 在另一 worktree）
 //!
@@ -306,27 +337,36 @@
 //! | 两处 doc 的字段名 | 确认 `describe` 响应里状态字段到底叫 `state` 还是 `status`，与 rust 侧收敛成一个（rust 现读 **`state` 优先**、`status` 兜底，见偏差 #8） |
 //! | 两处 doc 的终态语义 | 注明「`Pause` 在 rust 侧被判为终局失败（21117）且不自动重提」，避免 python 侧以为「发 `Pause` 会有人来 Resume」 |
 //! | `core/ci.py` 的 `DocProcessResult` | ⚠️ 偏差 #10 的对照面：**`total_page_count` 必须恒有值**（哪怕是 0）。若 python 侧改结构导致该字段缺失，rust 的 0 页护栏会把预览永久挂在 PENDING 上反复打 python |
-//!
-//! ## 表依赖
-//!
-//! - 读：`t_part_file`（经 `PartFileRepoTrait::get_by_id` 取一行）
-//! - 写：`t_file_preview`（**本域独占**，见建表注释「为什么独立成表」）
-//! - 外部：`infra::py_backend::PyBackendClient` 的两个 CI 转发方法
+//! | 两个 CI 转发端点的**身份处理** | ⚠️ 批量入口由**后台任务**驱动，转发头是 `X-Forwarded-User-Id: 0`（[`service::SYSTEM_ACTOR_ID`]，库里没有这个人）。python 侧**不得**因查不到该用户而拒绝转发 —— 否则日报里的图纸链接在生产恒挂不上，且症状是「CI 从不报错、链接就是不出现」 |
 //!
 //! ## 事务边界
 //!
 //! 本端点**不开显式事务**（与 `POST /objects/confirm` 同款「service 自管」的
 //! 例外）：它要**跨多次 HTTP 往返**（提交 / 查询 python），把整个状态机包在一个
-//! PG 事务里会让连接被外部 IO 长时间占住。故整条链走**一个 `pool.acquire()`
-//! 借来的连接**，每步写完立刻读回最新状态（见 `service::get_preview` 的注释）。
+//! PG 事务里会让连接被外部 IO 长时间占住。
+//!
+//! ⚠️ **连接纪律：每个 DB 步骤短借短还，跨 python 往返之前把连接真的还回池**
+//! （[`service::PreviewService::advance_pending`] 的 `conn` 形参**按值持有**就是这条
+//! 纪律的实现点 —— 取 `&mut PoolConnection` 的话 `drop(conn)` 只丢掉一个引用、连接
+//! **不会**回池，而那段代码「看起来」是守了纪律的）。
+//!
+//! 为什么必须还：HTTP 端点一次往返至多 10s（python 侧超时），而批量入口要在预算内
+//! 对几十份文件**反复**调它 ⇒ 不还连接等于把「日报推送时长 × 并发数」条连接挂在池外，
+//! 读端点跟着排队。
+//!
+//! ## 表依赖
+//!
+//! - 读：`t_part_file`（HTTP 端点经 `PartFileRepoTrait::get_by_id` 取一行；批量入口经
+//!   `PartFileRepo::list_pdf_drawings_by_part_ids` 按 `part_id` 批量取 PDF 图纸）
+//! - 写：`t_file_preview`（**本域独占**，见建表注释「为什么独立成表」）
+//! - 外部：`infra::py_backend::PyBackendClient` 的两个 CI 转发方法
 //!
 //! ## 模块内文件
 //!
 //! - `repo.rs` —— `t_file_preview` 的全部读写（**静态方法**，**用 `query!`
 //!   宏**，理由见该文件模块 doc）。⚠️ **方法个数不要在这里手写数字** —— 真源是
 //!   [`repo::ALL_METHODS`]（`repo.rs` 的 `tests::all_methods_matches_impl` 逐条
-//!   比对 `impl PreviewRepo`）。2026-10-13 review 第 2 轮 N-1：这个数字连错两轮
-//!   （6 → 8 → 实际 9），正是因为它是纯手工的散文、没有编译期抓手
+//!   比对 `impl PreviewRepo`）
 //! - `model.rs` —— `TFilePreview` 行结构
 //! - `service.rs` —— 状态机 + seed 推导 + URL 拼接 + python 转发
 //! - `dto.rs` —— `PreviewOut` 出参 + `PreviewQuery` / `PreviewSize`（`size` 档位解析）

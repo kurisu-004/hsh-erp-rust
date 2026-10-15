@@ -13,23 +13,41 @@
 //!
 //! ```text
 //! 借 1/3 → resolve_target（查 + 解密）→ 还
-//! 借 2/3 → fetch_rows（恒 ≤ 6 条 SQL）→ 还
+//! 借 2/3 → fetch_rows（恒 O(1) 条 SQL）→ 还
+//! ────────── 图纸直链（**零连接**：自己短借短还，跨网络轮询 CI）──────────
 //! ────── 逐片顺序发送（≈ max_chunks × 5s 的**纯网络等待**，零 DB IO）──────
 //! 借 3/3 → cfg_version 快照 + insert_log（合并成**一次**借还）→ 还
 //! ```
 //!
-//! 为什么：**投递期间握着一条 `PoolConnection` 等 ≈100s 的网络**，`/send` 又**无频控**
+//! 为什么：**投递期间握着一条 `PoolConnection` 等这段纯等待**（一次投递最坏 ≈580s 的
+//! **纯等待**：图纸就绪 ≤480s + 逐片发送 ≈ `max_chunks × 5s`，缺省 `max_chunks=6` 时
+//! ≈510s / 上界 20 时 ≈580s；核算见 [`DRAWING_CI_BUDGET_SECS`]），而 `/send` 又**无频控**
 //! ⇒ 几个管理员同时点就把连接池占满，**读端点跟着排队**（一条只查配置单例的
 //! `GET /config` 排在后面拿不到连接，现场看是「整个域卡住」）。`/preview` 不受
-//! 影响（只渲染不投递）。
+//! 影响（只渲染不投递；它那条连接虽然全程借着，但图纸环节传的是
+//! `Duration::ZERO` 预算 ⇒ 零 python 往返，见 [`rows_drawing_links`]）。
 //!
-//! ## 域外依赖：**1 个模块**（`wecom`，通道域）
+//! ## 图纸直链那一环（2026-10-23 新增，`include_drawings` 打开时才走）
+//!
+//! 它是**唯一**一段「可能跑满 8 分钟」的等待（[`DRAWING_CI_BUDGET_SECS`]，等腾讯云 CI
+//! 把 PDF 渲成图）。所以它排在 `fetch_rows` 的连接**归还之后**，且由 `files` 域的入口
+//! 自己短借短还 —— 本域那三个借还点一个都没多。`cfg.include_drawings = false` 时整段
+//! 跳过、**一条 SQL 都不发**（关掉就不触发 CI、不花钱，这是那个配置项的意义）。
+//!
+//! ## 域外依赖：**2 个模块**（`wecom` 通道域 + `files` 图纸域）
 //!
 //! [`crate::modules::wecom::service::resolve_target`]（拿明文 webhook URL + 名称 +
 //! 掩码）、[`crate::modules::wecom::service::target_is_available`]（调度注册判据）、
-//! [`crate::modules::wecom::sender::send_markdown`]（唯一出网点）。方向是
-//! **内容域 → 通道域**，反向不存在。
+//! [`crate::modules::wecom::sender::send_markdown`]（唯一出网点）。
 //! ⚠️ 本域**不解密**任何东西：webhook URL 的解密在通道域内完成。
+//!
+//! 第二个是 [`crate::modules::files::part_file::preview::service::PreviewService::ensure_ready_for_parts`]
+//! （第三节的图纸直链，见 [`rows_drawing_links`]）：图纸链路要读 `t_part_file` 与
+//! `t_file_preview`、要推内容寻址种子、要跟腾讯云 CI 往返 —— 三样知识全属 `files` 域。
+//! 本域若自己去查 `t_part_file`、自己算种子，就得把 `preview_seed` 的公式（内容哈希 +
+//! 配方版本入种子）抄一份，而改配方时漏抄一处会让日报的链接指向另一个目录的图、**两端
+//! 都不报错**。方向仍是**内容域 → 能力提供方**，反向不存在（那个入口只吃 `part_id`
+//! 集合，不知道本域存在）。
 //!
 //! ## 发送流程（`deliver`）的顺序是刻意的
 //!
@@ -55,9 +73,11 @@
 //! `ResolvedTarget` 里 `url` 只在调用栈活着，本域只把它交给 `send_markdown`。
 //! 落库与 `tracing` 一律用 `masked`。
 
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::time::Duration;
 
-use chrono::NaiveDateTime;
+use chrono::{NaiveDate, NaiveDateTime};
 use sqlx::PgConnection;
 
 use crate::auth::rbac::CurrentUser;
@@ -65,14 +85,17 @@ use crate::infra::clock::now_naive;
 use crate::modules::wecom::sender;
 use crate::modules::wecom::service as wecom_service;
 use crate::modules::wecom_daily::dto::{
-    ConfigDefaultsOut, ConfigOut, Frequency, LOGS_LIMIT_MAX, LogListOut, LogListQuery,
-    MAX_CHUNKS_MAX, MAX_CHUNKS_MIN, NormalizedConfig, PreviewOut, PreviewRequest,
-    SUBJECT_TEMPLATE_MAX_CHARS, SaveConfigRequest, SendResultOut, SendStatus, TriggerSource,
-    UPCOMING_DAYS_MAX, UPCOMING_DAYS_MIN, WORKER_TOP_N_MAX, WORKER_TOP_N_MIN,
+    ConfigDefaultsOut, ConfigOut, DRAWING_CI_BUDGET_SECS, Frequency, LOGS_LIMIT_MAX, LogListOut,
+    LogListQuery, MAX_CHUNKS_MAX, MAX_CHUNKS_MIN, NormalizedConfig, ORDER_LIST_LIMIT_MAX,
+    ORDER_LIST_LIMIT_MIN, PreviewOut, PreviewRequest, SUBJECT_TEMPLATE_MAX_CHARS,
+    SaveConfigRequest, SendResultOut, SendStatus, TriggerSource, UPCOMING_DAYS_MAX,
+    UPCOMING_DAYS_MIN, WORKER_TOP_N_MAX, WORKER_TOP_N_MIN, report_window,
 };
 use crate::modules::wecom_daily::model::{TWeComDailyConfigRow, TWeComDailyLogRow};
-use crate::modules::wecom_daily::repo::{self, NewDailyLog};
-use crate::modules::wecom_daily::template::{self, RenderInput, ReportRows};
+use crate::modules::wecom_daily::repo::{self, ActiveBatchRow, AssemblyChildRow, NewDailyLog};
+use crate::modules::wecom_daily::template::{
+    self, OrderGroup, OrderGroupKind, OrderRow, RenderInput, ReportRows,
+};
 use crate::shared::error::{AppError, code};
 use crate::state::AppState;
 
@@ -193,11 +216,13 @@ impl ConfigOut {
             upcoming_days: row.upcoming_days,
             worker_metric: row.worker_metric.clone(),
             worker_top_n: row.worker_top_n,
+            order_list_limit: row.order_list_limit,
             max_chunks: row.max_chunks,
             include_overview: row.include_overview,
             include_delivery: row.include_delivery,
             include_orders: row.include_orders,
             include_workers: row.include_workers,
+            include_drawings: row.include_drawings,
             subject_template: row.subject_template.clone(),
             webhook_configured,
             created_at: format_ts(row.created_at),
@@ -221,11 +246,13 @@ impl ConfigOut {
             upcoming_days: d.upcoming_days,
             worker_metric: d.worker_metric.as_str().to_string(),
             worker_top_n: d.worker_top_n,
+            order_list_limit: d.order_list_limit,
             max_chunks: d.max_chunks,
             include_overview: d.include_overview,
             include_delivery: d.include_delivery,
             include_orders: d.include_orders,
             include_workers: d.include_workers,
+            include_drawings: d.include_drawings,
             subject_template: d.subject_template.clone(),
             webhook_configured,
             // 时间戳在「尚未创建」时没有意义，给空串而不是 `now()`：前端拿它做
@@ -252,7 +279,6 @@ impl SendResultOut {
             overview_batch_count: row.overview_batch_count,
             overview_quantity: row.overview_quantity,
             note_count: row.note_count,
-            note_part_count: row.note_part_count,
             overdue_count: row.overdue_count,
             upcoming_count: row.upcoming_count,
             worker_row_total: row.worker_row_total,
@@ -294,8 +320,9 @@ pub(crate) fn now_ts() -> NaiveDateTime {
 ///
 /// 规范化做的事（都在这里做完，下游一律拿 [`NormalizedConfig`]）：
 /// 1. `frequency` / `worker_metric` 解析成枚举（未知 ⇒ `21804`）；
-/// 2. `upcoming_days` **clamp** 到 `[1, 60]`（照 `mail_digest`：这个数只影响窗口
-///    宽窄，越界时夹到边界比报错更符合「用户想表达的意思」；而下面三个是**拒**）；
+/// 2. `upcoming_days` / `order_list_limit` **clamp** 到各自的区间（照 `mail_digest`：
+///    这两个数只影响窗口宽窄 / 清单长度，越界时夹到边界比报错更符合「用户想表达
+///    的意思」；而下面三个是**拒**）；
 /// 3. `DAILY` / `MANUAL_ONLY` 之下**清空** `weekday` / `day_of_month`
 ///    （不留脏值：读侧会照单全收地拼 cron，留着等于埋雷）；
 ///    `WEEKLY` / `MONTHLY` 的必填字段缺失 ⇒ `21804`；
@@ -320,11 +347,15 @@ pub fn validate_save_request(req: &SaveConfigRequest) -> Result<NormalizedConfig
             .clamp(UPCOMING_DAYS_MIN, UPCOMING_DAYS_MAX),
         worker_metric: req.worker_metric.parse()?,
         worker_top_n: req.worker_top_n,
+        order_list_limit: req
+            .order_list_limit
+            .clamp(ORDER_LIST_LIMIT_MIN, ORDER_LIST_LIMIT_MAX),
         max_chunks: req.max_chunks,
         include_overview: req.include_overview,
         include_delivery: req.include_delivery,
         include_orders: req.include_orders,
         include_workers: req.include_workers,
+        include_drawings: req.include_drawings,
         subject_template: validate_subject_template(req.subject_template.as_deref())?,
     };
     let weekday = match normalized.frequency {
@@ -487,6 +518,7 @@ fn validate_normalized(cfg: &NormalizedConfig) -> Result<NormalizedConfig, AppEr
         ));
     }
     validate_worker_top_n(cfg.worker_top_n)?;
+    validate_order_list_limit(cfg.order_list_limit)?;
     validate_max_chunks(cfg.max_chunks)?;
     validate_sections(cfg)?;
     Ok(cfg.clone())
@@ -498,6 +530,23 @@ fn validate_worker_top_n(v: i32) -> Result<(), AppError> {
             code::BIZ_WECOM_CONFIG_INVALID,
             format!(
                 "「最多列出工人」必须在 {WORKER_TOP_N_MIN}..{WORKER_TOP_N_MAX} 之间（0 = 不限），收到 {v}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// 第三节清单每组行数校验（**与 `worker_top_n` 同款**：下界 `0` = 不限）。
+///
+/// ⚠️ 保存路径是 **clamp**（见 `validate_save_request`），只有**合并覆盖**路径
+/// （预览 / 发送的临时覆盖）才拒 —— 与 `upcoming_days` 的分界同理：覆盖值是用户在
+/// 预览框里现填的，夹到边界会让预览结果与他的输入不符。
+fn validate_order_list_limit(v: i32) -> Result<(), AppError> {
+    if !(ORDER_LIST_LIMIT_MIN..=ORDER_LIST_LIMIT_MAX).contains(&v) {
+        return Err(AppError::biz(
+            code::BIZ_WECOM_CONFIG_INVALID,
+            format!(
+                "「交期清单每组最多列出」必须在 {ORDER_LIST_LIMIT_MIN}..{ORDER_LIST_LIMIT_MAX} 之间（0 = 不限），收到 {v}"
             ),
         ));
     }
@@ -567,11 +616,13 @@ pub async fn effective_config(
             None => base.worker_metric,
         },
         worker_top_n: overrides.worker_top_n.unwrap_or(base.worker_top_n),
+        order_list_limit: overrides.order_list_limit.unwrap_or(base.order_list_limit),
         max_chunks: overrides.max_chunks.unwrap_or(base.max_chunks),
         include_overview: overrides.include_overview.unwrap_or(base.include_overview),
         include_delivery: overrides.include_delivery.unwrap_or(base.include_delivery),
         include_orders: overrides.include_orders.unwrap_or(base.include_orders),
         include_workers: overrides.include_workers.unwrap_or(base.include_workers),
+        include_drawings: overrides.include_drawings.unwrap_or(base.include_drawings),
         subject_template: overrides.subject_template.clone().or(base.subject_template),
     };
     validate_normalized(&merged)
@@ -598,17 +649,26 @@ fn normalize_row(row: &TWeComDailyConfigRow) -> Result<NormalizedConfig, AppErro
         upcoming_days: row.upcoming_days,
         worker_metric: row.worker_metric.parse()?,
         worker_top_n: row.worker_top_n,
+        order_list_limit: row.order_list_limit,
         max_chunks: row.max_chunks,
         include_overview: row.include_overview,
         include_delivery: row.include_delivery,
         include_orders: row.include_orders,
         include_workers: row.include_workers,
+        include_drawings: row.include_drawings,
         subject_template: row.subject_template.clone(),
     })
 }
 
 /// `POST /preview`：渲染但**不发送、不落流水**。
+///
+/// ## ⚠️ 图纸直链传 **`Duration::ZERO`** 预算
+///
+/// 这一步只取**已经 `READY`** 的预览直链、**零 python 往返**：管理端点不该因为点了
+/// 「预览日报」就提交 CI job（按页计费）、更不该让请求挂在 python 上等好几分钟。没就绪
+/// 的那几行渲成纯文字 —— 与推送路径的差别只在这里。
 pub async fn preview(
+    state: &Arc<AppState>,
     conn: &mut PgConnection,
     req: &PreviewRequest,
 ) -> Result<PreviewOut, AppError> {
@@ -617,11 +677,15 @@ pub async fn preview(
     // 关错了还是后端坏了。
     validate_sections(&cfg)?;
     let today = now_naive().date();
-    let rows = fetch_rows(conn, &cfg, today).await?;
+    let window = report_window(&cfg, today);
+    let mut rows = fetch_rows(conn, &cfg, window.0, window.1).await?;
+    rows.drawing_links =
+        rows_drawing_links(state, &cfg, &rows.drawing_part_ids, Duration::ZERO).await;
     let rendered = template::render(&RenderInput {
         cfg: &cfg,
         rows: &rows,
         today,
+        window,
     })?;
     let chunk_count = rendered.chunks.len() as i32;
     Ok(PreviewOut {
@@ -632,9 +696,7 @@ pub async fn preview(
         overview_quantity: rows.overview_quantity,
         completed_count: rows.completed_count,
         in_process_count: rows.in_process_count,
-        repair_part_count: rows.repair_part_count,
         note_count: rows.note_count,
-        note_part_count: rows.note_part_count,
         overdue_count: rows.overdue_count,
         upcoming_count: rows.upcoming_count,
         worker_rows: rows.worker_rows.clone(),
@@ -775,7 +837,6 @@ async fn log_prepare_failure(state: &Arc<AppState>, err: &AppError) {
         overview_batch_count: 0,
         overview_quantity: 0,
         note_count: 0,
-        note_part_count: 0,
         overdue_count: 0,
         upcoming_count: 0,
         worker_row_total: 0,
@@ -797,49 +858,82 @@ async fn log_prepare_failure(state: &Arc<AppState>, err: &AppError) {
 
 /// 按节开关取数（**关掉的节一条 SQL 都不发**）。
 ///
-/// ## 不变量：**恒 ≤ 6 条语句，与工单数 / 送货单数 / 工人数无关**
+/// ## 不变量：**语句数与返回行数无关（O(1)）**
 ///
-/// 上界来自下面**恰好 6 个** `repo::` 调用点：第一节 2 条 + 第二节 1 条 + 第三节 2 条
-/// + 第四节 1 条。⇒ **四节全开（缺省）时恰好 6 条**，关掉一节就少一条。
+/// 每节都把整组聚合压进**一条**语句：第一节 1 条（报工 / 送检 / 在制在同一句里
+/// 五个聚合）、第二节 1 条、第四节 1 个 `GROUP BY`；第三节是**清单**链路，固定
+/// **7 条**（见 [`collect_order_groups`] 的表）。**本函数体内没有任何循环** ——
+/// 工人榜的排序在下一句用 `sort_by` 做（内存操作）。
 ///
-/// **本函数体内没有任何循环** —— 工人榜的排序在下一句用 `sort_by` 做（内存操作）。
+/// ⚠️ **不钉死具体条数**：这类计数必然过期，而它守的那条东西（循环体内不许取数）
+/// 才是 O(1) 的真正来源。
 ///
 /// ## 护栏
-/// 「循环体内只许做内存操作、绝不调 `repo::`」由
-/// `tests/wecom_daily/n_plus_one_guard.rs` 的**源码级**护栏钉住（顶层恰好 6 个
-/// 调用点 + 循环体内禁 `repo::` / `sqlx::query`）。
+/// 「循环体内只许做内存操作、绝不调 `repo::` / `sqlx::query*`」由
+/// `tests/wecom_daily/n_plus_one_guard.rs` 的**源码级**护栏钉住。
 ///
 /// ⚠️ 逐节循环查是**功能完全正确、集成测试照样全绿**的写法（每条用例只造 2~3 行），
 /// 只有数据量涨上去时语句数才悄悄线性涨 —— 而日报恰好是「一天一次、量很大」的生产形态。
+///
+/// ## ⚠️ 图纸直链**不在本函数里**
+///
+/// 本函数只填 [`ReportRows::drawing_part_ids`]（第三节清单涉及哪些 owner id），直链由
+/// [`rows_drawing_links`] 在**调用方归还连接之后**去接 —— 那一步要跨网络轮询 CI，
+/// 放在持有本函数那条连接的位置就是拿连接池换钱（且 CI 按页计费，这笔交换极不划算）。
+///
+/// ## 窗口
+///
+/// `(from_ts, to_ts)` = **跨天**窗口（`dto::report_window` 算，理由见那处）。
+/// 第三节那两条交期查询仍吃**日历日** `today`（交期列本身是 `date`），这里由
+/// `to_ts.date()` 派生 —— 与窗口上界同一个值 ⇒ 「发送日」不会在一次推送里出现两个。
 async fn fetch_rows(
     conn: &mut PgConnection,
     cfg: &NormalizedConfig,
-    today: chrono::NaiveDate,
+    from_ts: NaiveDateTime,
+    to_ts: NaiveDateTime,
 ) -> Result<ReportRows, AppError> {
     let mut rows = ReportRows::default();
 
     if cfg.include_overview {
-        let ev = repo::overview_events(conn, today).await?;
+        let ev = repo::overview_events(conn, from_ts, to_ts).await?;
         rows.overview_batch_count = ev.batch_count as i32;
         rows.overview_quantity = ev.quantity as i32;
         rows.completed_count = ev.completed as i32;
-        rows.repair_part_count = ev.repair as i32;
-        rows.in_process_count = repo::in_process_count(conn).await? as i32;
+        rows.sent_batch_count = ev.sent as i32;
+        rows.in_process_count = ev.wip as i32;
     }
 
     if cfg.include_delivery {
-        let d = repo::delivery_note_summary(conn, today).await?;
-        rows.note_count = d.note_count as i32;
-        rows.note_part_count = d.part_count as i32;
+        let d = repo::delivery_note_summary(conn, from_ts, to_ts).await?;
+        rows.note_count = d.part_count as i32;
     }
 
     if cfg.include_orders {
-        rows.overdue_count = repo::count_overdue(conn, today).await? as i32;
-        rows.upcoming_count = repo::count_upcoming(conn, today, cfg.upcoming_days).await? as i32;
+        let today = to_ts.date();
+        let (groups, drawing_part_ids) = collect_order_groups(conn, cfg, today).await?;
+        rows.order_groups = groups;
+        // 第三节清单涉及的 owner id 集合：图纸链路在**本函数之外**接（见
+        // `rows_drawing_links`），因为它要跨网络轮询 CI、期间不得持有本函数的连接。
+        rows.drawing_part_ids = drawing_part_ids;
+        // ⚠️ 两个计数字段取**未截断的匹配工单数**（`OrderGroup::total` 之和），与
+        // 标题占位符 `{overdue_count}` 和流水快照列同源 —— 它们报的是「有几单要催」，
+        // 不是「这条消息里写了几行」。清单一行的清单不在这两个字段里。
+        rows.overdue_count = rows
+            .order_groups
+            .iter()
+            .filter(|g| g.kind == OrderGroupKind::Overdue)
+            .map(|g| g.total)
+            .sum();
+        rows.upcoming_count = rows
+            .order_groups
+            .iter()
+            .filter(|g| matches!(g.kind, OrderGroupKind::OnDate(_)))
+            .map(|g| g.total)
+            .sum();
     }
 
     if cfg.include_workers {
-        rows.worker_rows = repo::worker_rows(conn, today).await?;
+        rows.worker_rows = repo::worker_rows(conn, from_ts, to_ts).await?;
         // ⚠️ 排序在**内存**里做（SQL 不认识「按配置选指标」这件事）。三条排序键
         // 逐条有理由：指标降序（条形图要「最多的排前面」）/ 姓名升序（同指标时的稳定
         // 次序，免得两次推送的行序随机跳）/ 工号升序（同名兜底，保证确定性）。
@@ -854,6 +948,387 @@ async fn fetch_rows(
     }
 
     Ok(rows)
+}
+
+// ============================================================================
+// 第三节：交期清单的取数编排（**恒 7 条语句**）
+// ============================================================================
+
+/// 第三节的取数编排 + 分组 + 截断。
+///
+/// ## 语句清单（**恒 7 条**，与工单数 / 子件数 / 装配件数 / 货架数无关）
+///
+/// | # | 语句 | 入参形状 | 入参为空时 |
+/// |---|---|---|---|
+/// | 1 | [`repo::list_overdue`] | `today` | 照发（它自己出 `total = 0`） |
+/// | 2 | [`repo::list_upcoming`] | `today` + `upcoming_days` | 照发 |
+/// | 3 | [`repo::list_assembly_children`] | 清单里 `row_type='ASSEMBLY'` 的 id | **跳过** |
+/// | 4 | [`repo::list_active_batches`] | 散件工单 id + 全部子件 id | **跳过** |
+/// | 5 | [`repo::shelf_codes`] | 目标批次里 `PRODUCTION_SHELF` / `INSPECTION_SHELF` 的 holder id | **跳过** |
+/// | 6 | [`repo::worker_names`] | 目标批次里 `WORKER` 的 holder id | **跳过** |
+/// | 7 | [`repo::outsource_names`] | 目标批次里 `OUTSOURCE_COMPANY` 的 holder id | **跳过** |
+///
+/// ## 返回值第二项 = 图纸链路的入参
+///
+/// `(分组清单, 参与清单的 owner id)`。⚠️ 这批 id **不是**渲染用的：`fetch_rows` 把它挂到
+/// [`ReportRows::drawing_part_ids`]，由 [`rows_drawing_links`] 在**连接已归还**之后
+/// 去接图纸预览 —— 图纸那一环要跨网络轮询 CI，不能发生在持有本函数那条连接的时候。
+///
+/// ⚠️ **装配件 id 也在里面**：装配件自己在 `t_part_file` 里同样有 `DRAWING` 文件
+/// （整图），而「这套装配件现在在哪儿」已经由子件行回答了（见下一节）——位置不显示
+/// ≠ 图纸不挂。
+async fn collect_order_groups(
+    conn: &mut PgConnection,
+    cfg: &NormalizedConfig,
+    today: NaiveDate,
+) -> Result<(Vec<OrderGroup>, Vec<i64>), AppError> {
+    let overdue = repo::list_overdue(conn, today).await?;
+    let upcoming = repo::list_upcoming(conn, today, cfg.upcoming_days).await?;
+
+    // 装配件 id（两条查询的并集）—— 子件展开的入参。
+    let asm_ids: Vec<i64> = std::iter::once(&overdue)
+        .chain(std::iter::once(&upcoming))
+        .flat_map(|l| l.rows.iter())
+        .filter(|r| r.is_assembly())
+        .map(|r| r.id)
+        .collect();
+    let children = repo::list_assembly_children(conn, &asm_ids).await?;
+    let mut children_by_asm: HashMap<i64, Vec<AssemblyChildRow>> = HashMap::new();
+    for c in &children {
+        children_by_asm
+            .entry(c.assembly_id)
+            .or_default()
+            .push(c.clone());
+    }
+
+    // 活跃批次 → min-progress 目标批次 → `part_id → (location, holder_id)`。
+    // ⚠️ 入参**不含装配件 id**（见本函数 doc 的「位置只对 t_part 侧解析」）。
+    let part_ids: Vec<i64> = std::iter::once(&overdue)
+        .chain(std::iter::once(&upcoming))
+        .flat_map(|l| l.rows.iter())
+        .filter(|r| !r.is_assembly())
+        .map(|r| r.id)
+        .chain(children.iter().map(|c| c.id))
+        .collect();
+    let batches = repo::list_active_batches(conn, &part_ids).await?;
+    let mut batches_by_part: HashMap<i64, Vec<ActiveBatchRow>> = HashMap::new();
+    for b in &batches {
+        batches_by_part
+            .entry(b.part_id)
+            .or_default()
+            .push(b.clone());
+    }
+    let targets: HashMap<i64, (Option<String>, Option<i64>)> = batches_by_part
+        .iter()
+        .filter_map(|(part_id, bs)| {
+            repo::active_batch_target(bs)
+                .map(|b| (*part_id, (b.location.clone(), b.current_holder_id)))
+        })
+        .collect();
+
+    // 三个 holder 桶各查一次（`BTreeSet` 只为让入参顺序确定，便于复现与排障）。
+    let mut shelf_ids = BTreeSet::new();
+    let mut worker_ids = BTreeSet::new();
+    let mut outsource_ids = BTreeSet::new();
+    for (location, holder_id) in targets.values() {
+        let Some(hid) = holder_id else { continue };
+        match location.as_deref() {
+            Some("PRODUCTION_SHELF") | Some("INSPECTION_SHELF") => {
+                shelf_ids.insert(*hid);
+            }
+            Some("WORKER") => {
+                worker_ids.insert(*hid);
+            }
+            Some("OUTSOURCE_COMPANY") => {
+                outsource_ids.insert(*hid);
+            }
+            _ => {}
+        }
+    }
+    let shelf = repo::shelf_codes(conn, &shelf_ids.into_iter().collect::<Vec<_>>()).await?;
+    let worker = repo::worker_names(conn, &worker_ids.into_iter().collect::<Vec<_>>()).await?;
+    let outsource =
+        repo::outsource_names(conn, &outsource_ids.into_iter().collect::<Vec<_>>()).await?;
+
+    // 摊平成「(归组键, 行)」。直链由 [`rows_drawing_links`] 在**归还连接之后**填进
+    // `drawing_links`，本函数只负责把解析器搭起来（`links` 先给空表）。
+    let ctx = RowContext {
+        targets: &targets,
+        shelf: &shelf,
+        worker: &worker,
+        outsource: &outsource,
+        links: &HashMap::new(),
+    };
+    let mut flat: Vec<(OrderGroupKind, OrderRow)> = Vec::new();
+    flatten_orders(
+        &mut flat,
+        &overdue,
+        |_| OrderGroupKind::Overdue,
+        &mut children_by_asm,
+        &ctx,
+    );
+    flatten_orders(
+        &mut flat,
+        &upcoming,
+        OrderGroupKind::OnDate,
+        &mut children_by_asm,
+        &ctx,
+    );
+
+    let groups = group_and_cap(flat, overdue.total as i32, cfg.order_list_limit);
+
+    // 图纸链路的入参：**截断之后真的会被列出来的那些行**的 owner id（装配件 + 散件 +
+    // 子件）。⚠️ **必须在截断之后收集**：图纸链路要提交 CI job 而 CI **按页计费** ⇒
+    // 为「被 `order_list_limit` 挡掉、一个字符都不会出现在消息里」的那些行提交 CI
+    // 是纯浪费（现场逾期几千单时那是几千次提交）。这与 `include_drawings = false`
+    // 「整段跳过、不花钱」是同一条纪律的两个刻度。
+    //
+    // ⚠️ 与第 4 条语句（活跃批次）的入参**刻意不同**：那条不含装配件 id（装配件没有
+    // 批次），这条**含**（装配件自己在 `t_part_file` 里有 `DRAWING` 整图，而该列是
+    // polymorphic 的）。
+    let drawing_part_ids: Vec<i64> = groups
+        .iter()
+        .flat_map(|g| g.rows.iter())
+        .map(|r| r.owner_id)
+        .collect();
+
+    Ok((groups, drawing_part_ids))
+}
+
+/// 图纸预览直链：第三节清单里的 `owner id` → 可点开的第 1 页直链。
+///
+/// ## ⚠️ 这一段**在连接归还之后**才跑，且它自己借短连接
+///
+/// 图纸就绪要跨网络轮询 CI（最长 [`DRAWING_CI_BUDGET_SECS`]）⇒ 期间握着一条
+/// `PoolConnection` 会把连接池占满、读端点跟着排队（连接纪律见本文件模块 doc）。
+/// 它经 [`crate::state::AppState`] 自己取 `pool` / `py_backend` / `cos` 三样，不碰调用方
+/// 那条连接。
+///
+/// ## ⚠️ `include_drawings = false` ⇒ **一条 SQL 都不发**
+///
+/// 这是那个配置项存在的意义：关掉就**不触发 CI、不花钱**（CI 按页计费）。所以这个判断
+/// 必须落在**调用 `files` 域入口之前** —— 放在它之后就是「先花完钱再决定不给链接」。
+///
+/// ## `budget` 的两个取值
+///
+/// - 推送路径（`deliver`）：[`DRAWING_CI_BUDGET_SECS`]，会提交 CI job 并等到收敛；
+/// - 预览路径（`/preview`）：`Duration::ZERO`，**零 python 往返**，只取已经 `READY`
+///   的那些 —— 管理端点不该因为点了「预览」就烧 CI 配额、也不该挂在那里等几分钟。
+///
+/// 两者都**不抛错**：拿不到的 `part_id` 就不在返回值里 ⇒ 该行名称渲成纯文字。
+async fn rows_drawing_links(
+    state: &Arc<AppState>,
+    cfg: &NormalizedConfig,
+    part_ids: &[i64],
+    budget: Duration,
+) -> HashMap<i64, String> {
+    if !cfg.include_drawings {
+        return HashMap::new();
+    }
+    state
+        .preview_service
+        .ensure_ready_for_parts(
+            &state.pool,
+            &state.py_backend,
+            &state.config.cos.preview_prefix,
+            &state.config.cos.preview_base_url,
+            // ⚠️ 用 `view` 档（`eo-img.resize=l/2560`）而不是 `thumb`：日报里的链接
+            // 是「点开看图」，不是列表缩略图；档位选错的表现是「点进去字太小看不清」。
+            &state.config.cos.preview_image_view_params,
+            part_ids,
+            budget,
+        )
+        .await
+}
+
+/// 渲染一行的**解析器**：位置（`part_id → min-progress 目标批次的 holder 名`）与图纸
+/// 直链（`part_id → URL`）。
+///
+/// ⚠️ 打成结构体是因为 [`flatten_orders`] 要把同一套解析器递给**每一次**调用：拆成 5 个
+/// 形参会在两个调用点上重复 5 遍，而「位置按哪张表解析」这件事只该有一处判据。
+struct RowContext<'a> {
+    /// `part_id → (location, holder_id)`，来自 min-progress 的目标活跃批次。
+    targets: &'a HashMap<i64, (Option<String>, Option<i64>)>,
+    shelf: &'a HashMap<i64, String>,
+    worker: &'a HashMap<i64, String>,
+    outsource: &'a HashMap<i64, String>,
+    /// `part_id → 图纸预览直链`（接缝，见 [`rows_drawing_links`]）。
+    links: &'a HashMap<i64, String>,
+}
+
+impl RowContext<'_> {
+    /// 位置的中文展示值；**取不到就是 `None`**（渲染层据此整项不显示）。
+    fn location(&self, part_id: i64) -> Option<String> {
+        let (location, holder) = self.targets.get(&part_id)?;
+        holder_name(
+            location.as_deref(),
+            *holder,
+            self.shelf,
+            self.worker,
+            self.outsource,
+        )
+    }
+
+    /// 图纸直链；**键缺失就是 `None`**（名称渲成纯文字）。
+    fn link(&self, id: i64) -> Option<String> {
+        self.links.get(&id).cloned()
+    }
+}
+
+/// 把一次清单查询的行摊平进 `flat`，**装配件的子件紧随父行**。
+///
+/// `kind_of` 把交期日映射成归组键：逾期组恒同一个键（闭包忽略入参），日期组用这一行
+/// 自己的交期日。子件与父行**同键** —— 一个子件的交期由父装配件代表，两者不分组。
+///
+/// `children_by_asm` 是**取走式**的（`remove`）：每个装配件的子件只会被挂一次，
+/// 留着会让后面重复挂载。
+fn flatten_orders(
+    flat: &mut Vec<(OrderGroupKind, OrderRow)>,
+    list: &repo::OrderList,
+    kind_of: impl Fn(NaiveDate) -> OrderGroupKind,
+    children_by_asm: &mut HashMap<i64, Vec<AssemblyChildRow>>,
+    ctx: &RowContext<'_>,
+) {
+    for r in &list.rows {
+        let kind = kind_of(r.system_delivery_date);
+        flat.push((
+            kind,
+            OrderRow {
+                owner_id: r.id,
+                is_child: false,
+                serial_no: r.serial_no.clone(),
+                name: r.name.clone(),
+                quantity: r.quantity,
+                link: ctx.link(r.id),
+                location: ctx.location(r.id),
+            },
+        ));
+        for c in children_by_asm.remove(&r.id).unwrap_or_default() {
+            flat.push((
+                kind,
+                OrderRow {
+                    owner_id: c.id,
+                    is_child: true,
+                    serial_no: c.serial_no,
+                    name: c.name,
+                    quantity: c.quantity,
+                    link: ctx.link(c.id),
+                    location: ctx.location(c.id),
+                },
+            ));
+        }
+    }
+}
+
+/// 三个 holder 表按 `location` 分桶取名，**取不到就整项不显示**（`None`）。
+///
+/// ⚠️ 「取不到」有三种成因，都是同一个渲染后果（这一项不出现在行里）：
+/// holder id 为 NULL（还没上架）/ 该行已软删（查不到）/ `location` 不在四种之内
+/// （`OFFICE` 与 `None`）。
+fn holder_name(
+    location: Option<&str>,
+    holder_id: Option<i64>,
+    shelf: &HashMap<i64, String>,
+    worker: &HashMap<i64, String>,
+    outsource: &HashMap<i64, String>,
+) -> Option<String> {
+    let hid = holder_id?;
+    let name = match location? {
+        "PRODUCTION_SHELF" | "INSPECTION_SHELF" => shelf.get(&hid),
+        "WORKER" => worker.get(&hid),
+        "OUTSOURCE_COMPANY" => outsource.get(&hid),
+        _ => None,
+    }?;
+    location_display(location, Some(name))
+}
+
+/// 位置的中文展示值：`生产架:A-03` / `品检架:B-11` / `工人:张三` / `外协:某某`。
+///
+/// ⚠️ **`OFFICE` / `location IS NULL` 一律 `None`**：办公室不是「这件在哪儿」这个问题的
+/// 答案（它回答的是「还没谁来领」，属领料视角），把它渲成位置会让人以为货真在办公室；
+/// 而 `OFFICE` 那一档恰好又是「今天有一批件还没人动」的关键信号 —— 它属于提醒，不
+/// 属于位置。
+fn location_display(location: Option<&str>, holder_name: Option<&str>) -> Option<String> {
+    let label = match location? {
+        "PRODUCTION_SHELF" => "生产架",
+        "INSPECTION_SHELF" => "品检架",
+        "WORKER" => "工人",
+        "OUTSOURCE_COMPANY" => "外协",
+        _ => return None,
+    };
+    Some(format!("{label}:{}", holder_name?))
+}
+
+/// 摊平的行 → 组，并按 `order_list_limit` 扣额度（**纯函数**，不看库、不碰连接）。
+///
+/// ## 组的顺序（**在这里钉死，不依赖 SQL 的 `ORDER BY`**）
+///
+/// 逾期组第一，日期组按交期日升序。`sort_by_key` 是**稳定**排序 ⇒ 组内行的相对次序
+/// 逐字保留（装配件行永远紧挨着它的子件行，即使输入被打乱过）。
+///
+/// ## 额度怎么扣
+///
+/// **工单行与子件行吃同一个额度**，`order_list_limit == 0` 表示不限。
+/// ⚠️ 额度扣的是**行**不是工单：一个装配件 + 30 个子件会一次吃掉 31 的额度 —— 这是
+/// 有意的（额度是「这条消息最多写多少行」的直译），而子件截断**不单独提示**，只在组末
+/// 出**一行**脚注「另有 N **行**未列出」（N = 未列出的行数）。
+///
+/// ⚠️ 脚注的「行」与组标题的「N 条」（[`OrderGroup::total`]，工单数）**量纲不同**：
+/// 两者不作差、不相加，文案自带单位就是让读者不去做那道算术。
+///
+/// `overdue_total` 单列传入（而不是从 `flat` 数）：它是 SQL 的
+/// `COUNT(*) OVER ()`，即便将来主查询加了 `LIMIT` 也仍然是未截断的匹配总数。
+fn group_and_cap(
+    flat: Vec<(OrderGroupKind, OrderRow)>,
+    overdue_total: i32,
+    limit: i32,
+) -> Vec<OrderGroup> {
+    let mut by_kind: Vec<(OrderGroupKind, Vec<OrderRow>)> = Vec::new();
+    for (kind, row) in flat {
+        match by_kind.iter_mut().find(|(k, _)| *k == kind) {
+            Some((_, rows)) => rows.push(row),
+            None => by_kind.push((kind, vec![row])),
+        }
+    }
+    // ⚠️ `NaiveDate::MIN` 只是占位：逾期组的排序键恒小于任何日期组。
+    by_kind.sort_by_key(|(kind, _)| match kind {
+        OrderGroupKind::Overdue => (0u8, NaiveDate::MIN),
+        OrderGroupKind::OnDate(d) => (1u8, *d),
+    });
+
+    by_kind
+        .into_iter()
+        .map(|(kind, rows)| {
+            let total = match kind {
+                OrderGroupKind::Overdue => overdue_total,
+                // 日期组的「N 条」= 该日命中的工单数（子件不算工单）。
+                OrderGroupKind::OnDate(_) => rows.iter().filter(|r| !r.is_child).count() as i32,
+            };
+            let (rows, omitted) = cap_rows(rows, limit);
+            OrderGroup {
+                kind,
+                rows,
+                omitted,
+                total,
+            }
+        })
+        .collect()
+}
+
+/// 扣额度：`(留下的行, 未列出的行数)`。
+///
+/// ⚠️ `limit <= 0` 是**不限**（配置语义见 `dto::ORDER_LIST_LIMIT_MIN`），不是「一条都
+/// 不列」—— 把 0 当成「留 0 条」会让「不限」这个配置项表达出与字面相反的意思。
+fn cap_rows(rows: Vec<OrderRow>, limit: i32) -> (Vec<OrderRow>, i64) {
+    if limit <= 0 {
+        return (rows, 0);
+    }
+    let cap = limit as usize;
+    if rows.len() <= cap {
+        return (rows, 0);
+    }
+    let omitted = (rows.len() - cap) as i64;
+    (rows.into_iter().take(cap).collect(), omitted)
 }
 
 /// 落一行流水（**版本号快照与 INSERT 合并在同一次借还里**，见模块 doc「连接纪律」）。
@@ -921,10 +1396,23 @@ pub fn status_for(chunk_count: i32, chunk_sent: i32) -> SendStatus {
 ///
 /// ## ⚠️ **连接纪律**：只在三处借、用完即还
 ///
-/// 本函数**不再接收 `&mut PgConnection`**（2026-10-19）：投递期间握着连接等 ≈100s 的
-/// 网络会把连接池占满、读端点跟着排队（`/send` 无频控 ⇒ 几个管理员同时点就成立）。
+/// 本函数**不再接收 `&mut PgConnection`**（2026-10-19）：投递期间握着连接等逐片发送那段
+/// 纯网络等待（≈ `max_chunks × 5s`，**不含**图纸就绪那 ≤480s）会把连接池占满、读端点跟着
+/// 排队（`/send` 无频控 ⇒ 几个管理员同时点就成立）。
 /// 连接纪律见模块 doc，落在下面三段块作用域里：
 /// ① 解析通道 ② 取数 ③ 落流水 —— **③ 之后的逐片发送全程零 DB IO、零连接**。
+///
+/// ## 发送前的等待段有两段，都不持连接
+///
+/// ```text
+/// 借 2/3a → 取数（恒 O(1) 条 SQL）→ 还
+/// ─── 图纸直链：零预算以外的最长 ≤ 8 分钟等待，全程自己短借短还 ───
+/// ─── 逐片顺序发送：≈ max_chunks × 5s 的纯网络等待 ───
+/// ```
+///
+/// ⚠️ 这两段串起来仍在长档 660s 之内（`480 + 6×5 = 510`，核算见
+/// [`DRAWING_CI_BUDGET_SECS`]）—— 这不是巧合而是常量算出来的，超了就是整条请求被
+/// 超时层掐掉、已推送的分片连同流水一起消失。
 async fn deliver(
     state: &Arc<AppState>,
     cfg: &NormalizedConfig,
@@ -940,15 +1428,29 @@ async fn deliver(
 
     let now = now_ts();
     let today = now.date();
-    // 借还 2/3：恒 ≤ 6 条 SQL（关掉的节一条都不发，见 `fetch_rows`）。
-    let rows = {
+    // 统计窗口（跨天）：两端都从**同一份配置**推出来，标题块与 SQL 共用它一个值。
+    let window = report_window(cfg, today);
+    // 借还 2/3a：恒 O(1) 条 SQL（关掉的节一条都不发，见 `fetch_rows`）。
+    let mut rows = {
         let mut conn = state.pool.acquire().await?;
-        fetch_rows(&mut conn, cfg, today).await?
+        fetch_rows(&mut conn, cfg, window.0, window.1).await?
     };
+    // ── 借还 2/3b：图纸预览直链（**连接已归还**，且全程自己短借短还）──
+    // ⚠️ 这一段可能跨网络轮询 CI 最长 DRAWING_CI_BUDGET_SECS（`include_drawings`
+    // 为真且有未就绪的图纸时）。它**必须**排在上面那个块之外：握着连接等 CI 会把连接池
+    // 占满、读端点跟着排队（连接纪律见本文件模块 doc）。
+    rows.drawing_links = rows_drawing_links(
+        state,
+        cfg,
+        &rows.drawing_part_ids,
+        Duration::from_secs(DRAWING_CI_BUDGET_SECS),
+    )
+    .await;
     let rendered = template::render(&RenderInput {
         cfg,
         rows: &rows,
         today,
+        window,
     })?;
     // ⚠️ 上面这一行返回 `Err(21804)` 时**不落流水**：没发出去，不是投递失败。
     // 前端 `/send` 失败后正是靠「有没有流水行」区分这两类。
@@ -989,7 +1491,6 @@ async fn deliver(
             overview_batch_count: rows.overview_batch_count,
             overview_quantity: rows.overview_quantity,
             note_count: rows.note_count,
-            note_part_count: rows.note_part_count,
             overdue_count: rows.overdue_count,
             upcoming_count: rows.upcoming_count,
             worker_row_total: rendered.worker_row_total,
@@ -1077,7 +1578,8 @@ pub fn worker_quantity_total(rows: &[crate::modules::wecom_daily::dto::WorkerBar
 mod tests {
     use super::*;
     use crate::modules::wecom_daily::dto::{
-        MAX_CHUNKS_DEFAULT, UPCOMING_DAYS_DEFAULT, WORKER_TOP_N_DEFAULT, WorkerBarRow, WorkerMetric,
+        MAX_CHUNKS_DEFAULT, ORDER_LIST_LIMIT_DEFAULT, UPCOMING_DAYS_DEFAULT, WORKER_TOP_N_DEFAULT,
+        WorkerBarRow, WorkerMetric,
     };
 
     fn row(name: &str, batch: i32, quantity: i32) -> WorkerBarRow {
@@ -1206,6 +1708,68 @@ mod tests {
         );
     }
 
+    /// ★ 守卫：`order_list_limit` 与 `worker_top_n` 同款语义 —— `0` = 不限、越界即
+    /// `21804`；而**保存路径**是 clamp（夹到边界，不是报错）。
+    #[test]
+    fn order_list_limit_bounds_are_21804_and_clamped_on_save() {
+        assert!(validate_order_list_limit(0).is_ok(), "0 = 不限");
+        assert!(validate_order_list_limit(30).is_ok());
+        assert!(validate_order_list_limit(200).is_ok());
+        let e = validate_order_list_limit(-1).unwrap_err();
+        assert_eq!(e.code(), code::BIZ_WECOM_CONFIG_INVALID);
+        assert!(e.to_string().contains("0 = 不限"), "要说明 0 的语义：{e}");
+        assert_eq!(
+            validate_order_list_limit(201).unwrap_err().code(),
+            code::BIZ_WECOM_CONFIG_INVALID
+        );
+
+        // 保存路径：越界被夹到边界（照 `upcoming_days` 的分界，见函数 doc）。
+        let mk = |v: i32| SaveConfigRequest {
+            version: 0,
+            enabled: false,
+            frequency: "DAILY".into(),
+            send_hour: Some(20),
+            send_minute: Some(5),
+            weekday: None,
+            day_of_month: None,
+            webhook_id: None,
+            upcoming_days: UPCOMING_DAYS_DEFAULT,
+            worker_metric: "QUANTITY".into(),
+            worker_top_n: WORKER_TOP_N_DEFAULT,
+            order_list_limit: v,
+            max_chunks: MAX_CHUNKS_DEFAULT,
+            include_overview: true,
+            include_delivery: true,
+            include_orders: true,
+            include_workers: true,
+            include_drawings: true,
+            subject_template: None,
+        };
+        assert_eq!(validate_save_request(&mk(-5)).unwrap().order_list_limit, 0);
+        assert_eq!(
+            validate_save_request(&mk(9999)).unwrap().order_list_limit,
+            200
+        );
+    }
+
+    /// 缺省 `max_chunks` 从 3 提到 6：第三节清单形态下每行 ≈135 字节（含一条 ≈95
+    /// 字节的图纸预览直链），4 组 × 30 条 ≈ 16.4 KB ≈ 5 片 ⇒ 3 片装不下**完全按缺省
+    /// 配置**生成的一份日报。20 是企业微信官方限频，6 是「装得下缺省」与「不刷屏」
+    /// 之间的中间值。
+    #[test]
+    fn default_max_chunks_fits_the_default_order_list() {
+        assert_eq!(MAX_CHUNKS_DEFAULT, 6);
+        // 4 组 × 缺省 30 条 × 135 字节 ≈ 16.2 KB ⇒ 每片 4048 字节预算下 5 片装得下
+        assert!(
+            (4 * ORDER_LIST_LIMIT_DEFAULT * 135) as usize / (4096 - 48)
+                < MAX_CHUNKS_DEFAULT as usize,
+            "缺省配置生成的清单必须装得进缺省片数"
+        );
+        // ⚠️ 「6 仍在 `1..=20` 之内」这一条由 `max_chunks_bounds_are_21804` 里的
+        // `validate_max_chunks(MAX_CHUNKS_DEFAULT).is_ok()` 守着（走函数，clippy 的
+        // `assertions_on_constants` 才不会把重复的常量比较判成噪声）。
+    }
+
     /// 校验矩阵：频率与配套字段不匹配 ⇒ `21804`。
     #[test]
     fn frequency_and_time_mismatch_is_21804() {
@@ -1222,11 +1786,13 @@ mod tests {
             upcoming_days: UPCOMING_DAYS_DEFAULT,
             worker_metric: "QUANTITY".into(),
             worker_top_n: WORKER_TOP_N_DEFAULT,
+            order_list_limit: ORDER_LIST_LIMIT_DEFAULT,
             max_chunks: 3,
             include_overview: true,
             include_delivery: true,
             include_orders: true,
             include_workers: true,
+            include_drawings: true,
             subject_template: None,
         })
         .unwrap_err();
@@ -1246,11 +1812,13 @@ mod tests {
                 upcoming_days: UPCOMING_DAYS_DEFAULT,
                 worker_metric: "QUANTITY".into(),
                 worker_top_n: WORKER_TOP_N_DEFAULT,
+                order_list_limit: ORDER_LIST_LIMIT_DEFAULT,
                 max_chunks: 3,
                 include_overview: true,
                 include_delivery: true,
                 include_orders: true,
                 include_workers: true,
+                include_drawings: true,
                 subject_template: None,
             })
             .is_ok(),
@@ -1325,11 +1893,13 @@ mod tests {
             upcoming_days: days,
             worker_metric: "QUANTITY".into(),
             worker_top_n: WORKER_TOP_N_DEFAULT,
+            order_list_limit: ORDER_LIST_LIMIT_DEFAULT,
             max_chunks: 3,
             include_overview: true,
             include_delivery: true,
             include_orders: true,
             include_workers: true,
+            include_drawings: true,
             subject_template: None,
         };
         assert_eq!(validate_save_request(&mk(-5)).unwrap().upcoming_days, 1);
@@ -1526,5 +2096,243 @@ mod tests {
         assert_eq!(cfg_version_best_effort(Ok(0)), 0);
         let boom = AppError::Database(sqlx::Error::PoolTimedOut);
         assert_eq!(cfg_version_best_effort(Err(boom)), 0, "读失败必须降级成 0");
+    }
+    // ========================================================================
+    // 第三节：分组 / 截断 / 位置解析（纯函数）
+    // ========================================================================
+
+    /// 造一行（测试用：默认有序列号、无位置、无链接）。
+    fn mk_row(is_child: bool, serial: &str) -> OrderRow {
+        OrderRow {
+            owner_id: 0,
+            is_child,
+            serial_no: Some(serial.to_string()),
+            name: serial.to_string(),
+            quantity: 1,
+            link: None,
+            location: None,
+        }
+    }
+
+    fn day(n: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 10, 15)
+            .expect("固定日期合法")
+            .checked_add_signed(chrono::Duration::days(n as i64))
+            .expect("日期不越界")
+    }
+
+    /// ★ 守卫：分组顺序 = **逾期组第一，日期组按交期日升序**，且**不依赖输入顺序**。
+    ///
+    /// ⚠️ 入参是**打乱**的：顺序保证写在 [`group_and_cap`] 里而不是「反正 SQL 已经
+    /// `ORDER BY` 过了」—— 依赖调用方恰好排好序的那种写法，在多一次查询（比如把日期组
+    /// 改成单独查）时就会静默乱序。
+    #[test]
+    fn order_groups_are_overdue_first_then_dates_ascending() {
+        let flat = vec![
+            (OrderGroupKind::OnDate(day(1)), mk_row(false, "D1")),
+            (OrderGroupKind::Overdue, mk_row(false, "O1")),
+            (OrderGroupKind::OnDate(day(0)), mk_row(false, "D0")),
+            (OrderGroupKind::OnDate(day(0)), mk_row(false, "D0b")),
+            (OrderGroupKind::Overdue, mk_row(false, "O2")),
+        ];
+        let groups = group_and_cap(flat, 12, 0);
+        assert_eq!(groups.len(), 3, "逾期 1 组 + 两个日期各 1 组");
+        assert_eq!(groups[0].kind, OrderGroupKind::Overdue);
+        assert_eq!(groups[1].kind, OrderGroupKind::OnDate(day(0)));
+        assert_eq!(groups[2].kind, OrderGroupKind::OnDate(day(1)));
+        // 组内行的相对次序逐字保留（稳定排序）。
+        let names = |g: &OrderGroup| g.rows.iter().map(|r| r.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&groups[0]), vec!["O1", "O2"]);
+        assert_eq!(names(&groups[1]), vec!["D0", "D0b"]);
+    }
+
+    /// ★ 守卫：组标题的「N 条」= **匹配工单数**，子件行不算工单；逾期组用 SQL 给的
+    /// 未截断总数。
+    #[test]
+    fn group_total_counts_orders_not_rows() {
+        let flat = vec![
+            (OrderGroupKind::OnDate(day(0)), mk_row(false, "A")),
+            (OrderGroupKind::OnDate(day(0)), mk_row(true, "a1")),
+            (OrderGroupKind::OnDate(day(0)), mk_row(true, "a2")),
+            (OrderGroupKind::OnDate(day(1)), mk_row(false, "B")),
+        ];
+        let groups = group_and_cap(flat, 99, 0);
+        assert_eq!(groups[0].total, 1, "3 行（1 工单 + 2 子件）只算 1 单");
+        assert_eq!(groups[1].total, 1);
+        // 逾期组的 total 取形参（SQL 的 `COUNT(*) OVER ()`），不是数行数。
+        let only_overdue =
+            group_and_cap(vec![(OrderGroupKind::Overdue, mk_row(false, "O"))], 41, 0);
+        assert_eq!(only_overdue[0].total, 41);
+    }
+
+    /// ★ 守卫：`order_list_limit == 0` 是**不限**（不是「一条都不列」）。
+    #[test]
+    fn order_limit_zero_means_unlimited() {
+        let flat: Vec<_> = (0..50)
+            .map(|i| (OrderGroupKind::Overdue, mk_row(false, &format!("F{i:02}"))))
+            .collect();
+        let groups = group_and_cap(flat, 50, 0);
+        assert_eq!(groups[0].rows.len(), 50, "0 = 全列");
+        assert_eq!(groups[0].omitted, 0, "没截断就没有脚注");
+    }
+
+    /// ★ 守卫：**工单行与子件行吃同一个额度**，截断只留一行脚注、**不为子件单独提示**。
+    ///
+    /// 额度是「这条消息最多写多少行」的直译：一个装配件 + 3 个子件在额度 2 时只留下
+    /// 装配件行 + 第一个子件，脚注报「另有 3 行未列出」（行数，不是工单数）。
+    #[test]
+    fn order_limit_is_shared_between_orders_and_children() {
+        let flat = vec![
+            (OrderGroupKind::Overdue, mk_row(false, "P")),
+            (OrderGroupKind::Overdue, mk_row(true, "C1")),
+            (OrderGroupKind::Overdue, mk_row(true, "C2")),
+            (OrderGroupKind::Overdue, mk_row(true, "C3")),
+            (OrderGroupKind::Overdue, mk_row(false, "Q")),
+        ];
+        let groups = group_and_cap(flat, 2, 2);
+        assert_eq!(
+            groups[0].rows.len(),
+            2,
+            "额度 2 ⇒ 只留 2 行（跨工单与子件）"
+        );
+        assert_eq!(
+            groups[0]
+                .rows
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["P", "C1"]
+        );
+        assert_eq!(groups[0].omitted, 3, "报未列出的**行**数，不报工单数");
+        assert_eq!(groups[0].total, 2, "「N 条」是未截断的匹配工单数");
+    }
+
+    /// ★ 守卫：额度**按组**各算一份（不是整个第三节共用一份）。
+    #[test]
+    fn order_limit_applies_per_group() {
+        let flat: Vec<_> = (0..4)
+            .map(|i| (OrderGroupKind::Overdue, mk_row(false, &format!("O{i}"))))
+            .chain((0..4).map(|i| {
+                (
+                    OrderGroupKind::OnDate(day(0)),
+                    mk_row(false, &format!("D{i}")),
+                )
+            }))
+            .collect();
+        let groups = group_and_cap(flat, 4, 2);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].rows.len(), 2);
+        assert_eq!(groups[1].rows.len(), 2, "日期组有自己的 2 条额度");
+        assert_eq!(groups[1].omitted, 2);
+    }
+
+    /// ★ 守卫：`cap_rows` 的负数也按「不限」处理（配置层已 clamp，这里是防御）。
+    #[test]
+    fn cap_rows_treats_non_positive_limit_as_unlimited() {
+        let rows = vec![mk_row(false, "A"), mk_row(false, "B")];
+        let (kept, omitted) = cap_rows(rows.clone(), 0);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(omitted, 0);
+        let (kept, omitted) = cap_rows(rows, -1);
+        assert_eq!(kept.len(), 2, "负数不得被当成「留 0 条」");
+        assert_eq!(omitted, 0);
+    }
+
+    /// ★ 守卫：位置的中文展示值 = `中文名:实体名`，**四种 location 各一个标签**，
+    /// `OFFICE` / `NULL` / 查不到名字一律**整项不显示**。
+    #[test]
+    fn location_display_labels_the_four_kinds_and_rejects_office() {
+        assert_eq!(
+            location_display(Some("PRODUCTION_SHELF"), Some("A-03")).as_deref(),
+            Some("生产架:A-03")
+        );
+        assert_eq!(
+            location_display(Some("INSPECTION_SHELF"), Some("B-11")).as_deref(),
+            Some("品检架:B-11")
+        );
+        assert_eq!(
+            location_display(Some("WORKER"), Some("张三")).as_deref(),
+            Some("工人:张三")
+        );
+        assert_eq!(
+            location_display(Some("OUTSOURCE_COMPANY"), Some("宏达")).as_deref(),
+            Some("外协:宏达")
+        );
+        // 三种「拿不到」都归一成 None（渲染层据此整项不显示）。
+        assert_eq!(location_display(Some("OFFICE"), Some("张三")), None);
+        assert_eq!(location_display(None, Some("张三")), None);
+        assert_eq!(location_display(Some("WORKER"), None), None);
+    }
+
+    /// ★ 守卫：`holder_name` 按 `location` 分桶取名，取不到（holder 行已软删）时
+    /// **回落成 `None`** 而不是「位置: 无」。
+    #[test]
+    fn holder_name_looks_up_the_right_bucket_and_falls_back_to_none() {
+        let shelf = HashMap::from([(10, "A-03".to_string())]);
+        let worker = HashMap::from([(20, "张三".to_string())]);
+        let outsource = HashMap::from([(30, "宏达".to_string())]);
+        assert_eq!(
+            holder_name(
+                Some("PRODUCTION_SHELF"),
+                Some(10),
+                &shelf,
+                &worker,
+                &outsource
+            )
+            .as_deref(),
+            Some("生产架:A-03")
+        );
+        assert_eq!(
+            holder_name(
+                Some("INSPECTION_SHELF"),
+                Some(10),
+                &shelf,
+                &worker,
+                &outsource
+            )
+            .as_deref(),
+            Some("品检架:A-03"),
+            "两种货架位置共用 `t_shelf` 一个桶"
+        );
+        assert_eq!(
+            holder_name(Some("WORKER"), Some(20), &shelf, &worker, &outsource).as_deref(),
+            Some("工人:张三")
+        );
+        assert_eq!(
+            holder_name(
+                Some("OUTSOURCE_COMPANY"),
+                Some(30),
+                &shelf,
+                &worker,
+                &outsource
+            )
+            .as_deref(),
+            Some("外协:宏达")
+        );
+        // ⚠️ 拿着 worker 的 id 去查货架桶查得到也**不显示**（id 在三类实体间不互斥，
+        // 按 location 分桶才是判据）。
+        assert_eq!(
+            holder_name(
+                Some("PRODUCTION_SHELF"),
+                Some(20),
+                &shelf,
+                &worker,
+                &outsource
+            ),
+            None
+        );
+        // 软删 ⇒ 查不到 ⇒ 整项不显示。
+        assert_eq!(
+            holder_name(Some("WORKER"), Some(999), &shelf, &worker, &outsource),
+            None
+        );
+        assert_eq!(
+            holder_name(Some("OFFICE"), Some(20), &shelf, &worker, &outsource),
+            None
+        );
+        assert_eq!(
+            holder_name(Some("WORKER"), None, &shelf, &worker, &outsource),
+            None
+        );
     }
 }

@@ -17,21 +17,23 @@ async fn empty_table_returns_full_defaults_with_zero_version_and_id() {
     assert_eq!(d["id"].as_str(), Some("0"), "表空时 id 恒为字符串 \"0\"");
     assert_eq!(d["enabled"].as_bool(), Some(false));
     assert_eq!(d["frequency"].as_str(), Some("DAILY"));
-    assert_eq!(d["send_hour"].as_i64(), Some(8));
-    assert_eq!(d["send_minute"].as_i64(), Some(0));
+    // ⚠️ 缺省推送时刻 = 缺省统计窗口锚点（`dto::report_window`）：20:05。
+    assert_eq!(d["send_hour"].as_i64(), Some(20));
+    assert_eq!(d["send_minute"].as_i64(), Some(5));
     assert!(d["weekday"].is_null());
     assert!(d["webhook_id"].is_null());
     assert_eq!(d["upcoming_days"].as_i64(), Some(3));
     assert_eq!(d["worker_metric"].as_str(), Some("QUANTITY"));
     assert_eq!(d["worker_top_n"].as_i64(), Some(15));
-    assert_eq!(d["max_chunks"].as_i64(), Some(3));
+    assert_eq!(d["order_list_limit"].as_i64(), Some(30));
+    assert_eq!(d["max_chunks"].as_i64(), Some(6));
     assert_eq!(d["webhook_configured"].as_bool(), Some(false));
     assert!(d["subject_template"].is_null());
     assert_eq!(d["created_at"].as_str(), Some(""), "未创建时时间戳是空串");
 
-    // **21 个字段**（前端 `.strict()` + 键数断言钉死；少一个键前端当场抛）。
+    // **23 个字段**（前端 `.strict()` + 键数断言钉死；少一个键前端当场抛）。
     let n = d.as_object().expect("data 是对象").len();
-    assert_eq!(n, 21, "ConfigOut 必须逐字 21 个字段：{d}");
+    assert_eq!(n, 23, "ConfigOut 必须逐字 23 个字段：{d}");
 }
 
 /// `webhook_id` 指向**已软删**的 webhook ⇒ `GET /config` 的 `webhook_configured=false`
@@ -338,6 +340,32 @@ async fn upcoming_days_is_clamped_on_save() {
     assert_eq!(data(&env)["upcoming_days"].as_i64(), Some(60));
 }
 
+/// 第三节清单两个配置项：保存往返 + `order_list_limit` 在**保存路径**是 clamp。
+#[tokio::test]
+async fn order_list_settings_round_trip_and_clamp_on_save() {
+    let ctx = bootstrap().await;
+    let mut body = config_body(0, ctx.webhook_id);
+    body["order_list_limit"] = json!(9999);
+    body["include_drawings"] = json!(false);
+    let (status, env) = post_as_manager(&ctx, "/cron/wecom-daily/config", body).await;
+    assert_eq!(status, StatusCode::OK, "{env}");
+    assert_eq!(
+        data(&env)["order_list_limit"].as_i64(),
+        Some(200),
+        "越界被夹到上界（不是报错）"
+    );
+    assert_eq!(
+        data(&env)["include_drawings"].as_bool(),
+        Some(false),
+        "图纸直链开关是普通布尔，保存即生效"
+    );
+
+    // 读回（而不是只看 POST 的响应体）⇒ 真的落库了
+    let (_, env2) = get_as_manager(&ctx, "/cron/wecom-daily/config").await;
+    assert_eq!(data(&env2)["order_list_limit"].as_i64(), Some(200));
+    assert_eq!(data(&env2)["include_drawings"].as_bool(), Some(false));
+}
+
 /// `subject_template` 超长 / 含 CR-LF ⇒ `21804`。
 #[tokio::test]
 async fn subject_template_overlong_or_crlf_is_21804() {
@@ -489,5 +517,8 @@ async fn meta_ships_six_keys_with_ranges_and_flags() {
     assert_eq!(d["defaults"]["frequency"].as_str(), Some("DAILY"));
     assert!(d["defaults"]["webhook_id"].is_null());
     assert_eq!(d["defaults"]["worker_metric"].as_str(), Some("QUANTITY"));
-    assert_eq!(d["defaults"]["max_chunks"].as_i64(), Some(3));
+    assert_eq!(d["defaults"]["max_chunks"].as_i64(), Some(6));
+    // ⚠️ 第三节清单两个配置项的缺省值也从 `defaults` 段下发（前端不许硬编码）。
+    assert_eq!(d["defaults"]["order_list_limit"].as_i64(), Some(30));
+    assert_eq!(d["defaults"]["include_drawings"].as_bool(), Some(true));
 }

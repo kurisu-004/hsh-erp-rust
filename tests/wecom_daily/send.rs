@@ -249,9 +249,9 @@ async fn scheduled_prepare_failure_still_writes_a_log_row() {
     assert!(row["error_message"].as_str().is_some());
 }
 
-/// 日志行 **19 个字段**（前端 `.strict()` + 键数断言钉死）。
+/// 流水行 **18 个字段**（前端 `.strict()` + 键数断言钉死）。
 #[tokio::test]
-async fn log_row_has_nineteen_fields() {
+async fn log_row_has_eighteen_fields() {
     let ctx = bootstrap().await;
     let bad = insert_webhook(&ctx.pool, &unique_name("不可达6"), &unreachable_url()).await;
     save_config(&ctx, bad).await;
@@ -260,7 +260,8 @@ async fn log_row_has_nineteen_fields() {
     let (_, env) = get_as_manager(&ctx, "/cron/wecom-daily/logs").await;
     let row = &data(&env)["items"].as_array().unwrap()[0];
     let n = row.as_object().expect("行是对象").len();
-    assert_eq!(n, 19, "流水行必须逐字 19 个字段：{row}");
+    // ⚠️ 18 = 19 − `note_part_count`（2026-10-23 随 DB 列一并下线）。
+    assert_eq!(n, 18, "流水行必须逐字 18 个字段：{row}");
     for k in [
         "log_id",
         "config_version",
@@ -275,7 +276,6 @@ async fn log_row_has_nineteen_fields() {
         "overview_batch_count",
         "overview_quantity",
         "note_count",
-        "note_part_count",
         "overdue_count",
         "upcoming_count",
         "worker_row_total",

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            w.name        AS \"worker_name!\",\n            w.badge_code  AS \"badge_code!\",\n            COUNT(DISTINCT e.batch_id)::bigint AS \"batch_count!\",\n            COALESCE(SUM(e.quantity), 0)::bigint AS \"quantity!\"\n        FROM t_part_event e\n        JOIN t_worker w ON w.id = e.worker_id AND w.deleted_at IS NULL\n        WHERE e.event_type IN ('RETURNED_TO_SHELF', 'SENT_TO_INSPECTION')\n          AND e.created_at >= $1::date::timestamp\n          AND e.created_at < ($1::date + INTERVAL '1 day')::timestamp\n        GROUP BY e.worker_id, w.name, w.badge_code\n        HAVING COUNT(DISTINCT e.batch_id) > 0 OR COALESCE(SUM(e.quantity), 0) > 0\n        ",
+  "query": "\n        SELECT\n            w.name        AS \"worker_name!\",\n            w.badge_code  AS \"badge_code!\",\n            COUNT(DISTINCT e.batch_id)::bigint AS \"batch_count!\",\n            COALESCE(SUM(e.quantity), 0)::bigint AS \"quantity!\"\n        FROM t_part_event e\n        JOIN t_worker w ON w.id = e.worker_id AND w.deleted_at IS NULL\n        WHERE e.event_type IN ('RETURNED_TO_SHELF', 'SENT_TO_INSPECTION')\n          AND e.created_at >= $1\n          AND e.created_at < $2\n        GROUP BY e.worker_id, w.name, w.badge_code\n        HAVING COUNT(DISTINCT e.batch_id) > 0 OR COALESCE(SUM(e.quantity), 0) > 0\n        ",
   "describe": {
     "columns": [
       {
@@ -40,7 +40,8 @@
     ],
     "parameters": {
       "Left": [
-        "Date"
+        "Timestamp",
+        "Timestamp"
       ]
     },
     "nullable": [
@@ -50,5 +51,5 @@
       null
     ]
   },
-  "hash": "2cecc9aed4b24a3c11c102f5ef66911641d55795ea6218bd86aa1c7cff2f8c1d"
+  "hash": "e6ad30d4d28081a733bb6f86b37bbcba1996fe345c51dc2969ebcbfa4ab2fad0"
 }

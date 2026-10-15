@@ -12,18 +12,40 @@
 //! | 客户端版本门槛 | 无 | **4.1.36+**（安卓 4.1.38+），**低版本退化为纯文本** |
 //!
 //! 本域选 v1，两条理由：
-//! 1. **颜色是日报的核心信号**：逾期数橙红、返修数橙红是这份日报最该被一眼看到
-//!    的东西。低版本退化成纯文本 ⇒ 整份日报在老客户端上变成一坨没格式的文本，
-//!    **风险不可接受**。
+//! 1. **颜色是日报的核心信号**：逾期数橙红（要催的那批）与统计区间的灰（这是哪一段
+//!    时间的数）是这份日报最该被一眼看到的东西。低版本退化成纯文本 ⇒ 整份日报在老
+//!    客户端上变成一坨没格式的文本，**风险不可接受**。
 //! 2. v1 牺牲的表格能力，本域**本来也不需要**：日报是「几个数字 + 一张条形图」的
 //!    摘要，不是明细表（明细在邮件域与统计页）。
 //!
 //! ## 分片：块级、**不截断**
 //!
 //! 渲染器产出的是**块**（[`Block`]）而不是字符串：顺序固定
-//! `Title → Overview → Delivery → Orders → WorkersHead → WorkerRow×k → Footer`。
+//! `Title → Overview → Delivery → Orders… → WorkersHead → WorkerRow×k → Footer`。
 //! ⚠️ **`WorkerRow` 不可再拆**（它是一整行）⇒ **所有分片都发生在块边界上，永远不会把
 //! 一行劈成两半** —— 把一行劈开会得到两条半个名字的工人，看着像数据坏了。
+//!
+//! ### ⚠️ 第三节的清单块**逐行可拆**（与工人行刻意相反）
+//!
+//! 清单行的形状是「一个装配件 + 它的 N 个子件」：**一行装配件带 30 个子件就是 31 个
+//! 渲染行**。若沿用工人行那种「一组一个块、不可拆」，这 31 行会变成一个 ≈4.2 KB 的
+//! 单块 —— 比单条消息预算（`4096 − RESERVE`）还大，于是**一个装配件就能让整份日报
+//! 渲染失败**（`21804`），而现场看到的现象只是「今天装配件特别多」。
+//!
+//! 所以清单块的粒度是**一行**：装配件行、子件行各是一个块，`assemble` 可以在任意两行
+//! 之间断开。
+//!
+//! **粘在一起与可拆的边界、以及拆分后果**（逐条钉住，改渲染前先读）：
+//!
+//! | 不可拆（同一个块内） | 可拆（块边界上断开） | 后果 |
+//! |---|---|---|
+//! | 第三节小标题 + **第一组**的组标题 + 该组首行 | 该组其余行 | 每片至多以「组标题 + 首行」开头，不会出现只有标题没有内容的片 |
+//! | 后续每组：组标题 + 该组首行 | 该组其余行 | 组内某片可能以若干**子件行**开头，而它们的装配件行在上一片 |
+//! | 组末脚注「另有 N **行**未列出」 | — | 脚注可能落在下一片 |
+//!
+//! 「子件行与父行被拆到两片」是**可接受**的：子件行自带序列号 / 名称 / 数量 / 位置，
+//! 单看一行就完整（这正是它逐字重复父行全部字段的原因），而标题块每片都重复、给出
+//! 日期上下文。反过来「把一行劈成两半」不可接受 —— 那会得到半个链接 URL。
 //!
 //! **两趟贪心装填**：
 //!
@@ -42,11 +64,13 @@
 //!
 //! | 情形 | 处置 |
 //! |---|---|
-//! | 单个块自身 > 4096 − RESERVE | `21804`，错误消息**指明是哪一节**（当前最大块是 `WorkersHead`） |
+//! | 单个块自身 > 4096 − RESERVE | `21804`，错误消息**指明是哪一节** |
 //! | 装填结果片数 > `max_chunks` | `21804`，文案给出两个可行动方向 |
 //! | `max_chunks > 20` | **保存配置时**即拒 `21804`（企业微信官方限频 20 条/分钟） |
 
-use chrono::NaiveDate;
+use std::collections::HashMap;
+
+use chrono::{NaiveDate, NaiveDateTime};
 
 use crate::modules::wecom_daily::dto::{
     NormalizedConfig, SECTION_DELIVERY, SECTION_ORDERS, SECTION_OVERVIEW, SECTION_WORKERS,
@@ -74,6 +98,91 @@ const BAR_EMPTY: char = '░';
 // 入参 / 出参
 // ============================================================================
 
+/// 第三节清单的**一行**（渲染入参形态；数据由 `service::fetch_rows` 装配好）。
+///
+/// ⚠️ 它是**渲染入参**而不是表投影：序列号 / 名称 / 数量来自 `t_part`（或
+/// `t_assembly`），但 `link` 与 `location` 是本域自己算出来的（图纸预览直链、
+/// 「生产架:A-03」这种中文位置），表里没有这两列。
+#[derive(Debug, Clone)]
+pub struct OrderRow {
+    /// `t_part.id` 或 `t_assembly.id`（**渲染层不读它**）。
+    ///
+    /// ⚠️ 它存在的理由是**省钱**：图纸链路（`include_drawings`）要向 `files` 域提交 CI
+    /// job，而 CI **按页计费** ⇒ 只能为「**本次真的会被列出来的**」那些行去提交。若按
+    /// 未截断的匹配集提交，`order_list_limit` 挡掉的那些行（现场可能成百上千）会白花
+    /// 一次 CI 的钱，而它们一个字符都不会出现在消息里。
+    /// service 层据此在**截断之后**收集 id 集合（见 `service::collect_order_groups`）。
+    pub owner_id: i64,
+    /// 是否**装配件的子件行**（渲染时前缀成 `>   └ `）。
+    ///
+    /// ⚠️ 层级靠 `└` 这个字符表达，**不靠行首空格**：`markdown` v1 会把行首连续空格
+    /// 当缩进吃掉（本域已有的证据见 `worker_line_blocks` 的口径 3 —— 正因为如此数值
+    /// 才不做右对齐补空格）。把子件行整体套进 `<font color="comment">` 更糟：名称
+    /// 本身是 `[名称](直链)` 链接，而**链接嵌在 font 标签里能否被 v1 解析没有保证**，
+    /// 赌输了这一节就退化成「一堆不可点的灰字」。所以层级只由 `└` 承担 —— 它在任何
+    /// 客户端、任何版本下都是字面量。
+    pub is_child: bool,
+    /// `t_part.serial_no` / `t_assembly.serial_no`，**可空**。
+    ///
+    /// ⚠️ `None` 时**留空**：不回退图号、不显示「无」。留空时该字段连同它后面的分隔
+    /// 空格一起去掉（见 `order_line`）—— 留一个悬空空格在真机上会变成不稳定的缩进，
+    /// 而它不承载任何信息。
+    pub serial_no: Option<String>,
+    /// 名称（`varchar(200) NOT NULL`）；有 [`OrderRow::link`] 时渲染成链接文字。
+    pub name: String,
+    /// 件数 / 套数（渲染成 `×N`）。
+    pub quantity: i32,
+    /// 图纸预览直链。`None` ⇒ 名称渲染成**纯文字**（不加方括号与圆括号）。
+    ///
+    /// ⚠️ 本字段是 Part 2b 的**接缝**：那一轮把 `t_part_file` → `t_file_preview` →
+    /// 直链的链路接上后，这里才会有值。为 `None` 时清单退化成纯文字行，其余形态
+    /// （分组 / 缩进 / 截断 / 位置）逐字不变。
+    pub link: Option<String>,
+    /// 位置的中文展示值（`生产架:A-03` / `工人:张三` / `外协:某某`）。
+    /// `None` ⇒ **整项不显示**，连分隔空格都不留（`OFFICE` / 无活跃批次 / holder 行
+    /// 已软删三种情形都是它）。
+    pub location: Option<String>,
+}
+
+/// 第三节的**一组**：逾期组，或某个交期日一组。
+#[derive(Debug, Clone)]
+pub struct OrderGroup {
+    /// 组是哪一类（决定组标题是「逾期未交」还是那个日期）。
+    pub kind: OrderGroupKind,
+    /// 要渲染的行（装配件行在前、它的子件行紧随其后）。
+    pub rows: Vec<OrderRow>,
+    /// 未列出的**行**数（子件行算一条）；`0` = 没截断，脚注不出现。
+    ///
+    /// ⚠️ 报的是**行**数而不是工单数：额度是按行扣的，按工单数报会在「装配件子件多」
+    /// 时显得「只少了几条」，而群里其实少了一大片。
+    ///
+    /// ⚠️ **它与 [`OrderGroup::total`] 量纲不同**（`total` 是工单数、这个是行数）⇒
+    /// 脚注文案必须自带「行」这个单位（`另有 N 行未列出`），否则读者会把组标题的工单数
+    /// 与脚注的行数相加、读成「共 N + N 条」。
+    pub omitted: i64,
+    /// 该组的**匹配工单数**（**不受** `order_list_limit` 影响）—— 组标题的「N 条」。
+    pub total: i32,
+}
+
+/// 组的类别。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderGroupKind {
+    /// 逾期未交（`system_delivery_date < today`，**不按日期再细分**）。
+    Overdue,
+    /// 某个交期日（`today <= sdd < today + upcoming_days`）。
+    OnDate(NaiveDate),
+}
+
+impl OrderGroupKind {
+    /// 组标题里 `·` 左边的那段文字（日期组用 `%Y-%m-%d`）。
+    fn label(self) -> String {
+        match self {
+            Self::Overdue => "逾期未交".to_string(),
+            Self::OnDate(d) => d.format("%Y-%m-%d").to_string(),
+        }
+    }
+}
+
 /// 一次日报渲染所需的**全部**数字（`service::fetch_rows` 的返回值）。
 ///
 /// ⚠️ 它不是 `T*`（表行投影）也不是 wire 出参：`PreviewOut` 只是它的「加 chunks」
@@ -82,13 +191,44 @@ const BAR_EMPTY: char = '░';
 pub struct ReportRows {
     pub overview_batch_count: i32,
     pub overview_quantity: i32,
+    /// 完工单数（**不进正文**，见 `PreviewOut.completed_count` 的注释）。
     pub completed_count: i32,
+    /// 工人主动送检的批次数（第一节正文第二行的「送检 x 批」）。
+    pub sent_batch_count: i32,
+    /// 当前在制单数（第一节正文第二行的「在制 y 单」，口径见 `repo::OverviewEvents::wip`）。
     pub in_process_count: i32,
-    pub repair_part_count: i32,
+    /// 第二节**唯一**的数字：本期出货的去重工单数（= `COUNT(DISTINCT part_id)`）。
     pub note_count: i32,
-    pub note_part_count: i32,
+    /// 第三节逾期组的**未截断匹配工单数**（同时进标题占位符 `{overdue_count}` 与
+    /// 流水快照列 `t_wecom_daily_log.overdue_count`）。
     pub overdue_count: i32,
+    /// 第三节日期组（`today <= sdd < today + upcoming_days`）的未截断匹配工单数。
     pub upcoming_count: i32,
+    /// 第三节的分组清单（**已按 `order_list_limit` 截断**，见 [`OrderGroup::omitted`]）。
+    ///
+    /// ⚠️ 空 vec = 第三节一条工单都没有 ⇒ 渲染层**只出小标题、不出空态行**（与第四节
+    /// 「没有工人行就只出小标题」同款）：「今天没有要催的工单」本身就是好消息，每天
+    /// 在日报里加一行「无」是往好消息上刷噪音。管理员仍然能从 `/preview` 的
+    /// `sections[]` 看到这一节是开着的。
+    pub order_groups: Vec<OrderGroup>,
+    /// 图纸预览直链：`owner id → 直链`。
+    ///
+    /// ⚠️ 键的 id 空间**是 `t_part_file.part_id` 那一列**：散件行传 `t_part.id`、
+    /// 装配件行传 `t_assembly.id`（该列 polymorphic、无物理外键）⇒ 两类行用同一个
+    /// 字段名承载，**没有**「装配件的直链挂在子件上」这种改写。
+    ///
+    /// 取不到的工单**不在 map 里**（`get` 得 `None`）⇒ 该行名称渲染成纯文字。
+    /// 四种成因同一后果（没有 PDF 图纸 / 预算耗尽 / CI 终局失败 / 打 python 失败），
+    /// 见 `files::part_file::preview::service::PreviewService::ensure_ready_for_parts`。
+    pub drawing_links: HashMap<i64, String>,
+    /// 第三节清单里**本次真的会被列出的**那些行的 owner id（装配件 + 散件 + 子件），
+    /// 图纸链路的入参。
+    ///
+    /// ⚠️ **渲染层不读它**（渲染只认 `OrderRow.link`）；它是给 service 层的「取完数、
+    /// 还了连接之后再接图纸」用的中间量。必须与 [`Self::order_groups`] **同一次**
+    /// 生成、且**在 `order_list_limit` 截断之后**收集 —— 清单变了而它没跟着变，直链就会
+    /// 挂到不在清单里的行上；而 CI 按页计费 ⇒ 多提交一次就多花一次钱。
+    pub drawing_part_ids: Vec<i64>,
     /// 全量工人行（`worker_top_n` 的挡人发生在渲染层，**不是**这里）。
     pub worker_rows: Vec<WorkerBarRow>,
 }
@@ -111,7 +251,14 @@ pub fn worker_quantity_total(rows: &[WorkerBarRow]) -> i32 {
 pub struct RenderInput<'a> {
     pub cfg: &'a NormalizedConfig,
     pub rows: &'a ReportRows,
+    /// 统计基准日（= 发送当日）—— 标题模板的 `{date}` 用它。
     pub today: NaiveDate,
+    /// 统计窗口 `(from_ts, to_ts)`，由 `dto::report_window` 算出（**跨天**）。
+    ///
+    /// ⚠️ 它同时进**标题块**的「统计区间」那一行：窗口一跨天，「今日 00:00 ~ 今日
+    /// 23:59」这种按日历日写死的说法就**必然是假的**（窗口头一天），而读者唯一能核对
+    /// 的就是这一行 —— 它错了，整份日报的可信度就没了。
+    pub window: (NaiveDateTime, NaiveDateTime),
 }
 
 /// [`render`] 的出参。
@@ -138,10 +285,17 @@ pub enum BlockKind {
     Title,
     /// 第一节：全厂报工总览。
     Overview,
-    /// 第二节：今日出货。
+    /// 第二节：本期出货。
     Delivery,
-    /// 第三节：逾期未交 / N 日内交期。
-    Orders,
+    /// 第三节：**清单为空**时只有小标题（一个块）。
+    OrdersHead,
+    /// 第三节的**一个渲染行**（装配件行 / 子件行 / 「组标题 + 首行」的粘头块）。
+    ///
+    /// ⚠️ 它是本域**唯一**允许「一个块装多行」的正文块（最多 3 行：小标题 + 组标题 +
+    /// 首行），拆分的边界与后果见文件头「第三节的清单块逐行可拆」。
+    OrderLine,
+    /// 第三节组末的截断脚注（`order_list_limit` 真的挡掉了行时才有）。
+    OrderFooter,
     /// 第四节的小标题（一次）。
     WorkersHead,
     /// 第四节的一行工人（**不可再拆**）。
@@ -156,8 +310,10 @@ impl BlockKind {
         match self {
             Self::Title => "标题",
             Self::Overview => "第一节（全厂报工总览）",
-            Self::Delivery => "第二节（今日出货）",
-            Self::Orders => "第三节（逾期未交 / 交期工单）",
+            Self::Delivery => "第二节（本期出货）",
+            Self::OrdersHead | Self::OrderLine | Self::OrderFooter => {
+                "第三节（逾期未交 / 交期工单）"
+            }
             Self::WorkersHead | Self::WorkerRow | Self::Footer => "第四节（工人报工条形图）",
         }
     }
@@ -221,6 +377,11 @@ pub fn render(input: &RenderInput) -> Result<Rendered, AppError> {
 /// `{date}` / `{batch_count}` / `{quantity}` / `{note_count}` / `{overdue_count}`。
 /// 照 `mail_digest` 的既有口径：未知占位符原样保留（管理员能一眼看出自己写错了什么）
 /// 比静默吞掉好；**没有别的**内置占位符可换。
+///
+/// ⚠️ **`{note_count}` 喂的是第二节的**唯一**数字**（本期出货的去重工单数）：第二节
+/// 改口径后不再统计「送货单张数」，但**占位符名保留**——存量模板里已经写着
+/// `{note_count}`，删掉这个替换会让它在标题里变成一串没人解释的 `{note_count}`。
+/// （2026-10-23 起 `rows.note_count` 承载这个数，`note_part_count` 那一键随列下线。）
 fn render_subject(cfg: &NormalizedConfig, rows: &ReportRows, today: NaiveDate) -> String {
     let tpl = cfg
         .subject_template
@@ -241,7 +402,7 @@ pub const DEFAULT_SUBJECT_TEMPLATE: &str = "# 生产日报 · {date}";
 fn build_blocks(input: &RenderInput, subject: &str) -> Vec<Block> {
     let cfg = input.cfg;
     let rows = input.rows;
-    let today = input.today;
+    let (from_ts, to_ts) = input.window;
 
     let mut out: Vec<Block> = Vec::new();
 
@@ -249,9 +410,9 @@ fn build_blocks(input: &RenderInput, subject: &str) -> Vec<Block> {
     out.push(Block::new(
         BlockKind::Title,
         format!(
-            "{subject}\n\n> 统计区间 <font color=\"comment\">{} 00:00 ~ {} 23:59</font>",
-            today.format("%Y-%m-%d"),
-            today.format("%Y-%m-%d")
+            "{subject}\n\n> 统计区间 <font color=\"comment\">{} ~ {}</font>",
+            from_ts.format("%m-%d %H:%M"),
+            to_ts.format("%m-%d %H:%M")
         ),
     ));
 
@@ -260,14 +421,12 @@ fn build_blocks(input: &RenderInput, subject: &str) -> Vec<Block> {
             BlockKind::Overview,
             format!(
                 "## 一、全厂报工总览\n\
-                 > 报工批次 <font color=\"info\">{}</font> 批 · 送检放回 <font color=\"info\">{}</font> 件\n\
-                 > 今日完工 <font color=\"info\">{}</font> 单 · 当前在制 <font color=\"info\">{}</font> 单\n\
-                 > 今日返修 <font color=\"warning\">{}</font> 单",
+                 > 报工：<font color=\"info\">{}</font> 批  共 <font color=\"info\">{}</font> 件\n\
+                 > 送检 <font color=\"info\">{}</font> 批  在制 <font color=\"info\">{}</font> 单",
                 rows.overview_batch_count,
                 rows.overview_quantity,
-                rows.completed_count,
+                rows.sent_batch_count,
                 rows.in_process_count,
-                rows.repair_part_count,
             ),
         ));
     }
@@ -276,22 +435,15 @@ fn build_blocks(input: &RenderInput, subject: &str) -> Vec<Block> {
         out.push(Block::new(
             BlockKind::Delivery,
             format!(
-                "## 二、今日出货\n\
-                 > 已取货送货单 <font color=\"warning\">{}</font> 单 · 合计 <font color=\"info\">{}</font> 件",
-                rows.note_count, rows.note_part_count,
+                "## 二、本期出货\n\
+                 > 出货：<font color=\"info\">{}</font> 单",
+                rows.note_count,
             ),
         ));
     }
 
     if cfg.include_orders {
-        out.push(Block::new(
-            BlockKind::Orders,
-            format!(
-                "## 三、逾期未交 / {} 日内交期\n\
-                 > 逾期未交 <font color=\"warning\">{}</font> 单 · {} 日内交期 <font color=\"info\">{}</font> 单",
-                cfg.upcoming_days, rows.overdue_count, cfg.upcoming_days, rows.upcoming_count,
-            ),
-        ));
+        out.extend(order_blocks(cfg, rows));
     }
 
     if cfg.include_workers {
@@ -322,6 +474,197 @@ fn build_blocks(input: &RenderInput, subject: &str) -> Vec<Block> {
 
     out
 }
+
+/// 第三节的清单块（**逾期组在前，日期组按日期升序接在后面** —— 顺序由
+/// `service::fetch_rows` 的分组保证，本函数只照着渲）。
+///
+/// ## 一行长什么样（逐字形态）
+///
+/// ```text
+/// > F1001 [名称甲](https://…/p1.jpg) ×2  工人:张三
+/// >   └ F1003 [子件丙](https://…/p3.jpg) ×4  品检架:B-11
+/// ```
+///
+/// 即 `序列号 [名称](图纸直链) ×数量  位置`，四个字段各自的边界见
+/// [`OrderRow`] 的字段注释。
+///
+/// ## 组标题
+///
+/// `> **逾期未交 · 12 条**` / `> **2026-10-15 · 7 条**` —— 「N 条」是
+/// [`OrderGroup::total`]（**未截断**的匹配工单数），不是实际列出的行数；被挡掉的部分
+/// 由组末脚注单独交代。
+///
+/// ## 空清单
+///
+/// ⚠️ **一条工单都没有时只出小标题**，不出任何组标题、不出「无」行（理由见
+/// [`ReportRows::order_groups`]）。
+fn order_blocks(cfg: &NormalizedConfig, rows: &ReportRows) -> Vec<Block> {
+    let heading = format!("## 三、逾期未交 / {} 日内交期", cfg.upcoming_days);
+    if rows.order_groups.is_empty() {
+        return vec![Block::new(BlockKind::OrdersHead, heading)];
+    }
+
+    let mut out: Vec<Block> = Vec::new();
+    for (gi, group) in rows.order_groups.iter().enumerate() {
+        // ⚠️ 组**恒**至少有一行（`order_list_limit == 0` 表示不限，否则至少留第一行），
+        // 所以 `first()` 不会落空；真落空时也让标题自己成块，不 panic。
+        let mut lines = group.rows.iter();
+        let mut block = String::new();
+        if gi == 0 {
+            // 第一组把小标题也吸进来 —— 否则会出现「一小节只有标题、下一片才有内容」。
+            block.push_str(&heading);
+            block.push('\n');
+        }
+        block.push_str(&group_heading(group));
+        if let Some(first) = lines.next() {
+            block.push('\n');
+            block.push_str(&order_line(first));
+            out.push(Block::new(BlockKind::OrderLine, block));
+        } else {
+            out.push(Block::new(BlockKind::OrderLine, block));
+        }
+        for r in lines {
+            out.push(Block::new(BlockKind::OrderLine, order_line(r)));
+        }
+        if group.omitted > 0 {
+            // ⚠️ 单位是**行**不是工单（`OrderGroup::omitted` 的口径），组标题那个「N 条」
+            // 才是工单数 —— 两者量纲不同，文案必须自带单位才不会读成「共 N+N 条」。
+            out.push(Block::new(
+                BlockKind::OrderFooter,
+                format!(
+                    "> <font color=\"comment\">另有 {} 行未列出</font>",
+                    group.omitted
+                ),
+            ));
+        }
+    }
+    out
+}
+
+/// 组标题行：`> **逾期未交 · 12 条**` / `> **2026-10-15 · 7 条**`。
+fn group_heading(group: &OrderGroup) -> String {
+    format!("> **{} · {} 条**", group.kind.label(), group.total)
+}
+
+/// 把清单行里的**用户自由输入**压成在 markdown v1 里**无结构**的纯文本（2026-10-23）。
+///
+/// ## 两个职责，缺一不可
+///
+/// 1. **剥控制字符**（`char::is_control()` 为真的一律去掉）：该判定恒等于 Unicode **`Cc`**
+///    （U+0000–U+001F 与 U+007F–U+009F）⇒ 覆盖 `\n` / `\r` / `\t` 与 C1 控制区；**不覆盖**
+///    `Cf`（零宽字符）与 `Zl` / `Zp`（逐条见「不在覆盖范围内的已知残留」）。清单行的三个字段
+///    都被拼在**同一行**里，只要文本里留一个 `\n`，剩下的部分
+///    就能另起一行、伪装成一条独立清单行甚至一条组标题（`> **2026-10-01 · 99 条**`）——
+///    markdown v1 明确支持 `>` 引用与 `**加粗**`，这不是理论构造。**不替换成可见占位符**
+///    （那会让名称列凭空多出一串 `?`）。
+/// 2. **半角结构字符换近形全角**：`[`→`［`、`]`→`］`、`(`→`（`、`)`→`）`、`\`→`＼`。
+///    `[名称](直链)` 的链接文字里因此**凑不出 `](`**，链接语法闭合不了。
+///
+/// ## 为什么是「换全角」而不是「加反斜杠转义」
+///
+/// 企业微信 markdown **v1 的官方语法子集里没有反斜杠转义**（只有 `#` 标题、
+/// `**加粗**`、`[文本](url)`、`` ` `` 行内代码、`>` 引用、`<font color>` 六项；图片语法
+/// 只存在于 markdown_v2）⇒ 反斜杠转义压在一个**未文档化的解析器行为**上：若 v1 解析器
+/// 是朴素实现（扫第一个 `](` 切链接、不认 `\`），`甲\](https://evil.example/x\)[乙` 里的
+/// 第一个 `]` **仍然闭合链接**、URL 取到注入串 ⇒ 注入照样成立，只是字符位置变了。
+/// **换全角是与解析器无关的结构性保证**：任何解析器（CommonMark 兼容的、朴素的、
+/// 正则的）都认不出全角括号，链接文字里就凑不出 `](`。防注入的主体是「凑不出闭合符」，
+/// 不是「藏起闭合符」。
+///
+/// ## ⚠️ 代价：一个有意取舍
+///
+/// 含半角括号的正常零件名会被换成全角（`连杆(左)` → `连杆（左）`），**视觉无损** ——
+/// 零件名里本来就常见全角括号。取舍是「宁可在极端情况下改一个字符的形状，也不能让
+/// 一条可编辑字段决定日报里某个链接指向哪里」：日报的全部价值就是「点开看图」，而名称
+/// 与图号都是管理员可编辑的自由文本。
+///
+/// ## 覆盖范围（守卫 ⑭ 守的就是这里）
+///
+/// 覆盖 [`order_line`] 的**三个**用户自由输入字段：`name`（`t_part.name` /
+/// `t_assembly.name`，`varchar(200)` 自由文本）、`serial_no`、`location`（内嵌
+/// `t_worker.name` / 外协公司名 / 货架码）。其余位置（组标题的日期与「N 条」、`×N`、
+/// 分组标签）来自枚举或数值，**不存在清洗需求**。
+///
+/// ## 不在覆盖范围内的已知残留
+///
+/// - `name` 还能注入 `<font color="…">` 之类的 markdown v1 font 标签（能改颜色与
+///   观感，改不了链接指向）—— 换全角解决不了它，观感级，登记在
+///   `docs/api/wecom-daily.md` §8.3；
+/// - URL 侧的 `base_url` / `preview_image_view_params` 是**部署配置**，其中若含半角
+///   `)` 或空格会截断链接语法（链接随之失效，指向自家 COS 的意图不成立）—— 部署面
+///   可控，接受该形态；同一节有登记；
+/// - `Cf`（零宽字符，如 U+200B / U+200C / U+200D / U+FEFF / U+00AD）能伪装字形
+///   （两个不同名称看起来一样）—— 观感级；`Zl` / `Zp`（U+2028 行分隔符 / U+2029 段分隔符）
+///   在企业微信 markdown v1 解析器里**是否被当作换行没有官方口径可依**（能依据的只有
+///   v1 那六项语法子集，而它不涉及这两个字符）⇒ 按理论面登记；若将来实测确认「不当
+///   换行」，这一条可降级为纯观感项。
+fn clean_text(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control())
+        .map(|c| match c {
+            '[' => '［',
+            ']' => '］',
+            '(' => '（',
+            ')' => '）',
+            '\\' => '＼',
+            other => other,
+        })
+        .collect()
+}
+
+/// 一个清单行：`序列号 [名称](直链) ×数量  位置`。
+///
+/// ## ⚠️ 三个「缺了就不出现」的字段
+///
+/// 1. **序列号**为 `None` ⇒ 字段**连同它后面的一个分隔空格**一起去掉（不是留下双空格
+///    悬在那里：`markdown` v1 会把行首连续空格当缩进吃掉，留下的空格会让同一类行的
+///    行首宽度变得不可预测）；
+/// 2. **图纸直链**为 `None` ⇒ 名称渲染成**纯文字**（不加 `[]()`），因为一个指向空处的
+///    链接比没有链接更让人困惑；
+/// 3. **位置**为 `None`（或空串）⇒ **整项不显示**，连它前面那两个分隔空格一起去掉
+///    （判据见 [`OrderRow::location`]）。
+///
+/// ## ⚠️ 三个用户自由输入字段过 [`clean_text`]
+///
+/// `name` / `serial_no` / `location` 三个字段都是自由文本，而 `name` 会被塞进
+/// `[名称](直链)` 的链接结构里、`serial_no` 与 `location` 都排在清单行里 ⇒ 不清洗就
+/// 能提前闭合链接伪造出指向外站的第二条链接，或靠换行伪造出独立的一行。两个职责与
+/// 取舍（剥控制字符 + 半角换全角）见 [`clean_text`]。
+///
+/// ⚠️ 链接**文字**之外的字段**不做清洗**：组标题的日期、`×N`、分组标签都来自枚举或
+/// 数值，`<` / `>` 原样透传即可（守卫 ⑭ 覆盖这里的三个字段，不是「全篇」）。
+fn order_line(r: &OrderRow) -> String {
+    let prefix = if r.is_child {
+        CHILD_PREFIX
+    } else {
+        ORDER_PREFIX
+    };
+    let name = match r.link.as_deref() {
+        Some(url) => format!("[{}]({url})", clean_text(&r.name)),
+        None => clean_text(&r.name),
+    };
+    let head = match r.serial_no.as_deref() {
+        // 有序列号：`> F1001 名称 …`（序列号与其后恰一个空格）。
+        Some(s) => format!("{prefix}{} {name}", clean_text(s)),
+        // 无序列号：整个字段去掉，行首恒是 `prefix`。
+        None => format!("{prefix}{name}"),
+    };
+    let mut line = format!("{head} ×{}", r.quantity);
+    // ⚠️ 空串按「没有位置」处理（2026-10-23）：直接拼上去会得到 `×2  ` 这种行尾双空格，
+    // 而 `markdown` v1 吃行首连续空格、行尾双空格只会在真机上留一段看不见的空白。
+    if let Some(loc) = r.location.as_deref().filter(|s| !s.is_empty()) {
+        line.push_str("  ");
+        line.push_str(&clean_text(loc));
+    }
+    line
+}
+
+/// 清单行的前缀：工单行 `> `，子件行 `>   └ `。
+///
+/// ⚠️ 子件前缀里那 3 个空格**不承载信息**（v1 会吃掉行首连续空格），层级靠 `└`
+/// 这个字面量 —— 理由见 [`OrderRow::is_child`]。
+const ORDER_PREFIX: &str = "> ";
+const CHILD_PREFIX: &str = ">   └ ";
 
 /// 工人行块（每行一个块，**不可再拆**）。
 ///
@@ -544,12 +887,14 @@ mod tests {
             overview_batch_count: 128,
             overview_quantity: 456,
             completed_count: 37,
+            sent_batch_count: 86,
             in_process_count: 92,
-            repair_part_count: 5,
-            note_count: 6,
-            note_part_count: 214,
+            note_count: 214,
             overdue_count: 12,
             upcoming_count: 7,
+            order_groups: order_groups_fixture(),
+            drawing_links: HashMap::new(),
+            drawing_part_ids: Vec::new(),
             worker_rows: (0..n)
                 .map(|i| WorkerBarRow {
                     worker_name: format!("工人{i:03}"),
@@ -561,11 +906,78 @@ mod tests {
         }
     }
 
+    /// 一个清单行（测试用默认值：有序列号、无位置、无链接）。
+    fn order_row(serial: &str, name: &str, qty: i32) -> OrderRow {
+        OrderRow {
+            // ⚠️ fixture 的 owner_id 只为让结构体编译得过，渲染层不读它（见该字段 doc）。
+            owner_id: 0,
+            is_child: false,
+            serial_no: Some(serial.to_string()),
+            name: name.to_string(),
+            quantity: qty,
+            link: None,
+            location: None,
+        }
+    }
+
+    /// 一个子件行（只差 `is_child` 与前缀）。
+    fn child_row(serial: &str, name: &str, qty: i32) -> OrderRow {
+        OrderRow {
+            is_child: true,
+            ..order_row(serial, name, qty)
+        }
+    }
+
+    /// 一组（默认没截断）。
+    fn group(kind: OrderGroupKind, rows: Vec<OrderRow>, total: i32) -> OrderGroup {
+        OrderGroup {
+            kind,
+            rows,
+            omitted: 0,
+            total,
+        }
+    }
+
+    /// 全域 fixture 的第三节清单：**逾期组**（散件 1 行 + 装配件 1 行带 2 个子件）
+    /// 与**一个日期组**（2 行）—— 覆盖「子件缩进」「位置」「组标题」三种形态。
+    fn order_groups_fixture() -> Vec<OrderGroup> {
+        let mut parent = order_row("F2000", "装配件乙", 1);
+        parent.location = Some("生产架:A-03".to_string());
+        vec![
+            group(
+                OrderGroupKind::Overdue,
+                vec![
+                    {
+                        let mut r = order_row("F1001", "名称甲", 2);
+                        r.location = Some("工人:张三".to_string());
+                        r
+                    },
+                    parent,
+                ],
+                12,
+            ),
+            group(
+                OrderGroupKind::OnDate(today()),
+                vec![
+                    child_row("F1003", "子件丙", 4),
+                    child_row("F1004", "子件丁", 5),
+                ],
+                7,
+            ),
+        ]
+    }
+
+    /// 缺省配置下的统计窗口（锚点 = 缺省推送时刻 20:05，跨天）。
+    fn window() -> (NaiveDateTime, NaiveDateTime) {
+        crate::modules::wecom_daily::dto::report_window(&NormalizedConfig::default(), today())
+    }
+
     fn render_ok(cfg: &NormalizedConfig, rows: &ReportRows) -> Rendered {
         render(&RenderInput {
             cfg,
             rows,
             today: today(),
+            window: window(),
         })
         .expect("不该报 21804")
     }
@@ -668,6 +1080,7 @@ mod tests {
             cfg: &cfg,
             rows: &rows,
             today: today(),
+            window: window(),
         })
         .expect_err("标题块超限必须报错");
         assert_eq!(err.code(), code::BIZ_WECOM_CONFIG_INVALID);
@@ -684,6 +1097,7 @@ mod tests {
             cfg: &cfg,
             rows: &rows,
             today: today(),
+            window: window(),
         })
         .expect_err("超上限必须报错");
         assert_eq!(err.code(), code::BIZ_WECOM_CONFIG_INVALID);
@@ -701,8 +1115,8 @@ mod tests {
     fn closed_section_is_not_rendered_at_all() {
         let rows = rows_with_workers(2);
         let cases: [(bool, &str, &str); 4] = [
-            (false, "一、全厂报工总览", "报工批次"),
-            (false, "二、今日出货", "已取货送货单"),
+            (false, "一、全厂报工总览", "报工："),
+            (false, "二、本期出货", "出货："),
             (false, "三、逾期未交", "逾期未交"),
             (false, "四、工人报工", "工人报工"),
         ];
@@ -720,6 +1134,55 @@ mod tests {
             assert!(!all.contains(heading), "关掉的节不该出现标题 {heading}");
             assert!(!all.contains(needle), "关掉的节不该出现内容 {needle}");
         }
+    }
+
+    /// ★ 守卫 ⑯：第一节 / 第二节的**逐字正文**（口径一改，最容易悄悄漂的就是这两块）。
+    ///
+    /// ⚠️ 「全文不得再出现『今日』」这一条才是本用例的重点：窗口跨天之后（见
+    /// `dto::report_window`），任何留着「今日」的措辞都**必然是错的** —— 它会把昨天
+    /// 20:05 之后到今天 20:05 之前的那一段说成「今天」。
+    #[test]
+    fn overview_and_delivery_sections_render_the_agreed_wording() {
+        let rows = rows_with_workers(1);
+        let out = render_ok(&cfg_with(0, 20), &rows);
+        let all = out.chunks.join("\n");
+        assert!(all.contains("## 一、全厂报工总览"), "{all}");
+        assert!(
+            all.contains(
+                "> 报工：<font color=\"info\">128</font> 批  共 <font color=\"info\">456</font> 件"
+            ),
+            "{all}"
+        );
+        assert!(
+            all.contains(
+                "> 送检 <font color=\"info\">86</font> 批  在制 <font color=\"info\">92</font> 单"
+            ),
+            "{all}"
+        );
+        assert!(all.contains("## 二、本期出货"), "{all}");
+        assert!(
+            all.contains("> 出货：<font color=\"info\">214</font> 单"),
+            "{all}"
+        );
+        assert!(
+            !all.contains("今日"),
+            "窗口跨天，全文不该再出现「今日」措辞：{all}"
+        );
+    }
+
+    /// ★ 守卫 ⑰：标题块的「统计区间」是**真实的跨天窗口两端**，不是写死的日历日。
+    ///
+    /// 缺省锚点 20:05、`today() = 2026-10-18` ⇒ 窗口 `[10-17 20:05, 10-18 20:05)`。
+    /// ⚠️ 变异验证：把 `report_window` 改回「当天 00:00 ~ 当天 23:59」时本条立刻红。
+    #[test]
+    fn title_block_shows_the_real_cross_day_window() {
+        let rows = rows_with_workers(1);
+        let out = render_ok(&cfg_with(0, 20), &rows);
+        let all = out.chunks.join("\n");
+        assert!(
+            all.contains("> 统计区间 <font color=\"comment\">10-17 20:05 ~ 10-18 20:05</font>"),
+            "{all}"
+        );
     }
 
     /// ★ 守卫 ⑦：姓名按**显示宽度**对齐 ⇒ 条形起始列一致。
@@ -949,8 +1412,10 @@ mod tests {
         assert!(!all.contains("在此省略"), "不限人数时不该有省略脚注：{all}");
     }
 
-    /// ★ 守卫 ⑭：本域是 markdown 不是 HTML ⇒ **不做任何转义**，
-    /// 工人名里的 `<` / `>` 原样透传，而 `<font color=…>` 自身成对。
+    /// ★ 守卫 ⑭：本域是 markdown 不是 HTML ⇒ 工人名里的 `<` / `>` 原样透传，
+    /// 而 `<font color=…>` 自身成对。⚠️ 覆盖范围**不是「全篇」**：清单行的 `name` /
+    /// `serial_no` / `location` 是用户自由输入、会进链接结构或拼在同一行里，那三个字段
+    /// 过 [`clean_text`]（见下面三条守卫）。
     #[test]
     fn markdown_special_chars_are_not_swallowed() {
         let rows = ReportRows {
@@ -974,6 +1439,127 @@ mod tests {
             "font 标签不成对：{all}"
         );
         assert!(all.matches("<font").count() > 0);
+    }
+
+    /// ★ 守卫 ⑭ 的第二半：**清单行**的用户自由输入**必须**过 [`clean_text`] 的半角→全角
+    /// 替换（2026-10-23）。
+    ///
+    /// `name` 会被塞进 `[名称](直链)` 的链接结构里，而 `t_part.name` 是 `varchar(200)`
+    /// 自由文本（管理员可编辑）⇒ 名字里出现 `](` 就能在自己的文本内部**提前闭合**
+    /// 链接、把后半段变成第二条链接指向外站。判据取「输出里真正成对闭合的 `](` **只有
+    /// 一条**」（那条真实直链），且注入的 URL 没有被半角 `)` 收尾成目的地。
+    ///
+    /// ⚠️ 断言数的是**未经任何转义的 `](`**：防线主体是「凑不出半角 `](`」，与解析器
+    /// 认不认反斜杠转义无关（markdown v1 的官方语法子集里没有反斜杠转义）。
+    #[test]
+    fn order_line_cannot_close_the_link_from_free_text() {
+        let mut evil = order_row("F1001", "甲](https://evil.example/x)[乙", 2);
+        evil.link = Some("https://cos.example/real/p1.jpg".into());
+        let rows = ReportRows {
+            overdue_count: 1,
+            order_groups: vec![group(OrderGroupKind::Overdue, vec![evil], 1)],
+            ..ReportRows::default()
+        };
+        let out = render_ok(&cfg_with(0, 20), &rows);
+        let all = out.chunks.join("\n");
+
+        // 数半角 `](` = markdown 里真正成对闭合的链接。
+        let chars: Vec<char> = all.chars().collect();
+        let closed_links = chars
+            .windows(2)
+            .filter(|w| w[0] == ']' && w[1] == '(')
+            .count();
+        assert_eq!(
+            closed_links, 1,
+            "注入的 `](` 不得提前闭合成第二条链接（应只剩真实直链那一条）：{all}"
+        );
+
+        // 真实直链完好，且注入的 URL 没有被半角 `)` 收尾成链接目的地。
+        assert!(
+            all.contains("](https://cos.example/real/p1.jpg)"),
+            "真实直链必须原样保留：{all}"
+        );
+        assert!(
+            !all.contains("evil.example/x)"),
+            "注入的外站 URL 后面不得跟半角 `)`，不能成为链接目的地：{all}"
+        );
+        // ⚠️ 注入串的两个半角括号都换成了全角 ⇒ 链接文字里连闭合符都拼不出来。
+        assert!(
+            all.contains("甲］（https://evil.example/x）［乙"),
+            "注入的 `]([` 三个结构字符必须换近形全角：{all}"
+        );
+    }
+
+    /// ★ 守卫 ⑭ 的第三半：**序列号**排在行首 ⇒ 换行能伪造出独立的清单行 / 组标题。
+    ///
+    /// 判据取「输出里没有任何一行**以**伪造的组标题形态**开头**」—— 控制字符被剥掉后
+    /// 文本仍在，但它只能待在原行内、跟在序列号后面。
+    #[test]
+    fn serial_no_cannot_forge_an_extra_line() {
+        let forged = order_row("F1\n> **2026-01-01 · 99 条**", "普通件", 1);
+        let rows = ReportRows {
+            overdue_count: 1,
+            order_groups: vec![group(OrderGroupKind::Overdue, vec![forged], 1)],
+            ..ReportRows::default()
+        };
+        let out = render_ok(&cfg_with(0, 20), &rows);
+        let all = out.chunks.join("\n");
+        assert!(
+            !all.lines()
+                .any(|l| l.trim_start().starts_with("> **2026-01-01")),
+            "序列号里的换行必须被剥掉，不能伪造出一条独立组标题：{all}"
+        );
+        assert!(
+            all.lines().all(|l| !l.contains('\t')),
+            "控制字符（制表符）不得漏进输出：{all}"
+        );
+    }
+
+    /// ★ 守卫 ⑭ 的第四半：**名称**与**位置**里的换行同样造不出独立行 / 组标题。
+    ///
+    /// 与 `serial_no_cannot_forge_an_extra_line` 同款判据，但字段换成另外两个用户自由
+    /// 输入：名称走链接文字（`[名称](直链)`）、位置内嵌工人名 / 外协公司名 / 货架码 ——
+    /// 三者都是拼进**同一行清单行**里的自由文本，留一个 `\n` 就足以伪造出一条组标题。
+    /// ⚠️ 变异验证：把 [`clean_text`] 里的 `!c.is_control()` 过滤去掉，本条立刻红
+    /// （两个字段的换行都会让伪造标题另起一行）。
+    #[test]
+    fn name_and_location_cannot_forge_an_extra_line() {
+        // 名称：换行 + 伪造组标题 + 伪造清单行（`>` 引用与 `**加粗**` 在 v1 都受支持）。
+        let mut forged_name = order_row("F1001", "连杆\n> **2026-01-01 · 99 条**\n> F9999", 1);
+        forged_name.link = Some("https://cos.example/real/p1.jpg".into());
+        // 位置：内嵌的工人名带换行。
+        let mut forged_loc = order_row("F1002", "普通件", 1);
+        forged_loc.location = Some("工人:张三\n> **2026-01-01 · 99 条**".into());
+        let rows = ReportRows {
+            overdue_count: 1,
+            order_groups: vec![group(
+                OrderGroupKind::Overdue,
+                vec![forged_name, forged_loc],
+                1,
+            )],
+            ..ReportRows::default()
+        };
+        let out = render_ok(&cfg_with(0, 20), &rows);
+        let all = out.chunks.join("\n");
+
+        assert!(
+            !all.lines()
+                .any(|l| l.trim_start().starts_with("> **2026-01-01")),
+            "名称 / 位置里的换行必须被剥掉，不能伪造出一条独立组标题：{all}"
+        );
+        assert!(
+            !all.lines().any(|l| l.trim_start().starts_with("> F9999")),
+            "名称里的换行不得把剩余部分拆成一条独立清单行：{all}"
+        );
+        // 剥掉换行后文本仍在，但只能待在原行内。
+        assert!(
+            all.contains("连杆> **2026-01-01 · 99 条**> F9999"),
+            "被剥掉的只是换行，文本本身必须留在原行：{all}"
+        );
+        assert!(
+            all.contains("工人:张三> **2026-01-01 · 99 条**"),
+            "位置内嵌的工人名同理：{all}"
+        );
     }
 
     /// ★ 守卫 ⑮：**「（i/N）」后缀的字节数恒 ≤ RESERVE**（pass 1 为它预留的预算）。
@@ -1032,6 +1618,7 @@ mod tests {
             cfg: &cfg,
             rows: &rows,
             today: today(),
+            window: window(),
         })
         .expect_err("超长标题必须报错");
         assert!(err.to_string().contains("标题"));
@@ -1103,5 +1690,262 @@ mod tests {
         assert!(all.contains("## 四、工人报工（送件数）"));
         assert!(!all.contains("░░░"), "没有工人就不该有空条：{all}");
         assert_eq!(out.worker_row_total, 0);
+    }
+    // ========================================================================
+    // 第三节：交期清单（缩进 / 缺省字段 / 截断 / 拆片）
+    // ========================================================================
+
+    /// ★ 守卫 ⑱：第三节**逐字行形态** = `序列号 [名称](直链) ×数量  位置`。
+    ///
+    /// ⚠️ 这条守卫逐字钉住规格给的四个字段与它们的分隔符：序列号后**一个**空格、
+    /// 名称的方括号、`×数量`、位置前**两个**空格。分隔符数量变了不会报错、只会让人
+    /// 在群里读不出哪一列是哪一列。
+    #[test]
+    fn order_line_shape_is_verbatim() {
+        let mut r = order_row("F1001", "名称甲", 2);
+        r.link = Some("https://cos.hsh-erp.cloud/previews/seed01/p1.jpg".to_string());
+        r.location = Some("工人:张三".to_string());
+        assert_eq!(
+            order_line(&r),
+            "> F1001 [名称甲](https://cos.hsh-erp.cloud/previews/seed01/p1.jpg) ×2  工人:张三"
+        );
+
+        // 无直链 ⇒ 名称是**纯文字**（不留空的 `[]()`，那会渲成一个点不动的链接）。
+        let mut plain = order_row("F1002", "名称乙", 1);
+        plain.location = Some("生产架:A-03".to_string());
+        assert_eq!(order_line(&plain), "> F1002 名称乙 ×1  生产架:A-03");
+    }
+
+    /// ★ 守卫 ⑲：子件行带 `└ ` 缩进前缀，且**层级只靠 `└`**（不靠行首空格）。
+    #[test]
+    fn child_rows_render_with_the_tree_prefix() {
+        let mut r = child_row("F1003", "子件丙", 4);
+        r.location = Some("品检架:B-11".to_string());
+        assert_eq!(order_line(&r), ">   └ F1003 子件丙 ×4  品检架:B-11");
+        // 父行与子件行的前缀逐字不同（否则层级在渲染层就已经丢了）。
+        assert!(order_line(&order_row("F2000", "装配件乙", 1)).starts_with(ORDER_PREFIX));
+        assert!(order_line(&r).starts_with(CHILD_PREFIX));
+    }
+
+    /// ★ 守卫 ⑳：**序列号为空则留空**（不回退图号、不显示「无」），且**不留悬空
+    /// 空格**。
+    ///
+    /// ⚠️ 变异验证：把 `None` 分支写成 `format!("{prefix} {name}")` 时本条立刻红 ——
+    /// 悬空空格在 `markdown` v1 里会被当缩进吃掉，同一类行的行首宽度从此不可预测。
+    #[test]
+    fn missing_serial_number_renders_blank_without_a_dangling_space() {
+        let mut r = order_row("F1001", "名称甲", 2);
+        r.serial_no = None;
+        r.location = Some("工人:张三".to_string());
+        assert_eq!(order_line(&r), "> 名称甲 ×2  工人:张三");
+        assert!(!order_line(&r).contains("无"), "不许用「无」之类的占位字");
+        assert!(!order_line(&r).starts_with(">  "), "行首不许留双空格");
+
+        // 子件行同理：前缀之后直接是名称。
+        let c = OrderRow {
+            serial_no: None,
+            ..child_row("F1003", "子件丙", 4)
+        };
+        assert_eq!(order_line(&c), ">   └ 子件丙 ×4");
+    }
+
+    /// ★ 守卫 ㉑：**位置拿不到就整项不显示**（连分隔空格都不留）。
+    ///
+    /// 四种「拿不到」在 service 层归一成同一个 `None`（`OFFICE` / 无活跃批次 /
+    /// holder 行已软删），渲染层只认「有值就显示、没有就什么都没有」。⚠️ **空串与
+    /// `None` 同等对待**（2026-10-23）：空串一旦被当成「有值」，行尾会留两个看不见的
+    /// 悬空空格，而那条脏输出不该被守成契约。
+    #[test]
+    fn missing_location_drops_the_whole_item() {
+        let mut r = order_row("F1001", "名称甲", 2);
+        assert_eq!(order_line(&r), "> F1001 名称甲 ×2");
+        assert!(!order_line(&r).ends_with(' '), "行尾不许留悬空空格");
+        r.location = Some(String::new());
+        assert_eq!(
+            order_line(&r),
+            "> F1001 名称甲 ×2",
+            "空串按「没有位置」处理，不许拼出行尾双空格"
+        );
+    }
+
+    /// ★ 守卫 ㉒：组标题是 `**逾期未交 · N 条**` / `**2026-10-15 · N 条**`，且小标题
+    /// 与**第一组**的组标题 + 首行在同一个块里（不出现「只有标题没有内容」的片）。
+    #[test]
+    fn order_groups_render_heading_and_sticky_first_row() {
+        let rows = rows_with_workers(1);
+        let out = render_ok(&cfg_with(0, 20), &rows);
+        let all = out.chunks.join("\n");
+        assert!(all.contains("## 三、逾期未交 / 3 日内交期"), "{all}");
+        assert!(all.contains("> **逾期未交 · 12 条**"), "{all}");
+        assert!(
+            all.contains(&format!("> **{} · 7 条**", today().format("%Y-%m-%d"))),
+            "{all}"
+        );
+        // 小标题与第一组的组标题 + 首行同块（顺序相邻、中间无别的块）。
+        assert!(
+            all.contains(
+                "## 三、逾期未交 / 3 日内交期\n> **逾期未交 · 12 条**\n> F1001 名称甲 ×2  工人:张三"
+            ),
+            "{all}"
+        );
+    }
+
+    /// ★ 守卫 ㉓：**清单为空时只出小标题**，不出组标题、不出空态行。
+    ///
+    /// 与第四节「没有工人行就只出小标题」同款：`PreviewOut.sections[]` 已经告诉
+    /// 管理员这一节是开着的，正文再补一行「无」只是往好消息上刷噪音。
+    #[test]
+    fn empty_order_list_renders_heading_only() {
+        let rows = ReportRows::default();
+        let out = render_ok(&cfg_with(0, 20), &rows);
+        let all = out.chunks.join("\n");
+        assert!(all.contains("## 三、逾期未交 / 3 日内交期"), "{all}");
+        assert!(!all.contains("逾期未交 ·"), "空清单不出组标题：{all}");
+        assert!(!all.contains("另有"), "空清单不出截断脚注：{all}");
+    }
+
+    /// ★ 守卫 ㉔：`include_orders == false` ⇒ 整节**完全不出现**。
+    #[test]
+    fn closed_orders_section_is_absent_even_with_rows() {
+        let mut rows = rows_with_workers(1);
+        rows.order_groups = order_groups_fixture();
+        let cfg = NormalizedConfig {
+            include_orders: false,
+            ..cfg_with(0, 20)
+        };
+        let all = render_ok(&cfg, &rows).chunks.join("\n");
+        assert!(!all.contains("三、逾期未交"), "{all}");
+        assert!(!all.contains("名称甲"), "{all}");
+    }
+
+    /// ★ 守卫 ㉕：截断脚注**只在真的挡掉了行时**出现，文案逐字是「另有 N **行**未列出」
+    /// （单位是行、组标题那个「N 条」是工单数，两者不同量纲）。
+    #[test]
+    fn truncation_footer_names_the_withheld_row_count() {
+        let mut rows = rows_with_workers(1);
+        rows.order_groups = vec![group(
+            OrderGroupKind::Overdue,
+            (0..5)
+                .map(|i| order_row(&format!("F{i}"), &format!("名称{i}"), 1))
+                .collect(),
+            5,
+        )];
+        // omitted=3 是 service 层算好的（额度 2 / 共 5 行）。
+        rows.order_groups[0].omitted = 3;
+        let all = render_ok(&cfg_with(0, 20), &rows).chunks.join("\n");
+        assert!(
+            all.contains("> <font color=\"comment\">另有 3 行未列出</font>"),
+            "{all}"
+        );
+        // 脚注在组末（该组最后一行之后）。
+        let at_footer = all.find("另有 3 行未列出").expect("脚注存在");
+        let at_last_row = all.find("F4").expect("组内最后一行存在");
+        assert!(at_last_row < at_footer, "脚注必须落在组末：{all}");
+
+        // omitted = 0 ⇒ 不出现脚注。
+        rows.order_groups[0].omitted = 0;
+        let all = render_ok(&cfg_with(0, 20), &rows).chunks.join("\n");
+        assert!(!all.contains("另有"), "没截断就不该有脚注：{all}");
+    }
+
+    /// ★ 守卫 ㉖：**清单块逐行可拆** —— 一套装配件带 30 个子件会逼出多片，但每一行
+    /// 都**完整**（链接、序列号、数量、位置都不被劈开），且 31 行一个不少。
+    ///
+    /// ⚠️ 每行都挂上 ≈95 字节的图纸直链（Part 2b 接上后的真实形态）才够把 31 行撑到
+    /// 4096 字节之外 —— 只用短名时 31 行装得进一片，这条守卫就测不到「可拆」了。
+    /// ⚠️ 变异验证：把清单块改成「一个装配件一个块、不可拆」时本条立刻红（那条路下
+    /// 31 行会变成 ≈4.6 KB 的单块，直接撞单块超限 `21804`）。
+    #[test]
+    fn order_rows_split_across_chunks_without_breaking_a_line() {
+        let url = |seed: &str| {
+            Some(format!(
+                "https://cos.hsh-erp.cloud/previews/{seed}/p1.jpg?eo-img.resize=l/2560"
+            ))
+        };
+        let mut parent = order_row("F2000", "装配件乙", 1);
+        parent.link = url("ba6ad9c78280e31bc23ef746e78e27d8");
+        parent.location = Some("生产架:A-03".to_string());
+        let mut rows = vec![parent];
+        for i in 0..30 {
+            let mut c = child_row(&format!("F3{i:03}"), &format!("子件{i:02}"), i + 1);
+            c.link = url(&format!("seed{i:02}0000000000000000000000000"));
+            c.location = Some("工人:张三".to_string());
+            rows.push(c);
+        }
+        // 期望行 = `order_line` 逐字渲染的结果（一条完整行就是一个整体）。
+        let expected: Vec<String> = rows.iter().map(order_line).collect();
+        assert!(
+            expected.iter().map(|s| s.len()).sum::<usize>() > CHUNK_BYTE_LIMIT,
+            "fixture 必须真的超过单片预算，否则测不到拆片"
+        );
+
+        let report = ReportRows {
+            order_groups: vec![group(OrderGroupKind::Overdue, rows, 31)],
+            ..ReportRows::default()
+        };
+        // 只留第三节：其余三节的正文行也是 `> ` 开头，混进来会让「逐行比对」失焦。
+        let cfg = NormalizedConfig {
+            include_overview: false,
+            include_delivery: false,
+            include_workers: false,
+            ..cfg_with(0, 20)
+        };
+        let out = render_ok(&cfg, &report);
+        assert!(
+            out.chunks.len() >= 2,
+            "31 行长名行必然多片，实际 {}",
+            out.chunks.len()
+        );
+
+        let mut seen: Vec<String> = Vec::new();
+        for (i, c) in out.chunks.iter().enumerate() {
+            assert!(c.len() <= CHUNK_BYTE_LIMIT, "第 {} 片超 4096 字节", i + 1);
+            for line in c.lines() {
+                // 标题块第二行（统计区间）与组标题（`**…**`）也是 `> ` 开头，都不是
+                // 清单行 —— 拿它们去比对期望集合只会得到一条看不懂的失败信息。
+                if line.starts_with("> 统计区间")
+                    || line.starts_with("> **")
+                    || (!line.starts_with(CHILD_PREFIX) && !line.starts_with(ORDER_PREFIX))
+                {
+                    continue;
+                }
+                assert!(
+                    expected.iter().any(|e| e == line),
+                    "第 {} 片里出现了被劈开 / 不存在的行：{line}",
+                    i + 1
+                );
+                seen.push(line.to_string());
+            }
+        }
+        assert_eq!(seen.len(), 31, "31 行一个不少、不重");
+        assert_eq!(seen, expected, "顺序逐字不变（子件仍紧跟其父行）");
+    }
+
+    /// ★ 守卫 ㉗：子件行**紧跟**它的装配件行（组内顺序不被分片打乱）。
+    #[test]
+    fn child_rows_stay_directly_after_their_parent_row() {
+        let rows = ReportRows {
+            order_groups: vec![group(
+                OrderGroupKind::Overdue,
+                vec![
+                    order_row("F2000", "装配件乙", 1),
+                    child_row("F3001", "子件一", 2),
+                    child_row("F3002", "子件二", 3),
+                    order_row("F1001", "散件甲", 4),
+                    child_row("F3003", "孤儿子件", 5),
+                ],
+                3,
+            )],
+            ..ReportRows::default()
+        };
+        let all = render_ok(&cfg_with(0, 20), &rows).chunks.join("\n");
+        let order: Vec<usize> = ["装配件乙", "子件一", "子件二", "散件甲", "孤儿子件"]
+            .iter()
+            .map(|needle| all.find(needle).unwrap_or_else(|| panic!("{needle} 缺失")))
+            .collect();
+        assert!(
+            order.windows(2).all(|w| w[0] < w[1]),
+            "组内行序必须与入参一致：{all}"
+        );
     }
 }

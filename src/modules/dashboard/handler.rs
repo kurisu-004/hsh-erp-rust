@@ -152,7 +152,8 @@ pub async fn get_delivery_orders(
 
 /// 解析并限长 `statuses` 查询串（逗号分隔的 OrderStatus 字面量列表）。
 ///
-/// 只做**非空 + 限长**校验，**不校验元素是否属 `DELIVERY_STATUSES`**：抽屉按层
+/// 只做**非空 + 限长**校验，**不校验元素是否属
+/// [`crate::shared::delivery_status::DELIVERY_STATUSES`]**：抽屉按层
 /// 传子集，白名单之外的字面量一律查 0 行（而不是 400），前端因此可以先于后端上线
 /// 新的图层状态而不必等后端放行白名单。
 ///

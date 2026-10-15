@@ -242,4 +242,46 @@ impl PartFileRepo {
         .fetch_all(executor)
         .await
     }
+
+    /// ★ 一次拉回一批 owner 的 **PDF 图纸**行（`part_id = ANY($1)`）。
+    ///
+    /// ## ⚠️ 为什么是「每 owner 全部图纸」而不是「每 owner 最新一张」
+    ///
+    /// 「取最新一张」这条业务口径放在 service 侧（`PreviewService::latest_of`，按
+    /// `(created_at, id)` 判）而不是这条 SQL 的 `DISTINCT ON`：`DISTINCT ON` 能少传行，
+    /// 但它把口径藏进一个 `ORDER BY`，改了口径也没人会在 SQL 侧发现。放 service 侧它
+    /// 是一条有名字、有单测的规则。
+    ///
+    /// ## ⚠️ `kind='DRAWING' AND file_type='PDF'` 是**两个**条件
+    ///
+    /// `DRAWING` 下面同时存着 `PDF` 与 `CAD_2D` 两类文件，而预览直链只对 PDF 成立。
+    ///
+    /// ## ⚠️ `part_id` 是 **polymorphic**（无 owner 类型列）
+    ///
+    /// 本列装的是 `t_part.id` **或** `t_assembly.id`（历史 schema 单列，见
+    /// [`Self::list_by_owner`] 的注释）⇒ 调用方把「散件 id 与装配件 id 混在一个数组里」
+    /// 传进来是**正确**用法，不是 bug。
+    ///
+    /// 入参为空集时**不发 SQL**（省一条语句；`= ANY('{}')` 本来就恒空）。
+    pub async fn list_pdf_drawings_by_part_ids<'e, E: PgExecutor<'e>>(
+        executor: E,
+        part_ids: &[i64],
+    ) -> Result<Vec<TPartFile>, sqlx::Error> {
+        if part_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_as::<_, TPartFile>(
+            "SELECT id, part_id, kind, file_type, object_key, original_filename, \
+                    file_size, content_type, upload_status, content_sha256, \
+                    version, created_at, created_by, updated_at, updated_by, \
+                    deleted_at, paired_file_id \
+             FROM t_part_file \
+             WHERE part_id = ANY($1) AND deleted_at IS NULL \
+               AND kind = 'DRAWING' AND file_type = 'PDF' \
+             ORDER BY part_id ASC, created_at ASC, id ASC",
+        )
+        .bind(part_ids)
+        .fetch_all(executor)
+        .await
+    }
 }

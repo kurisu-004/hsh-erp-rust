@@ -2,9 +2,10 @@
 //!
 //! ## 这个文件防的是什么
 //!
-//! `POST /api/v2/cron/wecom-daily/send` 在**同一个请求内**串着做「取数（恒 ≤ 6 条
-//! SQL）+ 最多 `max_chunks`（上界 20）次**顺序 HTTP**」。单片超时 5s
-//! （`wecom::sender::HTTP_TIMEOUT_MS`）⇒ 最坏 ≈ 100s。而
+//! `POST /api/v2/cron/wecom-daily/send` 在**同一个请求内**串着做「取数（定长几条
+//! SQL）+ **图纸就绪等待 ≤480s**（`wecom_daily::dto::DRAWING_CI_BUDGET_SECS`）+ 最多
+//! `max_chunks`（上界 20）次**顺序 HTTP**」（单片 5s，`wecom::sender::HTTP_TIMEOUT_MS`）
+//! ⇒ 最坏 ≈**510s**（缺省 `max_chunks=6`）/ ≈**580s**（`max_chunks` 上界 20）。而
 //! `middleware::timeout_middleware` 是 `tokio::time::timeout` —— **到点把 handler 的
 //! future 整个 drop 掉**，于是：
 //!
@@ -18,9 +19,12 @@
 //! 任何 `AppError`** ⇒ 运维在流水表里查不到痕迹。这就是本域的 `/send` 必须进
 //! `is_long_timeout_path` 长档白名单的原因。
 //!
-//! ## 为什么是「纯函数断言」而不是一个真跑 ≈100s 的集成测试
+//! ⚠️ **耗时主导项是 480s 的图纸就绪等待、不是发送段**（2026-10-23）：调低长档超时会
+//! 以同样的症状砍掉正常推送。改这一档前先读 `src/middleware/timeout.rs` 的白名单表。
 //!
-//! 真跑一次最坏路径要 100s 起步（还要一个真不可达的 webhook + 一个能把响应体撑住的
+//! ## 为什么是「纯函数断言」而不是一个真跑 ≈510s 的集成测试
+//!
+//! 真跑一次最坏路径要 510s 起步（还要一个真不可达的 webhook + 一个能把响应体撑住的
 //! 代理），不可测。而白名单判定本身是**纯函数**（`is_long_timeout_path` /
 //! `select_timeout` 都不碰 IO）⇒ 直接喂字面量断言即可。
 //! ⚠️ lib 侧已有同款单测（`src/middleware/timeout.rs::tests`）；**两处都要有**：
@@ -77,7 +81,8 @@ fn long_tier_is_strictly_greater_than_the_default_tier() {
     );
 }
 
-/// ⚠️ `/preview` **必须不命中**长档：它只渲染、不投递（恒 ≤ 6 条 SQL），30s 绰绰有余。
+/// ⚠️ `/preview` **必须不命中**长档：它只渲染、不投递（图纸段传 `Duration::ZERO`
+/// 预算，零 CI 提交）⇒ 恒为定长几条短语句，30s 绰绰有余。
 ///
 /// 把它捞进长档不会出错，但会让一个真卡住的预览迟迟不被兜底挡住 —— 白名单越宽，
 /// 「慢请求不被兜底」这个保证越稀释。

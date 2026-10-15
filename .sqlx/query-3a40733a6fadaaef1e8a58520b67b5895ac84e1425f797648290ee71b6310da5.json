@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        INSERT INTO t_wecom_daily_log (\n            id, config_version, trigger_source, webhook_name, webhook_masked,\n            report_date, markdown_bytes, chunk_count, chunk_sent,\n            overview_batch_count, overview_quantity, note_count, note_part_count,\n            overdue_count, upcoming_count, worker_row_total, status, error_message,\n            sent_at, created_at\n        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $19)\n        RETURNING id, config_version, trigger_source, webhook_name, webhook_masked,\n                  report_date, markdown_bytes, chunk_count, chunk_sent,\n                  overview_batch_count, overview_quantity, note_count, note_part_count,\n                  overdue_count, upcoming_count, worker_row_total, status, error_message,\n                  sent_at, created_at\n        ",
+  "query": "\n        INSERT INTO t_wecom_daily_log (\n            id, config_version, trigger_source, webhook_name, webhook_masked,\n            report_date, markdown_bytes, chunk_count, chunk_sent,\n            overview_batch_count, overview_quantity, note_count,\n            overdue_count, upcoming_count, worker_row_total, status, error_message,\n            sent_at, created_at\n        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $18)\n        RETURNING id, config_version, trigger_source, webhook_name, webhook_masked,\n                  report_date, markdown_bytes, chunk_count, chunk_sent,\n                  overview_batch_count, overview_quantity, note_count,\n                  overdue_count, upcoming_count, worker_row_total, status, error_message,\n                  sent_at, created_at\n        ",
   "describe": {
     "columns": [
       {
@@ -137,17 +137,6 @@
       },
       {
         "ordinal": 12,
-        "name": "note_part_count",
-        "type_info": "Int4",
-        "origin": {
-          "Table": {
-            "table": "t_wecom_daily_log",
-            "name": "note_part_count"
-          }
-        }
-      },
-      {
-        "ordinal": 13,
         "name": "overdue_count",
         "type_info": "Int4",
         "origin": {
@@ -158,7 +147,7 @@
         }
       },
       {
-        "ordinal": 14,
+        "ordinal": 13,
         "name": "upcoming_count",
         "type_info": "Int4",
         "origin": {
@@ -169,7 +158,7 @@
         }
       },
       {
-        "ordinal": 15,
+        "ordinal": 14,
         "name": "worker_row_total",
         "type_info": "Int4",
         "origin": {
@@ -180,7 +169,7 @@
         }
       },
       {
-        "ordinal": 16,
+        "ordinal": 15,
         "name": "status",
         "type_info": "Varchar",
         "origin": {
@@ -191,7 +180,7 @@
         }
       },
       {
-        "ordinal": 17,
+        "ordinal": 16,
         "name": "error_message",
         "type_info": "Varchar",
         "origin": {
@@ -202,7 +191,7 @@
         }
       },
       {
-        "ordinal": 18,
+        "ordinal": 17,
         "name": "sent_at",
         "type_info": "Timestamp",
         "origin": {
@@ -213,7 +202,7 @@
         }
       },
       {
-        "ordinal": 19,
+        "ordinal": 18,
         "name": "created_at",
         "type_info": "Timestamp",
         "origin": {
@@ -235,7 +224,6 @@
         "Int4",
         "Int2",
         "Int2",
-        "Int4",
         "Int4",
         "Int4",
         "Int4",
@@ -264,11 +252,10 @@
       false,
       false,
       false,
-      false,
       true,
       false,
       false
     ]
   },
-  "hash": "3a3e455351e6fcfcc5d8424865e01e8454a751f9e076c6084dbe9c6d8e9050e7"
+  "hash": "3a40733a6fadaaef1e8a58520b67b5895ac84e1425f797648290ee71b6310da5"
 }

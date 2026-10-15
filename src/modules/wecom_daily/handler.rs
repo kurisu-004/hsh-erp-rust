@@ -12,8 +12,11 @@
 //! **除 `/send` 外的 4 个端点**统一在 handler：`state.pool.acquire()` → 借 `&mut *conn`
 //! 给 service → drop conn。
 //! ⚠️ **例外：`POST /send` 的连接由 service 段段自己借**（2026-10-19）—— 它要在**同一个
-//! 请求内**串着发 ≈100s 的网络，握着一条连接等会把池占满、读端点跟着排队，所以 handler
-//! 只传 `state`（不借连接），由 `service::deliver` 按「借 3 次、每次用完即还」执行。
+//! 请求内**串着等一次投递，最坏 ≈580s 的**纯等待**（图纸就绪 ≤480s + 逐片发送
+//! ≈ `max_chunks × 5s`，缺省 `max_chunks=6` 时 ≈510s / 上界 20 时 ≈580s；核算见
+//! `wecom_daily::dto::DRAWING_CI_BUDGET_SECS`）。⚠️ HTTP 层的请求持有窗口**覆盖整段**，
+//! 主导项就是那 ≤480s。握着一条连接等会把池占满、读端点跟着排队，所以 handler 只传 `state`
+//! （不借连接），由 `service::deliver` 按「借 3 次、每次用完即还」执行。
 //! 纪律全文见 `service` 模块 doc「连接纪律」。
 //! 本域**不开显式事务**（读端点无写；写端点各只做单行 INSERT / 单行 UPDATE，语句
 //! 自身原子）。理由见 `service` 模块 doc。
@@ -145,7 +148,7 @@ pub async fn preview(
 ) -> Result<Json<R<PreviewOut>>, AppError> {
     current.require_role(Role::Manager)?;
     let mut conn = state.pool.acquire().await?;
-    let out = service::preview(&mut conn, &req).await?;
+    let out = service::preview(&state, &mut conn, &req).await?;
     Ok(Json(R::ok(out)))
 }
 

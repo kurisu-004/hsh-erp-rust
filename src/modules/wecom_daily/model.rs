@@ -45,12 +45,16 @@ pub struct TWeComDailyConfigRow {
     pub worker_metric: String,
     /// `0` = 不限（全列）。
     pub worker_top_n: i32,
+    /// 第三节交期清单每组最多列出的工单数；`0` = 不限。
+    pub order_list_limit: i32,
     /// 分片数上限；`1..=20`（20 是企业微信官方限频）。
     pub max_chunks: i16,
     pub include_overview: bool,
     pub include_delivery: bool,
     pub include_orders: bool,
     pub include_workers: bool,
+    /// 第三节清单是否带图纸预览直链。
+    pub include_drawings: bool,
     pub subject_template: Option<String>,
     pub created_at: NaiveDateTime,
     pub created_by: Option<i64>,
@@ -84,8 +88,13 @@ pub struct TWeComDailyLogRow {
     pub chunk_sent: i16,
     pub overview_batch_count: i32,
     pub overview_quantity: i32,
+    /// 第二节那个数：本期出货的**去重工单数**（`COUNT(DISTINCT part_id)`）。
+    ///
+    /// ⚠️ **2026-10-23 起语义变更**：此前该列记的是「本期出货的送货单张数」，同日
+    /// 的 `note_part_count` 才是去重工单数；第二节改单值口径后 `note_part_count`
+    /// 那一列已下线（迁移 `20261023010000_001`），本列承载现在这个数。**历史行按旧
+    /// 语义理解**，见该迁移的列注释。
     pub note_count: i32,
-    pub note_part_count: i32,
     pub overdue_count: i32,
     pub upcoming_count: i32,
     /// 工人榜行数（`worker_top_n` 挡掉尾部**之前**的真实行数）。

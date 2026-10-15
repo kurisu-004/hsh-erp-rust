@@ -405,7 +405,7 @@ async fn preview_excludes_parts_with_delivered_or_completed_batch() {
     assert!(html.contains("P-SOFTDEL"), "软删批次不算已交：{env}");
 }
 
-/// 非「未交付」状态的工单不参与（`status = ANY(DELIVERY_STATUSES)`）。
+/// 非「未交付」状态的工单不参与（`status = ANY(shared::delivery_status::DELIVERY_STATUSES)`）。
 #[tokio::test]
 async fn preview_skips_statuses_outside_delivery_whitelist() {
     let ctx = crate::bootstrap().await;

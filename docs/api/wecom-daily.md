@@ -20,20 +20,25 @@
 > 迁移 `migrations/20261018000000_001_wecom.sql`、错误码段 `shared/error.rs` 的 `218xx`。
 > 通道侧（webhook 实体 / 加密 / 掩码 / 出网）见 [`wecom.md`](wecom.md)。
 >
-> ## 域隔离：内容域 → 通道域，**单向**
+> ## 域隔离：内容域 → 通道域 + 图纸域，**两条都单向**
 >
-> 本域 import `wecom` 的 `service::resolve_target` / `service::target_is_available` /
-> `sender::send_markdown`；`wecom` 域**对本域零代码依赖**（§8.1）。
-> ⚠️ 唯一的例外是一处**只读**引用：`service::webhook_row_exists` 调
-> `wecom::repo::get_webhook` 取 `ConfigOut.webhook_configured`。理由见 §2.1。
+> 本域 import 两个域，**反向都零代码依赖**（§8.1）：
+>
+> | 域 | 本域取什么 | 反向 |
+> |---|---|---|
+> | `wecom`（通道域） | `service::resolve_target` / `service::target_is_available` / `sender::send_markdown` | 零代码依赖；唯一触及是 `wecom::repo` 里一条「查有没有配置在用我」的 COUNT SQL，以及本域调 `wecom::repo::get_webhook` 取 `ConfigOut.webhook_configured`（§2.1） |
+> | `files`（图纸域） | 第三节清单的**图纸预览直链**：`preview_service::ensure_ready_for_parts(part_ids, budget)` | 零（`t_file_preview` 的唯一写方是预览状态机，它不知道本域存在） |
 >
 > ⚠️ 本域**不解密**任何东西：webhook URL 的解密在通道域内完成（明文只在调用栈里活着）。
 >
-> ## 取数 SQL **零他域符号引用**
+> ## 取数 SQL **零他域符号引用**（图纸那一环除外，理由见 §4.6）
 >
-> 本域的统计 SQL 完全写在本域（`repo.rs`），**不 import** `statistics` / `mail_digest` /
+> 统计与清单 SQL 完全写在本域（`repo.rs`），**不 import** `statistics` / `mail_digest` /
 > `dashboard` 的任何符号（用户 2026-10-16 定的硬要求「在推送通知的域重写 SQL，不要复用
-> 其它域的」）。代价：「未交付」状态白名单变成**四处人工同步**，见 §5。
+> 其它域的」）。代价：「未交付」状态白名单的人工同步点见 §4.5。
+> ⚠️ **图纸链路的 SQL 不在本域** —— `t_part_file` / `t_file_preview` 的读与
+> 内容寻址种子全在 `files` 域的批量入口里；本域只交出「第三节清单涉及哪些 `part_id`」
+> 这一个入参（§4.6）。
 
 ## 1. 端点表（5 个端点 / 6 条路由，**全部 Manager 独占**）
 
@@ -48,8 +53,8 @@
 | `GET` | `/api/v2/cron/wecom-daily/config` | 读配置**单例**。表空时返**全默认 + `version=0` + `id="0"`**（**不是 404**） |
 | `POST` | `/api/v2/cron/wecom-daily/config` | **全量覆写**，body **必含 `version`**。成功后 `task::wecom_daily::reschedule` 热重载 cron（**失败不回滚配置**，只 warn） |
 | `GET` | `/api/v2/cron/wecom-daily/meta` | 表单选项源：**6 个键**（频率 / 工人榜指标 / 缺省值 / 三段取值范围） |
-| `POST` | `/api/v2/cron/wecom-daily/preview` | 渲染分片。**不发送、不落流水**。空体 `{}` = 全用当前配置。⚠️ **超 `max_chunks` ⇒ `21804`，绝不截断** |
-| `POST` | `/api/v2/cron/wecom-daily/send` | 真发 + 落流水（**成败都落**）。**顺序**逐片发送 |
+| `POST` | `/api/v2/cron/wecom-daily/preview` | 渲染分片。**不发送、不落流水**。空体 `{}` = 全用当前配置。⚠️ **超 `max_chunks` ⇒ `21804`，绝不截断**。⚠️ 图纸直链只取**已就绪**的（零 CI 提交，§4.6） |
+| `POST` | `/api/v2/cron/wecom-daily/send` | 真发 + 落流水（**成败都落**）。**顺序**逐片发送。⚠️ 发送前有一段**最长 8 分钟**的图纸就绪等待（§4.6） |
 | `GET` | `/api/v2/cron/wecom-daily/logs` | 分页，`sent_at DESC, id DESC`，`limit` clamp `[1,200]` 缺省 20，`offset` clamp `>=0`，`total` 不受 limit 截断 |
 
 ⚠️ **5 个端点 / 6 条路由**：`/config` 读与写是两条路由（前端契约里它们是两个语义完全
@@ -63,7 +68,7 @@
 
 ## 2. 逐字段
 
-### 2.1 `ConfigOut`（`GET/POST /config`，**21 个字段**）
+### 2.1 `ConfigOut`（`GET/POST /config`，**23 个字段**）
 
 `id` / `webhook_id` 是 JSON **string**（雪花防 JS 精度截断）。
 
@@ -81,8 +86,10 @@
 | `upcoming_days` | number | 第三节窗口天数，缺省 3，**clamp 1..60** |
 | `worker_metric` | string | `QUANTITY`（送件数）/ `BATCH`（报工批次数）。⚠️ 迁移列注释写的 `HOURS` 是过时的，见 §8.3 第 1 条 |
 | `worker_top_n` | number | 第四节人数上限，缺省 15，**0 = 不限**，范围 0..200 |
-| `max_chunks` | number | 单次最多发几条，缺省 3，范围 **1..20**（20 = 企业微信官方限频） |
+| `order_list_limit` | number | 第三节**每个交期组**最多列出多少工单，缺省 30，**0 = 不限**，范围 0..200。⚠️ 截断在 Rust 侧做，组标题的「N 条」恒是**未截断**的匹配总数（§4.5） |
+| `max_chunks` | number | 单次最多发几条，缺省 **6**，范围 **1..20**（20 = 企业微信官方限频） |
 | `include_overview` / `include_delivery` / `include_orders` / `include_workers` | bool | 四节开关，缺省全 true。⚠️ **四节全关 ⇒ `21804`** |
+| `include_drawings` | bool | 第三节清单是否带图纸预览直链，缺省 `true`。⚠️ **`false` ⇒ 图纸环节整段跳过、一条 SQL 都不发、不触发 CI**（CI 按页计费，§4.6） |
 | `subject_template` | string \| null | 标题模板，≤200 **字**，拒 CR/LF。`null` ⇒ 域内默认串 |
 | `webhook_configured` | bool | **纯 DB 存在性检查**（`webhook_id` 指向的行还在不在），**不解密** |
 | `created_at` / `updated_at` | string | naive timestamp；表空时是**空串**（不是会跳动的假时间） |
@@ -97,26 +104,42 @@
 
 ### 2.2 `SaveConfigRequest`（`POST /config` 入参，全量覆写）
 
-形状 = 上面 21 个字段**去掉** `id` / `version` 的新增 / 时间戳 / `webhook_configured`，
+形状 = 上面 23 个字段**去掉** `id` / `version` 的新增 / 时间戳 / `webhook_configured`，
 **加上** `version`（必填）。
 
 ⚠️ `version` **必填、无 `#[serde(default)]`**：缺失时 axum `Json` 提取器返 **HTTP 422
 纯文本**，不是业务信封（回归用例 `config::missing_version_is_422_plain_text`）。
 
 ⚠️ **与写侧校验的两处刻意不对称**（都照 `mail_digest` 既有口径）：
-- `upcoming_days` **clamp** 1..60（越界时夹到边界 —— 这个数只影响窗口宽窄）；
+- `upcoming_days` / `order_list_limit` **clamp**（`1..60` / `0..200` —— 这两个数只影响窗口
+  宽窄 / 清单长度，越界时夹到边界比报错更符合「用户想表达的意思」）；
 - `worker_top_n` / `max_chunks` / `worker_metric` / 频率配套字段 / 四节全关 **一律拒**
   （`21804`）。
+
+⚠️ 同一批字段在 **`POST /preview` / `POST /send` 的覆盖路径**上改口径：`upcoming_days` 与
+`order_list_limit` 走**拒**（`21804`）而不是 clamp —— 覆盖值是管理员在预览框里现填的，
+夹到边界会让预览结果与他的输入不符（他填 -5，看到的却是「未来 1 天」）。
 
 ⚠️ `webhook_id` 指向不存在**或已软删**的 webhook ⇒ `21806`（写侧校验，不等到推送时才发现）。
 
 ### 2.3 `PreviewRequest`（`POST /preview` 与 `POST /send` 共用）
 
-配置字段的**部分覆盖**，全部键可选（空体 `{}` = 完全用当前配置）。
+配置字段的**部分覆盖**，全部键可选（空体 `{}` = 完全用当前配置）：
+
+| 覆盖项 | 取值域 | 覆盖路径的校验 |
+|---|---|---|
+| `order_list_limit` | `0..200`（`0` = 不限） | 越界 ⇒ `21804`（**不 clamp**，见 §2.2 的不对称说明） |
+| `include_drawings` | bool | 无 |
+| 其余各配置项（见 §2.1） | 同 §2.1 | 同 §2.2 |
+
 ⚠️ **不含 `version`**（这两个端点不写配置）；⚠️ **不含 `webhook_id`**：「推到哪个群」是
 一条**配置**决策，不该被「预览一次」顺带改掉（否则 `/send` 的覆盖就成了绕过配置页直接
 换通道的后门）。serde 默认忽略未知键 ⇒ 前端带上它也无妨。
-覆盖值**重新跑一遍完整校验**（它在预览框里是用户现填的，夹到边界会让预览与输入不符）。
+覆盖值**重新跑一遍完整校验**。
+
+⚠️ `order_list_limit` 与 `include_drawings` 之所以值得覆盖：清单每行带直链约多 95 字节，
+而这两个开关直接决定分片数会不会撞 `max_chunks` ⇒ 管理员必须能在**不动落库配置**的
+前提下对比两种形态。
 
 ### 2.4 `MetaOut`（`GET /meta`，**6 个键**）
 
@@ -124,14 +147,18 @@
 |---|---|
 | `frequencies[]` | `{value, label, needs_time, needs_weekday, needs_day_of_month}` × 4 |
 | `worker_metrics[]` | `{value, label}` × 2（`QUANTITY`「送件数」/ `BATCH`「报工批次数」） |
-| `defaults` | 与 `ConfigOut` 同构，去掉 `id`/`version`/两个时间戳/`webhook_configured`；`webhook_id` 恒 `null` |
+| `defaults` | 与 `ConfigOut` 同构（含 `order_list_limit` 缺省 30 / `include_drawings` 缺省 true），去掉 `id`/`version`/两个时间戳/`webhook_configured`；`webhook_id` 恒 `null` |
 | `upcoming_days_range` | `{min: 1, max: 60}` |
 | `worker_top_n_range` | `{min: 0, max: 200}`（0 = 不限） |
 | `max_chunks_range` | `{min: 1, max: 20}` |
 
 ⚠️ **三个 range 与四个 `needs_*` 全部由本端下发，前端不许硬编码**。
+⚠️ **`order_list_limit` 的取值域没有单独的 range 键**（本端仍是 **6 个键**）：它的区间
+`0..200` 写在 §2.1 与 `POST /config` 的 clamp 行为里，表单校验按那一份实现即可。要把它
+也下发成第 7 个键会改 `GET /meta` 的 wire 契约（前端 `.strict()` schema 同步），当前
+不构成阻塞 —— 登记见 §8.3。
 
-### 2.5 `PreviewOut`（`POST /preview`，**15 个字段**）
+### 2.5 `PreviewOut`（`POST /preview`，**13 个字段**）
 
 | 字段 | 说明 |
 |---|---|
@@ -139,9 +166,9 @@
 | `chunks[]` | 将按顺序发送的 N 条，逐条 ≤ 4096 **字节** |
 | `chunk_count` | 冗余字段，恒等于 `chunks.len()` |
 | `overview_batch_count` / `overview_quantity` | 第一节：报工批次数 / 送检放回件数 |
-| `completed_count` / `in_process_count` / `repair_part_count` | 第一节：今日完工 / 当前在制 / 今日返修 |
-| `note_count` / `note_part_count` | 第二节：今日已取货送货单数 / 合计件数 |
-| `overdue_count` / `upcoming_count` | 第三节：逾期未交 / N 日内交期 |
+| `completed_count` / `in_process_count` | 第一节：本期完工 / 当前在制。⚠️ `completed_count` **不进正文**（保留在出参里是为了让管理员在预览弹窗核对口径） |
+| `note_count` | 第二节**唯一**的数字：本期出货的**去重工单数**（§4.4）。⚠️ **2026-10-23 起语义变更**：此前本键恒 0、真正的数字在 `note_part_count`（那时本键指的是「送货单张数」）；`note_part_count` 那一键已随 DB 列一并下线 |
+| `overdue_count` / `upcoming_count` | 第三节：**未截断**的逾期工单数 / 未来 N 日内交期工单数（与组标题「N 条」同源，§4.5） |
 | `worker_rows[]` | `{worker_name, badge_code, batch_count, quantity}` —— **两条指标都返回**，不受 `worker_metric` 影响 |
 | `worker_row_total` | **全量**工人行数（可能 > `chunks` 里出现的条数） |
 | `sections[]` | 本次实际生效的节：`overview` / `delivery` / `orders` / `workers` |
@@ -149,7 +176,7 @@
 ⚠️ **契约里没有 `markdown` 单字段** —— 只维护一个真相源。同时维护 `markdown` 与
 `chunks` 会让「要发几条」有两个答案，而那恰恰是管理员唯一需要预判的东西。
 
-### 2.6 流水行（`SendResultOut` = `LogListOut.items[]` 的元素，**19 个字段**）
+### 2.6 流水行（`SendResultOut` = `LogListOut.items[]` 的元素，**18 个字段**）
 
 | 字段 | 说明 |
 |---|---|
@@ -163,7 +190,7 @@
 | `markdown_bytes` | **全部片**的字节数**之和** |
 | `chunk_count` | 渲染出的片数。⚠️ **`0` 是合法值** = 准备阶段就失败、还没渲染 |
 | `chunk_sent` | 实发片数 |
-| `overview_batch_count` / `overview_quantity` / `note_count` / `note_part_count` / `overdue_count` / `upcoming_count` / `worker_row_total` | 各节计数快照 |
+| `overview_batch_count` / `overview_quantity` / `note_count` / `overdue_count` / `upcoming_count` / `worker_row_total` | 各节计数快照。⚠️ `note_count` 与 `PreviewOut.note_count` **同源同义**（2026-10-23 起承载第二节那个数；**更早的历史行里它记的是「送货单张数」**，见 §8.3） |
 | `error_message` | string \| null（列是 `varchar(500)`，写侧按**字符**截断到 500） |
 | `sent_at` | naive timestamp |
 
@@ -200,107 +227,225 @@ wire 上不可区分）⇒ 前端只维护一份 schema。
 
 ## 4. 口径表
 
-### 4.1 报工 = **送检 + 放回**（不是「领取」）
+### 4.1 统计窗口：**跨天**的 `[前一天 @ 推送时刻, 当天 @ 推送时刻)`
 
-事件集：`event_type IN ('RETURNED_TO_SHELF', 'SENT_TO_INSPECTION')`，窗口半开
-`[today, today+1)`。
+第一节 / 第二节 / 第四节走**时间戳**窗口，第三节走**日历日**窗口 —— 两套窗口由同一份
+配置的同一个值派生，**不要互串**。
 
-| 口径 | 表达式 | 理由 |
-|---|---|---|
-| `overview_batch_count` | `COUNT(DISTINCT batch_id)` | ① `COUNT(DISTINCT)` **忽略 NULL** ⇒ 件级事件不计入 —— 这正是「报工批次数」的正解；② 同一批次分两次放回折叠成 **1** 批（日报要「动了多少批」，不是「扫码按了多少次」）。同款判据在 `statistics` 域的「有效工时」维度上**逐字同源** |
-| `overview_quantity` | `COALESCE(SUM(quantity), 0)` | ⚠️ **全仓从未算过这个口径**：`statistics` 域没有（它算工时 / 领取数），`wx` 域有一个近似但事件集是 `PICKED_UP + RETURNED_TO_SHELF` **且排除 `SENT_TO_INSPECTION`**（那边是为了算「经手件数」去重）⇒ 口径不同、不能用 |
-| `completed_count` | `COUNT(DISTINCT part_id) WHERE event_type='COMPLETED' AND batch_id IS NULL` | 工单级事件（与 `statistics::count_completed` 同款判据） |
-| `repair_part_count` | `COUNT(DISTINCT part_id) WHERE event_type='REPAIR_STARTED'` | 同上 |
+| 项 | 内容 |
+|---|---|
+| 两端 | `(from_ts, to_ts) = (前一天 @ 锚点, 当天 @ 锚点)`，**半开** `[from_ts, to_ts)` |
+| 锚点 | `send_hour` / `send_minute`（**推送时刻本身**），缺省 **20:05** |
+| 兜底 | 任一分量为 `NULL` 或越界 ⇒ **各自独立**回退到 `20:05`（不 clamp —— 库里可能躺着 `99`，夹成 `23:59` 会得到一个看起来合法、实际统计了完全不同一段时间的窗口） |
+| 第三节的 `today` | `to_ts.date()`，与窗口上界**同一个值** ⇒ 一次推送里不会出现两个「发送日」 |
 
-**为什么不含 `PICKED_UP`**：那是「从货架**领取**」—— 工人把件拿走的那一刻，工序**还没
-开始**。日报问的是「今天干了多少活」，答领取数等于把「拿起来」当成「做完了」。
+**为什么窗口跨天**：日报回答的是「**这一班**干了多少」，而一班横跨两天（下午下的料、
+第二天上午才做完）。按日历日切 ⇒ 昨天推送出去的那条永远缺最后一班的量，而读者恰恰是
+当天晚上看昨天那一班结论的人。
 
-⚠️ **⚠️ `worker_id` 在 2026-10-12 之前从未被写入过**（`shared/part_event/mod.rs` +
-迁移 `20261011120000`）⇒ **该日期之前的日报「工人报工」恒为 0、第一节四个数字全为 0**。
-**这不是 bug**，是数据事实。现场看到大面积 0 时不要当故障排查，先看事件表的写入时间。
+⚠️ **SQL 里绝不写 `CURRENT_DATE`**：DB 会话时区（测试容器 UTC）与
+`infra::clock::now_naive()` 的 Asia/Shanghai 是**两个时钟**，Shanghai 00:00–08:00 期间
+`CURRENT_DATE == today - 1`，窗口整体偏移一天且**不报任何错**。
 
-⚠️ `JOIN t_worker w ON w.id = e.worker_id` 是 **INNER**（照 `statistics` 同款）：
-`worker_id` 指向一个已消失的工人时，那条事件不该进任何工人维度的统计。连带后果见 §8.3
-第 3 条（`completed` / `repair` 与统计域存在刻意差异）。
+### 4.2 第一节：全厂报工总览（**一条语句**五个聚合）
 
-### 4.2 当前在制（第一节第三个数）
+事件集 `event_type IN ('RETURNED_TO_SHELF', 'SENT_TO_INSPECTION')`，窗口 §4.1。
+`JOIN t_worker w ON w.id = e.worker_id` 是 **INNER**（照 `statistics` 的「有效工时」维度
+同款）：`worker_id` 指向一个已消失的工人时，那条事件不该进任何工人维度的统计。
 
-`t_part` where `deleted_at IS NULL AND status NOT IN ('COMPLETED','CANCELLED')`
-**AND** `NOT EXISTS（件级 COMPLETED / CANCELLED 事件）`，**当前快照、非日窗**。
+| 口径 | 表达式 | 进正文 | 理由 |
+|---|---|---|---|
+| `overview_batch_count` | `COUNT(DISTINCT CASE WHEN … THEN e.batch_id END)` | ✅ | `COUNT(DISTINCT)` **忽略 NULL** ⇒ 件级事件不计入；同一批次分两次放回折叠成 **1** 批（日报要「动了多少批」，不是「扫码按了多少次」） |
+| `overview_quantity` | `COALESCE(SUM(CASE WHEN … THEN e.quantity END), 0)` | ✅ | ⚠️ **全仓从未算过这个口径**：`statistics` 没有（它算工时 / 领取数），`wx` 域有个近似但事件集是 `PICKED_UP + RETURNED_TO_SHELF` 且**排除** `SENT_TO_INSPECTION` ⇒ 口径不同、不能用 |
+| `sent_batch_count` | `COUNT(DISTINCT CASE WHEN event_type='SENT_TO_INSPECTION' THEN batch_id END)` | ✅ | 工人**主动送检**（「这一批做完了、交给品检了」）≠ 放回货架。同样按 `batch_id` 去重，否则「送检 3 批」在只送过 2 批的现场是追责用的假数字 |
+| `completed_count` | `COUNT(DISTINCT part_id) WHERE event_type='COMPLETED' AND batch_id IS NULL` | ❌ | 工单级事件。保留在出参里是为了让管理员在预览弹窗核对口径 |
+| `in_process_count` | `COUNT(*) FROM t_part WHERE deleted_at IS NULL AND status='IN_PROCESS'` | ✅ | ⚠️ **只看派生列**、当前快照、**不受窗口约束**，见 §4.3 |
 
-⚠️ **二选一已定：照抄 `statistics::repo::count_in_process_at`（含那条 `NOT EXISTS`）**。
-理由：日报的首要属性是**可与统计页对账**，而那一次子查询的代价是 `t_part_event` 上的
-一个索引扫描，在日频场景下可忽略。不抄能省一次全表扫，但遇到历史脏数据会与统计页不一致。
+**为什么不含 `PICKED_UP`**：那是「从货架**领取**」—— 工人把件拿走的那一刻工序**还没开始**。
+日报问的是「这一班干了多少活」，答领取数等于把「拿起来」当成「做完了」。同款判据在
+`statistics` 域的「有效工时」维度上**逐字同源**。
 
-### 4.3 出货（第二节）
+⚠️ **`SUM(quantity)` 必须 `COALESCE(…, 0)`**：全 NULL 时 PG 返回 NULL，而「全 NULL」就是
+「本期没有任何一条报工事件」—— 日报最常见的形态。
 
-`t_delivery_note` where `deleted_at IS NULL AND picked_up_at` 落在 `[today, today+1)`；
-件数 = `LEFT JOIN LATERAL (SELECT COUNT(*) FROM t_part_batch WHERE delivery_note_id = n.id
-AND deleted_at IS NULL)` 的和。
+### 4.3 当前在制（第一节第三个数）
+
+`COUNT(*) FROM t_part WHERE deleted_at IS NULL AND status = 'IN_PROCESS'`，**当前快照、
+不受窗口约束**。
+
+⚠️ **只判派生列、不带那道「件级 COMPLETED / CANCELLED 事件」守卫**，这与统计页
+`statistics::repo::count_in_process_at` 的口径**刻意不同**。理由：日报要的是「**此刻**手上
+还有多少活」，那是当前快照而不是本期统计量；判定就该与大屏等其它页面用同一个列 ——
+同一个列才不会在三个页面上给出三个数。代价是 `t_part.status` 是 min-progress **派生缓存**、
+存在滞后窗口（刚完工的件在派生列翻过来之前仍算在制）⇒ 两个页面可能对不上，差的就是那些
+「派生列忘了翻」的脏行。登记见 §8.3。
+
+### 4.4 第二节：本期出货（**一个数字**）
+
+`COUNT(DISTINCT b.part_id)`，`t_delivery_note` JOIN `t_part_batch ON b.delivery_note_id = n.id`
+且 `b.deleted_at IS NULL`，`n.picked_up_at` 落在 §4.1 的窗口内。
 
 - ⚠️ **不写 status 谓词**：流转是 `DRAFT → SUBMITTED → PICKED_UP → ARCHIVED`，
   `picked_up_at` 只在 `PICKED_UP` 迁移时被设置且此后**不清空** ⇒ 写死
-  `status='PICKED_UP'` 会**漏掉已归档的单**，而那恰恰是「今天真正出了货」的那些。
+  `status='PICKED_UP'` 会**漏掉已归档的单**，而那恰恰是「真正出了货」的那些。
   回归：`preview::delivery_section_counts_archived_notes_by_picked_up_at`。
-- ⚠️ **`part_count` 不是 `t_delivery_note` 的列**：它是「该单名下**未软删批次**的条数」
-  （照 `com/delivery_note/service/inner.rs` 的 `PartBatchRepo::list_by_delivery_note`）
-  ⇒ 必须 `LATERAL` 一次数完（逐单查是功能正确但语句数线性涨的写法，源码护栏守它）。
+- ⚠️ **按 `part_id` 去重**：一张送货单里同一工单挂多个批次（一次送货装走同一工单的两个
+  批次）时，按批次计会把一张单报成两单，管理员按这个数字去核单会对不上。
+- ⚠️ **工单不是送货单的列**，要经 `t_part_batch` 才拿得到 ⇒ 必须 JOIN（逐单循环查是功能
+  完全正确但语句数线性涨的写法，源码护栏守它）。
 
-### 4.4 交期窗口（第三节）
+⚠️ **本节只有一个数字**（`note_count`）：出参、流水列、标题占位符 `{note_count}` 四处
+同源。**送货单张数**这个口径已下线，DB 列 `note_part_count` 一并删除（迁移
+`20261023010000_001`）—— 详见 §8.3。
 
-逾期 = `system_delivery_date < today`；未来 = `>= today AND < today + N`（`N =
-upcoming_days`，clamp 1..60）。**窗口是半开的，「N 日内交期」含今天**（今天到期最该被
-看见）。第三条**照抄** `mail_digest::repo::list_overdue` / `list_upcoming` 的全部谓词：
+### 4.5 第三节：按交期分组的工单清单（**7 条语句**）
 
-- 工单级行单位（`t_part` 侧带 `assembly_id IS NULL`，装配件单独一支 `UNION ALL`，其批次
-  经子件两跳）；
-- 6 态白名单 `PENDING / PROGRAMMING / IN_PROCESS / OUTSOURCE / INSPECTION /
-  READY_TO_SHIP`；
-- `NOT EXISTS（任一批次 `DELIVERED` / `COMPLETED`）` 已交量守卫，**含 `COMPLETED`**
-  （force-complete 端点强推它；漏掉会让已完工的工单继续被算逾期）。
+清单的**行单位是工单级**：散件工单一条、装配件一条；装配件的子件以**子行**挂在父行下面
+（渲染前缀 `└`），**不**重复计入行数 —— 否则一个 30 子件的装配件会把「逾期 12 单」撑成
+41 单。
 
-⚠️ **四处人工同步**（本域的 `repo::DELIVERY_STATUSES` 是**自有常量**，改一处必须同步
-另三处）：本域常量 / `mail_digest::repo::DELIVERY_STATUSES` /
-`dashboard::repo::delivery::DELIVERY_STATUSES` / 前端 `UpcomingDeliveryChart.vue` 的
-`LAYERS[].statuses`。
+| 谓词 | 内容 |
+|---|---|
+| 逾期组 | `system_delivery_date < today`，**无上界** |
+| 日期组 | `today <= system_delivery_date < today + upcoming_days`（**半开，含今天** —— 今天到期最该被看见，`upcoming_days=3` 即共 3 天） |
+| 状态白名单 | **品检前 4 态**：`PENDING` / `PROGRAMMING` / `IN_PROCESS` / `OUTSOURCE`（`shared::delivery_status::RED_TIER_STATUSES`） |
+| 已交量守卫 | `NOT EXISTS（任一批次 DELIVERED / COMPLETED）` —— **含 `COMPLETED`**（force-complete 端点强推它，漏掉会让已完工的工单继续被算逾期） |
+| 装配件那一支 | `t_assembly` 同款谓词，已交量守卫经 `c.assembly_id = a.id` 扫它**全部**子件的批次 ⇒ **装配件能进清单，就意味着它的子件一件都没被交过** |
 
-### 4.5 工人榜与条形图（第四节）
+⚠️ **为什么取 4 态而不是大屏那份 6 态**：本节答的是「**品检还没开始的活**里哪些要催」——
+`INSPECTION`（已进品检）与 `READY_TO_SHIP`（品检完待发货）各有自己的下一动作，混进来
+会让「该催谁」这个唯一的问题得到一个答非所问的清单。**同一套谓词、不同的状态集**是有意
+分叉，不是漂移。
+
+⚠️ **状态白名单必须共用一份**：三域各存一份副本时，「加一个状态」漏改一处不会编译失败，
+只会让日报 / 邮件 / 大屏三处的「未交付」判定互相矛盾且无单测变红。真源在
+`shared::delivery_status::RED_TIER_STATUSES`；**人工同步点只有 2 处**（§8.3 第 1 条）。
+
+**清单链路的 7 条语句**（与工单数 / 子件数 / 装配件数 / 货架数**无关**，入参为空集时跳过）：
+
+| # | 语句 | 入参形状 |
+|---|---|---|
+| 1 | 逾期主查询 | `today`（照发，它自己出 `total = 0`） |
+| 2 | 未来主查询 | `today` + `upcoming_days`（照发） |
+| 3 | 装配件子件展开 | 清单里装配件的 id |
+| 4 | 活跃批次 | 散件工单 id + 全部子件 id（**不含装配件 id**，见下） |
+| 5 | `t_shelf.code` | 目标批次里 `PRODUCTION_SHELF` / `INSPECTION_SHELF` 的 holder id |
+| 6 | `t_worker.name` | 目标批次里 `WORKER` 的 holder id |
+| 7 | `t_outsource_company.name` | 目标批次里 `OUTSOURCE_COMPANY` 的 holder id |
+
+⚠️ **位置只对 `t_part` 侧的 id 解析，装配件行恒不显示位置**：`t_part_batch.part_id` 指向
+的是 **`t_part`**（批次挂在零件上），而装配件在 `t_assembly` 里、`t_part.assembly_id` 指的
+是它的子件 ⇒ **装配件自己没有批次**。「这套装配件现在在哪儿」由**子件行逐条**回答（这正是
+清单要展开子件的原因）。
+
+**位置怎么派生**（判据逐字照抄 `part::service::list_enrichment`，不许本域自己发明）：
+① 排除 `CANCELLED`；一条不剩则退回全部批次；② 再排除 `COMPLETED`；仍不剩则退回第 ① 步的
+集合；③ 取 `shared::batch::status_machine::part_status_progress` **最小**的那批，并列取
+`batch_no` 最小。`None` = 无活跃批次 ⇒ 渲染层**整项不显示**位置（不留悬空分隔符）。
+
+⚠️ **`order_list_limit` 的截断在 Rust 侧做，SQL 不加 `LIMIT`**：组标题的「N 条」必须是
+**未截断的匹配总数**（`COUNT(*) OVER ()`）；SQL 侧加 `LIMIT` 会让某个日期组的条数与
+`total` 一起失守、组标题开始说假话。代价是「逾期几千单」的现场要拉回几千行 —— 渲染仍然
+只出 `order_list_limit` 行，被挡掉的部分由组末脚注「另有 N **行**未列出」交代。
+
+⚠️ **空清单只出小标题**，不出组标题、不出「无」行：「今天没有要催的工单」本身就是好消息，
+每天在日报里加一行「无」是往好消息上刷噪音。管理员仍能从 `/preview` 的 `sections[]` 看到
+这一节是开着的。
+
+### 4.6 图纸预览直链（第三节，`include_drawings` 打开时）
+
+每个工单行的名称渲成 `[名称](直链)`，直链是 `files` 域 COS CI 预览的**第 1 页**：
+
+```text
+{preview_base_url}/{preview_prefix}/{preview_seed}/p1.jpg?eo-img.resize=l/2560
+```
+
+| 环节 | 内容 |
+|---|---|
+| 入口 | `files::part_file::preview::service::PreviewService::ensure_ready_for_parts(part_ids, budget)`。本域只交出「清单涉及哪些 `part_id`」，**不碰** `t_part_file` / `t_file_preview` / COS / python 任何一样 |
+| 入参 | **本次会被列出的**那些行的 `part_id`（**截断之后**的集合，见本节末尾） |
+| 每份取哪张 | 该 `part_id` 的**最新一张** `kind='DRAWING' AND file_type='PDF'` 的文件（`(created_at, id)` 最大，`id` 是同秒 tiebreaker） |
+| 状态机 | 与 `GET /objects/{id}/preview` **完全同一份**（两道并发闸 / 自愈重置 / 四种终局失败 / `Success` 但 0 页仍当进行中） |
+| 只取第 1 页 | 形态决定：日报每行只有一个链接位，企业微信 markdown 渲染不了多图。翻页走 `GET /objects/{id}/preview` |
+| 缺键 | 没有 PDF 图纸 / 预算耗尽 / CI 终局失败 / 打 python 失败 ⇒ **该 key 不返回**，渲染成**纯文字名称**。⚠️ **绝不抛错**：一份日报因为一张图没转出来就不该发不出去 |
+
+⚠️ **预算是上限不是承诺**（`DRAWING_CI_BUDGET_SECS = 480`）：
+
+```text
+480s(图纸就绪等待) + max_chunks(6) × 5s(逐片顺序发送) = 510s < 660s（长档超时）
+```
+
+余量 150s 留给：取数 SQL、渲染、以及超时层本身的开销。
+`max_chunks` 调到上限 20 时最坏仍是 480 + 100 = **580s** ⇒ **与分片数无关地安全**。
+超时的几行不挂链接，其余正常挂。
+
+⚠️ **整个 `/send` 请求的最坏耗时以这一项为主导**（2026-10-23）：≈510s（缺省
+`max_chunks=6`）/ ≈580s（`max_chunks` 上界 20），与上表同源。`CLAUDE.md` 的
+wecom_daily 段与 `src/middleware/timeout.rs` 的白名单表写的是同一组数字 —— **调低
+660s 那一档前先读那两处**，否则超时会把正常推送砍成「已推送的前 k 片留在群里、
+`GET /logs` 里一行流水都没有」。
+
+⚠️ **`/preview` 传 `Duration::ZERO` 预算**：只取**已经 READY** 的那些、**零 python 往返**
+—— 管理端点不该因为点了「预览日报」就提交 CI job（按页计费），也不该让请求挂在 python 上
+等几分钟。
+
+⚠️ **`include_drawings = false` ⇒ 整段跳过、一条 SQL 都不发**：这是那个配置项存在的意义
+（关掉就不触发 CI、不花钱）。判断必须落在**调用 `files` 域入口之前** —— 放在它之后就是
+「先花完钱再决定不给链接」。
+
+⚠️ **只为「本次真的会被列出来的行」提交 CI**：入参是**截断之后**的行集合，不是未截断的
+匹配集。`order_list_limit` 挡掉的那些行一个字符都不会出现在消息里，为它们跑 CI 是纯浪费
+（逾期几千单时那是几千次按页计费的提交）。这条与上面那条是同一条纪律的两个刻度。
+
+⚠️ **这一环不持 DB 连接**：它可能跑满 8 分钟，握着 `PoolConnection` 等 CI 会把连接池占满、
+读端点跟着排队。故它在 `fetch_rows` 的连接**归还之后**执行，并由 `files` 域的入口自己短借
+短还。
+
+⚠️⚠️ **路径里绝不带文件名**（跨域安全条款，`files::part_file::preview` 的模块 doc 有整段
+说明）：`t_part_file.object_key` 是 `{sha16}_{原文件名}` 而文件名就是**图号**、可枚举；
+预览前缀是 public-read，把图号拼进路径等于**公开整张厂的图号清单**。路径成分只有
+`<prefix>/<seed>/p{n}.jpg`，`seed` 是纯哈希（内容哈希 + 渲染配方版本，配方换代即换代）。
+回归：`tests/files/preview.rs::ensure_ready_for_parts_zero_budget_is_read_only`。
+
+### 4.7 第四节：工人榜与条形图
 
 `GROUP BY e.worker_id`，输出 `{worker_name, badge_code, batch_count, quantity}`。
 
-- 事件集与 §4.1 逐字同源；`JOIN t_worker w ON w.id = e.worker_id AND w.deleted_at IS NULL`。
+- 事件集与 §4.2 逐字同源；`JOIN t_worker w ON w.id = e.worker_id AND w.deleted_at IS NULL`
+  （⚠️ **带**软删闸门，而 §4.2 的那条 JOIN **不带** ⇒ 差值登记在 §8.3）。
 - ⚠️ **排除 `batch_count = 0 AND quantity = 0` 的工人**（`HAVING`）：统计页会为零报工工人
-  **补零行**（那一页要的是「谁今天没干活」），日报只画条形图 —— 让零值行进来等于把条形
-  图灌满空条，而日报**只**服务于「今天干了多少」这个问题。
+  **补零行**（那一页要的是「谁今天没干活」），日报只画条形图 —— 让零值行进来等于把条形图
+  灌满空条，而日报**只**服务于「本期干了多少」这个问题。
 - 排序在**内存**里做（SQL 不认识「按配置选指标」）：指标降序 → 姓名升序 → 工号升序
   （保证两次推送的行序不随机跳）。
-- `worker_metric` 切换**条长依据**与**行内数值 / 标题口径**：`QUANTITY` ⇒ 按
-  `quantity`、显示件数、标题「工人报工（送件数）」；`BATCH` ⇒ 按 `batch_count`、显示
-  批次数、标题「工人报工（报工批次数）」。
+- `worker_metric` 切换**条长依据**与**行内数值 / 标题口径**：`QUANTITY` ⇒ 按 `quantity`、
+  显示件数、标题「工人报工（送件数）」；`BATCH` ⇒ 按 `batch_count`、显示批次数、标题
+  「工人报工（报工批次数）」。
 
-### 4.6 四条 SQL 硬约束（改 SQL 前逐条读）
+⚠️ **`worker_id` 在 2026-10-12 之前从未被写入过**（`shared/part_event/mod.rs` + 迁移
+`20261011120000`）⇒ **该日期之前的日报「工人报工」恒为 0**。这不是 bug，是数据事实；现场
+看到大面积 0 时不要当故障排查，先看事件表的写入时间。
 
-1. **`today` 是形参，SQL 里绝不写 `CURRENT_DATE`**：DB 会话时区（测试容器 UTC）与
-   `infra::clock::now_naive()` 的 Asia/Shanghai 是**两个时钟**，Shanghai 00:00–08:00
-   期间 `CURRENT_DATE == today - 1`，且**不报任何错**。
-2. **窗口是半开 `[today, today+N)`**。
-3. **出货查询不写 status 谓词**。
-4. **`SUM(quantity)` 必须 `COALESCE(…, 0)`**：全 NULL 时 PG 返 NULL，而「全 NULL」就是
-   「今天没有任何一条报工事件」—— 日报最常见的形态。
+### 4.8 SQL 硬约束（改 SQL 前逐条读）
 
-### 4.7 取数恒 ≤ 6 条语句
+1. **`today` / 窗口两端是形参，SQL 里绝不写 `CURRENT_DATE`**（理由见 §4.1）。
+2. **两套窗口不要互串**：第一 / 二 / 四节走**时间戳**窗口，第三节走**日历日**窗口
+   （交期列本身是 `date`）。
+3. **出货查询不写 status 谓词**（理由见 §4.4）。
+4. **`SUM(quantity)` 必须 `COALESCE(…, 0)`**（理由见 §4.2）。
 
-上界 = 第一节 2 条（`overview_events` + `in_process_count`）+ 第二节 1 条 +
-第三节 2 条 + 第四节 1 条 = **6 条**。**关掉的节一条 SQL 都不发**（`service::fetch_rows`
-的四个 `if cfg.include_*`），与工单数 / 送货单数 / 工人数**无关**。
+### 4.9 取数恒 **O(1)**（语句数与行数无关）
 
-⚠️ **节开关拦的是「四节全关 ⇒ `21804`」，不是「只能开一个」** —— 四节都开是缺省形态。
-⚠️ **刻意不写死总数**：这类计数必然过期，错的那个数比没有更坏。上界是**推出来的**，
-由 `fetch_rows` 的 doc + 源码护栏守住。
+第一节 1 条、第二节 1 条、第四节 1 个 `GROUP BY`、第三节 7 条（§4.5 的表）；
+**关掉的节一条 SQL 都不发**。图纸那一环（§4.6）的**准备段 ≤ 2 条语句**
+（`t_part_file` 与 `t_file_preview` 各至多一条批量；入参空集时一条都不发），与工单数无关；已就绪的那些**零 IO**
+返回。⚠️ 只有**推进段**随「未就绪份数 × 轮数」增长 —— 所以本域的义务是**只把截断之后
+会被列出来的行**交给它（见 §4.6 末尾）。
 
-护栏：`tests/wecom_daily/n_plus_one_guard.rs`（两条：循环体内禁 `repo::` / `sqlx::query`
-+ 顶层恰好 6 个调用点）。⚠️ **逐工单循环查是功能完全正确、集成测试照样全绿的写法**，
-只有语句数会线性涨，所以只能靠源码护栏守（该文件头登记了 6 条已知盲区）。
+⚠️ **刻意不钉死具体条数**：这类计数必然过期。护栏守的是「循环体内不许出现取数调用」那条
+东西本身 —— `tests/wecom_daily/n_plus_one_guard.rs` 扫 `service.rs` 全部生产代码的循环体，
+命中 `repo::` / `sqlx::query*` 即失败（该文件头登记了它的已知盲区：迭代器链、裸调用、
+并发扇出等）。
 
 ## 5. 渲染与分片
 
@@ -312,41 +457,59 @@ upcoming_days`，clamp 1..60）。**窗口是半开的，「N 日内交期」含
 | **字体颜色** | ✅ | ❌ |
 | 客户端门槛 | 无 | **4.1.36+**（安卓 4.1.38+），**低版本退化为纯文本** |
 
-选 v1 的两条理由：① **颜色是日报的核心信号**（逾期数 / 返修数橙红是这份日报最该被一眼
-看到的东西），低版本退化成纯文本 ⇒ 整份日报在老客户端上变成一坨没格式的文本，**风险
-不可接受**；② v1 牺牲的表格能力本域**本来也不需要**（日报是「几个数字 + 一张条形图」的
-摘要，明细在邮件域与统计页）。
+选 v1 的两条理由：① **颜色是日报的核心信号**（统计区间的灰、清单脚注的灰、节内数字的
+蓝是这份日报最该被一眼区分的东西），低版本退化成纯文本 ⇒ 整份日报在老客户端上变成一坨
+没格式的文本，**风险不可接受**；② v1 牺牲的表格能力本域**本来也不需要**（日报是
+「几个数字 + 一份清单 + 一张条形图」，明细在邮件域与统计页）。
+
+⚠️ **链接是 v1 的必要能力而不是加分项**：第三节清单行的图纸直链就是 `[名称](URL)`，
+而 `markdown_v2` 虽然也支持链接，但它不支持颜色 ⇒ 两者只能取其一，取了 v2 就失去颜色。
 
 ### 5.2 消息形态
 
 ```markdown
 # 生产日报 · 2026-10-18
 
-> 统计区间 <font color="comment">2026-10-18 00:00 ~ 23:59</font>
+> 统计区间 <font color="comment">10-17 20:05 ~ 10-18 20:05</font>
 
 ## 一、全厂报工总览
-> 报工批次 <font color="info">128</font> 批 · 送检放回 <font color="info">456</font> 件
-> 今日完工 <font color="info">37</font> 单 · 当前在制 <font color="info">92</font> 单
-> 今日返修 <font color="warning">5</font> 单
+> 报工：<font color="info">128</font> 批  共 <font color="info">456</font> 件
+> 送检 <font color="info">86</font> 批  在制 <font color="info">92</font> 单
 
-## 二、今日出货
-> 已取货送货单 <font color="warning">6</font> 单 · 合计 <font color="info">214</font> 件
+## 二、本期出货
+> 出货：<font color="info">214</font> 单
 
 ## 三、逾期未交 / 3 日内交期
-> 逾期未交 <font color="warning">12</font> 单 · 3 日内交期 <font color="info">7</font> 单
+> **逾期未交 · 12 条**
+> F1001 [名称甲](https://cos.hsh-erp.cloud/previews/ba6ad9c78280e31bc23ef746e78e27d8/p1.jpg?eo-img.resize=l/2560) ×2  工人:张三
+>   └ F1003 [子件丙](https://cos.hsh-erp.cloud/previews/1f0c…/p1.jpg?eo-img.resize=l/2560) ×4  品检架:B-11
+> **2026-10-19 · 7 条**
+> F1005 名称乙 ×1  生产架:A-03
+> <font color="comment">另有 18 行未列出</font>
 
 ## 四、工人报工（送件数）
 > 42 张三 ██████████
 > 25 李四 ██████
 > 3 王五 ██
+> <font color="comment">另有 8 人在此省略（配置「最多列出工人」= 15）</font>
 ```
 
-- ⚠️ **关掉的节完全不出现**（不是「出现标题 + 0」）。
+- ⚠️ **关掉的节完全不出现**（不是「出现标题 + 0」）。第三节一条工单都没有时**只出小标题**。
+- ⚠️ 统计区间那行是**跨天**窗口（§4.1），写成「今日 00:00 ~ 23:59」必然是假的；读者唯一
+  能核对的就是这一行，它错了整份日报的可信度就没了。
+- 第三节行内四段的缺省规则：**序列号**为 `NULL` 时字段连同分隔空格一起去掉；**图纸直链**
+  缺键时名称渲成**纯文字**（不留空 `[]()`）；**位置**取不到时整项不显示（不留悬空分隔符）。
+- ⚠️ 标题模板占位符 `{note_count}` 喂的是第二节那个数（本期出货去重工单数）；**未知占位符
+  原样保留**（照 `mail_digest` 既有口径：管理员能一眼看出自己写错了什么）。空 ⇒ 后端默认串
+  `# 生产日报 · {date}`。
 - `subject_template` 占位符**只认** `{date}` `{batch_count}` `{quantity}` `{note_count}`
   `{overdue_count}`，**未知占位符原样保留**（照 `mail_digest` 既有口径：管理员能一眼看出
   自己写错了什么）。空 ⇒ 后端默认串 `# 生产日报 · {date}`。
-- ⚠️ **本域是 markdown 不是 HTML ⇒ 不做任何转义**：工人名里的 `<` / `>` 原样透传，
-  `<font color=…>` 自身成对（守卫 `template.rs::tests::markdown_special_chars_are_not_swallowed`）。
+- ⚠️ **工人行不做转义**（清单行那三个用户自由输入字段是另一回事，见 §8.3 第 16 条）：
+  工人名里的 `<` / `>` 原样透传，`<font color=…>` 自身成对（守卫
+  `template.rs::tests::markdown_special_chars_are_not_swallowed`）。
+  ⚠️ 该守卫只钉住**这一条无害**机制；工人名里**真正**成立的注入机制是另外两条
+  （`\n` 伪造行 / 行内 `[文字](url)` 伪造外链），登记在 §8.3 第 17 条。
 
 ### 5.3 字符条形图的三条排版口径
 
@@ -366,9 +529,26 @@ upcoming_days`，clamp 1..60）。**窗口是半开的，「N 日内交期」含
 ### 5.4 分片：**不截断**
 
 渲染器产出**块**列表，顺序固定
-`Title → Overview → Delivery → Orders → WorkersHead → WorkerRow×k → Footer`。
-⚠️ **`WorkerRow` 不可再拆**（它是一整行）⇒ **所有分片都发生在块边界上，永远不会把一行
-劈成两半**（劈开会得到两条半个名字的工人，看着像数据坏了）。
+`Title → Overview → Delivery → OrdersHead → OrderLine×k → OrderFooter… → WorkersHead →
+WorkerRow×k → Footer`。
+
+⚠️ **两套粒度，刻意相反**：
+
+| | 粒度 | 为什么 |
+|---|---|---|
+| **工人行** | 一个 `WorkerRow` = 一个块，**不可拆** | 劈开得到两条半个名字的工人，看着像数据坏了 |
+| **第三节清单行** | **一行一个块，逐行可拆** | 一行装配件带 30 个子件就是 31 个渲染行；若「一组一个块」不可拆，那 31 行会变成 ≈4.2 KB 的单块 —— **超过单条消息预算**，于是「一个装配件就能让整份日报渲染失败」（`21804`），而现场看到的现象只是「今天装配件特别多」 |
+
+可拆与不可拆的**边界**（逐条钉住）：
+
+| 不可拆（同一个块内） | 可拆（块边界上断开） | 后果 |
+|---|---|---|
+| 第三节小标题 + **第一组**的组标题 + 该组首行 | 该组其余行 | 每片至多以「组标题 + 首行」开头，不会出现只有标题没有内容的片 |
+| 后续每组：组标题 + 该组首行 | 该组其余行 | 组内某片可能以若干**子件行**开头，而它们的装配件行在上一片 |
+| 组末脚注「另有 N **行**未列出」 | — | 脚注可能落在下一片 |
+
+「子件行与父行被拆到两片」是**可接受**的：子件行自带序列号 / 名称 / 数量 / 位置，单看一行
+就完整；反过来「把一行劈成两半」不可接受 —— 那会得到半个链接 URL。
 
 **两趟贪心装填**：
 
@@ -381,21 +561,33 @@ upcoming_days`，clamp 1..60）。**窗口是半开的，「N 日内交期」含
   ⚠️ **标题块在每一片都重复**（一份**副本**）—— 否则第 2 片在群里是几行孤零零的工人
   数据、没有日期上下文。
 
-**没有「另有 N 人省略」的字节截断 footer。** `worker_top_n > 0` 时挡掉的人是**管理员
-主动设的展示上限**，footer 文案必须能分辨：
+**两处「被挡掉」各有自己的脚注，且都不是字节截断**（渲染器从不静默少发内容）：
 
-```
-> <font color="comment">另有 8 人在此省略（配置「最多列出工人」= 15）</font>
-```
+| 挡掉什么 | 脚注 | 何时不出现 |
+|---|---|---|
+| 某组里超出 `order_list_limit` 的**行** | `> <font color="comment">另有 18 行未列出</font>` | 该组没挡掉任何行（`limit = 0` 或行数不足） |
+| 超出 `worker_top_n` 的工人 | `> <font color="comment">另有 8 人在此省略（配置「最多列出工人」= 15）</font>` | `worker_top_n = 0`（不限） |
 
-`worker_top_n == 0`（不限）时 footer **不出现**。
+⚠️ **清单那条脚注数的是「行」，组标题数的是「工单」，两者不同量纲**（2026-10-23）：
+
+| | 量纲 | 真源 |
+|---|---|---|
+| 组标题「逾期未交 · N 条」 | **工单**数（未截断，`COUNT(*) OVER ()`） | [`OrderGroup::total`](../../src/modules/wecom_daily/template.rs) |
+| 脚注「另有 N 行未列出」 | **行**数 = 该组未截断行数 − 实际列出行数 | [`OrderGroup::omitted`](../../src/modules/wecom_daily/template.rs) |
+
+⚠️ 两者**不作差、不相加**：有子件时工单数 ≠ 行数，作差会得到负数、相加会被读成「共
+N + N 条」。文案自带单位（「行」）就是让读者不去做那道算术 —— 一个装配件 + 2 个子件被
+整组挡掉时，组标题报 1 条工单、脚注报 3 行，两句都各自为真。
+
+⚠️ 脚注文案要能分辨「配置挡掉的」与「装不下」—— 后者
+是不存在的：装不下只会 `21804`（§5.5），不会变成一条「已省略」。
 
 ### 5.5 三个防御性分支（**一律 `21804`，绝不静默截断**）
 
 | 情形 | 处置 |
 |---|---|
 | 单个块自身 > `4096 − RESERVE` | `21804`，错误消息**指明是哪一节**。当前最大块是 `WorkersHead`（~120 字节），但 `subject_template` 很长时是标题块 —— 这条是防御性的 |
-| 装填结果片数 > `max_chunks` | `21804`，文案：「本次日报需要 4 条，但配置上限为 2；请调高「最多拆几条」或调低「最多列出工人」」 |
+| 装填结果片数 > `max_chunks` | `21804`，文案：「本次日报需要 4 条，但配置上限为 2；请调高「最多拆几条」或调低「最多列出工人」」。⚠️ 清单形态下调低 `order_list_limit` 同样有效（每行约 135 字节，其中一条直链约 95 字节） |
 | `max_chunks > 20` | **保存配置时**即拒 `21804`（企业微信官方限频：每个消息推送 ≤ 20 条/分钟） |
 
 ### 5.6 部分投递语义
@@ -413,11 +605,21 @@ upcoming_days`，clamp 1..60）。**窗口是半开的，「N 日内交期」含
 的做法）。⚠️ **`render` 阶段的 `21804`（超 `max_chunks`）不落流水** —— 没发出去，不是
 投递失败。前端 `/send` 失败后正是靠「有没有流水行」区分这两类。
 
+⚠️ **发送之前还有一段等待**：图纸就绪（§4.6，最长 480s）。它是**纯等待**、不发任何
+消息，所以「群里第一条消息出现在什么时候」取决于当日工单的预览是否已就绪 —— CI 通常
+几秒内收敛，预算只在 CI 异常时才会被吃掉。
+
 ## 6. 移除记录
 
-**无。** 全新域，无任何端点 / 表 / 迁移被移除。迁移
-`migrations/20261018000000_001_wecom.sql` 建的三张表（`t_wecom_webhook` 属通道域 +
-本域的 `t_wecom_daily_config` / `t_wecom_daily_log`）**全部在用**。
+- **端点 / 表：无移除。** 全新域，无任何端点或表被删。迁移
+  `migrations/20261018000000_001_wecom.sql` 建的三张表（`t_wecom_webhook` 属通道域 +
+  本域的 `t_wecom_daily_config` / `t_wecom_daily_log`）**全部在用**。
+- **唯一的列移除**：`t_wecom_daily_log.note_part_count`，迁移
+  `20261023010000_001_wecom_daily_note_count_semantics.sql`。第二节改成单值口径后它是第
+  二个表达同一个数字的键，随该迁移整列删除；`note_count` 改承载现在这个数（语义变更与
+  历史行的读法见 §8.3 第 11 条）。Rust 字段与出参 wire 键同步下线 ⇒ `PreviewOut` 15→13
+  字段、流水行 19→18 字段（标题占位符 `{note_count}` **名字保持不变**，避免存量
+  `subject_template` 变成裸占位符）。
 
 ## 7. 与 WS 的关系
 
@@ -437,22 +639,28 @@ upcoming_days`，clamp 1..60）。**窗口是半开的，「N 日内交期」含
 | `t_part` / `t_part_batch` | ✅（在制 / 交期 / 出货件数 / 批量列） | ❌ | `part` |
 | `t_assembly` / `t_customer` | ✅（交期两支 `UNION ALL`） | ❌ | `assembly` / `com` |
 | `t_delivery_note` | ✅（第二节） | ❌ | `com::delivery_note` |
-| `t_worker` | ✅（两处 `JOIN`） | ❌ | `prod` |
+| `t_worker` | ✅（第一节 `JOIN` + 第四节 `GROUP BY` + holder 名批量解析） | ❌ | `prod` |
+| `t_shelf` | ✅（位置：生产架 / 品检架的 `code`） | ❌ | `prod` |
+| `t_outsource_company` | ✅（位置：外协厂名） | ❌ | `prod::outsource` |
+| `t_part_file` | ✅（图纸直链，**在 `files` 域内**） | ❌ | `files` |
+| `t_file_preview` | ✅（预览状态，**在 `files` 域内**） | ⚠️ **间接写**（`ensure_ready_for_parts` 内部推进状态机；本域只调那个入口） | `files`（本域不直连） |
 
 ⚠️ **别域表的张数刻意不写死**（加表就过期）。**域隔离护栏不适用**：本域读若干张别域表
-（只读聚合是既定 pattern，同 `dashboard` / `statistics`），而内容域向通道域取推送通道是
-**「通道 / 内容」这个切分的必然结果**（与 `mail_digest → scheduled_task` 同款），
-护栏若装上会把**正确**的写法也拦掉。
+（只读聚合是既定 pattern，同 `dashboard` / `statistics`），而内容域向通道域取推送通道、
+向图纸域取预览直链，都是**「通道 / 内容」「能力提供方 / 消费方」这两个切分的必然结果**
+（与 `mail_digest → scheduled_task` 同款），护栏若装上会把**正确**的写法也拦掉。
+⚠️ 图纸那张表的读写**不在本域的 SQL 里**：本域连 `t_part_file` 的表结构都不引用
+（§4.6），所以「图纸链路变了」不需要改本域一行代码。
 
 ### 8.2 前端配套
 
 | 后端 | 前端 | 备注 |
 |---|---|---|
-| `/cron/wecom-daily/config`（21 键） | `views/wecom/daily/weComDailySchema.ts::weComDailyConfigSchema` | `.strict()` + `Object.keys().length === 21` |
+| `/cron/wecom-daily/config`（23 键） | `views/wecom/daily/weComDailySchema.ts::weComDailyConfigSchema` | `.strict()` + `Object.keys().length === 23` |
 | `/cron/wecom-daily/meta`（6 键） | `weComDailyMetaSchema` | 三个 range + 四个 `needs_*` **不许硬编码** |
-| `/cron/wecom-daily/preview`（15 键） | `weComDailyPreviewSchema` | ⚠️ 无 `markdown` 单字段 |
+| `/cron/wecom-daily/preview`（13 键） | `weComDailyPreviewSchema` | ⚠️ 无 `markdown` 单字段 |
 | `/cron/wecom-daily/send` | `weComDailyLogSchema` | 与 `/logs` 的行同一个结构体 |
-| `/cron/wecom-daily/logs`（19 键/行） | `weComDailyLogSchema` / `weComDailyLogListSchema` | |
+| `/cron/wecom-daily/logs`（18 键/行） | `weComDailyLogSchema` / `weComDailyLogListSchema` | |
 
 **部署顺序**：后端必须先上（旧路径 404、无 alias，失败发生在**网络层**）。
 ⚠️ 前端兜底常量（`DEFAULT_WECOM_DAILY_FREQUENCY_LABELS` / `DEFAULT_WECOM_DAILY_WORKER_METRIC_OPTIONS`
@@ -463,11 +671,11 @@ upcoming_days`，clamp 1..60）。**窗口是半开的，「N 日内交期」含
 
 1. **前端刻意不建「统计日」列** —— `report_date` 恒等于 `sent_at` 的日期（后端同一个
    `now_naive()` 取值）⇒ 一列是另一列的常量前缀，列表里放两列等于给同一事实两行。
-2. **前端刻意不做日报 6 个数字的表格列**（`overview_batch_count` / `overview_quantity` /
-   `note_count` / `note_part_count` / `overdue_count` / `upcoming_count`）—— 流水表存它们
-   只是为了「事后复盘当时那份日报是什么数字」，而企业微信群里还看得到同样的数字；列表里
-   再铺 6 列会把真正需要看的（状态 / 片数 / 通道 / 时间）挤成窄列。它们**在库里、在
-   `GET /logs` 出参里都在**，只是不做表格列。
+2. **前端刻意不做日报 5 个数字的表格列**（`overview_batch_count` / `overview_quantity` /
+   `note_count` / `overdue_count` / `upcoming_count`）—— 流水表存它们只是为了「事后复盘
+   当时那份日报是什么数字」，而企业微信群里还看得到同样的数字；列表里再铺 5 列会把真正
+   需要看的（状态 / 片数 / 通道 / 时间）挤成窄列。它们**在库里、在 `GET /logs` 出参里
+   都在**，只是不做表格列。
 
 ### 8.3 已知偏差登记
 
@@ -480,18 +688,19 @@ upcoming_days`，clamp 1..60）。**窗口是半开的，「N 日内交期」含
    ⚠️ **为什么不去改那一行注释**（不是「规矩不许改」这种形式主义理由）：迁移是
    append-only，**改一个字都会让已 apply 过该迁移的库 checksum 失配** ⇒
    `sqlx migrate run` 直接失败、**进程起不来**。代价（一次不可逆的启动失败）与收益
-   （一行过时注释）完全不成比例，所以偏差如实登记在**四处**（本条 / `dto.rs` 文件头 +
-   `model.rs` 字段 doc / `CLAUDE.md`），而**真源只有一处**：`dto::WorkerMetric` +
-   写侧 `21804` 拒未知值。
+   （一行过时注释）完全不成比例，所以偏差如实登记在本域几处（本文 / `dto.rs` 文件头 /
+   `model.rs` 字段 doc），而**真源只有一处**：`dto::WorkerMetric` + 写侧 `21804` 拒未知值。
 2. **前端 `DEFAULT_WECOM_DAILY_*` 兜底常量与后端 `GET /meta` 的 label 措辞不同**
    （「按件数」vs「送件数」、「每周（指定星期几）」vs「每周」）。真源是 meta，前端那份
    只在 meta 在飞时用 ⇒ 不是契约冲突，但**看到两者不一致不要以为哪个错了**。
-3. **`completed_count` / `repair_part_count` 与 `statistics` 域存在刻意差异**：
-   `statistics::count_completed` / `count_repair_parts` **没有 JOIN `t_worker`**，
-   而本域为了「一条语句四个聚合」把 `JOIN t_worker w ON w.id = e.worker_id`（INNER）加
-   在整条语句上 ⇒ `worker_id IS NULL` 或指向已删工人的事件在本域**不计入**这两个数字。
-   连带后果：2026-10-12 之前的事件（`worker_id` 从未被写入）在本域第一节四个数字全为 0。
-   详见 §4.1。
+3. **`completed_count` 与 `statistics` 域存在刻意差异**：`statistics::count_completed`
+   **没有 JOIN `t_worker`**，而本域为了「一条语句五个聚合」把
+   `JOIN t_worker w ON w.id = e.worker_id`（INNER）加在整条语句上 ⇒ `worker_id IS NULL`
+   或指向已删工人的事件在本域**不计入**这个数字。连带后果：2026-10-12 之前的事件
+   （`worker_id` 从未被写入）在本域第一节的完工数恒为 0。详见 §4.2。
+   ⚠️ **「返修件数」这个口径已下线**（第一节不再有 `repair_part_count`，出参里也没有）——
+   本仓的返修是「工件级」而非「工单级」，与本域的行单位不同源，保留一个同名字段只会让
+   读的人以为它是工单数。
 4. **`overview_quantity` 与「各工人 `quantity` 之和」在软删工人处会不等**：
    `overview_events` 的 `JOIN t_worker` **不带**软删闸门，`worker_rows` **带**
    （`w.deleted_at IS NULL`）⇒ 一个「当天有事件、但工人行已被软删」的行只进前者。
@@ -519,11 +728,76 @@ upcoming_days`，clamp 1..60）。**窗口是半开的，「N 日内交期」含
    要补它需要一个**真实群机器人地址**作为测试夹具。
 10. **⚠️ 请求超时优先于落流水**：`timeout_middleware` 是 `tokio::time::timeout` ——
     到点把 handler 的 future **整个 drop 掉**，所以「请求级超时」永远**优先于**
-    「落流水」。`POST /cron/wecom-daily/send` 最坏 ≈ 100s（`max_chunks` 上界 20 ×
-    单片 5s），为此本域已把 `/send` 放进
+    「落流水」。`POST /cron/wecom-daily/send` 最坏 ≈ **510s**（缺省 `max_chunks=6`）/
+    ≈ **580s**（`max_chunks` 上界 20）—— 构成是「图纸就绪预算 480s + `max_chunks` ×
+    单片 5s」，见 §4.6 的核算。为此本域已把 `/send` 放进
     `middleware::timeout::is_long_timeout_path` 的**长档白名单**（660s，与批量打印共用
     一档）⇒ **正常路径下「失败也落流水」成立**。⚠️ 但**已知残留缺口**：整链超出该档时
     （数据库本身不可用、上游网关比 660s 更早切断连接），那一行流水**仍然写不出来**，
     `GET /logs` 里查不到痕迹。这不是「已完全解决」，是「把触发概率压到可忽略」的处置；
     要彻底消除它得改成分片投递与流水落库**解耦**（后台任务补写流水），那是独立重构。
     护栏：`tests/wecom_daily/timeout_guard.rs` + `middleware::timeout` 的 lib 单测。
+11. **⚠️ `note_count` 的历史行按**旧语义**读**：该列在 2026-10-23 之前记的是「本期出货的
+    **送货单张数**」，现在记的是「本期出货的**去重工单数**」。迁移不改任何存量行的值 ⇒
+    两种量级混在同一列里（一张单装多个工单时前者远小于后者）。日报正文与新流水只看得到
+    新语义；读历史流水做复盘时必须知道这个切换点。列注释已登记同一件事（迁移是
+    append-only，无法给历史行加标记列而不引入新的口径）。
+12. **⚠️ 位置用派生列有滞后窗口**：「这个工单现在在哪儿」取的是
+    `shared::batch::status_machine` 的 min-progress 判据，而批次状态本身是派生缓存 ⇒
+    刚流转完的工单在派生列翻过来之前可能还显示旧位置。与 §4.3 的在制数同源问题，处置
+    同款（同一个判据，好过每页各发明一套）。
+13. **⚠️ 图纸链路依赖 python 侧的 CI 端点**：本域侧实现完整，但 python 侧未部署
+    `/api/v1/files/ci-preview-jobs` 时，打 python 的每一步都失败 ⇒ 全部行不带链接
+    （**不报错、日照发出**）。这是「缺链接优于发不出去」那条取舍的直接后果，排障时先看
+    链接是否成片消失（是 ⇒ python/CI 侧问题，不是本域取数问题）。
+14. **`order_list_limit` 的取值域没有在 `GET /meta` 里下发**（本端仍是 6 个键）：区间
+    `0..200` 写在 §2.1 与 `POST /config` 的 clamp 行为里。要下发成第 7 个键会改 wire
+    契约（前端 `.strict()` schema 要同步），当前不构成阻塞（管理员填超界值时后端会 clamp）。
+15. **⚠️ 状态白名单的人工同步点只有 2 处**（后端 1 处 + 前端 1 处），登记在此是因为
+    「漏改一处不会编译失败」这个性质没有变：
+    - 后端：`shared::delivery_status::RED_TIER_STATUSES`（日报 / 邮件 / 大屏共用一份）；
+    - 前端：`UpcomingDeliveryChart.vue` 的 `LAYERS[].statuses`（大屏的交期面板用 6 态，
+      与日报的 4 态**有意不同**，不是漂移）。
+16. **⚠️ 清单行三个用户自由输入字段的清洗，以及它挡不住的东西**：`name`
+    （`t_part.name` / `t_assembly.name`，`varchar(200)` 自由文本）、`serial_no`、
+    `location`（内嵌工人名 / 外协公司名 / 货架码）三个字段统一过 `template.rs` 的
+    `clean_text`：**剥控制字符**（`char::is_control()` 恒等于 Unicode `Cc`，即 U+0000–U+001F
+    与 U+007F–U+009F ⇒ 覆盖 `\n` / `\r` / `\t` 与 C1 控制区；**不覆盖** `Cf` 与 `Zl` / `Zp`，
+    见本条末尾的残留）+ **半角结构字符换近形全角**
+    （`[` `]` `(` `)` `\` → `［` `］` `（` `）` `＼`）。
+    ⇒ **链接注入有结构性保证**：链接文字里凑不出半角 `](`，任何解析器（CommonMark 兼容的、
+    朴素的、正则的）都闭不出第二条链接（`甲](https://evil.example/x)[乙` 这类伪造外链
+    不成立）；换行被剥掉 ⇒ 三个字段里的 `\n` 都造不出独立清单行或组标题。
+    ⚠️ **为什么不用反斜杠转义**：企业微信 markdown **v1 的官方语法子集里没有反斜杠转义**
+    （就六项：`#` 标题 / `**加粗**` / `[文本](url)` / 行内代码 / `>` 引用 / `<font color>`；
+    图片语法只存在于 markdown_v2），拿它当防线等于压在一个未文档化的解析器行为上 ⇒
+    改用与解析器无关的「凑不出闭合符」。
+    ⚠️ **代价**：含半角括号的正常零件名会被换成全角（`连杆(左)` → `连杆（左）`），视觉
+    无损；这是有意取舍 —— 宁可改一个字符的形状，也不能让一条可编辑字段决定日报里某个链接
+    指向哪里。
+    ⚠️ **三条挡不住的残留**：
+    - 名称还能注入 markdown v1 支持的 `<font color="…">` ⇒ 改掉这一行的**颜色与观感**，
+      **改不了链接指向**。观感级、非安全面，**接受**；要根治得引入 HTML 白名单净化，
+      那是独立重构；
+    - URL 侧的 `base_url` / `preview_image_view_params` 是**部署配置**，其中若含半角 `)`
+      或空格会截断链接语法（链接随之失效）。失效方向是「链接打不开」而不是「指向外站」，
+      且部署面可控 ⇒ 接受该形态；
+    - `Cf`（零宽字符，如 U+200B / U+200C / U+200D / U+FEFF / U+00AD）能伪装字形（两个
+      不同名称看起来一样）—— 观感级；`Zl` / `Zp`（U+2028 行分隔符 / U+2029 段分隔符）在
+      企业微信 markdown v1 解析器里**是否被当作换行没有官方口径可依**（能依据的只有 v1
+      那六项语法子集，而它不涉及这两个字符）⇒ 按理论面登记；若将来实测确认「不当换行」，
+      这一条可降级为纯观感项。
+17. **⚠️ 第四节工人行的 `worker_name` 不做任何清洗**：渲染格式是 `> {v} {name}{pad} █`
+    （`template.rs::worker_line_blocks`），`name` 取自 `t_worker.name`（管理员可编辑的
+    `varchar` 自由文本），**完全不过 `clean_text`** ⇒ 两条注入机制都成立：
+    - `\n` → 伪造一条独立行 / 伪造组标题（同第 16 条第 1 点）；
+    - `[文字](https://…)` → **行内直接可点击的外链**（行内即可成立，无需借助换行伪造行）。
+    ⚠️ **刻意登记的不一致**：同一个 `t_worker.name` 字段，在**第三节过清洗**（它内嵌在
+    `location` 里 ⇒ 见第 16 条）、在**第四节不过**。这是**登记在案的现状，不是漏写** ——
+    `clean_text` 的「覆盖范围」只圈了 `order_line` 的三个字段。
+    ⚠️ **为什么接受**：① 它被守卫 ⑭ 第一半
+    （`template.rs::tests::markdown_special_chars_are_not_swallowed`）钉死 —— 那条守卫明确
+    要求工人名里的 `<` / `>` 原样透传，改清洗会与守卫直接冲突；② 要上清洗还必须先裁决一个
+    口径问题：`display_width` 的补空格按**清洗前**还是**清洗后**算（`clean_text` 会把半角
+    括号换成全角、剥掉 `Cc` 字符，两者都改变字符数）⇒ 判错方向会让条形图整列错位，而错位
+    比注入更难在群里被当场发现。

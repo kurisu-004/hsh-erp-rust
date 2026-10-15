@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, config_version, trigger_source, webhook_name, webhook_masked,\n               report_date, markdown_bytes, chunk_count, chunk_sent,\n               overview_batch_count, overview_quantity, note_count, note_part_count,\n               overdue_count, upcoming_count, worker_row_total, status, error_message,\n               sent_at, created_at\n        FROM t_wecom_daily_log\n        ORDER BY sent_at DESC, id DESC\n        LIMIT $1 OFFSET $2\n        ",
+  "query": "\n        SELECT id, config_version, trigger_source, webhook_name, webhook_masked,\n               report_date, markdown_bytes, chunk_count, chunk_sent,\n               overview_batch_count, overview_quantity, note_count,\n               overdue_count, upcoming_count, worker_row_total, status, error_message,\n               sent_at, created_at\n        FROM t_wecom_daily_log\n        ORDER BY sent_at DESC, id DESC\n        LIMIT $1 OFFSET $2\n        ",
   "describe": {
     "columns": [
       {
@@ -137,17 +137,6 @@
       },
       {
         "ordinal": 12,
-        "name": "note_part_count",
-        "type_info": "Int4",
-        "origin": {
-          "Table": {
-            "table": "t_wecom_daily_log",
-            "name": "note_part_count"
-          }
-        }
-      },
-      {
-        "ordinal": 13,
         "name": "overdue_count",
         "type_info": "Int4",
         "origin": {
@@ -158,7 +147,7 @@
         }
       },
       {
-        "ordinal": 14,
+        "ordinal": 13,
         "name": "upcoming_count",
         "type_info": "Int4",
         "origin": {
@@ -169,7 +158,7 @@
         }
       },
       {
-        "ordinal": 15,
+        "ordinal": 14,
         "name": "worker_row_total",
         "type_info": "Int4",
         "origin": {
@@ -180,7 +169,7 @@
         }
       },
       {
-        "ordinal": 16,
+        "ordinal": 15,
         "name": "status",
         "type_info": "Varchar",
         "origin": {
@@ -191,7 +180,7 @@
         }
       },
       {
-        "ordinal": 17,
+        "ordinal": 16,
         "name": "error_message",
         "type_info": "Varchar",
         "origin": {
@@ -202,7 +191,7 @@
         }
       },
       {
-        "ordinal": 18,
+        "ordinal": 17,
         "name": "sent_at",
         "type_info": "Timestamp",
         "origin": {
@@ -213,7 +202,7 @@
         }
       },
       {
-        "ordinal": 19,
+        "ordinal": 18,
         "name": "created_at",
         "type_info": "Timestamp",
         "origin": {
@@ -247,11 +236,10 @@
       false,
       false,
       false,
-      false,
       true,
       false,
       false
     ]
   },
-  "hash": "45516ad0ee54c698aeb56469bd368bc1de6d9e874e06021988e0853abe4bf8e7"
+  "hash": "238706335efe17c7eeca4c0dd8bf521b4843af721d59f7520ca85865cfb988af"
 }
