@@ -546,59 +546,63 @@ fn group_heading(group: &OrderGroup) -> String {
     format!("> **{} · {} 条**", group.kind.label(), group.total)
 }
 
-/// 清单行的链接文字与序列号要过的**最小 markdown 转义**（2026-10-23）。
+/// 把清单行里的**用户自由输入**压成在 markdown v1 里**无结构**的纯文本（2026-10-23）。
 ///
-/// ## 转义的字符集为什么是这五个
+/// ## 两个职责，缺一不可
 ///
-/// `[名称](直链)` 这条构造里，`[` `]` `(` `)` 四个字符参与定义链接结构，`\` 是
-/// markdown 的转义引导符 ⇒ 用户输入里只要有它们，就能在自己的名称内部**提前闭合**
-/// 链接、把后半段变成第二条链接，而本域渲染的是 `t_part.name`（`varchar(200)`
-/// **自由文本**、管理员可编辑）。
+/// 1. **剥控制字符**（`char::is_control()` 为真的一律去掉）：覆盖 `\n` / `\r` / `\t` /
+///    零宽类。清单行的三个字段都被拼在**同一行**里，只要文本里留一个 `\n`，剩下的部分
+///    就能另起一行、伪装成一条独立清单行甚至一条组标题（`> **2026-10-01 · 99 条**`）——
+///    markdown v1 明确支持 `>` 引用与 `**加粗**`，这不是理论构造。**不替换成可见占位符**
+///    （那会让名称列凭空多出一串 `?`）。
+/// 2. **半角结构字符换近形全角**：`[`→`［`、`]`→`］`、`(`→`（`、`)`→`）`、`\`→`＼`。
+///    `[名称](直链)` 的链接文字里因此**凑不出 `](`**，链接语法闭合不了。
 ///
-/// 例：名称 `甲](https://evil.example/x)[乙` 不转义时输出
-/// `[甲](https://evil.example/x)[乙](<真实 COS 直链>)` ⇒ 客户端渲染成「甲」链到外站、
-/// 「乙」链到真图。日报的全部价值就是「点开看图」，串号/名称又是用户可编辑字段 ⇒
-/// 这是一条实打实的钓鱼面。
+/// ## 为什么是「换全角」而不是「加反斜杠转义」
 ///
-/// ## 为什么是「转义」而不是「检出特殊字符就不给链接」
+/// 企业微信 markdown **v1 的官方语法子集里没有反斜杠转义**（只有 `#` 标题、
+/// `**加粗**`、`[文本](url)`、`` ` `` 行内代码、`>` 引用、`<font color>` 六项；图片语法
+/// 只存在于 markdown_v2）⇒ 反斜杠转义压在一个**未文档化的解析器行为**上：若 v1 解析器
+/// 是朴素实现（扫第一个 `](` 切链接、不认 `\`），`甲\](https://evil.example/x\)[乙` 里的
+/// 第一个 `]` **仍然闭合链接**、URL 取到注入串 ⇒ 注入照样成立，只是字符位置变了。
+/// **换全角是与解析器无关的结构性保证**：任何解析器（CommonMark 兼容的、朴素的、
+/// 正则的）都认不出全角括号，链接文字里就凑不出 `](`。防注入的主体是「凑不出闭合符」，
+/// 不是「藏起闭合符」。
 ///
-/// 后者会让**正常的图号/名称里带括号**的行集体失链（`6001(A)`、`连杆（左）` 之类），
-/// 代价远大于收益。转义之后最坏形态是**观感级**：客户端若不认反斜杠转义，名称会
-/// 显示成 `甲](x)[乙` 这样的花屏，而**不会**让链接指向外站 —— 安全属性与可读性二者
-/// 取到了正确的偏序。
+/// ## ⚠️ 代价：一个有意取舍
+///
+/// 含半角括号的正常零件名会被换成全角（`连杆(左)` → `连杆（左）`），**视觉无损** ——
+/// 零件名里本来就常见全角括号。取舍是「宁可在极端情况下改一个字符的形状，也不能让
+/// 一条可编辑字段决定日报里某个链接指向哪里」：日报的全部价值就是「点开看图」，而名称
+/// 与图号都是管理员可编辑的自由文本。
 ///
 /// ## 覆盖范围（守卫 ⑭ 守的就是这里）
 ///
-/// 只覆盖 [`order_line`] 的 `name` 与 `serial_no` 两个**用户自由输入**字段：其余
-/// 位置（组标题的日期、数字、`×N`、分组标签）来自枚举或数值，**不存在转义需求**。
+/// 覆盖 [`order_line`] 的**三个**用户自由输入字段：`name`（`t_part.name` /
+/// `t_assembly.name`，`varchar(200)` 自由文本）、`serial_no`、`location`（内嵌
+/// `t_worker.name` / 外协公司名 / 货架码）。其余位置（组标题的日期与「N 条」、`×N`、
+/// 分组标签）来自枚举或数值，**不存在清洗需求**。
 ///
 /// ## 不在覆盖范围内的已知残留
 ///
 /// - `name` 还能注入 `<font color="…">` 之类的 markdown v1 font 标签（能改颜色与
-///   观感，改不了链接指向）—— 观感级，登记在 `docs/api/wecom-daily.md` §8.3；
-/// - URL 侧的 `base_url` / `preview_image_view_params` 是**部署配置**，其中若含
-///   `)` 或空格会截断链接语法（链接随之失效，指向自家 COS 的意图不成立）——
-///   部署面可控，接受该形态。
-fn escape_link_text(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        if matches!(ch, '[' | ']' | '(' | ')' | '\\') {
-            out.push('\\');
-        }
-        out.push(ch);
-    }
-    out
-}
-
-/// 序列号去**控制字符与换行**（2026-10-23）。
-///
-/// 序列号排在清单行的**行首**，一个 `\n` 就能让剩余部分另起一行、伪装成一条独立的
-/// 清单行（甚至伪装成组标题）。markdown v1 里这是实打实的行伪造 ⇒ 控制字符与换行
-/// 一律剥掉，**不替换成可见占位符**（那会让名称列凭空多出一串 `?`）。
-///
-/// 其余内容走 [`escape_link_text`]（见那里的字符集说明）。
-fn clean_serial_no(s: &str) -> String {
-    escape_link_text(&s.chars().filter(|c| !c.is_control()).collect::<String>())
+///   观感，改不了链接指向）—— 换全角解决不了它，观感级，登记在
+///   `docs/api/wecom-daily.md` §8.3；
+/// - URL 侧的 `base_url` / `preview_image_view_params` 是**部署配置**，其中若含半角
+///   `)` 或空格会截断链接语法（链接随之失效，指向自家 COS 的意图不成立）—— 部署面
+///   可控，接受该形态；同一节有登记。
+fn clean_text(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control())
+        .map(|c| match c {
+            '[' => '［',
+            ']' => '］',
+            '(' => '（',
+            ')' => '）',
+            '\\' => '＼',
+            other => other,
+        })
+        .collect()
 }
 
 /// 一个清单行：`序列号 [名称](直链) ×数量  位置`。
@@ -613,15 +617,15 @@ fn clean_serial_no(s: &str) -> String {
 /// 3. **位置**为 `None`（或空串）⇒ **整项不显示**，连它前面那两个分隔空格一起去掉
 ///    （判据见 [`OrderRow::location`]）。
 ///
-/// ## ⚠️ `name` 与 `serial_no` 过最小 markdown 转义
+/// ## ⚠️ 三个用户自由输入字段过 [`clean_text`]
 ///
-/// 两者都是用户自由输入，而 `name` 会被塞进 `[名称](直链)` 的链接结构里 ⇒ 不转义
-/// 就能提前闭合链接、伪造出指向外站的第二条链接。字符集与取舍见 [`escape_link_text`]，
-/// 序列号另外剥控制字符与换行（它排在行首，能伪造整行）见 [`clean_serial_no`]。
+/// `name` / `serial_no` / `location` 三个字段都是自由文本，而 `name` 会被塞进
+/// `[名称](直链)` 的链接结构里、`serial_no` 与 `location` 都排在清单行里 ⇒ 不清洗就
+/// 能提前闭合链接伪造出指向外站的第二条链接，或靠换行伪造出独立的一行。两个职责与
+/// 取舍（剥控制字符 + 半角换全角）见 [`clean_text`]。
 ///
-/// ⚠️ 链接**文字**之外的字段**不做转义**：组标题的日期、`×N`、分组标签都来自枚举或
-/// 数值，`<` / `>` 原样透传即可（守卫 ⑭ 覆盖工人名与这里的 `name` / `serial_no`，不是
-/// 「全篇」）。
+/// ⚠️ 链接**文字**之外的字段**不做清洗**：组标题的日期、`×N`、分组标签都来自枚举或
+/// 数值，`<` / `>` 原样透传即可（守卫 ⑭ 覆盖这里的三个字段，不是「全篇」）。
 fn order_line(r: &OrderRow) -> String {
     let prefix = if r.is_child {
         CHILD_PREFIX
@@ -629,12 +633,12 @@ fn order_line(r: &OrderRow) -> String {
         ORDER_PREFIX
     };
     let name = match r.link.as_deref() {
-        Some(url) => format!("[{}]({url})", escape_link_text(&r.name)),
-        None => escape_link_text(&r.name),
+        Some(url) => format!("[{}]({url})", clean_text(&r.name)),
+        None => clean_text(&r.name),
     };
     let head = match r.serial_no.as_deref() {
         // 有序列号：`> F1001 名称 …`（序列号与其后恰一个空格）。
-        Some(s) => format!("{prefix}{} {name}", clean_serial_no(s)),
+        Some(s) => format!("{prefix}{} {name}", clean_text(s)),
         // 无序列号：整个字段去掉，行首恒是 `prefix`。
         None => format!("{prefix}{name}"),
     };
@@ -643,7 +647,7 @@ fn order_line(r: &OrderRow) -> String {
     // 而 `markdown` v1 吃行首连续空格、行尾双空格只会在真机上留一段看不见的空白。
     if let Some(loc) = r.location.as_deref().filter(|s| !s.is_empty()) {
         line.push_str("  ");
-        line.push_str(loc);
+        line.push_str(&clean_text(loc));
     }
     line
 }
@@ -1403,8 +1407,8 @@ mod tests {
 
     /// ★ 守卫 ⑭：本域是 markdown 不是 HTML ⇒ 工人名里的 `<` / `>` 原样透传，
     /// 而 `<font color=…>` 自身成对。⚠️ 覆盖范围**不是「全篇」**：清单行的 `name` /
-    /// `serial_no` 是用户自由输入、会进链接结构，那两个字段过最小转义
-    /// （见下面两条守卫）。
+    /// `serial_no` / `location` 是用户自由输入、会进链接结构或拼在同一行里，那三个字段
+    /// 过 [`clean_text`]（见下面三条守卫）。
     #[test]
     fn markdown_special_chars_are_not_swallowed() {
         let rows = ReportRows {
@@ -1430,15 +1434,18 @@ mod tests {
         assert!(all.matches("<font").count() > 0);
     }
 
-    /// ★ 守卫 ⑭ 的第二半：**清单行**的用户自由输入**必须**过最小 markdown 转义
-    /// （2026-10-23）。
+    /// ★ 守卫 ⑭ 的第二半：**清单行**的用户自由输入**必须**过 [`clean_text`] 的半角→全角
+    /// 替换（2026-10-23）。
     ///
     /// `name` 会被塞进 `[名称](直链)` 的链接结构里，而 `t_part.name` 是 `varchar(200)`
     /// 自由文本（管理员可编辑）⇒ 名字里出现 `](` 就能在自己的文本内部**提前闭合**
-    /// 链接、把后半段变成第二条链接指向外站。断言：真正成对闭合的链接结构**只有一条**
-    /// （那条真实直链）、注入的 URL **没有**被 `)` 收尾成目的地。
+    /// 链接、把后半段变成第二条链接指向外站。判据取「输出里真正成对闭合的 `](` **只有
+    /// 一条**」（那条真实直链），且注入的 URL 没有被半角 `)` 收尾成目的地。
+    ///
+    /// ⚠️ 断言数的是**未经任何转义的 `](`**：防线主体是「凑不出半角 `](`」，与解析器
+    /// 认不认反斜杠转义无关（markdown v1 的官方语法子集里没有反斜杠转义）。
     #[test]
-    fn order_line_escapes_markdown_link_structure_in_free_text() {
+    fn order_line_cannot_close_the_link_from_free_text() {
         let mut evil = order_row("F1001", "甲](https://evil.example/x)[乙", 2);
         evil.link = Some("https://cos.example/real/p1.jpg".into());
         let rows = ReportRows {
@@ -1449,26 +1456,30 @@ mod tests {
         let out = render_ok(&cfg_with(0, 20), &rows);
         let all = out.chunks.join("\n");
 
-        // 数「**未被反斜杠转义**的 `]` 紧跟 `(`」= markdown 里真正成对闭合的链接。
+        // 数半角 `](` = markdown 里真正成对闭合的链接。
         let chars: Vec<char> = all.chars().collect();
         let closed_links = chars
             .windows(2)
-            .enumerate()
-            .filter(|(i, w)| w[0] == ']' && w[1] == '(' && !(*i > 0 && chars[i - 1] == '\\'))
+            .filter(|w| w[0] == ']' && w[1] == '(')
             .count();
         assert_eq!(
             closed_links, 1,
             "注入的 `](` 不得提前闭合成第二条链接（应只剩真实直链那一条）：{all}"
         );
 
-        // 真实直链完好，且注入的 URL 没有被 `)` 收尾成链接目的地。
+        // 真实直链完好，且注入的 URL 没有被半角 `)` 收尾成链接目的地。
         assert!(
             all.contains("](https://cos.example/real/p1.jpg)"),
             "真实直链必须原样保留：{all}"
         );
         assert!(
             !all.contains("evil.example/x)"),
-            "注入的外站 URL 必须被 `\\)` 打断，不能成为链接目的地：{all}"
+            "注入的外站 URL 后面不得跟半角 `)`，不能成为链接目的地：{all}"
+        );
+        // ⚠️ 注入串的两个半角括号都换成了全角 ⇒ 链接文字里连闭合符都拼不出来。
+        assert!(
+            all.contains("甲］（https://evil.example/x）［乙"),
+            "注入的 `]([` 三个结构字符必须换近形全角：{all}"
         );
     }
 
@@ -1494,6 +1505,53 @@ mod tests {
         assert!(
             all.lines().all(|l| !l.contains('\t')),
             "控制字符（制表符）不得漏进输出：{all}"
+        );
+    }
+
+    /// ★ 守卫 ⑭ 的第四半：**名称**与**位置**里的换行同样造不出独立行 / 组标题。
+    ///
+    /// 与 `serial_no_cannot_forge_an_extra_line` 同款判据，但字段换成另外两个用户自由
+    /// 输入：名称走链接文字（`[名称](直链)`）、位置内嵌工人名 / 外协公司名 / 货架码 ——
+    /// 三者都是拼进**同一行清单行**里的自由文本，留一个 `\n` 就足以伪造出一条组标题。
+    /// ⚠️ 变异验证：把 [`clean_text`] 里的 `!c.is_control()` 过滤去掉，本条立刻红
+    /// （两个字段的换行都会让伪造标题另起一行）。
+    #[test]
+    fn name_and_location_cannot_forge_an_extra_line() {
+        // 名称：换行 + 伪造组标题 + 伪造清单行（`>` 引用与 `**加粗**` 在 v1 都受支持）。
+        let mut forged_name = order_row("F1001", "连杆\n> **2026-01-01 · 99 条**\n> F9999", 1);
+        forged_name.link = Some("https://cos.example/real/p1.jpg".into());
+        // 位置：内嵌的工人名带换行。
+        let mut forged_loc = order_row("F1002", "普通件", 1);
+        forged_loc.location = Some("工人:张三\n> **2026-01-01 · 99 条**".into());
+        let rows = ReportRows {
+            overdue_count: 1,
+            order_groups: vec![group(
+                OrderGroupKind::Overdue,
+                vec![forged_name, forged_loc],
+                1,
+            )],
+            ..ReportRows::default()
+        };
+        let out = render_ok(&cfg_with(0, 20), &rows);
+        let all = out.chunks.join("\n");
+
+        assert!(
+            !all.lines()
+                .any(|l| l.trim_start().starts_with("> **2026-01-01")),
+            "名称 / 位置里的换行必须被剥掉，不能伪造出一条独立组标题：{all}"
+        );
+        assert!(
+            !all.lines().any(|l| l.trim_start().starts_with("> F9999")),
+            "名称里的换行不得把剩余部分拆成一条独立清单行：{all}"
+        );
+        // 剥掉换行后文本仍在，但只能待在原行内。
+        assert!(
+            all.contains("连杆> **2026-01-01 · 99 条**> F9999"),
+            "被剥掉的只是换行，文本本身必须留在原行：{all}"
+        );
+        assert!(
+            all.contains("工人:张三> **2026-01-01 · 99 条**"),
+            "位置内嵌的工人名同理：{all}"
         );
     }
 
