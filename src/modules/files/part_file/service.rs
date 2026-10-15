@@ -406,9 +406,10 @@ impl PartFileService {
     /// `GET /objects/{id}/content`（后端代理，见
     /// [`Self::get_file_content_of_checked_row`]）即可。
     ///
-    /// ⚠️ 本端点回的是 **COS 预签直链**（有效期 1 小时），拿到即可绕过本后端任意
-    /// 访问、直链可外传。content 不同：字节流由后端代理、每次访问都重新过 RBAC。
-    /// 要放开「工控机看图纸」时放开 content 即可，不要顺带把这里的授权也发出去。
+    /// ⚠️ 本端点回的是 **COS 预签直链**（有效期由 `COS_PRESIGN_EXPIRE` 下发，
+    /// 代码缺省 3600s），拿到即可绕过本后端任意访问、直链可外传。content 不同：
+    /// 字节流由后端代理、每次访问都重新过 RBAC。要放开「工控机看图纸」时放开
+    /// content 即可，不要顺带把这里的授权也发出去。
     ///
     /// 2026-09-29 扁平化：DB 历史行 object_key 仍是五段（legacy），但 COS 桶内
     /// 真实对象可能按新模板存储（同一文件内容 sha16 一致 → 新模板 key 一致）。
@@ -429,6 +430,7 @@ impl PartFileService {
         mut repo: R,
         cos: Arc<dyn CosClient>,
         cfg_upload_prefix: &str,
+        cfg_presign_expire_seconds: u32,
         file_id: i64,
         current: &CurrentUser,
     ) -> Result<PartFileWithUrlOut, AppError> {
@@ -450,7 +452,9 @@ impl PartFileService {
         }
         let effective_key =
             Self::resolve_effective_key(cos.as_ref(), cfg_upload_prefix, &row.object_key).await?;
-        let url = cos.presigned_get_url(&effective_key, 3600).await?;
+        let url = cos
+            .presigned_get_url(&effective_key, cfg_presign_expire_seconds)
+            .await?;
         Ok(PartFileWithUrlOut {
             id: row.id.to_string(),
             kind: row.kind,
@@ -461,7 +465,7 @@ impl PartFileService {
             content_sha256: row.content_sha256,
             upload_status: row.upload_status,
             download_url: url,
-            url_expires_in_seconds: 3600,
+            url_expires_in_seconds: cfg_presign_expire_seconds,
         })
     }
 

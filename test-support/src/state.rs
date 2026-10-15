@@ -29,7 +29,7 @@ use hsh_erp_rust::infra::config::{
     AppConfig, AutoCompleteConfig, CosBackend, CosConfig, JwtConfig, MailAccountSecret,
     PythonBackendConfig, RedisConfig as AppRedisConfig, SnowflakeConfig, WeComConfig,
 };
-use hsh_erp_rust::infra::cos::{CosClient, NoopCos, ObjectMeta};
+use hsh_erp_rust::infra::cos::{CosClient, NoopCos, ObjectMeta, PresignedPutUrl};
 // 2026-09-28 新增：rust → python 后端转发客户端（薄壳鉴权转发 STS）。
 use hsh_erp_rust::infra::py_backend::{NoopPyBackend, PyBackendClient};
 use hsh_erp_rust::infra::ws_hub::WsHub;
@@ -105,6 +105,9 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
             upload_prefix: "uploads".into(),
             presign_expire_seconds: 3600,
             max_file_size: 314_572_800,
+            // 2026-10-15 新增：写侧预签 PUT URL 有效期（前端直传上传）。
+            upload_url_expire_seconds: 900,
+            // 2026-10-15：随 confirm / batch 改造一并删除。
             tmp_prefix: "tmp/".into(),
             // 2026-10-13 PR2：CI 预览图 URL 拼接两件套。测试值取固定字面量，
             // 让 `tests/files/preview.rs` 能逐条断言拼出来的 URL。
@@ -306,6 +309,9 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
             upload_prefix: "uploads".into(),
             presign_expire_seconds: 3600,
             max_file_size: 314_572_800,
+            // 2026-10-15 新增：写侧预签 PUT URL 有效期（前端直传上传）。
+            upload_url_expire_seconds: 900,
+            // 2026-10-15：随 confirm / batch 改造一并删除。
             tmp_prefix: "tmp/".into(),
             // 2026-10-13 PR2：CI 预览图 URL 拼接两件套。测试值取固定字面量，
             // 让 `tests/files/preview.rs` 能逐条断言拼出来的 URL。
@@ -472,6 +478,9 @@ pub async fn test_state_with_cos(
             upload_prefix: "uploads".into(),
             presign_expire_seconds: 3600,
             max_file_size: 314_572_800,
+            // 2026-10-15 新增：写侧预签 PUT URL 有效期（前端直传上传）。
+            upload_url_expire_seconds: 900,
+            // 2026-10-15：随 confirm / batch 改造一并删除。
             tmp_prefix: "tmp/".into(),
             // 2026-10-13 PR2：CI 预览图 URL 拼接两件套。测试值取固定字面量，
             // 让 `tests/files/preview.rs` 能逐条断言拼出来的 URL。
@@ -655,8 +664,14 @@ pub fn test_ws_app(state: Arc<AppState>) -> axum::Router {
 // - 默认返回 NoSuchKey 错误（与真实 COS 行为一致），便于验证 21114 TMP_MISSING
 // - 线程安全：`std::sync::Mutex`（`parking_lot` 不在依赖树，避免本轮新增 dev-deps）
 //
-// 当前实现覆盖的 6 个方法：put_object / get_object / presigned_get_url /
-// delete_object / head_object / copy_object。
+// 当前实现覆盖的 7 个方法：put_object / get_object / presigned_get_url /
+// presigned_put_url / delete_object / head_object / copy_object。
+//
+// 2026-10-15 新增 `presigned_put_url`：返回含 object_key 的可辨识占位 URL
+// （`local://mock/{key}`，与 `presigned_get_url` 同款形态）并把入参记进
+// `put_url_calls`，让集成测试能断言「签了几张 URL / 签的是哪个 key / 带的
+// content_type 对不对」。CAS 命中的短路路径靠「**没有**新的 put_url_calls」
+// 来断言 —— 那正是秒传的观测点。
 //
 // 2026-10-16（review 第 1 轮 MINOR-6）：`put_object` 由 no-op 改成**真的存字节**
 // （连带写 head_responses），`delete_object` 连带**移除**字节，`copy_object`
@@ -690,6 +705,8 @@ pub struct MockCos {
     pub copy_calls: std::sync::Mutex<Vec<(String, String)>>,
     /// 触发过的 `delete_object` key 列表（验证 spawn 兜底删除）。
     pub delete_calls: std::sync::Mutex<Vec<String>>,
+    /// 触发过的 `presigned_put_url` （key, content_type）列表（验证签发了几张 URL）。
+    pub put_url_calls: std::sync::Mutex<Vec<(String, String)>>,
 }
 
 impl Default for MockCos {
@@ -707,6 +724,7 @@ impl MockCos {
             head_calls: std::sync::Mutex::new(Vec::new()),
             copy_calls: std::sync::Mutex::new(Vec::new()),
             delete_calls: std::sync::Mutex::new(Vec::new()),
+            put_url_calls: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -737,6 +755,11 @@ impl MockCos {
             .iter()
             .filter(|k| k.as_str() == key)
             .count()
+    }
+
+    /// 取 `presigned_put_url` 被调用次数（CAS 命中的秒传路径断言它 **== 0**）。
+    pub fn put_url_call_count(&self) -> usize {
+        self.put_url_calls.lock().unwrap().len()
     }
 
     /// 取 delete 被调用次数。
@@ -817,6 +840,24 @@ impl CosClient for MockCos {
         _expires_seconds: u32,
     ) -> Result<String, AppError> {
         Ok(format!("local://mock/{key}"))
+    }
+
+    /// 2026-10-15 新增：与 `presigned_get_url` 同款占位（URL 含 object_key），
+    /// 额外把 (key, content_type) 记进 `put_url_calls` 供断言。
+    async fn presigned_put_url(
+        &self,
+        key: &str,
+        content_type: &str,
+        _expires_seconds: u32,
+    ) -> Result<PresignedPutUrl, AppError> {
+        self.put_url_calls
+            .lock()
+            .unwrap()
+            .push((key.to_string(), content_type.to_string()));
+        Ok(PresignedPutUrl {
+            url: format!("local://mock/{key}"),
+            content_type: content_type.to_string(),
+        })
     }
 
     /// 2026-10-16：删掉时也把桶里的字节**移除**（原先只记 `delete_calls`）。

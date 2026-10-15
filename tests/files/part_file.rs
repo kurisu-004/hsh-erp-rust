@@ -453,6 +453,7 @@ async fn get_url_returns_presigned_url() {
             &mut *tx,
             cos.clone(),
             UPLOAD_UPLOAD_PREFIX,
+            UPLOAD_PRESIGN_EXPIRE,
             out.id,
             &current,
         )
@@ -462,7 +463,7 @@ async fn get_url_returns_presigned_url() {
     assert_eq!(detail.id, out.id.to_string());
     assert_eq!(detail.kind, "DRAWING");
     assert!(detail.download_url.contains(&out.object_key));
-    assert_eq!(detail.url_expires_in_seconds, 3600);
+    assert_eq!(detail.url_expires_in_seconds, UPLOAD_PRESIGN_EXPIRE);
 }
 
 /// 守卫是**权限点**而不是角色：同为 MANAGER（原白名单内角色），未持
@@ -504,6 +505,7 @@ async fn get_url_requires_permission_point() {
             &mut *tx,
             cos.clone(),
             UPLOAD_UPLOAD_PREFIX,
+            UPLOAD_PRESIGN_EXPIRE,
             uploaded.id,
             &manager_no_perm,
         )
@@ -763,6 +765,9 @@ const UPLOAD_UPLOAD_PREFIX: &str = "uploads";
 /// 既有用例的行为与走 HTTP handler 的路径保持同一条上限；想测「超限」分支请显式传
 /// 一个更小的值（见 `upload_over_max_file_size_returns_21103`），别依赖改这里。
 const UPLOAD_MAX_FILE_SIZE: usize = 300 * 1024 * 1024;
+/// 2026-10-15：`/url` 的预签直链有效期改读 `COS_PRESIGN_EXPIRE`（不再写死 3600），
+/// service 层单测与 handler 集成测试共用同一个常量。
+const UPLOAD_PRESIGN_EXPIRE: u32 = 3600;
 
 #[tokio::test]
 async fn confirm_tmp_missing_returns_21114() {
@@ -1220,6 +1225,7 @@ async fn rbac_shelf_account_get_file_url_still_forbidden() {
             &mut *tx,
             cos.clone(),
             UPLOAD_UPLOAD_PREFIX,
+            UPLOAD_PRESIGN_EXPIRE,
             uploaded.id,
             &shelf_account,
         )

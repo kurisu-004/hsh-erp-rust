@@ -51,6 +51,8 @@ fn build_cos_config() -> CosConfig {
         upload_prefix: "drawings/".into(),
         presign_expire_seconds: 900,
         max_file_size: 100 * 1024 * 1024,
+        // 2026-10-15 新增：写侧预签 PUT URL 有效期（本 binary 不消费，填缺省）。
+        upload_url_expire_seconds: 900,
         tmp_prefix: "tmp/".into(),
         // 2026-10-13 PR2：CI 预览图 URL 拼接两件套（本 binary 不打预览端点，取字面量即可）
         preview_prefix: "previews".into(),

@@ -268,12 +268,25 @@ pub struct CosConfig {
     /// `cargo run` 场景生效。根仓那 6 处待单独提交改掉，本仓不要在文档里声称
     /// 「前缀已统一」——那会让后人以为闭环已合上。
     pub upload_prefix: String,
+    /// COS 预签 URL 有效期（秒，env `COS_PRESIGN_EXPIRE`，代码缺省 3600）。
+    ///
+    /// 读侧（`GET /objects/{id}/url` 回的下载直链）用它；rust 侧此前把 `3600`
+    /// 写死在 service 里、这个 env 解析了从没被读过（2026-10-15 修正为真读）。
     pub presign_expire_seconds: u32,
     pub max_file_size: usize,
-    /// COS 临时对象 prefix 模板前缀（默认 `tmp/`，含尾斜杠）。可用于多种场景：
-    /// - confirm handler 校验 `tmp_key` 必须以此前缀开头
+    /// 写侧**预签 PUT URL** 的有效期（秒，env `COS_UPLOAD_URL_EXPIRE`，缺省 900）。
     ///
-    /// 可通过 `COS_TMP_PREFIX` env 覆盖，缺省 `tmp/`。
+    /// 2026-10-15 新增：统一上传链路后前端拿 URL 直传 COS，本字段决定那张 URL
+    /// 活多久。缺省 900s 远大于一次上传所需（大文件 + 弱网），又不至于让一张能写
+    /// 桶的 URL 挂太久。与 [`Self::presign_expire_seconds`]（读侧下载直链）分属两
+    /// 条链路、各自独立配置。
+    pub upload_url_expire_seconds: u32,
+    /// COS 临时对象 prefix 模板前缀（默认 `tmp/`，含尾斜杠）。
+    ///
+    /// ⚠️ **2026-10-15 起进入下线流程**：统一上传链路不再有 tmp 区，
+    /// `POST /files/objects/confirm` 的防呆改为「服务端按 sha+filename 重新派生
+    /// CAS key 比对」，`POST /parts/batch` 的 bindings 分支整条删除。随那两处改完
+    /// 本字段（与 `COS_TMP_PREFIX` env）一并删除。
     pub tmp_prefix: String,
     /// COS 桶内 **CI 预览图** 前缀（env `COS_PREVIEW_PREFIX`，代码缺省 `previews`）。
     ///
@@ -809,8 +822,10 @@ impl AppConfig {
                     upload_prefix: env_or("COS_UPLOAD_PREFIX", "obj/"),
                     presign_expire_seconds: env_parse("COS_PRESIGN_EXPIRE", 3600)?,
                     max_file_size: env_parse("COS_MAX_FILE_SIZE", 300 * 1024 * 1024)?,
-                    // 2026-09-20 迁移：删 `sts_duration_seconds` 字段（spike 已记
-                    // 「将来清理」）；STS 链路与 COS 对象存储解耦。
+                    // 2026-10-15 新增：写侧预签 PUT URL 有效期（前端直传上传用）。
+                    upload_url_expire_seconds: env_parse("COS_UPLOAD_URL_EXPIRE", 900u32)?,
+                    // 2026-10-15：进入下线流程（见字段 doc），随 confirm / batch
+                    // 改造一并删除。
                     tmp_prefix: env_or("COS_TMP_PREFIX", "tmp/"),
                     // 2026-10-13 PR2：`files::part_file::preview` 的 URL 拼接两件套
                     preview_prefix: env_or("COS_PREVIEW_PREFIX", "previews"),

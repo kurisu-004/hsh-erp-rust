@@ -14,7 +14,8 @@
 //!   + `enable_virtual_host_style()` 强制 virtual-host，避免 COS `PathStyleDomainForbidden` 403）
 //! - `NoopOpenDal` 持 `opendal::Operator`（Memory backend，本地 in-memory BTreeMap，
 //!   不发任何网络请求）；与 `NoopCos`（cos.rs 占位）接口对齐，但走真内存全链路
-//! - 6 个 trait method 直接调 `Operator::write/read/stat/delete/copy/presign_read`
+//! - 7 个 trait method 直接调 `Operator::write/read/stat/delete/copy/presign_read/presign_write`
+//!   （`presign_write` 2026-10-15 新增，前端直传上传用）
 //! - 错误识别：`opendal::ErrorKind::NotFound` 对应 404 NoSuchKey
 //!
 //! 行数对比：迁移前 `cos.rs` 约 840 行（V1 Presigner + cos-rust-sdk + reqwest copy +
@@ -31,7 +32,7 @@ use opendal::{ErrorKind, Operator};
 use tracing::info;
 
 use crate::infra::config::{CosBackend, CosConfig};
-use crate::infra::cos::{CosClient, ObjectMeta};
+use crate::infra::cos::{CosClient, ObjectMeta, PresignedPutUrl};
 use crate::shared::error::{AppError, code};
 
 /// 真实 COS 客户端（OpenDAL S3 backend）。
@@ -92,6 +93,10 @@ impl OpenDalCos {
             backend = "OpenDAL",
             region = %cfg.region,
             bucket = %cfg.bucket,
+            // 2026-10-15：两条预签链路的有效期一并打出来（读侧下载直链 /
+            // 写侧前端直传 PUT），排障「URL 过期」时先看这两项而不是翻 .env。
+            presign_expire = %cfg.presign_expire_seconds,
+            upload_url_expire = %cfg.upload_url_expire_seconds,
             "OpenDalCos 已构造"
         );
 
@@ -144,6 +149,34 @@ impl CosClient for OpenDalCos {
                 )
             })?;
         Ok(signed.uri().to_string())
+    }
+
+    /// 2026-10-15 新增：预签 PUT（前端 XHR 直传上传，字节不过 rust 进程）。
+    ///
+    /// `content_type(..)` 传给 OpenDAL 是让它知道这次写是什么 MIME；⚠️ **真桶实测
+    /// （2026-10-15）签名头仍只有 `host`**（`X-Amz-SignedHeaders=host`），即这个
+    /// 头不参与签名 —— 少带它不会 403，但对象在 COS 上就没有 Content-Type。
+    async fn presigned_put_url(
+        &self,
+        key: &str,
+        content_type: &str,
+        expires_seconds: u32,
+    ) -> Result<PresignedPutUrl, AppError> {
+        let signed = self
+            .op
+            .presign_write_with(key, Duration::from_secs(expires_seconds as u64))
+            .content_type(content_type)
+            .await
+            .map_err(|e| {
+                AppError::biz(
+                    code::BIZ_PART_FILE_UPLOAD_FAILED,
+                    format!("OpenDAL presign_write 失败: {e}"),
+                )
+            })?;
+        Ok(PresignedPutUrl {
+            url: signed.uri().to_string(),
+            content_type: content_type.to_string(),
+        })
     }
 
     async fn delete_object(&self, key: &str) -> Result<(), AppError> {
@@ -265,6 +298,21 @@ impl CosClient for NoopOpenDal {
         Ok(format!("local://{key}"))
     }
 
+    /// 2026-10-15 新增：Memory backend 的 `Capability` 不含 `presign_write`（连
+    /// `presign_read` 也没有），故与 `presigned_get_url` 同款返回 `local://{key}`
+    /// 占位 —— 集成测断言的是「URL 里含派生的 object_key」，不是网络可达。
+    async fn presigned_put_url(
+        &self,
+        key: &str,
+        content_type: &str,
+        _expires_seconds: u32,
+    ) -> Result<PresignedPutUrl, AppError> {
+        Ok(PresignedPutUrl {
+            url: format!("local://{key}"),
+            content_type: content_type.to_string(),
+        })
+    }
+
     async fn delete_object(&self, key: &str) -> Result<(), AppError> {
         match self.op.delete(key).await {
             Ok(()) => Ok(()),
@@ -350,7 +398,7 @@ pub fn build_cos_client(cfg: &CosConfig) -> anyhow::Result<Arc<dyn CosClient>> {
 }
 
 // =====================================================================================
-// 单测：覆盖 OpenDAL Operator 适配 + 6 个 trait method + STS builder 接受临时凭据
+// 单测：覆盖 OpenDAL Operator 适配 + 7 个 trait method + STS builder 接受临时凭据
 // 不发任何网络请求，全部走 NoopOpenDal（Memory backend）
 // =====================================================================================
 
@@ -457,6 +505,26 @@ mod tests {
             url.contains(key),
             "NoopOpenDal 占位 URL 必须含 key，实际: {url}"
         );
+    }
+
+    /// 2026-10-15 新增：`presigned_put_url` 在 Memory backend 上的占位契约。
+    ///
+    /// 断言两件事：① URL 含 object_key（前端据此拼 confirm 的入参）；
+    /// ② `content_type` 原样回传（前端 PUT 时要原样带上，否则对象没有 Content-Type）。
+    #[tokio::test]
+    async fn memory_backend_presigned_put_returns_key_and_content_type() {
+        let client = make_client();
+        let key = "obj/abc123def4567890_主轴装配图.pdf";
+        let signed = client
+            .presigned_put_url(key, "application/pdf", 900)
+            .await
+            .expect("presigned_put_url");
+        assert!(
+            signed.url.contains(key),
+            "占位 PUT URL 必须含 object_key，实际: {}",
+            signed.url
+        );
+        assert_eq!(signed.content_type, "application/pdf");
     }
 
     #[tokio::test]

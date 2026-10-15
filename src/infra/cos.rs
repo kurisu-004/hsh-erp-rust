@@ -3,6 +3,7 @@
 //! 对应 Python `backend-python/core/cos.py`：
 //! - `put_object` / `get_object` / `presigned_get_url` / `delete_object`
 //! - M2 新增 `head_object` / `copy_object`（服务端→服务端 copy + 元数据查询）
+//! - 2026-10-15 新增 `presigned_put_url`（预签 PUT，前端直传上传，字节不过 rust）
 //! - 业务实现阶段补：`upload_file_advanced`（大文件分块）、`download_object_cached`（SHA256 LRU 缓存）
 //!
 //! 2026-09-11 重构：使用 `cos-rust-sdk`（社区 SDK，仿 cos-python-sdk-v5）作为
@@ -42,6 +43,16 @@ pub struct ObjectMeta {
     pub etag: String,
 }
 
+/// 预签 PUT URL（`presigned_put_url` 的返回值）。
+///
+/// 2026-10-15 新增：统一上传链路后，前端拿它 XHR PUT **直传** COS，字节不经过
+/// rust 进程。`content_type` 一并回给前端，让 PUT 请求的头与签发时一致。
+#[derive(Debug, Clone)]
+pub struct PresignedPutUrl {
+    pub url: String,
+    pub content_type: String,
+}
+
 #[async_trait]
 pub trait CosClient: Send + Sync {
     async fn put_object(
@@ -52,6 +63,20 @@ pub trait CosClient: Send + Sync {
     ) -> Result<(), AppError>;
     async fn get_object(&self, key: &str) -> Result<Vec<u8>, AppError>;
     async fn presigned_get_url(&self, key: &str, expires_seconds: u32) -> Result<String, AppError>;
+    /// 签发预签 PUT URL（前端直传上传用）。
+    ///
+    /// 2026-10-15 新增：统一上传链路后端侧唯一能力——签发针对**单个固定
+    /// `object_key`** 的写权限 URL，前端拿它 XHR PUT 直传 COS，字节不过 rust 进程。
+    ///
+    /// ⚠️ 签名头只有 `host`（2026-10-15 真桶实测：`X-Amz-SignedHeaders=host`），
+    /// 即 `content_type` **不参与签名**。前端仍**必须**原样带上这个头 —— 否则对象在
+    /// COS 上没有 Content-Type，读侧 / 前端预览会按 `application/octet-stream` 猜。
+    async fn presigned_put_url(
+        &self,
+        key: &str,
+        content_type: &str,
+        expires_seconds: u32,
+    ) -> Result<PresignedPutUrl, AppError>;
     async fn delete_object(&self, key: &str) -> Result<(), AppError>;
     /// 2026-09-16 M2-A 新增：取对象 size + etag（不带 body）。
     async fn head_object(&self, key: &str) -> Result<ObjectMeta, AppError>;
@@ -105,6 +130,20 @@ impl CosClient for NoopCos {
         _expires_seconds: u32,
     ) -> Result<String, AppError> {
         Ok(format!("local://{key}"))
+    }
+
+    /// 2026-10-15 新增：与 `presigned_get_url` 同款的占位语义（`local://{key}`）——
+    /// `COS_ENABLED=false` 的本地调试不需要一个能真的 PUT 的 URL。
+    async fn presigned_put_url(
+        &self,
+        key: &str,
+        content_type: &str,
+        _expires_seconds: u32,
+    ) -> Result<PresignedPutUrl, AppError> {
+        Ok(PresignedPutUrl {
+            url: format!("local://{key}"),
+            content_type: content_type.to_string(),
+        })
     }
 
     async fn delete_object(&self, key: &str) -> Result<(), AppError> {
