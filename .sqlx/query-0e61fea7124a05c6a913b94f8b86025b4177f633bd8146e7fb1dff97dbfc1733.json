@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT part_id, id, created_at\n        FROM t_part_file\n        WHERE part_id = ANY($1) AND deleted_at IS NULL\n          AND kind = 'DRAWING' AND file_type = 'PDF'\n        ORDER BY part_id ASC, created_at ASC, id ASC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "part_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_file",
+            "name": "part_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_file",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "created_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_part_file",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8Array"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "0e61fea7124a05c6a913b94f8b86025b4177f633bd8146e7fb1dff97dbfc1733"
+}

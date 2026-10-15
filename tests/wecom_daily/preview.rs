@@ -897,6 +897,393 @@ async fn overview_section_carries_batch_sent_and_wip_numbers() {
     assert!(!all.contains("今日"), "{all}");
 }
 
+// ===========================================================================
+//  第三节：交期清单（分组 / 装配件子件 / 位置 / 截断）
+// ===========================================================================
+
+/// ★ 集成守卫：**半开日期窗口** + **红档 4 态** + **已交量守卫**三者在正文里的落点。
+///
+/// 逐个钉住（fixture 的每一行都有它的判据，少一行就会有判据没被测到）：
+/// - `sdd = today - 2 / -1` ⇒ 逾期组；
+/// - `sdd = today` ⇒ 进**第一个日期组**（半开区间的下界含今天）；
+/// - `sdd = today + 1 / +2` ⇒ 对应日期组（`upcoming_days = 3`）；
+/// - `sdd = today + 3` ⇒ **两组都不进**（半开区间的上界不含）；
+/// - 逾期但 `status = 'INSPECTION'` / `'READY_TO_SHIP'` ⇒ **不进**（红档 = 品检前 4 态）；
+/// - 逾期且有 `DELIVERED` / `COMPLETED` 批次 ⇒ **不进**（部分已交不显示）。
+#[tokio::test]
+async fn orders_section_grouping_uses_a_half_open_date_window() {
+    let ctx = bootstrap().await;
+    let cid = ctx.customer_id;
+
+    // 逾期组：两天前、昨天（半开区间的左侧无上界）。
+    insert_part_serialized(
+        &ctx.pool,
+        cid,
+        Some("F1001"),
+        "OD-1",
+        "IN_PROCESS",
+        2,
+        Some(today().pred_days(2)),
+    )
+    .await;
+    insert_part_serialized(
+        &ctx.pool,
+        cid,
+        Some("F1002"),
+        "OD-2",
+        "PENDING",
+        1,
+        Some(today().pred_days(1)),
+    )
+    .await;
+    // 品检后的两态：红档只收「品检前」，它们不进清单。
+    insert_part_serialized(
+        &ctx.pool,
+        cid,
+        Some("F9001"),
+        "OD-INS",
+        "INSPECTION",
+        1,
+        Some(today().pred_days(1)),
+    )
+    .await;
+    insert_part_serialized(
+        &ctx.pool,
+        cid,
+        Some("F9002"),
+        "OD-RTS",
+        "READY_TO_SHIP",
+        1,
+        Some(today().pred_days(1)),
+    )
+    .await;
+
+    // 日期组：今天 / +1 / +2（上界 +3 不含）。
+    for (i, serial) in [(0, "F2001"), (1, "F2002"), (2, "F2003"), (3, "F2004")] {
+        insert_part_serialized(
+            &ctx.pool,
+            cid,
+            Some(serial),
+            &format!("UP-{i}"),
+            "IN_PROCESS",
+            1,
+            Some(today().succ_days(i)),
+        )
+        .await;
+    }
+
+    // 部分已交（DELIVERED / COMPLETED 各一）⇒ 整张工单不进清单。
+    let partial = insert_part_serialized(
+        &ctx.pool,
+        cid,
+        Some("F3001"),
+        "UP-PART",
+        "IN_PROCESS",
+        9,
+        Some(today()),
+    )
+    .await;
+    insert_batch(&ctx.pool, partial, "DELIVERED").await;
+    let forced = insert_part_serialized(
+        &ctx.pool,
+        cid,
+        Some("F3002"),
+        "UP-FORCE",
+        "IN_PROCESS",
+        9,
+        Some(today()),
+    )
+    .await;
+    insert_batch(&ctx.pool, forced, "COMPLETED").await;
+
+    let (status, env) = post_as_manager(&ctx, "/cron/wecom-daily/preview", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{env}");
+    let all = chunks_of(&env).join("\n");
+
+    // 组标题：逾期组在前，日期组按日期升序接在后面。
+    assert!(all.contains("## 三、逾期未交 / 3 日内交期"), "{all}");
+    assert!(all.contains("> **逾期未交 · 2 条**"), "{all}");
+    assert!(
+        all.contains(&format!("> **{} · 1 条**", today().format("%Y-%m-%d"))),
+        "{all}"
+    );
+    assert!(
+        all.contains(&format!(
+            "> **{} · 1 条**",
+            today().succ_days(1).format("%Y-%m-%d")
+        )),
+        "{all}"
+    );
+    assert!(
+        all.contains(&format!(
+            "> **{} · 1 条**",
+            today().succ_days(2).format("%Y-%m-%d")
+        )),
+        "{all}"
+    );
+    assert!(
+        !all.contains(today().succ_days(3).format("%Y-%m-%d").to_string().as_str()),
+        "`today + 3` 在半开区间外，不该出现该日期组：{all}"
+    );
+
+    // 计数：逾期 2 单 / 日期 3 单（**未截断**，与清单行一一对应）。
+    assert_eq!(data(&env)["overdue_count"].as_i64(), Some(2));
+    assert_eq!(data(&env)["upcoming_count"].as_i64(), Some(3));
+
+    // 进清单的逐条出现。
+    for serial in ["F1001", "F1002", "F2001", "F2002", "F2003"] {
+        assert!(all.contains(serial), "{serial} 该在清单里：{all}");
+    }
+    // 被判据挡掉的逐条**不出现**（图号也不出现，正文里只有序列号）。
+    for (serial, why) in [
+        ("F9001", "INSPECTION 不属于红档（品检前）"),
+        ("F9002", "READY_TO_SHIP 不属于红档（品检前）"),
+        ("F3001", "已交割（DELIVERED）⇒ 部分已交不显示"),
+        ("F3002", "已完工（COMPLETED，force-complete 强推）⇒ 不显示"),
+        ("F2004", "`today + 3` 在半开区间外"),
+    ] {
+        assert!(!all.contains(serial), "{serial} 不该出现（{why}）：{all}");
+    }
+}
+
+/// ★ 集成守卫：装配件行 + **缩进子件行**，子件各带自己的序列号 / 名称 / 数量 / 位置。
+///
+/// 同时覆盖位置的四个分支：`生产架` / `工人` / `外协`（三种能查到名字的）与
+/// `OFFICE` / 无批次（两种查不到 ⇒ **整项不显示**，连分隔空格都不留）。
+#[tokio::test]
+async fn orders_section_renders_assembly_with_children_and_positions() {
+    let ctx = bootstrap().await;
+    let cid = ctx.customer_id;
+    let shelf = insert_shelf(&ctx.pool, "A-03").await;
+    let worker = insert_worker(&ctx.pool, "张三").await;
+    let outsource = insert_outsource_company(&ctx.pool, "宏达").await;
+
+    let asm = insert_assembly_serialized(
+        &ctx.pool,
+        cid,
+        Some("F5000"),
+        "ASM-1",
+        2,
+        Some(today().pred_days(1)),
+    )
+    .await;
+    // 三个子件：分别落在生产架 / 工人手里 / 外协，另有一个在办公室、一个没有批次。
+    let c1 = insert_child_part(&ctx.pool, cid, asm, Some("F5001"), "C-1", 4).await;
+    let c2 = insert_child_part(&ctx.pool, cid, asm, Some("F5002"), "C-2", 5).await;
+    let c3 = insert_child_part(&ctx.pool, cid, asm, Some("F5003"), "C-3", 6).await;
+    let c4 = insert_child_part(&ctx.pool, cid, asm, Some("F5004"), "C-4", 7).await;
+    let _c5 = insert_child_part(&ctx.pool, cid, asm, None, "C-5", 8).await;
+    insert_batch_at(
+        &ctx.pool,
+        c1,
+        "IN_PROCESS",
+        Some("PRODUCTION_SHELF"),
+        Some(shelf),
+    )
+    .await;
+    insert_batch_at(&ctx.pool, c2, "IN_PROCESS", Some("WORKER"), Some(worker)).await;
+    insert_batch_at(
+        &ctx.pool,
+        c3,
+        "OUTSOURCE",
+        Some("OUTSOURCE_COMPANY"),
+        Some(outsource),
+    )
+    .await;
+    insert_batch_at(&ctx.pool, c4, "PENDING", Some("OFFICE"), Some(shelf)).await;
+    // c5 刻意**不造批次** ⇒ 无活跃批次 ⇒ 位置整项不显示。
+
+    // 另有一张散件：序列号 NULL + 位置拿不到 ⇒ 两个「缺省字段」都在它身上。
+    let loose = insert_part_serialized(
+        &ctx.pool,
+        cid,
+        None,
+        "LOOSE-1",
+        "IN_PROCESS",
+        3,
+        Some(today().pred_days(3)),
+    )
+    .await;
+    insert_batch_at(&ctx.pool, loose, "PENDING", None, None).await;
+
+    let (status, env) = post_as_manager(&ctx, "/cron/wecom-daily/preview", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{env}");
+    let all = chunks_of(&env).join("\n");
+
+    // 装配件行：它自己**没有批次**（批次挂在子件上）⇒ 位置整项不显示。
+    assert!(all.contains("> F5000 装ASM-1 ×2"), "{all}");
+    // 子件行：`>   └ ` 缩进 + 各自的位置。
+    assert!(all.contains(">   └ F5001 件C-1 ×4  生产架:A-03"), "{all}");
+    assert!(all.contains(">   └ F5002 件C-2 ×5  工人:张三"), "{all}");
+    assert!(all.contains(">   └ F5003 件C-3 ×6  外协:宏达"), "{all}");
+    // OFFICE ⇒ 整项不显示（不是「办公室」）；无批次 ⇒ 同样不显示。
+    assert!(all.contains(">   └ F5004 件C-4 ×7"), "{all}");
+    assert!(all.contains(">   └ 件C-5 ×8"), "{all}");
+    // 序列号 NULL ⇒ 留空（不显示「无」、不回退图号）。
+    assert!(all.contains("> 件LOOSE-1 ×3"), "{all}");
+    assert!(!all.contains("无"), "序列号缺省不许编占位字：{all}");
+    // 装配件**算 1 单**、子件不重复计入（工单级行单位）。
+    assert_eq!(data(&env)["overdue_count"].as_i64(), Some(2));
+}
+
+/// ★ 集成守卫：`order_list_limit` 截断 + **组末一行**脚注，且子件与工单**同额**扣减；
+/// `0` = 不限时不截断、不出脚注。
+#[tokio::test]
+async fn orders_section_truncates_at_order_list_limit_with_one_footer() {
+    let ctx = bootstrap().await;
+    let cid = ctx.customer_id;
+    // 一套装配件（3 个子件）+ 2 张散件 = **6 行 / 3 单**（工单级行单位）。
+    let asm = insert_assembly_serialized(
+        &ctx.pool,
+        cid,
+        Some("F7000"),
+        "ASM-T",
+        1,
+        Some(today().pred_days(1)),
+    )
+    .await;
+    for (i, serial) in [(0, "F7001"), (1, "F7002"), (2, "F7003")] {
+        let c = insert_child_part(&ctx.pool, cid, asm, Some(serial), &format!("T-{i}"), 1).await;
+        insert_batch_at(
+            &ctx.pool,
+            c,
+            "IN_PROCESS",
+            Some("WORKER"),
+            Some(insert_worker(&ctx.pool, &format!("工{i}")).await),
+        )
+        .await;
+    }
+    insert_part_serialized(
+        &ctx.pool,
+        cid,
+        Some("F7004"),
+        "T-A",
+        "IN_PROCESS",
+        1,
+        Some(today().pred_days(1)),
+    )
+    .await;
+    insert_part_serialized(
+        &ctx.pool,
+        cid,
+        Some("F7005"),
+        "T-B",
+        "IN_PROCESS",
+        1,
+        Some(today().pred_days(1)),
+    )
+    .await;
+
+    // ⚠️ `order_list_limit` **不是** `/preview` 的覆盖项（`dto::PreviewRequest` 里没有
+    // 它，`effective_config` 照搬基线值）⇒ 截断必须走 `POST /config` 落配置再预览，
+    // 这也正是管理员在配置页改「最多列出工单」后的真实链路。
+    let (st, env) = post_as_manager(
+        &ctx,
+        "/cron/wecom-daily/config",
+        json!({
+            "version": 0,
+            "enabled": true,
+            "frequency": "DAILY",
+            "send_hour": 20,
+            "send_minute": 5,
+            "webhook_id": ctx.webhook_id.to_string(),
+            "upcoming_days": 3,
+            "worker_metric": "QUANTITY",
+            "worker_top_n": 15,
+            "order_list_limit": 3,
+            "max_chunks": 6,
+            "include_overview": true,
+            "include_delivery": true,
+            "include_orders": true,
+            "include_workers": true,
+            "include_drawings": true,
+            "subject_template": null
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{env}");
+
+    // 额度 3：装配件行 + 头两个子件 = 3 行，脚注报未列出的 3 **行**（第三个子件 +
+    // 两张散件）。⚠️ 脚注数的是**行**不是工单：6 行 − 3 行 = 3。
+    let (_, capped) = post_as_manager(&ctx, "/cron/wecom-daily/preview", json!({})).await;
+    let all = chunks_of(&capped).join("\n");
+    assert!(all.contains("> F7000 装ASM-T ×1"), "{all}");
+    assert!(all.contains(">   └ F7001 件T-0 ×1"), "{all}");
+    assert!(all.contains(">   └ F7002 件T-1 ×1"), "{all}");
+    assert!(!all.contains("F7003"), "额度用完，后面的行不再出：{all}");
+    assert!(
+        all.contains("> <font color=\"comment\">另有 3 条未列出</font>"),
+        "{all}"
+    );
+    assert_eq!(
+        all.matches("另有").count(),
+        1,
+        "子件截断**不单独提示**，整组只出一行脚注：{all}"
+    );
+    assert_eq!(
+        data(&capped)["overdue_count"].as_i64(),
+        Some(3),
+        "「N 条」是未截断的匹配工单数（装配件 1 + 散件 2），不受 order_list_limit 影响"
+    );
+    assert!(all.contains("> **逾期未交 · 3 条**"), "{all}");
+
+    // 额度 0 = 不限：6 行全出、无脚注（改配置要走标准 OCC：先读回 version 再覆写）。
+    let (cur, cur_env) = get_as_manager(&ctx, "/cron/wecom-daily/config").await;
+    assert_eq!(cur, StatusCode::OK, "{cur_env}");
+    let version = data(&cur_env)["version"].as_i64().expect("version 是整数");
+    let (st, env2) = post_as_manager(
+        &ctx,
+        "/cron/wecom-daily/config",
+        json!({
+            "version": version,
+            "enabled": true,
+            "frequency": "DAILY",
+            "send_hour": 20,
+            "send_minute": 5,
+            "webhook_id": ctx.webhook_id.to_string(),
+            "upcoming_days": 3,
+            "worker_metric": "QUANTITY",
+            "worker_top_n": 15,
+            "order_list_limit": 0,
+            "max_chunks": 6,
+            "include_overview": true,
+            "include_delivery": true,
+            "include_orders": true,
+            "include_workers": true,
+            "include_drawings": true,
+            "subject_template": null
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{env2}");
+    let (_, full) = post_as_manager(&ctx, "/cron/wecom-daily/preview", json!({})).await;
+    let all = chunks_of(&full).join("\n");
+    for serial in ["F7000", "F7001", "F7002", "F7003", "F7004", "F7005"] {
+        assert!(all.contains(serial), "{serial} 在「不限」下必须出现：{all}");
+    }
+    assert!(!all.contains("另有"), "不限时不出脚注：{all}");
+}
+
+/// ★ 集成守卫：**空清单**时第三节只出小标题（不出组标题、不出「无」行）。
+#[tokio::test]
+async fn empty_orders_section_renders_heading_only() {
+    let ctx = bootstrap().await;
+    let (status, env) = post_as_manager(&ctx, "/cron/wecom-daily/preview", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{env}");
+    let all = chunks_of(&env).join("\n");
+    assert!(all.contains("## 三、逾期未交 / 3 日内交期"), "{all}");
+    assert!(!all.contains("逾期未交 ·"), "空清单不出组标题：{all}");
+    assert!(!all.contains("另有"), "空清单不出脚注：{all}");
+    // 节的 slug 仍然在 `sections[]` 里（管理员能看到这一节是开着的）。
+    let sections: Vec<&str> = data(&env)["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(sections.contains(&"orders"), "{sections:?}");
+}
+
 // `NaiveDate` 的 ±N 天小工具（避免用例里出现 `2026-10-18` 这类字面量）。
 trait DayMath {
     fn pred_days(self, n: i64) -> NaiveDate;

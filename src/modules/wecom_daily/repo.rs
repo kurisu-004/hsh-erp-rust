@@ -2,7 +2,8 @@
 //!
 //! 分两组，形态一致（静态 SQL + `sqlx::query_as!` 字面量宏 ⇒ **编译期按 `.env` 的
 //! DATABASE_URL 连开发库校验列名与类型**，产物进 `.sqlx/`）：
-//! 1. **统计查询**（第一节 / 第二节 / 第三节 / 第四节各一至两条）；
+//! 1. **统计查询**（第一节 / 第二节各一至两条，第三节是**清单**链路的 8 条，第四节一条
+//!    `GROUP BY`）；
 //! 2. **配置 / 流水 CRUD**。
 //!
 //! ## ⚠️ 四条硬约束（改 SQL 前逐条读）
@@ -29,22 +30,43 @@
 //! ## 域隔离：**零他域符号引用**
 //!
 //! 本文件**不 import** `statistics` / `mail_digest` / `dashboard` 的任何符号。
-//! 第六条（逾期）与第七条（未来）的**谓词**逐字照抄 `mail_digest::repo`，而
-//! 「未交付」状态白名单取自共享常量
-//! [`crate::shared::delivery_status::DELIVERY_STATUSES`] —— `shared::` 不属于任何
+//! 第三节逾期 / 未来两条清单的**谓词**逐字照抄 `dashboard::repo::delivery` 的
+//! `overdue` / `upcoming` 两个桶（那两条与 `mail_digest::repo` 的同名查询本来就
+//! 同源，三处逐字一致），而状态白名单取自共享常量
+//! [`crate::shared::delivery_status::RED_TIER_STATUSES`] —— `shared::` 不属于任何
 //! 业务域，域隔离判定只认「域根段 + 他域路径」的前缀失配，所以引用它**不构成**跨域
-//! 依赖。而白名单**必须**共用一份：三域各存一份副本时，「加一个状态」漏改一处不会
+//! 依赖。
+//!
+//! ## ⚠️ 状态白名单为什么是**品检前 4 态**而不是大屏那份 6 态
+//!
+//! 日报这一节答的是「**品检还没开始的活**里哪些要催」—— `INSPECTION`（已进品检）
+//! 与 `READY_TO_SHIP`（品检完待发货）各有自己的下一动作，混进来会让「该催谁」这个
+//! 唯一的问题得到一个答非所问的清单。故本域取 `RED_TIER_STATUSES`（`PENDING` /
+//! `PROGRAMMING` / `IN_PROCESS` / `OUTSOURCE`），而大屏交期面板取
+//! `DELIVERY_STATUSES`（6 态）——**同一套谓词、不同的状态集**是有意分叉，不是漂移。
+//! 改白名单只改共享常量一处（`shared::delivery_status.rs`）。
+//!
+//! ⚠️ 白名单**必须**共用一份：三域各存一份副本时，「加一个状态」漏改一处不会
 //! 编译失败，只会让日报 / 邮件 / 大屏三处的「未交付」判定互相矛盾且无单测变红。
 //!
 //! ## 取数恒 **O(1)**：语句数与返回行数无关（护栏见
 //! `tests/wecom_daily/n_plus_one_guard.rs`）
 //!
-//! 不变量是「**语句数不随工单数 / 送货单数 / 工人数增长**」：每节都把整组聚合压进
-//! **一条**语句（第一节 1 条、第二节 1 条、第三节各 1 条、第四节 1 个 `GROUP BY`），
-//! 关掉的节一条都不查。逐节循环查是**功能完全正确**的改法（数字守恒、渲染逐字一致、
-//! 集成测试全绿），只有数据量涨上去时语句数才悄悄线性涨 —— 而日报恰好是「一天一次、
-//! 量很大」的生产形态。⚠️ **刻意不钉死具体条数**：这类计数必然过期，而护栏守的
-//! 「循环体内不许出现取数调用」才是那条不变量的真正来源。
+//! 不变量是「**语句数不随工单数 / 子件数 / 送货单数 / 工人数增长**」：每节都把整组
+//! 聚合压进**一条**语句（第一节 1 条、第二节 1 条、第四节 1 个 `GROUP BY`），
+//! 第三节的**清单**链路是固定 8 条（逾期 / 未来两条主查询 + 装配件子件展开 + 活跃
+//! 批次 + 三个 holder 名批量解析 + 图纸文件），关掉的节一条都不查。逐行查是**功能
+//! 完全正确**的改法（渲染逐字一致、集成测试全绿），只有数据量涨上去时语句数才悄悄
+//! 线性涨 —— 而日报恰好是「一天一次、量很大」的生产形态。⚠️ **刻意不钉死具体条数**：
+//! 这类计数必然过期，而护栏守的「循环体内不许出现取数调用」才是那条不变量的真正
+//! 来源。
+//!
+//! ⚠️ 第三节**刻意不给清单主查询加 `LIMIT`**：`order_list_limit` 的截断在 Rust 侧
+//! 做，而组标题的「N 条」必须是**未截断的匹配总数**（`COUNT(*) OVER ()`）；SQL 侧加
+//! `LIMIT` 会让某个日期组的条数与 `total` 一起失守、组标题开始说假话。代价是「逾期
+//! 几千单」的现场要拉回几千行 —— 渲染仍然只出 `order_list_limit` 行。
+
+use std::collections::HashMap;
 
 use chrono::{NaiveDate, NaiveDateTime};
 use sqlx::{PgConnection, Row};
@@ -52,7 +74,10 @@ use sqlx::{PgConnection, Row};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::wecom_daily::dto::WorkerBarRow;
 use crate::modules::wecom_daily::model::{TWeComDailyConfigRow, TWeComDailyLogRow};
-use crate::shared::delivery_status::delivery_statuses_vec;
+use crate::shared::batch::status_machine::part_status_progress;
+// 2026-10-23：第三节的状态白名单从「未交付 6 态」改成「**品检前 4 态**」（红档），
+// 理由与「大屏为什么仍用 6 态」见文件头「域隔离」一节。
+use crate::shared::delivery_status::red_tier_statuses_vec;
 
 // ============================================================================
 // 第一节：全厂报工总览
@@ -222,101 +247,522 @@ pub async fn delivery_note_summary(
 }
 
 // ============================================================================
-// 第三节：逾期未交 / 未来 N 天交期
+// 第三节：逾期未交 / 未来 N 天交期（**清单行**，不再是两个计数）
 // ============================================================================
 
-/// 逾期未交工单数（**工单级**）。
+/// 装配件行的来源字面量（与两条清单 SQL 里写死的 `'ASSEMBLY'::text` 对齐）。
+const ROW_TYPE_ASSEMBLY: &str = "ASSEMBLY";
+
+/// 第三节清单的一行（**工单级**：散件工单一条 + 装配件一条）。
 ///
-/// ⚠️ **谓词逐字照抄 `mail_digest::repo::list_overdue`**，只把投影收窄成 `COUNT`
-/// （日报只要一个数，不列行）。照抄的理由：那份 SQL 是「未交付」的**既定契约**，
-/// 自己另写一份等于给同一件事发明第二个定义（改一处漏一处，报出去的数字对不上却
-/// 谁都说不清）。
-///
-/// 保留的四个要点：
-/// - 工单级行单位（`t_part` 侧带 `assembly_id IS NULL`，装配件单独一支 `UNION ALL`）；
-/// - `system_delivery_date < $1`（**含今天之前、不含今天** —— 今天的交期属未来节）；
-/// - `NOT EXISTS（任一批次 `DELIVERED` / `COMPLETED`）` 已交量守卫，**含
-///   `COMPLETED`**（force-complete 端点强推它，漏掉会让已完工的工单继续被算逾期）；
-/// - 装配件那一支经子件两跳（批次挂在子件上）。
-pub async fn count_overdue(conn: &mut PgConnection, today: NaiveDate) -> Result<i64, sqlx::Error> {
-    let row = sqlx::query(
-        "SELECT COUNT(*)::bigint AS cnt FROM ( \
-             SELECT p.id \
-             FROM t_part p \
-             WHERE p.deleted_at IS NULL \
-               AND p.assembly_id IS NULL \
-               AND p.system_delivery_date IS NOT NULL \
-               AND p.system_delivery_date < $1 \
-               AND p.status = ANY($2::varchar[]) \
-               AND NOT EXISTS (SELECT 1 FROM t_part_batch b \
-                                WHERE b.part_id = p.id AND b.deleted_at IS NULL \
-                                  AND b.status IN ('DELIVERED', 'COMPLETED')) \
-             UNION ALL \
-             SELECT a.id \
-             FROM t_assembly a \
-             WHERE a.deleted_at IS NULL \
-               AND a.system_delivery_date IS NOT NULL \
-               AND a.system_delivery_date < $1 \
-               AND a.status = ANY($2::varchar[]) \
-               AND NOT EXISTS (SELECT 1 FROM t_part c JOIN t_part_batch b ON b.part_id = c.id \
-                               WHERE c.assembly_id = a.id AND c.deleted_at IS NULL \
-                                 AND b.deleted_at IS NULL \
-                                 AND b.status IN ('DELIVERED', 'COMPLETED')) \
-         ) u",
-    )
-    .bind(today)
-    .bind(delivery_statuses_vec())
-    .fetch_one(&mut *conn)
-    .await?;
-    Ok(row.get::<i64, _>("cnt"))
+/// ⚠️ **行单位是工单级而不是件级**：与 `dashboard::repo::delivery` 的 `overdue` /
+/// `upcoming` 两个桶逐字一致（装配件算 1 条、其子件不重复计入）。子件仍然会出现，
+/// 但它们是**渲染时挂在装配件行下面的子行**（[`OrderRow::is_child`]），不是清单的
+/// 行单位 —— 否则一个 30 子件的装配件会把「逾期 12 单」撑成 41 单。
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct OrderListRow {
+    /// `'PART'`（散件工单）/ `'ASSEMBLY'`（装配件本身），由 SQL 的 `'…'::text`
+    /// 字面量带出（判断入口见 [`OrderListRow::is_assembly`]）。
+    pub row_type: String,
+    /// `t_part.id` 或 `t_assembly.id`。
+    pub id: i64,
+    /// `varchar(15)`，**可空**（未派发序列号）。
+    ///
+    /// ⚠️ 可空就是可空：渲染层在它是 `None` 时**留空**，不回退图号、不显示「无」
+    /// ——「无」是系统自己编的字，出现在现场会让人以为序列号那一栏坏了。
+    pub serial_no: Option<String>,
+    /// `varchar(200) NOT NULL`，清单里作为链接文字（`[名称](图纸直链)`）。
+    pub name: String,
+    /// 装配件的语义是**套数**、散件是**件数**（与 dashboard 的行单位约定同款）。
+    pub quantity: i32,
+    /// 系统交期；两条谓词都带 `IS NOT NULL`，故这里是**非空** `date`（宏里用
+    /// `AS "system_delivery_date!"` 覆盖掉 nullable 推断，省掉一层 `Option` 拆包）。
+    ///
+    /// ⚠️ 它同时是**分组的键**：逾期组按 `< today` 归组、日期组按它归到
+    /// `2026-10-15` / `2026-10-16` 那一组（组标题就是它的 `%Y-%m-%d`）。
+    pub system_delivery_date: NaiveDate,
+    /// `COUNT(*) OVER ()`：该次查询的**未截断匹配总数**，在同一批返回行上恒相同。
+    ///
+    /// ⚠️ 私有字段 + [`OrderList::from_rows`] 归并的原因：它**不是**某一行的属性，
+    /// 挂在行上只是因为 `COUNT(*) OVER ()` 必须出现在 select 列表里。
+    total: i64,
 }
 
-/// 未来 `days` 天内交期到期且一件没交过的工单数。
+impl OrderListRow {
+    /// 是否装配件行（决定要不要把它的子件挂进来）。
+    pub fn is_assembly(&self) -> bool {
+        self.row_type == ROW_TYPE_ASSEMBLY
+    }
+}
+
+/// 一次清单查询的返回：命中行 + **未截断**的匹配总数。
+#[derive(Debug, Clone, Default)]
+pub struct OrderList {
+    /// 按 `system_delivery_date ASC, id ASC` 排好的命中行。
+    pub rows: Vec<OrderListRow>,
+    /// 匹配总数（**不受** `order_list_limit` 影响；组标题的「N 条」用它）。
+    pub total: i64,
+}
+
+impl OrderList {
+    /// 从一批行里归并出 `total`。
+    ///
+    /// ⚠️ **零命中时没有任何行**（窗口函数无从求值）⇒ `total` 退化成 `0`，而不是
+    /// 报错或写成一个占位负数；这是 PG 窗口函数的固有形态，`dashboard::repo::delivery`
+    /// 的 `read_bucket` 是同款处置。
+    fn from_rows(rows: Vec<OrderListRow>) -> Self {
+        let total = rows.first().map(|r| r.total).unwrap_or(0);
+        Self { rows, total }
+    }
+}
+
+/// 逾期未交清单（`system_delivery_date < today`，**无上界**）。
 ///
-/// 窗口是**半开** `[today, today + days)`（硬约束 2）：`days = 3` 时含今天与今天
-/// 之后 2 天，共 3 天。SQL 里用 `$1::date + $3::int`（PG 的 `date + int` 本身返回
-/// `date`，不需要绕 `interval`）。
+/// ## ⚠️ 谓词的四个要点，逐条照抄 `dashboard::repo::delivery::SQL_ORDERS_OVERDUE`
 ///
-/// ⚠️ 谓词其余部分逐字照 `mail_digest::repo::list_upcoming`（见 [`count_overdue`]
-/// 的四个要点）。
-pub async fn count_upcoming(
+/// 1. **行单位工单级**：`t_part` 侧带 `assembly_id IS NULL`（排除装配件子件），
+///    装配件单独一支 `UNION ALL`。自己另写一套行单位等于让「日报逾期 N 条」与「大屏
+///    逾期 N 条」在同一个库上给出两个数，而两边的人都不知道该信哪个。
+/// 2. **窗口是开在 `today` 左侧的无界区间**：今天到期的属未来组（那是**最该被看见**
+///    的一批，混进「逾期」等于把还没到期的东西说成过期）。
+/// 3. **已交量守卫 `NOT EXISTS（任一批次 `DELIVERED` / `COMPLETED`）`**：用户口径是
+///    「部分已交的不显示」——只要交过一部分（哪怕 1 件 / 100 件），整张工单就不再是
+///    「未交」。守卫**含 `COMPLETED`**（force-complete 端点强推它，漏掉会让已完工的
+///    工单继续被算逾期）。
+/// 4. **装配件那一支经子件两跳**（批次挂在子件上），所以它的 `NOT EXISTS` 是
+///    `t_part c JOIN t_part_batch b ON b.part_id = c.id WHERE c.assembly_id = a.id`。
+///
+/// 唯一**有意**的差别是状态白名单：本条取**品检前 4 态**（见文件头「域隔离」），
+/// 大屏那两条取未交付 6 态。
+pub async fn list_overdue(
+    conn: &mut PgConnection,
+    today: NaiveDate,
+) -> Result<OrderList, sqlx::Error> {
+    let rows = sqlx::query_as!(
+        OrderListRow,
+        r#"
+        SELECT
+            u.row_type             AS "row_type!",
+            u.id                   AS "id!",
+            u.serial_no            AS "serial_no?",
+            u.name                 AS "name!",
+            u.quantity             AS "quantity!",
+            u.system_delivery_date AS "system_delivery_date!",
+            COUNT(*) OVER ()       AS "total!"
+        FROM (
+            SELECT p.id, p.serial_no, p.name, p.quantity, p.system_delivery_date,
+                   'PART'::text AS row_type
+            FROM t_part p
+            WHERE p.deleted_at IS NULL
+              AND p.assembly_id IS NULL
+              AND p.system_delivery_date IS NOT NULL
+              AND p.system_delivery_date < $1::date
+              AND p.status = ANY($2::varchar[])
+              AND NOT EXISTS (SELECT 1 FROM t_part_batch b
+                               WHERE b.part_id = p.id AND b.deleted_at IS NULL
+                                 AND b.status IN ('DELIVERED', 'COMPLETED'))
+            UNION ALL
+            SELECT a.id, a.serial_no, a.name, a.quantity, a.system_delivery_date,
+                   'ASSEMBLY'::text
+            FROM t_assembly a
+            WHERE a.deleted_at IS NULL
+              AND a.system_delivery_date IS NOT NULL
+              AND a.system_delivery_date < $1::date
+              AND a.status = ANY($2::varchar[])
+              AND NOT EXISTS (SELECT 1 FROM t_part c JOIN t_part_batch b ON b.part_id = c.id
+                              WHERE c.assembly_id = a.id AND c.deleted_at IS NULL
+                                AND b.deleted_at IS NULL
+                                AND b.status IN ('DELIVERED', 'COMPLETED'))
+        ) u
+        ORDER BY u.system_delivery_date ASC, u.id ASC
+        "#,
+        today,
+        red_tier_statuses_vec(),
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(OrderList::from_rows(rows))
+}
+
+/// 未来 `days` 天内交期到期且一件没交过的工单清单。
+///
+/// ## ⚠️ 窗口必须是**半开日历日** `[today, today + days)`（硬约束 2）
+///
+/// **含今天**（今天到期最该被看见，`days = 3` 即共 3 天）；写成 `<= today + N` 会让
+/// 「3 日内」悄悄变成 4 天，而这种偏差**不报任何错**，只是每天多列一批根本不该在
+/// 「3 日内」里的工单。SQL 里用 `$1::date + $3::int`（PG 的 `date + int` 本身返回
+/// `date`，不必绕 `interval`）。
+///
+/// ⚠️ 谓词其余部分与 [`list_overdue`] **逐字相同**（只把 `< $1` 换成半开的
+/// `>= $1 AND < $1 + $3`）——两条谓词同源是「逾期组与日期组不重不漏」的前提：
+/// `sdd == today` 只进日期组、`sdd == today + days` 两组都不进。
+///
+/// ⚠️ 这里**没有** `IS NOT NULL`：`sdd >= $1` 对 NULL 求值为 NULL（不成立）已经把它
+/// 排除掉了，与 `dashboard` 的 `upcoming` 桶逐字同款。
+pub async fn list_upcoming(
     conn: &mut PgConnection,
     today: NaiveDate,
     days: i32,
-) -> Result<i64, sqlx::Error> {
-    let row = sqlx::query(
-        "SELECT COUNT(*)::bigint AS cnt FROM ( \
-             SELECT p.id \
-             FROM t_part p \
-             WHERE p.deleted_at IS NULL \
-               AND p.assembly_id IS NULL \
-               AND p.system_delivery_date IS NOT NULL \
-               AND p.system_delivery_date >= $1::date \
-               AND p.system_delivery_date < $1::date + $3::int \
-               AND p.status = ANY($2::varchar[]) \
-               AND NOT EXISTS (SELECT 1 FROM t_part_batch b \
-                                WHERE b.part_id = p.id AND b.deleted_at IS NULL \
-                                  AND b.status IN ('DELIVERED', 'COMPLETED')) \
-             UNION ALL \
-             SELECT a.id \
-             FROM t_assembly a \
-             WHERE a.deleted_at IS NULL \
-               AND a.system_delivery_date IS NOT NULL \
-               AND a.system_delivery_date >= $1::date \
-               AND a.system_delivery_date < $1::date + $3::int \
-               AND a.status = ANY($2::varchar[]) \
-               AND NOT EXISTS (SELECT 1 FROM t_part c JOIN t_part_batch b ON b.part_id = c.id \
-                               WHERE c.assembly_id = a.id AND c.deleted_at IS NULL \
-                                 AND b.deleted_at IS NULL \
-                                 AND b.status IN ('DELIVERED', 'COMPLETED')) \
-         ) u",
+) -> Result<OrderList, sqlx::Error> {
+    let rows = sqlx::query_as!(
+        OrderListRow,
+        r#"
+        SELECT
+            u.row_type             AS "row_type!",
+            u.id                   AS "id!",
+            u.serial_no            AS "serial_no?",
+            u.name                 AS "name!",
+            u.quantity             AS "quantity!",
+            u.system_delivery_date AS "system_delivery_date!",
+            COUNT(*) OVER ()       AS "total!"
+        FROM (
+            SELECT p.id, p.serial_no, p.name, p.quantity, p.system_delivery_date,
+                   'PART'::text AS row_type
+            FROM t_part p
+            WHERE p.deleted_at IS NULL
+              AND p.assembly_id IS NULL
+              AND p.system_delivery_date >= $1::date
+              AND p.system_delivery_date < $1::date + $3::int
+              AND p.status = ANY($2::varchar[])
+              AND NOT EXISTS (SELECT 1 FROM t_part_batch b
+                               WHERE b.part_id = p.id AND b.deleted_at IS NULL
+                                 AND b.status IN ('DELIVERED', 'COMPLETED'))
+            UNION ALL
+            SELECT a.id, a.serial_no, a.name, a.quantity, a.system_delivery_date,
+                   'ASSEMBLY'::text
+            FROM t_assembly a
+            WHERE a.deleted_at IS NULL
+              AND a.system_delivery_date >= $1::date
+              AND a.system_delivery_date < $1::date + $3::int
+              AND a.status = ANY($2::varchar[])
+              AND NOT EXISTS (SELECT 1 FROM t_part c JOIN t_part_batch b ON b.part_id = c.id
+                              WHERE c.assembly_id = a.id AND c.deleted_at IS NULL
+                                AND b.deleted_at IS NULL
+                                AND b.status IN ('DELIVERED', 'COMPLETED'))
+        ) u
+        ORDER BY u.system_delivery_date ASC, u.id ASC
+        "#,
+        today,
+        red_tier_statuses_vec(),
+        days,
     )
-    .bind(today)
-    .bind(delivery_statuses_vec())
-    .bind(days)
-    .fetch_one(&mut *conn)
+    .fetch_all(&mut *conn)
     .await?;
-    Ok(row.get::<i64, _>("cnt"))
+    Ok(OrderList::from_rows(rows))
+}
+
+/// 装配件的**子件行**（`t_part WHERE assembly_id = ANY(...)`）。
+///
+/// ⚠️ **不过滤状态、不过滤交期**：子件的交期由父装配件那一行代表（子件自己的
+/// `system_delivery_date` 在业务上不独立生效），把它单列成组只会让同一件事在清单里
+/// 出现两遍。
+///
+/// ⚠️ 也**不需要**在这里补一道「已交量守卫」：装配件那一支的 `NOT EXISTS` 已经经
+/// `c.assembly_id = a.id` 扫过它全部子件的批次 —— 装配件能进清单，就意味着**它的
+/// 子件没有一件被交过**（见 [`list_overdue`] 的要点 4）。
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct AssemblyChildRow {
+    /// `t_part.id`（子件自己也是一张工单，有自己的序列号与批次）。
+    pub id: i64,
+    /// 父装配件 `t_assembly.id`（Rust 侧按它分桶挂回装配件行下面）。
+    pub assembly_id: i64,
+    /// 见 [`OrderListRow::serial_no`]：可空，渲染时留空。
+    pub serial_no: Option<String>,
+    pub name: String,
+    pub quantity: i32,
+}
+
+/// 一次拉回清单里**全部装配件**的子件（`assembly_id = ANY($1)`）。
+///
+/// ⚠️ `ORDER BY assembly_id ASC, id ASC` 里的 `id ASC` 是**tiebreaker**，不是业务
+/// 顺序：PG 对并列行不保证稳定排序，而子件要逐行渲染 —— 不补它，同一个库两次预览会
+/// 给出不同的子件次序。它等价于「同父装配件取建单最早的子件」。
+///
+/// 入参为空集时**不发 SQL**（省一条语句；`assembly_id = ANY('{}')` 本来就恒空，但
+/// 「空集不发」是这个域的通用纪律，见 `worker_rows` 之外的批量解析族）。
+pub async fn list_assembly_children(
+    conn: &mut PgConnection,
+    assembly_ids: &[i64],
+) -> Result<Vec<AssemblyChildRow>, sqlx::Error> {
+    if assembly_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as!(
+        AssemblyChildRow,
+        r#"
+        SELECT id, assembly_id AS "assembly_id!", serial_no, name, quantity
+        FROM t_part
+        WHERE assembly_id = ANY($1) AND deleted_at IS NULL
+        ORDER BY assembly_id ASC, id ASC
+        "#,
+        assembly_ids,
+    )
+    .fetch_all(&mut *conn)
+    .await
+}
+
+/// 一条**活跃批次**（`t_part_batch` 的部分列投影 —— 只为算「位置」）。
+///
+/// ⚠️ 刻意只投影 6 列而不是 `TPartBatch` 全列：日报对批次只关心「它在哪儿、归谁」，
+/// 多拉的列是纯带宽（一条装配件 30 个子件 × 多批次时这个差额会被放大几十倍）。
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ActiveBatchRow {
+    pub part_id: i64,
+    /// **每个 `part_id` 各自从 1 起**（唯一键 `uq_t_part_batch_part_no`），故它只是
+    /// tiebreaker 的一部分，不是「装配件内的第几批」。
+    pub batch_no: i32,
+    pub status: String,
+    /// `PRODUCTION_SHELF` / `INSPECTION_SHELF` / `WORKER` / `OUTSOURCE_COMPANY` /
+    /// `OFFICE` / `None`。
+    pub location: Option<String>,
+    /// 指向 `t_shelf` / `t_worker` / `t_outsource_company` 之一，**取决于
+    /// `location`**（无物理外键，见 `t_part_batch.current_holder_id` 的列注释）。
+    pub current_holder_id: Option<i64>,
+}
+
+/// 一次拉回清单里全部 `t_part` 侧工单（含装配件的子件）的**活跃批次**。
+///
+/// ⚠️ `WHERE part_id = ANY($1) AND deleted_at IS NULL` 与
+/// `prod::batch::repo::PartBatchRepo::list_active_by_part_ids` **逐字一致**，
+/// `ORDER BY part_id ASC, batch_no ASC` 也是 —— 「活跃批次」的**定义**（软删闸门 +
+/// 排序）只有一份含义，本域照抄而不是自己再定一遍，否则同一个工单在工单列表页和在
+/// 日报里会显示两个不同的位置。
+pub async fn list_active_batches(
+    conn: &mut PgConnection,
+    part_ids: &[i64],
+) -> Result<Vec<ActiveBatchRow>, sqlx::Error> {
+    if part_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as!(
+        ActiveBatchRow,
+        r#"
+        SELECT part_id, batch_no, status, location, current_holder_id
+        FROM t_part_batch
+        WHERE part_id = ANY($1) AND deleted_at IS NULL
+        ORDER BY part_id ASC, batch_no ASC
+        "#,
+        part_ids,
+    )
+    .fetch_all(&mut *conn)
+    .await
+}
+
+/// min-progress 的**目标活跃批次**（判据逐字照抄 `part::service` 的两处实现）。
+///
+/// ## ⚠️ 为什么必须照抄而不能自己发明一套
+///
+/// 「这个工单现在在哪儿」这个问题，工单列表页已经有一个答案了
+/// （`part::service::list_enrichment::enrich_part_list_with_location_and_holder`，
+/// 与 `shared::batch::status_machine::compute_part_target` 同款判据）。日报如果自己
+/// 选一套（比如「取最新批次」），同一个工单在两个页面上会显示两个位置，而两边的
+/// 人都会认为**另一个页面错了**。所以本函数逐字复制那三步：
+///
+/// 1. 排除 `CANCELLED`；若一条都不剩 ⇒ 候选退回到**全部**批次（全取消的工单照样要
+///    显示一个位置，否则清单里凭空少一行）；
+/// 2. 非空时再排除 `COMPLETED`；若一条都不剩 ⇒ 候选退回第 1 步的结果；
+/// 3. 取 [`part_status_progress`] 最小的那批；**并列时取首条**（`min_by_key` 的语义）
+///    —— 首条由 SQL 的 `ORDER BY part_id, batch_no` 决定，即「并列取 `batch_no`
+///    最小的」。
+///
+/// progress 表在 `shared::batch::status_machine`（本仓唯一的 progress 真源），本域
+/// 引它而不复制：复制一份就会在「加一个批次状态」时静默漂移。
+///
+/// `None` = 无活跃批次 ⇒ 调用方**整项不显示**「位置」（不留悬空分隔符）。
+pub fn active_batch_target(batches: &[ActiveBatchRow]) -> Option<&ActiveBatchRow> {
+    if batches.is_empty() {
+        return None;
+    }
+    let non_cancelled: Vec<&ActiveBatchRow> =
+        batches.iter().filter(|b| b.status != "CANCELLED").collect();
+    if non_cancelled.is_empty() {
+        // 全是 CANCELLED ⇒ 退回全部批次（见 doc 的第 1 步）。
+        return min_progress(batches.iter().collect());
+    }
+    let non_terminal: Vec<&ActiveBatchRow> = non_cancelled
+        .iter()
+        .copied()
+        .filter(|b| b.status != "COMPLETED")
+        .collect();
+    if non_terminal.is_empty() {
+        // 非 CANCELLED 全是 COMPLETED ⇒ 退回非取消集（见 doc 的第 2 步）。
+        return min_progress(non_cancelled);
+    }
+    min_progress(non_terminal)
+}
+
+/// min-progress 取一条（**并列取首条**，与上两条 fallback 共用）。
+fn min_progress(candidates: Vec<&ActiveBatchRow>) -> Option<&ActiveBatchRow> {
+    candidates
+        .iter()
+        .min_by_key(|b| part_status_progress(&b.status))
+        .copied()
+}
+
+// ---------------------------------------------------------------------------
+// 三个 holder 名批量解析（每类 1 条 SQL，入参空集时跳过）
+// ---------------------------------------------------------------------------
+
+/// `t_shelf.code` 的批量解析。
+///
+/// ⚠️ **带软删闸门**：被软删的货架已不在现场清单上，报它的 `code` 等于报一个管理员
+/// 已经无法核对的架号。
+pub async fn shelf_codes(
+    conn: &mut PgConnection,
+    ids: &[i64],
+) -> Result<HashMap<i64, String>, sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = sqlx::query_as!(
+        ShelfCodeRow,
+        r#"
+        SELECT id, code AS "code!"
+        FROM t_shelf
+        WHERE id = ANY($1) AND deleted_at IS NULL
+        "#,
+        ids,
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows.into_iter().map(|r| (r.id, r.code)).collect())
+}
+
+/// `t_worker.name` 的批量解析（软删闸门同上）。
+pub async fn worker_names(
+    conn: &mut PgConnection,
+    ids: &[i64],
+) -> Result<HashMap<i64, String>, sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = sqlx::query_as!(
+        NameRow,
+        r#"
+        SELECT id, name AS "name!"
+        FROM t_worker
+        WHERE id = ANY($1) AND deleted_at IS NULL
+        "#,
+        ids,
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows.into_iter().map(|r| (r.id, r.name)).collect())
+}
+
+/// `t_outsource_company.name` 的批量解析（软删闸门同上）。
+pub async fn outsource_names(
+    conn: &mut PgConnection,
+    ids: &[i64],
+) -> Result<HashMap<i64, String>, sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = sqlx::query_as!(
+        NameRow,
+        r#"
+        SELECT id, name AS "name!"
+        FROM t_outsource_company
+        WHERE id = ANY($1) AND deleted_at IS NULL
+        "#,
+        ids,
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows.into_iter().map(|r| (r.id, r.name)).collect())
+}
+
+/// `t_shelf` 的两列投影（`code` 在本域只是货架编号，故结构体独立于 `NameRow`）。
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct ShelfCodeRow {
+    id: i64,
+    code: String,
+}
+
+/// `t_worker` / `t_outsource_company` 共用的两列投影。
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct NameRow {
+    id: i64,
+    name: String,
+}
+
+// ---------------------------------------------------------------------------
+// 图纸文件（只投影 `part_id` + 文件 id + 时间戳；直链由 Part 2b 接上）
+// ---------------------------------------------------------------------------
+
+/// 清单里命中的 **PDF 图纸文件**一行。
+///
+/// ⚠️ `kind='DRAWING' AND file_type='PDF'` 是**两个**条件而不是只看 `kind`：
+/// `DRAWING` 下面同时存着 `PDF` 与 `CAD_2D` 两类（列注释：「扩展名大写（PDF / STEP /
+/// NC / …），与 kind 配套」），而 PDF 预览直链这条链路只对 PDF 成立。
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DrawingFileRow {
+    pub part_id: i64,
+    /// `t_part_file.id` —— Part 2b 拿它去 `t_file_preview` 换预览种子。
+    pub id: i64,
+    /// 同秒上传多张图纸时靠它（与 `id` 一起）定序。
+    pub created_at: NaiveDateTime,
+}
+
+/// 一次拉回清单里全部工单的 **PDF 图纸文件**行（**不过滤到每工单一条**）。
+///
+/// ## ⚠️ 「取最新一张」在 Rust 侧做（[`latest_drawing_by_part`]），不在 SQL 里
+///
+/// `DISTINCT ON` 能少传行，但它把「同一工单有 3 张图纸时取哪张」这条业务口径藏进了
+/// 一个 `ORDER BY` 里；放在 Rust 侧它就是一条有名字、有单测的规则，而口径变了也不
+/// 会有人漏改 SQL。
+///
+/// ⚠️ 本函数当前**没有调用方**：直链由 `files` 域的预览入口生成（另一轮接上），
+/// 日报这一侧只负责「哪些工单有图纸」这件事留在结构里。在没有消费者的句子里查一次
+/// 再把结果丢掉，是纯粹的浪费 —— 所以这里**只提供函数与口径**，接链的那一轮加一行
+/// 调用即可（不涉及任何表结构或出参变更）。
+pub async fn list_drawing_files(
+    conn: &mut PgConnection,
+    part_ids: &[i64],
+) -> Result<Vec<DrawingFileRow>, sqlx::Error> {
+    if part_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as!(
+        DrawingFileRow,
+        r#"
+        SELECT part_id, id, created_at
+        FROM t_part_file
+        WHERE part_id = ANY($1) AND deleted_at IS NULL
+          AND kind = 'DRAWING' AND file_type = 'PDF'
+        ORDER BY part_id ASC, created_at ASC, id ASC
+        "#,
+        part_ids,
+    )
+    .fetch_all(&mut *conn)
+    .await
+}
+
+/// 每个工单的**最新一张** PDF 图纸（`part_id → t_part_file.id`）。
+///
+/// ⚠️ **最新 = `(created_at, id)` 的最大值**，`id` 是 tiebreaker：同一批上传（同一秒）
+/// 的两张图纸若不加它，取哪张取决于 PG 的物理行序，同一个工单两次预览会给出不同的
+/// 图纸链接。
+///
+/// 无图纸的工单**不在结果里**（`map.get(&id)` 得 `None`）⇒ 渲染成纯文字名称。
+pub fn latest_drawing_by_part(rows: &[DrawingFileRow]) -> HashMap<i64, i64> {
+    let mut out: HashMap<i64, DrawingFileRow> = HashMap::new();
+    for r in rows {
+        let keep_new = out
+            .get(&r.part_id)
+            .is_none_or(|prev| (prev.created_at, prev.id) < (r.created_at, r.id));
+        if keep_new {
+            out.insert(
+                r.part_id,
+                DrawingFileRow {
+                    part_id: r.part_id,
+                    id: r.id,
+                    created_at: r.created_at,
+                },
+            );
+        }
+    }
+    out.into_iter().map(|(k, v)| (k, v.id)).collect()
 }
 
 // ============================================================================
@@ -671,4 +1117,183 @@ pub struct NewDailyLog {
     /// ⚠️ `report_date` 必须由它 `.date()` 派生（同一个 `now_naive()` 调用取值）——
     /// 「统计日恒等于发送时刻的日期」是前端**不建「统计日」列**的前提。
     pub sent_at: NaiveDateTime,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ts(sec: u32) -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(2026, 10, 15)
+            .expect("固定日期合法")
+            .and_hms_opt(9, 0, sec)
+            .expect("时分秒合法")
+    }
+
+    fn batch(part_id: i64, batch_no: i32, status: &str) -> ActiveBatchRow {
+        ActiveBatchRow {
+            part_id,
+            batch_no,
+            status: status.to_string(),
+            location: Some("PRODUCTION_SHELF".to_string()),
+            current_holder_id: Some(900 + batch_no as i64),
+        }
+    }
+
+    /// 取本文件源码里 `[start_marker, end_marker)` 之间的片段（失败即 panic）。
+    fn src_between(start: &str, end: &str) -> String {
+        let code = include_str!("repo.rs");
+        let lo = code
+            .find(start)
+            .unwrap_or_else(|| panic!("源码里找不到 `{start}`（函数被改名/删除？）"));
+        let hi = code[lo + start.len()..]
+            .find(end)
+            .unwrap_or_else(|| panic!("`{start}` 之后找不到 `{end}`"))
+            + lo
+            + start.len();
+        // ⚠️ **先剥掉注释行**：doc 里正好写着「写成 `<= today + N` 会让……」，留着它
+        // 会让下面那条「SQL 里不许出现 `<=`」的断言被自己的注释判红。
+        code[lo..hi]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// ★ 守卫：**半开窗口的两个边界**在 SQL 里写对了。
+    ///
+    /// ⚠️ 为什么是**源码级**断言而不是普通单测：这两个边界是 SQL 文本里的比较运算符，
+    /// 纯函数单元测试够不到它；而它是硬约束 2（「写 `<= today + N` 会让『3 日内』变成
+    /// 4 天」）的全部内容 —— 写错了**不报任何错**，只是每天多列一批根本不该在「3 日内」
+    /// 里的工单。端到端的行为证据在
+    /// `tests/wecom_daily/preview.rs::orders_section_grouping_uses_a_half_open_date_window`
+    /// （真库、真 SQL）；这条钉的是「改 SQL 的人会先撞到这里」。
+    #[test]
+    fn list_queries_use_the_half_open_date_window() {
+        let overdue = src_between("pub async fn list_overdue", "pub async fn list_upcoming");
+        assert!(
+            overdue.contains("p.system_delivery_date < $1::date"),
+            "逾期组 = `sdd < today`（今天到期属日期组）"
+        );
+        assert!(!overdue.contains("<="), "逾期组不许出现 `<=`：{overdue}");
+
+        let upcoming = src_between("pub async fn list_upcoming", "/// 装配件的**子件行**");
+        // 两支（`t_part` / `t_assembly`）各一对边界，缺一条就会漏掉一类工单。
+        assert_eq!(
+            upcoming.matches("system_delivery_date >= $1::date").count(),
+            2,
+            "两支都要 `>= today`（含今天）"
+        );
+        assert_eq!(
+            upcoming
+                .matches("system_delivery_date < $1::date + $3::int")
+                .count(),
+            2,
+            "两支都要 `< today + days`（不含第 N 天）"
+        );
+        assert!(
+            !upcoming.contains("<="),
+            "写成 `<= today + N` 会让「3 日内」变成 4 天：{upcoming}"
+        );
+    }
+
+    /// ★ 守卫：`active_batch_target` 的三段候选集与 `part::service` 的既有实现同形。
+    ///
+    /// 三段分别是：① 排除 `CANCELLED`；② 非空时再排除 `COMPLETED`，非空则用②；
+    /// ③ 三者都空时逐级回退。**逐条写死**是为了让「改候选集 = 改日报里工单的位置」
+    /// 这件事必须先来这里改（而不是在日报里偷偷换一套选批规则）。
+    #[test]
+    fn active_batch_target_follows_the_three_step_candidate_set() {
+        // ① 全 CANCELLED ⇒ 退回全部批次，取 progress 最小者。
+        let all_cancelled = vec![
+            batch(1, 1, "CANCELLED"),
+            batch(1, 2, "CANCELLED"),
+            batch(1, 3, "CANCELLED"),
+        ];
+        assert_eq!(
+            active_batch_target(&all_cancelled).map(|b| b.batch_no),
+            Some(1),
+            "全取消时取首条（progress 全是兜底档 2）"
+        );
+
+        // ② 非 CANCELLED 全 COMPLETED ⇒ 退回非取消集，取其中 progress 最小者。
+        let all_completed = vec![
+            batch(1, 1, "COMPLETED"),
+            batch(1, 2, "PENDING"),
+            batch(1, 3, "COMPLETED"),
+        ];
+        assert_eq!(
+            active_batch_target(&all_completed).map(|b| b.status.clone()),
+            Some("PENDING".to_string())
+        );
+
+        // ③ 正常形态：排除 CANCELLED / COMPLETED 后取 min-progress。
+        let mixed = vec![
+            batch(1, 1, "INSPECTION"),
+            batch(1, 2, "CANCELLED"),
+            batch(1, 3, "PENDING"),
+            batch(1, 4, "COMPLETED"),
+            batch(1, 5, "IN_PROCESS"),
+        ];
+        assert_eq!(
+            active_batch_target(&mixed).map(|b| b.batch_no),
+            Some(3),
+            "PENDING 的 progress 最小；CANCELLED / COMPLETED 都不参与"
+        );
+
+        // 空集 ⇒ None（调用方整项不显示「位置」）。
+        assert!(active_batch_target(&[]).is_none());
+    }
+
+    /// ★ 守卫：min-progress **并列取首条**，而首条由 SQL 的 `batch_no ASC` 决定。
+    #[test]
+    fn min_progress_ties_take_the_first_ordered_batch() {
+        let tied = vec![batch(7, 1, "IN_PROCESS"), batch(7, 2, "IN_PROCESS")];
+        assert_eq!(
+            active_batch_target(&tied).map(|b| b.batch_no),
+            Some(1),
+            "两条 progress 相同时取 `batch_no` 最小的（并列可复现）"
+        );
+        // 反序输入下仍取首条 —— 判据是「输入顺序里的第一个」，由 SQL 的 ORDER BY 保证。
+        let tied_reversed = vec![batch(7, 2, "IN_PROCESS"), batch(7, 1, "IN_PROCESS")];
+        assert_eq!(
+            active_batch_target(&tied_reversed).map(|b| b.batch_no),
+            Some(2)
+        );
+    }
+
+    /// ★ 守卫：`latest_drawing_by_part` 取 `(created_at, id)` 最大的一张，且**同秒**
+    /// 上传的两张按 `id` 定序（否则同一工单两次预览给出不同链接）。
+    #[test]
+    fn latest_drawing_by_part_breaks_created_at_ties_by_id() {
+        let rows = vec![
+            DrawingFileRow {
+                part_id: 1,
+                id: 11,
+                created_at: ts(10),
+            },
+            DrawingFileRow {
+                part_id: 2,
+                id: 22,
+                created_at: ts(30),
+            },
+            // 工单 1 的第二张：更晚 ⇒ 胜出。
+            DrawingFileRow {
+                part_id: 1,
+                id: 12,
+                created_at: ts(20),
+            },
+            // 工单 2 的第二张：同一秒但 id 更大 ⇒ 也胜出（tiebreaker 生效）。
+            DrawingFileRow {
+                part_id: 2,
+                id: 23,
+                created_at: ts(30),
+            },
+        ];
+        let out = latest_drawing_by_part(&rows);
+        assert_eq!(out.get(&1).copied(), Some(12), "取更晚的那张");
+        assert_eq!(out.get(&2).copied(), Some(23), "同秒取 id 更大的");
+        assert_eq!(out.len(), 2, "两个工单各一张");
+        assert!(latest_drawing_by_part(&[]).is_empty());
+    }
 }
