@@ -678,10 +678,10 @@ pub(crate) async fn insert_log_row(
     sqlx::query(
         "INSERT INTO t_wecom_daily_log (id, config_version, trigger_source, webhook_name, \
          webhook_masked, report_date, markdown_bytes, chunk_count, chunk_sent, \
-         overview_batch_count, overview_quantity, note_count, note_part_count, \
+         overview_batch_count, overview_quantity, note_count, \
          overdue_count, upcoming_count, worker_row_total, status, error_message, \
          sent_at, created_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, 100, $7, $8, 1, 2, 3, 4, 5, 6, $9, $10, $11, $12, $12)",
+         VALUES ($1, $2, $3, $4, $5, $6, 100, $7, $8, 1, 2, 3, 4, 5, $9, $10, $11, $12, $12)",
     )
     .bind(id)
     .bind(config_version)

@@ -50,15 +50,16 @@ async fn preview_never_writes_log_row() {
     assert_eq!(count_logs(&ctx.pool).await, 0, "/preview 绝不落流水");
 }
 
-/// 空体 `{}` = 全用当前配置；出参是 **14 个字段**、**没有** `markdown` 单字段。
+/// 空体 `{}` = 全用当前配置；出参是 **13 个字段**、**没有** `markdown` 单字段。
 #[tokio::test]
-async fn preview_out_has_fourteen_fields_and_no_markdown_singular() {
+async fn preview_out_has_thirteen_fields_and_no_markdown_singular() {
     let ctx = bootstrap().await;
     let (status, env) = post_as_manager(&ctx, "/cron/wecom-daily/preview", json!({})).await;
     assert_eq!(status, StatusCode::OK, "{env}");
     let d = data(&env);
     let n = d.as_object().expect("data 是对象").len();
-    assert_eq!(n, 14, "PreviewOut 必须逐字 14 个字段：{d}");
+    // ⚠️ 13 = 14 − `note_part_count`（2026-10-23 随 DB 列一并下线，出参键同步）。
+    assert_eq!(n, 13, "PreviewOut 必须逐字 13 个字段：{d}");
     assert!(
         d.get("markdown").is_none(),
         "契约里没有 `markdown` 单字段（只有 chunks）：{d}"
@@ -425,17 +426,17 @@ async fn delivery_section_counts_distinct_parts_by_picked_up_at() {
 
     let (status, env) = post_as_manager(&ctx, "/cron/wecom-daily/preview", json!({})).await;
     assert_eq!(status, StatusCode::OK, "{env}");
-    // ⚠️ `note_count`（送货单张数）已下线、恒 0；第二节只有一个数字 = 出货工单数。
+    // ⚠️ 第二节只有一个数字，且 `note_count` 就是它（2026-10-23 起语义变更，
+    // `note_part_count` 那一键随列下线）。
     assert_eq!(
         data(&env)["note_count"].as_i64(),
-        Some(0),
-        "第二节改单值口径后不再统计送货单张数"
-    );
-    assert_eq!(
-        data(&env)["note_part_count"].as_i64(),
         Some(2),
         "出货 2 单：已归档的单也算（不写 status 谓词），p2 的两个批次折叠成 1 单，\
          昨天上班时间取货的单在窗口外"
+    );
+    assert!(
+        data(&env).get("note_part_count").is_none(),
+        "note_part_count 必须整个下线（前端 .strict() schema 按键名排版）"
     );
 }
 
