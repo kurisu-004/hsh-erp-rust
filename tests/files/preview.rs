@@ -1,16 +1,16 @@
 //! `files::part_file::preview` 集成测试（2026-10-13 PR2 新建）
 //!
-//! 被测端点：`GET /api/v2/files/objects/{file_id}/preview`
-//! （COS CI 图纸预览，惰性轮询、零后台任务）。
+//! 被测对象：`GET /api/v2/files/objects/{file_id}/preview`（COS CI 图纸预览，惰性
+//! 轮询、零后台任务）+ 批量入口 `PreviewService::ensure_ready_for_parts`（供
+//! 「一次要给出几十条图纸链接」的调用方，如企业微信日报的第三节）。
 //!
-//! ## 覆盖场景：**34 个测试函数**（2026-10-13 新增 1 条后逐函数点数）
+//! ## 覆盖场景：**37 个测试函数**（批量入口新增 3 条后逐函数点数）
 //!
 //! 拆开是 **25 个编号函数**（下表 24 个编号条目，含 8b；其中 #18 一条覆盖 2 个
-//! 函数）+ **9 条不编号护栏**。
+//! 函数）+ **12 条不编号护栏**。
 //!
 //! ⚠️ 本节的数字是纯手工维护的散文 ⇒ **改本文件时必须逐函数点数核对**，按
 //! 「编号条目 / 实际函数」两栏分开写，避免「一个条目两个函数」的歧义。
-//! 2026-10-13（轮询节流可配新增 #23）后的真值：**34**。
 //!
 //! | # | 用例（⚠️ 一条可含多个函数） | 函数数 | 断言要点 |
 //! |---|---|---:|---|
@@ -57,8 +57,14 @@
 //!   **确定性**并发断言（service 层的 `join!` 版本验不了，见下节）
 //! - `concurrent_takeover_of_expired_claim_submits_once` —— 过期认领的并发接管只提一次
 //! - `live_claim_blocks_all_python_calls_until_lease_expiry` —— 租约期内零 python 调用
+//! - `ensure_ready_for_parts_zero_budget_is_read_only` —— 批量入口的**成本护栏**：
+//!   `Duration::ZERO` ⇒ 零 python 往返，且链接路径只有
+//!   `<prefix>/<seed>/p1.jpg`（★ 图号绝不进路径）
+//! - `ensure_ready_for_parts_with_budget_submits_once_then_gives_up_without_error` ——
+//!   有预算时**恰好提交一个** job，预算耗尽 ⇒ 不带链接、**不抛错**
+//! - `ensure_ready_for_parts_with_empty_input_is_a_no_op` —— 入参空集 ⇒ 一条语句都不发
 //!
-//! **合计 25 + 9 = 34 个测试函数。**
+//! **合计 25 + 12 = 37 个测试函数。**
 //!
 //! ## matchit 冲突的验证方式（本文件最重要的一条护栏）
 //!
@@ -156,8 +162,23 @@ async fn insert_part_file(
     filename: &str,
     content_sha256: Option<&str>,
 ) -> i64 {
-    let id = shared_test_snowflake().next_id();
     let part_id = shared_test_snowflake().next_id();
+    insert_part_file_for_part(pool, part_id, kind, file_type, filename, content_sha256).await
+}
+
+/// 与 [`insert_part_file`] 同款，但 **`part_id` 由调用方给**。
+///
+/// 批量入口（`ensure_ready_for_parts`）的入参就是 `part_id` 集合 ⇒ 这条用例必须自己
+/// 知道每个 part 的 id，否则没法断言「返回的 map 的键就是它传进去的那些」。
+async fn insert_part_file_for_part(
+    pool: &PgPool,
+    part_id: i64,
+    kind: &str,
+    file_type: &str,
+    filename: &str,
+    content_sha256: Option<&str>,
+) -> i64 {
+    let id = shared_test_snowflake().next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_part_file \
@@ -2250,4 +2271,175 @@ fn parse_ci_status_word_table_is_exhaustive() {
         CiStatus::Success,
         "Success + 1 页必须收敛成 Success，不能被 0 页护栏误伤"
     );
+}
+
+// ===========================================================================
+//  批量入口：`ensure_ready_for_parts`（供「一次要给出几十条图纸链接」的调用方）
+// ===========================================================================
+//
+// 这三条用例覆盖批量入口与 HTTP 端点的**行为分歧**：同一个状态机、同一套两道闸，
+// 但「预算为零 / 有预算」时对 python 的动作完全不同。
+// ⚠️ 它们是日报那条链路（企业微信第三节）唯一的成本护栏 —— CI 按页计费，
+// 「预览一次日报就烧一次 CI」会让这个功能在车间被立刻关掉。
+
+/// 造一个装好 `MockPyBackendClient` 的 `state`（直接换 `py_backend` 字段）。
+///
+/// ⚠️ `Arc::get_mut` 要求强计数为 1 —— 故必须在 `test_state` 刚返回、还没 clone 过
+/// 的时候替换（与 [`app_with_mock`] 同一纪律）。
+async fn state_with_mock(pool: PgPool, mock: MockPyBackendClient) -> Arc<AppState> {
+    let mut state = test_state(pool).await;
+    let py_backend: Arc<dyn PyBackendClient> = Arc::new(mock);
+    Arc::get_mut(&mut state)
+        .expect("state Arc 必须 unique")
+        .py_backend = py_backend;
+    state
+}
+
+/// ★ 预算为零 ⇒ **零 python 往返**，只给已 `READY` 的那些直链。
+///
+/// 钉的是三件事：
+/// 1. `Duration::ZERO` 真的**一次 python 都不打**（两个方法都 `.never()`）—— 管理端点
+///    「预览日报」绝不能顺带提交 CI job（按页计费）；
+/// 2. 已 READY 的那份给的是**第 1 页**直链，路径里只有 `<prefix>/<seed>/p1.jpg`；
+/// 3. 没有就绪行的那份**不在返回值里**（⇒ 日报那一行渲成纯文字，而不是空链接）。
+#[tokio::test]
+async fn ensure_ready_for_parts_zero_budget_is_read_only() {
+    let pool = test_pool().await;
+    let part_ready = shared_test_snowflake().next_id();
+    let part_pending = shared_test_snowflake().next_id();
+    let part_no_file = shared_test_snowflake().next_id();
+
+    let f_ready = insert_part_file_for_part(
+        &pool,
+        part_ready,
+        "DRAWING",
+        "PDF",
+        "A00123_rev2.pdf",
+        Some(&"a".repeat(64)),
+    )
+    .await;
+    let seed_ready = PreviewService::preview_seed(&fetch_row(&pool, f_ready).await);
+    insert_part_file_for_part(
+        &pool,
+        part_pending,
+        "DRAWING",
+        "PDF",
+        "B00456.pdf",
+        Some(&"b".repeat(64)),
+    )
+    .await;
+
+    // 3 页的 READY（模拟上一次调用已收敛）。
+    sqlx::query(
+        "INSERT INTO t_file_preview \
+           (id, preview_seed, src_object_key, ci_job_id, state, page_count, \
+            created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, 'k', 'job-done', 'READY', 3, now(), 1, now(), 1)",
+    )
+    .bind(shared_test_snowflake().next_id())
+    .bind(&seed_ready)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mut mock = MockPyBackendClient::new();
+    mock.expect_forward_ci_submit().never();
+    mock.expect_forward_ci_describe().never();
+    let state = state_with_mock(pool.clone(), mock).await;
+
+    let links = PreviewService::new(shared_test_snowflake().clone(), 2)
+        .ensure_ready_for_parts(
+            &pool,
+            &state.py_backend,
+            PREVIEW_PREFIX,
+            PREVIEW_BASE_URL,
+            "",
+            &[part_ready, part_pending, part_no_file],
+            std::time::Duration::ZERO,
+        )
+        .await;
+
+    assert_eq!(links.len(), 1, "只有 READY 的那份有链接：{links:?}");
+    let url = links.get(&part_ready).expect("已就绪的那份必须有链接");
+    assert_eq!(
+        url.as_str(),
+        format!("{PREVIEW_BASE_URL}/{PREVIEW_PREFIX}/{seed_ready}/p1.jpg"),
+        "只给第 1 页（形态决定：日报每行只有一个链接位）"
+    );
+    assert!(!url.contains("A00123"), "★ 图号绝不能进路径：{url}");
+    assert!(
+        !links.contains_key(&part_pending) && !links.contains_key(&part_no_file),
+        "未就绪 / 没有图纸的那两份都不该有链接（缺键 ⇒ 渲成纯文字）"
+    );
+}
+
+/// 有预算时**恰好提交一个** CI job，预算耗尽 ⇒ 不带链接、**且不抛错**。
+///
+/// 这是「一份日报因为一张图没转出来就不该发不出去」那条不变式的护栏：入口返回的是
+/// 一个 map，**没有 Result** —— 失败只表现为「那个键没有」。
+#[tokio::test]
+async fn ensure_ready_for_parts_with_budget_submits_once_then_gives_up_without_error() {
+    let pool = test_pool().await;
+    let part = shared_test_snowflake().next_id();
+    let file_id = insert_part_file_for_part(
+        &pool,
+        part,
+        "DRAWING",
+        "PDF",
+        "C00789.pdf",
+        Some(&"c".repeat(64)),
+    )
+    .await;
+    let seed = PreviewService::preview_seed(&fetch_row(&pool, file_id).await);
+
+    let mut mock = MockPyBackendClient::new();
+    mock.expect_forward_ci_submit()
+        .times(1)
+        .returning(|_body, _headers| Ok(ci_ok(json!({"job_id": "job-batch"}))));
+    // ⚠️ describe 一次都不该打：本预算小于一个节流间隔（缺省 2s），第一轮提交完就退出。
+    mock.expect_forward_ci_describe().never();
+    let state = state_with_mock(pool.clone(), mock).await;
+
+    let links = PreviewService::new(shared_test_snowflake().clone(), 2)
+        .ensure_ready_for_parts(
+            &pool,
+            &state.py_backend,
+            PREVIEW_PREFIX,
+            PREVIEW_BASE_URL,
+            "",
+            &[part],
+            std::time::Duration::from_millis(600),
+        )
+        .await;
+
+    assert!(links.is_empty(), "预算耗尽时不得给半成品链接：{links:?}");
+    let st = read_state(&pool, &seed).await.expect("行已登记");
+    assert_eq!(
+        st,
+        ("PENDING".to_string(), Some("job-batch".to_string()), 0),
+        "job 已提交且行停在 PENDING（明天的日报会接着轮询它，而不是从头再来）"
+    );
+}
+
+/// 入参为空集 ⇒ **一条语句都不发**（连 `t_part_file` 都不查）。
+#[tokio::test]
+async fn ensure_ready_for_parts_with_empty_input_is_a_no_op() {
+    let pool = test_pool().await;
+    let mut mock = MockPyBackendClient::new();
+    mock.expect_forward_ci_submit().never();
+    mock.expect_forward_ci_describe().never();
+    let state = state_with_mock(pool.clone(), mock).await;
+
+    let links = PreviewService::new(shared_test_snowflake().clone(), 2)
+        .ensure_ready_for_parts(
+            &pool,
+            &state.py_backend,
+            PREVIEW_PREFIX,
+            PREVIEW_BASE_URL,
+            "",
+            &[],
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+    assert!(links.is_empty());
 }

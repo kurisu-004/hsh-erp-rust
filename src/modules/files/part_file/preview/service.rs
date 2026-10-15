@@ -1,14 +1,28 @@
 //! `files::part_file::preview` 的业务层：惰性状态机 + seed 推导 + URL 拼接。
 //!
-//! 本文件是 `GET /api/v2/files/objects/{file_id}/preview` 的全部业务逻辑，
-//! 模块级取舍（安全 / CDN 契约 / 状态机）见 [`super::mod`] 的 doc。
+//! 本文件是 `GET /api/v2/files/objects/{file_id}/preview` 与批量入口
+//! [`PreviewService::ensure_ready_for_parts`] 的全部业务逻辑，模块级取舍
+//! （安全 / CDN 契约 / 状态机）见 [`super::mod`] 的 doc。
+//!
+//! ## ⚠️ 状态机只有**一份**，两条驱动路径共用「推进一格」
+//!
+//! [`PreviewService::get_preview`]（HTTP 端点，一次请求推进一格）与
+//! [`PreviewService::ensure_ready_for_parts`]（批量入口，在预算内反复推进到收敛）
+//! **共用 [`PreviewService::advance_one`]**：登记、两道并发闸、自愈重置、四种终局失败、
+//! 0 页护栏全部在这一处。复制第二份状态机的代价不是「代码多」，而是**省钱契约会开始
+//! 漂移**：某一侧漏掉「认领先于打 python」或漏判 `reset_to_pending` 的行数，症状是
+//! CI job 重复提交（按页计费）且**两个调用方都看不出对方错了**。
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::http::HeaderMap;
 use chrono::NaiveDateTime;
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use sqlx::pool::PoolConnection;
 use tracing::warn;
 
 use crate::auth::rbac::{CurrentUser, Role};
@@ -22,6 +36,25 @@ use crate::modules::files::part_file::preview::dto::PreviewOut;
 use crate::modules::files::part_file::preview::model::TFilePreview;
 use crate::modules::files::part_file::preview::repo::{PreviewRepo, state};
 use crate::shared::error::{AppError, code};
+
+/// 后台任务（非某个登录用户发起的请求）驱动预览链路时的**审计署名 id**。
+///
+/// ## 为什么要有一个「无用户」的取值
+///
+/// `t_file_preview.created_by` / `updated_by` 是 bigint，而批量入口
+/// [`PreviewService::ensure_ready_for_parts`] 的调用方是**定时任务**（企业微信日报
+/// cron：库里没有任何人点了「发送」）—— 它没有登录用户可署。这两列**只做审计、
+/// 不进任何谓词**，所以「署名是谁」不影响状态机的任何一个判据。
+///
+/// 取 `0` 而不是 `NULL`：`create_part_file` 等写路径一律传 `i64`，而
+/// `find_by_seed` / `claim_submit` 那些谓词从不引用这两列 ⇒ 让调用方传
+/// `Option<i64>` 只会把「这个调用点没有用户」这件事散成每个调用点各写一次判断。
+///
+/// ⚠️ **跨仓义务**：批量路径同样会带 `X-Forwarded-User-Id: 0` 转发给 python
+/// （见 [`PreviewService::fwd_headers`]），python 侧**不得**因查不到该用户而拒绝转发 ——
+/// 否则日报的图纸链接会在生产恒挂不上。登记见 [`super::mod`] 的
+/// 「需要 `backend-python` 同步的位置」表。
+pub const SYSTEM_ACTOR_ID: i64 = 0;
 
 /// 认领占位 token 的前缀（打 python **之前**写进 `ci_job_id` 的那枚标记）。
 ///
@@ -191,99 +224,456 @@ impl PreviewService {
         // ── 0. 可预览性闸门（纯内存判断，先于任何 IO）──
         Self::assert_previewable(file)?;
 
-        // ── 1. 派生内容寻址种子 ──
+        // 一次 HTTP 请求 = **至多一次** python 往返：推一格就返回，由前端按
+        // `retry_after_ms` 再来（批量入口才会反复推进，见 `ensure_ready_for_parts`）。
         let seed = Self::preview_seed(file);
+        Self::step_to_out(
+            self.advance_one(pool, py_backend, preview_prefix, &seed, file, current.id)
+                .await?,
+            preview_base_url,
+            preview_prefix,
+            image_params,
+        )
+    }
+
+    /// [`Step`] → 端点出参（**只**服务 HTTP 端点那条路径）。
+    ///
+    /// ⚠️ `FAILED` 在这里**必须**冒泡成 `21117`（本端点三态契约里失败走 502 信封），
+    /// 而批量入口对同一个 `Step` 的处置是「跳过这一份、不影响整份日报」—— 失败**该**
+    /// 影响谁由调用方决定，这是两条路径唯一的处置分歧。
+    fn step_to_out(
+        step: Step,
+        preview_base_url: &str,
+        preview_prefix: &str,
+        image_params: &str,
+    ) -> Result<PreviewOut, AppError> {
+        match step {
+            Step::Ready { seed, page_count } => Ok(Self::ready_out(
+                &seed,
+                page_count,
+                preview_base_url,
+                preview_prefix,
+                image_params,
+            )),
+            Step::Pending { retry_after_ms } => Ok(PreviewOut::pending(retry_after_ms)),
+            Step::Failed { reason } => Err(AppError::biz(
+                code::BIZ_PART_FILE_PREVIEW_FAILED,
+                format!("CI 预览渲染失败: {reason}"),
+            )),
+        }
+    }
+
+    /// ★ 批量入口：`part_id` 集合 → 每个 part 的**第 1 页**预览直链。
+    ///
+    /// 供「一次要在几十份清单里给出可点开的图纸链接」的调用方使用（企业微信日报的
+    /// 第三节）。返回值里**缺键** = 这一份不挂链接，四种成因同一后果（见下），
+    /// **绝不抛错**：一份日报因为一张图没转出来就不该发不出去。
+    ///
+    /// ## 缺键的四种成因（同一个渲染后果：名称渲成纯文字）
+    ///
+    /// 1. 该 part 没有 `DRAWING` 类的 PDF 图纸；
+    /// 2. 预算耗尽（`budget` 内没等到 CI 收敛）；
+    /// 3. CI 终局失败（行打 `FAILED`）；
+    /// 4. 打 python 失败（上游 5xx / 信封错误）。
+    ///
+    /// ## ⚠️ 只取**第 1 页**，不是全部页
+    ///
+    /// 返回值是「一行一个 markdown 链接」的素材：日报每行只挂一个 URL，而企业微信
+    /// markdown 链接渲染不了多图。多页图纸（整套装配件图）只给首页，是形态决定的，
+    /// 不是「取不到后面的页」—— 要翻页请走 `GET /objects/{file_id}/preview`。
+    ///
+    /// ## `budget` 的两条用法
+    ///
+    /// - **真预算**（推送路径）：`DRAWING_CI_BUDGET` 那个量级，会提交 CI job 并轮询
+    ///   到收敛或预算耗尽；
+    /// - **`Duration::ZERO`**（只读路径，如管理端 `/preview`）：一次 python 往返都
+    ///   不发生，只把**已经 READY** 的那些直链取出来。⇒ 「预览一次日报」不会烧掉
+    ///   CI 配额、也不会让 HTTP 请求挂在那儿等几分钟。
+    ///
+    /// ## ⚠️ **O(1) 语句数 + 预算共享**（为什么不按 part 逐个等）
+    ///
+    /// 固定 3 条语句与 part 数无关（`t_part_file` 批量 1 条 + `t_file_preview` 按 seed
+    /// 批量 1 条 + 各待推进者每格至多 1 次 python / 2~3 条状态迁移 UPDATE），随后
+    /// **轮转**推进：每一轮让所有未收敛的 part 各推一格。逐个 part 串行等会让排在
+    /// 后面的 part 在前面的慢 job 上把预算耗光，而它们彼此的收敛时刻互不相干。
+    ///
+    /// ## ⚠️ **全程不持有 DB 连接**
+    ///
+    /// 每一格由 [`Self::advance_one`] 自己短借短还，python 往返期间**手里没有连接**
+    /// —— 本函数最长会跑满 `budget`（分钟级），握着一条 `PoolConnection` 等 CI 会把
+    /// 连接池占满、读端点跟着排队。
+    ///
+    /// ⚠️ `#[allow(too_many_arguments)]` 是**刻意**的：八个形参里有五个是
+    /// **部署级配置**（`pool` / `py_backend` / `prefix` / `base_url` / `image_params`），
+    /// 它们在本仓的惯例里都由调用方从 `AppState` 直接传（`handler::get_part_file_preview`
+    /// 同款）。打成结构体只会在签名里造一层「看起来更整齐、实际每处调用都要多构造一个
+    /// 东西」的壳，而这三个 `&str` 在函数体内再拆包时还得逐个注明谁是谁。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn ensure_ready_for_parts(
+        &self,
+        pool: &PgPool,
+        py_backend: &Arc<dyn PyBackendClient>,
+        preview_prefix: &str,
+        preview_base_url: &str,
+        image_params: &str,
+        part_ids: &[i64],
+        budget: Duration,
+    ) -> HashMap<i64, String> {
+        // ① 每个 part 的最新一张 PDF 图纸（`t_part_file` 批量一条语句）。
+        let files = match Self::latest_pdf_drawings(pool, part_ids).await {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(error = %e, "批量确保图纸预览：读 t_part_file 失败，本期不挂任何链接");
+                return HashMap::new();
+            }
+        };
+        if files.is_empty() {
+            // 没有一份 PDF 图纸 ⇒ 一个字都不必打 python（连 `t_file_preview` 都不查）。
+            return HashMap::new();
+        }
+        // ② 按 seed 批量查 `t_file_preview`（一条语句）。
+        let urls = UrlParams {
+            prefix: preview_prefix,
+            base_url: preview_base_url,
+            image_params,
+        };
+        let (ready, pending) = match self.split_by_state(pool, &files, urls).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "批量确保图纸预览：读 t_file_preview 失败，本期不挂任何链接");
+                return HashMap::new();
+            }
+        };
+
+        // ③ 轮转推进未收敛者，直到预算耗尽 / 全部收敛 / 全部终局失败。
+        self.drive_pending(
+            pool,
+            py_backend,
+            urls,
+            pending,
+            ready,
+            tokio::time::Instant::now() + budget,
+        )
+        .await
+    }
+
+    /// 轮转推进：每一轮让每个未收敛者各推一格，直到预算耗尽或全部收敛 / 失败。
+    ///
+    /// ## 为什么是**轮转**而不是「逐个 part 等到收敛」
+    ///
+    /// 逐个串行等会让排在后面的 part 在前面那个慢 job 上把预算耗光，而各 part 的
+    /// 收敛时刻彼此独立（不同 CI job、不同 PDF）。轮转的代价是「预算耗尽时每个 part
+    /// 拿到的轮数相同」，这正是想要的结果：要么都挂上链接，要么都不挂 —— 而不是
+    /// 清单前半段有链接、后半段没有。
+    async fn drive_pending(
+        &self,
+        pool: &PgPool,
+        py_backend: &Arc<dyn PyBackendClient>,
+        urls: UrlParams<'_>,
+        mut pending: Vec<DrawingTarget>,
+        mut ready: HashMap<i64, String>,
+        deadline: tokio::time::Instant,
+    ) -> HashMap<i64, String> {
+        while !pending.is_empty() {
+            let mut still: Vec<DrawingTarget> = Vec::with_capacity(pending.len());
+            // `drain(..)` 把值**移**出来：循环体里有 `.await`，借用 `pending` 的元素
+            // 会跨 await 存活（编译器直接拒绝）。
+            for t in pending.drain(..) {
+                if tokio::time::Instant::now() >= deadline {
+                    still.push(t);
+                    continue;
+                }
+                match self
+                    .advance_one(
+                        pool,
+                        py_backend,
+                        urls.prefix,
+                        &t.seed,
+                        &t.file,
+                        SYSTEM_ACTOR_ID,
+                    )
+                    .await
+                {
+                    Ok(Step::Ready { page_count, .. }) => {
+                        if let Some(u) = urls.first_page(&t.seed, page_count) {
+                            ready.insert(t.part_id, u);
+                        }
+                    }
+                    Ok(Step::Pending { .. }) => still.push(t),
+                    Ok(Step::Failed { reason }) => {
+                        // 终局失败**不重试**：CI 按页计费，而这一格的失败已被状态机打
+                        // 成 `FAILED`（终局），下一次调用（含明天这次日报）自愈重提。
+                        warn!(seed = %t.seed, reason = %reason, "批量确保图纸预览：CI 终局失败，该份不带链接");
+                    }
+                    // ⚠️ 打 python 失败**不中断整批**：其余 part 的预览仍能就绪。行保持
+                    // `PENDING` 且认领已归还 ⇒ 下一次调用会自动补提交。
+                    Err(e) => {
+                        warn!(seed = %t.seed, error = %e, "批量确保图纸预览：打 python 失败，该份不带链接");
+                    }
+                }
+            }
+            pending = still;
+            if pending.is_empty() {
+                break;
+            }
+            // 一格都没收敛 ⇒ 守一个节流间隔再进下一轮。⚠️ sleep 时长取
+            // `min(节流, 距 deadline)`：一次收尾 sleep 越过 deadline 就等于整条推送
+            // 超出长档超时（`middleware/timeout.rs` 的 660s）。
+            let remain = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remain.is_zero() {
+                break;
+            }
+            tokio::time::sleep(std::cmp::min(remain, self.backoff_std())).await;
+        }
+        if !pending.is_empty() {
+            warn!(
+                pending = pending.len(),
+                ready = ready.len(),
+                "批量确保图纸预览：预算耗尽，未收敛的那几份不带链接"
+            );
+        }
+        ready
+    }
+
+    /// 每个 part 的**最新一张** PDF 图纸（`part_id → TPartFile`）。
+    ///
+    /// ## ⚠️ 「最新」在内存里判，`DISTINCT ON` 不进 SQL
+    ///
+    /// 与任何「每 owner 取最新一行」的批量查询同款取舍：`DISTINCT ON` 能少传行，
+    /// 但它把「同一 part 有 3 张图纸时取哪张」这条业务口径藏进一个 `ORDER BY`；
+    /// 放在这里它就是一条有名字、有单测的规则（[`Self::latest_of`]），口径变了也不会
+    /// 有人漏改 SQL。
+    ///
+    /// 排序 `ORDER BY part_id ASC, created_at ASC, id ASC` 只为让入参顺序确定、
+    /// 便于复现与排障（判「最新」不依赖它，见上）。
+    ///
+    /// ⚠️ 入参为空集时**不发 SQL**（省一条语句；本域的通用纪律）。
+    async fn latest_pdf_drawings(
+        pool: &PgPool,
+        part_ids: &[i64],
+    ) -> Result<Vec<DrawingTarget>, sqlx::Error> {
+        if part_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = pool.acquire().await?;
+        let rows =
+            crate::modules::files::part_file::repo::PartFileRepo::list_pdf_drawings_by_part_ids(
+                &mut *conn, part_ids,
+            )
+            .await?;
+        drop(conn);
+
+        let mut by_part: HashMap<i64, TPartFile> = HashMap::with_capacity(rows.len());
+        for f in rows {
+            match by_part.entry(f.part_id) {
+                Entry::Occupied(mut prev) => {
+                    if Self::is_newer(&f, prev.get()) {
+                        prev.insert(f);
+                    }
+                }
+                Entry::Vacant(v) => {
+                    v.insert(f);
+                }
+            }
+        }
+        Ok(by_part
+            .into_iter()
+            .map(|(part_id, file)| DrawingTarget {
+                part_id,
+                seed: Self::preview_seed(&file),
+                file,
+            })
+            .collect())
+    }
+
+    /// 「`b` 比 `a` 新就换掉它」（判据 = `(created_at, id)` 的字典序）。
+    ///
+    /// ⚠️ `id` 是**必需**的 tiebreaker：同一秒上传多张图纸时，取哪张取决于 PG 的物理
+    /// 行序 —— 少了它，同一个 part 两次生成日报会给出不同的图纸链接。
+    fn is_newer(cand: &TPartFile, cur: &TPartFile) -> bool {
+        (cand.created_at, cand.id) > (cur.created_at, cur.id)
+    }
+
+    /// 把批量目标按「已就绪 / 待推进」分成两堆（`t_file_preview` 按 seed 批量一条语句）。
+    ///
+    /// 分堆而不是「一条一条查」是这条链路 **O(1)** 的另一半：READY 的那些**零 IO**
+    /// 返回、不进 python 往返循环。
+    async fn split_by_state(
+        &self,
+        pool: &PgPool,
+        targets: &[DrawingTarget],
+        urls: UrlParams<'_>,
+    ) -> Result<(HashMap<i64, String>, Vec<DrawingTarget>), sqlx::Error> {
+        let seeds: Vec<String> = targets.iter().map(|t| t.seed.clone()).collect();
+        let mut conn = pool.acquire().await?;
+        let rows = PreviewRepo::find_by_seeds(&mut *conn, &seeds).await?;
+        drop(conn);
+        let by_seed: HashMap<&str, &TFilePreview> =
+            rows.iter().map(|r| (r.preview_seed.as_str(), r)).collect();
+
+        let mut ready: HashMap<i64, String> = HashMap::new();
+        let mut pending: Vec<DrawingTarget> = Vec::new();
+        for t in targets {
+            match by_seed.get(t.seed.as_str()) {
+                // ⚠️ 只认 `READY` 且 `page_count > 0`：0 页的 READY 是 CI 报成功时
+                // 对象尚未落盘的窗口，状态机的 0 页护栏会把它当进行中处理，这里照同一
+                // 判据把它划进「待推进」。
+                Some(r) if r.state == state::READY && r.page_count > 0 => {
+                    if let Some(u) = urls.first_page(&t.seed, r.page_count as i64) {
+                        ready.insert(t.part_id, u);
+                    }
+                }
+                _ => pending.push(t.clone()),
+            }
+        }
+        Ok((ready, pending))
+    }
+
+    /// ★ **推进一格**：状态机唯一的实现，两条驱动路径（HTTP 端点 / 批量入口）共用。
+    ///
+    /// 「一格」= 从「读行；必要时登记」开始，到「至多一次 python 往返 + 相应落库」
+    /// 为止。返回值即这一格的结论，**由调用方决定怎么处置**（HTTP 端点把
+    /// `Failed` 变成 502，批量入口只是跳过这一份）。
+    ///
+    /// ## 状态分支（与 [`Self::get_preview`] 的 doc 同表，两处必须同步）
+    ///
+    /// | 条件 | 动作 | 外部依赖 |
+    /// |---|---|---|
+    /// | seed 未命中 | INSERT PENDING（`ON CONFLICT DO NOTHING`）→ **登记成功才**提交 CI | 提交 1 次 |
+    /// | seed 未命中但 INSERT 冲突（并发，别的请求已登记） | 返 `Pending`（`retry_after_ms` = 一个节流间隔） | **无** |
+    /// | `READY` | 返 `Ready`，**零 IO**（不登记、不打 python） | **无** |
+    /// | `FAILED` | 自愈重置为 `PENDING` 后按 `PENDING` 处理；重置 **0 行** ⇒ 读回真实状态按它走 | 见下 |
+    /// | `PENDING` 且 `now < next_poll_at` | 返 `Pending`（节流） | **无** |
+    /// | `PENDING` 且到期、**无真 job id**（NULL 或认领占位 token） | **条件认领**（`claim_submit` 抢到才继续）→ 打 python | 提交 ≤1 次 |
+    /// | 认领失败（并发，别人正在提交 / 行已非 PENDING） | 返 `Pending`，**绝不自己打 python** | **无** |
+    /// | `PENDING` 且到期且有真 job id | describe：Success → `Ready`；**四种终局失败**（`Failed` / `Cancel` / `Pause` / `NotExist`）→ `Failed`；其余 → 推进 `next_poll_at` 返 `Pending` | 查询 1 次 |
+    ///
+    /// ## ⚠️ 并发不重复提交 CI job 是**两道闸**，各管一段
+    ///
+    /// | 闸 | 管哪条路径 | 机制 |
+    /// |---|---|---|
+    /// | `uk_t_file_preview_seed` 唯一索引 | **首次登记** | `insert_pending` 的 `ON CONFLICT DO NOTHING`，`rows==1` 才是登记者 |
+    /// | [`PreviewRepo::claim_submit`] 条件 UPDATE | **重试** 与 **自愈** | 「行已存在 + 无真 job id + 到期」，两个请求都能读到；认领抢到才允许打 python |
+    ///
+    /// 只靠唯一索引会漏掉后两条路径（详见该方法的 doc）。本函数是它们**唯一**的实现
+    /// 点，批量入口与 HTTP 端点都从这里过 ⇒ 加一条驱动路径不会漏掉任一闸。
+    ///
+    /// ## ⚠️ 连接纪律：每个 DB 步骤短借短还，**python 往返期间不持连接**
+    ///
+    /// 一次 `advance_one` 至多打一次 python（提交或 describe，各有
+    /// `PythonBackendConfig::timeout_ms` 缺省 10s 的超时）。HTTP 端点路径上这点时间
+    /// 无所谓，而批量入口要在预算内对几十份文件反复调本函数 ⇒ 「python 在飞时手里
+    /// 握着一条连接」会随并发的日报数线性堆积，把连接池占满、读端点跟着排队。
+    async fn advance_one(
+        &self,
+        pool: &PgPool,
+        py_backend: &Arc<dyn PyBackendClient>,
+        preview_prefix: &str,
+        seed: &str,
+        file: &TPartFile,
+        actor_id: i64,
+    ) -> Result<Step, AppError> {
         let now = now_naive();
 
-        // 整个状态机在**一个连接**上跑：每次写完立刻读回最新状态（并发下别的请求
-        // 可能已推进过状态），避免「读 A 状态 → 写 → 读 B 状态」的自造 TOCTOU。
+        // ── 1. 取当前行；未命中则尝试登记 ──
         let mut conn = pool.acquire().await?;
-
-        // ── 2. 取当前行；未命中则尝试登记 ──
-        let mut row = match PreviewRepo::find_by_seed(&mut *conn, &seed).await? {
+        let mut row = match PreviewRepo::find_by_seed(&mut *conn, seed).await? {
             Some(r) => Some(r),
             None => {
                 let inserted = PreviewRepo::insert_pending(
                     &mut *conn,
                     self.snowflake.next_id(),
-                    &seed,
+                    seed,
                     &file.object_key,
                     // ⚠️ **置 `now()` 而不是「现在 + 退避」**：本次调用就是登记者，
-                    // 它必须**紧接着**就提交 job（否则首次调用只会登记不提交，前端
-                    // 要等一个节流间隔后的第二次调用才看见 job 被提交；间隔缺省 2s、
-                    // 可经 env `PREVIEW_POLL_BACKOFF_SECONDS` 配 1..=5）。
+                    // 它必须**紧接着**就提交 job（否则首次调用只会登记不提交，调用方要
+                    // 等一个节流间隔后的第二次调用才看见 job 被提交；间隔缺省 2s、可经
+                    // env `PREVIEW_POLL_BACKOFF_SECONDS` 配 1..=5）。
                     // `now()` 同时也让「登记成功但进程在提交前挂了」能被下一次调用
-                    // 的 3d 分支补上（自愈）。
+                    // 的「补提交」分支恢复（自愈）。
                     now,
-                    current.id,
+                    actor_id,
                 )
                 .await?;
                 if inserted {
                     // 本调用是登记者 → 读回自己刚插的那行，交给下面的统一状态机处理
-                    PreviewRepo::find_by_seed(&mut *conn, &seed).await?
+                    PreviewRepo::find_by_seed(&mut *conn, seed).await?
                 } else {
-                    // 撞唯一索引 = 并发，别的请求正在提交 → 直接返 PENDING，
+                    // 撞唯一索引 = 并发，别的请求正在提交 → 直接返 Pending，
                     // **绝不自己再提交一次**（重复提交 CI = 重复计费）
                     None
                 }
             }
         };
 
-        // ── 3. 统一状态机 ──
+        // 并发分支：命中别人刚登记的 PENDING 且尚未提交，本调用不做任何推进。
+        // 返 Pending 让调用方稍后再来（那时轮询条件已到期）。
         let Some(row) = row.as_mut() else {
-            // 并发分支：命中别人刚登记的 PENDING 且尚未提交，本调用不做任何推进。
-            // 返 PENDING 让前端按 retry_after_ms 稍后再来（那时轮询条件已到期）。
-            return Ok(PreviewOut::pending(self.backoff_ms()));
+            drop(conn);
+            return Ok(Step::Pending {
+                retry_after_ms: self.backoff_ms(),
+            });
         };
 
-        // 3a. READY → **立即返回，零 IO**。
+        // 2a. READY → **立即返回，零 IO**。
         //     ⚠️ 必须排在所有推进逻辑之前：`mark_ready` 会把 `next_poll_at` 清成
         //     NULL，而 `poll_due` 把 NULL 当作「到期」（PENDING 行的 fail-open）。
         //     若把 READY 交给下面的 PENDING 流程，一个本该零 IO 的请求会去打一次
         //     python describe —— 既慢、又可能把并发窗口里的状态写乱。
         if row.state == state::READY {
-            return Ok(Self::ready_out(
-                row,
-                preview_base_url,
-                preview_prefix,
-                image_params,
-            ));
+            let out = Step::Ready {
+                seed: row.preview_seed.clone(),
+                page_count: row.page_count as i64,
+            };
+            drop(conn);
+            return Ok(out);
         }
 
-        // 3b. FAILED → 自愈重置为 PENDING 后重走下面的推进流程。
-        //     ⚠️ **只判 FAILED、不碰 READY**（READY 已在 3a 返回）。
+        // 2b. FAILED → 自愈重置为 PENDING 后重走下面的推进流程。
+        //     ⚠️ **只判 FAILED、不碰 READY**（READY 已在 2a 返回）。
         //
-        //     ⚠️⚠️ `reset_to_pending` 的**返回值必须判**（2026-10-13 review 第 1 轮
-        //     MAJOR-1）：0 行不是错误，而是「并发下别人已把这行推进走了」。此前本处
-        //     **丢弃**了行数、无条件把内存行改成 `PENDING / ci_job_id = None`，
-        //     然后继续走 3d → **再提交一个 CI job**。CI 按页计费 ⇒ 两个并存 job、
-        //     先写的那个变孤儿、钱两份都花了。症状与 B-1 同款迷惑：调用方拿到
-        //     PENDING，看起来一切正常，只是账单翻倍。
+        //     ⚠️⚠️ `reset_to_pending` 的**返回值必须判**：0 行不是错误，而是「并发下
+        //     别人已把这行推进走了」。把它丢掉并无条件把内存行改成
+        //     `PENDING / ci_job_id = None` 会让本调用**再提交一个 CI job**，与赢家那个
+        //     并存（按页计费 = 双份钱，先写的那个变孤儿）。
         if row.state == state::FAILED {
-            let reset = PreviewRepo::reset_to_pending(&mut *conn, row.id, current.id).await?;
+            let reset = PreviewRepo::reset_to_pending(&mut *conn, row.id, actor_id).await?;
             if reset == 0 {
                 // 认输：按**别人推进后的真实状态**走，绝不自己提交。
-                // 重新读回（可能已是 PENDING + 别人的新 job id，也可能是 READY）。
-                let Some(fresh) = PreviewRepo::find_by_seed(&mut *conn, &seed).await? else {
+                let Some(fresh) = PreviewRepo::find_by_seed(&mut *conn, seed).await? else {
                     // 行被软删了（本仓 preview 侧零 DELETE，理论上不会发生）：
-                    // 退化成「不推进」，让前端下轮再来。
-                    return Ok(self.pending_out(row, &now));
+                    // 退化成「不推进」，让调用方下轮再来。
+                    return Ok(self.pending_step(row, &now));
                 };
                 *row = fresh;
-                // 重新过 3a：可能已被别人推到 READY，那就该零 IO 直接返。
+                drop(conn);
+                // 重新过 2a：可能已被别人推到 READY，那就该零 IO 直接返。
                 if row.state == state::READY {
-                    return Ok(Self::ready_out(
-                        row,
-                        preview_base_url,
-                        preview_prefix,
-                        image_params,
-                    ));
+                    return Ok(Step::Ready {
+                        seed: row.preview_seed.clone(),
+                        page_count: row.page_count as i64,
+                    });
                 }
-                // 仍是 FAILED（别人又把它打失败了）⇒ 本调用不参与自愈，返 PENDING。
+                // 仍是 FAILED（别人又把它打失败了）⇒ 本调用不参与自愈，返 Pending。
                 if row.state == state::FAILED {
-                    return Ok(self.pending_out(row, &now));
+                    return Ok(self.pending_step(row, &now));
                 }
-                // 否则是 PENDING ⇒ 继续走下面的 3c / 3d（3d 有条件认领，不会重复提交）
+                // 否则是 PENDING ⇒ 继续走下面的 2c / 2d（2d 有条件认领，不会重复提交）。
+                // ⚠️ 重新借一条而不是复用上面那条：上面那条此刻仍被本作用域持有。
+                let fresh_conn = pool.acquire().await?;
+                return self
+                    .advance_pending(
+                        pool,
+                        py_backend,
+                        preview_prefix,
+                        seed,
+                        file,
+                        actor_id,
+                        fresh_conn,
+                        row,
+                        now,
+                    )
+                    .await;
             } else {
                 row.state = state::PENDING.to_string();
                 row.ci_job_id = None;
@@ -292,30 +682,69 @@ impl PreviewService {
             }
         }
 
-        // 3c. PENDING & 未到期 → 节流返回（不打 python）
+        self.advance_pending(
+            pool,
+            py_backend,
+            preview_prefix,
+            seed,
+            file,
+            actor_id,
+            conn,
+            row,
+            now,
+        )
+        .await
+    }
+
+    /// 推进「已是 `PENDING`」的行（`advance_one` 的后半段）。
+    ///
+    /// ## ⚠️ `conn` **按值持有**，`drop(conn)` 是「真还连接」的唯一写法
+    ///
+    /// 形参若取 `&mut PoolConnection`，函数里的 `drop(conn)` 只是丢掉一个引用、连接
+    /// **不会**回池（编译器只会给 `unused_must_use` 之外的 `dropping_references` 警告，
+    /// 而那条警告恰好被本函数最初的一版吞掉了）—— 于是「python 在飞时不占池位」这条
+    /// 连接纪律在代码上看起来成立、实际不成立。故本形参取**所有权**：跨网络往返前
+    /// `drop(conn)` 把连接真的还回池，之后再 `pool.acquire()` 借一条新的。
+    ///
+    /// 写成本方法（而不是内联进 `advance_one`）是为了让「重置 0 行 → 读回真实状态 →
+    /// 可能已是 READY / FAILED」的收尾有地方落脚，又不必把整个状态机的缩进再套一层。
+    #[allow(clippy::too_many_arguments)]
+    async fn advance_pending(
+        &self,
+        pool: &PgPool,
+        py_backend: &Arc<dyn PyBackendClient>,
+        preview_prefix: &str,
+        seed: &str,
+        file: &TPartFile,
+        actor_id: i64,
+        mut conn: PoolConnection<sqlx::Postgres>,
+        row: &mut TFilePreview,
+        now: NaiveDateTime,
+    ) -> Result<Step, AppError> {
+        // 2c. PENDING & 未到期 → 节流返回（不打 python）
         if !Self::poll_due(row, &now) {
-            return Ok(self.pending_out(row, &now));
+            return Ok(self.pending_step(row, &now));
         }
 
-        // 3d. 尚无真 job id → **条件认领**后补提交
+        // 2d. 尚无真 job id → **条件认领**后补提交
         //     （首次登记的正常延续 / 上次提交失败后的重试 / 自愈后的重新提交）
         //
-        //     ⚠️ **认领先于打 python**（review 第 1 轮 MAJOR-1）：唯一索引只闸首次
-        //     登记，这两条路径是「行已存在」，两个请求会同时读到「due + 无 job id」。
-        //     「先查再打 python」是 TOCTOU ⇒ 两个 CI job（按页计费）。标准写法是
-        //     用一条带谓词的 UPDATE 认领，只有抢到的那个才允许打 python。
+        //     ⚠️ **认领先于打 python**：唯一索引只闸首次登记，这两条路径是「行已存在」，
+        // 两个请求会同时读到「due + 无 job id」。「先查再打 python」是 TOCTOU ⇒ 两个
+        // CI job（按页计费）。标准写法是用一条带谓词的 UPDATE 认领，只有抢到的那个才
+        // 允许打 python。
         //
-        //     ⚠️ 判据是「**没有真 job id**」而不是「`ci_job_id IS NULL`」：认领期间
-        //     该列被写成 [`CLAIM_TOKEN_PREFIX`] 占位 token，必须一并认作「尚未提交」
-        //     （进程在认领与 mark_submitted 之间挂掉时，下一次调用靠这条恢复）。
+        //     ⚠️ 判据是「**没有真 job id**」而不是「`ci_job_id IS NULL`」：认领期间该列
+        // 被写成 [`CLAIM_TOKEN_PREFIX`] 占位 token，必须一并认作「尚未提交」（进程在
+        // 认领与 mark_submitted 之间挂掉时，下一次调用靠这条恢复）。
         let needs_submit = match row.ci_job_id.as_deref() {
             None => true,
             Some(id) => id.starts_with(CLAIM_TOKEN_PREFIX),
         };
         if needs_submit {
             let claim_token = format!("{CLAIM_TOKEN_PREFIX}{}", self.snowflake.next_id());
-            // 租约**不是**节流戳：它只用来在「认领 → POST → mark_submitted」这段
-            // 窗口内挡住别的请求（见 CLAIM_LEASE_SECONDS 的 doc）。
+            // 租约**不是**节流戳：它只用来在「认领 → POST → mark_submitted」这段窗口内
+            // 挡住别的请求（见 CLAIM_LEASE_SECONDS 的 doc）。
             let lease_until = now + chrono::Duration::seconds(CLAIM_LEASE_SECONDS);
             // ⚠️ `now` 一并传入：租约到期比较用**应用时钟**，不用 SQL 的 `now()`
             //    （DB 会话时区与应用时钟是两个东西，理由见 repo 的 doc）
@@ -325,118 +754,115 @@ impl PreviewService {
                 &claim_token,
                 lease_until,
                 now,
-                current.id,
+                actor_id,
             )
             .await?;
             if !claimed {
                 // 认领失败 = 别人正在提交（租约未过）/ 行已不是 PENDING
-                // ⇒ **绝不自己打 python**。返 PENDING 让前端按 retry_after_ms 再来。
-                return Ok(self.pending_out(row, &now));
+                // ⇒ **绝不自己打 python**。返 Pending 让调用方按 retry_after_ms 再来。
+                return Ok(self.pending_step(row, &now));
             }
             let next_poll = now + self.backoff();
-            match Self::submit(py_backend, preview_prefix, &seed, &file.object_key, current).await {
+            // ⚠️ 提交是**跨网络**的往返 ⇒ 先还连接再打，python 在飞时不占池位。
+            drop(conn);
+            let submitted =
+                Self::submit(py_backend, preview_prefix, seed, &file.object_key, actor_id).await;
+            let mut conn = pool.acquire().await?;
+            let outcome = match submitted {
                 Ok(job_id) => {
-                    // ⚠️ `claim_token` 必须一并传入：`mark_submitted` 的谓词靠它
-                    //    校验「我才是认领者」（review 第 2 轮 N-5）。传错 / 传空会让
-                    //    写入永远得 0 行 ⇒ job id 落不了库 ⇒ 预览永远卡在 PENDING。
+                    // ⚠️ `claim_token` 必须一并传入：`mark_submitted` 的谓词靠它校验
+                    //    「我才是认领者」。传错 / 传空会让写入永远得 0 行 ⇒ job id 落不了
+                    //    库 ⇒ 预览永远卡在 PENDING。
                     PreviewRepo::mark_submitted(
                         &mut *conn,
                         row.id,
                         &job_id,
                         next_poll,
                         &claim_token,
-                        current.id,
+                        actor_id,
                     )
                     .await?;
-                    // ⚠️ **两处都要更新**：`pending_out` 读的是内存里这一行的
-                    // `next_poll_at`，只改 `ci_job_id` 会让它仍停在「登记时的
-                    // `now()`」⇒ 算出 `retry_after_ms = 0`，前端立刻重调，
-                    // 退避形同虚设（变成忙轮询）。且此时传 `&now`（不是 `&next_poll`）
-                    // 才是「距现在还有多久」的正确语义。
+                    // ⚠️ **两处都要更新**：`pending_step` 读的是内存里这一行的
+                    // `next_poll_at`，只改 `ci_job_id` 会让它仍停在「登记时的 `now()`」
+                    // ⇒ 算出 `retry_after_ms = 0`，调用方立刻重调，退避形同虚设（变成
+                    // 忙轮询）。且此时传 `&now`（不是 `&next_poll`）才是「距现在还有
+                    // 多久」的正确语义。
                     row.ci_job_id = Some(job_id);
                     row.next_poll_at = Some(next_poll);
-                    return Ok(self.pending_out(row, &now));
+                    Ok(self.pending_step(row, &now))
                 }
                 Err(e) => {
-                    // 提交失败**不**把行打成 FAILED —— 那是 CI 的终态语义，
-                    // 而这里只是「这次没送出去」。行保持 PENDING / ci_job_id 仍为空，
-                    // 下次调用（过了 next_poll_at）会自动重试 ⇒ 自愈。
+                    // 提交失败**不**把行打成 FAILED —— 那是 CI 的终态语义，而这里只是
+                    // 「这次没送出去」。行保持 PENDING / ci_job_id 仍为空，下次调用（过了
+                    // next_poll_at）会自动重试 ⇒ 自愈。
                     warn!(
                         seed = %seed,
                         error = %e,
                         "CI 预览任务提交失败，行保持 PENDING 待重试"
                     );
                     // ⚠️ **归还认领**（`ci_job_id` 清回 NULL），不能留着占位 token：
-                    // 留着虽然也能被下一轮 3d 重新认领（谓词认 token），但该列上挂一个
+                    // 留着虽然也能被下一轮重新认领（谓词认 token），但该列上挂一个
                     // python 侧不存在的值，会误导任何将来直接读这一列的排障代码。
                     // 用独立方法而非改 `touch_poll`：`touch_poll` 还有一个调用点
-                    // （3e 的 Running 分支）**必须保留真 job id**，两处语义相反。
+                    // （2e 的 Running 分支）**必须保留真 job id**，两处语义相反。
                     let released =
-                        PreviewRepo::release_claim(&mut *conn, row.id, &claim_token, current.id)
+                        PreviewRepo::release_claim(&mut *conn, row.id, &claim_token, actor_id)
                             .await?;
-                    // ⚠️⚠️ **只在真的归还成功（1 行）时才推节流戳**
-                    //（2026-10-13 review 第 2 轮 N-5 的 R2）：`release_claim` 得 0 行
-                    // = 认领**已被接管** / 行已不是 PENDING。此时若仍无条件
+                    // ⚠️⚠️ **只在真的归还成功（1 行）时才推节流戳**：得 0 行 = 认领**已被
+                    // 接管** / 行已不是 PENDING。此时若仍无条件
                     // `touch_poll(now + 节流间隔)`，就会把**接管者刚写的租约戳**
-                    // （now + 30s）**缩短**成 now + 节流间隔（缺省 2s，可配 1..=5）
-                    // ⇒ 第三个请求一个节流间隔后即可合法接管 ⇒「租约不可抢」这条闸
-                    // 被一个善意的退避动作从下面捅穿。
+                    // （now + 30s）**缩短**成 now + 节流间隔（缺省 2s，可配 1..=5）⇒ 第三个
+                    // 请求一个节流间隔后即可合法接管 ⇒「租约不可抢」这条闸被一个善意的
+                    // 退避动作从下面捅穿。
                     if released == 1 {
-                        // 节流：至少等一个 backoff 再重试，避免前端对着一个必然失败的
-                        // 上游连打（错误原样抛给调用方 → 21118 / HTTP 502）。
-                        PreviewRepo::touch_poll(
-                            &mut *conn,
-                            row.id,
-                            now + self.backoff(),
-                            current.id,
-                        )
-                        .await?;
+                        // 节流：至少等一个 backoff 再重试，避免对着一个必然失败的上游连打
+                        // （错误原样抛给调用方 → 21118 / HTTP 502）。
+                        PreviewRepo::touch_poll(&mut *conn, row.id, now + self.backoff(), actor_id)
+                            .await?;
                     } else {
                         warn!(
                             seed = %seed,
                             "归还认领得 0 行（已被接管或行已非 PENDING），不推节流戳以免缩短接管者的租约"
                         );
                     }
-                    return Err(e);
+                    Err(e)
                 }
-            }
+            };
+            return outcome;
         }
 
-        // 3e. 有真 job id 且到期 → describe
-        //     ⚠️ 走到这里时 `ci_job_id` 必非 None（3d 已把「无真 job id」return 掉），
-        //     故这里用 `expect` 而不是 `unwrap_or_default()` —— 后者会把「状态机
-        //     被改坏」静默变成「打 python 一个空 job id 的 URL」，故障现场难查。
-        //     ⚠️⚠️ **改 3d 分支结构时必须同步改这里**：3d 现在多认了一种
-        //     `CLAIM_TOKEN_PREFIX` 占位值，若 3d 的放行条件被放宽而本处没跟着把
-        //     占位值滤掉，就会拿一个 python 侧不存在的 job id 去 describe。
+        // 2e. 有真 job id 且到期 → describe
+        //     ⚠️ 走到这里时 `ci_job_id` 必非 None（「补提交」分支已把「无真 job id」
+        //     return 掉），故这里用 `expect` 而不是 `unwrap_or_default()` —— 后者会把
+        //     「状态机被改坏」静默变成「打 python 一个空 job id 的 URL」，故障现场难查。
+        //     ⚠️⚠️ **改上面那个分支的结构时必须同步改这里**：它多认了一种
+        //     `CLAIM_TOKEN_PREFIX` 占位值，若放行条件被放宽而本处没跟着把占位值滤掉，
+        //     就会拿一个 python 侧不存在的 job id 去 describe。
         let job_id = row
             .ci_job_id
             .as_deref()
-            .expect("3e 分支必已确保 ci_job_id 非空")
+            .expect("2e 分支必已确保 ci_job_id 非空")
             .to_string();
-        let describe = Self::describe(py_backend, &job_id, current).await?;
+        // ⚠️ 同上：describe 是跨网络往返，先还连接。
+        drop(conn);
+        let describe = Self::describe(py_backend, &job_id, actor_id).await;
+        let mut conn = pool.acquire().await?;
+        let describe = describe?;
         match describe.status {
             CiStatus::Success => {
-                PreviewRepo::mark_ready(&mut *conn, row.id, describe.page_count, current.id)
-                    .await?;
-                row.state = state::READY.to_string();
-                row.page_count = describe.page_count;
-                row.error_message = None;
-                row.next_poll_at = None;
-                Ok(Self::ready_out(
-                    row,
-                    preview_base_url,
-                    preview_prefix,
-                    image_params,
-                ))
+                PreviewRepo::mark_ready(&mut *conn, row.id, describe.page_count, actor_id).await?;
+                Ok(Step::Ready {
+                    seed: row.preview_seed.clone(),
+                    page_count: describe.page_count as i64,
+                })
             }
             CiStatus::Failed | CiStatus::Canceled | CiStatus::Paused | CiStatus::NotExist => {
                 // ⚠️ **四个变体逐个列出、刻意不写 `_`**：编译器会在本函数新增
                 // `CiStatus` 变体时把这里变红，防止新词又悄悄落进兜底变无限轮询。
                 //
-                // 四者统一落 `FAILED` + 21117（含 `NotExist`），**不静默重提 job**
-                // —— 决策理由与「为什么不会变成无限提交 job」的论证见
-                // [`super::mod`] 的「CI 终局失败的落点」一节。
+                // 四者统一落 `FAILED`（含 `NotExist`），**不静默重提 job** —— 决策理由与
+                // 「为什么不会变成无限提交 job」的论证见 [`super::mod`] 的「CI 终局失败的
+                // 落点」一节。
                 let mut msg = describe.status.failure_reason().to_string();
                 if let Some(reason) = describe.message.as_deref().filter(|m| !m.trim().is_empty()) {
                     msg.push('：');
@@ -449,24 +875,19 @@ impl PreviewService {
                     ci_state = %describe.status.as_str(),
                     "CI 预览任务落入终局失败态，行打 FAILED（下次调用自愈重提）"
                 );
-                PreviewRepo::mark_failed(&mut *conn, row.id, &msg, current.id).await?;
-                Err(AppError::biz(
-                    code::BIZ_PART_FILE_PREVIEW_FAILED,
-                    format!("CI 预览渲染失败: {msg}"),
-                ))
+                PreviewRepo::mark_failed(&mut *conn, row.id, &msg, actor_id).await?;
+                Ok(Step::Failed { reason: msg })
             }
             CiStatus::Running => {
-                // 退避推进节流戳，返 PENDING（前端按 retry_after_ms 再来）
+                // 退避推进节流戳，返 Pending（调用方按 retry_after_ms 再来）
                 let next_poll = now + self.backoff();
-                PreviewRepo::touch_poll(&mut *conn, row.id, next_poll, current.id).await?;
+                PreviewRepo::touch_poll(&mut *conn, row.id, next_poll, actor_id).await?;
                 row.next_poll_at = Some(next_poll);
-                // ⚠️ **传 `&now` 而不是 `&next_poll`**（2026-10-13 review 第 1 轮修）：
-                // 与 3d 分支同一纪律 —— `pending_out` 算的是 `next_poll_at - 传入时刻`
-                // 即「距现在还有多久」，传 `&next_poll` 会让结果恒为 **0** ⇒ 前端
-                // 拿 `retry_after_ms = 0` 立刻重调，退避形同虚设（变成**忙轮询**，
-                // 每个请求都真打一次 python）。这正是「无限轮询」在**合法 Running
-                // 路径**上的同款症状：越是非法终局被识别出来，这条路径越要真的节流。
-                Ok(self.pending_out(row, &now))
+                // ⚠️ **传 `&now` 而不是 `&next_poll`**：与「补提交」分支同一纪律 ——
+                // `pending_step` 算的是 `next_poll_at - 传入时刻` 即「距现在还有多久」，
+                // 传 `&next_poll` 会让结果恒为 **0** ⇒ 调用方拿到 `retry_after_ms = 0`
+                // 立刻重调，退避形同虚设（变成**忙轮询**，每次都真打一次 python）。
+                Ok(self.pending_step(row, &now))
             }
         }
     }
@@ -632,6 +1053,16 @@ impl PreviewService {
         )
     }
 
+    /// [`Self::backoff`] 的 `std::time::Duration` 形态（批量推进循环要 `tokio::time::sleep`）。
+    ///
+    /// clamp 口径与 [`Self::backoff`] **同源**（同一区间常量），两处不得漂移。
+    fn backoff_std(&self) -> Duration {
+        Duration::from_secs(
+            self.poll_backoff_seconds
+                .clamp(1, PREVIEW_POLL_BACKOFF_MAX_SECONDS) as u64,
+        )
+    }
+
     /// 返给前端的建议重试间隔（毫秒）。clamp 口径与 [`Self::backoff`] 相同
     /// （同一个区间常量，两处不得漂移）。
     fn backoff_ms(&self) -> u64 {
@@ -660,31 +1091,36 @@ impl PreviewService {
     ///
     /// ⚠️ 2026-10-13 轮询节流可配后由关联函数改 `&self`：`next_poll_at` 为 NULL 的
     /// 兜底分支要用 `self.backoff_ms()`（与 `backoff()` 同源）。
-    fn pending_out(&self, row: &TFilePreview, now: &NaiveDateTime) -> PreviewOut {
-        let retry_after_ms = row
-            .next_poll_at
-            .map(|at| (at - *now).num_milliseconds().max(0) as u64)
-            .unwrap_or_else(|| self.backoff_ms());
-        PreviewOut::pending(retry_after_ms)
+    fn pending_step(&self, row: &TFilePreview, now: &NaiveDateTime) -> Step {
+        Step::Pending {
+            retry_after_ms: row
+                .next_poll_at
+                .map(|at| (at - *now).num_milliseconds().max(0) as u64)
+                .unwrap_or_else(|| self.backoff_ms()),
+        }
     }
 
     /// READY 出参：`pages` 长度恒等于 `page_count`（同一处循环产出，不可能不等长）。
     ///
     /// `image_params` 是 `size` 档位选好的图片处理参数，原样透传给
     /// [`Self::preview_urls`]（空串 = `full` 档 / 未配置）。
+    ///
+    /// 形参是 `seed` + `page_count` 而不是 `&TFilePreview`：状态机在
+    /// [`Self::advance_pending`] 里已经**把行还回内存**、连接也还了，拿到裸值比把整行
+    /// 的生命周期拖到这里干净。
     fn ready_out(
-        row: &TFilePreview,
+        seed: &str,
+        page_count: i64,
         preview_base_url: &str,
         preview_prefix: &str,
         image_params: &str,
     ) -> PreviewOut {
-        let page_count = row.page_count.max(0) as i64;
         PreviewOut::ready(
             page_count,
             Self::preview_urls(
                 preview_base_url,
                 preview_prefix,
-                &row.preview_seed,
+                seed,
                 page_count,
                 image_params,
             ),
@@ -743,14 +1179,14 @@ impl PreviewService {
         preview_prefix: &str,
         seed: &str,
         src_object_key: &str,
-        current: &CurrentUser,
+        actor_id: i64,
     ) -> Result<String, AppError> {
         let body = json!({
             "src_object_key": src_object_key,
             "dst_prefix": Self::preview_object_prefix(preview_prefix, seed),
         });
         let resp = py_backend
-            .forward_ci_submit(body, Self::fwd_headers(current))
+            .forward_ci_submit(body, Self::fwd_headers(actor_id))
             .await?;
         Self::parse_envelope(&resp.body, &resp.status, "submit")?
             .get("job_id")
@@ -769,10 +1205,10 @@ impl PreviewService {
     async fn describe(
         py_backend: &Arc<dyn PyBackendClient>,
         job_id: &str,
-        current: &CurrentUser,
+        actor_id: i64,
     ) -> Result<CiDescribe, AppError> {
         let resp = py_backend
-            .forward_ci_describe(job_id, Self::fwd_headers(current))
+            .forward_ci_describe(job_id, Self::fwd_headers(actor_id))
             .await?;
         let data = Self::parse_envelope(&resp.body, &resp.status, "describe")?;
         // ⚠️ **状态字段名跨仓有两种写法，且 `state` 才是真源**（2026-10-13 review
@@ -965,9 +1401,14 @@ impl PreviewService {
 
     /// 转发头：注入 `X-Forwarded-User-Id`（与 `files::handler::forward_sts_tmp_keys`
     /// 同款纪律 —— python 端靠它取真实身份）。
-    fn fwd_headers(current: &CurrentUser) -> HeaderMap {
+    ///
+    /// ⚠️ 形参是 `i64` 而不是 `&CurrentUser`：批量入口由**后台任务**驱动，那里没有
+    /// 登录用户（它署名 [`SYSTEM_ACTOR_ID`]）。要让它为了「拿一个 id」而构造一个
+    /// `CurrentUser` 假人，就得凭空编出角色 / 货架 scope —— 那几个字段本请求里
+    /// 一个也不读，编出来只是让「这个请求是谁」看起来比实际更确定。
+    fn fwd_headers(actor_id: i64) -> HeaderMap {
         let mut h = HeaderMap::new();
-        if let Ok(v) = current.id.to_string().parse() {
+        if let Ok(v) = actor_id.to_string().parse() {
             h.insert("x-forwarded-user-id", v);
         }
         h
@@ -1037,6 +1478,76 @@ struct CiDescribe {
     message: Option<String>,
 }
 
+/// ★ **推进一格**的结论（[`PreviewService::advance_one`] 的出参）。
+///
+/// ## 为什么不让 `advance_one` 直接产 `PreviewOut`
+///
+/// 因为**两条驱动路径对「失败」的处置相反**：HTTP 端点要把终局失败变成 502 信封
+/// （前端据此停自动重试），而批量入口只是「这一份不挂链接」、整份日报照发。让状态机
+/// 自己产 wire 出参就得在这两条路径之间做取舍判断，而那正是调用方的权限。
+enum Step {
+    /// 已收敛到 `READY`（`seed` 是回读后的种子，`page_count > 0` 恒成立）。
+    ///
+    /// 返 seed 而不是让调用方自己留着 `file`：种子的 `char(64)` 空白填充只在
+    /// `find_by_seed` 的读出口被 `trim_end()` 修过（见 [`PreviewRepo::find_by_seed`]），
+    /// 由状态机把这个**已修好的值**交给调用方，就不必在每个调用点各记一次「读出来的
+    /// seed 要 trim」这条纪律。
+    Ready { seed: String, page_count: i64 },
+    /// 仍在推进中；`retry_after_ms` = 距现在还差多久（**不是** `next_poll_at -
+    /// next_poll_at` 那个恒 0 的值，见 `pending_step` 的注释）。
+    Pending { retry_after_ms: u64 },
+    /// 落入终局失败：行**已**被打成 `FAILED`，`reason` 是落进 `error_message` 的同一句。
+    Failed { reason: String },
+}
+
+/// 批量入口的一个目标：「某个 part 的最新一张 PDF 图纸」+ 由它派生的种子。
+///
+/// `file` 是**整行**而不是几列窄投影：`advance_one` 的两条路径都要它的 `object_key`
+/// 与 `content_sha256`（推 seed + 提交 CI），而窄投影会在「推 seed 的地方补一列」
+/// 与「提交的地方补一列」之间来回漏。
+#[derive(Debug, Clone)]
+struct DrawingTarget {
+    /// `t_part_file.part_id`（⚠️ polymorphic：散件行传 `t_part.id`、装配件行传
+    /// `t_assembly.id` —— 同一条查询、同一列，见 [`PreviewService::latest_pdf_drawings`]）。
+    part_id: i64,
+    /// 由 [`PreviewService::preview_seed`] 派生（纯哈希，⚠️ **不带文件名**）。
+    seed: String,
+    file: TPartFile,
+}
+
+/// 拼直链所需的三个**部署级**参数（批量入口一路传下去）。
+///
+/// 打成结构体而不是三个形参：`first_page` 与 `advance_one` 都要用到它们，逐层
+/// 拆三个字符串会让「哪个是 base、哪个是 prefix」在每个签名里重新猜一遍。
+#[derive(Debug, Clone, Copy)]
+struct UrlParams<'a> {
+    prefix: &'a str,
+    base_url: &'a str,
+    image_params: &'a str,
+}
+
+impl UrlParams<'_> {
+    /// 第 1 页的直链；`page_count <= 0` ⇒ `None`（**不返回空串**：空串会被调用方当成
+    /// 一个合法链接塞进 markdown，渲染出一个点不动的空链接）。
+    ///
+    /// ⚠️ 路径成分只有 `{base}/{prefix}/{seed}/p1.jpg`（+ 可选 query），**绝不含
+    /// 文件名** —— 图号可枚举而 `previews/` 是 public-read，理由与补偿见
+    /// [`super::mod`] 的「⚠️⚠️ 安全条款：预览路径里绝不能带文件名」。本函数复用
+    /// [`PreviewService::preview_urls`]（与 CI 写对象的 `dst_prefix` 同一真源），所以
+    /// 「写到哪里」与「读哪里取」不可能分叉。
+    fn first_page(&self, seed: &str, page_count: i64) -> Option<String> {
+        PreviewService::preview_urls(
+            self.base_url,
+            self.prefix,
+            seed,
+            page_count,
+            self.image_params,
+        )
+        .into_iter()
+        .next()
+    }
+}
+
 /// `parse_envelope` / `upstream_detail` 的单测。
 ///
 /// ⚠️ **这组用例的存在理由是一个真实故障**（2026-10-14）：CI 预览提交持续 502，
@@ -1051,12 +1562,118 @@ mod tests {
     use super::*;
     use axum::body::Bytes;
     use axum::http::StatusCode;
+    use chrono::NaiveDate;
 
     /// python 的统一信封（`R.fail` 的形状：`{code, message, data}`）。
     fn envelope(code: i64, message: &str) -> Bytes {
         Bytes::from(
             serde_json::to_vec(&json!({"code": code, "message": message, "data": null})).unwrap(),
         )
+    }
+
+    // ---------------------------------------------------------------
+    // 批量入口的两条纯逻辑（不碰 DB、不发 HTTP）
+    // ---------------------------------------------------------------
+
+    /// 造一条 `t_part_file` 行（纯内存 fixture，不落库）。
+    fn file_row(id: i64, part_id: i64, filename: &str, sec: u32) -> TPartFile {
+        TPartFile {
+            id,
+            part_id,
+            kind: "DRAWING".into(),
+            file_type: "PDF".into(),
+            // ⚠️ 形状照生产：`{sha16}_{原文件名}`，而文件名是**图号**、可枚举。
+            object_key: format!("0123456789abcdef_{filename}"),
+            original_filename: filename.into(),
+            file_size: 1024,
+            content_type: "application/pdf".into(),
+            upload_status: "READY".into(),
+            content_sha256: None,
+            version: 0,
+            created_at: NaiveDate::from_ymd_opt(2026, 10, 23)
+                .expect("固定日期合法")
+                .and_hms_opt(9, 0, sec)
+                .expect("时分秒合法"),
+            created_by: Some(1),
+            updated_at: NaiveDate::from_ymd_opt(2026, 10, 23)
+                .expect("固定日期合法")
+                .and_hms_opt(9, 0, sec)
+                .expect("时分秒合法"),
+            updated_by: Some(1),
+            deleted_at: None,
+            paired_file_id: None,
+        }
+    }
+
+    /// ★ 守卫：批量入口取「每个 part 的**最新一张**」，同秒上传时按 `id` 定序。
+    ///
+    /// ⚠️ 少了 `id` 这个 tiebreaker，同一秒上传的两张图纸取哪张取决于 PG 的物理行序
+    /// ⇒ 同一个工单两份日报给出不同链接，而两边都不会报错。
+    #[test]
+    fn newest_drawing_wins_and_id_breaks_created_at_ties() {
+        let older = file_row(11, 1, "A00123.pdf", 10);
+        let newer = file_row(12, 1, "A00124.pdf", 20);
+        assert!(
+            PreviewService::is_newer(&newer, &older),
+            "更晚上传的那张必须胜出"
+        );
+        assert!(!PreviewService::is_newer(&older, &newer));
+
+        // 同一秒：`id` 更大者胜出（两条 SQL 的 ORDER BY 都按 id 兜底排序）。
+        let tie_low = file_row(21, 2, "A00201.pdf", 30);
+        let tie_high = file_row(22, 2, "A00202.pdf", 30);
+        assert!(PreviewService::is_newer(&tie_high, &tie_low));
+        assert!(!PreviewService::is_newer(&tie_low, &tie_high));
+    }
+
+    /// ⚠️⚠️ 安全守卫：批量入口给出的直链**只有** `<prefix>/<seed>/p1.jpg`，
+    /// **绝不带文件名**（图号可枚举而 `previews/` 是 public-read）。
+    ///
+    /// 同时钉住「只给第 1 页」这条形态决定：多页图纸在日报里只有一个链接位。
+    #[test]
+    fn batch_link_path_is_prefix_seed_and_first_page_only() {
+        let f = file_row(31, 1, "A00123_rev2.pdf", 10);
+        let seed = PreviewService::preview_seed(&f);
+        let urls = UrlParams {
+            prefix: "previews",
+            base_url: "https://cos.example.com/",
+            image_params: "eo-img.resize=l/2560",
+        };
+        let link = urls
+            .first_page(&seed, 7)
+            .expect("page_count > 0 必有第 1 页");
+
+        assert_eq!(
+            link,
+            format!("https://cos.example.com/previews/{seed}/p1.jpg?eo-img.resize=l/2560")
+        );
+        assert!(!link.contains("A00123"), "★ 图号绝不能进路径：{link}");
+        assert!(!link.contains("rev2"), "★ 版本号绝不能进路径：{link}");
+        assert!(
+            !link.contains(&f.object_key),
+            "★ object_key 绝不能进路径：{link}"
+        );
+        assert!(
+            !link.contains("p2") && !link.contains("p7"),
+            "★ 只给第 1 页（形态决定），不得夹带其它页：{link}"
+        );
+        // 种子恒 32 位 hex ⇒ 路径成分长度固定，图号拼不进去。
+        assert_eq!(seed.len(), PREVIEW_SEED_HEX_LEN);
+    }
+
+    /// `page_count <= 0` ⇒ **不给链接**（而不是给一条点不动的空串）。
+    ///
+    /// ⚠️ 空串会被调用方当成合法链接塞进 markdown，渲染出一个看起来能点、实际什么都不
+    /// 是的链接 —— 那比「没有链接」更难被发现。
+    #[test]
+    fn zero_page_row_yields_no_link() {
+        let urls = UrlParams {
+            prefix: "previews",
+            base_url: "https://cos.example.com",
+            image_params: "",
+        };
+        assert!(urls.first_page("deadbeef", 0).is_none());
+        assert!(urls.first_page("deadbeef", -1).is_none());
     }
 
     // ---------------------------------------------------------------

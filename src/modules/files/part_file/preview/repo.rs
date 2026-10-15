@@ -68,6 +68,7 @@ use crate::modules::files::part_file::preview::model::TFilePreview;
 /// 都当场红。散文里出现的方法个数一律引用 [`ALL_METHODS`].len()，不要手写。
 pub const ALL_METHODS: &[&str] = &[
     "find_by_seed",
+    "find_by_seeds",
     "insert_pending",
     "mark_submitted",
     "mark_ready",
@@ -143,6 +144,54 @@ impl PreviewRepo {
             r.preview_seed = r.preview_seed.trim_end().to_string();
         }
         Ok(row)
+    }
+
+    /// 按 `preview_seed` **批量**取预览任务（软删闸门）。
+    ///
+    /// 返回 `seed → 行`。未命中的 seed **不在结果里**（调用方据此走「首次登记」分支
+    /// 或「本次不挂链接」分支）。
+    ///
+    /// ## 为什么要有它（而不是让调用方按 seed 逐个 `find_by_seed`）
+    ///
+    /// 批量入口（`PreviewService::ensure_ready_for_parts`）一次要给几十份图纸出链接；
+    /// 逐个查会让语句数随 part 数线性涨，而这个域的成本不是 CPU 是**钱**（每次推进都
+    /// 可能提交一个按页计费的 CI job）⇒ 语句数必须与 part 数无关。
+    ///
+    /// ## ⚠️ 空集合**不发 SQL**（省一条语句）
+    ///
+    /// `preview_seed = ANY('{}')` 本来就恒空，但「空集不发」是这个域的通用纪律
+    /// （见 `find_by_seed` 之外的批量族）。
+    ///
+    /// ## ⚠️ 与 `find_by_seed` 同一份「`char(64)` 空白填充」修法
+    ///
+    /// 本方法**同样在此处统一 `trim_end()`**，与 `find_by_seed` 逐字同款 —— 新增读路径
+    /// 时**必须**走这两个方法之一，不要自己写 SQL 读 `preview_seed`。
+    pub async fn find_by_seeds<'e, E>(
+        executor: E,
+        seeds: &[String],
+    ) -> Result<Vec<TFilePreview>, sqlx::Error>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
+        if seeds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut rows = sqlx::query_as!(
+            TFilePreview,
+            r#"
+            SELECT id, preview_seed, src_object_key, ci_job_id, state, page_count,
+                   error_message, next_poll_at
+            FROM public.t_file_preview
+            WHERE preview_seed = ANY($1) AND deleted_at IS NULL
+            "#,
+            seeds,
+        )
+        .fetch_all(executor)
+        .await?;
+        for r in rows.iter_mut() {
+            r.preview_seed = r.preview_seed.trim_end().to_string();
+        }
+        Ok(rows)
     }
 
     /// 首次登记一条 `PENDING` 任务，**`ON CONFLICT DO NOTHING`**。
