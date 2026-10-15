@@ -7,19 +7,24 @@
 //!
 //! ## ⚠️ 四条硬约束（改 SQL 前逐条读）
 //!
-//! 1. **`today` 是形参，SQL 里绝不写 `CURRENT_DATE`**：DB 会话时区（测试容器 UTC）
-//!    与 `infra::clock::now_naive()` 的 Asia/Shanghai 是**两个时钟**，Shanghai
-//!    00:00–08:00 期间 `CURRENT_DATE == today - 1`，于是「今天」的三个窗口整体
-//!    偏移一天，且**不报任何错**。
-//! 2. **窗口是半开 `[today, today+N)`**；「3 日内交期」**含今天**（今天到期最该被
-//!    看见，`days = 3` 即 `[today, today+3)` 共 3 天）。写 `<= today + N` 会让
-//!    「3 日内」变成 4 天。
+//! 1. **统计窗口是形参 `(from_ts, to_ts)`，SQL 里绝不写 `CURRENT_DATE`**：DB 会话
+//!    时区（测试容器 UTC）与 `infra::clock::now_naive()` 的 Asia/Shanghai 是**两个
+//!    时钟**，Shanghai 00:00–08:00 期间 `CURRENT_DATE == today - 1`，于是「本期」的
+//!    窗口整体偏移一天，且**不报任何错**。窗口两端由 `dto::report_window` 从配置
+//!    算出（**前一天 @ 推送时刻 ~ 当天 @ 推送时刻**）⇒ 跨天，而 `date + INTERVAL`
+//!    那种「按日历日切」的做法在这里根本不成立（推送时刻可能落在 20:05，窗口上界
+//!    就不在当天零点）。
+//! 2. **窗口是半开 `[from_ts, to_ts)`**；第三节的「N 日内交期」按**日历日**半开
+//!    `[today, today+N)`（**含今天**：今天到期最该被看见，`days = 3` 即共 3 天），
+//!    写 `<= today + N` 会让「3 日内」变成 4 天。⚠️ 第一节 / 第二节 / 第四节走**时间
+//!    戳**窗口（硬约束 1），第三节走**日期**窗口（交期列本身就是 `date`）——两套窗口
+//!    不要互串。
 //! 3. **出货查询不写 status 谓词**：流转是 `DRAFT → SUBMITTED → PICKED_UP →
 //!    ARCHIVED`（`com/delivery_note/model.rs`），`picked_up_at` 只在 `PICKED_UP`
 //!    迁移时被设置且此后**不清空** ⇒ 写死 `status = 'PICKED_UP'` 会**漏掉已归档的
-//!    单**（而已归档的单才是真正「今天出了货」的那些）。
+//!    单**（而已归档的单才是真正「出了货」的那些）。
 //! 4. **`SUM(quantity)` 必须 `COALESCE(…, 0)`**：全 NULL 时 PG 返回 NULL 而不是 0，
-//!    而「全 NULL」就是「今天没有任何一条报工事件」——日报最常见的形态。
+//!    而「全 NULL」就是「本期没有任何一条报工事件」——日报最常见的形态。
 //!
 //! ## 域隔离：**零他域符号引用**
 //!
@@ -53,30 +58,48 @@ use crate::shared::delivery_status::delivery_statuses_vec;
 // 第一节：全厂报工总览
 // ============================================================================
 
-/// 第一节的四个数字（**一条语句四个条件聚合**）。
+/// 第一节的五个数字（**一条语句五个条件聚合**）。
 #[derive(Debug, Clone, Copy, sqlx::FromRow)]
 pub struct OverviewEvents {
     /// 报工**批次数** = `COUNT(DISTINCT batch_id)`。
     pub batch_count: i64,
     /// 送检 + 放回的**件数** = `COALESCE(SUM(quantity), 0)`。
     pub quantity: i64,
-    /// 今日完工单数（`COMPLETED` 且 `batch_id IS NULL` ⇒ 工单级事件）。
+    /// 完工单数（`COMPLETED` 且 `batch_id IS NULL` ⇒ 工单级事件）。
+    ///
+    /// ⚠️ **不进正文**（第一节正文只有报工 / 送检 / 在制三组数字），但仍**保留在出参**
+    /// 里：`/preview` 的结构化数字是管理员核对口径的入口，删掉它等于让「今天完工了几单」
+    /// 在系统里彻底无处可查。
     pub completed: i64,
-    /// 今日返修单数（`REPAIR_STARTED`，distinct part_id）。
-    pub repair: i64,
+    /// 工人主动送检的**批次数** = `COUNT(DISTINCT batch_id)`（事件集只有
+    /// `SENT_TO_INSPECTION`）。
+    pub sent: i64,
+    /// 当前在制工单数（**当前快照、不受窗口约束**）。
+    ///
+    /// ⚠️ **它只看派生列 `t_part.status = 'IN_PROCESS'`**，且这与统计页
+    /// `statistics::repo::count_in_process_at` 的口径**刻意不同**：统计页那条额外带
+    /// 一道 `NOT EXISTS（件级 `COMPLETED` / `CANCELLED` 事件）`守卫，用来抵消
+    /// 「历史脏数据里 `t_part.status` 忘了翻」的偏差；本域不加那道守卫 ⇒ 两页可能
+    /// 对不上，差的就是那些「派生列忘了翻」的脏行。
+    ///
+    /// 为什么选派生列：日报要的是「**此刻**手上还有多少活」，那是**当前快照**而不是
+    /// 本期统计量；判定就该与大屏等其它页面用同一个列 —— 同一个列才不会在三个页面
+    /// 给出三个数。代价是 `t_part.status` 是 min-progress **派生缓存**、存在滞后
+    /// 窗口（刚完工的件在派生列翻过来之前仍算在制）。
+    pub wip: i64,
 }
 
-/// 第一节的四个条件聚合（一条语句）。
+/// 第一节的五个数字（一条语句）。
 ///
 /// ## 报工 = **送检 + 放回**，不是「领取」
 ///
 /// 事件集 `event_type IN ('RETURNED_TO_SHELF', 'SENT_TO_INSPECTION')`。
 /// ⚠️ **刻意不含 `PICKED_UP`**：那是「从货架**领取**」—— 工人把件拿走的那一刻，
-/// 工序**还没开始**。日报问的是「今天干了多少活」，答领取数等于把「拿起来」当成
+/// 工序**还没开始**。日报问的是「本期干了多少活」，答领取数等于把「拿起来」当成
 /// 「做完了」。同一条判据在 `statistics` 域的「有效工时」维度上是**逐字同源**的
 /// （`RETURNED_TO_SHELF` + `SENT_TO_INSPECTION`，理由见其 SQL 常量的 doc）。
 ///
-/// ## ⚠️ **四条口径的理由，逐条都要读完再改**
+/// ## ⚠️ **五条口径的理由，逐条都要读完再改**
 ///
 /// 1. **`COUNT(DISTINCT batch_id)`（批次数）忽略 NULL** ⇒ 件级事件（`batch_id IS
 ///    NULL`）不计入。这正是「报工批次数」的正解：同一批次分两次放回会折叠成 1 批
@@ -85,23 +108,29 @@ pub struct OverviewEvents {
 ///    `statistics` 域没有（它算的是工时 / 领取数），`wx` 域有一个近似但事件集是
 ///    `PICKED_UP + RETURNED_TO_SHELF` **且排除 `SENT_TO_INSPECTION`**（那边是为了
 ///    算「经手件数」去重），口径不同、不能用。
-/// 3. **`completed` / `repair` 走同一条语句 ⇒ 受同一条 `JOIN t_worker` 影响**
-///    （见下条），这是与 `statistics::repo::count_completed` / `count_repair_parts`
-///    的**刻意差异**，登记在 `docs/api/wecom-daily.md` §8.3 第 3 条。
-/// 4. **`JOIN t_worker w ON w.id = e.worker_id` 是 INNER**（照 `statistics` 的
+/// 3. **`sent` 与 `batch_count` 的差别只在事件集**：一个只看 `SENT_TO_INSPECTION`
+///    （工人**主动送检**，即「这一批做完了、交给品检了」），另一个是送检 + 放回
+///    （放回货架是「做完了但先归架」，不进品检队列）。⚠️ **同样按 `COUNT(DISTINCT
+///    batch_id)` 去重**：同一批次送检两次只算 1 批，否则「送检 3 批」在只送过 2 批的
+///    现场会变成一个追责用的假数字。
+/// 4. **`wip` 只看派生列 `t_part.status`**，见 [`OverviewEvents::wip`] 的口径说明
+///    （它带滞后窗口，是这五个数里**唯一**与其它四条不同源的一个）。
+/// 5. **`JOIN t_worker w ON w.id = e.worker_id` 是 INNER**（照 `statistics` 的
 ///    「有效工时」维度同款）：`worker_id` 指向一个已消失的工人时，那条事件不该进
 ///    任何工人维度的统计。
 ///    ⚠️ **连带的已知后果**：`worker_id` 在 2026-10-12 之前**从未被写入过**
 ///    （`shared/part_event/mod.rs` + 迁移 `20261011120000`），故该日期之前的
-///    历史事件既进不了 `completed` / `repair`（INNER JOIN 落空），`quantity` /
-///    `batch_count` 也是 0。**这不是 bug**，是数据事实，登记在
+///    历史事件既进不了 `completed`（INNER JOIN 落空），`quantity` /
+///    `batch_count` / `sent` 也是 0。**这不是 bug**，是数据事实，登记在
 ///    `docs/api/wecom-daily.md` §4「`worker_id` 的历史空洞」。
+///    ⚠️ `wip` **不受**这条影响（它根本不 join 工人表）。
 ///
 /// ## 窗口
-/// 半开 `[today, today+1)`（硬约束 1 + 2）。
+/// 半开 `[from_ts, to_ts)`（硬约束 1 + 2），两端由 `dto::report_window` 算出。
 pub async fn overview_events(
     conn: &mut PgConnection,
-    today: NaiveDate,
+    from_ts: NaiveDateTime,
+    to_ts: NaiveDateTime,
 ) -> Result<OverviewEvents, sqlx::Error> {
     sqlx::query_as!(
         OverviewEvents,
@@ -117,96 +146,76 @@ pub async fn overview_events(
                 WHEN e.event_type = 'COMPLETED' AND e.batch_id IS NULL
                 THEN e.part_id END)::bigint AS "completed!",
             COUNT(DISTINCT CASE
-                WHEN e.event_type = 'REPAIR_STARTED'
-                THEN e.part_id END)::bigint AS "repair!"
+                WHEN e.event_type = 'SENT_TO_INSPECTION'
+                THEN e.batch_id END)::bigint AS "sent!",
+            (SELECT COUNT(*) FROM t_part p
+              WHERE p.deleted_at IS NULL AND p.status = 'IN_PROCESS')::bigint AS "wip!"
         FROM t_part_event e
         JOIN t_worker w ON w.id = e.worker_id
-        WHERE e.created_at >= $1::date::timestamp
-          AND e.created_at < ($1::date + INTERVAL '1 day')::timestamp
+        WHERE e.created_at >= $1
+          AND e.created_at < $2
         "#,
-        today,
+        from_ts,
+        to_ts,
     )
     .fetch_one(&mut *conn)
     .await
 }
 
-/// 「当前在制」工单数（**当前快照、非日窗**）。
-///
-/// ## 二选一：照抄 `statistics` 的那条（含 `NOT EXISTS`）
-///
-/// `statistics::repo::count_in_process_at` 多一个 `NOT EXISTS（件级 COMPLETED /
-///
-/// CANCELLED 事件）` 子查询来抵消「历史脏数据里 `t_part.status` 忘了翻」的偏差。
-/// 照抄它 ⇒ 本域这个数字能与统计页**逐个对账**；不抄 ⇒ 少一次全表扫，但遇到脏数据
-/// 会与统计页不一致。**选「照抄」**：日报的首要属性是可对账，而那一次子查询的代价是
-/// 一个 `t_part_event` 上的索引扫描（`e.part_id` 有索引），在日报这个日频场景下可忽略。
-pub async fn in_process_count(conn: &mut PgConnection) -> Result<i64, sqlx::Error> {
-    let row = sqlx::query(
-        "SELECT COUNT(*)::bigint AS cnt \
-         FROM t_part p \
-         WHERE p.deleted_at IS NULL \
-           AND p.status NOT IN ('COMPLETED', 'CANCELLED') \
-           AND NOT EXISTS ( \
-             SELECT 1 FROM t_part_event e \
-             WHERE e.part_id = p.id \
-               AND e.batch_id IS NULL \
-               AND e.event_type IN ('COMPLETED', 'CANCELLED') \
-           )",
-    )
-    .fetch_one(&mut *conn)
-    .await?;
-    Ok(row.get::<i64, _>("cnt"))
-}
-
 // ============================================================================
-// 第二节：今日出货
+// 第二节：本期出货
 // ============================================================================
 
-/// 第二节的两个数字（一条语句两个聚合）。
+/// 第二节的**唯一**数字（本期的出货单数）。
 #[derive(Debug, Clone, Copy, sqlx::FromRow)]
 pub struct DeliveryNoteSummary {
-    /// 今日已取货的送货单数。
-    pub note_count: i64,
-    /// 那些单名下的**未删批次数**之和（= 前端送货单详情页那个 `part_count`）。
+    /// 本期出货的**工单数** = `COUNT(DISTINCT b.part_id)`。
+    ///
+    /// ⚠️ **按 `part_id` 去重**：同一张送货单里同一工单挂了多个批次（一次送货装走
+    /// 同一工单的两个批次），日报问的是「今天出了几**单**货」，按批次计会把一张单
+    /// 报成两单，管理员按这个数字去核单会对不上。
     pub part_count: i64,
 }
 
-/// 今日出货：单数 + 件数（**一条语句两个聚合**）。
+/// 本期出货的工单数（**一条语句**）。
 ///
-/// ## 为什么必须 `LEFT JOIN LATERAL` 而不能逐单查
+/// ## 为什么是 JOIN + `COUNT(DISTINCT)` 而不是逐单数
 ///
-/// ⚠️ **`part_count` 不是 `t_delivery_note` 的列**：送货单详情页那个 `part_count` 的
-/// 口径是「该单名下**未软删批次**的条数」（照 `com/delivery_note/service/inner.rs`
-/// 的 `PartBatchRepo::list_by_delivery_note`）⇒ 必须去 `t_part_batch` 数。
-/// 逐单循环查是**功能完全正确**的改法，但出货单量随业务涨而语句数线性涨 ⇒
-/// `LATERAL` 把「每单数一次」压进**同一条语句**。
+/// ⚠️ **工单不是送货单的列**：要数的对象是「本期被取走的送货单名下有哪几个工单」，
+/// 而工单挂在 `t_part_batch.delivery_note_id` 上 ⇒ 必须经 `t_part_batch` 才能拿到
+/// `part_id`。逐单循环查是**功能完全正确**的改法，但出货单量随业务涨而语句数线性
+/// 涨 ⇒ 一条 JOIN + `COUNT(DISTINCT b.part_id)` 把整件事压成**恒 O(1)** 条语句。
+/// ⚠️ `COUNT(DISTINCT …)` 同时兜住了「同一工单在同一张单里多批次」与「同一工单
+/// 被两张单先后取走」两种重复。
+///
+/// ## 软删闸门
+///
+/// `t_part_batch.deleted_at IS NULL`：被软删的批次不算出货（与送货单详情页
+/// `PartBatchRepo::list_by_delivery_note` 的口径同源）。
 ///
 /// ## 硬约束 3：**不写 status 谓词**
 ///
 /// `picked_up_at` 只在 `PICKED_UP` 迁移时被设置且此后不清空，而单子随后会流转到
 /// `ARCHIVED` ⇒ 写死 `status = 'PICKED_UP'` 会漏掉**已归档的单**，而那些恰恰是
-/// 「今天真正出了货」的单。
+/// 「真正出了货」的单。
 pub async fn delivery_note_summary(
     conn: &mut PgConnection,
-    today: NaiveDate,
+    from_ts: NaiveDateTime,
+    to_ts: NaiveDateTime,
 ) -> Result<DeliveryNoteSummary, sqlx::Error> {
     sqlx::query_as!(
         DeliveryNoteSummary,
         r#"
-        SELECT
-            COUNT(*)::bigint AS "note_count!",
-            COALESCE(SUM(pc.part_count), 0)::bigint AS "part_count!"
+        SELECT COUNT(DISTINCT b.part_id)::bigint AS "part_count!"
         FROM t_delivery_note n
-        LEFT JOIN LATERAL (
-            SELECT COUNT(*)::bigint AS part_count
-            FROM t_part_batch b
-            WHERE b.delivery_note_id = n.id AND b.deleted_at IS NULL
-        ) pc ON TRUE
+        JOIN t_part_batch b
+          ON b.delivery_note_id = n.id AND b.deleted_at IS NULL
         WHERE n.deleted_at IS NULL
-          AND n.picked_up_at >= $1::date::timestamp
-          AND n.picked_up_at < ($1::date + INTERVAL '1 day')::timestamp
+          AND n.picked_up_at >= $1
+          AND n.picked_up_at < $2
         "#,
-        today,
+        from_ts,
+        to_ts,
     )
     .fetch_one(&mut *conn)
     .await
@@ -311,7 +320,7 @@ pub async fn count_upcoming(
 }
 
 // ============================================================================
-// 第四节：工人今日报工（条形图的数据源）
+// 第四节：工人本期报工（条形图的数据源）
 // ============================================================================
 
 /// 第四节的工人行（**一个 `GROUP BY` 一次拉回**，一个工人一条）。
@@ -335,17 +344,18 @@ pub struct WorkerRowRaw {
 /// ## 为什么 `HAVING` 挡掉全零工人
 ///
 /// 统计页会为零报工工人**补零行**（那一页要的是「谁今天没干活」），日报只画条形图 ——
-/// 让零值行进来等于把条形图灌满空条，而日报**只**服务于「今天干了多少」这个问题。
+/// 让零值行进来等于把条形图灌满空条，而日报**只**服务于「本期干了多少」这个问题。
 ///
 /// ## `t_worker` 软删闸门
 ///
 /// ⚠️ 这里带 `w.deleted_at IS NULL` 而第一节的 `JOIN t_worker` **不带** ⇒ 两条
-/// SQL 在「工人被软删且当天有事件」时**会不一致**（第一节算进去、这里不算）。
+/// SQL 在「工人被软删且本期有事件」时**会不一致**（第一节算进去、这里不算）。
 /// 处置：如实登记在 `docs/api/wecom-daily.md` §8.3 第 4 条 + `service.rs` 的一致性
 /// 校验注释，不偷偷对齐（对齐哪一侧都会让另一侧与它的源域脱节）。
 pub async fn worker_rows(
     conn: &mut PgConnection,
-    today: NaiveDate,
+    from_ts: NaiveDateTime,
+    to_ts: NaiveDateTime,
 ) -> Result<Vec<WorkerBarRow>, sqlx::Error> {
     let rows = sqlx::query_as!(
         WorkerRowRaw,
@@ -358,12 +368,13 @@ pub async fn worker_rows(
         FROM t_part_event e
         JOIN t_worker w ON w.id = e.worker_id AND w.deleted_at IS NULL
         WHERE e.event_type IN ('RETURNED_TO_SHELF', 'SENT_TO_INSPECTION')
-          AND e.created_at >= $1::date::timestamp
-          AND e.created_at < ($1::date + INTERVAL '1 day')::timestamp
+          AND e.created_at >= $1
+          AND e.created_at < $2
         GROUP BY e.worker_id, w.name, w.badge_code
         HAVING COUNT(DISTINCT e.batch_id) > 0 OR COALESCE(SUM(e.quantity), 0) > 0
         "#,
-        today,
+        from_ts,
+        to_ts,
     )
     .fetch_all(&mut *conn)
     .await?;

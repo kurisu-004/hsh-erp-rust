@@ -46,7 +46,7 @@
 //! | 装填结果片数 > `max_chunks` | `21804`，文案给出两个可行动方向 |
 //! | `max_chunks > 20` | **保存配置时**即拒 `21804`（企业微信官方限频 20 条/分钟） |
 
-use chrono::NaiveDate;
+use chrono::{NaiveDate, NaiveDateTime};
 
 use crate::modules::wecom_daily::dto::{
     NormalizedConfig, SECTION_DELIVERY, SECTION_ORDERS, SECTION_OVERVIEW, SECTION_WORKERS,
@@ -82,10 +82,13 @@ const BAR_EMPTY: char = '░';
 pub struct ReportRows {
     pub overview_batch_count: i32,
     pub overview_quantity: i32,
+    /// 完工单数（**不进正文**，见 `PreviewOut.completed_count` 的注释）。
     pub completed_count: i32,
+    /// 工人主动送检的批次数（第一节正文第二行的「送检 x 批」）。
+    pub sent_batch_count: i32,
+    /// 当前在制单数（第一节正文第二行的「在制 y 单」，口径见 `repo::OverviewEvents::wip`）。
     pub in_process_count: i32,
-    pub repair_part_count: i32,
-    pub note_count: i32,
+    /// 第二节**唯一**的数字：本期出货的工单数（= `COUNT(DISTINCT part_id)`）。
     pub note_part_count: i32,
     pub overdue_count: i32,
     pub upcoming_count: i32,
@@ -111,7 +114,14 @@ pub fn worker_quantity_total(rows: &[WorkerBarRow]) -> i32 {
 pub struct RenderInput<'a> {
     pub cfg: &'a NormalizedConfig,
     pub rows: &'a ReportRows,
+    /// 统计基准日（= 发送当日）—— 标题模板的 `{date}` 用它。
     pub today: NaiveDate,
+    /// 统计窗口 `(from_ts, to_ts)`，由 `dto::report_window` 算出（**跨天**）。
+    ///
+    /// ⚠️ 它同时进**标题块**的「统计区间」那一行：窗口一跨天，「今日 00:00 ~ 今日
+    /// 23:59」这种按日历日写死的说法就**必然是假的**（窗口头一天），而读者唯一能核对
+    /// 的就是这一行 —— 它错了，整份日报的可信度就没了。
+    pub window: (NaiveDateTime, NaiveDateTime),
 }
 
 /// [`render`] 的出参。
@@ -138,7 +148,7 @@ pub enum BlockKind {
     Title,
     /// 第一节：全厂报工总览。
     Overview,
-    /// 第二节：今日出货。
+    /// 第二节：本期出货。
     Delivery,
     /// 第三节：逾期未交 / N 日内交期。
     Orders,
@@ -156,7 +166,7 @@ impl BlockKind {
         match self {
             Self::Title => "标题",
             Self::Overview => "第一节（全厂报工总览）",
-            Self::Delivery => "第二节（今日出货）",
+            Self::Delivery => "第二节（本期出货）",
             Self::Orders => "第三节（逾期未交 / 交期工单）",
             Self::WorkersHead | Self::WorkerRow | Self::Footer => "第四节（工人报工条形图）",
         }
@@ -221,6 +231,10 @@ pub fn render(input: &RenderInput) -> Result<Rendered, AppError> {
 /// `{date}` / `{batch_count}` / `{quantity}` / `{note_count}` / `{overdue_count}`。
 /// 照 `mail_digest` 的既有口径：未知占位符原样保留（管理员能一眼看出自己写错了什么）
 /// 比静默吞掉好；**没有别的**内置占位符可换。
+///
+/// ⚠️ **`{note_count}` 现在喂的是第二节的**唯一**数字**（本期出货的工单数）：第二节
+/// 改口径后不再统计「送货单张数」，但**占位符名保留**——存量模板里已经写着
+/// `{note_count}`，删掉这个替换会让它在标题里变成一串没人解释的 `{note_count}`。
 fn render_subject(cfg: &NormalizedConfig, rows: &ReportRows, today: NaiveDate) -> String {
     let tpl = cfg
         .subject_template
@@ -230,7 +244,7 @@ fn render_subject(cfg: &NormalizedConfig, rows: &ReportRows, today: NaiveDate) -
     tpl.replace("{date}", &today.format("%Y-%m-%d").to_string())
         .replace("{batch_count}", &rows.overview_batch_count.to_string())
         .replace("{quantity}", &rows.overview_quantity.to_string())
-        .replace("{note_count}", &rows.note_count.to_string())
+        .replace("{note_count}", &rows.note_part_count.to_string())
         .replace("{overdue_count}", &rows.overdue_count.to_string())
 }
 
@@ -241,7 +255,7 @@ pub const DEFAULT_SUBJECT_TEMPLATE: &str = "# 生产日报 · {date}";
 fn build_blocks(input: &RenderInput, subject: &str) -> Vec<Block> {
     let cfg = input.cfg;
     let rows = input.rows;
-    let today = input.today;
+    let (from_ts, to_ts) = input.window;
 
     let mut out: Vec<Block> = Vec::new();
 
@@ -249,9 +263,9 @@ fn build_blocks(input: &RenderInput, subject: &str) -> Vec<Block> {
     out.push(Block::new(
         BlockKind::Title,
         format!(
-            "{subject}\n\n> 统计区间 <font color=\"comment\">{} 00:00 ~ {} 23:59</font>",
-            today.format("%Y-%m-%d"),
-            today.format("%Y-%m-%d")
+            "{subject}\n\n> 统计区间 <font color=\"comment\">{} ~ {}</font>",
+            from_ts.format("%m-%d %H:%M"),
+            to_ts.format("%m-%d %H:%M")
         ),
     ));
 
@@ -260,14 +274,12 @@ fn build_blocks(input: &RenderInput, subject: &str) -> Vec<Block> {
             BlockKind::Overview,
             format!(
                 "## 一、全厂报工总览\n\
-                 > 报工批次 <font color=\"info\">{}</font> 批 · 送检放回 <font color=\"info\">{}</font> 件\n\
-                 > 今日完工 <font color=\"info\">{}</font> 单 · 当前在制 <font color=\"info\">{}</font> 单\n\
-                 > 今日返修 <font color=\"warning\">{}</font> 单",
+                 > 报工：<font color=\"info\">{}</font> 批  共 <font color=\"info\">{}</font> 件\n\
+                 > 送检 <font color=\"info\">{}</font> 批  在制 <font color=\"info\">{}</font> 单",
                 rows.overview_batch_count,
                 rows.overview_quantity,
-                rows.completed_count,
+                rows.sent_batch_count,
                 rows.in_process_count,
-                rows.repair_part_count,
             ),
         ));
     }
@@ -276,9 +288,9 @@ fn build_blocks(input: &RenderInput, subject: &str) -> Vec<Block> {
         out.push(Block::new(
             BlockKind::Delivery,
             format!(
-                "## 二、今日出货\n\
-                 > 已取货送货单 <font color=\"warning\">{}</font> 单 · 合计 <font color=\"info\">{}</font> 件",
-                rows.note_count, rows.note_part_count,
+                "## 二、本期出货\n\
+                 > 出货：<font color=\"info\">{}</font> 单",
+                rows.note_part_count,
             ),
         ));
     }
@@ -544,9 +556,8 @@ mod tests {
             overview_batch_count: 128,
             overview_quantity: 456,
             completed_count: 37,
+            sent_batch_count: 86,
             in_process_count: 92,
-            repair_part_count: 5,
-            note_count: 6,
             note_part_count: 214,
             overdue_count: 12,
             upcoming_count: 7,
@@ -561,11 +572,17 @@ mod tests {
         }
     }
 
+    /// 缺省配置下的统计窗口（锚点 = 缺省推送时刻 20:05，跨天）。
+    fn window() -> (NaiveDateTime, NaiveDateTime) {
+        crate::modules::wecom_daily::dto::report_window(&NormalizedConfig::default(), today())
+    }
+
     fn render_ok(cfg: &NormalizedConfig, rows: &ReportRows) -> Rendered {
         render(&RenderInput {
             cfg,
             rows,
             today: today(),
+            window: window(),
         })
         .expect("不该报 21804")
     }
@@ -668,6 +685,7 @@ mod tests {
             cfg: &cfg,
             rows: &rows,
             today: today(),
+            window: window(),
         })
         .expect_err("标题块超限必须报错");
         assert_eq!(err.code(), code::BIZ_WECOM_CONFIG_INVALID);
@@ -684,6 +702,7 @@ mod tests {
             cfg: &cfg,
             rows: &rows,
             today: today(),
+            window: window(),
         })
         .expect_err("超上限必须报错");
         assert_eq!(err.code(), code::BIZ_WECOM_CONFIG_INVALID);
@@ -701,8 +720,8 @@ mod tests {
     fn closed_section_is_not_rendered_at_all() {
         let rows = rows_with_workers(2);
         let cases: [(bool, &str, &str); 4] = [
-            (false, "一、全厂报工总览", "报工批次"),
-            (false, "二、今日出货", "已取货送货单"),
+            (false, "一、全厂报工总览", "报工："),
+            (false, "二、本期出货", "出货："),
             (false, "三、逾期未交", "逾期未交"),
             (false, "四、工人报工", "工人报工"),
         ];
@@ -720,6 +739,55 @@ mod tests {
             assert!(!all.contains(heading), "关掉的节不该出现标题 {heading}");
             assert!(!all.contains(needle), "关掉的节不该出现内容 {needle}");
         }
+    }
+
+    /// ★ 守卫 ⑯：第一节 / 第二节的**逐字正文**（口径一改，最容易悄悄漂的就是这两块）。
+    ///
+    /// ⚠️ 「全文不得再出现『今日』」这一条才是本用例的重点：窗口跨天之后（见
+    /// `dto::report_window`），任何留着「今日」的措辞都**必然是错的** —— 它会把昨天
+    /// 20:05 之后到今天 20:05 之前的那一段说成「今天」。
+    #[test]
+    fn overview_and_delivery_sections_render_the_agreed_wording() {
+        let rows = rows_with_workers(1);
+        let out = render_ok(&cfg_with(0, 20), &rows);
+        let all = out.chunks.join("\n");
+        assert!(all.contains("## 一、全厂报工总览"), "{all}");
+        assert!(
+            all.contains(
+                "> 报工：<font color=\"info\">128</font> 批  共 <font color=\"info\">456</font> 件"
+            ),
+            "{all}"
+        );
+        assert!(
+            all.contains(
+                "> 送检 <font color=\"info\">86</font> 批  在制 <font color=\"info\">92</font> 单"
+            ),
+            "{all}"
+        );
+        assert!(all.contains("## 二、本期出货"), "{all}");
+        assert!(
+            all.contains("> 出货：<font color=\"info\">214</font> 单"),
+            "{all}"
+        );
+        assert!(
+            !all.contains("今日"),
+            "窗口跨天，全文不该再出现「今日」措辞：{all}"
+        );
+    }
+
+    /// ★ 守卫 ⑰：标题块的「统计区间」是**真实的跨天窗口两端**，不是写死的日历日。
+    ///
+    /// 缺省锚点 20:05、`today() = 2026-10-18` ⇒ 窗口 `[10-17 20:05, 10-18 20:05)`。
+    /// ⚠️ 变异验证：把 `report_window` 改回「当天 00:00 ~ 当天 23:59」时本条立刻红。
+    #[test]
+    fn title_block_shows_the_real_cross_day_window() {
+        let rows = rows_with_workers(1);
+        let out = render_ok(&cfg_with(0, 20), &rows);
+        let all = out.chunks.join("\n");
+        assert!(
+            all.contains("> 统计区间 <font color=\"comment\">10-17 20:05 ~ 10-18 20:05</font>"),
+            "{all}"
+        );
     }
 
     /// ★ 守卫 ⑦：姓名按**显示宽度**对齐 ⇒ 条形起始列一致。
@@ -954,7 +1022,7 @@ mod tests {
     #[test]
     fn markdown_special_chars_are_not_swallowed() {
         let rows = ReportRows {
-            note_count: 1,
+            note_part_count: 1,
             overdue_count: 1,
             worker_rows: vec![WorkerBarRow {
                 worker_name: "A<B>C".into(),
@@ -1032,6 +1100,7 @@ mod tests {
             cfg: &cfg,
             rows: &rows,
             today: today(),
+            window: window(),
         })
         .expect_err("超长标题必须报错");
         assert!(err.to_string().contains("标题"));

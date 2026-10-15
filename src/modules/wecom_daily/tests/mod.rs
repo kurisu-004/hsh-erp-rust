@@ -109,7 +109,13 @@ fn default_config_is_the_meta_defaults_segment() {
     assert!(!d.enabled, "少发一条永远好过多发一条");
     assert_eq!(d.webhook_id, None, "默认不替用户选通道");
     assert_eq!(d.frequency, Frequency::Daily);
-    assert_eq!((d.send_hour, d.send_minute), (Some(8), Some(0)));
+    // ⚠️ 缺省推送时刻**同时**是统计窗口的锚点（`dto::report_window`）⇒ 20:05 不是
+    // 随手取的整数，改它会连带改掉报工 / 出货 / 工人榜三处的窗口上界。
+    assert_eq!(
+        (d.send_hour, d.send_minute),
+        (Some(20), Some(5)),
+        "缺省锚点 20:05 = 统计窗口的两端"
+    );
     assert_eq!(d.weekday, None);
     assert_eq!(d.day_of_month, None);
     assert_eq!(d.upcoming_days, 3);

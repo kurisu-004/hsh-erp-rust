@@ -68,7 +68,7 @@ use crate::modules::wecom_daily::dto::{
     ConfigDefaultsOut, ConfigOut, Frequency, LOGS_LIMIT_MAX, LogListOut, LogListQuery,
     MAX_CHUNKS_MAX, MAX_CHUNKS_MIN, NormalizedConfig, PreviewOut, PreviewRequest,
     SUBJECT_TEMPLATE_MAX_CHARS, SaveConfigRequest, SendResultOut, SendStatus, TriggerSource,
-    UPCOMING_DAYS_MAX, UPCOMING_DAYS_MIN, WORKER_TOP_N_MAX, WORKER_TOP_N_MIN,
+    UPCOMING_DAYS_MAX, UPCOMING_DAYS_MIN, WORKER_TOP_N_MAX, WORKER_TOP_N_MIN, report_window,
 };
 use crate::modules::wecom_daily::model::{TWeComDailyConfigRow, TWeComDailyLogRow};
 use crate::modules::wecom_daily::repo::{self, NewDailyLog};
@@ -617,11 +617,13 @@ pub async fn preview(
     // 关错了还是后端坏了。
     validate_sections(&cfg)?;
     let today = now_naive().date();
-    let rows = fetch_rows(conn, &cfg, today).await?;
+    let window = report_window(&cfg, today);
+    let rows = fetch_rows(conn, &cfg, window.0, window.1).await?;
     let rendered = template::render(&RenderInput {
         cfg: &cfg,
         rows: &rows,
         today,
+        window,
     })?;
     let chunk_count = rendered.chunks.len() as i32;
     Ok(PreviewOut {
@@ -632,8 +634,9 @@ pub async fn preview(
         overview_quantity: rows.overview_quantity,
         completed_count: rows.completed_count,
         in_process_count: rows.in_process_count,
-        repair_part_count: rows.repair_part_count,
-        note_count: rows.note_count,
+        // ⚠️ 第二节改单值口径后不再统计「送货单张数」⇒ `note_count` 恒 0（列保留是
+        // 为了不动流水表结构与前端 `.strict()` 契约）。它不是「今天没出货」。
+        note_count: 0,
         note_part_count: rows.note_part_count,
         overdue_count: rows.overdue_count,
         upcoming_count: rows.upcoming_count,
@@ -797,49 +800,57 @@ async fn log_prepare_failure(state: &Arc<AppState>, err: &AppError) {
 
 /// 按节开关取数（**关掉的节一条 SQL 都不发**）。
 ///
-/// ## 不变量：**恒 ≤ 6 条语句，与工单数 / 送货单数 / 工人数无关**
+/// ## 不变量：**语句数与返回行数无关（O(1)）**
 ///
-/// 上界来自下面**恰好 6 个** `repo::` 调用点：第一节 2 条 + 第二节 1 条 + 第三节 2 条
-/// + 第四节 1 条。⇒ **四节全开（缺省）时恰好 6 条**，关掉一节就少一条。
+/// 每节都把整组聚合压进**一条**语句：第一节 1 条（报工 / 送检 / 在制在同一句里
+/// 五个聚合）、第二节 1 条、第三节各 1 条、第四节 1 个 `GROUP BY`。**本函数体
+/// 内没有任何循环** —— 工人榜的排序在下一句用 `sort_by` 做（内存操作）。
 ///
-/// **本函数体内没有任何循环** —— 工人榜的排序在下一句用 `sort_by` 做（内存操作）。
+/// ⚠️ **不钉死具体条数**：这类计数必然过期，而它守的那条东西（循环体内不许取数）
+/// 才是 O(1) 的真正来源。
 ///
 /// ## 护栏
-/// 「循环体内只许做内存操作、绝不调 `repo::`」由
-/// `tests/wecom_daily/n_plus_one_guard.rs` 的**源码级**护栏钉住（顶层恰好 6 个
-/// 调用点 + 循环体内禁 `repo::` / `sqlx::query`）。
+/// 「循环体内只许做内存操作、绝不调 `repo::` / `sqlx::query*`」由
+/// `tests/wecom_daily/n_plus_one_guard.rs` 的**源码级**护栏钉住。
 ///
 /// ⚠️ 逐节循环查是**功能完全正确、集成测试照样全绿**的写法（每条用例只造 2~3 行），
 /// 只有数据量涨上去时语句数才悄悄线性涨 —— 而日报恰好是「一天一次、量很大」的生产形态。
+///
+/// ## 窗口
+///
+/// `(from_ts, to_ts)` = **跨天**窗口（`dto::report_window` 算，理由见那处）。
+/// 第三节那两条交期查询仍吃**日历日** `today`（交期列本身是 `date`），这里由
+/// `to_ts.date()` 派生 —— 与窗口上界同一个值 ⇒ 「发送日」不会在一次推送里出现两个。
 async fn fetch_rows(
     conn: &mut PgConnection,
     cfg: &NormalizedConfig,
-    today: chrono::NaiveDate,
+    from_ts: NaiveDateTime,
+    to_ts: NaiveDateTime,
 ) -> Result<ReportRows, AppError> {
     let mut rows = ReportRows::default();
 
     if cfg.include_overview {
-        let ev = repo::overview_events(conn, today).await?;
+        let ev = repo::overview_events(conn, from_ts, to_ts).await?;
         rows.overview_batch_count = ev.batch_count as i32;
         rows.overview_quantity = ev.quantity as i32;
         rows.completed_count = ev.completed as i32;
-        rows.repair_part_count = ev.repair as i32;
-        rows.in_process_count = repo::in_process_count(conn).await? as i32;
+        rows.sent_batch_count = ev.sent as i32;
+        rows.in_process_count = ev.wip as i32;
     }
 
     if cfg.include_delivery {
-        let d = repo::delivery_note_summary(conn, today).await?;
-        rows.note_count = d.note_count as i32;
+        let d = repo::delivery_note_summary(conn, from_ts, to_ts).await?;
         rows.note_part_count = d.part_count as i32;
     }
 
     if cfg.include_orders {
+        let today = to_ts.date();
         rows.overdue_count = repo::count_overdue(conn, today).await? as i32;
         rows.upcoming_count = repo::count_upcoming(conn, today, cfg.upcoming_days).await? as i32;
     }
 
     if cfg.include_workers {
-        rows.worker_rows = repo::worker_rows(conn, today).await?;
+        rows.worker_rows = repo::worker_rows(conn, from_ts, to_ts).await?;
         // ⚠️ 排序在**内存**里做（SQL 不认识「按配置选指标」这件事）。三条排序键
         // 逐条有理由：指标降序（条形图要「最多的排前面」）/ 姓名升序（同指标时的稳定
         // 次序，免得两次推送的行序随机跳）/ 工号升序（同名兜底，保证确定性）。
@@ -940,15 +951,18 @@ async fn deliver(
 
     let now = now_ts();
     let today = now.date();
-    // 借还 2/3：恒 ≤ 6 条 SQL（关掉的节一条都不发，见 `fetch_rows`）。
+    // 统计窗口（跨天）：两端都从**同一份配置**推出来，标题块与 SQL 共用它一个值。
+    let window = report_window(cfg, today);
+    // 借还 2/3：恒 O(1) 条 SQL（关掉的节一条都不发，见 `fetch_rows`）。
     let rows = {
         let mut conn = state.pool.acquire().await?;
-        fetch_rows(&mut conn, cfg, today).await?
+        fetch_rows(&mut conn, cfg, window.0, window.1).await?
     };
     let rendered = template::render(&RenderInput {
         cfg,
         rows: &rows,
         today,
+        window,
     })?;
     // ⚠️ 上面这一行返回 `Err(21804)` 时**不落流水**：没发出去，不是投递失败。
     // 前端 `/send` 失败后正是靠「有没有流水行」区分这两类。
@@ -988,7 +1002,9 @@ async fn deliver(
             chunk_sent: chunk_sent as i16,
             overview_batch_count: rows.overview_batch_count,
             overview_quantity: rows.overview_quantity,
-            note_count: rows.note_count,
+            // ⚠️ `note_count` 恒 0：第二节改单值口径后不再统计「送货单张数」，而流水
+            // 表那一列是 `NOT NULL`（理由见 `dto::SendResultOut::note_count`）。
+            note_count: 0,
             note_part_count: rows.note_part_count,
             overdue_count: rows.overdue_count,
             upcoming_count: rows.upcoming_count,

@@ -17,8 +17,9 @@ async fn empty_table_returns_full_defaults_with_zero_version_and_id() {
     assert_eq!(d["id"].as_str(), Some("0"), "表空时 id 恒为字符串 \"0\"");
     assert_eq!(d["enabled"].as_bool(), Some(false));
     assert_eq!(d["frequency"].as_str(), Some("DAILY"));
-    assert_eq!(d["send_hour"].as_i64(), Some(8));
-    assert_eq!(d["send_minute"].as_i64(), Some(0));
+    // ⚠️ 缺省推送时刻 = 缺省统计窗口锚点（`dto::report_window`）：20:05。
+    assert_eq!(d["send_hour"].as_i64(), Some(20));
+    assert_eq!(d["send_minute"].as_i64(), Some(5));
     assert!(d["weekday"].is_null());
     assert!(d["webhook_id"].is_null());
     assert_eq!(d["upcoming_days"].as_i64(), Some(3));

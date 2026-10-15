@@ -1,8 +1,12 @@
 //! 端点 3：`POST /preview`（渲染分片；**不发送、不落流水**）
 //!
-//! 覆盖：窗口半开含今天 / 交期窗口收缩 / 已交量守卫 / 节开关 / 分片（≥2 片、逐片
-//! ≤4096 字节、首行带「（i/N）」、`N==1` 无后缀）/ `worker_top_n` 脚注 /
-//! 超 `max_chunks` 返 `21804` / **绝不写流水行**。
+//! 覆盖：统计窗口半开且**跨天**（前一天 @ 锚点 ~ 当天 @ 锚点）/ 交期窗口收缩 /
+//! 已交量守卫 / 节开关 / 分片（≥2 片、逐片 ≤4096 字节、首行带「（i/N）」、`N==1`
+//! 无后缀）/ `worker_top_n` 脚注 / 超 `max_chunks` 返 `21804` / **绝不写流水行**。
+//!
+//! ⚠️ **所有「今天 xx:xx」的 fixture 都落在新窗口内**（缺省锚点 20:05 ⇒ 窗口是
+//! `[昨天 20:05, 今天 20:05)`）；要造窗口外的点必须用 `yesterday_at()` 且时刻**早于
+//! 20:05**，或今天 20:05 之后。
 
 use axum::http::StatusCode;
 use serde_json::{Value, json};
@@ -46,15 +50,15 @@ async fn preview_never_writes_log_row() {
     assert_eq!(count_logs(&ctx.pool).await, 0, "/preview 绝不落流水");
 }
 
-/// 空体 `{}` = 全用当前配置；出参是 **15 个字段**、**没有** `markdown` 单字段。
+/// 空体 `{}` = 全用当前配置；出参是 **14 个字段**、**没有** `markdown` 单字段。
 #[tokio::test]
-async fn preview_out_has_fifteen_fields_and_no_markdown_singular() {
+async fn preview_out_has_fourteen_fields_and_no_markdown_singular() {
     let ctx = bootstrap().await;
     let (status, env) = post_as_manager(&ctx, "/cron/wecom-daily/preview", json!({})).await;
     assert_eq!(status, StatusCode::OK, "{env}");
     let d = data(&env);
     let n = d.as_object().expect("data 是对象").len();
-    assert_eq!(n, 15, "PreviewOut 必须逐字 15 个字段：{d}");
+    assert_eq!(n, 14, "PreviewOut 必须逐字 14 个字段：{d}");
     assert!(
         d.get("markdown").is_none(),
         "契约里没有 `markdown` 单字段（只有 chunks）：{d}"
@@ -137,8 +141,13 @@ async fn report_event_set_is_returned_plus_sent_to_inspection() {
         "送件数 = 放回 2 + 送检 5（不含领取 9）"
     );
     let chunks = chunks_of(&env).join("\n");
-    assert!(chunks.contains("报工批次"));
-    assert!(chunks.contains("<font color=\"info\">2</font> 批"));
+    assert!(chunks.contains("报工："), "{chunks}");
+    assert!(
+        chunks.contains(
+            "> 报工：<font color=\"info\">2</font> 批  共 <font color=\"info\">7</font> 件"
+        ),
+        "{chunks}"
+    );
 }
 
 /// 同一批次分两次放回 ⇒ 折叠成 **1 批**（`COUNT(DISTINCT batch_id)` 的正解）。
@@ -174,45 +183,61 @@ async fn same_batch_returned_twice_counts_as_one_batch() {
     assert_eq!(data(&env)["overview_quantity"].as_i64(), Some(10));
 }
 
-/// 窗口半开 `[today, today+1)`：昨天的同型事件**不计入**，今天 00:00 与 23:59 都计入。
+/// 统计窗口是**跨天半开** `[昨天 20:05, 今天 20:05)`（缺省锚点 = 缺省推送时刻）。
+///
+/// 四个点各钉一侧边界：昨天 19:59 在外、**昨天 20:05 之后在内**（这条是跨天窗口
+/// 与旧日历日窗口的**唯一**差别：旧形态下昨天 23:59 是「昨天」的量）、今天 00:00 在内、
+/// 今天 20:05 之后在外（上界不含）。
 #[tokio::test]
-async fn today_window_is_half_open_and_includes_today() {
+async fn cross_day_window_is_half_open_around_the_anchor() {
     let ctx = bootstrap().await;
     let worker_id = insert_worker(&ctx.pool, "赵六").await;
     let part_id = insert_part(&ctx.pool, ctx.customer_id, "EV-3", "IN_PROCESS", None).await;
-    // 昨天 23:59 ⇒ 窗口外
-    let b_old = insert_batch(&ctx.pool, part_id, "IN_PROCESS").await;
+    // 昨天 19:59 ⇒ 窗口外（下界之前）
+    let b_before = insert_batch(&ctx.pool, part_id, "IN_PROCESS").await;
     insert_event(
         &ctx.pool,
         part_id,
         Some(worker_id),
         "RETURNED_TO_SHELF",
         Some(11),
-        Some(b_old),
+        Some(b_before),
+        yesterday_at(19),
+    )
+    .await;
+    // 昨天 23:59 ⇒ 窗口内（**跨天窗口的关键一条**）
+    let b_prev = insert_batch(&ctx.pool, part_id, "IN_PROCESS").await;
+    insert_event(
+        &ctx.pool,
+        part_id,
+        Some(worker_id),
+        "RETURNED_TO_SHELF",
+        Some(13),
+        Some(b_prev),
         yesterday_at(23),
     )
     .await;
-    // 今天 00:00 ⇒ 窗口内（下界闭合）
-    let b_lo = insert_batch(&ctx.pool, part_id, "IN_PROCESS").await;
+    // 今天 00:00 ⇒ 窗口内
+    let b_mid = insert_batch(&ctx.pool, part_id, "IN_PROCESS").await;
     insert_event(
         &ctx.pool,
         part_id,
         Some(worker_id),
         "RETURNED_TO_SHELF",
         Some(1),
-        Some(b_lo),
+        Some(b_mid),
         today_at(0, 0),
     )
     .await;
-    // 今天 23:59 ⇒ 窗口内（上界是次日 00:00，仍然闭合）
-    let b_hi = insert_batch(&ctx.pool, part_id, "IN_PROCESS").await;
+    // 今天 23:59 ⇒ 窗口外（上界不含）
+    let b_after = insert_batch(&ctx.pool, part_id, "IN_PROCESS").await;
     insert_event(
         &ctx.pool,
         part_id,
         Some(worker_id),
         "RETURNED_TO_SHELF",
         Some(1),
-        Some(b_hi),
+        Some(b_after),
         today_at(23, 59),
     )
     .await;
@@ -220,8 +245,9 @@ async fn today_window_is_half_open_and_includes_today() {
     let (_, env) = post_as_manager(&ctx, "/cron/wecom-daily/preview", json!({})).await;
     assert_eq!(
         data(&env)["overview_quantity"].as_i64(),
-        Some(2),
-        "昨天 23:59 的 11 件必须被半开窗口排除"
+        Some(14),
+        "窗口 = 昨天 20:05 起算：昨天 19:59 的 11 件与今天 23:59 的 1 件都在外，\
+         昨天 23:59 的 13 件 + 今天 00:00 的 1 件在内"
     );
 }
 
@@ -358,9 +384,9 @@ async fn upcoming_days_shrinks_the_window() {
     assert_eq!(n, 0, "预览的覆盖值绝不落库");
 }
 
-/// 第二节：只按 `picked_up_at` 判，**已归档的单也要算**（硬约束 3）。
+/// 第二节：只按 `picked_up_at` 判、**按工单去重**，**已归档的单也要算**（硬约束 3）。
 #[tokio::test]
-async fn delivery_section_counts_archived_notes_by_picked_up_at() {
+async fn delivery_section_counts_distinct_parts_by_picked_up_at() {
     let ctx = bootstrap().await;
     let part_id = insert_part(&ctx.pool, ctx.customer_id, "DN-P", "READY_TO_SHIP", None).await;
 
@@ -384,28 +410,32 @@ async fn delivery_section_counts_archived_notes_by_picked_up_at() {
     let p2 = insert_part(&ctx.pool, ctx.customer_id, "DN-P2", "READY_TO_SHIP", None).await;
     insert_batch_full(&ctx.pool, p2, "READY_TO_SHIP", Some(n2)).await;
     insert_batch_full(&ctx.pool, p2, "READY_TO_SHIP", Some(n2)).await;
-    // 昨天取货的单 ⇒ 窗口外
-    let _ = insert_delivery_note(
+    // 昨天**上班时间**取货的单 ⇒ 窗口外（窗口下界是昨天 20:05）
+    let n_old = insert_delivery_note(
         &ctx.pool,
         ctx.customer_id,
         "PICKED_UP",
         Some(yesterday_at(11)),
     )
     .await;
+    let p_old = insert_part(&ctx.pool, ctx.customer_id, "DN-OLD", "READY_TO_SHIP", None).await;
+    insert_batch_full(&ctx.pool, p_old, "READY_TO_SHIP", Some(n_old)).await;
     // 从没取货的单（DRAFT，picked_up_at 为 NULL）⇒ 不算
     let _ = insert_delivery_note(&ctx.pool, ctx.customer_id, "DRAFT", None).await;
 
     let (status, env) = post_as_manager(&ctx, "/cron/wecom-daily/preview", json!({})).await;
     assert_eq!(status, StatusCode::OK, "{env}");
+    // ⚠️ `note_count`（送货单张数）已下线、恒 0；第二节只有一个数字 = 出货工单数。
     assert_eq!(
         data(&env)["note_count"].as_i64(),
-        Some(2),
-        "已归档的单也要算（不写 status 谓词）"
+        Some(0),
+        "第二节改单值口径后不再统计送货单张数"
     );
     assert_eq!(
         data(&env)["note_part_count"].as_i64(),
-        Some(3),
-        "件数 = 那些单名下未删批次数之和"
+        Some(2),
+        "出货 2 单：已归档的单也算（不写 status 谓词），p2 的两个批次折叠成 1 单，\
+         昨天上班时间取货的单在窗口外"
     );
 }
 
@@ -429,14 +459,9 @@ async fn closed_sections_are_absent_from_every_chunk() {
             "include_overview",
             json!(false),
             "一、全厂报工总览",
-            "报工批次",
+            "报工：",
         ),
-        (
-            "include_delivery",
-            json!(false),
-            "二、今日出货",
-            "已取货送货单",
-        ),
+        ("include_delivery", json!(false), "二、本期出货", "出货："),
         ("include_orders", json!(false), "三、逾期未交", "逾期未交"),
         ("include_workers", json!(false), "四、工人报工", "工人报工"),
     ];
@@ -785,9 +810,9 @@ async fn clerk_cannot_preview() {
     assert_eq!(status, StatusCode::FORBIDDEN, "{env}");
 }
 
-/// 「今天完工 / 当前在制 / 今日返修」三个数字都出现在第一节。
+/// 第一节正文的三个口径：报工批数 / 送检批数（去重）/ 在制单数（`status='IN_PROCESS'`）。
 #[tokio::test]
-async fn overview_section_carries_all_five_numbers() {
+async fn overview_section_carries_batch_sent_and_wip_numbers() {
     let ctx = bootstrap().await;
     let w = insert_worker(&ctx.pool, "周九").await;
     let p_done = insert_part(&ctx.pool, ctx.customer_id, "CP-1", "COMPLETED", None).await;
@@ -801,32 +826,75 @@ async fn overview_section_carries_all_five_numbers() {
         today_at(9, 0),
     )
     .await;
-    let p_rep = insert_part(&ctx.pool, ctx.customer_id, "CP-2", "IN_PROCESS", None).await;
+    // 同一批次送检**两次** ⇒ 送检批数按 `COUNT(DISTINCT batch_id)` 折叠成 1。
+    let p_sent = insert_part(&ctx.pool, ctx.customer_id, "CP-2", "INSPECTION", None).await;
+    let b_sent = insert_batch(&ctx.pool, p_sent, "INSPECTION").await;
     insert_event(
         &ctx.pool,
-        p_rep,
+        p_sent,
+        Some(w),
+        "SENT_TO_INSPECTION",
+        Some(3),
+        Some(b_sent),
+        today_at(9, 1),
+    )
+    .await;
+    insert_event(
+        &ctx.pool,
+        p_sent,
+        Some(w),
+        "SENT_TO_INSPECTION",
+        Some(4),
+        Some(b_sent),
+        today_at(9, 2),
+    )
+    .await;
+    // 在制：`t_part.status = 'IN_PROCESS'`（**只**看派生列，不再有事件守卫）。
+    let wip = insert_part(&ctx.pool, ctx.customer_id, "IP-1", "IN_PROCESS", None).await;
+    insert_event(
+        &ctx.pool,
+        wip,
         Some(w),
         "REPAIR_STARTED",
         None,
         None,
-        today_at(9, 1),
+        today_at(9, 3),
     )
     .await;
-    // 在制：既没 COMPLETED 事件、状态又不在终态
-    let _ = insert_part(&ctx.pool, ctx.customer_id, "IP-1", "IN_PROCESS", None).await;
 
     let (status, env) = post_as_manager(&ctx, "/cron/wecom-daily/preview", json!({})).await;
     assert_eq!(status, StatusCode::OK, "{env}");
     assert_eq!(data(&env)["completed_count"].as_i64(), Some(1));
-    assert_eq!(data(&env)["repair_part_count"].as_i64(), Some(1));
-    assert!(
-        data(&env)["in_process_count"].as_i64().unwrap() >= 1,
-        "在制数至少包含 CP-2 与 IP-1"
+    assert_eq!(
+        data(&env)["overview_batch_count"].as_i64(),
+        Some(1),
+        "报工批数 = 送检+放回的 distinct batch（同批两次送检折叠成 1 批）"
+    );
+    assert_eq!(
+        data(&env)["overview_quantity"].as_i64(),
+        Some(7),
+        "报工件数 = 两次送检都算（3 + 4）"
+    );
+    assert_eq!(
+        data(&env)["in_process_count"].as_i64(),
+        Some(1),
+        "在制 = t_part.status='IN_PROCESS' 的工单（IP-1）；REPAIR_STARTED 不进这个数"
     );
     let all = chunks_of(&env).join("\n");
-    assert!(all.contains("今日完工"));
-    assert!(all.contains("当前在制"));
-    assert!(all.contains("今日返修"));
+    assert!(
+        all.contains(
+            "> 报工：<font color=\"info\">1</font> 批  共 <font color=\"info\">7</font> 件"
+        ),
+        "{all}"
+    );
+    assert!(
+        all.contains(
+            "> 送检 <font color=\"info\">1</font> 批  在制 <font color=\"info\">1</font> 单"
+        ),
+        "{all}"
+    );
+    // 「今日」措辞在跨天窗口下必然是错的
+    assert!(!all.contains("今日"), "{all}");
 }
 
 // `NaiveDate` 的 ±N 天小工具（避免用例里出现 `2026-10-18` 这类字面量）。

@@ -25,14 +25,81 @@
 //! `estimated_minutes`，而日报要的是一个当场可算、跨域可对账的量；见
 //! `docs/api/wecom-daily.md` §4 口径表）。登记见该文档 §8.3 第 1 条。
 
+use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 
 use crate::shared::error::{AppError, code};
 
 // ============================================================================
-// 取值范围常量（`GET /meta` 下发给前端，前端一律不硬编码）
+// 统计窗口锚点（窗口的两端由它算出，见 [`report_window`]）
 // ============================================================================
 
+/// 统计窗口缺省锚点的**小时**：20。
+///
+/// ⚠️ 这不是「下班时间」这类软性理由，而是**默认推送时刻**的缺省值 —— 窗口上界恒
+/// 等于「本次推送的那一刻」，下界是它**前一天**的同一时刻（跨天窗口）。两者必须同源，
+/// 否则管理员改了「推送时刻」而窗口不动，日报会统计一段与推送时间错位的时间。
+pub const WINDOW_ANCHOR_DEFAULT_HOUR: i16 = 20;
+/// 统计窗口缺省锚点的**分钟**：05。
+///
+/// ⚠️ 挑 `20:05` 而不是 `20:00`：整点是全厂扫码/交付动作最密集的时刻，窗口上界压在
+/// 整点上会让「20:00 整那一秒」的事件落在窗口外（半开区间的右端），而 5 分钟的错开
+/// 既避开整点又仍然贴着「下班后汇总」的实际语义。
+pub const WINDOW_ANCHOR_DEFAULT_MINUTE: i16 = 5;
+
+/// 统计窗口：`(from_ts, to_ts)` = **前一天 @ 锚点 ~ 当天 @ 锚点**。
+///
+/// ## 为什么窗口**跨天**
+///
+/// 日报回答的是「**这一班**干了多少」，而一班横跨两天：下午 4 点下的料、第二天上午
+/// 才做完了。按日历日切窗口会让「今天 20:05 才做完的那批」被切进**明天的**那份日报，
+/// 于是昨天推送出去的那条里永远缺最后一班的量 —— 而日报的读者（老板 / 车间主管）
+/// 恰恰是在当天晚上看昨天那一班的结论。
+///
+/// ## 锚点从哪来
+///
+/// `send_hour` / `send_minute`（推送时刻）就是锚点：上界恒等于「本次推送的那一刻」。
+/// ⚠️ **两者任一为 `None` 时回退到 [`WINDOW_ANCHOR_DEFAULT_HOUR`] /
+///
+/// [`WINDOW_ANCHOR_DEFAULT_MINUTE`]**（`MANUAL_ONLY` 之下这两个字段允许为空，且允许
+/// 存脏值 —— 写侧对 `MANUAL_ONLY` 刻意不校验时刻范围，理由见
+/// `service::validate_time`）。所以这里必须**各自独立**兜底，不能用「`hour` 空则
+/// 分钟也空」这种联动兜底。
+///
+/// ⚠️ **越界值退回缺省锚点，而不是夹逼到边界**：`MANUAL_ONLY` 之下写侧刻意不校验
+/// 时刻范围（理由见 `service::validate_time`），库里可能躺着 `99`。把 `99` 夹成
+/// `23:59` 会得到一个**看起来合法、实际统计了完全不同一段时间**的窗口；退回缺省
+/// 锚点则与「没配过时刻」的表现一致 —— 两种都比产出怪窗口好。
+///
+/// 纯函数（零 IO）⇒ lib 单测直接可调，窗口的两端不需要连库就能钉住。
+pub fn report_window(cfg: &NormalizedConfig, today: NaiveDate) -> (NaiveDateTime, NaiveDateTime) {
+    let hour = cfg
+        .send_hour
+        .filter(|h| (0..=23).contains(h))
+        .unwrap_or(WINDOW_ANCHOR_DEFAULT_HOUR) as u32;
+    let minute = cfg
+        .send_minute
+        .filter(|m| (0..=59).contains(m))
+        .unwrap_or(WINDOW_ANCHOR_DEFAULT_MINUTE) as u32;
+    let to_ts = today.and_hms_opt(hour, minute, 0).unwrap_or_else(|| {
+        // 上面已把两个分量过滤到合法域 ⇒ 这里**不可达**；保留它是为了让本函数对未来的
+        // 改动仍然「要么给出一个合法时刻、要么给缺省锚点」，而不是退化成 `1970-01-01`
+        // 那种看起来能编译、实际是空窗口的值。
+        today
+            .and_hms_opt(
+                WINDOW_ANCHOR_DEFAULT_HOUR as u32,
+                WINDOW_ANCHOR_DEFAULT_MINUTE as u32,
+                0,
+            )
+            .expect("缺省锚点恒合法")
+    });
+    let from_ts = to_ts - chrono::Duration::days(1);
+    (from_ts, to_ts)
+}
+
+// ============================================================================
+// 取值范围常量（`GET /meta` 下发给前端，前端一律不硬编码）
+// ============================================================================
 /// 「未来 N 天交期」窗口天数下限。
 pub const UPCOMING_DAYS_MIN: i32 = 1;
 /// 「未来 N 天交期」窗口天数上限。
@@ -508,8 +575,10 @@ impl Default for NormalizedConfig {
         Self {
             enabled: false,
             frequency: Frequency::Daily,
-            send_hour: Some(8),
-            send_minute: Some(0),
+            // ⚠️ 缺省推送时刻**同时**是统计窗口的锚点（见 `report_window`）⇒ 这里改成
+            // 20:05 时，报工 / 出货 / 工人榜三处窗口的上界一律跟着走。
+            send_hour: Some(WINDOW_ANCHOR_DEFAULT_HOUR),
+            send_minute: Some(WINDOW_ANCHOR_DEFAULT_MINUTE),
             weekday: None,
             day_of_month: None,
             webhook_id: None,
@@ -664,7 +733,7 @@ pub struct WorkerBarRow {
     pub quantity: i32,
 }
 
-/// `POST /preview` 响应体（**15 个字段**）：渲染、不发送、不落 log。
+/// `POST /preview` 响应体（**14 个字段**）：渲染、不发送、不落 log。
 ///
 /// ⚠️ **没有 `markdown` 单字段**，只有 `chunks: Vec<String>` —— 同时维护两份会让
 /// 「要发几条」有两个答案，而那恰恰是管理员唯一需要预判的东西。
@@ -678,10 +747,16 @@ pub struct PreviewOut {
     pub chunk_count: i32,
     pub overview_batch_count: i32,
     pub overview_quantity: i32,
+    /// 完工单数。⚠️ **不进正文**（第一节正文只有报工 / 送检 / 在制），但保留在出参里
+    /// —— 预览弹窗是管理员核对口径的入口，删掉它等于让这个数在系统里无处可查。
     pub completed_count: i32,
+    /// 当前在制单数（口径 = `t_part.status = 'IN_PROCESS'`，见 `repo::OverviewEvents::wip`）。
     pub in_process_count: i32,
-    pub repair_part_count: i32,
+    /// ⚠️ **恒为 0**：第二节改单值口径（`COUNT(DISTINCT part_id)`）后不再统计「送货单
+    /// 张数」，而该键要留着（流水表列与前端 `.strict()` schema 都按它存在）。
+    /// 它**不是**「今天没出货」—— 出货数字看 [`Self::note_part_count`]。
     pub note_count: i32,
+    /// 第二节的唯一数字：本期出货的工单数。
     pub note_part_count: i32,
     pub overdue_count: i32,
     pub upcoming_count: i32,
@@ -715,7 +790,12 @@ pub struct SendResultOut {
     pub chunk_sent: i32,
     pub overview_batch_count: i32,
     pub overview_quantity: i32,
+    /// ⚠️ **恒为 0**：第二节改单值口径后不再统计「送货单张数」，而
+    /// `t_wecom_daily_log.note_count` 是 `NOT NULL` 列 ⇒ 本域不再落一个能代表「本期
+    /// 出了几张送货单」的值。读它时**不要**当成「今天没出货」，出货数字是
+    /// `note_part_count`。列的增删留给契约变更（前端 `.strict()` schema 也按它排版）。
     pub note_count: i32,
+    /// 第二节的唯一数字：本期出货的工单数（`COUNT(DISTINCT part_id)`）。
     pub note_part_count: i32,
     pub overdue_count: i32,
     pub upcoming_count: i32,
@@ -754,6 +834,81 @@ pub const SECTION_WORKERS: &str = "workers";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn day() -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 10, 18).expect("固定测试日期合法")
+    }
+
+    /// ★ 守卫：窗口恒**跨天**，两端都等于同一个锚点（推送时刻）。
+    ///
+    /// ⚠️ 这条钉的是「一天」这个不变量本身：哪天有人把 `from_ts` 写成 `to_ts` 当天的
+    /// 零点、或写成 `today - 1 天的**零点**」（那会少统计前一天 00:00~20:05 的量），
+    /// 本条立刻红。
+    #[test]
+    fn report_window_spans_exactly_one_day_back_from_the_anchor() {
+        let cfg = NormalizedConfig::default();
+        let (from, to) = report_window(&cfg, day());
+        let anchor = day()
+            .and_hms_opt(
+                WINDOW_ANCHOR_DEFAULT_HOUR as u32,
+                WINDOW_ANCHOR_DEFAULT_MINUTE as u32,
+                0,
+            )
+            .expect("缺省锚点恒合法");
+        assert_eq!(to, anchor, "上界 = 发送当天的推送时刻");
+        assert_eq!(
+            from,
+            anchor - chrono::Duration::days(1),
+            "下界 = 前一天的同一时刻"
+        );
+        assert_eq!((to - from).num_seconds(), 24 * 3600);
+        // 半开 `[from, to)`：下界闭合、上界不含（`e.created_at < to` 这一侧的边界）。
+        assert!(from < to);
+    }
+
+    /// ★ 守卫：锚点缺省 / 脏值都退回缺省锚点，**绝不**产出一个「看起来合法、实际是空
+    /// 窗口」的时间对。
+    ///
+    /// `MANUAL_ONLY` 之下 `send_hour` / `send_minute` 允许为空、且写侧**刻意不校验**
+    /// 时刻范围（理由见 `service::validate_time`）⇒ 这两档不是假想。
+    #[test]
+    fn report_window_falls_back_to_default_anchor() {
+        let anchor = day()
+            .and_hms_opt(
+                WINDOW_ANCHOR_DEFAULT_HOUR as u32,
+                WINDOW_ANCHOR_DEFAULT_MINUTE as u32,
+                0,
+            )
+            .expect("缺省锚点恒合法");
+        let full = (anchor - chrono::Duration::days(1), anchor);
+
+        // 两个都缺省
+        let cfg = NormalizedConfig {
+            send_hour: None,
+            send_minute: None,
+            ..NormalizedConfig::default()
+        };
+        assert_eq!(report_window(&cfg, day()), full);
+
+        // ⚠️ **各自独立**兜底：只有分钟缺省时，小时仍取配置值（不能连坐成缺省小时）。
+        let cfg = NormalizedConfig {
+            send_hour: Some(9),
+            send_minute: None,
+            ..NormalizedConfig::default()
+        };
+        let (from, to) = report_window(&cfg, day());
+        assert_eq!(to, day().and_hms_opt(9, 5, 0).unwrap());
+        assert_eq!(from, to - chrono::Duration::days(1));
+
+        // 脏值 99（写侧对 MANUAL_ONLY 放行）⇒ 夹逼后回缺省锚点，而不是 `None` 崩溃
+        // 或悄悄变成当天 00:00。
+        let cfg = NormalizedConfig {
+            send_hour: Some(99),
+            send_minute: Some(99),
+            ..NormalizedConfig::default()
+        };
+        assert_eq!(report_window(&cfg, day()), full);
+    }
 
     /// ★ 守卫：读侧两个枚举的**脏值解析失败回 `code::INTERNAL`（系统层），不是 `21802`**
     /// （投递失败）。

@@ -555,8 +555,10 @@ pub(crate) fn config_body(version: i32, webhook_id: i64) -> Value {
         "version": version,
         "enabled": true,
         "frequency": "DAILY",
-        "send_hour": 8,
-        "send_minute": 0,
+        // ⚠️ 推送时刻**同时**是统计窗口的锚点（`dto::report_window`）⇒ 用例里造的事件
+        // 必须落在这个时刻之前的 24 小时内（这里的事件都落在当天 09:00）。
+        "send_hour": 20,
+        "send_minute": 5,
         "weekday": null,
         "day_of_month": null,
         "webhook_id": webhook_id.to_string(),
