@@ -1,6 +1,6 @@
 //! `print_template` 域集成测试（**2026-10-16 新建 binary**，与新域同批）
 //!
-//! 本 binary 与 `src/modules/print_template/` 同批落地，覆盖 5 个端点的
+//! 本 binary 与 `src/modules/print_template/` 同批落地，覆盖 4 个端点的
 //! HTTP 契约 + `t_part_file` 复用层的落库形态 + 角色 / 权限守卫 + 硬切 404。
 //!
 //! ## ⚠️ 入口**必须是 `main.rs`**
@@ -9,7 +9,9 @@
 //! （binary 名 = `<dir>`，即 `print_template`）。
 //!
 //! ## 拆分映射（3 个 sub-file）
-//! - `upload.rs`  —— 端点 1：multipart 上传 / 替换语义 / 四道轻校验 / 403 守卫
+//! - `upload.rs`  —— 模板写入链路（upload-intents → 直传 → confirm）/ 替换语义 /
+//!   校验矩阵 / 403 守卫。⚠️ **2026-10-15 起本域没有上传端点**：写入一律经
+//!   `POST /files/objects/upload-intents` + `POST /files/objects/confirm`
 //! - `resolve.rs` —— 端点 3 / 4：21109 未绑定 / 内容字节 / 权限点守卫 / 旧路径 404
 //! - `delete.rs`  —— 端点 5：OCC（缺 version ⇒ 422 纯文本 / 陈旧 ⇒ 40901）+ 端点 2 列表
 //!
@@ -43,11 +45,12 @@ mod upload;
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::http::{Request, Response, StatusCode, header};
+use axum::http::{Request, Response, StatusCode};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 
 use hsh_erp_rust::infra::clock::now_naive;
+use hsh_erp_rust::infra::cos::CosClient;
 use hsh_erp_test_support::{
     MockCos, PartFixture, load_part_fixture, login_token, shared_test_snowflake, test_app,
     test_pool, test_state_with_cos,
@@ -147,86 +150,14 @@ pub(crate) fn minimal_xlsx_bytes(tag: &str) -> Vec<u8> {
     v
 }
 
-// ===========================================================================
-//  multipart 请求构造
-// ===========================================================================
-
-/// multipart 边界（wire 上不可见，仅用于分隔 part）。
-pub(crate) const MP_BOUNDARY: &str = "hshPrintTemplateBoundary3xYq";
-
-/// 手工拼一个 `multipart/form-data` body。
+/// 2026-10-15：模板上传走**全仓统一的收文件链路**，本域不再有上传端点。
 ///
-/// `file` 的四元组 = `(字段名, filename, content_type, 字节)`；`None` 即**不发**
-/// 该字段（用来测「缺 file」分支）。⚠️ `filename` 也不能省 —— handler 用
-/// `field.file_name()` 的 `None` 判「缺文件名」，那是另一条 20104 分支。
-/// 照抄 `tests/files/upload.rs` 的同名 helper（请求构造不是 fixture）。
-pub(crate) fn multipart_body(
-    data: Option<&str>,
-    file: Option<(&str, &str, &str, &[u8])>,
-) -> Vec<u8> {
-    let mut body: Vec<u8> = Vec::new();
-    if let Some(d) = data {
-        body.extend_from_slice(format!("--{MP_BOUNDARY}\r\n").as_bytes());
-        body.extend_from_slice(b"Content-Disposition: form-data; name=\"data\"\r\n\r\n");
-        body.extend_from_slice(d.as_bytes());
-        body.extend_from_slice(b"\r\n");
-    }
-    if let Some((field, filename, content_type, bytes)) = file {
-        body.extend_from_slice(format!("--{MP_BOUNDARY}\r\n").as_bytes());
-        body.extend_from_slice(
-            format!(
-                "Content-Disposition: form-data; name=\"{field}\"; filename=\"{filename}\"\r\n"
-            )
-            .as_bytes(),
-        );
-        body.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
-        body.extend_from_slice(bytes);
-        body.extend_from_slice(b"\r\n");
-    }
-    body.extend_from_slice(format!("--{MP_BOUNDARY}--\r\n").as_bytes());
-    body
-}
-
-/// 构造一个 multipart 请求（`data` + `file`），带 Bearer。
+/// 三步：① `POST /files/objects/upload-intents`（`owner_kind=CUSTOMER` +
+/// `kind=DELIVERY_TEMPLATE`）② 模拟浏览器把字节 PUT 到 `object_key`
+/// （真实链路这一步不发本进程；替身用 `MockCos::put_object`）③
+/// `POST /files/objects/confirm` 落行。
 ///
-/// ⚠️ **uri 固定是 `/print-templates`**（本域端点 1）。要打别的 multipart 端点
-/// （典型是 `POST /files/objects` 那个**通用上传原语**，见 review 第 1 轮 MAJOR-4）
-/// 必须显式调 [`multipart_request_to`] —— 2026-10-16 首版这条 helper 把 uri 写死、
-/// 又被「CLERK 绕行」用例复用，于是那条用例其实打的是 `/print-templates`（被本域
-/// 自己的 `require_role(Manager)` 挡下），**恒真绿**、什么也没钉到。
-pub(crate) fn multipart_request(
-    data: Option<&str>,
-    file: Option<(&str, &str, &str, &[u8])>,
-    bearer: Option<&str>,
-) -> Request<Body> {
-    multipart_request_to("/print-templates", data, file, bearer)
-}
-
-/// 同 [`multipart_request`]，但**显式给 uri**。
-pub(crate) fn multipart_request_to(
-    uri: &str,
-    data: Option<&str>,
-    file: Option<(&str, &str, &str, &[u8])>,
-    bearer: Option<&str>,
-) -> Request<Body> {
-    let body = multipart_body(data, file);
-    let mut builder = Request::builder().method("POST").uri(uri).header(
-        header::CONTENT_TYPE,
-        format!("multipart/form-data; boundary={MP_BOUNDARY}"),
-    );
-    if let Some(t) = bearer {
-        builder = builder.header(header::AUTHORIZATION, format!("Bearer {t}"));
-    }
-    builder
-        .body(Body::from(body))
-        .expect("multipart_request_to: build request")
-}
-
-// ===========================================================================
-//  请求 helper（业务端点）
-// ===========================================================================
-
-/// `POST /print-templates`（带完整 multipart）→ `(status, 信封)`。
+/// ⚠️ 第 ② 步是**替身**：本 binary 不测「HTTP → COS」的传输。
 pub(crate) async fn upload(
     ctx: &Ctx,
     customer_id: i64,
@@ -234,35 +165,112 @@ pub(crate) async fn upload(
     bytes: &[u8],
     bearer: &str,
 ) -> (StatusCode, Value) {
-    let data = json!({ "customer_id": customer_id.to_string() }).to_string();
-    send_multipart(
+    let (status, env) = upload_intents(ctx, customer_id, filename, bytes, bearer).await;
+    if !status.is_success() {
+        return (status, env); // 第 ① 步就拒了（角色 / 校验），后续不发生
+    }
+    let item = &env["data"]["items"][0];
+    let object_key = item["object_key"]
+        .as_str()
+        .expect("非秒传项必有 object_key")
+        .to_string();
+    let content_type = item["content_type"]
+        .as_str()
+        .unwrap_or(XLSX_MIME)
+        .to_string();
+
+    // ② 模拟前端 PUT 直传（真实链路这一步发生在浏览器里）
+    ctx.cos
+        .put_object(&object_key, bytes.to_vec(), &content_type)
+        .await
+        .expect("模拟 PUT");
+
+    // ③ confirm
+    let sha = hsh_erp_rust::modules::files::part_file::repo::hash_bytes(bytes);
+    confirm(
         ctx,
-        multipart_request(
-            Some(&data),
-            Some((
-                "file",
-                filename,
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                bytes,
-            )),
+        customer_id,
+        filename,
+        bytes.len() as i64,
+        &content_type,
+        &sha,
+        &object_key,
+        bearer,
+    )
+    .await
+}
+
+/// 只跑第 ① 步（签发）—— 校验矩阵 / 角色矩阵用例用它断言第一道闸门。
+pub(crate) async fn upload_intents(
+    ctx: &Ctx,
+    customer_id: i64,
+    filename: &str,
+    bytes: &[u8],
+    bearer: &str,
+) -> (StatusCode, Value) {
+    let sha = hsh_erp_rust::modules::files::part_file::repo::hash_bytes(bytes);
+    let body = json!({
+        "owner_kind": "CUSTOMER",
+        "owner_id": customer_id.to_string(),
+        "items": [{
+            "client_ref": "print-template",
+            "kind": "DELIVERY_TEMPLATE",
+            "original_filename": filename,
+            "content_type": XLSX_MIME,
+            "file_size": bytes.len().to_string(),
+            "content_sha256": sha,
+        }],
+    });
+    hsh_erp_test_support::send(
+        ctx.app.clone(),
+        hsh_erp_test_support::json_request(
+            "POST",
+            "/files/objects/upload-intents",
+            Some(body),
             Some(bearer),
         ),
     )
     .await
 }
 
-/// 打一个 multipart 请求并解析信封。
-pub(crate) async fn send_multipart(ctx: &Ctx, req: Request<Body>) -> (StatusCode, Value) {
-    use tower::ServiceExt;
-    let resp: Response<Body> = ctx.app.clone().oneshot(req).await.expect("oneshot");
-    let status = resp.status();
-    let raw = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .expect("read body");
-    let env: Value = serde_json::from_slice(&raw)
-        .unwrap_or_else(|e| panic!("parse JSON: {e}; raw = {}", String::from_utf8_lossy(&raw)));
-    (status, env)
+/// 只跑第 ③ 步（confirm）—— 「CLERK 经 confirm 造不出模板行」这类用例要用。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn confirm(
+    ctx: &Ctx,
+    customer_id: i64,
+    filename: &str,
+    file_size: i64,
+    content_type: &str,
+    sha: &str,
+    object_key: &str,
+    bearer: &str,
+) -> (StatusCode, Value) {
+    let body = json!({
+        "owner_kind": "CUSTOMER",
+        "owner_id": customer_id.to_string(),
+        "kind": "DELIVERY_TEMPLATE",
+        "object_key": object_key,
+        "content_sha256": sha,
+        "original_filename": filename,
+        "file_size": file_size.to_string(),
+        "content_type": content_type,
+        "ext": "xlsx",
+    });
+    hsh_erp_test_support::send(
+        ctx.app.clone(),
+        hsh_erp_test_support::json_request(
+            "POST",
+            "/files/objects/confirm",
+            Some(body),
+            Some(bearer),
+        ),
+    )
+    .await
 }
+
+/// xlsx 的规范 MIME（与 `print_template::dto::XLSX_MIME` 同款字面量）。
+pub(crate) const XLSX_MIME: &str =
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 
 /// `GET /print-templates/{id}/content` → `(status, headers, 字节)`。
 ///

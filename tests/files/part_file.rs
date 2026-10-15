@@ -51,9 +51,12 @@ use std::sync::Arc;
 
 use axum::http::StatusCode;
 use hsh_erp_rust::auth::rbac::{CurrentUser, Role};
-use hsh_erp_rust::infra::cos::NoopCos;
+use hsh_erp_rust::infra::cos::CosClient;
+use hsh_erp_rust::modules::files::part_file::repo::hash_bytes;
 use hsh_erp_rust::modules::files::part_file::service::PartFileService;
+use hsh_erp_rust::modules::files::part_file::vo::PartFileOut;
 use hsh_erp_rust::shared::error::AppError;
+use hsh_erp_rust::util::cos_key::build_cas_key;
 use serde_json::json;
 use sqlx::PgPool;
 
@@ -156,6 +159,59 @@ fn test_current_user_with_roles_and_perms(roles: Vec<Role>, perms: &[&str]) -> C
     }
 }
 
+/// `Arc<MockCos>` → `Arc<dyn CosClient>` 的就地擦除（helper 收 trait object）。
+fn cos_dyn(cos: &Arc<MockCos>) -> Arc<dyn CosClient> {
+    cos.clone()
+}
+
+/// 2026-10-15：模拟**前端**的完整上传动作 ——「PUT 直传 COS → confirm 登记」。
+///
+/// 四步刻意复刻真实链路：① 客户端算 sha256；② 按生产同一份
+/// `util::cos_key::build_cas_key` 派生 CAS key；③ 把字节 PUT 到那个 key
+/// （`cos.put_object`，真实链路这一步发生在浏览器里）；④ 调 `bind_uploaded_file`
+/// 登记。
+///
+/// ⚠️ 第 ③ 步用 `cos.put_object` 而不是真发预签 PUT：本文件不测「HTTP → COS」的
+/// 传输（那是 `infra::cos_opendal` 与真桶冒烟的职责），只需让 `head_object` 能
+/// 看到正确 size。替身用 `MockCos`（put 会连带写 head_responses）。
+#[allow(clippy::too_many_arguments)]
+async fn upload_via_confirm(
+    pool: &PgPool,
+    cos: &Arc<dyn CosClient>,
+    owner_kind: &str,
+    owner_id: i64,
+    kind: &str,
+    filename: &str,
+    content_type: &str,
+    bytes: Vec<u8>,
+    current: &CurrentUser,
+) -> Result<PartFileOut, AppError> {
+    let sha = hash_bytes(&bytes);
+    let object_key = build_cas_key(UPLOAD_UPLOAD_PREFIX, &sha, filename);
+    cos.put_object(&object_key, bytes.clone(), content_type)
+        .await
+        .expect("put_object（模拟前端 PUT 直传）");
+    let cos: Arc<dyn CosClient> = cos.clone();
+    PartFileService::new(shared_test_snowflake().clone(), cos.clone())
+        .bind_uploaded_file(
+            pool,
+            cos,
+            UPLOAD_UPLOAD_PREFIX,
+            UPLOAD_MAX_FILE_SIZE,
+            owner_kind,
+            owner_id,
+            kind,
+            &object_key,
+            &sha,
+            filename,
+            bytes.len() as i64,
+            content_type,
+            None,
+            current,
+        )
+        .await
+}
+
 // ===========================================================================
 //  Tests
 // ===========================================================================
@@ -168,26 +224,22 @@ async fn upload_pdf_happy_path() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let cos = Arc::new(NoopCos);
+    let cos = Arc::new(MockCos::new());
 
     let pdf_bytes = b"%PDF-1.5\nhello world\n%%EOF".to_vec();
-    let mut tx = pool.begin().await.unwrap();
-    let out = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
-        .upload_file_for_owner(
-            &mut *tx,
-            UPLOAD_UPLOAD_PREFIX,
-            UPLOAD_MAX_FILE_SIZE,
-            "PART",
-            part_id,
-            "DRAWING",
-            "drawing.pdf",
-            "application/pdf",
-            pdf_bytes,
-            &current,
-        )
-        .await
-        .expect("upload should succeed");
-    tx.commit().await.unwrap();
+    let out = upload_via_confirm(
+        &pool,
+        &cos_dyn(&cos),
+        "PART",
+        part_id,
+        "DRAWING",
+        "drawing.pdf",
+        "application/pdf",
+        pdf_bytes,
+        &current,
+    )
+    .await
+    .expect("upload should succeed");
 
     assert_eq!(out.kind, "DRAWING");
     assert_eq!(out.file_type, "PDF");
@@ -207,26 +259,23 @@ async fn upload_invalid_kind_returns_21102() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let cos = Arc::new(NoopCos);
+    let cos = Arc::new(MockCos::new());
 
     let bytes = b"some step data".to_vec();
-    let mut tx = pool.begin().await.unwrap();
-    let err = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
-        .upload_file_for_owner(
-            &mut *tx,
-            UPLOAD_UPLOAD_PREFIX,
-            UPLOAD_MAX_FILE_SIZE,
-            "PART",
-            part_id,
-            "DRAWING", // DRAWING 不接受 step
-            "drawing.step",
-            "application/octet-stream",
-            bytes,
-            &current,
-        )
-        .await
-        .expect_err("扩展名 step 不在 DRAWING 白名单");
-    drop(tx);
+    let err = upload_via_confirm(
+        &pool,
+        &cos_dyn(&cos),
+        "PART",
+        part_id,
+        "DRAWING",
+        // DRAWING 不接受 step
+        "drawing.step",
+        "application/octet-stream",
+        bytes,
+        &current,
+    )
+    .await
+    .expect_err("扩展名 step 不在 DRAWING 白名单");
 
     match err {
         AppError::Biz { code, .. } => assert_eq!(code, 21102, "BIZ_PART_FILE_BAD_TYPE"),
@@ -242,47 +291,39 @@ async fn upload_cas_dedup_skips_cos() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let cos = Arc::new(NoopCos);
+    let cos = Arc::new(MockCos::new());
 
     let pdf_bytes = b"%PDF-1.5\nidentical content\n%%EOF".to_vec();
 
     // 第一次上传
-    let mut tx = pool.begin().await.unwrap();
-    let out1 = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
-        .upload_file_for_owner(
-            &mut *tx,
-            UPLOAD_UPLOAD_PREFIX,
-            UPLOAD_MAX_FILE_SIZE,
-            "PART",
-            part_id,
-            "DRAWING",
-            "first.pdf",
-            "application/pdf",
-            pdf_bytes.clone(),
-            &current,
-        )
-        .await
-        .expect("first upload ok");
-    tx.commit().await.unwrap();
+    let out1 = upload_via_confirm(
+        &pool,
+        &cos_dyn(&cos),
+        "PART",
+        part_id,
+        "DRAWING",
+        "first.pdf",
+        "application/pdf",
+        pdf_bytes.clone(),
+        &current,
+    )
+    .await
+    .expect("first upload ok");
 
     // 第二次上传同 sha → CAS 命中，复用 object_key，id 不同
-    let mut tx = pool.begin().await.unwrap();
-    let out2 = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
-        .upload_file_for_owner(
-            &mut *tx,
-            UPLOAD_UPLOAD_PREFIX,
-            UPLOAD_MAX_FILE_SIZE,
-            "PART",
-            part_id,
-            "DRAWING",
-            "second.pdf",
-            "application/pdf",
-            pdf_bytes.clone(),
-            &current,
-        )
-        .await
-        .expect("CAS upload ok");
-    tx.commit().await.unwrap();
+    let out2 = upload_via_confirm(
+        &pool,
+        &cos_dyn(&cos),
+        "PART",
+        part_id,
+        "DRAWING",
+        "second.pdf",
+        "application/pdf",
+        pdf_bytes.clone(),
+        &current,
+    )
+    .await
+    .expect("CAS upload ok");
 
     // CAS 命中：返回已有 id，object_key 相同
     assert_eq!(out1.id, out2.id, "CAS 命中应返回已有 id");
@@ -294,26 +335,22 @@ async fn upload_cas_dedup_skips_cos() {
 async fn upload_owner_not_found_returns_21105() {
     let pool = setup().await;
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let cos = Arc::new(NoopCos);
+    let cos = Arc::new(MockCos::new());
 
     let nonexistent = 99_999_999_999_i64;
-    let mut tx = pool.begin().await.unwrap();
-    let err = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
-        .upload_file_for_owner(
-            &mut *tx,
-            UPLOAD_UPLOAD_PREFIX,
-            UPLOAD_MAX_FILE_SIZE,
-            "PART",
-            nonexistent,
-            "DRAWING",
-            "drawing.pdf",
-            "application/pdf",
-            b"%PDF-1.5\n".to_vec(),
-            &current,
-        )
-        .await
-        .expect_err("不存在的 owner");
-    drop(tx);
+    let err = upload_via_confirm(
+        &pool,
+        &cos_dyn(&cos),
+        "PART",
+        nonexistent,
+        "DRAWING",
+        "drawing.pdf",
+        "application/pdf",
+        b"%PDF-1.5\n".to_vec(),
+        &current,
+    )
+    .await
+    .expect_err("不存在的 owner");
 
     match err {
         AppError::Biz { code, .. } => assert_eq!(code, 21105, "BIZ_PART_FILE_OWNER_NOT_FOUND"),
@@ -329,25 +366,21 @@ async fn rbac_inspector_can_upload_returns_403() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let inspector = test_current_user_with_roles(vec![Role::Inspector]);
-    let cos = Arc::new(NoopCos);
+    let cos = Arc::new(MockCos::new());
 
-    let mut tx = pool.begin().await.unwrap();
-    let err = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
-        .upload_file_for_owner(
-            &mut *tx,
-            UPLOAD_UPLOAD_PREFIX,
-            UPLOAD_MAX_FILE_SIZE,
-            "PART",
-            part_id,
-            "DRAWING",
-            "drawing.pdf",
-            "application/pdf",
-            b"%PDF-1.5\n".to_vec(),
-            &inspector,
-        )
-        .await
-        .expect_err("Inspector 无 upload 权限");
-    drop(tx);
+    let err = upload_via_confirm(
+        &pool,
+        &cos_dyn(&cos),
+        "PART",
+        part_id,
+        "DRAWING",
+        "drawing.pdf",
+        "application/pdf",
+        b"%PDF-1.5\n".to_vec(),
+        &inspector,
+    )
+    .await
+    .expect_err("Inspector 无 upload 权限");
 
     match err {
         AppError::Biz { code, .. } => assert_eq!(code, 40300, "FORBIDDEN"),
@@ -363,7 +396,7 @@ async fn list_filter_by_kind() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let cos = Arc::new(NoopCos);
+    let cos = Arc::new(MockCos::new());
 
     // 上传 1 个 DRAWING + 1 个 3D_MODEL（每 kind 在 uk_t_part_file_single 下只能 1 个/owner）
     for (i, (filename, kind, content_type)) in [
@@ -379,23 +412,19 @@ async fn list_filter_by_kind() {
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
         );
         let body = format!("{}{}", unique_prefix, "x".repeat(1024)).into_bytes();
-        let mut tx = pool.begin().await.unwrap();
-        PartFileService::new(shared_test_snowflake().clone(), cos.clone())
-            .upload_file_for_owner(
-                &mut *tx,
-                UPLOAD_UPLOAD_PREFIX,
-                UPLOAD_MAX_FILE_SIZE,
-                "PART",
-                part_id,
-                kind,
-                filename,
-                content_type,
-                body,
-                &current,
-            )
-            .await
-            .expect("seed upload");
-        tx.commit().await.unwrap();
+        upload_via_confirm(
+            &pool,
+            &cos_dyn(&cos),
+            "PART",
+            part_id,
+            kind,
+            filename,
+            content_type,
+            body,
+            &current,
+        )
+        .await
+        .expect("seed upload");
     }
 
     // list 仅 DRAWING（只上传了 1 个 DRAWING）
@@ -427,25 +456,21 @@ async fn get_url_returns_presigned_url() {
     // fixture 同时装角色与点。
     let current =
         test_current_user_with_roles_and_perms(vec![Role::Manager], &["part.drawing.print"]);
-    let cos = Arc::new(NoopCos);
+    let cos = Arc::new(MockCos::new());
 
-    let mut tx = pool.begin().await.unwrap();
-    let out = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
-        .upload_file_for_owner(
-            &mut *tx,
-            UPLOAD_UPLOAD_PREFIX,
-            UPLOAD_MAX_FILE_SIZE,
-            "PART",
-            part_id,
-            "DRAWING",
-            "test.pdf",
-            "application/pdf",
-            b"%PDF-1.5\n".to_vec(),
-            &current,
-        )
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
+    let out = upload_via_confirm(
+        &pool,
+        &cos_dyn(&cos),
+        "PART",
+        part_id,
+        "DRAWING",
+        "test.pdf",
+        "application/pdf",
+        b"%PDF-1.5\n".to_vec(),
+        &current,
+    )
+    .await
+    .unwrap();
 
     let mut tx = pool.begin().await.unwrap();
     let detail = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
@@ -478,24 +503,20 @@ async fn get_url_requires_permission_point() {
     let l2 = insert_l2_customer(&pool, "子客PF-URL-Perm", l1).await;
     let part_id = insert_part_for_owner(&pool, l2).await;
 
-    let cos = Arc::new(NoopCos);
-    let mut tx = pool.begin().await.unwrap();
-    let uploaded = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
-        .upload_file_for_owner(
-            &mut *tx,
-            UPLOAD_UPLOAD_PREFIX,
-            UPLOAD_MAX_FILE_SIZE,
-            "PART",
-            part_id,
-            "DRAWING",
-            "perm.pdf",
-            "application/pdf",
-            b"%PDF-1.5\n".to_vec(),
-            &test_current_user_with_roles_and_perms(vec![Role::Manager], &["part.drawing.print"]),
-        )
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
+    let cos = Arc::new(MockCos::new());
+    let uploaded = upload_via_confirm(
+        &pool,
+        &cos_dyn(&cos),
+        "PART",
+        part_id,
+        "DRAWING",
+        "perm.pdf",
+        "application/pdf",
+        b"%PDF-1.5\n".to_vec(),
+        &test_current_user_with_roles_and_perms(vec![Role::Manager], &["part.drawing.print"]),
+    )
+    .await
+    .unwrap();
 
     // Manager 角色在手、权限点未授 ⇒ 40300
     let manager_no_perm = test_current_user_with_roles(vec![Role::Manager]);
@@ -535,7 +556,7 @@ async fn list_includes_paired_file_id() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     // 直接 SQL 造配对行（绕开 cnc_program 上传通道，聚焦 part_file 列表投影）
-    let cos = Arc::new(NoopCos);
+    let cos = Arc::new(MockCos::new());
     let g_id = shared_test_snowflake().next_id();
     let s_id = shared_test_snowflake().next_id();
     for (id, kind, file_type, filename, sha, paired_id) in [
@@ -617,27 +638,23 @@ async fn content_happy_path() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let cos = Arc::new(NoopCos);
+    let cos = Arc::new(MockCos::new());
 
-    let mut tx = pool.begin().await.unwrap();
-    let out = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
-        .upload_file_for_owner(
-            &mut *tx,
-            UPLOAD_UPLOAD_PREFIX,
-            UPLOAD_MAX_FILE_SIZE,
-            "PART",
-            part_id,
-            "DRAWING",
-            "content.pdf",
-            "application/pdf",
-            b"%PDF-1.5\nhello\n%%EOF".to_vec(),
-            &current,
-        )
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
+    let out = upload_via_confirm(
+        &pool,
+        &cos_dyn(&cos),
+        "PART",
+        part_id,
+        "DRAWING",
+        "content.pdf",
+        "application/pdf",
+        b"%PDF-1.5\nhello\n%%EOF".to_vec(),
+        &current,
+    )
+    .await
+    .unwrap();
 
-    // content 端点 — NoopCos.get_object 返空字节，但应正常返回
+    // content 端点 — MockCos 存了真实字节，应逐字节回读
     // ⚠️ 2026-10-16 review 第 2 轮 MINOR-A：原先这里调 `get_file_content`（那个
     // 「有角色闸门、无 kind 闸门」的 pub 方法已随本轮整条删除），现走生产同款形态
     // —— handler 取一次行判完 kind，再交给 `get_file_content_of_checked_row`。
@@ -649,9 +666,12 @@ async fn content_happy_path() {
         .await
         .expect("content ok");
     drop(tx);
-    assert!(content.content_type.is_some());
-    // NoopCos.get_object 返回空
-    assert!(content.bytes.is_empty());
+    assert_eq!(content.content_type.as_deref(), Some("application/pdf"));
+    assert_eq!(
+        content.bytes,
+        b"%PDF-1.5\nhello\n%%EOF".to_vec(),
+        "content 端点必须回读「前端 PUT 上来的那份字节」"
+    );
 }
 
 #[tokio::test]
@@ -662,26 +682,22 @@ async fn soft_delete_happy_path() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let cos = Arc::new(NoopCos);
+    let cos = Arc::new(MockCos::new());
 
-    let mut tx = pool.begin().await.unwrap();
-    let out = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
-        .upload_file_for_owner(
-            &mut *tx,
-            UPLOAD_UPLOAD_PREFIX,
-            UPLOAD_MAX_FILE_SIZE,
-            "PART",
-            part_id,
-            "DRAWING",
-            "del.pdf",
-            "application/pdf",
-            b"%PDF-1.5\n".to_vec(),
-            &current,
-        )
-        .await
-        .unwrap();
+    let out = upload_via_confirm(
+        &pool,
+        &cos_dyn(&cos),
+        "PART",
+        part_id,
+        "DRAWING",
+        "del.pdf",
+        "application/pdf",
+        b"%PDF-1.5\n".to_vec(),
+        &current,
+    )
+    .await
+    .unwrap();
     let version = out.version;
-    tx.commit().await.unwrap();
 
     // delete by Manager（kind=DRAWING → M+C 通行）
     let mut tx = pool.begin().await.unwrap();
@@ -689,12 +705,13 @@ async fn soft_delete_happy_path() {
         .soft_delete_file(&mut *tx, out.id, version, &current)
         .await
         .expect("delete ok");
-    tx.commit().await.unwrap();
     // 2026-09-15 review A2：service 应返回 cos object_key 供 handler commit 后清理
     assert!(
         !object_key.is_empty(),
         "soft_delete_file 应返回 cos object_key"
     );
+    // 2026-10-15：软删必须 commit 才对后续断言可见（service 直调不开事务）
+    tx.commit().await.unwrap();
 
     // 再次查应 not found（include_deleted=false）
     let mut tx = pool.begin().await.unwrap();
@@ -715,25 +732,21 @@ async fn soft_delete_version_conflict() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let cos = Arc::new(NoopCos);
+    let cos = Arc::new(MockCos::new());
 
-    let mut tx = pool.begin().await.unwrap();
-    let out = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
-        .upload_file_for_owner(
-            &mut *tx,
-            UPLOAD_UPLOAD_PREFIX,
-            UPLOAD_MAX_FILE_SIZE,
-            "PART",
-            part_id,
-            "DRAWING",
-            "conf.pdf",
-            "application/pdf",
-            b"%PDF-1.5\n".to_vec(),
-            &current,
-        )
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
+    let out = upload_via_confirm(
+        &pool,
+        &cos_dyn(&cos),
+        "PART",
+        part_id,
+        "DRAWING",
+        "conf.pdf",
+        "application/pdf",
+        b"%PDF-1.5\n".to_vec(),
+        &current,
+    )
+    .await
+    .unwrap();
 
     // 故意 version+999 → 冲突
     let mut tx = pool.begin().await.unwrap();
@@ -770,48 +783,37 @@ const UPLOAD_MAX_FILE_SIZE: usize = 300 * 1024 * 1024;
 const UPLOAD_PRESIGN_EXPIRE: u32 = 3600;
 
 #[tokio::test]
-async fn confirm_tmp_missing_returns_21114() {
+async fn confirm_object_not_in_cos_returns_21114() {
     let pool = setup().await;
-    let l1 = insert_l1_customer(&pool, "客户PF-TmpMiss", "F").await;
-    let l2 = insert_l2_customer(&pool, "子客PF-TmpMiss", l1).await;
+    let l1 = insert_l1_customer(&pool, "客户PF-ObjMiss", "F").await;
+    let l2 = insert_l2_customer(&pool, "子客PF-ObjMiss", l1).await;
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let cos = Arc::new(MockCos::new()); // 未注册 tmp_key → head_object NoSuch
+    let cos = Arc::new(MockCos::new()); // 未注册该 key → head_object NoSuch
 
-    let tmp_key = "tmp/test/missing.pdf";
     let sha = "c".repeat(64);
-    let req = ConfirmFileIn {
-        // 2026-10-13 PR1b：owner 改由 body 携带（旧端点的 part_id 在 path 段）
-        owner_kind: "PART".into(),
-        owner_id: part_id.to_string(),
-        kind: "DRAWING".into(),
-        tmp_key: tmp_key.into(),
-        content_sha256: sha,
-        original_filename: "drawing.pdf".into(),
-        file_size: 1024,
-        content_type: "application/pdf".into(),
-        ext: None, // 2026-09-29 新增字段：client 未传走兼容回退
-    };
-    let err = PartFileService::bind_uploaded_file(
-        &pool,
-        shared_test_snowflake().as_ref(),
-        cos.clone(),
-        UPLOAD_UPLOAD_PREFIX,
-        UPLOAD_TMP_PREFIX,
-        UPLOAD_MAX_FILE_SIZE,
-        "PART",
-        part_id,
-        &req.kind,
-        &req.tmp_key,
-        &req.content_sha256,
-        &req.original_filename,
-        req.file_size,
-        &req.content_type,
-        &current,
-    )
-    .await
-    .expect_err("head_object 找不到 tmp_key 应报错");
+    // object_key 必须与「按 (sha256, filename) 派生」的值逐字一致，否则先被防呆拦下
+    let object_key = build_cas_key(UPLOAD_UPLOAD_PREFIX, &sha, "drawing.pdf");
+    let err = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
+        .bind_uploaded_file(
+            &pool,
+            cos.clone(),
+            UPLOAD_UPLOAD_PREFIX,
+            UPLOAD_MAX_FILE_SIZE,
+            "PART",
+            part_id,
+            "DRAWING",
+            &object_key,
+            &sha,
+            "drawing.pdf",
+            1024,
+            "application/pdf",
+            None,
+            &current,
+        )
+        .await
+        .expect_err("object_key 在 COS 上不存在应报错");
 
     match err {
         AppError::Biz { code, .. } => {
@@ -819,12 +821,67 @@ async fn confirm_tmp_missing_returns_21114() {
         }
         other => panic!("期望 AppError::Biz(21114)，got {other:?}"),
     }
-    // 验证 head 被调用了一次（mock 计数）
     assert_eq!(
-        cos.head_call_count(tmp_key),
+        cos.head_call_count(&object_key),
         1,
         "MockCos.head_object 应被调用 1 次"
     );
+}
+
+/// 2026-10-15 新增（key 防呆）：入参 `object_key` 与服务端按
+/// (content_sha256, original_filename) 重新派生出来的 CAS key 不一致 ⇒ **21114**，
+/// 且**不**触发 head（防呆排在 IO 之前）。
+#[tokio::test]
+async fn confirm_object_key_not_derived_from_sha_returns_21114_without_head() {
+    let pool = setup().await;
+    let l1 = insert_l1_customer(&pool, "客户PF-KeyGuard", "F").await;
+    let l2 = insert_l2_customer(&pool, "子客PF-KeyGuard", l1).await;
+    let part_id = insert_part_for_owner(&pool, l2).await;
+
+    let current = test_current_user_with_roles(vec![Role::Manager]);
+    let cos = Arc::new(MockCos::new());
+    let sha = "9".repeat(64);
+    // 伪造一个「存在且 size 正确」的对象：若防呆失效，它就会被登记成功
+    let forged = "uploads/9999999999999999_other.pdf";
+    cos.set_head(forged, 1024);
+
+    let err = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
+        .bind_uploaded_file(
+            &pool,
+            cos.clone(),
+            UPLOAD_UPLOAD_PREFIX,
+            UPLOAD_MAX_FILE_SIZE,
+            "PART",
+            part_id,
+            "DRAWING",
+            forged,
+            &sha,
+            "drawing.pdf",
+            1024,
+            "application/pdf",
+            None,
+            &current,
+        )
+        .await
+        .expect_err("object_key 与派生值不符必须拒绝");
+
+    match err {
+        AppError::Biz { code, .. } => assert_eq!(code, 21114),
+        other => panic!("期望 AppError::Biz(21114)，got {other:?}"),
+    }
+    assert_eq!(
+        cos.head_calls.lock().unwrap().len(),
+        0,
+        "防呆排在 head_object 之前：key 不合法时不该有任何外部 IO"
+    );
+    // 零副作用：库里没有该 owner 的 DRAWING 行
+    let rows: Vec<(i64,)> =
+        sqlx::query_as("SELECT id FROM t_part_file WHERE part_id = $1 AND kind = 'DRAWING'")
+            .bind(part_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(rows.is_empty(), "被拒的 confirm 不该留下任何行");
 }
 
 #[tokio::test]
@@ -837,47 +894,75 @@ async fn confirm_size_mismatch_returns_21115() {
     let current = test_current_user_with_roles(vec![Role::Manager]);
     let cos = Arc::new(MockCos::new());
 
-    let tmp_key = "tmp/test/sizemm.pdf";
-    // mock head 返回 size=2048，但客户端声明 size=1024 → 触发 size mismatch
-    cos.set_head(tmp_key, 2048);
     let sha = "d".repeat(64);
-    let req = ConfirmFileIn {
-        // 2026-10-13 PR1b：owner 改由 body 携带（旧端点的 part_id 在 path 段）
-        owner_kind: "PART".into(),
-        owner_id: part_id.to_string(),
-        kind: "DRAWING".into(),
-        tmp_key: tmp_key.into(),
-        content_sha256: sha,
-        original_filename: "drawing.pdf".into(),
-        file_size: 1024, // 客户端声明
-        content_type: "application/pdf".into(),
-        ext: None, // 2026-09-29 新增字段
-    };
-    let err = PartFileService::bind_uploaded_file(
-        &pool,
-        shared_test_snowflake().as_ref(),
-        cos.clone(),
-        UPLOAD_UPLOAD_PREFIX,
-        UPLOAD_TMP_PREFIX,
-        UPLOAD_MAX_FILE_SIZE,
-        "PART",
-        part_id,
-        &req.kind,
-        &req.tmp_key,
-        &req.content_sha256,
-        &req.original_filename,
-        req.file_size,
-        &req.content_type,
-        &current,
-    )
-    .await
-    .expect_err("size 不一致应报错");
+    let object_key = build_cas_key(UPLOAD_UPLOAD_PREFIX, &sha, "drawing.pdf");
+    // mock head 返回 size=2048，但客户端声明 size=1024 → 触发 size mismatch
+    cos.set_head(&object_key, 2048);
+    let err = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
+        .bind_uploaded_file(
+            &pool,
+            cos.clone(),
+            UPLOAD_UPLOAD_PREFIX,
+            UPLOAD_MAX_FILE_SIZE,
+            "PART",
+            part_id,
+            "DRAWING",
+            &object_key,
+            &sha,
+            "drawing.pdf",
+            1024, // 客户端声明
+            "application/pdf",
+            None,
+            &current,
+        )
+        .await
+        .expect_err("size 不一致应报错");
 
     match err {
         AppError::Biz { code, .. } => {
             assert_eq!(code, 21115, "BIZ_PART_FILE_SIZE_MISMATCH");
         }
         other => panic!("期望 AppError::Biz(21115)，got {other:?}"),
+    }
+}
+
+/// 2026-10-15 新增：`head` 出来是 0 字节对象（前端 PUT 空 body 落到了正式 key）
+/// 同样按「对象没落地」处理 ⇒ 21114。
+#[tokio::test]
+async fn confirm_zero_byte_object_returns_21114() {
+    let pool = setup().await;
+    let l1 = insert_l1_customer(&pool, "客户PF-Zero", "F").await;
+    let l2 = insert_l2_customer(&pool, "子客PF-Zero", l1).await;
+    let part_id = insert_part_for_owner(&pool, l2).await;
+
+    let current = test_current_user_with_roles(vec![Role::Manager]);
+    let cos = Arc::new(MockCos::new());
+    let sha = "8".repeat(64);
+    let object_key = build_cas_key(UPLOAD_UPLOAD_PREFIX, &sha, "empty.pdf");
+    cos.set_head(&object_key, 0);
+
+    let err = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
+        .bind_uploaded_file(
+            &pool,
+            cos.clone(),
+            UPLOAD_UPLOAD_PREFIX,
+            UPLOAD_MAX_FILE_SIZE,
+            "PART",
+            part_id,
+            "DRAWING",
+            &object_key,
+            &sha,
+            "empty.pdf",
+            1024,
+            "application/pdf",
+            None,
+            &current,
+        )
+        .await
+        .expect_err("0 字节对象应被拒");
+    match err {
+        AppError::Biz { code, .. } => assert_eq!(code, 21114),
+        other => panic!("期望 AppError::Biz(21114)，got {other:?}"),
     }
 }
 
@@ -892,24 +977,15 @@ async fn confirm_replace_old_single_returns_ready() {
     let cos = Arc::new(MockCos::new());
 
     // 第一次 confirm（kind=DRAWING / sha=aaa...）
-    let tmp_key_1 = "tmp/test/replace-1.pdf";
-    cos.set_head(tmp_key_1, 1024);
-    let sha_1 = "a".repeat(64);
-    let (out1, _tk1) = PartFileService::bind_uploaded_file(
+    let out1 = upload_via_confirm(
         &pool,
-        shared_test_snowflake().as_ref(),
-        cos.clone(),
-        UPLOAD_UPLOAD_PREFIX,
-        UPLOAD_TMP_PREFIX,
-        UPLOAD_MAX_FILE_SIZE,
+        &cos_dyn(&cos),
         "PART",
         part_id,
         "DRAWING",
-        tmp_key_1,
-        &sha_1,
         "first.pdf",
-        1024,
         "application/pdf",
+        b"%PDF-1.5\nfirst\n%%EOF".to_vec(),
         &current,
     )
     .await
@@ -918,24 +994,15 @@ async fn confirm_replace_old_single_returns_ready() {
     assert_eq!(out1.upload_status, "READY");
 
     // 第二次 confirm（kind=DRAWING / sha=bbb... 不同 sha → 触发旧行软删）
-    let tmp_key_2 = "tmp/test/replace-2.pdf";
-    cos.set_head(tmp_key_2, 2048);
-    let sha_2 = "b".repeat(64);
-    let (out2, _tk2) = PartFileService::bind_uploaded_file(
+    let out2 = upload_via_confirm(
         &pool,
-        shared_test_snowflake().as_ref(),
-        cos.clone(),
-        UPLOAD_UPLOAD_PREFIX,
-        UPLOAD_TMP_PREFIX,
-        UPLOAD_MAX_FILE_SIZE,
+        &cos_dyn(&cos),
         "PART",
         part_id,
         "DRAWING",
-        tmp_key_2,
-        &sha_2,
         "second.pdf",
-        2048,
         "application/pdf",
+        b"%PDF-1.5\nsecond\n%%EOF".to_vec(),
         &current,
     )
     .await
@@ -956,9 +1023,12 @@ async fn confirm_replace_old_single_returns_ready() {
         old.deleted_at.is_some(),
         "旧行 deleted_at 必须被设置（uk_t_part_file_single 单文件替换）"
     );
-    assert_eq!(old.content_sha256.as_deref(), Some(sha_1.as_str()));
+    assert_eq!(
+        old.content_sha256.as_deref(),
+        Some(out1.content_sha256.as_deref().unwrap())
+    );
 
-    // 新行：READ 且 deleted_at=NULL
+    // 新行：READY 且 deleted_at=NULL
     let mut tx = pool.begin().await.unwrap();
     let new_row = PartFileRepo::get_by_id(&mut *tx, second_id, false)
         .await
@@ -967,23 +1037,24 @@ async fn confirm_replace_old_single_returns_ready() {
     assert!(new_row.is_some(), "新行应可查到（deleted_at IS NULL）");
     let new = new_row.unwrap();
     assert!(new.deleted_at.is_none(), "新行 deleted_at 必须为 NULL");
-    assert_eq!(new.content_sha256.as_deref(), Some(sha_2.as_str()));
     assert_eq!(new.upload_status, "READY");
-    assert_eq!(new.file_size, 2048);
+    assert_eq!(
+        new.file_size,
+        b"%PDF-1.5\nsecond\n%%EOF".len() as i64,
+        "file_size 是前端声明的字节数"
+    );
 }
 
-// ===== 2026-09-29 扁平化新测试：tmp→parts copy_object + 读端点 legacy fallback =====
+// ===== 2026-09-29 扁平化：CAS key 模板五段→两段 =====
 //
-// 不依赖 axum，直接 service 直调：
-// - tmp_to_parts_copy_test：确认 CAS key 模板五段→两段后，bind_uploaded_file
-//   仍走 copy_object(tmp → cas_key)，cas_key 形如 `{prefix}{sha16}_{safe_filename}`。
-// - read_fallback_to_legacy_key_test：模拟 DB 历史行 object_key 是五段格式
-//   但 COS 桶里真实对象按新模板存的场景，验证 `resolve_effective_key` 重写后
-//   能命中。
+// - cas_key_is_two_segments：confirm 落库的 object_key 形如
+//   `{prefix}{sha16}_{safe_filename}`，且**不再**有服务端 copy（字节是前端直传到
+//   正式 key 的）。
+// - read_fallback_to_legacy_key_test：DB 历史行 object_key 是五段格式但 COS 桶里
+//   真实对象按新模板存的场景，验证 `resolve_effective_key` 重写后能命中。
 
 #[tokio::test]
-async fn tmp_to_parts_copy_test() {
-    // 2026-09-29 新增：bind_uploaded_file 派生 CAS key 走新模板（两段），copy 仍触发
+async fn cas_key_is_two_segments() {
     let pool = setup().await;
     let l1 = insert_l1_customer(&pool, "客户PF-Copy2Seg", "F").await;
     let l2 = insert_l2_customer(&pool, "子客PF-Copy2Seg", l1).await;
@@ -992,49 +1063,32 @@ async fn tmp_to_parts_copy_test() {
     let current = test_current_user_with_roles(vec![Role::Manager]);
     let cos = Arc::new(MockCos::new());
 
-    let tmp_key = "tmp/test/copy-2seg.pdf";
-    cos.set_head(tmp_key, 1024);
-    let sha = "f".repeat(64);
-    let (out, _tk) = PartFileService::bind_uploaded_file(
+    let out = upload_via_confirm(
         &pool,
-        shared_test_snowflake().as_ref(),
-        cos.clone(),
-        UPLOAD_UPLOAD_PREFIX,
-        UPLOAD_TMP_PREFIX,
-        UPLOAD_MAX_FILE_SIZE,
+        &cos_dyn(&cos),
         "PART",
         part_id,
         "DRAWING",
-        tmp_key,
-        &sha,
         "test.pdf",
-        1024,
         "application/pdf",
+        b"%PDF-1.5\ncopy2seg\n%%EOF".to_vec(),
         &current,
     )
     .await
     .expect("bind_uploaded_file 应成功");
 
-    // 2026-09-29 扁平化：新模板两段 `{prefix}{sha16}_{safe_filename}`
-    // 即 `uploads/fffffff...{16chars}_test.pdf`（prefix 兼容 .env `uploads` /
-    // `uploads/` 两种风格 —— 此处传 "uploads"，build_cas_key 自动补尾斜杠）。
-    let expected_cas_key = "uploads/ffffffffffffffff_test.pdf";
+    // 新模板两段 `{prefix}{sha16}_{safe_filename}`
+    let sha16 = out.content_sha256.as_deref().unwrap()[..16].to_string();
+    let expected_cas_key = format!("uploads/{sha16}_test.pdf");
     assert_eq!(
         out.object_key, expected_cas_key,
         "新模板 CAS key 必须两段：prefix + sha16_<safe_filename>"
     );
-
-    // copy_object 应被调用：src=tmp_key, dst=新 cas_key
-    let copy_calls = cos
-        .copy_calls
-        .lock()
-        .unwrap()
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    assert_eq!(copy_calls.len(), 1, "copy_object 应被调用 1 次");
-    assert_eq!(copy_calls[0].0, tmp_key);
-    assert_eq!(copy_calls[0].1, expected_cas_key);
+    // ⚠️ **没有服务端 copy**：字节是前端直传到正式 key 的
+    assert!(
+        cos.copy_calls.lock().unwrap().is_empty(),
+        "统一链路后服务端不再 copy（copy_calls 必须为空）"
+    );
 }
 
 #[tokio::test]
@@ -1103,25 +1157,21 @@ async fn rbac_shelf_account_can_list_files() {
     let l2 = insert_l2_customer(&pool, "子客PF-ShelfList", l1).await;
     let part_id = insert_part_for_owner(&pool, l2).await;
 
-    let cos = Arc::new(NoopCos);
+    let cos = Arc::new(MockCos::new());
     // 先由 MANAGER 造一个 DRAWING（写路径对 SHELF_ACCOUNT 仍是拒的，见下方用例）
-    let mut tx = pool.begin().await.unwrap();
-    PartFileService::new(shared_test_snowflake().clone(), cos.clone())
-        .upload_file_for_owner(
-            &mut *tx,
-            UPLOAD_UPLOAD_PREFIX,
-            UPLOAD_MAX_FILE_SIZE,
-            "PART",
-            part_id,
-            "DRAWING",
-            "shelf.pdf",
-            "application/pdf",
-            b"%PDF-1.5\nshelf\n%%EOF".to_vec(),
-            &test_current_user_with_roles(vec![Role::Manager]),
-        )
-        .await
-        .expect("MANAGER 上传应成功");
-    tx.commit().await.unwrap();
+    upload_via_confirm(
+        &pool,
+        &cos_dyn(&cos),
+        "PART",
+        part_id,
+        "DRAWING",
+        "shelf.pdf",
+        "application/pdf",
+        b"%PDF-1.5\nshelf\n%%EOF".to_vec(),
+        &test_current_user_with_roles(vec![Role::Manager]),
+    )
+    .await
+    .expect("MANAGER 上传应成功");
 
     let shelf_account = test_current_user_with_roles(vec![Role::ShelfAccount]);
     let query = hsh_erp_rust::modules::files::part_file::dto::PartFileListQuery {
@@ -1151,24 +1201,20 @@ async fn rbac_shelf_account_can_get_file_content() {
     let l2 = insert_l2_customer(&pool, "子客PF-ShelfContent", l1).await;
     let part_id = insert_part_for_owner(&pool, l2).await;
 
-    let cos = Arc::new(NoopCos);
-    let mut tx = pool.begin().await.unwrap();
-    let uploaded = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
-        .upload_file_for_owner(
-            &mut *tx,
-            UPLOAD_UPLOAD_PREFIX,
-            UPLOAD_MAX_FILE_SIZE,
-            "PART",
-            part_id,
-            "DRAWING",
-            "shelf-content.pdf",
-            "application/pdf",
-            b"%PDF-1.5\nshelf\n%%EOF".to_vec(),
-            &test_current_user_with_roles(vec![Role::Manager]),
-        )
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
+    let cos = Arc::new(MockCos::new());
+    let uploaded = upload_via_confirm(
+        &pool,
+        &cos_dyn(&cos),
+        "PART",
+        part_id,
+        "DRAWING",
+        "shelf-content.pdf",
+        "application/pdf",
+        b"%PDF-1.5\nshelf\n%%EOF".to_vec(),
+        &test_current_user_with_roles(vec![Role::Manager]),
+    )
+    .await
+    .unwrap();
 
     let shelf_account = test_current_user_with_roles(vec![Role::ShelfAccount]);
     // ⚠️ 2026-10-16 review 第 2 轮 MINOR-A：同上，取行与取字节走生产同款的两步。
@@ -1186,8 +1232,12 @@ async fn rbac_shelf_account_can_get_file_content() {
         Some("application/pdf"),
         "content_type 透传"
     );
-    // NoopCos.get_object 返回空字节（本用例只守 RBAC 放行 + content_type 透传）
-    assert!(content.bytes.is_empty(), "NoopCos 不返真实字节");
+    // 2026-10-15：替身换成 MockCos 后这里能钉「返回字节 == 上传字节」
+    assert_eq!(
+        content.bytes,
+        b"%PDF-1.5\nshelf\n%%EOF".to_vec(),
+        "工控机账号读到的必须是同一份字节"
+    );
 }
 
 /// SHELF_ACCOUNT 调 `/part-files/{id}/url` **仍被拒**：`part.drawing.print` 的默认
@@ -1199,24 +1249,20 @@ async fn rbac_shelf_account_get_file_url_still_forbidden() {
     let l2 = insert_l2_customer(&pool, "子客PF-ShelfURL", l1).await;
     let part_id = insert_part_for_owner(&pool, l2).await;
 
-    let cos = Arc::new(NoopCos);
-    let mut tx = pool.begin().await.unwrap();
-    let uploaded = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
-        .upload_file_for_owner(
-            &mut *tx,
-            UPLOAD_UPLOAD_PREFIX,
-            UPLOAD_MAX_FILE_SIZE,
-            "PART",
-            part_id,
-            "DRAWING",
-            "shelf-url.pdf",
-            "application/pdf",
-            b"%PDF-1.5\n".to_vec(),
-            &test_current_user_with_roles(vec![Role::Manager]),
-        )
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
+    let cos = Arc::new(MockCos::new());
+    let uploaded = upload_via_confirm(
+        &pool,
+        &cos_dyn(&cos),
+        "PART",
+        part_id,
+        "DRAWING",
+        "shelf-url.pdf",
+        "application/pdf",
+        b"%PDF-1.5\n".to_vec(),
+        &test_current_user_with_roles(vec![Role::Manager]),
+    )
+    .await
+    .unwrap();
 
     let shelf_account = test_current_user_with_roles(vec![Role::ShelfAccount]);
     let mut tx = pool.begin().await.unwrap();
@@ -1253,50 +1299,42 @@ async fn rbac_shelf_account_cannot_upload_or_delete() {
     let l2 = insert_l2_customer(&pool, "子客PF-ShelfWrite", l1).await;
     let part_id = insert_part_for_owner(&pool, l2).await;
 
-    let cos = Arc::new(NoopCos);
+    let cos = Arc::new(MockCos::new());
     let shelf_account = test_current_user_with_roles(vec![Role::ShelfAccount]);
 
     // 上传：40300
-    let mut tx = pool.begin().await.unwrap();
-    let up_err = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
-        .upload_file_for_owner(
-            &mut *tx,
-            UPLOAD_UPLOAD_PREFIX,
-            UPLOAD_MAX_FILE_SIZE,
-            "PART",
-            part_id,
-            "DRAWING",
-            "shelf-write.pdf",
-            "application/pdf",
-            b"%PDF-1.5\n".to_vec(),
-            &shelf_account,
-        )
-        .await
-        .expect_err("SHELF_ACCOUNT 无上传权限");
-    drop(tx);
+    let up_err = upload_via_confirm(
+        &pool,
+        &cos_dyn(&cos),
+        "PART",
+        part_id,
+        "DRAWING",
+        "shelf-write.pdf",
+        "application/pdf",
+        b"%PDF-1.5\n".to_vec(),
+        &shelf_account,
+    )
+    .await
+    .expect_err("SHELF_ACCOUNT 无上传权限");
     match up_err {
         AppError::Biz { code, .. } => assert_eq!(code, 40300, "上传：FORBIDDEN"),
         other => panic!("上传：期望 AppError::Biz(40300)，got {other:?}"),
     }
 
     // 软删：先由 MANAGER 造一个 DRAWING，SHELF_ACCOUNT 去删应 40300
-    let mut tx = pool.begin().await.unwrap();
-    let uploaded = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
-        .upload_file_for_owner(
-            &mut *tx,
-            UPLOAD_UPLOAD_PREFIX,
-            UPLOAD_MAX_FILE_SIZE,
-            "PART",
-            part_id,
-            "DRAWING",
-            "shelf-write.pdf",
-            "application/pdf",
-            b"%PDF-1.5\n".to_vec(),
-            &test_current_user_with_roles(vec![Role::Manager]),
-        )
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
+    let uploaded = upload_via_confirm(
+        &pool,
+        &cos_dyn(&cos),
+        "PART",
+        part_id,
+        "DRAWING",
+        "shelf-write.pdf",
+        "application/pdf",
+        b"%PDF-1.5\n".to_vec(),
+        &test_current_user_with_roles(vec![Role::Manager]),
+    )
+    .await
+    .unwrap();
 
     let mut tx = pool.begin().await.unwrap();
     let del_err = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
@@ -1350,24 +1388,20 @@ async fn bootstrap_hardcut_guard() -> (PgPool, axum::Router, String, i64, i64) {
     let l2 = insert_l2_customer(&pool, "子客PF-HardCut", l1).await;
     let part_id = insert_part_for_owner(&pool, l2).await;
 
-    let cos = Arc::new(NoopCos);
-    let mut tx = pool.begin().await.unwrap();
-    let out = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
-        .upload_file_for_owner(
-            &mut *tx,
-            UPLOAD_UPLOAD_PREFIX,
-            UPLOAD_MAX_FILE_SIZE,
-            "PART",
-            part_id,
-            "DRAWING",
-            "hardcut.pdf",
-            "application/pdf",
-            b"%PDF-1.5\nhardcut\n%%EOF".to_vec(),
-            &test_current_user_with_roles(vec![Role::Manager]),
-        )
-        .await
-        .expect("MANAGER 上传应成功（保证 404 不是「资源不存在」造成的）");
-    tx.commit().await.unwrap();
+    let cos = Arc::new(MockCos::new());
+    let out = upload_via_confirm(
+        &pool,
+        &cos_dyn(&cos),
+        "PART",
+        part_id,
+        "DRAWING",
+        "hardcut.pdf",
+        "application/pdf",
+        b"%PDF-1.5\nhardcut\n%%EOF".to_vec(),
+        &test_current_user_with_roles(vec![Role::Manager]),
+    )
+    .await
+    .expect("MANAGER 上传应成功（保证 404 不是「资源不存在」造成的）");
 
     (pool, app, token, out.id, part_id)
 }
@@ -1581,24 +1615,20 @@ async fn bootstrap_pr1b_hardcut_guard() -> (PgPool, axum::Router, String, i64, i
     .expect("insert t_assembly");
 
     // 再给装配件造一条真实的 ASSEMBLY_MASTER 文件行（owner_kind=ASSEMBLY）
-    let cos = Arc::new(NoopCos);
-    let mut tx = pool.begin().await.unwrap();
-    PartFileService::new(shared_test_snowflake().clone(), cos)
-        .upload_file_for_owner(
-            &mut *tx,
-            UPLOAD_UPLOAD_PREFIX,
-            UPLOAD_MAX_FILE_SIZE,
-            "ASSEMBLY",
-            asm_id,
-            "ASSEMBLY_MASTER",
-            "hardcut-master.pdf",
-            "application/pdf",
-            b"%PDF-1.5\nhardcut master\n%%EOF".to_vec(),
-            &test_current_user_with_roles(vec![Role::Manager]),
-        )
-        .await
-        .expect("MANAGER 上传装配件 PDF 应成功");
-    tx.commit().await.unwrap();
+    let cos = Arc::new(MockCos::new());
+    upload_via_confirm(
+        &pool,
+        &cos_dyn(&cos),
+        "ASSEMBLY",
+        asm_id,
+        "ASSEMBLY_MASTER",
+        "hardcut-master.pdf",
+        "application/pdf",
+        b"%PDF-1.5\nhardcut master\n%%EOF".to_vec(),
+        &test_current_user_with_roles(vec![Role::Manager]),
+    )
+    .await
+    .expect("MANAGER 上传装配件 PDF 应成功");
 
     (pool, app, token, part_id, asm_id)
 }
@@ -1801,7 +1831,7 @@ fn asm_list_query(
 /// `list_files` 的薄壳（service 直调 + 自开自提交 tx），供上面两条用例复用。
 async fn asm_list(
     pool: &PgPool,
-    cos: &Arc<NoopCos>,
+    cos: &Arc<MockCos>,
     current: &CurrentUser,
     q: hsh_erp_rust::modules::files::part_file::dto::PartFileListQuery,
 ) -> hsh_erp_rust::modules::files::part_file::vo::PartFileListOut {
@@ -1833,25 +1863,21 @@ async fn list_assembly_owner_filters_by_kind_and_owner() {
     let asm_b = insert_assembly_row(&pool, "ASM-LIST-B", l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let cos = Arc::new(NoopCos);
+    let cos = Arc::new(MockCos::new());
 
-    let mut tx = pool.begin().await.unwrap();
-    let out = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
-        .upload_file_for_owner(
-            &mut *tx,
-            UPLOAD_UPLOAD_PREFIX,
-            UPLOAD_MAX_FILE_SIZE,
-            "ASSEMBLY",
-            asm_a,
-            "ASSEMBLY_MASTER",
-            "master-a.pdf",
-            "application/pdf",
-            b"%PDF-1.5\nasm list a\n%%EOF".to_vec(),
-            &current,
-        )
-        .await
-        .expect("装配件上传应成功");
-    tx.commit().await.unwrap();
+    let out = upload_via_confirm(
+        &pool,
+        &cos_dyn(&cos),
+        "ASSEMBLY",
+        asm_a,
+        "ASSEMBLY_MASTER",
+        "master-a.pdf",
+        "application/pdf",
+        b"%PDF-1.5\nasm list a\n%%EOF".to_vec(),
+        &current,
+    )
+    .await
+    .expect("装配件上传应成功");
 
     // ① 按 owner_kind=ASSEMBLY + owner_id 命中，且 items 内容正确
     let r = asm_list(
@@ -1933,31 +1959,28 @@ async fn soft_delete_assembly_master_happy_path() {
     let asm_id = insert_assembly_row(&pool, "ASM-DEL", l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let cos = Arc::new(NoopCos);
+    let cos = Arc::new(MockCos::new());
 
-    let mut tx = pool.begin().await.unwrap();
-    let out = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
-        .upload_file_for_owner(
-            &mut *tx,
-            UPLOAD_UPLOAD_PREFIX,
-            UPLOAD_MAX_FILE_SIZE,
-            "ASSEMBLY",
-            asm_id,
-            "ASSEMBLY_MASTER",
-            "master-del.pdf",
-            "application/pdf",
-            b"%PDF-1.5\nasm del\n%%EOF".to_vec(),
-            &current,
-        )
-        .await
-        .expect("装配件上传应成功");
-    tx.commit().await.unwrap();
+    let out = upload_via_confirm(
+        &pool,
+        &cos_dyn(&cos),
+        "ASSEMBLY",
+        asm_id,
+        "ASSEMBLY_MASTER",
+        "master-del.pdf",
+        "application/pdf",
+        b"%PDF-1.5\nasm del\n%%EOF".to_vec(),
+        &current,
+    )
+    .await
+    .expect("装配件上传应成功");
 
     let mut tx = pool.begin().await.unwrap();
     let object_key = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
         .soft_delete_file(&mut *tx, out.id, out.version, &current)
         .await
         .expect("ASSEMBLY_MASTER 应可软删（与 DRAWING 同款 M+C 角色面）");
+    // 2026-10-15：软删必须 commit 才对后续断言可见
     tx.commit().await.unwrap();
     assert_eq!(object_key, out.object_key, "返回的应是软删行的 CAS key");
 
@@ -1973,4 +1996,86 @@ async fn soft_delete_assembly_master_happy_path() {
         .unwrap();
     drop(tx);
     assert_eq!(after.items.len(), 0, "软删后列表不应再有该行");
+}
+
+// ===========================================================================
+//  2026-10-15 硬切守卫：统一上传链路上线的三条旧路径**整段消失**
+//
+//  与上方 2026-10-13 的 7 条守卫同源：端点下线必须**干净 404**，既不能被
+//  任何 `Path<i64>` catch-all 吞成 400，也不能被 40100 / 40300 解释掉。
+//  判据：带**合法 MANAGER token** 打旧 URL，断言 HTTP 404。
+//
+//  覆盖的 3 条旧 URL：
+//  - POST /api/v2/files/sts-tmp-keys        （python STS 转发）
+//  - POST /api/v2/files/objects             （multipart 上传代理）
+//  - POST /api/v2/files/cnc/pairs           （CNC 配对 multipart）
+//
+//  ⚠️ `POST /files/objects` 是**同前缀同段数**最危险的一条：删掉它之后，路径
+//  只剩 `GET /files/objects` 注册。若哪天有人把 `.route("/", get(h).post(h))`
+//  改回去，这条立刻红。
+// ===========================================================================
+
+#[tokio::test]
+async fn upload_chain_hard_cut_returns_404() {
+    let (_pool, app, token, _file_id, _part_id) = bootstrap_hardcut_guard().await;
+
+    let cases = [
+        // 整段前缀消失 ⇒ 干净 404
+        ("POST", "/files/sts-tmp-keys", StatusCode::NOT_FOUND),
+        ("POST", "/files/cnc/pairs", StatusCode::NOT_FOUND),
+        // ⚠️ `POST /files/objects` 是 **405**：路径本身还在（列表端点
+        // `GET /files/objects` 挂在同一个 `.route("/", get(h))` 上），matchit
+        // 先判路径、再判方法 ⇒ 只注册 GET 的路径收到 POST 就是 405。
+        // 同款先例见 `print_template/upload.rs::old_upload_endpoint_is_gone_and_list_still_works`。
+        ("POST", "/files/objects", StatusCode::METHOD_NOT_ALLOWED),
+    ];
+    for (method, uri, want) in cases {
+        let (status, raw) =
+            send_raw(app.clone(), json_request(method, uri, None, Some(&token))).await;
+        assert_eq!(
+            status, want,
+            "旧端点 {method} /api/v2{uri} 必须 {want}（硬切无 alias）: {status} {raw}"
+        );
+    }
+    // 对照组：同一路径的 GET 仍 200（证明 405 是方法不匹配、不是整段前缀没了）
+    let (status, env) = send(
+        app.clone(),
+        json_request("GET", "/files/objects", None, Some(&token)),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "对照组：GET /files/objects 仍可用（列表端点未被牵连）: {env}"
+    );
+}
+
+/// `POST /files/objects/upload-intents` 存在 ⇒ 上一条的 404 不是「整个 files
+/// 前缀都没了」的假象。这条是**反向对照**：给硬切守卫配一个正向锚点。
+#[tokio::test]
+async fn upload_intents_route_is_not_swallowed_by_old_catch_all() {
+    let (_pool, app, token, _file_id, part_id) = bootstrap_hardcut_guard().await;
+
+    // body 故意不合规（空 items）：只验「路由命中并进入 handler」（⇒ 422 业务信封），
+    // 而不是「路由不存在」（⇒ 404）。
+    let (status, envelope) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/files/objects/upload-intents",
+            Some(json!({
+                "owner_kind": "PART",
+                "owner_id": part_id.to_string(),
+                "items": [],
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "/files/objects/upload-intents 必须命中 handler（空 items ⇒ 40001），实际 {status} {envelope}"
+    );
+    assert_eq!(envelope["code"], 40001, "{envelope}");
 }

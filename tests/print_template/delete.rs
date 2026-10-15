@@ -23,7 +23,7 @@ use crate::{
 async fn seed(ctx: &Ctx, customer_id: i64, tag: &str) -> (i64, Vec<u8>) {
     let bytes = minimal_xlsx_bytes(tag);
     let (st, env) = upload(ctx, customer_id, "待删除.xlsx", &bytes, &ctx.manager_token).await;
-    assert_eq!(st, StatusCode::CREATED, "seed 上传失败：{env}");
+    assert_eq!(st, StatusCode::OK, "seed 模板写入失败：{env}");
     let id = env["data"]["id"].as_str().unwrap().parse::<i64>().unwrap();
     let version = env["data"]["version"].as_i64().unwrap() as i32;
     assert_eq!(version, 0, "新行 version 从 0 起");

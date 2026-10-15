@@ -1,667 +1,872 @@
-//! `files::part_file` 通用上传原语的集成测试（2026-10-13 PR1b 自
-//! `tests/assembly/files.rs` 迁入）
+//! `POST /api/v2/files/objects/upload-intents` 集成测试（2026-10-15 新建）
 //!
-//! ## 为什么从 assembly binary 迁过来
+//! 被测端点是统一收文件链路的第 ② 步：业务提交成功后签发**预签 PUT URL**，
+//! 前端拿它直传 COS（字节不过 rust 进程），再走第 ④ 步
+//! `POST /files/objects/confirm` 登记。
 //!
-//! 端点 `POST /api/v2/assemblies/{assembly_id}/files` 已下线，上传并入
-//! `POST /api/v2/files/objects`（四合一）。被测对象从
-//! `AssemblyService::upload_assembly_files` 变成
-//! `PartFileService::upload_file_for_owner`（`owner_kind=ASSEMBLY` /
-//! `kind=ASSEMBLY_MASTER`），归属随端点一起搬进 files 域，故按「一域一份测试
-//! binary」的约定迁到本 binary。`tests/assembly/lifecycle.rs` 保留其余 4 条
-//! 生命周期用例（那是文件更名，不是搬家）。
+//! ## 为什么这三条打 HTTP、而不是 service 直调
 //!
-//! ## 集成策略
-//! service 直调（不打 HTTP）：`pool.begin()` → `&mut *tx` 喂 service → 显式
-//! `tx.commit()`。
+//! 本端点的契约面**大半在 HTTP 层**：批量 `items[]` 的反序列化、雪花 id 的
+//! string 形态、`R<T>` 信封、`already_exists` / `upload_url` 的两态出参。service
+//! 直调结构上测不到这些。
 //!
-//! ⚠️ 2026-10-13 review 第 1 轮 MINOR-4：service 直调**测不到** handler 层的
-//! multipart 契约（字段分发 / `serde_json` 解析 / 雪花 id parse / 三条 20104 分支 /
-//! 201 Created + 信封）。故本文件末尾另加了 3 条**打真实 HTTP 路由**的用例，
-//! multipart body 由本地 `upload_request` 手工拼（test-support 无同名 helper，
-//! 它不是 fixture，是请求构造）。
+//! ## 覆盖
+//! 1. `intents_happy_path`                     — 正常签发：URL 含 object_key、content_type 与请求一致、expires_in > 0
+//! 2. `intents_cas_hit_is_instant_upload`      — CAS 命中秒传：already_exists + existing_file + **不返回 upload_url**
+//! 3. `intents_batch_echoes_client_ref_in_order` — 批量：`client_ref` 原样回显、顺序对应
+//! 4. `intents_clerk_can_sign`                 — 角色：CLERK 可用（PART）
+//! 5. `intents_inspector_and_shelf_rejected`   — 角色：INSPECTOR / SHELF_ACCOUNT 被拒（403）
+//! 6. `intents_validation_matrix`              — sha 非 64hex / size=0 / size 超限 /
+//!    扩展名与 kind 不匹配 / content_type 与 ext 不匹配 / owner 不存在 /
+//!    owner_kind × kind 配对
+//! 7. `intents_customer_delivery_template_*`   — CUSTOMER × DELIVERY_TEMPLATE：
+//!    MANAGER 可、CLERK 403、绑**二级**客户被拒
 //!
-//! ## 覆盖场景
-//!   1. upload_assembly_master_happy_path — ASSEMBLY owner 上传 PDF → 落库 + 详情可见
-//!   2. upload_assembly_master_ext_must_be_pdf — 扩展名 .step → 21102
-//!   3. upload_assembly_master_cas_dedup — 同内容二次上传 → CAS 命中（同一 id）
-//!   4. upload_unknown_owner_kind_rejected — owner_kind 不在 {PART, ASSEMBLY} → 20104
-//!   5. upload_empty_bytes_rejected — 0 字节 → 40001（review 第 1 轮 MAJOR-1 补回）
-//!   6. upload_over_max_file_size_returns_21103 — 超 `cfg_max_file_size` → 21103（同上）
-//!   7. upload_cross_owner_kind_pair_rejected — PART + ASSEMBLY_MASTER 等错配 → 20104（MINOR-3）
-//!   8. http_upload_happy_path_returns_201 — HTTP 层 happy path（MINOR-4）
-//!   9. http_upload_non_numeric_owner_id_returns_20104 — `owner_id` 非数字（MINOR-4）
-//!  10. http_upload_missing_file_returns_20104 — 缺 `file` 字段（MINOR-4）
+//! ## ⚠️ CAS 秒传那两条的零副作用断言
+//!
+//! 「命中就不签 URL」是秒传的**观测点**：`MockCos::put_url_calls` 必须**不增长**
+//! （替身的 `presigned_put_url` 是纯内存签名，不发网络请求）。若哪天改成「命中也签」，
+//! 用例当场红。
 
 use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use hsh_erp_rust::auth::rbac::{CurrentUser, Role};
-use hsh_erp_rust::infra::clock::now_naive;
-use hsh_erp_rust::infra::cos::NoopCos;
-use hsh_erp_rust::modules::assembly::dto::AssemblyCreateRequest;
-use hsh_erp_rust::modules::assembly::service::AssemblyService;
-use hsh_erp_rust::modules::files::part_file::service::PartFileService;
-use hsh_erp_rust::shared::error::AppError;
-use serde_json::json;
+use serde_json::{Value, json};
 use sqlx::PgPool;
 
+use hsh_erp_rust::infra::cos::CosClient;
+use hsh_erp_rust::modules::files::part_file::repo::PartFileRepoTrait;
 use hsh_erp_test_support::{
-    AssemblyFixture, load_assembly_fixture, login_token, send, shared_test_snowflake, test_app,
-    test_pool, test_state,
+    MockCos, PartFixture, load_part_fixture, login_token, send, test_app, test_pool, test_state,
+    test_state_with_cos,
 };
 
-/// 2026-10-13：与 `part_file.rs` 的 `UPLOAD_UPLOAD_PREFIX` 同款常量 —— 那是
-/// **测试自造**的 cfg 值（test-support 的 `test_state` 配 `uploads`），与
-/// `config.rs` 的缺省 `obj/` 无关，两者互不干扰。
-const UPLOAD_UPLOAD_PREFIX: &str = "uploads";
-
-/// 上传 size 上限（2026-10-13 review 第 1 轮 MAJOR-1：`upload_file_for_owner` 新增收
-/// `cfg_max_file_size` 形参，由 handler 传 `state.config.cos.max_file_size`）。
-/// 与 `test_state` 的 `CosConfig.max_file_size`（300MB）逐字一致。
-const UPLOAD_MAX_FILE_SIZE: usize = 300 * 1024 * 1024;
-
-async fn setup() -> (PgPool, AssemblyFixture) {
+async fn setup() -> (PgPool, PartFixture) {
     let pool = test_pool().await;
-    let fx = load_assembly_fixture(&pool).await;
+    let fx = load_part_fixture(&pool).await;
     (pool, fx)
 }
 
-async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
-    let id = shared_test_snowflake().next_id();
-    let now = now_naive();
-    sqlx::query(
-        "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
-         created_at, created_by, updated_at, updated_by) \
-         VALUES ($1, $2, NULL, $3, 0, $4, NULL, $4, NULL)",
-    )
-    .bind(id)
-    .bind(name)
-    .bind(prefix)
-    .bind(now)
-    .execute(pool)
-    .await
-    .expect("insert L1");
-    id
+/// `MockCos` 注入的 app（签发 URL 的可观测点靠它；生产走 OpenDalCos）。
+async fn app_with_mock_cos(pool: &PgPool) -> (axum::Router, Arc<MockCos>) {
+    let cos = Arc::new(MockCos::new());
+    let state = test_state_with_cos(pool.clone(), cos.clone()).await;
+    (test_app(state), cos)
 }
 
-async fn insert_l2_customer(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
-    let id = shared_test_snowflake().next_id();
-    let now = now_naive();
-    sqlx::query(
-        "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
-         created_at, created_by, updated_at, updated_by) \
-         VALUES ($1, $2, $3, NULL, 0, $4, NULL, $4, NULL)",
-    )
-    .bind(id)
-    .bind(name)
-    .bind(l1_id)
-    .bind(now)
-    .execute(pool)
-    .await
-    .expect("insert L2");
-    id
+fn sha_of(bytes: &[u8]) -> String {
+    hsh_erp_rust::modules::files::part_file::repo::hash_bytes(bytes)
 }
 
-async fn insert_serial_counter(pool: &PgPool, prefix: &str, initial: i64) {
-    let now = now_naive();
-    sqlx::query(
-        "INSERT INTO t_serial_counter (prefix, counter, version, created_at, created_by, \
-         updated_at, updated_by) \
-         VALUES ($1, $2, 0, $3, NULL, $3, NULL) \
-         ON CONFLICT (prefix) DO UPDATE SET counter = EXCLUDED.counter, \
-                                           version = 0, updated_at = EXCLUDED.updated_at",
-    )
-    .bind(prefix)
-    .bind(initial)
-    .bind(now)
-    .execute(pool)
-    .await
-    .expect("seed counter");
+/// 造一个 item 请求体（字段名与 `UploadIntentsIn` 逐字对齐）。
+fn item(
+    client_ref: &str,
+    kind: &str,
+    filename: &str,
+    content_type: &str,
+    size: i64,
+    sha: &str,
+) -> Value {
+    json!({
+        "client_ref": client_ref,
+        "kind": kind,
+        "original_filename": filename,
+        "content_type": content_type,
+        // ⚠️ 仓内约定：入参数字一律 JSON **string**（serde `deserialize_i64`）
+        "file_size": size.to_string(),
+        "content_sha256": sha,
+    })
 }
 
-fn test_current_user(roles: Vec<Role>) -> CurrentUser {
-    CurrentUser {
+fn intents_request(
+    token: &str,
+    owner_kind: &str,
+    owner_id: &str,
+    items: Vec<Value>,
+) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/files/objects/upload-intents")
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::from(
+            json!({ "owner_kind": owner_kind, "owner_id": owner_id, "items": items }).to_string(),
+        ))
+        .unwrap()
+}
+
+/// 把「上传意图 → 模拟 PUT → confirm」跑完，返回 confirm 的行。
+///
+/// 与真实链路的唯一差别：第 ③ 步用 `cos.put_object`（替身）代替浏览器发 HTTP PUT。
+#[allow(clippy::too_many_arguments)]
+async fn upload_via_chain(
+    pool: &PgPool,
+    cos: &Arc<MockCos>,
+    owner_kind: &str,
+    owner_id: i64,
+    kind: &str,
+    filename: &str,
+    content_type: &str,
+    bytes: Vec<u8>,
+    current: &hsh_erp_rust::auth::rbac::CurrentUser,
+) -> hsh_erp_rust::modules::files::part_file::vo::PartFileOut {
+    let svc = hsh_erp_rust::modules::files::part_file::service::PartFileService::new(
+        hsh_erp_test_support::shared_test_snowflake().clone(),
+        cos.clone(),
+    );
+    let sha = sha_of(&bytes);
+    let object_key = hsh_erp_rust::util::cos_key::build_cas_key("uploads", &sha, filename);
+    cos.put_object(&object_key, bytes.clone(), content_type)
+        .await
+        .expect("模拟前端 PUT 直传");
+    svc.bind_uploaded_file(
+        pool,
+        cos.clone(),
+        "uploads",
+        300 * 1024 * 1024,
+        owner_kind,
+        owner_id,
+        kind,
+        &object_key,
+        &sha,
+        filename,
+        bytes.len() as i64,
+        content_type,
+        None,
+        current,
+    )
+    .await
+    .expect("confirm 应成功")
+}
+
+fn manager() -> hsh_erp_rust::auth::rbac::CurrentUser {
+    hsh_erp_rust::auth::rbac::CurrentUser {
         id: 1,
-        username: "asm_files_tester".into(),
-        roles,
+        username: "manager".into(),
+        roles: vec![hsh_erp_rust::auth::rbac::Role::Manager],
         shelf_ids: vec![],
         shelf_wildcard: false,
         permissions: Vec::new(),
     }
 }
 
-/// 建一个不传 PDF 的装配件（建单端点仍会派发 serial_no，PDF 只用于页数校验）。
-async fn seed_assembly(pool: &PgPool, suffix: &str) -> i64 {
-    let l1 = insert_l1_customer(pool, &format!("客户AFU-{suffix}"), "F").await;
-    let l2 = insert_l2_customer(pool, &format!("子客AFU-{suffix}"), l1).await;
-    insert_serial_counter(pool, "F", 0).await;
-    let mut tx = pool.begin().await.unwrap();
-    let req = AssemblyCreateRequest {
-        drawing_no: format!("D-AFU-{suffix}"),
-        name: format!("asm-upload-{suffix}"),
-        applicant_name: None,
-        customer_id: l2.to_string(),
-        request_date: None,
-        planned_delivery_date: None,
-        is_urgent: Some(false),
-        quantity: Some(1),
-        unit_price: None,
-        total_price: None,
-        order_no: None,
-        system_delivery_date: None,
-        note: None,
-        children: vec![],
-    };
-    let current = test_current_user(vec![Role::Manager]);
-    let asm = AssemblyService::create_assembly(
-        &mut tx,
-        shared_test_snowflake().as_ref(),
-        &req,
-        vec![],
-        &current,
-    )
-    .await
-    .expect("create assembly");
-    tx.commit().await.unwrap();
-    asm.assembly.id
-}
-
-fn pdf_bytes(tag: &str) -> Vec<u8> {
-    format!("%PDF-1.5\n{tag}\n%%EOF").into_bytes()
-}
-
-/// ASSEMBLY owner 上传 `ASSEMBLY_MASTER` 成功，且 `GET /assemblies/{id}` 详情可见。
-///
-/// ⚠️ 这条同时守住了「端点下线不等于能力下线」：`GET /assemblies/{id}/files` 端点
-/// 被删了，但**详情里的 `files[]` 仍在**（走 `service/crud.rs` 的
-/// `list_part_files_by_owner`），两条是不同的路径。
-#[tokio::test]
-async fn upload_assembly_master_happy_path() {
-    let (pool, _fx) = setup().await;
-    let asm_id = seed_assembly(&pool, "OK").await;
-    let cos = Arc::new(NoopCos);
-    let current = test_current_user(vec![Role::Manager]);
-
-    let mut tx = pool.begin().await.unwrap();
-    let out = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
-        .upload_file_for_owner(
-            &mut *tx,
-            UPLOAD_UPLOAD_PREFIX,
-            UPLOAD_MAX_FILE_SIZE,
-            "ASSEMBLY",
-            asm_id,
-            "ASSEMBLY_MASTER",
-            "master.pdf",
-            "application/pdf",
-            pdf_bytes("upload happy"),
-            &current,
-        )
-        .await
-        .expect("upload ok");
-    tx.commit().await.unwrap();
-
-    assert_eq!(out.kind, "ASSEMBLY_MASTER");
-    assert_eq!(out.file_type, "PDF");
-    assert_eq!(out.owner_kind, "ASSEMBLY");
-    assert_eq!(out.owner_id, asm_id);
-    assert_eq!(out.original_filename, "master.pdf");
-    assert!(out.content_sha256.is_some());
-
-    let mut tx = pool.begin().await.unwrap();
-    let detail = AssemblyService::get_assembly(&mut tx, asm_id, &current)
-        .await
-        .unwrap();
-    drop(tx);
-    assert_eq!(detail.files.len(), 1, "详情 files[] 应看到刚上传的 PDF");
-    assert_eq!(detail.files[0].id, out.id);
-    assert_eq!(detail.files[0].original_filename, "master.pdf");
-}
-
-/// 非 PDF 扩展名 → 21102 `BIZ_PART_FILE_BAD_TYPE`。
-#[tokio::test]
-async fn upload_assembly_master_ext_must_be_pdf() {
-    let (pool, _fx) = setup().await;
-    let asm_id = seed_assembly(&pool, "EXT").await;
-    let cos = Arc::new(NoopCos);
-    let current = test_current_user(vec![Role::Manager]);
-
-    let mut tx = pool.begin().await.unwrap();
-    let err = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
-        .upload_file_for_owner(
-            &mut *tx,
-            UPLOAD_UPLOAD_PREFIX,
-            UPLOAD_MAX_FILE_SIZE,
-            "ASSEMBLY",
-            asm_id,
-            "ASSEMBLY_MASTER",
-            "master.step",
-            "application/octet-stream",
-            b"some step data".to_vec(),
-            &current,
-        )
-        .await
-        .expect_err("非 PDF 扩展名应被拒");
-    drop(tx);
-
-    match err {
-        AppError::Biz { code, .. } => assert_eq!(code, 21102, "BIZ_PART_FILE_BAD_TYPE"),
-        other => panic!("期望 AppError::Biz(21102)，got {other:?}"),
-    }
-}
-
-/// CAS 去重：同 owner + 同 kind + 同内容二次上传 → 返回**同一条**记录。
-///
-/// ⚠️ 这是 `upload_file_for_owner` 与被删的 `PartService::upload_part_file`
-/// 判据不同带来的行为：`upload_file_for_owner` 按 **sha** 去重（省一次 COS PUT），
-/// `upload_part_file` 按 `(owner, kind)` 去重（不看内容）。
-#[tokio::test]
-async fn upload_assembly_master_cas_dedup() {
-    let (pool, _fx) = setup().await;
-    let asm_id = seed_assembly(&pool, "CAS").await;
-    let cos = Arc::new(NoopCos);
-    let current = test_current_user(vec![Role::Manager]);
-    let svc = PartFileService::new(shared_test_snowflake().clone(), cos.clone());
-
-    let mut tx = pool.begin().await.unwrap();
-    let first = svc
-        .upload_file_for_owner(
-            &mut *tx,
-            UPLOAD_UPLOAD_PREFIX,
-            UPLOAD_MAX_FILE_SIZE,
-            "ASSEMBLY",
-            asm_id,
-            "ASSEMBLY_MASTER",
-            "first.pdf",
-            "application/pdf",
-            pdf_bytes("identical"),
-            &current,
-        )
-        .await
-        .expect("first upload");
-    tx.commit().await.unwrap();
-
-    let mut tx = pool.begin().await.unwrap();
-    let second = svc
-        .upload_file_for_owner(
-            &mut *tx,
-            UPLOAD_UPLOAD_PREFIX,
-            UPLOAD_MAX_FILE_SIZE,
-            "ASSEMBLY",
-            asm_id,
-            "ASSEMBLY_MASTER",
-            "second.pdf",
-            "application/pdf",
-            pdf_bytes("identical"),
-            &current,
-        )
-        .await
-        .expect("CAS 命中不应报错");
-    tx.commit().await.unwrap();
-
-    assert_eq!(first.id, second.id, "CAS 命中应返回已有记录");
-    assert_eq!(first.object_key, second.object_key);
-}
-
-/// `owner_kind` 不在 `{PART, ASSEMBLY}` 白名单 → 20104 `BIZ_INVALID_VALUE`。
-#[tokio::test]
-async fn upload_unknown_owner_kind_rejected() {
-    let (pool, _fx) = setup().await;
-    let asm_id = seed_assembly(&pool, "KIND").await;
-    let cos = Arc::new(NoopCos);
-    let current = test_current_user(vec![Role::Manager]);
-
-    let mut tx = pool.begin().await.unwrap();
-    let err = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
-        .upload_file_for_owner(
-            &mut *tx,
-            UPLOAD_UPLOAD_PREFIX,
-            UPLOAD_MAX_FILE_SIZE,
-            "PART_FILE", // 既不是 PART 也不是 ASSEMBLY
-            asm_id,
-            "ASSEMBLY_MASTER",
-            "master.pdf",
-            "application/pdf",
-            pdf_bytes("bad owner kind"),
-            &current,
-        )
-        .await
-        .expect_err("未知 owner_kind 应被拒");
-    drop(tx);
-
-    match err {
-        AppError::Biz { code, .. } => assert_eq!(code, 20104, "BIZ_INVALID_VALUE"),
-        other => panic!("期望 AppError::Biz(20104)，got {other:?}"),
-    }
-}
-
-/// **0 字节文件** → 40001 `VALIDATION_ERROR`（2026-10-13 review 第 1 轮 MAJOR-1）。
-///
-/// 这道守卫是被删的 `PartService::upload_part_file` 带过的，PR1b 四合一时丢了：
-/// 丢了之后 `.pdf` 空文件能过 ext / content_type 两道校验 → `hash_bytes(&[])` →
-/// `put_object` 写 0 字节对象 → INSERT `file_size = 0` 的行。
-///
-/// ⚠️ 断言的是 **40001 而不是 21103**：空文件是「无效输入」，不是「太大」，与被删
-/// 实现的取舍逐字一致。
-#[tokio::test]
-async fn upload_empty_bytes_rejected() {
-    let (pool, _fx) = setup().await;
-    let asm_id = seed_assembly(&pool, "EMPTY").await;
-    let cos = Arc::new(NoopCos);
-    let current = test_current_user(vec![Role::Manager]);
-
-    let mut tx = pool.begin().await.unwrap();
-    let err = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
-        .upload_file_for_owner(
-            &mut *tx,
-            UPLOAD_UPLOAD_PREFIX,
-            UPLOAD_MAX_FILE_SIZE,
-            "ASSEMBLY",
-            asm_id,
-            "ASSEMBLY_MASTER",
-            "master.pdf",
-            "application/pdf",
-            Vec::new(), // ← 0 字节
-            &current,
-        )
-        .await
-        .expect_err("0 字节应被拒");
-    drop(tx);
-
-    match err {
-        AppError::Validation(msg) => assert!(
-            msg.contains("字节为空"),
-            "错误文案应指向空字节，实际：{msg}"
-        ),
-        other => panic!("期望 AppError::Validation(40001)，got {other:?}"),
-    }
-
-    // 取证：DB 里不能留下 file_size = 0 的行（守卫必须发生在 INSERT 之前）
-    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM t_part_file WHERE part_id = $1")
-        .bind(asm_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(rows, 0, "被拒的上传不应留下任何 t_part_file 行");
-}
-
-/// **超过 `cfg_max_file_size`** → 21103 `BIZ_PART_FILE_TOO_LARGE`（同上，MAJOR-1）。
-///
-/// ⚠️ 上限**由形参传入**，所以这里传一个 16 字节的小值就能触发，不必真造 100MB 的
-/// payload —— 这也顺带证明了「上限来自配置、不是写死的常量」。
-///
-/// 丢掉这道守卫的另一后果：21103 在 multipart 上传路径上**彻底不可达**
-/// （`dto::validate::check_file_size` 的唯一调用方只剩 `bind_uploaded_file`）。
-#[tokio::test]
-async fn upload_over_max_file_size_returns_21103() {
-    let (pool, _fx) = setup().await;
-    let asm_id = seed_assembly(&pool, "BIG").await;
-    let cos = Arc::new(NoopCos);
-    let current = test_current_user(vec![Role::Manager]);
-    const TINY_MAX: usize = 16;
-
-    let mut tx = pool.begin().await.unwrap();
-    let err = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
-        .upload_file_for_owner(
-            &mut *tx,
-            UPLOAD_UPLOAD_PREFIX,
-            TINY_MAX,
-            "ASSEMBLY",
-            asm_id,
-            "ASSEMBLY_MASTER",
-            "master.pdf",
-            "application/pdf",
-            pdf_bytes("这段内容明确长于 16 字节上限"),
-            &current,
-        )
-        .await
-        .expect_err("超限应被拒");
-    drop(tx);
-
-    match err {
-        AppError::Biz { code, .. } => assert_eq!(code, 21103, "BIZ_PART_FILE_TOO_LARGE"),
-        other => panic!("期望 AppError::Biz(21103)，got {other:?}"),
-    }
-}
-
-/// `owner_kind` × `kind` 错配 → 20104（2026-10-13 review 第 1 轮 MINOR-3）。
-///
-/// 四合一之前这层配对由各端点的 path 段结构性保证；合并后两个字段都来自 client，
-/// 不加守卫就会造出 `part + ASSEMBLY_MASTER` 这种**永不可删**的行
-/// （`soft_delete_file` 的 kind 分派原先不含 ASSEMBLY_MASTER，本轮已补上）。
-///
-/// 纯内存判断 ⇒ 不该碰 DB、不该有写入；用不存在的 owner id 也照样返回 20104，
-/// 这正是「配对校验早于 owner 存在性校验」的可观测证据。
-#[tokio::test]
-async fn upload_cross_owner_kind_pair_rejected() {
-    let (pool, _fx) = setup().await;
-    let cos = Arc::new(NoopCos);
-    let current = test_current_user(vec![Role::Manager]);
-
-    for (owner_kind, kind, why) in [
-        ("PART", "ASSEMBLY_MASTER", "零件挂装配件整图"),
-        ("ASSEMBLY", "DRAWING", "装配件挂零件图纸"),
-        ("ASSEMBLY", "3D_MODEL", "装配件挂 3D 模型"),
-    ] {
-        let mut tx = pool.begin().await.unwrap();
-        // owner id 用一个必然不存在的值：若配对守卫没生效，报的就会是 21105
-        // OWNER_NOT_FOUND 而不是 20104。
-        let err = PartFileService::new(shared_test_snowflake().clone(), cos.clone())
-            .upload_file_for_owner(
-                &mut *tx,
-                UPLOAD_UPLOAD_PREFIX,
-                UPLOAD_MAX_FILE_SIZE,
-                owner_kind,
-                -1,
+/// 直接落一行（给「秒传」用例造前置数据用）。
+async fn seed_part_file(
+    pool: &PgPool,
+    owner_id: i64,
+    kind: &str,
+    filename: &str,
+    content_type: &str,
+    bytes: Vec<u8>,
+) -> String {
+    let sha = sha_of(&bytes);
+    let object_key = hsh_erp_rust::util::cos_key::build_cas_key("uploads", &sha, filename);
+    {
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo: &mut sqlx::PgConnection = &mut conn;
+        PartFileRepoTrait::create_part_file(
+            &mut repo,
+            hsh_erp_rust::modules::files::part_file::repo::NewPartFile {
+                id: hsh_erp_test_support::shared_test_snowflake().next_id(),
+                part_id: owner_id,
+                owner_kind: "PART",
                 kind,
-                "x.pdf",
-                "application/pdf",
-                pdf_bytes("mismatched pair"),
-                &current,
-            )
-            .await
-            .expect_err("错配的 owner_kind × kind 应被拒");
-        drop(tx);
-
-        match err {
-            AppError::Biz { code, .. } => assert_eq!(
-                code, 20104,
-                "{owner_kind}+{kind}（{why}）应得 20104 BIZ_INVALID_VALUE"
-            ),
-            other => panic!("{owner_kind}+{kind} 期望 AppError::Biz(20104)，got {other:?}"),
-        }
-    }
-}
-
-// ===========================================================================
-//  2026-10-13 review 第 1 轮 MINOR-4：`POST /files/objects` 的 HTTP 层契约
-//
-//  service 直调测不到的部分全在这里：multipart 循环与 `data` / `file` 分发、
-//  `serde_json::from_str`、`owner_id: String::parse::<i64>()`、缺 `data` / 缺
-//  `file` / 缺文件名三条 20104 分支、以及 **HTTP 201 Created + `R<PartFileOut>`
-//  信封**。角色守卫先于 multipart 解析这条纪律由既有 `part_file.rs` 的 RBAC 用例
-//  （`rbac_inspector_can_upload_returns_403`）守着，不重复。
-//
-//  ⚠️ multipart body 由本文件本地拼：test-support 只提供 JSON 侧的
-//  `json_request`，没有 multipart 版本的 helper。这是**请求构造**不是 fixture，
-//  故不违反「新测试一律直接用 test-support 入口」那条例外清单的适用范围。
-// ===========================================================================
-
-/// multipart 边界（wire 上不可见，仅用于分隔 part）。
-const MP_BOUNDARY: &str = "hshFilesBoundary7MA4YWxkTrun";
-
-/// 手工拼一个 `multipart/form-data` body。
-///
-/// `file` 的四元组 = `(字段名, filename, content_type, 字节)`；`None` 即**不发**
-/// 该字段（用来测「缺 file」分支）。⚠️ `filename` 也不能省 —— handler 用
-/// `field.file_name()` 的 `None` 判「缺文件名」，那是另一条 20104 分支。
-fn multipart_body(data: Option<&str>, file: Option<(&str, &str, &str, &[u8])>) -> Vec<u8> {
-    let mut body: Vec<u8> = Vec::new();
-    if let Some(d) = data {
-        body.extend_from_slice(format!("--{MP_BOUNDARY}\r\n").as_bytes());
-        body.extend_from_slice(b"Content-Disposition: form-data; name=\"data\"\r\n\r\n");
-        body.extend_from_slice(d.as_bytes());
-        body.extend_from_slice(b"\r\n");
-    }
-    if let Some((field, filename, content_type, bytes)) = file {
-        body.extend_from_slice(format!("--{MP_BOUNDARY}\r\n").as_bytes());
-        body.extend_from_slice(
-            format!(
-                "Content-Disposition: form-data; name=\"{field}\"; filename=\"{filename}\"\r\n"
-            )
-            .as_bytes(),
-        );
-        body.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
-        body.extend_from_slice(bytes);
-        body.extend_from_slice(b"\r\n");
-    }
-    body.extend_from_slice(format!("--{MP_BOUNDARY}--\r\n").as_bytes());
-    body
-}
-
-/// 构造一条打 `POST /api/v2/files/objects` 的 multipart 请求（带 MANAGER token）。
-fn upload_request(
-    data: Option<&str>,
-    file: Option<(&str, &str, &str, &[u8])>,
-    token: &str,
-) -> Request<Body> {
-    Request::builder()
-        .method("POST")
-        .uri("/files/objects")
-        .header(
-            "content-type",
-            format!("multipart/form-data; boundary={MP_BOUNDARY}"),
+                file_type: "PDF",
+                object_key: &object_key,
+                original_filename: filename,
+                file_size: bytes.len() as i64,
+                content_type,
+                upload_status: "READY",
+                content_sha256: Some(&sha),
+                created_by: 1,
+            },
         )
-        .header("authorization", format!("Bearer {token}"))
-        .body(Body::from(multipart_body(data, file)))
-        .expect("build request")
+        .await
+        .expect("seed t_part_file");
+    }
+    object_key
 }
 
-/// HTTP 层 happy path：201 Created + `R<PartFileOut>` 信封 + `data` 键齐备。
-///
-/// 这是 MINOR-4 的核心断言 —— service 直调**看不到**状态码与信封，只能在这里钉。
+async fn insert_part(pool: &PgPool, label: &str) -> i64 {
+    let id = hsh_erp_test_support::shared_test_snowflake().next_id();
+    sqlx::query(
+        "INSERT INTO t_part (id, name, drawing_no, applicant_name, customer_id, \
+         request_date, planned_delivery_date, status, version, \
+         created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, 'DWG-INTENTS', 'tester', $3, current_date, current_date, \
+                 'PENDING', 0, now(), NULL, now(), NULL)",
+    )
+    .bind(id)
+    .bind(format!("part-{label}"))
+    .bind(PartFixture::CUSTOMER_L2_ID)
+    .execute(pool)
+    .await
+    .expect("insert t_part");
+    id
+}
+
+async fn insert_l1(pool: &PgPool, name: &str) -> i64 {
+    let id = hsh_erp_test_support::shared_test_snowflake().next_id();
+    sqlx::query(
+        "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
+         created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, NULL, 'F', 0, now(), NULL, now(), NULL)",
+    )
+    .bind(id)
+    .bind(name)
+    .execute(pool)
+    .await
+    .expect("insert L1");
+    id
+}
+
+async fn insert_l2(pool: &PgPool, name: &str, l1: i64) -> i64 {
+    let id = hsh_erp_test_support::shared_test_snowflake().next_id();
+    sqlx::query(
+        "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
+         created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, $3, NULL, 0, now(), NULL, now(), NULL)",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(l1)
+    .execute(pool)
+    .await
+    .expect("insert L2");
+    id
+}
+
+// ===========================================================================
+//  1. 正常签发
+// ===========================================================================
+
 #[tokio::test]
-async fn http_upload_happy_path_returns_201() {
+async fn intents_happy_path() {
     let (pool, fx) = setup().await;
-    let asm_id = seed_assembly(&pool, "HTTP").await;
-    let app = test_app(test_state(pool.clone()).await);
-    let token = login_token(&app, &fx.part_manager_username, AssemblyFixture::PASSWORD).await;
+    let part_id = insert_part(&pool, "intents-happy").await;
+    let (app, cos) = app_with_mock_cos(&pool).await;
+    let token = login_token(&app, &fx.manager_username, PartFixture::PASSWORD).await;
 
-    let data = json!({
-        "owner_kind": "ASSEMBLY",
-        "owner_id": asm_id.to_string(), // 雪花 id 一律字符串（JS 精度约定）
-        "kind": "ASSEMBLY_MASTER",
-    })
-    .to_string();
-
+    let bytes = b"%PDF-1.5\nintents happy\n%%EOF".to_vec();
+    let sha = sha_of(&bytes);
     let (status, envelope) = send(
         app.clone(),
-        upload_request(
-            Some(&data),
-            Some((
-                "file",
-                "master.pdf",
-                "application/pdf",
-                &pdf_bytes("http happy"),
-            )),
+        intents_request(
             &token,
+            "PART",
+            &part_id.to_string(),
+            vec![item(
+                "ref-1",
+                "DRAWING",
+                "intents.pdf",
+                "application/pdf",
+                bytes.len() as i64,
+                &sha,
+            )],
         ),
     )
     .await;
 
+    assert_eq!(status, StatusCode::OK, "签发成功是 200：{envelope}");
+    assert_eq!(envelope["code"], 0, "成功信封 code=0：{envelope}");
+    let it = &envelope["data"]["items"][0];
+    assert_eq!(it["client_ref"], "ref-1", "client_ref 原样回显");
+    assert_eq!(it["already_exists"], false);
+    let object_key = it["object_key"].as_str().expect("object_key 必为字符串");
+    let expected_key = hsh_erp_rust::util::cos_key::build_cas_key("uploads", &sha, "intents.pdf");
+    assert_eq!(
+        object_key, expected_key,
+        "object_key 必须是按 (sha, filename) 派生的 CAS key"
+    );
+    assert_eq!(
+        it["content_type"], "application/pdf",
+        "content_type 原样回传（前端 PUT 时必须原样带上）"
+    );
+    let expires = it["expires_in"].as_u64().expect("expires_in 必为数字");
+    assert!(expires > 0, "expires_in 必须 > 0，实际 {expires}");
+    let url = it["upload_url"].as_str().expect("upload_url 必为字符串");
+    assert!(
+        url.contains(object_key),
+        "upload_url 必须含 object_key（前端拿它 PUT）：{url}"
+    );
+    // 替身观测点：确实签发了一次，且签的是这个 key
+    let calls = cos.put_url_calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "应恰好签发 1 张 URL");
+    assert_eq!(calls[0].0, object_key);
+    assert_eq!(calls[0].1, "application/pdf");
+}
+
+// ===========================================================================
+//  2. CAS 命中秒传
+// ===========================================================================
+
+#[tokio::test]
+async fn intents_cas_hit_is_instant_upload() {
+    let (pool, fx) = setup().await;
+    let part_id = insert_part(&pool, "intents-cas").await;
+    let (app, cos) = app_with_mock_cos(&pool).await;
+    let token = login_token(&app, &fx.manager_username, PartFixture::PASSWORD).await;
+
+    // 前置：先跑完一轮完整链路（同 owner + kind + 同 sha 落一行）
+    let bytes = b"%PDF-1.5\nidentical content\n%%EOF".to_vec();
+    let seeded = upload_via_chain(
+        &pool,
+        &cos,
+        "PART",
+        part_id,
+        "DRAWING",
+        "first.pdf",
+        "application/pdf",
+        bytes.clone(),
+        &manager(),
+    )
+    .await;
+    let before = cos.put_url_call_count();
+    assert!(seeded.id > 0, "前置行应已落库（helper 自检）");
+
+    let sha = sha_of(&bytes);
+    let (status, envelope) = send(
+        app.clone(),
+        intents_request(
+            &token,
+            "PART",
+            &part_id.to_string(),
+            vec![item(
+                "ref-cas",
+                "DRAWING",
+                "second.pdf",
+                "application/pdf",
+                bytes.len() as i64,
+                &sha,
+            )],
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "秒传也是 200：{envelope}");
+    let it = &envelope["data"]["items"][0];
+    assert_eq!(it["client_ref"], "ref-cas");
+    assert_eq!(
+        it["already_exists"], true,
+        "同 owner+kind+sha 已有活跃行 ⇒ 秒传：{it}"
+    );
+    assert!(
+        it.get("upload_url").is_none(),
+        "秒传项**不得**返回 upload_url（服务端没签）：{it}"
+    );
+    assert!(
+        it.get("object_key").is_none(),
+        "秒传项不带 object_key：{it}"
+    );
+    let existing = &it["existing_file"];
+    assert!(
+        existing["id"].is_string(),
+        "existing_file 必须是完整的 PartFileOut（id 为字符串）：{existing}"
+    );
+    assert_eq!(existing["kind"], "DRAWING");
+    assert_eq!(existing["original_filename"], "first.pdf");
+    assert_eq!(
+        cos.put_url_call_count(),
+        before,
+        "命中 CAS 时**一张 URL 都不该签**（秒传的观测点）"
+    );
+}
+
+/// 边界：被软删的旧行**不算**秒传命中（只有活跃行短路）。
+#[tokio::test]
+async fn intents_cas_ignores_soft_deleted_row() {
+    let (pool, fx) = setup().await;
+    let part_id = insert_part(&pool, "intents-cas-soft").await;
+    let (app, cos) = app_with_mock_cos(&pool).await;
+    let token = login_token(&app, &fx.manager_username, PartFixture::PASSWORD).await;
+
+    let bytes = b"%PDF-1.5\nsoft deleted content\n%%EOF".to_vec();
+    let out = upload_via_chain(
+        &pool,
+        &cos,
+        "PART",
+        part_id,
+        "DRAWING",
+        "old.pdf",
+        "application/pdf",
+        bytes.clone(),
+        &manager(),
+    )
+    .await;
+    {
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo: &mut sqlx::PgConnection = &mut conn;
+        PartFileRepoTrait::soft_delete_file(&mut repo, out.id, out.version, 1)
+            .await
+            .expect("soft delete");
+    }
+
+    let sha = sha_of(&bytes);
+    let (status, envelope) = send(
+        app.clone(),
+        intents_request(
+            &token,
+            "PART",
+            &part_id.to_string(),
+            vec![item(
+                "ref-soft",
+                "DRAWING",
+                "new.pdf",
+                "application/pdf",
+                bytes.len() as i64,
+                &sha,
+            )],
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{envelope}");
+    let it = &envelope["data"]["items"][0];
+    assert_eq!(
+        it["already_exists"], false,
+        "旧行已软删 ⇒ 不算秒传命中，应重新签 URL：{it}"
+    );
+    assert!(it["upload_url"].is_string());
+}
+
+// ===========================================================================
+//  3. 批量：client_ref 原样回显、顺序对应
+// ===========================================================================
+
+#[tokio::test]
+async fn intents_batch_echoes_client_ref_in_order() {
+    let (pool, fx) = setup().await;
+    let part_id = insert_part(&pool, "intents-batch").await;
+    let (app, _cos) = app_with_mock_cos(&pool).await;
+    let token = login_token(&app, &fx.manager_username, PartFixture::PASSWORD).await;
+
+    let b1 = b"%PDF-1.5\nbatch one\n%%EOF".to_vec();
+    let b2 = b"%PDF-1.5\nbatch two\n%%EOF".to_vec();
+    let (status, envelope) = send(
+        app.clone(),
+        intents_request(
+            &token,
+            "PART",
+            &part_id.to_string(),
+            vec![
+                item(
+                    "a",
+                    "DRAWING",
+                    "a.pdf",
+                    "application/pdf",
+                    b1.len() as i64,
+                    &sha_of(&b1),
+                ),
+                item(
+                    "b",
+                    "DRAWING",
+                    "b.pdf",
+                    "application/pdf",
+                    b2.len() as i64,
+                    &sha_of(&b2),
+                ),
+                item(
+                    "c",
+                    "3D_MODEL",
+                    "c.step",
+                    "application/step",
+                    128,
+                    &"c".repeat(64),
+                ),
+            ],
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{envelope}");
+    let items = envelope["data"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 3, "批量项数应与请求一致：{envelope}");
+    for (i, want) in ["a", "b", "c"].iter().enumerate() {
+        assert_eq!(
+            items[i]["client_ref"], *want,
+            "第 {i} 项的 client_ref 必须原样回显且**顺序对应**"
+        );
+        assert_eq!(items[i]["already_exists"], false);
+        assert!(items[i]["upload_url"].is_string());
+    }
+    assert_eq!(
+        items[2]["content_type"], "application/step",
+        "逐项 content_type 各自回传"
+    );
+}
+
+// ===========================================================================
+//  4./5. 角色矩阵
+// ===========================================================================
+
+#[tokio::test]
+async fn intents_clerk_can_sign() {
+    let (pool, fx) = setup().await;
+    let part_id = insert_part(&pool, "intents-clerk").await;
+    let (app, _cos) = app_with_mock_cos(&pool).await;
+    let token = login_token(&app, &fx.clerk_username, PartFixture::PASSWORD).await;
+
+    let bytes = b"%PDF-1.5\nclerk\n%%EOF".to_vec();
+    let (status, envelope) = send(
+        app.clone(),
+        intents_request(
+            &token,
+            "PART",
+            &part_id.to_string(),
+            vec![item(
+                "clerk",
+                "DRAWING",
+                "clerk.pdf",
+                "application/pdf",
+                bytes.len() as i64,
+                &sha_of(&bytes),
+            )],
+        ),
+    )
+    .await;
     assert_eq!(
         status,
-        StatusCode::CREATED,
-        "上传成功必须是 201 Created（旧 part 端点是 200），实际 {status}：{envelope}"
+        StatusCode::OK,
+        "CLERK 在 UPLOAD_ROLES（M+C+CNC）内，应可签发：{envelope}"
     );
-    assert_eq!(envelope["code"], 0, "成功信封 code 应为 0：{envelope}");
-    let out = &envelope["data"];
-    assert_eq!(out["owner_kind"], "ASSEMBLY");
-    assert_eq!(out["owner_id"], asm_id.to_string(), "owner_id 出参是字符串");
-    assert_eq!(out["kind"], "ASSEMBLY_MASTER");
-    assert_eq!(out["file_type"], "PDF");
-    assert!(
-        out["id"].is_string(),
-        "雪花 id 出参必须是字符串（防 JS 精度截断）：{out}"
-    );
-
-    // 取证：HTTP 路径真的落了库（不是只回了个信封）
-    let mut tx = pool.begin().await.unwrap();
-    let detail =
-        AssemblyService::get_assembly(&mut tx, asm_id, &test_current_user(vec![Role::Manager]))
-            .await
-            .unwrap();
-    drop(tx);
-    assert_eq!(detail.files.len(), 1);
-    assert_eq!(detail.files[0].id.to_string(), out["id"]);
 }
 
-/// HTTP 层：`data.owner_id` 非数字 → 20104（雪花 id 解析分支）。
 #[tokio::test]
-async fn http_upload_non_numeric_owner_id_returns_20104() {
+async fn intents_inspector_and_shelf_rejected() {
     let (pool, fx) = setup().await;
-    let app = test_app(test_state(pool.clone()).await);
-    let token = login_token(&app, &fx.part_manager_username, AssemblyFixture::PASSWORD).await;
+    let part_id = insert_part(&pool, "intents-rbac").await;
+    let (app, _cos) = app_with_mock_cos(&pool).await;
 
-    let data = json!({
-        "owner_kind": "ASSEMBLY",
-        "owner_id": "not-a-number",
-        "kind": "ASSEMBLY_MASTER",
-    })
-    .to_string();
+    for username in [&fx.inspector_username, &fx.shelf_account_username] {
+        let token = login_token(&app, username, PartFixture::PASSWORD).await;
+        let bytes = b"%PDF-1.5\nrbac\n%%EOF".to_vec();
+        let (status, envelope) = send(
+            app.clone(),
+            intents_request(
+                &token,
+                "PART",
+                &part_id.to_string(),
+                vec![item(
+                    "rbac",
+                    "DRAWING",
+                    "rbac.pdf",
+                    "application/pdf",
+                    bytes.len() as i64,
+                    &sha_of(&bytes),
+                )],
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{username} 不在写路径角色表内，应 403：{envelope}"
+        );
+        assert_eq!(envelope["code"], 40300, "{username} 应得 40300");
+    }
+}
+
+// ===========================================================================
+//  6. 校验矩阵
+// ===========================================================================
+
+#[tokio::test]
+async fn intents_validation_matrix() {
+    let (pool, fx) = setup().await;
+    let part_id = insert_part(&pool, "intents-invalid").await;
+    let (app, _cos) = app_with_mock_cos(&pool).await;
+    let token = login_token(&app, &fx.manager_username, PartFixture::PASSWORD).await;
+    let ok_sha = "a".repeat(64);
+
+    // 逐条独立打一次：每条断言「状态码 + 业务码」两项。
+    let cases: Vec<(&str, Vec<Value>, u16, i64)> = vec![
+        (
+            "sha 非 64 位 hex",
+            vec![item(
+                "v1",
+                "DRAWING",
+                "a.pdf",
+                "application/pdf",
+                10,
+                "not-a-sha",
+            )],
+            422,
+            40001,
+        ),
+        (
+            "file_size = 0",
+            vec![item(
+                "v2",
+                "DRAWING",
+                "a.pdf",
+                "application/pdf",
+                0,
+                &ok_sha,
+            )],
+            422,
+            40001,
+        ),
+        (
+            "file_size 超 COS_MAX_FILE_SIZE（300MB）",
+            vec![item(
+                "v3",
+                "DRAWING",
+                "a.pdf",
+                "application/pdf",
+                300 * 1024 * 1024 + 1,
+                &ok_sha,
+            )],
+            400,
+            21103,
+        ),
+        (
+            "扩展名不在 kind 白名单（DRAWING + .step）",
+            vec![item(
+                "v4",
+                "DRAWING",
+                "a.step",
+                "application/step",
+                10,
+                &ok_sha,
+            )],
+            400,
+            21102,
+        ),
+        (
+            "content_type 与扩展名不匹配（.pdf + octet-stream）",
+            vec![item(
+                "v5",
+                "DRAWING",
+                "a.pdf",
+                "application/octet-stream",
+                10,
+                &ok_sha,
+            )],
+            400,
+            21102,
+        ),
+        (
+            "owner_kind × kind 配对非法（PART + ASSEMBLY_MASTER）",
+            vec![item(
+                "v6",
+                "ASSEMBLY_MASTER",
+                "a.pdf",
+                "application/pdf",
+                10,
+                &ok_sha,
+            )],
+            400,
+            20104,
+        ),
+        (
+            "owner 不存在",
+            vec![item(
+                "v7",
+                "DRAWING",
+                "a.pdf",
+                "application/pdf",
+                10,
+                &ok_sha,
+            )],
+            404,
+            21105,
+        ),
+    ];
+
+    for (label, items, want_status, want_code) in cases {
+        let owner_id = if label == "owner 不存在" {
+            "999999999999999999".to_string()
+        } else {
+            part_id.to_string()
+        };
+        let (status, envelope) = send(
+            app.clone(),
+            intents_request(&token, "PART", &owner_id, items),
+        )
+        .await;
+        assert_eq!(
+            status.as_u16(),
+            want_status,
+            "「{label}」的 HTTP 状态码：{envelope}"
+        );
+        assert_eq!(
+            envelope["code"], want_code,
+            "「{label}」的业务码：{envelope}"
+        );
+    }
+}
+
+/// `items` 为空 / 超 200 上限（批量形状校验，40001）。
+#[tokio::test]
+async fn intents_rejects_empty_and_oversized_items() {
+    let (pool, fx) = setup().await;
+    let part_id = insert_part(&pool, "intents-shape").await;
+    let (app, _cos) = app_with_mock_cos(&pool).await;
+    let token = login_token(&app, &fx.manager_username, PartFixture::PASSWORD).await;
 
     let (status, envelope) = send(
         app.clone(),
-        upload_request(
-            Some(&data),
-            Some((
-                "file",
-                "master.pdf",
+        intents_request(&token, "PART", &part_id.to_string(), vec![]),
+    )
+    .await;
+    assert_eq!(status.as_u16(), 422, "空 items：{envelope}");
+    assert_eq!(envelope["code"], 40001);
+
+    let many: Vec<Value> = (0..201)
+        .map(|i| {
+            item(
+                &format!("o{i}"),
+                "DRAWING",
+                &format!("o{i}.pdf"),
                 "application/pdf",
-                &pdf_bytes("bad id"),
-            )),
+                10,
+                &format!("{:0>64}", i),
+            )
+        })
+        .collect();
+    let (status, envelope) = send(
+        app.clone(),
+        intents_request(&token, "PART", &part_id.to_string(), many),
+    )
+    .await;
+    assert_eq!(status.as_u16(), 422, "201 项超上限：{envelope}");
+    assert_eq!(envelope["code"], 40001);
+}
+
+// ===========================================================================
+//  7. CUSTOMER × DELIVERY_TEMPLATE（送货单打印模板）
+// ===========================================================================
+
+#[tokio::test]
+async fn intents_customer_delivery_template_manager_ok() {
+    let (pool, fx) = setup().await;
+    let l1 = insert_l1(&pool, "客户-模板-签发").await;
+    let (app, _cos) = app_with_mock_cos(&pool).await;
+    let token = login_token(&app, &fx.manager_username, PartFixture::PASSWORD).await;
+
+    let mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    let (status, envelope) = send(
+        app.clone(),
+        intents_request(
             &token,
+            "CUSTOMER",
+            &l1.to_string(),
+            vec![item(
+                "tpl",
+                "DELIVERY_TEMPLATE",
+                "模板.xlsx",
+                mime,
+                4096,
+                &"d".repeat(64),
+            )],
         ),
     )
     .await;
-
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{envelope}");
-    assert_eq!(envelope["code"], 20104, "owner_id 非法 → BIZ_INVALID_VALUE");
-    assert!(
-        envelope["message"].as_str().unwrap().contains("owner_id"),
-        "错误文案应指向 owner_id：{envelope}"
-    );
+    assert_eq!(status, StatusCode::OK, "MANAGER 应可签发模板：{envelope}");
+    assert_eq!(envelope["data"]["items"][0]["content_type"], mime);
 }
 
-/// HTTP 层：缺 `file` 字段 → 20104（multipart 循环的 `file` 分发分支）。
 #[tokio::test]
-async fn http_upload_missing_file_returns_20104() {
+async fn intents_customer_delivery_template_clerk_forbidden() {
     let (pool, fx) = setup().await;
-    let asm_id = seed_assembly(&pool, "NOFILE").await;
-    let app = test_app(test_state(pool.clone()).await);
-    let token = login_token(&app, &fx.part_manager_username, AssemblyFixture::PASSWORD).await;
+    let l1 = insert_l1(&pool, "客户-模板-CLERK").await;
+    let (app, _cos) = app_with_mock_cos(&pool).await;
+    let token = login_token(&app, &fx.clerk_username, PartFixture::PASSWORD).await;
 
-    let data = json!({
-        "owner_kind": "ASSEMBLY",
-        "owner_id": asm_id.to_string(),
-        "kind": "ASSEMBLY_MASTER",
-    })
-    .to_string();
-
-    let (status, envelope) = send(app.clone(), upload_request(Some(&data), None, &token)).await;
-
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{envelope}");
-    assert_eq!(envelope["code"], 20104, "缺 file → BIZ_INVALID_VALUE");
-    assert!(
-        envelope["message"].as_str().unwrap().contains("file"),
-        "错误文案应指向 file 字段：{envelope}"
+    let (status, envelope) = send(
+        app.clone(),
+        intents_request(
+            &token,
+            "CUSTOMER",
+            &l1.to_string(),
+            vec![item(
+                "tpl",
+                "DELIVERY_TEMPLATE",
+                "模板.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                4096,
+                &"d".repeat(64),
+            )],
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "CUSTOMER 写路径仅 Manager，CLERK 必须 403：{envelope}"
     );
+    assert_eq!(envelope["code"], 40300);
+}
 
-    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM t_part_file WHERE part_id = $1")
-        .bind(asm_id)
-        .fetch_one(&pool)
+/// 绑**二级**客户被拒（`repo::customer_owner_exists` 的 `parent_id IS NULL` 判据）。
+///
+/// ⚠️ 错误码是 **21105**（OWNER_NOT_FOUND）而不是 20104 —— 上传端点下线后
+/// 模板写入只剩这两条通用写入口，L1-only 判据在 files 域的共用闸门里，代码统一。
+#[tokio::test]
+async fn intents_customer_l2_rejected_with_21105() {
+    let (pool, fx) = setup().await;
+    let l1 = insert_l1(&pool, "客户-模板-L1").await;
+    let l2 = insert_l2(&pool, "子客-模板-L2", l1).await;
+    let (app, _cos) = app_with_mock_cos(&pool).await;
+    let token = login_token(&app, &fx.manager_username, PartFixture::PASSWORD).await;
+
+    let (status, envelope) = send(
+        app.clone(),
+        intents_request(
+            &token,
+            "CUSTOMER",
+            &l2.to_string(),
+            vec![item(
+                "tpl",
+                "DELIVERY_TEMPLATE",
+                "模板.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                4096,
+                &"d".repeat(64),
+            )],
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "模板只绑一级客户，绑二级应被拒：{envelope}"
+    );
+    assert_eq!(envelope["code"], 21105);
+    // 零副作用：L2 名下没有任何模板行
+    let rows: Vec<(i64,)> = sqlx::query_as("SELECT id FROM t_part_file WHERE part_id = $1")
+        .bind(l2)
+        .fetch_all(&pool)
         .await
         .unwrap();
-    assert_eq!(rows, 0, "被拒的请求不应留下 t_part_file 行");
+    assert!(rows.is_empty(), "被拒的签发不该留下任何行");
+}
+
+/// seed 专用：确认「helper 造的前置行确实落在库里」——避免上面两条用例的
+/// 前置数据是空跑（helper 自己 panic 就会红，这条只是把因果写进测试输出）。
+#[tokio::test]
+async fn seed_helper_is_wired() {
+    let (pool, _fx) = setup().await;
+    let part_id = insert_part(&pool, "intents-seedcheck").await;
+    let key = seed_part_file(
+        &pool,
+        part_id,
+        "DRAWING",
+        "seed.pdf",
+        "application/pdf",
+        b"%PDF-1.5\nseed\n%%EOF".to_vec(),
+    )
+    .await;
+    assert!(key.starts_with("uploads/"), "seed key 应是 CAS 模板：{key}");
+    assert_eq!(
+        test_state(pool.clone())
+            .await
+            .cos
+            .presigned_get_url(&key, 60)
+            .await
+            .unwrap(),
+        format!("local://{key}"),
+        "默认 state 用 NoopCos（占位 URL 含 key）；app_with_mock_cos 才是 MockCos"
+    );
 }

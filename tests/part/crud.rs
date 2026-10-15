@@ -1517,316 +1517,130 @@ fn manager_current(id: i64) -> hsh_erp_rust::auth::rbac::CurrentUser {
     }
 }
 
-/// 构造一个简单 PDF 字节（无需真实 PDF 格式，仅用于占位 bytes；service 不校验内容）
-fn fake_pdf_bytes() -> Vec<u8> {
-    b"%PDF-1.4\n%fake test drawing for upload integration\n%%EOF\n".to_vec()
-}
-
-/// 构造一个简单 STEP 字节
-fn fake_step_bytes() -> Vec<u8> {
-    b"ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\nENDSEC;\nEND-ISO-10303-21;\n".to_vec()
-}
-
-#[tokio::test]
-#[ignore]
-async fn upload_drawing_service_integration() {
-    let pool = test_pool().await;
-    let fx = load_part_fixture(&pool).await;
-
-    // fixture 不预置 part（避免 PENDING 状态污染 list_parts_basic 等期望空库测试）；
-    // 这里动态插一个 PENDING part 给 service upload 用。
-    let part_id = insert_part(&pool, "P-DRAW", fx.customer_l2_id, None, "PENDING").await;
-    let cos = std::sync::Arc::new(NoopCos);
-
-    let bytes = fake_pdf_bytes();
-    let mut conn = pool.begin().await.unwrap();
-    let pf = PartFileService::new(shared_test_snowflake().clone(), cos)
-        .upload_file_for_owner(
-            &mut *conn,
-            UPLOAD_UPLOAD_PREFIX,
-            UPLOAD_MAX_FILE_SIZE,
-            "PART",
-            part_id,
-            "DRAWING",
-            "drawing.pdf",
-            "application/pdf",
-            bytes.clone(),
-            &manager_current(1),
-        )
-        .await
-        .expect("上传图纸应成功");
-    conn.commit().await.unwrap();
-
-    assert_eq!(pf.kind, "DRAWING");
-    assert_eq!(pf.file_type, "PDF");
-    assert_eq!(pf.owner_id, part_id);
-    assert_eq!(pf.owner_kind, "PART");
-    assert_eq!(pf.original_filename, "drawing.pdf");
-    assert_eq!(pf.file_size, bytes.len() as i64);
-    assert_eq!(pf.content_type, "application/pdf");
-    assert_eq!(pf.upload_status, "READY");
-    assert!(pf.content_sha256.is_some());
-    // 2026-10-13：两段模板 `{prefix}{sha16}_{safe_filename}`（原断言写的
-    // `uploads/part/{id}/DRAWING/` 是 2026-09-29 扁平化**之前**的形态）
-    assert!(
-        pf.object_key.starts_with("uploads/"),
-        "CAS key 应带 cfg 前缀: {}",
-        pf.object_key
-    );
-    assert!(pf.object_key.ends_with("_drawing.pdf"));
-
-    let row = PartFileRepo::get_by_part_kind(&pool, part_id, "DRAWING")
-        .await
-        .unwrap()
-        .expect("DB 行应存在");
-    assert_eq!(row.id, pf.id);
-}
-
-#[tokio::test]
-#[ignore]
-async fn upload_3d_model_service_integration() {
-    let pool = test_pool().await;
-    let fx = load_part_fixture(&pool).await;
-    let cos = std::sync::Arc::new(NoopCos);
-
-    let part_id = insert_part(&pool, "P-3D", fx.customer_l2_id, None, "PENDING").await;
-
-    let bytes = fake_step_bytes();
-    let mut conn = pool.begin().await.unwrap();
-    let pf = PartFileService::new(shared_test_snowflake().clone(), cos)
-        .upload_file_for_owner(
-            &mut *conn,
-            UPLOAD_UPLOAD_PREFIX,
-            UPLOAD_MAX_FILE_SIZE,
-            "PART",
-            part_id,
-            "3D_MODEL",
-            "bracket.step",
-            "application/step",
-            bytes.clone(),
-            &manager_current(1),
-        )
-        .await
-        .expect("上传 3D 模型应成功");
-    conn.commit().await.unwrap();
-
-    assert_eq!(pf.kind, "3D_MODEL");
-    assert_eq!(pf.file_type, "STEP");
-    assert_eq!(pf.owner_id, part_id);
-    assert_eq!(pf.original_filename, "bracket.step");
-    assert_eq!(pf.file_size, bytes.len() as i64);
-    assert!(pf.object_key.starts_with("uploads/"));
-    assert!(pf.object_key.ends_with("_bracket.step"));
-
-    let row = PartFileRepo::get_by_part_kind(&pool, part_id, "3D_MODEL")
-        .await
-        .unwrap()
-        .expect("DB 行应存在");
-    assert_eq!(row.id, pf.id);
-    assert_eq!(row.file_type, "STEP");
-}
-
-#[tokio::test]
-#[ignore]
-async fn upload_bad_extension_rejected() {
-    let pool = test_pool().await;
-    let fx = load_part_fixture(&pool).await;
-    let cos = std::sync::Arc::new(NoopCos);
-    let part_id = insert_part(&pool, "P-BAD", fx.customer_l2_id, None, "PENDING").await;
-
-    let mut conn = pool.begin().await.unwrap();
-    let err = PartFileService::new(shared_test_snowflake().clone(), cos)
-        .upload_file_for_owner(
-            &mut *conn,
-            UPLOAD_UPLOAD_PREFIX,
-            UPLOAD_MAX_FILE_SIZE,
-            "PART",
-            part_id,
-            "DRAWING",
-            "evil.step",
-            "application/step",
-            b"junk".to_vec(),
-            &manager_current(1),
-        )
-        .await
-        .expect_err("应被扩展名白名单拦截");
-    conn.rollback().await.unwrap();
-
-    assert_eq!(
-        err.code(),
-        code::BIZ_PART_FILE_BAD_TYPE,
-        "实际错误: {err:?}"
-    );
-}
-
-#[tokio::test]
-#[ignore]
-async fn upload_content_type_mismatch_rejected() {
-    let pool = test_pool().await;
-    let fx = load_part_fixture(&pool).await;
-    let cos = std::sync::Arc::new(NoopCos);
-    let part_id = insert_part(&pool, "P-CT", fx.customer_l2_id, None, "PENDING").await;
-
-    let mut conn = pool.begin().await.unwrap();
-    let err = PartFileService::new(shared_test_snowflake().clone(), cos)
-        .upload_file_for_owner(
-            &mut *conn,
-            UPLOAD_UPLOAD_PREFIX,
-            UPLOAD_MAX_FILE_SIZE,
-            "PART",
-            part_id,
-            "DRAWING",
-            "drawing.pdf",
-            "image/png",
-            b"junk".to_vec(),
-            &manager_current(1),
-        )
-        .await
-        .expect_err("应被 content_type 校验拦截");
-    conn.rollback().await.unwrap();
-
-    assert_eq!(err.code(), code::BIZ_PART_FILE_BAD_TYPE);
-}
+// ===========================================================================
+//  2026-10-15：multipart 上传端点下线，随之删除的 4 条 `upload_file_for_owner`
+//  service 直调用例（`upload_drawing_service_integration` /
+//  `upload_3d_model_service_integration` / `upload_bad_extension_rejected` /
+//  `upload_content_type_mismatch_rejected`）
+// ===========================================================================
+//
+// 四条用例的被测方法 `PartFileService::upload_file_for_owner` 已随
+// `POST /files/objects`（multipart 代理）删除。等价覆盖在新链路上：
+// - 签发 / 校验矩阵 / 角色：`tests/files/upload.rs`
+// - confirm 的 head + size + key 防呆 + 配对：`tests/files/part_file.rs`
+// ⚠️ **不要**把它们改写成 service 直调的「新版本」：upload-intents 只做校验 +
+// 签名，不写库，任何「直调 service 后查库」的形态在那个端点上不存在。
 
 // ===========================================================================
-//  2026-09-16 M2-B review 第 2 轮 B1 修：cleanup_tmp_keys 全量收集回归测试
+//  2026-10-15：`POST /parts/batch` 的文件绑定（bindings）整段下线
 // ===========================================================================
+//
+// 原先的三条用例（`batch_create_with_bindings_partial_failure_cleans_all_tmp`
+// service 直调 + `batch_create_parts_handler_spawn_delete_on_ok` /
+// `..._on_err` 两条 HTTP）全部随 `items[].drawing_file` / `model3d_file`
+// 与 head/copy 分支删除而移除：文件改走 `POST /files/objects/upload-intents`
+// → 前端直传 → `POST /files/objects/confirm`（owner = 建单后拿到的 part_id）。
+//
+// ⚠️ **不要**把它们改写成「新链路」的等价物：`POST /parts/batch` 现在**不碰**
+// `t_part_file`，新链路的用例在 `tests/files/upload.rs`（签发）与
+// `tests/files/part_file.rs`（confirm）。
 
+/// 硬切守卫：旧的 `drawing_file` / `model3d_file` 字段**不再产生任何效果**。
+///
+/// ⚠️ 形态要说准：本仓 DTO **不开** `serde(deny_unknown_fields)`（axum 的
+/// `Json` 提取器默认**静默丢弃**未知字段，与 `GET /parts` 的 10 字段 union-list
+/// 兼容用例同款纪律），所以带这两个字段的请求仍是 **200**。真正要钉的是
+/// **副作用为零**：`t_part_file` 一行不写、`cleanup_tmp_keys` 恒空。
+///
+/// 若哪天有人把字段加回 DTO（或重新引入 bindings 分支），`files == 0` 这条会红。
 #[tokio::test]
-async fn batch_create_with_bindings_partial_failure_cleans_all_tmp() {
-    use hsh_erp_rust::modules::part::dto_crud::{
-        FileBindingIn, PartBatchCreateItem, PartBatchCreateRequest,
-    };
-    use std::sync::Arc;
-
-    let pool = test_pool().await;
-    let fx = load_part_fixture(&pool).await;
-
-    let current = manager_current(1);
-    let cos = std::sync::Arc::new(MockCos::new());
-
-    let tmp_key_0 = "tmp/test/binding-clean-0.pdf";
-    let tmp_key_1 = "tmp/test/binding-clean-1.pdf";
-    let sha_0 = "0".repeat(64);
-    let sha_1 = "1".repeat(64);
-    cos.set_head(tmp_key_0, 1024);
-    cos.set_head(tmp_key_1, 1024);
-
+async fn batch_create_ignores_removed_binding_fields() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
     let today = chrono::Utc::now()
         .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
         .date_naive();
-    let long_name = "甲".repeat(60);
-    let req = PartBatchCreateRequest {
-        customer_id: fx.customer_l2_id,
-        items: vec![
-            PartBatchCreateItem {
-                name: "bad-item".into(),
-                drawing_no: "D-BAD".into(),
-                applicant_name: long_name,
-                quantity: 1,
-                request_date: today,
-                planned_delivery_date: today,
-                is_urgent: false,
-                order_no: None,
-                system_delivery_date: None,
-                note: None,
-                assembly_id: None,
-                unit_price: None,
-                total_price: None,
-                drawing_file: Some(FileBindingIn {
-                    tmp_key: tmp_key_0.into(),
-                    content_sha256: sha_0.clone(),
-                    original_filename: "first.pdf".into(),
-                    file_size: 1024,
-                    content_type: "application/pdf".into(),
-                    ext: None, // 2026-09-29 新增字段
-                }),
-                model3d_file: None,
+    let req_body = json!({
+        "customer_id": fx.customer_l2_id.to_string(),
+        "items": [{
+            "name": "removed-binding-item",
+            "drawing_no": "D-NOBIND",
+            "applicant_name": "丁",
+            "quantity": 1,
+            "request_date": today.to_string(),
+            "planned_delivery_date": today.to_string(),
+            "is_urgent": false,
+            "drawing_file": {
+                "tmp_key": "uploads/x.pdf",
+                "content_sha256": "a".repeat(64),
+                "original_filename": "x.pdf",
+                "file_size": "1024",
+                "content_type": "application/pdf"
             },
-            PartBatchCreateItem {
-                name: "ok-item".into(),
-                drawing_no: "D-OK".into(),
-                applicant_name: "乙".into(),
-                quantity: 1,
-                request_date: today,
-                planned_delivery_date: today,
-                is_urgent: false,
-                order_no: None,
-                system_delivery_date: None,
-                note: None,
-                assembly_id: None,
-                unit_price: None,
-                total_price: None,
-                drawing_file: Some(FileBindingIn {
-                    tmp_key: tmp_key_1.into(),
-                    content_sha256: sha_1.clone(),
-                    original_filename: "second.pdf".into(),
-                    file_size: 1024,
-                    content_type: "application/pdf".into(),
-                    ext: None, // 2026-09-29 新增字段
-                }),
-                model3d_file: None,
-            },
-        ],
-    };
-
-    let mut tx = pool.begin().await.unwrap();
-    let (out, keys) = PartService::batch_create_parts_with_bindings(
-        &mut *tx,
-        shared_test_snowflake().as_ref(),
-        cos.clone(),
-        "uploads",
-        "tmp/",
-        &req,
-        &current,
+            "model3d_file": null,
+        }],
+    });
+    let (status, envelope) = send(
+        app,
+        json_request("POST", "/parts/batch", Some(req_body), Some(&token)),
     )
-    .await
-    .map_err(|(e, _)| e)
-    .expect("batch_create_parts_with_bindings 应整体返回 Ok（含 failed）");
-    tx.commit().await.unwrap();
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "未知字段被静默丢弃（DTO 不开 deny_unknown_fields），建单本身应成功：{envelope}"
+    );
+    let files: i64 = sqlx::query_scalar("SELECT count(*) FROM t_part_file")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        files, 0,
+        "drawing_file 字段已下线 ⇒ 不得再产生任何 t_part_file 行：{envelope}"
+    );
+    assert_eq!(
+        envelope["data"]["cleanup_tmp_keys"],
+        json!([]),
+        "也不该再有需要清理的 tmp key：{envelope}"
+    );
+}
 
+/// 对照组：去掉那两个字段 ⇒ 200 且 `cleanup_tmp_keys` 恒为空（响应形状兼容）。
+#[tokio::test]
+async fn batch_create_without_bindings_succeeds_with_empty_cleanup_keys() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let today = chrono::Utc::now()
+        .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+        .date_naive();
+    let req_body = json!({
+        "customer_id": fx.customer_l2_id.to_string(),
+        "items": [{
+            "name": "plain-item",
+            "drawing_no": "D-PLAIN",
+            "applicant_name": "戊",
+            "quantity": 1,
+            "request_date": today.to_string(),
+            "planned_delivery_date": today.to_string(),
+            "is_urgent": false,
+        }],
+    });
+    let (status, envelope) = send(
+        app,
+        json_request("POST", "/parts/batch", Some(req_body), Some(&token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "纯建单应成功: {envelope}");
+    assert_eq!(envelope["code"], 0, "{envelope}");
     assert_eq!(
-        out.created.len(),
-        1,
-        "应 created=1: failed={:?}",
-        out.failed
+        envelope["data"]["cleanup_tmp_keys"],
+        json!([]),
+        "cleanup_tmp_keys 保留字段但恒为空（响应形状兼容，见 vo/part_batch.rs）"
     );
-    assert_eq!(out.failed.len(), 1, "应 failed=1");
-    assert_eq!(out.failed[0].item_index, 0, "失败项位于 idx=0");
-    assert_eq!(
-        out.failed[0].code, 50001,
-        "DATABASE 兜底码（applicant_name 超长 22001）"
-    );
-
-    assert_eq!(
-        keys.len(),
-        2,
-        "cleanup_tmp_keys 应包含 2 个 key（成功 + 失败 item 各 1）: got {keys:?}"
-    );
-    assert!(
-        keys.contains(&tmp_key_0.to_string()),
-        "失败 item 的 tmp_key 必须保留在 cleanup_tmp_keys 中: {keys:?}"
-    );
-    assert!(
-        keys.contains(&tmp_key_1.to_string()),
-        "成功 item 的 tmp_key 也必须在 cleanup_tmp_keys 中: {keys:?}"
-    );
-
-    assert_eq!(cos.head_call_count(tmp_key_0), 1, "item 0 head 应被调 1 次");
-    assert_eq!(cos.head_call_count(tmp_key_1), 1, "item 1 head 应被调 1 次");
-    let copy_calls = cos.copy_calls.lock().unwrap().clone();
-    assert_eq!(
-        copy_calls.len(),
-        2,
-        "copy_object 应被调 2 次（每个 binding 一份）: got {copy_calls:?}"
-    );
-
-    assert_eq!(
-        cos.delete_call_count(tmp_key_0),
-        0,
-        "service 层不应直接 spawn delete（属 handler 职责）"
-    );
-    let _ = Arc::new(()); // suppress unused
+    // 零副作用：本端点不再写 t_part_file
+    let files: i64 = sqlx::query_scalar("SELECT count(*) FROM t_part_file")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(files, 0, "POST /parts/batch 不该再写 t_part_file");
 }
 
 #[tokio::test]
@@ -1845,164 +1659,15 @@ async fn policy_unit_smoke_integration() {
 }
 
 // ===========================================================================
-// 2026-09-16 M2-C：handler 后置 spawn delete 端到端断言
+// 2026-10-15：handler 后置 spawn delete 端到端断言（2 条）随 bindings 分支删除
 // ===========================================================================
-
-#[tokio::test]
-async fn batch_create_parts_handler_spawn_delete_on_ok() {
-    use std::sync::Arc;
-
-    let pool = test_pool().await;
-    let fx = load_part_fixture(&pool).await;
-
-    let cos = Arc::new(MockCos::new());
-    let tmp_key = "tmp/test/handler-spawn-delete.pdf".to_string();
-    let sha = "a".repeat(64);
-    cos.set_head(&tmp_key, 1024);
-
-    let state = test_state_with_cos(pool.clone(), cos.clone()).await;
-    let app = test_app(state.clone());
-
-    let token = login_token(&app, &fx.manager_username, PartFixture::PASSWORD).await;
-
-    let today = chrono::Utc::now()
-        .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
-        .date_naive();
-    let req_body = json!({
-        "customer_id": fx.customer_l2_id.to_string(),
-        "items": [{
-            "name": "spawn-delete-item",
-            "drawing_no": "D-SPAWN",
-            "applicant_name": "丙",
-            "quantity": 1,
-            "request_date": today.to_string(),
-            "planned_delivery_date": today.to_string(),
-            "is_urgent": false,
-            "drawing_file": {
-                "tmp_key": tmp_key,
-                "content_sha256": sha,
-                "original_filename": "handler.pdf",
-                "file_size": "1024",
-                "content_type": "application/pdf"
-            },
-            "model3d_file": null,
-        }],
-    });
-
-    let (status, envelope) = send(
-        app,
-        json_request("POST", "/parts/batch", Some(req_body), Some(&token)),
-    )
-    .await;
-
-    assert_eq!(status, axum::http::StatusCode::OK, "应 200: {envelope}");
-    assert_eq!(envelope["code"], 0, "应 code=0: {envelope}");
-    let created = envelope["data"]["created"]
-        .as_array()
-        .map(|a| a.len())
-        .unwrap_or(0);
-    assert_eq!(created, 1, "应 created=1: {envelope}");
-
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let delete_calls = cos.delete_calls.lock().unwrap().clone();
-    assert!(
-        delete_calls
-            .iter()
-            .any(|k| k == "tmp/test/handler-spawn-delete.pdf"),
-        "handler spawn delete 应触发 tmp_key 兜底: got {delete_calls:?}"
-    );
-}
-
-#[tokio::test]
-async fn batch_create_parts_handler_spawn_delete_on_err() {
-    use std::sync::Arc;
-
-    let pool = test_pool().await;
-    let fx = load_part_fixture(&pool).await;
-
-    let cos = Arc::new(MockCos::new());
-    let first_tmp_key = "tmp/test/handler-err-spawn-delete-first.pdf";
-    let second_tmp_key = "tmp/test/handler-err-spawn-delete-second.pdf";
-    let first_sha = "a".repeat(64);
-    let second_sha = "b".repeat(64);
-    cos.set_head(first_tmp_key, 1024);
-
-    let state = test_state_with_cos(pool.clone(), cos.clone()).await;
-    let app = test_app(state.clone());
-
-    let token = login_token(&app, &fx.manager_username, PartFixture::PASSWORD).await;
-
-    let today = chrono::Utc::now()
-        .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
-        .date_naive();
-    let req_body = json!({
-        "customer_id": fx.customer_l2_id.to_string(),
-        "items": [
-            {
-                "name": "first-item",
-                "drawing_no": "D-FIRST",
-                "applicant_name": "甲",
-                "quantity": 1,
-                "request_date": today.to_string(),
-                "planned_delivery_date": today.to_string(),
-                "is_urgent": false,
-                "drawing_file": {
-                    "tmp_key": first_tmp_key,
-                    "content_sha256": first_sha,
-                    "original_filename": "first.pdf",
-                    "file_size": "1024",
-                    "content_type": "application/pdf"
-                },
-                "model3d_file": null,
-            },
-            {
-                "name": "second-item",
-                "drawing_no": "D-SECOND",
-                "applicant_name": "乙",
-                "quantity": 1,
-                "request_date": today.to_string(),
-                "planned_delivery_date": today.to_string(),
-                "is_urgent": false,
-                "drawing_file": {
-                    "tmp_key": second_tmp_key,
-                    "content_sha256": second_sha,
-                    "original_filename": "second.pdf",
-                    "file_size": "1024",
-                    "content_type": "application/pdf"
-                },
-                "model3d_file": null,
-            },
-        ],
-    });
-
-    let (status, envelope) = send(
-        app,
-        json_request("POST", "/parts/batch", Some(req_body), Some(&token)),
-    )
-    .await;
-
-    assert!(
-        !status.is_success(),
-        "Err 路径应非 2xx: status={status}, envelope={envelope}"
-    );
-    assert_eq!(
-        envelope["code"], 21114,
-        "Err 路径应报 21114 BIZ_PART_FILE_TMP_OBJECT_MISSING: {envelope}"
-    );
-
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let delete_calls = cos.delete_calls.lock().unwrap().clone();
-    assert!(
-        delete_calls.iter().any(|k| k == first_tmp_key),
-        "Err 路径下 handler 应 spawn delete first_tmp_key 兜底: got {delete_calls:?}"
-    );
-    assert!(
-        !delete_calls.iter().any(|k| k == second_tmp_key),
-        "second_tmp_key 因 head 失败未进 COS，不应被 delete: got {delete_calls:?}"
-    );
-}
+//
+// 原用例 `batch_create_parts_handler_spawn_delete_on_ok` / `..._on_err`
+// 断言的是「handler 在 commit 后 spawn 批量 `delete_object(tmp_keys)` 兜底」。
+// 统一链路后 `POST /parts/batch` **不碰** `t_part_file`、也没有 tmp 对象 ⇒ 这条
+// 纪律整体消失。文件写入侧仍保留同款纪律（`files` 域的
+// `POST /objects/{id}/delete` 与 `print_template` 的 delete 端点），覆盖在
+// `tests/files/part_file.rs` 与 `tests/print_template/delete.rs`。
 
 /// 2026-09-30 新增：`/parts` 老端点对 10 字段 union-list 参数的兼容回归。
 ///

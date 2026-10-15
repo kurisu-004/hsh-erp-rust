@@ -634,6 +634,25 @@ impl PartFileService {
         validate::check_filename(original_filename)?;
         validate::check_file_size(file_size, cfg_max_file_size)?;
         validate::check_content_type(content_type, original_filename)?;
+        // ⚠️ 扩展名必须落在**本 kind** 的白名单里：`check_kind` 只判「这个 kind 有
+        // 没有白名单」，`check_content_type` 只判「声明的 MIME 与扩展名配不配得上」——
+        // 两者都不判「这个 kind 收不收这种扩展名」。缺这道，调用方跳过
+        // upload-intents 直接打 confirm 就能给 DRAWING 落一行 `.step`。
+        // （upload-intents 侧也判同一张表，见 `grant_upload_intents`。）
+        {
+            let ext = policy::ext_of(original_filename).ok_or_else(|| {
+                AppError::biz(
+                    code::BIZ_PART_FILE_BAD_TYPE,
+                    format!("文件缺少扩展名: {original_filename:?}"),
+                )
+            })?;
+            if !policy::allowed_exts(kind).contains(&ext.as_str()) {
+                return Err(AppError::biz(
+                    code::BIZ_PART_FILE_BAD_TYPE,
+                    format!("kind={kind:?} 不接受扩展名 {ext:?}"),
+                ));
+            }
+        }
 
         // 3b. CNC 配对目标校验（kind 必须互补）+ 目标行存在性。
         //     排在任何写入之前 ⇒ 配错 kind 时零副作用。
@@ -710,9 +729,8 @@ impl PartFileService {
             let mut repo: &mut sqlx::PgConnection = &mut conn;
             PartFileRepoTrait::get_by_owner_kind_sha(&mut repo, owner_id, kind, sha256).await?
         };
-        if cas_hit.is_some() && pair_with_file_id.is_none() {
-            let existing = cas_hit.expect("已判 is_some");
-            return Ok(Self::render_out(&existing, owner_kind));
+        if let (Some(existing), None) = (&cas_hit, pair_with_file_id) {
+            return Ok(Self::render_out(existing, owner_kind));
         }
 
         // 7./8. tx 内写入（+ 配对）

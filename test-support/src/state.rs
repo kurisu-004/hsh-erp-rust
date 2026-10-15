@@ -107,8 +107,6 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
             max_file_size: 314_572_800,
             // 2026-10-15 新增：写侧预签 PUT URL 有效期（前端直传上传）。
             upload_url_expire_seconds: 900,
-            // 2026-10-15：随 confirm / batch 改造一并删除。
-            tmp_prefix: "tmp/".into(),
             // 2026-10-13 PR2：CI 预览图 URL 拼接两件套。测试值取固定字面量，
             // 让 `tests/files/preview.rs` 能逐条断言拼出来的 URL。
             preview_prefix: "previews".into(),
@@ -311,8 +309,6 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
             max_file_size: 314_572_800,
             // 2026-10-15 新增：写侧预签 PUT URL 有效期（前端直传上传）。
             upload_url_expire_seconds: 900,
-            // 2026-10-15：随 confirm / batch 改造一并删除。
-            tmp_prefix: "tmp/".into(),
             // 2026-10-13 PR2：CI 预览图 URL 拼接两件套。测试值取固定字面量，
             // 让 `tests/files/preview.rs` 能逐条断言拼出来的 URL。
             preview_prefix: "previews".into(),
@@ -480,8 +476,6 @@ pub async fn test_state_with_cos(
             max_file_size: 314_572_800,
             // 2026-10-15 新增：写侧预签 PUT URL 有效期（前端直传上传）。
             upload_url_expire_seconds: 900,
-            // 2026-10-15：随 confirm / batch 改造一并删除。
-            tmp_prefix: "tmp/".into(),
             // 2026-10-13 PR2：CI 预览图 URL 拼接两件套。测试值取固定字面量，
             // 让 `tests/files/preview.rs` 能逐条断言拼出来的 URL。
             preview_prefix: "previews".into(),

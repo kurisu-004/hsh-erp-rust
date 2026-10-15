@@ -41,7 +41,7 @@
 
 use axum::http::StatusCode;
 use hsh_erp_test_support::{json_request, send, send_raw};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::{
     Ctx, assert_biz_code, bootstrap, fetch_content, minimal_xlsx_bytes, resolve,
@@ -55,7 +55,7 @@ const XLSX_MIME: &str = "application/vnd.openxmlformats-officedocument.spreadshe
 async fn seed_template(ctx: &Ctx, customer_id: i64) -> i64 {
     let bytes = minimal_xlsx_bytes(&format!("seed {customer_id}"));
     let (st, env) = upload(ctx, customer_id, "模板.xlsx", &bytes, &ctx.manager_token).await;
-    assert_eq!(st, StatusCode::CREATED, "seed 上传失败：{env}");
+    assert_eq!(st, StatusCode::OK, "seed 模板写入失败：{env}");
     env["data"]["id"]
         .as_str()
         .expect("id 是 JSON string")
@@ -90,29 +90,31 @@ async fn resolve_hit_returns_template_and_customer_name() {
 //  1b. 出参形状：行 VO 的 `customer_name`（2026-10-16 review 第 2 轮 C-1）
 // ===========================================================================
 
-/// ★ **上传 / 列表 / resolve 三个端点的行 VO 都带 `customer_name`** 且命中时等于
-/// 那个一级客户的名。
+/// ★ **列表 / resolve 两个端点的行 VO 都带 `customer_name`** 且命中时等于那个
+/// 一级客户的名。
 ///
-/// ⚠️ **这是硬阻断级回归**（review 第 2 轮 C-1）：前端 `printTemplateSchema` 是
-/// `.strict()` 且 `customer_name` **必填** —— 缺这一个键时
-/// - 上传即便后端返 **201** 也恒抛 ZodError（前端看不到成功）；
-/// - 列表每行都抛 ⇒ 页面恒空、「客户」列恒显「（已删除的客户）」；
-/// - 「自动选用模板」那条链路同样拿不到数据。
-/// 也就是**对着真后端本域 100% 不可用**，而当时三条端点的用例全绿。
+/// ⚠️ **这是硬阻断级回归**：前端 `printTemplateSchema` 是 `.strict()` 且
+/// `customer_name` **必填** —— 缺这一个键时列表每行都抛 ⇒ 页面恒空、
+/// 「客户」列恒显「（已删除的客户）」，也就是对着真后端本域 100% 不可用，
+/// 而当时用例全绿。
 ///
-/// ⚠️ 三个端点走**三条不同的填充路径**（端点 1 顺带 L1 强制点那条查询、
-/// 端点 2 批量 `id = ANY($1)` 后内存 join、端点 3 与顶层同源），所以三处都要断。
+/// ⚠️ 2026-10-15：**写入侧的出参不再带 `customer_name`**。模板写入改走
+/// `POST /files/objects/confirm`，它回的是 `R<PartFileOut>`（18 字段的文件行
+/// 投影，**没有** `customer_name` —— `customer_name` 是本域给 `t_customer`
+/// 补的列，files 域不出）。前端写完模板后**刷新列表**即可拿到名字；本用例的
+/// ①② 两步 accordingly 钉的是「列表 / resolve 仍带」，写入侧只钉「落库」。
 #[tokio::test]
-async fn customer_name_is_present_on_upload_list_and_resolve() {
+async fn customer_name_is_present_on_list_and_resolve() {
     let ctx = bootstrap().await;
 
-    // ① 端点 1（上传）
+    // ① 写入侧：confirm 的出参是 `PartFileOut`（**无** customer_name 键）
     let bytes = minimal_xlsx_bytes("customer name shape");
     let (st, env) = upload(&ctx, ctx.l1_id, "带客户名.xlsx", &bytes, &ctx.manager_token).await;
-    assert_eq!(st, StatusCode::CREATED, "{env}");
-    assert_eq!(
-        env["data"]["customer_name"], "模板测试甲公司",
-        "上传出参的行 VO 必须带客户名：{env}"
+    assert_eq!(st, StatusCode::OK, "{env}");
+    assert_eq!(env["data"]["kind"], "DELIVERY_TEMPLATE", "{env}");
+    assert!(
+        env["data"].get("customer_name").is_none(),
+        "confirm 回 `PartFileOut`，按契约不含 customer_name：{env}"
     );
 
     // ② 端点 2（列表）
@@ -296,7 +298,7 @@ async fn content_bytes_are_byte_identical_to_upload() {
     let ctx = bootstrap().await;
     let bytes = minimal_xlsx_bytes("byte identical");
     let (st, env) = upload(&ctx, ctx.l1_id, "取字节.xlsx", &bytes, &ctx.manager_token).await;
-    assert_eq!(st, StatusCode::CREATED, "{env}");
+    assert_eq!(st, StatusCode::OK, "{env}");
     let id = env["data"]["id"].as_str().unwrap().parse::<i64>().unwrap();
 
     let (status, headers, got) = fetch_content(&ctx, id, &ctx.manager_token).await;
@@ -348,48 +350,27 @@ async fn content_of_non_template_file_returns_21101() {
 }
 
 // ===========================================================================
-//  8. 通用上传原语的绕行面（两条写入口）
+//  8. 通用写入口的绕行面（两条：upload-intents / confirm）
 // ===========================================================================
+//
+// ⚠️ 2026-10-15：模板写入链路统一到 `POST /files/objects/upload-intents` →
+// 前端直传 → `POST /files/objects/confirm` 之后，本域**没有任何自己的上传端点**
+// ——「谁能写 DELIVERY_TEMPLATE」这道闸门只存在于这两条通用写入口里
+// （`policy::write_roles_for` / `confirm_roles_for`）。因此绕行面必须钉。
 
-/// ★ CLERK 经 `POST /api/v2/files/objects`（**files 域的通用上传原语**）
-/// 也造不出 `DELIVERY_TEMPLATE` 行 ⇒ **403**，且该 L1 名下**没有**模板行。
+/// ★ CLERK 经 `POST /files/objects/upload-intents`（**files 域的通用写入口**）
+/// 造不出 `DELIVERY_TEMPLATE` 行 ⇒ **403**，且该 L1 名下**没有**模板行。
 ///
-/// ⚠️ 这是本域最容易被绕开的一处：`POST /print-templates` 有 MANAGER 守卫，
-/// 但 `POST /files/objects` 的 `owner_kind` / `kind` 都由 client 在 multipart
-/// `data` 里给。只在域内 handler 守 MANAGER 是不够的 ——
-/// 所以 `PartFileService::upload_file_for_owner` 里有那道按 `owner_kind`
-/// 分派角色的闸门（`policy::write_roles_for`）。本用例从**外部**钉住它。
-///
-/// ⚠️⚠️ **本用例必须显式打 `/files/objects`（`multipart_request_to`）**：
-/// 2026-10-16 首版误用了 uri 写死成 `/print-templates` 的 `multipart_request`，
-/// 于是 403 来自**本域自己的** handler 守卫、`data` 里的 `owner_kind` / `kind`
-/// 压根没被解析 ⇒ 断言恒真、什么也没钉到（review 第 1 轮 MAJOR-4）。
-/// 现在打的是真的通用上传端点，且 `data` 的形状就是它的 `UploadFileData`。
+/// 断言的形态刻意挑在**任何外部 IO 之前**：请求只发到签发端点，拿到 403 就证明
+/// 角色闸门排在派生 key / 签名之前。
 #[tokio::test]
-async fn clerk_cannot_bypass_via_generic_upload_endpoint() {
-    use crate::{multipart_request_to, send_multipart};
+async fn clerk_cannot_bypass_via_generic_upload_intents_endpoint() {
+    use crate::upload_intents;
     let ctx = bootstrap().await;
     let bytes = minimal_xlsx_bytes("bypass attempt");
 
-    let data = format!(
-        r#"{{"owner_kind":"CUSTOMER","owner_id":"{}","kind":"DELIVERY_TEMPLATE"}}"#,
-        ctx.l1_id
-    );
-    let (status, env) = send_multipart(
-        &ctx,
-        multipart_request_to(
-            "/files/objects",
-            Some(&data),
-            Some((
-                "file",
-                "绕行.xlsx",
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                &bytes,
-            )),
-            Some(&ctx.clerk_token),
-        ),
-    )
-    .await;
+    let (status, env) =
+        upload_intents(&ctx, ctx.l1_id, "绕行.xlsx", &bytes, &ctx.clerk_token).await;
 
     assert_biz_code(status, &env, 40300, StatusCode::FORBIDDEN);
     assert!(
@@ -398,45 +379,37 @@ async fn clerk_cannot_bypass_via_generic_upload_endpoint() {
             .is_empty(),
         "绕行失败不得留下任何行：{env}"
     );
+    assert!(
+        ctx.cos.get_responses.lock().unwrap().is_empty(),
+        "被拒的签发不得已往 COS 写过字节"
+    );
 }
 
-/// ★ **正向对照**：同一个 multipart、换成 **Manager** 打同一个 `/files/objects`
-/// ⇒ 会**真的写进去**（201）。
+/// ★ **正向对照**：同样的请求换成 **Manager** ⇒ 签发成功（200）**并能走完 confirm
+/// 真正落库**。
 ///
 /// ⚠️ 这条是上一条的**对照组**，缺了它上一条就没有意义：403 可能来自任何一层
-/// （本域 handler、`owner_kind` × `kind` 配对、扩展名、content_type……），
-/// 只有「同样的 body 换个角色就成功」才能证明被拒的**唯一**原因是角色闸门，
-/// 且证明请求**真的打到了 `POST /files/objects`**（打错 URL 的话这条会红）。
+/// （owner 存在性、`owner_kind` × `kind` 配对、扩展名、content_type……），
+/// 只有「同样的 body 换个角色就成功」才能证明被拒的**唯一**原因是角色闸门。
 #[tokio::test]
-async fn manager_bypass_control_group_really_reaches_the_generic_endpoint() {
-    use crate::{multipart_request_to, send_multipart};
+async fn manager_bypass_control_group_really_reaches_the_generic_endpoints() {
+    use crate::upload;
     let ctx = bootstrap().await;
     let bytes = minimal_xlsx_bytes("bypass control");
 
-    let data = format!(
-        r#"{{"owner_kind":"CUSTOMER","owner_id":"{}","kind":"DELIVERY_TEMPLATE"}}"#,
-        ctx.other_l1_id
-    );
-    let (status, env) = send_multipart(
+    let (status, env) = upload(
         &ctx,
-        multipart_request_to(
-            "/files/objects",
-            Some(&data),
-            Some((
-                "file",
-                "对照.xlsx",
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                &bytes,
-            )),
-            Some(&ctx.manager_token),
-        ),
+        ctx.other_l1_id,
+        "对照.xlsx",
+        &bytes,
+        &ctx.manager_token,
     )
     .await;
 
     assert_eq!(
         status,
-        StatusCode::CREATED,
-        "Manager 打通用端点应成功：{env}"
+        StatusCode::OK,
+        "Manager 走通用链路应成功落库：{env}"
     );
     assert_eq!(env["data"]["kind"], "DELIVERY_TEMPLATE");
     assert_eq!(env["data"]["owner_kind"], "CUSTOMER");
@@ -449,62 +422,35 @@ async fn manager_bypass_control_group_really_reaches_the_generic_endpoint() {
     );
 }
 
-/// ★ **Manager 也绑不了二级客户**：`POST /files/objects` 带 `owner_id=<L2>` ⇒
-/// **21105**（HTTP 404），且零副作用（库里无行 + 桶里无对象）。
+/// ★ **Manager 也绑不了二级客户**：`owner_id=<L2>` ⇒ **21105**（HTTP 404），
+/// 且零副作用（库里无行 + 桶里无对象 + 父 L1 未被碰）。
 ///
-/// ⚠️ 这是 **2026-10-16 review 第 2 轮 MAJOR-A**：上一轮给 confirm 加「拒 CUSTOMER」
-/// 的理由逐字是「该端点没有『只绑一级客户』的强制点，放行等于给 Manager 一条绕过
-/// L1-only 的路」—— 而**同一句理由逐字适用于 `POST /files/objects`**。上一轮刻意
-/// 留着它开、并用上面那条对照组（真 L1 ⇒ 201）钉住「这条路对 Manager 是通的」，
-/// 于是第 1 轮 MAJOR-1 里「含二级客户的模板可绕」这后半句只在两条入口之一上闭合。
-/// 现 L1 判据下沉进共用原语 `PartFileRepo::customer_owner_exists`
-/// （谓词加 `AND parent_id IS NULL`），错误码沿用同族 21105。
-///
-/// 绑定这条时**注意与上一条对照着读**：owner 只换了「L1 → L2」，
-/// 角色、路径、body 形状逐字相同 ⇒ 两条合起来才是完整的判据网（角色过了、L1
-/// 这道没过）。
+/// ⚠️ L1-only 判据在 `PartFileRepoTrait::customer_owner_exists`（谓词含
+/// `AND parent_id IS NULL`），两条写入口共用；错误码沿用 21105。
 #[tokio::test]
 async fn manager_cannot_bind_template_to_l2_customer_via_generic_endpoint() {
-    use crate::{multipart_request_to, send_multipart};
+    use crate::upload;
     let ctx = bootstrap().await;
     let bytes = minimal_xlsx_bytes("bind to l2");
 
-    let data = format!(
-        r#"{{"owner_kind":"CUSTOMER","owner_id":"{}","kind":"DELIVERY_TEMPLATE"}}"#,
-        ctx.l2_id
-    );
-    let (status, env) = send_multipart(
-        &ctx,
-        multipart_request_to(
-            "/files/objects",
-            Some(&data),
-            Some((
-                "file",
-                "绑二级.xlsx",
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                &bytes,
-            )),
-            Some(&ctx.manager_token),
-        ),
-    )
-    .await;
+    let (status, env) = upload(&ctx, ctx.l2_id, "绑二级.xlsx", &bytes, &ctx.manager_token).await;
 
     // 21105 = BIZ_PART_FILE_OWNER_NOT_FOUND，`status_from_code` 映射成 404
     assert_biz_code(status, &env, 21105, StatusCode::NOT_FOUND);
 
-    // 零副作用 ①：L2 名下没有模板行（否则就是 review 第 2 轮修的那个孤儿配置行）
+    // 零副作用 ①：L2 名下没有模板行（否则就是「永不消费」的孤儿配置行）
     assert!(
         rows_for_owner_kind(&ctx.pool, ctx.l2_id, "DELIVERY_TEMPLATE")
             .await
             .is_empty(),
         "绑二级被拒 ⇒ L2 名下不得有任何行：{env}"
     );
-    // 零副作用 ②：桶里也没有对象 —— owner 存在性复核排在 `cos.put_object` **之前**
+    // 零副作用 ②：桶里也没有对象 —— owner 存在性校验排在任何 COS 交互**之前**
     assert!(
         ctx.cos.get_responses.lock().unwrap().is_empty(),
         "被拒的请求不得已往 COS 写过字节"
     );
-    // 零副作用 ③：其父 L1 名下也没有被动过（本次请求不该软删任何东西）
+    // 零副作用 ③：其父 L1 名下也没有被动过
     assert!(
         rows_for_owner_kind(&ctx.pool, ctx.l1_id, "DELIVERY_TEMPLATE")
             .await
@@ -513,41 +459,29 @@ async fn manager_cannot_bind_template_to_l2_customer_via_generic_endpoint() {
     );
 }
 
-/// ★ CLERK 经 `POST /api/v2/files/objects/confirm`（**第二条**写入口，STS 直传回执）
-/// 同样造不出模板行 ⇒ 403，且零副作用。
+/// ★ CLERK 经 `POST /files/objects/confirm`（**第二条**写入口）同样造不出模板行
+/// ⇒ 403，且零副作用。
 ///
-/// ⚠️ 这是 2026-10-16 首版**真正漏掉**的那条路径（review 第 1 轮 MAJOR-1）：
-/// 本轮给 `owner_kind_allows_kind` 加了 `CUSTOMER => DELIVERY_TEMPLATE`，而
-/// `bind_uploaded_file` 的角色闸门恒是 `M + C`、**与 `owner_kind` 无关** ⇒
-/// CLERK 打 confirm 能造出并**替换掉**任意未软删客户名下的模板行。
-/// 现已与 `upload_file_for_owner` 共用 `policy::write_roles_for`。
-///
-/// 断言的形态刻意挑在**任何外部 IO 之前**：body 里的 `tmp_key` 是假的
-/// （`head_object` 必失败），所以「真的走到了 head 那一步」会换成 21114；
-/// 拿到 403 就证明闸门排在它前面。
+/// 断言的形态刻意挑在**任何外部 IO 之前**：body 里的 `object_key` 是按
+/// (sha, filename) 正确派生但桶里**不存在**的值 —— 若真走到 head 那一步会换成
+/// 21114；拿到 403 就证明闸门排在它前面。
 #[tokio::test]
 async fn clerk_cannot_bypass_via_generic_confirm_endpoint() {
-    use hsh_erp_test_support::{json_request, send};
+    use crate::{XLSX_MIME, confirm};
+    use hsh_erp_rust::util::cos_key::build_cas_key;
 
     let ctx = bootstrap().await;
-    let body = json!({
-        "owner_kind": "CUSTOMER",
-        "owner_id": ctx.l1_id.to_string(),
-        "kind": "DELIVERY_TEMPLATE",
-        "tmp_key": "tmp/never-uploaded.xlsx",
-        "content_sha256": "a".repeat(64),
-        "original_filename": "confirm绕行.xlsx",
-        "file_size": "1024",
-        "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    });
-    let (status, env) = send(
-        ctx.app.clone(),
-        json_request(
-            "POST",
-            "/files/objects/confirm",
-            Some(body),
-            Some(&ctx.clerk_token),
-        ),
+    let sha = "a".repeat(64);
+    let object_key = build_cas_key("uploads", &sha, "confirm绕行.xlsx");
+    let (status, env) = confirm(
+        &ctx,
+        ctx.l1_id,
+        "confirm绕行.xlsx",
+        1024,
+        XLSX_MIME,
+        &sha,
+        &object_key,
+        &ctx.clerk_token,
     )
     .await;
 
@@ -560,47 +494,27 @@ async fn clerk_cannot_bypass_via_generic_confirm_endpoint() {
     );
 }
 
-/// ★ **Manager** 打 confirm 写 `CUSTOMER` 也被拒 ⇒ **20104**（不是 201 Created）。
+/// ★ **Manager** 经 confirm 写 `CUSTOMER` **是允许的**（2026-10-15 起）。
 ///
-/// ⚠️ 这条钉的是 MAJOR-1 的**第二个缺口**：角色闸门只保证「到得了这里」，而
-/// confirm 端点**没有**本域那两条业务不变式（「只绑一级客户」在
-/// `print_template::service::customer_is_l1`，「替换语义」在上传流程里）⇒
-/// Manager 经它能造出一行绑在**二级客户** id 上的模板行，绕过 L1-only 规则。
-/// 本域零个合法 CUSTOMER confirm 调用方，故直接拒（错误码 20104：不是权限问题，
-/// 是「这个 owner 类型本端点不服务」）。
+/// ⚠️ 这条与本文件里被删的 `manager_cannot_write_template_via_confirm_endpoint`
+/// 正好相反 —— 打印模板直传化之后，模板写入**只**有 confirm 这一条路，
+/// 「替换语义」（同 L1 至多一份活跃模板）由 confirm 事务内的
+/// 「软删旧活跃行 + INSERT」承接。
+///
+/// 断言两件事：① 不再是 20104；② 走完链后 L1 名下恰好一条活跃行。
 #[tokio::test]
-async fn manager_cannot_write_template_via_confirm_endpoint() {
-    use hsh_erp_test_support::{json_request, send};
-
+async fn manager_can_write_template_via_confirm_endpoint() {
+    use crate::upload;
     let ctx = bootstrap().await;
-    let body = json!({
-        "owner_kind": "CUSTOMER",
-        "owner_id": ctx.l1_id.to_string(),
-        "kind": "DELIVERY_TEMPLATE",
-        "tmp_key": "tmp/never-uploaded.xlsx",
-        "content_sha256": "b".repeat(64),
-        "original_filename": "manager确认.xlsx",
-        "file_size": "1024",
-        "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    });
-    let (status, env) = send(
-        ctx.app.clone(),
-        json_request(
-            "POST",
-            "/files/objects/confirm",
-            Some(body),
-            Some(&ctx.manager_token),
-        ),
-    )
-    .await;
+    let bytes = minimal_xlsx_bytes("manager confirm ok");
 
-    assert_biz_code(status, &env, 20104, StatusCode::BAD_REQUEST);
-    assert!(
-        rows_for_owner_kind(&ctx.pool, ctx.l1_id, "DELIVERY_TEMPLATE")
-            .await
-            .is_empty(),
-        "被拒后不得留下任何行：{env}"
-    );
+    let (status, env) = upload(&ctx, ctx.l1_id, "经理模板.xlsx", &bytes, &ctx.manager_token).await;
+    assert_eq!(status, StatusCode::OK, "Manager 应能经 confirm 落库：{env}");
+    assert_eq!(env["data"]["kind"], "DELIVERY_TEMPLATE");
+    assert_eq!(env["data"]["owner_kind"], "CUSTOMER");
+    let rows = rows_for_owner_kind(&ctx.pool, ctx.l1_id, "DELIVERY_TEMPLATE").await;
+    assert_eq!(rows.len(), 1, "L1 名下应恰好一条模板行：{rows:?}");
+    assert!(!rows[0].1, "该行必须是活跃行：{rows:?}");
 }
 
 // ===========================================================================

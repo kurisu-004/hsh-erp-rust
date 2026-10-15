@@ -12,11 +12,15 @@
 //! 4. `batch_create_rejects_when_l1_serial_prefix_missing` —— L1 未配 prefix
 //!    → 20308 整单拒，且 t_part 行数不变；
 //! 5. `batch_create_serials_are_unique_and_increasing` —— 同批 / 跨批都不重号且递增；
-//! 6. `batch_create_with_bindings_dispatches_serial_and_keeps_prices` —— 带
-//!    `drawing_file` 的另一个 service 入口（`has_bindings` 分流）同样派号 + 透传金额；
-//! 7. `batch_create_rejects_when_l1_parent_soft_deleted` —— L1 父行已软删 → 20102；
-//! 8. `batch_create_rejects_when_serial_prefix_not_uppercase` —— prefix 非 A-Z → 20104；
-//! 9. `batch_with_pdfs_endpoint_is_gone_and_old_path_is_rejected` —— 硬切守卫（见下）。
+//! 6. `batch_create_rejects_when_l1_parent_soft_deleted` —— L1 父行已软删 → 20102；
+//! 7. `batch_create_rejects_when_serial_prefix_not_uppercase` —— prefix 非 A-Z → 20104；
+//! 8. `batch_with_pdfs_endpoint_is_gone_and_old_path_is_rejected` —— 硬切守卫（见下）。
+//!
+//! ## 2026-10-15：`POST /parts/batch` 的 bindings 分支下线
+//!
+//! 原第 6 条 `batch_create_with_bindings_dispatches_serial_and_keeps_prices`
+//! （钉「带 `drawing_file` 时走另一个 service 入口，同样派号 + 透传金额」）随之
+//! 删除，理由见下方同名注释。
 //!
 //! ## 2026-10-13：`POST /parts/batch-with-pdfs` 下线，本文件少 2 条用例
 //!
@@ -564,8 +568,11 @@ async fn batch_with_pdfs_endpoint_is_gone_and_old_paths_are_no_longer_routed() {
     })
     .to_string();
     for (label, pdfs) in [("带 PDF", vec![make_fixture_pdf(3)]), ("无 PDF", vec![])] {
-        let (s, raw) = send_raw(app.clone(), batch_with_pdfs_request(&json_field, &pdfs, &token))
-            .await;
+        let (s, raw) = send_raw(
+            app.clone(),
+            batch_with_pdfs_request(&json_field, &pdfs, &token),
+        )
+        .await;
         assert_eq!(
             s,
             StatusCode::METHOD_NOT_ALLOWED,
@@ -586,122 +593,22 @@ async fn batch_with_pdfs_endpoint_is_gone_and_old_paths_are_no_longer_routed() {
 }
 
 // ===========================================================================
-//  8. 带文件绑定的 with_bindings 分支：同样派号 + 透传金额
+//  2026-10-15：带文件绑定的 with_bindings 分支整体下线
 // ===========================================================================
 
-/// 2026-10-05 补：handler 按 `has_bindings` 分流，带 `drawing_file` 时走
-/// `batch_create_parts_with_bindings`（另一个 service 入口）。该入口的 `acquire`
-/// 刻意放在 per-item SAVEPOINT **之前**（失败时 counter 不回退，代价是号留空洞），
-/// 此前只有「补两个字段」的覆盖、零 serial_no / 金额断言，这里钉死它与 legacy
-/// 分支同口径。
-#[tokio::test]
-async fn batch_create_with_bindings_dispatches_serial_and_keeps_prices() {
-    let pool = test_pool().await;
-    let fx = load_part_fixture(&pool).await;
-    let cos = std::sync::Arc::new(MockCos::new());
-    let tmp_key = "tmp/test/with-bindings.pdf";
-    cos.set_head(tmp_key, 1024);
-    let app = test_app(test_state_with_cos(pool.clone(), cos.clone()).await);
-    let token = login_token(&app, &fx.manager_username, PartFixture::PASSWORD).await;
-
-    let today = today().to_string();
-    let body = json!({
-        "customer_id": fx.customer_l2_id.to_string(),
-        "items": [{
-            "name": "带图纸件",
-            "drawing_no": "D-BIND",
-            "applicant_name": "甲",
-            "quantity": 1,
-            "request_date": today,
-            "planned_delivery_date": today,
-            "is_urgent": false,
-            "unit_price": "88.80",
-            "total_price": "177.60",
-            "drawing_file": {
-                "tmp_key": tmp_key,
-                "content_sha256": "c".repeat(64),
-                "original_filename": "with-bindings.pdf",
-                "file_size": "1024",
-                "content_type": "application/pdf",
-            },
-            "model3d_file": null,
-        }],
-    });
-    let (s, env) = send(
-        app,
-        json_request("POST", "/parts/batch", Some(body), Some(&token)),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "batch create（带绑定）: {env}");
-    assert_eq!(env["code"], 0, "batch create（带绑定）: {env}");
-    let created = env["data"]["created"].as_array().expect("created 数组");
-    assert_eq!(created.len(), 1, "一件应成功: {env}");
-    assert!(
-        env["data"]["failed"]
-            .as_array()
-            .expect("failed 数组")
-            .is_empty(),
-        "不应有失败件: {env}"
-    );
-    let item = &created[0];
-    // 全新库 ⇒ counter 从 0 起 ⇒ 本件拿到第 1 个号
-    let serial = assert_dispatched_serial(item["serial_no"].as_str(), "P1000", "created[0]");
-    assert_eq!(
-        item["unit_price"].as_str(),
-        Some("88.80"),
-        "with_bindings 分支也要透传单价: {item}"
-    );
-    assert_eq!(
-        item["total_price"].as_str(),
-        Some("177.60"),
-        "with_bindings 分支也要透传总价: {item}"
-    );
-    let (db_serial, unit_price, total_price): (
-        Option<String>,
-        rust_decimal::Decimal,
-        rust_decimal::Decimal,
-    ) = sqlx::query_as(
-        "SELECT serial_no, unit_price, total_price FROM t_part WHERE id = $1::bigint",
-    )
-    .bind(item["id"].as_str().unwrap())
-    .fetch_one(&pool)
-    .await
-    .expect("查 t_part");
-    assert_eq!(
-        db_serial.as_deref(),
-        Some(serial.as_str()),
-        "DB 行 serial_no 必须与响应一致（INSERT 期写入）"
-    );
-    assert_eq!(
-        unit_price,
-        rust_decimal::Decimal::new(8880, 2),
-        "DB 单价 88.80"
-    );
-    assert_eq!(
-        total_price,
-        rust_decimal::Decimal::new(17760, 2),
-        "DB 总价 177.60"
-    );
-    // 确实走了 with_bindings 分支（不是 legacy）：part_file 行存在
-    let file_rows: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM t_part_file WHERE part_id = $1::bigint AND kind = 'DRAWING'",
-    )
-    .bind(item["id"].as_str().unwrap())
-    .fetch_one(&pool)
-    .await
-    .expect("count t_part_file");
-    assert_eq!(
-        file_rows, 1,
-        "drawing_file 绑定应落 1 行 t_part_file: {env}"
-    );
-    // counter 恰好被推进 1 次（1 件 1 号，无重复派发）
-    let counter: i64 =
-        sqlx::query_scalar("SELECT counter FROM t_serial_counter WHERE prefix = 'P'")
-            .fetch_one(&pool)
-            .await
-            .expect("查 t_serial_counter");
-    assert_eq!(counter, 1, "1 件只该派 1 个号，counter 应为 1");
-}
+// 原 `batch_create_with_bindings_dispatches_serial_and_keeps_prices` 整条删除。
+//
+// 原因：它钉的是「handler 按 `has_bindings` 分流、带 `drawing_file` 走
+// `batch_create_parts_with_bindings` 那个 service 入口」—— 而那个入口连同
+// `items[].drawing_file` / `model3d_file` 入参随统一上传链路上线一并删除，
+// `POST /parts/batch` 现在**只有一条**路径。
+//
+// ⚠️ 顺带说明它原本钉住的**另一半**（序列号派发 + 金额透传）没有丢：
+// 「batch create 派号 + 单价/总价透传」由本文件其余用例覆盖
+// （`batch_create_dispatches_serial_numbers_*` 与金额那几条），「POST /parts/batch
+// 回归纯建单」由 `tests/part/crud.rs` 的
+// `batch_create_ignores_removed_binding_fields` /
+// `batch_create_without_bindings_succeeds_with_empty_cleanup_keys` 覆盖。
 
 // ===========================================================================
 //  9-10. serial_prefix_for_customer 的负向分支（20102 / 20104）

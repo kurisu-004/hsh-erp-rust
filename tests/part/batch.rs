@@ -571,120 +571,20 @@ async fn location_tree_happy_path() {
     );
 }
 
-// ===== 2026-09-29 扁平化新测试：batch_create_with_bindings_object_key_test =====
+// ===========================================================================
+//  2026-10-15：`batch_create_with_bindings` 整条删除
+// ===========================================================================
 //
-// 走完整 service 链路（service 调用 copy_object），断言 part_file 行的 object_key
-// 已切换到新两段模板 `{prefix}{sha16}_{safe_filename}`，不再含 owner_kind/owner_id/
-// KIND 段。
+// 原用例 `batch_create_with_bindings_object_key_test`（断言 bindings 行的 object_key
+// 已是两段模板）随 `items[].drawing_file` / `model3d_file` 与 head/copy 分支删除
+// 而移除：`POST /parts/batch` 现在**不碰** `t_part_file`，文件一律走
+// `POST /files/objects/upload-intents` → 前端直传 → `POST /files/objects/confirm`。
+//
+// 等价覆盖：CAS key 两段模板由 `tests/files/part_file.rs::cas_key_is_two_segments`
+// 守着；「POST /parts/batch 回归纯建单」由 `tests/part/crud.rs` 的两条
+// （`batch_create_rejects_removed_binding_fields` /
+// `batch_create_without_bindings_succeeds_with_empty_cleanup_keys`）守着。
 
-#[tokio::test]
-async fn batch_create_with_bindings_object_key_test() {
-    use hsh_erp_rust::auth::rbac::Role;
-    use hsh_erp_rust::modules::part::dto_crud::{
-        FileBindingIn, PartBatchCreateItem, PartBatchCreateRequest,
-    };
-    use hsh_erp_rust::modules::part::service::PartService;
-    use hsh_erp_test_support::fixture::PartFixture;
-
-    let pool = test_pool().await;
-    let fx: PartFixture = load_part_fixture(&pool).await;
-    // 2026-09-29 扁平化新增测试：本文件无 manager_current 私有 helper（仅 crud.rs 有），
-    // 直接构造 Manager CurrentUser（与 file.rs::test_current_user_with_roles 同形）。
-    let current = hsh_erp_rust::auth::rbac::CurrentUser {
-        id: 1,
-        username: "test-manager".into(),
-        roles: vec![Role::Manager],
-        shelf_ids: vec![],
-        shelf_wildcard: false,
-        permissions: Vec::new(),
-    };
-    let cos = std::sync::Arc::new(MockCos::new());
-
-    let tmp_key = "tmp/test/binding-flat.pdf";
-    let sha = "1".repeat(64);
-    cos.set_head(tmp_key, 1024);
-
-    let today = chrono::Utc::now()
-        .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
-        .date_naive();
-    let req = PartBatchCreateRequest {
-        customer_id: fx.customer_l2_id,
-        items: vec![PartBatchCreateItem {
-            name: "ok-item".into(),
-            drawing_no: "D-FLAT".into(),
-            applicant_name: "X".into(),
-            quantity: 1,
-            request_date: today,
-            planned_delivery_date: today,
-            is_urgent: false,
-            order_no: None,
-            system_delivery_date: None,
-            note: None,
-            assembly_id: None,
-            unit_price: None,
-            total_price: None,
-            drawing_file: Some(FileBindingIn {
-                tmp_key: tmp_key.into(),
-                content_sha256: sha.clone(),
-                original_filename: "flat.pdf".into(),
-                file_size: 1024,
-                content_type: "application/pdf".into(),
-                ext: None, // 2026-09-29 新增字段
-            }),
-            model3d_file: None,
-        }],
-    };
-
-    let mut tx = pool.begin().await.unwrap();
-    let (out, _keys) = PartService::batch_create_parts_with_bindings(
-        &mut *tx,
-        shared_test_snowflake().as_ref(),
-        cos.clone(),
-        "uploads",
-        "tmp/",
-        &req,
-        &current,
-    )
-    .await
-    .map_err(|(e, _)| e)
-    .expect("batch_create_parts_with_bindings 应 Ok");
-    tx.commit().await.unwrap();
-
-    // 直接查 DB 找 part_file 行：按 owner_id + kind 找出刚生成的 part_file
-    let new_part_id = out.created[0].part.id;
-    let mut tx = pool.begin().await.unwrap();
-    let rows = hsh_erp_rust::modules::files::part_file::repo::PartFileRepo::list_by_owner(
-        &mut *tx,
-        "PART",
-        new_part_id,
-    )
-    .await
-    .unwrap();
-    drop(tx);
-
-    assert_eq!(rows.len(), 1, "新 part 应该有 1 个 part_file 行");
-    let pf = &rows[0];
-
-    // 新模板两段：`{prefix}{sha16}_{safe_filename}`，不含 owner_kind/owner_id/KIND
-    let expected_cas_key = "uploads/1111111111111111_flat.pdf";
-    assert_eq!(
-        pf.object_key, expected_cas_key,
-        "2026-09-29 扁平化：DB 行 object_key 必须为新两段模板（不含 owner_kind/owner_id/KIND）"
-    );
-    // 反向断言：旧五段前缀不能出现
-    assert!(
-        !pf.object_key.contains("/part/") && !pf.object_key.contains("/DRAWING/"),
-        "object_key 不应再含 owner_kind 'part/' 或 KIND 'DRAWING/'"
-    );
-}
-
-// ===========================================================================
-//  权限点闸门（2026-10-15 新增）
-// ===========================================================================
-
-/// split / cancel 迁权限点（2026-10-15）—— `batch.split` / `batch.cancel` 矩阵
-/// 均为 M,C：Inspector ⇒ 40300；Clerk ⇒ 200（正向留痕，自原 `require_any_role`
-/// 集合逐格迁移）。
 #[tokio::test]
 async fn split_and_cancel_permission_matrix() {
     let (pool, app, _token, fx) = bootstrap_as_manager().await;

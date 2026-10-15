@@ -59,7 +59,6 @@ fn make_cos_config(backend: CosBackend, enabled: bool) -> CosConfig {
         max_file_size: 300 * 1024 * 1024,
         // 2026-10-15 新增：写侧预签 PUT URL 有效期（本 binary 不签发，填缺省）。
         upload_url_expire_seconds: 900,
-        tmp_prefix: "tmp/".to_string(),
         // 2026-10-13 PR2：CI 预览图 URL 拼接两件套（本 binary 不打预览端点，取字面量即可）
         preview_prefix: "previews".to_string(),
         preview_base_url: "https://test-bucket.cos.ap-shanghai.myqcloud.com".to_string(),
