@@ -41,7 +41,7 @@
 //! |---|---|---|
 //! | 第三节小标题 + **第一组**的组标题 + 该组首行 | 该组其余行 | 每片至多以「组标题 + 首行」开头，不会出现只有标题没有内容的片 |
 //! | 后续每组：组标题 + 该组首行 | 该组其余行 | 组内某片可能以若干**子件行**开头，而它们的装配件行在上一片 |
-//! | 组末脚注「另有 N 条未列出」 | — | 脚注可能落在下一片 |
+//! | 组末脚注「另有 N **行**未列出」 | — | 脚注可能落在下一片 |
 //!
 //! 「子件行与父行被拆到两片」是**可接受**的：子件行自带序列号 / 名称 / 数量 / 位置，
 //! 单看一行就完整（这正是它逐字重复父行全部字段的原因），而标题块每片都重复、给出
@@ -155,6 +155,10 @@ pub struct OrderGroup {
     ///
     /// ⚠️ 报的是**行**数而不是工单数：额度是按行扣的，按工单数报会在「装配件子件多」
     /// 时显得「只少了几条」，而群里其实少了一大片。
+    ///
+    /// ⚠️ **它与 [`OrderGroup::total`] 量纲不同**（`total` 是工单数、这个是行数）⇒
+    /// 脚注文案必须自带「行」这个单位（`另有 N 行未列出`），否则读者会把组标题的工单数
+    /// 与脚注的行数相加、读成「共 N + N 条」。
     pub omitted: i64,
     /// 该组的**匹配工单数**（**不受** `order_list_limit` 影响）—— 组标题的「N 条」。
     pub total: i32,
@@ -523,10 +527,12 @@ fn order_blocks(cfg: &NormalizedConfig, rows: &ReportRows) -> Vec<Block> {
             out.push(Block::new(BlockKind::OrderLine, order_line(r)));
         }
         if group.omitted > 0 {
+            // ⚠️ 单位是**行**不是工单（`OrderGroup::omitted` 的口径），组标题那个「N 条」
+            // 才是工单数 —— 两者量纲不同，文案必须自带单位才不会读成「共 N+N 条」。
             out.push(Block::new(
                 BlockKind::OrderFooter,
                 format!(
-                    "> <font color=\"comment\">另有 {} 条未列出</font>",
+                    "> <font color=\"comment\">另有 {} 行未列出</font>",
                     group.omitted
                 ),
             ));
@@ -540,6 +546,61 @@ fn group_heading(group: &OrderGroup) -> String {
     format!("> **{} · {} 条**", group.kind.label(), group.total)
 }
 
+/// 清单行的链接文字与序列号要过的**最小 markdown 转义**（2026-10-23）。
+///
+/// ## 转义的字符集为什么是这五个
+///
+/// `[名称](直链)` 这条构造里，`[` `]` `(` `)` 四个字符参与定义链接结构，`\` 是
+/// markdown 的转义引导符 ⇒ 用户输入里只要有它们，就能在自己的名称内部**提前闭合**
+/// 链接、把后半段变成第二条链接，而本域渲染的是 `t_part.name`（`varchar(200)`
+/// **自由文本**、管理员可编辑）。
+///
+/// 例：名称 `甲](https://evil.example/x)[乙` 不转义时输出
+/// `[甲](https://evil.example/x)[乙](<真实 COS 直链>)` ⇒ 客户端渲染成「甲」链到外站、
+/// 「乙」链到真图。日报的全部价值就是「点开看图」，串号/名称又是用户可编辑字段 ⇒
+/// 这是一条实打实的钓鱼面。
+///
+/// ## 为什么是「转义」而不是「检出特殊字符就不给链接」
+///
+/// 后者会让**正常的图号/名称里带括号**的行集体失链（`6001(A)`、`连杆（左）` 之类），
+/// 代价远大于收益。转义之后最坏形态是**观感级**：客户端若不认反斜杠转义，名称会
+/// 显示成 `甲](x)[乙` 这样的花屏，而**不会**让链接指向外站 —— 安全属性与可读性二者
+/// 取到了正确的偏序。
+///
+/// ## 覆盖范围（守卫 ⑭ 守的就是这里）
+///
+/// 只覆盖 [`order_line`] 的 `name` 与 `serial_no` 两个**用户自由输入**字段：其余
+/// 位置（组标题的日期、数字、`×N`、分组标签）来自枚举或数值，**不存在转义需求**。
+///
+/// ## 不在覆盖范围内的已知残留
+///
+/// - `name` 还能注入 `<font color="…">` 之类的 markdown v1 font 标签（能改颜色与
+///   观感，改不了链接指向）—— 观感级，登记在 `docs/api/wecom-daily.md` §8.3；
+/// - URL 侧的 `base_url` / `preview_image_view_params` 是**部署配置**，其中若含
+///   `)` 或空格会截断链接语法（链接随之失效，指向自家 COS 的意图不成立）——
+///   部署面可控，接受该形态。
+fn escape_link_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if matches!(ch, '[' | ']' | '(' | ')' | '\\') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// 序列号去**控制字符与换行**（2026-10-23）。
+///
+/// 序列号排在清单行的**行首**，一个 `\n` 就能让剩余部分另起一行、伪装成一条独立的
+/// 清单行（甚至伪装成组标题）。markdown v1 里这是实打实的行伪造 ⇒ 控制字符与换行
+/// 一律剥掉，**不替换成可见占位符**（那会让名称列凭空多出一串 `?`）。
+///
+/// 其余内容走 [`escape_link_text`]（见那里的字符集说明）。
+fn clean_serial_no(s: &str) -> String {
+    escape_link_text(&s.chars().filter(|c| !c.is_control()).collect::<String>())
+}
+
 /// 一个清单行：`序列号 [名称](直链) ×数量  位置`。
 ///
 /// ## ⚠️ 三个「缺了就不出现」的字段
@@ -549,11 +610,18 @@ fn group_heading(group: &OrderGroup) -> String {
 ///    行首宽度变得不可预测）；
 /// 2. **图纸直链**为 `None` ⇒ 名称渲染成**纯文字**（不加 `[]()`），因为一个指向空处的
 ///    链接比没有链接更让人困惑；
-/// 3. **位置**为 `None` ⇒ **整项不显示**，连它前面那两个分隔空格一起去掉（判据见
-///    [`OrderRow::location`]）。
+/// 3. **位置**为 `None`（或空串）⇒ **整项不显示**，连它前面那两个分隔空格一起去掉
+///    （判据见 [`OrderRow::location`]）。
 ///
-/// ⚠️ 本函数**不做任何转义**：本域渲染的是 markdown 而非 HTML，名称里的 `<` / `>`
-/// 原样透传（守卫 ⑭ 对全篇有效）。
+/// ## ⚠️ `name` 与 `serial_no` 过最小 markdown 转义
+///
+/// 两者都是用户自由输入，而 `name` 会被塞进 `[名称](直链)` 的链接结构里 ⇒ 不转义
+/// 就能提前闭合链接、伪造出指向外站的第二条链接。字符集与取舍见 [`escape_link_text`]，
+/// 序列号另外剥控制字符与换行（它排在行首，能伪造整行）见 [`clean_serial_no`]。
+///
+/// ⚠️ 链接**文字**之外的字段**不做转义**：组标题的日期、`×N`、分组标签都来自枚举或
+/// 数值，`<` / `>` 原样透传即可（守卫 ⑭ 覆盖工人名与这里的 `name` / `serial_no`，不是
+/// 「全篇」）。
 fn order_line(r: &OrderRow) -> String {
     let prefix = if r.is_child {
         CHILD_PREFIX
@@ -561,17 +629,19 @@ fn order_line(r: &OrderRow) -> String {
         ORDER_PREFIX
     };
     let name = match r.link.as_deref() {
-        Some(url) => format!("[{}]({url})", r.name),
-        None => r.name.clone(),
+        Some(url) => format!("[{}]({url})", escape_link_text(&r.name)),
+        None => escape_link_text(&r.name),
     };
     let head = match r.serial_no.as_deref() {
         // 有序列号：`> F1001 名称 …`（序列号与其后恰一个空格）。
-        Some(s) => format!("{prefix}{s} {name}"),
+        Some(s) => format!("{prefix}{} {name}", clean_serial_no(s)),
         // 无序列号：整个字段去掉，行首恒是 `prefix`。
         None => format!("{prefix}{name}"),
     };
     let mut line = format!("{head} ×{}", r.quantity);
-    if let Some(loc) = r.location.as_deref() {
+    // ⚠️ 空串按「没有位置」处理（2026-10-23）：直接拼上去会得到 `×2  ` 这种行尾双空格，
+    // 而 `markdown` v1 吃行首连续空格、行尾双空格只会在真机上留一段看不见的空白。
+    if let Some(loc) = r.location.as_deref().filter(|s| !s.is_empty()) {
         line.push_str("  ");
         line.push_str(loc);
     }
@@ -1331,8 +1401,10 @@ mod tests {
         assert!(!all.contains("在此省略"), "不限人数时不该有省略脚注：{all}");
     }
 
-    /// ★ 守卫 ⑭：本域是 markdown 不是 HTML ⇒ **不做任何转义**，
-    /// 工人名里的 `<` / `>` 原样透传，而 `<font color=…>` 自身成对。
+    /// ★ 守卫 ⑭：本域是 markdown 不是 HTML ⇒ 工人名里的 `<` / `>` 原样透传，
+    /// 而 `<font color=…>` 自身成对。⚠️ 覆盖范围**不是「全篇」**：清单行的 `name` /
+    /// `serial_no` 是用户自由输入、会进链接结构，那两个字段过最小转义
+    /// （见下面两条守卫）。
     #[test]
     fn markdown_special_chars_are_not_swallowed() {
         let rows = ReportRows {
@@ -1356,6 +1428,73 @@ mod tests {
             "font 标签不成对：{all}"
         );
         assert!(all.matches("<font").count() > 0);
+    }
+
+    /// ★ 守卫 ⑭ 的第二半：**清单行**的用户自由输入**必须**过最小 markdown 转义
+    /// （2026-10-23）。
+    ///
+    /// `name` 会被塞进 `[名称](直链)` 的链接结构里，而 `t_part.name` 是 `varchar(200)`
+    /// 自由文本（管理员可编辑）⇒ 名字里出现 `](` 就能在自己的文本内部**提前闭合**
+    /// 链接、把后半段变成第二条链接指向外站。断言：真正成对闭合的链接结构**只有一条**
+    /// （那条真实直链）、注入的 URL **没有**被 `)` 收尾成目的地。
+    #[test]
+    fn order_line_escapes_markdown_link_structure_in_free_text() {
+        let mut evil = order_row("F1001", "甲](https://evil.example/x)[乙", 2);
+        evil.link = Some("https://cos.example/real/p1.jpg".into());
+        let rows = ReportRows {
+            overdue_count: 1,
+            order_groups: vec![group(OrderGroupKind::Overdue, vec![evil], 1)],
+            ..ReportRows::default()
+        };
+        let out = render_ok(&cfg_with(0, 20), &rows);
+        let all = out.chunks.join("\n");
+
+        // 数「**未被反斜杠转义**的 `]` 紧跟 `(`」= markdown 里真正成对闭合的链接。
+        let chars: Vec<char> = all.chars().collect();
+        let closed_links = chars
+            .windows(2)
+            .enumerate()
+            .filter(|(i, w)| w[0] == ']' && w[1] == '(' && !(*i > 0 && chars[i - 1] == '\\'))
+            .count();
+        assert_eq!(
+            closed_links, 1,
+            "注入的 `](` 不得提前闭合成第二条链接（应只剩真实直链那一条）：{all}"
+        );
+
+        // 真实直链完好，且注入的 URL 没有被 `)` 收尾成链接目的地。
+        assert!(
+            all.contains("](https://cos.example/real/p1.jpg)"),
+            "真实直链必须原样保留：{all}"
+        );
+        assert!(
+            !all.contains("evil.example/x)"),
+            "注入的外站 URL 必须被 `\\)` 打断，不能成为链接目的地：{all}"
+        );
+    }
+
+    /// ★ 守卫 ⑭ 的第三半：**序列号**排在行首 ⇒ 换行能伪造出独立的清单行 / 组标题。
+    ///
+    /// 判据取「输出里没有任何一行**以**伪造的组标题形态**开头**」—— 控制字符被剥掉后
+    /// 文本仍在，但它只能待在原行内、跟在序列号后面。
+    #[test]
+    fn serial_no_cannot_forge_an_extra_line() {
+        let forged = order_row("F1\n> **2026-01-01 · 99 条**", "普通件", 1);
+        let rows = ReportRows {
+            overdue_count: 1,
+            order_groups: vec![group(OrderGroupKind::Overdue, vec![forged], 1)],
+            ..ReportRows::default()
+        };
+        let out = render_ok(&cfg_with(0, 20), &rows);
+        let all = out.chunks.join("\n");
+        assert!(
+            !all.lines()
+                .any(|l| l.trim_start().starts_with("> **2026-01-01")),
+            "序列号里的换行必须被剥掉，不能伪造出一条独立组标题：{all}"
+        );
+        assert!(
+            all.lines().all(|l| !l.contains('\t')),
+            "控制字符（制表符）不得漏进输出：{all}"
+        );
     }
 
     /// ★ 守卫 ⑮：**「（i/N）」后缀的字节数恒 ≤ RESERVE**（pass 1 为它预留的预算）。
@@ -1548,7 +1687,9 @@ mod tests {
     /// ★ 守卫 ㉑：**位置拿不到就整项不显示**（连分隔空格都不留）。
     ///
     /// 四种「拿不到」在 service 层归一成同一个 `None`（`OFFICE` / 无活跃批次 /
-    /// holder 行已软删），渲染层只认「有值就显示、没有就什么都没有」。
+    /// holder 行已软删），渲染层只认「有值就显示、没有就什么都没有」。⚠️ **空串与
+    /// `None` 同等对待**（2026-10-23）：空串一旦被当成「有值」，行尾会留两个看不见的
+    /// 悬空空格，而那条脏输出不该被守成契约。
     #[test]
     fn missing_location_drops_the_whole_item() {
         let mut r = order_row("F1001", "名称甲", 2);
@@ -1557,8 +1698,8 @@ mod tests {
         r.location = Some(String::new());
         assert_eq!(
             order_line(&r),
-            "> F1001 名称甲 ×2  ",
-            "空串仍按「有值」处理（防御）"
+            "> F1001 名称甲 ×2",
+            "空串按「没有位置」处理，不许拼出行尾双空格"
         );
     }
 
@@ -1612,7 +1753,8 @@ mod tests {
         assert!(!all.contains("名称甲"), "{all}");
     }
 
-    /// ★ 守卫 ㉕：截断脚注**只在真的挡掉了行时**出现，文案逐字是「另有 N 条未列出」。
+    /// ★ 守卫 ㉕：截断脚注**只在真的挡掉了行时**出现，文案逐字是「另有 N **行**未列出」
+    /// （单位是行、组标题那个「N 条」是工单数，两者不同量纲）。
     #[test]
     fn truncation_footer_names_the_withheld_row_count() {
         let mut rows = rows_with_workers(1);
@@ -1627,11 +1769,11 @@ mod tests {
         rows.order_groups[0].omitted = 3;
         let all = render_ok(&cfg_with(0, 20), &rows).chunks.join("\n");
         assert!(
-            all.contains("> <font color=\"comment\">另有 3 条未列出</font>"),
+            all.contains("> <font color=\"comment\">另有 3 行未列出</font>"),
             "{all}"
         );
         // 脚注在组末（该组最后一行之后）。
-        let at_footer = all.find("另有 3 条未列出").expect("脚注存在");
+        let at_footer = all.find("另有 3 行未列出").expect("脚注存在");
         let at_last_row = all.find("F4").expect("组内最后一行存在");
         assert!(at_last_row < at_footer, "脚注必须落在组末：{all}");
 

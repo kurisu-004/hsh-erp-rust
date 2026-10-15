@@ -1175,9 +1175,9 @@ async fn orders_section_truncates_at_order_list_limit_with_one_footer() {
     )
     .await;
 
-    // ⚠️ `order_list_limit` **不是** `/preview` 的覆盖项（`dto::PreviewRequest` 里没有
-    // 它，`effective_config` 照搬基线值）⇒ 截断必须走 `POST /config` 落配置再预览，
-    // 这也正是管理员在配置页改「最多列出工单」后的真实链路。
+    // ⚠️ 本用例**刻意走落库配置路径**（先 `POST /config` 再 `/preview`），不走
+    // `PreviewRequest.order_list_limit` 的请求级覆盖：那才是管理员在配置页改完「最多
+    // 列出工单」之后的真实链路（配置已落库、预览读的就是它）。
     let (st, env) = post_as_manager(
         &ctx,
         "/cron/wecom-daily/config",
@@ -1213,7 +1213,7 @@ async fn orders_section_truncates_at_order_list_limit_with_one_footer() {
     assert!(all.contains(">   └ F7002 件T-1 ×1"), "{all}");
     assert!(!all.contains("F7003"), "额度用完，后面的行不再出：{all}");
     assert!(
-        all.contains("> <font color=\"comment\">另有 3 条未列出</font>"),
+        all.contains("> <font color=\"comment\">另有 3 行未列出</font>"),
         "{all}"
     );
     assert_eq!(
