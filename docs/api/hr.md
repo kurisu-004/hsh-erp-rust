@@ -1,4 +1,4 @@
-# hr::schedule 域 API（人事排班日历）
+# hr 域 API（人事排班：全局日历 + 班次 + 班次日历覆盖）
 
 > 域：`hr`（源码 `src/modules/hr/`，即人事排班域的全局日历 + 班次 + 班次日历覆盖）。本文件是该域的**唯一**契约来源，任何字段 / 端点变更必须同步本文件。
 > 路由前缀 `/api/v2/hr`（`handler::router()`，注册链：`modules/mod.rs` 的 `/api/v2` nest → `.nest("/hr", hr::router())`）。
@@ -121,7 +121,11 @@ is_workday = effective_day_type ∈ { WORKDAY, MAKEUP_WORKDAY }
 |---|---|---|
 | `items` | item[] | **必填**（缺 → axum `Json` 提取器的 422 纯文本）。**空数组也落 `21904`** —— 「没说要写什么」不是合法请求，见 §5 |
 
-`CalendarDayUpsertItem`：`cal_date`（date，必填）/ `day_type`（string，必填，6 档之一）/ `name`（string?，`CUSTOM_LEAVE` **必填**，缺失或全空白 → `21907`）/ `remark`（string?，不进出参，仅管理端留痕）。
+`CalendarDayUpsertItem`：`cal_date`（date，必填）/ `day_type`（string，必填，6 档之一）/ `name`（string?，`varchar(50)`，`CUSTOM_LEAVE` **必填**，缺失或全空白 → `21907`；超长 → `21909`）/ `remark`（string?，`varchar(200)`，超长 → `21909`；不进出参，仅管理端留痕）。
+
+⚠️ **同一批里出现同一个 `cal_date` 不会被拒，而是「后写覆盖先写」**（2026-10-23 登记）：那一条只剩一行，终值 = 该日期**最后一次**出现的值。这不是宽容而是**必需** —— 批量 SQL 是 `INSERT … SELECT … FROM UNNEST(…) ON CONFLICT (cal_date) WHERE deleted_at IS NULL DO UPDATE`，同批命中同一行两次时 PG 抛 `ON CONFLICT DO UPDATE command cannot affect row a second time`（SQLSTATE `21000`），既不是 `23505` 也不在任何显式档 ⇒ **HTTP 500**。而「一次范围拖选 + 一次补写」就能造出这种请求，门槛是零。口径与读侧 `into_day_map` 的「脏数据后写覆盖先写」同源：同一天只能有一个最终口径，后出现的那条就是调用方的最新意图。端点 9 同款。
+
+⚠️ 条数上限 366（`21904`）：见 §5.2。
 
 ### 3.4 `CalendarDaysDeleteRequest` / `ShiftDaysDeleteRequest`（端点 3 / 10）
 
@@ -136,23 +140,25 @@ is_workday = effective_day_type ∈ { WORKDAY, MAKEUP_WORKDAY }
 
 | 字段 | 类型 | 语义 |
 |---|---|---|
-| `code` | string | 必填，`varchar(30)`，未软删行内唯一；重复 → `21902`（HTTP 409，**不是** `40901` —— 后者只表达 OCC）。落库前 `trim()` |
-| `name` | string | 必填，`varchar(50)`，落库前 `trim()` |
-| `segments` | segment[] | **必填且无 `#[serde(default)]`**（缺 → axum `Json` 提取器返 **HTTP 422 纯文本**）——「没有时段的班次」没有意义。形态见 §2.4 |
-| `color` | string? | `varchar(20)`，前端色板值；可 NULL |
+| `code` | string | 必填，`varchar(30)`，未软删行内唯一；重复 → `21902`（HTTP 409，**不是** `40901` —— 后者只表达 OCC）。⚠️ **trim 后为空 / 全空白 → `21909`**，超 30 字符 → `21909` |
+| `name` | string | 必填，`varchar(50)`，落库前 `trim()`；⚠️ trim 后为空 → `21909`，超 50 字符 → `21909` |
+| `segments` | segment[] | **必填且无 `#[serde(default)]`**（缺 → axum `Json` 提取器返 **HTTP 422 纯文本**）——「没有时段的班次没有意义」。形态见 §2.4 |
+| `color` | string? | `varchar(20)`，前端色板值；可 NULL。超 20 字符 → `21909` |
 | `sort_order` | int? | 缺省 `0` |
-| `remark` | string? | `varchar(200)` |
+| `remark` | string? | `varchar(200)`；超 200 字符 → `21909`（人事随手粘贴的自由文本，超长是**日常操作**） |
 
 ⚠️ 建班次的 `version = 0`、`is_active = true` —— **入参里没有** `version` / `is_active`：新建永远从启用态起（建了就是能用的），下架是独立的端点 7。
+
+⚠️ **列宽守卫是必需的、不是锦上添花**：PG 对 `varchar(n)` 超长抛 `22001`（`string_data_right_truncation`），既不是 `23505`（`is_unique_violation` 判不到）也不在任何显式档 ⇒ 会落 `50001` / **HTTP 500**、message 被替换成「数据库错误」。service 侧统一用 `check_len` 判**字符数**（不是字节数 —— `varchar(30)` 放得下 30 个汉字，前端可以放心传中文 `code` / `name` / `remark`）。
 
 ### 3.6 `UpdateShiftRequest`（端点 6）—— 部分覆盖
 
 | 字段 | 类型 | 语义 |
 |---|---|---|
 | `version` | int | **必填 OCC 锚**（CLAUDE.md §8）。陈旧 → `40901`；**缺失 → axum 的 422 纯文本**（不是业务信封） |
-| `code` / `name` | string? | 给了才改（`name` 会 `trim()`） |
+| `code` / `name` | string? | 给了才改（`name` 会 `trim()`）。⚠️ trim 后为空 → `21909`（能建出来不等于能改成空）；超列宽（30 / 50）→ `21909` |
 | `segments` | segment[]? | 给了就**整列替换**（不做段级 merge），且重跑一遍 V1–V6；不传则沿用行上那份 |
-| `color` / `remark` | string? | ⚠️ 传 `null` 等于「**这次不改**」—— 本端点**没有**「显式清空某个可空列」的语义（要清空就传空串） |
+| `color` / `remark` | string? | ⚠️ 传 `null` 等于「**这次不改**」—— 本端点**没有**「显式清空某个可空列」的语义（要清空就传空串）。超列宽（20 / 200）→ `21909` |
 | `sort_order` | int? | 给了才改 |
 
 ⚠️ 本 DTO **没有** `is_active`：启用 / 停用是两个意图，停用有独立端点。
@@ -167,10 +173,10 @@ is_workday = effective_day_type ∈ { WORKDAY, MAKEUP_WORKDAY }
 
 | 字段 | 类型 | 语义 |
 |---|---|---|
-| `items` | item[] | 必填；空数组 → `21904`（同端点 2 的口径） |
-| `items[].cal_date` | date | 必填 |
+| `items` | item[] | 必填；空数组 → `21904`，超 366 条 → `21904`（同端点 2 的口径） |
+| `items[].cal_date` | date | 必填；同批重复 → **后写覆盖先写**（见 §3.3 的警示） |
 | `items[].day_type` | string | 必填，6 档之一 |
-| `items[].remark` | string? | 要写说明走这里 |
+| `items[].remark` | string? | 要写说明走这里；`varchar(200)`，超长 → `21909` |
 
 ⚠️ **刻意没有 `name`**（`t_hr_shift_calendar` 表也没这列）：「这天为什么特殊」是**全局日历**的语义，班次覆盖只改「这天算不算上班」。⇒ 端点 9 写 `CUSTOM_LEAVE` **不**要求 `name`、也**不**落 `21907`（那条闸门只属全局日历）。
 
@@ -230,39 +236,83 @@ is_workday = effective_day_type ∈ { WORKDAY, MAKEUP_WORKDAY }
 
 段值是绝对偏移 ⇒ 归属日就是 `cal_date` 本身。**不需要**任何「跨天标志位 + 推断」：出参里没有 `cross_day` 之外还需要前端自己算的日期字段。
 
-### 5.2 区间 366 天上限
+### 5.2 区间 366 天上限 + 单批 366 条上限
 
-`from <= to` 且 `(to − from) ≤ 366` 天（**两端闭**：恰好 366 放行、367 拒），违反一律 `21904`（HTTP 400）。理由：读端点要**逐日推导并回传**，一个请求灌 10 年就是 3650 个出参项 —— 前端用不上，却已经把 DB 与序列化 CPU 花掉了。
+**跨度**：`from <= to` 且 `(to − from) ≤ 366` 天（判据是**差值**；两端闭 ⇒ 最多 **367** 个日历日），违反一律 `21904`（HTTP 400）。理由：读端点要**逐日推导并回传**，一个请求灌 10 年就是 3650 个出参项 —— 前端用不上，却已经把 DB 与序列化 CPU 花掉了。
+
+**条数**：一条 `items` / `dates` 的元素数 ≤ **366**，违反同样 `21904`。
+
+⚠️ 两条判据**缺一不可**：跨度只看「最小 ~ 最大日期」，所以 367 个**全同日期**的项跨度恒为 0、绕得过跨度，却仍会灌进一次巨大的 `UNNEST`（请求体解析完、`Vec` 已分配之后才被拒，那点内存与 CPU 已经花掉了）。条数上限卡在**去重之前**，让这种请求在入口就被拒。
 
 ⚠️ **批量 upsert 的 `{items:[…]}` 走同一条判据**：`items` 的最小 / 最大 `cal_date` 构成一个**隐式区间**。不卡它的话，攒一个大 `items` 就能把「一个请求最多 366 天」的承诺从读端点绕过去。
 
-### 5.3 空 `items` 落 `21904`（不是静默 `affected: 0`）
+### 5.3 同批重复日期 = 后写覆盖先写
+
+端点 2 / 9 的 `items` 里出现同一个 `cal_date` 时，那一天**只落一行**，终值取该日期**最后一次**出现的值。
+
+⚠️ **这不是宽容，是必需**：批量 SQL 是 `INSERT … SELECT … FROM UNNEST(…) ON CONFLICT … DO UPDATE`，同一条命令影响同一行两次时 PG 抛 `ON CONFLICT DO UPDATE command cannot affect row a second time`（SQLSTATE `21000`）—— 既不是 `23505`（`is_unique_violation` 判不到）也不在任何显式档 ⇒ `50001` / **HTTP 500**、message 被替换成「数据库错误」。而「前端一次范围拖选 + 一次补写」就能造出这种请求。
+
+去重后保留**第一次出现的位置**（只把值换成后写那条），这样 `affected` 与入参顺序的关系不会变得不可预期。
+
+### 5.4 空 `items` 落 `21904`（不是静默 `affected: 0`）
 
 端点 2 与端点 9 的 `items` 为空数组 ⇒ `21904`。理由：「没说要写什么」不是合法请求；返回 `affected: 0` 会让调用方以为「写了但没生效」。这与 §4.4 的「delete 的 `affected = 0` 是合法成功」是**两件不同的事**，别混。
 
-### 5.4 `null` 与缺省的语义
+### 5.5 `null` 与缺省的语义
 
 - **入参 `Option<T>` 的 `None` 一律是「这次不改」**（端点 6），**没有**「显式清空某个可空列」的语义 —— 要清空就传空串（`color` / `remark` / `name` 都是 varchar 而非有约束的可空列）。
 - **`segments` 是单列覆盖**：传了就整列替换（不做段级 merge），不传就保持原值。
 - **出参的可空列是真的可空**：`name` / `color` / `remark` 是 `string | null`，前端要能处理 `null`（不要 `x || ''` 后再判空）。
 
-### 5.5 `version` 缺失是 422 纯文本，不是业务信封
+### 5.6 `version` 缺失是 422 纯文本，不是业务信封
 
 端点 6 / 7 的 `version` 必填且无 `#[serde(default)]`，缺失时请求**到不了 service**，由 axum `Json` 提取器直接拒 ⇒ **HTTP 422 + 纯文本 body**（不是 `R { code, … }` 信封）。前端错误处理要把「解析信封」与「解析纯文本」两条路都留着。端点 5 的 `segments` 缺失同理。
+
+### 5.7 字段值守卫（`21909`）：空白必填项 + `varchar` 列宽
+
+service 在落库前对每个 `varchar` 入参做两道检查，违规一律 `21909` / HTTP 400：
+
+| 检查 | 覆盖列 | 上限 |
+|---|---|---|
+| 必填项 trim 后非空 | `code` / `name`（端点 5、6） | — |
+| 列宽（**字符数**，不是字节数） | `code` / `name` / `color` / `remark`（端点 5、6）、日历 `name` / `remark`（端点 2）、覆盖行 `remark`（端点 9） | 30 / 50 / 20 / 200 |
+
+⚠️ **为什么必须显式判**：PG 对 `varchar(n)` 超长抛 `22001`（`string_data_right_truncation`），落不进任何显式档 ⇒ `50001` / **HTTP 500**、message 变成「数据库错误」。而 `remark` 是人事随手粘贴的自由文本，超长是**日常操作** —— 不判就是把一次正常粘贴变成 500。
+
+⚠️ **为什么按字符数**：`varchar(30)` 计的是**字符**，放得下 30 个汉字（90 字节）。按字节判会把「10 个汉字的 code」误拒成 400 —— 挡住合法输入比 500 更坏（它让用户以为自己输错了）。
+
+⚠️ **为什么空白 `code` 要拒**：它会**占住** `uk_t_hr_shift_code` 的 partial unique —— 建出一条 `code = ''` 的班次后，任何人想用空 code 都撞 `21902`，而那条空班次本身没有任何业务含义。`name` 空串则让排班表上出现一行没名字的班次。两者都是「入参非法」（`21909`）而不是「状态冲突」（`21902`）。
+
+### 5.8 「班次可写」的判据下沉进写 SQL（不是读-再-写）
+
+端点 6 / 7 / 9 / 10 的写 SQL **自带班次侧判据**（`WHERE s.id = $N AND s.is_active AND s.deleted_at IS NULL`，端点 9 以 `FROM t_hr_shift s` 关联的形式出现）。service 侧那次 `get_shift` + `ensure_writable` 只是**友好报错的前置检查**，真正的判据在写语句自己的谓词里。
+
+⚠️ 理由：读-再-写之间有 TOCTOU 窗口，并发的 `POST /shifts/{id}/deactivate` 落在窗口里时，覆盖行会写进一个已经停用的班次，而 `21906` 被整个绕过。
+
+⚠️ **0 行的归因**（前端要按 code 分流，不要一律当 OCC）：
+
+| 库里的现状 | `update` / `deactivate` / `upsert days` | `delete days` |
+|---|---|---|
+| 查不到 / 已软删 | `21901` | `21901` |
+| 在但已停用（并发） | `21906` | `21906` |
+| 在、启用中 | `40901`（`version` 陈旧） | `Ok(affected = 0)` —— 合法成功 |
+
+⚠️ 最后一行是两种语义的分野：端点 10 的 `affected = 0` 表示「那几天本来就没有覆盖行」（见 §4.4），**不是**错误；端点 6 / 7 的 0 行则一定是冲突。所以只有端点 10 的 0 行需要「班次仍可写才放行」这一脚回查。
 
 ## 6. 错误码
 
 | 码 | 常量 | HTTP | 触发场景 |
 |---|---|---|---|
-| `21901` | `BIZ_HR_SHIFT_NOT_FOUND` | 404 | 查 / 改 / 停用 / 写覆盖 / 清覆盖一个**不存在或已软删**的班次（含端点 8 的读端点） |
+| `21901` | `BIZ_HR_SHIFT_NOT_FOUND` | 404 | 查 / 改 / 停用 / 写覆盖 / 清覆盖一个**不存在或已软删**的班次（含端点 8 的读端点）；也含写 SQL 0 行后的回查归因（§5.8） |
 | `21902` | `BIZ_HR_SHIFT_CODE_DUPLICATED` | 409 | 班次 `code` 重复（**不是** `40901`，后者只表达 OCC）。应用层预检与 DB partial unique 的并发兜底**同码** |
 | `21903` | `BIZ_HR_SHIFT_SEGMENT_INVALID` | 400 | 段非法（V1–V5 任一）**或**库里那一列 jsonb 解不出来 / 解出来过不了 V1–V6（降级成 21903 而不是 500） |
-| `21904` | `BIZ_HR_CALENDAR_RANGE_INVALID` | 400 | `from > to` / 跨度 > 366 天 / upsert 的 `items` 为空 / 删行请求没恰好命中 `{dates}` 或 `{from,to}` 一种形态 |
+| `21904` | `BIZ_HR_CALENDAR_RANGE_INVALID` | 400 | `from > to` / 跨度 > 366 天 / upsert 或 delete 的批量**条数** > 366 / upsert 的 `items` 为空 / 删行请求没恰好命中 `{dates}` 或 `{from,to}` 一种形态 |
 | `21905` | `BIZ_HR_DAY_TYPE_INVALID` | 400 | 未知 `day_type`（含大小写不符） |
-| `21906` | `BIZ_HR_SHIFT_INACTIVE` | 409 | 对**已停用**班次做写操作（改 / 停用 / 写覆盖 / 清覆盖）。重复停用也走这条（幂等拒绝） |
+| `21906` | `BIZ_HR_SHIFT_INACTIVE` | 409 | 对**已停用**班次做写操作（改 / 停用 / 写覆盖 / 清覆盖）。重复停用、并发停用后迟到的写都走这条 |
 | `21907` | `BIZ_HR_CALENDAR_LEAVE_NAME_REQUIRED` | 400 | `CUSTOM_LEAVE` 未填 `name`（**仅全局日历**，见 §3.8） |
 | `21908` | `BIZ_HR_SHIFT_SPAN_EXCEEDS_DAY` | 400 | **V6**：`span > "24:00"` |
-| `40901` | `VERSION_CONFLICT` | 409 | 端点 6 / 7 的 `version` 与库内当前值不一致 |
+| `21909` | `BIZ_HR_FIELD_INVALID` | 400 | **字段值非法**：必填项（`code` / `name`）trim 后为空白，或某字段超出 `varchar` 列宽（判**字符数**）。⚠️ 不判的话 PG 的 `22001` 落不进任何显式档 ⇒ **500**，见 §5.7 |
+| `40901` | `VERSION_CONFLICT` | 409 | 端点 6 / 7 的 `version` 与库内当前值不一致（也含写 SQL 0 行后的 OCC 归因，见 §5.8） |
 | `40300` | `FORBIDDEN` | 403 | 缺对应权限点（守卫判在 service 第一行 ⇒ **在区间/段/存在性校验之前**） |
 
 ⚠️ 权限守卫（`40300`）**先于**一切入参校验：无权账号连候选 SELECT 都跑不到。这是有意的（端点 1/8 要逐日推导并回传整个区间，不该让无权者拿它做信息探测）。代价是无权账号在写端点上会**先开一次事务**才被拒 —— 只是短连接占用，零写入、不落锁。
@@ -281,11 +331,12 @@ is_workday = effective_day_type ∈ { WORKDAY, MAKEUP_WORKDAY }
 | 菜单授权 | MANAGER + CLERK 都授 | `seeds/rbac.sql` §4.1 / §4.2。⚠️ CLERK 持有 `hr.view` 却拿不到菜单 = 权限给了但页面进不去，自相矛盾 |
 | ⚠️ **API 前缀 ≠ 菜单 path** | API `/api/v2/hr/*`，菜单 `/hr/schedule` | 两层是不同层的东西；菜单 path 不跟着 API 前缀变 |
 
-前端侧的三条同源要求：
+前端侧的四条同源要求：
 
 1. **不重复实现推导**：渲染一律用后端给的 `day_type` / `effective_day_type` / `is_workday`，不要在前端按星期或按 `is_workday = day_type !== REST_DAY` 之类近似式重算。
 2. **`is_workday` 的判据与后端同源**：只有 `WORKDAY` 与 `MAKEUP_WORKDAY` 算上班日。前端若要自己判，用 `effective_day_type` 而**不是** `global_day_type`。
 3. **`overflow_minutes` 按分钟渲染**：要显示「跨到次日 02:30」就用分钟自己换算，别指望后端给小时。
+4. **长度上限的前端常量必须逐字对齐 `varchar` 真值**（`code` **30** / `name` **50** / `color` **20** / `remark` **200**，日历 `name` 50 / `remark` 200）：后端超长一律 `21909` / 400，前端多放 1 个字符就会让用户撞一条「看起来像格式错」的报错。同理，`code` / `name` 前端不要用 `trim()` 前的长度做校验 —— **后端判的是 trim 后的值**。
 
 ⚠️ **部署顺序**：`hr.view` / `hr.schedule.manage` 两个权限点与两个菜单 code 由 `seeds/*.sql` 下发（启动钩子自动跑）。菜单/权限未上而后端已上时，端点会正常返回 40300（不是 404），症状是「页面能进、数据全空」；先跑一次 `./scripts/seed_apply.sh` 即可。
 
@@ -295,7 +346,9 @@ is_workday = effective_day_type ∈ { WORKDAY, MAKEUP_WORKDAY }
 
 **零跨域引用** —— 三张表全是本域自有，排班与工人 / 订单 / 考勤零交集，SQL 真源全部写在 `repo.rs` 里。改本域**不需要**检查其它域的调用点。
 
-⚠️ **但整域「域隔离护栏」刻意不装**：`shared::domain_guard::assert_no_foreign_domain` 是**按路径前缀**判定的，而 `handler.rs` 的 `mod tests` 按仓内统一约定**必须**复用共用比对器 `crate::modules::files::route_guard::routes_in_router_source`（复制一份会让「解析规则」变成两份可漂移的散文）。那一行是本域唯一的跨域路径，且它既不是 service 也不是 repo，只是一条 `#[cfg(test)]` 的路由表比对器。护栏的规则（「不 import 别域的 service / repo」）在这里恰好把**正确**的写法也拦了 —— 与 `serial`、`print_template` 是**同款豁免**。日后若把 `route_guard` 这类「共用测试工具」上提到 `shared`，三处应一并改成「装护栏」。
+⚠️ **但整域「域隔离护栏」刻意不装**：`shared::domain_guard::assert_no_foreign_domain` 是**按路径前缀**判定的，而 `handler.rs` 的 `mod tests` 按仓内统一约定**必须**复用共用比对器 `crate::modules::files::route_guard::routes_in_router_source`（复制一份会让「解析规则」变成两份可漂移的散文）。那一行是本域唯一的跨域路径，且它既不是 service 也不是 repo，只是一条 `#[cfg(test)]` 的路由表比对器。护栏的规则（「不 import 别域的 service / repo」）在这里恰好把**正确**的写法也拦了。
+
+⚠️ **与 `serial` / `print_template` 的差别不要说成「同款」**：那两域不装护栏，是因为它们的**生产代码**里就 import 了别域（`assembly::repo` / `files::part_file`），护栏即使放过 `#[cfg(test)]` 也会照样报警；本域唯一的跨域路径**只在 `#[cfg(test)]` 里**，生产代码零跨域。三处都「不装护栏」，成因并不同款。日后把 `route_guard` 上提到 `shared` 之后，本域应改成「装护栏」（它那时真的干净了），另两域仍不装。
 
 ### 8.2 `t_hr_shift.segments` 是本仓第一个 jsonb 列
 
@@ -317,8 +370,10 @@ is_workday = effective_day_type ∈ { WORKDAY, MAKEUP_WORKDAY }
 | 1 | **跨度 ≤ 24:00 排除了 `span > 24h` 的班次** | 典型被排除形态：「昨晚 20:00 连做到今天中午 14:00」（span 18h 仍合法，但「22:00 连做 26 小时」不合法）。放宽它需要给两个日历写端点新增跨 `days × shifts` 的重叠检查（O(days × shifts) + 与并发插入之间的 TOCTOU 窗口）。**有意不放宽**，理由见 §2.4 |
 | 2 | **日历表只存例外** | 常态工作日 / 常态周末不落行，读端点按星期推导并标 `derived = true`。365 天全落行会让「明年元旦调休」从「改一行」变成「改 200 行」 |
 | 3 | **不广播 WS** | 本域是**配置页**，**没有订阅方**：大屏 WS（`/ws/dashboard`）的增量清单里没有排班数据，仓库也没有「排班变更」的消费端。加一条没有订阅者的广播等于给每个大屏客户端白加一次防抖与重取。考勤排班表页面将来落地时走自己的取数路径（HTTP 首取 + 页面级刷新） |
-| 4 | **未装域隔离护栏** | 同 `serial` / `print_template` 的同款豁免，理由见 §8.1 |
-| 5 | **`color` 传 `null` = 不改** | 端点 6 没有「显式清空可空列」的语义（三态的第三态缺席）。要清空传空串 —— 见 §5.4 |
+| 4 | **未装域隔离护栏** | 本域唯一的跨域路径只在 `#[cfg(test)]` 里（理由见 §8.1），与 `serial` / `print_template`（**生产代码**就 import 别域）成因不同款 |
+| 5 | **`color` 传 `null` = 不改** | 端点 6 没有「显式清空可空列」的语义（三态的第三态缺席）。要清空传空串 —— 见 §5.5 |
 | 6 | **停用不级联软删覆盖行** | 历史考勤要复现「某天这个班次按什么口径算的」，级联清掉后只剩「全局日历 + 星期推导」能重猜，而覆盖行恰恰是当年与全局不同的那些天 |
 | 7 | **`overflow_minutes` 用分钟** | 见 §4.2；用小时会把 90 分钟的溢出报成 1 小时 |
 | 8 | **权限守卫在入参校验之前** | 见 §6 末；代价是写端点上无权账号会先开一次事务（零写入、不落锁） |
+| 9 | **两张批量写表上的 `version` 不做客户端锚**（偏离 CLAUDE.md §8「带 `version` 列的表写端点 body 必须收 `version`」） | `t_hr_calendar_day` / `t_hr_shift_calendar` 的写端点是 `{items:[…]}` 的**整批 upsert / 软删**，行级 OCC 在这个形态下不成立：一批里每一行都是「按 `cal_date` 命中即覆盖」，客户端并不持有某一行的 `version`，要塞进 `items[].version` 只会暴露内部实现、并把「一批要么全过要么全不进」拆成一堆行级判据。真正要防的并发（两个人把同一天改成不同口径）由「partial unique + `ON CONFLICT DO UPDATE` 的后写覆盖」与「`t_hr_shift` 上的真 OCC」挡住。⇒ `version` 在这两张表上**只作写计数器**（每次 upsert / 软删自增，供审计与将来排查）。先例：`t_wecom_daily_log`（只增审计流水、刻意无 `version`）。客户端的版本锚**只加在 `t_hr_shift` 上**（端点 6 / 7） |
+| 10 | **不另建同列的非 partial 索引** | 两条读查询的谓词恒带 `deleted_at IS NULL`，被同列 partial unique 的谓词**蕴含** ⇒ PG 直接拿 partial unique 走索引。`ix_t_hr_calendar_day_cal_date` / `ix_t_hr_shift_calendar_shift_date` 只会各多贡献一份写放大（每次 upsert / 软删维护两棵同样的 B 树），读端点一行都用不上 |

@@ -127,15 +127,20 @@ COMMENT ON COLUMN public.t_hr_calendar_day.name IS '节假日名 / 休息日说�
 COMMENT ON COLUMN public.t_hr_calendar_day.remark IS '备注（varchar(200)）；不进出参，仅管理端留痕';
 COMMENT ON COLUMN public.t_hr_calendar_day.version IS '乐观锁版本号；批量 upsert 的 DO UPDATE 自增；删行（软删）同样自增';
 COMMENT ON COLUMN public.t_hr_calendar_day.deleted_at IS '软删标记；删行后该日回退到「按星期推导」（POST /calendar/days/delete）';
+COMMENT ON COLUMN public.t_hr_calendar_day.created_at IS '行写入时刻（timestamp，无时区；全仓统一按 Asia/Shanghai 解读）';
+COMMENT ON COLUMN public.t_hr_calendar_day.created_by IS '建行人（t_user.id，裸 bigint 无外键；审计字段，不参与任何业务判定）';
+COMMENT ON COLUMN public.t_hr_calendar_day.updated_at IS '最近一次写入（含 upsert 的 DO UPDATE 与软删）的时刻';
+COMMENT ON COLUMN public.t_hr_calendar_day.updated_by IS '最近一次写入人（t_user.id）；与 created_by 相等说明这一行建完没被改过';
 
 ALTER TABLE ONLY public.t_hr_calendar_day ADD CONSTRAINT t_hr_calendar_day_pkey PRIMARY KEY (id);
 
 -- ⚠️ partial unique：软删后索引项消失 ⇒ 同一天可以重新显式登记一次。
+-- ⚠️ **刻意不再另建 `(cal_date)` 全列索引**：区间读端点的谓词恒为
+--   `deleted_at IS NULL AND cal_date BETWEEN $1 AND $2`，被蕴含于本 partial unique 的
+--   谓词里 ⇒ PG 直接拿它走索引。同列再挂一条 `ix_` 只会多一份双份的写放大
+--   （每次 upsert / 软删维护两棵同样的 B 树），读端点一行都用不上。
 CREATE UNIQUE INDEX uk_t_hr_calendar_day_date
     ON public.t_hr_calendar_day (cal_date) WHERE deleted_at IS NULL;
--- 区间读端点 `WHERE cal_date BETWEEN $1 AND $2` 的索引。
-CREATE INDEX ix_t_hr_calendar_day_cal_date
-    ON public.t_hr_calendar_day (cal_date);
 
 -- ---------------------------------------------------------------------------
 -- 2. 班次（时段内联 jsonb）
@@ -169,12 +174,18 @@ CREATE TABLE public.t_hr_shift (
 COMMENT ON TABLE  public.t_hr_shift IS '人事排班：班次（时段内联 jsonb，绝对时钟轴）；停用走 is_active=false，不级联软删班次覆盖行';
 COMMENT ON COLUMN public.t_hr_shift.id IS '雪花主键，App 侧生成；出参按 JSON string 序列化';
 COMMENT ON COLUMN public.t_hr_shift.version IS '乐观锁版本号；写路径带 WHERE version=$2，0 行 → 40901';
-COMMENT ON COLUMN public.t_hr_shift.code IS '班次编码（varchar(30)）；未软删行内唯一，重复 → 21902（HTTP 409，不是 40901 —— 后者只表达 OCC）';
-COMMENT ON COLUMN public.t_hr_shift.color IS '显示色（varchar(20)，前端色板值）；可 NULL，前端走自己的默认色';
+COMMENT ON COLUMN public.t_hr_shift.code IS '班次编码（varchar(30)）；未软删行内唯一，重复 → 21902（HTTP 409，不是 40901 —— 后者只表达 OCC）；空白 → 21909，超长 → 21909';
+COMMENT ON COLUMN public.t_hr_shift.name IS '班次名（varchar(50)，排班表 / 甘特图上显示）；空白 → 21909，超长 → 21909（不是 500 —— PG 的 varchar 超长是 22001，落不进业务码）';
+COMMENT ON COLUMN public.t_hr_shift.color IS '显示色（varchar(20)，前端色板值）；可 NULL，前端走自己的默认色；超长 → 21909';
+COMMENT ON COLUMN public.t_hr_shift.remark IS '备注（varchar(200)）；可 NULL，不进出参仅管理端留痕；超长 → 21909（人事随手粘贴的自由文本，超长是日常操作）';
 COMMENT ON COLUMN public.t_hr_shift.segments IS '时段数组 jsonb：[{"seq":1,"start":"22:00","end":"26:00"}]；绝对时钟轴 HH∈0..48，夜班 22:00→次日 02:00 写 26:00；1..6 段、start<end、首段 <24:00、升序不重叠、span≤24:00（违规见 ck 约束与 21903/21908）';
 COMMENT ON COLUMN public.t_hr_shift.is_active IS '是否启用；停用后一切写操作（改 / 写覆盖行 / 清覆盖）→ 21906（HTTP 409）';
 COMMENT ON COLUMN public.t_hr_shift.sort_order IS '列表 / 排班表展示序（升序）；同序时按 id ASC 兜底';
 COMMENT ON COLUMN public.t_hr_shift.deleted_at IS '软删标记；被 t_hr_shift_calendar.shift_id 引用时**不**级联（保留历史考勤口径）';
+COMMENT ON COLUMN public.t_hr_shift.created_at IS '行写入时刻（timestamp，无时区；全仓统一按 Asia/Shanghai 解读）';
+COMMENT ON COLUMN public.t_hr_shift.created_by IS '建行人（t_user.id，裸 bigint 无外键；审计字段，不参与任何业务判定）';
+COMMENT ON COLUMN public.t_hr_shift.updated_at IS '最近一次写入（改班次 / 停用）的时刻';
+COMMENT ON COLUMN public.t_hr_shift.updated_by IS '最近一次写入人（t_user.id）；与 created_by 相等说明这一行建完没被改过';
 
 ALTER TABLE ONLY public.t_hr_shift ADD CONSTRAINT t_hr_shift_pkey PRIMARY KEY (id);
 
@@ -225,13 +236,20 @@ COMMENT ON TABLE  public.t_hr_shift_calendar IS '人事排班：班次的单日�
 COMMENT ON COLUMN public.t_hr_shift_calendar.shift_id IS '所属班次（t_hr_shift.id，无物理外键）；停用的班次写覆盖行 → 21906，不存在 / 已软删 → 21901';
 COMMENT ON COLUMN public.t_hr_shift_calendar.cal_date IS '被覆盖的那一天；与 shift_id 组成未软删行内的唯一键（uk_t_hr_shift_calendar）';
 COMMENT ON COLUMN public.t_hr_shift_calendar.day_type IS '覆盖后的日型（6 档之一，无 DB ENUM）；刻意无 name 列（名称属全局日历语义），要说明走 remark';
-COMMENT ON COLUMN public.t_hr_shift_calendar.version IS '乐观锁版本号；批量 upsert 的 DO UPDATE 自增；清覆盖（软删）同样自增';
+COMMENT ON COLUMN public.t_hr_shift_calendar.version IS '乐观锁版本号；批量 upsert 的 DO UPDATE 自增；清覆盖（软删）同样自增；批量写端点不做行级 OCC（客户端不锚这一列，见 hr.md §8.3 取舍 9）';
+COMMENT ON COLUMN public.t_hr_shift_calendar.id IS '雪花主键，App 侧生成；出参按 JSON string 序列化（本表不直接出参，端点 8 只回 cal_date 与日型）';
+COMMENT ON COLUMN public.t_hr_shift_calendar.remark IS '说明（本班次视角，varchar(200)）；可 NULL；超长 → 21909';
+COMMENT ON COLUMN public.t_hr_shift_calendar.created_at IS '行写入时刻（timestamp，无时区；全仓统一按 Asia/Shanghai 解读）';
+COMMENT ON COLUMN public.t_hr_shift_calendar.created_by IS '建行人（t_user.id，裸 bigint 无外键；审计字段，不参与任何业务判定）';
+COMMENT ON COLUMN public.t_hr_shift_calendar.updated_at IS '最近一次写入（upsert 的 DO UPDATE 或清覆盖的软删）的时刻';
+COMMENT ON COLUMN public.t_hr_shift_calendar.updated_by IS '最近一次写入人（t_user.id）；与 created_by 相等说明这一行建完没被改过';
+COMMENT ON COLUMN public.t_hr_shift_calendar.deleted_at IS '软删标记；清掉后该日回退到全局日历；⚠️ 班次停用**不**级联软删本表（保留历史考勤口径）';
 
 ALTER TABLE ONLY public.t_hr_shift_calendar ADD CONSTRAINT t_hr_shift_calendar_pkey PRIMARY KEY (id);
 
 -- ⚠️ partial unique：一个班次同一天只能有一条覆盖行（防重复写同一天两种口径）。
+-- ⚠️ **同样刻意不另建 `(shift_id, cal_date)` 全列索引**：班次区间读端点的谓词恒带
+--   `deleted_at IS NULL`，被本 partial unique 的谓词蕴含 ⇒ 同列 `ix_` 只会多一份
+--   写放大，读端点一行都用不上。
 CREATE UNIQUE INDEX uk_t_hr_shift_calendar
     ON public.t_hr_shift_calendar (shift_id, cal_date) WHERE deleted_at IS NULL;
--- 班次区间读端点 `WHERE shift_id=$1 AND cal_date BETWEEN $2 AND $3` 的索引。
-CREATE INDEX ix_t_hr_shift_calendar_shift_date
-    ON public.t_hr_shift_calendar (shift_id, cal_date);

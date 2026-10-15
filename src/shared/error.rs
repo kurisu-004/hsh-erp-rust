@@ -510,6 +510,14 @@ pub mod code {
     //   ⚠️ **单独一码、不并进 21903**：这一条是本域最关键的结构性护栏（跨日重叠 ⟺
     //   span > 24h），卡死它之后相邻两日 / 隔日的班次实例在时间轴上不可能重叠，
     //   日历写端点才能零重叠检查。给它独立码，前端可单独提示「时段总跨度超 24 小时」。
+    // 21909 = **字段值非法**（必填字段为空白 / 某字段超出列宽）→ **400**。
+    //   覆盖三类形态：`code` / `name` trim 后为空、`code`(30) / `name`(50) / `color`(20)
+    //   / `remark`(200) / 日历 `name`(50) 超出列宽。
+    //   ⚠️ **必须显式判长**：PG 对 `varchar(n)` 超长抛的是 `22001`（string_data_right_truncation），
+    //   既不是 `23505` 也不是任何显式档 ⇒ 落 `AppError::Database` → `50001` / HTTP 500，
+    //   message 被替换成「数据库错误」。而 `remark` 是人事随手粘贴的自由文本，超长是日常操作。
+    //   ⚠️ **不并进 21903**：21903 的语义是「时段形态非法」+「库里 jsonb 坏了」，前端按它
+    //   提示的是「检查时段」；字段超长要提示的是「这个字段太长了」，混掉就没法只改一条文案。
     pub const BIZ_HR_SHIFT_NOT_FOUND: i32 = 21901;
     pub const BIZ_HR_SHIFT_CODE_DUPLICATED: i32 = 21902;
     pub const BIZ_HR_SHIFT_SEGMENT_INVALID: i32 = 21903;
@@ -518,6 +526,7 @@ pub mod code {
     pub const BIZ_HR_SHIFT_INACTIVE: i32 = 21906;
     pub const BIZ_HR_CALENDAR_LEAVE_NAME_REQUIRED: i32 = 21907;
     pub const BIZ_HR_SHIFT_SPAN_EXCEEDS_DAY: i32 = 21908;
+    pub const BIZ_HR_FIELD_INVALID: i32 = 21909;
 
     // 系统错误
     pub const INTERNAL: i32 = 50000;
@@ -768,22 +777,25 @@ fn status_from_code(c: i32) -> StatusCode {
         // 为了让「它落在 400 段」成为有断言的契约，而不是兜底的副产物。
         c if c == code::BIZ_CUSTOMER_HAS_CHILDREN => StatusCode::BAD_REQUEST,
 
-        // ---- 2xxxx 业务码：400（hr 人事排班域 21903 / 21904 / 21905 / 21907 / 21908，
-        // 2026-10-19 新增）----
-        // ⚠️ **5 个码全部必须显式登记**：下面 `(20000..30000) => BAD_REQUEST` 的兜底虽然
+        // ---- 2xxxx 业务码：400（hr 人事排班域 21903 / 21904 / 21905 / 21907 / 21908 /
+        // 21909，2026-10-19 新增）----
+        // ⚠️ **6 个码全部必须显式登记**：下面 `(20000..30000) => BAD_REQUEST` 的兜底虽然
         // 同值，但让「它落在 400 段」成为有断言的契约，而不是兜底的副产物 ——
-        // 这五码是本域唯一的入参面，前端按 code 分流文案，不该随兜底规则漂移。
+        // 这六码是本域唯一的入参面，前端按 code 分流文案，不该随兜底规则漂移。
         // - 21903 时段非法（格式 / 零长 / 乱序 / 重叠 / 首段 ≥ 24:00 / 超 48h / 段数越界）
         //   + 「库里那一列 jsonb 解不成 Vec<Segment>」的读侧降级（数据坏了也不能 500）。
         // - 21904 区间非法（from > to 或跨度 > 366 天）。
         // - 21905 未知 day_type（无 DB ENUM，合法性只在 Rust 侧）。
         // - 21907 CUSTOM_LEAVE 未填 name。
         // - 21908 班次 span > 24:00（本域的结构性护栏，单独一码便于前端单独提示）。
+        // - 21909 字段值非法（必填字段空白 / 超出 varchar 列宽）。
+        //   ⚠️ 这一条是「不判长就 500」的补丁：PG 的 `22001` 落不进任何显式档。
         c if c == code::BIZ_HR_SHIFT_SEGMENT_INVALID
             || c == code::BIZ_HR_CALENDAR_RANGE_INVALID
             || c == code::BIZ_HR_DAY_TYPE_INVALID
             || c == code::BIZ_HR_CALENDAR_LEAVE_NAME_REQUIRED
-            || c == code::BIZ_HR_SHIFT_SPAN_EXCEEDS_DAY =>
+            || c == code::BIZ_HR_SHIFT_SPAN_EXCEEDS_DAY
+            || c == code::BIZ_HR_FIELD_INVALID =>
         {
             StatusCode::BAD_REQUEST
         }
@@ -1427,6 +1439,7 @@ mod tests {
             code::BIZ_HR_SHIFT_SPAN_EXCEEDS_DAY,
             "BIZ_HR_SHIFT_SPAN_EXCEEDS_DAY",
         ),
+        (code::BIZ_HR_FIELD_INVALID, "BIZ_HR_FIELD_INVALID"),
         // 207xx 工艺链（worker-pool auto-allocate 阶段新增）
         (
             code::BIZ_PROCESS_CHAIN_NOT_FOUND,
@@ -1696,7 +1709,8 @@ mod tests {
         assert_eq!(code::BIZ_HR_SHIFT_INACTIVE, 21906);
         assert_eq!(code::BIZ_HR_CALENDAR_LEAVE_NAME_REQUIRED, 21907);
         assert_eq!(code::BIZ_HR_SHIFT_SPAN_EXCEEDS_DAY, 21908);
-        // ⚠️ 21909 是 219xx 段的下一个空位：当前无生产方，**不预分配**（同上）。
+        assert_eq!(code::BIZ_HR_FIELD_INVALID, 21909);
+        // ⚠️ 21910 是 219xx 段的下一个空位：当前无生产方，**不预分配**（同上）。
     }
 
     /// 数据驱动的 HTTP 表覆盖测试：每个 (code, expected_http, name) 一行。
@@ -1849,7 +1863,8 @@ mod tests {
         ),
         // 2026-10-19 新增（hr 人事排班域 219xx）：班次不存在 / 已软删 → 404；
         // code 重复 → 409（⚠️ 不是 40901，那一码只表达 OCC）；对已停用班次写 → 409；
-        // 时段非法 / 区间非法 / 未知 day_type / CUSTOM_LEAVE 缺 name / span 超 24h → 400。
+        // 时段非法 / 区间非法 / 未知 day_type / CUSTOM_LEAVE 缺 name / span 超 24h /
+        // 字段值非法（空白或超列宽）→ 400。
         (
             code::BIZ_HR_SHIFT_NOT_FOUND,
             StatusCode::NOT_FOUND,
@@ -1889,6 +1904,11 @@ mod tests {
             code::BIZ_HR_SHIFT_SPAN_EXCEEDS_DAY,
             StatusCode::BAD_REQUEST,
             "BIZ_HR_SHIFT_SPAN_EXCEEDS_DAY",
+        ),
+        (
+            code::BIZ_HR_FIELD_INVALID,
+            StatusCode::BAD_REQUEST,
+            "BIZ_HR_FIELD_INVALID",
         ),
         (code::FORBIDDEN, StatusCode::FORBIDDEN, "FORBIDDEN"),
         (

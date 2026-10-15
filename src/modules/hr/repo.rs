@@ -406,6 +406,16 @@ pub struct NewShiftDay {
 /// 批量 upsert 班次覆盖行（`ON CONFLICT (shift_id, cal_date) WHERE deleted_at IS NULL`）。
 ///
 /// 冲突目标带谓词的理由同 [`upsert_calendar_days`]（那个索引是 partial unique）。
+///
+/// ## ⚠️ `is_active` 判据**下沉进 SQL**（2026-10-23）
+///
+/// `FROM UNNEST(…) AS u(…), t_hr_shift s WHERE s.id = $N AND s.is_active AND s.deleted_at
+/// IS NULL`：班次不可写时整个 SELECT 命中 0 行 ⇒ 0 行插入，service 回查归因
+/// （不存在 → `21901` / 已停用 → `21906`）。
+///
+/// 判据必须落在**写语句自己的谓词**里，只在 service 侧 `get_shift` + `ensure_writable`
+/// 是读-再-写：并发的 `POST /shifts/{id}/deactivate` 落在读与写之间时，覆盖行会写进一个
+/// 已经停用的班次，而 `21906` 被整个绕过。
 pub async fn upsert_shift_days(
     conn: &mut PgConnection,
     shift_id: i64,
@@ -420,7 +430,9 @@ pub async fn upsert_shift_days(
         )
         SELECT u.id, 0, $5, u.cal_date, u.day_type, u.remark, $6, $7, $6, $7
         FROM UNNEST($1::bigint[], $2::date[], $3::text[], $4::text[])
-             AS u(id, cal_date, day_type, remark)
+             AS u(id, cal_date, day_type, remark),
+             t_hr_shift s
+        WHERE s.id = $5 AND s.is_active AND s.deleted_at IS NULL
         ON CONFLICT (shift_id, cal_date) WHERE deleted_at IS NULL DO UPDATE SET
             day_type   = EXCLUDED.day_type,
             remark     = EXCLUDED.remark,
@@ -441,6 +453,9 @@ pub async fn upsert_shift_days(
 }
 
 /// 按给定日期软删某班次的覆盖行（清完该日回退到全局日历）。
+///
+/// ⚠️ 班次侧的 `is_active` 守卫同 [`upsert_shift_days`]（经 `FROM t_hr_shift s` 关联），
+/// 0 行时由 service 回查归因。
 pub async fn soft_delete_shift_days_by_dates(
     conn: &mut PgConnection,
     shift_id: i64,
@@ -449,9 +464,11 @@ pub async fn soft_delete_shift_days_by_dates(
     now: NaiveDateTime,
 ) -> Result<i64, AppError> {
     let sql = format!(
-        "UPDATE t_hr_shift_calendar SET deleted_at = $3, updated_at = $3, updated_by = $4, \
-                version = version + 1 \
-         WHERE {ALIVE} AND shift_id = $1 AND cal_date = ANY($2::date[])"
+        "UPDATE t_hr_shift_calendar c SET deleted_at = $3, updated_at = $3, updated_by = $4, \
+                version = c.version + 1 \
+         FROM t_hr_shift s \
+         WHERE s.id = $1 AND s.id = c.shift_id AND s.is_active AND s.deleted_at IS NULL \
+                AND c.{ALIVE} AND c.cal_date = ANY($2::date[])"
     );
     let res = sqlx::query(AssertSqlSafe(sql))
         .bind(shift_id)
@@ -464,6 +481,8 @@ pub async fn soft_delete_shift_days_by_dates(
 }
 
 /// 按区间软删某班次的覆盖行（两端闭）。
+///
+/// ⚠️ 班次侧的 `is_active` 守卫同 [`upsert_shift_days`]。
 pub async fn soft_delete_shift_days_by_range(
     conn: &mut PgConnection,
     shift_id: i64,
@@ -473,9 +492,11 @@ pub async fn soft_delete_shift_days_by_range(
     now: NaiveDateTime,
 ) -> Result<i64, AppError> {
     let sql = format!(
-        "UPDATE t_hr_shift_calendar SET deleted_at = $4, updated_at = $4, updated_by = $5, \
-                version = version + 1 \
-         WHERE {ALIVE} AND shift_id = $1 AND cal_date BETWEEN $2 AND $3"
+        "UPDATE t_hr_shift_calendar c SET deleted_at = $4, updated_at = $4, updated_by = $5, \
+                version = c.version + 1 \
+         FROM t_hr_shift s \
+         WHERE s.id = $1 AND s.id = c.shift_id AND s.is_active AND s.deleted_at IS NULL \
+                AND c.{ALIVE} AND c.cal_date BETWEEN $2 AND $3"
     );
     let res = sqlx::query(AssertSqlSafe(sql))
         .bind(shift_id)

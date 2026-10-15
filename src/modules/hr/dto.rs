@@ -32,12 +32,22 @@ pub const PERM_VIEW: &str = "hr.view";
 /// 写权限点（其余 7 条端点）。
 pub const PERM_MANAGE: &str = "hr.schedule.manage";
 
-/// 日历区间的**最大跨度**（含首尾，`from` 到 `to` 之间不超过 366 天）。
+/// 读端点区间的**最大跨度**（判据 `(to − from) ≤ MAX_RANGE_DAYS`）。
 ///
 /// ⚠️ 为什么卡：日历读端点要逐日推导并回传（无显式行时按星期兜底），一个请求灌
 /// 10 年就是 3650 个出参项 —— 前端用不上，却已经把 DB 与序列化 CPU 花掉了。
-/// 超限 → `21904 BIZ_HR_CALENDAR_RANGE_INVALID`。
+/// ⚠️ **两端闭 ⇒ 最多 367 个日历日**（`from == to + 366` 是第 367 天），
+/// 说「最多 366 天」会少算一天。超限 → `21904 BIZ_HR_CALENDAR_RANGE_INVALID`。
 pub const MAX_RANGE_DAYS: i64 = 366;
+
+/// 单次写端点批量入参的**最大条数**（`items` / `dates` 通用）。
+///
+/// ⚠️ 为什么**除了日期跨度还要卡条数**：[`MAX_RANGE_DAYS`] 只约束「最小 ~ 最大日期」的
+/// 跨度，攒一个 10 万条的**全同日期** `items` 能把跨度判据绕过去（跨度恒为 0），
+/// 而那仍然是一次巨大的 `UNNEST`。按日期去重之后它会收敛成 1 行，但请求体已经解析完、
+/// `items` 数组已经分配好了 —— 上限卡在**去重之前**，让这种请求在入口就被拒。
+/// 超限 → `21904`（与跨度超限同码同档：都是「这批太大了」）。
+pub const MAX_BATCH_ITEMS: usize = 366;
 
 /// 时段条数下限 / 上限（V5：`1 ≤ n ≤ 6`）。
 ///
@@ -54,10 +64,33 @@ pub const MAX_SEGMENTS: usize = 6;
 pub const MAX_CLOCK_MINUTES: i32 = 48 * 60;
 
 /// `"24:00"`（当天末尾 / 次日零点）的分钟数；`end > 24:00` 即**跨天**。
+///
+/// ⚠️ 与 [`MAX_SPAN_MINUTES`] 同值但**不是同一条口径**：这一条是「哪个时刻算跨天」
+/// （用于 V3 首段归属判定与两个派生列），那一条是「一个班次实例最多跨多久」
+/// （V6）。两者现在都是 `24:00`，但它们回答的是两个问题，改一个不该牵动另一个。
 pub const DAY_BOUNDARY_MINUTES: i32 = 24 * 60;
 
 /// span 上界（V6）：`max(end) − min(start) ≤ 24:00`。
 pub const MAX_SPAN_MINUTES: i32 = 24 * 60;
+
+// ============================================================================
+// varchar 列宽（与迁移文件里的列定义逐字对齐）
+// ============================================================================
+//
+// ⚠️ **为什么 service 侧要有这一层守卫**：PG 对 `varchar(n)` 超长抛的是 `22001`
+// （`string_data_right_truncation`），既不是 `23505`（`is_unique_violation` 判不到）
+// 也不在任何显式档 ⇒ 落 `AppError::Database` → `50001` / HTTP **500**，message 还被
+// 替换成「数据库错误」。而 `remark` 是人事随手粘贴的自由文本，超长是**日常操作**。
+// 超长一律 `21909 BIZ_HR_FIELD_INVALID`（HTTP 400）。
+
+/// `t_hr_shift.code` 的列宽（未软删行内唯一的班次编码）。
+pub const COL_SHIFT_CODE: usize = 30;
+/// `t_hr_shift.name` 与 `t_hr_calendar_day.name` 的列宽。
+pub const COL_NAME: usize = 50;
+/// `t_hr_shift.color` 的列宽。
+pub const COL_COLOR: usize = 20;
+/// 三张表的 `remark` 列宽。
+pub const COL_REMARK: usize = 200;
 
 // ============================================================================
 // 1 / 8：区间读端点的 query

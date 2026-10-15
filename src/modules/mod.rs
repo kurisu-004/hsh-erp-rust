@@ -201,8 +201,9 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // 端点级归属裁决问题（与上方 `/serials` 那条不同：那条横跨两张他域表才单开前缀）。
         // 10 端点、读写两个权限点（`hr.view` / `hr.schedule.manage`），守卫判在
         // service 第一行（`current.require_permission(..)`），此处不挂 role layer。
-        // 前缀 `/hr`：顶层 nest、单段短词（**刻意不是** `hr-schedule` 那种 kebab-case
-        // 长词 —— 菜单路径与前端路由用的就是 `/hr` 这个词）。
+        // 前缀 `/hr`：顶层 nest、单段裸名词。⚠️ **API 前缀与菜单 path 是两层不同的
+        // 东西**：菜单 path 是 `/hr/schedule`（见 `seeds/menu.sql`），前端路由也是
+        // `hr/schedule` —— 别把菜单侧的词当成本前缀的依据。
         // ⚠️ 本域**无硬切记录**（新立），**无 alias**。
         // ⚠️ matchit 无冲突：域内唯一的 `Path<i64>` catch-all 在 `/shifts/{id}`（2 段），
         // 同段数的 `/calendar/days`（2 段全静态）第 1 段就分道，不触发「静态段被吞成

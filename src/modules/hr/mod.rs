@@ -90,6 +90,7 @@
 //! | 21906 | `BIZ_HR_SHIFT_INACTIVE` | 409 | 对已停用班次做写操作 |
 //! | 21907 | `BIZ_HR_CALENDAR_LEAVE_NAME_REQUIRED` | 400 | `CUSTOM_LEAVE` 未填 `name` |
 //! | 21908 | `BIZ_HR_SHIFT_SPAN_EXCEEDS_DAY` | 400 | **V6**：`span > 24:00` |
+//! | 21909 | `BIZ_HR_FIELD_INVALID` | 400 | 必填项（`code` / `name`）trim 后为空白，或某字段超 `varchar` 列宽（判**字符数**） |
 //!
 //! ## 结构（**转发式**，见 CLAUDE.md「路由声明规约」第 9 条）
 //!
@@ -111,7 +112,7 @@
 //! 全文见 `repo.rs` 模块 doc。**因此本域不需要跑 `./scripts/sqlx_prepare.sh`、
 //! 不产生 `.sqlx/` 缓存 diff。**
 //!
-//! ## 域隔离护栏：**刻意不装**（2026-10-19 复核，只一处例外）
+//! ## 域隔离护栏：**刻意不装**（2026-10-19 复核，2026-10-23 复核措辞）
 //!
 //! 本域的业务代码**零跨域引用** —— 三张表 `t_hr_calendar_day` / `t_hr_shift` /
 //! `t_hr_shift_calendar` 全是本域自有，排班与工人 / 订单 / 考勤零交集，SQL 真源
@@ -126,12 +127,14 @@
 //! `#[cfg(test)]` 的路由表比对器。
 //!
 //! 护栏的规则（「不 import 别域的 service / repo」）在这里恰好把**正确**的写法也拦了。
-//! 与 `serial`（同样复用 `files::route_guard`，同样整域不装护栏，见其 `mod.rs`
-//! 「域隔离护栏：不适用」一节）、`print_template`（复用同一个比对器、同样不装护栏）
-//! 是**同款豁免**，三处的理由逐字同源。
 //!
-//! ⚠️ 日后若要把 `route_guard` 这类「共用测试工具」上提到 `shared`（那才是它该在的
-//! 位置），本节与 `serial` / `print_template` 的对应小节应一并改成「装护栏」。
+//! ⚠️ **与 `serial` / `print_template` 的差别要说清（不要笼统写成「同款」）**：那两域
+//! 之所以不装护栏，是因为它们的**生产代码**里就 import 了别域（`assembly::repo` /
+//! `files::part_file`），护栏即使放过 `#[cfg(test)]` 也会照样报警；而本域唯一的跨域
+//! 路径**只在 `#[cfg(test)]` 里**，生产代码零跨域。三处都「不装护栏」，成因并不同款。
+//!
+//! 日后若要把 `route_guard` 这类「共用测试工具」上提到 `shared`（那才是它该在的
+//! 位置），本节应改成「装护栏」（生产代码侧确实已经干净）。
 //! **不要**为了「让本域看起来整齐」而删掉 `handler::tests` 里那行比对器复用。
 //!
 //! ## 零 WS 广播（有意取舍）
@@ -156,7 +159,7 @@ pub mod vo;
 /// 本域 router 工厂（转发式：路由表在 [`handler::router`]）。
 ///
 /// 挂载点：`src/modules/mod.rs::v2_router()` 的 `.nest("/hr", …)`
-/// —— 顶层 nest、单段、kebab-case 风格的短词。
+/// —— 顶层 nest、单段裸名词（`hr`，不是 kebab-case）。
 pub fn router() -> Router<Arc<AppState>> {
     handler::router()
 }

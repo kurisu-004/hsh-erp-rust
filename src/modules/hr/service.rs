@@ -27,10 +27,11 @@ use crate::auth::rbac::CurrentUser;
 use crate::infra::clock::now_naive;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::hr::dto::{
-    CalendarDaysDeleteRequest, CalendarDaysUpsertRequest, CalendarRangeQuery, CreateShiftRequest,
-    DeactivateShiftRequest, MAX_CLOCK_MINUTES, MAX_RANGE_DAYS, MAX_SEGMENTS, MAX_SPAN_MINUTES,
-    MIN_SEGMENTS, PERM_MANAGE, PERM_VIEW, ShiftCalendarRangeQuery, ShiftDaysDeleteRequest,
-    ShiftDaysUpsertRequest, ShiftListQuery, UpdateShiftRequest,
+    COL_COLOR, COL_NAME, COL_REMARK, COL_SHIFT_CODE, CalendarDaysDeleteRequest,
+    CalendarDaysUpsertRequest, CalendarRangeQuery, CreateShiftRequest, DAY_BOUNDARY_MINUTES,
+    DeactivateShiftRequest, MAX_BATCH_ITEMS, MAX_CLOCK_MINUTES, MAX_RANGE_DAYS, MAX_SEGMENTS,
+    MAX_SPAN_MINUTES, MIN_SEGMENTS, PERM_MANAGE, PERM_VIEW, ShiftCalendarRangeQuery,
+    ShiftDaysDeleteRequest, ShiftDaysUpsertRequest, ShiftListQuery, UpdateShiftRequest,
 };
 use crate::modules::hr::model::{DayType, ShiftSegment, TShiftRow, derive_from_weekday};
 use crate::modules::hr::repo;
@@ -211,7 +212,7 @@ pub fn validate_segments(segments: &[ShiftSegment]) -> Result<NormalizedSegments
 
     // ── V3：首段起点必须落在当日 ──
     let first_start = bounds[0].0;
-    if first_start >= 24 * 60 {
+    if first_start >= DAY_BOUNDARY_MINUTES {
         return Err(seg_invalid(format!(
             "首段起点({}) 必须早于 `24:00`，否则工作开始时间不在 cal_date 当日、日期归属无从谈起",
             format_clock(first_start)
@@ -243,8 +244,8 @@ pub fn validate_segments(segments: &[ShiftSegment]) -> Result<NormalizedSegments
 
     Ok(NormalizedSegments {
         daily_minutes: bounds.iter().map(|(s, e)| e - s).sum(),
-        cross_day: max_end > 24 * 60,
-        overflow_minutes: (max_end - 24 * 60).max(0),
+        cross_day: max_end > DAY_BOUNDARY_MINUTES,
+        overflow_minutes: (max_end - DAY_BOUNDARY_MINUTES).max(0),
         segments: normalized,
     })
 }
@@ -315,7 +316,13 @@ pub fn validate_range(from: NaiveDate, to: NaiveDate) -> Result<(), AppError> {
     Ok(())
 }
 
-/// 一批 `cal_date` 的隐式区间校验（空批 → 21904）。
+/// 一批 `cal_date` 的隐式区间校验（空批 / 条数超限 / 跨度超限，一律 `21904`）。
+///
+/// ⚠️ 三个判据缺一不可：
+/// * **空批** → `21904`（「没说要写什么」不是合法请求）；
+/// * **条数 > [`MAX_BATCH_ITEMS`]** → `21904`：跨度判据只看「最小 ~ 最大日期」，
+///   一万个**全同日期**的 `items` 能把跨度绕过去（跨度恒为 0）却仍是一次巨大 UNNEST；
+/// * **跨度 > [`MAX_RANGE_DAYS`]** → `21904`。
 fn validate_date_batch(dates: &[NaiveDate]) -> Result<(), AppError> {
     if dates.is_empty() {
         return Err(AppError::biz(
@@ -323,9 +330,43 @@ fn validate_date_batch(dates: &[NaiveDate]) -> Result<(), AppError> {
             "items 为空：没有要写入的日期",
         ));
     }
+    if dates.len() > MAX_BATCH_ITEMS {
+        return Err(AppError::biz(
+            code::BIZ_HR_CALENDAR_RANGE_INVALID,
+            format!("一批 {} 个日期超过上限 {MAX_BATCH_ITEMS} 条", dates.len()),
+        ));
+    }
     let min = dates.iter().copied().min().expect("非空");
     let max = dates.iter().copied().max().expect("非空");
     validate_range(min, max)
+}
+
+/// 按 `cal_date` 去重一批判次（**后写覆盖先写**）。
+///
+/// ## 为什么必须去重（2026-10-23）
+///
+/// 批量 upsert 的 SQL 是 `INSERT … SELECT … FROM UNNEST(…) ON CONFLICT (cal_date)
+/// WHERE deleted_at IS NULL DO UPDATE`。同一条命令里影响同一行两次时 PG 抛
+/// `ON CONFLICT DO UPDATE command cannot affect row a second time`
+/// （SQLSTATE `21000`）—— 它既不是 `23505`（`is_unique_violation` 判不到）也不在任何
+/// 显式档 ⇒ 落 `AppError::Database` → `50001` / **HTTP 500**。而「同批里出现同一个
+/// `cal_date`」的门槛是零：前端一次范围拖选 + 一次补写就能产生它。
+///
+/// **后写覆盖先写**（而不是报错）与 [`into_day_map`] 的「脏数据后写覆盖先写」同口径：
+/// 同一批里同一天只能有一个最终口径，后出现的那条就是调用方的最新意图。
+///
+/// 保序：结果按**第一次出现的位置**排列，让「`affected` 与入参顺序对得上」这条可预期
+/// 的性质留在（虽然它不参与任何语义判定）。
+fn dedup_by_date<T: Clone>(items: &[T], date_of: impl Fn(&T) -> NaiveDate) -> Vec<T> {
+    let mut kept: Vec<T> = Vec::with_capacity(items.len());
+    for item in items {
+        let d = date_of(item);
+        match kept.iter_mut().find(|k| date_of(k) == d) {
+            Some(slot) => *slot = item.clone(),
+            None => kept.push(item.clone()),
+        }
+    }
+    kept
 }
 
 /// 删行请求的两种形态归一：`{dates:[…]}` 或 `{from,to}`（必恰好命中一种）。
@@ -364,6 +405,44 @@ fn resolve_delete_target(
             "删行请求必须二选一：{dates:[…]} 或 {from,to}（不能都省、不能只给一半、不能都给）",
         )),
     }
+}
+
+// ============================================================================
+// 字段值守卫（21909）
+// ============================================================================
+
+/// 字段值非法（`21909`，HTTP 400）：必填字段为空白，或某字段超出 `varchar` 列宽。
+fn field_invalid(msg: impl Into<String>) -> AppError {
+    AppError::biz(code::BIZ_HR_FIELD_INVALID, msg)
+}
+
+/// 列宽守卫：`v` 的**字符数**超过 `max` ⇒ `21909`。
+///
+/// ⚠️ **按字符数、不按字节数**：PG 的 `varchar(n)` 计的是**字符**，
+/// `varchar(30)` 放得下 30 个汉字（90 字节）。按 `len()`（字节）判会把
+/// 10 个汉字的 `name` 误拒成 400 —— 那比 500 更坏，因为它挡掉合法输入。
+fn check_len(field: &str, v: &str, max: usize) -> Result<(), AppError> {
+    let n = v.chars().count();
+    if n > max {
+        return Err(field_invalid(format!(
+            "{field} 长度 {n} 超过上限 {max} 个字符"
+        )));
+    }
+    Ok(())
+}
+
+/// 必填文本：先 `trim()`，再判空 —— 空串 / 纯空白一律 `21909`。
+///
+/// ⚠️ 为什么卡：`code` 空串会**占住** `uk_t_hr_shift_code` 的 partial unique
+/// （一旦有人建出 `code = ''`，后续所有人想用空 code 都撞 `21902`，而这条空班次
+/// 本身没有任何业务含义）；`name` 空串则让排班表上出现一行没名字的班次。
+/// 两者都是「入参非法」，不是「状态冲突」。
+fn require_text(field: &str, v: &str) -> Result<String, AppError> {
+    let t = v.trim();
+    if t.is_empty() {
+        return Err(field_invalid(format!("{field} 不能为空或全是空白")));
+    }
+    Ok(t.to_string())
 }
 
 // ============================================================================
@@ -426,13 +505,20 @@ pub async fn upsert_calendar_days(
 ) -> Result<CalendarDaysWriteOut, AppError> {
     current.require_permission(PERM_MANAGE)?;
 
+    // 先校验（空批 / 条数 / 跨度，判在**入参原始条数**上），再去重。
     let dates: Vec<NaiveDate> = req.items.iter().map(|i| i.cal_date).collect();
     validate_date_batch(&dates)?;
 
-    // 先逐条校验（day_type 合法性 / CUSTOM_LEAVE 必须带 name），**全部过了再落库**
+    // ⚠️ **必须去重**：PG 的
+    // `ON CONFLICT DO UPDATE command cannot affect row a second time`（SQLSTATE 21000）
+    // 落不进任何显式档 ⇒ 同批里出现同一个 `cal_date` 就是 HTTP 500。而它的门槛是零：
+    // 前端一次范围拖选 + 一次补写就能产生它。
+    let items = dedup_by_date(&req.items, |i| i.cal_date);
+
+    // 逐条校验（day_type 合法性 / CUSTOM_LEAVE 必须带 name / 列宽），**全部过了再落库**
     // —— 批写是「要么这批全过、要么一行不进」的语义（handler 的事务边界）。
-    let mut rows = Vec::with_capacity(req.items.len());
-    for item in &req.items {
+    let mut rows = Vec::with_capacity(items.len());
+    for item in &items {
         let dt = DayType::parse(&item.day_type)?;
         if dt == DayType::CustomLeave && item.name.as_deref().unwrap_or("").trim().is_empty() {
             return Err(AppError::biz(
@@ -442,6 +528,14 @@ pub async fn upsert_calendar_days(
                     item.cal_date
                 ),
             ));
+        }
+        // 超长 ⇒ PG `22001` ⇒ 500；必须在入参层拒成 21909。`name` 是节假日名 / 休息日
+        // 说明（人事随手打字），`remark` 是自由文本 —— 两列都要卡。
+        if let Some(name) = &item.name {
+            check_len("name", name, COL_NAME)?;
+        }
+        if let Some(remark) = &item.remark {
+            check_len("remark", remark, COL_REMARK)?;
         }
         rows.push(repo::NewCalendarDay {
             id: snowflake.next_id(),
@@ -514,10 +608,24 @@ pub async fn create_shift(
     current.require_permission(PERM_MANAGE)?;
     let norm = validate_segments(&req.segments)?;
 
+    // 字段值守卫（21909）：必填项 trim 后判空、可空项按**字符数**判列宽。
+    // ⚠️ 顺序在 `code_exists` 之前：空 code 预检会撞上「已存在的空 code」而误报 21902，
+    // 超长 code 预检则会拿一个注定写不进去的值去查库。
+    let code = require_text("code", &req.code)?;
+    check_len("code", &code, COL_SHIFT_CODE)?;
+    let name = require_text("name", &req.name)?;
+    check_len("name", &name, COL_NAME)?;
+    if let Some(color) = &req.color {
+        check_len("color", color, COL_COLOR)?;
+    }
+    if let Some(remark) = &req.remark {
+        check_len("remark", remark, COL_REMARK)?;
+    }
+
     // 应用层预检（friendly message）+ DB partial unique（并发兜底）。
     // ⚠️ 两条都映射成**同一个** `21902`：调用方不该区分「我查出来的」与「撞并发撞出来的」。
-    if repo::code_exists(conn, req.code.trim(), None).await? {
-        return Err(code_dup_error(req.code.trim()));
+    if repo::code_exists(conn, &code, None).await? {
+        return Err(code_dup_error(&code));
     }
     let id = snowflake.next_id();
     let segments_json: Vec<serde_json::Value> = norm
@@ -527,8 +635,8 @@ pub async fn create_shift(
         .collect();
     let new = repo::NewShift {
         id,
-        code: req.code.trim().to_string(),
-        name: req.name.trim().to_string(),
+        code,
+        name,
         color: req.color.clone(),
         segments: segments_json,
         sort_order: req.sort_order.unwrap_or(0),
@@ -593,19 +701,35 @@ pub async fn update_shift(
         .map(|s| serde_json::to_value(s).expect("ShiftSegment 必可序列化"))
         .collect();
 
-    let new_code = req.code.as_deref().unwrap_or(&row.code).trim().to_string();
+    let new_code = match &req.code {
+        Some(c) => {
+            let t = require_text("code", c)?;
+            check_len("code", &t, COL_SHIFT_CODE)?;
+            t
+        }
+        None => row.code.clone(),
+    };
+    let new_name = match &req.name {
+        Some(n) => {
+            let t = require_text("name", n)?;
+            check_len("name", &t, COL_NAME)?;
+            t
+        }
+        None => row.name.clone(),
+    };
+    if let Some(color) = &req.color {
+        check_len("color", color, COL_COLOR)?;
+    }
+    if let Some(remark) = &req.remark {
+        check_len("remark", remark, COL_REMARK)?;
+    }
     if new_code != row.code && repo::code_exists(conn, &new_code, Some(id)).await? {
         return Err(code_dup_error(&new_code));
     }
 
     let patch = repo::ShiftPatch {
         code: new_code,
-        name: req
-            .name
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or(&row.name)
-            .to_string(),
+        name: new_name,
         color: req.color.clone().or_else(|| row.color.clone()),
         segments: segments_json,
         sort_order: req.sort_order.unwrap_or(row.sort_order),
@@ -624,10 +748,9 @@ pub async fn update_shift(
             }
         })?;
     if affected == 0 {
-        // 归因：行还在（上面刚读到过）⇒ 是 version 陈旧，不是「不存在」。
-        // ⚠️ 这是 CLAUDE.md §8 允许的「兜底对账」，不是隐式 OCC：真正的 OCC 锚是
-        // body 里那个必填的 `version`。
-        return Err(occ_conflict());
+        // ⚠️ 0 行有**三种**成因，一律归因成 OCC 会把「已被并发停用」说成
+        // 「版本陈旧」，两种的处置完全不同（前者要刷新，后者要重新加载后再提交）。
+        return Err(attribute_zero_row_shift(conn, id).await);
     }
 
     let row = repo::get_shift(conn, id)
@@ -642,6 +765,37 @@ fn occ_conflict() -> AppError {
         code::VERSION_CONFLICT,
         "班次已被他人修改，请重新加载后再提交",
     )
+}
+
+/// **0 行归因（返回的错误必是 `Err`）**：读一次班次行把成因分清。
+///
+/// | 库里的现状 | 归因 |
+/// |---|---|
+/// | 查不到 / 已软删 | `21901`（调用方该换个 id） |
+/// | 在但 `is_active = false` | `21906`（并发停用，处置是「刷新后再看」） |
+/// | 在、启用中 | `40901` OCC（`version` 陈旧，处置是「重新加载后再提交」） |
+///
+/// ⚠️ **为什么必须分清后两种**：它们给前端的下一步动作完全不同（刷新 vs 重新加载
+/// 后重试），一律归因成 OCC 会让「这个班次已经停用」这件事被说成「你版本旧了」，
+/// 而后者会让客户端反复重试一个永远过不去的请求。
+async fn attribute_zero_row_shift(conn: &mut PgConnection, id: i64) -> AppError {
+    match repo::get_shift(conn, id).await {
+        Ok(None) => shift_not_found(),
+        Ok(Some(row)) if !row.is_active => inactive_error(&row),
+        Ok(Some(_)) => occ_conflict(),
+        Err(e) => e,
+    }
+}
+
+/// **0 行归因（软删类写 SQL）**：`Ok(())` = 班次仍可写，0 行只是「那几天本来就没有行」。
+///
+/// 与 [`attribute_zero_row_shift`] 的区别就在这个 `Ok` 分支：清覆盖的
+/// `affected = 0` 是**合法成功**（见 §4.4），所以「班次可写」时不能报错。
+async fn ensure_shift_still_writable(conn: &mut PgConnection, id: i64) -> Result<(), AppError> {
+    let row = repo::get_shift(conn, id)
+        .await?
+        .ok_or_else(shift_not_found)?;
+    ensure_writable(&row)
 }
 
 /// 班次不存在 / 已软删（`21901`，HTTP 404）。
@@ -691,7 +845,10 @@ pub async fn deactivate_shift(
 
     let affected = repo::deactivate_shift(conn, id, req.version, current.id, now_naive()).await?;
     if affected == 0 {
-        return Err(occ_conflict());
+        // 0 行 = `version` 陈旧 / 行已不在 / **已被并发停用**（SQL 里带 `AND is_active`）。
+        // 并发重复停用应当给 `21906` 而不是 `40901`：调用方重试一个已停用的班次
+        // 永远过不去，说成 OCC 只会让客户端空转。
+        return Err(attribute_zero_row_shift(conn, id).await);
     }
     let row = repo::get_shift(conn, id)
         .await?
@@ -785,14 +942,19 @@ pub async fn upsert_shift_days(
         .ok_or_else(shift_not_found)?;
     ensure_writable(&row)?;
 
+    // 同端点 2：条数 / 跨度判在原始 `items` 上，判完再去重（同批重复日期 ⇒ 21000 ⇒ 500）。
     let dates: Vec<NaiveDate> = req.items.iter().map(|i| i.cal_date).collect();
     validate_date_batch(&dates)?;
+    let items = dedup_by_date(&req.items, |i| i.cal_date);
 
-    let mut rows = Vec::with_capacity(req.items.len());
-    for item in &req.items {
+    let mut rows = Vec::with_capacity(items.len());
+    for item in &items {
         // ⚠️ 覆盖行**不**校验 `CUSTOM_LEAVE` 必须带 name：`t_hr_shift_calendar` 表
         // **没有** `name` 列（那个名字属于全局日历的语义，见迁移注释）。
         // 要写说明走 `remark`。日型合法性照常校验（未知 → 21905）。
+        if let Some(remark) = &item.remark {
+            check_len("remark", remark, COL_REMARK)?;
+        }
         rows.push(repo::NewShiftDay {
             id: snowflake.next_id(),
             cal_date: item.cal_date,
@@ -802,6 +964,12 @@ pub async fn upsert_shift_days(
     }
 
     let affected = repo::upsert_shift_days(conn, id, &rows, current.id, now_naive()).await?;
+    if affected == 0 {
+        // ⚠️ 写 SQL 里带 `is_active` 守卫（见 `repo::upsert_shift_days`），所以
+        // 「一批非空却 0 行」只可能是班次在这两条语句之间被并发停用 / 软删了。
+        // 上面那次 `ensure_writable` 是**读-再-写**的 TOCTOU 窗口，这里才是真判据。
+        return Err(attribute_zero_row_shift(conn, id).await);
+    }
     Ok(ShiftDaysWriteOut { affected })
 }
 
@@ -831,6 +999,12 @@ pub async fn delete_shift_days(
             repo::soft_delete_shift_days_by_range(conn, id, f, t, current.id, now_naive()).await?
         }
     };
+    if affected == 0 {
+        // 清覆盖的 `affected = 0` 本身是合法成功，但**前提是班次仍可写**：两条软删 SQL
+        // 都带班次侧的 `is_active` 守卫（并发停用时它们会命中 0 行）。0 行时回查一次，
+        // 把「并发停用」与「那几天本来就没有覆盖行」分开。
+        ensure_shift_still_writable(conn, id).await?;
+    }
     Ok(ShiftDaysWriteOut { affected })
 }
 
@@ -852,7 +1026,7 @@ mod tests {
             .collect()
     }
 
-    /// **合法 5 例** + 逐例的派生列期望。
+    /// **合法 6 例** + 逐例的派生列期望。
     ///
     /// 派生列一起钉，是为了让「`overflow_minutes` 不跨天时恒为 0」与
     /// 「`daily_minutes` 是各段之和、无折算」这两条口径不被后来人无声改动。
@@ -894,6 +1068,22 @@ mod tests {
                 0,
                 1440,
             ),
+            (
+                // ⚠️ V5 的**上界**边界：恰好 6 段必须放行（7 段被拒由下面那张表钉）。
+                // 只钉「7 段拒」而不钉「6 段过」，那天有人把上界改成 `< 6` 两边都会全绿。
+                "三班倒 6 段（V5 上界恰好 6：01:00 起连排到晚 23:00，段间 1 小时休息）",
+                segs(&[
+                    ("01:00", "05:00"),
+                    ("06:00", "10:00"),
+                    ("11:00", "15:00"),
+                    ("16:00", "18:00"),
+                    ("19:00", "21:00"),
+                    ("22:00", "23:00"),
+                ]),
+                false,
+                0,
+                240 + 240 + 240 + 120 + 120 + 60,
+            ),
         ];
 
         for (desc, input, want_cross, want_overflow, want_minutes) in cases {
@@ -911,7 +1101,7 @@ mod tests {
         }
     }
 
-    /// **非法 8 例** + 每例期望的错误码。
+    /// **非法 9 例** + 每例期望的错误码。
     ///
     /// 逐例钉到**具体码**（而不是只钉「被拒」）：`21903`（V1–V5 段形态问题）与
     /// `21908`（V6 span 超一天）是两种语义，前端文案不同，混掉就没法只改一条。
@@ -935,6 +1125,13 @@ mod tests {
             Case {
                 desc: "零长段（start == end，V2 严格小于）",
                 input: segs(&[("08:00", "08:00")]),
+                want: code::BIZ_HR_SHIFT_SEGMENT_INVALID,
+            },
+            Case {
+                // ⚠️ 与「零长段」同属 V2 但方向相反：start > end 的段是**倒挂**的，
+                // 归一化时 start 不小于 end，派生列 `daily_minutes` 会算成负数。
+                desc: "倒挂段（start > end，V2 另一侧）",
+                input: segs(&[("17:00", "08:00")]),
                 want: code::BIZ_HR_SHIFT_SEGMENT_INVALID,
             },
             Case {
@@ -1068,6 +1265,89 @@ mod tests {
             resolve_delete_target(Some(vec![]), None, None),
         ] {
             assert_eq!(bad.unwrap_err().code(), code::BIZ_HR_CALENDAR_RANGE_INVALID);
+        }
+    }
+
+    /// **批量条数上限**：一条 `items` 攒 367 项（哪怕全是同一个日期）必须被拒成
+    /// `21904`。
+    ///
+    /// ⚠️ 这条与「跨度 ≤ 366 天」是**两个**判据：367 个**同日期**的项跨度恒为 0，
+    /// 只卡跨度会让它一路灌进一次巨大的 `UNNEST`。
+    #[test]
+    fn batch_item_count_is_capped_even_when_every_date_is_identical() {
+        let d = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        assert!(
+            validate_date_batch(&vec![d; MAX_BATCH_ITEMS]).is_ok(),
+            "恰好 {MAX_BATCH_ITEMS} 条放行"
+        );
+        let err = validate_date_batch(&vec![d; MAX_BATCH_ITEMS + 1]).unwrap_err();
+        assert_eq!(err.code(), code::BIZ_HR_CALENDAR_RANGE_INVALID);
+        assert_eq!(err.http_status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// **同批重复日期按「后写覆盖先写」收敛**（PG 的 `21000` 那一刀的前置防线）。
+    ///
+    /// ⚠️ 顺序也要钉：结果保留**第一次出现的位置**，只把值换成后写那条。这样
+    /// `affected` 与入参顺序的关系不会因为去重而变得不可预期。
+    #[test]
+    fn dedup_by_date_keeps_last_write_in_the_first_occurrence_slot() {
+        let d = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        let d2 = d + chrono::Duration::days(1);
+        let items = vec![("a", d), ("b", d2), ("c", d), ("d", d2), ("e", d2)];
+        let kept = dedup_by_date(&items, |(_, d)| *d);
+        let tags: Vec<&str> = kept.iter().map(|(t, _)| *t).collect();
+        assert_eq!(tags, vec!["c", "e"], "后写覆盖先写，且保留首次出现的位置");
+        assert_eq!(kept[0].1, d);
+        assert_eq!(kept[1].1, d2);
+    }
+
+    /// 列宽守卫：**按字符数**判，且四列全部越界落 `21909` / HTTP 400（不是 500）。
+    ///
+    /// ⚠️ 中文那条是关键：`varchar(30)` 放得下 30 个汉字（90 字节）。按字节判会把
+    /// 「10 个汉字的 code」误拒 —— 挡住合法输入比 500 更坏。
+    #[test]
+    fn check_len_counts_characters_and_maps_to_21909() {
+        let han = "汉"; // 1 字符 = 3 字节
+        assert!(
+            check_len("code", &han.repeat(30), 30).is_ok(),
+            "30 个汉字放行"
+        );
+        let err = check_len("code", &han.repeat(31), 30).unwrap_err();
+        assert_eq!(err.code(), code::BIZ_HR_FIELD_INVALID);
+        assert_eq!(err.http_status(), StatusCode::BAD_REQUEST);
+
+        for (field, max) in [
+            ("code", COL_SHIFT_CODE),
+            ("name", COL_NAME),
+            ("color", COL_COLOR),
+            ("remark", COL_REMARK),
+        ] {
+            assert!(
+                check_len(field, &"x".repeat(max), max).is_ok(),
+                "{field} 边界放行"
+            );
+            assert_eq!(
+                check_len(field, &"x".repeat(max + 1), max)
+                    .unwrap_err()
+                    .code(),
+                code::BIZ_HR_FIELD_INVALID,
+                "{field} 超宽应落 21909"
+            );
+        }
+    }
+
+    /// 必填文本：空白 / 空串一律 `21909`，且落库前已 `trim()`。
+    ///
+    /// ⚠️ 空白 `code` 会**占住** `uk_t_hr_shift_code` 的 partial unique —— 建出一条
+    /// `code = ''` 的班次后，所有想用空 code 的人都会撞 `21902`，而那条空班次本身没有
+    /// 任何业务含义。
+    #[test]
+    fn require_text_rejects_blank_and_trims() {
+        assert_eq!(require_text("code", "  DAY  ").unwrap(), "DAY");
+        for blank in ["", " ", "\t", "   \t  "] {
+            let err = require_text("code", blank).unwrap_err();
+            assert_eq!(err.code(), code::BIZ_HR_FIELD_INVALID, "`{blank}` 应被拒");
+            assert_eq!(err.http_status(), StatusCode::BAD_REQUEST);
         }
     }
 

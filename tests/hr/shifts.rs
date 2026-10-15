@@ -13,7 +13,8 @@ use serde_json::{Value, json};
 
 use crate::{
     assert_biz_code, bootstrap, create_body, create_shift, date, deactivate_shift, ghost_id, id_of,
-    post_as_manager, post_raw, segs, unique_code, version_of,
+    live_override_count, post_as_manager, post_raw, segs, unique_code, version_of,
+    write_override_day,
 };
 
 // ===========================================================================
@@ -349,6 +350,149 @@ async fn missing_segments_is_plain_text_422() {
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{raw}");
     assert!(raw.contains("segments"), "422 应点名缺失字段：{raw}");
+}
+
+/// ⚠️ **回归**：`code` / `name` 的**空白**必须被拒（`21909` / 400），建班次与改班次
+/// 两条路径都拒。
+///
+/// ⚠️ 为什么这不是小事：空 `code` 会**占住** `uk_t_hr_shift_code` 的 partial unique ——
+/// 建出一条 `code = ''` 的班次之后，任何人想用空 code 都撞 `21902`，而那条空班次本身
+/// 没有任何业务含义（调用方还分不清「我的 code 重复了」与「我不该传空 code」）。
+#[tokio::test]
+async fn blank_code_or_name_is_21909_on_both_write_paths() {
+    let ctx = bootstrap().await;
+
+    for (label, code, name) in [
+        ("空白 code", "   ", "有名字"),
+        ("空串 code", "", "有名字"),
+        ("空白 name", &unique_code("BLK"), "  \t "),
+        ("空串 name", &unique_code("BLK2"), ""),
+    ] {
+        let (status, env) = post_as_manager(
+            &ctx,
+            "/hr/shifts",
+            json!({ "code": code, "name": name, "segments": segs(&[("08:00", "17:00")]) }),
+        )
+        .await;
+        assert_ne!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{label} 绝不能是 500：{env}"
+        );
+        assert_biz_code(status, &env, 21909, StatusCode::BAD_REQUEST);
+    }
+
+    // 改班次路径同样拒（能建出来 ≠ 能改成空）
+    let shift = create_shift(&ctx, &unique_code("BLKUPD"), &[("08:00", "17:00")]).await;
+    let id = id_of(&shift);
+    for body in [
+        json!({ "version": version_of(&shift), "code": "   " }),
+        json!({ "version": version_of(&shift), "name": "  " }),
+    ] {
+        let (status, env) = post_as_manager(&ctx, &format!("/hr/shifts/{id}"), body).await;
+        assert_ne!(status, StatusCode::INTERNAL_SERVER_ERROR, "{env}");
+        assert_biz_code(status, &env, 21909, StatusCode::BAD_REQUEST);
+    }
+
+    // 边界：trim 后非空（前后带空格）照常放行，且落库的是 trim 后的值
+    let (status, env) = post_as_manager(
+        &ctx,
+        "/hr/shifts",
+        json!({
+            "code": format!("  {}  ", unique_code("TRIM")),
+            "name": "  带空格的名字  ",
+            "segments": segs(&[("08:00", "17:00")]),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{env}");
+    assert_eq!(
+        env["data"]["code"],
+        json!(env["data"]["code"].as_str().unwrap().trim()),
+        "落库 / 出参必须是 trim 后的值：{env}"
+    );
+    assert_eq!(env["data"]["name"], json!("带空格的名字"), "{env}");
+}
+
+/// ⚠️ **回归**：写 SQL 自带的 `is_active` 判据必须真的生效。
+///
+/// service 侧的 `get_shift` + `ensure_writable` 是**读-再-写**：并发的
+/// `POST /shifts/{id}/deactivate` 落在读与写之间时，光靠它挡不住。本例**不模拟并发**，
+/// 而是直接验证「班次已停用」这个状态下写端点的归因与「库里没有覆盖行被写进去」——
+/// 判据下沉进 SQL 之后，这两条无论有没有并发都成立（并发窗口里也一样）。
+#[tokio::test]
+async fn writes_to_a_deactivated_shift_are_refused_and_leave_no_rows() {
+    let ctx = bootstrap().await;
+    let shift = create_shift(&ctx, &unique_code("TOCTOU"), &[("08:00", "17:00")]).await;
+    let id = id_of(&shift);
+    let d0 = date(0);
+    let d1 = date(1);
+    write_override_day(&ctx, id, &d0, "MAKEUP_WORKDAY").await;
+    write_override_day(&ctx, id, &d1, "MAKEUP_HOLIDAY").await;
+    assert_eq!(live_override_count(&ctx.pool, id).await, 2);
+
+    deactivate_shift(&ctx, id, version_of(&shift)).await;
+
+    // 端点 9：21906，且库里不多出一行
+    let (status, env) = post_as_manager(
+        &ctx,
+        &format!("/hr/shifts/{id}/calendar/days"),
+        json!({ "items": [{ "cal_date": date(2), "day_type": "WORKDAY" }] }),
+    )
+    .await;
+    assert_biz_code(status, &env, 21906, StatusCode::CONFLICT);
+    assert_eq!(
+        live_override_count(&ctx.pool, id).await,
+        2,
+        "被拒的写入不得留下覆盖行"
+    );
+
+    // 端点 10 的两种形态：同样 21906（清覆盖的 affected=0 本身合法，但班次不可写时不是）
+    for (label, body) in [
+        ("dates 形态", json!({ "dates": [d0] })),
+        ("区间形态", json!({ "from": d0, "to": d1 })),
+    ] {
+        let (status, env) =
+            post_as_manager(&ctx, &format!("/hr/shifts/{id}/calendar/days/delete"), body).await;
+        assert_biz_code(status, &env, 21906, StatusCode::CONFLICT);
+        assert_eq!(
+            live_override_count(&ctx.pool, id).await,
+            2,
+            "{label} 被拒 ⇒ 覆盖行不该被清掉"
+        );
+    }
+
+    // 端点 6 改班次：同样 21906（而不是把 0 行说成 OCC）
+    let (status, env) = post_as_manager(
+        &ctx,
+        &format!("/hr/shifts/{id}"),
+        json!({ "version": version_of(&shift) + 1, "name": "还想改" }),
+    )
+    .await;
+    assert_biz_code(status, &env, 21906, StatusCode::CONFLICT);
+}
+
+/// 端点 10 的 `affected = 0` 仍必须是**合法成功**（那几天本来就没有覆盖行）——
+/// 0 行归因的补查不许把这个语义改掉。
+#[tokio::test]
+async fn clearing_override_on_a_live_shift_with_nothing_to_delete_is_zero_not_an_error() {
+    let ctx = bootstrap().await;
+    let shift = create_shift(&ctx, &unique_code("ZERO"), &[("08:00", "17:00")]).await;
+    let id = id_of(&shift);
+    let d = date(0);
+
+    let (status, env) = post_as_manager(
+        &ctx,
+        &format!("/hr/shifts/{id}/calendar/days/delete"),
+        json!({ "dates": [d] }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "启用中的班次清 0 行是合法成功：{env}"
+    );
+    assert_eq!(env["data"]["affected"], json!(0), "{env}");
 }
 
 // ===========================================================================

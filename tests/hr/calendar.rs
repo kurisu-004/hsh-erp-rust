@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use crate::{
     Ctx, assert_biz_code, bootstrap, create_shift, date, deactivate_shift, ghost_id,
-    global_calendar_map, id_of, live_override_count, post_as_manager, shift_calendar_items,
+    global_calendar_map, id_of, live_override_count, post_as_manager, segs, shift_calendar_items,
     version_of, weekday_of, write_global_day, write_override_day,
 };
 
@@ -319,6 +319,220 @@ async fn upsert_batch_span_is_capped_by_the_same_366_day_rule() {
     )
     .await;
     assert_biz_code(status, &env, 21904, StatusCode::BAD_REQUEST);
+}
+
+/// ⚠️ **回归**：**同一条命令里出现同一个 `cal_date` 必须不是 500。**
+///
+/// PG 的 `INSERT … SELECT … FROM UNNEST(…) ON CONFLICT (cal_date) WHERE deleted_at IS
+/// NULL DO UPDATE` 在同批命中同一行两次时抛 `ON CONFLICT DO UPDATE command cannot
+/// affect row a second time`（SQLSTATE `21000`）—— 它既不是 `23505` 也不在任何显式档
+/// ⇒ 落 `AppError::Database` → `50001` / **HTTP 500**。而「前端一次范围拖选 + 一次补写」
+/// 就能造出这种请求，门槛是零。
+///
+/// 口径是**后写覆盖先写**（与读侧 `into_day_map` 的「脏数据后写覆盖先写」同源），
+/// 终值必须是**后出现的那条**。
+#[tokio::test]
+async fn duplicate_dates_in_one_batch_are_not_500_and_last_write_wins() {
+    let ctx = bootstrap().await;
+    let d = date(0);
+
+    // 端点 2：先 WORKDAY 后 REST_DAY ⇒ 终值 REST_DAY
+    let (status, env) = post_as_manager(
+        &ctx,
+        "/hr/calendar/days",
+        json!({ "items": [
+            { "cal_date": d, "day_type": "WORKDAY" },
+            { "cal_date": d, "day_type": "REST_DAY" },
+        ] }),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "同批重复日期绝不能是 500：{env}"
+    );
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "同批重复日期按后写覆盖先写放行：{env}"
+    );
+    assert_eq!(
+        env["data"]["affected"],
+        json!(1),
+        "去重后只剩一行受影响：{env}"
+    );
+    let days = global_calendar_map(&ctx, &d, &d).await;
+    assert_eq!(
+        days[0]["day_type"],
+        json!("REST_DAY"),
+        "终值必须是**后写**那条：{days:?}"
+    );
+    assert_eq!(days[0]["derived"], json!(false));
+
+    // 反向再钉一次：后写 WORKDAY 时终值必须变回来（不是「第一条赢」的另一种实现）
+    let (status, env) = post_as_manager(
+        &ctx,
+        "/hr/calendar/days",
+        json!({ "items": [
+            { "cal_date": d, "day_type": "REST_DAY" },
+            { "cal_date": d, "day_type": "WORKDAY" },
+        ] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{env}");
+    let days = global_calendar_map(&ctx, &d, &d).await;
+    assert_eq!(days[0]["day_type"], json!("WORKDAY"), "{days:?}");
+
+    // 端点 9：同一批里同一天两条覆盖行也是同一刀（冲突目标是 (shift_id, cal_date)）
+    let shift = create_shift(&ctx, &crate::unique_code("DUPDAY"), &[("08:00", "17:00")]).await;
+    let id = id_of(&shift);
+    let (status, env) = post_as_manager(
+        &ctx,
+        &format!("/hr/shifts/{id}/calendar/days"),
+        json!({ "items": [
+            { "cal_date": d, "day_type": "MAKEUP_WORKDAY" },
+            { "cal_date": d, "day_type": "MAKEUP_HOLIDAY" },
+        ] }),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "端点 9 同样不能 500：{env}"
+    );
+    assert_eq!(status, StatusCode::OK, "{env}");
+    assert_eq!(env["data"]["affected"], json!(1), "{env}");
+    let items = shift_calendar_items(&ctx, id, &d, &d).await;
+    assert_eq!(
+        items[0]["effective_day_type"],
+        json!("MAKEUP_HOLIDAY"),
+        "端点 9 也是后写覆盖先写：{items:?}"
+    );
+}
+
+/// ⚠️ **回归**：一条 `items` 的**条数**也有上限（366）。
+///
+/// 跨度判据只看「最小 ~ 最大日期」，所以 367 个**全同日期**的项跨度恒为 0、能绕过去，
+/// 却仍会灌进一次巨大的 `UNNEST`。
+#[tokio::test]
+async fn batch_item_count_is_capped_even_when_all_dates_are_identical() {
+    let ctx = bootstrap().await;
+    let d = date(0);
+    let items: Vec<Value> = (0..=366)
+        .map(|_| json!({ "cal_date": d, "day_type": "WORKDAY" }))
+        .collect();
+    assert_eq!(items.len(), 367, "本例要 367 条（上限 +1）");
+    let (status, env) = post_as_manager(&ctx, "/hr/calendar/days", json!({ "items": items })).await;
+    assert_biz_code(status, &env, 21904, StatusCode::BAD_REQUEST);
+
+    // 恰好 366 条放行（边界不能跟着一起收紧）
+    let items: Vec<Value> = (0..366)
+        .map(|_| json!({ "cal_date": d, "day_type": "WORKDAY" }))
+        .collect();
+    let (status, env) = post_as_manager(&ctx, "/hr/calendar/days", json!({ "items": items })).await;
+    assert_eq!(status, StatusCode::OK, "恰好 366 条应放行：{env}");
+    assert_eq!(env["data"]["affected"], json!(1), "去重后仍是一行：{env}");
+}
+
+/// ⚠️ **回归**：`varchar` 列超长必须是 `21909` / 400，**不是 500**。
+///
+/// PG 对 `varchar(n)` 超长抛 `22001`（`string_data_right_truncation`），落不进任何显式档
+/// ⇒ 会变成 `50001` / HTTP 500、message 被替换成「数据库错误」。`remark` 尤其要紧：
+/// 它是人事随手粘贴的自由文本，超长是**日常操作**。
+#[tokio::test]
+async fn oversized_varchar_columns_are_400_not_500() {
+    let ctx = bootstrap().await;
+
+    // 班次四列：code 30 / name 50 / color 20 / remark 200
+    let cases: Vec<(&str, Value)> = vec![
+        (
+            "code 31 字符",
+            json!({
+                "code": "C".repeat(31),
+                "name": "超长编码",
+                "segments": segs(&[("08:00", "17:00")]),
+            }),
+        ),
+        (
+            "name 51 字符",
+            json!({
+                "code": crate::unique_code("LEN1"),
+                "name": "名".repeat(51),
+                "segments": segs(&[("08:00", "17:00")]),
+            }),
+        ),
+        (
+            "color 21 字符",
+            json!({
+                "code": crate::unique_code("LEN2"),
+                "name": "超长颜色",
+                "color": "#".repeat(21),
+                "segments": segs(&[("08:00", "17:00")]),
+            }),
+        ),
+        (
+            "remark 201 字符",
+            json!({
+                "code": crate::unique_code("LEN3"),
+                "name": "超长备注",
+                "remark": "备".repeat(201),
+                "segments": segs(&[("08:00", "17:00")]),
+            }),
+        ),
+    ];
+    for (label, body) in cases {
+        let (status, env) = post_as_manager(&ctx, "/hr/shifts", body).await;
+        assert_ne!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{label} 绝不能是 500：{env}"
+        );
+        assert_biz_code(status, &env, 21909, StatusCode::BAD_REQUEST);
+    }
+
+    // 边界放行：30 / 50 / 20 / 200 恰好不拒
+    let (status, env) = post_as_manager(
+        &ctx,
+        "/hr/shifts",
+        json!({
+            "code": format!("E{}", "C".repeat(29)),
+            "name": "名".repeat(50),
+            "color": "#".repeat(20),
+            "remark": "备".repeat(200),
+            "segments": segs(&[("08:00", "17:00")]),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "恰好等于列宽必须放行：{env}");
+
+    // 日历两列同样要卡：name 50 / remark 200（端点 2）
+    for (label, item) in [
+        (
+            "日历 name 51 字符",
+            json!({ "cal_date": date(0), "day_type": "CUSTOM_LEAVE", "name": "节".repeat(51) }),
+        ),
+        (
+            "日历 remark 201 字符",
+            json!({ "cal_date": date(1), "day_type": "WORKDAY", "remark": "备".repeat(201) }),
+        ),
+    ] {
+        let (status, env) =
+            post_as_manager(&ctx, "/hr/calendar/days", json!({ "items": [item] })).await;
+        assert_ne!(status, StatusCode::INTERNAL_SERVER_ERROR, "{label}：{env}");
+        assert_biz_code(status, &env, 21909, StatusCode::BAD_REQUEST);
+    }
+
+    // 端点 9 的 remark 同样要卡
+    let shift = create_shift(&ctx, &crate::unique_code("LENOV"), &[("08:00", "17:00")]).await;
+    let id = id_of(&shift);
+    let (status, env) = post_as_manager(
+        &ctx,
+        &format!("/hr/shifts/{id}/calendar/days"),
+        json!({ "items": [{ "cal_date": date(0), "day_type": "WORKDAY", "remark": "备".repeat(201) }] }),
+    )
+    .await;
+    assert_ne!(status, StatusCode::INTERNAL_SERVER_ERROR, "{env}");
+    assert_biz_code(status, &env, 21909, StatusCode::BAD_REQUEST);
 }
 
 /// 端点 2：`CUSTOM_LEAVE` 未填 `name` → `21907`；其它日型不填 `name` 正常放行。
