@@ -202,6 +202,15 @@ pub fn router() -> Router<Arc<AppState>> {
     // ★ **2026-10-15：`POST /parts/batch` 的 bindings 分支已删除**（与上面的
     // 「响应形状与状态码变更」一起成为历史）—— 该端点现在**不碰** `t_part_file`，
     // 回归纯建单；响应里的 `cleanup_tmp_keys` 字段保留但恒为空（形状兼容）。
+    //
+    // ⚠️⚠️ **`items[].drawing_file` / `items[].model3d_file` 现在被 serde
+    // **静默丢弃**（`PartBatchCreateItem` 未开 `deny_unknown_fields`）⇒ 前端继续
+    // 发这两个字段会拿到 **200 + 零副作用**（文件绑定凭空消失，服务端**没有任何
+    // 信号**）。⇒ **前端必须停发**。
+    // ⚠️ 这条兼容策略与 files 域 confirm 的 `tmp_key`→`object_key` **硬切**
+    // （缺字段 ⇒ 422）方向**相反**，是两条独立决策，别拿其中一个的结论套另一个。
+    // 集成测试钉住两侧：`tests/part/crud.rs::batch_create_ignores_removed_binding_fields`
+    // 与 `tests/files/part_file.rs` 的 upload-intents / confirm 硬切守卫。
 }
 
 /// part 域的**生产链路逃生端点**子路由（不含公共前缀；由 `prod::router()` 桥接到

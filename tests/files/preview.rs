@@ -1734,7 +1734,7 @@ async fn submit_request_body_matches_python_schema() {
 /// `preview_object_prefix` 与 `preview_urls` 的同源性 + 尾斜杠容忍。
 ///
 /// ⚠️ `COS_PREVIEW_PREFIX` 的缺省是 `previews`（**无**尾斜杠），而同结构体的
-/// `COS_UPLOAD_PREFIX` / `COS_TMP_PREFIX` 缺省都**带** —— 运维照着后两者的习惯
+/// `COS_UPLOAD_PREFIX` 缺省**带** —— 运维照着它的习惯
 /// 配成 `previews/` 是极自然的事。COS 的 key 里 `//` 是实打实的两个字符（不像 URL
 /// 那样被规范化），不 trim 就是「CI 写到 `previews//x/`、前端去取 `previews/x/`」。
 #[test]

@@ -54,10 +54,67 @@
 //! ≤ `COS_MAX_FILE_SIZE`）+ COS `head_object` 的实测 size 与入参逐字比对
 //! （不符即 **21115**）；`head` 为 0 字节同样按「对象没落地」处理（**21114**）。
 //!
+//! **④ ⚠️ CAS 秒传的判据已从「服务端算的 sha」变成「客户端声明的 sha」。**
+//! 上面 ① 的第一段说的是「服务端**既拿不到字节、也无法重算 sha**」——但**秒传**
+//! 这一条路上，服务端连一次 `head` 都不做：`grant_upload_intents` 拿
+//! `get_by_owner_kind_sha(owner_id, kind, &it.content_sha256)` 一命中就回
+//! `already_exists: true` + `existing_file`，前端**跳过 PUT 与 confirm**。也就是说
+//! 判据本身就是那条**不可验证**的 `content_sha256` 列。
+//!
+//! 威胁模型：攻击者只要让**某 owner 名下某 kind 的活跃行**的 `content_sha256`
+//! 列写着某个值 X（对象里其实不是 X 也行 —— 他直传任意字节、confirm 时声明 X），
+//! 此后任何**真上传内容 X** 的用户调 upload-intents 都会拿到秒传响应、
+//! 跳过 PUT，最终交付的是攻击者的字节。要成立需要攻击者**预先知道**受害者将
+//! 上传内容的 sha（未公开、逐文件不同）⇒ 现实可行窗口窄，但不是零。
+//!
+//! 可选缓解（本轮**未做**，取舍理由见下）：秒传前对 `existing_file` 的
+//! `object_key` 做一次 `head_object`，用实测 size 与入库的 `file_size` 交叉校验。
+//! **未做的理由**：`head` 要发网络请求（与「秒传一次 PUT 都不发」的收益直接冲突），
+//! 且 size 只能交叉校验、**验不出内容**（一个字节数相同的恶意对象照样通过）。
+//! ⇒ 它不是「修好了」，只是把「全靠客户端声明」挪近一格。别当成等价替换。
+//!
+//! ⚠️ **CAS key 不含 owner**（`build_cas_key(prefix, sha, filename)` 两段模板）：
+//! 同一份内容 + 同一文件名在**任何 owner** 名下派生出的 key 相同，秒传/直传都
+//! 命中同一个对象。这是内容寻址的正常性质（省一份存储），但也意味着「拿到一张
+//! 能写某 key 的签名 URL」与「能绑到哪个 owner」是两件事 —— owner 归属由
+//! `t_part_file` 行决定，不由 key 决定。
+//!
 //! **③ CUSTOMER 的角色口径。** `owner_kind='CUSTOMER'`（送货单打印模板）**两条**
 //! 写入口都只放 **Manager**（`policy::write_roles_for`，共用同一张表）；
 //! 且 owner 存在性走 `repo::customer_owner_exists`（含 `parent_id IS NULL`）⇒
 //! 只绑**一级**客户，绑二级客户得 **21105**。
+//!
+//! ### ⚠️ 前端配套改动清单（2026-10-15 两条写入口的 DTO 逐字段变更）
+//!
+//! 两条写入口的入参 / 出参与前端此前的形态**逐字段不同**（前端仓
+//! `src/types/part_file.ts` / `src/api/files/objects.ts` 的旧 zod schema 直接
+//! 反序列化会失败）。CLAUDE.md 要求「修改 DTO 字段 / 错误码必须同步更新对应域
+//! 的文档与注释」，本表就是那份登记：
+//!
+//! | 端点 | 方向 | 旧（前端现有） | 新（后端当前） |
+//! |---|---|---|---|
+//! | `upload-intents` | 入参 | `{owner_part_id?, files: [{kind, filename, file_size, content_sha256, content_type}]}` | `{owner_kind, owner_id, items: [{client_ref, kind, original_filename, content_type, file_size, content_sha256}]}` |
+//! | `upload-intents` | 出参 | `{tmp_key}` | `{already_exists, object_key?, upload_url?, content_type?, expires_in, existing_file?}` |
+//! | `confirm` | 入参 | `tmp_key` | **`object_key`**（硬切，无兼容层；缺它 ⇒ 422 纯文本） |
+//! | `confirm` | 出参 | — | `R<PartFileOut>`（18 字段；无 `customer_name`） |
+//!
+//! ⚠️ **秒传项必须容忍缺字段**：`already_exists: true` 时出参**没有**
+//! `object_key` / `upload_url` / `content_type`（`skip_serializing_if` 省略），
+//! 前端 schema 若把前三个设成必填 ⇒ 秒传响应直接校验失败。
+//!
+//! ⚠️⚠️ **`file_size` / `owner_id` / `pair_with_file_id` 入参必须是 JSON 字符串**：
+//! 后端走 `shared::types::deserialize_i64`，实现是
+//! `String::deserialize(d)?.parse::<i64>()` ⇒ **只收字符串**；传裸 number 会在
+//! axum `Json` 提取器层炸 ⇒ **HTTP 422 纯文本**，不是 `R<T>` 信封，前端
+//! `envelopeResponseInterceptor` 拿不到 `{code,message}`。
+//!
+//! ⚠️ **`POST /parts/batch` 的 `drawing_file` / `model3d_file` 必须停发**：该 DTO
+//! 没有开 `deny_unknown_fields` ⇒ 继续发会 **200 + 零副作用**（文件绑定被静默
+//! 丢弃，服务端无任何信号）。这与 confirm 的 `tmp_key`→`object_key` 硬切
+//! （缺字段 ⇒ 422）方向**相反**，是两条不同的兼容策略，别混记。
+//!
+//! 契约全表见 `docs/api/print_template.md` §1.0（送货单打印模板侧的写入链路是
+//! 本域两条写入口的一个使用者，`owner_kind='CUSTOMER'` + `kind='DELIVERY_TEMPLATE'`）。
 //!
 //! ### COS key 前缀：代码侧统一 `obj/`，**容器部署下仍未统一**
 //!
@@ -100,7 +157,7 @@
 //!
 //! | `owner_kind` | 允许的 `kind` |
 //! |---|---|
-//! | `PART` | `DRAWING` / `3D_MODEL` / `G_CODE` / `SETUP_SHEET`（后两个是 CNC 配对的两种文件，2026-10-15 起由 confirm 的 `pair_with_file_id` 承接） |
+//! | `PART` | `DRAWING` / `3D_MODEL` / `CAD_2D` / `G_CODE` / `SETUP_SHEET`（`G_CODE` / `SETUP_SHEET` 是 CNC 配对的两种文件，由 confirm 的 `pair_with_file_id` 承接；`CAD_2D` = DWG / DXF 源文件） |
 //! | `ASSEMBLY` | `ASSEMBLY_MASTER` |
 //! | `CUSTOMER` | `DELIVERY_TEMPLATE`（送货单打印模板） |
 //!
@@ -115,7 +172,8 @@
 //! **模板字节不新建表**，复用本表的 `t_part_file`：`kind='DELIVERY_TEMPLATE'`，
 //! `part_id` 列装的是**一级客户的 `t_customer.id`**，「该 L1 名下存在一行未软删的
 //! `DELIVERY_TEMPLATE`」本身就是绑定关系。承载域是新建的 `print_template` 域
-//! （`src/modules/print_template/`，URL `/api/v2/print-templates`，5 端点），
+//! （`src/modules/print_template/`，URL `/api/v2/print-templates`，**4 端点** ——
+//! 写入不在它自己那儿，走本域两条写入口），
 //! 完整契约见 `docs/api/print_template.md`。本域只出**九处**能力：
 //! ① `kind` 白名单 / 扩展名 / file_type / content_type 四张表加了 `DELIVERY_TEMPLATE`；
 //! ② `owner_kind='CUSTOMER'` 的闸门（`repo::customer_owner_exists`，⚠️ **含
@@ -175,7 +233,7 @@
 //! | 端点 | 角色集合 | 备注 |
 //! |---|---|---|
 //! | `POST /files/objects/upload-intents` | `PART`/`ASSEMBLY`：M / C / CNC；**`CUSTOMER`：仅 M** | 按 `owner_kind` 分派（`policy::write_roles_for(…, WriteEntry::Upload)`），两条写入口共用同一张表 |
-//! | `POST /files/objects/confirm` | M / C；`G_CODE` / `SETUP_SHEET`：M / CNC；**`CUSTOMER`：仅 M** | `policy::confirm_roles_for(owner_kind, kind)`：CNC 配对两种 kind 另给 CNC 岗位（与被删的 `POST /files/cnc/pairs` 口径逐字相同：M+CNC、不含 Clerk），其余走 `WriteEntry::Confirm` |
+//! | `POST /files/objects/confirm` | M / C；`G_CODE` / `SETUP_SHEET`：M / CNC；**`CUSTOMER`：仅 M** | `policy::confirm_roles_for(owner_kind, kind)`：CNC 配对两种 kind 另给 CNC 岗位（CNC 程序历来由 CNC 岗位写：M+CNC、不含 Clerk），其余走 `WriteEntry::Confirm`（`CAD_2D` 走这一支） |
 //! | `GET /files/objects`（列表） | M / C / I / CNC / **SHELF** | 2026-10-10 放开 SHELF；⚠️ 2026-10-16 起**永不返回 `DELIVERY_TEMPLATE` 行**（显式传 `kind` 也是空） |
 //! | `GET /files/objects/{id}/content` | M / C / I / CNC / **SHELF** | 2026-10-10 放开 SHELF；⚠️ 2026-10-16 起**加 kind 白名单**（拒 `DELIVERY_TEMPLATE` 等非文件类 kind），与 `/url` 共用 `policy::is_file_content_kind` |
 //! | `GET /files/objects/{id}/url` | 权限点 `part.drawing.print`（默认矩阵 M / C / I / CNC） | **默认矩阵刻意不含 SHELF**，见下；⚠️ 2026-10-16 起**同样加 kind 白名单**（review 第 1 轮 MAJOR-2） |
@@ -185,16 +243,21 @@
 //! ### ⚠️ 写侧对各 kind 的接受面（当前事实）
 //!
 //! `allowed_exts` 是**一张**白名单，`upload-intents` / `confirm` / 软删分派三条路径
-//! 共用它 ⇒ 某 kind 一旦进了白名单，写侧就能造该 kind 的行。
+//! 共用它 ⇒ 某 kind 一旦进了白名单（**且** `owner_kind_allows_kind` 放了它），
+//! 写侧就能造该 kind 的行。
 //!
-//! - `DRAWING` / `3D_MODEL` / `ASSEMBLY_MASTER`：M+C+CNC 可写（与图纸 / 3D 模型 /
-//!   装配件整图的既有权限面一致）。
+//! - `DRAWING` / `3D_MODEL` / `ASSEMBLY_MASTER` / `CAD_2D`：M+C+CNC 可写
+//!   （与图纸 / 3D 模型 / 装配件整图 / CAD 源文件的既有权限面一致）。
 //! - `G_CODE` / `SETUP_SHEET`：confirm 侧 M+CNC（`confirm_roles_for`）；
 //!   `upload-intents` 侧 M+C+CNC。
 //! - `DELIVERY_TEMPLATE`：**仅 Manager**（两条写入口都是）。
 //!
 //! `soft_delete_file` 的 kind 分派逐条对应（`G_CODE` M+CNC、`DELIVERY_TEMPLATE`
 //! 仅 Manager），故不存在「写得进、删不掉」的 kind。
+//! ⚠️ **两张写侧表必须同步改**（`allowed_exts` 与 `owner_kind_allows_kind`）：
+//! 任缺一张，那个 kind 在两条入口都传不上来 —— `CAD_2D` 就这么丢过一次
+//! （DB / 读侧 / 删侧全都支持它，只有写侧两张表漏了）。lib 单测
+//! `policy::tests::every_allowed_ext_kind_is_mounted_on_some_owner` 钉住这条。
 //!
 //! ### 2026-10-13：零件维度三条嵌套列表端点下线 ⇒ 不再有「两层闸门取交集」
 //!
@@ -274,7 +337,7 @@
 //! | 6 | **`confirm` 的 size 上限读 `COS_MAX_FILE_SIZE`**（`.env.example` = 100MB ⇒ 按样例配置部署时**上限**按该配置走）。⚠️ 副作用：入参 size 校验排在 `head_object` **之前** ⇒ 前端 PUT 了一个 100–300MB 的对象而配置只放行 100MB 时，confirm 报 21103 且该对象**留在桶里**（没有后置清理可做 —— 它就在正式 key 上），只能等 COS lifecycle 回收 | **有意保留 + 已登记**（先拒后查，少一次外部 IO） |
 //! | 7 | **`GET /files/objects` 的 `owner_kind` 过滤是空操作，且响应里的 `owner_kind` 从请求参数回显**（`service::render_out(&row, owner_kind)` 取形参、不取行上任何列 —— schema 压根没有 owner 类型列） | **有意保留 + 已登记**（读侧不构成隔离，见 `repo/sql.rs::list_with_filters` / `list_by_owner` 顶部注释；review 第 2 轮 MINOR-C 补登记。⚠️ **本条最易误导后人**：**写侧本轮新加了 `owner_kind` × `kind` 强制配对**（20104）而**读侧全无对应隔离** ⇒ 拿 `owner_kind=PART` 去查装配件 owner id 仍会返回 ASSEMBLY_MASTER 行，不要据响应里的 `owner_kind` 认定这些行真属该类型） |
 //! | 8 | **`GET /files/objects/{id}/preview` 返回永久 public-read 直链并放开 `SHELF_ACCOUNT`**：比 `/url` 的 1 小时预签窗口更宽、且**无过期、无撤销**（除改 `previews/` 的 COS ACL），也无法按零件关闭 | **有意保留 + 已登记**（用户拍板选项 A；取舍全文与补偿表见 `preview/mod.rs` 的「安全取舍反转」一节。⚠️ 它与第 6 行「`owner_kind` 过滤是空操作」同源：读侧仍无 owner 级范围判定） |
-//! | 9 | **`t_part_file` 表上没有 `owner_kind` 列 —— owner 语义只活在 API 层**：写侧由 `policy::owner_kind_allows_kind` 强制配对；读侧 `list_with_filters` / `list_by_owner` 的 `owner_kind` 形参**完全不进 SQL**；`render_out` 的 `owner_kind` 字段是**从请求参数回显**、不是从行上读出来的 | **有意保留 + 已登记**（与第 7 条同源。⚠️ 2026-10-16 加第三种 owner `CUSTOMER`（`DELIVERY_TEMPLATE`）后代价更明确：库里无法区分「零件 123 的图纸」与「客户 123 的打印模板」，二者共用 `part_id` 一个列空间。`print_template` 域因此**从不在通用列表端点上读这批行** —— 它只有自己那 5 条端点，每条都按 `(part_id, kind='DELIVERY_TEMPLATE')` 精确取，不依赖 `owner_kind` 过滤） |
+//! | 9 | **`t_part_file` 表上没有 `owner_kind` 列 —— owner 语义只活在 API 层**：写侧由 `policy::owner_kind_allows_kind` 强制配对；读侧 `list_with_filters` / `list_by_owner` 的 `owner_kind` 形参**完全不进 SQL**；`render_out` 的 `owner_kind` 字段是**从请求参数回显**、不是从行上读出来的 | **有意保留 + 已登记**（与第 7 条同源。⚠️ 2026-10-16 加第三种 owner `CUSTOMER`（`DELIVERY_TEMPLATE`）后代价更明确：库里无法区分「零件 123 的图纸」与「客户 123 的打印模板」，二者共用 `part_id` 一个列空间。`print_template` 域因此**从不在通用列表端点上读这批行** —— 它只有自己那 **4** 条端点（列表 / resolve / content / delete；写入不在本域），每条都按 `(part_id, kind='DELIVERY_TEMPLATE')` 精确取，不依赖 `owner_kind` 过滤） |
 //! | 10 | **`part_id` 一列现已承载**三种 owner：① `t_part.id`（DRAWING / 3D_MODEL / G_CODE / SETUP_SHEET / CAD_2D）、② `t_assembly.id`（ASSEMBLY_MASTER）、③ **`t_customer.id`（DELIVERY_TEMPLATE，2026-10-16）**。三者共用同一个雪花 ID 空间、**无映射表** | **有意保留 + 已登记**（用户拍板「不新建模板表」；新表要多一套软删 / 审计 / OCC 列，而模板字节本来就得走 COS + `t_part_file` 的 CAS key 与配额逻辑）。代价：`SELECT * FROM t_part_file WHERE part_id = $1` 这种**不带 kind** 的查询在语义上是跨三类 owner 的 —— 新增读路径**必须**带 `kind` 谓词，不得依赖 `part_id` 单列的隐含语义） |
 //! | 11 | **`POST /files/objects/confirm` 曾能造 `DELIVERY_TEMPLATE` 行**：两条写入口的角色闸门一度不共用，CLERK 能经 confirm 造出并替换任意客户的模板行 | **已闭合**（两条写入口共用 `policy::write_roles_for` / `confirm_roles_for`，`CUSTOMER` 恒收窄为仅 Manager；集成测试 `clerk_cannot_bypass_via_generic_confirm_endpoint` 从外部钉住） |
 //! | 12 | **通用列表端点曾会列出模板行**（review 第 1 轮 MAJOR-3）：`PartFileListQuery.kind` 缺省时无 kind 谓词，端点角色集合含 `SHELF_ACCOUNT` ⇒ 工控机账号可列出全部客户的模板元数据（越权读链的「发现」环节）。⚠️ 该事实**本轮之前**也成立，只是那时表里还没有第三种 owner | **已闭合**（`service::list_files` 无条件传 `exclude_kind = Some("DELIVERY_TEMPLATE")`，rows 与 total 两条 SQL 同步；集成测试 `shelf_account_list_never_sees_delivery_template_rows`） |

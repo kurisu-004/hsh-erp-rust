@@ -21,6 +21,10 @@
 //!    owner_kind × kind 配对
 //! 7. `intents_customer_delivery_template_*`   — CUSTOMER × DELIVERY_TEMPLATE：
 //!    MANAGER 可、CLERK 403、绑**二级**客户被拒
+//! 8. `confirm_content_type_mismatch_is_21102_like_upload_intents`
+//!    —— 两条写入口对同一个 MIME 不匹配必须给**同一个**码（21102 / 400）
+//! 9. `cad_2d_dwg_goes_through_the_whole_chain` —— CAD 源文件（DWG）整条链路可走通
+//!    （`CAD_2D` 曾只缺写侧两张 policy 表，前端 CAD tab 传不上来）
 //!
 //! ## ⚠️ CAS 秒传那两条的零副作用断言
 //!
@@ -92,6 +96,40 @@ fn intents_request(
         .header("Authorization", format!("Bearer {token}"))
         .body(Body::from(
             json!({ "owner_kind": owner_kind, "owner_id": owner_id, "items": items }).to_string(),
+        ))
+        .unwrap()
+}
+
+/// `POST /files/objects/confirm` 的请求体（字段名与 `ConfirmFileIn` 逐字对齐）。
+#[allow(clippy::too_many_arguments)]
+fn confirm_request(
+    token: &str,
+    owner_kind: &str,
+    owner_id: &str,
+    kind: &str,
+    object_key: &str,
+    sha: &str,
+    filename: &str,
+    size: i64,
+    content_type: &str,
+) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/files/objects/confirm")
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::from(
+            json!({
+                "owner_kind": owner_kind,
+                "owner_id": owner_id,
+                "kind": kind,
+                "object_key": object_key,
+                "content_sha256": sha,
+                "original_filename": filename,
+                "file_size": size.to_string(),
+                "content_type": content_type,
+            })
+            .to_string(),
         ))
         .unwrap()
 }
@@ -869,4 +907,187 @@ async fn seed_helper_is_wired() {
         format!("local://{key}"),
         "默认 state 用 NoopCos（占位 URL 含 key）；app_with_mock_cos 才是 MockCos"
     );
+}
+
+// ===========================================================================
+//  8. content_type 与扩展名不匹配：两条写入口必须给**同一个**码
+// ===========================================================================
+
+/// ⚠️ **「声明的 MIME 与扩展名对不上」在两条写入口都是 21102 / HTTP 400**。
+///
+/// upload-intents 自判返 21102；confirm 原先走 `validate::check_content_type` 返
+/// `AppError::validation` = 40001 / HTTP 422 —— 同一份文件、同一个判据、两个码两个
+/// HTTP 状态，前端要写两套特判。现在统一为 21102。
+#[tokio::test]
+async fn confirm_content_type_mismatch_is_21102_like_upload_intents() {
+    let (pool, fx) = setup().await;
+    let part_id = insert_part(&pool, "intents-ct").await;
+    let (app, cos) = app_with_mock_cos(&pool).await;
+    let token = login_token(&app, &fx.manager_username, PartFixture::PASSWORD).await;
+
+    // 前置：把字节真 PUT 到正式 CAS key 上 ⇒ confirm 的失败点只可能是 MIME 校验
+    let bytes = b"%PDF-1.5\nct mismatch\n%%EOF".to_vec();
+    let sha = sha_of(&bytes);
+    let object_key = hsh_erp_rust::util::cos_key::build_cas_key("uploads", &sha, "ct.pdf");
+    cos.put_object(&object_key, bytes.clone(), "application/pdf")
+        .await
+        .expect("模拟前端 PUT");
+
+    // upload-intents 侧：同一个不匹配的 MIME ⇒ 21102 / 400
+    let (status, envelope) = send(
+        app.clone(),
+        intents_request(
+            &token,
+            "PART",
+            &part_id.to_string(),
+            vec![item(
+                "ct",
+                "DRAWING",
+                "ct.pdf",
+                "application/octet-stream",
+                bytes.len() as i64,
+                &sha,
+            )],
+        ),
+    )
+    .await;
+    assert_eq!(status.as_u16(), 400, "upload-intents 侧：{envelope}");
+    assert_eq!(envelope["code"], 21102, "upload-intents 侧：{envelope}");
+
+    // confirm 侧：同一个不匹配的 MIME ⇒ 必须**同样**是 21102 / 400
+    let (status, envelope) = send(
+        app.clone(),
+        confirm_request(
+            &token,
+            "PART",
+            &part_id.to_string(),
+            "DRAWING",
+            &object_key,
+            &sha,
+            "ct.pdf",
+            bytes.len() as i64,
+            "application/octet-stream",
+        ),
+    )
+    .await;
+    assert_eq!(
+        status.as_u16(),
+        400,
+        "confirm 侧必须与 upload-intents 同码同状态（历史差异：422 / 40001）：{envelope}"
+    );
+    assert_eq!(
+        envelope["code"], 21102,
+        "confirm 侧必须与 upload-intents 同码：{envelope}"
+    );
+
+    // 零副作用：被拒的 confirm 不该留下任何行
+    let rows: Vec<(i64,)> = sqlx::query_as("SELECT id FROM t_part_file WHERE part_id = $1")
+        .bind(part_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(rows.is_empty(), "被拒的 confirm 不该落行：{rows:?}");
+}
+
+// ===========================================================================
+//  9. CAD_2D（DWG / DXF）整条链路
+// ===========================================================================
+
+/// ★ **CAD 源文件（DWG / DXF）从「无处可上传」到能走完整条链路**。
+///
+/// `CAD_2D` 早已在 DB CHECK / `uk_t_part_file_single` / 读侧 kind 白名单 / 软删分派
+/// 里，前端零件详情也有专门的 CAD tab（`:accept='.dwg,.dxf'`）；只有**写侧两张
+/// policy 表**漏了它 ⇒ 那两条入口都传不上去。本用例把三步（签发 → PUT → 登记）
+/// 全走一遍，钉住 `file_type='CAD_2D'` 与 MIME 兜底（dwg/dxf 无官方 MIME ⇒ 浏览器
+/// 发 `application/octet-stream` 必须被收）。
+#[tokio::test]
+async fn cad_2d_dwg_goes_through_the_whole_chain() {
+    let (pool, fx) = setup().await;
+    let part_id = insert_part(&pool, "intents-cad").await;
+    let (app, cos) = app_with_mock_cos(&pool).await;
+    let token = login_token(&app, &fx.manager_username, PartFixture::PASSWORD).await;
+
+    let bytes = b"AutoCAD DWG placeholder".to_vec();
+    let sha = sha_of(&bytes);
+
+    // ① 签发：CAD_2D + .dwg + octet-stream 必须放行
+    let (status, envelope) = send(
+        app.clone(),
+        intents_request(
+            &token,
+            "PART",
+            &part_id.to_string(),
+            vec![item(
+                "cad",
+                "CAD_2D",
+                "bracket.dwg",
+                "application/octet-stream",
+                bytes.len() as i64,
+                &sha,
+            )],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "CAD_2D 签发应 200：{envelope}");
+    let object_key = envelope["data"]["items"][0]["object_key"]
+        .as_str()
+        .expect("CAD_2D 应签出 object_key")
+        .to_string();
+
+    // ② 直传（替身）
+    cos.put_object(&object_key, bytes.clone(), "application/octet-stream")
+        .await
+        .expect("模拟前端 PUT");
+
+    // ③ 登记：行落库、file_type 由扩展名推导
+    let (status, envelope) = send(
+        app.clone(),
+        confirm_request(
+            &token,
+            "PART",
+            &part_id.to_string(),
+            "CAD_2D",
+            &object_key,
+            &sha,
+            "bracket.dwg",
+            bytes.len() as i64,
+            "application/octet-stream",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "CAD_2D 登记应 200：{envelope}");
+    assert_eq!(envelope["data"]["kind"], "CAD_2D");
+    assert_eq!(
+        envelope["data"]["file_type"], "CAD_2D",
+        "dwg ⇒ file_type='CAD_2D'（与 kind 同名）"
+    );
+
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT kind FROM t_part_file WHERE part_id = $1 AND deleted_at IS NULL")
+            .bind(part_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows, vec![("CAD_2D".to_string(),)], "CAD_2D 行应落库");
+
+    // 反向：CAD_2D 只收 dwg / dxf，pdf 一律 21102
+    let (status, envelope) = send(
+        app.clone(),
+        intents_request(
+            &token,
+            "PART",
+            &part_id.to_string(),
+            vec![item(
+                "cad-pdf",
+                "CAD_2D",
+                "bracket.pdf",
+                "application/pdf",
+                10,
+                &"c".repeat(64),
+            )],
+        ),
+    )
+    .await;
+    assert_eq!(status.as_u16(), 400, "CAD_2D 不收 pdf：{envelope}");
+    assert_eq!(envelope["code"], 21102);
 }

@@ -4,17 +4,22 @@
 //! 前端的模板管理页面增加上传模板和查看已有模板的功能。且可以绑定一级客户。
 //! 送货单打印时自动选择已绑定的模板」。
 //!
-//! ## 端点（5 条，挂在 `/api/v2/print-templates`，由 [`router`] 桥接）
+//! ## 端点（**4 条**，挂在 `/api/v2/print-templates`，由 [`router`] 桥接）
 //!
 //! | # | Method | Path | 守卫 | 说明 |
 //! |---|---|---|---|---|
-//! | 1 | `POST` | `/` | `require_role(Manager)` | multipart 上传并**替换**该 L1 的模板；成功返 **201** |
-//! | 2 | `GET` | `/` | `require_role(Manager)` | 列表，可选 `?customer_id=` + `limit` / `offset` |
-//! | 3 | `GET` | `/resolve` | 权限点 `delivery_note.print` | `?customer_id=<L1>` → 模板；未绑定 ⇒ `21109` |
-//! | 4 | `GET` | `/{template_id}/content` | 权限点 `delivery_note.print` | 后端代理 xlsx 字节（裸字节，非 `R<T>`） |
-//! | 5 | `POST` | `/{template_id}/delete` | `require_role(Manager)` | 软删，body **必含 `version`**（OCC）⇒ 40901 |
+//! | 1 | `GET` | `/` | `require_role(Manager)` | 列表，可选 `?customer_id=` + `limit` / `offset` |
+//! | 2 | `GET` | `/resolve` | 权限点 `delivery_note.print` | `?customer_id=<L1>` → 模板；未绑定 ⇒ `21109` |
+//! | 3 | `GET` | `/{template_id}/content` | 权限点 `delivery_note.print` | 后端代理 xlsx 字节（裸字节，非 `R<T>`） |
+//! | 4 | `POST` | `/{template_id}/delete` | `require_role(Manager)` | 软删，body **必含 `version`**（OCC）⇒ 40901 |
 //!
-//! **权威路由清单是 `handler::ROUTES`（5 条）**，lib 单测
+//! ⚠️ **本域没有写端点**：模板的写入走 `files` 域的统一收文件链路
+//! （`POST /files/objects/upload-intents`（`owner_kind=CUSTOMER` +
+//! `kind=DELIVERY_TEMPLATE`）→ 前端直传 COS → `POST /files/objects/confirm`），
+//! 「一个 L1 至多一份活跃模板」的替换语义由 confirm 事务内的「软删旧行 + INSERT」
+//! 承接。完整流程见 `docs/api/print_template.md` §1.0。
+//!
+//! **权威路由清单是 `handler::ROUTES`（4 条）**，lib 单测
 //! `handler::tests::routes_declared_in_router` 用
 //! `crate::modules::files::route_guard::routes_in_router_source` 逐条比对 `router()`
 //! 源码（复用该共用比对器，**不**复制一份）。
@@ -43,13 +48,13 @@
 //! | 如果新建模板表 | 本域的实际做法 |
 //! |---|---|
 //! | 要多一套 `id / version / created_* / updated_* / deleted_at` 列 | 全部复用 `t_part_file` 既有列（`version` 直接当 OCC 锚） |
-//! | 模板字节仍得落 COS、仍得算 CAS key、仍得算 sha256、仍受 `COS_MAX_FILE_SIZE` 约束 | 一行不加（复用 `util::cos_key::build_cas_key` + `PartFileService::upload_file_for_owner`） |
+//! | 模板字节仍得落 COS、仍得算 CAS key、仍受 `COS_MAX_FILE_SIZE` 约束 | 一行不加（复用 `util::cos_key::build_cas_key` + `files` 域两条写入口） |
 //! | 「一个 L1 至多一份活跃模板」要另建唯一索引 | 复用 `uk_t_part_file_single`（2026-10-16 迁移把 `DELIVERY_TEMPLATE` 加进它的 kind 白名单） |
 //! | 删除要写两张表 + 处理两套软删语义 | 只有一张表的一次软删 |
 //!
 //! 代价是**读侧必须始终带 `kind` 谓词**（`t_part_file.part_id` 一个列空间现承载
 //! 三种 owner：零件 / 装配件 / 一级客户），登记在 `docs/api/print_template.md`
-//! §8.3 与 `files/part_file/mod.rs` 的「已知偏差登记」第 10 条。本域 5 条端点
+//! §8.3 与 `files/part_file/mod.rs` 的「已知偏差登记」第 10 条。本域 4 条端点
 //! **全部**按 `(part_id, kind='DELIVERY_TEMPLATE')` 取，**从不**依赖通用列表端点。
 //!
 //! ## 绑定粒度：只绑一级客户（`t_customer.parent_id IS NULL`）
@@ -58,18 +63,16 @@
 //! 数与顺序是**按客户**的：L2 与其父 L1 往往是同一套抬头，绑到 L2 会立刻出现
 //! 「同一个客户名下两个 L2 模板打架」。
 //!
-//! ⚠️ **L1-only 有**两道**强制点、错误码不同**：
-//! - 本域这一侧是 `service::l1_customer_name`（前置、零外部 IO）⇒ **20104**，
-//!   把「不存在 / 已软删 / 不是一级」三种情形**刻意不区分**（前端拿到的都是
-//!   「你选的这个客户 id 不能绑模板」，回显原 id 让它自己选，而不是让前端去猜是
-//!   「不存在」还是「不是一级」）；
-//! - `files` 域那侧是 `PartFileRepoTrait::customer_owner_exists` ⇒ **21105**
-//!   （HTTP 404），**2026-10-16 review 第 2 轮 MAJOR-A 把 `parent_id IS NULL`
-//!   下沉进了它**：管的是「有人绕过本域 handler、直调共用上传原语
-//!   `upload_file_for_owner`」那条路径（如 `POST /files/objects`，其
-//!   `owner_kind` / `owner_id` 全由 client 给）。
+//! ⚠️ **L1-only 只有**一道**强制点，错误码 21105**：
+//! `PartFileRepoTrait::customer_owner_exists`（谓词含 `AND parent_id IS NULL`），
+//! 它是 `files` 域两条写入口**共用**的闸门 —— 三种失败情形（不存在 / 已软删 /
+//! 不是一级客户）**刻意不区分**，message 里带原始 id 让前端改选。
+//! ⇒ 前端看到 21105（HTTP 404）的含义是「你给的那个 id 不能当模板的 owner」，
+//! 处理方式是**改选客户**，不要在 21105 上做「重试」或「换个入口」。
 //!
-//! ⇒ **两道都要留**，缺任一条都不成立。正常路径永远先被本域这一侧拦下。
+//! ⚠️ **别因为「files 域不该知道客户分两级」把谓词去掉** —— files 域判的是
+//! `parent_id IS NULL` 这个**列取值**，与它判 `t_part.assembly_id IS NULL`
+//! （散件）同形。完整取舍见 `docs/api/print_template.md` §4.1。
 //!
 //! ## 守卫：两条读端点**绝不能** MANAGER-only
 //!
@@ -83,9 +86,9 @@
 //!
 //! ## 本域**刻意不装** `assert_no_foreign_domain` 域隔离护栏
 //!
-//! 与 `prod::scan` / `wx` 同款「**转发型**域」：本域的字节读写**全部**经
-//! `files::part_file`（`upload_file_for_owner` / `get_file_row` /
-//! `get_file_content_for_row` / `soft_delete_file` / `list_with_filters`），
+//! 与 `prod::scan` / `wx` 同款「**转发型**域」：本域的 `t_part_file` 读写**全部**经
+//! `files::part_file`（`get_file_row` / `get_file_content_for_row` /
+//! `soft_delete_file` / `list_with_filters`；写入经该域的两条写入口），
 //! 这是设计（复用 `t_part_file`，见上表）而不是越界。
 //! 硬装这道护栏只会逼出「把 files 域的写法复制一份到本域」这种更糟的结果。
 //! 本域对 `t_customer` 的三处读（`parent_id IS NULL` 强制点**顺带取名**、`resolve`
@@ -106,12 +109,12 @@
 //! `mod.rs` 只放 `pub fn router()`，路由表在 `handler::router()`。
 //! **不建 `repo.rs` / `model.rs`** —— 本域没有自有表：
 //! - `t_part_file` 的读写走 `files::part_file` 的既有 `PartFileRepoTrait`
-//!   （`get_by_part_kind` / `soft_delete_active_by_part_kind` / `get_by_id` /
-//!   `soft_delete_file` / `list_with_filters` 都是既有方法，逐字复用）；
-//! - `t_customer` 的三处只读查询直接写在 `service.rs`（运行时 `sqlx::query_scalar` /
+//!   （`get_by_part_kind` / `get_by_id` / `soft_delete_file` / `list_with_filters`
+//!   都是既有方法，逐字复用）；
+//! - `t_customer` 的只读查询直接写在 `service.rs`（运行时 `sqlx::query_scalar` /
 //!   `sqlx::query_as`，**不进 `query!` 宏**、不需要 `.sqlx/` 缓存）。
 //!
-//! 范本：`files::part_file::cnc` 子模块（「复用 `t_part_file`、无 repo 层」）。
+//! 范本：本域自己就是「复用 `t_part_file`、无 repo 层」的样板。
 //!
 //! ## 完整契约
 //!

@@ -1,17 +1,16 @@
 //! `files::part_file` 子模块 DTO（2026-09-16 M2-B → 2026-09-18 上传会话拆分
-//! + 2026-09-22 PR4 拆分 + 2026-10-13 收编进 files 域）
+//! + 2026-09-22 PR4 拆分 + 2026-10-13 收编进 files 域 + 2026-10-15 上传链路统一）
 //!
 //! 对应 Python myERP/schema/part_file.py。
 //!
 //! ## DTO/VO 边界（2026-09-22 PR4 重构）
 //! 本文件仅含入参（Deserialize）；出参结构（`PartFileOut` / `PartFileWithUrlOut` /
-//! `PartFileListOut`）在 `super::vo`。
+//! `PartFileListOut` / `UploadIntentsOut`）在 `super::vo`。
 //!
-//! 2026-10-13：`DeletePartFileRequest` 自 `parent::handler` 移入本文件（与
-//! `ConfirmFileIn` 做邻居）。原因是它原先被 `cnc` 子模块的 handler import ——
-//! 全仓唯一一处 handler → handler 跨模块 import；子模块化之后那条依赖线读起来像
-//! 「cnc 依赖 part_file 的 handler 层」，而 DTO 归 dto.rs 才是本仓既有约定
-//! （见上文 DTO/VO 边界）。
+//! ## 入参分两组（2026-10-15 起）
+//! - **两条写入口**：[`UploadIntentsIn`]（批量签发）+ [`ConfirmFileIn`]（单件登记）。
+//!   本域不再有任何 multipart 端点 ⇒ **没有**「`data` 文本字段」这类形态。
+//! - **读端点**：[`PartFileListQuery`]（列表 query）+ [`DeletePartFileRequest`]。
 
 use serde::Deserialize;
 
@@ -25,22 +24,6 @@ pub struct DeletePartFileRequest {
     pub version: i32,
 }
 
-/// `POST /api/v2/files/objects` multipart 的 `data` 文本字段（JSON 序列化本结构）。
-///
-/// 2026-10-13 PR1b **复活**：本结构在 PR1a 随 `POST /api/v2/part-files/` 端点下线
-/// 一并删除，本轮四合一上传端点（`POST /files/objects`）把它原样接回来 —— 复用旧
-/// 契约，不是新设计。四个旧入口（`upload-drawing` / `upload-3d-model` /
-/// `assemblies/{id}/files` / `POST /part-files/`）现在共用这一个形态。
-#[derive(Debug, Clone, Deserialize)]
-pub struct UploadFileData {
-    pub owner_kind: String, // PART / ASSEMBLY
-    /// 雪花 id 的**字符串**形式（`shared::types` 的 serde helper 约定：i64 主键
-    /// 一律以 string 出入参，防 JS 精度截断）。handler 侧 parse 成 i64 后交给
-    /// service。
-    pub owner_id: String,
-    pub kind: String, // DRAWING / 3D_MODEL / ASSEMBLY_MASTER / CAD_2D / …
-}
-
 // ===== 2026-10-15 上传链路统一：upload-intents（签发预签 PUT URL） =====
 //
 // 全仓唯一的收文件链路：业务提交成功 → `POST /files/objects/upload-intents` 拿
@@ -50,6 +33,12 @@ pub struct UploadFileData {
 ///
 /// `owner_kind` / `owner_id` 一次声明、本组 `items` 共用 —— 前端一次选中多个文件
 /// 只发一个请求，不必逐文件往返。
+///
+/// ⚠️ **`owner_id` / `items[].file_size` 必须是 JSON 字符串**：两者都走
+/// [`deserialize_i64`]（`String::deserialize(d)?.parse::<i64>()`），**裸 number
+/// 反序列化失败** ⇒ 在 axum `Json` 提取器层就炸 ⇒ **HTTP 422 纯文本**，不是
+/// `R<T>` 信封（前端 `envelopeResponseInterceptor` 拿不到 `{code,message}`）。
+/// 本仓 i64 一律 string 出入参（防 JS 精度截断），入参侧同款。
 #[derive(Debug, Clone, Deserialize)]
 pub struct UploadIntentsIn {
     /// `PART` / `ASSEMBLY` / `CUSTOMER`
@@ -72,6 +61,8 @@ pub struct UploadIntentItemIn {
     pub kind: String,
     pub original_filename: String,
     pub content_type: String,
+    /// ⚠️ 必须是 JSON **字符串**（见 [`UploadIntentsIn`] 的 doc：裸 number ⇒
+    /// 提取器层 422 纯文本）。
     #[serde(deserialize_with = "deserialize_i64")]
     pub file_size: i64,
     /// 64 位小写 hex
@@ -115,6 +106,8 @@ pub struct ConfirmFileIn {
     pub object_key: String,
     pub content_sha256: String,
     pub original_filename: String,
+    /// ⚠️ 必须是 JSON **字符串**（与 `UploadIntentItemIn::file_size` 同款
+    /// `deserialize_i64` 约定；裸 number ⇒ 提取器层 422 纯文本）。
     #[serde(deserialize_with = "deserialize_i64")]
     pub file_size: i64,
     pub content_type: String,
@@ -123,9 +116,14 @@ pub struct ConfirmFileIn {
     /// 边界（`.tar.gz`）上与 client 不一致。
     #[serde(default)]
     pub ext: Option<String>,
-    /// 2026-10-15 新增：CNC 配对目标（另一条已登记的 `t_part_file` 行 id，字符串
-    /// 形式的雪花 id）。给了就把本行与那一行**双向**互写 `paired_file_id`
-    /// （G_CODE ↔ SETUP_SHEET）；不给则不配对。
+    /// CNC 配对目标（另一条已登记的 `t_part_file` 行 id，字符串形式的雪花 id）。
+    /// 给了就把本行与那一行**双向**互写 `paired_file_id`（G_CODE ↔ SETUP_SHEET）；
+    /// 不给则不配对。
+    ///
+    /// ⚠️ **配对只在同一个 owner 内成立**：`bind_uploaded_file` 会比目标行的
+    /// `part_id` 与本请求的 `owner_id`，不同 ⇒ 20104（kind 不互补也是 20104，
+    /// 目标行不存在 ⇒ 21101）。配对是**覆写**语义（不清理对面原有指向），所以
+    /// 这道校验是「前端按 `paired_file_id` 分组不错料」的唯一保证。
     #[serde(default)]
     pub pair_with_file_id: Option<String>,
 }
@@ -150,17 +148,19 @@ pub struct PartFileListQuery {
 
 /// 入参字段校验（直传 COS 链路专用）。
 ///
-/// 任何字段不合法 → `AppError::Validation(...)`（错误码 40001，HTTP 422）；
-/// 不引入业务码，避免与既有 `BIZ_PART_FILE_BAD_TYPE` 21102（multipart 端点）
-/// 在语义上重叠——此处校验失败是「客户端没按规范填字段」，与 kind 不匹配
-/// 不是一回事。
+/// 字段形状不合法（sha 格式 / filename / size 上下限 / 未知 kind）→
+/// `AppError::Validation(...)`（错误码 **40001**、HTTP 422）。
+///
+/// ⚠️ **例外是 content_type**：它不匹配扩展名时返 **21102**（HTTP 400），不是
+/// 40001 —— [`check_content_type`] 的 doc 写了为什么：同一个判据在
+/// `upload-intents` 侧也是 21102，两条写入口必须逐字一致。
 ///
 /// 校验范围：
 /// - `content_sha256`：64 hex chars（regex `^[0-9a-f]{64}$`）
 /// - `filename`：非空、长度 ≤ 255
 /// - `file_size`：> 0 且 ≤ `max_file_size`（默认 300MB）
 /// - `kind`：必须出现在 `policy::allowed_exts`（非空即合法）
-/// - `content_type`：与扩展名匹配（`policy::expected_content_types_for_ext`）
+/// - `content_type`：与扩展名匹配（`policy::expected_content_types_for_ext`）→ 21102
 pub mod validate {
     use super::*;
 
@@ -222,17 +222,31 @@ pub mod validate {
     }
 
     /// content_type 与 filename 扩展名匹配。
+    ///
+    /// ⚠️ **错误码是 21102（HTTP 400），刻意与 `upload-intents` 侧逐字一致**：
+    /// 「声明的 MIME 与扩展名对不上」是**同一个**判据，两条写入口给出同一个码，
+    /// 前端才能对「同一份文件、两个入口、两个错误码」这件事不做特判。
+    /// 缺扩展名同样归 21102（upload-intents 侧的 `ext_of` 失败也是 21102）。
+    /// ⚠️ 别把它改回 40001：那会让「绕过 upload-intents 直打 confirm」的前端
+    /// 在**完全相同**的输入上拿到另一个码 + 另一个 HTTP 状态。
     pub fn check_content_type(content_type: &str, filename: &str) -> Result<(), AppError> {
-        let ext = policy::ext_of(filename)
-            .ok_or_else(|| AppError::validation(format!("filename {filename:?} 缺少扩展名")))?;
+        let ext = policy::ext_of(filename).ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_PART_FILE_BAD_TYPE,
+                format!("filename {filename:?} 缺少扩展名"),
+            )
+        })?;
         let expected = policy::expected_content_types_for_ext(&ext);
         if !expected
             .iter()
             .any(|c| c.eq_ignore_ascii_case(content_type))
         {
-            return Err(AppError::validation(format!(
-                "content_type {content_type:?} 与扩展名 {ext:?} 不匹配（期望 {expected:?}）"
-            )));
+            return Err(AppError::biz(
+                code::BIZ_PART_FILE_BAD_TYPE,
+                format!(
+                    "content_type {content_type:?} 与扩展名 {ext:?} 不匹配（期望 {expected:?}）"
+                ),
+            ));
         }
         Ok(())
     }

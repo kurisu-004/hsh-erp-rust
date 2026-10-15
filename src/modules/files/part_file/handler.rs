@@ -1,104 +1,93 @@
 //! `files::part_file` 子模块 HTTP handler（2026-09-14 Phase 3 + 2026-09-15 takeover-fill
-//! + followup-cleanup + 2026-09-16 M2-B 业务层 + 2026-09-18 upload-intents 删除
-//! + 2026-09-22 对齐 iam 范式 + 2026-10-13 收编进 files 域）
+//! + followup-cleanup + 2026-09-16 M2-B 业务层 + 2026-09-22 对齐 iam 范式
+//! + 2026-10-13 收编进 files 域 + 2026-10-15 上传链路统一）
 //!
 //! 对应 Python myERP/api/v1/part_file.py。
 //!
 //! ## 端点（7 条，挂在 `/api/v2/files/objects`，由 `files::handler::router()` 的
 //! `.nest("/objects", …)` 桥接）
-//!   - `POST /`                    —— 单文件上传（multipart：`data` JSON + `file` 二进制）
-//!   - `GET  /`                    —— 列表查询 + 分页（`owner_kind` / `owner_id` / `kind` 过滤）
-//!   - `POST /confirm`             —— STS 直传回执：把 tmp 对象绑定到 owner
-//!   - `GET  /{file_id}/url`       —— 单条详情 + COS 预签下载 URL
-//!   - `GET  /{file_id}/content`   —— 后端代理文件内容
-//!   - `POST /{file_id}/delete`    —— 软删 + COS 异步清理
-//!   - `GET  /{file_id}/preview`   —— COS CI 图纸预览（**2026-10-13 PR2 新增**，
-//!     逻辑全在 `preview` 子模块；本文件只做路由 + 一次取行）
+//!   - `POST /upload-intents`        —— **批量**签发预签 PUT URL（纯读，无字节）
+//!   - `POST /confirm`               —— 直传回执登记：软删旧活跃行 + INSERT +（可选）CNC 配对
+//!   - `GET  /`                      —— 列表查询 + 分页（`owner_kind` / `owner_id` / `kind` 过滤）
+//!   - `GET  /{file_id}/url`         —— 单条详情 + COS 预签下载 URL
+//!   - `GET  /{file_id}/content`     —— 后端代理文件内容
+//!   - `POST /{file_id}/delete`      —— 软删 + COS 异步清理
+//!   - `GET  /{file_id}/preview`     —— COS CI 图纸预览（逻辑全在 `preview` 子模块，
+//!     本文件只做路由 + 一次取行 + `?size=view|thumb|full` 解析）
 //!
-//! ⚠️ 列表 / 上传端点在 wire 上是 `POST|GET /api/v2/files/objects`（**无尾斜杠**）：
-//! axum 0.8 的 `nest` 把内层 `.route("/", …)` 注册成 `<prefix>` 本身。迁移前的
-//! `GET /api/v2/part-files/` 同样是 404（行为未变），详见 `../../mod.rs` 模块 doc
-//! 的尾斜杠一节。
+//! ⚠️ 列表 / 两条写入口在 wire 上是 `POST|GET /api/v2/files/objects` 与
+//! `/api/v2/files/objects/upload-intents`（**无尾斜杠**）：axum 0.8 的 `nest` 把
+//! 内层 `.route("/", …)` 注册成 `<prefix>` 本身。旧前缀 `/api/v2/part-files/*`
+//! 一律 404（无 alias），详见 `../../mod.rs` 模块 doc 的尾斜杠一节。
 //!
-//! 2026-10-13：**自独立 `part_file` 域收编进 `files` 域**，URL 由
-//! `/api/v2/part-files/*` 硬切到 `/api/v2/files/objects/*`（**无 alias，旧路径 404**）。
+//! ## ⚠️ 本域**没有任何收字节的端点**
 //!
-//! ## 2026-10-13 PR1b：写路径搬进本子模块（上传四合一）
+//! 收文件链路恒为「签发 URL → 前端直传 COS → 登记」三步：
 //!
-//! 本子模块此前只提供**读 + 软删**，上传与 confirm 分散在 part / assembly 两个域。
-//! 本轮把**五个**旧入口收敛成**两个**：
+//! ```text
+//! ① POST /objects/upload-intents  → grant_upload_intents（纯读 + 逐项签 URL）
+//! ② 前端 XHR PUT 直传 COS（字节不过 rust 进程）
+//! ③ POST /objects/confirm        → bind_uploaded_file（head 校验 + 软删 + INSERT）
+//! ```
 //!
-//! | 旧 URL | 新 URL | 处置 |
+//! 已下线的收字节入口（**无 alias、旧路径 404**）：
+//!
+//! | 旧 URL | 处置 |
+//! |---|---|
+//! | `POST /api/v2/files/objects`（multipart 代理） | 删 —— 由上面三步承接 |
+//! | `POST /api/v2/files/sts-tmp-keys`（python STS 转发） | 删 —— 预签 PUT 改在本仓签发 |
+//! | `POST /api/v2/files/cnc/pairs`（一次收两文件做配对） | 删 —— 配对改由 confirm 的 `pair_with_file_id` 承接 |
+//! | `POST /api/v2/parts/{part_id}/upload-drawing` / `upload-3d-model` | 删 —— 2026-10-13 并入通用上传原语 |
+//! | `POST /api/v2/assemblies/{id}/files` | 删 —— 同上 |
+//! | `POST /api/v2/part-files/` | 删 —— 同上 |
+//! | `POST /api/v2/parts/{part_id}/files/confirm` | 硬切到 `POST /objects/confirm` |
+//!
+//! 2026-10-13 同批下线的「零件维度嵌套列表」入口（`part_nested_router()` 一并删除，
+//! 已核实零前端调用方）：`/part-files/parts/{id}/files`（`GET`）、
+//! `cad-files`（`POST`）、`cnc-programs`（`POST`+`GET`）、`setup-sheets`（`POST`+`GET`）、
+//! `cnc-pair`（`POST`）。连带删除的死代码：`read_part_file_multipart`、`PartFilesQuery`。
+//!
+//! ### ⚠️ matchit 注册顺序：**无冲突**
+//!
+//! | 路由 | 段数（相对 nest 根） | 与其它路由的关系 |
 //! |---|---|---|
-//! | `POST /api/v2/parts/{part_id}/upload-drawing` | `POST /api/v2/files/objects` | 四合一 |
-//! | `POST /api/v2/parts/{part_id}/upload-3d-model` | `POST /api/v2/files/objects` | 四合一 |
-//! | `POST /api/v2/assemblies/{assembly_id}/files` | `POST /api/v2/files/objects` | 四合一 |
-//! | `POST /api/v2/part-files/`（PR1a 下线，本轮复活） | `POST /api/v2/files/objects` | 四合一 |
-//! | `POST /api/v2/parts/{part_id}/files/confirm` | `POST /api/v2/files/objects/confirm` | 搬家 + body 加 `owner_kind` / `owner_id` |
-//! | `GET /api/v2/assemblies/{assembly_id}/files` | — | **删**（0 调用方，与 `GET /files/objects?owner_kind=ASSEMBLY&owner_id=X` 等价） |
+//! | `/` | 0 | 段数不同 |
+//! | `/upload-intents` | 1 | 段数不同 |
+//! | `/confirm` | 1 | 段数不同（与上一条同为静态段、互不竞争） |
+//! | `/{file_id}/url` · `/{file_id}/content` · `/{file_id}/delete` · `/{file_id}/preview` | 2 | 同段数、**同为 `{file_id}` 捕获段 + 第 2 段静态**；matchit 同层静态段优先，逐一不争 |
 //!
-//! ### ⚠️ `POST /files/objects` 的契约是**复用**旧 `POST /part-files/`，不是新设计
+//! ⚠️ **别只靠读源码判断**（CLAUDE.md 路由声明规约第 9 条的老踩坑就是「同段数静态段
+//! 被 catch-all 吞成 400」）：实测钉死在
+//! `tests/files/part_file.rs::upload_intents_route_is_not_swallowed_by_old_catch_all`
+//! 与 `tests/files/preview.rs::preview_route_is_not_swallowed_by_sibling_catch_alls`。
 //!
-//! multipart 形态逐字沿用：`data` 文本字段（`UploadFileData` JSON：
-//! `{ owner_kind, owner_id, kind }`）+ `file` 二进制字段。三个 part / assembly 旧端点
-//! 只是把 `owner_kind` / `owner_id` / `kind` 从 path 段 + 硬编码搬进了这个 JSON。
+//! ## 事务边界
 //!
-//! ### ⚠️ 响应形状变更（assembly 上传）
-//!
-//! 旧 `POST /assemblies/{id}/files` 回 `Vec<AssemblyFileRef>`
-//! （`{id, original_filename, page_count}`），本端点回 `PartFileOut`（18 字段）。
-//! `page_count` 键消失，但上传路径本就硬编码 `page_count: None`
-//! （`assembly/service/lifecycle.rs` 的上传分支），**无信息损失**。
-//! 另一处行为变更见 `service.rs::upload_file_for_owner` 的去重语义对照表。
-//!
-//! ### ⚠️ matchit 注册顺序
-//!
-//! `/confirm` 是 3 段（`files/objects/confirm`），与 `/{file_id}/url` 等 4 段 catch-all
-//! 段数不同，**天然无冲突**；`/`（0 段内的 root）同样不与之竞争。
-//!
-//! ## 2026-10-13 同批下线的 7 条端点（移除记录，防后人重建）
-//!
-//! 原「零件维度嵌套」第二入口 `/part-files/parts/{part_id}/<file>...` 整段下线
-//! （`part_nested_router()` 一并删除），已核实零前端调用方：
-//!
-//! | 旧 URL | 方法 | 处置 |
-//! |---|---|---|
-//! | `/part-files/parts/{part_id}/files` | `GET` | 删（等价于 `GET /files/objects?owner_kind=PART&owner_id=…`） |
-//! | `/part-files/parts/{part_id}/cad-files` | `POST` | 删（等价于 `POST /files/objects` + `kind=CAD_2D`） |
-//! | `/part-files/parts/{part_id}/cnc-programs` | `POST` + `GET` | 删（G_CODE 走 `POST /files/cnc/pairs`） |
-//! | `/part-files/parts/{part_id}/setup-sheets` | `POST` + `GET` | 删（同上） |
-//! | `/part-files/parts/{part_id}/cnc-pair` | `POST` | 删（与 `POST /files/cnc/pairs` 重复） |
-//!
-//! 连带删除的死代码：`read_part_file_multipart`（private helper，4 个调用方全删）、
-//! `PartFilesQuery`。
-//!
-//! ⚠️ 上表**没有** `POST /part-files/`：它在 PR1b 以 `POST /files/objects` 的形态
-//! **复活并通用化**了，别按本表把它当已删端点。
-//! （2026-10-13 review 第 1 轮 NIT-9 订正：原文标题写「8 条」是因为把复活的
-//! `POST /part-files/` 也数了进去；实际下线的是上表 **7** 条。原文那句
-//! 「`POST /part-files/` 不在本表」也自相矛盾，已改成「上表**没有**」。）
-//!
-//! ## 事务边界（2026-09-22 重构对齐 iam 范式，2026-10-13 收编时不变）
-//! handler 负责 `pool.begin()` / `tx.commit()` —— service 不知事务：
-//! - ① **写 + post-commit 副作用**（soft_delete_part_file）：`pool.begin()` →
-//!   `state.part_file_service.soft_delete_file(&mut tx, ...)` → 拿到 object_key 后
-//!   `tx.commit()` → handler `tokio::spawn(cos.delete_object(...))`（review A2 约定：
-//!   commit 在前，spawn 在后）。
-//! - ② **读端点**（list_part_files / get_part_file_url / get_part_file_content）：
+//! - ① **写 + post-commit 副作用**（`soft_delete_part_file`）：`pool.begin()` →
+//!   `soft_delete_file(&mut tx, ...)` → 拿到 `object_key` 后 `tx.commit()` → handler
+//!   `tokio::spawn(cos.delete_object(...))`（2026-09-15 review A2 约定：commit 在前，
+//!   spawn 在后）。
+//! - ② **读端点**（`list_part_files` / `get_part_file_url` / `get_part_file_content`）：
 //!   `pool.begin()` → service 跑查询 → `tx.commit()`。
-//! - ③ **写端点**（upload_part_file）：`pool.begin()` → service → `tx.commit()`。
-//! - ④ **confirm 端点**（confirm_file_object）：**handler 不开 tx** —— service
-//!   `bind_uploaded_file` 自管事务（head/copy 是外部 IO，不该包在事务里），
-//!   handler 只在 service 返回**已 commit** 之后 spawn 兜底清理 tmp 对象。
+//! - ③ **`grant_upload_intents`**：`pool.begin()` → service（纯读 + 逐项本地签名）
+//!   → `tx.commit()`。⚠️ 批量上限 200（`service::UPLOAD_INTENTS_MAX_ITEMS`）⇒
+//!   签名最多 200 次、DB 往返最多 200 次；签名是本地计算不发网。
+//! - ④ **`confirm_file_object` / `get_part_file_preview`**：**handler 不开 tx** ——
+//!   前者 service `bind_uploaded_file` 自管事务（`head_object` 是外部 IO，不该包在
+//!   事务里），后者是预览状态机要跨多次 python HTTP 往返（service 走
+//!   `pool.acquire()`）。
 //!
 //! service 仅业务逻辑（方法签名 `<R: PartFileRepoTrait>(&self, mut repo: R, ...)`，
 //! `PartFileRepoTrait` 已对 `&mut PgConnection` 实现），handler/service 借
 //! `&mut *tx` / `&mut *conn` 喂给 trait。
 //!
 //! ## 约束
-//! - 统一响应信封：`Result<Json<R<T>>, AppError>`。
-//! - 权限在 service 层（`current.require_any_role(...)` 守卫）；handler 侧只保留
-//!   「权限守卫先于 multipart 解析」这条顺序纪律（避免未授权请求触发内存分配）。
+//! - 统一响应信封：`Result<Json<R<T>>, AppError>`（两条取字节端点除外，回裸字节）。
+//! - 权限在 service 层（`current.require_any_role(...)` 守卫）。
+//! - ⚠️ **body 反序列化失败不在信封内**：两条写入口用 axum `Json` 提取器，`file_size`
+//!   走 `deserialize_i64`（**只收 JSON 字符串**）⇒ 裸 number / 缺字段在提取器层就
+//!   返 **HTTP 422 纯文本**，前端拿不到 `{code,message}`。两条端点都**不接**
+//!   `serde(default)`，故缺字段同样 422。
 //! - WS 广播：本子模块不上报 WS 事件（文件资产是只读引用）。
 
 use std::sync::Arc;
@@ -131,12 +120,29 @@ use crate::state::AppState;
 /// 直传 COS（字节不过 rust 进程），再走 `POST /objects/confirm` 登记。
 ///
 /// 权限：service 内 `grant_upload_intents` 的 `policy::write_roles_for(owner_kind,
-/// WriteEntry::Upload)` —— 与 multipart 上传**逐字同口径**（PART/ASSEMBLY 是
-/// M+C+CNC；CUSTOMER 送货单打印模板仅 Manager）。
+/// WriteEntry::Upload)` —— PART/ASSEMBLY 是 M+C+CNC；CUSTOMER（送货单打印模板）
+/// 仅 Manager。
 ///
-/// 事务边界：handler `pool.begin()` → service（纯读 + 一次签名）→ `tx.commit()`。
-/// 与 `confirm_file_object`（service 自管 tx）相反：本端点不碰外部 IO 的事务持有，
-/// 只是沿用本文件「handler 管 tx」的统一范式。
+/// 事务边界：handler `pool.begin()` → service（纯读 + 逐项本地签名）→
+/// `tx.commit()`。与 `confirm_file_object`（service 自管 tx）相反：本端点不碰
+/// 外部 IO 的事务持有，只是沿用本文件「handler 管 tx」的统一范式。
+///
+/// ## ⚠️ 「纯读」不等于「一次签名」
+///
+/// 批量上限 **200** 项（`service::UPLOAD_INTENTS_MAX_ITEMS`），逐项处理 ⇒
+/// **最多 200 次** `presigned_put_url`（本地计算、不发网络请求）与**最多 200 次**
+/// `get_by_owner_kind_sha` DB 往返（索引点查）。CAS 命中的项不签名。
+/// ⇒ 一次请求在极端批量下会占住一个连接跑 200 次点查；这是**有意接受的**取舍
+/// （一次多选几百个文件是「建单」量级的场景，不是常态）。
+///
+/// ## ⚠️ body 反序列化失败**不在 `R<T>` 信封内**
+///
+/// `Json<UploadIntentsIn>` 提取器对 `items[].file_size` 走 `deserialize_i64`
+/// ——**只收 JSON 字符串**。传裸 number（`"file_size": 2048`）或缺字段 ⇒
+/// **HTTP 422 纯文本**，前端 `envelopeResponseInterceptor` 拿不到
+/// `{code, message}`。`owner_id` 同理（解析失败才有信封 20104，那是 handler 里的
+/// `parse::<i64>`，不是 serde）。
+/// 完整字段清单与前端配套改名见 `part_file/mod.rs` 的「前端配套改动清单」。
 pub async fn grant_upload_intents(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -176,9 +182,14 @@ pub async fn grant_upload_intents(
 /// 权限：service 内 `bind_uploaded_file` 的 `policy::confirm_roles_for(owner_kind,
 /// kind)` —— CNC 配对两种 kind（G_CODE / SETUP_SHEET）是 M+CNC，其余逐字沿用
 /// `write_roles_for(Confirm)`（PART/ASSEMBLY 是 M+C；CUSTOMER 送货单打印模板
-/// **仅 Manager**，且本端点已不再拒 CUSTOMER —— 打印模板直传化走的就是它）。
+/// **仅 Manager**，且本端点**不拒** CUSTOMER —— 打印模板的写入走的就是它）。
 ///
 /// ⚠️ 事务边界不变：service 自管 tx（`head_object` 是外部 IO，不进事务）。
+///
+/// ⚠️ body 反序列化失败**不在 `R<T>` 信封内**：`file_size` 走 `deserialize_i64`
+/// （**只收 JSON 字符串**）⇒ 裸 number / 缺字段（含被硬切掉的旧 `tmp_key` 字段名）
+/// 在 `Json` 提取器层就返 **HTTP 422 纯文本**。同款坑在 delete 端点的 `version`
+/// 上已登记过（CLAUDE.md OCC 铁律）。
 pub async fn confirm_file_object(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -424,22 +435,22 @@ pub async fn soft_delete_part_file(
 /// `PENDING` 走 **200 + `state: "PENDING"`**（不是 202）：它是正常中间态而非错误，
 /// 详见 `preview::dto::PreviewOut` 的三态契约表。
 ///
-/// ## ⚠️ matchit 注册顺序：**无冲突**（2026-10-13 实测）
+/// ## ⚠️ matchit 注册顺序：**无冲突**（实测钉死）
 ///
-/// `/{file_id}/preview` 是 3 段，与本 router 内其它路由逐一比对：
+/// `/{file_id}/preview` 是 2 段，与本 router 内其它路由逐一比对：
 ///
 /// | 路由 | 段数 | 与 `/preview` 的关系 |
 /// |---|---|---|
 /// | `/` | 0 | 段数不同 |
-/// | `/confirm` | 1 | 段数不同 |
-/// | `/{file_id}/url` | 2 | 段数不同 |
-/// | `/{file_id}/content` | 2 | 段数不同 |
-/// | `/{file_id}/delete` | 2 | 段数不同 |
-/// | **`/{file_id}/preview`** | **2** | **同段数，且同为 `{file_id}` 捕获段** |
+/// | `/upload-intents` · `/confirm` | 1 | 段数不同 |
+/// | `/{file_id}/url` | 2 | 段数相同，第 2 段同为静态 `url` |
+/// | `/{file_id}/content` | 2 | 段数相同，第 2 段同为静态 `content` |
+/// | `/{file_id}/delete` | 2 | 段数相同，第 2 段同为静态 `delete` |
+/// | **`/{file_id}/preview`** | **2** | **同段数、同为 `{file_id}` 捕获段** |
 ///
-/// 与 `/confirm`（1 段静态）的历史踩坑不同：这里 `/preview` 与 `/{file_id}/url` 等
-/// **位置完全平行** —— 二者的第 2 段一个是字面量 `preview`、一个是捕获段，
-/// matchit 对「同层静态段 vs 捕获段」按静态优先匹配，**没有歧义**。
+/// 与 `/confirm`（1 段静态）的历史踩坑不同：这里四条 2 段路由的第 2 段**全都是
+/// 字面量**、第 1 段**全都是捕获段**，matchit 对「同层静态段 vs 捕获段」按静态
+/// 优先匹配，**没有歧义**。
 ///
 /// 实测证据见 `tests/files/preview.rs::preview_route_is_not_swallowed_by_sibling_catch_alls`
 /// —— 它逐条打 `/objects/{id}/preview` 与 `/objects/{id}/url`，两条都必须命中
@@ -504,15 +515,14 @@ pub const ROUTES: &[&str] = &[
     "GET /{file_id}/preview",
 ];
 
-/// `files::part_file` 子模块 axum 子路由。
+/// `files::part_file` 子模块 axum 子路由（完整路径 `/api/v2/files/objects/*`）。
 ///
-/// 2026-10-13 PR1b：`POST /` 的上传端点复活并通用化（与 part / assembly 侧三条旧
-/// 端点四合一），`POST /confirm` 自 part 域搬入；`.nest("/parts/{part_id}",
-/// part_nested_router())` 仍是 PR1a 删除后不复存在的形态。
+/// 2026-10-15：multipart 上传端点下线，本 router **不再有任何收字节的路由**；
+/// 写路径恒为 `POST /upload-intents` + `POST /confirm` 两步（字节由前端直传 COS）。
 ///
-/// 2026-10-13 PR2：新增 `/{file_id}/preview`（COS CI 预览）。⚠️ 注册位置与
-/// `/{file_id}/url` 等**平行**而非「先于」—— matchit 对同层静态段本就静态优先，
-/// 顺序无关（实测钉死见 `get_part_file_preview` 的 doc 与对应测试）。
+/// ⚠️ `/{file_id}/preview` 与 `/{file_id}/url` 等**位置平行**而非「先于」——
+/// matchit 对同层静态段本就静态优先，顺序无关（实测钉死见
+/// `get_part_file_preview` 的 doc 与对应集成测试）。
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", get(list_part_files))
@@ -531,10 +541,10 @@ mod tests {
 
     /// `ROUTES` 必须与 `router()` 源码**逐条**一致（不多、不少、同序）。
     ///
-    /// 解析规则在 `crate::modules::files::route_guard`（本域三个 router 共用同一
-    /// 份实现，2026-10-13 review 第 2 轮 N-4 抽出）。
+    /// 解析规则在 `crate::modules::files::route_guard`（本域 `part_file` /
+    /// `files` 两个 router + 域外的 `print_template` 共用同一份实现）。
     ///
-    /// ⚠️ 本表的计数口径：`"/"` 只有 `get(h)`（2026-10-15 起 multipart 上传下线）
+    /// ⚠️ 本表的计数口径：`"/"` 只有 `get(h)`（multipart 上传端点 2026-10-15 下线）
     /// ⇒ **记 1 条**；本表 7 条 = 7 条 `.route` 语句。
     #[test]
     fn routes_declared_in_router() {

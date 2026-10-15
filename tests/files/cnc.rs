@@ -18,8 +18,13 @@
 //! 1. `pair_g_code_then_setup_sheet_points_each_other` — 两次 confirm 后两行 `paired_file_id` 互指
 //! 2. `pair_setup_sheet_that_was_instant_upload`  — 秒传行（upload-intents 短路返回的既有行）配对同样正确
 //! 3. `pair_with_non_complementary_kind_returns_20104` — 配到 DRAWING 行 ⇒ 20104
-//! 4. `pair_permission_matrix`                   — MANAGER / CNC_PROGRAMMER 可确认，CLERK 403
-//! 5. `pair_target_missing_returns_21101`        — `pair_with_file_id` 指向已软删/不存在的行
+//! 4. `pair_across_owners_returns_20104`         — **跨 owner 配对** ⇒ 20104 + 零副作用
+//! 5. `pair_permission_matrix`                   — MANAGER / CNC_PROGRAMMER 可确认，CLERK 403
+//! 6. `pair_target_missing_returns_21101`        — `pair_with_file_id` 指向已软删/不存在的行
+//!
+//! ⚠️ 第 4 条守的是「配对只在**同一个 owner** 内成立」这条不变式：配对拆成两次独立
+//! confirm 之后，旧的一次性配对端点那道「同一个 `part_id` 建两行」的隐式保证没了，
+//! 必须由 `bind_uploaded_file` 显式比 `part_id`。
 //!
 //! ## 为什么走 service 直调
 //!
@@ -294,6 +299,105 @@ async fn pair_with_non_complementary_kind_returns_20104() {
             .await
             .unwrap();
     assert!(rows.is_empty(), "被拒的 confirm 不该留下 SETUP_SHEET 行");
+}
+
+/// ⚠️ **跨 owner 配对必须被拒（20104），且两行 `paired_file_id` 恒 NULL**。
+///
+/// 配对原先由 `POST /files/cnc/pairs` 在**一次请求内**用同一个 `part_id` 建两行
+/// ⇒ 跨 owner 结构上不可能发生。拆成两次独立 confirm 后那个隐式不变量没了，
+/// 而 `t_part_file` 上没有 owner 列可依（owner 语义只活在 API 层）⇒
+/// `bind_uploaded_file` 必须显式比 `part_id`。
+///
+/// 漏掉它不只是「两行互指错对象」：被指那一行原先的 `paired_file_id` 仍指向别的行
+/// （配对只 `set` 不 `clear`）⇒ 前端按 `paired_file_id` 分组时直接串料。
+#[tokio::test]
+async fn pair_across_owners_returns_20104() {
+    let pool = setup().await;
+    let part_a = insert_part(&pool, "cnc-cross-a").await;
+    let part_b = insert_part(&pool, "cnc-cross-b").await;
+    let cos = Arc::new(MockCos::new());
+    let current = user(vec![Role::Manager]);
+
+    // part A 上一条 G_CODE
+    let g = confirm_file(
+        &pool,
+        &cos,
+        part_a,
+        "G_CODE",
+        "O9001.tap",
+        "application/octet-stream",
+        b"O9001\nG0 X3 Y3\n".to_vec(),
+        None,
+        &current,
+    )
+    .await
+    .expect("part A 的 G_CODE confirm");
+
+    // part B 上传 SETUP_SHEET，并试图配到 part A 的那行 ⇒ 20104
+    let err = confirm_file(
+        &pool,
+        &cos,
+        part_b,
+        "SETUP_SHEET",
+        "setup.pdf",
+        "application/pdf",
+        b"%PDF-1.5\ncross owner\n%%EOF".to_vec(),
+        Some(g.id),
+        &current,
+    )
+    .await
+    .expect_err("跨 owner 配对必须被拒");
+    match err {
+        AppError::Biz { code, .. } => assert_eq!(code, 20104, "跨 owner ⇒ 20104"),
+        other => panic!("期望 AppError::Biz(20104)，got {other:?}"),
+    }
+
+    // 零副作用：part A 的 G_CODE 行没被动过，part B 名下没有 SETUP_SHEET 行
+    assert_eq!(
+        paired_of(&pool, g.id).await,
+        None,
+        "被拒的跨 owner 配对不该改动对面行（否则前端分组串料）"
+    );
+    let rows: Vec<(i64,)> =
+        sqlx::query_as("SELECT id FROM t_part_file WHERE part_id = $1 AND kind = 'SETUP_SHEET'")
+            .bind(part_b)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(rows.is_empty(), "被拒的 confirm 不该留下 SETUP_SHEET 行");
+
+    // 反向同理：part A 的 SETUP_SHEET 去配 part B 的 G_CODE 也一样被拒
+    let g_b = confirm_file(
+        &pool,
+        &cos,
+        part_b,
+        "G_CODE",
+        "O9002.tap",
+        "application/octet-stream",
+        b"O9002\nG0 X4 Y4\n".to_vec(),
+        None,
+        &current,
+    )
+    .await
+    .expect("part B 的 G_CODE confirm");
+    let err = confirm_file(
+        &pool,
+        &cos,
+        part_a,
+        "SETUP_SHEET",
+        "setup-a.pdf",
+        "application/pdf",
+        b"%PDF-1.5\ncross owner rev\n%%EOF".to_vec(),
+        Some(g_b.id),
+        &current,
+    )
+    .await
+    .expect_err("反向跨 owner 同样必须被拒");
+    match err {
+        AppError::Biz { code, .. } => assert_eq!(code, 20104),
+        other => panic!("期望 AppError::Biz(20104)，got {other:?}"),
+    }
+    assert_eq!(paired_of(&pool, g_b.id).await, None);
 }
 
 /// 非配对 kind 带 `pair_with_file_id` ⇒ 20104（DRAWING 不参与 CNC 配对）。

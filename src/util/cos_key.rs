@@ -7,8 +7,8 @@
 //! - `legacy_key` 反向解析 + `LegacyKey` 结构体：读端点（`get_part_file_url` /
 //!   `get_file_content_for_row`）在 DB 持有的 object_key（仍是历史五段）找不对象时，
 //!   先尝试按 sha16 推新 key，找不到再试 DB 原值；新数据写入则一律走新模板。
-//! - 上传路径（`upload_file_for_owner` / `upload_part_file`）一律走新模板，
-//!   `upload_prefix` 配置字段降级为 dead_code（保留兼容 .env 旧值不报错）。
+//! - 写入路径（`files::part_file` 的两条写入口）一律走新模板，`upload_prefix`
+//!   只作为 key 前缀拼在前面。
 //!
 //! 对齐 Python `backend-python/core/file_hash.py:32-78`：
 //! - `safe_filename(name)`：把任意 filename 折叠为 `[A-Za-z0-9._-]` 范围；

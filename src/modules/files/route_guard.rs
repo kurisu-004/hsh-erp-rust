@@ -3,14 +3,13 @@
 //!
 //! ## 为什么抽到这里
 //!
-//! 本模块被 **2 处** `router()` 工厂的 `ROUTES` 表复用：
+//! 本模块被 **3 处** `router()` 工厂的 `ROUTES` 表复用：
 //!
 //! | 文件 | 前缀 | `ROUTES` 条数 |
 //! |---|---|---:|
 //! | `files/handler.rs` | `/api/v2/files` | 0（只有 `.nest`，无自有端点） |
 //! | `part_file/handler.rs` | `/api/v2/files/objects` | 7 |
-//!
-//! 另有域外一处：`print_template::handler::ROUTES`（4 条）。
+//! | `print_template/handler.rs`（**域外**） | `/api/v2/print-templates` | 4 |
 //!
 //! 各处各抄一份解析器会把「解析规则」变成多份可漂移的散文 —— 与
 //! `repo::ALL_METHODS` 那条教训同款。故抽成本模块一处，共同调用。

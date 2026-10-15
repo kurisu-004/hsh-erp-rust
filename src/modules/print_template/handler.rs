@@ -1,17 +1,24 @@
-//! `print_template` 域 HTTP handler：5 个端点 + 路由表（**2026-10-16 新建**）
+//! `print_template` 域 HTTP handler：**4 个端点** + 路由表
 //!
 //! 端点（挂在 `/api/v2/print-templates`，由 [`router`] 桥接）：
-//! - `POST /`                  —— multipart 上传并**替换**该 L1 的模板（**201 Created**）
 //! - `GET  /`                  —— 列表（`?customer_id=` + `limit` / `offset`）
 //! - `GET  /resolve`           —— 打印对话框取该 L1 的模板；未绑定 ⇒ `21109`（HTTP 422）
 //! - `GET  /{template_id}/content` —— 后端代理 xlsx 字节（**裸字节**，非 `R<T>`）
 //! - `POST /{template_id}/delete`  —— 软删（body **必含** `version`）
 //!
+//! ## ⚠️ 本域**没有写端点**
+//!
+//! 模板的写入走 `files` 域的统一收文件链路（`POST /files/objects/upload-intents`
+//! → 前端 XHR PUT 直传 COS → `POST /files/objects/confirm`），本文件**不持任何
+//! 收字节的路由**。「一个 L1 至多一份活跃模板」的替换语义（软删旧行 + INSERT 在
+//! 同一事务里）由 confirm 承接，角色闸门 `CUSTOMER ⇒ 仅 Manager` 在
+//! `policy::write_roles_for`。见 `docs/api/print_template.md` §1.0 与 §4.2。
+//!
 //! ## 角色 / 权限守卫（**下沉在 handler 第一行**，仓库惯例）
 //!
 //! | 端点 | 守卫 | 为什么 |
 //! |---|---|---|
-//! | `POST /` · `GET /` · `POST /{id}/delete` | `require_role(Manager)` | 模板是**配置**：改它会影响别人出货单上的抬头 / 地址 / 行数与顺序 |
+//! | `GET /` · `POST /{id}/delete` | `require_role(Manager)` | 模板是**配置**：改它会影响别人出货单上的抬头 / 地址 / 行数与顺序 |
 //! | `GET /resolve` · `GET /{id}/content` | 权限点 `delivery_note.print` | **打印对话框是 CLERK / INSPECTOR 在用**（备货、点检、装车都要打单），绝不能 MANAGER-only。该权限点默认矩阵恰是 MANAGER / CLERK / INSPECTOR（`seeds/rbac.sql`），ADMIN 元角色由 `require_permission` 内部短路放行 |
 //!
 //! service 内**再复核一次**（双层守卫）。`require_role` / `require_permission`
@@ -21,39 +28,28 @@
 //!
 //! | 端点 | 事务 | 理由 |
 //! |---|---|---|
-//! | `POST /` | `pool.begin()` → `upload_template` → `tx.commit()` | **必须**有：「先软删旧行 + 再写新行」共用一个 tx，否则第二步失败会留下空洞（见 `service.rs` 模块 doc） |
 //! | `GET /` · `GET /resolve` | **不开**，走 `pool.acquire()` | 纯读（同 `mail_digest` / `statistics` 范式） |
 //! | `GET /{id}/content` | **不开**，走 `pool.acquire()` | COS `get_object` 是外部 IO，包进 PG 事务会让连接被外部依赖长时间占住（与 `files::part_file::preview` 同款取舍） |
 //! | `POST /{id}/delete` | `pool.begin()` → `delete_template` → `tx.commit()` → **commit 之后**才 spawn `cos.delete_object` | `files` 域 2026-09-15 review A2 修的「commit 在前、spawn 在后」纪律：避免 commit 失败却已触发 COS 删除、产生孤儿对象 |
 //!
-//! ## multipart 契约（端点 1）
-//!
-//! body（`multipart/form-data`）：
-//! - `data`：**必填文本字段**，`UploadTemplateData` 的 JSON —— `{"customer_id":"<雪花 id>"}`
-//! - `file`：**必填二进制字段**（xlsx）
-//!
-//! ⚠️ multipart 循环的写法逐字照抄 `files::part_file::handler::upload_part_file`
-//! （`field.name()` 分发 + `field.text()` / `field.bytes()` + 其余字段 drain 掉），
-//! 但**只有两个字段**：本域前端只走这一次性 multipart，**不扩展 STS 两段式**
-//! （没有 `POST /confirm` 对应端点，见 `docs/api/print_template.md` §8.3 第 3 条）。
-//!
-//! ⚠️ `data` 里**只有 `customer_id` 一个键**：`owner_kind` / `kind` 由服务端钉死
-//! （`dto::OWNER_KIND` / `dto::TEMPLATE_KIND`），不接受客户端指定 —— 与
-//! `files` 域通用上传原语的 `UploadFileData` 恰好相反，理由见 `dto.rs`。
-//!
-//! ## 错误码（端点 1，按校验顺序，先命中先返回）
+//! ## 错误码
 //!
 //! | 码 | HTTP | 条件 |
 //! |---|---|---|
-//! | 40300 | 403 | 角色不在 M / C / I 内（**守卫先于 multipart 解析**） |
-//! | 20104 | 400 | 缺 `data` / 缺 `file` / 缺文件名 / `customer_id` 非数字 / **客户不存在 · 已软删 · 不是一级客户** |
-//! | 40001 | 422 | **0 字节**（空文件是「无效输入」，不是「太大」，同 `files` 域取舍） |
-//! | 21102 | 400 | 扩展名非 xlsx / **前 4 字节不是 `PK\x03\x04`** |
-//! | 21103 | 400 | 超过 `config.cos.max_file_size`（`COS_MAX_FILE_SIZE`） |
-//! | 21105 | 404 | owner 不存在（`upload_file_for_owner` 内的**兜底**；正常流程走不到） |
-//! | 21108 | 400 | 撞 `uk_t_part_file_single`（并发双传同一 L1 的极端形态） |
+//! | 40300 | 403 | 角色 / 权限点不满足（守卫在 handler 第一行，先于任何 service 调用） |
+//! | 20104 | 400 | `customer_id` 缺参 / 非数字（走 `R<T>` 信封，不是纯文本 400） |
+//! | 21109 | 422 | `resolve`：该 L1 未绑定（或已软删） |
+//! | 21101 | 404 | `content` / `delete`：`template_id` 不存在、或不是 `DELIVERY_TEMPLATE` 行 |
+//! | 40901 | 409 | `delete`：OCC `version` 与库里不符 |
+//! | 40001 | 422 | **纯文本**：`delete` body 缺 `version`（axum `Json` 提取器层，**不在信封内**） |
 //!
-//! ## ⚠️ matchit 注册顺序：**无冲突**（逐条核对过）
+//! ⚠️ **`POST /{template_id}/delete` 的 body 反序列化失败不在信封内**：
+//! `DeleteTemplateRequest::version` 无 `#[serde(default)]`（CLAUDE.md OCC 铁律）
+//! ⇒ 缺字段时 axum `Json` 提取器返 **HTTP 422 纯文本**，前端只能当「请求体不合法」
+//! 处理。同款坑在 `files` 域两条写入口（`file_size` 走 `deserialize_i64`、只收
+//! JSON 字符串）上也存在，登记在 `files/part_file/mod.rs` 的「前端配套改动清单」。
+//!
+//! ## ⚠️ matchit 注册顺序：**无冲突**（实测钉死）
 //!
 //! | 路由 | 段数 | 说明 |
 //! |---|---|---|
@@ -91,14 +87,13 @@ use crate::state::AppState;
 
 /// 打印模板端点用的权限点（`seeds/rbac.sql` 里已登记，默认矩阵 M / C / I）。
 ///
-/// ⚠️ 该权限点 2026-10-16 前的描述是「**前端-only**，后端无打印端点，仅登记」，
-/// 本轮起它**真的**守后端两条端点了（`/resolve` + `/{id}/content`）——
-/// 授权矩阵**逐字不变**（仍照前端 `deliveryNotePermissions.ts::canPrint` 的
-/// MANAGER / CLERK / INSPECTOR），只改描述文字。
+/// ⚠️ 该权限点的描述从「**前端-only**，后端无打印端点，仅登记」改成「打印对话框取
+/// 模板 + 取 xlsx 字节的守卫点」，**授权矩阵逐字不变**（仍照前端
+/// `deliveryNotePermissions.ts::canPrint` 的 MANAGER / CLERK / INSPECTOR）。
 const PRINT_PERMISSION: &str = "delivery_note.print";
 
 // ============================================================================
-//  端点 2：GET /
+//  端点 1：GET /
 // ============================================================================
 
 /// `GET /api/v2/print-templates` → 200 OK
@@ -120,7 +115,7 @@ pub async fn list_templates(
 }
 
 // ============================================================================
-//  端点 3：GET /resolve
+//  端点 2：GET /resolve
 // ============================================================================
 
 /// `GET /api/v2/print-templates/resolve?customer_id=<L1>` → 200 OK
@@ -142,7 +137,7 @@ pub async fn resolve_template(
 }
 
 // ============================================================================
-//  端点 4：GET /{template_id}/content
+//  端点 3：GET /{template_id}/content
 // ============================================================================
 
 /// `GET /api/v2/print-templates/{template_id}/content` —— 后端代理 xlsx 字节。
@@ -193,7 +188,7 @@ pub async fn get_template_content(
 }
 
 // ============================================================================
-//  端点 5：POST /{template_id}/delete
+//  端点 4：POST /{template_id}/delete
 // ============================================================================
 
 /// `POST /api/v2/print-templates/{template_id}/delete` —— 软删（OCC）。
@@ -241,11 +236,12 @@ pub async fn delete_template(
 
 /// 本域 router 注册的全部路由（`METHOD /path`，相对 `/api/v2/print-templates`）。
 ///
-/// 本域端点数（5）此前只散在 `src/modules/print_template/mod.rs` 的端点表、
-/// `docs/api/print_template.md` §1、`CLAUDE.md` 三处**手工维护**；本常量是那
-/// 三处的**唯一真源**，`mod tests::routes_declared_in_router` 逐条比对 `router()`
-/// 源码 —— 加 / 删端点忘同步会当场红（范式同 `files::part_file::handler::ROUTES`，
-/// 解析器也复用同一个 `files::route_guard::routes_in_router_source`）。
+/// 本域端点数（**4**：写入不在本域，见模块 doc）此前只散在
+/// `src/modules/print_template/mod.rs` 的端点表、`docs/api/print_template.md` §1、
+/// `CLAUDE.md` 三处**手工维护**；本常量是那三处的**唯一真源**，
+/// `mod tests::routes_declared_in_router` 逐条比对 `router()` 源码 —— 加 / 删端点
+/// 忘同步会当场红（范式同 `files::part_file::handler::ROUTES`，解析器也复用
+/// 同一个 `files::route_guard::routes_in_router_source`）。
 ///
 /// 计数口径与全仓一致：一条 `.route(path, m1)` 记 1 条；一条
 /// `.route(path, get(h).post(h))` 记 2 条。
@@ -283,7 +279,7 @@ mod tests {
     /// `ROUTES` 必须与 `router()` 源码**逐条**一致（不多、不少、同序）。
     ///
     /// ⚠️ 复用 `files::route_guard::routes_in_router_source`（**不复制一份**）：
-    /// 那份是 files 域三个 router 共用的比对器，`#[cfg(test)] pub(crate)`
+    /// 那份是 files 域两个 router + 本域共用的比对器，`#[cfg(test)] pub(crate)`
     /// 在 crate 内跨模块可达。抄一份会让「解析规则」变成两份可漂移的散文。
     #[test]
     fn routes_declared_in_router() {
@@ -303,8 +299,8 @@ mod tests {
         }
     }
 
-    /// 5 条路由无重复；`/` 的 GET / POST 各占一条（读列表 vs 上传替换是
-    /// 两个语义完全不同的动作，重复登记会掩盖其中一条被删掉）。
+    /// 4 条路由无重复（`ROUTES` 里出现重复条目 ⇒ 加端点时抄错行，且会让下面那
+    /// 条计数断言失去意义）。
     #[test]
     fn routes_have_no_duplicates() {
         let mut seen = BTreeSet::new();
@@ -315,7 +311,7 @@ mod tests {
         assert_eq!(
             ROUTES.len(),
             4,
-            "本域端点数是 4（2026-10-15 起无上传端点）；改端点必须同步改这里与 mod.rs 端点表"
+            "本域端点数是 4（写入走 files 域两条写入口，本域不持上传端点）；改端点必须同步改这里与 mod.rs 端点表"
         );
     }
 

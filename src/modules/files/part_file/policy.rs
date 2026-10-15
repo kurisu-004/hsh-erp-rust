@@ -4,7 +4,8 @@
 //! 对齐 Python 后端 `core/_file_kind_policy.py`（2026-09-11 新增）。
 //!
 //! ## 用途
-//! - service 层 `upload_file_for_owner` 通用函数在落库前做扩展名校验：
+//! - 两条写入口（`grant_upload_intents` = `POST /objects/upload-intents`、
+//!   `bind_uploaded_file` = `POST /objects/confirm`）在落库前做扩展名校验：
 //!   1. 取扩展名（`ext_of`），缺扩展名 → 拒绝
 //!   2. 在 `allowed_exts(kind)` 白名单内 → 否则拒绝
 //!   3. `content_type` 在 `expected_content_types_for_ext(&ext)` 白名单内 → 否则拒绝
@@ -27,17 +28,30 @@ use crate::auth::rbac::Role;
 ///
 /// 扩展名作为静态切片返回，service 层用 `contains` 判断。
 ///
-/// 2026-10-13 **新增 `ASSEMBLY_MASTER`**：上传四合一（`POST /files/objects`
-/// 同时承接 part 与 assembly 两条 owner）之后，装配件 PDF 也走
-/// `upload_file_for_owner`，而本白名单原先**只认 DRAWING / 3D_MODEL** ⇒
-/// `owner_kind=ASSEMBLY` 的上传会一律撞 21102。取值 `&["pdf"]` 与被删的
+/// 2026-10-13 **新增 `ASSEMBLY_MASTER`**：上传入口统一同时承接 part 与 assembly
+/// 两条 owner 之后，装配件 PDF 也走本表，而它原先**只认 DRAWING / 3D_MODEL** ⇒
+/// `owner_kind=ASSEMBLY` 的上传会一律撞 21102。取值 `&["pdf"]` 与已删的
 /// `AssemblyService::upload_assembly_files` 的判定（`ext != "pdf"` 即拒）逐字等价。
-/// 连带效果：`dto::validate::check_kind` 此前会把 `ASSEMBLY_MASTER` 判成「未知 kind」
-/// 一并拒掉，`POST /files/objects/confirm` 现在也接受该 kind。
+/// 连带效果：`dto::validate::check_kind` 复用同一张白名单，confirm 一并接受该 kind。
 ///
-/// ⚠️ **仍未覆盖**：CAD_2D / G_CODE / SETUP_SHEET 三个 kind 不在本白名单里 ——
-/// 它们只经 CNC 配对端点（`POST /files/cnc/pairs`，走 `cnc/service.rs` 的专用
-/// 分支）写入，不经过本函数，故不受影响。
+/// ⚠️ **覆盖的 kind 必须与 DB 的 `ck_t_part_file_kind` 逐条对齐**：全仓**每一条**
+/// 收文件入口都是 `upload-intents` + `confirm`，两者都判本表 ⇒ 「本表缺某个 kind」
+/// 等于「那个 kind 在**任何**入口都上传不了」。当前 7 条全收
+/// （`DRAWING` / `3D_MODEL` / `ASSEMBLY_MASTER` / `CAD_2D` / `G_CODE` /
+/// `SETUP_SHEET` / `DELIVERY_TEMPLATE`）。
+///
+/// ★ **2026-10-15 新增 `CAD_2D`（dwg / dxf）**：它原先不在本表、而
+/// [`owner_kind_allows_kind`] 的 PART 臂也不收它 ⇒ 前端零件详情「CAD 源文件」
+/// tab（`usePartFileUpload({ kind: 'CAD_2D' })`，`:accept='.dwg,.dxf'`）**没有任何
+/// 入口可上传**。DB 侧早已允许该 kind（CHECK 约束、`uk_t_part_file_single` 谓词、
+/// [`is_file_content_kind`] 白名单、软删分派 `CAD_2D => M+C`），只有这两张**写侧**
+/// 表漏了它 ⇒ 本次是**补齐写侧**，读侧与删侧一直就是通的。
+///
+/// **2026-10-15 新增 `G_CODE` / `SETUP_SHEET`**：CNC 配对的两种文件改走
+/// `POST /objects/upload-intents` + `POST /objects/confirm`（`pair_with_file_id`
+/// 互指），必须进这张白名单，否则 confirm 的 kind 闸门会把它们全拒。取值逐字沿用
+/// 已删的 `files::part_file::cnc::service` 里的两道判定（g_code ∈
+/// {tap,nc,gcode,mpf,cnc}、setup_sheet 恒 pdf）。
 ///
 /// 2026-10-16 **新增 `DELIVERY_TEMPLATE`**：送货单打印模板复用 `t_part_file`
 /// 承载（不新建模板表），扩展名**只收 `xlsx`**。
@@ -45,9 +59,9 @@ use crate::auth::rbac::Role;
 /// hucre / SheetJS 侧读它要走另一条兼容路径，而需求原文就是「模板支持 xlsx
 /// 格式」。旧 `.xls` 模板请先另存为 `.xlsx` 再上传。
 /// 连带效果：`dto::validate::check_kind` 复用同一张白名单，所以
-/// `POST /files/objects/confirm`（STS 两段式）也顺带接受该 kind —— 但
-/// `print_template` 域**只用一次性 multipart 上传**，没有走 confirm 的调用方，
-/// 见 `docs/api/print_template.md` §8.3 第 3 条。
+/// `POST /files/objects/confirm` 也顺带接受该 kind —— 但 `print_template` 域
+/// 自己不发请求，写入走的是本表的 upload-intents + confirm（见
+/// `docs/api/print_template.md` §1.0）。
 ///
 /// 2026-09-11 新增
 pub fn allowed_exts(kind: &str) -> &'static [&'static str] {
@@ -56,11 +70,8 @@ pub fn allowed_exts(kind: &str) -> &'static [&'static str] {
         "3D_MODEL" => &["step", "stp", "iges", "igs", "stl", "obj", "3mf"],
         "ASSEMBLY_MASTER" => &["pdf"],
         "DELIVERY_TEMPLATE" => &["xlsx"],
-        // 2026-10-15：G_CODE / SETUP_SHEET 两条 CNC 配对文件改走
-        // `POST /objects/upload-intents` + `POST /objects/confirm`（`pair_with_file_id`
-        // 互指），所以它们必须进这张白名单，否则 confirm 的 kind 闸门会把它们全拒。
-        // 取值逐字沿用被删的 `files::part_file::cnc::service` 里的两道判定
-        // （g_code ∈ {tap,nc,gcode,mpf,cnc}、setup_sheet 恒 pdf）。
+        // 2026-10-15：CAD 源文件（DWG / DXF）。见上面那条「新增 CAD_2D」的缘由。
+        "CAD_2D" => &["dwg", "dxf"],
         "G_CODE" => &["tap", "nc", "gcode", "mpf", "cnc"],
         "SETUP_SHEET" => &["pdf"],
         _ => &[],
@@ -84,26 +95,29 @@ pub fn allowed_exts(kind: &str) -> &'static [&'static str] {
 /// 管「这种文件能是什么格式」。两张表都过了才进扩展名 / content_type 校验。
 ///
 /// **fail-safe 方向**：不在表内的组合一律 `false`。将来若给 `allowed_exts` 加了
-/// 新的 kind（CAD_2D / G_CODE / SETUP_SHEET 走 CNC 配对端点写入，不经本函数），
-/// 本表**不会**自动放行它 —— 那是有意的：新 kind 必须先在这里显式声明它挂哪种
-/// owner，避免又出现「能写不能删」的行。
+/// 新的 kind，本表**不会**自动放行它 —— 那是有意的：新 kind 必须先在这里显式声明
+/// 它挂哪种 owner，避免又出现「能写不能删」的行。
 ///
 /// 2026-10-16 **新增第三种 owner `CUSTOMER`**（只收 `DELIVERY_TEMPLATE`）：
 /// 送货单打印模板挂在**一级客户**上（`print_template` 域）。
 /// ⚠️ `CUSTOMER` 是**单向**的：`PART` / `ASSEMBLY` 两臂刻意**不加**
-/// `DELIVERY_TEMPLATE` —— 否则 `POST /files/objects`（owner_kind 与 kind 都由
-/// client 在 multipart `data` 里给）会造出「零件挂送货单打印模板」这种
-/// 语义上不存在的行，且这类行**无人读**（`print_template` 域只按
-/// `(customer_id, DELIVERY_TEMPLATE)` 查），是纯垃圾数据。
+/// `DELIVERY_TEMPLATE` —— 否则两条写入口（owner_kind 与 kind 都由 client 在
+/// body 里给）会造出「零件挂送货单打印模板」这种语义上不存在的行，且这类行
+/// **无人读**（`print_template` 域只按 `(customer_id, DELIVERY_TEMPLATE)` 查），
+/// 是纯垃圾数据。
 /// 未列出的 owner_kind 一律返 `false`（fail-safe），该行为**不变**。
 ///
 /// 2026-10-13 新增
 pub fn owner_kind_allows_kind(owner_kind: &str, kind: &str) -> bool {
     match owner_kind {
-        // 2026-10-15：`G_CODE` / `SETUP_SHEET` 随「CNC 配对走 confirm 的
-        // `pair_with_file_id`」一并放行到 PART（此前它们只经被删的
-        // `POST /files/cnc/pairs` 写入，那条路径不走本函数）。
-        "PART" => matches!(kind, "DRAWING" | "3D_MODEL" | "G_CODE" | "SETUP_SHEET"),
+        // `CAD_2D`（2026-10-15）：与 `G_CODE` / `SETUP_SHEET` 一并放行到 PART ——
+        // 它是零件自己的 CAD 源文件（DWG / DXF），前端零件详情有专门的 tab。
+        // ⚠️ 它**必须**与 `allowed_exts("CAD_2D")` 同批加：两张表任缺一张，
+        // upload-intents / confirm 就都放不下这个 kind（详见 `allowed_exts` 的 doc）。
+        "PART" => matches!(
+            kind,
+            "DRAWING" | "3D_MODEL" | "CAD_2D" | "G_CODE" | "SETUP_SHEET"
+        ),
         "ASSEMBLY" => matches!(kind, "ASSEMBLY_MASTER"),
         // 2026-10-16 新增：一级客户只挂送货单打印模板（xlsx）。
         "CUSTOMER" => matches!(kind, "DELIVERY_TEMPLATE"),
@@ -115,9 +129,10 @@ pub fn owner_kind_allows_kind(owner_kind: &str, kind: &str) -> bool {
 
 /// CNC 配对的两个 kind（G_CODE ↔ SETUP_SHEET 互指）。
 ///
-/// 2026-10-15 新增：配对语义原在 `files::part_file::cnc` 子模块里（整块删除），
-/// 现在由 `POST /objects/confirm` 的 `pair_with_file_id` 承接，故 kind 判据、角色
-/// 分派、扩展名白名单三处都要有一个**共同的**「这两个 kind 叫什么」定义。
+/// 配对语义由 `POST /objects/confirm` 的 `pair_with_file_id` 承接，故 kind 判据、
+/// 角色分派、扩展名白名单三处都要有一个**共同的**「这两个 kind 叫什么」定义。
+/// ⚠️ **`CAD_2D` 不是配对 kind**：它没有互补的 counterpart，带
+/// `pair_with_file_id` 一律 20104。
 pub fn is_cnc_pair_kind(kind: &str) -> bool {
     matches!(kind, "G_CODE" | "SETUP_SHEET")
 }
@@ -135,7 +150,8 @@ pub fn cnc_pair_counterpart(kind: &str) -> Option<&'static str> {
 //  写路径的角色分派（2026-10-16 review 第 1 轮 MAJOR-1 抽出）
 // ===========================================================================
 
-/// `POST /api/v2/files/objects`（multipart 上传）对**非 CUSTOMER** owner 的角色集合。
+/// `POST /api/v2/files/objects/upload-intents`（签发预签 PUT URL）对**非 CUSTOMER**
+/// owner 的角色集合。
 ///
 /// 取 4 条旧上传端点的**并集**（`upload-drawing` / `upload-3d-model` 是 M+C，
 /// `POST /assemblies/{id}/files` 是 M+C，旧 `POST /part-files/` 是 M+C+CNC），
@@ -144,19 +160,20 @@ pub fn cnc_pair_counterpart(kind: &str) -> Option<&'static str> {
 /// ⚠️ **CUSTOMER owner 不走这份集合**（走 [`write_roles_for`] 的收窄分支）。
 pub const UPLOAD_ROLES: &[Role] = &[Role::Manager, Role::Clerk, Role::CncProgrammer];
 
-/// `POST /api/v2/files/objects/confirm`（STS 直传回执）对**非 CUSTOMER** owner 的角色集合。
+/// `POST /api/v2/files/objects/confirm`（直传回执登记）对**非 CUSTOMER** owner 的
+/// 角色集合。
 ///
 /// 逐字沿用自 part 域搬来的旧 `POST /parts/{id}/files/confirm`（M+C）。
-/// ⚠️ **刻意不与 [`UPLOAD_ROLES`] 合并**：confirm 是「客户端先把对象直传进 tmp 区、
+/// ⚠️ **刻意不与 [`UPLOAD_ROLES`] 合并**：confirm 是「客户端先把对象预签直传进桶、
 /// 再回执绑定」的第二段式链路，它历史上就没给过 CncProgrammer；合并成一个表会顺带
-/// 放开 confirm 的 CNC 面 —— 那不是本轮要修的东西（见 `part_file/mod.rs` 的
-/// 「权限面只做收口、不做放开」纪律）。
+/// 放开 confirm 的 CNC 面 —— 那是一次**权限面放开**，与本轮方向相反（见
+/// `part_file/mod.rs` 的「权限面只做收口、不做放开」纪律）。
 pub const CONFIRM_ROLES: &[Role] = &[Role::Manager, Role::Clerk];
 
 /// `CUSTOMER` owner（= 送货单打印模板）的写角色集合：**仅 Manager**。
 ///
 /// 这是「CLERK 不能偷偷绑 / 换别人客户的打印模板」的**唯一**收口点，且
-/// **两条写入口共用**（`upload_file_for_owner` 与 `bind_uploaded_file` 都经
+/// **两条写入口共用**（`grant_upload_intents` 与 `bind_uploaded_file` 都经
 /// [`write_roles_for`]）。
 pub const CUSTOMER_WRITE_ROLES: &[Role] = &[Role::Manager];
 
@@ -176,9 +193,10 @@ pub const CUSTOMER_WRITE_ROLES: &[Role] = &[Role::Manager];
 /// 变体（那本来就该是一件显眼的事 —— 新入口必须显式决定它的角色面）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteEntry {
-    /// `POST /files/objects`（multipart 上传）—— 默认集合 [`UPLOAD_ROLES`]。
+    /// `POST /files/objects/upload-intents`（签发预签 PUT URL）—— 默认集合
+    /// [`UPLOAD_ROLES`]。
     Upload,
-    /// `POST /files/objects/confirm`（STS 直传回执）—— 默认集合 [`CONFIRM_ROLES`]。
+    /// `POST /files/objects/confirm`（直传回执登记）—— 默认集合 [`CONFIRM_ROLES`]。
     Confirm,
 }
 
@@ -203,13 +221,12 @@ impl WriteEntry {
 /// （`CUSTOMER` ⇒ 仅 Manager），其余 owner_kind 逐字返回**该入口自己的**既有集合。
 ///
 /// ## 调用方（两处，缺一不可）
-/// - `service::upload_file_for_owner`（`POST /files/objects` 的角色闸门）
-/// - `service::bind_uploaded_file`（`POST /files/objects/confirm` 的角色闸门）
+/// - `service::grant_upload_intents`（`POST /files/objects/upload-intents` 的闸门）
+/// - `service::bind_uploaded_file`（`POST /files/objects/confirm` 的闸门）
 ///
-/// ⚠️ 2026-10-16 review 第 1 轮 MAJOR-1：本轮新增 `owner_kind='CUSTOMER'` 时
-/// 只在 `upload_file_for_owner` 里加了 CUSTOMER 分支，**漏了 confirm 那条**，
-/// 于是 CLERK 打 `POST /files/objects/confirm` 仍能造出（并替换掉）任意客户的
-/// 打印模板行。共用本函数就是防「下次新增 owner_kind 又只改一条入口」。
+/// ⚠️ 本函数**必须两条入口共用**：CUSTOMER 的收窄最早只做在其中一条上，
+/// 结果 CLERK 打另一条仍能造出（并替换掉）任意客户的打印模板行。
+/// 共用本函数就是防「下次新增 owner_kind 又只改一条入口」。
 ///
 /// ⚠️ 2026-10-16 review 第 2 轮 MINOR-B：形参由 `default_roles: &[Role]`
 /// 改成 [`WriteEntry`]，**调用点不再传常量**（原形态下「传错常量」是静默的权限面
@@ -218,7 +235,7 @@ pub fn write_roles_for(owner_kind: &str, entry: WriteEntry) -> &'static [Role] {
     match owner_kind {
         "CUSTOMER" => CUSTOMER_WRITE_ROLES,
         // 未知 owner_kind 由调用方后续的配对守卫报 20104，这里逐字沿用该**入口**
-        // 自己的默认集合（与本轮之前 `upload_file_for_owner` 的 `_ =>` 臂行为一致）。
+        // 自己的默认集合（与 `owner_kind_allows_kind` 加 CUSTOMER 之前的行为一致）。
         _ => entry.default_roles(),
     }
 }
@@ -228,14 +245,15 @@ pub fn write_roles_for(owner_kind: &str, entry: WriteEntry) -> &'static [Role] {
 /// 2026-10-15 新增：confirm 端点接管 CNC 配对（G_CODE / SETUP_SHEET 的上传与
 /// `pair_with_file_id` 互指）之后，它的角色集合不能只按 `owner_kind` 派 —— 那张表
 /// 给出的是 `CONFIRM_ROLES`（M+C，历史上这条端点没给过 CNC）。而 CNC 程序文件
-/// 历来由 CNC 岗位写（被删的 `POST /files/cnc/pairs` 是 M+CNC），直接套 M+C
+/// 历来由 CNC 岗位写（`POST /files/cnc/pairs` 下线前是 M+CNC），直接套 M+C
 /// 会把写 G_CODE 的门关死；直接对所有 kind 放 CNC 又会把 DRAWING / 3D_MODEL 的
 /// confirm 面放开——那是权限面放大，与本轮方向相反。
 ///
 /// ⇒ 分派规则：配对两种 kind 走 [`CNC_PAIR_ROLES`]，其余逐字走
 /// `write_roles_for(owner_kind, WriteEntry::Confirm)`（含 CUSTOMER ⇒ 仅 Manager）。
-/// 写入端点（upload-intents）同样能签 G_CODE，那里用的是 `WriteEntry::Upload`
-/// （M+C+CNC），本就含 CNC，无需再分派。
+/// ⚠️ **`CAD_2D` 不在这层分派里**（它走 `WriteEntry::Confirm` 的 M+C）—— CAD 源
+/// 文件历来由 M+C 读写，不是 CNC 岗位的东西。upload-intents 侧同理走
+/// `WriteEntry::Upload`（M+C+CNC），该集合本就含 M+C，无需再分派。
 pub fn confirm_roles_for(owner_kind: &str, kind: &str) -> &'static [Role] {
     if is_cnc_pair_kind(kind) {
         CNC_PAIR_ROLES
@@ -295,6 +313,9 @@ pub fn is_file_content_kind(kind: &str) -> bool {
 ///
 /// 2026-10-16 新增 `"xlsx" => "XLSX"`（`DELIVERY_TEMPLATE` 的唯一格式）。
 ///
+/// 2026-10-15 新增 `"dwg" | "dxf" => "CAD_2D"` —— 与 `kind` 同名（与 `G_CODE`
+/// 那支同款取值法），DB 的 `ck_t_part_file_kind` 本来就允许 `CAD_2D`。
+///
 /// 2026-09-11 新增
 pub fn file_type_for_ext(ext: &str) -> Option<&'static str> {
     match ext.to_ascii_lowercase().as_str() {
@@ -305,8 +326,10 @@ pub fn file_type_for_ext(ext: &str) -> Option<&'static str> {
         "obj" => Some("OBJ"),
         "3mf" => Some("3MF"),
         "xlsx" => Some("XLSX"),
+        // 2026-10-15：CAD 源文件（dwg / dxf）→ `file_type='CAD_2D'`。
+        "dwg" | "dxf" => Some("CAD_2D"),
         // 2026-10-15：G_CODE 的五种扩展名 → `file_type='G_CODE'`（与
-        // `t_part_file.kind='G_CODE'` 同名，被删的 cnc 配对实现也是这么写的）。
+        // `t_part_file.kind='G_CODE'` 同名，已删的 cnc 配对实现也是这么写的）。
         "tap" | "nc" | "gcode" | "mpf" | "cnc" => Some("G_CODE"),
         _ => None,
     }
@@ -332,6 +355,14 @@ pub fn file_type_for_ext(ext: &str) -> Option<&'static str> {
 /// 成 `.xlsx` 就能过 content_type 这道闸，而模板是要被前端 SheetJS / hucre
 /// 直接解析的，伪装进来只会在渲染阶段炸。
 ///
+/// ⚠️ **2026-10-15 新增 `dwg` / `dxf` 分支：这两个扩展名没有单一官方 MIME**
+/// （IANA 没登记，CAD 工具各发各的：AutoCAD 发 `application/acad`、
+/// 部分 ODA / BricsCAD 发 `image/vnd.dwg` / `image/vnd.dxf`、草图工具发
+/// `application/dxf`），而浏览器对**不认识的**类型一律发
+/// `application/octet-stream` ⇒ **必须给兜底**（同 step / stl 那几支的取舍）。
+/// ⚠️ 与 pdf / xlsx 的纪律差别在于「这里没法只收精确值」—— 不收
+/// octet-stream 等于 DWG / DXF 这条上传路径在浏览器上根本走不通。
+///
 /// 2026-09-11 新增
 pub fn expected_content_types_for_ext(ext: &str) -> &'static [&'static str] {
     match ext.to_ascii_lowercase().as_str() {
@@ -355,6 +386,15 @@ pub fn expected_content_types_for_ext(ext: &str) -> &'static [&'static str] {
         ],
         // ⚠️ 只收精确值，**不给** `application/octet-stream` 兜底（同 pdf 一节的理由）。
         "xlsx" => &["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"],
+        // 2026-10-15：CAD 源文件（DWG / DXF）。逐字理由见上面那一节：没有官方 MIME
+        // ⇒ 收 CAD 工具常见的三种 + 浏览器对未知类型发的 octet-stream。
+        "dwg" | "dxf" => &[
+            "application/octet-stream",
+            "application/acad",
+            "application/dxf",
+            "image/vnd.dwg",
+            "image/vnd.dxf",
+        ],
         // 2026-10-15：G_CODE 五种扩展名。这些类型浏览器基本不认识，Element Plus
         // 的 `:accept` / 拖拽上传**多发** `application/octet-stream`，故本组**给**
         // 兜底（与 step / stl 那几支同款取舍）；`text/plain` 是次常见的形态
@@ -409,7 +449,6 @@ mod tests {
 
     #[test]
     fn allowed_exts_assembly_master_only_pdf() {
-        // 2026-10-13：上传四合一后装配件 PDF 也走 upload_file_for_owner，
         // 该白名单必须认 ASSEMBLY_MASTER，否则 assembly owner 的上传一律 21102。
         assert_eq!(allowed_exts("ASSEMBLY_MASTER"), &["pdf"]);
         // 与被删的 upload_assembly_files 判定逐字等价：只收 PDF
@@ -448,19 +487,67 @@ mod tests {
         assert!(!owner_kind_allows_kind("ASSEMBLY", "3D_MODEL"));
     }
 
+    /// PART 臂收哪几种 kind（CAD_2D / G_CODE / SETUP_SHEET 都是零件自己的文件），
+    /// 以及它们**不挂**到别的 owner。
     #[test]
-    fn owner_kind_allows_kind_allows_cnc_pair_kinds_and_rejects_the_rest() {
-        // 2026-10-15：G_CODE / SETUP_SHEET 随「CNC 配对走 confirm 的
-        // `pair_with_file_id`」放行到 PART —— 它们是配对的两种 kind。
+    fn owner_kind_allows_kind_allows_part_kinds_and_rejects_the_rest() {
         assert!(owner_kind_allows_kind("PART", "G_CODE"));
         assert!(owner_kind_allows_kind("PART", "SETUP_SHEET"));
-        // CAD_2D 不在其中：没有 kind 能配对它，也没有 kind 的扩展名白名单收它
-        assert!(!owner_kind_allows_kind("PART", "CAD_2D"));
-        // ⚠️ 配对两种 kind **不挂**到 ASSEMBLY / CUSTOMER
+        // CAD_2D（2026-10-15）：前端零件详情有 CAD 源文件 tab，前端类型
+        // `PartFileKind` 一直含它 —— 不放行 ⇒ 那个 tab 永远传不上来。
+        assert!(owner_kind_allows_kind("PART", "CAD_2D"));
+        // ⚠️ 配对两种 kind 与 CAD_2D 都**不挂**到 ASSEMBLY / CUSTOMER
         assert!(!owner_kind_allows_kind("ASSEMBLY", "G_CODE"));
         assert!(!owner_kind_allows_kind("CUSTOMER", "G_CODE"));
+        assert!(!owner_kind_allows_kind("ASSEMBLY", "CAD_2D"));
+        assert!(!owner_kind_allows_kind("CUSTOMER", "CAD_2D"));
         assert!(!owner_kind_allows_kind("PART", "UNKNOWN"));
         assert!(!owner_kind_allows_kind("PART_FILE", "DRAWING"));
+    }
+
+    /// ⚠️ **两张写侧表必须逐条对齐**（2026-10-15）：`allowed_exts` 缺某个 kind
+    /// ⇒ 扩展名闸门拒它；本表缺 ⇒ owner×kind 配对闸门拒它。任缺一张，那个 kind 在
+    /// upload-intents 与 confirm 里都**上传不了**（`CAD_2D` 就这么丢过一次）。
+    #[test]
+    fn every_allowed_ext_kind_is_mounted_on_some_owner() {
+        for kind in [
+            "DRAWING",
+            "3D_MODEL",
+            "ASSEMBLY_MASTER",
+            "CAD_2D",
+            "G_CODE",
+            "SETUP_SHEET",
+            "DELIVERY_TEMPLATE",
+        ] {
+            assert!(
+                !allowed_exts(kind).is_empty(),
+                "{kind} 连扩展名白名单都没有"
+            );
+            assert!(
+                owner_kind_allows_kind("PART", kind)
+                    || owner_kind_allows_kind("ASSEMBLY", kind)
+                    || owner_kind_allows_kind("CUSTOMER", kind),
+                "{kind} 有扩展名白名单却没有 owner 配对 ⇒ 两条写入口都传不上去"
+            );
+        }
+    }
+
+    /// 2026-10-15：`CAD_2D` 的完整写侧映射（dwg / dxf → file_type + MIME 白名单）。
+    #[test]
+    fn allowed_exts_and_file_type_cover_cad_2d() {
+        assert_eq!(allowed_exts("CAD_2D"), &["dwg", "dxf"]);
+        for ext in ["dwg", "dxf"] {
+            assert_eq!(file_type_for_ext(ext), Some("CAD_2D"), "{ext} 的 file_type");
+            let cts = expected_content_types_for_ext(ext);
+            // dwg/dxf 没有官方 MIME ⇒ 必须收浏览器对未知类型发的 octet-stream
+            assert!(
+                cts.contains(&"application/octet-stream"),
+                "{ext} 必须收 octet-stream（浏览器不认识这两个类型）"
+            );
+            assert!(cts.contains(&"application/acad"));
+        }
+        // PDF 的 MIME 不在 CAD 白名单里（别顺手把别的类型放进来）
+        assert!(!expected_content_types_for_ext("dwg").contains(&"application/pdf"));
     }
 
     /// 2026-10-15：`confirm_roles_for` 的 kind 分派 —— 配对两种 kind 是 M+CNC，
@@ -509,8 +596,8 @@ mod tests {
     /// 2026-10-16：`CUSTOMER` 只挂 `DELIVERY_TEMPLATE`，且**反向一律拒**。
     ///
     /// 反向那三条（PART / ASSEMBLY 挂 DELIVERY_TEMPLATE）是本条守卫存在的全部
-    /// 理由：`POST /files/objects` 的 owner_kind 与 kind 都由 client 给，
-    /// 不挡就会有「零件挂送货单打印模板」这种无人读、删不掉的垃圾行。
+    /// 理由：两条写入口的 owner_kind 与 kind 都由 client 给，不挡就会有
+    /// 「零件挂送货单打印模板」这种无人读、删不掉的垃圾行。
     #[test]
     fn owner_kind_allows_kind_customer_is_delivery_template_only() {
         assert!(owner_kind_allows_kind("CUSTOMER", "DELIVERY_TEMPLATE"));

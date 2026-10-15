@@ -149,16 +149,15 @@ pub trait PartFileRepoTrait: Send {
     async fn assembly_owner_exists(&mut self, assembly_id: i64) -> Result<bool, sqlx::Error>;
     /// `SELECT EXISTS(SELECT 1 FROM t_customer WHERE id = $1 AND deleted_at IS NULL
     /// AND parent_id IS NULL)` —— 2026-10-16 新增，`owner_kind='CUSTOMER'` 的
-    /// 闸门（送货单打印模板挂在一级客户上，由 `print_template` 域写入）。
+    /// 闸门（送货单打印模板挂在一级客户上；写入经本域两条写入口，
+    /// `print_template` 域自己不发请求）。
     ///
-    /// ## ⚠️ 2026-10-16 review 第 2 轮 MAJOR-A：**L1 判据下沉到本方法**
+    /// ## ⚠️ **L1 判据在本方法里，`print_template` 域自己一个都没有**
     ///
-    /// 首版（review 第 1 轮）这里**只判「存在且未软删」**，把 `parent_id IS NULL`
-    /// 当成 `print_template` 域的独有强制点。那是个错的切分：`POST /files/objects`
-    /// 的 `owner_kind` / `owner_id` 都由 client 在 multipart `data` 里给，
-    /// `upload_file_for_owner` **不判 L1** ⇒ Manager 打
-    /// `{"owner_kind":"CUSTOMER","owner_id":"<二级客户>"}` 会 201 + 落一行绑在
-    /// 二级客户上的模板行。后果三条：
+    /// 本方法的 `owner_kind` / `owner_id` 全由 client 在 body 里给（两条写入口
+    /// 都是），若这里只判「存在且未软删」，Manager 打
+    /// `{"owner_kind":"CUSTOMER","owner_id":"<二级客户>"}` 就会落一行绑在二级客户
+    /// 上的模板行。后果三条：
     /// ① 违反「只绑一级客户」这条用户拍板的不变式；
     /// ② `uk_t_part_file_single` 是 `(part_id, kind)`，L1 行与 L2 行互不冲突 ⇒
     ///    「一个 L1 至多一份活跃模板」在 (L1, L2) 这一对上被绕过，且给 L1 重新上传时
@@ -166,11 +165,11 @@ pub trait PartFileRepoTrait: Send {
     /// ③ 该行 `resolve` 永远读不到（`delivery_note.customer_id` 是 L1）⇒ 变成
     ///    **永不消费也永不被清理**的孤儿配置行。
     ///
-    /// ⇒ `parent_id IS NULL` 现在是**两道闸门共有**的判据：本方法（files 域，
-    /// 兜底、错误码 21105）与 `print_template::service::l1_customer_name`
-    /// （本域自己的前置强制点、错误码 20104、零外部 IO）。前者管「任何绕过本域
-    /// handler 直调共用上传原语的路径」，后者管「本域 5 条端点的正常路径」，
-    /// **缺任一条都不成立**。
+    /// ⇒ `parent_id IS NULL` 是本不变式在**全仓唯一**的强制点：`files` 域两条写
+    /// 入口（`grant_upload_intents` 与 `bind_uploaded_file`）都经
+    /// `PartFileService::assert_owner_exists` → 本方法，错误码 **21105** /
+    /// HTTP 404，排在 COS PUT 之前。`print_template` 域自己**一个强制点都没有**
+    /// （它没有写端点）⇒ 要去掉谓词，只能改这里，没有第二个地方可退。
     ///
     /// ⚠️ **本文件读 `t_customer` 是 `files` 域唯一一处跨域表引用**，属本仓既定
     /// 的「只读跨域聚合」pattern（同 `dashboard` / `statistics` / `prod::inspection`）：

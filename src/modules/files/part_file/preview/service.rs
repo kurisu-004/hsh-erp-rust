@@ -521,7 +521,7 @@ impl PreviewService {
     ///
     /// ⚠️ 退回分支**不是**内容寻址（同一份内容挂不同文件名会算出不同种子 ⇒ 重复
     /// 跑 CI）。这是可接受的：它只对 `content_sha256 IS NULL` 的历史行走，而
-    /// 新上传路径（`upload_file_for_owner` / `bind_uploaded_file`）必写 sha256。
+    /// 新写入路径（`grant_upload_intents` / `bind_uploaded_file`）必写 sha256。
     /// 真要根治得回填历史行的 sha256（要重读 COS 对象算哈希），属独立立项。
     pub fn preview_seed(file: &TPartFile) -> String {
         // ⚠️ 材料与配方标签之间用 `|` 分隔：两段都是定长 / 无 `|` 的十六进制或
@@ -963,8 +963,8 @@ impl PreviewService {
         Ok(v.get("data").cloned().unwrap_or(Value::Null))
     }
 
-    /// 转发头：注入 `X-Forwarded-User-Id`（与 `files::handler::forward_sts_tmp_keys`
-    /// 同款纪律 —— python 端靠它取真实身份）。
+    /// 转发头：注入 `X-Forwarded-User-Id` —— python 端靠它取真实身份
+    /// （转发到 python 的其它本仓端点同款纪律）。
     fn fwd_headers(current: &CurrentUser) -> HeaderMap {
         let mut h = HeaderMap::new();
         if let Ok(v) = current.id.to_string().parse() {

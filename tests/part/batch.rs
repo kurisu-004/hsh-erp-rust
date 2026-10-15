@@ -582,9 +582,19 @@ async fn location_tree_happy_path() {
 //
 // 等价覆盖：CAS key 两段模板由 `tests/files/part_file.rs::cas_key_is_two_segments`
 // 守着；「POST /parts/batch 回归纯建单」由 `tests/part/crud.rs` 的两条
-// （`batch_create_rejects_removed_binding_fields` /
+// （`batch_create_ignores_removed_binding_fields` /
 // `batch_create_without_bindings_succeeds_with_empty_cleanup_keys`）守着。
+// ⚠️ `drawing_file` / `model3d_file` 现在是**被 serde 静默丢弃**的字段
+// （DTO 未开 `deny_unknown_fields`）⇒ 继续发会拿到 200 + 零副作用；这条兼容策略与
+// confirm 的 `tmp_key`→`object_key` 硬切方向相反，两件事别混记。
 
+// ===========================================================================
+//  权限点闸门
+// ===========================================================================
+
+/// split / cancel 迁权限点 —— `batch.split` / `batch.cancel` 矩阵
+/// 均为 M,C：Inspector ⇒ 40300；Clerk ⇒ 200（正向留痕，自原 `require_any_role`
+/// 集合逐格迁移）。
 #[tokio::test]
 async fn split_and_cancel_permission_matrix() {
     let (pool, app, _token, fx) = bootstrap_as_manager().await;

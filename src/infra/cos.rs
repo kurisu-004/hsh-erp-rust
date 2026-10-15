@@ -6,6 +6,11 @@
 //! - 2026-10-15 新增 `presigned_put_url`（预签 PUT，前端直传上传，字节不过 rust）
 //! - 业务实现阶段补：`upload_file_advanced`（大文件分块）、`download_object_cached`（SHA256 LRU 缓存）
 //!
+//! ⚠️ **`copy_object` 当前零生产调用方**（2026-10-15）：随上传链路统一
+//! （字节不再经 rust 进程做服务端 copy）与 `POST /parts/batch` 的 bindings 分支
+//! 删除，它的前两个调用方都没了。**实现保留** —— infra 是**能力层**，trait 上
+//! 少一个方法就等于「将来要用得先把历史 diff 翻出来重贴一遍」。别拿它当死代码删。
+//!
 //! 2026-09-11 重构：使用 `cos-rust-sdk`（社区 SDK，仿 cos-python-sdk-v5）作为
 //! 上传 / 下载 / 删除的真实客户端；`presigned_get_url` SDK 未提供，单独用
 //! `hmac` + `sha1` + `hex` 手写 V1 签名拼 URL。新增 `COS_ENABLED` 开关：

@@ -120,11 +120,11 @@ pub(crate) async fn bootstrap() -> Ctx {
 /// 字段全 0 + 文件名长度 0 + 压缩后长度 0 + 本地头长度 0 + 扩展字段长度 0，
 /// 最后补一条中央目录结束记录（EOCD）`PK\x05\x06` + 16 个 0 字节。
 ///
-/// 后端**只校验前 4 字节**（`dto::has_zip_magic`），所以最小形态其实只要
-/// `PK\x03\x04` 就够；这里给到 EOCD 是为了让这份字节「万一将来后端加结构校验」
-/// 时不至于立刻变成非法 zip。⚠️ 它**不是**一个能被 SheetJS 打开的工作簿 ——
-/// 那正是「后端刻意不引 zip crate」这条取舍的已知代价（见
-/// `docs/api/print_template.md` §8.3 第 3 条）。
+/// ⚠️ **后端现在一道 zip 校验都没有**（统一上传链路后 confirm 只拿到 `head`，
+/// 拿不到字节 ⇒ ZIP magic 与 xlsx 结构都答不了，职责移交前端 `assertTemplateMatches`）。
+/// 所以最小形态其实只要 `PK\x03\x04` 就够；这里给到 EOCD 是为了让这份字节
+/// 「万一将来后端加结构校验」时不至于立刻变成非法 zip。⚠️ 它**不是**一个能被
+/// SheetJS 打开的工作簿 —— 见 `docs/api/print_template.md` §3.2。
 pub(crate) fn minimal_xlsx_bytes(tag: &str) -> Vec<u8> {
     let mut v: Vec<u8> = Vec::new();
     // 本地文件头 30 字节：签名 4 + 版本 2 + 标志 2 + 压缩 2 + 时间 2 + 日期 2

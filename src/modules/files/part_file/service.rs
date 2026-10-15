@@ -5,7 +5,7 @@
 //! ## 上传链路（2026-10-15 统一：预签 PUT 直传）
 //!
 //! ```text
-//! ① POST /files/objects/upload-intents  → grant_upload_intents（纯读 + 一次签名）
+//! ① POST /files/objects/upload-intents  → grant_upload_intents（纯读 + ≤200 次签名）
 //! ② 前端 XHR PUT 直传 COS（字节不过本进程）
 //! ③ POST /files/objects/confirm       → bind_uploaded_file（head 校验 + INSERT）
 //! ```
@@ -19,7 +19,8 @@
 //! ## 与 part / assembly 域的耦合
 //! **恒为「零」**：`t_part_file` 的写入路径只有本子模块那两条端点。
 //! 装配体 PDF（`kind='ASSEMBLY_MASTER'`）走同一条通道，`owner_kind='ASSEMBLY'`；
-//! 客户送货单打印模板（`kind='DELIVERY_TEMPLATE'`）走 `owner_kind='CUSTOMER'`。
+//! 客户送货单打印模板（`kind='DELIVERY_TEMPLATE'`）走 `owner_kind='CUSTOMER'`；
+//! CAD 源文件（`kind='CAD_2D'`，dwg / dxf）走 `owner_kind='PART'`。
 //!
 //! ## 2026-10-13 PR1b：COS key 前缀统一 `obj/`
 //! 上传写入的 CAS key 前缀取自 `cfg.cos.upload_prefix`（缺省 `obj/`），读端点的
@@ -107,6 +108,17 @@ impl PartFileService {
     ///
     /// 那样前端拿到的就是一条「写这个既有 key」的授权 —— 而那个 key 已经被一条活跃
     /// 行引用着，前端却不需要真的写它。秒传的口号是「一次 PUT 都不发」。
+    ///
+    /// ## ⚠️ 批量代价（刻意保留）
+    ///
+    /// 第 8 步的 `get_by_owner_kind_sha` 是**逐项**在 `for` 循环里点的 ⇒ 200 项
+    /// 就是 200 次串行往返（索引点查，单次很便宜，但整条循环跑在 handler 开的
+    /// tx 里、占住一个连接）。签名的 200 次是本地计算、不发网。
+    /// ⚠️ **「一次 `WHERE (part_id, kind, sha) IN (...)` 批量查」是已知的可选优化，
+    /// 本轮不做**：它要动 `PartFileRepoTrait`（加方法）+ test-support 的 mock，
+    /// 而收益只在「一次请求传 200 个文件」这个批量上限场景；每项判据不同
+    /// （kind / sha 都逐项不同），批量化的收益上限就是省 199 次点查往返，
+    /// 不改变量级。⚠️ 别在别处顺手改 —— 要改就把上面这句一起删掉。
     #[allow(clippy::too_many_arguments)]
     pub async fn grant_upload_intents<R: PartFileRepoTrait>(
         &self,
@@ -130,10 +142,9 @@ impl PartFileService {
             )));
         }
 
-        // 2. 角色闸门：与 `upload_file_for_owner`（multipart 上传）**逐字同口径**
-        //    —— PART/ASSEMBLY → M+C+CNC，CUSTOMER（送货单打印模板）→ 仅 Manager。
-        //    两条写入口必须共用 `policy::write_roles_for`，否则「谁能写
-        //    DELIVERY_TEMPLATE」的收口点会分叉（见该函数的 doc）。
+        // 2. 角色闸门 —— PART/ASSEMBLY → M+C+CNC，CUSTOMER（送货单打印模板）
+        //    → 仅 Manager。与 confirm **共用** `policy::write_roles_for`，
+        //    否则「谁能写 DELIVERY_TEMPLATE」的收口点会分叉（见该函数的 doc）。
         current.require_any_role(policy::write_roles_for(
             owner_kind,
             policy::WriteEntry::Upload,
@@ -234,8 +245,8 @@ impl PartFileService {
     ///
     /// 权限（2026-10-10 新增 `Role::ShelfAccount`）：5 角色。放开给工控机账号是因为
     /// 报工台（`/scan/*`，路由守卫就是 `SHELF_ACCOUNT`）的图纸预览要拉这份列表。
-    /// ⚠️ **只读端点**：上传 `upload_file_for_owner` 与软删 `soft_delete_file` 的角色
-    /// 白名单**不含** `ShelfAccount`，两者是写路径、不在本次放开范围。
+    /// ⚠️ **只读端点**：两条写入口（`grant_upload_intents` / `bind_uploaded_file`）
+    /// 与软删 `soft_delete_file` 的角色白名单**不含** `ShelfAccount`，它们是写路径。
     ///
     /// ⚠️ **2026-10-16 review 第 1 轮 MAJOR-3：本端点永不返回 `DELIVERY_TEMPLATE`
     /// 行**（`?kind=DELIVERY_TEMPLATE` 也一样返空，不是「缺省时才排除」）。
@@ -430,10 +441,9 @@ impl PartFileService {
     /// `{PART, ASSEMBLY}`」那道守卫同款 —— 两者都是「请求里这对字段的组合非法」，
     /// 而不是文件本身有问题（后者才是 21102 `BIZ_PART_FILE_BAD_TYPE`）。
     ///
-    /// 两条写路径（`upload_file_for_owner` multipart 上传 / `bind_uploaded_file`
-    /// STS 直传回执）都调它：`policy::allowed_exts` 新增 `ASSEMBLY_MASTER` 顺带把
-    /// confirm 路径的接受面一起放大了（`dto::validate::check_kind` 复用同一张
-    /// 白名单），不放这里的话 confirm 能造出同样的「写得了、删不了」行。
+    /// 两条写入口（`grant_upload_intents` / `bind_uploaded_file`）都调它，且都排在
+    /// **任何 DB 往返之前**（纯内存判断）。`policy::allowed_exts` 收的每个 kind 都
+    /// 必须在这里挂一种 owner，否则 confirm 能造出「写得了、删不了」的行。
     fn assert_owner_kind_matches_kind(owner_kind: &str, kind: &str) -> Result<(), AppError> {
         if !policy::owner_kind_allows_kind(owner_kind, kind) {
             return Err(AppError::biz(
@@ -464,12 +474,11 @@ impl PartFileService {
     /// `soft_delete_active_by_part_kind(l1_id)` 清不掉 L2 那行；③ 该行 `resolve`
     /// 永远读不到（送货单的 `customer_id` 是 L1）⇒ 永不消费、永不清理的孤儿配置行。
     ///
-    /// ⇒ **两道闸门现在共有这条判据**：本方法（files 域兜底、21105、排在 COS PUT
-    /// 之前）与 `print_template::service::l1_customer_name`（该域自己的前置强制点、
-    /// 20104、零外部 IO）。正常路径永远先被后者拦下（错误码 20104），本方法管的是
-    /// 「有人绕过那个域的 handler 直调共用上传原语」这条路径。**不要**因为
-    /// 「本域不该知道客户分两级」把谓词去掉 —— 本域判的是 `parent_id IS NULL` 这个
-    /// **列取值**，与它判 `t_part.assembly_id IS NULL`（散件）同形。
+    /// ⇒ **这条判据现在只在一处**：本方法（files 域共用闸门，upload-intents 与
+    /// confirm **共用**，错误码 **21105** / HTTP 404，排在 COS PUT 之前）。
+    /// **不要**因为「本域不该知道客户分两级」把谓词去掉 —— 本域判的是
+    /// `parent_id IS NULL` 这个**列取值**，与它判 `t_part.assembly_id IS NULL`
+    /// （散件）同形。完整取舍见 `docs/api/print_template.md` §4.1。
     async fn assert_owner_exists<R: PartFileRepoTrait>(
         repo: &mut R,
         owner_kind: &str,
@@ -493,9 +502,7 @@ impl PartFileService {
                 }
             }
             "CUSTOMER" => {
-                // ⚠️ 2026-10-16 review 第 2 轮 MAJOR-A：谓词含 `parent_id IS NULL`
-                // （一级客户），首版只判存在 ⇒ Manager 经 `POST /files/objects`
-                // 能把模板绑到二级客户上。理由见本方法的 doc。
+                // 谓词含 `parent_id IS NULL`（一级客户）—— 理由见本方法的 doc。
                 if !repo.customer_owner_exists(owner_id).await? {
                     return Err(AppError::biz(
                         code::BIZ_PART_FILE_OWNER_NOT_FOUND,
@@ -569,7 +576,10 @@ impl PartFileService {
     ///
     /// 1. 角色闸门 —— `policy::confirm_roles_for(owner_kind, kind)`
     /// 2. owner 存在性 + `owner_kind` × `kind` 配对
-    /// 3. 字段校验（kind / sha256 / filename / size / content_type）
+    /// 3. 字段校验（kind / sha256 / filename / size / content_type / 扩展名白名单）。
+    ///    仅当 `pair_with_file_id` 给了才继续第 3b 步：目标行存在 + **kind 互补**
+    ///    + **同一个 owner**（`part_id` 相同）；任一不满足 ⇒ 20104 / 21101，
+    ///    **零副作用**。
     /// 4. **key 防呆**：服务端按 `content_sha256` + `original_filename` **重新派生**
     ///    CAS key，与入参 `object_key` 逐字比对，不一致即 21114
     /// 5. `head_object`：不存在 / size=0 → 21114；size 与声明不符 → 21115
@@ -577,6 +587,10 @@ impl PartFileService {
     /// 7. tx 内：软删旧活跃行 + INSERT + readback
     /// 8. tx 内：CNC 配对（`pair_with_file_id` 给了才做）双向互写
     /// 9. commit → `PartFileOut`
+    ///
+    /// ⚠️ 步骤 8 是**覆写**语义：`set_paired_file_id` 不清对面的旧指向，所以
+    /// 步骤 3b 的 owner / kind 两道校验是它唯一的正确性前提 —— 配错一次就是
+    /// 前端 `paired_file_id` 分组串料。
     ///
     /// ## ⚠️ **内容 sha256 不做服务端校验**（与 sha 绑定有关的取舍见 `mod.rs`）
     ///
@@ -650,8 +664,17 @@ impl PartFileService {
             }
         }
 
-        // 3b. CNC 配对目标校验（kind 必须互补）+ 目标行存在性。
-        //     排在任何写入之前 ⇒ 配错 kind 时零副作用。
+        // 3b. CNC 配对目标校验（kind 必须互补 + **必须同一个 owner**）+ 目标行存在性。
+        //     排在任何写入之前 ⇒ 配错 kind / 配错 owner 时零副作用。
+        //
+        //     ⚠️ **owner 一致性这道闸门是拆成两次 confirm 之后才必须显式补上的**：
+        //     配对原先由 `POST /files/cnc/pairs` 在**一次请求内**用同一个
+        //     `part_id` 建两行 ⇒ 跨 owner 配对结构上不可能发生。拆成两次独立
+        //     confirm 之后这个隐式不变量没了，而 `t_part_file` 上**没有 owner_kind
+        //     列**（见本模块 mod.rs 已知偏差第 9 条）⇒ 只能拿 `part_id` 比。
+        //     漏掉它的后果不只是「两行互指错对象」：被指的那一行原先的
+        //     `paired_file_id` **仍指向别的行**（本方法只 `set` 不 `clear`），
+        //     前端按 `paired_file_id` 分组展示 ⇒ 直接串料。
         if let Some(pair_id) = pair_with_file_id {
             let counterpart = policy::cnc_pair_counterpart(kind).ok_or_else(|| {
                 AppError::biz(
@@ -675,6 +698,18 @@ impl PartFileService {
                     format!(
                         "pair_with_file_id={pair_id} 的 kind={:?} 与本行 kind={kind:?} 不互补（应为 {counterpart}）",
                         target.kind
+                    ),
+                ));
+            }
+            // ⚠️ 同一道闸门的第二半：kind 互补还不够，两行必须挂在**同一个 owner**
+            // 上。判据是 `part_id` 列（三种 owner 共用同一个列空间，本行的
+            // `owner_id` 就装在这里）。
+            if target.part_id != owner_id {
+                return Err(AppError::biz(
+                    code::BIZ_INVALID_VALUE,
+                    format!(
+                        "pair_with_file_id={pair_id} 挂在 part_id={} 上，与本行的 owner_id={owner_id} 不同 —— CNC 配对只在同一个 owner 内成立",
+                        target.part_id
                     ),
                 ));
             }
