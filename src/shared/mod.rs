@@ -15,6 +15,13 @@ pub mod analytics;
 // 依赖 prod::batch，与逐域剥离方向相反。详见 `shared/batch/mod.rs` 顶部注释。
 pub mod batch;
 pub mod customer; // 2026-10-17：客户树（任意深度）遍历与 id 展开 —— subtree_ids / root_id_of / paths_of / require_leaf_customer 等，各域共用
+// 2026-10-23 新增 delivery_status：「未交付」6 态白名单 + 「品检前」4 态分层白名单
+// （dashboard / mail_digest / wecom_daily 三域各自写 SQL、共用同一份判据）。**为什么
+// 上提到 shared**：白名单留成多份副本时，「加一个状态」漏改一处**不会编译失败**，只
+// 会让三处数字互相矛盾且无单测变红。`shared::` 不属于任何业务域 ⇒ 各域的
+// `assert_no_foreign_domain` 护栏只认「域根段 + 他域路径」的前缀失配，本模块不触发
+// 任何跨域判定，强度不降（与 `shared::analytics` / `shared::customer` 同款取舍）。
+pub mod delivery_status;
 // 2026-10-07 新增 domain_guard：跨域只读聚合域（dashboard / prod::programming …）的
 // 域隔离护栏，把「本域不 import 其它域的 service / repo」从口头约定变成 CI 强制。
 // 只在单测里用（调用方全在各域 `#[cfg(test)] mod tests`），故不进生产 API 面。

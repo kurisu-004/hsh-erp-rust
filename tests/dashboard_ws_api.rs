@@ -78,9 +78,11 @@ use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::ws_hub::WsEvent;
 use hsh_erp_rust::modules::dashboard::dto::DeliveryBasis;
 use hsh_erp_rust::modules::dashboard::repo::{
-    DELIVERY_BUCKET_LIMIT, DELIVERY_DETAIL_LIMIT, DELIVERY_STATUSES, DashboardRepo,
+    DELIVERY_BUCKET_LIMIT, DELIVERY_DETAIL_LIMIT, DashboardRepo,
 };
 use hsh_erp_rust::modules::dashboard::service::DashboardService;
+// 2026-10-23：「未交付」白名单已上提到 shared，本用例直接钉共享常量那份的字面值。
+use hsh_erp_rust::shared::delivery_status::DELIVERY_STATUSES;
 use hsh_erp_test_support::{
     DashboardWsFixture, json_request, load_dashboard_ws_fixture, send as ts_send, send_raw,
     shared_test_snowflake, test_app, test_pool, test_state, test_ws_app,

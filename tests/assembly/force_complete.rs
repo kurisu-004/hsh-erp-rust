@@ -3,7 +3,8 @@
 //!
 //! 端点用途：把「实际早已送货、但没在系统录入」的装配件整体判为已交。验收核心是
 //! **`t_assembly.status` 真被写成 `COMPLETED`** —— dashboard 大屏的三个交期桶
-//! （`upcoming` / `overdue` / `partial`，判据 `status = ANY(DELIVERY_STATUSES)`）与柱状图
+//! （`upcoming` / `overdue` / `partial`，判据
+//! `status = ANY(shared::delivery_status::DELIVERY_STATUSES)`）与柱状图
 //! `by_status`（判据 `status NOT IN ('COMPLETED','CANCELLED')`）都以该列为准，写对了这行
 //! 就必然从所有切片消失。
 //!

@@ -24,19 +24,22 @@
 //! ## 域隔离：**零他域符号引用**
 //!
 //! 本文件**不 import** `statistics` / `mail_digest` / `dashboard` 的任何符号。
-//! 第六条（逾期）与第七条（未来）的**谓词**逐字照抄 `mail_digest::repo`，但
-//! 「未交付」状态白名单是**本域自有常量** [`DELIVERY_STATUSES`] ⇒ 它与
-//! `mail_digest::repo::DELIVERY_STATUSES` / `dashboard::repo::delivery::DELIVERY_STATUSES`
-//! / 前端 `UpcomingDeliveryChart.vue` 的 `LAYERS[].statuses` 构成**四处人工同步**关系，
-//! 改一处必须同步另三处（同步义务见 `docs/api/wecom-daily.md` §4 与 §8.3）。
+//! 第六条（逾期）与第七条（未来）的**谓词**逐字照抄 `mail_digest::repo`，而
+//! 「未交付」状态白名单取自共享常量
+//! [`crate::shared::delivery_status::DELIVERY_STATUSES`] —— `shared::` 不属于任何
+//! 业务域，域隔离判定只认「域根段 + 他域路径」的前缀失配，所以引用它**不构成**跨域
+//! 依赖。而白名单**必须**共用一份：三域各存一份副本时，「加一个状态」漏改一处不会
+//! 编译失败，只会让日报 / 邮件 / 大屏三处的「未交付」判定互相矛盾且无单测变红。
 //!
-//! ## 取数恒 ≤ 6 条语句
+//! ## 取数恒 **O(1)**：语句数与返回行数无关（护栏见
+//! `tests/wecom_daily/n_plus_one_guard.rs`）
 //!
-//! 上界 = 第一节 2 条 + 第二节 1 条 + 第三节 2 条 + 第四节 1 条 = 6 条；**关掉的节
-//! 一条都不查**（`service::fetch_rows` 的 `if cfg.include_*`），与工单数 / 送货单
-//! 数 / 工人数**无关**。护栏见 `tests/wecom_daily/n_plus_one_guard.rs`。
-//! ⚠️ **刻意不写死总数**：这类计数必然过期，错的那个数比没有更坏 —— 上界是推出来的
-//! （六条语句各在哪个函数、哪个开关下会发），由 `fetch_rows` 的 doc 与源码护栏守住。
+//! 不变量是「**语句数不随工单数 / 送货单数 / 工人数增长**」：每节都把整组聚合压进
+//! **一条**语句（第一节 1 条、第二节 1 条、第三节各 1 条、第四节 1 个 `GROUP BY`），
+//! 关掉的节一条都不查。逐节循环查是**功能完全正确**的改法（数字守恒、渲染逐字一致、
+//! 集成测试全绿），只有数据量涨上去时语句数才悄悄线性涨 —— 而日报恰好是「一天一次、
+//! 量很大」的生产形态。⚠️ **刻意不钉死具体条数**：这类计数必然过期，而护栏守的
+//! 「循环体内不许出现取数调用」才是那条不变量的真正来源。
 
 use chrono::{NaiveDate, NaiveDateTime};
 use sqlx::{PgConnection, Row};
@@ -44,32 +47,7 @@ use sqlx::{PgConnection, Row};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::wecom_daily::dto::WorkerBarRow;
 use crate::modules::wecom_daily::model::{TWeComDailyConfigRow, TWeComDailyLogRow};
-
-/// 「未交付」状态白名单（6 态）。取集合用于第三节两条查询的
-/// `status = ANY($2::varchar[])`。
-///
-/// ⚠️ **刻意复制而**不** import `mail_digest::repo::DELIVERY_STATUSES` 或
-/// `dashboard::repo::delivery::DELIVERY_STATUSES`**（用户 2026-10-16 定的硬要求：
-/// 「在推送通知的域重写 SQL，不要复用其它域的」）。取值逐字相同，**改一处必须同步
-/// 另三处**（mail_digest 本域 / dashboard 本域 / 前端 `LAYERS[].statuses`）。
-pub const DELIVERY_STATUSES: [&str; 6] = [
-    "PENDING",
-    "PROGRAMMING",
-    "IN_PROCESS",
-    "OUTSOURCE",
-    "INSPECTION",
-    "READY_TO_SHIP",
-];
-
-/// [`DELIVERY_STATUSES`] 的 `Vec<String>` 形态（`LazyLock` 只算一次）。
-///
-/// 理由与 `mail_digest::repo` 同款：本域走 `sqlx::query_as!` **宏**，宏要求参数是
-/// 具体可绑的 Rust 类型，`&[&str; 6]` 绑不上 `$2::varchar[]`。
-fn delivery_statuses_vec() -> &'static [String] {
-    static VEC: std::sync::LazyLock<Vec<String>> =
-        std::sync::LazyLock::new(|| DELIVERY_STATUSES.iter().map(|s| s.to_string()).collect());
-    &VEC
-}
+use crate::shared::delivery_status::delivery_statuses_vec;
 
 // ============================================================================
 // 第一节：全厂报工总览

@@ -56,21 +56,14 @@ use crate::shared::analytics::delivered::{fetch_delivered_quantities, fetch_deli
 use crate::shared::customer::{CustomerPath, paths_of};
 use crate::shared::error::AppError;
 
-/// 影响「未交付」判定的状态白名单（2026-10-07）。
-///
-/// 柱状图 `UpcomingDeliveryChart.vue` 的 `LAYERS[].statuses` 里 top(4) + middle(2)
-/// 正是这 6 态，bottom 层额外含 DELIVERED。
-/// 交期面板三桶的已交判据（SQL 里的 `NOT EXISTS` / `EXISTS` 已交批次）与逾期 KPI 全在服务端，
-/// 6 态在前端**只剩 `LAYERS[].statuses` 这一个镜像**
-/// ——改本常量时只需核对这一处。同步关系与症状见 docs/api/dashboard.md §5。
-pub const DELIVERY_STATUSES: [&str; 6] = [
-    "PENDING",
-    "PROGRAMMING",
-    "IN_PROCESS",
-    "OUTSOURCE",
-    "INSPECTION",
-    "READY_TO_SHIP",
-];
+// 2026-10-23：「未交付」6 态白名单取自共享常量（原先是本文件的一份副本）。本域的
+// 三条交期 SQL 与「已交数量 / 已交套数」聚合同款取舍 —— 只共用判据本身，行单位 /
+// 窗口 / 投影列各自写全（见文件头）。`shared::` 不属于任何业务域 ⇒ 本域的
+// `assert_no_foreign_domain` 护栏（只认「域根段 + 他域路径」前缀失配）仍然零跨域
+// 依赖，强度不降。6 态在前端**只剩** `UpcomingDeliveryChart.vue` 的
+// `LAYERS[].statuses` 这一个镜像（top(4) + middle(2)；bottom 层是 DELIVERED，不在
+// 白名单里）—— 改共享常量时只需核对这一处，同步关系与症状见 docs/api/dashboard.md §5。
+use crate::shared::delivery_status::DELIVERY_STATUSES;
 
 /// 每个分桶的最大行数（upcoming / overdue / partial 三桶各一条独立上限）。
 pub const DELIVERY_BUCKET_LIMIT: usize = 30;

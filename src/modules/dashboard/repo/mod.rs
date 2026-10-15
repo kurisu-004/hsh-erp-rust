@@ -11,7 +11,7 @@ use crate::modules::dashboard::vo::{
 pub mod delivery;
 pub mod sql;
 
-pub use delivery::{DELIVERY_BUCKET_LIMIT, DELIVERY_DETAIL_LIMIT, DELIVERY_STATUSES, DeliveryRepo};
+pub use delivery::{DELIVERY_BUCKET_LIMIT, DELIVERY_DETAIL_LIMIT, DeliveryRepo};
 pub use sql::{BatchLite, DashboardRepo, PartLite, RecentBatchesData};
 
 #[async_trait]
