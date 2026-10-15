@@ -17,7 +17,8 @@
 //!   211xx 零件文件、212xx 外协公司、213xx 外协报价、214xx 送货单、215xx 外协发货、
 //!   217xx 交期汇总邮件（2026-10-13 新增；216xx 上传会话域 2026-09-28 下线后**未复用**，
 //!   理由见 `code` 模块内 217xx 段的注释）、218xx 企业微信推送（2026-10-18 新增；
-//!   `wecom` 通道域 + `wecom_daily` 内容域）。
+//!   `wecom` 通道域 + `wecom_daily` 内容域）、219xx 人事排班（2026-10-19 新增；
+//!   `hr` 域，日历 + 班次 + 班次日历覆盖）。
 //!
 //!   错误码段位归属（2026-09-19 prod 聚合后）：
 //!   - `prod::worker` / `prod::queue` → `202xx` 工人段（共享；queue 的 `WORKER_POOL_EMPTY`/`NO_WORK_TYPE` 等复用 `20205`/`20206`）
@@ -482,6 +483,42 @@ pub mod code {
     pub const BIZ_WECOM_WEBHOOK_NAME_DUPLICATE: i32 = 21807;
     pub const BIZ_WECOM_WEBHOOK_IN_USE: i32 = 21808;
 
+    // 219xx 人事排班（hr 域，2026-10-19 新增）
+    //
+    // ⚠️ **为什么不是 216xx**：`216xx`（上传会话域）已于 2026-09-28 随域下线**释放**，
+    // 但复用一个「已用过又被回收」的段位有风险 —— 老客户端 / 旧日志里可能还残留 216xx
+    // 的映射，撞码比撞段更隐蔽（217xx 当初就是为此放弃 216xx，见上面那段注释）。
+    // 而 `218xx` 已被 wecom 占用（21801-21808）。故取**全新段 219xx**，与 217xx / 218xx
+    // 同款处理，照 CLAUDE.md §3「新增域错误码先入对应段、每域一段」的约定。
+    //
+    // 21901 = 班次不存在**或已软删** → **404**（查 / 改 / 停用 / 写覆盖行四条路径共用）。
+    //   ⚠️ 「不存在」与「已软删」给同一个码：调用方两种场景都该「换个 id」，没有区分价值
+    //   （同 `BIZ_MAIL_ACCOUNT_NOT_FOUND` 21706 / `BIZ_WECOM_WEBHOOK_NOT_FOUND` 21806）。
+    // 21902 = 班次 code 重复 → **409**。⚠️ **不是** 40901 —— 40901 只表达 OCC，
+    //   业务唯一键冲突（`uk_t_hr_shift_code`）须有专用码，见 CLAUDE.md §8。
+    // 21903 = 班次时段非法 → **400**：段格式非法 / 零长段 / 乱序 / 段内重叠 /
+    //   首段 ≥ "24:00" / 超 48h / 空数组 / 超 6 段。
+    //   ⚠️ 同一个码也覆盖「库里那一列 jsonb 解不成 `Vec<Segment>`」的读侧降级 ——
+    //   那是**数据**坏了，但不能让它变成 500。
+    // 21904 = 日历区间非法 → **400**：`from > to`，或区间跨度 > 366 天
+    //   （防一个请求灌 10 年；批量 upsert 的日期跨度走同一条判据）。
+    // 21905 = 未知 `day_type` → **400**（无 DB ENUM，合法性只在 Rust 侧）。
+    // 21906 = 对已停用班次做写操作（改 / 停用 / 写覆盖行 / 清覆盖）→ **409**。
+    //   语义是「状态冲突」而非「入参非法」：改请求改不动，只能先启用班次。
+    // 21907 = `CUSTOM_LEAVE` 未填 `name` → **400**（自定义休息日没有名字没法排班表展示）。
+    // 21908 = 班次 span 超一天（`max(end) − min(start) > "24:00"`）→ **400**。
+    //   ⚠️ **单独一码、不并进 21903**：这一条是本域最关键的结构性护栏（跨日重叠 ⟺
+    //   span > 24h），卡死它之后相邻两日 / 隔日的班次实例在时间轴上不可能重叠，
+    //   日历写端点才能零重叠检查。给它独立码，前端可单独提示「时段总跨度超 24 小时」。
+    pub const BIZ_HR_SHIFT_NOT_FOUND: i32 = 21901;
+    pub const BIZ_HR_SHIFT_CODE_DUPLICATED: i32 = 21902;
+    pub const BIZ_HR_SHIFT_SEGMENT_INVALID: i32 = 21903;
+    pub const BIZ_HR_CALENDAR_RANGE_INVALID: i32 = 21904;
+    pub const BIZ_HR_DAY_TYPE_INVALID: i32 = 21905;
+    pub const BIZ_HR_SHIFT_INACTIVE: i32 = 21906;
+    pub const BIZ_HR_CALENDAR_LEAVE_NAME_REQUIRED: i32 = 21907;
+    pub const BIZ_HR_SHIFT_SPAN_EXCEEDS_DAY: i32 = 21908;
+
     // 系统错误
     pub const INTERNAL: i32 = 50000;
     pub const DATABASE: i32 = 50001;
@@ -672,7 +709,10 @@ fn status_from_code(c: i32) -> StatusCode {
             // 2026-10-18 新增（wecom 通道域 21806）：webhook 不存在**或已软删**。
             // 与 21801 的分工：21801 是「没配通道 → 服务不可用」，这里是「点了
             // 这个 id 但它不在」⇒ 调用方该换 id。
-            || c == code::BIZ_WECOM_WEBHOOK_NOT_FOUND =>
+            || c == code::BIZ_WECOM_WEBHOOK_NOT_FOUND
+            // 2026-10-19 新增（hr 人事排班域 21901）：班次不存在**或已软删**，
+            // 查 / 改 / 停用 / 写覆盖行四条路径共用（逐字对位 21706 / 21806）。
+            || c == code::BIZ_HR_SHIFT_NOT_FOUND =>
         {
             StatusCode::NOT_FOUND
         }
@@ -727,6 +767,26 @@ fn status_from_code(c: i32) -> StatusCode {
         // 下面 `(20000..30000) => BAD_REQUEST` 的兜底本来就是 400，这里显式登记是
         // 为了让「它落在 400 段」成为有断言的契约，而不是兜底的副产物。
         c if c == code::BIZ_CUSTOMER_HAS_CHILDREN => StatusCode::BAD_REQUEST,
+
+        // ---- 2xxxx 业务码：400（hr 人事排班域 21903 / 21904 / 21905 / 21907 / 21908，
+        // 2026-10-19 新增）----
+        // ⚠️ **5 个码全部必须显式登记**：下面 `(20000..30000) => BAD_REQUEST` 的兜底虽然
+        // 同值，但让「它落在 400 段」成为有断言的契约，而不是兜底的副产物 ——
+        // 这五码是本域唯一的入参面，前端按 code 分流文案，不该随兜底规则漂移。
+        // - 21903 时段非法（格式 / 零长 / 乱序 / 重叠 / 首段 ≥ 24:00 / 超 48h / 段数越界）
+        //   + 「库里那一列 jsonb 解不成 Vec<Segment>」的读侧降级（数据坏了也不能 500）。
+        // - 21904 区间非法（from > to 或跨度 > 366 天）。
+        // - 21905 未知 day_type（无 DB ENUM，合法性只在 Rust 侧）。
+        // - 21907 CUSTOM_LEAVE 未填 name。
+        // - 21908 班次 span > 24:00（本域的结构性护栏，单独一码便于前端单独提示）。
+        c if c == code::BIZ_HR_SHIFT_SEGMENT_INVALID
+            || c == code::BIZ_HR_CALENDAR_RANGE_INVALID
+            || c == code::BIZ_HR_DAY_TYPE_INVALID
+            || c == code::BIZ_HR_CALENDAR_LEAVE_NAME_REQUIRED
+            || c == code::BIZ_HR_SHIFT_SPAN_EXCEEDS_DAY =>
+        {
+            StatusCode::BAD_REQUEST
+        }
 
         // ---- 2xxxx 业务码：409 (状态冲突 / 重复 / 占用 / 锁) ----
         // 2026-09-30 新增：prod/pool/move 的 from/holder 不一致也归到 409 段，
@@ -783,7 +843,12 @@ fn status_from_code(c: i32) -> StatusCode {
             // 2026-10-18 新增（wecom 通道域）：webhook 重名（21807，**不是** 40901）
             // 与「webhook 被每日总结配置引用、禁止删除」（21808）。逐字对位 21707/21708。
             || c == code::BIZ_WECOM_WEBHOOK_NAME_DUPLICATE
-            || c == code::BIZ_WECOM_WEBHOOK_IN_USE =>
+            || c == code::BIZ_WECOM_WEBHOOK_IN_USE
+            // 2026-10-19 新增（hr 人事排班域）：班次 code 重复（21902，**不是** 40901
+            // —— 后者只表达 OCC，业务唯一键冲突须有专用码，见 CLAUDE.md §8）与
+            // 「对已停用班次做写操作」（21906，改 / 停用 / 写覆盖行 / 清覆盖）。
+            || c == code::BIZ_HR_SHIFT_CODE_DUPLICATED
+            || c == code::BIZ_HR_SHIFT_INACTIVE =>
         {
             StatusCode::CONFLICT
         }
@@ -1338,6 +1403,30 @@ mod tests {
             "BIZ_WECOM_WEBHOOK_NAME_DUPLICATE",
         ),
         (code::BIZ_WECOM_WEBHOOK_IN_USE, "BIZ_WECOM_WEBHOOK_IN_USE"),
+        // 219xx 人事排班（2026-10-19 新增：hr 域 = 全局日历 + 班次 + 班次日历覆盖）
+        (code::BIZ_HR_SHIFT_NOT_FOUND, "BIZ_HR_SHIFT_NOT_FOUND"),
+        (
+            code::BIZ_HR_SHIFT_CODE_DUPLICATED,
+            "BIZ_HR_SHIFT_CODE_DUPLICATED",
+        ),
+        (
+            code::BIZ_HR_SHIFT_SEGMENT_INVALID,
+            "BIZ_HR_SHIFT_SEGMENT_INVALID",
+        ),
+        (
+            code::BIZ_HR_CALENDAR_RANGE_INVALID,
+            "BIZ_HR_CALENDAR_RANGE_INVALID",
+        ),
+        (code::BIZ_HR_DAY_TYPE_INVALID, "BIZ_HR_DAY_TYPE_INVALID"),
+        (code::BIZ_HR_SHIFT_INACTIVE, "BIZ_HR_SHIFT_INACTIVE"),
+        (
+            code::BIZ_HR_CALENDAR_LEAVE_NAME_REQUIRED,
+            "BIZ_HR_CALENDAR_LEAVE_NAME_REQUIRED",
+        ),
+        (
+            code::BIZ_HR_SHIFT_SPAN_EXCEEDS_DAY,
+            "BIZ_HR_SHIFT_SPAN_EXCEEDS_DAY",
+        ),
         // 207xx 工艺链（worker-pool auto-allocate 阶段新增）
         (
             code::BIZ_PROCESS_CHAIN_NOT_FOUND,
@@ -1597,6 +1686,17 @@ mod tests {
         assert_eq!(code::BIZ_WECOM_WEBHOOK_IN_USE, 21808);
         // ⚠️ 21809 是 218xx 段的下一个空位：当前无生产方，**不预分配**
         // （与 217xx 段「21709 是下一个空位、不要用」同款纪律）。
+
+        // 219xx（hr 人事排班域，2026-10-19 新增）
+        assert_eq!(code::BIZ_HR_SHIFT_NOT_FOUND, 21901);
+        assert_eq!(code::BIZ_HR_SHIFT_CODE_DUPLICATED, 21902);
+        assert_eq!(code::BIZ_HR_SHIFT_SEGMENT_INVALID, 21903);
+        assert_eq!(code::BIZ_HR_CALENDAR_RANGE_INVALID, 21904);
+        assert_eq!(code::BIZ_HR_DAY_TYPE_INVALID, 21905);
+        assert_eq!(code::BIZ_HR_SHIFT_INACTIVE, 21906);
+        assert_eq!(code::BIZ_HR_CALENDAR_LEAVE_NAME_REQUIRED, 21907);
+        assert_eq!(code::BIZ_HR_SHIFT_SPAN_EXCEEDS_DAY, 21908);
+        // ⚠️ 21909 是 219xx 段的下一个空位：当前无生产方，**不预分配**（同上）。
     }
 
     /// 数据驱动的 HTTP 表覆盖测试：每个 (code, expected_http, name) 一行。
@@ -1746,6 +1846,49 @@ mod tests {
             code::BIZ_WECOM_WEBHOOK_IN_USE,
             StatusCode::CONFLICT,
             "BIZ_WECOM_WEBHOOK_IN_USE",
+        ),
+        // 2026-10-19 新增（hr 人事排班域 219xx）：班次不存在 / 已软删 → 404；
+        // code 重复 → 409（⚠️ 不是 40901，那一码只表达 OCC）；对已停用班次写 → 409；
+        // 时段非法 / 区间非法 / 未知 day_type / CUSTOM_LEAVE 缺 name / span 超 24h → 400。
+        (
+            code::BIZ_HR_SHIFT_NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            "BIZ_HR_SHIFT_NOT_FOUND",
+        ),
+        (
+            code::BIZ_HR_SHIFT_CODE_DUPLICATED,
+            StatusCode::CONFLICT,
+            "BIZ_HR_SHIFT_CODE_DUPLICATED",
+        ),
+        (
+            code::BIZ_HR_SHIFT_INACTIVE,
+            StatusCode::CONFLICT,
+            "BIZ_HR_SHIFT_INACTIVE",
+        ),
+        (
+            code::BIZ_HR_SHIFT_SEGMENT_INVALID,
+            StatusCode::BAD_REQUEST,
+            "BIZ_HR_SHIFT_SEGMENT_INVALID",
+        ),
+        (
+            code::BIZ_HR_CALENDAR_RANGE_INVALID,
+            StatusCode::BAD_REQUEST,
+            "BIZ_HR_CALENDAR_RANGE_INVALID",
+        ),
+        (
+            code::BIZ_HR_DAY_TYPE_INVALID,
+            StatusCode::BAD_REQUEST,
+            "BIZ_HR_DAY_TYPE_INVALID",
+        ),
+        (
+            code::BIZ_HR_CALENDAR_LEAVE_NAME_REQUIRED,
+            StatusCode::BAD_REQUEST,
+            "BIZ_HR_CALENDAR_LEAVE_NAME_REQUIRED",
+        ),
+        (
+            code::BIZ_HR_SHIFT_SPAN_EXCEEDS_DAY,
+            StatusCode::BAD_REQUEST,
+            "BIZ_HR_SHIFT_SPAN_EXCEEDS_DAY",
         ),
         (code::FORBIDDEN, StatusCode::FORBIDDEN, "FORBIDDEN"),
         (

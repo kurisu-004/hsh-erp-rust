@@ -1,0 +1,1091 @@
+//! `hr`（人事排班）域业务逻辑（**2026-10-19 新增**）：时段校验 V1–V6 +
+//! 10 条端点的用例编排。
+//!
+//! 自由函数（范式同 `serial::service` / `wecom::service`），签名收 `&mut PgConnection`
+//! —— **service 不知事务**，事务边界在 handler（CLAUDE.md「必须遵守的架构约定」第 1 条）。
+//!
+//! ## 权限守卫判在**第一行**（每个用例的第一句）
+//!
+//! `current.require_permission(PERM_VIEW)` / `require_permission(PERM_MANAGE)`。
+//! 放在用例开头而不是 handler，是为了让「无权的账号连候选 SELECT 都跑不到」——
+//! 本域的读端点会逐日推导并回传整个区间，写端点会跨两张表做批量写，都不该让无权者
+//! 拿它做信息探测。代价是无权账号会**先开一次事务**才被拒（写端点的事务在 handler），
+//! 但那只是短连接占用，零写入、不落锁。
+//!
+//! ## ⚠️ 本域**零 WS 广播**（有意取舍）
+//!
+//! 本域是**配置页**（人事在后台配日历 / 班次），**没有订阅方**：大屏 WS
+//! (`/ws/dashboard`) 的增量清单里没有排班数据，仓库当前也没有任何「排班变更」的
+//! 消费端。加一条没有订阅者的广播，等于给每个大屏客户端白加一次防抖与重取。
+//! 考勤排班表页面将来落地时，应当走它自己的取数路径（HTTP 首取 + 页面级刷新），
+//! 而不是给本域硬接一条 WS。
+
+use chrono::NaiveDate;
+use sqlx::PgConnection;
+
+use crate::auth::rbac::CurrentUser;
+use crate::infra::clock::now_naive;
+use crate::infra::snowflake::SnowflakeIdGenerator;
+use crate::modules::hr::dto::{
+    CalendarDaysDeleteRequest, CalendarDaysUpsertRequest, CalendarRangeQuery, CreateShiftRequest,
+    DeactivateShiftRequest, MAX_CLOCK_MINUTES, MAX_RANGE_DAYS, MAX_SEGMENTS, MAX_SPAN_MINUTES,
+    MIN_SEGMENTS, PERM_MANAGE, PERM_VIEW, ShiftCalendarRangeQuery, ShiftDaysDeleteRequest,
+    ShiftDaysUpsertRequest, ShiftListQuery, UpdateShiftRequest,
+};
+use crate::modules::hr::model::{DayType, ShiftSegment, TShiftRow, derive_from_weekday};
+use crate::modules::hr::repo;
+use crate::modules::hr::vo::{
+    CalendarDayOut, CalendarDaysOut, CalendarDaysWriteOut, ShiftCalendarDayOut, ShiftCalendarOut,
+    ShiftDaysWriteOut, ShiftListOut, ShiftOut,
+};
+use crate::shared::error::{AppError, code};
+
+// ============================================================================
+// 时段校验：绝对时钟轴 V1–V6
+// ============================================================================
+
+/// 段值的**严格**正则：`HH:MM`，`HH` 一到两位、`MM` 两位且落在 `00..=59`。
+///
+/// ⚠️ 刻意**不**做 trim / 大写折叠 / 补零：段值是 `t_hr_shift.segments` 的持久化
+/// 字面量，唯一合法形态就是库里那一种。`"8:00"` 会被这条正则**放行**（`{1,2}` 匹配一位
+/// 小时），但落库前由 [`format_clock`] 规范化成 `"08:00"`；而 `" 08:00"` / `"8:0"` /
+/// `"24:60"` 一律拒。
+pub const CLOCK_REGEX: &str = r"^([0-9]{1,2}):([0-5]\d)$";
+
+/// 编译一次的段值正则（`parse_clock` 每次调用都命中它 ⇒ 用 `LazyLock` 免重建，
+/// 同 `wecom::dto::webhook_url_regex`）。
+fn clock_regex() -> &'static regex::Regex {
+    static RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(CLOCK_REGEX).expect("常量正则必合法"));
+    &RE
+}
+
+/// 校验通过后的**规范化**结果（顺带带上三个派生列的原料）。
+///
+/// `segments` 已按 `start` 升序、`seq` 重编为 `1..n` —— 落库的就是这个形态，
+/// 于是「客户端传了乱 seq」不会让整列 jsonb 的字节形态无谓漂移。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedSegments {
+    pub segments: Vec<ShiftSegment>,
+    /// `max(end) > "24:00"`
+    pub cross_day: bool,
+    /// `max(end) − "24:00"`（分钟），不跨天时为 `0`
+    pub overflow_minutes: i32,
+    /// `Σ(end − start)`（分钟，无折算）
+    pub daily_minutes: i32,
+}
+
+/// 时段非法（V1–V5 全部归这一个码）。
+fn seg_invalid(msg: impl Into<String>) -> AppError {
+    AppError::biz(code::BIZ_HR_SHIFT_SEGMENT_INVALID, msg)
+}
+
+/// span 超一天（V6 专用码，见 `error.rs` 的 21908 声明）。
+fn span_invalid(msg: impl Into<String>) -> AppError {
+    AppError::biz(code::BIZ_HR_SHIFT_SPAN_EXCEEDS_DAY, msg)
+}
+
+/// 段值 → 自 `cal_date 00:00` 起算的分钟偏移。
+///
+/// 判据（三步，顺序固定）：
+/// 1. 严格正则 [`CLOCK_REGEX`]：`HH:MM`，`HH` 一到两位、`MM ∈ 00..=59`；
+/// 2. `hh > 48` 拒（`"49:00"`）；
+/// 3. 总分钟 `> 2880` 拒（`"48:30"` —— `hh ≤ 48` 已经过了第 2 步，但 `48:30`
+///    仍然越界，必须单独卡）。
+pub fn parse_clock(s: &str) -> Result<i32, AppError> {
+    let caps = clock_regex().captures(s).ok_or_else(|| {
+        seg_invalid(format!(
+            "段值 `{s}` 格式非法（应为 HH:MM，小时 0..48、分钟 00..59）"
+        ))
+    })?;
+    let hh: i32 = caps[1]
+        .parse()
+        .map_err(|_| seg_invalid(format!("段值 `{s}` 的小时不可解析")))?;
+    let mm: i32 = caps[2]
+        .parse()
+        .map_err(|_| seg_invalid(format!("段值 `{s}` 的分钟不可解析")))?;
+    if hh > 48 {
+        return Err(seg_invalid(format!(
+            "段值 `{s}` 越界：小时最大 48（`48:00`）"
+        )));
+    }
+    let total = hh * 60 + mm;
+    if total > MAX_CLOCK_MINUTES {
+        return Err(seg_invalid(format!(
+            "段值 `{s}` 越界：最大 `48:00`（{MAX_CLOCK_MINUTES} 分钟）"
+        )));
+    }
+    Ok(total)
+}
+
+/// 把分钟偏移格式化回 `"HH:MM"`（`24` 小时制，`48:00` 就是 48 点整）。
+fn format_clock(minutes: i32) -> String {
+    format!("{:02}:{:02}", minutes / 60, minutes % 60)
+}
+
+/// **班次时段校验 V1–V6**（本域最硬的一处口径，返回规范化结果）。
+///
+/// | # | 规则 | 违规码 |
+/// |---|---|---|
+/// | V1 | `0 ≤ start`，`end ≤ "48:00"` | 21903 |
+/// | V2 | `start < end`（严格，**不承认零长段**） | 21903 |
+/// | V3 | `segments[0].start < "24:00"`（首段必须落在当日） | 21903 |
+/// | V4 | 按 `start` 升序且不重叠：`start_{i+1} >= end_i` | 21903 |
+/// | V5 | `1 ≤ n ≤ 6` | 21903 |
+/// | **V6** | **`span = max(end) − min(start) ≤ "24:00"`** | **21908** |
+///
+/// ## V3 为什么必需：它是「日期归属」的锚
+///
+/// 段值是 `cal_date 00:00` 起算的**绝对偏移**，「跨天班次的日期归属 = 工作开始时间
+/// 所在日」由数据结构本身保证。若首段起点就在 `24:00` 之后（如 `25:00` 起），那这一班
+/// 的**开始时间**落在次日 ⇒ `cal_date` 不再是它的归属日，出参里的
+/// `cal_date` / `is_override` / 日历写端点全部失去意义。V3 把这种形态在写侧就拒掉。
+///
+/// ## ⚠️ V6 是本设计最关键的一刀，**不许放宽**
+///
+/// **跨日重叠 ⟺ `span > 24h`**。卡死 V6 之后：
+/// * 相邻两日（今天 22:00→次日 02:00、明天 22:00→后天 02:00）、隔日的班次实例在
+///   时间轴上**结构性地不可能重叠** ⇒ 日历写端点**零重叠检查**（它们只需要「同一天
+///   只能有一个班次实例」这条同日语义，那由 `t_hr_shift_calendar` 的
+///   `(shift_id, cal_date)` 唯一索引守着）；
+/// * 同时它也是「一个班次实例最长 24 小时」的劳动法底线。
+///
+/// 放宽 V6 的代价不是「多一种排班形态」，而是**日历写端点必须新增一条重叠检查**，
+/// 而那条检查要跨 366 天 × N 个班次做区间求交 —— 一次请求 O(days × shifts)，且
+/// 与并发插入之间存在 TOCTOU 窗口。V6 是拿「排班形态的表达力」换「日历写端点的
+/// 可证明正确」，这个取舍是有意的。
+pub fn validate_segments(segments: &[ShiftSegment]) -> Result<NormalizedSegments, AppError> {
+    // ── V5：段数 ──
+    if segments.len() < MIN_SEGMENTS || segments.len() > MAX_SEGMENTS {
+        return Err(seg_invalid(format!(
+            "时段段数必须介于 {MIN_SEGMENTS}..={MAX_SEGMENTS}，实得 {}",
+            segments.len()
+        )));
+    }
+
+    // ── 先把每个段值解成分钟（V1 的格式 / 越界部分；解析失败全部 21903）──
+    let mut bounds: Vec<(i32, i32)> = Vec::with_capacity(segments.len());
+    for seg in segments {
+        let start = parse_clock(&seg.start)?;
+        let end = parse_clock(&seg.end)?;
+        bounds.push((start, end));
+    }
+
+    // ── V2：start < end（严格，不承认零长段）──
+    for (i, (start, end)) in bounds.iter().enumerate() {
+        if start >= end {
+            return Err(seg_invalid(format!(
+                "第 {} 段 start({}) 必须严格小于 end({})",
+                i + 1,
+                format_clock(*start),
+                format_clock(*end)
+            )));
+        }
+    }
+
+    // ── V4a：按 start 升序（**乱序是错，不是「顺手排一下」**）──
+    for i in 1..bounds.len() {
+        if bounds[i].0 <= bounds[i - 1].0 {
+            return Err(seg_invalid(format!(
+                "时段必须按 start 升序：第 {} 段 start({}) 不大于第 {} 段 start({})",
+                i + 1,
+                format_clock(bounds[i].0),
+                i,
+                format_clock(bounds[i - 1].0)
+            )));
+        }
+    }
+
+    // ── V4b：不重叠（`start_{i+1} >= end_i`，相邻段可以首尾相接）──
+    for i in 1..bounds.len() {
+        if bounds[i].0 < bounds[i - 1].1 {
+            return Err(seg_invalid(format!(
+                "第 {} 段 start({}) 与第 {} 段 end({}) 重叠",
+                i + 1,
+                format_clock(bounds[i].0),
+                i,
+                format_clock(bounds[i - 1].1)
+            )));
+        }
+    }
+
+    // ── V3：首段起点必须落在当日 ──
+    let first_start = bounds[0].0;
+    if first_start >= 24 * 60 {
+        return Err(seg_invalid(format!(
+            "首段起点({}) 必须早于 `24:00`，否则工作开始时间不在 cal_date 当日、日期归属无从谈起",
+            format_clock(first_start)
+        )));
+    }
+
+    // ── V6：span ≤ 24:00（本域的结构性护栏，见上方 doc）──
+    let min_start = first_start;
+    let max_end = bounds.iter().map(|(_, end)| *end).max().unwrap_or(0);
+    let span = max_end - min_start;
+    if span > MAX_SPAN_MINUTES {
+        return Err(span_invalid(format!(
+            "时段总跨度 {}（{} → {}）超过 24:00；跨日重叠 ⟺ span > 24h，\
+             卡死这条才能让日历写端点零重叠检查",
+            format_clock(span),
+            format_clock(min_start),
+            format_clock(max_end)
+        )));
+    }
+
+    // ── 规范化：seq 重编为 1..n，段值补零成 `"HH:MM"` ──
+    let normalized = bounds
+        .iter()
+        .enumerate()
+        .map(|(i, (start, end))| {
+            ShiftSegment::new(i as u8 + 1, &format_clock(*start), &format_clock(*end))
+        })
+        .collect::<Vec<_>>();
+
+    Ok(NormalizedSegments {
+        daily_minutes: bounds.iter().map(|(s, e)| e - s).sum(),
+        cross_day: max_end > 24 * 60,
+        overflow_minutes: (max_end - 24 * 60).max(0),
+        segments: normalized,
+    })
+}
+
+/// 读库路径用：jsonb 原值 → 规范化结果。
+///
+/// ⚠️ **两处降级都不是 500**：
+/// * `serde_json::from_value` 失败（库里那一列被手工改坏）→ `21903`；
+/// * 解析成功但**过不了 V1–V6**（CHECK 约束只管「1..6 个元素」，管不住元素内容）→
+///   同一条 `validate_segments` 的码。
+///
+/// 复用校验而不是「读出来就算」：三个派生列（`cross_day` / `overflow_minutes` /
+/// `daily_minutes`）必须**永远**是由同一套规则算出来的，否则同一行在不同请求里会
+/// 给出不同的派生值。
+pub fn parse_segments_strict(v: &serde_json::Value) -> Result<NormalizedSegments, AppError> {
+    let raw: Vec<ShiftSegment> = serde_json::from_value(v.clone()).map_err(|e| {
+        seg_invalid(format!(
+            "班次时段列不是合法的时段数组（jsonb 解析失败：{e}）；请用写端点重建该班次的时段"
+        ))
+    })?;
+    validate_segments(&raw)
+}
+
+/// 行 → 出参（含三个派生列；派生失败按上面的口径降级而不是 500）。
+fn shift_out(row: &TShiftRow) -> Result<ShiftOut, AppError> {
+    let norm = parse_segments_strict(&row.segments)?;
+    Ok(ShiftOut {
+        id: row.id,
+        version: row.version,
+        code: row.code.clone(),
+        name: row.name.clone(),
+        color: row.color.clone(),
+        segments: norm.segments,
+        is_active: row.is_active,
+        sort_order: row.sort_order,
+        remark: row.remark.clone(),
+        cross_day: norm.cross_day,
+        overflow_minutes: norm.overflow_minutes,
+        daily_minutes: norm.daily_minutes,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    })
+}
+
+// ============================================================================
+// 区间校验（21904）
+// ============================================================================
+
+/// 区间合法性：`from <= to` 且跨度 ≤ [`MAX_RANGE_DAYS`] 天（两端闭）。
+///
+/// ⚠️ 批量 upsert 的 `{items:[…]}` 走**同一条**判据：`items` 的最小 / 最大 `cal_date`
+/// 构成一个隐式区间。不卡它的话，攒一个大 `items` 就能把「一个请求最多 366 天」的
+/// 承诺从读端点绕过去 —— 那个上限本来就是防「一个请求灌 10 年」用的。
+pub fn validate_range(from: NaiveDate, to: NaiveDate) -> Result<(), AppError> {
+    if from > to {
+        return Err(AppError::biz(
+            code::BIZ_HR_CALENDAR_RANGE_INVALID,
+            format!("区间非法：from({from}) 晚于 to({to})"),
+        ));
+    }
+    let days = (to - from).num_days();
+    if days > MAX_RANGE_DAYS {
+        return Err(AppError::biz(
+            code::BIZ_HR_CALENDAR_RANGE_INVALID,
+            format!("区间跨度 {days} 天超过上限 {MAX_RANGE_DAYS} 天"),
+        ));
+    }
+    Ok(())
+}
+
+/// 一批 `cal_date` 的隐式区间校验（空批 → 21904）。
+fn validate_date_batch(dates: &[NaiveDate]) -> Result<(), AppError> {
+    if dates.is_empty() {
+        return Err(AppError::biz(
+            code::BIZ_HR_CALENDAR_RANGE_INVALID,
+            "items 为空：没有要写入的日期",
+        ));
+    }
+    let min = dates.iter().copied().min().expect("非空");
+    let max = dates.iter().copied().max().expect("非空");
+    validate_range(min, max)
+}
+
+/// 删行请求的两种形态归一：`{dates:[…]}` 或 `{from,to}`（必恰好命中一种）。
+#[derive(Debug)]
+enum DeleteTarget {
+    Dates(Vec<NaiveDate>),
+    Range(NaiveDate, NaiveDate),
+}
+
+/// 把 `{dates | from+to}` 归一成 [`DeleteTarget`]；两种都没给 / 都给 / `dates` 为空
+/// 一律 `21904`（而不是「删 0 行」的假成功）。
+fn resolve_delete_target(
+    dates: Option<Vec<NaiveDate>>,
+    from: Option<NaiveDate>,
+    to: Option<NaiveDate>,
+) -> Result<DeleteTarget, AppError> {
+    match (dates, from, to) {
+        (Some(ds), None, None) => {
+            if ds.is_empty() {
+                return Err(AppError::biz(
+                    code::BIZ_HR_CALENDAR_RANGE_INVALID,
+                    "dates 为空数组：等于没说要删什么",
+                ));
+            }
+            validate_date_batch(&ds)?;
+            Ok(DeleteTarget::Dates(ds))
+        }
+        (None, Some(f), Some(t)) => {
+            validate_range(f, t)?;
+            Ok(DeleteTarget::Range(f, t))
+        }
+        // ⚠️ 其余全部形态（都省 / 只给一半 / 都给）一律 21904。用 catch-all 而不是
+        // 逐个列举：`Option<Vec<_>>` 的组合有 3×2×2 = 12 种，逐个列必然漏一两个。
+        _ => Err(AppError::biz(
+            code::BIZ_HR_CALENDAR_RANGE_INVALID,
+            "删行请求必须二选一：{dates:[…]} 或 {from,to}（不能都省、不能只给一半、不能都给）",
+        )),
+    }
+}
+
+// ============================================================================
+// 端点 1：全局日历区间读
+// ============================================================================
+
+/// `GET /calendar/days?from&to` —— 全局日历区间读（**逐日一行，一天都不省**）。
+///
+/// 返回的每一天要么来自显式行（`derived = false`），要么按星期推导补齐
+/// （`derived = true`）。
+pub async fn list_calendar_days(
+    conn: &mut PgConnection,
+    current: &CurrentUser,
+    query: &CalendarRangeQuery,
+) -> Result<CalendarDaysOut, AppError> {
+    current.require_permission(PERM_VIEW)?;
+    validate_range(query.from, query.to)?;
+
+    let rows = repo::list_calendar_days(conn, query.from, query.to).await?;
+    let mut items = Vec::with_capacity((query.to - query.from).num_days() as usize + 1);
+    // ⚠️ 走「一个游标 + 一个下标」的线性推进，而不是 `HashMap`：`rows` 已按 `cal_date`
+    // 升序返回，两条有序序列求差集在 O(n) 里完成，不必建索引表。
+    let mut it = rows.into_iter();
+    let mut next_row = it.next();
+    let mut cursor = query.from;
+    while cursor <= query.to {
+        match next_row.as_ref().filter(|r| r.cal_date == cursor) {
+            Some(_) => {
+                let row = next_row.take().expect("刚 peek 到必然还挂着");
+                items.push(CalendarDayOut {
+                    cal_date: row.cal_date,
+                    day_type: DayType::parse(&row.day_type)?,
+                    name: row.name,
+                    derived: false,
+                });
+                next_row = it.next();
+            }
+            None => items.push(CalendarDayOut {
+                cal_date: cursor,
+                day_type: derive_from_weekday(cursor),
+                name: None,
+                derived: true,
+            }),
+        }
+        cursor += chrono::Duration::days(1);
+    }
+    Ok(CalendarDaysOut { items })
+}
+
+// ============================================================================
+// 端点 2：全局日历批量 upsert
+// ============================================================================
+
+/// `POST /calendar/days` —— 批量 upsert 全局日历显式行（**只存例外**）。
+pub async fn upsert_calendar_days(
+    conn: &mut PgConnection,
+    snowflake: &SnowflakeIdGenerator,
+    current: &CurrentUser,
+    req: &CalendarDaysUpsertRequest,
+) -> Result<CalendarDaysWriteOut, AppError> {
+    current.require_permission(PERM_MANAGE)?;
+
+    let dates: Vec<NaiveDate> = req.items.iter().map(|i| i.cal_date).collect();
+    validate_date_batch(&dates)?;
+
+    // 先逐条校验（day_type 合法性 / CUSTOM_LEAVE 必须带 name），**全部过了再落库**
+    // —— 批写是「要么这批全过、要么一行不进」的语义（handler 的事务边界）。
+    let mut rows = Vec::with_capacity(req.items.len());
+    for item in &req.items {
+        let dt = DayType::parse(&item.day_type)?;
+        if dt == DayType::CustomLeave && item.name.as_deref().unwrap_or("").trim().is_empty() {
+            return Err(AppError::biz(
+                code::BIZ_HR_CALENDAR_LEAVE_NAME_REQUIRED,
+                format!(
+                    "{} 是自定义休息日，必须填 name（排班表要显示它）",
+                    item.cal_date
+                ),
+            ));
+        }
+        rows.push(repo::NewCalendarDay {
+            id: snowflake.next_id(),
+            cal_date: item.cal_date,
+            day_type: dt.as_str().to_string(),
+            name: item.name.clone(),
+            remark: item.remark.clone(),
+        });
+    }
+
+    let affected = repo::upsert_calendar_days(conn, &rows, current.id, now_naive()).await?;
+    Ok(CalendarDaysWriteOut { affected })
+}
+
+// ============================================================================
+// 端点 3：全局日历批量删行
+// ============================================================================
+
+/// `POST /calendar/days/delete` —— 删掉显式行，那几天**回退到按星期推导**。
+///
+/// ⚠️ `affected = 0` 是**合法成功**：那几天本来就没有显式行。
+pub async fn delete_calendar_days(
+    conn: &mut PgConnection,
+    current: &CurrentUser,
+    req: &CalendarDaysDeleteRequest,
+) -> Result<CalendarDaysWriteOut, AppError> {
+    current.require_permission(PERM_MANAGE)?;
+    let target = resolve_delete_target(req.dates.clone(), req.from, req.to)?;
+    let affected = match target {
+        DeleteTarget::Dates(ds) => {
+            repo::soft_delete_calendar_days_by_dates(conn, &ds, current.id, now_naive()).await?
+        }
+        DeleteTarget::Range(f, t) => {
+            repo::soft_delete_calendar_days_by_range(conn, f, t, current.id, now_naive()).await?
+        }
+    };
+    Ok(CalendarDaysWriteOut { affected })
+}
+
+// ============================================================================
+// 端点 4：班次列表
+// ============================================================================
+
+/// `GET /shifts?include_inactive` —— 班次列表（含三个派生列）。
+pub async fn list_shifts(
+    conn: &mut PgConnection,
+    current: &CurrentUser,
+    query: &ShiftListQuery,
+) -> Result<ShiftListOut, AppError> {
+    current.require_permission(PERM_VIEW)?;
+    let rows = repo::list_shifts(conn, query.include_inactive).await?;
+    let mut items = Vec::with_capacity(rows.len());
+    for row in &rows {
+        items.push(shift_out(row)?);
+    }
+    Ok(ShiftListOut { items })
+}
+
+// ============================================================================
+// 端点 5：建班次
+// ============================================================================
+
+/// `POST /shifts` —— 建班次（`version = 0`、`is_active = true`）。
+pub async fn create_shift(
+    conn: &mut PgConnection,
+    snowflake: &SnowflakeIdGenerator,
+    current: &CurrentUser,
+    req: &CreateShiftRequest,
+) -> Result<ShiftOut, AppError> {
+    current.require_permission(PERM_MANAGE)?;
+    let norm = validate_segments(&req.segments)?;
+
+    // 应用层预检（friendly message）+ DB partial unique（并发兜底）。
+    // ⚠️ 两条都映射成**同一个** `21902`：调用方不该区分「我查出来的」与「撞并发撞出来的」。
+    if repo::code_exists(conn, req.code.trim(), None).await? {
+        return Err(code_dup_error(req.code.trim()));
+    }
+    let id = snowflake.next_id();
+    let segments_json: Vec<serde_json::Value> = norm
+        .segments
+        .iter()
+        .map(|s| serde_json::to_value(s).expect("ShiftSegment 必可序列化"))
+        .collect();
+    let new = repo::NewShift {
+        id,
+        code: req.code.trim().to_string(),
+        name: req.name.trim().to_string(),
+        color: req.color.clone(),
+        segments: segments_json,
+        sort_order: req.sort_order.unwrap_or(0),
+        remark: req.remark.clone(),
+        operator: current.id,
+        now: now_naive(),
+    };
+    repo::insert_shift(conn, &new).await.map_err(|e| {
+        if crate::shared::error::is_unique_violation(&e) {
+            code_dup_error(&new.code)
+        } else {
+            AppError::Database(e)
+        }
+    })?;
+
+    let row = repo::get_shift(conn, id)
+        .await?
+        .ok_or_else(|| AppError::internal("班次刚建好就读不回来"))?;
+    shift_out(&row)
+}
+
+/// code 重复（`21902`，HTTP **409** —— ⚠️ 不是 `40901`，后者只表达 OCC）。
+fn code_dup_error(code: &str) -> AppError {
+    AppError::biz(
+        code::BIZ_HR_SHIFT_CODE_DUPLICATED,
+        format!("班次编码 `{code}` 已存在"),
+    )
+}
+
+// ============================================================================
+// 端点 6：改班次
+// ============================================================================
+
+/// `POST /shifts/{id}` —— 改班次（**部分覆盖** + OCC）。
+///
+/// `segments` 是**单列覆盖**（传了就整列替换，不做段级 merge）；其余字段同理
+/// （body 里给了才改）。⚠️ `color` / `remark` 传 `null` 等于「**这次不改**」——
+/// 本端点**没有**「显式清空某个可空列」的语义（要清空就传空串）。
+pub async fn update_shift(
+    conn: &mut PgConnection,
+    current: &CurrentUser,
+    id: i64,
+    req: &UpdateShiftRequest,
+) -> Result<ShiftOut, AppError> {
+    current.require_permission(PERM_MANAGE)?;
+
+    let row = repo::get_shift(conn, id)
+        .await?
+        .ok_or_else(shift_not_found)?;
+    ensure_writable(&row)?;
+
+    // 时段：给了就重新走一遍 V1–V6（不能只信「它是之前校验过的」—— 客户端可以
+    // 直接传一条手工构造的 segments）；没给就沿用行上那份（同样过一遍校验，让三个
+    // 派生列与写路径同源）。
+    let norm = match &req.segments {
+        Some(segs) => validate_segments(segs)?,
+        None => parse_segments_strict(&row.segments)?,
+    };
+    let segments_json: Vec<serde_json::Value> = norm
+        .segments
+        .iter()
+        .map(|s| serde_json::to_value(s).expect("ShiftSegment 必可序列化"))
+        .collect();
+
+    let new_code = req.code.as_deref().unwrap_or(&row.code).trim().to_string();
+    if new_code != row.code && repo::code_exists(conn, &new_code, Some(id)).await? {
+        return Err(code_dup_error(&new_code));
+    }
+
+    let patch = repo::ShiftPatch {
+        code: new_code,
+        name: req
+            .name
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or(&row.name)
+            .to_string(),
+        color: req.color.clone().or_else(|| row.color.clone()),
+        segments: segments_json,
+        sort_order: req.sort_order.unwrap_or(row.sort_order),
+        remark: req.remark.clone().or_else(|| row.remark.clone()),
+        operator: current.id,
+        now: now_naive(),
+    };
+    let affected = repo::update_shift(conn, id, req.version, &patch)
+        .await
+        .map_err(|e| {
+            // 改成已占用的 code → 撞 `uk_t_hr_shift_code`（并发兜底，与上面的预检同码）。
+            if crate::shared::error::is_unique_violation(&e) {
+                code_dup_error(&patch.code)
+            } else {
+                AppError::Database(e)
+            }
+        })?;
+    if affected == 0 {
+        // 归因：行还在（上面刚读到过）⇒ 是 version 陈旧，不是「不存在」。
+        // ⚠️ 这是 CLAUDE.md §8 允许的「兜底对账」，不是隐式 OCC：真正的 OCC 锚是
+        // body 里那个必填的 `version`。
+        return Err(occ_conflict());
+    }
+
+    let row = repo::get_shift(conn, id)
+        .await?
+        .ok_or_else(shift_not_found)?;
+    shift_out(&row)
+}
+
+/// OCC 冲突（`40901`）。⚠️ **只表达 OCC**，业务唯一键冲突走 `21902`。
+fn occ_conflict() -> AppError {
+    AppError::biz(
+        code::VERSION_CONFLICT,
+        "班次已被他人修改，请重新加载后再提交",
+    )
+}
+
+/// 班次不存在 / 已软删（`21901`，HTTP 404）。
+fn shift_not_found() -> AppError {
+    AppError::biz(code::BIZ_HR_SHIFT_NOT_FOUND, "班次不存在或已删除")
+}
+
+/// 对已停用班次做写操作（`21906`，HTTP 409）。
+fn inactive_error(row: &TShiftRow) -> AppError {
+    AppError::biz(
+        code::BIZ_HR_SHIFT_INACTIVE,
+        format!(
+            "班次「{}」（{}）已停用，不能再改 / 写覆盖行 / 清覆盖",
+            row.name, row.code
+        ),
+    )
+}
+
+/// 「这个班次现在能不能被写」的唯一判据（停用 ⇒ 一切写操作 409）。
+fn ensure_writable(row: &TShiftRow) -> Result<(), AppError> {
+    if row.is_active {
+        Ok(())
+    } else {
+        Err(inactive_error(row))
+    }
+}
+
+// ============================================================================
+// 端点 7：停用班次
+// ============================================================================
+
+/// `POST /shifts/{id}/deactivate` —— 停用（软下架）。
+///
+/// ⚠️ **不软删 `t_hr_shift` 行、不级联软删 `t_hr_shift_calendar` 的覆盖行**：
+/// 历史考勤还要复现当年那天的口径。重复停用 → `21906`（幂等拒绝）。
+pub async fn deactivate_shift(
+    conn: &mut PgConnection,
+    current: &CurrentUser,
+    id: i64,
+    req: &DeactivateShiftRequest,
+) -> Result<ShiftOut, AppError> {
+    current.require_permission(PERM_MANAGE)?;
+    let row = repo::get_shift(conn, id)
+        .await?
+        .ok_or_else(shift_not_found)?;
+    ensure_writable(&row)?;
+
+    let affected = repo::deactivate_shift(conn, id, req.version, current.id, now_naive()).await?;
+    if affected == 0 {
+        return Err(occ_conflict());
+    }
+    let row = repo::get_shift(conn, id)
+        .await?
+        .ok_or_else(shift_not_found)?;
+    shift_out(&row)
+}
+
+// ============================================================================
+// 端点 8：班次区间日历
+// ============================================================================
+
+/// `GET /shifts/{id}/calendar?from&to` —— 班次的工作日历区间读。
+///
+/// 每一天同时回传 `global_day_type`（全局日历说的）与 `effective_day_type`
+/// （覆盖行 / 全局行 / 星期推导三级推导的结果）⇒ 前端可以既显示「这天全局是节假日」
+/// 又显示「但这个班次那天照常上班」，**不需要自己实现推导**。
+pub async fn list_shift_calendar(
+    conn: &mut PgConnection,
+    current: &CurrentUser,
+    id: i64,
+    query: &ShiftCalendarRangeQuery,
+) -> Result<ShiftCalendarOut, AppError> {
+    current.require_permission(PERM_VIEW)?;
+    validate_range(query.from, query.to)?;
+    // 班次不存在 / 已软删 → 404（读端点同样要判，否则会对着一个不存在的班次返回
+    // 一整段「全部走推导」的空日历，看起来像「这个班次不排班」）。
+    let _ = repo::get_shift(conn, id)
+        .await?
+        .ok_or_else(shift_not_found)?;
+
+    let global_rows = repo::list_calendar_days(conn, query.from, query.to).await?;
+    let override_rows = repo::list_shift_days(conn, id, query.from, query.to).await?;
+
+    let globals = into_day_map(global_rows.into_iter().map(|r| (r.cal_date, r.day_type)));
+    let overrides = into_day_map(override_rows.into_iter().map(|r| (r.cal_date, r.day_type)));
+
+    let mut items = Vec::with_capacity((query.to - query.from).num_days() as usize + 1);
+    let mut cursor = query.from;
+    while cursor <= query.to {
+        // 第 2 级：全局日历行
+        let global_day_type = match globals.get(&cursor) {
+            Some(raw) => DayType::parse(raw)?,
+            None => derive_from_weekday(cursor),
+        };
+        // 第 1 级：班次覆盖行
+        let (effective_day_type, is_override) = match overrides.get(&cursor) {
+            Some(raw) => (DayType::parse(raw)?, true),
+            None => (global_day_type, false),
+        };
+        items.push(ShiftCalendarDayOut {
+            cal_date: cursor,
+            global_day_type,
+            effective_day_type,
+            is_workday: effective_day_type.is_workday(),
+            is_override,
+        });
+        cursor += chrono::Duration::days(1);
+    }
+    Ok(ShiftCalendarOut {
+        shift_id: id,
+        items,
+    })
+}
+
+/// `Vec<(NaiveDate, String)>` → `HashMap<NaiveDate, String>`。
+///
+/// ⚠️ 若同一日期出现两次（partial unique 索引漏网 / 手工改过库），**后写覆盖先写**
+/// 而不是报错 —— 读端点不该因为库里有一条脏数据就整个失败（那会把「这张日历打不开」
+/// 变成排班系统不可用）。写入侧的唯一索引才是防线。
+fn into_day_map(
+    rows: impl Iterator<Item = (NaiveDate, String)>,
+) -> std::collections::HashMap<NaiveDate, String> {
+    rows.collect()
+}
+
+// ============================================================================
+// 端点 9：班次覆盖行批量 upsert
+// ============================================================================
+
+/// `POST /shifts/{id}/calendar/days` —— 批量 upsert 班次覆盖行。
+pub async fn upsert_shift_days(
+    conn: &mut PgConnection,
+    snowflake: &SnowflakeIdGenerator,
+    current: &CurrentUser,
+    id: i64,
+    req: &ShiftDaysUpsertRequest,
+) -> Result<ShiftDaysWriteOut, AppError> {
+    current.require_permission(PERM_MANAGE)?;
+    let row = repo::get_shift(conn, id)
+        .await?
+        .ok_or_else(shift_not_found)?;
+    ensure_writable(&row)?;
+
+    let dates: Vec<NaiveDate> = req.items.iter().map(|i| i.cal_date).collect();
+    validate_date_batch(&dates)?;
+
+    let mut rows = Vec::with_capacity(req.items.len());
+    for item in &req.items {
+        // ⚠️ 覆盖行**不**校验 `CUSTOM_LEAVE` 必须带 name：`t_hr_shift_calendar` 表
+        // **没有** `name` 列（那个名字属于全局日历的语义，见迁移注释）。
+        // 要写说明走 `remark`。日型合法性照常校验（未知 → 21905）。
+        rows.push(repo::NewShiftDay {
+            id: snowflake.next_id(),
+            cal_date: item.cal_date,
+            day_type: DayType::parse(&item.day_type)?.as_str().to_string(),
+            remark: item.remark.clone(),
+        });
+    }
+
+    let affected = repo::upsert_shift_days(conn, id, &rows, current.id, now_naive()).await?;
+    Ok(ShiftDaysWriteOut { affected })
+}
+
+// ============================================================================
+// 端点 10：清班次覆盖
+// ============================================================================
+
+/// `POST /shifts/{id}/calendar/days/delete` —— 清覆盖，那几天回退到全局日历。
+pub async fn delete_shift_days(
+    conn: &mut PgConnection,
+    current: &CurrentUser,
+    id: i64,
+    req: &ShiftDaysDeleteRequest,
+) -> Result<ShiftDaysWriteOut, AppError> {
+    current.require_permission(PERM_MANAGE)?;
+    let row = repo::get_shift(conn, id)
+        .await?
+        .ok_or_else(shift_not_found)?;
+    ensure_writable(&row)?;
+
+    let target = resolve_delete_target(req.dates.clone(), req.from, req.to)?;
+    let affected = match target {
+        DeleteTarget::Dates(ds) => {
+            repo::soft_delete_shift_days_by_dates(conn, id, &ds, current.id, now_naive()).await?
+        }
+        DeleteTarget::Range(f, t) => {
+            repo::soft_delete_shift_days_by_range(conn, id, f, t, current.id, now_naive()).await?
+        }
+    };
+    Ok(ShiftDaysWriteOut { affected })
+}
+
+// ============================================================================
+// 表驱动单测：validate_segments 的 V1–V6
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+
+    /// 段数组糖：`[("22:00","26:00"), …]`，`seq` 按序自动编号。
+    fn segs(pairs: &[(&str, &str)]) -> Vec<ShiftSegment> {
+        pairs
+            .iter()
+            .enumerate()
+            .map(|(i, (s, e))| ShiftSegment::new(i as u8 + 1, s, e))
+            .collect()
+    }
+
+    /// **合法 5 例** + 逐例的派生列期望。
+    ///
+    /// 派生列一起钉，是为了让「`overflow_minutes` 不跨天时恒为 0」与
+    /// 「`daily_minutes` 是各段之和、无折算」这两条口径不被后来人无声改动。
+    #[test]
+    fn valid_segments_accepted_with_expected_derived_values() {
+        let cases: &[(&str, Vec<ShiftSegment>, bool, i32, i32)] = &[
+            (
+                "夜班 22:00→次日 02:00（最小跨天形态）",
+                segs(&[("22:00", "26:00")]),
+                true,
+                120,
+                240,
+            ),
+            (
+                "24 小时连做 08:00→次日 08:00（span 恰好 24:00，V6 边界）",
+                segs(&[("08:00", "32:00")]),
+                true,
+                480,
+                1440,
+            ),
+            (
+                "夜班 + 次日早班（两段都跨天，span 12:00）",
+                segs(&[("22:00", "26:00"), ("28:00", "34:00")]),
+                true,
+                600,
+                600,
+            ),
+            (
+                "周末白班两段（不跨天，段间留 1 小时午休）",
+                segs(&[("08:00", "12:00"), ("13:00", "17:00")]),
+                false,
+                0,
+                480,
+            ),
+            (
+                "单段 00:00→24:00（end 恰在边界，**不算**跨天）",
+                segs(&[("00:00", "24:00")]),
+                false,
+                0,
+                1440,
+            ),
+        ];
+
+        for (desc, input, want_cross, want_overflow, want_minutes) in cases {
+            let got = validate_segments(input)
+                .unwrap_or_else(|e| panic!("`{desc}` 应当合法，实际被拒：{e}"));
+            assert_eq!(got.cross_day, *want_cross, "`{desc}` 的 cross_day");
+            assert_eq!(
+                got.overflow_minutes, *want_overflow,
+                "`{desc}` 的 overflow_minutes"
+            );
+            assert_eq!(
+                got.daily_minutes, *want_minutes,
+                "`{desc}` 的 daily_minutes"
+            );
+        }
+    }
+
+    /// **非法 8 例** + 每例期望的错误码。
+    ///
+    /// 逐例钉到**具体码**（而不是只钉「被拒」）：`21903`（V1–V5 段形态问题）与
+    /// `21908`（V6 span 超一天）是两种语义，前端文案不同，混掉就没法只改一条。
+    #[test]
+    fn invalid_segments_rejected_with_expected_code() {
+        struct Case {
+            desc: &'static str,
+            input: Vec<ShiftSegment>,
+            want: i32,
+        }
+        let seven = segs(&[
+            ("01:00", "02:00"),
+            ("03:00", "04:00"),
+            ("05:00", "06:00"),
+            ("07:00", "08:00"),
+            ("09:00", "10:00"),
+            ("11:00", "12:00"),
+            ("13:00", "14:00"),
+        ]);
+        let cases = vec![
+            Case {
+                desc: "零长段（start == end，V2 严格小于）",
+                input: segs(&[("08:00", "08:00")]),
+                want: code::BIZ_HR_SHIFT_SEGMENT_INVALID,
+            },
+            Case {
+                desc: "乱序（第二段 start 早于第一段，V4a）",
+                input: segs(&[("13:00", "17:00"), ("08:00", "12:00")]),
+                want: code::BIZ_HR_SHIFT_SEGMENT_INVALID,
+            },
+            Case {
+                desc: "段内重叠（第二段 start 早于第一段 end，V4b）",
+                input: segs(&[("08:00", "13:00"), ("12:00", "17:00")]),
+                want: code::BIZ_HR_SHIFT_SEGMENT_INVALID,
+            },
+            Case {
+                desc: "首段起点 ≥ 24:00（日期归属无从谈起，V3）",
+                input: segs(&[("24:00", "28:00")]),
+                want: code::BIZ_HR_SHIFT_SEGMENT_INVALID,
+            },
+            Case {
+                desc: "超 48 小时（`49:00`，V1 上界）",
+                input: segs(&[("08:00", "49:00")]),
+                want: code::BIZ_HR_SHIFT_SEGMENT_INVALID,
+            },
+            Case {
+                desc: "空数组（V5 下界）",
+                input: segs(&[]),
+                want: code::BIZ_HR_SHIFT_SEGMENT_INVALID,
+            },
+            Case {
+                desc: "超 6 段（V5 上界）",
+                input: seven,
+                want: code::BIZ_HR_SHIFT_SEGMENT_INVALID,
+            },
+            Case {
+                desc: "span > 24:00（V1–V5 全过，只卡 V6 ⇒ 必须落 21908）",
+                input: segs(&[("08:00", "20:00"), ("26:00", "33:00")]),
+                want: code::BIZ_HR_SHIFT_SPAN_EXCEEDS_DAY,
+            },
+        ];
+
+        for c in cases {
+            let err = validate_segments(&c.input)
+                .err()
+                .unwrap_or_else(|| panic!("`{}` 应当被拒，实际被接受", c.desc));
+            assert_eq!(err.code(), c.want, "`{}` 的错误码不对：{err}", c.desc);
+        }
+    }
+
+    /// V6 那一条**必须**落 21908 而不是并进 21903 —— 前端要能只对「跨度超一天」
+    /// 给一条专门文案（它同时是「这个班次排法有问题」而不是「参数格式错了」）。
+    #[test]
+    fn span_over_day_is_a_dedicated_code_and_maps_to_400() {
+        let err = validate_segments(&segs(&[("08:00", "20:00"), ("26:00", "33:00")])).unwrap_err();
+        assert_eq!(err.code(), code::BIZ_HR_SHIFT_SPAN_EXCEEDS_DAY);
+        assert_eq!(err.http_status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// V6 的**边界**：span 恰好 `24:00` 放行、`24:01` 拒。
+    #[test]
+    fn span_boundary_is_inclusive_at_exactly_24h() {
+        assert!(validate_segments(&segs(&[("08:00", "20:00"), ("20:00", "32:00")])).is_ok());
+        let err = validate_segments(&segs(&[("08:00", "20:01"), ("20:01", "32:01")])).unwrap_err();
+        assert_eq!(err.code(), code::BIZ_HR_SHIFT_SPAN_EXCEEDS_DAY);
+    }
+
+    /// 规范化：`seq` 重编为 `1..n`、段值补零，且**不改变语义**。
+    #[test]
+    fn normalization_resequences_and_pads_clock_values() {
+        let input = vec![
+            ShiftSegment::new(9, "8:00", "12:00"),
+            ShiftSegment::new(3, "13:00", "17:00"),
+        ];
+        let got = validate_segments(&input).unwrap();
+        assert_eq!(
+            got.segments,
+            vec![
+                ShiftSegment::new(1, "08:00", "12:00"),
+                ShiftSegment::new(2, "13:00", "17:00"),
+            ]
+        );
+    }
+
+    /// 段值解析：合法形态全通，越界 / 畸形全拒。
+    #[test]
+    fn clock_parser_accepts_reasonable_and_rejects_out_of_range() {
+        // ⚠️ `24:30`（次日 00:30）是**合法**段值：绝对时钟轴的合法域是
+        // `[00:00, 48:00]`，V1 只卡上界 `48:00`。跨日上限由 **V6 的 span** 负责，
+        // **不是**由「单个段值不得越过午夜」负责 —— 后者表达不了「夜班 + 次日早班」。
+        for ok in ["00:00", "8:00", "08:00", "23:59", "24:00", "24:30", "48:00"] {
+            assert!(parse_clock(ok).is_ok(), "`{ok}` 应当合法");
+        }
+        for bad in [
+            "", "0800", "08:0", " 08:00", "08:60", "48:01", "49:00", "100:00", "-1:00",
+        ] {
+            assert_eq!(
+                parse_clock(bad).unwrap_err().code(),
+                code::BIZ_HR_SHIFT_SEGMENT_INVALID,
+                "`{bad}` 应当被拒"
+            );
+        }
+    }
+
+    /// 区间校验：倒序与超跨度都落 21904（HTTP 400）；`from == to` 与 366 天放行。
+    #[test]
+    fn range_validation_boundaries() {
+        let d = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        assert!(validate_range(d, d).is_ok());
+        assert!(validate_range(d, d + chrono::Duration::days(366)).is_ok());
+        assert!(validate_range(d, d + chrono::Duration::days(367)).is_err());
+        let err = validate_range(d + chrono::Duration::days(1), d).unwrap_err();
+        assert_eq!(err.code(), code::BIZ_HR_CALENDAR_RANGE_INVALID);
+        assert_eq!(err.http_status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// 删行目标的两种形态归一：二选一命中才过，四种非法形态全落 21904。
+    #[test]
+    fn delete_target_requires_exactly_one_form() {
+        let d = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        assert!(matches!(
+            resolve_delete_target(Some(vec![d]), None, None).unwrap(),
+            DeleteTarget::Dates(_)
+        ));
+        assert!(matches!(
+            resolve_delete_target(None, Some(d), Some(d + chrono::Duration::days(7))).unwrap(),
+            DeleteTarget::Range(_, _)
+        ));
+        for bad in [
+            resolve_delete_target(None, None, None),
+            resolve_delete_target(None, Some(d), None),
+            resolve_delete_target(None, None, Some(d)),
+            resolve_delete_target(Some(vec![d]), Some(d), Some(d)),
+            resolve_delete_target(Some(vec![]), None, None),
+        ] {
+            assert_eq!(bad.unwrap_err().code(), code::BIZ_HR_CALENDAR_RANGE_INVALID);
+        }
+    }
+
+    /// 读侧降级：库里那一列 jsonb 被改坏时落 `21903`，**不是** 500。
+    #[test]
+    fn corrupt_segments_json_degrades_to_21903_not_500() {
+        for bad in [
+            serde_json::json!("not-an-array"),
+            serde_json::json!([1, 2, 3]),
+            serde_json::json!([{"seq": 1, "start": "99:99", "end": "12:00"}]),
+            serde_json::json!([]),
+        ] {
+            let err = parse_segments_strict(&bad).unwrap_err();
+            assert_eq!(
+                err.code(),
+                code::BIZ_HR_SHIFT_SEGMENT_INVALID,
+                "坏 jsonb {bad} 应当降级成 21903"
+            );
+        }
+    }
+}

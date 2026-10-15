@@ -57,6 +57,12 @@ sqlx = { version = "0.9", features = [
     "chrono",
     "migrate",
     "rust_decimal",
+    # 2026-10-19 新增显式声明：`serde_json::Value` 的 JSON / JSONB 编解码。
+    # 此前 hr 域之前全仓 42 张表零 jsonb 列，本仓只有 `to_jsonb(...) AS x` 这类**读**
+    # 路径用到它（`outsource::board::repo`），而那条是靠 sqlx 的 `default` 隐式生效的。
+    # `t_hr_shift.segments` 是本仓**第一个 jsonb 列**（时段内联），故把隐式依赖
+    # 显式化，避免日后有人裁 `default-features` 时静默编译失败。
+    "json",
 ] }
 
 # 序列化与时间
