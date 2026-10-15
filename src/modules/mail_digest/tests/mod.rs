@@ -16,8 +16,8 @@
 //! ## 为什么不装 `assert_no_foreign_domain`
 //! 见 [`super`] 的模块 doc 末节：第 1 类依赖是只读聚合别域的表、统计 SQL 在本域
 //! 写全（既定 pattern），第 2 类是「内容域向通道域取发信凭据」的必然引用，两类都不适合
-//! 用「不 import 别域 service / repo」来守。统计用的 `DELIVERY_STATUSES` 自
-//! **2026-10-16** 起已是本域自有常量，不构成跨域引用。
+//! 用「不 import 别域 service / repo」来守。统计用的状态白名单取自
+//! `shared::delivery_status`（`shared::` 不属于任何业务域），不构成跨域引用。
 
 use super::dto::{
     Frequency, SaveConfigRequest, TriggerSource, VisibleColumn, parse_visible_columns,

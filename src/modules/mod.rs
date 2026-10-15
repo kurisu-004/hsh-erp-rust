@@ -90,8 +90,11 @@ pub mod wecom;
 // 4 节报表 + 分片渲染 + 推送配置单例 + 流水），5 个端点 / 6 条路由全部 Manager 独占，
 // URL 挂 `/api/v2/cron/wecom-daily`。
 // ⚠️ **全新域，无任何旧路径、无 alias**。
-// 取数 SQL 在本域内写全、**零他域符号引用**（统计口径常量 `repo::DELIVERY_STATUSES`
-// 是本域自有的一份，与 mail_digest / dashboard 两处人工同步）。
+// 取数 SQL 在本域内写全、**零他域符号引用**：第三节的状态白名单取自共享常量
+// `shared::delivery_status::RED_TIER_STATUSES`（`shared::` 不属于任何业务域），
+// 后端三处（日报 / 邮件 / 大屏）因此只有**一个人工同步点** + 前端 `LAYERS` 那一处。
+// ⚠️ 图纸直链那一环是例外：它调 `files` 域的预览批量入口（表结构 / COS / python 全部
+// 由那个域承担），本域只交出清单涉及的 part_id 集合。
 // 完整契约见 `docs/api/wecom-daily.md`。
 pub mod wecom_daily;
 // 2026-09-28 删除：相关上传会话域（Redis 共享 STS 凭证会话机制）。

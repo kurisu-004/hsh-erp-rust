@@ -24,7 +24,8 @@
 //!
 //! 两个域各自演进的枚举，字面量逐字相同但**配套字段语义由各自的 `GET /meta` 下发**；
 //! 共用一个常量会在后端改一侧语义时让另一侧静默漂移。域隔离是硬要求（与
-//! `docs/api/wecom-daily.md` §4 口径表的「四处人工同步」同一原则）。
+//! `docs/api/wecom-daily.md` §2.4「两个 range 与四个 `needs_*` 全部由本端下发」同一
+//! 原则：枚举字面量重复是可接受的，取值语义的**真源必须唯一**）。
 
 use crate::modules::wecom_daily::dto::Frequency;
 use crate::shared::error::{AppError, code};

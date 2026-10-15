@@ -285,16 +285,22 @@ ORDER BY c.assembly_id;
 
 ## 5. 状态域约定（无编译期保障）
 
-- 后端常量：`repo/delivery.rs::DELIVERY_STATUSES`
+- 后端常量：`shared/delivery_status.rs` 的 `DELIVERY_STATUSES`（**共享常量**，`shared::`
+  不属于任何业务域）—— 交期面板的逾期 / 未来两桶与邮件域、日报域**共用同一份字面量**。
 - 前端对应：柱状图 `UpcomingDeliveryChart.vue` 的 `LAYERS[].statuses`——`top`（PENDING /
   PROGRAMMING / IN_PROCESS / OUTSOURCE）+ `middle`（INSPECTION / READY_TO_SHIP）合起来
-  正是本常量的 6 态，`bottom`（DELIVERED）额外多一个。
+  正是这 6 态，`bottom`（DELIVERED）额外多一个。
   2026-10-07 起交期面板的分桶判定改为服务端按「已交批次」判定（2026-10-10 又把面板从
   两桶拆成三桶），6 态在前端**只剩 `LAYERS[].statuses` 这一个镜像**（见 §2.2）。
 
-两者是**人工同步**关系：Rust 常量与 TS 字面量之间没有任何编译期约束，漂了不会编译失败，
-只会让「逾期数」与「柱状图层数」互相矛盾（且现象是数字对不上、极难定位）。改任一侧必须同步另一侧；
-集成测试 `overdue_accepts_all_six_delivery_statuses` 把后端常量的字面值钉死，也只会抓到这一种症状。
+⚠️ **人工同步点共 2 处**（后端 1 + 前端 1）：后端三域已共用 `shared::` 那一份，所以
+「加一个状态」只需要改它一处；剩下的风险是**前端那份 TS 字面量**与 Rust 之间没有任何
+编译期约束，漂了不会编译失败，只会���「逾期数」与「柱状图层数」互相矛盾（现象是数字对不上、
+极难定位）。集成测试 `overdue_accepts_all_six_delivery_statuses` 把后端常量的字面值钉死，
+也只会抓到这一种症状。
+
+⚠️ 日报域的清单取的是 `RED_TIER_STATUSES`（同文件的**品检前 4 态**）—— 同一套谓词、
+不同的状态集是**有意分叉**（日报答的是「品检还没开始的活里哪些要催」），不是漂移。
 
 ## 6. 移除记录
 
