@@ -7,7 +7,7 @@
 //!
 //! | # | Method | Path | 权限点 | 说明 |
 //! |---|---|---|---|---|
-//! | 1 | `GET` | `/calendar/days?from&to` | `hr.view` | 全局日历区间读（逐日一行，`derived` 标出推导日，每行另带逐班次 `shift_bands` 色带，2026-10-19 新增） |
+//! | 1 | `GET` | `/calendar/days?from&to` | `hr.view` | 全局日历区间读（逐日一行，`derived` 标出推导日，每行另带逐班次 `shift_bands` 色带，2026-10-23 新增） |
 //! | 2 | `POST` | `/calendar/days` | `hr.schedule.manage` | 批量 upsert 全局日历显式行（**只存例外**） |
 //! | 3 | `POST` | `/calendar/days/delete` | `hr.schedule.manage` | 删显式行 → 回退按星期推导 |
 //! | 4 | `GET` | `/shifts` | `hr.view` | 班次列表（含三个派生列） |
@@ -44,7 +44,7 @@
 //! 推导并把该行标 `derived = true`。365 天全落行会让「明年元旦调休」从「改一行」
 //! 变成「改 200 行」。
 //!
-//! 端点 1 的逐班次色带 `shift_bands`（2026-10-19 新增，供全局日历渲染「所有班次的
+//! 端点 1 的逐班次色带 `shift_bands`（2026-10-23 新增，供全局日历渲染「所有班次的
 //! 颜色色带」）与端点 8 走**同一个** `service::derive_effective` ⇒ 两个端点不可能
 //! 对同一天给出不同的 `is_workday`。
 //!

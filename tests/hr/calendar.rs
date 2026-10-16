@@ -314,7 +314,7 @@ fn bands_of(day: &Value) -> Vec<Value> {
     arr.clone()
 }
 
-/// 端点 1（2026-10-19 新增）：每行带 `shift_bands` —— **每日 × 每活跃班次**一条色带，
+/// 端点 1（2026-10-23 新增）：每行带 `shift_bands` —— **每日 × 每活跃班次**一条色带，
 /// 全局日历上直接渲染「所有班次的颜色带」不必再发 N 次 `GET /shifts/{id}/calendar`。
 ///
 /// ⚠️ 这条钉的是**三条口径**：只含**活跃**班次、顺序**稳定**（`sort_order` 升序再
@@ -334,7 +334,7 @@ async fn global_calendar_carries_one_band_per_active_shift_in_stable_order() {
     // `ZZ` 的 code 字典序**最末**但 `sort_order` 最小 ⇒ 它必须排第一（证明 code 不能盖过
     // sort_order）；`AA` 与 `BB` 同为 `sort_order = 1` ⇒ 两者之间才按 code 排。
     //
-    // ⚠️ **`BB` 必须先于 `AA` 建**（2026-10-19）：`unique_code` 尾部是单调雪花 ⇒
+    // ⚠️ **`BB` 必须先于 `AA` 建**（2026-10-23）：`unique_code` 尾部是单调雪花 ⇒
     // 「先建先小」，于是 `id(BB) < id(AA)`，而 code 字典序仍是 `AA < BB`。
     // 这样本用例才真的钉死了 tie-break 是 **`code`** —— 若实现把 `code` 换成 `id`（即
     // 照抄端点 4 `list_shifts` 的兜底键），本用例会红。若两者同序（AA 先建），两种

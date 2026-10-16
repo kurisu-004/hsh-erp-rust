@@ -450,7 +450,7 @@ fn require_text(field: &str, v: &str) -> Result<String, AppError> {
 }
 
 // ============================================================================
-// 日型推导的唯一真源（端点 1 / 端点 8 共用，2026-10-19 抽成共用函数）
+// 日型推导的唯一真源（端点 1 / 端点 8 共用，2026-10-23 抽成共用函数）
 // ============================================================================
 
 /// 三级推导（**覆盖行 > 全局行 > 按星期兜底**）的**唯一实现**。
@@ -504,9 +504,9 @@ fn derive_effective(
 /// `GET /calendar/days?from&to` —— 全局日历区间读（**逐日一行，一天都不省**）。
 ///
 /// 返回的每一天要么来自显式行（`derived = false`），要么按星期推导补齐
-/// （`derived = true`）；每行另带 `shift_bands`（逐班次色带，2026-10-19 新增）。
+/// （`derived = true`）；每行另带 `shift_bands`（逐班次色带，2026-10-23 新增）。
 ///
-/// ## `shift_bands` 的取数与性能（2026-10-19）
+/// ## `shift_bands` 的取数与性能（2026-10-23）
 ///
 /// SQL 总共**仍是 3 条**：`list_calendar_days`（全局显式行）+ `list_shifts(.., false)`
 /// （活跃班次）+ `list_shift_overrides_in_range`（区间内**全部**班次的覆盖行）。
@@ -533,11 +533,12 @@ pub async fn list_calendar_days(
     let mut shifts = repo::list_shifts(conn, false).await?;
     // ⚠️ **必须在这里重排**：`repo::list_shifts` 的兜底键是 `id ASC`，而契约要求
     // `sort_order ASC` → `code ASC`（`code` 在未软删行内唯一 ⇒ 全序、顺序稳定）。
-    // 前端按数组顺序切色带段，顺序漂了就画错。
+    // 这个顺序就是前端拿到的**渲染顺序**（前端不必自己再排），顺序漂了就画错。
     //
     // ⚠️ 重排也意味着**色带顺序与端点 4 `GET /shifts` 不保证一致**（那边 `sort_order`
-    // 打平时按 `id` 兜底）⇒ 前端**必须按 `shift_id` 配对**、不得按下标配对，否则色带
-    // 会串到别的班次上且无任何报错。登记在 `docs/api/hr.md` §4.1.1 第 1 条。
+    // 打平时按 `id` 兜底）⇒ 前端**配对一律按 `shift_id`**（建 Map 查表，**不是**按数组
+    // 下标 zip）、不得按下标配对，否则色带会串到别的班次上且无任何报错。登记在
+    // `docs/api/hr.md` §4.1.1 第 1 条。
     shifts.sort_by(|a, b| {
         a.sort_order
             .cmp(&b.sort_order)
@@ -1479,7 +1480,7 @@ mod tests {
         NaiveDate::from_ymd_opt(2030, 3, 4).unwrap() + chrono::Duration::days(offset)
     }
 
-    /// 端点 1 的 `shift_bands` 形状（2026-10-19 新增）：**无覆盖行 ⇒ `effective` 逐字
+    /// 端点 1 的 `shift_bands` 形状（2026-10-23 新增）：**无覆盖行 ⇒ `effective` 逐字
     /// 等于全局日型、`is_override = false`**；**有覆盖行 ⇒ 等于覆盖值、`is_override =
     /// true`**。
     ///
