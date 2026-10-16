@@ -407,7 +407,7 @@ service 侧那次 `get_shift` + `ensure_writable` 只是**友好报错的前置�
 | 8 | **权限守卫在入参校验之前** | 见 §6 末；代价是写端点上无权账号会先开一次事务（零写入、不落锁） |
 | 9 | **两张批量写表上的 `version` 不做客户端锚**（偏离 CLAUDE.md §8「带 `version` 列的表写端点 body 必须收 `version`」） | `t_hr_calendar_day` / `t_hr_shift_calendar` 的写端点是 `{items:[…]}` 的**整批 upsert / 软删**，行级 OCC 在这个形态下不成立：一批里每一行都是「按 `cal_date` 命中即覆盖」，客户端并不持有某一行的 `version`，要塞进 `items[].version` 只会暴露内部实现、并把「一批要么全过要么全不进」拆成一堆行级判据。真正要防的并发（两个人把同一天改成不同口径）由「partial unique + `ON CONFLICT DO UPDATE` 的后写覆盖」与「`t_hr_shift` 上的真 OCC」挡住。⇒ `version` 在这两张表上**只作写计数器**（每次 upsert / 软删自增，供审计与将来排查）。先例：`t_wecom_daily_log`（只增审计流水、刻意无 `version`）。客户端的版本锚**只加在 `t_hr_shift` 上**（端点 6 / 7） |
 | 10 | **不另建同列的非 partial 索引** | 两条读查询的谓词恒带 `deleted_at IS NULL`，被同列 partial unique 的谓词**蕴含** ⇒ PG 直接拿 partial unique 走索引。`ix_t_hr_calendar_day_cal_date` / `ix_t_hr_shift_calendar_shift_date` 只会各多贡献一份写放大（每次 upsert / 软删维护两棵同样的 B 树），读端点一行都用不上 |
-| 11 | **`shift_bands` 让出参体积 = 区间天数 × 活跃班次数**（2026-10-23） | 端点 1 每行带**逐班次色带**（§4.1.1）⇒ 跨度上限 366 天 ⇒ 两端闭**最多 367 天**；⚠️ **band 条数 = 367 × 活跃班次数，而活跃班次没有上限**（端点 4 不分页、`list_shifts` 全量返回）⇒ 20 个活跃班次是 7340 条（实测体积见 §8.4），30 个就是 11010 条。响应体随班次数**线性**放大，**没有系统级上界**，体积明显变大。**有意不为它下调区间上限（§5.2）**：上限防的是「一个请求灌 10 年」，而色带是前端渲染排班表的必需数据 —— 砍掉它等于让前端退回 N+1 次 `GET /shifts/{id}/calendar`。推导是**纯内存** HashMap 查表，SQL 总共仍是 3 条（全局行 / 活跃班次 / 区间内全部覆盖行），**不是** N+1 查询。实测体积见 §8.4。⚠️ 那第 3 条 SQL（`list_shift_overrides_in_range`）**按 `cal_date` 过滤，而 `t_hr_shift_calendar` 上唯一可用索引的前导列是 `shift_id`**（`uk_t_hr_shift_calendar (shift_id, cal_date) WHERE deleted_at IS NULL`）⇒ 目前（表体量小时）走**顺序扫描**；本域刻意不为此建 `(cal_date)` 索引（与第 10 条同源取舍）。⚠️ **这不是稳态结论**：这条 SQL 的 `ORDER BY shift_id, cal_date` 恰好与该索引的列序一致、谓词 `deleted_at IS NULL` 又与 partial 谓词一致，体量上来后 PG 完全可能改走 `uk_t_hr_shift_calendar` 的 Index Scan 再按 `cal_date` 过滤 —— **两条都不理想**（前者扫全表，后者读全索引再丢弃）。届时需二选一：补 `(cal_date, shift_id)` 索引（列序同时对上 `cal_date` 的区间过滤与 `ORDER BY shift_id, cal_date` ⇒ **Filter 与 Sort 一并免掉**；只补 `(cal_date)` 只能免 Filter、仍要一次显式 Sort），或改成按活跃班次 `shift_id = ANY($1)` 让现有索引可用 |
+| 11 | **`shift_bands` 让出参体积 = 区间天数 × 活跃班次数**（2026-10-23） | 端点 1 每行带**逐班次色带**（§4.1.1）⇒ 跨度上限 366 天 ⇒ 两端闭**最多 367 天**；⚠️ **band 条数 = 367 × 活跃班次数，而活跃班次没有上限**（端点 4 不分页、`list_shifts` 全量返回）⇒ 20 个活跃班次是 7340 条（实测体积见 §8.4），30 个就是 11010 条。响应体随班次数**线性**放大，**没有系统级上界**，体积明显变大。**有意不为它下调区间上限（§5.2）**：上限防的是「一个请求灌 10 年」，而色带是前端渲染排班表的必需数据 —— 砍掉它等于让前端退回 N+1 次 `GET /shifts/{id}/calendar`。推导是**纯内存** HashMap 查表，SQL 总共仍是 3 条（全局行 / 活跃班次 / 区间内全部覆盖行），**不是** N+1 查询。实测体积见 §8.4。⚠️ 那第 3 条 SQL（`list_shift_overrides_in_range`）有**两个**待处理的问题，而它们的解法**不是加索引**：① **Filter** —— 它按 `cal_date` 做区间过滤，而 `t_hr_shift_calendar` 上唯一可用索引的前导列是 `shift_id`（`uk_t_hr_shift_calendar (shift_id, cal_date) WHERE deleted_at IS NULL`）⇒ `cal_date` 落在第二列上，进不了 index cond，只能当 Filter **把整棵索引读出来再丢弃**；目前（表体量小时）PG 干脆走**顺序扫描**扫全表，连索引都用不上 —— 本域刻意为此不建 `(cal_date)` 索引（与第 10 条同源取舍）。② **Sort 与 Seq Scan 二选一随体量漂移，不是稳态结论** —— 这条 SQL 带着 `ORDER BY shift_id, cal_date`（列序与该 uk 一致）、谓词 `deleted_at IS NULL` 又与 partial 谓词一致，体量上来后 PG 完全可能改走该 uk 的 Index Scan：**两条路都不理想**，且哪条更省由优化器按体量现算、不由代码保证（前者扫全表，后者读全索引再丢弃，排序则看走哪条）。⇒ **最优解是改这条查询、而不是再建一棵索引**：`ORDER BY shift_id, cal_date` **语义上并不需要** —— service 侧 `into_shift_day_map` 把结果收进 `HashMap<(shift_id, cal_date), String>`，之后只有 `derive_effective` 按 `(shift_id, date)` **点查**（`overrides.get(&(shift_id, date))`），从不迭代这张 map、也不按下标配对 ⇒ 行的先后**对结果无影响**（脏数据「后写覆盖先写」本身就是任意的，见 `into_shift_day_map` 的注释）。既然排序是白付的，谓词再改成按活跃班次 `shift_id = ANY($1)`（活跃班次端点 1 本来就已经取过一次）即可 —— `shift_id` 有了等值路径，第二列的 `cal_date` 就**跟着进 index cond**（区间过滤由每个班次分片各走一次索引区间）⇒ **Filter 与 Sort 两个问题一并消失，且一棵新索引都不用建**，与第 10 条的取舍也不冲突。⚠️ 这里**只是取舍登记**：当前实现不动这条 SQL，`ORDER BY` 仍在仓库里（`repo::list_shift_overrides_in_range`），体量小的时候两者的代价差别可以忽略。⚠️ 反过来，**若将来坚持保留 `ORDER BY`**，那三条路的真实取舍是：补 `(cal_date)` 与补 `(cal_date, shift_id)` 对 **Sort 毫无差别** —— 二者前导列都是 `cal_date`，输出序都是 `cal_date` 优先，与 `ORDER BY shift_id, cal_date` **不是同一个序**（反向扫也只是 `cal_date` 逆序，更不匹配）⇒ 都仍要一次**显式 Sort**，`(cal_date, shift_id)` 的唯一增量只是把索引建得更宽、**免不掉 Sort**；要免 Sort 只有 `(shift_id, cal_date)` 一条路，而那**就是现有 uk 本身** ⇒ 等于原地退回问题 ①（Filter 不理想），与第 10 条反对冗余索引的取舍同源 |
 
 ### 8.4 `shift_bands` 的实测序列化体积（2026-10-23）
 
@@ -426,14 +426,16 @@ service 侧那次 `get_shift` + `ensure_writable` 只是**友好报错的前置�
 - ⚠️ 末列是「整份出参字节 ÷ band 条数」的**摊薄均值**，**不是**单条 band 自身的尺寸。整份出参
   = band 字节 + **日行骨架**字节（`cal_date` / `day_type` / `name` / `derived`，实测约
   90 B/天），而日行骨架是**按天**摊的 ⇒ 班次数越少，每条 band 分摊到的骨架越厚，均值就越高。
-  上界那行（367 天 × 20 班次）骨架被摊得最薄，均值几乎贴着单条 band 自身尺寸。
+  上表**最坏的一行**（367 天 × 20 班次）骨架被摊得最薄，均值几乎贴着单条 band 自身尺寸。
 - 单条 band 的**上界**约 **114 B**：形态恒为 4 个键，日型字面量取最长的一档
   `STATUTORY_HOLIDAY`（17 字符，`is_workday` 随之恒为 `false`）⇒
   `{"shift_id":"7300000000000000000","effective_day_type":"STATUTORY_HOLIDAY","is_workday":false,"is_override":false}`。
   同一形态的基线（`WORKDAY`，7 字符、`is_workday` 为 `true`）实测 **103 B**，加进数组后
   每条再摊 1 B 分隔逗号 ⇒ 约 104 B，正是上表末列小值的来源。`shift_id` 是 19 位雪花
   （字符串 19 字节 + 引号），占其中约 1/4。
-- ⚠️ **常态请求远小于上表**：上界要同时「区间拉满」且「班次编到 20 个」；一个月 5 个班次
-  只有 ~19 KB。体积是**线性**增长的（O(days × shifts)），没有二次项。
+- ⚠️ **常态请求远小于上表**：表中最坏的那一行要同时「区间拉满」且「班次编到 20 个」；一个月 5 个班次
+  只有 ~19 KB。体积是**线性**增长的（O(days × shifts)），没有二次项。班次数本身
+  **没有上限**（端点 4 不分页），所以这一行也只是**实测样本里最大的一条**，不是系统级上界
+  （见 §8.3 第 11 条）。
 - 结论：**不为色带下调 366 天的跨度上限**（理由见 §8.3 第 11 条）。真要再省，只能让前端
   按月分段取（区间口径不变）—— 那是前端侧的取数策略，后端不为它加参数。
