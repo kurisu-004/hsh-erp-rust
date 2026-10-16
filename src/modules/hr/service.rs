@@ -20,6 +20,8 @@
 //! 考勤排班表页面将来落地时，应当走它自己的取数路径（HTTP 首取 + 页面级刷新），
 //! 而不是给本域硬接一条 WS。
 
+use std::collections::HashMap;
+
 use chrono::NaiveDate;
 use sqlx::PgConnection;
 
@@ -33,11 +35,13 @@ use crate::modules::hr::dto::{
     MAX_SPAN_MINUTES, MIN_SEGMENTS, PERM_MANAGE, PERM_VIEW, ShiftCalendarRangeQuery,
     ShiftDaysDeleteRequest, ShiftDaysUpsertRequest, ShiftListQuery, UpdateShiftRequest,
 };
-use crate::modules::hr::model::{DayType, ShiftSegment, TShiftRow, derive_from_weekday};
+use crate::modules::hr::model::{
+    DayType, ShiftSegment, TShiftCalendarRow, TShiftRow, derive_from_weekday,
+};
 use crate::modules::hr::repo;
 use crate::modules::hr::vo::{
-    CalendarDayOut, CalendarDaysOut, CalendarDaysWriteOut, ShiftCalendarDayOut, ShiftCalendarOut,
-    ShiftDaysWriteOut, ShiftListOut, ShiftOut,
+    CalendarDayOut, CalendarDaysOut, CalendarDaysWriteOut, ShiftBandOut, ShiftCalendarDayOut,
+    ShiftCalendarOut, ShiftDaysWriteOut, ShiftListOut, ShiftOut,
 };
 use crate::shared::error::{AppError, code};
 
@@ -446,13 +450,67 @@ fn require_text(field: &str, v: &str) -> Result<String, AppError> {
 }
 
 // ============================================================================
+// 日型推导的唯一真源（端点 1 / 端点 8 共用，2026-10-16 抽成共用函数）
+// ============================================================================
+
+/// 三级推导（**覆盖行 > 全局行 > 按星期兜底**）的**唯一实现**。
+///
+/// 返回 `(global_day_type, effective_day_type, is_override)`。
+///
+/// ## ⚠️ 为什么两处**必须**共用这一个函数（而不是各写一遍）
+///
+/// 端点 1 的 `shift_bands`（每日 × 每班次）与端点 8 的 `items`（每日 × 单班次）要回答
+/// **同一个问题**：「班次 `shift_id` 在 `date` 这天上不上班」。两处各判一次，哪怕
+/// 判据一字不差也**必然会漂移** —— 一处改了、另一处没改时，两个端点对同一天给出
+/// 不同的 `is_workday`，而 `is_workday` 是**考勤取数的唯一判据**。派生规则一旦分叉，
+/// 考勤算出的工时就会与排班表显示的对不上，且没有任何报错。
+///
+/// 前端同理**不得**自己重算（`docs/api/hr.md` §7 第 1 / 2 条）：`is_workday` 一律读
+/// 出参。
+///
+/// `globals` 收的是**原始字符串**（`HashMap<NaiveDate, String>`）：库里若出现未知
+/// 日型字面量，由这里的 [`DayType::parse`] 降级成 `21905`，而不是让整行解码失败
+/// （与 `model::TCalendarDayRow::day_type` 的口径同源）。
+fn derive_effective(
+    globals: &HashMap<NaiveDate, String>,
+    overrides: &HashMap<(i64, NaiveDate), String>,
+    shift_id: i64,
+    date: NaiveDate,
+) -> Result<(DayType, DayType, bool), AppError> {
+    // 第 2 级：全局日历行（无显式行 ⇒ 按星期兜底）
+    let global_day_type = match globals.get(&date) {
+        Some(raw) => DayType::parse(raw)?,
+        None => derive_from_weekday(date),
+    };
+    // 第 1 级：班次覆盖行（键含 shift_id ⇒ 同一个 map 可同时供多班次共用）
+    let (effective_day_type, is_override) = match overrides.get(&(shift_id, date)) {
+        Some(raw) => (DayType::parse(raw)?, true),
+        None => (global_day_type, false),
+    };
+    Ok((global_day_type, effective_day_type, is_override))
+}
+
+// ============================================================================
 // 端点 1：全局日历区间读
 // ============================================================================
 
 /// `GET /calendar/days?from&to` —— 全局日历区间读（**逐日一行，一天都不省**）。
 ///
 /// 返回的每一天要么来自显式行（`derived = false`），要么按星期推导补齐
-/// （`derived = true`）。
+/// （`derived = true`）；每行另带 `shift_bands`（逐班次色带，2026-10-16 新增）。
+///
+/// ## `shift_bands` 的取数与性能（2026-10-16）
+///
+/// SQL 总共**仍是 3 条**：`list_calendar_days`（全局显式行）+ `list_shifts(.., false)`
+/// （活跃班次）+ `list_shift_overrides_in_range`（区间内**全部**班次的覆盖行）。
+/// 「每一天 × 每个活跃班次」的推导是**纯内存**的 `HashMap` 查表 +
+/// [`derive_from_weekday`]，**不是** N+1 查询 —— 若按班次循环
+/// `repo::list_shift_days` 就是 N+1 次，那才是这里刻意避开的。
+///
+/// ⚠️ **已知取舍（登记在 `docs/api/hr.md` §8.3）**：响应体大小是
+/// **区间天数 × 活跃班次数**。区间上限 366 天（§5.2）配 20 个活跃班次 ⇒ 最多
+/// **7340 条 band**，出参会明显变大。**有意不改区间上限** —— 上限防的是「一个请求灌
+/// 10 年」；色带是前端渲染排班表的必需数据，砍掉它等于让前端回到 N+1 次请求。
 pub async fn list_calendar_days(
     conn: &mut PgConnection,
     current: &CurrentUser,
@@ -462,6 +520,21 @@ pub async fn list_calendar_days(
     validate_range(query.from, query.to)?;
 
     let rows = repo::list_calendar_days(conn, query.from, query.to).await?;
+    // 色带的两个原料：区间内全部班次的覆盖行 + 全部**活跃**班次（各一次读，见上方性能注）。
+    let override_rows = repo::list_shift_overrides_in_range(conn, query.from, query.to).await?;
+    let mut shifts = repo::list_shifts(conn, false).await?;
+    // ⚠️ **必须在这里重排**：`repo::list_shifts` 的兜底键是 `id ASC`，而契约要求
+    // `sort_order ASC` → `code ASC`（`code` 在未软删行内唯一 ⇒ 全序、顺序稳定）。
+    // 前端按数组顺序切色带段，顺序漂了就画错。
+    shifts.sort_by(|a, b| {
+        a.sort_order
+            .cmp(&b.sort_order)
+            .then_with(|| a.code.cmp(&b.code))
+    });
+
+    let globals = into_day_map(rows.iter().map(|r| (r.cal_date, r.day_type.clone())));
+    let overrides = into_shift_day_map(override_rows.into_iter());
+
     let mut items = Vec::with_capacity((query.to - query.from).num_days() as usize + 1);
     // ⚠️ 走「一个游标 + 一个下标」的线性推进，而不是 `HashMap`：`rows` 已按 `cal_date`
     // 升序返回，两条有序序列求差集在 O(n) 里完成，不必建索引表。
@@ -469,6 +542,18 @@ pub async fn list_calendar_days(
     let mut next_row = it.next();
     let mut cursor = query.from;
     while cursor <= query.to {
+        // 逐班次色带（无活跃班次时是空数组，不是 `null` —— 前端直接遍历即可）。
+        let mut shift_bands = Vec::with_capacity(shifts.len());
+        for shift in &shifts {
+            let (_, effective_day_type, is_override) =
+                derive_effective(&globals, &overrides, shift.id, cursor)?;
+            shift_bands.push(ShiftBandOut {
+                shift_id: shift.id,
+                effective_day_type,
+                is_workday: effective_day_type.is_workday(),
+                is_override,
+            });
+        }
         match next_row.as_ref().filter(|r| r.cal_date == cursor) {
             Some(_) => {
                 let row = next_row.take().expect("刚 peek 到必然还挂着");
@@ -477,6 +562,7 @@ pub async fn list_calendar_days(
                     day_type: DayType::parse(&row.day_type)?,
                     name: row.name,
                     derived: false,
+                    shift_bands,
                 });
                 next_row = it.next();
             }
@@ -485,6 +571,7 @@ pub async fn list_calendar_days(
                 day_type: derive_from_weekday(cursor),
                 name: None,
                 derived: true,
+                shift_bands,
             }),
         }
         cursor += chrono::Duration::days(1);
@@ -865,6 +952,9 @@ pub async fn deactivate_shift(
 /// 每一天同时回传 `global_day_type`（全局日历说的）与 `effective_day_type`
 /// （覆盖行 / 全局行 / 星期推导三级推导的结果）⇒ 前端可以既显示「这天全局是节假日」
 /// 又显示「但这个班次那天照常上班」，**不需要自己实现推导**。
+///
+/// ⚠️ 推导走 [`derive_effective`] —— 与端点 1 的 `shift_bands` **同一条路径**，
+/// 改判据时两个端点一起变，不存在「两边各判一次」的漂移。
 pub async fn list_shift_calendar(
     conn: &mut PgConnection,
     current: &CurrentUser,
@@ -883,21 +973,13 @@ pub async fn list_shift_calendar(
     let override_rows = repo::list_shift_days(conn, id, query.from, query.to).await?;
 
     let globals = into_day_map(global_rows.into_iter().map(|r| (r.cal_date, r.day_type)));
-    let overrides = into_day_map(override_rows.into_iter().map(|r| (r.cal_date, r.day_type)));
+    let overrides = into_shift_day_map(override_rows.into_iter());
 
     let mut items = Vec::with_capacity((query.to - query.from).num_days() as usize + 1);
     let mut cursor = query.from;
     while cursor <= query.to {
-        // 第 2 级：全局日历行
-        let global_day_type = match globals.get(&cursor) {
-            Some(raw) => DayType::parse(raw)?,
-            None => derive_from_weekday(cursor),
-        };
-        // 第 1 级：班次覆盖行
-        let (effective_day_type, is_override) = match overrides.get(&cursor) {
-            Some(raw) => (DayType::parse(raw)?, true),
-            None => (global_day_type, false),
-        };
+        let (global_day_type, effective_day_type, is_override) =
+            derive_effective(&globals, &overrides, id, cursor)?;
         items.push(ShiftCalendarDayOut {
             cal_date: cursor,
             global_day_type,
@@ -918,10 +1000,21 @@ pub async fn list_shift_calendar(
 /// ⚠️ 若同一日期出现两次（partial unique 索引漏网 / 手工改过库），**后写覆盖先写**
 /// 而不是报错 —— 读端点不该因为库里有一条脏数据就整个失败（那会把「这张日历打不开」
 /// 变成排班系统不可用）。写入侧的唯一索引才是防线。
-fn into_day_map(
-    rows: impl Iterator<Item = (NaiveDate, String)>,
-) -> std::collections::HashMap<NaiveDate, String> {
+fn into_day_map(rows: impl Iterator<Item = (NaiveDate, String)>) -> HashMap<NaiveDate, String> {
     rows.collect()
+}
+
+/// `t_hr_shift_calendar` 行 → `HashMap<(shift_id, cal_date), String>`（**键含班次**）。
+///
+/// ⚠️ 键含 `shift_id` 是为了端点 1 与端点 8 能**共用同一个 map 与同一个
+/// [`derive_effective`]**：端点 1 一次读回区间内**全部**班次的覆盖行，端点 8 只放一个
+/// 班次的行，两边都是这张表的行、按同一种键查即可。
+/// 「后写覆盖先写」的脏数据口径同 [`into_day_map`]。
+fn into_shift_day_map(
+    rows: impl Iterator<Item = TShiftCalendarRow>,
+) -> HashMap<(i64, NaiveDate), String> {
+    rows.map(|r| ((r.shift_id, r.cal_date), r.day_type))
+        .collect()
 }
 
 // ============================================================================
@@ -1365,6 +1458,134 @@ mod tests {
                 err.code(),
                 code::BIZ_HR_SHIFT_SEGMENT_INVALID,
                 "坏 jsonb {bad} 应当降级成 21903"
+            );
+        }
+    }
+
+    /// `day(offset)` 的 ISO 串（推导用例的确定性基准日 = 2030-03-04 周一）。
+    fn d(offset: i64) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2030, 3, 4).unwrap() + chrono::Duration::days(offset)
+    }
+
+    /// 端点 1 的 `shift_bands` 形状（2026-10-16 新增）：**无覆盖行 ⇒ `effective` 逐字
+    /// 等于全局日型、`is_override = false`**；**有覆盖行 ⇒ 等于覆盖值、`is_override =
+    /// true`**。
+    ///
+    /// ⚠️ 同时钉住「覆盖 map 的键**含 `shift_id`**」：B 班次的覆盖行不得渗进 A 班次的
+    /// 色带 —— 那正是 `HashMap<(i64, NaiveDate), _>` 这个复合键存在的全部理由，
+    /// 换成按日期单键时这条会立刻全绿地挂掉。
+    #[test]
+    fn shift_band_shape_follows_the_override_row_existence() {
+        let mon = d(0);
+        let globals: HashMap<NaiveDate, String> = [(mon, "STATUTORY_HOLIDAY".to_string())]
+            .into_iter()
+            .collect();
+        let overrides: HashMap<(i64, NaiveDate), String> =
+            [((11_i64, mon), "MAKEUP_WORKDAY".to_string())]
+                .into_iter()
+                .collect();
+
+        // 有覆盖行（班次 11）
+        let (g, eff, is_ovr) = derive_effective(&globals, &overrides, 11, mon).unwrap();
+        assert_eq!(g, DayType::StatutoryHoliday, "global 仍是全局那一档");
+        assert_eq!(eff, DayType::MakeupWorkday, "覆盖行压过全局行");
+        assert!(is_ovr, "有覆盖行 ⇒ is_override");
+
+        // 无覆盖行（班次 22，同一个 map）⇒ 逐字继承全局
+        let (g, eff, is_ovr) = derive_effective(&globals, &overrides, 22, mon).unwrap();
+        assert_eq!(g, DayType::StatutoryHoliday);
+        assert_eq!(eff, g, "无覆盖行 ⇒ effective 逐字等于 global");
+        assert!(!is_ovr, "无覆盖行 ⇒ is_override=false");
+
+        // 全局也没有显式行 ⇒ 周一兜底 WORKDAY（`REST_DAY` 只落在周末）
+        let sat = d(5);
+        let empty: HashMap<NaiveDate, String> = HashMap::new();
+        let (_, eff, is_ovr) = derive_effective(&empty, &overrides, 22, sat).unwrap();
+        assert_eq!(eff, DayType::RestDay, "周六兜底 REST_DAY");
+        assert!(!eff.is_workday());
+        assert!(!is_ovr);
+    }
+
+    /// 端点 1 的 `shift_bands` 里，库里出现未知日型字面量时降级成 `21905`（不是 500）。
+    ///
+    /// ⚠️ **全局行与覆盖行两侧都要钉**：只钉一侧时，另一侧改成「原样透传字符串」这种
+    /// 退法测试不会红，而前端会拿到一个不认识的日型字面量。
+    #[test]
+    fn unknown_day_type_in_both_maps_degrades_to_21905() {
+        let mon = d(0);
+        for globals in [
+            [(mon, "WORKDAY".to_string())]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            [(mon, "不是日型".to_string())]
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+        ] {
+            let overrides: HashMap<(i64, NaiveDate), String> =
+                [((11_i64, mon), "也不是日型".to_string())]
+                    .into_iter()
+                    .collect();
+            let err = derive_effective(&globals, &overrides, 11, mon).unwrap_err();
+            assert_eq!(err.code(), code::BIZ_HR_DAY_TYPE_INVALID);
+            assert_eq!(err.http_status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    /// ⚠️ **回归**：`ShiftBandOut` 的 wire 形状 —— 恰好 **4 个键**、`shift_id` 是
+    /// **JSON string**（雪花防 JS 精度截断）、`is_workday` 恒等于
+    /// `effective_day_type.is_workday()`。
+    ///
+    /// 钉键的个数而不是「某个键存在」：多塞一个字段（如 `code` / `color`）会让
+    /// 前端多一份**与 `GET /shifts` 不同步**的班次真相源，那是最坏的一种冗余。
+    #[test]
+    fn shift_band_serializes_with_exactly_four_keys_and_string_shift_id() {
+        let v = serde_json::to_value(ShiftBandOut {
+            shift_id: 7_376_123_456_789_012_345,
+            effective_day_type: DayType::MakeupWorkday,
+            is_workday: true,
+            is_override: true,
+        })
+        .unwrap();
+        let obj = v.as_object().expect("是对象");
+        assert_eq!(
+            obj.len(),
+            4,
+            "恰好 4 个键，多一个都是「第二个班次真相源」：{v}"
+        );
+        assert_eq!(
+            obj["shift_id"],
+            serde_json::json!("7376123456789012345"),
+            "雪花 id 出参必须是 JSON string：{v}"
+        );
+        assert_eq!(
+            obj["effective_day_type"],
+            serde_json::json!("MAKEUP_WORKDAY")
+        );
+        assert_eq!(obj["is_workday"], serde_json::json!(true));
+        assert_eq!(obj["is_override"], serde_json::json!(true));
+
+        // `is_workday` 与日型的对应关系由 `DayType::is_workday` 单点决定，两档之外
+        // 一律 false（前端色带按这个值上色）。
+        for (dt, want) in [
+            (DayType::Workday, true),
+            (DayType::MakeupWorkday, true),
+            (DayType::RestDay, false),
+            (DayType::StatutoryHoliday, false),
+            (DayType::MakeupHoliday, false),
+            (DayType::CustomLeave, false),
+        ] {
+            let band = serde_json::to_value(ShiftBandOut {
+                shift_id: 1,
+                effective_day_type: dt,
+                is_workday: dt.is_workday(),
+                is_override: false,
+            })
+            .unwrap();
+            assert_eq!(
+                band["is_workday"],
+                serde_json::json!(want),
+                "{:?} 的 is_workday 应为 {want}",
+                dt
             );
         }
     }

@@ -275,6 +275,146 @@ async fn range_constraints_on_both_read_endpoints() {
 //  2. 端点 1 / 2 / 3：全局日历
 // ===========================================================================
 
+/// 建一个**指定 `sort_order`** 的班次（色带排序口径用例要造同 `sort_order` 的两个班次，
+/// `crate::create_shift` 那版固定走缺省 `0`，造不出来）。
+async fn create_shift_ordered(ctx: &Ctx, code_prefix: &str, sort_order: i32) -> Value {
+    let code = crate::unique_code(code_prefix);
+    let (status, env) = post_as_manager(
+        ctx,
+        "/hr/shifts",
+        json!({
+            "code": code,
+            "name": format!("色带班次 {code_prefix}"),
+            "sort_order": sort_order,
+            "segments": segs(&[("08:00", "17:00")]),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "建班次应成功：{env}");
+    env["data"].clone()
+}
+
+/// 该行的 `shift_bands`（`CalendarDayOut.shift_bands`），顺带断言「恰好 4 个键」。
+fn bands_of(day: &Value) -> Vec<Value> {
+    let arr = day["shift_bands"]
+        .as_array()
+        .unwrap_or_else(|| panic!("shift_bands 是数组（无活跃班次时是空数组）：{day}"));
+    for b in arr {
+        let obj = b.as_object().expect("band 是对象");
+        assert_eq!(
+            obj.len(),
+            4,
+            "band 恰好 4 个键（多一个就是「第二个班次真相源」）：{b}"
+        );
+        assert!(
+            b["shift_id"].is_string(),
+            "band.shift_id 必须是 JSON string（雪花防精度截断）：{b}"
+        );
+    }
+    arr.clone()
+}
+
+/// 端点 1（2026-10-16 新增）：每行带 `shift_bands` —— **每日 × 每活跃班次**一条色带，
+/// 全局日历上直接渲染「所有班次的颜色带」不必再发 N 次 `GET /shifts/{id}/calendar`。
+///
+/// ⚠️ 这条钉的是**三条口径**：只含**活跃**班次、顺序**稳定**（`sort_order` 升序再
+/// `code` 升序）、`is_workday = false` 的班次**照样出现**（滤掉就等于前端拿不到
+/// 「这天哪些班次在休」）。
+#[tokio::test]
+async fn global_calendar_carries_one_band_per_active_shift_in_stable_order() {
+    let ctx = bootstrap().await;
+    let holiday = date(0); // 周一：全局显式行 = 法定节假日
+    let tue = date(1); // 周二：无显式行 ⇒ 兜底 WORKDAY
+    write_global_day(&ctx, &holiday, "STATUTORY_HOLIDAY", Some("法定节假日")).await;
+
+    // 排序口径：`sort_order` 升序 → `code` 升序。
+    // `ZZ` 的 code 字典序**最末**但 `sort_order` 最小 ⇒ 它必须排第一（证明 code 不能盖过
+    // sort_order）；`AA` 与 `BB` 同为 `sort_order = 1` ⇒ 两者之间才按 code 排。
+    let zz = create_shift_ordered(&ctx, "ZZ", 0).await;
+    let zid = id_of(&zz);
+    let aa = create_shift_ordered(&ctx, "AA", 1).await;
+    let aid = id_of(&aa);
+    let bb = create_shift_ordered(&ctx, "BB", 1).await;
+    let bid = id_of(&bb);
+
+    // A 班次在法定节假日里照常上班（覆盖行）
+    write_override_day(&ctx, aid, &holiday, "MAKEUP_WORKDAY").await;
+    // B 班次在**全局是工作日**里独自休息（覆盖行）⇒ is_workday = false 但**照样出现**
+    write_override_day(&ctx, bid, &tue, "MAKEUP_HOLIDAY").await;
+
+    let days = global_calendar_map(&ctx, &holiday, &tue).await;
+    assert_eq!(days.len(), 2, "{days:?}");
+
+    // ── 法定节假日那天 ──
+    let hb = bands_of(&days[0]);
+    assert_eq!(
+        hb.iter()
+            .map(|b| b["shift_id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>(),
+        vec![zid.to_string(), aid.to_string(), bid.to_string()],
+        "顺序必须是 sort_order 升序（ZZ 最前）再 code 升序（AA 在 BB 前）：{hb:?}"
+    );
+    assert_eq!(
+        hb[1]["effective_day_type"],
+        json!("MAKEUP_WORKDAY"),
+        "{hb:?}"
+    );
+    assert_eq!(hb[1]["is_workday"], json!(true), "调休上班是上班日");
+    assert_eq!(hb[1]["is_override"], json!(true), "有覆盖行");
+    for b in [&hb[0], &hb[2]] {
+        assert_eq!(
+            b["effective_day_type"],
+            json!("STATUTORY_HOLIDAY"),
+            "无覆盖行 ⇒ effective 逐字等于该行的全局 day_type：{b}"
+        );
+        assert_eq!(b["is_workday"], json!(false));
+        assert_eq!(
+            b["is_override"],
+            json!(false),
+            "无覆盖行 ⇒ is_override=false"
+        );
+    }
+    assert_eq!(days[0]["day_type"], json!("STATUTORY_HOLIDAY"), "{days:?}");
+
+    // ── 周二：全局兜底 WORKDAY，B 班次独自休息 ──
+    assert_eq!(days[1]["day_type"], json!("WORKDAY"));
+    assert_eq!(days[1]["derived"], json!(true));
+    let tb = bands_of(&days[1]);
+    let tb_b = tb
+        .iter()
+        .find(|b| b["shift_id"] == json!(bid.to_string()))
+        .unwrap();
+    assert_eq!(
+        tb_b["effective_day_type"],
+        json!("MAKEUP_HOLIDAY"),
+        "覆盖行压过全局：{tb:?}"
+    );
+    assert_eq!(
+        tb_b["is_workday"],
+        json!(false),
+        "⚠️ 休息的班次**照样出现在色带里**（只过滤停用班次）：{tb:?}"
+    );
+    assert_eq!(tb_b["is_override"], json!(true));
+    let tb_a = tb
+        .iter()
+        .find(|b| b["shift_id"] == json!(aid.to_string()))
+        .unwrap();
+    assert_eq!(tb_a["effective_day_type"], json!("WORKDAY"), "{tb:?}");
+    assert_eq!(tb_a["is_workday"], json!(true));
+
+    // ── 停用 ZZ 后：色带里不再有它，其余顺序不变 ──
+    deactivate_shift(&ctx, zid, version_of(&zz)).await;
+    let days2 = global_calendar_map(&ctx, &holiday, &holiday).await;
+    let hb2 = bands_of(&days2[0]);
+    assert_eq!(
+        hb2.iter()
+            .map(|b| b["shift_id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>(),
+        vec![aid.to_string(), bid.to_string()],
+        "⚠️ 停用班次不排人，不该占一条色带：{hb2:?}"
+    );
+}
+
 /// 端点 1：区间内**逐日一行，一天都不省**；显式行 `derived = false`、带 `name`。
 #[tokio::test]
 async fn global_calendar_lists_every_day_of_the_range() {

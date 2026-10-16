@@ -190,6 +190,26 @@ is_workday = effective_day_type ∈ { WORKDAY, MAKEUP_WORKDAY }
 | `day_type` | string | 已含按星期推导的兜底（前端**不需要**再自己判周六周日），字面量见 §2.2 |
 | `name` | string \| null | 节假日名 / 休息日说明；`derived = true` 的行**恒为 `null`**（库里就没这行） |
 | `derived` | bool | `true` = 该日**无显式行**，值是按星期推导出来的 |
+| `shift_bands` | `ShiftBandOut[]` | **2026-10-16 新增**：该日**逐班次**色带（见 §4.1.1），供全局日历直接渲染「所有班次的颜色带」 |
+
+#### 4.1.1 `ShiftBandOut`（端点 1 的 `shift_bands[]` 元素，**2026-10-16 新增**）
+
+| 字段 | 类型 | 口径 |
+|---|---|---|
+| `shift_id` | string | 雪花 id 序列化成 **JSON string**（与 §4.3 的 `ShiftCalendarOut.shift_id` 逐字同款） |
+| `effective_day_type` | string | 该班次这一天**真正生效**的日型（三级推导，见 §2.3）。**无覆盖行时逐字等于同一行的 `day_type`**；有覆盖行时可以与全局**不同** |
+| `is_workday` | bool | `effective_day_type` 是否算上班日（考勤取数的**唯一**判据，判据表见 §2.2） |
+| `is_override` | bool | 是否来自本班次的覆盖行（判据是**存在性**，见 §2.3） |
+
+三条口径，**前端渲染色带全靠它们**：
+
+1. **顺序稳定**：按班次 `sort_order` 升序、再 `code` 升序（`code` 在未软删行内唯一 ⇒ 全序）。前端可直接按数组顺序切分渲染段，**不必自己再排一次**。
+2. **只含 `is_active = true` 的班次**：停用班次不排人，不该在排班表上占一条色带。（停用班次的覆盖行**仍在库里**且端点 8 照常可读 —— 停用只挡写，见 §5.8。）
+3. ⚠️ **`is_workday = false` 的班次照样出现**，只过滤停用班次、**不**在这里按 `is_workday` 过滤：前端要的就是「这天哪些班次在休」，滤掉就没有色带了。**要不要渲染由前端自己决定。**
+
+⚠️ 形状恒定：**恰好 4 个键**，`shift_bands` 恒为数组（无活跃班次时是 `[]`，不是 `null`）。刻意**不**把 `code` / `color` / `name` 塞进 band —— 那些是端点 4 的真相源，复制一份就会与班次列表不同步。
+
+⚠️ 推导与端点 8 走**同一个**后端函数（`service::derive_effective`），`is_workday` 恒取 `effective_day_type.is_workday()` ⇒ **两个端点不可能给出不同的 `is_workday`**。前端也不得自己重算（见 §7）。
 
 ### 4.2 `ShiftOut`（端点 4 / 5 / 6 / 7 复用同一形状）
 
@@ -338,12 +358,13 @@ service 侧那次 `get_shift` + `ensure_writable` 只是**友好报错的前置�
 | 菜单授权 | MANAGER + CLERK 都授 | `seeds/rbac.sql` §4.1 / §4.2。⚠️ CLERK 持有 `hr.view` 却拿不到菜单 = 权限给了但页面进不去，自相矛盾 |
 | ⚠️ **API 前缀 ≠ 菜单 path** | API `/api/v2/hr/*`，菜单 `/hr/schedule` | 两层是不同层的东西；菜单 path 不跟着 API 前缀变 |
 
-前端侧的四条同源要求：
+前端侧的五条同源要求：
 
 1. **不重复实现推导**：渲染一律用后端给的 `day_type` / `effective_day_type` / `is_workday`，不要在前端按星期或按 `is_workday = day_type !== REST_DAY` 之类近似式重算。
-2. **`is_workday` 的判据与后端同源**：只有 `WORKDAY` 与 `MAKEUP_WORKDAY` 算上班日。前端若要自己判，用 `effective_day_type` 而**不是** `global_day_type`。
-3. **`overflow_minutes` 按分钟渲染**：要显示「跨到次日 02:30」就用分钟自己换算，别指望后端给小时。
-4. **长度上限的前端常量必须逐字对齐 `varchar` 真值**（`code` **30** / `name` **50** / `color` **20** / `remark` **200**，日历 `name` 50 / `remark` 200）：后端超长一律 `21909` / 400，前端多放 1 个字符就会让用户撞一条「看起来像格式错」的报错。同理，`code` / `name` 前端不要用 `trim()` 前的长度做校验 —— **后端判的是 trim 后的值**。
+2. **⚠️ 不得按班次自己重算推导**（2026-10-16）：全局日历上的「每个班次这天上不上班」一律读端点 1 的 `shift_bands[].is_workday`（§4.1.1），**不要**为了画色带去逐个班次发 `GET /shifts/{id}/calendar`（那是 N+1 次请求），也不要拿 `day_type` 加 `is_active` 之类近似式在本地推。端点 1 与端点 8 的 `is_workday` 由**同一个**后端函数算出，前端复制一遍就等于埋了第二套口径。
+3. **`is_workday` 的判据与后端同源**：只有 `WORKDAY` 与 `MAKEUP_WORKDAY` 算上班日。前端若要自己判，用 `effective_day_type` 而**不是** `global_day_type`（端点 1 的 band 上只有 `effective_day_type`，没有 `global_day_type`）。
+4. **`overflow_minutes` 按分钟渲染**：要显示「跨到次日 02:30」就用分钟自己换算，别指望后端给小时。
+5. **长度上限的前端常量必须逐字对齐 `varchar` 真值**（`code` **30** / `name` **50** / `color` **20** / `remark` **200**，日历 `name` 50 / `remark` 200）：后端超长一律 `21909` / 400，前端多放 1 个字符就会让用户撞一条「看起来像格式错」的报错。同理，`code` / `name` 前端不要用 `trim()` 前的长度做校验 —— **后端判的是 trim 后的值**。
 
 ⚠️ **部署顺序**：`hr.view` / `hr.schedule.manage` 两个权限点与两个菜单 code 由 `seeds/*.sql` 下发（启动钩子自动跑）。菜单/权限未上而后端已上时，端点会正常返回 40300（不是 404），症状是「页面能进、数据全空」；先跑一次 `./scripts/seed_apply.sh` 即可。
 
@@ -384,3 +405,25 @@ service 侧那次 `get_shift` + `ensure_writable` 只是**友好报错的前置�
 | 8 | **权限守卫在入参校验之前** | 见 §6 末；代价是写端点上无权账号会先开一次事务（零写入、不落锁） |
 | 9 | **两张批量写表上的 `version` 不做客户端锚**（偏离 CLAUDE.md §8「带 `version` 列的表写端点 body 必须收 `version`」） | `t_hr_calendar_day` / `t_hr_shift_calendar` 的写端点是 `{items:[…]}` 的**整批 upsert / 软删**，行级 OCC 在这个形态下不成立：一批里每一行都是「按 `cal_date` 命中即覆盖」，客户端并不持有某一行的 `version`，要塞进 `items[].version` 只会暴露内部实现、并把「一批要么全过要么全不进」拆成一堆行级判据。真正要防的并发（两个人把同一天改成不同口径）由「partial unique + `ON CONFLICT DO UPDATE` 的后写覆盖」与「`t_hr_shift` 上的真 OCC」挡住。⇒ `version` 在这两张表上**只作写计数器**（每次 upsert / 软删自增，供审计与将来排查）。先例：`t_wecom_daily_log`（只增审计流水、刻意无 `version`）。客户端的版本锚**只加在 `t_hr_shift` 上**（端点 6 / 7） |
 | 10 | **不另建同列的非 partial 索引** | 两条读查询的谓词恒带 `deleted_at IS NULL`，被同列 partial unique 的谓词**蕴含** ⇒ PG 直接拿 partial unique 走索引。`ix_t_hr_calendar_day_cal_date` / `ix_t_hr_shift_calendar_shift_date` 只会各多贡献一份写放大（每次 upsert / 软删维护两棵同样的 B 树），读端点一行都用不上 |
+| 11 | **`shift_bands` 让出参体积 = 区间天数 × 活跃班次数**（2026-10-16） | 端点 1 每行带**逐班次色带**（§4.1.1）⇒ 366 天 × 20 个活跃班次 = **最多 7340 条 band**，响应体明显变大。**有意不为它下调区间上限（§5.2）**：上限防的是「一个请求灌 10 年」，而色带是前端渲染排班表的必需数据 —— 砍掉它等于让前端退回 N+1 次 `GET /shifts/{id}/calendar`。推导是**纯内存** HashMap 查表，SQL 总共仍是 3 条（全局行 / 活跃班次 / 区间内全部覆盖行），**不是** N+1 查询。实测体积见 §8.4 |
+
+### 8.4 `shift_bands` 的实测序列化体积（2026-10-16）
+
+用**真实出参结构**（`CalendarDaysOut` 逐日 367 行 + 每行 N 条 `ShiftBandOut`，雪花
+`shift_id` 取 19 位）实测 `serde_json::to_string` 的字节数：
+
+| 区间天数 | 活跃班次 | band 条数 | 整份出参字节 | 单条 band 均值 |
+|---:|---:|---:|---:|---:|
+| 31（一个月） | 5 | 155 | 19,020 B（约 18.6 KB） | 约 109 B |
+| 366（上限） | 5 | 1,830 | 224,415 B（约 219 KB） | 约 109 B |
+| 366（上限） | 10 | 3,660 | 415,775 B（约 406 KB） | 约 109 B |
+| **367（上限，两端闭）** | **20** | **7,340** | **800,706 B（约 782 KB）** | 约 109 B |
+
+- 单条 band 的**上界**约 109 B，形态固定：
+  `{"shift_id":"7300000000000000000","effective_day_type":"WORKDAY","is_workday":true,"is_override":false}`。
+  `shift_id` 是 19 位雪花（字符串 19 字节 + 引号）、日型字面量最长 `STATUTORY_HOLIDAY`（18），
+  两者占了其中绝大部分。
+- ⚠️ **常态请求远小于上表**：上界要同时「区间拉满」且「班次编到 20 个」；一个月 5 个班次
+  只有 ~19 KB。体积是**线性**增长的（O(days × shifts)），没有二次项。
+- 结论：**不为色带下调 366 天的区间上限**（理由见 §8.3 第 11 条）。真要再省，只能让前端
+  按月分段取（区间口径不变）—— 那是前端侧的取数策略，后端不为它加参数。

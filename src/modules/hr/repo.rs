@@ -402,6 +402,35 @@ pub async fn list_shift_days(
         .await?)
 }
 
+/// 区间内**全部班次**的**未软删**覆盖行（按 `shift_id, cal_date` 升序）。
+///
+/// **与 [`list_shift_days`] 的差别只有「不按班次过滤」这一处**：谓词、投影、守卫、
+/// 排序键（去掉 `shift_id` 后按 `(shift_id, cal_date)`）全部逐字同款。存在理由：
+/// 端点 1 的 `shift_bands` 要一次拿到**每一天 × 每个活跃班次**的覆盖情况，而端点 8
+/// 只关心单个班次 —— 若按班次循环调 [`list_shift_days`] 就是 N+1 次查询。
+///
+/// ⚠️ **不按班次 `is_active` 过滤**：停用班次的覆盖行**仍在生效语义上**（停用只挡写，
+/// 端点 8 照常可读），是否出现在色带里由 service 按 `is_active` 过滤决定，
+/// 不该在 SQL 里就把它们藏掉（那会让「停用班次的历史口径」在这一层不可查）。
+pub async fn list_shift_overrides_in_range(
+    conn: &mut PgConnection,
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Result<Vec<TShiftCalendarRow>, AppError> {
+    let sql = format!(
+        "SELECT id, version, shift_id, cal_date, day_type, remark, created_at, created_by, \
+                updated_at, updated_by, deleted_at \
+         FROM t_hr_shift_calendar WHERE {ALIVE} \
+                AND cal_date BETWEEN $1 AND $2 \
+         ORDER BY shift_id ASC, cal_date ASC"
+    );
+    Ok(sqlx::query_as::<_, TShiftCalendarRow>(AssertSqlSafe(sql))
+        .bind(from)
+        .bind(to)
+        .fetch_all(&mut *conn)
+        .await?)
+}
+
 /// 待 upsert 的班次覆盖行（**id 由 App 侧生成**；理由同 [`NewCalendarDay`]）。
 #[derive(Debug, Clone)]
 pub struct NewShiftDay {
