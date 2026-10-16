@@ -314,12 +314,15 @@ fn bands_of(day: &Value) -> Vec<Value> {
     arr.clone()
 }
 
-/// 端点 1（2026-10-16 新增）：每行带 `shift_bands` —— **每日 × 每活跃班次**一条色带，
+/// 端点 1（2026-10-19 新增）：每行带 `shift_bands` —— **每日 × 每活跃班次**一条色带，
 /// 全局日历上直接渲染「所有班次的颜色带」不必再发 N 次 `GET /shifts/{id}/calendar`。
 ///
 /// ⚠️ 这条钉的是**三条口径**：只含**活跃**班次、顺序**稳定**（`sort_order` 升序再
 /// `code` 升序）、`is_workday = false` 的班次**照样出现**（滤掉就等于前端拿不到
 /// 「这天哪些班次在休」）。
+///
+/// ⚠️ 其中「`code` 升序」这半截是**唯一**能抓住 tie-break 写错的构造：`AA` / `BB` 的
+/// `sort_order` 打平，而**建库顺序刻意让 `id` 序与 `code` 序相反**（`BB` 先建）。
 #[tokio::test]
 async fn global_calendar_carries_one_band_per_active_shift_in_stable_order() {
     let ctx = bootstrap().await;
@@ -330,12 +333,22 @@ async fn global_calendar_carries_one_band_per_active_shift_in_stable_order() {
     // 排序口径：`sort_order` 升序 → `code` 升序。
     // `ZZ` 的 code 字典序**最末**但 `sort_order` 最小 ⇒ 它必须排第一（证明 code 不能盖过
     // sort_order）；`AA` 与 `BB` 同为 `sort_order = 1` ⇒ 两者之间才按 code 排。
+    //
+    // ⚠️ **`BB` 必须先于 `AA` 建**（2026-10-19）：`unique_code` 尾部是单调雪花 ⇒
+    // 「先建先小」，于是 `id(BB) < id(AA)`，而 code 字典序仍是 `AA < BB`。
+    // 这样本用例才真的钉死了 tie-break 是 **`code`** —— 若实现把 `code` 换成 `id`（即
+    // 照抄端点 4 `list_shifts` 的兜底键），本用例会红。若两者同序（AA 先建），两种
+    // tie-break 给出同样的答案，把实现换成 `id` 这条用例照样全绿 ⇒ 覆盖是假的。
     let zz = create_shift_ordered(&ctx, "ZZ", 0).await;
     let zid = id_of(&zz);
-    let aa = create_shift_ordered(&ctx, "AA", 1).await;
-    let aid = id_of(&aa);
     let bb = create_shift_ordered(&ctx, "BB", 1).await;
     let bid = id_of(&bb);
+    let aa = create_shift_ordered(&ctx, "AA", 1).await;
+    let aid = id_of(&aa);
+    assert!(
+        bid < aid,
+        "雪花单调 ⇒ BB 先建必然 id 更小，这条前提不成立本用例就失去鉴别力：{bid} vs {aid}"
+    );
 
     // A 班次在法定节假日里照常上班（覆盖行）
     write_override_day(&ctx, aid, &holiday, "MAKEUP_WORKDAY").await;
@@ -352,7 +365,7 @@ async fn global_calendar_carries_one_band_per_active_shift_in_stable_order() {
             .map(|b| b["shift_id"].as_str().unwrap().to_string())
             .collect::<Vec<_>>(),
         vec![zid.to_string(), aid.to_string(), bid.to_string()],
-        "顺序必须是 sort_order 升序（ZZ 最前）再 code 升序（AA 在 BB 前）：{hb:?}"
+        "顺序必须是 sort_order 升序（ZZ 最前）再 code 升序（AA 在 BB 前，**与 id 序相反**）：{hb:?}"
     );
     assert_eq!(
         hb[1]["effective_day_type"],

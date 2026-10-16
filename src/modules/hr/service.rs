@@ -450,7 +450,7 @@ fn require_text(field: &str, v: &str) -> Result<String, AppError> {
 }
 
 // ============================================================================
-// 日型推导的唯一真源（端点 1 / 端点 8 共用，2026-10-16 抽成共用函数）
+// 日型推导的唯一真源（端点 1 / 端点 8 共用，2026-10-19 抽成共用函数）
 // ============================================================================
 
 /// 三级推导（**覆盖行 > 全局行 > 按星期兜底**）的**唯一实现**。
@@ -471,6 +471,13 @@ fn require_text(field: &str, v: &str) -> Result<String, AppError> {
 /// `globals` 收的是**原始字符串**（`HashMap<NaiveDate, String>`）：库里若出现未知
 /// 日型字面量，由这里的 [`DayType::parse`] 降级成 `21905`，而不是让整行解码失败
 /// （与 `model::TCalendarDayRow::day_type` 的口径同源）。
+///
+/// ⚠️ **失败半径**：端点 1 要对**每个活跃班次 × 区间内每一天**各调一次本函数 ⇒ **任一**
+/// 活跃班次在**任一天**的覆盖行（或全局行）字面量不合法，**整个请求**就是 `21905` /
+/// HTTP 400 —— 半径是「全局日历 × 整个区间」，不是「单个班次」。端点 8 的同款降级
+/// 半径只有单班次。这是共用同一个函数的**代价**，有意接受：色带本身就是「所有班次 ×
+/// 整天」的笛卡尔积，出参形状已经要求这一点；而把两处推导拆开各判一次，漂移是无声的
+/// （见上方「为什么必须共用」）。
 fn derive_effective(
     globals: &HashMap<NaiveDate, String>,
     overrides: &HashMap<(i64, NaiveDate), String>,
@@ -497,9 +504,9 @@ fn derive_effective(
 /// `GET /calendar/days?from&to` —— 全局日历区间读（**逐日一行，一天都不省**）。
 ///
 /// 返回的每一天要么来自显式行（`derived = false`），要么按星期推导补齐
-/// （`derived = true`）；每行另带 `shift_bands`（逐班次色带，2026-10-16 新增）。
+/// （`derived = true`）；每行另带 `shift_bands`（逐班次色带，2026-10-19 新增）。
 ///
-/// ## `shift_bands` 的取数与性能（2026-10-16）
+/// ## `shift_bands` 的取数与性能（2026-10-19）
 ///
 /// SQL 总共**仍是 3 条**：`list_calendar_days`（全局显式行）+ `list_shifts(.., false)`
 /// （活跃班次）+ `list_shift_overrides_in_range`（区间内**全部**班次的覆盖行）。
@@ -508,9 +515,10 @@ fn derive_effective(
 /// `repo::list_shift_days` 就是 N+1 次，那才是这里刻意避开的。
 ///
 /// ⚠️ **已知取舍（登记在 `docs/api/hr.md` §8.3）**：响应体大小是
-/// **区间天数 × 活跃班次数**。区间上限 366 天（§5.2）配 20 个活跃班次 ⇒ 最多
-/// **7340 条 band**，出参会明显变大。**有意不改区间上限** —— 上限防的是「一个请求灌
-/// 10 年」；色带是前端渲染排班表的必需数据，砍掉它等于让前端回到 N+1 次请求。
+/// **区间天数 × 活跃班次数**。跨度上限 366 天 ⇒ 两端闭**最多 367 天**（§5.2）配
+/// 20 个活跃班次 ⇒ 最多 **7340 条 band**，出参会明显变大。**有意不改区间上限** ——
+/// 上限防的是「一个请求灌 10 年」；色带是前端渲染排班表的必需数据，砍掉它等于让前端
+/// 回到 N+1 次请求。
 pub async fn list_calendar_days(
     conn: &mut PgConnection,
     current: &CurrentUser,
@@ -526,6 +534,10 @@ pub async fn list_calendar_days(
     // ⚠️ **必须在这里重排**：`repo::list_shifts` 的兜底键是 `id ASC`，而契约要求
     // `sort_order ASC` → `code ASC`（`code` 在未软删行内唯一 ⇒ 全序、顺序稳定）。
     // 前端按数组顺序切色带段，顺序漂了就画错。
+    //
+    // ⚠️ 重排也意味着**色带顺序与端点 4 `GET /shifts` 不保证一致**（那边 `sort_order`
+    // 打平时按 `id` 兜底）⇒ 前端**必须按 `shift_id` 配对**、不得按下标配对，否则色带
+    // 会串到别的班次上且无任何报错。登记在 `docs/api/hr.md` §4.1.1 第 1 条。
     shifts.sort_by(|a, b| {
         a.sort_order
             .cmp(&b.sort_order)
@@ -1467,7 +1479,7 @@ mod tests {
         NaiveDate::from_ymd_opt(2030, 3, 4).unwrap() + chrono::Duration::days(offset)
     }
 
-    /// 端点 1 的 `shift_bands` 形状（2026-10-16 新增）：**无覆盖行 ⇒ `effective` 逐字
+    /// 端点 1 的 `shift_bands` 形状（2026-10-19 新增）：**无覆盖行 ⇒ `effective` 逐字
     /// 等于全局日型、`is_override = false`**；**有覆盖行 ⇒ 等于覆盖值、`is_override =
     /// true`**。
     ///
